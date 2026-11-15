@@ -181,6 +181,29 @@ impl CellValue {
     }
 }
 
+/// The registry's one stored form of a phone number, what a `number` cell holds (sealed in a
+/// generation builds up to 0.200.0 read, plain text after it, where [`Ty::Phone`] admits exactly
+/// this function's own output): its ASCII digits only, a US number's leading country `1`
+/// dropped, as fleet_db normalized it. `None` below four digits or above the fifteen E.164
+/// allows.
+pub(crate) fn phone_digits(raw: &str) -> Option<String> {
+    let mut digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() == 11 && digits.starts_with('1') {
+        digits.remove(0);
+    }
+    (4..=15).contains(&digits.len()).then_some(digits)
+}
+
+/// The stored form ([`phone_digits`]) of the number a person typed, on a command line or in a
+/// grid cell: what is typed is held to a number's shape first ([`guard::is_phone`]: 7 to 15
+/// digits, an optional leading `+`, no other character).
+pub(crate) fn typed_phone(typed: &str) -> Option<String> {
+    let typed = typed.trim();
+    guard::is_phone(typed)
+        .then(|| phone_digits(typed))
+        .flatten()
+}
+
 fn refuse(collection: &Collection, column: &str, rule: &str) -> Error {
     Error::new(&format!("{}.{column}: {rule}", collection.name))
 }
@@ -252,16 +275,31 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
             }
             guard::word(url).map_err(guard::Refusal::rule)
         }
+        // The registry's one stored form ([`phone_digits`]'s own output), which `phones set`,
+        // the grid and the importer write: what a person types is held to a number's shape
+        // there ([`typed_phone`]).
+        Ty::Phone => {
+            let digits = text()?;
+            (phone_digits(digits).as_deref() == Some(digits))
+                .then_some(())
+                .ok_or(
+                    "a phone number is stored as its digits, 4 to 15 of them, a US number \
+                     without its leading 1",
+                )
+        }
         Ty::Secret => super::secret::is_sealed(text()?)
             .then_some(())
             .ok_or("a secret cell holds an authenticated opaque token"),
         Ty::SecretRef => {
             let object = x.as_object().ok_or("a vault reference names its entry")?;
             let names = |key: &str| {
-                object
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .is_some_and(crate::crypto::name)
+                object.get(key).and_then(Value::as_str).is_some_and(|name| {
+                    if key == "entry" {
+                        super::secret::entry_text(name)
+                    } else {
+                        crate::crypto::name(name)
+                    }
+                })
             };
             if !object
                 .keys()
@@ -273,8 +311,12 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
                 return Err("a vault reference holds only vault, entry and item names");
             }
             object
-                .values()
-                .filter_map(Value::as_str)
+                .iter()
+                .filter(|(key, value)| {
+                    !(key.as_str() == "entry"
+                        && value.as_str().is_some_and(super::secret::is_entry_name))
+                })
+                .filter_map(|(_, value)| value.as_str())
                 .try_for_each(|name| guard::word(name).map_err(guard::Refusal::rule))
         }
         Ty::Key | Ty::Ref(_) => {
@@ -448,10 +490,17 @@ pub fn members<'a>(column: &Column, field: Option<&'a Field>) -> BTreeSet<&'a st
 }
 
 /// Whether the element `elem` of the set column `column`, its cell's candidates' values
-/// `values`, reads present as [`project`] reads it: some candidate adds it ([`adds`]); for a
-/// text set, only where every candidate decodes (`unreadable` false) and is one its element
-/// holds, since a projection shows any other element raw and never as a member.
-pub fn element_present(column: &Column, elem: &str, values: &[Value], unreadable: bool) -> bool {
+/// `values`, already reads as an edit storing `x` leaves it, as [`project`] reads it: present
+/// when some candidate adds it ([`adds`]), whichever way `x` goes. Never for a text set's
+/// element with a candidate that does not decode (`unreadable`) or that its element cannot hold:
+/// a projection shows that element raw, so it confirms neither an add nor a removal.
+pub fn element_holds(
+    column: &Column,
+    elem: &str,
+    values: &[Value],
+    unreadable: bool,
+    x: &Value,
+) -> bool {
     if column.ty.text_set().is_some()
         && (unreadable
             || !values
@@ -460,7 +509,7 @@ pub fn element_present(column: &Column, elem: &str, values: &[Value], unreadable
     {
         return false;
     }
-    values.iter().any(|x| adds(column, elem, x))
+    values.iter().any(|x| adds(column, elem, x)) == adds(column, elem, x)
 }
 
 /// `raw` as a member of a text set of `max`-byte texts: its normal form ([`keys::normal_text`]),
@@ -502,6 +551,24 @@ pub fn admissible(ty: &Ty, x: &Value) -> bool {
             items.iter().all(|item| check(inner, item, false).is_ok())
         }
         _ => check(ty, x, true).is_ok(),
+    }
+}
+
+/// Whether `x`, a value of `column` of row `pk`, names only an entry it may name: true for null
+/// and for any column but a `SecretRef`. A secret-named one ([`super::secret_named`], which the
+/// schema holds to `SecretRef`) names only an entry bound to those coordinates
+/// ([`super::secret::bound`]); any other (a `vault_ref`, which points at an entry it does not
+/// own) never names a secret cell's entry ([`super::secret::is_entry_name`]), so the guard
+/// [`check`] waives for that shape only ever passes a name bound to an already-guarded row key.
+pub fn owns_entry(collection: &str, column: &Column, pk: &str, x: &Value) -> bool {
+    if !matches!(column.ty, Ty::SecretRef) || x.is_null() {
+        return true;
+    }
+    let entry = super::secret::entry_of(x);
+    if super::secret_named(column.name) {
+        entry.is_some_and(|entry| super::secret::bound(collection, column.name, pk, entry))
+    } else {
+        !entry.is_some_and(super::secret::is_entry_name)
     }
 }
 
@@ -559,7 +626,16 @@ pub fn change(collection: &Collection, key: CellKey<'_>, value: &CellValue) -> R
                 .and_then(|()| check_elem_value(column, elem, &value.x))
                 .map_err(|rule| refuse(collection, column.name, rule))?;
         }
-        None => validate(collection, column, &value.x)?,
+        None => {
+            validate(collection, column, &value.x)?;
+            if !owns_entry(collection.name, column, key.pk, &value.x) {
+                return Err(refuse(
+                    collection,
+                    column.name,
+                    "a secret cell names only its own store entry",
+                ));
+            }
+        }
     }
     Ok(Change {
         collection: collection.name.to_owned(),
@@ -993,9 +1069,10 @@ pub fn project(collection: &Collection, cells: &Cells) -> Projection {
                             .iter()
                             .all(|c| check_elem_value(column, elem, &c.value.x).is_ok())
                 }
-                None => candidates
-                    .iter()
-                    .all(|c| check(&column.ty, &c.value.x, true).is_ok()),
+                None => candidates.iter().all(|c| {
+                    check(&column.ty, &c.value.x, true).is_ok()
+                        && owns_entry(collection.name, column, parsed.pk, &c.value.x)
+                }),
             });
         let set = column.filter(|c| matches!(c.ty, Ty::Set(_)));
         if !readable {

@@ -6,7 +6,7 @@ use crate::prompt::fixtures::rows;
 /// codex 0.155.1's trust gate, measured.
 pub(crate) fn codex_0_155_trust() -> Vec<String> {
     rows(&[
-        "> You are in /Users//x/aterm",
+        "> You are in /Users/_user0/aterm",
         "",
         "  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of",
         "  prompt injection. Trusting the directory allows project-local config, hooks, and exec policies to load.",

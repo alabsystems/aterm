@@ -26,45 +26,20 @@ fn image(root: &Path) -> Image {
     image
 }
 
+/// The ways a vault entry holds its place and cannot be read as text: a byte no UTF-8 text
+/// holds, and an overlong encoding.
 fn faults() -> Vec<&'static str> {
-    let mut faults = vec!["directory", "file-parent"];
-    if cfg!(unix) {
-        faults.extend(["link", "dangling-link", "fifo", "dangling-parent"]);
-    }
-    faults
+    vec!["not-utf8", "overlong"]
 }
 
-fn plant_fault(bed: &Bed, path: &Path, kind: &str, valid: &str) {
-    match kind {
-        "directory" => {
-            fs::create_dir(path).unwrap();
-            fs::write(path.join("owner-work"), b"keep").unwrap();
-        }
-        "file-parent" => fs::write(bed.secrets(), b"owner work").unwrap(),
-        #[cfg(unix)]
-        "link" | "dangling-link" | "dangling-parent" => {
-            let target = bed.home.join("source-target");
-            if kind == "link" {
-                fs::write(&target, valid).unwrap();
-            }
-            let link = if kind == "dangling-parent" {
-                bed.secrets()
-            } else {
-                path.to_path_buf()
-            };
-            std::os::unix::fs::symlink(target, link).unwrap();
-        }
-        #[cfg(unix)]
-        "fifo" => {
-            use std::os::unix::ffi::OsStrExt as _;
-            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-            // SAFETY: the NUL-terminated path lives through mkfifo and names only this fixture.
-            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        }
+/// Publish entry `name` unreadable as `kind` ([`faults`]).
+fn plant_fault(bed: &Bed, name: &str, kind: &str) {
+    let bytes = match kind {
+        "not-utf8" => vec![0xff, 0xfe, b'\n'],
+        "overlong" => vec![0xc0, 0x80, b'\n'],
         _ => panic!("unknown source fault: {kind}"),
-    }
-    #[cfg(not(unix))]
-    let _ = valid;
+    };
+    crate::vault_entry::seed(&bed.home, &[(name, &bytes)]);
 }
 
 fn project(state: &State, action: &str, cli: Cli, variant: &str, cold: bool) -> State {
@@ -82,8 +57,8 @@ fn project(state: &State, action: &str, cli: Cli, variant: &str, cold: bool) -> 
     } else {
         cli_fleet_file(cli)
     };
-    let primary = bed.secrets().join(&name);
-    let fallback = bed.secrets().join(ACCOUNTS_CSV_FILE);
+    let primary = name.as_str();
+    let fallback = ACCOUNTS_CSV_FILE;
     let region = if cli == Cli::Kimi {
         "region='global'\n"
     } else {
@@ -99,33 +74,23 @@ fn project(state: &State, action: &str, cli: Cli, variant: &str, cold: bool) -> 
         "Primary" => {
             bed.secret(&name, &toml);
             if variant == "broken-fallback" {
-                fs::create_dir(&fallback).unwrap();
+                plant_fault(&bed, fallback, "not-utf8");
             } else {
                 bed.secret(ACCOUNTS_CSV_FILE, &csv);
             }
             1
         }
         "Fallback" => {
-            #[cfg(unix)]
-            if variant == "linked-parent" {
-                let target = bed.home.join("source-parent");
-                fs::create_dir(&target).unwrap();
-                std::os::unix::fs::symlink(target, bed.secrets()).unwrap();
-            }
-            fs::create_dir_all(bed.secrets()).unwrap();
-            fs::write(&fallback, &csv).unwrap();
+            bed.secret(fallback, &csv);
             2
         }
         "PrimaryUnavailable" => {
-            if !matches!(variant, "file-parent" | "dangling-parent") {
-                bed.secret(ACCOUNTS_CSV_FILE, &csv);
-            }
-            plant_fault(&bed, &primary, variant, &toml);
+            bed.secret(ACCOUNTS_CSV_FILE, &csv);
+            plant_fault(&bed, primary, variant);
             3
         }
         "FallbackUnavailable" => {
-            fs::create_dir(bed.secrets()).unwrap();
-            plant_fault(&bed, &fallback, variant, &csv);
+            plant_fault(&bed, fallback, variant);
             for (file, email) in [
                 (".claude.json", "local-m16@example.test"),
                 (".claude.json.backup", "local-m16-2@example.test"),
@@ -140,7 +105,8 @@ fn project(state: &State, action: &str, cli: Cli, variant: &str, cold: bool) -> 
         }
         _ => panic!("unknown source action"),
     };
-    let present = source_entry_present(&primary);
+    let present =
+        crate::vault_entry::read_text(&bed.home, primary, SOURCE_TEXT_MAX_BYTES).occupies();
     if cli == Cli::Claude && !cold {
         fs::write(
             bed.config.join(FLEET_ROSTER_FILE),
@@ -168,21 +134,16 @@ fn project(state: &State, action: &str, cli: Cli, variant: &str, cold: bool) -> 
             Some(&bed.aterm_toml()),
             &bed.roster(cli),
         );
-        // A selected invalid file can refuse during alias validation, before
-        // an origin with a printable path exists. It must still refuse below
-        // without consuming a fallback or changing any retained record.
+        // A selected unreadable entry can refuse before an origin names it. It must still
+        // refuse below without consuming a fallback or changing any retained record.
         if !matches!(&origin, FleetOrigin::SourcePending(_)) || case <= 2 {
             assert_eq!(
                 origin.source(),
-                Some(
-                    if case == 1 || case == 3 {
-                        &primary
-                    } else {
-                        &fallback
-                    }
-                    .display()
-                    .to_string()
-                ),
+                Some(crate::vault_entry::source_name(if case == 1 || case == 3 {
+                    primary
+                } else {
+                    fallback
+                })),
                 "{cli:?} {action} {variant} cold={cold}",
             );
         }
@@ -239,13 +200,8 @@ fn project(state: &State, action: &str, cli: Cli, variant: &str, cold: bool) -> 
 pub(crate) fn source_transition(state: &State, action: &str) -> State {
     let variants = match action {
         "Primary" => vec!["plain", "broken-fallback"],
-        "Fallback" if cfg!(unix) => vec!["plain", "linked-parent"],
         "Fallback" => vec!["plain"],
-        "PrimaryUnavailable" => faults(),
-        "FallbackUnavailable" => faults()
-            .into_iter()
-            .filter(|kind| !matches!(*kind, "file-parent" | "dangling-parent"))
-            .collect(),
+        "PrimaryUnavailable" | "FallbackUnavailable" => faults(),
         _ => panic!("unknown source action"),
     };
     let mut agreed = None;

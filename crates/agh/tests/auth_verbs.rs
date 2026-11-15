@@ -21,9 +21,18 @@ fn person(root: &Path, fake: &FakeGithub, env: MapEnv) -> (Ctx, Captured) {
     (ctx.with_terminals(false, true), captured)
 }
 
-fn person_with(root: &Path, fake: &FakeGithub, stdin: &str) -> (Ctx, Captured) {
-    let (ctx, captured) = person(root, fake, common::env());
-    (ctx.with_stdin(stdin.as_bytes().to_vec()), captured)
+/// `token` published as vault entry `name` of the store under `root`'s home, and the path that
+/// names it as `--file` (`~/.secrets/NAME`, which agh reads as the entry and never opens); a
+/// later call publishes another value, as a rotation does.
+fn vault_file(root: &Path, name: &str, token: &str) -> PathBuf {
+    let home = dirs(root).home;
+    common::vault_entry(&home, name, token);
+    home.join(".secrets").join(name)
+}
+
+/// The `--file` word for `file`.
+fn word(file: &Path) -> String {
+    file.display().to_string()
 }
 
 fn dirs(root: &Path) -> Dirs {
@@ -94,32 +103,46 @@ fn run(ctx: &mut Ctx, args: &[&str]) -> u8 {
     common::run_cli(ctx, args)
 }
 
-const ADD_DEV: [&str; 10] = [
-    "auth",
-    "add",
-    "dev",
-    "--stdin",
-    "--tier",
-    "dev",
-    "--owner",
-    "fixture-dev",
-    "--write",
-    "--format",
-];
+/// `auth add dev --file FILE --tier dev --owner fixture-dev --write --format`, its format left
+/// to the caller.
+fn add_dev(file: &str) -> Vec<&str> {
+    vec![
+        "auth",
+        "add",
+        "dev",
+        "--file",
+        file,
+        "--tier",
+        "dev",
+        "--owner",
+        "fixture-dev",
+        "--write",
+        "--format",
+    ]
+}
 
-/// An agent provisions with no terminal on stderr or stdin: from a
-/// file in place and from a piped stdin alike.
+/// The private agh directory holds agh.toml and its locks, never a token: agh copies none.
+fn holds_no_token(dirs: &Dirs) {
+    assert!(
+        !dirs.config.join("tokens").exists(),
+        "{:?}",
+        names_in(&dirs.config)
+    );
+}
+
+/// An agent routes a vault file with no terminal on stderr or stdin, and a file elsewhere in
+/// place alike.
 #[test]
 fn auth_add_without_a_terminal_provisions() {
     let root = common::scratch("auth-noterm");
     let fake = FakeGithub::start();
     let token = agh_fake::token("noterm");
     fake.add_token(&token, "fixture-dev-bot");
-    let (ctx, captured) = common::ctx(root.path(), &fake, common::env());
-    let mut ctx = ctx.with_stdin(format!("{token}\n").into_bytes());
+    let file = word(&vault_file(root.path(), "dev", &token));
+    let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     let exit = run(
         &mut ctx,
-        &["auth", "add", "dev", "--stdin", "--tier", "dev"],
+        &["auth", "add", "dev", "--file", &file, "--tier", "dev"],
     );
     assert_eq!(exit, 0, "{}", captured.stderr_text());
     assert_eq!(
@@ -134,7 +157,6 @@ fn auth_add_without_a_terminal_provisions() {
 
     let other = agh_fake::token("noterm-file");
     fake.add_token(&other, "fixture-ext-bot");
-    std::fs::create_dir_all(&dirs.home).expect("home");
     let file = common::write_token(&dirs.home.join("tok"), "ext.token", &other);
     let path = file.display().to_string();
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
@@ -152,75 +174,25 @@ fn auth_add_without_a_terminal_provisions() {
 }
 
 #[test]
-fn auth_add_stdin_from_a_terminal_is_usage_and_reads_nothing() {
-    let root = common::scratch("auth-ttyin");
+fn auth_add_of_a_vault_file_writes_a_private_agh_toml_that_validates() {
+    let root = common::scratch("auth-vault-file");
     let fake = FakeGithub::start();
-    let token = agh_fake::token("ttyin");
+    let token = agh_fake::token("vault-file");
     fake.add_token(&token, "fixture-dev-bot");
-    let (ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
-    let mut ctx = ctx.with_stdin_terminal(true);
-    let exit = run(
-        &mut ctx,
-        &[
-            "auth",
-            "add",
-            "dev",
-            "--stdin",
-            "--tier",
-            "dev",
-            "--owner",
-            "fixture-dev",
-            "--write",
-            "--drafts",
-        ],
-    );
-    assert_eq!(exit, 2);
-    let error = common::error_json(&captured.stderr_text());
-    assert_eq!(error["kind"], Value::from("usage"));
-    let next = error["next"].as_str().expect("a next");
-    assert!(next.contains("dev --stdin --tier dev"), "{next}");
-    assert!(next.contains("--owner fixture-dev"), "{next}");
-    assert!(next.contains("--write"), "{next}");
-    assert!(next.contains("--drafts"), "{next}");
-    assert!(next.ends_with("< FILE"), "{next}");
-    assert!(!dirs(root.path()).config.exists());
-    assert!(fake.seen().is_empty());
-    let mut unread = String::new();
-    std::io::Read::read_to_string(&mut ctx.stdin, &mut unread).expect("stdin");
-    assert_eq!(unread, format!("{token}\n"), "stdin was read");
-    let dirs = dirs(root.path());
-    std::fs::create_dir_all(&dirs.home).expect("home");
-    let file = common::write_token(&dirs.home.join("tok"), "dev.token", &token);
-    let (ctx, captured) = person(root.path(), &fake, common::env());
-    let mut ctx = ctx.with_stdin_terminal(true);
-    let path = file.display().to_string();
-    let exit = run(
-        &mut ctx,
-        &["auth", "add", "dev", "--file", &path, "--tier", "dev"],
-    );
-    assert_eq!(exit, 0, "{}", captured.stderr_text());
-}
-
-#[test]
-fn auth_add_from_stdin_writes_private_files_that_validate() {
-    let root = common::scratch("auth-stdin");
-    let fake = FakeGithub::start();
-    let token = agh_fake::token("stdin");
-    fake.add_token(&token, "fixture-dev-bot");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
-    let mut args = ADD_DEV.to_vec();
+    let file = vault_file(root.path(), "dev", &token);
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    let path = word(&file);
+    let mut args = add_dev(&path);
     args.push("json");
     assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
     let dirs = dirs(root.path());
     assert_eq!(mode(&dirs.config), 0o700);
     assert_eq!(mode(&dirs.config_file()), 0o600);
-    assert_eq!(mode(&dirs.tokens()), 0o700);
-    let token_file = dirs.tokens().join("dev.token");
-    assert_eq!(mode(&token_file), 0o600);
-    assert_eq!(names_in(&dirs.tokens()), ["dev.token"]);
+    holds_no_token(&dirs);
     assert_eq!(
-        std::fs::read_to_string(&token_file).expect("the token file"),
-        format!("{token}\n")
+        std::fs::read_to_string(&file).expect("the vault file"),
+        format!("{token}\n"),
+        "the vault's file is read in place"
     );
     let router = validated(&dirs);
     let profile = router.profile("dev").expect("the dev profile");
@@ -244,6 +216,7 @@ fn auth_add_from_stdin_writes_private_files_that_validate() {
     );
     assert_eq!(answer["login"], Value::from("fixture-dev-bot"));
     assert_eq!(answer["kind"], Value::from("classic"));
+    assert_eq!(answer["source"], Value::from("vault:dev"));
     let user = fake
         .seen()
         .into_iter()
@@ -266,8 +239,9 @@ fn auth_add_keeps_a_files_comments() {
     fake.add_token(&token, "fixture-dev-bot");
     let dirs = dirs(root.path());
     common::write_config(&dirs, COMMENTED);
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
-    let mut args = ADD_DEV.to_vec();
+    let path = word(&vault_file(root.path(), "dev", &token));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    let mut args = add_dev(&path);
     args.push("json");
     assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
     let text = config_text(&dirs);
@@ -290,23 +264,35 @@ fn auth_add_again_replaces_the_token_and_login_and_a_tier_change_is_refused() {
     fake.add_token(&first, "fixture-dev-bot");
     fake.add_token(&second, "fixture-reader");
     let dirs = dirs(root.path());
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{first}\n"));
-    let mut args = ADD_DEV.to_vec();
-    args.push("json");
-    assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
+    let first_file = vault_file(root.path(), "dev", &first);
+    let second_file = vault_file(root.path(), "dev-next", &second);
+    let other_file = vault_file(root.path(), "other", &second);
+    let (first_word, second_word, other_word) =
+        (word(&first_file), word(&second_file), word(&other_file));
+    let mut first_args = add_dev(&first_word);
+    first_args.push("json");
+    let mut second_args = add_dev(&second_word);
+    second_args.push("json");
+    let other_args = [
+        "auth",
+        "add",
+        "other",
+        "--file",
+        &other_word,
+        "--tier",
+        "dev",
+    ];
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    assert_eq!(run(&mut ctx, &first_args), 0, "{}", captured.stderr_text());
 
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{second}\n"));
-    assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
-    let token_file = dirs.tokens().join("dev.token");
-    assert_eq!(
-        std::fs::read_to_string(&token_file).expect("the token file"),
-        format!("{second}\n")
-    );
-    assert_eq!(names_in(&dirs.tokens()), ["dev.token"]);
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    assert_eq!(run(&mut ctx, &second_args), 0, "{}", captured.stderr_text());
     let router = validated(&dirs);
+    let dev = router.profile("dev").expect("the dev profile");
+    assert_eq!(dev.login.as_deref(), Some("fixture-reader"));
     assert_eq!(
-        router.profile("dev").and_then(|p| p.login.as_deref()),
-        Some("fixture-reader")
+        dev.source,
+        identity::Source::Entry(identity::VaultEntry::new("dev-next", &dirs.home))
     );
     let row = owner(&parsed(&dirs), "fixture-dev");
     assert_eq!(strings(row.get("read")), ["dev"]);
@@ -341,83 +327,52 @@ fn auth_add_again_replaces_the_token_and_login_and_a_tier_change_is_refused() {
     let env = std::sync::Arc::new(GateEnv(std::sync::Mutex::new(Some((entered, released)))));
     std::thread::scope(|scope| {
         let pending = scope.spawn(|| {
-            let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{first}\n"));
+            let (mut ctx, captured) = person(root.path(), &fake, common::env());
             ctx.env = env.clone();
             ctx.transport = Some(std::sync::Arc::new(agh::wire::http::HttpTransport::new(
                 env.clone(),
             )));
-            (run(&mut ctx, &args), captured)
+            (run(&mut ctx, &first_args), captured)
         });
         let release = Release(Some(release));
         ready
             .recv_timeout(common::HANG)
             .expect("the first edit reached its request");
-        let staged = dirs.tokens().join("dev.token.agh-new");
-        assert_eq!(
-            std::fs::read_to_string(&staged).expect("the first stage"),
-            format!("{first}\n")
-        );
         let before = config_text(&dirs);
         let sent = fake.seen().len();
         for edit in ["same", "other", "remove"] {
-            let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{second}\n"));
+            let (mut ctx, captured) = person(root.path(), &fake, common::env());
             let exit = match edit {
-                "same" => run(&mut ctx, &args),
-                "other" => run(
-                    &mut ctx,
-                    &["auth", "add", "other", "--stdin", "--tier", "dev"],
-                ),
+                "same" => run(&mut ctx, &second_args),
+                "other" => run(&mut ctx, &other_args),
                 "remove" => run(&mut ctx, &["auth", "remove", "dev"]),
                 _ => unreachable!(),
             };
             assert_eq!(exit, 1, "{}", captured.stderr_text());
             assert_eq!(config_text(&dirs), before);
-            assert_eq!(
-                std::fs::read_to_string(&staged).expect("the held stage"),
-                format!("{first}\n")
-            );
-            assert_eq!(
-                std::fs::read_to_string(&token_file).expect("the earlier token"),
-                format!("{second}\n")
-            );
             assert_eq!(fake.seen().len(), sent, "a competing edit sent no request");
         }
         drop(release);
         let (exit, captured) = pending.join().expect("the first editor completed");
         assert_eq!(exit, 0, "{}", captured.stderr_text());
     });
+    let router = validated(&dirs);
+    let dev = router.profile("dev").expect("the dev profile");
+    assert_eq!(dev.login.as_deref(), Some("fixture-dev-bot"));
     assert_eq!(
-        std::fs::read_to_string(&token_file).expect("the first token"),
-        format!("{first}\n")
+        dev.source,
+        identity::Source::Entry(identity::VaultEntry::new("dev", &dirs.home))
     );
-    assert_eq!(
-        validated(&dirs)
-            .profile("dev")
-            .and_then(|p| p.login.as_deref()),
-        Some("fixture-dev-bot")
-    );
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{second}\n"));
-    assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
-    assert_eq!(
-        std::fs::read_to_string(&token_file).expect("the replacement token"),
-        format!("{second}\n")
-    );
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    assert_eq!(run(&mut ctx, &second_args), 0, "{}", captured.stderr_text());
     assert_eq!(
         validated(&dirs)
             .profile("dev")
             .and_then(|p| p.login.as_deref()),
         Some("fixture-reader")
     );
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{second}\n"));
-    assert_eq!(
-        run(
-            &mut ctx,
-            &["auth", "add", "other", "--stdin", "--tier", "dev"]
-        ),
-        0,
-        "{}",
-        captured.stderr_text()
-    );
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    assert_eq!(run(&mut ctx, &other_args), 0, "{}", captured.stderr_text());
     assert!(validated(&dirs).profile("other").is_some());
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
     assert_eq!(
@@ -428,12 +383,28 @@ fn auth_add_again_replaces_the_token_and_login_and_a_tier_change_is_refused() {
     );
     assert!(validated(&dirs).profile("dev").is_some());
     assert!(validated(&dirs).profile("other").is_none());
+    for (name, token) in [("dev", &first), ("dev-next", &second), ("other", &second)] {
+        let held = identity::vault_value(&dirs.home, name).expect("the store");
+        assert_eq!(
+            held.map(|value| value.expose().to_vec()),
+            Some(format!("{token}\n").into_bytes()),
+            "agh never writes a vault entry"
+        );
+    }
 
     let before = config_text(&dirs);
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{second}\n"));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
     let exit = run(
         &mut ctx,
-        &["auth", "add", "dev", "--stdin", "--tier", "external"],
+        &[
+            "auth",
+            "add",
+            "dev",
+            "--file",
+            &second_word,
+            "--tier",
+            "external",
+        ],
     );
     assert_eq!(exit, 1, "{}", captured.stderr_text());
     assert_eq!(config_text(&dirs), before);
@@ -447,16 +418,13 @@ fn auth_add_of_a_token_github_rejects_changes_nothing() {
     common::write_config(&dirs, COMMENTED);
     let before = config_text(&dirs);
     let rejected = agh_fake::token("rejected");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{rejected}\n"));
-    let mut args = ADD_DEV.to_vec();
+    let path = word(&vault_file(root.path(), "dev", &rejected));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    let mut args = add_dev(&path);
     args.push("json");
     assert_eq!(run(&mut ctx, &args), 4, "{}", captured.stderr_text());
     assert_eq!(config_text(&dirs), before);
-    assert!(
-        names_in(&dirs.tokens()).is_empty(),
-        "{:?}",
-        names_in(&dirs.tokens())
-    );
+    holds_no_token(&dirs);
     assert!(captured.stdout().is_empty());
 }
 
@@ -511,7 +479,7 @@ fn auth_add_from_a_private_file_names_it_in_place() {
         row.get("token_file").and_then(aterm_toml::Value::as_str),
         Some("~/tok/dev.token")
     );
-    assert!(names_in(&dirs.tokens()).is_empty());
+    holds_no_token(&dirs);
     assert_eq!(
         common::stdout_json(&captured)["source"],
         Value::from("file:~/tok/dev.token")
@@ -520,7 +488,7 @@ fn auth_add_from_a_private_file_names_it_in_place() {
 }
 
 #[test]
-fn auth_add_refuses_a_missing_file_a_long_stdin_and_a_loose_config_directory() {
+fn auth_add_refuses_a_missing_file_and_a_loose_config_directory() {
     let root = common::scratch("auth-refuse");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
@@ -530,14 +498,6 @@ fn auth_add_refuses_a_missing_file_a_long_stdin_and_a_loose_config_directory() {
     let exit = run(
         &mut ctx,
         &["auth", "add", "dev", "--file", &path, "--tier", "dev"],
-    );
-    assert_eq!(exit, 2, "{}", captured.stderr_text());
-
-    let long = "x".repeat(300);
-    let (mut ctx, captured) = person_with(root.path(), &fake, &long);
-    let exit = run(
-        &mut ctx,
-        &["auth", "add", "dev", "--stdin", "--tier", "dev"],
     );
     assert_eq!(exit, 2, "{}", captured.stderr_text());
     assert!(!dirs.config.exists());
@@ -551,56 +511,45 @@ fn auth_add_refuses_a_missing_file_a_long_stdin_and_a_loose_config_directory() {
     common::chmod(&dirs.config, 0o755);
     let token = agh_fake::token("loose-dir");
     fake.add_token(&token, "fixture-dev-bot");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
+    let file = word(&vault_file(root.path(), "dev", &token));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
     let exit = run(
         &mut ctx,
-        &["auth", "add", "dev", "--stdin", "--tier", "dev"],
+        &["auth", "add", "dev", "--file", &file, "--tier", "dev"],
     );
     assert_eq!(exit, 1, "{}", captured.stderr_text());
     assert_eq!(mode(&dirs.config), 0o755);
-    assert!(!dirs.tokens().exists());
-
-    common::chmod(&dirs.config, 0o700);
-    std::fs::DirBuilder::new()
-        .mode(0o755)
-        .create(dirs.tokens())
-        .expect("a loose tokens directory");
-    common::chmod(&dirs.tokens(), 0o755);
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
-    let exit = run(
-        &mut ctx,
-        &["auth", "add", "dev", "--stdin", "--tier", "dev"],
-    );
-    assert_eq!(exit, 1, "{}", captured.stderr_text());
-    assert_eq!(mode(&dirs.tokens()), 0o755);
     let error = common::error_json(&captured.stderr_text());
-    let why = error["why"].as_str().unwrap_or_default();
-    let tokens = dirs.tokens().display().to_string();
-    assert_eq!(why.matches(tokens.as_str()).count(), 1, "{why}");
     assert!(
         error["next"]
             .as_str()
             .is_some_and(|next| next.starts_with("chmod 700 ") && next.contains("chmod 755 ")),
         "{error}"
     );
+    assert!(fake.seen().is_empty(), "{:?}", fake.seen());
 }
 
 #[test]
 fn auth_add_checks_its_arguments() {
     let root = common::scratch("auth-args");
     let fake = FakeGithub::start();
+    let token = agh_fake::token("api-args");
+    fake.add_token(&token, "fixture-dev-bot");
+    let file = vault_file(root.path(), "dev", &token);
+    let f = word(&file);
+    let f = f.as_str();
     for args in [
-        &["auth", "add", "anonymous", "--stdin", "--tier", "dev"][..],
-        &["auth", "add", "Dev", "--stdin", "--tier", "dev"],
-        &["auth", "add", "dev", "--stdin", "--tier", "staging"],
-        &["auth", "add", "dev", "--stdin"],
+        &["auth", "add", "anonymous", "--file", f, "--tier", "dev"][..],
+        &["auth", "add", "Dev", "--file", f, "--tier", "dev"],
+        &["auth", "add", "dev", "--file", f, "--tier", "staging"],
+        &["auth", "add", "dev", "--file", f],
         &["auth", "add", "dev", "--tier", "dev"],
+        &["auth", "add", "dev", "--stdin", "--tier", "dev"],
         &[
-            "auth", "add", "dev", "--stdin", "--file", "/x", "--tier", "dev",
+            "auth", "add", "dev", "--file", f, "--tier", "dev", "--write",
         ],
-        &["auth", "add", "dev", "--stdin", "--tier", "dev", "--write"],
         &[
-            "auth", "add", "dev", "--stdin", "--tier", "dev", "--owner", "-bad",
+            "auth", "add", "dev", "--file", f, "--tier", "dev", "--owner", "-bad",
         ],
     ] {
         let (mut ctx, captured) = person(root.path(), &fake, common::env());
@@ -611,35 +560,29 @@ fn auth_add_checks_its_arguments() {
             captured.stderr_text()
         );
     }
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    assert_eq!(run(&mut ctx, &["auth", "add", "dev", "--tier", "dev"]), 2);
+    let error = common::error_json(&captured.stderr_text());
+    assert_eq!(
+        error["why"],
+        Value::from(
+            "name the token: --file ~/.secrets/NAME names the vault entry NAME in this Mac's \
+             store, or --file PATH a token file of your own"
+        ),
+        "{error}"
+    );
     assert!(!dirs(root.path()).config.exists());
 
     let dirs = dirs(root.path());
     let gh = common::github(Router::empty(), &fake);
-    let token = agh_fake::token("api-args");
-    fake.add_token(&token, "fixture-dev-bot");
     let mut req = identity::provision::AddRequest {
-        name: "../escape".to_string(),
-        from: identity::provision::AddFrom::Stdin,
+        name: String::new(),
+        file: file.clone(),
         tier: agh::policy::Tier::Dev,
         owners: Vec::new(),
         write: false,
         drafts: false,
     };
-    let mut stdin = std::io::Cursor::new(format!("{token}\n").into_bytes());
-    let error = identity::provision::add(&gh, &dirs, &req, &mut stdin)
-        .expect_err("the public API refuses traversal before creating its directory");
-    assert_eq!(error.kind, agh::error::Kind::Usage, "{error:?}");
-    assert_eq!(stdin.position(), 0);
-    assert!(!dirs.config.exists());
-
-    std::fs::create_dir_all(dirs.config.parent().expect("the config parent"))
-        .expect("the config parent");
-    aterm_uds::private_file::create_private_dir(&dirs.config).expect("the private config");
-    aterm_uds::private_file::create_private_dir(&dirs.tokens()).expect("the private tokens");
-    let sub = dirs.tokens().join("sub");
-    aterm_uds::private_file::create_private_dir(&sub).expect("a token subdirectory");
-    let sentinel = dirs.config.join("keep");
-    std::fs::write(&sentinel, b"kept outside tokens").expect("the owned sentinel");
     let absolute = root
         .path()
         .join("absolute")
@@ -648,29 +591,19 @@ fn auth_add_checks_its_arguments() {
         .to_string();
     for name in ["../escape", "sub/token", absolute.as_str()] {
         req.name = name.to_string();
-        let mut stdin = std::io::Cursor::new(format!("{token}\n").into_bytes());
-        let error = identity::provision::add(&gh, &dirs, &req, &mut stdin)
+        let error = identity::provision::add(&gh, &dirs, &req)
             .expect_err("the public API refuses a name outside the profile grammar");
         assert_eq!(error.kind, agh::error::Kind::Usage, "{name}: {error:?}");
-        assert_eq!(stdin.position(), 0);
-        assert_eq!(names_in(&dirs.config), ["keep", "tokens"]);
-        assert_eq!(names_in(&dirs.tokens()), ["sub"]);
-        assert!(names_in(&sub).is_empty());
-        assert!(!root.path().join("absolute.token.agh-new").exists());
-        assert_eq!(
-            std::fs::read(&sentinel).expect("the sentinel"),
-            b"kept outside tokens"
-        );
+        assert!(!dirs.config.exists(), "{name}");
         assert!(fake.seen().is_empty(), "{:?}", fake.seen());
     }
     req.name = "dev".to_string();
-    let mut stdin = std::io::Cursor::new(format!("{token}\n").into_bytes());
-    let added = identity::provision::add(&gh, &dirs, &req, &mut stdin)
+    let added = identity::provision::add(&gh, &dirs, &req)
         .expect("the same public API admits an ordinary profile");
     assert_eq!(added.login, "fixture-dev-bot");
     assert_eq!(
-        std::fs::read_to_string(added.token_file).expect("the token"),
-        format!("{token}\n")
+        added.source,
+        identity::Source::Entry(identity::VaultEntry::new("dev", &dirs.home))
     );
     assert_eq!(fake.seen().len(), 1);
 }
@@ -691,12 +624,15 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
     );
     let answer = common::stdout_json(&captured);
     assert_eq!(answer["profile"], Value::from("dev"));
-    assert_eq!(answer["token_file_deleted"], Value::from(false));
+    assert!(answer.get("token_file_deleted").is_none(), "{answer}");
     assert_eq!(
         answer["owners_edited"],
         aterm_json::json!(["fixture-dev", "alabsystems"])
     );
-    assert!(root.path().join("tokens").join("dev.token").exists());
+    assert!(
+        root.path().join("tokens").join("dev.token").exists(),
+        "its file is kept"
+    );
     let doc = parsed(&dirs);
     assert!(doc.get("profiles").and_then(|p| p.get("dev")).is_none());
     for name in ["fixture-dev", "alabsystems"] {
@@ -716,14 +652,17 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
 
     let token = agh_fake::token("own");
     fake.add_token(&token, "fixture-ext-bot");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
+    let ext = vault_file(root.path(), "ext", &token);
+    let path = word(&ext);
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
     let exit = run(
         &mut ctx,
         &[
             "auth",
             "add",
             "ext",
-            "--stdin",
+            "--file",
+            &path,
             "--tier",
             "external",
             "--owner",
@@ -731,8 +670,6 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
         ],
     );
     assert_eq!(exit, 0, "{}", captured.stderr_text());
-    assert!(dirs.tokens().join("ext.token").exists());
-    let stale = common::write_token(&dirs.tokens(), "ext.token.agh-new", &token);
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
     assert_eq!(
         run(&mut ctx, &["auth", "remove", "ext"]),
@@ -741,13 +678,9 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
         captured.stderr_text()
     );
     assert_eq!(
-        common::stdout_json(&captured)["token_file_deleted"],
-        Value::from(true)
-    );
-    assert!(!dirs.tokens().join("ext.token").exists());
-    assert_eq!(
-        std::fs::read_to_string(&stale).expect("the interrupted stage"),
-        format!("{token}\n")
+        std::fs::read_to_string(&ext).expect("the vault's file"),
+        format!("{token}\n"),
+        "removing a profile leaves the vault's file to the vault"
     );
 
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
@@ -777,7 +710,7 @@ fn auth_remove_drops_every_reference_and_only_its_own_token_file() {
 }
 
 #[test]
-fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
+fn an_occupied_edit_lock_refuses_and_is_kept() {
     fn make_fifo(path: &Path) -> Result<std::process::Output, aterm_uds::deadline::RunError> {
         let mut cmd = aterm_uds::spawnfd::command("mkfifo");
         cmd.arg(path);
@@ -789,116 +722,36 @@ fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
         .pop()
         .expect("one child result")
     }
-    let root = common::scratch("auth-staged");
+    let root = common::scratch("auth-lock");
     let fake = FakeGithub::start();
-    let token = agh_fake::token("staged");
+    let token = agh_fake::token("lock");
     fake.add_token(&token, "fixture-dev-bot");
     let dirs = dirs(root.path());
     common::write_config(&dirs, "");
     std::fs::remove_file(dirs.config_file()).expect("no agh.toml yet");
-    let staged = common::write_token(&dirs.tokens(), "dev.token.agh-new", &token);
-    let path = staged.display().to_string();
-    let (mut ctx, captured) = person(root.path(), &fake, common::env());
-    let exit = run(
-        &mut ctx,
-        &["auth", "add", "ci", "--file", &path, "--tier", "dev"],
-    );
-    assert_eq!(exit, 2, "{}", captured.stderr_text());
-    assert!(staged.exists(), "the person's token is kept");
-    assert!(!dirs.config_file().exists());
-    assert!(fake.seen().is_empty(), "{:?}", fake.seen());
-
-    let own = dirs.tokens().join("dev.token");
+    let file = word(&vault_file(root.path(), "dev", &token));
+    let args = [
+        "auth",
+        "add",
+        "dev",
+        "--file",
+        file.as_str(),
+        "--tier",
+        "dev",
+    ];
     let neighbor = common::write_token(root.path(), "kept-token", &token);
-    let other = agh_fake::token("other");
-    fake.add_token(&other, "fixture-dev-bot");
-    for kind in ["file", "link", "fifo"] {
-        let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{other}\n"));
-        assert_eq!(
-            run(
-                &mut ctx,
-                &["auth", "add", "dev", "--stdin", "--tier", "dev"]
-            ),
-            1,
-            "{kind}: {}",
-            captured.stderr_text()
-        );
-        assert!(!dirs.config_file().exists());
-        assert!(fake.seen().is_empty());
-        match kind {
-            "file" => {
-                assert_eq!(
-                    std::fs::read_to_string(&staged).expect("the occupied stage"),
-                    format!("{token}\n")
-                );
-                std::fs::remove_file(&staged).expect("remove the fixture's file");
-                std::os::unix::fs::symlink(&neighbor, &staged).expect("a fixture link");
-            }
-            "link" => {
-                assert!(
-                    std::fs::symlink_metadata(&staged)
-                        .expect("the link")
-                        .file_type()
-                        .is_symlink()
-                );
-                std::fs::remove_file(&staged).expect("remove the fixture's link");
-                let made = match make_fifo(&staged) {
-                    Ok(made) => made,
-                    Err(error) => {
-                        let kept = root.keep();
-                        panic!(
-                            "mkfifo did not reach confirmed EOF: {error}; retained {}",
-                            kept.display()
-                        );
-                    }
-                };
-                assert!(made.status.success(), "mkfifo: {made:?}");
-            }
-            "fifo" => {
-                use std::os::unix::fs::FileTypeExt as _;
-                assert!(
-                    std::fs::symlink_metadata(&staged)
-                        .expect("the FIFO")
-                        .file_type()
-                        .is_fifo()
-                );
-                std::fs::remove_file(&staged).expect("remove the fixture's FIFO");
-            }
-            _ => unreachable!(),
-        }
-    }
-    assert_eq!(
-        std::fs::read_to_string(&neighbor).expect("the link's target"),
-        format!("{token}\n")
-    );
     let lock = dirs.config.join(".auth-edit.lock");
     std::fs::write(&lock, b"occupied lock").expect("the fixture's lock file");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{other}\n"));
-    assert_eq!(
-        run(
-            &mut ctx,
-            &["auth", "add", "dev", "--stdin", "--tier", "dev"]
-        ),
-        1,
-        "{}",
-        captured.stderr_text()
-    );
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    assert_eq!(run(&mut ctx, &args), 1, "{}", captured.stderr_text());
     assert_eq!(
         std::fs::read(&lock).expect("the occupied lock"),
         b"occupied lock"
     );
     std::fs::remove_file(&lock).expect("remove the fixture's occupied lock");
     std::os::unix::fs::symlink(&neighbor, &lock).expect("a fixture lock link");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{other}\n"));
-    assert_eq!(
-        run(
-            &mut ctx,
-            &["auth", "add", "dev", "--stdin", "--tier", "dev"]
-        ),
-        1,
-        "{}",
-        captured.stderr_text()
-    );
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    assert_eq!(run(&mut ctx, &args), 1, "{}", captured.stderr_text());
     assert!(
         std::fs::symlink_metadata(&lock)
             .expect("the lock link")
@@ -921,16 +774,8 @@ fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
         }
     };
     assert!(made.status.success(), "mkfifo: {made:?}");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{other}\n"));
-    assert_eq!(
-        run(
-            &mut ctx,
-            &["auth", "add", "dev", "--stdin", "--tier", "dev"]
-        ),
-        1,
-        "{}",
-        captured.stderr_text()
-    );
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    assert_eq!(run(&mut ctx, &args), 1, "{}", captured.stderr_text());
     {
         use std::os::unix::fs::FileTypeExt as _;
         assert!(
@@ -943,55 +788,9 @@ fn a_staged_token_is_never_named_and_never_deleted_while_a_profile_names_it() {
     std::fs::remove_file(&lock).expect("remove the fixture's lock FIFO");
     assert!(!dirs.config_file().exists());
     assert!(fake.seen().is_empty());
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{other}\n"));
-    assert_eq!(
-        run(
-            &mut ctx,
-            &["auth", "add", "dev", "--stdin", "--tier", "dev"]
-        ),
-        0,
-        "{}",
-        captured.stderr_text()
-    );
-    assert!(!staged.exists());
-    assert_eq!(
-        std::fs::read_to_string(&own).expect("the new token"),
-        format!("{other}\n")
-    );
-    std::fs::remove_file(&own).expect("remove the fixture's new token");
-    common::write_token(&dirs.tokens(), "dev.token.agh-new", &token);
-    fake.clear_seen();
-
-    common::write_config(
-        &dirs,
-        &format!(
-            "[profiles.ci]\ntoken_file = \"{path}\"\ntier = \"dev\"\n\n\
-             [profiles.dev]\ntoken_file = \"{}\"\ntier = \"dev\"\n",
-            own.display()
-        ),
-    );
-    validated(&dirs);
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
-    assert_eq!(
-        run(&mut ctx, &["auth", "remove", "dev"]),
-        0,
-        "{}",
-        captured.stderr_text()
-    );
-    assert!(staged.exists(), "ci's token is kept");
-    let other = agh_fake::token("other");
-    fake.add_token(&other, "fixture-dev-bot");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{other}\n"));
-    let exit = run(
-        &mut ctx,
-        &["auth", "add", "dev", "--stdin", "--tier", "dev"],
-    );
-    assert_eq!(exit, 1, "{}", captured.stderr_text());
-    assert_eq!(
-        std::fs::read_to_string(&staged).expect("ci's token"),
-        format!("{token}\n")
-    );
-    assert!(!own.exists());
+    assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
+    validated(&dirs);
 }
 
 #[test]
@@ -999,29 +798,20 @@ fn auth_add_drafts_vouches_for_the_token_and_a_re_add_without_it_drops_the_line(
     let root = common::scratch("auth-drafts");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
+    let missing = root.path().join("no-such.token").display().to_string();
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
-    let exit = run(
-        &mut ctx,
-        &[
-            "auth",
-            "add",
-            "dev",
-            "--stdin",
-            "--tier",
-            "dev",
-            "--owner",
-            "fixture-dev",
-            "--drafts",
-        ],
-    );
-    assert_eq!(exit, 2, "{}", captured.stderr_text());
+    let mut args = add_dev(&missing);
+    args.insert(10, "--drafts");
+    args.push("json");
+    assert_eq!(run(&mut ctx, &args), 2, "{}", captured.stderr_text());
     assert!(!dirs.config.exists());
 
     let token = agh_fake::fine_grained_token("dev");
     fake.add_token(&token, "fixture-dev-bot");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
-    let mut args = ADD_DEV.to_vec();
-    args.insert(9, "--drafts");
+    let path = word(&vault_file(root.path(), "dev", &token));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    let mut args = add_dev(&path);
+    args.insert(10, "--drafts");
     args.push("json");
     assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
     let doc = parsed(&dirs);
@@ -1038,8 +828,8 @@ fn auth_add_drafts_vouches_for_the_token_and_a_re_add_without_it_drops_the_line(
     let gh = common::github(router, &fake);
     assert!(gh.drafts_vouched("dev"));
 
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
-    let mut args = ADD_DEV.to_vec();
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    let mut args = add_dev(&path);
     args.push("json");
     assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
     let doc = parsed(&dirs);
@@ -1217,9 +1007,9 @@ fn whoami_lists_present_absent_unusable_and_ambient_rows() {
     let gh_token = &rows[3];
     assert_eq!(gh_token["source"], Value::from("env:GH_TOKEN"));
     assert!(
-        gh_token["remedy"]
-            .as_str()
-            .is_some_and(|r| r.contains("GH_TOKEN")),
+        gh_token["remedy"].as_str().is_some_and(
+            |r| r == "never used: agh reads tokens only from the vault and agh.toml's profiles"
+        ),
         "{gh_token}"
     );
     assert_eq!(
@@ -1474,8 +1264,7 @@ fn auth_remove_refuses_a_file_that_is_already_invalid_and_changes_nothing() {
     let root = common::scratch("auth-remove-invalid");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
-    common::write_config(&dirs, ""); // the private config directory, for tokens/
-    let token = common::write_token(&dirs.tokens(), "b.token", &agh_fake::token("shared"));
+    let token = vault_file(root.path(), "b", &agh_fake::token("shared"));
     let text = format!(
         "[profiles.a]\ntoken_file = \"{shared}\"\ntier = \"dev\"\n\n[profiles.b]\ntoken_file = \"{shared}\"\ntier = \"dev\"\n",
         shared = token.display()
@@ -1509,8 +1298,7 @@ fn auth_remove_of_a_linked_agh_directory_gives_the_loads_refusal() {
         config: root.path().join("elsewhere").join("agh"),
         ..dirs.clone()
     };
-    common::write_config(&real, "");
-    let token = common::write_token(&real.tokens(), "dev.token", &agh_fake::token("linked"));
+    let token = vault_file(root.path(), "dev", &agh_fake::token("linked"));
     let text = format!(
         "[profiles.dev]\ntoken_file = \"{}\"\ntier = \"dev\"\n",
         token.display()
@@ -1544,39 +1332,25 @@ fn auth_remove_of_a_linked_agh_directory_gives_the_loads_refusal() {
 }
 
 #[test]
-fn a_linked_tokens_directory_is_never_deleted_from() {
-    let root = common::scratch("auth-linked-tokens");
+fn auth_remove_never_deletes_a_token_file() {
+    let root = common::scratch("auth-remove-keeps");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
     let secrets = root.path().join("secrets");
-    let token = common::write_token(&secrets, "dev.token", &agh_fake::token("linked-tokens"));
+    let token = common::write_token(&secrets, "dev.token", &agh_fake::token("kept"));
     let beside = common::write_token(&secrets, "dev.token.agh-new", &agh_fake::token("beside"));
     let text = format!(
         "[profiles.dev]\ntoken_file = \"{}\"\ntier = \"dev\"\n",
         token.display()
     );
     common::write_config(&dirs, &text);
-    std::os::unix::fs::symlink(&secrets, dirs.tokens()).expect("the link");
     validated(&dirs);
-
-    let (mut ctx, captured) = person_with(root.path(), &fake, "");
-    let exit = run(
-        &mut ctx,
-        &["auth", "add", "dev", "--stdin", "--tier", "dev"],
-    );
-    assert_eq!(exit, 2, "{}", captured.stderr_text());
-    assert!(beside.exists(), "a usage error deletes nothing");
-
     let (mut ctx, captured) = person(root.path(), &fake, common::env());
     assert_eq!(
         run(&mut ctx, &["auth", "remove", "dev"]),
         0,
         "{}",
         captured.stderr_text()
-    );
-    assert_eq!(
-        common::stdout_json(&captured)["token_file_deleted"],
-        Value::from(false)
     );
     assert!(token.exists(), "the person's token is kept");
     assert!(beside.exists(), "the file beside it is kept");
@@ -1604,10 +1378,11 @@ fn auth_add_under_a_parent_it_cannot_write_could_not_run() {
     }
     let token = agh_fake::token("unwritable");
     fake.add_token(&token, "fixture-dev-bot");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
+    let file = word(&vault_file(root.path(), "dev", &token));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
     let exit = run(
         &mut ctx,
-        &["auth", "add", "dev", "--stdin", "--tier", "dev"],
+        &["auth", "add", "dev", "--file", &file, "--tier", "dev"],
     );
     common::chmod(parent, 0o700);
     assert_eq!(exit, 3, "{}", captured.stderr_text());
@@ -1622,9 +1397,8 @@ fn auth_remove_edits_an_inline_default_table() {
     let root = common::scratch("auth-remove-inline");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
-    common::write_config(&dirs, ""); // the private config directory, for tokens/
-    let a = common::write_token(&dirs.tokens(), "a.token", &agh_fake::token("inline-a"));
-    let b = common::write_token(&dirs.tokens(), "b.token", &agh_fake::token("inline-b"));
+    let a = vault_file(root.path(), "a", &agh_fake::token("inline-a"));
+    let b = vault_file(root.path(), "b", &agh_fake::token("inline-b"));
     let text = format!(
         "default = {{ read = [\"a\", \"b\", \"anonymous\"] }}\n\n[profiles.a]\ntoken_file = \"{}\"\ntier = \"dev\"\n\n[profiles.b]\ntoken_file = \"{}\"\ntier = \"dev\"\n",
         a.display(),
@@ -1675,6 +1449,8 @@ fn auth_add_re_provisions_an_inline_profile_row_and_drops_its_reach_claim() {
     fake.add_token(&new, "fixture-reader");
     let dirs = dirs(root.path());
     let old_file = common::write_token(&root.path().join("elsewhere"), "dev.token", &old);
+    let new_file = vault_file(root.path(), "dev", &new);
+    let new_word = word(&new_file);
     for (case, text) in [
         (
             "an inline row",
@@ -1697,10 +1473,10 @@ fn auth_add_re_provisions_an_inline_profile_row_and_drops_its_reach_claim() {
             before.profile("dev").is_some_and(|p| p.covers_all_repos),
             "{case}"
         );
-        let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{new}\n"));
+        let (mut ctx, captured) = person(root.path(), &fake, common::env());
         let exit = run(
             &mut ctx,
-            &["auth", "add", "dev", "--stdin", "--tier", "dev"],
+            &["auth", "add", "dev", "--file", &new_word, "--tier", "dev"],
         );
         assert_eq!(exit, 0, "{case}: {}", captured.stderr_text());
         let router = validated(&dirs);
@@ -1709,7 +1485,7 @@ fn auth_add_re_provisions_an_inline_profile_row_and_drops_its_reach_claim() {
         assert!(!profile.covers_all_repos, "{case}");
         assert_eq!(
             profile.source,
-            identity::Source::File(dirs.tokens().join("dev.token")),
+            identity::Source::Entry(identity::VaultEntry::new("dev", &dirs.home)),
             "{case}"
         );
     }
@@ -1725,8 +1501,9 @@ fn auth_add_refuses_an_inline_owners_array_before_any_request() {
     let text = "owners = [{ name = \"fixture-dev\", tier = \"dev\", read = [\"anonymous\"] }]\n";
     common::write_config(&dirs, text);
     validated(&dirs);
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
-    let mut args = ADD_DEV.to_vec();
+    let path = word(&vault_file(root.path(), "dev", &token));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    let mut args = add_dev(&path);
     args.push("json");
     assert_eq!(run(&mut ctx, &args), 2, "{}", captured.stderr_text());
     let error = common::error_json(&captured.stderr_text());
@@ -1737,7 +1514,7 @@ fn auth_add_refuses_an_inline_owners_array_before_any_request() {
         "{error}"
     );
     assert!(fake.seen().is_empty(), "{:?}", fake.seen());
-    assert!(names_in(&dirs.tokens()).is_empty());
+    holds_no_token(&dirs);
     assert_eq!(config_text(&dirs), text);
 }
 
@@ -1746,9 +1523,8 @@ fn auth_remove_edits_an_inline_owners_array() {
     let root = common::scratch("auth-remove-inline-owners");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
-    common::write_config(&dirs, ""); // the private config directory, for tokens/
-    let a = common::write_token(&dirs.tokens(), "a.token", &agh_fake::token("owners-a"));
-    let b = common::write_token(&dirs.tokens(), "b.token", &agh_fake::token("owners-b"));
+    let a = vault_file(root.path(), "a", &agh_fake::token("owners-a"));
+    let b = vault_file(root.path(), "b", &agh_fake::token("owners-b"));
     let text = format!(
         "owners = [{{ name = \"fixture-dev\", tier = \"dev\", read = [\"a\", \"b\"], write = \"b\" }}, {{ name = \"fixture-ext\", tier = \"dev\", read = [\"a\"] }}]\n\n[profiles.a]\ntoken_file = \"{}\"\ntier = \"dev\"\nlogin = \"fixture-reader\"\n\n[profiles.b]\ntoken_file = \"{}\"\ntier = \"dev\"\nlogin = \"fixture-dev-bot\"\n",
         a.display(),
@@ -1777,7 +1553,8 @@ fn auth_add_refuses_anonymous() {
     let fake = FakeGithub::start();
     let token = agh_fake::token("anonymous-add");
     fake.add_token(&token, "fixture-dev-bot");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
+    let file = word(&vault_file(root.path(), "dev", &token));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
     let exit = run(
         &mut ctx,
         &[
@@ -1785,7 +1562,8 @@ fn auth_add_refuses_anonymous() {
             "auth",
             "add",
             "dev",
-            "--stdin",
+            "--file",
+            &file,
             "--tier",
             "dev",
         ],
@@ -1832,23 +1610,28 @@ fn an_ambient_token_a_profile_names_is_reported_as_that_profiles() {
     let root = common::scratch("whoami-ambient-used");
     let fake = FakeGithub::start();
     let dirs = dirs(root.path());
+    let ambient = agh_fake::token("ambient-used");
+    let file = vault_file(root.path(), "mine", &ambient);
     common::write_config(
         &dirs,
-        "[profiles.mine]\nenv = \"GH_TOKEN\"\ntier = \"dev\"\n",
+        &format!(
+            "[profiles.mine]\ntoken_file = \"{}\"\ntier = \"dev\"\n",
+            file.display()
+        ),
     );
-    let ambient = agh_fake::token("ambient-used");
     let env = MapEnv::new().with("GH_TOKEN", &ambient);
     let (mut ctx, captured) = common::ctx(root.path(), &fake, env);
     assert_eq!(run(&mut ctx, &["whoami"]), 0, "{}", captured.stderr_text());
     let rows = identity_rows(&captured);
     assert_eq!(rows[0]["profile"], Value::from("mine"));
-    assert_eq!(rows[0]["source"], Value::from("env:GH_TOKEN"));
+    assert_eq!(rows[0]["source"], Value::from("vault:mine"));
     let ambient_row = &rows[1];
     assert!(ambient_row["profile"].is_null(), "{ambient_row}");
-    assert!(
-        ambient_row["remedy"]
-            .as_str()
-            .is_some_and(|r| r.contains("mine")),
+    assert_eq!(
+        ambient_row["remedy"],
+        Value::from(
+            "never used: it is profile mine's token, which agh reads from that profile's vault entry or file"
+        ),
         "{ambient_row}"
     );
 }
@@ -1859,8 +1642,9 @@ fn auth_add_meters_the_get_user_it_sends_as_the_new_token() {
     let fake = FakeGithub::start();
     let token = agh_fake::token("metered");
     fake.add_token(&token, "fixture-dev-bot");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
-    let mut args = ADD_DEV.to_vec();
+    let path = word(&vault_file(root.path(), "dev", &token));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
+    let mut args = add_dev(&path);
     args.extend(["json", "--meta"]);
     assert_eq!(run(&mut ctx, &args), 0, "{}", captured.stderr_text());
     let stderr = captured.stderr_text();
@@ -1879,29 +1663,22 @@ fn auth_add_refuses_a_token_file_agh_toml_cannot_name() {
     use std::os::unix::ffi::OsStrExt;
     let root = common::scratch("auth-not-utf8");
     let fake = FakeGithub::start();
-    let token = agh_fake::token("not-utf8");
-    fake.add_token(&token, "fixture-dev-bot");
     let (mut ctx, _captured) = person(root.path(), &fake, common::env());
     let gh = ctx.github().expect("the client");
-    let mut odd = dirs(root.path());
-    odd.config = root
-        .path()
-        .join(std::ffi::OsStr::from_bytes(b"cfg-\xff"))
-        .join("agh");
+    let dirs = dirs(root.path());
     let req = identity::provision::AddRequest {
         name: "dev".to_string(),
-        from: identity::provision::AddFrom::Stdin,
+        file: root.path().join(std::ffi::OsStr::from_bytes(b"tok-\xff")),
         tier: agh::policy::Tier::Dev,
         owners: Vec::new(),
         write: false,
         drafts: false,
     };
-    let mut stdin = std::io::Cursor::new(format!("{token}\n").into_bytes());
-    let error = identity::provision::add(&gh, &odd, &req, &mut stdin)
+    let error = identity::provision::add(&gh, &dirs, &req)
         .expect_err("a path that is not UTF-8 is refused");
     assert_eq!(error.kind, agh::error::Kind::Usage, "{error:?}");
     assert!(fake.seen().is_empty(), "{:?}", fake.seen());
-    assert!(!odd.config.exists());
+    assert!(!dirs.config.exists());
 }
 
 #[test]
@@ -1918,11 +1695,12 @@ fn a_loose_config_directory_with_a_space_gets_a_quoted_chmod() {
         .create(&spaced.config)
         .expect("a loose config directory");
     common::chmod(&spaced.config, 0o755);
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
+    let file = word(&vault_file(root.path(), "dev", &token));
+    let (mut ctx, captured) = person(root.path(), &fake, common::env());
     ctx.dirs = Some(spaced.clone());
     let exit = run(
         &mut ctx,
-        &["auth", "add", "dev", "--stdin", "--tier", "dev"],
+        &["auth", "add", "dev", "--file", &file, "--tier", "dev"],
     );
     assert_eq!(exit, 1, "{}", captured.stderr_text());
     assert_eq!(mode(&spaced.config), 0o755);
@@ -2013,30 +1791,6 @@ fn legacy_loose_accepts_a_loose_file_and_marks_the_row() {
         .expect("agh.toml loads")
         .expect("agh.toml");
     assert!(!plain.profiles()["dev"].legacy_loose());
-}
-
-#[test]
-fn legacy_loose_refuses_stdin() {
-    let root = common::scratch("auth-loose-stdin");
-    let fake = FakeGithub::start();
-    let token = agh_fake::token("loose-stdin");
-    fake.add_token(&token, "fixture-dev-bot");
-    let (mut ctx, captured) = person_with(root.path(), &fake, &format!("{token}\n"));
-    let exit = run(
-        &mut ctx,
-        &[
-            "auth",
-            "add",
-            "dev",
-            "--stdin",
-            "--tier",
-            "dev",
-            "--legacy-loose",
-        ],
-    );
-    assert_eq!(exit, 2, "{}", captured.stderr_text());
-    assert!(fake.seen().is_empty(), "{:?}", fake.seen());
-    assert!(!dirs(root.path()).config.exists());
 }
 
 #[test]

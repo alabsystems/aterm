@@ -384,12 +384,12 @@ impl NeedWatch {
     }
 
     /// The `(node, sid, leaf)` of a session or node face this watch reads: `/f/<F>/pub/<node>/
-    /// <sid>/ev` or `…/presence`, its node a principal and its sid a session's (`s-…`) or the
+    /// <sid>/ev` or `…/presence`, its node a principal and its sid a session id (`subject::is_session_id`) or the
     /// node's own (`node`).
     fn face<'a>(&self, subject: &'a str) -> Option<(&'a str, &'a str, &'static str)> {
         let principal = |node: &str, sid: &str| {
             crate::subject::is_principal(node)
-                && (sid == "node" || (sid.starts_with("s-") && crate::subject::is_principal(sid)))
+                && (sid == "node" || crate::subject::is_session_id(sid))
         };
         ["ev", "presence"].into_iter().find_map(|leaf| {
             fabric_brief::owner(&self.fleet, subject, leaf)

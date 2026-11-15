@@ -1416,6 +1416,38 @@ fn cli_refuses_invocations_that_would_drop_a_safety_answer() {
     }
 }
 
+/// `accept-check-failure` names a check whose FAIL an owner may accept, its report and its
+/// reason, and nothing else. Negative controls: a source-shape check, a word that names no
+/// release check, and a missing or extra word are each refused.
+#[test]
+fn accept_check_failure_parses_only_a_test_class_check_with_its_report_and_reason() {
+    for check in ["test", "spec", "appkit", "measure"] {
+        let Ok(cli::Cmd::AcceptCheck {
+            check: parsed,
+            report,
+            reason,
+        }) = parse(&["accept-check-failure", check, "/logs/06-verify.log", "why"])
+        else {
+            panic!("accept-check-failure {check} parses");
+        };
+        assert_eq!(parsed.name(), check);
+        assert_eq!(report, std::path::Path::new("/logs/06-verify.log"));
+        assert_eq!(reason, "why");
+    }
+    for bad in [
+        &["accept-check-failure", "lint", "/logs/06-verify.log", "why"][..],
+        &["accept-check-failure", "candidate-shim", "/l", "why"],
+        &["accept-check-failure", "census", "/l", "why"],
+        &["accept-check-failure", "export", "/l", "why"],
+        &["accept-check-failure", "test", "/l"],
+        &["accept-check-failure", "test"],
+        &["accept-check-failure"],
+        &["accept-check-failure", "test", "/l", "why", "more"],
+    ] {
+        assert!(parse(bad).is_err(), "CONTROL: {bad:?}");
+    }
+}
+
 /// `cut --sign` can read the journal's Linux declaration and keeps the credential
 /// profile it was handed: the parse the release's step 7 depends on.
 #[test]

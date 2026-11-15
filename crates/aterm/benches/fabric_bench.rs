@@ -29,8 +29,7 @@ mod harness;
 #[path = "../tests/fabric_bench/census.rs"]
 mod census;
 #[cfg(unix)]
-#[path = "../tests/fabric_bench/clock.rs"]
-mod clock;
+use aterm_bench::head_sampling as clock;
 #[cfg(unix)]
 #[path = "../tests/fabric_bench/profile.rs"]
 #[expect(

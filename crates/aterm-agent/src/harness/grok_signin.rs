@@ -62,8 +62,9 @@
 //!   label `adopt-default` gives; printed in the caller's terminal as a link and published on its
 //!   session ([`Owner`]). Where a renewal can approve Grok's page headlessly
 //!   ([`Cli::renews_headlessly`]) it leads with the once-ever step that makes the next sign-in
-//!   automatic ([`Setup`]: one sign-in in aterm's browser window where one that opens a window is
-//!   installed or the pinned one can be fetched, else the row's mailbox in the vault) and keeps
+//!   automatic ([`Setup`]: one sign-in in aterm's browser window, after installing a browser that
+//!   opens one where none is installed or fetchable; never a credential, which the vault holds
+//!   and the need ledger asks the lab for, `mailbox:<label>`) and keeps
 //!   the code and the page as the immediate alternative. While accounts.x.ai answers the
 //!   headless browser with its block page (design §5 (g)) no setup makes a sign-in automatic, so
 //!   the need is the code and the page alone.
@@ -198,8 +199,10 @@ fn counts(file: &Path) -> bool {
 
 /// Whether the login file `file` is one grok would start on: there, non-empty, and not refused
 /// ([`refused_marker`] at least as new as it). Every reader of a Grok login outside this gate
-/// that decides whether grok may start (a worker's sign-in floor) asks this, so none reads a
-/// login grok refused as signed in.
+/// that decides whether it signs grok in (a running session's observed login,
+/// [`super::observe::grok`], and a stored login's lapse,
+/// [`crate::ai::connector::stored_login_lapsed`]) asks this, so none reads a login grok refused
+/// as signed in.
 #[must_use]
 pub fn login_accepted(file: &Path) -> bool {
     counts(file)
@@ -382,32 +385,26 @@ pub const ADOPT_LABEL: &str = super::cli::ACCOUNTS_OWN_LABEL;
 
 /// The once-ever step that makes every later Grok Build sign-in on this machine automatic: the
 /// need leads with it ([`need_words`], [`needs_you_line`]) where a renewal can approve Grok's
-/// page headlessly ([`Cli::renews_headlessly`], [`Ladder::need_setup`]). It names only steps
-/// that work on this machine, in the order they run: `accounts browser` only where it opens a
-/// window here (`window`, [`super::browser_window::WindowRoute::reachable`]: a desk that opens
-/// one, and a Chromium that opens one installed, or the pinned Chrome for Testing fetched first
-/// where no fetch of it failed lately), else the mailbox first.
+/// page headlessly ([`Cli::renews_headlessly`], [`Ladder::need_setup`]). Each is a person's own
+/// act (a vendor sign-in, or the row's email), never a credential: the row's mailbox comes from
+/// the vault, and a row with none has `mailbox:<label>` filed in the need ledger
+/// ([`LiveAuto::row`]), which asks the lab's Macs. It names only steps that work on this
+/// machine, in the order they run: `accounts browser` where it opens a window here (`window`,
+/// [`super::browser_window::WindowRoute::reachable`]: a desk that opens one, and a Chromium that
+/// opens one installed, or the pinned Chrome for Testing fetched first where no fetch of it
+/// failed lately), else such a browser installed first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Setup {
     /// The row has an email and `accounts browser` opens a window here: one sign-in in aterm's
     /// own browser window (`aterm harness accounts browser <label> --cli grok`, which keeps the
-    /// row's profile signed in to x.ai), or the row's mailbox in the vault (`ai-mailbox.toml`),
-    /// which reads the code x.ai mails.
+    /// row's profile signed in to x.ai).
     Window(String),
     /// The row has an email and `accounts browser` opens no window here (no desk to open one
-    /// on, or none installed and the pinned one's fetch failed or cannot run): the row's mailbox
-    /// in the vault, or such a browser installed first.
-    Mailbox(String),
-    /// As [`Setup::Mailbox`], but the row's mailbox is in the vault already and its
-    /// `[[mailboxes]]` entry has no password yet: that password filled in.
-    MailboxPassword {
-        /// The row's label.
-        label: String,
-        /// The masked mailbox login ([`super::mailbox_routes::mask_login`]).
-        login: String,
-    },
+    /// on, or none installed and the pinned one's fetch failed or cannot run): such a browser
+    /// installed first, then that sign-in.
+    Chromium(String),
     /// The row names no email, which the window and the mailbox both need: add it first, then the
-    /// window where `window`, else the mailbox.
+    /// sign-in in aterm's window (after installing a browser that opens one where not `window`).
     Email {
         /// The row's label.
         label: String,
@@ -415,8 +412,8 @@ pub enum Setup {
         window: bool,
     },
     /// No row signs the default home in: adopt it under `label` (one the roster does not list,
-    /// [`adopt_label`]), with its email, first; then the window where `window`, else the
-    /// mailbox.
+    /// [`adopt_label`]), with its email, first; then the sign-in in aterm's window (after
+    /// installing a browser that opens one where not `window`).
     Adopt {
         /// The label to adopt the default home under.
         label: String,
@@ -431,10 +428,7 @@ impl Setup {
     fn short(&self) -> String {
         match self {
             Setup::Window(label) => format!("once: sign {label} in at the desk"),
-            Setup::Mailbox(label) => format!("once: {label}'s mailbox in the vault"),
-            Setup::MailboxPassword { login, .. } => {
-                format!("once: {login}'s password in the vault")
-            }
+            Setup::Chromium(label) => format!("once: a window browser, then sign {label} in"),
             Setup::Email { label, .. } => format!("once: an email on {label}'s grok row"),
             Setup::Adopt { label, .. } => format!("once: adopt the default home as {label}"),
         }
@@ -443,8 +437,9 @@ impl Setup {
     /// The command or file the short words name, after the page in the attention entry.
     fn exact(&self) -> String {
         match self {
-            Setup::Window(label) => Step::Browser(Cli::Grok, label.clone()).to_string(),
-            Setup::Mailbox(_) | Setup::MailboxPassword { .. } => "ai-mailbox.toml".to_owned(),
+            Setup::Window(label) | Setup::Chromium(label) => {
+                Step::Browser(Cli::Grok, label.clone()).to_string()
+            }
             Setup::Email { .. } => "email = \"…\" in Grok Build's roster".to_owned(),
             Setup::Adopt { label, .. } => Step::AdoptDefault(Cli::Grok, label.clone()).to_string(),
         }
@@ -453,49 +448,30 @@ impl Setup {
     /// Its words in the terminal's `NEEDS YOU:` line: the steps in the order they run, each one
     /// that works on this machine.
     fn sentence(&self) -> String {
-        /// After a first step: the window, else the mailbox, and the other as the alternative.
-        fn then(label: &str, window: bool) -> String {
+        /// The sign-in in aterm's window: run where one opens here, else after installing a
+        /// browser that opens one.
+        fn sign_in(label: &str, window: bool) -> String {
+            let step = Step::Browser(Cli::Grok, label.to_owned());
             if window {
-                format!(
-                    "then run `{}` at this machine's desk and sign in there, or put that email's \
-                     mailbox in the vault (ai-mailbox.toml)",
-                    Step::Browser(Cli::Grok, label.to_owned())
-                )
+                format!("run `{step}` at this machine's desk and sign in there")
             } else {
                 format!(
-                    "then put that email's mailbox in the vault (ai-mailbox.toml), or install a \
-                     Chromium that opens a window (Google Chrome for Testing or Chromium) and \
-                     run `{}` at this machine's desk",
-                    Step::Browser(Cli::Grok, label.to_owned())
+                    "install a Chromium that opens a window (Google Chrome for Testing or \
+                     Chromium) and run `{step}` at this machine's desk"
                 )
             }
         }
         match self {
-            Setup::Window(label) => format!(
-                "run `{}` at this machine's desk and sign in there, or put {label}'s mailbox in \
-                 the vault (ai-mailbox.toml)",
-                Step::Browser(Cli::Grok, label.clone())
-            ),
-            Setup::Mailbox(label) => format!(
-                "put {label}'s mailbox in the vault (ai-mailbox.toml), or install a Chromium that \
-                 opens a window (Google Chrome for Testing or Chromium) and run `{}` at this \
-                 machine's desk",
-                Step::Browser(Cli::Grok, label.clone())
-            ),
-            Setup::MailboxPassword { label, login } => format!(
-                "fill in the password of mailbox {login} (its [[mailboxes]] entry in the vault's \
-                 ai-mailbox.toml), or install a Chromium that opens a window (Google Chrome for \
-                 Testing or Chromium) and run `{}` at this machine's desk",
-                Step::Browser(Cli::Grok, label.clone())
-            ),
+            Setup::Window(label) => sign_in(label, true),
+            Setup::Chromium(label) => sign_in(label, false),
             Setup::Email { label, window } => format!(
-                "add `email = \"…\"` to {label}'s row in Grok Build's roster, {}",
-                then(label, *window)
+                "add `email = \"…\"` to {label}'s row in Grok Build's roster, then {}",
+                sign_in(label, *window)
             ),
             Setup::Adopt { label, window } => format!(
-                "run `{}` with your x.ai email, {}",
+                "run `{}` with your x.ai email, then {}",
                 Step::AdoptDefault(Cli::Grok, label.clone()),
-                then(label, *window)
+                sign_in(label, *window)
             ),
         }
     }
@@ -668,6 +644,9 @@ pub struct Ladder {
     /// password yet, the masked login of that entry
     /// ([`super::headless_oauth::VendorApprover::mailbox_unready`]).
     pub mailbox_unready: Option<String>,
+    /// Where the row has an email and no mailbox, whether `mailbox:<label>` stands filed in the
+    /// need ledger ([`LiveAuto::row`]): the record says so, and no person is asked for it.
+    pub mailbox_filed: bool,
     /// The headless browser.
     pub browser: Browser,
     /// `accounts browser` opens a window here: this desk opens one, and a Chromium that opens
@@ -691,6 +670,7 @@ impl Ladder {
             profile: false,
             mailbox: false,
             mailbox_unready: None,
+            mailbox_filed: false,
             browser: Browser::Missing(why.to_owned()),
             window: false,
             adopt: ADOPT_LABEL.to_owned(),
@@ -728,20 +708,15 @@ impl Ladder {
                 window: self.window,
             },
             (_, Some(_)) if self.window => Setup::Window(self.label.clone()),
-            (_, Some(_)) => match (&self.mailbox_unready, self.mailbox) {
-                (Some(login), false) => Setup::MailboxPassword {
-                    label: self.label.clone(),
-                    login: login.clone(),
-                },
-                _ => Setup::Mailbox(self.label.clone()),
-            },
+            (_, Some(_)) => Setup::Chromium(self.label.clone()),
         }
     }
 
     /// What it found, one line in the ladder's order (never the email):
     /// `row(main, the default home's) profile(none) mailbox(none configured)
     /// headless-browser(none installed)`; a mailbox whose entry has no password yet reads
-    /// `mailbox(ab…@… has no password yet)`.
+    /// `mailbox(ab…@… has no password yet)`, and either ends `; filed mailbox:<label>` where
+    /// that want stands filed ([`Ladder::mailbox_filed`]).
     #[must_use]
     pub fn words(&self) -> String {
         format!(
@@ -760,8 +735,18 @@ impl Ladder {
             if self.profile { "ready" } else { "none" },
             match (self.mailbox, &self.mailbox_unready) {
                 (true, _) => "ready".to_owned(),
-                (false, Some(login)) => format!("{login} has no password yet"),
-                (false, None) => "none configured".to_owned(),
+                (false, unready) => format!(
+                    "{}{}",
+                    unready.as_ref().map_or_else(
+                        || "none configured".to_owned(),
+                        |login| format!("{login} has no password yet")
+                    ),
+                    if self.mailbox_filed {
+                        format!("; filed mailbox:{}", self.label)
+                    } else {
+                        String::new()
+                    }
+                ),
             },
             match &self.browser {
                 Browser::Found => "found".to_owned(),
@@ -854,6 +839,7 @@ struct RowRead {
     profile: bool,
     mailbox: bool,
     mailbox_unready: Option<String>,
+    mailbox_filed: bool,
     adopt: String,
     approver: super::headless_oauth::VendorApprover,
 }
@@ -881,7 +867,10 @@ impl LiveAuto {
     /// rung is skipped, never guessed); the profile [`super::headless_oauth::row_browser_profile`]
     /// names, the one `accounts browser` opens; and the mailbox configured for its email, which
     /// alone lets the approver type that email into x.ai's page (x.ai mails a code nobody would
-    /// read otherwise).
+    /// read otherwise). Where the rung could use one ([`Cli::renews_headlessly`]) and the row
+    /// has an email but no mailbox, `mailbox:<label>` is filed in the need ledger, which asks
+    /// the lab's Macs; once its mailbox holds, a standing filing is met
+    /// ([`super::accounts_sync::mailbox_need`]).
     fn row(&self) -> Option<RowRead> {
         let store = self.store.as_ref()?;
         let roster = self
@@ -908,7 +897,17 @@ impl LiveAuto {
             .mailbox_unready_login
             .clone()
             .filter(|_| email.is_some() && !mailbox);
+        let filed = self.home.as_deref().and_then(|home| {
+            row_mailbox_need(
+                home,
+                &label,
+                email.is_some(),
+                mailbox,
+                Cli::Grok.renews_headlessly(),
+            )
+        });
         Some(RowRead {
+            mailbox_filed: !mailbox && filed.is_some(),
             label,
             from,
             email,
@@ -919,6 +918,23 @@ impl LiveAuto {
             approver,
         })
     }
+}
+
+/// The row's `mailbox:<label>` need: filed where the automatic step could use a mailbox
+/// (`renews`) and the row has an `email` but no `mailbox`, met once its mailbox holds
+/// ([`super::accounts_sync::mailbox_need`]); the need's line, or `None` where nothing moved. The
+/// want names the vault's per-label entries (`<label>_password`, `<label>_totp`), which no pool
+/// owns, so a label two pools share shares its need.
+fn row_mailbox_need(
+    home: &Path,
+    label: &str,
+    email: bool,
+    mailbox: bool,
+    renews: bool,
+) -> Option<String> {
+    (email && renews)
+        .then(|| super::accounts_sync::mailbox_need(home, label, mailbox))
+        .flatten()
 }
 
 impl Auto for LiveAuto {
@@ -957,6 +973,7 @@ impl Auto for LiveAuto {
             profile: read.profile,
             mailbox: read.mailbox,
             mailbox_unready: read.mailbox_unready,
+            mailbox_filed: read.mailbox_filed,
             browser,
             window: super::browser_window::window_route(home).reachable(),
             adopt: read.adopt,

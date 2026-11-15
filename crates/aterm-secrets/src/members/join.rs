@@ -3,15 +3,16 @@
 
 //! The joining Mac's flow (`aterm members join`, `docs/DESIGN-fluid-swarm-2026-10-28.md`
 //! §3.3.1): ask every member it found, all at once; then run the phrase a person typed with the
-//! member that shows it, write `~/.secrets` from that member's bundle (F10's interim handover),
+//! member that shows it, write this Mac's vault configuration from that member's bundle (F10's
+//! interim handover, which keeps none of the bundle's values),
 //! ask the vault's server with the `Allowed`, and tell the other members it was let in. How a
 //! member is reached is the caller's: the CLI dials the `ask` ALPN, a test a stream pair.
 
 use super::bundle::Handed;
 use super::desk::Answer;
 use super::joiner::{self, Greeting, Joining};
+use crate::client::Report;
 use crate::client::{self, Paths};
-use crate::materialize::Report;
 use crate::phrase::Phrase;
 use crate::{Error, Result};
 use std::collections::BTreeSet;
@@ -366,7 +367,7 @@ pub struct Joined {
     pub member: String,
     /// The machine name it was allowed under.
     pub name: String,
-    /// What the bundle wrote to `~/.secrets`.
+    /// The entries this Mac reads in place from its store, the names alone.
     pub report: Report,
     /// How the vault holds this Mac now.
     pub admission: Admission,
@@ -402,9 +403,10 @@ impl std::fmt::Display for PhraseFailed {
 }
 
 /// Run `phrase` with the member [`pick`] chooses from `heard`, write this Mac's vault
-/// configuration and `~/.secrets` from its bundle (from the membership log where the bundle
-/// carries it, else from the member's `[everyone]` files, after which this Mac asks the vault's
-/// server with its `Allowed`), and tell every other member in `heard` that this Mac was let in.
+/// configuration from its bundle (and its records, where the bundle carries the membership log,
+/// whose entries this Mac then reads in place; else, from the member's `[everyone]` files, keeping
+/// none of their values, after which this Mac asks the vault's server with its `Allowed`), and
+/// tell every other member in `heard` that this Mac was let in.
 ///
 /// A member busy with a vault pass answers before its run touches the phrase, naming how long
 /// the phrase has left (`left=`): this Mac says so once (`say`, one line) and runs the same

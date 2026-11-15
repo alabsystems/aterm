@@ -1136,8 +1136,8 @@ fn standin_stage(_: &Ctx, spec: &StageSpec) -> Report {
 }
 
 /// Run by [`one_interrupt_in_two_memory_waits_ends_the_run`] in a process of its own: a verify
-/// run of `doc` and `libc` under `--admit wait`, their independent lanes claiming 8.4 and 10.8
-/// GiB (19.2 of the run's 21.5 together, so both wait in the ledger at once), its interrupt
+/// run of `lint` and `test` under `--admit wait`, the lint's and the test compile's independent
+/// lanes claiming 8.4 and 10.8 GiB (19.2 of the run's 21.5 together, so both wait in the ledger at once), its interrupt
 /// handling verify's own, that exits as verify does.
 #[test]
 fn standin_run_waits_for_memory() {
@@ -1148,10 +1148,10 @@ fn standin_run_waits_for_memory() {
     let scratch = dir.join("scratch");
     std::fs::create_dir_all(&scratch).expect("the run's scratch");
     let b = book(&dir);
-    keep(&b, &dir, StageId::Doctests, 7);
-    keep(&b, &dir, StageId::LibcOracle, 9);
+    keep(&b, &dir, StageId::Tippy, 7);
+    keep(&b, &dir, StageId::TestCompile, 9);
     let ctx = Ctx::new(dir.clone(), gui(), EnvSnapshot::default(), scratch)
-        .with_checks(&[Check::Doc, Check::Libc])
+        .with_checks(&[Check::Lint, Check::Test])
         .with_quiet(Some(Admit::Wait))
         .with_memory(b);
     let mut out = std::io::stdout();

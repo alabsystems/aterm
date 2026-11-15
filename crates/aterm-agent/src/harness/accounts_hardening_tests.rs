@@ -9,7 +9,6 @@
 //! upkeep does. Every fixture email is `example.test`.
 
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -554,17 +553,22 @@ fn mailbox_admission_conforms_and_rejects_lost_history() {
 
 /// What an earlier sync left in `~/.secrets`: aterm's own copy of a list found on this Mac,
 /// written an hour ago, naming `old@` beside `a1@`.
-fn stale_copy(desk: &Desk) -> PathBuf {
-    let secrets = desk.home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
-    let copy = secrets.join(FLEET_ROSTER_FILE);
-    let found = FleetRoster::from_toml(
+fn stale_text() -> String {
+    FleetRoster::from_toml(
         "[[account]]\nlabel = \"m27\"\nmachines = [\"m27\"]\nemail = \"a1@example.test\"\n\n\
          [[account]]\nlabel = \"m27-2\"\nmachines = [\"m27\"]\nemail = \"old@example.test\"\n",
         "fixture",
     )
-    .unwrap();
-    fs::write(&copy, found.to_toml_for(Some(OptIn::Discovered))).unwrap();
+    .unwrap()
+    .to_toml_for(Some(OptIn::Discovered))
+}
+
+/// The fleet roster an earlier build wrote to `~/.secrets`, which no sync reads.
+fn stale_copy(desk: &Desk) -> PathBuf {
+    let secrets = desk.home.join(".secrets");
+    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
+    let copy = secrets.join(FLEET_ROSTER_FILE);
+    fs::write(&copy, stale_text()).unwrap();
     set_mtime(&copy, SystemTime::now() - Duration::from_secs(3600));
     copy
 }
@@ -593,11 +597,10 @@ fn named_sync(desk: &Desk) {
     sync_accounts_with(&env, Some(named.to_str().unwrap()), None, &how).expect("named sync");
 }
 
-/// A copy aterm wrote to `~/.secrets` before a person synced a named list is superseded by it:
-/// no later sync reads the copy, so the account the named list dropped stays dropped, and the
-/// copy is left as it was. The first automatic read records retirement even if the rows are
-/// already settled; a later timestamp cannot undo it. An initially unretired vault delivery
-/// keeps its precedence however old it is.
+/// A copy an earlier build wrote to `~/.secrets` is never read: once a person syncs a named
+/// list, no automatic sync is due, the account the named list dropped stays dropped, and the copy
+/// is left as it was. CONTROL: the same roster delivered by the store keeps its precedence over
+/// the named list, so an automatic sync is due.
 #[test]
 fn a_named_sync_supersedes_the_copy_aterm_wrote_before_it() {
     let desk = Desk::new("m27");
@@ -608,18 +611,12 @@ fn a_named_sync_supersedes_the_copy_aterm_wrote_before_it() {
     let named = ["a1@example.test", "new@example.test"];
     assert_eq!(emails(&desk), named);
     assert!(
-        needs_init_accounts_sync(&desk.home, &desk.state, &desk.roster(), NOW + 1),
-        "the replacement still needs durable retirement"
+        !needs_init_accounts_sync(&desk.home, &desk.state, &desk.roster(), NOW + 1),
+        "the copy is not a source"
     );
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW + 2).expect("sync");
     assert_eq!(emails(&desk), named, "`old@` stays dropped");
     assert_eq!(fs::read(&copy).unwrap(), kept, "the copy is left as it was");
-    assert!(!needs_init_accounts_sync(
-        &desk.home,
-        &desk.state,
-        &desk.roster(),
-        NOW + 2
-    ));
     let config = desk.config.join("aterm.toml");
     assert_eq!(
         fleet_origin(
@@ -634,28 +631,9 @@ fn a_named_sync_supersedes_the_copy_aterm_wrote_before_it() {
         }
     );
 
-    set_mtime(&copy, SystemTime::now() + Duration::from_secs(60));
-    assert!(
-        !needs_init_accounts_sync(&desk.home, &desk.state, &desk.roster(), NOW + 3),
-        "a newer timestamp cannot undo retirement"
-    );
-
     let desk = Desk::new("m27");
     desk.default_login("a1@example.test");
-    let copy = stale_copy(&desk);
-    let dir = desk.home.join(".config/aterm/secrets");
-    fs::create_dir_all(&dir).unwrap();
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let state = dir.join("state.toml");
-    fs::write(
-        &state,
-        format!(
-            "membership = \"in\"\nseq = 1\n\n[manifest]\n\"{FLEET_ROSTER_FILE}\" = \"{}\"\n",
-            aterm_secrets::materialize::digest_hex(&fs::read(&copy).unwrap())
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&state, fs::Permissions::from_mode(0o600)).unwrap();
+    crate::vault_entry::seed(&desk.home, &[(FLEET_ROSTER_FILE, stale_text().as_bytes())]);
     named_sync(&desk);
     assert!(
         needs_init_accounts_sync(&desk.home, &desk.state, &desk.roster(), NOW + 1),

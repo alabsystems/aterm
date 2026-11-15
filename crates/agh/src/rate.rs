@@ -12,8 +12,10 @@ use crate::error::{Error, IdentityRef, Kind, Sub};
 
 mod attribution;
 mod cache;
+mod cutter;
 mod usage;
 pub(crate) use attribution::parent_chain;
+pub use cutter::in_cut_tree;
 
 /// One resource's limit as GitHub last reported it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,7 +152,8 @@ pub struct RateBook {
 
 /// Held through a background attempt and its quota-header update. Sixteen fixed
 /// lock stripes serialize every local process of an identity without accumulating
-/// lock files when credentials rotate. The cutter takes none of these locks.
+/// lock files when credentials rotate. A client built as the cutter (no reserve) takes none of
+/// these locks; a process in a cut's tree ([`in_cut_tree`]) takes them as any other does.
 pub(crate) struct BackgroundGuard {
     #[cfg(unix)]
     _held: Option<aterm_uds::private_file::PrivateLock>,
@@ -256,7 +259,9 @@ impl RateBook {
     /// Background core reads stop before the cutter's reserve. This snapshot is
     /// shared by every local client of the identity; each fleet Mac enforces it
     /// against GitHub's shared counter. A 1000-request margin absorbs in-flight
-    /// fleet reads; it is not an independent budget on each Mac.
+    /// fleet reads; it is not an independent budget on each Mac. The caller sends
+    /// a read this refuses only from inside a cut's own process tree
+    /// ([`in_cut_tree`]), which the reserve is kept for.
     #[must_use]
     pub fn refuse_background(&self, key: &str, now: u64, reserve: u64) -> Option<Error> {
         if reserve == 0 {

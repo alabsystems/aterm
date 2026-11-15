@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::WindowId;
 
 #[test]
 fn allocation_open_cancels_a_deferred_last_tab_window_close() {

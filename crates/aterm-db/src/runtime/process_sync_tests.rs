@@ -394,16 +394,21 @@ fn records(paths: &Paths, table: Scope, until: Instant) -> crate::Result<Records
         .collect())
 }
 
-fn wait_records(paths: &Paths, table: Scope, expected: &Records) {
+fn wait_records(paths: &Paths, table: Scope, expected: &Records, phase: &str) {
     let until = Instant::now() + HANG;
     loop {
         let actual = records(paths, table, until);
-        match &actual {
-            Ok(actual) if actual == expected => return,
-            Err(error) if !error.is_busy() => panic!("table observation failed: {error}"),
-            _ => {}
+        // A live enrollment or witness publication may refuse an observation. Only the
+        // complete expected records satisfy this wait; a persistent refusal fails at HANG.
+        if actual.as_ref().is_ok_and(|actual| actual == expected) {
+            return;
         }
-        assert!(Instant::now() < until, "table did not repair: {actual:?}");
+        assert!(
+            Instant::now() < until,
+            "{phase}: table {:?} did not repair {} records: {actual:?}",
+            table.digest(),
+            expected.len(),
+        );
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -474,25 +479,40 @@ fn separate_processes_enroll_then_repair_external_writes_and_later_tables() {
     source.matched(&configs[0], table.scope);
     recipient.matched(&configs[1], table.scope);
     assert!(lab.bootstrap(1).witness().unwrap().is_some());
-    wait_records(&lab.paths[1], table.scope, &expected);
+    wait_records(&lab.paths[1], table.scope, &expected, "initial enrollment");
 
     // Both independent processes have completed matching scans. These writes
     // originate outside them; the test neither restarts them nor clears their caches.
     let forward = br#"{"key":"source-after-warmup","quantity":2}"#;
     let forward_id = append(&lab.paths[0], &table, false, forward);
     expected.insert(forward_id, forward.to_vec());
-    wait_records(&lab.paths[1], table.scope, &expected);
+    wait_records(
+        &lab.paths[1],
+        table.scope,
+        &expected,
+        "external forward write",
+    );
     let reverse = br#"{"key":"recipient-after-warmup","quantity":3}"#;
     let reverse_id = append(&lab.paths[1], &table, false, reverse);
     expected.insert(reverse_id, reverse.to_vec());
-    wait_records(&lab.paths[0], table.scope, &expected);
+    wait_records(
+        &lab.paths[0],
+        table.scope,
+        &expected,
+        "external reverse write",
+    );
 
     let later =
         Descriptor::application(lab.bootstrap(0).trust(), "warm-processes", "later", 1).unwrap();
     let later_payload = br#"{"key":"later-table","quantity":4}"#;
     let later_id = append(&lab.paths[0], &later, true, later_payload);
     let later_expected = Records::from([(later_id, later_payload.to_vec())]);
-    wait_records(&lab.paths[1], later.scope, &later_expected);
+    wait_records(
+        &lab.paths[1],
+        later.scope,
+        &later_expected,
+        "later declared table",
+    );
     for (config, (pid, identity)) in configs.iter().zip([
         (source.id(), &identities[0]),
         (recipient.id(), &identities[1]),

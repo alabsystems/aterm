@@ -6,8 +6,8 @@
 
 use super::*;
 
-const A: &str = "s-a";
-const B: &str = "s-b";
+const A: &str = "ta000000000";
+const B: &str = "tb000000000";
 
 /// [`advertising`], its connection having said `Hello` as an attach's has: the reclaim
 /// needs the broker's retire verb and the log it serves.
@@ -65,8 +65,8 @@ fn mailed_then_b_left(
     reader: &mut Conn,
 ) -> (String, String, u64) {
     *lane.outbox.lock().unwrap() = Some(
-        "post sid=s-a id=1 to=@s-b kind=note len=2\nhi\
-         post sid=s-b id=1 to=@s-a kind=note len=2\nho"
+        "post sid=ta000000000 id=1 to=@tb000000000 kind=note len=2\nhi\
+         post sid=tb000000000 id=1 to=@ta000000000 kind=note len=2\nho"
             .to_string(),
     );
     bridge.drain_outbox();
@@ -86,7 +86,7 @@ fn mailed_then_b_left(
 /// **A DEPARTED SESSION'S LANE AND ROW GO BACK, AND NOTHING ROUTES TO IT AFTER**: the
 /// sweep that first finds B gone gives nothing back; once its wait has passed, the lane
 /// to B and B's presence row leave the index, the budget is two subjects lighter, and B's
-/// pin goes, so a bare `@s-b` and an explicit `@s-b@<node>` are both unroutable. Nothing
+/// pin goes, so a bare `@tb000000000` and an explicit `@tb000000000@<node>` are both unroutable. Nothing
 /// of A's goes. A pin written again past the retire finds no route either: the row is
 /// gone.
 #[cfg(unix)]
@@ -123,15 +123,17 @@ fn a_departed_sessions_lane_and_row_go_back_and_nothing_routes_to_it_after() {
     assert!(bridge.reclaim.is_empty(), "{:?}", bridge.reclaim);
     assert!(!bridge.state.pins().contains_key(B), "B's pin stayed");
     assert_eq!(
-        bridge.resolve_to("@s-b", Some(A)).unwrap(),
+        bridge.resolve_to("@tb000000000", Some(A)).unwrap(),
         Route::Unroutable
     );
     assert_eq!(
-        bridge.resolve_to(&format!("@s-b@{node}"), Some(A)).unwrap(),
+        bridge
+            .resolve_to(&format!("@tb000000000@{node}"), Some(A))
+            .unwrap(),
         Route::Unroutable
     );
     assert_eq!(
-        bridge.resolve_to("@s-a", Some(A)).unwrap(),
+        bridge.resolve_to("@ta000000000", Some(A)).unwrap(),
         Route::To(format!("/f/f/in/{node}/{A}/{node}"))
     );
 
@@ -144,7 +146,7 @@ fn a_departed_sessions_lane_and_row_go_back_and_nothing_routes_to_it_after() {
 
     bridge.state.pin(B, &node).unwrap();
     assert_eq!(
-        bridge.resolve_to("@s-b", Some(A)).unwrap(),
+        bridge.resolve_to("@tb000000000", Some(A)).unwrap(),
         Route::Unroutable,
         "a pin to a node that advertises no row for the sid routed"
     );
@@ -175,7 +177,7 @@ fn a_session_back_after_its_subjects_went_is_advertised_again_and_routes() {
         row.is_some_and(|row| row.contains("state=live")),
         "B was not advertised again"
     );
-    for to in ["@s-b".to_string(), format!("@s-b@{node}")] {
+    for to in ["@tb000000000".to_string(), format!("@tb000000000@{node}")] {
         assert_eq!(
             bridge.resolve_to(&to, Some(A)).unwrap(),
             Route::To(format!("/f/f/in/{node}/{B}/{node}")),
@@ -208,8 +210,8 @@ fn a_departed_session_with_a_post_still_reserved_keeps_its_subjects() {
     assert_eq!(spent(&bridge, &mut reader), before - 2);
 }
 
-/// Another node, `n-..fa`, its node row live and `s-x` live on it, written by its own
-/// producer: the connection that writes its rows, and the subject of `s-x`'s row.
+/// Another node, `n-..fa`, its node row live and `tx000000000` live on it, written by its own
+/// producer: the connection that writes its rows, and the subject of `tx000000000`'s row.
 fn far_node_with_s_x(bridge: &Bridge) -> (Conn, String) {
     let (mut peer, _) = bridge.connect().unwrap();
     peer.publish(
@@ -219,7 +221,7 @@ fn far_node_with_s_x(bridge: &Bridge) -> (Conn, String) {
         b"v=1 t=1 state=live inc=1",
     )
     .unwrap();
-    let x_row = subject::session_face("f", FAR, "s-x", "presence");
+    let x_row = subject::session_face("f", FAR, "tx000000000", "presence");
     peer.publish(FAR_PRODUCER, 2, &x_row, b"v=1 t=1 inc=1 state=live")
         .unwrap();
     (peer, x_row)
@@ -228,23 +230,25 @@ fn far_node_with_s_x(bridge: &Bridge) -> (Conn, String) {
 const FAR: &str = "n-00000000000000fa";
 const FAR_PRODUCER: u64 = 9_000;
 
-/// A's post to `to`, drained: the lane it lands on, which this node writes to `s-x`.
+/// A's post to `to`, drained: the lane it lands on, which this node writes to `tx000000000`.
 fn a_posts_to(lane: &FakeVerbLane, bridge: &mut Bridge, reader: &mut Conn, to: &str) -> String {
-    *lane.outbox.lock().unwrap() = Some(format!("post sid=s-a id=7 to={to} kind=note len=2\nhi"));
+    *lane.outbox.lock().unwrap() = Some(format!(
+        "post sid=ta000000000 id=7 to={to} kind=note len=2\nhi"
+    ));
     bridge.drain_outbox();
     bridge.settle_acks();
-    let to_x = format!("/f/f/in/{FAR}/s-x/{}/note", bridge.node);
+    let to_x = format!("/f/f/in/{FAR}/tx000000000/{}/note", bridge.node);
     assert!(
         indexed(reader, &to_x).is_some(),
-        "the lane to s-x was not written"
+        "the lane to tx000000000 was not written"
     );
     to_x
 }
 
 /// **A LANE TO ANOTHER NODE'S DEPARTED SESSION GOES BACK, WITH NOTHING ON THIS NODE TO
-/// SAY IT LEFT**: A mails `s-x` on another node, whose row then reads `exited`. That is
+/// SAY IT LEFT**: A mails `tx000000000` on another node, whose row then reads `exited`. That is
 /// no event here (no session of this node left, no attach), yet the lane A wrote keeps the
-/// sweep looking: the sweeps that follow find `s-x` gone, and once the wait has passed the
+/// sweep looking: the sweeps that follow find `tx000000000` gone, and once the wait has passed the
 /// lane, which only this node is charged for, leaves the index. Nothing of the other
 /// node's goes, and with no lane to another node left the sweep is owed nothing more.
 #[cfg(unix)]
@@ -256,7 +260,12 @@ fn a_lane_to_another_nodes_departed_session_goes_back() {
         !bridge.reclaim_remote,
         "a lane to another node before any post"
     );
-    let to_x = a_posts_to(&lane, &mut bridge, &mut reader, &format!("@s-x@{FAR}"));
+    let to_x = a_posts_to(
+        &lane,
+        &mut bridge,
+        &mut reader,
+        &format!("@tx000000000@{FAR}"),
+    );
     assert!(
         bridge.reclaim_remote && bridge.sweep_owed(),
         "a lane to another node's session owes no sweep"
@@ -269,9 +278,12 @@ fn a_lane_to_another_nodes_departed_session_goes_back() {
     assert_eq!(
         spent(&bridge, &mut reader),
         before,
-        "s-x is live on its node: its lane stays"
+        "tx000000000 is live on its node: its lane stays"
     );
-    assert!(bridge.sweep_owed(), "the sweep stopped looking at s-x");
+    assert!(
+        bridge.sweep_owed(),
+        "the sweep stopped looking at tx000000000"
+    );
 
     peer.publish(FAR_PRODUCER, 3, &x_row, b"v=1 t=2 inc=1 state=exited")
         .unwrap();
@@ -294,29 +306,29 @@ fn a_lane_to_another_nodes_departed_session_goes_back() {
 }
 
 /// **A SESSION WHOSE NODE GAVE ITS ROW BACK IS UNROUTABLE FROM ANOTHER NODE**: A posts
-/// to a bare `@s-x`, which pins `s-x` to its node. `s-x` leaves, and its node's own
-/// reclaim gives its row back. Neither the explicit `@s-x@<node>` nor the pinned bare
-/// `@s-x` routes then, before this node's sweep or after it; this node's sweep gives its
+/// to a bare `@tx000000000`, which pins `tx000000000` to its node. `tx000000000` leaves, and its node's own
+/// reclaim gives its row back. Neither the explicit `@tx000000000@<node>` nor the pinned bare
+/// `@tx000000000` routes then, before this node's sweep or after it; this node's sweep gives its
 /// lane back and drops the pin. An address naming that node and a sid it never had is no
-/// route either. CONTROL: `s-x` live again on its node routes both forms.
+/// route either. CONTROL: `tx000000000` live again on its node routes both forms.
 #[cfg(unix)]
 #[test]
 fn a_session_whose_node_gave_its_row_back_is_unroutable_from_another_node() {
     let (lane, mut bridge, _push, mut reader, _server) = attached(&[(1, A)]);
     let (mut peer, x_row) = far_node_with_s_x(&bridge);
-    let to_x = a_posts_to(&lane, &mut bridge, &mut reader, "@s-x");
+    let to_x = a_posts_to(&lane, &mut bridge, &mut reader, "@tx000000000");
     assert_eq!(
-        bridge.state.pins().get("s-x").map(String::as_str),
+        bridge.state.pins().get("tx000000000").map(String::as_str),
         Some(FAR)
     );
-    let explicit = format!("@s-x@{FAR}");
-    let lane_to_x = Route::To(format!("/f/f/in/{FAR}/s-x/{}", bridge.node));
-    for to in ["@s-x", explicit.as_str()] {
+    let explicit = format!("@tx000000000@{FAR}");
+    let lane_to_x = Route::To(format!("/f/f/in/{FAR}/tx000000000/{}", bridge.node));
+    for to in ["@tx000000000", explicit.as_str()] {
         assert_eq!(bridge.resolve_to(to, Some(A)).unwrap(), lane_to_x, "{to}");
     }
     assert_eq!(
         bridge
-            .resolve_to(&format!("@s-never@{FAR}"), Some(A))
+            .resolve_to(&format!("@tnever00000@{FAR}"), Some(A))
             .unwrap(),
         Route::Unroutable,
         "a sid the named node never advertised"
@@ -324,7 +336,7 @@ fn a_session_whose_node_gave_its_row_back_is_unroutable_from_another_node() {
 
     peer.publish(FAR_PRODUCER, 3, &x_row, b"v=1 t=2 inc=1 state=exited")
         .unwrap();
-    for to in ["@s-x", explicit.as_str()] {
+    for to in ["@tx000000000", explicit.as_str()] {
         assert_eq!(
             bridge.resolve_to(to, Some(A)).unwrap(),
             Route::Unroutable,
@@ -333,10 +345,10 @@ fn a_session_whose_node_gave_its_row_back_is_unroutable_from_another_node() {
     }
     let (_, moot) = peer
         .retire_subject(FAR_PRODUCER, &x_row)
-        .expect("the far node gives s-x's row back");
+        .expect("the far node gives tx000000000's row back");
     assert!(!moot, "the far row's retire was moot");
     assert_eq!(indexed(&mut reader, &x_row), None);
-    for to in ["@s-x", explicit.as_str()] {
+    for to in ["@tx000000000", explicit.as_str()] {
         assert_eq!(
             bridge.resolve_to(to, Some(A)).unwrap(),
             Route::Unroutable,
@@ -347,9 +359,17 @@ fn a_session_whose_node_gave_its_row_back_is_unroutable_from_another_node() {
     bridge.retire_ghost_presence();
     wait_passed(&mut bridge);
     bridge.retire_ghost_presence();
-    assert_eq!(indexed(&mut reader, &to_x), None, "the lane to s-x stayed");
-    assert_eq!(bridge.state.pins().get("s-x"), None, "s-x's pin stayed");
-    for to in ["@s-x", explicit.as_str()] {
+    assert_eq!(
+        indexed(&mut reader, &to_x),
+        None,
+        "the lane to tx000000000 stayed"
+    );
+    assert_eq!(
+        bridge.state.pins().get("tx000000000"),
+        None,
+        "tx000000000's pin stayed"
+    );
+    for to in ["@tx000000000", explicit.as_str()] {
         assert_eq!(
             bridge.resolve_to(to, Some(A)).unwrap(),
             Route::Unroutable,
@@ -359,7 +379,7 @@ fn a_session_whose_node_gave_its_row_back_is_unroutable_from_another_node() {
 
     peer.publish(FAR_PRODUCER, 4, &x_row, b"v=1 t=3 inc=2 state=live")
         .unwrap();
-    for to in ["@s-x", explicit.as_str()] {
+    for to in ["@tx000000000", explicit.as_str()] {
         assert_eq!(
             bridge.resolve_to(to, Some(A)).unwrap(),
             lane_to_x,
@@ -476,7 +496,7 @@ fn a_session_revived_between_the_read_and_the_retire_keeps_its_row_and_its_pin()
         "a revived session lost its pin"
     );
     assert_eq!(
-        bridge.resolve_to("@s-b", Some(A)).unwrap(),
+        bridge.resolve_to("@tb000000000", Some(A)).unwrap(),
         Route::To(format!("/f/f/in/{node}/{B}/{node}"))
     );
 
@@ -487,7 +507,7 @@ fn a_session_revived_between_the_read_and_the_retire_keeps_its_row_and_its_pin()
 }
 
 /// **A PIN A KILLED BRIDGE LEFT BEHIND ITS RETIRES GOES AT THE NEXT ATTACH**: the reclaim
-/// gave back everything this node held of B (here) and of `s-x` (on another node, whose
+/// gave back everything this node held of B (here) and of `tx000000000` (on another node, whose
 /// own reclaim gave its row back), and the bridge died before it dropped their pins. The
 /// next bridge tracks nothing; its attach's sweep reads the pinned nodes, finds nothing of
 /// either held, and drops both pins.
@@ -497,7 +517,7 @@ fn a_pin_a_killed_bridge_left_behind_its_retires_goes_at_the_next_attach() {
     let (lane, mut bridge, mut push, mut reader, _server) = attached(&[(1, A), (2, B)]);
     let (_, to_b, _) = mailed_then_b_left(&lane, &mut bridge, &mut push, &mut reader);
     let (mut peer, x_row) = far_node_with_s_x(&bridge);
-    let to_x = a_posts_to(&lane, &mut bridge, &mut reader, "@s-x");
+    let to_x = a_posts_to(&lane, &mut bridge, &mut reader, "@tx000000000");
     let node = bridge.node.clone();
     bridge.state.pin(B, &node).unwrap();
     peer.publish(FAR_PRODUCER, 3, &x_row, b"v=1 t=2 inc=1 state=exited")
@@ -520,12 +540,15 @@ fn a_pin_a_killed_bridge_left_behind_its_retires_goes_at_the_next_attach() {
     bridge.reclaim.clear();
     bridge.reclaim_owed = false;
     bridge.reclaim_remote = false;
-    assert!(bridge.state.pins().contains_key(B) && bridge.state.pins().contains_key("s-x"));
+    assert!(bridge.state.pins().contains_key(B) && bridge.state.pins().contains_key("tx000000000"));
 
     assert!(bridge.attach_broker(), "the attach");
     let pins = bridge.state.pins();
     assert!(!pins.contains_key(B), "B's pin stayed: {pins:?}");
-    assert!(!pins.contains_key("s-x"), "s-x's pin stayed: {pins:?}");
+    assert!(
+        !pins.contains_key("tx000000000"),
+        "tx000000000's pin stayed: {pins:?}"
+    );
 }
 
 /// **ONLY A REFUSAL FOR GOOD SWITCHES THE RECLAIM OFF, AND ONLY UNTIL THE NEXT ATTACH**: a
@@ -573,7 +596,7 @@ fn an_address_naming_this_node_and_a_sid_with_no_row_is_unroutable() {
     let node = bridge.node.clone();
     assert_eq!(
         bridge
-            .resolve_to(&format!("@s-never@{node}"), Some(A))
+            .resolve_to(&format!("@tnever00000@{node}"), Some(A))
             .unwrap(),
         Route::Unroutable
     );

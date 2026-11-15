@@ -62,7 +62,7 @@ fn credential(
         "credential-material",
         client::entry::read_publication_material(&scope.paths, &config, name),
     )?
-    .ok_or_else(|| Error::new("probe awaits an authenticated materialized GitHub credential"))?;
+    .ok_or_else(|| Error::new("probe awaits an authenticated GitHub credential in the store"))?;
     let current = guarded(scope, journal, entry.snapshot(), deadline);
     let http = super::diagnosed(
         "credential-client",
@@ -136,13 +136,15 @@ pub(super) fn notary_profile(
     journal: &Journal,
     deadline: Instant,
 ) -> Result<String> {
-    scope.require(&journal.subject, deadline)?;
-    let modern = scope.paths.home.join(super::super::RELEASE_PROFILE);
-    let bytes = crate::fsx::read_private(&modern, super::super::MAX_READ)?
-        .ok_or_else(|| Error::new("probe has no authorized release profile"))?;
+    let config = scope.require(&journal.subject, deadline)?;
+    // The release profile is the store's entry, read in place; no file under the home is read.
+    let profile =
+        client::read_verified_entry(&scope.paths, &config, super::super::RELEASE_PROFILE)?
+            .ok_or_else(|| Error::new("probe has no authorized release profile"))?;
     // Parse only the public profile-name assignment. Do not copy the profile's private
     // signing key into an extra TOML value merely to read one nonsecret field.
-    let text = bytes
+    let text = profile
+        .value()
         .as_str()
         .ok_or_else(|| Error::new("probe release profile is not UTF-8"))?;
     parse_notary_profile_text(text)

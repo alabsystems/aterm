@@ -194,3 +194,56 @@ fn a_login_successors_hold_off_counts_one_failure_once_and_starts_over() {
         "the next end is a first"
     );
 }
+
+/// A LOST LOGIN'S MOVE WHOSE SUCCESSOR NEVER ATTACHED HOLDS ITS DESTINATION OFF FOR THE SOURCE: its
+/// session is handed back on the login it lost, where the same wall asks again, so its end is
+/// noted against the source's identity and the destination's login and generation, and no new
+/// move onto that destination is created until the rung passes. A successor that attached clears
+/// it, as a renewal's does. A usage-limit handoff's end is still struck instead.
+#[test]
+fn a_lost_logins_move_whose_successor_never_attached_holds_its_destination_off() {
+    let (_tmp, mut env, fixture, _) = super::super::tests::fixture();
+    env.now = 1_000_000;
+    let mut moved = fixture.clone();
+    moved.intent.purpose = Purpose::LoginRotation;
+    moved.destination = Some(Identity::from_native("target", "user"));
+    let until = |env: &Env| {
+        with_receipt_writer(env, |writer| {
+            writer.unattached_login_until(&moved.intent.identity, &moved.new_auth, moved.generation)
+        })
+        .unwrap()
+        .unwrap()
+    };
+    let create = |env: &Env, receipt: &Receipt| {
+        with_receipt_writer(env, |writer| writer.create(receipt)).map(|_| receipt.id.clone())
+    };
+    assert!(create(&env, &root(&moved, "31", Phase::Ready, moved.generation)).is_ok());
+    let ended = end_unattached(
+        &env,
+        &root(&moved, "32", Phase::Committing, moved.generation),
+    );
+    with_receipt_writer(&env, |writer| writer.note_unattached_login(&ended))
+        .unwrap()
+        .unwrap();
+    assert_eq!(until(&env), Some(env.now + accounts::NO_RESET_WALL_S[0]));
+    assert_eq!(
+        create(&env, &root(&moved, "33", Phase::Ready, moved.generation)),
+        Err("successor-never-attached")
+    );
+    // Another source's sessions are not held off that destination.
+    let mut other = root(&moved, "34", Phase::Ready, moved.generation);
+    other.intent.identity = Identity::from_native("another-source", "user");
+    assert!(create(&env, &other).is_ok());
+
+    let mut attached = root(&moved, "35", Phase::Committed, moved.generation);
+    attached.successor_pid = Some(77);
+    attached.successor_birth = Some(7_700);
+    assert_eq!(
+        with_receipt_writer(&env, |writer| {
+            write_receipt(&env, &attached)?;
+            writer.note_attached_login(&attached)
+        }),
+        Ok(Some(()))
+    );
+    assert_eq!(until(&env), None, "an attach clears the hold-off");
+}

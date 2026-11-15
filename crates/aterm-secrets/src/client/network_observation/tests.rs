@@ -138,8 +138,8 @@ fn actual_url_body_is_recorded_but_unchanged_poll_cache_and_raw_replay_do_not_re
     assert!(applied.sequence() > fresh.sequence());
     assert_eq!(applied.sequence(), published.seq);
     assert_eq!(
-        std::fs::read(materialize::target_path(&paths.home, "token").unwrap()).unwrap(),
-        b"newly-applied-token"
+        stored(&paths, "token").as_deref(),
+        Some(&b"newly-applied-token"[..])
     );
     server.stop();
 }
@@ -210,54 +210,6 @@ fn an_exact_peer_does_not_replace_a_healthy_configured_source_receipt() {
 }
 
 #[test]
-fn deferred_unchanged_repair_does_not_record_a_real_body() {
-    let root = aterm_tempfile::tempdir().unwrap();
-    let (paths, server, _) = fixture(root.path());
-    let received = fetch_body(&paths);
-    let config = configured(&paths).unwrap();
-    let state = load_state(&paths).unwrap();
-    let token = materialize::target_path(&paths.home, "token").unwrap();
-    fsx::write_atomic(&token, b"locally-changed", 0o600).unwrap();
-    assert!(!files_intact(&paths, &state), "CONTROL: files need repair");
-    let mut repaired = Some((
-        (source_identity(&config), state.seq),
-        unsettled(&paths, &state),
-    ));
-    let outcome =
-        apply_fetched_repairing(&paths, config, state, received, Some(&mut repaired)).unwrap();
-    assert!(
-        matches!(outcome, SyncOutcome::Unchanged { .. }),
-        "CONTROL: unchanged debounce path"
-    );
-    assert_eq!(std::fs::read(token).unwrap(), b"locally-changed");
-    assert_eq!(original_time(&paths), None);
-    server.stop();
-}
-
-#[test]
-fn failed_actual_body_apply_retains_old_receipt_without_projecting_it() {
-    // Every server it reads is its own on loopback, which answers.
-    let _answering = ServersAnswering::set();
-    let root = aterm_tempfile::tempdir().unwrap();
-    let (paths, server, _) = fixture(root.path());
-    sync_reader_until(&paths, Instant::now() + Duration::from_secs(60)).unwrap();
-    let old = original_time(&paths).unwrap();
-    let token = materialize::target_path(&paths.home, "token").unwrap();
-    std::fs::remove_file(&token).unwrap();
-    std::fs::create_dir(&token).unwrap();
-    let opened = admin_open(&paths).unwrap();
-    let mut doc = opened.doc.clone();
-    doc.set_entry(&Audience::Everyone, "token", b"changed-token")
-        .unwrap();
-    admin_publish(&paths, &opened, &doc).unwrap();
-    let outcome = sync_reader_until(&paths, Instant::now() + Duration::from_secs(60)).unwrap();
-    assert!(matches!(outcome, SyncOutcome::Applied { report, .. } if !report.failed.is_empty()));
-    assert_eq!(original_time(&paths), Some(old));
-    assert_eq!(observed(&paths), None);
-    server.stop();
-}
-
-#[test]
 fn cache_substitution_clears_even_identical_previous_body_provenance() {
     let _answering = ServersAnswering::set();
     let lab = crate::client::log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"old")]);
@@ -294,10 +246,7 @@ fn cache_substitution_clears_even_identical_previous_body_provenance() {
         None,
         "local substitution cannot inherit even an exact-body earlier network token"
     );
-    assert_eq!(
-        std::fs::read(paths.home.join(".secrets/shared")).unwrap(),
-        b"new"
-    );
+    assert_eq!(crate::client::stored(&paths, "shared").unwrap(), b"new");
     lab.server.stop();
 }
 
@@ -403,10 +352,7 @@ fn f20_log_only_update_requires_a_real_body_to_record_the_new_materialization() 
     assert_eq!(cached.seq, before.seq);
     assert_eq!(cached.digest, before.digest);
     assert_ne!(cached.records_digest, before.records_digest);
-    assert_eq!(
-        std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
-        b"v2"
-    );
+    assert_eq!(crate::client::stored(&reader, "shared").unwrap(), b"v2");
     let retained = cached.network_materialization.as_ref().unwrap();
     assert_eq!(retained.observation.sampled_at_ms, original_sample);
     assert_eq!(
@@ -448,9 +394,6 @@ fn f20_log_only_update_requires_a_real_body_to_record_the_new_materialization() 
     let current = observed(reader).expect("new actual body records the matching materialization");
     assert_eq!(current.source(), VaultNetworkSource::ConfiguredUrl);
     assert_eq!(current.sequence(), before.seq);
-    assert_eq!(
-        std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
-        b"v2"
-    );
+    assert_eq!(crate::client::stored(&reader, "shared").unwrap(), b"v2");
     macs.server.stop();
 }

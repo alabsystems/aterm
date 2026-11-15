@@ -7,7 +7,7 @@ use super::*;
 fn installed_rig(env: &EnvSnapshot) -> Result<Rig, String> {
     let store = Store::read(env)?;
     let label = store.release()?;
-    Rig::new(env, &store, label)
+    Rig::new(env, &store, Pair::Installed, label, Placement::SharedCache)
 }
 
 #[test]
@@ -47,6 +47,12 @@ fn the_rigs_first_build_is_in_a_home_with_a_caches_folder() {
     let absent = aterm_tempfile::tempdir().unwrap();
     env.rustup_home = Some(absent.path().join("rustup-not-installed").into_os_string());
     let rig = installed_rig(&env).expect("installed released shim and helper");
+    let context = crate::Ctx::new(
+        rig.tree.clone(),
+        crate::Scope::workspace(),
+        env.clone(),
+        rig.home.join("run"),
+    );
     assert!(rig.home.join("Library/Caches").is_dir());
     io(fs::create_dir_all(rig.tree.join("src"))).unwrap();
     io(fs::write(
@@ -64,19 +70,24 @@ fn the_rigs_first_build_is_in_a_home_with_a_caches_folder() {
         "pub fn bootstrap_probe() {}\n",
     ))
     .unwrap();
-    let first = rig.build().unwrap();
-    assert!(
-        first.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    assert!(built_artifact(&first.stdout, &rig.home));
+    let first = rig.build(context.exec_env()).unwrap();
+    assert!(first.run.ok, "{}", &first.run.output);
+    assert!(built_artifact(
+        first.stdout.as_deref().unwrap().as_bytes(),
+        &rig.home
+    ));
 }
 
 #[test]
 fn installed_release_rejects_config_target_and_accepts_jobs() {
     let env = EnvSnapshot::capture();
     let rig = installed_rig(&env).expect("installed released shim and helper");
+    let context = crate::Ctx::new(
+        rig.tree.clone(),
+        crate::Scope::workspace(),
+        env.clone(),
+        rig.home.join("run"),
+    );
     io(fs::create_dir_all(rig.tree.join("src"))).unwrap();
     io(fs::create_dir_all(rig.tree.join(".cargo"))).unwrap();
     io(fs::write(
@@ -100,13 +111,13 @@ fn installed_release_rejects_config_target_and_accepts_jobs() {
         "[build]\ntarget-dir = \"target/.ubd/main.noindex\"\n",
     ))
     .unwrap();
-    let bad = rig.build().unwrap();
-    let said = String::from_utf8_lossy(&bad.stderr);
+    let bad = rig.build(context.exec_env()).unwrap();
+    let said = &bad.run.output;
     if rig.label == "aterm 0.197.0" {
-        assert!(!bad.status.success(), "0.197.0 must reject ff1626d7ab8");
+        assert!(!bad.run.ok, "0.197.0 must reject ff1626d7ab8");
     }
     // Later public releases may support the layout; the 0.197.0 pair must refuse it.
-    if !bad.status.success() {
+    if !bad.run.ok {
         assert!(
             said.contains("explicit build target is unmanaged or unsupported"),
             "{said}"
@@ -117,14 +128,13 @@ fn installed_release_rejects_config_target_and_accepts_jobs() {
         "[build]\njobs = 1\n",
     ))
     .unwrap();
-    let good = rig.build().unwrap();
-    assert!(
-        good.status.success(),
-        "{}",
-        String::from_utf8_lossy(&good.stderr)
-    );
+    let good = rig.build(context.exec_env()).unwrap();
+    assert!(good.run.ok, "{}", &good.run.output);
     assert!(rig.tree.join("target/debug/libaterm_time.rlib").is_file());
-    assert!(built_artifact(&good.stdout, &rig.home));
+    assert!(built_artifact(
+        good.stdout.as_deref().unwrap().as_bytes(),
+        &rig.home
+    ));
 
     // The same production stage must name the changed input, rather than merely fail
     // an unrelated source build. Commit the accepted config, then reproduce ff1626d7ab8.
@@ -434,6 +444,188 @@ fn the_stage_judges_with_the_release_before_the_newest_tag_and_not_an_older_one(
     );
 }
 
+const BUILD_WAIT_FIXTURE: &str = "ATERM_RELEASED_SHIM_WAIT_FIXTURE";
+
+#[test]
+fn sandboxed_build_wait_fixture() {
+    let Some(home) = std::env::var_os(BUILD_WAIT_FIXTURE).map(PathBuf::from) else {
+        return;
+    };
+    let waits = aterm_toolchain::waits::dir().expect("runner supplies its wait directory");
+    assert!(
+        waits.starts_with(&home),
+        "waits must stay in writable scratch"
+    );
+    let mark = aterm_toolchain::waits::Mark::begin("bootstrap fixture waiting for capacity")
+        .expect("sandbox permits the runner's wait mark");
+    assert!(
+        aterm_toolchain::waits::waiting(&waits)
+            .iter()
+            .any(|wait| wait.pid == std::process::id()),
+        "the parent can observe this locked wait mark"
+    );
+    eprintln!("bootstrap fixture entered");
+    fs::write(home.join("ready"), "ready").unwrap();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "bootstrap fixture release",
+        || home.join("release").is_file().then_some(()),
+    );
+    drop(mark);
+    eprintln!("bootstrap fixture admitted");
+    if home.join("hold-work").is_file() {
+        fs::write(home.join("working"), "working").unwrap();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "inactivity detector to end fixture",
+            || home.join("finish-work").is_file().then_some(()),
+        );
+    }
+    println!("bootstrap fixture stdout");
+}
+
+/// Advances only after the actual child proves a sandboxed, locked wait. The first usage
+/// read may precede the wait observation, so a one-second step forces a later regular look
+/// before the long jump. The third usage read releases the child after 69 virtual seconds.
+#[derive(Debug)]
+struct BuildClock {
+    home: PathBuf,
+    ready_at: std::sync::OnceLock<std::time::Instant>,
+    phase: std::sync::atomic::AtomicU8,
+    progressing: bool,
+}
+
+impl exec::Host for BuildClock {
+    fn monotonic(&self) -> std::time::Instant {
+        use std::sync::atomic::Ordering;
+        if !self.home.join("ready").is_file() {
+            return std::time::Instant::now();
+        }
+        let ready_at = *self.ready_at.get_or_init(std::time::Instant::now);
+        let seconds = match self.phase.load(Ordering::SeqCst) {
+            0 => 1,
+            1 => 2,
+            2 => 71,
+            3 => 71 + u64::from(self.home.join("working").is_file()),
+            phase => 141 + u64::from(phase.saturating_sub(4)) * 70,
+        };
+        ready_at + Duration::from_secs(seconds)
+    }
+
+    fn group_usage(&self, pgid: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
+        use std::sync::atomic::Ordering;
+        match self.phase.load(Ordering::SeqCst) {
+            0 if self.home.join("ready").is_file() => self.phase.store(1, Ordering::SeqCst),
+            1 => self.phase.store(2, Ordering::SeqCst),
+            2 => {
+                fs::write(self.home.join("release"), "release").unwrap();
+                self.phase.store(3, Ordering::SeqCst);
+            }
+            3 if self.home.join("working").is_file() => self.phase.store(4, Ordering::SeqCst),
+            phase if phase >= 4 => {
+                self.phase.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        Some(vec![aterm_sysprobe::MemberUsage {
+            pid: pgid,
+            start: 1,
+            cpu_ns: 1,
+            runnable_ns: 1,
+            ..Default::default()
+        }])
+    }
+
+    fn idle(&self) -> Option<Duration> {
+        None
+    }
+
+    fn process_progress(
+        &self,
+        _root: u32,
+        _probe: &mut aterm_uds::deadline::ProcessProgressProbe,
+    ) -> Option<u64> {
+        let phase = self.phase.load(std::sync::atomic::Ordering::SeqCst);
+        if self.progressing && phase >= 7 {
+            fs::write(self.home.join("finish-work"), "finished").unwrap();
+        }
+        Some(if self.progressing {
+            u64::from(phase)
+        } else {
+            0
+        })
+    }
+
+    fn cores(&self) -> u32 {
+        1
+    }
+}
+
+#[test]
+fn sandboxed_bootstrap_excludes_admission_wait_and_still_detects_a_hang() {
+    for work in [None, Some(false), Some(true)] {
+        let env = EnvSnapshot::capture();
+        let rig = installed_rig(&env).unwrap();
+        if work.is_some() {
+            fs::write(rig.home.join("hold-work"), "hold").unwrap();
+        }
+        let context = crate::Ctx::new(
+            rig.tree.clone(),
+            crate::Scope::workspace(),
+            env,
+            rig.home.join("run"),
+        );
+        let clock = BuildClock {
+            home: rig.home.clone(),
+            ready_at: std::sync::OnceLock::new(),
+            phase: std::sync::atomic::AtomicU8::new(0),
+            progressing: work == Some(true),
+        };
+        let mut command = rig.sandbox().unwrap();
+        command
+            .env(BUILD_WAIT_FIXTURE, &rig.home)
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "released_shim::mac::tests::sandboxed_build_wait_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+        let output = rig.run_build(
+            &command,
+            exec::ExecEnv {
+                host: &clock,
+                ..context.exec_env()
+            },
+        );
+        assert!(rig.home.join("release").is_file(), "child was admitted");
+        assert!(
+            output.run.output.contains("bootstrap fixture admitted"),
+            "{:?}",
+            output.run
+        );
+        assert!(output.run.usage.unwrap().waited >= Duration::from_secs(60));
+        if work == Some(false) {
+            assert!(
+                !output.run.ok && output.run.code.is_none(),
+                "{:?}",
+                output.run
+            );
+            assert!(
+                output
+                    .run
+                    .output
+                    .contains("no captured output or complete descendant CPU/I/O progress"),
+                "{:?}",
+                output.run
+            );
+        } else {
+            assert!(output.run.ok, "{:?}", output.run);
+            assert!(output.stdout.unwrap().contains("bootstrap fixture stdout"));
+        }
+    }
+}
+
 /// A release asks this judgment of its own tree at step 1, before it qualifies anything: it is
 /// the stage's own function, so the cut's refusal and the check's row are the same words.
 /// NEGATIVE CONTROL: the same checkout with a library the release cannot compile is refused,
@@ -537,4 +729,160 @@ fn a_cut_asks_the_stages_own_judgment_and_reads_its_row() {
         .find_map(|line| line.strip_prefix("released-shim failure inputs retained at "))
         .expect("a refusal names the rig it kept");
     fs::remove_dir_all(retained).unwrap();
+}
+
+/// A tracked one-package checkout named as the rig's build names it.
+fn tracked_package() -> aterm_tempfile::TempDir {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    for (path, text) in [
+        (
+            "Cargo.toml",
+            "[package]\nname='aterm-time'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
+        ),
+        (
+            "Cargo.lock",
+            "version = 4\n[[package]]\nname = \"aterm-time\"\nversion = \"0.0.0\"\n",
+        ),
+        ("src/lib.rs", "pub fn bootstrap_probe() {}\n"),
+    ] {
+        fs::write(dir.path().join(path), text).unwrap();
+    }
+    for args in [
+        &["init", "--quiet"][..],
+        &["add", "--", "Cargo.toml", "Cargo.lock", "src/lib.rs"],
+    ] {
+        let mut cmd = crate::git_provider::command();
+        cmd.current_dir(dir.path()).args(args);
+        for name in crate::changed::GIT_REDIRECTS {
+            cmd.env_remove(name);
+        }
+        let out =
+            aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN).unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    dir
+}
+
+/// A stand-in for the helper's front (`<helper> __build_admit --shim <tool> <placed> <program>
+/// <words>`): it becomes the program, as a front that admits the build does, except where
+/// `refused` (a `case` pattern over the call's words) matches, which it refuses as aterm
+/// 0.199.0's helper refused the no-cache fallback.
+fn helper(dir: &Path, refused: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("helper");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprogram=$5\nshift 5\ncase \"$*\" in\n  {refused})\n    \
+             printf '%s\\n' 'atpkg: build cache ownership refused: the selected quiet build \
+             target could not be resolved safely; no build started' >&2\n    exit 75 ;;\nesac\n\
+             exec \"$program\" \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn candidate_rows(helper: &Path) -> Vec<(crate::ladder::Outcome, String)> {
+    let env = EnvSnapshot::capture();
+    let tree = tracked_package();
+    let state = aterm_tempfile::tempdir().unwrap();
+    let context = crate::Ctx::new(
+        tree.path().to_path_buf(),
+        crate::Scope::workspace(),
+        env.clone(),
+        state.path().to_path_buf(),
+    );
+    let mut report = crate::ladder::Report::new("candidate-shim");
+    candidate(tree.path(), &env, helper, context.exec_env(), &mut report);
+    let rows: Vec<_> = report
+        .outcomes()
+        .map(|(outcome, label)| (outcome, label.to_owned()))
+        .collect();
+    assert_eq!(rows.len(), Placement::ALL.len(), "{}", report.render());
+    for ((_, label), placement) in rows.iter().zip(Placement::ALL) {
+        assert!(label.contains(placement.name()), "{}", report.render());
+    }
+    // A refused judgment keeps its rig for whoever reads the red; these are the test's own.
+    let kept: Vec<_> = report
+        .render()
+        .lines()
+        .filter_map(|line| line.strip_prefix("candidate-shim failure inputs retained at "))
+        .map(PathBuf::from)
+        .collect();
+    let red = rows
+        .iter()
+        .filter(|(outcome, _)| *outcome != crate::ladder::Outcome::Ok)
+        .count();
+    assert_eq!(kept.len(), red, "{}", report.render());
+    for rig in kept {
+        // The fallback's home holds a folder nothing may write; its own removal needs no write.
+        fs::remove_dir_all(rig).unwrap();
+    }
+    rows
+}
+
+/// The shim a candidate rig runs is this tree's text, naming the helper it was handed and the
+/// scratch store, and a helper that admits every build is green under every placement.
+#[test]
+fn a_candidate_pair_that_admits_every_placement_is_green_under_each() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let helper = helper(dir.path(), "'no call is refused'");
+    let env = EnvSnapshot::capture();
+    let store = Store::read(&env).expect("this machine's package store");
+    let rig = Rig::new(
+        &env,
+        &store,
+        Pair::Candidate { helper: &helper },
+        "fixture".into(),
+        Placement::NewHome,
+    )
+    .unwrap();
+    assert!(!rig.home.join("Library").exists());
+    let text = fs::read_to_string(&rig.shim).unwrap();
+    assert_eq!(
+        atpkg::build_cache::registered::shim_helper(&text).as_deref(),
+        Some(helper.as_path())
+    );
+    assert!(text.contains(rig.home.join("pkg/store/trust").to_str().unwrap()));
+    assert!(!text.contains(store.prefix.to_str().unwrap()), "{text}");
+    for (outcome, label) in candidate_rows(&helper) {
+        assert_eq!(outcome, crate::ladder::Outcome::Ok, "{label}");
+    }
+}
+
+/// The 0.199.0 defect, as the rig sees it: a helper that refuses the shim's in-tree fallback
+/// and admits the rest is red under the home where this tree's shim selects that fallback,
+/// named, and green under the other three. The installed-release judgment ran one placement
+/// and could not see it until that helper shipped.
+#[test]
+fn a_candidate_helper_that_refuses_the_no_cache_fallback_is_red_under_it_alone() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let helper = helper(
+        dir.path(),
+        "*\"build.build-dir='{workspace-root}/target/.ubd/build.noindex'\"*",
+    );
+    let rows = candidate_rows(&helper);
+    for ((outcome, label), placement) in rows.iter().zip(Placement::ALL) {
+        if placement == Placement::NoCache {
+            assert_eq!(
+                *outcome,
+                crate::ladder::Outcome::Fail(crate::ladder::Severity::GateFailed),
+                "{label}"
+            );
+            assert!(
+                label.contains("refuse a first build under the no-cache fallback")
+                    && label.contains("build cache ownership refused"),
+                "{label}"
+            );
+        } else {
+            assert_eq!(*outcome, crate::ladder::Outcome::Ok, "{label}");
+        }
+    }
 }

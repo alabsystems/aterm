@@ -4253,7 +4253,12 @@ fn off_reader_screen_cuts_alt_leave_and_shell_rekey_replay_and_step_rewind_insta
     for i in 0..8 {
         live.process_at(format!("hist {i}\r\n").as_bytes(), clock(i * 10));
     }
-    let mut r = seeded(&live);
+    // The seed keyframe takes a frozen tick before the ones below: by the real clock it would
+    // land as long after the recorder's epoch as seeding took, past 1_000 on a loaded machine.
+    let mut r = TemporalRecorder::new();
+    r.freeze_now_for_test(Some(Ticks(0)));
+    r.record_keyframe(keyframe_of(&live, usize::MAX).expect("seedable"));
+    r.seed_spine(SpinePre::take(&live));
     let (tx, rx) = queue(64);
     let mut mark = SpineMark::attach(r.spine_watermark());
 

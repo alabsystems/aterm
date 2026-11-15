@@ -19,14 +19,18 @@ use crate::supervise::policy::approval::{
     RULE_ALLOW_ONCE, RULE_LIMIT_RESET, RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM, RULE_TRUST_ANY,
     SUBJECT_OPTION, WARNED_UNDER_SAFE,
 };
-use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
 use crate::supervise::policy::question::{CHOSE_FIRST_SAFE, CHOSE_RECOMMENDED, CHOSE_UNMARKED};
 use crate::supervise::policy::reset::KeepWhy;
-use crate::supervise::policy::turn_end::{
-    LAND, LAND_CHECK_HEAD, LAND_CONTRADICTED_HEAD, LAND_NUDGE, LAND_NUDGE_REMOTE_MAIN_BEFORE,
-    LAND_REMOTE_MAIN_BEFORE, RULE_ANSWER, RULE_LAND, RULE_LAND_ANSWER, is_land_rule,
-};
+use crate::supervise::policy::turn_end::RULE_ANSWER;
 use crate::supervise::run::LINE_CHARS;
+use alab_policy::go_ahead::RULE_GO_AHEAD;
+use alab_policy::{
+    land_check::LAND_CHECK_HEAD,
+    words::{
+        LAND, LAND_CONTRADICTED_HEAD, LAND_NUDGE, LAND_NUDGE_REMOTE_MAIN_BEFORE,
+        LAND_REMOTE_MAIN_BEFORE, RULE_LAND, RULE_LAND_ANSWER, is_land_rule,
+    },
+};
 
 const MTIME_SLACK_MS: i64 = 60_000;
 
@@ -104,7 +108,7 @@ pub const FORCED_CONTINUES_LINE: &str =
 /// The acts [`FORCED_CONTINUES`] counts: Cruise's done check, and the two challenges older builds
 /// typed at a done claim (retired, still read in a week's ledgers).
 pub const FORCED_CONTINUE_RULES: [&str; 3] = {
-    use crate::supervise::policy::turn_end::{RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED};
+    use alab_policy::words::{RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED};
     [RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED]
 };
 
@@ -1400,11 +1404,11 @@ pub(crate) fn opens_with_land_words(said: &str) -> bool {
         clipped(LAND_CHECK_HEAD),
     ];
     // Land's instruction as the person's switch over a held tab types it opens with its why
-    // (`turn_end::switch_why`), which a clipped line may cut before the instruction's own words.
+    // (`alab_policy::words::switch_why`), which a clipped line may cut before the instruction's own words.
     let switched = said
         .strip_prefix(crate::harness::harness_mark!())
         .and_then(|r| r.strip_prefix(' '))
-        .is_some_and(|r| r.starts_with(crate::supervise::policy::turn_end::SWITCH_WHY_HEAD));
+        .is_some_and(|r| r.starts_with(alab_policy::words::SWITCH_WHY_HEAD));
     let said = said.as_bytes();
     switched || SAID.iter().any(|words| said.starts_with(words))
 }

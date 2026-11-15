@@ -712,9 +712,12 @@ fn a_rows_refusal_is_its_login_files() {
         digest: refresh_token_digest("held"),
     };
     let on_own = row(Some(&own), "owner@example.test");
-    assert_eq!(row_refusal(&on_own, Some(&default), settled_at()), settled);
     assert_eq!(
-        row_refusal(&on_own, None, settled_at() - 1),
+        row_refusal(&on_own, None, Some(&default), settled_at()),
+        settled
+    );
+    assert_eq!(
+        row_refusal(&on_own, None, None, settled_at() - 1),
         RefusalStanding::Pending {
             reason: RefusalReason::Expired,
             digest: refresh_token_digest("held"),
@@ -723,9 +726,9 @@ fn a_rows_refusal_is_its_login_files() {
         "its own directory, not the default login"
     );
     let on_default = row(None, "owner@example.test");
-    assert_eq!(row_refusal(&on_default, Some(&default), NOW), settled);
+    assert_eq!(row_refusal(&on_default, None, Some(&default), NOW), settled);
     assert_eq!(
-        row_refusal(&on_default, None, NOW),
+        row_refusal(&on_default, None, None, NOW),
         RefusalStanding::Unknown,
         "no place named"
     );
@@ -734,12 +737,12 @@ fn a_rows_refusal_is_its_login_files() {
         ..on_default.clone()
     };
     assert_eq!(
-        row_refusal(&empty, Some(&default), NOW),
+        row_refusal(&empty, None, Some(&default), NOW),
         settled,
         "an empty directory is the default login"
     );
     assert_eq!(
-        row_refusal(&row(None, "other@example.test"), Some(&default), NOW),
+        row_refusal(&row(None, "other@example.test"), None, Some(&default), NOW),
         RefusalStanding::Unknown,
         "another account's login in the row's place"
     );
@@ -764,6 +767,168 @@ fn a_rows_refusal_is_its_login_files() {
         row_signed_out_reason(&on_own, Condition::SignedOut, None, settled_at() - 1),
         None,
         "not yet settled"
+    );
+}
+
+/// A LOGIN IN ATERM'S OWN CUSTODY ANSWERS FROM ITS ROW'S RECORD ([`row_refusal`]): where native
+/// custody recorded a settled refusal's reason with the row's sign-out, the row stands settled
+/// for that reason under the digest of the refresh token its login file holds, whenever it is
+/// read (custody records a refusal only once settled). CONTROLS, each unknown: no record, or
+/// none given; a sign-out on record with no reason; a row expecting another address, or of
+/// another label; another refresh token in the file (and the first one back answers again);
+/// another route for the login's reads; any later word on record. With the custody marker gone
+/// the legacy journal answers instead and the row's record is not read.
+#[test]
+fn a_custody_logins_refusal_is_its_rows_record() {
+    use crate::harness::accounts::{Auth, Cli, Row, Store, stage_auth, stage_settled_refusal};
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let user_home = tmp.path().join("home");
+    let store = Store::at_for(&tmp.path().join("state"), Cli::Codex, &user_home);
+    let own = tmp.path().join("own");
+    hour_login(&own, NOW, Some("held"));
+    let marker = beside_auth(&own, OWNER_MARKER_SUFFIX);
+    std::fs::write(&marker, OWNER_MARKER_TEXT).expect("marker");
+    let row = Row {
+        label: "row".into(),
+        dir: Some(own.to_str().expect("UTF-8").to_owned()),
+        email: Some("owner@example.test".into()),
+        ..Row::default()
+    };
+    let read_at = |row: &Row, now: i64| {
+        let (state, warning) = store.load(now).expect("state");
+        assert!(warning.is_none());
+        row_refusal(
+            row,
+            store.custody_record(&state, row),
+            store.default_login_home().as_deref(),
+            now,
+        )
+    };
+    let read = |row: &Row| read_at(row, NOW);
+    assert_eq!(read(&row), RefusalStanding::Unknown, "no record");
+
+    let context = store.capture_auth_context(&row).expect("context");
+    store
+        .transact_logins(NOW - 10, &mut None, |state, logins| {
+            stage_auth(
+                state,
+                &row,
+                logins,
+                context.clone(),
+                Auth::SignedOut,
+                NOW - 10,
+            );
+            Ok(Vec::new())
+        })
+        .expect("sign-out");
+    assert_eq!(
+        read(&row),
+        RefusalStanding::Unknown,
+        "a sign-out on record with no reason"
+    );
+
+    let settle = |at: i64| {
+        let context = store.capture_auth_context(&row).expect("context");
+        store
+            .transact_logins(at, &mut None, |state, logins| {
+                stage_settled_refusal(state, &row, logins, context, RefusalReason::Reused, at);
+                Ok(Vec::new())
+            })
+            .expect("settled refusal");
+    };
+    settle(NOW - 5);
+    let settled = RefusalStanding::Settled {
+        reason: RefusalReason::Reused,
+        digest: refresh_token_digest("held"),
+    };
+    assert_eq!(read(&row), settled);
+    assert_eq!(
+        read_at(&row, NOW - 5),
+        settled,
+        "custody records a refusal only once it is settled"
+    );
+    assert!(
+        !RefusalReason::Reused.ends_ordinarily(),
+        "settled, and still no ordinary end"
+    );
+    assert_eq!(
+        row_refusal(&row, None, store.default_login_home().as_deref(), NOW),
+        RefusalStanding::Unknown,
+        "no record given"
+    );
+    assert_eq!(
+        row_signed_out_reason(
+            &row,
+            crate::harness::accounts::Condition::SignedOut,
+            store.default_login_home().as_deref(),
+            NOW
+        ),
+        None,
+        "a report reads no row record"
+    );
+    let other_address = Row {
+        email: Some("other@example.test".into()),
+        ..row.clone()
+    };
+    assert_eq!(
+        read(&other_address),
+        RefusalStanding::Unknown,
+        "a row expecting another address"
+    );
+    let other_label = Row {
+        label: "another".into(),
+        ..row.clone()
+    };
+    assert_eq!(
+        read(&other_label),
+        RefusalStanding::Unknown,
+        "a row of another label has no record"
+    );
+
+    hour_login(&own, NOW, Some("signed-in-again"));
+    assert_eq!(
+        read(&row),
+        RefusalStanding::Unknown,
+        "another refresh token in the file"
+    );
+    hour_login(&own, NOW, Some("held"));
+    assert_eq!(read(&row), settled, "CONTROL: the same login again");
+
+    std::fs::write(
+        own.join("config.toml"),
+        "chatgpt_base_url='http://127.0.0.1:1'\n",
+    )
+    .expect("config");
+    assert_eq!(
+        read(&row),
+        RefusalStanding::Unknown,
+        "another route for the login's reads"
+    );
+    std::fs::remove_file(own.join("config.toml")).expect("remove");
+    assert_eq!(read(&row), settled, "CONTROL: the same route again");
+
+    std::fs::remove_file(&marker).expect("remove");
+    assert_eq!(
+        read(&row),
+        RefusalStanding::Unpresented {
+            digest: refresh_token_digest("held"),
+        },
+        "out of custody, the legacy journal answers and the row's record is not read"
+    );
+    std::fs::write(&marker, OWNER_MARKER_TEXT).expect("marker");
+    assert_eq!(read(&row), settled, "CONTROL: in custody again");
+
+    let context = store.capture_auth_context(&row).expect("context");
+    store
+        .transact_logins(NOW + 1, &mut None, |state, logins| {
+            stage_auth(state, &row, logins, context, Auth::Ok, NOW + 1);
+            Ok(Vec::new())
+        })
+        .expect("sign-in");
+    assert_eq!(
+        read_at(&row, NOW + 1),
+        RefusalStanding::Unknown,
+        "a later word on record"
     );
 }
 

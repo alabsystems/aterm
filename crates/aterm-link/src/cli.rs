@@ -441,7 +441,8 @@ the key carries the mark Time Machine honours. No other system has a mark, so a 
 there has to be told to skip it. It protects the log in backups that leave the key out and in
 copies made without the key, not against a process of this user or a copy of the whole folder.
 
-Prints `listening <socket>` once bound and keeps `<log>.health` (0600) beside the log.
+Prints `listening <socket>` once bound and keeps `<log>.health` (0600) beside the log. Its
+stderr then times the start: a `start stamps` line, each phase on the machine's continuous clock.
 Exits 0 when its executable is replaced, its lifeline ends, or its socket path is removed
 or taken by another socket; exits 75 when its log is poisoned, so its supervisor restarts
 it. Retains `ev` records up to 7 days / 256 MiB, unread mail up to 7 days / 64 MiB, each
@@ -546,6 +547,7 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
         .then(|| take_stop_signals(std::thread::current()))
         .flatten();
     let seam = crate::broker_health::Seam::from_env(std::path::Path::new(&log));
+    let mut stamps = crate::start_stamps::Stamps::broker_entered();
     let at_rest = match crate::at_rest::prepare(
         std::path::Path::new(&log),
         aterm_uds::backup::Backups::SYSTEM,
@@ -560,6 +562,7 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
     for note in &at_rest.notes {
         eprintln!("aterm link broker: {note}");
     }
+    stamps.mark(crate::start_stamps::KEY);
     let opened = crate::durability::open_escalating(
         std::path::Path::new(&log),
         secret,
@@ -568,9 +571,13 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
         seam.escalation(),
         at_rest.key.as_ref().map(crate::at_rest::Key::bytes),
     );
+    stamps.mark(crate::start_stamps::OPENED);
     drop(at_rest);
     let broker = match opened {
         Ok(opened) => {
+            if let Some(ns) = opened.locked_ns {
+                stamps.mark_at(crate::start_stamps::LOCKED, ns);
+            }
             use std::io::Write as _;
             let mut err = std::io::stderr();
             if let Some(why) = &opened.renewed {
@@ -601,6 +608,7 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
         }
     };
     seam.arm(&broker, std::path::Path::new(&log));
+    stamps.mark(crate::start_stamps::ARMED);
     let retained = match crate::broker_rules::retain(&broker) {
         Ok(()) => format!(
             "retained by aterm's default rules ({})",
@@ -622,6 +630,7 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
     }
     // The limit the broker serves under, read back from it: the start line says what it does.
     let limited = crate::broker_rules::rate_word(broker.rate_limit());
+    stamps.mark(crate::start_stamps::RULES);
     let handle = match broker.serve(&endpoint) {
         Ok(h) => h,
         Err(e) => {
@@ -635,6 +644,7 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
             return ExitCode::FAILURE;
         }
     };
+    stamps.mark(crate::start_stamps::SERVED);
     if let Err(e) = broker.keep_health(crate::broker_health::HEALTH_EVERY) {
         eprintln!(
             "aterm link broker: {}: could not write its health ({e}); astream tries again every \
@@ -650,8 +660,12 @@ so every session that node serves names it in `inbox` (`given_up=`) and marks it
     {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
+        // Stamped before the line: a launcher that reads the line and then its own clock always
+        // reads it later than this.
+        stamps.mark(crate::start_stamps::LISTENING);
         let _ = writeln!(out, "listening {endpoint}");
         let _ = out.flush();
+        let _ = writeln!(std::io::stderr(), "{}", stamps.line());
         let _ = writeln!(
             std::io::stderr(),
             "aterm link broker: unix socket on {endpoint}{guard_note}, durability {}: {}; \

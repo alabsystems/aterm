@@ -84,7 +84,6 @@ thread_local! {
 }
 
 fn manual_protection(
-    cli: Cli,
     env: &Env,
     config: &Path,
     image: Option<&str>,
@@ -93,14 +92,10 @@ fn manual_protection(
         home: env.home.clone(),
         ..SourceProtection::default()
     };
-    if let Some(home) = &env.home {
-        protection
-            .read_only
-            .push(home.join(".secrets").join(cli_fleet_file(cli)));
-    }
     if let Some(source) = image.and_then(source_key_text)
         && !source.starts_with("http://")
         && !source.starts_with("https://")
+        && crate::vault_entry::source_entry(&source).is_none()
     {
         let input = if let Some(relative) = source.strip_prefix("~/") {
             source_path(
@@ -122,14 +117,10 @@ fn manual_protection(
 }
 
 /// Explicit native selection bypasses default source planning, never output protection.
-pub(in crate::harness) fn protect_manual_roster(
-    cli: Cli,
-    env: &Env,
-    roster: &Path,
-) -> Result<(), String> {
+pub(in crate::harness) fn protect_manual_roster(env: &Env, roster: &Path) -> Result<(), String> {
     let config = env.config.clone().unwrap_or_else(|| config_beside(roster));
     let image = read_config(&config)?;
-    let protection = manual_protection(cli, env, &config, image.as_deref())?;
+    let protection = manual_protection(env, &config, image.as_deref())?;
     let destination = accounts::usage_target(Some(roster))?.ok_or("missing account roster")?;
     protection.check(&[roster, &destination])
 }
@@ -177,14 +168,14 @@ impl ManualRosterPlan {
             None
         };
         let retire = native
-            || selected.as_ref().is_some_and(|selected| {
-                selected.retires_legacy(env.home.as_deref(), env.config.as_deref())
-            });
+            || selected
+                .as_ref()
+                .is_some_and(|selected| selected.retires_legacy(env.config.as_deref()));
         captured = captured.with_policy(policy, retire);
         if let Some(selected) = &selected {
             captured = captured.with_selection(env, roster, SourceScope::Init, selected.clone());
         }
-        let protection = manual_protection(cli, env, &config, captured.config_image.as_deref())?;
+        let protection = manual_protection(env, &config, captured.config_image.as_deref())?;
         let destination = accounts::usage_target(Some(roster))?.ok_or("missing account roster")?;
         protection.check(&[roster, &destination])?;
         let fleet = match selected.as_ref().map(SelectedSource::origin) {
@@ -313,7 +304,7 @@ impl AutomaticSource {
             if let Some(observation) = &self.selection
                 && observation
                     .selected
-                    .retires_legacy(observation.home.as_deref(), observation.config.as_deref())
+                    .retires_legacy(observation.config.as_deref())
                     != self.retire_legacy
             {
                 return Err(SyncError::retry(

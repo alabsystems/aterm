@@ -10,13 +10,13 @@ use core::ops::Range;
 pub struct Sid<'a>(&'a str);
 
 impl<'a> Sid<'a> {
-    /// `s` as a session id, or `None` when it is not one.
+    /// `s` as a session id, or `None` when it is not one: a tab ID ([`crate::tab_id::TabId`],
+    /// `t` and 10 base32 characters) or a legacy tab's ID ([`crate::tab_id::is_legacy`]), which a
+    /// shell opened before the `t` form still sends.
     #[inline]
     #[must_use]
     pub fn parse(s: &'a str) -> Option<Self> {
-        let hex = s.strip_prefix("s-")?;
-        let digit = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
-        (!hex.is_empty() && hex.bytes().all(digit)).then_some(Self(s))
+        (crate::tab_id::is_tab_id(s) || crate::tab_id::is_legacy(s)).then_some(Self(s))
     }
 
     /// The id as the wire and the rendezvous directory spell it.
@@ -34,7 +34,7 @@ pub enum Selector<'a> {
     SelfTok,
     /// `@<digits>`: a process-local session number.
     Local(u64),
-    /// `@s-<hex>`: a stable session id.
+    /// `@<tab id>` or `@s-<hex>`: a stable session id ([`Sid::parse`]).
     Sid(Sid<'a>),
     /// Any other body (`@S-1`, `@./s-1`, `@self`, a number past `u64`, an empty one).
     Invalid(&'a str),

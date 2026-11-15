@@ -119,11 +119,16 @@ pub fn seam_target(layout: &Layout, name: &str) -> PathBuf {
     view_dir(layout, name)
 }
 
-/// Stock binary names and the Trust tools they clone in a view.
+/// Stock binary names and the Trust tools they clone in a view: each name rustup's proxy runs in a
+/// checkout that pins `trust` (an editor's `rust-analyzer`, a `rustfmt` on save), so the proxy finds
+/// the Trust tool instead of refusing a component a linked toolchain cannot add.
 pub const STOCK_NAMES: &[(&str, &str)] = &[
     ("rustc", "trustc"),
     ("cargo", "targo"),
     ("rustdoc", "trustdoc"),
+    ("rust-analyzer", "trust-analyzer"),
+    ("rustfmt", "trustfmt"),
+    ("cargo-fmt", "targo-fmt"),
 ];
 
 const VIEW_DIRS: &[&str] = &["lib", "libexec", "share", "etc"];

@@ -615,7 +615,7 @@ fn backed_off(late: i64) -> Seen {
 /// one short turn before the wall.
 fn streak_past_prompt(streak: u32, late: i64) -> Seen {
     let step = i64::try_from(
-        turn_end::TurnEndTiming::default()
+        alab_policy::config::TurnEndTiming::default()
             .short_wait_at(streak)
             .expect("a back-off")
             .as_millis(),

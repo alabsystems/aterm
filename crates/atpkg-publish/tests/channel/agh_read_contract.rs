@@ -21,7 +21,7 @@ use aterm_update_core::github_rest::Origins;
 use atpkg_publish::channel::{DOWNLOAD_ATTEMPTS, download_retried};
 use atpkg_publish::host::agh::AghHost;
 use atpkg_publish::host::fake::FakeHost;
-use atpkg_publish::host::rest::RestHost;
+use atpkg_publish::host::rest::{RestHost, TokenSource};
 use atpkg_publish::host::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
 
 use super::scratch;
@@ -415,7 +415,11 @@ impl RestWorld {
         let ports = fake.ports();
         let origins = Origins::loopback(ports.api, ports.uploads, ports.web, ports.cdn);
         let git_base = origins.web.clone();
-        let host = RestHost::at(Some(tokens.join("dev.token")), origins, git_base);
+        let host = RestHost::at(
+            Some(TokenSource::File(tokens.join("dev.token"))),
+            origins,
+            git_base,
+        );
         RestWorld {
             fake,
             host,

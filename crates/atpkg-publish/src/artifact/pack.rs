@@ -949,6 +949,7 @@ fn build(
             // A bounded collector keeps a stream's tail, and the build's JSON messages name
             // every executable: the bounded build is the one whose stdout must be complete.
             run.deadline = Some(within);
+            run.queue.clone_from(&request.build_queue);
             match tools.run_complete(&run, aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES) {
                 Ok(ran) => ran,
                 Err(RunError::TimedOut) => {
@@ -1089,7 +1090,7 @@ impl Signer {
     /// No key, or no roster that verifies.
     pub fn load(ctx: &Ctx) -> Result<Self> {
         Ok(Self {
-            key: MachineKey::load(ctx, &ctx.identity.key)?,
+            key: MachineKey::this_machine(ctx)?,
             authority: sign::elected(ctx)?,
         })
     }
@@ -1462,5 +1463,6 @@ pub fn parse_args(ctx: &mut Ctx, args: &[String], tools: &dyn Tools) -> Result<P
         upload,
         env: Vec::new(),
         build_within: None,
+        build_queue: None,
     })
 }

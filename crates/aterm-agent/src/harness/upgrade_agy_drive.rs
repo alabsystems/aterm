@@ -869,6 +869,7 @@ fn relaunch_held(
     let (line, dialect) = match plan(opts, st, k) {
         Ok(p) => (p.line, p.dialect),
         Err(NoPlan::Wait(why)) => return said(r, format!("wait:{why}")),
+        Err(NoPlan::Account(refusal)) => return said(r, format!("wait:{}", refusal.kind.word())),
         Err(NoPlan::Refused { why, detail, .. }) => return fail(opts, r, st, &why, &detail),
     };
     st.line.clone_from(&line);
@@ -1250,8 +1251,8 @@ fn typing_fence(c: &mut Client, tab: &str) -> Result<Option<String>, &'static st
         return Err("screen-unreadable");
     };
     match aterm_phase::agy::phase(&scr.rows) {
-        (aterm_phase::Phase::Idle | aterm_phase::Phase::Question, true) => {}
-        (aterm_phase::Phase::Prompt, _) => return Err("box"),
+        (alab_policy::vocab::Phase::Idle | alab_policy::vocab::Phase::Question, true) => {}
+        (alab_policy::vocab::Phase::Prompt, _) => return Err("box"),
         _ => return Err("busy"),
     }
     if !composer_empty(&scr) {
@@ -1273,7 +1274,7 @@ pub(super) fn type_text(
         .filter(|_| turn_takes_gen(c))
         .map(|g| format!("if-gen={g} yield=0.2 "))
         .unwrap_or_default();
-    let guard = super::composer_guard('>', text);
+    let guard = alab_policy::guard::composer_guard('>', text);
     let (head, _) = c
         .request_counted(&format!(
             "@{tab} turn {lane}{fence}submit=guarded:{guard} idle=600 {TURN_WAIT} {text}"

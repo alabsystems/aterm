@@ -27,7 +27,7 @@ use aterm_slog::Chose;
 
 /// A key's class: the keys that choose on a box or question, and every other input. An event is
 /// classed on the input side ([`KeyClass::of_event`], in `crate::human_input`), so the log takes a
-/// class and its code names no input event (census `slog-inert`: a mark never becomes input).
+/// class and its code names no input event: a mark never becomes input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyClass {
     /// Enter: the focused option.

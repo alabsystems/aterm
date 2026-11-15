@@ -332,6 +332,7 @@ fn a_command_spawned_through_the_factory_gets_the_default_editor() {
             None,
             None,
             None,
+            None,
         )
         .expect("the command starts");
         assert_eq!(

@@ -3,7 +3,7 @@
 
 //! `login-notice [<code> [<label>]|disk [<cause>]|end|back]`.
 
-use aterm_agent::supervise::limit::ResetClock;
+use aterm_agent::supervise::limit::reset_clock;
 use aterm_agent::supervise::policy::exception::Exception;
 use aterm_agent::supervise::policy::notice::{self, NoticeText};
 use aterm_phase::Program;
@@ -152,7 +152,7 @@ pub(crate) fn notes(asked: &Asked, sid: &str) -> Vec<HostNote> {
             let why = text.whys.iter().copied().max_by_key(|w| w.chars().count());
             let reset = text
                 .expect_reset
-                .and_then(|_| ResetClock::of(Some(SAMPLE_RESET)))
+                .and_then(|_| reset_clock(Some(SAMPLE_RESET)))
                 .map(|clock| clock.words());
             vec![resume(Some(Exception::of_notice_reset(
                 text,

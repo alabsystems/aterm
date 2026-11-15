@@ -30,7 +30,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+pub mod cost;
 pub mod repository_refresh;
+pub use cost::Spent;
 
 /// The desired state's revision: a pass is due on the same build once it moves, as when an item
 /// joins or leaves the pass (3: `sync.identity`; 4: the ALab steward's fleet item; 5:
@@ -949,8 +951,21 @@ pub trait Ports: Sync {
     /// # Errors
     /// The join did not finish.
     fn join_peers(&self) -> Result<PeersDone, String>;
-    /// Write `line` to aterm.log: a pass's ledger line, or why it was refused.
+    /// Write `line` to aterm.log: a pass's ledger line and its cost line, a start's that found
+    /// the lock held, or why a pass was refused.
     fn log(&self, line: &str);
+    /// What this process has spent so far, which a pass reads once it holds its lock and again
+    /// as it ends: its cost line says the difference. Nothing where a port does not measure.
+    fn spent(&self) -> Spent {
+        Spent::default()
+    }
+    /// The note this runner's starter gave its start (`aterm_secrets::converge::StartNote`'s
+    /// word: why the pass was owed, and the runners before it that found the lock held), where
+    /// it gave one. The pass's cost line carries it; a pass that finds the lock held says it in
+    /// a line of its own.
+    fn start_note(&self) -> Option<String> {
+        None
+    }
     /// The installed release aterm.app's program where it is installed and this process is not
     /// it (a held copy a vault subscriber's job runs, say): the subscriber's pass runs from there
     /// (`aterm init --converge`'s hand-off), so the rows a held copy applies are the installed
@@ -963,26 +978,57 @@ pub trait Ports: Sync {
     fn run_elsewhere(&self, program: &Path, args: &[String]) -> Result<Option<i32>, String>;
 }
 
-/// One sync kind's item over [`Ports`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Peers,
-    Vault,
-    Github,
-    OwedClone,
-    CloneTuning,
-    Identity,
-    StewardRevoke,
-    StewardLease,
-    StewardServerStandby,
-    Fleet,
-    Node,
-    SharedData,
-    Requests,
-    Accounts,
-    Release,
-    Fabric,
-    Awake,
+/// Declares [`Kind`] with each kind's row id beside it, so [`Kind::ALL`] and [`Kind::id`] hold
+/// every kind by construction: a kind added here is in both.
+macro_rules! kinds {
+    ($($kind:ident => $id:ident),+ $(,)?) => {
+        /// One sync kind's item over [`Ports`].
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Kind {
+            $($kind),+
+        }
+
+        impl Kind {
+            /// Every kind.
+            const ALL: &'static [Self] = &[$(Self::$kind),+];
+
+            /// The id of this kind's row, which a pass journals its changes under.
+            const fn id(self) -> &'static str {
+                match self {
+                    $(Self::$kind => $id),+
+                }
+            }
+        }
+    };
+}
+
+kinds! {
+    Peers => PEERS,
+    Vault => VAULT,
+    Github => GITHUB,
+    OwedClone => CLONE,
+    CloneTuning => CLONE_TUNING,
+    Identity => IDENTITY,
+    StewardRevoke => STEWARD_REVOKE,
+    StewardLease => STEWARD_LEASE,
+    StewardServerStandby => STEWARD_SERVER_STANDBY,
+    Fleet => FLEET,
+    Node => NODE,
+    SharedData => SHARED_DATA,
+    Requests => REQUESTS,
+    Accounts => ACCOUNTS,
+    Release => RELEASE,
+    Fabric => FABRIC,
+    Awake => AWAKE,
+}
+
+/// Whether `id` is the id of one of this lane's own items ([`Kind`]), which a pass journals
+/// that item's changes under. The base layer a pass runs first journals under its items' own
+/// ids (`aterm doctor`'s), the repository prerequisite under its own, and the GitHub step
+/// `sync.clone` runs under that step's items' (`init.github.*`): none of those is one.
+#[must_use]
+pub fn own_item(id: &str) -> bool {
+    Kind::ALL.iter().any(|kind| kind.id() == id)
 }
 
 impl Kind {
@@ -1219,26 +1265,7 @@ fn sync_fleet_with_retry(ports: &dyn Ports) -> Result<FleetDone, String> {
 
 impl Item for Synced<'_> {
     fn id(&self) -> String {
-        match self.kind {
-            Kind::Peers => PEERS,
-            Kind::Vault => VAULT,
-            Kind::Github => GITHUB,
-            Kind::OwedClone => CLONE,
-            Kind::CloneTuning => CLONE_TUNING,
-            Kind::Identity => IDENTITY,
-            Kind::StewardRevoke => STEWARD_REVOKE,
-            Kind::StewardLease => STEWARD_LEASE,
-            Kind::StewardServerStandby => STEWARD_SERVER_STANDBY,
-            Kind::Fleet => FLEET,
-            Kind::Node => NODE,
-            Kind::SharedData => SHARED_DATA,
-            Kind::Requests => REQUESTS,
-            Kind::Accounts => ACCOUNTS,
-            Kind::Release => RELEASE,
-            Kind::Fabric => FABRIC,
-            Kind::Awake => AWAKE,
-        }
-        .to_owned()
+        self.kind.id().to_owned()
     }
 
     fn family(&self) -> &'static str {
@@ -2110,7 +2137,8 @@ impl Pass {
 /// [`Stop::Held`] while another pass runs; [`Stop::Refused`] outside the account's own login,
 /// where its context or state directory cannot be read, or when the items cannot be ordered. A
 /// refused [`Mode::Apply`] pass writes its own aterm.log line (`refusal`): a runner's stderr goes
-/// nowhere, so a Mac whose every pass is refused leaves that trace.
+/// nowhere, so a Mac whose every pass is refused leaves that trace. So does one that found the
+/// lock held (`held_line`), which is how the starts that ran nothing are counted.
 pub fn converge(
     ports: &dyn Ports,
     trigger: Trigger,
@@ -2119,12 +2147,29 @@ pub fn converge(
     on_row: &mut dyn FnMut(&ItemReport),
 ) -> Result<Pass, Stop> {
     let pass = run_pass(ports, trigger, mode, work.into(), on_row);
-    if mode == Mode::Apply
-        && let Err(Stop::Refused(why)) = &pass
-    {
-        ports.log(&refusal(&ports.build(), trigger, why));
+    if mode == Mode::Apply {
+        match &pass {
+            Err(Stop::Refused(why)) => ports.log(&refusal(&ports.build(), trigger, why)),
+            Err(Stop::Held) => ports.log(&held_line(
+                &ports.build(),
+                trigger,
+                ports.start_note().as_deref(),
+            )),
+            Ok(_) => {}
+        }
     }
     pass
+}
+
+/// The one aterm.log line of a start that found the lock held and ran nothing: the build, the
+/// trigger and the start's note. Its head is its own (`converge held`), never a pass line's
+/// `converge build=`, so a tally of passes counts no held start.
+fn held_line(build: &str, trigger: Trigger, note: Option<&str>) -> String {
+    format!(
+        "converge held build={build} trigger={} note={}",
+        trigger.word(),
+        note.unwrap_or("-")
+    )
 }
 
 /// A refused pass's one aterm.log line: the build, the trigger and why.
@@ -2160,6 +2205,8 @@ fn run_pass(
         }
         Mode::Plan => (None, Default::default()),
     };
+    // Read under the lock, so a pass that found it held, and a plan, read nothing.
+    let began = pass.as_ref().map(|_| ports.spent());
     let record = if let Some(pass) = &pass {
         Some(pass.record())
     } else {
@@ -2246,7 +2293,16 @@ fn run_pass(
     let unrecorded = pass
         .as_ref()
         .and_then(|pass| pass.record_pass(record).err());
+    let spent = began.map_or_else(Spent::default, |began| ports.spent().since(began));
     ports.log(&ledger(&build, trigger, due, &rows, unrecorded.as_deref()));
+    ports.log(&cost::line(
+        &build,
+        trigger,
+        due,
+        spent,
+        ports.start_note().as_deref(),
+        &rows,
+    ));
     Ok(Pass {
         due,
         rows,
@@ -2276,9 +2332,11 @@ fn clipped(why: &str, max: usize) -> String {
     out
 }
 
-/// A pass's one aterm.log line: the build and trigger, a tally, and the rows that did not end
+/// A pass's ledger line: the build and trigger, a tally, and the rows that did not end
 /// right, each with its why (`[sync.fleet: the issuer did not answer | ...]`), [`clipped`] to
-/// [`LEDGER_WHY`] chars, or [`LEDGER_FAILED_WHY`] for a failed row's.
+/// [`LEDGER_WHY`] chars, or [`LEDGER_FAILED_WHY`] for a failed row's. What the pass cost, which
+/// rows changed and the note of its start are a line of their own ([`cost::line`]), so none of
+/// them takes room this line's whys need in the one log record each line is.
 fn ledger(
     build: &str,
     trigger: Trigger,

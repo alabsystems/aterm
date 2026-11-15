@@ -1,10 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::Command;
+use super::{Command, Stdio};
 use std::cell::Cell;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+
+#[test]
+fn an_unavailable_prepared_route_restores_the_command_and_preserves_no_birth() {
+    use crate::spawnfd::{BirthAttempt, SpawnFailure};
+    assert!(crate::tether::executable().is_none());
+    let mut command = Command::new("/bin/sleep");
+    command.arg("30").process_group(17);
+    let attempt = BirthAttempt::new().unwrap();
+    let key = attempt.key().clone();
+    match command
+        .prepare_cohort(attempt)
+        .expect_err("no helper route")
+    {
+        SpawnFailure::NotSpawned(receipt) => {
+            assert_eq!(receipt.key(), &key);
+            assert_eq!(receipt.error().kind(), io::ErrorKind::Unsupported);
+        }
+        other => panic!("unexpected actual birth outcome: {other:?}"),
+    }
+    assert_eq!(command.pgroup, Some(17));
+    assert!(command.entry_barrier.is_none());
+    assert!(command.require_tether);
+}
 
 #[test]
 fn a_temporary_process_group_is_restored_after_an_unwind() {
@@ -186,4 +209,66 @@ fn a_tethered_spawns_exec_status_shares_the_spawn_lock() {
         "the spawn handing the write end holds the lock exclusively"
     );
     drop(handing);
+}
+#[test]
+fn output_defaults_preserve_configured_io_and_restore_the_unset_slots() {
+    use std::io::Write as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let input = root.path().join("input");
+    let output = root.path().join("output");
+    std::fs::write(&input, b"prepared input\n").unwrap();
+    let mut command = Command::new(crate::deadline::stand_in(std::path::Path::new("/bin/cat")));
+    command
+        .stdin(std::fs::File::open(input).unwrap())
+        .stdout(std::fs::File::create(&output).unwrap());
+    let captured = command
+        .with_output_defaults(|command| command.spawn().unwrap().wait_with_output())
+        .unwrap();
+    assert!(captured.status.success());
+    assert!(captured.stdout.is_empty());
+    assert!(captured.stderr.is_empty());
+    assert_eq!(std::fs::read(output).unwrap(), b"prepared input\n");
+    assert!(command.stdin.is_some());
+    assert!(command.stdout.is_some());
+    assert!(command.stderr.is_none());
+
+    let mut defaults = Command::new(crate::deadline::stand_in(std::path::Path::new("/bin/cat")));
+    let captured = defaults
+        .with_output_defaults(|command| command.spawn().unwrap().wait_with_output())
+        .unwrap();
+    assert!(captured.status.success());
+    assert!(captured.stdout.is_empty());
+    assert!(defaults.stdin.is_none() && defaults.stdout.is_none() && defaults.stderr.is_none());
+    let mut piped = Command::new(crate::deadline::stand_in(std::path::Path::new("/bin/cat")));
+    piped.stdin(Stdio::piped());
+    let mut child = piped
+        .with_output_defaults(|command| command.spawn())
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"the caller's pipe\n")
+        .unwrap();
+    assert_eq!(
+        child.wait_with_output().unwrap().stdout,
+        b"the caller's pipe\n"
+    );
+    assert!(piped.stdin.is_some() && piped.stdout.is_none() && piped.stderr.is_none());
+}
+
+#[test]
+fn output_defaults_restore_after_spawn_error_and_unwind() {
+    let mut command = Command::new("/path/that/does/not/name/an/executable");
+    assert!(
+        command
+            .with_output_defaults(|command| command.spawn())
+            .is_err()
+    );
+    assert!(command.stdin.is_none() && command.stdout.is_none() && command.stderr.is_none());
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        command.with_output_defaults(|_| panic!("injected unwind"))
+    }));
+    assert!(result.is_err());
+    assert!(command.stdin.is_none() && command.stdout.is_none() && command.stderr.is_none());
 }

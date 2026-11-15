@@ -18,6 +18,7 @@ use aterm_uds::lan::wire::{self, Frame, Reader, Request, Target};
 use aterm_uds::lan::{ConnectOptions, UdpOptions, here};
 
 use crate::bonjour::{self, Bonjour};
+use crate::counts::{Count, Counts, Sink};
 
 /// The most connections served at once: one more is told the broker is busy
 /// ([`Frame::Unchecked`]) and closed.
@@ -64,6 +65,43 @@ pub(crate) enum Admission {
         expect(dead_code, reason = "code is checked on macOS")
     )]
     Code(Arc<aterm_keeper::identity::Identity>),
+    /// A law's script in place of the kernel and macOS: it takes the path [`Self::Code`] takes
+    /// ([`full_check`]), so what that path counts is counted of real connections.
+    #[cfg(test)]
+    Scripted(Scripted),
+}
+
+/// A scripted read of a connection's audit token.
+#[cfg(test)]
+type ScriptedToken = dyn Fn(&CtlStream) -> Option<aterm_uds::peer::AuditToken> + Send + Sync;
+
+/// A scripted full check of the process a token names.
+#[cfg(test)]
+type ScriptedCheck =
+    dyn Fn(Option<aterm_uds::peer::AuditToken>) -> Result<(), CheckError> + Send + Sync;
+
+/// What a law scripts of a connection's admission.
+#[cfg(test)]
+pub(crate) struct Scripted {
+    /// The audit token the kernel is said to give for the connection.
+    pub(crate) token: Box<ScriptedToken>,
+    /// The full check's verdict of the process that token names.
+    pub(crate) full_check: Box<ScriptedCheck>,
+}
+
+/// The one path every admission by code takes: the full check `check` of the process `token`
+/// names, counted where it is called ([`Count::ChecksRun`]: a call, whether or not a check then
+/// starts), and as it returns the requesting process counted by its token with what the check
+/// said of it.
+fn full_check(
+    counts: &Counts,
+    token: Option<aterm_uds::peer::AuditToken>,
+    check: impl FnOnce(Option<aterm_uds::peer::AuditToken>) -> Result<(), CheckError>,
+) -> Result<(), CheckError> {
+    counts.add(Count::ChecksRun);
+    let verdict = check(token);
+    counts.requester(token, verdict.is_ok());
+    verdict
 }
 
 /// Resolve this image once. Only the canonical team branch supplies an update
@@ -112,7 +150,7 @@ impl Admission {
 
     /// Whether the peer on `stream` is admitted: a refusal of its uid or code, or a check that
     /// could not run or finish, which judged nothing.
-    fn check(&self, stream: &CtlStream) -> Result<(), CheckError> {
+    fn check(&self, stream: &CtlStream, counts: &Counts) -> Result<(), CheckError> {
         match self {
             Self::SameUid => match aterm_uds::peer::peer_uid(stream) {
                 Some(uid) if uid == aterm_uds::peer::our_uid() => Ok(()),
@@ -121,11 +159,20 @@ impl Admission {
                     "the kernel did not name the peer's uid".to_owned(),
                 )),
             },
-            Self::Code(identity) => identity.check_named(
-                stream,
-                aterm_uds::peer::peer_audit_token(stream),
-                aterm_uds::peer::CHECK_HANG,
-            ),
+            Self::Code(identity) => {
+                full_check(counts, aterm_uds::peer::peer_audit_token(stream), |token| {
+                    identity.check_named_costed(
+                        stream,
+                        token,
+                        aterm_uds::peer::CHECK_HANG,
+                        &counts.check_cost,
+                    )
+                })
+            }
+            #[cfg(test)]
+            Self::Scripted(script) => full_check(counts, (script.token)(stream), |token| {
+                (script.full_check)(token)
+            }),
         }
     }
 }
@@ -164,6 +211,10 @@ pub(crate) fn team_requirement(team: &str) -> io::Result<String> {
 /// code, and adopting a signed update of `opts.source` (it then exits 0 for launchd to start the
 /// new image, as it does when its own image is replaced).
 ///
+/// It counts its connections, its full checks, its name resolutions and their CPU time into
+/// [`aterm_uds::lan::COUNTS_NAME`] beside the socket ([`crate::counts`]): on a running Mac,
+/// `cat /var/run/systems.alab.aterm-lan/broker.counts`.
+///
 /// # Errors
 /// Not root (outside a test binary), off macOS, the socket's folder or the socket that cannot be
 /// made, or the admission requirement that cannot be read.
@@ -191,7 +242,9 @@ pub fn serve(opts: Opts) -> io::Result<()> {
 /// A bound broker socket and what serving it needs.
 pub(crate) struct Server {
     listener: aterm_uds::CtlListener,
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
+    /// Where the accept loop writes the counts ([`crate::counts`]).
+    pub(crate) sink: Sink,
 }
 
 pub(crate) struct Shared {
@@ -200,7 +253,10 @@ pub(crate) struct Shared {
     /// Where a connection's lines go: the broker's [`log`], or nowhere when the one client is
     /// this process (the direct path), which hears each failure itself as a frame.
     log: fn(std::fmt::Arguments<'_>),
-    live: AtomicUsize,
+    pub(crate) live: AtomicUsize,
+    /// What this server counts of its connections ([`crate::counts`]). Only a served socket's
+    /// accept loop writes them to a file; the direct path's are counted and read by nobody.
+    pub(crate) counts: Counts,
     /// The test seam the server was bound under, carried into each connection's thread.
     #[cfg(any(test, debug_assertions))]
     seam: aterm_uds::lan::Seam,
@@ -218,6 +274,7 @@ impl Shared {
             bonjour,
             log,
             live: AtomicUsize::new(0),
+            counts: Counts::new(),
             #[cfg(any(test, debug_assertions))]
             seam: aterm_uds::lan::seam(),
         }
@@ -307,80 +364,148 @@ impl Server {
         Ok(Self {
             listener,
             shared: Arc::new(Shared::new(admission, bonjour, log)),
+            sink: Sink::beside(socket),
         })
+    }
+
+    /// Accept one connection and count it: the connection to serve (`None` for one told the
+    /// broker is serving its most), and whether the counts are due to be written
+    /// ([`aterm_uds::tally::due`]: at the 1st, 2nd, 4th ... 256th connection, then each 256th).
+    ///
+    /// # Errors
+    /// The accept's error.
+    fn accept(&self) -> io::Result<(Option<CtlStream>, bool)> {
+        let stream = loop {
+            match aterm_uds::accept(
+                &self.listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.raw_os_error() == Some(libc::ECONNABORTED) => {}
+                Err(error) => return Err(error),
+            }
+        };
+        let due = aterm_uds::tally::due(self.shared.counts.add(Count::Accepted));
+        if self.shared.live.fetch_add(1, Ordering::AcqRel) >= MAX_LIVE {
+            self.shared.live.fetch_sub(1, Ordering::AcqRel);
+            self.shared.counts.add(Count::Busy);
+            let _ = wire::send(
+                &stream,
+                &Frame::Unchecked {
+                    words: format!("the LAN broker is serving {MAX_LIVE} connections"),
+                },
+            );
+            return Ok((None, due));
+        }
+        Ok((Some(stream), due))
+    }
+
+    /// One turn of the accept loop: accept a connection and count it, hand it to `serve` (not
+    /// one told the broker is serving its most), and then write the counts where they are due.
+    /// The write comes after the hand-off, so the connection it was due at is not kept from its
+    /// thread by it; a connection that arrives during the write waits in the listen queue for
+    /// it, which is one small file made and renamed at 9 of the first 256 connections and at
+    /// each 256th after. No timer writes the counts, so a broker nothing connects to writes
+    /// nothing.
+    ///
+    /// # Errors
+    /// The accept's error.
+    pub(crate) fn step(&mut self, serve: impl FnOnce(&Arc<Shared>, CtlStream)) -> io::Result<()> {
+        let (stream, due) = self.accept()?;
+        if let Some(stream) = stream {
+            serve(&self.shared, stream);
+        }
+        if due {
+            self.sink.write(&self.shared.counts, log);
+        }
+        Ok(())
     }
 
     /// Accept and serve connections, each on its own thread, until accepting fails.
     ///
     /// # Errors
     /// The accept's error.
-    pub(crate) fn run(self) -> io::Result<()> {
+    pub(crate) fn run(mut self) -> io::Result<()> {
         loop {
-            let (stream, _) = match aterm_uds::accept(
-                &self.listener,
-                aterm_uds::AcceptWait::Forever,
-                aterm_uds::AcceptedMode::Blocking,
-            ) {
-                Ok(accepted) => accepted,
-                Err(error) if error.raw_os_error() == Some(libc::ECONNABORTED) => continue,
-                Err(error) => return Err(error),
-            };
-            if self.shared.live.fetch_add(1, Ordering::AcqRel) >= MAX_LIVE {
-                self.shared.live.fetch_sub(1, Ordering::AcqRel);
-                let _ = wire::send(
-                    &stream,
-                    &Frame::Unchecked {
-                        words: format!("the LAN broker is serving {MAX_LIVE} connections"),
-                    },
-                );
-                continue;
-            }
-            let shared = Arc::clone(&self.shared);
-            let spawned = std::thread::Builder::new()
-                .name("lan-conn".into())
-                .spawn(move || {
-                    let _live = Live(&shared.live);
-                    #[cfg(any(test, debug_assertions))]
-                    aterm_uds::lan::seam_here(shared.seam.clone(), || connection(&shared, &stream));
-                    #[cfg(not(any(test, debug_assertions)))]
-                    connection(&shared, &stream);
-                });
-            if let Err(error) = spawned {
-                self.shared.live.fetch_sub(1, Ordering::AcqRel);
-                log(format_args!("no thread for a connection: {error}"));
-            }
+            self.step(|shared, stream| {
+                let serving = Arc::clone(shared);
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("lan-conn".into())
+                        .spawn(move || {
+                            let shared = serving;
+                            let _live = Live(&shared.live);
+                            // This thread was started for this connection: its whole CPU time is the
+                            // connection's, added when it ends and, for a standing operation, each
+                            // time it hears something.
+                            let mut cpu = aterm_uds::cpu::ThreadCpu::born();
+                            let mut spent = || cpu.add_to(&shared.counts.conn_cpu_ns);
+                            #[cfg(any(test, debug_assertions))]
+                            aterm_uds::lan::seam_here(shared.seam.clone(), || {
+                                connection(&shared, &stream, &mut spent);
+                            });
+                            #[cfg(not(any(test, debug_assertions)))]
+                            connection(&shared, &stream, &mut spent);
+                            spent();
+                        });
+                if let Err(error) = spawned {
+                    shared.live.fetch_sub(1, Ordering::AcqRel);
+                    shared.counts.add(Count::NoThread);
+                    log(format_args!("no thread for a connection: {error}"));
+                }
+            })?;
         }
     }
 }
 
-/// Serve one connection: admit its peer, exchange hellos, and answer its one request.
-pub(crate) fn connection(shared: &Shared, stream: &CtlStream) {
-    connection_clock(shared, stream, Instant::now);
+/// Serve one connection: admit its peer, exchange hellos, and answer its one request. `spent` is
+/// called where a standing operation heard something: the serving thread's CPU time so far can be
+/// added there (the accept loop's threads do; the direct path, on its caller's thread, adds none).
+pub(crate) fn connection(shared: &Shared, stream: &CtlStream, spent: &mut dyn FnMut()) {
+    connection_clock(shared, stream, Instant::now, spent);
 }
 
 #[cfg(test)]
 pub(crate) fn connection_at(shared: &Shared, stream: &CtlStream, started: Instant) {
-    connection_clock(shared, stream, || started);
+    connection_clock(shared, stream, || started, &mut || {});
 }
 
-fn connection_clock(shared: &Shared, stream: &CtlStream, started: impl FnOnce() -> Instant) {
+fn connection_clock(
+    shared: &Shared,
+    stream: &CtlStream,
+    started: impl FnOnce() -> Instant,
+    spent: &mut dyn FnMut(),
+) {
+    let ended = served(shared, stream, started, spent);
+    shared.counts.add(ended);
+}
+
+/// One connection served: the one way it ended, which [`connection_clock`] counts.
+fn served(
+    shared: &Shared,
+    stream: &CtlStream,
+    started: impl FnOnce() -> Instant,
+    spent: &mut dyn FnMut(),
+) -> Count {
     let pid = aterm_uds::fdpass::peer_pid(stream).unwrap_or(0);
-    if let Err(why) = shared.admission.check(stream) {
-        let judged = if matches!(why, CheckError::Refused(_)) {
-            "refused"
-        } else {
-            "could not check"
+    if let Err(why) = shared.admission.check(stream, &shared.counts) {
+        let (judged, ended) = match why {
+            CheckError::Refused(_) => ("refused", Count::Refused),
+            CheckError::Unchecked(_) => ("could not check", Count::Unchecked),
+            CheckError::Unanswered(_) => ("could not check", Count::Unanswered),
         };
         (shared.log)(format_args!("{judged} pid {pid}: {why}"));
         let _ = wire::send(stream, &not_admitted(why));
-        return;
+        return ended;
     }
+    shared.counts.add(Count::Admitted);
     let hello = Frame::Hello {
         protocol: aterm_uds::lan::PROTOCOL,
         build: aterm_uds::lan::hello_build().to_owned(),
     };
     if wire::send(stream, &hello).is_err() {
-        return;
+        return Count::HelloUnsent;
     }
     let mut reader = Reader::new(0);
     let deadline = Some(started() + REQUEST_HANG);
@@ -391,38 +516,51 @@ fn connection_clock(shared: &Shared, stream: &CtlStream, started: impl FnOnce() 
                 "pid {pid} speaks protocol {protocol} (build {build}), this broker {}",
                 aterm_uds::lan::PROTOCOL
             ));
-            return;
+            return Count::WrongProtocol;
         }
-        Ok(None) => return,
+        Ok(None) => return Count::ClosedUnsaid,
         Ok(Some(other)) => {
             (shared.log)(format_args!("pid {pid} opened with {other:?}"));
-            return;
+            return Count::WrongFirstFrame;
         }
         Err(error) => {
             (shared.log)(format_args!("pid {pid}: {error}"));
-            return;
+            return Count::ReadError;
         }
     }
     let request = match reader.frame(stream, deadline) {
         Ok(Some(Frame::Request(request))) => request,
         // A hello alone: `aterm lan status`.
-        Ok(None) => return,
+        Ok(None) => return Count::HelloOnly,
         Ok(Some(other)) => {
             (shared.log)(format_args!("pid {pid} asked {other:?}"));
-            return;
+            return Count::WrongRequestFrame;
         }
         Err(error) => {
             (shared.log)(format_args!("pid {pid}: {error}"));
-            return;
+            return Count::ReadError;
         }
     };
     if reader.buffered() {
         (shared.log)(format_args!("pid {pid} sent bytes past its one request"));
-        return;
+        return Count::TrailingBytes;
     }
-    if let Err((code, words)) = answer(shared, stream, request) {
-        (shared.log)(format_args!("pid {pid}: {words}"));
-        let _ = wire::send(stream, &Frame::Error { code, words });
+    shared.counts.add(match &request {
+        Request::Connect { .. } => Count::Connect,
+        Request::Udp { .. } => Count::Udp,
+        Request::Resolve { .. } => Count::Resolve,
+        Request::Browse { .. } => Count::Browse,
+        Request::ResolveService { .. } => Count::ResolveService,
+        Request::Query { .. } => Count::Query,
+        Request::Register(_) => Count::Register,
+    });
+    match answer(shared, stream, request, spent) {
+        Ok(()) => Count::Answered,
+        Err((code, words)) => {
+            (shared.log)(format_args!("pid {pid}: {words}"));
+            let _ = wire::send(stream, &Frame::Error { code, words });
+            Count::Failed
+        }
     }
 }
 
@@ -463,7 +601,12 @@ fn not_local(what: impl std::fmt::Display) -> Failure {
 }
 
 /// Answer `request` on `stream`: the reply, or the failure to send instead.
-fn answer(shared: &Shared, stream: &CtlStream, request: Request) -> Result<(), Failure> {
+fn answer(
+    shared: &Shared,
+    stream: &CtlStream,
+    request: Request,
+    spent: &mut dyn FnMut(),
+) -> Result<(), Failure> {
     match request {
         Request::Connect {
             target,
@@ -495,7 +638,9 @@ fn answer(shared: &Shared, stream: &CtlStream, request: Request) -> Result<(), F
                     .map_err(|e| failure(&e))?
                 }
                 Target::Host(name) => {
-                    let mut addrs = here::resolve(&name, port, within).map_err(|e| failure(&e))?;
+                    let mut addrs =
+                        here::resolve_counted(&name, port, within, &shared.counts.resolve_threads)
+                            .map_err(|e| failure(&e))?;
                     if !addrs
                         .iter()
                         .any(|addr| aterm_uds::lan::is_local_network(&addr.ip()))
@@ -544,7 +689,9 @@ fn answer(shared: &Shared, stream: &CtlStream, request: Request) -> Result<(), F
             if !aterm_uds::lan::is_local_name(&name) {
                 return Err(not_local(&name));
             }
-            let resolved = here::resolve(&name, 0, within(within_ms)?).map_err(|e| failure(&e))?;
+            let resolved =
+                here::resolve_counted(&name, 0, within(within_ms)?, &shared.counts.resolve_threads)
+                    .map_err(|e| failure(&e))?;
             let mut addrs: Vec<IpAddr> = Vec::new();
             for addr in resolved {
                 if !addrs.contains(&addr.ip()) && addrs.len() < wire::MAX_ITEMS {
@@ -555,7 +702,7 @@ fn answer(shared: &Shared, stream: &CtlStream, request: Request) -> Result<(), F
         }
         bonjour_request => {
             let mut live = shared.bonjour.start(&bonjour_request)?;
-            bonjour::drive(stream, live.as_mut())
+            bonjour::drive(stream, live.as_mut(), spent)
         }
     }
 }

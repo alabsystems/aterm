@@ -259,17 +259,106 @@ pub(crate) fn reports_its_own_end(trusted_cwd: Option<&str>) -> bool {
     })
 }
 
+/// The most bytes [`TaskRecord::line`] takes once percent-encoded, as its row carries it: the
+/// bound `docs/DESIGN-streams-2026-11-12.md` §6 sets on a description's one line.
+pub(crate) const TASK_LINE_MAX: usize = 256;
+
+/// The most bytes of a task's first line [`task_line`] gives the redactor: the word
+/// [`TASK_LINE_MAX`] falls in is judged whole up to here, and text past it is never shown, so no
+/// phrase there replaces the title.
+const TASK_LINE_JUDGED_MAX: usize = 4 * TASK_LINE_MAX;
+
+/// How many times [`task_line`] redacts and cuts again before it gives up on a line.
+const TASK_LINE_SETTLE: usize = 4;
+
+/// THE TASK'S FIRST LINE as a title reads it: the first line of `task` that draws something,
+/// with each character no title shows dropped (a blank one read as a space) before anything
+/// judges it, so none splits a credential the redactor would see whole; trimmed and kept literal
+/// (a leading `#` stays); cut past [`TASK_LINE_MAX`] bytes at the end of the word the bound falls
+/// in; its credentials redacted ([`crate::survey::redact`]: a spawn's author cannot be shown to
+/// be a person, §6); and cut at whole graphemes to [`TASK_LINE_MAX`] encoded bytes, redacted and
+/// cut again until nothing changes, since a cut inside a word can leave one the redactor judges
+/// anew. `None` where no line draws anything, where the redactor replaces the whole line (its
+/// placeholder names no session), and where the line does not settle. A line it returns reads
+/// back as itself, so a stored row's line is read through it again.
+#[must_use]
+pub(crate) fn task_line(task: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(task);
+    let first = text
+        .lines()
+        .find(|line| !line.chars().all(crate::task_launch::draws_nothing))?;
+    let shown: String = first
+        .chars()
+        .filter_map(|c| {
+            if !crate::session_timeline::is_forbidden_metadata_char(c) {
+                Some(c)
+            } else if c.is_whitespace() {
+                Some(' ')
+            } else {
+                None
+            }
+        })
+        .collect();
+    let judged = through_word_at(shown.trim(), TASK_LINE_MAX, TASK_LINE_JUDGED_MAX);
+    let mut line = cut_to_encoded(&crate::survey::redact(judged), TASK_LINE_MAX);
+    let mut settled = false;
+    for _ in 0..TASK_LINE_SETTLE {
+        let again = cut_to_encoded(&crate::survey::redact(&line), TASK_LINE_MAX);
+        if again == line {
+            settled = true;
+            break;
+        }
+        line = again;
+    }
+    (settled && !line.is_empty() && line != crate::survey::REDACTED_LINE).then_some(line)
+}
+
+/// `text` through the end of the word byte `at` falls in (to the next
+/// [`crate::survey::is_token_break`]), and never past `most` bytes, each cut on a character
+/// boundary.
+fn through_word_at(text: &str, at: usize, most: usize) -> &str {
+    if text.len() <= at {
+        return text;
+    }
+    let mut end = text.len().min(most);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut from = at;
+    while !text.is_char_boundary(from) {
+        from -= 1;
+    }
+    let word_end = text[from..end]
+        .find(crate::survey::is_token_break)
+        .map_or(end, |offset| from + offset);
+    &text[..word_end]
+}
+
+/// `text` cut at whole graphemes to `max` percent-encoded bytes, its trailing blanks trimmed.
+fn cut_to_encoded(text: &str, max: usize) -> String {
+    use aterm_grapheme::GraphemeClusters as _;
+    let mut kept = text.len();
+    if aterm_codec::pct::encoded_len(text) > max {
+        let mut encoded = 0;
+        kept = 0;
+        for grapheme in text.graphemes() {
+            encoded += aterm_codec::pct::encoded_len(grapheme);
+            if encoded > max {
+                break;
+            }
+            kept += grapheme.len();
+        }
+    }
+    text[..kept].trim().to_owned()
+}
+
 /// Default `from=` value when a task is started by `ctl` without a caller session ID.
 pub(crate) const FROM_CTL: &str = "ctl";
 
-/// Whether `from` is `ctl` or a valid global session ID (`s-<hex>`).
+/// Whether `from` is `ctl` or a tab's ID in either form ([`crate::keeper_link::valid_sid`]).
 #[must_use]
 pub(crate) fn valid_from(from: &str) -> bool {
-    from == FROM_CTL
-        || (from.len() <= 64
-            && from
-                .strip_prefix("s-")
-                .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())))
+    from == FROM_CTL || crate::keeper_link::valid_sid(from)
 }
 
 /// Directory where task result files live (`<state>/tasks/`).
@@ -380,6 +469,15 @@ pub(crate) struct TaskRecord {
     /// The fact word's own revision (`fact_rev=`): moved by every edit of [`Self::fact`], never by
     /// a mark, and never moving [`Self::rev`], so no `await task` past a rev wakes on it.
     pub(crate) fact_rev: u64,
+    /// THE TASK'S FIRST LINE ([`task_line`]): the line an agent worker's spawn gave its task first,
+    /// which names the session in both title ladders ahead of its folder
+    /// (`crate::app_tabs::resolved_terminal_title_rung`,
+    /// `crate::App::tab_label_of_session`). The task file it came from goes at a quit
+    /// (`crate::task_launch::retire_task_files_at_quit`) and a restored session has a new ID, so
+    /// the record keeps it and a carry row holds it (`line=`). A mark never touches it, and a turn
+    /// does not move it: it names the task the spawn gave. `None` for a program worker, whose task
+    /// is its program's input, and for a record no spawn made.
+    pub(crate) line: Option<String>,
 }
 
 impl TaskRecord {
@@ -533,6 +631,10 @@ impl TaskRecord {
             out.push_str(" trusted_cwd=");
             out.push_str(&crate::control::pct_encode(folder));
         }
+        if let Some(line) = &self.line {
+            out.push_str(" line=");
+            out.push_str(&crate::control::pct_encode(line));
+        }
         if let Some(block) = self.program_block {
             out.push_str(&format!(" block={block}"));
         }
@@ -574,6 +676,9 @@ impl TaskRecord {
     /// standing, as after a plain restart, so noting the same episode again wakes no `facts=1`
     /// waiter twice; the loop clears a carried word no open hold stands for (aterm-agent's
     /// `Session::door_task_seed`).
+    ///
+    /// A `line=` reads as the line [`task_line`] makes of it (an older writer's row has none), so
+    /// one a hand wrote, of several lines or over the bound, never refuses the record.
     #[must_use]
     pub(crate) fn from_carry_row(
         row: &str,
@@ -667,6 +772,9 @@ impl TaskRecord {
                 .filter(|_| fact_rev > 0)
                 .and_then(FactWord::parse),
             fact_rev,
+            line: field("line")
+                .map(aterm_codec::pct::decode)
+                .and_then(|line| task_line(line.as_bytes())),
         })
     }
 
@@ -820,7 +928,7 @@ pub(crate) const PROGRAM_MARK_BY_HARNESS: &str = "ERR task mark: a program worke
 fn loop_carries(ctx: &SessionCtx) -> bool {
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     meta.live_supervisor(crate::metrics::now_us()).is_some()
-        && meta.autopilot_word() != Some(aterm_agent::supervise::Autopilot::Off)
+        && meta.autopilot_word() != Some(alab_policy::config::Autopilot::Off)
 }
 
 /// The [`TASK_WHY`] word `value` is, as its `'static` spelling.
@@ -985,6 +1093,7 @@ impl TaskMark {
                 program_block: None,
                 fact: None,
                 fact_rev: 0,
+                line: None,
             };
             return (record, true);
         };
@@ -1123,7 +1232,7 @@ pub(crate) fn owner_moves_task(owner: &str) -> bool {
 }
 
 /// [`supervisor_asks`] in `meta` beside the needs sets every reader reads
-/// ([`crate::needs::told_of`]): a proven self-claim's own while it stands
+/// ([`crate::needs::told_of`]): those of a claim with an act proof while it stands
 /// ([`crate::session_timeline::SessionMeta::self_needs`]), else those aterm's own loop told
 /// `timeline`, read under the two locks the caller holds, the meta's taken first.
 pub(crate) fn asks_standing(
@@ -1569,11 +1678,11 @@ pub(crate) fn reopen_at_turn(ctx: &SessionCtx, local_id: u64, by: &TurnBy, found
 #[must_use]
 pub(crate) fn autopilot_mark(
     record: &TaskRecord,
-    word: Option<aterm_agent::supervise::Autopilot>,
+    word: Option<alab_policy::config::Autopilot>,
     set_by: Option<&crate::session_timeline::AutopilotSetBy>,
     now_unix_ms: u64,
 ) -> Option<TaskMark> {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     if record.runs_a_program() {
         return None;
     }
@@ -1619,7 +1728,7 @@ pub(crate) const OFF_SETTLES_MS: u64 = 3_000;
 #[must_use]
 pub(crate) fn off_settles_in(
     record: &TaskRecord,
-    word: Option<aterm_agent::supervise::Autopilot>,
+    word: Option<alab_policy::config::Autopilot>,
     set_by: Option<&crate::session_timeline::AutopilotSetBy>,
     now_unix_ms: u64,
 ) -> Option<std::time::Duration> {
@@ -1629,7 +1738,7 @@ pub(crate) fn off_settles_in(
     let set_by = set_by.filter(|by| by.actor != aterm_slog::Actor::Aterm)?;
     let set_ms = u64::try_from(set_by.since_ms).ok()?;
     let settles = set_ms.saturating_add(OFF_SETTLES_MS);
-    (word? == aterm_agent::supervise::Autopilot::Off
+    (word? == alab_policy::config::Autopilot::Off
         && record.state == TaskState::Working
         && set_ms >= record.since_unix_ms
         && now_unix_ms < settles)

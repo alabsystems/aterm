@@ -13,6 +13,8 @@ description = "aterm — the one-command release cutter behind the `targo --unve
 # The cutter is the binary. The integration tests `#[path]`-mount its src/ into one
 # test binary, tests/it/main.rs; every mount recompiles the cutter and reruns its inline
 # tests, so this bin has `test = false` and each inline test runs once, in `it`:
+# `bench = false` also excludes Cargo's implicit benchmark harness: the CLI has no
+# benchmark cases, and that harness would compile the cutter a second time under test.
 #  - `targo --unverified test --bin aterm-release` runs nothing; `-p aterm-release` and
 #    `--tests` run the lib's tests and `it`.
 #  - `it` reaches `pub(crate)` items through the mounts, which carry
@@ -23,6 +25,7 @@ description = "aterm — the one-command release cutter behind the `targo --unve
 name = "aterm-release"
 path = "src/main.rs"
 test = false
+bench = false
 
 # The lib holds only what needs none of the cutter: the repair worker a failed cut opens
 # (src/repair.rs), which the binary links. Its tests run in the lib's own test binary
@@ -149,6 +152,11 @@ aterm-dirfd.workspace = true
 # The cutter's native-exec handoff blocks HUP/INT/TERM until the new image installs its
 # handlers, then restores only the signals the old image newly blocked.
 libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Read-only mappings and private delete-on-close snapshots use the generated,
+# SDK-checked Win32 declaration closure.
+aterm-win32 = { workspace = true }
 
 [dev-dependencies]
 # Binds the release-floor resolver and late guard to their derived lifecycle model.

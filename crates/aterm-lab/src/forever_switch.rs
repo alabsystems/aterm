@@ -112,7 +112,7 @@ pub const COMMAND_PAST_MS: i64 = 30_000;
 
 /// The words ending the `WAITING` line the loop journals for the person who typed a draft: its
 /// hands-off hold, until their grace runs out.
-pub const PERSON_HOLD: &str = turn_end::PERSON_TYPING;
+pub const PERSON_HOLD: &str = alab_policy::words::PERSON_TYPING;
 
 /// How long past the person's grace from the clearing the loop's hold may run: the loop reads
 /// their last key at its next look, every few seconds at rest, later under load.
@@ -266,11 +266,14 @@ pub fn land_at_once(seen: &Seen, t0: i64) -> Verdict {
     else {
         return Verdict::Unobserved(format!("no point judged within {}", at(t0, seen.end_ms)));
     };
-    let line = seen.acts(turn_end::RULE_LAND).first().map(|(t, _)| *t);
+    let line = seen
+        .acts(alab_policy::words::RULE_LAND)
+        .first()
+        .map(|(t, _)| *t);
     let wrote = seen.cover.typed.as_deref().and_then(|typed| {
         typed
             .iter()
-            .find(|a| a.rule.as_deref() == Some(turn_end::RULE_LAND) && a.sent_ms >= t0)
+            .find(|a| a.rule.as_deref() == Some(alab_policy::words::RULE_LAND) && a.sent_ms >= t0)
     });
     let after = |t: i64| {
         let gap = t - point.ts;
@@ -496,7 +499,7 @@ pub fn land_once(seen: &Seen, t0: i64) -> Verdict {
         .into_iter()
         .filter(|(t, _)| *t >= t0)
         .collect();
-    let land = |l: &Line| act_rule(&l.1) == Some(turn_end::RULE_LAND);
+    let land = |l: &Line| act_rule(&l.1) == Some(alab_policy::words::RULE_LAND);
     if let Some(w) = acts.windows(2).find(|w| land(w[0]) && land(w[1])) {
         return Verdict::Fail(format!(
             "land@v1 typed at +{} and again at +{}, no act between",
@@ -523,7 +526,7 @@ pub fn held_noted(seen: &Seen, t0: i64) -> Verdict {
     };
     let Some(a) = typed
         .iter()
-        .find(|a| a.rule.as_deref() == Some(turn_end::RULE_LAND) && a.sent_ms >= t0)
+        .find(|a| a.rule.as_deref() == Some(alab_policy::words::RULE_LAND) && a.sent_ms >= t0)
     else {
         return Verdict::Unobserved("no land@v1 written on the tapes".to_string());
     };
@@ -672,7 +675,7 @@ fn land_within(
     t0: i64,
     (said, bad): (&mut Vec<String>, &mut Vec<String>),
 ) -> Option<i64> {
-    let lands = seen.acts(turn_end::RULE_LAND);
+    let lands = seen.acts(alab_policy::words::RULE_LAND);
     let Some((tl, _)) = lands.iter().copied().find(|(t, _)| *t >= from) else {
         bad.push(format!(
             "no land@v1 typed from +{} within {}",
@@ -719,7 +722,7 @@ fn land_within(
     if !again.is_empty() {
         bad.push(format!("land@v1 typed again: {}", named(&again, t0)));
     }
-    if seen.typed_row(turn_end::RULE_LAND, *tl).is_none() {
+    if seen.typed_row(alab_policy::words::RULE_LAND, *tl).is_none() {
         bad.push(format!(
             "land@v1 journaled at +{}, but no ledger row typed",
             at(t0, *tl)
@@ -1229,14 +1232,14 @@ pub fn judge_over_held(seen: &Seen, t0: i64) -> Verdict {
         at(t0, ta),
         at(0, ta - sw.at)
     ));
-    if rule != turn_end::RULE_LAND {
+    if rule != alab_policy::words::RULE_LAND {
         bad.push(format!("the act after the switch was {rule}, not land@v1"));
     }
     if ta - sw.at > LAND_WITHIN_MS {
         bad.push(format!("past {} s of the switch", LAND_WITHIN_MS / 1000));
     }
-    let text = seen.act_text(turn_end::RULE_LAND, ask);
-    if turn_end::is_switch_ask(text) {
+    let text = seen.act_text(alab_policy::words::RULE_LAND, ask);
+    if alab_policy::words::is_switch_ask(text) {
         said.push(format!("opened by the why: \"{}\"", one_line(text, 150)));
     } else {
         bad.push(format!(
@@ -1246,7 +1249,7 @@ pub fn judge_over_held(seen: &Seen, t0: i64) -> Verdict {
     }
     if let Some(reply) = held_reply(seen, *ts) {
         // The journal's point keeps the reply's bullet (`⏺ `), which the loop's reply has not.
-        let quote = turn_end::held_quote(reply);
+        let quote = alab_policy::words::held_quote(reply);
         let head: String = quote
             .trim_start_matches(|c: char| !c.is_alphanumeric())
             .chars()

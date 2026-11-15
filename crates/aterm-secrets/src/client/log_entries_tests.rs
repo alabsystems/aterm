@@ -113,22 +113,23 @@ pub(super) fn clone_identity_to(src: &Paths, dst: &Paths) {
     fsx::write_atomic(&dst.identity_file(), &id_bytes, 0o600).expect("write dst identity");
 }
 
-fn snapshot_materialized_secrets(home: &Path) -> BTreeMap<String, Vec<u8>> {
-    let mut out = BTreeMap::new();
-    let secrets_dir = home.join(".secrets");
-    if let Ok(entries) = std::fs::read_dir(&secrets_dir) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_file()) {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                out.insert(name, std::fs::read(entry.path()).expect("read secret file"));
-            }
-        }
-    }
-    out
+/// Every name `paths`'s Mac reads by name ([`State::held`], as its last apply recorded them),
+/// each with the value it reads in place.
+fn read_in_place_values(paths: &Paths) -> BTreeMap<String, Vec<u8>> {
+    load_state(paths)
+        .unwrap()
+        .held
+        .unwrap_or_default()
+        .into_keys()
+        .map(|name| {
+            let value = stored(paths, &name).unwrap_or_else(|| panic!("{name} reads in place"));
+            (name, value)
+        })
+        .collect()
 }
 
 #[test]
-fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
+fn a_mac_reads_the_same_values_from_the_log_as_from_the_envelope() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let m22 = Paths::for_home(&root.path().join("m22"));
     let vault_file = root.path().join("alab.vault");
@@ -190,8 +191,8 @@ fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
     join_host(&m7_env, &pinned, "m7");
     enroll_commons(&m22, &m7_env);
 
-    // Record everything `m7_env` materialized from the envelope BEFORE Genesis v2 seeds the log.
-    let env_files = snapshot_materialized_secrets(&m7_env.home);
+    // Record everything `m7_env` reads from the envelope BEFORE Genesis v2 seeds the log.
+    let env_files = read_in_place_values(&m7_env);
     let env_state = load_state(&m7_env).unwrap();
     let env_sight = sight(&m7_env).unwrap().expect("envelope sight");
     let env_commons = match observe_commons(&m7_env).unwrap() {
@@ -223,14 +224,14 @@ fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
     assert!(full_log.has_epochs());
 
     // Clone m7's identity onto a fresh Mac (`m7_log`), give it the seeded `.records` store, and
-    // join: it materializes from the log and produces byte-identical files, manifest, sight,
-    // Commons observation, and `read_verified_entry`!
+    // join: it applies from the log and reads byte-identical values, the same recorded entries,
+    // sight, Commons observation, and `read_verified_entry`!
     let m7_log = Paths::for_home(&root.path().join("m7-log"));
     clone_identity_to(&m7_env, &m7_log);
     fsx::write_atomic(&m7_log.records_file(), &full_store.encode(), 0o600).unwrap();
     join_host(&m7_log, &pinned, "m7");
 
-    let log_files = snapshot_materialized_secrets(&m7_log.home);
+    let log_files = read_in_place_values(&m7_log);
     let log_state = load_state(&m7_log).unwrap();
     let log_sight = sight(&m7_log).unwrap().expect("log sight");
     let log_commons = match observe_commons(&m7_log).unwrap() {
@@ -246,9 +247,9 @@ fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
         log_state.records_digest.is_some(),
         "log-backed sync must record records_digest"
     );
+    assert!(!env_files.is_empty());
     assert_eq!(log_files, env_files);
-    assert_eq!(log_state.manifest.files, env_state.manifest.files);
-    assert_eq!(log_state.own, env_state.own);
+    assert_eq!(log_state.held, env_state.held);
     assert_eq!(log_sight.held, env_sight.held);
     assert_eq!(log_commons, env_commons);
     assert_eq!(
@@ -257,8 +258,8 @@ fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
     );
 
     // Negative control: a Put only the log holds (drafted on m22 after the stamped version, never
-    // published in an envelope). A Mac whose log holds it writes its value, which the envelope
-    // never carried: the files above came from the log.
+    // published in an envelope). A Mac whose log holds it reads its value, which the envelope
+    // never carried: the values above came from the log.
     let mut edited = admin_open(&m22).unwrap().doc.clone();
     edited
         .set_entry(&Audience::Everyone, "shared-api-key", b"sk-log-only-02")
@@ -285,7 +286,7 @@ fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
     clone_identity_to(&m7_env, &m7_ahead);
     fsx::write_atomic(&m7_ahead.records_file(), &log_only.encode(), 0o600).unwrap();
     join_host(&m7_ahead, &pinned, "m7");
-    let ahead_files = snapshot_materialized_secrets(&m7_ahead.home);
+    let ahead_files = read_in_place_values(&m7_ahead);
     assert_eq!(
         ahead_files.get("shared-api-key").map(Vec::as_slice),
         Some(b"sk-log-only-02".as_slice())
@@ -294,8 +295,8 @@ fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
 
 /// Law 5 on two lab Macs: m22 and m7 each `Put` the `[everyone]` entry `race-token` beside the
 /// other and each receives the other's after its own. Both open the lower record id's value as a
-/// conflict from their own logs, both `Put`s survive in each store, both Macs write that value to
-/// disk, and one later save settles the conflict.
+/// conflict from their own logs, both `Put`s survive in each store, both Macs read that value in
+/// place, and one later save settles the conflict.
 ///
 /// No arrival-order control fits here: a Mac reads its log from its records file, which the
 /// records cache recovers ([`crate::membership_log::Store::recover`]) inserting each record after
@@ -306,7 +307,7 @@ fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
 /// across inserts, where
 /// `entries::tests::every_arrival_order_of_concurrent_writes_reads_the_same_entries` catches it.
 #[test]
-fn concurrent_puts_both_survive_and_every_mac_writes_the_same_one() {
+fn concurrent_puts_both_survive_and_every_mac_reads_the_same_one() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s1 = start_loopback_server(&root.path().join("s1"));
     let url = format!("http://{}/v1/alab", s1.addr);
@@ -402,7 +403,7 @@ fn concurrent_puts_both_survive_and_every_mac_writes_the_same_one() {
         })
         .unwrap();
 
-    // Deliver in opposite orders locally BEFORE talking to the server, then materialize on each:
+    // Deliver in opposite orders locally BEFORE talking to the server, then apply on each:
     save_records(&m22, put_m22.bytes()).unwrap();
     save_records(&m22, put_m7.bytes()).unwrap();
     save_records(&m7, put_m7.bytes()).unwrap();
@@ -434,7 +435,7 @@ fn concurrent_puts_both_survive_and_every_mac_writes_the_same_one() {
         assert_eq!(opens(paths), (Some(expected_winner.to_vec()), true));
     }
 
-    // Post both to server so envelope fetch sees no conflict and both Macs materialize from log.
+    // Post both to server so envelope fetch sees no conflict and both Macs apply from the log.
     transport::post_records(&url, &encode_records([&put_m22, &put_m7])).unwrap();
 
     // Both sibling Puts survive in each Mac's store and `conflicts` flags `race-token`.
@@ -455,14 +456,14 @@ fn concurrent_puts_both_survive_and_every_mac_writes_the_same_one() {
         );
     }
 
-    // BOTH Macs write the exact value of the lower `RecordId`: m7 from the log, and m22, an admin
+    // BOTH Macs read the exact value of the lower `RecordId`: m7 from the log, and m22, an admin
     // whose log moved, by mirroring the merged log (which leaves both values candidates).
-    sync(&m7, None).expect("m7 materializes concurrent puts");
-    sync(&m22, None).expect("m22 materializes concurrent puts");
+    sync(&m7, None).expect("m7 applies concurrent puts");
+    sync(&m22, None).expect("m22 applies concurrent puts");
     sync(&m7, None).expect("m7 applies m22's mirror");
     for paths in [&m22, &m7] {
-        let disk = std::fs::read(paths.home.join(".secrets/race-token")).unwrap();
-        assert_eq!(disk.as_slice(), expected_winner);
+        let read = stored(paths, "race-token").unwrap();
+        assert_eq!(read.as_slice(), expected_winner);
     }
 
     // One subsequent save whose parents include both concurrent heads resolves the conflict!
@@ -483,8 +484,8 @@ fn concurrent_puts_both_survive_and_every_mac_writes_the_same_one() {
             .unwrap()
             .unwrap();
         assert!(opened.conflicts.is_empty());
-        let disk = std::fs::read(paths.home.join(".secrets/race-token")).unwrap();
-        assert_eq!(disk.as_slice(), b"resolved-once");
+        let read = stored(paths, "race-token").unwrap();
+        assert_eq!(read.as_slice(), b"resolved-once");
     }
 
     s1.stop();
@@ -623,17 +624,11 @@ fn an_entry_edited_on_the_lower_seq_side_of_a_split_survives_the_heal() {
 
     // --- HEAL ---
     // 1. Even before any admin rebuilds the envelope mirror, v2 member `m_v2` unions `.records`
-    //    across `[url1, url2]` and materializes BOTH islands' edits!
+    //    across `[url1, url2]` and reads BOTH islands' edits!
     sync_with_candidates(&m_v2, None, &[url1.clone(), url2.clone()])
         .expect("m_v2 syncs unioned log across heal");
-    assert_eq!(
-        std::fs::read(m_v2.home.join(".secrets/split-key")).unwrap(),
-        b"v1-from-lower-seq"
-    );
-    assert_eq!(
-        std::fs::read(m_v2.home.join(".secrets/other-key")).unwrap(),
-        b"v3-from-higher-seq"
-    );
+    assert_eq!(stored(&m_v2, "split-key").unwrap(), b"v1-from-lower-seq");
+    assert_eq!(stored(&m_v2, "other-key").unwrap(), b"v3-from-higher-seq");
     // An F10 handover bundle built by `m_v2` before any envelope mirror reads `[everyone]`
     // entries from the membership log (returning `other-key = v3-from-higher-seq` even though
     // `m_v2`'s cached envelope from `s1` still holds `other-key = v0`).
@@ -1226,8 +1221,9 @@ pub(super) fn member_key(paths: &Paths) -> (Bootstrap, crate::membership_log::Me
     (bootstrap, actor, incarnation)
 }
 
-/// A real apply under the former host-wrapper selector, with the current signed heads.
-/// The current selector chooses `current`, while the materialized file still holds `stale`.
+/// A real apply under the former host-wrapper selector, with the current signed heads: it read
+/// `stale` in place and recorded that selection, which the current selector, choosing `current`,
+/// does not hold.
 pub(super) fn stale_host_materialization(log_only: bool, legacy: bool) -> (TwoMacs, Paths) {
     let lab = two_macs(&[
         (Audience::Everyone, "shared", b"initial"),
@@ -1334,10 +1330,7 @@ pub(super) fn stale_host_materialization(log_only: bool, legacy: bool) -> (TwoMa
         }
         .unwrap();
         assert!(matches!(outcome, SyncOutcome::Applied { .. }));
-        assert_eq!(
-            std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
-            b"stale"
-        );
+        assert_eq!(stored(&reader, "shared").unwrap(), b"stale");
     });
     if legacy {
         // A real old process saved the same state without the new optional receipt.
@@ -1371,8 +1364,10 @@ pub(super) fn stale_host_materialization(log_only: bool, legacy: bool) -> (TwoMa
             .as_slice(),
         b"current"
     );
-    assert!(changed_files(&reader, &state).is_empty());
-    assert!(gaps(&reader, &state).is_empty());
+    assert!(
+        local_intact(&reader, &state),
+        "the apply finished: only its selection is stale"
+    );
     assert_eq!(state.network_materialization.is_none(), log_only);
     (lab, reader)
 }
@@ -1803,7 +1798,7 @@ fn a_lab_written_from_a_template_is_the_lab_it_copies() {
     admin_publish(&first.m22, &admin, &doc).unwrap();
     sync(&first.m7, None).unwrap();
     sync(&second.m7, None).unwrap();
-    let shared = |paths: &Paths| std::fs::read(paths.home.join(".secrets/shared")).unwrap();
+    let shared = |paths: &Paths| stored(paths, "shared").unwrap();
     assert_eq!(shared(&first.m7), b"first");
     assert_eq!(shared(&second.m7), b"copied", "the other lab heard nothing");
     assert_eq!(shared(&second.m22), b"copied");
@@ -1859,7 +1854,7 @@ fn a_clone_and_a_copy_of_a_home_are_the_same_tree() {
 }
 
 #[test]
-fn a_log_behind_the_envelope_never_writes_an_older_value() {
+fn a_log_behind_the_envelope_never_reads_an_older_value() {
     use crate::need::{self, GhProfile, Purpose, Want};
 
     let macs = two_macs(&[(
@@ -1879,17 +1874,14 @@ fn a_log_behind_the_envelope_never_writes_an_older_value() {
     let rotated = std::fs::read(m22.cache_file()).unwrap();
 
     // s2 holds the rotated version and none of its records (the held 0.145 server takes no
-    // records, or the POST failed): a Mac on s2 with no log yet writes v2 from the envelope.
+    // records, or the POST failed): a Mac on s2 with no log yet reads v2 from the envelope.
     let s2 = start_loopback_server(&macs.root.path().join("s2"));
     let url2 = format!("http://{}/v1/alab", s2.addr);
     transport::publish(&Source::Url(url2.clone()), &rotated).expect("seed s2 envelope");
     let p = Paths::for_home(&macs.root.path().join("p"));
     clone_identity_to(m7, &p);
     join_host(&p, &format!("{url2}#{}", macs.signer), "m7");
-    assert_eq!(
-        std::fs::read(p.home.join(".secrets/gh_access_token")).unwrap(),
-        b"token-v2"
-    );
+    assert_eq!(stored(&p, "gh_access_token").unwrap(), b"token-v2");
     need::test_alab_policy(&p);
     let paired = || {
         let config = config(&p).unwrap().unwrap();
@@ -1927,18 +1919,15 @@ fn a_log_behind_the_envelope_never_writes_an_older_value() {
     sync(&p, None).expect("p syncs the genesis-era log");
     assert!(load_records(&p).unwrap().log().is_some());
     assert_eq!(
-        std::fs::read(p.home.join(".secrets/gh_access_token")).unwrap(),
+        stored(&p, "gh_access_token").unwrap(),
         b"token-v2",
-        "a log behind the envelope wrote the older value over the newer file"
+        "a log behind the envelope read the older value over the newer one"
     );
 
     // Once the rotation's records reach s2 the log holds the version, and p reads it from there.
     transport::post_records(&url2, &load_records(m22).unwrap().encode()).unwrap();
     sync(&p, None).expect("p syncs the whole log");
-    assert_eq!(
-        std::fs::read(p.home.join(".secrets/gh_access_token")).unwrap(),
-        b"token-v2"
-    );
+    assert_eq!(stored(&p, "gh_access_token").unwrap(), b"token-v2");
     assert!(load_state(&p).unwrap().records_digest.is_some());
     let covers = paired();
     assert_eq!(covers.sequence(), envelope.sequence());
@@ -2050,7 +2039,7 @@ fn no_seat_edit_survives_mirror(parented: bool) {
         .unwrap()
         .digest();
     // m22, the seated admin, mirrors: the edit stays in the envelope, reaches
-    // the log, and m7 writes it. An explicit upgrade keeps the parent guard.
+    // the log, and m7 reads it. An explicit upgrade keeps the parent guard.
     let _ = admin_mirror_log(m22, &[]).expect("admin_mirror_log");
     if parented {
         let mirrored = envelope::parse(&std::fs::read(m22.cache_file()).unwrap()).unwrap();
@@ -2064,10 +2053,7 @@ fn no_seat_edit_survives_mirror(parented: bool) {
         "the mirror reverted an edit the log never held"
     );
     sync(m7, None).expect("m7 syncs");
-    assert_eq!(
-        std::fs::read(m7.home.join(".secrets/shared")).unwrap(),
-        b"v2-from-m9"
-    );
+    assert_eq!(stored(m7, "shared").unwrap(), b"v2-from-m9");
     let m7_cfg = config(m7).unwrap().unwrap();
     let m7_cached = envelope::parse(&std::fs::read(m7.cache_file()).unwrap()).unwrap();
     assert!(
@@ -2204,10 +2190,7 @@ fn an_epoch_minted_outside_a_host_list_never_seals_that_lists_next_write() {
     doc.set_entry(&ring, "release-cred", b"ring-v2-rotated")
         .unwrap();
     admin_publish(m22, &admin, &doc).expect("rotate release-cred");
-    assert_eq!(
-        std::fs::read(m22.home.join(".secrets/release-cred")).unwrap(),
-        b"ring-v2-rotated"
-    );
+    assert_eq!(stored(m22, "release-cred").unwrap(), b"ring-v2-rotated");
 
     // m7 holds K_X (it minted it): a Wrap to itself in its own copy is all it needs to open
     // whatever was sealed under K_X. The rotated value must be sealed under an epoch it never
@@ -2303,13 +2286,10 @@ fn a_mac_the_envelope_admits_stays_in_while_the_log_holds_no_wrap_for_it() {
     // m9 joins before any record reaches it, and reads the envelope.
     join_host(&m9, &pinned, "m9");
     assert_eq!(load_state(&m9).unwrap().membership, Stored::In);
-    assert_eq!(
-        std::fs::read(m9.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v1"
-    );
+    assert_eq!(stored(&m9, "shared").unwrap(), b"everyone-v1");
 
     // The genesis-era log reaches it. The log never removed m9, and the envelope still lets it
-    // in: m9 stays in and keeps its files.
+    // in: m9 stays in and keeps reading its entries.
     fsx::write_atomic(&m9.records_file(), &seeded, 0o600).unwrap();
     sync(&m9, None).expect("m9 syncs with the log");
     assert_eq!(
@@ -2674,13 +2654,10 @@ fn an_admin_outside_a_host_list_deletes_an_entry_there_for_every_mac_in_it() {
         "m7 still reads the log"
     );
     assert!(
-        !m7.home.join(".secrets/m7-cred").exists(),
+        stored(m7, "m7-cred").is_none(),
         "a Mac in [m7] kept an entry an admin outside it deleted"
     );
-    assert_eq!(
-        std::fs::read(m7.home.join(".secrets/m7-keep")).unwrap(),
-        b"keep-v1"
-    );
+    assert_eq!(stored(m7, "m7-keep").unwrap(), b"keep-v1");
 
     macs.server.stop();
     drop(macs.root);
@@ -2817,8 +2794,8 @@ fn an_admin_outside_a_host_list_that_drops_its_section_deletes_every_entry_there
 /// `remove_from_log` covers a log without them (one seeded before F18, or one
 /// `trusted_commons_log` does not trust).
 ///
-/// NEGATIVE CONTROL (before F18 merged): drop `remove_from_log` from `admin_revoke`: m7 writes the
-/// revoked Mac's value into `~/.secrets/gh-token`. Since F18, dropping it as well as the in-log
+/// NEGATIVE CONTROL (before F18 merged): drop `remove_from_log` from `admin_revoke`: m7 reads the
+/// revoked Mac's value as `gh-token`. Since F18, dropping it as well as the in-log
 /// retirement fails the revoke ("Commons retirement did not retain the requested restriction").
 #[test]
 fn a_revoked_mac_cannot_rewrite_an_entry_for_the_macs_that_read_the_log() {
@@ -2897,7 +2874,7 @@ fn a_revoked_mac_cannot_rewrite_an_entry_for_the_macs_that_read_the_log() {
 
     sync(&m7, None).expect("m7 syncs after the forged Put");
     assert_eq!(
-        std::fs::read(m7.home.join(".secrets/gh-token")).unwrap(),
+        stored(&m7, "gh-token").unwrap(),
         b"token-v1",
         "a revoked Mac rewrote an entry on a Mac that reads the log"
     );
@@ -2922,7 +2899,7 @@ fn a_revoked_mac_cannot_rewrite_an_entry_for_the_macs_that_read_the_log() {
 const SPLIT_TOKEN: &str = "aterm-claude-token-ac-0123456789abcdef";
 
 /// Two admins save different values for one entry while split. After the heal each admin's own
-/// pass mirrors the merged log, every Mac writes the same value, and the other stays a candidate:
+/// pass mirrors the merged log, every Mac reads the same value, and the other stays a candidate:
 /// status names the conflict until a person saves the entry, which settles it. A Claude Code
 /// token's conflict is named as one (`token`), which the token call picks, not `aterm secrets set`.
 ///
@@ -2975,11 +2952,11 @@ fn a_conflict_stays_until_a_person_saves_it_and_status_names_it() {
         conflict,
         "the heal settled a conflict nobody saw"
     );
-    let winner = std::fs::read(lab.m_v2.home.join(".secrets/split-key")).unwrap();
+    let winner = stored(&lab.m_v2, "split-key").unwrap();
     assert!(winner == b"from-st1" || winner == b"from-st2");
     assert_eq!(conflicts(&lab.st1).unwrap(), conflict);
 
-    // A person saves the value every Mac writes: that settles it.
+    // A person saves the value every Mac reads: that settles it.
     let mut a = admin_open(&lab.st1).unwrap();
     assert_eq!(
         a.doc
@@ -2996,10 +2973,7 @@ fn a_conflict_stays_until_a_person_saves_it_and_status_names_it() {
     admin_publish(&lab.st1, &a, &d).expect("the person's save");
     sync_with_candidates(&lab.m_v2, None, &urls).expect("m8 syncs the save");
     assert_eq!(conflicts(&lab.m_v2).unwrap(), vec![token]);
-    assert_eq!(
-        std::fs::read(lab.m_v2.home.join(".secrets/split-key")).unwrap(),
-        winner
-    );
+    assert_eq!(stored(&lab.m_v2, "split-key").unwrap(), winner);
 
     lab.s1.stop();
     lab.s2.stop();
@@ -3047,7 +3021,7 @@ fn a_publish_cut_short_after_the_server_stored_it_still_reaches_every_mac() {
     }
     sync(m7, None).expect("m7 syncs");
     assert_eq!(
-        std::fs::read(m7.home.join(".secrets/gh-token")).unwrap(),
+        stored(m7, "gh-token").unwrap(),
         b"token-v2",
         "a Mac whose log reads the version waits for good on records only the writer held"
     );
@@ -3145,10 +3119,7 @@ fn an_anchor_removed_on_one_side_of_a_split_leaves_every_mac_reading() {
         );
     }
     sync_with_candidates(&lab.m_v2, None, &urls).expect("m8 syncs the publish");
-    assert_eq!(
-        std::fs::read(lab.m_v2.home.join(".secrets/other-key")).unwrap(),
-        b"v1-from-st2"
-    );
+    assert_eq!(stored(&lab.m_v2, "other-key").unwrap(), b"v1-from-st2");
 
     lab.s1.stop();
     lab.s2.stop();
@@ -3836,10 +3807,7 @@ fn bounded_member_cached_head_applies_new_admission_and_removal_without_a_server
     .expect("cached pending envelope applies the signed admission locally");
     assert!(matches!(outcome, SyncOutcome::Applied { .. }));
     assert_eq!(load_state(&m40).unwrap().membership, Stored::In);
-    assert_eq!(
-        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v1"
-    );
+    assert_eq!(stored(&m40, "shared").unwrap(), b"everyone-v1");
 
     save_records(&m40, &removal).unwrap();
     assert_eq!(
@@ -3890,10 +3858,7 @@ fn a_member_without_the_admin_locker_admits_a_mac() {
 
     write_from_log_bundle(&m40, &bundle).expect("m40 writes from the log");
     assert_eq!(load_state(&m40).unwrap().membership, Stored::In);
-    assert_eq!(
-        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v1"
-    );
+    assert_eq!(stored(&m40, "shared").unwrap(), b"everyone-v1");
     assert!(
         holds_allowed(&m40),
         "m40 keeps the Allowed for an admin's approver, which reads nothing for it"
@@ -3933,7 +3898,7 @@ fn a_member_without_the_admin_locker_admits_a_mac() {
     admin_publish(m22, &admin, &doc).expect("m22 publishes");
     sync(&m40, None).expect("m40 syncs the admin's change");
     assert_eq!(
-        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
+        stored(&m40, "shared").unwrap(),
         b"everyone-v2",
         "m40 reads the admin's later value"
     );
@@ -3943,10 +3908,7 @@ fn a_member_without_the_admin_locker_admits_a_mac() {
     let (bundle42, logged42) = hand(&m40, &request42, &allowed42, true);
     assert!(logged42, "m40, seated by m7's Admit, hands the log");
     write_from_log_bundle(&m42, &bundle42).expect("m42 takes m40's Admit");
-    assert_eq!(
-        std::fs::read(m42.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v2"
-    );
+    assert_eq!(stored(&m42, "shared").unwrap(), b"everyone-v2");
 
     // Another Mac asking under a label the log holds gets the next free one.
     let (_, request2, allowed2) = newcomer(macs.root.path(), m7, "m40-twin");
@@ -4007,10 +3969,7 @@ fn a_mac_whose_bundle_was_lost_takes_its_admit_from_another_member() {
     }
     write_from_log_bundle(&m40, &again).expect("m40 takes m7's Admit from m22");
     assert_eq!(load_state(&m40).unwrap().membership, Stored::In);
-    assert_eq!(
-        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v1"
-    );
+    assert_eq!(stored(&m40, "shared").unwrap(), b"everyone-v1");
 
     macs.server.stop();
     drop(macs.root);
@@ -4039,10 +3998,7 @@ fn a_lan_and_a_laptop_each_admit_a_mac_and_both_stay_in_after_the_heal() {
     write_from_log_bundle(&m40, &bundle40).expect("m40 writes from m7's log");
     write_from_log_bundle(&m41, &bundle41).expect("m41 writes from m22's log");
     for mac in [&m40, &m41] {
-        assert_eq!(
-            std::fs::read(mac.home.join(".secrets/shared")).unwrap(),
-            b"everyone-v1"
-        );
+        assert_eq!(stored(mac, "shared").unwrap(), b"everyone-v1");
     }
     let m7_log = load_records(m7).unwrap().log().unwrap().membership();
     assert!(
@@ -4081,7 +4037,7 @@ fn a_lan_and_a_laptop_each_admit_a_mac_and_both_stay_in_after_the_heal() {
     for mac in [&m40, &m41] {
         sync(mac, None).expect("sync the admin's change");
         assert_eq!(
-            std::fs::read(mac.home.join(".secrets/shared")).unwrap(),
+            stored(mac, "shared").unwrap(),
             b"everyone-v2",
             "both new Macs read the admin's later value"
         );
@@ -4519,10 +4475,7 @@ fn join_bundles_keep_waiting_records_local_and_fit_the_advertised_history() {
             write_from_log_bundle(&joining, &received.unwrap()).unwrap();
             let retained = load_records(&joining).unwrap();
             assert_eq!(retained.len(), retained.complete_inventory().len());
-            assert_eq!(
-                std::fs::read(joining.home.join(".secrets/shared")).unwrap(),
-                b"everyone-v1"
-            );
+            assert_eq!(stored(&joining, "shared").unwrap(), b"everyone-v1");
         });
         macs.server.stop();
     });
@@ -4669,7 +4622,7 @@ fn a_new_mac_takes_alabs_genesis_only_from_keys_its_build_names() {
     let forged = forged_log_bundle(&joiner, &forger_seed, forger, vec![vault], b"forged");
     write_from_log_bundle(&joiner, &forged).expect_err("a genesis only the bundle names");
     assert!(!joiner.records_file().exists());
-    assert!(!joiner.home.join(".secrets/gh-token").exists());
+    assert!(stored(&joiner, "gh-token").is_none());
     assert!(config(&joiner).unwrap().is_none(), "no vault configured");
 
     // CONTROL: the same log under the vault key's genesis is taken (while no digest is
@@ -4681,10 +4634,7 @@ fn a_new_mac_takes_alabs_genesis_only_from_keys_its_build_names() {
         let honest = Paths::for_home(&root.path().join("h"));
         let bundle = forged_log_bundle(&honest, &vault_seed, vault, Vec::new(), b"real");
         write_from_log_bundle(&honest, &bundle).expect("the vault key's genesis");
-        assert_eq!(
-            std::fs::read(honest.home.join(".secrets/gh-token")).unwrap(),
-            b"real"
-        );
+        assert_eq!(stored(&honest, "gh-token").unwrap(), b"real");
     }
     drop(root);
 }
@@ -4819,10 +4769,7 @@ fn a_mac_the_log_admits_posts_its_allowed_until_an_admins_approver_names_it() {
     );
     sync(&m40, None).expect("m40 syncs");
     assert_eq!(load_state(&m40).unwrap().membership, Stored::In);
-    assert_eq!(
-        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v1"
-    );
+    assert_eq!(stored(&m40, "shared").unwrap(), b"everyone-v1");
     assert!(
         !holds_allowed(&m40),
         "named in [machines], m40 posts it no more"
@@ -4878,10 +4825,7 @@ fn a_gap_seen_long_after_it_opened_is_still_closed_by_one_holder_first() {
     );
     post_records_to_servers(&first).expect("posted");
     sync(&m40, None).expect("m40 syncs");
-    assert_eq!(
-        std::fs::read(m40.home.join(".secrets/b-value")).unwrap(),
-        b"put-beside-the-admit"
-    );
+    assert_eq!(stored(&m40, "b-value").unwrap(), b"put-beside-the-admit");
 
     macs.server.stop();
     drop(macs.root);
@@ -4962,8 +4906,9 @@ fn approval_leaves_new_labels_to_the_registry_instead_of_growing_the_roster() {
 
 /// The no-log fallback stays the working path where the log path does not apply (F15 keeps
 /// F10's interim there): a vault with no genesis yet (ALab until F12b), and a new Mac that does
-/// not read the log bundle. Each hands F10's `[everyone]` files, the new Mac writes them with
-/// no records file and holds the member's `Allowed` for the admin's approver.
+/// not read the log bundle. Each hands F10's `[everyone]` files, which the new Mac checks and
+/// keeps no value of (its store's first apply, once admitted, fills it), with no records file,
+/// and holds the member's `Allowed` for the admin's approver.
 ///
 /// NEGATIVE CONTROL: in `hand_over`, ignore `reads_log` (take the log path whenever the member
 /// can sign one): the Mac that does not read the log gets a log bundle and the
@@ -4995,10 +4940,11 @@ fn a_vault_with_no_log_still_admits_by_the_allowed_relay() {
     let (m40, request, allowed) = newcomer(root.path(), &m7, "m40");
     let (bundle, logged) = hand(&m7, &request, &allowed, true);
     assert!(!logged, "a vault with no log hands F10's files");
-    write_from_bundle(&m40, &bundle).expect("m40 writes the files");
+    write_from_bundle(&m40, &bundle).expect("m40 takes the bundle");
     assert_eq!(
-        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v1"
+        stored(&m40, "shared"),
+        None,
+        "a pending Mac reads no value the bundle carried"
     );
     assert_eq!(load_state(&m40).unwrap().membership, Stored::Pending);
     assert!(holds_allowed(&m40), "m40 waits on the admin's approver");
@@ -5166,10 +5112,7 @@ fn a_wrap_gap_after_a_concurrent_epoch_is_closed_by_one_holder() {
     );
 
     sync(&m40, None).expect("m40 syncs");
-    assert_eq!(
-        std::fs::read(m40.home.join(".secrets/b-value")).unwrap(),
-        b"put-beside-the-admit"
-    );
+    assert_eq!(stored(&m40, "b-value").unwrap(), b"put-beside-the-admit");
 
     macs.server.stop();
     drop(macs.root);
@@ -5640,7 +5583,7 @@ fn a_mac_holding_f10s_files_asks_the_members_again_once_it_holds_a_log() {
     let (m40, request, allowed) = newcomer(macs.root.path(), m7, "m40");
     let (bundle, logged) = hand(m7, &request, &allowed, false);
     assert!(!logged, "CONTROL: F10's files");
-    write_from_bundle(&m40, &bundle).expect("m40 writes the files");
+    write_from_bundle(&m40, &bundle).expect("m40 takes the bundle");
     assert_eq!(load_state(&m40).unwrap().membership, Stored::Pending);
     assert!(holds_allowed(&m40), "m40 holds the member's Allowed");
 
@@ -5694,7 +5637,7 @@ fn a_member_missing_an_epoch_only_as_its_own_wrap_gap_still_admits_by_the_log() 
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m40, _, first, second) = admitted_beside_a_concurrent_epoch(&macs);
     assert!(
-        !m40.home.join(".secrets/b-value").exists(),
+        stored(&m40, "b-value").is_none(),
         "CONTROL: m40 lacks the epoch the LAN side minted"
     );
 
@@ -5704,7 +5647,7 @@ fn a_member_missing_an_epoch_only_as_its_own_wrap_gap_still_admits_by_the_log() 
     write_from_log_bundle(&m41, &bundle).expect("m41 writes from the log");
     assert_eq!(load_state(&m41).unwrap().membership, Stored::In);
     assert_eq!(
-        std::fs::read(m41.home.join(".secrets/shared")).unwrap(),
+        stored(&m41, "shared").unwrap(),
         b"everyone-v1",
         "m41 reads what m40 holds at once"
     );
@@ -5721,10 +5664,7 @@ fn a_member_missing_an_epoch_only_as_its_own_wrap_gap_still_admits_by_the_log() 
     }
     for mac in [&m40, &m41] {
         sync(mac, None).expect("syncs");
-        assert_eq!(
-            std::fs::read(mac.home.join(".secrets/b-value")).unwrap(),
-            b"put-beside-the-admit"
-        );
+        assert_eq!(stored(mac, "b-value").unwrap(), b"put-beside-the-admit");
     }
 
     macs.server.stop();
@@ -5771,17 +5711,14 @@ fn a_value_removed_from_everyone_stays_closed_to_a_mac_admitted_after() {
         admin_publish(m22, &admin, &doc).expect("publish the removal");
     }
     sync(m7, None).expect("m7 syncs");
-    assert!(!m7.home.join(".secrets/secret").exists());
+    assert!(stored(m7, "secret").is_none());
 
     let (m40, request, allowed) = newcomer(macs.root.path(), m7, "m40");
     let (bundle, logged) = hand(m7, &request, &allowed, true);
     assert!(logged);
     write_from_log_bundle(&m40, &bundle).expect("m40 writes from the log");
-    assert_eq!(
-        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v1"
-    );
-    assert!(!m40.home.join(".secrets/secret").exists());
+    assert_eq!(stored(&m40, "shared").unwrap(), b"everyone-v1");
+    assert!(stored(&m40, "secret").is_none());
     let log = load_records(&m40).unwrap().log().unwrap().clone();
     let opened = log
         .open_audience_entries(&read_identity(&m40).unwrap().unwrap())
@@ -5923,8 +5860,8 @@ fn log_bundle_newcomer_is_materialization_ready_before_first_sync_and_fails_over
         Some(crate::pake::PhraseState::Burned)
     );
 
-    // Before any sync, m40 has no cached envelope (`state.digest == None`), yet its local files
-    // were materialized from the verified membership log bundle.
+    // Before any sync, m40 has no cached envelope (`state.digest == None`), yet it reads its
+    // entries in place from the verified membership log bundle.
     let state40 = load_state(&m40).unwrap();
     let cfg40 = config(&m40).unwrap().unwrap();
     assert!(state40.digest.is_none());
@@ -5941,7 +5878,7 @@ fn log_bundle_newcomer_is_materialization_ready_before_first_sync_and_fails_over
     );
     let mark_ready = materialization_mark(&m40).unwrap().expect("mark");
     let observed = match observe_materialization(&m40, &cfg40, || {
-        Ok(std::fs::read(m40.home.join(".secrets/shared")).unwrap())
+        Ok(stored(&m40, "shared").unwrap())
     })
     .unwrap()
     {
@@ -5951,16 +5888,20 @@ fn log_bundle_newcomer_is_materialization_ready_before_first_sync_and_fails_over
     assert_eq!(observed.inputs, b"everyone-v1");
     assert!(observed.snapshot.is_current(&m40).unwrap());
 
-    // Negative control: corrupting a materialized file blocks readiness with LocalFilesIncomplete.
-    std::fs::write(m40.home.join(".secrets/shared"), b"tampered").unwrap();
+    // Negative control: an apply that began and recorded nothing blocks readiness with
+    // ApplyIncomplete.
+    let applied40 = load_state(&m40).unwrap();
+    let mut unfinished = applied40.clone();
+    unfinished.failed = true;
+    save_state(&m40, &unfinished).unwrap();
     assert!(!materialization_ready(&m40).unwrap());
-    let mark_tampered = materialization_mark(&m40).unwrap().expect("mark");
-    assert_ne!(mark_ready, mark_tampered);
+    let mark_unfinished = materialization_mark(&m40).unwrap().expect("mark");
+    assert_ne!(mark_ready, mark_unfinished);
     assert!(matches!(
         observe_materialization(&m40, &cfg40, || Ok(())).unwrap(),
-        MaterializationObservation::Blocked(MaterializationBlocker::LocalFilesIncomplete)
+        MaterializationObservation::Blocked(MaterializationBlocker::ApplyIncomplete)
     ));
-    std::fs::write(m40.home.join(".secrets/shared"), b"everyone-v1").unwrap();
+    save_state(&m40, &applied40).unwrap();
     assert!(materialization_ready(&m40).unwrap());
 
     // Sync m40 once against primary (`macs.server`) so m40 holds the current envelope head, still
@@ -5997,19 +5938,16 @@ fn log_bundle_newcomer_is_materialization_ready_before_first_sync_and_fails_over
     .unwrap();
 
     // `peer_subsumes_held` uses `open_entries_preferring_log` so log-admitted m40 (with no locker
-    // in either envelope) fails over to `s2`'s higher-seq head and materializes `everyone-v2`.
+    // in either envelope) fails over to `s2`'s higher-seq head and reads `everyone-v2`.
     sync_with_candidates(&m40, None, std::slice::from_ref(&url2)).expect("m40 fails over to s2");
     assert!(load_state(&m40).unwrap().seq > seq_initial);
-    assert_eq!(
-        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v2"
-    );
+    assert_eq!(stored(&m40, "shared").unwrap(), b"everyone-v2");
 
     s2.stop();
     macs.server.stop();
     drop(macs.root);
 
-    // A previous selector's intact files are not the current selector's materialization,
+    // A previous selector's finished apply is not the current selector's materialization,
     // even when its applied signed heads are unchanged. The registered inventory itself
     // stays legal and unchanged; stale unrelated meaning blocks the ordinary capture guard.
     for (log_only, legacy) in [(false, false), (false, true), (true, false), (true, true)] {
@@ -6029,13 +5967,14 @@ fn log_bundle_newcomer_is_materialization_ready_before_first_sync_and_fails_over
         let ready = materialization_ready(&reader).unwrap();
         let blocked = matches!(
             observe_materialization(&reader, &config, || Ok(())).unwrap(),
-            MaterializationObservation::Blocked(MaterializationBlocker::LocalFilesIncomplete)
+            MaterializationObservation::Blocked(MaterializationBlocker::ApplyIncomplete)
         );
-        let stale = read_verified_entry(&reader, &config, "shared").unwrap();
+        let current = read_verified_entry(&reader, &config, "shared").unwrap();
         lab.server.stop();
-        assert!(
-            stale.is_none(),
-            "the current entry reader rejects the old file"
+        assert_eq!(
+            current.map(|entry| entry.value().as_slice().to_vec()),
+            Some(b"current".to_vec()),
+            "the current entry reader reads the current selection in place"
         );
         assert!(!ready, "same heads do not prove current selected meaning");
         assert!(blocked, "the ordinary observation must stay pending");
@@ -6131,14 +6070,11 @@ fn code_only_log_member_is_removed_on_admin_publish_and_not_rewrapped_by_commons
     assert!(!materialization_ready(&m40).unwrap());
 
     // And a full sync marks m40 Revoked, blocks materialization readiness, and never decrypts
-    // `everyone-v2`.
+    // `everyone-v2`: a revoked Mac reads nothing in place.
     sync(&m40, None).expect("m40 syncs");
     assert_eq!(load_state(&m40).unwrap().membership, Stored::Revoked);
     assert!(!materialization_ready(&m40).unwrap());
-    assert_eq!(
-        std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v1"
-    );
+    assert_eq!(stored(&m40, "shared"), None);
 
     macs.server.stop();
     drop(macs.root);
@@ -6401,10 +6337,7 @@ fn narrowing_commons_control_is_a_gap_the_heal_closes_and_only_a_remove_keeps_th
     let m7_req = boot7.request().expect("m7 request");
     sync_records(m7, None).expect("m7 pulls m22's heal");
     sync(m7, None).expect("m7 syncs v2");
-    assert_eq!(
-        std::fs::read(m7.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v2"
-    );
+    assert_eq!(stored(m7, "shared").unwrap(), b"everyone-v2");
     assert!(
         load_records(m7)
             .unwrap()
@@ -6739,9 +6672,7 @@ fn narrowing_commons_control_is_a_gap_the_heal_closes_and_only_a_remove_keeps_th
     let removed_state = load_state(&m40).unwrap();
     let mut incomplete = removed_state.clone();
     incomplete.failed = true;
-    incomplete
-        .pending
-        .insert("a-file".to_owned(), "pending".to_owned());
+    incomplete.held = None;
     save_state(&m40, &incomplete).unwrap();
     assert!(matches!(
         steward::observe_alab_role(&m40),
@@ -7128,8 +7059,8 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
     match sync(&m50, None).expect("log-only sync without envelope") {
         SyncOutcome::Applied { report, .. } => {
             assert!(
-                report.written.iter().any(|p| p.ends_with("host_secret")),
-                "sync on log-only member must materialize new entry from log: {report:?}"
+                report.changed && report.held.iter().any(|name| name == "host_secret"),
+                "sync on log-only member must apply the new entry from the log: {report:?}"
             );
         }
         other => panic!("expected Applied, got {other:?}"),
@@ -7144,7 +7075,7 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
     );
     let accepted_token =
         with_materialization_ready_for_entries(&m50, &cfg50, &["gh_access_token"], || {
-            fsx::read_private(&m50.home.join(".secrets/gh_access_token"), 1024)
+            Ok(stored(&m50, "gh_access_token"))
         })
         .unwrap()
         .unwrap();
@@ -7565,10 +7496,7 @@ fn a_0_145_member_heard_in_14_days_keeps_the_mirror_on() {
         Some(b"v1".as_slice())
     );
     sync(&quiet.m7, None).expect("the current member reads the log without a new mirror");
-    assert_eq!(
-        std::fs::read(quiet.m7.home.join(".secrets/shared")).unwrap(),
-        b"v2"
-    );
+    assert_eq!(stored(&quiet.m7, "shared").unwrap(), b"v2");
     // Even a complete quiet history cannot suppress the envelope that removes a machine.
     let removed = id7_of(&quiet);
     let (_, actor, _) = member_key(&quiet.m7);

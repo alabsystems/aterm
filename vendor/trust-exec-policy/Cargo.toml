@@ -2,7 +2,7 @@
 
 [package]
 name = "trust-exec-policy"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 publish = false
@@ -13,5 +13,5 @@ libc = "0.2"
 
 [package.metadata.aterm-vendor]
 upstream = "https://github.com/alabsystems/trust"
-commit = "cae6f4b58466174749dde6f0d7d0bbf1fcc5e052"
+commit = "ad3c3beff79c0d9476bec559dd6e77a13cfa2f29"
 subdir = "crates/trust-exec-policy"

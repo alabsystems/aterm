@@ -20,17 +20,18 @@ fn main() -> std::process::ExitCode {
         return code;
     }
     let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(unix)]
+    if let Some(code) = aterm_verify::runtime_capture::entry(&raw) {
+        return code;
+    }
     // Pin reads and writes to one usable provider before any worker dispatch.
     let _ = aterm_verify::git_provider::pin();
     // SAFETY: CLI entry has started no other thread.
     if let Some(code) = unsafe { aterm_verify::remote_cli::entry(&raw) } {
         return code;
     }
-    // Before a stage can rebuild this executable: the census memo is keyed by the code that
-    // judges (one stat now; the bytes are hashed when the census first runs).
-    aterm_census::pin_code();
     // Before any dispatch: every child of this dedicated CLI process (targo,
-    // the test binaries, this binary re-invoked as a recorder or doc driver)
+    // the test binaries, this binary re-invoked as a recorder)
     // inherits the raised limit.
     aterm_uds::spawnfd::raise_soft_nofile();
     if let Some(code) = aterm_verify::compile_width::wrapper_entry(&raw) {
@@ -38,18 +39,9 @@ fn main() -> std::process::ExitCode {
     }
     if raw
         .first()
-        .is_some_and(|a| a == aterm_verify::docdriver::RUNTOOL_FLAG)
-    {
-        std::process::exit(aterm_verify::docdriver::runtool_main(&raw[1..]));
-    }
-    if raw
-        .first()
         .is_some_and(|a| a == aterm_verify::testrun::RECORD_FLAG)
     {
         std::process::exit(aterm_verify::testrun::record_main(&raw[1..]));
-    }
-    if std::env::var_os(aterm_verify::docdriver::DRIVER_ENV).is_some() {
-        std::process::exit(aterm_verify::docdriver::main(&raw));
     }
     let args: Vec<String> = raw
         .iter()

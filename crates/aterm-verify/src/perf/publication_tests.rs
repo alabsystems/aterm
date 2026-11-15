@@ -43,17 +43,24 @@ fn a_named_sink_is_written_through_a_fifo_and_a_link() {
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&fifo)
         .unwrap();
-    publish_named(&fifo, "{\"lane\":1}\n").unwrap();
+    // A concurrent fork may retain a writer until exec; publication need not yield EOF.
+    let _other_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&fifo)
+        .unwrap();
+    let expected = "{\"lane\":1}\n";
+    publish_named(&fifo, expected).unwrap();
     assert!(
         std::fs::symlink_metadata(&fifo)
             .unwrap()
             .file_type()
             .is_fifo()
     );
-    // The writer has closed, so the read ends at the bytes it wrote.
-    let mut got = String::new();
-    reader.read_to_string(&mut got).unwrap();
-    assert_eq!(got, "{\"lane\":1}\n");
+    // Publication completed synchronously; another writer need not have closed.
+    let mut got = vec![0; expected.len()];
+    reader.read_exact(&mut got).unwrap();
+    assert_eq!(got, expected.as_bytes());
 
     let target = dir.path().join("reports.json");
     std::fs::write(&target, "an older, longer report\n").unwrap();

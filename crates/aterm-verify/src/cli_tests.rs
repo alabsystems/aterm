@@ -41,7 +41,7 @@ fn checks_and_sets_combine_in_one_order_and_the_default_is_dev() {
     assert!(!ok(&["fmt", "census"]).narrows());
 }
 
-/// Only a run whose lint, test, doc or checkers builds its `-p` with this host's cargo asks
+/// Only a run whose lint, test or checkers builds its `-p` with this host's cargo asks
 /// whether the host's graph holds each spec. CONTROL: `export-scan` and `cells` read `-p`
 /// too ([`Args::narrows`]), and are not asked.
 #[test]
@@ -51,7 +51,6 @@ fn only_a_check_that_builds_its_selection_here_hands_cargo_its_specs() {
         (vec!["-p", p], true),
         (vec!["lint", "-p", p], true),
         (vec!["test", "-p", p], true),
-        (vec!["doc", "-p", p], true),
         (vec!["checkers", "-p", p], true),
         (vec!["export-scan", "-p", p], false),
         (vec!["cells", "-p", p], false),
@@ -87,107 +86,26 @@ fn release_implies_the_whole_workspace_and_needs_its_bundle() {
     );
 }
 
-/// Binary proofs go only with a release's test check and its frozen context. Release-only
-/// lint proofs remain separate; another check cannot take binaries. A development run takes
-/// neither, only the input-drift bracket.
+/// A release's frozen context goes only with a release's test, lint or appkit check; a
+/// development run takes none.
 #[test]
-fn a_release_resume_carries_the_binaries_that_passed_only_into_its_test_run() {
+fn only_a_release_takes_its_frozen_context() {
     assert_eq!(
         ok(&["release", "--tree", "--events", "/l/06-verify.events"])
             .events
             .as_deref(),
         Some(std::path::Path::new("/l/06-verify.events"))
     );
-    let a = ok(&[
-        "release",
-        "--checks=test",
-        "--passed-binaries",
-        "/l/06-verify.passed-binaries",
-        "--carry-context",
-        &"ab".repeat(32),
-    ]);
-    assert_eq!(a.checks, [Check::Test]);
-    assert_eq!(
-        a.passed_binaries.as_deref(),
-        Some(std::path::Path::new("/l/06-verify.passed-binaries"))
-    );
-    assert!(
-        ok(&[
-            "release",
-            "--passed-binaries",
-            "/p",
-            "--carry-context",
-            &"ab".repeat(32),
-            "--app",
-            "/a",
-        ])
-        .checks
-        .contains(&Check::Test)
-    );
-    // A development run carries nothing: it takes neither proofs nor their context, and
-    // brackets its inputs only when asked, as `verify land`'s judgment asks.
     let context = "ab".repeat(32);
+    let a = ok(&["release", "--checks=test", "--carry-context", &context]);
+    assert_eq!(a.checks, [Check::Test]);
+    assert_eq!(a.carry_context.as_deref(), Some(context.as_str()));
     for selection in [vec!["test", "--all"], vec!["--base", "previous-main"]] {
-        for extra in [
-            &[
-                "--passed-binaries",
-                "/p",
-                "--carry-context",
-                context.as_str(),
-            ][..],
-            &["--carry-context", context.as_str()],
-            &["--passed-binaries", "/p"],
-        ] {
-            let mut args = selection.clone();
-            args.extend(extra);
-            assert!(parse(args.iter().copied()).is_err(), "{args:?}");
-        }
         let mut args = selection.clone();
-        args.push(super::INPUT_DRIFT);
-        let parsed = ok(&args);
-        assert!(parsed.input_drift && !parsed.release);
-        assert!(!ok(&selection).input_drift);
-    }
-    for args in [
-        &["fmt", super::INPUT_DRIFT][..],
-        &["release", "--checks=test", super::INPUT_DRIFT],
-    ] {
+        args.extend(["--carry-context", context.as_str()]);
         assert!(parse(args.iter().copied()).is_err(), "{args:?}");
     }
-    for args in [
-        &[
-            "release",
-            "--checks",
-            "fmt",
-            "--passed-binaries",
-            "/p",
-            "--carry-context",
-            "abababababababababababababababababababababababababababababababab",
-        ][..],
-        &[
-            "release",
-            "--bundle",
-            "--passed-binaries",
-            "/p",
-            "--carry-context",
-            "abababababababababababababababababababababababababababababababab",
-            "--app",
-            "/a",
-        ],
-        &[
-            "fmt",
-            "--passed-binaries",
-            "/p",
-            "--carry-context",
-            "abababababababababababababababababababababababababababababababab",
-        ],
-    ] {
-        assert!(parse(args.iter().copied()).is_err(), "{args:?}");
-    }
-    assert!(
-        parse(["release", "--checks=test", "--passed-binaries", "/p",]).is_err(),
-        "proofs without their frozen context are not reusable"
-    );
+    assert!(parse(["release", "--checks", "fmt", "--carry-context", &context]).is_err());
     assert!(
         parse(["release", "--checks=test", "--carry-context", "AA"]).is_err(),
         "the salt is one canonical SHA-256"
@@ -197,6 +115,27 @@ fn a_release_resume_carries_the_binaries_that_passed_only_into_its_test_run() {
         Some(std::path::Path::new("/e")),
         "a dev run keeps its events (verify land's judgment)"
     );
+}
+
+/// A judgment keeps its events in its events file alone; the flag needs that file, and a
+/// release, whose cutter reads its events from captured output, never takes it.
+#[test]
+fn events_stay_off_the_console_only_for_a_run_that_has_an_events_file() {
+    let a = ok(&["--base", "abc", "--events", "/e", super::EVENTS_FILE_ONLY]);
+    assert!(a.events_file_only);
+    assert!(!ok(&["--base", "abc", "--events", "/e"]).events_file_only);
+    for args in [
+        &["--base", "abc", super::EVENTS_FILE_ONLY][..],
+        &[
+            "release",
+            "--tree",
+            "--events",
+            "/e",
+            super::EVENTS_FILE_ONLY,
+        ],
+    ] {
+        assert!(parse(args.iter().copied()).is_err(), "{args:?}");
+    }
 }
 
 /// Lint package proofs have their own release-only wire and share the frozen item context.
@@ -533,5 +472,82 @@ fn a_round_of_a_hand_merge_says_so_and_the_word_needs_its_round() {
             "{refused:?}: {}",
             refusal.message()
         );
+    }
+}
+
+/// A round whose shared Markdown a file may read names those files (`--readers`), and the word
+/// means nothing without the round it describes, nor for a merge a person made, which is judged
+/// in full where it shares such Markdown. CONTROL: a round without it names none.
+#[test]
+fn a_round_names_the_files_that_may_read_its_markdown_and_the_word_needs_its_round() {
+    let round = [
+        "--base",
+        "tip",
+        "--judged",
+        "judged",
+        "--shared",
+        "/s",
+        "--readers",
+        "/r",
+    ];
+    let parsed = ok(&round);
+    assert_eq!(parsed.readers.as_deref(), Some(std::path::Path::new("/r")));
+    assert!(parsed.narrows() && !parsed.all && !parsed.by_hand);
+    assert_eq!(parsed.checks, DEV);
+    assert_eq!(ok(&round[..6]).readers, None);
+    for refused in [
+        &["--readers", "/r"][..],
+        &["--base", "tip", "--readers", "/r"],
+        &["--all", "--readers", "/r"],
+    ] {
+        let refusal = parse(refused.iter().copied()).unwrap_err();
+        assert!(
+            refusal.message().contains("it needs --judged and --shared"),
+            "{refused:?}: {}",
+            refusal.message()
+        );
+    }
+    let mut by_hand = round.to_vec();
+    by_hand.push("--by-hand");
+    let refusal = parse(by_hand).unwrap_err();
+    assert!(
+        refusal.message().contains("contradict each other"),
+        "{}",
+        refusal.message()
+    );
+    assert!(
+        parse([
+            "--base",
+            "tip",
+            "--judged",
+            "judged",
+            "--shared",
+            "/s",
+            "--readers"
+        ])
+        .is_err()
+    );
+}
+
+/// `--queued-since` takes unix milliseconds: when the work the run judges was first queued.
+/// NEGATIVE CONTROLS: no value, a word, a negative and a fraction are usage errors, and a run that
+/// names none was queued as it starts.
+#[test]
+fn queued_since_takes_unix_milliseconds() {
+    let parse = |args: &[&str]| super::parse(args.iter().copied());
+    assert_eq!(
+        parse(&[super::QUEUED_SINCE, "1794632178000"])
+            .unwrap()
+            .queued_since,
+        Some(1_794_632_178_000)
+    );
+    assert_eq!(parse(&[]).unwrap().queued_since, None);
+    for bad in [
+        &[super::QUEUED_SINCE][..],
+        &[super::QUEUED_SINCE, "soon"],
+        &[super::QUEUED_SINCE, "-5"],
+        &[super::QUEUED_SINCE, "1.5"],
+    ] {
+        assert!(parse(bad).is_err(), "{bad:?}");
     }
 }

@@ -92,7 +92,7 @@ fn the_brief_folds_each_session_from_the_bus_alone() {
     let twice = bs.clone();
     bs.extend(twice);
     bs.push("v=1 t=5 ev=undeliverable%20off=3".to_string());
-    let r = read_of(&[("n-1", "s-a", bs)]);
+    let r = read_of(&[("n-1", "ta000000000", bs)]);
     let text = render(&cfg(), &BriefOpts::default(), &r, 1_760_000_001_000);
     let header = text.lines().next().expect("a header");
     assert!(header.starts_with("OK "), "{text}");
@@ -105,7 +105,7 @@ fn the_brief_folds_each_session_from_the_bus_alone() {
         !header.contains(" dup=0 "),
         "the second copies were counted: {header}"
     );
-    assert!(text.contains("@s-a@n-1 - ep=1 as_of="), "{text}");
+    assert!(text.contains("@ta000000000@n-1 - ep=1 as_of="), "{text}");
     assert!(
         text.contains("need=failure"),
         "the run's failure, from the bus: {text}"
@@ -114,7 +114,7 @@ fn the_brief_folds_each_session_from_the_bus_alone() {
 
 #[test]
 fn a_spawned_sessions_open_folds_without_its_parent() {
-    let parent = "s-parentqzp6";
+    let parent = "tparentqzp6";
     let mut log = Log::new(1);
     let f = Fields::new()
         .id(aterm_slog::Key::Parent, parent)
@@ -134,11 +134,11 @@ fn a_spawned_sessions_open_folds_without_its_parent() {
             .all(|b| !b.contains("parent=") && !b.contains(parent)),
         "{bs:#?}"
     );
-    let r = read_of(&[("n-1", "s-a", bs)]);
+    let r = read_of(&[("n-1", "ta000000000", bs)]);
     let text = render(&cfg(), &BriefOpts::default(), &r, 1_760_000_001_000);
     let header = text.lines().next().expect("a header");
     assert!(header.contains(" sessions=1 partial=0 "), "{header}");
-    assert!(text.contains("@s-a@n-1 - ep=1 as_of="), "{text}");
+    assert!(text.contains("@ta000000000@n-1 - ep=1 as_of="), "{text}");
     assert!(!text.contains(parent), "{text}");
 }
 
@@ -161,8 +161,8 @@ fn a_keeper_recovered_sid_folds_its_new_space_alone() {
     );
     let mut new_bodies = bodies(&mut new);
     old_bodies.append(&mut new_bodies);
-    let r = read_of(&[("n-1", "s-k", old_bodies)]);
-    let s = &r.sessions[&("n-1".to_string(), "s-k".to_string())];
+    let r = read_of(&[("n-1", "tk000000000", old_bodies)]);
+    let s = &r.sessions[&("n-1".to_string(), "tk000000000".to_string())];
     assert_eq!(s.spaces.len(), 2, "two seq spaces");
     let (ep, space) = s.spaces.iter().next_back().expect("the newest");
     assert_eq!(*ep, 1_760_000_500);
@@ -185,27 +185,30 @@ fn a_session_of_a_gone_node_or_without_its_start_is_partial() {
         .filter(|b| !b.contains(" op=snap "))
         .cloned()
         .collect();
-    let mut r = read_of(&[("n-1", "s-a", bs.clone()), ("n-2", "s-b", late.clone())]);
+    let mut r = read_of(&[
+        ("n-1", "ta000000000", bs.clone()),
+        ("n-2", "tb000000000", late.clone()),
+    ]);
     r.nodes_gone.push("n-1".to_string());
     r.from = 1;
     let text = render(&cfg(), &BriefOpts::default(), &r, 1_760_000_001_000);
     assert!(
-        text.contains("@s-a@n-1 - ep=1 as_of=") && text.contains("partial why=node-gone"),
+        text.contains("@ta000000000@n-1 - ep=1 as_of=") && text.contains("partial why=node-gone"),
         "{text}"
     );
     let b_line = text
         .lines()
-        .find(|l| l.starts_with("@s-b@n-2"))
-        .expect("s-b");
+        .find(|l| l.starts_with("@tb000000000@n-2"))
+        .expect("tb000000000");
     assert!(b_line.contains("partial why=no-start"), "{b_line}");
     assert!(
         !b_line.contains(" holes="),
         "the window's cut is no loss nobody said: {b_line}"
     );
-    let whole = read_of(&[("n-2", "s-b", late)]);
+    let whole = read_of(&[("n-2", "tb000000000", late)]);
     let text = render(&cfg(), &BriefOpts::default(), &whole, 1_760_000_001_000);
     assert!(text.contains(" holes=1..2"), "{text}");
-    let seeded = read_of(&[("n-2", "s-c", bs[2..].to_vec())]);
+    let seeded = read_of(&[("n-2", "tc000000000", bs[2..].to_vec())]);
     let text = render(&cfg(), &BriefOpts::default(), &seeded, 1_760_000_001_000);
     assert!(!text.contains("partial why=no-start"), "{text}");
     assert!(text.lines().next().unwrap().contains(" partial="), "{text}");
@@ -223,7 +226,7 @@ fn a_newer_writers_words_are_foreign_and_no_hole() {
     .iter()
     .map(|b| (*b).to_string())
     .collect();
-    let r = read_of(&[("n-1", "s-a", bodies)]);
+    let r = read_of(&[("n-1", "ta000000000", bodies)]);
     let text = render(&cfg(), &BriefOpts::default(), &r, 2);
     let header = text.lines().next().expect("a header");
     assert!(header.contains(" opaque=0 foreign=3 "), "{header}");
@@ -242,7 +245,7 @@ fn a_hostile_body_is_printed_safe() {
 #[test]
 fn the_brief_reads_its_words_within_their_bounds() {
     let o = BriefOpts::parse(&[
-        "@s-a@n-1".to_string(),
+        "@ta000000000@n-1".to_string(),
         "--window".to_string(),
         "1024".to_string(),
         "--budget".to_string(),
@@ -258,7 +261,13 @@ fn the_brief_reads_its_words_within_their_bounds() {
             o.budget,
             o.json
         ),
-        (Some("s-a"), Some("n-1"), Some(1024), Some(500), true)
+        (
+            Some("ta000000000"),
+            Some("n-1"),
+            Some(1024),
+            Some(500),
+            true
+        )
     );
     assert!(
         !BriefOpts::parse(&[]).expect("reads").json,
@@ -287,12 +296,16 @@ fn a_session_without_its_close_past_a_relaunch_is_partial() {
     let mut a = session(1, 1_760_000_000_000);
     let bs = bodies(&mut a);
     let mut r = read_of(&[
-        ("n-1", "s-x", bs.clone()),
-        ("n-1", "s-y", bs.clone()),
-        ("n-1", "s-z", bs),
+        ("n-1", "tx000000000", bs.clone()),
+        ("n-1", "ty000000000", bs.clone()),
+        ("n-1", "tz000000000", bs),
     ]);
     r.node_inc.insert("n-1".to_string(), 7);
-    for (sid, state, inc) in [("s-x", "exited", 6), ("s-y", "live", 6), ("s-z", "live", 7)] {
+    for (sid, state, inc) in [
+        ("tx000000000", "exited", 6),
+        ("ty000000000", "live", 6),
+        ("tz000000000", "live", 7),
+    ] {
         let s = r
             .sessions
             .get_mut(&("n-1".to_string(), sid.to_string()))
@@ -307,19 +320,25 @@ fn a_session_without_its_close_past_a_relaunch_is_partial() {
             .unwrap_or_else(|| panic!("{sid}: {text}"))
             .to_string()
     };
-    assert!(line("s-x").contains("partial why=no-close"), "{text}");
-    assert!(line("s-y").contains("partial why=node-gone"), "{text}");
-    assert!(!line("s-z").contains("partial"), "{text}");
+    assert!(
+        line("tx000000000").contains("partial why=no-close"),
+        "{text}"
+    );
+    assert!(
+        line("ty000000000").contains("partial why=node-gone"),
+        "{text}"
+    );
+    assert!(!line("tz000000000").contains("partial"), "{text}");
 }
 
 #[test]
 fn a_nodes_will_of_either_word_makes_its_unclosed_sessions_partial_node_gone() {
     for will in ["away", "gone"] {
         let mut a = session(1, 1_760_000_000_000);
-        let mut r = read_of(&[("n-1", "s-a", bodies(&mut a))]);
+        let mut r = read_of(&[("n-1", "ta000000000", bodies(&mut a))]);
         let mut row = |sid: &str, body: &str| r.presence("n-1", sid, body.as_bytes()).unwrap();
         row("node", "v=1 t=1 state=live inc=1");
-        row("s-a", "v=1 t=1 inc=1 state=live");
+        row("ta000000000", "v=1 t=1 inc=1 state=live");
         let partial = |r: &Read| {
             let text = render_json(&cfg(), &json_opts(), r, 1_760_000_001_000, None);
             let v = json_of(&text);
@@ -353,7 +372,7 @@ fn a_nodes_will_of_either_word_makes_its_unclosed_sessions_partial_node_gone() {
         assert!(text.contains("partial why=node-gone"), "{will}: {text}");
         r.presence("n-1", "node", b"v=1 t=3 state=live inc=2")
             .unwrap();
-        r.presence("n-1", "s-a", b"v=1 t=3 inc=2 state=live")
+        r.presence("n-1", "ta000000000", b"v=1 t=3 inc=2 state=live")
             .unwrap();
         assert!(partial(&r).is_empty(), "{will}: a reattach restores it");
     }
@@ -364,7 +383,7 @@ fn many_sessions_are_held_to_the_budget() {
     let items: Vec<(String, Vec<String>)> = (0..60)
         .map(|i| {
             let mut log = session(1, 1_760_000_000_000 + i);
-            (format!("s-{i:02}"), bodies(&mut log))
+            (format!("t{i:010}"), bodies(&mut log))
         })
         .collect();
     let refs: Vec<(&str, &str, Vec<String>)> = items
@@ -395,44 +414,49 @@ fn many_sessions_are_held_to_the_budget() {
         .find_map(|l| l.strip_prefix("more=sessions:"))
         .and_then(|k| k.parse::<usize>().ok())
         .expect("more=sessions");
-    let shown = text.lines().filter(|l| l.starts_with("@s-")).count();
+    let shown = text.lines().filter(|l| l.starts_with("@t")).count();
     assert_eq!(shown + more, 60, "{text}");
     assert!(shown > 0);
-    assert!(text.contains("@s-59@n-1"), "the newest first: {text}");
+    assert!(
+        text.contains("@t0000000059@n-1"),
+        "the newest first: {text}"
+    );
 }
 
 #[test]
 fn a_brief_refuses_a_roster_or_fold_past_its_session_bound() {
     let body = b"v=2 t=1 ep=1 seq=1 ms=1 op=open node=- k=spawn src=aterm conf=exact";
     let mut r = Read::default();
-    r.presence("n-1", "s-0000", b"state=live inc=1").unwrap();
-    r.ingest(FLEET, None, 1, &face("n-1", "s-0000"), body)
+    r.presence("n-1", "t0000000000", b"state=live inc=1")
+        .unwrap();
+    r.ingest(FLEET, None, 1, &face("n-1", "t0000000000"), body)
         .unwrap();
     assert_eq!(r.sessions.len(), 1);
     assert_eq!(
-        r.sessions[&("n-1".to_string(), "s-0000".to_string())]
+        r.sessions[&("n-1".to_string(), "t0000000000".to_string())]
             .spaces
             .len(),
         1
     );
     for i in 1..SESSIONS_MAX {
-        r.presence("n-1", &format!("s-{i:04}"), b"state=live inc=1")
+        r.presence("n-1", &format!("t{i:010}"), b"state=live inc=1")
             .unwrap();
     }
     assert_eq!(r.sessions.len(), SESSIONS_MAX);
-    r.presence("n-1", "s-0000", b"state=exited inc=2").unwrap();
-    r.ingest(FLEET, None, 2, &face("n-1", "s-0000"), body)
+    r.presence("n-1", "t0000000000", b"state=exited inc=2")
         .unwrap();
-    let s = &r.sessions[&("n-1".to_string(), "s-0000".to_string())];
+    r.ingest(FLEET, None, 2, &face("n-1", "t0000000000"), body)
+        .unwrap();
+    let s = &r.sessions[&("n-1".to_string(), "t0000000000".to_string())];
     assert_eq!(
         (s.presence.as_deref(), s.presence_inc, s.newest_off),
         (Some("exited"), Some(2), 2)
     );
     let roster_refused = r
-        .presence("n-1", "s-overflow", b"state=live inc=1")
+        .presence("n-1", "t0verf10w00", b"state=live inc=1")
         .is_err();
     let fold_refused = r
-        .ingest(FLEET, None, 3, &face("n-1", "s-overflow"), body)
+        .ingest(FLEET, None, 3, &face("n-1", "t0verf10w00"), body)
         .is_err();
 
     let mut records = Read::default();
@@ -442,7 +466,7 @@ fn a_brief_refuses_a_roster_or_fold_past_its_session_bound() {
                 FLEET,
                 None,
                 i as u64,
-                &face("n-1", &format!("s-{i:04}")),
+                &face("n-1", &format!("t{i:010}")),
                 body,
             )
             .unwrap();
@@ -452,12 +476,12 @@ fn a_brief_refuses_a_roster_or_fold_past_its_session_bound() {
             FLEET,
             None,
             SESSIONS_MAX as u64,
-            &face("n-1", "s-0000"),
+            &face("n-1", "t0000000000"),
             body,
         )
         .unwrap();
     let records_refused = records
-        .ingest(FLEET, None, 9, &face("n-1", "s-overflow"), body)
+        .ingest(FLEET, None, 9, &face("n-1", "t0verf10w00"), body)
         .is_err();
 
     let mut nodes = Read::default();
@@ -509,7 +533,7 @@ fn a_window_below_the_retained_floor_reads_from_it() {
         .iter()
         .zip(1u64..)
         .map(|(b, seq)| {
-            conn.publish(91, seq, &face("n-a", "s-a"), b.as_bytes())
+            conn.publish(91, seq, &face("n-a", "ta000000000"), b.as_bytes())
                 .expect("publish")
                 .0
         })
@@ -595,8 +619,8 @@ fn the_json_brief_holds_each_session_in_its_closed_schema() {
     let mut appr = in_approval(1_760_000_060_000, "bash");
     let mut failed = session(1, 1_760_000_000_000);
     let r = read_of(&[
-        ("n-2", "s-f", bodies(&mut failed)),
-        ("n-1", "s-a", bodies(&mut appr)),
+        ("n-2", "tf000000000", bodies(&mut failed)),
+        ("n-1", "ta000000000", bodies(&mut appr)),
     ]);
     let text = render_json(&cfg(), &json_opts(), &r, now, Some("n-2"));
     assert!(text.contains(r#""need":"approval:bash""#), "{text}");
@@ -632,7 +656,7 @@ fn the_json_brief_holds_each_session_in_its_closed_schema() {
         (get(a, "node"), get(a, "sid"), get(a, "this"), get(a, "ep")),
         (
             aterm_json::Value::from("n-1"),
-            aterm_json::Value::from("s-a"),
+            aterm_json::Value::from("ta000000000"),
             aterm_json::Value::from(false),
             aterm_json::Value::from(1u64)
         ),
@@ -654,7 +678,7 @@ fn the_json_brief_holds_each_session_in_its_closed_schema() {
         .map(|(l, k)| ((*l).to_string(), (*k).to_string()))
         .collect();
     assert_eq!(open, want, "{text}");
-    assert_eq!(get(a, "last_seq").as_u64(), Some(as_of("s-a")));
+    assert_eq!(get(a, "last_seq").as_u64(), Some(as_of("ta000000000")));
     assert_eq!(
         get(a, "age_s").as_u64(),
         Some(39),
@@ -667,11 +691,11 @@ fn the_json_brief_holds_each_session_in_its_closed_schema() {
     assert_eq!(get(a, "partial").as_array().map(Vec::len), Some(0));
     assert_eq!(
         (get(f, "sid").as_str(), get(f, "this").as_bool()),
-        (Some("s-f"), Some(true))
+        (Some("tf000000000"), Some(true))
     );
     assert_eq!(get(f, "need").as_str(), Some("failure"));
     assert_eq!(get(f, "open").as_array().map(Vec::len), Some(0), "{text}");
-    assert_eq!(get(f, "last_seq").as_u64(), Some(as_of("s-f")));
+    assert_eq!(get(f, "last_seq").as_u64(), Some(as_of("tf000000000")));
     assert_eq!(get(f, "age_s").as_u64(), Some(99));
 }
 
@@ -710,8 +734,8 @@ fn the_json_brief_names_no_claimed_need() {
     let mut beside = session(1, at);
     claim(&mut beside, 5);
     let r = read_of(&[
-        ("n-1", "s-only", bodies(&mut only)),
-        ("n-1", "s-beside", bodies(&mut beside)),
+        ("n-1", "t0n1y000000", bodies(&mut only)),
+        ("n-1", "tbes1de0000", bodies(&mut beside)),
     ]);
     let text = render_json(&cfg(), &json_opts(), &r, at + 60_000, None);
     assert!(!text.contains("help"), "{text}");
@@ -723,8 +747,8 @@ fn the_json_brief_names_no_claimed_need() {
             .and_then(|s| s.get("need").cloned())
             .unwrap_or_else(|| panic!("{sid}'s need: {text}"))
     };
-    assert!(need("s-only").is_null(), "a claim alone: {text}");
-    assert_eq!(need("s-beside").as_str(), Some("failure"), "{text}");
+    assert!(need("t0n1y000000").is_null(), "a claim alone: {text}");
+    assert_eq!(need("tbes1de0000").as_str(), Some("failure"), "{text}");
 }
 
 /// NEITHER BRIEF PRINTS A HOST OR CONTENT FIELD A RAW BODY CARRIES (session log Phase 6 fix
@@ -769,10 +793,10 @@ fn neither_brief_prints_a_host_or_content_field_a_raw_body_carries() {
         let d = aterm_slog::decode_bus(b).unwrap_or_else(|e| panic!("{e:?}: {b}"));
         assert!(d.rec.is_bus_class(), "PRECONDITION: a bus record: {b}");
     }
-    let mut r = read_of(&[("n-1", "s-a", ev)]);
+    let mut r = read_of(&[("n-1", "ta000000000", ev)]);
     r.presence(
         "n-1",
-        "s-a",
+        "ta000000000",
         b"v=1 t=1 state=live inc=1 attention=QZP6WORD8 title=QZP6WORD9",
     )
     .expect("a presence row");
@@ -780,7 +804,10 @@ fn neither_brief_prints_a_host_or_content_field_a_raw_body_carries() {
 
     let text = render(&cfg(), &BriefOpts::default(), &r, now);
     assert!(!text.contains("QZP6WORD"), "{text}");
-    assert!(text.contains("@s-a@n-1 live ep=1 "), "the presence: {text}");
+    assert!(
+        text.contains("@ta000000000@n-1 live ep=1 "),
+        "the presence: {text}"
+    );
     assert!(text.contains("- claude r1 "), "the run: {text}");
     assert!(text.contains(" need=escalated "), "the need: {text}");
     assert!(
@@ -838,7 +865,7 @@ fn the_json_brief_is_held_to_the_budget() {
     let items: Vec<(String, Vec<String>)> = (0..60)
         .map(|i| {
             let mut log = session(1, 1_760_000_000_000 + i);
-            (format!("s-{i:02}"), bodies(&mut log))
+            (format!("t{i:010}"), bodies(&mut log))
         })
         .collect();
     let refs: Vec<(&str, &str, Vec<String>)> = items
@@ -859,7 +886,7 @@ fn the_json_brief_is_held_to_the_budget() {
     assert_eq!(sessions.len() as u64 + n("more"), 60, "{text}");
     assert_eq!(
         sessions[0].get("sid").and_then(aterm_json::Value::as_str),
-        Some("s-59"),
+        Some("t0000000059"),
         "the newest first"
     );
 }
@@ -1010,18 +1037,21 @@ fn a_session_a_later_incarnation_retired_reads_closed_out_gone_derived_never_wri
     let at = 1_760_000_000_000;
     let now = at + 600_000;
     let mut dead = in_approval(at, "bash");
-    let mut r = read_of(&[("n-1", "s-dead", bodies(&mut dead))]);
-    let key = ("n-1".to_string(), "s-dead".to_string());
+    let mut r = read_of(&[("n-1", "tdead000000", bodies(&mut dead))]);
+    let key = ("n-1".to_string(), "tdead000000".to_string());
     let carried: Vec<aterm_slog::Rec> = r.sessions[&key].spaces[&1].records().cloned().collect();
     let head = carried.last().map(|r| r.seq).expect("records");
     for (sid, row) in [
         ("node", "v=1 t=1 state=live inc=1"),
-        ("s-dead", "v=1 t=1 inc=1 state=live"),
+        ("tdead000000", "v=1 t=1 inc=1 state=live"),
         ("node", "v=1 t=2 state=away inc=1 fabric=disconnected"),
         ("node", "v=1 t=3 state=live inc=2"),
     ] {
         r.presence("n-1", sid, row.as_bytes()).expect("a row");
-        let s = session_obj(&render_json(&cfg(), &json_opts(), &r, now, None), "s-dead");
+        let s = session_obj(
+            &render_json(&cfg(), &json_opts(), &r, now, None),
+            "tdead000000",
+        );
         assert_eq!(
             open_of(&s),
             in_approval_path(),
@@ -1029,11 +1059,11 @@ fn a_session_a_later_incarnation_retired_reads_closed_out_gone_derived_never_wri
         );
         assert_eq!(closed_of(&s), None, "after {row}: open, so not closed");
     }
-    r.presence("n-1", "s-dead", b"v=1 t=4 inc=3 state=exited")
+    r.presence("n-1", "tdead000000", b"v=1 t=4 inc=3 state=exited")
         .expect("the sweep's row");
 
     let json = render_json(&cfg(), &json_opts(), &r, now, None);
-    let s = session_obj(&json, "s-dead");
+    let s = session_obj(&json, "tdead000000");
     assert_eq!(open_of(&s), Vec::new(), "nothing open: {json}");
     assert_eq!(
         need_of(&s),
@@ -1052,9 +1082,9 @@ fn a_session_a_later_incarnation_retired_reads_closed_out_gone_derived_never_wri
         "the space's own head, never a derived seq: {json}"
     );
     let text = render(&cfg(), &BriefOpts::default(), &r, now);
-    let lines = lines_of(&text, "s-dead");
+    let lines = lines_of(&text, "tdead000000");
     assert!(
-        lines[0].starts_with(&format!("@s-dead@n-1 exited ep=1 as_of={head} "))
+        lines[0].starts_with(&format!("@tdead000000@n-1 exited ep=1 as_of={head} "))
             && lines[0].contains(" partial why=no-close"),
         "{text}"
     );
@@ -1127,44 +1157,47 @@ fn crashed(r: &mut Read, node: &str, sid: &str) {
 
 /// A SUCCESSOR'S RESTORE NAMES A DEAD SESSION (fix unit E9). Its aterm died ([`CRASH_ROWS`]:
 /// the session's row live under `inc=1`, its node's will, the node live under `inc=2`), and the
-/// relaunch's new shell opens `restore prev=s-dead` on the dead session's node: the brief
-/// derives s-dead's close (its `partial` says `node-gone`: the close never reached the bus, and
+/// relaunch's new shell opens `restore prev=tdead000000` on the dead session's node: the brief
+/// derives tdead000000's close (its `partial` says `node-gone`: the close never reached the bus, and
 /// a restore is a relaunch of its node's), and keeps deriving it in a read narrowed to
-/// `@s-dead`, which reads its node's other sessions' restores for it. A session of another
+/// `@tdead000000`, which reads its node's other sessions' restores for it. A session of another
 /// node naming the same sid derives nothing, nor does the successor itself, which folds as any
 /// session. NEGATIVE CONTROLS, run: with no derivation, and with a narrowed read that skips
-/// other sids' bodies, s-dead's open path stays `[run agent, turn, step approval]`.
+/// other sids' bodies, tdead000000's open path stays `[run agent, turn, step approval]`.
 #[test]
 fn a_successors_restore_derives_its_predecessors_close_in_a_narrowed_read_too() {
     let at = 1_760_000_000_000;
     let now = at + 600_000;
     let dead = bodies(&mut in_approval(at, "bash"));
-    let far = bodies(&mut successor("s-dead", at + 60_000));
-    let next = bodies(&mut successor("s-dead", at + 61_000));
+    let far = bodies(&mut successor("tdead000000", at + 60_000));
+    let next = bodies(&mut successor("tdead000000", at + 61_000));
     assert!(
         next.iter()
-            .any(|b| b.contains(" k=restore ") && b.contains(" prev=s-dead")),
+            .any(|b| b.contains(" k=restore ") && b.contains(" prev=tdead000000")),
         "PRECONDITION: the restore crosses the bus naming its predecessor: {next:?}"
     );
     let mut r = read_of(&[
-        ("n-1", "s-dead", dead.clone()),
-        ("n-2", "s-far", far.clone()),
+        ("n-1", "tdead000000", dead.clone()),
+        ("n-2", "tfar0000000", far.clone()),
     ]);
-    crashed(&mut r, "n-1", "s-dead");
-    let s = session_obj(&render_json(&cfg(), &json_opts(), &r, now, None), "s-dead");
+    crashed(&mut r, "n-1", "tdead000000");
+    let s = session_obj(
+        &render_json(&cfg(), &json_opts(), &r, now, None),
+        "tdead000000",
+    );
     assert_eq!(
         open_of(&s),
         in_approval_path(),
         "another node's restore names another session"
     );
     let mut r = read_of(&[
-        ("n-1", "s-dead", dead.clone()),
-        ("n-2", "s-far", far),
-        ("n-1", "s-next", next.clone()),
+        ("n-1", "tdead000000", dead.clone()),
+        ("n-2", "tfar0000000", far),
+        ("n-1", "tnext000000", next.clone()),
     ]);
-    crashed(&mut r, "n-1", "s-dead");
+    crashed(&mut r, "n-1", "tdead000000");
     let json = render_json(&cfg(), &json_opts(), &r, now, None);
-    let s = session_obj(&json, "s-dead");
+    let s = session_obj(&json, "tdead000000");
     assert_eq!(open_of(&s), Vec::new(), "{json}");
     assert_eq!(
         need_of(&s),
@@ -1172,13 +1205,13 @@ fn a_successors_restore_derives_its_predecessors_close_in_a_narrowed_read_too() 
         "{json}"
     );
     assert_eq!(partial_of(&s), ["node-gone"], "{json}");
-    let successor = session_obj(&json, "s-next");
+    let successor = session_obj(&json, "tnext000000");
     assert_eq!(
         (need_of(&successor), partial_of(&successor)),
         ((None, None), Vec::<String>::new()),
         "the successor folds as any session: {json}"
     );
-    let key = ("n-1".to_string(), "s-dead".to_string());
+    let key = ("n-1".to_string(), "tdead000000".to_string());
     assert_eq!(
         settled_fold(&r, "n-1", &r.sessions[&key], Derive::Paged).and_then(|f| f.died),
         Some(Died::Restored),
@@ -1189,13 +1222,19 @@ fn a_successors_restore_derives_its_predecessors_close_in_a_narrowed_read_too() 
         head: 1000,
         ..Read::default()
     };
-    crashed(&mut narrow, "n-1", "s-dead");
+    crashed(&mut narrow, "n-1", "tdead000000");
     let mut off = 0;
-    for (sid, bs) in [("s-dead", &dead), ("s-next", &next)] {
+    for (sid, bs) in [("tdead000000", &dead), ("tnext000000", &next)] {
         for b in bs {
             off += 1;
             narrow
-                .ingest(FLEET, Some("s-dead"), off, &face("n-1", sid), b.as_bytes())
+                .ingest(
+                    FLEET,
+                    Some("tdead000000"),
+                    off,
+                    &face("n-1", sid),
+                    b.as_bytes(),
+                )
                 .expect("within the bound");
         }
     }
@@ -1205,11 +1244,14 @@ fn a_successors_restore_derives_its_predecessors_close_in_a_narrowed_read_too() 
         "a narrowed read folds its one session"
     );
     let opts = BriefOpts {
-        sid: Some("s-dead".to_string()),
+        sid: Some("tdead000000".to_string()),
         json: true,
         ..BriefOpts::default()
     };
-    let s = session_obj(&render_json(&cfg(), &opts, &narrow, now, None), "s-dead");
+    let s = session_obj(
+        &render_json(&cfg(), &opts, &narrow, now, None),
+        "tdead000000",
+    );
     assert_eq!(open_of(&s), Vec::new(), "narrowed too");
     assert_eq!(partial_of(&s), ["node-gone"]);
 }
@@ -1234,27 +1276,27 @@ fn a_session_whose_close_reached_the_bus_reads_as_it_did_whatever_says_it_died()
     )
     .expect("closes");
     let done = bodies(&mut done);
-    let next = bodies(&mut successor("s-done", at + 60_000));
-    let plain = read_of(&[("n-1", "s-done", done.clone())]);
+    let next = bodies(&mut successor("td0ne000000", at + 60_000));
+    let plain = read_of(&[("n-1", "td0ne000000", done.clone())]);
     let want = session_obj(
         &render_json(&cfg(), &json_opts(), &plain, now, None),
-        "s-done",
+        "td0ne000000",
     );
-    let mut r = read_of(&[("n-1", "s-done", done), ("n-1", "s-next", next)]);
+    let mut r = read_of(&[("n-1", "td0ne000000", done), ("n-1", "tnext000000", next)]);
     for (sid, row) in [
-        ("s-done", "v=1 t=1 inc=1 state=live"),
+        ("td0ne000000", "v=1 t=1 inc=1 state=live"),
         ("node", "v=1 t=3 state=live inc=3"),
-        ("s-done", "v=1 t=4 inc=3 state=exited"),
+        ("td0ne000000", "v=1 t=4 inc=3 state=exited"),
     ] {
         r.presence("n-1", sid, row.as_bytes()).expect("a row");
     }
     let json = render_json(&cfg(), &json_opts(), &r, now, None);
-    assert_eq!(session_obj(&json, "s-done"), want, "{json}");
+    assert_eq!(session_obj(&json, "td0ne000000"), want, "{json}");
     assert_eq!(need_of(&want), (Some("exited".to_string()), None));
     let f = settled_fold(
         &r,
         "n-1",
-        &r.sessions[&("n-1".to_string(), "s-done".to_string())],
+        &r.sessions[&("n-1".to_string(), "td0ne000000".to_string())],
         Derive::Shown,
     )
     .expect("a fold");
@@ -1264,7 +1306,7 @@ fn a_session_whose_close_reached_the_bus_reads_as_it_did_whatever_says_it_died()
         f.derived
     );
     let text = render(&cfg(), &BriefOpts::default(), &r, now);
-    let lines = lines_of(&text, "s-done");
+    let lines = lines_of(&text, "td0ne000000");
     assert!(!lines[0].contains("partial"), "{text}");
     assert!(
         lines
@@ -1298,18 +1340,18 @@ fn a_clean_quits_close_on_the_bus_reads_closed_out_app_quit_never_gone() {
     )
     .expect("the quit closes");
     let quit = bodies(&mut quit);
-    let next = bodies(&mut successor("s-quit", at + 60_000));
+    let next = bodies(&mut successor("tqv1t000000", at + 60_000));
     for withdrawn in [true, false] {
         let mut r = read_of(&[
-            ("n-1", "s-quit", quit.clone()),
-            ("n-1", "s-next", next.clone()),
+            ("n-1", "tqv1t000000", quit.clone()),
+            ("n-1", "tnext000000", next.clone()),
         ]);
         let mut rows = vec![
             ("node", "v=1 t=1 state=live inc=1"),
-            ("s-quit", "v=1 t=1 inc=1 state=live"),
+            ("tqv1t000000", "v=1 t=1 inc=1 state=live"),
         ];
         if withdrawn {
-            rows.push(("s-quit", "v=1 t=2 inc=1 state=exited"));
+            rows.push(("tqv1t000000", "v=1 t=2 inc=1 state=exited"));
         }
         rows.extend([
             ("node", "v=1 t=2 state=away inc=1 fabric=disconnected"),
@@ -1321,7 +1363,7 @@ fn a_clean_quits_close_on_the_bus_reads_closed_out_app_quit_never_gone() {
         let f = settled_fold(
             &r,
             "n-1",
-            &r.sessions[&("n-1".to_string(), "s-quit".to_string())],
+            &r.sessions[&("n-1".to_string(), "tqv1t000000".to_string())],
             Derive::Paged,
         )
         .expect("a fold");
@@ -1331,7 +1373,7 @@ fn a_clean_quits_close_on_the_bus_reads_closed_out_app_quit_never_gone() {
             f.derived
         );
         let json = render_json(&cfg(), &json_opts(), &r, now, None);
-        let s = session_obj(&json, "s-quit");
+        let s = session_obj(&json, "tqv1t000000");
         assert_eq!(
             partial_of(&s),
             Vec::<String>::new(),
@@ -1343,7 +1385,7 @@ fn a_clean_quits_close_on_the_bus_reads_closed_out_app_quit_never_gone() {
             "withdrawn {withdrawn}: the machine form says the quit's own close: {json}"
         );
         let text = render(&cfg(), &BriefOpts::default(), &r, now);
-        let lines = lines_of(&text, "s-quit");
+        let lines = lines_of(&text, "tqv1t000000");
         assert!(
             !lines[0].contains("partial"),
             "withdrawn {withdrawn}: {text}"
@@ -1380,7 +1422,7 @@ fn neither_a_will_nor_a_relaunch_nor_an_exit_under_its_own_incarnation_derives_a
             "a will",
             &[
                 ("node", "v=1 t=1 state=live inc=1"),
-                ("s-a", "v=1 t=1 inc=1 state=live"),
+                ("ta000000000", "v=1 t=1 inc=1 state=live"),
                 ("node", "v=1 t=2 state=away inc=1 fabric=disconnected"),
             ][..],
             "node-gone",
@@ -1388,7 +1430,7 @@ fn neither_a_will_nor_a_relaunch_nor_an_exit_under_its_own_incarnation_derives_a
         (
             "the relaunch moment",
             &[
-                ("s-a", "v=1 t=1 inc=1 state=live"),
+                ("ta000000000", "v=1 t=1 inc=1 state=live"),
                 ("node", "v=1 t=2 state=live inc=2"),
             ][..],
             "node-gone",
@@ -1397,8 +1439,8 @@ fn neither_a_will_nor_a_relaunch_nor_an_exit_under_its_own_incarnation_derives_a
             "an exit under its own incarnation",
             &[
                 ("node", "v=1 t=1 state=live inc=1"),
-                ("s-a", "v=1 t=1 inc=1 state=live"),
-                ("s-a", "v=1 t=2 inc=1 state=exited"),
+                ("ta000000000", "v=1 t=1 inc=1 state=live"),
+                ("ta000000000", "v=1 t=2 inc=1 state=exited"),
             ][..],
             "no-close",
         ),
@@ -1406,17 +1448,17 @@ fn neither_a_will_nor_a_relaunch_nor_an_exit_under_its_own_incarnation_derives_a
             "an exit with no earlier row",
             &[
                 ("node", "v=1 t=1 state=live inc=3"),
-                ("s-a", "v=1 t=2 inc=3 state=exited"),
+                ("ta000000000", "v=1 t=2 inc=3 state=exited"),
             ][..],
             "no-close",
         ),
     ] {
-        let mut r = read_of(&[("n-1", "s-a", dead.clone())]);
+        let mut r = read_of(&[("n-1", "ta000000000", dead.clone())]);
         for (sid, row) in rows {
             r.presence("n-1", sid, row.as_bytes()).expect("a row");
         }
         let json = render_json(&cfg(), &json_opts(), &r, now, None);
-        let s = session_obj(&json, "s-a");
+        let s = session_obj(&json, "ta000000000");
         assert_eq!(open_of(&s), in_approval_path(), "{case}: {json}");
         assert_eq!(
             need_of(&s),
@@ -1427,7 +1469,7 @@ fn neither_a_will_nor_a_relaunch_nor_an_exit_under_its_own_incarnation_derives_a
         let f = settled_fold(
             &r,
             "n-1",
-            &r.sessions[&("n-1".to_string(), "s-a".to_string())],
+            &r.sessions[&("n-1".to_string(), "ta000000000".to_string())],
             Derive::Shown,
         )
         .expect("a fold");
@@ -1464,9 +1506,9 @@ fn a_one_shot_brief_reads_the_row_that_says_which_incarnation_hosted_a_session()
     };
     let row = |sid: &str| format!("/f/{FLEET}/pub/n-a/{sid}/presence");
     publish(&mut conn, &row("node"), "v=1 t=1 state=live inc=1");
-    publish(&mut conn, &row("s-dead"), "v=1 t=1 inc=1 state=live");
+    publish(&mut conn, &row("tdead000000"), "v=1 t=1 inc=1 state=live");
     for b in bodies(&mut in_approval(at, "bash")) {
-        publish(&mut conn, &face("n-a", "s-dead"), &b);
+        publish(&mut conn, &face("n-a", "tdead000000"), &b);
     }
     publish(
         &mut conn,
@@ -1474,27 +1516,27 @@ fn a_one_shot_brief_reads_the_row_that_says_which_incarnation_hosted_a_session()
         "v=1 t=2 state=away inc=1 fabric=disconnected",
     );
     publish(&mut conn, &row("node"), "v=1 t=3 state=live inc=2");
-    publish(&mut conn, &row("s-dead"), "v=1 t=4 inc=2 state=exited");
+    publish(&mut conn, &row("tdead000000"), "v=1 t=4 inc=2 state=exited");
 
     let mut c = cfg();
     c.broker = sock.to_string_lossy().into_owned();
     for opts in [
         BriefOpts::default(),
         BriefOpts {
-            sid: Some("s-dead".to_string()),
+            sid: Some("tdead000000".to_string()),
             node: Some("n-a".to_string()),
             ..BriefOpts::default()
         },
     ] {
         let r = read(&c, &opts).expect("the brief reads");
-        let s = &r.sessions[&("n-a".to_string(), "s-dead".to_string())];
+        let s = &r.sessions[&("n-a".to_string(), "tdead000000".to_string())];
         assert_eq!(
             (s.presence.as_deref(), s.presence_inc, s.lived_inc),
             (Some("exited"), Some(2), Some(1)),
             "{opts:?}"
         );
         let json = render_json(&c, &json_opts(), &r, at + 600_000, None);
-        let obj = session_obj(&json, "s-dead");
+        let obj = session_obj(&json, "tdead000000");
         assert_eq!(open_of(&obj), Vec::new(), "{opts:?}: {json}");
         assert_eq!(partial_of(&obj), ["no-close"], "{opts:?}: {json}");
     }
@@ -1502,16 +1544,16 @@ fn a_one_shot_brief_reads_the_row_that_says_which_incarnation_hosted_a_session()
 
 /// A RESTORE SAYS A SESSION DIED ONLY WHEN ITS INCARNATION ENDED WITHOUT WITHDRAWING IT (fix
 /// unit E9, the lander's review). aterm writes `restore prev=<sid>` whenever a new shell fills a
-/// pane, so four sessions waiting in a box are each named by a successor's restore: s-crash's
-/// aterm died ([`CRASH_ROWS`]), and its close is derived; s-quit's quit withdrew it (`exited`
-/// under `inc=1`, the incarnation that hosted it) before its node's will and relaunch; s-tab's
+/// pane, so four sessions waiting in a box are each named by a successor's restore: tcrash00000's
+/// aterm died ([`CRASH_ROWS`]), and its close is derived; tqv1t000000's quit withdrew it (`exited`
+/// under `inc=1`, the incarnation that hosted it) before its node's will and relaunch; ttab0000000's
 /// closed tab was reopened under its own incarnation, which still lives; and the read knows no
-/// incarnation that hosted s-none. Those three derive nothing, for a reader or a watch: their
+/// incarnation that hosted tn0ne000000. Those three derive nothing, for a reader or a watch: their
 /// open path stays `[run agent, turn, step approval]`, their need `approval:bash`, and only
-/// s-quit is partial (`no-close`). NEGATIVE CONTROLS, run: a restore that counts whatever
-/// withdrew the session derives s-quit's close; one that counts while the session's own
-/// incarnation lives derives s-tab's; one that takes an unknown incarnation as ended derives
-/// s-none's.
+/// tqv1t000000 is partial (`no-close`). NEGATIVE CONTROLS, run: a restore that counts whatever
+/// withdrew the session derives tqv1t000000's close; one that counts while the session's own
+/// incarnation lives derives ttab0000000's; one that takes an unknown incarnation as ended derives
+/// tn0ne000000's.
 #[test]
 fn a_restore_says_a_session_died_only_when_its_incarnation_ended_without_withdrawing_it() {
     let at = 1_760_000_000_000;
@@ -1519,20 +1561,20 @@ fn a_restore_says_a_session_died_only_when_its_incarnation_ended_without_withdra
     let waiting = bodies(&mut in_approval(at, "bash"));
     let mut items = Vec::new();
     for (node, sid, next) in [
-        ("n-1", "s-crash", "s-c2"),
-        ("n-2", "s-quit", "s-q2"),
-        ("n-3", "s-tab", "s-t2"),
-        ("n-4", "s-none", "s-n2"),
+        ("n-1", "tcrash00000", "tc200000000"),
+        ("n-2", "tqv1t000000", "tq200000000"),
+        ("n-3", "ttab0000000", "tt200000000"),
+        ("n-4", "tn0ne000000", "tn200000000"),
     ] {
         items.push((node, sid, waiting.clone()));
         items.push((node, next, bodies(&mut successor(sid, at + 60_000))));
     }
     let mut r = read_of(&items);
-    crashed(&mut r, "n-1", "s-crash");
+    crashed(&mut r, "n-1", "tcrash00000");
     for (node, sid, row) in [
         ("n-2", "node", "v=1 t=1 state=live inc=1"),
-        ("n-2", "s-quit", "v=1 t=1 inc=1 state=live"),
-        ("n-2", "s-quit", "v=1 t=2 inc=1 state=exited"),
+        ("n-2", "tqv1t000000", "v=1 t=1 inc=1 state=live"),
+        ("n-2", "tqv1t000000", "v=1 t=2 inc=1 state=exited"),
         (
             "n-2",
             "node",
@@ -1540,29 +1582,29 @@ fn a_restore_says_a_session_died_only_when_its_incarnation_ended_without_withdra
         ),
         ("n-2", "node", "v=1 t=3 state=live inc=2"),
         ("n-3", "node", "v=1 t=1 state=live inc=1"),
-        ("n-3", "s-tab", "v=1 t=1 inc=1 state=live"),
+        ("n-3", "ttab0000000", "v=1 t=1 inc=1 state=live"),
         ("n-4", "node", "v=1 t=3 state=live inc=2"),
     ] {
         r.presence(node, sid, row.as_bytes()).expect("a row");
     }
     let json = render_json(&cfg(), &json_opts(), &r, now, None);
     let text = render(&cfg(), &BriefOpts::default(), &r, now);
-    let crash = session_obj(&json, "s-crash");
+    let crash = session_obj(&json, "tcrash00000");
     assert_eq!(open_of(&crash), Vec::new(), "the crash derives: {json}");
     assert_eq!(
         need_of(&crash),
         (Some("exited".to_string()), Some("gone".to_string())),
         "{json}"
     );
-    let crash_key = ("n-1".to_string(), "s-crash".to_string());
+    let crash_key = ("n-1".to_string(), "tcrash00000".to_string());
     assert_eq!(
         settled_fold(&r, "n-1", &r.sessions[&crash_key], Derive::Paged).and_then(|f| f.died),
         Some(Died::Restored)
     );
     for (node, sid, why) in [
-        ("n-2", "s-quit", &["no-close"][..]),
-        ("n-3", "s-tab", &[][..]),
-        ("n-4", "s-none", &[][..]),
+        ("n-2", "tqv1t000000", &["no-close"][..]),
+        ("n-3", "ttab0000000", &[][..]),
+        ("n-4", "tn0ne000000", &[][..]),
     ] {
         let s = session_obj(&json, sid);
         assert_eq!(open_of(&s), in_approval_path(), "{sid}: {json}");
@@ -1618,15 +1660,15 @@ fn a_derived_close_closes_every_node_the_fold_holds_open_innermost_first() {
     )
     .expect("the turn");
     let mut r = read_of(&[
-        ("n-1", "s-two", bodies(&mut log)),
+        ("n-1", "ttw00000000", bodies(&mut log)),
         (
             "n-1",
-            "s-next",
-            bodies(&mut successor("s-two", at + 60_000)),
+            "tnext000000",
+            bodies(&mut successor("ttw00000000", at + 60_000)),
         ),
     ]);
-    crashed(&mut r, "n-1", "s-two");
-    let s = &r.sessions[&("n-1".to_string(), "s-two".to_string())];
+    crashed(&mut r, "n-1", "ttw00000000");
+    let s = &r.sessions[&("n-1".to_string(), "ttw00000000".to_string())];
     let head = s.spaces[&1]
         .records()
         .map(|r| r.seq)
@@ -1666,9 +1708,9 @@ fn a_derived_close_closes_every_node_the_fold_holds_open_innermost_first() {
 #[test]
 fn a_derived_record_takes_no_seq_a_body_of_the_space_holds() {
     let at = 1_760_000_000_000;
-    let key = ("n-1".to_string(), "s-dead".to_string());
+    let key = ("n-1".to_string(), "tdead000000".to_string());
     let mut dead = bodies(&mut in_approval(at, "bash"));
-    let plain = read_of(&[("n-1", "s-dead", dead.clone())]);
+    let plain = read_of(&[("n-1", "tdead000000", dead.clone())]);
     let space = &plain.sessions[&key].spaces[&1];
     let as_of = space.fold_seeded().0.state().as_of;
     let head = space
@@ -1685,14 +1727,14 @@ fn a_derived_record_takes_no_seq_a_body_of_the_space_holds() {
         space.max_ms() + 1
     ));
     let mut r = read_of(&[
-        ("n-1", "s-dead", dead),
+        ("n-1", "tdead000000", dead),
         (
             "n-1",
-            "s-next",
-            bodies(&mut successor("s-dead", at + 60_000)),
+            "tnext000000",
+            bodies(&mut successor("tdead000000", at + 60_000)),
         ),
     ]);
-    crashed(&mut r, "n-1", "s-dead");
+    crashed(&mut r, "n-1", "tdead000000");
     let s = &r.sessions[&key];
     assert_eq!(
         (s.spaces[&1].foreign, s.spaces[&1].len()),
@@ -1710,16 +1752,16 @@ fn a_derived_record_takes_no_seq_a_body_of_the_space_holds() {
 }
 
 /// A ONE-SHOT BRIEF TELLS A QUIT'S WITHDRAWAL FROM A CRASH BY THE ROWS ITS WINDOW HOLDS (fix unit
-/// E9, the lander's review). On n-a the aterm crashed: s-crash's row was later retired by the
-/// next incarnation's sweep (`exited inc=2`), and s-given's too, whose row the bridge then gave
-/// back (no last value). On n-b the aterm quit: its bridge withdrew s-quit and s-left (`exited
-/// inc=1`, the incarnation that hosted them), and gave s-left's row back. A successor's restore
+/// E9, the lander's review). On n-a the aterm crashed: tcrash00000's row was later retired by the
+/// next incarnation's sweep (`exited inc=2`), and tg1ven00000's too, whose row the bridge then gave
+/// back (no last value). On n-b the aterm quit: its bridge withdrew tqv1t000000 and t1eft000000 (`exited
+/// inc=1`, the incarnation that hosted them), and gave t1eft000000's row back. A successor's restore
 /// names each. The read takes the window's presence rows for each such session it knows no
-/// hosting incarnation of, so s-crash and s-given read closed (their restore says they died),
-/// and s-quit and s-left derive nothing (their quit withdrew them), in a read of the fleet and in
+/// hosting incarnation of, so tcrash00000 and tg1ven00000 read closed (their restore says they died),
+/// and tqv1t000000 and t1eft000000 derive nothing (their quit withdrew them), in a read of the fleet and in
 /// one narrowed to the sid. NEGATIVE CONTROLS, run: a read that takes the earlier rows only for
-/// a session whose last row says `exited` leaves s-given open; one whose earlier rows record no
-/// exit derives s-left's close.
+/// a session whose last row says `exited` leaves tg1ven00000 open; one whose earlier rows record no
+/// exit derives t1eft000000's close.
 #[cfg(unix)]
 #[test]
 fn a_one_shot_brief_tells_a_quits_withdrawal_from_a_crash_by_the_rows_its_window_holds() {
@@ -1744,8 +1786,8 @@ fn a_one_shot_brief_tells_a_quits_withdrawal_from_a_crash_by_the_rows_its_window
     let row = |node: &str, sid: &str| format!("/f/{FLEET}/pub/{node}/{sid}/presence");
     let waiting = bodies(&mut in_approval(at, "bash"));
     for (node, sids) in [
-        ("n-a", ["s-crash", "s-given"]),
-        ("n-b", ["s-quit", "s-left"]),
+        ("n-a", ["tcrash00000", "tg1ven00000"]),
+        ("n-b", ["tqv1t000000", "t1eft000000"]),
     ] {
         publish(&mut conn, &row(node, "node"), "v=1 t=1 state=live inc=1");
         for sid in sids {
@@ -1755,7 +1797,7 @@ fn a_one_shot_brief_tells_a_quits_withdrawal_from_a_crash_by_the_rows_its_window
             }
         }
     }
-    for sid in ["s-quit", "s-left"] {
+    for sid in ["tqv1t000000", "t1eft000000"] {
         publish(&mut conn, &row("n-b", sid), "v=1 t=2 inc=1 state=exited");
     }
     for node in ["n-a", "n-b"] {
@@ -1767,19 +1809,19 @@ fn a_one_shot_brief_tells_a_quits_withdrawal_from_a_crash_by_the_rows_its_window
         publish(&mut conn, &row(node, "node"), "v=1 t=3 state=live inc=2");
     }
     for (node, sid, next) in [
-        ("n-a", "s-crash", "s-c2"),
-        ("n-a", "s-given", "s-g2"),
-        ("n-b", "s-quit", "s-q2"),
-        ("n-b", "s-left", "s-l2"),
+        ("n-a", "tcrash00000", "tc200000000"),
+        ("n-a", "tg1ven00000", "tg200000000"),
+        ("n-b", "tqv1t000000", "tq200000000"),
+        ("n-b", "t1eft000000", "t1200000000"),
     ] {
         for b in bodies(&mut successor(sid, at + 60_000)) {
             publish(&mut conn, &face(node, next), &b);
         }
     }
-    for sid in ["s-crash", "s-given"] {
+    for sid in ["tcrash00000", "tg1ven00000"] {
         publish(&mut conn, &row("n-a", sid), "v=1 t=4 inc=2 state=exited");
     }
-    for (node, sid) in [("n-a", "s-given"), ("n-b", "s-left")] {
+    for (node, sid) in [("n-a", "tg1ven00000"), ("n-b", "t1eft000000")] {
         conn.retire_subject(91, &row(node, sid))
             .expect("the row given back");
     }
@@ -1787,10 +1829,10 @@ fn a_one_shot_brief_tells_a_quits_withdrawal_from_a_crash_by_the_rows_its_window
     let mut c = cfg();
     c.broker = sock.to_string_lossy().into_owned();
     for (node, sid, dies) in [
-        ("n-a", "s-crash", true),
-        ("n-a", "s-given", true),
-        ("n-b", "s-quit", false),
-        ("n-b", "s-left", false),
+        ("n-a", "tcrash00000", true),
+        ("n-a", "tg1ven00000", true),
+        ("n-b", "tqv1t000000", false),
+        ("n-b", "t1eft000000", false),
     ] {
         for opts in [
             BriefOpts::default(),

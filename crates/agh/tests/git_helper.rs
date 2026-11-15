@@ -116,7 +116,8 @@ impl World {
             "profile": grant.profile,
             "slug": grant.slug,
             "start": grant.start,
-            "v": 1,
+            "credential_binding": aterm_codec::hex::encode_lower(&grant.credential_binding),
+            "v": 2,
         })
         .to_string();
         let path = self.dirs.grants().join(format!("{nonce}.json"));
@@ -133,6 +134,7 @@ impl World {
 struct TestGrant {
     slug: &'static str,
     profile: &'static str,
+    credential_binding: [u8; 32],
     pid: u32,
     start: u64,
     expires_at: u64,
@@ -151,6 +153,12 @@ impl TestGrant {
         TestGrant {
             slug,
             profile,
+            credential_binding: {
+                let mut digest = aterm_digest::Sha256::new();
+                digest.update(b"agh/git-operation-credential/v2\0");
+                digest.update(agh_fake::token(profile).as_bytes());
+                digest.finalize()
+            },
             pid,
             start,
             expires_at: common::SIM_START + 600,
@@ -238,11 +246,10 @@ fn a_dev_request_never_answers_a_release_grant() {
     let world = World::canonical("helper-b5");
     let nonce = world.grant(&TestGrant::live("fixture-dev/app", "release"));
     let out = world.get(granted(&nonce), DEV_REQUEST);
-    assert_eq!(out, credential(&world.token("dev")));
+    assert_eq!(out, QUIT);
     assert!(!out.contains(&world.token("release")));
     let who = world.whoami(granted(&nonce), "https://github.com/fixture-dev/app.git");
-    assert_eq!(who["profile"], Value::from("dev"), "{who}");
-    assert_eq!(who["tier"], Value::from("dev"), "{who}");
+    assert_eq!(who["answer"], Value::from("quit"), "{who}");
     assert_eq!(who["grant"], Value::Null, "{who}");
 }
 
@@ -263,13 +270,99 @@ fn a_dev_grant_answers_only_the_writer() {
     assert_eq!(who["grant"], Value::from("live"), "{who}");
     assert_eq!(who["profile"], Value::from("dev"), "{who}");
     let reader = world.grant(&TestGrant::live("fixture-dev/app", "reader"));
-    assert_eq!(
-        world.get(granted(&reader), DEV_REQUEST),
-        credential(&world.token("reader"))
-    );
+    assert_eq!(world.get(granted(&reader), DEV_REQUEST), QUIT);
     let who = world.whoami(granted(&reader), url);
     assert_eq!(who["grant"], Value::Null, "{who}");
-    assert_eq!(who["profile"], Value::from("reader"), "{who}");
+    assert_eq!(who["answer"], Value::from("quit"), "{who}");
+}
+
+#[test]
+fn a_supplied_invalid_operation_grant_never_falls_back_to_the_dev_read_chain() {
+    for damage in [
+        "missing",
+        "empty",
+        "bad-nonce",
+        "v1",
+        "missing-binding",
+        "short-binding",
+        "uppercase-binding",
+        "wrong-slug",
+        "expired",
+    ] {
+        let world = World::with_reader("helper-invalid-operation");
+        let nonce = world.grant(&TestGrant::live("fixture-dev/app", "dev"));
+        let path = world.dirs.grants().join(format!("{nonce}.json"));
+        let mut record: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let nonce = match damage {
+            "missing" => {
+                std::fs::remove_file(&path).unwrap();
+                nonce
+            }
+            "empty" => String::new(),
+            "bad-nonce" => "not-a-nonce".into(),
+            _ => {
+                let fields = record.as_object_mut().unwrap();
+                match damage {
+                    "v1" => {
+                        fields.insert("v".into(), Value::from(1));
+                    }
+                    "missing-binding" => {
+                        fields.remove("credential_binding");
+                    }
+                    "short-binding" => {
+                        fields.insert("credential_binding".into(), Value::from("ab".repeat(6)));
+                    }
+                    "uppercase-binding" => {
+                        fields.insert("credential_binding".into(), Value::from("AB".repeat(32)));
+                    }
+                    "wrong-slug" => {
+                        fields.insert("slug".into(), Value::from("fixture-dev/other"));
+                    }
+                    "expired" => {
+                        fields.insert("expires_at".into(), Value::from(common::SIM_START - 1));
+                    }
+                    _ => unreachable!(),
+                }
+                std::fs::write(&path, record.to_string()).unwrap();
+                nonce
+            }
+        };
+        assert_eq!(world.get(granted(&nonce), DEV_REQUEST), QUIT, "{damage}");
+        assert_eq!(
+            world.get(MapEnv::new(), DEV_REQUEST),
+            credential(&world.token("reader"))
+        );
+    }
+}
+
+#[test]
+fn a_credential_rotated_after_grant_creation_is_not_emitted() {
+    for (slug, profile, request, directory, filename) in [
+        ("fixture-dev/app", "dev", DEV_REQUEST, "tokens", "dev.token"),
+        (
+            "alabsystems/aterm",
+            "release",
+            RELEASE_REQUEST,
+            "secrets",
+            "release.token",
+        ),
+    ] {
+        let world = World::canonical("helper-rotation");
+        let nonce = world.grant(&TestGrant::live(slug, profile));
+        assert_eq!(
+            world.get(granted(&nonce), request),
+            credential(&world.token(profile))
+        );
+        std::fs::write(
+            world.root.path().join(directory).join(filename),
+            agh_fake::token("rotated"),
+        )
+        .unwrap();
+        assert_eq!(world.get(granted(&nonce), request), QUIT);
+        let who = world.whoami(granted(&nonce), &format!("https://github.com/{slug}.git"));
+        assert_eq!(who["answer"], Value::from("quit"));
+        assert_eq!(who["grant"], Value::Null);
+    }
 }
 
 #[test]
@@ -885,9 +978,12 @@ fn repo_fetch_main_keeps_work_and_refs_and_records_rewinds() {
         crate::git_runner::host_git(&bare, &["commit-tree", &tree, "-p", &first, "-m", "two"]);
     crate::git_runner::host_git(&bare, &["update-ref", "refs/heads/main", &second]);
     crate::git_runner::host_git(&bare, &["tag", "remote-tag", &second]);
+    // It prints the commit this run wrote, which a caller takes rather than reading the ref
+    // back: every worktree shares the ref, so another worktree's fetch may have moved it since.
+    let wrote = |oid: &str| aterm_json::json!({"ref": "refs/agh/fetched-main", "oid": oid});
     let (exit, captured) = invoke("fetch-main", &["--meta"]);
     assert_eq!(exit, 0, "{}", captured.stderr_text());
-    assert_eq!(captured.stdout_text(), "");
+    assert_eq!(common::stdout_json(&captured), wrote(&second));
     assert!(captured.stderr_text().contains("as=reader"));
     assert!(captured.stderr_text().contains("ref=refs/agh/fetched-main"));
     assert_eq!(
@@ -898,6 +994,7 @@ fn repo_fetch_main_keeps_work_and_refs_and_records_rewinds() {
     crate::git_runner::host_git(&bare, &["update-ref", "refs/heads/main", &first]);
     let (exit, captured) = invoke("fetch-main", &[]);
     assert_eq!(exit, 0, "{}", captured.stderr_text());
+    assert_eq!(common::stdout_json(&captured), wrote(&first));
     assert_eq!(
         crate::git_runner::host_git(&checkout, &["rev-parse", "refs/agh/fetched-main"]),
         first
@@ -986,13 +1083,7 @@ fn vault_world(label: &str, config: Option<&str>) -> (World, String) {
     let dirs = Dirs::under(root.path());
     let token = agh_fake::token("vault-dev");
     fake.add_token(&token, "fixture-dev");
-    let path = agh::identity::vault::Slot::Dev.path(&dirs.home);
-    std::fs::create_dir_all(&dirs.home).expect("the home");
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("the vault file's name");
-    common::write_token(path.parent().expect("the vault directory"), name, &token);
+    common::vault_entry(&dirs.home, agh::identity::vault::Slot::Dev.entry(), &token);
     let fingerprint = agh::identity::fingerprint(token.as_bytes());
     agh::identity::vault::record_for_tests(
         &dirs,

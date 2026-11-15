@@ -374,8 +374,6 @@ fn a_default_kimi_pool_is_a_converge_source_without_a_claude_source() {
         scratch.path().join("state"),
         scratch.path().join("config"),
     );
-    let secrets = home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
     std::fs::create_dir_all(&config_dir).unwrap();
     let config = config_dir.join("aterm.toml");
     let roster = config_dir.join("accounts.toml");
@@ -383,12 +381,15 @@ fn a_default_kimi_pool_is_a_converge_source_without_a_claude_source() {
     aterm_uds::atomic_file::write(&config, configured.as_bytes(), 0o600).unwrap();
     std::fs::write(&roster, "").unwrap();
     let kimi = accounts::roster_beside_for(&config, accounts::Cli::Kimi).unwrap();
-    let source = secrets.join(accounts_sync::cli_fleet_file(accounts::Cli::Kimi));
     let fleet = concat!(
         "[[account]]\nlabel = \"kimi-1\"\nemail = \"kimi-one@example.com\"\n",
         "machines = [\"m16\"]\nregion = \"global\"\n",
     );
-    std::fs::write(&source, fleet).unwrap();
+    aterm_agent::vault_entry::put(
+        &home,
+        &accounts_sync::cli_fleet_file(accounts::Cli::Kimi),
+        fleet,
+    );
     let now = 1_800_000_000;
     assert!(
         !accounts_sync::has_init_accounts_source(&home, &state, &roster, now),
@@ -423,7 +424,6 @@ fn a_default_kimi_pool_is_a_converge_source_without_a_claude_source() {
     );
     std::fs::write(&config, configured).unwrap();
     let read = accounts_at(Some(&config), &home, &state, &roster, now);
-    assert_eq!(std::fs::read_to_string(&source).unwrap(), fleet);
     assert!(std::fs::read(&roster).unwrap().is_empty());
     assert!(!kimi.exists(), "the probe creates no local Kimi roster");
     assert!(!state.exists(), "the probes write no account state");
@@ -457,16 +457,17 @@ fn a_default_codex_pool_reads_and_applies_without_either_accounts_roster() {
         scratch.path().join("state"),
         scratch.path().join("config"),
     );
-    let secrets = home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
     std::fs::create_dir_all(&config_dir).unwrap();
     let config = config_dir.join("aterm.toml");
     let roster = config_dir.join("accounts.toml");
     let codex = accounts::roster_beside_for(&config, accounts::Cli::Codex).unwrap();
     let configured = "[fleet]\nmachine = \"m16\"\n";
-    let source = secrets.join(accounts_sync::cli_fleet_file(accounts::Cli::Codex));
     let fleet = "[[account]]\nlabel='codex-1'\nemail='codex-one@example.test'\nmachines=['m16']\n";
-    std::fs::write(&source, fleet).unwrap();
+    aterm_agent::vault_entry::put(
+        &home,
+        &accounts_sync::cli_fleet_file(accounts::Cli::Codex),
+        fleet,
+    );
     aterm_uds::atomic_file::write(
         &config,
         format!("{configured}[harness]\naccounts='off'\n").as_bytes(),
@@ -500,7 +501,6 @@ fn a_default_codex_pool_reads_and_applies_without_either_accounts_roster() {
     for cli in [accounts::Cli::Grok, accounts::Cli::Kimi] {
         assert!(!accounts::roster_beside_for(&config, cli).unwrap().exists());
     }
-    assert_eq!(std::fs::read_to_string(source).unwrap(), fleet);
     assert!(
         matches!(&before, AccountsRead::Due(why) if why.contains("codex"))
             && matches!(after, AccountsRead::Current(_)),

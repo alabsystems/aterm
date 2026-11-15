@@ -53,11 +53,7 @@ fn fixture(source: i64, case: i64, spelling: &str) -> MailboxConfig {
         ("store/mailbox.toml", high.as_str()),
         (".config/aterm/accounts.toml", roster),
     ];
-    for (name, text) in files {
-        let path = home.path().join(name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
+    plant(home.path(), &files);
     let store = home.path().join("store");
     let cfg = match source {
         0 => discover_mailbox_config_files_raw(Some(home.path()), Some(&store), None),
@@ -68,10 +64,13 @@ fn fixture(source: i64, case: i64, spelling: &str) -> MailboxConfig {
         _ => unreachable!(),
     };
     for (name, text) in files {
-        assert_eq!(
-            std::fs::read_to_string(home.path().join(name)).unwrap(),
-            text
-        );
+        let held = match name.strip_prefix(".secrets/") {
+            Some(entry) => crate::vault_entry::read_text(home.path(), entry, 1 << 20)
+                .text()
+                .map(str::to_owned),
+            None => std::fs::read_to_string(home.path().join(name)).ok(),
+        };
+        assert_eq!(held.as_deref(), Some(text));
     }
     cfg
 }
@@ -151,14 +150,13 @@ fn mailbox_superseded_totp_uri_does_not_retain_its_old_email_alias() {
     let old = configuration("m27", 2, None).replace("mailbox%40", "old-inbox%40");
     let new_uri = OLD_TOTP.replace("mailbox%40", "new-inbox%40");
     let new = configuration("m27", 1, None).replace("KRSXG5A", &new_uri);
-    for (name, text) in [
-        (".secrets/ai-mailbox.toml", old),
-        ("store/mailbox.toml", new),
-    ] {
-        let path = home.path().join(name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
+    plant(
+        home.path(),
+        &[
+            (".secrets/ai-mailbox.toml", old),
+            ("store/mailbox.toml", new),
+        ],
+    );
     let cfg = discover_mailbox_config_files_raw(
         Some(home.path()),
         Some(&home.path().join("store")),
@@ -184,15 +182,14 @@ fn mailbox_superseded_totp_uri_does_not_retain_its_old_email_alias() {
 #[test]
 fn mailbox_raw_named_secrets_obey_contested_label_isolation() {
     let home = aterm_tempfile::tempdir().unwrap();
-    for (name, text) in [
+    plant(
+        home.path(),
+        &[
         (".secrets/m27", format!("password-2\nsecond-2\n{OLD_TOTP}\n")),
         (".config/aterm/accounts.toml", "[[account]]\nlabel='m27'\nclass='dedicated'\nemail='owner@example.org'\n".to_owned()),
         (".config/aterm/accounts-kimi.toml", "[[account]]\nlabel='m27'\nclass='dedicated'\nemail='other@example.org'\nregion='global'\n".to_owned()),
-    ] {
-        let path = home.path().join(name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
+        ],
+    );
     let cfg = discover_mailbox_config_files_raw(Some(home.path()), None, None);
     assert!(cfg.contested_labels.contains("m27"));
     for email in ["mailbox@example.org", "other@example.org"] {
@@ -215,30 +212,30 @@ fn mailbox_named_files_cannot_override_equivalent_store_keys() {
         let home = aterm_tempfile::tempdir().unwrap();
         let high = configuration("m27.2", 1, None);
         let roster = "[[account]]\nlabel='m27-2'\nclass='dedicated'\nemail='mailbox@example.org'\n";
-        for (name, text) in [
-            ("store/mailbox.toml", high.as_str()),
-            (".config/aterm/accounts.toml", roster),
-        ] {
-            let path = home.path().join(name);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
-        }
-        let secrets = home.path().join(".secrets");
-        std::fs::create_dir(&secrets).unwrap();
+        plant(
+            home.path(),
+            &[
+                ("store/mailbox.toml", high.as_str()),
+                (".config/aterm/accounts.toml", roster),
+            ],
+        );
         if raw {
-            std::fs::write(
-                secrets.join("m27_2"),
-                format!("password-2\nsecond-2\n{OLD_TOTP}\n"),
-            )
-            .unwrap();
+            plant(
+                home.path(),
+                &[(
+                    ".secrets/m27_2",
+                    format!("password-2\nsecond-2\n{OLD_TOTP}\n"),
+                )],
+            );
         } else {
-            for (name, value) in [
-                ("m27_2_password", credential(0, 2)),
-                ("m27_2_mailbox_password", credential(1, 2)),
-                ("m27_2_totp", credential(2, 2)),
-            ] {
-                std::fs::write(secrets.join(name), value).unwrap();
-            }
+            plant(
+                home.path(),
+                &[
+                    (".secrets/m27_2_password", credential(0, 2)),
+                    (".secrets/m27_2_mailbox_password", credential(1, 2)),
+                    (".secrets/m27_2_totp", credential(2, 2)),
+                ],
+            );
         }
         let cfg = discover_mailbox_config_files_raw(
             Some(home.path()),
@@ -262,7 +259,8 @@ fn explicit_email_fixture(source: i64) -> MailboxConfig {
     let owner = "owner_m27@example.org";
     let home = aterm_tempfile::tempdir().unwrap();
     let secrets = home.path().join(".secrets");
-    std::fs::create_dir(&secrets).unwrap();
+    let put =
+        |name: &str, text: &str| crate::vault_entry::seed(home.path(), &[(name, text.as_bytes())]);
     let values = [credential(0, 1), credential(1, 1), credential(2, 1)];
     let fields = ["password", "mailbox_password", "totp_secret"];
     let body: String = fields
@@ -270,25 +268,32 @@ fn explicit_email_fixture(source: i64) -> MailboxConfig {
         .zip(&values)
         .map(|(key, value)| format!("{key} = '{value}'\n"))
         .collect();
+    // No store entry is named by an email (an entry's name is `[A-Za-z0-9._-]`), so the first
+    // two sources are the local mailbox file and the store's `mailbox.toml`.
     match source {
-        0 => std::fs::write(secrets.join(owner), &body).unwrap(),
+        0 => plant(
+            home.path(),
+            &[(
+                ".config/aterm/mailbox.toml",
+                format!("[accounts.'{owner}']\n{body}"),
+            )],
+        ),
         1 => {
-            for (field, value) in fields.iter().zip(&values) {
-                std::fs::write(secrets.join(format!("{owner}_{field}")), value).unwrap();
-            }
+            let text: String = fields
+                .iter()
+                .zip(&values)
+                .map(|(key, value)| format!("'{owner}_{key}' = '{value}'\n"))
+                .collect();
+            put(MAILBOX_TOML_FILE, &text);
         }
-        2 => std::fs::write(
-            secrets.join("ai-mailbox.toml"),
-            format!("[accounts.'{owner}']\n{body}"),
-        )
-        .unwrap(),
+        2 => put("ai-mailbox.toml", &format!("[accounts.'{owner}']\n{body}")),
         3 => {
             let text: String = fields
                 .iter()
                 .zip(&values)
                 .map(|(key, value)| format!("'{owner}_{key}' = '{value}'\n"))
                 .collect();
-            std::fs::write(secrets.join("ai-mailbox.toml"), text).unwrap();
+            put("ai-mailbox.toml", &text);
         }
         4 => {
             let text: String = ["passwords", "mailbox_passwords", "totp_secrets"]
@@ -296,16 +301,16 @@ fn explicit_email_fixture(source: i64) -> MailboxConfig {
                 .zip(&values)
                 .map(|(section, value)| format!("[{section}]\n'{owner}' = '{value}'\n"))
                 .collect();
-            std::fs::write(secrets.join("ai-mailbox.toml"), text).unwrap();
+            put("ai-mailbox.toml", &text);
         }
         5 => {
             let mut text = String::new();
             for (field, value) in fields.iter().zip(&values) {
                 let path = secrets.join(format!("value-{field}"));
-                std::fs::write(&path, value).unwrap();
+                put(&format!("value-{field}"), value);
                 text.push_str(&format!("'{owner}_{field}_file' = '{}'\n", path.display()));
             }
-            std::fs::write(secrets.join("ai-mailbox.toml"), text).unwrap();
+            put("ai-mailbox.toml", &text);
         }
         6 => {
             let text = format!(
@@ -314,7 +319,7 @@ fn explicit_email_fixture(source: i64) -> MailboxConfig {
                  [totp_secrets]\n'{owner}' = '{}'\n",
                 values[0], values[1], values[2]
             );
-            std::fs::write(secrets.join("ai-mailbox.toml"), text).unwrap();
+            put("ai-mailbox.toml", &text);
         }
         _ => unreachable!(),
     }
@@ -404,21 +409,20 @@ fn a_renamed_rows_old_label_still_names_its_secrets() {
     use super::super::accounts::{Cli, Vendor};
     use super::super::alab_roster::{Lab, LabAccount, with_lab};
     let home = aterm_tempfile::tempdir().unwrap();
-    for (name, text) in [
-        (
-            ".secrets/ai-mailbox.toml",
-            "[passwords]\nm22-2 = \"fixture-pw\"\n",
-        ),
-        (
-            ".config/aterm/accounts.toml",
-            "[[account]]\nlabel = \"claude-bbbbbb\"\nclass = \"dedicated\"\n\
-             email = \"bob@example.test\"\n",
-        ),
-    ] {
-        let path = home.path().join(name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
+    plant(
+        home.path(),
+        &[
+            (
+                ".secrets/ai-mailbox.toml",
+                "[passwords]\nm22-2 = \"fixture-pw\"\n",
+            ),
+            (
+                ".config/aterm/accounts.toml",
+                "[[account]]\nlabel = \"claude-bbbbbb\"\nclass = \"dedicated\"\n\
+                 email = \"bob@example.test\"\n",
+            ),
+        ],
+    );
     let read = || {
         discover_mailbox_config_files_raw(Some(home.path()), None, None)
             .password_for(Some("bob@example.test"))
@@ -452,20 +456,19 @@ fn a_renamed_rows_old_label_still_names_its_secrets() {
 fn a_mac_the_lab_names_reads_no_sheet_for_its_mailbox_labels() {
     use super::super::alab_roster::{Lab, with_lab};
     let home = aterm_tempfile::tempdir().unwrap();
-    for (name, text) in [
-        (
-            ".secrets/ai-mailbox.toml",
-            "[passwords]\nkimi-m16 = \"sheet-pw\"\n",
-        ),
-        (
-            ".secrets/ai-accounts.csv",
-            "email,computer,claude,kimi\nkimi-sheet@example.test,m16,,global\n",
-        ),
-    ] {
-        let path = home.path().join(name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
+    plant(
+        home.path(),
+        &[
+            (
+                ".secrets/ai-mailbox.toml",
+                "[passwords]\nkimi-m16 = \"sheet-pw\"\n",
+            ),
+            (
+                ".secrets/ai-accounts.csv",
+                "email,computer,claude,kimi\nkimi-sheet@example.test,m16,,global\n",
+            ),
+        ],
+    );
     let read = || {
         discover_mailbox_config_files_raw(Some(home.path()), None, None)
             .password_for(Some("kimi-sheet@example.test"))
@@ -491,20 +494,19 @@ fn a_mac_the_lab_names_reads_no_sheet_for_its_mailbox_labels() {
 fn a_pending_lab_reads_no_sheet_for_its_mailbox_labels() {
     use super::super::alab_roster::while_pending;
     let home = aterm_tempfile::tempdir().unwrap();
-    for (name, text) in [
-        (
-            ".secrets/ai-mailbox.toml",
-            "[passwords]\nkimi-m16 = \"sheet-pw\"\n",
-        ),
-        (
-            ".secrets/ai-accounts.csv",
-            "email,computer,claude,kimi\nkimi-sheet@example.test,m16,,global\n",
-        ),
-    ] {
-        let path = home.path().join(name);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, text).unwrap();
-    }
+    plant(
+        home.path(),
+        &[
+            (
+                ".secrets/ai-mailbox.toml",
+                "[passwords]\nkimi-m16 = \"sheet-pw\"\n",
+            ),
+            (
+                ".secrets/ai-accounts.csv",
+                "email,computer,claude,kimi\nkimi-sheet@example.test,m16,,global\n",
+            ),
+        ],
+    );
     let read = || {
         discover_mailbox_config_files_raw(Some(home.path()), None, None)
             .password_for(Some("kimi-sheet@example.test"))
@@ -515,4 +517,22 @@ fn a_pending_lab_reads_no_sheet_for_its_mailbox_labels() {
         "nothing pending: the sheet names it"
     );
     assert_eq!(while_pending(read), None);
+}
+
+/// A home holding `files`, each `(path, text)` under `home`; a `.secrets/NAME` path is the vault
+/// entry NAME, published to the store this home administers and read in place, never a file.
+fn plant<T: AsRef<str>>(home: &Path, files: &[(&str, T)]) {
+    let mut entries = Vec::new();
+    for (path, text) in files {
+        if let Some(name) = path.strip_prefix(".secrets/") {
+            entries.push((name, text.as_ref().as_bytes()));
+            continue;
+        }
+        let at = home.join(path);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(at, text.as_ref()).unwrap();
+    }
+    if !entries.is_empty() {
+        crate::vault_entry::seed(home, &entries);
+    }
 }

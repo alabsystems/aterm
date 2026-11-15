@@ -78,7 +78,7 @@ fn report(
         volumes,
         None,
         &Ok(claims.to_vec()),
-        trees,
+        (trees, None),
         1_000,
         &super::cpu::Report::absent(),
     )
@@ -102,7 +102,7 @@ fn json_report(
         volumes,
         None,
         &Ok(claims.to_vec()),
-        trees,
+        (trees, None),
         1_000,
         &super::cpu::Report::absent(),
     );
@@ -645,8 +645,9 @@ fn a_waiter_no_claims_end_can_start_is_named_stuck() {
     let shown = claim_lines(&r, &[], &claims);
     assert!(
         shown[0].contains(&format!(
-            "reserves {}: it cannot start yet and no claim's end can start it (it waits for \
-             memory no claim holds), so each claim behind it that fits goes first",
+            "reserves {}: it cannot start yet and no end of a claim it can wait for can start \
+             it (it waits for memory no claim holds but the work it runs under), so each claim \
+             behind it that fits goes first",
             gib(0)
         )),
         "{}",
@@ -680,5 +681,59 @@ fn a_waiter_no_claims_end_can_start_is_named_stuck() {
     assert_eq!(
         json_claims(&report, "reserved_mem"),
         [Value::from(0u64), Value::from(3 * GIB)]
+    );
+}
+
+/// THE LISTING NAMES THE JUDGMENT TURN'S QUEUE: who holds it, then each waiter in the order it
+/// takes it (smallest key, queued since plus predicted), with its prediction and wait; the JSON
+/// gives each claim's turn and the queue by claim. NEGATIVE CONTROL: a ledger with no claim of
+/// the turn lists no turn line, and its JSON queue is empty.
+#[test]
+fn the_listing_names_the_judgment_turns_queue() {
+    let (r, _) = data();
+    let turn = |pid, start_ms, since_ms, predicted_ms, held| {
+        mem_claim(
+            pid,
+            start_ms,
+            Need::new(format!("verify judgment turn: {pid}")).heavy(since_ms, predicted_ms),
+            held,
+        )
+    };
+    let claims = [
+        turn(2, 10, 0, 600_000, false),
+        turn(3, 20, 100, 300_000, false),
+        turn(1, 5, 0, 900_000, true),
+        mem_claim(4, 30, Need::new("cargo build").cores(2), false),
+    ];
+    let out = report(&r, &[], &claims, None);
+    let turn_lines: Vec<&String> = out.iter().filter(|l| l.starts_with("turn ")).collect();
+    assert_eq!(turn_lines.len(), 3, "{out:#?}");
+    assert!(turn_lines[0].contains("held by pid 1"), "{turn_lines:?}");
+    assert!(turn_lines[1].contains("1. pid 3 waits"), "{turn_lines:?}");
+    assert!(turn_lines[1].contains("key 300100"), "{turn_lines:?}");
+    assert!(turn_lines[2].contains("2. pid 2 waits"), "{turn_lines:?}");
+    let json = json_report(&r, &[], &claims, None);
+    let heavy = json_claims(&json, "heavy");
+    assert_eq!(heavy[1].get("key").and_then(Value::as_u64), Some(300_100));
+    assert!(heavy[3].is_null());
+    let queue: Vec<u64> = json
+        .get("turn")
+        .and_then(Value::as_array)
+        .expect("turn")
+        .iter()
+        .map(|c| c[1].as_u64().expect("pid"))
+        .collect();
+    assert_eq!(queue, [1, 3, 2]);
+
+    let plain = [mem_claim(4, 30, Need::new("cargo build").cores(2), false)];
+    assert!(
+        !report(&r, &[], &plain, None)
+            .iter()
+            .any(|l| l.starts_with("turn "))
+    );
+    let json = json_report(&r, &[], &plain, None);
+    assert_eq!(
+        json.get("turn").and_then(Value::as_array).map(Vec::len),
+        Some(0)
     );
 }

@@ -110,6 +110,7 @@ fn mint(lab: &Lab) {
         expiry_from: ExpiryFrom::Printed,
         minted_on: "m22".to_owned(),
         cli: "2.1.318".to_owned(),
+        minted_by: None,
         verified: None,
     };
     let written = claude_token::write(
@@ -406,9 +407,41 @@ fn a_token_in_use_here_is_served_and_a_busy_vault_is_passed_over_at_once() {
     drop(held);
 }
 
+/// THE HOLD AT THE WRAPPER (§5.6): the lab's token, minted here with nothing compared yet, is held
+/// while the row's stored login works here, the roster saying which login that is: the launch
+/// stays on it (`awaiting-basis`, journaled), and nothing is read to serve. CONTROL: with no login
+/// record of the row's account here, the same token is served.
+#[cfg(unix)]
+#[test]
+fn a_token_awaiting_its_basis_is_held_at_the_wrapper_while_the_stored_login_works() {
+    let lab = Lab::new();
+    crate::harness::journal::with_keyer(keyer, || mint(&lab));
+    let world = World::new();
+    let ctx = world.ctx(&[], Some(&lab));
+    let (decision, _, _) = decided(&world.run(Some("work"), &[]), &ctx);
+    assert!(
+        matches!(decision, Decision::Token { .. }),
+        "CONTROL: {decision:?}"
+    );
+    // The vault is the user home's, so the row's login record is read beside it.
+    std::fs::write(
+        lab.paths.home.join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"person@example.com"}}"#,
+    )
+    .expect("the login record");
+    let (decision, read, noted) = decided(&world.run(Some("work"), &[]), &ctx);
+    assert_eq!(decision, Decision::Stored(Fallback::AwaitingBasis));
+    assert!(read.is_none(), "nothing read to serve");
+    assert_eq!(noted, Some((entry(), "awaiting-basis")));
+}
+
 /// The variable the wrapper stand-in's parent sets: where the reader writes what it saw.
 #[cfg(target_os = "macos")]
 const REPORT: &str = "ATERM_TEST_TOKEN_RUN_REPORT";
+
+/// The `minted_at` of the token the wrapper stand-in serves.
+#[cfg(target_os = "macos")]
+const SERVED_MINTED: u64 = 1_790_000_000;
 
 /// The stand-in for the wrapper: serves the sentinel to the reader stand-in (this test binary
 /// again), as `token-run` does once the judgment said `Token`.
@@ -428,12 +461,12 @@ fn token_wrapper_stand_in() {
         "--quiet",
     ]);
     let token = aterm_secrets::SecretBytes::from(sentinel());
-    let error = serve(exe.as_os_str(), &args, &token, entry());
+    let error = serve(exe.as_os_str(), &args, &token, (entry(), SERVED_MINTED));
     panic!("the exec failed: {error}");
 }
 
 /// The stand-in Claude Code: reads its descriptor to the newline, and writes whether it held
-/// the sentinel, the marker and every credential variable it saw.
+/// the sentinel, the marker, the token it names and every credential variable it saw.
 #[cfg(target_os = "macos")]
 #[test]
 fn token_reader_stand_in() {
@@ -463,10 +496,11 @@ fn token_reader_stand_in() {
         .filter(|name| *name != token_route::DESCRIPTOR_ENV && std::env::var_os(name).is_some())
         .collect();
     let marker = std::env::var(token_route::MARKER_ENV).unwrap_or_default();
+    let minted = std::env::var(token_route::MINTED_ENV).unwrap_or_default();
     std::fs::write(
         report,
         format!(
-            "token={token}\nmarker={marker}\ncredentials={}\n",
+            "token={token}\nmarker={marker}\nminted={minted}\ncredentials={}\n",
             seen.join(",")
         ),
     )
@@ -474,8 +508,9 @@ fn token_reader_stand_in() {
 }
 
 /// SERVING (§5.3): the program the wrapper execs reads the token from the descriptor its
-/// variable numbers, to the newline; it sees the marker naming the entry, and no credential
-/// variable (the empty ones and a stale marker inherited are gone).
+/// variable numbers, to the newline; it sees the marker naming the entry and the served token's
+/// `minted_at` beside it, and no credential variable (the empty ones, and a stale marker and
+/// `minted_at` inherited, are gone).
 #[cfg(target_os = "macos")]
 #[test]
 fn the_exec_d_program_reads_the_token_from_its_descriptor() {
@@ -497,7 +532,8 @@ fn the_exec_d_program_reads_the_token_from_its_descriptor() {
         .env(
             token_route::MARKER_ENV,
             "aterm-claude-token-ac-0000000000000000",
-        );
+        )
+        .env(token_route::MINTED_ENV, "1");
     let out = aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
         .expect("the wrapper ran");
     assert!(
@@ -512,6 +548,9 @@ fn the_exec_d_program_reads_the_token_from_its_descriptor() {
     let said = std::fs::read_to_string(&report).expect("the reader's report");
     assert_eq!(
         said,
-        format!("token=same\nmarker={}\ncredentials=\n", entry().name())
+        format!(
+            "token=same\nmarker={}\nminted={SERVED_MINTED}\ncredentials=\n",
+            entry().name()
+        )
     );
 }

@@ -33,16 +33,16 @@ pub use policy::Policy;
 pub(crate) const MAX_TABLES: usize = 63;
 /// The slots of [`MAX_TABLES`] kept for the compiled reserved tables ([`reserved`]), which take
 /// them before any declaration in causal order (docs/DESIGN-alab-lab-model-2026-11-01.md
-/// §3.10): the registry and the generation a roll restates it into, which both hold storage
-/// until the storage release frees the sealed one ([`release`]).
-pub(crate) const RESERVED_SLOTS: usize = 2;
+/// §3.10): each registry generation this build compiles, since a roll restates one into the
+/// next and both hold storage until the storage release frees the sealed one ([`release`]).
+pub(crate) const RESERVED_SLOTS: usize = 3;
 /// The slots of [`MAX_TABLES`] the catalog's declared tables share: the rest stay for the rings
 /// (`ring::RING_SLOTS`) and the reserved tables ([`RESERVED_SLOTS`]), whose storage never
 /// counts against these.
 pub(crate) const CATALOG_SLOTS: usize = MAX_TABLES - ring::RING_SLOTS - RESERVED_SLOTS;
 
 /// The compiled tables that take the reserved slots: the lab registry's generations
-/// (`alab/registry` and `alab/registry.2`, each at version 1). Catalog slots otherwise go to
+/// (`alab/registry`, `alab/registry.2` and `alab/registry.3`, each at version 1). Catalog slots otherwise go to
 /// declarations in causal order, so a new Mac that meets more subscribable declarations ahead of
 /// the registry than there are slots could never hold it, and the owner keeps adding Macs; a
 /// reserved table is subscribed whatever its causal order and whoever declared it, while there

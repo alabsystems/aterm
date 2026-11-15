@@ -289,3 +289,68 @@ fn owned_token_digest_matches_native_spent_token_correlation() {
     assert!(owned_refresh_token_digest(b"{}").is_err());
     assert!(owned_refresh_token_digest(&vec![b' '; 16 * 1024 + 1]).is_err());
 }
+
+/// AN OWNED REFUSAL'S REASON IS ITS ANSWER'S CLOSED WORD: each explicit refusal
+/// ([`owned_refresh_refused`]) names the reason its code is. A refresh-token code refuses under
+/// any status but `200`, as it rejects the grant and as the legacy exchange records it, so its
+/// reason is the same word off `400` and `401` too: a `503`, `500` or `403` that names it.
+/// CONTROLS: an answer that is no explicit refusal names no reason: a bare gateway `401`, an
+/// unlisted code, any `200`, and, off `400` and `401`, `invalid_grant` or a failure's own code.
+#[test]
+fn an_owned_refusals_reason_is_its_answers_closed_word() {
+    let cases: [(u16, &[u8], Option<RefusalReason>); 12] = [
+        (
+            401,
+            br#"{"error":{"code":"refresh_token_expired"}}"#,
+            Some(RefusalReason::Expired),
+        ),
+        (
+            401,
+            br#"{"error":{"code":"refresh_token_reused"}}"#,
+            Some(RefusalReason::Reused),
+        ),
+        (
+            400,
+            br#"{"error":"refresh_token_invalidated"}"#,
+            Some(RefusalReason::Invalidated),
+        ),
+        (
+            400,
+            br#"{"error":"invalid_grant"}"#,
+            Some(RefusalReason::InvalidGrant),
+        ),
+        (
+            503,
+            br#"{"error":"refresh_token_expired"}"#,
+            Some(RefusalReason::Expired),
+        ),
+        (
+            500,
+            br#"{"error":{"code":"refresh_token_reused"}}"#,
+            Some(RefusalReason::Reused),
+        ),
+        (
+            403,
+            br#"{"error":{"code":"refresh_token_invalidated"}}"#,
+            Some(RefusalReason::Invalidated),
+        ),
+        (401, b"<html>gateway challenge</html>", None),
+        (401, br#"{"error":"account_deactivated"}"#, None),
+        (200, br#"{"error":"refresh_token_expired"}"#, None),
+        (503, br#"{"error":"invalid_grant"}"#, None),
+        (503, br#"{"error":"temporarily_unavailable"}"#, None),
+    ];
+    for (status, body, want) in cases {
+        let shown = String::from_utf8_lossy(body);
+        assert_eq!(
+            owned_refresh_refused(status, body),
+            want.is_some(),
+            "CONTROL: {status} {shown}"
+        );
+        assert_eq!(
+            owned_refresh_refusal_reason(status, body),
+            want.unwrap_or(RefusalReason::UNKNOWN),
+            "{status} {shown}"
+        );
+    }
+}

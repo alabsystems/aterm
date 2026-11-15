@@ -915,9 +915,12 @@ fn a_calls_steps_inputs_have_their_sids_filled() {
         other => panic!("{other:?}"),
     };
     let after = body(
-        r#"{"messages":[{"role":"user","content":"toolstart"},{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]},{"role":"user","content":[{"type":"tool_result","content":"spawned s-1a2b"}]}]}"#,
+        r#"{"messages":[{"role":"user","content":"toolstart"},{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]},{"role":"user","content":[{"type":"tool_result","content":"spawned t0000001a2b"}]}]}"#,
     );
-    assert_eq!(commands(&after), ["result s-1a2b", "await s-1a2b"]);
+    assert_eq!(
+        commands(&after),
+        ["result t0000001a2b", "await t0000001a2b"]
+    );
     let first =
         J::parse(r#"[{"calls":[{"name":"Bash","input":{"command":"result @SID:1@"}}]}]"#).unwrap();
     let start = body(r#"{"messages":[{"role":"user","content":"toolstart"}]}"#);
@@ -1170,8 +1173,7 @@ fn a_text_step_ends_the_turn_and_the_script_goes_on_at_the_next_user_row() {
     .unwrap();
     let start = r#"{"role":"user","content":"MGR go"}"#;
     let used = r#"{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{}}]}"#;
-    let result =
-        r#"{"role":"user","content":[{"type":"tool_result","content":"OK s-0f0accf352b3"}]}"#;
+    let result = r#"{"role":"user","content":[{"type":"tool_result","content":"OK t0accf352b3"}]}"#;
     let said = r#"{"role":"assistant","content":[{"type":"text","text":"Waiting."}]}"#;
     let wake = r#"{"role":"user","content":"<task-notification>done</task-notification>"}"#;
     let req = |ms: &[&str]| body(&format!(r#"{{"messages":[{}]}}"#, ms.join(",")));
@@ -1186,7 +1188,7 @@ fn a_text_step_ends_the_turn_and_the_script_goes_on_at_the_next_user_row() {
         Some(ToolTurn::Call(_, input, 2)) => {
             assert_eq!(
                 input.get("command").and_then(J::as_str),
-                Some("aterm ctl @s-0f0accf352b3 result")
+                Some("aterm ctl @t0accf352b3 result")
             );
             assert_eq!(input.get("n"), Some(&J::Arr(vec![J::s("@SID:2@")])));
         }
@@ -1230,10 +1232,27 @@ fn a_text_step_ends_the_turn_and_the_script_goes_on_at_the_next_user_row() {
 }
 
 #[test]
-fn a_session_id_is_s_dash_and_hex_digits() {
-    assert_eq!(first_sid("OK s-0f0a\n"), Some("s-0f0a"));
-    assert_eq!(first_sid("aterm-ctl: OK s-1 x s-2"), Some("s-1"));
-    assert_eq!(first_sid("s- s-xyz this-s-12 s-"), None);
+fn a_session_id_is_a_tab_id() {
+    assert_eq!(first_sid("OK tqn5r6e0148\n"), Some("tqn5r6e0148"));
+    assert_eq!(
+        first_sid("aterm-ctl: OK t0000000001 x t0000000002"),
+        Some("t0000000001")
+    );
+    assert_eq!(
+        first_sid("t t000000001 T0000000001 t000000000u t00000000012 tqn5r"),
+        None,
+        "too short, upper case, outside the alphabet, too long, a shown short ID"
+    );
+    assert_eq!(
+        first_sid("OK s-0123456789abcdef0123\n"),
+        Some("s-0123456789abcdef0123"),
+        "an earlier tab's ID, which it keeps until it closes"
+    );
+    assert_eq!(
+        first_sid("s-0123456789abcdef012 S-0123456789ABCDEF0123 s-0f1e"),
+        None,
+        "CONTROL: an earlier ID too short, upper case, a shown short ID"
+    );
 }
 
 #[test]

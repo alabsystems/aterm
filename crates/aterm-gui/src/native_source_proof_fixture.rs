@@ -12,8 +12,12 @@ use aterm_window::platform::pump_events::EventLoopExtPumpEvents;
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "native_source_proof_controller.rs"]
+mod controller;
 #[path = "native_source_proof_fault.rs"]
 mod fault;
+#[path = "native_retained_proof_fixture.rs"]
+mod retained;
 
 #[derive(Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +33,9 @@ struct Command {
 
 #[derive(Default)]
 struct Trace {
+    controller: Option<Arc<controller::Observation>>,
+    controller_retired_while_live: bool,
+    controller_survived_credentials: bool,
     caller: Option<Caller>,
     ready_seen: bool,
     closed_seen: bool,
@@ -115,6 +122,9 @@ impl Drop for Pty {
 /// machine-MACed by the constructor-owned private world, never a raw image/path
 /// admission. Child stdout is transferred as its actual descriptor.
 pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
+    run_source_protocol_fixture(frame)
+}
+fn run_source_protocol_fixture(frame: String) -> Result<(), String> {
     let env = Env::from_process()?;
     let home = env.home.as_deref().ok_or("source fixture HOME missing")?;
     let lifetime = account_work::Lifetime::default();
@@ -134,6 +144,7 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
     let mut handle = super::super::control_redraw_conformance::registered_session(1, &term);
     let sid = handle.sid.as_str().to_owned();
     let launch = SourceProofLaunch::admit(&env, frame.trim_end(), &lifetime, &scope, &sid)?;
+    let retained_mode = launch.retained_frontend();
     let root = launch.directory().to_path_buf();
     let socket = root.join("control.sock");
     let socket_text = socket
@@ -190,21 +201,25 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
     let spawn = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
     let shell_args = ["-f".into(), "-i".into()];
-    let shell = aterm_pty::spawn_shell_with_pid(
-        24,
-        80,
-        &spawn,
-        &sandbox,
-        &environment,
-        Some("/bin/zsh"),
-        Some(&shell_args),
-        None,
-        None,
-        home.to_str(),
-        None,
-        aterm_sandbox::Limits::inherit(),
-    )
-    .map_err(|_| "source fixture PTY unavailable")?;
+    let shell = if retained_mode {
+        spawn_foreground(&env, &launch, &environment)?
+    } else {
+        aterm_pty::spawn_shell_with_pid(
+            24,
+            80,
+            &spawn,
+            &sandbox,
+            &environment,
+            Some("/bin/zsh"),
+            Some(&shell_args),
+            None,
+            None,
+            home.to_str(),
+            None,
+            aterm_sandbox::Limits::inherit(),
+        )
+        .map_err(|_| "source fixture PTY unavailable")?
+    };
     let pty = Pty {
         master: shell.master,
         shell: aterm_pty::record_spawned_shell(shell.pid),
@@ -214,6 +229,12 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
     Arc::get_mut(&mut handle.ctx)
         .ok_or("source fixture context already shared")?
         .sink = Arc::new(aterm_session::sink::SinkWriter::new(pty.master));
+    if retained_mode {
+        retained::install(
+            Arc::get_mut(&mut handle.ctx).ok_or("retained fixture context shared")?,
+            &launch,
+        )?;
+    }
     let store = crate::session_store::new_store();
     store
         .write()
@@ -243,8 +264,46 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
     let trace = Arc::new(Mutex::new(Trace::default()));
     let observed_trace = Arc::clone(&trace);
     let observed_registry = Arc::clone(&registry);
-    let observe: Arc<SourceOutcomeObserver<'static>> =
-        Arc::new(move |peer, connection, outcome| {
+    let observed_sid = sid.clone();
+    let observed_master = pty.master;
+    let observe: Arc<SourceOutcomeObserver<'static>> = Arc::new(
+        move |peer, connection, outcome| {
+            if retained_mode {
+                return false;
+            }
+            let needs_control = observed_trace
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .controller
+                .is_none();
+            if let (Some(pid), Some(connection), Some(outcome)) =
+                (peer, connection, outcome.as_ref())
+                && outcome["action"].as_str() == Some("controller-open")
+                && needs_control
+            {
+                // SAFETY: Pty retains this actual descriptor until all server
+                // workers have joined; the observation neither owns nor duplicates it.
+                let master = unsafe { std::os::fd::BorrowedFd::borrow_raw(observed_master) };
+                if let Ok(control) = controller::Observation::capture(
+                    &observed_registry,
+                    &observed_sid,
+                    pid,
+                    connection,
+                    outcome,
+                    master,
+                ) {
+                    let mut trace = observed_trace.lock().unwrap_or_else(|p| p.into_inner());
+                    if trace.controller.is_none()
+                        && trace
+                            .caller
+                            .as_ref()
+                            .is_none_or(|caller| caller == &control.caller)
+                    {
+                        trace.caller = Some(control.caller.clone());
+                        trace.controller = Some(Arc::new(control));
+                    }
+                }
+            }
             let caller = observed_trace
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -254,6 +313,9 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
                 return false;
             };
             let mut fault_candidate = None;
+            let mut credential_retirement = false;
+            let mut controller_withdrawal = false;
+            let mut ready_observation = false;
             // Completion evidence is real production dispatch, independent of a
             // census which may be Busy while another member changes its mapping.
             // Preserve it boundedly; evidence alone never proves Ready or Closed.
@@ -262,6 +324,9 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
             {
                 let mut trace = observed_trace.lock().unwrap_or_else(|p| p.into_inner());
                 let action = outcome["action"].as_str().unwrap_or_default();
+                ready_observation = matches!(action, "member-ready" | "member-rebound-ready");
+                credential_retirement = matches!(action, "member-retire" | "member-retire-owned");
+                controller_withdrawal = action == "controller-close";
                 trace.ready_evidence |= matches!(action, "member-ready" | "member-rebound-ready");
                 if matches!(action, "member-retire" | "member-retire-owned")
                     && let Some(member) = outcome["member"].as_str()
@@ -291,6 +356,7 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
             }
             let until = Instant::now() + MUST_HAPPEN;
             loop {
+                let mut lifecycle_observed = !(credential_retirement || controller_withdrawal);
                 let observation = observed_registry.observe_source_proof(&caller);
                 if let Err(error) = &observation {
                     // This explicit fixture records only the closed error enum,
@@ -298,6 +364,16 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
                     eprintln!("Source qualification native: observation failed {error:?}");
                 }
                 if let Ok(observation) = observation {
+                    if ready_observation {
+                        eprintln!(
+                            "Source qualification native: ready-census issued={} members={} unresolved={} managers_ready={}",
+                            observation.issued,
+                            observation.members,
+                            observation.unresolved,
+                            observation.managers_ready
+                        );
+                        ready_observation = false;
+                    }
                     let current_fault = fault_candidate
                         .as_ref()
                         .is_some_and(|outcome| fault::ReadyLoss::current(outcome, &observation));
@@ -312,6 +388,20 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
                     );
                     trace.closed_seen =
                         every_member_closed && trace.ready_seen && observation.closed();
+                    trace.controller_survived_credentials |= trace.closed_seen
+                        && trace
+                            .controller
+                            .as_ref()
+                            .is_some_and(|control| control.current());
+                    trace.controller_retired_while_live |= trace.closed_seen
+                        && trace
+                            .controller
+                            .as_ref()
+                            .is_some_and(|control| control.retired_while_live());
+                    lifecycle_observed = (!credential_retirement
+                        || !trace.closed_seen
+                        || trace.controller_survived_credentials)
+                        && (!controller_withdrawal || trace.controller_retired_while_live);
                     trace.last = Some(observation);
                     if current_fault && let Some(candidate) = fault_candidate.as_ref() {
                         return trace
@@ -320,14 +410,16 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
                             .is_some_and(|loss| loss.accept(candidate));
                     }
                 }
-                if fault_candidate.is_none() || Instant::now() >= until {
+                if (fault_candidate.is_none() && lifecycle_observed) || Instant::now() >= until {
                     return false;
                 }
-                // No stale trace fallback can trigger the fault. The real reply
-                // remains unsent while a briefly Busy coherent probe retries.
+                // Keep the SDK alive behind the real unsent reply while a Busy
+                // snapshot retries. Unknown liveness cannot prove withdrawal,
+                // and process exit cannot stand in for explicit retirement.
                 std::thread::sleep(Duration::from_millis(1));
             }
-        });
+        },
+    );
     let server_stop = Arc::clone(&stopping);
     let server_context = Arc::clone(&context);
     let server_observe = Arc::clone(&observe);
@@ -409,15 +501,27 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
             Ok::<_, io::Error>(())
         })
         .map_err(|_| "source fixture control thread unavailable")?;
+    let mut retained_backend = None;
     let result = (|| -> Result<(), String> {
-        let mut owned_child = ChildGuard(crate::task_launch::spawn_source_proof(
+        if retained_mode {
+            let ctx = Arc::clone(&handle.ctx);
+            let mut pump = super::renewal::Pump::source_fixture(handle, term);
+            return retained::run(&ctx, &launch, &pty, &sid, &server, || {
+                event_loop.pump_app_events(Some(Duration::from_millis(10)), &mut pump);
+            })
+            .map(|backend| {
+                retained_backend = Some(backend);
+            });
+        }
+        let (child, input) = crate::task_launch::spawn_source_proof(
             &env,
             &sid,
             Arc::clone(&registry),
-            scope,
+            scope.clone(),
             &launch,
             &environment,
-        )?);
+        )?;
+        let mut owned_child = ChildGuard(child);
         let child = &mut owned_child.0;
         let process =
             Process::observe(child.id()).ok_or("source proof kernel child unavailable")?;
@@ -426,11 +530,17 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
             pid: process.pid,
             birth: process.birth,
         };
-        trace.lock().unwrap_or_else(|p| p.into_inner()).caller = Some(caller.clone());
-        let input = child
-            .stdin
-            .take()
-            .ok_or("source proof child stdin unavailable")?;
+        {
+            let mut trace = trace.lock().unwrap_or_else(|p| p.into_inner());
+            if trace
+                .caller
+                .as_ref()
+                .is_some_and(|original| original != &caller)
+            {
+                return Err("source proof controller belongs to another child".into());
+            }
+            trace.caller = Some(caller.clone());
+        }
         let output = child
             .stdout
             .take()
@@ -451,7 +561,7 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
             ));
         }
         let header = aterm_json::to_vec(&aterm_json::json!({"schema":1,"sid":sid,
-            "hostPid":std::process::id(),"pid":process.pid,"birth":process.birth}))
+        "hostPid":std::process::id(),"pid":process.pid,"birth":process.birth}))
         .map_err(|_| "source proof metadata encoding failed")?;
         if aterm_uds::fdpass::send_with_fds(&guardian, &header, &[input.as_fd(), output.as_fd()])
             .map_err(|_| "source proof descriptor transfer failed")?
@@ -580,9 +690,9 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
                 let trace = trace.lock().unwrap_or_else(|p| p.into_inner());
                 let outcomes = trace.outcomes.iter().collect::<Vec<_>>();
                 let mut reply = aterm_json::to_vec(&aterm_json::json!({"schema":1,
-                    "request":command.request,"action":command.action,"outcome":if pending.is_some() {"pending"} else {"ok"},
-                    "generation":promoted_generation,"observation":trace.last.as_ref(),"readySeen":trace.ready_seen,"closedSeen":trace.closed_seen,"outcomes":outcomes,"outcomeSequence":trace.outcome_sequence,"readyLoss":trace.ready_loss}))
-                    .map_err(|_| "source proof guardian encoding failed")?;
+                "request":command.request,"action":command.action,"outcome":if pending.is_some() {"pending"} else {"ok"},
+                "generation":promoted_generation,"observation":trace.last.as_ref(),"readySeen":trace.ready_seen,"closedSeen":trace.closed_seen,"outcomes":outcomes,"outcomeSequence":trace.outcome_sequence,"readyLoss":trace.ready_loss}))
+                .map_err(|_| "source proof guardian encoding failed")?;
                 if reply.len()
                     > aterm_agent::harness::codex_source_registry::SOURCE_PROOF_OBSERVATION_LIMIT
                 {
@@ -635,6 +745,26 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
             return Err("source proof SDK child failed".into());
         }
         let trace = trace.lock().unwrap_or_else(|p| p.into_inner());
+        let control = trace
+            .controller
+            .as_ref()
+            .ok_or("source proof missed actual SDK control admission")?;
+        eprintln!(
+            "Source qualification native: controller before_ready={} foreground_denied={} survived_credentials={} retired_while_live={}",
+            control.before_ready,
+            control.foreground_denied,
+            trace.controller_survived_credentials,
+            trace.controller_retired_while_live
+        );
+        if !control.before_ready
+            || !control.foreground_denied
+            || !trace.controller_survived_credentials
+            || !trace.controller_retired_while_live
+        {
+            return Err(
+                "source proof did not qualify SDK control lifetime independently of Ready".into(),
+            );
+        }
         if !trace.ready_seen || !trace.closed_seen || pending.is_some() {
             eprintln!(
                 "Source qualification native: final ready={} closed={} closed_receipts={} issued={:?} members={:?} highwater={:?} unresolved={:?} custody={:?} active={:?} pending={:?} ending={:?}",
@@ -654,6 +784,24 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
         }
         Ok(())
     })();
+    if retained_mode && result.is_err() {
+        let ctx = context
+            .active
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|active| Arc::clone(&active.ctx));
+        if let Some(ctx) = ctx {
+            for stage in ctx.native_policy.retained_qualification_stages() {
+                eprintln!("Retained qualification backend: stage={stage}");
+            }
+        }
+    }
+    let mut pause = if retained_mode {
+        lifetime.pause()
+    } else {
+        None
+    };
     stopping.store(true, Ordering::Release);
     let served = server
         .join()
@@ -662,7 +810,33 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
     if let Err(error) = &served {
         eprintln!("Source qualification native: {error}");
     }
-    drop((context, launch, pty));
+    drop((context, launch, pty, scope));
+    if let Some(mut closed) = pause.take() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            registry.reap_gone();
+            match closed.try_wait() {
+                Ok(_drained) => break,
+                Err(still_closed) => closed = still_closed,
+            }
+            if Instant::now() >= deadline {
+                return Err("retained fixture App scope drain hang detector".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if let Some(backends) = retained_backend {
+            for backend in backends {
+                if aterm_uds::process::group_presence(backend.group)
+                    != aterm_uds::process::ProcessPresence::Absent
+                {
+                    return Err("retained fixture backend cohort did not settle".into());
+                }
+            }
+            eprintln!(
+                "Retained qualification native: actual App drain and backend cohort absence=true"
+            );
+        }
+    }
     result?;
     served
 }
@@ -670,3 +844,100 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
 #[cfg(test)]
 #[path = "native_source_proof_fixture_source_closure_tests.rs"]
 mod source_closure_tests;
+
+/// Launch the admitted debug SDK as the real session-leading foreground PTY
+/// program, not a GUI-session child with a fabricated foreground identity.
+/// The caller must retain and settle this actual PTY/shell before returning.
+fn spawn_foreground(
+    env: &Env,
+    launch: &SourceProofLaunch,
+    environment: &[(String, String)],
+) -> Result<aterm_pty::SpawnedShell, String> {
+    launch.current()?;
+    if !launch.retained_frontend() {
+        return Err("retained fixture requires its authenticated purpose".into());
+    }
+    // Frontend control has no credential constructor. In particular it must not
+    // retain a first-Source exclusion while the independent backend initializes.
+    // Only the machine-authenticated image admission and actual PTY spawn apply.
+    let home = env
+        .home
+        .as_deref()
+        .ok_or("foreground SDK HOME unavailable")?;
+    let codex_home = home.join(".codex");
+    aterm_secrets::fsx::ensure_private_dir(&codex_home)
+        .map_err(|_| "foreground SDK home unavailable")?;
+    let mut selected = environment
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    selected.insert(
+        "CODEX_HOME".into(),
+        codex_home.to_string_lossy().into_owned(),
+    );
+    selected.insert(
+        "CODEX_AUTH_PATH".into(),
+        launch.auth_file().to_string_lossy().into_owned(),
+    );
+    selected.remove("CODEX_AUTH_SLOT");
+    selected.remove(aterm_agent::harness::codex_source_registry::LAUNCH_ENV);
+    let selected = selected.into_iter().collect::<Vec<_>>();
+    let program = launch
+        .candidate()
+        .to_str()
+        .ok_or("foreground SDK path unavailable")?;
+    let mut arguments = vec!["alab-native-retained-proof".to_owned()];
+    if let Some(replacement) = launch.replacement_candidate() {
+        arguments.push("--replacement-image".into());
+        arguments.push(
+            replacement
+                .to_str()
+                .ok_or("replacement SDK path unavailable")?
+                .into(),
+        );
+    }
+    launch.current()?;
+    // SAFETY: the authenticated Rust-only SourceProofLaunch owns this isolated
+    // world and admits this exact image; this grants no Source or Ready state.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let shell = aterm_pty::spawn_shell_with_pid(
+        24,
+        80,
+        &spawn,
+        &sandbox,
+        &selected,
+        Some(program),
+        Some(&arguments),
+        None,
+        None,
+        env.home.as_deref().and_then(|home| home.to_str()),
+        None,
+        aterm_sandbox::Limits::inherit(),
+    )
+    .map_err(|_| "foreground SDK PTY spawn failed")?;
+    let identity = aterm_pty::record_spawned_shell(shell.pid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let admitted_child = loop {
+        if aterm_agent::harness::native_act::Process::observe(shell.pid as u32).is_some_and(
+            |process| {
+                Some(process.image)
+                    == aterm_agent::harness::native_act::Image::at(launch.candidate())
+            },
+        ) {
+            break launch.current();
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err("foreground SDK image hang detector".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    if let Err(error) = admitted_child {
+        aterm_pty::hangup_shell(&identity, shell.master);
+        aterm_pty::close_fd(shell.master);
+        aterm_pty::reap_shell(identity);
+        return Err(error);
+    }
+    Ok(shell)
+}

@@ -278,9 +278,7 @@ fn the_landed_row_stands_with_the_land_prompts() {
 /// continuation.
 #[test]
 fn the_done_check_row_stands_under_kept_going() {
-    use aterm_agent::supervise::policy::turn_end::{
-        RULE_CONTINUE, RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED,
-    };
+    use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED};
     let rule = |s: &mut HarnessStats, rule: &str, n: u64| {
         s.by_rule.insert(rule.to_string(), n);
     };

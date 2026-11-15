@@ -311,3 +311,51 @@ fn a_mailbox_poll_its_host_slept_past_reads_no_mail() {
         "CONTROL: a live deadline reads the link"
     );
 }
+
+/// A QUIT ENDS A SIGN-IN'S MAIL POLL: a poll of a mailbox that holds no mail, under an hour's
+/// budget, keeps looking while its account work stands and ends with the deadline's words at
+/// its next look once that work is cancelled ([`Deadline::cancelled_by`]), within the hang
+/// detector. NEGATIVE CONTROL: without `remaining`'s read of the cancellation, the poll runs to
+/// its hour and the hang detector fails the test.
+#[test]
+fn a_cancelled_deadline_ends_a_mail_poll() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let cfg = MailboxConfig {
+        dir: Some(tmp.path().to_owned()),
+        seen_file: Some(tmp.path().join("mail.seen")),
+        ..MailboxConfig::default()
+    };
+    let quit: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let looks: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let cancelled: &'static (dyn Fn() -> bool + Sync) = Box::leak(Box::new(|| {
+        looks.fetch_add(1, Ordering::SeqCst);
+        quit.load(Ordering::SeqCst)
+    }));
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let deadline = Deadline::after(Duration::from_secs(3600)).cancelled_by(cancelled);
+        let mut seen = BTreeSet::new();
+        let _ = done.send(poll_mailbox_config_until(
+            &cfg,
+            Some("one@example.test"),
+            deadline,
+            false,
+            &mut seen,
+        ));
+    });
+    let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while looks.load(Ordering::SeqCst) < 3 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(looks.load(Ordering::SeqCst) >= 3, "the poll is looking");
+    assert!(
+        finished.try_recv().is_err(),
+        "an uncancelled poll of an empty mailbox goes on"
+    );
+    quit.store(true, Ordering::SeqCst);
+    let result = finished
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the cancelled poll ended within the hang detector");
+    assert!(result.is_err(), "{result:?}");
+}

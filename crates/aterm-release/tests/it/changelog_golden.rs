@@ -399,10 +399,9 @@ fn the_roll_of_fragments_equals_todays_byte_for_byte() {
     );
     assert_ne!(moved, LIVE, "the live line stands mid-Changed");
     let today = changelog::roll(&moved, "0.199.0", "2026-11-12").unwrap();
-    let assembled =
-        aterm_verify::changelog_fragments::assemble(&scaffold, &files, Some(&harness)).unwrap();
+    let assembled = changelog::fragments::assemble(&scaffold, &files, Some(&harness)).unwrap();
     let from_files = changelog::roll(&assembled, "0.199.0", "2026-11-12").unwrap();
-    let drained = aterm_verify::changelog_fragments::assemble(LIVE, &[], Some(&harness)).unwrap();
+    let drained = changelog::fragments::assemble(LIVE, &[], Some(&harness)).unwrap();
     let from_raw = changelog::roll(&drained, "0.199.0", "2026-11-12").unwrap();
     for rolled in [&from_files, &from_raw] {
         assert_eq!(rolled, &today);

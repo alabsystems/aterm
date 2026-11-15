@@ -26,6 +26,7 @@ pub mod coalitions;
 pub mod cpu_hardware;
 pub mod cpu_policy;
 pub mod dstate;
+pub mod exec_gate;
 pub mod file_events;
 mod process_thermal;
 pub use process_thermal::{ProcessThermal, ProcessThermalState, process_thermal};
@@ -35,6 +36,7 @@ pub mod iflist;
 mod iokit;
 pub mod jobs;
 pub mod kproc;
+pub mod lane;
 pub mod linux;
 mod machine;
 pub mod machine_type;
@@ -59,6 +61,7 @@ pub mod situation;
 #[cfg(target_os = "macos")]
 mod situation_macos;
 pub mod slots;
+pub mod test_binary;
 pub mod timeline;
 pub mod volumes;
 #[cfg(all(windows, target_pointer_width = "64"))]
@@ -86,7 +89,7 @@ pub use machine::{
     memory_detail, net_links, net_links_into, open_socket_count, tcp_after_publish, tcp_counts,
     tcp_counts_into, tcp_summary, tcp_summary_into, volume, withdrawn_cores, workqueue_limits,
 };
-pub use room::{TaskRoom, task_room};
+pub use room::{TaskRoom, pid_counts, task_room, task_tables};
 
 /// Whether this Mac's kernel offers the hypervisor Virtualization.framework runs on
 /// (`kern.hv_support` is 1), read by `sysctlbyname` with no framework loaded: the vz lane's

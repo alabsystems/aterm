@@ -24,13 +24,14 @@ struct Capture {
 }
 
 impl Capture {
-    fn of(fd: OwnedFd, stream: ChildOutput) -> io::Result<Self> {
-        let pipe = File::from(fd);
-        nonblocking(&pipe)?;
-        Ok(Self {
-            pipe: Some(pipe),
-            stream,
-        })
+    const fn empty(stream: ChildOutput) -> Self {
+        Self { pipe: None, stream }
+    }
+
+    fn attach(&mut self, fd: OwnedFd) -> io::Result<()> {
+        // Attach before fallible setup: the Run guard must retain this reader until its
+        // final natural-status observation, even when nonblocking setup fails.
+        nonblocking(self.pipe.insert(File::from(fd)))
     }
 
     fn read_ready(
@@ -59,16 +60,19 @@ impl Capture {
 
 /// Forced retirement requests group termination while the unreaped root reserves its ID.
 /// Cooperative retirement requests its owner's stop and retains the actual root through cleanup.
-struct Run<'a> {
+struct Run<'retire, 'observe> {
     child: Child,
     input: Option<Secret>,
     to_child: Option<File>,
     sent: usize,
     reaped: bool,
-    retire: Option<&'a mut dyn FnMut()>,
+    natural_exit: bool,
+    observed_exit: Option<&'observe mut dyn FnMut(std::process::ExitStatus)>,
+    retire: Option<&'retire mut dyn FnMut()>,
+    streams: [Capture; 2],
 }
 
-impl Run<'_> {
+impl Run<'_, '_> {
     fn settle(&mut self) {
         self.settle_with(Child::wait);
     }
@@ -77,7 +81,18 @@ impl Run<'_> {
         &mut self,
         mut wait: impl FnMut(&mut Child) -> io::Result<std::process::ExitStatus>,
     ) {
+        if !self.reaped
+            && !self.natural_exit
+            && self.observed_exit.is_some()
+            && self.child.owns_unreaped()
+            && matches!(self.child.exit_status_unreaped(), Ok(Some(_)))
+        {
+            // This peek precedes stdin EOF, reader closure and every cleanup signal.
+            // Report its immutable natural status only after the owning wait below.
+            self.natural_exit = true;
+        }
         self.close_input();
+        self.close_output();
         if self.reaped {
             return;
         }
@@ -100,8 +115,9 @@ impl Run<'_> {
                 continue;
             }
             match wait(&mut self.child) {
-                Ok(_) => {
+                Ok(status) => {
                     self.reaped = true;
+                    self.report_exit(status);
                     return;
                 }
                 Err(_) => {
@@ -121,9 +137,28 @@ impl Run<'_> {
         }
     }
 
+    fn report_exit(&mut self, status: std::process::ExitStatus) {
+        // WNOWAIT supplies this reserved child's natural status before termination is
+        // requested. A cleanup-induced kill is never a previously observed producer result.
+        if self.natural_exit
+            && let Some(observed) = self.observed_exit.take()
+        {
+            observed(status);
+        }
+    }
+
     fn close_input(&mut self) {
         self.input = None;
         self.to_child = None;
+        drop(self.child.stdin.take());
+    }
+
+    fn close_output(&mut self) {
+        for stream in &mut self.streams {
+            stream.pipe = None;
+        }
+        drop(self.child.stdout.take());
+        drop(self.child.stderr.take());
     }
 
     fn write_ready(&mut self) -> io::Result<()> {
@@ -156,7 +191,7 @@ impl Run<'_> {
     }
 }
 
-impl Drop for Run<'_> {
+impl Drop for Run<'_, '_> {
     fn drop(&mut self) {
         self.settle();
     }
@@ -203,6 +238,7 @@ pub(super) fn output_with_input_until_watching(
         },
         stopped,
         None,
+        None,
     )?;
     Ok(status.map(|status| Output {
         status,
@@ -218,7 +254,30 @@ pub(super) fn stream_until_stopped(
     output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
     stopped: impl FnMut() -> bool,
 ) -> io::Result<Option<std::process::ExitStatus>> {
-    run_with_input_until_watching(cmd, None, None, deadline, spawned, output, stopped, None)
+    run_with_input_until_watching(
+        cmd, None, None, deadline, spawned, output, stopped, None, None,
+    )
+}
+
+pub(super) fn stream_until_stopped_observing_exit(
+    cmd: &mut Command,
+    deadline: Option<Instant>,
+    spawned: impl FnOnce(u32),
+    output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
+    stopped: impl FnMut() -> bool,
+    mut observed_exit: impl FnMut(std::process::ExitStatus),
+) -> io::Result<Option<std::process::ExitStatus>> {
+    run_with_input_until_watching(
+        cmd,
+        None,
+        None,
+        deadline,
+        spawned,
+        output,
+        stopped,
+        None,
+        Some(&mut observed_exit),
+    )
 }
 
 pub(super) fn stream_with_stdin_until_stopped(
@@ -239,6 +298,7 @@ pub(super) fn stream_with_stdin_until_stopped(
         output,
         stopped,
         retire,
+        None,
     )
 }
 
@@ -255,6 +315,7 @@ fn run_with_input_until_watching(
     mut output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
     mut stopped: impl FnMut() -> bool,
     retire: Option<&mut dyn FnMut()>,
+    observed_exit: Option<&mut dyn FnMut(std::process::ExitStatus)>,
 ) -> io::Result<Option<std::process::ExitStatus>> {
     if !cfg!(any(target_vendor = "apple", target_os = "linux")) {
         return Err(io::Error::new(
@@ -286,45 +347,57 @@ fn run_with_input_until_watching(
         to_child: None,
         sent: 0,
         reaped: false,
+        natural_exit: false,
+        observed_exit,
         retire,
+        streams: [
+            Capture::empty(ChildOutput::Stdout),
+            Capture::empty(ChildOutput::Stderr),
+        ],
     };
     spawned(run.child.id());
     if run.input.is_some() {
         let stdin = run.child.stdin.take().ok_or_else(missing_pipe)?;
-        let stdin = File::from(OwnedFd::from(stdin));
-        nonblocking(&stdin)?;
-        run.to_child = Some(stdin);
+        nonblocking(run.to_child.insert(File::from(OwnedFd::from(stdin))))?;
     }
     let stdout = run.child.stdout.take().ok_or_else(missing_pipe)?;
+    run.streams[0].attach(OwnedFd::from(stdout))?;
     let stderr = run.child.stderr.take().ok_or_else(missing_pipe)?;
-    let mut streams = [
-        Capture::of(OwnedFd::from(stdout), ChildOutput::Stdout)?,
-        Capture::of(OwnedFd::from(stderr), ChildOutput::Stderr)?,
-    ];
+    run.streams[1].attach(OwnedFd::from(stderr))?;
     if run.input.as_ref().is_some_and(Secret::is_empty) {
         run.close_input();
     }
     let mut exit = ExitWait::new(&run.child);
-    let mut exited = false;
     loop {
-        if !exited && run.child.exited()? {
-            run.close_input();
-            // exited() uses WNOWAIT: this owned root still reserves the group ID, and
-            // its natural exit status cannot be changed by signalling descendants now.
-            super::children::kill_group(&mut run.child);
-            exited = true;
+        if !run.natural_exit {
+            let exited = if run.observed_exit.is_some() {
+                if let Some(status) = run.child.exit_status_unreaped()? {
+                    run.natural_exit = true;
+                    run.report_exit(status);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                run.child.exited()?
+            };
+            if exited {
+                run.natural_exit = true;
+                run.close_input();
+                // WNOWAIT leaves this owned root reserving the group ID, and
+                // its natural exit status cannot be changed by signalling descendants now.
+                super::children::kill_group(&mut run.child);
+            }
         }
-        if exited && streams.iter().all(|stream| stream.pipe.is_none()) {
+        if run.natural_exit && run.streams.iter().all(|stream| stream.pipe.is_none()) {
             let status = run.child.wait()?;
             run.reaped = true;
+            run.report_exit(status);
             return Ok(Some(status));
         }
         if stopped() {
-            // No output-completion claim accompanies cancellation. Close our own pipes
-            // before retaining this waiter until its actual root is positively reaped.
-            for stream in &mut streams {
-                stream.pipe = None;
-            }
+            // No output-completion claim accompanies cancellation. Retirement observes
+            // natural status before closing pipes and positively reaps the actual root.
             run.settle();
             return Ok(None);
         }
@@ -344,7 +417,7 @@ fn run_with_input_until_watching(
             });
             owners.push(0);
         }
-        for (index, stream) in streams.iter().enumerate() {
+        for (index, stream) in run.streams.iter().enumerate() {
             if let Some(pipe) = &stream.pipe {
                 fds.push(PollFd {
                     fd: pipe.as_raw_fd(),
@@ -354,7 +427,9 @@ fn run_with_input_until_watching(
                 owners.push(index + 1);
             }
         }
-        if !exited && let Some(fd) = exit.reporter() {
+        if !run.natural_exit
+            && let Some(fd) = exit.reporter()
+        {
             fds.push(PollFd {
                 fd,
                 events: POLLIN,
@@ -369,7 +444,7 @@ fn run_with_input_until_watching(
             }
             match owner {
                 0 => run.write_ready()?,
-                1 | 2 => streams[owner - 1].read_ready(&mut output)?,
+                1 | 2 => run.streams[owner - 1].read_ready(&mut output)?,
                 _ => exit.reported(),
             }
         }

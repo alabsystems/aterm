@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use aterm_effects::cat_baker::{CatColorKey, ResolvedFills};
 use aterm_scene::{PathCmd, PathTransform, Tile, fill_path, parse_path};
 
-const HEROES: [&str; 4] = ["s1_03", "s1_15", "s1_21", "spec_stretch"];
+const HEROES: [&str; 3] = ["s1_03", "s1_15", "s1_21"];
 const REPAIRS: [&str; 5] = ["s1_04", "s1_05", "s1_06", "s1_19", "s1_22"];
 const ARTIST_PASS: [&str; 24] = [
     "s1_00",
@@ -71,7 +71,10 @@ fn number(value: &aterm_toml::Value) -> f32 {
 }
 
 fn load(id: &str) -> Asset {
-    let source = std::fs::read_to_string(asset_path(id)).expect("read hero cat asset");
+    load_from(&std::fs::read_to_string(asset_path(id)).expect("read hero cat asset"))
+}
+
+fn load_from(source: &str) -> Asset {
     let doc: aterm_toml::Value = source.parse().expect("parse hero cat asset");
     let viewbox = doc["viewbox"].as_array().expect("viewbox array");
     let anchor = doc["anchor"].as_table().expect("anchor table");
@@ -283,7 +286,7 @@ fn hero_assets_are_semantic_bounded_layout_stable_and_legible() {
         );
     }
 
-    for asset in &assets[..3] {
+    for asset in &assets {
         for required in HEAD_ROLES {
             role_layer(asset, required);
         }
@@ -296,12 +299,115 @@ fn hero_assets_are_semantic_bounded_layout_stable_and_legible() {
             "reaction swap changes no anchor"
         );
     }
-    assert!(
-        assets[3].viewbox.0 / assets[3].viewbox.1 > 1.35,
-        "the cursor stretch pose must remain visibly wide"
+}
+
+/// The pet roster's pose `id` (`art/pet/<id>.toml`).
+fn load_pet(id: &str) -> Asset {
+    let path = aterm_tempfile::manifest_dir()
+        .join("art/pet")
+        .join(format!("{id}.toml"));
+    load_from(&std::fs::read_to_string(&path).expect("read pet pose asset"))
+}
+
+/// Where two assets' art differs (viewbox, anchor, or a layer's role, fill, recolor or paths),
+/// or `None` where they draw the same thing.
+fn art_difference(a: &Asset, b: &Asset) -> Option<String> {
+    if a.viewbox != b.viewbox || a.anchor != b.anchor {
+        return Some(format!(
+            "frame {:?}/{:?} against {:?}/{:?}",
+            a.viewbox, a.anchor, b.viewbox, b.anchor
+        ));
+    }
+    if a.layers.len() != b.layers.len() {
+        return Some(format!(
+            "{} layers against {}",
+            a.layers.len(),
+            b.layers.len()
+        ));
+    }
+    for (k, (x, y)) in a.layers.iter().zip(&b.layers).enumerate() {
+        for key in ["role", "ref_fill", "recolor", "paths"] {
+            if x[key] != y[key] {
+                return Some(format!("layer {k} ({}): `{key}`", role(x)));
+            }
+        }
+    }
+    None
+}
+
+/// The collectible `spec_stretch` is the flying cat: the pet rig's glide, `pet_fly`, layer for
+/// layer, so the Kitty Log's sighting of the flier is the cat that flies. It is held to the pet
+/// budget and the hero bars a head is.
+#[test]
+fn spec_stretch_is_the_glide() {
+    let stretch = load("spec_stretch");
+    let glide = load_pet("pet_fly");
+    assert_eq!(
+        art_difference(&stretch, &glide),
+        None,
+        "spec_stretch is pet_fly's twin"
     );
-    role_layer(&assets[3], "accessory");
-    role_layer(&assets[3], "pattern");
+    // The comparator is not blind: another pose of the same cat differs.
+    assert!(
+        art_difference(&stretch, &load_pet("pet_leap")).is_some(),
+        "control: the comparator must tell pet_leap from the glide"
+    );
+    assert_clean_and_bounded(&stretch, 14, &["outline", "coat", "muzzle"], 360);
+    assert_eq!(
+        role_layer(&stretch, "outline")["recolor"].as_str(),
+        Some("fixed")
+    );
+    assert_eq!(
+        role_layer(&stretch, "coat")["recolor"].as_str(),
+        Some("coat")
+    );
+    assert!(
+        luma(role_layer(&stretch, "outline")) < 0.25,
+        "light-theme ink is dark"
+    );
+    assert!(
+        luma(role_layer(&stretch, "muzzle")) > 0.80,
+        "muzzle protects face contrast"
+    );
+    assert_legible_at_16(
+        &stretch,
+        55.0,
+        &[
+            ("inner_ear", 0.7),
+            ("muzzle", 2.0),
+            ("eye", 1.0),
+            ("nose", 0.2),
+            ("mouth", 0.45),
+            ("whisker", 1.5),
+        ],
+    );
+    assert!(
+        stretch.viewbox.0 / stretch.viewbox.1 > 1.35,
+        "the flier's glide must remain visibly wide"
+    );
+}
+
+/// The share of `asset`'s silhouette (its outline layer) its coat covers at 16 px: the brand
+/// cat's coat, not a slab of something else wrapped in a keyline.
+fn coat_share_at_16(asset: &Asset) -> f32 {
+    coverage(&render_roles(asset, &["coat"], 16)) / coverage(&render_roles(asset, &["outline"], 16))
+}
+
+#[test]
+fn the_flier_is_coat_not_pastry() {
+    let share = coat_share_at_16(&load("spec_stretch"));
+    assert!(
+        share >= 0.5,
+        "the flier's coat covers only {share:.2} of its silhouette at 16 px"
+    );
+    // The control: the flier before it was the brand cat (main's spec_stretch with its comment
+    // cut, so nothing here names what it drew) is mostly not coat, and fails the bar.
+    let before = load_from(include_str!("fixtures/flier_slab_before.toml"));
+    let was = coat_share_at_16(&before);
+    assert!(
+        was < 0.5,
+        "control: the slab flier read {was:.2} coat, the law must reject it"
+    );
 }
 
 #[test]

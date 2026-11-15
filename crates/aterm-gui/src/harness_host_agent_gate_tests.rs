@@ -282,7 +282,7 @@ fn an_off_on_edit_revokes_an_inflight_exit_attempt_result() {
         })
     });
     hooks.acts.snapshot = Arc::new(|sid| {
-        Some(Snapshot {
+        Ok(Snapshot {
             pid: 5151,
             ..snap(sid)
         })
@@ -361,7 +361,7 @@ fn an_off_on_edit_revokes_an_inflight_restored_landing_read() {
     hooks.acts.exited = Arc::new(|_, _| true);
     hooks.acts.snapshot = Arc::new(move |sid| {
         release_after_edit(&released, &entered_tx);
-        Some(Snapshot {
+        Ok(Snapshot {
             pid: 5151,
             ..snap(sid)
         })

@@ -157,7 +157,7 @@ fn every_angles_act_fits_the_verbatim_bound_with_every_suffix() {
         // The repository's ask rides at every angle; the go-ahead's word gives it the room where
         // the two do not fit beside the clauses ([`fitted_check`]).
         let whole = text.starts_with(&done_check_words(n));
-        let cut = super::super::go_ahead::unless_held(&done_check_words(n), true).into_owned();
+        let cut = alab_policy::go_ahead::unless_held(&done_check_words(n), true).into_owned();
         assert!(whole || text.starts_with(&cut), "{n}: {text}");
         kept[usize::from(whole)] = true;
         for whole in [
@@ -220,10 +220,10 @@ fn someones_turn_starts_the_angles_again_and_the_agents_own_work_does_not() {
     now += 3 * MIN;
     let (after, _) = claim_checked(&mut st, CLAIMS[3], None, now);
     // The first angle again, and their key minutes old holds their hour: the go-ahead's word is
-    // left out ([`super::super::go_ahead::unless_held`]).
+    // left out ([`alab_policy::go_ahead::unless_held`]).
     assert_eq!(
         after,
-        super::super::go_ahead::unless_held(&done_check_words(0), true)
+        alab_policy::go_ahead::unless_held(&done_check_words(0), true)
     );
 }
 

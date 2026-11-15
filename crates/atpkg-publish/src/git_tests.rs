@@ -122,3 +122,77 @@ fn only_a_checkout_without_an_origin_is_told_it_has_none() {
     ]);
     assert!(source_with_origin(&repo, &slug).is_ok());
 }
+
+/// The index-hint query answers for a repository of any size: it reads the listing to its end
+/// an entry at a time and holds only a hinted one. The fixture's index lists more than a whole
+/// capture holds (TY's 402,779 files list 38 MB, and the tip lane could not qualify it), with
+/// no file written: the query reads the index alone. NEGATIVE CONTROL: the same listing read
+/// whole is still refused at the capture limit, as the query was before it read by entry, so
+/// the fixture is over the limit and the answer is the entry reading's.
+#[cfg(unix)]
+#[test]
+fn an_index_longer_than_a_whole_capture_is_still_searched_for_hints() {
+    const HANG_DETECTOR: Duration = Duration::from_secs(120);
+    const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+    let dir = aterm_tempfile::TempDir::new().expect("scratch");
+    let repo = dir.path().join("big");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    let git = |args: &[&str], stdin: aterm_uds::spawnfd::Stdio| {
+        let mut git = crate::testkit::git();
+        git.arg("-C").arg(&repo).args(args);
+        // A hang detector, not a budget: each is one local index write.
+        let out =
+            aterm_uds::deadline::output_until_from(&mut git, stdin, Instant::now() + HANG_DETECTOR)
+                .expect("fixture git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    let null = aterm_uds::spawnfd::Stdio::null;
+    git(&["init", "-q"], null());
+    // Index entries name files that are never written: 9,000 paths of some 2,000 bytes.
+    let segment = "s".repeat(200);
+    let path = |n: usize| format!("{n:05}/{}", [segment.as_str(); 10].join("/"));
+    let entries = 9_000;
+    let mut info = String::new();
+    for n in 0..entries {
+        info.push_str(&format!("100644 {EMPTY_BLOB} 0\t{}\n", path(n)));
+    }
+    assert!(info.len() > MAX_COMPLETE_STDOUT_BYTES, "{}", info.len());
+    let listing = dir.path().join("index-info");
+    std::fs::write(&listing, &info).expect("write index-info");
+    git(
+        &["update-index", "--add", "--index-info"],
+        std::fs::File::open(&listing)
+            .expect("open index-info")
+            .into(),
+    );
+
+    let whole = run(&repo, &["ls-files", "-v", "-z"]).expect_err("a listing over the limit");
+    assert!(
+        whole
+            .to_string()
+            .contains("exceeds the complete-capture limit"),
+        "{whole}"
+    );
+    assert_eq!(
+        index_hint(&repo).expect("the listing is read to its end"),
+        None
+    );
+
+    let last = path(entries - 1);
+    for (set, clear, flag) in [
+        ("--assume-unchanged", "--no-assume-unchanged", "h"),
+        ("--skip-worktree", "--no-skip-worktree", "S"),
+    ] {
+        git(&["update-index", set, "--", &last], null());
+        assert_eq!(
+            index_hint(&repo).expect("the listing is read to its end"),
+            Some(format!("{flag} {last}")),
+            "{set}"
+        );
+        git(&["update-index", clear, "--", &last], null());
+    }
+    assert_eq!(
+        index_hint(&repo).expect("the listing is read to its end"),
+        None
+    );
+}

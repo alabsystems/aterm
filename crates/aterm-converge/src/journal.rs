@@ -2,7 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! `<state_dir>/converge/journal.ndjson`: one line per change, flushed to stable media before
-//! applying, and one per item an apply run ended failed.
+//! applying, and one per item an apply run ended failed. On Unix a bounded latest-change index
+//! is flushed before returning to the caller, retaining change evidence across rotations.
+//! A metadata-only checkpoint establishes an initial witness before a fresh observation.
+
+#[cfg(unix)]
+mod history;
+#[cfg(unix)]
+pub use history::HistoryStamp;
 
 use crate::engine::Journal;
 use serde::Serialize;
@@ -23,6 +30,8 @@ pub struct FileJournal {
 #[derive(Serialize)]
 struct Line<'a> {
     time: u64,
+    #[cfg(unix)]
+    nonce: String,
     id: &'a str,
     from: &'a str,
     to: &'a str,
@@ -33,8 +42,24 @@ struct Line<'a> {
 #[derive(Serialize)]
 struct Failed<'a> {
     time: u64,
+    #[cfg(unix)]
+    nonce: String,
     id: &'a str,
     failed: &'a str,
+}
+
+/// A metadata-only baseline before a native read, with no pending effect.
+#[cfg(unix)]
+#[derive(Serialize)]
+struct Checkpoint {
+    time: u64,
+    nonce: String,
+    checkpoint: bool,
+}
+
+#[cfg(unix)]
+fn nonce() -> Result<String, String> {
+    aterm_uds::rand::hex_token::<16>().map_err(|error| error.to_string())
 }
 
 fn now_secs() -> u64 {
@@ -50,6 +75,9 @@ impl FileJournal {
     pub const FILE: &'static str = "journal.ndjson";
     /// The one rotation kept.
     pub const ROTATED: &'static str = "journal.1.ndjson";
+    /// The bounded latest-change index, independent of the two journal files.
+    #[cfg(unix)]
+    pub const HISTORY: &'static str = history::FILE;
     /// The most bytes the journal holds before it rotates: 1 MiB.
     pub const BOUND: u64 = 1 << 20;
     /// The advisory lock each append holds, beside the journal.
@@ -88,7 +116,7 @@ impl FileJournal {
         }
     }
 
-    fn append(&self, line: &[u8]) -> Result<(), String> {
+    fn append(&self, line: &[u8], change: Option<&str>) -> Result<(), String> {
         let len = u64::try_from(line.len()).unwrap_or(u64::MAX);
         if len > self.bound {
             return Err(format!(
@@ -101,6 +129,14 @@ impl FileJournal {
         make_dir(&self.dir).map_err(|e| shown(e, &self.dir))?;
         let lock_path = self.dir.join(Self::LOCK);
         let _held = Held::take(&lock_path, self.wait).map_err(|e| shown(e, &lock_path))?;
+        #[cfg(unix)]
+        let mut history = history::History::begin(&path).map_err(|e| shown(e, &path))?;
+        #[cfg(unix)]
+        if let Some(id) = change {
+            history.note(id).map_err(|e| shown(e, &path))?;
+        }
+        #[cfg(not(unix))]
+        let _ = change;
         let (mut file, held) = open_append(&path).map_err(|e| shown(e, &path))?;
         let fresh = held == 0 || held.saturating_add(len) > self.bound;
         if held > 0 && held.saturating_add(len) > self.bound {
@@ -130,7 +166,68 @@ impl FileJournal {
         if fresh {
             aterm_durable::durable_dir(&self.dir).map_err(|e| shown(e, &self.dir))?;
         }
+        // The witness is durable before before_change returns and its caller may apply.
+        // A crash or publication failure leaves its old journal identity mismatched, so a
+        // reader cannot treat unrecorded changes as an unchanged history.
+        #[cfg(unix)]
+        history.publish(&path).map_err(|e| shown(e, &path))?;
         Ok(())
+    }
+
+    /// Establish retained history before a fresh observation, including on an empty or
+    /// legacy journal. Already-bound history needs no write. The checkpoint records no
+    /// setting change and preserves all earlier journal lines.
+    ///
+    /// # Errors
+    /// The journal or its index cannot be written durably, its lock remains held, or the
+    /// operating system cannot provide randomness.
+    #[cfg(unix)]
+    pub fn prepare_history(&self) -> Result<(), String> {
+        if history::History::read(&self.path()).is_some() {
+            return Ok(());
+        }
+        let mut line = aterm_json::to_string(&Checkpoint {
+            time: now_secs(),
+            nonce: nonce()?,
+            checkpoint: true,
+        })
+        .map_err(|error| error.to_string())?;
+        line.push('\n');
+        self.append(line.as_bytes(), None)
+    }
+
+    /// Whether a line is a well-formed metadata-only history checkpoint, containing no
+    /// item id or setting values. Readers of legacy fences may pass over this line.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn is_history_checkpoint(line: &[u8]) -> bool {
+        history::is_checkpoint(line)
+    }
+
+    /// A bounded witness of the latest change to any item selected by `includes`, across
+    /// journal rotations. None when the sidecar is missing, damaged or does not cover the
+    /// current journal (including a write by an older process).
+    #[cfg(unix)]
+    #[must_use]
+    pub fn history_stamp_at(path: &Path, includes: impl Fn(&str) -> bool) -> Option<HistoryStamp> {
+        Self::history_stamp_with_wait(path, includes, Self::WAIT)
+    }
+
+    #[cfg(unix)]
+    fn history_stamp_with_wait(
+        path: &Path,
+        includes: impl Fn(&str) -> bool,
+        wait: Duration,
+    ) -> Option<HistoryStamp> {
+        // Do not create a journal directory merely to inspect absent history. Once an
+        // index exists, share the writer's lock so its journal/index pair is read together.
+        if !fs::symlink_metadata(path.with_file_name(Self::HISTORY))
+            .is_ok_and(|meta| meta.is_file())
+        {
+            return None;
+        }
+        let _held = Held::take(&path.with_file_name(Self::LOCK), wait).ok()?;
+        history::History::read(path).map(|history| history.stamp(includes))
     }
 }
 
@@ -144,6 +241,8 @@ impl Journal for FileJournal {
     ) -> Result<(), String> {
         let mut line = aterm_json::to_string(&Line {
             time: now_secs(),
+            #[cfg(unix)]
+            nonce: nonce()?,
             id,
             from,
             to,
@@ -151,18 +250,20 @@ impl Journal for FileJournal {
         })
         .map_err(|e| e.to_string())?;
         line.push('\n');
-        self.append(line.as_bytes())
+        self.append(line.as_bytes(), Some(id))
     }
 
     fn failed(&mut self, id: &str, why: &str) -> Result<(), String> {
         let mut line = aterm_json::to_string(&Failed {
             time: now_secs(),
+            #[cfg(unix)]
+            nonce: nonce()?,
             id,
             failed: why,
         })
         .map_err(|e| e.to_string())?;
         line.push('\n');
-        self.append(line.as_bytes())
+        self.append(line.as_bytes(), None)
     }
 }
 

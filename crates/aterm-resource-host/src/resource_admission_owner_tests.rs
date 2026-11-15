@@ -86,7 +86,7 @@ fn assert_fault_terminal(detail: impl std::fmt::Debug, expected: &str) {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[path = "resource_admission_owner_tests/bootstrap_object_engineering.rs"]
-mod bootstrap_object_engineering;
+pub(in crate::actor::owner) mod bootstrap_object_engineering;
 
 #[cfg(target_os = "macos")]
 fn owner_fixture_sdk_lease(
@@ -209,7 +209,7 @@ fn loan_bookkeeping_does_not_resurrect_a_native_terminal_phase() {
     }
     let world = World::new();
     let binding = Binding {
-        session: "s-ab".into(),
+        session: "s-000000000000000000ab".into(),
         attempt: [17; 16],
     };
     world.owner.journal.create(&binding).unwrap();
@@ -645,7 +645,7 @@ fn queue_owned(
     attempt: [u8; 16],
 ) -> (Binding, CohortClosureRef, CtlStream) {
     let binding = Binding {
-        session: "s-acde".into(),
+        session: "s-0000000000000000acde".into(),
         attempt,
     };
     let (host, client) = CtlStream::pair().unwrap();
@@ -1578,7 +1578,7 @@ fn known_member_attempt_never_receives_a_new_no_child_refusal() {
     use aterm_types::resource_subgroup::{Capability, CpuDelegation, GnuTransport, Request};
     let mut world = World::new();
     let binding = Binding {
-        session: "s-acde".into(),
+        session: "s-0000000000000000acde".into(),
         attempt: [92; 16],
     };
     world.owner.journal.create(&binding).unwrap();

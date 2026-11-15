@@ -300,6 +300,23 @@ impl Fresh {
         matches!(self.known(), Known::Lower)
     }
 
+    /// Why a window of this class holds no exact figure ([`Why`]): an unread class's reason, or
+    /// read earlier for a bound. `None` for a reading of now, a wall, and a login: a row with no
+    /// login here says its login where its figure would be ([`Figure::SignedOut`]), never as a
+    /// reason of its week.
+    #[must_use]
+    pub const fn why(self) -> Option<Why> {
+        match self {
+            Fresh::NeverRead => Some(Why::NeverRead),
+            Fresh::ResetUnread => Some(Why::ResetUnread),
+            Fresh::ClockInvalid => Some(Why::ClockInvalid),
+            Fresh::AsOf | Fresh::Stale | Fresh::IdleHere | Fresh::UsedSince | Fresh::Pool => {
+                Some(Why::Earlier)
+            }
+            Fresh::Now | Fresh::Walled | Fresh::SignedOut | Fresh::NotEnrolled => None,
+        }
+    }
+
     /// Whether a figure of this class may be shown as a number (never an unread one).
     #[must_use]
     pub const fn shows_figure(self) -> bool {
@@ -312,6 +329,99 @@ impl Fresh {
                 | Fresh::Pool
                 | Fresh::Walled
         )
+    }
+}
+
+/// Why the glass holds no exact figure of a signed-in account's week, said in words and never as
+/// a mark (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1): its week unread, for one of
+/// three reasons ([`Figure::Unread`], [`RowOutlook::unread`]), or read earlier, a bound any Mac
+/// may have spent since (what a lean on a bound says, §2.3). A login is none of these: a row
+/// with no login here says it as its figure ([`Figure::SignedOut`], [`Figure::SigningIn`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Why {
+    /// aterm has never read its week ([`Fresh::NeverRead`]).
+    NeverRead,
+    /// Its week reset since it was read ([`Fresh::ResetUnread`]).
+    ResetUnread,
+    /// The time of its last reading cannot be admitted on this clock ([`Fresh::ClockInvalid`]).
+    ClockInvalid,
+    /// Read earlier: a lower bound of use, which any Mac may have spent since.
+    Earlier,
+}
+
+impl Why {
+    /// Every reason, in this order.
+    pub const ALL: [Why; 4] = [
+        Why::NeverRead,
+        Why::ResetUnread,
+        Why::ClockInvalid,
+        Why::Earlier,
+    ];
+
+    /// Whether it says the week is unread (every reason but [`Why::Earlier`]).
+    #[must_use]
+    pub const fn unread(self) -> bool {
+        !matches!(self, Why::Earlier)
+    }
+
+    /// Why the row a lean leans on holds no exact figure, of its class `fresh`
+    /// ([`Fresh::why`]). The replay forks only on a row it holds no exact figure of, and the
+    /// policy takes no row with no login here, so every lean's class has a reason; a class
+    /// with none is one the replay knows nothing of, which is said as never read.
+    #[must_use]
+    pub const fn of_lean(fresh: Fresh) -> Why {
+        match fresh.why() {
+            Some(why) => why,
+            None => Why::NeverRead,
+        }
+    }
+
+    /// Its words on the glass beside an account's whole name, where its week has no figure to
+    /// say (`not read yet`): plain words, never a mark and never a figure nothing reported.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Why::NeverRead => "not read yet",
+            Why::ResetUnread => "not read since reset",
+            Why::ClockInvalid => "time unconfirmed",
+            Why::Earlier => "read earlier",
+        }
+    }
+
+    /// [`Self::words`] where a row is short of room: the fewest words that still say why no
+    /// figure stands (`not read`, `read earlier`). Line E beside a narrow name, a lean's phrase
+    /// and each item of the Account card's `Switch this Mac to`
+    /// (`fact_menu::account_menu_rows_from`) say them.
+    #[must_use]
+    pub const fn brief(self) -> &'static str {
+        match self {
+            Why::NeverRead | Why::ResetUnread | Why::ClockInvalid => "not read",
+            Why::Earlier => "read earlier",
+        }
+    }
+
+    /// What the words say after the name of a row the rotation moves onto (`pool1, which aterm
+    /// has never read`): why its week holds no exact figure, as a relative clause.
+    #[must_use]
+    pub const fn which(self) -> &'static str {
+        match self {
+            Why::NeverRead => "which aterm has never read",
+            Why::ResetUnread => "whose week aterm has not read since its reset",
+            Why::ClockInvalid => "whose observation time is unconfirmed",
+            Why::Earlier => "whose week was read earlier",
+        }
+    }
+
+    /// The whole sentence a hover title and a reader say of an account whose week has no
+    /// figure, after its name: why none stands.
+    #[must_use]
+    pub const fn sentence(self) -> &'static str {
+        match self {
+            Why::NeverRead => "aterm has not read its week yet",
+            Why::ResetUnread => "its week reset and aterm has not read it since",
+            Why::ClockInvalid => "the time of its last reading is unconfirmed",
+            Why::Earlier => "its week was read earlier",
+        }
     }
 }
 
@@ -499,6 +609,10 @@ pub struct WindowOutlook {
     pub projection: Option<Proj>,
     /// Where it was read.
     pub source: Option<Source>,
+    /// A peer's bound of the window ([`Inputs::lab`]), kept only where this Mac's own reading is
+    /// unknown or its reset passed ([`Fresh::ResetUnread`], [`Fresh::NeverRead`]): what the line
+    /// says in place of nothing, and what the lean's best case counts instead of a fresh week.
+    pub lab: Option<super::alab_seen::Bound>,
 }
 
 /// Where a figure was read: the tap, a `/usage` panel or a warning, on this machine or another.
@@ -547,18 +661,14 @@ impl RowOutlook {
         self.windows.iter().find(|x| x.window == w)
     }
 
-    /// What the glass says in its figure's place: a row with no login to run on here
-    /// ([`accounts::login_here`], which [`Self::condition`] holds as not enrolled or signed out)
-    /// is [`Figure::SignedOut`], or [`Figure::SigningIn`] while a sign-in of it runs, whatever
-    /// was last read of its week; any other row is its week's figure ([`Self::week_figure`]). So
-    /// `?` is said only of a signed-in row whose week has not been read.
+    /// What the glass says in its figure's place: a row with no login to run on here says its
+    /// login ([`Figure::login`]: `signed out`, or `signing in` while a sign-in of it runs),
+    /// whatever was last read of its week; any other row is its week's figure
+    /// ([`Self::week_figure`]). So `not read` is said only of a signed-in row whose week has not
+    /// been read, and [`Self::unread`] says why.
     #[must_use]
     pub fn figure(&self, as_of: i64) -> Figure {
-        match self.condition {
-            Condition::NotEnrolled | Condition::SignedOut if self.signing_in => Figure::SigningIn,
-            Condition::NotEnrolled | Condition::SignedOut => Figure::SignedOut,
-            _ => self.week_figure(as_of),
-        }
+        Figure::login(&self.condition, self.signing_in).unwrap_or_else(|| self.week_figure(as_of))
     }
 
     /// Its week's reading as the glass says it ([`Figure::of_week`]), whatever its login: the
@@ -568,6 +678,35 @@ impl RowOutlook {
     pub fn week_figure(&self, as_of: i64) -> Figure {
         self.window(Window::Week)
             .map_or(Figure::Unread, |week| Figure::of_week(week, as_of))
+    }
+
+    /// Why its week has no figure at `as_of`, where [`Self::week_figure`] is
+    /// [`Figure::Unread`]: its week's class where that is an unread one ([`Fresh::why`]); else
+    /// what [`Figure::of_week`] refused the reading for (a clock it cannot admit, a reset that
+    /// has passed), and never read where it holds none. A row with no login here says its login
+    /// in its figure's place instead ([`Self::figure`]), except on this tab's own lead, which
+    /// says its week.
+    #[must_use]
+    pub fn unread(&self, as_of: i64) -> Option<Why> {
+        if self.week_figure(as_of) != Figure::Unread {
+            return None;
+        }
+        let Some(week) = self.window(Window::Week) else {
+            return Some(Why::NeverRead);
+        };
+        Some(match week.fresh.why() {
+            Some(why) if why.unread() => why,
+            _ if week
+                .at
+                .is_some_and(|at| super::profile::usage_read_age(at, as_of).is_none()) =>
+            {
+                Why::ClockInvalid
+            }
+            _ if week.seen_x10.is_some() && week.reset.is_some_and(|r| r <= as_of) => {
+                Why::ResetUnread
+            }
+            _ => Why::NeverRead,
+        })
     }
 }
 
@@ -586,10 +725,9 @@ pub struct Read {
     pub epoch: Option<i64>,
 }
 
-/// What the glass says of an account with no login to run on here ([`Figure::SignedOut`]).
+/// What the glass says of an account with no login to run on here ([`Figure::SignedOut`]), at
+/// every width: the one word every surface that names an account says of that state.
 pub const SIGNED_OUT: &str = "signed out";
-/// [`SIGNED_OUT`] at a row's narrowest form ([`Figure::narrow_words`]).
-pub const NO_LOGIN: &str = "no login";
 /// What the glass says of an account whose sign-in runs on this Mac now ([`Figure::SigningIn`]).
 pub const SIGNING_IN: &str = "signing in";
 
@@ -608,17 +746,33 @@ pub enum Figure {
     AtLeast(u16),
     /// A standing wall: `out`, never a percentage.
     Out,
-    /// Unread, or read before a reset that has passed: `?`.
+    /// A signed-in account's week unread, or read before a reset that has passed: `not read`,
+    /// and where the row is known why ([`Why::words`], [`RowOutlook::unread`]). Never a mark.
     Unread,
     /// The account has no login to run on here, none made or one signed out
-    /// ([`RowOutlook::figure`]): `signed out`, in the figure's place. A fact of the row, in the
-    /// quiet ink; it raises nothing.
+    /// ([`Figure::login`]): `signed out`, in the figure's place, at every width. A fact of the
+    /// row, in the quiet ink; it raises nothing.
     SignedOut,
     /// A sign-in of the account runs on this Mac now: `signing in`.
     SigningIn,
 }
 
 impl Figure {
+    /// What the glass says in place of the figure of a row in `condition`, with a sign-in of it
+    /// running on this Mac where `signing_in`: a row with no login to run on here
+    /// ([`accounts::login_here`], which [`accounts::condition`] holds as not enrolled or signed
+    /// out) is [`Figure::SignedOut`], or [`Figure::SigningIn`] while its sign-in runs; `None` for
+    /// a row with a login here, whose week is its figure. The one rule the row, its title and
+    /// speech, and the Account card's items read.
+    #[must_use]
+    pub const fn login(condition: &Condition, signing_in: bool) -> Option<Figure> {
+        match condition {
+            Condition::NotEnrolled | Condition::SignedOut if signing_in => Some(Figure::SigningIn),
+            Condition::NotEnrolled | Condition::SignedOut => Some(Figure::SignedOut),
+            _ => None,
+        }
+    }
+
     /// A reading's figure at `now`: exact while current, a lower bound after, unread once its
     /// window reset or where its clock cannot be admitted.
     #[must_use]
@@ -678,9 +832,9 @@ impl Figure {
     }
 
     /// Its words, the one form every surface a person reads says ([`super::left`]): `37% left`,
-    /// `≤30% left`, `out`, `?`, `signed out`, `signing in`. A percentage always carries the word
-    /// `left`, `0% left` is said only of a reading of 100, and a bound never says less is left
-    /// than may be.
+    /// `≤30% left`, `out`, `not read`, `signed out`, `signing in`, never a mark. A percentage
+    /// always carries the word `left`, `0% left` is said only of a reading of 100, and a bound
+    /// never says less is left than may be.
     #[must_use]
     pub fn words(self) -> String {
         match self {
@@ -690,20 +844,9 @@ impl Figure {
             }
             Figure::AtLeast(x10) => super::left::bound_words(u32::from(x10)),
             Figure::Out => "out".into(),
-            Figure::Unread => "?".into(),
+            Figure::Unread => "not read".into(),
             Figure::SignedOut => SIGNED_OUT.into(),
             Figure::SigningIn => SIGNING_IN.into(),
-        }
-    }
-
-    /// [`Self::words`] where a row is laid at its narrowest (its name's local part): a row
-    /// with no login says [`NO_LOGIN`], two cells shorter and never `out`, which is a wall's
-    /// word. Every other figure says its words.
-    #[must_use]
-    pub fn narrow_words(self) -> String {
-        match self {
-            Figure::SignedOut => NO_LOGIN.into(),
-            figure => figure.words(),
         }
     }
 
@@ -894,8 +1037,35 @@ pub struct Lean {
     pub why: Fresh,
     /// It holds nothing.
     pub worst: Pass,
-    /// It holds its read figure, or a fresh week.
+    /// It holds what [`Self::assumed`] says.
     pub best: Pass,
+    /// What the best case assumed of the row's week.
+    pub assumed: Assumed,
+}
+
+/// What a lean's best case assumed of the row's week ([`Lean::assumed`]), so its words and its
+/// JSON say which: a fresh week is said only where the pass assumed one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Assumed {
+    /// The figure this Mac read of it, which any Mac may have spent since.
+    Read,
+    /// A peer's bound of it ([`WindowOutlook::lab`]): as used as that Mac read until its reset,
+    /// or full to the end of the wall it saw.
+    Peer(super::alab_seen::Bound),
+    /// A fresh week: nothing here or from a peer bounds it.
+    Fresh,
+}
+
+impl Assumed {
+    /// The JSON word.
+    #[must_use]
+    pub const fn word(&self) -> &'static str {
+        match self {
+            Assumed::Read => "read",
+            Assumed::Peer(_) => "peer",
+            Assumed::Fresh => "fresh",
+        }
+    }
 }
 
 /// One pass of the replay.
@@ -978,9 +1148,11 @@ pub enum Verdict {
     Lean {
         /// The work is covered to here.
         until: i64,
-        /// Then the rotation moves to this row, which aterm cannot read.
+        /// Then the rotation moves to this row, whose week aterm holds no exact figure of.
         row: String,
-        /// Its class.
+        /// Its class: an unread one, or a bound ([`Fresh::IdleHere`], [`Fresh::UsedSince`],
+        /// [`Fresh::Pool`]: read earlier, and any Mac may have spent it since); the glass says
+        /// it as [`Why::of_lean`].
         why: Fresh,
         /// The worst case's stop: from, and where it ends (never at the wall the worst case
         /// invented).
@@ -1093,6 +1265,11 @@ pub struct Inputs<'a> {
     pub series: &'a BTreeMap<String, Vec<SeriesRow>>,
     /// Each label's renewal `subscriptionType`, where the logins hold one.
     pub renewals: &'a BTreeMap<String, String>,
+    /// Each label's peer bounds from the journal snapshot the caller held
+    /// ([`super::alab_seen::bounds`]), empty with none: display evidence that the account was
+    /// used elsewhere, never that it has room. Only a row whose own reading is unknown or whose
+    /// reset passed shows one, and only the lean's best case counts it; nothing writes it.
+    pub lab: &'a BTreeMap<String, super::alab_seen::Bounds>,
     /// `[harness] accounts`.
     pub mode: Mode,
     /// `[harness] usage_credits`.
@@ -1546,6 +1723,9 @@ struct SimRow {
     fresh_week: Fresh,
     /// The read figure a best case counts ([`Known::Lower`]).
     read_week: Option<Seen>,
+    /// A peer's bound of the week a best case counts where no figure was read here
+    /// ([`WindowOutlook::lab`]).
+    lab_week: Option<super::alab_seen::Bound>,
 }
 
 impl SimRow {
@@ -2263,29 +2443,43 @@ impl<'a> Sim<'a> {
         let _ = self.at_wall(Window::Week);
     }
 
-    fn assume_best(&mut self, b: usize) {
+    /// The best case of a row the policy moves onto unread, and what it assumed: its read
+    /// figure exactly, else a peer's bound of its week while it holds (the least use the
+    /// evidence allows: a wall a peer saw is a full week to its end), else a fresh week.
+    fn assume_best(&mut self, b: usize) -> Assumed {
         let t = self.t;
         let row = &mut self.rows[b];
         row.seen = true;
-        match (row.week.known, row.read_week) {
-            (Known::Lower, Some(seen)) => {
+        let assumed = match (row.week.known, row.read_week, row.lab_week.clone()) {
+            (Known::Lower, Some(seen), _) => {
                 row.week.known = Known::Exact;
                 row.week.acc = i128::from(seen.pct_x10) * row.scale();
                 row.week.reset = Some(seen.reset);
+                Assumed::Read
+            }
+            (_, None, Some(bound)) if bound.until() > t => {
+                row.week = Win {
+                    acc: i128::from(bound.used_x10().min(1000)) * row.scale(),
+                    reset: Some(bound.until()),
+                    ..Win::empty(Known::Exact)
+                };
+                Assumed::Peer(bound)
             }
             _ => {
                 row.week = Win {
                     reset: Some(t + Window::Week.len_s()),
                     ..Win::empty(Known::Exact)
                 };
+                Assumed::Fresh
             }
-        }
+        };
         if row.five.known != Known::Exact {
             row.five = Win::empty(Known::Exact);
         }
         self.open_five();
         self.read_into_state(b);
         self.note_fill(b);
+        assumed
     }
 
     fn fork(&mut self, b: usize) {
@@ -2304,7 +2498,7 @@ impl<'a> Sim<'a> {
         best.stops.clear();
         best.link_from = self.t;
         best.seed_fills();
-        best.assume_best(b);
+        let assumed = best.assume_best(b);
         let at = self.t;
         self.lean = Some(Box::new(Lean {
             at,
@@ -2312,6 +2506,7 @@ impl<'a> Sim<'a> {
             why,
             worst: worst.run(),
             best: best.run(),
+            assumed,
         }));
     }
 
@@ -2736,8 +2931,9 @@ pub fn replay_mode(policy: &crate::supervise::SupervisorConfig) -> Mode {
 }
 
 /// The outlook `aterm harness accounts` reports: `series`, what the report read once of each
-/// row's series ([`account_series::report_view`]), in the outlook's view ([`series_view`]), and
-/// the renewals read from `logins` beside the state the report read, nothing written.
+/// row's series ([`account_series::report_view`]), in the outlook's view ([`series_view`]), the
+/// renewals read from `logins` beside the state the report read, and `lab`, the peer bounds of
+/// the journal snapshot the report held ([`Inputs::lab`]), nothing written.
 #[must_use]
 pub fn for_report(
     series: &BTreeMap<String, Vec<SeriesRow>>,
@@ -2745,6 +2941,7 @@ pub fn for_report(
     (mode, credits): (Mode, bool),
     (now, offset): (i64, fn(i64) -> i64),
     signing_in: Option<&str>,
+    lab: &BTreeMap<String, super::alab_seen::Bounds>,
 ) -> Outlook {
     let series = series_view(series, now);
     let renewals = renewals_of(roster, logins);
@@ -2754,6 +2951,7 @@ pub fn for_report(
         enrolled,
         series: &series,
         renewals: &renewals,
+        lab,
         mode,
         credits,
         now,
@@ -2831,6 +3029,14 @@ fn build(
         };
         let (fresh_week, seen_week) = fresh_of(row, state, cond, is_carrier, Window::Week, now);
         let (fresh_five, seen_five) = fresh_of(row, state, cond, is_carrier, Window::Five, now);
+        let lab_of = |w: Window, fresh: Fresh| {
+            let bounds = inputs.lab.get(&row.label)?;
+            matches!(fresh, Fresh::ResetUnread | Fresh::NeverRead).then_some(())?;
+            match w {
+                Window::Week => bounds.week.clone(),
+                Window::Five => bounds.five.clone(),
+            }
+        };
         let window = |w: Window, fresh: Fresh, seen: Option<Seen>| WindowOutlook {
             window: w,
             used_x10: seen
@@ -2844,6 +3050,7 @@ fn build(
             fresh,
             projection: None,
             source: seen.map(|s| s.source),
+            lab: lab_of(w, fresh),
         };
         let walled = matches!(cond, Condition::Limited { .. }).then(|| {
             let mut clone = quota_replay_state(state, now);
@@ -2927,6 +3134,7 @@ fn build(
             fresh_week,
             read_week: seen_week
                 .filter(|s| s.reset > now && super::profile::usage_read_age(s.at, now).is_some()),
+            lab_week: lab_of(Window::Week, fresh_week),
         });
     }
     let multiples: BTreeMap<String, u32> =
@@ -3668,16 +3876,14 @@ impl Outlook {
     /// The verdict as spoken sentences.
     #[must_use]
     pub fn verdict_spoken(&self) -> String {
-        let cannot = |row: &str| {
-            let fresh = self
-                .row(row)
-                .and_then(|r| r.window(Window::Week))
-                .map(|w| w.fresh);
-            match fresh {
-                Some(Fresh::NeverRead) => "which aterm has never read",
-                Some(Fresh::ClockInvalid) => "whose observation time is unconfirmed",
-                _ => "which aterm cannot read",
-            }
+        // Why the row a lean's stop leans on holds no exact figure: its week's class.
+        let which = |row: &str| {
+            Why::of_lean(
+                self.row(row)
+                    .and_then(|r| r.window(Window::Week))
+                    .map_or(Fresh::NeverRead, |w| w.fresh),
+            )
+            .which()
         };
         match &self.verdict {
             Verdict::Walled { to: Some(to), .. } => {
@@ -3702,7 +3908,7 @@ impl Outlook {
                     .spoken_end(*end)
                     .map_or_else(|| " with no end in reach".into(), |e| format!(" to {e}"));
                 let tail = match lean {
-                    Some(row) => format!(", whatever {row}, {}, holds", cannot(row)),
+                    Some(row) => format!(", whatever {row}, {}, holds", which(row)),
                     None => ", when every account is out".into(),
                 };
                 format!(
@@ -3711,7 +3917,10 @@ impl Outlook {
                 )
             }
             Verdict::Lean {
-                until, row, stop, ..
+                until,
+                row,
+                why,
+                stop,
             } => {
                 let worst = stop.map_or_else(String::new, |(from, end)| {
                     let end = self
@@ -3725,7 +3934,7 @@ impl Outlook {
                 format!(
                     "Continuous until {}. After that the rotation moves to {row}, {}.{worst}",
                     self.spoken_about(*until),
-                    cannot(row)
+                    Why::of_lean(*why).which()
                 )
             }
             Verdict::Credits { at } => format!(
@@ -3773,10 +3982,65 @@ impl Outlook {
         }
     }
 
+    /// A peer's bound as the CLI's window line says it, where this Mac's own reading is unknown
+    /// or its reset passed: `≤68% left · ♻ Mon Nov 16 08:00 (in 3d) · as of 3h (statusline, m13),
+    /// others may use it`, the figure an upper bound of what is left; a peer's wall `out · ♻ … ·
+    /// as of 3h (wall, m13)`.
+    fn lab_words(&self, bound: &super::alab_seen::Bound) -> String {
+        let until = bound.until();
+        let reset = format!(
+            "\u{267b} {} (in {})",
+            self.cli_when(until),
+            span_words(until - self.as_of)
+        );
+        match bound {
+            super::alab_seen::Bound::Used {
+                pct_x10,
+                read,
+                by,
+                src,
+                ..
+            } => format!(
+                "{} \u{b7} {reset} \u{b7} as of {} ({src}, {by}), others may use it",
+                super::left::bound_words(u32::from(*pct_x10)),
+                self.age(Some(*read))
+            ),
+            super::alab_seen::Bound::Wall { read, by, .. } => format!(
+                "out \u{b7} {reset} \u{b7} as of {} (wall, {by})",
+                self.age(Some(*read))
+            ),
+        }
+    }
+
+    /// What a lean's best case assumed, as its header says it: `holds what was read`, `holds
+    /// what m13 read (≤1% left until Mon Nov 16 08:00)`, `stays walled as m13 saw it (until …)`,
+    /// `has a fresh week`.
+    fn assumed_words(&self, assumed: &Assumed) -> String {
+        match assumed {
+            Assumed::Read => "holds what was read".into(),
+            Assumed::Peer(super::alab_seen::Bound::Used {
+                pct_x10, reset, by, ..
+            }) => format!(
+                "holds what {by} read ({} until {})",
+                super::left::bound_words(u32::from(*pct_x10)),
+                long_when(*reset, &self.offsets)
+            ),
+            Assumed::Peer(super::alab_seen::Bound::Wall { until, by, .. }) => format!(
+                "stays walled as {by} saw it (until {})",
+                long_when(*until, &self.offsets)
+            ),
+            Assumed::Fresh => "has a fresh week".into(),
+        }
+    }
+
     fn window_line(&self, row: &RowOutlook, w: &WindowOutlook) -> String {
         let mut out = format!("       {:<5} ", w.window.word());
         if w.fresh == Fresh::ClockInvalid {
             out.push_str("\u{2014} \u{b7} observation time unconfirmed");
+            return out;
+        }
+        if let Some(bound) = &w.lab {
+            out.push_str(&self.lab_words(bound));
             return out;
         }
         let closed =
@@ -3798,10 +4062,15 @@ impl Outlook {
                 ));
                 return out;
             }
-            Fresh::NeverRead | Fresh::SignedOut | Fresh::NotEnrolled => {
+            Fresh::NeverRead => {
+                out.push_str("\u{2014} \u{b7} never read");
+                return out;
+            }
+            // A row with no login here: its login in the glass's word for it ([`Figure::login`]).
+            Fresh::SignedOut | Fresh::NotEnrolled => {
                 out.push_str(&format!(
                     "\u{2014} \u{b7} {}",
-                    w.fresh.word().replace('-', " ")
+                    row.figure(self.as_of).words()
                 ));
                 return out;
             }
@@ -3888,7 +4157,7 @@ impl Outlook {
         let mut out: Vec<String> = row
             .windows
             .iter()
-            .filter(|w| w.window == Window::Week || w.at.is_some())
+            .filter(|w| w.window == Window::Week || w.at.is_some() || w.lab.is_some())
             .map(|w| self.window_line(row, w))
             .collect();
         // How the replay counts a plan that names no multiple, or any where the carrier's
@@ -4150,10 +4419,7 @@ impl Outlook {
             self.pass_lines(&lean.worst, out, &format!("{indent}    "));
             out.push_str(&format!(
                 "{indent}  if it {}:\n",
-                match lean.why {
-                    f if f.bounded() => "holds what was read",
-                    _ => "has a fresh week",
-                }
+                self.assumed_words(&lean.assumed)
             ));
             self.pass_lines(&lean.best, out, &format!("{indent}    "));
         }
@@ -4310,8 +4576,51 @@ impl Outlook {
             "not_needed".into(),
             Value::Array(self.not_needed.iter().cloned().map(Value::from).collect()),
         );
+        // Each row's peer bounds by window id, where it shows one ([`WindowOutlook::lab`]).
+        let lab: Map = self
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let windows: Map = row
+                    .windows
+                    .iter()
+                    .filter_map(|w| Some((w.window.id().to_owned(), lab_json(w.lab.as_ref()?))))
+                    .collect();
+                (!windows.is_empty()).then(|| (row.label.clone(), Value::Object(windows)))
+            })
+            .collect();
+        o.insert("lab".into(), Value::Object(lab));
         Value::Object(o)
     }
+}
+
+/// A peer's bound in `--json`: `{kind: "used", used_x10, reset, read, by, src}` or `{kind:
+/// "wall", until, read, by}`, use in tenths as every JSON figure is.
+fn lab_json(bound: &super::alab_seen::Bound) -> Value {
+    let mut o = Map::new();
+    match bound {
+        super::alab_seen::Bound::Used {
+            pct_x10,
+            reset,
+            read,
+            by,
+            src,
+        } => {
+            o.insert("kind".into(), Value::from("used"));
+            o.insert("used_x10".into(), Value::from(*pct_x10));
+            o.insert("reset".into(), Value::from(*reset));
+            o.insert("read".into(), Value::from(*read));
+            o.insert("by".into(), Value::from(by.clone()));
+            o.insert("src".into(), Value::from(src.clone()));
+        }
+        super::alab_seen::Bound::Wall { until, read, by } => {
+            o.insert("kind".into(), Value::from("wall"));
+            o.insert("until".into(), Value::from(*until));
+            o.insert("read".into(), Value::from(*read));
+            o.insert("by".into(), Value::from(by.clone()));
+        }
+    }
+    Value::Object(o)
 }
 
 /// A pace's lookback as the CLI says it: whole hours up to a day (`24h`), else [`span_words`].
@@ -4382,6 +4691,11 @@ fn pass_json(p: &Pass) -> Value {
             o.insert("why".into(), Value::from(l.why.word()));
             o.insert("worst".into(), pass_json(&l.worst));
             o.insert("best".into(), pass_json(&l.best));
+            // What the best case assumed: `read`, `fresh`, or `peer` with the bound it held.
+            o.insert("assumed".into(), Value::from(l.assumed.word()));
+            if let Assumed::Peer(bound) = &l.assumed {
+                o.insert("peer".into(), lab_json(bound));
+            }
             Value::Object(o)
         }),
     );

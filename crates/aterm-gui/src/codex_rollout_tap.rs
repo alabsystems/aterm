@@ -31,6 +31,27 @@ pub(crate) const RECHECK: Duration = Duration::from_secs(1);
 /// may precede the write; a further [`RECHECK`] covers the sweep's own lag.
 pub(crate) const SETTLE: Duration = Duration::from_secs(2);
 
+/// How often a codex-alab tab at rest is read while it wrote within [`NEAR_FOR`]: nothing of the
+/// tab moved since its last read, and no trailing, settle or pair read is owed ([`due`]).
+pub(crate) const REST_NEAR: Duration = Duration::from_secs(15);
+
+/// How often a tab at rest is read once its last output is [`NEAR_FOR`] old or older, and one that
+/// has written nothing.
+pub(crate) const REST_FAR: Duration = Duration::from_secs(60);
+
+/// How long after a tab's last output its rest reads keep [`REST_NEAR`].
+pub(crate) const NEAR_FOR: Duration = Duration::from_secs(10 * 60);
+
+/// The interval between a resting tab's reads at `now`, its last output at `output`:
+/// [`REST_NEAR`] while that output is younger than [`NEAR_FOR`], else [`REST_FAR`].
+pub(crate) fn rest_recheck(now: Instant, output: Option<Instant>) -> Duration {
+    if output.is_some_and(|wrote| now.saturating_duration_since(wrote) < NEAR_FOR) {
+        REST_NEAR
+    } else {
+        REST_FAR
+    }
+}
+
 /// What the status sweep saw of a tab when it asked ([`due`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Look {
@@ -54,6 +75,9 @@ pub(crate) struct RolloutAsk {
     pub(crate) output: Option<Instant>,
     /// The screen generation the last call saw ([`Look::screen`]); `None` when asked with no look.
     pub(crate) screen: Option<crate::control::ScreenGen>,
+    /// The screen generation the last read was dispatched at, which a tab's rest is judged
+    /// against ([`due`]); `None` when that read was asked with no look.
+    pub(crate) read: Option<crate::control::ScreenGen>,
     /// The settle read owed ([`SETTLE`]): the screen moved while the record named a count.
     pub(crate) settle: Option<Instant>,
     /// The harness pairing's read wait the session's log last named ([`pair_wait`]).
@@ -127,6 +151,12 @@ pub(crate) enum Ask {
 /// record names a count owes one more read [`SETTLE`] after the move, re-armed by each later move
 /// and discharged by the first read at or after it; a pair read ([`pair_wait`]) is kept, and
 /// discharged, the same way.
+/// A sweep [`RECHECK`] or more after the last read reads again at once where the output or the
+/// screen moved since that read, where a trailing read is owed (noted by a sweep inside
+/// [`RECHECK`], or the read went out within [`RECHECK`] of the output it saw), or where a settle
+/// or a pair read has come due. A tab none of those holds for is at rest: it is read once per
+/// [`rest_recheck`] (15 s while it wrote in the last ten minutes, then 60 s), at the first sweep
+/// at or after that interval, and no timer is armed for it.
 pub(crate) fn due(
     asked: &mut HashMap<u64, RolloutAsk>,
     session: u64,
@@ -159,6 +189,27 @@ pub(crate) fn due(
         prior.settle = settle;
         return Ask::Nothing;
     }
+    // The screen is the one the last read saw, not the last call: a move a sweep inside
+    // `RECHECK` was first to see still ends the rest. A trailing read noted owed ends it
+    // whatever this sweep sees: the tests beside it imply that one only while the output
+    // instant moves forward.
+    if let Some(prior) = asked.get_mut(&session)
+        && output == prior.output
+        && screen == prior.read
+        && !prior.owed
+        && !prior
+            .output
+            .is_some_and(|wrote| prior.at.saturating_duration_since(wrote) < RECHECK)
+        && settle.is_none_or(|at| at > now)
+        && prior.pair.is_none_or(|at| at > now)
+        && now.saturating_duration_since(prior.at) < rest_recheck(now, output)
+    {
+        // The screen stands since the read, so the settle is the one the ask holds, or none
+        // once the record names no count.
+        prior.screen = screen;
+        prior.settle = settle;
+        return Ask::Nothing;
+    }
     asked.insert(
         session,
         RolloutAsk {
@@ -166,6 +217,7 @@ pub(crate) fn due(
             owed: false,
             output,
             screen,
+            read: screen,
             settle: settle.filter(|at| *at > now),
             wait: prior.and_then(|p| p.wait),
             pair: prior.and_then(|p| p.pair).filter(|at| *at > now),
@@ -524,7 +576,8 @@ fn read_on(
     let floor = arm.floor_ms.max((job.image.born_ms)(pid).unwrap_or(0));
     let running = (job.image.build)(pid);
     let version = (job.image.version)(pid);
-    held.tap.arm(floor, arm.given, running.as_deref());
+    held.tap
+        .arm(floor, arm.adopted_ms, arm.given, running.as_deref());
     // A read that reached the rollout's end read every row written before it began (`began`, on
     // the log's clock): the harness pairing's watermark (`SessionLog::harness_pair`). A read that
     // failed or stopped short gives none.
@@ -611,6 +664,7 @@ fn read_facts(
         branch,
         task: held.task.clone(),
         goal,
+        thread: tapped.thread.clone(),
     };
     (held.shown.as_ref() != Some(&survey)).then_some(survey)
 }

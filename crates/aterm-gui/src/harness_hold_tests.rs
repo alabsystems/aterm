@@ -285,7 +285,7 @@ fn every_leg() -> u8 {
 
 #[test]
 fn the_open_leg_names_what_the_nudge_named_never_as_a_quote() {
-    use aterm_agent::supervise::policy::turn_end::open_word_at;
+    use alab_policy::open_work::open_word_at;
     let every: Vec<&str> = (1..=u16::MAX)
         .map_while(|i| std::num::NonZeroU16::new(i).and_then(open_word_at))
         .collect();
@@ -1027,8 +1027,8 @@ fn a_stopped_tab_says_so_wherever_its_autopilot_is_read_until_the_hold_lifts() {
 fn a_stopped_cruise_says_the_stop_in_place_of_its_promise() {
     use crate::autopilot::{AutopilotView, mode_words};
     use crate::harness_glass::stop_words;
+    use alab_policy::config::Autopilot;
     use aterm_agent::harness::acts::{HeldBy, STOPPED_TYPING};
-    use aterm_agent::supervise::Autopilot;
     use aterm_agent::supervise::policy::exception::Exception;
     let (mut app, sid, _host) = desk("cruise");
     let promise = mode_words(Autopilot::Cruise).chip;

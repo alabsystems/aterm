@@ -884,3 +884,50 @@ fn a_separate_process_holds_custody_until_its_writer_ends() {
     prune(dir.path(), &directory);
     assert!(!path.exists(), "closed child log is now eligible");
 }
+
+/// WHAT A RUN SAID BEFORE ITS LOG OPENED IS KEPT (`crate::turn::take` waits for the judgment turn
+/// before the log opens): a line written before the companion attached joins it once its first
+/// record, the `invocation-started` its pairing reads, is there, once, in the order written, and
+/// a later line follows it. NEGATIVE CONTROL: before `retain_early` the companion holds only its
+/// first record, so the line is not there by any other path.
+#[test]
+fn a_line_written_before_the_log_opened_joins_the_kept_events_after_their_first_record() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("run.log");
+    let mut events = crate::event_log::EventLog::unrecorded();
+    let early = "verify-event: {\"schema\":1,\"event\":\"judgment-turn\"}";
+    crate::event_log::emit(Some(&events), early);
+    let mut log = open_paired_at(&path, false, events.id()).unwrap();
+    events.retain(log.take_events().unwrap());
+    crate::event_log::emit(
+        Some(&events),
+        "verify-event: {\"schema\":1,\"event\":\"invocation-started\"}",
+    );
+    let kinds = || -> Vec<String> {
+        std::fs::read_to_string(events_path(&path))
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("verify-event: "))
+            .map(|json| {
+                let value: aterm_json::Value = aterm_json::from_str(json).unwrap();
+                value["event"].as_str().unwrap_or_default().to_owned()
+            })
+            .filter(|kind| kind != "private-run-events")
+            .collect()
+    };
+    assert_eq!(
+        kinds(),
+        ["invocation-started"],
+        "not kept before retain_early"
+    );
+    events.retain_early();
+    events.retain_early();
+    crate::event_log::emit(
+        Some(&events),
+        "verify-event: {\"schema\":1,\"event\":\"stage-started\"}",
+    );
+    assert_eq!(
+        kinds(),
+        ["invocation-started", "judgment-turn", "stage-started"]
+    );
+}

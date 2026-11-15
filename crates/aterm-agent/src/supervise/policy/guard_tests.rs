@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::*;
+use alab_policy::guard::*;
 use aterm_phase::prompt::fixtures;
 
 /// The shipped matcher: what the server compiles a `key if=<re>` with.

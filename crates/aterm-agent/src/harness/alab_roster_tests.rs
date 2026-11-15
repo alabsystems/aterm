@@ -338,6 +338,7 @@ fn the_lab_fleet_adds_this_macs_preferred_accounts_in_rank_order() {
     let lab = Lab {
         me: Some(test_machine("m22")),
         settled: false,
+        bound: Default::default(),
         accounts: vec![
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", None)]),
             account("bob", Cli::Claude, "claude-bbbbbb", &[("m22", Some(2))]),
@@ -395,6 +396,7 @@ fn a_preference_never_drops_a_row() {
     let lab = Lab {
         me: Some(test_machine("m22")),
         settled: true,
+        bound: Default::default(),
         accounts: vec![
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
             account("cy", Cli::Claude, "claude-cccccc", &[("m20", Some(1))]),
@@ -528,6 +530,7 @@ impl Home {
         Lab {
             me: Some(test_machine("m22")),
             settled,
+            bound: Default::default(),
             accounts: vec![
                 legacy(
                     account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
@@ -749,6 +752,7 @@ fn a_label_another_account_holds_stays_with_its_row() {
     let lab = Lab {
         me: Some(test_machine("m22")),
         settled: false,
+        bound: Default::default(),
         accounts: vec![
             account("gil", Cli::Claude, "work", &[("m22", Some(1))]),
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(2))]),
@@ -810,6 +814,7 @@ fn a_source_the_owner_set_wins_over_the_lab() {
     let lab = Lab {
         me: Some(test_machine("m22")),
         settled: false,
+        bound: Default::default(),
         accounts: vec![
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
             account("fay", Cli::Kimi, "kimi-ffffff", &[("m22", Some(1))]),
@@ -952,6 +957,7 @@ fn preference_bed(state: &aterm_spec::interp::State) -> (Lab, Roster) {
     let lab = Lab {
         me: Some(test_machine("m1")),
         settled: false,
+        bound: Default::default(),
         accounts: vec![x],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
@@ -1102,6 +1108,7 @@ fn an_account_asked_for_by_name_joins_with_no_preference() {
     let lab = Lab {
         me: Some(test_machine("m1")),
         settled: false,
+        bound: Default::default(),
         accounts: vec![
             legacy(
                 account("ann", Cli::Claude, "claude-aaaaaa", &[("m20", Some(1))]),
@@ -1181,6 +1188,7 @@ fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
     let lab = Lab {
         me: Some(test_machine("m1")),
         settled: true,
+        bound: Default::default(),
         accounts: vec![account(
             "ann",
             Cli::Claude,
@@ -1240,6 +1248,7 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
     let lab = Lab {
         me: Some(test_machine("m1")),
         settled: true,
+        bound: Default::default(),
         accounts: vec![
             ann.clone(),
             legacy(

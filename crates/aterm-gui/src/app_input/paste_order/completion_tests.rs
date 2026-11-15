@@ -5,6 +5,140 @@ use super::*;
 use crate::control_input_ack::{InputMark, testing};
 
 #[test]
+fn a_real_queued_key_keeps_pending_input_until_its_epoch_and_acceptance_are_published() {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+    use std::sync::mpsc;
+
+    struct Release(Option<mpsc::Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    let (handle, mut reader) = testing::owned_handle(75);
+    let event = InputEvent::Key {
+        key: Key::Character('q'),
+        mods: Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let epoch = WrittenEpoch::default();
+    let before = handle.ctx.sink.input_epoch();
+    let (entered, entered_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let release = Release(Some(release));
+    with_write_gate_for_test(
+        move || {
+            entered.send(()).unwrap();
+            release_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the queued key is released");
+        },
+        || {
+            let (receipt, inline) = queued_or_inline_observed(
+                true,
+                &handle.term,
+                &handle.ctx.modes,
+                &handle.ctx.sink,
+                &handle.ctx.output_echo,
+                &event,
+                None,
+                None,
+                None,
+                Some(&epoch),
+            );
+            assert!(!inline);
+            assert!(receipt.is_queued());
+            entered_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the real writer reaches the held key");
+            assert_eq!(epoch.get(), None, "queue admission publishes no epoch");
+            assert_eq!(handle.ctx.sink.input_epoch(), before);
+            assert_eq!(
+                handle.ctx.output_echo.pending_input.load(Ordering::Acquire),
+                1,
+                "the exact queued key owns one retention token"
+            );
+            assert!(handle.ctx.output_echo.retains_input());
+            assert!(
+                !handle
+                    .ctx
+                    .output_echo
+                    .published
+                    .lock()
+                    .unwrap()
+                    .retained_input,
+                "the held key has no accepted data yet"
+            );
+            drop(release);
+            await_drain_for_test(&handle.ctx.sink);
+            assert_eq!(testing::byte(&mut reader), b'q');
+            assert_ne!(handle.ctx.sink.input_epoch(), before);
+            assert_eq!(epoch.get(), Some(handle.ctx.sink.input_epoch()));
+            assert_eq!(
+                handle.ctx.output_echo.pending_input.load(Ordering::Acquire),
+                0,
+                "the completed key retires its pending token"
+            );
+            assert!(
+                handle
+                    .ctx
+                    .output_echo
+                    .published
+                    .lock()
+                    .unwrap()
+                    .retained_input
+            );
+            assert!(handle.ctx.output_echo.retains_input());
+        },
+    );
+
+    for unavailable in [false, true] {
+        let (refused, mut reader) = testing::owned_handle(76);
+        let epoch = WrittenEpoch::default();
+        let before = refused.ctx.sink.input_epoch();
+        let _refusal = reject_admission_for_test(&refused.ctx.sink, unavailable);
+        let (receipt, inline) = queued_or_inline_observed(
+            true,
+            &refused.term,
+            &refused.ctx.modes,
+            &refused.ctx.sink,
+            &refused.ctx.output_echo,
+            &event,
+            None,
+            None,
+            None,
+            Some(&epoch),
+        );
+        assert!(!inline);
+        assert!(receipt.input_queue_full());
+        assert_eq!(epoch.get(), None);
+        assert_eq!(refused.ctx.sink.input_epoch(), before);
+        assert_eq!(
+            refused
+                .ctx
+                .output_echo
+                .pending_input
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(!refused.ctx.output_echo.retains_input());
+        assert_eq!(refused.ctx.sink.ordered_egress_count(), 0);
+        use std::io::Read as _;
+        let mut byte = [0];
+        assert_eq!(
+            reader.read(&mut byte).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a refused key writes no data"
+        );
+    }
+}
+
+#[test]
 fn scoped_writer_drops_stale_queues_and_finishes_the_started_command_before_ack() {
     use crate::session_timeline::{SupervisorInputDelivery, scoped_input_tests};
     use aterm_agent::harness::contract::Scope;
@@ -48,6 +182,7 @@ fn scoped_writer_drops_stale_queues_and_finishes_the_started_command_before_ack(
         let bytes = retained_bytes(&event).unwrap();
         assert!(budget.claim(bytes, false));
         handle.ctx.sink.claim_ordered_egress();
+        let pending_input = handle.ctx.output_echo.hold_input(&event).unwrap();
         Job {
             term: handle.term.clone(),
             modes: handle.ctx.modes.clone(),
@@ -62,6 +197,8 @@ fn scoped_writer_drops_stale_queues_and_finishes_the_started_command_before_ack(
             completion: Some(completion),
             written: None,
             epoch: None,
+            _pending_input: pending_input,
+            before_write: None,
             _reservation: Reservation {
                 budget: budget.clone(),
                 sink: handle.ctx.sink.clone(),
@@ -183,6 +320,7 @@ fn only_completed_nonempty_jobs_mark_the_exact_admitted_log() {
         let bytes = retained_bytes(&event).expect("tiny job");
         assert!(budget.claim(bytes, false));
         handle.ctx.sink.claim_ordered_egress();
+        let pending_input = handle.ctx.output_echo.hold_input(&event).unwrap();
         Job {
             term: handle.term.clone(),
             modes: handle.ctx.modes.clone(),
@@ -197,6 +335,8 @@ fn only_completed_nonempty_jobs_mark_the_exact_admitted_log() {
             completion: Some(completion),
             written: None,
             epoch: None,
+            _pending_input: pending_input,
+            before_write: None,
             _reservation: Reservation {
                 budget: budget.clone(),
                 sink: handle.ctx.sink.clone(),

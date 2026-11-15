@@ -5,9 +5,9 @@
 //! lease can be released, including a dial still awaiting its first SYN reply.
 
 use super::{
-    announce::{self, Announced},
     census::{self, Event},
     discovery::{Hints, MemoryScope, Outcome, REMEMBERED_MAX, REMEMBERED_NAME, Remembered},
+    moved::{Moves, Subject},
     report::{AuthenticatedConnection, RepairRound, bounded_failure},
 };
 use crate::{
@@ -19,7 +19,7 @@ use aterm_secrets::commons::hearing::Said;
 use aterm_uds::ready::Doorbell;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     os::fd::{AsFd as _, BorrowedFd},
@@ -175,8 +175,6 @@ impl Worker {
             .name("commons-repair".into())
             .spawn(move || {
                 let _end = end;
-                // What this thread appends, its round ingested: no listener announces it again.
-                announce::on_round();
                 let mut repair = repair;
                 repair.begin_round();
                 let mut connection = connection;
@@ -376,6 +374,9 @@ impl Link {
 thread_local! {
     /// MUTANT of CR1, on for one test thread: an inbound round tells discovery nothing, as before.
     static UNVOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Transport::refresh`], on for one test thread: a link a turn dropped that
+    /// reopens on a source still among the addresses says this Mac's network changed.
+    static REOPEN_OPENS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Where a transport keeps the endpoints it verified across restarts ([`Hints::remember`]): a
@@ -447,6 +448,9 @@ pub(super) struct Contact {
     pub(super) actor: astream_wire::sync::Actor,
     /// Its latest authentication.
     pub(super) at: Instant,
+    /// How long after [`Self::at`] this transport's scheduler promises the peer its next round
+    /// ([`Hints::promise`]): the lease the contact gives the peer in the network observation.
+    pub(super) lease: Duration,
     /// What the latest-authenticated round that said anything of its version said, or
     /// [`Said::Unknown`] while none did.
     pub(super) said: Said,
@@ -469,6 +473,7 @@ impl Contact {
         Self {
             actor,
             at,
+            lease: Hints::promise(),
             said,
             said_at: at,
             clock,
@@ -506,6 +511,10 @@ impl Contact {
 pub(super) struct Transport {
     endpoint: Option<Arc<Endpoint>>,
     links: Vec<Link>,
+    /// The sources that held a working link and stayed among the refreshed addresses since
+    /// ([`Self::refresh`]): a link a turn dropped there reopens on the same attachment, which
+    /// is no change of this Mac's network.
+    linked: BTreeSet<IpAddr>,
     hints: Hints,
     /// Where it keeps the endpoints it verified across restarts, if it serves a seat.
     memory: Option<Memory>,
@@ -529,12 +538,13 @@ pub(super) struct Transport {
     push: Option<Push>,
     /// The latest failed local link operation since the last refresh, bounded like a repair error.
     failure: Option<String>,
-    /// What each round's end, each push asked of the owner and each local append rings
-    /// ([`Self::waits_on`]); none where the pipe could not be made, and the owner then ticks
-    /// every [`super::TICK`].
+    /// What each round's end, each push asked of the owner and the watch on what moved here
+    /// rings ([`Self::waits_on`]); none where the pipe could not be made, and the owner then
+    /// ticks every [`super::TICK`].
     doorbell: Option<Arc<Doorbell>>,
-    /// The tables this process appended to since the last turn took them ([`Self::announcer`]).
-    announced: Arc<Announced>,
+    /// Its look at what of this Mac's Commons state moved ([`Self::watching`]), which its dials
+    /// then offer ([`Hints::moved`]); it looks at nothing until its owner gives it one.
+    moves: Moves,
     /// A LAN attachment's stand-in (tests): while it reads false each address refreshed is one no
     /// bind reaches (its checks refuse it, as an attachment that changed since its address was
     /// read), and once it reads true it is the loopback ([`Self::standing_in`]).
@@ -658,9 +668,12 @@ impl Transport {
         {
             hints.remember(memory.read(), now, now_ms);
         }
+        // Its audits keep the lab's catalog heard ([`Hints::keep_catalog`]).
+        hints.keep_catalog(endpoint.as_ref().and_then(Endpoint::catalog_table));
         Ok(Self {
             endpoint: endpoint.map(Arc::new),
             links: Vec::new(),
+            linked: BTreeSet::new(),
             hints,
             memory,
             workers: Vec::new(),
@@ -679,7 +692,7 @@ impl Transport {
             push: None,
             failure: None,
             doorbell: Doorbell::new().ok().map(Arc::new),
-            announced: Arc::default(),
+            moves: Moves::default(),
             #[cfg(test)]
             stand_in: None,
             #[cfg(test)]
@@ -693,8 +706,13 @@ impl Transport {
     /// Open a link on each address in `addresses` that has none. A link counts once its first
     /// beacon went out: where the network fails its sends (EHOSTUNREACH) though its sockets bound,
     /// the link is dropped here, failed, before any observation or peer's reachability counts it,
-    /// and the next refresh tries again.
-    pub(super) fn refresh(&mut self, addresses: &[SocketAddr]) {
+    /// and the next refresh tries again. Whether a link opened on a source that held none since
+    /// it was last among `addresses`: this Mac's network changed, and the owner then unsettles
+    /// what stood on it ([`Self::unsettle`]). A link a turn dropped after a transient failure
+    /// (a send refused during power save or roaming) reopens on an attachment that never left,
+    /// and says nothing changed: however often that happens, it moves no endpoint's schedule.
+    pub(super) fn refresh(&mut self, addresses: &[SocketAddr]) -> bool {
+        let mut opened = false;
         #[cfg(test)]
         let stood_in = self.stood_in(addresses);
         #[cfg(test)]
@@ -705,6 +723,7 @@ impl Transport {
                 continue;
             };
             if self.links.iter().any(|link| link.source == address.ip()) {
+                self.linked.insert(address.ip());
                 continue;
             }
             let listener = if self
@@ -737,10 +756,20 @@ impl Transport {
                 delivering: self.delivering.clone(),
             };
             match link.beacon(&self.hints) {
-                Ok(()) => self.links.push(link),
+                Ok(()) => {
+                    self.links.push(link);
+                    #[cfg(test)]
+                    let reopens = REOPEN_OPENS.with(std::cell::Cell::get);
+                    #[cfg(not(test))]
+                    let reopens = false;
+                    opened |= self.linked.insert(address.ip()) || reopens;
+                }
                 Err(error) => self.fail_link(source.into(), "discovery beacon", error),
             }
         }
+        self.linked
+            .retain(|source| addresses.iter().any(|address| address.ip() == *source));
+        opened
     }
 
     fn fail_link(&mut self, source: IpAddr, operation: &str, error: io::Error) {
@@ -770,6 +799,19 @@ impl Transport {
         std::mem::take(&mut self.contacts)
     }
 
+    /// The seats this transport's dials found gone since the last call, each with when the dial
+    /// that found it so began ([`Hints::take_departures`]): the owner ends each one's lease in
+    /// the network observation, where a contact at or after then stands.
+    pub(super) fn take_departures(&mut self) -> Vec<(astream_wire::sync::Actor, Instant)> {
+        self.hints.take_departures()
+    }
+
+    /// This Mac's network changed, or it woke after sleeping `slept`, at `now`: every
+    /// established endpoint is due an audit soon, whatever it rested on ([`Hints::unsettle`]).
+    pub(super) fn unsettle(&mut self, now: Instant, slept: Duration) {
+        self.hints.unsettle(now, slept);
+    }
+
     /// Push `table`: dial every verified peer that does not speak `Bus` now ([`Hints::hurry`]); the
     /// rounds this side begins repair `table` first while the endpoint's push names it
     /// (`crate::replica::First`). How many peers it hurried; with none there is no push.
@@ -787,6 +829,17 @@ impl Transport {
     /// on its table (`crate::replica::Report::caught_up`).
     pub(super) fn reached(&self) -> bool {
         self.push.as_ref().is_some_and(|push| push.reached)
+    }
+
+    /// Look at what moved here through `moves` ([`Self::turn`]).
+    pub(super) fn watching(&mut self, moves: Moves) {
+        self.moves = moves;
+    }
+
+    /// The owner's polled round: the next tick looks at what moved here, whatever its watch
+    /// heard.
+    pub(super) fn look_soon(&mut self) {
+        self.moves.poll();
     }
 
     /// End the push: rounds keep their ordinary spacing again.
@@ -857,25 +910,63 @@ impl Transport {
                         self.observed.insert(table, report.retained_after);
                     }
                 }
+                if let Some(actor) = repair.authenticated_actor() {
+                    // What this round received from the seat, whether or not it then completed:
+                    // if the next look finds that moved, the seat holds what moved it
+                    // ([`Moves::received`]). The look reads what this Mac holds; these counts
+                    // only say when to look and whom not to offer it back to.
+                    if report.control.as_ref().is_ok_and(|r| r.received > 0) {
+                        self.moves.received(Subject::Control, actor, started);
+                    }
+                    if repair.membership().is_some_and(|r| r.received > 0) {
+                        self.moves.received(Subject::Members, actor, started);
+                    }
+                    if let Some(app) = repair.application().or(repair.application_interrupted())
+                        && let Some(table) = app.table
+                        && app.received + app.conflicts_received > 0
+                    {
+                        self.moves.received(Subject::Table(table), actor, started);
+                    }
+                    // A completed round, whichever side dialled it, settles its seat for what
+                    // moved here before it began, unless its membership or table exchange broke
+                    // off ([`Hints::settle`]).
+                    if success {
+                        self.hints.settle(actor, target, started, &repair);
+                    }
+                }
+                // What a round said of its table, as the network observation will read it,
+                // is what the scheduler hears of the lab's catalog ([`Hints::told`]).
+                if let Some((_, round, _)) = report.observation()
+                    && round.spoke()
+                    && let Some(table) = round.table
+                {
+                    self.hints.told(table, started, round.left_nothing());
+                }
                 if let Some(address) = target {
+                    // What the dial came to tells a peer that is not there from a round this
+                    // side never asked ([`Outcome::dialled`]).
+                    let outcome = outcome.dialled(
+                        report.control.as_ref().err().map(|failure| failure.cause),
+                        report.cancelled,
+                    );
                     self.hints.finish(address, repair, outcome, now);
                 } else if let Some(actor) = repair.authenticated_actor().filter(|_| success)
                     && let Some(connection) = &report.connection
                     && !unvouched()
                 {
                     // A peer that dialled in and completed a round is up: its endpoints here
-                    // drop their backoff as one this side dialled would, and its address leads
-                    // its beacons; where the round moved nothing, this side's own dial of the
-                    // peer waits the ordinary interval again (`Hints::vouch`).
-                    let quiet = outcome == (Outcome::Repaired { transferred: false });
-                    self.hints.vouch(connection.peer.ip(), actor, quiet, now);
+                    // whose dials failed drop their backoff as one this side dialled would, and
+                    // its address leads its beacons. A healthy endpoint's audit keeps this
+                    // side's own clock (`Hints::vouch`).
+                    self.hints.vouch(connection.peer.ip(), actor, now);
                 }
                 self.retain_report(report);
             }
             Err(_) => {
+                // A worker that panicked asked its peer nothing this side can tell of.
                 if let Some(address) = worker.target {
                     self.hints
-                        .finish(address, Repair::default(), Outcome::Refused, now);
+                        .finish(address, Repair::default(), Outcome::Unasked, now);
                 }
                 self.retain_report(RepairRound::panicked(worker.target));
             }
@@ -948,17 +1039,7 @@ impl Transport {
         self.doorbell.clone()
     }
 
-    /// The listener that tells this transport of its custody's local appends
-    /// (`crate::table::store::listen`, [`Announced::listener`]): it notes the table and rings
-    /// the doorbell, and the turn the ring wakes names the table to each peer's hint
-    /// ([`Endpoint::announce`]) and dials every established peer ([`Hints::announce`]).
-    pub(super) fn announcer(
-        &self,
-    ) -> impl Fn(&crate::table::store::Appended<'_>) + Send + Sync + 'static {
-        self.announced.listener(self.doorbell.clone())
-    }
-
-    /// Take what rang the doorbell, before the tick that reads what it announced.
+    /// Take what rang the doorbell, before the turn that reads what rang it.
     pub(super) fn clear_doorbell(&self) {
         if let Some(bell) = &self.doorbell {
             bell.clear();
@@ -966,14 +1047,13 @@ impl Transport {
     }
 
     /// What the serving loop waits on between ticks besides its stop and the clock
-    /// ([`Self::next_due`]): the doorbell, which each round's end, each push and each local
-    /// append rings ([`Self::announcer`]); and each
-    /// link's listener while its incoming rounds leave room for one more, as [`Self::turn`]
-    /// accepts only then (a connection it cannot take yet waits for a round's end, which rings).
-    /// No multicast socket is among them: a beacon wakes nothing, and waits in its socket for
-    /// the next hearing turn ([`Self::turn`]), the loop's polled round (`super::POLL`) at the
-    /// latest. `None` without a doorbell: nothing would wake the loop for a round's end, so it
-    /// keeps its tick.
+    /// ([`Self::next_due`]): the doorbell, which each round's end, each push and each change the
+    /// watch on what moved here hears rings ([`Self::watching`]); and each link's listener while
+    /// its incoming rounds leave room for one more, as [`Self::turn`] accepts only then (a
+    /// connection it cannot take yet waits for a round's end, which rings). No multicast socket
+    /// is among them: a beacon wakes nothing, and waits in its socket for the next hearing turn
+    /// ([`Self::turn`]), the loop's polled round (`super::POLL`) at the latest. `None` without a
+    /// doorbell: nothing would wake the loop for a round's end, so it keeps its tick.
     pub(super) fn waits_on(&self) -> Option<Vec<BorrowedFd<'_>>> {
         let bell = self.doorbell.as_ref()?;
         let accepts = self.endpoint.is_some()
@@ -989,11 +1069,12 @@ impl Transport {
 
     /// When [`Self::turn`] next has work by the clock alone, as `now` reads it: its links' next
     /// beacon, its token's rotation, and its next dial ([`dial_due`]). A connection, a round's
-    /// end, a push and a local append come without the clock and wake the loop through
-    /// [`Self::waits_on`]. Its seats' read ([`SEATS`]), the beacons its peers sent, the expiry
-    /// of endpoints and presence heard ([`Hints::expire_presence`]) and the remembered
-    /// endpoints' refresh, which nothing waits for, ride on the owner's polled round
-    /// (`super::POLL`, the same two seconds as [`SEATS`]), so each comes at most that much late.
+    /// end, a push and a change the watch on what moved here hears come without the clock and
+    /// wake the loop through [`Self::waits_on`]. Its seats' read ([`SEATS`]), the beacons its
+    /// peers sent, the expiry of endpoints and presence heard ([`Hints::expire_presence`]) and
+    /// the remembered endpoints' refresh, which nothing waits for, ride on the owner's polled
+    /// round (`super::POLL`, the same two seconds as [`SEATS`]), so each comes at most that much
+    /// late; so does the look at what moved here that no watch told ([`Self::look_soon`]).
     pub(super) fn next_due(&self, now: Instant) -> Instant {
         let mut due = self.rotate;
         if !self.links.is_empty() {
@@ -1011,6 +1092,22 @@ impl Transport {
             }
         }
         due
+    }
+
+    /// Look at what moved here, if a look is due ([`Moves::take`]), and tell the dial scheduler
+    /// ([`Hints::moved`]). A turn looks after it joined the rounds that ended and before it
+    /// accepts or dials one, so every round that begins at `now` or later began after the look
+    /// read: such a round, and no earlier one, may settle a seat for what this look found
+    /// ([`Hints::settle`]). A look that found anything moved counts once
+    /// ([`census::Event::Announce`]), however much it found.
+    fn look(&mut self, now: Instant) {
+        let moved = self.moves.take();
+        if !moved.is_empty() {
+            census::count(Event::Announce);
+        }
+        for (subject, sources) in moved {
+            self.hints.moved(subject, sources, now);
+        }
     }
 
     /// Read the seats' advertised builds from the fleet book in `state`
@@ -1042,7 +1139,7 @@ impl Transport {
             let speaks = self.bus.lock().unwrap_or_else(|p| p.into_inner()).clone();
             self.hints.bus_speakers(match (speaks, &self.endpoint) {
                 (Some(speaks), Some(endpoint)) => endpoint.bus_actors(&*speaks),
-                _ => std::collections::BTreeSet::new(),
+                _ => BTreeSet::new(),
             });
             // This reads a local cache only: Commons never polls the fleet for versions.
             // Isolated attachments and unit tests must not consult the live lab.
@@ -1075,19 +1172,13 @@ impl Transport {
                 index += 1;
             }
         }
-        if let Some((tables, unnamed)) = self.announced.take() {
-            census::count(Event::Announce);
-            if let Some(endpoint) = &self.endpoint {
-                endpoint.announce(&tables, unnamed);
-            }
-            self.hints.announce(now);
-        }
         if let Some(memory) = &self.memory
             && let Some(now_ms) = aterm_time::unix_millis()
             && let Some(remembered) = self.hints.remembered(now, now_ms)
         {
             memory.write(&remembered);
         }
+        self.look(now);
         let mut index = 0;
         let mut after_accept = None;
         while index < self.links.len() {

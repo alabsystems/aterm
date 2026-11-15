@@ -944,7 +944,7 @@ fn a_stamp_ahead_of_the_clock_is_read_as_made_no_later_than_now_plus_the_skew() 
         ..sample(5, 20)
     });
     main.offer = Some(Offer {
-        kind: Some(aterm_phase::ResetKind::Full),
+        kind: Some(alab_policy::vocab::ResetKind::Full),
         left: 1,
         use_by: Some(ahead + DAY),
         at: ahead,
@@ -4232,7 +4232,7 @@ fn samples_offers_auth_and_sessions_are_recorded_newest_first() {
             .map(|o| (o.left, o.use_by)),
         Some((1, None))
     );
-    let weekly = Some(aterm_phase::ResetKind::Weekly);
+    let weekly = Some(alab_policy::vocab::ResetKind::Weekly);
     assert!(note_offer(
         &mut s,
         "main",
@@ -4653,7 +4653,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
 
     let mut told = claimed.clone();
     let used = ResetDone::Used {
-        kind: aterm_phase::ResetKind::Weekly,
+        kind: alab_policy::vocab::ResetKind::Weekly,
         left: Some(1),
     };
     for (account, wall, sid) in [
@@ -4717,7 +4717,7 @@ fn a_wall_is_claimed_for_a_reset_once_and_the_claim_stays_as_its_record() {
 
 #[test]
 fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
-    use aterm_phase::ResetKind;
+    use alab_policy::vocab::ResetKind;
     let r = three();
     let enrolled = all(&r);
     let written = NOW - HOUR;
@@ -4776,26 +4776,32 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
         kind,
         left: Some(left),
     };
-    for (done, kind, why) in [
+    // What each outcome refilled: the claim's window, both windows for a full reset, and nothing
+    // for a limit that lifted by itself.
+    for (done, kind, why, refilled) in [
         (
             used(ResetKind::Weekly, 1),
             Kind::ResetUsed,
             "1 weekly reset left",
+            &[WEEK_LIMIT][..],
         ),
         (
             used(ResetKind::Session, 0),
             Kind::ResetUsed,
             "no five-hour resets left",
+            &[WEEK_LIMIT][..],
         ),
         (
             used(ResetKind::Full, 2),
             Kind::ResetUsed,
             "2 full resets left",
+            &[WEEK_LIMIT, SESSION_LIMIT][..],
         ),
-        (ResetDone::Lifted, Kind::ResetKept, "lifted"),
+        (ResetDone::Lifted, Kind::ResetKept, "lifted", &[][..]),
     ] {
         let mut s = walled.clone();
         let rows = reset_outcome(&mut s, "main", until, "s-one", &done, NOW);
+        assert_eq!(rows[0].refilled, refilled, "{done:?}: what it refilled");
         assert_eq!(
             rows.iter()
                 .map(|e| (
@@ -4894,7 +4900,7 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
 
     let mut unscoped = walled.clone();
     unscoped.reset.as_mut().expect("claim").window = None;
-    reset_outcome(
+    let rows = reset_outcome(
         &mut unscoped,
         "main",
         until,
@@ -4909,6 +4915,11 @@ fn a_reset_used_or_a_limit_lifted_clears_only_its_claimed_window() {
     assert_eq!(
         unscoped.reset.as_ref().and_then(|c| c.done.as_deref()),
         Some("used")
+    );
+    assert_eq!(
+        rows[0].refilled,
+        [SESSION_LIMIT, WEEK_LIMIT],
+        "a full reset refills both windows, its claim naming none"
     );
 
     for (new_until, observed) in [(until + DAY, NOW - 1), (until, until + RESET_GRACE_S + 1)] {
@@ -5082,7 +5093,9 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
         let event = Event::new(NOW, kind, "main")
             .with_to("work-2")
             .with_sid("s-1a2b")
+            .refilling([SESSION_LIMIT, WEEK_LIMIT, SESSION_LIMIT])
             .because("five_hour until 1790003600");
+        assert_eq!(event.refilled, [SESSION_LIMIT, WEEK_LIMIT], "once each");
         let line = event.to_json_line();
         assert!(!line.contains('\n'), "{line}");
         assert_eq!(Event::of_json_line(&line), Some(event), "{}", kind.as_str());
@@ -5155,12 +5168,18 @@ fn a_ledger_row_round_trips_as_one_bounded_line() {
         pk: None,
         workflow: None,
         step: None,
+        refilled: (0..9).map(|n| format!("{n}{long}")).collect(),
     };
     let line = hostile.to_json_line();
     assert!(!line.contains(['\n', '\r', '\u{2028}']));
     assert!(line.len() < MAX_EVENT_LINE_BYTES, "{}", line.len());
     let back = Event::of_json_line(&line).expect("still a row");
     assert!(back.account.len() <= LABEL_MAX && back.why.len() <= LEDGER_WHY_MAX);
+    assert!(
+        back.refilled.len() <= REFILLED_MAX && back.refilled.iter().all(|w| w.len() <= WORD_MAX),
+        "{:?}",
+        back.refilled
+    );
     assert!(back.to.is_some_and(|t| t.len() <= LABEL_MAX));
     assert!(back.sid.is_some_and(|s| s.len() <= WORD_MAX));
     assert!(back.why.starts_with("failed: é"), "{}", back.why);
@@ -7774,7 +7793,7 @@ fn the_week_nearly_used_with_credits_off_is_a_line_and_nothing_else_is() {
 /// their reasons are the ones without any offer.
 #[test]
 fn windows_full_carries_a_standing_offer_of_the_week_and_no_other() {
-    use aterm_phase::ResetKind;
+    use alab_policy::vocab::ResetKind;
     let r = own_row();
     let reset = NOW + 3 * DAY;
     let full = |credits: Credits, offer: Option<(Option<ResetKind>, u32, Option<i64>)>| {
@@ -7943,7 +7962,7 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
     };
     for done in [
         ResetDone::Used {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             left: Some(1),
         },
         ResetDone::Lifted,
@@ -8038,7 +8057,7 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
             until,
             "s-1",
             &ResetDone::Used {
-                kind: aterm_phase::ResetKind::Full,
+                kind: alab_policy::vocab::ResetKind::Full,
                 left: None,
             },
             NOW + 40,
@@ -8092,7 +8111,7 @@ fn a_limit_reset_refills_the_walled_window_and_no_other() {
             until,
             "s-1",
             &ResetDone::Used {
-                kind: aterm_phase::ResetKind::Full,
+                kind: alab_policy::vocab::ResetKind::Full,
                 left: None,
             },
             NOW + 40,
@@ -8128,7 +8147,7 @@ fn a_warning_drawn_before_a_reset_says_nothing_after_it() {
                 week_end,
                 "s-a",
                 &ResetDone::Used {
-                    kind: aterm_phase::ResetKind::Weekly,
+                    kind: alab_policy::vocab::ResetKind::Weekly,
                     left: None,
                 },
                 NOW + 10,
@@ -8296,7 +8315,7 @@ fn the_lines_week_is_the_warnings_word_never_a_samples() {
             week_end,
             "s-1",
             &ResetDone::Used {
-                kind: aterm_phase::ResetKind::Weekly,
+                kind: alab_policy::vocab::ResetKind::Weekly,
                 left: None,
             },
             NOW + 11 * MIN,
@@ -8516,6 +8535,35 @@ fn a_reset_used_inside_a_window_opens_an_epoch_and_the_refill_stands() {
             .starts_with("five_hour refilled inside its window"),
         "{}",
         events[0].why
+    );
+    assert_eq!(
+        events[0].refilled,
+        [SESSION_LIMIT],
+        "the window it refilled"
+    );
+    // Read late, the row is dated by the figures that show the refill, as the window's epoch is:
+    // a reading made at that instant is of the refilled window, never cut by its own refill.
+    let mut late = state();
+    note_reading(
+        &mut late,
+        "main",
+        &five(win(1000, reset, None), NOW, true),
+        NOW,
+    );
+    let refill = note_reading(
+        &mut late,
+        "main",
+        &five(win(50, reset, Some(1000)), NOW + MIN, true),
+        NOW + 2 * MIN,
+    );
+    assert_eq!(
+        (refill[0].kind, refill[0].t),
+        (Kind::Reset, NOW + MIN),
+        "{refill:?}"
+    );
+    assert_eq!(
+        late.accounts["main"].windows[SESSION_LIMIT].epoch_at,
+        Some(NOW + MIN)
     );
     assert_eq!(
         s.accounts["main"]
@@ -9167,7 +9215,7 @@ fn a_reset_used_cuts_the_walled_windows_tap_figure() {
         s.accounts["main"].windows[WEEK_LIMIT].clone()
     };
     let used = run(&ResetDone::Used {
-        kind: aterm_phase::ResetKind::Weekly,
+        kind: alab_policy::vocab::ResetKind::Weekly,
         left: Some(0),
     });
     assert_eq!(used.epoch_at, Some(NOW + 2 * MIN));
@@ -9998,8 +10046,15 @@ fn a_workers_starter_is_the_account_its_login_file_names() {
         }),
     };
     let moved = |s: &State, seen: Option<&str>| {
-        claude_worker_move(&r, s, &enrolled, &plain(seen), Mode::Wall, NOW)
-            .map(|(from, to)| (from.label.as_str(), to.label.as_str()))
+        claude_worker_move(
+            &r,
+            s,
+            &enrolled,
+            &plain(seen),
+            (Mode::Wall, NOW),
+            &mut |_| true,
+        )
+        .map(|(from, to)| (from.label.as_str(), to.label.as_str()))
     };
     let mut main_walled = on_main();
     limited(&mut main_walled, "main", NOW + 3 * HOUR);
@@ -11140,7 +11195,7 @@ fn weeks_said_holds_a_limit_reset_on_its_week_over_the_reads_before_it() {
     };
     assert_eq!(
         walled(&ResetDone::Used {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             left: Some(0),
         }),
         (false, (None, None, NOW - 20 * MIN)),
@@ -11285,4 +11340,540 @@ fn weeks_said_loads_only_the_weeks_a_screen_names() {
             .collect::<Vec<_>>(),
         [FABLE, "seven_day_sonnet"]
     );
+}
+
+/// The upkeep's reading of the vault at `read_at`, naming `label`'s token as in use on this Mac
+/// until `end` ([`TokensHere`]).
+fn token_read(state: &mut State, label: &str, read_at: i64, end: i64) {
+    state.tokens_here = Some(TokensHere {
+        read_at,
+        ends: [(label.to_owned(), end)].into(),
+    });
+}
+
+/// A stand-in for what the one token judgment asks of a launch onto `label`'s stored login, whose
+/// token's standing here is `fact` ([`crate::harness::token_route::judge`]).
+struct LaunchOnto {
+    label: String,
+    fact: crate::harness::token_route::TokenFact,
+}
+
+impl crate::harness::token_route::Ask for LaunchOnto {
+    fn account(
+        &self,
+    ) -> Result<(crate::harness::token_route::Account, Option<TokenEntry>), String> {
+        Ok((
+            crate::harness::token_route::Account {
+                label: Some(self.label.clone()),
+                email: format!("{}@example.com", self.label),
+            },
+            TokenEntry::parse("aterm-claude-token-ac-00000000000000b2"),
+        ))
+    }
+    fn claims(
+        &self,
+        _account: &crate::harness::token_route::Account,
+    ) -> Option<crate::harness::token_route::Fallback> {
+        None
+    }
+    fn token(
+        &self,
+        _entry: TokenEntry,
+        _account: &crate::harness::token_route::Account,
+    ) -> crate::harness::token_route::TokenFact {
+        self.fact
+    }
+}
+
+/// The one judgment of an interactive launch of a store build onto `row`, its token's standing
+/// here being `fact`.
+fn launch_judged(
+    row: &Row,
+    fact: crate::harness::token_route::TokenFact,
+) -> crate::harness::token_route::Decision {
+    let argv = vec!["claude".to_owned()];
+    crate::harness::token_route::judge(
+        &crate::harness::token_route::Facts {
+            macos: true,
+            no_harness: false,
+            argv: &argv,
+            store_build: true,
+        },
+        &LaunchOnto {
+            label: row.label.clone(),
+            fact,
+        },
+    )
+}
+
+/// THE OWNER'S SWITCHING ON A YEAR TOKEN: a row whose stored login is signed out here while its
+/// vault token is in use here (the upkeep's fresh reading names it) runs, so rotation picks it,
+/// the report says it is on its token rather than signed out, and its launch starts on the token.
+/// Its walls still stand. NEGATIVE CONTROLS: the same row with no reading, a reading over an hour
+/// old, a reading of another row, or its token already ended stays `WhyNot::SignedOut`, and no
+/// launch picks it.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_signed_out_row_whose_vault_token_is_in_use_here_is_picked_by_rotation_and_starts_on_its_token()
+{
+    use crate::harness::token_route::{Decision, TokenFact};
+    let r = three();
+    let enrolled = all(&r);
+    let mut s = on_main();
+    limited(&mut s, "main", NOW + HOUR);
+    limited(&mut s, "work-2", NOW + HOUR);
+    note_auth(&mut s, "pool-a", Auth::SignedOut, NOW - DAY);
+    let pool = r.row("pool-a").expect("pool-a");
+    let logins = Logins::default();
+
+    // Controls: nothing puts the signed-out row in rotation.
+    let mut stale = s.clone();
+    token_read(&mut stale, "pool-a", NOW - HOUR - 1, NOW + DAY);
+    let mut ended = s.clone();
+    token_read(&mut ended, "pool-a", NOW - MIN, NOW);
+    let mut other = s.clone();
+    token_read(&mut other, "work-2", NOW - MIN, NOW + DAY);
+    for (why, control) in [
+        ("no reading", &s),
+        ("a reading over an hour old", &stale),
+        ("its token ended", &ended),
+        ("a reading of another row", &other),
+    ] {
+        assert_eq!(
+            why_not(&r, control, &enrolled, &wall(), "pool-a"),
+            WhyNot::SignedOut,
+            "CONTROL ({why})"
+        );
+        assert_eq!(
+            login_here(pool, control, true, NOW),
+            LoginHere::SignedOut,
+            "{why}"
+        );
+        assert_eq!(
+            login_state(pool, &logins, control, NOW),
+            LoginState::Expired
+        );
+        assert_eq!(launch_row(&r, control, &enrolled, NOW), None, "{why}");
+    }
+
+    // The upkeep read its token in use here a minute ago, to last a year.
+    let mut on_token = s.clone();
+    token_read(&mut on_token, "pool-a", NOW - MIN, NOW + 365 * DAY);
+    assert_eq!(login_here(pool, &on_token, true, NOW), LoginHere::OnToken);
+    assert!(login_here(pool, &on_token, true, NOW).signed_in());
+    assert_eq!(
+        login_state(pool, &logins, &on_token, NOW),
+        LoginState::OnToken {
+            until: NOW + 365 * DAY
+        }
+    );
+    assert_eq!(
+        login_state(pool, &logins, &on_token, NOW).as_str(),
+        LoginHere::ON_TOKEN
+    );
+    assert_eq!(cond(&r, &on_token, "pool-a", NOW), Condition::Usable);
+    assert!(
+        candidates(&r, &on_token, &enrolled, Some("main"), &wall(), NOW)
+            .iter()
+            .any(|(label, verdict)| label == "pool-a" && verdict.is_ok()),
+        "rotation picks it"
+    );
+    let picked = launch_row(&r, &on_token, &enrolled, NOW).map(|row| row.label.as_str());
+    assert_eq!(picked, Some("pool-a"));
+    // The launch-time guard asks the one judgment once, which starts it on its token.
+    let mut asked = 0;
+    let started = token_guarded(
+        &r,
+        &on_token,
+        &enrolled,
+        NOW,
+        &mut |row| {
+            asked += 1;
+            matches!(launch_judged(row, TokenFact::InUse), Decision::Token { .. })
+        },
+        None,
+        |state| launch_row(&r, state, &enrolled, NOW),
+    )
+    .expect("a row starts");
+    assert_eq!(started.label, "pool-a");
+    assert_eq!(
+        asked, 1,
+        "one judgment of the row only its token puts in rotation"
+    );
+    assert!(matches!(
+        launch_judged(started, TokenFact::InUse),
+        Decision::Token { ref account, .. } if account.named() == "pool-a"
+    ));
+    // A pool of that row alone still has a working login while its token lasts.
+    let alone = Roster {
+        rows: vec![Row {
+            email: Some("pool-a@example.com".to_owned()),
+            ..pool.clone()
+        }],
+    };
+    assert!(
+        none_working_within(&alone, &logins, &s, &enrolled, NOW, DAY),
+        "CONTROL: signed out, nothing works"
+    );
+    assert!(!none_working_within(
+        &alone, &logins, &on_token, &enrolled, NOW, DAY
+    ));
+
+    // A wall on it stands as on any row.
+    let mut walled = on_token.clone();
+    limited(&mut walled, "pool-a", NOW + 2 * HOUR);
+    assert_eq!(
+        why_not(&r, &walled, &enrolled, &wall(), "pool-a"),
+        WhyNot::Limited {
+            until: NOW + 2 * HOUR
+        }
+    );
+}
+
+/// THE LAUNCH-TIME GUARD: where the upkeep's reading put a signed-out row in rotation but the one
+/// judgment at launch would fall back to its stored login (its token ended since, was refused, or
+/// the vault cannot say), the pick is refused as signed out and the next candidate is taken, at
+/// the cost of that one judgment. A row signed in here is never judged. NEGATIVE CONTROL: where the
+/// judgment serves the token, the row is taken.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn the_launch_guard_refuses_a_row_whose_launch_would_fall_back_to_its_lapsed_stored_login() {
+    use crate::harness::token_route::{Decision, TokenFact};
+    let r = roster(&[
+        ("main", Class::Preferred, None),
+        ("tok", Class::Preferred, Some(at!("/logins/tok"))),
+        ("spare", Class::Pool, Some(at!("/logins/spare"))),
+    ]);
+    let enrolled = all(&r);
+    let mut s = on_main();
+    limited(&mut s, "main", NOW + HOUR);
+    note_auth(&mut s, "tok", Auth::SignedOut, NOW - DAY);
+    token_read(&mut s, "tok", NOW - MIN, NOW + 365 * DAY);
+    assert_eq!(
+        launch_row(&r, &s, &enrolled, NOW).map(|row| row.label.as_str()),
+        Some("tok"),
+        "the reading puts it first"
+    );
+    for fact in [
+        TokenFact::Ended,
+        TokenFact::Rejected,
+        TokenFact::Busy,
+        TokenFact::Absent,
+    ] {
+        let mut judged = Vec::new();
+        let started = token_guarded(
+            &r,
+            &s,
+            &enrolled,
+            NOW,
+            &mut |row| {
+                judged.push(row.label.clone());
+                let decision = launch_judged(row, fact);
+                assert!(
+                    matches!(decision, Decision::Stored(_)),
+                    "the launch falls back to the stored login: {decision:?}"
+                );
+                matches!(decision, Decision::Token { .. })
+            },
+            None,
+            |state| launch_row(&r, state, &enrolled, NOW),
+        );
+        assert_eq!(
+            started.map(|row| row.label.as_str()),
+            Some("spare"),
+            "{fact:?}: the next candidate starts"
+        );
+        assert_eq!(judged, ["tok"], "{fact:?}: one judgment, of that row alone");
+    }
+    // The refused copy reads it signed out, as a pick says.
+    let mut refused = s.clone();
+    refused.refuse_token("tok");
+    assert_eq!(
+        why_not(&r, &refused, &enrolled, &wall(), "tok"),
+        WhyNot::SignedOut
+    );
+    assert!(
+        s.tokens_here
+            .as_ref()
+            .is_some_and(|read| read.ends.contains_key("tok")),
+        "the refusal touches only the selection's copy"
+    );
+    // CONTROL: the judgment serves its token, so it starts.
+    let started = token_guarded(
+        &r,
+        &s,
+        &enrolled,
+        NOW,
+        &mut |row| matches!(launch_judged(row, TokenFact::InUse), Decision::Token { .. }),
+        None,
+        |state| launch_row(&r, state, &enrolled, NOW),
+    );
+    assert_eq!(started.map(|row| row.label.as_str()), Some("tok"));
+    // Every candidate refused leaves no row, never a dead login.
+    let mut lone = s.clone();
+    limited(&mut lone, "spare", NOW + HOUR);
+    assert_eq!(
+        token_guarded(&r, &lone, &enrolled, NOW, &mut |_| false, None, |state| {
+            launch_row(&r, state, &enrolled, NOW)
+        },),
+        None
+    );
+}
+
+/// A WORKER LEAVES A STARTER'S ROW ONLY ITS TOKEN KEEPS RUNNING WHERE THE TOKEN WOULD NOT SERVE
+/// IT: the starter's tab is on `main`, whose stored login is signed out, and the upkeep's reading
+/// names its token in use here, so `main` still runs and the host keeps the worker there. The
+/// launch-time guard asks the token judgment of `main` once; where it would not serve (the vault
+/// reads busy, or this is no Mac), the worker moves where the host moves a signed-out tab
+/// (`work-2`) instead of starting on `main`'s lapsed stored login, and a survey says the same row
+/// a launch would start on ([`super::super::accounts_pool::unstarted_launch_row`]). NEGATIVE
+/// CONTROL: where the judgment serves the token, the worker stays on `main` and runs on it; with
+/// no reading `main` reads signed out and moves the worker with no judgment asked. Before the
+/// guard asked of the starter's row, the worker stayed on `main` whatever the judgment said.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_worker_leaves_a_starters_row_only_its_token_runs_where_the_token_would_not_serve() {
+    use crate::harness::observe::Login;
+    let r = three();
+    let enrolled = all(&r);
+    let plain = Login::claude(&[], None, &r);
+    assert_eq!(
+        plain.reconciled(&r).row().map(|row| row.label.as_str()),
+        Some("main")
+    );
+    let mut s = on_main();
+    note_auth(&mut s, "main", Auth::SignedOut, NOW - DAY);
+    let mut on_token = s.clone();
+    token_read(&mut on_token, "main", NOW - MIN, NOW + 365 * DAY);
+    let main = r.row("main").expect("main");
+    assert_eq!(login_here(main, &on_token, true, NOW), LoginHere::OnToken);
+    let worker = |state: &State, serves: bool| {
+        let mut asked = Vec::new();
+        let moved = claude_worker_move(
+            &r,
+            state,
+            &enrolled,
+            &plain,
+            (Mode::Wall, NOW),
+            &mut |row| {
+                asked.push(row.label.clone());
+                serves
+            },
+        )
+        .map(|(from, to)| (from.label.clone(), to.label.clone()));
+        let surveyed = super::super::accounts_pool::unstarted_launch_row(
+            (Cli::Claude, false, Mode::Wall),
+            &r,
+            state,
+            &enrolled,
+            (None, None),
+            NOW,
+            &mut |_| serves,
+        )
+        .map(|row| row.label.clone());
+        (moved, asked, surveyed)
+    };
+    let (moved, asked, surveyed) = worker(&on_token, false);
+    assert_eq!(
+        moved,
+        Some(("main".to_owned(), "work-2".to_owned())),
+        "the token would not serve `main`: the worker leaves it"
+    );
+    assert_eq!(asked, ["main"], "one judgment, of the starter's row");
+    assert_eq!(
+        surveyed.as_deref(),
+        Some("work-2"),
+        "the survey says the row the launch starts on"
+    );
+    let (moved, asked, surveyed) = worker(&on_token, true);
+    assert_eq!(moved, None, "CONTROL: its token serves it, so it stays");
+    assert_eq!(asked, ["main"]);
+    assert_eq!(surveyed.as_deref(), Some("main"));
+    let (moved, asked, surveyed) = worker(&s, true);
+    assert_eq!(
+        moved,
+        Some(("main".to_owned(), "work-2".to_owned())),
+        "CONTROL: signed out with no reading, it moves"
+    );
+    assert!(asked.is_empty(), "with no judgment asked");
+    assert_eq!(surveyed.as_deref(), Some("work-2"));
+}
+
+/// A SURVEY SAYS THE ROW THE GUARDED LAUNCH STARTS ON: where the reading puts a signed-out row
+/// first but the token judgment would not serve it (a reading kept across a vault this Mac could
+/// not read, say), a launch refuses it and the survey's `launch=` names the row the launch takes
+/// instead, never the refused one a placement would weigh. NEGATIVE CONTROL: where the judgment
+/// serves it, both name it. Before the survey asked the guard, it named the refused row.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_survey_says_the_row_the_guarded_launch_starts_on() {
+    use crate::harness::observe::Login;
+    let r = roster(&[
+        ("main", Class::Preferred, None),
+        ("tok", Class::Preferred, Some(at!("/logins/tok"))),
+        ("spare", Class::Pool, Some(at!("/logins/spare"))),
+    ]);
+    let enrolled = all(&r);
+    let plain = Login::claude(&[], None, &r);
+    let mut s = on_main();
+    limited(&mut s, "main", NOW + HOUR);
+    note_auth(&mut s, "tok", Auth::SignedOut, NOW - DAY);
+    token_read(&mut s, "tok", NOW - MIN, NOW + 365 * DAY);
+    for (serves, row) in [(false, "spare"), (true, "tok")] {
+        let launched =
+            claude_worker_move(&r, &s, &enrolled, &plain, (Mode::Wall, NOW), &mut |_| {
+                serves
+            })
+            .map(|(_, to)| to.label.clone());
+        let surveyed = super::super::accounts_pool::unstarted_launch_row(
+            (Cli::Claude, false, Mode::Wall),
+            &r,
+            &s,
+            &enrolled,
+            (None, None),
+            NOW,
+            &mut |_| serves,
+        )
+        .map(|row| row.label.clone());
+        assert_eq!(launched.as_deref(), Some(row), "serves: {serves}");
+        assert_eq!(surveyed, launched, "serves: {serves}");
+    }
+}
+
+/// THE READING TAKES THE JUDGMENT'S PLATFORM STEP: a launch starts on a vault token only on macOS
+/// ([`super::super::token_route::LAUNCHES_ON_TOKEN`], `Fallback::Platform`), so where none does a
+/// fresh reading naming a signed-out row puts nothing on its token: no `on-token` login, no row
+/// rotation counts, no working login a warning would count. NEGATIVE CONTROL: the same reading on
+/// a host whose launches start on a token names the row.
+#[test]
+fn the_reading_of_the_rows_on_their_token_takes_the_judgments_platform_step() {
+    assert_eq!(
+        super::super::token_route::LAUNCHES_ON_TOKEN,
+        cfg!(target_os = "macos")
+    );
+    let r = three();
+    let mut s = on_main();
+    note_auth(&mut s, "pool-a", Auth::SignedOut, NOW - DAY);
+    token_read(&mut s, "pool-a", NOW - MIN, NOW + 365 * DAY);
+    let pool = r.row("pool-a").expect("pool-a");
+    assert_eq!(
+        on_token_where(false, pool, &s, NOW),
+        None,
+        "no launch starts on it"
+    );
+    assert_eq!(
+        on_token_where(true, pool, &s, NOW),
+        Some(NOW + 365 * DAY),
+        "CONTROL: a host whose launches start on a token"
+    );
+}
+
+/// THE DIGEST'S DUE LINE FOLLOWS THE RENEWAL-OFF RULE FOR A ROW ON ITS TOKEN: a login this Mac
+/// used whose sign-out is on record reads due on the records, and the window's digest named it
+/// "due for renewal" although the upkeep never renews a row on its vault token and the report says
+/// `on-token`. With the reading naming it, [`due_logins_here`] leaves it out. NEGATIVE CONTROL:
+/// with no reading it is due.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn the_due_line_leaves_out_a_row_on_its_vault_token() {
+    let mut r = three();
+    for row in &mut r.rows {
+        row.email = Some(format!("{}@example.com", row.label));
+    }
+    let enrolled = all(&r);
+    let logins = Logins::default();
+    let mut s = on_main();
+    let _ = note_session(&mut s, "s-1", "pool-a", None, NOW - HOUR);
+    note_auth(&mut s, "pool-a", Auth::SignedOut, NOW - MIN);
+    assert_eq!(
+        due_logins_here(&r, &logins, &s, &enrolled, NOW),
+        ["pool-a"],
+        "CONTROL: signed out on record and used here, with no reading"
+    );
+    let mut on_token = s.clone();
+    token_read(&mut on_token, "pool-a", NOW - MIN, NOW + 365 * DAY);
+    assert_eq!(
+        login_state(r.row("pool-a").unwrap(), &logins, &on_token, NOW).as_str(),
+        LoginHere::ON_TOKEN
+    );
+    assert!(due_logins_here(&r, &logins, &on_token, &enrolled, NOW).is_empty());
+}
+
+/// THE UPKEEP'S READING IS KEPT ACROSS AN UNREAD VAULT: a reading that names rows is kept in the
+/// store and read back by a judged load, with no vault read; a vault that could not be read keeps
+/// the reading before it (never clears it); a reading that names no row removes it; it is Claude
+/// Code's store's alone. NEGATIVE CONTROL: an empty reading does clear it, so the kept file is what
+/// the Unknown read left standing.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn an_unknown_vault_read_keeps_the_previous_reading_of_the_rows_on_their_token() {
+    let dir = tmp("tokens-here");
+    let store = Store::at(dir.path());
+    let r = three();
+    let read: std::collections::BTreeMap<String, u64> =
+        [("pool-a".to_owned(), u64::try_from(NOW + DAY).unwrap())].into();
+    assert_eq!(store.read_tokens_here(), None, "nothing kept yet");
+    assert!(
+        !store.note_tokens_here(None, NOW).unwrap(),
+        "unknown, nothing kept"
+    );
+    assert_eq!(store.read_tokens_here(), None);
+
+    assert!(store.note_tokens_here(Some(&read), NOW).unwrap());
+    let kept = TokensHere {
+        read_at: NOW,
+        ends: [("pool-a".to_owned(), NOW + DAY)].into(),
+    };
+    assert_eq!(store.read_tokens_here(), Some(kept.clone()));
+
+    // The vault could not be read a pass later: the reading before it stands.
+    assert!(!store.note_tokens_here(None, NOW + MIN).unwrap());
+    assert_eq!(
+        store.read_tokens_here(),
+        Some(kept.clone()),
+        "kept, not cleared"
+    );
+
+    // A judged state carries it, read from the file alone.
+    let mut state = State::default();
+    store.hydrate_lapsed(&mut state, &r);
+    assert_eq!(state.tokens_here, Some(kept));
+    let pool = r.row("pool-a").expect("pool-a");
+    assert_eq!(on_token_here(pool, &state, NOW + MIN), Some(NOW + DAY));
+    assert_eq!(
+        on_token_here(pool, &state, NOW + HOUR + 1),
+        None,
+        "over an hour old, it says nothing"
+    );
+
+    // Another CLI's store keeps none.
+    let codex = Store::at_for(dir.path(), Cli::Codex, dir.path());
+    assert!(!codex.note_tokens_here(Some(&read), NOW).unwrap());
+    assert_eq!(codex.read_tokens_here(), None);
+
+    // CONTROL: a reading that names no row removes it.
+    assert!(
+        store
+            .note_tokens_here(Some(&std::collections::BTreeMap::new()), NOW + MIN)
+            .unwrap()
+    );
+    assert_eq!(store.read_tokens_here(), None);
 }

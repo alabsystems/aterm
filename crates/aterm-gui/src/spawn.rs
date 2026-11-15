@@ -772,9 +772,11 @@ pub(crate) fn adopted_handoff_commit(
     rekey_deferred.filter(|_| adopted && !recovered).cloned()
 }
 
-/// Whether `s` is a session id as [`SessionId::generate`] makes one: `s-` + 20 lower-case hex.
+/// Whether `s` is a minted tab ID in either form ([`aterm_session::is_minted_sid`]): `t` and 10
+/// base32 characters, which [`crate::tab_ids::mint`] makes, or the `s-` and 20 lower-case hex
+/// digits a tab opened before that form keeps.
 pub(crate) fn is_valid_session_id(s: &str) -> bool {
-    s.len() == 22 && aterm_types::control_request::Sid::parse(s).is_some()
+    aterm_session::is_minted_sid(s)
 }
 
 /// Parse an injected root identity from the recursion env values.
@@ -875,7 +877,7 @@ pub(crate) fn provision_observe_env(origin_sid: &SessionId) -> Vec<(String, Stri
 pub(crate) fn provision_child_recursion_env() -> (Vec<(String, String)>, ChildProvision) {
     use aterm_types::domain::{ENV_LAUNCH_NONCE, ENV_SESSION_ID};
     let prov = ChildProvision {
-        child_sid: SessionId::generate(),
+        child_sid: crate::tab_ids::mint(),
         child_nonce: LaunchNonce::generate(),
         read: EdgeToken::generate(),
         write: EdgeToken::generate(),
@@ -1500,6 +1502,7 @@ pub(crate) fn spawn_session(
     cwd_override: Option<&str>,
     observe: Option<&SessionId>,
     task: Option<&crate::task_launch::TaskSeed>,
+    kept: Option<SessionId>,
     mut adopt: Option<Adopted>,
 ) -> std::io::Result<Session> {
     let spare = factory.spare.as_ref();
@@ -1621,16 +1624,24 @@ pub(crate) fn spawn_session(
         env_add.push(pair);
     }
 
+    // The tab's ID: the adopted shell's; a parent's injected one (session 0 only); the one a
+    // cold restore kept for the leaf ([`crate::tab_ids::keep`], already claimed); else a new one.
     let (self_id, self_nonce, premint) = match &adopt {
         Some(a) => {
             crate::identity_claim::hold_transferred(&a.sid);
+            crate::tab_ids::note_here(&a.sid);
             (a.sid.clone(), a.nonce, false)
         }
-        None if id == 0 => adopt_injected_identity().map_or_else(
-            || (SessionId::generate(), LaunchNonce::generate(), false),
-            |(sid, nonce)| (sid, nonce, true),
-        ),
-        None => (SessionId::generate(), LaunchNonce::generate(), false),
+        None => match (id == 0).then(adopt_injected_identity).flatten() {
+            Some((sid, nonce)) => {
+                crate::tab_ids::note_here(&sid);
+                (sid, nonce, true)
+            }
+            None => match kept {
+                Some(sid) => (sid, LaunchNonce::generate(), true),
+                None => (crate::tab_ids::mint(), LaunchNonce::generate(), false),
+            },
+        },
     };
     let lost_nonce = adopt.is_none() && debug_lost_shell_nonce();
     let offers_rekey = adopt.is_none()
@@ -5941,7 +5952,7 @@ pub(crate) fn gated_output_wake_for_test(
     gated_output_wake(flag, now_ns, 0, false, send, || now_ns)
 }
 
-fn gated_output_wake(
+pub(super) fn gated_output_wake(
     flag: &AtomicU64,
     now_ns: u64,
     idle_since_ns: u64,

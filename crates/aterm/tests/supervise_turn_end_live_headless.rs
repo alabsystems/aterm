@@ -10,11 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use aterm_agent::supervise::config::CONTINUE_TEXT;
-use aterm_agent::supervise::policy::needs::NEEDS_HINT;
-use aterm_agent::supervise::policy::turn_end::{
-    Cleared, Clearing, FORWARD_RECOVERY, Outage, TurnEndTiming, cleared_text,
-};
+use alab_policy::config::{CONTINUE_TEXT, TurnEndTiming};
+use alab_policy::needs::NEEDS_HINT;
+use alab_policy::words::FORWARD_RECOVERY;
+use aterm_agent::supervise::policy::turn_end::{Cleared, Clearing, Outage, cleared_text};
 use aterm_agent::supervise::prompt::fixtures::{
     BOX_BASH_TOUCH, END_529, GOAL_ACTIVE_SUGGESTION, composer, screen,
 };

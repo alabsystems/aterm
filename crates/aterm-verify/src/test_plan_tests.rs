@@ -79,6 +79,7 @@ fn measured_short_work_fills_a_gap_without_delaying_its_head() {
             Some(seen(9.0, 36.0, 1, 1)),
             Some(seen(8.0, 8.0, 1, 1)),
         ],
+        &[],
         4,
         None,
         0,
@@ -153,6 +154,7 @@ fn unseen_binaries_start_first_then_recorded_duration_regardless_of_failure() {
     let plan_of = |third: Seen| {
         plan(
             &[Some(short), None, Some(long), Some(third), None],
+            &[],
             8,
             None,
             GIB,
@@ -175,14 +177,43 @@ fn unseen_binaries_start_first_then_recorded_duration_regardless_of_failure() {
         "a binary with no history is planned as heavy as the heaviest kept: {unseen:?}"
     );
     assert_eq!(
-        plan(&[None], 2, None, 0).order[0].width,
+        plan(&[None], &[], 2, None, 0).order[0].width,
         2,
         "never wider than the share"
     );
     assert_eq!(
-        plan(&[None], 8, Some(3), 0).order[0].width,
+        plan(&[None], &[], 8, Some(3), 0).order[0].width,
         3,
         "nor than the ceiling"
+    );
+}
+
+/// THE CHANGE'S OWN CRATES FIRST (`docs/DESIGN-landing-economy.md` §2.2b): the binaries `seeds`
+/// marks lead, each class in the order above (unrecorded in Cargo order, then longest recorded),
+/// and every binary keeps the width, charge, peak and prediction the plan without seeds gives it.
+/// NEGATIVE CONTROL: no seed, or every binary one, is the order above.
+#[test]
+fn the_seeds_binaries_lead_with_unchanged_widths_and_charges() {
+    let short = seen(2.0, 8.0, 4, 8);
+    let long = seen(30.0, 120.0, 4, 8);
+    let middle = seen(10.0, 10.0, 1, 1);
+    let all = [Some(short), None, Some(long), Some(middle), None];
+    let order = |p: &Plan| -> Vec<usize> { p.order.iter().map(|b| b.index).collect() };
+    let plain = plan(&all, &[], 6, None, GIB);
+    assert_eq!(order(&plain), [1, 4, 2, 3, 0]);
+    assert_eq!(order(&plan(&all, &[true; 5], 6, None, GIB)), order(&plain));
+    // Seeds: the short recorded binary, the second unrecorded one and the middle one.
+    let seeds = [true, false, false, true, true];
+    let led = plan(&all, &seeds, 6, None, GIB);
+    assert_eq!(order(&led), [4, 3, 0, 1, 2]);
+    assert_eq!((led.share, led.target), (plain.share, plain.target));
+    for b in &led.order {
+        assert_eq!(*b, at(&plain, b.index), "binary {} kept its plan", b.index);
+    }
+    // A seeds list shorter than the binaries marks none past its end.
+    assert_eq!(
+        order(&plan(&all, &[false, false, true], 6, None, GIB)),
+        [2, 1, 4, 3, 0]
     );
 }
 
@@ -200,7 +231,7 @@ fn the_widths_are_those_whose_schedule_ends_first_from_the_bound_up() {
         .filter_map(|(i, s)| Some((i, (*s)?)))
         .collect();
     assert_eq!(bound(&known, 4, 4), secs(70.0));
-    let p = plan(&all, 4, None, 0);
+    let p = plan(&all, &[], 4, None, 0);
     assert_eq!(
         (at(&p, 0).width, at(&p, 0).charge, at(&p, 0).predicted),
         (4, 4, Some(secs(40.0))),
@@ -240,7 +271,7 @@ fn the_widths_are_those_whose_schedule_ends_first_from_the_bound_up() {
     };
     assert!(below.order.iter().all(|b| b.width == 2), "{below:?}");
     assert_eq!(schedule(&below).end, pair_floor, "{below:?}");
-    let regularized = plan(&pair, 2, None, 0);
+    let regularized = plan(&pair, &[], 2, None, 0);
     assert_eq!(schedule(&regularized).end, pair_floor, "{regularized:?}");
 }
 
@@ -257,7 +288,7 @@ fn of_plans_that_end_together_the_narrowest() {
         Some(quick),
         Some(quick),
     ];
-    let p = plan(&all, 8, None, 0);
+    let p = plan(&all, &[], 8, None, 0);
     assert_eq!(p.target, secs(120.0), "{p:?}");
     assert_eq!(schedule(&p).end, busy.wall_at(6) + secs(40.0), "{p:?}");
     assert_eq!((at(&p, 0).width, at(&p, 0).charge), (6, 6), "{p:?}");
@@ -301,12 +332,12 @@ fn a_binarys_threads_scale_its_wall() {
     let few = seen(9.0, 18.0, 8, 2);
     assert_eq!(few.wall_at(8), few.wall_at(2), "two tests use two threads");
     assert_eq!(
-        plan(&[Some(few)], 8, None, 0).order[0].width,
+        plan(&[Some(few)], &[], 8, None, 0).order[0].width,
         2,
         "no wider than its tests"
     );
     let busy = seen(80.0, 640.0, 8, 100);
-    let narrowed = plan(&[Some(busy), Some(waits)], 8, Some(4), 0);
+    let narrowed = plan(&[Some(busy), Some(waits)], &[], 8, Some(4), 0);
     assert_eq!(
         (at(&narrowed, 0).width, schedule(&narrowed).end),
         (4, secs(160.0)),
@@ -363,18 +394,18 @@ fn unrelated_work_cannot_serialize_the_release_poles() {
         Some(seen(392.0, 392.0, 1, 1072)),
     ];
     all.extend(std::iter::repeat_n(Some(seen(1262.0, 1262.0, 1, 1)), 8));
-    let p = plan(&all, 8, None, 0);
+    let p = plan(&all, &[], 8, None, 0);
     assert_eq!((at(&p, 0).width, at(&p, 0).charge), (4, 1), "{p:?}");
     assert_eq!((at(&p, 1).width, at(&p, 1).charge), (4, 4), "{p:?}");
     for share in 1..=3 {
-        let p = plan(&all[..2], share, None, 0);
+        let p = plan(&all[..2], &[], share, None, 0);
         assert!(
             p.order
                 .iter()
                 .all(|b| b.width <= share && b.charge <= share)
         );
     }
-    let p = plan(&all[..2], 8, Some(2), 0);
+    let p = plan(&all[..2], &[], 8, Some(2), 0);
     assert!(p.order.iter().all(|b| b.width == 2));
 }
 
@@ -397,17 +428,17 @@ fn waiting_threads_are_charged_their_measured_cpu() {
 fn a_binary_that_uses_more_than_its_threads_runs_no_wider_than_the_share_holds() {
     // 11.1 cores at six threads: 1.85 per thread, so 5.55 at three and 7.4 at four.
     let pools = seen(100.0, 1110.0, 6, 50);
-    let planned = at(&plan(&[Some(pools)], 6, None, 0), 0);
+    let planned = at(&plan(&[Some(pools)], &[], 6, None, 0), 0);
     assert_eq!((planned.width, planned.charge), (3, 6), "{planned:?}");
     assert_eq!(planned.predicted, Some(secs(200.0)));
     let threads = seen(100.0, 600.0, 6, 50);
-    let planned = at(&plan(&[Some(threads)], 6, None, 0), 0);
+    let planned = at(&plan(&[Some(threads)], &[], 6, None, 0), 0);
     assert_eq!((planned.width, planned.charge), (6, 6), "{planned:?}");
     let lanes = Seen {
         per_thread: 14.0,
         ..pools
     };
-    let planned = at(&plan(&[Some(lanes)], 6, None, 0), 0);
+    let planned = at(&plan(&[Some(lanes)], &[], 6, None, 0), 0);
     assert_eq!((planned.width, planned.charge), (1, 6), "{planned:?}");
 }
 
@@ -539,12 +570,15 @@ fn the_memory_claim_is_the_schedules_own_concurrent_peak() {
     );
     assert_eq!(schedule(&p(8)).peak, 16 * GIB);
     assert_eq!(
-        schedule(&plan(&[None, None], 4, None, GIB)).peak,
+        schedule(&plan(&[None, None], &[], 4, None, GIB)).peak,
         GIB,
         "two unseen binaries four wide take turns on four cores"
     );
-    assert_eq!(schedule(&plan(&[None, None], 8, None, GIB)).peak, 2 * GIB);
-    assert_eq!(schedule(&plan(&[None, None], 8, None, 0)).peak, 0);
+    assert_eq!(
+        schedule(&plan(&[None, None], &[], 8, None, GIB)).peak,
+        2 * GIB
+    );
+    assert_eq!(schedule(&plan(&[None, None], &[], 8, None, 0)).peak, 0);
 }
 /// Recorded durations reach the actual dispatcher's first admission. With no records it
 /// retains the declared order. The control changes only the planted binary's duration.
@@ -558,7 +592,6 @@ fn a_planted_long_binary_starts_first_from_recorded_history() {
                 name,
                 Sample {
                     partition: None,
-                    exe_sha256: None,
                     at_ms: 1,
                     outcome: "ok".into(),
                     wall_ms,
@@ -575,7 +608,7 @@ fn a_planted_long_binary_starts_first_from_recorded_history() {
     };
     let first = |history: &History| {
         let seen = ["short", "planted", "other"].map(|name| history.seen(name));
-        Dispatcher::new(&plan(&seen, 1, None, 1), None)
+        Dispatcher::new(&plan(&seen, &[], 1, None, 1), None)
             .next(0.0)
             .unwrap()
             .index
@@ -599,7 +632,7 @@ fn duration_then_memory_orders_work_and_unavailable_reservations_leave_no_hole()
         failed: true,
         ..seen(1.0, 1.0, 1, 1)
     };
-    let p = plan(&[Some(small), Some(short), Some(large)], 4, None, GIB);
+    let p = plan(&[Some(small), Some(short), Some(large)], &[], 4, None, GIB);
     assert_eq!(
         p.order.iter().map(|b| b.index).collect::<Vec<_>>(),
         [2, 0, 1]

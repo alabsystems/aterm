@@ -6,11 +6,11 @@
 use std::sync::atomic::AtomicUsize;
 
 use super::*;
-use crate::supervise::config::Autopilot;
 use crate::supervise::occupancy::reading::LOOK_EVERY_MS;
 use crate::supervise::occupancy::rules::{RuleId, WOULD_RULE};
 use crate::supervise::occupancy::{OccupancyReading, OccupancySaid, SaidVerdict, SlotsSeen};
 use crate::supervise::policy::turn_end::Reach;
+use alab_policy::config::Autopilot;
 
 /// A host whose board reads `reading`, counting the asks and keeping what the door told it.
 #[derive(Debug, Default)]
@@ -725,7 +725,10 @@ fn each_guard_in_hand_holds_the_due_line_once() {
         assert_eq!(d.would, [(NUDGE.to_string(), 33 * MIN)], "{tag}");
     }
     let land = SupervisorConfig {
-        autopilot: Autopilot::Land,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot: Autopilot::Land,
+            ..policy.turn_end.clone()
+        },
         ..policy
     };
     let d = run("door-guard-land", land, &|_, _| {});
@@ -1925,7 +1928,7 @@ fn a_ready_idle_word_replays_under_the_k_its_tape_names() {
         journal: Some(dir.join("journal.jsonl")),
         ..hosted(35 * 60)
     };
-    opts.policy.autopilot = Autopilot::Land;
+    opts.policy.turn_end.autopilot = Autopilot::Land;
     let mut m = Mock::new(vec![break_screen()]);
     m.stall_sleep = Some(Duration::from_secs(60));
     let run = record_watch(&mut m, &opts, |s| {
@@ -1986,7 +1989,7 @@ fn unraised_watch(tag: &str) -> (String, Vec<crate::supervise::tape::codec::Item
         journal: Some(dir.join("journal.jsonl")),
         ..hosted(50 * 60)
     };
-    opts.policy.autopilot = Autopilot::Land;
+    opts.policy.turn_end.autopilot = Autopilot::Land;
     let mut m = Mock::new(vec![break_screen()]);
     m.stall_sleep = Some(Duration::from_secs(60));
     let run = record_watch(&mut m, &opts, |s| {

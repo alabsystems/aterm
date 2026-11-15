@@ -446,6 +446,47 @@ fn idle() -> Facts {
     }
 }
 
+/// CLOUDFLARE'S BLOCK PAGE IS NO LOGIN WALL FOR THE UPGRADE: Claude Code 2.1.323 writes the page
+/// Cloudflare's edge answers in the API's place as its `authentication_failed` answer, worded
+/// `Please run /login · API Error: 403 Attention Required! | Cloudflare` (m2, 2026-11-13), and the
+/// login it names was never lost. Neither the screen nor the measured transcript reads it as the
+/// login wall, so no wall's clock starts there.
+/// CONTROL: the same row worded as a lost login, on the screen and in the transcript, is the wall.
+#[test]
+fn cloudflares_block_page_is_no_login_wall_for_the_upgrade() {
+    use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};
+    let edge = "Please run /login · API Error: 403 Attention Required! | Cloudflare";
+    let mut shown = screen(LOGIN_EXPIRED);
+    let row = shown
+        .iter()
+        .position(|r| r.starts_with("⏺ Login expired"))
+        .expect("the wall row");
+    assert!(
+        upgrade::login_wall(Agent::Claude, &shown),
+        "CONTROL: the lost login's screen"
+    );
+    shown[row] = format!("⏺ {edge}");
+    assert!(
+        !upgrade::login_wall(Agent::Claude, &shown),
+        "the page's screen"
+    );
+    let measured =
+        include_str!("../supervise/fixtures/claude-2.1.323-transcript-cloudflare-403.jsonl");
+    assert!(
+        !upgrade::transcript_login_wall(measured),
+        "the measured transcript"
+    );
+    let ts = "2026-09-27T05:00:24.039Z";
+    let lost = auth_wall_row(ts, INCIDENT_SESSION);
+    assert!(
+        upgrade::transcript_login_wall(&lost),
+        "CONTROL: the lost login's row"
+    );
+    let paged = lost.replace("Login expired · Please run /login", edge);
+    assert_ne!(paged, lost);
+    assert!(!upgrade::transcript_login_wall(&paged), "the page's row");
+}
+
 #[test]
 fn the_login_wall_is_read_from_the_screen_and_the_transcript() {
     use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};

@@ -404,7 +404,15 @@ pub fn verdict_of(
         },
         Ok(ran) => {
             let said = failure_tail(c, ran, nonce, request);
-            if c.auth_words.iter().any(|w| said.contains(w)) {
+            // Cloudflare's block or challenge page in the API's place, which Claude Code words
+            // as a lost login (`Please run /login · API Error: 403 Attention Required! |
+            // Cloudflare`): a network block the login did not cause and no sign-in moves.
+            if aterm_phase::wall::edge_block(&said) {
+                (
+                    Verdict::Failed,
+                    Some("Cloudflare's block page answered in the API's place".to_string()),
+                )
+            } else if c.auth_words.iter().any(|w| said.contains(w)) {
                 (
                     Verdict::Auth,
                     Some("its login could not authenticate".to_string()),

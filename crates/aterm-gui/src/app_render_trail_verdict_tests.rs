@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::{keyed_celebration_completion, verdict_armed, verdict_voice};
+use super::{keyed_celebration_completion, verdict_armed, verdict_sound, verdict_voice};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -345,4 +345,32 @@ fn a_quick_command_is_silent() {
         Some((true, false)),
         "…including a ten-minute one: the bell is the green cadence's"
     );
+}
+
+#[test]
+fn the_new_music_box_hears_every_keyed_result_and_no_other_voice_hears_more() {
+    use aterm_effects::trail_sound::SoundVoice;
+    for &voice in SoundVoice::ALL {
+        let ii = matches!(voice, SoundVoice::MusicBoxII);
+        for (failed, dur) in [
+            (false, None),
+            (false, Some(120)),
+            (false, Some(2_000)),
+            (false, Some(30_000)),
+            (true, Some(5)),
+            (true, None),
+        ] {
+            let heard = verdict_sound(voice, failed, dur);
+            let cue = verdict_voice(failed, dur);
+            if ii && cue.is_none() {
+                assert_eq!(
+                    heard,
+                    Some((false, false)),
+                    "a quick pass brings the new music box home"
+                );
+            } else {
+                assert_eq!(heard, cue, "{voice:?} {failed} {dur:?}");
+            }
+        }
+    }
 }

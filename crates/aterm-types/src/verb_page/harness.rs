@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! `help harness`: what a self-supervising agent reads of aterm's harness: the `[harness]`
-//! policy, the account menu's recovery observation, and a measured fact for an act.
+//! policy, the account menu's recovery observation, a measured fact for an act, and what the
+//! session's repository holds that no remote main has.
 
 use super::{Page, Section, para, row};
 
@@ -15,7 +16,9 @@ pub(crate) const PAGE: Page = Page {
              work is landed (Land), by the `[harness]` policy. An agent that supervises \
              itself (codex-alab, `supervisor_proven=1`) reads that policy here. A fact is a \
              measured sentence (a stall's no-progress) aterm's own loop lets ride after one of \
-             its acts.",
+             its acts. The repository probe is what Land checks before a landing: the window \
+             harness's own read of the session's repository, for the harness that holds the \
+             session's proven claim.",
         ),
         row(
             "harness policy",
@@ -35,6 +38,11 @@ pub(crate) const PAGE: Page = Page {
             "harness fact told episode=<016x>",
             "say the act that carried the fact started",
         ),
+        row(
+            "harness probe repo",
+            "what the session's repository holds that no remote main has, as the window \
+             harness's Land reads it (owner; the session's standing proven claim alone)",
+        ),
     ],
     options: &[],
     reply: &[
@@ -53,6 +61,10 @@ pub(crate) const PAGE: Page = Page {
             "fact: none and why, or the sentence and the rider to type after the act's words",
         ),
         row("OK | ERR stale fact", "fact told"),
+        row(
+            "OK read=<word> clean=<0|1> as_of_ms=<ms> from=<source> … | OK read=pending",
+            "probe: the reading, then what was measured and the counts (`help harness probe`)",
+        ),
     ],
     examples: &[
         row(
@@ -62,6 +74,10 @@ pub(crate) const PAGE: Page = Page {
         row(
             "aterm ctl @self harness recovery",
             "what the account menu last saw of recovery",
+        ),
+        row(
+            "aterm ctl @self harness probe repo",
+            "whether Land would find the session's repository clean",
         ),
     ],
     sections: &[
@@ -81,7 +97,12 @@ pub(crate) const PAGE: Page = Page {
                      rotation is on, and with it ` codex_rotation_five_hour=<seconds>`, a plain \
                      decimal count: this host hands a codex-alab session off at a five-hour \
                      limit only where that limit's reset is more than that many seconds away \
-                     (nearer, `codex-rotation prepare` answers `state=not-needed`).",
+                     (nearer, `codex-rotation prepare` answers `state=not-needed`); \
+                     ` codex_rotation_login=1` follows, apart from those, while this host moves a \
+                     codex-alab session whose login was lost to another account already signed \
+                     in here (`codex-login-rotation prepare`, the rotation's four keys): only a \
+                     settled `refresh_token_expired` refusal of the token its login file holds, \
+                     every other loss staying a stop for a person.",
                 ),
                 para(
                     "Followed by every `[harness]` key (pct-encoded, `-` when empty, \
@@ -164,6 +185,45 @@ pub(crate) const PAGE: Page = Page {
                     "`fact told episode=<016x>` (Write) says the act that carried it started: \
                      `OK`, or `ERR stale fact` (no offer of that episode to this claim), and \
                      nothing is told.",
+                ),
+            ],
+        },
+        Section {
+            name: "probe",
+            about: "probe repo: the reading, what was measured, the counts, and when to ask again",
+            rows: &[
+                para(
+                    "`probe repo` (Owner; only on the session's standing proven claim, a \
+                     codex-alab self-claim or a rostered harness's, from its connection or its \
+                     proven process, else `ERR denied` with nothing read) reads the session's \
+                     repository with the window harness's own reader, the one its Land checks \
+                     before a landing. The folder is the one the tab's agent works in, as the \
+                     window harness's snapshot of it names it where that snapshot names the \
+                     claimant (`from=snapshot`: the last folder its transcript wrote, and the \
+                     branches its commands used), else the claimant's working directory \
+                     (`from=claimant`); `from=none` names no folder and reads clean, as the \
+                     window harness's probe with no snapshot does.",
+                ),
+                para(
+                    "The read runs on a thread of its own for the tab and an ask waits 400 ms \
+                     for it: `OK read=pending from=<source>` while it goes on, and the tab's \
+                     next ask answers that read. `as_of_ms=` is when the read began (unix ms, \
+                     `-` unknown): one begun before the turn being judged ended is asked again.",
+                ),
+                para(
+                    "`read=` is `found` (work no remote main has), `checked` (none, at the \
+                     named commit), `clean` (none, and no commit named: no repository or no \
+                     probe here, or a `HEAD` with no commit yet), `gone` (the folder is gone) \
+                     or `unread` (a read failed or was cut: not known, and nothing more \
+                     follows). `clean=1` is Land's verdict for \
+                     checked, clean and gone. Then `repo=` `branch=` `head=` `main_ref=` \
+                     `remote=<0|1|->` (branch, head and remote named for `checked` only), \
+                     `changed=` `untracked=` `stashes=` `unpushed=` `unlanded=` \
+                     `sub_unpushed=` `parked=`, `state=<016x|->` (the found work's hash: two \
+                     readings of one state found the same work), and the named paths, \
+                     submodules and parked branches as `path_count=<k> path_0=…`, `sub_count=` \
+                     `sub_0=…` and `parked_on_count=` `parked_on_0=…` (at most three each). \
+                     Text is percent-encoded and `-` is none; keys are only ever added to.",
                 ),
             ],
         },

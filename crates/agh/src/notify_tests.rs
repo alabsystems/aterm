@@ -48,7 +48,7 @@ fn a_value_that_is_not_utf8_is_unset() {
     use super::{SessionNotifier, mux_nested};
     let tab = || {
         crate::identity::MapEnv::new()
-            .with("ATERM_PARENT_SESSION_ID", "s-01")
+            .with("ATERM_PARENT_SESSION_ID", "t0000000001")
             .with("ATERM_MUX_BASE", "|")
     };
     for raw in ["TMUX", "ATERM_MUX"] {
@@ -56,7 +56,7 @@ fn a_value_that_is_not_utf8_is_unset() {
         assert!(!mux_nested(&env), "{raw}");
         assert_eq!(
             SessionNotifier::from_env(&env).sid,
-            Ok("s-01".to_string()),
+            Ok("t0000000001".to_string()),
             "{raw}"
         );
     }
@@ -77,7 +77,7 @@ fn a_bar_inside_tmux_is_the_same_session() {
     let tmux = "/tmp/tmux-501/a|b,123,0";
     let tab = |now: &str| {
         crate::identity::MapEnv::new()
-            .with("ATERM_PARENT_SESSION_ID", "s-01")
+            .with("ATERM_PARENT_SESSION_ID", "t0000000001")
             .with("ATERM_MUX_BASE", &format!("{tmux}|"))
             .with("TMUX", now)
     };

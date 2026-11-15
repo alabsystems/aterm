@@ -612,8 +612,13 @@ pub(crate) fn follow_transition(
             .unwrap_or_default();
         let placed = view.mailboxes();
         let mailbox = placed.get("ann@example.test").map(String::as_str);
-        return follow_project(state, &chain, mailbox, &checks::lab(&cells).0)
-            .unwrap_or_else(|| panic!("a chain no state names: {chain:?} from {state:?}"));
+        return follow_project(
+            state,
+            &chain,
+            mailbox,
+            &checks::lab(&crate::alab::registry::REGISTRY_3, &cells).0,
+        )
+        .unwrap_or_else(|| panic!("a chain no state names: {chain:?} from {state:?}"));
     }
     let model = aterm_models_harness::fleet_machine_assignment_model();
     let [next] = &model.successors(action, state)[..] else {
@@ -689,7 +694,7 @@ fn an_alias_chain_takes_the_harness_models_steps() {
     let view = LabView::read(&cells, &OwnedRead::default(), &OwnedRead::default(), None);
     let placed = view.mailboxes();
     let mailbox = placed.get("ann@example.test").map(String::as_str);
-    let found = checks::lab(&cells).0;
+    let found = checks::lab(&crate::alab::registry::REGISTRY_3, &cells).0;
     refused(
         &retired_hub,
         follow_project(&retired_hub, &raw, mailbox, &found).expect("hub then root"),
@@ -724,7 +729,7 @@ fn an_alias_chain_takes_the_harness_models_steps() {
         .unwrap_or_default();
     let placed = view.mailboxes();
     let ann = keys::address_pk("ann@example.test").unwrap();
-    let own_only: Vec<_> = checks::lab(&cells)
+    let own_only: Vec<_> = checks::lab(&crate::alab::registry::REGISTRY_3, &cells)
         .0
         .into_iter()
         .filter(|f| f.pks.first() == Some(&ann))

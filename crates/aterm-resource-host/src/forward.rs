@@ -25,6 +25,8 @@ const SUBMIT: u8 = 4;
 const SUBMIT_ACCOUNTED: u8 = 5;
 const EXPECT_STORE: u8 = 6;
 const SUBMIT_ACCOUNTED_EXPECT_STORE: u8 = 7;
+const RESOURCE_OBSERVATION: u8 = 8;
+const OBSERVER_PERMIT: u8 = 9;
 
 fn refused() -> io::Error {
     io::Error::new(
@@ -45,6 +47,7 @@ pub(crate) struct Forwarder {
     stream: Mutex<CtlStream>,
     custodian: Peer,
     broken: AtomicBool,
+    observation_supported: std::sync::OnceLock<bool>,
 }
 impl Forwarder {
     pub(crate) fn is_broken(&self) -> bool {
@@ -59,6 +62,7 @@ impl Forwarder {
             stream: Mutex::new(stream),
             custodian,
             broken: AtomicBool::new(false),
+            observation_supported: std::sync::OnceLock::new(),
         })
     }
     fn with<T>(&self, f: impl FnOnce(&CtlStream, Instant) -> io::Result<T>) -> io::Result<T> {
@@ -98,6 +102,50 @@ impl Forwarder {
             wire::write_frame(stream, &[CAPABILITIES], deadline)?;
             json_reply(stream, deadline)
         })
+    }
+    pub(crate) fn resource_observation(
+        &self,
+        since: u64,
+    ) -> io::Result<crate::resource_observation::Observation> {
+        let supported = match self.observation_supported.get() {
+            Some(supported) => *supported,
+            None => {
+                let value =
+                    self.capabilities()?["resource_observation"].as_str() == Some("origin-wait-v1");
+                *self.observation_supported.get_or_init(|| value)
+            }
+        };
+        if !supported {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        self.with(|stream, deadline| {
+            let mut frame = vec![RESOURCE_OBSERVATION];
+            frame.extend(since.to_be_bytes());
+            wire::write_frame(stream, &frame, deadline)?;
+            let header = json_reply(stream, deadline)?;
+            if header == aterm_json::json!({"version":1,"unavailable":true}) {
+                // A complete logical refusal is synchronized. A temporary OS counter read
+                // failure must not poison this private connection.
+                return Ok(Err(io::Error::other(
+                    "native resource counters unavailable",
+                )));
+            }
+            let mut header = Some(header);
+            let observation = crate::resource_observation::Observation::receive(since, || {
+                header
+                    .take()
+                    .map_or_else(|| json_reply(stream, deadline), Ok)
+            })?;
+            let start = i32::try_from(self.custodian.pid)
+                .ok()
+                .and_then(aterm_uds::process::read_process_start);
+            if observation.host.pid != self.custodian.pid
+                || start.is_none_or(|s| s.boot.0 != observation.host.start)
+            {
+                return Err(refused());
+            }
+            Ok(Ok(observation))
+        })?
     }
     pub(crate) fn authorize(&self, request: &Submission) -> io::Result<bool> {
         self.with(|stream, deadline| {
@@ -211,7 +259,22 @@ fn json_write(stream: &CtlStream, value: &aterm_json::Value, deadline: Instant) 
 /// same-user connection and must never be installed on a public listener.
 pub(crate) fn serve(
     stream: &CtlStream,
+    authenticate: impl FnMut(Peer) -> io::Result<()>,
+) -> io::Result<()> {
+    serve_mode(stream, authenticate, false)
+}
+
+pub(crate) fn serve_observer(
+    stream: &CtlStream,
+    authenticate: impl FnMut(Peer) -> io::Result<()>,
+) -> io::Result<()> {
+    serve_mode(stream, authenticate, true)
+}
+
+fn serve_mode(
+    stream: &CtlStream,
     mut authenticate: impl FnMut(Peer) -> io::Result<()>,
+    readonly: bool,
 ) -> io::Result<()> {
     let original = wire::local_peer(stream)?;
     authenticate(original)?;
@@ -234,7 +297,15 @@ pub(crate) fn serve(
         authenticate(original)?;
         let frame = wire::read_frame(stream, deadline)?;
         let (op, body) = frame.split_first().ok_or_else(refused)?;
+        if readonly && !matches!(*op, CAPABILITIES | RESOURCE_OBSERVATION) {
+            return Err(refused());
+        }
         match *op {
+            OBSERVER_PERMIT if body.is_empty() => {
+                let value = crate::observer_permit::issue().map(|permit| aterm_json::json!({"version":1,"permit":std::str::from_utf8(permit.expose()).unwrap_or("")}))
+                    .unwrap_or_else(|_| aterm_json::json!({"version":1,"unavailable":true}));
+                json_write(stream, &value, deadline)?;
+            }
             EXPECT_STORE if body.is_empty() => {
                 let expected = wire::store_expectation::receive(stream, deadline)?;
                 authenticate(original)?;
@@ -244,6 +315,21 @@ pub(crate) fn serve(
             }
             CAPABILITIES if body.is_empty() => {
                 json_write(stream, &crate::actor::capabilities(), deadline)?
+            }
+            RESOURCE_OBSERVATION if body.len() == 8 => {
+                let since = u64::from_be_bytes(body.try_into().map_err(|_| refused())?);
+                match crate::resource_observation::snapshot(since) {
+                    Ok(observation) => {
+                        for frame in observation.frames() {
+                            json_write(stream, &frame, deadline)?;
+                        }
+                    }
+                    Err(_) => json_write(
+                        stream,
+                        &aterm_json::json!({"version":1,"unavailable":true}),
+                        deadline,
+                    )?,
+                }
             }
             AUTHORIZE | SUBMIT | SUBMIT_ACCOUNTED | SUBMIT_ACCOUNTED_EXPECT_STORE => {
                 let request = Submission::decode(body)?;

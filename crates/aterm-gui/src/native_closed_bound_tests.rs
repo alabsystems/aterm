@@ -800,3 +800,64 @@ fn a_login_renewal_that_attached_lifts_its_successors_hold_off() {
     );
     assert!(!successor_held_off(&world));
 }
+
+/// A LOST LOGIN'S MOVE WHOSE SUCCESSOR NEVER ATTACHED HOLDS ITS DESTINATION OFF AS A RENEWAL'S
+/// DOES: its terminal cleanup notes the end against the source's identity and the destination's
+/// login and generation (no pool record is retired, since a session's move has none), so the
+/// session handed back on the login it lost is not moved onto that destination again before the
+/// rung passes.
+#[test]
+fn a_lost_logins_move_whose_successor_never_attached_holds_its_destination_off() {
+    let world = world(8031);
+    let moved = recovery::Receipt {
+        id: "ab".repeat(16),
+        intent: recovery::Intent {
+            purpose: recovery::Purpose::LoginRotation,
+            ..world.root.intent.clone()
+        },
+        destination: Some(recovery::Identity::from_native("target", "user")),
+        current_attempt: Some(recovery::AttemptRef {
+            id: "12".repeat(16),
+            generation: 1,
+        }),
+        ..world.root.clone()
+    };
+    let ended = recovery::with_receipt_writer(&world.env, |writer| {
+        recovery::write_receipt(&world.env, &moved)?;
+        writer.cancel(
+            &moved,
+            recovery::CancellationKind::SuccessorNeverAttached,
+            0,
+            0,
+        )?;
+        recovery::read_receipt(&world.env, &moved.id).ok_or("ended")
+    })
+    .unwrap()
+    .unwrap();
+    let held = |world: &World| {
+        recovery::with_receipt_writer(&world.env, |writer| {
+            writer.unattached_login_until(&moved.intent.identity, &moved.new_auth, moved.generation)
+        })
+        .unwrap()
+        .unwrap()
+    };
+    assert_eq!(held(&world), None);
+    let service = renewal::Service::new(world.seal.clone());
+    assert!(renewal::fixture_cleanup_terminal_pool(
+        &world.handle.ctx,
+        &service,
+        &world.env,
+        &ended,
+        &world.facts,
+    ));
+    assert!(held(&world).is_some(), "the end holds the destination off");
+    let store = world.env.accounts_store_for(accounts::Cli::Codex).unwrap();
+    assert!(
+        store
+            .load_logins(world.env.now)
+            .unwrap()
+            .0
+            .native_rotations
+            .is_empty()
+    );
+}

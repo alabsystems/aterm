@@ -5,8 +5,8 @@
 //! ([`Schema`]) and the row type the fold fills. One schema drives every face: `aterm db fleet`
 //! prints by it, and a sheet reads its columns, types and words from it.
 //!
-//! A column is a `typed::Column` (the ATT/1 value types, so a value is checked and masked as a
-//! registry cell is) and the words that say what it holds. Integers only: a percentage is tenths
+//! A column is a `typed::Column` (the ATT/1 value types, so a value is checked as a registry
+//! cell is) and the words that say what it holds. Integers only: a percentage is tenths
 //! (`_x10`), a core count hundredths (`_x100`), a time Unix milliseconds.
 //!
 //! A measure is a pair of columns, how much is used and how much there is, each in the
@@ -552,7 +552,7 @@ pub struct AccountRow {
     pub provider: Option<String>,
     /// Its label: the short name a person calls it by.
     pub slug: Option<String>,
-    /// Its login address, held as the registry holds it and printed masked.
+    /// Its login address, held as the registry holds it and printed as it is.
     pub login: Option<String>,
     pub status: Option<&'static str>,
     pub plan: Option<String>,
@@ -586,7 +586,7 @@ pub static ACCOUNTS: Schema = Schema {
         col("account", Ty::Key, "registry key"),
         opt("provider", Ty::Key, "its provider"),
         opt("slug", Ty::AccountLabel(32), "its label"),
-        opt("login", Ty::Email, "its login address, masked"),
+        opt("login", Ty::Email, "its login address"),
         opt("status", Ty::Enum(ACCOUNT_STATUS), "registry status"),
         opt("plan", Ty::Key, "its plan"),
         opt(
@@ -743,6 +743,8 @@ pub struct AgentRow {
     pub usage_7d_pct: Option<u8>,
     pub account: AccountRef,
     pub model: Option<String>,
+    /// Whether it is pinned; unread where its row did not say.
+    pub pinned: Option<bool>,
     pub read_at_ms: u64,
     pub how: How,
     /// Whether the answer that listed it proved a node key this Mac binds. An unproven row is a
@@ -790,6 +792,11 @@ pub static AGENTS: Schema = Schema {
             "the registry account it runs on; unread where its word names none",
         ),
         opt("model", Ty::Text(48), "its model"),
+        opt(
+            "pinned",
+            Ty::Bool,
+            "whether a person or a lead agent pinned it; unread from an aterm before the pin",
+        ),
         col("read_at", Ty::Time, "when its row was read"),
         col("how", Ty::Enum(&["self", "survey"]), "self or survey"),
         col(
@@ -822,6 +829,7 @@ impl Row for AgentRow {
                 AccountRef::Resolved(pk) => Cell::of(pk.clone()),
             },
             Cell::read(self.model.clone()),
+            Cell::read(self.pinned),
             Cell::of(self.read_at_ms),
             Cell::of(self.how.word()),
             Cell::of(self.proven),

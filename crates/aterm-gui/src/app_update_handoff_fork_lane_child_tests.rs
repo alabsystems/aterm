@@ -113,7 +113,13 @@ fn the_fork_lane_successor_transfers_the_proof_and_commit_ends_and_restores_thei
         commit_wr,
     } = super::AttemptPipes::make().expect("the attempt's proof and Commit pipes");
     let handed = vec![proof_wr.as_raw_fd(), commit_rd.as_raw_fd()];
-    let original_flags: Vec<_> = handed.iter().map(|&fd| descriptor_flags(fd)).collect();
+    let ends = [
+        proof_rd.as_raw_fd(),
+        proof_wr.as_raw_fd(),
+        commit_rd.as_raw_fd(),
+        commit_wr.as_raw_fd(),
+    ];
+    let original_flags: Vec<_> = ends.iter().map(|&fd| descriptor_flags(fd)).collect();
     assert!(
         original_flags
             .iter()
@@ -146,12 +152,11 @@ fn the_fork_lane_successor_transfers_the_proof_and_commit_ends_and_restores_thei
     let mut child = super::spawn_fork_lane_successor(&mut cmd, &handed)
         .expect("the fork lane's successor starts holding the proof and Commit ends");
     assert_eq!(
-        handed
-            .iter()
+        ends.iter()
             .map(|&fd| descriptor_flags(fd))
             .collect::<Vec<_>>(),
         original_flags,
-        "each handed end's original flags are restored once the spawn returned"
+        "every pipe end retains its original flags once the spawn returned"
     );
     drop((proof_wr, commit_rd));
     let mut commit = std::fs::File::from(commit_wr);

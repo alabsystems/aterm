@@ -1213,6 +1213,8 @@ fn a_plain_push_carries_the_identity_side_car_and_a_stamped_one_its_stamp() {
             pan_from: -0.5,
             block_lead_s: 0.0,
             flow: 0.0,
+            session: 7,
+            prompt: false,
         },
     );
     let captured = audio.take_captured_with_meta_for_test();
@@ -1245,6 +1247,8 @@ fn a_stamped_cue_reaches_the_worker_output_with_its_stamp() {
             pan_from: 0.0,
             block_lead_s: 0.0,
             flow: 0.0,
+            session: 3,
+            prompt: false,
         },
     })
     .unwrap();

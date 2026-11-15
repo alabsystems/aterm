@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! File and directory flush primitives.
+//! File and directory flush primitives and cooperating writers' sibling locks.
 //!
 //! Every flush this crate makes is astream-sys's, so `astream_sys::flush_tally` counts each
 //! one, by the call it is: [`primitive::full`] and [`primitive::full_data`] are `full_sync` and
@@ -15,6 +15,8 @@
 use std::fs::File;
 use std::io;
 use std::path::Path;
+
+pub mod write_lock;
 
 /// Which of this crate's flushes `astream_sys::flush_tally` counts, as one word a reading of
 /// that tally names beside its counts (aterm-link's wait tally does): `all`, on every target,

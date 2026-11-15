@@ -20,8 +20,8 @@ use super::upgrade::{self, Candidate, Facts, Phase, Request, SessionFile, Source
 use crate::RelayClient;
 use crate::supervise::approvals;
 use crate::supervise::policy::git_config::claude_dir_at;
-use crate::supervise::run::composer_guard;
 use crate::supervise::screen::HumanInput;
+use alab_policy::guard::composer_guard;
 
 #[path = "upgrade_status.rs"]
 mod upgrade_status;
@@ -1342,28 +1342,66 @@ fn terminal_owner(pid: u32, t: &[(u32, u32, String, String)]) -> Option<(u32, &s
     None
 }
 
-fn live_terminal(pid: u32) -> Option<(u32, String)> {
+/// What a read of the process that opened a process's terminal found ([`Kernel::terminal_read`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TerminalRead {
+    /// The process table, or the process's own row in it, was not read (unreadable, held past
+    /// its wait by a process in the middle of an exec, or the process gone since it was named):
+    /// nothing is known of its terminal, and a caller never takes this for a terminal nobody
+    /// opened (LS-15).
+    Unread,
+    /// The process's row was read: the process that opened its terminal and that one's name, or
+    /// `None` where it has no controlling terminal or no opener was found above it.
+    Read(Option<(u32, String)>),
+}
+
+impl TerminalRead {
+    /// The opener read, an unread table giving none ([`Kernel::terminal`]'s answer).
+    fn opener(self) -> Option<(u32, String)> {
+        match self {
+            Self::Read(opener) => opener,
+            Self::Unread => None,
+        }
+    }
+}
+
+fn live_terminal_read(pid: u32) -> TerminalRead {
     #[cfg(target_os = "macos")]
     {
-        let rows = aterm_sysprobe::kproc::records()?;
+        let Some(rows) = aterm_sysprobe::kproc::records() else {
+            return TerminalRead::Unread;
+        };
+        if !rows.iter().any(|r| r.pid == pid) {
+            return TerminalRead::Unread;
+        }
         let walk: Vec<(u32, u32, String, String)> = rows
             .iter()
             .map(|r| (r.pid, r.ppid, tty_word(r.tty), String::new()))
             .collect();
-        let (owner, _) = terminal_owner(pid, &walk)?;
-        let r = rows.iter().find(|r| r.pid == owner)?;
-        Some((owner, comm_name(r)))
+        TerminalRead::Read(terminal_owner(pid, &walk).and_then(|(owner, _)| {
+            let r = rows.iter().find(|r| r.pid == owner)?;
+            Some((owner, comm_name(r)))
+        }))
     }
     // No process on Windows has a controlling terminal: a pseudoconsole is not an identity the
     // kernel records against the processes attached to it.
     #[cfg(windows)]
     {
-        let _ = pid;
-        None
+        // A missing or unreadable process is not an observed terminal owner.
+        if kernel_start(pid).is_none() {
+            return TerminalRead::Unread;
+        }
+        TerminalRead::Read(None)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        terminal_owner(pid, &tty_table()).map(|(owner, name)| (owner, name.to_string()))
+        let table = tty_table();
+        if !table.iter().any(|(listed, _, _, _)| *listed == pid) {
+            return TerminalRead::Unread;
+        }
+        TerminalRead::Read(
+            terminal_owner(pid, &table).map(|(owner, name)| (owner, name.to_string())),
+        )
     }
 }
 
@@ -1495,6 +1533,12 @@ pub(super) trait Kernel {
     }
     fn parent(&self, pid: u32) -> Option<u32>;
     fn terminal(&self, pid: u32) -> Option<(u32, String)>;
+    /// [`Self::terminal`] with a read that was not made told apart from a terminal nobody opened
+    /// ([`TerminalRead`]). An injected kernel's answer counts as read; the live kernel says where
+    /// the process table or the process's row was not read.
+    fn terminal_read(&self, pid: u32) -> TerminalRead {
+        TerminalRead::Read(self.terminal(pid))
+    }
     fn opener(&self, agent: u32, parent: u32) -> Option<String> {
         self.terminal(agent)
             .filter(|(owner, _)| *owner == parent)
@@ -1593,7 +1637,11 @@ impl Kernel for Live {
     }
 
     fn terminal(&self, pid: u32) -> Option<(u32, String)> {
-        live_terminal(pid)
+        live_terminal_read(pid).opener()
+    }
+
+    fn terminal_read(&self, pid: u32) -> TerminalRead {
+        live_terminal_read(pid)
     }
 
     fn opener(&self, agent: u32, parent: u32) -> Option<String> {
@@ -2922,7 +2970,7 @@ pub(super) fn roster(c: &mut Client) -> Vec<String> {
     body.lines()
         .filter_map(|l| {
             l.split_whitespace()
-                .find(|t| t.starts_with("s-"))
+                .find(|t| aterm_types::control_verbs::is_minted_sid(t))
                 .map(str::to_owned)
         })
         .collect()
@@ -2952,7 +3000,10 @@ pub(super) fn aside_read(c: &mut Client, agents_off: &[aterm_phase::Program]) ->
     let mut aside = Aside::default();
     for row in body.lines() {
         let mut words = row.split_whitespace();
-        let Some(sid) = words.nth(1).filter(|s| s.starts_with("s-")) else {
+        let Some(sid) = words
+            .nth(1)
+            .filter(|s| aterm_types::control_verbs::is_minted_sid(s))
+        else {
             continue;
         };
         let (mut holder, mut autopilot, mut program) = (None, None, None);
@@ -3033,7 +3084,9 @@ pub(crate) fn roster_rows(body: &str) -> Option<Vec<(u64, LiveTab)>> {
         let mut words = row.split_whitespace();
         let local = crate::parse_uint::<u64>(words.next()?)?;
         let sid = words.next()?.to_string();
-        if !sid.starts_with("s-") || rows.iter().any(|(_, t)| t.sid == sid) {
+        if !aterm_types::control_verbs::is_minted_sid(&sid)
+            || rows.iter().any(|(_, t)| t.sid == sid)
+        {
             return None;
         }
         let fgpgid = row
@@ -5367,6 +5420,13 @@ impl St {
         }
     }
 
+    /// [`Self::note_wait`] of `word` at `now`, its entry in the wait log noting `why`, the reason
+    /// in full where the word cannot say it (which check an account admission refused).
+    pub(super) fn note_wait_why(&mut self, word: &str, why: &str, now: u64) {
+        self.note_wait(word, now);
+        self.annotate_wait(now, why);
+    }
+
     fn annotate_wait(&mut self, now: u64, note: &str) {
         if let Some(last) = self.waits.last_mut()
             && last.at == now
@@ -6748,8 +6808,7 @@ pub(super) fn registry_life<'a>(
     known_live: &'a [String],
 ) -> impl Fn(&str) -> TabLife + 'a {
     fn entry(graph: &Path, sid: &str) -> Option<bool> {
-        let hex = sid.strip_prefix("s-")?;
-        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !aterm_types::control_verbs::is_minted_sid(sid) {
             return None;
         }
         match std::fs::symlink_metadata(graph.join(sid)) {
@@ -8251,7 +8310,7 @@ pub(super) fn ledger_tabs(body: &str, session: &str, tab: &str) -> Vec<(String, 
         .collect();
     let mut last: Vec<(String, usize)> = Vec::new();
     for (i, (_, t, s)) in rows.iter().enumerate() {
-        if s == session && t != tab && super::tap::is_tab_id(t) {
+        if s == session && t != tab && aterm_types::control_verbs::is_minted_sid(t) {
             last.retain(|(x, _)| x != t);
             last.push((t.clone(), i));
         }
@@ -8439,7 +8498,7 @@ fn noted_earlier_tabs_read(
     read(&earlier_tabs_path(root, tab))
         .map(|body| {
             body.lines()
-                .filter(|t| super::tap::is_tab_id(t) && *t != tab)
+                .filter(|t| aterm_types::control_verbs::is_minted_sid(t) && *t != tab)
                 .map(str::to_string)
                 .collect()
         })
@@ -8454,7 +8513,10 @@ pub fn note_earlier_tab(opts: &Opts, tab: &str, was: &str) {
 }
 
 pub(crate) fn note_earlier_tab_under(root: &Path, tab: &str, was: &str) {
-    if !super::tap::is_tab_id(tab) || !super::tap::is_tab_id(was) || was == tab {
+    if !aterm_types::control_verbs::is_minted_sid(tab)
+        || !aterm_types::control_verbs::is_minted_sid(was)
+        || was == tab
+    {
         return;
     }
     let Some(body) = earlier_tab_note(tab, was, noted_earlier_tabs(root, tab)) else {
@@ -8464,8 +8526,8 @@ pub(crate) fn note_earlier_tab_under(root: &Path, tab: &str, was: &str) {
 }
 
 fn earlier_tab_note(tab: &str, was: &str, mut noted: Vec<String>) -> Option<String> {
-    if !super::tap::is_tab_id(tab)
-        || !super::tap::is_tab_id(was)
+    if !aterm_types::control_verbs::is_minted_sid(tab)
+        || !aterm_types::control_verbs::is_minted_sid(was)
         || was == tab
         || noted.iter().any(|t| t == was)
     {
@@ -8483,7 +8545,7 @@ pub(super) fn earlier_tabs<'a>(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for t in tabs {
-        if !super::tap::is_tab_id(t) || t == current {
+        if !aterm_types::control_verbs::is_minted_sid(t) || t == current {
             continue;
         }
         out.retain(|o| o != t);
@@ -8570,6 +8632,58 @@ impl Tasked {
             return Some(true);
         }
         at_end.then_some(false)
+    }
+}
+
+/// THE `/goal` OF THE CONVERSATION A RELAUNCH SNAPSHOT NAMES, by its own record
+/// ([`super::goal::GoalRecord`]): the transcript found as [`Finished`] finds it, at each ask, and
+/// read on from where the last ask stopped. Claude Code's alone; another conversation starts it
+/// over.
+#[derive(Debug, Default)]
+pub struct GoalOf {
+    session: String,
+    record: super::goal::GoalRecord,
+}
+
+impl GoalOf {
+    /// What the record of the conversation `snap` names says of its goal; unread where `snap`
+    /// names no Claude Code conversation, or its transcript is not found or not read to its end.
+    pub fn of_snapshot(
+        &mut self,
+        user_home: &Path,
+        snap: &super::relaunch::Snapshot,
+    ) -> super::goal::GoalRead {
+        self.of_snapshot_at(user_home, snap, || live_cwd(snap))
+    }
+
+    pub(super) fn of_snapshot_at(
+        &mut self,
+        user_home: &Path,
+        snap: &super::relaunch::Snapshot,
+        cwd: impl FnOnce() -> Option<PathBuf>,
+    ) -> super::goal::GoalRead {
+        use super::goal::GoalRead;
+        let Some(session) = snap.session.as_deref() else {
+            return GoalRead::Unread;
+        };
+        match snap.run {
+            super::relaunch::AgentRun::Claude => {}
+            super::relaunch::AgentRun::Codex(_)
+            | super::relaunch::AgentRun::Muse(_)
+            | super::relaunch::AgentRun::Agy(_) => return GoalRead::Unread,
+        }
+        if self.session != session {
+            *self = Self {
+                session: session.to_string(),
+                ..Self::default()
+            };
+        }
+        match conversation_dir(user_home, snap, session, cwd)
+            .and_then(|dir| transcript_in(&dir, session))
+        {
+            Some(path) => self.record.read(&path),
+            None => GoalRead::Unread,
+        }
     }
 }
 
@@ -9260,6 +9374,14 @@ pub fn named_standing_wall(
     snap: &super::relaunch::Snapshot,
 ) -> Option<upgrade::StandingWall> {
     upgrade::transcript_standing_wall(&snapshot_tail(user_home, snap)?)
+}
+
+/// The status of the newest API error Claude Code wrote in `snap`'s conversation
+/// ([`super::token_route::newest_api_error_status`]): what says whether a lost-login wall on a
+/// token session is the token's refusal.
+#[must_use]
+pub fn named_api_error_status(user_home: &Path, snap: &super::relaunch::Snapshot) -> Option<u16> {
+    super::token_route::newest_api_error_status(&snapshot_tail(user_home, snap)?)
 }
 
 /// Reads the environment only while the process identity and captured login agree.
@@ -10234,7 +10356,7 @@ fn known_after(step: &str, waits: u32) -> Option<After> {
 
 fn ladder(waits: u32) -> After {
     After::Later(
-        crate::supervise::ladder::Ladder(&later_rungs())
+        alab_policy::ladder::Ladder(&later_rungs())
             .step(usize::try_from(waits).unwrap_or(usize::MAX)),
     )
 }
@@ -11939,7 +12061,7 @@ pub(super) fn ladder_look(
         scr.cursor.map(|(_, col)| col),
         scr.title.as_deref(),
     );
-    let idle_read = reading.phase == aterm_phase::Phase::Idle
+    let idle_read = reading.phase == alab_policy::vocab::Phase::Idle
         && reading.phase_authoritative
         && reading.wall.is_none()
         && reading.prompt.is_none();
@@ -13184,6 +13306,9 @@ fn launch_of<'a>(
         homedir: None,
         login,
         route,
+        // An upgrade replaces the live agent it reads these off: a line that keeps them keeps its
+        // credential.
+        running: Some(crate::harness::relaunch::Running { home, login, route }),
         auth_observed,
         launch_env: None,
         serve: crate::harness::relaunch::Serve::Judge,
@@ -13379,7 +13504,7 @@ fn reads_idle(read: &Screen) -> bool {
         read.cursor.map(|(_, col)| col),
         read.title.as_deref(),
     );
-    reading.phase == aterm_phase::Phase::Idle
+    reading.phase == alab_policy::vocab::Phase::Idle
         && reading.phase_authoritative
         && reading.wall.is_none()
         && reading.prompt.is_none()
@@ -13974,16 +14099,17 @@ fn restart(
         // (`relaunch::relaunch_account_admits`), so an upgrade never ends an agent it cannot
         // start again.
         if st.native.is_none()
-            && let Err(why) = super::relaunch::relaunch_account_admits(opts, st, shell)
+            && let Err(refusal) = super::relaunch::relaunch_account_admits(opts, st, shell)
         {
             aterm_log::info!(
                 "harness @{tab}: the upgrade waits before its signal: its relaunch's account \
-                 would wait: {why}"
+                 would wait"
             );
             st.unsent(back);
             st.cause.clear();
+            let waits = super::relaunch::account_refused(r.clone(), st, &refusal, now_s());
             save(opts, &sf.session_id, st);
-            break 'signal Some(said(r.clone(), super::relaunch::WAIT_ACCOUNT));
+            break 'signal Some(waits);
         }
         let signal = if let Some(binding) = st.native.as_ref() {
             super::native_restart::signal(c, tab, binding)

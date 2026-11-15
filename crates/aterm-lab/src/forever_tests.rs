@@ -3,18 +3,22 @@
 
 //! Tests for `lab forever` stub scripts, request readers, and scenario judge.
 
+use alab_policy::config::CONTINUE_TEXT;
+use alab_policy::land_check::{
+    LAND_CHECK, LAND_CHECK_HINT_CLOSE, RULE_LAND_CHECK, WAITS_ON_YOU, hint_clause, land_check_text,
+    listed_suffix,
+};
+use alab_policy::needs::needs_you;
+use alab_policy::open_work::clean_defense;
+use alab_policy::words::{
+    DONE_CHECK, LAND, LAND_ANSWER, LAND_CONTRADICTED_HEAD, LAND_NUDGE, RULE_LEFT, Said,
+    classify_said, says_done,
+};
 use aterm_agent::harness::acts::HeldBy;
 use aterm_agent::harness::repo_work::{RepoRead, RepoWork};
 use aterm_agent::supervise::approvals::LEFT_REASON;
-use aterm_agent::supervise::config::CONTINUE_TEXT;
-use aterm_agent::supervise::policy::land_check::{
-    LAND_CHECK_HINT_CLOSE, WAITS_ON_YOU, hint_clause, land_check_text, listed_suffix,
-};
-use aterm_agent::supervise::policy::needs::needs_you;
 use aterm_agent::supervise::policy::turn_end::{
-    DONE_CHECK, LAND, LAND_ANSWER, LAND_CHECK, LAND_CONTRADICTED_HEAD, LAND_NUDGE,
-    REVERSIBLE_ANSWER, RULE_LAND_CHECK, RULE_LEFT, Said, classify_said, clean_defense,
-    land_contradicted, open_work_suffix, repo_work_suffix, says_done,
+    REVERSIBLE_ANSWER, land_contradicted, open_work_suffix, repo_work_suffix,
 };
 
 use super::surfaces::held::tests::three_a_said;
@@ -131,17 +135,20 @@ fn the_owners_continuation_is_the_labs_continue_text_blank_line_and_all() {
     let (cfg, warnings) =
         SupervisorConfig::from_aterm_toml(&format!("[harness]\n{}\n", owner_keys()));
     assert!(warnings.is_empty(), "{warnings:?}");
-    assert_eq!(cfg.continue_text, OWNER_CONTINUE);
-    assert!(cfg.continue_text.contains("\n\n"));
+    assert_eq!(cfg.turn_end.continue_text, OWNER_CONTINUE);
+    assert!(cfg.turn_end.continue_text.contains("\n\n"));
     for head in [DEFENSE_HEAD, "NEEDS YOU:"] {
         assert!(
-            cfg.continue_text.lines().any(|l| l.starts_with(head)),
+            cfg.turn_end
+                .continue_text
+                .lines()
+                .any(|l| l.starts_with(head)),
             "{head}"
         );
     }
     let raw = format!("[harness]\ncontinue_text = \"{OWNER_CONTINUE}\"\n");
     let (cfg, _) = SupervisorConfig::from_aterm_toml(&raw);
-    assert_ne!(cfg.continue_text, OWNER_CONTINUE);
+    assert_ne!(cfg.turn_end.continue_text, OWNER_CONTINUE);
     assert!(Chain::COVER.contains(&Chain::CruiseO));
     assert_eq!(Chain::CruiseO.autopilot(), "cruise");
     assert_eq!(Chain::CruiseO.scenarios(), [Scenario::C4]);
@@ -2650,8 +2657,8 @@ fn a_no_remote_or_plain_landing_comes_through_the_check() {
                 T0 + 1_000,
                 format!(
                     "CONTINUED seq=3 rule={} {}",
-                    turn_end::RULE_LAND_CHECK,
-                    turn_end::LAND_CHECK_HEAD
+                    alab_policy::land_check::RULE_LAND_CHECK,
+                    alab_policy::land_check::LAND_CHECK_HEAD
                 ),
             ));
         }
@@ -2659,7 +2666,7 @@ fn a_no_remote_or_plain_landing_comes_through_the_check() {
             T0 + 2_000,
             format!(
                 "DONE seq=4 rule={} Nothing left: committed.",
-                turn_end::RULE_LAND
+                alab_policy::words::RULE_LAND
             ),
         ));
         s
@@ -4006,7 +4013,7 @@ fn the_ladder_and_angles_modes_alone_run_the_ladder_at_an_eighth_and_the_outages
         let seam = u
             .instance_env
             .split_whitespace()
-            .find(|w| w.starts_with(turn_end::LADDER_SCALE_SEAM))
+            .find(|w| w.starts_with(aterm_agent::supervise::config::LADDER_SCALE_SEAM))
             .map(str::to_string);
         assert_eq!(seam, env, "{mode:?}");
     }
@@ -5553,7 +5560,7 @@ const LAND_SINCE: &str = "1125";
 /// Its opening sweep's read (5d): its chip drawn in front before its first prompt, the title its
 /// mode's sentence from MODE_WORDS.
 fn opened(program: &str, mode: &str) -> Option<(i64, String)> {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     use aterm_agent::supervise::mode_words::mode_words;
     let m = Autopilot::ALL
         .into_iter()
@@ -8244,7 +8251,7 @@ fn laddered_late(scale: f64, late: u32, extra: i64) -> Seen {
 
 /// [`laddered`] as main journals it past its forward recovery (`g2-cl-lad`, bo1's merged arm,
 /// 2026-11-01): the stub's one reply repeats from the second act on, so from step 3 each wait is
-/// the recovery's (`turn_end::REPEAT_RECOVERY_WAIT`), naming no streak.
+/// the recovery's (`alab_policy::words::REPEAT_RECOVERY_WAIT`), naming no streak.
 fn laddered_recovering(scale: f64) -> Seen {
     let mut s = laddered(scale);
     for (_, l) in &mut s.journal {
@@ -8260,7 +8267,7 @@ fn laddered_recovering(scale: f64) -> Seen {
         let until = word(l, "until").unwrap();
         *l = format!(
             "WAITING seq={n} until={until} {}",
-            turn_end::REPEAT_RECOVERY_WAIT
+            alab_policy::words::REPEAT_RECOVERY_WAIT
         );
     }
     s
@@ -8286,7 +8293,7 @@ fn the_ladder_reads_the_recoverys_waits_as_its_steps() {
     let mut other = s.clone();
     for (_, l) in &mut other.journal {
         *l = l.replace(
-            turn_end::REPEAT_RECOVERY_WAIT,
+            alab_policy::words::REPEAT_RECOVERY_WAIT,
             "standing decision refused; changing approach on the next turn",
         );
     }
@@ -8304,7 +8311,7 @@ fn the_ladder_reads_the_recoverys_waits_as_its_steps() {
     short.journal[k].1 = format!(
         "WAITING seq=5 until={} {}",
         stamp(t + 60_000),
-        turn_end::REPEAT_RECOVERY_WAIT
+        alab_policy::words::REPEAT_RECOVERY_WAIT
     );
     let (w, why) = lad(&short);
     assert_eq!(w, "FAIL", "{why}");
@@ -8436,9 +8443,9 @@ fn the_ladder_passes_only_where_its_steps_double_to_the_cap_each_act_at_its_due(
 
 #[test]
 fn the_judges_ladder_is_the_products_own_scaled() {
-    use aterm_agent::supervise::ladder::doubling;
+    use alab_policy::ladder::doubling;
     for scale in [1.0, 0.5, LADDER_SCALE] {
-        let t = turn_end::TurnEndTiming::default().ladder_scaled(scale);
+        let t = alab_policy::config::TurnEndTiming::default().ladder_scaled(scale);
         for n in 1..=9_u32 {
             let d = doubling(t.short_backoff, n - 1, t.short_backoff_max);
             assert_eq!(
@@ -9166,7 +9173,7 @@ fn cruise_forward() -> Seen {
             372_300,
             &format!(
                 "WAITING seq=2616 until=x {}",
-                turn_end::REPEAT_RECOVERY_WAIT
+                alab_policy::words::REPEAT_RECOVERY_WAIT
             ),
         ),
     ]);

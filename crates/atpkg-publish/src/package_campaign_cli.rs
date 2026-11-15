@@ -10,7 +10,7 @@ use crate::channel::Log;
 use std::collections::BTreeSet;
 
 /// One durable regular-package publication, through Agh for both owners.
-pub const SYNOPSIS: &str = "publish-package PKG --build YYYYMMDDNN --source-repo DIR --state DIR [--program codex] (requires --host agh)";
+pub const SYNOPSIS: &str = "publish-package PKG --build YYYYMMDDNN --source-repo DIR --state DIR [--program codex] [--valid-until YYYY-MM-DDTHH:MM:SSZ] (requires --host agh)";
 
 /// Qualify, retain, stage, read back and publish one package and its exact index.
 /// # Errors
@@ -18,6 +18,7 @@ pub const SYNOPSIS: &str = "publish-package PKG --build YYYYMMDDNN --source-repo
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let mut native = Vec::new();
     let mut state = None;
+    let mut valid_until = None;
     let mut source = false;
     let mut seen = BTreeSet::new();
     let mut arguments = args.iter();
@@ -27,6 +28,12 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
                 let value = arguments.next().ok_or_else(|| Error::usage(SYNOPSIS))?;
                 if state.replace(PathBuf::from(value)).is_some() {
                     return Err(Error::usage("publish-package names --state once"));
+                }
+            }
+            "--valid-until" => {
+                let value = arguments.next().ok_or_else(|| Error::usage(SYNOPSIS))?;
+                if valid_until.replace(value.as_str()).is_some() {
+                    return Err(Error::usage("publish-package names --valid-until once"));
                 }
             }
             "--out" | "--key" | "--toolchain" | "--upload" => {
@@ -74,11 +81,19 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
         &HostTools,
         &inputs,
         &|build| atpkg::cli::signed_tree_root("trust", build),
+        valid_until,
         &mut Log::echo("atpkg-publish publish-package"),
     )?;
-    println!(
-        "{} {} build {} published and read back at index {}",
-        request.program, pkg.version, request.build, outcome.published.index_build
-    );
+    if outcome.published_now {
+        println!(
+            "{} {} build {} published and read back at index {}",
+            request.program, pkg.version, request.build, outcome.index_build
+        );
+    } else {
+        println!(
+            "{} {} build {} was already published at index {}, read back again: nothing to do",
+            request.program, pkg.version, request.build, outcome.index_build
+        );
+    }
     Ok(())
 }

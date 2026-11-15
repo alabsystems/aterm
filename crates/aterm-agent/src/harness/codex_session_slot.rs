@@ -30,15 +30,7 @@ pub struct Caller {
 
 impl Caller {
     fn valid(&self) -> bool {
-        self.pid > 1
-            && self.birth > 0
-            && self.sid.starts_with("s-")
-            && self.sid.len() > 2
-            && self.sid.len() <= 64
-            && self
-                .sid
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        self.pid > 1 && self.birth > 0 && aterm_types::control_verbs::is_minted_sid(&self.sid)
     }
 }
 

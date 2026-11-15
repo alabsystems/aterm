@@ -12,6 +12,7 @@ const NOW: Clocks = Clocks {
 /// The menu for `startup` and `version`, the lid option off and no pause.
 fn shown(startup: Startup, version: &str) -> Shown<'_> {
     Shown {
+        aterm: true,
         startup,
         lid_awake: false,
         paused: None,
@@ -30,7 +31,7 @@ fn tags_round_trip_and_unknown_is_inert() {
             assert_ne!(action.tag(), other.tag());
         }
     }
-    for tag in [0, -1, 8, isize::MAX, isize::MIN] {
+    for tag in [0, -1, 9, isize::MAX, isize::MIN] {
         assert_eq!(MenuAction::from_tag(tag), None, "{tag}");
     }
 }
@@ -49,7 +50,7 @@ fn actions(rows: &[Row]) -> Vec<(String, MenuAction, bool)> {
 }
 
 #[test]
-fn the_menu_is_about_activate_startup_quit() {
+fn the_menu_is_about_open_activate_startup_quit() {
     let rows = compose(Mode::Off, NOW, shown(Startup::Off, "0.106.0"));
     assert_eq!(rows[0], Row::Info(about_line("0.106.0")));
     assert_eq!(rows.iter().filter(|r| matches!(r, Row::Info(_))).count(), 1);
@@ -64,18 +65,42 @@ fn the_menu_is_about_activate_startup_quit() {
     assert_eq!(
         shape,
         [
-            "info", "-", "item", "item", "item", "item", "-", "item", "item", "-", "item"
+            "info", "-", "item", "-", "item", "item", "item", "item", "-", "item", "item", "-",
+            "item"
         ]
     );
     let items = actions(&rows);
     let order: Vec<_> = items.iter().map(|(_, a, _)| *a).collect();
     assert_eq!(order, MenuAction::ALL);
     assert!(items.iter().all(|(_, _, checked)| !checked));
-    assert_eq!(items[0].0, "Activate for 1 Hour");
-    assert_eq!(items[3].0, "Activate Forever");
-    assert_eq!(items[4].0, LID_LABEL);
-    assert_eq!(items[5].0, STARTUP_LABEL);
-    assert_eq!(items[6].0, QUIT_LABEL);
+    assert_eq!(items[0].0, OPEN_ATERM_LABEL);
+    assert_eq!(items[1].0, "Activate for 1 Hour");
+    assert_eq!(items[4].0, "Activate Forever");
+    assert_eq!(items[5].0, LID_LABEL);
+    assert_eq!(items[6].0, STARTUP_LABEL);
+    assert_eq!(items[7].0, QUIT_LABEL);
+}
+
+#[test]
+fn a_mug_with_no_aterm_app_has_no_open_aterm_row() {
+    let with = compose(Mode::Off, NOW, shown(Startup::Off, "1"));
+    let without = compose(
+        Mode::Off,
+        NOW,
+        Shown {
+            aterm: false,
+            ..shown(Startup::Off, "1")
+        },
+    );
+    // The row and the separator under it go; nothing else changes.
+    assert_eq!(without.len() + 2, with.len());
+    assert_eq!(without[..2], with[..2]);
+    assert_eq!(without[2..], with[4..]);
+    assert!(
+        actions(&without)
+            .iter()
+            .all(|(_, a, _)| *a != MenuAction::OpenAterm)
+    );
 }
 
 #[test]
@@ -163,8 +188,8 @@ fn a_clock_set_back_shows_the_time_really_left() {
         wall: NOW.wall - 24 * HOUR + 8 * 60,
     };
     let items = actions(&compose(mode, back, shown(Startup::Off, "1")));
-    assert_eq!(items[0].0, "Activate for 1 Hour \u{2014} 52 min left");
-    assert!(items[0].2);
+    assert_eq!(items[1].0, "Activate for 1 Hour \u{2014} 52 min left");
+    assert!(items[1].2);
     assert_eq!(
         tooltip(mode, back, HELD),
         "aCaffeine is keeping this Mac awake for 52 min more"

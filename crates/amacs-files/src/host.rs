@@ -276,23 +276,113 @@ impl StepFailure {
     }
 }
 
+/// An immutable admission payload. Public fields are readable through shared
+/// references only; admission and grant owners never expose mutable payload access.
+#[derive(Debug)]
+pub struct AdmittedPayload {
+    directory: bool,
+    pub text: Arc<String>,
+    pub prepared_text: amacs::store::PreparedText,
+    pub observed: ObservedFileVersion,
+    baseline: PreparedBaseline,
+}
+
+impl AdmittedPayload {
+    pub fn is_directory(&self) -> bool {
+        self.directory
+    }
+
+    fn new(
+        text: Arc<String>,
+        observed: ObservedFileVersion,
+        directory: Option<Arc<amacs::store::DirectoryListing>>,
+        reservation: Option<amacs::store::PreparationReservation>,
+    ) -> Arc<Self> {
+        let is_directory = directory.is_some();
+        // The reservation still owns construction capacity through baseline encoding.
+        let baseline = PreparedBaseline::new(
+            observed,
+            directory
+                .as_ref()
+                .map_or(text.as_str(), |listing| listing.text.as_str()),
+        );
+        let prepared_text = match reservation {
+            Some(reservation) => {
+                amacs::store::PreparedText::prepare_reserved(text, directory, reservation)
+            }
+            None => match directory {
+                Some(listing) => amacs::store::PreparedText::from_directory(listing),
+                None => amacs::store::PreparedText::from_shared(text),
+            },
+        };
+        let text = prepared_text.shared_line();
+        Arc::new(Self {
+            baseline,
+            prepared_text,
+            text,
+            observed,
+            directory: is_directory,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GrantedDocument {
-    pub directory: Option<amacs::store::DirectoryListing>,
     pub grant: DocumentGrant,
-    pub text: String,
+    /// The grant as it stood before this call changed it, which
+    /// [`DocumentGrantStore::reinstate`] puts back when the open it was granted for does not
+    /// install; `None` when this call minted it, which [`DocumentGrantStore::forget`] undoes.
+    pub prior: Option<DocumentGrant>,
+    binding: DocumentGrant,
+    payload: Arc<AdmittedPayload>,
+}
+impl std::ops::Deref for GrantedDocument {
+    type Target = AdmittedPayload;
+    fn deref(&self) -> &Self::Target {
+        &self.payload
+    }
+}
+
+/// A later bound read is an observation, not a prospective document open.
+/// It shares decoded content without constructing unused document storage.
+#[derive(Clone, Debug)]
+pub struct ObservedDocument {
+    pub grant: DocumentGrant,
+    pub text: Arc<String>,
     pub observed: ObservedFileVersion,
 }
 
 /// One local file or directory admitted but not yet granted.
 #[derive(Clone, Debug)]
 pub struct AdmittedDocument {
-    pub directory: Option<amacs::store::DirectoryListing>,
     pub(crate) canonical_uri: String,
     pub(crate) path: PathBuf,
     target: AtomicFileTarget,
-    pub(crate) text: String,
-    pub(crate) observed: ObservedFileVersion,
+    payload: Arc<AdmittedPayload>,
+}
+impl std::ops::Deref for AdmittedDocument {
+    type Target = AdmittedPayload;
+    fn deref(&self) -> &Self::Target {
+        &self.payload
+    }
+}
+
+/// An admitted snapshot whose existing logical grant was validated before publication.
+///
+/// Preparation may read the filesystem on a worker. Committing this value changes only the
+/// grant store; later reads and writes still validate the retained physical path bindings.
+#[derive(Clone, Debug)]
+pub struct PreparedDocumentGrant {
+    admitted: AdmittedDocument,
+    expected: Option<DocumentGrant>,
+    access: GrantAccess,
+}
+
+impl PreparedDocumentGrant {
+    /// The exact admitted base retained by this validated grant.
+    pub fn prepared_text(&self) -> amacs::store::PreparedText {
+        self.admitted.prepared_text.clone()
+    }
 }
 
 impl AdmittedDocument {
@@ -301,13 +391,18 @@ impl AdmittedDocument {
         &self.canonical_uri
     }
 
+    /// The decoded text captured by this admission.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
     /// Whether no file exists yet: admitted with [`AdmitOptions::allow_missing`] as an empty text, which the first save creates.
-    pub const fn is_missing(&self) -> bool {
+    pub fn is_missing(&self) -> bool {
         !self.observed.exists
     }
 
     /// How the admitted text maps back to the file's bytes.
-    pub const fn encoding(&self) -> DiskEncoding {
+    pub fn encoding(&self) -> DiskEncoding {
         self.observed.encoding()
     }
 }
@@ -359,19 +454,43 @@ pub fn admit_local_file_opts(
     uri: &str,
     options: AdmitOptions,
 ) -> Result<AdmittedDocument, DocumentHostError> {
+    admit_local_file_impl(uri, options, None)
+}
+
+/// Worker admission reserves retirement before reading/materializing text or navigation.
+pub fn admit_local_file_prepared_opts(
+    uri: &str,
+    options: AdmitOptions,
+) -> Result<AdmittedDocument, DocumentHostError> {
+    let reservation = crate::retirement::reservation().map_err(preparation_error)?;
+    admit_local_file_impl(uri, options, Some(reservation))
+}
+
+fn preparation_error(error: std::io::Error) -> DocumentHostError {
+    DocumentHostError::Io {
+        stage: AtomicSaveStage::Preflight,
+        message: format!("document preparation: {error}"),
+        kind: Some(error.kind()),
+    }
+}
+
+fn admit_local_file_impl(
+    uri: &str,
+    options: AdmitOptions,
+    reservation: Option<amacs::store::PreparationReservation>,
+) -> Result<AdmittedDocument, DocumentHostError> {
     let requested = file_uri_path(uri)?;
     if fs::symlink_metadata(&requested).is_ok_and(|metadata| metadata.is_dir()) {
         let target = resolve_atomic_target(&requested, options.allow_config_symlinks)?;
         let path = target.target_path.clone();
         let directory = read_directory(&path, options.limit)?;
         let observed = ObservedFileVersion::observed(directory.text.as_bytes(), None, None);
+        let text = Arc::new(String::new());
         return Ok(AdmittedDocument {
             canonical_uri: path_to_file_uri(&path)?,
             path,
             target,
-            text: directory.text.clone(),
-            observed,
-            directory: Some(directory),
+            payload: AdmittedPayload::new(text, observed, Some(Arc::new(directory)), reservation),
         });
     }
     let contents = read_atomic_file_with_config_symlinks(
@@ -389,13 +508,17 @@ pub fn admit_local_file_opts(
     }
     let canonical_uri = path_to_file_uri(&path)?;
     let decoded = decode_utf8(contents.bytes)?;
+    let text = Arc::new(decoded.text);
     Ok(AdmittedDocument {
-        directory: None,
         canonical_uri,
         path,
         target: contents.baseline.target,
-        text: decoded.text,
-        observed: contents.baseline.observed.with_encoding(decoded.encoding),
+        payload: AdmittedPayload::new(
+            text,
+            contents.baseline.observed.with_encoding(decoded.encoding),
+            None,
+            reservation,
+        ),
     })
 }
 
@@ -643,10 +766,31 @@ pub struct DocumentPersistenceStore {
 struct DocumentPersistence {
     grant: DocumentGrantId,
     save: SaveReducer,
-    observed_image: Option<ObservedDocumentImage>,
+    observed_image: Option<Arc<ObservedDocumentImage>>,
+}
+
+/// Observation-bound immutable persistence baseline prepared during admission.
+#[derive(Clone, Debug)]
+struct PreparedBaseline {
+    version: ObservedFileVersion,
+    image: Option<Arc<ObservedDocumentImage>>,
+}
+impl PreparedBaseline {
+    fn new(version: ObservedFileVersion, text: &str) -> Self {
+        Self {
+            version,
+            image: version.exists.then(|| {
+                Arc::new(ObservedDocumentImage::new(
+                    version,
+                    Arc::from(text.as_bytes()),
+                ))
+            }),
+        }
+    }
 }
 
 /// The exact text of one observed version, as the document holds it.
+#[derive(Clone, Debug)]
 struct ObservedDocumentImage {
     version: ObservedFileVersion,
     /// The text as the document holds it, which `version`'s encoding maps to
@@ -658,6 +802,11 @@ struct ObservedDocumentImage {
 
 impl ObservedDocumentImage {
     fn new(version: ObservedFileVersion, bytes: Arc<[u8]>) -> Self {
+        #[cfg(any(test, debug_assertions))]
+        amacs::store::record_preparation_work(amacs::store::PreparationWork {
+            baseline_input_bytes: bytes.len(),
+            ..Default::default()
+        });
         let reread = fresh_reading(&bytes, version.encoding());
         Self {
             version,
@@ -716,13 +865,22 @@ pub enum PersistenceError {
 }
 
 impl DocumentPersistenceStore {
-    pub fn register(
+    /// Register an admission's original disk image without materializing text on UI.
+    pub fn register_prepared(
         &mut self,
         document: DocumentId,
-        grant: DocumentGrantId,
-        observed: ObservedFileVersion,
-        text: &str,
+        granted: &GrantedDocument,
     ) -> Result<(), PersistenceError> {
+        let grant = granted.grant.id;
+        let binding = &granted.binding;
+        if grant != binding.id
+            || granted.grant.canonical_uri != binding.canonical_uri
+            || granted.grant.path != binding.path
+            || granted.grant.target != binding.target
+        {
+            return Err(PersistenceError::GrantMismatch);
+        }
+        let baseline = &granted.payload.baseline;
         if let Some(existing) = self.documents.get(&document) {
             return (existing.grant == grant)
                 .then_some(())
@@ -732,10 +890,8 @@ impl DocumentPersistenceStore {
             document,
             DocumentPersistence {
                 grant,
-                save: SaveReducer::new(document, observed),
-                observed_image: observed
-                    .exists
-                    .then(|| ObservedDocumentImage::new(observed, Arc::from(text.as_bytes()))),
+                save: SaveReducer::new(document, baseline.version),
+                observed_image: baseline.image.clone(),
             },
         );
         Ok(())
@@ -779,7 +935,7 @@ impl DocumentPersistenceStore {
             SaveReduction::Durable(_) => {
                 let version = persistence.save.observed();
                 persistence.observed_image =
-                    pending_bytes.map(|bytes| ObservedDocumentImage::new(version, bytes));
+                    pending_bytes.map(|bytes| Arc::new(ObservedDocumentImage::new(version, bytes)));
             }
             SaveReduction::ReboundEquivalent(_)
             | SaveReduction::Conflict(_)
@@ -844,6 +1000,15 @@ impl DocumentPersistenceStore {
         self.documents
             .get(&document)
             .map(|persistence| persistence.grant)
+    }
+
+    /// Whether some document's saver holds `grant`: an open that failed after registering it
+    /// leaves the grant with its document rather than forgetting or reinstating it
+    /// ([`GrantedDocument::prior`]).
+    pub fn binds(&self, grant: DocumentGrantId) -> bool {
+        self.documents
+            .values()
+            .any(|persistence| persistence.grant == grant)
     }
 
     /// Rebind `document`'s baseline to `observed`, whose exact text is `text` (a fresh read), leaving the buffer as it is.
@@ -912,7 +1077,7 @@ impl DocumentPersistenceStore {
                 .accept_observation(observed)
                 .map_err(PersistenceError::Save)?;
             if let Some(image) = persistence.observed_image.as_mut() {
-                image.version = observed;
+                Arc::make_mut(image).version = observed;
             }
             return Ok(());
         }
@@ -920,9 +1085,12 @@ impl DocumentPersistenceStore {
             .save
             .accept_observation(observed)
             .map_err(PersistenceError::Save)?;
-        persistence.observed_image = observed
-            .exists
-            .then(|| ObservedDocumentImage::new(observed, Arc::from(text.as_bytes())));
+        persistence.observed_image = observed.exists.then(|| {
+            Arc::new(ObservedDocumentImage::new(
+                observed,
+                Arc::from(text.as_bytes()),
+            ))
+        });
         Ok(())
     }
 }
@@ -976,36 +1144,125 @@ impl DocumentGrantStore {
         admitted: AdmittedDocument,
         access: GrantAccess,
     ) -> Result<GrantedDocument, DocumentHostError> {
+        let existing = self
+            .by_uri
+            .get(&admitted.canonical_uri)
+            .map(|id| {
+                self.grants
+                    .get(id)
+                    .cloned()
+                    .ok_or(DocumentHostError::UnknownGrant)
+            })
+            .transpose()?;
+        let prepared = Self::validate_admitted(admitted, access, existing)?;
+        self.grant_prepared(prepared)
+    }
+
+    /// Validate an admitted snapshot against the exact existing grant, away from its owner.
+    /// The returned value retains the complete physical binding, including symlink identities.
+    ///
+    /// # Errors
+    /// The existing binding no longer validates, or belongs to another canonical target.
+    pub fn prepare_admitted(
+        admitted: AdmittedDocument,
+        access: GrantAccess,
+        existing: Option<DocumentGrant>,
+    ) -> Result<PreparedDocumentGrant, DocumentHostError> {
+        if admitted.prepared_text.has_graph() {
+            let reservation = if admitted.prepared_text.is_worker_prepared() {
+                None
+            } else {
+                Some(crate::retirement::reservation().map_err(preparation_error)?)
+            };
+            admitted
+                .prepared_text
+                .ensure_worker_owned(reservation)
+                .map_err(preparation_error)?;
+        } else if existing.is_none() {
+            return Err(preparation_error(std::io::Error::other(
+                "prepared storage was already consumed",
+            )));
+        }
+        Self::validate_admitted(admitted, access, existing)
+    }
+
+    fn validate_admitted(
+        admitted: AdmittedDocument,
+        access: GrantAccess,
+        existing: Option<DocumentGrant>,
+    ) -> Result<PreparedDocumentGrant, DocumentHostError> {
+        if let Some(grant) = &existing {
+            validate_atomic_target(&grant.target)?;
+            if grant.canonical_uri != admitted.canonical_uri
+                || grant.target.target_path != admitted.target.target_path
+            {
+                return Err(DocumentHostError::TargetRetargeted);
+            }
+        }
+        Ok(PreparedDocumentGrant {
+            admitted,
+            expected: existing,
+            access,
+        })
+    }
+
+    /// Commit a prepared grant without filesystem operations.
+    ///
+    /// The logical grant must still be the one preparation observed. A concurrent access
+    /// upgrade is retained; a missing, replaced, retargeted or downgraded grant is refused.
+    /// This publishes the prepared observation, not a fresh filesystem observation; every
+    /// subsequent file read or write keeps its existing physical-binding validation.
+    ///
+    /// # Errors
+    /// The logical grant changed after preparation, or fresh grant identifiers are exhausted.
+    pub fn grant_prepared(
+        &mut self,
+        prepared: PreparedDocumentGrant,
+    ) -> Result<GrantedDocument, DocumentHostError> {
+        let PreparedDocumentGrant {
+            admitted,
+            expected,
+            access,
+        } = prepared;
         let AdmittedDocument {
-            directory,
             canonical_uri,
             path,
             target: admitted_target,
-            text,
-            observed,
+            payload,
         } = admitted;
-        let access = if directory.is_some() {
+        let access = if payload.directory {
             GrantAccess::ReadOnly
         } else {
             access
         };
-        let grant = if let Some(id) = self.by_uri.get(&canonical_uri).copied() {
+        let (grant, prior) = if let Some(expected) = expected {
+            if self.by_uri.get(&canonical_uri) != Some(&expected.id) {
+                return Err(DocumentHostError::UnknownGrant);
+            }
             let grant = self
                 .grants
-                .get_mut(&id)
+                .get_mut(&expected.id)
                 .ok_or(DocumentHostError::UnknownGrant)?;
-            validate_atomic_target(&grant.target)?;
-            if grant.target.target_path != admitted_target.target_path {
+            if grant.id != expected.id
+                || grant.canonical_uri != expected.canonical_uri
+                || grant.path != expected.path
+                || grant.target != expected.target
+                || (expected.access.permits_write() && !grant.access.permits_write())
+            {
                 return Err(DocumentHostError::TargetRetargeted);
             }
+            let prior = grant.clone();
             grant.target.retain_logical_binding(&admitted_target);
-            grant.access = if directory.is_some() {
+            grant.access = if payload.directory {
                 GrantAccess::ReadOnly
             } else {
                 grant.access.merged(access)
             };
-            grant.clone()
+            (grant.clone(), Some(prior))
         } else {
+            if self.by_uri.contains_key(&canonical_uri) {
+                return Err(DocumentHostError::UnknownGrant);
+            }
             let raw = self.next_id.max(1);
             let id = DocumentGrantId(NonZeroU64::new(raw).ok_or(DocumentHostError::MalformedUri)?);
             self.next_id = raw.checked_add(1).ok_or(DocumentHostError::MalformedUri)?;
@@ -1018,13 +1275,13 @@ impl DocumentGrantStore {
             };
             self.by_uri.insert(canonical_uri, id);
             self.grants.insert(id, grant.clone());
-            grant
+            (grant, None)
         };
         Ok(GrantedDocument {
-            directory,
+            binding: grant.clone(),
             grant,
-            text,
-            observed,
+            prior,
+            payload,
         })
     }
 
@@ -1039,8 +1296,24 @@ impl DocumentGrantStore {
         }
     }
 
+    /// Put back a grant a later [`Self::grant_admitted`] widened or rebound
+    /// ([`GrantedDocument::prior`]) when the open it was granted for did not install: its
+    /// access and its binding exactly, under its id. A grant forgotten since stays forgotten.
+    pub fn reinstate(&mut self, prior: DocumentGrant) {
+        if let Some(grant) = self.grants.get_mut(&prior.id) {
+            *grant = prior;
+        }
+    }
+
     pub fn cloned_grant(&self, id: DocumentGrantId) -> Option<DocumentGrant> {
         self.grants.get(&id).cloned()
+    }
+
+    /// The current grant for a canonical URI, without a filesystem observation.
+    pub fn grant_for_uri(&self, canonical_uri: &str) -> Option<&DocumentGrant> {
+        self.by_uri
+            .get(canonical_uri)
+            .and_then(|id| self.grants.get(id))
     }
 
     /// Refresh a directory through its original path binding.
@@ -1078,7 +1351,7 @@ impl DocumentGrantStore {
         &self,
         id: DocumentGrantId,
         limit: usize,
-    ) -> Result<GrantedDocument, DocumentHostError> {
+    ) -> Result<ObservedDocument, DocumentHostError> {
         self.refresh_bound(id, limit, false)
     }
 
@@ -1087,7 +1360,7 @@ impl DocumentGrantStore {
         &self,
         id: DocumentGrantId,
         limit: usize,
-    ) -> Result<GrantedDocument, DocumentHostError> {
+    ) -> Result<ObservedDocument, DocumentHostError> {
         self.refresh_bound(id, limit, true)
     }
 
@@ -1096,7 +1369,7 @@ impl DocumentGrantStore {
         id: DocumentGrantId,
         limit: usize,
         allow_missing: bool,
-    ) -> Result<GrantedDocument, DocumentHostError> {
+    ) -> Result<ObservedDocument, DocumentHostError> {
         let grant = self
             .grants
             .get(&id)
@@ -1104,10 +1377,10 @@ impl DocumentGrantStore {
             .ok_or(DocumentHostError::UnknownGrant)?;
         let contents = read_bound_file(&grant.target, limit, allow_missing)?;
         let decoded = decode_utf8(contents.bytes)?;
-        Ok(GrantedDocument {
-            directory: None,
+        let text = Arc::new(decoded.text);
+        Ok(ObservedDocument {
             grant,
-            text: decoded.text,
+            text,
             observed: contents.baseline.observed.with_encoding(decoded.encoding),
         })
     }
@@ -1142,6 +1415,11 @@ fn execute_granted_save_with_elapsed(
 
 /// Decode file bytes into a buffer [`Decoded`], stripping any UTF-8 BOM and normalizing pure CRLF to LF.
 fn decode_utf8(bytes: Vec<u8>) -> Result<Decoded, DocumentHostError> {
+    #[cfg(any(test, debug_assertions))]
+    amacs::store::record_preparation_work(amacs::store::PreparationWork {
+        decoded_input_bytes: bytes.len(),
+        ..Default::default()
+    });
     // Decode after the BOM into a new String so the prover does not need to track an in-place drain range.
     if let [b0, b1, b2, text @ ..] = bytes.as_slice()
         && is_utf8_bom(*b0, *b1, *b2)
@@ -1833,7 +2111,7 @@ fn save_lock_path(path: &Path, parent: &Path) -> PathBuf {
 
 /// The name of the save lock of the file `name`, beside it.
 fn save_lock_name(name: &OsStr) -> String {
-    format!(".{}.aterm-write.lock", name.to_string_lossy())
+    aterm_durable::write_lock::name(name)
 }
 
 /// The save lock a commit of `path` takes, which a person may have to remove when it is another user's ([`SaveTouch::Lock`]).

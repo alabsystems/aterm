@@ -21,7 +21,13 @@ use super::*;
 
 /// The flags the landing gives a judgment's child, besides `--base`/`--events` and a round's
 /// `--judged`/`--shared`.
-const FLAGS: [&str; 4] = ["--input-drift", "--admit", "--timeout", "--test-cores"];
+const FLAGS: [&str; 5] = [
+    "--events-file-only",
+    "--admit",
+    "--timeout",
+    "--test-cores",
+    "--queued-since",
+];
 /// Where a tree states its verifier's contract.
 const CONTRACT: &str = "verify/contract";
 /// A contract's line naming the build recipe its verifier's code builds with (where its
@@ -126,7 +132,7 @@ fn words(
     let mut kept = Vec::new();
     while let Some(word) = words.next() {
         if FLAGS.contains(&word.as_str()) && !composer.contains(word) {
-            if word != crate::cli::INPUT_DRIFT {
+            if word != crate::cli::EVENTS_FILE_ONLY {
                 words.next();
             }
             continue;
@@ -160,8 +166,6 @@ fn refused() -> Judged {
 struct Log {
     said: Vec<String>,
     handoffs: Vec<Handoff>,
-    /// Each branch read: the contract of the image that read it, and its base.
-    branches: Vec<(Vec<String>, String)>,
     /// Each child: the contract of the image that composed its words, and the words.
     runs: Vec<(Vec<String>, Vec<String>)>,
     /// Each refusal a tree's verifier gave.
@@ -249,14 +253,7 @@ impl Landing<'_> {
                     }
                 }
             },
-            branch: &mut |_: &Path, base: &str| {
-                self.log
-                    .borrow_mut()
-                    .branches
-                    .push((contract.clone(), base.to_owned()));
-                crates(&["a"])
-            },
-            lane: &mut |_: &Path, _: &str| Lane::Pass,
+            records: super::quiet(),
             // A shared path a crate may own reaches every crate here: only the worlds' shared
             // Markdown is answered by a round.
             reach: &|_: &Path, _: &str, paths: Option<&[String]>| match paths {
@@ -270,6 +267,7 @@ impl Landing<'_> {
                 Some(Round {
                     judged: &delta.judged,
                     shared: Path::new("/shared"),
+                    readers: None,
                     mechanical: delta.mechanical,
                 }),
             ) {
@@ -279,6 +277,7 @@ impl Landing<'_> {
                     refused()
                 }
             },
+            autofix: &mut |_: &Path, _: &[String]| Ok(()),
             hand_over: &mut |image: &Image, file: &Path, root: &Path| {
                 assert_eq!(
                     root,
@@ -322,7 +321,7 @@ fn seed_contract(world: &World, contract: &[String]) -> String {
 }
 
 /// THE KI'S EXIT TEST: main moves into the branch's file during the first judgment and, in the
-/// same commit, retires `--input-drift` from its verifier. The interrupted judgment's re-judge
+/// same commit, retires `--events-file-only` from its verifier. The interrupted judgment's re-judge
 /// judges a tree whose verifier no longer takes a flag the starting image passes: the landing
 /// hands itself, once, to that tree's verifier with the receipt so far (one interrupted
 /// judgment), the branch's crates (read by the starting image over M1) and the person's
@@ -333,7 +332,7 @@ fn seed_contract(world: &World, contract: &[String]) -> String {
 #[test]
 fn a_rejudge_tree_whose_verifier_drops_a_flag_the_starting_run_passes_lands_as_that_tree() {
     let v1 = contract(&FLAGS);
-    let v2 = without(crate::cli::INPUT_DRIFT);
+    let v2 = without(crate::cli::EVENTS_FILE_ONLY);
     for lie in [false, true] {
         let world = world();
         let m1 = seed_contract(&world, &v1);
@@ -347,7 +346,9 @@ fn a_rejudge_tree_whose_verifier_drops_a_flag_the_starting_run_passes_lands_as_t
             }
             let first = log.borrow().runs[0].1.clone();
             assert!(
-                first.iter().any(|word| word == crate::cli::INPUT_DRIFT),
+                first
+                    .iter()
+                    .any(|word| word == crate::cli::EVENTS_FILE_ONLY),
                 "{first:?}"
             );
             assert!(
@@ -362,7 +363,10 @@ fn a_rejudge_tree_whose_verifier_drops_a_flag_the_starting_run_passes_lands_as_t
                 poll(&mut || false),
                 "a shared non-Markdown path dooms the run"
             );
-            Some(Ran::Interrupted { secs: 0 })
+            Some(Ran::Interrupted {
+                secs: 0,
+                queued: false,
+            })
         };
         let landing = Landing {
             world: &world,
@@ -379,7 +383,7 @@ fn a_rejudge_tree_whose_verifier_drops_a_flag_the_starting_run_passes_lands_as_t
         if lie {
             assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
             assert!(said.iter().any(|line| line == KI_LINE), "{said:#?}");
-            assert_eq!(log.refusals, ["verify: unknown flag `--input-drift`"]);
+            assert_eq!(log.refusals, ["verify: unknown flag `--events-file-only`"]);
             assert!(log.handoffs.is_empty());
             assert_eq!(origin_main(&world), moved, "nothing was pushed");
             continue;
@@ -399,7 +403,7 @@ fn a_rejudge_tree_whose_verifier_drops_a_flag_the_starting_run_passes_lands_as_t
             moved
         );
         assert_eq!((handoff.composes, &handoff.cone), (0, &m1));
-        assert_eq!(handoff.branch, Some(crates(&["a"])));
+        assert_eq!(handoff.branch, None);
         assert_eq!(handoff.words, ["--test-cores", "4"]);
         assert_eq!(
             (
@@ -408,21 +412,22 @@ fn a_rejudge_tree_whose_verifier_drops_a_flag_the_starting_run_passes_lands_as_t
             ),
             (1, 0)
         );
-        assert_eq!(
-            log.branches,
-            [(v1.clone(), m1)],
-            "read once, by the starting image"
-        );
         let [(_, first), (composer, second)] = log.runs.as_slice() else {
             panic!("two children: {:#?}", log.runs);
         };
-        assert!(first.iter().any(|word| word == crate::cli::INPUT_DRIFT));
+        assert!(
+            first
+                .iter()
+                .any(|word| word == crate::cli::EVENTS_FILE_ONLY)
+        );
         assert_eq!(
             composer, &v2,
             "the re-judge's words are its tree's own build's"
         );
         assert!(
-            !second.iter().any(|word| word == crate::cli::INPUT_DRIFT),
+            !second
+                .iter()
+                .any(|word| word == crate::cli::EVENTS_FILE_ONLY),
             "{second:?}"
         );
         assert!(
@@ -464,7 +469,7 @@ fn a_rejudge_tree_whose_verifier_drops_a_flag_the_starting_run_passes_lands_as_t
 #[test]
 fn a_first_judgment_of_a_merge_the_landing_made_runs_as_the_merged_tree() {
     let v1 = contract(&FLAGS);
-    let v2 = without(crate::cli::INPUT_DRIFT);
+    let v2 = without(crate::cli::EVENTS_FILE_ONLY);
     for lie in [false, true] {
         let world = world();
         seed_contract(&world, &v1);
@@ -486,7 +491,6 @@ fn a_first_judgment_of_a_merge_the_landing_made_runs_as_the_merged_tree() {
         if lie {
             assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
             assert!(said.iter().any(|line| line == KI_LINE), "{said:#?}");
-            assert_eq!(log.branches, [(v1.clone(), m1.clone())]);
             assert_eq!(origin_main(&world), m1, "nothing was pushed");
             continue;
         }
@@ -498,16 +502,11 @@ fn a_first_judgment_of_a_merge_the_landing_made_runs_as_the_merged_tree() {
         assert_eq!(handoff.base, m1);
         assert_eq!((&handoff.cone, handoff.branch.as_ref()), (&m1, None));
         assert_eq!(handoff.stated, Stated::default());
-        assert_eq!(
-            log.branches,
-            [(v2.clone(), m1)],
-            "read by the image that judges"
-        );
         let [(composer, run)] = log.runs.as_slice() else {
             panic!("one child: {:#?}", log.runs);
         };
         assert_eq!(composer, &v2);
-        assert!(!run.iter().any(|word| word == crate::cli::INPUT_DRIFT));
+        assert!(!run.iter().any(|word| word == crate::cli::EVENTS_FILE_ONLY));
         assert!(
             said.iter()
                 .any(|line| line.starts_with("verify land: LANDED")),
@@ -606,7 +605,7 @@ fn a_recheck_hands_over_with_its_composition_count() {
 #[test]
 fn an_image_whose_own_build_is_not_itself_could_not_run_instead_of_looping() {
     let v1 = contract(&FLAGS);
-    let v2 = without(crate::cli::INPUT_DRIFT);
+    let v2 = without(crate::cli::EVENTS_FILE_ONLY);
     for unstable in [true, false] {
         let world = world();
         seed_contract(&world, &v1);
@@ -636,7 +635,7 @@ fn an_image_whose_own_build_is_not_itself_could_not_run_instead_of_looping() {
                         && line.contains(FIX)),
                 "{said:#?}"
             );
-            assert!(log.runs.is_empty() && log.branches.is_empty());
+            assert!(log.runs.is_empty());
             assert_eq!(origin_main(&world), m1, "nothing was pushed");
         } else {
             assert_eq!(hops, [1], "{said:#?}");
@@ -655,7 +654,7 @@ fn an_image_whose_own_build_is_not_itself_could_not_run_instead_of_looping() {
 fn a_merge_that_changes_the_verifiers_build_recipe_hands_its_step_on_twice_and_lands() {
     let v1 = contract(&FLAGS);
     for changed in [true, false] {
-        let mut v2 = without(crate::cli::INPUT_DRIFT);
+        let mut v2 = without(crate::cli::EVENTS_FILE_ONLY);
         if changed {
             v2.push(format!("{RECIPE}2"));
         }
@@ -699,16 +698,11 @@ fn a_merge_that_changes_the_verifiers_build_recipe_hands_its_step_on_twice_and_l
         if changed {
             judging.push(format!("{BUILT_BY}2"));
         }
-        assert_eq!(
-            log.branches,
-            [(judging.clone(), m1)],
-            "read by the image that judges"
-        );
         let [(composer, run)] = log.runs.as_slice() else {
             panic!("one child: {:#?}", log.runs);
         };
         assert_eq!(composer, &judging);
-        assert!(!run.iter().any(|word| word == crate::cli::INPUT_DRIFT));
+        assert!(!run.iter().any(|word| word == crate::cli::EVENTS_FILE_ONLY));
         assert!(
             said.iter()
                 .any(|line| line.starts_with("verify land: LANDED")),
@@ -788,7 +782,7 @@ fn a_recheck_whose_merge_changes_the_build_recipe_hands_on_twice_with_its_count(
 }
 
 /// A LATER STEP HANDS ON AS THE FIRST DID: a step that runs where it was handed leaves the next
-/// step at hop 0. The main the landing merges before its first judgment retires `--input-drift`
+/// step at hop 0. The main the landing merges before its first judgment retires `--events-file-only`
 /// and changes the verifier's build recipe, so that judgment hands on twice and runs and passes
 /// at hop [`HOPS`]; main then moves into the branch's file and, in the same commit, retires
 /// `--admit` too. The re-judge's own verifier is another image again, and that step hands over
@@ -799,7 +793,7 @@ fn a_recheck_whose_merge_changes_the_build_recipe_hands_on_twice_with_its_count(
 #[test]
 fn a_rejudge_after_a_step_that_ran_where_it_was_handed_hands_on_from_its_first_hop() {
     let v1 = contract(&FLAGS);
-    let mut v2 = without(crate::cli::INPUT_DRIFT);
+    let mut v2 = without(crate::cli::EVENTS_FILE_ONLY);
     v2.push(format!("{RECIPE}2"));
     let v3: Vec<String> = v2
         .iter()
@@ -863,7 +857,7 @@ fn a_rejudge_after_a_step_that_ran_where_it_was_handed_hands_on_from_its_first_h
         git(&world.work, &["rev-parse", &format!("{}^2", rejudge.at)]),
         moved
     );
-    assert_eq!(rejudge.branch, Some(crates(&["a"])));
+    assert_eq!(rejudge.branch, None);
     assert_eq!(
         (
             rejudge.stated.checked.len(),
@@ -877,11 +871,6 @@ fn a_rejudge_after_a_step_that_ran_where_it_was_handed_hands_on_from_its_first_h
         image.push(format!("{BUILT_BY}2"));
         image
     };
-    assert_eq!(
-        log.branches,
-        [(built_by_2(&v2), m1.clone())],
-        "read once, by the image that ran the first judgment"
-    );
     let composers: Vec<&Vec<String>> = log.runs.iter().map(|(composer, _)| composer).collect();
     assert_eq!(composers, [&built_by_2(&v2), &built_by_2(&v3)]);
     assert!(log.refusals.is_empty(), "{:?}", log.refusals);
@@ -919,10 +908,16 @@ fn a_resume_of_a_file_that_is_not_the_checkouts_own_handoff_leaves_it_as_it_was(
         cone: head,
         branch: None,
         stated: Stated::default(),
+        run: Some(handoff::Carried {
+            id: "a".repeat(32),
+            started: 1,
+            seq: 0,
+            cause: None,
+        }),
     };
     let bytes = String::from_utf8(sample.encode().expect("it encodes"))
         .expect("UTF-8")
-        .replace(r#""schema":2"#, r#""schema":3"#);
+        .replace(r#""schema":3"#, r#""schema":4"#);
     let notes = world.work.join("notes.txt");
     let own =
         PathBuf::from(git(&world.work, &["rev-parse", "--absolute-git-dir"])).join(handoff::FILE);
@@ -947,8 +942,11 @@ fn a_resume_of_a_file_that_is_not_the_checkouts_own_handoff_leaves_it_as_it_was(
 /// its options do not take (a flag the sending build took and this one does not) could not
 /// run, naming those words and the rerun, before the image the handoff names is compared or
 /// anything is judged or pushed. The checkout's own handoff file is taken, read once whether or
-/// not it is honoured, so it is gone. A receiver that went on under its defaults instead would
+/// not it is honoured, so it is gone, and the run it carried ends there: one end record, under
+/// its id and from its next ordinal. A receiver that went on under its defaults instead would
 /// refuse this handoff for its image, which is not this build's, and say nothing of the words.
+/// NEGATIVE CONTROL, run as a mutant: `resume_cli` returning at the words' refusal without
+/// [`refused`] left the carried run with no end record.
 #[test]
 fn a_handoff_of_words_this_build_does_not_take_could_not_run_naming_them() {
     let world = world();
@@ -974,10 +972,22 @@ fn a_handoff_of_words_this_build_does_not_take_could_not_run_naming_them() {
         cone: head.clone(),
         branch: None,
         stated: Stated::default(),
+        run: Some(handoff::Carried {
+            id: "a".repeat(32),
+            started: 1,
+            seq: 0,
+            cause: None,
+        }),
     };
     handoff::write(&own, &handed).expect("the handoff is written");
     let mut said = Vec::new();
-    let code = resume_cli(&own, &world.work, &mut |line| said.push(line.to_owned()));
+    let store = Store::default();
+    let code = resume_cli(
+        &own,
+        &world.work,
+        &mut |line| said.push(line.to_owned()),
+        &mut |_| store.records('r'),
+    );
     assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
     let refusal = format!(
         "verify land: COULD NOT RUN — this tree's verify land does not take the landing's words \
@@ -985,6 +995,19 @@ fn a_handoff_of_words_this_build_does_not_take_could_not_run_naming_them() {
     );
     assert_eq!(said, [refusal], "the words' refusal, and nothing after it");
     assert!(said[0].contains(FIX), "{said:#?}");
+    // The run the handoff carried ends here: its end record, under its own id and from its
+    // next ordinal, could not run.
+    let [journal, _] = store.runs('a');
+    let end = ends(&journal);
+    assert_eq!(end.len(), 1, "{:#?}", told(&journal));
+    assert_eq!(
+        (end[0].seq, end[0].run.started, end[0].exit),
+        (0, 1, Some(exit::COULD_NOT_RUN))
+    );
+    assert!(
+        store.runs('r')[0].is_empty(),
+        "no run of the receiver's own"
+    );
     assert!(
         !own.exists(),
         "the checkout's own handoff is taken, whether or not it is honoured"
@@ -1024,6 +1047,12 @@ fn a_handoff_the_receiver_cannot_honour_could_not_run() {
         cone: m0.clone(),
         branch: None,
         stated: Stated::default(),
+        run: Some(handoff::Carried {
+            id: "a".repeat(32),
+            started: 1,
+            seq: 0,
+            cause: None,
+        }),
     };
     let passed = aterm_types::land_trailer::Checked {
         tree: git(&world.work, &["rev-parse", "HEAD^{tree}"]),
@@ -1079,7 +1108,7 @@ fn a_handoff_the_receiver_cannot_honour_could_not_run() {
             Handoff {
                 step: aterm_land::Step::Recheck,
                 composes: COMPOSES + 1,
-                branch: Some(crates(&["a"])),
+                branch: Some(handoff::Branch::Crates(["a".to_owned()].into())),
                 stated: Stated {
                     checked: vec![passed],
                     ..Stated::default()
@@ -1125,7 +1154,7 @@ fn a_handoff_the_receiver_cannot_honour_could_not_run() {
             "{why}: {:#?}",
             log.said
         );
-        assert!(log.runs.is_empty() && log.branches.is_empty(), "{why}");
+        assert!(log.runs.is_empty(), "{why}");
         assert_eq!(origin_main(&world), elsewhere, "{why}: nothing was pushed");
         match prep {
             Prep::None => {}
@@ -1247,6 +1276,12 @@ fn a_handed_step_whose_revision_the_kept_judgment_passed_is_not_run_again() {
             cone: m0.clone(),
             branch: None,
             stated: Stated::default(),
+            run: Some(handoff::Carried {
+                id: "a".repeat(32),
+                started: 1,
+                seq: 0,
+                cause: None,
+            }),
         };
         let log = RefCell::new(Log::default());
         let landing = Landing {
@@ -1267,12 +1302,11 @@ fn a_handed_step_whose_revision_the_kept_judgment_passed_is_not_run_again() {
         let receipt = stated(&world, &origin_main(&world)).expect("stated");
         if record == "same" {
             assert!(resumed, "{said:#?}");
-            assert!(log.runs.is_empty() && log.branches.is_empty(), "{said:#?}");
+            assert!(log.runs.is_empty(), "{said:#?}");
             assert_eq!(Some(receipt), kept, "the kept judgment, as it was made");
         } else {
             assert!(!resumed, "{record}: {said:#?}");
             assert_eq!(log.runs.len(), 1, "{record}: {said:#?}");
-            assert_eq!(log.branches, [(v1.clone(), m0.clone())], "{record}");
             assert_eq!(receipt.checked.len(), 1, "{record}");
             assert_eq!(
                 (
@@ -1289,7 +1323,7 @@ fn a_handed_step_whose_revision_the_kept_judgment_passed_is_not_run_again() {
 
 /// A LANDING RESUMED FROM ITS KEPT JUDGMENT JUDGES A MAIN THAT DOES NOT COMPOSE AS THE MERGED
 /// TREE: after the judgment, main moved into the branch's file and, in the same commit, retired
-/// `--input-drift` from its verifier. The rerun resumes at the push with the kept receipt, finds
+/// `--events-file-only` from its verifier. The rerun resumes at the push with the kept receipt, finds
 /// that main does not compose, merges it and hands the re-judge to the merge's verifier: the
 /// handoff carries the kept receipt (the earlier run's two interrupted judgments and its pass),
 /// no branch crates (the resumed landing judged nothing) and the cone they are read over (the main commit the
@@ -1299,7 +1333,7 @@ fn a_handed_step_whose_revision_the_kept_judgment_passed_is_not_run_again() {
 #[test]
 fn a_resumed_landing_whose_moved_main_does_not_compose_is_judged_again_as_the_merged_tree() {
     let v1 = contract(&FLAGS);
-    let v2 = without(crate::cli::INPUT_DRIFT);
+    let v2 = without(crate::cli::EVENTS_FILE_ONLY);
     for lie in [false, true] {
         let world = world();
         let before = origin_main(&world);
@@ -1352,7 +1386,7 @@ fn a_resumed_landing_whose_moved_main_does_not_compose_is_judged_again_as_the_me
         if lie {
             assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
             assert!(said.iter().any(|line| line == KI_LINE), "{said:#?}");
-            assert_eq!(log.refusals, ["verify: unknown flag `--input-drift`"]);
+            assert_eq!(log.refusals, ["verify: unknown flag `--events-file-only`"]);
             assert!(log.handoffs.is_empty());
             assert_eq!(origin_main(&world), moved, "nothing was pushed");
             continue;
@@ -1369,16 +1403,11 @@ fn a_resumed_landing_whose_moved_main_does_not_compose_is_judged_again_as_the_me
             (&handoff.cone, handoff.branch.as_ref(), &handoff.stated),
             (&m0, None, &kept)
         );
-        assert_eq!(
-            log.branches,
-            [(v2.clone(), m0.clone())],
-            "read by the judging image"
-        );
         let [(composer, run)] = log.runs.as_slice() else {
             panic!("one child: {:#?}", log.runs);
         };
         assert_eq!(composer, &v2);
-        assert!(!run.iter().any(|word| word == crate::cli::INPUT_DRIFT));
+        assert!(!run.iter().any(|word| word == crate::cli::EVENTS_FILE_ONLY));
         let landing = origin_main(&world);
         let receipt = stated(&world, &landing).expect("stated");
         assert_eq!(receipt.interrupted, kept.interrupted, "{said:#?}");
@@ -1393,7 +1422,7 @@ fn a_resumed_landing_whose_moved_main_does_not_compose_is_judged_again_as_the_me
 /// A STEP THE KEPT JUDGMENT STOOD FOR RAN NOWHERE HERE, SO THE NEXT STARTS AT HOP 0: a judgment
 /// handed over as its last hop ([`HOPS`]) to an image whose checkout keeps a passed judgment of
 /// that revision goes to the push with the kept receipt. Main has moved into the branch's file
-/// and, in the same commit, retired `--input-drift` from its verifier, so the re-judge's own
+/// and, in the same commit, retired `--events-file-only` from its verifier, so the re-judge's own
 /// verifier is another image, and that step hands over as its own first hop, with the kept
 /// receipt, no branch crates (nothing was judged here) and the cone the kept judgment merged;
 /// its receiver judges and lands, stating both judgments. A step that kept the hop
@@ -1402,7 +1431,7 @@ fn a_resumed_landing_whose_moved_main_does_not_compose_is_judged_again_as_the_me
 #[test]
 fn a_rejudge_after_a_handed_step_the_kept_judgment_stood_for_hands_on_from_its_first_hop() {
     let v1 = contract(&FLAGS);
-    let v2 = without(crate::cli::INPUT_DRIFT);
+    let v2 = without(crate::cli::EVENTS_FILE_ONLY);
     let world = world();
     let m0 = seed_contract(&world, &v1);
     let at = edit_line(&world.work, "shared.txt", 8, "branch");
@@ -1426,6 +1455,12 @@ fn a_rejudge_after_a_handed_step_the_kept_judgment_stood_for_hands_on_from_its_f
         cone: m0.clone(),
         branch: None,
         stated: Stated::default(),
+        run: Some(handoff::Carried {
+            id: "a".repeat(32),
+            started: 1,
+            seq: 0,
+            cause: None,
+        }),
     };
     let log = RefCell::new(Log::default());
     let landing = Landing {
@@ -1465,11 +1500,6 @@ fn a_rejudge_after_a_handed_step_the_kept_judgment_stood_for_hands_on_from_its_f
     assert_eq!(
         git(&world.work, &["rev-parse", &format!("{}^2", rejudge.at)]),
         moved
-    );
-    assert_eq!(
-        log.branches,
-        [(v2.clone(), m0.clone())],
-        "read by the judging image"
     );
     let [(composer, _)] = log.runs.as_slice() else {
         panic!("one child: {:#?}", log.runs);

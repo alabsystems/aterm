@@ -15,7 +15,7 @@ use aterm_secrets::client::{
     JoinOptions, JoinPassword, NodePassPace, Paths, admin_cached, admin_commons_init, admin_open,
     admin_publish_approved, admit_member_in_log, configure_log_member, create, join, load_records,
     machine_identity, node_pass_receipt, remove_member_in_log, save_records, sync,
-    test_put_everyone, test_sign_genesis,
+    test_sign_genesis,
 };
 use aterm_secrets::commons::binding::Pending;
 use aterm_secrets::commons::bootstrap::{Bootstrap, Device};
@@ -32,7 +32,6 @@ const PAST_EVERY_RANK: u64 = 1_000 * 60_000;
 /// Two members of a vault at a path. `m2` holds the keys and took m5's `Admit` and none of its
 /// `Wrap`s: a gap, on a Mac with no record of who else might close it.
 struct Lab {
-    m1: Paths,
     m2: Paths,
     m5: Recipient,
 }
@@ -126,11 +125,7 @@ fn a_gap_on_m2(root: &Path) -> Lab {
         .iter()
         .filter(|record| !matches!(record.body(), Body::Wrap { .. }));
     save_records(&m2, &encode_records(no_wrap)).unwrap();
-    let lab = Lab {
-        m1,
-        m2,
-        m5: recipient,
-    };
+    let lab = Lab { m2, m5: recipient };
     assert!(!lab.healed(), "the fixture leaves a gap");
     lab
 }
@@ -142,16 +137,6 @@ impl Lab {
             .log()
             .unwrap()
             .wraps_maximal_audience_to(&EpochAudience::Everyone, &self.m5)
-    }
-
-    /// A record of an entry signed on m1 reaches m2 by no path the pass knows of.
-    fn an_entry_reaches_m2(&self) {
-        test_put_everyone(&self.m1, "later", b"later-v1").unwrap();
-        save_records(&self.m2, &load_records(&self.m1).unwrap().encode()).unwrap();
-    }
-
-    fn later(&self) -> std::path::PathBuf {
-        self.m2.home.join(".secrets/later")
     }
 }
 
@@ -198,7 +183,7 @@ fn config_of_m2(
 }
 
 #[test]
-fn a_windowless_node_heals_a_gap_and_materializes_with_no_subscriber() {
+fn a_windowless_node_heals_a_gap_with_no_subscriber() {
     let root = aterm_tempfile::tempdir().unwrap();
     let (state, relay) = (root.path().join("state"), root.path().join("relay"));
     std::fs::create_dir_all(&state).unwrap();
@@ -228,18 +213,12 @@ fn a_windowless_node_heals_a_gap_and_materializes_with_no_subscriber() {
         "a timer's pass heals the gap",
         || lab.healed().then_some(()),
     );
-    lab.an_entry_reaches_m2();
-    aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "a new record's pass writes its file under ~/.secrets",
-        || (std::fs::read(lab.later()).ok()? == b"later-v1").then_some(()),
-    );
     stop.set();
     assert_eq!(node.join().unwrap(), ExitCode::SUCCESS);
 }
 
 /// The negative control: with the pass off (the mesh off, as this build's switch has it until R2)
-/// no thread starts, so nothing on this Mac closes the gap or writes the file.
+/// no thread starts, so nothing on this Mac closes the gap.
 #[test]
 fn with_the_mesh_off_the_node_runs_no_pass_and_the_gap_stays() {
     let root = aterm_tempfile::tempdir().unwrap();

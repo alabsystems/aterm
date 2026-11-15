@@ -48,6 +48,7 @@ macro_rules! verify_island {
 
 pub mod host;
 pub mod io;
+mod retirement;
 pub mod save_words;
 
 /// A document store whose write capability a test mints: a test process that handles no untrusted

@@ -28,7 +28,8 @@ pub const BUDGET_SECS: u64 = 300;
 const MIN_REPAIRS: usize = 8;
 
 /// The glow on, so a typed key reaches the hosted task.
-const GLOW_ON: &str = "serious_mode = false\ncursor_trail = true\ncursor_momentum_glow = true";
+pub(super) const GLOW_ON: &str =
+    "serious_mode = false\ncursor_trail = true\ncursor_momentum_glow = true";
 
 /// The shell's rc: the keys go to `cat` on a tty that echoes them, since a recording stops at a key a program reads raw outside an integrated prompt.
 const TYPED_INTO: &str = "exec /bin/cat\n";

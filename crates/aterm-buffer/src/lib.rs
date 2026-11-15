@@ -310,6 +310,32 @@ impl Surface {
         (start, self.line_lower_bound(r.end))
     }
 
+    /// Adopt an immutable prepared line under the caller's write authority.
+    /// No comparison or copy of its contents is performed.
+    pub fn append_shared_line(&mut self, _c: &WriteCap, text: Arc<String>) -> Seq {
+        let id = LineId(self.next_line);
+        self.next_line = self.next_line.saturating_add(1);
+        Arc::make_mut(&mut self.lines).push((id, text));
+        Arc::make_mut(&mut self.log).append(Op::Append(id))
+    }
+
+    /// Replace a line with prepared storage, refusing a stale head.
+    pub fn set_shared_line(
+        &mut self,
+        _c: &WriteCap,
+        base: Seq,
+        id: LineId,
+        text: Arc<String>,
+    ) -> TxnOutcome {
+        if self.seq() != base {
+            return TxnOutcome::Conflict;
+        }
+        if let Some(i) = self.line_index(id) {
+            Arc::make_mut(&mut self.lines)[i].1 = text;
+        }
+        TxnOutcome::Committed(Arc::make_mut(&mut self.log).append(Op::Write(id)))
+    }
+
     /// MUTATE: the one buffer-edit verb.
     pub fn apply(&mut self, _c: &WriteCap, e: Edit) -> Seq {
         match e {

@@ -16,6 +16,8 @@ use aterm_types::macos_setup::{
 };
 
 #[cfg(test)]
+mod materialization_tests;
+#[cfg(test)]
 mod typed_join_tests;
 
 /// The context for reading checklist rows, not a macOS permission grant.
@@ -369,9 +371,9 @@ enum VaultRead {
     PendingOff { approve: Option<String> },
     /// A member whose subscriber runs; `cache_ready` meets the vault's local ownership checks.
     Member { cache_ready: bool },
-    /// A member whose subscriber, the process that keeps `~/.secrets` in sync, is installed but
-    /// has stayed down past launchd's restart window. Nothing starts it again by itself: the
-    /// Secrets stage installs it, so Set up now does.
+    /// A member whose subscriber, the process that keeps this Mac's vault copy current, is
+    /// installed but has stayed down past launchd's restart window. Nothing starts it again by
+    /// itself: the Secrets stage installs it, so Set up now does.
     Stopped,
     /// Its vault let it go with no act against it that it can read: a rotation left it out
     /// ([`aterm_secrets::client::dropped`], one-mesh E2). Every member that read the rotation
@@ -560,21 +562,41 @@ fn vault(plan: &Plan, here: scope::VaultHere, root: Option<&Path>) -> Result<Obs
         (Some(_), Membership::Pending) => pending_read(&paths, &status, join_place_now),
         (Some(_), Membership::Revoked { .. }) if client::dropped(&paths) => VaultRead::Dropped,
         (Some(_), Membership::Revoked { .. }) => VaultRead::Revoked,
-        // A status read: a vault pass holding the state lock reads as not ready at once.
-        (Some(config), Membership::In { .. } | Membership::Plain) => member_read(
-            matches!(
+        (Some(config), Membership::In { .. } | Membership::Plain) => {
+            return member_observation(
                 client::observe_materialization(&paths, config, || Ok(()))
                     .map_err(|error| error.to_string())?,
-                client::MaterializationObservation::Ready(_)
-            ),
-            subscriber_now(&paths.home)?,
-            std::env::current_exe()
-                .and_then(std::fs::canonicalize)
-                .ok()
-                .as_deref(),
-        ),
+                |cache_ready| {
+                    let read = member_read(
+                        cache_ready,
+                        subscriber_now(&paths.home)?,
+                        std::env::current_exe()
+                            .and_then(std::fs::canonicalize)
+                            .ok()
+                            .as_deref(),
+                    );
+                    Ok(vault_heard(&read, plan.selection, here, root))
+                },
+            );
+        }
     };
     Ok(vault_heard(&read, plan.selection, here, root))
+}
+
+/// A writer holding the lock says nothing about readiness. Withhold that reading so the
+/// row retains its last evidence; every actual readiness verdict still reaches the reader.
+fn member_observation<T>(
+    observed: aterm_secrets::client::MaterializationObservation<T>,
+    read: impl FnOnce(bool) -> Result<Observation, String>,
+) -> Result<Observation, String> {
+    use aterm_secrets::client::{MaterializationBlocker, MaterializationObservation};
+    match observed {
+        MaterializationObservation::Blocked(MaterializationBlocker::WriterBusy) => {
+            Ok(Observation::withheld(Subject::Setting(Setting::Secrets)))
+        }
+        MaterializationObservation::Ready(_) => read(true),
+        MaterializationObservation::Blocked(_) => read(false),
+    }
 }
 
 /// Where this Mac is for its own ALab join's words, from its network place

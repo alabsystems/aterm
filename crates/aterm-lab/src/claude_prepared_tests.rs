@@ -272,6 +272,17 @@ fi
     cmd.args(&plan.argv[1..])
         .current_dir(fixture.root.path())
         .env("ATERM_PREPARED_PARENT_ONLY", "must not reach the child");
+    let qualified =
+        aterm_uds::deadline::output_within(&mut cmd, aterm_uds::deadline::FIRST_EXEC_HANG)
+            .expect("the prepared Claude fixture's first execution completes");
+    assert!(qualified.status.success(), "{qualified:?}");
+    let marker = format!("PREPARED_EXTRA={literal}");
+    assert!(
+        String::from_utf8_lossy(&qualified.stdout)
+            .lines()
+            .any(|line| line == marker),
+        "the prepared fixture proves its body ran: {qualified:?}"
+    );
     let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(60))
         .expect("the harmless prepared child answers within a minute");
     assert!(out.status.success(), "{out:?}");

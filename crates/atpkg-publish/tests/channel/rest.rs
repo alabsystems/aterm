@@ -19,7 +19,7 @@ use agh_fake::{
 use aterm_types::http_retry::Policy;
 use aterm_uds::spawnfd::Command;
 use aterm_update_core::github_rest::{Direct, Origins, Spawn};
-use atpkg_publish::host::rest::{RestHost, probe_of};
+use atpkg_publish::host::rest::{RestHost, TokenSource, probe_of};
 use atpkg_publish::host::{HostError, Probe, ReleaseHost, Replace, STAGED, Slug};
 
 use super::scratch;
@@ -155,7 +155,7 @@ impl Rig {
     /// Authenticated [`RestHost`] pointed at `git_base` with hermetic git config.
     fn host_at(&self, git_base: &str) -> RestHost {
         RestHost::at(
-            Some(self.token_file.clone()),
+            Some(TokenSource::File(self.token_file.clone())),
             self.origins.clone(),
             git_base.to_string(),
         )
@@ -531,12 +531,16 @@ fn a_write_without_a_token_is_refused_before_anything_is_sent() {
             "never goes anonymously",
         ),
         (
-            RestHost::at(Some(empty), rig.origins.clone(), rig.origins.web.clone()),
+            RestHost::at(
+                Some(TokenSource::File(empty)),
+                rig.origins.clone(),
+                rig.origins.web.clone(),
+            ),
             "never goes anonymously",
         ),
         (
             RestHost::at(
-                Some(rig.file("bad.token", b"two words\n")),
+                Some(TokenSource::File(rig.file("bad.token", b"two words\n"))),
                 rig.origins.clone(),
                 rig.origins.web.clone(),
             ),
@@ -1109,7 +1113,7 @@ fn git_hands_its_token_over_whatever_helpers_and_use_http_path_the_users_config_
     let seen = against_git_server(|base| {
         user_config(base);
         let host = RestHost::at(
-            Some(rig.token_file.clone()),
+            Some(TokenSource::File(rig.token_file.clone())),
             rig.origins.clone(),
             base.to_string(),
         )

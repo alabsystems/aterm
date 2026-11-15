@@ -583,7 +583,7 @@ fn sessions_in_custody(root: &Path, ctl: &mut Ctl, more: usize) -> Vec<String> {
     for _ in 0..more {
         let reply = ctl.ok("spawn");
         assert!(
-            reply.split_whitespace().any(|t| t.starts_with("s-")),
+            reply.split_whitespace().any(aterm_types::tab_id::is_tab_id),
             "`spawn` names its sid: {reply}"
         );
     }

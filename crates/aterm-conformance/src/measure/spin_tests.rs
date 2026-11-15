@@ -5,6 +5,7 @@ use super::*;
 
 const CLAUDE: SpinRow = SpinRow {
     scene: SpinScene::ClaudeShaped,
+    recording: true,
     window: Duration::from_secs(10),
     max_arms: 100,
     max_timer_wakes: Some(12),
@@ -12,6 +13,7 @@ const CLAUDE: SpinRow = SpinRow {
     needle_owed: false,
     max_wakes: 400,
     max_frames: None,
+    min_hidden_parked: None,
 };
 
 const PET: SpinRow = SpinRow {
@@ -36,6 +38,7 @@ const fn counts(arms: u64, timer_wakes: Option<u64>, wakes: Option<u64>) -> Coun
         },
         wakes,
         frames: None,
+        hidden_parked: None,
     }
 }
 
@@ -64,6 +67,78 @@ fn a_bounded_frame_count_fails_one_past_its_bound() {
         ShapeVerdict::Pass,
         "an unbounded row"
     );
+}
+
+/// A hidden row fails one frame past its bound, and passes only where at least its fewest
+/// redraws parked, a parked count unreported (a build without the gate) passing none; a row
+/// that asks for none passes whatever parked.
+#[test]
+fn a_hidden_row_fails_a_frame_and_passes_only_on_the_redraws_it_parked() {
+    let hidden = SpinRow {
+        scene: SpinScene::Hidden,
+        max_frames: Some(0),
+        min_hidden_parked: Some(5),
+        ..CLAUDE
+    };
+    let at = |frames, hidden_parked| Counts {
+        frames,
+        hidden_parked,
+        ..counts(0, Some(5), Some(200))
+    };
+    assert_eq!(judge(&hidden, at(Some(0), Some(5))), ShapeVerdict::Pass);
+    assert_eq!(
+        judge(&hidden, at(Some(1), Some(10))),
+        ShapeVerdict::Fail,
+        "one frame of a minimised window"
+    );
+    assert_eq!(
+        judge(&hidden, at(Some(0), Some(4))),
+        ShapeVerdict::Fail,
+        "output that never reached the window"
+    );
+    assert_eq!(
+        judge(&hidden, at(Some(0), None)),
+        ShapeVerdict::Fail,
+        "a build that reports no parked redraw"
+    );
+    assert_eq!(
+        judge(&CLAUDE, at(None, None)),
+        ShapeVerdict::Pass,
+        "a row that asks for no parked redraw"
+    );
+}
+
+/// A build whose `trail status` reports no `sight=` (one from before the field) leaves the
+/// hidden row unanswered, so a bundle this checkout did not build is named rather than refused;
+/// one that reports it, wherever its window is, can take it.
+#[test]
+fn a_build_without_the_sight_field_leaves_the_hidden_row_unanswered() {
+    let at = |sight: &str| format!("OK 1\ntrail focused=true selection=front {sight}");
+    assert_eq!(
+        hidden_unanswered(&at("resting=false")),
+        Some("ctl trail status does not report sight")
+    );
+    for sight in ["sight=visible", "sight=covered", "sight=off-glass"] {
+        assert_eq!(hidden_unanswered(&at(sight)), None, "{sight}");
+    }
+}
+
+/// A hidden take decides only on a window that reads `sight=off-glass`, and on no window event
+/// in its window.
+#[test]
+fn a_hidden_take_decides_only_off_every_glass_and_with_no_window_event() {
+    let at = |sight: &str| format!("OK 1\ntrail focused=false selection=front {sight}");
+    assert_eq!(hidden_unready(&at("sight=off-glass")), None);
+    for (sight, off) in [
+        ("sight=covered", "sight=covered"),
+        ("sight=visible", "sight=visible"),
+        ("", "sight=?"),
+    ] {
+        assert_eq!(hidden_unready(&at(sight)).as_deref(), Some(off), "{sight}");
+    }
+    assert!(os_events_unidle(SpinScene::Hidden, 1).is_some(), "a show");
+    assert_eq!(os_events_unidle(SpinScene::Hidden, 0), None);
+    assert_eq!(rest_unready(SpinScene::Hidden, &at("resting=true")), None);
 }
 
 /// A resting take decides only on a window that reads `resting=true`; the awake control
@@ -95,6 +170,10 @@ fn a_rest_take_decides_only_at_rest_and_the_awake_control_only_awake() {
         Some("resting=true")
     );
     assert_eq!(rest_unready(SpinScene::Windowed, &at("resting=true")), None);
+    assert_eq!(
+        rest_unready(SpinScene::WindowedRewound, &at("resting=true")),
+        None
+    );
     assert!(os_events_unidle(SpinScene::Resting, 1).is_some());
     assert_eq!(os_events_unidle(SpinScene::Resting, 0), None);
 }
@@ -129,6 +208,113 @@ const fn needle(fires: u64, (owed, carried): (u64, u64), wakes: u64) -> Counts<'
         },
         ..counts(0, None, Some(wakes))
     }
+}
+
+/// Every row writes its recording either way, after its scene's lines and before any table,
+/// so it records or not as it says whatever the shipped default is; a Rewind view's scenes
+/// need the recording arm.
+#[test]
+fn a_rows_head_sets_its_recording_either_way_and_a_rewound_scene_needs_it_on() {
+    for scene in [
+        SpinScene::ClaudeShaped,
+        SpinScene::Idle,
+        SpinScene::Rewound,
+        SpinScene::WindowedRewound,
+        SpinScene::Windowed,
+        SpinScene::PetAsleep,
+        SpinScene::Resting,
+        SpinScene::Hidden,
+    ] {
+        // Every scene the enum has: a new one fails to compile here until it joins the list.
+        match scene {
+            SpinScene::ClaudeShaped
+            | SpinScene::Idle
+            | SpinScene::Rewound
+            | SpinScene::WindowedRewound
+            | SpinScene::Windowed
+            | SpinScene::PetAsleep
+            | SpinScene::Resting
+            | SpinScene::Hidden => {}
+        }
+        for recording in [true, false] {
+            let row = SpinRow {
+                scene,
+                recording,
+                ..CLAUDE
+            };
+            let head = head(&row);
+            let last = head.lines().last().unwrap_or_default();
+            assert_eq!(
+                last,
+                format!("temporal_recording = {recording}"),
+                "{scene:?}: {head}"
+            );
+            assert_eq!(
+                head.matches("temporal_recording").count(),
+                1,
+                "{scene:?}: {head}"
+            );
+            assert!(!head.contains('['), "no table opens in a spin head: {head}");
+            assert_eq!(
+                row.validate().is_ok(),
+                recording || !scene.rewound(),
+                "{scene:?} recording={recording}"
+            );
+        }
+    }
+    assert!(SpinScene::WindowedRewound.windowed() && SpinScene::WindowedRewound.rewound());
+    assert!(!SpinScene::Rewound.windowed() && SpinScene::Rewound.rewound());
+    assert!(!SpinScene::WindowedRewound.pet());
+    assert!(
+        SpinScene::WindowedRewound
+            .config()
+            .contains("motion = \"reduced\"")
+    );
+    assert_eq!(
+        SpinScene::WindowedRewound.config(),
+        SpinScene::Windowed.config(),
+        "the window half is the bare window's"
+    );
+    // The view half takes the bare window's event allowance, not a pet's none.
+    assert_eq!(os_events_unidle(SpinScene::WindowedRewound, 2), None);
+    assert!(os_events_unidle(SpinScene::WindowedRewound, MAX_OS_EVENTS + 1).is_some());
+}
+
+/// The windowed Rewound row bounds the blink lane at 0: a focused window that blinks its
+/// caret over a rewound pane fails it under every other bound (the red: the `is_rewound` arm
+/// of the blink deadline taken out, which blinked it 19 times in 10 s on 2026-10-27), as a
+/// blink lane the metrics leave out does.
+#[test]
+fn a_blinking_caret_over_a_rewound_window_fails_its_row() {
+    let row = SpinRow {
+        scene: SpinScene::WindowedRewound,
+        max_timer_wakes: Some(20),
+        max_owner_fires: &[(BLINK_LANE, 0)],
+        max_wakes: 200,
+        ..CLAUDE
+    };
+    let still = [(BLINK_LANE, Some(0))];
+    let quiet = Counts {
+        owner_fires: &still,
+        ..counts(0, Some(10), Some(60))
+    };
+    assert_eq!(judge(&row, quiet), ShapeVerdict::Pass);
+    for blinks in [Some(1), Some(20), None] {
+        let fired = [(BLINK_LANE, blinks)];
+        assert_eq!(
+            judge(
+                &row,
+                Counts {
+                    owner_fires: &fired,
+                    ..counts(0, Some(10), Some(60))
+                }
+            ),
+            ShapeVerdict::Fail,
+            "{blinks:?} blink fires"
+        );
+    }
+    let line = "OK timer_wakes=29 deadline_fires_by_owner=blink:19,system_vitals:10";
+    assert_eq!(owner_fires(line, BLINK_LANE), Some(19));
 }
 
 #[test]

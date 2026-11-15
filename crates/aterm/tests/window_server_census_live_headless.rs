@@ -266,7 +266,7 @@ fn a_driven_headless_instance_draws_no_window_server_preflight() {
 
     let spawned = client_ok(&inst, &["spawn"]);
     assert!(
-        spawned.starts_with("OK s-"),
+        aterm_agent::spawned_tab_id(&spawned).is_some(),
         "spawn replies `OK <sid>`: {spawned:?}"
     );
     let image = client_ok(&inst, &["image", "census.png"]);

@@ -587,6 +587,8 @@ pub(crate) enum ButtonIcon {
     Spark,
     /// Two tabs over a page: Tab Control's own pictogram, apart from Window's.
     Tabs,
+    /// A laptop: Settings ▸ This Mac's, this machine's own name.
+    Computer,
     Trash,
     Reset,
     Clear,
@@ -7506,6 +7508,11 @@ fn paint_button_icon_prims(
             prims.push(outline(cx - 8.0, cy - 3.0, 16.0, 10.0, 2.0));
             prims.push(outline(cx - 8.0, cy - 7.0, 7.0, 5.0, 1.5));
             prims.push(outline(cx + 1.0, cy - 7.0, 7.0, 5.0, 1.5));
+        }
+        ButtonIcon::Computer => {
+            prims.push(outline(cx - 7.0, cy - 7.0, 14.0, 10.0, 1.5));
+            prims.push(line(cx - 9.0, cy + 5.0, 18.0, 1.0));
+            prims.push(line(cx - 2.0, cy + 3.0, 4.0, 1.0));
         }
         ButtonIcon::Trash => {
             prims.push(line(cx - 6.0, cy - 5.0, 12.0, 1.0));

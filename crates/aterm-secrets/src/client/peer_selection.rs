@@ -155,6 +155,7 @@ pub(super) fn select(
     }
     let verified_primary = match primary {
         Ok(Fetched::Body(bytes)) => {
+            pass_counts::add(Count::FreshPrimary);
             envelope::verify_for_reader(bytes, &config.name, pin, &config.followed, None)
                 .ok()
                 .map(|(envelope, pinned, _)| (envelope, pinned))
@@ -201,19 +202,42 @@ pub(super) fn select(
     // Recover the exact body before comparing any advancing peer. An exact
     // peer is useful evidence even when ordinary source repair suppresses its
     // selection. Do not publish or cache it until the normal apply path runs.
-    let exact_body = |bytes: &[u8]| {
-        envelope::verify_for_reader(bytes, &config.name, pin, &config.followed, held.as_ref())
-            .is_ok_and(|(e, _, _)| e.seq == before.seq && before.digest == Some(e.digest()))
+    let is_held = |e: &Envelope| e.seq == before.seq && before.digest == Some(e.digest());
+    // The held vault's entry answers for the bytes it was parsed from, and so for a peer's body
+    // that is those very bytes; any other body is parsed and verified whole
+    // ([`chain_cache::verify_as_held`]).
+    let held_entry = super::chain_cache::held(&paths.cache_file()).ok().flatten();
+    let peer_sites = (Count::MemoSelectPeer, Count::FreshSelectPeer);
+    let reader = |floor| super::chain_cache::Reader {
+        name: &config.name,
+        pin,
+        followed: &config.followed,
+        floor,
     };
     // A changed URL does not invalidate signed comparison evidence. The
     // source-bound cache helpers still control reuse and publication elsewhere.
-    let mut baseline = super::chain_cache::held(&paths.cache_file())
-        .ok()
-        .flatten()
-        .filter(|parsed| exact_body(parsed.bytes()))
+    let mut baseline = held_entry
+        .as_deref()
+        .filter(|parsed| {
+            pass_counts::add(Count::MemoSelectHeld);
+            parsed
+                .verify_for_reader(&config.name, pin, &config.followed, held.as_ref())
+                .is_ok_and(|(e, _, _)| is_held(e))
+        })
         .map(|parsed| parsed.bytes().to_vec())
         .or_else(|| match primary {
-            Ok(Fetched::Body(bytes)) if primary_is_held && exact_body(bytes) => Some(bytes.clone()),
+            Ok(Fetched::Body(bytes)) if primary_is_held => {
+                pass_counts::add(Count::FreshPrimary);
+                envelope::verify_for_reader(
+                    bytes,
+                    &config.name,
+                    pin,
+                    &config.followed,
+                    held.as_ref(),
+                )
+                .is_ok_and(|(e, _, _)| is_held(&e))
+                .then(|| bytes.clone())
+            }
             _ => None,
         });
     if baseline.is_none() {
@@ -221,7 +245,14 @@ pub(super) fn select(
             bounded::budget(deadline, Duration::MAX)?;
             if before.digest == Some(peer.digest)
                 && peer.seq == before.seq
-                && exact_body(&peer.envelope)
+                && super::chain_cache::verify_as_held(
+                    held_entry.as_deref(),
+                    &peer.envelope,
+                    reader(held.as_ref()),
+                    peer_sites,
+                    |e, _| is_held(e),
+                )
+                .unwrap_or(false)
             {
                 baseline = Some(peer.envelope.clone());
                 break;
@@ -238,9 +269,13 @@ pub(super) fn select(
     let mut admitted = Vec::new();
     for peer in found {
         bounded::budget(deadline, Duration::MAX)?;
-        let Ok((_, peer_pin, _)) =
-            envelope::verify_for_reader(&peer.envelope, &config.name, pin, &config.followed, held)
-        else {
+        let Ok(peer_pin) = super::chain_cache::verify_as_held(
+            held_entry.as_deref(),
+            &peer.envelope,
+            reader(held),
+            peer_sites,
+            |_, peer_pin| peer_pin,
+        ) else {
             continue;
         };
         let exact = before.digest == Some(peer.digest) && peer.seq == before.seq;
@@ -276,8 +311,8 @@ pub(super) fn select(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "VaultCachedMaterialization",
-        action = "LoseFile",
-        reason = "Local file is removed or changed outside the subscriber"
+        action = "Unsettle",
+        reason = "A newer selection, or a failed apply, leaves the applied one not current"
     )
 )]
 #[cfg_attr(
@@ -300,8 +335,8 @@ pub(super) fn select(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "VaultCachedMaterialization",
-        action = "ForgetOwnership",
-        reason = "Persisted state predates tracking this reader's own entries"
+        action = "LegacyState",
+        reason = "Persisted state predates recording what this reader reads"
     )
 )]
 #[cfg_attr(
@@ -341,7 +376,7 @@ pub(super) fn cached_materialization(
         && (!repairs_primary || served.is_none_or(|seq| seq >= before.seq))
         && before.membership == Stored::In
         && source_bound(config, before)
-        && (!files_intact(paths, before) || before.own.is_none())
+        && (!applied_intact(paths, before) || before.held.is_none())
         && let Some(copy) = verified_cached_envelope(paths, config, before)
     {
         *body = None;
@@ -453,6 +488,43 @@ pub(super) fn cached_log_progress(
     }
     *body = None;
     Some(copy)
+}
+
+/// [`cached_log_progress`] at most once an apply. Each place an apply falls back to the cache's
+/// own log progress asks it of the same cache, log and state (the apply moves only `heard`
+/// between them), and each ask verified the cache and resolved this Mac's entries again
+/// (ATERM-KI-1113-902). A network body is let go wherever the progress is taken, as each ask
+/// did.
+#[derive(Default)]
+pub(super) struct LogProgress(std::cell::OnceCell<Option<Vec<u8>>>);
+
+impl LogProgress {
+    pub(super) fn of(
+        &self,
+        paths: &Paths,
+        config: &Config,
+        state: &State,
+        body: &mut Option<network_observation::Body>,
+    ) -> Option<Vec<u8>> {
+        let copy = self
+            .0
+            .get_or_init(|| {
+                #[cfg(test)]
+                LOG_PROGRESS_ASKS.with(|asks| asks.set(asks.get() + 1));
+                cached_log_progress(paths, config, state, &mut None)
+            })
+            .clone();
+        if copy.is_some() {
+            *body = None;
+        }
+        copy
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Each [`cached_log_progress`] a [`LogProgress`] asked on this thread.
+    pub(super) static LOG_PROGRESS_ASKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// An envelope cannot replace values already materialized from an unavailable log.
@@ -567,8 +639,8 @@ pub(super) fn configured_log_recovery(
         return None;
     }
     if state.records_digest == Some(log_entries::records_heads_digest(&configured.log))
-        && state.own.is_some()
-        && files_intact(paths, state)
+        && state.held.is_some()
+        && applied_intact(paths, state)
     {
         return None;
     }

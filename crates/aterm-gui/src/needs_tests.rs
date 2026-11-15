@@ -1861,7 +1861,7 @@ fn a_told_set_reads_under_its_entrys_program() {
 
 #[test]
 fn a_told_need_in_any_script_reads_whole() {
-    let long: String = "\u{9700}".repeat(aterm_agent::supervise::policy::needs::NEED_CHARS);
+    let long: String = "\u{9700}".repeat(alab_policy::needs::NEED_CHARS);
     assert_eq!(long.len(), 480, "PRECONDITION: three bytes a letter");
     let entry = harness_entry("claude", &cut64(&long), 1);
     let v = of(&told_with(&entry, &[&long, &long], &entry));
@@ -2228,7 +2228,7 @@ fn two_grok_auth_walls_give_one_need() {
         let label = || ADOPT_LABEL.to_owned();
         for setup in [
             Some(Setup::Window(label())),
-            Some(Setup::Mailbox(label())),
+            Some(Setup::Chromium(label())),
             Some(Setup::Email {
                 label: label(),
                 window: true,
@@ -2307,4 +2307,86 @@ fn an_asks_key_moves_with_its_count() {
     let first = |text: &str| need_words(text).map(|w| w.first.to_string());
     assert_eq!(first(one), first(two), "the same first need");
     assert_eq!(first(one).as_deref(), Some("grant Accessibility to aterm"));
+}
+
+/// A SELF-CLAIM'S SET LOSES ITS CREDENTIAL LINES, AND ITS ENTRY IS REBUILT FOR THE NEEDS LEFT:
+/// the needs the entry counted past the set's own are still counted, the program and the tail kept;
+/// a set of credentials alone stores nothing. NEGATIVE CONTROL: a set with no credential line is
+/// kept as told. An entry stands for a person unless the need it leads with is a credential, and
+/// then only as its set rebuilds it.
+#[test]
+fn a_set_for_the_person_holds_no_credential() {
+    let set = |needs: &[&str], entry: &str| {
+        let needs: Vec<String> = needs.iter().map(|n| (*n).to_string()).collect();
+        HarnessNeeds::told(&needs, entry).expect("a set")
+    };
+    let kept = set(
+        &["approve the notes", "sign 0.48.0"],
+        "Codex needs you: approve the notes (+1 more) \u{2014} carrying on",
+    );
+    assert_eq!(
+        kept.for_person(),
+        PersonsSet {
+            told: Some(kept),
+            credentials: Vec::new()
+        }
+    );
+    let split = set(
+        &["the notary password", "approve the notes", "sign 0.48.0"],
+        "Codex needs you: the notary password (+5 more) \u{2014} waits on you",
+    )
+    .for_person();
+    assert_eq!(split.credentials, vec!["the notary password".to_string()]);
+    let told = split.told.expect("the person's needs");
+    assert_eq!(told.needs(), ["approve the notes", "sign 0.48.0"]);
+    assert_eq!(
+        told.entry(),
+        "Codex needs you: approve the notes (+4 more) \u{2014} waits on you"
+    );
+    let alone = set(
+        &["the notary password", "a GitHub token"],
+        "Codex needs you: the notary password (+1 more) \u{2014} carrying on",
+    )
+    .for_person();
+    assert_eq!(alone.told, None);
+    assert_eq!(alone.credentials.len(), 2);
+
+    let cut = set(
+        &["the notary password", "approve the notes"],
+        "Codex needs you: the notary password, approve the notes",
+    )
+    .for_person()
+    .told
+    .expect("the person's need");
+    assert_eq!(
+        cut.entry(),
+        "Codex needs you: approve the notes \u{2014} carrying on",
+        "an entry no count or tail frames is read whole, as every reader reads it"
+    );
+
+    let lone = "kind=ask Codex needs you: the notary password \u{2014} carrying on";
+    assert_eq!(entry_for(Some(lone), None), None);
+    let counted = "Codex needs you: the notary password (+1 more) \u{2014} carrying on";
+    assert_eq!(
+        entry_for(Some(counted), None),
+        None,
+        "its set says the rest"
+    );
+    assert_eq!(
+        entry_for(Some("Codex needs you: the notary password"), None),
+        None
+    );
+    let person = "Codex needs you: approve the notes \u{2014} carrying on";
+    assert_eq!(entry_for(Some(person), None).as_deref(), Some(person));
+    let told = set(&["the notary password", "approve the notes"], counted);
+    assert_eq!(
+        entry_for(Some(counted), Some(&told)).as_deref(),
+        Some(person)
+    );
+    assert_eq!(
+        entry_for(Some(person), Some(&told)).as_deref(),
+        Some(person),
+        "a set told with another text says nothing of this one"
+    );
+    assert_eq!(entry_for(None, Some(&told)), None);
 }

@@ -89,19 +89,35 @@ impl Git {
     }
 }
 
-impl GitRunner for Git {
-    fn git(&self, args: &[&str]) -> Result<RunOut> {
+impl Git {
+    fn no_transport(args: &[&str]) {
         assert!(
             !args
                 .iter()
                 .any(|word| matches!(*word, "fetch" | "push" | "ls-remote")),
             "publisher tests must use typed Origin for transport: {args:?}"
         );
+    }
+}
+
+impl GitRunner for Git {
+    fn git(&self, args: &[&str]) -> Result<RunOut> {
+        Self::no_transport(args);
         self.local.git(args)
+    }
+
+    fn git_read(&self, args: &[&str]) -> Result<RunOut> {
+        Self::no_transport(args);
+        self.local.git_read(args)
     }
 
     fn git_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
         self.local.git_input(args, input)
+    }
+
+    fn git_read_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
+        Self::no_transport(args);
+        self.local.git_read_input(args, input)
     }
 
     fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<RunOut> {

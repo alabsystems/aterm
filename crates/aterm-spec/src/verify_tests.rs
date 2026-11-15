@@ -151,14 +151,35 @@ fn a_stopped_search_is_never_a_verdict() {
 
 #[test]
 fn only_a_named_law_is_a_refutation() {
-    assert_eq!(
-        super::ty_violated_law("--- ty stdout ---\nError: Invariant Fits is violated.\n"),
-        Some("Fits")
-    );
+    for (diagnostic, law) in [
+        (
+            "Error: Invariant Fits is violated by the initial state:",
+            "Fits",
+        ),
+        ("Error: Invariant Fits is violated.", "Fits"),
+        (
+            "Error: Invariant IdleTakesNothing is violated by the initial state:\n/\\ a = 0\n/\\ b = 0\n/\\ steps = 0\n",
+            "IdleTakesNothing",
+        ),
+    ] {
+        for (stdout, stderr) in [("", diagnostic), (diagnostic, "")] {
+            let evidence = format!("--- ty stdout ---\n{stdout}\n--- ty stderr ---\n{stderr}\n");
+            assert_eq!(super::ty_violated_law(&evidence), Some(law), "{evidence}");
+        }
+    }
     for failure in [
         "Error: Successor state is not completely specified\nStates found: 1\n",
         "Parse error: unexpected token\n",
+        "Error: Invariant violation detected\n",
+        "Error: Invariant  is violated.\n",
+        "Error: Invariant  is violated by the initial state:\n",
         "No errors found (exhaustive).\n",
+        "Model checking stopped: memory limit reached\n",
+        "INVARIANTS: Fits, Bounded\n",
+        "Error: Invariant Fits is violated by the initial state\n",
+        "Error: Invariant Fits is violated by the initial state: extra text\n",
+        "Error: Invariant Fits is violated by an initial state:\n",
+        "Error: Invariant Fits is violated during evaluation.\n",
     ] {
         assert_eq!(super::ty_violated_law(failure), None, "{failure}");
     }

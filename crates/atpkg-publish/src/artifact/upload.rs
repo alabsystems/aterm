@@ -12,12 +12,12 @@ use crate::host::{HostError, HostRole, Release, ReleaseHost, Replace, STAGED, Sl
 mod version;
 pub use version::VERSION_RESERVATION;
 
-/// Check that the staging owner can be written before building: its token file exists and is
+/// Check that the staging owner can be written before building: its vault entry is there and
 /// non-empty where the staging host is `RestHost` (`host::gh_serves`), and otherwise the staging
 /// host's own pre-claim check (`write_preflight`, finding F2) of the staging index repository.
 /// A pack verb asks [`program_preflight`] instead, of the repository its upload goes to.
 /// # Errors
-/// Returns a refusal naming the missing or unusable token file, or the staging writer the host
+/// Returns a refusal naming the missing or unusable vault entry, or the staging writer the host
 /// refused.
 pub fn token_preflight(ctx: &Ctx) -> Result<()> {
     token_preflight_for(ctx, atpkg::manifest::INDEX_REPO)
@@ -27,7 +27,7 @@ pub fn token_preflight(ctx: &Ctx) -> Result<()> {
 /// that program to: under agh both push and a release-tier grant are per repository, so the
 /// pre-claim check asks it of the repository the upload goes to.
 /// # Errors
-/// Returns a refusal naming the missing or unusable token file, or the staging writer the host
+/// Returns a refusal naming the missing or unusable vault entry, or the staging writer the host
 /// refused on `repo`.
 pub fn token_preflight_for(ctx: &Ctx, repo: &str) -> Result<()> {
     if !gh_serves(ctx, HostRole::Staging) {
@@ -41,14 +41,14 @@ pub fn token_preflight_for(ctx: &Ctx, repo: &str) -> Result<()> {
     match ctx.usable_token(&ctx.tokens.staging) {
         Ok(true) => Ok(()),
         Ok(false) => Err(Error::refused(format!(
-            "--upload needs the staging owner's token at {} (every pack is uploaded to {} first, \
+            "--upload needs the staging owner's token, {} (every pack is uploaded to {} first, \
              and a write never goes anonymously) — nothing built",
-            ctx.shown(&ctx.tokens.staging),
+            ctx.shown_token(&ctx.tokens.staging),
             ctx.accounts.staging
         ))),
         Err(why) => Err(Error::refused(format!(
-            "--upload needs the staging owner's token at {}: {why} — nothing built",
-            ctx.shown(&ctx.tokens.staging),
+            "--upload needs the staging owner's token, {}: {why} — nothing built",
+            ctx.shown_token(&ctx.tokens.staging),
         ))),
     }
 }

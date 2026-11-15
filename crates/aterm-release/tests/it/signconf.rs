@@ -160,79 +160,56 @@ fn preflight_accepts_a_notarizable_devid_app() {
     sign::devid_preflight(DEVID_RUNTIME_INFO, false).expect("devid dmg");
 }
 
+/// An explicit profile outranks the store's ring, the store's ring is read in place where no
+/// profile is named, and a home with neither resolves to none. Nothing is read from a ring file
+/// under the home: a planted `release-ring` directory is never consulted.
+/// NEGATIVE CONTROL: with `from_store` answering `None`, the stored ring resolves to nothing:
+/// `machine state yields credentials`.
 #[test]
-fn resolution_prefers_the_flag_then_machine_state_then_none() {
-    use std::os::unix::fs::PermissionsExt as _;
+fn resolution_prefers_the_flag_then_the_store_then_none() {
     let home = tempdir("resolve-home");
-    let repo = tempdir("resolve-repo");
-    let none = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
+    let none = sign::ReleaseCredentials::resolve_with(None, home.to_str())
         .expect("an unprovisioned machine resolves clean");
-    assert!(none.is_none(), "no flag + no machine key = no credentials");
-
-    let ring = home.join(atpkg_keys::provision::RELEASE_RING_REL);
-    std::fs::create_dir_all(&ring).unwrap();
-    let rng = ring::rand::SystemRandom::new();
-    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-    let expected = {
-        use ring::signature::KeyPair as _;
-        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        aterm_codec::base64::encode(kp.public_key().as_ref()).expect("32-byte key")
-    };
-    let key_path = ring.join("machine.key");
-    std::fs::write(&key_path, pkcs8.as_ref()).unwrap();
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let machine = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
-        .expect("a provisioned machine resolves")
+    assert!(none.is_none(), "no flag and no store: no credentials");
+    let planted = home.join(atpkg_keys::provision::RELEASE_RING_REL);
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(planted.join("machine.key"), b"not a key").unwrap();
+    let (_, expected) = crate::seed_ring(&home, None);
+    let machine = sign::ReleaseCredentials::resolve_with(None, home.to_str())
+        .expect("a provisioned store resolves")
         .expect("machine state yields credentials");
     assert_eq!(
         machine.pubkey(),
         expected,
-        "identity derives from machine.key"
+        "the identity is the store's key"
     );
-    assert!(
-        machine.machine_roster().is_none(),
-        "no staged roster in the repo means none is claimed"
-    );
-
-    std::fs::create_dir_all(repo.join("dist")).unwrap();
-    std::fs::write(repo.join("dist/aterm-machines.toml"), "x").unwrap();
-    let with_roster = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
-        .expect("resolves")
-        .expect("credentials");
+    assert_eq!(machine.machine_id(), Some("m22"));
     assert_eq!(
-        with_roster.machine_roster(),
-        Some(repo.join("dist/aterm-machines.toml").as_path()),
-        "the staged roster is the default — the same one the atpkg tools ship"
+        machine.machine_roster(),
+        Some(&sign::RosterSource::Store),
+        "the store's ring is authorized by the store's roster pair"
     );
 
     let (pkcs8_b64, flag_pub) = keypair_b64();
     let profile = write_profile(&home, &format!("signing_key = \"{pkcs8_b64}\"\n"), 0o600);
-    let flagged = sign::ReleaseCredentials::resolve_with(Some(&profile), &repo, home.to_str())
+    let flagged = sign::ReleaseCredentials::resolve_with(Some(&profile), home.to_str())
         .expect("the explicit profile loads")
         .expect("credentials");
     assert_eq!(
         flagged.pubkey(),
         flag_pub,
-        "an explicit --release-credentials outranks ambient machine state"
+        "an explicit --release-credentials outranks the store"
     );
 }
 
+/// A store ring whose record names another key than its key and profile is refused, never
+/// passed over to resolve as none.
 #[test]
-fn a_present_but_unsafe_machine_key_is_an_error_not_a_fallthrough() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let home = tempdir("resolve-badperm");
-    let repo = tempdir("resolve-badperm-repo");
-    let ring = home.join(atpkg_keys::provision::RELEASE_RING_REL);
-    std::fs::create_dir_all(&ring).unwrap();
-    let rng = ring::rand::SystemRandom::new();
-    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-    let key_path = ring.join("machine.key");
-    std::fs::write(&key_path, pkcs8.as_ref()).unwrap();
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let err = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
-        .expect_err("a world-readable machine key must refuse, not skip");
-    assert!(
-        err.contains("machine.key"),
-        "the refusal names the offending file: {err}"
-    );
+fn a_ring_that_is_not_one_identity_is_an_error_not_a_fallthrough() {
+    let home = tempdir("resolve-split");
+    let (_, other) = keypair_b64();
+    crate::seed_ring(&home, Some(&other));
+    let err = sign::ReleaseCredentials::resolve_with(None, home.to_str())
+        .expect_err("a split ring must refuse, not skip");
+    assert!(err.contains("not one identity"), "{err}");
 }

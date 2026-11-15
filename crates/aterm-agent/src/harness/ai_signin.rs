@@ -25,7 +25,8 @@ use super::ai_pool::{self, LocalPoolIdentity, Pool};
 use super::claims::{Book, View};
 use super::headless_oauth::{MailboxConfig, MailboxCredential};
 
-/// Materialized filename under `~/.secrets/` carrying age-sealed per-email passwords for warm Macs.
+/// The vault entry, and the name of a local file beside the store or config, carrying age-sealed
+/// per-email passwords for warm Macs.
 pub const AI_SIGNIN_FILE: &str = aterm_secrets::entry_class::AI_SIGNIN;
 
 /// Audit log filename under `<state_dir>/` recording answered `mail-code <email>` relay requests.
@@ -583,31 +584,46 @@ impl AiSigninDoc {
     }
 }
 
-/// Discover and apply `ai-signin.toml` under `home` (or `store_dir`) into `out`, decrypting warm
-/// per-email credentials with this Mac's local age identity when present.
+/// Discover and apply `ai-signin.toml` into `out`, in order: a file in `store_dir`, the vault's
+/// entry in `home`'s store ([`crate::vault_entry`]), a file in `~/.config/aterm` and one beside
+/// the config, decrypting warm per-email credentials with this Mac's local age identity when
+/// present.
 pub fn load_local_ai_signin_into(
     home: Option<&Path>,
     store_dir: Option<&Path>,
     config_path: Option<&Path>,
     out: &mut MailboxConfig,
 ) {
-    let mut candidates = Vec::new();
+    const MAX_SIGNIN_BYTES: usize = 4 * 1024 * 1024;
+    let file = |path: std::path::PathBuf| {
+        if !path.is_file() {
+            return None;
+        }
+        super::accounts::read_bounded(&path, MAX_SIGNIN_BYTES as u64)
+            .ok()
+            .flatten()
+    };
+    let mut candidates: Vec<Option<String>> = Vec::new();
     if let Some(store) = store_dir {
-        candidates.push(store.join(AI_SIGNIN_FILE));
+        candidates.push(file(store.join(AI_SIGNIN_FILE)));
     }
     if let Some(h) = home {
-        candidates.push(h.join(".secrets").join(AI_SIGNIN_FILE));
-        candidates.push(h.join(".config/aterm").join(AI_SIGNIN_FILE));
+        candidates.push(
+            crate::vault_entry::read_text(h, AI_SIGNIN_FILE, MAX_SIGNIN_BYTES)
+                .text()
+                .map(str::to_owned),
+        );
+        candidates.push(file(h.join(".config/aterm").join(AI_SIGNIN_FILE)));
     }
     if let Some(cfg_file) = config_path
         && let Some(parent) = cfg_file.parent()
     {
-        candidates.push(parent.join(AI_SIGNIN_FILE));
+        candidates.push(file(parent.join(AI_SIGNIN_FILE)));
     }
 
     #[cfg(unix)]
     let local_identity = home.and_then(|h| {
-        let paths = aterm_secrets::client::Paths::for_home(h);
+        let paths = aterm_secrets::client::Paths::locate_for_home(h);
         aterm_secrets::client::read_machine_identity(&paths)
             .ok()
             .flatten()
@@ -615,13 +631,7 @@ pub fn load_local_ai_signin_into(
     #[cfg(not(unix))]
     let local_identity: Option<Identity> = None;
 
-    for path in candidates {
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(Some(text)) = super::accounts::read_bounded(&path, 4 * 1024 * 1024) else {
-            continue;
-        };
+    for text in candidates.into_iter().flatten() {
         let Ok(doc) = AiSigninDoc::from_toml(&text) else {
             continue;
         };
@@ -1210,7 +1220,13 @@ fn steward_handle_mail_code_with_key(
     cfg.relay_state_dir = None;
 
     let is_steward_mailbox = has_catch_all_login(&cfg)
-        || home.join(".secrets/ai-mailbox.toml").is_file()
+        || crate::vault_entry::read_text(
+            home,
+            super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            super::headless_oauth::MAILBOX_TOML_MAX_BYTES,
+        )
+        .text()
+        .is_some()
         || home.join(".config/aterm/ai-mailbox.toml").is_file()
         || store_dir.join("ai-mailbox.toml").is_file();
     let has_local_backend = cfg.dir.is_some()
@@ -1256,9 +1272,7 @@ fn steward_handle_mail_code_with_key(
         }
     }
 
-    let pool_path = home.join(".secrets").join(ai_pool::AI_POOL_FILE);
-    let pool = read_regular_nofollow_bounded(&pool_path, 4 * 1024 * 1024)
-        .and_then(|raw| Pool::from_toml(&raw, &pool_path.display().to_string()).ok());
+    let pool = ai_pool::read_under(home);
     let claims = super::claims::read_book(home).map_err(|_| MailCodeRefusal::RosterBusy)?;
 
     let key_hex = proof_key.map(|k| k.hex());
@@ -1390,12 +1404,21 @@ fn read_standby_steward_labels(home: &Path, roster: Option<&SwarmRoster>) -> Vec
     if let Ok(Some(holder)) = aterm_secrets::client::swarm_lease_holder(&paths) {
         push_label(&mut out, &holder);
     }
-    for candidate in [
-        home.join(".secrets")
-            .join(aterm_secrets::entry_class::SWARM_POLICY_FILE),
-        home.join(".config/aterm/swarm-policy.toml"),
+    const MAX_POLICY_BYTES: usize = 1024 * 1024;
+    for raw in [
+        crate::vault_entry::read_text(
+            home,
+            aterm_secrets::entry_class::SWARM_POLICY_FILE,
+            MAX_POLICY_BYTES,
+        )
+        .text()
+        .map(str::to_owned),
+        read_regular_nofollow_bounded(
+            &home.join(".config/aterm/swarm-policy.toml"),
+            MAX_POLICY_BYTES as u64,
+        ),
     ] {
-        let Some(raw) = read_regular_nofollow_bounded(&candidate, 1024 * 1024) else {
+        let Some(raw) = raw else {
             continue;
         };
         if let Ok(policy) = aterm_secrets::swarm_roster::SwarmPolicy::from_toml(&raw)

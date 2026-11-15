@@ -9,7 +9,7 @@ use aterm_bootstrap_verify::pin::{self, Pin};
 
 use crate::chain::sha256;
 use crate::support::{
-    Lib, Scratch, bash, hermetic, install_sh, q, read, root, run, s, symlink, system_path, tree,
+    HANG, Lib, Scratch, bash, hermetic, install_sh, q, read, root, s, symlink, system_path, tree,
     unpinned_install_sh, write,
 };
 use crate::verifier::under_test;
@@ -83,8 +83,8 @@ fn the_seam_runs_only_the_file_it_is_held_to() {
     let built = under_test();
     let built_digest = sha256(&std::fs::read(&built).expect("the verifier"));
     let shim = scratch.mkdir("shim");
-    scratch.exe("shim/python3", "#!/bin/sh\nexit 1\n");
-    scratch.exe("shim/curl", NO_NETWORK);
+    scratch.stand_in("shim/python3", "#!/bin/sh\nexit 1\n");
+    scratch.stand_in("shim/curl", NO_NETWORK);
     let bare = scratch.mkdir("bare");
     let mut lib = Lib::new();
     lib.env("STUB_RAN", s(&ran))
@@ -174,7 +174,7 @@ fn the_seam_runs_only_the_file_it_is_held_to() {
     };
     let whole_unpinned = whole(&mut lib, &Pin::default());
     let whole_pinned = whole(&mut lib, &pinned(&digest));
-    let recs = lib.run(&scratch);
+    let recs = lib.run_qualifying(&scratch, Some((runs, &ran)));
     assert_eq!(recs[good].rc, 0, "{}", said(&recs[good]));
     assert_eq!(recs[good].var("LINUX_VERIFIER"), s(&stand_in));
     assert_eq!(recs[runs].rc, 0, "{}", said(&recs[runs]));
@@ -302,7 +302,7 @@ fn a_pinned_verifier_is_fetched_held_to_its_digest_and_removed() {
         "release_asset_size() { echo 5; }; download_release_asset() { return 1; }; linux_verifier_ready x86_64",
         &vars,
     );
-    let recs = lib.run(&scratch);
+    let recs = lib.run_qualifying(&scratch, Some((runs, &ran)));
 
     let rec = &recs[planned];
     assert_eq!(rec.rc, 0, "{}", said(rec));
@@ -478,10 +478,27 @@ fn piped(
     for (key, value) in hermetic(&home, &env) {
         cmd.env(key, value);
     }
-    let done = run(&mut cmd);
+    let mut answered_at = None;
+    let mut stalled_after_receipt = || {
+        if std::fs::metadata(&ran).is_ok_and(|meta| meta.len() != 0) {
+            answered_at.get_or_insert_with(std::time::Instant::now);
+        }
+        answered_at.is_some_and(|at| at.elapsed() >= HANG)
+    };
+    let done = aterm_uds::deadline::output_until_from_unless(
+        &mut cmd,
+        aterm_uds::spawnfd::Stdio::null(),
+        std::time::Instant::now() + aterm_uds::deadline::FIRST_EXEC_HANG,
+        &mut stalled_after_receipt,
+    )
+    .expect("the installer qualifies its first exec, then finishes within a minute of its receipt");
     Piped {
-        code: done.code(),
-        out: done.all(),
+        code: done.status.code().expect("the installer exits normally"),
+        out: format!(
+            "{}{}",
+            String::from_utf8_lossy(&done.stdout),
+            String::from_utf8_lossy(&done.stderr)
+        ),
         requests: read(&log).lines().map(str::to_string).collect(),
         ran: read(&ran).lines().map(str::to_string).collect(),
         left: tree(&home.tmp)

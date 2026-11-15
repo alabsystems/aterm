@@ -117,8 +117,8 @@ pub(crate) fn cached_materialization_transition(
         "RequestFull" => {
             next.insert("full", 1);
         }
-        "LoseFile" => {
-            next.insert("dirty", 1);
+        "Unsettle" => {
+            next.insert("unsettled", 1);
         }
         "LoseCache" => {
             next.insert("cached", 0);
@@ -126,8 +126,8 @@ pub(crate) fn cached_materialization_transition(
         "Revoke" => {
             next.insert("active", 0);
         }
-        "ForgetOwnership" => {
-            next.insert("owned", 0);
+        "LegacyState" => {
+            next.insert("recorded", 0);
         }
         "Older" => {
             next.insert("older", 1);
@@ -138,8 +138,9 @@ pub(crate) fn cached_materialization_transition(
         }
         "Decide" => {
             let mut f = Fixture::new();
-            if state["dirty"] == 1 {
-                std::fs::remove_file(f.paths.home.join(".secrets/shared")).unwrap();
+            if state["unsettled"] == 1 {
+                f.before.materialization_selection =
+                    Some(materialization_selection::Meaning::from_digest([224; 32]));
             }
             if state["cached"] == 0 {
                 std::fs::write(f.paths.cache_file(), b"damaged cache").unwrap();
@@ -147,8 +148,8 @@ pub(crate) fn cached_materialization_transition(
             if state["active"] == 0 {
                 f.before.membership = Stored::Revoked;
             }
-            if state["owned"] == 0 {
-                f.before.own = None;
+            if state["recorded"] == 0 {
+                f.before.held = None;
             }
             let seq = f.before.seq - u64::from(state["older"] == 1);
             let mut body = network_observation::Attempt::start(
@@ -195,7 +196,7 @@ fn cached_materialization_model_conforms_and_rejects_conditional_repair() {
         }
     }
     let mut conditional = model.init_state();
-    conditional.insert("dirty", 1);
+    conditional.insert("unsettled", 1);
     let mut bad = cached_materialization_transition(&conditional, "Decide");
     bad.insert("pick", 1);
     assert!(!model.successors("Decide", &conditional).contains(&bad));
@@ -499,7 +500,8 @@ pub(crate) fn cached_log_transition(
 fn bodyless_repair_authenticates_the_exact_cache_and_source() {
     for damage in 0..6 {
         let mut f = Fixture::new();
-        std::fs::remove_file(f.paths.home.join(".secrets/shared")).unwrap();
+        // An older aterm's state: no apply of this build recorded what it reads.
+        f.before.held = None;
         match damage {
             0 => {
                 std::fs::remove_file(f.paths.cache_file()).unwrap();
@@ -518,7 +520,7 @@ fn bodyless_repair_authenticates_the_exact_cache_and_source() {
             }
             5 => {
                 f.before.membership = Stored::Pending;
-                f.before.own = None;
+                f.before.held = None;
             }
             _ => unreachable!(),
         }
@@ -538,8 +540,8 @@ fn bodyless_repair_authenticates_the_exact_cache_and_source() {
 #[test]
 fn bodyless_repair_accepts_absent_or_ahead_etags_without_adopting_them() {
     for seq in [None, Some(400)] {
-        let f = Fixture::new();
-        std::fs::remove_file(f.paths.home.join(".secrets/shared")).unwrap();
+        let mut f = Fixture::new();
+        f.before.held = None;
         let fetched = peer_selection::cached_materialization(
             &f.paths, &f.config, &f.before, true, true, seq, &mut None,
         )
@@ -561,10 +563,7 @@ fn bodyless_repair_uses_the_locked_state_after_another_local_pass() {
         };
         sync_with(&f.paths, next).unwrap();
         let current = load_state(&f.paths).unwrap();
-        let file = f.paths.home.join(".secrets/shared");
-        if file.exists() {
-            std::fs::remove_file(&file).unwrap();
-        }
+        unrecord_apply(&f.paths);
         let served = tagged.then_some(f.before.seq);
         let outcome = apply_response_until(
             &f.paths,
@@ -580,10 +579,15 @@ fn bodyless_repair_uses_the_locked_state_after_another_local_pass() {
         assert_eq!((after.seq, after.digest), (current.seq, current.digest));
         if revoked {
             assert_eq!(after.membership, Stored::Revoked);
-            assert!(!file.exists());
+            assert!(after.held.is_none());
+            assert!(crate::client::stored(&f.paths, "shared").is_none());
         } else {
             assert!(matches!(outcome, SyncOutcome::Applied { .. }));
-            assert_eq!(std::fs::read(file).unwrap(), b"retained");
+            assert!(after.held.is_some());
+            assert_eq!(
+                crate::client::stored(&f.paths, "shared").unwrap(),
+                b"retained"
+            );
         }
     }
 }
@@ -598,9 +602,8 @@ fn an_overtaken_network_body_uses_the_current_cache_without_network_credit() {
             current.records_digest = Some([29; 32]);
             save_state(&f.paths, &current).unwrap();
         }
-        let file = f.paths.home.join(".secrets/shared");
         if dirty {
-            std::fs::remove_file(&file).unwrap();
+            unrecord_apply(&f.paths);
         }
         let fetched = Fetched::Body(f.base);
         let body = network_observation::Attempt::start(
@@ -627,13 +630,16 @@ fn an_overtaken_network_body_uses_the_current_cache_without_network_credit() {
         );
         let after = load_state(&f.paths).unwrap();
         assert_eq!((after.seq, after.digest), (current.seq, current.digest));
-        if dirty && missing_log {
-            assert!(
-                !file.exists(),
-                "an unavailable log cannot supply the missing value"
+        assert_eq!(
+            after.held.is_some(),
+            !(dirty && missing_log),
+            "an unavailable log cannot supply the apply"
+        );
+        if !missing_log {
+            assert_eq!(
+                crate::client::stored(&f.paths, "shared").unwrap(),
+                b"retained"
             );
-        } else {
-            assert_eq!(std::fs::read(file).unwrap(), b"retained");
         }
         if missing_log {
             assert_eq!(after.records_digest, current.records_digest);
@@ -686,8 +692,7 @@ fn bodyless_conditional_repair_ignores_a_stale_pre_fetch_log_snapshot() {
     // The pre-fetch snapshot saw unapplied log activity. Another pass has
     // already settled it when this response reaches the state lock.
     f.before.records_digest = Some([29; 32]);
-    let file = f.paths.home.join(".secrets/shared");
-    std::fs::remove_file(&file).unwrap();
+    unrecord_apply(&f.paths);
     let outcome = apply_response_until(
         &f.paths,
         f.config,
@@ -699,7 +704,7 @@ fn bodyless_conditional_repair_ignores_a_stale_pre_fetch_log_snapshot() {
     )
     .unwrap();
     assert!(matches!(outcome, SyncOutcome::Unchanged { .. }));
-    assert!(!file.exists());
+    assert!(load_state(&f.paths).unwrap().held.is_none());
 }
 
 #[test]
@@ -749,8 +754,10 @@ fn losing_the_log_does_not_replay_an_older_cached_value() {
             assert!(matches!(outcome, SyncOutcome::NotIn));
         }
         let applied = load_state(&lab.m7).unwrap();
-        let file = lab.m7.home.join(".secrets/shared");
-        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        assert_eq!(
+            crate::client::stored(&lab.m7, "shared"),
+            (response != 4).then(|| b"new".to_vec())
+        );
         std::fs::remove_file(lab.m7.records_file()).unwrap();
         let received = match response {
             0 => Err(Error::new("source unavailable")),
@@ -759,9 +766,9 @@ fn losing_the_log_does_not_replay_an_older_cached_value() {
             _ => Ok(Fetched::Body(middle).into()),
         };
         let _ = apply_response_until(&lab.m7, config, applied.clone(), received, None, None, true);
-        assert_eq!(
-            std::fs::read(file).unwrap(),
-            b"new",
+        let value = crate::client::stored(&lab.m7, "shared");
+        assert!(
+            matches!(value.as_deref(), None | Some(b"new")),
             "log loss is not a new value: response={response}"
         );
         assert_eq!(
@@ -812,14 +819,9 @@ fn an_exact_peer_remains_usable_when_the_local_log_cannot_support_publication() 
         )
         .unwrap();
         assert!(matches!(outcome, SyncOutcome::Unchanged { .. }));
-        assert_eq!(
-            load_state(&f.paths).unwrap().records_digest,
-            before.records_digest
-        );
-        assert_eq!(
-            std::fs::read(f.paths.home.join(".secrets/shared")).unwrap(),
-            b"retained"
-        );
+        let after = load_state(&f.paths).unwrap();
+        assert_eq!(after.records_digest, before.records_digest);
+        assert_eq!(after.held, before.held);
     }
 }
 
@@ -962,7 +964,7 @@ fn a_replacement_waiting_for_records_preserves_the_previous_state() {
     assert!(matches!(outcome, SyncOutcome::Applied { .. }));
     assert_eq!(configured(&old.m7).unwrap().signer, Some(next_key));
     assert_eq!(
-        std::fs::read(old.m7.home.join(".secrets/shared")).unwrap(),
+        crate::client::stored(&old.m7, "shared").unwrap(),
         b"replacement"
     );
     assert!(
@@ -1064,7 +1066,7 @@ fn a_behind_log_cannot_swallow_the_transport_error() {
     sync_with(&lab.m7, std::fs::read(lab.m22.cache_file()).unwrap()).unwrap();
     let config = configured(&lab.m7).unwrap();
     let before = load_state(&lab.m7).unwrap();
-    assert!(files_intact(&lab.m7, &before));
+    assert!(applied_intact(&lab.m7, &before));
     save_records(&lab.m7, &old_records).unwrap();
     let outcome = apply_response_until(
         &lab.m7,
@@ -1167,10 +1169,7 @@ fn failed_fetch_uses_the_current_locked_cache_for_local_log_progress() {
     let after = load_state(&lab.m7).unwrap();
     assert_eq!((after.seq, after.digest), (current.seq, current.digest));
     assert_ne!(after.records_digest, current.records_digest);
-    assert_eq!(
-        std::fs::read(lab.m7.home.join(".secrets/shared")).unwrap(),
-        b"new"
-    );
+    assert_eq!(crate::client::stored(&lab.m7, "shared").unwrap(), b"new");
     lab.server.stop();
 }
 
@@ -1181,10 +1180,7 @@ fn failed_fetch_repairs_only_when_the_locked_state_admits_it() {
             let f = Fixture::new();
             sync_with(&f.paths, if revoked { f.revoked } else { f.good }).unwrap();
             let current = load_state(&f.paths).unwrap();
-            let file = f.paths.home.join(".secrets/shared");
-            if file.exists() {
-                std::fs::remove_file(&file).unwrap();
-            }
+            unrecord_apply(&f.paths);
             let result = apply_response_until(
                 &f.paths,
                 f.config.clone(),
@@ -1205,37 +1201,12 @@ fn failed_fetch_repairs_only_when_the_locked_state_admits_it() {
             } else {
                 assert_eq!(result.unwrap_err().to_string(), "source unavailable");
             }
-            assert_eq!(file.exists(), admitted);
             let after = load_state(&f.paths).unwrap();
+            assert_eq!(after.held.is_some(), admitted);
             assert_eq!((after.seq, after.digest), (current.seq, current.digest));
             assert_eq!(after.membership, current.membership);
             assert!(network_observation::project(&f.paths, &f.config, &after).is_none());
         }
-    }
-}
-
-#[test]
-fn cached_retry_keeps_a_verified_source_binding_after_a_local_write_failure() {
-    for offline in [false, true] {
-        let f = Fixture::new();
-        let dir = f.paths.home.join(".secrets");
-        let file = dir.join("shared");
-        std::fs::remove_file(&file).unwrap();
-        std::fs::remove_dir(&dir).unwrap();
-        std::fs::write(&dir, b"local obstruction").unwrap();
-        sync_with(&f.paths, f.base).unwrap();
-        let failed = load_state(&f.paths).unwrap();
-        assert!(failed.failed);
-        assert!(source_bound(&f.config, &failed));
-        std::fs::remove_file(&dir).unwrap();
-        let response = if offline {
-            Err(Error::new("source unavailable"))
-        } else {
-            Ok(Fetched::NoNewer(None).into())
-        };
-        apply_response_until(&f.paths, f.config, failed, response, None, None, false).unwrap();
-        assert_eq!(std::fs::read(file).unwrap(), b"retained");
-        assert!(!load_state(&f.paths).unwrap().failed);
     }
 }
 
@@ -1269,7 +1240,7 @@ fn a_lost_cache_does_not_let_a_legacy_peer_discard_the_exact_recovery_copy() {
                 assert_eq!(selected.digest, f.before.digest.unwrap(), "cached={cached}");
                 sync_with(&f.paths, selected.envelope).unwrap();
                 assert_eq!(
-                    std::fs::read(f.paths.home.join(".secrets/shared")).unwrap(),
+                    crate::client::stored(&f.paths, "shared").unwrap(),
                     b"retained"
                 );
             }
@@ -1415,7 +1386,7 @@ fn a_compiled_signer_replacement_is_not_bound_by_the_retired_lineage() {
                 assert_eq!(load_state(&f.paths).unwrap().seq, seq);
                 assert_eq!(configured(&f.paths).unwrap().signer, Some(current));
                 assert_eq!(
-                    std::fs::read(f.paths.home.join(".secrets/replacement")).unwrap(),
+                    crate::client::stored(&f.paths, "replacement").unwrap(),
                     b"current lineage"
                 );
             }
@@ -2035,11 +2006,19 @@ fn a_bodyless_response_applies_log_admission_from_a_pending_cache() {
         assert_eq!(after.digest, before.digest);
         assert!(after.network_materialization.is_none());
         assert_eq!(
-            std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
+            crate::client::stored(&reader, "shared").unwrap(),
             b"newly admitted"
         );
         lab.server.stop();
     }
+}
+
+/// Make the state at `paths` one an older aterm wrote: no apply of this build recorded what it
+/// reads ([`State::held`]), so an unconditional pass applies the version it holds again.
+fn unrecord_apply(paths: &Paths) {
+    let mut state = load_state(paths).unwrap();
+    state.held = None;
+    save_state(paths, &state).unwrap();
 }
 
 fn head(bytes: Vec<u8>, config: &Config) -> SyncPeerHead {
@@ -2049,6 +2028,7 @@ fn head(bytes: Vec<u8>, config: &Config) -> SyncPeerHead {
         None,
         config,
         config.signer.as_ref().unwrap(),
+        None,
     )
     .unwrap()
 }
@@ -2171,10 +2151,7 @@ fn ordinary_and_bounded_readers_apply_log_progress_without_an_envelope_server() 
             if removed {
                 assert_eq!(load_state(&lab.m7).unwrap().membership, Stored::Revoked);
             } else {
-                assert_eq!(
-                    std::fs::read(lab.m7.home.join(".secrets/shared")).unwrap(),
-                    b"new"
-                );
+                assert_eq!(crate::client::stored(&lab.m7, "shared").unwrap(), b"new");
             }
         }
     }
@@ -2209,10 +2186,7 @@ fn log_progress_under_the_held_envelope_leaves_the_cache_file_as_it_is() {
     let after = load_state(&lab.m7).unwrap();
     assert_eq!((after.seq, after.digest), (before.seq, before.digest));
     assert_ne!(after.records_digest, before.records_digest);
-    assert_eq!(
-        std::fs::read(lab.m7.home.join(".secrets/shared")).unwrap(),
-        b"new"
-    );
+    assert_eq!(crate::client::stored(&lab.m7, "shared").unwrap(), b"new");
     assert_eq!(
         fsx::stamp(&lab.m7.cache_file()),
         Some(cache),

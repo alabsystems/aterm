@@ -102,20 +102,20 @@ fn resolutions_past_the_bound_are_refused_until_one_ends() {
     };
     for _ in 0..2 {
         assert_eq!(
-            resolve_in(&SLOTS, "hangs", 7, Duration::from_millis(1), hang())
+            resolve_in(&SLOTS, "hangs", 7, Duration::from_millis(1), None, hang())
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::TimedOut
         );
     }
-    let refused = resolve_in(&SLOTS, "third", 7, MUST_HAPPEN, hang()).unwrap_err();
+    let refused = resolve_in(&SLOTS, "third", 7, MUST_HAPPEN, None, hang()).unwrap_err();
     assert_eq!(refused.raw_os_error(), Some(libc::EAGAIN), "{refused}");
     release.send(()).unwrap();
     release.send(()).unwrap();
     let answered = |_: &str, _: u16| Ok(vec![SocketAddr::from(([127, 0, 0, 1], 7))]);
     let start = Instant::now();
     let resolved = loop {
-        match resolve_in(&SLOTS, "fourth", 7, MUST_HAPPEN, answered) {
+        match resolve_in(&SLOTS, "fourth", 7, MUST_HAPPEN, None, answered) {
             Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => {
                 assert!(
                     start.elapsed() < MUST_HAPPEN,
@@ -145,7 +145,7 @@ fn a_literal_address_answers_with_every_slot_taken() {
         Ok(Vec::new())
     };
     assert_eq!(
-        resolve_in(&SLOTS, "hangs", 7, Duration::from_millis(1), hang)
+        resolve_in(&SLOTS, "hangs", 7, Duration::from_millis(1), None, hang)
             .unwrap_err()
             .kind(),
         io::ErrorKind::TimedOut
@@ -155,12 +155,12 @@ fn a_literal_address_answers_with_every_slot_taken() {
     for literal in ["127.0.0.1", "::1", "192.0.2.7", "fe80::1"] {
         let expected: Vec<SocketAddr> = (literal, 7).to_socket_addrs().unwrap().collect();
         assert_eq!(
-            resolve_in(&SLOTS, literal, 7, MUST_HAPPEN, unasked).unwrap(),
+            resolve_in(&SLOTS, literal, 7, MUST_HAPPEN, None, unasked).unwrap(),
             expected,
             "{literal}"
         );
     }
-    let refused = resolve_in(&SLOTS, "localhost", 7, MUST_HAPPEN, unasked).unwrap_err();
+    let refused = resolve_in(&SLOTS, "localhost", 7, MUST_HAPPEN, None, unasked).unwrap_err();
     assert_eq!(refused.raw_os_error(), Some(libc::EAGAIN), "{refused}");
     release.send(()).unwrap();
 }
@@ -178,4 +178,41 @@ fn localhost_resolves_here_and_a_zero_bound_is_refused() {
         resolve("localhost", 7, Duration::ZERO).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
+}
+
+/// A counted resolution's thread is counted once, as its lookup returns and before its answer
+/// is heard, whatever the lookup answered; an uncounted one and a literal address count none.
+/// The lookups are a test's, so nothing here waits on a resolver.
+///
+/// Negative control: run the lookup alone in `resolve_in`'s thread (`None => ...` for both
+/// arms): the first count reads 0, wants 1.
+#[test]
+fn a_counted_resolution_counts_its_thread_as_the_lookup_returns() {
+    use std::sync::atomic::Ordering;
+    static SLOTS: Slots = Slots::new(4);
+    let threads = std::sync::Arc::new(crate::cpu::ThreadsCpu::new());
+    let counted = || Some(std::sync::Arc::clone(&threads));
+    let ended = || threads.ended.load(Ordering::Relaxed);
+    let at = vec![SocketAddr::from(([127, 0, 0, 1], 7))];
+    let found = {
+        let at = at.clone();
+        move |_: &str, _: u16| Ok(at)
+    };
+    assert_eq!(
+        resolve_in(&SLOTS, "named", 7, MUST_HAPPEN, counted(), found.clone()).unwrap(),
+        at
+    );
+    assert_eq!(ended(), 1);
+    let failed = |_: &str, _: u16| Err(io::Error::other("no such name"));
+    resolve_in(&SLOTS, "unknown", 7, MUST_HAPPEN, counted(), failed).unwrap_err();
+    assert_eq!(ended(), 2);
+    // A literal address starts no thread, and an uncounted resolution's thread is not counted.
+    let unasked =
+        |name: &str, _: u16| -> io::Result<Vec<SocketAddr>> { panic!("{name} was looked up") };
+    resolve_in(&SLOTS, "127.0.0.1", 7, MUST_HAPPEN, counted(), unasked).unwrap();
+    assert_eq!(
+        resolve_in(&SLOTS, "named", 7, MUST_HAPPEN, None, found).unwrap(),
+        at
+    );
+    assert_eq!(ended(), 2);
 }

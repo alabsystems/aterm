@@ -38,7 +38,6 @@ fn base_swarm_roster_for(
     let envelope_bound = cached.is_some();
     if state.membership == Stored::In
         && !state.failed
-        && state.pending.is_empty()
         && pin_admitted(expected, None)
         && (log_only_bound || envelope_bound)
         && let Some(identity) = reads.identity()?
@@ -362,7 +361,6 @@ fn swarm_roster_with_base(
     let envelope_bound = envelope_held(reads, expected, state)?.is_some();
     if state.membership == Stored::In
         && !state.failed
-        && state.pending.is_empty()
         && pin_admitted(expected, None)
         && (log_only_bound || envelope_bound)
         && let Some(identity) = reads.identity()?
@@ -1309,7 +1307,6 @@ pub fn resolve_local_swarm_label(
         && local_log.is_some();
     if state.membership != Stored::In
         || state.failed
-        || !state.pending.is_empty()
         || expected.signer.is_none()
         || !pin_admitted(&expected, None)
         || (!source_bound(&expected, &state) && !log_only_bound)

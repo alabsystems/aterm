@@ -435,6 +435,13 @@ pub(crate) const LATENCY_BUCKETS: usize = 27 * 1024;
 pub(crate) type Histogram = HistogramBins<H_BUCKETS>;
 pub(crate) type LatencyDist = Distribution<LATENCY_BUCKETS>;
 
+/// Inclusive bounds on the recorded value occupying a quantile's histogram bucket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QuantileBounds {
+    pub(crate) lower_ns: u64,
+    pub(crate) upper_ns: u64,
+}
+
 pub(crate) struct HistogramBins<const N: usize> {
     coarse: [AtomicU64; H_BUCKETS],
     // Keep unused latency ledgers and local Metrics values small. Allocation is
@@ -554,21 +561,42 @@ impl HistCopy {
         self.n
     }
 
-    /// The value at quantile `q` (0 < q ≤ 1), as the containing bucket's upper edge in ns — conservative by construction.
+    /// The containing bucket's computed exclusive upper edge at `q` (0 < q ≤ 1), in ns.
+    /// The final bucket saturates; use [`Self::percentile_bounds`] to bound recorded values.
     #[must_use]
     pub(crate) fn percentile(&self, q: f64) -> Option<u64> {
+        self.quantile_bucket(q).map(self.upper_edge)
+    }
+
+    /// The inclusive interval containing quantile `q` (0 < q ≤ 1). The final bucket also
+    /// contains every value above its computed edge, so its upper bound is `u64::MAX`.
+    #[must_use]
+    pub(crate) fn percentile_bounds(&self, q: f64) -> Option<QuantileBounds> {
+        let index = self.quantile_bucket(q)?;
+        Some(QuantileBounds {
+            lower_ns: if index == 0 {
+                0
+            } else {
+                (self.upper_edge)(index - 1)
+            },
+            upper_ns: if index == self.counts.len() - 1 {
+                u64::MAX
+            } else {
+                (self.upper_edge)(index) - 1
+            },
+        })
+    }
+
+    fn quantile_bucket(&self, q: f64) -> Option<usize> {
         if self.n == 0 {
             return None;
         }
         let target = ((q * self.n as f64).ceil() as u64).clamp(1, self.n);
         let mut seen = 0u64;
-        self.counts
-            .iter()
-            .position(|&c| {
-                seen += c;
-                seen >= target
-            })
-            .map(self.upper_edge)
+        self.counts.iter().position(|&c| {
+            seen += c;
+            seen >= target
+        })
     }
 }
 

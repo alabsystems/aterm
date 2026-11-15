@@ -37,7 +37,9 @@ pub(crate) use self::event::{option_only_character, KeyEventExtra};
 pub(crate) use self::event_loop::{
     ActiveEventLoop, EventLoop, EventLoopProxy, PlatformSpecificEventLoopAttributes,
 };
-pub(crate) use self::key_origin::{set_window_input_classifier, window_event_origin};
+pub(crate) use self::key_origin::{
+    set_window_input_classifier, window_event_native_input, window_event_origin,
+};
 pub(crate) use self::monitor::MonitorHandle;
 pub(crate) use self::terminate::{exit_ends_in_appkit, refuse as refuse_deferred_termination};
 pub use self::terminate::{ReplyWait, TerminateAnswer};

@@ -5598,6 +5598,48 @@ fn a_fleet_peer_reads_the_survey_at_its_level() {
     assert_eq!(fleet_survey("survey", "", Scope::Owner, &store), None);
 }
 
+/// A window answers a peer's fleet survey with the machine's look, and the node job's own read
+/// (relayed with no peer, `node_serve::relayed_survey`) with none: a look is taken only
+/// inside a peer's answer, never on the node job's timers.
+#[test]
+#[cfg(unix)]
+fn a_window_takes_a_look_for_a_peers_survey_and_none_for_the_node_jobs_own() {
+    let store = crate::session_store::new_store();
+    let fleet = Scope::Fleet {
+        content: false,
+        drive: false,
+    };
+    let look = |reply: &str| {
+        reply
+            .lines()
+            .nth(1)
+            .is_some_and(|instance| instance.split(' ').any(|t| t.starts_with("m_at_ms=")))
+    };
+    let answer = |peer: Option<std::net::SocketAddr>| {
+        let header = crate::fleet_listen::node_serve::RelayHeader::Survey {
+            content: false,
+            drive: false,
+            peer,
+        };
+        let (_, serving) = crate::fleet_listen::node_serve::relayed_survey(&header)
+            .expect("a survey header is served as a survey");
+        serving_fleet_as(serving, || {
+            fleet_survey("survey", "", fleet, &store).expect("a fleet survey")
+        })
+    };
+    let peer: std::net::SocketAddr = "192.0.2.7:4040".parse().expect("a peer address");
+    let peers = answer(Some(peer));
+    assert!(look(&peers), "a peer's answer takes the look: {peers}");
+    let own = answer(None);
+    assert!(!look(&own), "the node job's own read takes none: {own}");
+    assert!(
+        own.lines()
+            .nth(1)
+            .is_some_and(|i| i.starts_with("instance ")),
+        "the node job's read is still answered whole: {own}"
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn a_turn_with_no_text_is_usage_unless_it_submits_nothing() {
@@ -6119,6 +6161,35 @@ fn the_router_routes_every_row_by_its_class_and_refuses_the_rest() {
     );
 }
 
+/// A SESSION'S `harness` LINE GOES TO THE VERB ITS FIRST WORD NAMES: `harness probe repo` is a
+/// session verb and reaches the probe verb ([`crate::harness_probe_verb`]), never the policy
+/// verb's usage line; `recovery` and `fact` reach their own; every other `harness` line, the
+/// bare one and any word no handler owns, is the policy verb's.
+#[test]
+fn a_harness_line_goes_to_the_verb_its_first_word_names() {
+    use aterm_types::control_verbs::spec_for;
+    assert!(
+        matches!(
+            route("harness", spec_for("harness", "probe repo")),
+            Ok((Route::Session, _))
+        ),
+        "a session verb"
+    );
+    for (rest, want) in [
+        ("probe repo", HarnessVerb::Probe),
+        ("probe", HarnessVerb::Probe),
+        ("  probe   repo ", HarnessVerb::Probe),
+        ("recovery", HarnessVerb::Recovery),
+        ("fact land-hold", HarnessVerb::Fact),
+        ("", HarnessVerb::Policy),
+        ("policy", HarnessVerb::Policy),
+        ("probes repo", HarnessVerb::Policy),
+        ("repo probe", HarnessVerb::Policy),
+    ] {
+        assert_eq!(HarnessVerb::of(rest), want, "{rest:?}");
+    }
+}
+
 #[test]
 fn owner_verbs_need_no_terminal_except_the_session_authority_ones() {
     use aterm_types::control_verbs::{Access, VERBS};
@@ -6596,8 +6667,8 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
     );
 
     let every: Vec<String> = [
-        crate::harness_screen::EveryPress::Mode(aterm_agent::supervise::Autopilot::Cruise),
-        crate::harness_screen::EveryPress::Mode(aterm_agent::supervise::Autopilot::Land),
+        crate::harness_screen::EveryPress::Mode(alab_policy::config::Autopilot::Cruise),
+        crate::harness_screen::EveryPress::Mode(alab_policy::config::Autopilot::Land),
         crate::harness_screen::EveryPress::Timer(crate::autopilot_timers::TimerChoice::In(120)),
         crate::harness_screen::EveryPress::Timer(crate::autopilot_timers::TimerChoice::At),
         crate::harness_screen::EveryPress::Follow,
@@ -6648,7 +6719,7 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Harness));
     assert_eq!(
         app.front_control_surface(),
-        FrontControlSurface::HarnessSettings
+        FrontControlSurface::OwnerSettings
     );
     for verb in ["key", "mouse", "paste"] {
         let need = front_drive_escalation(config_edge, input_of(verb), app.front_control_surface())
@@ -6666,8 +6737,8 @@ fn harness_session_presses_are_owner_only_on_both_paths() {
         );
     }
     assert_eq!(
-        front_drive_denial(FrontControlSurface::HarnessSettings),
-        "ERR native settings harness open (owner-only while open)\n"
+        front_drive_denial(FrontControlSurface::OwnerSettings),
+        "ERR native settings owner-only page open (owner-only while open)\n"
     );
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Security));
     assert_eq!(
@@ -6796,7 +6867,10 @@ fn grant_then_edge_handshake_then_revoke_roundtrip() {
     assert_eq!(cmd_revoke(&ctx, owner, hex), "ERR no such edge\n");
 
     let who = cmd_whoami(&ctx, owner);
-    assert!(who.starts_with("OK s-"), "whoami: {who}");
+    assert!(
+        who.starts_with("OK t"),
+        "whoami names the t ID minted for it: {who}"
+    );
     assert!(who.trim_end().ends_with("owner"), "whoami scope: {who}");
 }
 
@@ -12144,12 +12218,14 @@ fn typed_turn_with(
 /// auto-idle` against `-footer-plan`, measured), so a turn fenced on the composer's rows (`if-rows=`)
 /// alone pasted and pressed Enter after it, inside the person's grace. With `if-human=` the count of
 /// the person's gestures the caller's read took, a key since stops the turn before its paste, or once
-/// pasted before its Enter, the text left unsubmitted. A repaint off the fenced rows that no person
-/// made moves neither fence.
+/// pasted before its Enter, the text left unsubmitted; with no key, its Enter is the turn's own
+/// write under the terminal lock (`fenced_submit`), which the program answers. A repaint off the
+/// fenced rows that no person made moves neither fence.
 /// NEGATIVE CONTROLS: the compares before the paste dropped (under the fence's lock and after it),
-/// and the key-before arm pastes; the compare before the first press dropped, and the key-in-paste
-/// arm presses Enter.
+/// and the key-before arm pastes; the compares at the first press dropped (before it and under
+/// its lock), and the key-in-paste arm presses Enter.
 #[test]
+#[cfg(unix)]
 fn a_turn_fenced_on_the_person_skips_a_key_its_fenced_rows_never_show() {
     use aterm_types::control_verbs::RowsFence;
     use std::cell::{Cell, RefCell};
@@ -12166,8 +12242,15 @@ fn a_turn_fenced_on_the_person_skips_a_key_its_fenced_rows_never_show() {
     // (arm, the person's key before the turn, their key inside its paste, if-human=) ->
     // (its verdict's head, pasted, Enters)
     let run = |before: bool, in_paste: bool, human: bool| -> (String, usize, usize) {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let store = session_store::new_store();
-        let h = registered_session(0, -1, b"");
+        let (h, rx) = guarded_pipe_session(0);
+        // SAFETY: guarded_pipe_session returned this new write descriptor; the
+        // session/sink borrow it and no other owner closes it. No writer is pending.
+        let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
+        aterm_pty::set_nonblocking(rx.as_raw_fd(), true).expect("a nonblocking program end");
         store.write().unwrap().register(h.clone());
         let term = &h.term;
         term.lock().unwrap().process(idle.as_bytes());
@@ -12212,17 +12295,46 @@ fn a_turn_fenced_on_the_person_skips_a_key_its_fenced_rows_never_show() {
         } else {
             String::new()
         };
-        let out = cmd_turn(
-            term,
-            &store,
-            0,
-            &format!("if-rows={fence} {human}submit_verify=seq idle=20 timeout=60000 hello"),
-            &h.ctx,
-            &io,
-        );
+        let turned = AtomicBool::new(false);
+        let written = AtomicUsize::new(0);
+        let out = std::thread::scope(|s| {
+            // The program: an Enter the turn writes itself draws the response a press draws.
+            s.spawn(|| {
+                let mut buf = [0u8; 64];
+                loop {
+                    let stopping = turned.load(Ordering::Acquire);
+                    match (&rx).read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            for _ in buf[..n].iter().filter(|b| **b == b'\r') {
+                                written.fetch_add(1, Ordering::SeqCst);
+                                term.lock().unwrap().process(b"\r\n\x1b[2Kresponse\r\n");
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stopping {
+                                break;
+                            }
+                            aterm_uds::deadline::poll_yield();
+                        }
+                        Err(e) => panic!("reading the program's end: {e}"),
+                    }
+                }
+            });
+            let out = cmd_turn(
+                term,
+                &store,
+                0,
+                &format!("if-rows={fence} {human}submit_verify=seq idle=20 timeout=60000 hello"),
+                &h.ctx,
+                &io,
+            );
+            turned.store(true, Ordering::Release);
+            out
+        });
         let head = out.lines().next().unwrap_or_default().to_string();
         let n = pasted.borrow().len();
-        (head, n, enters.get())
+        (head, n, enters.get() + written.load(Ordering::SeqCst))
     };
     let (head, pasted, enters) = run(true, false, true);
     assert!(
@@ -19037,13 +19149,36 @@ fn closed_session_fixture(
     std::sync::Arc<crate::SessionCtx>,
     Vec<aterm_session::EdgeToken>,
 ) {
+    closed_session_fixture_of(grants, None)
+}
+
+/// [`closed_session_fixture`], its tab under `kept`'s ID (a restore's kept one) with a log
+/// whose base is `kept`'s epoch, where `kept` names them.
+fn closed_session_fixture_of(
+    grants: &[aterm_session::Op],
+    kept: Option<(aterm_session::SessionId, u32)>,
+) -> (
+    crate::App,
+    std::sync::Arc<crate::SessionCtx>,
+    Vec<aterm_session::EdgeToken>,
+) {
     let mut app = crate::App::headless_for_test();
     let source = app.pool.get(0).expect("session 0").ctx.self_id.clone();
-    app.push_stub_tab(crate::WindowId(0), crate::stub_session(app.next_session_id));
+    let stub = match &kept {
+        Some((sid, _)) => crate::stub_session_as(app.next_session_id, sid.clone()),
+        None => crate::stub_session(app.next_session_id),
+    };
+    app.push_stub_tab(crate::WindowId(0), stub);
     let local = app.next_session_id - 1;
     let ctx = std::sync::Arc::clone(&app.pool.get(local).expect("the stub").ctx);
     {
         let mut tl = ctx.timeline.lock().unwrap();
+        if let Some((_, ep)) = kept {
+            *tl.slog_mut() = crate::session_log::SessionLog::starting(
+                std::sync::Arc::new(crate::session_log::Epochs::new()),
+                aterm_slog::Stamp::new(u64::from(ep) * 1000, 0),
+            );
+        }
         let now = tl.slog().now();
         tl.slog_mut().open_session(None, None, now);
         for _ in 0..3 {
@@ -19790,6 +19925,406 @@ fn a_revoked_edge_cannot_read_a_closed_session_through_the_journal() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// A journal under `<scratch>/logs` holding one chain per `(instance, log)`, each ended by a
+/// quit, every log `sid`'s.
+#[cfg(unix)]
+fn journal_of_quit_logs(
+    scratch: &std::path::Path,
+    sid: &aterm_session::SessionId,
+    logs: &[(&str, &aterm_slog::Log)],
+) -> std::path::PathBuf {
+    use aterm_slog::journal::{EndWhy, FORMAT, Frame, Inst, encode_frame};
+    let _ = std::fs::remove_dir_all(scratch);
+    let path = scratch.join("logs");
+    std::fs::create_dir_all(&path).expect("logs");
+    let dir = crate::session_log_journal::fs::PinnedJournalFs::open(&path, true)
+        .expect("opens")
+        .expect("made");
+    let short = aterm_slog::ShortId::new(sid.as_str()).expect("a sid is an id");
+    for (i, (inst, log)) in logs.iter().enumerate() {
+        let t = 1_760_600_000_000 + i as u64 * 1000;
+        let mut seg = {
+            use crate::session_log_journal::fs::JournalFs as _;
+            dir.create_segment(&format!("{inst}.1.slog"))
+                .expect("a segment")
+        };
+        let take = aterm_slog::journal::take(log, 0, 512, true);
+        let mut bytes = String::new();
+        for f in std::iter::once(Frame::Seg {
+            v: FORMAT,
+            inst: Inst::new(inst).expect("an instance"),
+            n: 1,
+            t,
+            build: "test".to_string(),
+        })
+        .chain(aterm_slog::journal::take_frames(short, &take, true, t))
+        .chain(std::iter::once(Frame::End {
+            why: EndWhy::Quit,
+            t: t + 1,
+        })) {
+            bytes.push_str(&encode_frame(&f).expect("encodes"));
+            bytes.push('\n');
+        }
+        let _ = seg.write(bytes.as_bytes()).expect("writes");
+    }
+    path
+}
+
+/// A log of epoch `ep` that opens its session at `wall` and holds `runs` closed `cmd` runs, then
+/// closes `out=app-quit` as a quit does.
+#[cfg(unix)]
+fn quit_log(ep: u32, wall: u64, runs: usize) -> aterm_slog::Log {
+    use aterm_slog::{Actor, Close, Conf, Fields, Kind, Log, Open, Out, RunOut, SessionOut, Src};
+    let at = |ms: u64| aterm_slog::Stamp::new(wall + ms, ms);
+    let mut log = Log::new(ep);
+    log.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Nobody,
+        Fields::new(),
+        at(0),
+    )
+    .expect("opens");
+    for i in 0..runs as u64 {
+        let r = log
+            .open(
+                Open::new(Kind::Cmd, Src::Shell, Conf::Strong),
+                at(1 + 2 * i),
+            )
+            .expect("a run");
+        log.close(
+            r,
+            Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact),
+            at(2 + 2 * i),
+        )
+        .expect("closes");
+    }
+    log.close_session(
+        Close::new(Out::Session(SessionOut::AppQuit), Src::Aterm, Conf::Exact).by(Actor::Aterm),
+        at(100),
+    )
+    .expect("the quit closes it");
+    log
+}
+
+/// One session ID of each form this Mac's readers take: the `t` form a mint makes, and a legacy
+/// tab's `s-` and 20 hex digits, which a shell opened before the `t` form still holds
+/// ([`aterm_types::tab_id::is_legacy`]).
+#[cfg(unix)]
+fn both_id_forms() -> [aterm_session::SessionId; 2] {
+    let earlier = aterm_session::SessionId::new(format!(
+        "s-{}",
+        &aterm_session::LaunchNonce::generate().to_hex()[..20]
+    ));
+    let forms = [aterm_session::SessionId::generate(), earlier];
+    assert_eq!(
+        forms.each_ref().map(|sid| (
+            sid.tab().is_some(),
+            aterm_types::tab_id::is_legacy(sid.as_str())
+        )),
+        [(true, false), (false, true)],
+        "PRECONDITION: a tab ID of each form: {forms:?}"
+    );
+    forms
+}
+
+/// The `base=` a `log` reply's header names.
+#[cfg(unix)]
+fn header_base(reply: &str) -> Option<u32> {
+    header_number(reply, "base=")
+}
+
+/// The `ep=` a `log` or `brief` reply's header names: a brief names its log by this alone.
+#[cfg(unix)]
+fn header_ep(reply: &str) -> Option<u32> {
+    header_number(reply, "ep=")
+}
+
+/// The number after `key` in a reply's header line.
+#[cfg(unix)]
+fn header_number(reply: &str, key: &str) -> Option<u32> {
+    reply
+        .lines()
+        .next()
+        .and_then(|h| h.split_whitespace().find_map(|t| t.strip_prefix(key)))
+        .and_then(|b| b.parse::<u32>().ok())
+}
+
+/// How many runs a `log` reply opens.
+#[cfg(unix)]
+fn opened_runs(reply: &str) -> usize {
+    reply.lines().filter(|l| l.contains(" open r")).count()
+}
+
+/// LT-01 KEEPS A TAB'S ID ACROSS A COLD RESTORE, and the restore starts it a new log, so the sid
+/// names every log the tab kept: `log prev[=<k>]` and `brief prev[=<k>]` read the `k`-th before
+/// the one a plain `log` reads (the live log, a log closed here, or the journal's newest) from
+/// the journal, for the Owner only, under a tab ID of either form; a brief names the log it
+/// summarizes by its header's `ep=`. NEGATIVE CONTROLS: the plain read and the plain brief answer
+/// the newest, a count past the oldest log answers none, an edge is answered no such session and a
+/// bad count is the usage line.
+#[cfg(unix)]
+#[test]
+fn log_prev_reads_the_log_a_kept_tab_id_kept_before_from_the_journal() {
+    use super::{NO_EARLIER_LOG, Scope, Selector, earlier_log_reply, journal_session_reply_with};
+    let base = std::fs::canonicalize(std::env::temp_dir()).expect("tmp");
+    let (first, second, live) = (1_794_000_000, 1_794_000_100, 1_794_000_200);
+    for (form, sid) in both_id_forms().into_iter().enumerate() {
+        let scratch = base.join(format!(
+            "aterm-ctl-journal-prev-{}-{form}",
+            std::process::id()
+        ));
+        let (a, b) = (quit_log(first, 1_000, 3), quit_log(second, 9_000, 1));
+        let logs = journal_of_quit_logs(&scratch, &sid, &[("p1-aa", &a), ("p2-bb", &b)]);
+        let reader = crate::session_log_journal::read::Reader::at(logs);
+        let store = crate::session_store::new_store();
+        let sel = Selector::parse(sid.as_str());
+        let journal = |rest: &str| {
+            journal_session_reply_with(Some(&reader), Some(&sel), "log", rest, &store, Scope::Owner)
+                .unwrap_or_else(|| panic!("the journal holds {sid}"))
+        };
+
+        let newest = journal("");
+        assert_eq!(header_base(&newest), Some(second), "{sid}: {newest}");
+        assert_eq!(
+            opened_runs(&newest),
+            1,
+            "NEGATIVE CONTROL: the plain read is the newest: {newest}"
+        );
+        for rest in ["prev", "prev=1", "prev n=400"] {
+            let earlier = journal(rest);
+            assert_eq!(
+                header_base(&earlier),
+                Some(first),
+                "{sid} {rest}: {earlier}"
+            );
+            assert_eq!(opened_runs(&earlier), 3, "{sid} {rest}: {earlier}");
+            assert!(
+                earlier.contains(" close - spawn out=app-quit "),
+                "{sid} {rest}: {earlier}"
+            );
+        }
+        assert_eq!(
+            journal("prev=2"),
+            NO_EARLIER_LOG,
+            "{sid}: none before the first"
+        );
+        for bad in ["prev=0", "prev=x", "prev=", "prev prev=2"] {
+            assert_eq!(
+                journal(bad),
+                crate::session_log::LOG_USAGE,
+                "{sid} {bad}: the usage line"
+            );
+        }
+        let brief_of = |rest: &str| {
+            journal_session_reply_with(
+                Some(&reader),
+                Some(&sel),
+                "brief",
+                rest,
+                &store,
+                Scope::Owner,
+            )
+            .unwrap_or_else(|| panic!("the journal holds {sid}"))
+        };
+        let brief = brief_of("prev");
+        assert!(
+            brief.starts_with("OK ") && brief.contains(&format!(" sid={sid} ")),
+            "{brief}"
+        );
+        assert_eq!(
+            header_ep(&brief),
+            Some(first),
+            "{sid}: `brief prev` summarizes B1: {brief}"
+        );
+        let newest_brief = brief_of("");
+        assert_eq!(
+            header_ep(&newest_brief),
+            Some(second),
+            "{sid}: NEGATIVE CONTROL: the plain brief summarizes the newest: {newest_brief}"
+        );
+        let edge = Scope::Edge(aterm_session::EdgeToken::generate());
+        assert_eq!(
+            journal_session_reply_with(Some(&reader), Some(&sel), "log", "prev", &store, edge),
+            None,
+            "{sid}: an edge is answered no such session"
+        );
+
+        // The tab restored again and live under the same ID: `prev` counts back from its live
+        // log.
+        let from_live = |back: u32| {
+            earlier_log_reply(
+                Some(&reader),
+                sid.as_str(),
+                "log",
+                "",
+                back,
+                Some(live),
+                &store,
+            )
+        };
+        assert_eq!(header_base(&from_live(1)), Some(second), "{sid}");
+        assert_eq!(header_base(&from_live(2)), Some(first), "{sid}");
+        assert_eq!(from_live(3), NO_EARLIER_LOG, "{sid}");
+        assert_eq!(
+            earlier_log_reply(None, sid.as_str(), "log", "", 1, Some(live), &store),
+            NO_EARLIER_LOG,
+            "{sid}: no journal, no earlier log"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+    assert_eq!(
+        super::argument_escalation("log", "prev"),
+        Some(super::Need::OwnerOnly),
+        "a live session's `log prev` is the Owner's too"
+    );
+    for (verb, rest) in [("brief", "prev=2"), ("log", "prev=0"), ("log", "prev prev")] {
+        assert_eq!(
+            super::argument_escalation(verb, rest),
+            Some(super::Need::OwnerOnly),
+            "`{verb} {rest}`: a brief's `prev` and a malformed `prev` word are the Owner's"
+        );
+    }
+    assert_eq!(super::argument_escalation("log", "n=3"), None);
+}
+
+/// A TAB RESTORED UNDER ITS KEPT ID (LT-01) AND THEN CLOSED IN THIS PROCESS answers a plain `log`
+/// from the closed-session index, so its `log prev[=<k>]` counts back from that closed log's base
+/// (B2) to the log the tab kept before the restore (B1), read from the journal, and only the
+/// Owner reads it: an edge the closed log grants `ReadScreen` is refused the `prev` form, and an
+/// edge it grants nothing is answered no such session. `prev` counts from the closed log's base,
+/// not from the journal's newest log, so it answers B1 also while the journal's writer has not yet
+/// written B2. Under a tab ID of either form. NEGATIVE CONTROLS: the plain read is the index's
+/// log (B2, no run), the plain brief's `ep=` is B2's, `prev=2` is past the oldest, and the granted
+/// edge reads the plain form.
+#[cfg(unix)]
+#[test]
+fn log_prev_counts_back_from_a_log_closed_in_this_process() {
+    use super::{NO_EARLIER_LOG, Scope, Selector, closed_session_reply_with};
+    let base = std::fs::canonicalize(std::env::temp_dir()).expect("tmp");
+    let (first, second) = (1_794_100_000, 1_794_100_100);
+    for (form, sid) in both_id_forms().into_iter().enumerate() {
+        let (mut app, ctx, tokens) = closed_session_fixture_of(
+            &[aterm_session::Op::ReadScreen],
+            Some((sid.clone(), second)),
+        );
+        assert_eq!(ctx.self_id, sid, "PRECONDITION: the tab kept its ID");
+        let local = local_of(&app, &ctx);
+        app.retire_session_registration(local);
+        let sel = Selector::parse(sid.as_str());
+        let scratch = |leg: &str| {
+            base.join(format!(
+                "aterm-ctl-journal-closed-prev-{}-{form}-{leg}",
+                std::process::id()
+            ))
+        };
+        let (both, lagging) = (scratch("both"), scratch("lagging"));
+        let reader = crate::session_log_journal::read::Reader::at(journal_of_quit_logs(
+            &both,
+            &sid,
+            &[
+                ("p1-aa", &quit_log(first, 1_000, 3)),
+                ("p2-bb", &quit_log(second, 9_000, 1)),
+            ],
+        ));
+        let read = |verb: &str, rest: &str, scope: Scope| {
+            closed_session_reply_with(Some(&reader), Some(&sel), verb, rest, &app.store, scope)
+        };
+
+        let plain = read("log", "", Scope::Owner);
+        assert_eq!(
+            header_base(&plain),
+            Some(second),
+            "{sid}: PRECONDITION: the closed log is B2: {plain}"
+        );
+        assert!(
+            plain.contains(" close - ") && opened_runs(&plain) == 0,
+            "{sid}: NEGATIVE CONTROL: the plain read is the index's log, not the journal's: {plain}"
+        );
+        for rest in ["prev", "prev=1"] {
+            let earlier = read("log", rest, Scope::Owner);
+            assert_eq!(
+                header_base(&earlier),
+                Some(first),
+                "{sid} {rest}: {earlier}"
+            );
+            assert_eq!(opened_runs(&earlier), 3, "{sid} {rest}: {earlier}");
+            assert!(
+                earlier.contains(" close - spawn out=app-quit "),
+                "{sid} {rest}: {earlier}"
+            );
+        }
+        assert_eq!(
+            read("log", "prev=2", Scope::Owner),
+            NO_EARLIER_LOG,
+            "{sid}: none before B1"
+        );
+        let brief = read("brief", "prev", Scope::Owner);
+        assert!(
+            brief.starts_with("OK ") && brief.contains(&format!(" sid={sid} ")),
+            "{sid}: {brief}"
+        );
+        assert_eq!(
+            header_ep(&brief),
+            Some(first),
+            "{sid}: `brief prev` summarizes B1: {brief}"
+        );
+        let plain_brief = read("brief", "", Scope::Owner);
+        assert_eq!(
+            header_ep(&plain_brief),
+            Some(second),
+            "{sid}: NEGATIVE CONTROL: the plain brief summarizes the closed log: {plain_brief}"
+        );
+        let granted = Scope::Edge(tokens[0]);
+        assert!(
+            read("log", "", granted).starts_with("OK "),
+            "{sid}: NEGATIVE CONTROL: the grant reads the closed log itself"
+        );
+        for (verb, rest) in [("log", "prev"), ("brief", "prev"), ("log", "prev=2")] {
+            assert_eq!(
+                read(verb, rest, granted),
+                "ERR denied\n",
+                "{sid}: `{verb} {rest}` is the Owner's alone"
+            );
+        }
+        assert_eq!(
+            read(
+                "log",
+                "prev",
+                Scope::Edge(aterm_session::EdgeToken::generate())
+            ),
+            "ERR no such session\n",
+            "{sid}: an edge the log grants nothing is answered no such session"
+        );
+
+        // The journal's writer has not yet written this process's B2: `prev` still counts back
+        // from the closed log's base, where the journal's newest (B1) would have none before it.
+        let behind = crate::session_log_journal::read::Reader::at(journal_of_quit_logs(
+            &lagging,
+            &sid,
+            &[("p1-aa", &quit_log(first, 1_000, 3))],
+        ));
+        let earlier = closed_session_reply_with(
+            Some(&behind),
+            Some(&sel),
+            "log",
+            "prev",
+            &app.store,
+            Scope::Owner,
+        );
+        assert_eq!(
+            header_base(&earlier),
+            Some(first),
+            "{sid}: prev counts back from the closed log: {earlier}"
+        );
+        assert_eq!(opened_runs(&earlier), 3, "{sid}: {earlier}");
+        for dir in [both, lagging] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
 #[test]
 fn the_harness_token_reads_as_harness_and_holds_owner_power() {
     let instance = "0f".repeat(32);
@@ -20380,6 +20915,69 @@ fn a_guarded_submit_into_a_busy_sink_after_typing_keeps_its_id_in_doubt() {
     assert_eq!(pastes.get(), 1, "typed exactly once");
 }
 
+/// A TURN FENCED ON THE PERSON SUBMITS AS A GUARDED ONE DOES, INTO A BUSY SINK TOO: with
+/// `if-human=` and the default submit, the Enter is the turn's own write under the terminal lock
+/// that compares the person's count (`fenced_submit`), never the window's press route, so a sink
+/// that takes none of it until `submit_window=` ends answers the guarded submit's busy reply, the
+/// text typed and not submitted and the `id=` in doubt. NEGATIVE CONTROL: with `submit_is_fenced`
+/// reading the guard alone, the Enter goes by `press` and the turn answers no busy reply.
+#[test]
+#[cfg(unix)]
+fn a_turn_fenced_on_the_person_into_a_busy_sink_answers_as_a_guarded_one() {
+    let store = session_store::new_store();
+    // No nonblocking master: every immediate write of the Enter is `BusyZero`.
+    let h = registered_session(0, -1, b"> ");
+    store.write().unwrap().register(h.clone());
+    let pastes = std::cell::Cell::new(0u32);
+    let paste = |_: &str| {
+        pastes.set(pastes.get() + 1);
+        true
+    };
+    let presses = std::cell::Cell::new(0u32);
+    let press = |_: &str| {
+        presses.set(presses.get() + 1);
+        true
+    };
+    let line = format!(
+        "if-human={} submit_window=20 idle=5 timeout=2000 hi",
+        h.ctx.human_input.seq()
+    );
+    let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+    let turn = || {
+        crate::pty_idem::guarded_waking(
+            &h.ctx,
+            Scope::Owner,
+            "turn",
+            Some(key.as_str()),
+            &|| {},
+            |witness| {
+                cmd_turn(
+                    &h.term,
+                    &store,
+                    0,
+                    &line,
+                    &h.ctx,
+                    &TurnIo {
+                        paste: &paste,
+                        press: &press,
+                        witness: Some(witness),
+                        ..TurnIo::paste_only()
+                    },
+                )
+            },
+        )
+    };
+
+    assert_eq!(
+        turn(),
+        aterm_types::control_verbs::TURN_SUBMIT_BUSY_LINE,
+        "the text is typed and its fenced Enter found the sink busy"
+    );
+    assert_eq!(turn(), "ERR in-doubt seq=1\n");
+    assert_eq!(pastes.get(), 1, "typed exactly once");
+    assert_eq!(presses.get(), 0, "the window's press route is never taken");
+}
+
 /// A GUARDED ENTER THAT WAS A TURN'S FIRST WRITE AND WROTE NOTHING GIVES ITS `id=` BACK (fourth
 /// review of the turn-deadline work, 2026-11-06): a typed turn of control characters alone types
 /// nothing, so its guarded Enter is its first write, and a guard that misses writes nothing at
@@ -20427,7 +21025,7 @@ fn a_guarded_first_enter_that_wrote_nothing_gives_its_id_back() {
 /// A guarded submit fenced on the person (`if-human=`) judges the person under the lock at every
 /// try of its Enter, the retries the busy sink calls for included: a gesture while the sink takes
 /// none of the Enter cuts the turn (`reason=person`, the text left standing), never an Enter after
-/// it. NEGATIVE CONTROL: `guarded_submit` without the person in its fence, and the retries run the
+/// it. NEGATIVE CONTROL: `fenced_submit` without the person in its fence, and the retries run the
 /// window out (`TURN_SUBMIT_BUSY_LINE`).
 #[test]
 #[cfg(unix)]
@@ -20469,6 +21067,72 @@ fn a_guarded_submit_fenced_on_the_person_stops_at_a_gesture_in_its_busy_retries(
         reply.starts_with("OK 0 turn skipped reason=person typed=0 pasted=2 submitted=0"),
         "{reply}"
     );
+}
+
+/// A FENCED SUBMIT IS ADMITTED BY ITS TURN'S `if-supervisor=` FENCE, AS EACH WRITE THE TURN MAKES
+/// BY ITS ROUTE IS (`turn_write`): a turn whose supervisor's claim lapsed after its paste writes
+/// none of its Enter, guarded (`submit=guarded:`) or fenced on the person (`if-human=`), and
+/// answers `ERR key delivery failed`, its text standing. NEGATIVE CONTROL: the same turns with the
+/// claim standing write their Enter.
+#[test]
+#[cfg(unix)]
+fn a_fenced_submit_is_admitted_by_its_turns_supervisor_fence() {
+    let holder = format!("watcher@{}", std::process::id());
+    let run = |fence: &str, lapse: bool| -> (String, Vec<u8>) {
+        let store = session_store::new_store();
+        let (h, rx) = guarded_pipe_session(0);
+        // SAFETY: guarded_pipe_session returned this new write descriptor; the
+        // session/sink borrow it and no other owner closes it. No writer is pending.
+        let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
+        store.write().unwrap().register(h.clone());
+        crate::term_lock(&h.term).process(b"> ");
+        crate::session_timeline::claim_supervisor_as(
+            &h.ctx,
+            &holder,
+            None,
+            None,
+            None,
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("the supervisor's claim");
+        let _carried = CarriedFence::enter(
+            crate::session_timeline::SupervisorInputDelivery::Legacy(holder.clone()),
+        );
+        let paste = |_: &str| {
+            if lapse {
+                assert!(crate::session_timeline::release_supervisor_held_by(
+                    &h.ctx,
+                    &holder,
+                    crate::metrics::now_us(),
+                    aterm_slog::Actor::Ctl,
+                ));
+            }
+            true
+        };
+        let fence = fence.replace("{seen}", &h.ctx.human_input.seq().to_string());
+        let reply = cmd_turn(
+            &h.term,
+            &store,
+            0,
+            &format!("{fence} presses=1 submit_window=20 idle=5 timeout=60000 hi"),
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                ..TurnIo::paste_only()
+            },
+        );
+        let head = reply.lines().next().unwrap_or_default().to_string();
+        (head, drain_pipe(&rx))
+    };
+    for fence in ["submit=guarded:^>", "if-human={seen}"] {
+        let (head, written) = run(fence, true);
+        assert_eq!(head, "ERR key delivery failed", "{fence}");
+        assert!(written.is_empty(), "{fence}: no Enter: {written:?}");
+        let (head, written) = run(fence, false);
+        assert!(head.starts_with("OK "), "{fence}: {head}");
+        assert_eq!(written, b"\r", "{fence}: the Enter went");
+    }
 }
 
 /// A guarded re-press the sink takes none of, after an earlier Enter went, stops the re-presses
@@ -22401,10 +23065,10 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
             "{line}: an unknown session was admitted"
         );
     }
-    assert_eq!(
-        wrote("spawn agent=grok len=5"),
-        Some("spawn"),
-        "recognized worker grammar leaves supervision admission to the launch path"
+    let refused = gate("spawn agent=grok len=5").expect_err("an agent word no worker row names");
+    assert!(
+        refused.ends_with("; not `agent=grok`"),
+        "a word no worker row names is the spawn's grammar refusal: {refused}"
     );
 }
 
@@ -22460,7 +23124,7 @@ fn every_drive_refusal_names_the_word_it_refuses() {
         (format!("spawn cwd={CWD} len=5"), "len=5".to_owned()),
         (format!("spawn cwd={CWD} theme=x"), "theme=x".to_owned()),
         (format!("spawn cwd={CWD} cwd={CWD}"), format!("cwd={CWD}")),
-        (format!("@{W} meta set autopilot cruise"), "meta".to_owned()),
+        (format!("@{W} meta set supervisor other"), "meta".to_owned()),
         (format!("@{W} restart"), "restart".to_owned()),
         (format!("@{W} feed-bin 5"), "feed-bin".to_owned()),
         (
@@ -22765,6 +23429,16 @@ fn a_drives_record_names_what_moved() {
         drive_record(&act(DriveKind::Close), "OK closed\n", false),
         Some("closed")
     );
+    for (reply, expected) in [
+        ("OK submitted=1\n", Some("submitted settings in")),
+        ("OK skipped reason=changed submitted=0\n", None),
+        ("ERR busy agent settings\n", None),
+    ] {
+        assert_eq!(
+            drive_record(&act(DriveKind::Configure), reply, false),
+            expected
+        );
+    }
     // A read, mail and a fleet service leave no record of a session driven, whatever answers.
     for kind in [
         DriveKind::Read,
@@ -23842,6 +24516,14 @@ fn every_drive_line_has_one_kind_and_the_gate_is_keyed_by_it() {
         (format!("@{W} turn timeout=20000 hi"), K::Turn),
         (format!("@{W} key Enter"), K::Key),
         (format!("@{W} send hi"), K::Send),
+        (format!("@{W} meta"), K::Read),
+        (format!("@{W} meta set autopilot cruise"), K::Configure),
+        (format!("@{W} meta set autopilot land"), K::Configure),
+        (format!("@{W} meta unset autopilot"), K::Configure),
+        (
+            format!("@{W} agent set model=gpt-6.1-sol effort=ultra"),
+            K::Configure,
+        ),
         (format!("hold {W} on reason=build"), K::Hold),
         (format!("hold {W} off"), K::Hold),
         (format!("@{W} close"), K::Close),
@@ -23927,7 +24609,7 @@ fn every_drive_line_has_one_kind_and_the_gate_is_keyed_by_it() {
         "accounts-renew start=x",
         "@s-00000000000000aa hold on",
         "@s-00000000000000aa spawn agent=claude len=5",
-        "@s-00000000000000aa meta set autopilot land",
+        "@s-00000000000000aa meta set supervisor other",
         "@s-00000000000000aa board",
         "request",
         "request review r-20261111-1200-87be5228-01",
@@ -24412,14 +25094,292 @@ fn a_drive_request_show_and_requests_are_reads_and_review_is_refused() {
         format!("request review {ID} note=ok"),
         format!("request keep {ID}"),
         format!("request reply {ID} -- hi"),
+        format!("request clean {ID} stop=1"),
     ] {
         let refused = kind(&line).expect_err(&line);
         assert!(
-            refused.contains("review, keep and reply are this Mac's person's")
+            refused.contains("review, keep, reply and clean are this Mac's person's")
                 && refused.ends_with(&format!("; not `{}`", drive_word(&line))),
             "{refused}"
         );
     }
     // NEGATIVE: a `request` aimed at a session is no drive's.
     assert!(kind(&format!("@s-00000000000000aa request show {ID}")).is_err());
+}
+
+/// A PIN OF A SESSION NOT HERE SAYS THERE IS NO SUCH SESSION: an id no tab here holds resolves to
+/// none, and `pin` and `unpin` answer from no closed log or journal. CONTROL: a tab here resolves.
+#[test]
+fn a_pin_of_a_session_not_here_says_no_such_session() {
+    use super::{Resolution, Scope, Selector, closed_session_reply_with, resolve};
+    let store = crate::session_store::new_store();
+    let here = crate::session_store::test_handle(3);
+    let here_sid = here.sid.as_str().to_owned();
+    store.write().unwrap().register(here);
+    let gone = Selector::parse("s-0123456789abcdef0123");
+    assert!(matches!(resolve(&store, &gone), Resolution::Missing));
+    for verb in ["pin", "unpin"] {
+        assert_eq!(
+            closed_session_reply_with(None, Some(&gone), verb, "", &store, Scope::Owner),
+            "ERR no such session\n",
+            "{verb}"
+        );
+    }
+    assert!(matches!(
+        resolve(&store, &Selector::parse(&here_sid)),
+        Resolution::Hosted(_)
+    ));
+}
+
+#[test]
+fn a_fleet_spawn_carries_codex_effort_without_downgrading_other_engines() {
+    let homes = |_sid: &SessionId| false;
+    let line = "spawn agent=codex model=gpt-6.1-sol effort=ultra cwd=/tmp len=1";
+    assert_eq!(
+        drive_spawn(line, line.strip_prefix("spawn ").unwrap(), &homes, None).unwrap(),
+        format!("{line} raise=false")
+    );
+    for rest in [
+        "agent=codex effort=bogus len=1",
+        "agent=codex effort=ultra effort=low len=1",
+        "agent=claude effort=ultra len=1",
+    ] {
+        assert!(
+            drive_spawn(&format!("spawn {rest}"), rest, &homes, None).is_err(),
+            "{rest}"
+        );
+    }
+}
+
+/// Native settings never inject a command into an ordinary shell or an
+/// unproven agent, even where its terminal looks like Codex.
+#[test]
+fn agent_settings_refuse_unproven_targets_without_touching_the_terminal() {
+    let h = registered_session(0, -1, b"\r\n> Ask Codex to do anything");
+    let before = term_lock(&h.term).content_seq();
+    let reply =
+        control_session::agent_settings_turn(&h.term, &h.ctx, "set model=gpt-6.1-sol effort=ultra");
+    assert_eq!(
+        reply,
+        Err("ERR agent settings: requires a proven Codex-alab session\n".into())
+    );
+    assert_eq!(term_lock(&h.term).content_seq(), before);
+}
+
+#[test]
+fn fleet_configuration_is_narrow_and_requires_a_hosted_session() {
+    let hosts = |sid: &SessionId| sid.as_str() == "s-00000000000000aa";
+    let yes = |_: &SessionId| true;
+    let no = |_: &SessionId| false;
+    let gate = |line| drive_gate(line, &hosts, &yes, &no, &no);
+    for line in [
+        "@s-00000000000000aa meta set autopilot cruise",
+        "@s-00000000000000aa meta set autopilot off",
+        "@s-00000000000000aa agent set effort=ultra",
+    ] {
+        assert!(gate(line).is_ok(), "{line}");
+    }
+    for line in [
+        "@self meta set autopilot cruise",
+        "@s-00000000000000bb meta set autopilot cruise",
+        "@s-00000000000000aa meta set supervisor mine",
+        "@s-00000000000000aa meta set autopilot cruise supervisor=mine",
+        "@s-00000000000000aa agent set model=a model=b",
+        "@s-00000000000000aa agent set effort=unknown",
+    ] {
+        assert!(gate(line).is_err(), "{line}");
+    }
+}
+
+#[test]
+fn agent_settings_guard_preserves_a_draft_arriving_during_the_native_read() {
+    let store = session_store::new_store();
+    let h = registered_session(
+        0,
+        -1,
+        "\x1b[21;1H› \x1b[23;1Hsession model\x1b[24;1H← for agents\x1b[21;3H".as_bytes(),
+    );
+    store.write().unwrap().register(h.clone());
+    let selection = aterm_types::agent_settings::Selection::parse("set effort=ultra").unwrap();
+    let request = control_session::agent_settings_guarded(&h.term, &h.ctx, selection, || {
+        term_lock(&h.term).process(b"my unfinished draft");
+        true // A stale native idle record must not bless the changed screen.
+    })
+    .unwrap();
+    let before = cmd_text(&h.term);
+    let reply = cmd_turn(&h.term, &store, 0, &request, &h.ctx, &TurnIo::paste_only());
+    assert!(reply.contains("reason=changed"), "{reply}");
+    assert!(reply.contains("submitted=0"), "{reply}");
+    assert_eq!(
+        cmd_text(&h.term),
+        before,
+        "native settings must preserve the draft"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn agent_settings_refuse_fresh_pending_input_before_reading_the_native_record() {
+    use crate::input_stall::tests::{raw_pty_pair, slave_read_all};
+    let (master, slave) = raw_pty_pair();
+    let h = registered_session(
+        0,
+        master,
+        "\x1b[21;1H› \x1b[23;1Hsession model\x1b[24;1H← for agents\x1b[21;3H".as_bytes(),
+    );
+    h.ctx.sink.note_master_nonblocking(true);
+    h.ctx
+        .sink
+        .write_frame_nonparking(b"my draft")
+        .expect("queued human input");
+    let selection = aterm_types::agent_settings::Selection::parse("set effort=ultra").unwrap();
+    let reply = control_session::agent_settings_guarded(&h.term, &h.ctx, selection, || {
+        panic!("must refuse before consulting a possibly stale record")
+    });
+    assert_eq!(
+        reply,
+        Err("ERR busy agent settings: pending terminal input\n".into())
+    );
+    assert_eq!(slave_read_all(slave), b"my draft");
+    aterm_pty::close_fd(master);
+    aterm_pty::close_fd(slave);
+}
+
+#[test]
+fn agent_settings_refuse_an_existing_rendered_draft_even_if_native_idle_is_stale() {
+    let h = registered_session(
+        0,
+        -1,
+        "\x1b[21;1H› my draft\x1b[23;1Hsession model\x1b[24;1H← for agents\x1b[21;3H".as_bytes(),
+    );
+    let selection = aterm_types::agent_settings::Selection::parse("set effort=ultra").unwrap();
+    let before = cmd_text(&h.term);
+    let reply = control_session::agent_settings_guarded(&h.term, &h.ctx, selection, || true);
+    assert_eq!(
+        reply,
+        Err("ERR busy agent settings: no empty native composer\n".into())
+    );
+    assert_eq!(cmd_text(&h.term), before);
+}
+
+#[test]
+fn agent_settings_accept_dim_placeholder_but_not_a_hidden_cursor_or_multiline_draft() {
+    let h = registered_session(
+        0,
+        -1,
+        "\x1b[21;1H› \x1b[2mAsk Codex to do anything\x1b[0m\x1b[23;1Hsession model\x1b[24;1H← for agents\x1b[21;3H".as_bytes(),
+    );
+    assert!(control_session::agent_settings_composer_empty(&term_lock(
+        &h.term
+    )));
+    term_lock(&h.term).process(b"\x1b[?25l");
+    assert!(!control_session::agent_settings_composer_empty(&term_lock(
+        &h.term
+    )));
+    term_lock(&h.term).process(b"\x1b[?25h\r\n  second line\x1b[1A\x1b[3G");
+    assert!(!control_session::agent_settings_composer_empty(&term_lock(
+        &h.term
+    )));
+}
+
+/// The agent-settings turn types its command through the turn's key route and submits it with
+/// its own fenced Enter (`if-human=`, written under the terminal lock by `fenced_submit`), which
+/// the program answers.
+#[test]
+#[cfg(unix)]
+fn agent_settings_native_command_reaches_the_guarded_turn_writer() {
+    use aterm_types::keyboard::{Key, NamedKey};
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+    let store = session_store::new_store();
+    let (h, rx) = guarded_pipe_session(0);
+    // SAFETY: guarded_pipe_session returned this new write descriptor; the
+    // session/sink borrow it and no other owner closes it. No writer is pending.
+    let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
+    aterm_pty::set_nonblocking(rx.as_raw_fd(), true).expect("a nonblocking program end");
+    term_lock(&h.term)
+        .process("\x1b[21;1H› \x1b[23;1Hsession model\x1b[24;1H← for agents\x1b[21;3H".as_bytes());
+    store.write().unwrap().register(h.clone());
+    let selection =
+        aterm_types::agent_settings::Selection::parse("set model=gpt-6.1-sol effort=ultra")
+            .unwrap();
+    let request =
+        control_session::agent_settings_guarded(&h.term, &h.ctx, selection, || true).unwrap();
+    let written = Mutex::new(String::new());
+    let key = |event| {
+        let text = match event {
+            InputEvent::Key {
+                key: Key::Character(c),
+                ..
+            } => c.to_string(),
+            InputEvent::Key {
+                key: Key::Named(NamedKey::Space),
+                ..
+            } => " ".into(),
+            InputEvent::KeySequence(bytes) => String::from_utf8(bytes).unwrap(),
+            other => panic!("unexpected native setting input: {other:?}"),
+        };
+        written.lock().unwrap().push_str(&text);
+        term_lock(&h.term).process(text.as_bytes());
+        true
+    };
+    let momentum = || Ok((0.0, Instant::now()));
+    let request = format!("cap=1 cadence=1 idle=20 timeout=3000 submit_verify=seq {request}");
+    let turned = AtomicBool::new(false);
+    let reply = std::thread::scope(|s| {
+        // The program: the turn's own Enter draws its answer.
+        s.spawn(|| {
+            let mut buf = [0u8; 64];
+            loop {
+                let stopping = turned.load(Ordering::Acquire);
+                match (&rx).read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        for _ in buf[..n].iter().filter(|b| **b == b'\r') {
+                            written.lock().unwrap().push('\n');
+                            term_lock(&h.term).process(b"\r\nModel selection received\r\n");
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopping {
+                            break;
+                        }
+                        aterm_uds::deadline::poll_yield();
+                    }
+                    Err(e) => panic!("reading the program's end: {e}"),
+                }
+            }
+        });
+        let reply = cmd_turn(
+            &h.term,
+            &store,
+            0,
+            &request,
+            &h.ctx,
+            &TurnIo {
+                key: &key,
+                momentum: &momentum,
+                ..TurnIo::paste_only()
+            },
+        );
+        turned.store(true, Ordering::Release);
+        reply
+    });
+    assert_eq!(
+        *written.lock().unwrap(),
+        "/model gpt-6.1-sol --reasoning=ultra\n"
+    );
+    assert!(reply.contains("submitted=1"), "{reply}");
+    let reply = control_session::agent_settings_reply(reply);
+    assert!(reply.contains("confirmation=pending"), "{reply}");
+}
+
+#[test]
+fn agent_settings_refuse_multiline_drafts_with_a_blank_line_gap() {
+    let h = registered_session(0, -1, "\x1b[19;1H› \x1b[21;1Hhidden third-line draft\x1b[23;1Hsession model\x1b[24;1H← for agents\x1b[19;3H".as_bytes());
+    assert!(!control_session::agent_settings_composer_empty(&term_lock(
+        &h.term
+    )));
 }

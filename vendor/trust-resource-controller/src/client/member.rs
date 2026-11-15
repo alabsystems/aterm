@@ -836,8 +836,8 @@ impl ProxyChild {
         }
         if self.control.ready_to_receive()? {
             let bytes = self.control.receive(deadline)?;
-            if let Some(request) = &self.compiler_request {
-                if let Ok(prepared) =
+            if let Some(request) = &self.compiler_request
+                && let Ok(prepared) =
                     crate::workload::host::coordinator::CompilerPrepared::decode(&bytes, request)
                 {
                     if !self.attached
@@ -851,7 +851,6 @@ impl ProxyChild {
                     self.compiler_prepared = Some(prepared);
                     return Ok(None);
                 }
-            }
             let (frame, accounting) = if self.accounted {
                 match crate::accounting::TerminalFrame::decode(
                     &bytes,
@@ -928,6 +927,16 @@ impl ProxyChild {
     }
 }
 
+impl Drop for ProxyChild {
+    fn drop(&mut self) {
+        // Actual helper only: no target-PID wait/kill. Closing control asks the
+        // host to cancel; it retains accepted copies until actual scope drain.
+        let _ = self.helper.kill();
+        let _ = self.helper.wait();
+        self.descriptions.clear();
+    }
+}
+
 #[cfg(test)]
 mod helper_tests {
     use super::*;
@@ -961,14 +970,5 @@ mod helper_tests {
         after_helper_exit(&control, &proof, false).unwrap();
         assert_eq!(control.receive(deadline).unwrap(), b"original queued frame");
         assert!(after_helper_exit(&control, &proof, true).is_err());
-    }
-}
-impl Drop for ProxyChild {
-    fn drop(&mut self) {
-        // Actual helper only: no target-PID wait/kill. Closing control asks the
-        // host to cancel; it retains accepted copies until actual scope drain.
-        let _ = self.helper.kill();
-        let _ = self.helper.wait();
-        self.descriptions.clear();
     }
 }

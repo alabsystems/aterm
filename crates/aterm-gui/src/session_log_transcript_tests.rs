@@ -334,6 +334,187 @@ fn a_first_binding_read_says_the_rows_it_lost() {
     }
 }
 
+/// A ROW A RE-ARMED FOLD LATCHES ON AGAIN IS LOST ONCE: the fold latches off on a row it cannot
+/// read (a tool call with no time), which the join counts `dropped=1` with one `state=off`. A
+/// fresh fold, as a seamless update's successor arms it from the log's watermark, reads that file
+/// from the watermark, reaches the same row and latches again: a re-read, so the join counts
+/// nothing more and says no other state.
+/// CONTROL: the glue applying the fold's `Off` as a lost row (`TxEvent::Lost { n: 1 }`) is caught.
+#[test]
+fn a_row_a_rearmed_fold_latches_on_again_is_lost_once() {
+    let mut r = Rig::new("slog-tx-relatch");
+    let _ = r.read(&LogWake::default());
+    r.publish(1_000, "busy", 5);
+    let timeless = calls("m1", 1_200, &[("toolu_a", "Bash")])
+        .replace(&format!(r#""timestamp":"{}","#, at(1_200)), "");
+    assert!(!timeless.contains("timestamp"), "PRECONDITION: {timeless}");
+    r.append(&[
+        prompt("v1", 1_100, "go"),
+        timeless,
+        calls("m2", 1_300, &[("toolu_b", "Bash")]),
+    ]);
+    let _ = r.read(&LogWake::default());
+    let latched = |r: &Rig| {
+        let got = r.lines();
+        let off: Vec<String> = having(&got, " source field=transcript state=off ")
+            .into_iter()
+            .cloned()
+            .collect();
+        (
+            off,
+            r.tl.lock()
+                .unwrap()
+                .slog()
+                .transcript_view(Source::Transcript),
+        )
+    };
+    let (off, view) = latched(&r);
+    assert_eq!(
+        off.len(),
+        1,
+        "PRECONDITION: the fold latched: {:?}",
+        r.lines()
+    );
+    assert!(off[0].contains(" dropped=1 "), "{off:?}");
+    assert_eq!(view.map(|v| v.dropped), Some(1));
+    let sources = having(&r.lines(), " source field=transcript ").len();
+    r.fold = footer::FooterCache::default();
+    r.tail = footer::TailCache::default();
+    r.hand.set(2_000);
+    let _ = r.read(&LogWake::default());
+    let (again, view) = latched(&r);
+    assert_eq!(
+        view.map(|v| (v.dropped, v.state)),
+        Some((1, Some(aterm_slog::TxState::Off))),
+        "a re-read: {:?}",
+        r.lines()
+    );
+    assert_eq!(again, off, "one state=off said: {:?}", r.lines());
+    assert_eq!(
+        having(&r.lines(), " source field=transcript ").len(),
+        sources,
+        "no other state said: {:?}",
+        r.lines()
+    );
+    assert!(
+        having(&r.lines(), "toolu_b").is_empty(),
+        "no row past the latch: {:?}",
+        r.lines()
+    );
+}
+
+/// What the join of the run in front holds of `tl`'s transcript: its `dropped=` count and the
+/// run's tool count `tools=` sends (`None`: unread).
+fn tool_count(tl: &Mutex<SessionTimeline>) -> (Option<u64>, Option<u32>) {
+    let g = tl.lock().unwrap();
+    (
+        g.slog()
+            .transcript_view(Source::Transcript)
+            .map(|v| v.dropped),
+        g.slog().run_tools(aterm_phase::Program::Claude),
+    )
+}
+
+/// A ROW A RE-ARMED FOLD READS AGAIN IS LOST ONCE: the fold counts a row it cannot parse lost
+/// (`dropped=1`), and the join's watermark moves past it with the count. A fresh fold, as a
+/// seamless update's successor or a footer re-armed after tab status off and on arms it from the
+/// log's watermark, reads that file from the watermark: the row lies at or below it, so it is no
+/// new loss, and no other source mark is said.
+/// CONTROL: the tracker taking the fold's `Lost` as no row (a count with no position, which
+/// leaves the watermark below it) is caught: the re-armed fold counts it again (`dropped=2`).
+#[test]
+fn a_row_a_rearmed_fold_cannot_parse_again_is_lost_once() {
+    let mut r = Rig::new("slog-tx-relost");
+    let _ = r.read(&LogWake::default());
+    r.publish(1_000, "busy", 5);
+    r.append(&[
+        prompt("v1", 1_100, "go"),
+        calls("m1", 1_200, &[("toolu_a", "Bash")]),
+        format!(
+            r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","timestamp":"{}","message":"#,
+            at(1_300)
+        ),
+    ]);
+    let _ = r.read(&LogWake::default());
+    assert_eq!(
+        tool_count(&r.tl),
+        (Some(1), None),
+        "PRECONDITION: the row is lost: {:?}",
+        r.lines()
+    );
+    let sources = having(&r.lines(), " source field=transcript ").len();
+    r.fold = footer::FooterCache::default();
+    r.tail = footer::TailCache::default();
+    r.hand.set(2_000);
+    let _ = r.read(&LogWake::default());
+    assert_eq!(
+        tool_count(&r.tl),
+        (Some(1), None),
+        "a re-read: {:?}",
+        r.lines()
+    );
+    assert_eq!(
+        having(&r.lines(), " source field=transcript ").len(),
+        sources,
+        "no other state said: {:?}",
+        r.lines()
+    );
+    r.append(&[calls("m2", 2_100, &[("toolu_b", "Bash")])]);
+    let _ = r.read(&LogWake::default());
+    assert_eq!(
+        having(&r.lines(), "toolu_b").len(),
+        1,
+        "the rows after it are read: {:?}",
+        r.lines()
+    );
+}
+
+/// A ROW WRITTEN WHILE AN UPDATE HANDS OVER IS LOST, NEVER SKIPPED: the predecessor's join holds
+/// its run's tool steps whole (`tools=1`). Claude Code writes a tool row after the predecessor's
+/// last read and before the successor adopts, so the row lies past the carried watermark but is
+/// dated below the adoption, which the successor's join never places a row before. The successor
+/// counts it lost, so `tools=` says `-` rather than the short count as exact.
+/// CONTROL: the successor's fold dropping that row as history (the adoption taken as its floor,
+/// nothing counted) is caught: `tools=1` and `dropped=0`.
+#[test]
+fn a_row_written_while_an_update_hands_over_is_lost_never_skipped() {
+    use super::super::tests::{hand_over, producer, successors_first_sweep};
+    let (p, store, hand) = producer();
+    let mut r = Rig::on("slog-tx-handover", Arc::clone(&p.ctx.timeline), hand);
+    let _ = r.read(&LogWake::default());
+    r.publish(1_000, "busy", 5);
+    r.append(&[
+        prompt("v1", 1_100, "go"),
+        calls("m1", 1_200, &[("toolu_a", "Bash")]),
+    ]);
+    let _ = r.read(&LogWake::default());
+    assert_eq!(
+        tool_count(&r.tl),
+        (Some(0), Some(1)),
+        "PRECONDITION: whole: {:?}",
+        r.lines()
+    );
+    r.append(&[calls("m2", 1_500, &[("toolu_b", "Bash")])]);
+    let (s, _next, hand) = hand_over(&p, &store, 2_000, true);
+    successors_first_sweep(&mut s.ctx.timeline.lock().unwrap(), "claude");
+    r.tl = Arc::clone(&s.ctx.timeline);
+    r.hand = hand;
+    r.fold = footer::FooterCache::default();
+    r.tail = footer::TailCache::default();
+    let _ = r.read(&LogWake::default());
+    assert_eq!(
+        tool_count(&r.tl),
+        (Some(1), None),
+        "the row the update hid is lost: {:?}",
+        r.lines()
+    );
+    assert!(
+        having(&r.lines(), "toolu_b").is_empty(),
+        "it is never placed below the adoption: {:?}",
+        r.lines()
+    );
+}
+
 #[test]
 fn a_burst_past_the_queue_keeps_its_bind_and_says_its_count() {
     use aterm_agent::harness::steps::STEP_QUEUE;
@@ -720,7 +901,7 @@ fn a_turn_that_ends_under_its_own_background_work_closes_and_so_does_its_wake() 
     // stalled build published) reproduce the stall: one turn, never closed. The
     // second vendor's end remains ambiguous evidence without replacing its metrics.
     let reader_phase = aterm_phase::read(Some("claude"), &rows, None).phase;
-    assert_eq!(reader_phase, aterm_phase::Phase::Busy);
+    assert_eq!(reader_phase, alab_policy::vocab::Phase::Busy);
     let stalled = turns_over_background_work("slog-tx-bg-busy", reader_phase.name());
     assert!(having(&stalled, " close t").is_empty(), "{stalled:#?}");
     assert_eq!(having(&stalled, " open t").len(), 1, "{stalled:#?}");

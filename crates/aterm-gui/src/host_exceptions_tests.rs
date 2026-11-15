@@ -1627,10 +1627,10 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
 #[test]
 fn the_window_full_line_names_the_resets_left_only_where_an_offer_stands() {
     use crate::messages_host::wall_stamp_now;
+    use alab_policy::vocab::ResetKind;
     use aterm_agent::harness::accounts::Offer;
     use aterm_messages::PostOutcome;
     use aterm_messages::need::Need;
-    use aterm_phase::ResetKind;
     const NOV_12: i64 = 1_794_441_600 + 12 * 3600;
     let offer = |kind: Option<ResetKind>, left: u32, use_by: Option<i64>| Offer {
         kind,
@@ -2684,7 +2684,8 @@ fn a_lost_logins_notices_are_one_row_in_their_latest_words_closed_fixed_once_it_
         .live_by_key(&asks(&app)[0])
         .expect("the ask")
         .id;
-    assert!(app.messages.mark_seen(read, Instant::now()));
+    let wall = app.messages_wall.now();
+    assert!(app.messages.mark_seen(read, wall, Instant::now()));
     assert!(asks(&app).is_empty(), "read: no longer a live ask");
     told(&mut app, "s-1", Some(notice(&notice::LOGIN_SIGN_IN)));
     assert_eq!(
@@ -2799,8 +2800,9 @@ fn a_read_notice_stays_quiet_after_the_next_notice_tells_its_story_on() {
     let ca = mr::notice_ask_key("s-1", Some("ca"));
     tell_notice(&mut app, "s-1", Some(&notice::LOGIN_SIGN_IN));
     let read = app.messages.live_by_key(&si).expect("the ask").id;
+    let wall = app.messages_wall.now();
     assert!(
-        app.messages.mark_seen(read, Instant::now()),
+        app.messages.mark_seen(read, wall, Instant::now()),
         "the owner reads it"
     );
     tell_notice(&mut app, "s-1", Some(&notice::LOGIN_CANCELLED));
@@ -4918,7 +4920,8 @@ fn a_dismissed_service_alert_holds_for_its_process_across_a_relaunch() {
         .expect("restated in place");
     assert_eq!(restated.msg.title, "fseventsd holds 150.0 GiB");
     let id = restated.id;
-    assert!(app.messages.dismiss(id, Instant::now()));
+    let wall = app.messages_wall.now();
+    assert!(app.messages.dismiss(id, wall, Instant::now()));
 
     let lines: Vec<LogLine> = app
         .messages

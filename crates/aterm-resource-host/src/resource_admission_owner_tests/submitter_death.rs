@@ -18,7 +18,7 @@ const EXACT: &str = "actor::owner::tests::submitter_death::actual_submitter_sigk
 
 fn binding() -> Binding {
     Binding {
-        session: "s-acde".into(),
+        session: "s-0000000000000000acde".into(),
         attempt: [83; 16],
     }
 }

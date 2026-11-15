@@ -52,7 +52,7 @@ fn a_missing_restart_read_does_not_follow_a_newer_process() {
     let kept = Arc::clone(&idle.kept);
     idle.hooks.acts.snapshot = Arc::new(move |_| {
         kept.lock().unwrap().snapshot = Some(newer.clone());
-        None
+        Err(NO_AGENT)
     });
     let calls = Arc::new(AtomicUsize::new(0));
     let followed = Arc::clone(&calls);
@@ -77,7 +77,7 @@ fn an_idle_read_cannot_cross_a_generation_with_the_same_snapshot() {
     let kept = Arc::clone(&idle.kept);
     idle.hooks.acts.snapshot = Arc::new(move |sid| {
         kept.lock().unwrap().account = AccountKept::default();
-        Some(Snapshot {
+        Ok(Snapshot {
             pid: 9900,
             ..snap(sid)
         })
@@ -121,7 +121,9 @@ fn read_case(case: i64) -> [i64; 4] {
             16 => cancels.store(true, Ordering::SeqCst),
             _ => {}
         }
-        (case <= 7 || case == 15 || case == 16).then(|| from_read.clone())
+        (case <= 7 || case == 15 || case == 16)
+            .then(|| from_read.clone())
+            .ok_or(NO_AGENT)
     });
     let state = Arc::clone(&kept);
     let cancels = Arc::clone(&revoked);

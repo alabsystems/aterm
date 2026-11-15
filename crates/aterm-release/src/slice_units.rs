@@ -543,6 +543,7 @@ impl aterm_capacity::Machine for BudgetMachine {
                     aterm_capacity::Proc {
                         pid: process.pid,
                         ppid: process.ppid,
+                        start: process.start.unwrap_or(0),
                         footprint: 0,
                         charged: 0,
                         written: process.disk_written.unwrap_or(0),

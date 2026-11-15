@@ -44,7 +44,9 @@ pub struct CoalitionUsage {
     pub tasks_started: u64,
     /// Tasks of it that have exited.
     pub tasks_exited: u64,
-    /// Its members' CPU time, exited members' included, nanoseconds.
+    /// Its members' CPU time summed over effective QoS classes, exited members' included,
+    /// nanoseconds. The scheduler ledger's `cpu_time` omits time on current macOS kernels;
+    /// the QoS counters follow the same running threads and include that work.
     pub cpu_ns: u64,
     /// Bytes its members read from storage, exited members' included.
     pub bytes_read: u64,
@@ -231,7 +233,12 @@ pub fn decode_usage(
     raw: &[u64; USAGE_WORDS],
     (numer, denom): (u32, u32),
 ) -> Option<CoalitionUsage> {
-    if raw[EQOS_LEN] != QOS_CLASSES as u64 {
+    if raw[EQOS_LEN] != QOS_CLASSES as u64
+        || raw[EQOS..EQOS + QOS_CLASSES].contains(&UNWRITTEN)
+        || [TASKS_STARTED, TASKS_EXITED, BYTES_READ]
+            .iter()
+            .any(|&word| raw[word] == UNWRITTEN)
+    {
         return None;
     }
     let ns = |ticks: u64| ticks_to_ns(ticks, numer, denom);
@@ -243,7 +250,7 @@ pub fn decode_usage(
         id,
         tasks_started: raw[TASKS_STARTED],
         tasks_exited: raw[TASKS_EXITED],
-        cpu_ns: ns(raw[CPU_TIME]),
+        cpu_ns: eqos_ns.iter().copied().fold(0, u64::saturating_add),
         bytes_read: raw[BYTES_READ],
         eqos_ns,
         footprint: (raw[PHYS_FOOTPRINT] != UNWRITTEN).then_some(raw[PHYS_FOOTPRINT]),

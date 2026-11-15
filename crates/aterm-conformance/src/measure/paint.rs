@@ -4,7 +4,7 @@
 //! The paint matrix: one row is a scene typed into a release `aterm`, captured,
 //! scanned ([`super::scan`]) and judged against what the row expects.
 
-use super::instance::{CouldNotRun, could_not_run};
+use super::instance::{CouldNotRun, could_not_run, field, uint_field};
 use super::scan::{FrameNote, ScanReport, StatusRow};
 use super::starvation::{Disposition, SchedReading, ShapeVerdict, Starvation};
 
@@ -83,6 +83,13 @@ pub enum Expect {
     Quiet,
     /// Typed cursor/text pixels with the canonical off style.
     EffectOff,
+    /// A rewound pane, over whose past no effect is drawn: no effect ink on any frame, no ribbon
+    /// claimed, and no companion found on a frame whose engine claims one. The engine may keep its
+    /// resident pet owned off glass, so the pet's claim is no finding; a pet drawn where it is
+    /// claimed is. The scanner looks for a companion only where it is claimed, so a pet drawn
+    /// under no claim is caught only by its ink, and one already drawn on the first frame (the
+    /// ink baseline) adds none.
+    Past,
 }
 
 /// How the take is captured, and so what the instrument perturbs.
@@ -277,6 +284,16 @@ pub struct PaintRow {
     pub split: Option<Split>,
     /// The body whose reach the take bounds, if any.
     pub reach: Option<Reach>,
+    /// Whether the instance records (`temporal_recording`), written either way and read back
+    /// from `temporal status` before the take: the shipped default paints the recording arm, and
+    /// a person who turns Rewind off the other.
+    pub recording: bool,
+    /// Whether the take is captured with a Rewind view open on its pane ([`Expect::Past`]).
+    pub rewound: bool,
+    /// Whether the glow is hosted for the take (`aos attach code=shipped` before the keys, its
+    /// trace read after them): the release `aos` path a person can attach, painting as the
+    /// in-process glow does.
+    pub hosted: bool,
 }
 
 impl PaintRow {
@@ -314,6 +331,41 @@ impl PaintRow {
                 return could_not_run("the companion judges a spelling its style does not select");
             }
         }
+        if self.rewound != (self.expect == Expect::Past) {
+            return could_not_run(
+                "a rewound row expects the past's darkness, and only a rewound row does",
+            );
+        }
+        if self.rewound {
+            if !self.recording {
+                return could_not_run("a Rewind view opens only on a recording pane");
+            }
+            if self.capture.is_video() {
+                return could_not_run(
+                    "a rewound row needs an image burst, so each frame's companion claim binds \
+                     to its frame",
+                );
+            }
+            if self.scene != Scene::Prompt
+                || self.split.is_some()
+                || self.companion.is_some()
+                || self.reach.is_some()
+            {
+                return could_not_run(
+                    "a rewound row types into an unsplit prompt and judges no companion or reach",
+                );
+            }
+        }
+        if self.hosted && (self.style == Style::Off || self.expect != Expect::Ink) {
+            return could_not_run("a hosted glow row types ink under a style that paints");
+        }
+        if self.hosted && self.scene != Scene::Plane {
+            return could_not_run(
+                "a hosted glow row types into the plane, whose `sleep` keeps the tty echoing: a \
+                 recording detaches at a key a program reads raw, so another scene's task could \
+                 take no key on a healthy build",
+            );
+        }
         if let Some(reach) = self.reach {
             if self.scene != Scene::Plane || self.split.is_some() {
                 return could_not_run(
@@ -338,6 +390,14 @@ impl PaintRow {
     /// What a red on this row means.
     #[must_use]
     pub const fn meaning(&self) -> &'static str {
+        if self.rewound {
+            return "effects drew over a rewound pane's past: effect ink, a companion or a ribbon \
+                    on a frame taken with its Rewind view open";
+        }
+        if self.hosted {
+            return "a glow hosted by the release `aos` path did not paint what the in-process \
+                    glow paints, or its hosted task did not take the typed keys";
+        }
         if self.reach.is_some() {
             return "the body did not paint, or its band's top did not stand within its bounds \
                     above the typed row (reach_px against reach_bounds_pct of cell_h): a body \
@@ -392,6 +452,44 @@ pub struct Ledger {
     pub final_row: Option<StatusRow>,
     /// Effect ticks that composed the ribbon body's stream (`fx_under_frames`).
     pub fx_under_frames: u64,
+    /// A hosted take's glow, read after its frames.
+    pub hosted: Option<Hosted>,
+}
+
+/// What a hosted take's glow did, read after its frames ([`Ledger::hosted`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hosted {
+    /// `aos status attached=`: still hosted when the frames were taken.
+    pub attached: bool,
+    /// `aos trace keys=`: the keys its hosted task took.
+    pub keys: u64,
+    /// `aos trace broken=`: whether its log broke.
+    pub broken: bool,
+}
+
+impl Hosted {
+    /// The account an `aos status` and an `aos trace` reply give, or `None` when either lacks
+    /// a field it is read from.
+    #[must_use]
+    pub fn read(status: &str, trace: &str) -> Option<Self> {
+        let flag = |line: &str, key: &str| match field(line, key)? {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
+        Some(Self {
+            attached: flag(status, "attached")?,
+            keys: uint_field(trace, "keys")?,
+            broken: flag(trace, "broken")?,
+        })
+    }
+
+    /// Whether the glow stayed hosted through the take, its log held, and its task took every
+    /// one of the `typed` keys.
+    #[must_use]
+    pub fn held(self, typed: usize) -> bool {
+        self.attached && !self.broken && u64::try_from(typed).is_ok_and(|n| self.keys >= n)
+    }
 }
 
 impl Ledger {
@@ -505,6 +603,7 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
         Expect::Dark => s.total_ink == 0,
         Expect::TrailDark => ledger.trail_quiet() && s.ribbon_claimed == 0 && s.ribbon_dark == 0,
         Expect::Quiet => !ink_holds(row, s)?,
+        Expect::Past => s.total_ink == 0 && s.companion_frames == 0 && s.ribbon_claimed == 0,
         Expect::EffectOff => {
             let window_dark = !row.capture.is_video()
                 || (s.driven.dark_us >= 0
@@ -542,11 +641,17 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
         }
     };
     let reach_ok = row.reach.is_none_or(|reach| reach_holds(reach, s));
-    Ok(if pass && style_ok && companion_ok && reach_ok {
-        ShapeVerdict::Pass
-    } else {
-        ShapeVerdict::Fail
-    })
+    let hosted_ok = !row.hosted
+        || ledger
+            .hosted
+            .is_some_and(|hosted| hosted.held(row.keys().len()));
+    Ok(
+        if pass && style_ok && companion_ok && reach_ok && hosted_ok {
+            ShapeVerdict::Pass
+        } else {
+            ShapeVerdict::Fail
+        },
+    )
 }
 
 /// One row's measured outcome.
@@ -563,6 +668,10 @@ pub struct PaintReport {
     pub wall_us: u64,
     /// How long the alt-screen scene took to switch past its launch.
     pub alt_wait_ms: u64,
+    /// Pipeline states the subject built on its frame thread during the capture, after the
+    /// take's warm had landed (`trail warm`'s `frame_builds=`): each is a shader compile on the
+    /// frame path, which a window that warmed from its mint does not make.
+    pub frame_builds: u64,
     /// The cadence the subject observed typed keys at (image takes): median and worst gap.
     pub typed_gap_ms: Option<(u64, u64)>,
     /// A video take's driven bracket on the recording's own clock, `lo:hi` ms.
@@ -575,6 +684,11 @@ pub struct PaintReport {
     pub checks: String,
     /// The subject's own frames on the GPU over the take.
     pub subject_gpu: SubjectGpu,
+    /// A rewound take's `rewind status` after its frames, which must still read `view=open`.
+    pub view: Option<String>,
+    /// A hosted take's account after its frames ([`Hosted`]): whether it was still attached, the
+    /// keys its hosted task took and whether its log broke.
+    pub hosted_trace: Option<String>,
 }
 
 /// The subject's frames on the GPU over one take, as `ctl metrics` reads them (`n_gpu_time`,
@@ -636,7 +750,8 @@ impl std::fmt::Display for PaintReport {
         let (r, s) = (&self.row, &self.scan);
         write!(
             f,
-            "PAINT scene={} style={} companion={:?} capture={:?} backend={} expect={:?} \
+            "PAINT scene={} style={} companion={:?} capture={:?} recording={} rewound={} \
+             hosted={} backend={} expect={:?} \
              frames={} best_ink={} best_hues={} total_ink={} union_hues={} cyan_px={} \
              cyan_frames={} rainbow_frames={} rainbow_run={} rainbow_gap={} driven_dark_us={} \
              driven_frames={} sampling_hole_us={} nominal_dt_us={} mature_lead_us={} all_composed_frames={} driven_coverage={} \
@@ -647,14 +762,18 @@ impl std::fmt::Display for PaintReport {
              companion_min_h={} companion_max_h={} companion_height_bounds_pct={} \
              fx_under_frames={} reach={} reach_frames={} reach_px={} \
              reach_min_px={} reach_max_px={} reach_bounds_pct={} cell_h={} row_bottom={} \
-             typed_gap_ms={:?} driven_ms={} alt_wait_ms={} wall_us={} subject_gpu_frames={} \
-             subject_gpu_p99_us={} subject_gpu_max_us={} sched_ticks={} \
+             typed_gap_ms={:?} driven_ms={} alt_wait_ms={} frame_builds={} wall_us={} \
+             subject_gpu_frames={} subject_gpu_p99_us={} subject_gpu_max_us={} sched_ticks={} \
              sched_late_max_us={} sched_window_ticks={} sched_window_late_max_us={} qos={:?} \
-             subject_band={} bench_band={} starved={:?} reason=\"{}\" shape={:?} verdict={:?} {}",
+             subject_band={} bench_band={} starved={:?} reason=\"{}\" shape={:?} verdict={:?} \
+             view={:?} hosted_trace={:?} {}",
             r.scene.name(),
             r.style.name(),
             r.companion,
             r.capture,
+            r.recording,
+            r.rewound,
+            r.hosted,
             self.backend,
             r.expect,
             s.frames,
@@ -718,6 +837,7 @@ impl std::fmt::Display for PaintReport {
             self.driven_ms
                 .map_or_else(|| "none".to_string(), |(lo, hi)| format!("{lo}:{hi}")),
             self.alt_wait_ms,
+            self.frame_builds,
             self.wall_us,
             opt(self.subject_gpu.frames),
             opt(self.subject_gpu.p99_us),
@@ -733,6 +853,8 @@ impl std::fmt::Display for PaintReport {
             self.starvation,
             self.shape,
             self.disposition,
+            self.view,
+            self.hosted_trace,
             self.checks,
         )
     }

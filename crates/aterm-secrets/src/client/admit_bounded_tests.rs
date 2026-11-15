@@ -160,7 +160,7 @@ fn log_bundle_inherits_source_mark_only_when_it_learns_complete_records() {
             fixture.log.records().map(|r| *r.id()).collect()
         );
         assert_eq!(
-            std::fs::read(fixture.paths.home.join(".secrets/bundle-value")).unwrap(),
+            crate::client::stored(&fixture.paths, "bundle-value").unwrap(),
             b"synthetic-value"
         );
     }

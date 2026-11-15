@@ -83,6 +83,10 @@ pub(super) fn header_line(
     if ctx.state != Freshness::Fresh {
         h.push_str(&format!(" state={}", ctx.state.word()));
     }
+    if let Some(s) = ctx.snap.filter(|s| !s.stalled.is_empty()) {
+        let lanes: Vec<&str> = s.stalled.iter().map(|l| l.lane).collect();
+        h.push_str(&format!(" stalled={}", lanes.join(",")));
+    }
     if delta {
         h.push_str(" delta=1");
     }
@@ -125,12 +129,165 @@ pub fn window_ms(s: &Snapshot) -> Option<u64> {
         .map(|ns| ns / 1_000_000)
 }
 
+/// CPU ownership has one window and one account in every resource view. A process sweep's
+/// live rates remain useful for its rows, but omit work that ended between sweeps.
+fn cpu_facts(s: &Snapshot) -> Option<&crate::explain::WhyFacts> {
+    s.why.as_deref().filter(|f| {
+        f.lane.on() && f.split.via == crate::explain::Via::Coalitions && s.coal_lane.on()
+    })
+}
+
+fn cpu_timing(s: &Snapshot) -> Option<(u64, u64, &'static str)> {
+    cpu_facts(s)
+        .map(|f| (f.at_ns, f.window_ns, "coalitions"))
+        .or_else(|| {
+            s.scoped_cpu
+                .as_ref()
+                .map(|cpu| (s.at_ns, cpu.window_ns, "process_and_reap"))
+        })
+}
+
+fn busy_cpu(s: &Snapshot) -> Option<f32> {
+    cpu_facts(s)
+        .map(|f| f.split.global_mc as f32 / 1000.0)
+        .or_else(|| s.cpu.as_ref().and_then(|c| c.current_busy()))
+}
+
+fn aterm_cpu(s: &Snapshot) -> Option<f32> {
+    cpu_facts(s)
+        .map(|f| (f.split.aterm_mc + f.split.delegated_mc) as f32 / 1000.0)
+        .or_else(|| s.scoped_cpu.as_ref().map(|cpu| cpu.all_actual() as f32))
+        .or_else(|| s.aterm.as_ref().map(|a| a.cores.raw))
+}
+
+fn aterm_cpu_bound(s: &Snapshot) -> bool {
+    cpu_facts(s).map_or_else(
+        || s.scoped_cpu.as_ref().is_none_or(|cpu| cpu.app_incomplete),
+        |f| f.split.ownership_incomplete || f.provenance_incomplete,
+    )
+}
+
+fn tab_cpu(s: &Snapshot, keys: &[u64]) -> Option<(i64, bool)> {
+    let Some(f) = cpu_facts(s) else {
+        let cpu = s.scoped_cpu.as_ref()?;
+        let rows: Vec<_> = cpu.tabs.iter().filter(|t| keys.contains(&t.key)).collect();
+        return (!rows.is_empty()).then(|| {
+            (
+                (rows.iter().map(|t| t.actual()).sum::<f64>() * 1000.0).floor() as i64,
+                true,
+            )
+        });
+    };
+    let rows: Vec<_> = f
+        .split
+        .tabs
+        .iter()
+        .filter(|(k, _)| keys.contains(k))
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    Some((
+        if f.provenance_incomplete || f.split.unaccounted_mc > 0 {
+            f.split
+                .tab_floors
+                .iter()
+                .filter(|(key, _)| keys.contains(key))
+                .map(|(_, cpu)| *cpu)
+                .sum()
+        } else {
+            f.split.tab_actual_of(keys)
+        },
+        f.procs_truncated
+            || f.split.unaccounted_mc > 0
+            || f.provenance_incomplete
+            || f.split.ownership_incomplete
+            || f.split.unattributed_mc > 0
+            || f.split.short_tabs.iter().any(|k| keys.contains(k))
+            || f.split.ambiguous_tabs.iter().any(|k| keys.contains(k)),
+    ))
+}
+
+fn cpu_words(s: &Snapshot) -> &'static str {
+    if cpu_facts(s).is_some() || s.scoped_cpu.is_some() {
+        "CPU includes live and finished work; memory is live footprint"
+    } else {
+        exact_words()
+    }
+}
+
+fn split_exact(s: &Snapshot) -> &'static str {
+    cpu_facts(s).map_or("heuristic", |f| {
+        if f.split.exact { "exact" } else { "heuristic" }
+    })
+}
+
+fn tab_cpu_json(s: &Snapshot, keys: &[u64], o: &mut Jv) {
+    if let Some((cpu, bound)) = tab_cpu(s, keys) {
+        let Some(f) = cpu_facts(s) else {
+            let account = s.scoped_cpu.as_ref().unwrap();
+            let rows: Vec<_> = account
+                .tabs
+                .iter()
+                .filter(|t| keys.contains(&t.key))
+                .collect();
+            o.set("cpu_mc", Jv::at_least(cpu.max(0) as u64, "not_sampled"));
+            o.set(
+                "cpu_charge_mc",
+                Jv::Int((rows.iter().map(|t| t.charge).sum::<f64>() * 1000.0).round() as i64),
+            );
+            o.set(
+                "cpu_floor_mc",
+                Jv::Int((rows.iter().map(|t| t.floor).sum::<f64>() * 1000.0).floor() as i64),
+            );
+            o.set("cpu_ambiguous", Jv::Bool(rows.iter().any(|t| t.ambiguous)));
+            o.set("cpu_via", Jv::s("process_and_reap"));
+            o.set("cpu_window_ns", Jv::u(account.window_ns));
+            o.set("exact", Jv::s("at_least"));
+            return;
+        };
+        let ambiguous = f.split.ambiguous_tabs.iter().any(|k| keys.contains(k));
+        o.set(
+            "cpu_mc",
+            if bound {
+                Jv::at_least(
+                    cpu.max(0) as u64,
+                    if ambiguous {
+                        "ambiguous_reap"
+                    } else {
+                        "unattributed"
+                    },
+                )
+            } else {
+                Jv::Int(cpu)
+            },
+        );
+        o.set("cpu_via", Jv::s("reap_credit"));
+        o.set("cpu_charge_mc", Jv::Int(f.split.tab_charge_of(keys)));
+        o.set(
+            "cpu_floor_mc",
+            Jv::Int(
+                f.split
+                    .tab_floors
+                    .iter()
+                    .filter(|(k, _)| keys.contains(k))
+                    .map(|(_, mc)| *mc)
+                    .sum(),
+            ),
+        );
+        o.set("cpu_ambiguous", Jv::Bool(ambiguous));
+        o.set("cpu_window_ns", Jv::u(cpu_facts(s).unwrap().window_ns));
+        o.set("exact", Jv::s(if bound { "at_least" } else { "measured" }));
+    }
+}
+
 /// A scope's figures, summed over its sessions where it has several.
 #[derive(Clone, Debug, Default)]
 struct Fig {
     present: bool,
     cores: f32,
     footprint: Option<u64>,
+    footprint_unread: u32,
     procs: u32,
     wait: Option<f32>,
     write_bps: Option<f64>,
@@ -145,6 +302,7 @@ impl Fig {
             present: true,
             cores: sv.cores.raw.max(0.0),
             footprint: sv.footprint,
+            footprint_unread: sv.footprint_unread,
             procs: sv.procs,
             wait: sv.wait,
             write_bps: sv.write_bps,
@@ -168,6 +326,7 @@ impl Fig {
             (a, b) => a.or(b),
         };
         self.procs += o.procs;
+        self.footprint_unread = self.footprint_unread.saturating_add(o.footprint_unread);
         self.wait = match (self.wait, o.wait) {
             (Some(a), Some(b)) => Some(a + b),
             (a, b) => a.or(b),
@@ -371,11 +530,7 @@ pub(super) fn rec<T: std::fmt::Display>(v: Option<T>, why: &str) -> String {
 
 fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
     let mut parts = Vec::new();
-    if let Some((cpu, busy)) = s
-        .cpu
-        .as_ref()
-        .and_then(|c| c.current_busy().map(|b| (c, b)))
-    {
+    if let Some((cpu, busy)) = s.cpu.as_ref().and_then(|c| busy_cpu(s).map(|b| (c, b))) {
         let motion = cpu
             .busy
             .motion(words::CORES_GATE)
@@ -465,22 +620,26 @@ pub(super) fn mem_clauses(m: &crate::model::MemView) -> [String; 2] {
 
 fn aterm_clauses(s: &Snapshot) -> Vec<String> {
     let Some(a) = s.aterm.as_ref() else {
+        if stalled_lane(s, "aterm").is_some() {
+            return vec![unavailable("stalled")];
+        }
         return vec!["measuring (one process sweep has no interval)".into()];
     };
-    let mut first = format!("{} cores", words::cores(a.cores.raw));
-    if let Some(busy) = s
-        .cpu
-        .as_ref()
-        .and_then(|c| c.current_busy())
-        .filter(|b| *b > 0.05)
-    {
-        let share = (a.cores.raw / busy * 100.0).round().clamp(0.0, 100.0);
-        first.push_str(&format!(", {share:.0}% of busy"));
+    let used = aterm_cpu(s).unwrap_or(a.cores.raw);
+    let mut first = if aterm_cpu_bound(s) {
+        format!("≥{:.3} cores", (used * 1000.0).floor() / 1000.0)
+    } else {
+        format!("{} cores", words::cores(used))
+    };
+    if let Some(busy) = busy_cpu(s).filter(|b| *b > 0.05) {
+        let share = (used / busy * 100.0).round().clamp(0.0, 100.0);
+        first.push_str(&format!(
+            ", {}{share:.0}% of busy",
+            if aterm_cpu_bound(s) { "≥" } else { "" }
+        ));
     }
     let mut parts = vec![first];
-    if let Some(f) = a.footprint {
-        parts.push(words::mem(f));
-    }
+    parts.push(memory_words(a.footprint, a.footprint_unread));
     parts.push(format!(
         "{} process{}",
         a.procs,
@@ -489,7 +648,7 @@ fn aterm_clauses(s: &Snapshot) -> Vec<String> {
     parts
 }
 
-fn tab_clauses(f: &Fig) -> Vec<String> {
+fn tab_clauses(f: &Fig, cpu_at_least: bool) -> Vec<String> {
     if !f.present {
         return vec!["measuring (one process sweep has no interval)".into()];
     }
@@ -497,10 +656,12 @@ fn tab_clauses(f: &Fig) -> Vec<String> {
     if !f.program.is_empty() {
         parts.push(format!("program {}", exe_word(&f.program)));
     }
-    parts.push(format!("{} cores", words::cores(f.cores)));
-    if let Some(b) = f.footprint {
-        parts.push(words::mem(b));
-    }
+    parts.push(if cpu_at_least {
+        format!("≥{:.3} cores", f.cores)
+    } else {
+        format!("{} cores", words::cores(f.cores))
+    });
+    parts.push(memory_words(f.footprint, f.footprint_unread));
     if let Some(st) = f.starved().filter(|s| *s >= 0.25) {
         parts.push(format!("waiting for a core {:.0}%", st * 100.0));
     }
@@ -539,6 +700,40 @@ fn note(key: &str, text: impl Into<String>) -> Line {
 }
 
 fn rest_line(ctx: &Ctx<'_>, s: &Snapshot, tab: &Fig) -> Option<Line> {
+    if let Some(f) = cpu_facts(s) {
+        let keys = scope_keys(ctx, ScopeArg::Tab);
+        let p = f.split.parts_of_coverage(&keys, f.provenance_incomplete);
+        let bound = tab_cpu(s, &keys).is_some_and(|(_, bound)| bound);
+        return Some(line(
+            "rest",
+            format!(
+                "rest    tab {}{:.3}c · rest of aterm {}{:.3}c · others {}c · {} {}c · unaccounted {:+.3}c · window_ms={} · via=coalitions",
+                if bound { "≥" } else { "" },
+                p.tab as f64 / 1000.0,
+                if f.split.ownership_incomplete || f.provenance_incomplete {
+                    "≥"
+                } else if bound {
+                    "≤"
+                } else {
+                    ""
+                },
+                p.aterm_rest as f64 / 1000.0,
+                if aterm_cpu_bound(s) {
+                    format!("≥{:.3}", p.others as f64 / 1000.0)
+                } else {
+                    words::cores(p.others as f32 / 1000.0)
+                },
+                ctx.machine.services_word(),
+                if aterm_cpu_bound(s) {
+                    format!("≥{:.3}", p.services as f64 / 1000.0)
+                } else {
+                    words::cores(p.services as f32 / 1000.0)
+                },
+                p.unaccounted as f64 / 1000.0,
+                f.window_ns / 1_000_000
+            ),
+        ));
+    }
     let Some(sp) = s.split else {
         return s.procs_window_ns.map(|_| {
             line(
@@ -547,20 +742,16 @@ fn rest_line(ctx: &Ctx<'_>, s: &Snapshot, tab: &Fig) -> Option<Line> {
             )
         });
     };
-    let rest_of_aterm = (sp.aterm - tab.cores).max(0.0);
+    let app = aterm_cpu(s).unwrap_or(sp.aterm);
+    let used =
+        tab_cpu(s, &scope_keys(ctx, ScopeArg::Tab)).map_or(tab.cores, |(mc, _)| mc as f32 / 1000.0);
+    let rest_of_aterm = (app - used).max(0.0);
     let mut text = format!(
-        "rest    tab {} · rest of aterm {} · others {} · {} ≈{}",
-        c1(tab.cores),
-        c1(rest_of_aterm),
-        c1(sp.others),
-        ctx.machine.services_word(),
-        c1(sp.services)
+        "rest    tab ≥{used:.3}c · rest of aterm ≥{rest_of_aterm:.3}c · others ≥{:.3}c · services ≥{:.3}c · unaccounted {:+.3}c · services_via=live_own",
+        (sp.others * 1000.0).floor() / 1000.0,
+        (sp.services * 1000.0).floor() / 1000.0,
+        sp.global - app - sp.others - sp.services
     );
-    if sp.unaccounted < -0.05 {
-        text.push_str(&format!(" · unaccounted -{}", c1(-sp.unaccounted)));
-    } else {
-        text.push_str(" (by subtraction, unaccounted work included)");
-    }
     if let Some(w) = window_ms(s) {
         text.push_str(&format!(" · window_ms={w}"));
     }
@@ -821,6 +1012,9 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
     if let Some(line) = stale_line(q.view, ctx) {
         lines.push(line);
     }
+    if let Some(s) = ctx.snap {
+        lines.extend(stalled_lines(s));
+    }
     let events: Vec<Line> = ctx.snap.map_or_else(Vec::new, |s| {
         ctx.events
             .iter()
@@ -835,6 +1029,23 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
             .collect(),
         _ => Vec::new(),
     };
+    if matches!(
+        q.view,
+        View::Overview | View::Tab | View::Aterm | View::Global
+    ) && let Some(s) = ctx.snap
+        && let Some((at, window, via)) = cpu_timing(s)
+    {
+        let older = s.at_ns.saturating_sub(at) / 1_000_000;
+        lines.push(line(
+            "cpu_reading",
+            format!(
+                "cpu_reading as_of={} age_ms={} window_ms={} via={via} includes_finished=1",
+                clock_ms(ctx.as_of_unix_ms.saturating_sub(older)),
+                ctx.age_ms.saturating_add(older),
+                window / 1_000_000
+            ),
+        ));
+    }
     match ctx.snap {
         None => lines.push(note(
             "state",
@@ -880,6 +1091,69 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
     }
 }
 
+/// The lane stalled at `s` that feeds `figure` ([`crate::lanes::stalls`]).
+pub(super) fn stalled_lane(s: &Snapshot, figure: &str) -> Option<&'static str> {
+    crate::lanes::stalls(&s.stalled, figure)
+}
+
+/// Why `figure` reads unknown at `s`: `stalled` while a lane that feeds it is, else `why`.
+pub(super) fn unknown_why(s: &Snapshot, figure: &str, why: &'static str) -> &'static str {
+    if stalled_lane(s, figure).is_some() {
+        "stalled"
+    } else {
+        why
+    }
+}
+
+/// `figure` unknown at `s`, in JSON: `{"why":"stalled","lane":…}` while a lane that feeds it is
+/// stalled, else `{"why": why}`.
+pub(super) fn unknown_json(s: &Snapshot, figure: &str, why: &'static str) -> Jv {
+    stalled_lane(s, figure).map_or_else(|| Jv::why(why), Jv::stalled)
+}
+
+/// `v`, or `figure` unknown at `s` ([`unknown_json`]).
+fn known_or_stalled(s: &Snapshot, v: Option<u64>, figure: &str, why: &'static str) -> Jv {
+    v.map_or_else(|| unknown_json(s, figure, why), Jv::u)
+}
+
+/// One head line per lane stalled at `s`: the read it is in, since when, and the figures it
+/// leaves unknown.
+fn stalled_lines(s: &Snapshot) -> Vec<Line> {
+    s.stalled
+        .iter()
+        .map(|l| {
+            let mut t = format!("stalled {}: {}", l.lane, l.call);
+            if let Some(pid) = l.pid {
+                t.push_str(&format!(" pid={pid}"));
+                if let Some(name) = l.name.as_deref() {
+                    t.push_str(&format!(" ({})", exe_word(name)));
+                }
+            }
+            t.push_str(&format!(
+                " since {} for {} · figures {}",
+                clock_ms(u64::try_from(l.since_unix_ms).unwrap_or(0)),
+                span_word(l.for_ms),
+                l.figures().join(",")
+            ));
+            note(&format!("stalled.{}", l.lane), t)
+        })
+        .collect()
+}
+
+/// A span, ms, in its largest units: `850ms`, `12.4s`, `3m12s`, `2h05m`.
+fn span_word(ms: u64) -> String {
+    let s = ms / 1000;
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if s < 60 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s / 60) % 60)
+    }
+}
+
 /// The first line of a view whose figures come from a snapshot the reader has not refreshed
 /// ([`Freshness::Stale`]): when they were read and how long ago, in words, so a reader of the
 /// lines alone never takes an old `cores busy` or `easing` for the present (the header's
@@ -904,9 +1178,34 @@ fn stale_line(view: View, ctx: &Ctx<'_>) -> Option<Line> {
 fn overview_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     lines.push(sentence("global", "global", &global_clauses(ctx, s)));
     lines.push(sentence("aterm", "aterm", &aterm_clauses(s)));
-    let tab = tabs_fig(s, &scope_keys(ctx, ScopeArg::Tab), ctx.target.key);
+    let keys = scope_keys(ctx, ScopeArg::Tab);
+    let mut tab = tabs_fig(s, &keys, ctx.target.key);
+    if let Some((cpu, _)) = tab_cpu(s, &keys) {
+        tab.cores = cpu as f32 / 1000.0;
+    }
     let label = tab_label(ctx);
-    lines.push(sentence(&label, &label, &tab_clauses(&tab)));
+    let clauses = match stalled_lane(s, "tab").filter(|_| !tab.present) {
+        Some(_) => vec![unavailable("stalled")],
+        None => tab_clauses(&tab, tab_cpu(s, &keys).is_some_and(|(_, low)| low)),
+    };
+    lines.push(sentence(&label, &label, &clauses));
+    if let Some(f) = cpu_facts(s)
+        && f.split.ambiguous_tabs.iter().any(|k| keys.contains(k))
+    {
+        lines.push(line(
+            "cpu_charge",
+            format!(
+                "cpu_charge tab_mc={} own_floor_mc={} actual=ambiguous_reap",
+                f.split.tab_charge_of(&keys),
+                f.split
+                    .tab_floors
+                    .iter()
+                    .filter(|(k, _)| keys.contains(k))
+                    .map(|(_, mc)| *mc)
+                    .sum::<i64>()
+            ),
+        ));
+    }
     if let Some(r) = rest_line(ctx, s, &tab) {
         lines.push(r);
     }
@@ -943,15 +1242,25 @@ fn tab_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     if !f.program.is_empty() {
         head.push_str(&format!(" · program {}", exe_word(&f.program)));
     }
-    head.push_str(&format!(" · {}", exact_words()));
+    head.push_str(&format!(" · {}", cpu_words(s)));
     lines.push(line("tab", head));
     if !f.present {
         lines.push(line(
             "cpu",
-            "cpu    measuring (one process sweep has no interval)",
+            if stalled_lane(s, "tab").is_some() {
+                format!("cpu    {}", unavailable("stalled"))
+            } else {
+                "cpu    measuring (one process sweep has no interval)".to_owned()
+            },
         ));
     } else {
-        let mut cpu = format!("cpu    {}", c2(f.cores));
+        let (used, lower) =
+            tab_cpu(s, &keys).map_or((f.cores, false), |(mc, lower)| (mc as f32 / 1000.0, lower));
+        let mut cpu = if lower {
+            format!("cpu    ≥{used:.3}c")
+        } else {
+            format!("cpu    {}", c2(used))
+        };
         match f.starved() {
             Some(st) => cpu.push_str(&format!(
                 " · waiting for a core {:.0}% ({})",
@@ -967,13 +1276,20 @@ fn tab_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             " · core type split {}",
             unavailable("not_sampled")
         ));
+        if let Some(facts) = cpu_facts(s)
+            && facts.split.ambiguous_tabs.iter().any(|k| keys.contains(k))
+        {
+            cpu.push_str(&format!(
+                " · counter charge {} (actual total unknown)",
+                c2(facts.split.tab_charge_of(&keys) as f32 / 1000.0)
+            ));
+        }
         lines.push(line("cpu", cpu));
         lines.push(line(
             "mem",
             format!(
                 "mem    {} footprint ({} procs, {} unread) · slope {}",
-                f.footprint
-                    .map_or_else(|| unavailable("refused"), words::mem),
+                memory_words(f.footprint, f.footprint_unread),
                 f.procs,
                 f.refused,
                 unavailable("not_sampled")
@@ -1011,8 +1327,10 @@ fn tab_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             if roots == 1 { "" } else { "s" },
             root_kinds_words(ctx),
             disk::totals_clause(ctx.disk, bps_word),
-            f.write_bps
-                .map_or_else(|| unavailable("not_sampled"), bps_word),
+            f.write_bps.map_or_else(
+                || unavailable(unknown_why(s, "writes", "not_sampled")),
+                bps_word
+            ),
         ),
     ));
     lines.push(line(
@@ -1070,46 +1388,144 @@ fn aterm_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     lines.push(line(
         "aterm",
         format!(
-            "aterm   instance {} · {} session{} · {} · coalitions {}",
+            "aterm   app work · instance {} · {} session{} · {} · coalitions {}",
             s.self_pid,
             ctx.tabs.len(),
             if ctx.tabs.len() == 1 { "" } else { "s" },
-            exact_words(),
-            unavailable("lane_off:coalitions")
+            cpu_words(s),
+            if cpu_facts(s).is_some() {
+                "measured".into()
+            } else {
+                unavailable("lane_off:coalitions")
+            }
         ),
     ));
     let Some(a) = s.aterm.as_ref() else {
         lines.push(line(
             "cpu",
-            "cpu     measuring (one process sweep has no interval)",
+            if stalled_lane(s, "aterm").is_some() {
+                format!("cpu     {}", unavailable("stalled"))
+            } else {
+                "cpu     measuring (one process sweep has no interval)".to_owned()
+            },
         ));
         return;
     };
-    let busy = s.cpu.as_ref().and_then(|c| c.current_busy());
-    let mut cpu = format!("cpu     {}", c2(a.cores.raw));
-    if let Some(b) = busy {
-        cpu.push_str(&format!(" of {} busy", c2(b)));
-        if b > 0.05 {
-            cpu.push_str(&format!(
-                " ({:.0}%)",
-                (a.cores.raw / b * 100.0).clamp(0.0, 100.0)
-            ));
-        }
-    }
-    cpu.push_str(&format!(" · {} live processes", a.procs));
-    lines.push(line("cpu", cpu));
-    let mut tab_sum = 0.0f32;
-    for t in &s.tabs {
-        tab_sum += t.scope.cores.raw.max(0.0);
-        let tabn = ctx
-            .tab_number(t.key)
-            .map_or_else(|| "-".to_owned(), |n| n.to_string());
-        let sid = ctx
-            .tabs
-            .iter()
-            .find(|f| f.key == t.key)
-            .map_or_else(|| "-".to_owned(), |f| pct(&f.sid));
+    if let Some(f) = cpu_facts(s) {
+        let total = f.split.aterm_mc + f.split.delegated_mc;
         lines.push(line(
+            "cpu",
+            format!(
+                "cpu     {} of {} busy · cpu_charge_mc={} charge_difference_mc={} · window_ms={} · via=coalitions",
+                if aterm_cpu_bound(s) { format!("≥{:.3}c", total as f64 / 1000.0) } else { c2(total as f32 / 1000.0) },
+                c2(f.split.global_mc as f32 / 1000.0),
+                f.split.own_mc + f.split.tabs.iter().map(|(_, charge)| charge).sum::<i64>(),
+                total - f.split.own_mc - f.split.tabs.iter().map(|(_, charge)| charge).sum::<i64>(),
+                f.window_ns / 1_000_000
+            ),
+        ));
+        for t in &s.tabs {
+            let Some((used, lower)) = tab_cpu(s, &[t.key]) else {
+                continue;
+            };
+            let tabn = ctx
+                .tab_number(t.key)
+                .map_or_else(|| "-".into(), |n| n.to_string());
+            lines.push(line(format!("part tab {}", t.key), format!(
+                "part name=tab tab={tabn} local={} program={} cpu_mc={}{} cpu_charge_mc={} cpu_floor_mc={} fp_bytes={} procs={} exact={}",
+                t.key, exe_word(&t.program), if lower { "≥" } else { "" }, used,
+                f.split.tab_charge_of(&[t.key]), f.split.tab_floors.iter().find(|(k, _)| *k == t.key).map_or(0, |(_, mc)| *mc),
+                memory_record(t.scope.footprint, t.scope.footprint_unread), t.scope.procs, if lower { "at_least" } else { "measured" }
+            )));
+        }
+        lines.push(line(
+            "part shared",
+            format!(
+                "part name=shared cpu_mc={}{} cpu_charge_mc={} cpu_floor_mc={} (aterm processes outside tabs)",
+                if f.split.own_ambiguous { "≥" } else { "" }, f.split.own_actual(), f.split.own_mc, f.split.own_floor_mc
+            ),
+        ));
+        lines.push(line(
+            "part unattributed",
+            format!(
+                "part name=unattributed cpu_mc={}",
+                (total
+                    - f.split.own_actual()
+                    - f.split
+                        .tab_actual_of(&f.split.tabs.iter().map(|t| t.0).collect::<Vec<_>>()))
+                .max(0)
+            ),
+        ));
+        let difference = total
+            - f.split.own_actual()
+            - f.split
+                .tab_actual_of(&f.split.tabs.iter().map(|t| t.0).collect::<Vec<_>>());
+        let difference = difference.min(0);
+        lines.push(line(
+            "part counter_difference",
+            format!(
+                "part name=counter_difference cpu_mc={difference} (coalition and process counters)"
+            ),
+        ));
+    } else if let Some(cpu) = &s.scoped_cpu {
+        lines.push(line(
+            "cpu",
+            format!(
+                "cpu     ≥{:.3}c · cpu_charge_mc={} · window_ms={} · via=process_and_reap",
+                cpu.all_actual(),
+                (cpu.all_charge() * 1000.0).round() as i64,
+                cpu.window_ns / 1_000_000
+            ),
+        ));
+        for tab in &cpu.tabs {
+            let number = ctx
+                .tab_number(tab.key)
+                .map_or_else(|| "-".into(), |n| n.to_string());
+            lines.push(line(format!("part tab {}", tab.key), format!("part name=tab tab={number} local={} cpu_mc=≥{} cpu_charge_mc={} cpu_floor_mc={}",
+                tab.key, (tab.actual() * 1000.0).floor() as i64, (tab.charge * 1000.0).round() as i64, (tab.floor * 1000.0).floor() as i64)));
+        }
+        lines.push(line(
+            "part shared",
+            format!(
+                "part name=shared cpu_mc=≥{} cpu_charge_mc={} cpu_floor_mc={}",
+                (cpu.own_actual() * 1000.0).floor() as i64,
+                (cpu.own_charge * 1000.0).round() as i64,
+                (cpu.own_floor * 1000.0).floor() as i64
+            ),
+        ));
+        lines.push(line(
+            "part unattributed",
+            format!(
+                "part name=unattributed cpu_mc={}",
+                unavailable("lane_off:coalitions")
+            ),
+        ));
+    } else {
+        let busy = busy_cpu(s);
+        let mut cpu = format!("cpu     {}", c2(a.cores.raw));
+        if let Some(b) = busy {
+            cpu.push_str(&format!(" of {} busy", c2(b)));
+            if b > 0.05 {
+                cpu.push_str(&format!(
+                    " ({:.0}%)",
+                    (a.cores.raw / b * 100.0).clamp(0.0, 100.0)
+                ));
+            }
+        }
+        cpu.push_str(&format!(" · {} live processes", a.procs));
+        lines.push(line("cpu", cpu));
+        let mut tab_sum = 0.0f32;
+        for t in &s.tabs {
+            tab_sum += t.scope.cores.raw.max(0.0);
+            let tabn = ctx
+                .tab_number(t.key)
+                .map_or_else(|| "-".to_owned(), |n| n.to_string());
+            let sid = ctx
+                .tabs
+                .iter()
+                .find(|f| f.key == t.key)
+                .map_or_else(|| "-".to_owned(), |f| pct(&f.sid));
+            lines.push(line(
             format!("part tab {}", t.key),
             format!(
                 "part name=tab tab={tabn} local={} sid={sid} program={} cpu_mc={} wait_mc={} fp_bytes={} procs={} exact=live",
@@ -1117,44 +1533,61 @@ fn aterm_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 exe_word(&t.program),
                 mc(t.scope.cores.raw),
                 rec(mc_opt(t.scope.wait), "not_sampled"),
-                rec(t.scope.footprint, "refused"),
+                memory_record(t.scope.footprint, t.scope.footprint_unread),
                 t.scope.procs
             ),
         ));
+        }
+        let me = s.procs.iter().find(|r| r.scope == RowScope::SelfProc);
+        let self_cores = me.and_then(|r| r.cores).unwrap_or(0.0);
+        lines.push(line(
+            "part self",
+            format!(
+                "part name=self pid={} cpu_mc={} fp_bytes={}",
+                s.self_pid,
+                rec(me.and_then(|r| r.cores).map(mc), "warming"),
+                rec(me.and_then(|r| r.footprint), "refused")
+            ),
+        ));
+        let helpers: Vec<&ProcView> = s
+            .procs
+            .iter()
+            .filter(|r| r.scope == RowScope::Helper)
+            .collect();
+        let shared_cores = s.shared.as_ref().map_or(0.0, |shared| shared.cores.raw);
+        let helpers_cores = (a.cores.raw - tab_sum - self_cores - shared_cores).max(0.0);
+        let mut h = format!(
+            "part name=helpers cpu_mc={} procs={}",
+            mc(helpers_cores),
+            helpers.len()
+        );
+        if let Some(top) = helpers.first() {
+            h.push_str(&format!(" top={}", exe_word(&top.name)));
+        }
+        lines.push(line("part helpers", h));
+        if let Some(shared) = &s.shared {
+            lines.push(line("part shared_app", format!(
+            "part name=shared_app cpu_mc={} fp_bytes={} procs={} (other app instances and detached services)",
+            mc(shared.cores.raw), memory_record(shared.footprint, shared.footprint_unread), shared.procs
+        )));
+        }
+        lines.push(line(
+            "part unattributed",
+            format!(
+                "part name=unattributed cpu_mc={}",
+                unavailable("lane_off:coalitions")
+            ),
+        ));
     }
-    let me = s.procs.iter().find(|r| r.scope == RowScope::SelfProc);
-    let self_cores = me.and_then(|r| r.cores).unwrap_or(0.0);
-    lines.push(line(
-        "part self",
-        format!(
-            "part name=self pid={} cpu_mc={} fp_bytes={}",
-            s.self_pid,
-            rec(me.and_then(|r| r.cores).map(mc), "warming"),
-            rec(me.and_then(|r| r.footprint), "refused")
-        ),
-    ));
-    let helpers: Vec<&ProcView> = s
-        .procs
-        .iter()
-        .filter(|r| r.scope == RowScope::Helper)
-        .collect();
-    let helpers_cores = (a.cores.raw - tab_sum - self_cores).max(0.0);
-    let mut h = format!(
-        "part name=helpers cpu_mc={} procs={}",
-        mc(helpers_cores),
-        helpers.len()
-    );
-    if let Some(top) = helpers.first() {
-        h.push_str(&format!(" top={}", exe_word(&top.name)));
+    if cpu_facts(s).is_some()
+        && let Some(shared) = &s.shared
+    {
+        lines.push(line("shared app live", format!(
+            "slice name=shared_app included_in=shared cpu_live_mc={} fp_bytes={} procs={} window_ms={} (other app instances and detached services)",
+            mc(shared.cores.raw), memory_record(shared.footprint, shared.footprint_unread), shared.procs,
+            s.procs_window_ns.unwrap_or(0) / 1_000_000
+        )));
     }
-    lines.push(line("part helpers", h));
-    lines.push(line(
-        "part unattributed",
-        format!(
-            "part name=unattributed cpu_mc={}",
-            unavailable("lane_off:coalitions")
-        ),
-    ));
     lines.push(line(
         "gpu",
         format!(
@@ -1169,12 +1602,42 @@ fn aterm_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         "mem",
         format!(
             "mem     {} footprint (live members) · writes {}",
-            a.footprint
-                .map_or_else(|| unavailable("refused"), words::mem),
+            memory_words(a.footprint, a.footprint_unread),
             a.write_bps
                 .map_or_else(|| unavailable("not_sampled"), bps_word)
         ),
     ));
+    if !s.native_terminals.is_empty() {
+        let known = s
+            .native_terminals
+            .iter()
+            .filter_map(|t| t.wait_cpu_ns)
+            .fold(0_u64, u64::saturating_add);
+        let unread = s
+            .native_terminals
+            .iter()
+            .filter(|t| t.wait_cpu_ns.is_none())
+            .count();
+        lines.push(line("native waits", format!("native_waits completed={} wait_cpu_ns={} unread={} scope=owning_wait_total; includes waited descendants; not a current CPU rate", s.native_terminals.len(), if unread > 0 { format!("≥{known}") } else { known.to_string() }, unread)));
+        for terminal in s.native_terminals.iter().take(8) {
+            lines.push(line(
+                format!("native wait {} {}", terminal.host.pid, terminal.seq),
+                format!(
+                    "native_wait pid={} start={} local={} wait_cpu_ns={} own_cpu_ns={} child_cpu_ns={} reaps_unwaited={} exited_ns={} previous_cut_ns={} current_cut_ns={}",
+                    terminal.process.pid,
+                    rec(terminal.process.start, "not_sampled"),
+                    terminal.tab.map_or_else(|| "-".into(), |t| t.to_string()),
+                    rec(terminal.wait_cpu_ns, "not_sampled"),
+                    rec(terminal.process.cpu_ns, "not_sampled"),
+                    rec(terminal.process.child_cpu_ns, "not_sampled"),
+                    terminal.process.reaps_unwaited.map_or_else(|| unavailable("not_sampled"), |v| u8::from(v).to_string()),
+                    rec(terminal.timing.exited_ns, "not_sampled"),
+                    rec(terminal.timing.previous.continuous_ns, "not_sampled"),
+                    rec(terminal.timing.current.continuous_ns, "not_sampled"),
+                ),
+            ));
+        }
+    }
 }
 
 fn machine_line(ctx: &Ctx<'_>, s: &Snapshot) -> String {
@@ -1252,10 +1715,10 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
         Some(cpu) => {
             let mut t = format!(
                 "cpu      {} of {} cores busy",
-                rec(cpu.current_busy().map(words::cores), "no_counter_delta"),
+                rec(busy_cpu(s).map(words::cores), "no_counter_delta"),
                 cpu.total()
             );
-            if let Some(busy) = cpu.current_busy() {
+            if let Some(busy) = busy_cpu(s) {
                 t.push_str(&format!(
                     " · {} cores idle",
                     words::cores((cpu.total() as f32 - busy).max(0.0))
@@ -1281,32 +1744,43 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
             "cpu      measuring (the first sample has no interval)",
         )),
     }
-    if let Some(sp) = s.split {
-        let mut t = format!(
-            "split    aterm {} · others {} · {} ≈{}",
-            c1(sp.aterm),
-            c1(sp.others),
-            ctx.machine.services_word(),
-            c1(sp.services)
+    if let Some(f) = cpu_facts(s) {
+        lines.push(line("split", format!(
+            "split    aterm {} · others {} · {} {} · unaccounted {:+.3}c · via=coalitions · window_ms={}",
+            if aterm_cpu_bound(s) { format!("≥{:.3}c", (f.split.aterm_mc + f.split.delegated_mc) as f64 / 1000.0) } else { c1((f.split.aterm_mc + f.split.delegated_mc) as f32 / 1000.0) },
+            if aterm_cpu_bound(s) { format!("≥{:.3}c", f.split.others_mc as f64 / 1000.0) } else { c1(f.split.others_mc as f32 / 1000.0) }, ctx.machine.services_word(),
+            if aterm_cpu_bound(s) { format!("≥{:.3}c", f.split.services_mc as f64 / 1000.0) } else { c1(f.split.services_mc as f32 / 1000.0) }, f.split.unaccounted_mc as f64 / 1000.0,
+            f.window_ns / 1_000_000
+        )));
+    } else if let Some(sp) = s.split {
+        let app = aterm_cpu(s).unwrap_or(sp.aterm);
+        let t = format!(
+            "split    aterm ≥{app:.3}c · others ≥{:.3}c · services ≥{:.3}c · unaccounted {:+.3}c · services_via=live_own · via={}",
+            (sp.others * 1000.0).floor() / 1000.0,
+            (sp.services * 1000.0).floor() / 1000.0,
+            sp.global - app - sp.others - sp.services,
+            if s.scoped_cpu.is_some() {
+                "process_and_reap"
+            } else {
+                "live_processes"
+            }
         );
-        if sp.unaccounted < -0.05 {
-            t.push_str(&format!(" · unaccounted -{}", c1(-sp.unaccounted)));
-        } else {
-            t.push_str(" (by subtraction, unaccounted work included)");
-        }
-        t.push_str(" · live (parent chains)");
         lines.push(line("split", t));
-    } else if s.procs_window_ns.is_some() {
+    } else if s.procs_window_ns.is_some() || stalled_lane(s, "split").is_some() {
         lines.push(line(
             "split",
-            format!("split    {}", unavailable("not_sampled")),
+            format!(
+                "split    {}",
+                unavailable(unknown_why(s, "split", "not_sampled"))
+            ),
         ));
     }
     let mut th = format!(
         "threads  waiting for a core {}",
-        s.global
-            .wait
-            .map_or_else(|| unavailable("not_sampled"), |w| format!("≥{}", c2(w)))
+        s.global.wait.map_or_else(
+            || unavailable(unknown_why(s, "wait", "not_sampled")),
+            |w| format!("≥{}", c2(w))
+        )
     );
     th.push_str(&format!(
         " (your processes; {} other-user processes unread)",
@@ -1351,6 +1825,9 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
         |r| !r.scope.in_aterm() && r.cores.is_some_and(|c| c >= 0.1),
         "top",
     );
+    if ctx.owner_class && stalled_lane(s, "top").is_some() {
+        lines.push(line("top", format!("top      {}", unavailable("stalled"))));
+    }
 }
 
 fn top_rows(
@@ -1439,6 +1916,145 @@ fn gpu_words(s: &Snapshot) -> String {
 /// class names (Linux, Windows; design §9.6).
 pub(super) fn exact_partition(ctx: &Ctx<'_>) -> bool {
     ctx.machine.family == "macOS"
+        && ctx.snap.and_then(|s| s.mem.as_ref()).is_some_and(|m| {
+            m.sample.exact && m.sample.compressed.is_some() && m.sample.in_vm() <= m.sample.total
+        })
+}
+
+/// A memory charge remains a lower bound whenever any member could not be read.
+pub(super) fn memory_words(bytes: Option<u64>, unread: u32) -> String {
+    match bytes {
+        Some(bytes) if unread > 0 => format!("≥{}", words::mem(bytes)),
+        Some(bytes) => words::mem(bytes),
+        None => unavailable("refused"),
+    }
+}
+
+fn memory_record(bytes: Option<u64>, unread: u32) -> String {
+    match bytes {
+        Some(bytes) if unread > 0 => format!("≥{bytes}"),
+        _ => rec(bytes, "refused"),
+    }
+}
+
+fn memory_json(bytes: Option<u64>, unread: u32) -> Jv {
+    match bytes {
+        Some(bytes) if unread > 0 => Jv::at_least_refused(bytes, unread),
+        _ => Jv::known_or(bytes, "refused"),
+    }
+}
+
+struct MemoryReading {
+    owners: crate::model::MemoryOwners,
+    via: &'static str,
+    age_ms: u64,
+}
+
+impl MemoryReading {
+    fn of(s: &Snapshot) -> Option<Self> {
+        if let Some(f) = s
+            .why
+            .as_ref()
+            .filter(|f| f.lane.on() && !f.split.rows.is_empty())
+        {
+            let mut owners = crate::model::MemoryOwners::of_coalitions(
+                &f.split,
+                f.memory_provenance_incomplete
+                    || s.memory_owners.is_none_or(|o| o.ownership_incomplete),
+            );
+            owners.ownership_incomplete |= f.at_ns == s.at_ns
+                && s.aterm
+                    .as_ref()
+                    .and_then(|a| a.footprint)
+                    .is_some_and(|observed| observed > owners.aterm.bytes);
+            return Some(Self {
+                owners,
+                via: "coalitions",
+                age_ms: s.at_ns.saturating_sub(f.at_ns) / 1_000_000,
+            });
+        }
+        s.memory_owners.map(|owners| Self {
+            owners,
+            via: "processes",
+            age_ms: 0,
+        })
+    }
+
+    fn charges(&self) -> [(&'static str, crate::model::MemoryCharge); 4] {
+        [
+            ("aterm", self.owners.aterm),
+            ("others", self.owners.others),
+            ("services", self.owners.services),
+            ("unknown", self.owners.unknown),
+        ]
+    }
+
+    fn words(&self, charge: crate::model::MemoryCharge) -> String {
+        if self.owners.ownership_incomplete {
+            return format!(
+                "{} (observed {})",
+                unavailable("ownership_incomplete"),
+                words::mem(charge.bytes)
+            );
+        }
+        if charge.members > 0 && charge.unread == charge.members {
+            return unavailable("refused");
+        }
+        let mark = if charge.unread > 0 || self.owners.truncated {
+            "≥"
+        } else {
+            ""
+        };
+        format!("{mark}{}", words::mem(charge.bytes))
+    }
+
+    fn json(&self) -> Jv {
+        let mut result = Jv::obj([
+            ("via", Jv::s(self.via)),
+            ("age_ms", Jv::u(self.age_ms)),
+            ("truncated", Jv::Bool(self.owners.truncated)),
+            (
+                "ownership_incomplete",
+                Jv::Bool(self.owners.ownership_incomplete),
+            ),
+            (
+                "units",
+                Jv::s(if self.via == "coalitions" {
+                    "charge_groups"
+                } else {
+                    "processes"
+                }),
+            ),
+        ]);
+        for (name, charge) in self.charges() {
+            let bytes = if charge.members > 0 && charge.unread == charge.members {
+                Jv::why("refused")
+            } else if charge.unread > 0 {
+                Jv::at_least_refused(charge.bytes, charge.unread)
+            } else if self.owners.truncated {
+                Jv::at_least(charge.bytes, "truncated")
+            } else {
+                Jv::u(charge.bytes)
+            };
+            let mut object = Jv::obj([
+                (
+                    "footprint_bytes",
+                    if self.owners.ownership_incomplete {
+                        Jv::why("ownership_incomplete")
+                    } else {
+                        bytes.clone()
+                    },
+                ),
+                ("members", Jv::u(u64::from(charge.members))),
+                ("unread", Jv::u(u64::from(charge.unread))),
+            ]);
+            if self.owners.ownership_incomplete {
+                object.set("observed_footprint_bytes", bytes);
+            }
+            result.set(name, object);
+        }
+        result
+    }
 }
 
 /// The classes, bytes; `None` for one the OS does not say (Windows'
@@ -1738,14 +2354,15 @@ fn cores_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         "threads",
         format!(
             "threads waiting_mc={} unread={} tab_waiting_mc={} tab_starved_pm={}",
-            s.global
-                .wait
-                .map_or_else(|| unavailable("not_sampled"), |w| format!("≥{}", mc(w))),
+            s.global.wait.map_or_else(
+                || unavailable(unknown_why(s, "wait", "not_sampled")),
+                |w| format!("≥{}", mc(w))
+            ),
             s.global.refused,
-            rec(mc_opt(tab.wait), "not_sampled"),
+            rec(mc_opt(tab.wait), unknown_why(s, "tab", "not_sampled")),
             rec(
                 tab.starved().map(|x| (x * 1000.0).round() as u32),
-                "not_sampled"
+                unknown_why(s, "tab", "not_sampled")
             )
         ),
     ));
@@ -1920,34 +2537,40 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     lines.push(line("paging", format!("paging  {}", paging_words(m))));
     let tab = tabs_fig(s, &scope_keys(ctx, ScopeArg::Tab), ctx.target.key);
     let aterm_fp = s.aterm.as_ref().and_then(|a| a.footprint);
-    let others_fp: u64 = s
-        .procs
-        .iter()
-        .filter(|r| r.scope == RowScope::Others)
-        .filter_map(|r| r.footprint)
-        .sum();
     let mut owners = format!(
         "owners  {} {}",
         tab_label(ctx),
-        tab.footprint
-            .map_or_else(|| unavailable("refused"), words::mem)
+        memory_words(tab.footprint, tab.footprint_unread)
     );
-    if let (Some(a), Some(t)) = (aterm_fp, tab.footprint) {
+    if let (Some(a), Some(t)) = (aterm_fp, tab.footprint)
+        && tab.footprint_unread == 0
+        && s.aterm.as_ref().is_some_and(|a| a.footprint_unread == 0)
+    {
         owners.push_str(&format!(
             " · rest of aterm {}",
             words::mem(a.saturating_sub(t))
         ));
     }
-    if s.procs.iter().any(|r| r.scope == RowScope::Unknown) {
-        owners.push_str(&format!(" · others {}", unavailable("not_sampled")));
-    } else {
-        owners.push_str(&format!(
-            " · others ≥{} (the busiest and largest rows only)",
-            words::mem(others_fp)
-        ));
-    }
-    owners.push_str(" · footprints are shares, not a split of RAM");
+    owners.push_str(" · live process footprints include compressed charges");
     lines.push(line("owners", owners));
+    if let Some(reading) = MemoryReading::of(s) {
+        let mut text = format!(
+            "charges via={} age_ms={} truncated={}",
+            reading.via,
+            reading.age_ms,
+            u8::from(reading.owners.truncated)
+        );
+        for (name, charge) in reading.charges() {
+            text.push_str(&format!(" · {name} {}", reading.words(charge)));
+        }
+        let unread = reading
+            .charges()
+            .iter()
+            .fold(0_u32, |sum, (_, c)| sum.saturating_add(c.unread));
+        text.push_str(&format!(" · unread={unread}"));
+        text.push_str(" · memory charges are not a partition of physical RAM");
+        lines.push(line("charges", text));
+    }
     let keys = scope_keys(ctx, ScopeArg::Tab);
     let mut rows: Vec<&ProcView> = s.procs.iter().filter(|r| r.footprint.is_some()).collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.footprint));
@@ -2081,6 +2704,7 @@ fn program_scope_word(scope: ProcScope) -> &'static str {
     match scope {
         ProcScope::Tab(_) => "tab",
         ProcScope::Aterm => "aterm",
+        ProcScope::Shared => "shared-aterm",
         ProcScope::Other => "others",
     }
 }
@@ -2165,8 +2789,10 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             ctx.roots.len(),
             if ctx.roots.len() == 1 { "" } else { "s" },
             disk::totals_clause(ctx.disk, bps_word),
-            f.write_bps
-                .map_or_else(|| unavailable("not_sampled"), bps_word)
+            f.write_bps.map_or_else(
+                || unavailable(unknown_why(s, "writes", "not_sampled")),
+                bps_word
+            )
         ),
     ));
     let depth = usize::from(q.depth.unwrap_or(DISK_DEPTH_DEFAULT));
@@ -2683,10 +3309,17 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
     if s.procs_window_ns.is_none() {
         lines.push(line(
             "procs",
-            format!(
-                "procs  {who} · {}: one process sweep has no interval",
-                unavailable("warming")
-            ),
+            if stalled_lane(s, "procs").is_some() {
+                format!(
+                    "procs  {who} · {}: the process sweep did not answer",
+                    unavailable("stalled")
+                )
+            } else {
+                format!(
+                    "procs  {who} · {}: one process sweep has no interval",
+                    unavailable("warming")
+                )
+            },
         ));
         return;
     }
@@ -2713,7 +3346,7 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
             rec(r.gpu.map(gpu_ppm), GPU_LANE_OFF),
             r.state.word(),
             scheduling_json(r.scheduling, ctx.machine.family).to_text(),
-            rec(r.age_ms(s.at_unix_ms), BIRTH_UNREAD)
+            rec(r.age_ms(s.at_unix_ms), unknown_why(s, "ages", BIRTH_UNREAD))
         );
         if let RowScope::Tab(k) = r.scope
             && !matches!(scope, ScopeArg::Pane | ScopeArg::Tab)
@@ -2813,7 +3446,7 @@ fn global_json(s: &Snapshot) -> Jv {
         "cpu_mc",
         s.cpu.as_ref().map_or_else(
             || Jv::why("warming"),
-            |c| Jv::known_or(c.current_busy().map(mc), "no_counter_delta"),
+            |_| Jv::known_or(busy_cpu(s).map(mc), "no_counter_delta"),
         ),
     )]);
     o.set(
@@ -2834,7 +3467,7 @@ fn global_json(s: &Snapshot) -> Jv {
     o.set(
         "wait_mc",
         s.global.wait.map_or_else(
-            || Jv::why("not_sampled"),
+            || unknown_json(s, "wait", "not_sampled"),
             |w| Jv::at_least_refused(mc(w), s.global.refused),
         ),
     );
@@ -2884,7 +3517,7 @@ fn global_json(s: &Snapshot) -> Jv {
     o.set(
         "disk_write_bytes_per_s",
         s.global.write_bps.map_or_else(
-            || Jv::why("not_sampled"),
+            || unknown_json(s, "writes", "not_sampled"),
             |b| Jv::at_least_refused(b.round() as u64, s.global.refused),
         ),
     );
@@ -2921,7 +3554,10 @@ fn global_json(s: &Snapshot) -> Jv {
             "not_sampled",
         ),
     );
-    o.set("procs", Jv::Int(i64::from(s.global.procs)));
+    o.set(
+        "procs",
+        stalled_lane(s, "procs").map_or_else(|| Jv::Int(i64::from(s.global.procs)), Jv::stalled),
+    );
     o.set("exact", Jv::s("exact"));
     o
 }
@@ -2945,7 +3581,11 @@ fn fig_json(f: &Fig) -> Jv {
             "not_sampled",
         ),
     );
-    o.set("footprint_bytes", Jv::known_or(f.footprint, "refused"));
+    o.set(
+        "footprint_bytes",
+        memory_json(f.footprint, f.footprint_unread),
+    );
+    o.set("footprint_unread", Jv::u(u64::from(f.footprint_unread)));
     o.set(
         "write_bytes_per_s",
         Jv::known_or(f.write_bps.map(|b| b.round() as u64), "not_sampled"),
@@ -2976,6 +3616,10 @@ fn tab_obj(ctx: &Ctx<'_>, s: &Snapshot, keys: &[u64], f: &Fig) -> Jv {
             o.set(&k, v);
         }
     }
+    tab_cpu_json(s, keys, &mut o);
+    if let Some(lane) = stalled_lane(s, "tab").filter(|_| !f.present) {
+        o.set("cpu_mc", Jv::stalled(lane));
+    }
     o.set(
         "jobs",
         s.jobs.as_deref().map_or_else(
@@ -2986,33 +3630,83 @@ fn tab_obj(ctx: &Ctx<'_>, s: &Snapshot, keys: &[u64], f: &Fig) -> Jv {
     o
 }
 
-fn split_json(s: &Snapshot, tab: &Fig) -> Jv {
+fn split_json(ctx: &Ctx<'_>, s: &Snapshot, tab: &Fig) -> Jv {
+    if let Some(f) = cpu_facts(s) {
+        let p = f
+            .split
+            .parts_of_coverage(&scope_keys(ctx, ScopeArg::Tab), f.provenance_incomplete);
+        let ownership_bound = f.split.ownership_incomplete || f.provenance_incomplete;
+        let bound = tab_cpu(s, &scope_keys(ctx, ScopeArg::Tab)).is_some_and(|(_, bound)| bound);
+        return Jv::obj([
+            (
+                "tab",
+                if bound {
+                    Jv::at_least(p.tab.max(0) as u64, "not_sampled")
+                } else {
+                    Jv::Int(p.tab)
+                },
+            ),
+            (
+                "aterm_rest",
+                if ownership_bound {
+                    Jv::at_least(p.aterm_rest.max(0) as u64, "mixed_ownership")
+                } else if bound {
+                    Jv::at_most(p.aterm_rest.max(0) as u64, "not_sampled")
+                } else {
+                    Jv::Int(p.aterm_rest)
+                },
+            ),
+            (
+                "others",
+                if ownership_bound {
+                    Jv::at_least(p.others.max(0) as u64, "mixed_ownership")
+                } else {
+                    Jv::Int(p.others)
+                },
+            ),
+            (
+                "services",
+                if ownership_bound {
+                    Jv::at_least(p.services.max(0) as u64, "mixed_ownership")
+                } else {
+                    Jv::Int(p.services)
+                },
+            ),
+            ("unaccounted", Jv::Int(p.unaccounted)),
+        ]);
+    }
     match s.split {
         Some(sp) => {
-            let rest = (sp.aterm - tab.cores).max(0.0);
+            let app = aterm_cpu(s).unwrap_or(sp.aterm);
+            let used = tab_cpu(s, &scope_keys(ctx, ScopeArg::Tab))
+                .map_or(tab.cores, |(mc, _)| mc as f32 / 1000.0);
+            let rest = (app - used).max(0.0);
             let whole = mc(sp.global) as i64;
-            let t = mc(tab.cores) as i64;
-            let r = mc(rest) as i64;
-            let o = mc(sp.others) as i64;
-            let remainder = whole - t - r - o;
-            let (services, unaccounted) = if remainder >= 0 {
-                (Jv::Int(remainder), Jv::why("lane_off:coalitions"))
-            } else {
-                (Jv::Int(0), Jv::Int(remainder))
-            };
+            let t = (f64::from(used) * 1000.0).floor() as i64;
+            let r = (f64::from(rest) * 1000.0).floor() as i64;
+            let o = (f64::from(sp.others) * 1000.0).floor() as i64;
+            let services = (f64::from(sp.services) * 1000.0).floor() as i64;
+            let remainder = whole - t - r - o - services;
             Jv::obj([
-                ("tab", Jv::Int(t)),
-                ("aterm_rest", Jv::Int(r)),
-                ("others", Jv::Int(o)),
-                ("services", services),
-                ("unaccounted", unaccounted),
+                ("tab", Jv::at_least(t.max(0) as u64, "not_sampled")),
+                ("aterm_rest", Jv::at_least(r.max(0) as u64, "not_sampled")),
+                ("others", Jv::at_least(o.max(0) as u64, "not_sampled")),
+                (
+                    "services",
+                    Jv::at_least(services.max(0) as u64, "not_sampled"),
+                ),
+                ("unaccounted", Jv::Int(remainder)),
             ])
         }
-        None => Jv::why(if s.procs_window_ns.is_some() {
-            "not_sampled"
-        } else {
-            "warming"
-        }),
+        None => unknown_json(
+            s,
+            "split",
+            if s.procs_window_ns.is_some() {
+                "not_sampled"
+            } else {
+                "warming"
+            },
+        ),
     }
 }
 
@@ -3038,10 +3732,28 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
     if let Some(g) = ctx.gap {
         o.set("gap", Jv::s(g.word()));
     }
+    if let Some(s) = ctx.snap.filter(|s| !s.stalled.is_empty()) {
+        o.set("lanes", lanes_json(s));
+    }
     let Some(s) = ctx.snap else {
         o.set("events", Jv::Arr(Vec::new()));
         return o;
     };
+    if matches!(
+        q.view,
+        View::Overview | View::Tab | View::Aterm | View::Global
+    ) && let Some((at, window, _)) = cpu_timing(s)
+    {
+        let older = s.at_ns.saturating_sub(at) / 1_000_000;
+        o.set(
+            "cpu_as_of",
+            Jv::obj([
+                ("unix_ms", Jv::u(ctx.as_of_unix_ms.saturating_sub(older))),
+                ("age_ms", Jv::u(ctx.age_ms.saturating_add(older))),
+                ("window_ms", Jv::u(window / 1_000_000)),
+            ]),
+        );
+    }
     match q.view {
         View::Overview => {
             let keys = scope_keys(ctx, ScopeArg::Tab);
@@ -3050,8 +3762,8 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             o.set("global", global_json(s));
             o.set("aterm", aterm_json(s));
             o.set("tab", tab_obj(ctx, s, &keys, &tab));
-            o.set("split_mc", split_json(s, &tab));
-            o.set("split_exact", Jv::s("heuristic"));
+            o.set("split_mc", split_json(ctx, s, &tab));
+            o.set("split_exact", Jv::s(split_exact(s)));
         }
         View::Tab => {
             let keys = scope_keys(ctx, ScopeArg::Tab);
@@ -3082,18 +3794,34 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
             o.set("place", place_json(s));
             o.set("net", net_json(q, s));
             let tab = tabs_fig(s, &scope_keys(ctx, ScopeArg::Tab), ctx.target.key);
-            o.set("split_mc", split_json(s, &tab));
+            o.set("split_mc", split_json(ctx, s, &tab));
             o.set(
                 "aterm_mc",
-                Jv::known_or(s.aterm.as_ref().map(|a| mc(a.cores.raw)), "warming"),
+                if let Some(lane) = stalled_lane(s, "aterm").filter(|_| s.aterm.is_none()) {
+                    Jv::stalled(lane)
+                } else if aterm_cpu_bound(s) {
+                    aterm_cpu(s).map_or_else(
+                        || unknown_json(s, "aterm", "warming"),
+                        |cpu| {
+                            Jv::at_least(
+                                (f64::from(cpu) * 1000.0).floor().max(0.0) as u64,
+                                "not_sampled",
+                            )
+                        },
+                    )
+                } else {
+                    known_or_stalled(s, aterm_cpu(s).map(mc), "aterm", "warming")
+                },
             );
-            o.set("split_exact", Jv::s("heuristic"));
+            o.set("split_exact", Jv::s(split_exact(s)));
             o.set(
                 "thermal",
                 s.thermal
                     .map_or_else(|| Jv::why("unsupported"), thermal_json),
             );
-            if ctx.owner_class {
+            if let Some(lane) = stalled_lane(s, "top").filter(|_| ctx.owner_class) {
+                o.set("top", Jv::stalled(lane));
+            } else if ctx.owner_class {
                 let top: Vec<Jv> = s
                     .procs
                     .iter()
@@ -3165,15 +3893,20 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
                     (
                         "wait_mc",
                         s.global.wait.map_or_else(
-                            || Jv::why("not_sampled"),
+                            || unknown_json(s, "wait", "not_sampled"),
                             |w| Jv::at_least_refused(mc(w), s.global.refused),
                         ),
                     ),
-                    ("tab_wait_mc", Jv::known_or(tab.wait.map(mc), "not_sampled")),
+                    (
+                        "tab_wait_mc",
+                        known_or_stalled(s, tab.wait.map(mc), "tab", "not_sampled"),
+                    ),
                     (
                         "tab_starved_pm",
-                        Jv::known_or(
+                        known_or_stalled(
+                            s,
                             tab.starved().map(|x| (x * 1000.0).round() as u64),
+                            "tab",
                             "not_sampled",
                         ),
                     ),
@@ -3243,36 +3976,231 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
     o
 }
 
+/// Every lane stalled at `s`: `{"lane","state","call","pid","name","since","since_unix_ms","for_ms","figures"}`.
+fn lanes_json(s: &Snapshot) -> Jv {
+    Jv::Arr(
+        s.stalled
+            .iter()
+            .map(|l| {
+                let mut o = Jv::obj([
+                    ("lane", Jv::s(l.lane)),
+                    ("state", Jv::s("stalled")),
+                    ("call", Jv::s(l.call)),
+                ]);
+                if let Some(pid) = l.pid {
+                    o.set("pid", Jv::u(u64::from(pid)));
+                }
+                if let Some(name) = l.name.as_deref() {
+                    o.set("name", Jv::s(exe_word(name)));
+                }
+                let since = u64::try_from(l.since_unix_ms).unwrap_or(0);
+                o.set("since", Jv::s(clock_ms(since)));
+                o.set("since_unix_ms", Jv::u(since));
+                o.set("for_ms", Jv::u(l.for_ms));
+                o.set(
+                    "figures",
+                    Jv::Arr(l.figures().iter().map(|f| Jv::s(*f)).collect()),
+                );
+                o
+            })
+            .collect(),
+    )
+}
+
 fn aterm_json(s: &Snapshot) -> Jv {
     match s.aterm.as_ref() {
         Some(a) => {
             let mut f = Fig::of(a);
             f.program.clear();
             let mut o = fig_json(&f);
-            if let Some(b) = s
-                .cpu
-                .as_ref()
-                .and_then(|c| c.current_busy())
-                .filter(|b| *b > 0.05)
-            {
+            let used = aterm_cpu(s).unwrap_or(a.cores.raw);
+            o.set("cpu_mc", Jv::u(mc(used)));
+            if let Some(b) = busy_cpu(s).filter(|b| *b > 0.05) {
                 o.set(
                     "share_of_busy_pm",
-                    Jv::u(((a.cores.raw / b) * 1000.0).round().clamp(0.0, 1000.0) as u64),
+                    Jv::u(((used / b) * 1000.0).round().clamp(0.0, 1000.0) as u64),
                 );
             }
             o.set("gpu_pm", Jv::known_or(a.gpu.map(gpu_pm), GPU_LANE_OFF));
             o.set("instance", Jv::u(u64::from(s.self_pid)));
-            o.set("coalitions", Jv::why("lane_off:coalitions"));
-            o.set("via", Jv::s("parent_chains"));
+            if !s.native_terminals.is_empty() {
+                o.set("native_waits", native_waits_json(s));
+            }
+            if let Some(shared) = &s.shared {
+                let mut slice = fig_json(&Fig::of(shared));
+                slice.set("included_in", Jv::s("aterm"));
+                slice.set("cpu_window_ns", Jv::known_or(s.procs_window_ns, "warming"));
+                slice.set("cpu_accounting", Jv::s("live_processes"));
+                o.set("shared_app", slice);
+            }
+            if let Some(facts) = cpu_facts(s) {
+                if facts.split.ownership_incomplete || facts.provenance_incomplete {
+                    let total = facts.split.aterm_mc + facts.split.delegated_mc;
+                    o.set(
+                        "cpu_mc",
+                        Jv::at_least(total.max(0) as u64, "mixed_ownership"),
+                    );
+                    o.set(
+                        "share_of_busy_pm",
+                        Jv::at_least(
+                            (total.max(0) as u64).saturating_mul(1000)
+                                / facts.split.global_mc.max(1) as u64,
+                            "mixed_ownership",
+                        ),
+                    );
+                }
+                o.set("coalitions", Jv::u(u64::from(facts.split.listed)));
+                o.set("via", Jv::s("coalitions"));
+                let charge = facts.split.own_mc
+                    + facts
+                        .split
+                        .tabs
+                        .iter()
+                        .map(|(_, charge)| charge)
+                        .sum::<i64>();
+                o.set("cpu_charge_mc", Jv::Int(charge));
+                o.set(
+                    "charge_difference_mc",
+                    Jv::Int(facts.split.aterm_mc + facts.split.delegated_mc - charge),
+                );
+                o.set("cpu_window_ns", Jv::u(facts.window_ns));
+                o.set("exact", Jv::s(split_exact(s)));
+            } else {
+                o.set("coalitions", Jv::why("lane_off:coalitions"));
+                if let Some(cpu) = &s.scoped_cpu {
+                    o.set(
+                        "cpu_mc",
+                        Jv::at_least(
+                            (cpu.all_actual() * 1000.0).floor().max(0.0) as u64,
+                            "not_sampled",
+                        ),
+                    );
+                    o.set(
+                        "cpu_charge_mc",
+                        Jv::Int((cpu.all_charge() * 1000.0).round() as i64),
+                    );
+                    o.set(
+                        "cpu_floor_mc",
+                        Jv::Int(
+                            ((cpu.own_floor + cpu.tabs.iter().map(|t| t.floor).sum::<f64>())
+                                * 1000.0)
+                                .floor() as i64,
+                        ),
+                    );
+                    o.set(
+                        "cpu_ambiguous",
+                        Jv::Bool(cpu.own_ambiguous || cpu.tabs.iter().any(|t| t.ambiguous)),
+                    );
+                    o.set("via", Jv::s("process_and_reap"));
+                    o.set("cpu_window_ns", Jv::u(cpu.window_ns));
+                    o.set("exact", Jv::s("at_least"));
+                    if let Some(busy) = busy_cpu(s).filter(|b| *b > 0.0) {
+                        o.set(
+                            "share_of_busy_pm",
+                            Jv::at_least(
+                                (cpu.all_actual() / f64::from(busy) * 1000.0)
+                                    .floor()
+                                    .max(0.0) as u64,
+                                "not_sampled",
+                            ),
+                        );
+                    }
+                } else {
+                    o.set("via", Jv::s("parent_chains"));
+                }
+            }
             o
         }
-        None => Jv::obj([("cpu_mc", Jv::why("warming")), ("exact", Jv::s("live"))]),
+        None => Jv::obj([
+            (
+                "cpu_mc",
+                stalled_lane(s, "aterm").map_or_else(|| Jv::why("warming"), Jv::stalled),
+            ),
+            ("exact", Jv::s("live")),
+        ]),
     }
+}
+
+fn native_waits_json(s: &Snapshot) -> Jv {
+    let known = s
+        .native_terminals
+        .iter()
+        .filter_map(|t| t.wait_cpu_ns)
+        .fold(0_u64, u64::saturating_add);
+    let unread = s
+        .native_terminals
+        .iter()
+        .filter(|t| t.wait_cpu_ns.is_none())
+        .count();
+    Jv::obj([
+        ("scope", Jv::s("owning_wait_total")),
+        ("quantity", Jv::s("kernel_counter_charge")),
+        ("completed", Jv::u(s.native_terminals.len() as u64)),
+        (
+            "wait_cpu_ns",
+            if unread > 0 {
+                Jv::at_least_refused(known, unread as u32)
+            } else {
+                Jv::u(known)
+            },
+        ),
+        (
+            "rows",
+            Jv::Arr(
+                s.native_terminals
+                    .iter()
+                    .take(8)
+                    .map(|t| {
+                        Jv::obj([
+                            ("pid", Jv::u(u64::from(t.process.pid))),
+                            ("start", Jv::known_or(t.process.start, "not_sampled")),
+                            ("seq", Jv::u(t.seq)),
+                            ("local", Jv::known_or(t.tab, "gone")),
+                            (
+                                "timing",
+                                Jv::obj([
+                                    ("clock", Jv::s("continuous_boot_ns")),
+                                    ("exited_ns", Jv::known_or(t.timing.exited_ns, "not_sampled")),
+                                    (
+                                        "previous_cut_ns",
+                                        Jv::known_or(
+                                            t.timing.previous.continuous_ns,
+                                            "not_sampled",
+                                        ),
+                                    ),
+                                    (
+                                        "current_cut_ns",
+                                        Jv::known_or(t.timing.current.continuous_ns, "not_sampled"),
+                                    ),
+                                ]),
+                            ),
+                            ("wait_cpu_ns", Jv::known_or(t.wait_cpu_ns, "not_sampled")),
+                            ("own_cpu_ns", Jv::known_or(t.process.cpu_ns, "not_sampled")),
+                            (
+                                "child_cpu_ns",
+                                Jv::known_or(t.process.child_cpu_ns, "not_sampled"),
+                            ),
+                            (
+                                "reaps_unwaited",
+                                t.process
+                                    .reaps_unwaited
+                                    .map_or_else(|| Jv::why("not_sampled"), Jv::Bool),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "more",
+            Jv::u(s.native_terminals.len().saturating_sub(8) as u64),
+        ),
+    ])
 }
 
 fn parts_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     let Some(a) = s.aterm.as_ref() else {
-        return Jv::why("warming");
+        return unknown_json(s, "aterm", "warming");
     };
     let mut parts = Vec::new();
     let mut tab_sum = 0.0f32;
@@ -3297,7 +4225,62 @@ fn parts_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                 p.set(&k, v);
             }
         }
+        tab_cpu_json(s, &[t.key], &mut p);
         parts.push(p);
+    }
+    if let Some(f) = cpu_facts(s) {
+        let keys: Vec<_> = f.split.tabs.iter().map(|t| t.0).collect();
+        let unassigned = f.split.aterm_mc + f.split.delegated_mc
+            - f.split.own_actual()
+            - f.split.tab_actual_of(&keys);
+        let mut own = Jv::obj([
+            ("name", Jv::s("shared")),
+            (
+                "cpu_mc",
+                if f.split.own_ambiguous {
+                    Jv::at_least(f.split.own_actual().max(0) as u64, "ambiguous_reap")
+                } else {
+                    Jv::Int(f.split.own_actual())
+                },
+            ),
+            ("cpu_charge_mc", Jv::Int(f.split.own_mc)),
+            ("cpu_floor_mc", Jv::Int(f.split.own_floor_mc)),
+            ("cpu_ambiguous", Jv::Bool(f.split.own_ambiguous)),
+        ]);
+        own.set("cpu_window_ns", Jv::u(f.window_ns));
+        parts.push(own);
+        for (name, value) in [
+            ("unattributed", unassigned.max(0)),
+            ("counter_difference", unassigned.min(0)),
+        ] {
+            parts.push(Jv::obj([("name", Jv::s(name)), ("cpu_mc", Jv::Int(value))]));
+        }
+        return Jv::Arr(parts);
+    }
+    if let Some(cpu) = &s.scoped_cpu {
+        parts.push(Jv::obj([
+            ("name", Jv::s("shared")),
+            (
+                "cpu_mc",
+                Jv::at_least(
+                    (cpu.own_actual() * 1000.0).floor().max(0.0) as u64,
+                    "not_sampled",
+                ),
+            ),
+            (
+                "cpu_charge_mc",
+                Jv::Int((cpu.own_charge * 1000.0).round() as i64),
+            ),
+            (
+                "cpu_floor_mc",
+                Jv::Int((cpu.own_floor * 1000.0).floor() as i64),
+            ),
+        ]));
+        parts.push(Jv::obj([
+            ("name", Jv::s("unattributed")),
+            ("cpu_mc", Jv::why("lane_off:coalitions")),
+        ]));
+        return Jv::Arr(parts);
     }
     let me = s.procs.iter().find(|r| r.scope == RowScope::SelfProc);
     let self_cores = me.and_then(|r| r.cores).unwrap_or(0.0);
@@ -3322,10 +4305,19 @@ fn parts_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         ("name", Jv::s("helpers")),
         (
             "cpu_mc",
-            Jv::u(mc((a.cores.raw - tab_sum - self_cores).max(0.0))),
+            Jv::u(mc((a.cores.raw
+                - tab_sum
+                - self_cores
+                - s.shared.as_ref().map_or(0.0, |shared| shared.cores.raw))
+            .max(0.0))),
         ),
         ("procs", Jv::u(helpers as u64)),
     ]));
+    if let Some(shared) = &s.shared {
+        let mut part = fig_json(&Fig::of(shared));
+        part.set("name", Jv::s("shared_app"));
+        parts.push(part);
+    }
     parts.push(Jv::obj([
         ("name", Jv::s("unattributed")),
         ("cpu_mc", Jv::why("lane_off:coalitions")),
@@ -3579,7 +4571,11 @@ fn mem_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                     .tab
                     .map_or_else(|| Jv::why("gone"), |t| Jv::u(t as u64)),
             ),
-            ("footprint_bytes", Jv::known_or(tab.footprint, "refused")),
+            (
+                "footprint_bytes",
+                memory_json(tab.footprint, tab.footprint_unread),
+            ),
+            ("footprint_unread", Jv::u(u64::from(tab.footprint_unread))),
             ("slope_bytes_per_min", Jv::why("not_sampled")),
             ("exact", Jv::s("live")),
         ]),
@@ -3589,11 +4585,43 @@ fn mem_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         Jv::obj([
             (
                 "footprint_bytes",
-                Jv::known_or(s.aterm.as_ref().and_then(|a| a.footprint), "warming"),
+                s.aterm.as_ref().map_or_else(
+                    || unknown_json(s, "aterm", "warming"),
+                    |a| memory_json(a.footprint, a.footprint_unread),
+                ),
+            ),
+            (
+                "footprint_unread",
+                s.aterm.as_ref().map_or_else(
+                    || unknown_json(s, "aterm", "warming"),
+                    |a| Jv::u(u64::from(a.footprint_unread)),
+                ),
             ),
             ("exact", Jv::s("live")),
-            ("via", Jv::s("parent_chains")),
+            (
+                "via",
+                Jv::s(
+                    if s.why.as_deref().is_some_and(|facts| {
+                        facts.lane.on() && facts.at_ns == s.at_ns && !facts.split.rows.is_empty()
+                    }) {
+                        "coalitions_and_processes"
+                    } else {
+                        "processes"
+                    },
+                ),
+            ),
         ]),
+    );
+    o.set(
+        "owners",
+        MemoryReading::of(s).map_or_else(
+            || unknown_json(s, "procs", "warming"),
+            |reading| reading.json(),
+        ),
+    );
+    o.set(
+        "class_overflow_bytes",
+        Jv::u(m.sample.in_vm().saturating_sub(m.sample.total)),
     );
     let mut rows: Vec<&ProcView> = s.procs.iter().filter(|r| r.footprint.is_some()).collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.footprint));
@@ -3636,7 +4664,11 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
     o.set("cpu_mc_scope", Jv::s("process_self"));
     o.set(
         "cpu_accounting",
-        cpu_accounting_json(&r.cpu_accounting, ctx.machine.family),
+        cpu_accounting_json(
+            &r.cpu_accounting,
+            ctx.machine.family,
+            stalled_lane(s, "reaping"),
+        ),
     );
     o.set(
         "wait_mc",
@@ -3650,7 +4682,10 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
     );
     o.set("gpu_ppm", Jv::known_or(r.gpu.map(gpu_ppm), GPU_LANE_OFF));
     o.set("stat", Jv::s(r.state.word()));
-    o.set("age_ms", Jv::known_or(r.age_ms(s.at_unix_ms), BIRTH_UNREAD));
+    o.set(
+        "age_ms",
+        known_or_stalled(s, r.age_ms(s.at_unix_ms), "ages", BIRTH_UNREAD),
+    );
     o.set(
         "scheduling",
         scheduling_json(r.scheduling, ctx.machine.family),
@@ -3691,7 +4726,13 @@ fn proc_rate_why(ctx: &Ctx<'_>, r: &ProcView) -> &'static str {
     }
 }
 
-pub(super) fn cpu_accounting_json(c: &crate::model::CpuAccounting, family: &str) -> Jv {
+/// `c` as JSON; `reaping` is the lane stalled that reads whether the kernel reaps its children
+/// for it, if one is.
+pub(super) fn cpu_accounting_json(
+    c: &crate::model::CpuAccounting,
+    family: &str,
+    reaping: Option<&'static str>,
+) -> Jv {
     // Match raw hardware counters: decimal strings preserve every u64 bit.
     let raw = |value: Option<u64>, why: &str| {
         value.map_or_else(|| Jv::why(why), |v| Jv::s(v.to_string()))
@@ -3708,8 +4749,10 @@ pub(super) fn cpu_accounting_json(c: &crate::model::CpuAccounting, family: &str)
         ("child_scope", Jv::s("reaped_descendants")),
         (
             "auto_reaps_children",
-            c.auto_reaps_children
-                .map_or_else(|| Jv::why(child_why), Jv::Bool),
+            c.auto_reaps_children.map_or_else(
+                || reaping.map_or_else(|| Jv::why(child_why), Jv::stalled),
+                Jv::Bool,
+            ),
         ),
         ("counter_at_ns", raw(c.sampled_at_ns, "not_sampled")),
         ("pid_start", raw(c.start, "not_sampled")),
@@ -3793,7 +4836,7 @@ pub(crate) fn scheduling_context_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         (
             "wait_mc",
             s.global.wait.map_or_else(
-                || Jv::why("not_sampled"),
+                || unknown_json(s, "wait", "not_sampled"),
                 |w| Jv::at_least_refused(mc(w), s.global.refused),
             ),
         ),
@@ -3803,7 +4846,7 @@ pub(crate) fn scheduling_context_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         ),
         (
             "process_window_ns",
-            Jv::known_or(s.procs_window_ns, "warming"),
+            known_or_stalled(s, s.procs_window_ns, "procs", "warming"),
         ),
         (
             "finding",
@@ -3851,6 +4894,7 @@ fn program_json(ctx: &Ctx<'_>, s: &Snapshot, g: &ProgramGroup) -> Jv {
             Jv::s(match g.scope {
                 ProcScope::Tab(_) => "tab",
                 ProcScope::Aterm => "aterm",
+                ProcScope::Shared => "shared-aterm",
                 ProcScope::Other => "other",
             }),
         ),
@@ -3866,8 +4910,8 @@ fn program_json(ctx: &Ctx<'_>, s: &Snapshot, g: &ProgramGroup) -> Jv {
         "age_ms",
         match (g.age_ms(s.at_unix_ms), g.unborn) {
             (Some(age), 0) => Jv::u(age),
-            (Some(age), _) => Jv::at_least(age, BIRTH_UNREAD),
-            (None, _) => Jv::why(BIRTH_UNREAD),
+            (Some(age), _) => Jv::at_least(age, unknown_why(s, "ages", BIRTH_UNREAD)),
+            (None, _) => unknown_json(s, "ages", BIRTH_UNREAD),
         },
     );
     o
@@ -3875,7 +4919,7 @@ fn program_json(ctx: &Ctx<'_>, s: &Snapshot, g: &ProgramGroup) -> Jv {
 
 fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv {
     if s.procs_window_ns.is_none() {
-        return Jv::why("warming");
+        return stalled_lane(s, "procs").map_or_else(|| Jv::why("warming"), Jv::stalled);
     }
     let rows = procs_in_scope(ctx, s, scope);
     let unread = rows.iter().filter(|r| r.refused).count();
@@ -4055,7 +5099,12 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
     );
     o.set(
         "write_bytes_per_s",
-        Jv::known_or(f.write_bps.map(|b| b.round() as u64), "not_sampled"),
+        known_or_stalled(
+            s,
+            f.write_bps.map(|b| b.round() as u64),
+            "writes",
+            "not_sampled",
+        ),
     );
     o.set("writers", Jv::Arr(writers));
     if withheld > 0 {

@@ -3,17 +3,18 @@
 
 //! Muse Code (`muse`) terminal screen grammar, prompt/card parsers, and phase classifier.
 
-use crate::phase::{Phase, is_rule, leading_spaces, plain_rule_width};
+use crate::phase::{is_rule, leading_spaces, plain_rule_width};
 use crate::prompt::{Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Select};
 use crate::text::blank;
 use crate::turn::{CardPlace, LaunchCard};
-use crate::wall::{ApiCause, Placement, Wall, WallKind};
+use crate::wall::{Placement, Wall};
+use alab_policy::vocab::{ApiCause, Phase, WallKind};
 
 /// The Muse Code (`muse`) harness version, `MAJOR.MINOR` with no third part.
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 23, "0.23");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 24, "0.24");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -900,10 +901,10 @@ pub fn said_whole(rows: &[String]) -> bool {
 }
 
 /// Extracts earlier `◆` replies belonging to the same turn as [`said_tail`], joined
-/// ([`crate::reader::join_messages`]).
+/// ([`alab_policy::text::join_messages`]).
 #[must_use]
 pub fn turn_said_before(rows: &[String]) -> Option<String> {
-    turn_messages_before(rows).map(|m| crate::reader::join_messages(&m))
+    turn_messages_before(rows).map(|m| alab_policy::text::join_messages(&m))
 }
 
 /// [`turn_said_before`] reply by reply, oldest first.
@@ -916,7 +917,7 @@ pub fn turn_messages_before(rows: &[String]) -> Option<Vec<String>> {
 /// [`turn_said_before`], its lines read as [`said_lines`] reads them.
 #[must_use]
 pub fn turn_lines_before(rows: &[String], apart: crate::reader::Apart) -> Option<String> {
-    turn_message_lines_before(rows, apart).map(|m| crate::reader::join_messages(&m))
+    turn_message_lines_before(rows, apart).map(|m| alab_policy::text::join_messages(&m))
 }
 
 /// [`turn_lines_before`] reply by reply, oldest first.

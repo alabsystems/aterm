@@ -220,6 +220,7 @@ warm = ["m90"]
                 kind: Kind::Lease,
                 since: now - 60,
             }],
+            ranks_homes: false,
         }]),
     );
 
@@ -404,8 +405,7 @@ mod unix_relay_tests {
         let member_home = root.path().join("member-home");
         let member_state = root.path().join("member-state");
 
-        std::fs::create_dir_all(steward_home.join(".secrets")).unwrap();
-        std::fs::create_dir_all(member_home.join(".secrets")).unwrap();
+        std::fs::create_dir_all(steward_home.join(".config/aterm")).unwrap();
         std::fs::create_dir_all(member_home.join(".config/aterm")).unwrap();
         aterm_uds::private_file::ensure_private_dir(&steward_state).unwrap();
         aterm_uds::private_file::ensure_private_dir(&member_state).unwrap();
@@ -496,7 +496,7 @@ warm = ["m1"]
         .expect("member join");
         sync(&member_paths, None).expect("member sync");
 
-        // 2. Give Steward Mac a local catch-all Maildir (`ai-mailbox.toml` in admin's `.secrets/`)
+        // 2. Give Steward Mac a local catch-all Maildir (its own `mailbox.toml` beside aterm.toml)
         //    with an older mbox message (`111111`) followed by a newer message (`842917`) for m22,
         //    plus a message (`999999`) for m1's private account.
         let maildir = root.path().join("steward-catchall.mbox");
@@ -522,7 +522,9 @@ warm = ["m1"]
         );
         std::fs::write(&maildir, mbox_body).unwrap();
         std::fs::write(
-            steward_home.join(".secrets/ai-mailbox.toml"),
+            steward_home
+                .join(".config/aterm")
+                .join(crate::harness::headless_oauth::MAILBOX_TOML_FILE),
             format!("dir = \"{}\"\n", maildir.display()),
         )
         .unwrap();
@@ -591,7 +593,7 @@ warm = ["m1"]
         .unwrap()
         .unwrap();
 
-        // 5. Member `m22` discovers its mailbox config from `~/.secrets/ai-signin.toml` alone
+        // 5. Member `m22` discovers its mailbox config from the vault's `ai-signin.toml` alone
         //    (no local mailbox!) and polls for `m22-catchall@example.com`.
         let member_store_dir = member_state.join("accounts");
         std::fs::create_dir_all(&member_store_dir).unwrap();
@@ -1064,6 +1066,7 @@ fn denied_member_stale_claim_cannot_block_active_member_mail_code() {
                 kind: Kind::Lease,
                 since: now - 500,
             }],
+            ranks_homes: false,
         },
         Row {
             machine: "00000000000000000000000000000012".to_owned(),
@@ -1075,6 +1078,7 @@ fn denied_member_stale_claim_cannot_block_active_member_mail_code() {
                 kind: Kind::Lease,
                 since: now - 100,
             }],
+            ranks_homes: false,
         },
     ]);
     let view = View {
@@ -1131,14 +1135,14 @@ fn read_standby_steward_labels_filters_denied_stewards() {
         roster.to_toml().as_bytes(),
     )
     .expect("set roster");
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        aterm_secrets::entry_class::SWARM_POLICY_FILE,
+        b"[[steward]]\nlabel = \"m2\"\nrank = 1\nalways_on = true\n\n[[steward]]\nlabel = \"m22\"\nrank = 2\nalways_on = true\n",
+    )
+    .expect("set policy");
     aterm_secrets::client::admin_publish(&paths, &adm, &doc).expect("publish");
     aterm_secrets::client::sync(&paths, None).expect("sync");
-
-    std::fs::write(
-        home_dir.path().join(".secrets/swarm-policy.toml"),
-        "[[steward]]\nlabel = \"m2\"\nrank = 1\nalways_on = true\n\n[[steward]]\nlabel = \"m22\"\nrank = 2\nalways_on = true\n",
-    )
-    .unwrap();
 
     let pass = || {
         let roster = ai_pool::read_pass_roster(&paths).unwrap();
@@ -1220,18 +1224,6 @@ fn authorize_mail_code_refuses_mismatched_claimed_label_and_prefers_readmitted_r
     .expect("re-admitted m22 row must be authorized");
     assert_eq!(auth.label, "m22");
     assert_eq!(auth.recipient, m22_new_id.recipient());
-
-    #[cfg(unix)]
-    {
-        let dir = aterm_tempfile::tempdir().expect("tempdir");
-        let secrets = dir.path().join(".secrets");
-        std::fs::create_dir_all(&secrets).expect("secrets dir");
-        let outside = dir.path().join("outside-policy.toml");
-        std::fs::write(&outside, "stewards = [\"injected\"]\n").expect("outside");
-        std::os::unix::fs::symlink(&outside, secrets.join("swarm-policy.toml"))
-            .expect("symlink policy");
-        assert!(read_standby_steward_labels(dir.path(), None).is_empty());
-    }
 }
 
 #[test]
@@ -1266,6 +1258,7 @@ fn authorize_mail_code_rejects_forged_row_label_from_other_bound_member_and_hono
             kind: Kind::Lease,
             since: now - 60,
         }],
+        ranks_homes: false,
     }]);
     let claims = (View::default(), forged_book);
     assert_eq!(
@@ -1286,6 +1279,7 @@ fn authorize_mail_code_rejects_forged_row_label_from_other_bound_member_and_hono
                 kind: Kind::Lease,
                 since: now - 500,
             }],
+            ranks_homes: false,
         },
         Row {
             machine: "node-m10".to_owned(),
@@ -1297,6 +1291,7 @@ fn authorize_mail_code_rejects_forged_row_label_from_other_bound_member_and_hono
                 kind: Kind::Lease,
                 since: now - 60,
             }],
+            ranks_homes: false,
         },
     ]);
     let claims = (View::default(), machine_book);

@@ -1304,12 +1304,115 @@ fn init_journals_nothing_when_every_item_is_already_right() {
     assert!(!scratch.path().join(FileJournal::DIR).exists());
 }
 
+/// [`writes_no_private_row`] passes the Repositories stage's items and the sync lane's own ids,
+/// and no other item a person's whole run composes: every item built for a row System State
+/// reads privately (each Mac setting, both sign-outs, Rust in Spotlight) is held to write one,
+/// so a change journaled under it drops that row's kept reading. The ids are the real items',
+/// as [`groups`] builds them with each one's row.
+/// NEGATIVE CONTROL: with the predicate passing every id, the first privately read row's item
+/// fails here; with [`crate::init_github::names_item`] passing none, the Repositories items do.
+#[test]
+fn only_the_sync_lane_and_the_repositories_stage_write_no_private_row() {
+    use aterm_types::macos_setup::Subject;
+    let alice = at_console(user("alice", 501));
+    let mut sys = Fake::root();
+    sys.euid = 501;
+    let profile = b"[github]\naccount='octocat'\nowner='octocat'\n";
+    let path = "/Users//alice/.config/aterm/init.toml";
+    sys.file(path, profile).stat_of(
+        path,
+        Stat {
+            uid: 501,
+            gid: 20,
+            mode: 0o600,
+            dir: false,
+            symlink: false,
+            len: profile.len() as u64,
+        },
+    );
+    let github = crate::init_github::items(&sys, &alice, None).unwrap();
+    let repositories: Vec<String> = github.iter().map(|item| item.id()).collect();
+    assert_eq!(repositories.len(), 2, "{repositories:?}");
+    let spotlight: Vec<String> = spotlight(&alice, crate::init_spotlight::Projects::Noted)
+        .iter()
+        .map(|item| item.id())
+        .chain([crate::init_spotlight::Scope.id()])
+        .collect();
+    let (groups, rows) = groups(
+        &alice,
+        Presence::AtConsole,
+        crate::init_spotlight::Projects::Noted,
+        crate::init_secrets::Secrets {
+            items: Vec::new(),
+            waited_on: None,
+        },
+        github,
+        &KeyboardRead::EMPTY,
+        Selection::all(),
+        &[],
+        true,
+        None,
+    );
+    let private: Vec<Setting> = Setting::ALL
+        .into_iter()
+        .filter(|setting| Subject::Setting(*setting).reads_privately())
+        .collect();
+    assert_eq!(private.len(), 9, "{private:?}");
+    for setting in private {
+        let writers: Vec<&String> = if setting == Setting::Spotlight {
+            spotlight.iter().collect()
+        } else {
+            rows.iter()
+                .filter(|(_, row)| *row == setting)
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert!(!writers.is_empty(), "{setting:?} has an item");
+        for id in writers {
+            assert!(!writes_no_private_row(id), "{setting:?}: {id}");
+        }
+    }
+    let composed: Vec<String> = groups
+        .iter()
+        .flat_map(|(items, _)| items.iter().map(|item| item.id()))
+        .collect();
+    assert!(spotlight[..3].iter().all(|id| composed.contains(id)));
+    for id in &composed {
+        assert_eq!(
+            writes_no_private_row(id),
+            repositories.contains(id),
+            "{id} of {composed:?}"
+        );
+    }
+    for id in [
+        crate::sync::REQUESTS.to_owned(),
+        crate::sync::CLONE.to_owned(),
+        crate::sync::IDENTITY.to_owned(),
+        format!("{}@alice", crate::clone_tuning::ID),
+    ] {
+        assert!(writes_no_private_row(&id), "{id}");
+    }
+    for id in [
+        crate::init_github::ID,
+        "init.github.",
+        "init.githubs.native@alice",
+        crate::sync::BASE,
+        crate::sync::FAMILY,
+        "sync.dock",
+        "sync.repository-prerequisites",
+        "github.key@alice",
+        "",
+    ] {
+        assert!(!writes_no_private_row(id), "{id:?}");
+    }
+}
+
 #[test]
 fn init_places_every_item_at_the_workstation_layer_run_at_the_console() {
     let alice = ctx(&[user("alice", 501)]);
     let mut sys = Fake::root();
     sys.euid = 501;
-    let profile = b"[github]\naccount='octocat'\nowner='octocat'\ntoken_file='~/.secrets/github'\n";
+    let profile = b"[github]\naccount='octocat'\nowner='octocat'\n";
     let path = "/Users//alice/.config/aterm/init.toml";
     sys.file(path, profile).stat_of(
         path,
@@ -1352,8 +1455,8 @@ fn init_places_every_item_at_the_workstation_layer_run_at_the_console() {
         .collect();
     assert_eq!(
         github.len(),
-        3,
-        "the keychain block, the GitHub sign-in and checkouts: {github:?}"
+        2,
+        "the keychain block and the repository stage: {github:?}"
     );
     assert!(github.iter().all(|id| id.contains("github")), "{github:?}");
     let asked: Vec<String> = bound
@@ -4322,7 +4425,6 @@ fn fleet_inventory_clones_without_an_earlier_init_and_respects_holds() {
             total: 1
         },
     );
-    let path = Path::new(&who.home).join(".secrets/github-repositories.json");
     let bytes = aterm_json::to_vec(&aterm_json::json!({
         "schema":2,"account":"alice","repositories":[{
             "id":2,"name":"new-code","owner":{"login":"alice"},
@@ -4331,16 +4433,10 @@ fn fleet_inventory_clones_without_an_earlier_init_and_respects_holds() {
         }]
     }))
     .unwrap();
-    sys.file(path.to_str().unwrap(), &bytes).stat_of(
-        path.to_str().unwrap(),
-        Stat {
-            uid: 501,
-            gid: 20,
-            mode: 0o600,
-            dir: false,
-            symlink: false,
-            len: bytes.len() as u64,
-        },
+    sys.vault_set(
+        &who.home,
+        aterm_secrets::entry_class::GITHUB_REPOSITORIES,
+        &bytes,
     );
     assert!(matches!(
         owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
@@ -8819,17 +8915,10 @@ fn a_clone_the_person_named_is_not_forgotten_by_the_vaults_sync() {
     note_owed(&[waiting], Action::Apply, Some(&state), &picked.start).unwrap();
     // The vault's token lands; System State still holds the group, as it did.
     let (sys, _) = alice();
-    let token = "/Users//alice/.secrets/gh_access_token";
-    sys.file(token, b"fixture_token_only").stat_of(
-        token,
-        Stat {
-            uid: 501,
-            gid: 20,
-            mode: 0o600,
-            dir: false,
-            symlink: false,
-            len: 18,
-        },
+    sys.vault_set(
+        "/Users//alice",
+        crate::init_github::TOKEN_ENTRY,
+        b"fixture_token_only",
     );
     let cloned = AtomicBool::new(false);
     let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {

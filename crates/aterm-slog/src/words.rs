@@ -5,7 +5,7 @@
 
 use crate::vocab::{BOX_WORDS, NEED_WORDS, OUT_WORDS, UNKNOWN, WALL_WORDS, lookup};
 
-/// A wall kind (`aterm_phase::WallKind::name()`'s words).
+/// A wall kind (`alab_policy::vocab::WallKind::name()`'s words).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WallKind {
     /// `usage-session`.

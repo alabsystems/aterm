@@ -8,7 +8,7 @@
 use super::*;
 
 /// `count` tables two writers hold, each empty on both, sorted by digest.
-fn tables(lab: &Lab, count: usize) -> Vec<(Scope, [PathBuf; 2])> {
+pub(crate) fn tables(lab: &Lab, count: usize) -> Vec<(Scope, [PathBuf; 2])> {
     let mut tables: Vec<_> = (0..count)
         .map(|table| {
             let paths: [PathBuf; 2] = std::array::from_fn(|node| {
@@ -28,7 +28,7 @@ fn tables(lab: &Lab, count: usize) -> Vec<(Scope, [PathBuf; 2])> {
     tables
 }
 
-fn endpoint(lab: &Lab, tables: &[(Scope, [PathBuf; 2])], node: usize) -> Endpoint {
+pub(crate) fn endpoint(lab: &Lab, tables: &[(Scope, [PathBuf; 2])], node: usize) -> Endpoint {
     Endpoint::from_bootstrap(&lab.bootstrap(node))
         .unwrap()
         .unwrap()
@@ -43,7 +43,7 @@ fn endpoint(lab: &Lab, tables: &[(Scope, [PathBuf; 2])], node: usize) -> Endpoin
 }
 
 /// Mac `node` writes one record to `table`.
-fn write(lab: &Lab, tables: &[(Scope, [PathBuf; 2])], table: usize, node: usize) {
+pub(crate) fn write(lab: &Lab, tables: &[(Scope, [PathBuf; 2])], table: usize, node: usize) {
     let bootstrap = lab.bootstrap(node);
     let session = Session::open(&bootstrap).unwrap();
     let (scope, paths) = &tables[table];
@@ -54,7 +54,12 @@ fn write(lab: &Lab, tables: &[(Scope, [PathBuf; 2])], table: usize, node: usize)
 }
 
 /// The records Mac `node` holds of `table`.
-fn held(lab: &Lab, tables: &[(Scope, [PathBuf; 2])], table: usize, node: usize) -> usize {
+pub(crate) fn held(
+    lab: &Lab,
+    tables: &[(Scope, [PathBuf; 2])],
+    table: usize,
+    node: usize,
+) -> usize {
     let bootstrap = lab.bootstrap(node);
     let session = Session::open(&bootstrap).unwrap();
     let (scope, paths) = &tables[table];
@@ -214,7 +219,7 @@ fn measure_receipt_hint_work_after(settled: bool, writer_reference: bool) {
 }
 
 /// The table the initiator's last round selected, by its place in `tables`.
-fn selected(repair: &PeerRepair, tables: &[(Scope, [PathBuf; 2])]) -> usize {
+pub(super) fn selected(repair: &PeerRepair, tables: &[(Scope, [PathBuf; 2])]) -> usize {
     let table = repair.application().unwrap().table;
     tables
         .iter()
@@ -316,18 +321,23 @@ fn a_peer_from_before_cr1_neither_asks_nor_answers_and_keeps_the_scan() {
     }
 }
 
-/// C3: a table this side wrote to and its endpoint announced is its next round's, ahead of the
-/// scan's turn and without asking the peer anything, and the scan goes on from where it was.
-/// An append whose table went unnamed has the next round ask which tables differ, inside the
-/// gap it would otherwise wait out, and the table that differs is taken the same way: the
-/// scan's place stays. The endpoint keeps each peer's hint and a round starts from that copy,
-/// so the announce goes to the endpoint, not into the caller's repair.
+/// C3: a table the dial scheduler led this side's round with ([`PeerRepair::lead`], what a walk
+/// hands a dial for a table that moved here) is its next round's, ahead of the scan's turn and
+/// without asking the peer anything, and the scan goes on from where it was. An ask
+/// ([`PeerRepair::ask`]) inside the gap the round would otherwise wait out finds the table that
+/// differs, which is taken first, and the scan's place stays. The endpoint keeps each peer's
+/// hint and a round starts from that copy; the lead goes with the round's request, which the
+/// lease keeps.
 ///
-/// NEGATIVE CONTROL (2026-11-12): with [`Repair::announce`] naming no table, the round after the
-/// write took the scan's next table (`the announced table, not the scan's next`: `left: (1,
+/// The merge of 2026-11-13 ported this law from main's announce, which named the table to the
+/// endpoint's every hint, to the lead the walk hands one dial; an unnamed append, which no look
+/// makes, became the ask.
+///
+/// NEGATIVE CONTROL (2026-11-12, as an announce): with the announce naming no table, the round
+/// after the write took the scan's next table (`the led table, not the scan's next`: `left: (1,
 /// false)`, `right: (3, false)`).
 #[test]
-fn an_announced_table_is_the_next_rounds_before_the_scans_turn() {
+fn a_led_table_is_the_next_rounds_before_the_scans_turn() {
     let lab = Lab::new(&[Role::Writer; 2]);
     let tables = tables(&lab, 4);
     let endpoints = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
@@ -344,11 +354,11 @@ fn an_announced_table_is_the_next_rounds_before_the_scans_turn() {
     );
 
     write(&lab, &tables, 3, 0);
-    endpoints[0].announce(&BTreeSet::from([tables[3].0.digest()]), false);
+    assert!(ours.lead(tables[3].0.digest()));
     assert_eq!(
         round(&mut ours),
         (3, false),
-        "the announced table, not the scan's next"
+        "the led table, not the scan's next"
     );
     assert_eq!(
         held(&lab, &tables, 3, 1),
@@ -362,11 +372,11 @@ fn an_announced_table_is_the_next_rounds_before_the_scans_turn() {
     );
 
     write(&lab, &tables, 0, 0);
-    endpoints[0].announce(&BTreeSet::new(), true);
+    ours.ask();
     assert_eq!(
         round(&mut ours),
         (0, true),
-        "an unnamed append asks, and the table that differs comes first"
+        "an ask finds the table that differs, which comes first"
     );
     assert_eq!(held(&lab, &tables, 0, 1), 1);
     assert_eq!(
@@ -376,84 +386,113 @@ fn an_announced_table_is_the_next_rounds_before_the_scans_turn() {
     );
 }
 
-/// Announced tables leave the regular scan its place and its turns, over four common tables
-/// and rounds that move nothing. With table 3 announced before every second round, the rounds
-/// between go on through tables 1, 2, 3 and 0: every table is selected within eight rounds.
-/// With it announced before every round, each fifth round is the scan's (the `TABLE_BURST`th
-/// announced round in a row yields to it): every table is selected within fifteen. And two
-/// tables announced before every round take turns.
+/// Led tables leave the regular scan its place and its turns, over four common tables and
+/// rounds that move nothing. With table 3 led before every second round, the rounds between go
+/// on through tables 1, 2, 3 and 0: every table is selected within eight rounds. With it led
+/// before every round, each fifth round is the scan's (the `TABLE_BURST`th led round in a row
+/// yields to it): every table is selected within fifteen. And two tables led before every round
+/// take turns.
 ///
-/// NEGATIVE CONTROL (2026-11-12): with [`Repair::announce`] naming its tables among those whose
-/// witnesses differed, which the regular turn visits and follows, as it did, tables 1 and 2
-/// were never selected (`announced before every second round: the scan keeps its place
-/// between`: `left: [3, 0, 3, 0, 3, 0, 3, 0]`, `right: [3, 1, 3, 2, 3, 3, 3, 0]`).
-/// NEGATIVE CONTROL (2026-11-12): with an announced table's round never yielding, the scan had
-/// no round (`announced before every round: each fifth round is the scan's`: `left: [3, 3, 3,
-/// 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]`).
-/// NEGATIVE CONTROL (2026-11-12): with the announced table taken always the first of them,
-/// table 3 waited behind table 1 (`two announced tables take turns`: `left: [1, 1, 1, 1]`,
-/// `right: [1, 3, 1, 3]`).
+/// The merge of 2026-11-13 ported this law from main's announced tables to the leads that
+/// replaced them, with the same sequences.
+///
+/// NEGATIVE CONTROL (2026-11-12, as an announce): with the announced tables kept among those
+/// whose witnesses differed, which the regular turn visits and follows, tables 1 and 2 were
+/// never selected (`left: [3, 0, 3, 0, 3, 0, 3, 0]`); `a_lead_survives_the_witness_answer`
+/// holds the lead out of that set (`LEAD_IN_DIFFERING`).
+/// MUTANT (`LEADS_UNYIELDING`): a run of led rounds never yields, and the scan has no round
+/// (`led before every round: each fifth round is the scan's`).
+/// NEGATIVE CONTROL (2026-11-12, as an announce): with the announced table taken always the
+/// first of them, table 3 waited behind table 1 (`two led tables take turns`: `left: [1, 1, 1,
+/// 1]`, `right: [1, 3, 1, 3]`).
 #[test]
-fn announced_tables_leave_the_scan_its_place_and_its_turns() {
-    let lab = Lab::new(&[Role::Writer; 2]);
-    let tables = tables(&lab, 4);
-    let endpoints = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
-    let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
-    // The tables `rounds` rounds select, `announced` named to the endpoint before each round
-    // whose number `when` passes.
-    let mut rounds = |rounds: usize, announced: &[usize], when: &dyn Fn(usize) -> bool| {
-        let named: BTreeSet<_> = announced.iter().map(|n| tables[*n].0.digest()).collect();
-        (0..rounds)
-            .map(|n| {
-                if when(n) {
-                    endpoints[0].announce(&named, false);
-                }
-                exchange_round(&endpoints[0], &endpoints[1], &mut ours, &mut theirs);
-                selected(&ours, &tables)
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(rounds(1, &[], &|_| false), [0], "the scan's first table");
-    assert_eq!(
-        rounds(8, &[3], &|n| n % 2 == 0),
-        [3, 1, 3, 2, 3, 3, 3, 0],
-        "announced before every second round: the scan keeps its place between"
-    );
-    assert_eq!(
-        rounds(15, &[3], &|_| true),
-        [3, 3, 3, 3, 1, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3],
-        "announced before every round: each fifth round is the scan's"
-    );
-    assert_eq!(
-        rounds(4, &[1, 3], &|_| true),
-        [1, 3, 1, 3],
-        "two announced tables take turns"
-    );
+fn led_tables_leave_the_scan_its_place_and_its_turns() {
+    for unyielding in [false, true] {
+        let lab = Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, 4);
+        let endpoints = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
+        let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
+        // The tables `rounds` rounds select, `led` asked of the round before each whose number
+        // `when` passes.
+        let mut rounds = |rounds: usize, led: &[usize], when: &dyn Fn(usize) -> bool| {
+            (0..rounds)
+                .map(|n| {
+                    if when(n) {
+                        for table in led {
+                            assert!(ours.lead(tables[*table].0.digest()));
+                        }
+                    }
+                    LEADS_UNYIELDING.with(|flag| flag.set(unyielding));
+                    exchange_round(&endpoints[0], &endpoints[1], &mut ours, &mut theirs);
+                    LEADS_UNYIELDING.with(|flag| flag.set(false));
+                    selected(&ours, &tables)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rounds(1, &[], &|_| false), [0], "the scan's first table");
+        assert_eq!(
+            rounds(8, &[3], &|n| n % 2 == 0),
+            [3, 1, 3, 2, 3, 3, 3, 0],
+            "led before every second round: the scan keeps its place between"
+        );
+        let every = rounds(15, &[3], &|_| true);
+        if unyielding {
+            assert_eq!(every, [3; 15], "MUTANT: the scan has no round");
+            continue;
+        }
+        assert_eq!(
+            every,
+            [3, 3, 3, 3, 1, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3],
+            "led before every round: each fifth round is the scan's"
+        );
+        assert_eq!(
+            rounds(4, &[1, 3], &|_| true),
+            [1, 3, 1, 3],
+            "two led tables take turns"
+        );
+    }
 }
 
-/// An announce names at most a round's list of tables ([`MAX_TABLES`]); one past that, like an
-/// append whose table went unnamed, has the next round ask for witnesses instead.
+/// A lead names at most a round's list of tables ([`MAX_TABLES`]): one past that is not kept,
+/// and the scan reaches its table at its turn. A table led already is led once.
 ///
-/// NEGATIVE CONTROL (2026-11-12): with [`Repair::announce`] naming no table, the hint named
-/// none of the 64 (`left: ({}, false)`).
+/// The merge of 2026-11-13 ported this law from main's announce, which asked for witnesses past
+/// the bound; a lead past it is refused instead, and the walk's dial still settles its seat.
 #[test]
-fn an_announce_past_a_lists_bound_asks_for_witnesses() {
+fn a_lead_past_a_lists_bound_is_not_kept() {
     let table = |n: u8| -> Digest { [n; 32] };
-    let listed = || Repair {
-        listed_ms: Some(1),
-        ..Repair::default()
-    };
-    let full: BTreeSet<_> = (0..MAX_TABLES).map(|n| table(n as u8)).collect();
-    let mut repair = listed();
-    repair.announce(&full, false);
-    assert_eq!(repair.announced(), (&full, false));
-    repair.announce(&BTreeSet::from([table(3)]), false);
-    assert_eq!(repair.announced(), (&full, false), "a table named already");
-    repair.announce(&BTreeSet::from([table(200)]), false);
-    assert_eq!(repair.announced(), (&full, true), "one past the bound asks");
-    let mut repair = listed();
-    repair.announce(&BTreeSet::new(), true);
-    assert_eq!(repair.announced(), (&BTreeSet::new(), true));
+    let mut repair = Repair::default();
+    for n in 0..MAX_TABLES {
+        assert!(repair.lead(table(n as u8)), "table {n} of a full list");
+    }
+    assert!(repair.lead(table(3)), "a table led already");
+    assert!(!repair.lead(table(200)), "one past the bound is not kept");
+    assert!(repair.pending());
+}
+
+/// A round that trades table lists leaves, on both sides, which tables both listed
+/// ([`PeerRepair::lists`]): a table one side holds and the other does not list is left out, and
+/// a peer no round traded lists with tells nothing. The dial scheduler's walk passes a seat over
+/// for a table its last lists left out (`crate::runtime::discovery`).
+/// NEGATIVE CONTROL (2026-11-13, by an inverse edit then undone): with the table exchange
+/// keeping no listing, `the initiator` read none for each table.
+#[test]
+fn a_round_leaves_which_tables_both_sides_listed() {
+    let lab = Lab::new(&[Role::Writer; 2]);
+    let tables = tables(&lab, 3);
+    let digest = |table: usize| tables[table].0.digest();
+    // Mac 1 lists only the first two.
+    let endpoints = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables[..2], 1)];
+    let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
+    assert!(ours.listed().is_none(), "no round has traded lists");
+    exchange_round(&endpoints[0], &endpoints[1], &mut ours, &mut theirs);
+    for (side, repair) in [("initiator", &ours), ("responder", &theirs)] {
+        assert_eq!(
+            [0, 1, 2].map(|table| repair.listed().map(|lists| lists.contains(&digest(table)))),
+            [Some(true), Some(true), Some(false)],
+            "the {side}"
+        );
+    }
 }
 
 /// Two rounds on `tables`' first table, unreadable on Mac 1 (its checkpoint gone), each deferred,

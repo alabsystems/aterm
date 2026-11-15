@@ -18,7 +18,11 @@ fn directory_listing_is_sorted_bounded_and_granted_read_only() {
         .grant_admitted(admitted, GrantAccess::ReadWrite)
         .unwrap();
     assert_eq!(granted.grant.access, GrantAccess::ReadOnly);
-    let listing = granted.directory.unwrap();
+    let mut documents = crate::test_document_store();
+    let document = documents
+        .open_prepared(uri.clone(), granted.prepared_text.clone())
+        .unwrap();
+    let listing = documents.directory(document).unwrap();
     assert!(listing.text.find("folder/").unwrap() < listing.text.find(".hidden").unwrap());
     assert!(listing.text.find(".hidden").unwrap() < listing.text.find("z.txt").unwrap());
     assert_eq!(listing.entries.len(), 4);
@@ -134,7 +138,7 @@ fn local_uri_is_canonical_bounded_and_reuses_grant() {
     let second = grants
         .open_local(&uri, GrantAccess::ReadWrite, DEFAULT_DOCUMENT_LIMIT)
         .unwrap();
-    assert_eq!(first.text, "# hello\n");
+    assert_eq!(first.text.as_str(), "# hello\n");
     assert_eq!(first.grant.id, second.grant.id);
     assert_eq!(second.grant.access, GrantAccess::ReadWrite);
 }
@@ -161,11 +165,14 @@ fn open_document(path: &Path, options: AdmitOptions) -> OpenDocument {
         .grant_admitted(admitted, GrantAccess::ReadWrite)
         .unwrap();
     let mut documents = crate::test_document_store();
-    let document = documents.open(granted.grant.canonical_uri.clone(), granted.text.clone());
-    let mut persistence = DocumentPersistenceStore::default();
-    persistence
-        .register(document, granted.grant.id, granted.observed, &granted.text)
+    let document = documents
+        .open_prepared(
+            granted.grant.canonical_uri.clone(),
+            granted.prepared_text.clone(),
+        )
         .unwrap();
+    let mut persistence = DocumentPersistenceStore::default();
+    persistence.register_prepared(document, &granted).unwrap();
     OpenDocument {
         grants,
         persistence,
@@ -221,7 +228,7 @@ fn missing_with_allow_missing_is_empty_and_first_save_creates() {
     fs::remove_file(&path).unwrap();
     let admitted = admit_local_file_opts(&file_uri(&path), ALLOW_MISSING).unwrap();
     assert!(admitted.is_missing());
-    assert_eq!(admitted.text, "");
+    assert_eq!(admitted.text.as_str(), "");
     assert_eq!(admitted.encoding(), DiskEncoding::PLAIN);
 
     let mut opened = open_document(&path, ALLOW_MISSING);
@@ -317,7 +324,7 @@ fn bom_round_trips_byte_exact() {
         .grants
         .refresh_local(opened.granted.grant.id, DEFAULT_DOCUMENT_LIMIT)
         .unwrap();
-    assert_eq!(refreshed.text, opened.text());
+    assert_eq!(refreshed.text.as_str(), opened.text());
 }
 
 /// A file whose every line ends in CRLF is held with LF and saved with
@@ -349,7 +356,7 @@ fn crlf_file_round_trips_with_lf_in_buffer() {
             .grants
             .refresh_local(opened.granted.grant.id, DEFAULT_DOCUMENT_LIMIT)
             .unwrap();
-        assert_eq!(refreshed.text, "one\ntwo\nthree\n", "{name}");
+        assert_eq!(refreshed.text.as_str(), "one\ntwo\nthree\n", "{name}");
         assert!(
             opened
                 .persistence
@@ -532,7 +539,7 @@ fn a_save_read_back_another_way_is_unchanged() {
             .grants
             .refresh_local(opened.granted.grant.id, DEFAULT_DOCUMENT_LIMIT)
             .unwrap();
-        assert_eq!(refreshed.text, reading, "{name}: the fresh read");
+        assert_eq!(refreshed.text.as_str(), reading, "{name}: the fresh read");
         assert_eq!(refreshed.observed.encoding(), encoding, "{name}");
         let baseline = opened.persistence.observed(opened.document).unwrap();
         assert_eq!(
@@ -750,7 +757,7 @@ fn a_missing_document_refreshes_as_missing_until_its_file_appears() {
         .refresh_local_allowing_missing(id, DEFAULT_DOCUMENT_LIMIT)
         .unwrap();
     assert!(!absent.observed.exists);
-    assert_eq!(absent.text, "");
+    assert_eq!(absent.text.as_str(), "");
     assert_eq!(
         crate::io::detect_version_conflict(opened.granted.observed, absent.observed),
         None
@@ -762,7 +769,7 @@ fn a_missing_document_refreshes_as_missing_until_its_file_appears() {
         .refresh_local_allowing_missing(id, DEFAULT_DOCUMENT_LIMIT)
         .unwrap();
     assert!(appeared.observed.exists);
-    assert_eq!(appeared.text, "from elsewhere\n");
+    assert_eq!(appeared.text.as_str(), "from elsewhere\n");
     assert_eq!(
         crate::io::detect_version_conflict(opened.granted.observed, appeared.observed),
         Some(crate::io::VersionConflict::Existence)
@@ -790,7 +797,8 @@ fn open_path_resolves_a_symlinked_parent() {
     assert_eq!(
         admit_local_file_opts(&uri, AdmitOptions::DOCUMENT)
             .unwrap()
-            .text,
+            .text
+            .as_str(),
         "here\n"
     );
 
@@ -860,7 +868,7 @@ fn admission_then_grant_matches_the_synchronous_open() {
     let path = unique_file("two-phase", b"# split\n");
     let uri = file_uri(&path);
     let admitted = admit_local_file(&uri, DEFAULT_DOCUMENT_LIMIT, false).unwrap();
-    assert_eq!(admitted.text, "# split\n");
+    assert_eq!(admitted.text.as_str(), "# split\n");
     assert!(admitted.canonical_uri.starts_with("file:///"));
     assert!(admitted.path.is_absolute());
 
@@ -873,7 +881,7 @@ fn admission_then_grant_matches_the_synchronous_open() {
         .unwrap();
     assert_eq!(first.grant.id, second.grant.id);
     assert_eq!(second.grant.access, GrantAccess::ReadWrite);
-    assert_eq!(first.text, "# split\n");
+    assert_eq!(first.text.as_str(), "# split\n");
     assert_eq!(first.observed, second.observed);
 
     let direct = grants
@@ -887,6 +895,277 @@ fn admission_then_grant_matches_the_synchronous_open() {
             Err(DocumentHostError::Io { .. })
         ),
         "a missing file fails at admission, before any grant state exists"
+    );
+}
+
+/// A minted grant has no prior; a repeat grant hands back the grant as it stood before it
+/// widened it, and [`DocumentGrantStore::reinstate`] puts that back under the same id: an
+/// open that widened a read-only grant and then failed to install leaves it read-only.
+#[test]
+fn a_repeat_grant_names_its_prior_and_reinstate_puts_it_back() {
+    let path = unique_file("reinstate", b"# kept\n");
+    let uri = file_uri(&path);
+    let mut grants = DocumentGrantStore::new();
+    let first = grants
+        .open_local(&uri, GrantAccess::ReadOnly, DEFAULT_DOCUMENT_LIMIT)
+        .unwrap();
+    assert!(first.prior.is_none(), "a minted grant names no prior");
+    let id = first.grant.id;
+
+    let widened = grants
+        .open_local(&uri, GrantAccess::ReadWrite, DEFAULT_DOCUMENT_LIMIT)
+        .unwrap();
+    let prior = widened
+        .prior
+        .expect("a repeat grant names the grant it changed");
+    assert_eq!(widened.grant.id, id);
+    assert_eq!(prior.id, id);
+    assert_eq!(prior.access, GrantAccess::ReadOnly);
+    assert_eq!(grants.get(id).unwrap().access, GrantAccess::ReadWrite);
+
+    grants.reinstate(prior);
+    let restored = grants.get(id).expect("the reinstated grant keeps its id");
+    assert_eq!(restored.access, GrantAccess::ReadOnly);
+    assert_eq!(restored.target(), first.grant.target());
+    assert_eq!(grants.id_for_uri(&first.grant.canonical_uri), Some(id));
+}
+
+/// [`DocumentGrantStore::reinstate`] puts back a grant's binding exactly: a repeat open by
+/// another spelling of the same file adds a logical binding, and reinstating its prior drops it.
+#[cfg(unix)]
+#[test]
+fn reinstate_drops_the_binding_a_failed_open_added() {
+    use std::os::unix::fs::symlink;
+
+    let scratch = crate::test_scratch_dir("reinstate-binding");
+    let dir = scratch.path();
+    let real = dir.join("real.toml");
+    let logical = dir.join("aterm.toml");
+    fs::write(&real, "theme = \"Default\"\n").unwrap();
+    owner_only(&real);
+    symlink("real.toml", &logical).unwrap();
+
+    let mut grants = DocumentGrantStore::new();
+    let first = grants
+        .open_local_config(&file_uri(&logical), GrantAccess::ReadOnly, 4096)
+        .unwrap();
+    let id = first.grant.id;
+    let again = grants
+        .open_local_config(&file_uri(&real), GrantAccess::ReadWrite, 4096)
+        .unwrap();
+    assert_eq!(again.grant.id, id);
+    assert_ne!(
+        grants.get(id).unwrap().target(),
+        first.grant.target(),
+        "the second spelling is bound beside the first"
+    );
+
+    grants.reinstate(again.prior.expect("a repeat grant names its prior"));
+    let restored = grants.get(id).expect("the reinstated grant keeps its id");
+    assert_eq!(restored.target(), first.grant.target());
+    assert_eq!(restored.access, GrantAccess::ReadOnly);
+}
+
+#[test]
+fn prepared_grant_commit_does_no_path_io_and_later_use_still_revalidates() {
+    let scratch = crate::test_scratch_dir("prepared-no-io");
+    let parent = scratch.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    let path = parent.join("document.md");
+    fs::write(&path, "admitted text").unwrap();
+    let admitted = admit_local_file(&file_uri(&path), DEFAULT_DOCUMENT_LIMIT, false).unwrap();
+    let mut grants = DocumentGrantStore::new();
+    let opened = grants
+        .grant_admitted(admitted.clone(), GrantAccess::ReadOnly)
+        .unwrap();
+    let prepared = DocumentGrantStore::prepare_admitted(
+        admitted.clone(),
+        GrantAccess::ReadWrite,
+        Some(opened.grant.clone()),
+    )
+    .unwrap();
+
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(&parent).unwrap();
+    fs::write(&parent, "the former parent is now a file").unwrap();
+    assert!(
+        opened.grant.validate_current_binding().is_err(),
+        "a fresh path walk must fail"
+    );
+    assert!(
+        DocumentGrantStore::prepare_admitted(
+            admitted,
+            GrantAccess::ReadOnly,
+            Some(opened.grant.clone()),
+        )
+        .is_err(),
+        "preparation still validates physical binding"
+    );
+
+    let committed = grants.grant_prepared(prepared).unwrap();
+    assert_eq!(committed.grant.id, opened.grant.id);
+    assert_eq!(committed.grant.target(), opened.grant.target());
+    assert_eq!(committed.text.as_str(), "admitted text");
+    assert_eq!(committed.observed, opened.observed);
+    assert_eq!(committed.grant.access, GrantAccess::ReadWrite);
+    assert!(
+        committed.grant.validate_current_binding().is_err(),
+        "publishing a prepared observation does not waive later validation"
+    );
+}
+
+#[test]
+fn prepared_grants_refuse_missing_replaced_or_newly_created_logical_identity() {
+    let path = unique_file("prepared-stale", b"text");
+    let admitted = admit_local_file(&file_uri(&path), DEFAULT_DOCUMENT_LIMIT, false).unwrap();
+    for replace in [false, true] {
+        let mut grants = DocumentGrantStore::new();
+        let opened = grants
+            .grant_admitted(admitted.clone(), GrantAccess::ReadOnly)
+            .unwrap();
+        let prepared = DocumentGrantStore::prepare_admitted(
+            admitted.clone(),
+            GrantAccess::ReadWrite,
+            Some(opened.grant.clone()),
+        )
+        .unwrap();
+        grants.forget(opened.grant.id);
+        let replacement = replace.then(|| {
+            grants
+                .grant_admitted(admitted.clone(), GrantAccess::ReadOnly)
+                .unwrap()
+        });
+        let next = grants.next_id;
+        assert!(matches!(
+            grants.grant_prepared(prepared),
+            Err(DocumentHostError::UnknownGrant)
+        ));
+        assert_eq!(grants.next_id, next, "refusal mints nothing");
+        if let Some(replacement) = replacement {
+            assert_ne!(replacement.grant.id, opened.grant.id);
+            assert_eq!(
+                grants.get(replacement.grant.id).unwrap().access,
+                GrantAccess::ReadOnly
+            );
+        } else {
+            assert!(grants.by_uri.is_empty() && grants.grants.is_empty());
+        }
+    }
+
+    let mut grants = DocumentGrantStore::new();
+    let prepared =
+        DocumentGrantStore::prepare_admitted(admitted.clone(), GrantAccess::ReadWrite, None)
+            .unwrap();
+    let intervening = grants
+        .grant_admitted(admitted, GrantAccess::ReadOnly)
+        .unwrap();
+    assert!(matches!(
+        grants.grant_prepared(prepared),
+        Err(DocumentHostError::UnknownGrant)
+    ));
+    assert_eq!(
+        grants.get(intervening.grant.id).unwrap().access,
+        GrantAccess::ReadOnly
+    );
+}
+
+#[test]
+fn prepared_grant_preserves_access_upgrades_and_refuses_target_or_access_replacement() {
+    let path = unique_file("prepared-upgrade", b"text");
+    let admitted = admit_local_file(&file_uri(&path), DEFAULT_DOCUMENT_LIMIT, false).unwrap();
+    let mut grants = DocumentGrantStore::new();
+    let opened = grants
+        .grant_admitted(admitted.clone(), GrantAccess::ReadOnly)
+        .unwrap();
+    let prepared = DocumentGrantStore::prepare_admitted(
+        admitted.clone(),
+        GrantAccess::ReadOnly,
+        Some(opened.grant.clone()),
+    )
+    .unwrap();
+    grants
+        .grant_admitted(admitted.clone(), GrantAccess::ReadWrite)
+        .unwrap();
+    assert_eq!(
+        grants.grant_prepared(prepared).unwrap().grant.access,
+        GrantAccess::ReadWrite
+    );
+
+    let expected = grants.cloned_grant(opened.grant.id).unwrap();
+    let prepared = DocumentGrantStore::prepare_admitted(
+        admitted.clone(),
+        GrantAccess::ReadOnly,
+        Some(expected.clone()),
+    )
+    .unwrap();
+    grants.grants.get_mut(&expected.id).unwrap().access = GrantAccess::ReadOnly;
+    assert!(matches!(
+        grants.grant_prepared(prepared),
+        Err(DocumentHostError::TargetRetargeted)
+    ));
+    assert_eq!(
+        grants.get(expected.id).unwrap().access,
+        GrantAccess::ReadOnly
+    );
+
+    for change_target in [false, true] {
+        let expected = grants.cloned_grant(opened.grant.id).unwrap();
+        let prepared = DocumentGrantStore::prepare_admitted(
+            admitted.clone(),
+            GrantAccess::ReadOnly,
+            Some(expected.clone()),
+        )
+        .unwrap();
+        let live = grants.grants.get_mut(&expected.id).unwrap();
+        if change_target {
+            live.target.target_path.push("replacement");
+        } else {
+            live.target
+                .additional_logical_bindings
+                .push(LogicalPathBinding {
+                    logical_path: live.target.logical_path.clone(),
+                    logical_symlinks: Vec::new(),
+                });
+        }
+        assert!(matches!(
+            grants.grant_prepared(prepared),
+            Err(DocumentHostError::TargetRetargeted)
+        ));
+        grants.grants.insert(expected.id, expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preparing_a_reused_grant_rejects_a_retargeted_config_symlink() {
+    use std::os::unix::fs::symlink;
+    let scratch = crate::test_scratch_dir("prepare-retarget");
+    let first = scratch.path().join("first.toml");
+    let second = scratch.path().join("second.toml");
+    let logical = scratch.path().join("aterm.toml");
+    fs::write(&first, "first").unwrap();
+    fs::write(&second, "second").unwrap();
+    owner_only(&first);
+    owner_only(&second);
+    symlink(&first, &logical).unwrap();
+    let admitted = admit_local_file(&file_uri(&logical), DEFAULT_DOCUMENT_LIMIT, true).unwrap();
+    let mut grants = DocumentGrantStore::new();
+    let opened = grants
+        .grant_admitted(admitted.clone(), GrantAccess::ReadOnly)
+        .unwrap();
+    fs::remove_file(&logical).unwrap();
+    symlink(&second, &logical).unwrap();
+    assert!(matches!(
+        DocumentGrantStore::prepare_admitted(
+            admitted,
+            GrantAccess::ReadWrite,
+            Some(opened.grant.clone()),
+        ),
+        Err(DocumentHostError::TargetRetargeted)
+    ));
+    assert_eq!(
+        grants.get(opened.grant.id).unwrap().access,
+        GrantAccess::ReadOnly
     );
 }
 
@@ -1435,7 +1714,7 @@ fn regular_target_atomic_replace_with_identical_bytes_keeps_grant_valid() {
     fs::rename(&replacement, &path).unwrap();
 
     let refreshed = grants.refresh_local(opened.grant.id, 1024).unwrap();
-    assert_eq!(refreshed.text, opened.text);
+    assert_eq!(refreshed.text.as_str(), opened.text.as_str());
     assert_eq!(
         crate::io::detect_version_conflict(opened.observed, refreshed.observed),
         Some(crate::io::VersionConflict::Identity),
@@ -1455,9 +1734,7 @@ fn persistence_completion_is_document_owned_not_view_owned() {
     let document = documents.open(opened.grant.canonical_uri.clone(), "saved".to_string());
     let snapshot = documents.snapshot(document).unwrap();
     let mut persistence = DocumentPersistenceStore::default();
-    persistence
-        .register(document, opened.grant.id, opened.observed, &opened.text)
-        .unwrap();
+    persistence.register_prepared(document, &opened).unwrap();
     let pending = persistence.begin(&snapshot).unwrap();
 
     let result = grants.execute_save(pending.grant, &pending.plan);
@@ -1528,7 +1805,7 @@ fn config_symlink_chain_is_bound_and_preserved_while_ordinary_grants_fail_closed
     let opened = grants
         .open_local_config(&file_uri(&logical), GrantAccess::ReadWrite, 4096)
         .unwrap();
-    assert_eq!(opened.text, "theme = \"Default\"\n");
+    assert_eq!(opened.text.as_str(), "theme = \"Default\"\n");
     assert_eq!(opened.grant.logical_path(), logical);
     assert_eq!(
         opened.grant.target().target_path(),
@@ -1549,7 +1826,7 @@ fn config_symlink_chain_is_bound_and_preserved_while_ordinary_grants_fail_closed
             4096,
         )
         .unwrap();
-    assert_eq!(opened_parent.text, "theme = \"Nord\"\n");
+    assert_eq!(opened_parent.text.as_str(), "theme = \"Nord\"\n");
     assert_eq!(
         opened_parent.grant.logical_path(),
         parent_alias.join("second.toml")
@@ -2388,4 +2665,105 @@ fn write_lock_owner_check_rejects_mismatched_uid_with_lock_touch() {
         })
     );
     assert!(failure.message.contains("not owned by this user"));
+}
+
+#[test]
+fn admission_payload_and_baseline_transfer_with_exact_grant_provenance() {
+    use amacs::store::{PreparationWork, take_preparation_work};
+    for repeats in [1, 131_072] {
+        for bytes in [
+            "é\n".repeat(repeats).into_bytes(),
+            format!("\u{feff}{}", "é\r\n".repeat(repeats)).into_bytes(),
+        ] {
+            let dir = crate::test_scratch_dir("prepared-admission");
+            let path = fs::canonicalize(dir.path()).unwrap().join("file");
+            fs::write(&path, bytes).unwrap();
+            let uri = path_to_file_uri(&path).unwrap();
+            let (admitted, work) = std::thread::spawn(move || {
+                take_preparation_work();
+                let admitted =
+                    admit_local_file_prepared_opts(&uri, AdmitOptions::DOCUMENT).unwrap();
+                let work = take_preparation_work();
+                assert_eq!(work.retirement_nodes_reserved, 3);
+                let prepared = DocumentGrantStore::prepare_admitted(
+                    admitted.clone(),
+                    GrantAccess::ReadWrite,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(take_preparation_work(), PreparationWork::default());
+                drop(prepared);
+                // The real synchronous-admission upgrade is the negative control:
+                // it must obtain nodes, while already-reserved admission must not.
+                let synchronous = admit_local_file_opts(&uri, AdmitOptions::DOCUMENT).unwrap();
+                take_preparation_work();
+                let upgrade =
+                    DocumentGrantStore::prepare_admitted(synchronous, GrantAccess::ReadWrite, None)
+                        .unwrap();
+                assert_eq!(take_preparation_work().retirement_nodes_reserved, 3);
+                drop(upgrade);
+                (admitted, work)
+            })
+            .join()
+            .unwrap();
+            assert!(work.baseline_input_bytes > 0);
+            assert_eq!(work.projection_input_bytes, admitted.text.len());
+            let mut grants = DocumentGrantStore::new();
+            take_preparation_work();
+            let granted = grants
+                .grant_admitted(admitted.clone(), GrantAccess::ReadWrite)
+                .unwrap();
+            let mut documents = crate::test_document_store();
+            let document = documents
+                .open_prepared(
+                    granted.grant.canonical_uri.clone(),
+                    granted.prepared_text.clone(),
+                )
+                .unwrap();
+            let mut persistence = DocumentPersistenceStore::default();
+            persistence.register_prepared(document, &granted).unwrap();
+            for _ in 0..8 {
+                let ready = granted.clone();
+                assert!(Arc::ptr_eq(&ready.payload, &admitted.payload));
+                persistence.register_prepared(document, &ready).unwrap();
+            }
+            assert_eq!(
+                take_preparation_work(),
+                PreparationWork {
+                    adoptions: 1,
+                    ..Default::default()
+                }
+            );
+            assert!(persistence.observed_text_matches(document, &granted.text));
+            take_preparation_work();
+            // Negative control invokes the same content-sized production
+            // constructor directly on UI rather than transferring its image.
+            let unprepared_image =
+                ObservedDocumentImage::new(granted.observed, Arc::from(granted.text.as_bytes()));
+            let control = take_preparation_work();
+            eprintln!(
+                "baseline-work repeats={repeats} encoding={:?} worker={work:?} synchronous-negative={control:?}",
+                granted.observed.encoding()
+            );
+            assert!(control.baseline_input_bytes > 0);
+            drop(unprepared_image);
+
+            let other_uri = path_to_file_uri(&fs::canonicalize(dir.path()).unwrap()).unwrap();
+            let other = grants
+                .grant_admitted(
+                    admit_local_file_opts(&other_uri, AdmitOptions::DOCUMENT).unwrap(),
+                    GrantAccess::ReadWrite,
+                )
+                .unwrap();
+            let mut wrong = granted.clone();
+            wrong.grant = other.grant.clone();
+            assert_eq!(
+                persistence.register_prepared(document, &wrong),
+                Err(PersistenceError::GrantMismatch)
+            );
+            assert!(other.is_directory());
+            let cloned = other.clone();
+            assert!(Arc::ptr_eq(&other.payload, &cloned.payload));
+        }
+    }
 }

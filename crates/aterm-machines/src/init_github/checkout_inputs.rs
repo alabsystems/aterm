@@ -7,6 +7,7 @@
 use super::{Asked, asked, inventory, profile, repos};
 use crate::model::User;
 use crate::port::System;
+use aterm_secrets::converge::MarkMoved;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -50,11 +51,26 @@ impl std::fmt::Debug for RepositoryCheckoutMetadata {
     }
 }
 
+/// Each watched path's class: which kind of Git metadata it is, to say what moved
+/// ([`Checkouts::moved`]). It is no part of what a capture observed, so it takes no part in any
+/// comparison: two captures that differ only here are equal.
+#[derive(Clone, Default)]
+struct Classes(BTreeMap<PathBuf, MarkMoved>);
+
+impl PartialEq for Classes {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Classes {}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Checkouts {
     home: PathBuf,
     uid: u32,
     paths: BTreeMap<PathBuf, bool>,
+    classes: Classes,
     metadata: RepositoryCheckoutMetadata,
 }
 
@@ -64,13 +80,14 @@ impl Checkouts {
             home: PathBuf::from(&user.home),
             uid: user.uid,
             paths: BTreeMap::new(),
+            classes: Classes::default(),
             metadata: RepositoryCheckoutMetadata {
                 shapes: Vec::new(),
                 versions: Vec::new(),
             },
         };
         if matches!(
-            profile(sys, user).and_then(|p| asked(p.and_then(|p| p.github), user)),
+            profile(sys, user).and_then(|p| asked(p.and_then(|p| p.github))),
             Ok(Asked::Default)
         ) && let Ok(listed) =
             inventory::Inventory::read(sys, user).map(|i| i.into_repositories())
@@ -85,7 +102,7 @@ impl Checkouts {
                 let root = scope.home.join(repo.name);
                 let admin = root.join(".git");
                 if !repo.required_submodules.is_empty() {
-                    scope.insert(root.join(".gitmodules"), true);
+                    scope.insert(root.join(".gitmodules"), true, MarkMoved::GITMODULES);
                 }
                 scope.checkout(sys, &root, &admin, !repo.required_submodules.is_empty());
                 for relative in repo.required_submodules {
@@ -97,7 +114,11 @@ impl Checkouts {
         scope
     }
 
-    fn insert(&mut self, path: PathBuf, version: bool) {
+    /// Watch `path`, and its version where `version`, as a path of `class`: a path keeps the
+    /// first class it was given, so a checkout's `.git` is `git-dir` whether or not it is also
+    /// its administrative directory.
+    fn insert(&mut self, path: PathBuf, version: bool, class: MarkMoved) {
+        self.classes.0.entry(path.clone()).or_insert(class);
         // The private manifest is bounded to one MiB and each repository to 64 declared
         // dependencies. Never silently drop a selected destination to meet a watch limit.
         self.paths
@@ -107,9 +128,9 @@ impl Checkouts {
     }
 
     fn checkout(&mut self, sys: &dyn System, root: &Path, allowed_admin: &Path, objects: bool) {
-        self.insert(root.to_path_buf(), false);
+        self.insert(root.to_path_buf(), false, MarkMoved::ROOT);
         let marker = root.join(".git");
-        self.insert(marker.clone(), true);
+        self.insert(marker.clone(), true, MarkMoved::GIT_DIR);
         if !self.admitted(sys, root, true) {
             return;
         }
@@ -150,20 +171,20 @@ impl Checkouts {
     }
 
     fn admin(&mut self, sys: &dyn System, admin: &Path, objects: bool) {
-        self.insert(admin.to_path_buf(), true);
-        for name in [
-            "config",
-            "config.worktree",
-            "HEAD",
-            "index",
-            "packed-refs",
-            "shallow",
-            "commondir",
-            "gitdir",
-            "refs",
-            "refs/heads",
+        self.insert(admin.to_path_buf(), true, MarkMoved::ADMIN_DIR);
+        for (name, class) in [
+            ("config", MarkMoved::CONFIG),
+            ("config.worktree", MarkMoved::CONFIG_WORKTREE),
+            ("HEAD", MarkMoved::HEAD),
+            ("index", MarkMoved::INDEX),
+            ("packed-refs", MarkMoved::PACKED_REFS),
+            ("shallow", MarkMoved::SHALLOW),
+            ("commondir", MarkMoved::POINTER),
+            ("gitdir", MarkMoved::POINTER),
+            ("refs", MarkMoved::REFS_DIR),
+            ("refs/heads", MarkMoved::REFS_HEADS_DIR),
         ] {
-            self.insert(admin.join(name), true);
+            self.insert(admin.join(name), true, class);
         }
         if !self.admitted(sys, admin, true) {
             return;
@@ -174,23 +195,23 @@ impl Checkouts {
             && let Some(path) = normalize(admin, reference)
             && path.starts_with(admin.join("refs"))
         {
-            self.insert(path, true);
+            self.insert(path, true, MarkMoved::CURRENT_REF);
         }
         if objects {
             let object_root = admin.join("objects");
-            for path in [
-                &object_root,
-                &object_root.join("pack"),
-                &object_root.join("info"),
-                &object_root.join("info/alternates"),
+            for (path, class) in [
+                (object_root.clone(), MarkMoved::OBJECTS_DIR),
+                (object_root.join("pack"), MarkMoved::OBJECTS_DIR),
+                (object_root.join("info"), MarkMoved::OBJECTS_DIR),
+                (object_root.join("info/alternates"), MarkMoved::ALTERNATES),
             ] {
-                self.insert(path.clone(), true);
+                self.insert(path, true, class);
             }
             if self.admitted(sys, &object_root, true) {
                 let names: Vec<_> = (0..=255).map(|value| format!("{value:02x}")).collect();
                 if let Ok(names) = sys.scoped_child_directories(&object_root, self.uid, &names) {
                     for name in names {
-                        self.insert(object_root.join(name), true);
+                        self.insert(object_root.join(name), true, MarkMoved::OBJECTS_FANOUT);
                     }
                 }
             }
@@ -276,6 +297,65 @@ impl Checkouts {
 
     pub(super) fn metadata(&self) -> RepositoryCheckoutMetadata {
         self.metadata.clone()
+    }
+
+    /// What differs between `before` and this later capture, as classes and never a path:
+    /// `added` for a path only this one watches and `removed` for one only `before` did; for a
+    /// path both watch, its class where its version or its own owner, mode or kind differs
+    /// (or one of them reads its version and the other not); `shape` where a folder on the way
+    /// to a watched path, not watched itself, differs in owner, mode or kind, or the two admit
+    /// by different accounts. The set is empty exactly when the two captures are equal.
+    pub(super) fn moved(&self, before: &Self) -> MarkMoved {
+        let mut moved = MarkMoved::default();
+        if self.home != before.home || self.uid != before.uid {
+            moved = moved.with(MarkMoved::SHAPE);
+        }
+        if self
+            .paths
+            .keys()
+            .any(|path| !before.paths.contains_key(path))
+        {
+            moved = moved.with(MarkMoved::ADDED);
+        }
+        if before
+            .paths
+            .keys()
+            .any(|path| !self.paths.contains_key(path))
+        {
+            moved = moved.with(MarkMoved::REMOVED);
+        }
+        let both = |path: &Path| self.paths.contains_key(path) && before.paths.contains_key(path);
+        let versions = |scope: &Self| -> BTreeMap<PathBuf, Result<[u8; 32], io::ErrorKind>> {
+            scope.metadata.versions.iter().cloned().collect()
+        };
+        let (was, now) = (versions(before), versions(self));
+        for path in was.keys().chain(now.keys()) {
+            if both(path) && was.get(path) != now.get(path) {
+                moved = moved.with(self.class(path));
+            }
+        }
+        let was: BTreeMap<&Path, &Result<Shape, io::ErrorKind>> = before
+            .metadata
+            .shapes
+            .iter()
+            .map(|(path, shape)| (path.as_path(), shape))
+            .collect();
+        for (path, shape) in &self.metadata.shapes {
+            if was.get(path.as_path()).is_some_and(|was| *was != shape) {
+                // A watched path's own shape is its class; a folder on the way is `shape`.
+                moved = moved.with(if both(path) {
+                    self.class(path)
+                } else {
+                    MarkMoved::SHAPE
+                });
+            }
+        }
+        moved
+    }
+
+    /// The class `path` was first watched as.
+    fn class(&self, path: &Path) -> MarkMoved {
+        self.classes.0.get(path).copied().unwrap_or_default()
     }
 
     pub(super) fn paths(&self) -> Vec<PathBuf> {

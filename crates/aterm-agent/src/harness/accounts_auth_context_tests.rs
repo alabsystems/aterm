@@ -520,3 +520,253 @@ fn a_failed_preparation_excludes_selection_without_fabricating_auth_or_policy() 
         BTreeSet::new()
     );
 }
+
+/// A store on a fresh home whose default login is row `b`'s, with that row and its context.
+fn settled_refusal_store(scratch: &Path) -> (Store, Row, AuthContext) {
+    let home = scratch.join("home");
+    let store = Store::at_for(&scratch.join("state"), Cli::Codex, &home);
+    login(&home.join(".codex"), 1);
+    let row = Row {
+        label: "b".into(),
+        email: Some("b@example.test".into()),
+        ..Row::default()
+    };
+    let context = store.capture_auth_context(&row).unwrap();
+    (store, row, context)
+}
+
+/// Stages `reason` as row `b`'s settled refusal at `at` and publishes it.
+fn settle_refusal(
+    store: &Store,
+    row: &Row,
+    context: &AuthContext,
+    reason: super::super::codex_app_login::RefusalReason,
+    at: i64,
+) {
+    store
+        .transact_logins(at, &mut None, |state, logins| {
+            stage_settled_refusal(state, row, logins, context.clone(), reason, at);
+            Ok(Vec::new())
+        })
+        .unwrap();
+}
+
+/// A SETTLED REFUSAL'S REASON IS ONE WORD IN `state.json`, BESIDE ITS SIGN-OUT: staging it
+/// records the sign-out in the login's context and the reason's closed code word under
+/// `auth_refusal`, and a reload reads the same reason back. CONTROLS: a `state.json` written
+/// before the key existed reads none and is otherwise the same record; a word that is no
+/// reason's own code, a reason beside any word but the sign-out, and one with no context read
+/// none.
+#[test]
+fn a_settled_refusals_reason_is_one_word_in_state_json_and_reads_back() {
+    use super::super::codex_app_login::{OtherRefusal, RefusalReason};
+    for reason in [
+        RefusalReason::Expired,
+        RefusalReason::Reused,
+        RefusalReason::Invalidated,
+        RefusalReason::InvalidGrant,
+        RefusalReason::Other(OtherRefusal::InvalidToken),
+        RefusalReason::UNKNOWN,
+    ] {
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let (store, row, context) = settled_refusal_store(scratch.path());
+        settle_refusal(&store, &row, &context, reason, NOW);
+        let text = std::fs::read_to_string(store.state_file()).unwrap();
+        let doc: Value = aterm_json::from_str(&text).unwrap();
+        let record = &doc["accounts"]["b"];
+        assert_eq!(
+            record.get("auth_refusal"),
+            Some(&Value::from(reason.code())),
+            "{reason:?}"
+        );
+        assert_eq!(
+            record.get("auth"),
+            Some(&Value::from(Auth::SignedOut.as_str())),
+            "{reason:?}"
+        );
+        let (state, warning) = store.load(NOW).unwrap();
+        assert!(warning.is_none());
+        let account = state.account("b");
+        assert_eq!(account.auth, Auth::SignedOut);
+        assert_eq!(account.auth_at, Some(NOW));
+        assert_eq!(account.auth_context.as_ref(), Some(&context));
+        assert_eq!(account.auth_refusal, Some(reason));
+        let read = |doc: &Value| {
+            let Ok(state) = State::from_json(&aterm_json::to_string(doc).unwrap(), NOW) else {
+                panic!("{reason:?}: an unreadable state");
+            };
+            state.account("b")
+        };
+        assert_eq!(read(&doc), account, "{reason:?}: a round trip");
+        assert_eq!(
+            State::from_json(&state.to_json(), NOW)
+                .ok()
+                .map(|state| state.account("b").auth_refusal),
+            Some(Some(reason)),
+            "{reason:?}: written again as it was read"
+        );
+
+        let edited = |edit: &dyn Fn(&mut Map)| {
+            let mut doc = doc.clone();
+            edit(
+                doc.as_object_mut()
+                    .and_then(|doc| doc.get_mut("accounts"))
+                    .and_then(Value::as_object_mut)
+                    .and_then(|accounts| accounts.get_mut("b"))
+                    .and_then(Value::as_object_mut)
+                    .unwrap(),
+            );
+            read(&doc)
+        };
+        let older = edited(&|record| {
+            record.remove("auth_refusal").unwrap();
+        });
+        assert_eq!(older.auth_refusal, None, "{reason:?}: an older state.json");
+        assert_eq!(
+            older,
+            Account {
+                auth_refusal: None,
+                ..account.clone()
+            },
+            "{reason:?}: an older state.json is otherwise the same record"
+        );
+        for (why, word) in [
+            ("no reason's code", Value::from("token expired")),
+            ("another case", Value::from(reason.code().to_uppercase())),
+            ("not a word", Value::from(1)),
+        ] {
+            let read = edited(&|record| {
+                record.insert("auth_refusal".into(), word.clone());
+            });
+            assert_eq!(read.auth_refusal, None, "{reason:?}: {why}");
+        }
+        let signed_in = edited(&|record| {
+            record.insert("auth".into(), Value::from("ok"));
+        });
+        assert_eq!(signed_in.auth, Auth::Ok, "CONTROL: {reason:?}");
+        assert_eq!(
+            signed_in.auth_refusal, None,
+            "{reason:?}: beside another word"
+        );
+        let unbound = edited(&|record| {
+            record.remove("auth_context").unwrap();
+        });
+        assert_eq!(unbound.auth, Auth::SignedOut, "CONTROL: {reason:?}");
+        assert_eq!(unbound.auth_refusal, None, "{reason:?}: with no context");
+    }
+}
+
+/// EVERY OTHER AUTH WORD CLEARS A SETTLED REFUSAL'S REASON: a sign-in, a served turn, a staged
+/// word (the same sign-out among them), a login's end and an unscoped note each leave none.
+/// CONTROLS: a context check and a word older than the sign-out change nothing, and a settled
+/// refusal older than the word on record keeps its reason out.
+#[test]
+fn every_other_auth_word_clears_a_settled_refusals_reason() {
+    use super::super::codex_app_login::RefusalReason;
+    type Stage = fn(&mut State, &Row, &Logins, AuthContext, i64);
+    let cases: [(&str, Stage, i64, bool); 7] = [
+        ("a sign-in", stage_checked_sign_in, NOW + 1, true),
+        ("a served turn", stage_signed_back, NOW + 1, true),
+        (
+            "a signed-in word",
+            |state, row, logins, context, at| {
+                stage_auth(state, row, logins, context, Auth::Ok, at);
+            },
+            NOW + 1,
+            true,
+        ),
+        (
+            "the same sign-out, staged again",
+            |state, row, logins, context, at| {
+                stage_auth(state, row, logins, context, Auth::SignedOut, at);
+            },
+            NOW + 1,
+            true,
+        ),
+        ("a login's end", stage_login_end, NOW + 1, true),
+        ("CONTROL: a context check", stage_auth_check, NOW + 1, false),
+        (
+            "CONTROL: an older word",
+            |state, row, logins, context, at| {
+                stage_auth(state, row, logins, context, Auth::Ok, at);
+            },
+            NOW - 1,
+            false,
+        ),
+    ];
+    for (name, stage, at, clears) in cases {
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let (store, row, context) = settled_refusal_store(scratch.path());
+        settle_refusal(&store, &row, &context, RefusalReason::Expired, NOW);
+        assert_eq!(
+            store.load(NOW).unwrap().0.account("b").auth_refusal,
+            Some(RefusalReason::Expired),
+            "CONTROL: {name}"
+        );
+        store
+            .transact_logins(NOW + 1, &mut None, |state, logins| {
+                stage(state, &row, logins, context.clone(), at);
+                Ok(Vec::new())
+            })
+            .unwrap();
+        let (state, _) = store.load(NOW + 1).unwrap();
+        assert_eq!(
+            state.account("b").auth_refusal,
+            (!clears).then_some(RefusalReason::Expired),
+            "{name}"
+        );
+        if !clears {
+            assert_eq!(state.account("b").auth, Auth::SignedOut, "{name}");
+            assert_eq!(state.account("b").auth_at, Some(NOW), "{name}");
+        }
+    }
+
+    let scratch = aterm_tempfile::TempDir::new().unwrap();
+    let (store, row, context) = settled_refusal_store(scratch.path());
+    settle_refusal(&store, &row, &context, RefusalReason::Expired, NOW);
+    store
+        .transact(NOW + 1, &mut None, |state| {
+            Ok(note_auth(state, "b", Auth::SignedOut, NOW + 1))
+        })
+        .unwrap();
+    let (state, _) = store.load(NOW + 1).unwrap();
+    assert_eq!(state.account("b").auth_at, Some(NOW + 1), "CONTROL");
+    assert_eq!(state.account("b").auth_refusal, None, "an unscoped note");
+
+    let scratch = aterm_tempfile::TempDir::new().unwrap();
+    let (store, row, context) = settled_refusal_store(scratch.path());
+    store
+        .transact_logins(NOW + 5, &mut None, |state, logins| {
+            stage_auth(
+                state,
+                &row,
+                logins,
+                context.clone(),
+                Auth::SignedOut,
+                NOW + 5,
+            );
+            Ok(Vec::new())
+        })
+        .unwrap();
+    store
+        .transact_logins(NOW + 6, &mut None, |state, logins| {
+            stage_settled_refusal(
+                state,
+                &row,
+                logins,
+                context.clone(),
+                RefusalReason::Expired,
+                NOW,
+            );
+            Ok(Vec::new())
+        })
+        .unwrap();
+    let (state, _) = store.load(NOW + 6).unwrap();
+    assert_eq!(state.account("b").auth, Auth::SignedOut);
+    assert_eq!(state.account("b").auth_at, Some(NOW + 5));
+    assert_eq!(
+        state.account("b").auth_refusal,
+        None,
+        "a newer word on record keeps an older settled refusal's reason out"
+    );
+}

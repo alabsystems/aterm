@@ -17,11 +17,24 @@ fn fixture() -> (Fake, User) {
     sys.euid = user.uid;
     sys.logged_in(&user);
     directory(&sys, &user, Path::new(&user.home));
-    let path = inventory::file(&user.home);
     let bytes = br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","clone_url":"https://github.com/fixture/code.git","private":true,"default_branch":"main","required_submodules":["vendor/library"]}]}"#;
-    file(&sys, &user, &path, bytes);
+    sys.vault_set(&user.home, inventory::ENTRY, bytes);
     inventory::Inventory::read(&sys, &user).unwrap();
     (sys, user)
+}
+
+/// A real file vault beside `home`, its store holding `bytes` as the private inventory: what a
+/// test whose port is [`crate::port::Live`] reads in place.
+#[cfg(unix)]
+fn seeded_inventory(vault: &Path, home: &Path, bytes: &[u8]) {
+    use aterm_secrets::{client, text::Audience};
+    let paths = client::Paths::for_home(home);
+    client::create(&paths, vault.to_str().unwrap(), None, Some("fixture")).unwrap();
+    let admin = client::admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, inventory::ENTRY, bytes)
+        .unwrap();
+    client::admin_publish(&paths, &admin, &doc).unwrap();
 }
 
 fn directory(sys: &Fake, user: &User, path: &Path) {
@@ -171,7 +184,7 @@ fn gitfiles_cannot_enlist_unselected_or_symlinked_private_directories() {
     );
     // The canonical profile parser, rather than filesystem presence, chooses scope.
     assert!(matches!(
-        profile(&sys, &user).and_then(|p| asked(p.and_then(|p| p.github), &user)),
+        profile(&sys, &user).and_then(|p| asked(p.and_then(|p| p.github))),
         Ok(Asked::Off)
     ));
     assert!(Checkouts::capture(&sys, &user).paths().is_empty());
@@ -180,7 +193,7 @@ fn gitfiles_cannot_enlist_unselected_or_symlinked_private_directories() {
 #[cfg(unix)]
 #[test]
 fn native_dependency_object_arrival_moves_cached_metadata_without_a_git_process() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
 
     let scratch = aterm_tempfile::tempdir().unwrap();
     let home = scratch.path().canonicalize().unwrap();
@@ -192,18 +205,13 @@ fn native_dependency_object_arrival_moves_cached_metadata_without_a_git_process(
         shell: String::new(),
         admin: false,
     };
-    let private = inventory::file(home.to_str().unwrap());
     let checkout = home.join("code");
     let admin = checkout.join(".git/modules/library");
-    for directory in [
-        private.parent().unwrap(),
-        &admin.join("objects/aa"),
-        &checkout.join("vendor/library"),
-    ] {
+    for directory in [&admin.join("objects/aa"), &checkout.join("vendor/library")] {
         std::fs::create_dir_all(directory).unwrap();
     }
-    std::fs::write(&private, br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","clone_url":"https://github.com/fixture/code.git","private":true,"default_branch":"main","required_submodules":["vendor/library"]}]}"#).unwrap();
-    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let vault = aterm_tempfile::tempdir().unwrap();
+    seeded_inventory(&vault.path().join("fixture.vault"), &home, br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","clone_url":"https://github.com/fixture/code.git","private":true,"default_branch":"main","required_submodules":["vendor/library"]}]}"#);
     std::fs::write(
         checkout.join("vendor/library/.git"),
         b"gitdir: ../../.git/modules/library\n",
@@ -261,12 +269,7 @@ fn a_53_repository_round_observes_each_distinct_component_once() {
         &aterm_json::json!({"schema":2,"account":"fixture","repositories":repositories}),
     )
     .unwrap();
-    file(
-        &sys,
-        &user,
-        &inventory::file(home.to_str().unwrap()),
-        &bytes,
-    );
+    sys.vault_set(&user.home, inventory::ENTRY, &bytes);
     inventory::Inventory::read(&sys, &user).unwrap();
     let scope = Checkouts::capture(&sys, &user);
     let mut calls = BTreeMap::<PathBuf, usize>::new();
@@ -314,7 +317,7 @@ fn a_53_repository_round_observes_each_distinct_component_once() {
 #[cfg(unix)]
 #[test]
 fn replacing_a_checked_parent_cannot_cross_the_scoped_metadata_boundary() {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
 
     let scratch = aterm_tempfile::tempdir().unwrap();
     let base = scratch.path().canonicalize().unwrap();
@@ -323,10 +326,7 @@ fn replacing_a_checked_parent_cannot_cross_the_scoped_metadata_boundary() {
     let foreign = base.join("other-application-state");
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::create_dir_all(foreign.join(".git")).unwrap();
-    std::fs::create_dir(home.join(".secrets")).unwrap();
-    let private = inventory::file(home.to_str().unwrap());
-    std::fs::write(&private, br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","private":true,"default_branch":"main","clone_url":"https://github.com/fixture/code.git"}]}"#).unwrap();
-    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    seeded_inventory(&base.join("fixture.vault"), &home, br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","private":true,"default_branch":"main","clone_url":"https://github.com/fixture/code.git"}]}"#);
     std::fs::write(root.join(".git/config"), b"selected origin").unwrap();
     std::fs::write(foreign.join(".git/config"), b"foreign origin").unwrap();
     let user = User {
@@ -365,4 +365,179 @@ fn replacing_a_checked_parent_cannot_cross_the_scoped_metadata_boundary() {
             .any(|(path, version)| path == &config && version.is_err()),
         "a parent swapped after its cached admission must not yield foreign metadata"
     );
+}
+
+/// A class as the note's word spells it, so a failure names classes and not bits.
+fn spelled(moved: MarkMoved) -> String {
+    aterm_secrets::converge::StartNote {
+        moved,
+        ..aterm_secrets::converge::StartNote::default()
+    }
+    .word()
+}
+
+/// EACH WATCHED PATH THAT MOVES THE MARK NAMES ITS CLASS, AND ONLY ITS CLASS: in a checkout
+/// with a required submodule and every watched file present, changing one file's bytes moves
+/// exactly that file's class (`config`, `config-worktree`, `index`, `packed-refs`, `shallow`,
+/// a submodule's `gitdir` pointer, the current ref, `alternates`, `.gitmodules`, a gitfile); a
+/// new entry in a watched folder moves that folder's class alone (a checkout's `.git` is
+/// `git-dir`, a submodule's administrative folder `admin-dir`, `refs`, `refs/heads`,
+/// `objects/pack`, a loose-object folder); a checkout folder's own mode is `root`, and the mode
+/// of a folder on the way to the submodule's checkout, not watched itself, `shape`; a new
+/// loose-object folder is `objects-dir` and `added`; and `HEAD` naming another ref is `head`,
+/// `added` and `removed`. A look at an unchanged checkout moves nothing, and each later capture
+/// is equal to the one before it exactly when nothing moved. Limit: the Fake digests a folder
+/// by its entries' names, so an entry made and removed between two looks moves nothing here;
+/// what the installed build's sets say is read from its ledger lines.
+/// NEGATIVE CONTROL: watching `index` as `config` gives `m=config` where `m=index` is wanted.
+#[test]
+fn each_path_that_moves_the_mark_names_its_class() {
+    let (fake, user) = fixture();
+    let (sys, user) = (&fake, &user);
+    let root = Path::new(&user.home).join("code");
+    let admin = root.join(".git");
+    let module = admin.join("modules/library");
+    let mode = |path: &Path, mode: u32| {
+        sys.stat_of(
+            path.to_str().unwrap(),
+            Stat {
+                uid: user.uid,
+                gid: user.gid,
+                mode,
+                dir: true,
+                symlink: false,
+                len: 0,
+            },
+        );
+    };
+    for path in [
+        &root,
+        &admin,
+        &admin.join("refs"),
+        &admin.join("refs/heads"),
+        &admin.join("objects"),
+        &admin.join("objects/pack"),
+        &admin.join("objects/info"),
+        &admin.join("objects/aa"),
+        &root.join("vendor"),
+        &root.join("vendor/library"),
+        &admin.join("modules"),
+        &module,
+        &module.join("refs"),
+        &module.join("refs/heads"),
+        &module.join("objects"),
+    ] {
+        directory(sys, user, path);
+    }
+    for (path, bytes) in [
+        (root.join(".gitmodules"), &b"[submodule]"[..]),
+        (admin.join("config"), b"[core]"),
+        (admin.join("config.worktree"), b"[core]"),
+        (admin.join("HEAD"), b"ref: refs/heads/main\n"),
+        (admin.join("index"), b"DIRC"),
+        (admin.join("packed-refs"), b"# pack-refs"),
+        (admin.join("shallow"), b"0000"),
+        (admin.join("refs/heads/main"), b"1111\n"),
+        (admin.join("objects/info/alternates"), b""),
+        (admin.join("objects/aa/object"), b"object"),
+        (
+            root.join("vendor/library/.git"),
+            b"gitdir: ../../.git/modules/library\n",
+        ),
+        (module.join("config"), b"[core]"),
+        (module.join("HEAD"), b"ref: refs/heads/main\n"),
+        (module.join("gitdir"), b"../../../vendor/library/.git\n"),
+    ] {
+        file(sys, user, &path, bytes);
+    }
+    let mut before = Checkouts::capture(sys, user);
+    assert!(before.paths().contains(&admin.join("objects/aa")));
+    assert!(before.paths().contains(&module.join("gitdir")));
+    let again = Checkouts::capture(sys, user);
+    assert_eq!(spelled(again.moved(&before)), "");
+    assert!(again == before);
+    let mut look = |change: &dyn Fn(), wanted: MarkMoved| {
+        change();
+        let after = Checkouts::capture(sys, user);
+        let moved = after.moved(&before);
+        assert_eq!(spelled(moved), spelled(wanted));
+        assert_eq!(moved.is_empty(), after == before);
+        before = after;
+    };
+    let write = |path: PathBuf| move || file(sys, user, &path, b"changed");
+    for (path, class) in [
+        (admin.join("config"), MarkMoved::CONFIG),
+        (admin.join("config.worktree"), MarkMoved::CONFIG_WORKTREE),
+        (admin.join("index"), MarkMoved::INDEX),
+        (admin.join("packed-refs"), MarkMoved::PACKED_REFS),
+        (admin.join("shallow"), MarkMoved::SHALLOW),
+        (module.join("gitdir"), MarkMoved::POINTER),
+        (admin.join("refs/heads/main"), MarkMoved::CURRENT_REF),
+        (admin.join("objects/info/alternates"), MarkMoved::ALTERNATES),
+        (root.join(".gitmodules"), MarkMoved::GITMODULES),
+        (module.join("config"), MarkMoved::CONFIG),
+    ] {
+        look(&write(path), class);
+    }
+    look(
+        &|| {
+            file(
+                sys,
+                user,
+                &root.join("vendor/library/.git"),
+                b"gitdir: ../../.git/modules/library\r\n",
+            );
+        },
+        MarkMoved::GIT_DIR,
+    );
+    for (path, class) in [
+        (admin.join("ORIG_HEAD"), MarkMoved::GIT_DIR),
+        (module.join("FETCH_HEAD"), MarkMoved::ADMIN_DIR),
+        (admin.join("refs/heads/other"), MarkMoved::REFS_HEADS_DIR),
+        (
+            admin.join("objects/pack/pack-1.idx"),
+            MarkMoved::OBJECTS_DIR,
+        ),
+        (admin.join("objects/aa/other"), MarkMoved::OBJECTS_FANOUT),
+    ] {
+        look(&write(path), class);
+    }
+    look(
+        &|| directory(sys, user, &admin.join("refs/tags")),
+        MarkMoved::REFS_DIR,
+    );
+    look(&|| mode(&root, 0o750), MarkMoved::ROOT);
+    look(&|| mode(&root.join("vendor"), 0o750), MarkMoved::SHAPE);
+    look(
+        &|| directory(sys, user, &admin.join("objects/bb")),
+        MarkMoved::OBJECTS_DIR.with(MarkMoved::ADDED),
+    );
+    look(
+        &|| file(sys, user, &admin.join("HEAD"), b"ref: refs/heads/other\n"),
+        MarkMoved::HEAD
+            .with(MarkMoved::ADDED)
+            .with(MarkMoved::REMOVED),
+    );
+    look(&|| {}, MarkMoved::default());
+}
+
+/// A PATH'S CLASS TAKES NO PART IN WHAT A CAPTURE DECIDES: two captures that differ only in the
+/// class a path was watched as are equal and nothing moved between them, so no look calls for
+/// work, or calls for none, because of a class.
+/// NEGATIVE CONTROL: classes compared as the map they are make the two captures unequal.
+#[test]
+fn a_class_takes_no_part_in_what_a_capture_decides() {
+    let (sys, user) = fixture();
+    let root = Path::new(&user.home).join("code");
+    directory(&sys, &user, &root);
+    directory(&sys, &user, &root.join(".git"));
+    let capture = Checkouts::capture(&sys, &user);
+    let mut relabelled = capture.clone();
+    assert!(!relabelled.classes.0.is_empty());
+    for class in relabelled.classes.0.values_mut() {
+        *class = MarkMoved::SHAPE;
+    }
+    assert!(relabelled == capture);
+    assert!(relabelled.moved(&capture).is_empty());
+    assert!(capture.moved(&relabelled).is_empty());
 }

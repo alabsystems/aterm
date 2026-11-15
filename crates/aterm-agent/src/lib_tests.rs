@@ -940,3 +940,23 @@ fn the_ctl_client_is_this_image_even_once_its_file_is_replaced() {
     };
     assert_eq!(resolved_exe(gone), expect);
 }
+
+#[test]
+fn a_spawn_reply_names_one_valid_tab_in_its_success_header() {
+    let sid = "tqn5r6e0148";
+    for reply in [format!("OK {sid}"), format!("OK {sid} req=r-1\n")] {
+        assert_eq!(spawned_tab_id(&reply).unwrap().as_str(), sid);
+    }
+    // A spawn mints a `t` ID: a legacy tab's `s-` ID names no tab a spawn made.
+    assert!(spawned_tab_id("OK s-1a2b3c4d5e6f70819203").is_none());
+    for reply in [
+        "ERR tqn5r6e0148",
+        "OK",
+        "OK tqn5",
+        "OK s-bad",
+        "OK req=r-1 tqn5r6e0148",
+        "OK\ntqn5r6e0148",
+    ] {
+        assert_eq!(spawned_tab_id(reply), None, "{reply:?}");
+    }
+}

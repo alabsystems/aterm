@@ -96,6 +96,49 @@ fn a_held_token_is_checked_as_the_process_it_named() {
         .expect("the floor reads no token");
 }
 
+/// The live law of [`CheckCost`]: each real code check is counted once, on the helper thread
+/// that ran it, as it returns, and a check settled without a helper is not counted. The checks
+/// are macOS's own (`SecCodeCopyGuestWithAttributes`, `SecCodeCheckValidity`) of this process's
+/// real token. It counts checks; `cpu_ns` is a clock's reading and is asserted nowhere.
+///
+/// Negative control: delete the `checks` add in `costed` (the first assertion reads 0, wants 1).
+#[test]
+fn a_costed_check_is_counted_on_the_helper_that_ran_it() {
+    use std::sync::atomic::Ordering;
+    aterm_uds::deadline::require_trust_service();
+    let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
+    let (a, _b) = CtlStream::pair().expect("pair");
+    let token = aterm_uds::peer::peer_audit_token(&a).expect("the kernel names the peer");
+    let cost = std::sync::Arc::new(CheckCost::default());
+    verdict(id.check_named_costed(&a, Some(token), WITHIN, &cost))
+        .expect("the costed check admits what the plain check admits");
+    assert_eq!(cost.checks.load(Ordering::Relaxed), 1);
+    // A second real check is a second count.
+    verdict(id.check_named_costed(&a, Some(token), WITHIN, &cost))
+        .expect("the same peer is admitted again");
+    assert_eq!(cost.checks.load(Ordering::Relaxed), 2);
+    // Another generation of this pid: the token does not name the connected peer, so the check
+    // settles before any helper runs and is not counted.
+    let mut later = token;
+    later.0[7] = later.0[7].wrapping_add(1);
+    let stale = verdict(id.check_named_costed(&a, Some(later), WITHIN, &cost));
+    assert!(matches!(stale, Err(CheckError::Unchecked(_))), "{stale:?}");
+    assert_eq!(cost.checks.load(Ordering::Relaxed), 2);
+    // No token and no requirement: each settles with no helper, so neither is counted.
+    let unnamed = verdict(id.check_named_costed(&a, None, WITHIN, &cost));
+    assert!(
+        matches!(unnamed, Err(CheckError::Unchecked(_))),
+        "{unnamed:?}"
+    );
+    Identity::same_uid()
+        .check_named_costed(&a, Some(token), WITHIN, &cost)
+        .expect("the floor runs no code check");
+    assert_eq!(cost.checks.load(Ordering::Relaxed), 2);
+    // The plain check adds to no cost.
+    verdict(id.check_named(&a, Some(token), WITHIN)).expect("the plain check");
+    assert_eq!(cost.checks.load(Ordering::Relaxed), 2);
+}
+
 #[test]
 fn code_on_disk_is_checked_against_the_requirement() {
     aterm_uds::deadline::require_trust_service();

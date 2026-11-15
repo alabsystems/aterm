@@ -1339,11 +1339,7 @@ fn chips_in(seen: &Seen, from: i64, until: i64) -> Vec<(i64, Chip, String)> {
 
 /// L1: `face=land` while it lands.
 fn l1_face(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
-    let Some((t1, _)) = seen
-        .acts(aterm_agent::supervise::policy::turn_end::RULE_LAND)
-        .first()
-        .copied()
-    else {
+    let Some((t1, _)) = seen.acts(alab_policy::words::RULE_LAND).first().copied() else {
         return Verdict::Unobserved("no land act (L1's records)".into());
     };
     let until = seen.first_after("DONE ", *t1).map_or(i64::MAX, |(t, _)| *t);
@@ -1586,7 +1582,7 @@ pub enum TitleSays {
 /// [`NO_RECORD`]: aterm_agent::supervise::mode_words::NO_RECORD
 #[must_use]
 pub fn title_says(t: &str, mode: &str) -> TitleSays {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     use aterm_agent::supervise::mode_words::{
         CHECKED_LEAD, GONE_LEAD, LANDED_REST, NO_RECORD, NO_REPO_CHECKED, mode_words,
     };
@@ -2382,9 +2378,9 @@ fn n_span(seen: &Seen, t0: i64, k: usize) -> Result<(i64, i64), Verdict> {
 /// The act that asked step `k` of N1–N4.
 const N_ASKED: [Option<&str>; 4] = [
     None,
-    Some(aterm_agent::supervise::policy::turn_end::RULE_CONTINUE),
-    Some(aterm_agent::supervise::policy::turn_end::RULE_DONE_CHECK),
-    Some(aterm_agent::supervise::policy::turn_end::RULE_CONTINUE),
+    Some(alab_policy::words::RULE_CONTINUE),
+    Some(alab_policy::words::RULE_DONE_CHECK),
+    Some(alab_policy::words::RULE_CONTINUE),
 ];
 
 /// Judges step `k` of the N1–N4 needs chain from `seen`.
@@ -2962,14 +2958,14 @@ fn new_window(
 }
 
 /// Session `sid`'s local id, the column before its sid on its `ls` line (`<local> <sid> <parent>
-/// …`, after the client's instance column: `0 3 s-… s-… alive …`), which the window's own keys
-/// carry (`harness/session/<local>/…`). The sid is the line's first `s-` token, so a child's line
-/// naming `sid` as its parent is not its.
+/// …`, after the client's instance column: `0 3 t… t… alive …`), which the window's own keys
+/// carry (`harness/session/<local>/…`). The sid is the line's first tab-ID token, so a child's
+/// line naming `sid` as its parent is not its.
 #[must_use]
 pub fn local_of(ls: &str, sid: &str) -> Option<String> {
     ls.lines().find_map(|l| {
         let f: Vec<&str> = l.split_whitespace().collect();
-        let at = f.iter().position(|t| t.starts_with("s-"))?;
+        let at = f.iter().position(|t| aterm_types::tab_id::is_tab_id(t))?;
         let local = f[..at].last()?;
         (f[at] == sid && local.bytes().all(|b| b.is_ascii_digit())).then(|| (*local).to_string())
     })
@@ -3608,12 +3604,8 @@ pub fn landings_of(journal: &[(i64, String)], today: impl Fn(i64) -> bool) -> us
         if super::act_rule(l).is_some_and(|r| r.starts_with("land")) {
             open = true;
         } else if l.starts_with("DONE ")
-            && l.split_whitespace().any(|w| {
-                w == format!(
-                    "rule={}",
-                    aterm_agent::supervise::policy::turn_end::RULE_LAND
-                )
-            })
+            && l.split_whitespace()
+                .any(|w| w == format!("rule={}", alab_policy::words::RULE_LAND))
         {
             if open && today(*t) {
                 n += 1;

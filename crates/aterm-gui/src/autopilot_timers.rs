@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 
 use crate::App;
 use crate::claude_lights::{Clock, LandAtGlass, Weekday};

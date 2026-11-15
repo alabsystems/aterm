@@ -79,7 +79,7 @@ fn a_signing_command_that_never_answers_is_stopped_at_its_deadline() {
 
 /// A read-only look names provision, with the operator's folder, as the step when it can
 /// make the on-disk certificate an identity; a refused certificate (named), no current one,
-/// or no key is the owner's errand at Apple, and a folder or key it could not read blocks.
+/// or no key is a to-do, and a folder or key it could not read blocks.
 #[test]
 fn a_key_whose_certificate_is_on_disk_is_provisions_step_not_an_errand() {
     let key = Path::new("/nonexistent/devid-m9.key");
@@ -152,12 +152,13 @@ fn a_key_whose_certificate_is_on_disk_is_provisions_step_not_an_errand() {
     ) {
         Outcome::Todo { what, next } => {
             assert!(what.contains("/x/Downloads/old.cer"), "{what}");
+            assert_eq!(next, unheld_next("m9"));
             assert!(
-                next.contains("provision --id m9 --cert-dir /x/Downloads`"),
+                next.ends_with("`aterm secrets need developer-id:m9`"),
                 "{next}"
             );
         }
-        _ => panic!("a refused certificate is an errand at Apple"),
+        _ => panic!("a refused certificate is a to-do"),
     }
 }
 
@@ -397,6 +398,48 @@ fn a_mac_without_a_pair_files_the_want_and_never_mints_unasked() {
         Outcome::Todo { next, .. } => assert!(next.contains("developer-id:m9"), "{next}"),
         _ => panic!("a check with no identity is a todo"),
     }
+}
+
+/// A certificate the keychain refuses (revoked) counts as none: whatever the vault answers
+/// short of an identity, and even beside a request this Mac minted, the want is unheld, so
+/// provision files `developer-id:<id>` and no run waits on that certificate's request.
+#[test]
+fn a_revoked_certificate_leaves_the_want_unheld_whatever_the_vault_says() {
+    let revoked = Path::new("/home/.aterm/apple/devid-m9.cer");
+    for answer in [
+        Vault::Imported("imported".into()),
+        Vault::Pending("signing proof pending".into()),
+        Vault::Absent,
+    ] {
+        for requested in [false, true] {
+            match settle("m9", answer.clone(), Some(revoked), requested) {
+                Outcome::Unheld(what) => {
+                    assert!(
+                        what.contains("devid-m9.cer") && what.contains("revoked"),
+                        "{what}"
+                    );
+                }
+                _ => panic!("{answer:?} beside a revoked certificate leaves the want unheld"),
+            }
+        }
+    }
+    assert!(matches!(
+        settle(
+            "m9",
+            Vault::Unread("no registry".into()),
+            Some(revoked),
+            false
+        ),
+        Outcome::Blocked { .. }
+    ));
+    assert!(matches!(
+        settle("m9", Vault::Absent, None, true),
+        Outcome::Waiting { .. }
+    ));
+    assert!(matches!(
+        settle("m9", Vault::Pending("ring".into()), None, false),
+        Outcome::Blocked { .. }
+    ));
 }
 
 /// A scratch HOME holding a Developer ID pair in `~/.aterm/apple` as the vault fills it

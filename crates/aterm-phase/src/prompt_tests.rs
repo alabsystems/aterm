@@ -765,7 +765,10 @@ fn a_boxs_foot_note_is_read_whole_over_its_countdown() {
 #[test]
 fn the_workflow_rm_unresolvable_box_reads_whole() {
     let r = screen(BOX_RM_UNRESOLVABLE_WORKFLOW);
-    assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+    assert_eq!(
+        crate::phase::worker_phase(&r),
+        alab_policy::vocab::Phase::Prompt
+    );
     let p = parse_prompt_v2(&r).expect("the box");
     assert_eq!(p.kind, PromptKind::Bash);
     assert_eq!(
@@ -776,7 +779,7 @@ fn the_workflow_rm_unresolvable_box_reads_whole() {
     assert_eq!(p.command_rows.len(), 6, "{:?}", p.command_rows);
     assert_eq!(
         p.command_rows[0],
-        "cd /Users//user00/trust-vc-m1-notes/reader &&"
+        "cd /Users/_user0/trust-vc-m1-notes/reader &&"
     );
     assert!(p.command_rows[5].ends_with("cat dumps/basic-$t.txt; done"));
     assert_eq!(p.description_rows, 0);
@@ -787,7 +790,7 @@ fn the_workflow_rm_unresolvable_box_reads_whole() {
     assert_eq!(
         p.notes,
         [
-            "Dangerous rm operation on statically-unresolvable target: /Users//user00/trust-vc/dumps/*"
+            "Dangerous rm operation on statically-unresolvable target: /Users/_user0/trust-vc/dumps/*"
         ]
     );
     assert_eq!(p.auto_deny, None);
@@ -796,7 +799,7 @@ fn the_workflow_rm_unresolvable_box_reads_whole() {
         Some(RmBreaker {
             command: RmCommand::Rm,
             kind: RmBreakerKind::Unresolvable,
-            target: "/Users//user00/trust-vc/dumps/*".to_string(),
+            target: "/Users/_user0/trust-vc/dumps/*".to_string(),
         })
     );
     let roles: Vec<(Option<u8>, Role, bool)> =
@@ -1068,7 +1071,10 @@ fn the_trust_dialog_reads_its_folder_options_and_exit() {
         (TRUST_2_1_308, "/at.lab0/proj"),
     ] {
         let r = screen(text);
-        assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+        assert_eq!(
+            crate::phase::worker_phase(&r),
+            alab_policy::vocab::Phase::Prompt
+        );
         let p = parse_prompt_v2(&r).expect("the dialog");
         assert_eq!(p.kind, PromptKind::Trust);
         assert_eq!(p.title, "Accessing workspace:");
@@ -1177,7 +1183,7 @@ fn the_lab_boxes_read_as_measured() {
             let r = screen(text);
             assert_eq!(
                 crate::phase::worker_phase(&r),
-                crate::phase::Phase::Prompt,
+                alab_policy::vocab::Phase::Prompt,
                 "{what}"
             );
             let p = parse_prompt_v2(&r).unwrap_or_else(|| panic!("{what}: the box"));
@@ -1304,7 +1310,7 @@ fn the_lab_boxes_read_as_measured() {
         let r = screen(text);
         assert_eq!(
             crate::phase::worker_phase(&r),
-            crate::phase::Phase::Prompt,
+            alab_policy::vocab::Phase::Prompt,
             "{what}"
         );
         let p = parse_prompt_v2(&r).unwrap_or_else(|| panic!("{what}: the rm box"));
@@ -1400,7 +1406,10 @@ fn the_limit_options_dialog_reads_its_wait_row_by_label() {
         ),
     ] {
         let r = screen(text);
-        assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+        assert_eq!(
+            crate::phase::worker_phase(&r),
+            alab_policy::vocab::Phase::Prompt
+        );
         let p = parse_prompt_v2(&r).expect("the dialog");
         assert_eq!((p.kind, p.head_off_screen), (PromptKind::UsageLimit, false));
         let read: Vec<(&str, Role)> = p
@@ -1500,7 +1509,10 @@ fn the_limit_dialog_in_the_fullscreen_panel_is_read_only_whole() {
 fn a_box_whose_footer_wraps_is_read_whole() {
     let last = |r: &[String]| r.iter().rposition(|x| !x.trim().is_empty()).expect("a row");
     let r = screen(LIMIT_OPTIONS_34);
-    assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+    assert_eq!(
+        crate::phase::worker_phase(&r),
+        alab_policy::vocab::Phase::Prompt
+    );
     let p = parse_prompt_v2(&r).expect("the dialog");
     assert_eq!((p.kind, p.head_off_screen), (PromptKind::UsageLimit, false));
     let read: Vec<(&str, Role)> = p
@@ -1547,7 +1559,10 @@ fn a_box_whose_footer_wraps_is_read_whole() {
 fn a_title_ink_wrapped_names_its_box() {
     let wait = "Wait here, then continue automatically at 12:23pm";
     let r = screen(LIMIT_OPTIONS_26);
-    assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+    assert_eq!(
+        crate::phase::worker_phase(&r),
+        alab_policy::vocab::Phase::Prompt
+    );
     let p = parse_prompt_v2(&r).expect("the 26-column dialog");
     assert_eq!(
         (p.kind, p.title.as_str()),
@@ -1793,7 +1808,7 @@ fn a_plan_dialog_whose_hint_wraps_is_read() {
         let r = screen(text);
         assert_eq!(
             crate::phase::worker_phase(&r),
-            crate::phase::Phase::Prompt,
+            alab_policy::vocab::Phase::Prompt,
             "{r:#?}"
         );
         let p = parse_prompt_v2(&r).expect("the dialog");
@@ -1948,7 +1963,7 @@ fn words_that_quote_the_footer_are_not_a_box() {
         assert_eq!(parse_prompt_v2(r), None, "{name}");
         assert_ne!(
             crate::phase::worker_phase(r),
-            crate::phase::Phase::Prompt,
+            alab_policy::vocab::Phase::Prompt,
             "{name}"
         );
     }
@@ -2143,7 +2158,7 @@ fn bash_box(command_rows: &[&str], options: &[&str]) -> Vec<String> {
 
 const PERSIST_OPTIONS: [&str; 3] = [
     " ❯ 1. Yes",
-    "   2. Yes, and always allow access to /Users//x/proj from this project",
+    "   2. Yes, and always allow access to /Users/_user0/proj from this project",
     "   3. No",
 ];
 
@@ -2293,7 +2308,7 @@ fn the_question_dialog_footers_are_footers() {
         ]);
         assert_eq!(
             crate::phase::worker_phase(&r),
-            crate::phase::Phase::Prompt,
+            alab_policy::vocab::Phase::Prompt,
             "{footer}"
         );
         let p = parse_prompt_v2(&r).expect("the dialog");
@@ -2347,7 +2362,10 @@ fn a_box_under_a_multi_row_tool_output_is_a_box() {
             Some(PromptKind::Bash),
             "{above:?}"
         );
-        assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+        assert_eq!(
+            crate::phase::worker_phase(&r),
+            alab_policy::vocab::Phase::Prompt
+        );
         let mut on = rows(&above);
         on.extend(rows(&box_rows[1..]));
         on.extend(composer("  ? for shortcuts"));
@@ -2362,7 +2380,7 @@ fn a_box_quoted_in_a_message_is_not_a_box() {
         "",
         "  Accessing workspace:",
         "",
-        "  /Users//x/trusted/proj",
+        "  /Users/_user0/trusted/proj",
         "",
         "  ❯ No, exit",
         "    Yes, I trust this folder",
@@ -2391,7 +2409,7 @@ fn a_box_quoted_in_a_message_is_not_a_box() {
         assert_eq!(parse_prompt_v2(&r), None, "{quoted:?}");
         assert_ne!(
             crate::phase::worker_phase(&r),
-            crate::phase::Phase::Prompt,
+            alab_policy::vocab::Phase::Prompt,
             "{quoted:?}"
         );
         let live: Vec<String> = quoted
@@ -2435,7 +2453,7 @@ fn a_box_quoted_in_the_users_message_is_not_a_box() {
         assert_eq!(parse_prompt_v2(&r), None, "{quoted:?}");
         assert_ne!(
             crate::phase::worker_phase(&r),
-            crate::phase::Phase::Prompt,
+            alab_policy::vocab::Phase::Prompt,
             "{quoted:?}"
         );
         for above in [
@@ -2509,10 +2527,10 @@ fn a_box_quoted_under_an_indented_stop_row_is_not_a_box() {
                     }
                     assert_eq!(parse_prompt_v2(&r), None, "{r:#?}");
                     let phase = crate::phase::worker_phase(&r);
-                    assert_ne!(phase, crate::phase::Phase::Prompt, "{r:#?}");
+                    assert_ne!(phase, alab_policy::vocab::Phase::Prompt, "{r:#?}");
                     let spinner = stop.iter().any(|s| crate::phase::is_glyph_row(s));
                     if !busy && !spinner {
-                        assert_eq!(phase, crate::phase::Phase::Idle, "{r:#?}");
+                        assert_eq!(phase, alab_policy::vocab::Phase::Idle, "{r:#?}");
                     }
                 }
             }
@@ -2789,8 +2807,8 @@ fn every_2_1_282_box_reads_as_its_own_kind() {
             text: TRUST_BACKSTOP,
             kind: PromptKind::Trust,
             title: "Accessing workspace:",
-            command: "/Users//user00/aterm",
-            path: Some("/Users//user00/aterm"),
+            command: "/Users/_user0/aterm",
+            path: Some("/Users/_user0/aterm"),
             roles: &[Deny, Trust],
             select: Select::ArrowsEnter,
             cancel: Some(Reject),
@@ -2933,7 +2951,7 @@ fn every_2_1_282_box_reads_as_its_own_kind() {
         let r = screen(w.text);
         let name = w.title;
         let reading = crate::reader::read(Some("claude"), &r, None);
-        assert_eq!(reading.phase, crate::phase::Phase::Prompt, "{name}");
+        assert_eq!(reading.phase, alab_policy::vocab::Phase::Prompt, "{name}");
         assert!(reading.phase_authoritative, "{name}");
         let p = reading.prompt.expect("the box");
         assert_eq!(p.kind, w.kind, "{name}");
@@ -3246,7 +3264,7 @@ fn a_footerless_box_is_read_over_the_retry_row_it_left_standing() {
     assert_eq!(p.span.1, retry - 2, "the box ends on its last option");
     assert_eq!(prompt_box_first_row(&r), Some(p.span.0));
     let reading = crate::reader::read(Some("claude"), &r, None);
-    assert_eq!(reading.phase, crate::phase::Phase::Prompt);
+    assert_eq!(reading.phase, alab_policy::vocab::Phase::Prompt);
     assert!(reading.phase_authoritative);
 
     let mut scrolled = r.clone();
@@ -3290,7 +3308,7 @@ fn a_footerless_box_is_read_at_the_live_bottom_only() {
         assert_eq!(parse_prompt_v2(&quoted), None, "{name} quoted");
         assert_ne!(
             crate::phase::worker_phase(&quoted),
-            crate::phase::Phase::Prompt,
+            alab_policy::vocab::Phase::Prompt,
             "{name}"
         );
 
@@ -3506,7 +3524,10 @@ fn a_card_mode_tool_box_is_read_by_its_shape() {
         assert!(p.tool_card(), "{t}");
         assert_eq!(p.question, None);
         assert_eq!(p.cancel.map(|c| c.effect), Some(CancelEffect::Reject));
-        assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Prompt);
+        assert_eq!(
+            crate::phase::worker_phase(&r),
+            alab_policy::vocab::Phase::Prompt
+        );
     }
     assert!(!parse_prompt_v2(&screen(BOX_TOOL)).expect("box").tool_card());
     let swap = |from: &str, to: &str| -> Vec<String> {
@@ -3575,7 +3596,7 @@ fn a_box_taller_than_the_pane_is_read_with_its_head_off_screen() {
         assert_eq!(p.span.1, r.len() - 1, "{name}");
         assert!(!p.tool_card(), "{name}");
         let reading = crate::reader::read(Some("claude"), &r, None);
-        assert_eq!(reading.phase, crate::phase::Phase::Prompt, "{name}");
+        assert_eq!(reading.phase, alab_policy::vocab::Phase::Prompt, "{name}");
         assert!(reading.phase_authoritative, "{name}");
         let mut scrolled = r.clone();
         scrolled.extend(composer("  ? for shortcuts"));
@@ -3658,7 +3679,7 @@ fn a_cut_box_starting_at_its_question_or_an_option_reads_without_panic() {
         }
         let reading = crate::reader::read(Some("claude"), &r, None);
         assert!(reading.phase_authoritative, "{name}");
-        assert_ne!(reading.phase, crate::phase::Phase::Idle, "{name}");
+        assert_ne!(reading.phase, alab_policy::vocab::Phase::Idle, "{name}");
     }
 }
 
@@ -3689,7 +3710,8 @@ fn a_box_cut_at_its_question_is_no_tool_card() {
 
 #[test]
 fn claudes_composer_under_a_table_is_no_footerless_dialog() {
-    use crate::phase::{Phase, worker_phase};
+    use crate::phase::worker_phase;
+    use alab_policy::vocab::Phase;
     for (composer_row, footer) in [
         ("❯ Try \"refactor <filepath>\"", "  ? for shortcuts"),
         (
@@ -3745,7 +3767,7 @@ fn claudes_composer_under_a_table_is_no_footerless_dialog() {
 
 #[test]
 fn the_mcp_server_dialogs_are_named_by_their_titles_and_every_answer_is_kept() {
-    use crate::phase::Phase;
+    use alab_policy::vocab::Phase;
     let one = screen(MCP_SERVER_ONE);
     let p = parse_prompt_v2(&one).expect("the one-server dialog");
     assert_eq!(p.kind, PromptKind::McpServer);
@@ -4674,7 +4696,7 @@ fn the_settings_errors_continue_without_is_its_refusal() {
 
 #[test]
 fn the_model_switch_confirmation_is_read_by_its_title_under_the_panel_rule() {
-    use crate::phase::Phase;
+    use alab_policy::vocab::Phase;
     for (name, text, subject) in [
         ("model", MODEL_SWITCH, "switch to Sonnet 5"),
         ("inline", MODEL_SWITCH_INLINE, "switch to Opus 5.5"),
@@ -4763,7 +4785,7 @@ fn the_model_switch_confirmation_is_read_by_its_title_under_the_panel_rule() {
 
 #[test]
 fn a_footerless_box_whose_head_is_cut_is_read_with_its_head_off_screen() {
-    use crate::phase::Phase;
+    use alab_policy::vocab::Phase;
     let tail = |r: &[String], n: usize| r[r.len() - n..].to_vec();
     for (name, text, kind) in [
         ("network", BOX_NETWORK, PromptKind::NetworkRequest),
@@ -4956,7 +4978,7 @@ fn a_footerless_box_is_titled_by_the_nearest_titled_row() {
 
 #[test]
 fn claudes_composer_with_its_top_rule_cut_is_no_box() {
-    use crate::phase::Phase;
+    use alab_policy::vocab::Phase;
     let tail = |r: Vec<String>, n: usize| r[r.len() - n..].to_vec();
     let survey: Vec<String> = include_str!("fixtures/survey-open.txt")
         .lines()
@@ -4998,7 +5020,7 @@ fn claudes_composer_with_its_top_rule_cut_is_no_box() {
 
 #[test]
 fn a_gutter_row_in_a_live_box_body_never_reads_idle() {
-    use crate::phase::Phase;
+    use alab_policy::vocab::Phase;
     let rule = "─".repeat(120);
     let tall = |head: &[&str], body: usize, foot: &[&str]| {
         let mut r = rows(head);
@@ -5169,7 +5191,7 @@ fn a_plan_taller_than_the_tail_is_still_a_plan() {
     assert_eq!(cut.title, crate::anchor!("plan.proceed"));
     assert_eq!(
         crate::reader::read(Some("claude"), &tail, None).phase,
-        crate::phase::Phase::Prompt
+        alab_policy::vocab::Phase::Prompt
     );
 }
 
@@ -5192,7 +5214,7 @@ fn the_plan_question_and_hint_ink_wrapped_are_one_dialog() {
     );
     assert_eq!(p.span.1, r.len() - 1, "the hint's last row");
     let read = crate::reader::read(Some("claude"), &r, None);
-    assert_eq!(read.phase, crate::phase::Phase::Prompt);
+    assert_eq!(read.phase, alab_policy::vocab::Phase::Prompt);
     assert!(read.phase_authoritative);
 
     let r = screen(PLAN_APPROVAL_TALL_80_2_1_300);
@@ -5200,7 +5222,7 @@ fn the_plan_question_and_hint_ink_wrapped_are_one_dialog() {
     let p = parse_prompt_v2(&r).expect("the 80-column dialog");
     assert_eq!((p.kind, p.title.as_str()), (PromptKind::PlanExit, proceed));
     assert_eq!(p.options.len(), 3);
-    assert_eq!(crate::worker_phase(&r), crate::Phase::Prompt);
+    assert_eq!(crate::worker_phase(&r), alab_policy::vocab::Phase::Prompt);
 
     let mut quoted = screen(PLAN_APPROVAL_TALL_80_2_1_300);
     quoted.extend(composer("  ? for shortcuts"));
@@ -5366,7 +5388,10 @@ fn a_bracketed_box_is_read_by_its_dashes_not_by_a_column() {
     let bash = |text: &str| {
         let p = parse_prompt_v2(&screen(text)).expect("the box");
         assert_eq!(p.kind, PromptKind::Bash);
-        assert_eq!(crate::worker_phase(&screen(text)), crate::Phase::Prompt);
+        assert_eq!(
+            crate::worker_phase(&screen(text)),
+            alab_policy::vocab::Phase::Prompt
+        );
         assert!(p.notes.iter().all(|n| !n.contains('╌')), "{:?}", p.notes);
         p
     };
@@ -5435,7 +5460,7 @@ fn a_bracketed_box_is_read_by_its_dashes_not_by_a_column() {
         let p = bash(&rows.join("\n"));
         assert_eq!(
             crate::worker_phase(&rows),
-            crate::Phase::Prompt,
+            alab_policy::vocab::Phase::Prompt,
             "{footer:?}"
         );
         assert_eq!(p.command_rows, ["touch sub-x"], "{footer:?}");
@@ -5475,7 +5500,7 @@ fn a_bracketed_box_is_read_by_its_dashes_not_by_a_column() {
 
     for text in [BOX_FETCH_2_1_287, BOX_FETCH_ASK_RULE_2_1_287] {
         let r = screen(text);
-        assert_eq!(crate::worker_phase(&r), crate::Phase::Prompt);
+        assert_eq!(crate::worker_phase(&r), alab_policy::vocab::Phase::Prompt);
         let p = parse_prompt_v2(&r).expect("the fetch box");
         assert_eq!(p.kind, PromptKind::Fetch);
         assert!(
@@ -5676,7 +5701,7 @@ fn wrapped_non_shell_review_reasons_keep_their_block_boundaries() {
 #[test]
 fn the_plan_approval_is_a_box_without_a_footer() {
     let r = screen(PLAN_APPROVAL);
-    assert_eq!(crate::worker_phase(&r), crate::Phase::Prompt);
+    assert_eq!(crate::worker_phase(&r), alab_policy::vocab::Phase::Prompt);
     let p = parse_prompt_v2(&r).expect("the plan approval");
     assert_eq!(p.kind, PromptKind::PlanExit);
     assert!(

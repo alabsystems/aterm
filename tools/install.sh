@@ -880,6 +880,11 @@ bounded() {
 		[[ -z "${BOUNDED_OUT:-}" ]] || exec >"$BOUNDED_OUT"
 		[[ -z "${BOUNDED_ERR:-}" ]] || exec 3>"$BOUNDED_ERR"
 		unset BOUNDED_OUT BOUNDED_ERR
+		pid="" pending_signal="" pending_status=0
+		trap 'pending_signal=INT; pending_status=130' INT
+		trap 'pending_signal=TERM; pending_status=143' TERM
+		trap 'pending_signal=HUP; pending_status=129' HUP
+		trap 'pending_signal=QUIT; pending_status=131' QUIT
 		set -m
 		"$@" 2>&3 </dev/null &
 		pid=$!
@@ -888,6 +893,7 @@ bounded() {
 		trap 'bounded_cut TERM 143' TERM
 		trap 'bounded_cut HUP 129' HUP
 		trap 'bounded_cut QUIT 131' QUIT
+		[[ -z "$pending_signal" ]] || bounded_cut "$pending_signal" "$pending_status"
 		deadline=$((SECONDS + secs))
 		looks=0
 		while kill -0 "$pid" 2>/dev/null; do
@@ -3785,8 +3791,90 @@ hold_kills() {
 	trap 'run_cut HUP 129' HUP
 }
 
+# Run a post-swap command without a time limit, but with a wait a signal can
+# interrupt. A foreground external command can hold bash's EXIT cleanup until
+# it ends even after TERM/HUP reset to their defaults. Own the child's group so
+# ending the installer also ends the work it started, before cleanup runs. A
+# shell phase first forwards TERM to its shells so nested bounded calls can
+# close their own groups; an ordinary command is killed directly.
+interruptible() {
+	local interrupt_pid="" interrupt_signal="" interrupt_status=0
+	local interrupt_traps interrupt_monitor=0 rc=0
+	local interrupt_cooperative="${INTERRUPTIBLE_COOPERATIVE:-0}"
+	local INTERRUPTIBLE_COOPERATIVE=0
+	interrupt_traps="$(trap -p INT TERM HUP QUIT)"
+	[[ $- != *m* ]] || interrupt_monitor=1
+	# Record a signal during launch, then handle it once $! has been captured.
+	trap 'interrupt_signal=INT; interrupt_status=130' INT
+	trap 'interrupt_signal=TERM; interrupt_status=143' TERM
+	trap 'interrupt_signal=HUP; interrupt_status=129' HUP
+	trap 'interrupt_signal=QUIT; interrupt_status=131' QUIT
+	set -m
+	"$@" <&0 &
+	interrupt_pid=$!
+	[[ "$interrupt_monitor" == 1 ]] || set +m
+	trap 'interruptible_cut INT 130' INT
+	trap 'interruptible_cut TERM 143' TERM
+	trap 'interruptible_cut HUP 129' HUP
+	trap 'interruptible_cut QUIT 131' QUIT
+	[[ -z "$interrupt_signal" ]] || interruptible_cut "$interrupt_signal" "$interrupt_status"
+	wait "$interrupt_pid" || rc=$?
+	trap - INT TERM HUP QUIT
+	eval "$interrupt_traps"
+	return "$rc"
+}
+
+interruptible_cut() { # <signal> <status>; interruptible owns interrupt_pid
+	trap '' INT TERM HUP QUIT
+	if [[ "$interrupt_cooperative" == 1 ]]; then
+		# Shell phases may contain bounded's separate child groups. Signal all
+		# their shells, then let those handlers kill their groups before this
+		# group disappears. Killing the phase first strands those children.
+		kill -TERM -- "-$interrupt_pid" 2>/dev/null || true
+		local interrupt_deadline=$((SECONDS + VERIFY_WAIT_SECS))
+		while kill -0 -- "-$interrupt_pid" 2>/dev/null; do
+			[[ "$SECONDS" -lt "$interrupt_deadline" ]] || break
+			sleep 0.02
+		done
+	fi
+	kill -KILL -- "-$interrupt_pid" 2>/dev/null || true
+	wait "$interrupt_pid" 2>/dev/null || true
+	run_cut "$1" "$2"
+}
+
+# A shell phase carries its state back only on normal completion. Its file is
+# private, named in the caller's cleanup before launch, and contains only our
+# printf-%q assignments. A cut never reads a half-written state. Keep the
+# installing shell outside the phase, with its EXIT cleanup and live stdout.
+post_swap_step() { # <space-separated scalar names> <function> [args...]
+	local post_state post_names="$1"
+	shift
+	local BOUNDED_TEMPS=(${BOUNDED_TEMPS[@]+"${BOUNDED_TEMPS[@]}"})
+	probe_temp post_state aterm-step || return 1
+	INTERRUPTIBLE_COOPERATIVE=1 interruptible post_swap_body "$post_state" "$post_names" "$@"
+	. "$post_state"
+	interruptible rm -f "$post_state"
+}
+
+post_swap_body() {
+	local post_body_file="$1" post_body_names="$2" post_body_name
+	local POST_SWAP_PHASE=1
+	set +m
+	end_on_ctrl_c
+	hold_kills
+	shift 2
+	"$@"
+	for post_body_name in $post_body_names; do
+		printf '%s=%q\n' "$post_body_name" "${!post_body_name}"
+	done >"$post_body_file"
+}
+
 release_kills() {
-	trap - TERM HUP
+	if [[ "${POST_SWAP_PHASE:-0}" == 1 ]]; then
+		hold_kills
+	else
+		trap - TERM HUP
+	fi
 }
 
 # Expand the zip, or mount the DMG, <asset> at <mnt>, TERM and HUP held from
@@ -6166,6 +6254,85 @@ path_step_plan() {
 	esac
 }
 
+# --- the toolset half: what "installing aterm" is for ---------------------------
+# docs/GOLDEN-INSTALL-PATH.md §1: "Installing aterm installs all those packages."
+#
+# `atpkg seed` makes every decision, not this script: it records adoption, lays
+# the pending stubs, and answers every "cannot seed" case as success with a
+# stable line (`seed-unusable:` for a machine the signed index publishes nothing
+# for, a plain note for [packages].auto_install = false or a set a previous
+# `uninstall --all` declined). So a non-zero exit is a real failure, with one
+# exception, ATPKG_CONTENDED_EXIT: another atpkg run holds the store lock
+# (usually the open app's launch-time pass), and the script stands aside and
+# says so.
+install_toolchain() {
+	local aterm_bin
+	aterm_bin="$(toolset_driver)"
+	if [[ "$aterm_bin" != "run "* ]]; then
+		echo "install.sh: SKIPPED the ALab toolset: ${aterm_bin#skip }" >&2
+		return 0
+	fi
+	aterm_bin="${aterm_bin#run }"
+
+	# One line on every lane: where the builds come from (a pinned pre-v0.63
+	# app's sealed payload, else the signed network index) and whether this
+	# machine has any is `pkg seed`'s to decide and to say.
+	local why
+	why="$(toolset_withheld)"
+	if [[ -n "$why" ]]; then
+		echo "install.sh: toolset: none installs — $why"
+	else
+		echo "install.sh: installing the ALab toolset (aterm pkg seed)"
+	fi
+	local rc=0
+	interruptible "$aterm_bin" pkg seed || rc=$?
+	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
+		# Stood aside: another atpkg run holds the store lock — usually the
+		# app's own launch-time pass, which finishes the job, but a person's
+		# `aterm pkg` holds the same lock and install.sh cannot tell which, so
+		# the line names no holder. A stand-down is not "nothing was
+		# installed": a wrapper keyed on the exit code must not read it as a
+		# failed install.
+		echo "install.sh: another aterm pkg run is using the ALab toolset — rerun later: $aterm_bin pkg seed" >&2
+		TOOLCHAIN_RAN=1
+		return 0
+	elif [[ $rc -ne 0 ]]; then
+		# Non-fatal: the terminal is installed and working, and `aterm pkg seed`
+		# is re-runnable at any time.
+		echo "install.sh: aterm is installed; the ALab toolset did not install (exit $rc) — rerun: $aterm_bin pkg seed" >&2
+		return 0
+	fi
+	TOOLCHAIN_RAN=1
+
+	# Bring the seeded builds current now: the GUI does so on its own loop, which
+	# never runs for someone who installed from a terminal and never opens the
+	# app. Only what drifted is fetched; an offline machine keeps what it has.
+	# Its input is /dev/null, as when this script is piped to sh, so the update
+	# is never read as one a person typed: such an update ends with `aterm init`,
+	# and this script's halves are the ones its header lists (setup is the app's
+	# first launch on a Mac, else the person's own `aterm init`). A word for that
+	# (`--no-init`) would be refused by an older installed aterm this drives. A
+	# contended store therefore stands aside at once (exit 75, said below) rather
+	# than waiting for the other pass.
+	echo "install.sh: updating the ALab toolset (aterm pkg update)"
+	rc=0
+	interruptible "$aterm_bin" pkg update </dev/null || rc=$?
+	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
+		# Stood aside, as for the seed above: no holder is named.
+		echo "install.sh: another aterm pkg run is using the ALab toolset — rerun later: $aterm_bin pkg update" >&2
+	elif [[ $rc -eq $ATPKG_OFFLINE_EXIT ]]; then
+		echo "install.sh: NOTE: could not reach the index to check for newer builds." >&2
+		echo "  anything already installed keeps working; retry later with: $aterm_bin pkg update" >&2
+	elif [[ $rc -ne 0 ]]; then
+		echo "install.sh: NOTE: the toolset update failed (exit $rc) — anything already installed keeps working." >&2
+		echo "  retry with: $aterm_bin pkg update" >&2
+	fi
+	# Deliberately does not set INSTALLED_ANY. This half runs on top of an app
+	# the other halves (or a previous run) placed, and on an already-seeded
+	# machine it correctly does nothing — claiming an install here would turn
+	# the "nothing was installed" failure into a false success.
+}
+
 # The test seam: a suite sources this file with ATERM_INSTALL_LIBRARY_ONLY=1 to
 # drive the functions above without parsing arguments or touching the host.
 if [[ "${ATERM_INSTALL_LIBRARY_ONLY:-0}" == 1 ]]; then
@@ -7023,6 +7190,11 @@ install_app() {
 	# the swap. Same rule for the set-aside path, and for the folder a root run
 	# stages in (stage_bundle).
 	place_bundle "$MNT/aterm.app" "$DEST"
+	post_swap_step 'PLACED_ATERM APP_TO_OPEN INSTALLED_ANY' install_app_finish
+}
+
+# Work after the atomic bundle swap, in one cancellable shell phase.
+install_app_finish() {
 	record_placed_command "$DEST/aterm.app/Contents/MacOS/aterm"
 
 	# Nudge Spotlight (a run as the account staged a folder whose name is no
@@ -7030,8 +7202,8 @@ install_app() {
 	# bundle; a root run staged aterm.app in a folder of its own, and the
 	# rename moved it) and LaunchServices, so the app is findable at its final
 	# path the moment the installer exits.
-	mdimport "$DEST/aterm.app" >/dev/null 2>&1 || true
-	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+	interruptible mdimport "$DEST/aterm.app" >/dev/null 2>&1 || true
+	interruptible /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
 		-f "$DEST/aterm.app" >/dev/null 2>&1 || true
 
 	# Read here, not inside a command substitution, whose stdout is its pipe.
@@ -7044,10 +7216,10 @@ install_app() {
 	# multi-minute toolset seed downstream would hold open. The EXIT trap repeats
 	# this harmlessly.
 	if [[ "${CONTAINER_KIND:-dmg}" == dmg && -d "$MNT" ]]; then
-		hdiutil detach "$MNT" -quiet >/dev/null 2>&1 ||
-			{ sleep 2; hdiutil detach "$MNT" -force -quiet >/dev/null 2>&1; } || true
+		interruptible hdiutil detach "$MNT" -quiet >/dev/null 2>&1 ||
+			{ interruptible sleep 2; interruptible hdiutil detach "$MNT" -force -quiet >/dev/null 2>&1; } || true
 	fi
-	rm -rf "$TMP" 2>/dev/null || true
+	interruptible rm -rf "$TMP" 2>/dev/null || true
 
 	echo "install.sh: installed aterm $VERSION -> $DEST/aterm.app"
 	# A running aterm is not opened again: it takes the new version on its
@@ -7156,85 +7328,6 @@ install_linux_app() {
 	LINUX_APP_INSTALLED=1
 }
 
-# --- the toolset half: what "installing aterm" is for ---------------------------
-# docs/GOLDEN-INSTALL-PATH.md §1: "Installing aterm installs all those packages."
-#
-# `atpkg seed` makes every decision, not this script: it records adoption, lays
-# the pending stubs, and answers every "cannot seed" case as success with a
-# stable line (`seed-unusable:` for a machine the signed index publishes nothing
-# for, a plain note for [packages].auto_install = false or a set a previous
-# `uninstall --all` declined). So a non-zero exit is a real failure, with one
-# exception, ATPKG_CONTENDED_EXIT: another atpkg run holds the store lock
-# (usually the open app's launch-time pass), and the script stands aside and
-# says so.
-install_toolchain() {
-	local aterm_bin
-	aterm_bin="$(toolset_driver)"
-	if [[ "$aterm_bin" != "run "* ]]; then
-		echo "install.sh: SKIPPED the ALab toolset: ${aterm_bin#skip }" >&2
-		return 0
-	fi
-	aterm_bin="${aterm_bin#run }"
-
-	# One line on every lane: where the builds come from (a pinned pre-v0.63
-	# app's sealed payload, else the signed network index) and whether this
-	# machine has any is `pkg seed`'s to decide and to say.
-	local why
-	why="$(toolset_withheld)"
-	if [[ -n "$why" ]]; then
-		echo "install.sh: toolset: none installs — $why"
-	else
-		echo "install.sh: installing the ALab toolset (aterm pkg seed)"
-	fi
-	local rc=0
-	"$aterm_bin" pkg seed || rc=$?
-	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
-		# Stood aside: another atpkg run holds the store lock — usually the
-		# app's own launch-time pass, which finishes the job, but a person's
-		# `aterm pkg` holds the same lock and install.sh cannot tell which, so
-		# the line names no holder. A stand-down is not "nothing was
-		# installed": a wrapper keyed on the exit code must not read it as a
-		# failed install.
-		echo "install.sh: another aterm pkg run is using the ALab toolset — rerun later: $aterm_bin pkg seed" >&2
-		TOOLCHAIN_RAN=1
-		return 0
-	elif [[ $rc -ne 0 ]]; then
-		# Non-fatal: the terminal is installed and working, and `aterm pkg seed`
-		# is re-runnable at any time.
-		echo "install.sh: aterm is installed; the ALab toolset did not install (exit $rc) — rerun: $aterm_bin pkg seed" >&2
-		return 0
-	fi
-	TOOLCHAIN_RAN=1
-
-	# Bring the seeded builds current now: the GUI does so on its own loop, which
-	# never runs for someone who installed from a terminal and never opens the
-	# app. Only what drifted is fetched; an offline machine keeps what it has.
-	# Its input is /dev/null, as when this script is piped to sh, so the update
-	# is never read as one a person typed: such an update ends with `aterm init`,
-	# and this script's halves are the ones its header lists (setup is the app's
-	# first launch on a Mac, else the person's own `aterm init`). A word for that
-	# (`--no-init`) would be refused by an older installed aterm this drives. A
-	# contended store therefore stands aside at once (exit 75, said below) rather
-	# than waiting for the other pass.
-	echo "install.sh: updating the ALab toolset (aterm pkg update)"
-	rc=0
-	"$aterm_bin" pkg update </dev/null || rc=$?
-	if [[ $rc -eq $ATPKG_CONTENDED_EXIT ]]; then
-		# Stood aside, as for the seed above: no holder is named.
-		echo "install.sh: another aterm pkg run is using the ALab toolset — rerun later: $aterm_bin pkg update" >&2
-	elif [[ $rc -eq $ATPKG_OFFLINE_EXIT ]]; then
-		echo "install.sh: NOTE: could not reach the index to check for newer builds." >&2
-		echo "  anything already installed keeps working; retry later with: $aterm_bin pkg update" >&2
-	elif [[ $rc -ne 0 ]]; then
-		echo "install.sh: NOTE: the toolset update failed (exit $rc) — anything already installed keeps working." >&2
-		echo "  retry with: $aterm_bin pkg update" >&2
-	fi
-	# Deliberately does not set INSTALLED_ANY. This half runs on top of an app
-	# the other halves (or a previous run) placed, and on an already-seeded
-	# machine it correctly does nothing — claiming an install here would turn
-	# the "nothing was installed" failure into a false success.
-}
-
 # --- PATH, for shells that are not aterm ------------------------------------------
 # atpkg writes a per-shell hook into ~/.aterm/shell.d on every install, and its
 # seed, install and update passes append a block sourcing it to each EXISTING
@@ -7262,6 +7355,92 @@ wire_shell_path() {
 	fi
 }
 
+# The remaining install halves share one cancellable shell phase.
+finish_install() {
+	if [[ "$DO_CLI" -eq 1 ]]; then
+		if [[ -n "$CLI_SKIP" ]]; then
+			echo "install.sh: SKIPPED the CLI (aterm): $CLI_SKIP" >&2
+		else
+			install_cli
+		fi
+	fi
+	# After the CLI half: the seed lane is driven through the installed `aterm`, so
+	# it needs the symlink (or the bundle) to exist. Before the PATH half, which
+	# points at a hook that exists only once atpkg has laid the toolset down.
+	#
+	# Not gated on the app half having run: `--no-app` is the normal way to say
+	# "the app is already installed", and install_toolchain proves an `aterm`
+	# exists and skips with a reason when it does not.
+	if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
+		if [[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]]; then
+			# The lean default (docs/DESIGN-streaming-batteries-2026-08-23.md §7):
+			# first launch provisions the toolset per program with live progress,
+			# and the GUI's own seed pass records adoption there — the audited
+			# consent seam (atpkg cmd_seed). A headless `pkg seed` here would block
+			# on the full download and move the consent write out of that seam.
+			# TOOLCHAIN_DEFERRED is set only by a fresh lean-default app install
+			# whose user holds this Mac's console (toolset_deferral); every other
+			# lane (--no-app, an already-current app, a pinned pre-lean DMG,
+			# Linux, an install over SSH) runs install_toolchain here. A root run
+			# for someone else stays deferred: no toolset is ever seeded as root.
+			TOOLSET_WHY="$(toolset_withheld)"
+			if [[ "${TOOLSET_AS_ROOT:-0}" -eq 1 ]]; then
+				echo "install.sh: toolset: $ROOT_TOOLSET_LINE"
+			elif [[ -n "$TOOLSET_WHY" ]]; then
+				echo "install.sh: toolset: none installs — $TOOLSET_WHY"
+			elif [[ -z "$APP_TO_OPEN" ]]; then
+				# An app this run opens says it in open_installed_app's line.
+				echo "install.sh: toolset: installs on aterm's first launch (from a terminal instead: aterm pkg install --default-set)"
+			fi
+		else
+			if [[ "${TOOLSET_NO_WINDOW:-0}" -eq 1 && -z "$(toolset_withheld)" ]]; then
+				echo "install.sh: toolset: you are not at this Mac's console, so no aterm window will install it — installing it here"
+			fi
+			install_toolchain
+		fi
+	else
+		# --no-toolchain persists (persist_no_toolchain) in every aterm.toml an
+		# aterm here reads (aterm_config_paths): the app's first launch reads the
+		# same key and leaves the toolset alone. A write that fails is said, never
+		# fatal — the halves already installed stand.
+		while IFS= read -r NO_TOOLCHAIN_CFG; do
+			persist_no_toolchain "$NO_TOOLCHAIN_CFG" ||
+				echo "install.sh: NOTE: could not write $NO_TOOLCHAIN_CFG; set \`[packages] auto_install = false\` there by hand to keep the toolset out" >&2
+		done <<<"$(aterm_config_paths)"
+	fi
+	if [[ "$DO_PATH" -eq 1 ]]; then
+		wire_shell_path
+	fi
+	# The deferred PATH hint: when the managed block (which carries $BIN_DIR)
+	# exists, telling the user to hand-edit the same profile is noise; every path
+	# where no block does — --no-path, no hook laid down (nothing installable for
+	# this machine, failed seed), an unrecognised shell, an unwritable rc — still
+	# ends with the actionable NOTE. cli_path_hint itself re-checks PATH
+	# membership, so it stays silent when $BIN_DIR is already reachable.
+	if [[ "$CLI_PATH_HINT_WANTED" -eq 1 && "$PATH_BLOCK_WROTE" -eq 0 ]]; then
+		cli_path_hint
+	fi
+	if [[ -n "$APP_TO_OPEN" ]]; then
+		open_installed_app "$APP_TO_OPEN" \
+			"$([[ "$DO_TOOLCHAIN" -eq 1 && "${TOOLCHAIN_DEFERRED:-0}" -eq 1 && -z "$(toolset_withheld)" ]] && echo 1 || echo 0)"
+		APP_TO_OPEN=""
+	fi
+	if [[ "$INSTALLED_ANY" -eq 0 ]]; then
+		# A toolchain/PATH-only invocation (--no-app --no-cli) installs nothing by
+		# INSTALLED_ANY's deliberately narrow definition even when it did exactly
+		# what was asked; a completed seed or a standing managed PATH block is that
+		# run's success, so it must not exit "nothing was installed".
+		if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 ]] &&
+			[[ "$TOOLCHAIN_RAN" -eq 1 || "$PATH_BLOCK_WROTE" -eq 1 ]]; then
+			join_secrets_headless
+			return 0
+		fi
+		echo "install.sh: nothing was installed" >&2
+		exit 1
+	fi
+	join_secrets_headless
+}
+
 # --- run what's possible, skip the rest loudly, fail only if nothing ran -------
 if [[ "$DO_APP" -eq 1 ]]; then
 	if [[ -n "$APP_SKIP" ]]; then
@@ -7277,88 +7456,7 @@ if [[ "$DO_APP" -eq 1 ]]; then
 		install_app
 	fi
 fi
-if [[ "$DO_CLI" -eq 1 ]]; then
-	if [[ -n "$CLI_SKIP" ]]; then
-		echo "install.sh: SKIPPED the CLI (aterm): $CLI_SKIP" >&2
-	else
-		install_cli
-	fi
-fi
-# After the CLI half: the seed lane is driven through the installed `aterm`, so
-# it needs the symlink (or the bundle) to exist. Before the PATH half, which
-# points at a hook that exists only once atpkg has laid the toolset down.
-#
-# Not gated on the app half having run: `--no-app` is the normal way to say
-# "the app is already installed", and install_toolchain proves an `aterm`
-# exists and skips with a reason when it does not.
-if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
-	if [[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]]; then
-		# The lean default (docs/DESIGN-streaming-batteries-2026-08-23.md §7):
-		# first launch provisions the toolset per program with live progress,
-		# and the GUI's own seed pass records adoption there — the audited
-		# consent seam (atpkg cmd_seed). A headless `pkg seed` here would block
-		# on the full download and move the consent write out of that seam.
-		# TOOLCHAIN_DEFERRED is set only by a fresh lean-default app install
-		# whose user holds this Mac's console (toolset_deferral); every other
-		# lane (--no-app, an already-current app, a pinned pre-lean DMG,
-		# Linux, an install over SSH) runs install_toolchain here. A root run
-		# for someone else stays deferred: no toolset is ever seeded as root.
-		TOOLSET_WHY="$(toolset_withheld)"
-		if [[ "${TOOLSET_AS_ROOT:-0}" -eq 1 ]]; then
-			echo "install.sh: toolset: $ROOT_TOOLSET_LINE"
-		elif [[ -n "$TOOLSET_WHY" ]]; then
-			echo "install.sh: toolset: none installs — $TOOLSET_WHY"
-		elif [[ -z "$APP_TO_OPEN" ]]; then
-			# An app this run opens says it in open_installed_app's line.
-			echo "install.sh: toolset: installs on aterm's first launch (from a terminal instead: aterm pkg install --default-set)"
-		fi
-	else
-		if [[ "${TOOLSET_NO_WINDOW:-0}" -eq 1 && -z "$(toolset_withheld)" ]]; then
-			echo "install.sh: toolset: you are not at this Mac's console, so no aterm window will install it — installing it here"
-		fi
-		install_toolchain
-	fi
-else
-	# --no-toolchain persists (persist_no_toolchain) in every aterm.toml an
-	# aterm here reads (aterm_config_paths): the app's first launch reads the
-	# same key and leaves the toolset alone. A write that fails is said, never
-	# fatal — the halves already installed stand.
-	while IFS= read -r NO_TOOLCHAIN_CFG; do
-		persist_no_toolchain "$NO_TOOLCHAIN_CFG" ||
-			echo "install.sh: NOTE: could not write $NO_TOOLCHAIN_CFG; set \`[packages] auto_install = false\` there by hand to keep the toolset out" >&2
-	done <<<"$(aterm_config_paths)"
-fi
-if [[ "$DO_PATH" -eq 1 ]]; then
-	wire_shell_path
-fi
-# The deferred PATH hint: when the managed block (which carries $BIN_DIR)
-# exists, telling the user to hand-edit the same profile is noise; every path
-# where no block does — --no-path, no hook laid down (nothing installable for
-# this machine, failed seed), an unrecognised shell, an unwritable rc — still
-# ends with the actionable NOTE. cli_path_hint itself re-checks PATH
-# membership, so it stays silent when $BIN_DIR is already reachable.
-if [[ "$CLI_PATH_HINT_WANTED" -eq 1 && "$PATH_BLOCK_WROTE" -eq 0 ]]; then
-	cli_path_hint
-fi
-if [[ -n "$APP_TO_OPEN" ]]; then
-	open_installed_app "$APP_TO_OPEN" \
-		"$([[ "$DO_TOOLCHAIN" -eq 1 && "${TOOLCHAIN_DEFERRED:-0}" -eq 1 && -z "$(toolset_withheld)" ]] && echo 1 || echo 0)"
-	APP_TO_OPEN=""
-fi
-if [[ "$INSTALLED_ANY" -eq 0 ]]; then
-	# A toolchain/PATH-only invocation (--no-app --no-cli) installs nothing by
-	# INSTALLED_ANY's deliberately narrow definition even when it did exactly
-	# what was asked; a completed seed or a standing managed PATH block is that
-	# run's success, so it must not exit "nothing was installed".
-	if [[ "$DO_APP" -eq 0 && "$DO_CLI" -eq 0 ]] &&
-		[[ "$TOOLCHAIN_RAN" -eq 1 || "$PATH_BLOCK_WROTE" -eq 1 ]]; then
-		join_secrets_headless
-		exit 0
-	fi
-	echo "install.sh: nothing was installed" >&2
-	exit 1
-fi
-join_secrets_headless
+post_swap_step 'APP_TO_OPEN' finish_install
 }
 
 # The guard's other half (see the whole-file execution guard above). This call

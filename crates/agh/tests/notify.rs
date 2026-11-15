@@ -30,7 +30,7 @@ use aterm_json::Value;
 
 use crate::common::{self, HANG, SIM_START, slug};
 
-const SID: &str = "s-0123456789abcdef";
+const SID: &str = "t6789abcdef";
 
 /// What the test broker does after it has read one line past `AUTH`.
 enum Reply {
@@ -164,7 +164,7 @@ fn line(text: &str) -> Reply {
     Reply::Line(text.to_string())
 }
 
-const CONNECTED: &str = "OK schema=1 sid=s-0123456789abcdef fabric=connected";
+const CONNECTED: &str = "OK schema=1 sid=t6789abcdef fabric=connected";
 
 fn notice() -> Notice {
     Notice::converged(
@@ -222,7 +222,7 @@ fn a_post_runs_the_six_steps() {
 fn a_disconnected_fabric_is_skipped_and_posts_nothing() {
     let broker = Broker::new();
     let handle = broker.serve(
-        vec![line("OK schema=1 sid=s-0123456789abcdef fabric=absent")],
+        vec![line("OK schema=1 sid=t6789abcdef fabric=absent")],
         false,
     );
     assert_eq!(
@@ -232,9 +232,9 @@ fn a_disconnected_fabric_is_skipped_and_posts_nothing() {
     assert_eq!(heard(handle).len(), 2);
 
     for status in [
-        "OK schema=1 sid=s-0123456789abcdef",
-        "OK schema=1 sid=s-0123456789abcdef fabric=Connected",
-        "OK schema=1 sid=s-0123456789abcdef fabric=connected,",
+        "OK schema=1 sid=t6789abcdef",
+        "OK schema=1 sid=t6789abcdef fabric=Connected",
+        "OK schema=1 sid=t6789abcdef fabric=connected,",
     ] {
         let broker = Broker::new();
         let handle = broker.serve(vec![line(status)], false);
@@ -348,9 +348,7 @@ fn an_oversized_or_unframed_reply_is_failed() {
 
     let broker = Broker::new();
     let handle = broker.serve(
-        vec![line(
-            "OK schema=1 sid=s-0123456789abcdef fabric=connected\r",
-        )],
+        vec![line("OK schema=1 sid=t6789abcdef fabric=connected\r")],
         false,
     );
     assert_eq!(
@@ -386,21 +384,39 @@ fn no_session_and_mux_are_skipped() {
             "no-session",
         ),
         (
+            MapEnv::new().with("ATERM_PARENT_SESSION_ID", "T0000000001"),
+            "no-session",
+        ),
+        (
+            MapEnv::new().with("ATERM_PARENT_SESSION_ID", "t000000001"),
+            "no-session",
+        ),
+        (
+            // an earlier tab's ID one hex digit short
+            MapEnv::new().with("ATERM_PARENT_SESSION_ID", "s-0123456789abcdef012"),
+            "no-session",
+        ),
+        (
+            // an earlier tab's ID in upper-case hex
+            MapEnv::new().with("ATERM_PARENT_SESSION_ID", "s-0123456789ABCDEF0123"),
+            "no-session",
+        ),
+        (
             MapEnv::new()
-                .with("ATERM_PARENT_SESSION_ID", "s-01")
+                .with("ATERM_PARENT_SESSION_ID", "t0000000001")
                 .with("ATERM_MUX", "1"),
             "mux",
         ),
         (
             MapEnv::new()
-                .with("ATERM_PARENT_SESSION_ID", "s-01")
+                .with("ATERM_PARENT_SESSION_ID", "t0000000001")
                 .with("ATERM_MUX_BASE", "|")
                 .with("TMUX", "/tmp/tmux-501/default,1,0"),
             "mux",
         ),
         (
             MapEnv::new()
-                .with("ATERM_PARENT_SESSION_ID", "s-01")
+                .with("ATERM_PARENT_SESSION_ID", "t0000000001")
                 .with("TERM", "screen-256color"),
             "mux",
         ),
@@ -448,6 +464,37 @@ fn a_tab_shaped_env_posts() {
         );
         assert_eq!(heard(handle).len(), 3);
     }
+}
+
+/// A tab opened before the tab-ID update keeps its `s-` ID until it closes, so its shell's
+/// env names that ID and a post goes to it under it.
+#[test]
+fn an_earlier_tabs_env_posts_under_its_own_id() {
+    const EARLIER: &str = "s-0123456789abcdef0123";
+    let broker = Broker::new();
+    let handle = broker.serve(
+        vec![
+            line("OK schema=1 sid=s-0123456789abcdef0123 fabric=connected"),
+            line("OK 19"),
+        ],
+        false,
+    );
+    let env = MapEnv::new()
+        .with("ATERM_PARENT_SESSION_ID", EARLIER)
+        .with("ATERM_MUX_BASE", "|");
+    let notifier = SessionNotifier::from_env(&env)
+        .with_socket_for_tests(&broker.sock)
+        .with_bound_for_tests(HANG);
+    let notice = notice();
+    assert_eq!(post(&notifier, &notice), Posted::Sent("19".into()));
+    assert_eq!(
+        heard(handle),
+        [
+            format!("AUTH {}", broker.token),
+            format!("@{EARLIER} status"),
+            notice.line(EARLIER),
+        ]
+    );
 }
 
 #[test]
@@ -540,7 +587,7 @@ fn bodies_and_lines_are_exact() {
     assert_eq!(
         notice.line(SID),
         format!(
-            "@s-0123456789abcdef post to=say:agh.write kind=note key={} -- {body}",
+            "@t6789abcdef post to=say:agh.write kind=note key={} -- {body}",
             notice.key
         )
     );
@@ -548,7 +595,7 @@ fn bodies_and_lines_are_exact() {
     assert_eq!(wait.topic, Topic::Release);
     assert!(
         wait.line(SID)
-            .starts_with("@s-0123456789abcdef post to=say:agh.release kind=note key=agh-"),
+            .starts_with("@t6789abcdef post to=say:agh.release kind=note key=agh-"),
         "{}",
         wait.line(SID)
     );

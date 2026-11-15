@@ -203,6 +203,63 @@ impl KittyCommand {
 /// which for a graphics command begins with the `G` identifier.
 #[must_use]
 pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
+    Some(parse_kitty_control(apc)?.decode_payload())
+}
+
+/// Parsed control fields and a borrowed, still-encoded payload.
+///
+/// A host can inspect the control fields before deciding whether it needs the payload.
+/// The terminal engine uses [`parse_kitty_command`] to decode every accepted command.
+#[derive(Debug)]
+pub struct KittyControl<'a> {
+    command: KittyCommand,
+    payload_b64: &'a [u8],
+}
+
+impl KittyControl<'_> {
+    /// The parsed fields, with an empty payload until [`Self::decode_payload`] is called.
+    #[must_use]
+    pub const fn command(&self) -> &KittyCommand {
+        &self.command
+    }
+
+    /// Decode the payload with the protocol's existing empty-on-error behavior.
+    #[must_use]
+    pub fn decode_payload(mut self) -> KittyCommand {
+        if !self.payload_b64.is_empty()
+            && let Ok(s) = std::str::from_utf8(self.payload_b64)
+        {
+            #[cfg(any(test, debug_assertions))]
+            KITTY_PAYLOAD_DECODES.with(|counts| {
+                let (calls, bytes) = counts.get();
+                counts.set((calls.saturating_add(1), bytes.saturating_add(s.len())));
+            });
+            if let Ok(bytes) = aterm_codec::base64::decode(s) {
+                self.command.payload = bytes;
+            }
+        }
+        self.command
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    static KITTY_PAYLOAD_DECODES: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+/// Actual Kitty base64 decode attempts and encoded bytes on this thread since the last read.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub fn take_kitty_payload_decodes_for_test() -> (usize, usize) {
+    KITTY_PAYLOAD_DECODES.with(|counts| counts.replace((0, 0)))
+}
+
+/// Parse the same Kitty control fields as [`parse_kitty_command`], retaining the encoded payload
+/// for a caller that first needs to decide whether to decode it.
+#[must_use]
+pub fn parse_kitty_control(apc: &[u8]) -> Option<KittyControl<'_>> {
     let rest = apc.strip_prefix(b"G")?;
     let (control, payload_b64) = match rest.iter().position(|&b| b == b';') {
         Some(i) => (&rest[..i], &rest[i + 1..]),
@@ -267,14 +324,10 @@ pub fn parse_kitty_command(apc: &[u8]) -> Option<KittyCommand> {
         }
     }
 
-    if !payload_b64.is_empty()
-        && let Ok(s) = std::str::from_utf8(payload_b64)
-        && let Ok(bytes) = aterm_codec::base64::decode(s)
-    {
-        cmd.payload = bytes;
-    }
-
-    Some(cmd)
+    Some(KittyControl {
+        command: cmd,
+        payload_b64,
+    })
 }
 
 #[inline]

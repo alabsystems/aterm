@@ -164,7 +164,7 @@ fn marked(pid: i32) -> Option<bool> {
     const MARK: &[u8] = b"ATERM_FIXTURE_BEFORE_EXEC=inherited";
     #[cfg(target_vendor = "apple")]
     {
-        let bytes = crate::procargs::read(pid as u32)?;
+        let bytes = crate::procargs::read(pid as u32).ok()?;
         Some(
             crate::procargs::parse(&bytes)?
                 .env()

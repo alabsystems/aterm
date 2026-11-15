@@ -4709,7 +4709,7 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
         reason: false,
     };
     let sentence =
-        crate::supervise::mode_words::mode_words(crate::supervise::Autopilot::Cruise).chip;
+        crate::supervise::mode_words::mode_words(alab_policy::config::Autopilot::Cruise).chip;
     let whole_title = format!("autopilot: cruise \u{2014} {sentence} \u{b7} click: land");
     let click = "autopilot: cruise \u{b7} click: land";
     let hover = LightsWidth {
@@ -4858,7 +4858,7 @@ fn a_footer_read_tells_the_step_tap_what_it_found() {
             .collect::<Vec<_>>()
     };
     let mut waited = FooterCache::default();
-    waited.set_floor(0, None);
+    waited.set_floor(0, 0, None);
     assert!(read(&mut waited).is_empty() && !waited.steps_bound());
     append_to(&transcript, &served_row("m1", two_pm - 60));
     let evs = read(&mut waited);
@@ -4866,7 +4866,7 @@ fn a_footer_read_tells_the_step_tap_what_it_found() {
     assert!(waited.steps_bound());
     let len = std::fs::metadata(&transcript).unwrap().len();
     let mut over = FooterCache::default();
-    over.set_floor(0, None);
+    over.set_floor(0, 0, None);
     assert_eq!(read(&mut over), vec![StepEvent::Bind { len }]);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -7158,11 +7158,13 @@ fn the_rotation_words_name_accounts_by_their_shown_names() {
     );
 }
 
-/// A login the account state says is signed out (agy's account gate) is named `not signed in`
-/// on line D, as a warning and at every width, and by no email, label or figure: none is known
-/// true of it any more. Negative control: the same facts not signed out name the email.
+/// A login the account state says is signed out (agy's account gate) is named `signed out` on
+/// line D, the one word every surface says of an account with no login to run on
+/// (`outlook::SIGNED_OUT`), as a bold warning at every width, and by no email, label, figure or
+/// second word (`not signed in`): none is known true of it any more. Negative control: the same
+/// facts not signed out name the email.
 #[test]
-fn a_signed_out_login_is_named_not_signed_in() {
+fn a_signed_out_login_is_named_signed_out() {
     use super::super::profile::SubscriptionDisplay;
     let with = |signed_out: bool| FooterFacts {
         account: Some("work-2".to_owned()),
@@ -7175,17 +7177,14 @@ fn a_signed_out_login_is_named_not_signed_in() {
         ..narrow_rule_facts()
     };
     let out = with(true);
-    assert_eq!(
-        unit_name(&out),
-        Some(super::super::quota_view::NOT_SIGNED_IN)
-    );
+    assert_eq!(unit_name(&out), Some(super::super::outlook::SIGNED_OUT));
     let forms = account_unit(&out);
     assert!(!forms.is_empty());
     for form in &forms {
-        assert_eq!(unit_text(form).as_deref(), Some("not signed in"));
+        assert_eq!(unit_text(form).as_deref(), Some("signed out"));
         assert!(
             form.iter()
-                .all(|s| s.tone == Tone::of(super::super::quota_view::Role::Warn))
+                .all(|s| s.tone == Tone::of(super::super::quota_view::Role::Warn) && s.bold)
         );
     }
     let control = with(false);

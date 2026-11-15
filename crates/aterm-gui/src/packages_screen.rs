@@ -2285,7 +2285,7 @@ const fn machine_apply_would(universal_control: bool, rosetta: bool) -> &'static
 pub(crate) const MACHINE_NOTHING_TO_APPLY: &str =
     "Nothing to apply: Universal Control is already as you chose.";
 
-/// Settings ▸ Security's "This Mac" status.
+/// Settings ▸ Security's "Machine settings" status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MachineProjection {
     /// These are macOS host settings; elsewhere the status is absent.
@@ -2320,7 +2320,7 @@ pub(crate) struct MachineProjection {
 /// Owned, structured read projection shared with the native Settings `/packages` route.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PackagesProjection {
-    /// The `[machine]` host settings slice (Settings ▸ Security's "This Mac" status).
+    /// The `[machine]` host settings slice (Settings ▸ Security's "Machine settings" status).
     pub(crate) machine: MachineProjection,
     /// A status read has landed (the headline, Activity and program rows wait on it).
     pub(crate) observed: bool,

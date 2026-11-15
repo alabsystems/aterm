@@ -3,8 +3,9 @@
 
 //! A person's review of what was asked of this Mac (ATERM-KI-1109-3, step 5 of the requests
 //! design): `requests` lists the requests, `request show` reads one, and `request review`,
-//! `request keep` and `request reply` act on one. `request claim` is the footprint's
-//! ([`crate::requests_footprint::cmd_request_as`]).
+//! `request keep`, `request reply` and `request clean` act on one. `request claim` is the
+//! footprint's ([`crate::requests_footprint::cmd_request_as`]); a cleanup is
+//! [`crate::requests_clean`]'s.
 //!
 //! Who reads: any owner connection, an agent's tab included; and another Mac's drive, which reads
 //! only the requests its own node made, and never the content tier (a fallback why, the
@@ -41,10 +42,12 @@ use std::path::PathBuf;
 
 const USAGE: &str = "ERR usage: request claim path=<abs|~/…> [req=<id>] | request show <id> \
                      [offset=<n>] [limit=<1..512>] [--json] | request review <id> \
-                     [note=<pct>] | request keep <id> | request reply <id> [--] <text>\n";
+                     [note=<pct>] | request keep <id> | request reply <id> [--] <text> | \
+                     request clean <id> [stop=1]\n";
 
 const LIST_USAGE: &str = "ERR usage: requests [state=open|running|concluded|unreviewed|reviewed|\
-                          kept|all] [from=<node|head|sid>] [n=<1..512>] [before=<id>] [--json]\n";
+                          cleaning|cleaned|kept|all] [from=<node|head|sid>] [n=<1..512>] \
+                          [before=<id>] [--json]\n";
 
 /// How many rows `requests` prints with no `n=`, and `request show` tab rows with no `limit=`.
 const LIST_DEFAULT: usize = 50;
@@ -66,11 +69,16 @@ pub(crate) type Post<'p> =
 pub(crate) struct Hands<'a> {
     /// The owner-token connection's process ([`crate::control::caller_actor_as`]).
     pub(crate) client: &'a dyn Fn() -> crate::typed_by::Who,
+    /// Whether that process was cut from the shell that started it ([`detached_with`]).
+    pub(crate) detached: &'a dyn Fn(&crate::typed_by::Who) -> bool,
     /// Keep these sessions (local ids) as the person's tabs, by this actor, on the main thread:
     /// how many it kept.
     pub(crate) keep_tabs: &'a dyn Fn(Vec<u64>, ExitActor) -> Result<usize, String>,
     /// A reply's mail ([`Post`]).
     pub(crate) post: &'a Post<'a>,
+    /// A cleanup (`request clean`, [`crate::requests_clean::cmd`]): what follows `clean`, by this
+    /// actor and its token.
+    pub(crate) clean: &'a dyn Fn(&str, ExitActor, &str) -> String,
     /// The home and state home a claim is judged against.
     pub(crate) places: &'a Places,
 }
@@ -84,6 +92,13 @@ pub(crate) fn cmd(
     proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
 ) -> String {
     let client = || crate::typed_by::Who::client(crate::control::serving_peer_pid());
+    let detached = |who: &crate::typed_by::Who| {
+        detached_with(
+            who,
+            &aterm_uds::process::read_lineage,
+            aterm_uds::process::launchd_idversion(),
+        )
+    };
     let keep_tabs = |sessions: Vec<u64>, by: ExitActor| {
         crate::control::control_media::call_main(proxy, |reply| crate::Wake::KeepTabs {
             sessions,
@@ -95,6 +110,9 @@ pub(crate) fn cmd(
     let post = |from: &crate::SessionCtx, to: To<'_>, key: &str, text: &str| {
         crate::fabric::report::post(from, to, key, text)
     };
+    let clean = |after: &str, actor: ExitActor, by: &str| {
+        crate::requests_clean::cmd(after, actor, by, store, proxy)
+    };
     cmd_as(
         verb,
         rest,
@@ -102,8 +120,10 @@ pub(crate) fn cmd(
         store,
         &Hands {
             client: &client,
+            detached: &detached,
             keep_tabs: &keep_tabs,
             post: &post,
+            clean: &clean,
             places: &Places::host(),
         },
     )
@@ -135,7 +155,7 @@ pub(crate) fn cmd_as(
             hands.places,
         ),
         Some("show") => show(after, &Reader::of_connection(), hands.places),
-        Some(act @ ("review" | "keep" | "reply")) => {
+        Some(act @ ("review" | "keep" | "reply" | "clean")) => {
             let (actor, by) = match actor_of(act, scope, store, hands) {
                 Ok(acting) => acting,
                 Err(refusal) => return refusal,
@@ -143,6 +163,7 @@ pub(crate) fn cmd_as(
             match act {
                 "review" => review(after, &by),
                 "keep" => keep(after, actor, &by, store, hands),
+                "clean" => (hands.clean)(after, actor, &by),
                 _ => reply(after, &actor, &by, store, hands),
             }
         }
@@ -270,6 +291,8 @@ enum Filter {
     /// Concluded, and not reviewed.
     Unreviewed,
     Reviewed,
+    Cleaning,
+    Cleaned,
     Kept,
 }
 
@@ -282,6 +305,8 @@ impl Filter {
             "concluded" => Self::Concluded,
             "unreviewed" => Self::Unreviewed,
             "reviewed" => Self::Reviewed,
+            "cleaning" => Self::Cleaning,
+            "cleaned" => Self::Cleaned,
             "kept" => Self::Kept,
             _ => return None,
         })
@@ -295,6 +320,8 @@ impl Filter {
             Self::Concluded => matches!(request.state(), State::Concluded(_)),
             Self::Unreviewed => request.stage() == Stage::Concluded,
             Self::Reviewed => request.stage() == Stage::Reviewed,
+            Self::Cleaning => request.stage() == Stage::Cleaning,
+            Self::Cleaned => request.stage() == Stage::Cleaned,
             Self::Kept => request.kept.is_some(),
         }
     }
@@ -712,6 +739,51 @@ fn shown(
             opt_enc(review.note.as_deref()),
         ));
     }
+    if let Some(clean) = &request.clean {
+        lines.push(format!(
+            "clean by={} at_ms={} stop={}",
+            enc(&clean.by),
+            clean.at_ms,
+            u8::from(clean.stop)
+        ));
+    }
+    for archive in &request.archives {
+        lines.push(format!(
+            "archive dir={} at_ms={} bytes={} files={} listed={} whole={}",
+            pct::encode(&format!(
+                "{}/{}/{}",
+                aterm_requests::DIR,
+                crate::requests_clean::ARCHIVE,
+                archive.dir
+            )),
+            archive.at_ms,
+            archive.bytes,
+            archive.files,
+            archive.listed,
+            u8::from(archive.whole),
+        ));
+    }
+    for gone in &request.gone {
+        lines.push(format!(
+            "gone path={} at_ms={} did={} why={} bytes={}",
+            pct::encode(&gone.path),
+            gone.at_ms,
+            gone.did.word(),
+            gone.why.map_or("-", aterm_requests::Keep::word),
+            num(gone.bytes),
+        ));
+    }
+    if let Some(cleaned) = &request.cleaned {
+        lines.push(format!(
+            "cleaned by={} at_ms={} tabs={} deleted={} kept={} failed={}",
+            enc(&cleaned.by),
+            cleaned.at_ms,
+            cleaned.tabs,
+            cleaned.deleted,
+            cleaned.kept,
+            cleaned.failed,
+        ));
+    }
     for reply in &request.replies {
         let text = said.and_then(|said| {
             said.replies
@@ -791,6 +863,49 @@ fn timeline(request: &Request, tabs: &[aterm_requests::Tab]) -> Vec<(u64, String
     if let Some((by, at)) = &request.kept {
         events.push((*at, format!("what=kept by={}", enc(by))));
     }
+    if let Some(clean) = &request.clean {
+        events.push((
+            clean.at_ms,
+            format!(
+                "what=clean by={} stop={}",
+                enc(&clean.by),
+                u8::from(clean.stop)
+            ),
+        ));
+    }
+    for archive in &request.archives {
+        events.push((
+            archive.at_ms,
+            format!(
+                "what=archived dir={} files={} whole={}",
+                pct::encode(&archive.dir),
+                archive.files,
+                u8::from(archive.whole)
+            ),
+        ));
+    }
+    for gone in &request.gone {
+        events.push((
+            gone.at_ms,
+            format!(
+                "what=gone path={} did={}",
+                pct::encode(&gone.path),
+                gone.did.word()
+            ),
+        ));
+    }
+    if let Some((why, at)) = request.uncleaned {
+        events.push((at, format!("what=uncleaned why={}", why.word())));
+    }
+    if let Some(cleaned) = &request.cleaned {
+        events.push((
+            cleaned.at_ms,
+            format!(
+                "what=cleaned deleted={} kept={} failed={}",
+                cleaned.deleted, cleaned.kept, cleaned.failed
+            ),
+        ));
+    }
     for reply in &request.replies {
         events.push((
             reply.at_ms,
@@ -806,7 +921,8 @@ fn timeline(request: &Request, tabs: &[aterm_requests::Tab]) -> Vec<(u64, String
 }
 
 /// `request show`'s rows as one JSON object: `request`, `page`, `said` (or null), `tabs`, `claims`,
-/// `review` (or null), `replies` and `timeline`.
+/// `review` (or null), `replies`, `clean` (or null), `archives`, `gone`, `cleaned` (or null) and
+/// `timeline`.
 fn show_json(lines: &[String]) -> String {
     let of = |kind: &str| -> Vec<String> {
         lines
@@ -824,7 +940,7 @@ fn show_json(lines: &[String]) -> String {
     let many = |kind: &str| format!("[{}]", of(kind).join(","));
     format!(
         "{{\"request\":{},\"page\":{},\"said\":{},\"tabs\":{},\"claims\":{},\"review\":{},\"replies\":{},\
-         \"timeline\":{}}}",
+         \"clean\":{},\"archives\":{},\"gone\":{},\"cleaned\":{},\"timeline\":{}}}",
         one("request"),
         one("page"),
         one("said"),
@@ -832,6 +948,10 @@ fn show_json(lines: &[String]) -> String {
         many("claim"),
         one("review"),
         many("reply"),
+        one("clean"),
+        many("archive"),
+        many("gone"),
+        one("cleaned"),
         many("timeline"),
     )
 }
@@ -844,7 +964,9 @@ fn show_json(lines: &[String]) -> String {
 /// lineage as the survey does), one where an agent runs, one `ctl spawn` started, one an update
 /// carried over (the handoff keeps no record of who started or drove it), one under the remote
 /// hold, or one a control client other than aterm's own was ever admitted to type into is
-/// refused, as `reveal` refuses them ([`crate::control::marks_of`]).
+/// refused, as `reveal` refuses them ([`crate::control::marks_of`]). An `aterm ctl` in no tab
+/// whose line of parents broke ([`detached_with`]) is refused too: no tab's shell is above it, yet
+/// a command an agent backgrounded in a subshell that exited (`(aterm ctl … &)`) reads so.
 fn actor_of(
     verb: &str,
     scope: Scope,
@@ -855,7 +977,16 @@ fn actor_of(
                           ctl in no tab, or a shell tab a person opened where no agent runs and \
                           nothing else typed";
     let refused = |who: &str| Err(format!("ERR request {verb}: {PERSON}, never {who}\n"));
-    match crate::control::caller_actor_as(scope, None, store, || (hands.client)()) {
+    let mut client = None;
+    let actor = crate::control::caller_actor_as(scope, None, store, || {
+        let who = (hands.client)();
+        client = Some(who.clone());
+        who
+    });
+    match actor {
+        ExitActor::Ctl if client.as_ref().is_some_and(|who| (hands.detached)(who)) => {
+            refused("a command cut from the shell that started it")
+        }
         ExitActor::Ctl => Ok((ExitActor::Ctl, "ctl".to_owned())),
         ExitActor::Human => Ok((ExitActor::Human, "human".to_owned())),
         ExitActor::Sid(sid) => match tab_of(store, &sid) {
@@ -872,6 +1003,27 @@ fn actor_of(
         ExitActor::Harness => refused("aterm's harness"),
         _ => refused("this caller"),
     }
+}
+
+/// Whether `who`, an owner-token client, was cut from the shell that started it: launchd adopted
+/// the topmost process of its line of parents (`lineage_of` reads it), its own launcher gone, as
+/// it adopts a command an agent backgrounds in a subshell that exits. A person's `aterm ctl` in
+/// another terminal app, an ssh login or a launchd job keeps an unbroken line up to a process
+/// launchd started (`launchd`, launchd's pid version). A lineage that does not read, and a
+/// platform that keeps no launcher version (anything but Apple's), is never judged cut.
+pub(crate) fn detached_with(
+    who: &crate::typed_by::Who,
+    lineage_of: &dyn Fn(i32) -> Option<aterm_uds::process::Lineage>,
+    launchd: Option<i32>,
+) -> bool {
+    let crate::typed_by::Who::Process { lineage, .. } = who else {
+        return false;
+    };
+    let Some(&(top, _)) = lineage.last() else {
+        return false;
+    };
+    lineage_of(top)
+        .is_some_and(|read| read.launcher_version.is_some() && read.orphaned(launchd, 0, || None))
 }
 
 /// Whose tab an `aterm ctl` asked from, as [`actor_of`] judges it: the first that holds.

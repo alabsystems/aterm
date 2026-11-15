@@ -2,6 +2,13 @@
 // Copyright 2026 Andrew Yates
 use super::*;
 use crate::harness::repo_work::RepoRead;
+use alab_policy::config::{MIN_WORK, TurnEndTiming};
+use alab_policy::land_check::LAND_CHECK;
+use alab_policy::open_work::{OPEN_HEADS, land_open_found};
+use alab_policy::words::{
+    DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, DONE_TAIL, LAND_REMOTE_MAIN_BEFORE, NO_REPOSITORY,
+    RULE_GO_AHEAD_HOUR, RULE_LEFT, RULE_OPEN_ITEMS, RULE_UNCOMMITTED, STOP_PHRASES,
+};
 use aterm_phase::prompt::fixtures::{
     COMPACT_FAILED_1_MEASURED, COMPACT_FAILED_2_MEASURED, COMPACT_FAILED_3_MEASURED,
     COMPACT_FAILED_FIRST_MEASURED, COMPACT_NOT_ENOUGH_MEASURED, COMPACT_SUCCEEDED_MEASURED,
@@ -147,7 +154,8 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
         leftover: crate::harness::leftover::LeftRead::NotAsked,
-        credentials: crate::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: crate::harness::goal::GoalRead::Unread,
     }
 }
 
@@ -200,10 +208,11 @@ fn typed(rule: &'static str) -> TurnEndAction {
 }
 
 /// Cruise's continuation within the hour the person's last key holds the go-ahead: it does not say
-/// the go-ahead is no need ([`super::go_ahead::unless_held`]).
+/// the go-ahead is no need ([`alab_policy::go_ahead::unless_held`]).
 fn continued_held() -> TurnEndAction {
     TurnEndAction::Type {
-        text: super::go_ahead::unless_held(&continuation_text(&cfg(), None), true).into_owned(),
+        text: alab_policy::go_ahead::unless_held(&continuation_text(&cfg(), None), true)
+            .into_owned(),
         rule_id: RULE_CONTINUE,
     }
 }
@@ -699,7 +708,7 @@ fn an_api_error_is_tried_blind_on_the_outage_ladder_and_retries_off_escalate() {
         WallKind::ApiError {
             code: Some(400),
             retryable: false,
-            cause: aterm_phase::ApiCause::Server,
+            cause: alab_policy::vocab::ApiCause::Server,
         },
         "API Error: 400 bad request",
         Some(3 * MIN),
@@ -3629,7 +3638,7 @@ fn a_bucket_waited_on_is_taken_up_by_the_loop_that_follows() {
             reset,
             Duration::ZERO,
             false,
-            ResetClock::of(Some("Oct 17 at 4:20pm")),
+            reset_clock(Some("Oct 17 at 4:20pm")),
             t,
         );
         assert!(st.waits_on_named_reset());
@@ -4907,7 +4916,7 @@ fn the_rules_ride_in_the_continuation() {
         TurnEndAction::Type {
             text: format!(
                 "{} (standing rules: commit after each stage)",
-                cfg().continue_text
+                cfg().turn_end.continue_text
             ),
             rule_id: RULE_CONTINUE
         }
@@ -6023,7 +6032,7 @@ fn a_wall_is_its_own_rules_even_where_the_upgrade_owns_the_turn_ends() {
             WallKind::ApiError {
                 code: Some(500),
                 retryable: true,
-                cause: aterm_phase::ApiCause::Server,
+                cause: alab_policy::vocab::ApiCause::Server,
             },
             "API Error: 500 Internal server error",
         ),
@@ -6328,7 +6337,7 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
     st.acted(&a, &busy, t0());
     let a = at(
         &mut st,
-        &closing(IDLE, &cfg().continue_text, None),
+        &closing(IDLE, &cfg().turn_end.continue_text, None),
         t0() + fast,
     );
     assert!(
@@ -6337,7 +6346,7 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
     );
     let (a, _) = past_backoff(
         &mut st,
-        &closing(IDLE, &cfg().continue_text, None),
+        &closing(IDLE, &cfg().turn_end.continue_text, None),
         t0() + fast,
     );
     assert_eq!(a, checked());
@@ -7370,63 +7379,6 @@ fn a_stop_that_names_a_destructive_act_is_answered_reversibly() {
 }
 
 #[test]
-fn destructive_words_match_their_inflections() {
-    for (text, w) in [
-        ("it deletes the rows", "delete"),
-        ("the rows are deleted", "delete"),
-        ("the table is dropped", "drop"),
-        ("dropping it", "drop"),
-        ("drops the legacy table", "drop"),
-        ("removes node_modules", "remove"),
-        ("wiping build/", "wipe"),
-        ("wiped", "wipe"),
-        ("resetting the branch", "reset"),
-        ("the branch is force-pushed", "force-push"),
-        ("the file is overwritten", "overwrite"),
-        ("it overwrote the file", "overwrite"),
-        ("this rewrote history", "rewrite history"),
-        ("purges the cache", "purge"),
-        ("destroys the volume", "destroy"),
-        ("truncated the log", "truncate"),
-        ("migrates the schema", "migrate"),
-        ("deploys to prod", "deploy"),
-        ("publishes the crate", "publish"),
-        ("uninstalls it", "uninstall"),
-        ("reverted the merge", "revert"),
-        ("a full removal of the cache", "removal"),
-        ("the deletion of stale branches", "deletion"),
-        ("git push -f origin main", "push -f"),
-        ("pushing -f to main", "push -f"),
-        ("git push origin main -f", "push -f"),
-        ("git push -vf origin main", "push -f"),
-        ("git push origin feature.fix -vuf", "push -f"),
-        ("git push origin and -f", "push -f"),
-        (
-            "git push --force-with-lease origin main",
-            "force-with-lease",
-        ),
-        ("push --force-with-lease=main:4f2a1c9", "force-with-lease"),
-    ] {
-        assert_eq!(destructive_word(text), Some(w), "{text}");
-    }
-    for text in [
-        "a dropdown menu",
-        "the deployment guide",
-        "reformat the file",
-        "rename the table",
-        "the migration tests pass",
-        "git push origin main",
-        "git push origin f",
-        "git push origin main -ofoo",
-        "git push origin main; tail -f the log",
-        "tail -f the log",
-        "cp -f a.txt b.txt",
-    ] {
-        assert_eq!(destructive_word(text), None, "{text}");
-    }
-}
-
-#[test]
 fn a_report_or_a_question_only_the_person_can_answer_is_no_choice() {
     let now = t0();
     let report = "Added a table documenting which option each flag maps to. All tests pass.";
@@ -8258,7 +8210,7 @@ fn a_code_less_server_error_measured_down_is_the_connections_outage() {
 /// A DOWN ONLY THE MEASURE MAKES A WALL'S OUTAGE HOLDS IT ONE CAP (v6 §14.17.5.2): a code-less
 /// server error is the connection's outage only by the host's measure, never by its own words (the
 /// `/goal` echo's reason covers a 529 too), so a Down holds its try as a measured outage holds a
-/// wall-less point's act ([`TurnEndTiming::outage_holds_until`]): until `outage_cap` has passed
+/// wall-less point's act ([`outage_holds_until`]): until `outage_cap` has passed
 /// since the Down began, and then it is tried blind. A probe wrong about the route (a firewall
 /// that lets the agent through and not the probe) costs the session one cap, once per outage, not
 /// a stop for as long as the probe reads Down. Controls: a wall whose own words name the
@@ -10459,26 +10411,6 @@ fn a_landing_taken_on_from_the_record_types_nothing_until_someone_else_types() {
 }
 
 #[test]
-fn a_retired_token_line_is_a_done_claim() {
-    for yes in [
-        "ATERM-TASK-DONE",
-        "All landed.\n`ATERM-TASK-DONE`",
-        "All landed.\n**ATERM-TASK-DONE**\n",
-        "All landed.\n  ATERM-TASK-DONE.  ",
-    ] {
-        assert!(says_done(Some(yes)), "{yes:?}");
-    }
-    for no in [
-        "I will write ATERM-TASK-DONE when the task is finished.",
-        "Fixed the parser; ATERM-TASK-DONE-ISH is next.",
-        "",
-    ] {
-        assert!(!says_done(Some(no)), "{no:?}");
-    }
-    assert!(!says_done(None));
-}
-
-#[test]
 fn completion_prose_receives_the_ordinary_continuation() {
     for said in [
         "All done.",
@@ -10685,302 +10617,6 @@ fn open_work_reads_heads_and_status_words_and_never_a_negation() {
         assert!(open_work(Some(tail)).is_empty(), "{tail:?}");
     }
     assert!(open_work(None).is_empty());
-}
-
-#[test]
-fn open_work_keeps_fenced_examples_out_of_the_report() {
-    for tail in [
-        "A sample report:\n```text\nStill open: finish the tests.\n```\nATERM-TASK-DONE",
-        "A sample report:\n````text\n```\nTests were not run.\n```\n````\nATERM-TASK-DONE",
-        "A sample report:\n~~~text\nStill open: finish the tests.\n~~~\nATERM-TASK-DONE",
-        "A sample report:\n```text\nStill open: finish the tests.\nATERM-TASK-DONE",
-        "Still open:\n```text\nAn example, not a reported item.\n```\nAll checks passed.\nATERM-TASK-DONE",
-    ] {
-        assert!(open_work(Some(tail)).is_empty(), "{tail:?}");
-    }
-    for fence in ["```", "~~~~"] {
-        let tail = format!(
-            "A sample report:\n{fence}text\nLeft: the example only.\n{fence}\n\
-             Still open: finish the actual tests.\nATERM-TASK-DONE"
-        );
-        assert_eq!(open_work(Some(&tail)), &["still open"], "{tail:?}");
-    }
-    assert_eq!(
-        open_work(Some(
-            "All work completed\n```text\nAn example.\n```\nstill open: the actual tests.\nATERM-TASK-DONE"
-        )),
-        &["still open"]
-    );
-
-    for (open, inner, close) in [
-        ("~~~~markdown", "```", "~~~~"),
-        ("````markdown", "~~~", "````"),
-        ("````markdown", "```", "````"),
-        ("~~~~markdown", "~~~", "~~~~"),
-        ("```markdown", "``` not a close", "```"),
-        ("~~~markdown", "~~~ not a close", "~~~"),
-        ("```markdown", "~~~", "````"),
-    ] {
-        let tail = format!("{open}\n{inner}\nAll done.\n{close}");
-        assert!(open_work(Some(&tail)).is_empty(), "{tail:?}");
-        assert_eq!(
-            open_work(Some(&format!(
-                "{tail}\nStill open: finish the actual tests."
-            ))),
-            &["still open"]
-        );
-    }
-}
-
-#[test]
-fn open_work_reads_balanced_underscore_emphasis_without_splitting_identifiers() {
-    for (tail, want) in [
-        (
-            "__Still open__: finish the tests.\nATERM-TASK-DONE",
-            "still open",
-        ),
-        (
-            "_Remaining work_: finish the tests.\nATERM-TASK-DONE",
-            "remaining",
-        ),
-        ("The tests were _not run_.\nATERM-TASK-DONE", "not run"),
-        ("The checks were __skipped__.\nATERM-TASK-DONE", "skipped"),
-    ] {
-        assert_eq!(open_work(Some(tail)), &[want], "{tail:?}");
-    }
-    for tail in [
-        "Removed the skipped_test registry.\nATERM-TASK-DONE",
-        "Removed the _skipped_test_ registry.\nATERM-TASK-DONE",
-        "__Still open: an unmatched example marker.\nATERM-TASK-DONE",
-        "Ran `_not run_` as the example string.\nATERM-TASK-DONE",
-    ] {
-        assert!(open_work(Some(tail)).is_empty(), "{tail:?}");
-    }
-}
-
-#[test]
-fn open_work_reads_a_blocked_item_and_the_sentences_after_it() {
-    for (tail, want) in [
-        (
-            "Still open: the release needs a credential. Tests were not run.\nATERM-TASK-DONE",
-            &["still open", "not run"][..],
-        ),
-        (
-            "Left (blocked on the owner): the release. The tests were not run.\nATERM-TASK-DONE",
-            &["left", "not run"],
-        ),
-        (
-            "Still open: the release needs a credential; the tests were not run.\nATERM-TASK-DONE",
-            &["still open", "not run"],
-        ),
-        (
-            "Still open: the release tests were not run without the owner's credential.\nATERM-TASK-DONE",
-            &["still open"],
-        ),
-        (
-            "Left (blocked on the owner): the release. No tests were skipped.\nATERM-TASK-DONE",
-            &["left"],
-        ),
-        (
-            "Left: fix the tests. Tests were skipped.\nATERM-TASK-DONE",
-            &["left", "skipped"],
-        ),
-    ] {
-        assert_eq!(open_work(Some(tail)), want, "{tail:?}");
-    }
-}
-
-#[test]
-fn open_work_reads_work_left_mid_sentence_and_a_blocker_named_after_it() {
-    for (tail, want) in [
-        ("The lexer is still open.", &["still open"][..]),
-        ("I did not find the cause.", &["did not find"]),
-        (
-            "One spike at load 18: observed, not explained.",
-            &["not explained"],
-        ),
-        (
-            "I traced it but didn't fix it, because a fix is a code change.",
-            &["did not fix"],
-        ),
-        ("Both helpers are not yet run at once.", &["not run"]),
-        (
-            "Still open from AU-1:\n- the boot apply's second half",
-            &["still open"],
-        ),
-        (
-            "Open items, all out of scope:\n- the held pane's check",
-            &["open items"],
-        ),
-        (
-            "Follow-ups for the owner: bound the vendor DNS time.",
-            &["follow-ups"],
-        ),
-        (
-            "## Not measured, and why\n- **The index hint:** not passed in the replay.",
-            &["not measured"],
-        ),
-        (
-            "Left open, each with its blocker:\n- the primer: the window rewrites it at its next spawn",
-            &["left open"],
-        ),
-        (
-            "Another chain's trust run needs a re-run.",
-            &["needs a re-run"],
-        ),
-        (
-            "At this host's load the spike was not explained.",
-            &["not explained"],
-        ),
-        (
-            "Tests were not run; the release needs a credential.",
-            &["not run"],
-        ),
-        (
-            "Not run: the e2e suite. The docs built. Lint passed. The release needs the owner's credential.",
-            &["not run"],
-        ),
-        ("Tests: 12 passed, 2 skipped, no failures.", &["skipped"]),
-        ("The memory leak is still open.", &["still open"]),
-        (
-            "Still open: the verifier rejected the bundle's signature.",
-            &["still open"],
-        ),
-        ("Left: the reviewer's race finding in spawn.rs.", &["left"]),
-        (
-            "- The write was not allowed (EPERM) in the sandbox; not fixed.",
-            &["not fixed"],
-        ),
-        (
-            "- The release-mode tests: not run, because there was no time.",
-            &["not run"],
-        ),
-    ] {
-        assert_eq!(
-            open_work(Some(&format!("{tail}\n{FINISHED}"))),
-            want,
-            "{tail:?}"
-        );
-    }
-    for (tail, want) in [
-        (
-            "- Windows build: not compiled. Blocker: no Windows std on this host.",
-            &["not compiled"][..],
-        ),
-        (
-            "- **Windowed checks:** not run.\n  - Blocker: no windows on the owner's desktop.",
-            &["not run"],
-        ),
-        (
-            "- Moving the checks: not done, per the reviewer's correction.",
-            &["not done"],
-        ),
-        (
-            "- au-4: not done; its review verdict rejected it.",
-            &["not done"],
-        ),
-        (
-            "- Segmented downloads: not done on purpose; 8 streams measured slower.",
-            &["not done"],
-        ),
-        (
-            "- Trust for atpkg: skipped for memory, as round 1 measured.",
-            &["skipped"],
-        ),
-        (
-            "- GUI side: not done here; that is TC-3 per the plan.",
-            &["not done"],
-        ),
-        (
-            "- The stalled-mount case: not reproduced: no SMB mount is available.",
-            &["not reproduced"],
-        ),
-        (
-            "- Windowed Cmd-T was not measured (no windows allowed).",
-            &["not measured"],
-        ),
-        (
-            "- The trust floor check could not run on this host.",
-            &["not run"],
-        ),
-        (
-            "- aterm-gui's tests were not run. aterm-gui is not modified.",
-            &["not run"],
-        ),
-        (
-            "- I did not run `aterm agents install`: the brief forbids touching ~/.claude.",
-            &["not run"],
-        ),
-    ] {
-        assert_eq!(
-            open_work(Some(&format!("{tail}\n{FINISHED}"))),
-            want,
-            "{tail:?}"
-        );
-    }
-    for tail in [
-        "- contract-probe: not run, because no requires/ensures contract was added.",
-        "- contract-probe was not run because the diff adds no contract.",
-        "- contract-probe: not run. No contract was added.",
-        "- Headless QoS: not done, because main already has it.",
-        "A Window place skips the \"window still open\" check.",
-    ] {
-        assert!(
-            open_work(Some(&format!("{tail}\n{FINISHED}"))).is_empty(),
-            "{tail:?}"
-        );
-    }
-}
-
-#[test]
-fn open_work_reads_three_rounds_of_real_reports_as_labelled() {
-    let reports = corpora::open_work_reports();
-    let reads = |text: &str| !open_work(Some(&format!("{text}{FINISHED}"))).is_empty();
-    let mut wrong: Vec<String> = Vec::new();
-    for (name, excerpts) in &reports {
-        for (reads_open, text) in excerpts {
-            if reads(text) != *reads_open {
-                wrong.push(format!(
-                    "{name}: reads {}, labelled {}:\n{text}",
-                    reads(text),
-                    reads_open
-                ));
-            }
-        }
-        let joined: String = excerpts
-            .iter()
-            .map(|(_, text)| format!("{text}\n"))
-            .collect();
-        let any = excerpts.iter().any(|(reads_open, _)| *reads_open);
-        if reads(&joined) != any {
-            wrong.push(format!(
-                "{name}: the joined report reads {}",
-                reads(&joined)
-            ));
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n----\n"));
-    let report = |name: &str| {
-        let (_, excerpts) = reports.iter().find(|(n, _)| *n == name).expect(name);
-        let joined: String = excerpts
-            .iter()
-            .map(|(_, text)| format!("{text}\n"))
-            .collect();
-        reads(&joined)
-    };
-    for name in [
-        "round 1, AU-1 review",
-        "round 1, measurement report",
-        "round 2, measurement report",
-        "round 2, TAB-1 implementer",
-    ] {
-        assert!(report(name), "{name}: ended with the token over open work");
-    }
-    assert!(
-        report("round 3, integration notes"),
-        "its leftovers are blocked, and open"
-    );
-    assert!(reports.len() > 60, "{} reports", reports.len());
 }
 
 fn advised(r: &TurnEndReading, to: &str) -> TurnEndReading {
@@ -14160,7 +13796,7 @@ fn a_waited_lost_login_whose_row_leaves_is_still_decided_as_that_wall() {
 fn reset_ends_owed_at_once() -> Vec<ResetOutcome> {
     vec![
         ResetOutcome::Spent {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             asks: true,
             left: Some(1),
             cleared_at: 1_000,
@@ -14174,7 +13810,7 @@ fn reset_ends_owed_at_once() -> Vec<ResetOutcome> {
         ResetOutcome::Failed { login: true },
         ResetOutcome::Unread,
         ResetOutcome::Walled {
-            kind: aterm_phase::ResetKind::Fable,
+            kind: alab_policy::vocab::ResetKind::Fable,
             left: 0,
         },
     ]
@@ -14222,7 +13858,7 @@ fn each_end_of_a_limit_reset_owes_one_continuation() {
     }
     for outcome in [
         ResetOutcome::Spent {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             asks: false,
             left: Some(1),
             cleared_at: 1_000,
@@ -14262,7 +13898,7 @@ fn each_end_of_a_limit_reset_owes_one_continuation() {
     let mut st = TurnEndState::default();
     st.reset_told(
         &ResetOutcome::Spent {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             asks: false,
             left: None,
             cleared_at: 1_000,
@@ -14312,7 +13948,7 @@ fn a_typed_act_or_work_seen_since_pays_the_resets_continuation() {
     let mut st = TurnEndState::default();
     st.reset_told(
         &ResetOutcome::Spent {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             asks: false,
             left: Some(1),
             cleared_at: 1_000,
@@ -14419,7 +14055,7 @@ fn a_resume_advised_for_the_resets_own_clearing_types_nothing_more() {
     );
     for outcome in [
         ResetOutcome::Spent {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             asks: true,
             left: Some(1),
             cleared_at: 1_000,
@@ -14450,7 +14086,7 @@ fn a_resume_advised_for_the_resets_own_clearing_types_nothing_more() {
     let mut st = TurnEndState::default();
     st.reset_told(
         &ResetOutcome::Spent {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             asks: false,
             left: Some(1),
             cleared_at: 1_000,
@@ -14467,7 +14103,7 @@ fn a_resume_advised_for_the_resets_own_clearing_types_nothing_more() {
     for outcome in [
         ResetOutcome::Kept,
         ResetOutcome::Walled {
-            kind: aterm_phase::ResetKind::Fable,
+            kind: alab_policy::vocab::ResetKind::Fable,
             left: 0,
         },
     ] {
@@ -14519,7 +14155,7 @@ fn no_account_is_asked_about_while_the_resets_continuation_is_owed() {
     for outcome in [
         ResetOutcome::Kept,
         ResetOutcome::Spent {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             asks: false,
             left: Some(1),
             cleared_at: 1_000,
@@ -14581,31 +14217,6 @@ fn no_account_is_asked_about_while_the_resets_continuation_is_owed() {
         at(&mut st, &spend, t),
         at(&mut TurnEndState::default(), &spend, t)
     );
-}
-
-#[test]
-fn a_remembered_tail_reads_as_a_fresh_read_of_it() {
-    let tails = [
-        "Suites are running.",
-        "Should I delete the old branch? (y/n)",
-        "Nothing left: the parser is on main.",
-        "Suites are running!",
-        "Want me to take that on?",
-        "DONE",
-        "Suites are running.",
-    ];
-    for _ in 0..2 {
-        for t in tails {
-            assert_eq!(classify_said(Some(t)), classify_said_read(t), "{t:?}");
-            let fresh =
-                needs::defense_line(t).is_some() || says_done_outright(&needs::without_needs(t));
-            assert_eq!(says_done(Some(t)), fresh, "{t:?}");
-        }
-    }
-    assert_eq!(classify_said(None), Said::Plain);
-    assert!(!says_done(None));
-    assert_ne!(classify_said_read(tails[0]), classify_said_read(tails[1]));
-    assert_ne!(says_done(Some(tails[0])), says_done(Some(tails[2])));
 }
 
 #[test]
@@ -14733,7 +14344,7 @@ const DEFENSE: &str = "Merged the parser and the lexer and pushed main.\nNothing
                        are removed, and the suites pass on main.";
 
 /// The land check's one landing answer.
-const LANDED_WORD: &str = super::land_check::LANDED;
+const LANDED_WORD: &str = alab_policy::land_check::LANDED;
 
 /// THE LAND CHECK as Land types it with no ack and no standing rules (`land-check@v1`).
 fn land_check_typed() -> TurnEndAction {
@@ -18818,6 +18429,11 @@ mod land_check_acts {
     include!("turn_end_land_check_tests.rs");
 }
 
+mod goal_restore_acts {
+    use super::*;
+    include!("turn_end_goal_restore_tests.rs");
+}
+
 mod hold_said {
     use super::*;
     include!("turn_end_hold_said_tests.rs");
@@ -18828,6 +18444,14 @@ mod agy_messages {
     include!("turn_end_agy_message_tests.rs");
 }
 
+#[test]
+fn equal_sets_key_equal_and_none_keys_zero() {
+    let a = vec!["x".to_string(), "y".to_string()];
+    assert_eq!(needs_key(&a), needs_key(&a.clone()));
+    assert_ne!(needs_key(&a), needs_key(&["x".to_string()]));
+    assert_eq!(needs_key(&[]), 0);
+}
+
 mod needs_wrap {
     use super::*;
     include!("turn_end_needs_wrap_tests.rs");
@@ -18836,20 +18460,6 @@ mod needs_wrap {
 mod pace {
     use super::*;
     include!("turn_end_pace_tests.rs");
-}
-
-mod corpora {
-    include!("turn_end_corpora_tests.rs");
-}
-
-mod found {
-    use super::*;
-    include!("turn_end_found_tests.rs");
-}
-
-mod reader_measure {
-    use super::*;
-    include!("turn_end_reader_measure_tests.rs");
 }
 
 mod wake_rider {
@@ -20232,8 +19842,7 @@ fn a_persons_login_aterm_cannot_close_is_told_now_after_its_last_esc() {
             Some(Exception::login_over_limit()),
             "Esc {n}: nobody told to close it yet"
         );
-        let pause =
-            crate::supervise::ladder::doubling(st.timing.take_within, n - 1, BACK_OUT_PAUSE_MAX);
+        let pause = alab_policy::ladder::doubling(st.timing.take_within, n - 1, BACK_OUT_PAUSE_MAX);
         let a = at(&mut st, &dialog, now + pause - Duration::from_secs(1));
         assert!(
             waits_until(&a, now + pause),
@@ -21785,8 +21394,7 @@ fn a_judged_turn_whose_opener_comes_into_sight_is_not_judged_again() {
     assert_eq!(
         a,
         TurnEndAction::Type {
-            text: crate::supervise::policy::go_ahead::unless_held(&done_check_words(0), true)
-                .into_owned(),
+            text: alab_policy::go_ahead::unless_held(&done_check_words(0), true).into_owned(),
             rule_id: RULE_DONE_CHECK,
         },
         "continued once they left: {a:?}"
@@ -22561,14 +22169,14 @@ fn host_agent_resumed_covers_external_late_and_delayed_relaunches_without_hiding
     for delay in [Duration::from_secs(5), RESUME_DRAWN + 5 * MIN] {
         let mut st = TurnEndState::default();
         st.seed_worked();
-        st.host_agent_resumed(Some(AgentResumed {
+        st.host_agent_resumed(HostAgent::Read(AgentResumed {
             pid: 100,
             started: Some(1_793_000_000),
             resumed: false,
         }));
         st.observe(&work, now);
         let at_banner = now + 21 * MIN + delay;
-        st.host_agent_resumed(Some(AgentResumed {
+        st.host_agent_resumed(HostAgent::Read(AgentResumed {
             pid: 200,
             started: Some(1_793_001_500),
             resumed: true,
@@ -22578,7 +22186,7 @@ fn host_agent_resumed_covers_external_late_and_delayed_relaunches_without_hiding
             !st.opened_fresh(),
             "resumed banner at {delay:?} must not open a fresh session"
         );
-        st.host_agent_resumed(Some(AgentResumed {
+        st.host_agent_resumed(HostAgent::Read(AgentResumed {
             pid: 200,
             started: Some(1_793_001_500),
             resumed: true,
@@ -22592,7 +22200,7 @@ fn host_agent_resumed_covers_external_late_and_delayed_relaunches_without_hiding
 
         // NEGATIVE CONTROL: once PID 200 has drawn a non-taskless screen, a taskless screen in the
         // same PID (`/clear`) DOES set `opened_fresh`.
-        st.host_agent_resumed(Some(AgentResumed {
+        st.host_agent_resumed(HostAgent::Read(AgentResumed {
             pid: 200,
             started: Some(1_793_001_500),
             resumed: true,
@@ -22614,10 +22222,10 @@ fn host_agent_resumed_covers_external_late_and_delayed_relaunches_without_hiding
         let mut st = TurnEndState::default();
         st.seed_worked();
         st.observe(&work, now);
-        st.host_agent_resumed(None);
+        st.host_agent_resumed(HostAgent::Absent);
         st.observe(&banner, now + 21 * MIN);
         assert!(st.opened_fresh(), "tentative before snapshot lands");
-        st.host_agent_resumed(Some(AgentResumed {
+        st.host_agent_resumed(HostAgent::Read(AgentResumed {
             pid: 300,
             started: Some(1_793_002_000),
             resumed,
@@ -22634,7 +22242,7 @@ fn host_agent_resumed_covers_external_late_and_delayed_relaunches_without_hiding
     st.observe(&work, now);
     let relaunch = now + 21 * MIN;
     st.restarted(&Restart::Memory, true, &work, relaunch);
-    st.host_agent_resumed(Some(AgentResumed {
+    st.host_agent_resumed(HostAgent::Read(AgentResumed {
         pid: 400,
         started: Some(1_793_003_000),
         resumed: false,
@@ -22644,6 +22252,321 @@ fn host_agent_resumed_covers_external_late_and_delayed_relaunches_without_hiding
     st.observe(&asked, relaunch + Duration::from_secs(40));
     assert!(st.exchange_opens());
     assert!(st.left_to_person());
+}
+
+/// AN UNREAD HOST ANSWER IS NO RESUME (LS-15): within [`RESUME_DRAWN`] of the loop's own relaunch,
+/// a loaded host whose snapshot read is still out past its bound answers [`HostAgent::Unread`]. The
+/// taskless screen read then is neither the resume's banner nor a fresh program's: the next read
+/// that answers decides, and one naming a process that resumes nothing opens the fresh session.
+/// NEGATIVE CONTROL on main: the unread answer was `None`, the restart's grace read the fresh
+/// program's banner as the resume's, and the read that landed later (`resumed: false`) only ended
+/// the grace, so the person's message in the fresh program was carried on as the old session's.
+/// CONTROLS: a later read naming a resume keeps the session; an answer of no agent decides nothing.
+#[test]
+fn an_unread_host_answer_after_a_restart_is_decided_by_the_read_that_lands() {
+    let now = t0();
+    let banner = TurnEndReading {
+        autopilot: Autopilot::Land,
+        taskless: true,
+        ..idle("", None)
+    };
+    let work = TurnEndReading {
+        autopilot: Autopilot::Land,
+        ..idle("Implemented the parser fix.", Some(20 * MIN))
+    };
+    let asked = TurnEndReading {
+        autopilot: Autopilot::Land,
+        person: Some(Duration::from_secs(30)),
+        key: Some(Duration::from_secs(30)),
+        ..idle("The test still passes.", Some(30 * Duration::from_secs(1)))
+    };
+    let after_unread = |landed: HostAgent| {
+        let mut st = TurnEndState::default();
+        st.seed_worked();
+        st.observe(&work, now);
+        let relaunch = now + 21 * MIN;
+        st.restarted(&Restart::Memory, true, &work, relaunch);
+        st.host_agent_resumed(HostAgent::Unread);
+        st.observe(&banner, relaunch + Duration::from_secs(10));
+        assert!(
+            !st.opened_fresh(),
+            "an unread answer decides nothing at the banner"
+        );
+        st.host_agent_resumed(landed);
+        st.observe(&asked, relaunch + Duration::from_secs(40));
+        st
+    };
+
+    let fresh = after_unread(HostAgent::Read(AgentResumed {
+        pid: 500,
+        started: Some(1_793_004_000),
+        resumed: false,
+    }));
+    assert!(
+        fresh.exchange_opens(),
+        "the read that landed names a fresh program: its banner opened a session of its own"
+    );
+    assert!(
+        fresh.left_to_person(),
+        "the fresh program's exchange is the person's"
+    );
+
+    // CONTROL: the read that landed names the resume: the session goes on.
+    let resumed = after_unread(HostAgent::Read(AgentResumed {
+        pid: 500,
+        started: Some(1_793_004_000),
+        resumed: true,
+    }));
+    assert!(!resumed.exchange_opens(), "the resume carries the session");
+    assert!(
+        !resumed.left_to_person(),
+        "Land carries the resumed session on"
+    );
+
+    // CONTROL: an answer of no agent in front (the program left) decides nothing for the banner.
+    let gone = after_unread(HostAgent::Absent);
+    assert!(
+        !gone.exchange_opens(),
+        "no agent read: the banner opened nothing"
+    );
+}
+
+/// A HOST READ STILL OUT WHEN THE PERSON'S EXCHANGE IS JUDGED IS NO RESUME (LS-15): within
+/// [`RESUME_DRAWN`] of the loop's own relaunch, the taskless screen read while the host's read was
+/// out is undecided, and no read has answered by the person's message. The exchange is judged a
+/// fresh program's: left to the person, nothing typed, and the `LEFT` row says the read was out
+/// ([`TurnEndState::exchange_unread`]). The read that lands later settles it: one naming the
+/// resume takes the exchange back so Land carries the session on; one naming a fresh program
+/// keeps it left. NEGATIVE CONTROL on main (and on the first cut of this fix): the unread answer
+/// fell back to "not fresh", the restart's grace read the banner as the resume's, and the fresh
+/// program's exchange was carried on as the old session's (`exchange_opens=false
+/// left_to_person=false`).
+#[test]
+fn a_host_read_still_out_at_the_persons_exchange_after_a_restart_is_never_a_resume() {
+    let now = t0();
+    let banner = TurnEndReading {
+        autopilot: Autopilot::Land,
+        taskless: true,
+        ..idle("", None)
+    };
+    let work = TurnEndReading {
+        autopilot: Autopilot::Land,
+        ..idle("Implemented the parser fix.", Some(20 * MIN))
+    };
+    let asked = TurnEndReading {
+        autopilot: Autopilot::Land,
+        person: Some(Duration::from_secs(30)),
+        key: Some(Duration::from_secs(30)),
+        ..idle("The test still passes.", Some(30 * Duration::from_secs(1)))
+    };
+    let after = TurnEndReading {
+        autopilot: Autopilot::Land,
+        ..idle("The test still passes.", None)
+    };
+    let relaunch = now + 21 * MIN;
+    let unread_at_exchange = || {
+        let mut st = TurnEndState::default();
+        st.seed_worked();
+        st.observe(&work, now);
+        st.restarted(&Restart::Memory, true, &work, relaunch);
+        st.host_agent_resumed(HostAgent::Unread);
+        st.observe(&banner, relaunch + Duration::from_secs(10));
+        st.host_agent_resumed(HostAgent::Unread);
+        st.observe(&asked, relaunch + Duration::from_secs(40));
+        assert!(
+            st.exchange_opens(),
+            "an exchange judged with the read out is never carried on as the resume's"
+        );
+        assert!(
+            st.left_to_person(),
+            "it is left to the person, nothing typed"
+        );
+        assert!(
+            st.exchange_unread(),
+            "the LEFT row says it was judged with the read out"
+        );
+        st
+    };
+
+    // The read lands naming the resume: Land takes the exchange back and carries the work on.
+    let mut st = unread_at_exchange();
+    st.host_agent_resumed(HostAgent::Read(AgentResumed {
+        pid: 600,
+        started: Some(1_793_005_000),
+        resumed: true,
+    }));
+    st.observe(&after, relaunch + Duration::from_secs(50));
+    assert!(!st.exchange_opens(), "the resume's exchange is no opening");
+    assert!(
+        !st.left_to_person(),
+        "the resumed session's exchange is taken back: Land carries on"
+    );
+    assert!(!st.exchange_unread(), "settled by the read that landed");
+
+    // The read lands naming a fresh program: the exchange stays the person's.
+    let mut st = unread_at_exchange();
+    st.host_agent_resumed(HostAgent::Read(AgentResumed {
+        pid: 600,
+        started: Some(1_793_005_000),
+        resumed: false,
+    }));
+    st.observe(&after, relaunch + Duration::from_secs(50));
+    assert!(
+        st.left_to_person(),
+        "the fresh program's exchange stays left"
+    );
+    assert!(!st.exchange_unread(), "settled by the read that landed");
+
+    // CONTROL: the loop's own carry-on turn (no person's hand) under the read out is judged as
+    // before: the session's task stays carried.
+    let mut st = TurnEndState::default();
+    st.seed_worked();
+    st.observe(&work, now);
+    st.restarted(&Restart::Memory, true, &work, relaunch);
+    st.host_agent_resumed(HostAgent::Unread);
+    st.observe(&banner, relaunch + Duration::from_secs(10));
+    st.host_agent_resumed(HostAgent::Unread);
+    st.observe(
+        &TurnEndReading {
+            autopilot: Autopilot::Land,
+            ..idle("Carried on with the parser fix.", Some(2 * MIN))
+        },
+        relaunch + 3 * MIN,
+    );
+    assert!(!st.exchange_unread(), "no person's exchange was judged");
+    assert!(!st.left_to_person(), "the loop's own turn is never left");
+}
+
+/// OUTSIDE ANY RESTART GRACE AN UNREAD HOST ANSWER CHANGES NOTHING (LS-15): with no relaunch of
+/// the loop's and no host-confirmed resume in hand, a taskless screen is a fresh program's banner
+/// whatever the host's read says, as on main, where the read still out was `None`: the person's
+/// exchange in that program opens its session and is left to them. NEGATIVE CONTROL: the first cut
+/// of this fix deferred every taskless screen under an unread answer, so here the fresh program's
+/// exchange was carried on as the old session's (`exchange_opens=false left_to_person=false`).
+#[test]
+fn an_unread_host_answer_outside_any_restart_grace_behaves_as_main() {
+    let now = t0();
+    let banner = TurnEndReading {
+        autopilot: Autopilot::Land,
+        taskless: true,
+        ..idle("", None)
+    };
+    let work = TurnEndReading {
+        autopilot: Autopilot::Land,
+        ..idle("Implemented the parser fix.", Some(20 * MIN))
+    };
+    let asked = TurnEndReading {
+        autopilot: Autopilot::Land,
+        person: Some(Duration::from_secs(30)),
+        key: Some(Duration::from_secs(30)),
+        ..idle("The test still passes.", Some(30 * Duration::from_secs(1)))
+    };
+    let judged = |answer: HostAgent| {
+        let mut st = TurnEndState::default();
+        st.seed_worked();
+        st.observe(&work, now);
+        st.host_agent_resumed(answer);
+        st.observe(&banner, now + 21 * MIN);
+        assert!(
+            st.opened_fresh(),
+            "{answer:?}: the banner opens a fresh session"
+        );
+        st.host_agent_resumed(answer);
+        st.observe(&asked, now + 22 * MIN);
+        (
+            st.exchange_opens(),
+            st.left_to_person(),
+            st.exchange_unread(),
+        )
+    };
+    assert_eq!(
+        judged(HostAgent::Unread),
+        judged(HostAgent::Absent),
+        "an unread answer outside a grace is judged as main judged it"
+    );
+    assert_eq!(judged(HostAgent::Unread), (true, true, false));
+}
+
+/// AN UNREAD ANSWER KEEPS THE LAST AGENT READ (LS-15): the host named the tab's process as one
+/// that resumed the session's conversation (aterm's relaunch on its agent's exit, no restart of
+/// this loop's), its transcript not drawn yet; a later read that is not read is no news, so the
+/// taskless screen that follows is that resume's banner, not a fresh program's. NEGATIVE CONTROL:
+/// an unread answer that erases the agent (`resumed_agent = None`, as main's `None` did) leaves no
+/// resume standing and no restart grace to cover it, and the banner opens a fresh session. CONTROL:
+/// a read that answers with no agent does erase it, and the same banner opens a fresh session; and
+/// the agent read before the loop's restart is the process the restart ended, not kept for the
+/// relaunch's.
+#[test]
+fn an_unread_host_answer_keeps_the_last_agent_read() {
+    let now = t0();
+    let banner = TurnEndReading {
+        autopilot: Autopilot::Land,
+        taskless: true,
+        ..idle("", None)
+    };
+    let work = TurnEndReading {
+        autopilot: Autopilot::Land,
+        ..idle("Implemented the parser fix.", Some(20 * MIN))
+    };
+    let resume = HostAgent::Read(AgentResumed {
+        pid: 800,
+        started: Some(1_793_008_000),
+        resumed: true,
+    });
+    let banner_after = |then: HostAgent| {
+        let mut st = TurnEndState::default();
+        st.seed_worked();
+        st.observe(&work, now);
+        st.host_agent_resumed(resume);
+        st.host_agent_resumed(then);
+        st.observe(&banner, now + 21 * MIN);
+        st.opened_fresh()
+    };
+    assert!(
+        !banner_after(HostAgent::Unread),
+        "the resume read before the unread answer stands: its banner is the resume's"
+    );
+    // CONTROL: a read that answers with no agent erases the resume.
+    assert!(
+        banner_after(HostAgent::Absent),
+        "with no agent read the banner opens a fresh session"
+    );
+
+    // A fresh program read after the loop's restart, then an unread answer: its banner still
+    // opens its own session.
+    let relaunch = now + 21 * MIN;
+    let mut st = TurnEndState::default();
+    st.seed_worked();
+    st.observe(&work, now);
+    st.restarted(&Restart::Memory, true, &work, relaunch);
+    st.host_agent_resumed(HostAgent::Read(AgentResumed {
+        pid: 700,
+        started: Some(1_793_006_000),
+        resumed: false,
+    }));
+    st.host_agent_resumed(HostAgent::Unread);
+    st.observe(&banner, relaunch + Duration::from_secs(10));
+    assert!(
+        st.opened_fresh(),
+        "the fresh program read before the unread answer still opens its session"
+    );
+
+    // CONTROL: a fresh program read before the restart is not the relaunch's.
+    let mut st = TurnEndState::default();
+    st.seed_worked();
+    st.host_agent_resumed(HostAgent::Read(AgentResumed {
+        pid: 100,
+        started: Some(1_793_000_000),
+        resumed: false,
+    }));
+    st.observe(&work, now);
+    st.restarted(&Restart::Memory, true, &work, relaunch);
+    st.host_agent_resumed(HostAgent::Unread);
+    st.observe(&banner, relaunch + Duration::from_secs(10));
+    assert!(
+        !st.opened_fresh(),
+        "the ended process's word is not the relaunch's: the banner is undecided, not fresh"
+    );
 }
 
 /// A LOOP STARTED AS THE SESSION'S OFF LIFTED ATTACHES TO A SESSION THAT RAN UNDER OFF (D2-2):
@@ -22699,7 +22622,7 @@ fn a_loop_lifted_off_off_carries_a_persons_quick_turn_on_the_session_off_left() 
         st.start_lifted_off(OffStood::Person);
         st.agent_started(now - Duration::from_secs(9));
         st.agent_started_unix(1_793_000_000);
-        st.host_agent_resumed(Some(AgentResumed {
+        st.host_agent_resumed(HostAgent::Read(AgentResumed {
             pid: 900,
             started: Some(1_793_000_000),
             resumed: false,
@@ -22774,7 +22697,7 @@ fn a_loop_lifted_off_off_leaves_the_opening_exchange_its_screen_shows_to_the_per
                 );
             }
             if case == Case::Resumed {
-                st.host_agent_resumed(Some(AgentResumed {
+                st.host_agent_resumed(HostAgent::Read(AgentResumed {
                     pid: 31,
                     started: Some(1_793_000_000),
                     resumed: true,
@@ -22868,7 +22791,7 @@ fn a_fresh_programs_opening_message_read_busy_first_opens_its_session() {
                 st.agent_started(began);
                 st.agent_started_unix(BEGAN);
                 if case != Case::NoHost {
-                    st.host_agent_resumed(Some(AgentResumed {
+                    st.host_agent_resumed(HostAgent::Read(AgentResumed {
                         pid: 777,
                         started: Some(BEGAN),
                         resumed: case == Case::Resumed,
@@ -22880,7 +22803,7 @@ fn a_fresh_programs_opening_message_read_busy_first_opens_its_session() {
                         &under(mode, work.clone()),
                         now - Duration::from_secs(22),
                     );
-                    st.host_agent_resumed(Some(AgentResumed {
+                    st.host_agent_resumed(HostAgent::Read(AgentResumed {
                         pid: 777,
                         started: Some(BEGAN),
                         resumed: false,
@@ -22943,7 +22866,7 @@ fn a_resumed_conversations_first_question_opens_no_session() {
             st.agent_started(now - Duration::from_secs(20));
             st.agent_started_unix(BEGAN);
             if let Some(resumed) = resumed {
-                st.host_agent_resumed(Some(AgentResumed {
+                st.host_agent_resumed(HostAgent::Read(AgentResumed {
                     pid: 4242,
                     started: Some(BEGAN),
                     resumed,

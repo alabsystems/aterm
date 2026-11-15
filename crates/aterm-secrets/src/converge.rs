@@ -20,7 +20,9 @@ use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::net::IpAddr;
 use std::path::Path;
 
+mod note;
 mod refresh;
+pub use note::{Causes, MarkMoved, NOTE_MAX, START_NOTE_ENV, StartNote, note_word, noting, reap};
 pub use refresh::{
     RefreshObservation, RefreshRequest, RefreshScope, RefreshVersion, RepositoryRequest,
 };
@@ -104,6 +106,11 @@ fn runner_argument(exe: &Path, trigger: &str, argument: &str, value: &str) -> Co
         .stderr(Stdio::null())
         .setsid(true)
         .leave_background_band(trigger == SUBSCRIBER);
+    // The start's note, where its starter gave one ([`noting`]): one variable no program reads
+    // but the runner, which writes it into its own log line.
+    if let Some(word) = note::noted() {
+        command.env(START_NOTE_ENV, word);
+    }
     command
 }
 
@@ -249,6 +256,21 @@ pub struct Due {
     /// Automatic work was held. Its next admitted input capture owes fresh readback.
     activation: bool,
     retry: RunnerRetry,
+    /// Why the next start is owed: every cause noted since the last start ([`Due::note`]).
+    causes: Causes,
+    /// What last set [`Self::retry`]'s time, named once that time starts a runner.
+    retry_cause: Causes,
+    /// The last start's note.
+    noted: StartNote,
+    /// How many runners in a row ended finding the lock held, the CPU they spent, and when the
+    /// first of them was reaped: zeroed by a runner that ended any other way.
+    held: u32,
+    held_cpu_ms: u64,
+    held_since: Option<u64>,
+    /// What moved the inputs' mark, and in how many looks, since the last start
+    /// ([`Due::because_moved`]).
+    moved: MarkMoved,
+    moves: u32,
 }
 
 impl Due {
@@ -296,6 +318,32 @@ impl Due {
         self.pending = merge_requests(self.pending, Some(request));
     }
 
+    /// Note `cause` for the next start's note. It changes no pacing.
+    pub(crate) fn because(&mut self, cause: Causes) {
+        self.causes = self.causes.with(cause);
+    }
+
+    /// Note what moved the inputs' mark in `looks` looks that called for work, for the next
+    /// start's note. It changes no pacing.
+    pub(crate) fn because_moved(&mut self, moved: MarkMoved, looks: u32) {
+        self.moved = self.moved.with(moved);
+        self.moves = self.moves.saturating_add(looks);
+    }
+
+    /// Add the CPU a runner that found the lock held spent, as its reap measured it.
+    pub(crate) fn held_spent(&mut self, cpu: std::time::Duration) {
+        self.held_cpu_ms = self
+            .held_cpu_ms
+            .saturating_add(u64::try_from(cpu.as_millis()).unwrap_or(u64::MAX));
+    }
+
+    /// The note of the start the latest pacing method that returned true chose: why it was
+    /// owed, and the held runners before it.
+    #[must_use]
+    pub fn note(&self) -> StartNote {
+        self.noted
+    }
+
     /// Service the same job while another subscriber lane is waiting on HTTP.
     pub(crate) fn poll(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
         self.start(None, now_ms, routes, last)
@@ -304,6 +352,7 @@ impl Due {
     /// Canonical identity changed. Schedule local convergence without granting naming or
     /// repository authority, forcing remote freshness, or replacing a stronger pending request.
     pub fn identity_changed(&mut self) {
+        self.because(Causes::IDENTITY);
         self.identity_pending = true;
         // A newer canonical intent does not inherit the prior intent's failure backoff.
         self.identity_retry = RunnerRetry::default();
@@ -329,6 +378,7 @@ impl Due {
                 RepositoryRequest::Refresh(RefreshRequest::after(None, self.observed.version))
             }
         };
+        self.because(Causes::LOCAL);
         self.after_request(request, now_ms, routes, last)
     }
 
@@ -346,6 +396,7 @@ impl Due {
     /// Whether the subscriber starts a runner as it starts: always, unless one it started still
     /// runs (none can yet), at `now_ms` with `routes`.
     pub fn at_start(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
+        self.because(Causes::START);
         self.start(
             Some(RepositoryRequest::Refresh(RefreshRequest::ensure(
                 None,
@@ -368,6 +419,12 @@ impl Due {
     ) -> bool {
         let applied = matches!(outcome, SyncOutcome::Applied { .. });
         let back = std::mem::take(&mut self.failing);
+        if applied {
+            self.because(Causes::APPLIED);
+        }
+        if back {
+            self.because(Causes::RECOVERED);
+        }
         self.start(
             (applied || back).then_some(RepositoryRequest::Repair),
             now_ms,
@@ -386,8 +443,12 @@ impl Due {
         last: Last,
     ) -> bool {
         self.failed();
+        let applied = matches!(outcome, SyncOutcome::Applied { .. });
+        if applied {
+            self.because(Causes::APPLIED);
+        }
         self.start(
-            matches!(outcome, SyncOutcome::Applied { .. }).then_some(RepositoryRequest::Repair),
+            applied.then_some(RepositoryRequest::Repair),
             now_ms,
             routes,
             last,
@@ -403,6 +464,21 @@ impl Due {
     /// completion ends its failure streak; a held lock stays owed without consuming backoff.
     /// A Repair that ran beside deferred Refresh debt cannot retire or reschedule that debt.
     pub fn reaped(&mut self, last: Last, now_ms: u64) {
+        match last {
+            Last::Held => {
+                self.held = self.held.saturating_add(1);
+                self.held_since.get_or_insert(now_ms);
+                // The pass is still owed for what its held start was owed for.
+                self.causes = self.causes.with(self.noted.causes);
+                self.because_moved(self.noted.moved, self.noted.moves);
+            }
+            Last::Ended | Last::Failed | Last::Unfinished => {
+                self.held = 0;
+                self.held_cpu_ms = 0;
+                self.held_since = None;
+            }
+            Last::None | Last::Running => {}
+        }
         if self.identity_running
             && matches!(
                 last,
@@ -429,6 +505,13 @@ impl Due {
         // success cannot clear retry work that arrived while that job ran.
         if last != Last::Ended || self.retry_request.is_none() {
             self.retry.reaped(last, now_ms);
+            match last {
+                Last::Failed => self.retry_cause = Causes::RETRY_FAILED,
+                Last::Unfinished => self.retry_cause = Causes::RETRY_UNFINISHED,
+                Last::Held => self.retry_cause = Causes::RETRY_HELD,
+                Last::Ended => self.retry_cause = Causes::default(),
+                Last::None | Last::Running => {}
+            }
         }
         match last {
             Last::Failed | Last::Unfinished => {
@@ -471,6 +554,7 @@ impl Due {
     ) -> bool {
         self.reaped(last, now_ms);
         if std::mem::take(&mut self.activation) {
+            self.because(Causes::ACTIVATION);
             self.request(RepositoryRequest::Refresh(RefreshRequest::after(
                 None,
                 self.observed.version,
@@ -502,6 +586,7 @@ impl Due {
             {
                 self.retry_request = merge_requests(self.retry_request, self.pending.take());
                 self.retry.at = Some(now_ms.saturating_add(remaining));
+                self.retry_cause = Causes::RETRY_WAVE;
                 self.started = Some((now_ms, RECHECK_MS));
             }
         }
@@ -509,6 +594,7 @@ impl Due {
             && let Some(remaining) = self.observed.retry_for(request)
         {
             self.retry.at = Some(now_ms.saturating_add(remaining));
+            self.retry_cause = Causes::RETRY_WAVE;
         }
         if last == Last::Running {
             return false;
@@ -516,11 +602,27 @@ impl Due {
         // A future repository retry cannot defer local identity debt, nor can its clock
         // spend identity's independent failure backoff. No second child or timer is started.
         if self.identity_pending || self.identity_retry.due(now_ms) {
+            if self.identity_retry.due(now_ms) {
+                self.because(Causes::RETRY_IDENTITY);
+            }
             self.pending = merge_requests(self.pending, Some(RepositoryRequest::Repair));
         }
         if self.pending.is_none() && !self.retry.due(now_ms) {
             return false;
         }
+        if self.retry.due(now_ms) {
+            self.because(self.retry_cause);
+        }
+        self.noted = StartNote {
+            causes: std::mem::take(&mut self.causes),
+            held: self.held,
+            held_cpu_ms: self.held_cpu_ms,
+            waited_ms: self
+                .held_since
+                .map_or(0, |since| now_ms.saturating_sub(since)),
+            moved: std::mem::take(&mut self.moved),
+            moves: std::mem::take(&mut self.moves),
+        };
         // Any admitted full pass can carry still-owed identity alongside its other work.
         // Keep that subject's custody through the actual child outcome (including start None).
         self.identity_running = self.identity_pending || self.identity_retry.at.is_some();
@@ -578,11 +680,16 @@ impl Due {
             .is_some_and(|before| before != routes);
         let went_back = self.started.is_some_and(|(at, _)| now_ms < at);
         let request = if moved || went_back {
+            if moved {
+                self.because(Causes::ROUTES);
+            }
             if went_back {
+                self.because(Causes::CLOCK);
                 self.started = Some((now_ms, RECHECK_MS));
             }
             Some(RefreshRequest::after(None, self.observed.version))
         } else if self.started.is_none_or(|(at, wait)| now_ms - at >= wait) {
+            self.because(Causes::RECHECK);
             Some(RefreshRequest::ensure(None, self.observed.version))
         } else {
             None

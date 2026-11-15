@@ -1135,7 +1135,10 @@ fn hash_command_configs(
     Ok(())
 }
 
-fn hash_cargo_config(
+/// Fold the Cargo configuration file at `path` into `hash`: its bytes (or that it is absent),
+/// each compiler tool it selects (which must be one of `allowed`) and each clippy directory it
+/// names (added to `clippy_dirs`). A configuration whose readers are unbounded refuses.
+pub(crate) fn hash_cargo_config(
     hash: &mut aterm_digest::Sha256,
     path: &Path,
     allowed: &BTreeSet<PathBuf>,
@@ -1310,7 +1313,12 @@ fn bounded_config_readers(value: &aterm_toml::Value) -> Result<(), String> {
     Ok(())
 }
 
-fn hash_clippy_directory(hash: &mut aterm_digest::Sha256, directory: &Path) -> Result<(), String> {
+/// Fold `directory`'s path and its `clippy.toml` and `.clippy.toml` (each, or that it is absent)
+/// into `hash`.
+pub(crate) fn hash_clippy_directory(
+    hash: &mut aterm_digest::Sha256,
+    directory: &Path,
+) -> Result<(), String> {
     part(
         hash,
         b"clippy-config-directory",
@@ -1650,8 +1658,54 @@ fn digest_file(path: &Path) -> Result<String, String> {
     Ok(aterm_codec::hex::encode_lower(&hash.finalize()))
 }
 
+/// Conservative execution identity of a compiler tool the lint key names. Bytes alone are
+/// insufficient there: an equal tool which moved behind a symlink or whose execution metadata
+/// changed must lint again rather than inherit a prior pass. Unix ctime binds ACL/xattr changes
+/// without reading or recording their possibly platform-specific values; atime is deliberately
+/// absent because this verifier's own read can move it. A store tool is installed once and never
+/// relinked, so these fields repeat.
 fn runtime_file_identity(path: &Path) -> Result<Vec<u8>, String> {
-    crate::test_content::runtime_file_identity(path)
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let mut identity = os_bytes(path.as_os_str());
+    #[cfg(unix)]
+    let stat = {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut stat = Vec::new();
+        for value in [
+            metadata.dev(),
+            metadata.ino(),
+            u64::from(metadata.mode()),
+            metadata.nlink(),
+            u64::from(metadata.uid()),
+            u64::from(metadata.gid()),
+            metadata.rdev(),
+            metadata.size(),
+            metadata.blocks(),
+        ] {
+            stat.extend(value.to_le_bytes());
+        }
+        for value in [
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ] {
+            stat.extend(value.to_le_bytes());
+        }
+        stat
+    };
+    #[cfg(not(unix))]
+    let stat = vec![u8::from(metadata.permissions().readonly())];
+    identity.push(0);
+    identity.extend(stat);
+    Ok(identity)
 }
 
 /// One package completion event. Release keeps the last event for a spec.

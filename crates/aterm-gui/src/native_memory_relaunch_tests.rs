@@ -237,7 +237,11 @@ fn checked_memory_uses_real_source_gates_and_never_reauthorizes_recorded_signal(
     for case in 0..5 {
         let (handle, mut reader) = testing::owned_handle(7988 + case);
         let ctx = Arc::clone(&handle.ctx);
-        let mut world = World::new(ctx.self_id.as_str()).unwrap();
+        let mut world = World::new(
+            aterm_types::tab_id::TabId::parse(ctx.self_id.as_str())
+                .expect("the owned handle has a minted tab ID"),
+        )
+        .unwrap();
         crate::harness_host::publish_snapshot_for_test(
             ctx.self_id.as_str(),
             Some(world.snapshot()),
@@ -508,7 +512,11 @@ fn uncertain_memory_preparation_rechecks_the_source_and_reuses_the_saved_recipe(
     use crate::control_input_ack::testing;
     let (handle, mut reader) = testing::owned_handle(8110);
     let ctx = Arc::clone(&handle.ctx);
-    let mut world = World::new(ctx.self_id.as_str()).unwrap();
+    let mut world = World::new(
+        aterm_types::tab_id::TabId::parse(ctx.self_id.as_str())
+            .expect("the owned handle has a minted tab ID"),
+    )
+    .unwrap();
     crate::harness_host::publish_snapshot_for_test(ctx.self_id.as_str(), Some(world.snapshot()));
     let (kernel, _, _, _) = complete_cold_source(&handle, &mut reader, &world);
     let kernel = Arc::new(kernel);
@@ -621,7 +629,11 @@ fn revoked_memory_producer_during_journal_closes_without_effect_and_allows_fresh
     use crate::control_input_ack::testing;
     let (handle, mut reader) = testing::owned_handle(8111);
     let ctx = Arc::clone(&handle.ctx);
-    let mut world = World::new(ctx.self_id.as_str()).unwrap();
+    let mut world = World::new(
+        aterm_types::tab_id::TabId::parse(ctx.self_id.as_str())
+            .expect("the owned handle has a minted tab ID"),
+    )
+    .unwrap();
     crate::harness_host::publish_snapshot_for_test(ctx.self_id.as_str(), Some(world.snapshot()));
     let (mut kernel, _, _, _) = complete_cold_source(&handle, &mut reader, &world);
     world.controls().revision(

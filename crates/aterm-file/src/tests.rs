@@ -112,6 +112,7 @@ fn opened(newest: bool, frontier: Frontier, snapshot: Option<Snapshot>) -> Pass 
         frontier,
         projection: 1,
         withheld: 0,
+        inert: 0,
         projected: snapshot.map(|snapshot| Projected {
             snapshot,
             history: Vec::new(),
@@ -378,6 +379,56 @@ fn a_pass_records_its_word_and_a_refusal_leaves_the_snapshot_as_it_was() {
         assert_eq!(mode(&scratch.root.state_dir(&name("ai/accounts"))), 0o700);
         assert_eq!(mode(scratch.root.path()), 0o700);
     }
+}
+
+/// A pass records how many records of the file the replica holds inert, with the snapshot it
+/// wrote; `ls`, `status` and their JSON say it, and a status file that does not say reads as
+/// unknown.
+/// NEGATIVE CONTROL, observed: with `Status::line` leaving the count out, the line `ls` and
+/// `status` print lacks it: `` left: "live · rev 1 · 1 rows" right: "live · rev 1 · 1 rows · 2
+/// inert" ``.
+#[test]
+fn the_records_a_pass_counted_inert_are_shown_by_ls_and_status() {
+    let scratch = scratch();
+    let file = File::at(&scratch.root, &name("ai/accounts"));
+    let Pass::Opened(mut counted) = opened(true, frontier(0, &[1]), Some(accounts(vec![ada()])))
+    else {
+        unreachable!("an open")
+    };
+    counted.inert = 2;
+    file.record(file.look(), Pass::Opened(counted), 20)
+        .expect("records");
+    assert_eq!(file.state().expect("a state").inert, Some(2));
+    assert_eq!(file.status().line(), "live · rev 1 · 1 rows · 2 inert");
+    let ls = answer(&scratch.root, &["ls"]);
+    assert!(
+        ls.out
+            .contains("ai/accounts\ttable\tlive · rev 1 · 1 rows · 2 inert\t"),
+        "{}",
+        ls.out
+    );
+    let status: Value =
+        aterm_json::from_str(&answer(&scratch.root, &["status", "--json"]).out).expect("JSON");
+    assert_eq!(status["files"][0]["inert"], Value::from(2_u64), "{status}");
+    let listed: Value =
+        aterm_json::from_str(&answer(&scratch.root, &["ls", "--json"]).out).expect("JSON");
+    assert_eq!(listed["files"][0]["inert"], Value::from(2_u64), "{listed}");
+
+    // A status file this field is missing from (an older build rewrote it) does not say: the
+    // count is unknown, which the materializer projects again rather than trust, and the line
+    // says nothing of it while its JSON says 0.
+    let path = scratch.root.state(file.name());
+    let mut state: Value =
+        aterm_json::from_slice(&std::fs::read(&path).expect("the status")).expect("JSON");
+    if let Value::Object(object) = &mut state {
+        assert!(object.remove("inert").is_some());
+    }
+    std::fs::write(&path, state.to_string()).expect("written");
+    assert_eq!(file.state().expect("a state").inert, None);
+    assert_eq!(file.status().line(), "live · rev 1 · 1 rows");
+    let status: Value =
+        aterm_json::from_str(&answer(&scratch.root, &["status", "--json"]).out).expect("JSON");
+    assert_eq!(status["files"][0]["inert"], Value::from(0_u64), "{status}");
 }
 
 #[test]
@@ -1233,8 +1284,57 @@ fn draft(edits: Vec<crate::Edit>) -> crate::Draft {
     }
 }
 
+/// An owner act for these tests, `None` where `by` or `session` breaks its grammar: this
+/// crate's one call of the test seam past its clippy.toml row (one owner act).
+fn act(by: &str, session: Option<&str>) -> Option<crate::OwnerAct> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "aterm-file's one test helper for an owner act"
+    )]
+    let made = crate::owner_act_for_test(by, session);
+    made
+}
+
 fn person() -> crate::OwnerAct {
-    crate::OwnerAct::verb("person", Some("s-1")).expect("an owner act")
+    act("person", Some("s-1")).expect("an owner act")
+}
+
+/// The publisher's claim on the queued intent `id`: `None` where it is no longer waiting. The
+/// publisher's verbs have clippy.toml rows (aterm-db's `file::publish` alone calls them); each
+/// has its one test helper here.
+fn claim(file: &File, id: &str) -> Option<crate::Claim> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "aterm-file's one test helper for the publisher's claim"
+    )]
+    let claimed = file.claim(id);
+    claimed.expect("the outbox read")
+}
+
+/// The publisher holds the queued intent `id`, under its claim: `false` where none is queued.
+fn hold(file: &File, id: &str, why: &str, now_ms: u64) -> bool {
+    claim(file, id).is_some_and(|claim| claim.hold(why, now_ms).expect("held"))
+}
+
+/// The publisher writes the marker of the queued intent `id`: `false` where none is queued.
+fn mark_done(file: &File, id: &str, mark: &crate::Mark, now_ms: u64) -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "aterm-file's one test helper for the publisher's marker"
+    )]
+    let marked = file.mark_done(id, mark, now_ms);
+    marked.expect("marked")
+}
+
+/// The publisher takes the marked or held intent `id` out of the outbox: `false` where neither
+/// names it.
+fn dequeue(file: &File, id: &str) -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "aterm-file's one test helper for the publisher's dequeue"
+    )]
+    let dequeued = file.dequeue(id);
+    dequeued.expect("the outbox read")
 }
 
 /// An operation digest as an intent names one.
@@ -1351,13 +1451,16 @@ fn a_write_is_queued_durably_and_read_back_over_the_snapshot() {
             Err(crate::Refused::Malformed(_))
         ));
     }
-    assert!(crate::OwnerAct::verb("Not A Word", None).is_none());
+    assert!(act("Not A Word", None).is_none());
     assert_eq!(file.outbox().queued.len(), 2);
 }
 
 /// The outbox is bounded: at 1,024 intents a new owner write is refused, nothing queued is
 /// dropped to make room, and a held intent still counts. A Mac's own statements coalesce to
-/// the latest per cell instead.
+/// the latest per cell instead, and none is an owner's write: not one at an owner's key, and
+/// not a revert.
+/// NEGATIVE CONTROL, observed: with `well_formed` taking a revert stated as a Mac's own row, it
+/// is queued: `` assertion failed: matches!(links.state_mine("harness", revert, 5), … ``.
 #[test]
 fn a_full_outbox_refuses_the_new_write_and_mine_intents_coalesce() {
     let scratch = scratch();
@@ -1384,7 +1487,7 @@ fn a_full_outbox_refuses_the_new_write_and_mine_intents_coalesce() {
         "a refused write changes nothing"
     );
     // A held intent is out of the outbox and still counts against the bound.
-    assert!(file.hold(&format!("{:032x}", 0), "moved", 3).expect("held"));
+    assert!(hold(&file, &format!("{:032x}", 0), "moved", 3));
     assert_eq!(file.outbox().queued.len(), crate::outbox::MAX_INTENTS - 1);
     assert!(matches!(
         file.write(&person(), draft(vec![edit("ac9", "label", "v", &[])]), 4),
@@ -1392,7 +1495,8 @@ fn a_full_outbox_refuses_the_new_write_and_mine_intents_coalesce() {
     ));
     // A person's drop makes room.
     assert_eq!(
-        file.drop_intent(&format!("{:032x}", 0)).expect("dropped"),
+        file.drop_intent(&person(), &format!("{:032x}", 0))
+            .expect("dropped"),
         crate::Dropped::Dropped
     );
     file.write(&person(), draft(vec![edit("ac9", "label", "v", &[])]), 5)
@@ -1417,11 +1521,22 @@ fn a_full_outbox_refuses_the_new_write_and_mine_intents_coalesce() {
     assert_eq!(queued[0].edits[0].column, "seen");
     assert_eq!(queued[1], last.intent);
     assert!(queued.iter().all(crate::Intent::mine));
-    // An owner's write is never coalesced away, and a mine statement is never an owner's.
+    // An owner's write is never coalesced away, and a mine statement is never an owner's: not
+    // one at an owner's key, and not a revert, which names no key and so reads as an owner's.
     assert!(matches!(
         links.state_mine("harness", draft(vec![edit("ac1", "state", "x", &[])]), 4),
         Err(crate::Refused::Malformed(_))
     ));
+    let revert = crate::Draft {
+        born: false,
+        revert: Some(op(7)),
+        edits: Vec::new(),
+    };
+    assert!(matches!(
+        links.state_mine("harness", revert, 5),
+        Err(crate::Refused::Malformed(why)) if why.contains("revert")
+    ));
+    assert_eq!(links.outbox().queued.len(), 2);
 }
 
 /// The marker is written before the intent leaves the outbox, and only a marked or held intent
@@ -1456,16 +1571,13 @@ fn an_intent_leaves_the_outbox_only_marked_or_held_and_a_held_one_is_shown_not_a
             .unwrap_or_default()
     };
     // Neither marked nor held: it stays.
-    assert!(!file.dequeue(&intent.id).expect("read"));
+    assert!(!dequeue(&file, &intent.id));
     assert_eq!(file.outbox().queued.len(), 1);
     // Marked, and the publisher killed before the dequeue: still queued, no longer waiting.
-    assert!(
-        file.mark_done(&intent.id, &mark(Some(op(2))), 30)
-            .expect("marked")
-    );
+    assert!(mark_done(&file, &intent.id, &mark(Some(op(2))), 30));
     let outbox = file.outbox();
     assert_eq!((outbox.queued.len(), outbox.waiting().count()), (1, 0));
-    assert!(file.dequeue(&intent.id).expect("dequeued"));
+    assert!(dequeue(&file, &intent.id));
     assert!(file.outbox().queued.is_empty());
     // Published, and the snapshot does not hold the operation yet: the read still says it.
     assert_eq!(shown(&file), "mine");
@@ -1495,10 +1607,7 @@ fn an_intent_leaves_the_outbox_only_marked_or_held_and_a_held_one_is_shown_not_a
             50,
         )
         .expect("accepted");
-    assert!(
-        file.hold(&held.id, "changed since it was written", 60)
-            .expect("held")
-    );
+    assert!(hold(&file, &held.id, "changed since it was written", 60));
     let outbox = file.outbox();
     assert_eq!((outbox.queued.len(), outbox.held.len()), (0, 1));
     assert_eq!(outbox.held[0].intent, held.intent);
@@ -1566,14 +1675,34 @@ fn a_write_that_landed_is_accepted_whatever_its_folders_flush_said() {
 }
 
 /// A Mac's statement of its own row replaces what earlier statements say of the same cells, held
-/// ones included, so its statements never fill the bound an owner's write needs.
+/// ones included, so its statements never fill the bound an owner's write needs; a person's held
+/// revert beside them, which writes no cell, stays held until a person resolves it.
 ///
-/// NEGATIVE CONTROL, observed: with coalescing over queued statements alone, the held one keeps
-/// its cell: `left: [["state", "seen"]] right: [["seen"]]`.
+/// NEGATIVE CONTROLS, each observed: with coalescing over queued statements alone, the held one
+/// keeps its cell: `left: [["state", "seen"]] right: [["seen"]]`; with the held list keeping
+/// only intents that still hold an edit, the person's held revert goes with the emptied
+/// statement: `` the held revert stays: [] ``.
 #[test]
 fn a_held_statement_of_a_macs_own_row_is_replaced_by_its_latest() {
     let scratch = scratch();
     let links = File::at(&scratch.root, &name("ai/links"));
+    let revert = links
+        .write(
+            &person(),
+            crate::Draft {
+                born: false,
+                revert: Some(op(7)),
+                edits: Vec::new(),
+            },
+            1,
+        )
+        .expect("accepted");
+    assert!(hold(
+        &links,
+        &revert.id,
+        "its operation's cells changed since",
+        1
+    ));
     let held = links
         .state_mine(
             "harness",
@@ -1584,11 +1713,12 @@ fn a_held_statement_of_a_macs_own_row_is_replaced_by_its_latest() {
             1,
         )
         .expect("accepted");
-    assert!(
-        links
-            .hold(&held.id, "a typed cell key breaks its grammar", 2)
-            .expect("held")
-    );
+    assert!(hold(
+        &links,
+        &held.id,
+        "a typed cell key breaks its grammar",
+        2
+    ));
     let later = links
         .state_mine(
             "harness",
@@ -1600,12 +1730,27 @@ fn a_held_statement_of_a_macs_own_row_is_replaced_by_its_latest() {
         outbox
             .held
             .iter()
+            .filter(|held| held.intent.mine())
             .map(|held| held.intent.edits.iter().map(|e| e.column.clone()).collect())
+            .collect()
+    };
+    let reverts = |outbox: &crate::Outbox| -> Vec<String> {
+        outbox
+            .held
+            .iter()
+            .filter(|held| held.intent.revert.is_some())
+            .map(|held| held.intent.id.clone())
             .collect()
     };
     let outbox = links.outbox();
     assert_eq!(columns(&outbox), [["seen".to_owned()]]);
     assert_eq!(outbox.queued, std::slice::from_ref(&later.intent));
+    assert_eq!(
+        reverts(&outbox),
+        std::slice::from_ref(&revert.id),
+        "the held revert stays: {:?}",
+        reverts(&outbox)
+    );
     links
         .state_mine(
             "harness",
@@ -1614,7 +1759,13 @@ fn a_held_statement_of_a_macs_own_row_is_replaced_by_its_latest() {
         )
         .expect("accepted");
     let outbox = links.outbox();
-    assert!(outbox.held.is_empty(), "{:?}", columns(&outbox));
+    assert_eq!(outbox.held.len(), 1, "{:?}", columns(&outbox));
+    assert_eq!(
+        reverts(&outbox),
+        std::slice::from_ref(&revert.id),
+        "the held revert stays: {:?}",
+        reverts(&outbox)
+    );
     assert_eq!(outbox.queued.len(), 2);
 }
 
@@ -1670,7 +1821,7 @@ fn a_value_the_guard_refuses_is_never_queued_nor_shown() {
             .unwrap_or_default()
     };
     assert_eq!(shown(&file), aterm_value_guard::REFUSED);
-    assert!(file.hold(&planted.id, "refused", 30).expect("held"));
+    assert!(hold(&file, &planted.id, "refused", 30));
     let marked = shown(&file);
     assert!(
         marked.starts_with(crate::outbox::CONFLICT)
@@ -1704,10 +1855,7 @@ fn a_held_intent_is_resolved_once_whatever_a_crash_between_its_two_writes_left()
             20,
         )
         .expect("accepted");
-    assert!(
-        file.hold(&held.id, "changed since it was written", 30)
-            .expect("held")
-    );
+    assert!(hold(&file, &held.id, "changed since it was written", 30));
     let held_path = scratch.root.held(file.name());
     let held_line = std::fs::read(&held_path).expect("the held list");
     let mine = file
@@ -1736,7 +1884,7 @@ fn a_held_intent_is_resolved_once_whatever_a_crash_between_its_two_writes_left()
         "resolved once"
     );
     assert_eq!(
-        file.drop_intent(&held.id).expect("read"),
+        file.drop_intent(&person(), &held.id).expect("read"),
         crate::Dropped::Absent
     );
     assert_eq!(file.outbox().queued, std::slice::from_ref(&mine.intent));
@@ -1777,11 +1925,8 @@ fn a_marker_a_later_generation_restated_is_seen() {
             20,
         )
         .expect("accepted");
-    assert!(
-        file.mark_done(&intent.id, &mark(Some(op(5))), 30)
-            .expect("marked")
-    );
-    assert!(file.dequeue(&intent.id).expect("dequeued"));
+    assert!(mark_done(&file, &intent.id, &mark(Some(op(5))), 30));
+    assert!(dequeue(&file, &intent.id));
     // The same generation, without the operation: still laid over.
     file.record(
         file.look(),
@@ -1821,10 +1966,10 @@ fn a_drop_while_the_publisher_holds_its_claim_is_told_the_intent_is_published() 
     let signed = file
         .write(&person(), draft(vec![edit("ac1", "label", "desk", &[])]), 1)
         .expect("accepted");
-    let claim = file.claim(&signed.id).expect("read").expect("queued");
+    let claimed = claim(&file, &signed.id).expect("queued");
     let (other, id) = (file.clone(), signed.id.clone());
-    let dropping = std::thread::spawn(move || other.drop_intent(&id));
-    assert!(claim.mark_done(&mark(Some(op(3))), 2).expect("marked"));
+    let dropping = std::thread::spawn(move || other.drop_intent(&person(), &id));
+    assert!(claimed.mark_done(&mark(Some(op(3))), 2).expect("marked"));
     assert_eq!(
         dropping.join().expect("joined").expect("read"),
         crate::Dropped::Published
@@ -1841,8 +1986,8 @@ fn a_drop_while_the_publisher_holds_its_claim_is_told_the_intent_is_published() 
         .write(&person(), draft(vec![edit("ac2", "label", "lab", &[])]), 3)
         .expect("accepted");
     assert_eq!(
-        file.drop_intent(&dropped.id).expect("read"),
+        file.drop_intent(&person(), &dropped.id).expect("read"),
         crate::Dropped::Dropped
     );
-    assert!(file.claim(&dropped.id).expect("read").is_none());
+    assert!(claim(&file, &dropped.id).is_none());
 }

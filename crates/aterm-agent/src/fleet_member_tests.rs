@@ -9,6 +9,7 @@ use aterm_net::fleet_member::{Issuer, read_peers, serve_book, serve_join};
 use aterm_uds::private_file::{remove_private, write_private};
 use aterm_uds::stop::Stop;
 use std::cell::{Cell, RefCell};
+use std::io::Write as _;
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::rc::Rc;
@@ -113,6 +114,10 @@ fn native_fleet_registration_finishes_before_discovery_fallback() {
     );
 }
 
+/// The naming publication writes the fleet name only while the committed policy and canonical
+/// number still name it, and records no follow: the number it wrote over the follow's own name
+/// reads as [`FleetName::Kept`] against a later label. NEGATIVE CONTROL: the same name, which
+/// the follow wrote and recorded, reads as [`FleetName::Due`].
 #[test]
 fn canonical_name_publication_keeps_its_committed_policy_and_number_current() {
     use aterm_types::machine_name::Number;
@@ -163,12 +168,26 @@ fn canonical_name_publication_keeps_its_committed_policy_and_number_current() {
         0o600,
     )
     .unwrap();
+    let no = |_: &str| false;
+    follow_fleet_name_at(&world.places, "m59", &no, &|| Ok(())).unwrap();
+    assert_eq!(followed_name(&world.places.state).as_deref(), Some("m59"));
+    assert_eq!(
+        fleet_name_at(&world.places, "m60", &no).unwrap(),
+        FleetName::Due {
+            from: "m59".to_owned()
+        }
+    );
     set_primary_name(
         &world.places,
         "m59",
         &Writer::Canonical(Number::new(59).unwrap()),
     )
     .unwrap();
+    assert_eq!(followed_name(&world.places.state), None);
+    assert_eq!(
+        fleet_name_at(&world.places, "m60", &no).unwrap(),
+        FleetName::Kept("m59".to_owned())
+    );
     crate::machine_name::file::replace(&world.places.state, |name| {
         name.num = Number::new(60);
         Ok(())
@@ -364,10 +383,29 @@ fn a_private_reservation_takes_no_port_of_the_persons_fleet() {
     assert_ne!(at.port(), port, "{at}");
 }
 
+/// Leave `name` as this machine's fleet name with no follow record ([`FOLLOWED_FILE`]), as an
+/// earlier build's `aterm fleet name set` left a person's name, and an older follow its own
+/// before that record existed.
+fn kept_name(places: &Places, name: &str) {
+    member::ensure_private_dir(&places.state).unwrap();
+    write_private(
+        &places.state,
+        member::NAME_FILE,
+        format!("{name}\n").as_bytes(),
+    )
+    .unwrap();
+    remove_private(&places.state, FOLLOWED_FILE).unwrap();
+}
+
+/// Each primary name the fleet name takes answers for the node beside its temporary alias, and
+/// `aterm fleet name` reads both. The alias and a word outside the name grammar are no fleet
+/// name, and `aterm fleet name` with an argument is a usage error that names `aterm name set`;
+/// neither writes. NEGATIVE CONTROL: a valid name is written.
 #[test]
 fn giving_a_node_better_names_keeps_its_temporary_alias() {
+    let no = |_: &str| false;
     let world = World::new("primary-name");
-    name_machine(&world.places, &args(&["set", "m62"])).unwrap();
+    follow_fleet_name_at(&world.places, "m62", &no, &|| Ok(())).unwrap();
     let node = own_node(&world.places).unwrap();
     let alias = member::temporary_name(&node);
     assert_eq!(
@@ -378,30 +416,37 @@ fn giving_a_node_better_names_keeps_its_temporary_alias() {
         names_this_machine(&world.places, &alias).unwrap(),
         Some(node.clone())
     );
-    name_machine(&world.places, &args(&["set", "studio"])).unwrap();
+    follow_fleet_name_at(&world.places, "studio", &no, &|| Ok(())).unwrap();
     assert_eq!(
         names_this_machine(&world.places, "studio").unwrap(),
         Some(node.clone())
     );
     assert_eq!(
         names_this_machine(&world.places, &alias).unwrap(),
-        Some(node)
+        Some(node.clone())
     );
-    assert!(name_machine(&world.places, &args(&["set", &alias])).is_err());
-    assert!(name_machine(&world.places, &args(&["set", "../escape"])).is_err());
+    for word in [alias.as_str(), "../escape"] {
+        assert!(matches!(
+            fleet_name_at(&world.places, word, &no).unwrap(),
+            FleetName::NotApplicable(_)
+        ));
+        follow_fleet_name_at(&world.places, word, &no, &|| Ok(())).unwrap();
+    }
+    assert!(matches!(
+        name_machine(&world.places, &args(&["set", "m63"])),
+        Err(Failure::Usage(why)) if why.contains("`aterm name set")
+    ));
     assert_eq!(
-        member::read_primary_name(&world.places.state)
-            .unwrap()
-            .as_deref(),
-        Some("studio")
+        name_machine(&world.places, &[]).unwrap(),
+        format!("name=studio alias={alias} node={node}")
     );
 }
 
 /// The fleet name follows the name `sync.identity` gives the Mac (its swarm label) where it is
 /// unset, the follow's own, or an earlier label the roster gives this Mac, once: a second follow
-/// writes nothing. A name the person set, and an `m<N>` the person set that the roster does not
-/// give this Mac (NEGATIVE CONTROL: the same name with `earlier` saying yes is followed), are
-/// kept.
+/// writes nothing. A name with no follow record ([`kept_name`]), and such an `m<N>` that the
+/// roster does not give this Mac (NEGATIVE CONTROL: the same name with `earlier` saying yes is
+/// followed), are kept.
 #[test]
 fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
     let yes = |_: &str| true;
@@ -440,9 +485,9 @@ fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
         Some("m100")
     );
 
-    // A label the person set follows only when the roster gives it to this Mac as an earlier
-    // label of its own.
-    name_machine(&world.places, &args(&["set", "m42"])).unwrap();
+    // A label with no follow record follows only when the roster gives it to this Mac as an
+    // earlier label of its own.
+    kept_name(&world.places, "m42");
     assert_eq!(
         fleet_name_at(&world.places, "m100", &no).unwrap(),
         FleetName::Kept("m42".to_owned())
@@ -463,7 +508,7 @@ fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
     );
 
     // A person's own name is theirs, whatever the roster says.
-    name_machine(&world.places, &args(&["set", "studio"])).unwrap();
+    kept_name(&world.places, "studio");
     assert_eq!(
         fleet_name_at(&world.places, "m100", &yes).unwrap(),
         FleetName::Kept("studio".to_owned())
@@ -483,7 +528,8 @@ fn the_fleet_name_follows_the_swarm_label_once_and_keeps_a_persons_name() {
 
 /// A name the follow wrote stays aterm's: a later change of the name the Mac is given (the
 /// person's `[identity] name` changed, or removed so the label applies) reaches the fleet name
-/// too. NEGATIVE CONTROL: once the person sets the fleet name themselves, no follow replaces it.
+/// too. NEGATIVE CONTROL: once the fleet name has no follow record ([`kept_name`]), no follow
+/// replaces it.
 #[test]
 fn the_fleet_name_follows_a_changed_identity_name_it_wrote_itself() {
     let no = |_: &str| false;
@@ -502,7 +548,7 @@ fn the_fleet_name_follows_a_changed_identity_name_it_wrote_itself() {
     follow_fleet_name_at(&world.places, "m42", &no, &|| Ok(())).unwrap();
     assert_eq!(name().as_deref(), Some("m42"));
 
-    name_machine(&world.places, &args(&["set", "den"])).unwrap();
+    kept_name(&world.places, "den");
     assert_eq!(
         fleet_name_at(&world.places, "m42", &no).unwrap(),
         FleetName::Kept("den".to_owned())
@@ -512,10 +558,10 @@ fn the_fleet_name_follows_a_changed_identity_name_it_wrote_itself() {
 }
 
 /// A Mac the roster relabelled (`m58` to `m176`, keeping no alias) whose fleet name is the old
-/// label, which an older aterm's follow wrote with no record of the write, signs the roster's label
-/// after the next follow, as it does where a person set that `m<N>`; a name of the person's own is
-/// kept. NEGATIVE CONTROL: where the name followed is not the label the roster gives this Mac (the
-/// person's `[identity] name`), the old label is kept.
+/// label with no record of who wrote it (an older aterm's follow, or a person's `aterm fleet name
+/// set` in an earlier build) signs the roster's label after the next follow; a name of the
+/// person's own is kept. NEGATIVE CONTROL: where the name followed is not the label the roster
+/// gives this Mac (the person's `[identity] name`), the old label is kept.
 #[test]
 fn a_stale_swarm_label_follows_the_rosters_label_and_a_persons_name_is_kept() {
     let gives = |word: &str| word == "m176";
@@ -537,11 +583,18 @@ fn a_stale_swarm_label_follows_the_rosters_label_and_a_persons_name_is_kept() {
     follow_fleet_name_at(&world.places, "m176", &gives, &|| Ok(())).unwrap();
     assert_eq!(name().as_deref(), Some("m176"));
 
-    name_machine(&world.places, &args(&["set", "m58"])).unwrap();
+    // The same stale label, with no follow record, on a node the follow gave an identity.
+    kept_name(&world.places, "m58");
+    assert_eq!(
+        fleet_name_at(&world.places, "m176", &gives).unwrap(),
+        FleetName::Due {
+            from: "m58".to_owned()
+        }
+    );
     follow_fleet_name_at(&world.places, "m176", &gives, &|| Ok(())).unwrap();
     assert_eq!(name().as_deref(), Some("m176"));
 
-    name_machine(&world.places, &args(&["set", "studio"])).unwrap();
+    kept_name(&world.places, "studio");
     assert_eq!(
         fleet_name_at(&world.places, "m176", &gives).unwrap(),
         FleetName::Kept("studio".to_owned())
@@ -550,14 +603,14 @@ fn a_stale_swarm_label_follows_the_rosters_label_and_a_persons_name_is_kept() {
     assert_eq!(name().as_deref(), Some("studio"));
 }
 
-/// A follow writes only over the fleet name it read: a name the person set between its read and
-/// its write (under the write lock) is kept. A retired source intent also writes neither the
-/// name nor its ownership record. NEGATIVE CONTROL: the same admitted follow over the name it
-/// did read writes.
+/// A follow writes only over the fleet name it read: a name written between its read and its
+/// write (under the write lock), as the naming publication writes one, is kept. A retired source
+/// intent also writes neither the name nor its ownership record. NEGATIVE CONTROL: the same
+/// admitted follow over the name it did read writes.
 #[test]
 fn a_follow_never_writes_over_a_name_set_after_it_read() {
     let world = World::new("follow-race");
-    name_machine(&world.places, &args(&["set", "studio"])).unwrap();
+    kept_name(&world.places, "studio");
     let said = set_primary_name(
         &world.places,
         "m42",
@@ -610,10 +663,11 @@ fn a_follow_never_writes_over_a_name_set_after_it_read() {
 }
 
 /// A label another machine's signed entry already carries is read as taken and left, by the
-/// follow as by `name set`, writing nothing; the same follow on a book without that entry
-/// (NEGATIVE CONTROL) takes the name.
+/// follow as by the naming publication, writing nothing; the same follow on a book without that
+/// entry (NEGATIVE CONTROL) takes the name.
 #[test]
 fn the_fleet_name_never_takes_a_name_another_machine_holds() {
+    use aterm_types::machine_name::Number;
     let world = World::new("follow-collides");
     member::ensure_private_dir(&world.places.state).unwrap();
     let other = NodeIdentity::from_seed(&"7b".repeat(16), &[0x7b; 32]).unwrap();
@@ -634,7 +688,12 @@ fn the_fleet_name_never_takes_a_name_another_machine_holds() {
         member::read_primary_name(&world.places.state).unwrap(),
         None
     );
-    let refused = name_machine(&world.places, &args(&["set", "m42"])).unwrap_err();
+    let refused = set_primary_name(
+        &world.places,
+        "m42",
+        &Writer::Canonical(Number::new(42).unwrap()),
+    )
+    .unwrap_err();
     assert!(refused.into_text().contains("already names"));
     assert_eq!(
         member::read_primary_name(&world.places.state).unwrap(),
@@ -655,7 +714,7 @@ fn the_fleet_name_never_takes_a_name_another_machine_holds() {
 fn automatic_join_selects_its_own_port_and_delivers_the_signed_name() {
     let (issuer, code, _serving) = issuing("automatic-named-issuer");
     let newcomer = World::new("automatic-named-newcomer");
-    name_machine(&newcomer.places, &args(&["set", "studio"])).unwrap();
+    follow_fleet_name_at(&newcomer.places, "studio", &|_| false, &|| Ok(())).unwrap();
     assert!(matches!(
         converged(converge_on(&newcomer.places, &code, &Opts::default())),
         FleetSync::Joined(_)
@@ -949,6 +1008,9 @@ fn an_init_or_a_join_names_no_host_a_fleet_never_dials() {
     }
 }
 
+/// No stdin that carries input: a terminal, or an agent's shell (`/dev/null`).
+const NO_STDIN: Option<&[u8]> = None;
+
 #[test]
 fn a_code_file_gives_its_first_line() {
     let world = World::new("codefile");
@@ -956,18 +1018,18 @@ fn a_code_file_gives_its_first_line() {
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(&file, "\n  atf1-abcd@m7:7100  \nsecond\n").unwrap();
     assert_eq!(
-        read_code(Some(&file)).unwrap(),
-        ("atf1-abcd@m7:7100".to_owned(), CodeFrom::File)
+        given_code(Some(&file), Some(&b"atf1-piped"[..])).unwrap(),
+        Some("atf1-abcd@m7:7100".to_owned())
     );
-    assert!(!CodeFrom::File.left_behind().is_empty());
-    assert!(!CodeFrom::Piped.left_behind().is_empty());
-    assert!(CodeFrom::Typed.left_behind().is_empty());
     std::fs::write(&file, "\n\n").unwrap();
-    assert!(read_code(Some(&file)).is_err(), "an empty file is no code");
+    assert!(
+        given_code(Some(&file), NO_STDIN).is_err(),
+        "an empty file is no code, and no default fleet's join"
+    );
     let dir_code = file.with_file_name("code-dir");
     std::fs::create_dir_all(&dir_code).unwrap();
     assert!(
-        read_code(Some(&dir_code)).is_err(),
+        given_code(Some(&dir_code), NO_STDIN).is_err(),
         "a directory --code-file must be refused"
     );
     #[cfg(unix)]
@@ -979,18 +1041,130 @@ fn a_code_file_gives_its_first_line() {
         // SAFETY: `c_fifo` is a valid NUL-terminated path inside our owned scratch directory.
         assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
         assert!(
-            read_code(Some(&fifo)).is_err(),
+            given_code(Some(&fifo), NO_STDIN).is_err(),
             "a FIFO --code-file must fail immediately without blocking"
         );
     }
     let missing = file.with_file_name(a_code());
-    match read_code(Some(&missing)) {
+    match given_code(Some(&missing), NO_STDIN) {
         Err(Failure::Failed(why)) => assert!(
             !why.contains(&*missing.to_string_lossy()) && !why.contains(&a_code()),
             "{why}"
         ),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn stdin_that_carries_input_gives_a_code_and_an_empty_one_is_refused() {
+    assert_eq!(
+        given_code(None, Some(&b"\n atf1-piped \n"[..])).unwrap(),
+        Some("atf1-piped".to_owned())
+    );
+    for empty in [&b""[..], &b" \n\n"[..]] {
+        assert!(
+            matches!(
+                given_code(None, Some(empty)),
+                Err(Failure::Failed(why)) if why == "stdin holds no join code"
+            ),
+            "{empty:?}: an empty code file on stdin joins no default fleet"
+        );
+    }
+    assert_eq!(given_code(None, NO_STDIN).unwrap(), None);
+    let world = World::new("stdin-kind");
+    let dir = world.places.config.with_file_name("kinds");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("code");
+    std::fs::write(&file, "").unwrap();
+    let fifo = dir.join("fifo");
+    let c_fifo =
+        std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(fifo.as_os_str())).unwrap();
+    // SAFETY: `c_fifo` is a valid NUL-terminated path inside our owned scratch directory.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    let kind = |path: &Path| carries_input(&std::fs::metadata(path).unwrap());
+    assert!(
+        kind(&file) && kind(&fifo),
+        "a redirected file or a pipe carries input"
+    );
+    assert!(
+        !kind(Path::new("/dev/null")) && !kind(&dir),
+        "a device (an agent's shell's /dev/null) carries none"
+    );
+}
+
+#[test]
+fn a_join_given_no_code_is_the_default_fleets_sync() {
+    let world = World::new("join-default");
+    for flags in [&["--allow", "content"][..], &["--at", "m7.local"][..]] {
+        let opts = parse_join(&args(flags)).unwrap();
+        assert!(
+            matches!(join_default(&world.places, &opts), Err(Failure::Usage(_))),
+            "{flags:?} goes with a code"
+        );
+    }
+    let no_filing = || -> Result<aterm_secrets::client::Paths, Failure> {
+        panic!("a sync that ran files nothing")
+    };
+    assert_eq!(
+        default_joined(FleetSync::Joined("joined".into()), no_filing).unwrap(),
+        "joined"
+    );
+    assert_eq!(
+        default_joined(FleetSync::Current, no_filing).unwrap(),
+        FleetSync::Current.report()
+    );
+    assert!(matches!(
+        default_joined(FleetSync::Blocked("held by hand".into()), no_filing),
+        Err(Failure::Failed(why)) if why == "fleet membership is unchanged: held by hand"
+    ));
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = aterm_secrets::client::Paths::locate_for_home(home.path());
+    for (synced, why) in [
+        (FleetSync::NoVault, "this Mac is in no vault"),
+        (FleetSync::NotAlab, "this Mac's vault is not ALab's"),
+        (
+            FleetSync::NoCode,
+            "this Mac's copy of the ALab vault holds no fleet code",
+        ),
+    ] {
+        match default_joined(synced, || Ok(paths.clone())) {
+            Err(Failure::Failed(said)) => assert!(
+                said.starts_with(&format!("no join code given and {why}: filed fleet-code")),
+                "{said}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_join_whose_vault_holds_no_code_files_fleet_code_and_names_the_request() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = aterm_secrets::client::Paths::locate_for_home(home.path());
+    let why = file_fleet_code(&paths, "this Mac is in no vault");
+    let needs = aterm_secrets::need::list(&paths).unwrap();
+    let [need] = needs.as_slice() else {
+        panic!("one need: {needs:?}")
+    };
+    assert_eq!(
+        (&need.want, need.purpose),
+        (
+            &aterm_secrets::need::Want::FleetCode,
+            aterm_secrets::need::Purpose::FleetJoin
+        )
+    );
+    let id = aterm_codec::hex::encode_lower(&need.id);
+    assert!(
+        why.starts_with("no join code given and this Mac is in no vault: filed fleet-code")
+            && why.contains(&id),
+        "{why}"
+    );
+    file_fleet_code(&paths, "this Mac is in no vault");
+    assert_eq!(
+        aterm_secrets::need::list(&paths).unwrap().len(),
+        1,
+        "filing again is the same request"
+    );
 }
 
 #[test]
@@ -1303,9 +1477,9 @@ fn closed_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// A host word with no port is dialled at the default port, whether or not it serves another fleet.
+/// A failed survey preserves transport evidence separately from the words an agent reads.
 #[test]
-fn a_survey_of_a_host_alone_dials_it_at_the_default_port() {
+fn a_survey_of_a_host_keeps_transport_evidence_out_of_the_error() {
     let world = World::new("bare-host");
     let port = closed_port().to_string();
     ok(init(
@@ -1319,10 +1493,11 @@ fn a_survey_of_a_host_alone_dials_it_at_the_default_port() {
         by: None,
     };
     let read = survey_fleet_in(&world.places, &ask).unwrap_or_else(|why| panic!("{why}"));
-    let at = format!("127.0.0.1:{}", member::default_port());
     assert!(
-        matches!(&read.peers[..], [one] if one.answer.as_ref().is_err_and(|why| why.contains(&at))),
-        "{at}: {read:?}"
+        matches!(&read.peers[..], [one] if one.reason == Some("nothing-listens")
+            && one.addr.as_deref() == Some("127.0.0.1")
+            && one.answer.as_ref().is_err_and(|why| !why.contains("127.0.0.1"))),
+        "{read:?}"
     );
 }
 
@@ -1697,6 +1872,15 @@ fn peers_shows_a_nodes_version_and_its_windows_apart() {
         ok(join(&member.places, &opts, &code));
         let issuer_node = member::node_id(&issuer.places.state).unwrap();
         let listed = ok(list_peers(&member.places, HANG));
+        assert!(
+            !listed.contains("127.0.0.1"),
+            "default fleet output names members: {listed}"
+        );
+        let detailed = ok(list_peers_details(&member.places, HANG));
+        assert!(
+            detailed.contains("connected at 127.0.0.1:"),
+            "explicit details show the successful route: {detailed}"
+        );
         let header = listed
             .lines()
             .find(|line| line.trim_start().starts_with("NODE "))
@@ -1716,12 +1900,12 @@ fn peers_shows_a_nodes_version_and_its_windows_apart() {
             "the issuer answered ({window:?}):\n{listed}"
         );
         assert_eq!(
-            row.get(4).copied(),
+            row.get(2).copied(),
             Some("0.95.0"),
             "the node's version is kept ({window:?}):\n{listed}"
         );
         assert_eq!(
-            row.get(5).copied(),
+            row.get(3).copied(),
             Some(shown),
             "the window's version is shown ({window:?}):\n{listed}"
         );
@@ -1737,7 +1921,7 @@ fn peers_shows_a_nodes_version_and_its_windows_apart() {
             .split_whitespace()
             .collect();
         assert_eq!(
-            row.get(5).copied(),
+            row.get(3).copied(),
             Some("-"),
             "an unreached peer's window is unknown ({window:?}):\n{theirs}"
         );
@@ -1798,7 +1982,10 @@ fn peers_shows_each_peers_updater_from_its_answer() {
             .collect();
         assert_eq!(
             header.iter().position(|word| *word == "UPDATE"),
-            Some(8),
+            header
+                .windows(2)
+                .position(|words| words == ["WINDOW", "VERSION"])
+                .map(|column| column + 2),
             "UPDATE follows WINDOW VERSION ({update:?}):\n{listed}"
         );
         let row: Vec<&str> = listed
@@ -1812,14 +1999,30 @@ fn peers_shows_each_peers_updater_from_its_answer() {
             "the issuer answered ({update:?}):\n{listed}"
         );
         assert_eq!(
-            (row.get(4).copied(), row.get(5).copied()),
+            (row.get(2).copied(), row.get(3).copied()),
             (Some("0.95.0"), Some("0.199.0")),
             "the versions keep their columns ({update:?}):\n{listed}"
         );
         assert_eq!(
-            row.get(6).copied(),
+            row.get(4).copied(),
             Some(shown),
             "held is the peer's ({update:?}):\n{listed}"
+        );
+        let detailed = ok(list_peers_details(&member.places, HANG));
+        let detailed_row: Vec<&str> = detailed
+            .lines()
+            .find(|line| line.trim_start().starts_with(&head))
+            .unwrap_or_else(|| panic!("the detailed issuer's row:\n{detailed}"))
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            (
+                detailed_row.get(4).copied(),
+                detailed_row.get(5).copied(),
+                detailed_row.get(6).copied(),
+            ),
+            (Some("0.95.0"), Some("0.199.0"), Some(shown)),
+            "details preserve the versions and updater ({update:?}):\n{detailed}"
         );
         let lines: Vec<&str> = listed
             .lines()
@@ -1855,7 +2058,7 @@ fn peers_shows_each_peers_updater_from_its_answer() {
                 .split_whitespace()
                 .collect();
             assert_eq!(
-                row.get(6).copied(),
+                row.get(4).copied(),
                 Some("-"),
                 "an unreached peer's updater is unknown:\n{theirs}"
             );
@@ -2726,8 +2929,8 @@ fn a_fleet_started_worker_lowers_the_level_and_never_raises_it() {
     use aterm_types::fleet_access::{DRIVE_WORKERS, FleetAccess};
     let world = World::new("access-worker");
     let state = &world.places.state;
-    const DRIVEN: &str = "s-00000000000000aa";
-    const LOCAL: &str = "s-00000000000000bb";
+    const DRIVEN: &str = "t00000000aa";
+    const LOCAL: &str = "t00000000bb";
     let run =
         |words: &[&str], session: Option<&str>| access_from(&world.places, &args(words), session);
     let level = || crate::fleet_access::read(state).level;
@@ -3682,7 +3885,7 @@ fn an_init_beside_an_aterm_that_answers_nothing_says_so_at_once() {
         if port == held {
             let listed = with_aterm_here(
                 move || here.clone(),
-                || with_peers_answering(|| ok(peers(&world.places, &[]))),
+                || with_peers_answering(|| ok(peers(&world.places, &args(&["--details"])))),
             );
             let head = listed.lines().next().unwrap_or_default();
             assert!(
@@ -3805,7 +4008,7 @@ fn a_peers_header_never_calls_a_listener_the_aterm_here_refused_serving() {
     };
     ok(join(&member.places, &opts, &code));
     let head = |listed: &str| listed.lines().next().unwrap_or_default().to_owned();
-    let list = || with_peers_answering(|| ok(peers(&member.places, &[])));
+    let list = || with_peers_answering(|| ok(peers(&member.places, &args(&["--details"]))));
     let refused = with_aterm_here(|| Here::Answers(Some("refused:allow".to_owned())), list);
     assert!(
         head(&refused).contains(&format!(
@@ -4440,11 +4643,9 @@ fn a_proven_mac_that_names_this_one_in_its_survey_is_refused_not_hidden() {
     let read = only();
     let why = read.answer.as_ref().err().cloned().unwrap_or_default();
     assert!(
-        why.contains(&format!(
-            "proved node {}, its survey says node {}: not read",
-            &issuer_node[..8],
-            &mine[..8]
-        )),
+        read.reason == Some("identity")
+            && read.node.as_deref() == Some(issuer_node.as_str())
+            && !why.contains("127.0.0.1"),
         "{read:?}"
     );
     assert!(!read.unproven, "refused, not read as a claim");
@@ -4598,7 +4799,7 @@ fn a_members_rm_of_its_issuer_gives_a_members_remedy() {
         !removed.contains("keep the fleet's secret") && removed.ends_with(NO_ISSUER_NAMED),
         "{removed}"
     );
-    let listed = ok(list_peers(&member.places, HANG));
+    let listed = ok(list_peers_details(&member.places, HANG));
     assert!(
         listed.contains(reads_no_peer(true)) && !listed.contains("a member is recorded"),
         "{listed}"
@@ -4628,7 +4829,7 @@ fn a_members_rm_of_its_issuer_gives_a_members_remedy() {
         (1, None),
         "a peer named by hand is read"
     );
-    let listed = ok(list_peers(&member.places, HANG));
+    let listed = ok(list_peers_details(&member.places, HANG));
     assert!(
         listed.ends_with(
             "This machine holds the fleet's key and its book names no issuer, so it reads only \
@@ -4639,7 +4840,7 @@ fn a_members_rm_of_its_issuer_gives_a_members_remedy() {
     let joined = ok(join(&member.places, &opts, &code));
     assert!(joined.contains("recorded this machine"), "{joined}");
     assert!(
-        !ok(list_peers(&member.places, HANG)).contains("names no issuer"),
+        !ok(list_peers_details(&member.places, HANG)).contains("names no issuer"),
         "the join binds it again"
     );
 }
@@ -5010,7 +5211,7 @@ fn the_remedy_for_another_node_at_the_issuers_place_takes_the_issuer_out() {
     let issuer_node = member::node_id(&issuer.places.state).unwrap();
     let stand_in_node = member::node_id(&stand_in.places.state).unwrap();
 
-    let listed = ok(list_peers(&member.places, HANG));
+    let listed = ok(list_peers_details(&member.places, HANG));
     let row = listed
         .lines()
         .find(|line| line.trim_start().starts_with(short(&issuer_node)))
@@ -5066,28 +5267,27 @@ fn a_leave_names_each_tab_this_machine_holds_on_another_mac() {
     ok(join(&member.places, &opts, &code));
     let listener = serving.take();
     let node = member::node_id(&member.places.state).unwrap();
-    let sid = "s-0123456789abcdef0123";
+    let sid = "tabcdef0123";
     let _holding = Listener::with_rows(
         listener,
         &issuer.places.state,
         vec![
             format!("session sid={sid} held_from={node}"),
-            "session sid=s-00000000000000000002 held_from=-".to_owned(),
+            "session sid=t0000000002 held_from=-".to_owned(),
             format!("session sid=\u{1b}]52;c;aGk=\u{7} held_from={node}"),
-            format!("session sid=s-0123zz held_from={node}"),
+            format!("session sid=t00000123zu held_from={node}"),
         ],
     );
 
     let left = ok(with_peers_answering(|| leave(&member.places, &[])));
     assert!(
-        !left.contains('\u{1b}') && !left.contains("s-0123zz"),
+        !left.contains('\u{1b}') && !left.contains("t00000123zu"),
         "{left:?}"
     );
-    let hold = format!(
-        "aterm fleet leave:\n  hold       {sid} on 127.0.0.1:{port} stays held by this machine, \
-         which reaches that Mac no more once it has left: "
+    assert!(
+        left.contains(&format!("  hold       {sid} on node-")),
+        "{left}"
     );
-    assert!(left.starts_with(&hold), "{left}");
     assert_eq!(left.matches("  hold  ").count(), 1, "{left}");
     match drive_fleet_in(&member.places, &format!("127.0.0.1:{port}"), HANG) {
         Err(refused) => assert_eq!(
@@ -5130,11 +5330,10 @@ fn a_leave_reports_a_tab_it_holds_on_another_member() {
 
     // Every peer it reads serves in process: the read waits the hang detector, not its 3 s.
     let left = ok(with_peers_answering(|| leave(&holder.places, &[])));
-    let hold = format!(
-        "  hold       {sid} on 127.0.0.1:{port} stays held by this machine, which reaches that \
-         Mac no more once it has left: "
+    assert!(
+        left.contains(&format!("  hold       {sid} on node-")),
+        "{left}"
     );
-    assert!(left.contains(&hold), "{left}");
     assert_eq!(left.matches("  hold  ").count(), 1, "{left}");
 }
 
@@ -5147,19 +5346,16 @@ fn a_leave_names_each_mac_its_read_could_not_check_for_the_tabs_it_holds() {
         ..Opts::default()
     };
     ok(join(&member.places, &opts, &code));
-    let port = hinted_port(&code);
     drop(serving);
     drop(issuer);
 
     let left = ok(leave(&member.places, &[]));
-    let unread = format!(
-        "aterm fleet leave:\n  unread     127.0.0.1:{port}: this machine could not read it just \
-         now ("
-    );
+    let unread = "aterm fleet leave:
+  unread     node-";
     let stays = "so it cannot say which tabs it holds there, and any it holds stays held once it has \
                  left: ";
     assert!(
-        left.starts_with(&unread)
+        left.starts_with(unread)
             && left.contains(stays)
             && left.contains("  unread     its issuer's book was not read just now (")
             && left.find("  unread  ") < left.find("  removed  "),
@@ -5198,11 +5394,10 @@ fn a_join_of_another_fleet_names_each_tab_this_machine_holds_in_the_old_one() {
     let joined = ok(with_peers_answering(|| {
         join(&member.places, &opts, &other_code)
     }));
-    let hold = format!(
-        "  hold       {sid} on 127.0.0.1:{port} stays held by this machine, which reaches that \
-         Mac no more now that it holds another fleet's key: "
+    assert!(
+        joined.contains(&format!("  hold       {sid} on node-")),
+        "{joined}"
     );
-    assert!(joined.contains(&hold), "{joined}");
     assert_eq!(joined.matches("  hold  ").count(), 1, "{joined}");
     match with_issuer_serving(|| drive_fleet_in(&member.places, &format!("127.0.0.1:{port}"), HANG))
     {
@@ -5280,11 +5475,10 @@ fn an_issuers_leave_names_no_join_again_for_a_tab_it_holds() {
     assert!(member.places.state.join(ISSUER_BOOK_FILE).exists());
 
     let left = ok(with_peers_answering(|| leave(&issuer.places, &[])));
-    let hold = format!(
-        "aterm fleet leave:\n  hold       {sid} on 127.0.0.1:{port} stays held by this machine, \
-         which reaches that Mac no more once it has left: "
+    assert!(
+        left.contains(&format!("  hold       {sid} on node-")),
+        "{left}"
     );
-    assert!(left.starts_with(&hold), "{left}");
     assert!(
         !left.contains("joins again") && left.contains("its fleet went with it"),
         "{left}"
@@ -5643,7 +5837,7 @@ fn a_broker_refusal_leaves_the_fleet_peer_unobserved() {
         ))
         .into_io(),
     );
-    let row = peer_survey(&peer, Err(why), (&[], None, None), false);
+    let row = peer_survey(&peer, Err(why), false);
     assert_eq!(row.fault, aterm_ctl::PeerFault::NotDialled);
     assert_eq!(row.reason, Some("lan-broker"));
     assert!(row.authenticated.is_none());
@@ -5933,7 +6127,7 @@ fn a_join_at_a_place_another_member_listens_writes_nothing_and_the_issuer_names_
         )
     })
     .unwrap();
-    let listed = ok(list_peers(&issuer.places, HANG));
+    let listed = ok(list_peers_details(&issuer.places, HANG));
     assert!(
         listed.contains(&format!(
             "node {} holds this place: `join --port <n>` on {}, or `aterm fleet peers rm {}`",
@@ -6171,10 +6365,11 @@ fn another_secret_on_the_issuer_is_told_by_when_its_node_was_seen() {
             "{text}"
         );
     }
-    assert_eq!(
-        unreached_words(&seen(Some(3_000)), &why, &[], (None, None)),
-        why.to_string(),
-        "a member's"
+    let detailed = unreached_words(&seen(Some(3_000)), &why, &[], (None, None));
+    assert!(detailed.starts_with(why.guidance()), "{detailed}");
+    assert!(
+        detailed.contains(&at.to_string()),
+        "explicit details: {detailed}"
     );
 }
 
@@ -6241,14 +6436,39 @@ fn displaced_within_a_reason(
                 "{} > {room} beside {label}, or a part missing: {text}",
                 text.chars().count(),
             );
-            let row = peer_survey(&listed[0], Err(why()), (&listed, None, None), false);
+            let row = peer_survey(&listed[0], Err(why()), false);
             assert_eq!(row.node.as_deref(), Some(gone));
         }
     }
 }
 
 #[test]
-fn a_drive_to_a_copied_node_another_answers_for_names_the_issuers_rm() {
+fn drive_diagnostics_keep_transport_coordinates_in_explicit_details() {
+    let at = SocketAddr::from(([192, 0, 2, 81], 48761));
+    let peer = Peer {
+        node: Some("aa".repeat(16)),
+        via: Via::Joined,
+        ..manual_peer(at.ip().to_string(), at.port())
+    };
+    let why = Unreached::Connect(
+        at,
+        std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+    );
+    let refused = drive_unreached("lab-mini", &why);
+    assert!(
+        refused.why.starts_with("lab-mini:")
+            && refused.why.contains("saved route refused")
+            && refused.why.contains("aterm fleet sync")
+            && !refused.why.contains(&at.ip().to_string())
+            && !refused.why.contains(&at.port().to_string()),
+        "ordinary drive: {refused:?}"
+    );
+    let detailed = unreached_words(&peer, &why, &[], (None, None));
+    assert!(detailed.contains(&at.to_string()), "details: {detailed}");
+}
+
+#[test]
+fn a_drive_to_a_copied_node_keeps_the_identity_failure_without_coordinates() {
     const DRIVES: &[FleetOp] = &[
         FleetOp::Survey,
         FleetOp::Book,
@@ -6287,12 +6507,7 @@ fn a_drive_to_a_copied_node_another_answers_for_names_the_issuers_rm() {
             .err()
             .expect("another node answers there");
         assert!(
-            refused.why.ends_with(&format!(
-                "node {} holds this place: `join --port <n>` on {}, or the issuer's `peers rm {}`",
-                &issuer_node[..8],
-                &gone[..8],
-                &gone[..8]
-            )),
+            refused.why.contains("bound identity") && !refused.why.contains("127.0.0.1"),
             "{serves:?}: {refused:?}"
         );
     }
@@ -6312,7 +6527,7 @@ fn a_drive_its_peer_serves_none_of_is_one_its_grant_is_not_given() {
         .err()
         .expect("it serves no drive");
     assert!(
-        refused.ungranted && refused.why.contains("lets no one drive it"),
+        refused.ungranted && refused.why.contains("operation not served"),
         "{refused:?}"
     );
     drop(serving);
@@ -6505,14 +6720,10 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
     // in place of the survey's own deadline would end before it connects.
     let read = with_issuer_read_within(Duration::ZERO, || survey(&word, 2 * HANG));
     let said = read.peers[0].answer.as_ref().expect_err("it hung up");
-    let reason = Unreached::Handshake(
-        word.parse().unwrap(),
-        FleetError::Io(io::ErrorKind::UnexpectedEof.into()),
-    )
-    .to_string();
     assert_eq!(
-        said, &reason,
-        "the host dial's whole reason, which leaves no room for a lead"
+        read.peers[0].reason,
+        Some("no-handshake"),
+        "the host dial keeps the handshake failure independently of its wording: {said}"
     );
     hanging.join().unwrap();
     let note = read.note.as_deref().unwrap_or_default();
@@ -6529,13 +6740,12 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
         with_issuer_read_within(2 * HANG, || survey(&closed, 2 * HANG))
     };
     let said = read.peers[0].answer.as_ref().expect_err("nothing listens");
-    assert_eq!(
-        said,
-        &format!(
-            "issuer silent, as a host: nothing listens on {closed}: no aterm running there, \
-             or no [fleet] listen"
-        ),
-        "the issuer's silence first, then the dial's whole reason"
+    assert!(said.starts_with("issuer silent, as a host:"), "{said}");
+    assert!(said.contains("refused"), "{said}");
+    assert!(said.contains("aterm fleet sync"), "{said}");
+    assert!(
+        !said.contains(&closed),
+        "default diagnostics hide the route: {said}"
     );
     assert!(
         said.chars().count() + read.peers[0].label.chars().count() <= aterm_ctl::UNANSWERED_ROOM,
@@ -6688,8 +6898,7 @@ fn an_issuer_that_answers_with_no_book_is_told_once() {
     .unwrap_or_else(|why| panic!("{why}"));
     let said = read.peers[0].answer.as_ref().expect_err("nothing listens");
     assert!(
-        said.starts_with("no issuer's book, as a host: nothing listens on ")
-            && !said.contains("try again"),
+        read.peers[0].reason == Some("nothing-listens") && !said.contains("127.0.0.1"),
         "{said}"
     );
     let note = read.note.as_deref().unwrap_or_default();
@@ -6860,7 +7069,7 @@ fn a_listen_place_another_node_answers_at_is_one_this_listener_is_not_on() {
     };
     ok(join(&member.places, &opts, &code));
     let head = |listed: &str| listed.lines().next().unwrap_or_default().to_owned();
-    let list = || with_peers_answering(|| ok(peers(&member.places, &[])));
+    let list = || with_peers_answering(|| ok(peers(&member.places, &args(&["--details"]))));
     let unserved = list();
     assert!(
         head(&unserved).ends_with(&format!(
@@ -6939,7 +7148,12 @@ fn a_listen_that_is_no_ip_and_port_is_named_as_that() {
     let config = issuer.config();
     let listen = fleet_table(&config).unwrap().listen.unwrap();
     issuer.write_config(&config.replace(&listen, "localhost:7100"));
-    let listed = ok(peers(&issuer.places, &[]));
+    let plain = ok(peers(&issuer.places, &[]));
+    assert!(
+        plain.contains("configuration is invalid") && !plain.contains("localhost:7100"),
+        "{plain}"
+    );
+    let listed = ok(peers(&issuer.places, &args(&["--details"])));
     let head = listed.lines().next().unwrap_or_default();
     assert!(
         head.contains("([fleet] listen is localhost:7100, no numeric IP and port, so no aterm")
@@ -6961,7 +7175,7 @@ fn the_peers_listing_cuts_a_host_to_its_column_and_keeps_an_address_whole() {
     };
     let book = format!("{}\n", wide.line());
     write_private(&world.places.state, PEERS_FILE, book.as_bytes()).unwrap();
-    let listed = ok(peers(&world.places, &[]));
+    let listed = ok(peers(&world.places, &args(&["--details"])));
     assert!(
         listed.contains(
             "a-host-name-longer-tha…  [fd12:3456:789a:bcde:f012:3456:789a:bcde]:7100  \
@@ -7336,14 +7550,14 @@ fn a_survey_answer_is_unproven_unless_its_node_key_is_bound() {
             lines: Vec::new(),
         })
     };
-    let unproved = peer_survey(&peer, answered(false), (&[], None, None), false);
+    let unproved = peer_survey(&peer, answered(false), false);
     assert!(unproved.unproven);
     assert!(unproved.authenticated.is_none());
-    let proved = peer_survey(&peer, answered(true), (&[], None, None), false);
+    let proved = peer_survey(&peer, answered(true), false);
     assert!(!proved.unproven);
     assert_eq!(proved.authenticated.unwrap().key, [9; 32]);
     let unreached = Unreached::Local("no".to_owned());
-    assert!(!peer_survey(&peer, Err(unreached), (&[], None, None), false).unproven);
+    assert!(!peer_survey(&peer, Err(unreached), false).unproven);
 }
 
 #[test]
@@ -7630,8 +7844,7 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
         .err()
         .expect("nothing listens there");
     assert!(
-        unanswered.why.starts_with("nothing listens on 127.0.0.1:")
-            && unanswered.why.matches("127.0.0.1").count() == 1,
+        unanswered.why.contains("saved route refused") && !unanswered.why.contains("127.0.0.1"),
         "the peer named once: {unanswered:?}"
     );
 
@@ -7771,12 +7984,7 @@ fn a_drive_into_a_place_that_never_handshakes_is_unserved_within_its_deadline() 
     );
     let refused = refused.err().expect("never served");
     assert!(
-        refused.unserved
-            && !refused.again
-            && refused.why.contains(&format!(
-                "no fleet handshake within {:.1}s",
-                HANG.as_secs_f64()
-            )),
+        refused.unserved && !refused.again && refused.why.contains("fleet handshake"),
         "{refused:?}"
     );
     let closed = closed_port();
@@ -9344,7 +9552,7 @@ fn a_members_drive_grant_follows_its_issuers_book() {
     assert_eq!(grants(), granted(key));
 
     bind(None);
-    let listed = ok(list_peers(&member.places, HANG));
+    let listed = ok(list_peers_details(&member.places, HANG));
     assert!(
         listed.contains("its grant of [fleet] drive_from was removed")
             && listed.contains("and allow is content")
@@ -9598,9 +9806,8 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
             .err()
             .expect("nothing listens there");
         assert!(
-            dialled
-                .why
-                .starts_with(&format!("lab-mini.invalid:{third_port}: ")),
+            dialled.why.contains("saved route refused")
+                && !dialled.why.contains(&third_port.to_string()),
             "{word}: {dialled:?}"
         );
     }
@@ -9620,10 +9827,7 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
             .collect();
         assert_eq!(
             rows,
-            [(
-                format!("lab-mini.invalid:{third_port}").as_str(),
-                Some(node.as_str())
-            )],
+            [(member::temporary_name(&node).as_str(), Some(node.as_str()))],
             "{word}: the node bound at the place, as a drive dials it"
         );
     }
@@ -12859,12 +13063,7 @@ fn a_no_route_on_this_network_is_that_members_own() {
         "alone on the hotspot: its own"
     );
     let peer = manual_peer("m7".to_owned(), member::DEFAULT_PORT);
-    let row = peer_survey(
-        &peer,
-        Err(no_route([172, 20, 10, 5])),
-        (&[], None, None),
-        true,
-    );
+    let row = peer_survey(&peer, Err(no_route([172, 20, 10, 5])), true);
     assert_eq!(row.answer, Err(GONE_FROM_THE_LINK.to_owned()));
     assert_eq!(
         row.addr.as_deref(),
@@ -12877,18 +13076,13 @@ fn a_no_route_on_this_network_is_that_members_own() {
         Some("gone"),
         "the row's kind is the link's, not the dial's"
     );
-    let stayed = peer_survey(
-        &peer,
-        Err(no_route([172, 20, 10, 5])),
-        (&[], None, None),
-        false,
-    );
+    let stayed = peer_survey(&peer, Err(no_route([172, 20, 10, 5])), false);
     assert_eq!(stayed.reason, Some("no-route"), "the dial's own kind");
     let refused = Unreached::Connect(
         std::net::SocketAddr::from(([172, 20, 10, 6], 7100)),
         std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
     );
-    let refused_row = peer_survey(&peer, Err(refused), (&[], None, None), false);
+    let refused_row = peer_survey(&peer, Err(refused), false);
     assert_eq!(
         (refused_row.fault, refused_row.addr.as_deref()),
         (aterm_ctl::PeerFault::HostAnswered, Some("172.20.10.6"))
@@ -12951,7 +13145,7 @@ fn a_drive_dial_sends_its_requester_before_any_request() {
     }
     use aterm_types::control_verbs::Requester;
     let asked = Requester::of(
-        Some("s-0123456789abcdef0123"),
+        Some("tabcdef0123"),
         Some("claude"),
         Some("Opus 5.5"),
         Some("team acct"),

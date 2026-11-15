@@ -134,6 +134,9 @@ impl Watch {
                     )
                 });
                 freed = freed.saturating_add(pass.freed());
+                // While space is ample, measure who holds the disk, so the row a later
+                // crossing writes names holders from its first tick.
+                let _ = atpkg::build_cache::holders::measure_home(super::HOLDERS_DAILY_BUDGET);
             },
         )?;
         let pass_level = if projected.is_some() && level < super::Level::Short {

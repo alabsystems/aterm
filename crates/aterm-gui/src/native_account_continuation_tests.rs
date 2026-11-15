@@ -60,6 +60,7 @@ fn intent(login: &str) -> ExecutionIntent {
         login: Some(login.into()),
         owner: Some("fixture".into()),
         generation: "34".repeat(32),
+        purpose: aterm_agent::harness::accounts_pool::Purpose::Select,
     }
 }
 

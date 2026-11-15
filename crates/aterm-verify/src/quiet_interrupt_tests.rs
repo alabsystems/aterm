@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use aterm_capacity::admit::AdmissionAttempt;
 use aterm_capacity::{Admit, Claim, Error, Fixed, Ledger, Need, Pace, Reading, admit_with};
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
@@ -109,10 +110,13 @@ fn appkit_now_runs_loaded_but_a_measurement_now_still_starts_nothing() {
         &appkit,
         StageId::RedrawConformance,
         "AppKit redraw",
+        brief(),
         |need| {
             attempts.set(attempts.get() + 1);
             assert_eq!(need.quiet, Some(f64::INFINITY));
-            Ok(None)
+            Ok(AdmissionAttempt::Unreachable(
+                "injected: no window can exist".into(),
+            ))
         },
         || {
             calls.set(calls.get() + 1);
@@ -122,7 +126,7 @@ fn appkit_now_runs_loaded_but_a_measurement_now_still_starts_nothing() {
     assert!(
         refused
             .is_err_and(|why| why.contains("window admission") && why.contains("started nothing")),
-        "a one-look window shortfall is immediate and never force-admitted"
+        "an admission that can never be had is refused and never force-admitted"
     );
     assert_eq!(attempts.get(), 1);
     assert_eq!(calls.get(), 0);
@@ -132,7 +136,8 @@ fn appkit_now_runs_loaded_but_a_measurement_now_still_starts_nothing() {
         &appkit,
         StageId::RedrawConformance,
         "AppKit redraw",
-        |need| aterm_capacity::admit::try_admit_with(&ledger, &machine, need),
+        brief(),
+        |need| aterm_capacity::admit::try_admit_observed_with(&ledger, &machine, need),
         || {
             calls.set(calls.get() + 1);
             Ok(())
@@ -156,12 +161,204 @@ fn appkit_now_runs_loaded_but_a_measurement_now_still_starts_nothing() {
         &measurement,
         StageId::MeasuringTests,
         "measurement",
+        brief(),
         |_| panic!("measurement must use Timing, not the immediate window attempt"),
         || -> Result<(), String> { panic!("a measurement without timing admission must not run") },
     );
     assert!(
         result.is_err_and(|why| why.contains("started nothing")),
         "the negative control keeps Timing strict"
+    );
+}
+
+/// A window wait for tests: a hang detector's bound, looking often.
+fn brief() -> crate::WindowWait {
+    crate::WindowWait {
+        bound: MUST_HAPPEN,
+        look: std::time::Duration::from_millis(20),
+    }
+}
+
+/// An AppKit context under `--admit now`, as the release's early appkit run and a landing
+/// under `--admit now` make it.
+fn appkit_now(root: &Path) -> Ctx {
+    Ctx::new(
+        root.to_owned(),
+        Scope::crate_only("aterm-gui"),
+        EnvSnapshot::default(),
+        root.join("scratch"),
+    )
+    .with_quiet(Some(Admit::Now))
+    .with_measure_artifact(Some(crate::MeasureArtifact {
+        app: root.join("fixture.app"),
+        version: None,
+        commit: None,
+    }))
+}
+
+/// Set, the test binary is [`standin_window_holder`]: another run holding the per-user window
+/// admission in the scratch ledger under this directory.
+const HOLDER: &str = "ATERM_VERIFY_WINDOW_HOLDER";
+
+/// Another run's AppKit stage: hold the window claim (as `verify` under `--admit now` takes it)
+/// in the scratch ledger, say so with `held`, and let go once `release` appears.
+#[test]
+fn standin_window_holder() {
+    let Some(dir) = std::env::var_os(HOLDER).map(PathBuf::from) else {
+        return;
+    };
+    let claim = aterm_capacity::admit::try_admit_with(
+        &Ledger::at(dir.join("ledger")),
+        &machine(),
+        Need::new("verify control redraw conformance (another landing)")
+            .quiet(f64::INFINITY)
+            .checkout("/elsewhere/landing"),
+    )
+    .unwrap()
+    .expect("the stand-in holds the window admission");
+    std::fs::write(dir.join("held"), b"held").unwrap();
+    until_within(MUST_HAPPEN, "the test lets the holder go", || {
+        dir.join("release").exists().then_some(())
+    });
+    drop(claim);
+}
+
+/// Start [`standin_window_holder`] on `dir` and return once it holds the admission.
+fn window_holder(dir: &Path) -> Standin {
+    let mut child = Standin(
+        aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "quiet_interrupt_tests::standin_window_holder",
+                "--test-threads=1",
+            ])
+            .env(HOLDER, dir)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the window holder starts"),
+    );
+    until_within(
+        MUST_HAPPEN,
+        "the other run holds the window admission",
+        || {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "the holder ended before it held the admission"
+            );
+            dir.join("held").exists().then_some(())
+        },
+    );
+    child
+}
+
+/// R40: another run's AppKit stage holds the per-user window admission when this run's AppKit
+/// stage looks. The stage waits for it (it ran once the holder let go, after more than one look)
+/// instead of starting nothing at its first look; a holder that outlasts the bound ends the wait
+/// COULD NOT RUN naming that holder. Negative control: an admission that cannot be had (no
+/// ledger) is refused at its first look however long the bound.
+#[test]
+fn appkit_now_waits_for_another_runs_window_admission_bounded_and_names_its_holder() {
+    fn unused(_: Need, _: Admit) -> Result<Claim, Error> {
+        panic!("the AppKit immediate path must not ask for timing admission")
+    }
+    let quiet = || {
+        std::sync::Mutex::new(crate::Quiet {
+            claim: None,
+            left: 1,
+            admit: unused,
+        })
+    };
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ctx = appkit_now(scratch.path());
+    let ledger = Ledger::at(scratch.path().join("ledger"));
+    let machine = machine();
+    let release = scratch.path().join("release");
+
+    // The other run lets go a moment after this stage first looks.
+    let mut holder = window_holder(scratch.path());
+    let attempts = std::cell::Cell::new(0);
+    let calls = std::cell::Cell::new(0);
+    let ran = crate::run_timed_with(
+        &ctx,
+        &quiet(),
+        StageId::RedrawConformance,
+        "AppKit redraw",
+        brief(),
+        |need| {
+            let seen = aterm_capacity::admit::try_admit_observed_with(&ledger, &machine, need);
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 3 {
+                std::fs::write(&release, b"go").unwrap();
+            }
+            seen
+        },
+        || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        },
+    );
+    assert_eq!(
+        ran.map(|((), said)| said),
+        Ok(Some(crate::APPKIT_NOW.to_owned())),
+        "the stage waited for the other run's window admission and ran"
+    );
+    assert_eq!(calls.get(), 1);
+    assert!(
+        attempts.get() > 3,
+        "it looked again until the holder let go"
+    );
+    assert!(holder.0.wait().unwrap().success());
+    std::fs::remove_file(&release).unwrap();
+    std::fs::remove_file(scratch.path().join("held")).unwrap();
+
+    // A holder that never lets go: the bound ends the wait, naming it.
+    let _holder = window_holder(scratch.path());
+    let started = std::time::Instant::now();
+    let refused = crate::run_timed_with(
+        &ctx,
+        &quiet(),
+        StageId::ObjcDrives,
+        "AppKit objc",
+        crate::WindowWait {
+            bound: std::time::Duration::from_millis(400),
+            look: std::time::Duration::from_millis(20),
+        },
+        |need| aterm_capacity::admit::try_admit_observed_with(&ledger, &machine, need),
+        || -> Result<(), String> { panic!("a stage behind a held window admission must not run") },
+    );
+    let why = refused.expect_err("the bound ends the wait");
+    assert!(
+        why.contains("still held after")
+            && why.contains("another landing")
+            && why.contains("started nothing"),
+        "the refusal names who holds the admission: {why}"
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_millis(400));
+    std::fs::write(&release, b"go").unwrap();
+
+    // Negative control: no ledger to keep the admission in is refused at the first look.
+    let looks = std::cell::Cell::new(0);
+    let started = std::time::Instant::now();
+    let refused = crate::run_timed_with(
+        &ctx,
+        &quiet(),
+        StageId::RedrawConformance,
+        "AppKit redraw",
+        brief(),
+        |_| {
+            looks.set(looks.get() + 1);
+            Err(Error::Ledger(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no home directory to keep the ledger under",
+            )))
+        },
+        || -> Result<(), String> { panic!("no admission, no stage") },
+    );
+    assert!(refused.is_err_and(|why| why.contains("is unavailable")));
+    assert_eq!(looks.get(), 1);
+    assert!(
+        started.elapsed() < MUST_HAPPEN / 2,
+        "refused at once, not after the bound"
     );
 }
 

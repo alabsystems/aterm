@@ -125,7 +125,7 @@ impl Fixture {
             mailbox: &|_, _, _| (crate::harness::sign_in_ladder::Mailbox::Ready, None),
             log: Arc::new(move |line| lines.lock().unwrap().push(line.to_owned())),
             run_attempt: Some(Arc::new(|_, _| panic!("no unguarded fallback"))),
-            save_oauth: |_, _| Ok("inert".into()),
+            tokens_here: |_, _, _, _| None,
             shared: shared_renewal::Effects {
                 authority: Some(&factory),
                 checkpoint_authority: Some(&factory),
@@ -259,9 +259,15 @@ fn shared_guard_keeps_typed_provider_facts_even_when_publication_is_deferred() {
             );
             assert_eq!(observation.capture_failed(), capture);
             assert_eq!(observation.met(), Some(&met));
-            let words = observation.words();
+            let words = observation.ended(report.renewal);
             assert!(words.contains(&met.words()));
             assert!(!words.contains("private.invalid") && !words.contains("auth-secret"));
+            // A deferred run keeps its exit, as the diagnostic's words said before the one wording.
+            assert_eq!(
+                words.contains("the sign-in exited 1"),
+                stop && !capture,
+                "{words}"
+            );
             assert_eq!(fixture.bed.provider.calls.load(Ordering::SeqCst), 1);
             let records = fixture.records();
             assert_eq!(
@@ -320,8 +326,8 @@ fn a_host_cannot_put_a_raw_url_or_path_in_a_retained_browser_outcome() {
     let observation = report.observation.unwrap();
     assert_eq!(observation.exit_code(), Some(1));
     assert_eq!(observation.met(), None);
-    assert!(!observation.words().contains("private.invalid"));
-    assert!(!observation.words().contains("auth-secret"));
+    let words = observation.ended(report.renewal);
+    assert!(!words.contains("private.invalid") && !words.contains("auth-secret"));
     assert!(!format!("{observation:?}").contains("private.invalid"));
     assert_eq!(fixture.bed.provider.calls.load(Ordering::SeqCst), 1);
 }
@@ -354,6 +360,13 @@ fn shared_failure_diagnostics_do_not_change_custody_or_retry_policy() {
             assert!(diagnostic.completed_at > 0);
             let words = diagnostic.words();
             assert!(!words.contains("private.invalid") && !words.contains("auth-secret"));
+            // One wording of a run's end (`sign_in_ladder::how_it_ended`): no provider's
+            // name, and how it exited said at most once.
+            assert!(!words.contains("provider"), "{words}");
+            assert!(
+                words.matches(" exited ").count() <= usize::from(!capture),
+                "{words}"
+            );
             let debug = format!("{diagnostic:?}");
             assert!(!debug.contains("private.invalid") && !debug.contains("auth-secret"));
             if let Some(met) = &met {
@@ -389,6 +402,22 @@ fn shared_failure_diagnostics_do_not_change_custody_or_retry_policy() {
             );
             let log = fixture.lines.lock().unwrap().join("\n");
             assert!(!log.contains("private.invalid") && !log.contains("auth-secret"));
+            // The record the upkeep writes of this run says its end in the diagnostic's words,
+            // once (`spawn_row_renewal`'s `how`, `RenewalObservation::ended`): a join of two
+            // wordings would say it twice or put other words before it.
+            let record = fixture
+                .lines
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|line| {
+                    line.contains("automatic sign-in")
+                        && !line.contains("automatic sign-in started")
+                })
+                .cloned()
+                .expect("the upkeep logs the run's record");
+            assert!(record.contains(&format!(": {words}; ")), "{record}");
+            assert_eq!(record.matches(words.as_str()).count(), 1, "{record}");
             let policy = failed_policy(&fixture);
             assert_eq!(policy.outcome, accounts::shared::Outcome::Unknown);
             assert!(policy.staging_retained && policy.retries && policy.peer_ends_wait);
@@ -521,14 +550,14 @@ fn a_replaced_active_token_cannot_attach_or_clear_a_new_attempts_diagnostic() {
         code: 1,
         met: Some(Met::new(MetWord::BrowserControl, None)),
     }));
-    first.complete(row, NOW + 1, observation.clone());
+    first.complete(row, NOW + 1, (Renewal::AuthFailed, observation.clone()));
     assert!(
         fixture
             .activity(Instant::now())
             .iter()
             .all(|activity| activity.diagnostic.is_none())
     );
-    current.complete(row, NOW + 1, observation.clone());
+    current.complete(row, NOW + 1, (Renewal::AuthFailed, observation.clone()));
     let activity = fixture.activity(Instant::now());
     assert!(
         activity
@@ -550,7 +579,7 @@ fn a_replaced_active_token_cannot_attach_or_clear_a_new_attempts_diagnostic() {
         "shared",
         Some("mailbox"),
     );
-    current.complete(row, NOW + 2, observation);
+    current.complete(row, NOW + 2, (Renewal::AuthFailed, observation));
     assert!(
         fixture
             .activity(Instant::now())

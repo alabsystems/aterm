@@ -6,9 +6,11 @@
 //!
 //! A normal blob-filtered clone names paired promisor/filter metadata. The
 //! reader's isolated object view adopts neither configuration nor refs, and
-//! every Reader child disables lazy fetching. Permit only that canonical pair;
-//! all other keys retain the ordinary read-only transport screen. Values are
-//! examined inside the child projection and never enter its recorded answer.
+//! every Reader child disables lazy fetching. Its fixed Git environment also
+//! overrides core.hooksPath with /dev/null before any source command. Ignore
+//! that unused directory setting here; config-based hook commands remain
+//! refused. Permit the canonical filter pair, with every other key retaining
+//! the ordinary read-only transport screen. Values never enter the answer.
 
 use std::collections::BTreeMap;
 
@@ -87,7 +89,10 @@ pub(super) fn project(listed: &[u8]) -> Vec<u8> {
             if !accepted {
                 return refused(ConfigClass::Remote);
             }
-        } else {
+        } else if !key.eq_ignore_ascii_case(b"core.hookspath") {
+            // This is only the immutable commit projection. The value is not
+            // adopted or resolved; each real child retains the fixed /dev/null
+            // command-scope override. Ordinary transport still refuses it.
             names.extend_from_slice(key);
             names.push(0);
         }

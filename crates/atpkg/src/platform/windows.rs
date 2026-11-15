@@ -567,7 +567,12 @@ unsafe extern "system" fn swallow_ctrl_c(ctrl_type: u32) -> i32 {
 /// Run `command` to completion, then `exit` with its code (no `execve` on Windows).
 pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
     let _ = add_ctrl_handler(swallow_ctrl_c);
-    match command.spawn() {
+    // A target that is no program for this machine is the start's error, not a system box
+    // the start waits on (`aterm_uds::spawnfd`'s module docs).
+    let quiet = aterm_sysprobe::quiet_errors();
+    let started = command.spawn();
+    drop(quiet);
+    match started {
         Ok(mut child) => match child.wait() {
             Ok(status) => std::process::exit(status.code().unwrap_or(1)),
             Err(e) => e,

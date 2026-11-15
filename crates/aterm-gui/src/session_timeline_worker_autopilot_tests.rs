@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::{SessionMeta, keep_worker_autopilot, restore_carried_meta};
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 
 fn carried(ctx: &crate::SessionCtx, state: &str) {
     let row = format!(

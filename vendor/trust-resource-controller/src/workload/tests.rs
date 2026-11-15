@@ -4,8 +4,8 @@ use super::*;
 fn workload_support_marker_declares_only_its_distinct_closed_protocol() {
     assert_eq!(&WORKLOAD_PROTOCOL_MARKER[..16], b"TRUSTWORKLOAD001");
     let fields = WORKLOAD_PROTOCOL_MARKER[16..]
-        .chunks_exact(8)
-        .map(|value| u64::from_be_bytes(value.try_into().unwrap()))
+        .as_chunks::<8>().0.iter()
+        .map(|value| u64::from_be_bytes(*value))
         .collect::<Vec<_>>();
     assert_eq!(fields, [3, 6, 7, 40, 48, 1]);
     assert_ne!(WORKLOAD_PROTOCOL_MARKER, crate::resolver::RESOLVER_PROTOCOL_MARKER);

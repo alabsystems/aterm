@@ -253,6 +253,10 @@ fn encode_inline_table(out: &mut String, table: &InlineTable) {
         let value_suffix = if index + 1 == count { " " } else { "" };
         encode_key_value(out, &path, value, (" ", " "), (" ", value_suffix));
     }
+    if table.trailing_comma && count != 0 {
+        out.push(',');
+    }
+    out.push_str(table.trailing.as_str());
     out.push('}');
 }
 

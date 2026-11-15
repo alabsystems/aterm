@@ -1432,7 +1432,15 @@ fn captured_output_collector(
         work,
         Some(stopped),
     )
-    .map(|out| out.stdout)
+    .and_then(|out| {
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(super::ProgressError::Run(RunError::Wait(
+                std::io::Error::other(format!("fixture exited {}", out.status)),
+            )))
+        }
+    })
     .map_err(|error| error.to_string())
 }
 
@@ -1463,7 +1471,15 @@ fn the_captured_output_collector_reads_no_reaped_tree() {
 #[cfg(unix)]
 #[test]
 fn an_advancing_progress_probe_keeps_a_quiet_child_past_its_window() {
-    let dir = scratch("process-progress-advancing");
+    a_collector_keeps_a_quiet_child_past_its_window(
+        "process-progress-advancing",
+        captured_output_collector,
+    );
+}
+
+#[cfg(unix)]
+pub(super) fn a_collector_keeps_a_quiet_child_past_its_window(name: &str, run: StopCollector) {
+    let dir = scratch(name);
     let flag = dir.join("flag");
     let mut cmd = sh(
         "while [ ! -e \"$0\" ]; do sleep 0.02; done; printf done",
@@ -1488,19 +1504,10 @@ fn an_advancing_progress_probe_keeps_a_quiet_child_past_its_window() {
         }
         Some(reading)
     };
-    let result = super::output_from_while_process_progressing_with(
-        &mut cmd,
-        crate::spawnfd::Stdio::null(),
-        Duration::from_secs(60),
-        "the quiet fixture".to_owned(),
-        &mut now,
-        &mut probe,
-        None,
-    );
+    let result = run(&mut cmd, &mut now, &mut probe, &mut || false);
     let _ = std::fs::remove_dir_all(&dir);
     let out = result.expect("an advancing probe is no stall");
-    assert!(out.status.success(), "{out:?}");
-    assert_eq!(out.stdout, b"done");
+    assert_eq!(out, b"done");
     assert!(
         dropped && reads > 4,
         "the child answered only after the probe's fourth read: {reads} clock reads"

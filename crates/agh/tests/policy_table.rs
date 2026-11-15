@@ -5,7 +5,6 @@
 //! The Router over the canonical config (design §6.4).
 
 use agh::error::{Kind, Sub, Tried};
-use agh::identity::{self, MapEnv};
 use agh::policy::{
     AnonymousWhy, Decision, Named, Presence, RefusalCode, RouteRequest, RouteTarget, Router, Tier,
 };
@@ -495,50 +494,5 @@ fn explain_shows_the_walk() {
     assert_eq!(
         unusable["writer"].to_string(),
         r#"{"presence":"unusable","profile":"dev","why":"loose"}"#
-    );
-}
-
-fn real(router: &Router, env: &MapEnv) -> impl Fn(&str) -> Presence {
-    move |name: &str| {
-        router
-            .profile(name)
-            .map_or(Presence::Absent, |profile| identity::presence(profile, env))
-    }
-}
-
-#[test]
-fn an_ambient_token_changes_nothing_unless_a_profile_names_it() {
-    let router = canonical();
-    let quiet = MapEnv::new();
-    let loud = MapEnv::new()
-        .with("GH_TOKEN", &agh_fake::token("ambient"))
-        .with("GITHUB_TOKEN", &agh_fake::token("ambient2"));
-    for req in [
-        RouteRequest::read(repo(DEV)),
-        RouteRequest::read(repo(REL)),
-        RouteRequest::read(repo(EXT)),
-        RouteRequest::writer_read(repo(REL)),
-        RouteRequest::read(RouteTarget::Unscoped),
-    ] {
-        assert_eq!(
-            router.decide(&req, &real(&router, &quiet)),
-            router.decide(&req, &real(&router, &loud)),
-            "{req:?}"
-        );
-    }
-    let root = common::scratch("table-env");
-    let named = common::router(
-        "[profiles.dev]\nenv = \"GH_TOKEN\"\ntier = \"dev\"\nlogin = \"fixture-dev-bot\"\n\n\
-         [[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = [\"dev\"]\nwrite = \"dev\"\n",
-        root.path(),
-    );
-    let req = RouteRequest::read(repo(DEV));
-    assert_eq!(
-        named.decide(&req, &real(&named, &loud)),
-        send("dev", Tier::Dev)
-    );
-    assert_eq!(
-        code(&named.decide(&req, &real(&named, &quiet))),
-        Some(RefusalCode::ChainExhausted)
     );
 }

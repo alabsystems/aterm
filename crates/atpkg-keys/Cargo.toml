@@ -44,10 +44,12 @@ aterm-update-core = { workspace = true }
 aterm-types = { workspace = true }
 # The binary's mint clock (`aterm_time::unix_secs`), already in the graph via aterm-types.
 aterm-time = { workspace = true }
-# The master is read from /dev/tty with echo off (`isatty`, `tcgetattr`/`tcsetattr`), kept
-# out of swap best-effort (`mlock`/`munlock`) and out of core dumps (`setrlimit`): syscalls
-# with no safe std wrapper; POSIX-only, like the rest of this tool.
+# The master is kept out of swap best-effort (`mlock`/`munlock`) and out of core dumps
+# (`setrlimit`): syscalls with no safe std wrapper; POSIX-only, like the rest of this tool.
 libc = { workspace = true }
+# The master phrase's one store, the vault: its grammar, the registry read (else the
+# `paper-master` need) and the admin publish that keeps a new one (`aterm_secrets::paper_master`).
+aterm-secrets = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
 
@@ -63,11 +65,6 @@ aterm-models-release = { workspace = true }
 aterm-zstd = { workspace = true }
 # Fixture directories removed on drop.
 aterm-tempfile = { workspace = true }
-# The real terminal the setup/join tests run the binary on (tests/pty.rs).
-aterm-pty = { workspace = true }
-# `spawnfd::InheritNothing`, which tests/pty.rs installs in the child first (already in the
-# dev graph through aterm-pty and atpkg).
-aterm-uds = { workspace = true }
 
 [lints]
 workspace = true

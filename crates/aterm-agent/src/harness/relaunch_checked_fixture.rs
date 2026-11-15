@@ -143,7 +143,11 @@ pub struct World {
 }
 
 impl World {
-    pub fn new(tab: &str) -> Result<Self, String> {
+    /// A private source world whose process names this validated tab identity.
+    /// Host roster rows require tab IDs; accepting arbitrary words here would make
+    /// tests see `roster` rather than the refusal they intended to exercise.
+    pub fn new(tab: aterm_types::tab_id::TabId) -> Result<Self, String> {
+        let tab = tab.as_str();
         let root = aterm_tempfile::Builder::new()
             .prefix("rc-")
             .suffix(".noindex")

@@ -1263,7 +1263,7 @@ pub(crate) fn line_starts(line: &str) -> Vec<u8> {
 /// titled it by, as its chip reads, whatever agent the line starts.
 #[test]
 fn a_workers_tab_is_named_by_its_program_while_its_shell_titles_it_by_the_launch_line() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let (mut app, tabs, workers) = app_with(2, 3);
     let host = crate::harness_host::HostHandle::for_supervised_test(
         Vec::new(),

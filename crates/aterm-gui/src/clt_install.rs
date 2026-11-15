@@ -849,6 +849,8 @@ enum TerminalPurpose {
     Tools,
     #[cfg(target_os = "macos")]
     NameRule {
+        /// The surface that asked, and which of its writes this is.
+        by: crate::machine_title::Origin,
         generation: u64,
         origin: crate::tab_spawn::MenuOrigin,
     },
@@ -1095,7 +1097,7 @@ pub(crate) fn watch_for_tools() {
 pub(crate) struct RootSteps {
     /// Developer mode is off, or on and this console account may not use it.
     pub(crate) debugger: bool,
-    /// The rule that names the Mac after admission, or the LAN broker.
+    /// The rule that names the Mac after admission, the LAN broker, or Spotlight's scope.
     pub(crate) other: bool,
 }
 
@@ -1106,7 +1108,8 @@ impl RootSteps {
         debugger: false,
         other: false,
     };
-    /// A step beside developer mode owed (the Mac's name rule, the LAN broker).
+    /// A step beside developer mode owed (the Mac's name rule, the LAN broker, Spotlight's
+    /// scope).
     #[cfg(test)]
     pub(crate) const OTHER: Self = Self {
         debugger: false,
@@ -1129,8 +1132,10 @@ impl RootSteps {
 /// ([`aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED`], `refused`), or `broker`, the LAN
 /// broker's install owed as both read it ([`aterm_uds::lan::install::Reading::owed_with_running`]:
 /// its image or plist missing or not this build's, or its service stopped; a running image of
-/// the source's own signing team adopts with no password). A step that cannot be read is not owed: no password is
-/// asked for want of a reading. Only macOS reads it.
+/// the source's own signing team adopts with no password), or `spotlight`, a folder of this
+/// account's home besides Documents and Desktop that setup has never excluded from Spotlight
+/// nor failed to, which is `aterm init`'s own reading (`aterm_machines::init_spotlight::scope_owed`). A step that
+/// cannot be read is not owed: no password is asked for want of a reading. Only macOS reads it.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn root_steps_owed_by(
     mode: aterm_containment::consent::DebuggerMode,
@@ -1138,6 +1143,7 @@ pub(crate) fn root_steps_owed_by(
     rule: std::io::Result<(u32, u32, bool)>,
     refused: bool,
     broker: bool,
+    spotlight: bool,
 ) -> RootSteps {
     use aterm_containment::consent::DebuggerMode;
     let off = match mode {
@@ -1156,7 +1162,7 @@ pub(crate) fn root_steps_owed_by(
         debugger: off == Some(true)
             || (off == Some(false)
                 && member == aterm_containment::consent::DebuggerMember::NotMember),
-        other: rule_owed || broker,
+        other: rule_owed || broker || spotlight,
     }
 }
 
@@ -1189,7 +1195,9 @@ pub(crate) fn read_root_steps() -> bool {
                 let broker = aterm_uds::lan::install::owed_here(|| {
                     aterm_secrets::service::system_job_running(aterm_uds::lan::LABEL)
                 });
-                let owed = root_steps_owed_by(debugger.mode, member, rule, refused, broker);
+                let spotlight = aterm_types::macos_setup::spotlight_scope::owed_here();
+                let owed =
+                    root_steps_owed_by(debugger.mode, member, rule, refused, broker, spotlight);
                 aterm_log::info!("System State: setup's one Mac password owes this Mac: {owed:?}");
                 let _ = crate::workstation_setup::send_setup_wake(Wake::RootStepsOwed(owed));
             }
@@ -1288,13 +1296,14 @@ fn pressed_tab_then() -> crate::tab_spawn::TabSpawnThen {
 
 #[cfg(target_os = "macos")]
 fn name_rule_tab_then(
+    by: crate::machine_title::Origin,
     generation: u64,
     origin: crate::tab_spawn::MenuOrigin,
 ) -> crate::tab_spawn::TabSpawnThen {
     crate::tab_spawn::TabSpawnThen::Before {
         check: Box::new(move |app, window| {
             window == origin.window()
-                && app.machine_sets == generation
+                && app.machine_write_is_newest(by, generation)
                 && origin.is_current(app)
                 && !app.headless
                 && !app.developer_tools_install_active()
@@ -1303,8 +1312,8 @@ fn name_rule_tab_then(
         }),
         then: Box::new(move |app, landed| {
             match landed {
-                Ok(sid) => app.start_machine_name_authorization(&sid, generation, origin),
-                Err(why) => app.machine_name_authorization_finished(generation, Err(why)),
+                Ok(sid) => app.start_machine_name_authorization(&sid, by, generation, origin),
+                Err(why) => app.machine_name_authorization_finished(by, generation, Err(why)),
             }
             app.release_unused_access_dialog(std::time::Instant::now());
         }),
@@ -1316,24 +1325,29 @@ impl App {
     /// The fixed nonroot command waits for GO before it may launch sudo. Spawn
     /// success alone supplies no permission or naming publication authority.
     #[cfg(target_os = "macos")]
-    pub(crate) fn open_machine_name_authorization(&mut self, generation: u64) {
+    pub(crate) fn open_machine_name_authorization(
+        &mut self,
+        by: crate::machine_title::Origin,
+        generation: u64,
+    ) {
         let origin = self
             .frontmost_window
             .and_then(|window| self.palette_menu_origin(window));
         let Some(origin) = origin.filter(|origin| {
             !self.headless
                 && self.gesture_unvouched().is_none()
-                && self.machine_sets == generation
+                && self.machine_write_is_newest(by, generation)
                 && origin.is_current(self)
                 && !self.developer_tools_install_active()
                 && !self.access_dialog_up()
         }) else {
-            self.machine_name_authorization_finished(generation,
+            self.machine_name_authorization_finished(by, generation,
                 Err("Name permission repair needs the window that requested it, with no other permission operation running".into()));
             return;
         };
         let Some(exe) = own_aterm() else {
             self.machine_name_authorization_finished(
+                by,
                 generation,
                 Err("this application cannot name its own permission-repair program".into()),
             );
@@ -1347,7 +1361,7 @@ impl App {
             )),
             ..crate::tab_spawn::SpawnAsk::default()
         };
-        let then = name_rule_tab_then(generation, origin);
+        let then = name_rule_tab_then(by, generation, origin);
         let _act = crate::tab_marks::ActScope::gesture("name-permission");
         self.open_off_loop(
             origin.window(),
@@ -1361,6 +1375,7 @@ impl App {
     fn start_machine_name_authorization(
         &mut self,
         sid: &str,
+        by: crate::machine_title::Origin,
         generation: u64,
         origin: crate::tab_spawn::MenuOrigin,
     ) {
@@ -1378,13 +1393,18 @@ impl App {
         let Some(session) = session else {
             self.type_into_new_session(sid, TAB_STOP);
             self.machine_name_authorization_finished(
+                by,
                 generation,
                 Err("the permission tab's exact child could not be retained".into()),
             );
             return;
         };
         let mut terminal = Terminal::running(session, false, None);
-        terminal.purpose = TerminalPurpose::NameRule { generation, origin };
+        terminal.purpose = TerminalPurpose::NameRule {
+            by,
+            generation,
+            origin,
+        };
         self.workstation_setup
             .developer_tools_session
             .push(terminal);
@@ -2255,7 +2275,12 @@ impl App {
         terminal.finished = true;
         terminal.ended = true;
         #[cfg(target_os = "macos")]
-        if let TerminalPurpose::NameRule { generation, origin } = terminal.purpose {
+        if let TerminalPurpose::NameRule {
+            by,
+            generation,
+            origin,
+        } = terminal.purpose
+        {
             let retained = origin.is_retained(self)
                 && self
                     .windows_with_focused_session(session)
@@ -2273,7 +2298,7 @@ impl App {
                     }
                 }
             };
-            self.machine_name_authorization_finished(generation, result);
+            self.machine_name_authorization_finished(by, generation, result);
             return;
         }
         let told = terminal.told;
@@ -2535,14 +2560,14 @@ impl App {
         }
         if self.finish_developer_tools_install(session) {
             #[cfg(target_os = "macos")]
-            if let Some(TerminalPurpose::NameRule { generation, .. }) = self
+            if let Some(TerminalPurpose::NameRule { by, generation, .. }) = self
                 .workstation_setup
                 .developer_tools_session
                 .iter()
                 .find(|terminal| terminal.session == session && !terminal.ended)
                 .map(|terminal| terminal.purpose)
             {
-                self.machine_name_authorization_finished(generation,
+                self.machine_name_authorization_finished(by, generation,
                     Err("the name permission repair tab closed before a successful result was collected".into()));
             }
             self.workstation_setup
@@ -2716,7 +2741,7 @@ impl App {
 
     /// The launch's reading of setup's one early elevation ([`read_root_steps`]): `owed`, a root
     /// step beside the tools is still to do (developer mode, the rule that names the Mac after
-    /// admission, the LAN broker). Owed, the launch wants the tab as it wants it for missing tools
+    /// admission, the LAN broker, Spotlight's scope). Owed, the launch wants the tab as it wants it for missing tools
     /// ([`LAUNCH_WANT`]), on a Mac that has them too, so its one password does every root step
     /// setup has, asked by aterm itself with no press; the same holds and gates keep it (no
     /// scratch world, the account's [`Mark`], a quiet keyboard, no macOS dialog up, an

@@ -2,29 +2,24 @@
 // Copyright 2026 Andrew Yates
 
 //! What non-Secret ATT/1 cells may not hold (design §3.4): a credential-shaped string, free text that names
-//! a secret (so a plain-word password cannot ride a note), a full phone number (it lives in the
-//! vault; a phone row keeps its last four digits), or an address outside a typed `email` cell
-//! (so every address is masked). A refusal names the rule and never quotes the
+//! a secret (so a plain-word password cannot ride a note), a full phone number (it belongs in a
+//! phone row's `number` column), or an address outside a typed `email` cell (so an address is
+//! held only where its column says one is). A refusal names the rule and never quotes the
 //! value. Secret columns bypass these text guards only with an opaque inner seal;
 //! plaintext is rejected by their type check (aterm-db's `typed::cell::validate`).
 //!
-//! aterm-db's typed cells apply these rules by column type; aterm-file's outbox applies
-//! [`never_shown`] to every value an intent carries, whatever its column, so no writer of a
-//! shared file queues a value a read could show (docs/DESIGN-shared-files-2026-11-11.md §5,
-//! rule 6).
+//! aterm-db's typed cells apply these rules by column type; aterm-file's outbox refuses a value
+//! shaped like a credential ([`credential_shaped`]) or holding a phone number ([`phone_shaped`])
+//! in every value an intent carries, whatever its column, so no writer of a shared file queues
+//! one (docs/DESIGN-shared-files-2026-11-11.md §5, rule 6).
 
 #![forbid(unsafe_code)]
 
-/// What every surface shows in place of a string shaped like a credential, naming a secret or
-/// holding a phone number, which another writer's build stored though this one refuses it.
+/// What a surface shows in place of a string another writer's build stored though this one
+/// refuses to show it: in a table's views one shaped like a credential or naming a secret
+/// ([`withheld`]), in a shared file's outbox one shaped like a credential or holding a phone
+/// number.
 pub const REFUSED: &str = "(refused value: not shown)";
-
-/// Whether a string is never shown, whatever the reader asks: shaped like a credential, naming a
-/// secret, or holding a phone number.
-#[must_use]
-pub fn never_shown(text: &str) -> bool {
-    withheld(text) || phone_shaped(text)
-}
 
 /// Why a value was refused: a rule, never the value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,9 +49,7 @@ impl Refusal {
             Self::Address => "an address belongs in a typed email column",
             Self::Control => "text holds no control characters",
             Self::Length => "text is longer than its column allows",
-            Self::Phone => {
-                "a phone number lives in the vault; a phone row keeps its last four digits"
-            }
+            Self::Phone => "a phone number belongs in a phone row's number column",
             Self::MachineLabel => {
                 "an account's label names no machine: a preference row maps it to one"
             }
@@ -121,8 +114,8 @@ const fn token_byte(b: u8) -> bool {
 }
 
 /// Whether `text` carries a known credential shape: a token prefix at the start of a word, a
-/// provider key's prefix with its run, a base32 TOTP seed, or a long unbroken run of token
-/// characters.
+/// provider key's prefix with its run, a base32 TOTP seed, a URL carrying a password, or a long
+/// unbroken run of token characters.
 pub fn credential_shaped(text: &str) -> bool {
     let bytes = text.as_bytes();
     for (at, &b) in bytes.iter().enumerate() {
@@ -144,7 +137,7 @@ pub fn credential_shaped(text: &str) -> bool {
             return true;
         }
     }
-    if base32_seed(text) {
+    if base32_seed(text) || url_password(text) {
         return true;
     }
     let mut run = 0;
@@ -161,8 +154,49 @@ pub fn credential_shaped(text: &str) -> bool {
     false
 }
 
+/// Whether `text` holds a URL that carries a password: `://`, then `user:password@` before the
+/// authority ends (at `/`, `?`, `#` or white space). `ssh://git@host` names only a user and
+/// stays, as does an address in prose.
+fn url_password(text: &str) -> bool {
+    text.match_indices("://").any(|(at, separator)| {
+        text[at + separator.len()..]
+            .split(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .next()
+            .and_then(|authority| authority.rsplit_once('@'))
+            .and_then(|(userinfo, _)| userinfo.split_once(':'))
+            .is_some_and(|(_, password)| !password.is_empty())
+    })
+}
+
 /// The fewest digits a phone number has.
 const PHONE_DIGITS: usize = 7;
+/// The most digits a phone number has (E.164).
+const PHONE_MOST: usize = 15;
+/// The fewest digits a stored number has: a phone row keeps its last four.
+const PHONE_STORED: usize = 4;
+
+/// Whether `text` is a phone number as a person gives one to a table: 7 to 15 digits with an
+/// optional leading `+` and nothing else. What the table then stores is its own form of those
+/// digits (aterm-db's registry keeps digits only).
+#[must_use]
+pub fn is_phone(text: &str) -> bool {
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    (PHONE_DIGITS..=PHONE_MOST).contains(&digits.len())
+        && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether `text` reads as a phone number some build stored: an importer's digits (four or
+/// more) or what a person wrote before [`is_phone`] was asked (digits that spaces, `-`, `.`,
+/// `(` and `)` separate, after an optional leading `+`). It is 4 to 15 digits once the
+/// separators go, and nothing else: no letter, so no word and no token passes.
+#[must_use]
+pub fn stored_phone(text: &str) -> bool {
+    let written = text.strip_prefix('+').unwrap_or(text);
+    written
+        .bytes()
+        .all(|b| b.is_ascii_digit() || matches!(b, b' ' | b'-' | b'.' | b'(' | b')'))
+        && (PHONE_STORED..=PHONE_MOST).contains(&written.bytes().filter(u8::is_ascii_digit).count())
+}
 
 /// Whether `text` holds a phone number: a run of at least seven digits, standing apart from any
 /// word, that spaces, `-`, `.`, `(`, `)` and a leading `+` may separate. A leading calendar date
@@ -475,3 +509,7 @@ pub fn word(value: &str) -> Result<(), Refusal> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;

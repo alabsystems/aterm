@@ -10,6 +10,7 @@ use std::io::Write as _;
 
 const WORLD: &str = "ATPKG_STATUS_OBSERVATION_WORLD";
 const FAULT: &str = "ATPKG_STATUS_OBSERVATION_FAULT";
+const WAIT_LOSS: &str = "ATPKG_STATUS_OWNING_WAIT_LOSS";
 const HELPER: &str = "ATPKG_STATUS_OBSERVATION_HELPER";
 const OBSERVATION_ERROR: &str = "fixture: exec-status observation lost after execution proof";
 const ACTOR: &str = "build_admit::tests::status_observation::ordinary_status_actor_if_requested";
@@ -64,7 +65,9 @@ fn ordinary_status_actor_if_requested() {
         std::env::var_os(HELPER).expect("declared inert helper"),
     ));
     assert!(
-        aterm_uds::tether::prepared_executable().unwrap().is_some(),
+        aterm_uds::tether::prepared_executable_within(aterm_uds::deadline::FIRST_EXEC_HANG)
+            .unwrap()
+            .is_some(),
         "native status route is prepared"
     );
     let machine = machine();
@@ -80,9 +83,13 @@ fn ordinary_status_actor_if_requested() {
         supervise_with(
             Some(*held),
             command,
-            &mut |_| {},
+            &mut |_| {
+                if std::env::var_os(WAIT_LOSS).is_some() {
+                    std::fs::write(world.join("retaining"), "observed\n").unwrap();
+                }
+            },
             || None,
-            |_, meter| {
+            |child, meter| {
                 wait_for("leader and member produced actual execution proof", || {
                     world.join("probe").exists().then_some(())
                 });
@@ -98,6 +105,17 @@ fn ordinary_status_actor_if_requested() {
                     .then_some(())
                 });
                 std::fs::write(world.join("observed"), "ready\n").unwrap();
+                if std::env::var_os(WAIT_LOSS).is_some() {
+                    std::fs::write(world.join("end-root"), "go\n").unwrap();
+                    let pid = i32::try_from(child.id()).unwrap();
+                    let mut status = 0;
+                    // SAFETY: this isolated actor deliberately consumes its actual child's
+                    // owning wait outside the handle. The next production wait must get
+                    // the kernel's ECHILD, while the booked member remains alive.
+                    assert_eq!(unsafe { libc::waitpid(pid, &raw mut status, 0) }, pid);
+                    assert!(libc::WIFSIGNALED(status));
+                    std::fs::write(world.join("wait-lost"), "reaped\n").unwrap();
+                }
             },
         )
     };
@@ -112,11 +130,17 @@ fn ordinary_status_actor_if_requested() {
     };
     let rows = seat.ledger.as_ref().unwrap().list().unwrap().len();
     if let Err(error) = &outcome {
-        std::fs::write(world.join("observation-error"), error.to_string()).unwrap();
+        aterm_uds::atomic_file::write(
+            &world.join("observation-error"),
+            error.to_string().as_bytes(),
+            0o600,
+        )
+        .unwrap();
     }
-    std::fs::write(
-        world.join("result"),
-        format!("{} {rows}\n", if outcome.is_ok() { "ok" } else { "error" }),
+    aterm_uds::atomic_file::write(
+        &world.join("result"),
+        format!("{} {rows}\n", if outcome.is_ok() { "ok" } else { "error" }).as_bytes(),
+        0o600,
     )
     .unwrap();
     // Keep the real supervisor alive while the parent observes its result;
@@ -126,31 +150,32 @@ fn ordinary_status_actor_if_requested() {
     });
 }
 
+struct Actor {
+    child: std::mem::ManuallyDrop<spawnfd::Child>,
+    world: PathBuf,
+}
+impl Drop for Actor {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.world.join("end-root"), "go\n");
+        let _ = std::fs::write(self.world.join("finish-actor"), "go\n");
+        self.child.stdin.take();
+        if matches!(self.child.exited(), Ok(false)) {
+            let _ = self.child.kill();
+        }
+        if let Err(error) = self.child.wait() {
+            eprintln!(
+                "ordinary status cleanup Unknown: {error}; original child and world retained; fixture unqualified"
+            );
+            return;
+        }
+        // SAFETY: the same original child was positively reaped. This is
+        // its sole manual drop; an unknown wait instead retains the owner.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.child) };
+    }
+}
+
 #[test]
 fn an_ordinary_status_error_cannot_release_a_signalled_builds_live_member() {
-    struct Actor {
-        child: std::mem::ManuallyDrop<spawnfd::Child>,
-        world: PathBuf,
-    }
-    impl Drop for Actor {
-        fn drop(&mut self) {
-            let _ = std::fs::write(self.world.join("end-root"), "go\n");
-            let _ = std::fs::write(self.world.join("finish-actor"), "go\n");
-            self.child.stdin.take();
-            if matches!(self.child.exited(), Ok(false)) {
-                let _ = self.child.kill();
-            }
-            if let Err(error) = self.child.wait() {
-                eprintln!(
-                    "ordinary status cleanup Unknown: {error}; original child and world retained; fixture unqualified"
-                );
-                return;
-            }
-            // SAFETY: the same original child was positively reaped. This is
-            // its sole manual drop; an unknown wait instead retains the owner.
-            unsafe { std::mem::ManuallyDrop::drop(&mut self.child) };
-        }
-    }
     let mut results = Vec::new();
     let helper = aterm_tempfile::bin_exe("atpkg-status-fixture");
     for fault in [false, true] {
@@ -245,4 +270,77 @@ fn an_ordinary_status_error_cannot_release_a_signalled_builds_live_member() {
         !results[1].2 || results[1].1 != "error 0\n",
         "a postbirth status error released its ordinary claim while the signalled leader's actual member still ran"
     );
+}
+
+#[test]
+fn a_lost_owning_wait_keeps_the_original_claim_while_its_member_lives() {
+    let world = aterm_tempfile::tempdir().unwrap().keep();
+    let mut command = spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", ACTOR, "--test-threads=1", "--nocapture"])
+        .env(WORLD, &world)
+        .env(HELPER, aterm_tempfile::bin_exe("atpkg-status-fixture"))
+        .env(WAIT_LOSS, "1")
+        .env_remove(FAULT)
+        .setsid(true)
+        .stdin(spawnfd::Stdio::piped())
+        .stdout(spawnfd::Stdio::null())
+        .stderr(spawnfd::Stdio::inherit());
+    let mut actor = Actor {
+        child: std::mem::ManuallyDrop::new(command.spawn().unwrap()),
+        world,
+    };
+    let member: i32 = wait_for("the actual member started", || {
+        std::fs::read_to_string(actor.world.join("member-pid"))
+            .ok()?
+            .parse()
+            .ok()
+    });
+    actor
+        .child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"actual member executed\n")
+        .unwrap();
+    wait_for(
+        "the kernel owning wait was consumed outside its handle",
+        || actor.world.join("wait-lost").exists().then_some(()),
+    );
+    wait_for("supervision either retains the error or returns", || {
+        (actor.world.join("retaining").exists() || actor.world.join("result").exists())
+            .then_some(())
+    });
+    assert!(
+        matches!(actor.child.exited(), Ok(false)),
+        "the original supervisor is alive"
+    );
+    assert_eq!(
+        process::process_presence(member),
+        process::ProcessPresence::Present
+    );
+    assert_eq!(
+        Ledger::at(actor.world.join("ledger")).list().unwrap().len(),
+        1,
+        "a native ECHILD must not release the original reservation while the actual member lives"
+    );
+    assert!(
+        !actor.world.join("result").exists(),
+        "no retirement receipt was produced"
+    );
+    // Only the original pipe retires the real survivor. After owning-wait loss the
+    // supervisor cannot manufacture a receipt from its old PID, even once this ends.
+    actor.child.stdin.take();
+    wait_for(
+        "the actual member ended after its original lifeline closed",
+        || {
+            matches!(
+                process::process_presence(member),
+                process::ProcessPresence::Absent | process::ProcessPresence::Exited
+            )
+            .then_some(())
+        },
+    );
+    actor.child.kill().unwrap();
+    assert!(!actor.child.wait().unwrap().success());
 }

@@ -85,28 +85,37 @@ fn passing() -> Saw {
 
 /// The lab's one-row table as either identity reads it once the tables moved.
 fn table_read() -> TableRead {
-    TableRead {
-        complete: true,
-        epoch: "1a2b3c4d".into(),
-        rows: 1,
-        with_password: 1,
-        digest: "9f".repeat(32),
-    }
+    read_table(TABLE_OUT).unwrap()
 }
 
-/// What `table_now` prints: the view (compact JSON, every password masked) and the digest.
-const TABLE_OUT: &str = "{\"complete\":true,\"emails\":[{\"ad\":\"ad-0123456789abcdef\",\"password\":\"\u{2022}\u{2022}\"}],\"table\":\"emails\"}\n--nux-table--\n{\"digest\":\"9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f\",\"epoch\":\"1a2b3c4d\",\"rows\":1,\"table\":\"emails\",\"with_password\":1}\n";
+/// [`TABLE_NUMBER`] as the registry stores it and `aterm db phones` shows it where it opens.
+const TABLE_NUMBER_STORED: &str = "2025550149";
 
+/// What `table_now` prints: the emails view and the phones view (compact JSON), the number read.
+const TABLE_OUT: &str = "{\"complete\":true,\"emails\":[{\"ad\":\"ad-0123456789abcdef\",\"addr\":\"nux-proof@example.invalid\",\"password\":null}],\"state\":\"live\",\"table\":\"emails\"}\n--nux-table--\n{\"complete\":true,\"phones\":[{\"ph\":\"ph-0123456789abcdef\",\"last4\":\"0149\",\"number\":\"2025550149\"}],\"state\":\"live\",\"table\":\"phones\"}\n";
+
+/// A table read is its two views, value-free: the rows, the numbers read and one digest of what
+/// both show. A number this Mac did not open (the mask) is a row with no number read and
+/// another digest; a view that did not read the registry, one that is no view, and a run that
+/// printed no mark each say why.
+/// NEGATIVE CONTROL: with `read_table` counting any non-null `number` as read, the masked view
+/// counts one: `` left: 1 right: 0 ``.
 #[test]
-fn a_table_read_is_its_view_and_its_digest_value_free() {
-    assert_eq!(read_table(TABLE_OUT), Ok(table_read()));
-    // A digest refusal, a view that is not one, and a run that printed no mark each say why.
-    let no_key = TABLE_OUT.replace(
+fn a_table_read_is_its_two_views_value_free() {
+    let read = table_read();
+    assert!(read.complete);
+    assert_eq!((read.rows, read.numbers), (1, 1));
+    assert_eq!(read.digest.len(), 64);
+    assert!(TABLE_OUT.contains(TABLE_NUMBER_STORED));
+    let masked = read_table(&TABLE_OUT.replace(TABLE_NUMBER_STORED, "\u{2022}\u{2022}")).unwrap();
+    assert_eq!(masked.numbers, 0);
+    assert_ne!(masked.digest, read.digest);
+    let never = TABLE_OUT.replace(
         &TABLE_OUT[TABLE_OUT.find("--nux-table--\n").unwrap() + 14..],
-        "aterm db: this Mac holds no [everyone] key, so the table cannot be digested\n",
+        "{\"complete\":false,\"phones\":[],\"state\":\"never\",\"table\":\"phones\",\"why\":\"busy\"}\n",
     );
-    let why = read_table(&no_key).unwrap_err();
-    assert!(why.contains("no [everyone] key"), "{why}");
+    let why = read_table(&never).unwrap_err();
+    assert!(why.starts_with("the phones view said"), "{why}");
     let undeclared =
         "{\"next\":\"x\",\"registry\":\"not imported\",\"why\":\"y\"}\n--nux-table--\n{}";
     let why = read_table(undeclared).unwrap_err();
@@ -136,30 +145,24 @@ fn a_run_whose_joiner_does_not_read_the_labs_table_fails() {
         verdict(&saw)
     };
     let t = table_read;
-    // Another digest under the same epoch: the joiner holds another table.
+    // Another digest: the joiner shows another table.
     let other = TableRead {
         digest: "00".repeat(32),
         ..t()
     };
+    let seeds = prefix(&t().digest).to_owned();
     assert_eq!(
         with(Ok(t()), Ok(other)),
-        [
-            "the joiner's table is not the seed's (1 row(s), 1 with a password, digest \
-          00000000…; the seed's 1, 1, 9f9f9f9f…)"
-        ]
+        [format!(
+            "the joiner's table is not the seed's (1 row(s), 1 number(s) read, digest \
+             00000000…; the seed's 1, 1, {seeds}…)"
+        )]
     );
-    // The same digest text under another epoch proves nothing: unproven, never a match.
-    let moved = TableRead {
-        epoch: "ffffffff".into(),
-        ..t()
-    };
-    assert_eq!(
-        with(Ok(t()), Ok(moved)),
-        [
-            "the joiner digested under epoch ffffffff, the seed under 1a2b3c4d, so the tables \
-          are unproven"
-        ]
-    );
+    // The rows without the number opened: the joiner holds the table and not its key.
+    let unopened = read_table(&TABLE_OUT.replace(TABLE_NUMBER_STORED, "\u{2022}\u{2022}")).unwrap();
+    let said = with(Ok(t()), Ok(unopened));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].contains("1 row(s), 0 number(s) read"), "{said:?}");
     let partial = TableRead {
         complete: false,
         ..t()
@@ -168,14 +171,11 @@ fn a_run_whose_joiner_does_not_read_the_labs_table_fails() {
         with(Ok(t()), Ok(partial)),
         ["the joiner's table history is not complete"]
     );
-    // A seed table with no password, or no row, cannot show the joiner opening one.
-    let bare = TableRead {
-        with_password: 0,
-        ..t()
-    };
+    // A seed table that shows no number, or no row, cannot show the joiner opening one.
+    let bare = TableRead { numbers: 0, ..t() };
     assert_eq!(
         with(Ok(bare.clone()), Ok(bare)),
-        ["the seed's table holds no password, so the joiner opening one is unproven"]
+        ["the seed's table shows no number, so the joiner opening one is unproven"]
     );
     assert_eq!(
         with(Ok(t()), Err("no [everyone] key".into())),
@@ -191,12 +191,12 @@ fn a_run_whose_joiner_does_not_read_the_labs_table_fails() {
             "the joiner's table did not read: none"
         ]
     );
-    // NEGATIVE CONTROL (2026-11-05): with the epoch arm removed from `table_verdict`, the
-    // `moved` case above passes (left: []), as a digest compared across epochs would.
+    // NEGATIVE CONTROL: with the comparison arm removed from `table_verdict`, the `other` case
+    // above passes (left: []).
 }
 
 #[test]
-fn the_seeds_sheet_holds_no_password_and_its_password_never_reaches_argv() {
+fn the_seeds_sheet_holds_a_number_and_no_password() {
     let made = sheet("/n/phrase-seed");
     assert!(made.contains("umask 077"), "{made}");
     assert!(made.contains("/n/phrase-seed/sheet/emails.csv"), "{made}");
@@ -204,15 +204,14 @@ fn the_seeds_sheet_holds_no_password_and_its_password_never_reaches_argv() {
         !made.contains("/n/phrase-seed/seed/"),
         "never the published folder: {made}"
     );
-    assert!(made.contains("Email Address,Status"), "{made}");
+    assert!(
+        made.contains("Email Address,Status,Activation Phone Number"),
+        "{made}"
+    );
+    assert!(made.contains(TABLE_NUMBER), "{made}");
     assert!(
         !made.contains("Password"),
         "the sheet's flag column is left out: {made}"
-    );
-    let sealed = seal("/A/aterm", "/n/phrase-seed");
-    assert!(
-        sealed.contains("password --stdin < /n/phrase-seed/sheet/pw"),
-        "the value comes on stdin from its file: {sealed}"
     );
     assert!(import_table("/A/aterm", "/n/phrase-seed").contains(
         "HOME=/n/phrase-seed /A/aterm db alab import --emails /n/phrase-seed/sheet/emails.csv --apply"

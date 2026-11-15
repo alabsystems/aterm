@@ -25,7 +25,12 @@ mod crossing_tests;
 #[path = "server/takes_over_tests.rs"]
 mod takes_over_tests;
 
+#[cfg(test)]
+#[path = "server/round_counts_tests.rs"]
+mod round_counts_tests;
+
 use crate::envelope::{self, MAX_ENVELOPE};
+use crate::serve_counts::{Count, Phase, ServeCounts};
 use crate::transport::{JoinRequest, parse_join_line};
 use crate::wake::{Bell, Wake};
 use crate::{Error, fsx};
@@ -528,7 +533,8 @@ pub fn serve_with_role(
         }
         (None, None) => None,
     };
-    let children = Children::default();
+    // The tend thread counts into this server's counts whether or not it advertises.
+    let children = Children::counting(&running.shared.counts);
     let health_paths = client_paths.clone();
     let health_address = running.addr;
     children.tend_with_role(options.keep_awake, advertise, client_paths);
@@ -945,6 +951,9 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         record_writes: Mutex::new(()),
         records_pulls: PullSlots::new(RECORDS_PULLS_AT_ONCE),
         envelope_pulls: PullSlots::new(ENVELOPE_PULLS_AT_ONCE),
+        counts: Arc::new(ServeCounts::default()),
+        #[cfg(test)]
+        conn_ended: Mutex::new(None),
         untaken: crate::membership_log::untaken::Untaken::new(),
         advertiser: Mutex::new(None),
         records_boot: aterm_uds::rand::hex_token::<16>()?,
@@ -1180,6 +1189,13 @@ struct Shared {
     /// The pulls of a whole envelope longer than [`ENVELOPE_PEEK`] from peers under way now
     /// ([`ENVELOPE_PULLS_AT_ONCE`]).
     envelope_pulls: PullSlots,
+    /// What this server counts of its rounds, its pulls and the threads it starts
+    /// ([`crate::serve_counts`]), said in its log by the `vault-tend` thread.
+    counts: Arc<ServeCounts>,
+    /// Seam: where a test hears each `vault-conn` thread end, told once that thread is counted
+    /// and its connection given back.
+    #[cfg(test)]
+    conn_ended: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     /// What each peer sent a records pull that this server's store could not take, by vault and
     /// the peer's vault URL, for this run ([`crate::membership_log::untaken`]): the next pull from
     /// that peer names it first, so the peer answers only what is new past it.
@@ -2068,8 +2084,25 @@ fn dispatch(
         .name("vault-conn".to_owned())
         .stack_size(CONNECTION_STACK)
         .spawn(move || {
-            handle(&active.shared, stream, active.peer);
+            // This thread was started for this connection: its whole CPU time is the
+            // connection's, added as it ends.
+            active
+                .shared
+                .counts
+                .conn_threads
+                .ending(|| handle(&active.shared, stream, active.peer));
+            #[cfg(test)]
+            let ended = active
+                .shared
+                .conn_ended
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
             drop(active);
+            #[cfg(test)]
+            if let Some(ended) = ended {
+                let _ = ended.send(());
+            }
         });
     drop(spawned);
 }
@@ -5228,6 +5261,9 @@ struct Children {
     set: Arc<Mutex<ChildSet>>,
     /// The bell the `vault-tend` thread naps on, rung as this is dropped.
     bell: Mutex<Option<Arc<Bell>>>,
+    /// What a `vault-tend` thread that advertises for no server counts into
+    /// ([`Children::counting`]): its server's counts, or its own where none was given.
+    counts: Arc<ServeCounts>,
 }
 
 /// How long [`Registered::ended`] waits on a broker registration's connection for a frame: long
@@ -5598,6 +5634,10 @@ impl Drop for PullSlot<'_> {
 /// pull, not the pulls of every peer after it on the vault-tend thread. Their records bodies
 /// are read [`RECORDS_PULLS_AT_ONCE`] at a time, and their envelopes longer than
 /// [`ENVELOPE_PEEK`] [`ENVELOPE_PULLS_AT_ONCE`] at a time. Returns how many vaults advanced.
+///
+/// Each pull that stored anything is counted, and each thread started here adds its CPU time
+/// to the server's counts as it ends ([`crate::serve_counts`]); a pull this thread makes itself,
+/// for want of a thread, stays in this thread's time.
 fn pull_from_peers_shared(
     shared: &Shared,
     peers: &[crate::discover::DiscoveredVault],
@@ -5606,7 +5646,11 @@ fn pull_from_peers_shared(
     here: &[Target],
 ) -> usize {
     let pull = |peer: &crate::discover::DiscoveredVault| {
-        pull_from_peer(shared, peer, own_port, own_label, here)
+        let stored = pull_from_peer(shared, peer, own_port, own_label, here);
+        if stored != 0 {
+            shared.counts.add(Count::PullsStored);
+        }
+        stored
     };
     std::thread::scope(|scope| {
         let pulls: Vec<_> = peers
@@ -5614,7 +5658,9 @@ fn pull_from_peers_shared(
             .map(|peer| {
                 std::thread::Builder::new()
                     .name("vault-peer-pull".to_owned())
-                    .spawn_scoped(scope, move || pull(peer))
+                    .spawn_scoped(scope, move || {
+                        shared.counts.pull_threads.ending(|| pull(peer))
+                    })
             })
             .collect();
         peers
@@ -5654,6 +5700,7 @@ fn pull_from_peer(
     if is_obviously_self_url(&uri, own_port, own_label, here) {
         return stored;
     }
+    shared.counts.add(Count::Pulls);
     let vault_names: Vec<String> = match &peer.txt {
         Some(txt) => vec![txt.vault.clone()],
         None => {
@@ -5711,6 +5758,7 @@ fn pull_from_peer(
             let mut pulled =
                 observe_after_nowait_within(&vault_url, held_seq, budget, ENVELOPE_PEEK);
             if matches!(pulled, Ok(Pulled::Larger)) {
+                shared.counts.add(Count::EnvelopeWholeReads);
                 slot = Some(shared.envelope_pulls.take());
                 // A pull that held a slot before this one may have stored a newer version (one a
                 // publish spread to several peers): ask after what is held now, so a peer holding
@@ -5726,6 +5774,7 @@ fn pull_from_peer(
             }
             match pulled {
                 Ok(Pulled::Fetched(Fetched::Body(bytes))) => {
+                    shared.counts.add(Count::EnvelopeBodies);
                     let reply = put_vault(shared, &vault_name, &bytes, false);
                     if reply.status == 204 {
                         let advanced = {
@@ -5735,12 +5784,21 @@ fn pull_from_peer(
                             })
                         };
                         if advanced {
+                            shared.counts.add(Count::EnvelopesStored);
                             stored += 1;
                         }
                     }
                 }
-                Ok(Pulled::Fetched(_)) => {}
-                Ok(Pulled::Larger) | Err(_) => return stored,
+                Ok(Pulled::Fetched(Fetched::NoNewer(_))) => {
+                    shared.counts.add(Count::Envelope204);
+                }
+                Ok(Pulled::Fetched(Fetched::Missing)) => {
+                    shared.counts.add(Count::EnvelopeMissing);
+                }
+                Ok(Pulled::Larger) | Err(_) => {
+                    shared.counts.add(Count::EnvelopeUnanswered);
+                    return stored;
+                }
             }
             drop(slot);
         }
@@ -5777,8 +5835,14 @@ fn pull_from_peer(
                 crate::crossing::RecordsBound::here(crossed),
                 |id| records_input::known_record(shared, &vault_name, id),
             ) {
-                Ok(answer) => answer,
-                Err(_) => return stored,
+                Ok(answer) => {
+                    shared.counts.add(Count::RecordsFetches);
+                    answer
+                }
+                Err(_) => {
+                    shared.counts.add(Count::RecordsUnanswered);
+                    return stored;
+                }
             };
             let stated = answer.bound.stated();
             // A crossed server takes nothing from a peer of a build before the fence.
@@ -5822,6 +5886,9 @@ fn pull_from_peer(
                     .get(&vault_name)
                     .map_or(0, |slot| slot.store.len());
                 if after_len > before_len {
+                    shared
+                        .counts
+                        .add_n(Count::RecordsStored, after_len - before_len);
                     stored += 1;
                 }
             }
@@ -5927,6 +5994,7 @@ fn tend_role_targets(
     here: &[Target],
     peers: &[crate::discover::DiscoveredVault],
     holders: &[crate::discover::DiscoveredVault],
+    pull: PullPeers,
     probe_alab: impl FnMut(&str) -> Option<u64>,
 ) -> RoleTargets {
     let at = |txt| (!here.is_empty()).then(|| (here.to_vec(), txt));
@@ -5935,7 +6003,7 @@ fn tend_role_targets(
     shared.merge_pins(&mut pins);
     let alab_name = crate::alab_advertised().to_owned();
     if !peers.is_empty() {
-        let _ = pull_from_peers_shared(shared, peers, port, decided.as_deref(), here);
+        let _ = pull(shared, peers, port, decided.as_deref(), here);
     }
     let Some(name) = decided else {
         // A revoked or unavailable role cannot retain an earlier claim across a later grant.
@@ -5986,6 +6054,11 @@ fn tend_role_targets(
     };
     (primary, secondary)
 }
+
+/// Pull from each of a round's peers, as [`pull_from_peers_shared`] does ([`Seams::pull`]): how
+/// many vaults advanced.
+type PullPeers =
+    fn(&Shared, &[crate::discover::DiscoveredVault], u16, Option<&str>, &[Target]) -> usize;
 
 /// Probe a host label or holder URL for a verified ALab envelope, as [`probe_alab_endpoint`]
 /// does ([`Seams::probe`]).
@@ -6040,6 +6113,9 @@ struct Seams {
     /// Probes `alab-secrets.local` and the holders heard for a verified ALab envelope
     /// ([`probe_alab_endpoint`]); a test's arm hears none.
     probe: ProbeAlab,
+    /// Pulls from the peers a round resolved ([`pull_from_peers_shared`]); a test's arm records
+    /// what it was handed.
+    pull: PullPeers,
     /// Whether a device other than this Mac answers to a name ([`name_answered_here`]), asked
     /// when a registration of `alab-secrets` this server holds ended by itself.
     name_answered: Box<NameAnswered>,
@@ -6069,6 +6145,7 @@ impl Seams {
             end_for_sleep: Arc::new(Registered::end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: probe_alab_endpoint,
+            pull: pull_from_peers_shared,
             name_answered: Box::new(|name, own| name_answered_here(name, own, NAME_CHECK_BUDGET)),
             sharing: Box::new(|| {
                 #[cfg(unix)]
@@ -6233,6 +6310,16 @@ fn take_for_sleep(set: &Mutex<ChildSet>, asleep: &AtomicBool) -> Vec<(Option<Str
 }
 
 impl Children {
+    /// The children of the server `counts` belongs to: its `vault-tend` thread counts there
+    /// whether or not it advertises (one that advertises is handed the server itself).
+    fn counting(counts: &Arc<ServeCounts>) -> Children {
+        Children {
+            set: Arc::default(),
+            bell: Mutex::default(),
+            counts: Arc::clone(counts),
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, ChildSet> {
         self.set.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -6304,7 +6391,7 @@ impl Children {
     fn tend_role_seamed(
         &self,
         keep_awake: bool,
-        mut advertise: Option<(RoleDecider, Vec<String>, u16, Arc<Shared>)>,
+        advertise: Option<(RoleDecider, Vec<String>, u16, Arc<Shared>)>,
         client_paths: Option<crate::client::Paths>,
         mut seams: Seams,
     ) {
@@ -6316,7 +6403,6 @@ impl Children {
             .unwrap_or_else(PoisonError::into_inner)
             .held_file
             .clone_from(&held_file);
-        let pid = std::process::id();
         let bell = Arc::new(Bell::default());
         if let Some(routes) = seams.routes.take() {
             crate::wake::hear(&bell, routes, Wake::Route);
@@ -6349,112 +6435,35 @@ impl Children {
         let shared_for_wake = advertise
             .as_ref()
             .map(|(_, _, _, shared)| Arc::clone(shared));
+        // The server's counts: the server it advertises for, or the one these children were
+        // made for where it only keeps this Mac awake.
+        let counts = shared_for_wake.as_ref().map_or_else(
+            || Arc::clone(&self.counts),
+            |shared| Arc::clone(&shared.counts),
+        );
         let spawned = std::thread::Builder::new()
             .name("vault-tend".to_owned())
             .spawn(move || {
                 let _power = power;
-                let mut watch = None;
-                // Where a server that held `alab-secrets` stopped, this one takes it back.
-                let mut alab_watcher = AlabNameWatcher::resume(
-                    held_file.as_deref().and_then(take_held_stamp),
-                    aterm_time::unix_millis().unwrap_or(0),
-                    Instant::now(),
-                    aterm_uds::process::last_sleep_ms()
-                        .and_then(|(slept, _)| u64::try_from(slept).ok()),
+                let mut tending = Tending::begin(
+                    held,
+                    asleep,
+                    browse_bell,
+                    keep_awake,
+                    advertise,
+                    client_paths,
+                    held_file.as_deref(),
+                    counts,
                 );
-                let probe = seams.probe;
-                let mut why = None;
-                let mut held_said = false;
                 loop {
-                    let sharing = (seams.sharing)();
-                    if !sharing {
-                        // Dropping the watch ends its standing DNS child, not just this round's
-                        // resolves. A later on round gets fresh discoveries and wakes.
-                        watch = None;
-                    } else if watch.is_none()
-                        && advertise.is_some()
-                        && let Some(start) = seams.browse.as_ref()
-                    {
-                        // Its own names' Adds come back with each registration it starts.
-                        let own: Vec<&str> = advertise
-                            .iter()
-                            .flat_map(|(_, names, _, _)| names.iter().map(String::as_str))
-                            .chain([crate::alab_advertised()])
-                            .collect();
-                        watch = Some(start(&browse_bell, &own));
+                    let round = tending.round(&mut seams);
+                    if round.closed {
+                        return;
                     }
-                    if sharing == held_said {
-                        held_said = !sharing;
-                        note(if sharing {
-                            "sharing is on again ([swarm] enabled): advertising this vault"
-                        } else {
-                            "sharing is off ([swarm] enabled = false in aterm.toml, or it cannot \
-                             be read): this server advertises nothing on the local network until \
-                             it is on"
-                        });
+                    if let Some(line) = round.said {
+                        note(&line);
                     }
-                    let here = if sharing {
-                        (seams.targets)()
-                    } else {
-                        Vec::new()
-                    };
-                    let (peers, holders) = match &watch {
-                        Some(w) if sharing => (
-                            w.peer_vaults(PEER_RESOLVE_BUDGET),
-                            w.alab_holders(PEER_RESOLVE_BUDGET),
-                        ),
-                        _ => (Vec::new(), Vec::new()),
-                    };
-                    let role_targets = advertise.as_mut().map(|(decide, _, port, shared)| {
-                        if !sharing {
-                            // Ends both registrations ([`reregister_roles`]) and decides nothing.
-                            return (
-                                None,
-                                Some((crate::alab_advertised().to_owned(), *port, None)),
-                            );
-                        }
-                        after_sleep(&held, &mut alab_watcher);
-                        let port = *port;
-                        let holding = alab_watcher.is_holding();
-                        let targets = tend_role_targets(
-                            decide,
-                            port,
-                            shared,
-                            client_paths.as_ref(),
-                            &mut alab_watcher,
-                            &here,
-                            &peers,
-                            &holders,
-                            |target| probe(target, port, None, &here, holding, shared),
-                        );
-                        if let (Some((name, _, _)), Some(w)) = (&targets.0, &watch) {
-                            w.note_own(name);
-                        }
-                        targets
-                    });
-                    let alab_answered = (role_targets.is_some() && alab_registration_ended(&held))
-                        .then(|| (seams.name_answered)(crate::alab_advertised(), &here));
-                    {
-                        let mut set = held.lock().unwrap_or_else(PoisonError::into_inner);
-                        if set.closed {
-                            return;
-                        }
-                        if keep_awake {
-                            tend_awake(&mut set, &|| quiet(CAFFEINATE, &caffeinate_args(pid)));
-                        }
-                        if let Some(targets) = role_targets {
-                            reregister_awake(
-                                &mut set,
-                                &asleep,
-                                targets,
-                                &mut alab_watcher,
-                                why,
-                                &*seams.spawn,
-                                alab_answered,
-                            );
-                        }
-                    }
-                    why = Some(napping.nap(seams.every));
+                    tending.why = Some(napping.nap(seams.every));
                 }
             });
         match spawned {
@@ -6470,6 +6479,205 @@ impl Children {
             Err(e) => note(&format!(
                 "could not start keeping awake or advertising: {e}"
             )),
+        }
+    }
+}
+
+/// What the `vault-tend` thread keeps from one round to the next ([`Tending::round`]).
+struct Tending {
+    held: Arc<Mutex<ChildSet>>,
+    asleep: Arc<AtomicBool>,
+    /// The bell the thread naps on, which a standing browse it starts rings.
+    bell: Arc<Bell>,
+    keep_awake: bool,
+    pid: u32,
+    advertise: Option<(RoleDecider, Vec<String>, u16, Arc<Shared>)>,
+    client_paths: Option<crate::client::Paths>,
+    watch: Option<Arc<crate::discover::Watch>>,
+    alab_watcher: AlabNameWatcher,
+    /// What ended the nap before the round to come: none before the first round.
+    why: Option<Wake>,
+    held_said: bool,
+    /// The server's counts ([`crate::serve_counts`]), which its connections count into too.
+    counts: Arc<ServeCounts>,
+    /// This thread's CPU time, added to the counts by phase as each phase of a round ends.
+    cpu: aterm_uds::cpu::ThreadCpu,
+}
+
+/// How a round ended ([`Tending::round`]).
+struct Round {
+    /// The server's children are closed: the thread ends.
+    closed: bool,
+    /// The counts' line, where the rounds so far make one due
+    /// ([`ServeCounts::round_ended`]).
+    said: Option<String>,
+}
+
+impl Tending {
+    /// What the thread keeps before its first round, made on the thread that runs the rounds
+    /// (its CPU time is metered from here), counting into `counts`. Where a server that held
+    /// `alab-secrets` stopped (`held_file`), this one takes it back.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "what one thread keeps, each handed to it once as it starts"
+    )]
+    fn begin(
+        held: Arc<Mutex<ChildSet>>,
+        asleep: Arc<AtomicBool>,
+        bell: Arc<Bell>,
+        keep_awake: bool,
+        advertise: Option<(RoleDecider, Vec<String>, u16, Arc<Shared>)>,
+        client_paths: Option<crate::client::Paths>,
+        held_file: Option<&Path>,
+        counts: Arc<ServeCounts>,
+    ) -> Tending {
+        let alab_watcher = AlabNameWatcher::resume(
+            held_file.and_then(take_held_stamp),
+            aterm_time::unix_millis().unwrap_or(0),
+            Instant::now(),
+            aterm_uds::process::last_sleep_ms().and_then(|(slept, _)| u64::try_from(slept).ok()),
+        );
+        Tending {
+            held,
+            asleep,
+            bell,
+            keep_awake,
+            pid: std::process::id(),
+            advertise,
+            client_paths,
+            watch: None,
+            alab_watcher,
+            why: None,
+            held_said: false,
+            counts,
+            cpu: aterm_uds::cpu::ThreadCpu::born(),
+        }
+    }
+
+    /// One round: read whether sharing is on and where this Mac is, resolve the round's peers,
+    /// decide the role and pull from them, and keep this Mac awake and its adverts registered,
+    /// all through `seams`. It counts the round by what ended the nap before it, the names it
+    /// handed a resolver and each probe for the ALab name, and adds this thread's CPU time to
+    /// the counts by phase ([`crate::serve_counts`]); the threads it starts to resolve names
+    /// (on macOS and in tests: no other build starts any) are counted for this server while it
+    /// runs (`serve_counts::tending`).
+    fn round(&mut self, seams: &mut Seams) -> Round {
+        let counts = Arc::clone(&self.counts);
+        #[cfg(any(test, target_os = "macos"))]
+        let _tending = crate::serve_counts::tending(&counts);
+        // The nap that ended, and what this thread did around it.
+        self.cpu.add_to(counts.tend_cpu(Phase::Rest));
+        counts.add(Count::Rounds);
+        counts.add(Count::after(self.why));
+        let probe = seams.probe;
+        let pull = seams.pull;
+        let sharing = (seams.sharing)();
+        if !sharing {
+            counts.add(Count::RoundsHeld);
+            // Dropping the watch ends its standing DNS child, not just this round's
+            // resolves. A later on round gets fresh discoveries and wakes.
+            self.watch = None;
+        } else if self.watch.is_none()
+            && self.advertise.is_some()
+            && let Some(start) = seams.browse.as_ref()
+        {
+            // Its own names' Adds come back with each registration it starts.
+            let own: Vec<&str> = self
+                .advertise
+                .iter()
+                .flat_map(|(_, names, _, _)| names.iter().map(String::as_str))
+                .chain([crate::alab_advertised()])
+                .collect();
+            self.watch = Some(start(&self.bell, &own));
+        }
+        if sharing == self.held_said {
+            self.held_said = !sharing;
+            note(if sharing {
+                "sharing is on again ([swarm] enabled): advertising this vault"
+            } else {
+                "sharing is off ([swarm] enabled = false in aterm.toml, or it cannot \
+                 be read): this server advertises nothing on the local network until \
+                 it is on"
+            });
+        }
+        let here = if sharing {
+            (seams.targets)()
+        } else {
+            Vec::new()
+        };
+        let (peers, holders) = match &self.watch {
+            Some(w) if sharing => {
+                let (peer_names, peers) = w.peer_vaults(PEER_RESOLVE_BUDGET);
+                counts.add_n(Count::PeerNames, peer_names);
+                let (alab_names, holders) = w.alab_holders(PEER_RESOLVE_BUDGET);
+                counts.add_n(Count::AlabNames, alab_names);
+                (peers, holders)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        self.cpu.add_to(counts.tend_cpu(Phase::Resolve));
+        let role_targets = self.advertise.as_mut().map(|(decide, _, port, shared)| {
+            if !sharing {
+                // Ends both registrations ([`reregister_roles`]) and decides nothing.
+                return (
+                    None,
+                    Some((crate::alab_advertised().to_owned(), *port, None)),
+                );
+            }
+            after_sleep(&self.held, &mut self.alab_watcher);
+            let port = *port;
+            let holding = self.alab_watcher.is_holding();
+            let targets = tend_role_targets(
+                decide,
+                port,
+                shared,
+                self.client_paths.as_ref(),
+                &mut self.alab_watcher,
+                &here,
+                &peers,
+                &holders,
+                pull,
+                |target| {
+                    counts.add(Count::AlabProbes);
+                    probe(target, port, None, &here, holding, shared)
+                },
+            );
+            if let (Some((name, _, _)), Some(w)) = (&targets.0, &self.watch) {
+                w.note_own(name);
+            }
+            targets
+        });
+        self.cpu.add_to(counts.tend_cpu(Phase::Pull));
+        let alab_answered = (role_targets.is_some() && alab_registration_ended(&self.held))
+            .then(|| (seams.name_answered)(crate::alab_advertised(), &here));
+        {
+            let mut set = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            if set.closed {
+                return Round {
+                    closed: true,
+                    said: None,
+                };
+            }
+            if self.keep_awake {
+                let pid = self.pid;
+                tend_awake(&mut set, &|| quiet(CAFFEINATE, &caffeinate_args(pid)));
+            }
+            if let Some(targets) = role_targets {
+                reregister_awake(
+                    &mut set,
+                    &self.asleep,
+                    targets,
+                    &mut self.alab_watcher,
+                    self.why,
+                    &*seams.spawn,
+                    alab_answered,
+                );
+            }
+        }
+        self.cpu.add_to(counts.tend_cpu(Phase::Register));
+        Round {
+            closed: false,
+            said: counts.round_ended(),
         }
     }
 }

@@ -337,7 +337,7 @@ fn the_hover_follows_a_fire_that_found_the_timer_moved() {
     crate::autopilot_timers::set_fake_clocks(Some((mono, WALL_MS)));
     assert!(app.set_session_autopilot_timed(
         0,
-        Some(aterm_agent::supervise::Autopilot::Cruise),
+        Some(alab_policy::config::Autopilot::Cruise),
         Some(land_at),
         crate::autopilot::Surface::Settings
     ));
@@ -394,20 +394,20 @@ fn a_timed_write_stamps_each_strip_once() {
     );
     assert!(app.set_session_autopilot(
         0,
-        Some(aterm_agent::supervise::Autopilot::Cruise),
+        Some(alab_policy::config::Autopilot::Cruise),
         crate::autopilot::Surface::Settings
     ));
     let _ = crate::work_counts::take_tooltip_pushes();
     assert!(app.set_session_autopilot(
         0,
-        Some(aterm_agent::supervise::Autopilot::Land),
+        Some(alab_policy::config::Autopilot::Land),
         crate::autopilot::Surface::Settings
     ));
     let plain = crate::work_counts::take_tooltip_pushes();
     assert!(plain >= 1, "PRECONDITION: a window write stamps the strip");
     assert!(app.set_session_autopilot_timed(
         0,
-        Some(aterm_agent::supervise::Autopilot::Cruise),
+        Some(alab_policy::config::Autopilot::Cruise),
         Some(crate::autopilot_timers::wall_ms() + 3_600_000),
         crate::autopilot::Surface::Settings
     ));

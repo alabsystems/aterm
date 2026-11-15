@@ -130,28 +130,6 @@ fn a_module_the_parent_declares_test_only_is_test_code() {
 }
 
 #[test]
-fn the_renderers_never_name_terminal() {
-    let src = "use aterm_core::terminal::Terminal;\nfn draw(t: &Terminal) {}\n\
-               fn make() -> Terminal {}\nfn ok(f: &TerminalFrame, s: TermSize) {}\n\
-               // aterm_core::Terminal in prose\n";
-    let found = run(
-        &RENDERER_TERMINAL,
-        &[
-            ("crates/aterm-render/src/lib.rs", src),
-            ("crates/aterm-render/src/raster_tests.rs", src),
-        ],
-    );
-    assert_eq!(
-        spots(&found),
-        [
-            "crates/aterm-render/src/lib.rs:1",
-            "crates/aterm-render/src/lib.rs:2",
-            "crates/aterm-render/src/lib.rs:3",
-        ]
-    );
-}
-
-#[test]
 fn a_device_read_to_eof_is_found_in_code_only() {
     let src = "let k = std::fs::read(\"/dev/urandom\")?;\n\
                let s = fs::read_to_string( \"/dev/stdin\" );\n\
@@ -164,81 +142,12 @@ fn a_device_read_to_eof_is_found_in_code_only() {
     );
 }
 
-#[test]
-fn an_input_probe_is_found_in_code_and_strings_not_prose() {
-    let src = "// CGEventSourceFlagsState opened a connection\n\
-               unsafe extern \"C\" { fn CGEventSourceSecondsSince(s: u32) -> f64; }\n\
-               let sym = dlsym(c\"SLSInputModifierKeyState\");\n\
-               let why = \"+[NSEvent modifierFlags]\";\n";
-    let found = run(&INPUT_PROBE, &[("crates/aterm-gui/src/platform.rs", src)]);
-    assert_eq!(
-        spots(&found),
-        [
-            "crates/aterm-gui/src/platform.rs:2",
-            "crates/aterm-gui/src/platform.rs:3",
-            "crates/aterm-gui/src/platform.rs:4",
-        ]
-    );
-}
-
-#[test]
-fn a_protected_folder_literal_is_found_in_gui_cli_and_amacs_host_shipped_code() {
-    let src = "let a = home.join(\"Documents\");\nlet b = \"~/Downloads/x\";\n\
-               let c = Path::new(\"/Volumes/Ext\");\nlet d = \"Library/CloudStorage\";\n\
-               // ~/Desktop in prose\nlet e = DocumentsView::new();\n\
-               const DATA: &str = \"/System/Volumes/Data\";\n\
-               let f = \"/System/Volumes/Data/Volumes/Ext\";\n\
-               #[cfg(test)]\nmod tests {\n    const P: &str = \"~/Documents\";\n}\n";
-    let found = run(
-        &PROTECTED_FOLDER,
-        &[
-            ("crates/aterm-gui/src/lib.rs", src),
-            ("crates/aterm-gui/src/lib_tests.rs", src),
-            ("crates/aterm-containment/src/consent.rs", src),
-            ("crates/amacs-files/src/host.rs", src),
-            ("crates/amacs/src/store.rs", src),
-        ],
-    );
-    assert_eq!(
-        spots(&found),
-        [
-            "crates/amacs-files/src/host.rs:1",
-            "crates/amacs-files/src/host.rs:2",
-            "crates/amacs-files/src/host.rs:3",
-            "crates/amacs-files/src/host.rs:4",
-            "crates/amacs-files/src/host.rs:8",
-            "crates/aterm-gui/src/lib.rs:1",
-            "crates/aterm-gui/src/lib.rs:2",
-            "crates/aterm-gui/src/lib.rs:3",
-            "crates/aterm-gui/src/lib.rs:4",
-            "crates/aterm-gui/src/lib.rs:8",
-        ]
-    );
-}
-
-/// A module its parent declares test-only (`#[cfg(test)] mod tests;`) is
-/// test code whatever its name, and is not read; its shipped sibling is.
-#[test]
-fn a_protected_folder_literal_in_a_declared_test_module_is_test_code() {
-    let parent = "#[cfg(test)]\nmod tests;\nmod shipped;\n";
-    let literal = "const P: &str = \"/Volumes/aterm/aterm.app\";\n";
-    let found = run(
-        &PROTECTED_FOLDER,
-        &[
-            ("crates/aterm-gui/src/page.rs", parent),
-            ("crates/aterm-gui/src/page/tests.rs", literal),
-            ("crates/aterm-gui/src/page/shipped.rs", literal),
-        ],
-    );
-    assert_eq!(spots(&found), ["crates/aterm-gui/src/page/shipped.rs:1"]);
-}
-
 /// A test module's file that a shipped `#[path]`, `include!` or `mod` also loads is read,
 /// and so is what a shipped mount of it loads in turn; what only a test module loads stays
 /// test code.
 #[test]
 fn a_test_module_a_shipped_line_also_loads_is_read() {
-    let literal = "const P: &str = \"/Volumes/aterm/aterm.app\";\n";
+    let literal = "const P: &str = \"/usr/bin/pmset\";\n";
     // The parent, three files that spell the literal, and `extra` over them.
     let found = |parent: &str, extra: &[(&str, &str)]| {
         let mut files: std::collections::BTreeMap<&str, &str> = [
@@ -251,7 +160,7 @@ fn a_test_module_a_shipped_line_also_loads_is_read() {
         .collect();
         files.insert("crates/aterm-gui/src/page.rs", parent);
         let files: Vec<(&str, &str)> = files.into_iter().collect();
-        spots(&run(&PROTECTED_FOLDER, &files))
+        spots(&run(&super::super::machines::MACHINES_ROOT_DOOR, &files))
     };
     let tests =
         "#[cfg(test)]\nmod tests;\n#[cfg(test)]\n#[path = \"page_rig_tests.rs\"]\nmod rig;\n";
@@ -264,7 +173,7 @@ fn a_test_module_a_shipped_line_also_loads_is_read() {
         ),
         (
             "crates/aterm-gui/src/page_rig_more.rs",
-            "const P: &str = \"/Volumes/aterm/aterm.app\";\n\
+            "const P: &str = \"/usr/bin/pmset\";\n\
              #[path = \"page_rig_deep_tests.rs\"]\nmod deep;\n",
         ),
         ("crates/aterm-gui/src/page_rig_deep_tests.rs", literal),
@@ -412,13 +321,6 @@ fn every_guard_skips_the_same_test_code() {
     );
     let rows: &[Row<'_>] = &[
         (
-            &PROTECTED_FOLDER,
-            "crates/amacs-files",
-            "src",
-            "const P: &str = \"/Volumes/aterm/aterm.app\";\n",
-            &[],
-        ),
-        (
             &super::super::debug_seam::DEBUG_SEAM,
             "crates/aterm-lab",
             "src",
@@ -438,34 +340,6 @@ fn every_guard_skips_the_same_test_code() {
             "crates/aterm-cli",
             "src",
             "fn a() { run_devtools_change(c, g, f); }\n",
-            &[],
-        ),
-        (
-            &STORE_CURRENT,
-            "crates/aterm-verify",
-            "src",
-            "fn a(p: &Path) -> PathBuf {\n    p.join(\"current\")\n}\n",
-            &[],
-        ),
-        (
-            &RUNLOOP_TIMER,
-            "crates/aterm-window",
-            "src",
-            "fn f() {\n    let t = CFRunLoopTimerCreate(a, b);\n}\n",
-            &[],
-        ),
-        (
-            &super::super::stock_label::STOCK_LABEL,
-            "crates/aterm-c",
-            "src",
-            "fn f(cmd: &mut Cmd) {\n    cmd.env(\"RUSTUP_TOOLCHAIN\", \"stable\");\n}\n",
-            &[],
-        ),
-        (
-            &RENDERER_TERMINAL,
-            "crates/aterm-render",
-            "src",
-            "use aterm_core::terminal::Terminal;\n",
             &[],
         ),
         (
@@ -511,39 +385,11 @@ fn every_guard_skips_the_same_test_code() {
             &[],
         ),
         (
-            &super::super::doors::HANDOFF_NAME,
-            "crates/aterm-gui",
-            "src",
-            "fn s() {\n    let k = \"ATERM_HANDOFF_CLAIM\".to_string();\n}\n",
-            &[],
-        ),
-        (
-            &super::super::aos_step::AOS_STEP_CLOCK,
-            "crates/aterm-aos",
-            "src",
-            "fn a() {\n    let t = Instant::now();\n}\n",
-            &[],
-        ),
-        (
-            &super::super::term_write::TERM_WRITE,
-            "crates/aterm-gui",
-            "src",
-            "fn f(term: &Mutex<Terminal>) {\n    term.lock().unwrap().process(b\"x\");\n}\n",
-            &[],
-        ),
-        (
             &super::super::agent_gate::AGENT_GATE,
             "crates/aterm-gui-x",
             "src",
             "fn f(a: Program) -> bool {\n    a == Program::Claude\n}\n",
             &enums,
-        ),
-        (
-            &super::super::slog_inert::SLOG_INERT,
-            "crates/aterm-slog",
-            "src",
-            "fn f(w: SinkWriter) {}\n",
-            &[],
         ),
         (
             &ENGINE_PLATFORM,
@@ -648,51 +494,6 @@ fn an_engine_module_a_test_target_also_mounts_stays_test_code() {
         [
             "crates/aterm-aos/src/host.rs",
             "crates/aterm-aos/src/rig.rs"
-        ]
-    );
-}
-
-#[test]
-fn a_runloop_timer_lives_only_in_wake_timer() {
-    let src = "let t = CFRunLoopTimerCreate(a, b);\n\
-               let n = send(cls, sel!(scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:));\n";
-    let found = run(
-        &RUNLOOP_TIMER,
-        &[
-            ("crates/aterm-objc/src/wake_timer.rs", src),
-            ("crates/aterm-gui/src/app.rs", src),
-            ("crates/aterm-gui/tests/t.rs", src),
-            ("crates/aterm-window/src/platform_impl/macos/app.rs", src),
-        ],
-    );
-    assert_eq!(
-        spots(&found),
-        [
-            "crates/aterm-gui/src/app.rs:1",
-            "crates/aterm-gui/src/app.rs:2",
-            "crates/aterm-window/src/platform_impl/macos/app.rs:1",
-            "crates/aterm-window/src/platform_impl/macos/app.rs:2",
-        ]
-    );
-}
-
-#[test]
-fn the_keeper_links_no_gui_framework() {
-    let src = "#[link(name = \"AppKit\", kind = \"framework\")]\nextern \"C\" {}\n\
-               #[link(name = \"Security\", kind = \"framework\")]\n\
-               // objc_msgSend in prose\nlet x = winit::event_loop::EventLoop::new();\n";
-    let found = run(
-        &KEEPER_GUI,
-        &[
-            ("crates/aterm-keeper/src/lib.rs", src),
-            ("crates/aterm-gui/src/lib.rs", src),
-        ],
-    );
-    assert_eq!(
-        spots(&found),
-        [
-            "crates/aterm-keeper/src/lib.rs:1",
-            "crates/aterm-keeper/src/lib.rs:5",
         ]
     );
 }
@@ -831,340 +632,6 @@ fn no_off_host_crate_has_the_crash_restore_in_its_closure() {
             .detail
             .contains("through aterm-session -> aterm-restore"),
         "{found:?}"
-    );
-}
-
-#[test]
-fn the_keepers_closure_holds_no_gui_crate() {
-    use crate::scan_set::test_fixtures::{disk_tree, workspace_manifests};
-    let mut files = workspace_manifests(&[
-        (
-            "aterm-keeper",
-            "[dependencies]\naterm-uds = { workspace = true }\n",
-        ),
-        ("aterm-uds", "[dependencies]\nobjc-sys = \"0.3\"\n"),
-    ]);
-    for dir in ["aterm-gui", "aterm-types", "aterm-keeper", "aterm-uds"] {
-        files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
-    }
-    files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
-    let root = disk_tree("aterm-census-guards", "keeper-deps", &files);
-    let corpus = super::super::Corpus::of(&[]);
-    let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
-    let mut found = Vec::new();
-    keeper_gui_deps(&tree, &mut found);
-    let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0].path, "crates/aterm-uds/Cargo.toml");
-    assert!(found[0].detail.contains("`objc-sys`"), "{found:?}");
-
-    let mut files = workspace_manifests(&[
-        (
-            "aterm-keeper",
-            "[dependencies]\naterm-uds = { workspace = true }\n",
-        ),
-        (
-            "aterm-uds",
-            "[dependencies]\naterm-render = { path = \"../aterm-render\" }\n",
-        ),
-        ("aterm-render", ""),
-    ]);
-    for dir in [
-        "aterm-gui",
-        "aterm-types",
-        "aterm-keeper",
-        "aterm-uds",
-        "aterm-render",
-    ] {
-        files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
-    }
-    files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
-    let root = disk_tree("aterm-census-guards", "keeper-gui-crate", &files);
-    std::fs::write(
-        root.join("crates/aterm-render/src/lib.rs"),
-        "#[link(name = \"AppKit\", kind = \"framework\")]\nunsafe extern \"C\" {}\n",
-    )
-    .unwrap();
-    let corpus = super::super::Corpus::at(&root).unwrap();
-    let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
-    let mut found = Vec::new();
-    keeper_gui_deps(&tree, &mut found);
-    let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0].path, "crates/aterm-render/src/lib.rs");
-    assert!(found[0].detail.contains("AppKit"), "{found:?}");
-
-    let mut files = workspace_manifests(&[
-        (
-            "aterm-keeper",
-            "[dependencies]\naterm-uds = { workspace = true }\n",
-        ),
-        (
-            "aterm-uds",
-            "[dependencies]\nwindowing = { package = \"winit\", version = \"0.30\" }\n",
-        ),
-    ]);
-    for dir in ["aterm-gui", "aterm-types", "aterm-keeper", "aterm-uds"] {
-        files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
-    }
-    files.push(("Cargo.lock".to_string(), "version = 4\n".to_string()));
-    let root = disk_tree("aterm-census-guards", "keeper-renamed-gui", &files);
-    let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
-    let mut found = Vec::new();
-    keeper_gui_deps(&tree, &mut found);
-    let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0].path, "crates/aterm-uds/Cargo.toml");
-    assert!(found[0].detail.contains("`winit`"), "{found:?}");
-}
-
-#[test]
-fn keeper_framework_check_follows_source_instead_of_crate_names() {
-    use crate::scan_set::test_fixtures::{disk_tree, workspace_manifests};
-    for helper in ["aterm-objc", "native-helper"] {
-        for framework in ["Foundation", "AppKit"] {
-            let deps = format!(
-                "[dependencies]\nhelper = {{ package = \"{helper}\", path = \"../{helper}\" }}\n"
-            );
-            let mut files = workspace_manifests(&[
-                (
-                    "aterm-keeper",
-                    "[dependencies]\naterm-uds = { workspace = true }\n",
-                ),
-                ("aterm-uds", &deps),
-                (helper, ""),
-            ]);
-            for name in [
-                "aterm-gui",
-                "aterm-types",
-                "aterm-keeper",
-                "aterm-uds",
-                helper,
-            ] {
-                files.push((format!("crates/{name}/src/lib.rs"), String::new()));
-            }
-            let source = format!(
-                "#[link(name = \"{framework}\", kind = \"framework\")]\nunsafe extern \"C\" {{}}\n"
-            );
-            files.push(("Cargo.lock".to_owned(), "version = 4\n".to_owned()));
-            let root = disk_tree("aterm-census-guards", "keeper-framework-source", &files);
-            let path = format!("crates/{helper}/src/lib.rs");
-            std::fs::write(root.join(&path), source).unwrap();
-            let corpus = super::super::Corpus::at(&root).unwrap();
-            let tree = Tree::new(&root, &corpus, crate::guards::tests::NO_ENGINE);
-            let mut found = Vec::new();
-            keeper_gui_deps(&tree, &mut found);
-            let _ = std::fs::remove_dir_all(&root);
-            assert_eq!(
-                found.len(),
-                usize::from(framework == "AppKit"),
-                "{helper} {framework}: {found:?}"
-            );
-            if let Some(finding) = found.first() {
-                assert_eq!(finding.path, path);
-            }
-        }
-    }
-}
-
-/// The keeper's dependency closure through `Cargo.lock`: a transitive GUI package or a
-/// missing lock entry is a finding.
-#[test]
-fn the_keepers_closure_is_walked_through_cargo_lock() {
-    use crate::scan_set::test_fixtures::{disk_tree, workspace_manifests};
-    let lock = "version = 4\n\n\
-                [[package]]\nname = \"aterm-uds\"\nversion = \"0.1.0\"\n\
-                dependencies = [\n \"helper\",\n]\n\n\
-                [[package]]\nname = \"helper\"\nversion = \"1.0.0\"\n\
-                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
-                dependencies = [\n \"log\",\n \"middle\",\n]\n\n\
-                [[package]]\nname = \"middle\"\nversion = \"0.2.0\"\n\
-                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
-                dependencies = [\n \"objc2-foundation 0.3.1\",\n]\n\n\
-                [[package]]\nname = \"objc2-foundation\"\nversion = \"0.3.1\"\n\
-                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
-                [[package]]\nname = \"objc2-foundation\"\nversion = \"0.2.2\"\n\
-                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
-                [[package]]\nname = \"log\"\nversion = \"0.4.0\"\n\
-                dependencies = [\n \"winit\",\n]\n\n\
-                [[package]]\nname = \"winit\"\nversion = \"0.30.0\"\n\
-                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
-    let tree_with = |name: &str, uds_deps: &str| {
-        let mut files = workspace_manifests(&[
-            (
-                "aterm-keeper",
-                "[dependencies]\naterm-uds = { workspace = true }\n",
-            ),
-            ("aterm-uds", uds_deps),
-            ("aterm-log", "[dev-dependencies]\nwinit = \"0.30\"\n"),
-        ]);
-        for (path, contents) in files.iter_mut() {
-            if path == "Cargo.toml" {
-                contents.push_str("log = { path = \"crates/aterm-log\" }\n");
-            }
-        }
-        for dir in [
-            "aterm-gui",
-            "aterm-types",
-            "aterm-keeper",
-            "aterm-uds",
-            "aterm-log",
-        ] {
-            files.push((format!("crates/{dir}/src/lib.rs"), String::new()));
-        }
-        files.push(("Cargo.lock".to_string(), lock.to_string()));
-        disk_tree("aterm-census-guards", name, &files)
-    };
-    let run_on = |root: &std::path::Path| {
-        let corpus = super::super::Corpus::of(&[]);
-        let tree = Tree::new(root, &corpus, crate::guards::tests::NO_ENGINE);
-        let mut found = Vec::new();
-        keeper_gui_deps(&tree, &mut found);
-        let _ = std::fs::remove_dir_all(root);
-        found
-    };
-    let found = run_on(&tree_with(
-        "keeper-lock",
-        "[dependencies]\nhelper = \"1\"\n",
-    ));
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0].path, "crates/aterm-uds/Cargo.toml");
-    assert!(
-        found[0]
-            .detail
-            .contains("reaches `objc2-foundation` through helper -> middle -> objc2-foundation"),
-        "{found:?}"
-    );
-    let found = run_on(&tree_with(
-        "keeper-lock-stale",
-        "[dependencies]\nnot-locked = \"1\"\n",
-    ));
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert!(
-        found[0]
-            .detail
-            .contains("`not-locked`, which Cargo.lock does not hold"),
-        "{found:?}"
-    );
-    let hash = "1234567890123456789012345678901234567890";
-    let root = tree_with(
-        "keeper-git-closure",
-        &format!(
-            "[dependencies]\nhelper = {{ git = \"https://github.com/example/helper.git\", rev = \"{hash}\" }}\n"
-        ),
-    );
-    let path = root.join("Cargo.lock");
-    let locked = std::fs::read_to_string(&path).unwrap().replacen(
-        "source = \"registry+https://github.com/rust-lang/crates.io-index\"",
-        &format!("source = \"git+https://github.com/example/helper.git?rev={hash}#{hash}\""),
-        1,
-    );
-    std::fs::write(path, locked).unwrap();
-    let found = run_on(&root);
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert!(
-        found[0]
-            .detail
-            .contains("reaches `objc2-foundation` through helper -> middle -> objc2-foundation"),
-        "{found:?}"
-    );
-}
-
-#[test]
-fn the_std_command_alias_is_built_renamed_or_re_aliased_only_in_aterm_uds() {
-    let src = "use aterm_uds::spawnfd::StdCommand;\n\
-               fn a(c: &mut StdCommand) -> &mut StdCommand { c }\n\
-               let c = StdCommand::new(\"ls\");\n\
-               let d = aterm_uds::spawnfd::StdCommand :: new (\"ls\");\n\
-               use aterm_uds::spawnfd::StdCommand as Cmd;\n\
-               type Cmd2 = StdCommand;\n\
-               type Cmd3 = ::aterm_uds :: spawnfd::StdCommand;\n\
-               // StdCommand::new in prose\n\
-               let s = \"StdCommand::new\";\n\
-               let e = StdCommand::new_with(x);\n\
-               #[cfg(test)]\nmod tests {\n    fn t() { let _ = StdCommand::new(\"x\"); }\n}\n";
-    let found = run(
-        &STD_COMMAND,
-        &[
-            ("crates/aterm-gui/src/x.rs", src),
-            ("crates/aterm-uds/src/spawnfd.rs", src),
-        ],
-    );
-    assert_eq!(
-        spots(&found),
-        [
-            "crates/aterm-gui/src/x.rs:3",
-            "crates/aterm-gui/src/x.rs:4",
-            "crates/aterm-gui/src/x.rs:5",
-            "crates/aterm-gui/src/x.rs:6",
-            "crates/aterm-gui/src/x.rs:7",
-            "crates/aterm-gui/src/x.rs:13",
-        ],
-        "{found:?}"
-    );
-}
-
-/// Each door the lint cannot name, with the line it fires on.
-#[test]
-fn every_flock_door_the_lint_cannot_name_is_found() {
-    let cases: &[(&str, &str, usize)] = &[
-        (
-            "a private extern flock",
-            "unsafe extern \"C\" {\n    fn flock(fd: i32, op: i32) -> i32;\n}\n",
-            2,
-        ),
-        (
-            "flock under another name",
-            "unsafe extern \"C\" {\n    #[link_name = \"flock\"]\n    fn take_it(fd: i32) -> i32;\n}\n",
-            2,
-        ),
-        (
-            "an open that takes the lock",
-            "let fd = libc::open(p, libc::O_RDWR | libc::O_EXLOCK, 0o600);\n",
-            1,
-        ),
-        (
-            "an OFD lock",
-            "unsafe { libc::fcntl(fd, libc::F_OFD_SETLKW, &lock) };\n",
-            1,
-        ),
-        (
-            "a raw SYS_flock",
-            "libc::syscall(\n    libc::SYS_flock,\n    fd,\n)\n",
-            2,
-        ),
-        (
-            "a syscall by number",
-            "unsafe { libc::syscall(\n    131, fd, 6) };\n",
-            1,
-        ),
-    ];
-    for (why, src, line) in cases {
-        let found = run(&FLOCK_DOOR, &[("crates/aterm-gui/src/x.rs", src)]);
-        assert_eq!(
-            spots(&found),
-            [format!("crates/aterm-gui/src/x.rs:{line}")],
-            "MISS — {why}:\n{src}"
-        );
-    }
-}
-
-#[test]
-fn doors_the_lint_sees_and_near_misses_are_silent() {
-    let src = "// A private `fn flock(fd, op)` would be a finding.\n\
-               let l = unsafe { libc::flock(fd, libc::LOCK_EX) };\nlet _ = file.try_lock(); // O_EXLOCKED\n\
-               fn flock_probe() {}\nlet q = libc::fcntl(fd, libc::F_OFD_GETLK);\nlet _ = my_syscall(1);\n\
-               #[link_name = \"flockfile\"]\nlet c = libc::syscall(libc::SYS_close_range, 3);\n\
-               let s = \"fn flock(\";\n";
-    assert!(run(&FLOCK_DOOR, &[("crates/aterm-gui/src/x.rs", src)]).is_empty());
-    let libc = "pub const O_EXLOCK: c_int = 0x20;\npub const SYS_flock: c_int = 131;\n\
-                unsafe extern \"C\" {\n    pub fn flock(fd: c_int, op: c_int) -> c_int;\n}\n";
-    assert!(
-        run(
-            &FLOCK_DOOR,
-            &[("crates/aterm-libc/src/darwin_aarch64.rs", libc)]
-        )
-        .is_empty()
     );
 }
 
@@ -1850,34 +1317,6 @@ fn the_ledgers_readers_by_path_are_found_by_their_convention() {
             "crates/aterm-agent/src/supervise/turn_end_loop.rs:1",
             "crates/aterm-agent/src/supervise/turn_end_loop.rs:3",
             "crates/aterm-agent/src/supervise/turn_end_loop.rs:4",
-        ]
-    );
-}
-
-#[test]
-fn a_store_current_path_is_resolved_within_six_lines() {
-    let src = "fn b(p: &Path) -> PathBuf {\n    let c = p.join(\"store/trust/current/bin\");\n    \
-               std::fs::canonicalize(c).unwrap()\n}\n\
-               fn d(p: &Path) -> PathBuf {\n    physical(&p.join(\"current\"))\n}\n\
-               fn e(p: &Path) -> PathBuf {\n    p.join(\"currently\").join(\"a/current_x\")\n}\n\
-               // p.join(\"current\") in prose\n\
-               #[cfg(test)]\nmod tests {\n    fn t(p: &Path) { p.join(\"current\"); }\n}\n\
-               fn a(p: &Path) -> PathBuf {\n    p.join(\"current\")\n}\n\
-               fn c() -> PathBuf {\n    PathBuf::from(\"/opt/store/x/current\")\n}\n";
-    let found = run(
-        &STORE_CURRENT,
-        &[
-            ("crates/aterm-verify/src/lib.rs", src),
-            ("crates/atpkg/src/store.rs", src),
-            ("crates/aterm-verify/tests/t.rs", src),
-            ("crates/aterm-spec/src/verify_tests.rs", src),
-        ],
-    );
-    assert_eq!(
-        spots(&found),
-        [
-            "crates/aterm-verify/src/lib.rs:17",
-            "crates/aterm-verify/src/lib.rs:20",
         ]
     );
 }

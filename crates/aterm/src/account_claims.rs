@@ -4,7 +4,8 @@
 //! The Commons table the harness's account claims ride (docs/DESIGN-fluid-swarm-2026-10-28.md
 //! F19): `aterm_db::accounts::claims` behind `aterm_agent::harness::claims::Table`, and what this
 //! process's Commons runtime hears of its peers. A read carries what this Mac's peers say of its
-//! clock and the peers it reads as skewed, named by the swarm roster (F22).
+//! clock and the peers it reads as skewed, named by the swarm roster (F22), and each account's
+//! homes as the lab registry this process holds names them (`claims::Homes`).
 
 use aterm_agent::harness::claims::{self, Book, Presence, Row, Table, Tabled};
 use aterm_codec::hex;
@@ -165,6 +166,10 @@ impl Table for Commons {
             clock: clock_read(&read.clock),
             skewed: skewed_peers(&read.clock.skewed, roster.as_ref()),
             held: skewed_peers(&read.clock.held, roster.as_ref()),
+            // The lab this process holds names each account's homes, by the Commons machine
+            // each Mac's facts row binds; with none, every claim ranks as a lease
+            // (`claims::View::home_use`).
+            homes: aterm_agent::harness::alab_roster::current().map(|lab| claims::Homes::of(&lab)),
         })
     }
 
@@ -216,21 +221,29 @@ fn carry(book: &mut Book, me: &str, former: Option<&aterm_json::Value>, now: i64
 /// names itself and takes every contact (its history is unavailable, not frozen), so its peers'
 /// last contacts stay current and it gives presence. With no presence a lease lives until its
 /// row's `until`, as on a Mac with no Commons.
+///
+/// An absence is judged only over the time the observer has listened in its current run
+/// (`listening_since_ms`, rounded up to the second so it is never overstated): a resumed
+/// observer (an aterm restarted, a Mac woken from sleep) publishes the peers it kept, each with
+/// its last contact from before the gap, and a peer it has had no time to hear yet is not gone.
+/// A publication that names no listening gives no presence: its observer is not listening now.
 fn presence(observation: &NetworkObservation) -> Option<Presence> {
-    (observation.visibility == Visibility::Active && observation.observer.is_some()).then(|| {
-        Presence {
-            at: secs(observation.observed_at_ms),
-            heard: observation
-                .peers
-                .iter()
-                .map(|peer| {
-                    (
-                        hex::encode_lower(&peer.identity.machine_id),
-                        secs(peer.last_seen_ms),
-                    )
-                })
-                .collect(),
-        }
+    let listening_since = observation.listening_since_ms.filter(|_| {
+        observation.visibility == Visibility::Active && observation.observer.is_some()
+    })?;
+    Some(Presence {
+        at: secs(observation.observed_at_ms),
+        listening_since: i64::try_from(listening_since.div_ceil(1000)).unwrap_or(i64::MAX),
+        heard: observation
+            .peers
+            .iter()
+            .map(|peer| {
+                (
+                    hex::encode_lower(&peer.identity.machine_id),
+                    secs(peer.last_seen_ms),
+                )
+            })
+            .collect(),
     })
 }
 

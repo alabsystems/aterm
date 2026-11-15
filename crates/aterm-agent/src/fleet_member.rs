@@ -6,7 +6,7 @@
 //! the view ([`crate::fleet_view`]) and the lab verbs ([`crate::members_cli::parse_lab`]).
 
 use std::ffi::OsString;
-use std::io::{self, IsTerminal as _, Read as _, Write as _};
+use std::io::{self, Read as _};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -32,6 +32,9 @@ aterms of one LAN that hold one secret, each reading the others at the level
 they allow
 
 THE LAB:
+  aterm fleet peers [--details]
+                         check members by name with causes and next checks.
+                         --details includes saved transport coordinates
   aterm fleet [--json]   read authenticated fleet facts (three seconds per peer)
                          and match their complete node keys to signed seats.
                          Show current build, free disk, sessions and account
@@ -66,8 +69,9 @@ DEFAULT ALAB:
   drive may do there. Explicit access restrictions, a different manually
   joined fleet, and a previous `leave` remain in force.
   Use `aterm fleet peers` or `aterm ctl survey --fleet` to inspect it.
-  After joining, use its temporary node-<node-id> name, or assign a primary
-  name with `aterm fleet name set NAME`. The temporary alias remains valid.
+  After joining, use its temporary node-<node-id> name, or choose its number
+  with `aterm name set <mN|N>`, which publishes it as the fleet name. The
+  temporary alias remains valid.
 
 USAGE:
   aterm fleet init [--allow facts|content] [--port N] [--host H] [--rotate]
@@ -77,12 +81,17 @@ USAGE:
   aterm fleet join [--allow facts|content] [--port N] [--host H] [--at H[:P]]
                  [--code-file F]
                          on each other machine: join with that code (the
-                         fleet's secret alone), read from stdin when piped,
-                         from F, or typed at the terminal unshown; never an
-                         argument. Any member records the join: the one --at
-                         names, else the place an older aterm's code names,
-                         else each member this machine's book holds, then
-                         the members advertising _alab._tcp on this LAN
+                         fleet's secret alone), read from F or stdin
+                         redirected from a file or pipe, never an argument;
+                         given none, it is `aterm fleet sync --on`, the
+                         default ALab fleet's join with the vault's code
+                         (where this Mac's vault holds none, it files
+                         `aterm secrets need fleet-code` and fails; --allow
+                         and --at go with a code). Any member records the
+                         join: the one --at names, else the place an older
+                         aterm's code names, else each member this
+                         machine's book holds, then the members advertising
+                         _alab._tcp on this LAN
   aterm fleet peers [--timeout S]
                          the machines this one knows (its book and aterm.toml's
                          [[fleet.peers]] host = \"<host[:port]>\" entries), each
@@ -90,9 +99,11 @@ USAGE:
                          member, the book of the member that answered its
                          join too
   aterm fleet peers add <host[:port]> | rm <host[:port]|node>
-  aterm fleet name [set <name>]
-                         show this machine's name, or assign a better primary
-                         name; its automatic node-<id> alias stays valid
+  aterm fleet name       show this machine's fleet name, its automatic
+                         node-<id> alias (which stays valid) and its node.
+                         `aterm name set <mN|N>` chooses its number, which it
+                         publishes as the fleet name, and `aterm name nick
+                         <word>` its nickname
   aterm fleet allow facts|content
   aterm fleet allow drive --all | --from <host|node> [--from …]
                          what a peer may do here: read facts or content, or
@@ -309,12 +320,7 @@ pub(crate) fn main_entry(verb: &str, args: &[OsString]) -> ExitCode {
     let ran = Places::here().and_then(|places| {
         announcing(&places, || match verb {
             "init" => init(&places, &args),
-            "join" => parse_join(&args).and_then(|opts| {
-                let (code, from) = read_code(opts.code_file.as_deref())?;
-                let out = join(&places, &opts, &code).map(|report| report + from.left_behind());
-                scrub_string(code);
-                out
-            }),
+            "join" => parse_join(&args).and_then(|opts| person_join(&places, &opts)),
             "peers" => peers(&places, &args),
             "allow" => allow(&places, &args),
             "access" => access(&places, &args),
@@ -357,39 +363,35 @@ fn announcing<R>(places: &Places, run: impl FnOnce() -> R) -> R {
     ran
 }
 
+/// `aterm fleet name`: this machine's fleet name, its temporary alias and its node. It writes
+/// nothing: `aterm name set` chooses the number the fleet name carries
+/// ([`choose_machine_name_at`]), and any argument is a usage error that says so.
 fn name_machine(places: &Places, args: &[String]) -> Result<String, Failure> {
-    match args {
-        [] => {
-            let node =
-                own_node(places).ok_or_else(|| failed("this machine has no fleet identity yet"))?;
-            let temporary = member::temporary_name(&node);
-            let name = member::read_primary_name(&places.state)
-                .map_err(failed)?
-                .unwrap_or_else(|| temporary.clone());
-            Ok(format!("name={name} alias={temporary} node={node}"))
-        }
-        [verb, name] if verb == "set" => {
-            let name = name.to_ascii_lowercase();
-            if !member::valid_primary_name(&name) {
-                return Err(Failure::Usage("name set takes a name of 1–63 lowercase letters, digits and internal hyphens; node- is reserved for permanent temporary aliases".into()));
-            }
-            set_primary_name(places, &name, &Writer::Person)
-        }
-        _ => Err(Failure::Usage(
-            "name takes no arguments, or: name set <name>".into(),
-        )),
+    if !args.is_empty() {
+        return Err(Failure::Usage(
+            "name takes no arguments: `aterm name set <mN|N>` chooses this machine's number, \
+             which it publishes as the fleet name, and `aterm name nick <word>` its nickname"
+                .into(),
+        ));
     }
+    let node = own_node(places).ok_or_else(|| failed("this machine has no fleet identity yet"))?;
+    let temporary = member::temporary_name(&node);
+    let name = member::read_primary_name(&places.state)
+        .map_err(failed)?
+        .unwrap_or_else(|| temporary.clone());
+    Ok(format!("name={name} alias={temporary} node={node}"))
 }
 
 /// Publish an explicitly chosen machine number as the fleet name in `state` through the same
-/// checked writer as `fleet name set` ([`set_primary_name`]), while `state`'s machine name still
-/// holds `number` and the aterm.toml at `config` still names it in all three policy keys already
-/// committed by the publisher. Both sources are read again under the fleet writer's lock,
-/// after its other reads, with the canonical number last. Existing signed and registered holders
-/// are never overwritten. `config`'s `[[fleet.peers]]` hosts are read, beside the swarm roster,
-/// the book and its copy of the issuer's book, among the machines that may already answer to the
-/// name. The roster is the vault's beside `state`, or the live one where `state` is the live
-/// account's ([`crate::fleet_vault::vault_paths_for`]); with neither it names no machine.
+/// checked writer as the fleet name's follow ([`set_primary_name`]), while `state`'s machine
+/// name still holds `number` and the aterm.toml at `config` still names it in all three policy
+/// keys already committed by the publisher. Both sources are read again under the fleet
+/// writer's lock, after its other reads, with the canonical number last. Existing signed and
+/// registered holders are never overwritten. `config`'s `[[fleet.peers]]` hosts are read, beside
+/// the swarm roster, the book and its copy of the issuer's book, among the machines that may
+/// already answer to the name. The roster is the vault's beside `state`, or the live one where
+/// `state` is the live account's ([`crate::fleet_vault::vault_paths_for`]); with neither it
+/// names no machine.
 ///
 /// # Errors
 /// `state` cannot be made private or its node identity read; the swarm roster is unread; another
@@ -412,10 +414,11 @@ pub(crate) fn choose_machine_name_at(
 
 /// Who writes the fleet name, and so what the write records.
 enum Writer<'a> {
-    /// The person (`aterm fleet name set`): the name is theirs, and no follow replaces it, unless
-    /// it is a swarm label (`m<N>`) the roster gives this Mac no more ([`FleetName::Due`]).
-    Person,
-    /// The committed policy and canonical number must still match under the fleet writer lock.
+    /// The naming publication of the committed machine number
+    /// ([`crate::machine_name::publish::publish`]) through [`choose_machine_name_at`]: the
+    /// committed policy and canonical number must still match under the fleet writer lock. It
+    /// records no follow, so no follow replaces the name unless it is a swarm label (`m<N>`) the
+    /// roster gives this Mac no more ([`FleetName::Due`]).
     #[cfg(unix)]
     Canonical(aterm_types::machine_name::Number),
     /// `sync.identity`'s follow, which read the fleet name as `saw`: it writes only if the name
@@ -499,17 +502,12 @@ fn set_primary_name(places: &Places, name: &str, writer: &Writer<'_>) -> Result<
                     .map_err(|why| failed(why.phrase()))?;
             }
             Writer::Follow { current, .. } => current().map_err(failed)?,
-            Writer::Person => {}
         }
         if !already_written {
             aterm_uds::private_file::write_private(&places.state, member::NAME_FILE, bytes.as_bytes())
                 .map_err(|e| failed(e.to_string()))?;
         }
         match writer {
-            Writer::Person => {
-                aterm_uds::private_file::remove_private(&places.state, FOLLOWED_FILE)
-                    .map_err(|e| failed(e.to_string()))?;
-            }
             #[cfg(unix)]
             Writer::Canonical(_) => {
                 aterm_uds::private_file::remove_private(&places.state, FOLLOWED_FILE)
@@ -585,8 +583,10 @@ pub enum FleetName {
         /// What the fleet name reads as now.
         from: String,
     },
-    /// A name of the person's own (`aterm fleet name set`), or another name aterm did not write,
-    /// that is no swarm label the roster moved this Mac from: kept.
+    /// A fleet name the follow's record ([`FOLLOWED_FILE`]) does not name (a number the naming
+    /// publication wrote, a name an earlier build's `aterm fleet name set` wrote, or one an older
+    /// follow wrote before that record existed) that is no swarm label the roster moved this Mac
+    /// from: kept.
     Kept(String),
     /// Another machine already answers to that name (which): the fleet name is left as it is.
     Taken(String),
@@ -607,9 +607,10 @@ pub fn fleet_name_for(wanted: &str, earlier: &dyn Fn(&str) -> bool) -> Result<Fl
 }
 
 /// Make this account's fleet name follow `wanted` where [`fleet_name_for`] says it is due, by
-/// the one write `aterm fleet name set` makes, refused as it is for a name another registered
-/// machine holds. A name already in place, or one the person chose that is no swarm label the
-/// roster moved this Mac from, is left as it is.
+/// the one checked writer the naming publication writes its number through too
+/// ([`set_primary_name`]), refused as it is for a name another registered machine holds. A name
+/// already in place, or one the follow's record does not name that is no swarm label the roster
+/// moved this Mac from ([`FleetName::Kept`]), is left as it is.
 ///
 /// # Errors
 /// As [`fleet_name_for`], or the name is another machine's, it could not be written, or `current`
@@ -802,8 +803,8 @@ impl Opts {
 
 const NO_CODE_ARGUMENT: &str = "the join code is never an argument: every process on this \
      machine can read a command line (`ps`) and the shell's history keeps it. Pipe it in \
-     (`aterm fleet join < code-file`), name its file (`--code-file F`), or run `aterm fleet \
-     join` at a terminal and type it there (it is not shown)";
+     (`aterm fleet join < code-file`) or name its file (`--code-file F`); given neither, a join \
+     is the default ALab fleet's sync from the vault";
 
 fn carries_code(word: &str) -> bool {
     word.to_ascii_lowercase().contains(member::CODE_PREFIX)
@@ -918,29 +919,10 @@ fn parse_join(args: &[String]) -> Result<Opts, Failure> {
     )
 }
 
-/// Where [`read_code`] read the join code.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CodeFrom {
-    /// `--code-file`.
-    File,
-    /// Stdin, not a terminal: `aterm fleet join < code-file`, mostly.
-    Piped,
-    /// Typed at the terminal, unshown.
-    Typed,
-}
-
-impl CodeFrom {
-    const fn left_behind(self) -> &'static str {
-        match self {
-            Self::File | Self::Piped => {
-                "The join code is the fleet's secret: now that this machine has joined, delete \
-                 the file it came from and every copy of it (Downloads, a USB stick, a synced \
-                 folder).\n"
-            }
-            Self::Typed => "",
-        }
-    }
-}
+/// What a join by a code given says after its report: the code is the fleet's secret.
+const CODE_LEFT_BEHIND: &str = "The join code is the fleet's secret: now that this machine has \
+     joined, delete the file it came from and every copy of it (Downloads, a USB stick, a synced \
+     folder).\n";
 
 fn scrub_vec(mut bytes: Vec<u8>) {
     bytes.resize(bytes.capacity(), 0);
@@ -951,299 +933,152 @@ pub(crate) fn scrub_string(s: String) {
     scrub_vec(s.into_bytes());
 }
 
-fn read_code(code_file: Option<&Path>) -> Result<(String, CodeFrom), Failure> {
-    let mut text = String::new();
-    let read_result: Result<CodeFrom, Failure> = (|| {
-        if let Some(path) = code_file {
-            astream_sys::open_nonblocking(path, astream_sys::Links::Follow)
-                .and_then(|file| {
-                    let meta = file.metadata()?;
-                    if !meta.is_file() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "not a regular file",
-                        ));
-                    }
-                    text.reserve(
-                        usize::try_from(meta.len().min(CODE_READ_MAX))
-                            .unwrap_or(0)
-                            .saturating_add(1),
-                    );
-                    file.take(CODE_READ_MAX).read_to_string(&mut text)
-                })
-                .map_err(|e| failed(format!("the --code-file file: {e}")))?;
-            Ok(CodeFrom::File)
-        } else if !io::stdin().is_terminal() {
-            io::stdin()
-                .lock()
-                .take(CODE_READ_MAX)
-                .read_to_string(&mut text)
-                .map_err(|e| failed(format!("reading the code on stdin: {e}")))?;
-            Ok(CodeFrom::Piped)
-        } else {
-            text = read_unshown("Join code (not shown): ")
-                .map_err(|e| failed(format!("reading the code at the terminal: {e}")))?;
-            Ok(CodeFrom::Typed)
-        }
-    })();
-    let from = match read_result {
-        Ok(from) => from,
-        Err(err) => {
-            scrub_string(text);
-            return Err(err);
-        }
+/// A person's `aterm fleet join`: the fleet of the code given ([`given_code`]), else the default
+/// ALab fleet, joined as `aterm fleet sync --on` joins it ([`join_default`]).
+fn person_join(places: &Places, opts: &Opts) -> Result<String, Failure> {
+    let stdin = io::stdin();
+    let piped = carries(&stdin).then(|| stdin.lock());
+    let Some(code) = given_code(opts.code_file.as_deref(), piped)? else {
+        return join_default(places, opts);
     };
-    let picked = text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(|code| (code.to_owned(), from));
-    scrub_string(text);
-    picked.ok_or_else(|| failed("no join code came: pipe it in, or name its file with --code-file"))
+    let out = join(places, opts, &code).map(|report| report + CODE_LEFT_BEHIND);
+    scrub_string(code);
+    out
 }
 
-static UNSHOWN_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-static UNSHOWN_LFLAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Whether stdin carries input: a file, pipe or socket (`aterm fleet join < F`), not a terminal
+/// or another device (`/dev/null`, an agent's shell), nor a closed descriptor.
+fn carries(stdin: &io::Stdin) -> bool {
+    use std::os::fd::AsFd as _;
+    stdin
+        .as_fd()
+        .try_clone_to_owned()
+        .and_then(|fd| std::fs::File::from(fd).metadata())
+        .is_ok_and(|meta| carries_input(&meta))
+}
+
+/// [`carries`] for stdin's `meta`.
+fn carries_input(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+    let kind = meta.file_type();
+    kind.is_file() || kind.is_fifo() || kind.is_socket()
+}
+
+/// The join code given: the first non-blank line of `code_file`, else of `piped` (stdin, where it
+/// [`carries`] input); `None` where neither is given. A file or stdin with no code is refused,
+/// never read as no code given, so a code file that came out empty joins no other fleet.
+fn given_code(
+    code_file: Option<&Path>,
+    piped: Option<impl io::Read>,
+) -> Result<Option<String>, Failure> {
+    if let Some(path) = code_file {
+        let mut text = String::new();
+        let read = astream_sys::open_nonblocking(path, astream_sys::Links::Follow)
+            .and_then(|file| {
+                let meta = file.metadata()?;
+                if !meta.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "not a regular file",
+                    ));
+                }
+                text.reserve(
+                    usize::try_from(meta.len().min(CODE_READ_MAX))
+                        .unwrap_or(0)
+                        .saturating_add(1),
+                );
+                file.take(CODE_READ_MAX).read_to_string(&mut text)
+            })
+            .map_err(|e| failed(format!("the --code-file file: {e}")));
+        return first_line(text, read)?
+            .map(Some)
+            .ok_or_else(|| failed("the --code-file file holds no join code"));
+    }
+    let Some(piped) = piped else {
+        return Ok(None);
+    };
+    let mut text = String::new();
+    let read = piped
+        .take(CODE_READ_MAX)
+        .read_to_string(&mut text)
+        .map_err(|e| failed(format!("reading the code on stdin: {e}")));
+    first_line(text, read)?
+        .map(Some)
+        .ok_or_else(|| failed("stdin holds no join code"))
+}
+
+/// The first non-blank line of `text`, trimmed, once `read` filled it; `text` is scrubbed either
+/// way.
+fn first_line(text: String, read: Result<usize, Failure>) -> Result<Option<String>, Failure> {
+    let picked = read.map(|_| {
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_owned)
+    });
+    scrub_string(text);
+    picked
+}
+
+/// A person's join given no code: the default ALab fleet's sync, as `aterm fleet sync --on` makes
+/// it ([`sync_with`], the vault's code read by [`vault_code`]), listening at `--port`/`--host`.
+/// `--allow` and `--at` go with a code: the sync keeps the level set here and finds the fleet's
+/// members itself.
+fn join_default(places: &Places, opts: &Opts) -> Result<String, Failure> {
+    if opts.allow.is_some() || opts.at.is_some() {
+        return Err(Failure::Usage(
+            "--allow and --at go with a join code; given none, a join is the default fleet's \
+             sync (`aterm fleet allow` sets the level after)"
+                .to_owned(),
+        ));
+    }
+    let at = Opts {
+        port: opts.port,
+        host: opts.host.clone(),
+        ..Opts::default()
+    };
+    let synced = sync_with(places, true, || vault_code(Fetch::Sync), &at)?;
+    default_joined(synced, || {
+        aterm_secrets::client::Paths::live().map_err(failed)
+    })
+}
+
+/// What [`join_default`] says of its sync `synced`: where the vault gave no code, the
+/// `fleet-code` want is filed under `vault` and the failure names the request.
+fn default_joined(
+    synced: FleetSync,
+    vault: impl FnOnce() -> Result<aterm_secrets::client::Paths, Failure>,
+) -> Result<String, Failure> {
+    let why = match synced {
+        FleetSync::NoVault => "this Mac is in no vault",
+        FleetSync::NotAlab => "this Mac's vault is not ALab's",
+        FleetSync::NoCode => "this Mac's copy of the ALab vault holds no fleet code",
+        FleetSync::Blocked(_) => return Err(failed(synced.report())),
+        synced => return Ok(synced.report()),
+    };
+    Err(failed(file_fleet_code(&vault()?, why)))
+}
+
+/// `why` no default fleet code was read, with the `fleet-code` want filed under `paths`.
+fn file_fleet_code(paths: &aterm_secrets::client::Paths, why: &str) -> String {
+    use aterm_secrets::need::{Purpose, Want};
+    let want = Want::FleetCode;
+    let key = want.key();
+    match aterm_secrets::need::raise(paths, want, Purpose::FleetJoin) {
+        Ok(need) => format!(
+            "no join code given and {why}: filed {key} (request {}); another fleet's code goes \
+             on stdin or --code-file",
+            aterm_codec::hex::encode_lower(&need.id)
+        ),
+        Err(e) => format!("no join code given and {why}; {key} was not filed: {e}"),
+    }
+}
 
 fn after_now(d: Duration) -> Instant {
     let now = Instant::now();
     now.checked_add(d)
         .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365))
 }
-
-/// Puts the unshown terminal's local flags back as they were before it read (from a signal
-/// handler: async-signal-safe calls only).
-fn put_back_unshown() {
-    let fd = UNSHOWN_FD.load(std::sync::atomic::Ordering::SeqCst);
-    if fd >= 0 {
-        // SAFETY: `termios` is plain C data, and `fd` is the open `/dev/tty` held by an
-        // `Unshown` while `UNSHOWN_FD >= 0`; both `tcgetattr` and `tcsetattr` are POSIX
-        // async-signal-safe.
-        unsafe {
-            let mut term: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(fd, &mut term) == 0 {
-                #[allow(clippy::cast_possible_truncation, clippy::unnecessary_cast)]
-                {
-                    term.c_lflag =
-                        UNSHOWN_LFLAG.load(std::sync::atomic::Ordering::SeqCst) as libc::tcflag_t;
-                }
-                libc::tcsetattr(fd, libc::TCSAFLUSH, &term);
-            }
-        }
-    }
-}
-
-extern "C" fn restore_and_end(signal: libc::c_int) {
-    put_back_unshown();
-    // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no
-    // flags).
-    let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
-    default.sa_sigaction = libc::SIG_DFL;
-    // SAFETY: The default disposition, for the signal this handler took.
-    unsafe {
-        libc::sigaction(signal, &default, std::ptr::null_mut());
-    }
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "SIGINT, no core signal: the person's Ctrl-C ends the process as it would have"
-    )]
-    // SAFETY: `raise` is async-signal-safe; the disposition is the default.
-    unsafe {
-        libc::raise(signal);
-    }
-}
-
-/// SIGINT's handler while [`read_unshown_secret`] reads: the terminal's settings put back, as
-/// [`restore_and_end`] puts them, and the interruption noted ([`UNSHOWN_INTERRUPTED`]) for the
-/// read to see within a tick, so its caller ends what it runs before it exits.
-extern "C" fn restore_and_note(_signal: libc::c_int) {
-    put_back_unshown();
-    UNSHOWN_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Whether SIGINT came while [`read_unshown_secret`] read.
-static UNSHOWN_INTERRUPTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// The controlling terminal, opened with nothing echoed but a newline: its settings, and the
-/// SIGINT disposition it replaced, put back when it drops.
-struct Unshown {
-    tty: std::fs::File,
-    fd: i32,
-    saved: libc::termios,
-    claimed: bool,
-    interrupt: Option<libc::sigaction>,
-}
-
-impl Drop for Unshown {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        // SAFETY: `fd` is the open /dev/tty `tty` holds for the guard's whole life, and `saved`
-        // a termios `tcgetattr` filled.
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved);
-        }
-        if let Some(was) = &self.interrupt {
-            // SAFETY: Puts back the disposition `Unshown::open` replaced.
-            unsafe {
-                libc::sigaction(libc::SIGINT, was, std::ptr::null_mut());
-            }
-        }
-        if self.claimed {
-            UNSHOWN_FD.store(-1, Ordering::SeqCst);
-        }
-    }
-}
-
-impl Unshown {
-    /// Opens `/dev/tty`, turns its echo off (all but a newline's), sets `on_interrupt` as
-    /// SIGINT's handler where no other unshown read holds the terminal, and writes `prompt`.
-    fn open(prompt: &str, on_interrupt: extern "C" fn(libc::c_int)) -> io::Result<Self> {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        use std::sync::atomic::Ordering;
-        let tty = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open("/dev/tty")?;
-        let fd = tty.as_raw_fd();
-        // SAFETY: an all-zero termios is a valid value of the plain C struct, and `tcgetattr`
-        // overwrites it before it is read.
-        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-        // SAFETY: `fd` is open, and `saved` is a writable termios.
-        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        #[allow(clippy::unnecessary_cast)]
-        let saved_lflag = saved.c_lflag as u64;
-        let claimed = UNSHOWN_FD
-            .compare_exchange(-1, -2, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok();
-        if claimed {
-            UNSHOWN_LFLAG.store(saved_lflag, Ordering::SeqCst);
-            UNSHOWN_FD.store(fd, Ordering::SeqCst);
-        }
-        let interrupt = claimed
-            .then(|| {
-                // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an
-                // empty mask, no flags).
-                let mut handling: libc::sigaction = unsafe { std::mem::zeroed() };
-                handling.sa_sigaction = on_interrupt as libc::sighandler_t;
-                // SAFETY: As above.
-                let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
-                // SAFETY: A valid disposition for SIGINT; `was` receives the one it replaces.
-                (unsafe { libc::sigaction(libc::SIGINT, &handling, &mut was) } == 0).then_some(was)
-            })
-            .flatten();
-        let mut quiet = saved;
-        quiet.c_lflag &= !libc::ECHO;
-        quiet.c_lflag |= libc::ECHONL;
-        let mut unshown = Self {
-            tty,
-            fd,
-            saved,
-            claimed,
-            interrupt,
-        };
-        // SAFETY: `fd` is open, and `quiet` is a termios `tcgetattr` filled, then edited.
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        unshown.tty.write_all(prompt.as_bytes())?;
-        unshown.tty.flush()?;
-        Ok(unshown)
-    }
-}
-
-/// One line typed at the controlling terminal after `prompt`, with nothing echoed but its newline
-/// while it reads, the terminal's settings (and SIGINT's disposition) put back however the
-/// program leaves; the line keeps its newline. A join code's prompt, and `aterm members join`'s
-/// phrase prompt.
-pub(crate) fn read_unshown(prompt: &str) -> io::Result<String> {
-    let mut unshown = Unshown::open(prompt, restore_and_end)?;
-    let mut raw = Vec::with_capacity(128);
-    let mut byte = [0u8; 1];
-    while (raw.len() as u64) < CODE_READ_MAX {
-        match unshown.tty.read(&mut byte) {
-            Ok(0) => break,
-            Ok(_) => {
-                raw.push(byte[0]);
-                byte[0] = 0;
-                if raw.last() == Some(&b'\n') {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                scrub_vec(raw);
-                return Err(e);
-            }
-        }
-    }
-    drop(unshown);
-    String::from_utf8(raw).map_err(|bad| {
-        scrub_vec(bad.into_bytes());
-        io::Error::new(io::ErrorKind::InvalidData, "join code is not valid UTF-8")
-    })
-}
-
-/// [`read_unshown`] for a secret the caller hands on (the code a browser shows to paste into a
-/// Claude Code setup-token): the line, without its newline, in a buffer that is wiped when it
-/// drops and was made at its full size first, so no growth leaves a copy behind; `Ok(None)` once
-/// `cancelled` is set (the caller got its answer another way), looked at every
-/// [`UNSHOWN_TICK`] while no line is typed. Ctrl-C does not end the process: the terminal's settings are put back and
-/// the read returns `Interrupted` within a tick, so the caller ends what it runs and exits.
-///
-/// # Errors
-/// `/dev/tty` cannot be opened or set; a read fails; `Interrupted` at Ctrl-C.
-pub(crate) fn read_unshown_secret(
-    prompt: &str,
-    cancelled: &std::sync::atomic::AtomicBool,
-) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
-    use std::os::fd::AsRawFd as _;
-    use std::sync::atomic::Ordering;
-    UNSHOWN_INTERRUPTED.store(false, Ordering::SeqCst);
-    let mut unshown = Unshown::open(prompt, restore_and_note)?;
-    // macOS's poll(2) refuses a terminal device, so the read is made nonblocking on this open of
-    // `/dev/tty` alone (its own file description) and tried once a tick.
-    let fd = unshown.tty.as_raw_fd();
-    // SAFETY: `fd` is the open /dev/tty `unshown` holds; F_GETFL and F_SETFL take and give flags.
-    let nonblocking = unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
-    };
-    if !nonblocking {
-        return Err(io::Error::last_os_error());
-    }
-    let cap = usize::try_from(CODE_READ_MAX).unwrap_or(4096);
-    let mut line = zeroize::Zeroizing::new(Vec::with_capacity(cap));
-    let mut byte = zeroize::Zeroizing::new([0u8; 1]);
-    loop {
-        if UNSHOWN_INTERRUPTED.load(Ordering::SeqCst) {
-            return Err(io::Error::from(io::ErrorKind::Interrupted));
-        }
-        if cancelled.load(Ordering::SeqCst) {
-            return Ok(None);
-        }
-        match unshown.tty.read(&mut byte[..]) {
-            Ok(0) => break,
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) if line.len() < cap => line.push(byte[0]),
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(UNSHOWN_TICK),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-    Ok(Some(line))
-}
-
-/// How often [`read_unshown_secret`] looks at whether it was cancelled or interrupted.
-const UNSHOWN_TICK: Duration = Duration::from_millis(100);
 
 fn short(node: &str) -> &str {
     node.get(..8).unwrap_or(node)
@@ -1991,6 +1826,45 @@ fn prove_discovery_address_within(
     let node = member::node_principal(proof.key);
     (members.admits(&proof.key) && proof.node == node && advertised == node)
         .then_some((node, reached.addr))
+}
+
+/// Prove a route advertised by either fleet protocol. A v1 advert carries no identity, so its
+/// TLS node and key must match both the current membership log and an existing book binding.
+/// V2 keeps its canonical-principal and TXT checks. Neither path grants access or changes a book.
+#[must_use]
+pub fn prove_fleet_route(
+    hint: &aterm_secrets::discover::Advert,
+    (secret, me): (&FleetSecret, Option<&NodeIdentity>),
+    (members, bindings): (&member::MemberKeys, &member::Keyring),
+    within: Duration,
+) -> Option<(String, SocketAddr)> {
+    if hint.mesh_node().is_some() {
+        return prove_discovery_address_within(hint, secret, me, members, within);
+    }
+    let one = |name: &str| {
+        let mut values = hint.txt.iter().filter(|(key, _)| key == name);
+        let value = values.next()?.1.as_str();
+        values.next().is_none().then_some(value)
+    };
+    if one("v") != Some("1")
+        || hint.port == 0
+        || one("fleet").and_then(|port| port.parse::<u16>().ok()) != Some(hint.port)
+        || hint.txt.iter().any(|(key, _)| key == "id")
+    {
+        return None;
+    }
+    let reached = member::dial(
+        &hint.host,
+        None,
+        hint.port,
+        (secret, me),
+        FleetOp::Survey,
+        within,
+    )
+    .ok()?;
+    let proof = reached.peer.as_ref()?;
+    (members.admits(&proof.key) && bindings.bound(&proof.node) == Some(proof.key))
+        .then(|| (proof.node.clone(), reached.addr))
 }
 
 #[cfg(test)]
@@ -3501,6 +3375,9 @@ fn register_at(
 fn peers(places: &Places, args: &[String]) -> Result<String, Failure> {
     match args {
         [] => narrowing(places, || list_peers(places, peer_read_within())),
+        [flag] if flag == "--details" => {
+            narrowing(places, || list_peers_details(places, peer_read_within()))
+        }
         [flag, secs] if flag.as_str() == "--timeout" => {
             let within = check_within(secs)?;
             narrowing(places, || list_peers(places, within))
@@ -4345,13 +4222,14 @@ fn check_peers(places: &Places, within: Duration) -> Result<Listing, Failure> {
                     .spawn_scoped(scope, || {
                         own_listener(&table, (&secret, me.as_ref()), within)
                     });
-                let read = member::read_whole(
+                let read = member::read_whole_routes(
                     &peers,
                     &keys,
                     own.as_deref(),
                     (&secret, me.as_ref()),
                     within,
                     "survey facts",
+                    &crate::node_service::mesh_addresses(&places.state),
                 );
                 let listener = match probe {
                     Ok(probe) => probe.join().ok().flatten(),
@@ -4990,7 +4868,7 @@ pub fn fleet_node() -> Option<String> {
 }
 
 /// Vault paths associated with `places` ([`crate::fleet_vault::vault_paths_for`] of its state
-/// directory): a scratch test root holding `.secrets/` or its vault config directory, or the live
+/// directory): a scratch test root holding its vault config directory, or the live
 /// home when `places.state` is the live account's state directory.
 fn vault_paths_for(places: &Places) -> Option<aterm_secrets::client::Paths> {
     crate::fleet_vault::vault_paths_for(&places.state)
@@ -5157,8 +5035,8 @@ fn peer_is_denied_or_held_out(
 }
 
 /// How long a verb that names Macs by their swarm labels and names no deadline of its own (`allow
-/// drive`, `name set`, the fleet name's follow) waits out a vault writer that holds this Mac's
-/// state lock before it reads the roster ([`hold_roster`]).
+/// drive`, the fleet name the naming publication writes, the fleet name's follow) waits out a
+/// vault writer that holds this Mac's state lock before it reads the roster ([`hold_roster`]).
 const ROSTER_WAIT: Duration = Duration::from_secs(60);
 
 thread_local! {
@@ -5682,11 +5560,16 @@ fn shown_name(peer: &Peer) -> String {
     if let Some(name) = peer.primary_name() {
         return name.to_owned();
     }
-    if peer.port == member::default_port() {
-        peer.host.clone()
-    } else {
-        member::host_port(&peer.host, peer.port)
-    }
+    peer.node
+        .as_deref()
+        .map(member::temporary_name)
+        .unwrap_or_else(|| {
+            if peer.port == member::default_port() {
+                peer.host.clone()
+            } else {
+                member::host_port(&peer.host, peer.port)
+            }
+        })
 }
 
 /// This Mac's network place for `fleet peers` ([`list_peers_at`]); none in a unit test (its
@@ -5714,6 +5597,18 @@ fn list_peers(places: &Places, within: Duration) -> Result<String, Failure> {
     )
 }
 
+fn list_peers_details(places: &Places, within: Duration) -> Result<String, Failure> {
+    let listing = check_peers(places, within)?;
+    format_peer_listing_details(
+        places,
+        within,
+        listing,
+        place_now(places).as_ref(),
+        &aterm_netplace::words::Words::now(),
+        true,
+    )
+}
+
 /// `fleet peers` with this Mac's network place `place` said under its first line
 /// (`aterm_netplace::words::header`); with no member reached and some dialled while on another
 /// network, why (`words::why_away`).
@@ -5735,6 +5630,17 @@ fn format_peer_listing(
     place: Option<&aterm_netplace::Place>,
     words: &aterm_netplace::words::Words<'_>,
 ) -> Result<String, Failure> {
+    format_peer_listing_details(places, within, listing, place, words, false)
+}
+
+fn format_peer_listing_details(
+    places: &Places,
+    within: Duration,
+    listing: Listing,
+    place: Option<&aterm_netplace::Place>,
+    words: &aterm_netplace::words::Words<'_>,
+    details: bool,
+) -> Result<String, Failure> {
     let table = &listing.table;
     let own = own_node(places);
     let mut out = format!(
@@ -5743,7 +5649,18 @@ fn format_peer_listing(
         match (&listing.unchecked, &table.listen) {
             (Some(why), _) => format!(" — not checked: {why}"),
             (None, Some(listen)) => {
-                listens_words(places, &listing, (listen, within), own.as_deref())
+                if details {
+                    listens_words(places, &listing, (listen, within), own.as_deref())
+                } else {
+                    match &listing.listener {
+                        Some(Ok(_)) => " (this Mac's fleet listener answered)".to_owned(),
+                        Some(Err(why)) => {
+                            format!(" (this Mac's fleet listener: {})", why.guidance())
+                        }
+                        None if listen.parse::<SocketAddr>().is_err() => " (this Mac's fleet listener configuration is invalid; run `aterm fleet sync` here)".to_owned(),
+                        None => " (this Mac's fleet listener was not checked; run `aterm node status` here)".to_owned(),
+                    }
+                }
             }
             (None, None) => " (it has no [fleet] listen: no peer can read it)".to_owned(),
         }
@@ -5811,18 +5728,14 @@ fn format_peer_listing(
         })
         .collect();
     let wide = heads.iter().map(|head| head.len()).fold(8, usize::max);
+    let endpoints = if details {
+        format!("{:<23}  {:<21}  ", "HOST", "ADDRESS")
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "  {:<wide$}  {:<11}  {:<23}  {:<21}  {:<15}  {:<15}  {:<14}  {:<7}  {:<8}  {:<37}  CHECK\n",
-        "NODE",
-        "VIA",
-        "HOST",
-        "ADDRESS",
-        "NODE VERSION",
-        "WINDOW VERSION",
-        "UPDATE",
-        "JOINED",
-        "KEY",
-        "NAME"
+        "  {:<wide$}  {:<11}  {endpoints}{:<15}  {:<15}  {:<14}  {:<7}  {:<8}  {:<37}  CHECK\n",
+        "NODE", "VIA", "NODE VERSION", "WINDOW VERSION", "UPDATE", "JOINED", "KEY", "NAME"
     ));
     // Each answering peer's updater that is not routine, by its head: one line each after the
     // table (`updater_words`).
@@ -5844,7 +5757,7 @@ fn format_peer_listing(
                 if let Some(update) = checked.update.as_ref().filter(|update| !update.routine()) {
                     updaters.push(((*head).to_owned(), update.clone()));
                 }
-                match (&peer.node, &checked.node) {
+                let answer = match (&peer.node, &checked.node) {
                     (None, Some(node)) => format!(
                         "ok, serves {} (node {}{})",
                         checked.scope.word(),
@@ -5852,6 +5765,11 @@ fn format_peer_listing(
                         if checked.proven { ", proven" } else { "" }
                     ),
                     _ => format!("ok, serves {}", checked.scope.word()),
+                };
+                if details {
+                    format!("{answer}; connected at {}", checked.addr)
+                } else {
+                    answer
                 }
             }
             Some(Err(why)) => {
@@ -5876,14 +5794,23 @@ fn format_peer_listing(
                     aterm_netplace::words::GONE_FROM_THE_LINK.to_owned()
                 } else {
                     aterm_codec::tty::one_line(
-                        &unreached_words(peer, why, &listed, (own.as_deref(), minted)),
-                        200,
+                        &if details {
+                            unreached_words(peer, why, &listed, (own.as_deref(), minted))
+                        } else {
+                            why.guidance().to_owned()
+                        },
+                        400,
                     )
                 }
             }
         };
+        let endpoints = if details {
+            format!("{:<23}  {:<21}  ", column(&peer.host, 23), peer.target())
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "  {head:<wide$}  {:<11}  {:<23}  {:<21}  {:<15}  {:<15}  {:<14}  {:<7}  {:<8}  {:<37}  {check}\n",
+            "  {head:<wide$}  {:<11}  {endpoints}{:<15}  {:<15}  {:<14}  {:<7}  {:<8}  {:<37}  {check}\n",
             if row.configured.is_some() {
                 "config"
             } else if peer.is_dormant_at(now_ms) {
@@ -5891,8 +5818,6 @@ fn format_peer_listing(
             } else {
                 peer.via.word()
             },
-            column(&peer.host, 23),
-            peer.target(),
             peer.version.as_deref().unwrap_or("-"),
             window_version(row.check.as_ref()),
             update_word(row.check.as_ref()),
@@ -5941,6 +5866,9 @@ fn format_peer_listing(
         );
     }
     out.push_str(&void_grants(places).unwrap_or_default());
+    if !details {
+        out.push_str("Connection details: `aterm fleet peers --details`\n");
+    }
     Ok(out)
 }
 
@@ -6254,7 +6182,7 @@ fn unreached_words(
         };
     }
     let Unreached::OtherNode { at, said, want } = why else {
-        return why.to_string();
+        return format!("{why} ({why:?})");
     };
     // Each named by a head no other node the book, nor this machine, has.
     let known: Vec<&str> = listed
@@ -8804,13 +8732,14 @@ fn held_elsewhere(places: &Places) -> HeldElsewhere {
     };
     let book: Vec<Peer> = known.peers.into_iter().map(|(peer, _)| peer).collect();
     raise_open_files();
-    let (reads, book_read) = member::read_whole(
+    let (reads, book_read) = member::read_whole_routes(
         &book,
         &known.keys,
         Some(&own),
         (&secret, own_identity(places).as_ref()),
         peer_read_within(),
         "survey facts",
+        &crate::node_service::mesh_addresses(&places.state),
     );
     let mut found = HeldElsewhere {
         book: match book_read {
@@ -8837,7 +8766,7 @@ fn held_elsewhere(places: &Places) -> HeldElsewhere {
             Err(why) => {
                 found
                     .unread
-                    .push((name(), aterm_codec::tty::one_line(&why.to_string(), 160)));
+                    .push((name(), aterm_codec::tty::one_line(why.guidance(), 400)));
                 continue;
             }
         };
@@ -8855,9 +8784,8 @@ fn held_elsewhere(places: &Places) -> HeldElsewhere {
             };
             // A peer's sid is printed only when it is one, as `survey` prints it.
             if field("held_from").is_some_and(|node| node.eq_ignore_ascii_case(&own))
-                && let Some(sid) = field("sid").filter(|sid| {
-                    sid.len() <= 64 && aterm_types::control_request::Sid::parse(sid).is_some()
-                })
+                && let Some(sid) =
+                    field("sid").filter(|sid| aterm_types::control_verbs::is_minted_sid(sid))
                 && !held.iter().any(|(_, seen)| seen == sid)
             {
                 held.push((name(), sid.to_owned()));
@@ -9056,20 +8984,20 @@ fn drive_fleet_proven_in(
     }
     let named = |word: &str, unread: Option<&Missed>| -> Result<_, aterm_ctl::DriveRefused> {
         let known = known_peers(places).map_err(failure_words)?;
-        let book: Vec<Peer> = known.peers.into_iter().map(|(peer, _)| peer).collect();
         let bound = bound_peer(places, word, unread).map_err(failure_words)?;
-        Ok((known.keys, book, bound))
+        Ok((known.keys, bound))
     };
-    let (mut keys, mut book, mut bound) = named(&word, unread.as_ref()).map_err(|refused| {
-        match silent_issuer(places, &word, unread.as_ref()) {
-            Some(missed) => aterm_ctl::DriveRefused {
-                again: true,
-                unserved: missed.unserved,
-                ..refused
-            },
-            None => refused,
-        }
-    })?;
+    let (mut keys, mut bound) =
+        named(&word, unread.as_ref()).map_err(|refused| {
+            match silent_issuer(places, &word, unread.as_ref()) {
+                Some(missed) => aterm_ctl::DriveRefused {
+                    again: true,
+                    unserved: missed.unserved,
+                    ..refused
+                },
+                None => refused,
+            }
+        })?;
     if matches!(bound, Bound::Nobody) {
         if let Some(own) = at_own_place(places, &word) {
             return Err(format!(
@@ -9087,7 +9015,7 @@ fn drive_fleet_proven_in(
                     if let Some(own) = this_machine_alone(places, &word, None)? {
                         return Err(itself(&own));
                     }
-                    (keys, book, bound) = named(&word, None)?;
+                    (keys, bound) = named(&word, None)?;
                 }
                 Ok(false) => {}
                 Err(why) => unread = Some(why),
@@ -9175,27 +9103,14 @@ fn drive_fleet_proven_in(
         }
     }
     let label = shown_name(&peer);
-    let driven =
-        member::drive(&target_of(&peer), &keys, (&secret, &me), deadline).map_err(|why| {
-            let said = unreached_words(&peer, &why, &book, (Some(me.node()), code_minted(places)));
-            aterm_ctl::DriveRefused {
-                again: drive_again(&why),
-                left: None,
-                unserved: unserved(&why),
-                silent: drive_silent(&why),
-                ungranted: matches!(
-                    &why,
-                    Unreached::Handshake(_, FleetError::UnknownOp(op))
-                        if op == FleetOp::Drive.word()
-                ),
-                // The peer is named once: a reason that names its host already goes alone.
-                why: if said.contains(&peer.host) {
-                    said
-                } else {
-                    format!("{label}: {said}")
-                },
-            }
-        })?;
+    let target = target_of(&peer);
+    let routes: Vec<_> = crate::node_service::mesh_addresses(&places.state)
+        .into_iter()
+        .filter(|(node, _)| peer.node.as_deref() == Some(node.as_str()))
+        .map(|(_, at)| at)
+        .collect();
+    let driven = member::drive_routes(&target, &keys, (&secret, &me), deadline, &routes)
+        .map_err(|why| drive_unreached(&label, &why))?;
     if !traffic.current() {
         return Err(aterm_ctl::DriveRefused::once(
             FLEET_IDENTITY_CHANGED.to_owned(),
@@ -9219,12 +9134,30 @@ fn drive_fleet_proven_in(
     ))
 }
 
+/// A drive's failed dial, named and flagged for its caller. Technical routes stay in `peers
+/// --details`, including for a requester retry.
+fn drive_unreached(label: &str, why: &Unreached) -> aterm_ctl::DriveRefused {
+    aterm_ctl::DriveRefused {
+        again: drive_again(why),
+        left: None,
+        unserved: unserved(why),
+        silent: drive_silent(why),
+        ungranted: matches!(
+            why,
+            Unreached::Handshake(_, FleetError::UnknownOp(op))
+                if op == FleetOp::Drive.word()
+        ),
+        why: format!("{label}: {}", why.guidance()),
+    }
+}
+
 /// A drive's stream that sends its first line, naming the requester, in the same write as the
 /// first request (or before the first read). One write keeps a refusing Mac's answer readable:
 /// a Mac that refuses the drive answers and closes at once, and a second write landing on the
 /// closed connection draws a reset that can discard the answer before it is read.
 struct Introduced<S> {
     inner: S,
+    /// The requester line, until it is sent.
     first: Option<Vec<u8>>,
 }
 
@@ -9236,34 +9169,35 @@ impl<S: std::io::Write> Introduced<S> {
         }
     }
 
-    fn introduce(&mut self, then: &[u8]) -> std::io::Result<()> {
-        if let Some(mut first) = self.first.take() {
-            first.extend_from_slice(then);
-            self.inner.write_all(&first)?;
-            self.inner.flush()?;
-        }
-        Ok(())
+    /// Send the requester line, where it is unsent, with `then` in the same write.
+    fn send_first(&mut self, then: &[u8]) -> std::io::Result<bool> {
+        let Some(mut out) = self.first.take() else {
+            return Ok(false);
+        };
+        out.extend_from_slice(then);
+        self.inner.write_all(&out)?;
+        self.inner.flush()?;
+        Ok(true)
     }
 }
 
 impl<S: std::io::Write> std::io::Write for Introduced<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.first.is_some() {
-            self.introduce(buf)?;
+        if self.send_first(buf)? {
             return Ok(buf.len());
         }
         self.inner.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.introduce(&[])?;
+        self.send_first(&[])?;
         self.inner.flush()
     }
 }
 
 impl<S: std::io::Read + std::io::Write> std::io::Read for Introduced<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.introduce(&[])?;
+        self.send_first(&[])?;
         self.inner.read(buf)
     }
 }
@@ -9521,7 +9455,6 @@ fn survey_fleet_read_in(
             .ok_or_else(|| FLEET_IDENTITY_CHANGED.to_owned())?;
     let secret = aterm_net::fleet::read_key_file(&places.state).map_err(|e| no_key(places, &e))?;
     let known = known_peers(places).map_err(failure_words)?;
-    let mut book: Vec<Peer> = known.peers.into_iter().map(|(peer, _)| peer).collect();
     let me = own_identity(places);
     if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
         return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
@@ -9566,7 +9499,6 @@ fn survey_fleet_read_in(
         if read {
             let known = known_peers(places).map_err(failure_words)?;
             keys = known.keys;
-            book = known.peers.into_iter().map(|(peer, _)| peer).collect();
         }
         let mut bound = bound_peer(places, &word, missed.as_ref()).map_err(|refused| {
             aterm_ctl::FleetRefused {
@@ -9587,7 +9519,6 @@ fn survey_fleet_read_in(
                     Ok(true) => {
                         let known = known_peers(places).map_err(failure_words)?;
                         keys = known.keys;
-                        book = known.peers.into_iter().map(|(peer, _)| peer).collect();
                         word = host_word(places, what, None, deadline.0)?;
                         if let Some(own) = this_machine_alone(places, &word, None)? {
                             return Err(itself(&own).into());
@@ -9631,27 +9562,24 @@ fn survey_fleet_read_in(
         if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
             return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
         }
-        let read = member::survey_one_by(
+        let routes: Vec<_> = crate::node_service::mesh_addresses(&places.state)
+            .into_iter()
+            .filter(|(node, _)| peer.node.as_deref() == Some(node.as_str()))
+            .map(|(_, at)| at)
+            .collect();
+        let read = member::survey_one_routes(
             &target_of(&peer),
             keys,
             (&secret, me.as_ref()),
             deadline,
             query,
+            &routes,
         );
         if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
             return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
         }
         // One dial alone: no other member's answer can say a no-route is its own.
-        let mut row = peer_survey(
-            &peer,
-            read,
-            (
-                &book,
-                me.as_ref().map(NodeIdentity::node),
-                code_minted(places),
-            ),
-            false,
-        );
+        let mut row = peer_survey(&peer, read, false);
         // The word was dialled as a host only because no book here could say what it is: the row
         // keeps what that dial found whole, led by the issuer's silence where the row has room,
         // and the note says the rest.
@@ -9687,6 +9615,7 @@ fn survey_fleet_read_in(
         });
     }
     // A book that lists no peer is read by no dial: say why, as `peers` does.
+    let book: Vec<Peer> = known.peers.into_iter().map(|(peer, _)| peer).collect();
     let alone = (book.is_empty() && known.skipped.is_empty()).then(|| {
         format!(
             "survey --fleet read no other machine: {}",
@@ -9698,13 +9627,14 @@ fn survey_fleet_read_in(
     if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
         return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
     }
-    let (reads, book_read) = member::read_whole(
+    let (reads, book_read) = member::read_whole_routes(
         &book,
         &known.keys,
         own.as_deref(),
         (&secret, me.as_ref()),
         ask.within,
         query,
+        &crate::node_service::mesh_addresses(&places.state),
     );
     if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
         return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
@@ -9744,12 +9674,7 @@ fn survey_fleet_read_in(
             let gone = read
                 .as_ref()
                 .is_err_and(|why| gone_off_the_link(why, place.as_ref(), on_link.as_ref()));
-            Some(peer_survey(
-                peer,
-                read,
-                (&entries, own.as_deref(), code_minted(places)),
-                gone,
-            ))
+            Some(peer_survey(peer, read, gone))
         })
         .collect();
     peers.extend(
@@ -9880,7 +9805,6 @@ fn once_per_node(
 fn peer_survey(
     peer: &Peer,
     read: Result<member::Surveyed, Unreached>,
-    (listed, own, minted): (&[Peer], Option<&str>, Option<u64>),
     gone: bool,
 ) -> aterm_ctl::PeerSurvey {
     let name = shown_name(peer);
@@ -9895,12 +9819,7 @@ fn peer_survey(
                     key: *read.key?.bytes(),
                 })
             }),
-        label: match &read {
-            Ok(surveyed) if surveyed.addr.ip().to_string() != peer.host => {
-                format!("{name} at {}", surveyed.addr.ip())
-            }
-            _ => name,
-        },
+        label: name,
         node: peer.node.clone(),
         addr: match &read {
             Ok(surveyed) => Some(surveyed.addr.ip().to_string()),
@@ -9919,7 +9838,7 @@ fn peer_survey(
             if gone {
                 aterm_netplace::words::GONE_FROM_THE_LINK.to_owned()
             } else {
-                unreached_words(peer, &e, listed, (own, minted))
+                e.guidance().to_owned()
             }
         }),
     }

@@ -319,6 +319,19 @@ pub(super) fn require_soft_limit(request: u64, floor: RawFd) {
 /// The binary translator this process runs under ([`crate::process::translator`]).
 pub(crate) use crate::process::translator;
 
+/// Shared-memory conformance needs a native child: translation runs it in a copy. Keep this
+/// outside staged launches so unavailable evidence reaches the Linux lane without a panic.
+#[cfg(target_os = "linux")]
+pub(super) fn native_shared_child_applicable(test: &str) -> bool {
+    if let Some(translator) = translator() {
+        println!(
+            "NOT RUN under {translator}: {test}: requires a genuinely shared CLONE_VM child; the translator runs it in a copy, so a native CPU must decide this case"
+        );
+        return false;
+    }
+    true
+}
+
 /// Explanation printed when skipping `std` spawn comparisons under Rosetta on Linux.
 pub(super) const STD_SPAWN_MUTE: &str = "std's answer comes from glibc's posix_spawn, whose \
     child reports a failed exec or chdir through memory it shares with its parent \
@@ -1031,9 +1044,10 @@ fn a_key_named_twice_is_its_last_value_for_the_search_and_the_child_alike() {
 fn the_search_passes_over_what_it_may_not_run_and_a_script_without_a_shebang_runs() {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("spawnfd-execvp-{}", std::process::id()));
-    let (denied, script) = (dir.join("denied"), dir.join("script"));
+    let (denied, script, empty) = (dir.join("denied"), dir.join("script"), dir.join("empty"));
     std::fs::create_dir_all(&denied).expect("scratch dir");
     std::fs::create_dir_all(&script).expect("scratch dir");
+    std::fs::create_dir_all(&empty).expect("scratch dir");
     std::fs::write(denied.join("tool"), b"#!/bin/sh\nexit 9\n").expect("write");
     std::fs::set_permissions(denied.join("tool"), std::fs::Permissions::from_mode(0o474))
         .expect("chmod");
@@ -1056,9 +1070,12 @@ fn the_search_passes_over_what_it_may_not_run_and_a_script_without_a_shebang_run
     let status = spawned.map(|mut child| child.wait().expect("wait"));
 
     let (a, b) = lanes();
-    let mut alone = LaneCommand::new("tool");
-    alone.env_exactly([("PATH", denied.as_os_str())]);
-    let refused = spawn_with_two_fds(alone, a, b);
+    let mut unfound = LaneCommand::new("tool");
+    unfound.env_exactly([(
+        "PATH",
+        format!("{}:{}", denied.display(), empty.display()).as_str(),
+    )]);
+    let refused = spawn_with_two_fds(unfound, a, b);
     let _ = std::fs::remove_dir_all(&dir);
 
     let status = status.expect("the denied candidate is passed over, the script spawned");
@@ -1071,7 +1088,8 @@ fn the_search_passes_over_what_it_may_not_run_and_a_script_without_a_shebang_run
     assert_eq!(
         refused.as_ref().map_err(io::Error::raw_os_error).err(),
         Some(Some(EACCES)),
-        "alone, the candidate it may not run is EACCES: {refused:?}"
+        "with no candidate after it that runs, the one it may not run is EACCES, as execvp's \
+         walk answers, not the last candidate's ENOENT: {refused:?}"
     );
 }
 

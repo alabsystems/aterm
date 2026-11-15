@@ -364,6 +364,17 @@ if /bin/cat "$PREPARED_DENIED" >/dev/null 2>&1; then printf 'EXTERNAL=read\n'; e
         .current_dir(fixture.root.path())
         .env("ATERM_PREPARED_PARENT_ONLY", "parent-only")
         .env("OPENAI_API_KEY", "parent-only");
+    let qualified =
+        aterm_uds::deadline::output_within(&mut command, aterm_uds::deadline::FIRST_EXEC_HANG)
+            .expect("the prepared fixture's first execution completes");
+    assert!(qualified.status.success(), "{qualified:?}");
+    let marker = format!("PREPARED_EXTRA={literal}");
+    assert!(
+        String::from_utf8_lossy(&qualified.stdout)
+            .lines()
+            .any(|line| line == marker),
+        "the prepared fixture proves its body ran: {qualified:?}"
+    );
     let out =
         aterm_uds::deadline::output_until(&mut command, Instant::now() + Duration::from_secs(60))
             .unwrap();

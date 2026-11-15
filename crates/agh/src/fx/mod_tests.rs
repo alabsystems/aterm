@@ -330,19 +330,6 @@ fn a_shaped_fact_discards_the_recording() {
     assert!(!path.exists(), "the tape is removed");
 }
 
-/// A child is never taped, in any tape mode.
-#[test]
-fn a_child_is_never_taped() {
-    let dir = scratch();
-    let path = dir.path().join("t.atape");
-    let fx = Fx::record_with(&path, &header(TapeMode::Credentialed), Redactor::new())
-        .expect("a recording");
-    let refused = fx
-        .child(&ChildSpec::new(Path::new("/bin/gh")))
-        .expect_err("not taped");
-    assert_eq!(refused.sub, Sub::Replay(Replay::StreamNotTaped));
-}
-
 /// A credentialed streamed answer is taped by its digest: a 0600 file in a 0700
 /// `{tape}.d`, a `body-file` line on the tape, a replay that streams the same bytes, a
 /// rerecording that copies the file, and `Replay::StreamDigest` for a file that is

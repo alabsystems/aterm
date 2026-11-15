@@ -1996,20 +1996,42 @@ fn held_directories_and_fifos_are_not_regular_files() {
     }
 }
 
-/// A process's wait for a core is every thread's: with twice as many spinning threads as cores,
-/// the threads' summed `run_delay` must pass the leader's own (`/proc/self/schedstat`, the test
+/// A process's wait for a core is every thread's: two spinning threads narrowed to one core each
+/// wait for it about half the time, on any machine and loading that one core alone, so the
+/// threads' summed `run_delay` must pass the leader's own (`/proc/self/schedstat`, the test
 /// harness's main thread, which waits on the test thread and spins nowhere), which is what the
 /// probe read before. NEGATIVE CONTROL: the leader's file alone, the old reading, fails the
 /// comparison.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_processs_wait_for_a_core_is_every_threads() {
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    unsafe extern "C" {
+        /// `<sched.h>`; aterm-libc does not export it. `mask` is a `cpu_set_t`.
+        fn sched_getaffinity(pid: i32, size: usize, mask: *mut [u64; 16]) -> i32;
+        /// `<sched.h>`.
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const [u64; 16]) -> i32;
+    }
+    let mut allowed = [0u64; 16];
+    // SAFETY: `allowed` is a writable 1024-bit `cpu_set_t` of the size passed; pid 0 is this
+    // thread.
+    let rc = unsafe { sched_getaffinity(0, std::mem::size_of_val(&allowed), &raw mut allowed) };
+    assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    let word = allowed
+        .iter()
+        .position(|w| *w != 0)
+        .expect("an allowed core");
+    let mut one = [0u64; 16];
+    one[word] = 1 << allowed[word].trailing_zeros();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let spinners: Vec<_> = (0..cores * 2)
+    let spinners: Vec<_> = (0..2)
         .map(|_| {
             let stop = std::sync::Arc::clone(&stop);
             std::thread::spawn(move || {
+                // SAFETY: `one` is a readable `cpu_set_t` of the size passed, naming one core
+                // this process may run on; pid 0 narrows this thread alone.
+                let rc =
+                    unsafe { sched_setaffinity(0, std::mem::size_of_val(&one), &raw const one) };
+                assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
                 let mut n = 0u64;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     n = std::hint::black_box(n.wrapping_add(1));
@@ -2040,8 +2062,7 @@ fn a_processs_wait_for_a_core_is_every_threads() {
     }
     assert!(
         sum > alone.saturating_add(50_000_000),
-        "{} spinners on {cores} cores: threads' wait {sum} ns, leader's {alone} ns",
-        cores * 2
+        "two spinners on one core: threads' wait {sum} ns, leader's {alone} ns"
     );
 }
 

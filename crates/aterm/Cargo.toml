@@ -196,6 +196,10 @@ dev-seams = [
 ]
 
 [dev-dependencies]
+# The texts the turn-end policy types, which the live turn-end test reads off the screen.
+alab-policy = { workspace = true }
+# Focused clock tests belong to the headless benchmark library, not this application target.
+aterm-bench = { path = "../aterm-bench", default-features = false }
 # aterm-cores: the cores a test's pool may use (`available_parallelism`, bounded by its grant).
 aterm-cores = { workspace = true }
 # `plain_durable_flushes_in_tests!`: fabric_world, aterm_suite and the binary's own unit tests

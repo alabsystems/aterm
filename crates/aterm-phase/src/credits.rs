@@ -157,7 +157,7 @@ pub fn model_week(rows: &[String]) -> Option<ModelWeek> {
         return None;
     }
     let wall = crate::wall::wall(rows)
-        .filter(|w| matches!(w.kind, crate::wall::WallKind::ModelBucket { .. }))
+        .filter(|w| matches!(w.kind, alab_policy::vocab::WallKind::ModelBucket { .. }))
         .and_then(|w| Some((WeekModel::of_wall(&w.message)?, w.reset)));
     if let Some((model, reset)) = wall {
         return Some(ModelWeek {
@@ -380,11 +380,11 @@ pub fn usage_sighting(rows: &[String], places: impl Fn(&str) -> bool) -> Option<
         });
     }
     let unread_wall = crate::wall::wall(rows).filter(|w| match w.kind {
-        crate::wall::WallKind::ModelBucket { .. } => {
+        alab_policy::vocab::WallKind::ModelBucket { .. } => {
             WeekModel::of_wall(&w.message).is_none()
                 || w.reset.as_deref().is_some_and(|reset| !places(reset))
         }
-        crate::wall::WallKind::Spend => true,
+        alab_policy::vocab::WallKind::Spend => true,
         _ => false,
     });
     if let Some(w) = unread_wall {

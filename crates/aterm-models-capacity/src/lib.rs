@@ -14,6 +14,7 @@ mod models_memory_passing;
 mod models_qualify_fallback;
 mod models_qualify_memory;
 mod models_test_dispatch;
+mod models_timing_comparison;
 
 pub use models_capacity_cohort::capacity_cohort_model;
 pub use models_capacity_history::{capacity_history_model, capacity_terminal_model};
@@ -23,3 +24,5 @@ pub use models_qualify_fallback::{
 };
 pub use models_qualify_memory::qualify_memory_model;
 pub use models_test_dispatch::{test_dispatch_liveness, test_dispatch_model};
+
+pub use models_timing_comparison::timing_comparison_final_model;

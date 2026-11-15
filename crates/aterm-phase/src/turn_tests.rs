@@ -1020,7 +1020,10 @@ fn a_declined_question_is_a_persons_stop() {
     for text in [QUESTION_DECLINED_CANCEL, QUESTION_DECLINED_ESC] {
         let r = screen(text);
         assert!(interrupted(&r), "{r:?}");
-        assert_eq!(crate::phase::worker_phase(&r), crate::phase::Phase::Idle);
+        assert_eq!(
+            crate::phase::worker_phase(&r),
+            alab_policy::vocab::Phase::Idle
+        );
     }
     let foot = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
     let quoted = framed(
@@ -1057,7 +1060,7 @@ fn claude_codes_idle_compaction_is_its_own_housekeeping() {
         assert_eq!(said_tail(&measured).as_deref(), Some("ATERM-TASK-DONE"));
         assert_eq!(
             crate::phase::worker_phase(&measured),
-            crate::phase::Phase::Idle
+            alab_policy::vocab::Phase::Idle
         );
         for p in [Program::Generic, Program::Codex] {
             assert!(!p.reader().housekeeping(&measured), "{p:?}");

@@ -11,7 +11,7 @@ mod harness;
 
 mod census;
 mod census_tests;
-mod clock;
+use aterm_bench::head_sampling as clock;
 mod profile;
 mod profile_tests;
 #[expect(

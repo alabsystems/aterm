@@ -415,3 +415,105 @@ fn cursor_color_follows_osc12_and_resets_on_112() {
         "OSC 112 restores the host-configured cursor baseline"
     );
 }
+
+#[test]
+fn state_json_preserves_nulls_sources_sides_and_escaping() {
+    let mut state = WebThemeState::new(Appearance::Dark);
+    assert_eq!(
+        state.state_json(Appearance::Light),
+        r#"{"selector":null,"appearance":"dark","id":null,"side":null,"reported":"light","source":null}"#
+    );
+    state.host_set = true;
+    assert_eq!(
+        state.state_json(Appearance::Dark),
+        r#"{"selector":null,"appearance":"dark","id":null,"side":null,"reported":"dark","source":"host"}"#
+    );
+    state.selector = Some("x\"\\漢\n".into());
+    for (source, word) in [
+        (WebThemeSource::Builtin, "builtin"),
+        (WebThemeSource::Registered, "registered"),
+    ] {
+        state.installed = Some(WebDraw {
+            id: "y\"\\🙂\t".into(),
+            side: Appearance::Light,
+            source,
+            scheme: aterm_types::scheme::builtin("Nord").unwrap(),
+        });
+        let expected = format!(
+            r#"{{"selector":"x\"\\漢\n","appearance":"dark","id":"y\"\\🙂\t","side":"light","reported":"dark","source":"{word}"}}"#
+        );
+        assert_eq!(state.state_json(Appearance::Dark), expected);
+    }
+}
+
+#[test]
+fn catalog_export_matches_full_theme_projection_with_warnings_and_escaping() {
+    let mut state = WebThemeState::new(Appearance::Dark);
+    state.register(MINE).unwrap();
+    let custom = &mut state.registered[0];
+    custom.id = "id\"\\漢\n".into();
+    custom.meta.display_name = "name\"\\🙂\t".into();
+    custom.meta.pair = Some("pair\"".into());
+    custom.meta.description = Some("description\n".into());
+    custom.meta.warnings = vec![
+        aterm_types::scheme::ThemeWarning::LowTextContrast { hundredths: 123 },
+        aterm_types::scheme::ThemeWarning::SearchMatchLikeSelection,
+    ];
+    for registered in [true, false] {
+        if !registered {
+            state.registered.clear();
+        }
+        let builtins = builtin_theme_list().into_iter().map(|b| {
+            (
+                CatalogTheme::builtin(b.name).unwrap(),
+                b.signature,
+                "builtin",
+            )
+        });
+        let rows: Vec<String> = builtins.chain(state.registered.iter().cloned().map(|t| (t, false, "registered"))).map(|(t, signature, source)| format!(
+            "{{\"id\":{},\"display_name\":{},\"appearance\":\"{}\",\"appearance_source\":\"{}\",\"pair\":{},\"description\":{},\"signature\":{},\"source\":\"{}\",\"warnings\":{}}}",
+            json_string(&t.id), json_string(&t.meta.display_name), appearance_word(t.meta.appearance), source_word(t.meta.appearance_source), json_opt(t.meta.pair.as_deref()), json_opt(t.meta.description.as_deref()), signature, source, json_warnings(&t.meta)
+        )).collect();
+        let expected = format!(
+            "{{\"unset\":{},\"themes\":[{}]}}",
+            json_string(UNSET_THEME),
+            rows.join(",")
+        );
+        assert_eq!(state.catalog_json(), expected);
+    }
+}
+
+fn json_opt(s: Option<&str>) -> String {
+    s.map_or_else(|| "null".to_string(), json_string)
+}
+
+#[test]
+fn registration_reply_matches_the_original_json_projection() {
+    let mut terminal = terminal();
+    let mut state = WebThemeState::new(Appearance::Dark);
+    for text in [
+        MINE,
+        "name = Paper\nbackground = #ffffff\nforeground = #000000\nappearance = light\n",
+        "name = 漢🙂\nbackground = #101820\nforeground = #101820\n",
+        "name = Mine\nbackground = #202020\nforeground = #ffffff\n",
+    ] {
+        let theme = state.register(text).unwrap();
+        let expected = format!(
+            "{{\"id\":{},\"appearance\":\"{}\",\"appearance_source\":\"{}\",\"warnings\":{}}}",
+            json_string(&theme.id),
+            appearance_word(theme.meta.appearance),
+            source_word(theme.meta.appearance_source),
+            json_warnings(&theme.meta),
+        );
+        assert_eq!(terminal.register_theme(text).unwrap(), expected);
+    }
+}
+
+fn json_warnings(meta: &ThemeMeta) -> String {
+    let rows: Vec<String> = meta
+        .warnings
+        .iter()
+        .map(|w| json_string(&w.to_string()))
+        .collect();
+    format!("[{}]", rows.join(","))
+}

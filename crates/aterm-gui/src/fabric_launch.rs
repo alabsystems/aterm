@@ -16,8 +16,8 @@ const FABRIC_COMMAND_ENV: &str = "ATERM_FABRIC_COMMAND";
 const RELAUNCH_MIN: Duration = Duration::from_millis(200);
 const RELAUNCH_MAX: Duration = Duration::from_secs(30);
 
-/// A run this long was no startup failure: its bridge comes back at once, so a loop of
-/// healthy-then-dying runs launches about once per this.
+/// A run this long, counted from its launch, was no startup failure: its bridge comes back at
+/// once, so a loop of healthy-then-dying runs launches at most once per this.
 const RELAUNCH_HEALTHY: Duration = Duration::from_secs(5);
 
 /// How long a retired generation's lanes get to end before a warning says they have not
@@ -576,6 +576,12 @@ fn supervise_with(
             aterm_log::info!("fabric bridge supervisor retired: aterm is quitting");
             return;
         }
+        // The run counts from here. The bridge runs from its exec inside the launch, so a run
+        // counted from the launch's return lost what this thread took to come back to it (its
+        // wake on the exec's report, the lanes' attach, the log line below): a whole short-lived
+        // bridge could run and exit in it, and a bridge that outlived `RELAUNCH_HEALTHY` by less
+        // than a stall of this thread read as one that died young.
+        let started = Instant::now();
         match launch(argv) {
             Ok(mut launched) => {
                 aterm_log::info!(
@@ -583,7 +589,6 @@ fn supervise_with(
                     argv.first().map_or("?", |program| program_word(program)),
                     argv.len().saturating_sub(1)
                 );
-                let started = Instant::now();
                 let status = launched.wait();
                 let ran = started.elapsed();
                 launched.retire().watch_behind(LANES_END_WAIT);

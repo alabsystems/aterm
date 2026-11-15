@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::client::entry::admission::tests::writer_is_free;
-use crate::client::entry::tests::Fixture;
+use crate::client::entry::tests::{Fixture, publish_unresolved};
 use aterm_spec::interp::State as ModelState;
 
 struct Restore;
@@ -41,6 +41,7 @@ fn transition_with(state: &ModelState, action: &str, mutant: u8) -> ModelState {
     let mut expected = config(&fixture.paths).unwrap().unwrap();
     let scenario = state["scenario"];
     let foreign = (scenario == 4).then(Fixture::new);
+    let mut hidden = None;
     match scenario {
         1 | 2 => {
             fixture.publish(|doc| {
@@ -48,10 +49,9 @@ fn transition_with(state: &ModelState, action: &str, mutant: u8) -> ModelState {
                     .unwrap();
             });
             if scenario == 2 {
-                std::fs::remove_file(
-                    materialize::target_path(&fixture.paths.home, "pick").unwrap(),
-                )
-                .unwrap();
+                // Present in the version, its anchor chain unresolved: unavailable, never
+                // absent. Its file at the old path gone would change nothing.
+                hidden = Some(publish_unresolved(&fixture, "pick", b"inert-pick"));
             }
         }
         6 => std::fs::remove_file(fixture.paths.source_file()).unwrap(),
@@ -169,6 +169,7 @@ fn transition_with(state: &ModelState, action: &str, mutant: u8) -> ModelState {
     next.insert("free", i64::from(free));
     next.insert("kept", i64::from(fixture.bytes() == before));
     next.insert("acquired", i64::from(acquired));
+    drop(hidden);
     next
 }
 

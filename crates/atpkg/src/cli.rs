@@ -269,12 +269,19 @@ const TABLE: &[Verb] = &[
                 Control off for this host, Rosetta 2 on Apple silicon), then attempt cache \
                 cleanup\n\
                 aterm pkg machine cache           — advisory cleanup candidates and their \
-                footprints in the Rust build cache, tooling cache and retired verify gate's \
-                leftovers, and of a stage an earlier pass left, what will stay and why; cleanup \
+                footprints in the Rust build cache, tooling cache, retired verify gate's \
+                leftovers and the tagged caches (CACHEDIR.TAG) that finished or idle campaign \
+                scopes, worktree roots and per-campaign cache folders leave outside the shared \
+                cache, and of a stage an earlier pass left, what will stay and why; cleanup \
                 rechecks eligibility and checks active use of build and tooling caches; removes \
                 nothing\n\
                 aterm pkg machine cache clean     — run that cleanup, without applying host \
                 settings\n\
+                aterm pkg machine cache holders   — who holds the disk: the largest scopes, \
+                worktree roots, caches and folders in $HOME (never Documents, Desktop, \
+                Downloads or other apps' data), each with its size, last write and the age of \
+                its measure; measures what was never measured or measured longest ago first; \
+                removes nothing\n\
                 aterm pkg machine cache retire ABS — retire one registered ordinary cache, with \
                                                     identity, Cargo lock and process-use checks\n\
                 aterm pkg machine cache retain ABS — keep one existing exact cache root; no \
@@ -298,7 +305,8 @@ const TABLE: &[Verb] = &[
                 <size>`; --json: `reserved_mem`, `reserved_disk`), a held build's memory what \
                 its holder stepped it to as its run began (`stepped`), a waiter of memory that \
                 cannot start yet the most a claim behind it may take and go first without \
-                delaying it (`spares`), or that no claim's end can start it, so it reserves none \
+                delaying it (`spares`), or that no end of a claim it can wait for can start it, \
+                so it reserves none \
                 and each claim behind it that fits goes first, background work aside behind a \
                 release's (`stuck`), and a waiter whose disk \
                 is more than its volume has free above the floor is `unservable`",
@@ -2309,12 +2317,13 @@ fn run_pending(layout: &crate::store::Layout, tool: &str, passthrough: &[String]
         );
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt as _;
             #[expect(
                 clippy::disallowed_types,
                 reason = "a pending stub becomes the copy it names by exec: its caller's descriptors are the copy's"
             )]
-            let err = std::process::Command::new(&exe).args(passthrough).exec();
+            let mut command = std::process::Command::new(&exe);
+            command.args(passthrough);
+            let err = crate::platform::exec_or_run(&mut command);
             eprintln!("atpkg: could not run {}: {err}", exe.display());
             return ExitCode::from(126);
         }
@@ -2564,12 +2573,13 @@ fn wait_then_run(
     }
     #[cfg(unix)]
     if let Some(shim) = gated_shim(layout, tool) {
-        use std::os::unix::process::CommandExt as _;
         #[expect(
             clippy::disallowed_types,
             reason = "a pending stub becomes the landed program's shim by exec: its caller's descriptors are the shim's"
         )]
-        let err = std::process::Command::new(&shim).args(passthrough).exec();
+        let mut command = std::process::Command::new(&shim);
+        command.args(passthrough);
+        let err = crate::platform::exec_or_run(&mut command);
         eprintln!("atpkg: could not run {}: {err}", shim.display());
         return ExitCode::from(126);
     }
@@ -5262,8 +5272,9 @@ fn cmd_tree_root(dir: Option<&String>) -> ExitCode {
     }
 }
 
-/// The target triple of this build, for artifact selection.
-pub(crate) const fn current_triple() -> &'static str {
+/// The target triple of this build, for artifact selection: one of [`crate::TARGETS`], or
+/// `unknown` on a machine atpkg has no target for.
+pub const fn current_triple() -> &'static str {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
         "aarch64-apple-darwin"
@@ -7027,6 +7038,22 @@ pub(crate) fn cache_plan_words(why: crate::build_cache::Unused) -> String {
             days(idle),
             days(after)
         ),
+        Unused::Leftover {
+            idle,
+            after,
+            finished,
+        } => format!(
+            "candidate for the whole tagged cache folder (CACHEDIR.TAG, regenerable): {}; it \
+             was unwritten for {} and nothing seen in its unit was written within the age \
+             threshold ({})",
+            if finished {
+                "its unit holds a landed or delivered receipt"
+            } else {
+                "a leftover outside the shared cache with no receipt"
+            },
+            days(idle),
+            days(after)
+        ),
         Unused::GivenUp => "candidate for the whole scratch folder: a failed provisioning run \
                             left it after execution was observed"
             .to_owned(),
@@ -7118,6 +7145,67 @@ fn retire_verify_gate() -> usize {
     done.iter().filter(|(_, r)| r.is_ok()).count()
 }
 
+/// How long `aterm pkg machine cache holders` measures in one call: enough for a first whole
+/// measure of a full release host, and a later call resumes where this one stopped.
+const HOLDERS_LISTING_BUDGET: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// What `aterm pkg machine cache holders` prints: the largest holders
+/// ([`crate::build_cache::holders::NAMED`]), each on its line with its size, path, kind, last
+/// write and the age of its measure, then what the measured folders sum to beside the volume's
+/// own figures, so space no measured folder accounts for is said and not hidden.
+pub(crate) fn holders_listing(
+    survey: &crate::build_cache::holders::Survey,
+    now: std::time::SystemTime,
+    home: &std::path::Path,
+) -> String {
+    let named = crate::build_cache::holders::NAMED;
+    let mut out: Vec<String> = survey
+        .holders
+        .iter()
+        .take(named)
+        .map(|holder| holder.line(now))
+        .collect();
+    let lower = survey.holders.iter().filter(|h| !h.complete).count();
+    out.push(format!(
+        "Measured folders hold {} across {} folder(s) ({} listed){}{}.",
+        crate::cost::human_bytes(survey.bytes()),
+        survey.holders.len(),
+        survey.holders.len().min(named),
+        if lower > 0 {
+            format!("; {lower} figure(s) are lower bounds a later call completes")
+        } else {
+            String::new()
+        },
+        if survey.unmeasured > 0 {
+            format!(
+                "; {} folder(s) are not measured yet (run it again)",
+                survey.unmeasured
+            )
+        } else {
+            String::new()
+        },
+    ));
+    if let Some(volume) = aterm_capacity::read_volume(home) {
+        let used = volume.total.saturating_sub(volume.free);
+        out.push(format!(
+            "The volume at {} has {} free of {}; {} of its {} used is in no measured folder \
+             (the system, other apps' data, the folders never looked into, and what a measure \
+             has not reached).",
+            volume.mount.display(),
+            crate::cost::human_bytes(volume.free),
+            crate::cost::human_bytes(volume.total),
+            crate::cost::human_bytes(used.saturating_sub(survey.bytes())),
+            crate::cost::human_bytes(used),
+        ));
+    }
+    out.push(
+        "Nothing is removed by this listing. `aterm pkg machine cache` lists what cleanup may \
+         take; a checkout in $HOME is listed for its owner and never collected."
+            .to_owned(),
+    );
+    out.join("\n")
+}
+
 fn reclaim_build_cache() -> usize {
     use crate::build_cache::Unused;
     let retired = retire_verify_gate();
@@ -7163,10 +7251,23 @@ fn reclaim_build_cache() -> usize {
         .iter()
         .filter(|(_, why)| matches!(why, Unused::Stale { .. }))
         .count();
-    if removed.len() > parts + stayed + kept {
+    let mut leftovers = 0;
+    for (path, why) in &removed {
+        if matches!(why, Unused::Leftover { .. }) {
+            leftovers += 1;
+            println!("removed {}", path.display());
+        }
+    }
+    if leftovers > 0 {
+        println!(
+            "removed {leftovers} tagged cache folder(s) that finished or idle scopes, worktree \
+             roots and per-campaign cache folders left outside the shared cache"
+        );
+    }
+    if removed.len() > parts + stayed + kept + leftovers {
         println!(
             "removed {} unused Rust build cache folder(s)",
-            removed.len() - parts - stayed - kept
+            removed.len() - parts - stayed - kept - leftovers
         );
     }
     if parts > 0 {
@@ -7239,6 +7340,21 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
             if reclaim_build_cache() == 0 {
                 println!("no unused Rust build cache entries removed");
             }
+            ExitCode::SUCCESS
+        }
+        [sub, action] if sub == "cache" && action == "holders" => {
+            let Some(home) = aterm_types::dirs::home_dir() else {
+                eprintln!("atpkg: the holders listing needs a home directory");
+                return ExitCode::from(2);
+            };
+            let now = std::time::SystemTime::now();
+            let survey = crate::build_cache::holders::measure(
+                &home,
+                &crate::build_cache::holders::extra_here(),
+                now,
+                HOLDERS_LISTING_BUDGET,
+            );
+            println!("{}", holders_listing(&survey, now, &home));
             ExitCode::SUCCESS
         }
         [sub, action, root] if sub == "cache" && action == "retire" => {
@@ -7361,13 +7477,15 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                 format!(
                     "unknown argument {word:?} — a bare `machine` reads, `machine apply` \
                      applies, `machine cache` previews advisory cache cleanup candidates, \
-                     and `machine cache clean` attempts that cleanup"
+                     `machine cache clean` attempts that cleanup, and `machine cache holders` \
+                     lists who holds the disk"
                 )
             } else {
                 format!(
                     "too many arguments ({}) — a bare `machine` reads, `machine apply` \
                      applies, `machine cache` previews advisory cache cleanup candidates, \
-                     and `machine cache clean` attempts that cleanup",
+                     `machine cache clean` attempts that cleanup, and `machine cache holders` \
+                     lists who holds the disk",
                     other.len()
                 )
             };

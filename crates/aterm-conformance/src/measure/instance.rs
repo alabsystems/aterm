@@ -833,6 +833,37 @@ pub fn replay_checks(ctl: &Ctl) -> String {
     )
 }
 
+/// The config line a take writes for its recording, `temporal_recording = <on>`: written
+/// either way, so a row records or not as it says whatever the shipped default
+/// (aterm-gui `DEFAULT_TEMPORAL_RECORDING`) is.
+#[must_use]
+pub fn recording_line(on: bool) -> String {
+    format!("temporal_recording = {on}")
+}
+
+/// Whether a `temporal status` reply shows the recording a row asked for (`enabled=<want>`):
+/// [`CouldNotRun::Refused`] when it shows the other, so a setting that fell back to the default
+/// never passes as the row's arm, and [`CouldNotRun::Unanswered`] when it names no `enabled=`.
+/// # Errors
+/// As above.
+pub fn recording_reads(status: &str, want: bool) -> Result<(), CouldNotRun> {
+    match field(status, "enabled") {
+        Some(got) if got == if want { "true" } else { "false" } => Ok(()),
+        Some(got) => could_not_run(format!(
+            "the instance's recording is enabled={got}, not the enabled={want} its row asks \
+             ({status})"
+        )),
+        None => unanswered(format!("temporal status named no enabled= ({status})")),
+    }
+}
+
+/// [`recording_reads`] on the instance's focused pane, asked now.
+/// # Errors
+/// The request failed, or [`recording_reads`]'s.
+pub fn require_recording(ctl: &Ctl, want: bool) -> Result<(), CouldNotRun> {
+    recording_reads(&ctl.ok(&["temporal", "status"])?, want)
+}
+
 /// The `key=value` token `key` of a reply line.
 #[must_use]
 pub fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {

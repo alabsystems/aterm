@@ -628,6 +628,25 @@ impl Router {
         }
     }
 
+    /// A router whose default read chain is profile `name` alone, a dev-tier inline profile of
+    /// `token` with no login, over no owner rows or targets: what `[profiles.NAME]` and
+    /// `[default] read = ["NAME"]` would route, for a token an in-process caller already
+    /// admitted and holds in memory (design §6.1). A profile with no login is not bound by a
+    /// `GET /user` first: its caller vouches for the token.
+    #[must_use]
+    pub fn default_reader(name: &str, token: crate::identity::InlineToken) -> Router {
+        let profile = Profile::new(name, crate::identity::Source::Inline(token), Tier::Dev);
+        Router::from_validated(Validated {
+            profiles: std::collections::BTreeMap::from([(name.to_string(), profile)]),
+            owners: std::collections::BTreeMap::new(),
+            default_read: vec![ChainStep::Profile(name.to_string())],
+            targets: std::collections::BTreeMap::new(),
+            vault: false,
+            origin: ConfigOrigin::Text,
+            writers: Vec::new(),
+        })
+    }
+
     /// Retain file-backed grants and the admitted posture of explicit profiles only.
     pub(crate) fn with_file_authority(mut self, source: &Validated) -> Self {
         self.file_writers =
@@ -701,13 +720,13 @@ impl Router {
         self.validated.as_ref()?.profiles.get(name)
     }
 
-    /// The profile so named's [`Presence`] in `env` ([`crate::identity::presence`]), `Absent`
+    /// The profile so named's [`Presence`] ([`crate::identity::presence`]), `Absent`
     /// when no profile has that name: what the credential helper, `whoami --git` and a lane's
     /// host check each judge a writer by.
     #[must_use]
-    pub fn presence(&self, name: &str, env: &dyn crate::identity::EnvSource) -> Presence {
+    pub fn presence(&self, name: &str) -> Presence {
         self.profile(name)
-            .map_or(Presence::Absent, |row| crate::identity::presence(row, env))
+            .map_or(Presence::Absent, crate::identity::presence)
     }
 
     /// Every profile, sorted by name.
@@ -1051,7 +1070,7 @@ impl Router {
             Presence::Absent => refuse(
                 RefusalCode::WriterAbsent,
                 format!("the writer for {owner} ({writer}) is absent"),
-                crate::identity::vault::absent_step(profile)
+                crate::identity::vault::token_step(profile)
                     .unwrap_or_else(|| "agh auth status names its token's source".to_string()),
                 vec![(ChainStep::Profile(writer.to_string()), judged)],
             ),
@@ -1487,7 +1506,7 @@ pub const fn project_decision(decision: &Decision) -> (i64, i64) {
     aterm_spec_anchor::spec_unmodeled(
         machine = "AghRouteWall",
         action = "ToggleDev",
-        reason = "Bounded nondeterministic environment selection: whether the dev token file is present"
+        reason = "Bounded nondeterministic environment selection: whether the dev token is present"
     )
 )]
 #[cfg_attr(
@@ -1495,7 +1514,7 @@ pub const fn project_decision(decision: &Decision) -> (i64, i64) {
     aterm_spec_anchor::spec_unmodeled(
         machine = "AghRouteWall",
         action = "ToggleRel",
-        reason = "Bounded nondeterministic environment selection: whether the release token file is present"
+        reason = "Bounded nondeterministic environment selection: whether the release token is present"
     )
 )]
 #[cfg_attr(

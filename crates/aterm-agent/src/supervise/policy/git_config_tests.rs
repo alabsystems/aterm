@@ -864,6 +864,89 @@ fn the_workers_git_config_variables_are_seen() {
     );
 }
 
+/// The loader can write before Git reads any configuration. The native signed stand-in is
+/// kept in place by `test_program::kept`, including when a child never proves it ran.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_git_probe_refuses_loader_controls_before_the_loader_writes() {
+    let r = repo("loader-env");
+    // The loader control needs a native Git. Resolve the developer tool through xcrun,
+    // then retain its signed image with the existing fixture API.
+    let found = aterm_uds::deadline::ends_within(
+        aterm_uds::spawnfd::command("/usr/bin/xcrun").args(["--find", "git"]),
+        aterm_spec::wait::MUST_HAPPEN,
+    );
+    assert!(found.status.success(), "{found:?}");
+    let resolved = PathBuf::from(String::from_utf8(found.stdout).expect("Git path").trim());
+    let native_git = crate::test_program::kept(resolved);
+    let worker = isolated()
+        .with(&format!(
+            "PATH={}:{}",
+            native_git
+                .parent()
+                .expect("the stand-in's directory")
+                .display(),
+            test_worker_path()
+        ))
+        .with("GIT_CONFIG_COUNT=1")
+        .with("GIT_CONFIG_KEY_0=probe.fixture")
+        .with("GIT_CONFIG_VALUE_0=worker-env-seen");
+    let ordinary = worker
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect("an ordinary worker environment remains readable");
+    assert!(ordinary.config.contains(&(
+        "command".into(),
+        "probe.fixture".into(),
+        Some("worker-env-seen".into()),
+    )));
+    assert_eq!(hazard(&ordinary, &reads_in(r.0.path())), None);
+    let marker = r.0.path().join("loader-trace");
+    assert!(!marker.exists(), "the ordinary probe wrote no loader trace");
+    let loader = worker
+        .clone()
+        .with("DYLD_PRINT_LIBRARIES=1")
+        .with("DYLD_PRINT_LIBRARIES=")
+        .with(&format!("DYLD_PRINT_TO_FILE={}", marker.display()));
+
+    // NEGATIVE CONTROL: the actual probe's command builder, before the admission check,
+    // passes these variables to a native Git. Its stdout proves this kept image ran, and
+    // the trace proves the loader has a file side effect without loading a test library.
+    // Its effective Boolean control is empty, ahead of a shadowed value: presence enables it.
+    let probe = Probe {
+        env: &loader,
+        program: native_git,
+    };
+    let mut cmd = probe.git(r.0.path());
+    cmd.arg("--version");
+    let direct = git_output(&mut cmd).expect("the native loader control completes");
+    assert!(direct.status.success(), "{direct:?}");
+    assert!(direct.stdout.starts_with(b"git version "), "{direct:?}");
+    assert!(
+        !std::fs::read(&marker)
+            .expect("the native loader control wrote its trace")
+            .is_empty()
+    );
+    std::fs::remove_file(&marker).expect("remove only the completed control's trace");
+
+    let answer = loader.raw_git_view(r.0.path(), &|_| false);
+    assert!(
+        !marker.exists(),
+        "the production Git probe ran the loader before refusing it: {answer:?}"
+    );
+    let why = answer.expect_err("a loader-controlled worker is refused before any probe");
+    assert!(
+        ["DYLD_PRINT_TO_FILE", "DYLD_PRINT_LIBRARIES"]
+            .iter()
+            .any(|key| why.contains(key)),
+        "{why}"
+    );
+    let why = worker
+        .with("LD_PRELOAD=")
+        .raw_git_view(r.0.path(), &|_| false)
+        .expect_err("an empty loader control is still refused");
+    assert!(why.contains("LD_PRELOAD"), "{why}");
+}
+
 #[test]
 fn the_workers_external_diff_is_a_hazard() {
     let r = repo("ext-diff");

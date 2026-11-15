@@ -14,7 +14,7 @@ use crate::stats_plan::DeckForm;
 use aterm_vitals::Cell;
 use aterm_vitals::explain::{ActivityId, fixtures};
 use aterm_vitals::history::FREE_BUCKET_S;
-use aterm_vitals::model::{Hog, ProcScope, ScopeFig, TopProc, VolumeSample, Writer};
+use aterm_vitals::model::{Hog, ProcScope, ProgramGroup, ScopeFig, TopProc, VolumeSample, Writer};
 
 const LOC: Locale = Locale {
     platform: Platform::MacOs,
@@ -161,6 +161,31 @@ pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
             },
         ])
         .collect();
+    s.programs.clear();
+    for process in &s.top {
+        if let Some(group) = s
+            .programs
+            .iter_mut()
+            .find(|g| g.name == process.name && g.scope == process.scope)
+        {
+            group.n += 1;
+            group.cores += process.cores;
+            if let Some(bytes) = process.footprint {
+                group.footprint = Some(group.footprint.unwrap_or(0) + bytes);
+            }
+        } else {
+            s.programs.push(ProgramGroup {
+                name: process.name.clone(),
+                scope: process.scope,
+                n: 1,
+                cores: process.cores,
+                footprint: process.footprint,
+                footprint_unread: u32::from(process.footprint.is_none()),
+                born_ms: None,
+                unborn: 1,
+            });
+        }
+    }
     let cores = |t: &TopProc| Some(f64::from(t.cores));
     let bytes = |t: &TopProc| t.footprint.map(|b| b as f64);
     for (res, of) in [
@@ -222,7 +247,7 @@ fn footprints_scene(by: f64, long: bool, procs: bool) -> Snapshot {
         t.label = LONG_TAB.into();
     }
     if !procs {
-        for t in &mut s.top {
+        for t in &mut s.programs {
             t.footprint = None;
         }
     }
@@ -1160,6 +1185,65 @@ fn the_scope_filters_the_lists() {
     assert!(well(&global, "Biggest now").contains("WindowServer"));
 }
 
+#[test]
+fn the_memory_list_includes_idle_programs_outside_the_cpu_top() {
+    let mut snap = lens_scene(Scene::Calm);
+    snap.programs.push(ProgramGroup {
+        name: "idle-worker".into(),
+        scope: ProcScope::Tab(FRONT),
+        n: 2,
+        cores: 0.0,
+        footprint: Some(8 * GIB as u64),
+        footprint_unread: 0,
+        born_ms: None,
+        unborn: 2,
+    });
+    assert!(snap.top.iter().all(|p| p.name != "idle-worker"));
+    let memory = heard(
+        &snap,
+        Lens {
+            bar: Bar::Tab,
+            ..pinned(Instrument::Memory)
+        },
+    );
+    let biggest = well(&memory, "Biggest now in Tab 2");
+    assert!(biggest.contains("idle-worker \u{d7}2"), "{biggest}");
+    let cpu = heard(
+        &snap,
+        Lens {
+            bar: Bar::Tab,
+            ..pinned(Instrument::Cpu)
+        },
+    );
+    assert!(!well(&cpu, "Busiest now in Tab 2").contains("idle-worker"));
+}
+
+#[test]
+fn the_cpu_lens_keeps_counter_charge_apart_from_confirmed_work() {
+    let mut snap = lens_scene(Scene::Calm);
+    let cpu = &mut snap.resources[Resource::Cpu.index()];
+    cpu.aterm.now = Some(0.259);
+    cpu.aterm.cpu_charge = Some(3.5);
+    cpu.aterm.unread = 1;
+    for (key, fig) in &mut cpu.tabs {
+        if *key == FRONT {
+            fig.now = Some(0.159);
+            fig.cpu_charge = Some(2.5);
+            fig.unread = 1;
+        }
+    }
+    let laid = heard(&snap, pinned(Instrument::Cpu));
+    let accounting = well(&laid, "CPU accounting");
+    assert!(accounting.contains("≥0.25 confirmed"), "{accounting}");
+    assert!(
+        accounting.contains("counter charge 3.50 cores"),
+        "{accounting}"
+    );
+    assert!(accounting.contains(words::CPU_CHARGE_NOTE), "{accounting}");
+    let spoken = lens_sentence(&snap, Instrument::Cpu, &[FRONT], &LOC);
+    assert!(spoken.contains("counter charge 2.50 cores"), "{spoken}");
+}
+
 /// "This tab"'s lists (busiest, biggest, writers, jobs) take a process of any of its panes.
 #[test]
 fn a_split_tabs_lists_take_every_pane() {
@@ -1899,7 +1983,7 @@ fn why_now_says_what_sys_why_says() {
     }
     let drawn: Vec<&str> = laid.boxes.iter().map(|b| b.text.as_str()).collect();
     for text in [
-        "5 s window \u{b7} exact, 9 coalitions",
+        "5 s window \u{b7} partial, 9 coalitions",
         "Spotlight, after start-up",
         "1.42 cores",
         "macOS services 2.17 \u{b7} others 0.73 \u{b7} aterm 0.40, Tab 1 0.20",
@@ -1929,7 +2013,7 @@ fn why_nows_window_keeps_its_words_about_a_second() {
         let laid = cpu_for(&snap, &[1]);
         let drawn: Vec<&str> = laid.boxes.iter().map(|b| b.text.as_str()).collect();
         assert!(
-            drawn.contains(&"1 s window \u{b7} exact, 9 coalitions"),
+            drawn.contains(&"1 s window \u{b7} partial, 9 coalitions"),
             "{ms} ms: {drawn:?}"
         );
     }
@@ -2133,8 +2217,9 @@ fn why_now_bounds_the_tab_and_orders_the_split() {
             fixtures::claude_reaped_1032(),
             &[1],
             &[
-                "Why: Tab 1's work, 3.20 cores.",
-                "this tab is the main cause",
+                "no cause aterm can name: aterm, 3.40 cores.",
+                "busy: aterm 3.40, Tab 1 at least 0.20 \u{b7} macOS services 2.17 \u{b7} others 0.73.",
+                "whether it is the cause is not read now",
             ],
         ),
         (
@@ -2171,7 +2256,7 @@ fn why_now_bounds_the_tab_and_orders_the_split() {
             &["this tab is the main cause: 6.0 of 8.2 cores, easing."],
         ),
         (services, &[2], &["this tab is part of the cause, easing."]),
-        (aterm, &[1], &["Why: aterm itself, 1.50 cores."]),
+        (aterm, &[1], &["Why: aterm outside tabs, 1.50 cores."]),
     ];
     for (scene, panes, parts) in cases {
         let laid = cpu_for(&engine(scene), panes);
@@ -2180,6 +2265,16 @@ fn why_now_bounds_the_tab_and_orders_the_split() {
             assert!(said.contains(part), "{part:?}: {said}");
         }
     }
+    let inherited = cpu_for(&engine(fixtures::claude_reaped_1032()), &[1]);
+    let why = well(&inherited, "Why now");
+    assert!(!why.contains("Tab 1's work, 3.20"), "{why}");
+    assert!(!why.contains("this tab is the main cause"), "{why}");
+    let accounting = well(&inherited, "CPU accounting");
+    assert!(accounting.contains("≥0.20 confirmed"), "{accounting}");
+    assert!(
+        accounting.contains("counter charge 3.20 cores"),
+        "{accounting}"
+    );
 }
 
 #[test]

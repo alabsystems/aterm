@@ -43,7 +43,7 @@ const MAX_RECIPIENTS: usize = 8;
 /// `stop` marker ends it sooner.
 const MAX_RUN_S: u64 = 3600;
 const APPLICATION: &str = "lan-startup-data";
-const USAGE: &str = "commons-lan prepare-recipient <new-world> [--port <lab-fleet-port>] | prepare-source <new-world> [--serve <ip:port>] [--aterm <aterm>] [--port <lab-fleet-port>] <recipient-key>... | join <world> <capsule-file> [--aterm <aterm>] | pin <world> <card-file> [--aterm <aterm>] | check --aterm <aterm> (debug lab driver and app; URL acceptance and scripted home-LAN guards) | home-lan <world> <cidr> | run <aterm> <world> <seconds> | node <aterm> <world> <seconds> | pair <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | db <aterm> <world> <db-command> [args...] | secrets <aterm> <world> approve <age1…> --name <host>|join <lab-profile>/fixture.vault|join <its-lab-url>#<signer>|status | members <aterm> <world> join --at <ip:port>... | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world> | emails-fixture <world> <seed> | emails-set <aterm> <world> <seed> <row> <column> <value-or-tag> | emails-wait <aterm> <world> <digest>|!<digest> <seconds> | emails-reveal <aterm> <world> <seed> [<tag>...]";
+const USAGE: &str = "commons-lan prepare-recipient <new-world> [--port <lab-fleet-port>] | prepare-source <new-world> [--serve <ip:port>] [--aterm <aterm>] [--port <lab-fleet-port>] <recipient-key>... | join <world> <capsule-file> [--aterm <aterm>] | pin <world> <card-file> [--aterm <aterm>] | check --aterm <aterm> (debug lab driver and app; URL acceptance and scripted home-LAN guards) | home-lan <world> <cidr> | run <aterm> <world> <seconds> | node <aterm> <world> <seconds> | pair <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | db <aterm> <world> <db-command> [args...] | secrets <aterm> <world> approve <age1…> --name <host>|join <lab-profile>/fixture.vault|join <its-lab-url>#<signer>|status | members <aterm> <world> join --at <ip:port>... | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world> | emails-fixture <world> <seed> | emails-set <aterm> <world> <seed> <row> <column> <value-or-tag> | emails-wait <aterm> <world> <digest>|!<digest> <seconds>";
 
 /// The port a lab world's node serves the fleet's `ask` on unless `--port` names another.
 const LAB_FLEET_PORT: u16 = 7190;
@@ -1377,8 +1377,7 @@ fn table_snapshot(world: &World) -> Result<Value, Fail> {
 
 /// Whether `commons-lan db` passes `args` to the shipped database CLI: inert proposal and data
 /// commands, the lab model's import and check, and the owner's emails view. No credential
-/// activation, membership or service command passes, and `emails --show-passwords` reaches a
-/// process with no terminal, which the view refuses (one-mesh design §4.8).
+/// activation, membership or service command passes.
 fn admitted_db(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some(
@@ -1995,19 +1994,6 @@ pub fn cmd(args: &[String]) -> Res {
             )?;
             emit(&value)?;
             return Ok(code);
-        }
-        #[cfg(debug_assertions)]
-        [verb, aterm, root, seed, tags @ ..] if verb == "emails-reveal" => {
-            let (world, _) = prepare_run(Path::new(root), live)?;
-            let (value, code) = emails::reveal(Path::new(aterm), &world, seed, tags)?;
-            emit(&value)?;
-            return Ok(code);
-        }
-        #[cfg(not(debug_assertions))]
-        [verb, ..] if verb == "emails-reveal" => {
-            return Err(Fail::die(
-                "emails-reveal needs a debug lab image, as reveal-tab does",
-            ));
         }
         _ => return Err(Fail::usage(USAGE)),
     };

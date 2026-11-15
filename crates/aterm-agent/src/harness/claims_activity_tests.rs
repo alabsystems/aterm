@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::super::tests::Replica;
-use super::super::{Act, Cli, Kind, Mine, Touched, claimed, touch_on, touch_using};
+use super::super::{Act, Cli, Kind, Mine, Scope, Touched, claimed, touch_on, touch_using};
 use super::*;
 
 const NOW: i64 = 1_790_000_000;
@@ -44,6 +44,7 @@ impl Lab {
     fn touch(&self, name: &str, act: Act<'_>, now: i64) -> Touched {
         touch_on(
             &self.table,
+            Scope::Every,
             self.root.path(),
             &self.root.path().join(name),
             Some(&self.roster),
@@ -64,9 +65,11 @@ fn shared_claim_entrypoint_publishes_codex_and_refuses_a_second_machine() {
         let first = Lab::new();
         let second = Lab::new();
         for lab in [&first, &second] {
-            let secrets = lab.root.path().join(".secrets");
-            std::fs::create_dir(&secrets).unwrap();
-            std::fs::write(secrets.join(crate::harness::ai_pool::AI_POOL_FILE), "").unwrap();
+            crate::vault_entry::put(
+                lab.root.path(),
+                crate::harness::ai_pool::AI_POOL_FILE,
+                "version = 1\n",
+            );
         }
         let first_table = std::sync::Arc::new(Replica::new("aa01"));
         let second_table = std::sync::Arc::new(Replica::new("bb02"));
@@ -126,6 +129,7 @@ fn roster_and_table_reads_share_the_account_writer_lock() {
     };
     let result = touch_reading(
         &table,
+        Scope::Every,
         lab.root.path(),
         &store,
         Cli::Claude,
@@ -174,6 +178,7 @@ fn malformed_roster_refuses_but_an_absent_roster_remains_empty() {
     assert!(lab.table.row("aa01").is_none());
     let result = touch_on(
         &lab.table,
+        Scope::Every,
         lab.root.path(),
         &lab.root.path().join("second"),
         Some(&lab.root.path().join("absent.toml")),
@@ -378,6 +383,7 @@ fn a_senior_peer_refusal_survives_failure_to_save_the_observation() {
     };
     let result = touch_on(
         &table,
+        Scope::Every,
         lab.root.path(),
         &lab.root.path().join("first"),
         Some(&lab.roster),
@@ -509,6 +515,7 @@ impl<'a> Pushing<'a> {
     fn down(&self, lab: &Lab, store: &str, act: Act<'_>, now: i64) -> super::super::Pushed {
         super::super::push_on(
             self,
+            Scope::Every,
             lab.root.path(),
             &lab.root.path().join(store),
             Some(&lab.roster),
@@ -683,6 +690,7 @@ fn an_off_gives_up_every_claim_whatever_record_cannot_be_read() {
             let mut state = lab.state("first").load(NOW).unwrap().0;
             touch_using(
                 &lab.table,
+                Scope::Every,
                 lab.root.path(),
                 None,
                 &mut state,
@@ -710,6 +718,7 @@ fn legacy_claims_get_one_grace_period_without_perpetual_reseeding() {
         &Mine {
             machine: "aa01".into(),
             label: "m1".into(),
+            ranks_homes: false,
         },
         &key(),
         Kind::Lease,
@@ -769,6 +778,7 @@ fn peer_claim(lab: &Lab, until: i64) {
         &Mine {
             machine: "bb02".into(),
             label: "m2".into(),
+            ranks_homes: false,
         },
         &key(),
         Kind::Home,
@@ -833,6 +843,7 @@ fn failed_save_still_observes_a_live_peer() {
     let mut state = lab.state("second").load(NOW).unwrap().0;
     let result = touch_using(
         &lab.table,
+        Scope::Every,
         lab.root.path(),
         None,
         &mut state,
@@ -892,6 +903,7 @@ fn a_known_unwritable_table_does_not_record_unused_candidates() {
     let table: &dyn Table = &read_only;
     let result = touch_on(
         table,
+        Scope::Every,
         lab.root.path(),
         &lab.root.path().join("first"),
         Some(&lab.roster),
@@ -920,6 +932,7 @@ fn failed_activity_save_cannot_publish_a_claim() {
     let mut state = accounts::State::default();
     let result = touch_using(
         &lab.table,
+        Scope::Every,
         lab.root.path(),
         None,
         &mut state,
@@ -1035,6 +1048,7 @@ fn a_lost_publication_reply_still_has_durable_evidence_before_the_write() {
     let lab = Lab::new();
     let result = touch_on(
         &LostReply { lab: &lab },
+        Scope::Every,
         lab.root.path(),
         &lab.root.path().join("first"),
         Some(&lab.roster),
@@ -1162,6 +1176,7 @@ pub(crate) fn observation_transition(
                     &Mine {
                         machine: "aa01".into(),
                         label: "m1".into(),
+                        ranks_homes: false,
                     },
                     &key(),
                     Kind::Lease,
@@ -1218,6 +1233,7 @@ pub(crate) fn observation_transition(
             }
             let result = touch_using(
                 &table,
+                Scope::Every,
                 lab.root.path(),
                 None,
                 &mut local,

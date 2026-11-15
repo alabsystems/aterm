@@ -397,12 +397,12 @@ impl Counted {
 }
 
 /// An append rewrites only the trees on the paths it edits. A heartbeat over a journal with
-/// no `land/` entries and over one with 10,000 reads and writes the same trees, the root and
-/// `verdicts/`, and keeps `land/` by its id; a record under `land/<day>/<T>/` writes the root,
+/// no `land/` entries and over two entries on each of five days reads and writes only the root
+/// and `verdicts/`, keeping `land/` by its id; a record under `land/<day>/<T>/` writes the root,
 /// `land/`, `land/<day>/` and `<T>/`, whether `<T>/` is new or there; a removal drops what it
 /// empties. CONTROL: every tree is the one the old append's whole-journal `read-tree` /
 /// `write-tree` makes (`by_index`), every land entry kept. NEGATIVE CONTROL: list and make each
-/// untouched subtree again, and the heartbeat over 10,000 entries reads and writes `land/` too.
+/// untouched subtree again, and the populated journal's heartbeat reads and writes `land/` too.
 #[test]
 fn an_append_writes_only_the_trees_it_touches() {
     let (_tmp, one) = scratch(&["origin"]);
@@ -410,13 +410,22 @@ fn an_append_writes_only_the_trees_it_touches() {
     let mut r = lane_record("t0", "one", "judging", at);
     assert!(append(&one, "origin", None, &r, deadline()).unwrap());
     let small = head(&one, "origin", deadline()).unwrap().unwrap();
-    let paths: Vec<String> = (0..10_000u32)
+    let paths: Vec<String> = (0..10u32)
         .map(|i| format!("land/{}/{i:040x}/lint.{i:064x}.ok.toml", 20_400 + i % 5))
         .collect();
     let mut heartbeat = |parent: &str, updated: u64| {
         r.updated = updated;
         let (pushed, counted) = Counted::of(&one, |trees| {
-            append_with(&one, "origin", Some(parent), &r, deadline(), trees).unwrap()
+            append_with(
+                &one,
+                "origin",
+                Some(parent),
+                &r,
+                Place::Slot,
+                deadline(),
+                trees,
+            )
+            .unwrap()
         });
         assert!(pushed);
         let after = head(&one, "origin", deadline()).unwrap().unwrap();
@@ -467,7 +476,7 @@ fn an_append_writes_only_the_trees_it_touches() {
         .unwrap()
         .lines()
         .count(),
-        10_000
+        paths.len()
     );
 
     let body = blob_of(&one, "a new land record");
@@ -654,4 +663,598 @@ fn a_prune_removes_nothing_where_a_records_tree_names_no_journal_entry() {
          verdicts/x.toml\nverdicts/zz.toml",
         "only the stale record its own tree names is removed"
     );
+}
+
+/// A commit over `parent` whose tree puts each blob of `files` at its path, built at once as a
+/// fixture.
+fn with_blobs(root: &Path, parent: &str, files: &[(String, Vec<u8>)]) -> String {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let index = dir.path().join("index");
+    let run = |args: &[&str], input: Option<&[u8]>| {
+        let mut cmd = command(root, args);
+        cmd.env("GIT_INDEX_FILE", &index);
+        output(&mut cmd, input).unwrap()
+    };
+    run(&["read-tree", parent], None);
+    let lines: String = files
+        .iter()
+        .map(|(path, bytes)| {
+            let blob = run(&["hash-object", "-w", "--stdin"], Some(bytes));
+            format!("100644 blob {}\t{path}\n", blob.trim())
+        })
+        .collect();
+    run(&["update-index", "--index-info"], Some(lines.as_bytes()));
+    let tree = run(&["write-tree"], None);
+    git(
+        root,
+        &["commit-tree", tree.trim(), "-p", parent, "-m", "fixture"],
+    )
+    .unwrap()
+}
+
+/// The bytes at `path` on `head`.
+fn bytes_at(root: &Path, head: &str, path: &str) -> Vec<u8> {
+    capture_until(
+        &mut command(root, &["cat-file", "blob", &format!("{head}:{path}")]),
+        None,
+        deadline(),
+    )
+    .unwrap()
+    .stdout
+}
+
+/// `bytes` with the first digit after `marker` changed.
+fn flipped(bytes: &[u8], marker: &str) -> Vec<u8> {
+    let text = std::str::from_utf8(bytes).unwrap();
+    let at = text.find(marker).unwrap() + marker.len();
+    let mut out = bytes.to_vec();
+    out[at] = if out[at] == b'1' { b'2' } else { b'1' };
+    out
+}
+
+/// Exit test "the digest matches on read-back": signed records appended through one clone read
+/// back in a second clone of the same remote with the same blob ids and the same bytes, parse to
+/// the records written, and verify under the writer's key. CONTROL: the same records with one
+/// byte of each body changed, at the same paths, are unreadable: their signatures do not verify,
+/// while their names still say the pass and the FAIL. NEGATIVE CONTROL, run as a mutant that made
+/// this test fail: skip the signature check in `land_record::verify` (the changed records read).
+#[test]
+fn a_land_record_reads_back_byte_for_byte_and_its_signature_verifies() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, NOW, T, record, signer};
+    let (tmp, one) = scratch(&["origin"]);
+    let two = tmp.path().join("two");
+    git(tmp.path(), &["init", "--quiet", "two"]).unwrap();
+    let url = tmp.path().join("origin");
+    git(&two, &["remote", "add", "origin", url.to_str().unwrap()]).unwrap();
+    let me = signer(7);
+    let written = [
+        record(Check::Lint, Word::Ok, T, BASE, NOW),
+        record(Check::Test, Word::Fail, T, BASE, NOW),
+    ];
+    let signed: Vec<_> = written.iter().map(|r| r.sign(Some(&me)).unwrap()).collect();
+    let pushed = append_land(&one, "origin", &signed, NOW, deadline())
+        .unwrap()
+        .unwrap();
+    let fetched = head(&two, "origin", deadline()).unwrap();
+    assert_eq!(fetched.as_deref(), Some(pushed.as_str()));
+    let entries = land_records(&two, fetched.as_deref(), &[T], deadline()).unwrap();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    for (record, signed) in written.iter().zip(&signed) {
+        let path = &signed.path;
+        assert_eq!(
+            rev(&two, &format!("{pushed}:{path}")),
+            rev(&one, &format!("{pushed}:{path}")),
+            "{path}"
+        );
+        assert_eq!(bytes_at(&two, &pushed, path), signed.bytes, "{path}");
+        let entry = entries.iter().find(|e| e.path == *path).unwrap();
+        let read = entry.body.as_ref().unwrap();
+        assert_eq!(&read.record, record, "{path}");
+        assert_eq!(
+            read.signature.as_ref().map(|s| (s.node.as_str(), s.key)),
+            Some((me.node(), me.key())),
+            "{path}"
+        );
+    }
+    let changed: Vec<(String, Vec<u8>)> = signed
+        .iter()
+        .map(|s| (s.path.clone(), flipped(&s.bytes, "started = ")))
+        .collect();
+    let corrupt = with_blobs(&one, &pushed, &changed);
+    push(&one, "origin", &corrupt);
+    let fetched = head(&two, "origin", deadline()).unwrap();
+    let entries = land_records(&two, fetched.as_deref(), &[T], deadline()).unwrap();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    for entry in &entries {
+        let why = entry.body.as_ref().unwrap_err();
+        assert!(why.contains("signature does not verify"), "{why}");
+    }
+    let mut words: Vec<_> = entries
+        .iter()
+        .map(|entry| entry.filed.as_ref().unwrap().name.word.clone())
+        .collect();
+    words.sort();
+    assert_eq!(words, [Ok(Word::Ok), Ok(Word::Fail)]);
+}
+
+/// A FAIL's path keeps the first record filed there: a second FAIL record at the same path,
+/// from a writer whose append raced the first and so re-read the journal under the CAS, leaves
+/// the first in place and pushes nothing; so does a second FAIL later in one batch. CONTROL: an
+/// `ok` over an older `ok` at its path is replaced. NEGATIVE CONTROL, run as a mutant that made
+/// this test fail: let `land_append_with` put a FAIL already on its parent (the second
+/// replaces the first).
+#[test]
+fn a_fail_record_is_never_replaced() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, NOW, T, record, signer};
+    let (_tmp, one) = scratch(&["origin"]);
+    let me = signer(7);
+    let fail = |id: &str, word| {
+        let mut r = record(Check::Lint, word, T, BASE, NOW);
+        r.run.id = id.into();
+        r.sign(Some(&me)).unwrap()
+    };
+    let (first, second) = (fail("first", Word::Fail), fail("second", Word::Fail));
+    assert_eq!(first.path, second.path);
+    assert_ne!(first.bytes, second.bytes);
+    let stale = head(&one, "origin", deadline()).unwrap();
+    let held = append_land(
+        &one,
+        "origin",
+        std::slice::from_ref(&first),
+        NOW,
+        deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        land_append(
+            &one,
+            "origin",
+            stale.as_deref(),
+            std::slice::from_ref(&second),
+            NOW,
+            deadline()
+        ),
+        Ok(Appended::Raced),
+        "the second writer raced the first"
+    );
+    assert_eq!(
+        append_land(
+            &one,
+            "origin",
+            std::slice::from_ref(&second),
+            NOW,
+            deadline()
+        ),
+        Ok(Some(held.clone())),
+        "re-read under the CAS, it has nothing to write"
+    );
+    assert_eq!(bytes_at(&one, &held, &first.path), first.bytes);
+
+    let mut later = record(Check::Test, Word::Fail, T, BASE, NOW);
+    later.run.id = "one".into();
+    let batch_first = later.sign(Some(&me)).unwrap();
+    later.run.id = "two".into();
+    let batch_second = later.sign(Some(&me)).unwrap();
+    let after = append_land(
+        &one,
+        "origin",
+        &[batch_first.clone(), batch_second],
+        NOW,
+        deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(bytes_at(&one, &after, &batch_first.path), batch_first.bytes);
+
+    let (older, newer) = (fail("older", Word::Ok), fail("newer", Word::Ok));
+    append_land(&one, "origin", &[older], NOW, deadline()).unwrap();
+    let last = append_land(
+        &one,
+        "origin",
+        std::slice::from_ref(&newer),
+        NOW,
+        deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        bytes_at(&one, &last, &newer.path),
+        newer.bytes,
+        "CONTROL: a pass takes the newer record"
+    );
+}
+
+/// The land prune keeps its own day marker, `land/pruned-at`: after a lane append has written
+/// the day's `pruned-at` first, the day's first land append still drops each `land/<day>/` past
+/// `LAND_RETENTION` and keeps a younger one, writes `land/pruned-at`, leaves the lane's
+/// `pruned-at` alone, and appends no record filed under a day it drops. CONTROL: a second land
+/// append the same day prunes nothing. NEGATIVE CONTROL, run as a mutant that made this test
+/// fail: read the lane's `pruned-at` for the land prune (the expired day stays).
+#[test]
+fn the_land_prune_runs_on_its_own_marker() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, DAY, NOW, T, T2, record, signer};
+    let (_tmp, one) = scratch(&["origin"]);
+    let me = signer(7);
+    assert!(
+        append(
+            &one,
+            "origin",
+            None,
+            &lane_record("t0", "one", "judging", NOW),
+            deadline()
+        )
+        .unwrap()
+    );
+    let lane = head(&one, "origin", deadline()).unwrap().unwrap();
+    assert_eq!(
+        git(&one, &["show", &format!("{lane}:pruned-at")]).unwrap(),
+        DAY.to_string()
+    );
+    let at = |day: u64| day * 86_400 + 600;
+    let old = record(Check::Lint, Word::Ok, T2, BASE, at(DAY - 3))
+        .sign(Some(&me))
+        .unwrap();
+    let young = record(Check::Lint, Word::Ok, T2, BASE, at(DAY - 2))
+        .sign(Some(&me))
+        .unwrap();
+    let seeded = with_blobs(
+        &one,
+        &lane,
+        &[
+            (old.path.clone(), old.bytes.clone()),
+            (young.path.clone(), young.bytes.clone()),
+        ],
+    );
+    push(&one, "origin", &seeded);
+    let days = |head: &str| git(&one, &["ls-tree", "--name-only", head, "land/"]).unwrap();
+    let expired = record(Check::Fmt, Word::Ok, T, BASE, at(DAY - 3))
+        .sign(Some(&me))
+        .unwrap();
+    let fresh = record(Check::Fmt, Word::Ok, T, BASE, NOW)
+        .sign(Some(&me))
+        .unwrap();
+    let pruned = append_land(
+        &one,
+        "origin",
+        &[expired.clone(), fresh.clone()],
+        NOW,
+        deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        days(&pruned),
+        format!("land/{}\nland/{DAY}\nland/pruned-at", DAY - 2)
+    );
+    assert_eq!(
+        git(&one, &["show", &format!("{pruned}:{LAND_PRUNED_AT}")]).unwrap(),
+        DAY.to_string()
+    );
+    assert_eq!(
+        rev(&one, &format!("{pruned}:pruned-at")),
+        rev(&one, &format!("{lane}:pruned-at"))
+    );
+    assert_eq!(bytes_at(&one, &pruned, &fresh.path), fresh.bytes);
+    assert!(
+        git(&one, &["ls-tree", &pruned, &expired.path])
+            .unwrap()
+            .is_empty()
+    );
+
+    let reseeded = with_blobs(&one, &pruned, &[(old.path.clone(), old.bytes.clone())]);
+    push(&one, "origin", &reseeded);
+    let again = record(Check::Census, Word::Ok, T, BASE, NOW)
+        .sign(Some(&me))
+        .unwrap();
+    let kept = append_land(&one, "origin", &[again], NOW, deadline())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        days(&kept),
+        format!(
+            "land/{}\nland/{}\nland/{DAY}\nland/pruned-at",
+            DAY - 3,
+            DAY - 2
+        ),
+        "CONTROL: the day's second land append prunes nothing"
+    );
+}
+
+/// RUN RECORDS KEEP FOURTEEN DAYS BESIDE VERDICTS OF TWO: one store, a retention per kind. The
+/// first land append past `land/pruned-at`'s day drops the verdict day three days old and keeps
+/// the run days three and fourteen days old, while it drops the run day fifteen days old; a run
+/// record filed under a day its retention has expired is not appended. The verdict reader skips
+/// `land/runs` (it names no unreadable entry there) and the run reader reads each run record kept,
+/// from the day it is given on. NEGATIVE CONTROL, run as a mutant that made this test fail: prune
+/// `land/runs/<day>/` by a verdict's retention (the run days three and fourteen days old go).
+#[test]
+fn run_records_keep_fourteen_days_beside_verdicts_of_two() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, DAY, NOW, T, record, signer};
+    use crate::land_run::Kind;
+    use crate::land_run::tests::record as run_record;
+    let (_tmp, one) = scratch(&["origin"]);
+    let me = signer(7);
+    assert!(
+        append(
+            &one,
+            "origin",
+            None,
+            &lane_record("t0", "one", "judging", NOW),
+            deadline()
+        )
+        .unwrap()
+    );
+    let lane = head(&one, "origin", deadline()).unwrap().unwrap();
+    let at = |day: u64| day * 86_400 + 600;
+    let ran = |day: u64| {
+        crate::land_run::Record {
+            at: at(day),
+            ..run_record(Kind::End, 0)
+        }
+        .sign(Some(&me))
+        .unwrap()
+    };
+    let verdict_old = record(Check::Lint, Word::Ok, T, BASE, at(DAY - 3))
+        .sign(Some(&me))
+        .unwrap();
+    let seeded: Vec<(String, Vec<u8>)> = [
+        verdict_old.clone(),
+        ran(DAY - 15),
+        ran(DAY - 14),
+        ran(DAY - 3),
+    ]
+    .into_iter()
+    .map(|signed| (signed.path, signed.bytes))
+    .collect();
+    push(&one, "origin", &with_blobs(&one, &lane, &seeded));
+    let fresh = record(Check::Fmt, Word::Ok, T, BASE, NOW)
+        .sign(Some(&me))
+        .unwrap();
+    let pruned = append_land(
+        &one,
+        "origin",
+        &[fresh.clone(), ran(DAY), ran(DAY - 16)],
+        NOW,
+        deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    let ls = |dir: &str| git(&one, &["ls-tree", "--name-only", &pruned, dir]).unwrap();
+    assert_eq!(
+        ls("land/"),
+        format!("land/{DAY}\nland/pruned-at\nland/runs")
+    );
+    assert_eq!(
+        ls("land/runs/"),
+        format!(
+            "land/runs/{}\nland/runs/{}\nland/runs/{DAY}",
+            DAY - 14,
+            DAY - 3
+        )
+    );
+    let verdicts = land_records(&one, Some(&pruned), &[T], deadline()).unwrap();
+    assert_eq!(
+        verdicts.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+        [fresh.path.as_str()],
+        "{verdicts:?}"
+    );
+    let runs = run_records(&one, Some(&pruned), 0, deadline()).unwrap();
+    let days: Vec<u64> = runs
+        .iter()
+        .map(|entry| {
+            let body = entry.body.as_ref().expect("it reads");
+            body.record.at / 86_400
+        })
+        .collect();
+    assert_eq!(days, [DAY - 14, DAY - 3, DAY]);
+    assert_eq!(
+        run_records(&one, Some(&pruned), DAY - 3, deadline())
+            .unwrap()
+            .len(),
+        2,
+        "the run reader reads from the day it is given on"
+    );
+}
+
+/// The land prune goes by the earlier of the appending Mac's day and the lane's own (its
+/// `pruned-at`): a Mac whose clock runs 3 days ahead drops no current record, the day's FAIL
+/// included, and moves `land/pruned-at` no further than the lane's day, however often it
+/// appends. CONTROL: the next day, after the lane's own append, a correct clock's land append
+/// still drops the day past `LAND_RETENTION`. NEGATIVE CONTROL: with no lane day in the journal,
+/// a land append prunes nothing and writes no `land/pruned-at`.
+#[test]
+fn a_clock_ahead_prunes_no_current_record() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, DAY, NOW, T, T2, record, signer};
+    let me = signer(7);
+    let at = |day: u64| day * 86_400 + 600;
+    let signed = |check, word, tree: &str, ended| {
+        record(check, word, tree, BASE, ended)
+            .sign(Some(&me))
+            .unwrap()
+    };
+    let old = signed(Check::Lint, Word::Ok, T2, at(DAY - 2));
+    let current = signed(Check::Lint, Word::Fail, T, NOW);
+    let days =
+        |root: &Path, head: &str| git(root, &["ls-tree", "--name-only", head, "land/"]).unwrap();
+
+    let (_tmp, one) = scratch(&["origin"]);
+    assert!(
+        append(
+            &one,
+            "origin",
+            None,
+            &lane_record("t0", "one", "judging", NOW),
+            deadline()
+        )
+        .unwrap()
+    );
+    let lane = head(&one, "origin", deadline()).unwrap().unwrap();
+    let seeded = with_blobs(
+        &one,
+        &lane,
+        &[
+            (old.path.clone(), old.bytes.clone()),
+            (current.path.clone(), current.bytes.clone()),
+        ],
+    );
+    push(&one, "origin", &seeded);
+    let ahead = NOW + 3 * 86_400;
+    let mut last = seeded;
+    for _ in 0..2 {
+        let record = signed(Check::Fmt, Word::Ok, T2, ahead);
+        last = append_land(&one, "origin", &[record], ahead, deadline())
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(
+        days(&one, &last),
+        format!(
+            "land/{}\nland/{DAY}\nland/{}\nland/pruned-at",
+            DAY - 2,
+            DAY + 3
+        )
+    );
+    assert_eq!(bytes_at(&one, &last, &current.path), current.bytes);
+    assert_eq!(
+        git(&one, &["show", &format!("{last}:{LAND_PRUNED_AT}")]).unwrap(),
+        DAY.to_string(),
+        "no further than the lane's day"
+    );
+
+    let tomorrow = NOW + 86_400;
+    assert!(
+        append(
+            &one,
+            "origin",
+            Some(&last),
+            &lane_record("t1", "two", "judging", tomorrow),
+            deadline()
+        )
+        .unwrap()
+    );
+    let pruned = append_land(
+        &one,
+        "origin",
+        &[signed(Check::Census, Word::Ok, T, tomorrow)],
+        tomorrow,
+        deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        days(&one, &pruned),
+        format!(
+            "land/{DAY}\nland/{}\nland/{}\nland/pruned-at",
+            DAY + 1,
+            DAY + 3
+        ),
+        "CONTROL: the correct clock's next day drops the day past retention"
+    );
+    assert_eq!(
+        git(&one, &["show", &format!("{pruned}:{LAND_PRUNED_AT}")]).unwrap(),
+        (DAY + 1).to_string()
+    );
+
+    let (_tmp, two) = scratch(&["origin"]);
+    let old_day = signed(Check::Lint, Word::Ok, T2, at(DAY - 3));
+    let unpruned = append_land(&two, "origin", &[old_day], at(DAY - 3), deadline())
+        .unwrap()
+        .unwrap();
+    let kept = append_land(
+        &two,
+        "origin",
+        &[signed(Check::Fmt, Word::Ok, T, NOW)],
+        NOW,
+        deadline(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_ne!(kept, unpruned);
+    assert_eq!(
+        days(&two, &kept),
+        format!("land/{}\nland/{DAY}", DAY - 3),
+        "NEGATIVE CONTROL: no lane day, no prune"
+    );
+}
+
+/// A RECORD BESIDE ITS TREE'S SLOT IS THE JOURNAL'S AS ANY OTHER. `records` reads it with the
+/// slot's and `record` reads the slot alone; `published` knows a record the journal has held, at
+/// either place, at the head or before it; and a prune removes a stale record beside a slot by
+/// its own path, leaving the slot's record to its own age. NEGATIVE CONTROL: prune it by the
+/// slot its tree names, as every record was pruned before, and the fresh verdict goes while the
+/// stale record stays.
+#[test]
+fn a_record_beside_a_slot_is_read_found_and_pruned_by_its_own_path() {
+    let (_tmp, one) = scratch(&["origin"]);
+    let day = 20_404 * 86_400;
+    let old = day - RETENTION - 86_400;
+    let fresh = lane_record("t", "held", "pass", day);
+    assert!(append(&one, "origin", None, &fresh, deadline()).unwrap());
+    let parent = head(&one, "origin", deadline()).unwrap();
+    let late = lane_record("t", "late", "red", old);
+    assert!(!published(&one, parent.as_deref(), &late, deadline()).unwrap());
+    assert!(
+        append_at(
+            &one,
+            "origin",
+            parent.as_deref(),
+            &late,
+            Place::Beside,
+            deadline()
+        )
+        .unwrap()
+    );
+    let parent = head(&one, "origin", deadline()).unwrap();
+    assert_eq!(
+        git(
+            &one,
+            &["ls-tree", "-r", "--name-only", parent.as_deref().unwrap()]
+        )
+        .unwrap(),
+        "pruned-at\nverdicts/t.toml\nverdicts/t/late.toml"
+    );
+    let both = records(&one, parent.as_deref(), deadline()).unwrap();
+    assert!(both.contains(&fresh) && both.contains(&late), "{both:?}");
+    assert_eq!(
+        record(&one, parent.as_deref(), "t", deadline()).unwrap(),
+        Some(fresh.clone()),
+        "a tree's verdict is its slot's"
+    );
+    let next = lane_record("u", "next", "judging", day + 86_400);
+    assert!(append(&one, "origin", parent.as_deref(), &next, deadline()).unwrap());
+    let after = head(&one, "origin", deadline()).unwrap();
+    assert_eq!(
+        git(
+            &one,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                after.as_deref().unwrap(),
+                "verdicts/"
+            ]
+        )
+        .unwrap(),
+        "verdicts/t.toml\nverdicts/u.toml",
+        "the stale record went by its own path, and the tree's fresh verdict stayed"
+    );
+    for held in [&fresh, &late, &next] {
+        assert!(
+            published(&one, after.as_deref(), held, deadline()).unwrap(),
+            "the journal held {held:?}, pruned since or not"
+        );
+    }
+    let never = lane_record("t", "never", "red", old);
+    assert!(!published(&one, after.as_deref(), &never, deadline()).unwrap());
 }

@@ -9,9 +9,9 @@ use aterm_buffer::Seq;
 
 use super::chord::KeyChord;
 use super::command::{CommandAuthority, EditorCommand, Invocation, PrefixArgument, TAB_STOP};
-use super::history::DocumentHistory;
 #[cfg(test)]
 use super::history::HistoryMutant;
+use super::history::OwnedHistory;
 use super::keymap::{KeyResolution, Keymap, Platform, Profile};
 use super::kill::YankRecord;
 use super::macros::{KbdMacros, MacroStep};
@@ -187,7 +187,7 @@ pub struct EditorWorkspace {
     /// CRLF (every line of its file ended so): a yank puts a kill's CRLF in as LF, as the face
     /// does for typing and pastes, so the file does not save CR CR LF.
     pub crlf_on_disk: bool,
-    pub(super) histories: BTreeMap<DocumentId, DocumentHistory>,
+    pub(super) histories: BTreeMap<DocumentId, OwnedHistory>,
     /// The keyboard macros of input that carries [`CommandAuthority::Clipboard`] (the person's).
     pub(super) macros: KbdMacros,
     /// The keyboard macros of input that carries no clipboard authority (in aterm, a control
@@ -328,6 +328,29 @@ impl EditorWorkspace {
             self.buffers.push(document);
         }
         Ok(EditorBufferView::new(document, document_view, seq))
+    }
+
+    /// Build one unpublished view while retaining exclusive rollback authority.
+    pub fn attach_unpublished(
+        &mut self,
+        store: &mut DocumentStore,
+        document: DocumentId,
+        document_view: DocumentViewId,
+    ) -> Result<(EditorBufferView, crate::store::UnpublishedAttachment), EditorError> {
+        let attachment = store
+            .attach_unpublished_view(document, document_view)
+            .map_err(|_| EditorError::UnknownDocument)?;
+        let seq = store
+            .snapshot(document)
+            .ok_or(EditorError::UnknownDocument)?
+            .seq;
+        if !self.buffers.contains(&document) {
+            self.buffers.push(document);
+        }
+        Ok((
+            EditorBufferView::new(document, document_view, seq),
+            attachment,
+        ))
     }
 
     /// Insert typed text at every selection: a self-insert, so one

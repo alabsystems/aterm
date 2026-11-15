@@ -161,6 +161,7 @@ fn said_of_event(e: &StepEvent) -> Option<Said> {
             ("model", None, w)
         }
         StepEvent::Off { why } => ("off", None, vec![(*why).to_string()]),
+        StepEvent::Lost { n } => ("lost", None, vec![format!("n={n}")]),
     };
     words.sort();
     Some(Said {

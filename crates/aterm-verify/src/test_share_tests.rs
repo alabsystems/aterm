@@ -205,6 +205,47 @@ fn a_held_claim_accounts_for_load_by_its_age_and_a_later_waiter_is_behind() {
     assert_eq!((behind.waiting, behind.reserved), (1, 3));
 }
 
+/// THE TURN'S HOLDER RUNS AT FULL WIDTH. A run under the process that holds the judgment turn
+/// has all the room no other claim holds: on 12 cores at a 5-minute load of 30, all 12, where the
+/// same ledger read without the turn shares 3. NEGATIVE CONTROL: read by another process, the
+/// turn is not its own, and its share beside the 4 cores held is 2.
+#[test]
+fn a_run_that_holds_the_judgment_turn_has_all_the_room() {
+    let tmp = aterm_tempfile::tempdir().expect("scratch");
+    let ledger = Ledger::at(tmp.path().join("ledger"));
+    let fixed = Fixed::new(machine(0.0));
+    let admit = |need: Need| {
+        aterm_capacity::admit::try_admit_with(&ledger, &fixed, need)
+            .expect("the ledger answers")
+            .expect("admitted")
+    };
+    let _turn = admit(Need::new("verify judgment turn").heavy(0, 600_000));
+    let _held = admit(Need::new("other work").cores(4));
+    let records = ledger.list().expect("lists");
+    let mut asker = asker_after(&ledger);
+    asker.pid += 1;
+    asker.ancestors = vec![std::process::id()];
+    let under = Others::of(&records, &asker, unix_ms());
+    assert!(under.turn, "{under:?}");
+    assert_eq!(fair(12, &machine(30.0), &under, 0.0), 12);
+    assert_eq!(
+        fair(
+            12,
+            &machine(30.0),
+            &Others {
+                turn: false,
+                ..under
+            },
+            0.0
+        ),
+        3
+    );
+    asker.ancestors.clear();
+    let other = Others::of(&records, &asker, unix_ms());
+    assert!(!other.turn);
+    assert_eq!(fair(12, &machine(30.0), &other, 0.0), 2);
+}
+
 /// THE LOAD A RUN'S OWN BINARIES PUT IN IS NOT WORK NOBODY CLAIMED. Alone on a machine whose
 /// 5-minute load of 12 is its own binaries', a run has the 12 cores it asked. NEGATIVE CONTROL:
 /// with that load unread the share is 6, and a run would hold itself to half the machine.

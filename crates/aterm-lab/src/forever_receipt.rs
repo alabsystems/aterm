@@ -14,10 +14,10 @@
 
 use std::path::Path;
 
+use alab_policy::land_check::{RULE_LAND_CHECK, landed_reply};
+use alab_policy::words::RULE_LAND;
 use aterm_agent::harness::acts::{LandReceipt, ReceiptLeg};
 use aterm_agent::harness::land_receipt::{HEAD_DIGITS, RECEIPT};
-use aterm_agent::supervise::policy::land_check::{RULE_LAND_CHECK, landed_reply};
-use aterm_agent::supervise::policy::turn_end::RULE_LAND;
 
 use super::{Chain, Scenario, Seen, Verdict, at};
 use crate::util::one_line;

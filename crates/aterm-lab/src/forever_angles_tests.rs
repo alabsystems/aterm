@@ -4,11 +4,14 @@
 //! Tests for `cruise-angles` (v6 §14.5's 5a): its script and its judge, over records shaped as
 //! the loop journals them.
 
-use aterm_agent::supervise::policy::go_ahead::{NEVER_A_NEED, unless_held};
-use aterm_agent::supervise::policy::needs::{defense_line, needs_you};
-use aterm_agent::supervise::policy::turn_end::{
-    DONE_CHECK_FIXED_BEFORE, MIN_WORK, done_check_act, done_check_words, open_work, says_done,
+use alab_policy::config::MIN_WORK;
+use alab_policy::go_ahead::{NEVER_A_NEED, unless_held};
+use alab_policy::needs::{defense_line, needs_you};
+use alab_policy::{
+    open_work::open_work,
+    words::{DONE_CHECK_FIXED_BEFORE, done_check_words, says_done},
 };
+use aterm_agent::supervise::policy::turn_end::done_check_act;
 
 use std::path::PathBuf;
 

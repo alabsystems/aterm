@@ -3,7 +3,6 @@
 
 //! Supervisor keystrokes on prompt and question boxes.
 
-use super::super::policy::KeyAct;
 use super::super::policy::approval::{
     Answer, AnswerTarget, DeclineStep, QuestionPriority, decline_step,
 };
@@ -13,6 +12,7 @@ use super::super::policy::question::{
 };
 use super::approval_loop::PendingKind;
 use super::*;
+use alab_policy::guard::KeyAct;
 use aterm_phase::{QuestionDialog, QuestionFocus, QuestionForm};
 
 const MAX_DECLINE_STEPS: u32 = 3 + 3;
@@ -242,7 +242,7 @@ impl<C: Ctl> Session<'_, C> {
                 "the read carried no person count to fence the Enter on a typed answer",
             );
         }
-        let guard = super::super::policy::row_guard(&now.rows[row]);
+        let guard = alab_policy::guard::row_guard(&now.rows[row]);
         let at = match self.question_key(&guard, "enter", &now, person, Some(KeyAct::Answer))? {
             Keyed::Written(at) => at,
             Keyed::Not(p) => return Ok(p),
@@ -338,7 +338,7 @@ impl<C: Ctl> Session<'_, C> {
             ) else {
                 return unconfirmed("the dialog shows no focus to move");
             };
-            let guard = super::super::policy::row_guard(&now.rows[row]);
+            let guard = alab_policy::guard::row_guard(&now.rows[row]);
             let at = match self.question_key(&guard, arrow, &now, person, None)? {
                 Keyed::Written(at) => at,
                 Keyed::Not(p) => return Ok(Moved::Stopped(p)),
@@ -442,7 +442,7 @@ impl<C: Ctl> Session<'_, C> {
         else {
             return unconfirmed("the free-text row is not on the rows read");
         };
-        let guard = super::super::policy::row_guard(&now.rows[row]);
+        let guard = alab_policy::guard::row_guard(&now.rows[row]);
         let at = match self.question_text(&guard, text, &now, &key, priority, person)? {
             Keyed::Written(at) => at,
             Keyed::Not(p) => {
@@ -570,7 +570,7 @@ impl<C: Ctl> Session<'_, C> {
                 retry: false,
             }));
         };
-        let args = super::super::policy::key_args(guard, key, Some(generation));
+        let args = alab_policy::guard::key_args(guard, key, Some(generation));
         let args = match person {
             Some(n) => format!("if-human={n} {args}"),
             None => args,
@@ -704,9 +704,9 @@ impl<C: Ctl> Session<'_, C> {
         if self.unserved(&r) {
             return Err(Fail::Lost(format!("help key failed: {}", r.stderr.trim())));
         }
-        let known = r.ok() && super::super::policy::server_fences_gen(&r.stdout);
+        let known = r.ok() && alab_policy::guard::server_fences_gen(&r.stdout);
         self.caps.gen_fence = Some(known);
-        self.caps.act_word = Some(r.ok() && super::super::policy::server_takes_act(&r.stdout));
+        self.caps.act_word = Some(r.ok() && alab_policy::guard::server_takes_act(&r.stdout));
         Ok(known)
     }
 
@@ -825,7 +825,7 @@ impl<C: Ctl> Session<'_, C> {
             let Some(generation) = now.generation.clone() else {
                 return unconfirmed("the read carried no screen generation to fence on");
             };
-            let args = fenced(super::super::policy::key_args(
+            let args = fenced(alab_policy::guard::key_args(
                 guard,
                 arrow,
                 Some(&generation),
@@ -877,10 +877,10 @@ impl<C: Ctl> Session<'_, C> {
         let Some(generation) = now.generation.clone() else {
             return unconfirmed("the read carried no screen generation to fence on");
         };
-        let enter_guard = super::super::policy::row_guard(&now.rows[focused.row]);
+        let enter_guard = alab_policy::guard::row_guard(&now.rows[focused.row]);
         let args = self.acting(
             act,
-            fenced(super::super::policy::key_args(
+            fenced(alab_policy::guard::key_args(
                 &enter_guard,
                 key,
                 Some(&generation),
@@ -1217,7 +1217,7 @@ impl<C: Ctl> Session<'_, C> {
         person: Option<&str>,
         act: Option<KeyAct>,
     ) -> Result<(CtlReply, String), Fail> {
-        let args = super::super::policy::key_args(guard, key, Some(generation));
+        let args = alab_policy::guard::key_args(guard, key, Some(generation));
         let args = match person {
             Some(fence) => format!("{fence} {args}"),
             None => args,

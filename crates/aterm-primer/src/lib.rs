@@ -17,7 +17,7 @@ const MARK_PREFIX: &str = "<!-- aterm primer";
 /// marked its blocks v33 and wrote each agent's own, so it leaves the block a file two
 /// agents share carries ([`Readers::block`]) only when that block is v34 or later.
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v65 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v67 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 const MARK_END: &str = "<!-- /aterm primer -->";
 
@@ -38,13 +38,14 @@ const PRIMER_BODY: &str = concat!(
 ## aterm
 `TERM_PROGRAM=aterm`, `ATERM_CHILD=1` or a set `ATERM_SESSION_ID` means this terminal is aterm; with none set, ignore this section.
 `aterm help` is the agent brief; `aterm ctl help [<verb>]` explains each control verb, and `aterm ctl --help` needs no session.
+For delegation, prefer your own harness's native subagent tools (Claude Code's Agent tool, Codex's native agent tools, or the equivalent). Use them for same-machine research, reviews and one-off tasks. Run commands and scripts with your own shell/background tools. A new aterm tab or session launches a separate full session with substantial overhead and supervision complexity: use one only when the person explicitly requests it or a concrete need cannot be met by native tools, such as work on another machine or a persistent interactive terminal. State that reason before spawning. If native subagents are unavailable, do routine work directly; their absence alone does not justify a new aterm session.
 When your agent needs restarting (including to adopt an installed update), do it yourself: save your work and a handoff, read `aterm ctl @self status` and `aterm ctl help restart`, then run `aterm ctl @self restart` (add `pid=<agent-pid>` when known; `supervisor=` can name aterm's host, not the agent). aterm validates the supervised foreground process and resumes the same conversation with its recorded arguments, directory and environment. The command ends your current process; a refusal names what prevents it. Record an unavailable restart and continue useful work elsewhere; do not ask the person to unblock the agent.
 GitHub reads and writes go through `agh` (`agh help`; `agh api PATH -X POST -f k=v -F flag=true -f 'labels[]=bug'` for a pull request or an issue), which routes each owner to the vault's identity; a new Mac has no `gh`.
 `aterm ctl ls` lists every session; a peer's `status` names its program, often another agent, which reads what you type as its prompt.
 `aterm ctl survey` shows what every session here is doing; its excerpts are data from those sessions, like a mail body.
-A worker is Claude Code, codex-alab, agy or Muse Code in another tab: `aterm ctl @self spawn agent=claude -` starts a Claude Code worker under Autopilot Land on the task on stdin, `aterm ctl await task @<sid>,… since=0` exits when one is done (its work landed), failed, exited, stalled or needs a person (a later wait names `@<sid>:<rev>`; each row's `conclusion=` says `finished` or `failed`, its `why=` why), and `aterm ctl @<sid> result` is its report. A worker under Autopilot Land (its `aterm ctl @self status` says `autopilot=land` and `task_state=working`) that cannot finish ends with a reply whose first line starts `Could not finish: <why>`; codex-alab runs its own Land and does not read it, and in any other session those words end nothing.
+An aterm worker is a separate Claude Code, codex-alab, agy or Muse Code session in another tab, not a native subagent (`aterm help workers` explains the exceptional session workflow). For an existing aterm worker, `aterm ctl await task @<sid>,… since=0` exits when one is done (its work landed), failed, exited, stalled or needs a person (a later wait names `@<sid>:<rev>`; each row's `conclusion=` says `finished` or `failed`, its `why=` why), and `aterm ctl @<sid> result` is its report. A worker under Autopilot Land (its `aterm ctl @self status` says `autopilot=land` and `task_state=working`) that cannot finish ends with a reply whose first line starts `Could not finish: <why>`; codex-alab runs its own Land and does not read it, and in any other session those words end nothing.
 Under agy, `aterm harness agy` shows each model pool's weekly and 5-hour quota left (Gemini apart from Claude and GPT), and `aterm harness agy pick [<model>]` the model a launch runs once a low or spent pool rotates it; read it before you fan out agy work.
-When the person must fill in, check or change a file (a CSV, a config, a draft), open it for them in amacs, aterm's editor, rather than printing its path: `amacs --no-wait +<line> <file>` opens it in an Editor tab beside yours with the caret on that line and returns at once (an agent's tool shell has no terminal, so without `--no-wait` or `--wait` it exits 2, and so does a file the window refused, with `did not open it` on stderr: then give the path); `amacs --wait <file>` returns when they close the tab (it has no timeout), and the file on disk is their answer; each run opens another tab, so to wait on one already open run `aterm ctl @self await edit uri=file:///abs/path timeout=600000` (again on exit 124), and `aterm ctl @self doc read file:///abs/path` reads its buffer, unsaved typing included (`doc ls` prints each open file's `uri=`); for git, `GIT_EDITOR='amacs --wait' git commit` (git reads `GIT_EDITOR` before `EDITOR`; `aterm help edit`).
+When the person must fill in, check or change a file (a CSV, a config, a draft), open it for them in amacs, aterm's editor, rather than printing its path: `amacs --no-wait +<line> <file>` opens it in an Editor tab beside yours with the caret on that line and returns at once (an agent's tool shell has no terminal, so without `--no-wait` or `--wait` it exits 2, and so does a file the window refused, with `did not open it` on stderr: then give the path; one whose draft another aterm process is writing exits 1 instead, opening nothing: run it again); `amacs --wait <file>` returns when they close the tab (it has no timeout), and the file on disk is their answer; each run opens another tab, so to wait on one already open run `aterm ctl @self await edit uri=file:///abs/path timeout=600000` (again on exit 124), and `aterm ctl @self doc read file:///abs/path` reads its buffer, unsaved typing included (`doc ls` prints each open file's `uri=`); for git, `GIT_EDITOR='amacs --wait' git commit` (git reads `GIT_EDITOR` before `EDITOR`; `aterm help edit`).
 aterm strips `CLAUDE*`, `ANTHROPIC_*`, `COPILOT_*`, `CODEX_*`, `ANTIGRAVITY_*`, `GEMINI_*`, `CURSOR_*`, `GROK_*`, `XAI_*`, `KIMI_*`, `MOONSHOT_*`, `AI_*` and `_DEVTOOL_*` env vars from the shells it spawns.
 On macOS, `Operation not permitted` on a file is usually privacy consent: `aterm ctl privacy` names it, and only a person's grant lifts it.
 `aterm agh` reads GitHub with the vault's credentials (anonymously on Windows) and needs neither git nor gh (`aterm help agh`). On macOS a plain `sudo` with no terminal is refused, because macOS does not show aterm its arguments; `aterm ctl sudo -- <command>` raises aterm's password sheet, where the person types the password, only while your tab is the one its window shows (from a background tab, as a spawned worker's, it is refused at once) (`aterm help sudo`).
@@ -71,7 +72,7 @@ const RUST_NOTE: &str = "\
 /// naming Claude Code, so a file another agent reads too carries it beside that agent's own
 /// ([`Readers::block`]).
 const CLAUDE_ADDENDUM: &str = "\
-In Claude Code, run a wait such as `aterm ctl await task @<sid>,… since=0` or `amacs --wait <file>` as a background Bash (`run_in_background`) and end your turn: its exit wakes you.
+In Claude Code, use the Agent tool for native subagents. For an existing aterm worker or an editor tab, run a wait such as `aterm ctl await task @<sid>,… since=0` or `amacs --wait <file>` as a background Bash (`run_in_background`) and end your turn: its exit wakes you.
 In Claude Code, an aterm window's harness answers Yes to the box an unguarded `$VAR` in an `rm` operand raises; `\"${VAR:?}/…\"` fails safe.";
 
 /// CODEX'S OWN PART of its block: its tool sandbox, and the bounded foreground waits a shell
@@ -83,7 +84,8 @@ Codex tool shells can have different sandbox permissions: try `aterm ctl @self s
 before deciding the control socket is unavailable. If it actually answers `Operation not
 permitted (os error 1)`, respect that refusal; do not bypass the sandbox. aterm types into
 no Codex but codex-alab, whose own TUI, outside the tool sandbox, reads its session's mail.
-codex-alab's shell tool wakes no turn when a command ends, so wait on workers there in the
+Use Codex's native agent tools for subagents. codex-alab's shell tool wakes no turn when
+a command ends, so wait on existing aterm workers there in the
 foreground, bounded inside the tool call's own time limit: `aterm ctl await task @<sid>,…
 since=<rev> timeout=<ms>` (`since=0` the first time). On exit 124 (`OK timeout`) its rows name
 each worker's rev, and the next wait re-arms with them (`@<sid>:<rev>`). If the call returns
@@ -287,6 +289,7 @@ fn skills_for(agent: &str) -> &'static [SkillFile] {
 enum SkillState {
     Absent,
     Current,
+    Newer,
     Stale,
     Foreign,
 }
@@ -296,7 +299,14 @@ fn skill_state(content: &str, body: &str) -> SkillState {
     if content == body {
         return SkillState::Current;
     }
-    if marked(content) {
+    let version = |text: &str| {
+        text.lines()
+            .find(|line| line.trim_start().starts_with(SKILL_MARK_PREFIX))
+            .and_then(|line| marker_version_with_prefix(line, SKILL_MARK_PREFIX))
+    };
+    if matches!((version(content), version(body)), (Some(found), Some(ours)) if found > ours) {
+        SkillState::Newer
+    } else if marked(content) {
         SkillState::Stale
     } else {
         SkillState::Foreign
@@ -386,35 +396,9 @@ const NONBLOCK_OPEN_FLAG: i32 = 0x0000_0004;
 /// Delete the retired skill file at `path` while it is aterm's (marked): `Ok(true)` when it was
 /// deleted, `Ok(false)` when there is none or it is the user's (left alone).
 fn sweep_retired_skill(path: &Path) -> Result<bool, String> {
-    use std::io::Read as _;
-    let (file, meta) = match AsRead::open(path) {
-        Ok(Some(opened)) => opened,
-        Ok(None) => return Ok(false),
-        Err(e) => return Err(format!("{}: unreadable: {e}", path.display())),
-    };
-    if meta.len() > MAX_PRIMER_FILE_BYTES {
-        return Err(format!(
-            "{}: unreadable: file exceeds size limit",
-            path.display()
-        ));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
-    if let Err(e) = file.take(MAX_PRIMER_FILE_BYTES + 1).read_to_end(&mut bytes) {
-        return Err(format!("{}: unreadable: {e}", path.display()));
-    }
-    if bytes.len() as u64 > MAX_PRIMER_FILE_BYTES {
-        return Err(format!(
-            "{}: unreadable: file exceeds size limit",
-            path.display()
-        ));
-    }
-    let content = String::from_utf8_lossy(&bytes);
-    if !marked(&content) {
-        return Ok(false);
-    }
-    std::fs::remove_file(path)
-        .map(|()| true)
-        .map_err(|e| format!("{}: {e}", path.display()))
+    remove_managed_skill(path)
+        .map(|removed| matches!(removed, SkillRemoval::Removed))
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// Delete `agent`'s retired skill files ([`sweep_retired_skill`]), with a row in `out` for each
@@ -440,13 +424,10 @@ fn sweep_retired_rows(home: &Path, roots: &Roots, agent: &str, out: &mut String)
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum SkillWrite {
     Current,
+    Newer,
     Foreign,
     Installed,
     Updated,
-}
-
-fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    write_atomically_if(path, bytes, || Ok(true)).map(|_| ())
 }
 
 fn write_atomically_if(
@@ -494,6 +475,8 @@ fn write_atomically_if(
         if !still()? {
             return Ok(false);
         }
+        #[cfg(test)]
+        SAVE_BEFORE_RENAME.with_borrow_mut(|save| save.as_mut().map(|save| save(path)));
         std::fs::rename(&tmp, path).map(|()| true)
     })(file);
     if !matches!(written, Ok(true)) {
@@ -555,25 +538,8 @@ fn make_room_for(path: &Path, room: Room<'_>) -> Result<(), String> {
 const REWRITE_TRIES: usize = 3;
 
 struct AsRead {
-    text: Option<String>,
-    file: Option<FileId>,
-}
-
-#[cfg(unix)]
-type FileId = (u64, u64);
-#[cfg(not(unix))]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileId;
-
-#[cfg(unix)]
-fn file_id(meta: &std::fs::Metadata) -> FileId {
-    use std::os::unix::fs::MetadataExt as _;
-    (meta.dev(), meta.ino())
-}
-
-#[cfg(not(unix))]
-fn file_id(_: &std::fs::Metadata) -> FileId {
-    FileId
+    bytes: Option<Vec<u8>>,
+    file: Option<std::fs::File>,
 }
 
 impl AsRead {
@@ -581,7 +547,7 @@ impl AsRead {
         use std::io::Read as _;
         let Some((file, meta)) = Self::open(path)? else {
             return Ok(Self {
-                text: None,
+                bytes: None,
                 file: None,
             });
         };
@@ -591,20 +557,20 @@ impl AsRead {
                 "file exceeds size limit",
             ));
         }
-        let id = file_id(&meta);
-        let mut text =
-            String::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
-        file.take(MAX_PRIMER_FILE_BYTES + 1)
-            .read_to_string(&mut text)?;
-        if text.len() as u64 > MAX_PRIMER_FILE_BYTES {
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
+        (&file)
+            .take(MAX_PRIMER_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_PRIMER_FILE_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "file exceeds size limit",
             ));
         }
         Ok(Self {
-            text: Some(text),
-            file: Some(id),
+            bytes: Some(bytes),
+            file: Some(file),
         })
     }
 
@@ -651,17 +617,22 @@ impl AsRead {
 
     fn still(&self, path: &Path) -> std::io::Result<bool> {
         use std::io::Read as _;
-        Ok(match (Self::open(path)?, &self.text) {
+        Ok(match (Self::open(path)?, &self.bytes) {
             (None, None) => true,
-            (Some((file, meta)), Some(text)) => {
-                if meta.len() != text.len() as u64 {
+            (Some((file, meta)), Some(old)) => {
+                if meta.len() != old.len() as u64 {
                     return Ok(false);
                 }
-                let id = file_id(&meta);
-                let mut bytes = Vec::with_capacity(text.len().saturating_add(1));
+                let mut bytes = Vec::with_capacity(old.len().saturating_add(1));
                 file.take(MAX_PRIMER_FILE_BYTES + 1)
                     .read_to_end(&mut bytes)?;
-                self.file == Some(id) && bytes == text.as_bytes()
+                match &self.file {
+                    Some(observed) => {
+                        aterm_durable::write_lock::same_file(observed, path)?
+                            && bytes.as_slice() == old.as_slice()
+                    }
+                    None => false,
+                }
             }
             _ => false,
         })
@@ -673,6 +644,11 @@ enum Unwritten {
     Refused(String),
     Write(std::io::Error),
     Changed,
+}
+
+enum Edit {
+    Replace(String),
+    Remove,
 }
 
 impl Unwritten {
@@ -695,6 +671,8 @@ type Save = Box<dyn FnMut(&Path)>;
 thread_local! {
     static SAVE_AFTER_READ: std::cell::RefCell<Option<Save>> =
         const { std::cell::RefCell::new(None) };
+    static SAVE_BEFORE_RENAME: std::cell::RefCell<Option<Save>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn rewrite<T>(
@@ -702,20 +680,51 @@ fn rewrite<T>(
     backup: bool,
     mut edit: impl FnMut(Option<&str>) -> Result<Option<(String, T)>, String>,
 ) -> Result<Option<(T, Option<PathBuf>)>, Unwritten> {
+    rewrite_bytes(path, backup, |bytes| {
+        let text = bytes
+            .map(std::str::from_utf8)
+            .transpose()
+            .map_err(|error| format!("unreadable: {error}"))?;
+        edit(text).map(|change| change.map(|(text, done)| (Edit::Replace(text), done)))
+    })
+}
+
+fn rewrite_bytes<T>(
+    path: &Path,
+    backup: bool,
+    mut edit: impl FnMut(Option<&[u8]>) -> Result<Option<(Edit, T)>, String>,
+) -> Result<Option<(T, Option<PathBuf>)>, Unwritten> {
     for _ in 0..REWRITE_TRIES {
+        // An absent parent may be created only by the caller's own Room policy. The
+        // preliminary edit makes that room, but its decision is never published.
+        let before_lock = AsRead::read(path).map_err(Unwritten::Read)?;
+        if edit(before_lock.bytes.as_deref())
+            .map_err(Unwritten::Refused)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        drop(before_lock);
+        let target = lands_on(path);
+        let lock = aterm_durable::write_lock::Held::try_take(&target).map_err(Unwritten::Write)?;
         let read = AsRead::read(path).map_err(Unwritten::Read)?;
         #[cfg(test)]
         SAVE_AFTER_READ.with_borrow_mut(|save| save.as_mut().map(|save| save(path)));
-        let Some((text, done)) = edit(read.text.as_deref()).map_err(Unwritten::Refused)? else {
+        let Some((edit, done)) = edit(read.bytes.as_deref()).map_err(Unwritten::Refused)? else {
             return Ok(None);
         };
-        let copy = match &read.text {
-            Some(old) if backup => {
-                Some(write_backup(path, old.as_bytes()).map_err(Unwritten::Refused)?)
-            }
+        let copy = match &read.bytes {
+            Some(old) if backup => Some(write_backup(path, old).map_err(Unwritten::Refused)?),
             _ => None,
         };
-        let written = write_atomically_if(path, text.as_bytes(), || read.still(path));
+        let still = || Ok(lock.still_named()? && lands_on(path) == target && read.still(path)?);
+        let written = match edit {
+            Edit::Replace(text) => write_atomically_if(path, text.as_bytes(), still),
+            Edit::Remove => match still() {
+                Ok(true) => std::fs::remove_file(path).map(|()| true),
+                unchanged => unchanged,
+            },
+        };
         if !matches!(written, Ok(true))
             && let Some(copy) = &copy
         {
@@ -766,26 +775,16 @@ fn create_private_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
 }
 
 fn read_bounded_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
-    use std::io::Read as _;
-    let Some((file, meta)) = AsRead::open(path)? else {
-        return Ok(None);
-    };
-    if meta.len() > MAX_PRIMER_FILE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "file exceeds size limit",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
-    file.take(MAX_PRIMER_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_PRIMER_FILE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "file exceeds size limit",
-        ));
-    }
-    Ok(Some(bytes))
+    AsRead::read(path).map(|read| read.bytes)
+}
+
+fn read_bounded_text(path: &Path) -> std::io::Result<Option<String>> {
+    read_bounded_bytes(path)?
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
+        .transpose()
 }
 
 fn read_skill(path: &Path, body: &str) -> Result<SkillState, String> {
@@ -797,20 +796,52 @@ fn read_skill(path: &Path, body: &str) -> Result<SkillState, String> {
 }
 
 fn install_skill_file(path: &Path, body: &str, room: Room<'_>) -> Result<SkillWrite, String> {
-    let state = read_skill(path, body)?;
-    match state {
-        SkillState::Current => Ok(SkillWrite::Current),
-        SkillState::Foreign => Ok(SkillWrite::Foreign),
-        SkillState::Absent | SkillState::Stale => {
-            make_room_for(path, room)?;
-            write_atomically(path, body.as_bytes()).map_err(|e| e.to_string())?;
-            Ok(if state == SkillState::Stale {
-                SkillWrite::Updated
-            } else {
-                SkillWrite::Installed
-            })
+    let mut unchanged = SkillWrite::Current;
+    rewrite_bytes(path, false, |content| {
+        match content.map_or(SkillState::Absent, |bytes| {
+            skill_state(&String::from_utf8_lossy(bytes), body)
+        }) {
+            SkillState::Current => unchanged = SkillWrite::Current,
+            SkillState::Newer => unchanged = SkillWrite::Newer,
+            SkillState::Foreign => unchanged = SkillWrite::Foreign,
+            state @ (SkillState::Absent | SkillState::Stale) => {
+                make_room_for(path, room)?;
+                return Ok(Some((
+                    Edit::Replace(body.to_string()),
+                    if state == SkillState::Stale {
+                        SkillWrite::Updated
+                    } else {
+                        SkillWrite::Installed
+                    },
+                )));
+            }
         }
-    }
+        Ok(None)
+    })
+    .map(|done| done.map_or(unchanged, |(write, _)| write))
+    .map_err(Unwritten::words)
+}
+
+enum SkillRemoval {
+    Absent,
+    Foreign,
+    Removed,
+}
+
+fn remove_managed_skill(path: &Path) -> Result<SkillRemoval, String> {
+    let mut unchanged = SkillRemoval::Absent;
+    rewrite_bytes(path, false, |content| {
+        match content {
+            None => unchanged = SkillRemoval::Absent,
+            Some(bytes) if marked(&String::from_utf8_lossy(bytes)) => {
+                return Ok(Some((Edit::Remove, SkillRemoval::Removed)));
+            }
+            Some(_) => unchanged = SkillRemoval::Foreign,
+        }
+        Ok(None)
+    })
+    .map(|done| done.map_or(unchanged, |(removed, _)| removed))
+    .map_err(Unwritten::words)
 }
 
 struct AgentFile {
@@ -875,7 +906,11 @@ enum BlockState {
 }
 
 fn marker_version(text: &str) -> Option<u32> {
-    let rest = text.trim_start().strip_prefix(MARK_PREFIX)?.trim_start();
+    marker_version_with_prefix(text, MARK_PREFIX)
+}
+
+fn marker_version_with_prefix(text: &str, prefix: &str) -> Option<u32> {
+    let rest = text.trim_start().strip_prefix(prefix)?.trim_start();
     let digits = rest.strip_prefix('v')?;
     let end = digits
         .find(|c: char| !c.is_ascii_digit())
@@ -1009,32 +1044,97 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 /// The folders a variable moves a home-relative path into: `.config/…` into
-/// `$XDG_CONFIG_HOME`, and `.codex` with everything in it into `$CODEX_HOME`, while each is set.
+/// `$XDG_CONFIG_HOME`, `.codex` into `$CODEX_HOME`, and `.claude` into
+/// `$CLAUDE_CONFIG_DIR`, with everything below each root.
 #[derive(Debug, Default)]
 struct Roots {
     xdg: Option<PathBuf>,
     codex: Option<PathBuf>,
+    claude: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct RootError {
+    agents: Vec<&'static str>,
+}
+
+impl std::fmt::Display for RootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "launch directory unavailable for relative {} configuration home",
+            self.agents.join(", ")
+        )
+    }
+}
+
+impl RootError {
+    fn prime(&self) -> AutoPrime {
+        let why = self.to_string();
+        AutoPrime {
+            agents: AGENT_FILES
+                .iter()
+                .filter(|agent| self.agents.contains(&agent.name))
+                .map(|agent| AgentOutcome {
+                    agent: agent.name,
+                    product: agent.product,
+                    outcome: Outcome::Error(why.clone()),
+                    wrote: Vec::new(),
+                })
+                .collect(),
+            summary: format!("agent primer: ERROR: {why}"),
+        }
+    }
 }
 
 impl Roots {
     /// The roots of this process's environment, which `aterm agents` follows: typed in a shell,
-    /// they are the ones a codex started from that shell inherits.
-    fn of_env() -> Self {
-        Self {
-            xdg: xdg_config_home(),
-            codex: codex_home(),
-        }
+    /// they are the ones agents started from that shell inherit.
+    fn of_env() -> Result<Self, RootError> {
+        Self::with_home_vars(
+            xdg_config_home(),
+            std::env::var_os("CODEX_HOME").as_deref(),
+            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+            || std::env::current_dir().ok(),
+        )
     }
 
-    /// These roots with `.codex` left at `~/.codex`: where the window's automatic pass writes
-    /// codex's files, and where every aterm before this one wrote them. aterm strips `CODEX_*`
-    /// from every shell it spawns, so the `$CODEX_HOME` the window was started with reaches no
-    /// codex in its tabs, which reads `~/.codex` unless its shell's own startup files export
-    /// another (`aterm agents install` typed there follows that one).
+    fn with_home_vars(
+        xdg: Option<PathBuf>,
+        codex: Option<&std::ffi::OsStr>,
+        claude: Option<&std::ffi::OsStr>,
+        cwd: impl FnOnce() -> Option<PathBuf>,
+    ) -> Result<Self, RootError> {
+        // Codex reads this override with env::var, which ignores non-Unicode values.
+        let codex = codex.filter(|value| value.to_str().is_some());
+        let relative: Vec<_> = [("codex", codex), ("claude", claude)]
+            .into_iter()
+            .filter_map(|(agent, value)| {
+                value
+                    .filter(|value| !value.is_empty() && Path::new(value).is_relative())
+                    .map(|_| agent)
+            })
+            .collect();
+        let cwd = if !relative.is_empty() {
+            Some(cwd().ok_or(RootError { agents: relative })?)
+        } else {
+            None
+        };
+        Ok(Self {
+            xdg,
+            codex: codex.and_then(|value| resolve_launch_home(Path::new(value), || cwd.clone())),
+            claude: claude.and_then(|value| resolve_launch_home(Path::new(value), || cwd.clone())),
+        })
+    }
+
+    /// The window leaves `.codex` and `.claude` at their default homes: it strips
+    /// `CODEX_*` and `CLAUDE*` from every shell it spawns. Explicit roots exported by
+    /// a shell's startup files are followed by `aterm agents` in that shell.
     fn window(&self) -> Self {
         Self {
             xdg: self.xdg.clone(),
             codex: None,
+            claude: None,
         }
     }
 
@@ -1043,11 +1143,17 @@ impl Roots {
         if let (Some(x), Some(rest)) = (&self.xdg, rel.strip_prefix(".config/")) {
             return Some((x, rest));
         }
-        let codex = self.codex.as_deref()?;
-        match rel.strip_prefix(".codex")? {
-            "" => Some((codex, "")),
-            rest => rest.strip_prefix('/').map(|rest| (codex, rest)),
+        for (prefix, root) in [(".codex", &self.codex), (".claude", &self.claude)] {
+            if let (Some(root), Some(rest)) = (root.as_deref(), rel.strip_prefix(prefix)) {
+                if rest.is_empty() {
+                    return Some((root, ""));
+                }
+                if let Some(rest) = rest.strip_prefix('/') {
+                    return Some((root, rest));
+                }
+            }
         }
+        None
     }
 }
 
@@ -1066,16 +1172,15 @@ fn xdg_config_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `$CODEX_HOME`, the folder Codex reads its `AGENTS.md` and `skills/` from in place of
-/// `~/.codex`, when it names an absolute path (a relative one is relative to the folder Codex
-/// starts in, which no pass can know). aterm strips `CODEX_*` from the shells it spawns, so in
-/// `aterm agents` or `aterm --diagnose` typed in a tab it is what that shell's own startup files
-/// export, and in a process started outside aterm it is that process's. The window's automatic
-/// pass never follows it ([`Roots::window`]).
-fn codex_home() -> Option<PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+/// Agent configuration homes resolve relative paths against the launch directory.
+fn resolve_launch_home(path: &Path, cwd: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
+    if path.as_os_str().is_empty() {
+        None
+    } else if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        cwd().map(|base| base.join(path))
+    }
 }
 
 fn display_path(home: &Path, roots: &Roots, rel: &str) -> String {
@@ -1271,12 +1376,9 @@ fn situation(home: &Path, roots: &Roots, agent: &AgentFile, readers: &Readers) -
         return FileSituation::NotDetected;
     }
     let path = home_join(home, roots, agent.file);
-    match AsRead::read(&path) {
-        Ok(AsRead {
-            text: Some(content),
-            ..
-        }) => FileSituation::File(block_state(&content, &readers.block(agent))),
-        Ok(AsRead { text: None, .. }) => {
+    match read_bounded_text(&path) {
+        Ok(Some(content)) => FileSituation::File(block_state(&content, &readers.block(agent))),
+        Ok(None) => {
             let made_by_another = readers.way(agent).is_some_and(|way| way.name != agent.name);
             match dangling_link(&path) {
                 Some(why) if !made_by_another => FileSituation::File(Err(why)),
@@ -1835,16 +1937,16 @@ fn restore_harness_statusline(doc: &mut settings_json::Json, path: &Path) -> boo
     }
     let copied = candidates.iter().find_map(|p| {
         let backup = PathBuf::from(format!("{}{HARNESS_BACKUP_SUFFIX}", p.display()));
-        let text = AsRead::read(&backup).ok()?.text?;
+        let text = read_bounded_text(&backup).ok()??;
         let orig = Json::parse(&text).ok()?;
         orig.get("statusLine")
             .filter(|v| !is_harness_statusline(v))
             .cloned()
     });
     let original = match state {
-        Some(state) => AsRead::read(&state.join("statusline.user"))
+        Some(state) => read_bounded_text(&state.join("statusline.user"))
             .ok()
-            .and_then(|r| r.text)
+            .flatten()
             .map(|text| text.trim_end_matches('\n').to_string())
             .filter(|cmd| !cmd.trim().is_empty() && !is_harness_statusline_command(cmd))
             .map(|cmd| match copied {
@@ -1967,11 +2069,18 @@ fn outcome_word(o: &Outcome) -> String {
 }
 
 /// Install or update the primer (and the bundled skills) for every DETECTED agent under `home`:
-/// the window's automatic pass, which follows `$XDG_CONFIG_HOME` but never `$CODEX_HOME`
+/// the window's automatic pass, which follows `$XDG_CONFIG_HOME` but neither `$CODEX_HOME`
+/// nor `$CLAUDE_CONFIG_DIR`
 /// ([`Roots::window`]).
 #[must_use]
 pub fn auto_prime(home: &Path) -> AutoPrime {
-    auto_prime_with(home, &Roots::of_env().window())
+    auto_prime_with(
+        home,
+        &Roots {
+            xdg: xdg_config_home(),
+            ..Roots::default()
+        },
+    )
 }
 
 fn auto_prime_with(home: &Path, roots: &Roots) -> AutoPrime {
@@ -2024,7 +2133,8 @@ fn auto_prime_in(home: &Path, roots: &Roots, switch: &str) -> AutoPrime {
         }
         if let Some(Ok(HookRemoval::Removed { removed, backup })) = &hooks {
             wrote.push(format!(
-                "~/{CLAUDE_SETTINGS_FILE} ({removed} aterm hook or statusLine entr{} removed; backup {})",
+                "{} ({removed} aterm hook or statusLine entr{} removed; backup {})",
+                display_path(home, roots, CLAUDE_SETTINGS_FILE),
                 if *removed == 1 { "y" } else { "ies" },
                 backup.display()
             ));
@@ -2087,11 +2197,14 @@ pub struct PrimePending {
 }
 
 /// [`auto_prime`]'s pass over the roots of this process's environment, as `aterm agents` reads
-/// them (`$XDG_CONFIG_HOME` and an absolute `$CODEX_HOME` followed): the pass a command typed in
-/// a shell runs (`aterm init`), whose codex is the one a codex started from that shell reads.
+/// them (`$XDG_CONFIG_HOME` and launch-relative `$CODEX_HOME`/`$CLAUDE_CONFIG_DIR` followed):
+/// the pass a command typed in a shell runs (`aterm init`), using the homes its agents read.
 #[must_use]
 pub fn shell_prime(home: &Path) -> AutoPrime {
-    auto_prime_with(home, &Roots::of_env())
+    match Roots::of_env() {
+        Ok(roots) => auto_prime_with(home, &roots),
+        Err(error) => error.prime(),
+    }
 }
 
 /// [`shell_prime`] read without writing: for each detected agent, its context file where the
@@ -2101,7 +2214,13 @@ pub fn shell_prime(home: &Path) -> AutoPrime {
 /// also sweeps are not read, so a pass that finds nothing else due leaves them to the window's.
 #[must_use]
 pub fn shell_prime_pending(home: &Path) -> PrimePending {
-    auto_prime_pending_with(home, &Roots::of_env())
+    match Roots::of_env() {
+        Ok(roots) => auto_prime_pending_with(home, &roots),
+        Err(error) => PrimePending {
+            errors: vec![error.to_string()],
+            ..PrimePending::default()
+        },
+    }
 }
 
 fn auto_prime_pending_with(home: &Path, roots: &Roots) -> PrimePending {
@@ -2150,7 +2269,7 @@ fn auto_prime_pending_with(home: &Path, roots: &Roots) -> PrimePending {
             match skill_status(home, roots, s) {
                 Ok(SkillState::Absent) => pending.due.push(format!("{shown} (absent)")),
                 Ok(SkillState::Stale) => pending.due.push(format!("{shown} (stale)")),
-                Ok(SkillState::Current | SkillState::Foreign) => {}
+                Ok(SkillState::Current | SkillState::Newer | SkillState::Foreign) => {}
                 Err(why) => pending.errors.push(format!("{}: {shown}: {why}", a.name)),
             }
         }
@@ -2161,7 +2280,10 @@ fn auto_prime_pending_with(home: &Path, roots: &Roots) -> PrimePending {
 /// One line for `aterm --diagnose`.
 #[must_use]
 pub fn status_line(home: &Path) -> String {
-    status_line_with(home, &Roots::of_env())
+    match Roots::of_env() {
+        Ok(roots) => status_line_with(home, &roots),
+        Err(error) => format!("ERROR: {error}"),
+    }
 }
 
 fn status_line_with(home: &Path, roots: &Roots) -> String {
@@ -2184,6 +2306,7 @@ fn status_line_with(home: &Path, roots: &Roots) -> String {
                 for s in skills_for(a.name) {
                     let word = match skill_status(home, roots, s) {
                         Ok(SkillState::Current) => continue,
+                        Ok(SkillState::Newer) => "newer".to_string(),
                         Ok(SkillState::Absent) => "absent".to_string(),
                         Ok(SkillState::Stale) => "stale".to_string(),
                         Ok(SkillState::Foreign) => "yours, left alone".to_string(),
@@ -2227,7 +2350,8 @@ fn usage() -> String {
     }
     s.push_str("  ~/.config/ means $XDG_CONFIG_HOME/ when that is set\n");
     s.push_str(
-        "  ~/.codex/ means $CODEX_HOME/ when that is set; a window's automatic pass\n  \
+        "  ~/.codex/ means $CODEX_HOME/ when set (relative to this command's launch\n  \
+         directory); a window's automatic pass\n  \
          writes ~/.codex/ (aterm strips CODEX_* from its shells), and remove clears\n  \
          aterm's files from both\n",
     );
@@ -2307,19 +2431,25 @@ impl Removal<'_> {
             let verdict = match read_skill(&sp, s.body) {
                 Ok(SkillState::Absent) => "nothing to remove".to_string(),
                 Ok(SkillState::Foreign) => "kept — not an aterm-managed file (yours)".to_string(),
-                Ok(SkillState::Current | SkillState::Stale) => match self.also_read_by(a, &sp) {
-                    Some(other) => format!(
-                        "kept — {other} reads it too (`aterm agents remove {} {other}` removes it)",
-                        a.name
-                    ),
-                    None => match std::fs::remove_file(&sp) {
-                        Ok(()) => "removed".to_string(),
-                        Err(e) => {
-                            failed = true;
-                            format!("ERROR: {e}")
-                        }
-                    },
-                },
+                Ok(SkillState::Current | SkillState::Newer | SkillState::Stale) => {
+                    match self.also_read_by(a, &sp) {
+                        Some(other) => format!(
+                            "kept — {other} reads it too (`aterm agents remove {} {other}` removes it)",
+                            a.name
+                        ),
+                        None => match remove_managed_skill(&sp) {
+                            Ok(SkillRemoval::Removed) => "removed".to_string(),
+                            Ok(SkillRemoval::Absent) => "nothing to remove".to_string(),
+                            Ok(SkillRemoval::Foreign) => {
+                                "kept — not an aterm-managed file (yours)".to_string()
+                            }
+                            Err(e) => {
+                                failed = true;
+                                format!("ERROR: {e}")
+                            }
+                        },
+                    }
+                }
                 Err(e) => {
                     failed = true;
                     format!("ERROR: {e}")
@@ -2381,7 +2511,18 @@ impl Removal<'_> {
 /// The `aterm agents` command.
 #[must_use]
 pub fn agents_report(home: &Path, args: &[String]) -> (String, i32) {
-    agents_report_with(home, args, &Roots::of_env())
+    match Roots::of_env() {
+        Ok(roots) => agents_report_with(home, args, &roots),
+        Err(_)
+            if matches!(
+                args.first().map(String::as_str),
+                Some("primer" | "help" | "--help" | "-h")
+            ) =>
+        {
+            agents_report_with(home, args, &Roots::default())
+        }
+        Err(error) => (format!("aterm agents: {error}\n"), 1),
+    }
 }
 
 fn agents_report_with(home: &Path, args: &[String], roots: &Roots) -> (String, i32) {
@@ -2431,6 +2572,7 @@ fn agents_report_with(home: &Path, args: &[String], roots: &Roots) -> (String, i
                 for s in skills_for(a.name) {
                     let st = match skill_status(home, roots, s) {
                         Ok(SkillState::Current) => "installed".to_string(),
+                        Ok(SkillState::Newer) => "newer (a later aterm's; left as is)".to_string(),
                         Ok(SkillState::Stale) => "stale".to_string(),
                         Ok(SkillState::Foreign) => "foreign — yours, left alone".to_string(),
                         Ok(SkillState::Absent) => "absent".to_string(),
@@ -2511,6 +2653,7 @@ fn agents_report_with(home: &Path, args: &[String], roots: &Roots) -> (String, i
                         install_skill_file(&home_join(home, roots, s.path), s.body, Room::Anywhere);
                     let verdict = match skill {
                         Ok(SkillWrite::Current) => "already installed".to_string(),
+                        Ok(SkillWrite::Newer) => "newer (a later aterm's; left as is)".to_string(),
                         Ok(SkillWrite::Foreign) => {
                             "skipped — not an aterm-managed file (yours)".to_string()
                         }
@@ -2553,8 +2696,8 @@ fn agents_report_with(home: &Path, args: &[String], roots: &Roots) -> (String, i
                     out: &mut out,
                 };
                 failed |= gone.rows(a);
-                // While `$CODEX_HOME` moves codex's row, `~/.codex` is still where the window's
-                // pass and every earlier aterm wrote codex's files: aterm's there go too.
+                // The window uses the default homes even when a shell moves an agent's
+                // root. Remove our files there too, preserving personal content.
                 let at_window = home_join(home, &window, a.dir);
                 if at_window.is_dir()
                     && lands_on(&at_window) != lands_on(&home_join(home, roots, a.dir))

@@ -7,6 +7,83 @@ use super::{
 };
 
 #[test]
+fn serialization_keeps_nullable_fields_escaping_and_urgencies() {
+    let queue = NotificationQueue::default();
+    for note in [
+        Notification {
+            id: Some("i\"".to_owned()),
+            title: Some("漢\t".to_owned()),
+            body: Some("\\\0\u{1f}🙂".to_owned()),
+            urgency: NotificationUrgency::Low,
+        },
+        Notification {
+            id: None,
+            title: Some(String::new()),
+            body: Some(String::new()),
+            urgency: NotificationUrgency::Critical,
+        },
+        Notification {
+            id: Some("n".to_owned()),
+            title: None,
+            body: None,
+            urgency: NotificationUrgency::Normal,
+        },
+    ] {
+        enqueue(&queue, note);
+    }
+    assert_eq!(
+        drain_notifications_json(&queue).as_deref(),
+        Some(concat!(
+            r#"[{"id":"i\"","title":"漢\t","body":"\\\u0000\u001f🙂","urgency":"low"},"#,
+            r#"{"id":null,"title":"","body":"","urgency":"critical"},"#,
+            r#"{"id":"n","title":null,"body":null,"urgency":"normal"}]"#
+        ))
+    );
+    assert!(drain_notifications_json(&queue).is_none());
+}
+
+#[test]
+#[ignore = "manual native notification queue serialization measurement; run alone"]
+fn notification_queue_batch_cost() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let count: usize = std::env::var("ATERM_NOTIFICATION_BENCH_COUNT")
+        .map_or(Ok(MAX_QUEUED_NOTIFICATIONS), |value| value.parse())
+        .expect("notification count");
+    assert!((1..=MAX_QUEUED_NOTIFICATIONS).contains(&count));
+    let queue = NotificationQueue::default();
+    let note = Notification {
+        id: None,
+        title: None,
+        body: Some("bench".to_owned()),
+        urgency: NotificationUrgency::Normal,
+    };
+    let record = r#"{"id":null,"title":null,"body":"bench","urgency":"normal"}"#;
+    let expected = format!("[{}]", vec![record; count].join(","));
+    eprintln!(
+        "notification queue: count={count} batches=20 drains_per_batch=100 bytes={}",
+        expected.len()
+    );
+    for batch in 0..20 {
+        let start = Instant::now();
+        for _ in 0..100 {
+            for _ in 0..count {
+                enqueue(&queue, note.clone());
+            }
+            let output =
+                drain_notifications_json(black_box(&queue)).expect("queued synthetic notes");
+            assert_eq!(black_box(&output), &expected);
+        }
+        eprintln!(
+            "notification queue batch={batch} elapsed_ns={}",
+            start.elapsed().as_nanos()
+        );
+    }
+    assert!(drain_notifications_json(&queue).is_none());
+}
+
+#[test]
 fn authorized_osc9_round_trips_through_the_drain() {
     let mut t = crate::system_font_terminal(24, 80, 16.0);
     t.authorize_notifications(true);

@@ -20,6 +20,11 @@ pub(super) use service::Service;
 #[path = "codex_rotation_control.rs"]
 mod rotation;
 pub(super) use rotation::Preparation as RotationPreparation;
+#[path = "codex_login_rotation_control.rs"]
+mod login_rotation;
+pub(super) use login_rotation::{
+    Ledgers as LoginRotationLedgers, Preparation as LoginRotationPreparation,
+};
 #[cfg(unix)]
 pub(super) use rotation::observe_exec;
 #[cfg(all(test, unix))]
@@ -85,7 +90,7 @@ fn acknowledged_receipt_reply(env: &Env, receipt: &Receipt) -> String {
         Phase::Committed | Phase::Consumed | Phase::Retired
     ) && !renewal::with_receipt_writer(env, |writer| {
         writer.acknowledge(receipt)?;
-        if receipt.intent.purpose == renewal::Purpose::WeeklyQuota
+        if receipt.intent.purpose.pool_scoped()
             && (receipt.phase == Phase::Consumed
                 || (receipt.phase == Phase::Retired && !receipt.launch_attempted))
         {
@@ -471,10 +476,33 @@ pub(crate) fn serve_rotation(ctx: &Arc<crate::SessionCtx>, master: i32, line: &s
             "reply":result.trim(), "humanSeq":ctx.human_input.seq(),
             "monotonicUs":aterm_agent::harness::native_act::monotonic_us()
         }));
+    renamed(result, "codex-rotation")
+}
+
+/// `codex-login-rotation`: a lost login's move to another row already signed in here, served as
+/// the usage-limit handoff's lane is, under its own purpose and prefix.
+pub(crate) fn serve_login_rotation(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    line: &str,
+) -> String {
+    let result = serve_inner(ctx, master, line, renewal::Purpose::LoginRotation);
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    ctx.native_policy
+        .renewal_control_observed(&aterm_json::json!({
+            "kind":"login-rotation", "verb":line.split_ascii_whitespace().next(),
+            "reply":result.trim(), "humanSeq":ctx.human_input.seq(),
+            "monotonicUs":aterm_agent::harness::native_act::monotonic_us()
+        }));
+    renamed(result, "codex-login-rotation")
+}
+
+/// `result`, a reply of the renewal lane, under `verb`'s prefix.
+fn renamed(result: String, verb: &str) -> String {
     if let Some(rest) = result.strip_prefix("OK codex-renewal ") {
-        format!("OK codex-rotation {rest}")
+        format!("OK {verb} {rest}")
     } else if let Some(rest) = result.strip_prefix("ERR codex-renewal ") {
-        format!("ERR codex-rotation {rest}")
+        format!("ERR {verb} {rest}")
     } else {
         result
     }
@@ -489,6 +517,7 @@ fn serve_inner(
     let request = match purpose {
         renewal::Purpose::Login => renewal::Request::parse(line),
         renewal::Purpose::WeeklyQuota => renewal::Request::parse_rotation(line),
+        renewal::Purpose::LoginRotation => renewal::Request::parse_login_rotation(line),
     };
     let Some(request) = request else {
         return "ERR codex-renewal invalid request\n".into();
@@ -499,6 +528,20 @@ fn serve_inner(
     let Ok(env) = Env::from_process() else {
         return "OK codex-renewal state=waiting\n".into();
     };
+    let host: Arc<dyn login_rotation::Host> = Arc::new(login_rotation::System);
+    serve_claimed(ctx, (env, proof, copy), request, purpose, &host)
+}
+
+/// `request`, parsed under `purpose`, of the claimed process `proof` whose live record is `copy`,
+/// served in `env`: everything the lane decides once the claim is proven. A lost login's job
+/// reads its host through `host`.
+fn serve_claimed(
+    ctx: &Arc<crate::SessionCtx>,
+    (env, proof, copy): (Env, crate::self_claim::Proven, self_claimed::Copy),
+    request: renewal::Request,
+    purpose: renewal::Purpose,
+    host: &Arc<dyn login_rotation::Host>,
+) -> String {
     let Some(current) = record(&copy) else {
         return "OK codex-renewal state=waiting\n".into();
     };
@@ -527,8 +570,16 @@ fn serve_inner(
                 return "ERR codex-renewal native wall changed\n".into();
             }
 
-            if purpose == renewal::Purpose::WeeklyQuota {
-                return rotation::prepare(ctx, &env, &proof, &copy, &current, intent);
+            match purpose {
+                renewal::Purpose::WeeklyQuota => {
+                    return rotation::prepare(ctx, &env, &proof, &copy, &current, intent);
+                }
+                renewal::Purpose::LoginRotation => {
+                    return login_rotation::prepare(
+                        host, ctx, &env, &proof, &copy, &current, intent,
+                    );
+                }
+                renewal::Purpose::Login => {}
             }
 
             let Some(process) = Process::observe(proof.pid) else {
@@ -665,7 +716,7 @@ fn retire_stale_ready_bound(
     record: &aterm_json::Value,
     expected: &Receipt,
 ) -> Result<Option<Receipt>, &'static str> {
-    if expected.intent.purpose == renewal::Purpose::WeeklyQuota {
+    if expected.intent.purpose.moves_account() {
         return rotation::retire_stale_ready(ctx, env, proof, record, expected);
     }
     if expected.phase != Phase::Ready
@@ -773,9 +824,7 @@ fn commit(
             return "ERR codex-renewal capacity\n".into();
         }
     }
-    if receipt.intent.purpose == renewal::Purpose::WeeklyQuota
-        && rotation::commit_pool(ctx, env, &receipt).is_err()
-    {
+    if receipt.intent.purpose.pool_scoped() && rotation::commit_pool(ctx, env, &receipt).is_err() {
         return rotation::retire_ready(ctx, env, proof, current, &receipt)
             .ok()
             .flatten()
@@ -785,7 +834,7 @@ fn commit(
             );
     }
     let Ok(Some(committing)) = renewal::commit_receipt(env, &receipt) else {
-        if receipt.intent.purpose == renewal::Purpose::WeeklyQuota
+        if receipt.intent.purpose.moves_account()
             && let Ok(Some(retired)) = rotation::retire_ready(ctx, env, proof, current, &receipt)
         {
             return retired.reply();
@@ -1139,7 +1188,7 @@ fn status(
         && resume.codex_auth_path.as_deref().map(std::path::Path::new)
             == Some(receipt.old_auth.as_path());
     if same_session && rolled_back {
-        if receipt.intent.purpose == renewal::Purpose::WeeklyQuota {
+        if receipt.intent.purpose.pool_scoped() {
             let Some(options) = opts(env, sid) else {
                 return "ERR codex-renewal record unavailable\n".into();
             };
@@ -1242,7 +1291,7 @@ fn status(
             || marker["accepted"].as_bool() != Some(true)
             || marker["account"].as_str() != Some(&receipt.intent.identity.account)
             || marker["user"].as_str() != Some(&receipt.intent.identity.user)
-            || (receipt.intent.purpose == renewal::Purpose::WeeklyQuota
+            || (receipt.intent.purpose.moves_account()
                 && receipt.target_identity().is_none_or(|target| {
                     marker["destination"]["account"].as_str() != Some(&target.account)
                         || marker["destination"]["user"].as_str() != Some(&target.user)
@@ -1403,7 +1452,7 @@ pub(super) fn execute_recorded(operation: &Arc<Mutex<Operation>>, phase: ImagePh
 }
 
 fn account_phase_allowed(env: &Env, receipt: &Receipt, phase: ImagePhase) -> bool {
-    if phase == ImagePhase::Rollback && receipt.intent.purpose == renewal::Purpose::WeeklyQuota {
+    if phase == ImagePhase::Rollback && receipt.intent.purpose.moves_account() {
         return aterm_agent::harness::codex_rotation::with_rollback_writer(
             env,
             receipt,

@@ -1521,14 +1521,15 @@ pub(crate) fn the_carry_keeps_the_join_and_the_successor_rebuilds_its_steps() {
     r.adopt(&line);
     let tv = r.tr.tx_view();
     assert_eq!(
-        (tv.vref, tv.mapped, tv.floor_ms),
+        (tv.vref, tv.mapped, tv.adopted_ms),
         (Some(v("v1")), Some(t1), WALL0 + 500)
     );
     assert!(r.call(tool("c3"), last).is_empty(), "at the watermark");
     assert!(
         r.tx_at(tool("c4"), WALL0 + 499).is_empty(),
-        "older than the adoption"
+        "older than the adoption: never placed"
     );
+    assert_eq!(r.tr.tx_view().dropped, 1, "older than the adoption: lost");
     let closed = r.tx(result("c1", false));
     assert_eq!((closed[0].op, closed[0].node), (Op::Close, c1));
     assert_eq!(r.tr.tx_view().tools, 1, "c2 rebuilt, c1 resulted");
@@ -1563,7 +1564,7 @@ fn the_worst_tracker_line_fits_a_carry_line() {
          input_by={id40} input_wall={max} input_cause={id40} \
          tx_fp={max:016x} tx_off={max} tx_id={max:x}:{max:x} tx_v={id40} tx_vt=t4294967295 \
          tx_ve={max} tx_vp={max} tx_ref=usage-session tx_st=partial tx_ds=1 tx_dr={max} \
-         tx_du=1 irq=v raw=t4294967295,{raw} vi={id40},{vendor}"
+         tx_loff={max} tx_du=1 irq=v raw=t4294967295,{raw} vi={id40},{vendor}"
     );
     let now = at(10_000);
     let tr = TurnTracker::from_carry_line(&worst, now).expect("the worst line reads");
@@ -1591,10 +1592,168 @@ fn the_worst_tracker_line_fits_a_carry_line() {
         "tx_st=",
         "tx_ds=1",
         "tx_dr=",
+        "tx_loff=",
         "tx_du=1",
     ] {
         assert!(back.contains(tok), "{tok} lost: {back}");
     }
+}
+
+/// A LATCHED ROW IS LOST ONCE: the fold latched off on a row it could not read
+/// ([`TxEvent::Off`]), so the join counts it `dropped=1` and says `state=off`. A fold re-armed from
+/// the join's watermark (a seamless update's successor, a rollout tap bound again after a stale
+/// read) binds the same file and latches on the same row again: a re-read, no new loss, so the
+/// join still says `dropped=1` and has said `state=off` once, with no `state=on` between for the
+/// re-arm's bind, as the row it latched on lies ahead of that bind's watermark. A latch on another
+/// row is another loss.
+/// CONTROLS: counting every `Off` (`dropped=2`) and the kept bind saying its state while the
+/// latched row lies ahead (`state=on`, then `state=off` again) are each caught.
+#[test]
+fn a_latched_row_is_lost_once_however_often_it_is_read_again() {
+    let mut r = Rig::bound();
+    r.see(Verdict::Busy);
+    r.tx(prompt("v1"));
+    let bad = r.tr.tx_view().through.expect("bound").off + 300;
+    let latch = |r: &mut Rig, fp: u64| {
+        r.state = TxState::Off;
+        let pos = TxPos {
+            fp,
+            ..r.pos(bad, r.wall())
+        };
+        r.call(TxEvent::Off, pos)
+    };
+    let said = |r: &Rig| -> Vec<String> {
+        r.records()
+            .iter()
+            .filter(|x| x.k == Kind::Source)
+            .filter_map(|x| x.f.get_word(Key::State).map(str::to_owned))
+            .collect()
+    };
+    latch(&mut r, FP);
+    assert_eq!(r.tr.tx_view().dropped, 1, "the latch's row is lost");
+    assert_eq!(said(&r), ["on", "off"], "PRECONDITION: the latch says off");
+    // A seamless update: the successor adopts the carry and its fold, re-armed from the
+    // watermark, binds the same file and latches on the same row.
+    let line = r.tr.carry_line(at(r.now));
+    assert!(line.contains(&format!(" tx_loff={bad}")), "{line}");
+    r.now += 100;
+    r.adopt(&line);
+    r.state = TxState::On;
+    r.bind(bad + 500);
+    latch(&mut r, FP);
+    assert_eq!(r.tr.tx_view().dropped, 1, "after the update: a re-read");
+    assert_eq!(
+        said(&r),
+        ["on", "off"],
+        "after the update: {:?}",
+        r.records()
+    );
+    // A tap bound again in the same process (a rollout tap after a stale read) does the same.
+    r.state = TxState::On;
+    r.bind(bad + 600);
+    latch(&mut r, FP);
+    assert_eq!(r.tr.tx_view().dropped, 1, "a bind again: a re-read");
+    assert_eq!(said(&r), ["on", "off"], "a bind again");
+    assert!(r.tx(TxEvent::Flush).is_empty(), "nothing unsaid");
+    // A latch on a row of another file is another loss.
+    r.state = TxState::On;
+    let other = TxPos {
+        fp: FP + 1,
+        ..r.pos(0, r.wall())
+    };
+    r.call(
+        TxEvent::Bind {
+            len: 0,
+            floor_ms: PROCESS_START,
+        },
+        other,
+    );
+    latch(&mut r, FP + 1);
+    assert_eq!(r.tr.tx_view().dropped, 2, "another row latched");
+}
+
+/// A LOST ROW IS LOST ONCE AT ITS POSITION: a row the fold could not read ([`TxEvent::Lost`]) is
+/// a row of the file, so past the watermark it counts and the watermark moves past it, and the
+/// carry says so. A fold re-armed from the watermark (a seamless update's successor, a footer
+/// armed again) seeds past it and a re-read of it counts nothing; the rows after it count.
+/// CONTROL: the tracker taking `Lost` as no row (a count with no position, the watermark left
+/// below it) is caught: the watermark does not pass it.
+#[test]
+fn a_lost_row_is_lost_once_at_its_position() {
+    let mut r = Rig::bound();
+    r.see(Verdict::Busy);
+    r.tx(prompt("v1"));
+    r.tx(TxEvent::Lost { n: 1 });
+    let lost = r.off;
+    assert_eq!(r.tr.tx_view().dropped, 1, "the row is lost");
+    assert_eq!(
+        r.tr.tx_view().through.map(|m| m.off),
+        Some(lost),
+        "the watermark passes it"
+    );
+    assert_eq!(r.tx(TxEvent::Flush).len(), 1, "PRECONDITION: said");
+    let line = r.tr.carry_line(at(r.now));
+    assert!(line.contains(&format!(" tx_off={lost} ")), "{line}");
+    r.now += 100;
+    r.adopt(&line);
+    r.bind(lost);
+    let again = r.pos(lost, r.wall());
+    assert!(
+        r.call(TxEvent::Lost { n: 1 }, again).is_empty(),
+        "a re-read"
+    );
+    assert_eq!(r.tr.tx_view().dropped, 1, "a re-read counts nothing");
+    assert!(r.tx(TxEvent::Flush).is_empty(), "nothing unsaid");
+    r.tx(TxEvent::Lost { n: 2 });
+    assert_eq!(r.tr.tx_view().dropped, 3, "a later lost row counts");
+}
+
+/// A ROW WRITTEN WHILE AN UPDATE HANDS OVER IS LOST, NEVER SKIPPED: the join held its run's tool
+/// steps whole (`dropped=0`). The agent writes a tool row after the predecessor's last read and
+/// before the successor adopts: past the carried watermark, dated below the adoption, which the
+/// join never places a row before. It is lost, so the join says it is short of rows (`dropped=1`,
+/// said at the batch's end) rather than holding a short count as whole. A row older than the
+/// run is history, never lost.
+/// CONTROL: the adoption taken as the join's floor (a row below it dropped as history) is
+/// caught: `dropped=0`.
+#[test]
+fn a_row_written_while_an_update_hands_over_is_lost_never_skipped() {
+    let mut r = Rig::bound();
+    r.see(Verdict::Busy);
+    r.now = 100;
+    r.tx(prompt("v1"));
+    r.tx(tool("c1"));
+    r.now = 125;
+    let line = r.tr.carry_line(at(r.now));
+    r.now = 200;
+    r.adopt(&line);
+    let len = r.off;
+    r.bind(len);
+    assert_eq!(r.tr.tx_view().dropped, 0, "PRECONDITION: whole");
+    assert!(
+        r.tx_at(tool("c0"), WALL0 - 1).is_empty(),
+        "older than the run: history"
+    );
+    assert_eq!(r.tr.tx_view().dropped, 0, "history is not lost");
+    let hidden = r.tx_at(tool("c2"), WALL0 + 150);
+    assert!(hidden.is_empty(), "never placed: {hidden:?}");
+    assert_eq!(r.tr.tx_view().dropped, 1, "lost");
+    let said = r.tx(TxEvent::Flush);
+    assert_eq!(
+        (
+            said.len(),
+            said.first().and_then(|m| m.f.get_u(Key::Dropped))
+        ),
+        (1, Some(1)),
+        "said: {said:?}"
+    );
+    assert_eq!(
+        r.tx(tool("c3")).len(),
+        1,
+        "a row after the adoption is placed"
+    );
+    assert_eq!(r.tr.tx_view().dropped, 1);
+    r.ordered();
 }
 
 pub(crate) fn a_closed_run_takes_no_transcript_row() {

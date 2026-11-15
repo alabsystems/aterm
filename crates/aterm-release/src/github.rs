@@ -11,7 +11,7 @@ use aterm_json::Value;
 use aterm_types::http_retry::{Budget, Cause, Decision, Policy};
 use aterm_uds::spawnfd::{Command, Stdio};
 use aterm_update_core::github_rest::{
-    Answer, Body, Client, Method, Origins, Prepared, Request, RestError, Spawn, Token,
+    Answer, Body, Client, Method, Origins, Prepared, Request, RestError, Spawn,
 };
 
 use crate::ledger::{Error, Result, RunOut};
@@ -90,13 +90,13 @@ fn client_via(spawn: Option<&Arc<dyn Spawn>>) -> Result<Client> {
     })
 }
 
-/// The client before any caller's spawn: a test's fixture, or github.com as the token file.
+/// The client before any caller's spawn: a test's fixture, or github.com as the store's token.
 fn base_client() -> Result<Client> {
     #[cfg(test)]
     if let Some(fixture) = FIXTURE.with(|f| f.borrow().clone()) {
         let token = fixture
             .token
-            .map(|t| Token::new(t.as_bytes()))
+            .map(|t| aterm_update_core::github_rest::Token::new(t.as_bytes()))
             .transpose()
             .map_err(Error::new)?;
         let client = Client::new(fixture.origins, token);
@@ -107,10 +107,7 @@ fn base_client() -> Result<Client> {
             )))),
         });
     }
-    let token = match crate::publish::channel_token_path() {
-        Some(path) => Token::from_file(&path).map_err(Error::new)?,
-        None => None,
-    };
+    let token = crate::publish::channel_token().map_err(Error::new)?;
     Ok(
         Client::new(Origins::github(), token).with_spawn(Arc::new(TimedSpawn(Arc::new(
             aterm_update_core::github_rest::Direct,
@@ -134,11 +131,11 @@ impl Spawn for TimedSpawn {
 
 /// The shared release reader ([`aterm_update_core::release_asset`]) as the cut reads a
 /// release's assets: the web route and the asset CDN anonymously, as clients read them, and the
-/// API route, when the download host fails, as the release org's token when its file holds one
+/// API route, when the download host fails, as the release org's token when the store holds one
 /// (that token's allowance, not the address's shared anonymous 60 an hour); a test's fixture
 /// origins. It goes on for `patience` without progress before it stops.
 /// # Errors
-/// A token file that cannot be read, or holds a token [`Token::new`] refuses.
+/// A store that cannot be read, or a token [`Token::new`] refuses.
 pub(crate) fn reader(
     patience: std::time::Duration,
 ) -> Result<aterm_update_core::release_asset::Reader> {
@@ -147,15 +144,12 @@ pub(crate) fn reader(
     if let Some(fixture) = FIXTURE.with(|f| f.borrow().clone()) {
         let token = fixture
             .token
-            .map(|t| Token::new(t.as_bytes()))
+            .map(|t| aterm_update_core::github_rest::Token::new(t.as_bytes()))
             .transpose()
             .map_err(Error::new)?;
         return Ok(Reader::loopback(fixture.origins, token, patience));
     }
-    let token = match crate::publish::channel_token_path() {
-        Some(path) => Token::from_file(&path).map_err(Error::new)?,
-        None => None,
-    };
+    let token = crate::publish::channel_token().map_err(Error::new)?;
     Ok(Reader::new(Origins::github(), token).patient(patience))
 }
 

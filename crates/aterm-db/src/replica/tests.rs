@@ -20,6 +20,7 @@ use std::{
 
 mod clock;
 mod compatibility;
+mod hooks;
 mod inventory;
 mod policy;
 mod recovery;

@@ -36,6 +36,7 @@ fn lab(accounts: Vec<LabAccount>) -> Lab {
     Lab {
         me: Some(test_machine("m16")),
         settled: true,
+        bound: Default::default(),
         accounts,
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
@@ -233,11 +234,7 @@ fn native_sync_preserves_rank_for_existing_and_new_rows_with_an_opaque_key() {
             &bed.env.state,
             &bed.toml,
             NOW,
-            &mut ResyncSources::new(
-                &bed.env,
-                bed.env.home.as_deref().unwrap(),
-                &read_local_source_text,
-            ),
+            &mut ResyncSources::new(&bed.env, bed.env.home.as_deref().unwrap()),
             &mut Some(true),
         )
         .due
@@ -463,13 +460,13 @@ fn a_sync_with_nothing_to_read_names_the_pool_file() {
     let err = run();
     assert!(err.contains("nothing to read"), "{err}");
     assert!(err.contains(pool_file), "{err}");
-    let secrets = bed.env.home.as_deref().unwrap().join(".secrets");
-    fs::create_dir_all(&secrets).unwrap();
-    fs::write(
-        secrets.join(pool_file),
-        "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"ann@example.com\"\nwarm = [\"m16\"]\n",
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        bed.env.home.as_deref().unwrap(),
+        &[(
+            pool_file,
+            b"version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"ann@example.com\"\nwarm = [\"m16\"]\n",
+        )],
+    );
     let err = run();
     assert!(!err.contains("nothing to read"), "CONTROL: {err}");
 }
@@ -913,11 +910,9 @@ fn unavailable_checkpoint_io_does_not_establish_an_empty_twin() {
 }
 
 impl Bed {
-    /// A fleet file in `~/.secrets` of `accounts`, each `(label, address)`, for machine `m16`.
+    /// The vault's fleet entry of `accounts`, each `(label, address)`, for machine `m16`.
     fn fleet_file(&self, cli: Cli, accounts: &[(&str, &str)]) {
         let home = self.env.home.as_deref().unwrap();
-        let secrets = home.join(".secrets");
-        fs::create_dir_all(&secrets).unwrap();
         let rows: String = accounts
             .iter()
             .map(|(label, email)| {
@@ -926,7 +921,7 @@ impl Bed {
                 )
             })
             .collect();
-        fs::write(secrets.join(cli_fleet_file(cli)), rows).unwrap();
+        crate::vault_entry::seed(home, &[(&cli_fleet_file(cli), rows.as_bytes())]);
         crate::test_config::write(&self.toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
     }
 
@@ -1435,16 +1430,17 @@ fn the_report_and_the_sync_judge_a_source_that_changes_a_hold_alike() {
     for (warm, folds) in [("m3", false), ("m16", true)] {
         let bed = Bed::new();
         let ann = email("ann");
-        let secrets = bed.env.home.as_deref().unwrap().join(".secrets");
-        fs::create_dir_all(&secrets).unwrap();
-        fs::write(
-            secrets.join(crate::harness::ai_pool::AI_POOL_FILE),
-            format!(
-                "version = 1\n\n[last_heard]\nm3 = \"2026-10-27\"\nm16 = \"2026-10-27\"\n\n\
-                 [[account]]\nprovider = \"codex\"\nemail = \"{ann}\"\nwarm = [\"{warm}\"]\n"
-            ),
-        )
-        .unwrap();
+        crate::vault_entry::seed(
+            bed.env.home.as_deref().unwrap(),
+            &[(
+                crate::harness::ai_pool::AI_POOL_FILE,
+                format!(
+                    "version = 1\n\n[last_heard]\nm3 = \"2026-10-27\"\nm16 = \"2026-10-27\"\n\n\
+                     [[account]]\nprovider = \"codex\"\nemail = \"{ann}\"\nwarm = [\"{warm}\"]\n"
+                )
+                .as_bytes(),
+            )],
+        );
         crate::test_config::write(&bed.toml, "[fleet]\nmachine = \"m16\"\n").unwrap();
         seed(&bed, &ann, false);
         let named = report_folds(&bed, cli, &ann, None);

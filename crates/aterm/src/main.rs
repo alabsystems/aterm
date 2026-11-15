@@ -319,7 +319,7 @@ fn machines_unavailable() -> ExitCode {
 }
 
 /// `aterm secrets` where it cannot exist: the vault keeps its secrets private with POSIX file
-/// modes (0600 files in a 0700 `~/.secrets`), which Windows lacks, so `aterm-secrets` is a
+/// modes (a 0700 store of 0600 files), which Windows lacks, so `aterm-secrets` is a
 /// `cfg(unix)` dependency and the verb refuses by name (docs/DESIGN-secrets-2026-10-20.md §12).
 #[cfg(not(unix))]
 fn secrets_unavailable() -> ExitCode {
@@ -726,6 +726,9 @@ fn cpu_policy_hang() -> Option<std::time::Duration> {
 pub(crate) fn main() -> ExitCode {
     // First: every entry below, the early helper verbs included, reads the installed identity.
     aterm_stamp::install(&STAMP, COMPILED);
+    // One clock read: the broker's start stamps count its phases from here (KI-1111-2).
+    #[cfg(unix)]
+    aterm_link::start_stamps::main_entered();
     let mut argv: Vec<OsString> = std::env::args_os().collect();
     // Capture before ANY descriptor-opening subscriber/window/front-door setup.
     // SAFETY: stamp installation/args_os above only read in-memory startup data;
@@ -1149,6 +1152,13 @@ fn front_door_main(
             #[cfg(not(unix))]
             aterm_cli::Verb::Db => {
                 eprintln!("aterm db: not available on this platform (Unix only)");
+                ExitCode::from(2)
+            }
+            #[cfg(unix)]
+            aterm_cli::Verb::File => aterm_db::file::command::main_entry(forwarded),
+            #[cfg(not(unix))]
+            aterm_cli::Verb::File => {
+                eprintln!("aterm file: not available on this platform (Unix only)");
                 ExitCode::from(2)
             }
             aterm_cli::Verb::Email => aterm_agent::harness::email_cli::main_entry(forwarded),
@@ -6421,10 +6431,10 @@ struct SetupIo {
     /// Keep this process's latest readings of the rows read privately, those read back as
     /// wanted, each with the journal as its read started, for the next launch
     /// (`aterm_cli::macos_doctor::remember_private_read_back`, which keeps only those its fence
-    /// still holds for).
-    remember: fn(&[KeptReading]) -> Result<(), String>,
+    /// still holds for, returning its advanced fence after the save).
+    remember: fn(&mut [KeptReading]) -> Result<(), String>,
     /// What a previous launch kept of them, each with its fence, where it still holds: the same
-    /// run revision, and no change journaled since its read started
+    /// run revision, and no change journaled since its read started that may be to such a row
     /// (`aterm_cli::macos_doctor::remembered_private_read_back`).
     remembered: fn() -> Vec<KeptReading>,
     /// The change journal as a read starts, which fences what it reads for the next launch
@@ -6501,10 +6511,12 @@ fn wake_setup() {
 }
 
 /// One of aterm's windows gained focus: a wake that ends a run's wait only where the run waits
-/// on what a person does in System Settings or macOS ([`WakeMarks::ends_run_wait`]).
+/// on what a person does in System Settings or macOS ([`WakeMarks::ends_run_wait`]), and a hint
+/// to the window's keyboard keeper.
 #[cfg(target_os = "macos")]
 fn wake_setup_on_focus() {
     SETUP_WAKES.raise_focus();
+    input_attachments::focus_gained();
 }
 
 /// A person pressed Check again: a wake that starts a parked run's tries afresh, and lifts
@@ -6563,7 +6575,7 @@ fn wake_setup_for_console_with(
 /// answers goes on then, waiting on the broker, never on a person.
 #[cfg(target_os = "macos")]
 fn watch_setup_signals() {
-    aterm_gui::on_converge_pass_ended(observe_pending_repositories);
+    aterm_gui::on_converge_pass_ended(converge_pass_ended);
     aterm_gui::on_window_focus_gained(wake_setup_on_focus);
     aterm_types::macos_setup::on_system_state_front(wake_setup);
     aterm_types::macos_setup::access_record::on_append(access_step_recorded);
@@ -6638,10 +6650,12 @@ fn access_fact_observed(
     }
 }
 
-/// Retain the grant's follow-up intent before the existing keeper tries a finite worker.
+/// Retain the grant's follow-up intent before the existing keeper tries a finite worker, and
+/// hint that keeper.
 #[cfg(target_os = "macos")]
 fn start_withheld_follow_up() {
     withheld_preferences::request();
+    input_attachments::work_requested();
 }
 
 #[cfg(target_os = "macos")]
@@ -6874,7 +6888,10 @@ struct ObserveRequest {
     subjects: Vec<aterm_types::macos_setup::Subject>,
     /// Check again: read GitHub repositories even while it is not managed.
     forced: bool,
-    /// A child ending only requests a reading while its current Repo stage is pending.
+    /// A converge child ended ([`converge_pass_ended`]): the Repositories row is read only
+    /// while its stage is current and pending ([`SetupIo::pending_repositories`]). With none
+    /// pending the worker reads nothing for this request, and reads instead the vault rows
+    /// the last reading left waiting or unread ([`read_unsettled_vault_rows_again`]).
     pending_repositories: bool,
 }
 
@@ -7000,8 +7017,16 @@ impl ObserveQueue {
     /// Whether a start that failed holds the next one at `now` (milliseconds on
     /// [`observation_millis`]'s clock), its pause on [`OBSERVE_AGAIN`] not yet passed.
     fn start_held(&self, now: u64) -> bool {
+        !self.start_held_for(now).is_zero()
+    }
+
+    /// How much of that pause is left at `now`: nothing where no start failed.
+    fn start_held_for(&self, now: u64) -> std::time::Duration {
+        if self.misses == 0 {
+            return std::time::Duration::ZERO;
+        }
         let pause = u64::try_from(OBSERVE_AGAIN.after(self.misses).as_millis()).unwrap_or(u64::MAX);
-        self.misses > 0 && now < self.missed_at.saturating_add(pause)
+        std::time::Duration::from_millis(self.missed_at.saturating_add(pause).saturating_sub(now))
     }
 }
 
@@ -7045,9 +7070,10 @@ struct ObservedRows {
     /// This process looked once for what a previous launch kept of the private rows
     /// ([`SetupIo::remembered`]): it seeds only rows this process has no reading of.
     remembered_looked: bool,
-    /// The change journal as each kept row's read started ([`SetupIo::fence`]): what that
-    /// reading is kept for the next launch under, and only while nothing was journaled since. A
-    /// row with none (its journal unread) is not kept.
+    /// The change journal as each kept row's read started ([`SetupIo::fence`]), advanced after
+    /// each saved check of the intervening lines. A reading is kept for the next launch only
+    /// while no change that may be to such a row was journaled since. A row with none (its
+    /// journal unread) is not kept.
     fences: Vec<(
         aterm_types::macos_setup::Subject,
         aterm_cli::macos_doctor::Fence,
@@ -7065,6 +7091,25 @@ impl ObservedRows {
         self.fences.retain(|(row, _)| *row != subject);
         if let Some(fence) = fence {
             self.fences.push((subject, fence));
+        }
+    }
+}
+
+/// A save runs without the observation lock. Publish its advanced fences only for readings
+/// and original fences that still match its snapshot; a concurrent fresh read owns its fence.
+#[cfg(target_os = "macos")]
+impl ObservedRows {
+    fn advance_fences(&mut self, before: &[KeptReading], after: &[KeptReading]) {
+        for ((seen, old), (saved, new)) in before.iter().zip(after) {
+            if seen == saved
+                && self.rows.contains(seen)
+                && let Some((_, fence)) = self
+                    .fences
+                    .iter_mut()
+                    .find(|(subject, fence)| *subject == seen.subject && fence == old)
+            {
+                *fence = *new;
+            }
         }
     }
 }
@@ -7098,14 +7143,15 @@ static REMEMBER_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// ([`SetupIo::remember`]): each kept, dated reading of such a row that reads it as wanted, no
 /// stage running on its row and none run since its read started, with the journal as that read
 /// started ([`ObservedRows::fences`]), which the record keeps it under only while no aterm process
-/// journaled a change since. Run after a stage ends and whenever the readings change. A row that
-/// reads otherwise drops out, so the next launch never carries it as wanted.
+/// journaled a change since that may be to such a row. Run after a stage ends and whenever the
+/// readings change. A row that reads otherwise drops out, so the next launch never carries it as
+/// wanted. A successful save advances the fences of readings that have not changed meanwhile.
 #[cfg(target_os = "macos")]
 fn remember_private_readings() {
     let Ok(_turn) = REMEMBER_TURN.lock() else {
         return;
     };
-    let snapshot: Vec<_> = {
+    let mut snapshot: Vec<_> = {
         let Ok(activity) = SETUP_ACTIVITY.lock() else {
             return;
         };
@@ -7145,8 +7191,11 @@ fn remember_private_readings() {
             })
             .collect()
     };
-    if let Err(why) = (setup_io().remember)(&snapshot) {
+    let before = snapshot.clone();
+    if let Err(why) = (setup_io().remember)(&mut snapshot) {
         aterm_log::warn!("System State could not keep its last read-back: {why}");
+    } else if let Ok(mut rows) = OBSERVED_ROWS.lock() {
+        rows.advance_fences(&before, &snapshot);
     }
 }
 
@@ -7431,6 +7480,10 @@ fn retire_observed_rows_with_history(
     let live_retired = subjects.contains(&aterm_types::macos_setup::Subject::Setting(
         aterm_types::macos_setup::Setting::CapsLock,
     )) && rows.caps_live.take().is_some();
+    if live_retired {
+        // The keeper's next round publishes the Caps Lock live reading again.
+        input_attachments::work_requested();
+    }
     let changed = rows.rows.len() != before || live_retired || history_changed;
     if changed {
         rows.generation += 1;
@@ -7525,6 +7578,15 @@ fn capture_caps_live_scope() -> Option<CapsLiveScope> {
         choices: rows.choices,
         started: activity.epoch,
     })
+}
+
+/// Whether the readings hold `live` as the Caps Lock live reading: what a round's
+/// [`publish_caps_live`] leaves unless it was deferred, until a retirement takes the reading.
+#[cfg(target_os = "macos")]
+fn caps_live_stands(live: Option<(u64, aterm_types::macos_setup::LiveKeyboardMapping)>) -> bool {
+    OBSERVED_ROWS
+        .lock()
+        .is_ok_and(|rows| rows.caps_live == live)
 }
 
 /// Publish only from the sampler, after releasing its actor lock. The fast path performs
@@ -7643,10 +7705,13 @@ fn refresh_observation(subjects: Vec<aterm_types::macos_setup::Subject>) -> bool
     })
 }
 
-/// A converge child may have changed checkout state. Queue only; the observer reads and
-/// validates the current pending scope off the child reaper and the event loop.
+/// A converge child ended: it may have changed checkout state, and the vault pass that held
+/// the state lock under an earlier reading is over. Queue only; the observer reads and
+/// validates the current pending scope off the child reaper and the event loop, and where no
+/// Repositories stage is pending it reads the vault rows left waiting or unread again
+/// ([`read_unsettled_vault_rows_again`]).
 #[cfg(target_os = "macos")]
-fn observe_pending_repositories() {
+fn converge_pass_ended() {
     let _ = queue_observation(ObserveRequest {
         plan: None,
         choices: OBSERVED_ROWS.lock().map_or(0, |rows| rows.choices),
@@ -7656,6 +7721,82 @@ fn observe_pending_repositories() {
         forced: false,
         pending_repositories: true,
     });
+}
+
+/// Read again the Secrets and GitHub repositories rows whose last reading settled nothing by
+/// itself, on the observer's worker as a converge pass ends with no Repositories stage pending
+/// ([`observe_rows`]). Their one reading can land while a vault pass holds the state lock or
+/// the vault is moving, and for a finished setup nothing else reads them again in the
+/// background. The Secrets row is owed a reading while it reads [`Standing::Waiting`] or was
+/// not read ([`Standing::Unknown`]). The GitHub repositories row is owed one only while the
+/// plan the rows were read for manages it: while it was not read, and, while it waits, once
+/// the vault's mark moved since its last reading ([`token_mark_moved`]). A wait on the vault
+/// ends with a change of the vault, and one on anything else (GitHub, Git, the disk) is not
+/// asked of GitHub again at every pass. A row that reads any other standing is owed nothing.
+///
+/// A row can stay waiting or unread for as long as what it waits for does (a Mac no admin has
+/// approved, a vault file only a person can mend), and is then read at every pass's end. The
+/// reading is an ordinary refresh of exactly the rows owed (their readings stand until read,
+/// nothing is retired), made as one that says what the row's kept reading says changes nothing
+/// ([`observe_rows_as`]). Such a row costs its read alone: once its dated reading is kept as
+/// the row's last useful value, at the pass after it was dated, those passes write no record
+/// and move no generation.
+///
+/// [`Standing::Waiting`]: aterm_types::macos_setup::Standing::Waiting
+/// [`Standing::Unknown`]: aterm_types::macos_setup::Standing::Unknown
+#[cfg(target_os = "macos")]
+fn read_unsettled_vault_rows_again() {
+    use aterm_types::macos_setup::{Setting, Standing, Subject};
+    let secrets = Subject::Setting(Setting::Secrets);
+    let repositories = Subject::Setting(Setting::Repositories);
+    let (mut owed, repositories_wait, choices) = {
+        let Ok(rows) = OBSERVED_ROWS.lock() else {
+            return;
+        };
+        let standing = |subject: Subject| {
+            rows.rows
+                .iter()
+                .find(|row| row.subject == subject)
+                .map(|row| row.standing)
+        };
+        let mut owed = Vec::new();
+        if matches!(
+            standing(secrets),
+            Some(Standing::Waiting | Standing::Unknown)
+        ) {
+            owed.push(secrets);
+        }
+        let managed = rows
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.selection.contains(Setting::Repositories));
+        let repositories_reads = standing(repositories).filter(|_| managed);
+        if repositories_reads == Some(Standing::Unknown) {
+            owed.push(repositories);
+        }
+        (
+            owed,
+            repositories_reads == Some(Standing::Waiting),
+            rows.choices,
+        )
+    };
+    // The mark is read with no other lock held, and kept as its move's reading is made, here.
+    if repositories_wait && token_mark_moved(|| true) {
+        owed.push(repositories);
+    }
+    if owed.is_empty() {
+        return;
+    }
+    observe_rows_as(
+        ObserveRequest {
+            plan: None,
+            choices,
+            subjects: owed,
+            forced: false,
+            pending_repositories: false,
+        },
+        true,
+    );
 }
 
 /// Enqueue the captured request; another choice or request may have arrived
@@ -7694,6 +7835,23 @@ fn observation_millis() -> u64 {
 #[cfg(target_os = "macos")]
 fn maintain_observation_dispatch() {
     dispatch_observation_with(None, observation_millis, start_observation);
+}
+
+/// How long until [`maintain_observation_dispatch`] next has a reader to start: what is left of
+/// the pause that holds a batch whose reader never started, nothing once it has passed. `None`
+/// while the queue is idle or its reader runs, which reads no clock.
+#[cfg(target_os = "macos")]
+fn observation_dispatch_owed() -> Option<std::time::Duration> {
+    observation_dispatch_owed_at(observation_millis)
+}
+
+#[cfg(target_os = "macos")]
+fn observation_dispatch_owed_at(now: impl FnOnce() -> u64) -> Option<std::time::Duration> {
+    let queue = OBSERVE_QUEUE.lock().ok()?;
+    if queue.running || (queue.next.is_none() && queue.check.is_none()) {
+        return None;
+    }
+    Some(queue.start_held_for(now()))
 }
 
 #[cfg(target_os = "macos")]
@@ -7796,6 +7954,8 @@ fn dispatch_observation_publishing(
         queue.misses = queue.misses.saturating_add(1);
         queue.missed_at = now;
         drop(queue);
+        // The keeper's round starts the retained batch's reader again.
+        input_attachments::work_requested();
         publish();
         aterm_log::warn!("System State could not read its rows: {why}");
         return false;
@@ -7808,15 +7968,35 @@ fn dispatch_observation_publishing(
 /// Read, keep what no stage changed meanwhile, and publish the new readings.
 #[cfg(target_os = "macos")]
 fn observe_rows(request: ObserveRequest) {
+    observe_rows_as(request, false);
+}
+
+/// [`observe_rows`], `again` for a pass's end reading rows whose kept reading settled nothing
+/// ([`read_unsettled_vault_rows_again`]): nothing is known to have changed them, and the read
+/// recurs at every pass while they stay so. Such a reading that says what the row's kept one
+/// says, its date apart, changes nothing ([`says_what_is_kept`]): the kept reading stands with
+/// its own date, and the display history, the generation, the next launch's record and the
+/// published status are left as they were.
+#[cfg(target_os = "macos")]
+fn observe_rows_as(request: ObserveRequest, again: bool) {
     use aterm_types::macos_setup::{Observation, Setting, Standing, Subject};
     let repositories = Subject::Setting(Setting::Repositories);
-    let mut pending = if request.pending_repositories {
-        (setup_io().pending_repositories)().ok().flatten()
-    } else {
-        None
-    };
-    if request.pending_repositories && pending.is_none() {
-        return;
+    let mut pending = None;
+    if request.pending_repositories {
+        // Every pass end checks the private fences, even when no row needs a native read
+        // or the pending-stage lookup cannot answer. This runs on the observer worker.
+        remember_private_readings();
+        match (setup_io().pending_repositories)() {
+            Ok(Some(admission)) => pending = Some(admission),
+            // No admitted, unheld and unparked Repositories stage is unfinished (a finished
+            // setup, among others), so this request reads nothing; the vault rows a reading
+            // left waiting or unread are owed one of their own.
+            Ok(None) => {
+                read_unsettled_vault_rows_again();
+                return;
+            }
+            Err(_) => return,
+        }
     }
     let named = request
         .plan
@@ -7886,8 +8066,9 @@ fn observe_rows(request: ObserveRequest) {
     }
     let history_ticket = begin_setup_history(Some(&plan), Some(choices));
     let started = SETUP_ACTIVITY.lock().map_or(0, |activity| activity.epoch);
-    // The journal as the read starts: a change any aterm process journals after it keeps what
-    // this read finds out of the next launch's record ([`ObservedRows::fences`]).
+    // The journal as the read starts: a change any aterm process journals after it that may be
+    // to a privately read row keeps what this read finds out of the next launch's record
+    // ([`ObservedRows::fences`]).
     let fence = (setup_io().fence)();
     // Every reading is dated from before its read starts, so its age is never told as less than
     // it is (design §3.5).
@@ -8025,6 +8206,9 @@ fn observe_rows(request: ObserveRequest) {
             .into_iter()
             .filter(|seen| current_subject(&seen.subject))
         {
+            if again && says_what_is_kept(&rows, &seen) {
+                continue;
+            }
             // A withheld read ran no reader, so it supplies no evidence either way: the row's
             // unconfirmed mark and its display history stay as they were. An attempted read that
             // said nothing marks it.
@@ -8104,6 +8288,21 @@ fn observe_rows(request: ObserveRequest) {
     if wake {
         wake_setup();
     }
+}
+
+/// Whether `seen`, a reading that was made, says what its row's kept reading says, their dates
+/// apart: the kept one is dated, equals `seen` in everything else, and the row's unconfirmed
+/// mark is already what `seen` would leave it (set for a reading that said nothing, clear for
+/// any other).
+#[cfg(target_os = "macos")]
+fn says_what_is_kept(rows: &ObservedRows, seen: &aterm_types::macos_setup::Observation) -> bool {
+    use aterm_types::macos_setup::Standing;
+    !seen.is_withheld()
+        && rows.unconfirmed.contains(&seen.subject) == (seen.standing == Standing::Unknown)
+        && rows.rows.iter().any(|row| {
+            row.read_at()
+                .is_some_and(|at| at != 0 && seen.clone().stamped(at) == *row)
+        })
 }
 
 /// Start an ordinary read-only refresh of every System State row for `plan`. Private readers

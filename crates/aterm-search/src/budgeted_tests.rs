@@ -430,3 +430,54 @@ fn result_ranges_are_bounded_and_stable_past_the_cap() {
         final_results.matches[..4]
     );
 }
+
+#[test]
+fn skipped_prefix_equals_fed_rows_at_every_budget_and_depth_boundary() {
+    for total in [0usize, 1, 3, 15] {
+        for cap in [0usize, 1, 3, 32] {
+            for budget in [1usize, 3, usize::MAX] {
+                for base in [0usize, usize::MAX - 8] {
+                    for (query, sensitive, regex) in [
+                        ("é", true, false),
+                        ("É", false, false),
+                        ("é|x", true, true),
+                        ("", true, false),
+                    ] {
+                        let mut skipped = BudgetedSearch::with_max_cached_lines(
+                            query, sensitive, regex, base, total, cap,
+                        )
+                        .unwrap();
+                        let mut fed = BudgetedSearch::with_max_cached_lines(
+                            query, sensitive, regex, base, total, cap,
+                        )
+                        .unwrap();
+                        let mut cells = LineCells::new();
+                        cells.push(0..2, 4, 2);
+                        cells.push(2..3, 8, 1);
+                        cells.mark_truncated();
+                        loop {
+                            let end = fed.rows_fed().saturating_add(budget).min(total);
+                            skipped.skip_unretained_rows(budget);
+                            while skipped.rows_fed() < end {
+                                skipped.feed_row_cells("éx".into(), &cells);
+                            }
+                            while fed.rows_fed() < end {
+                                fed.feed_row_cells("éx".into(), &cells);
+                            }
+                            assert_eq!(skipped.rows_fed(), fed.rows_fed());
+                            assert_eq!(skipped.result_count(), fed.result_count());
+                            assert_eq!(skipped.results(), fed.results());
+                            assert_eq!(skipped.results_range(1, 2), fed.results_range(1, 2));
+                            assert_eq!(skipped.is_complete(), fed.is_complete());
+                            if fed.is_complete() {
+                                skipped.skip_unretained_rows(usize::MAX);
+                                assert_eq!(skipped.rows_fed(), total);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

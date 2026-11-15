@@ -2,12 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The source the guards read and the tree a rule is handed. Every accessor a rule reads them by
-//! records its question in the memo unit the rule runs as ([`crate::memo`]): a file's content,
-//! whether it mentions a needle set, what a prefix lists, whether a file is in the corpus,
-//! whether one is test code, and the corpus-wide facts (every path, the scripts, the manifests,
-//! the engine's baseline). A view one rule computed and another reads (a lexing, a file's loads)
-//! is recorded by the reader too, since each accessor records before it reads its cache.
+//! The source the guards read and the tree a rule is handed: every `.rs` file under
+//! [`CORPUS_DIRS`], each lexed at most once whichever rule asks first, and the checkout's paths,
+//! scripts and manifests.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
@@ -16,7 +13,6 @@ use std::sync::{Arc, OnceLock};
 
 use super::{Bound, Finding, hits, is_word, rules};
 use crate::lex::{Lexed, lex};
-use crate::memo::{self, Digest, Shared, Snapshot, Trace, global};
 
 /// What a rule reads: the checkout root (for what it reads through [`crate::tree`]) and the
 /// corpus.
@@ -42,7 +38,6 @@ impl<'a> Tree<'a> {
 
     /// The publication engine's baseline the caller read.
     pub(crate) fn engine(&self) -> &'a crate::EngineBaseline {
-        self.corpus.note(|t| t.global(global::ENGINE));
         self.engine
     }
 
@@ -77,52 +72,47 @@ pub(crate) struct Corpus {
     manifests: Vec<(String, String)>,
     /// Which files are test code that nothing ships ([`Corpus::test_code`]), read once.
     test_code: OnceLock<rules::TestCode>,
-    /// The memo run whose units' questions the corpus answers, when one runs.
-    owner: Option<Arc<Shared>>,
 }
 
 /// The directories whose `.rs` files make the corpus.
-const CORPUS_DIRS: &[&str] = memo::CORPUS_DIRS;
+const CORPUS_DIRS: &[&str] = &["crates", "apps"];
 
 impl Corpus {
-    /// Every `.rs` under [`CORPUS_DIRS`] at `root` (`target/` and dot directories skipped) as
-    /// `snapshot` read it, failing as a walk in path order fails first; then every file of the
+    /// Every `.rs` under [`CORPUS_DIRS`] at `root` (`target/` and dot directories skipped),
+    /// read in parallel, failing as a walk in path order fails first; then every file of the
     /// checkout, the scripts among them, and the manifests among them under [`CORPUS_DIRS`].
-    /// With `owner`, each accessor records its question in the unit its caller runs as.
-    pub(crate) fn read(
-        root: &Path,
-        snapshot: &Snapshot,
-        owner: Option<Arc<Shared>>,
-    ) -> Result<Self, String> {
+    pub(crate) fn at(root: &Path) -> Result<Self, String> {
+        let mut found = Vec::new();
         for dir in CORPUS_DIRS {
-            if let Some((_, why)) = snapshot.unwalked.iter().find(|(d, _)| d == dir) {
-                return Err(why.clone());
-            }
+            crate::collect_rs_files(&root.join(dir), &mut found)
+                .map_err(|e| format!("cannot walk {dir}: {e}"))?;
         }
-        if let Some(e) = snapshot
-            .path_order
-            .iter()
-            .map(|&at| &snapshot.files[at])
-            .filter(|f| memo::in_corpus(&f.rel))
-            .find_map(|f| f.text.as_ref().err())
-        {
-            return Err(e.clone());
-        }
-        let files = snapshot
-            .files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| memo::in_corpus(&f.rel))
-            .filter_map(|(at, f)| {
-                let raw = f.text.as_ref().ok()?;
-                Some(SourceFile::new(
-                    at,
-                    f.rel.clone(),
-                    Arc::clone(raw),
-                    owner.clone(),
-                ))
-            })
-            .collect();
+        found.sort();
+        let width = aterm_cores::available_parallelism().map_or(1, std::num::NonZero::get);
+        let per = found.len().div_ceil(width).max(1);
+        let read: Vec<Result<SourceFile, String>> = crate::workers::threads(|scope| {
+            let running: Vec<_> = found
+                .chunks(per)
+                .map(|group| {
+                    scope.spawn(move || {
+                        group
+                            .iter()
+                            .map(|path| {
+                                let raw = crate::tree::read_to_string(path)
+                                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                                Ok(SourceFile::new(crate::rel_path(root, path), raw.into()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            running
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
+        let mut files = read.into_iter().collect::<Result<Vec<_>, _>>()?;
+        files.sort_by(|a, b| a.rel.cmp(&b.rel));
         let mut paths = Vec::new();
         walk(root, "", &Ignored::read(root), &mut paths)?;
         paths.sort();
@@ -144,13 +134,7 @@ impl Corpus {
             paths,
             manifests,
             test_code: OnceLock::new(),
-            owner,
         })
-    }
-
-    /// The corpus of the checkout at `root`, read with no memo run.
-    pub(crate) fn at(root: &Path) -> Result<Self, String> {
-        Self::read(root, &Snapshot::read(root), None)
     }
 
     /// A corpus of the given `(path, contents)` files, for tests: the `.rs` ones as source, each
@@ -164,8 +148,7 @@ impl Corpus {
         rs.sort_unstable();
         let rs_files: Vec<SourceFile> = rs
             .iter()
-            .enumerate()
-            .map(|(at, (rel, raw))| SourceFile::new(at, (*rel).to_string(), Arc::from(*raw), None))
+            .map(|(rel, raw)| SourceFile::new((*rel).to_string(), Arc::from(*raw)))
             .collect();
         Self {
             files: rs_files,
@@ -182,29 +165,13 @@ impl Corpus {
                 .map(|(rel, text)| ((*rel).to_string(), (*text).to_string()))
                 .collect(),
             test_code: OnceLock::new(),
-            owner: None,
         }
-    }
-
-    /// Records `ask` in the unit this thread runs as, when a memo run reads the corpus.
-    pub(crate) fn note(&self, ask: impl FnOnce(&mut Trace)) {
-        memo::note(self.owner.as_ref(), ask);
     }
 
     /// Which files are test code that nothing ships ([`rules::TestCode::read`]), read once for
-    /// every guard that leaves test code out; each answer is a question of the unit that asks.
-    pub(crate) fn test_code(&self) -> TestCodeView<'_> {
-        TestCodeView {
-            corpus: self,
-            code: self.test_code_now(),
-        }
-    }
-
-    /// The corpus's [`rules::TestCode`], computed outside any unit's questions: each unit asks
-    /// about the files it names ([`TestCodeView::holds`]).
-    pub(super) fn test_code_now(&self) -> &rules::TestCode {
-        self.test_code
-            .get_or_init(|| memo::unrecorded(|| rules::TestCode::read(self)))
+    /// every guard that leaves test code out.
+    pub(super) fn test_code(&self) -> &rules::TestCode {
+        self.test_code.get_or_init(|| rules::TestCode::read(self))
     }
 
     /// The `.rs` files read.
@@ -214,43 +181,18 @@ impl Corpus {
 
     /// Every script of the checkout ([`Script::is_script`]).
     pub(crate) fn scripts(&self) -> &[Script] {
-        self.note(|t| t.global(global::SCRIPTS));
         &self.scripts
     }
 
     /// Every file of the checkout, root-relative ([`walk`]), in path order.
     pub(crate) fn paths(&self) -> &[String] {
-        self.note(|t| t.global(global::PATHS));
         &self.paths
     }
 
     /// Every Cargo manifest under [`CORPUS_DIRS`] ([`is_manifest`]), root-relative, with its
     /// text.
     pub(crate) fn manifests(&self) -> &[(String, String)] {
-        self.note(|t| t.global(global::MANIFESTS));
         &self.manifests
-    }
-
-    /// The digests of [`Self::paths`], [`Self::scripts`] and [`Self::manifests`], which a unit
-    /// that read one is judged by.
-    pub(crate) fn facts(&self) -> [Digest; 3] {
-        let mut paths: Vec<&[u8]> = vec![b"paths"];
-        paths.extend(self.paths.iter().map(|p| p.as_bytes()));
-        let mut scripts: Vec<&[u8]> = vec![b"scripts"];
-        for s in &self.scripts {
-            scripts.push(s.rel.as_bytes());
-            scripts.push(s.raw.as_bytes());
-        }
-        let mut manifests: Vec<&[u8]> = vec![b"manifests"];
-        for (rel, text) in &self.manifests {
-            manifests.push(rel.as_bytes());
-            manifests.push(text.as_bytes());
-        }
-        [
-            memo::digest(&paths),
-            memo::digest(&scripts),
-            memo::digest(&manifests),
-        ]
     }
 
     /// Every file whose path starts with one of `prefixes`.
@@ -258,7 +200,6 @@ impl Corpus {
         &'a self,
         prefixes: &'a [&'a str],
     ) -> impl Iterator<Item = &'a SourceFile> + 'a {
-        self.note(|t| t.listing(prefixes));
         let slice = if let [p] = prefixes {
             let start = self.files.partition_point(|f| f.rel.as_str() < *p);
             let end = start + self.files[start..].partition_point(|f| f.rel.starts_with(p));
@@ -273,29 +214,10 @@ impl Corpus {
 
     /// The file at `rel`, if the corpus holds it.
     pub(crate) fn get(&self, rel: &str) -> Option<&SourceFile> {
-        let found = self
-            .files
+        self.files
             .binary_search_by(|f| f.rel.as_str().cmp(rel))
             .ok()
-            .map(|i| &self.files[i]);
-        self.note(|t| t.has(rel, found.is_some()));
-        found
-    }
-}
-
-/// The corpus's test code, as one unit asks about it ([`Corpus::test_code`]).
-#[derive(Clone, Copy)]
-pub(crate) struct TestCodeView<'a> {
-    corpus: &'a Corpus,
-    code: &'a rules::TestCode,
-}
-
-impl TestCodeView<'_> {
-    /// Is `rel` test code that nothing ships ([`rules::TestCode::holds`])?
-    pub(crate) fn holds(&self, rel: &str) -> bool {
-        let answer = self.code.holds(rel);
-        self.corpus.note(|t| t.test_code(rel, answer));
-        answer
+            .map(|i| &self.files[i])
     }
 }
 
@@ -374,9 +296,6 @@ pub(crate) struct Load {
     pub(crate) files: Vec<String>,
     /// How the loader brings [`Self::files`] in.
     pub(crate) kind: LoadKind,
-    /// Declared logical module segments, including enclosing inline modules. Includes
-    /// splice into the caller and have no independently proven module identity.
-    pub(crate) module: Option<Vec<String>>,
     /// Outside the shipped lines: inside an item whose `cfg` proves it
     /// test-only.
     pub(crate) gated: bool,
@@ -622,16 +541,6 @@ impl Script {
         self.raw.lines().enumerate().map(|(i, l)| (i + 1, l))
     }
 
-    /// A Python script: a `.py`, or a `#!` naming python.
-    pub(crate) fn is_python(&self) -> bool {
-        self.rel.ends_with(".py")
-            || self
-                .raw
-                .lines()
-                .next()
-                .is_some_and(|l| l.starts_with("#!") && l.contains("python"))
-    }
-
     pub(crate) fn finding(&self, rule: &'static str, line: usize, detail: String) -> Finding {
         Finding {
             rule,
@@ -644,14 +553,11 @@ impl Script {
 
 /// One source file: its path, its bytes, and (on demand) its views.
 pub(crate) struct SourceFile {
-    /// Its index in the corpus, which is its index in the memo run's snapshot.
-    at: u32,
     pub(crate) rel: String,
     raw: Arc<str>,
     lexed: OnceLock<Lexed>,
     shipped: OnceLock<Vec<bool>>,
     loads: OnceLock<Vec<Load>>,
-    owner: Option<Arc<Shared>>,
 }
 
 /// One line of a file, in both views (byte-aligned).
@@ -664,47 +570,33 @@ pub(crate) struct Line<'a> {
 }
 
 impl SourceFile {
-    fn new(at: usize, rel: String, raw: Arc<str>, owner: Option<Arc<Shared>>) -> Self {
+    fn new(rel: String, raw: Arc<str>) -> Self {
         Self {
-            at: u32::try_from(at).unwrap_or(u32::MAX),
             rel,
             raw,
             lexed: OnceLock::new(),
             shipped: OnceLock::new(),
             loads: OnceLock::new(),
-            owner,
         }
     }
 
-    /// A file outside the corpus, read by its caller through [`crate::tree`] (which recorded
-    /// that read): its views answer no further question.
+    /// A file outside the corpus, read by its caller through [`crate::tree`].
     pub(crate) fn outside(rel: String, raw: impl Into<Arc<str>>) -> Self {
-        Self::new(0, rel, raw.into(), None)
-    }
-
-    /// Records that the unit this thread runs as read the file's content.
-    fn read(&self) {
-        let at = self.at;
-        memo::note(self.owner.as_ref(), |t| t.content(at));
+        Self::new(rel, raw.into())
     }
 
     /// The file's bytes.
     pub(crate) fn raw(&self) -> &str {
-        self.read();
         &self.raw
     }
 
     pub(crate) fn lexed(&self) -> &Lexed {
-        self.read();
         self.lexed.get_or_init(|| lex(&self.raw))
     }
 
     /// Does the raw file hold any of `needles`? A cheap prefilter before lexing.
     pub(crate) fn mentions(&self, needles: &[&str]) -> bool {
-        let answer = memo::mentions_in(&self.raw, needles);
-        let at = self.at;
-        memo::note(self.owner.as_ref(), |t| t.mentions(at, needles, answer));
-        answer
+        needles.iter().any(|n| self.raw.contains(n))
     }
 
     /// Every line, both views.
@@ -732,7 +624,6 @@ impl SourceFile {
     /// Whether each line ships, by its 0-based index (a line past the end ships): the flags
     /// [`Self::shipped_lines`] filters by.
     pub(crate) fn shipped_flags(&self) -> &[bool] {
-        self.read();
         self.shipped.get_or_init(|| crate::shipped_lines(&self.raw))
     }
 
@@ -760,7 +651,6 @@ impl SourceFile {
     /// else `name.rs` or `name/mod.rs` in the module's own directory — and each
     /// `include!` of a literal, against the file's directory.
     pub(crate) fn loads(&self) -> &[Load] {
-        self.read();
         self.loads.get_or_init(|| {
             let dir_owner = matches!(self.name(), "lib.rs" | "main.rs" | "mod.rs");
             let manifest_dir = self
@@ -848,14 +738,6 @@ impl SourceFile {
                 folder = joined(&folder, segment);
             }
             let by_name = relative.map_or_else(|| folder.clone(), |stem| joined(&folder, stem));
-            let module = Some(
-                chain
-                    .iter()
-                    .map(|&(segment, _)| segment)
-                    .chain(std::iter::once(*name))
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-            );
             let defaults = vec![
                 format!("{by_name}/{name}.rs"),
                 format!("{by_name}/{name}/mod.rs"),
@@ -864,7 +746,6 @@ impl SourceFile {
                 out.push(Load {
                     files: paths.iter().map(|&(p, _)| joined(&folder, p)).collect(),
                     kind: LoadKind::PathMod,
-                    module: module.clone(),
                     gated: gated(*at),
                 });
             }
@@ -874,7 +755,6 @@ impl SourceFile {
                 out.push(Load {
                     files: defaults,
                     kind: LoadKind::Mod,
-                    module,
                     gated: gated(*at),
                 });
             }
@@ -921,7 +801,6 @@ fn include_loads(
                 out.push(Load {
                     files: vec![joined(mdir, suffix.trim_start_matches('/'))],
                     kind: LoadKind::Include,
-                    module: None,
                     gated: gated(at),
                 });
             }
@@ -941,7 +820,6 @@ fn include_loads(
         out.push(Load {
             files: vec![joined(dir, path)],
             kind: LoadKind::Include,
-            module: None,
             gated: gated(at),
         });
     }

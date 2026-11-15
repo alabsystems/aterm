@@ -70,7 +70,6 @@ fn full() -> MachineName {
         nick: nick("Heron"),
         nick_class: NickClass::Chosen,
         migration: Some(Migration::Waiting),
-        undo: Some(held.clone()),
         fleets: vec![FleetClaim {
             digest: [0xab; 8],
             top: 41,
@@ -78,6 +77,31 @@ fn full() -> MachineName {
             lost: vec![num(5)],
             synced: true,
         }],
+        history: vec![
+            Change {
+                at_ms: NOW,
+                from: Some(num(7)),
+                to: Some(num(8)),
+                nick_from: Some(nick("Otter")),
+                nick_to: nick("Heron"),
+                by: Some(By {
+                    node: NodeId::new(&[9; 8]).expect("a mesh id"),
+                    kind: ByKind::Person,
+                }),
+                why: Why::Named,
+                undone: true,
+            },
+            Change {
+                at_ms: NOW - 20,
+                from: None,
+                to: Some(num(7)),
+                nick_from: None,
+                nick_to: nick("Otter"),
+                by: None,
+                why: Why::First,
+                undone: false,
+            },
+        ],
     }
 }
 
@@ -126,6 +150,9 @@ fn a_field_outside_its_grammar_is_refused() {
             "digest = \"ABABABABABABABAB\"",
         ),
         ("digest = \"abababababababab\"", "digest = \"abab\""),
+        ("why = \"named\"", "why = \"later\""),
+        ("nick_to = \"Heron\"", "nick_to = \"m12\""),
+        ("to = 8", "to = 1000000"),
     ] {
         assert!(good.contains(from), "the file spells {from}:\n{good}");
         let bad = good.replacen(from, to, 1);
@@ -141,6 +168,116 @@ fn a_field_outside_its_grammar_is_refused() {
         .collect();
     let text = nine.to_toml().expect("serializes");
     assert!(MachineName::from_toml(&text).is_err(), "nine `was` entries");
+    let mut long = full();
+    long.history = vec![long.history[1].clone(); HISTORY_MAX + 1];
+    let text = long.to_toml().expect("serializes");
+    assert!(
+        MachineName::from_toml(&text).is_err(),
+        "seventeen History entries"
+    );
+    long.history.truncate(HISTORY_MAX);
+    let text = long.to_toml().expect("serializes");
+    assert!(MachineName::from_toml(&text).is_ok(), "sixteen: control");
+}
+
+/// History reads back whole at its widest: [`HISTORY_MAX`] entries, each reason and kind of
+/// author, the first name's entry with no `from`, the widest nickname (21 fullwidth letters,
+/// 63 bytes) on both sides and the longest node word, beside a full `was` and every fleet,
+/// within [`FILE_MAX`].
+#[test]
+fn history_round_trips() {
+    let widest = nick(&"\u{ff21}".repeat(21));
+    assert_eq!(widest.as_str().len(), 63);
+    let whys = [
+        Why::First,
+        Why::Named,
+        Why::Nickname,
+        Why::Drawn,
+        Why::Undone,
+        Why::Registry,
+    ];
+    let kinds = [ByKind::Person, ByKind::Agent, ByKind::Auto];
+    let mut name = full();
+    name.nick = widest.clone();
+    name.was = (0..WAS_MAX)
+        .map(|i| Was {
+            num: num(999_000 + u32::try_from(i).expect("small")),
+            retired: i % 2 == 0,
+            lost: i % 3 == 0,
+        })
+        .collect();
+    name.fleets = (0..FLEETS_MAX)
+        .map(|i| FleetClaim {
+            digest: [u8::try_from(i).expect("small"); 8],
+            top: Number::MAX,
+            claim: name.fleets[0].claim.clone(),
+            lost: vec![num(Number::MAX); 4],
+            synced: true,
+        })
+        .collect();
+    name.history = (0..HISTORY_MAX)
+        .map(|i| {
+            let step = u32::try_from(i).expect("small");
+            let why = whys[i % whys.len()];
+            Change {
+                at_ms: NOW - u64::from(step),
+                from: (why != Why::First).then(|| num(Number::MAX - step - 1)),
+                to: Some(num(Number::MAX - step)),
+                nick_from: (why != Why::First).then(|| widest.clone()),
+                nick_to: widest.clone(),
+                by: Some(By {
+                    node: NodeId::new(&[u8::try_from(i).expect("small"); 16]).expect("a node id"),
+                    kind: kinds[i % kinds.len()],
+                }),
+                why,
+                undone: i % 2 == 1,
+            }
+        })
+        .collect();
+    let text = name.to_toml().expect("serializes");
+    assert!(text.len() <= FILE_MAX, "{} bytes:\n{text}", text.len());
+    assert_eq!(MachineName::from_toml(&text), Ok(name.clone()), "{text}");
+    for why in whys {
+        assert!(
+            text.contains(&format!("why = \"{}\"", why_word(why))),
+            "{why:?}"
+        );
+    }
+    let mut none = name;
+    none.history.clear();
+    let text = none.to_toml().expect("serializes");
+    assert!(!text.contains("history"), "an empty History writes nothing");
+    assert_eq!(MachineName::from_toml(&text), Ok(none));
+}
+
+/// An older build kept an `[undo]` table, which nothing read: such a file reads as the same name
+/// (the unknown table is passed over, never refused), and the next write drops the table. Its
+/// negative control was a mutant that put `#[serde(deny_unknown_fields)]` on the file's wire
+/// form: the read then failed.
+#[test]
+fn an_older_files_undo_table_reads_and_the_next_write_drops_it() {
+    let root = state();
+    let name = full();
+    let text = name.to_toml().expect("serializes");
+    let older = text.replacen(
+        "[[was]]",
+        &format!(
+            "[undo]\nnum = 7\nclass = \"seeded\"\nsince = 3\nbase = \"{}\"\ntgen = 1\n\n[[was]]",
+            node_word(node(2))
+        ),
+        1,
+    );
+    assert!(older.contains("[undo]"), "{older}");
+    assert_eq!(MachineName::from_toml(&older), Ok(name.clone()));
+    write_private(root.path(), FILE, older.as_bytes()).expect("an older build's file");
+    assert_eq!(read(root.path()).expect("reads"), Some(name));
+    replace(root.path(), |held| {
+        held.rev += 1;
+        Ok(())
+    })
+    .expect("replaces");
+    let written = std::fs::read_to_string(root.path().join(FILE)).expect("reads");
+    assert!(!written.contains("[undo]"), "{written}");
 }
 
 #[test]

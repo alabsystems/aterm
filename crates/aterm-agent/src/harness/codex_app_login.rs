@@ -55,12 +55,14 @@ pub use grant_completion::{FreshCodeGrant, StagedWitness};
 pub(in crate::harness) use refresh_transport::with_refresh_fixture_endpoint;
 pub(in crate::harness) use refresh_transport::{
     ReceivedRefresh, RefreshExchange, exchange_owned_refresh, merge_owned_refresh,
-    owned_refresh_refusal_settled_at, owned_refresh_refused, owned_refresh_token_digest,
+    owned_refresh_refusal_reason, owned_refresh_refusal_settled_at, owned_refresh_refused,
+    owned_refresh_token_digest,
 };
 #[cfg(any(test, debug_assertions))]
 pub use refusal::record_refusal_for_test;
+pub(crate) use refusal::refused_login_context;
 pub use refusal::{
-    OtherRefusal, RefusalReason, RefusalStanding, refusal_standing, row_refusal,
+    CustodyRecord, OtherRefusal, RefusalReason, RefusalStanding, refusal_standing, row_refusal,
     row_signed_out_reason, settled_refusal,
 };
 
@@ -2912,13 +2914,16 @@ pub fn read_identified_login_with_fixture_roots(
     expected_email: Option<&str>,
     roots: Vec<Vec<u8>>,
     use_token: super::provider_read::Use,
-) -> Option<IdentifiedUsage> {
-    use_token
+) -> IdentifiedRead {
+    if use_token
         .begin_home(super::provider_read::Read::CodexEndpoint, home, now)
-        .ok()?;
+        .is_err()
+    {
+        return IdentifiedRead::Unread;
+    }
     let usage_url = resolve_usage_url(config_home, user_home);
     if !usage_url.starts_with("https://") || !is_loopback_endpoint(&usage_url) {
-        return None;
+        return IdentifiedRead::Unread;
     }
     let client = Client::new(Trust::Roots(roots), ProxyMode::Direct, wait);
     let snapshot = read_login_snapshot_using(
@@ -2930,10 +2935,16 @@ pub fn read_identified_login_with_fixture_roots(
         expected_email,
         Some(&client),
     );
-    Some(IdentifiedUsage {
-        identity: snapshot.identity?,
-        usage: snapshot.reading.usage()?,
-    })
+    // As the live reader answers ([`read_identified_login_with`]): a login read signed out is a
+    // fact of its account, kept apart from a read that said nothing.
+    if snapshot.reading == Reading::SignedOut {
+        return IdentifiedRead::SignedOut;
+    }
+    snapshot
+        .identity
+        .zip(snapshot.reading.usage())
+        .map(|(identity, usage)| IdentifiedUsage { identity, usage })
+        .into()
 }
 
 fn percent_encode_component(input: &str) -> String {
@@ -4371,15 +4382,32 @@ pub(in crate::harness) fn login_with_enrollment_custody<C: CodeGrantCapture>(
         };
 
         let finished = || done.load(Ordering::SeqCst);
-        let page = match approver.approve(&Handoff {
+        let work_cancelled = || {
+            work.as_ref()
+                .is_some_and(super::account_work::Scope::cancelled)
+        };
+        // The approver's waits on the page and the mail end at their next look once this
+        // sign-in's account work is cancelled (a quit, an update).
+        let approval = approver.approve(&Handoff {
             url: &auth_url,
             code: None,
             completion: Completion::Loopback,
             hosts,
             email,
             finished: &finished,
-            deadline: super::login_drive::Deadline::waking(deadline, &Instant::now),
-        }) {
+            deadline: super::login_drive::Deadline::waking(deadline, &Instant::now)
+                .cancelled_by(&work_cancelled),
+        });
+        if work_cancelled() {
+            // Whatever the approver made of a page it left for the cancellation, it is no
+            // outcome of this account's sign-in.
+            let _ = server.join();
+            return Drove {
+                outcome: Outcome::Unverified("automatic account work is cancelled".into()),
+                host,
+            };
+        }
+        let page = match approval {
             Approval::Approved { page } => page,
             Approval::NotRun(why) => {
                 let _ = server.join();

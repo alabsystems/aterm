@@ -576,6 +576,7 @@ fn the_materializer_conforms_to_the_reading_walk_and_a_live_unsettled_read_or_a_
                     frontier: file.frontier().unwrap(),
                     projection: materialize::PROJECTION,
                     withheld: 0,
+                    inert: 0,
                     projected: None,
                 })),
                 NOW,

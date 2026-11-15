@@ -108,6 +108,7 @@ fn required_sandbox_preflight_uses_its_original_start() {
             Path::new(SANDBOX_EXEC),
             &mut command,
             Instant::now() - Duration::from_secs(age),
+            &|| false,
         );
         if age == 61 {
             assert!(result.is_some_and(|why| why.contains("deadline expired")));
@@ -134,9 +135,58 @@ fn required_sandbox_preflight_retains_a_real_native_refusal() {
         Path::new(SANDBOX_EXEC),
         &mut command,
         Instant::now() - Duration::from_secs(21),
+        &|| false,
     );
     assert!(root.path().join("started").is_file());
     assert!(result.is_some_and(|why| why.contains("exited 7 on a try")));
+}
+
+/// A QUIT ENDS AN AUTOMATIC SIGN-IN'S SANDBOX TRY: a try whose exec hangs (a stand-in that
+/// sleeps an hour) is ended, its group killed and reaped, at the first look after its account
+/// work is cancelled, and says so. NEGATIVE CONTROL: without the loop's read of `cancelled`, the
+/// try runs to its 60 s bound and says it did not finish.
+#[cfg(unix)]
+#[test]
+fn a_quit_ends_a_sandbox_try_whose_exec_hangs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let witness = dir.path().join("pid");
+    let program = dir.path().join("sandbox-exec");
+    let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho $$ > '{}.tmp' && mv '{0}.tmp' '{0}'\nexec '{}' 3600\n",
+            witness.display(),
+            sleep.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = aterm_uds::spawnfd::command(&program);
+    command
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    // The quit comes once the try's child is running.
+    let result = sandbox_refusal_command(&program, &mut command, Instant::now(), &|| {
+        witness.is_file()
+    });
+    assert!(
+        result
+            .as_deref()
+            .is_some_and(|why| why.contains("cancelled")),
+        "{result:?}"
+    );
+    let pid = std::fs::read_to_string(&witness)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        aterm_uds::process::process_presence(pid),
+        aterm_uds::process::ProcessPresence::Absent
+    );
 }
 
 #[test]

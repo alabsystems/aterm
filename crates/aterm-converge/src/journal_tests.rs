@@ -158,10 +158,14 @@ fn the_journal_rotates_within_its_bound_and_keeps_one_rotation() {
         .collect();
     let mut sorted = names.clone();
     sorted.sort();
-    assert_eq!(
-        sorted,
-        [FileJournal::ROTATED, FileJournal::LOCK, FileJournal::FILE]
-    );
+    let expected = vec![
+        #[cfg(unix)]
+        FileJournal::HISTORY,
+        FileJournal::ROTATED,
+        FileJournal::LOCK,
+        FileJournal::FILE,
+    ];
+    assert_eq!(sorted, expected);
     let current = lines(&journal.path());
     assert_eq!(current.last().unwrap()["id"].as_str(), Some("item.39"));
     let older = lines(&journal.rotated());
@@ -295,7 +299,7 @@ fn a_journal_that_is_not_a_regular_file_refuses_and_nothing_is_applied() {
         }
 
         let rot_scratch = aterm_tempfile::tempdir().unwrap();
-        let mut rot_journal = FileJournal::bounded(rot_scratch.path(), 128);
+        let mut rot_journal = FileJournal::bounded(rot_scratch.path(), 200);
         rot_journal.before_change("item.0", "a", "b", None).unwrap();
         let before_lines = lines(&rot_journal.path());
         assert_eq!(before_lines.len(), 1);
@@ -334,19 +338,28 @@ fn a_journal_that_is_not_a_regular_file_refuses_and_nothing_is_applied() {
 fn each_line_is_flushed_durable_before_its_change_and_a_new_entry_with_its_folder() {
     use aterm_durable::{Flush, seam::Recording};
     let scratch = aterm_tempfile::tempdir().unwrap();
-    let bound = 200;
+    let bound = 600;
     let mut journal = FileJournal::bounded(scratch.path(), bound);
     let recording = Recording::start();
     journal.before_change("item.0", "from", "to", None).unwrap();
-    assert_eq!(recording.take(), [Flush::Durable, Flush::Durable]);
+    assert_eq!(
+        recording.take(),
+        vec![Flush::Durable; if cfg!(unix) { 4 } else { 2 }]
+    );
     journal.before_change("item.1", "from", "to", None).unwrap();
-    assert_eq!(recording.take(), [Flush::Durable]);
+    assert_eq!(
+        recording.take(),
+        vec![Flush::Durable; if cfg!(unix) { 3 } else { 1 }]
+    );
     let mut flushes = Vec::new();
     while fs::metadata(journal.rotated()).is_err() {
         journal.before_change("item.n", "from", "to", None).unwrap();
         flushes = recording.take();
     }
-    assert_eq!(flushes, [Flush::Durable, Flush::Durable]);
+    assert_eq!(
+        flushes,
+        vec![Flush::Durable; if cfg!(unix) { 4 } else { 2 }]
+    );
 }
 
 #[test]
@@ -428,4 +441,49 @@ fn writers_that_cross_the_bound_together_rotate_once_and_none_is_refused() {
     for name in [FileJournal::FILE, FileJournal::ROTATED] {
         assert!(!lines(&dir.join(name)).is_empty(), "{name}");
     }
+}
+
+/// A failed index publication cannot authorize the pending change. A normal publication
+/// is the positive control, and the directory in place of the index is the negative one.
+#[cfg(unix)]
+#[test]
+fn a_history_publication_failure_keeps_the_change_unapplied() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let mut journal = FileJournal::under(scratch.path());
+    journal.before_change("initial", "a", "b", None).unwrap();
+    assert!(FileJournal::history_stamp_at(&journal.path(), |_| true).is_some());
+    let index = journal.path().with_file_name(FileJournal::HISTORY);
+    fs::remove_file(&index).unwrap();
+    fs::create_dir(&index).unwrap();
+    let item = Scripted::new(vec![change(), ok()], Ok(()));
+    let applies = Arc::clone(&item.applies);
+    let rows = run(&[Box::new(item)], Mode::Apply, &mut journal).unwrap();
+    assert_eq!(rows[0].outcome, Outcome::Failed);
+    assert_eq!(applies.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(FileJournal::history_stamp_at(&journal.path(), |_| true).is_none());
+}
+
+/// A reader cannot observe the transient pair between the durable journal append and index
+/// replacement. With the writer's lock held, a zero-wait read refuses; without the lock it
+/// returns the already-valid stamp. Ignoring the lock is the negative control.
+#[cfg(unix)]
+#[test]
+fn a_history_read_shares_the_writers_publication_lock() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let mut journal = FileJournal::under(scratch.path());
+    journal.before_change("setting", "a", "b", None).unwrap();
+    let before = FileJournal::history_stamp_at(&journal.path(), |_| true).unwrap();
+    let held = Held::take(
+        &journal.path().with_file_name(FileJournal::LOCK),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(
+        FileJournal::history_stamp_with_wait(&journal.path(), |_| true, Duration::ZERO).is_none()
+    );
+    drop(held);
+    assert_eq!(
+        FileJournal::history_stamp_with_wait(&journal.path(), |_| true, Duration::ZERO),
+        Some(before)
+    );
 }

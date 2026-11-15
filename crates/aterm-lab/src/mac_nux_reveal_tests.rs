@@ -8,7 +8,10 @@ use crate::reveal_tab::{AxEvidence, evidence_json};
 /// three as `tree` says (none: not read).
 fn checks(off: bool, tree: Option<[bool; 3]>) -> Vec<(String, bool)> {
     let mut checks = vec![
-        ("the import sealed the synthetic logins".to_owned(), true),
+        (
+            "in a tab the Editor tab opens on a private document".to_owned(),
+            true,
+        ),
         ("`text` of the Editor tab refuses".to_owned(), off),
     ];
     if let Some(tree) = tree {
@@ -93,7 +96,7 @@ fn cells_unread() -> Vec<(String, Value)> {
 #[test]
 fn the_evidence_is_the_report_lines_under_the_rows_publication() {
     let ev = Evidence {
-        imported: true,
+        editor_opened: true,
         ax: Some(AxEvidence {
             grid_read: true,
             logins_read: true,

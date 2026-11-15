@@ -448,7 +448,7 @@ pub fn read_process_markers(pid: i32) -> Option<Markers> {
             return None;
         }
         bracketed(pid, read_identity, || {
-            markers_from_procargs2(&crate::procargs::read(u32::try_from(pid).ok()?)?)
+            markers_from_procargs2(&crate::procargs::read(u32::try_from(pid).ok()?).ok()?)
         })
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]

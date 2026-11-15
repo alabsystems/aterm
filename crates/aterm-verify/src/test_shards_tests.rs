@@ -17,7 +17,6 @@ fn sample(wall_ms: u64, prefix: Option<&str>) -> Sample {
         cores: None,
         tests: Some(1000),
         partition: prefix.map(str::to_owned),
-        exe_sha256: None,
     }
 }
 
@@ -99,47 +98,28 @@ fn long_observed_partitions_expand_without_starting_an_executable() {
         History::decode(&history.encode())
     };
     let long = history(sample(180_000, Some("libtest_fixture::")));
-    let halves = expand(vec![binary.clone()], &long, None);
+    let halves = expand(vec![binary.clone()], &long);
     assert_eq!(halves.len(), 2);
     assert_eq!(
         seen(&long, &halves[0].spec).unwrap().wall,
         Duration::from_secs(90)
     );
-    let evidence = crate::test_content::Evidence {
-        exe_sha256: Some("ab".repeat(32)),
-        content_key: Some("cd".repeat(32)),
-        reason: None,
-        parts: crate::test_content::KeyParts::new(),
-    };
-    let prior_spec = format!("{} -- --skip prior::", binary.spec);
-    let mut passed = Passed::new();
-    passed.insert(
-        prior_spec.clone(),
-        crate::test_content::CarryProof::passed(&prior_spec, &evidence, 1.0),
-    );
-    assert!(
-        expand(vec![binary.clone()], &long, Some(&passed))[0]
-            .spec
-            .ends_with(" -- prior::")
-    );
     assert_eq!(
         expand(
             vec![binary.clone()],
-            &history(sample(119_999, Some("libtest_fixture::"))),
-            None
+            &history(sample(119_999, Some("libtest_fixture::")))
         ),
         [binary.clone()]
     );
     assert_eq!(
-        expand(vec![binary.clone()], &history(sample(180_000, None)), None),
+        expand(vec![binary.clone()], &history(sample(180_000, None))),
         [binary.clone()]
     );
     for invalid in ["--not-a-filter", "bad filter"] {
         assert_eq!(
             expand(
                 vec![binary.clone()],
-                &history(sample(180_000, Some(invalid))),
-                None
+                &history(sample(180_000, Some(invalid)))
             ),
             [binary.clone()]
         );
@@ -148,8 +128,7 @@ fn long_observed_partitions_expand_without_starting_an_executable() {
     assert_eq!(
         expand(
             vec![binary.clone()],
-            &history(sample(180_000, Some(&oversized))),
-            None
+            &history(sample(180_000, Some(&oversized)))
         ),
         [binary.clone()]
     );
@@ -157,8 +136,7 @@ fn long_observed_partitions_expand_without_starting_an_executable() {
     assert_eq!(
         expand(
             vec![binary.clone()],
-            &history(sample(180_000, Some(&full_filter))),
-            None
+            &history(sample(180_000, Some(&full_filter)))
         ),
         [binary.clone()]
     );
@@ -166,13 +144,13 @@ fn long_observed_partitions_expand_without_starting_an_executable() {
     for half in &halves {
         short.push(&half.spec, sample(40_000, None));
     }
-    assert_eq!(expand(vec![binary.clone()], &short, None), [binary.clone()]);
+    assert_eq!(expand(vec![binary.clone()], &short), [binary.clone()]);
     let mut filtered = binary.clone();
     filtered.record.argv.push("libtest_fixture::".into());
-    assert_eq!(expand(vec![filtered.clone()], &long, None), [filtered]);
+    assert_eq!(expand(vec![filtered.clone()], &long), [filtered]);
     let mut custom = binary;
     custom.harness = false;
-    assert_eq!(expand(vec![custom.clone()], &long, None), [custom]);
+    assert_eq!(expand(vec![custom.clone()], &long), [custom]);
 }
 
 /// The real run entry must dispatch both planned invocations. Removing its expansion hook

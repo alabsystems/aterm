@@ -54,7 +54,7 @@ fn held_call(inst: &Instance, boot_sid: &str, args: &[&str]) -> std::process::Ou
 fn named_sid(reply: &str) -> &str {
     reply
         .split_whitespace()
-        .find(|t| t.starts_with("s-"))
+        .find(|t| aterm_types::tab_id::is_tab_id(t))
         .unwrap_or_else(|| panic!("spawn names its sid: {reply}"))
 }
 

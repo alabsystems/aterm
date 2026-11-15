@@ -121,6 +121,11 @@ impl<T> RecoveryLedger<T> {
         self.entries.is_empty()
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn retains_token_for_test(&self, token: RecoveryToken) -> bool {
+        self.entries.iter().any(|entry| entry.sequence == token.0)
+    }
+
     pub(crate) fn push(&mut self, value: T, now_ms: u64) {
         self.prune(now_ms);
         if self.capacity == 0 {
@@ -136,6 +141,14 @@ impl<T> RecoveryLedger<T> {
             closed_at_ms: now_ms,
             value,
         });
+    }
+
+    /// Compare identity and age without cloning a recursive descriptor on every UI turn.
+    pub(crate) fn matches_candidate(&self, token: RecoveryToken, now_ms: u64) -> bool {
+        self.entries.back().is_some_and(|entry| {
+            entry.sequence == token.0
+                && now_ms.saturating_sub(entry.closed_at_ms) <= self.max_age_ms
+        })
     }
 
     fn live(&self, now_ms: u64) -> impl Iterator<Item = (&T, u64)> {

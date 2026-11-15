@@ -1772,23 +1772,20 @@ fn an_impostor_of_the_issuer_names_the_remedy_here() {
     let at = SocketAddr::from(([192, 168, 100, 100], 7100));
     let other = identity(&node_of(0x11), 4).key();
     let said = |target: &Peer, node: &str| {
-        answered_as(&target_of(target), &ring, at, Some(&proof(node, other)))
-            .unwrap_err()
-            .to_string()
+        answered_as(&target_of(target), &ring, at, Some(&proof(node, other))).unwrap_err()
     };
     let of_issuer = said(&issuer, i.node());
     assert!(
-        of_issuer.contains("claims issuer 11111111")
-            && of_issuer.contains("peers rm it here, rejoin"),
+        matches!(&of_issuer, Unreached::Impostor { issuer: true, node, .. } if node == i.node()),
         "{of_issuer}"
     );
     let of_member = said(&member, m.node());
     assert!(
-        of_member.contains("peers rm it on the issuer"),
+        matches!(&of_member, Unreached::Impostor { issuer: false, node, .. } if node == m.node()),
         "{of_member}"
     );
     for reason in [of_issuer, of_member] {
-        assert!(reason.chars().count() <= 103, "{reason}");
+        assert!(reason.to_string().chars().count() <= 103, "{reason}");
     }
 }
 
@@ -2973,13 +2970,9 @@ fn a_merged_entrys_unsigned_addr_neither_crowds_an_address_nor_moves_a_held_one(
             ..keyed(0xe3, silent.key(), [10, 0, 0, 9], 7100)
         },
         Peer {
+            addr: Some(IpAddr::from([10, 0, 0, 4])),
             seen_ms: Some(now - 60_000),
-            signed: Some(Signed::by(
-                &known,
-                ("m4.local", 7100, "0.146.0"),
-                now - 60_000,
-            )),
-            ..keyed(0xe4, known.key(), [10, 0, 0, 4], 7100)
+            ..Peer::own(&known, ("m4.local", 7100, "0.146.0"), now - 60_000)
         },
     ];
     let mut served: Vec<Peer> = others
@@ -3033,6 +3026,106 @@ fn a_merged_entrys_unsigned_addr_neither_crowds_an_address_nor_moves_a_held_one(
         Ok(Recorded::New),
         "a first-hand join from 10.0.0.9 is not crowded out by merged entries"
     );
+}
+
+#[test]
+fn a_new_signed_endpoint_retires_the_previous_endpoints_observed_address() {
+    let me = identity(&node_of(0xe4), 0x34);
+    for endpoint in [("192.168.1.127", 7100), ("m21.local", 7200)] {
+        let first = Peer {
+            addr: Some(IpAddr::from([172, 20, 10, 6])),
+            ..Peer::own(&me, ("m21.local", 7100, "0.198.0"), 100)
+        };
+        let mut book = vec![first.clone()];
+        let newer = Peer::own(&me, (endpoint.0, endpoint.1, "0.199.0"), 101);
+        assert_eq!(
+            merge_signed(
+                &mut book,
+                &[newer],
+                (None, 200),
+                (None, &[], &Keyring::default())
+            ),
+            1
+        );
+        assert_eq!(
+            book[0].addr, None,
+            "an observation of the old endpoint is stale"
+        );
+        assert_eq!(book[0].host, endpoint.0);
+        assert_eq!(book[0].port, endpoint.1);
+        assert!(book[0].signature_holds());
+        merge_signed(
+            &mut book,
+            &[first],
+            (None, 200),
+            (None, &[], &Keyring::default()),
+        );
+        assert_eq!(
+            book[0].addr, None,
+            "an older descriptor cannot restore the observation"
+        );
+        assert_eq!(book[0].port, endpoint.1);
+    }
+}
+
+#[test]
+fn named_member_connection_errors_give_a_next_check_without_transport_coordinates() {
+    let at = "172.20.10.6:62609".parse().unwrap();
+    for kind in [
+        io::ErrorKind::TimedOut,
+        io::ErrorKind::ConnectionRefused,
+        io::ErrorKind::HostUnreachable,
+        io::ErrorKind::NetworkUnreachable,
+        io::ErrorKind::PermissionDenied,
+    ] {
+        let why = Unreached::Connect(at, kind.into());
+        let words = why.to_string();
+        assert!(
+            words.chars().count() <= 100,
+            "the next check must fit a survey's error row: {words}"
+        );
+        assert!(
+            !words.contains("172.20.10.6") && !words.contains("62609"),
+            "{words}"
+        );
+        assert!(words.contains("check") || words.contains("run"), "{words}");
+        if kind == io::ErrorKind::TimedOut {
+            assert!(
+                words.contains("cause unknown"),
+                "a timeout does not prove its remote cause"
+            );
+        }
+        assert_eq!(
+            why.at(),
+            Some(at),
+            "technical evidence remains available explicitly"
+        );
+        assert!(
+            format!("{why:?}").contains("172.20.10.6"),
+            "explicit diagnostics retain the route"
+        );
+    }
+}
+
+#[test]
+fn issuer_book_errors_do_not_reintroduce_transport_coordinates() {
+    let at = "172.20.10.6:62609".parse().unwrap();
+    for why in [
+        BookUnread::Older(at),
+        BookUnread::OtherNode {
+            at,
+            said: node_of(1),
+            want: node_of(2),
+        },
+    ] {
+        let words = why.to_string();
+        assert!(
+            !words.contains("172.20.10.6") && !words.contains("62609"),
+            "{words}"
+        );
+        assert!(words.contains("aterm"), "a next check is retained: {words}");
+        assert!(format!("{why:?}").contains("172.20.10.6"));
+    }
 }
 
 /// Under a log, a signed entry under a key the log names no way (a founder's, while no record
@@ -6522,7 +6615,7 @@ fn a_peer_that_claims_a_bound_node_without_its_key_is_named_and_never_read() {
     let said = reads[0].as_ref().map(|_| ()).unwrap_err().to_string();
     assert!(
         matches!(&reads[0], Err(Unreached::Impostor { node: said, .. }) if *said == node)
-            && said.contains("claims node aaaaaaaa with another key"),
+            && !said.contains("127.0.0.1"),
         "{said}"
     );
     assert_eq!(impostor.asked(), 0);
@@ -6686,15 +6779,6 @@ fn a_proven_peer_is_read_only_as_the_node_it_proved() {
             );
         }
     }
-    let said = read(Some(&real), claims[0].0.clone(), true)
-        .map(|_| ())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        said.contains("proved node aaaaaaaa, its survey says node bcbcbcbc: not read"),
-        "{said}"
-    );
-
     match read(None, vec![head(&format!("node={mine}"))], false) {
         Ok(surveyed) => assert_eq!(
             (surveyed.node.as_deref(), surveyed.proven),
@@ -7219,7 +7303,7 @@ fn a_drive_reaches_only_the_node_this_machine_binds_a_key_to() {
     ) {
         Err(why @ Unreached::Handshake(_, FleetError::UnknownOp(_))) => {
             assert!(
-                why.to_string().contains("aterm fleet allow drive"),
+                why.to_string().contains("aterm fleet peers"),
                 "names what its person runs: {why}"
             );
         }
@@ -7387,7 +7471,7 @@ fn a_listener_that_hangs_up_in_the_handshake_is_said_to() {
     assert!(why.hung_up(), "{why:?}");
     let said = why.to_string();
     assert!(
-        said.contains("hung up mid-handshake") && said.contains("try again"),
+        said.contains("fleet handshake") && said.contains("aterm node status"),
         "{said}"
     );
     let at = SocketAddr::from(([192, 168, 1, 23], 7100));
@@ -10585,6 +10669,18 @@ fn an_answer_past_this_machines_clock_reads_as_none_and_the_next_answer_stands()
 }
 
 #[test]
+fn a_generic_fleet_refusal_is_not_diagnosed_as_a_different_secret() {
+    let at = SocketAddr::from(([127, 0, 0, 1], 7100));
+    let refused = Unreached::Handshake(at, FleetError::Refused);
+    let different_secret = Unreached::Handshake(at, FleetError::ListenerWrongSecret);
+    assert_ne!(
+        refused.guidance(),
+        different_secret.guidance(),
+        "a generic NO verdict carries no proof that the fleet secrets differ"
+    );
+}
+
+#[test]
 fn unreached_at_capacity_classifies_slot_drops_and_busy_without_retrying_refused_or_wrong_secret() {
     let addr = SocketAddr::from(([10, 0, 0, 1], 7100));
 
@@ -12857,39 +12953,14 @@ fn a_node_is_named_by_the_shortest_head_no_other_node_shares() {
         "the whole id where every shorter head is shared"
     );
     let at = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
-    let misnamed = Unreached::Misnamed {
-        at,
-        proved: a.to_owned(),
-        claimed: b.to_owned(),
-    };
-    assert!(
-        misnamed
-            .to_string()
-            .contains("proved node c0ffee34a1, its survey says node c0ffee34a2"),
-        "{misnamed}"
-    );
-    let other = Unreached::OtherNode {
-        at,
-        said: a.to_owned(),
-        want: b.to_owned(),
-    };
-    assert!(
-        other.to_string().starts_with(
-            "127.0.0.1 is node c0ffee34a1 now: rejoin this peer, or `aterm fleet peers rm \
-             c0ffee34a2`"
-        ),
-        "{other}"
-    );
     // A book read answered at the issuer's address by a node whose id begins as the issuer's.
     let book = BookUnread::OtherNode {
         at,
         said: a.to_owned(),
         want: b.to_owned(),
     };
-    assert_eq!(
-        book.to_string(),
-        "127.0.0.1:1 answered as node c0ffee34a1, not this Mac's issuer"
-    );
+    assert!(book.to_string().starts_with("node c0ffee34a1 answered"));
+    assert!(!book.to_string().contains("127.0.0.1"));
     for (refusal, head) in [
         (
             Undriven::Unlisted(a.to_owned()),
@@ -13050,10 +13121,15 @@ fn reasons_typed_by_producer() {
     }
     let here = connect(at, io::ErrorKind::TimedOut);
     let there = connect(other, io::ErrorKind::TimedOut);
-    assert_ne!(
+    assert_eq!(
         here.to_string(),
         there.to_string(),
-        "the words name the address"
+        "normal words do not expose transport coordinates"
+    );
+    assert_ne!(
+        here.at(),
+        there.at(),
+        "explicit transport evidence stays distinct"
     );
     assert_eq!(here.reason(), there.reason(), "the token does not");
     assert_ne!(

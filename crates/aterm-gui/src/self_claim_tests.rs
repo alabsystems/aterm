@@ -141,7 +141,7 @@ fn only_a_proven_claims_own_copy_names_a_rollout_target() {
 /// name no read-only target; a copy of another process goes at the release.
 #[test]
 fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
-    use crate::codex_rollout_tap::{Ask, RECHECK, due};
+    use crate::codex_rollout_tap::{Ask, REST_FAR, due};
     use crate::session_timeline::{claim_supervisor_as, release_supervisor};
     const THREAD: &str = "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77";
     let handle = crate::session_store::test_handle_on(7594, -1);
@@ -226,7 +226,8 @@ fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
     );
     let mut asked = std::collections::HashMap::new();
     let t0 = std::time::Instant::now();
-    for at in [t0, t0 + RECHECK] {
+    // The tab wrote nothing, so its second read is its rest clock's.
+    for at in [t0, t0 + REST_FAR] {
         assert_eq!(
             due(
                 &mut asked,
@@ -260,7 +261,7 @@ fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
             7594,
             tap_target(ctx, 4242),
             None,
-            (t0 + RECHECK * 2, None)
+            (t0 + REST_FAR * 2, None)
         ),
         Ask::Stop
     );
@@ -328,9 +329,9 @@ fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
 /// on, is the self-claim's own to wait out; everything else stays a stop.
 #[test]
 fn a_self_claim_answers_only_a_usage_wall_under_resume_limits() {
+    use alab_policy::vocab::WallKind;
     use aterm_agent::supervise::SupervisorConfig;
     use aterm_messages::presence::WallAnswer;
-    use aterm_phase::WallKind;
     let on = SupervisorConfig::default();
     assert!(on.resume_limits, "the default resumes limits");
     let off = SupervisorConfig {

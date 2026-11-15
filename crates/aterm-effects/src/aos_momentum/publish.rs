@@ -24,7 +24,8 @@ use super::bundle::{CandidateBundle, Publication, PublishedHead};
 use super::m4::{Admitted, row_verdict};
 use super::policy::{AcceptancePolicy, M4_POLICY_V1_DIGEST, Replace};
 use super::{
-    HostMode, Hosted, MomentumHost, MomentumObservation, MomentumSchema, PrebuiltMomentum,
+    Attached, HostMode, MomentumEngine, MomentumHost, MomentumObservation, MomentumSchema,
+    PrebuiltMomentum,
 };
 
 /// Why an admitted plan was not published, in the order the checks run.
@@ -183,7 +184,7 @@ fn publication(commit: &Commit<MomentumSchema>) -> Publication {
     }
 }
 
-impl Hosted {
+impl Attached<MomentumEngine> {
     #[inline]
     fn published(
         &mut self,

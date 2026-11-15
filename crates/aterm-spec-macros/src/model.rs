@@ -28,10 +28,22 @@ fn is_reserved(ident: &Ident) -> bool {
     RESERVED.contains(&ident.to_string().as_str())
 }
 
-/// Takes a name: an identifier that is not a reserved word.
+/// Takes an unescaped name that is not a reserved word.
 pub(crate) fn expect_name(c: &mut Cursor, what: &str) -> Result<Ident, Error> {
     match c.peek() {
-        Some(TokenTree::Ident(i)) if !is_reserved(i) => c.expect_ident(what),
+        Some(TokenTree::Ident(i)) => {
+            let name = i.to_string();
+            if name.starts_with("r#") {
+                Err(Error::new(
+                    i.span(),
+                    format!("expected an unescaped {what}"),
+                ))
+            } else if RESERVED.contains(&name.as_str()) {
+                Err(Error::new(i.span(), format!("expected {what}")))
+            } else {
+                c.expect_ident(what)
+            }
+        }
         _ => Err(Error::new(c.span(), format!("expected {what}"))),
     }
 }

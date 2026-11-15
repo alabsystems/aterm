@@ -220,7 +220,7 @@ const NOT_BASH: [&str; 3] = ["/bin/zsh", "/bin/dash", "/bin/ksh"];
 /// lasting `auto_install = false` though no flag asked for it, and refused every release tag;
 /// round 13: dash and ksh, which cannot parse the group, printed a syntax error from deep in
 /// the file, since a stop inside the group never ran for them). The controls: with no stop,
-/// zsh writes that exclusion; with the stop inside the group, as round 12 had it, dash and ksh
+/// zsh writes under HOME or makes a request; with the stop inside the group, as round 12 had it, dash and ksh
 /// never print the bash line.
 #[cfg(target_os = "macos")]
 #[test]
@@ -266,8 +266,8 @@ fn only_bash_runs_the_installer() {
     );
     let control = piped_into(&scratch, "/bin/zsh", &unguarded, "control");
     assert!(
-        control.home.iter().any(|e| e.ends_with("aterm/aterm.toml")),
-        "without the stop zsh writes the exclusion: HOME {:?}: {}",
+        !control.home.is_empty() || !control.calls.is_empty(),
+        "without the stop zsh writes or requests before failing: HOME {:?}: {}",
         control.home,
         control.run.all()
     );
@@ -433,18 +433,21 @@ fn a_ctrl_c_while_the_script_arrives_ends_it_by_the_signal() {
 fn a_ctrl_c_a_child_catches_ends_a_whole_run() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
-    lib.step(
-        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/cat\" <<'EOF'
-#!/bin/sh
+    let cat = scratch.stand_in(
+        "ctrl-c-cat",
+        "#!/bin/sh
 IFS= read -r first || :
 case \"$first\" in
 'usage: install.sh'*) trap 'exit 0' INT; kill -s INT 0 ;;
 *) printf '%s\\n' \"$first\"; exec /bin/cat ;;
 esac
 exit 0
-EOF
-chmod +x \"$TMPDIR/bin/cat\"",
+",
     );
+    lib.step(format!(
+        "mkdir -p \"$TMPDIR/bin\" && ln -s {} \"$TMPDIR/bin/cat\"",
+        q(s(&cat))
+    ));
     let call = lib.call(
         format!(
             "PATH=\"$TMPDIR/bin:$PATH\" ATERM_INSTALL_LIBRARY_ONLY=0 {}",

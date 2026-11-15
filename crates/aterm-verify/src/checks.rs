@@ -14,12 +14,11 @@ pub enum Check {
     Census,
     ExportScan,
     ReleasedShim,
+    CandidateShim,
     Lint,
     Test,
-    Doc,
     Forge,
     Cells,
-    WasmSmoke,
     WasmGlue,
     Browser,
     Libc,
@@ -60,7 +59,7 @@ pub struct Spec {
 }
 
 /// Every check, in the order `list` shows them and a verdict names them.
-pub const CHECKS: [Spec; 20] = [
+pub const CHECKS: [Spec; 19] = [
     Spec {
         check: Check::ReleasedShim,
         name: "released-shim",
@@ -69,6 +68,15 @@ pub const CHECKS: [Spec; 20] = [
         needs: &[],
         also: "macOS: installed release's targo shim and app helper, APFS, staged locked Trust build",
         runs: "on bootstrap input changes, installed shim/helper build aterm-time offline in a disposable checkout; personal caches and toolchains are read-only",
+    },
+    Spec {
+        check: Check::CandidateShim,
+        name: "candidate-shim",
+        stages: &[StageId::CandidateShim],
+        reach: Reach::WholeTree,
+        needs: &[],
+        also: "macOS: this store's targo shim (for the program it runs), APFS, staged locked Trust build",
+        runs: "builds this tree's atpkg, lays this tree's shim text naming it, and has that pair build aterm-time offline in a disposable checkout, a fresh home each: under the shared cache, a new home, the no-cache fallback and a caller's --target-dir; personal caches and toolchains are read-only",
     },
     Spec {
         check: Check::Fmt,
@@ -85,10 +93,8 @@ pub const CHECKS: [Spec; 20] = [
         stages: &[StageId::Census],
         reach: Reach::WholeTree,
         needs: &[],
-        also: "in a blobless partial clone lacking the public baseline's harness version files, \
-               network to import those blobs from its promisor remote (GitHub: an agh with \
-               `repo fetch --objects`; up to 10 minutes)",
-        runs: "aterm-census's source guards and its five L0 censuses",
+        also: "",
+        runs: "aterm-census's source guards and its main-loop census",
     },
     Spec {
         check: Check::ExportScan,
@@ -110,12 +116,12 @@ pub const CHECKS: [Spec; 20] = [
         reach: Reach::Selection,
         needs: &["targo-tippy"],
         also: "",
-        runs: "targo-tippy <selection> --all-targets -- -D warnings; a change cone has up to two \
-               passes, that one over what the change touched and default targets over the rest \
-               that link it, and leaves out what it holds only by a dev edge; then the \
-               required-features targets (--features <pkg>/<feat>,… --all-targets) of the \
-               selected packages that have them, in a cone of those it touched and those one \
-               edge from them; also -p aterm --release whenever the selection reaches aterm",
+        runs: "targo-tippy <selection> --all-targets -- -D warnings -A clippy::all -D \
+               clippy::correctness -D clippy::suspicious -D clippy::disallowed_methods -D \
+               clippy::disallowed_types -D clippy::disallowed_macros, one pass over every crate \
+               of the selection, a cone's dev dependents included; with --all (and in a \
+               release) also the required-features targets (--features <pkg>/<feat>,… \
+               --all-targets) of the packages that have them and -p aterm --release",
     },
     Spec {
         check: Check::Test,
@@ -124,6 +130,7 @@ pub const CHECKS: [Spec; 20] = [
         reach: Reach::Selection,
         needs: &[
             "targo",
+            "trustdoc",
             "cc",
             "bash",
             "bash-5.3",
@@ -136,16 +143,7 @@ pub const CHECKS: [Spec; 20] = [
             "chrome-headless-shell",
         ],
         also: "",
-        runs: "targo test <selection> --tests (no examples; under release, the measuring benches compiled too), binaries side by side within the run's CPU share, unseen first, then last run's failures, then longest known",
-    },
-    Spec {
-        check: Check::Doc,
-        name: "doc",
-        stages: &[StageId::Doctests],
-        reach: Reach::Selection,
-        needs: &["targo", "trustdoc"],
-        also: "",
-        runs: "targo test --doc <selection>",
+        runs: "targo test <selection> --tests (no examples; under release, the measuring benches compiled too), binaries side by side within the run's CPU share, the change's own crates' binaries first, each class unseen first, then longest known; then targo test --doc <selection>",
     },
     Spec {
         check: Check::Forge,
@@ -166,17 +164,6 @@ pub const CHECKS: [Spec; 20] = [
         runs: "every forge cell but this machine's own (or each --cell), its whole graph linted for its \
                own triple (-p: those crates alone); with a Windows cell and no -p or pulled selection \
                ruling them out, both windows-sys oracles (aterm-win32-oracle's oracle and oracle-052) \
-               (STOCK EXCEPTION)",
-    },
-    Spec {
-        check: Check::WasmSmoke,
-        name: "wasm-smoke",
-        stages: &[StageId::WasmSmoke],
-        reach: Reach::WholeTree,
-        needs: &["chrome-headless-shell", "rustup"],
-        also: "the stock pin's wasm32 std",
-        runs: "both web modules (dev) in headless Chromium: their host boundary, then the CPU \
-               replay; with test when aterm-wasm, aterm-gpu-web or aterm-wasm-abi is selected \
                (STOCK EXCEPTION)",
     },
     Spec {
@@ -255,7 +242,7 @@ pub const CHECKS: [Spec; 20] = [
         reach: Reach::WholeTree,
         needs: &["desktop"],
         also: "--app <APP>",
-        runs: "aterm-conformance's paint/spin/aos/rewind rows, then the GUI typing smoke, on <APP> (alone); \
+        runs: "aterm-conformance's paint/spin/aos/rewind/size rows, then the GUI typing smoke, on <APP> (alone); \
                a row a bundle this checkout's HEAD did not build has no answer to is named, not judged",
     },
     Spec {
@@ -270,7 +257,7 @@ pub const CHECKS: [Spec; 20] = [
     Spec {
         check: Check::Linux,
         name: "linux",
-        stages: &[StageId::LinuxLane],
+        stages: &[StageId::LinuxLabBuild, StageId::LinuxLane],
         reach: Reach::WholeTree,
         needs: &["rosetta", "limactl"],
         also: "network for the first provision",
@@ -281,23 +268,22 @@ pub const CHECKS: [Spec; 20] = [
 ];
 
 /// The bare command's set: fast, and scoped to what changed.
-pub const DEV: [Check; 7] = [
+pub const DEV: [Check; 6] = [
     Check::ReleasedShim,
     Check::Fmt,
     Check::Census,
     Check::ExportScan,
     Check::Lint,
     Check::Test,
-    Check::Doc,
 ];
 
 /// The release's tree half (`verify release --tree`): what the release's tree alone answers,
 /// with no bundle to judge.
 pub const RELEASE_TREE: [Check; 8] = [
+    Check::CandidateShim,
     Check::Fmt,
     Check::Lint,
     Check::Test,
-    Check::Doc,
     Check::Census,
     Check::Forge,
     Check::Libc,
@@ -353,8 +339,19 @@ impl Check {
         self.spec().reach == Reach::Selection
     }
 
+    /// Does this check judge exactly its selection's crates, on this host's graph: a check whose
+    /// land record names the crates it judged ([`crate::land_record::Record::scope`],
+    /// [`crate::land_seal::Run::keyed`]). Lint and test. Not export-scan, whose scope is the
+    /// changed files, the export's own inputs and the links of the Markdown it scans, which no
+    /// crate owns; not cells, whose cell compiles the dependents and the edges of its own graph,
+    /// which this host's cone does not hold; not checkers, a release check no land records.
+    #[must_use]
+    pub fn crate_scoped(self) -> bool {
+        matches!(self, Self::Lint | Self::Test)
+    }
+
     /// Does this check build its selection with this host's cargo: a stage that hands the `-p`
-    /// specs to `targo` for this machine's target (the lint, the test build, the doctests)?
+    /// specs to `targo` for this machine's target (the lint, the test build)?
     #[must_use]
     pub fn builds_selection(self) -> bool {
         self.narrows()
@@ -362,7 +359,7 @@ impl Check {
                 .spec()
                 .stages
                 .iter()
-                .any(|s| matches!(s, StageId::Tippy | StageId::TestCompile | StageId::Doctests))
+                .any(|s| matches!(s, StageId::Tippy | StageId::TestCompile))
     }
 
     /// Does this check read `scope`, given how the run selected it?
@@ -411,6 +408,76 @@ pub fn stages_of(checks: &[Check]) -> Vec<StageId> {
     v
 }
 
+/// The planned part of `check` in `ctx`'s run, the part of its land key
+/// ([`crate::land_seal::key`]) that is not its tree or its seal: `H(`
+/// [`crate::land_seal::PART_SCHEMA`]`, check, its planned stages, base, the canonical scope,
+/// changed, each flag its code reads)`, where `base` is the commit the change cone is cut from
+/// (released-shim and census read it, and every selection check's cone is computed from it) and
+/// `changed` the changed paths' digest. The flags: `release` and `fix` for every check;
+/// `--no-windows` for one whose stages open windows; `--compile-only`
+/// for one that compiles tests or the measuring benches; the checkers' variable for one that
+/// runs tests; and for cells, whether the selection pulled it (a pulled run narrows
+/// to the cone) and the cells it names. What only shapes the run on one Mac (`--test-cores`,
+/// `--test-threads`, `--timeout`, `--admit`, `--log`, `--events`, `--test-seed`) is no part.
+#[must_use]
+pub fn part(check: Check, ctx: &crate::Ctx, base: &str, changed: &str) -> String {
+    let spec = check.spec();
+    let wanted = crate::plan::wanted(ctx);
+    let stages: Vec<String> = spec
+        .stages
+        .iter()
+        .filter(|id| wanted.contains(id))
+        .map(|id| format!("{id:?}"))
+        .collect();
+    let mut parts: Vec<String> = vec![
+        crate::land_seal::PART_SCHEMA.to_owned(),
+        check.name().to_owned(),
+        stages.join(","),
+        base.to_owned(),
+        canonical_scope(&ctx.scope),
+        changed.to_owned(),
+    ];
+    let mut flag = |name: &str, on: bool| parts.push(format!("{name}={on}"));
+    flag("release", ctx.release);
+    flag("fix", ctx.fix);
+    let has = |any: &[StageId]| spec.stages.iter().any(|id| any.contains(id));
+    if spec.stages.iter().any(|id| id.opens_windows()) {
+        flag("no_windows", ctx.no_windows);
+    }
+    if has(&[StageId::TestCompile, StageId::MeasurePrebuild]) {
+        flag("compile_only", ctx.compile_only);
+    }
+    if has(&[StageId::TestCompile, StageId::Test]) {
+        flag("checkers_in_tests", ctx.checkers_in_tests);
+    }
+    if check == Check::Cells {
+        flag("cells_pulled", ctx.cells_pulled);
+        parts.push(format!("cells={}", ctx.cells.join(",")));
+    }
+    crate::land_seal::digest(parts.iter().map(String::as_str))
+}
+
+/// `scope` in one canonical spelling: its kind and each of its lists sorted.
+fn canonical_scope(scope: &crate::scope::Scope) -> String {
+    let sorted = |list: &[String]| {
+        let mut list = list.to_vec();
+        list.sort_unstable();
+        list.dedup();
+        list.join(",")
+    };
+    match scope {
+        crate::scope::Scope::Workspace => "workspace".to_owned(),
+        crate::scope::Scope::Packages(packages) => format!("packages:{}", sorted(packages)),
+        crate::scope::Scope::Changed(c) => format!(
+            "changed:crates={};seeds={};alone={};any_lib={}",
+            sorted(&c.crates),
+            sorted(&c.seeds),
+            sorted(&c.alone),
+            c.any_lib
+        ),
+    }
+}
+
 /// The package that holds each GPU arm's frames to their CPU twins, beside the
 /// record of wgpu's (docs/AUDIT-third-party-2026-10-15.md GW.6 and
 /// ORACLE-ADAPTER), and the test that compares them: a release's test run passes
@@ -419,25 +486,6 @@ pub const GOLDEN: (&str, &str) = (
     "aterm-gpu",
     "frame_record_tests::armed_frames_hold_to_their_cpu_twins",
 );
-
-/// The checks that judge what some packages' own tests cannot, each with those packages.
-pub const PULLS: [(Check, &[&str]); 1] = [(
-    Check::WasmSmoke,
-    &["aterm-wasm", "aterm-gpu-web", "aterm-wasm-abi"],
-)];
-
-/// The [`PULLS`] checks `wanted` lacks whose packages `holds` selects when `wanted` runs `test`.
-#[must_use]
-pub fn pulled(wanted: &[Check], holds: impl Fn(&str) -> bool) -> Vec<(Check, &'static str)> {
-    if !wanted.contains(&Check::Test) {
-        return Vec::new();
-    }
-    PULLS
-        .iter()
-        .filter(|(check, _)| !wanted.contains(check))
-        .filter_map(|(check, packages)| packages.iter().find(|p| holds(p)).map(|p| (*check, *p)))
-        .collect()
-}
 
 fn forge_pull_reason(
     wanted: &[Check],
@@ -499,21 +547,6 @@ pub fn appkit_pull(
         .find(|package| holds(package))
 }
 
-/// `wanted`, plus what it [`pulled`], in [`CHECKS`] order; `alone` is `wanted` as it is
-/// ([`crate::cli::Args::wanted`]).
-#[must_use]
-pub fn with_pulled(wanted: &[Check], alone: bool, holds: impl Fn(&str) -> bool) -> Vec<Check> {
-    if alone {
-        return wanted.to_vec();
-    }
-    let pulled = pulled(wanted, holds);
-    CHECKS
-        .iter()
-        .map(|s| s.check)
-        .filter(|c| wanted.contains(c) || pulled.iter().any(|(p, _)| p == c))
-        .collect()
-}
-
 /// Whether a run of `wanted` pulls [`Check::Cells`]: a dev run that lints a selection which
 /// compiles something, and does not name `cells` itself. Another OS's arms of the code (its
 /// `cfg`s, the test helpers only its targets compile) are linted on that OS's triple alone, so
@@ -521,8 +554,7 @@ pub fn with_pulled(wanted: &[Check], alone: bool, holds: impl Fn(&str) -> bool) 
 /// fixes 78f54c26c7, 266437995c and 333be891e9 each repaired on main. The pulled run checks one
 /// cell per other OS, each only where its graph holds a selected crate, and of that graph `-p`'s
 /// crates, or the cone and what the change reaches there ([`crate::cells::pulled_cells`],
-/// [`crate::cells::narrows`]); it is not red on a Windows cell's test-target warnings
-/// ([`crate::cells::leaves_test_warnings`]). `verify cells` checks every cell's whole graph.
+/// [`crate::cells::narrows`]). `verify cells` checks every cell's whole graph.
 #[must_use]
 pub fn pulls_cells(wanted: &[Check], release: bool, compiles: bool) -> bool {
     !release && compiles && wanted.contains(&Check::Lint) && !wanted.contains(&Check::Cells)
@@ -690,13 +722,12 @@ pub fn list_table() -> String {
          gitlink, unmodified, and not moved back from origin/main's pin at the merge-base\n\
          unless a commit says `astream-pin-rollback: <reason>` (else FAIL, exit 1, none run).\n\
          \n\
-         dev      fmt census export-scan lint test doc: the bare command, on the change cone\n\
-         \x20        any run with test (but release) adds wasm-smoke when its selection\n\
-         \x20        (the cone, -p or --all) holds aterm-wasm or aterm-gpu-web (on the cone:\n\
-         \x20        a change to any crate either builds on) or aterm-wasm-abi (their\n\
-         \x20        wasm32-only host boundary)\n\
+         dev      released-shim fmt census export-scan lint test: the bare command, on the\n\
+         \x20        change cone (test runs the selection's doctests after its test binaries)\n\
          release  what `ship release` requires: --all implied, --app required, a skip is exit 3\n\
-         perf     not a check: the performance lanes, `verify perf --list`\n",
+         perf     not a check: the performance lanes, `verify perf --list`\n\
+         vendor-out  not a check: sealed copies of alab-policy, aterm-phase and\n\
+         \x20           aterm-agent-names for another repository, `verify vendor-out --help`\n",
     );
     out
 }

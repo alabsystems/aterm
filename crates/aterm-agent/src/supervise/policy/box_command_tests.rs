@@ -238,7 +238,7 @@ fn boxed(text: &str) -> PromptV2 {
 
 #[test]
 fn a_reading_whose_words_turn_on_a_blank_the_screen_cannot_show_proves_nothing() {
-    use crate::supervise::classify::classify_command;
+    use alab_policy::classify::classify_command;
     let pre = ["echo $(true) $(true) $(true) $(true) $(true)"; 13].join("\n");
     let newline_reading = |p: &PromptV2| {
         p.readings()

@@ -100,7 +100,7 @@ impl FabricSession for Session {
 
 pub(super) fn session(path: &std::path::Path) -> Session {
     Session {
-        sid: SessionId::new("s-12345678"),
+        sid: SessionId::new("t0012345678"),
         fabric: SessionFabric::default(),
         path: path.to_owned(),
         facts: Default::default(),
@@ -251,17 +251,17 @@ fn an_arrival_with_the_mesh_on_is_one_ring_row_that_wakes_the_inbox_wait_and_cou
     );
 }
 
-/// The pre-R3 Mac `n-…bb`'s session `s-87654321`, served as a fleet drive serves it (its
+/// The pre-R3 Mac `n-…bb`'s session `t0087654321`, served as a fleet drive serves it (its
 /// mesh off), and an R3 session whose Mac heard `n-…aa`'s presence row and drives `n-…bb`.
 fn pre_r3_pair(scratch: &std::path::Path) -> (std::sync::Arc<Session>, Session) {
-    let there = std::sync::Arc::new(session(&scratch.join("there/s-87654321.toml")));
+    let there = std::sync::Arc::new(session(&scratch.join("there/t0087654321.toml")));
     let served = std::sync::Arc::clone(&there);
     let here = Session {
         heard: vec![format!("n-{}", "a".repeat(16))],
         drive: Some(Box::new(move |node, request| {
             assert_eq!(node, format!("n-{}", "b".repeat(16)));
             let rest = request
-                .strip_prefix("@s-87654321 post ")
+                .strip_prefix("@t0087654321 post ")
                 .ok_or_else(|| format!("not a post to the session: {request}"))?;
             Ok(as_node("c", || crate::cmd_post(&*served, rest, None)))
         })),
@@ -274,15 +274,15 @@ fn pre_r3_pair(scratch: &std::path::Path) -> (std::sync::Arc<Session>, Session) 
 fn a_post_to_a_pre_r3_mac_goes_by_direct_fleet_mail() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let (there, here) = pre_r3_pair(scratch.path());
-    let to = format!("to=@s-87654321@n-{}", "b".repeat(16));
+    let to = format!("to=@t0087654321@n-{}", "b".repeat(16));
     assert_eq!(
         crate::cmd_post(&here, &format!("{to} kind=ask key=q1 -- ACROSS"), None),
-        format!("OK fleet=f1 to=@s-87654321@n-{} key=q1\n", "b".repeat(16))
+        format!("OK fleet=f1 to=@t0087654321@n-{} key=q1\n", "b".repeat(16))
     );
     assert_eq!(
         crate::cmd_post(&here, &format!("{to} kind=ask key=q1 -- ACROSS"), None),
         format!(
-            "OK fleet=f1 to=@s-87654321@n-{} key=q1 dup=1\n",
+            "OK fleet=f1 to=@t0087654321@n-{} key=q1 dup=1\n",
             "b".repeat(16)
         ),
         "the key holds there: posted again, it lands once"
@@ -290,7 +290,7 @@ fn a_post_to_a_pre_r3_mac_goes_by_direct_fleet_mail() {
     let keyless = crate::cmd_post(&here, &format!("{to} kind=note -- KEYLESS"), None);
     assert!(
         keyless.starts_with(&format!(
-            "OK fleet=f2 to=@s-87654321@n-{} key=s-12345678.",
+            "OK fleet=f2 to=@t0087654321@n-{} key=t0012345678.",
             "b".repeat(16)
         )),
         "a key of this session's is made and named: {keyless}"
@@ -301,7 +301,7 @@ fn a_post_to_a_pre_r3_mac_goes_by_direct_fleet_mail() {
             && facts[0].starts_with("f1 to=")
             && facts[0].ends_with(" kind=ask key=q1")
             && facts[1].starts_with("f2 to=")
-            && facts[1].contains(" kind=note key=s-12345678."),
+            && facts[1].contains(" kind=note key=t0012345678."),
         "each message carried is one fact on this session's log, a duplicate none: {facts:?}"
     );
     let page = crate::cmd_inbox(&*there, "");
@@ -339,7 +339,7 @@ fn a_post_to_a_pre_r3_mac_goes_by_direct_fleet_mail() {
     );
 
     // Control: a Mac whose presence row was heard takes the post on the bus, undriven.
-    let heard = format!("to=@s-87654321@n-{}", "a".repeat(16));
+    let heard = format!("to=@t0087654321@n-{}", "a".repeat(16));
     assert_eq!(
         crate::cmd_post(&here, &format!("{heard} kind=note -- ON-THE-BUS"), None),
         "OK 1\n"
@@ -365,8 +365,8 @@ fn a_report_to_a_session_on_another_mac_is_routed_to_that_mac_by_direct_fleet_ma
     use crate::report::{To, post as report};
     let scratch = aterm_tempfile::tempdir().unwrap();
     let there = std::sync::Arc::new(Session {
-        sid: SessionId::new("s-87654321"),
-        ..session(&scratch.path().join("there/s-87654321.toml"))
+        sid: SessionId::new("t0087654321"),
+        ..session(&scratch.path().join("there/t0087654321.toml"))
     });
     let served = std::sync::Arc::clone(&there);
     let node = format!("n-{}", "b".repeat(16));
@@ -376,27 +376,27 @@ fn a_report_to_a_session_on_another_mac_is_routed_to_that_mac_by_direct_fleet_ma
         drive: Some(Box::new(move |at, request| {
             assert_eq!(at, wanted, "the drive goes to the manager's Mac");
             let rest = request
-                .strip_prefix("@s-87654321 post ")
+                .strip_prefix("@t0087654321 post ")
                 .ok_or_else(|| format!("not a post to the manager: {request}"))?;
             Ok(as_node("c", || crate::cmd_post(&*served, rest, None)))
         })),
         ..session(&scratch.path().join("here/inbox.toml"))
     };
     let to = To::There {
-        sid: "s-87654321",
+        sid: "t0087654321",
         node: &node,
     };
-    let line = "NEEDS YOU: a sign-in | sid=s-12345678 state=working";
+    let line = "NEEDS YOU: a sign-in | sid=t0012345678 state=working";
     assert_eq!(
-        report(&here, to, "s-12345678.need.1", line),
+        report(&here, to, "t0012345678.need.1", line),
         Ok(format!(
-            "OK fleet=f1 to=@s-87654321@{node} key=s-12345678.need.1"
+            "OK fleet=f1 to=@t0087654321@{node} key=t0012345678.need.1"
         ))
     );
     assert_eq!(
-        report(&here, to, "s-12345678.need.1", line),
+        report(&here, to, "t0012345678.need.1", line),
         Ok(format!(
-            "OK fleet=f1 to=@s-87654321@{node} key=s-12345678.need.1 dup=1"
+            "OK fleet=f1 to=@t0087654321@{node} key=t0012345678.need.1 dup=1"
         )),
         "sent again under its key, it lands once there"
     );
@@ -413,8 +413,8 @@ fn a_report_to_a_session_on_another_mac_is_routed_to_that_mac_by_direct_fleet_ma
     assert_eq!(
         here.facts.lock().unwrap().as_slice(),
         [format!(
-            "f1 to={} kind=report key=s-12345678.need.1",
-            crate::pct_encode(&format!("@s-87654321@{node}"))
+            "f1 to={} kind=report key=t0012345678.need.1",
+            crate::pct_encode(&format!("@t0087654321@{node}"))
         )],
         "the mail carried is one fact on the worker's log"
     );
@@ -428,7 +428,7 @@ fn a_report_to_a_session_on_another_mac_is_routed_to_that_mac_by_direct_fleet_ma
         ..session(&scratch.path().join("refused/inbox.toml"))
     };
     assert_eq!(
-        report(&refused, to, "s-12345678.need.1", line),
+        report(&refused, to, "t0012345678.need.1", line),
         Err(crate::report::Unsent::Answered {
             node: node.clone(),
             answer: "ERR denied: no drive grant".to_owned()
@@ -448,7 +448,7 @@ fn a_report_to_a_session_on_another_mac_is_routed_to_that_mac_by_direct_fleet_ma
         drive: Some(Box::new(move |_, _| Ok(wire.clone()))),
         ..session(&scratch.path().join("locked/inbox.toml"))
     };
-    let unsent = report(&locked, to, "s-12345678.need.1", line).expect_err("refused");
+    let unsent = report(&locked, to, "t0012345678.need.1", line).expect_err("refused");
     let crate::report::Unsent::Answered { answer, .. } = &unsent else {
         panic!("{unsent:?}");
     };
@@ -479,8 +479,8 @@ fn a_leaving_sessions_report_is_driven_to_a_mac_the_mesh_would_carry_it_to() {
         crate::note_bridge_supervised();
         let scratch = aterm_tempfile::tempdir().unwrap();
         let there = std::sync::Arc::new(Session {
-            sid: SessionId::new("s-87654321"),
-            ..session(&scratch.path().join("there/s-87654321.toml"))
+            sid: SessionId::new("t0087654321"),
+            ..session(&scratch.path().join("there/t0087654321.toml"))
         });
         let served = std::sync::Arc::clone(&there);
         let node = format!("n-{}", "a".repeat(16));
@@ -488,18 +488,18 @@ fn a_leaving_sessions_report_is_driven_to_a_mac_the_mesh_would_carry_it_to() {
             heard: vec![node.clone()],
             drive: Some(Box::new(move |_, request| {
                 let rest = request
-                    .strip_prefix("@s-87654321 post ")
+                    .strip_prefix("@t0087654321 post ")
                     .ok_or_else(|| format!("not a post to the manager: {request}"))?;
                 Ok(as_node("c", || crate::cmd_post(&*served, rest, None)))
             })),
             ..meshed(&scratch.path().join("here/inbox.toml"))
         };
         let to = To::There {
-            sid: "s-87654321",
+            sid: "t0087654321",
             node: &node,
         };
-        let closed = "s-12345678.closed.1";
-        let line = "finished, then its tab closed | sid=s-12345678 state=closed";
+        let closed = "t0012345678.closed.1";
+        let line = "finished, then its tab closed | sid=t0012345678 state=closed";
 
         assert_eq!(
             report(&here, to, closed, line),
@@ -510,7 +510,7 @@ fn a_leaving_sessions_report_is_driven_to_a_mac_the_mesh_would_carry_it_to() {
 
         assert_eq!(
             post_leaving(&here, to, closed, line),
-            Ok(format!("OK fleet=f1 to=@s-87654321@{node} key={closed}"))
+            Ok(format!("OK fleet=f1 to=@t0087654321@{node} key={closed}"))
         );
         assert_eq!(here.fabric.lock().posts.len(), 1, "nothing more is queued");
         assert_eq!(here.drives.lock().unwrap().len(), 1);
@@ -850,7 +850,7 @@ fn damaged_durable_state_refuses_and_is_not_replaced() {
             &receiver,
             &[
                 "off=8",
-                "from=s-a@n-a",
+                "from=t0000100001@n-a",
                 "kind=ask",
                 "trust=agent",
                 "text=bus"
@@ -895,7 +895,7 @@ fn bus_and_direct_cursors_can_be_rearmed_independently() {
             &receiver,
             &[
                 "off=8",
-                "from=s-a@n-a",
+                "from=t0000100001@n-a",
                 "kind=ask",
                 "trust=agent",
                 "text=bus"
@@ -942,7 +942,7 @@ fn bus_and_direct_cursors_can_be_rearmed_independently() {
             &receiver,
             &[
                 "off=9",
-                "from=s-a@n-a",
+                "from=t0000100001@n-a",
                 "kind=ask",
                 "trust=agent",
                 "text=next"
@@ -965,7 +965,7 @@ fn a_small_inbox_page_keeps_unreturned_bus_and_direct_rows_pending() {
         &receiver,
         &[
             "off=8",
-            "from=s-a@n-a",
+            "from=t0000100001@n-a",
             "kind=ask",
             "trust=agent",
             "text=bus",
@@ -1362,12 +1362,12 @@ fn earlier_reader(path: &std::path::Path) -> Result<String, String> {
 #[test]
 fn migration_keeps_an_idle_earlier_readers_mailbox_unchanged() {
     let scratch = aterm_tempfile::tempdir().unwrap();
-    let path = scratch.path().join("private/s-aaaaaaaa.toml");
+    let path = scratch.path().join("private/t0000100004.toml");
     let before = legacy_mailbox(&path);
     let expected = earlier_reader(&path).unwrap();
     let dir = path.parent().unwrap();
     // A new owner refreshes its own mailbox, without adopting the older owner's file.
-    let current = session(&dir.join("s-bbbbbbbb.toml"));
+    let current = session(&dir.join("t0000100012.toml"));
     let first = restore(&current);
     let first_read = earlier_reader(&path);
     let second = restore(&current);
@@ -1404,7 +1404,7 @@ fn a_storage_endpoint_alone_does_not_admit_mailbox_io() {
     }
 
     let scratch = aterm_tempfile::tempdir().unwrap();
-    let path = scratch.path().join("private/s-aaaaaaaa.toml");
+    let path = scratch.path().join("private/t0000100004.toml");
     let before = legacy_mailbox(&path);
     let owner = session(&path);
     let endpoint = Endpoint(&owner);
@@ -1435,7 +1435,7 @@ fn migration_waits_for_committed_ownership_before_reading_or_writing() {
         !missing.parent().unwrap().exists(),
         "no directory before Commit"
     );
-    let path = scratch.path().join("private/s-aaaaaaaa.toml");
+    let path = scratch.path().join("private/t0000100004.toml");
     let before = legacy_mailbox(&path);
     let owner = std::sync::Arc::new(session(&path));
     owner.ready.store(false, Ordering::SeqCst);
@@ -1476,7 +1476,7 @@ fn migration_waits_for_committed_ownership_before_reading_or_writing() {
 fn no_row_text_reaches_the_disk_and_an_earlier_builds_plaintext_is_sealed_by_its_next_transaction()
 {
     let scratch = aterm_tempfile::tempdir().unwrap();
-    let path = scratch.path().join("private/s-12345678.toml");
+    let path = scratch.path().join("private/t0012345678.toml");
     let receiver = session(&path);
     assert_eq!(
         as_node("a", || post(
@@ -1521,8 +1521,8 @@ fn no_row_text_reaches_the_disk_and_an_earlier_builds_plaintext_is_sealed_by_its
 #[test]
 fn a_mailbox_moved_to_another_sessions_file_does_not_open_there_and_is_not_replaced() {
     let scratch = aterm_tempfile::tempdir().unwrap();
-    let mine = scratch.path().join("private/s-11111111.toml");
-    let theirs = mine.with_file_name("s-22222222.toml");
+    let mine = scratch.path().join("private/t0011111111.toml");
+    let theirs = mine.with_file_name("t0022222222.toml");
     assert_eq!(
         as_node("a", || post(
             &session(&mine),
@@ -1562,7 +1562,7 @@ fn a_missing_key_refuses_direct_mail_mints_none_and_leaves_bus_mail_listed() {
             &receiver,
             &[
                 "off=8",
-                "from=s-a@n-a",
+                "from=t0000100001@n-a",
                 "kind=ask",
                 "trust=agent",
                 "text=bus"
@@ -1667,8 +1667,8 @@ fn a_key_of_another_length_is_refused_by_the_length_it_has() {
 #[test]
 fn no_key_is_minted_while_another_mailbox_beside_it_is_sealed_so_the_key_put_back_opens_all() {
     let scratch = aterm_tempfile::tempdir().unwrap();
-    let first = scratch.path().join("private/s-aaaaaaaa.toml");
-    let second = first.with_file_name("s-bbbbbbbb.toml");
+    let first = scratch.path().join("private/t0000100004.toml");
+    let second = first.with_file_name("t0000100012.toml");
     let dir = first.parent().unwrap();
     let key = dir.join(KEY);
     assert_eq!(
@@ -1702,7 +1702,7 @@ fn no_key_is_minted_while_another_mailbox_beside_it_is_sealed_so_the_key_put_bac
     for path in [&first, &second] {
         std::fs::rename(path, scratch.path().join(path.file_name().unwrap())).unwrap();
     }
-    let third = first.with_file_name("s-cccccccc.toml");
+    let third = first.with_file_name("t0000100013.toml");
     assert_eq!(
         as_node("a", || post(&session(&third), "key=k kind=ask -- THIRD")),
         "OK f1\n"
@@ -1778,7 +1778,7 @@ fn a_changed_stamp_takes_the_transaction_and_an_unchanged_one_reads_the_cache() 
         &receiver,
         &[
             "off=8",
-            "from=s-a@n-a",
+            "from=t0000100001@n-a",
             "kind=ask",
             "trust=agent",
             "text=bus",
@@ -1892,7 +1892,7 @@ fn a_handoff_peers_write_is_listed_by_the_next_inbox_and_its_refresh_wakes_a_par
                     receiver,
                     &[
                         "off=8",
-                        "from=s-a@n-a",
+                        "from=t0000100001@n-a",
                         "kind=ask",
                         "trust=agent",
                         "text=bus",

@@ -37,6 +37,8 @@ fn window(name: &str, used: u16, read_ago: i64) -> WindowSeen {
         }),
         read: Some((NOW - read_ago, "m3".into(), "statusline".into())),
         wall_until: None,
+        reader: None,
+        wall_by: None,
     }
 }
 

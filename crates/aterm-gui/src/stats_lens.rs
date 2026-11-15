@@ -875,27 +875,6 @@ impl Row {
     }
 }
 
-/// Processes of one name in one scope as one row.
-fn grouped<'a>(
-    items: impl IntoIterator<Item = (&'a str, ProcScope, f64)>,
-) -> Vec<(String, ProcScope, f64)> {
-    let mut groups: Vec<(&str, ProcScope, f64, usize)> = Vec::new();
-    for (name, scope, v) in items {
-        match groups.iter_mut().find(|g| g.0 == name && g.1 == scope) {
-            Some(g) => {
-                g.2 += v;
-                g.3 += 1;
-            }
-            None => groups.push((name, scope, v, 1)),
-        }
-    }
-    groups.sort_by(|a, b| b.2.total_cmp(&a.2));
-    groups
-        .into_iter()
-        .map(|(name, scope, v, n)| (program_label(name, n), scope, v))
-        .collect()
-}
-
 /// A program's row name: its name as a person reads it, `×n` where it runs as several processes.
 fn program_label(name: &str, n: usize) -> String {
     let name = aterm_vitals::jobs::wire::person_name(name);
@@ -921,7 +900,7 @@ fn chip_ink(pen: &Pen<'_>, scope: ProcScope, panes: &[u64]) -> Rgb {
                 pen.inks.tab
             }
         }
-        ProcScope::Tab(_) | ProcScope::Aterm => {
+        ProcScope::Tab(_) | ProcScope::Aterm | ProcScope::Shared => {
             if pen.ic {
                 pen.inks.aterm_ic
             } else {
@@ -1713,6 +1692,7 @@ impl Ctx<'_> {
                 .tab(k)
                 .map_or_else(|| "a tab".to_owned(), |t| t.label.clone()),
             ProcScope::Aterm => "aterm".to_owned(),
+            ProcScope::Shared => "shared aterm".to_owned(),
             ProcScope::Other => "other".to_owned(),
         }
     }
@@ -2542,6 +2522,7 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
         }
     }
     sections.extend(why);
+    sections.extend(cpu_accounting_section(c));
     LensDoc {
         name: "CPU",
         sources,
@@ -2722,21 +2703,22 @@ fn busiest_line(c: Ctx<'_>) -> Option<String> {
 fn busiest_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let n = snap.total_cores().unwrap_or(1).max(1) as f64;
-    let rows: Vec<Row> = grouped(
-        snap.top
-            .iter()
-            .filter(|t| c.in_scope(t.scope))
-            .map(|t| (t.name.as_str(), t.scope, f64::from(t.cores))),
-    )
-    .into_iter()
-    .map(|(name, scope, cores)| Row {
-        chip: Some(scope),
-        name,
-        scope: Some(c.scope_word(scope)),
-        share: Some(cores / n),
-        figure: format!("{} cores", words::cores(cores as f32)),
-    })
-    .collect();
+    let mut programs: Vec<_> = snap
+        .programs
+        .iter()
+        .filter(|t| c.in_scope(t.scope) && t.cores > 0.0)
+        .collect();
+    programs.sort_by(|a, b| b.cores.total_cmp(&a.cores));
+    let rows: Vec<Row> = programs
+        .into_iter()
+        .map(|t| Row {
+            chip: Some(t.scope),
+            name: program_label(&t.name, t.n as usize),
+            scope: Some(c.scope_word(t.scope)),
+            share: Some(f64::from(t.cores) / n),
+            figure: format!("{} cores", words::cores(t.cores)),
+        })
+        .collect();
     let name = format!("Busiest now{}", c.suffix());
     let mut line: Vec<String> = busiest_line(c).into_iter().collect();
     line.extend(rows.first().map(Row::said));
@@ -2758,6 +2740,58 @@ fn busiest_section(c: Ctx<'_>) -> Section<'_> {
         line,
         true,
     )
+}
+
+fn cpu_accounting_section(c: Ctx<'_>) -> Option<Section<'_>> {
+    let view = c.view(Resource::Cpu);
+    let figures = [
+        ("aterm", ProcScope::Aterm, &view.aterm),
+        (
+            c.tab_label,
+            ProcScope::Tab(c.panes.first().copied().unwrap_or(0)),
+            &view.tab,
+        ),
+    ];
+    let rows: Vec<Row> = figures
+        .into_iter()
+        .filter_map(|(name, scope, fig)| {
+            if c.bar == Bar::Tab && scope == ProcScope::Aterm {
+                return None;
+            }
+            if matches!(scope, ProcScope::Tab(0)) {
+                return None;
+            }
+            let charge = words::cpu_charge_words(fig)?;
+            let actual = fig.now?;
+            let (prefix, shown) = if fig.unread > 0 {
+                ("≥", (actual * 100.0).floor() / 100.0)
+            } else {
+                ("", actual)
+            };
+            Some(Row {
+                chip: Some(scope),
+                name: name.into(),
+                scope: None,
+                share: None,
+                figure: format!("{prefix}{shown:.2} confirmed · {charge}"),
+            })
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let line = vec![rows.iter().map(Row::said).collect::<Vec<_>>().join(" · ")];
+    Some(list_section(
+        c,
+        "CPU accounting".into(),
+        vec!["cores · confirmed CPU and counter charges".into()],
+        rows,
+        Some(words::CPU_CHARGE_NOTE.into()),
+        2,
+        "CPU accounting",
+        line,
+        true,
+    ))
 }
 
 /// Where a row's words start after the ∵ mark.
@@ -2836,7 +2870,11 @@ fn why_now_section(c: Ctx<'_>) -> Option<Section<'_>> {
             );
             (true, work.clone(), work)
         }
-        CauseId::AtermWork => (true, "aterm itself".to_owned(), "aterm itself".to_owned()),
+        CauseId::AtermWork => (
+            true,
+            "aterm outside tabs".to_owned(),
+            "aterm outside tabs".to_owned(),
+        ),
         CauseId::Unexplained => {
             let base = match evidence {
                 Some(Evidence::Uncovered { part }) => {
@@ -2978,7 +3016,11 @@ fn why_now_section(c: Ctx<'_>) -> Option<Section<'_>> {
         format!("{step}; {how}{signed}."),
     ];
     let window = window_words(f.window_ns);
-    let exact = if f.split.exact { "exact, " } else { "" };
+    let exact = if f.split.exact {
+        "exact, "
+    } else {
+        "partial, "
+    };
     let subs = vec![
         format!("{window} \u{b7} {exact}{} coalitions", f.split.listed),
         window,
@@ -3314,20 +3356,26 @@ fn classes_section(c: Ctx<'_>) -> Section<'_> {
 fn biggest_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let total = snap.mem.as_ref().map_or(1, |m| m.sample.total.max(1)) as f64;
-    let rows: Vec<Row> = grouped(snap.top.iter().filter_map(|t| {
-        t.footprint
-            .filter(|_| c.in_scope(t.scope))
-            .map(|f| (t.name.as_str(), t.scope, f as f64))
-    }))
-    .into_iter()
-    .map(|(name, scope, bytes)| Row {
-        chip: Some(scope),
-        name,
-        scope: Some(c.scope_word(scope)),
-        share: Some(bytes / total),
-        figure: words::mem(bytes as u64),
-    })
-    .collect();
+    let mut programs: Vec<_> = snap
+        .programs
+        .iter()
+        .filter(|t| c.in_scope(t.scope) && t.footprint.is_some())
+        .collect();
+    programs.sort_by_key(|t| std::cmp::Reverse(t.footprint));
+    let rows: Vec<Row> = programs
+        .into_iter()
+        .map(|t| Row {
+            chip: Some(t.scope),
+            name: program_label(&t.name, t.n as usize),
+            scope: Some(c.scope_word(t.scope)),
+            share: t.footprint.map(|b| b as f64 / total),
+            figure: format!(
+                "{}{}",
+                if t.footprint_unread > 0 { "≥" } else { "" },
+                words::mem(t.footprint.unwrap_or(0))
+            ),
+        })
+        .collect();
     let view = c.view(Resource::Memory);
     let over = words::footprints_over(
         Resource::Memory,
@@ -3342,11 +3390,23 @@ fn biggest_section(c: Ctx<'_>) -> Section<'_> {
     };
     let mut scopes: Vec<(String, Option<String>)> = Vec::new();
     if let Some(b) = view.aterm.now {
-        scopes.push((format!("aterm {}", words::mem(b as u64)), clause(false)));
+        scopes.push((
+            format!(
+                "aterm {}{}",
+                if view.aterm.unread > 0 { "≥" } else { "" },
+                words::mem(b as u64)
+            ),
+            clause(false),
+        ));
     }
     if let Some(b) = view.tab.now {
         scopes.push((
-            format!("{} {}", c.tab_label, words::mem(b as u64)),
+            format!(
+                "{} {}{}",
+                c.tab_label,
+                if view.tab.unread > 0 { "≥" } else { "" },
+                words::mem(b as u64)
+            ),
             clause(true),
         ));
     }

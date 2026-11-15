@@ -113,7 +113,7 @@ fn owner() -> Owner {
 fn request(cpu: CpuDelegation, gnu: GnuTransport) -> Request {
     use aterm_types::resource_admission::{Binding, Submission};
     let job = Binding {
-        session: "s-ab12".into(),
+        session: "s-0000000000000000ab12".into(),
         attempt: [1; 16],
     };
     Request {

@@ -20,7 +20,7 @@
 //! covered when that plan writes nothing for it and finds nothing that keeps it out; the run's own
 //! source row is no cell of the replica, so a replica a fuller source of the import already wrote
 //! is covered with no source row of its own. A
-//! `Secret` value that is a flag word (a has-password `1`, a none `0`,
+//! secret value that is a flag word (a has-password `1`, a none `0`,
 //! [`crate::typed::secret::flag_says`]) is covered when it agrees with whether the registry's
 //! cell is set; any other flag-shaped value (a password under six characters, which the registry
 //! never holds) stays uncovered, so the owner sees it before the replica goes. Every other
@@ -45,8 +45,8 @@ const MAX_RECORD: usize = 1024 * 1024;
 /// The most uncovered cells a record lists by coordinate; the count is always whole.
 const MAX_LISTED: usize = 256;
 
-/// The HKDF label of a replica's keyed digest: its own domain, apart from the registry's
-/// (`att::secret_digest`), so a replica digest never compares equal to a table digest. Its version
+/// The HKDF label of a replica's keyed digest: its own domain, so a replica digest never compares
+/// equal to a digest taken for any other purpose under the same key. Its version
 /// is the judgement's: a record an earlier judge wrote cannot pass a deletion's digest check, so
 /// its replica is imported again first.
 const REPLICA_DIGEST: &[u8] = b"aterm/fleet-db/replica-digest/4\0";

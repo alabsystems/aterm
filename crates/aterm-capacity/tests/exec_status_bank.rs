@@ -69,7 +69,11 @@ mod native {
             std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
             return;
         }
-        assert!(aterm_uds::tether::prepared_executable().unwrap().is_some());
+        assert!(
+            aterm_uds::tether::prepared_executable_within(aterm_uds::deadline::FIRST_EXEC_HANG)
+                .unwrap()
+                .is_some()
+        );
         let home = world.join("private-home");
         std::fs::DirBuilder::new()
             .mode(0o700)

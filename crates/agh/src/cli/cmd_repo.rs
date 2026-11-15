@@ -375,7 +375,10 @@ pub(crate) fn repo_clone(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// `agh repo fetch-main REPO DIR`: refresh agh's private main snapshot, with a reflog.
+/// `agh repo fetch-main REPO DIR`: refresh agh's private main snapshot, with a reflog, and
+/// print `{"ref", "oid"}`: the ref and the commit this run wrote there. Every worktree of the
+/// repository shares that ref, so another worktree's fetch can overwrite it, with an older
+/// main, before a later read of it; the printed commit is this run's own observation.
 /// Branches, tags, remote-tracking refs, stash and working files are not moved.
 ///
 /// # Errors
@@ -402,6 +405,9 @@ pub(crate) fn repo_fetch_main(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome
         run = run.without_blobs();
     }
     let out = gh.run_git(&run)?;
+    let oid = out
+        .fetched
+        .ok_or_else(|| crate::error::Error::local("the main fetch named no commit it wrote"))?;
     let mut receipt = Receipt::for_repo(inv, &gh, &slug);
     receipt.as_ = None;
     receipt
@@ -409,7 +415,10 @@ pub(crate) fn repo_fetch_main(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome
         .push(("as".into(), out.as_.unwrap_or_else(|| "anonymous".into())));
     receipt.notes.push(("ref".into(), INTO.into()));
     Ok(Outcome {
-        answer: Answer::Nothing,
+        answer: Answer::Object {
+            noun: Noun::Raw,
+            value: aterm_json::json!({"ref": INTO, "oid": oid}),
+        },
         receipt,
     })
 }

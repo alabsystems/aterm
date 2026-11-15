@@ -104,6 +104,7 @@ fn completed_predecessor_and_positive_noexec_survive_target_rotation_and_reload(
                     login: None,
                     owner: None,
                     generation: "22".repeat(32),
+                    purpose: crate::harness::accounts_pool::Purpose::Select,
                 }),
             }
         ),

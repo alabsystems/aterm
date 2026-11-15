@@ -274,11 +274,15 @@ pub fn fmt_dur(d: Duration) -> String {
     }
 }
 
-/// The short form of a session id for the hand slot.
+/// The short form of a session id for the hand slot: a tab ID's own short form
+/// ([`aterm_types::tab_id::TabId::short`], `tqn5r` or an earlier tab's `s-1a2b`), and any other
+/// word cut to its first 6 characters.
 #[must_use]
 pub fn short_sid(sid: &str) -> String {
-    let n = sid.chars().count().min(6);
-    sid.chars().take(n).collect()
+    match aterm_types::tab_id::TabId::parse(sid) {
+        Some(id) => id.short().to_owned(),
+        None => sid.chars().take(6).collect(),
+    }
 }
 
 /// A box's kind in a person's words.

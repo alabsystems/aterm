@@ -10,7 +10,8 @@ use super::fixtures::{
 use super::*;
 use crate::prompt::fixtures::{composer, rows, screen};
 use crate::reader::{Program, identify, program_of, read};
-use crate::wall::{Placement, WallKind};
+use crate::wall::Placement;
+use alab_policy::vocab::WallKind;
 
 #[test]
 fn the_plan_rate_limit_card_is_a_limit_wall_and_prose_that_quotes_it_is_none() {

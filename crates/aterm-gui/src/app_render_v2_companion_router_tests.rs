@@ -45,6 +45,7 @@ fn the_router_lead_is_the_footprints_own_lead() {
             geom: GEOM,
             cursor: (4, 10),
             look,
+            body: aterm_effects::kitty_cursor::CursorBody::Head,
             bob: 0.0,
             lift: 0.0,
         })
@@ -240,6 +241,7 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
             geom: GEOM,
             cursor: caret,
             look: head.render_look(),
+            body: aterm_effects::kitty_cursor::CursorBody::Head,
             bob: head.bob,
             lift: 0.0,
         })
@@ -380,6 +382,7 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
         },
         cursor: caret,
         look: head.render_look(),
+        body: aterm_effects::kitty_cursor::CursorBody::Head,
         bob: 0.0,
         lift: 0.0,
     };
@@ -401,6 +404,7 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
                 geom: layout.geom,
                 cursor: caret,
                 look: layout.look,
+                body: aterm_effects::kitty_cursor::CursorBody::Head,
                 colors: Default::default(),
                 bob: 0.0,
                 lift: 0.0,

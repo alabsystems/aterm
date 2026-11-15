@@ -45,6 +45,10 @@ fn a_waiter_for_memory_reserves_no_cores_against_a_holder() {
         used: TreeUse::default(),
         credited: TreeUse::default(),
         seen: true,
+        line: Vec::new(),
+        sole: true,
+        inside: None,
+        reckoned: None,
     };
     let idle = cores14_at(0.0);
     let holds = record(20, 0, Need::new("verify test").mem(3 * GIB), Some(0));

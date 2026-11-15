@@ -6,6 +6,13 @@
 use astream_wire::WakeClass;
 pub use aterm_types::fabric_grammar::{is_principal, is_topic, PRINCIPAL_MAX};
 
+/// Whether `s` names a session in a subject or a body's `from=`: a tab ID
+/// ([`aterm_types::tab_id::is_tab_id`]), or a legacy tab's ID ([`aterm_types::tab_id::is_legacy`]).
+#[must_use]
+pub fn is_session_id(s: &str) -> bool {
+    aterm_types::tab_id::is_tab_id(s) || aterm_types::tab_id::is_legacy(s)
+}
+
 /// A fleet name segment: the same bounded lowercase grammar, without a class prefix.
 #[must_use]
 pub fn is_fleet(f: &str) -> bool {
@@ -65,7 +72,7 @@ pub fn parse_in(fleet: &str, node: &str, subject: &str) -> Result<InAddr, Reject
         return Err(Reject::Malformed);
     }
     let (sid, src, kind) = (segs[5], segs[6], segs[7]);
-    if !is_principal(sid) || !sid.starts_with("s-") || !is_principal(src) {
+    if !is_session_id(sid) || !is_principal(src) {
         return Err(Reject::Malformed);
     }
     let Some(kind) = WakeClass::parse(kind) else {
@@ -257,7 +264,7 @@ pub fn parse_say(fleet: &str, subject: &str) -> Option<SayAddr> {
         return None;
     }
     let (node, sid, topic) = (segs[4], segs[5], segs[7]);
-    if !is_principal(node) || !is_principal(sid) || !sid.starts_with("s-") || !is_topic(topic) {
+    if !is_principal(node) || !is_session_id(sid) || !is_topic(topic) {
         return None;
     }
     Some(SayAddr {

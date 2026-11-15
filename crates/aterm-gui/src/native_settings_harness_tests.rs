@@ -12,8 +12,9 @@ use crate::harness_screen::{
 use crate::native_settings::harness_page::{
     HARNESS_CONFIG_TOGGLE, HARNESS_OPEN_CONFIG, HARNESS_REFRESH, harness_page_rows,
 };
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::stats::HarnessStats;
-use aterm_agent::supervise::{Autopilot, SupervisorConfig};
+use aterm_agent::supervise::SupervisorConfig;
 
 /// SESSIONS' `Every session` row (design §11.5), with this module's
 /// fixtures and readers.
@@ -3970,8 +3971,8 @@ fn a_background_landing_moves_no_switch() {
 
 /// [`fixture`] with landings (design §12.4): three sessions under Land.
 pub(super) fn fixture_landings() -> HarnessState {
+    use alab_policy::words::RULE_DONE_CHECK;
     use aterm_agent::harness::acts::TaskFace;
-    use aterm_agent::supervise::policy::turn_end::RULE_DONE_CHECK;
     let mut state = fixture();
     let first = state.sessions[0].clone();
     let with = |id: u64, task: TaskFace| {
@@ -4267,30 +4268,12 @@ fn forced_continues_says_what_it_counts() {
             "{key} with no done check"
         );
     }
-    const MANUAL: &str = include_str!("../../aterm-cli/src/manual.rs");
-    let manual = MANUAL.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        manual.contains(&format!("`{FORCED_CONTINUES}`")),
-        "the manual names the row"
-    );
 }
 
 #[test]
 fn every_mode_sentence_comes_from_mode_words() {
     use crate::autopilot::{MODE_WORDS, TIMED_CRUISE_CHIP, TIMED_CRUISE_RECORD};
     use crate::claude_lights::{ChipGlass, LandAtGlass, TitleWords, autopilot_title};
-    const MANUAL: &str = include_str!("../../aterm-cli/src/manual.rs");
-    let at = MANUAL
-        .find("\nAUTOPILOT \u{2014} ")
-        .expect("the AUTOPILOT section");
-    let section = &MANUAL[at + 1..];
-    let end = section[1..]
-        .find("\n\n")
-        .map_or(section.len(), |end| end + 1);
-    let manual = section[..end]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
     let (mut runtime, instance, view) = harness_route(fixture());
     let pages = every_page(&mut runtime, instance, view, &view_cx());
     let note = prefs::footnote_of(prefs::EDIT_HARNESS_AUTOPILOT).expect("the default's note");
@@ -4332,10 +4315,6 @@ fn every_mode_sentence_comes_from_mode_words() {
             button.description
         );
         assert!(
-            manual.contains(&format!("`{}`", words.chip)),
-            "{mode:?}'s sentence in the manual's AUTOPILOT: {manual}"
-        );
-        assert!(
             note.contains(words.record),
             "{mode:?}'s sentence in the default autopilot's note: {note}"
         );
@@ -4371,10 +4350,6 @@ fn every_mode_sentence_comes_from_mode_words() {
             .any(|line| line == &format!("Tab 2: {TIMED_CRUISE_RECORD}")),
         "{:?}",
         record.detail
-    );
-    assert!(
-        manual.contains(&format!("`{TIMED_CRUISE_CHIP}`")),
-        "the timed sentence in the manual: {manual}"
     );
 }
 

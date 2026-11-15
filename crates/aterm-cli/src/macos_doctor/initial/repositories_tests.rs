@@ -46,6 +46,17 @@ fn joined_inventory(home: &Path, source: &Path, inventory: &str) -> Paths {
     paths
 }
 
+/// The joined store's token and repository inventory, read in place, as the double's vault.
+fn deliver(sys: &Fake, home: &Path) {
+    let paths = Paths::locate_for_home(home);
+    for name in ["gh_access_token", "github-repositories.json"] {
+        match client::read_in_place(&paths, name).unwrap() {
+            Some(value) => sys.vault_set(home, name, value.as_slice()),
+            None => sys.vault_remove(home, name),
+        };
+    }
+}
+
 fn fake(home: &Path) -> (Fake, Ctx) {
     let user = User {
         name: "alice".into(),
@@ -81,19 +92,7 @@ fn fake(home: &Path) -> (Fake, Ctx) {
             .contains(" config --null --show-origin --get-regexp ")
             .then(|| Ran::ok(""))
     });
-    let token = home.join(".secrets/gh_access_token");
-    let bytes = std::fs::read(&token).unwrap();
-    sys.file(token.to_str().unwrap(), &bytes)
-        .stat_of(token.to_str().unwrap(), stat(false, bytes.len() as u64));
-    let inventory = home.join(".secrets/github-repositories.json");
-    match std::fs::read(&inventory) {
-        Ok(bytes) => {
-            sys.file(inventory.to_str().unwrap(), &bytes)
-                .stat_of(inventory.to_str().unwrap(), stat(false, bytes.len() as u64));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!("reading fixture inventory: {error}"),
-    }
+    deliver(&sys, home);
     for (endpoint, body) in [
         ("/user", aterm_json::json!({"login":"alice"})),
         (
@@ -268,8 +267,6 @@ fn a_ready_selected_vault_allows_repository_observation() {
     }
     for path in [
         home.clone(),
-        home.join(".secrets/gh_access_token"),
-        home.join(".secrets/github-repositories.json"),
         checkout.clone(),
         checkout.join(".git"),
         checkout.join(".git/objects"),
@@ -372,12 +369,7 @@ fn a_ready_selected_vault_allows_repository_observation() {
     let changed_inventory = INVENTORY.replace("\"id\":1", "\"id\":2");
     std::fs::write(&source, format!("gh_access_token={TOKEN}\ngithub-repositories.json={changed_inventory}\ntool-other=before\n")).unwrap();
     client::sync(&paths, None).unwrap();
-    let inventory = home.join(".secrets/github-repositories.json");
-    sys.file(
-        inventory.to_str().unwrap(),
-        &std::fs::read(&inventory).unwrap(),
-    )
-    .stat_of(inventory.to_str().unwrap(), live.stat(&inventory).unwrap());
+    deliver(&sys, &home);
     let changed = run(&sys, &ctx, Some(&plan), Mode::Plan, Some(proof)).unwrap();
     assert!(!super::super::rows_ready(&changed), "{changed:?}");
     assert_eq!(
@@ -422,7 +414,7 @@ fn an_empty_selected_inventory_needs_no_git_or_repository_work() {
     aterm_secrets::need::test_alab_policy(&paths);
     std::fs::write(&source, "github-repositories.json={\"schema\":2,\"account\":\"alice\",\"repositories\":[]}\ntool-other=before\n").unwrap();
     client::sync(&paths, None).unwrap();
-    sys.remove(&home.join(".secrets/gh_access_token")).unwrap();
+    deliver(&sys, &home);
     let pending = aterm_secrets::need::raise(
         &paths,
         aterm_secrets::need::Want::Gh(aterm_secrets::need::GhProfile::Dev),
@@ -479,12 +471,18 @@ fn a_ready_vault_keeps_the_repository_inputs_typed_blocker() {
             ..Plan::default()
         };
         let (sys, ctx) = fake(&home);
-        let missing = match wait {
-            Wait::Token => home.join(".secrets/gh_access_token"),
-            Wait::GitReadiness => Path::new(aterm_machines::items::github::CLT_GIT).to_path_buf(),
+        match wait {
+            Wait::Token => {
+                sys.vault_remove(&home, "gh_access_token");
+            }
+            Wait::GitReadiness => {
+                sys.stat_fails(
+                    aterm_machines::items::github::CLT_GIT,
+                    std::io::ErrorKind::NotFound,
+                );
+            }
             _ => unreachable!(),
-        };
-        sys.stat_fails(missing.to_str().unwrap(), std::io::ErrorKind::NotFound);
+        }
         let seen = observe(&sys, &ctx, Some(&plan), false).unwrap();
         // A missing token blocks the stage until the vault delivers one; Git readiness is
         // retried automatically. Neither is a person's.

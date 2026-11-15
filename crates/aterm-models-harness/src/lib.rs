@@ -112,6 +112,7 @@ mod models_account_binding_retention;
 mod models_account_browser_rehabilitation;
 mod models_account_claim_activity;
 mod models_account_claim_clock;
+mod models_account_claim_rank;
 mod models_account_completion_identity;
 mod models_account_controls;
 mod models_account_create_label;
@@ -344,6 +345,7 @@ pub use models_account_claim_activity::{
     account_claim_activity_model, account_claim_observation_model,
 };
 pub use models_account_claim_clock::account_claim_clock_model;
+pub use models_account_claim_rank::account_claim_rank_model;
 pub use models_account_completion_identity::account_completion_identity_model;
 pub use models_account_controls::account_controls_model;
 pub use models_account_create_label::account_create_label_model;

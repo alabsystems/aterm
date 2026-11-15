@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::admit::{decide, others};
+use crate::admit::{decide, ledgerwide, others};
 use crate::floor::GIB;
 use crate::{Held, Need, Overrun, Proc, Procs, Reading, Record, TreeUse, overruns};
 
@@ -62,7 +62,8 @@ fn waiters_line(records: &[Record], trees: &HashMap<u32, TreeUse>) -> String {
     let r = Reading::of_gib(48, 14, 14);
     let records: Vec<&Record> = records.iter().collect();
     let taken: HashSet<u32> = records.iter().map(|r| r.pid).collect();
-    let others = others(&records, taken, trees);
+    let wide = ledgerwide(&records, trees, None, &r);
+    let others = others(&records, taken, trees, &HashMap::new(), &wide);
     let need = Need::new("trust check aterm-render").mem_gib(12);
     decide(&need, (9, 1, 0), &r, &others, 60_000)
         .expect_err("waits")

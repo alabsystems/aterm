@@ -277,7 +277,7 @@ pub(super) fn matches(
             current.last_seen_ms >= expected.last_seen_ms
         }
         && current.last_seen_ms <= network.observed_at_ms
-        // A Reachable row is current by the lease its observer measured for that peer.
+        // A Reachable row is current by the lease its observer gave that peer's contact.
         && current.reachability_at(Some(now)) == current.reachability
         && match expected.last_checked_ms {
             None => {

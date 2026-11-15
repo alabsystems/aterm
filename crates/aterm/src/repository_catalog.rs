@@ -4,20 +4,20 @@
 //! Admin-owned inventory upkeep. The owned worker receives no administrative key:
 //! it fetches only; a later fresh admin callback conditionally publishes the result.
 
-use agh::identity::{EnvSource, ProcessEnv, TokenKind};
+use agh::identity::{InlineToken, ProcessEnv, TokenKind};
 use agh::page::{Consistency, End, LinkScope, ListOpts};
 use agh::policy::{RouteRequest, RouteTarget, Router};
 use agh::retry::RetryPolicy;
 use agh::wire::http::HttpTransport;
 use agh::{Call, GithubBuilder};
-use aterm_machines::init_github::{RepositoryCatalog, RepositoryCatalogVisibility};
+use aterm_machines::init_github::{
+    RepositoryCatalog, RepositoryCatalogChanges, RepositoryCatalogVisibility,
+};
 use aterm_secrets::{
     SecretBytes,
     client::{self, Admin, Config, Paths},
     text::Audience,
 };
-use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt as _;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 const NAME: &str = aterm_secrets::entry_class::GITHUB_REPOSITORIES;
 const TOKEN: &str = aterm_secrets::entry_class::DEV_GH_TOKEN;
 const PROFILE: &str = "private-catalog";
-const TOKEN_ENV: &str = "ATERM_ADMITTED_CATALOG_TOKEN";
 const MAX: usize = 1 << 20;
 const FETCH: Duration = Duration::from_secs(20);
 const LOOK: Duration = Duration::from_secs(15 * 60);
@@ -57,6 +56,9 @@ struct Candidate {
     bytes: Vec<u8>,
     visibility: RepositoryCatalogVisibility,
     observed: usize,
+    /// How `bytes` differs from the catalog it was refreshed from, whose digest `binding`
+    /// holds; [`publish`] goes on only while that is the published one.
+    changes: RepositoryCatalogChanges,
     observed_at: Instant,
 }
 type Fetcher = dyn Fn(Input, Arc<AtomicBool>) -> Result<Candidate, String> + Send + Sync;
@@ -152,6 +154,10 @@ pub(super) struct Upkeep {
     reported: Option<String>,
     members: Option<[u8; 32]>,
     followup: bool,
+    /// Runs in [`Upkeep::step`] between its take of a finished read and its choice to ask for
+    /// another: a test's stand-in for a read that finishes in that window.
+    #[cfg(test)]
+    between: Option<Box<dyn FnMut() + Send>>,
 }
 impl Default for Upkeep {
     fn default() -> Self {
@@ -164,15 +170,20 @@ impl Default for Upkeep {
             reported: None,
             members: None,
             followup: false,
+            #[cfg(test)]
+            between: None,
         }
     }
 }
 impl Upkeep {
+    /// Retires the work in flight, without joining the worker: the read being made is told to
+    /// stop and its answer is not kept, and a queued read and a finished one waiting for a step
+    /// are dropped. What the schedule holds stands: the binding it was kept for, when the next
+    /// look is due, the member set and an owed second read. So a pause makes no read the
+    /// schedule did not already owe, and a read it dropped is asked again at the next step that
+    /// captures its input, because `due` is empty while a read is queued, being made or
+    /// waiting. Only a step that captures a changed binding forgets the schedule.
     pub(super) fn pause(&mut self) {
-        self.basis = None;
-        self.due = None;
-        self.members = None;
-        self.followup = false;
         let mut mail = self
             .mailbox
             .0
@@ -258,8 +269,13 @@ impl Upkeep {
         self.reported = None;
         let changed = self.basis.as_ref() != Some(&input.binding);
         if changed {
+            // Either entry, the configuration or a path differs from the binding the schedule
+            // was kept for: what was read under it is retired and the next look is now.
             self.pause();
             self.basis = Some(input.binding.clone());
+            self.due = None;
+            self.members = None;
+            self.followup = false;
         }
         let members = membership(admin);
         if self
@@ -342,12 +358,27 @@ impl Upkeep {
                 self.due = Some(Instant::now() + RETRY);
                 return Err(error);
             }
+            #[cfg(test)]
+            if let Some(between) = self.between.as_mut() {
+                between();
+            }
             let mut mail = self
                 .mailbox
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !changed && (mail.active.is_some() || mail.pending.is_some()) {
+            // A read already queued, being made and not told to stop, or made since this step
+            // took the last answer, answers this step, and the next step drains it. A second
+            // read asked for beside it would still be in flight when that drain arms `due`. One
+            // a pause told to stop does not: its replacement waits behind it on the worker.
+            if !changed
+                && (mail.pending.is_some()
+                    || mail.result.is_some()
+                    || mail
+                        .active
+                        .as_ref()
+                        .is_some_and(|stop| !stop.load(Ordering::Acquire)))
+            {
                 return Ok(published);
             }
             if let Some(stop) = &mail.active {
@@ -445,20 +476,32 @@ fn publish(
     client::admin_publish_conditional_until(paths, &fresh, &doc, deadline).map_err(|_| {
         "private catalog publication awaits current authority or readback".to_string()
     })?;
-    aterm_log::info!(
-        "private repository catalog refreshed: mode={:?}, observed_owned={}",
-        candidate.visibility,
-        candidate.observed
-    );
+    aterm_log::info!("{}", refreshed_line(&candidate));
     Ok(1)
 }
 
-struct AdmittedToken(SecretBytes);
-impl EnvSource for AdmittedToken {
-    fn var_os(&self, name: &str) -> Option<OsString> {
-        (name == TOKEN_ENV).then(|| OsString::from_vec(self.0.as_slice().to_vec()))
-    }
+/// What a publication logs: why the entry was signed again, as counts of repositories and
+/// whether the account's spelling or the repositories' order differs. No name, URL, id, key
+/// name or size is in it. The entry is signed only where the candidate differs from it as
+/// JSON, so a logged line has a count above `0` or a flag set ([`RepositoryCatalogChanges`]).
+fn refreshed_line(candidate: &Candidate) -> String {
+    let RepositoryCatalogChanges {
+        other_fields,
+        size_only,
+        added,
+        removed,
+        pruned,
+        account,
+        order,
+    } = candidate.changes;
+    format!(
+        "private repository catalog refreshed: mode={:?}, observed_owned={}, \
+         other_fields={other_fields}, size_only={size_only}, added={added}, removed={removed}, \
+         pruned={pruned}, account={account}, order={order}",
+        candidate.visibility, candidate.observed
+    )
 }
+
 fn call(path: &str) -> Call {
     Call::get(
         path,
@@ -521,12 +564,9 @@ fn github(
     token: SecretBytes,
     transport: Arc<dyn agh::wire::Transport>,
 ) -> Result<agh::Github, String> {
-    let config = agh::config::parse("[profiles.private-catalog]\nenv='ATERM_ADMITTED_CATALOG_TOKEN'\ntier='dev'\n[default]\nread=['private-catalog']\n")
-        .map_err(|_| "catalog routing configuration is invalid")?;
-    let validated = agh::config::validate(&config, std::path::Path::new("/"), &|_| None)
-        .map_err(|_| "catalog routing configuration is invalid")?;
-    Ok(GithubBuilder::new(Router::from_validated(validated))
-        .env(Arc::new(AdmittedToken(token)))
+    let token = InlineToken::new(aterm_uds::secret::Secret::new(token.as_slice()))
+        .map_err(|_| "the catalog token is not one GitHub token")?;
+    Ok(GithubBuilder::new(Router::default_reader(PROFILE, token))
         .transport(transport)
         .refuse_anonymous_api(true)
         .retry(RetryPolicy::NONE)
@@ -640,6 +680,7 @@ fn observe(
         RepositoryCatalogVisibility::TokenVisible
     };
     let bytes = catalog.refresh(&user.login, user.id, &listing.items, visibility)?;
+    let changes = catalog.changes(&bytes)?;
     let observed_at = Instant::now();
     if stopped.load(Ordering::Acquire) || observed_at >= until {
         return Err("catalog provider read expired before its final result".into());
@@ -649,6 +690,7 @@ fn observe(
         bytes,
         visibility,
         observed: listing.items.len(),
+        changes,
         observed_at,
     })
 }

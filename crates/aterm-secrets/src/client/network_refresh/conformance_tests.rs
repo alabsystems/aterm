@@ -70,10 +70,9 @@ fn seeded(config: &Config, recipient: Option<[u8; 32]>) -> State {
         requested: 19,
         membership: Stored::In,
         proof: Some("fixture-proof".into()),
-        own: Some(BTreeSet::from(["fixture-token".into()])),
+        held: Some(BTreeMap::from([("fixture-token".into(), digest)])),
         ..State::default()
     };
-    state.manifest.files.insert("fixture-token".into(), digest);
     assert!(state.network_materialization.is_some());
     assert!(state.http204_response.is_some());
     let attempt = Attempt {

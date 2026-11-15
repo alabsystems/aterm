@@ -314,13 +314,18 @@ impl Fx {
         }
     }
 
-    /// This world built for the `gh` arm instead, said outright, with both token files: for a
-    /// test whose assertions read that arm's token checks or texts.
+    /// This world built for the `gh` arm instead, said outright, with both vault entries in its
+    /// home's store: for a test whose assertions read that arm's token checks or texts.
     pub fn use_gh(&mut self) {
         self.ctx = self.ctx.clone().with_host_choice(HostChoice::Gh);
-        std::fs::create_dir_all(self.ctx.home.join(".secrets")).expect("mkdir secrets");
-        std::fs::write(&self.ctx.tokens.staging, "ghp_staging_stub\n").expect("token");
-        std::fs::write(&self.ctx.tokens.channel, "ghp_channel_stub\n").expect("token");
+        self.ctx
+            .tokens
+            .staging
+            .put_for_tests(Some(b"ghp_staging_stub\n"));
+        self.ctx
+            .tokens
+            .channel
+            .put_for_tests(Some(b"ghp_channel_stub\n"));
     }
 
     /// What this world holds besides its directory, for [`Fx::laid`].
@@ -901,6 +906,7 @@ impl Packer for FakePacker {
                 upload: false,
                 env: Vec::new(),
                 build_within: None,
+                build_queue: None,
             },
         )?;
         Ok(atpkg_publish::artifact::bottle::BottleOutcome {

@@ -56,15 +56,15 @@
 //! (`fixtures/grok-1.0.70-box-*-narrow.txt`), where the key row is cut short of its right end.
 //! Other widths, other tools' cards, the cancel-turn panel and the window's title are unmeasured.
 
-use crate::phase::Phase;
 use crate::prompt::{Opt, PromptKind, PromptV2, Role, Select};
-use crate::wall::{Placement, Wall, WallKind};
+use crate::wall::{Placement, Wall};
+use alab_policy::vocab::{Phase, WallKind};
 
 /// The Grok (`grok`) harness version, `MAJOR.MINOR` with no third part.
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 20, "0.20");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 21, "0.21");
 
 /// How many of the screen's last worded rows a wall row may stand in ([`live_from`]): the
 /// notice a turn ended on, with room for a composer and key rows under it.

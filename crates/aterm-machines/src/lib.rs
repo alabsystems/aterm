@@ -44,6 +44,7 @@ pub mod lan_reach;
 pub mod model;
 pub mod plist;
 pub mod port;
+mod progress;
 pub mod protocol;
 pub mod release_probe;
 pub use aterm_repository_progress as repository_progress;

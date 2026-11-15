@@ -7,7 +7,7 @@ use std::path::Path;
 
 /// The local registry is data, never executable input. A dead record is retained so a peer
 /// can distinguish death from a failed fleet read.
-pub const DIRECTORY: &str = "release-lines";
+pub use aterm_ctl::release_holder::DIRECTORY;
 
 const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 

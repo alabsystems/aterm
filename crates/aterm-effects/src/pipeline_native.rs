@@ -1396,6 +1396,11 @@ impl EffectsPipeline {
         use crate::rainbow_kitty::companion::{
             self as companion, Body, BodyImpulse, CompanionAdmission, Reaction, SeatQuery,
         };
+        // The glide breathes in whole device pixels (`glide_bob_cells`): every host path routes
+        // here, so the bob is quantized once, before any seat or draw reads it.
+        if matches!(cat_frame.body, crate::kitty_cursor::CursorBody::Glide(_)) {
+            cat_frame.bob = crate::kitty_cursor::glide_bob_cells(cat_frame.bob, geom.cell_h);
+        }
         if self.cursor.glow.v2_status().is_none() {
             self.flying_sky_row = None;
             return FlyingSeat::default();
@@ -1450,6 +1455,7 @@ impl EffectsPipeline {
                     geom,
                     cursor: cell,
                     look,
+                    body: cat_frame.body,
                     bob: cat_frame.bob,
                     lift: 0.0,
                 })
@@ -1485,7 +1491,19 @@ impl EffectsPipeline {
         let gap = (WordDecorations::kitty_cursor_lead_px(geom.cell_w)
             / crate::word_decorations::HEAD_CARET_GAP_DEN)
             .max(1);
-        let fit_seat = companion::head_fit_seat(cell, rest, (cw, ch, geom.cols), gap, &ink);
+        let floor = self.decos.kitty_cursor_fit_floor(
+            crate::word_decorations::KittyCursorLayout {
+                geom,
+                cursor: cell,
+                look,
+                body: cat_frame.body,
+                bob: cat_frame.bob,
+                lift: 0.0,
+            },
+            rest,
+        );
+        let fit_seat =
+            companion::head_fit_seat(cell, rest, (cw, ch, geom.cols), (gap, floor), &ink);
         let whole_clear = !seat.over_ink
             && companion::box_clear(
                 (seat.x, seat.y, i32::from(seat.w), i32::from(seat.h)),
@@ -1496,8 +1514,13 @@ impl EffectsPipeline {
             );
         self.flying_fit_goal = fit_seat.map(|(goal, _)| (goal, now, animate));
         match fit_seat {
-            Some((goal, _)) if self.flying_fit.fitted() && !whole_clear => {
-                self.flying_fit.aim(goal, now, animate);
+            Some((goal, (x, _, w, _))) if self.flying_fit.fitted() && !whole_clear => {
+                // Less room past the caret takes the fit down at once: eased, the wider box
+                // stood over the caret's cell for the ease's frames, a key at a time by the wall.
+                let now_w = (f32::from(rest.w) * self.flying_fit.at(now)).round() as i32;
+                let caret_right = (i32::from(cell.1) + 1).saturating_mul(cw);
+                let over_caret = x + w - now_w < caret_right;
+                self.flying_fit.aim(goal, now, animate && !over_caret);
             }
             _ if self.flying_fit.fitted() => self.flying_fit.aim(1.0, now, animate),
             _ => {}
@@ -1507,16 +1530,12 @@ impl EffectsPipeline {
             // At the size it stands at now, on the caret's row: the layout's lift takes the
             // margin's rise back off, and the pose's lead carries it from its whole box's middle
             // to its place.
-            let (rest_w, rest_h) = (f32::from(rest.w), f32::from(rest.h));
-            let (w, h) = ((rest_w * fit).round() as i32, (rest_h * fit).round() as i32);
-            let grid_w = i32::from(geom.cols).saturating_mul(cw);
-            let caret_right = (i32::from(cell.1) + 1).saturating_mul(cw);
-            let x = (caret_right + gap).min(grid_w - w).max(0);
-            let y = i32::from(cell.0) * ch + (ch - h) / 2;
-            let row_top = i32::from(cell.0) * ch + ch / 2 - i32::from(rest.h) / 2;
             let bob_px = (cat_frame.bob * f32::from(geom.cell_h)).round() as i32;
-            let lift = (rest.y - (row_top + bob_px)) as f32 / f32::from(geom.cell_h);
-            let lead_px = x - (rest.x + i32::from(rest.w) / 2 - w / 2);
+            let companion::FittedHead {
+                rect: (x, y, w, h),
+                lift,
+                lead_px,
+            } = companion::fitted_head(cell, rest, fit, (cw, ch, geom.cols), gap, bob_px);
             if geom.cell_w > 0 {
                 let facing_left = self.companions.cursor_cat.placement_frame(now).facing_left;
                 let lead_cells = lead_px as f32 / f32::from(geom.cell_w);
@@ -1550,6 +1569,7 @@ impl EffectsPipeline {
                     geom,
                     cursor: cell,
                     look,
+                    body: cat_frame.body,
                     bob: cat_frame.bob,
                     lift,
                 }) {

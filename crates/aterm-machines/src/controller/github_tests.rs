@@ -2,13 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::port::{Fake, Stat};
+use crate::port::Fake;
 
 /// Made up; never a real token.
 const TOKEN: &str = "fixture_machine_user_token_only";
-
-/// The controller's token file in these tests.
-const TOKEN_FILE: &str = "/controller/keys/github_token";
 
 /// The key the VM's admin made (see items::github's fixtures).
 const ALICE_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJpFPtSPTOuLIj6oqQTj8ndNDVNHFp4renP47+wxFYao aterm-machines:lab-07:alice";
@@ -60,29 +57,25 @@ fn lists(sys: &Fake, held: &[(u64, &str)]) {
     sys.on_github_rest(RestMethod::Get, FIRST_PAGE, answer(200, &[], &keys(held)));
 }
 
-fn token_file() -> &'static Path {
-    Path::new(TOKEN_FILE)
+/// A controller signed in to the scratch vault home, holding no `gh:fleet` token yet.
+fn fake() -> Fake {
+    let sys = Fake::default();
+    super::super::credential::tests::in_vault(&sys, FLEET, None);
+    sys
 }
 
-/// `bytes` in the controller's token file, with `mode`, owned by this account.
-fn stored(sys: &Fake, bytes: &str, mode: u32) {
-    sys.file(TOKEN_FILE, bytes.as_bytes()).stat_of(
-        TOKEN_FILE,
-        Stat {
-            uid: sys.euid,
-            gid: 0,
-            mode,
-            dir: false,
-            symlink: false,
-            len: bytes.len() as u64,
-        },
-    );
+/// `bytes` as the vault's `gh:fleet` token, in this account's store.
+fn stored(sys: &Fake, bytes: &str) {
+    super::super::credential::tests::in_vault(sys, FLEET, Some(bytes.as_bytes()));
 }
 
-/// A controller whose token file holds a token for `fleetbot` that signs in as `login`.
+/// The `gh:fleet` entry.
+const FLEET: &str = aterm_secrets::need::catalog::FLEET_GH_TOKEN_ENTRY;
+
+/// A controller whose vault holds a `gh:fleet` token for `fleetbot` that signs in as `login`.
 fn controller(login: &str) -> Fake {
     let sys = Fake::default();
-    stored(&sys, &format!("{TOKEN}\n"), 0o600);
+    stored(&sys, &format!("{TOKEN}\n"));
     sys.on_github_rest(
         RestMethod::Get,
         "/user",
@@ -135,7 +128,7 @@ fn a_new_key_is_posted_and_one_already_held_is_only_recorded() {
             format!("ssh-ed25519 {BOB_BODY} aterm-machines:lab-07:bob"),
         ),
     ];
-    let done = register(&sys, token_file(), "fleetbot", "lab-07", &keys).unwrap();
+    let done = register(&sys, "fleetbot", "lab-07", &keys).unwrap();
     assert_eq!(
         done,
         [
@@ -187,7 +180,7 @@ fn a_key_held_on_a_later_page_is_found_and_a_page_cut_short_sends_nothing() {
             "bob".to_owned(),
             format!("ssh-ed25519 {BOB_BODY} aterm-machines:lab-07:bob"),
         )];
-        let done = register(&sys, token_file(), "fleetbot", "lab-07", &bob);
+        let done = register(&sys, "fleetbot", "lab-07", &bob);
         if cut {
             assert!(done.unwrap_err().contains("cut short"));
         } else {
@@ -208,7 +201,6 @@ fn a_token_for_another_login_sends_nothing() {
     let sys = controller("someone-else");
     let err = register(
         &sys,
-        token_file(),
         "fleetbot",
         "lab-07",
         &[("alice".into(), ALICE_KEY.into())],
@@ -219,24 +211,29 @@ fn a_token_for_another_login_sends_nothing() {
     clean(&sys);
 }
 
-/// No token file, a token file others can read, or one that holds no single token blocks the
-/// key call, which says so and asks nobody for a token. None of them sends anything, and none
-/// runs git.
+/// No `gh:fleet` token, one others can read, or one that holds no single token blocks the key
+/// call, which files the want with the lab and asks nobody. None of them sends anything, and
+/// none runs git.
 #[test]
-fn no_usable_token_file_blocks_the_key_call_and_sends_nothing() {
-    let sys = Fake::default();
-    let err = revoke(&sys, token_file(), "fleetbot", &[1]).unwrap_err();
-    assert!(err.contains("no GitHub token for fleetbot at"), "{err}");
-    assert!(!err.contains("github login"), "{err}");
+fn no_usable_fleet_token_blocks_the_key_call_and_sends_nothing() {
+    let sys = fake();
+    let err = revoke(&sys, "fleetbot", &[1]).unwrap_err();
+    assert!(
+        err.contains("no usable gh:fleet") && err.contains("asked the lab's Macs"),
+        "{err}"
+    );
     assert!(sys.calls().is_empty(), "{:?}", sys.calls());
-    for (bytes, mode, why) in [
-        (TOKEN, 0o644, "private regular file"),
-        ("", 0o600, "no single GitHub token"),
-        ("first second", 0o600, "no single GitHub token"),
+    for (bytes, unreadable, why) in [
+        (TOKEN, true, "cannot be read here"),
+        ("", false, "no single value"),
+        ("first second", false, "no single value"),
     ] {
         let sys = Fake::default();
-        stored(&sys, bytes, mode);
-        let err = revoke(&sys, token_file(), "fleetbot", &[1]).unwrap_err();
+        stored(&sys, bytes);
+        if unreadable {
+            sys.vault_unreadable(std::io::ErrorKind::PermissionDenied);
+        }
+        let err = revoke(&sys, "fleetbot", &[1]).unwrap_err();
         assert!(err.contains(why), "{err}");
         assert!(err.contains("host key calls are blocked"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
@@ -247,7 +244,7 @@ fn no_usable_token_file_blocks_the_key_call_and_sends_nothing() {
 #[test]
 fn a_token_github_no_longer_accepts_stops_at_the_login_check() {
     let sys = Fake::default();
-    stored(&sys, TOKEN, 0o600);
+    stored(&sys, TOKEN);
     sys.on_github_rest(
         RestMethod::Get,
         "/user",
@@ -255,7 +252,6 @@ fn a_token_github_no_longer_accepts_stops_at_the_login_check() {
     );
     let err = register(
         &sys,
-        token_file(),
         "fleetbot",
         "lab-07",
         &[("alice".into(), ALICE_KEY.into())],
@@ -281,7 +277,6 @@ fn a_refused_post_names_the_apis_reason() {
     );
     let err = register(
         &sys,
-        token_file(),
         "fleetbot",
         "lab-07",
         &[("alice".into(), ALICE_KEY.into())],
@@ -307,7 +302,7 @@ fn a_key_is_revoked_when_the_listing_no_longer_holds_it() {
         answer(204, &[], ""),
     );
     assert_eq!(
-        revoke(&sys, token_file(), "fleetbot", &[100_000_105, 100_000_106]),
+        revoke(&sys, "fleetbot", &[100_000_105, 100_000_106]),
         Ok(vec![format!("ssh-ed25519 {BOB_BODY}")])
     );
     let calls = sys.calls();
@@ -329,7 +324,7 @@ fn a_404_from_a_token_without_the_scope_is_not_a_key_already_gone() {
             "/user/keys/100000107",
             answer(404, &[ACCEPTED, ("X-OAuth-Scopes", held)], NOT_FOUND_BODY),
         );
-        let err = revoke(&sys, token_file(), "fleetbot", &[100_000_107]).unwrap_err();
+        let err = revoke(&sys, "fleetbot", &[100_000_107]).unwrap_err();
         assert!(
             err.starts_with(
                 "key 100000107: still registered (GitHub DELETE /user/keys/100000107: HTTP \
@@ -353,7 +348,7 @@ fn a_listing_the_token_may_not_read_names_the_missing_scope() {
         FIRST_PAGE,
         answer(404, &[ACCEPTED, ("X-OAuth-Scopes", "repo")], NOT_FOUND_BODY),
     );
-    let err = revoke(&sys, token_file(), "fleetbot", &[7]).unwrap_err();
+    let err = revoke(&sys, "fleetbot", &[7]).unwrap_err();
     assert!(
         err.starts_with("GitHub GET /user/keys: HTTP 404 (Not Found); the token lacks the admin:public_key scope"),
         "{err}"
@@ -376,7 +371,7 @@ fn a_listing_entry_out_of_shape_stops_the_revocation() {
             ),
         ),
     );
-    let err = revoke(&sys, token_file(), "fleetbot", &[100_000_107]).unwrap_err();
+    let err = revoke(&sys, "fleetbot", &[100_000_107]).unwrap_err();
     assert!(err.contains("not an id and an SSH key"), "{err}");
     assert!(sys.calls().iter().all(|c| !c.contains("DELETE")));
 }
@@ -384,19 +379,16 @@ fn a_listing_entry_out_of_shape_stops_the_revocation() {
 #[test]
 fn nothing_to_do_reads_no_token() {
     let sys = Fake::default();
-    assert_eq!(
-        register(&sys, token_file(), "fleetbot", "lab-07", &[]),
-        Ok(Vec::new())
-    );
-    assert_eq!(revoke(&sys, token_file(), "fleetbot", &[]), Ok(Vec::new()));
+    assert_eq!(register(&sys, "fleetbot", "lab-07", &[]), Ok(Vec::new()));
+    assert_eq!(revoke(&sys, "fleetbot", &[]), Ok(Vec::new()));
     assert!(sys.calls().is_empty());
 }
 
 #[test]
 fn an_account_that_is_not_a_login_is_refused_before_anything_is_read() {
     let sys = Fake::default();
-    stored(&sys, TOKEN, 0o600);
-    let err = revoke(&sys, token_file(), "--user=x", &[1]).unwrap_err();
+    stored(&sys, TOKEN);
+    let err = revoke(&sys, "--user=x", &[1]).unwrap_err();
     assert!(err.contains("not a GitHub login"), "{err}");
     assert!(sys.calls().is_empty());
 }

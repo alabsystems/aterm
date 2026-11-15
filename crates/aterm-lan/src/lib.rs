@@ -19,6 +19,8 @@
 mod bonjour;
 #[cfg(target_os = "macos")]
 mod bplist;
+#[cfg(unix)]
+mod counts;
 #[cfg(target_os = "macos")]
 mod direct;
 #[cfg(target_os = "macos")]

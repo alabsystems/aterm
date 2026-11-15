@@ -75,13 +75,10 @@ fn policy_and_source_precedence_are_rechecked_after_capture() {
             let held = store.acquire().unwrap();
             store.retire_source_held(&held, 1).unwrap();
         } else {
-            std::fs::create_dir(home.join(".secrets")).unwrap();
-            std::fs::write(
-                home.join(".secrets")
-                    .join(crate::harness::ai_pool::AI_POOL_FILE),
-                "account=[]\n",
-            )
-            .unwrap();
+            crate::vault_entry::seed(
+                home,
+                &[(crate::harness::ai_pool::AI_POOL_FILE, b"account=[]\n")],
+            );
         }
         assert_eq!(
             captured.validate().unwrap_err().retry_reason(),

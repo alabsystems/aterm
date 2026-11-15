@@ -51,6 +51,7 @@ fn on() -> Result<PolicyFacts, String> {
         effective: (true, "on"),
         session_questions: None,
         codex_rotation: false,
+        codex_login_rotation: false,
     })
 }
 

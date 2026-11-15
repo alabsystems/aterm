@@ -88,7 +88,22 @@ fn exact_age(ms: u64) -> String {
     }
 }
 
+// These are limits of the observation, not claims that the job has any of them.
+const PROGRESS_LIMITS: &str = "socket-bytes,cr-only-output,retry-work,raw-tui,long-poll";
+const PROGRESS_LIMIT_WORDS: &str = "socket bytes are not counted; CR-only output and retries may be real work; raw terminal programs may be deadlocked; long polls may still be waiting normally";
+
 impl JobRow {
+    /// Unmeasured activity that limits a live progress verdict. An observed exit
+    /// does not depend on these progress signals.
+    #[must_use]
+    pub const fn progress_limits(&self) -> Option<&'static str> {
+        if matches!(self.verdict, Verdict::Exited) {
+            None
+        } else {
+            Some(PROGRESS_LIMITS)
+        }
+    }
+
     /// The `sys jobs` row.
     #[must_use]
     pub fn wire(&self) -> String {
@@ -175,6 +190,9 @@ impl JobRow {
         if let Some(e) = self.exit.filter(|_| self.verdict == Verdict::Exited) {
             let _ = write!(o, " exit={e}");
         }
+        if let Some(limits) = self.progress_limits() {
+            let _ = write!(o, " progress_limits={limits}");
+        }
         let _ = write!(o, " verdict={}", self.verdict.word());
         if self.no_progress {
             o.push_str(" no_progress=1");
@@ -191,7 +209,10 @@ impl JobRow {
     /// The person's sentence for the verdict.
     #[must_use]
     pub fn said(&self) -> String {
-        let said = self.local_said();
+        let mut said = self.local_said();
+        if self.verdict.is_suspect() {
+            let _ = write!(said, "; observation limits: {PROGRESS_LIMIT_WORDS}");
+        }
         match self
             .working_descendant
             .filter(|_| matches!(self.verdict, Verdict::Quiet | Verdict::Stuck))
@@ -484,3 +505,7 @@ impl Findings {
         out
     }
 }
+
+#[cfg(test)]
+#[path = "wire_tests.rs"]
+mod tests;

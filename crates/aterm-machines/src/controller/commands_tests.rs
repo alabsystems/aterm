@@ -1704,7 +1704,7 @@ fn rest(status: u16, body: &str) -> Result<crate::port::GithubResponse, String> 
 }
 
 fn with_token(sys: &Fake) {
-    super::super::github_keys_tests::holds_token(sys, &paths(), MACHINE_TOKEN);
+    super::super::github_keys_tests::holds_token(sys, MACHINE_TOKEN);
     sys.on_github_rest(
         crate::port::RestMethod::Get,
         "/user",
@@ -1898,8 +1898,7 @@ fn a_revoked_key_is_never_registered_again_and_a_plan_registers_nothing() {
 /// A controller of `hosts` whose `[github]` row sends the key calls over agh, inline, to
 /// `fake` on loopback (plan §17).
 fn over_agh(hosts: &[&Host], fake: &agh_fake::FakeGithub) -> Fake {
-    let (sys, _token) =
-        super::super::github_keys_tests::inline_on(controller(hosts, false), &paths(), fake);
+    let (sys, _token) = super::super::github_keys_tests::inline_on(controller(hosts, false), fake);
     names(
         &sys,
         hosts,
@@ -1924,7 +1923,7 @@ fn a_runs_hosts_share_one_agh_client_so_their_key_writes_are_paced() {
     let e = env(&sys);
     let inv = inventory_of(&sys);
     // `run`'s loop: every host's report through the one `KeyCalls` it opens.
-    let key_calls = super::super::github::KeyCalls::new(&sys, &paths());
+    let key_calls = super::super::github::KeyCalls::new(&sys);
     for (host, body) in [(&a, ALICE_OLD), (&b, ALICE_NEW)] {
         after_run_with(
             &e,
@@ -2580,60 +2579,64 @@ fn here_apply_plain_says_nothing_and_exits_with_why_it_did_not_finish() {
         independent.calls()
     );
 
-    let indexing = Fake::root();
-    indexing.born(std::process::id(), 123).running(&[]);
-    indexing.stat_of(
-        "/dev/console",
-        crate::port::Stat {
-            uid: 0,
-            gid: 0,
-            mode: 0o600,
-            dir: false,
-            symlink: false,
-            len: 0,
-        },
-    );
-    indexing
-        .on(
-            "/usr/bin/mdutil -s /System/Volumes/Data",
-            Ran::ok("Indexing enabled."),
-        )
-        .on(
-            "/usr/bin/mdutil -s /System/Volumes/Data",
-            Ran::ok("Indexing disabled."),
-        )
-        .on("/usr/bin/mdutil -i off /System/Volumes/Data", Ran::ok(""));
-    assert!(matches!(
-        here_report(
-            &indexing,
+    // Spotlight's scope is root work of this transaction: the console account's home folders
+    // join the excluded list. A list that did not take them fails only its own row, however
+    // the editor exited: the transaction still ends finished, with the refusal recorded so
+    // the step is not owed again and no receipt claiming the folders.
+    let scoped = |config| {
+        let sys = Fake::root();
+        sys.born(std::process::id(), 123).running(&[]);
+        sys.stat_of(
+            "/dev/console",
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.on("/usr/bin/dscl . -list /Users UniqueID", Ran::ok("alice 501\n"))
+            .on("/usr/bin/dscl . -read /Groups/admin GroupMembership", Ran::ok("GroupMembership: alice\n"))
+            .on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell",
+                Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+        crate::init_spotlight::tests::home(&sys);
+        crate::init_spotlight::tests::spotlight(&sys, Some(&[]), config);
+        let report = here_report(
+            &sys,
             Mode::Apply,
             HereBaseline::BuiltIn(crate::init_clt::RootPlan::StepsOnly),
             Plain::default(),
             HereOutput::Plain,
-        ),
-        Ok(None)
-    ));
+        );
+        (sys, report)
+    };
+    let excluded =
+        |sys: &Fake| crate::init_spotlight::tests::config_list(sys).map(|list| list.len());
+    let (sys, report) = scoped(crate::init_spotlight::tests::Config::Writes);
+    assert!(matches!(report, Ok(None)), "{:?}", sys.calls());
+    assert_eq!(excluded(&sys), Some(3));
     assert!(
-        indexing
-            .calls()
+        sys.calls()
             .iter()
-            .any(|call| call == "/usr/bin/mdutil -i off /System/Volumes/Data")
+            .any(|call| call == "/usr/bin/killall -9 mds")
     );
-    indexing.on(
-        "/usr/bin/mdutil -s /System/Volumes/Data",
-        Ran::ok("Indexing enabled."),
-    );
-    assert_eq!(crate::init_spotlight::indexing(&indexing), Ok(false));
+    assert!(sys.written(crate::init_spotlight::SCOPE_RECEIPT).is_some());
+    assert!(sys.written(crate::init_spotlight::SCOPE_REFUSED).is_none());
+    let (sys, report) = scoped(crate::init_spotlight::tests::Config::Deaf);
     assert!(
-        here_report(
-            &indexing,
-            Mode::Apply,
-            HereBaseline::BuiltIn(crate::init_clt::RootPlan::StepsOnly),
-            Plain::default(),
-            HereOutput::Plain,
-        )
-        .is_err(),
-        "a successful mdutil exit cannot hide indexing that stayed enabled"
+        matches!(report, Ok(None)),
+        "a Spotlight scope that failed does not leave the root transaction unfinished: {:?}",
+        sys.calls()
+    );
+    assert_eq!(excluded(&sys), Some(0));
+    assert!(sys.written(crate::init_spotlight::SCOPE_RECEIPT).is_none());
+    assert!(sys.written(crate::init_spotlight::SCOPE_REFUSED).is_some());
+    assert!(
+        !sys.calls()
+            .iter()
+            .any(|call| call == "/usr/bin/killall -9 mds")
     );
 
     // Explicit naming authorization is a different, fixed root scope. No tools,

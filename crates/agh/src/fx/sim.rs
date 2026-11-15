@@ -2,9 +2,10 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The simulated world behind `Fx::simulated`: a test's time, moved only by sleeps, and its
-//! scripted children with the log of every child spec the doors were handed.
+//! The simulated world behind `Fx::simulated`: a test's time, moved only by sleeps, and the
+//! log of every child spec the git door was handed.
 
+#[cfg(unix)]
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -19,7 +20,7 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use super::child::ChildOut;
-use super::child::{ChildSpec, ScriptedChild};
+use super::child::ChildSpec;
 
 #[cfg(unix)]
 type AfterGit = Box<dyn FnOnce(&mut crate::error::Result<ChildOut>) + Send>;
@@ -47,12 +48,10 @@ pub(super) struct SimClock {
     simulated_time: Mutex<(Duration, Vec<Duration>)>,
     /// Every admitted HTTP retry diagnostic, in order.
     retry_notes: Mutex<Vec<String>>,
-    /// The children `Fx::child` answers from, in order.
-    scripted: Mutex<VecDeque<ScriptedChild>>,
     /// Installed scripted answers for `Fx::git`; `None` runs the real child.
     #[cfg(unix)]
     scripted_git: Mutex<Option<VecDeque<ChildOut>>>,
-    /// Every spec `Fx::child` or `Fx::git` accepted (one `child::check` passed), in call order.
+    /// Every spec `Fx::git` accepted (one `child::check` passed), in call order.
     run: Mutex<Vec<ChildSpec>>,
     #[cfg(unix)]
     git_hook: Mutex<Option<GitHook>>,
@@ -63,13 +62,12 @@ pub(super) struct SimClock {
 }
 
 impl SimClock {
-    /// Both clocks at their start, no scripted child, an empty log.
+    /// Both clocks at their start, an empty log.
     pub(super) const fn new(start_unix_secs: u64) -> SimClock {
         SimClock {
             start_unix_secs,
             simulated_time: Mutex::new((Duration::ZERO, Vec::new())),
             retry_notes: Mutex::new(Vec::new()),
-            scripted: Mutex::new(VecDeque::new()),
             #[cfg(unix)]
             scripted_git: Mutex::new(None),
             run: Mutex::new(Vec::new()),
@@ -130,22 +128,6 @@ impl SimClock {
             .clone()
     }
 
-    /// Queue `children` after any already scripted.
-    pub(super) fn script(&self, children: Vec<ScriptedChild>) {
-        self.scripted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(children);
-    }
-
-    /// The next scripted child, if any.
-    pub(super) fn next_child(&self) -> Option<ScriptedChild> {
-        self.scripted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front()
-    }
-
     #[cfg(unix)]
     pub(super) fn script_git(&self, answers: Vec<ChildOut>) {
         let mut scripted = self
@@ -177,6 +159,7 @@ impl SimClock {
     }
 
     /// Log the accepted spec and return its index under the same lock.
+    #[cfg(any(unix, test))]
     pub(super) fn log(&self, spec: &ChildSpec) -> usize {
         let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
         let ordinal = run.len();

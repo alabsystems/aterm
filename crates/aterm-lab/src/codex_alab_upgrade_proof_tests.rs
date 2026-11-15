@@ -171,7 +171,7 @@ fn auth_path_witness_matches_exact_isolated_path() {
 
 #[test]
 fn carried_request_reads_full_user_text_past_excerpt_cap() {
-    let full = aterm_agent::supervise::config::CONTINUE_TEXT;
+    let full = alab_policy::config::CONTINUE_TEXT;
     assert!(full.len() > 300);
     let tail = &full[full.len() - 300..];
     let owed = J::obj([("text", J::s(full))]);
@@ -191,7 +191,7 @@ fn carried_request_reads_full_user_text_past_excerpt_cap() {
 /// second request. NEGATIVE CONTROL: delivered once at its deadline, it passes.
 #[test]
 fn the_carried_continuation_is_timed_and_counted_by_its_own_request() {
-    let text = aterm_agent::supervise::config::CONTINUE_TEXT;
+    let text = alab_policy::config::CONTINUE_TEXT;
     let owed = J::obj([("text", J::s(text))]);
     let row = |tag: &str, t: i64, tool: &str| {
         J::obj([

@@ -22,7 +22,20 @@ use std::sync::{
 #[path = "codex_source_owned_launch.rs"]
 mod owned_launch;
 #[cfg(unix)]
-pub use owned_launch::{OwnedLaunchReservation, OwnedSpawnFailure, OwnedWorker};
+pub use owned_launch::{
+    BackendConfiguration, BackendStart, OwnedBackend, OwnedLaunchReservation, OwnedSpawnFailure,
+    OwnedWorker,
+};
+
+#[cfg(unix)]
+#[path = "codex_source_frontend_control.rs"]
+mod frontend_control;
+#[cfg(unix)]
+pub use frontend_control::{ControllerWithdrawal, FrontendController, FrontendMember};
+#[cfg(unix)]
+pub use owned_launch::{
+    OwnedService, OwnedServiceFailure, PreparedServiceAttachment, ServiceFrontend,
+};
 #[cfg(unix)]
 #[path = "codex_source_owned_environment.rs"]
 mod owned_environment;
@@ -354,13 +367,8 @@ impl LaunchReservation {
     }
 
     /// Build the actual launch from the admitted starter, bypassing the mutable
-    /// managed twin and retaining the ordinary sign-in recheck.
-    pub fn arm(
-        &self,
-        admitted: worker::Admitted,
-        cli: &worker::WorkerCli,
-        home: Option<&std::path::Path>,
-    ) -> Result<worker::Admitted, Error> {
+    /// managed twin.
+    pub fn arm(&self, admitted: worker::Admitted) -> Result<worker::Admitted, Error> {
         let check = || {
             let state = self.state.upgrade().ok_or(Error::Stale)?;
             let state = lock(&state)?;
@@ -380,7 +388,7 @@ impl LaunchReservation {
         };
         check()?;
         let (admitted, ()) = admitted
-            .prepare(cli, home, |mut starter| {
+            .prepare(|mut starter| {
                 starter.exe = self.executable.clone();
                 starter.env.retain(|(name, _)| name != LAUNCH_ENV);
                 starter.env.push((LAUNCH_ENV.into(), self.token.clone()));
@@ -684,6 +692,9 @@ struct State {
     plain_retiring: BTreeMap<String, ()>,
     launches: BTreeMap<String, Launch>,
     actors: BTreeMap<String, Actor>,
+    // Control connections neither read credentials nor join the Source census.
+    #[cfg(unix)]
+    controllers: BTreeMap<String, frontend_control::Issued>,
     uses: BTreeMap<String, reservation::Uses>,
     preloads: BTreeMap<String, Arc<preload_custody::Pending>>,
     preload_sequences: BTreeMap<String, preload_sequence::Ledger>,
@@ -1332,7 +1343,7 @@ impl Registry {
         if scope.cancelled() {
             return Err(Error::Denied);
         }
-        if !sid.starts_with("s-") || sid.len() > 64 {
+        if !aterm_types::control_verbs::is_minted_sid(sid) {
             return Err(Error::Denied);
         }
         // Resolve only the existing managed-twin grammar. The kernel observes
@@ -1520,38 +1531,52 @@ impl Registry {
             work,
         };
         permit.current().map_err(|_| "startup permission changed")?;
-        owner::with_current_published_grant(env, permit.binding(), &peer.caller, |grant| {
-            if grant.canonical_auth() != permit.cell.choice.auth_file() {
-                return Err("startup canonical source changed".into());
-            }
-            // Verify the actual kernel launch pointer, not a raw claimed path.
-            let args = atpkg::caller_shell::process_args(peer.caller.pid)
-                .ok_or("startup process unreadable")?;
-            let home = args.env_var("HOME").map(std::path::Path::new);
-            let mut selected = worker::Starter {
-                exe: std::path::PathBuf::new(),
-                env: Vec::new(),
-                args: Ok(Vec::new()),
-                unset: Vec::new(),
-            };
-            for name in ["CODEX_AUTH_PATH", "CODEX_HOME"] {
-                if let Some(value) = args.env_var(name) {
-                    selected.env.push((name.into(), value.into()));
+        // Closed debug phases locate a failed constructor without logging a
+        // grant, path, credential, or the private error returned by an owner.
+        let phase = std::cell::Cell::new("published-grant");
+        let result =
+            owner::with_current_published_grant(env, permit.binding(), &peer.caller, |grant| {
+                phase.set("launch-selection");
+                if grant.canonical_auth() != permit.cell.choice.auth_file() {
+                    return Err("startup canonical source changed".into());
                 }
-            }
-            let cwd = aterm_sysprobe::process_cwd(peer.caller.pid)
-                .ok_or("startup working directory unreadable")?;
-            if worker::declared_codex_auth_file(&selected, home, &cwd).as_deref()
-                != Some(permit.cell.choice.auth_file())
-            {
-                return Err("startup launch source changed".into());
-            }
-            permit.current().map_err(|_| "startup permission changed")?;
-            let value = use_initial(&grant, &permit)?;
-            permit.current().map_err(|_| "startup permission changed")?;
-            Ok(value)
-        })
-        .and_then(|value| {
+                // Verify the actual kernel launch pointer, not a raw claimed path.
+                let args = atpkg::caller_shell::process_args(peer.caller.pid)
+                    .ok_or("startup process unreadable")?;
+                let home = args.env_var("HOME").map(std::path::Path::new);
+                let mut selected = worker::Starter {
+                    exe: std::path::PathBuf::new(),
+                    env: Vec::new(),
+                    args: Ok(Vec::new()),
+                    unset: Vec::new(),
+                };
+                for name in ["CODEX_AUTH_PATH", "CODEX_HOME"] {
+                    if let Some(value) = args.env_var(name) {
+                        selected.env.push((name.into(), value.into()));
+                    }
+                }
+                let cwd = aterm_sysprobe::process_cwd(peer.caller.pid)
+                    .ok_or("startup working directory unreadable")?;
+                if worker::declared_codex_auth_file(&selected, home, &cwd).as_deref()
+                    != Some(permit.cell.choice.auth_file())
+                {
+                    return Err("startup launch source changed".into());
+                }
+                permit.current().map_err(|_| "startup permission changed")?;
+                phase.set("slot-initialization");
+                let value = use_initial(&grant, &permit)?;
+                phase.set("post-installation");
+                permit.current().map_err(|_| "startup permission changed")?;
+                Ok(value)
+            });
+        #[cfg(debug_assertions)]
+        if result.is_err() {
+            eprintln!(
+                "Source qualification native: initial source failed phase={}",
+                phase.get()
+            );
+        }
+        result.and_then(|value| {
             permit
                 .current()
                 .map_err(|_| "startup permission changed".to_string())?;
@@ -1966,6 +1991,10 @@ impl Registry {
         }
         drop(connections);
         if let Ok(mut state) = lock(&self.state) {
+            #[cfg(unix)]
+            state
+                .controllers
+                .retain(|_, issued| issued.connection.id != connection);
             for member in state
                 .members
                 .values_mut()
@@ -1982,14 +2011,23 @@ impl Registry {
         let Ok(state) = lock(&self.state) else {
             return true;
         };
-        state.members.values().any(|member| {
-            member.connection.id == connection && member.connection.alive.load(Ordering::Acquire)
-        }) || state.actors.values().any(|actor| {
-            actor.issued.values().any(|issued| {
-                issued.connection.id == connection
-                    && issued.connection.alive.load(Ordering::Acquire)
+        #[cfg(unix)]
+        let control_live = state.controllers.values().any(|issued| {
+            !issued.closed && issued.connection.id == connection && issued.connection.is_live()
+        });
+        #[cfg(not(unix))]
+        let control_live = false;
+        control_live
+            || state.members.values().any(|member| {
+                member.connection.id == connection
+                    && member.connection.alive.load(Ordering::Acquire)
             })
-        })
+            || state.actors.values().any(|actor| {
+                actor.issued.values().any(|issued| {
+                    issued.connection.id == connection
+                        && issued.connection.alive.load(Ordering::Acquire)
+                })
+            })
     }
 
     /// Off-main drain step after closing the App admission epoch, before waiting
@@ -2019,12 +2057,17 @@ impl Registry {
             let Ok(state) = lock(&self.state) else { return };
             let mut owners = reservation::target::owners(&state);
             owners.extend(reservation::target::resources::owners(&state));
+            #[cfg(unix)]
+            let controllers = state.controllers.values().map(|item| item.process.clone());
+            #[cfg(not(unix))]
+            let controllers = std::iter::empty::<Process>();
             let processes = state
                 .members
                 .values()
                 .map(|item| item.process.clone())
                 .chain(state.unrelated.values().map(|item| item.process.clone()))
                 .chain(state.actors.values().map(|item| item.process.clone()))
+                .chain(controllers)
                 .chain(state.launches.values().flat_map(|item| {
                     item.process.clone().into_iter().chain(
                         item.native_restart
@@ -2107,6 +2150,10 @@ impl Registry {
             return;
         };
         let mut target_constructors = Vec::new();
+        #[cfg(unix)]
+        state
+            .controllers
+            .retain(|_, issued| !is_gone(&issued.process) && issued.connection.is_live());
         let mut target_resources = Vec::new();
         for (caller, process) in &target_owners {
             if let Ok(retired) =

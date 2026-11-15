@@ -1,15 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Initial exec environment DATA from an observed process, never SDK admission.
+//! Explicit complete launch environment DATA, never SDK admission.
 //! Native owned children must not silently inherit the GUI's environment.
 use super::*;
 use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::ffi::OsStrExt;
 
-/// A private copy of one observed process's initial exec environment. Debug
+/// A private copy of explicitly requested launch settings for an observed process. Debug
 /// redacts its values and no serialization is implemented. It is not a process lease or a
 /// credential/provider grant; the child still needs its independent constructor.
+#[derive(Clone)]
 pub struct OwnedLaunchEnvironment {
     process: Process,
     identity: aterm_uds::process::Identity,
@@ -21,23 +22,44 @@ impl std::fmt::Debug for OwnedLaunchEnvironment {
     }
 }
 impl OwnedLaunchEnvironment {
-    /// Copy kernel-observed initial environment bytes, bracketed by birth,
-    /// mapped image and exec-generation observations where the OS supplies one.
-    /// Linux has no exec generation: a same-image exec between observations is
-    /// not excluded. This observation is DATA, not physical custody or authority.
+    /// Compare captured startup settings for selecting an existing backend.
+    /// The native constructor's replaced nonce is excluded. This compares DATA
+    /// only; it is neither a current-process check nor SDK/attachment authority.
+    pub fn same_settings(&self, other: &Self) -> bool {
+        fn settings(
+            values: &BTreeMap<OsString, OsString>,
+        ) -> impl Iterator<Item = (&OsString, &OsString)> {
+            values
+                .iter()
+                .filter(|(key, _)| key.as_os_str() != std::ffi::OsStr::new(LAUNCH_ENV))
+        }
+        settings(&self.values).eq(settings(&other.values))
+    }
+    /// Retain explicitly selected startup DATA for this actual process. The
+    /// caller must obtain the complete snapshot on its authenticated control
+    /// channel. Neither these bytes nor process metadata grant SDK/provider use.
     ///
     /// # Errors
-    /// The process changed, its environment is unreadable/withheld/empty, or has
-    /// ambiguous/malformed entries. An empty answer cannot prove an empty source.
-    pub fn capture(process: &Process) -> Result<Self, Error> {
+    /// Invalid/duplicate settings or a changed/unobservable process.
+    pub fn from_snapshot(
+        process: &Process,
+        settings: Vec<(OsString, OsString)>,
+    ) -> Result<Self, Error> {
         let pid = i32::try_from(process.pid).map_err(|_| Error::Unavailable)?;
         let identity = aterm_uds::process::read_identity(pid).ok_or(Error::Unavailable)?;
         if Process::observe(process.pid).as_ref() != Some(process) {
             return Err(Error::Stale);
         }
-        let values = read(process.pid)?;
-        if values.is_empty() {
-            return Err(Error::Unavailable);
+        let mut values = BTreeMap::new();
+        for (key, value) in settings {
+            if key.is_empty()
+                || key.as_bytes().contains(&b'=')
+                || key.as_bytes().contains(&0)
+                || value.as_bytes().contains(&0)
+                || values.insert(key, value).is_some()
+            {
+                return Err(Error::Denied);
+            }
         }
         let result = Self {
             process: process.clone(),
@@ -124,22 +146,61 @@ pub(super) struct AdmittedEnvironment {
     source: OwnedLaunchEnvironment,
     selected: BTreeMap<OsString, OsString>,
 }
+
+/// The only executable command produced by complete environment installation.
+/// Its command is private so no caller can edit environment settings after this
+/// boundary. Constructing it is not SDK readiness or a provider grant.
+pub(super) struct InstalledCommand {
+    command: aterm_uds::spawnfd::Command,
+}
+
+/// Actual native spawn custody from the sealed command, not an arbitrary child
+/// or a caller-reported process. Only InstalledCommand can construct this value.
+pub(super) struct InstalledSpawn {
+    spawned: aterm_uds::spawnfd::Spawned,
+}
+
+impl InstalledCommand {
+    pub(super) fn spawn(
+        mut self,
+        attempt: aterm_uds::spawnfd::BirthAttempt,
+    ) -> Result<InstalledSpawn, aterm_uds::spawnfd::SpawnFailure> {
+        self.command
+            .spawn_cohort(attempt)
+            .map(|spawned| InstalledSpawn { spawned })
+    }
+}
+
+impl InstalledSpawn {
+    pub(super) fn into_spawned(self) -> aterm_uds::spawnfd::Spawned {
+        self.spawned
+    }
+}
+
 impl AdmittedEnvironment {
-    pub(super) fn check_child(
+    pub(super) fn command(
         &self,
-        process: &Process,
-        token: &str,
+        starter: &worker::Starter,
         sid: &str,
-    ) -> Result<(), Error> {
-        let observed = OwnedLaunchEnvironment::capture(process)?;
-        let mut expected = self.selected.clone();
-        expected.insert(LAUNCH_ENV.into(), token.into());
-        expected.insert("ATERM_SESSION_ID".into(), sid.into());
-        expected.insert("ATERM_PARENT_SESSION_ID".into(), sid.into());
-        if observed.values != expected {
-            return Err(Error::Denied);
+        cwd: &std::path::Path,
+        input: aterm_uds::spawnfd::Stdio,
+        required_tether: bool,
+    ) -> Result<InstalledCommand, Error> {
+        let args = starter.args.as_ref().map_err(|_| Error::Unsupported)?;
+        let mut command = aterm_uds::spawnfd::command(&starter.exe);
+        self.install(&mut command, starter)?;
+        command
+            .args(args)
+            .current_dir(cwd)
+            .stdin(input)
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::piped())
+            .env("ATERM_SESSION_ID", sid)
+            .env("ATERM_PARENT_SESSION_ID", sid);
+        if required_tether {
+            command.require_tether();
         }
-        Ok(())
+        Ok(InstalledCommand { command })
     }
     pub(super) fn check(&self, starter: &worker::Starter) -> Result<(), Error> {
         self.source.current()?;
@@ -153,7 +214,7 @@ impl AdmittedEnvironment {
         }
         Ok(())
     }
-    pub(super) fn install(
+    fn install(
         &self,
         command: &mut aterm_uds::spawnfd::Command,
         starter: &worker::Starter,
@@ -176,52 +237,6 @@ fn declared(starter: &worker::Starter) -> Result<BTreeMap<String, String>, Error
         }
     }
     Ok(values)
-}
-
-fn entries<'a>(
-    words: impl Iterator<Item = &'a [u8]>,
-) -> Result<BTreeMap<OsString, OsString>, Error> {
-    let mut values = BTreeMap::new();
-    for word in words {
-        let split = word
-            .iter()
-            .position(|byte| *byte == b'=')
-            .ok_or(Error::Unavailable)?;
-        if split == 0 || word.contains(&0) {
-            return Err(Error::Unavailable);
-        }
-        let key = OsString::from_vec(word[..split].to_vec());
-        let value = OsString::from_vec(word[split + 1..].to_vec());
-        if values.insert(key, value).is_some() {
-            return Err(Error::Unavailable);
-        }
-    }
-    Ok(values)
-}
-
-#[cfg(target_os = "macos")]
-fn read(pid: u32) -> Result<BTreeMap<OsString, OsString>, Error> {
-    let bytes = aterm_uds::procargs::read(pid).ok_or(Error::Unavailable)?;
-    let parsed = aterm_uds::procargs::parse(&bytes)
-        .filter(|parsed| parsed.whole())
-        .ok_or(Error::Unavailable)?;
-    entries(parsed.env())
-}
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn read(pid: u32) -> Result<BTreeMap<OsString, OsString>, Error> {
-    let bytes = aterm_uds::process::read_environ(pid).ok_or(Error::Unavailable)?;
-    if !bytes.is_empty() && bytes.last() != Some(&0) {
-        return Err(Error::Unavailable);
-    }
-    entries(
-        bytes
-            .split(|byte| *byte == 0)
-            .filter(|word| !word.is_empty()),
-    )
-}
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
-fn read(_pid: u32) -> Result<BTreeMap<OsString, OsString>, Error> {
-    Err(Error::Unsupported)
 }
 
 #[cfg(test)]

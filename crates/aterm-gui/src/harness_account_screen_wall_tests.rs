@@ -20,7 +20,7 @@ const LAN_SCREEN: &str = "\
     Continuing automatically at Nov 6 at 12am · esc to cancel · /usage-credits to continue now
   ⏵⏵ bypass permissions on (shift+tab to cycle)";
 
-fn publication(snap: &Snapshot, kind: aterm_phase::WallKind) -> AgentPublication {
+fn publication(snap: &Snapshot, kind: alab_policy::vocab::WallKind) -> AgentPublication {
     AgentPublication {
         program: Some("claude".into()),
         reader: Some(Program::Claude),
@@ -54,7 +54,7 @@ fn worker(a: &Arc<Accts>, sid: &str, shown: &Arc<Mutex<AgentPublication>>) -> Wo
 
 #[test]
 fn a_screen_only_wall_rotates_and_records_the_current_account() {
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let rows = LAN_SCREEN.lines().map(str::to_owned).collect::<Vec<_>>();
     let generic = aterm_phase::read(Some("claude"), &rows, Some(0))
         .wall
@@ -185,7 +185,7 @@ fn a_screen_wall_read_requires_the_current_complete_frame_and_process() {
 fn screen_wall_identity_and_non_usage_errors_cannot_exhaust_an_account() {
     let a = Accts::new();
     let snap = a.spawn("s-screen-control", ACCT_TALK_A, "main");
-    let base = publication(&snap, aterm_phase::WallKind::UsageWeekly);
+    let base = publication(&snap, alab_policy::vocab::WallKind::UsageWeekly);
     for word in [
         "idle",
         "busy",
@@ -219,7 +219,7 @@ fn screen_wall_identity_and_non_usage_errors_cannot_exhaust_an_account() {
     unbound.session = None;
     assert_eq!(
         screen_account_wall_of(
-            &publication(&snap, aterm_phase::WallKind::UsageWeekly),
+            &publication(&snap, alab_policy::vocab::WallKind::UsageWeekly),
             &unbound
         ),
         None
@@ -233,7 +233,7 @@ fn a_screen_wall_keeps_a_clear_and_a_transcripts_process_boundary() {
     let snap = a.spawn(sid, ACCT_TALK_A, "main");
     let shown = Arc::new(Mutex::new(publication(
         &snap,
-        aterm_phase::WallKind::UsageWeekly,
+        alab_policy::vocab::WallKind::UsageWeekly,
     )));
     let idle = worker(&a, sid, &shown);
     idle.limited(true);
@@ -258,7 +258,7 @@ fn a_screen_wall_keeps_a_clear_and_a_transcripts_process_boundary() {
     );
     assert_eq!(
         moves(&idle.account(AccountPoint::Wall {
-            kind: aterm_phase::WallKind::UsageWeekly
+            kind: alab_policy::vocab::WallKind::UsageWeekly
         })),
         None
     );
@@ -268,7 +268,7 @@ fn a_screen_wall_keeps_a_clear_and_a_transcripts_process_boundary() {
     a.wall(ACCT_TALK_A, ACCT_NOW - 500);
     let shown = Arc::new(Mutex::new(publication(
         &snap,
-        aterm_phase::WallKind::UsageWeekly,
+        alab_policy::vocab::WallKind::UsageWeekly,
     )));
     let idle = worker(&a, sid, &shown);
     idle.limited(true);
@@ -278,7 +278,7 @@ fn a_screen_wall_keeps_a_clear_and_a_transcripts_process_boundary() {
     );
     assert_eq!(
         moves(&idle.account(AccountPoint::Wall {
-            kind: aterm_phase::WallKind::UsageWeekly
+            kind: alab_policy::vocab::WallKind::UsageWeekly
         })),
         None
     );
@@ -289,7 +289,7 @@ fn a_screen_wall_still_reports_a_move_that_landed_after_its_wait() {
     let a = Accts::new();
     let sid = "s-screen-untold";
     let snap = a.spawn(sid, ACCT_TALK_A, "main");
-    let kind = aterm_phase::WallKind::UsageWeekly;
+    let kind = alab_policy::vocab::WallKind::UsageWeekly;
     let point = AccountPoint::Wall { kind };
     let shown = Arc::new(Mutex::new(publication(&snap, kind)));
     let idle = worker(&a, sid, &shown);

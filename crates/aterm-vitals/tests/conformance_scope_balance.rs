@@ -36,6 +36,8 @@ struct Truth {
     e: i64,
     /// Their launcher's coalition.
     l: i64,
+    /// Independently observed foreign own CPU under that launcher.
+    f: i64,
     /// The user's other coalitions.
     o: i64,
     /// The services' coalitions.
@@ -51,6 +53,7 @@ const T1032: Truth = Truth {
     d: 0,
     e: 0,
     l: 0,
+    f: 0,
     o: 730,
     s: 2170,
 };
@@ -70,6 +73,7 @@ fn cases() -> Vec<(&'static str, Scene, u64, Truth)> {
     let shared = Truth {
         g: 4200,
         l: 900,
+        f: 100,
         ..T1032
     };
     let mut shared_behind = shared_launcher_1032();
@@ -80,6 +84,7 @@ fn cases() -> Vec<(&'static str, Scene, u64, Truth)> {
     let behind_shared = Truth {
         g: 3900,
         l: 600,
+        f: 100,
         ..T1032
     };
     vec![
@@ -129,6 +134,7 @@ fn cases() -> Vec<(&'static str, Scene, u64, Truth)> {
                 g: 3900,
                 d: 500,
                 l: 600,
+                f: 100,
                 ..T1032
             },
         ),
@@ -248,6 +254,7 @@ fn project(m: &Model, truth: Truth, split: &CoalSplit, tab: u64) -> [S; 3] {
         ("d", truth.d),
         ("e", truth.e),
         ("l", truth.l),
+        ("f", truth.f),
         ("o", truth.o),
         ("s", truth.s),
         ("fresh", 0),
@@ -342,14 +349,22 @@ fn the_tab_over_the_sweeps_window_is_caught_by_matched_windows_only() {
 }
 
 /// The shared launcher charged for both tabs' members as well as the tabs:
-/// 0.80 cores counted twice, the parts past the whole.
+/// 0.80 cores counted twice in the owner groups, exposed by a negative signed residual.
 #[test]
 fn charging_the_shared_launcher_is_caught_by_delegated_counted_once() {
+    let faulty = split(&shared_launcher_1032(), Some(Fault::ChargeSharedLauncher));
+    let parts = faulty.parts(Some(1));
+    assert_eq!((parts.others, parts.unaccounted), (1630, -800));
+    assert_eq!(
+        parts.tab + parts.aterm_rest + parts.others + parts.services + parts.unaccounted,
+        faulty.global_mc,
+        "the signed residual conserves the shown counters even when ownership repeats work"
+    );
     caught(
         Fault::ChargeSharedLauncher,
         "two tabs' delegated jobs under one launcher, tab 1",
         2,
-        &["PartsSumToWhole", "DelegatedCountedOnce"],
+        &["DelegatedCountedOnce"],
     );
 }
 

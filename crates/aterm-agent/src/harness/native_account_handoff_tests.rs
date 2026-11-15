@@ -21,6 +21,7 @@ fn intent(login: &str, generation: &str) -> ExecutionIntent {
         login: Some(login.into()),
         owner: Some("account".into()),
         generation: generation.repeat(32),
+        purpose: crate::harness::accounts_pool::Purpose::Select,
     }
 }
 

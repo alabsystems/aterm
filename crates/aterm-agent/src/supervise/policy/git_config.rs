@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use aterm_json::Value;
 use atpkg::caller_shell::ProcArgs;
 
-use crate::supervise::classify::{SUBSTITUTION, command_words, program, runs};
+use alab_policy::classify::{SUBSTITUTION, command_words, program, runs};
 
 /// Where a line's git reads run, and what they may do beyond reading.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -170,7 +170,7 @@ pub(crate) fn git_reads(
             out.grep_index = true;
         }
         let contacts_remote = sub == "ls-remote"
-            || (sub == "remote" && crate::supervise::classify::git_remote_show_contacts(args));
+            || (sub == "remote" && alab_policy::classify::git_remote_show_contacts(args));
         if contacts_remote && out.remote.is_none() {
             out.remote = Some(format!(
                 "git {sub} contacts a remote (credential helpers, ssh and the remote's \
@@ -321,6 +321,10 @@ impl std::fmt::Debug for WorkerEnv {
 
 fn withheld_from_probe(key: &str) -> bool {
     key == "GIT_CONFIG" || key.starts_with("GIT_TRACE")
+}
+
+fn loader_control(key: &str) -> bool {
+    key.starts_with("LD_") || key.starts_with("DYLD_")
 }
 
 impl WorkerEnv {
@@ -507,6 +511,17 @@ impl WorkerEnv {
         dir: &Path,
         worker_writes: &dyn Fn(&Path) -> bool,
     ) -> Result<GitView, String> {
+        // Loader controls act before Git reads its configuration, including Boolean controls
+        // whose empty value still enables them. Stripping them would inspect another environment.
+        if let Some(key) = self.process.env.iter().find_map(|kv| {
+            let (key, _) = kv.split_once('=')?;
+            loader_control(key).then_some(key)
+        }) {
+            return Err(format!(
+                "a git read whose worker sets `{key}` (a dynamic-loader control: this check \
+                 cannot safely start its configuration probe in that environment)"
+            ));
+        }
         // A `/`-rooted directory names no drive on Windows: the Bash tool's
         // shell there (Git Bash) reads `/c/x` as `C:\x` and its `/tmp` as a
         // folder of its own, where this process would read `\c\x` and `\tmp`
@@ -631,7 +646,8 @@ pub(crate) fn git_relevant(key: &str) -> bool {
     matches!(
         key,
         "PATH" | "HOME" | "XDG_CONFIG_HOME" | "DEVELOPER_DIR" | "SDKROOT"
-    ) || (key.starts_with("GIT_") && !matches!(key, "GIT_PAGER" | "GIT_EDITOR"))
+    ) || loader_control(key)
+        || (key.starts_with("GIT_") && !matches!(key, "GIT_PAGER" | "GIT_EDITOR"))
 }
 
 struct Probe<'a> {

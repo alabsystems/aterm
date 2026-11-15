@@ -16,10 +16,10 @@ use super::upgrade::{self, Dialect, SessionFile, Version};
 use super::upgrade_drive::state_dir;
 use super::upgrade_drive::{
     Client, HUNG_EXIT_AFTER_S, Hand, Job, Kernel, Live, Opts, Records, Report, SAME_PROGRAM,
-    Screen, SessionRosterCache, St, TAIL_BYTES, Targets, Terminated, Typed, WhereWritten, alive,
-    composer_clear, composer_empty, connect, continuation_composer_empty, conversation_live,
-    conversation_typed_by, cwd_of, earlier_tabs, exe_of, finished_where_written, first_word,
-    foreground_shell, held, home_carried, host_roster, ids, is_our_ancestor, kept_move,
+    Screen, SessionRosterCache, St, TAIL_BYTES, Targets, TerminalRead, Terminated, Typed,
+    WhereWritten, alive, composer_clear, composer_empty, connect, continuation_composer_empty,
+    conversation_live, conversation_typed_by, cwd_of, earlier_tabs, exe_of, finished_where_written,
+    first_word, foreground_shell, held, home_carried, host_roster, ids, is_our_ancestor, kept_move,
     kernel_start, ledger, left_to_person, live_background, load_record, model_and_mark,
     native_root, note_stuck, now_s, owned_by_aterm, process_in_tab, read_upgrade_dir, restore,
     roster, said, save, save_checked, screen, since, squash, sweep_lock, table, tail_to_end,
@@ -58,7 +58,9 @@ pub(super) struct Plan {
     /// recorded when the line is typed ([`note_dropped`]).
     pub(super) tap_dropped: Option<String>,
     /// Why [`Self::line`] does not carry the token wrapper its judgment offered it
-    /// ([`token_route::judge`]; the tap went first): recorded when the line is typed
+    /// ([`token_route::judge`]): it did not fit once the tap went, or the account's selection
+    /// policy refused the move onto the token while the stored login's line keeps the replaced
+    /// process's credential ([`stored_in_place`]). Recorded when the line is typed
     /// ([`note_dropped`]).
     pub(super) token_dropped: Option<String>,
     /// The directory [`Self::line`] runs the agent in when it carries no `cd` of its own: the
@@ -216,6 +218,9 @@ impl TokenServe {
 pub(super) enum NoPlan {
     /// A fact this pass could not read (one word).
     Wait(&'static str),
+    /// The command's account admission refused ([`command_account`]): the wait its kind names
+    /// ([`super::accounts_pool::RefusalKind::word`]), with the reason in full.
+    Account(super::accounts_pool::Refusal),
     /// A launch that can never be carried onto this target.
     Refused {
         why: String,
@@ -256,8 +261,15 @@ pub(super) struct Launch<'a> {
     pub(super) homedir: Option<&'a str>,
     /// The login the line must carry ([`login_env`]).
     pub(super) login: Option<&'a str>,
-    /// How the process it replaces authenticated ([`Snapshot::route`]).
+    /// How the line authenticates: the process it replaces did so ([`Snapshot::route`]), but for
+    /// a move off its vault token ([`moved_route`]).
     pub(super) route: accounts::AuthRoute,
+    /// The credential the live process this line replaces runs on, read off that process
+    /// ([`Running`]); `None` where the line replaces no running process (a relaunch after its
+    /// agent exited). A plan whose line keeps it exactly captures a
+    /// [`super::accounts_pool::Purpose::SameLogin`] intent, any other a
+    /// [`super::accounts_pool::Purpose::Select`] one ([`purpose_of`]).
+    pub(super) running: Option<Running<'a>>,
     /// The authentication route was positively observed, rather than omitted by a legacy record.
     pub(super) auth_observed: bool,
     /// What the replaced agent's own exec environment recorded of its shell's, where it was
@@ -265,6 +277,17 @@ pub(super) struct Launch<'a> {
     pub(super) launch_env: Option<&'a accounts::LaunchEnv>,
     /// What the line does with its account's vault token ([`Serve`]).
     pub(super) serve: Serve,
+}
+
+/// The credential a live agent runs on, as its own environment names it ([`Launch::running`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Running<'a> {
+    /// Its Claude home ([`accounts::HOME_ENV`]).
+    pub(super) home: Option<&'a str>,
+    /// Its login ([`accounts::LOGIN_ENV`]).
+    pub(super) login: Option<&'a str>,
+    /// How it authenticated.
+    pub(super) route: accounts::AuthRoute,
 }
 
 /// What a relaunch line does with its account's vault token
@@ -492,8 +515,14 @@ fn plan_with_selection(
         // observed route before Resolve selects and captures its account intent.
         None
     } else {
-        let mut intent =
-            command_account(opts, &selected_launch).map_err(|_| NoPlan::Wait("account"))?;
+        let purpose = purpose_of(launch, &selected_launch);
+        let mut intent = match command_account(opts, &selected_launch, purpose) {
+            Ok(intent) => intent,
+            Err(refusal) if token_move_refused(launch, &selected, &refusal) => {
+                return stored_in_place(opts, launch, shell, t, native_upgrade, kernel, &refusal);
+            }
+            Err(refusal) => return Err(NoPlan::Account(refusal)),
+        };
         intent.bind_external_environment(&selected.env, unset.as_deref(), launch.launch_env);
         Some(intent)
     };
@@ -515,6 +544,54 @@ fn plan_with_selection(
             unset,
             account_intent,
         }),
+    })
+}
+
+/// Whether `refusal`, of the account admission of `selected`, the line planned for `launch`, is a
+/// selection policy's ([`super::accounts_pool::RefusalKind::policy`]: signed out, a usage limit,
+/// a pin) refusing only the move onto the vault token the one judgment offered it
+/// ([`Serve::Judge`]) while the line replaces a live process: a line on the stored login instead
+/// may keep the credential that process runs on, which no selection policy holds
+/// ([`stored_in_place`]). A move that must serve the token ([`Serve::Must`]) has no such line, and
+/// a line that replaces no process selects either way.
+fn token_move_refused(
+    launch: &Launch<'_>,
+    selected: &SelectedCommand,
+    refusal: &super::accounts_pool::Refusal,
+) -> bool {
+    refusal.kind.policy()
+        && selected.served.is_some()
+        && launch.serve == Serve::Judge
+        && launch.running.is_some()
+}
+
+/// The plan of `launch` on its stored login ([`Serve::Never`]), for a move onto the vault token
+/// whose selection policy refused it (`refusal`, [`token_move_refused`]): where that line keeps
+/// the replaced process's credential, its intent is the same login's and is admitted on
+/// integrity alone; otherwise it selects, and its own refusal stands. The plan records why the
+/// line dropped the token wrapper ([`Plan::token_dropped`]).
+fn stored_in_place(
+    opts: &Opts,
+    launch: &Launch<'_>,
+    shell: u32,
+    t: &[super::upgrade_drive::ProcRow],
+    native_upgrade: bool,
+    kernel: &dyn Kernel,
+    refusal: &super::accounts_pool::Refusal,
+) -> Result<Plan, NoPlan> {
+    let stored = Launch {
+        serve: Serve::Never,
+        ..*launch
+    };
+    let plan = plan_with_selection(opts, &stored, shell, t, None, native_upgrade, kernel)?;
+    Ok(Plan {
+        token_dropped: Some(format!(
+            "the token wrapper left this relaunch line: moving onto the vault token selects its \
+             account, which waits {} ({}); the line keeps the stored login the agent runs on",
+            refusal.kind.word(),
+            refusal.why
+        )),
+        ..plan
     })
 }
 
@@ -617,12 +694,7 @@ impl token_route::Ask for PlanAsk<'_> {
         }
         .with_settings(&settings)
         .with_profile_store(profile);
-        let roster = self
-            .opts
-            .account_roster
-            .as_deref()
-            .filter(|path| path.exists())
-            .and_then(|path| accounts::Roster::load_for(accounts::Cli::Claude, path).ok());
+        let roster = plan_roster(self.opts);
         token_route::account_of(
             &who,
             roster.as_ref(),
@@ -651,8 +723,16 @@ impl token_route::Ask for PlanAsk<'_> {
     }
 }
 
+/// Claude Code's roster a plan reads, where one is there and admits.
+fn plan_roster(opts: &Opts) -> Option<accounts::Roster> {
+    opts.account_roster
+        .as_deref()
+        .filter(|path| path.exists())
+        .and_then(|path| accounts::Roster::load_for(accounts::Cli::Claude, path).ok())
+}
+
 /// The token's standing for a plan, as admission reads it: this Mac's vault under the user's
-/// home and its table.
+/// home, its table and accounts state, and the roster.
 #[cfg(unix)]
 fn token_fact(
     opts: &Opts,
@@ -666,6 +746,7 @@ fn token_fact(
     token_route::standing_fact(
         &aterm_secrets::client::Paths::for_home(&opts.home),
         &store,
+        plan_roster(opts).as_ref(),
         entry,
         account,
         u64::try_from(seat.now).unwrap_or(0),
@@ -704,12 +785,43 @@ fn account_seat(opts: &Opts) -> Result<super::accounts_pool::Seat<'_>, &'static 
     })
 }
 
+/// What the account admission of `selected`, the line planned for `launch`, checks: integrity
+/// alone ([`super::accounts_pool::Purpose::SameLogin`]) where the line keeps exactly the credential
+/// the live process it replaces runs on (the same route, token entry included, the same home and
+/// login, under the same `HOME`), so it adds no runner and selects nothing; integrity and the
+/// selection policy ([`super::accounts_pool::Purpose::Select`]) where it replaces no live process
+/// or its route, home or login changes (a move onto or off the vault token, an account move).
+pub(super) fn purpose_of(
+    launch: &Launch<'_>,
+    selected: &Launch<'_>,
+) -> super::accounts_pool::Purpose {
+    fn set(word: Option<&str>) -> Option<&str> {
+        word.filter(|word| !word.is_empty())
+    }
+    match launch.running {
+        Some(running)
+            if running.route == selected.route
+                && set(running.home) == set(selected.home)
+                && set(running.login) == set(selected.login)
+                && launch.homedir == selected.homedir =>
+        {
+            super::accounts_pool::Purpose::SameLogin
+        }
+        Some(_) | None => super::accounts_pool::Purpose::Select,
+    }
+}
+
 fn command_account(
     opts: &Opts,
     launch: &Launch<'_>,
-) -> Result<super::accounts_pool::ExecutionIntent, String> {
+    purpose: super::accounts_pool::Purpose,
+) -> Result<super::accounts_pool::ExecutionIntent, super::accounts_pool::Refusal> {
+    use super::accounts_pool::{Refusal, RefusalKind};
     if !launch.auth_observed {
-        return Err("command authentication attribution is unknown".into());
+        return Err(Refusal::new(
+            RefusalKind::Unattributed,
+            "command authentication attribution is unknown",
+        ));
     }
     // A launch path carries the route: a token session's relaunch keeps a `Token` intent, and
     // admission checks its row's custody, claims and token (§5.2).
@@ -740,8 +852,8 @@ fn command_account(
                     *directory = Path::new(launch.cwd).join(&*directory);
                 }
             }
-            super::accounts_pool::admit_external_execution(
-                &account_seat(opts)?,
+            super::accounts_pool::external_admission(
+                &seat_of(opts)?,
                 accounts::Cli::Claude,
                 &directories,
             )?;
@@ -749,7 +861,7 @@ fn command_account(
         return Ok(super::accounts_pool::ExecutionIntent::external());
     }
     super::accounts_pool::capture_execution(
-        &account_seat(opts)?,
+        &seat_of(opts)?,
         accounts::Cli::Claude,
         &accounts::ProcessLogin {
             login: launch
@@ -759,21 +871,34 @@ fn command_account(
             default_home: true,
             route,
         },
+        purpose,
     )
+}
+
+/// [`account_seat`], refused as unread where the namespace cannot be named.
+fn seat_of(opts: &Opts) -> Result<super::accounts_pool::Seat<'_>, super::accounts_pool::Refusal> {
+    account_seat(opts).map_err(|why| {
+        super::accounts_pool::Refusal::new(super::accounts_pool::RefusalKind::Unread, why)
+    })
 }
 
 fn account_execution(
     opts: &Opts,
     intent: Option<&super::accounts_pool::ExecutionIntent>,
-) -> Result<Option<super::accounts_pool::ExecutionGuard>, String> {
-    let intent = intent.ok_or("saved command authentication attribution is unknown")?;
+) -> Result<Option<super::accounts_pool::ExecutionGuard>, super::accounts_pool::Refusal> {
+    let intent = intent.ok_or_else(|| {
+        super::accounts_pool::Refusal::new(
+            super::accounts_pool::RefusalKind::Unattributed,
+            "saved command authentication attribution is unknown",
+        )
+    })?;
     if matches!(
         intent,
         super::accounts_pool::ExecutionIntent::External { .. }
     ) {
         return Ok(None);
     }
-    super::accounts_pool::admit_execution(&account_seat(opts)?, accounts::Cli::Claude, intent)
+    super::accounts_pool::execution_admission(&seat_of(opts)?, accounts::Cli::Claude, intent)
         .map(Some)
 }
 
@@ -781,7 +906,8 @@ fn external_at_shell(
     opts: &Opts,
     intent: Option<&super::accounts_pool::ExecutionIntent>,
     shell: u32,
-) -> Result<Option<super::accounts_pool::ExecutionGuard>, String> {
+) -> Result<Option<super::accounts_pool::ExecutionGuard>, super::accounts_pool::Refusal> {
+    use super::accounts_pool::{Refusal, RefusalKind};
     let Some(intent) = intent else {
         return Ok(None);
     };
@@ -805,7 +931,12 @@ fn external_at_shell(
         {
             Vec::new()
         }
-        None => return Err("shell authentication environment is unavailable".into()),
+        None => {
+            return Err(Refusal::new(
+                RefusalKind::Unattributed,
+                "shell authentication environment is unavailable",
+            ));
+        }
     };
     external_from_env(opts, intent, &inherited, cwd_of(shell).as_deref())
 }
@@ -815,23 +946,31 @@ fn external_from_env(
     intent: &super::accounts_pool::ExecutionIntent,
     inherited: &[String],
     cwd: Option<&str>,
-) -> Result<Option<super::accounts_pool::ExecutionGuard>, String> {
+) -> Result<Option<super::accounts_pool::ExecutionGuard>, super::accounts_pool::Refusal> {
+    use super::accounts_pool::{Refusal, RefusalKind};
+    let unattributed = |why: &str| Refusal::new(RefusalKind::Unattributed, why);
     let env = intent
         .external_environment(inherited)
-        .ok_or("external authentication context is unavailable")?;
+        .ok_or_else(|| unattributed("external authentication context is unavailable"))?;
     let who = accounts::ProcessLogin::of_exec_env(&env)
-        .ok_or("shell authentication attribution is unavailable")?;
+        .ok_or_else(|| unattributed("shell authentication attribution is unavailable"))?;
     let value = |name: &str| {
         env.iter()
             .filter_map(|entry| entry.split_once('='))
             .find(|(key, _)| *key == name)
             .map(|(_, value)| value)
     };
-    let home = value(accounts::HOMEDIR_ENV).ok_or("shell home is unavailable")?;
+    let home =
+        value(accounts::HOMEDIR_ENV).ok_or_else(|| unattributed("shell home is unavailable"))?;
     let same_home = same_dir(Some(home), &opts.home.to_string_lossy());
-    // An external intent names no account, so it names no token entry.
+    // An external intent names no account, so it names no token entry. A shell's environment
+    // that reads another route than its agent's (the agent's came from an rc file or a typed
+    // `export`, which the shell's exec environment never carries) never changes: the route stays
+    // unattributed at that shell, never a change the next look clears.
     if !intent.matches_process(&who, same_home, None) {
-        return Err("external authentication route is no longer present".into());
+        return Err(unattributed(
+            "external authentication route is no longer present",
+        ));
     }
     match who.route {
         accounts::AuthRoute::Outside => return Ok(None),
@@ -848,22 +987,106 @@ fn external_from_env(
     }
     for directory in &mut directories {
         if directory.is_relative() {
-            *directory = Path::new(cwd.ok_or("shell directory is unavailable")?).join(&*directory);
+            *directory =
+                Path::new(cwd.ok_or_else(|| unattributed("shell directory is unavailable"))?)
+                    .join(&*directory);
         }
     }
-    super::accounts_pool::admit_external_execution(
-        &account_seat(opts)?,
-        accounts::Cli::Claude,
-        &directories,
-    )
-    .map(Some)
+    super::accounts_pool::external_admission(&seat_of(opts)?, accounts::Cli::Claude, &directories)
+        .map(Some)
 }
 
-/// Whether the raw relaunch's account admission ([`relaunch`]: [`account_execution`], then
+/// The word a relaunch stops with whose saved account intent can never be admitted again at exec
+/// ([`exec_account`]): its login is filed under another owner row or namespace than its plan
+/// named.
+pub(super) const ACCOUNT_MOVED: &str = "account-moved";
+
+/// The relaunch's account admission at exec, once its agent is gone ([`relaunch`]), of `st`'s
+/// saved intent: the guard to hold through the line's dispatch (`None`: no account admission
+/// holds it), or, breaking, the report `r` the relaunch returns instead. Where only the stored login's
+/// credential generation moved since the plan (`accounts_pool::execution_readmission`: a
+/// renewal or a sign-in of its row, or, for a row with no binding of its own, any account's
+/// commit), the intent captured afresh for the same login and purpose is admitted and saved in `st`'s
+/// record before the line is typed, since no next pass plans that intent again. A login now
+/// filed under another owner row or namespace stops the relaunch at once ([`ACCOUNT_MOVED`]),
+/// its ledger saying why, rather than waiting out [`STALE_S`] on a comparison that cannot match
+/// again; any other refusal waits ([`WAIT_ACCOUNT`]) for the next pass. Only the raw relaunch
+/// renews (`renew`): a native binding carries the exact intent its helper admits at Execute, so
+/// it is admitted exactly.
+fn exec_account(
+    opts: &Opts,
+    r: Report,
+    st: &mut St,
+    session: &str,
+    renew: bool,
+) -> std::ops::ControlFlow<Report, Option<super::accounts_pool::ExecutionGuard>> {
+    use super::accounts_pool::{ExecutionIntent, Unadmitted};
+    use std::ops::ControlFlow::{Break, Continue};
+    let admitted = match st.account_intent.as_ref() {
+        Some(intent) if renew && !matches!(intent, ExecutionIntent::External { .. }) => {
+            seat_of(opts)
+                .map_err(Unadmitted::Refused)
+                .and_then(|seat| {
+                    super::accounts_pool::execution_readmission(
+                        &seat,
+                        accounts::Cli::Claude,
+                        intent,
+                    )
+                })
+                .map(|(guard, renewed)| (Some(guard), renewed))
+        }
+        intent => account_execution(opts, intent)
+            .map(|guard| (guard, None))
+            .map_err(Unadmitted::Refused),
+    };
+    match admitted {
+        Ok((guard, renewed)) => {
+            if let Some(intent) = renewed {
+                aterm_log::info!(
+                    "harness @{}: the relaunch's account admission took its login's new credential \
+                     generation",
+                    st.tab
+                );
+                st.account_intent = Some(intent);
+                save(opts, session, st);
+            }
+            Continue(guard)
+        }
+        Err(Unadmitted::Refused(why)) => {
+            aterm_log::info!(
+                "harness @{}: the relaunch's account admission waits: {why}",
+                st.tab
+            );
+            Break(said(r, WAIT_ACCOUNT))
+        }
+        Err(Unadmitted::Moved(why)) => {
+            st.stop(ACCOUNT_MOVED, now_s());
+            let r = said(r, format!("failed:{ACCOUNT_MOVED}"));
+            ledger(
+                opts,
+                &r,
+                &format!(
+                    "the agent ended for its relaunch and was not started again: {why}, so the \
+                     account its line was admitted for is no longer the one it would run on"
+                ),
+            );
+            save(opts, session, st);
+            Break(r)
+        }
+    }
+}
+
+/// Whether the raw relaunch's account admission ([`relaunch`]: [`exec_account`], then
 /// [`external_at_shell`]) passes for `st`'s saved intent at `shell` now, each guard let go at once.
 /// Every raw restart asks it before its signal: the restart in place's ([`restart_locked`]) and
-/// the upgrade's (`upgrade_drive::restart`). An agent whose relaunch checks no account passes.
-pub(super) fn relaunch_account_admits(opts: &Opts, st: &St, shell: u32) -> Result<(), String> {
+/// the upgrade's (`upgrade_drive::restart`). Before the signal the intent is admitted exactly
+/// ([`account_execution`]): a generation that moved since the plan waits, and the next pass plans
+/// again. An agent whose relaunch checks no account passes.
+pub(super) fn relaunch_account_admits(
+    opts: &Opts,
+    st: &St,
+    shell: u32,
+) -> Result<(), super::accounts_pool::Refusal> {
     if !checks_account_execution(&st.agent) {
         return Ok(());
     }
@@ -1194,8 +1417,9 @@ fn line_tap_selected(
 /// room on the tty's line ([`line_tap_kept`]).
 pub(super) const TAP_DROPPED: &str = "tap-dropped";
 
-/// The ledger's step for a relaunch typed without the token wrapper its judgment offered it, for
-/// want of room on the tty's line once the tap went ([`line_tap_selected`]).
+/// The ledger's step for a relaunch typed without the token wrapper its judgment offered it: for
+/// want of room on the tty's line once the tap went ([`line_tap_selected`]), or because the
+/// account's selection policy refused the move onto the token ([`stored_in_place`]).
 pub(super) const TOKEN_DROPPED: &str = "token-dropped";
 
 /// Record, beside the relaunch `r` whose line is about to be typed, that its line dropped the
@@ -1479,6 +1703,7 @@ pub(crate) fn with_permission_mode(flags: Vec<String>, mode: Option<&str>) -> Ve
 pub(super) fn unplanned(opts: &Opts, r: Report, st: &mut St, no: NoPlan) -> Report {
     match no {
         NoPlan::Wait(why) => said(r, format!("wait:{why}")),
+        NoPlan::Account(refusal) => account_refused(r, st, &refusal, now_s()),
         NoPlan::Refused { what, .. } if opts.dry_run => said(r, format!("would-refuse:{what}")),
         NoPlan::Refused { why, what, detail } => {
             st.stop(&why, now_s());
@@ -1487,6 +1712,38 @@ pub(super) fn unplanned(opts: &Opts, r: Report, st: &mut St, no: NoPlan) -> Repo
             r
         }
     }
+}
+
+/// A step the account admission of its command refused at `now`: the wait its kind names, with the
+/// whole reason in aterm.log and in `st`'s wait log ([`St::note_wait_why`]), since the word alone
+/// cannot say which check refused. Only a caller that saves `st` keeps that note on disk: the
+/// upgrade lane's record does; a relaunch lane's plan refused before any record of its own
+/// (a restart in place, a relaunch after its agent ended) leaves the reason in aterm.log alone.
+pub(super) fn account_refused(
+    r: Report,
+    st: &mut St,
+    refusal: &super::accounts_pool::Refusal,
+    now: u64,
+) -> Report {
+    let word = refusal.kind.word();
+    aterm_log::info!(
+        "harness @{}: the relaunch's account admission waits {word}: {}",
+        r.tab,
+        refusal.why
+    );
+    st.note_wait_why(word, &refusal.why, now);
+    said(r, format!("wait:{word}"))
+}
+
+/// Whether `step` is a wait an account admission refused before any launch was attempted
+/// ([`WAIT_ACCOUNT`], or one of [`super::accounts_pool::RefusalKind::word`]).
+#[must_use]
+pub fn account_admission_wait(step: &str) -> bool {
+    step == WAIT_ACCOUNT
+        || step
+            .strip_prefix("wait:")
+            .and_then(super::accounts_pool::RefusalKind::of_word)
+            .is_some()
 }
 
 /// How long a relaunch in flight may still act on its tab, from the agent's end (exiting) or the relaunch line (relaunched).
@@ -2132,15 +2389,9 @@ fn relaunch_held(
     // Its Execute takes canonical account admission after that point; legacy recipes cannot
     // enter this branch and keep their existing dispatch guard below.
     let account_guard = if checks_account_execution(&st.agent) && !deferred_cold {
-        match account_execution(opts, st.account_intent.as_ref()) {
-            Ok(guard) => guard,
-            Err(why) => {
-                aterm_log::info!(
-                    "harness @{}: the relaunch's account admission waits: {why}",
-                    st.tab
-                );
-                return said(r, WAIT_ACCOUNT);
-            }
+        match exec_account(opts, r.clone(), st, session, native.is_none()) {
+            std::ops::ControlFlow::Continue(guard) => guard,
+            std::ops::ControlFlow::Break(ended) => return ended,
         }
     } else {
         None
@@ -3372,12 +3623,10 @@ pub const DEFENDED: &str = "its last reply defends its work as landed or says it
      reads it";
 
 /// Whether the last reply on the screen `rows` draws for `program` ends the question of more typing
-/// ([`crate::supervise::policy::turn_end::reply_for_the_loop`]), the reading a relaunch under Land
+/// ([`alab_policy::open_work::reply_for_the_loop`]), the reading a relaunch under Land
 /// with no transcript of Claude Code's has.
 pub(super) fn defended_on_screen(program: aterm_phase::Program, rows: &[String]) -> bool {
-    crate::supervise::policy::turn_end::reply_for_the_loop(
-        program.reader().said_tail(rows).as_deref(),
-    )
+    alab_policy::open_work::reply_for_the_loop(program.reader().said_tail(rows).as_deref())
 }
 
 /// [`LANDING`] for a lane that reads the screen ([`defended_on_screen`]); the caller saves `st`.
@@ -3471,7 +3720,7 @@ pub(super) fn carried_text(
 }
 
 /// Whether one `status` reply says the person's last key holds the go-ahead now, as the loop's
-/// hour does ([`crate::supervise::policy::turn_end::GO_AHEAD_HELD`]): their typing
+/// hour does ([`alab_policy::words::GO_AHEAD_HELD`]): their typing
 /// (`human_typed_ms=`, else `human_ms=` from a window that reports no typing apart) within the
 /// hour. A reply with no readable key holds it, so a check typed after a restart says no go-ahead
 /// word where the hour cannot be read; `-` (no typing since the host began serving the tab) holds
@@ -3488,9 +3737,8 @@ pub fn go_ahead_held_by_status(status: &str) -> bool {
     };
     match field("human_typed_ms").or_else(|| field("human_ms")) {
         Some("-") => false,
-        Some(ms) => crate::parse_uint::<u64>(ms).is_none_or(|ms| {
-            Duration::from_millis(ms) < crate::supervise::policy::turn_end::GO_AHEAD_HELD
-        }),
+        Some(ms) => crate::parse_uint::<u64>(ms)
+            .is_none_or(|ms| Duration::from_millis(ms) < alab_policy::words::GO_AHEAD_HELD),
         None => true,
     }
 }
@@ -4450,7 +4698,7 @@ pub(super) fn restore_look(
         if quiet.is_none()
             && look_types(at, opts.background)
             && opts.press.is_none()
-            && super::tap::is_tab_id(&tab)
+            && aterm_types::control_verbs::is_minted_sid(&tab)
             && let Ok(mut c) = connect(opts, &tab)
             && autopilot_on(&mut c, &tab)
         {
@@ -5824,6 +6072,11 @@ fn restart_locked(
         homedir: None,
         login: login.as_deref(),
         route: moved_route(moves_account, snap.route),
+        running: Some(Running {
+            home: snap.home.as_deref(),
+            login: snap.login.as_deref(),
+            route: snap.route,
+        }),
         auth_observed: snap.auth_observed,
         launch_env: snap.launch_env.as_ref(),
         serve: serve_for(why),
@@ -6645,7 +6898,7 @@ pub struct Snapshot {
     /// Precise lifetime captured while this agent ran, retained after it ends; never inferred
     /// from the whole-second `start` hint on a later restore.
     pub lifetime: Option<ProcessLifetime>,
-    /// The tab (`s-<hex>`).
+    /// The tab (its tab ID: `t…`, or an earlier tab's `s-…`).
     pub tab: String,
     /// The agent: the tab's foreground job.
     pub pid: u32,
@@ -7120,6 +7373,76 @@ pub fn snapshot_with_claim(
     snapshot_with_claimed(opts, &Live, claim)
 }
 
+/// A snapshot read's refusal where the process table, or the foreground process's row in it, was
+/// not read ([`TerminalRead`]): on a loaded Mac a process in the middle of an exec holds
+/// every read of the table. The read then knows nothing of who opened the terminal, which
+/// `"terminal"` (read, and not aterm's) would claim.
+pub(super) const TERMINAL_UNREAD: &str = "terminal-unread";
+
+/// A snapshot read's refusal where the foreground process's image was not read and nothing else
+/// named it an agent's: with no image the read cannot say the program is no agent, which
+/// `"not-claude"` (image read, and no Claude Code) would claim.
+pub(super) const EXE_UNREADABLE: &str = "exe-unreadable";
+
+/// Whether the terminal of `pid` is one aterm opened, by `k`'s read of it: `terminal-unread`
+/// where that read was not made, `"terminal"` where it was and names another opener or none.
+fn terminal_is_aterms(k: &dyn Kernel, pid: u32) -> Result<(), &'static str> {
+    match k.terminal_read(pid) {
+        TerminalRead::Unread => Err(TERMINAL_UNREAD),
+        TerminalRead::Read(Some((opener, name))) if owned_by_aterm((opener, name.as_str())) => {
+            Ok(())
+        }
+        TerminalRead::Read(_) => Err("terminal"),
+    }
+}
+
+/// What a refused relaunch snapshot read ([`snapshot`], [`snapshot_with_claim`]) says of the tab,
+/// by its refusal code: the host's answer read and no agent a lane carries found in the tab, or no
+/// answer read at all. A caller that holds a restart's grace decides by the first and never by the
+/// second: an unread answer is not "no agent" (LS-15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotRefusal {
+    /// The tab was read and holds no agent a lane carries (the refusal's code): no foreground
+    /// group, a group no one tab owns, a job no shell runs or one in the background, a terminal
+    /// read and not one aterm opened, another tab's process, or a program whose image was read
+    /// and that no lane reads or carries.
+    Answered(&'static str),
+    /// The read failed before it could answer (the refusal's code): no tab named, no control
+    /// socket or no roster from it, or a process fact (its ids, argv, start, image, home, config
+    /// or open files, or the process that opened its terminal: `terminal-unread`) not read; an
+    /// agent whose conversation the read could not settle (`threads-ambiguous`); or any code
+    /// [`Self::of`] does not name, which is never taken for an answer.
+    Unread(&'static str),
+}
+
+impl SnapshotRefusal {
+    /// The refusal code `why` of a snapshot read, classified: the answers are named, and every
+    /// other code is [`Self::Unread`].
+    #[must_use]
+    pub fn of(why: &'static str) -> Self {
+        match why {
+            "no-foreground"
+            | "tab-ambiguous"
+            | "not-a-shell-job"
+            | "not-foreground"
+            | "terminal"
+            | "tab-identity-conflict"
+            | NO_LANE
+            | "not-claude"
+            | "not-a-tui" => Self::Answered(why),
+            _ => Self::Unread(why),
+        }
+    }
+
+    /// The refusal's code.
+    #[must_use]
+    pub const fn why(self) -> &'static str {
+        match self {
+            Self::Answered(why) | Self::Unread(why) => why,
+        }
+    }
+}
+
 /// Retain passive native crash evidence only after the host published this snapshot.
 /// The caller must release its publication locks before this control exchange; the observer
 /// still verifies that the exact vendor and shell are live before registering either one.
@@ -7203,13 +7526,7 @@ pub(super) fn self_claimed_snapshot_with(
     if shell == copy.pid || k.shell_holds_tab(shell) != Some(true) {
         return Err("no-shell");
     }
-    if !k
-        .terminal(shell)
-        .as_ref()
-        .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
-    {
-        return Err("terminal");
-    }
+    terminal_is_aterms(k, shell)?;
     let args = atpkg::caller_shell::process_args(shell).ok_or("argv-unreadable")?;
     if args
         .env_var("ATERM_PARENT_SESSION_ID")
@@ -7292,13 +7609,8 @@ fn snapshot_with_claimed(
         Some((Job::TabProgram { .. }, _)) => NO_SHELL,
         job => foreground_shell(job)?,
     };
-    if shell != NO_SHELL
-        && !k
-            .terminal(pid)
-            .as_ref()
-            .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
-    {
-        return Err("terminal");
+    if shell != NO_SHELL {
+        terminal_is_aterms(k, pid)?;
     }
     super::laps::lap("job");
     let args = atpkg::caller_shell::process_args(pid).ok_or("argv-unreadable")?;
@@ -7310,7 +7622,7 @@ fn snapshot_with_claimed(
         return Err("tab-identity-conflict");
     }
     let start = kernel_start(pid).ok_or("start")?;
-    let image = exe_of(pid);
+    let image = k.image(pid);
     super::laps::lap("process");
     match snapshot_lane(image.as_deref()) {
         SnapshotLane::CodexAlab => {
@@ -7341,13 +7653,19 @@ fn snapshot_with_claimed(
         .session_file(pid)
         .filter(|sf| squash(&sf.proc_start) == start);
     super::laps::lap("claude.records");
+    // No Claude Code by its arguments, image or records. That is the tab's answer only where
+    // the image was read: unread, the program may be any lane's agent.
     let (program, argv) = launched(
         &args.argv,
         image.as_deref(),
         &native_root(&opts.home),
         file.is_some(),
     )
-    .ok_or("not-claude")?;
+    .ok_or(if image.is_some() {
+        "not-claude"
+    } else {
+        EXE_UNREADABLE
+    })?;
     let cwd = file
         .as_ref()
         .map(|sf| sf.cwd.clone())
@@ -7730,13 +8048,13 @@ pub enum Carried {
 #[must_use]
 pub fn carried(
     decision: OnExit,
-    autopilot: crate::supervise::Autopilot,
+    autopilot: alab_policy::config::Autopilot,
     status: Option<&str>,
     driven_ms: Option<u64>,
     landed: bool,
     grace_s: u32,
 ) -> Carried {
-    use crate::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let carries = match autopilot {
         Autopilot::Cruise => true,
         Autopilot::Land => !landed,
@@ -8162,6 +8480,8 @@ fn after_exit_as(
         homedir: None,
         login: snap.login.as_deref(),
         route: snap.route,
+        // Its agent ended: the line starts a runner again, and its account admission selects.
+        running: None,
         auth_observed: snap.auth_observed,
         launch_env: snap.launch_env.as_ref(),
         serve: Serve::Judge,
@@ -9815,22 +10135,23 @@ pub fn outcome(step: &str) -> Outcome {
         .or_else(|| step.strip_prefix("told:"))
     {
         Outcome::Cannot(why.to_string())
-    } else if matches!(
-        step,
-        "busy:another-sweep"
-            | WAIT_ACT_ENDS
-            | WAIT_HAND_LIFTS
-            | WAIT_ACCOUNT
-            | WAIT_NATIVE_UNISSUED
-            | super::native_restart::WAIT_RETIRED_UNISSUED
-            | super::native_restart::WAIT_LAPSED
-            | super::native_restart::WAIT_CLOSED
-            | super::native_restart::WAIT_CLOSED_GRANTEE
-            | super::native_restart::WAIT_UNADMITTED
-            | super::native_restart::WAIT_CANCELLED
-            | super::native_restart::WAIT_CANCELLED_BEFORE_MUTATION
-            | super::native_restart::WAIT_ABORTED_BEFORE_SIGNAL
-    ) {
+    } else if account_admission_wait(step)
+        || matches!(
+            step,
+            "busy:another-sweep"
+                | WAIT_ACT_ENDS
+                | WAIT_HAND_LIFTS
+                | WAIT_NATIVE_UNISSUED
+                | super::native_restart::WAIT_RETIRED_UNISSUED
+                | super::native_restart::WAIT_LAPSED
+                | super::native_restart::WAIT_CLOSED
+                | super::native_restart::WAIT_CLOSED_GRANTEE
+                | super::native_restart::WAIT_UNADMITTED
+                | super::native_restart::WAIT_CANCELLED
+                | super::native_restart::WAIT_CANCELLED_BEFORE_MUTATION
+                | super::native_restart::WAIT_ABORTED_BEFORE_SIGNAL
+        )
+    {
         Outcome::Busy
     } else if let Some(why) = step.strip_prefix("busy:") {
         // State directory cannot hold the lock.
@@ -9840,8 +10161,9 @@ pub fn outcome(step: &str) -> Outcome {
     }
 }
 
-/// Account admission held an attempt before planning or executing its launch.
-/// This wait neither spends a restart attempt nor erases an earlier failure.
+/// Account admission held an attempt before executing its launch, after its agent ended.
+/// This wait, and each a plan's or a signal's admission names by what refused
+/// ([`account_admission_wait`]), neither spends a restart attempt nor erases an earlier failure.
 /// Other account waits may follow a dispatched restart and keep their own outcome.
 pub const WAIT_ACCOUNT: &str = "wait:account";
 
@@ -10240,7 +10562,7 @@ impl Relaunches {
         } else {
             self.tries
         };
-        crate::supervise::ladder::Ladder(&BACKOFF).step(usize::try_from(step).unwrap_or(usize::MAX))
+        alab_policy::ladder::Ladder(&BACKOFF).step(usize::try_from(step).unwrap_or(usize::MAX))
     }
 
     /// One attempt came to `outcome` at `now`.

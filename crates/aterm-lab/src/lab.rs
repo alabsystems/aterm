@@ -886,8 +886,9 @@ fn launch_window(
     (pid, hang): (&mut i32, Duration),
 ) -> Result<(), String> {
     let mut cmd = jailed_command(run, vars, program, out, stdin)?;
-    let child = cmd
-        .spawn()
+    // Held across the fork alone (`aterm_uds::spawn_lock`), so the child copies no descriptor
+    // another thread is making through `aterm_uds::kept_out` before its mark.
+    let child = aterm_uds::spawn_lock::spawn_std(&mut cmd, &[])
         .map_err(|e| format!("cannot start {}: {e}", program.join(" ")))?;
     *pid = procs::keep_forked(child);
     let door = Door::new(run)?;
@@ -1026,8 +1027,9 @@ pub(crate) fn launch_ready(
     let mut ready =
         aterm_agent::ready::Ready::open(&run.run).map_err(|e| format!("the ready signal: {e}"))?;
     ready.hand(&mut cmd);
-    let child = cmd
-        .spawn()
+    // Held across the fork alone (`aterm_uds::spawn_lock`), which hands the child the ready
+    // signal's write end.
+    let child = aterm_uds::spawn_lock::spawn_std(&mut cmd, &[ready.number()])
         .map_err(|e| format!("cannot start {}: {e}", program.join(" ")))?;
     *pid = procs::keep_forked(child);
     let child = *pid;

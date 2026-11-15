@@ -315,7 +315,7 @@ fn dry_slice_memory_forecast_matches_the_shared_serial_and_refusal_plans() {
         "serial, whose 42 GiB parent is short too",
         "alone through both serial slices",
         "39.7 GiB available",
-        "no claim holds it: other work on this Mac",
+        "no claim holds it",
     ] {
         assert!(forecast.line.contains(words), "{words}: {}", forecast.line);
     }

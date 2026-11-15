@@ -84,6 +84,13 @@ fn setup_file(path: &Path, bytes: &[u8]) {
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
+/// `token` and a newline published as vault entry `name` of the store under `home`
+/// (`vault::put_entry_for_tests`): what agh reads in place. No file under `home/.secrets` is read.
+#[cfg(unix)]
+pub fn vault_entry(home: &Path, name: &str, token: &str) {
+    agh::identity::vault::put_entry_for_tests(home, name, Some(format!("{token}\n").as_bytes()));
+}
+
 /// Creates `dirs.config` (`0700`) and writes `text` to `agh.toml` (`0600`).
 #[cfg(unix)]
 pub fn write_config(dirs: &Dirs, text: &str) {

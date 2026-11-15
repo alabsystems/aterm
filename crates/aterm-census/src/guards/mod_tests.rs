@@ -15,13 +15,7 @@ pub(crate) fn run(rule: &Rule, files: &[(&str, &str)]) -> Vec<Finding> {
         &corpus,
         NO_ENGINE,
     );
-    let walk = Walk {
-        root: tree.root,
-        engine: NO_ENGINE,
-        source: &std::sync::OnceLock::from(Arc::new(memo::Snapshot::empty())),
-        run: None,
-    };
-    run_rules(&tree, std::slice::from_ref(rule), &walk)
+    run_rules(&tree, std::slice::from_ref(rule))
 }
 
 /// Each finding as `path:line`.

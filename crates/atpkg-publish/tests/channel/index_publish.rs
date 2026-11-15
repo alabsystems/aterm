@@ -681,6 +681,40 @@ fn an_unowned_draft_without_an_index_is_never_adopted() {
 }
 
 #[test]
+fn a_host_without_a_create_journal_names_the_orphaned_draft_it_cannot_complete() {
+    let mut rig = live("idx-journalless-empty-draft");
+    rig.host.put(
+        &rig.index_slug(),
+        &index_tag(22),
+        FakeRelease {
+            draft: true,
+            prerelease: true,
+            ..Default::default()
+        },
+    );
+    // Faulty forwards every call but `complete_created`, as `RestHost` (the channel
+    // host under the default gh host and agh-staging) does: it keeps no create journal.
+    let host = rig.host.clone();
+    rig.route(Arc::new(Faulty {
+        inner: host,
+        release_answer: None,
+        unserved: None,
+        public_fetch: None,
+    }));
+    let before = writes(&rig.host).len();
+    let (error, _) = refused(&rig, &request(&rig, "out", true, Delta::default()));
+    let why = error.to_string();
+    assert!(matches!(error, Error::Refused(_)), "{why}");
+    assert!(
+        why.contains("orphaned DRAFT without an index.toml"),
+        "{why}"
+    );
+    assert!(why.contains("delete it"), "{why}");
+    assert_eq!(writes(&rig.host).len(), before);
+    assert!(rig.index_release(22).unwrap().draft);
+}
+
+#[test]
 fn a_half_created_release_is_refused() {
     let rig = own_then("idx-half", |rig, own| {
         lay(

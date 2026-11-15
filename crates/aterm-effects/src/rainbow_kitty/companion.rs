@@ -329,14 +329,16 @@ impl HeadFit {
 /// box `(x, y, w, h)` it stands in at that size: on the caret's row, its middle on the row's, as
 /// near the caret as the head's ring of air allows and no further than the grid's end, which at
 /// the last columns lays it across the caret and the letter behind it: fewer letters than the whole
-/// head lies on there, over two rows. `None` where the cells ahead of the caret hold letters (a line
-/// edited in the middle), which fitting would not clear.
+/// head lies on there, over two rows. No smaller than `floor` of `rest`
+/// ([`HEAD_FIT_FLOOR`] for the head; `WordDecorations::kitty_cursor_fit_floor`). `None` where the
+/// cells ahead of the caret hold letters (a line edited in the middle), which fitting would not
+/// clear.
 #[must_use]
 pub fn head_fit_seat<F>(
     caret: (u16, u16),
     rest: CatFootprint,
     (cw, ch, cols): (i32, i32, u16),
-    gap: i32,
+    (gap, floor): (i32, f32),
     ink: &F,
 ) -> Option<(f32, (i32, i32, i32, i32))>
 where
@@ -354,7 +356,7 @@ where
     let (rest_w, rest_h) = (f32::from(rest.w), f32::from(rest.h));
     let by_row = HEAD_ROW_SHARE * ch as f32 / rest_h;
     let by_room = (grid_w - caret_right - gap) as f32 / rest_w;
-    let goal = by_row.min(by_room).clamp(HEAD_FIT_FLOOR, 1.0);
+    let goal = by_row.min(by_room).clamp(floor.min(1.0), 1.0);
     let (w, h) = (
         (rest_w * goal).round() as i32,
         (rest_h * goal).round() as i32,
@@ -364,6 +366,48 @@ where
     let (_, last) = cell_span(x, w, cw, cols);
     let lettered = (caret.1.saturating_add(1)..=last).any(|c| ink(caret.0, c) == Some(true));
     (!lettered).then_some((goal, (x, y, w, h)))
+}
+
+/// Where a head fitted to its row stands at `fit` of its whole `rest`, and how a frame is laid
+/// to draw it there: one geometry for the terminal ([`crate::EffectsPipeline::route_flying_head`])
+/// and the settings preview, so the preview shows what the terminal draws.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FittedHead {
+    /// The box `(x, y, w, h)`, px: on the caret's row, its middle on the row's, `gap` px past the
+    /// caret and no further than the grid's end.
+    pub rect: (i32, i32, i32, i32),
+    /// The layout's lift, cells: it takes the whole head's rise off its row (and the frame's
+    /// hover, which a fitted head drops: a box with a pixel to spare in its row would bob out of
+    /// it) back off.
+    pub lift: f32,
+    /// The pose's lead, px: from the whole box's middle to the fitted box's place.
+    pub lead_px: i32,
+}
+
+/// [`FittedHead`] for the caret at `caret`, a whole head `rest` and the frame's hover `bob_px`.
+#[must_use]
+pub fn fitted_head(
+    caret: (u16, u16),
+    rest: CatFootprint,
+    fit: f32,
+    (cw, ch, cols): (i32, i32, u16),
+    gap: i32,
+    bob_px: i32,
+) -> FittedHead {
+    let (w, h) = (
+        (f32::from(rest.w) * fit).round() as i32,
+        (f32::from(rest.h) * fit).round() as i32,
+    );
+    let grid_w = i32::from(cols).saturating_mul(cw);
+    let caret_right = (i32::from(caret.1) + 1).saturating_mul(cw);
+    let x = (caret_right + gap).min(grid_w - w).max(0);
+    let y = i32::from(caret.0) * ch + (ch - h) / 2;
+    let row_top = i32::from(caret.0) * ch + ch / 2 - i32::from(rest.h) / 2;
+    FittedHead {
+        rect: (x, y, w, h),
+        lift: (rest.y - (row_top + bob_px)) as f32 / ch.max(1) as f32,
+        lead_px: x - (rest.x + i32::from(rest.w) / 2 - w / 2),
+    }
 }
 
 #[cfg(any(test, debug_assertions))]

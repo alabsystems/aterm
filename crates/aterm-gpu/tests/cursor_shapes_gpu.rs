@@ -300,3 +300,99 @@ fn gpu_blink_phase_and_hidden_suppress_cursor() {
         "DECTCEM off -> no cursor pixels"
     );
 }
+
+/// The rainbow block's keyline as the window draws it: the GPU's cursor stream lays the same
+/// one-pixel ring just inside the block as the CPU renderer, in the colour both work from the
+/// fill they draw (after the minimum-contrast floor) and the cell's ground
+/// (`aterm_render::block_keyline_colour`), over the fill and its letter; a bar and the host's
+/// hollow outline wear none. The control is the same frame with no tint: its edge is the fill.
+#[test]
+fn gpu_block_keyline_matches_cpu_and_follows_the_drawn_fill() {
+    const FILL: u32 = 0x0002_8402;
+    const TINT: u32 = 0x0013_1B13;
+    let (mut cpu, mut gpu) = renderers();
+    let (cw, ch) = cpu.cell_size();
+    let edge = |f: &Frame| -> Vec<u32> {
+        let mut px = Vec::new();
+        for x in 0..cw {
+            px.push(f.pixels[x]);
+            px.push(f.pixels[(ch - 1) * f.width + x]);
+        }
+        for y in 1..ch - 1 {
+            px.push(f.pixels[y * f.width]);
+            px.push(f.pixels[y * f.width + cw - 1]);
+        }
+        px
+    };
+    for min_contrast in [1.0f32, 7.0] {
+        cpu.set_minimum_contrast(min_contrast);
+        gpu.set_minimum_contrast(min_contrast);
+        let label = format!("keyline at minimum contrast {min_contrast}");
+        let mut win = aterm_gpu::WindowGpu::new();
+        let mut term = term_with(b"\x1b[2 q");
+        let mut input = term.cell_frame(2, 4);
+        // The fill the renderers draw: floored against the caret cell's ground at their
+        // effective floor (the knob, under the vibrancy rule).
+        let ground = aterm_render::rgb_to_u32(input.cells[0][0].bg);
+        let drawn = aterm_render::floor_cursor_fill(FILL, ground, cpu.effective_minimum_contrast());
+        assert_eq!(
+            min_contrast > 1.0,
+            drawn != FILL,
+            "fixture: the floor moves the fill"
+        );
+        let line = aterm_render::block_keyline_colour(drawn, TINT, ground);
+        assert_ne!(line, drawn, "fixture: the keyline is not the fill");
+        input.cursor_fill_override = Some(FILL);
+        input.cursor_keyline_tint = Some(TINT);
+        let cpu_frame = cpu.render_input(&input);
+        let gpu_frame = gpu.render_input(&mut win, &input, None);
+        let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+        assert!(delta <= 8, "{label}: GPU/CPU pixels diverge by {delta}");
+        for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+            let ring = edge(frame);
+            assert!(
+                ring.iter().all(|&p| near_color(p, line)),
+                "{label}: {name} draws the block's edge off the keyline {line:06x}: {:06x?}",
+                ring.iter()
+                    .filter(|&&p| !near_color(p, line))
+                    .take(4)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                near_color(frame.pixels[frame.width + 1], drawn),
+                "{label}: {name} keeps the fill {drawn:06x} inside the keyline"
+            );
+        }
+        // The control: no tint, and the block's edge is the fill it draws.
+        input.cursor_keyline_tint = None;
+        let plain = gpu.render_input(&mut win, &input, None);
+        assert!(
+            edge(&plain).iter().all(|&p| near_color(p, drawn)),
+            "{label}: control, the GPU block with no tint draws its edge in the fill"
+        );
+        input.cursor_keyline_tint = Some(TINT);
+        // A bar and the host's hollow outline wear none.
+        for (style, decscusr) in [
+            (None, &b"\x1b[6 q"[..]),
+            (Some(CursorStyle::HollowBlock), b""),
+        ] {
+            cpu.set_cursor_style_override(style);
+            gpu.set_cursor_style_override(style);
+            let mut term = term_with(decscusr);
+            let mut thin = term.cell_frame(2, 4);
+            thin.cursor_fill_override = Some(FILL);
+            thin.cursor_keyline_tint = Some(TINT);
+            for (name, frame) in [
+                ("CPU", cpu.render_input(&thin)),
+                ("GPU", gpu.render_input(&mut win, &thin, None)),
+            ] {
+                assert!(
+                    !frame.pixels.iter().any(|&p| near_color(p, line)),
+                    "{label}: {name} {style:?} {decscusr:?} wears the block's keyline"
+                );
+            }
+            cpu.set_cursor_style_override(None);
+            gpu.set_cursor_style_override(None);
+        }
+    }
+}

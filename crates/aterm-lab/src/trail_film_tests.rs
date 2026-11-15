@@ -716,14 +716,47 @@ fn lined(band: Rgb, (dy0, dy1): (i64, i64), cols: impl Fn(i64) -> bool) -> Image
 /// A film typed along row 1 of [`LINE_GRID`] from column 2, a key every 48 ms (3 frames) for `keys` keys, then
 /// held: each frame is what `draw` gives for the caret's column. The line's reading.
 fn typed_film(keys: i64, draw: impl Fn(i64) -> Image) -> LineRead {
+    typed_glass_film(keys, draw, |_| false)
+}
+
+/// [`typed_film`], each frame's glass as `glass` says for the caret's column.
+fn typed_glass_film(
+    keys: i64,
+    draw: impl Fn(i64) -> Image,
+    glass: impl Fn(i64) -> bool,
+) -> LineRead {
     let clean = lined(PAGE, (0, 0), |_| false);
     let mut track = LineTrack::default();
     for k in 0..(3 * keys + 30) {
         let caret = 2 + (k / 3).min(keys);
         let ms = 16 * u64::try_from(k + 1).unwrap();
-        track.frame(ms, &draw(caret), &clean, &LINE_GRID, (1, caret));
+        track.frame(
+            ms,
+            &draw(caret),
+            &clean,
+            &LINE_GRID,
+            (1, caret),
+            glass(caret),
+        );
     }
     track.read
+}
+
+/// A frame that drew the prism glass is not judged: the glass's body is as vivid as a rail inside the line's band.
+/// The same whole line under the glass on every frame reads unread, counted; under the glass on its first keys only,
+/// the frames after them are judged. Negative control: with no glass the film is judged whole.
+#[test]
+fn the_line_is_unread_under_the_glass() {
+    let under = |caret: i64| lined(RAIL[2], (-3, -1), |c| (2..caret).contains(&c));
+    let bare = typed_glass_film(12, under, |_| false);
+    assert_eq!((bare.share(), bare.glass_unread), (Some(1.0), 0));
+    let glassed = typed_glass_film(12, under, |_| true);
+    assert_eq!((glassed.frames, glassed.share()), (0, None));
+    assert_eq!(glassed.glass_unread, bare.frames);
+    let early = typed_glass_film(12, under, |caret| caret < 13);
+    assert!(early.glass_unread > 0 && early.frames > 0, "{early:?}");
+    assert_eq!(early.frames + early.glass_unread, bare.frames);
+    assert_eq!(early.share(), Some(1.0));
 }
 
 #[test]
@@ -816,7 +849,14 @@ fn a_film_s_line_is_the_share_of_typed_cells_with_a_vivid_line_under_them() {
         .into_iter()
         .enumerate()
     {
-        jump.frame(16 * (k as u64 + 1), &clean, &clean, &LINE_GRID, (1, col));
+        jump.frame(
+            16 * (k as u64 + 1),
+            &clean,
+            &clean,
+            &LINE_GRID,
+            (1, col),
+            false,
+        );
     }
     assert_eq!(jump.read, LineRead::default());
     // The report's line.
@@ -875,6 +915,7 @@ fn a_cell_with_ink_under_the_baseline_is_counted_apart() {
             &clean,
             &LINE_GRID,
             (1, caret),
+            false,
         );
     }
     let (lit, cells, _) = track.read.full.expect("judged");
@@ -1135,7 +1176,7 @@ fn a_run_films_the_flagship_on_both_themes_and_carets_unless_told() {
         a.scenes,
         ["typing", "burst", "context", "enter", "backspace"]
     );
-    assert!(a.replay && !a.report_only && !a.plant_star);
+    assert!(a.replay && !a.report_only && !a.plant_star && !a.glass);
     let a = parse_args(&args(&[
         "out",
         "fire",
@@ -1183,13 +1224,21 @@ fn a_run_films_the_flagship_on_both_themes_and_carets_unless_told() {
         &["out", "rainbow dog pet"],
         &["out", "nyan"],
         &["out", "rainbow", "--pet", "kitty"],
-        // The flier's flight is the app's: the replay films the pipeline's walkers.
-        &["out", "rainbow", "--pet", "flying cat"],
         &["out", "--frames", "3"],
     ] {
         let e = parse_args(&args(bad)).expect_err("a usage error");
         assert_eq!(e.code, 2, "{bad:?}: {:?}", e.msg);
     }
+    // The flier is filmed too, in a folder whose name has no space.
+    let flier = parse_args(&args(&["out", "rainbow", "--pet", "Flying Cat"])).expect("the flier");
+    assert_eq!(
+        (
+            flier.pet.as_str(),
+            flier.word().as_str(),
+            flier.folder().as_str()
+        ),
+        ("flying cat", "rainbow + flying cat", "rainbow-flying-cat")
+    );
     assert_eq!(style_slug("Classic Mono"), "classic-mono");
     let listed = list();
     assert!(
@@ -1197,4 +1246,162 @@ fn a_run_films_the_flagship_on_both_themes_and_carets_unless_told() {
         "{listed}"
     );
     assert_eq!(listed.matches("  * ").count(), DEFAULT_SCENES + 1);
+}
+
+#[test]
+fn glass_films_the_light_themes_in_their_own_folder() {
+    let a = parse_args(&args(&["out", "--pet", "off", "--glass"])).expect("a run");
+    assert!(a.glass && !a.unlatched);
+    assert_eq!(a.folder(), "rainbow-off-glass");
+    assert_eq!(a.lane(), Some(("1", "")));
+    assert!(a.glass_lane());
+    // The lane films the paper lane's themes, a dark page and a light one; which owes the glass its film says.
+    assert_eq!(a.themes, ["dark", "github-light"]);
+    assert_eq!(a.carets, ["block", "bar"]);
+    let a = parse_args(&args(&[
+        "out",
+        "--pet",
+        "off",
+        "--theme",
+        "github-light,dark",
+        "--glass",
+        "--plant-star",
+    ]))
+    .expect("a run");
+    assert_eq!(a.themes, ["github-light", "dark"]);
+    assert!(a.glass && a.plant_star);
+    // Control: the same run without the flag is the paper lane, in the paper lane's folder.
+    let paper = parse_args(&args(&[
+        "out",
+        "--pet",
+        "off",
+        "--theme",
+        "github-light,dark",
+    ]))
+    .expect("a run");
+    assert!(!paper.glass);
+    assert_eq!(paper.folder(), "rainbow-off");
+    assert_eq!(paper.lane(), None);
+    assert!(!paper.glass_lane());
+    // The glass lane's control: its own folder, no glass asked of it, and never without the lane.
+    let control =
+        parse_args(&args(&["out", "--pet", "off", "--glass", "--unlatched"])).expect("a run");
+    assert_eq!(control.folder(), "rainbow-off-glass-unlatched");
+    assert_eq!(control.lane(), Some(("unlatched", "-unlatched")));
+    assert!(!control.glass_lane());
+    let e = parse_args(&args(&["out", "--unlatched"])).expect_err("a usage error");
+    assert_eq!(e.code, 2);
+    let e = parse_args(&args(&["out", "--glass", "--theme", "sepia"])).expect_err("a usage error");
+    assert_eq!(e.code, 2);
+}
+
+/// A status row of [`NO_PET`]'s with the light fields `aterm-render`'s film writes.
+fn lit(light: u8, live: &str, sheer: u8, arms: &str) -> String {
+    format!(
+        "{} light={light} live={live} sheer={sheer} thin_ink=0.0000 arms={arms}\n",
+        NO_PET.trim_end()
+    )
+}
+
+/// A window-lane film of `frames` frames whose dims say `glass_page=page` (nothing, for `None`), each frame's
+/// status row `status` gives it, read as the glass lane reads it.
+fn glass_film(frames: u64, page: Option<u8>, status: impl Fn(u64) -> String) -> Reading {
+    let dir = film(frames, |_, _| {}, status);
+    if let Some(page) = page {
+        std::fs::write(
+            dir.path().join("film.dims.txt"),
+            format!("OK 3 8 52 32 cell_w=6 cell_h=10 pad=2 pad_top=1 head=0 glass_page={page}\n"),
+        )
+        .expect("the film's dims");
+    }
+    let mut read = judge_film(dir.path(), false).expect("the film reads");
+    read.glass_lane = true;
+    read
+}
+
+#[test]
+fn a_glass_page_in_the_glass_lane_must_draw_the_glass_on_its_held_light() {
+    let glass = "glass:glow_under+glow_under_ramps,guard:glow_under";
+    // Glass drawn on frames 3 to 6 of 6, latched on every one.
+    let read = glass_film(6, Some(1), |k| {
+        lit(3, "glass", 0, if k >= 3 { glass } else { "-" })
+    });
+    assert_eq!(read.glass_page, Some(true));
+    let g = &read.glass;
+    assert_eq!(
+        (g.read, g.drew, g.admitted, g.sheer, g.first_ms),
+        (6, 4, 6, 0, Some(48))
+    );
+    assert_eq!(g.light, Some((3, "glass".to_string())));
+    assert!(read.broken().is_empty(), "{:?}", read.broken());
+    assert!(
+        read.render().contains(
+            "GLASS    glass_frames=4 of 6 light=3;glass admitted_frames=6 sheer_frames=0 yield_frames=0 \
+             thin_ink=0.0000 first_glass_ms=48"
+        ),
+        "{}",
+        read.render()
+    );
+    // Negative control: a glass page latched over a face that takes no glass (sheer) draws paper, and the
+    // glass lane breaks on it by name.
+    let read = glass_film(6, Some(1), |_| lit(35, "glass", 1, "-"));
+    assert_eq!((read.glass.drew, read.glass.sheer), (0, 6));
+    assert_eq!(
+        read.broken(),
+        [
+            "glass: a light page in the glass lane drew no glass in 6 frames (light=35;glass, admitted on 0, \
+          sheer on 6, thin_ink 0.0000..0.0000)"
+        ]
+    );
+    // Negative control: a latch that lets go after the glass drew, or goes sheer, breaks too.
+    let read = glass_film(6, Some(1), |k| {
+        if k <= 3 {
+            lit(3, "glass", 0, glass)
+        } else {
+            lit(0, "-", 0, "-")
+        }
+    });
+    assert_eq!((read.glass.drew, read.glass.admitted), (3, 3));
+    assert_eq!(
+        read.broken(),
+        [
+            "glass: a light page in the glass lane held its light at the glass on 3 of 6 frames (sheer on 0): the \
+             latch let go of a page it admits"
+        ]
+    );
+    let read = glass_film(6, Some(1), |k| {
+        lit(
+            if k == 6 { 35 } else { 3 },
+            "glass",
+            u8::from(k == 6),
+            glass,
+        )
+    });
+    assert_eq!((read.glass.admitted, read.glass.sheer), (5, 1));
+    assert_eq!(read.broken().len(), 1, "{:?}", read.broken());
+    // A page that is no glass page owes none, though in the glass lane; nor does a glass page out of it.
+    let mut read = glass_film(6, Some(0), |_| lit(3, "glass", 0, "-"));
+    assert_eq!(read.glass_page, Some(false));
+    assert!(read.broken().is_empty(), "{:?}", read.broken());
+    read.glass_page = Some(true);
+    read.glass_lane = false;
+    assert!(read.broken().is_empty(), "{:?}", read.broken());
+    // A window-lane film whose dims do not say breaks in the glass lane, and a film from before the lane reads its
+    // light unread.
+    let read = glass_film(2, None, |_| NO_PET.to_string());
+    assert_eq!(read.glass_page, None);
+    assert_eq!(read.glass, GlassRead::default());
+    assert_eq!(
+        read.broken(),
+        [
+            "glass: the film's dims do not say whether its page takes the glass (no glass_page=): a film from \
+             before the glass lane wrote it; film it again"
+        ]
+    );
+    assert!(
+        read.render()
+            .contains("GLASS    glass_frames=0 of 2 light=unread"),
+        "{}",
+        read.render()
+    );
 }

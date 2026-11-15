@@ -87,6 +87,31 @@ fn main() {
         println!("returned {code}");
         std::process::exit(code);
     }
+    if role == "handoff-interrupted" {
+        // A landing whose interrupt handling took a SIGTERM just before it hands itself over.
+        let dir = dir.unwrap();
+        aterm_verify::exec::group::kill_on_interrupt();
+        // SAFETY: kill takes integers and signals this process, whose handler is installed.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+        let file = dir.join("handoff.json");
+        aterm_verify::land::handoff::write(&file, &handoff::sample(&dir)).unwrap();
+        let next = std::path::PathBuf::from(std::env::var_os("LAND_LIFETIME_NEXT").unwrap());
+        let code = aterm_verify::land::handoff::hand_over(
+            &aterm_verify::land::Image {
+                path: next,
+                digest: "ab".repeat(32),
+            },
+            &file,
+            &dir,
+        );
+        println!("returned {code}");
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        // It reports what it has, then dies of the signal it took.
+        aterm_verify::exec::group::end_interrupted();
+        std::process::exit(code);
+    }
     if role == "handoff-schema" {
         // Through the real CLI, in a checkout: a person's file that holds a handoff, outside the
         // git directory, then a handoff in another schema in the git directory's own file.
@@ -112,12 +137,23 @@ fn main() {
         let kept = std::fs::read_to_string(&notes).is_ok_and(|text| text == bytes);
         println!("notes-code={code} notes-kept={kept}");
         let file = dir.join(".git").join(aterm_verify::land::handoff::FILE);
-        publish(&file, &bytes.replace(r#""schema":2"#, r#""schema":3"#));
+        publish(&file, &bytes.replace(r#""schema":3"#, r#""schema":4"#));
         let code = resume(&file);
         println!("file-left={}", file.exists());
         std::process::exit(code);
     }
     if role == "parent" {
+        // The parent is one a signal ends. An ignored signal is a disposition a process
+        // inherits, and a shell starts a background job with SIGINT ignored (`nohup`, with
+        // SIGHUP): under one, the signal the test sends would leave this parent running and
+        // the test waiting for its death.
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: restoring a signal's default disposition in this single-threaded
+            // stand-in touches no handler state another thread reads.
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+        }
         let dir = dir.unwrap();
         let compiler = std::env::var_os("LAND_LIFETIME_COMPILER").is_some();
         let mut child = if std::env::var_os("LAND_LIFETIME_CONTROL").is_some() {
@@ -140,6 +176,7 @@ fn main() {
                 std::env::var_os("LAND_LIFETIME_RECHECK").map(|_| aterm_verify::land::Round {
                     judged: "fake-judged",
                     shared: &shared,
+                    readers: None,
                     mechanical: true,
                 });
             aterm_verify::land::judgment_command(
@@ -167,7 +204,8 @@ fn main() {
             if how != "pretend" {
                 // What the group started outside it is awaited until the hang detector passes
                 // with none of it ending, so only a hang, never a loaded host, fails a case.
-                aterm_verify::land::interrupt_judgment_awaiting(&mut child, MUST_HAPPEN);
+                let left = aterm_verify::land::interrupt_judgment_awaiting(&mut child, MUST_HAPPEN);
+                assert!(left.is_empty(), "the interrupt left {left:?} running");
             }
             publish_pid(&dir.join("interrupted"));
             loop {
@@ -191,7 +229,9 @@ fn main() {
             publish(
                 &dir.join("ending"),
                 &match ending {
-                    aterm_verify::land::Ending::Interrupted => "interrupted".to_owned(),
+                    aterm_verify::land::Ending::Interrupted { .. } => "interrupted".to_owned(),
+                    aterm_verify::land::Ending::Unended(left) => format!("unended {left:?}"),
+                    aterm_verify::land::Ending::Stopped => "stopped".to_owned(),
                     aterm_verify::land::Ending::Exited(code) => format!("exited {code}"),
                 },
             );
@@ -510,7 +550,7 @@ fn main() {
                 args.starts_with("--base fake-base --judged fake-judged --shared "),
                 "{args}"
             );
-            assert!(args.contains(aterm_verify::cli::INPUT_DRIFT), "{args}");
+            assert!(args.contains("--fail-fast"), "{args}");
         }
         if doomed {
             publish_pid(&dir.join("doom"));
@@ -595,6 +635,12 @@ mod handoff {
             cone: "2".repeat(40),
             branch: None,
             stated: aterm_types::land_trailer::Stated::default(),
+            run: Some(aterm_verify::land::handoff::Carried {
+                id: "a".repeat(32),
+                started: 1,
+                seq: 0,
+                cause: None,
+            }),
         }
     }
 
@@ -636,7 +682,10 @@ mod handoff {
     /// same exec without the handoff's flush loses that line and keeps the directory it started
     /// in; a missing image is a COULD NOT RUN the landing says and exits with; through the real
     /// CLI, a person's file outside the git directory is refused and left as it was, and a
-    /// handoff in another schema is refused by name and removed.
+    /// handoff in another schema is refused by name and removed. A landing that took an
+    /// interrupt before the exec does not hand over: the copy never runs, the landing returns
+    /// could not run and dies of the signal (a mutant of `hand_over` without its race-free
+    /// interrupt boundary, run once, ran the copy).
     pub fn exec(exe: &Path) {
         let mut scratch =
             aterm_uds::deadline::KeptUntilRan::new(aterm_tempfile::tempdir().unwrap().keep());
@@ -712,6 +761,13 @@ mod handoff {
             text.contains(&refused) && text.contains("returned 3"),
             "{text}"
         );
+        let (code, text, _) = landing(exe, at("interrupted"), "handoff-interrupted", &next, plain);
+        assert_eq!(code, None, "it died of the signal: {text}");
+        assert!(text.contains("returned 3"), "{text}");
+        assert!(
+            !text.contains("resumed image="),
+            "the copy never ran: {text}"
+        );
         let (code, text, _) = landing(exe, at("schema"), "handoff-schema", &missing, plain);
         assert_eq!(code, Some(3), "{text}");
         assert!(text.contains("notes-code=3 notes-kept=true"), "{text}");
@@ -721,7 +777,7 @@ mod handoff {
         );
         assert!(
             text.contains(
-                "it was handed over in schema 3; this tree's verify land reads schemas 1 and 2"
+                "it was handed over in schema 4; this tree's verify land reads schemas 1 to 3"
             ),
             "{text}"
         );
@@ -812,8 +868,12 @@ fn main() {
                 );
             }
         }
-        let out =
-            aterm_uds::deadline::output_within(&mut command, Duration::from_secs(60)).unwrap();
+        let out = aterm_uds::deadline::output_while_process_progressing(
+            &mut command,
+            Duration::from_secs(60),
+            "compiling the native verifier placement fixture",
+        )
+        .expect("the native placement build keeps making progress");
         assert!(
             out.status.success(),
             "{}",
@@ -869,7 +929,12 @@ fn main() {
         .env("BOOTSTRAP_TOOL_POLICY", "retained");
     verify::native_verifier::configure_runtime(&mut command, root, &snapshot);
     command.env("BOOTSTRAP_RUN_MARKER", &marker);
-    let out = aterm_uds::deadline::output_within(&mut command, Duration::from_secs(60)).unwrap();
+    let out = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        Duration::from_secs(60),
+        "the retained bootstrap verifier",
+    )
+    .unwrap();
     assert!(
         out.status.success(),
         "{}",

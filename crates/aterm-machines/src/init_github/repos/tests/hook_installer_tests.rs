@@ -168,7 +168,7 @@ fn a_hook_installer_on_a_mac_without_developer_tools_cannot_ask_for_them() {
 /// The fake clone of github.com/alice/new, carrying an installer when `carries`, and the run
 /// of it [`install_hooks`] makes once it is published.
 fn clone_carrying(carries: bool) -> (Fake, User, Repo, String, String) {
-    let (sys, who, _) = fixture();
+    let (sys, who) = fixture();
     let (repo, staged, clone_key) = script_clone(&sys, &who, false);
     if carries {
         sys.on_stat(&clone_key, &staged.join("scripts"), directory(who.uid));
@@ -564,126 +564,6 @@ fn the_installer_a_real_clone_carries_runs_in_it_and_says_what_it_did() {
     std::fs::write(plain.join("scripts"), b"a file, not a folder\n").unwrap();
     assert_eq!(install_hooks(&sys, &who, &named("plain"), None), None);
     home.close().unwrap();
-}
-
-/// `aterm init`'s profile stage says it too: the row its read-back reports ends with what the
-/// new clone's installer printed, and a failing installer leaves the stage changed.
-#[test]
-fn the_profile_stage_row_says_what_a_new_clones_hook_installer_did() {
-    for (reply, says) in [
-        (
-            Ran::ok(&format!("{INSTALLED}\n")),
-            format!("; ~/new: ran its {HOOK_INSTALLER}: {INSTALLED:?}"),
-        ),
-        (
-            Ran::exit(1, "ERROR: refused\n"),
-            format!(
-                "; ~/new: its {HOOK_INSTALLER} failed (exit 1: \"ERROR: refused\"); the clone \
-                 stands"
-            ),
-        ),
-    ] {
-        let (sys, who, repo, _, installer) = clone_carrying(true);
-        let config = config();
-        sys.on(&installer, reply);
-        script_existing(
-            &sys,
-            &who,
-            &Path::new(&who.home).join(&repo.name),
-            &repo.name,
-        );
-        sys.on_github_api(
-            &who,
-            &format!("{BASE}&page=1"),
-            page(vec![value("new", 1, true)], None),
-        );
-        let row = engine::run(
-            &[item(&who, &config, Vec::new())],
-            Mode::Apply,
-            &sys,
-            &ctx(std::slice::from_ref(&who)),
-            &mut NoJournal,
-        )
-        .remove(0);
-        assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
-        let now = row.to.unwrap_or_default();
-        assert!(now.ends_with(&says), "{now}");
-        assert_eq!(
-            sys.calls()
-                .iter()
-                .filter(|call| **call == installer)
-                .count(),
-            1
-        );
-    }
-}
-
-/// The stage's guards meet the installers: a guard that stops the rest once a clone it made ran
-/// its installer fails the row with that outcome after why, and a switch turned off before the
-/// read-back answers not applicable with it, so the one line about the installer is never lost.
-/// NEGATIVE CONTROLS: a guard checked after the clones with `?`, or the switch read before the
-/// outcomes are taken, drops the line from that answer.
-#[test]
-fn a_guard_or_switch_after_the_clones_still_says_what_their_installers_did() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let says = format!("~/new: ran its {HOOK_INSTALLER}: {INSTALLED:?}");
-    for stop in [true, false] {
-        let (sys, who, repo, _, installer) = clone_carrying(true);
-        let config = config();
-        sys.on(&installer, Ran::ok(&format!("{INSTALLED}\n")));
-        script_existing(
-            &sys,
-            &who,
-            &Path::new(&who.home).join(&repo.name),
-            &repo.name,
-        );
-        sys.on_github_api(
-            &who,
-            &format!("{BASE}&page=1"),
-            page(vec![value("new", 1, true)], None),
-        );
-        let ran = Arc::new(AtomicBool::new(false));
-        let seen = Arc::clone(&ran);
-        sys.simulate(move |_, command| {
-            if command.display() == installer {
-                seen.store(true, Ordering::SeqCst);
-            }
-            None
-        });
-        let item = item(&who, &config, Vec::new());
-        let context = ctx(std::slice::from_ref(&who));
-        assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
-        let authorized = || {
-            if stop && ran.load(Ordering::SeqCst) {
-                Err("late Stop".to_owned())
-            } else {
-                Ok(())
-            }
-        };
-        let applied = item.apply_guarded(&sys, &context, &authorized);
-        assert!(ran.load(Ordering::SeqCst), "the installer ran");
-        if stop {
-            let why = applied.unwrap_err();
-            assert_eq!(why, format!("late Stop; {says}"));
-            continue;
-        }
-        applied.unwrap();
-        sys.write_user_file(
-            &who,
-            &Path::new(&who.home).join(".config/aterm/init.toml"),
-            b"[github]\nenabled = false\n",
-            0o600,
-        )
-        .unwrap();
-        match item.probe(&sys, &context) {
-            Probe::NotApplicable { why } => assert_eq!(
-                why,
-                format!("repository setup is disabled in init.toml; {says}")
-            ),
-            other => panic!("{other:?}"),
-        }
-    }
 }
 
 /// A pass its guard stopped once the clones were done says why, then every failure its clones

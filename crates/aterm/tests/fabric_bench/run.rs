@@ -1588,6 +1588,20 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
     }
     let beside_census = census::census(beside.iter().copied());
     let lat = &lat_raw.samples;
+    let observation_bounds = |timeline: &clock::Timeline, samples: Vec<(u64, u64)>| {
+        let requested = samples.len();
+        let (lower, upper): (Vec<_>, Vec<_>) = samples
+            .into_iter()
+            .filter_map(|(start, seq)| timeline.latency_bounds_ms(start, seq))
+            .unzip();
+        json!({
+            "requested": requested,
+            "unknown": requested - lower.len(),
+            "timeline_valid": timeline.is_valid(),
+            "lower_ms": stats::to_json(&lower),
+            "upper_ms": stats::to_json(&upper),
+        })
+    };
 
     let mut post_call = Vec::new();
     let mut deliver = Vec::new();
@@ -1679,6 +1693,10 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
         "served": served.trim_end(),
         "head_changes_sampled": heads.acked.len(),
         "durable_head_changes_sampled": heads.durable.len(),
+        "head_observation": {
+            "what": "Observation windows run from the previous read start to the first changed read end, allowing one microsecond for clock quantization. Bounds start at post return and can be negative. Summaries describe sampled read windows, not directly instrumented publication timestamps. The requested sleep is not a precision guarantee.",
+            "requested_sleep_us": clock::SAMPLE_GAP.as_micros() as u64,
+        },
         "yardstick": yardstick_json(&ruler, &cal_before, &cal_after, unit),
         "normalized": {
             "what": "the measure divided by the strict yardstick's p50: how many bare Strict publishes it costs. Takes the disk's speed out, not CPU contention: compare runs at similar load",
@@ -1693,6 +1711,10 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "deliver_ms": stats::to_json(&deliver),
             "end_to_end_ms": stats::to_json(&end_to_end),
             "post_to_acked_ms": stats::to_json(&to_acked),
+            "post_to_acked_observation_bounds": observation_bounds(
+                &heads.acked, lat.iter().map(|s| (s.t_ret, seq_of(&s.text))).collect()),
+            "post_to_durable_observation_bounds": observation_bounds(
+                &heads.durable, lat.iter().map(|s| (s.t_ret, seq_of(&s.text))).collect()),
             "acked_to_visible_ms": stats::to_json(&acked_to_visible),
             "post_to_durable_head_ms": stats::to_json(&to_durable),
             "visible_to_commit_acked_ms": stats::to_json(&visible_to_committed),
@@ -1730,6 +1752,10 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             "rate_limited": bur.ticks.rate_limited,
             "deliver_ms": stats::to_json(&b_deliver),
             "post_to_acked_ms": stats::to_json(&b_to_acked),
+            "post_to_acked_observation_bounds": observation_bounds(
+                &heads.acked, bur.rets.iter().copied().zip(seqs.iter().copied()).collect()),
+            "post_to_durable_observation_bounds": observation_bounds(
+                &heads.durable, bur.rets.iter().copied().zip(seqs.iter().copied()).collect()),
             "acked_to_visible_ms": stats::to_json(&b_acked_to_visible),
             "post_to_durable_head_ms": stats::to_json(&b_to_durable),
             "census": census::to_json(&b_census, n, (b_lo, b_hi)),
@@ -1760,6 +1786,7 @@ fn messaging(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
             lat.len(),
             spec.warmup
         ),
+        "Head times below are first observations. The JSON also reports transition latency bounds from bracketing reads; requested sampling sleeps do not guarantee timing precision. Post-to-head latency starts at post return, excluding the post call.".to_string(),
         "| measure (ms) | n | mean | p50 | p95 | p99 |".to_string(),
         "|---|---:|---:|---:|---:|---:|".to_string(),
         stats::row("post call (request -> `OK`)", &post_call),
@@ -2055,6 +2082,9 @@ struct Backlog {
     cold_per_restart: Vec<u64>,
     /// What the broker's residency tier ran in each restart ([`Round::tier`], D10f).
     tier_per_restart: Vec<Option<astream_broker::TierTally>>,
+    /// With `wanted=`: the records the log took past the newest wanted note by the end of the
+    /// fill, its offset as the session's inbox reported it (F11c).
+    wanted_past: Option<u64>,
 }
 
 /// One `| … | n | mean | p50 | p95 | p99 | max |` cell run of `values`.
@@ -2104,6 +2134,17 @@ fn backlog_report(
         backlog::steady_subject(),
         backlog::STEADY_EVERY.as_millis()
     ));
+    if spec.wanted > 0 {
+        md.push(format!(
+            "**Wanted mail among the backlog** (F11c): the fill posts {} note(s) to every session \
+             among its oldest records, {} filler records before each, which the live bridge \
+             delivers and no session marks seen. Every restart's refill reads them again, cold, \
+             the pages that hold one record by record among the filler pages it passes whole; \
+             after each restart every session still lists each of its notes once.\n",
+            spec.wanted,
+            crate::spec::WANTED_GAP
+        ));
+    }
     md.push(
         "| sessions | fill (ms) | paced publish -> ack (ms) | n | mean | p50 | p95 | p99 | max |"
             .to_string(),
@@ -2135,6 +2176,7 @@ fn backlog_report(
                 .iter()
                 .map(|t| t.map_or(Value::Null, backlog::tier_json))
                 .collect::<Vec<_>>(),
+            "wanted_past_records": b.wanted_past,
         }));
     }
     md.push(String::new());
@@ -2202,6 +2244,9 @@ fn backlog_report(
     tier_report(backlogs, md);
     json!({
         "records": spec.backlog,
+        "wanted_per_session": spec.wanted,
+        "wanted_gap": crate::spec::WANTED_GAP,
+        "tier_page_records": crate::spec::TIER_PAGE_RECORDS,
         "body_bytes": backlog::FILL_BODY_LEN,
         "subject": backlog::fill_subject(node),
         "steady_every_ms": u64::try_from(backlog::STEADY_EVERY.as_millis()).unwrap_or(u64::MAX),
@@ -2375,6 +2420,11 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 sids.iter().map(|sid| presence_subject(&w, sid)).collect();
             let mut others_since = HashMap::new();
             let mut fill_ms = None;
+            // With `wanted=`: each session's wanted notes, and its row id before them.
+            let mut wanted: Option<backlog::Wanted> = None;
+            // With `wanted=`: the records the log took past the newest wanted note by the
+            // fill's end, read from where the notes landed, not where they were meant to.
+            let mut wanted_past = None;
             if spec.backlog > 0 {
                 eprintln!(
                     "fabric bench: {size} session(s) mark a note seen, then {} records fill the \
@@ -2384,11 +2434,30 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                 others_since =
                     backlog::seed_seen(&w, &mut mail_ctl, clock, &mailer, &sids, &size.to_string());
                 mail_since = others_since.remove(&mailer).unwrap_or(mail_since);
-                fill_ms = Some(backlog::fill(
-                    &w,
-                    backlog::FILL_PRODUCER + size_index as u64,
-                    spec.backlog,
-                ));
+                let producer = backlog::FILL_PRODUCER + size_index as u64;
+                if spec.wanted > 0 {
+                    let (ms, notes, newest_off) = backlog::fill_with_wanted(
+                        &w,
+                        &mut mail_ctl,
+                        clock,
+                        &mailer,
+                        &sids,
+                        &size.to_string(),
+                        producer,
+                        spec.backlog,
+                        spec.wanted,
+                    );
+                    wanted_past = Some(broker.head().saturating_sub(newest_off + 1));
+                    let mut before = others_since.clone();
+                    before.insert(mailer.clone(), mail_since);
+                    let mut newest = backlog::wanted_listed(&mut mail_ctl, &notes, &before);
+                    mail_since = newest.remove(&mailer).unwrap_or(mail_since);
+                    others_since.extend(newest);
+                    wanted = Some(backlog::Wanted { notes, before });
+                    fill_ms = Some(ms);
+                } else {
+                    fill_ms = Some(backlog::fill(&w, producer, spec.backlog));
+                }
             }
             eprintln!(
                 "fabric bench: attach with {size} session(s), {} restart(s)",
@@ -2488,6 +2557,11 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     let tier = backlog::tier_tally(broker)
                         .zip(tier_before)
                         .map(|(now, before)| now.since(before));
+                    if let Some(backlog::Wanted { notes, before }) = &wanted {
+                        // The refill read each wanted note again, cold: the inbox still lists
+                        // each once, no note lost and none doubled by the offer.
+                        backlog::wanted_listed(&mut mail_ctl, notes, before);
+                    }
                     if let Some(t) = counted.as_mut() {
                         let at = tallies::At {
                             bridge: new_pid,
@@ -2534,6 +2608,7 @@ fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
                     held: backlog::held(broker),
                     cold_per_restart: size_rounds.iter().map(|r| r.cold_reads).collect(),
                     tier_per_restart: size_rounds.iter().map(|r| r.tier).collect(),
+                    wanted_past,
                 });
             }
             rounds.extend(size_rounds);

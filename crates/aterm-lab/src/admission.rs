@@ -10,7 +10,8 @@
 //! window. This is admission evidence, not continuous quiet or a postcompile performance
 //! qualification. The same flag is the run's for every claim it makes: the
 //! Linux and Windows lanes' boots take it for their disk claims ([`mode`]).
-//! Functional windows reserve memory without timing evidence. Both window kinds also share
+//! Functional windows reserve memory without timing evidence. Correctness windows additionally
+//! hold quiet-claim exclusion without requiring low CPU load or sampled timing evidence. All kinds share
 //! one account-level lane for this original lab process; a scratch World never chooses it.
 //! Native handoffs retain the original lane in keepers and guarded development GUIs, so a
 //! surviving window remains serialized after its controller dies. Other desktop apps do
@@ -32,9 +33,44 @@ use crate::Fail;
 static RUN: OnceLock<(Admit, String)> = OnceLock::new();
 static WINDOW_PROCESS: OnceLock<u32> = OnceLock::new();
 
-/// A positive headroom requirement keeps functional work out of the ledger's auto-ALONE
+/// A positive headroom requirement keeps non-timing work out of the ledger's auto-ALONE
 /// policy: its requested peak must fit alongside this unreserved margin.
-const FUNCTIONAL_MARGIN: u64 = 128 * 1024 * 1024;
+pub(super) const FUNCTIONAL_MARGIN: u64 = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum ResourcePurpose {
+    Functional,
+    Correctness,
+}
+
+impl ResourcePurpose {
+    fn need(self, what: String, memory_bytes: u64) -> Need {
+        let need = Need::new(what).mem(memory_bytes).margin(FUNCTIONAL_MARGIN);
+        match self {
+            Self::Functional => need,
+            Self::Correctness => need.quiet(f64::INFINITY),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Functional => "functional memory claim",
+            Self::Correctness => "correctness window claim",
+        }
+    }
+
+    fn accepts(self, need: &Need) -> bool {
+        need.mem > 0
+            && need.margin > 0
+            && !need.alone
+            && need.patience.is_none()
+            && need.quiet_policy == aterm_capacity::QuietPolicy::Load
+            && match self {
+                Self::Functional => need.quiet.is_none(),
+                Self::Correctness => need.quiet == Some(f64::INFINITY),
+            }
+    }
+}
 const WINDOW_LANE: &str = aterm_types::lab_window_guard::LOCK_NAME;
 
 struct WindowLane {
@@ -235,9 +271,7 @@ pub fn functional(what: &str, memory_bytes: u64) -> Result<Claim, Fail> {
     functional_in(
         Ledger::user().as_ref(),
         &aterm_capacity::Live,
-        Need::new(format!("lab {verb}: {what}"))
-            .mem(memory_bytes)
-            .margin(FUNCTIONAL_MARGIN),
+        ResourcePurpose::Functional.need(format!("lab {verb}: {what}"), memory_bytes),
         what,
         mode,
         Pace::default(),
@@ -245,12 +279,33 @@ pub fn functional(what: &str, memory_bytes: u64) -> Result<Claim, Fail> {
     )
 }
 
-struct FunctionalMachine<'a> {
+/// Reserve a known positive memory budget and the quiet-claim exclusion for correctness only.
+/// Load and CPU samples cannot qualify or refuse this claim; it supplies no timing evidence.
+/// # Errors
+/// As [`functional`], and while another independent quiet/window claim holds the exclusion.
+pub(crate) fn correctness(what: &str, memory_bytes: u64) -> Result<Claim, Fail> {
+    let (mode, verb) = RUN
+        .get()
+        .cloned()
+        .unwrap_or_else(|| (Admit::Wait, String::new()));
+    resource_in(
+        ResourcePurpose::Correctness,
+        Ledger::user().as_ref(),
+        &aterm_capacity::Live,
+        ResourcePurpose::Correctness.need(format!("lab {verb}: {what}"), memory_bytes),
+        what,
+        mode,
+        Pace::default(),
+        &mut |line| eprintln!("{line}"),
+    )
+}
+
+struct KnownMemory<'a> {
     inner: &'a dyn Machine,
     unknown: Cell<bool>,
 }
 
-impl Machine for FunctionalMachine<'_> {
+impl Machine for KnownMemory<'_> {
     fn read(&self, path: Option<&Path>) -> aterm_capacity::Reading {
         let mut reading = self.inner.read(path);
         if !matches!((reading.available, reading.physical), (Some(available), Some(physical)) if physical > 0 && available <= physical)
@@ -261,6 +316,12 @@ impl Machine for FunctionalMachine<'_> {
             reading.available = Some(0);
         }
         reading
+    }
+    fn cpu_point(&self) -> Option<aterm_capacity::CpuPoint> {
+        self.inner.cpu_point()
+    }
+    fn gpu_busy(&self, stopped: &dyn Fn() -> bool) -> Option<u8> {
+        self.inner.gpu_busy(stopped)
     }
     fn procs(&self) -> Option<aterm_capacity::Procs> {
         self.inner.procs()
@@ -279,20 +340,45 @@ fn functional_in(
     pace: Pace,
     say: &mut dyn FnMut(&str),
 ) -> Result<Claim, Fail> {
-    let fail =
-        |why: &dyn std::fmt::Display, signal| refused(what, "functional memory claim", why, signal);
+    resource_in(
+        ResourcePurpose::Functional,
+        ledger,
+        machine,
+        need,
+        what,
+        mode,
+        pace,
+        say,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one injected admission path retains purpose, ledger, machine and wait observations"
+)]
+fn resource_in(
+    purpose: ResourcePurpose,
+    ledger: Option<&Ledger>,
+    machine: &dyn Machine,
+    need: Need,
+    what: &str,
+    mode: Admit,
+    pace: Pace,
+    say: &mut dyn FnMut(&str),
+) -> Result<Claim, Fail> {
+    let fail = |why: &dyn std::fmt::Display, signal| refused(what, purpose.label(), why, signal);
     if crate::stop::check().is_err() {
         return Err(fail(&"not asked for: the run was interrupted", None));
     }
-    if mode == Admit::Now {
+    if mode != Admit::Wait {
         return Err(fail(
-            &"not asked for: functional windows require --admit wait",
+            &"not asked for: non-timing windows require --admit wait",
             None,
         ));
     }
-    if need.mem == 0 || need.margin == 0 || need.quiet.is_some() || need.alone {
+    if !purpose.accepts(&need) {
         return Err(fail(
-            &"invalid: a positive peak and spare memory are required without quiet or ALONE",
+            &"invalid: a positive budget, spare memory and matching non-timing exclusion are required without ALONE",
             None,
         ));
     }
@@ -302,7 +388,7 @@ fn functional_in(
             None,
         )
     })?;
-    let machine = FunctionalMachine {
+    let machine = KnownMemory {
         inner: machine,
         unknown: Cell::new(false),
     };
@@ -387,6 +473,106 @@ pub fn quiet(what: &str) -> Result<Claim, Fail> {
         Pace::default(),
         &mut |line| eprintln!("{line}"),
     )
+}
+
+// Only a unit serialization lock lives globally. The noncloneable resource Claim
+// stays in its scoped owner; this lock alone supplies no capacity or timing authority.
+static COMPARISON: Mutex<()> = Mutex::new(());
+
+pub(super) struct ComparisonAdmission {
+    claim: Claim,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+impl ComparisonAdmission {
+    pub(super) fn claim(&self) -> &Claim {
+        &self.claim
+    }
+    pub(super) fn credit(&mut self, pids: &[u32]) -> std::io::Result<()> {
+        self.claim.credit(pids)
+    }
+    pub(super) fn entry(
+        &mut self,
+    ) -> Result<aterm_capacity::CpuWindow, aterm_capacity::TimingIssue> {
+        self.claim.measurement_entry()
+    }
+    pub(super) fn observation(
+        &mut self,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<aterm_capacity::ComparisonObservation, aterm_capacity::TimingIssue> {
+        self.claim.comparison_observation(say)
+    }
+}
+
+fn comparison_slot(slot: &Mutex<()>) -> Result<std::sync::MutexGuard<'_, ()>, Fail> {
+    slot.try_lock().map_err(|_| {
+        refused(
+            "timing comparison",
+            "serialization",
+            &"another quad is active or its original slot is unusable",
+            None,
+        )
+    })
+}
+
+/// One ordinary strict timing reservation with an explicit evidenced peak and normal spare.
+/// A quad retains this original claim; neither entry nor final observation renews it.
+/// # Errors
+/// Unknown/zero memory, missing ledger, override, busy/unknown timing admission or interruption.
+pub(super) fn comparison(what: &str, memory_bytes: u64) -> Result<ComparisonAdmission, Fail> {
+    if memory_bytes == 0 || mode() != Admit::Wait {
+        return Err(refused(
+            what,
+            "comparison",
+            &"positive evidenced peak and --admit wait required",
+            None,
+        ));
+    }
+    window_lane()?;
+    let serial = comparison_slot(&COMPARISON)?;
+    let ledger = Ledger::user();
+    let machine = KnownMemory {
+        inner: &aterm_capacity::Live,
+        unknown: Cell::new(false),
+    };
+    let _ = machine.read(None);
+    if machine.unknown.get() {
+        return Err(refused(
+            what,
+            "comparison",
+            &"memory observation unavailable",
+            None,
+        ));
+    }
+    let ledger = ledger
+        .as_ref()
+        .ok_or_else(|| refused(what, "comparison", &"account ledger unavailable", None))?;
+    let claim = aterm_capacity::admit_until(
+        ledger,
+        &machine,
+        Need::timing(what)
+            .mem(memory_bytes)
+            .margin(FUNCTIONAL_MARGIN),
+        mode(),
+        Pace::default(),
+        &mut |line| eprintln!("{line}"),
+        &|| machine.unknown.get() || crate::stop::check().is_err(),
+    )
+    .map_err(|e| refused(what, "comparison", &e, None))?;
+    if machine.unknown.get() {
+        return Err(refused(
+            what,
+            "comparison",
+            &"memory observation became unavailable",
+            None,
+        ));
+    }
+    claim
+        .comparison_custody()
+        .map_err(|e| refused(what, "comparison", &e, None))?;
+    Ok(ComparisonAdmission {
+        claim,
+        _serial: serial,
+    })
 }
 
 /// [`quiet`]'s admission of `need` for `what` in `ledger` on `machine`, at `pace`, its wait

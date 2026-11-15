@@ -5,18 +5,18 @@
 //! keychain) and repositories. By default the first launch's own repository stage ([`native`])
 //! reads the private account and complete repository inventory from the vault's
 //! `github-repositories.json`, beside its development token. init.toml's `[github]` table
-//! scopes, turns off, or replaces the source with its own token source.
+//! scopes it to an account and owner, or turns it off; the token is always the vault's.
 //! Beside it, in every mode but off, [`keychain`] replaces the keychain block an earlier `aterm
 //! init` wrote, read from git's settings before any GitHub answer.
 
-use crate::git_credential::{Git, Helper, Lookups};
+use crate::git_credential::Helper;
 use crate::items::{Ctx, Item};
-use crate::model::{Probe, User};
+use crate::model::User;
 use crate::port::{GithubError, Secret, System};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 mod checkout_inputs;
 mod credentials;
@@ -29,7 +29,7 @@ mod selection;
 mod source;
 pub use checkout_inputs::RepositoryCheckoutMetadata;
 pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
-pub use inventory::{RepositoryCatalog, RepositoryCatalogVisibility};
+pub use inventory::{RepositoryCatalog, RepositoryCatalogChanges, RepositoryCatalogVisibility};
 pub use native::{InitialRepositoryInputs, RepositoryReadback, RepositoryRun};
 pub(crate) use native::{automatic_inventory_counts, automatic_inventory_counts_captured};
 pub use selection::{RepositoryCredentialWithdrawal, RepositorySelection};
@@ -107,7 +107,7 @@ pub fn uses_vault_inventory(sys: &dyn System, ctx: &Ctx) -> Result<bool, String>
         return Err("repository inventory requires exactly one local user".into());
     };
     let table = profile(sys, user)?.and_then(|profile| profile.github);
-    Ok(matches!(asked(table, user)?, Asked::Default))
+    Ok(matches!(asked(table)?, Asked::Default))
 }
 
 /// The local clones of the vault's repository inventory, read offline for the git tuning
@@ -134,16 +134,16 @@ pub(crate) fn vault_clones(sys: &dyn System, ctx: &Ctx) -> Result<VaultClones, S
         return Err("repository inventory requires exactly one local user".into());
     };
     let table = profile(sys, user)?.and_then(|profile| profile.github);
-    match asked(table, user)? {
+    match asked(table)? {
         Asked::Off => return Ok(VaultClones::Off),
-        Asked::Scoped(_) | Asked::Profile(_) => return Ok(VaultClones::Profile),
+        Asked::Scoped(_) => return Ok(VaultClones::Profile),
         Asked::Default => {}
     }
-    match sys.stat(&inventory::file(&user.home)) {
-        Err(why) if why.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(VaultClones::NoInventory);
-        }
-        _ => {}
+    if sys
+        .vault_entry(Path::new(&user.home), inventory::ENTRY)
+        .is_ok_and(|entry| entry.is_none())
+    {
+        return Ok(VaultClones::NoInventory);
     }
     let listed = inventory::Inventory::read(sys, user)?.into_repositories();
     let standing = repos::partition(sys, user, &listed)?;
@@ -195,12 +195,10 @@ pub fn run_repository_credential_withdrawal(
 
 const INPUT_MAX: usize = 64 * 1024;
 
-/// The GitHub token the ALab vault's sync writes under `home`: the repository stage's token
-/// source unless init.toml's `[github]` names another. It is the file agh adopts as its dev
-/// profile when there is no agh.toml (agh design §6.10), so the two name one file.
-pub(crate) fn token_file(home: &Path) -> PathBuf {
-    agh::identity::vault::Slot::Dev.path(home)
-}
+/// The vault entry of the GitHub token (the registry's `gh:dev`): the repository stage's one
+/// token source, read in place from this Mac's store ([`System::vault_entry`]). It is the
+/// entry agh adopts as its dev profile when there is no agh.toml (agh design §6.10).
+pub(crate) const TOKEN_ENTRY: &str = agh::identity::vault::Slot::Dev.entry();
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -223,10 +221,6 @@ struct Table {
     account: Option<String>,
     #[serde(default)]
     owner: Option<String>,
-    #[serde(default)]
-    token_file: Option<PathBuf>,
-    #[serde(default)]
-    token_key: Option<String>,
 }
 
 const fn enabled() -> bool {
@@ -239,75 +233,51 @@ enum Asked {
     Default,
     /// `enabled = false`: no repository stage.
     Off,
-    /// `account` (and `owner`, else the account) without a token source: the native stage
-    /// over that owner's repositories, signed in as that account.
+    /// `account` (and `owner`, else the account): the native stage over that owner's
+    /// repositories, signed in as that account.
     Scoped(Github),
-    /// A `token_file` too: that source's credential item and its repository item, which also
-    /// fast-forwards the clean worktrees behind GitHub.
-    Profile(Github),
 }
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Github {
     pub account: String,
     pub owner: String,
-    pub token_file: PathBuf,
-    pub token_key: Option<String>,
-}
-
-impl Github {
-    /// aterm's helper over this token source: a profile's own file, answering as its account.
-    fn helper(&self, sys: &dyn System, user: &User) -> Option<Helper> {
-        Helper::token_file(
-            sys,
-            user,
-            &self.account,
-            &self.token_file,
-            self.token_key.as_deref(),
-        )
-    }
 }
 
 /// aterm's own GitHub helper for `user`, which every network git init and the converge pass run
-/// carries
-/// ([`crate::git_credential::pinned`]): over the token file init.toml's `[github]` names, else
-/// the vault's; `None` while `user` has no launcher.
+/// carries ([`crate::git_credential::pinned`]): over the vault's token; `None` while `user` has
+/// no launcher.
 pub(crate) fn helper(sys: &dyn System, user: &User) -> Option<Helper> {
-    match profile_source(sys, user) {
-        Some(config) => config.helper(sys, user),
-        None => Helper::vault(sys, user),
-    }
+    Helper::vault(sys, user)
+}
+
+/// The stage's id, as `aterm init --only` spells it. Each of its items' ids starts with it and
+/// a dot ([`names_item`]): `init.github.native@<user>`, `init.github.keychain@<user>`, and the
+/// clone tuning beside them ([`crate::clone_tuning::ID`]).
+pub const ID: &str = "init.github";
+
+/// Whether `id` names an item of this stage: [`ID`], a dot, then the item's own name. The
+/// stage's own id, which its failure row carries when its items cannot be built, names none.
+#[must_use]
+pub fn names_item(id: &str) -> bool {
+    id.strip_prefix(ID)
+        .and_then(|item| item.strip_prefix('.'))
+        .is_some_and(|item| !item.is_empty())
 }
 
 /// Whether `row` is the keychain item's ([`keychain`]), which no repository step depends on.
 pub(crate) fn keychain_row(row: &crate::model::ItemReport) -> bool {
-    row.id.starts_with("init.github.keychain@")
+    row.id
+        .strip_prefix(ID)
+        .is_some_and(|item| item.starts_with(".keychain@"))
 }
 
-/// The token source init.toml's `[github]` names for `user`; `None` is the vault's.
-fn profile_source(sys: &dyn System, user: &User) -> Option<Github> {
-    let table = profile(sys, user)
-        .ok()
-        .flatten()
-        .and_then(|read| read.github);
-    match asked(table, user) {
-        Ok(Asked::Profile(config)) => Some(config),
-        _ => None,
-    }
-}
-
-/// Whether the token aterm's helper ([`helper`]) would hand back is on this machine, read from
-/// the file as the helper reads it: no GitHub call, and the value goes no further than the
-/// scrubbed buffer this drops. A helper with none answers `quit`, which ends the person's own
+/// Whether the token aterm's helper ([`helper`]) would hand back is on this machine, read in
+/// place from the store as the helper reads it: no GitHub call, and the value goes no further
+/// than the wiped buffer this drops. A helper with none answers `quit`, which ends the person's own
 /// `git push`.
 pub(super) fn token_here(sys: &dyn System, user: &User) -> bool {
-    let source = profile_source(sys, user).unwrap_or_else(|| Github {
-        account: String::new(),
-        owner: String::new(),
-        token_file: token_file(Path::new(&user.home)),
-        token_key: None,
-    });
-    read_token(sys, user, &source).is_ok()
+    read_token(sys, user).is_ok()
 }
 
 /// Whether `user`'s git settings are aterm's to touch: `false` for `[github] enabled = false`.
@@ -316,13 +286,12 @@ pub(super) fn token_here(sys: &dyn System, user: &User) -> bool {
 /// init.toml cannot be read safely, or its `[github]` table cannot be admitted.
 pub(super) fn settings_managed(sys: &dyn System, user: &User) -> Result<bool, String> {
     let table = profile(sys, user)?.and_then(|read| read.github);
-    Ok(!matches!(asked(table, user)?, Asked::Off))
+    Ok(!matches!(asked(table)?, Asked::Off))
 }
 
 /// The repository stage `aterm init` runs: the first launch's own ([`native`]) unless init.toml's
-/// `[github]` turns it off or names its own token source, whose authentication and repository
-/// items then run. Either waits for the item `secrets` names, when one does: the secrets vault
-/// this run joins, or this Mac waits to be let into, writes the token file it reads
+/// `[github]` turns it off. It waits for the item `secrets` names, when one does: the secrets vault
+/// this run joins, or this Mac waits to be let into, delivers the token entry it reads
 /// ([`crate::init_secrets::Secrets::waited_on`]). The keychain item ([`keychain`]) comes first
 /// and waits for nothing: it asks GitHub nothing.
 ///
@@ -382,11 +351,11 @@ pub(crate) fn items_for_execution_with_withdrawal_guard(
         )]);
     }
     let profile = profile(sys, user)?.unwrap_or_default();
-    let config = match asked(profile.github, user)? {
+    match asked(profile.github)? {
         Asked::Off => {
             // A failed cleanup observation is a Native blocker, not a failure to build
             // every other setup group and not permission to retire an unknown intent.
-            return Ok(if withdrawal_unread {
+            Ok(if withdrawal_unread {
                 vec![native::item(
                     user,
                     secrets.map(str::to_owned),
@@ -397,60 +366,44 @@ pub(crate) fn items_for_execution_with_withdrawal_guard(
                 )]
             } else {
                 Vec::new()
-            });
+            })
         }
-        Asked::Default => {
-            return Ok(vec![
-                keychain::item(user),
-                native::item(
-                    user,
-                    secrets.map(str::to_owned),
-                    true,
-                    work,
-                    execution,
-                    withdrawal_current,
-                ),
-            ]);
-        }
-        Asked::Scoped(_) => {
-            return Ok(vec![
-                keychain::item(user),
-                native::item(
-                    user,
-                    secrets.map(str::to_owned),
-                    false,
-                    work,
-                    execution,
-                    withdrawal_current,
-                ),
-            ]);
-        }
-        Asked::Profile(config) => config,
-    };
-    let recorded = crate::init_develop::recorded(user, profile.develop.as_ref())?;
-    Ok(vec![
-        keychain::item(user),
-        Box::new(Auth {
-            user: user.clone(),
-            config: config.clone(),
-            after: secrets.map(str::to_owned),
-        }),
-        repos::item(user, &config, recorded),
-    ])
+        Asked::Default => Ok(vec![
+            keychain::item(user),
+            native::item(
+                user,
+                secrets.map(str::to_owned),
+                true,
+                work,
+                execution,
+                withdrawal_current,
+            ),
+        ]),
+        Asked::Scoped(_) => Ok(vec![
+            keychain::item(user),
+            native::item(
+                user,
+                secrets.map(str::to_owned),
+                false,
+                work,
+                execution,
+                withdrawal_current,
+            ),
+        ]),
+    }
 }
 
 /// What `sync.clone` reads of the GitHub step an `aterm init` owes ([`crate::init::owed_clone`]):
 /// whether the token it reads is on this Mac, and the step's mark.
 pub(crate) struct TokenRead {
-    /// The token is here: the vault's ([`token_file`]), or the `token_file` init.toml's
-    /// `[github]` names.
+    /// This Mac's store holds the vault's token ([`TOKEN_ENTRY`]).
     pub(crate) landed: bool,
-    /// Why a token file that is there cannot be used (not a regular file of the user's, a
-    /// link, readable by others, or too long): what is wrong with it, in plain words.
+    /// Why the store's token cannot be read here (its local state is unreadable): what is
+    /// wrong, in plain words.
     pub(crate) unusable: Option<String>,
-    /// A digest of init.toml, private repository metadata, the token and whether git is installed, which moves when any of
-    /// them changes: a clone only a person could finish waits until it does. The token itself is
-    /// not kept.
+    /// A digest of init.toml, private repository metadata, the token and whether git is
+    /// installed, which moves when any of them changes: a clone only a person could finish
+    /// waits until it does. The token itself is not kept.
     pub(crate) mark: String,
 }
 
@@ -467,30 +420,22 @@ pub(crate) fn token_read(sys: &dyn System, ctx: &Ctx) -> Result<Option<TokenRead
         .read_owned_file(&config, user.uid, INPUT_MAX, false)
         .unwrap_or_default();
     let table = profile(sys, user)?.and_then(|profile| profile.github);
-    let path = match asked(table, user)? {
-        Asked::Off => return Ok(None),
-        Asked::Default => token_file(Path::new(&user.home)),
-        Asked::Scoped(config) | Asked::Profile(config) => config.token_file,
-    };
-    let read = sys.read_owned_file(&path, user.uid, INPUT_MAX, true);
-    let unusable = match &read {
-        Err(why) if why.kind() != io::ErrorKind::NotFound => Some(format!(
-            "the GitHub token at {} is on this {} but cannot be used ({why}): it must be a \
-             regular file of yours, not a link, that only you can read, of at most {} KiB",
-            path.display(),
-            sys.machine(),
-            INPUT_MAX / 1024
-        )),
-        _ => None,
-    };
-    let token = read.ok().map(zeroize::Zeroizing::new);
-    let inventory = sys
-        .read_owned_file(
-            &inventory::file(&user.home),
-            user.uid,
-            inventory::MAX_BYTES,
-            true,
+    if matches!(asked(table)?, Asked::Off) {
+        return Ok(None);
+    }
+    let read = sys.vault_entry(Path::new(&user.home), TOKEN_ENTRY);
+    let unusable = read.as_ref().err().map(|why| {
+        format!(
+            "the GitHub token (vault entry {TOKEN_ENTRY}) cannot be read from this {}'s vault \
+             copy ({why})",
+            sys.machine()
         )
+    });
+    let token = read.ok().flatten();
+    let inventory = sys
+        .vault_entry(Path::new(&user.home), inventory::ENTRY)
+        .ok()
+        .flatten()
         .unwrap_or_default();
     // Whether git is there is part of the mark: a step that stopped without it runs again once
     // the Command Line Tools bring it.
@@ -535,33 +480,15 @@ pub(super) fn develop_checkouts(
     )
 }
 
-/// Returns the home's checkouts of the configured owner's repositories that are aterm workspaces.
-///
-/// # Errors
-/// The profile cannot be admitted, or the listing or a worktree cannot be read.
-pub(crate) fn aterm_checkouts(sys: &dyn System, ctx: &Ctx) -> Result<Vec<PathBuf>, String> {
-    let [user] = ctx.users.as_slice() else {
-        return Err("aterm init --develop requires exactly one local user".into());
-    };
-    let table = profile(sys, user)?.and_then(|profile| profile.github);
-    let Asked::Profile(config) = asked(table, user)? else {
-        return Ok(Vec::new());
-    };
-    let Some(token) = auth_ready(sys, user, &config)? else {
-        return Ok(Vec::new());
-    };
-    repos::aterm_checkouts(sys, user, &config, &token)
-}
-
 fn decode(bytes: &[u8]) -> Result<Config, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "init.toml must be UTF-8; no configuration contents were printed")?;
     aterm_toml::from_str(text)
-        .map_err(|_| "invalid init.toml; expected [github] enabled, account, owner, token_file and token_key, and [develop] checkouts (credential values do not belong in this file)".into())
+        .map_err(|_| "invalid init.toml; expected [github] enabled, account and owner, and [develop] checkouts (the GitHub token is the vault's gh:dev)".into())
 }
 
 /// What `table` asks ([`Asked`]), its names and paths checked.
-fn asked(table: Option<Table>, user: &User) -> Result<Asked, String> {
+fn asked(table: Option<Table>) -> Result<Asked, String> {
     let Some(table) = table else {
         return Ok(Asked::Default);
     };
@@ -569,61 +496,13 @@ fn asked(table: Option<Table>, user: &User) -> Result<Asked, String> {
         return Ok(Asked::Off);
     }
     let Some(account) = table.account else {
-        return Err(
-            "GitHub owner, token_file and token_key need an account in init.toml's [github]".into(),
-        );
+        return Err("GitHub owner needs an account in init.toml's [github]".into());
     };
     let owner = table.owner.unwrap_or_else(|| account.clone());
     if !login(&account) || !login(&owner) {
         return Err("GitHub account and owner must be valid login names".into());
     }
-    if table
-        .token_key
-        .as_deref()
-        .is_some_and(|key| !aterm_secrets::token_line::assignable(key))
-    {
-        return Err("GitHub token_key must be an environment assignment name".into());
-    }
-    let Some(token_file) = table.token_file else {
-        if table.token_key.is_some() {
-            return Err("GitHub token_key reads the token_file init.toml's [github] names".into());
-        }
-        return Ok(Asked::Scoped(Github {
-            account,
-            owner,
-            token_file: token_file(Path::new(&user.home)),
-            token_key: None,
-        }));
-    };
-    let path = token_file
-        .to_str()
-        .ok_or("GitHub token_file must be UTF-8")?;
-    let token_file = if let Some(relative) = path.strip_prefix("~/") {
-        Path::new(&user.home).join(relative)
-    } else {
-        token_file.clone()
-    };
-    if !token_file.is_absolute()
-        || token_file
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
-    {
-        return Err(
-            "GitHub token_file must be an absolute or ~/ path without dot components".into(),
-        );
-    }
-    if token_file
-        .file_name()
-        .is_some_and(|n| n == "release-credentials.toml")
-    {
-        return Err("GitHub token_file cannot name aterm release credentials".into());
-    }
-    Ok(Asked::Profile(Github {
-        account,
-        owner,
-        token_file,
-        token_key: table.token_key,
-    }))
+    Ok(Asked::Scoped(Github { account, owner }))
 }
 
 fn login(value: &str) -> bool {
@@ -635,10 +514,6 @@ fn login(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-
-pub(super) fn auth_id(user: &User) -> String {
-    format!("init.github.auth@{}", user.name)
 }
 
 /// Performs one GitHub GET request as `user` with `token`.
@@ -696,127 +571,16 @@ fn signed_in((value, _): crate::github_pages::Page) -> Result<String, GithubErro
 pub(crate) const NEEDS_GIT: &str = "GitHub bootstrap needs git, from Apple's Command Line Tools \
                                     or Xcode (aterm init --only base.clt installs the tools)";
 
-/// The token file's token, when aterm's route hands it back ([`Git::lookups`]) and GitHub signs
-/// it in as the configured account. A GitHub that cannot vouch for that token is no token here:
-/// the callers only read, and the Auth row says why.
-pub(super) fn auth_ready(
-    sys: &dyn System,
-    user: &User,
-    config: &Github,
-) -> Result<Option<Secret>, String> {
-    let Ok(token) = read_token(sys, user, config) else {
-        return Ok(None);
-    };
-    let git = Git::for_user(sys, user);
-    if !git.installed(sys) {
-        return Err(NEEDS_GIT.into());
-    }
-    let helper = config.helper(sys, user);
-    if !git.lookups(sys, user, helper.as_ref(), &token)?.ready() {
-        return Ok(None);
-    }
-    Ok(signs_in_as(sys, user, &token)
-        .ok()
-        .flatten()
-        .filter(|account| account.eq_ignore_ascii_case(&config.account))
-        .map(|_| token))
-}
-
-/// git's GitHub HTTPS route for a profile's own token file: aterm's helper hands that token back,
-/// never the login keychain, and GitHub signs it in as the configured account. The item only
-/// reads: it stores the token nowhere and writes nothing.
-struct Auth {
-    user: User,
-    config: Github,
-    /// The secrets item it waits for ([`items`]).
-    after: Option<String>,
-}
-
-impl Auth {
-    /// The token, and what aterm's route hands back for it; the probe's answer where it cannot
-    /// read them.
-    fn read(&self, sys: &dyn System) -> Result<(Secret, Lookups), Probe> {
-        let git = Git::for_user(sys, &self.user);
-        if !git.installed(sys) {
-            return Err(Probe::Unusable {
-                why: NEEDS_GIT.into(),
-            });
-        }
-        let token = read_token(sys, &self.user, &self.config)
-            .map_err(|unread| Probe::Blocked { why: unread.why })?;
-        let helper = self.config.helper(sys, &self.user);
-        let lookups = git
-            .lookups(sys, &self.user, helper.as_ref(), &token)
-            .map_err(|why| Probe::Unusable { why })?;
-        Ok((token, lookups))
-    }
-}
-
-impl Item for Auth {
-    fn id(&self) -> String {
-        auth_id(&self.user)
-    }
-    fn family(&self) -> &'static str {
-        "github"
-    }
-    fn title(&self) -> String {
-        format!(
-            "GitHub HTTPS credential for {} through aterm's own helper, never the login keychain",
-            self.config.account
-        )
-    }
-    fn after(&self) -> Vec<String> {
-        self.after.iter().cloned().collect()
-    }
-    fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
-        let (token, lookups) = match self.read(sys) {
-            Ok(read) => read,
-            Err(probe) => return probe,
-        };
-        if let Lookups::Not(why) = lookups {
-            return Probe::Blocked {
-                why: format!(
-                    "aterm's GitHub route does not hand back the token in {}: {why}; aterm never \
-                     keeps it in the login keychain",
-                    self.config.token_file.display()
-                ),
-            };
-        }
-        match signs_in_as(sys, &self.user, &token) {
-            Ok(Some(account)) if account.eq_ignore_ascii_case(&self.config.account) => {
-                Probe::Ok { now: self.title() }
-            }
-            Ok(_) => Probe::Blocked {
-                why: format!(
-                    "aterm's helper hands back the token in {}, but GitHub refuses it or signs it \
-                     in as another account than {}",
-                    self.config.token_file.display(),
-                    self.config.account
-                ),
-            },
-            Err(_) => Probe::Unusable {
-                why: "aterm's helper hands back the GitHub token file's token, but GitHub did \
-                      not say which account it signs in as (output withheld)"
-                    .into(),
-            },
-        }
-    }
-    /// The item only reads: its probe plans no change.
-    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        Ok(())
-    }
-}
-
 /// What a probe that found the block an earlier `aterm init` wrote says it reads.
 pub(super) const KEYCHAIN_BLOCK: &str = "git's global settings hold a GitHub credential block of the shape an earlier aterm init \
      wrote, which reads the login keychain (or, off a Mac, a plain token file)";
 
-/// Why [`read_token`] has no token: the engine's line, and whether the source is not there
-/// at all (the vault has not written it yet) rather than there and unusable.
+/// Why [`read_token`] has no token: the engine's line, and whether the store holds none at all
+/// (the vault has not delivered it yet) rather than one that cannot be used.
 pub(super) struct TokenUnread {
-    /// Nothing is at the source's path.
+    /// The store holds no such entry.
     pub(super) absent: bool,
-    /// The engine's line; it never quotes the file.
+    /// The engine's line; it never quotes the value.
     pub(super) why: String,
 }
 
@@ -826,46 +590,38 @@ impl From<TokenUnread> for String {
     }
 }
 
-fn read_token(sys: &dyn System, user: &User, config: &Github) -> Result<Secret, TokenUnread> {
+/// The vault's GitHub token ([`TOKEN_ENTRY`]), the stage's one token source, read in place.
+fn read_token(sys: &dyn System, user: &User) -> Result<Secret, TokenUnread> {
     crate::port::no_core_dumps();
-    let mut bytes = sys
-        .read_owned_file(&config.token_file, user.uid, INPUT_MAX, true)
-        .map_err(|error| {
-            let absent = error.kind() == io::ErrorKind::NotFound;
-            TokenUnread {
-                absent,
-                why: if absent {
-                    format!(
-                        "the GitHub token file ({}) is not on this {} yet",
-                        config.token_file.display(),
-                        sys.machine()
-                    )
-                } else {
-                    "GitHub token source must be an owned private regular file (0600), without \
-                     links, at most 64 KiB"
-                        .into()
-                },
-            }
+    let bytes = sys
+        .vault_entry(Path::new(&user.home), TOKEN_ENTRY)
+        .map_err(|why| TokenUnread {
+            absent: false,
+            why: format!(
+                "the GitHub token (vault entry {TOKEN_ENTRY}) cannot be read from this {}'s vault \
+                 copy ({why})",
+                sys.machine()
+            ),
+        })?
+        .ok_or_else(|| TokenUnread {
+            absent: true,
+            why: format!(
+                "the GitHub token (vault entry {TOKEN_ENTRY}) is not in this {}'s vault copy yet",
+                sys.machine()
+            ),
         })?;
-    let result = token(&bytes, config.token_key.as_deref());
-    aterm_uds::secret::scrub(&mut bytes);
-    result.map_err(|why| TokenUnread { absent: false, why })
+    if bytes.len() > INPUT_MAX {
+        return Err(TokenUnread {
+            absent: false,
+            why: "the GitHub token entry is longer than 64 KiB".into(),
+        });
+    }
+    token(bytes.as_slice()).map_err(|why| TokenUnread { absent: false, why })
 }
 
-fn token(bytes: &[u8], key: Option<&str>) -> Result<Secret, String> {
+fn token(bytes: &[u8]) -> Result<Secret, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "GitHub token source must be UTF-8")?;
-    let value = if let Some(key) = key {
-        aterm_secrets::token_line::assigned(text, key).map_err(|unassigned| match unassigned {
-            aterm_secrets::token_line::Unassigned::Repeated => {
-                "GitHub token_key appears more than once; no file content was executed"
-            }
-            aterm_secrets::token_line::Unassigned::Missing => {
-                "GitHub token_key was not found; no file content was executed"
-            }
-        })?
-    } else {
-        text.trim()
-    };
+    let value = text.trim();
     if value.is_empty()
         || value.len() > crate::port::SECRET_MAX
         || !value

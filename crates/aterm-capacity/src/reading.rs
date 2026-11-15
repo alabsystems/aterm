@@ -264,6 +264,10 @@ pub struct Proc {
     pub pid: u32,
     /// Its parent's pid.
     pub ppid: u32,
+    /// Its kernel start identity (`aterm_sysprobe` `ProcessReading::start`: Mach absolute ticks on
+    /// macOS, boot nanoseconds on Linux, creation FILETIME on Windows), 0 where unread. With its
+    /// pid it names one process from one sweep to the next; a reused pid reads another.
+    pub start: u64,
     /// The memory a claim's reservation charges it, bytes ([`Proc::of_reading`]: the lesser of
     /// its footprint and its resident size, on macOS its physical footprint and resident size, on
     /// Linux `RssAnon`): 0 where unread.
@@ -316,6 +320,26 @@ impl Procs {
         rows.next()
             .is_some_and(|process| process.footprint > 0 && process.charged <= process.footprint)
             && rows.next().is_none()
+    }
+
+    /// The kernel start identity of `pid`'s one row ([`Proc::start`]): `None` where the sweep
+    /// holds no row of it, more than one, or one whose start it did not read. The same one-row
+    /// rule as [`Self::observes_resources`].
+    pub(crate) fn start_of(&self, pid: u32) -> Option<u64> {
+        let mut rows = self.procs.iter().filter(|p| p.pid == pid);
+        let start = rows.next()?.start;
+        (start != 0 && rows.next().is_none()).then_some(start)
+    }
+
+    /// Comparison sizing refuses an unknown member instead of adding a zero footprint.
+    #[cfg(unix)]
+    pub(crate) fn observes_tree_resources(&self, root: u32) -> bool {
+        self.observes_resources(root)
+            && self
+                .procs
+                .iter()
+                .filter(|p| p.pid == root || self.ancestors(p.pid).contains(&root))
+                .all(|p| self.observes_resources(p.pid))
     }
 
     /// The processes `pid` descends from, its parent first, as far as the sweep holds them.
@@ -664,6 +688,7 @@ impl Proc {
         Proc {
             pid: p.pid,
             ppid: p.ppid,
+            start: p.start.unwrap_or(0),
             charged: p.resident.map_or(footprint, |r| r.min(footprint)),
             footprint,
             written: p.disk_written.unwrap_or(0),

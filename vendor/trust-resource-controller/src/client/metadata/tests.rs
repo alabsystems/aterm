@@ -396,7 +396,7 @@ fn existing_original_descriptions_are_ordered_never_reconstructed() {
         read: Descriptor { source: read.as_raw_fd() as u32, target: 3 },
         write: Descriptor { source: write.as_raw_fd() as u32, target: 4 },
     };
-    let originals = vec![OwnedFd::from(write), OwnedFd::from(read)];
+    let originals = vec![write, read];
     let expected = match request.member.delegations.gnu {
         GnuTransport::NumericPipe { read, write } => [read.source, write.source],
         _ => unreachable!(),

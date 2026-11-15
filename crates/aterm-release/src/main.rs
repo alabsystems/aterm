@@ -4,6 +4,7 @@
 //! `aterm-release`: the release cutter behind the `targo --unverified ship` alias.
 
 mod accepted_measure;
+mod allowance;
 mod apple;
 
 mod artifact;
@@ -66,6 +67,7 @@ mod cutter_inputs;
 mod release;
 mod release_disk;
 mod release_keychain;
+mod release_leftovers;
 mod release_pump;
 mod release_status;
 mod release_steps;
@@ -182,6 +184,10 @@ fn main() -> std::process::ExitCode {
     drop(remote_host);
     std::process::exit(code);
 }
+
+#[cfg(all(test, unix))]
+#[path = "test_vault_tests.rs"]
+mod test_vault;
 
 /// Create a short `.noindex` temporary directory for unit tests in this crate.
 #[cfg(test)]

@@ -493,7 +493,7 @@ fn a_staging_owner_that_cannot_be_read_is_never_read_as_absent() {
         }),
         staging: alab::Staging::Unknown("alabsystems unreachable".into()),
         latched: false,
-        public_on: std::collections::BTreeSet::new(),
+        public: alab::Public::NotLooked,
     };
     assert_eq!(
         alab::decide(&facts),
@@ -808,19 +808,16 @@ fn a_finished_run_leaves_no_start_stamp_for_the_next_lock_holder_to_be_read_as()
 }
 
 #[test]
-fn a_signing_run_needs_the_key_and_both_token_files() {
+fn a_signing_run_needs_the_key_and_both_tokens() {
     // The `gh` arm's token check, said outright; under agh both writers are asked instead
     // (`under_agh::a_signing_run_asks_both_writers_under_agh`).
     let mut w = World::new("alab-preflight");
     w.fx.use_gh();
-    std::fs::remove_file(&w.fx.ctx.tokens.staging).expect("rm token");
+    w.fx.ctx.tokens.staging.put_for_tests(None);
     let (r, _) = w.run(false);
     let e = r.expect_err("no staging token");
     assert!(matches!(e, Error::CannotRun(_)), "{e}");
-    assert!(
-        e.to_string().contains("staging token file missing/empty"),
-        "{e}"
-    );
+    assert!(e.to_string().contains("staging token missing/empty"), "{e}");
     ok(w.run(true));
 }
 
@@ -1633,6 +1630,104 @@ fn a_release_already_public_on_one_target_is_never_repacked_for_the_other() {
         "a published pack never gains rows: {:?}",
         w.fx.packer.legs()
     );
+}
+
+#[test]
+fn a_release_published_before_its_overlay_moved_on_is_never_repacked() {
+    // The tip lane published build 3 for Apple silicon alone (the public owner serves an
+    // aarch64-only pack), and has since moved that overlay on to 4: no target pins 3 now.
+    let w = World::new("alab-public-moved-on");
+    w.fx.publish_pkg("ay", 3, &fixture::manifest("ay", 3, &[ARM]));
+    head_with_overlay(&w, 6, 2, ARM, &[("ay", 4)]);
+    let (o, tx) = ok(w.run(false));
+    let ay = rendered(&o, "ay");
+    assert_eq!(
+        ay,
+        "SKIP: build 3 is already public on aarch64-apple-darwin, and a published pack never \
+         gains rows — x86_64-apple-darwin moves with the next signed release",
+        "{}",
+        tx.text()
+    );
+    assert!(
+        !w.fx.packer.legs().iter().any(|(p, _, _)| p == "ay"),
+        "{:?}",
+        w.fx.packer.legs()
+    );
+    let state = w.state();
+    assert!(!state.attempts_file("ay", 3).exists() && !state.blocked_file("ay", 3).exists());
+
+    // A public pack that does not verify says nothing about its rows: never read as
+    // unpublished, and never packed over.
+    let w = World::new("alab-public-invalid");
+    let slug = fixture::public(&w.fx, "ay");
+    w.fx.host.put_asset(
+        &slug,
+        "atpkg-ay-3",
+        "pkg-ay-3.toml",
+        fixture::manifest("ay", 3, &[ARM]).into_bytes(),
+    );
+    w.fx.host.put_asset(
+        &slug,
+        "atpkg-ay-3",
+        "pkg-ay-3.toml.sig",
+        b"not a signature".to_vec(),
+    );
+    head_with_overlay(&w, 6, 2, ARM, &[("ay", 4)]);
+    let (o, tx) = ok(w.run(false));
+    let ay = rendered(&o, "ay");
+    assert!(
+        ay.starts_with("SKIP: atpkg-ay-3 on alabsystems does not verify"),
+        "{ay}\n{}",
+        tx.text()
+    );
+    assert!(!w.fx.packer.legs().iter().any(|(p, _, _)| p == "ay"));
+}
+
+/// `atpkg-<program>-<build>` signed with `rows`, on the public owner alone: the staging owner
+/// never held it, or no longer does.
+fn publish_on_public_only(w: &World, program: &str, build: u64, rows: &[Triple]) {
+    let text = fixture::manifest(program, build, rows);
+    let slug = fixture::public(&w.fx, program);
+    let tag = format!("atpkg-{program}-{build}");
+    let name = format!("pkg-{program}-{build}.toml");
+    w.fx.host
+        .put_asset(&slug, &tag, &name, text.as_bytes().to_vec());
+    w.fx.host.put_asset(
+        &slug,
+        &tag,
+        &format!("{name}.sig"),
+        w.fx.keys.sign(text.as_bytes()),
+    );
+}
+
+#[test]
+fn a_build_the_public_owner_serves_whole_is_indexed_never_packed() {
+    // The public owner serves build 3 with both Apple rows and the staging owner holds no
+    // atpkg-ay-3: whether an overlay pins it still, or has moved on past it, the index is
+    // what remains. A pack would be a second manifest under a published tag, which the
+    // upload refuses and counts until the build latches.
+    for (label, overlay) in [("alab-public-whole", 3), ("alab-public-whole-moved", 4)] {
+        let w = World::new(label);
+        publish_on_public_only(&w, "ay", 3, &[ARM, X86]);
+        head_with_overlay(&w, 6, 2, ARM, &[("ay", overlay)]);
+        let (o, tx) = ok(w.run(false));
+        assert_eq!(
+            rendered(&o, "ay"),
+            "INDEX: v0.2.0 (build 3) is already public as atpkg-ay-3 with every Apple row it \
+             must carry — publishing the index is what remains, never a pack",
+            "{label}: {}",
+            tx.text()
+        );
+        assert!(
+            !w.fx.packer.legs().iter().any(|(p, _, _)| p == "ay"),
+            "{label}: {:?}",
+            w.fx.packer.legs()
+        );
+        assert_eq!(o.published, Some(7), "{label}: {}", tx.text());
+        assert_eq!(last_delta(&w).pins.get("ay"), Some(&3), "{label}");
+        let state = w.state();
+        assert!(!state.attempts_file("ay", 3).exists(), "{label}");
+    }
 }
 
 #[test]

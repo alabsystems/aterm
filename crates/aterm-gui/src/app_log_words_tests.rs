@@ -283,17 +283,38 @@ fn a_demoted_message_reaches_the_log_by_its_key_or_its_titles_length() {
 }
 
 /// PRIV4-3: the writers 1a7cad3eb5 turned from an alert into an aterm.log line keep words, kinds
-/// and lengths there: a document that could not open (`menu::notify`, whose body names the
-/// person's file) by its title and its body's length, and a launch that cannot go on
+/// and lengths there: a document that could not open (`App::show_failed_open`, whose detail names
+/// the person's file) by its title and its detail's length, and a launch that cannot go on
 /// (`fatal_launch_error`, whose detail can name a shell's path) by its kind and its detail's
-/// length; each text keeps its home on stderr. NEGATIVE CONTROLS (scratch): the `{title}: {body}`
-/// format fails the first sentinel check with `QZP7E7N1`, and the detail logged whole fails the
-/// second with `QZP7E7N2`.
+/// length; each text keeps its home (the failed open's on stderr and its window's Recovery tab).
+/// A File ▸ Open with no window to show it in keeps the same record. NEGATIVE CONTROLS
+/// (scratch): the `{title}: {body}` format of `menu::notify`, or the failed open's detail logged
+/// whole, fails the first sentinel check with `QZP7E7N1`; the launch detail logged whole fails
+/// the second with `QZP7E7N2`; and a windowless File ▸ Open that writes no record fails the
+/// third.
 #[test]
 fn an_open_failure_and_a_launch_fatal_reach_the_log_by_their_length() {
     let body = "document open failed: Preflight: /u/jsmith/QZP7E7N1/notes.md is evicted from \
                 iCloud Drive and must be downloaded in Finder first";
-    let logged = logged_while(|| crate::menu::notify("Couldn’t Open File", body));
+    let mut app = App::headless_for_test();
+    let wid = crate::WindowId(0);
+    let logged = logged_while(|| {
+        app.show_failed_open(
+            wid,
+            crate::app_documents::FailedOpen {
+                kind: crate::native_app::AppKind::Markdown,
+                requested_uri: Some("file:///u/jsmith/QZP7E7N1/notes.md".to_string()),
+                canonical_uri: None,
+                path_shown: "/u/jsmith/QZP7E7N1/notes.md".to_string(),
+                problem: body
+                    .trim_start_matches("document open failed: ")
+                    .to_string(),
+                detail: body.to_string(),
+                reveal: None,
+                entry: false,
+            },
+        );
+    });
     assert!(
         !logged.iter().any(|line| line.contains("QZP7E7N")),
         "the log keeps the document's path"
@@ -303,6 +324,32 @@ fn an_open_failure_and_a_launch_fatal_reach_the_log_by_their_length() {
             .iter()
             .any(|line| line == &format!("Couldn’t Open File: {}B", body.len())),
         "the failure is logged by its title and length: {} lines",
+        logged.len()
+    );
+    let (instance, _) = app.active_native_view(wid).expect("the failure's tab");
+    assert!(
+        matches!(
+            app.native_runtime.app(instance),
+            Some(crate::native_app::NativeApp::Recovery(recovery)) if recovery.metadata == body
+        ),
+        "the window that asked keeps the detail"
+    );
+    app.frontmost_window = None;
+    let mut why = String::new();
+    let logged = logged_while(|| {
+        why = app
+            .open_local_document_path(std::path::Path::new("/u/jsmith/QZP7E7N3/notes.md"))
+            .unwrap_err();
+    });
+    assert!(
+        !logged.iter().any(|line| line.contains("QZP7E7N")),
+        "the log keeps the chosen file's path"
+    );
+    assert!(
+        logged
+            .iter()
+            .any(|line| line == &format!("Couldn’t Open File: {}B", why.len())),
+        "with no window to show it, the failure is still logged by its title and length: {} lines",
         logged.len()
     );
     let detail = "spawn failed: child could not exec `/u/jsmith/QZP7E7N2/fish`";

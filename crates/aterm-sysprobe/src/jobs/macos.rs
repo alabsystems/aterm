@@ -91,8 +91,12 @@ fn from_bsd(pid: u32, b: &libc::proc_bsdinfo) -> ProcFacts {
     }
 }
 
-/// `sysctl(KERN_PROC_PID)`.
+/// `sysctl(KERN_PROC_PID)`, made inside this process's exec gate ([`crate::exec_gate`]): `None`,
+/// with nothing read, while an exec of this process has it closed.
 pub(crate) fn kinfo(pid: c_int) -> Option<darwin::Kinfo> {
+    let _in_kernel = crate::exec_gate::reading()?;
+    // Marked once the gate lets the read be made: a lane's crumb names a call its reader is in.
+    crate::lane::mark("sysctl KERN_PROC_PID", u32::try_from(pid).ok());
     let mut buf = vec![0u8; darwin::KINFO_SIZE];
     let mut len: libc::size_t = buf.len();
     let mut mib = [

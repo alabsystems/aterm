@@ -1,0 +1,24 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "alab-policy"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The turn-end readers an ALab harness judges an agent's reply with: needs, credentials, Land's check, the go-ahead, Cruise's carry, the press guard, whether a shell command only reads, the words each act types, the phase, wall and reset vocabulary a screen reader reports in, and the policy keys and timings it decides under; std only"
+
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = ["fixtures"]
+
+[lints]
+workspace = true
+
+# None, by design: claude-code-alab carries a sealed copy.
+[dependencies]

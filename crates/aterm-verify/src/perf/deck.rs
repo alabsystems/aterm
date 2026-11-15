@@ -132,13 +132,13 @@ fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
         out.display(),
         driver.display_workspace("test", &args)
     );
-    let built = driver
-        .workspace_command("test")?
+    let mut build_command = driver.workspace_command("test")?;
+    build_command
         .args(args)
         .env("ATERM_DECK_COST", &out)
         .current_dir(workspace_root())
-        .stderr(aterm_uds::spawnfd::Stdio::inherit())
-        .output()
+        .stderr(aterm_uds::spawnfd::Stdio::inherit());
+    let built = super::driver::compiler_output(&mut build_command)
         .map_err(|e| format!("could not build the bench: {e}"))?;
     if !built.status.success() {
         return Err(format!("deck bench build exited {}", built.status).into());
@@ -212,11 +212,11 @@ fn idle_take(dir: &Path) -> Result<String, String> {
     }
     eprintln!("  debug deck fixture plan: {}", plan.summary());
     eprintln!("  $ {}", targo.display("build", &build));
-    let built = targo
-        .command("build")?
+    let mut build_command = targo.command("build")?;
+    build_command
         .args(build)
-        .stderr(aterm_uds::spawnfd::Stdio::inherit())
-        .output()
+        .stderr(aterm_uds::spawnfd::Stdio::inherit());
+    let built = super::driver::compiler_output(&mut build_command)
         .map_err(|e| format!("could not spawn the build: {e}"))?;
     if !built.status.success() {
         return Err(format!("the debug fixture build exited {}", built.status));

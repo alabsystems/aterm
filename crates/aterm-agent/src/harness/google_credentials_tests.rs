@@ -181,23 +181,39 @@ fn a_local_file_without_a_registered_entry_is_never_a_credential() {
     assert!(matches!(fixture.load(), Err(Error::MissingEntry)));
 }
 
+/// An edited file at the entry's old `~/.secrets` path does not reach the browser: the vault's
+/// credential does, and the read is still current. NEGATIVE CONTROL: a change in the vault does
+/// make the read stale.
 #[cfg(unix)]
 #[test]
-fn edited_materialized_bytes_cannot_reach_the_browser() {
+fn an_edited_file_at_the_old_path_cannot_reach_the_browser() {
     let fixture = Fixture::new();
     fixture.publish("google-one", VALUE);
     let mut credentials = fixture.load().unwrap();
+    let file = fixture.paths.home.join(".secrets/google-one");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(
-        fixture.paths.home.join(".secrets/google-one"),
+        &file,
         VALUE.replace("fixture-only-password", "unverified-password"),
     )
     .unwrap();
-    assert_eq!(
-        credentials.with_google_page("https://accounts.google.com/signin", |_, _| panic!(
-            "unverified bytes reached the browser"
-        )),
-        Err(Error::Changed)
+    assert!(
+        credentials
+            .with_google_page("https://accounts.google.com/signin", |password, _| {
+                assert_ne!(
+                    password, "unverified-password",
+                    "the file reached the browser"
+                );
+                password == "fixture-only-password"
+            })
+            .unwrap()
     );
+    credentials.check_current().unwrap();
+    fixture.publish(
+        "google-one",
+        &VALUE.replace("fixture-only-password", "rotated-fixture-password"),
+    );
+    assert_eq!(credentials.check_current(), Err(Error::Changed));
 }
 
 #[cfg(unix)]

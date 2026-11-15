@@ -36,7 +36,7 @@ fn skip_path(rel: &str) -> bool {
         .is_some_and(|(_, ext)| BINARY_EXTS.iter().any(|b| ext.eq_ignore_ascii_case(b)))
 }
 
-pub(super) fn fence_open(raw: &str) -> Option<(u8, usize)> {
+pub(crate) fn fence_open(raw: &str) -> Option<(u8, usize)> {
     let trimmed = raw
         .strip_prefix("   ")
         .or_else(|| raw.strip_prefix("  "))
@@ -56,7 +56,7 @@ pub(super) fn fence_open(raw: &str) -> Option<(u8, usize)> {
     Some((first, run))
 }
 
-pub(super) fn fence_closes(raw: &str, ch: u8, min_len: usize) -> bool {
+pub(crate) fn fence_closes(raw: &str, ch: u8, min_len: usize) -> bool {
     let trimmed = raw
         .strip_prefix("   ")
         .or_else(|| raw.strip_prefix("  "))
@@ -109,7 +109,7 @@ fn conflict_marker(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
     };
     let readers = aterm_cores::available_parallelism().map_or(1, |n| n.get().min(8));
-    let mut judged: Vec<(usize, Vec<Finding>)> = crate::memo::threads(|scope| {
+    let mut judged: Vec<(usize, Vec<Finding>)> = crate::workers::threads(|scope| {
         let running: Vec<_> = (1..readers).map(|_| scope.spawn(read)).collect();
         let mut judged = read();
         for reader in running {

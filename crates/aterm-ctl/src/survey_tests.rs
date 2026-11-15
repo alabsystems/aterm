@@ -1536,6 +1536,34 @@ fn a_session_that_rang_names_its_newest_bell() {
     assert!(hostile.contains(" bells=1 (? sounded 4s ago)"), "{hostile}");
 }
 
+/// Another Mac's session is shown by its tab ID in either form: a tab opened before the tab-ID
+/// update keeps its `s-` ID until it closes. NEGATIVE CONTROL: a malformed ID of either form
+/// from a peer is shown as `?`.
+#[test]
+fn a_peers_session_is_shown_by_its_tab_id_in_either_form() {
+    let line = |sid: &str| {
+        let row = wire_row(&[
+            ("sid", sid),
+            ("program", "zsh"),
+            ("program_kind", "shell"),
+            ("agent", "-"),
+        ]);
+        let survey = parse_reply(&["instance pid=1 sessions=1".to_owned(), row]).unwrap();
+        session_line(&survey.sessions[0], None, true, false)
+    };
+    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        let shown = line(sid);
+        assert!(shown.starts_with(sid), "{shown}");
+    }
+    for bad in ["tqn5r6e014", "tqn5r6e014i", "s-0123456789abcdeg0123"] {
+        let shown = line(bad);
+        assert!(
+            shown.starts_with('?') && !shown.contains(bad),
+            "{bad}: {shown}"
+        );
+    }
+}
+
 #[test]
 fn an_old_bell_leaves_the_survey_line() {
     let line = |bells: Option<&str>| {
@@ -1686,7 +1714,7 @@ fn the_read_leads_with_its_data_line_within_the_budget() {
             8_000,
             DEFAULT_BUDGET,
         ] {
-            let read = render_read(&replies, budget, notes, None);
+            let read = render_read(&replies, budget, None, notes, None);
             assert!(
                 chars(&read) <= budget,
                 "{budget}: {} {read:?}",
@@ -1738,10 +1766,10 @@ fn the_read_leads_with_its_data_line_within_the_budget() {
         }
     }
     assert_eq!(
-        render_read(&replies, 100, &[], None),
+        render_read(&replies, 100, None, &[], None),
         format!("{}\n", closing_line(least, 100, false))
     );
-    let cut = render_read(&replies, head + 600, &[], None);
+    let cut = render_read(&replies, head + 600, None, &[], None);
     assert!(cut.starts_with(DATA_LINE), "{cut}");
     assert!(
         cut.contains(&format!(" more lines past the {}-char budget", head + 600)),
@@ -3699,6 +3727,38 @@ fn session_line_shows_request_from_and_why_beside_typed_by() {
     assert!(!person.contains(" request"), "{person}");
 }
 
+/// The list [`host_ask_args`] builds for a program that runs an installed `aterm ctl` is one
+/// this parser reads back as the same ask, with and without a holder to judge.
+/// NEGATIVE CONTROLS: a flag the parser does not know, a deadline past its bound and a list
+/// that names no `--host` are refused.
+#[test]
+fn a_built_host_ask_is_read_back_by_the_parser() {
+    let holder = crate::release_holder::Identity {
+        pid: 35164,
+        boot: "e304e5017ab24cc1b0e8c82441ac9cc8".into(),
+        start: 12_594_287_820_979,
+    };
+    let plain = host_ask_args("0eda109a4abfb84e22bb7807a7dad68c", 3, None);
+    assert_eq!(
+        host_ask(&plain).unwrap(),
+        HostAsk {
+            host: "0eda109a4abfb84e22bb7807a7dad68c".into(),
+            json: true,
+            within: Duration::from_secs(3),
+            holder: None,
+        }
+    );
+    let judged = host_ask_args("m73", 3, Some(&holder));
+    assert_eq!(host_ask(&judged).unwrap().holder, Some(holder));
+    let mut unknown = plain.clone();
+    unknown.push("--judge".into());
+    assert!(host_ask(&unknown).is_err());
+    assert!(host_ask(&host_ask_args("m73", 11, None)).is_err());
+    let words = |words: &[&str]| words.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert!(host_ask(&words(&["survey", "--json"])).is_err());
+    assert!(host_ask(&words(&["status"])).is_err());
+}
+
 /// A SESSION'S FLEET SURVEY IS ONE OUTGOING READ OF EACH MAC THAT ANSWERED IT, in the fleet
 /// activity record; a survey no session asked for (the menu-bar item's read, a placement's) is
 /// a poll and leaves no row, and neither does a Mac that did not answer or proved no node.
@@ -3752,4 +3812,425 @@ fn a_sessions_fleet_survey_is_a_read_of_each_mac_that_answered() {
         rows,
         [(a, Some("m18".to_owned())), (b, Some("m85".to_owned()))]
     );
+}
+
+/// `survey --json` CARRIES EACH SESSION'S PIN as its row says it, and a row with no `pinned=` (an
+/// aterm before the pin) carries none.
+#[test]
+fn survey_json_carries_a_sessions_pin() {
+    let row = |sid: &str, pinned: Option<&str>| {
+        let mut fields = vec![
+            ("local", "1"),
+            ("sid", sid),
+            ("program", "claude"),
+            ("program_kind", "agent"),
+            ("agent", "busy"),
+        ];
+        if let Some(pinned) = pinned {
+            fields.push(("pinned", pinned));
+        }
+        wire_row(&fields)
+    };
+    let replies = [reply(
+        2,
+        vec![
+            row("s-00000000000000000001", Some("1")),
+            row("s-00000000000000000002", Some("0")),
+            row("s-00000000000000000003", None),
+        ],
+    )];
+    let json = render_json(&replies);
+    assert_eq!(json.matches("\"pinned\":\"1\"").count(), 1, "{json}");
+    assert_eq!(json.matches("\"pinned\":\"0\"").count(), 1, "{json}");
+    assert_eq!(json.matches("\"pinned\"").count(), 2, "{json}");
+}
+
+/// An agent's row on host `host` whose harness upgrade word is `upgrade` (`None`: an aterm older
+/// than the field, which sends no `upgrade=`).
+fn upgrading(host: usize, n: usize, upgrade: Option<&str>) -> String {
+    let sid = format!("s-{host:04x}{n:016x}");
+    let local = n.to_string();
+    let mut fields = vec![
+        ("local", local.as_str()),
+        ("sid", sid.as_str()),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", "idle"),
+        ("agent_ms", "7200000"),
+    ];
+    fields.extend(upgrade.map(|word| ("upgrade", word)));
+    wire_row(&fields)
+}
+
+/// Fleet peer `host`'s answer carrying `rows`.
+fn upgrade_peer(host: &str, rows: Vec<String>) -> HostReply {
+    let mut lines = vec![format!(
+        "instance pid=7 host={host} version=0.200.0 sessions={} level=content at_ms=1",
+        rows.len()
+    )];
+    lines.extend(rows);
+    HostReply {
+        reason: None,
+        label: host.to_owned(),
+        remote: true,
+        unproven: false,
+        node: None,
+        answer: parse_reply(&lines),
+    }
+}
+
+/// The harness's span words (`aterm_agent::harness::upgrade::span`), which an upgrade word's age
+/// is written in.
+fn harness_span(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, secs / 3_600 % 24, secs / 60 % 60);
+    match (d, h, m) {
+        (0, 0, 0) => format!("{secs}s"),
+        (0, 0, m) => format!("{m}m"),
+        (0, h, 0) => format!("{h}h"),
+        (0, h, m) => format!("{h}h{m}m"),
+        (d, 0, _) => format!("{d}d"),
+        (d, h, _) => format!("{d}d{h}h"),
+    }
+}
+
+/// A session's line shows its harness upgrade word while one is pending, as the session shows
+/// it, and says nothing for one done, none (`-`) or none said (an aterm before the field); a
+/// peer's word that is not a plain word is `?`; `--json` carries the field as the row sent it.
+/// NEGATIVE CONTROL: without the line's `upgrade=` part the pending arm fails.
+#[test]
+fn a_pending_upgrade_shows_on_its_session_line_and_in_json() {
+    const HELD: &str = "pending/2.1.325/account/2h";
+    let peer = upgrade_peer(
+        "m16",
+        vec![
+            upgrading(16, 1, Some(HELD)),
+            upgrading(16, 2, Some("done/2.1.325/-/3m")),
+            upgrading(16, 3, Some("-")),
+            upgrading(16, 4, None),
+            upgrading(16, 5, Some("pending/2.1.325/<b>ask me</b>/2h")),
+        ],
+    );
+    let full = render_full(std::slice::from_ref(&peer), None);
+    let line_of = |n: usize| {
+        let sid = format!("s-{:04x}{n:016x}", 16);
+        full.lines()
+            .find(|line| line.starts_with(&sid))
+            .unwrap_or_else(|| panic!("{sid}: {full}"))
+            .to_owned()
+    };
+    assert!(line_of(1).contains(&format!(" upgrade={HELD}")), "{full}");
+    for n in 2..=4 {
+        assert!(!line_of(n).contains("upgrade="), "{n}: {full}");
+    }
+    assert!(line_of(5).ends_with(" upgrade=?"), "{full}");
+    assert!(!full.contains("<b>"), "{full}");
+    let here = reply(0, vec![upgrading(0, 1, Some(HELD))]);
+    let local = render_text(&[here], DEFAULT_BUDGET, None);
+    assert!(local.contains(&format!(" upgrade={HELD}")), "{local}");
+    let json = render_json(&[peer]);
+    assert!(json.contains(&format!("\"upgrade\":\"{HELD}\"")), "{json}");
+    assert!(json.contains("\"upgrade\":\"-\""), "{json}");
+}
+
+/// The `--fleet` digest's one line counts the sessions whose upgrade word reads held: `stalled` at
+/// any age, `pending`, `announced` or `held` once behind the ladder's last rung
+/// ([`UPGRADE_HELD_S`]), never a person's `deferred` or `skipped`, a `restarting` move, `done` or
+/// a state this reader does not know; on how many Macs (this Mac's instances are one), grouped by
+/// wait word, most held first; an agent's row from an aterm before the field is unknown, never
+/// current; a current fleet adds no line.
+/// NEGATIVE CONTROLS: reading a row with no `upgrade=` as current drops the unknown part (and the
+/// unknown-only line); a strict `>` at the bound drops the session behind exactly that long;
+/// counting every state but `done` by its age counts the person's defer and skip, the restart
+/// and the unknown state, and misses the young `stalled`; the 90-minute bound counts a busy
+/// session on the ladder's keys rung.
+#[test]
+fn the_fleet_digest_counts_upgrades_stalled_or_behind_past_the_ladder() {
+    for (span, secs) in [
+        ("45s", Some(45)),
+        ("12m", Some(720)),
+        ("8h22m", Some(30_120)),
+        ("3d", Some(259_200)),
+        ("1d4h", Some(100_800)),
+        ("", None),
+        ("h", None),
+        ("2x", None),
+        ("-", None),
+        ("1h-", None),
+        ("12", None),
+    ] {
+        assert_eq!(span_secs(span), secs, "{span:?}");
+    }
+    for secs in [UPGRADE_HELD_S - 60, UPGRADE_HELD_S, 7_200, 25_200] {
+        assert_eq!(span_secs(&harness_span(secs)), Some(secs), "{secs}");
+    }
+    let word = |why: &str, age: u64| format!("pending/2.1.325/{why}/{}", harness_span(age));
+    let at_bound = word("account", UPGRADE_HELD_S);
+    let under = word("account", UPGRADE_HELD_S - 60);
+    let replies = vec![
+        reply(
+            0,
+            vec![
+                upgrading(0, 1, Some(&at_bound)),
+                upgrading(0, 2, Some(&under)),
+                upgrading(0, 3, Some("done/2.1.325/-/5h")),
+            ],
+        ),
+        // A second instance on this Mac is the same Mac.
+        reply(1, vec![upgrading(1, 1, Some(&word("account", 7_200)))]),
+        upgrade_peer(
+            "m16",
+            (1..=4)
+                .map(|n| upgrading(16, n, Some(&word("account", 7_200))))
+                .collect(),
+        ),
+        upgrade_peer(
+            "m8",
+            vec![
+                upgrading(8, 1, Some("stalled/2.1.325/overdue:not-idle:busy/7h")),
+                upgrading(8, 2, Some("stalled/2.1.325/unwatched:3h/2h")),
+                upgrading(8, 3, Some("-")),
+            ],
+        ),
+        upgrade_peer("m22", vec![upgrading(22, 1, None), shell(2)]),
+        upgrade_peer("m30", vec![shell(1)]),
+        unanswered("m40", "no answer within 3.0s"),
+    ];
+    let bound = aterm_types::update_standing::left_words(UPGRADE_HELD_S);
+    assert_eq!(
+        held_upgrades_line(&replies).as_deref(),
+        Some(
+            format!(
+                "upgrades held (stalled or {bound}+ behind): 8 sessions on 3 Macs (account 6, \
+                 overdue:not-idle:busy 1, unwatched 1) \u{b7} unknown on 1 Mac (an aterm before \
+                 the field)"
+            )
+            .as_str()
+        )
+    );
+    // Held alone: the line names where to look, within its cap.
+    let held = held_upgrades_line(&replies[2..4]).expect("held");
+    assert_eq!(
+        held,
+        format!(
+            "upgrades held (stalled or {bound}+ behind): 6 sessions on 2 Macs (account 4, \
+             overdue:not-idle:busy 1, unwatched 1) \u{b7} survey --host <h> names each"
+        )
+    );
+    // What the word says decides, not its age alone: `stalled` at any age; on the ladder or
+    // `held` once behind the bound; never a person's word, a restart under way or a state this
+    // reader does not know, however long behind.
+    let behind =
+        |state: &str, why: &str, secs: u64| format!("{state}/2.1.325/{why}/{}", harness_span(secs));
+    let states = [upgrade_peer(
+        "m9",
+        [
+            behind("stalled", "refused:box", 300),
+            behind("announced", "-", UPGRADE_HELD_S),
+            behind("held", "native-retired-unissued", UPGRADE_HELD_S),
+            behind("pending", "not-idle:busy", 95 * 60),
+            behind("announced", "-", UPGRADE_HELD_S - 60),
+            behind("deferred", "defer:20h", 32_400),
+            behind("skipped", "skipped", 32_400),
+            behind("restarting", "continued", 32_400),
+            behind("frobbed", "-", 32_400),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(n, word)| upgrading(9, n, Some(word)))
+        .collect(),
+    )];
+    assert_eq!(
+        held_upgrades_line(&states),
+        Some(format!(
+            "upgrades held (stalled or {bound}+ behind): 3 sessions on 1 Mac (announced 1, \
+             native-retired-unissued 1, refused:box 1) \u{b7} survey --host <h> names each"
+        ))
+    );
+    // Unknown alone is said, never read as current.
+    let unsaid = [
+        upgrade_peer("m22", vec![upgrading(22, 1, None)]),
+        upgrade_peer("m23", vec![upgrading(23, 1, None)]),
+    ];
+    assert_eq!(
+        held_upgrades_line(&unsaid).as_deref(),
+        Some("upgrades unknown on 2 Macs (an aterm before the field)")
+    );
+    // A current fleet, and one held under the bound or done, add no line.
+    let current = [
+        reply(0, vec![upgrading(0, 1, Some("-")), shell(2)]),
+        upgrade_peer(
+            "m16",
+            vec![
+                upgrading(16, 1, Some(&under)),
+                upgrading(16, 2, Some("done/2.1.325/-/9h")),
+            ],
+        ),
+        upgrade_peer("m30", vec![shell(1)]),
+    ];
+    assert_eq!(held_upgrades_line(&current), None);
+    // At most four wait words are named, the rest counted; a peer's non-word is `?`.
+    let many = [upgrade_peer(
+        "m16",
+        ["a", "b", "c", "d", "e", "f g"]
+            .iter()
+            .enumerate()
+            .map(|(n, why)| upgrading(16, n, Some(&word(why, 7_200))))
+            .collect(),
+    )];
+    let many = held_upgrades_line(&many).expect("held");
+    assert!(
+        many.contains("(? 1, a 1, b 1, c 1, +2 more)") && chars(&many) <= HEADER_CHARS,
+        "{many}"
+    );
+}
+
+fn upgrading_fleet(_: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
+    let mut lines =
+        vec!["instance pid=7 host=m16 version=0.200.0 sessions=5 level=content at_ms=1".to_owned()];
+    lines.extend((1..=5).map(|n| upgrading(16, n, Some("pending/2.1.325/account/2h"))));
+    Ok(FleetRead {
+        peers: vec![PeerSurvey {
+            authenticated: None,
+            reason: None,
+            label: "m16".to_owned(),
+            answer: Ok(lines),
+            fault: PeerFault::Other,
+            unproven: false,
+            node: None,
+            addr: None,
+        }],
+        note: None,
+        alone: None,
+    })
+}
+
+/// `survey --fleet` leads with the held-upgrades line under its data line, reserved within the
+/// budget as the data line is (and kept only where every block shows with it); a local read and
+/// `--host` show each session's word and no such line; `--json` carries the field.
+/// NEGATIVE CONTROL: a read that never passes the line to the digest fails the first arm.
+#[test]
+fn a_fleet_read_leads_with_its_held_upgrades_within_the_budget() {
+    let parts = |a: &[&str]| -> Vec<String> { a.iter().map(|s| (*s).to_string()).collect() };
+    let here = || Ok(vec![reply(0, vec![shell(2)])]);
+    let read = |words: &[&str]| {
+        read_survey(
+            &parse_args(&parts(words)).unwrap(),
+            Some(upgrading_fleet),
+            here,
+            None,
+        )
+    };
+    let printed = read(&["survey", "--fleet"]);
+    let text = printed.out.expect("the digest");
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some(DATA_LINE), "{text}");
+    let lead = lines.next().unwrap_or_default();
+    assert!(
+        lead.starts_with("upgrades held ") && lead.contains(" 5 sessions on 1 Mac (account 5)"),
+        "{text}"
+    );
+    let headers = |text: &str| text.lines().filter(|line| line.starts_with("== ")).count();
+    let blocks = headers(&text);
+    assert!(blocks > 1, "{text}");
+    for budget in (240..4_000).step_by(37) {
+        let budget_word = budget.to_string();
+        let printed = read(&["survey", "--fleet", "--budget", &budget_word]);
+        let text = printed.out.expect("the digest");
+        assert!(chars(&text) <= budget, "{budget}: {} {text}", chars(&text));
+        for (n, line) in text.lines().enumerate() {
+            assert!(
+                n == 1 || !line.starts_with("upgrades held "),
+                "{budget}: only under the data line: {text}"
+            );
+        }
+        if text.lines().nth(1) == Some(lead) {
+            assert_eq!(
+                headers(&text),
+                blocks,
+                "{budget}: every block with it: {text}"
+            );
+        }
+    }
+    for words in [&["survey", "--host", "m16"][..], &["survey"]] {
+        let text = read(words).out.expect("the read");
+        assert!(
+            !text.lines().any(|line| line.starts_with("upgrades held ")),
+            "{words:?}: {text}"
+        );
+    }
+    let host = read(&["survey", "--host", "m16"]).out.expect("the read");
+    assert_eq!(
+        host.matches(" upgrade=pending/2.1.325/account/2h").count(),
+        5,
+        "{host}"
+    );
+    let printed = read(&["survey", "--fleet", "--json"]);
+    let json = printed.out.expect("the records");
+    assert_eq!(
+        json.matches("\"upgrade\":\"pending/2.1.325/account/2h\"")
+            .count(),
+        5,
+        "{json}"
+    );
+    assert!(
+        !printed
+            .err
+            .iter()
+            .any(|line| line.contains("upgrades held")),
+        "{:?}",
+        printed.err
+    );
+}
+
+/// The `--fleet` lead costs no block: at every budget where each block's `==` header fits folded
+/// into its counts but not with the lead too, the read leaves the lead out and shows every
+/// header; with room for both it shows both; where blocks are cut anyway the lead is left out
+/// too, so it never takes a block's line.
+/// NEGATIVE CONTROL: keeping the lead wherever any reply line fits with it (no
+/// [`Fitted::cut`] check) cuts the last Macs' blocks into the closing line in the first arm.
+#[test]
+fn the_fleet_lead_is_left_out_before_any_block() {
+    let replies: Vec<HostReply> = (0..20)
+        .map(|n| {
+            upgrade_peer(
+                &format!("m{n}"),
+                vec![upgrading(n, 1, Some("pending/2.1.325/account/2h"))],
+            )
+        })
+        .collect();
+    let lead = held_upgrades_line(&replies).expect("held");
+    let headers = |text: &str| text.lines().filter(|line| line.starts_with("== ")).count();
+    let blocks = blocks_of(&replies, None, false);
+    let folded = render(&blocks, &Shown::filled(&blocks, &[], 0));
+    assert_eq!(headers(&folded), replies.len(), "{folded}");
+    let floor = chars(DATA_LINE) + 1 + chars(&folded);
+    let both = floor + chars(&lead) + 1;
+    for budget in floor..both {
+        let text = render_read(&replies, budget, Some(&lead), &[], None);
+        assert!(chars(&text) <= budget, "{budget}: {text}");
+        assert!(
+            !text.contains(&lead),
+            "{budget}: the lead before a block: {text}"
+        );
+        assert_eq!(
+            headers(&text),
+            replies.len(),
+            "{budget}: every block: {text}"
+        );
+    }
+    let text = render_read(&replies, both, Some(&lead), &[], None);
+    assert_eq!(text.lines().nth(1), Some(lead.as_str()), "{text}");
+    assert_eq!(headers(&text), replies.len(), "{text}");
+    for budget in [floor - 1, floor - 200, floor / 2] {
+        let text = render_read(&replies, budget, Some(&lead), &[], None);
+        assert!(chars(&text) <= budget, "{budget}: {text}");
+        assert!(
+            text.contains(" more lines past the "),
+            "{budget}: cut: {text}"
+        );
+        assert!(
+            !text.contains(&lead),
+            "{budget}: no lead in a cut read: {text}"
+        );
+    }
 }

@@ -658,7 +658,7 @@ fn fill_a(root: &Path, ctl: &mut Ctl, n: u32, lines: u32) -> BTreeMap<String, u6
     for _ in 1..n {
         let reply = ctl.ok("spawn");
         assert!(
-            reply.split_whitespace().any(|t| t.starts_with("s-")),
+            reply.split_whitespace().any(aterm_types::tab_id::is_tab_id),
             "`spawn` names its sid: {reply}"
         );
     }

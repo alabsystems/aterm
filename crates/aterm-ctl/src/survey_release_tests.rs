@@ -158,7 +158,7 @@ fn retained_release_observations_do_not_displace_pressing_agent_excerpts() {
             answer: parse_reply(&lines),
             ..reply(vec![])
         };
-        let text = render_read(&[host], 800, &[], None);
+        let text = render_read(&[host], 800, None, &[], None);
         assert!(text.chars().count() <= 800);
         assert!(text.contains("pressing-observation"), "{agent}: {text}");
         assert!(
@@ -192,7 +192,7 @@ fn release_details_escape_terminal_controls_and_fold_with_the_text_budget() {
         12
     );
     for budget in [100, 250, 500] {
-        let text = render_read(std::slice::from_ref(&host), budget, &[], None);
+        let text = render_read(std::slice::from_ref(&host), budget, None, &[], None);
         assert!(text.chars().count() <= budget, "{budget}: {text}");
         assert!(!text.contains('\u{1b}'));
     }

@@ -838,10 +838,10 @@ const fn stopped_line(installed: bool) -> &'static str {
 }
 
 /// One progress line on this run's terminal, so a minutes-long download does not look hung. A
-/// terminal gone with its tab is no error: the install goes on.
+/// terminal gone with its tab, or one nothing reads (a kept installer after aterm quit), is no
+/// error: the line is dropped and counted ([`crate::progress`]) and the install goes on.
 fn say(line: &str) {
-    use std::io::Write as _;
-    let _ = writeln!(std::io::stderr(), "Command Line Tools: {line}\u{2026}");
+    crate::progress::say(&format!("Command Line Tools: {line}\u{2026}"));
 }
 
 const SOFTWAREUPDATE_BOILERPLATE: [&str; 2] =
@@ -888,6 +888,9 @@ impl Item for CommandLineTools {
             }
             Ok(())
         })();
+        // The work is over: say how many progress lines a terminal nobody read dropped, when it
+        // has room; this never waits, so the items after this one still run.
+        crate::progress::settle();
         self.note(
             applied
                 .as_ref()

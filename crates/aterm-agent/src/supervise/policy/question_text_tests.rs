@@ -12,9 +12,9 @@ use super::super::approval::{
     Answer, AnswerTarget, ApprovalCtx, Choice, Decision, PriorityWord, QuestionPriority,
     RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM, RULE_PROSE_LONG_TERM, decide,
 };
-use super::super::guard::row_guard;
 use super::tests::{row_of, with_focus};
 use super::*;
+use alab_policy::guard::row_guard;
 
 const RECOMMENDED: QuestionPriority = QuestionPriority::Word(PriorityWord::Recommended);
 const LONG: QuestionPriority = QuestionPriority::Word(PriorityWord::LongTerm);

@@ -18,6 +18,17 @@
 //! that blocks signals and execs leaves them blocked in the build; one that puts both back is
 //! byte-identical to a direct run (pid, parent, group, session, environment, mask, every
 //! disposition, descriptors, limits, umask, directory).
+//!
+//! THE FRONT BECOMES ITS BUILD ONLY WHILE NONE OF ITS THREADS READS THE PROCESS TABLE
+//! (`aterm_sysprobe::exec_gate`). An `execve` waits, with no way to end the wait, until every
+//! other thread of its process has ended, and the front's bounded table read
+//! (`aterm_sysprobe::kproc`, its `lane-kproc_table` thread) stays in the kernel after the front has
+//! stopped waiting for it, behind any other process in the middle of an exec. Read from a
+//! panic's stackshot (m72, 2026-11-12, macOS 27.2): two fronts did both at once and each waited
+//! on the other for good; five more fronts, every `ps` and the machine's restart then waited on
+//! them. So on macOS the front closes its gate first and, where a read is still in the kernel
+//! after the gate's bound, does not exec (`Stayed::Reading`): its caller runs the build as the
+//! front's child, which ends no thread of the front.
 
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -101,18 +112,23 @@ fn put_back() -> bool {
 /// process opened is close-on-exec), or `execve` with that environment and
 /// [`aterm_capacity::COVER_ENV`] set to `marker` where one is given. Where the load-time read did
 /// not run, std's exec does it, which hands the build SIGPIPE at its default and an empty mask.
-/// Returns only when the exec failed: its error.
+/// Returns only when this process is still the front: the exec failed ([`Stayed::Failed`]), or
+/// (macOS) was not made because a thread of this process is still in a process-table read
+/// (`Stayed::Reading`), with the front's signal state as it was.
 pub(crate) fn become_build<A: AsRef<OsStr>>(
     target: &Path,
     args: &[A],
     marker: Option<&str>,
-) -> std::io::Error {
+) -> Stayed {
     let words: Option<Vec<CString>> = std::iter::once(target.as_os_str())
         .chain(args.iter().map(AsRef::as_ref))
         .map(|w| CString::new(w.as_bytes()).ok())
         .collect();
     let Some(words) = words else {
-        return std::io::Error::new(std::io::ErrorKind::InvalidInput, "a word holds a NUL byte");
+        return Stayed::Failed(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a word holds a NUL byte",
+        ));
     };
     let env = marker.map(|marker| {
         let mut set = false;
@@ -135,6 +151,11 @@ pub(crate) fn become_build<A: AsRef<OsStr>>(
         }
         env
     });
+    #[cfg(target_os = "macos")]
+    let closed = match aterm_sysprobe::exec_gate::close(aterm_sysprobe::exec_gate::SETTLES_WITHIN) {
+        Ok(closed) => closed,
+        Err(still) => return Stayed::Reading(still),
+    };
     if !put_back() {
         #[expect(
             clippy::disallowed_types,
@@ -146,7 +167,10 @@ pub(crate) fn become_build<A: AsRef<OsStr>>(
         if let Some(marker) = marker {
             command.env(aterm_capacity::COVER_ENV, marker);
         }
-        return crate::platform::exec_or_run(&mut command);
+        let err = crate::platform::exec_or_run(&mut command);
+        #[cfg(target_os = "macos")]
+        drop(closed);
+        return Stayed::Failed(err);
     }
     let mut argv: Vec<*const libc::c_char> = words.iter().map(|w| w.as_ptr()).collect();
     argv.push(std::ptr::null());
@@ -164,7 +188,22 @@ pub(crate) fn become_build<A: AsRef<OsStr>>(
             unsafe { libc::execve(words[0].as_ptr(), argv.as_ptr(), envp.as_ptr()) };
         }
     }
-    std::io::Error::last_os_error()
+    let err = std::io::Error::last_os_error();
+    #[cfg(target_os = "macos")]
+    drop(closed);
+    Stayed::Failed(err)
+}
+
+/// Why [`become_build`] returned: this process is still the front.
+pub(crate) enum Stayed {
+    /// No exec replaced this process: its error (the exec's, or that of a word it could not
+    /// pass, a NUL byte in it).
+    Failed(std::io::Error),
+    /// No exec was made: process-table reads of this process were still in the kernel when the
+    /// gate's bound ended (how many, said). Nothing of the front's signal state was put back.
+    /// macOS alone: elsewhere no read of the process table waits on another process's exec.
+    #[cfg(target_os = "macos")]
+    Reading(aterm_sysprobe::exec_gate::StillReading),
 }
 
 #[cfg(test)]

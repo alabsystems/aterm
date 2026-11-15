@@ -833,6 +833,25 @@ fn a_head_cut_before_its_final_lf_is_malformed() {
 }
 
 #[test]
+fn a_tls_client_on_the_port_is_no_request() {
+    use std::io::{Read, Write};
+    let (fake, _, _) = fake();
+    let mut stream =
+        std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, fake.ports().api))
+            .expect("connect to the fake");
+    stream
+        .write_all(b"\x16\x03\x01\x00\xf1\x01\x00\x00\xed\x03\x03 GET / \r\n")
+        .expect("write a ClientHello's opening");
+    let mut answer = Vec::new();
+    stream
+        .read_to_end(&mut answer)
+        .expect("the fake closes the connection");
+    assert!(answer.is_empty(), "{answer:?}");
+    assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+    assert!(fake.violations().is_empty(), "{:?}", fake.violations());
+}
+
+#[test]
 fn torn_reads_its_repository_as_the_router_does() {
     let (fake, dev, first) = fake();
     let port = fake.ports().api;

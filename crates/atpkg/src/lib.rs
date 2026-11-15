@@ -83,6 +83,9 @@ pub mod flow;
 pub mod freespace;
 pub mod gate;
 pub mod gc;
+/// A git program at a path, asked once per file in a process how its reads are kept from
+/// fetching lazily (agh's answer, asked hermetically).
+pub mod git_lazy_fetch;
 pub mod harness;
 pub mod hooks;
 /// Which program and build a running image is, from the executable the kernel mapped.

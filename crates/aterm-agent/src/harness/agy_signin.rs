@@ -46,6 +46,8 @@ pub enum Error {
     Authorization,
     Callback,
     Native,
+    /// Its automatic account work was cancelled (a quit, an update): the native child was ended.
+    Cancelled,
 }
 
 impl std::fmt::Display for Error {
@@ -58,6 +60,7 @@ impl std::fmt::Display for Error {
             Self::Authorization => "Native agy Google authorization request was refused",
             Self::Callback => "Native agy Google callback did not match its request",
             Self::Native => "Native agy did not complete its authorization",
+            Self::Cancelled => "Native agy authorization stopped for shutdown or update",
         })
     }
 }
@@ -906,12 +909,16 @@ fn run_google_at_scoped(
         expected_email: binding.expected_email(),
         current: &current,
     });
+    let cancelled = || {
+        work.as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+    };
     let native = run_claimed(
         program,
         &profile,
         claim,
         recovery,
-        deadline,
+        (deadline, &cancelled),
         |request, deadline| {
             let mailbox = super::headless_oauth::discover_mailbox_config(Some(home), Some(state));
             let context = super::google_direct::Context {
@@ -958,7 +965,10 @@ impl UnverifiedGrant {
 struct Child {
     child: std::process::Child,
     _slave: OwnedFd,
-    master: std::fs::File,
+    /// Closed before the leader is reaped: a leader exiting with output still queued on its
+    /// terminal waits in the terminal's close until that queue drains, which only this end's
+    /// close or read does.
+    master: Option<std::fs::File>,
     exit: OwnedFd,
     group_ended: bool,
 }
@@ -971,6 +981,7 @@ impl Drop for Child {
         {
             let _ = aterm_uds::process::kill_group_until_empty(pid);
         }
+        drop(self.master.take());
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -1009,7 +1020,7 @@ pub fn run(
     deadline: WakeDeadline,
     approve: impl FnMut(&Authorization, WakeDeadline) -> Result<Code, Error>,
 ) -> Result<UnverifiedGrant, Error> {
-    run_claimed(program, profile, None, None, deadline, approve)
+    run_claimed(program, profile, None, None, (deadline, &|| false), approve)
 }
 
 fn stage_profile(
@@ -1121,7 +1132,7 @@ fn run_claimed(
     profile: &Path,
     claim: Option<super::browser_window::ProfileLock>,
     recovery: Option<StagedRecovery<'_>>,
-    deadline: WakeDeadline,
+    (deadline, cancelled): (WakeDeadline, &dyn Fn() -> bool),
     mut approve: impl FnMut(&Authorization, WakeDeadline) -> Result<Code, Error>,
 ) -> Result<UnverifiedGrant, Error> {
     remaining(deadline)?;
@@ -1134,10 +1145,15 @@ fn run_claimed(
         None => super::browser_window::ProfileLock::claim(profile).map_err(|_| Error::Profile)?,
     };
     let mut approval_started = false;
-    let mut result = run_attempt(program, profile, deadline, &mut |request, deadline| {
-        approval_started = true;
-        approve(request, deadline)
-    });
+    let mut result = run_attempt(
+        program,
+        profile,
+        (deadline, cancelled),
+        &mut |request, deadline| {
+            approval_started = true;
+            approve(request, deadline)
+        },
+    );
     if matches!(result, Err(Error::Native))
         && !approval_started
         && let Some(recovery) = recovery
@@ -1148,7 +1164,7 @@ fn run_claimed(
         if rejected {
             // The first native child is gone, and this same claim remains held.
             // Retry once from an empty staging grant with the original deadline.
-            result = run_attempt(program, profile, deadline, &mut approve);
+            result = run_attempt(program, profile, (deadline, cancelled), &mut approve);
         }
     }
     let (path, session) = result?;
@@ -1160,13 +1176,25 @@ fn run_claimed(
     })
 }
 
+/// One native child under `deadline`, ended (its whole group, by [`Child`]'s drop) at the first
+/// look after `cancelled` says its account work was cancelled while it is still to print its page
+/// or be handed its code. Once it has the code, the Google code is spent: only `deadline` bounds
+/// its wait to trade it for the grant, so a quit then keeps the grant for the recovery journal
+/// (`agy_signin_recovery`), which saves a completed native effect for the next launch. Its grant
+/// file is native agy's own write; nothing here reads one a child that was ended left.
 fn run_attempt(
     program: &Path,
     profile: &Path,
-    deadline: WakeDeadline,
+    (deadline, cancelled): (WakeDeadline, &dyn Fn() -> bool),
     approve: &mut impl FnMut(&Authorization, WakeDeadline) -> Result<Code, Error>,
 ) -> Result<(PathBuf, Option<super::google_browser::PendingSession>), Error> {
-    remaining(deadline)?;
+    let left = || {
+        if cancelled() {
+            return Err(Error::Cancelled);
+        }
+        remaining(deadline)
+    };
+    left()?;
     let gemini = profile.join(".gemini");
     let (master, slave, mut child) = aterm_pty::spawn_session_leader_on_pty(|_| {
         #[allow(clippy::disallowed_types, reason = "the controlling-terminal spawn seam takes StdCommand and applies inherit_nothing before spawning")]
@@ -1213,13 +1241,14 @@ fn run_attempt(
     let mut child = Child {
         child,
         _slave: slave,
-        master: std::fs::File::from(master),
+        master: Some(std::fs::File::from(master)),
         exit,
         group_ended: false,
     };
     let stdout = child.child.stdout.take().ok_or(Error::Process)?;
     let stderr = child.child.stderr.take().ok_or(Error::Process)?;
-    aterm_pty::set_nonblocking(child.master.as_raw_fd(), true).map_err(|_| Error::Process)?;
+    let master = child.master.as_ref().ok_or(Error::Process)?;
+    aterm_pty::set_nonblocking(master.as_raw_fd(), true).map_err(|_| Error::Process)?;
     let (sent, received) = mpsc::sync_channel(16);
     for (index, mut stream) in [Box::new(stdout) as Box<dyn Read + Send>, Box::new(stderr)]
         .into_iter()
@@ -1247,12 +1276,11 @@ fn run_attempt(
     let mut approved = false;
     let mut session = None;
     while !approved {
-        let (index, chunk) =
-            match received.recv_timeout(remaining(deadline)?.min(Duration::from_millis(100))) {
-                Ok(chunk) => chunk,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            };
+        let (index, chunk) = match received.recv_timeout(left()?.min(Duration::from_millis(100))) {
+            Ok(chunk) => chunk,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if output.iter().map(SecretBytes::len).sum::<usize>() + chunk.len() > LIMIT {
             return Err(Error::Output);
         }
@@ -1280,14 +1308,14 @@ fn run_attempt(
         let mut bytes = line.as_slice();
         while !bytes.is_empty() {
             remaining(deadline)?;
-            match child.master.write(bytes) {
+            match child.master.as_ref().ok_or(Error::Process)?.write(bytes) {
                 Ok(0) => return Err(Error::Process),
                 Ok(n) => bytes = &bytes[n..],
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // One tick at a time, so the next turn's look at both clocks ends a write
                     // the host slept past.
                     match aterm_uds::ready::until(
-                        child.master.as_fd(),
+                        child.master.as_ref().ok_or(Error::Process)?.as_fd(),
                         aterm_uds::ready::Interest::Write,
                         Instant::now() + deadline.tick(),
                     ) {
@@ -1303,6 +1331,7 @@ fn run_attempt(
         approved = true;
     }
     // Keep draining while awaiting native completion; auth output is never returned or logged.
+    // The code is spent once handed: a cancellation no longer ends this wait (see above).
     loop {
         let slice = Instant::now() + remaining(deadline)?.min(Duration::from_millis(20));
         match aterm_uds::ready::until(child.exit.as_fd(), aterm_uds::ready::Interest::Read, slice) {
@@ -1313,6 +1342,17 @@ fn run_attempt(
         for _ in 0..16 {
             if received.try_recv().is_err() {
                 break;
+            }
+        }
+        // The terminal's own output too (its echo of the code): an exiting leader waits in the
+        // terminal's close until that queue drains, and its exit would never be seen.
+        let mut discard = [0u8; 2048];
+        if let Some(mut master) = child.master.as_ref() {
+            for _ in 0..16 {
+                match master.read(&mut discard) {
+                    Ok(n) if n > 0 => {}
+                    _ => break,
+                }
             }
         }
     }

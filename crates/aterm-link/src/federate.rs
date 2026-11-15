@@ -433,8 +433,7 @@ pub fn person_post<'a>(subject: &'a str, me: &str) -> Option<(&'a str, &'a str, 
     (parts.next().is_none()
         && is_node(dst)
         && dst != me
-        && sid.starts_with("s-")
-        && subject::is_principal(sid)
+        && subject::is_session_id(sid)
         && crate::person::is_person_id(person)
         && !kind.is_empty())
     .then_some((dst, sid, person, kind))

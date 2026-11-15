@@ -422,17 +422,17 @@ fn the_claim_task_is_one_guarded_string() {
 }
 
 /// THE CLAIM TASK'S LAST REPLY CONCLUDES AUTOPILOT LAND EITHER WAY. A claim is a clean defense
-/// to Land's own reader ([`crate::supervise::policy::turn_end::clean_defense`]), which Land's
+/// to Land's own reader ([`alab_policy::open_work::clean_defense`]), which Land's
 /// check lands, and no worker's word that it could not finish. No claim is the worker's own
-/// `Could not finish:` ([`crate::supervise::policy::needs::could_not_finish`]), which a managed
+/// `Could not finish:` ([`alab_policy::needs::could_not_finish`]), which a managed
 /// Land worker concludes as failed at once, its why the reply's, and no defense. CONTROLS: the
 /// task's old `Nothing left: NOT CLAIMED:` ending is a defense and no such word; a `Could not
 /// finish:` under a `Nothing left:` line, or past the first line, concludes nothing; a defense
 /// with a NEEDS YOU line holds Land.
 #[test]
 fn the_claim_tasks_last_reply_concludes_autopilot_land() {
-    use crate::supervise::policy::needs::could_not_finish;
-    use crate::supervise::policy::turn_end::clean_defense;
+    use alab_policy::needs::could_not_finish;
+    use alab_policy::open_work::clean_defense;
     for reply in [
         "Nothing left: CLAIMED: the $250 cloud session credit for this account.",
         "Nothing left: CLAIMED: Claim your $250 cloud session credit. The page confirmed it.",

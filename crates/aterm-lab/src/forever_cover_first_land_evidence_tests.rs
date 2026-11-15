@@ -24,7 +24,7 @@ fn first_land_requires_unique_acts_and_preceding_evidence_in_each_stream() {
             Row {
                 ts: 30,
                 box_seq: Some(7),
-                rule: turn_end::RULE_LAND.into(),
+                rule: alab_policy::words::RULE_LAND.into(),
                 decision: "typed".into(),
                 ..Row::default()
             },
@@ -87,7 +87,7 @@ fn a_prior_instruction_or_a_point_after_the_act_cannot_qualify_first_land() {
             Row {
                 ts: 30,
                 box_seq: Some(7),
-                rule: turn_end::RULE_LAND.into(),
+                rule: alab_policy::words::RULE_LAND.into(),
                 decision: "typed".into(),
                 ..Row::default()
             },
@@ -110,7 +110,7 @@ fn a_prior_instruction_or_a_point_after_the_act_cannot_qualify_first_land() {
         Row {
             ts: 15,
             box_seq: Some(6),
-            rule: turn_end::RULE_LAND.into(),
+            rule: alab_policy::words::RULE_LAND.into(),
             decision: "typed".into(),
             ..Row::default()
         },

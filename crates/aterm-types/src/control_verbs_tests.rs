@@ -759,19 +759,24 @@ fn requester_refuses_unknown_or_repeated_key() {
     }
 }
 
-/// A REQUESTER'S SID IS ONE ATERM MINTED. NEGATIVE CONTROLS: a short, long, uppercase or
-/// non-hex sid, a chosen name and an alias are refused on the wire and left out by
+/// A REQUESTER'S SID IS ONE ATERM MINTED, IN EITHER FORM. NEGATIVE CONTROLS: a short, long,
+/// uppercase or non-hex sid, a `t` ID one character short or long, upper-case or with a
+/// Crockford alias, a chosen name and an alias are refused on the wire and left out by
 /// [`super::Requester::of`].
 #[test]
 fn requester_refuses_unminted_sid() {
     use super::{Requester, is_minted_sid};
-    let minted = "s-0123456789abcdef0123";
-    assert!(is_minted_sid(minted));
     let line = |sid: &str| format!("requester sid={sid} program=- model=- account=-");
-    assert_eq!(
-        Requester::parse(&line(minted)).map(|r| r.sid().map(str::to_owned)),
-        Ok(Some(minted.to_owned()))
-    );
+    // A tab opened before the `t` form keeps its `s-` ID, and an earlier build's requester line
+    // names it so: both forms read.
+    for minted in ["s-0123456789abcdef0123", "tqn5r6e0148"] {
+        assert!(is_minted_sid(minted), "{minted}");
+        assert_eq!(
+            Requester::parse(&line(minted)).map(|r| r.sid().map(str::to_owned)),
+            Ok(Some(minted.to_owned())),
+            "{minted}"
+        );
+    }
     for unminted in [
         "s-0123456789abcdef012",
         "s-0123456789abcdef01234",
@@ -780,6 +785,10 @@ fn requester_refuses_unminted_sid() {
         "x-0123456789abcdef0123",
         "worker",
         "s-7725",
+        "tqn5r6e014",
+        "tqn5r6e01488",
+        "Tqn5r6e0148",
+        "tqn5r6e014u",
     ] {
         assert!(!is_minted_sid(unminted), "{unminted}");
         assert!(Requester::parse(&line(unminted)).is_err(), "{unminted}");
@@ -883,7 +892,7 @@ fn request_row_is_write_meta_status() {
     );
     assert!(
         s.summary
-            .starts_with("request claim|show|review|keep|reply "),
+            .starts_with("request claim|show|review|keep|reply|clean "),
         "{}",
         s.summary
     );
@@ -903,6 +912,12 @@ fn request_forms_show_is_read_lines_reply_waits() {
     let reply = of("reply r-20261109-1411-87be5228-01 -- thanks");
     assert_eq!(
         (reply.op, reply.framing, reply.lane),
+        (OpClass::Write, Framing::Status, Lane::Wait)
+    );
+    // A cleanup waits on its own lane too: it may run for minutes.
+    let clean = of("clean r-20261109-1411-87be5228-01 stop=1");
+    assert_eq!(
+        (clean.op, clean.framing, clean.lane),
         (OpClass::Write, Framing::Status, Lane::Wait)
     );
     // NEGATIVE: the acts and the claim are writes answered on one line, on the row's lane.

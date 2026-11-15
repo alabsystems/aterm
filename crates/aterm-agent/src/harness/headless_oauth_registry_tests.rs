@@ -155,11 +155,11 @@ fn looking_at_a_registry_mailbox_reveals_nothing() {
 #[test]
 fn the_registry_decides_before_the_mailbox_file() {
     let home = bare_home();
-    let secrets_dir = home.path().join(".secrets");
-    std::fs::create_dir_all(&secrets_dir).unwrap();
-    std::fs::write(
-        secrets_dir.join(SECRETS_MAILBOX_TOML_FILE),
-        "[[mailboxes]]\n\
+    crate::vault_entry::seed(
+        home.path(),
+        &[(
+            SECRETS_MAILBOX_TOML_FILE,
+            b"[[mailboxes]]\n\
          login = \"other@example.test\"\n\
          password = \"fixture-file-other\"\n\
          webmail_url = \"https://other.example.test/inbox\"\n\
@@ -169,8 +169,8 @@ fn the_registry_decides_before_the_mailbox_file() {
          password = \"fixture-file-owner\"\n\
          totp_secret = \"fixture-file-seed\"\n\
          receives = [\"ai3@example.test\"]\n", // gitleaks:allow
-    )
-    .unwrap();
+        )],
+    );
     let mut registry = mailbox();
     registry.held = vec![Part::Password];
     alab_roster::with_mail(vec![registry], secrets(), || {

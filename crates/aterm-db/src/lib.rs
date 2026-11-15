@@ -140,6 +140,9 @@ enum FailureKind {
     /// A table write a held `Remove` keeps pending until its rotation arrives (one-mesh M4).
     #[cfg(unix)]
     WritePending,
+    /// A check that reached its deadline before it finished: it learned nothing.
+    #[cfg(unix)]
+    OutOfTime,
 }
 
 impl fmt::Debug for Error {
@@ -168,7 +171,8 @@ impl Error {
             #[cfg(unix)]
             FailureKind::EnrollmentPending
             | FailureKind::AwaitingMembership
-            | FailureKind::WritePending => RepairCause::NotReady,
+            | FailureKind::WritePending
+            | FailureKind::OutOfTime => RepairCause::NotReady,
             FailureKind::Other => RepairCause::Other,
         }
     }
@@ -248,6 +252,17 @@ impl Error {
         {
             false
         }
+    }
+    /// A check that reached its deadline before it finished. It met no holder and judged
+    /// nothing, so it is neither [`Self::busy`] nor a finding about what it checked.
+    #[cfg(unix)]
+    pub(crate) fn out_of_time(reason: &str) -> Self {
+        Self(reason.into(), FailureKind::OutOfTime)
+    }
+    /// Whether a check ran out of time before it finished ([`Self::out_of_time`]).
+    #[cfg(unix)]
+    pub(crate) fn is_out_of_time(&self) -> bool {
+        matches!(self.1, FailureKind::OutOfTime)
     }
     /// Whether local contention or a newer snapshot requires a fresh observation.
     #[cfg(unix)]

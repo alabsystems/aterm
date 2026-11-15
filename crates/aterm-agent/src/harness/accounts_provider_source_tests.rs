@@ -6,6 +6,19 @@ use crate::harness::alab_roster::{Lab, SourceSnapshot, TestSourceOverride, test_
 use aterm_spec::interp::State;
 use std::sync::Arc;
 
+const AI_POOL: &str = super::super::super::ai_pool::AI_POOL_FILE;
+
+fn pool_text(cli: Cli) -> String {
+    format!(
+        "version=1\n[[account]]\nprovider='{}'\nlabel='new'\nemail='new@example.test'\nwarm=['m16']\n",
+        if cli == Cli::Kimi {
+            "kimi:global"
+        } else {
+            cli.id()
+        }
+    )
+}
+
 struct Bed {
     _root: aterm_tempfile::TempDir,
     home: PathBuf,
@@ -18,7 +31,7 @@ impl Bed {
         let root = aterm_tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let state = root.path().join("state");
-        fs::create_dir_all(home.join(".secrets")).unwrap();
+        fs::create_dir_all(&home).unwrap();
         let config = root.path().join("aterm.toml");
         fs::write(&config, "[fleet]\nmachine='m16'\n").unwrap();
         Self {
@@ -29,17 +42,21 @@ impl Bed {
         }
     }
 
+    /// The vault's pool holds one account, `new`, warm on m16.
     fn pool(&self, cli: Cli) {
-        fs::write(self.pool_path(), format!(
-            "version=1\n[[account]]\nprovider='{}'\nlabel='new'\nemail='new@example.test'\nwarm=['m16']\n",
-            if cli == Cli::Kimi { "kimi:global" } else { cli.id() }
-        )).unwrap();
+        self.put(AI_POOL, &pool_text(cli));
     }
 
-    fn pool_path(&self) -> PathBuf {
-        self.home
-            .join(".secrets")
-            .join(super::super::super::ai_pool::AI_POOL_FILE)
+    /// The vault entry `name` holds `text` (an empty `text` removes it), read in place.
+    fn put(&self, name: &str, text: &str) {
+        crate::vault_entry::seed(&self.home, &[(name, text.as_bytes())]);
+    }
+
+    /// What the vault entry `name` holds now.
+    fn held(&self, name: &str) -> Option<String> {
+        crate::vault_entry::read_text(&self.home, name, 1 << 20)
+            .text()
+            .map(str::to_owned)
     }
 
     fn env(&self) -> Env {
@@ -302,39 +319,6 @@ fn completion_uses_the_native_source_and_refuses_pending_registry_state() {
     assert_eq!(source.fleet.unwrap().roster.accounts[0].label, "new");
 }
 
-#[cfg(unix)]
-#[test]
-fn completion_refuses_a_retired_hard_link_and_fenced_policy() {
-    let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
-    for pending in [false, true] {
-        let bed = Bed::new();
-        bed.pool(Cli::Codex);
-        fs::hard_link(
-            bed.pool_path(),
-            bed.home.join(".secrets").join(cli_fleet_file(Cli::Codex)),
-        )
-        .unwrap();
-        let store = bed.store(Cli::Codex);
-        let held = store.acquire().unwrap();
-        accounts::SYNC_COMMIT_CUT.set(pending.then_some(0));
-        let retired = store.retire_source_held(&held, 1);
-        accounts::SYNC_COMMIT_CUT.set(None);
-        assert_eq!(retired.is_err(), pending);
-        drop(held);
-        assert!(
-            codex_completion_source(
-                &bed.env(),
-                &Row {
-                    label: "new".into(),
-                    email: Some("new@example.test".into()),
-                    ..Row::default()
-                }
-            )
-            .is_err()
-        );
-    }
-}
-
 #[test]
 fn completion_ignores_pool_bytes_in_a_sheet_without_a_provider_column() {
     let bed = Bed::new();
@@ -346,12 +330,7 @@ fn completion_ignores_pool_bytes_in_a_sheet_without_a_provider_column() {
     };
     let before = codex_completion_source(&bed.env(), &row).unwrap();
     assert!(before.fleet.is_none());
-    bed.pool(Cli::Codex);
-    fs::rename(
-        bed.pool_path(),
-        bed.home.join(".secrets").join(ACCOUNTS_CSV_FILE),
-    )
-    .unwrap();
+    bed.put(ACCOUNTS_CSV_FILE, &pool_text(Cli::Codex));
     assert_eq!(codex_completion_source(&bed.env(), &row).unwrap(), before);
 }
 
@@ -368,7 +347,7 @@ fn already_retired_empty_assignments_need_no_writer() {
             } else {
                 SourceSnapshot::Absent
             });
-            fs::write(bed.pool_path(), "version=1\naccount=[]\n").unwrap();
+            bed.put(AI_POOL, "version=1\naccount=[]\n");
             let store = bed.store(cli);
             let held = store.acquire().unwrap();
             store.retire_source_held(&held, 1).unwrap();
@@ -491,7 +470,7 @@ fn every_provider_refuses_changed_sources_after_signin_custody() {
                 || {
                     replanned = true;
                     match change {
-                        0 => fs::write(bed.pool_path(), "version=1\naccount=[]\n").unwrap(),
+                        0 => bed.put(AI_POOL, "version=1\naccount=[]\n"),
                         1 => fs::write(&bed.config, "[fleet]\nmachine='m17'\n").unwrap(),
                         2 => registry.set(SourceSnapshot::Pending),
                         #[cfg(unix)]
@@ -532,10 +511,13 @@ fn providers_retire_empty_replacements_and_preserve_explicit_inputs() {
             } else {
                 SourceSnapshot::Absent
             });
+            // The CLI's fleet file an older aterm left in `~/.secrets`: the owner's backup, which
+            // nothing reads and nothing rewrites.
             let legacy = bed.home.join(".secrets").join(cli_fleet_file(cli));
+            fs::create_dir_all(legacy.parent().unwrap()).unwrap();
             fs::write(&legacy, "retained legacy bytes").unwrap();
             if !native {
-                fs::write(bed.pool_path(), "version=1\naccount=[]\n").unwrap();
+                bed.put(AI_POOL, "version=1\naccount=[]\n");
             }
             let result = sync_cli_with(
                 cli,
@@ -559,80 +541,20 @@ fn providers_retire_empty_replacements_and_preserve_explicit_inputs() {
 
         let bed = Bed::new();
         let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
-        bed.pool(cli);
-        let input = fs::read(bed.pool_path()).unwrap();
+        // An explicit input is the person's own file, outside the vault, and stays as it was.
+        let explicit = bed.home.join("pool.toml");
+        fs::write(&explicit, pool_text(cli)).unwrap();
+        let input = fs::read(&explicit).unwrap();
         let result = sync_cli_with(
             cli,
             (&bed.home, &bed.state, &bed.config),
-            (bed.pool_path().to_str(), None),
+            (explicit.to_str(), None),
             1,
             (&fetch_source_text, &[]),
         );
         assert!(matches!(result, Ok(CliSync::Synced(_))), "{result:?}");
         assert!(!bed.store(cli).source_policy().unwrap().retired());
-        assert_eq!(fs::read(bed.pool_path()).unwrap(), input);
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn a_provider_replacement_cannot_retire_itself_through_a_legacy_alias() {
-    let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
-    for cli in OTHER_CLIS {
-        for hard in [false, true] {
-            let bed = Bed::new();
-            let legacy = bed.home.join(".secrets").join(cli_fleet_file(cli));
-            fs::write(&legacy, "version=1\naccount=[]\n").unwrap();
-            if hard {
-                fs::hard_link(&legacy, bed.pool_path()).unwrap();
-            } else {
-                std::os::unix::fs::symlink(&legacy, bed.pool_path()).unwrap();
-            }
-            let before = bed.images(cli);
-            let result = sync_cli_with(
-                cli,
-                (&bed.home, &bed.state, &bed.config),
-                (None, None),
-                1,
-                (&fetch_source_text, &[]),
-            );
-            assert!(result.is_err(), "{cli:?}/{hard}: {result:?}");
-            assert_eq!(bed.images(cli), before);
-            assert!(!bed.store(cli).source_policy().unwrap().retired());
-            assert_eq!(
-                fs::read_to_string(legacy).unwrap(),
-                "version=1\naccount=[]\n"
-            );
-        }
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn retired_alias_refusals_do_not_read_excluded_bytes_for_retry() {
-    let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
-    for cli in OTHER_CLIS {
-        for hard in [false, true] {
-            let bed = Bed::new();
-            let legacy = bed.home.join(".secrets").join(cli_fleet_file(cli));
-            fs::write(&legacy, "version=1\naccount=[]\n").unwrap();
-            if hard {
-                fs::hard_link(&legacy, bed.pool_path()).unwrap();
-            } else {
-                std::os::unix::fs::symlink(&legacy, bed.pool_path()).unwrap();
-            }
-            let store = bed.store(cli);
-            let held = store.acquire().unwrap();
-            store.retire_source_held(&held, 1).unwrap();
-            drop(held);
-            let before = cli_sync_inputs(cli, &bed.home, &bed.state, &bed.config);
-            fs::write(&legacy, "changed excluded bytes").unwrap();
-            assert_eq!(
-                cli_sync_inputs(cli, &bed.home, &bed.state, &bed.config),
-                before
-            );
-            assert!(load_cli_fleet(cli, &bed.env(), &bed.home, None, &fetch_source_text).is_err());
-        }
+        assert_eq!(fs::read(&explicit).unwrap(), input);
     }
 }
 
@@ -662,8 +584,8 @@ fn native_label_migration_commits_its_retirement_at_every_cut() {
             .unwrap(),
         )
         .unwrap();
-        let legacy = bed.home.join(".secrets").join(cli_fleet_file(cli));
-        fs::write(&legacy, "preserved legacy input").unwrap();
+        let legacy = cli_fleet_file(cli);
+        bed.put(&legacy, "preserved legacy input");
         let _source = TestSourceOverride::new(SourceSnapshot::Present(Arc::new(Lab {
             me: Some(test_machine("m16")),
             settled: true,
@@ -704,10 +626,7 @@ fn native_label_migration_commits_its_retirement_at_every_cut() {
                 .row("native")
                 .is_some()
         );
-        assert_eq!(
-            fs::read_to_string(legacy).unwrap(),
-            "preserved legacy input"
-        );
+        assert_eq!(bed.held(&legacy).as_deref(), Some("preserved legacy input"));
     }
 }
 
@@ -766,7 +685,7 @@ fn transition_for(state: &State, action: &str, cli: Cli, bypass: bool) -> State 
         }),
         2 => registry.set(SourceSnapshot::Disabled),
         3 => registry.set(SourceSnapshot::Pending),
-        4 if state["origin"] == 0 => fs::write(bed.pool_path(), "version=1\naccount=[]\n").unwrap(),
+        4 if state["origin"] == 0 => bed.put(AI_POOL, "version=1\naccount=[]\n"),
         4 => registry.set(SourceSnapshot::Present(Arc::new(Lab {
             me: Some(test_machine("m17")),
             ..lab

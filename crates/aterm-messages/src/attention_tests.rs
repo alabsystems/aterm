@@ -225,14 +225,16 @@ fn mark_seen_folds_a_standing_row() {
         )
         .id;
     c.commit_rows(now, 3);
-    assert!(c.mark_seen(standing, now + ms(1)));
+    assert!(c.mark_seen(standing, stamp(), now + ms(1)));
     assert!(c.live(standing).is_none(), "read: folded");
     assert_eq!(
         c.log().get(standing).unwrap().state,
         LogState::Retired(Retired::Folded)
     );
-    assert!(c.mark_seen(live, now + ms(2)) && c.live(live).is_some());
-    assert!(c.mark_seen(ask, now + ms(3)) && c.live(ask).is_some());
+    assert!(c.mark_seen(live, stamp(), now + ms(2)));
+    assert!(c.live(live).is_some());
+    assert!(c.mark_seen(ask, stamp(), now + ms(3)));
+    assert!(c.live(ask).is_some());
 }
 
 #[test]

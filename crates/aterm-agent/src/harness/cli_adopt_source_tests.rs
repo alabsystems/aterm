@@ -45,12 +45,13 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
     let config = env.config.as_ref().unwrap();
     crate::test_config::write(config, "[fleet]\nmachine='m3'\n").unwrap();
     let beside = tmp.path().join(accounts_sync::FLEET_ROSTER_FILE);
-    let vault = env
-        .home
-        .as_ref()
-        .unwrap()
-        .join(".secrets")
-        .join(accounts_sync::FLEET_ROSTER_FILE);
+    let home = env.home.as_ref().unwrap();
+    // The vault's fleet roster, read in place from this Mac's store.
+    let vault_text = || {
+        crate::vault_entry::read_text(home, accounts_sync::FLEET_ROSTER_FILE, 4 << 20)
+            .text()
+            .map(str::to_owned)
+    };
     let label = "m3.1";
     let email = if case == 11 {
         "alias@example.test"
@@ -66,13 +67,12 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
         )
         .unwrap(),
         5 => {
-            std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
-            std::fs::write(
-                &vault,
+            crate::vault_entry::put(
+                home,
+                accounts_sync::FLEET_ROSTER_FILE,
                 fleet_text("work", "work@example.test", Some("named"), true),
-            )
-            .unwrap();
-            sources.push(vault.clone());
+            );
+            sources.push(None);
         }
         _ => {
             let (name, address) = match case {
@@ -102,9 +102,8 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
                 },
             )
             .unwrap();
-            sources.push(beside.clone());
+            sources.push(Some(beside.clone()));
             if matches!(case, 3 | 13) {
-                std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
                 let (name, address) = if case == 13 {
                     (label, "another@example.test")
                 } else {
@@ -112,9 +111,12 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
                 };
                 // Matching accounts alone do not make a vault input a writable
                 // legacy copy. Both cases remain externally owned.
-                std::fs::write(&vault, fleet_text(name, address, Some("discovered"), false))
-                    .unwrap();
-                sources.push(vault.clone());
+                crate::vault_entry::put(
+                    home,
+                    accounts_sync::FLEET_ROSTER_FILE,
+                    fleet_text(name, address, Some("discovered"), false),
+                );
+                sources.push(None);
             }
         }
     }
@@ -122,7 +124,6 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
     let store = env.accounts_store();
     let files = [
         beside,
-        vault,
         path.clone(),
         store.state_file(),
         store.logins_file(),
@@ -130,6 +131,7 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
         store.wake_path(),
     ];
     let before = files.each_ref().map(|path| std::fs::read(path).ok());
+    let vault_before = vault_text();
     let status = |login: &str| {
         assert!(matches!(case, 9 | 11), "unexpected probe");
         assert!(login.is_empty());
@@ -164,10 +166,18 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
             before,
             "refusal changed metadata: {out}{err}"
         );
+        assert_eq!(
+            vault_text(),
+            vault_before,
+            "refusal changed the vault's fleet"
+        );
     }
     let mut retained = 0;
     for source in &sources {
-        let text = std::fs::read_to_string(source).unwrap();
+        let text = match source {
+            Some(path) => std::fs::read_to_string(path).unwrap(),
+            None => vault_text().expect("the vault's fleet"),
+        };
         let Ok(fleet) = FleetRoster::from_toml(&text, "fixture") else {
             continue;
         };
@@ -219,11 +229,11 @@ fn source_case(case: i64) -> (i64, i64, i64, i64) {
     // The account store's state, logins and ledger: the wake marker a published adoption
     // replaces through its receipt tells a running host of the row and grants
     // nothing, while a refusal leaves it as it was with every other file (above).
-    let granted = files[3..6]
+    let granted = files[2..5]
         .iter()
         .enumerate()
-        .any(|(i, path)| std::fs::read(path).ok() != before[i + 3]);
-    let preserved = std::fs::read(&files[1]).ok() == before[1];
+        .any(|(i, path)| std::fs::read(path).ok() != before[i + 2]);
+    let preserved = vault_text() == vault_before;
     (
         i64::from(success),
         retained,

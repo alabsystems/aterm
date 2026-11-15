@@ -18,6 +18,11 @@ const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// The planted word: a command's second word, which the journal never keeps.
 const SECRET: &str = "QZP6SECRET1";
 
+/// What `@<sid> log prev` answers where the journal keeps no earlier log of the tab: past the
+/// oldest log it keeps, and wherever this launch keeps no journal (`aterm-gui`'s
+/// `control::NO_EARLIER_LOG`).
+const NO_EARLIER_LOG: &str = "ERR the journal keeps no earlier log of this session";
+
 /// The development seam that gives a headless instance a window's desk
 /// (`aterm-gui`'s `desk::HEADLESS_RESTORE_SEAM`).
 const DESK_SEAM: &str = "ATERM_DEBUG_HEADLESS_RESTORE";
@@ -153,7 +158,10 @@ fn await_journal_words(sock: &str, journal: &str, why: &str) {
 fn boot_sid(ctl: &mut Ctl) -> String {
     let (_, rows) = ctl.counted("sessions");
     rows.iter()
-        .find_map(|row| row.split_whitespace().find(|t| t.starts_with("s-")))
+        .find_map(|row| {
+            row.split_whitespace()
+                .find(|t| aterm_types::tab_id::is_tab_id(t))
+        })
         .unwrap_or_else(|| panic!("a session row: {rows:?}"))
         .to_string()
 }
@@ -184,9 +192,33 @@ fn marked_command(root: &Path) -> PathBuf {
     path
 }
 
+/// What B starts from once A has quit ([`a_then_b`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// A's saved layout: B restores A's tab under its own ID (LT-01) and starts it a new log, so
+    /// the log the tab kept in A is its `@<sid> log prev`.
+    Kept,
+    /// None (the world's `session.toml` removed): B's tab takes a new ID, no tab holds A's, and a
+    /// plain `@<sid> log` reads A's log, the journal's newest of that ID.
+    Removed,
+}
+
+/// What B answered for A's tab ([`a_then_b`]).
+struct Earlier {
+    /// The request B was asked: `@<sid> log prev` ([`Layout::Kept`]) or `@<sid> log`.
+    req: String,
+    /// Its reply's header.
+    header: String,
+    /// Its rows, when the header is `OK`.
+    lines: Vec<String>,
+    /// B, still running.
+    b: Proc,
+}
+
 /// The run of one world: A runs the secret's command, waits until its log
-/// holds the run, and quits; then B starts on the same roots.
-fn a_then_b(root: &Path) -> (String, String, Vec<String>, Proc) {
+/// holds the run, and quits; then B starts on the same roots from `layout` and
+/// is asked for the log A's tab kept in A.
+fn a_then_b(root: &Path, layout: Layout) -> Earlier {
     let script = marked_command(root);
     let mut a = boot(root, "a", true);
     let sid = {
@@ -206,24 +238,66 @@ fn a_then_b(root: &Path) -> (String, String, Vec<String>, Proc) {
     assert!(logged.is_some(), "A's log holds the command's run");
     quit(&mut a);
     drop(a);
+    if layout == Layout::Removed {
+        std::fs::remove_file(state_home(root).join("session.toml"))
+            .expect("remove this world's saved layout");
+    }
     let b = boot(root, "b", true);
+    let b_sid = boot_sid(&mut Ctl::connect(&b.sock));
+    let req = match layout {
+        Layout::Kept => {
+            assert_eq!(b_sid, sid, "B restores A's tab under its own ID");
+            format!("@{sid} log prev")
+        }
+        Layout::Removed => {
+            assert_ne!(b_sid, sid, "without A's layout B's tab takes a new ID");
+            req
+        }
+    };
     let header = Ctl::connect(&b.sock).line(&req);
     let lines = if header.starts_with("OK") {
         Ctl::connect(&b.sock).counted(&req).1
     } else {
         Vec::new()
     };
-    (sid, header, lines, b)
+    Earlier {
+        req,
+        header,
+        lines,
+        b,
+    }
 }
 
-/// B answers `log @<A's sid>` from A's journal; a plain headless instance and
-/// `[session_log] journal = false` keep no journal; `status log_journal=` and
-/// `log_journal_why=` say which (fix unit E5).
+/// B answered `run.req` with A's log, read from A's journal: its command's run and its own
+/// clean quit.
+fn assert_answers_a_log(run: &Earlier) {
+    let Earlier {
+        req, header, lines, ..
+    } = run;
+    assert!(header.starts_with("OK"), "`{req}` answers: {header}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(" cmd ") && l.contains(" detail=echo ")),
+        "A's run, from A's journal: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(" close ") && l.contains("out=app-quit")),
+        "A's own clean quit, from A's journal: {lines:?}"
+    );
+}
+
+/// B, restoring A's tab under its ID, answers `@<A's sid> log prev` from A's journal; a plain
+/// headless instance and `[session_log] journal = false` keep no journal; `status log_journal=`
+/// and `log_journal_why=` say which (fix unit E5).
 #[test]
 fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
     use std::os::unix::fs::PermissionsExt as _;
     let world = scratch_world("on", "");
-    let (sid, header, lines, b) = a_then_b(world.path());
+    let run = a_then_b(world.path(), Layout::Kept);
+    let b = &run.b;
     await_journal_words(&b.sock, "on", "-");
     let journal = journal_dir(world.path());
     let mode = |p: &Path| {
@@ -274,20 +348,8 @@ fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
         runs >= 1,
         "a positive control: the journal holds the command's run, by its program: {names:?}"
     );
-    assert!(header.starts_with("OK"), "`log @{sid}` answers: {header}");
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains(" cmd ") && l.contains(" detail=echo ")),
-        "A's run, from A's journal: {lines:?}"
-    );
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains(" close ") && l.contains("out=app-quit")),
-        "A's own clean quit, from A's journal: {lines:?}"
-    );
-    drop(b);
+    assert_answers_a_log(&run);
+    drop(run);
     let plain = scratch_world("plain", "");
     let mut c = boot(plain.path(), "c", false);
     assert_eq!(
@@ -302,9 +364,9 @@ fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
         "a headless instance keeps no journal"
     );
     let off = scratch_world("off", "[session_log]\njournal = false\n");
-    let (sid, header, _, b) = a_then_b(off.path());
+    let run = a_then_b(off.path(), Layout::Kept);
     assert_eq!(
-        journal_words(&b.sock),
+        journal_words(&run.b.sock),
         ("off".to_string(), "disabled".to_string()),
         "`journal = false` says so"
     );
@@ -312,9 +374,24 @@ fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
         !journal_dir(off.path()).exists(),
         "`journal = false` creates nothing"
     );
-    assert!(
-        header.starts_with("ERR"),
-        "without a journal `log @{sid}` of an earlier process is no session: {header}"
+    assert_eq!(
+        run.header, NO_EARLIER_LOG,
+        "without a journal `{}` names no earlier log",
+        run.req
     );
-    drop(b);
+}
+
+/// A sid no tab of B holds (B started without A's saved layout, so its tab took a new ID)
+/// answers a plain `@<sid> log` from A's journal alone, its newest log of that ID.
+#[test]
+fn a_sid_no_tab_holds_answers_its_log_from_the_journal() {
+    let world = scratch_world("arc", "");
+    let run = a_then_b(world.path(), Layout::Removed);
+    await_journal_words(&run.b.sock, "on", "-");
+    assert_answers_a_log(&run);
+    let before = Ctl::connect(&run.b.sock).line(&format!("{} prev", run.req));
+    assert_eq!(
+        before, NO_EARLIER_LOG,
+        "NEGATIVE CONTROL: A's log is the oldest the journal keeps of that ID"
+    );
 }

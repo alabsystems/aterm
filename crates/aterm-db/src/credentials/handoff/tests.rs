@@ -29,6 +29,27 @@ fn fixture() -> Lab {
 }
 
 fn round(lab: &Lab, permits: bool) -> (Repair, Repair, [crate::control::Report; 2]) {
+    round_with_owner(lab, permits, None)
+}
+
+fn round_with_owner(
+    lab: &Lab,
+    permits: bool,
+    custodian_owner: Option<CredentialOwner>,
+) -> (Repair, Repair, [crate::control::Report; 2]) {
+    round_on_side(lab, permits, custodian_owner, Side::Initiator)
+}
+
+fn round_on_side(
+    lab: &Lab,
+    permits: bool,
+    custodian_owner: Option<CredentialOwner>,
+    custodian_side: Side,
+) -> (Repair, Repair, [crate::control::Report; 2]) {
+    let holder_side = match custodian_side {
+        Side::Initiator => Side::Responder,
+        Side::Responder => Side::Initiator,
+    };
     let endpoint = |n| {
         let endpoint = Endpoint::from_bootstrap(&lab.bootstrap(n))
             .unwrap()
@@ -36,10 +57,13 @@ fn round(lab: &Lab, permits: bool) -> (Repair, Repair, [crate::control::Report; 
             .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config.toml"))
             .unwrap();
         if permits {
-            endpoint.with_credential_owner(
-                CredentialOwner::for_test(&lab.paths[n]),
-                lab.paths[n].home.join("config.toml"),
-            )
+            let owner = if n == 0 {
+                custodian_owner.clone()
+            } else {
+                None
+            }
+            .unwrap_or_else(|| CredentialOwner::for_test(&lab.paths[n]));
+            endpoint.with_credential_owner(owner, lab.paths[n].home.join("config.toml"))
         } else {
             endpoint
         }
@@ -64,14 +88,14 @@ fn round(lab: &Lab, permits: bool) -> (Repair, Repair, [crate::control::Report; 
                     LinkScope::Loopback,
                 )
                 .unwrap(),
-                Side::Responder,
+                holder_side,
                 &mut right,
             )
         });
         let left = custodian
             .exchange(
                 Connection::connect(address, LinkScope::Loopback, Duration::from_secs(60)).unwrap(),
-                Side::Initiator,
+                custodian_side,
                 &mut left,
             )
             .unwrap();
@@ -253,7 +277,7 @@ fn a_private_give_crosses_native_authenticated_runtime_transport_and_never_enter
     }
     client::sync(&lab.paths[2], None).unwrap();
     assert_eq!(
-        fsx::read_private(&lab.paths[2].home.join(".secrets/fixture_password"), 1024)
+        client::read_in_place(&lab.paths[2], "fixture_password")
             .unwrap()
             .unwrap()
             .as_slice(),
@@ -282,52 +306,51 @@ fn excluded_requesters_do_not_open_a_persons_input() {
     );
 }
 
+/// A label's values this Mac's store holds are the vault's own: the holder offers none of them
+/// and a handoff round takes nothing, and the custodian copies the label's two entries to the
+/// requester itself, never another entry the holder's store holds.
+/// NEGATIVE CONTROL: with the holder's probe offering a value its store holds (`holds` reading it
+/// in place), the pass offers it: `` left: 1 right: 0 ``.
 #[test]
-fn the_compiled_mailbox_source_sends_only_that_labels_two_entries() {
+fn a_label_the_store_holds_is_copied_by_the_custodian_with_its_two_entries_only() {
     let lab = fixture();
     let holder = &lab.paths[1];
-    fsx::ensure_private_dir(&holder.home.join(".secrets")).unwrap();
-    fsx::write_atomic(
-        &holder.home.join(".secrets/fixture_password"),
-        SENTINEL,
-        0o600,
-    )
-    .unwrap();
-    fsx::write_atomic(
-        &holder.home.join(".secrets/fixture_totp"),
-        b"FIXTURESEED",
-        0o600,
-    )
-    .unwrap();
-    fsx::write_atomic(
-        &holder.home.join(".secrets/other_password"),
-        b"never-send",
-        0o600,
-    )
-    .unwrap();
-    pass(holder).unwrap();
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    let m2 = Audience::Hosts(vec!["m2".into()]);
+    for (name, value) in [
+        ("fixture_password", SENTINEL),
+        ("fixture_totp", b"FIXTURESEED".as_slice()),
+        ("other_password", b"never-send".as_slice()),
+    ] {
+        doc.set_entry(&m2, name, value).unwrap();
+    }
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    client::sync(holder, None).unwrap();
+    assert!(
+        client::read_in_place(holder, "fixture_password")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(pass(holder).unwrap().offered, 0);
     repair_commons(&lab, 3);
     let (left, right, _) = round(&lab, true);
-    assert_eq!(left.handoff(), Some(&Ok(1)));
-    assert_eq!(right.handoff(), Some(&Ok(1)));
+    assert_eq!(left.handoff(), Some(&Ok(0)));
+    assert_eq!(right.handoff(), Some(&Ok(0)));
+    pass(&lab.paths[0]).unwrap();
+    custodian_pass_at(&lab.paths[0], now_ms()).unwrap().unwrap();
     let admin = client::admin_cached(&lab.paths[0]).unwrap();
     let requester = Audience::Hosts(vec!["m3".into()]);
-    assert_eq!(
-        admin
-            .doc
-            .entry(&requester, "fixture_totp")
-            .unwrap()
-            .value
-            .as_slice(),
-        b"FIXTURESEED"
-    );
-    assert!(
-        admin
-            .doc
-            .entries()
-            .iter()
-            .all(|entry| entry.name != "other_password")
-    );
+    for (name, value) in [
+        ("fixture_password", SENTINEL),
+        ("fixture_totp", b"FIXTURESEED".as_slice()),
+    ] {
+        assert_eq!(
+            admin.doc.entry(&requester, name).unwrap().value.as_slice(),
+            value
+        );
+    }
+    assert!(admin.doc.entry(&requester, "other_password").is_none());
 }
 
 #[test]
@@ -542,4 +565,113 @@ fn admin_give_fills_each_requesters_own_section_and_refuses_a_different_existing
             .is_none()
     );
     aterm_secrets::text::Document::parse(admin.doc.render().as_str().unwrap()).unwrap();
+}
+
+#[test]
+fn an_interrupted_offer_does_not_block_the_same_owners_next_authenticated_handoff() {
+    struct InterruptedHello<'a, 'b>(&'a Round<'b>);
+    impl std::io::Read for InterruptedHello<'_, '_> {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("the injected first write must fail before a read");
+        }
+    }
+    impl std::io::Write for InterruptedHello<'_, '_> {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            let mut competing = std::io::Cursor::new(Vec::new());
+            assert_eq!(take(self.0, &mut competing).unwrap(), 0);
+            competing.set_position(0);
+            assert_eq!(receive(&mut competing, 4).unwrap(), b"AQN1");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fixture interrupted hello",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let lab = fixture();
+    give_from(&lab.paths[1], "mailbox:fixture", || {
+        Ok(SecretBytes::from(SENTINEL))
+    })
+    .unwrap();
+    repair_commons(&lab, 3);
+    let owner = CredentialOwner::for_test(&lab.paths[0]);
+    let config = lab.paths[0].home.join("config.toml");
+    let actor = |n| lab.bootstrap(n).request().unwrap().binding().actor();
+    {
+        let custodian = Round {
+            paths: &lab.paths[0],
+            config: &config,
+            owner: &owner,
+            network: lab.bootstrap(0).trust().network,
+            local: actor(0),
+            peer: actor(1),
+        };
+        let error = take(&custodian, &mut InterruptedHello(&custodian)).unwrap_err();
+        assert!(
+            error.to_string().contains("fixture interrupted hello"),
+            "{error}"
+        );
+    }
+
+    let (left, right, _) = round_with_owner(&lab, true, Some(owner));
+    assert_eq!(
+        left.handoff(),
+        Some(&Ok(1)),
+        "the same owner can recover immediately"
+    );
+    assert_eq!(right.handoff(), Some(&Ok(1)));
+    let admin = client::admin_cached(&lab.paths[0]).unwrap();
+    assert_eq!(
+        admin
+            .doc
+            .entry(&Audience::Hosts(vec!["m3".into()]), "fixture_password")
+            .unwrap()
+            .value
+            .as_slice(),
+        SENTINEL
+    );
+    repair_commons(&lab, 3);
+    assert!(
+        observe(&lab.paths[2])
+            .unwrap()
+            .book
+            .threads
+            .values()
+            .any(|thread| thread.published.is_some())
+    );
+}
+
+#[test]
+fn an_incoming_connection_can_deliver_a_holders_offer_to_its_custodian() {
+    let lab = fixture();
+    give_from(&lab.paths[1], "mailbox:fixture", || {
+        Ok(SecretBytes::from(SENTINEL))
+    })
+    .unwrap();
+    repair_commons(&lab, 3);
+    let (custodian, holder, _) = round_on_side(&lab, true, None, Side::Responder);
+    assert_eq!(custodian.handoff(), Some(&Ok(1)));
+    assert_eq!(holder.handoff(), Some(&Ok(1)));
+    let admin = client::admin_cached(&lab.paths[0]).unwrap();
+    assert_eq!(
+        admin
+            .doc
+            .entry(&Audience::Hosts(vec!["m3".into()]), "fixture_password")
+            .unwrap()
+            .value
+            .as_slice(),
+        SENTINEL
+    );
+    repair_commons(&lab, 3);
+    assert!(
+        observe(&lab.paths[2])
+            .unwrap()
+            .book
+            .threads
+            .values()
+            .any(|thread| thread.published.is_some())
+    );
 }

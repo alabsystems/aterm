@@ -999,7 +999,7 @@ fn native_expired_and_malformed_grants_reach_a_fresh_google_handoff() {
         let claim = stage_profile(staging.path(), Some(profile.path())).unwrap();
         let original = std::fs::read(profile.path().join(".gemini/antigravity-cli/antigravity-oauth-token")).ok();
         let mut observed = false;
-        let result = run_claimed(&program, staging.path(), Some(claim), Some(StagedRecovery { expected_email: "synthetic@example.invalid", current: &|| true }), WakeDeadline::after(Duration::from_secs(60)), |_, _| {
+        let result = run_claimed(&program, staging.path(), Some(claim), Some(StagedRecovery { expected_email: "synthetic@example.invalid", current: &|| true }), (WakeDeadline::after(Duration::from_secs(60)), &|| false), |_, _| {
             observed = true;
             Err(Error::Callback)
         });
@@ -1041,4 +1041,148 @@ fn native_headless_handoff_is_admitted_and_cancellation_releases_its_profile() {
     assert!(observed, "native handoff was not observed");
     assert!(matches!(result, Err(Error::Callback)));
     let _claim = super::super::browser_window::ProfileLock::claim(profile.path()).unwrap();
+}
+
+/// A QUIT ENDS AGY'S NATIVE SIGN-IN CHILD: a stand-in agy that never prints its page keeps the
+/// sign-in going for as long as its account work stands (the deadline here is an hour), and the
+/// cancellation of that work ends it, its group ended and reaped, within the hang detector.
+/// NEGATIVE CONTROL: without the loop's read of `cancelled`, the child runs to its hour and the
+/// hang detector ends it by force and fails the test.
+#[cfg(unix)]
+#[test]
+fn a_quit_ends_agys_native_sign_in_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let witness = dir.path().join("pid");
+    let program = dir.path().join("agy");
+    let sleep = aterm_uds::deadline::stand_in(Path::new("/bin/sleep"));
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho $$ > '{}.tmp' && mv '{0}.tmp' '{0}'\nexec '{}' 3600\n",
+            witness.display(),
+            sleep.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profile = aterm_tempfile::tempdir().unwrap();
+    let quit = Arc::new(AtomicBool::new(false));
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let controller = {
+        let (quit, witness) = (Arc::clone(&quit), witness.clone());
+        std::thread::spawn(move || {
+            let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+            while !witness.is_file() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let ran = witness.is_file();
+            quit.store(true, Ordering::SeqCst);
+            // The hang detector: a child still out after it is ended by force, so the test
+            // fails rather than hangs.
+            let ended = finished.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok();
+            if !ended
+                && let Some(pid) = std::fs::read_to_string(&witness)
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<i32>().ok())
+            {
+                // SAFETY: a plain signal to the stand-in this test started, still unreaped.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            (ran, ended)
+        })
+    };
+    let result = run_claimed(
+        &program,
+        profile.path(),
+        None,
+        None,
+        (WakeDeadline::after(Duration::from_secs(3600)), &|| {
+            quit.load(Ordering::SeqCst)
+        }),
+        |_, _| Err(Error::Callback),
+    );
+    let _ = done.send(());
+    let (ran, ended) = controller.join().unwrap();
+    assert!(ran, "the stand-in's first exec within its hang detector");
+    assert!(
+        ended,
+        "the cancelled sign-in ended within the hang detector"
+    );
+    assert!(
+        matches!(result, Err(Error::Cancelled)),
+        "{:?}",
+        result.err()
+    );
+    let pid = std::fs::read_to_string(&witness)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        aterm_uds::process::process_presence(pid),
+        aterm_uds::process::ProcessPresence::Absent
+    );
+    let _claim = super::super::browser_window::ProfileLock::claim(profile.path()).unwrap();
+}
+
+/// A QUIT KEEPS A GRANT WHOSE CODE WAS HANDED: the Google code is single-use, so once native agy
+/// has it, a quit that lands while agy trades it for its grant does not end the child; the grant
+/// it writes is returned for the recovery journal to keep. The quit here is set before the code
+/// is written, so the wait after it looks at a cancelled scope from its first turn. The stand-in
+/// leaves its terminal's echo on, so its echo of the code stays queued on the terminal until the
+/// wait drains it; an exiting leader waits for that queue. NEGATIVE CONTROLS: with that wait
+/// reading the cancellation, the child is ended and the attempt says `Error::Cancelled`; without
+/// its drain of the terminal, the child never exits and the deadline (the hang detector) passes.
+#[cfg(unix)]
+#[test]
+fn a_quit_after_the_code_is_handed_keeps_agys_grant() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let program = dir.path().join("agy");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\nread code\numask 077\nprintf '%s' \"$code\" > \"$HOME/.gemini/{}/{}\"\nexit 0\n",
+            request("handed-state"),
+            super::super::upgrade_agy::APP_DATA_DIR,
+            super::super::upgrade_agy::GRANT_FILE,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let profile = aterm_tempfile::tempdir().unwrap();
+    let app = profile
+        .path()
+        .join(".gemini")
+        .join(super::super::upgrade_agy::APP_DATA_DIR);
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::set_permissions(
+        profile.path().join(".gemini"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let quit = AtomicBool::new(false);
+    let result = run_claimed(
+        &program,
+        profile.path(),
+        None,
+        None,
+        (WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN), &|| {
+            quit.load(Ordering::SeqCst)
+        }),
+        |request, _| {
+            let code = request.callback(
+                "https://antigravity.google/oauth-callback?code=fixture-code&state=handed-state",
+            );
+            quit.store(true, Ordering::SeqCst);
+            code
+        },
+    );
+    let grant = result.unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(std::fs::read(grant.path()).unwrap(), b"fixture-code");
 }

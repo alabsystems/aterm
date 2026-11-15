@@ -549,8 +549,7 @@ pub(super) fn prepare_shared_with_clock(
 
 /// THE ADOPTION'S SIGN-IN DOOR: a root approved this one account for this Mac's first custody
 /// (`grant`, re-read from the root's current decision), so its sign-in names that account and keeps
-/// the upkeep's spacing ([`super::super::sign_in_ladder::SPACING_S`]). The census guard
-/// `usage-read-on-timer` does not walk into it.
+/// the upkeep's spacing ([`super::super::sign_in_ladder::SPACING_S`]).
 fn approved_sign_in(grant: &Grant, cli: Cli, label: &str) -> SignIn {
     SignIn::granted_sign_in(grant, cli, label)
 }
@@ -559,8 +558,7 @@ fn approved_sign_in(grant: &Grant, cli: Cli, label: &str) -> SignIn {
 /// root's source for it), and the root's current decision for it, read now through `factory`, is
 /// one no login here answers yet: no attempt at it, or the last one not published. The root's
 /// decision is a person's, made for this Mac and this account; once its login is published, the
-/// row is renewed only as any login this Mac uses is ([`super::upkeep_sign_in`]). The census
-/// guard `usage-read-on-timer` does not walk into it.
+/// row is renewed only as any login this Mac uses is ([`super::upkeep_sign_in`]).
 pub(super) fn custody_sign_in(
     home: &Path,
     roster_path: &Path,

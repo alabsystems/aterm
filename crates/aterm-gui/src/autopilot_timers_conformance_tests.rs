@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 use aterm_spec::derive::Model;
 
 use super::set_fake_clocks;
@@ -266,6 +266,7 @@ impl TimerDrive {
     fn capture(&self) -> crate::restore::TerminalLeafRestore {
         let meta = self.ctx().unwrap().meta.lock().unwrap().sanitized();
         crate::restore::TerminalLeafRestore {
+            pinned: false,
             sid: None,
             lineage: None,
             log_ep: None,

@@ -43,7 +43,7 @@ use super::rows;
 use super::state::{LaneState, Lock};
 use crate::api::{Build, PackOutcome, PackRequest, Packer, Signing};
 use crate::artifact::qualify::{self, Receipt, Runner, Site};
-use crate::artifact::tools::{HostTools, Ran, Run, RunError};
+use crate::artifact::tools::{HostTools, Queue, Ran, Run, RunError};
 use crate::artifact::{pack, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
@@ -532,32 +532,32 @@ fn notice(ctx: &Ctx, deps: &Deps<'_>, state: &LaneState, message: &str) {
 }
 
 fn preflight(ctx: &Ctx, deps: &Deps<'_>, head: &VerifiedQuad, repos: &[&str]) -> Result<()> {
-    for (what, path) in [
-        ("machine key", &ctx.identity.key),
-        ("machine record", &ctx.identity.record),
-    ] {
-        if !path.is_file() {
-            return Err(Error::cannot_run(format!(
-                "no {what} at {} — this lane SIGNS what it packs; provision this Mac \
-                 (`atpkg-keys join --id <id>`) or run it on a rostered one",
-                ctx.shown(path)
-            )));
-        }
+    if let Some(what) = crate::identity::missing(ctx)? {
+        let path = if what == "machine key" {
+            &ctx.identity.key
+        } else {
+            &ctx.identity.record
+        };
+        return Err(Error::cannot_run(format!(
+            "no {what}: the store holds no release ring and there is none at {} — this lane SIGNS what it packs; \
+             provision this Mac (`atpkg-keys join --id <id>`) or run it on a rostered one",
+            ctx.shown(path)
+        )));
     }
     if gh_serves(ctx, HostRole::Staging) {
         match ctx.usable_token(&ctx.tokens.staging) {
             Ok(true) => {}
             Ok(false) => {
                 return Err(Error::cannot_run(format!(
-                    "staging token file missing/empty: {} — the unattended lane speaks only as \
+                    "staging token missing/empty: {} — the unattended lane speaks only as \
                      its owner's token",
-                    ctx.shown(&ctx.tokens.staging)
+                    ctx.shown_token(&ctx.tokens.staging)
                 )));
             }
             Err(why) => {
                 return Err(Error::cannot_run(format!(
-                    "staging token file invalid/unreadable: {} ({why})",
-                    ctx.shown(&ctx.tokens.staging)
+                    "staging token invalid/unreadable: {} ({why})",
+                    ctx.shown_token(&ctx.tokens.staging)
                 )));
             }
         }
@@ -987,6 +987,8 @@ struct Report<'a> {
     repo: &'a str,
     source: &'a str,
     build: Build,
+    /// The `n` of the `attempt-<n>` directory it is kept in, beside that attempt's step logs.
+    attempt: u64,
     outcome: &'a str,
     why: Option<&'a str>,
     steps: Vec<StepLine>,
@@ -1000,6 +1002,7 @@ struct StepLine {
     argv: Vec<String>,
     exit: Option<i32>,
     millis: u64,
+    queued_millis: u64,
     within_secs: u64,
     stdout_sha256: String,
     stderr_sha256: String,
@@ -1018,6 +1021,7 @@ impl StepLine {
             argv: r.argv.clone(),
             exit: r.exit,
             millis: r.millis,
+            queued_millis: r.queued_millis,
             within_secs: r.within_secs,
             stdout_sha256: r.stdout_sha256.clone(),
             stderr_sha256: r.stderr_sha256.clone(),
@@ -1106,40 +1110,46 @@ impl Bench<'_> {
         let (Some(frozen), Decision::Qualify) = (&row.frozen, &row.decision) else {
             return Fate::Failed("not a candidate".into());
         };
-        let clone = match self.freeze(def) {
-            Ok((dir, again)) if again == *frozen => dir,
-            Ok(_) => return Fate::Failed("its frozen main changed within the pass".into()),
-            Err(why) => return Fate::Failed(why),
-        };
+        let mut attempt = Attempt::of(&self.state.dir, name, frozen.build);
         let mut receipts = Vec::new();
-        let done = self.qualify_frozen(def, frozen, &clone, head, row, &mut receipts);
+        let done = match self.freeze(def) {
+            Ok((clone, again)) if again == *frozen => {
+                self.qualify_frozen(def, frozen, &clone, head, row, &mut attempt, &mut receipts)
+            }
+            Ok(_) => Err(Stop::Red("its frozen main changed within the pass".into())),
+            Err(why) => Err(Stop::Red(why)),
+        };
         let (outcome, why, fate) = match done {
+            // Nothing ran and nothing is counted: no attempt was made, and none is kept.
+            Ok(None) => return Fate::Unqualified,
             Ok(Some(record)) => ("enqueued", None, Fate::Enqueued(record)),
-            Ok(None) => ("unqualified", None, Fate::Unqualified),
             Err(Stop::Red(why)) => ("failed", Some(why.clone()), Fate::Failed(why)),
             Err(Stop::Infra(why)) => ("deferred", Some(why.clone()), Fate::Deferred(why)),
         };
         for receipt in &receipts {
             self.tx.say(format!("[{name}] {}", receipt.line()));
         }
-        let report = Report {
-            schema: "atpkg.lane.qualification.v1",
-            program: name,
-            repo: def.repo,
-            source: &frozen.sha,
-            build: frozen.build,
-            outcome,
-            why: why.as_deref(),
-            steps: receipts.iter().map(StepLine::of).collect(),
-        };
-        let path = self
-            .state
-            .dir
-            .join("receipts")
-            .join(format!("{name}-{}.json", frozen.build));
-        let written = aterm_json::to_string(&report)
-            .map_err(|e| Error::refused(format!("encode the qualification receipt: {e}")))
-            .and_then(|text| report::write_atomic(&path, &text));
+        // The receipt is kept in the attempt's own directory, beside its step logs: a later
+        // attempt of the build, whatever its outcome, never replaces it.
+        let written = attempt
+            .reserve()
+            .map_err(|e| Error::io("reserve this attempt's directory", &e))
+            .and_then(|(n, dir)| {
+                let report = Report {
+                    schema: "atpkg.lane.qualification.v1",
+                    program: name,
+                    repo: def.repo,
+                    source: &frozen.sha,
+                    build: frozen.build,
+                    attempt: n,
+                    outcome,
+                    why: why.as_deref(),
+                    steps: receipts.iter().map(StepLine::of).collect(),
+                };
+                aterm_json::to_string(&report)
+                    .map_err(|e| Error::refused(format!("encode the qualification receipt: {e}")))
+                    .and_then(|text| report::write_atomic(&dir.join(RECEIPT), &text))
+            });
         if let Err(e) = written {
             self.tx.warn(format!(
                 "[{name}] its qualification receipt was not kept: {e}"
@@ -1149,7 +1159,7 @@ impl Bench<'_> {
     }
 
     /// `Ok(Some(record))` enqueued, `Ok(None)` no list declared, `Err(stop)` failed or deferred.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn qualify_frozen(
         &self,
         def: &'static ProgramDef,
@@ -1157,6 +1167,7 @@ impl Bench<'_> {
         clone: &Path,
         head: u64,
         row: &Row,
+        attempt: &mut Attempt,
         receipts: &mut Vec<Receipt>,
     ) -> std::result::Result<Option<PathBuf>, Stop> {
         let (ctx, tx, name, build) = (self.ctx, self.tx, def.name, frozen.build);
@@ -1180,18 +1191,12 @@ impl Bench<'_> {
         let Some(plan) = qualify::parse(&json, name).map_err(|e| e.to_string())? else {
             return Ok(None);
         };
-        // Each attempt keeps its own raw output: a retry never overwrites what the last one
-        // left to be read.
-        let logs = self
-            .state
-            .dir
-            .join("logs")
-            .join(format!("{name}-{build}"))
-            .join(format!(
-                "attempt-{}",
-                self.state.attempts(name, build).saturating_add(1)
-            ));
-        let _ = std::fs::remove_dir_all(&logs);
+        // Each attempt keeps its own raw output in a directory no other attempt had: a retry,
+        // and a qualification again after a deferral or a set-aside record, never overwrites
+        // what an earlier one left to be read.
+        let (_, logs) = attempt
+            .reserve()
+            .map_err(|e| Stop::Infra(format!("reserve this attempt's log directory: {e}")))?;
 
         // Cheap first: the source checks, in the order the repository wrote them.
         let source = Site {
@@ -1216,10 +1221,12 @@ impl Bench<'_> {
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out).map_err(|e| format!("mkdir {}: {e}", out.display()))?;
         let started = Instant::now();
-        let packed = self.pack(def, clone, build, &out, plan.build().within);
+        let queue = Queue::of(clone);
+        let packed = self.pack(def, clone, build, &out, plan.build().within, &queue);
         let receipt = Receipt::build(
             plan.build(),
             started.elapsed(),
+            queue.waited(),
             packed
                 .as_ref()
                 .map(|_| ())
@@ -1322,8 +1329,9 @@ impl Bench<'_> {
             .map_err(|e| Stop::of("its ready record was not enqueued", &e))
     }
 
-    /// Pack this machine's target of `def` at `build` from `clone`, its build ended at
-    /// `within`. Signed, and not uploaded: nothing leaves this machine before its packed
+    /// Pack this machine's target of `def` at `build` from `clone`, its build ended once its
+    /// own time reaches `within`: what it waits to be admitted is left in `queue` and not
+    /// counted. Signed, and not uploaded: nothing leaves this machine before its packed
     /// controls pass.
     fn pack(
         &self,
@@ -1332,6 +1340,7 @@ impl Bench<'_> {
         build: Build,
         out: &Path,
         within: std::time::Duration,
+        queue: &Queue,
     ) -> std::result::Result<PackOutcome, Stop> {
         let (name, triple) = (def.name, self.opts.host);
         self.tx
@@ -1353,6 +1362,7 @@ impl Bench<'_> {
                     upload: false,
                     env: Vec::new(),
                     build_within: Some(within),
+                    build_queue: Some(queue.clone()),
                 },
             )
             .map_err(|e| Stop::of(&format!("the pack failed for {triple}"), &e))?;
@@ -1392,8 +1402,7 @@ impl Bench<'_> {
              this file is the latch: the lane skips {program} build {build} without rebuilding \
              while it exists.\n  Delete it (and attempts-{program}-{build}) to retry; a newer \
              main retries by itself.\n- the raw output of every step is under \
-             logs/{program}-{build}/attempt-<n>/, and its receipt is \
-             receipts/{program}-{build}.json.\n"
+             logs/{program}-{build}/attempt-<n>/, beside that attempt's receipt.json.\n"
         );
         let _ = report::write_atomic(&marker, &text);
         tx.warn(format!(
@@ -1406,6 +1415,68 @@ impl Bench<'_> {
             state,
             &format!("{program} build {build} blocked after {n} attempts: {headline}"),
         );
+    }
+}
+
+/// The name of an attempt's receipt in its `attempt-<n>` directory; a step's logs are
+/// `<step>[.<target>].stdout|.stderr` beside it.
+const RECEIPT: &str = "receipt.json";
+
+/// One qualification attempt of a build: its `logs/<program>-<build>/attempt-<n>/` directory,
+/// reserved the first time the attempt keeps something there (its step logs, else its receipt).
+struct Attempt {
+    build_logs: PathBuf,
+    reserved: Option<(u64, PathBuf)>,
+}
+
+impl Attempt {
+    fn of(lane_dir: &Path, program: &str, build: Build) -> Self {
+        Self {
+            build_logs: lane_dir.join("logs").join(format!("{program}-{build}")),
+            reserved: None,
+        }
+    }
+
+    /// The attempt's number and directory, made on first use.
+    fn reserve(&mut self) -> std::io::Result<(u64, PathBuf)> {
+        if let Some(reserved) = &self.reserved {
+            return Ok(reserved.clone());
+        }
+        let reserved = attempt_dir(&self.build_logs)?;
+        self.reserved = Some(reserved.clone());
+        Ok(reserved)
+    }
+}
+
+/// A new `attempt-<n>` directory under `build_logs` (one build's logs) and its `n`: one above
+/// the highest attempt already there, and the directory is made exclusively, so no two
+/// attempts of a build ever share one, whatever was counted against it in between.
+fn attempt_dir(build_logs: &Path) -> std::io::Result<(u64, PathBuf)> {
+    std::fs::create_dir_all(build_logs)?;
+    let mut n = std::fs::read_dir(build_logs)?
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_prefix("attempt-")?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    loop {
+        n = n.checked_add(1).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "{} holds no attempt number left",
+                build_logs.display()
+            ))
+        })?;
+        let dir = build_logs.join(format!("attempt-{n}"));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok((n, dir)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
     }
 }
 

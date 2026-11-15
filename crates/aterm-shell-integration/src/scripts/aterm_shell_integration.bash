@@ -18,7 +18,9 @@
 #   body at its next prompt when the host updates the body pointer
 # - TTY repair: restores terminal modes after a command that exits in raw mode
 #
-# Compatible with: bash 3.2+
+# Compatible with: bash 3.2+. No hook forks a subshell (`$(…)`, `( … )`, a pipeline)
+# where the session has its own output file: on macOS's bash 3.2 one forked after a
+# Ctrl-C can wait forever on a lock the shell holds (`__aterm_out`).
 
 # Only run in interactive shells
 [[ $- != *i* ]] && return
@@ -41,7 +43,9 @@
 # `return` reach the trace fd, without the nonce. The opening `local` comes first,
 # since it reads `$-`, `$?` and `$_` before any command changes them, so under
 # ALLEXPORT what it declares is exported while its hook runs, to aterm's own
-# `rm`, `stty` and `git`.
+# `rm`, `stty` and `git`. Before 4.4 one hook turns xtrace on itself, to read
+# bash's command number, and the next hook drops a trace a Ctrl-C left on
+# (`__aterm_mend`).
 
 # ─── Multiplexer boundary (screen / tmux) ───
 #
@@ -197,12 +201,17 @@ if (( __aterm_fresh_load )); then
     __aterm_original_prompt_command="${PROMPT_COMMAND:-}"
 fi
 
-# Check for a newer body pointer at the start of PROMPT_COMMAND.
+# Check for a newer body pointer at the start of PROMPT_COMMAND (its `rm` run as the
+# body runs a program, `__aterm_prog`, where it has that).
 __aterm_body_check() {
     [[ -n "$__aterm_body_pointer" && -f "$__aterm_body_pointer" ]] || return 0
     local __aterm_addr="" __aterm_file=""
     { IFS= read -r __aterm_addr < "$__aterm_body_pointer"; } 2>/dev/null
-    command rm -f -- "$__aterm_body_pointer"
+    if declare -F __aterm_prog >/dev/null; then
+        __aterm_prog rm -f -- "$__aterm_body_pointer"
+    else
+        command rm -f -- "$__aterm_body_pointer"
+    fi
     [[ ${#__aterm_addr} -eq 16 && "$__aterm_addr" != *[!0-9a-f]* ]] || return 0
     [ "$__aterm_addr" != "$__aterm_body_rev" ] || return 0
     __aterm_file="$__aterm_si_root/$__aterm_addr/aterm_shell_integration_body.bash"
@@ -612,11 +621,100 @@ __aterm_rekey_take() {
 }
 
 # Check for a new nonce written to `$__aterm_rekey_path`, then remove the file
-# (a program: only once the command's D is written).
+# (a program, `__aterm_prog`: only once the command's D is written).
 __aterm_rekey_check() {
     [[ -n "$__aterm_rekey_path" && -f "$__aterm_rekey_path" ]] || return 0
     __aterm_rekey_take
-    command rm -f -- "$__aterm_rekey_path"
+    __aterm_prog rm -f -- "$__aterm_rekey_path"
+}
+
+# ─── No subshell in a hook (`__aterm_out`) ───
+#
+# A hook takes a command's output from `__aterm_out`, never from a `$(…)`, a `( … )`
+# or a pipeline. On macOS's /bin/bash 3.2 a Ctrl-C that lands while readline writes
+# to the terminal (its redisplay, which goes to stderr) makes bash jump out of its
+# SIGINT handler with stderr's stdio lock still held by the shell's thread. The
+# shell takes that lock again at will, but a child it forks has another thread, and
+# a subshell takes the lock at once (bash's `command_substitute` reads
+# `fileno (stderr)` right after its fork): the first subshell a hook forks waits on
+# it forever and the shell hangs at its prompt for good (sampled: the shell in a
+# `read` of the pipe, the child in `flockfile`). A program the shell execs takes no
+# lock before it runs if bash prints nothing in the child, so a hook runs one
+# (`stty`, `git`, `rm`) through `__aterm_prog`. bash 5.3 runs no handler code there
+# (its readline acts on the Ctrl-C at the next key), and before 5.3 the reads below
+# are the hooks' forks.
+#
+# `__aterm_out` runs `"$@"` with its output in the session's own file, the host's
+# `<re-key path>.out` in its private folder (the host removes it with the session),
+# reads it back whole into `REPLY` and empties it, with builtins alone. A shell with
+# no re-key path (an older host, the file sourced by hand), or whose file cannot be
+# written, has none (`__aterm_out_ok` fails: `__aterm_outfile` empty, until a body
+# loads again) and its hooks read by `$(…)` as before.
+[[ -n ${__aterm_outfile-} ]] || __aterm_outfile=${__aterm_rekey_path:+$__aterm_rekey_path.out}
+__aterm_out_ok() {
+    [[ -n $__aterm_outfile ]] || return 1
+    [[ -f $__aterm_outfile && -w $__aterm_outfile ]] && return 0
+    [[ ! -e $__aterm_outfile ]] && { : >|"$__aterm_outfile"; } 2>/dev/null && return 0
+    __aterm_outfile=
+    return 1
+}
+# `"$@"`'s output (its stdout; stderr is dropped) in `REPLY`, and its status; 1 with
+# nothing run and `REPLY` empty where there is no file. It reads the file back a line a
+# `read`: with the newline delimiter bash's `read` takes a regular file in blocks (128
+# bytes a call on 3.2), where any other (`-d ''`) costs a system call a byte, thousands
+# a prompt for a long history entry.
+__aterm_out() {
+    REPLY=
+    __aterm_out_ok || return 1
+    local __aterm_rc=0 __aterm_line= __aterm_nl=$'\n'
+    { { "$@"; } >|"$__aterm_outfile" || __aterm_rc=$?; } 2>/dev/null
+    {
+        {
+            while IFS= read -r __aterm_line; do
+                REPLY=$REPLY$__aterm_line$__aterm_nl
+            done
+            REPLY=$REPLY$__aterm_line
+        } <"$__aterm_outfile"
+    } 2>/dev/null || :
+    { : >|"$__aterm_outfile"; } 2>/dev/null || :
+    return "$__aterm_rc"
+}
+
+# Run the program `"$@"` from a hook so bash prints nothing in its child: only once
+# `type -P` found it (bash prints a missing command's error there), its stderr
+# dropped by the shell, and with job control off, so the child sets no process group
+# of its own (macOS loses that race now and then, and bash prints `child setpgid …`
+# there). `__aterm_jobs_held` is up while job control is off; 127 where it is not found.
+__aterm_jobs_held=${__aterm_jobs_held-}
+__aterm_prog() {
+    type -P "$1" >/dev/null 2>&1 || return 127
+    local __aterm_rc=0
+    case $- in *m*) __aterm_jobs_held=1; set +m ;; esac
+    { command "$@" || __aterm_rc=$?; } 2>/dev/null
+    if [[ -n $__aterm_jobs_held ]]; then
+        __aterm_jobs_held=
+        set -m
+    fi
+    return "$__aterm_rc"
+}
+
+# A Ctrl-C can end a hook halfway, with job control off around a program
+# (`__aterm_prog`) or, before 4.4, with xtrace on in the read of the command number
+# (`__aterm_history_traced`, `__aterm_trace_held` up). The next hook mends both: it
+# turns job control on again, and drops the trace from the flags it took (its
+# `__aterm_flags`) and so puts back. The prompt's hook mends at its start
+# (`__aterm_end_command`), the DEBUG trap only outside a hook: under functrace it fires
+# inside one too, between `__aterm_prog`'s mark and its `set +m`, where a mend would
+# take the mark that turns job control on again after the program.
+__aterm_trace_held=${__aterm_trace_held-}
+__aterm_mend() {
+    if [[ -n $__aterm_jobs_held ]]; then
+        __aterm_jobs_held=
+        set -m
+    fi
+    [[ -n $__aterm_trace_held ]] || return 0
+    __aterm_trace_held=
+    __aterm_flags=${__aterm_flags//x/}
 }
 
 # Capability-nonce suffix helper for external callers; internal emitters use
@@ -668,7 +766,8 @@ __aterm_win_cwd_to=
 # end of the prompt and read `history 1` on the first trap when the line was
 # saved to history; fall back to `$BASH_COMMAND` when history was skipped
 # (`ignorespace`, `ignoredups`, `set +o history`) or on pre-5.3 Windows POSIX
-# shells where a `$(...)` fork costs ~16 ms (bash 5.3+ uses `${ ...; }` in-process).
+# shells where a `$(...)` fork costs ~16 ms (bash 5.3+ uses `${ ...; }` in-process,
+# and an older bash the session's file, `__aterm_out`, forking only where it has none).
 #
 # No builtin puts a history entry in a variable, and bash 5.3 keeps a `${ ...; }`
 # substitution's output in a file it makes and unlinks at once: a memfd where
@@ -680,10 +779,23 @@ __aterm_win_cwd_to=
 # MSYS2 process) went away, a read-only container on an older Linux with
 # `$TMPDIR` unset. The read fails (`function_substitute: cannot open anonymous
 # file`) and the line runs with no block. So the read names a folder it saw
-# just now, `$TMPDIR` or else `/tmp`, and forks `$(...)`, which needs none,
-# only where neither is there, whatever `$OSTYPE` says: whether bash gets a
-# memfd is its kernel's and its libc's to say.
+# just now, `$TMPDIR` or else `/tmp`, and where neither is there it reads through
+# the session's file (`__aterm_history_out`), whatever `$OSTYPE` says: whether
+# bash gets a memfd is its kernel's and its libc's to say. It forks `$(...)`,
+# which needs no file, only where the session has none either.
 __aterm_hist_mark="${__aterm_hist_mark:-}"
+# The assignment stays on the builtin: a posix-mode 3.2 keeps one made before a function.
+__aterm_history_print() { HISTTIMEFORMAT= builtin history 1; }
+# The last history entry in `REPLY` through the session's file (`__aterm_out`), with the
+# newlines a `$(…)` drops dropped; 1, with nothing read, where the session has no file.
+__aterm_history_out() {
+    __aterm_out_ok || return 1
+    local __aterm_nl=$'\n'
+    __aterm_out __aterm_history_print || :
+    while [[ "$REPLY" == *"$__aterm_nl" ]]; do
+        REPLY=${REPLY%"$__aterm_nl"}
+    done
+}
 if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
     # Inside eval so older bash versions do not fail parsing `${ ...; }`.
     eval '__aterm_history_line() {
@@ -693,13 +805,15 @@ if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )
             local TMPDIR=/tmp
             REPLY=${ HISTTIMEFORMAT= builtin history 1; }
         else
-            REPLY=$(HISTTIMEFORMAT= builtin history 1)
+            __aterm_history_out || REPLY=$(HISTTIMEFORMAT= builtin history 1)
         fi
     }'
 elif [[ -n "$__aterm_win_posix" ]]; then
     __aterm_history_line() { return 1; }
 else
-    __aterm_history_line() { REPLY=$(HISTTIMEFORMAT= builtin history 1); }
+    __aterm_history_line() {
+        __aterm_history_out || REPLY=$(HISTTIMEFORMAT= builtin history 1)
+    }
 fi
 
 # On bash < 5, `$HISTCMD` reads 1 in traps regardless of whether the line was
@@ -717,8 +831,8 @@ fi
 # `__aterm_line_unheard` starts no line while the count stands still. Only a prompt
 # string decodes the count. 4.4 and later read it in process with `${p@P}` (inside
 # eval, so that 3.2 parses this file). Before 4.4 xtrace's PS4 decodes it, in the
-# fork that reads the history entry (`__aterm_history_numbered`). A bash compares
-# reads of one kind only: 5.3's PS4 read gives one less than its `${p@P}`.
+# read of the history entry (`__aterm_history_numbered`). A bash compares reads of
+# one kind only: 5.3's PS4 read gives one less than its `${p@P}`.
 __aterm_hist_seen="${__aterm_hist_seen:-}"
 __aterm_cmd_mark="${__aterm_cmd_mark:-}"
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
@@ -738,19 +852,50 @@ if (( BASH_VERSINFO[0] < 5 )); then
         }
     else
         # The last history entry in `REPLY`, as `__aterm_history_line` reads it, and the
-        # command number in `__aterm_no` (empty when unread), from one fork. xtrace
+        # command number in `__aterm_no` (empty when unread), from one read. xtrace
         # writes PS4 for the `:` after the entry, with PS4's first character repeated
-        # once per level, so the number is the last line. A `BASH_XTRACEFD` (4.1 and
-        # later) other than 1 or 2 would send that line elsewhere, so the fork unsets it.
+        # once per level, so the number is the last line; the `set +x` after it traces
+        # into nothing. The read is the session's file (`__aterm_out`), the trace the
+        # shell's own under a local PS4, `__aterm_trace_held` up while it runs: a Ctrl-C
+        # in it leaves xtrace on, which the next hook takes out of the flags it puts back
+        # (`__aterm_mend`). A `BASH_XTRACEFD` other than 1 or 2 would send the line
+        # elsewhere, and a redirection of its descriptor resets bash's trace, so there
+        # the read forks and the child unsets it, as it forks where the session has no
+        # file. Only 4.1 and later read that variable: before 4.1 it is a plain one, a
+        # person's dotfiles may set it for a newer bash, and the read stays in process.
+        __aterm_history_traced() {
+            HISTTIMEFORMAT= builtin history 1
+            {
+                __aterm_trace_held=1
+                set -x
+                :
+                { set +x; } 2>/dev/null
+                __aterm_trace_held=
+            } 2>&1
+        }
         __aterm_history_numbered() {
             local __aterm_nl=$'\n'
-            REPLY=$(HISTTIMEFORMAT= builtin history 1
-                {
-                    [[ ${BASH_XTRACEFD-1} == [12] ]] || unset BASH_XTRACEFD
-                    PS4='+\#;'
-                    set -x
-                    :
-                } 2>&1)
+            if { (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] < 401 )) ||
+                [[ ${BASH_XTRACEFD-1} == [12] ]]; } && __aterm_out_ok; then
+                if ! { local PS4='+\#;'; } 2>/dev/null; then
+                    # A readonly PS4: no number, and the entry as ever.
+                    __aterm_no=
+                    __aterm_history_line
+                    return
+                fi
+                __aterm_out __aterm_history_traced || :
+                while [[ "$REPLY" == *"$__aterm_nl" ]]; do
+                    REPLY=${REPLY%"$__aterm_nl"}
+                done
+            else
+                REPLY=$(HISTTIMEFORMAT= builtin history 1
+                    {
+                        [[ ${BASH_XTRACEFD-1} == [12] ]] || unset BASH_XTRACEFD
+                        PS4='+\#;'
+                        set -x
+                        :
+                    } 2>&1)
+            fi
             __aterm_no=${REPLY##*"$__aterm_nl"}
             __aterm_no=${__aterm_no#"${__aterm_no%%[!+]*}"}
             __aterm_no=${__aterm_no%%;*}
@@ -939,7 +1084,11 @@ __aterm_win_cwd() {
     esac
 }
 
-# Report current working directory (signed OSC 633;P;AtermCwd + plain OSC 7).
+# Report current working directory (signed OSC 633;P;AtermCwd + plain OSC 7). bash sets
+# `HOSTNAME` as it starts; a host name the startup files unset is the one this body saw
+# first (`__aterm_hostname`), and with none the URI names no host, which reads as this
+# machine: no `$(hostname)` (`__aterm_out` says why a hook forks no subshell).
+[[ -n ${__aterm_hostname-} ]] || __aterm_hostname=${HOSTNAME-}
 __aterm_report_cwd() {
     local cwd="$PWD"
     if [[ -n "$__aterm_win_posix" ]]; then
@@ -948,7 +1097,7 @@ __aterm_report_cwd() {
     fi
     local REPLY
     __aterm_urlencode "$cwd"
-    local uri="file://${HOSTNAME:-$(hostname)}${REPLY}"
+    local uri="file://${HOSTNAME:-$__aterm_hostname}${REPLY}"
     if [[ -n "$__aterm_id_suffix_str" ]]; then
         __aterm_osc "633;P;AtermCwd=${uri}${__aterm_id_suffix_str}"
     fi
@@ -982,6 +1131,7 @@ __aterm_mark_exec_finish() {
 # calls it for a trampoline that predates it. Only the first call writes.
 __aterm_end_command() {
     local __aterm_hook_live=1
+    __aterm_mend
     [[ -n "$__aterm_last_command" ]] || __aterm_untraced __aterm_line_unheard
     [[ -n "$__aterm_last_command" ]] || return 0
     __aterm_rekey_take
@@ -1024,6 +1174,7 @@ __aterm_mark_integration_rev() {
 # in `FUNCNAME`, which outside functrace must not cost a shell its marks.
 __aterm_preexec() {
     { local __aterm_flags=$-; set +axv; } 2>/dev/null
+    [[ -n ${__aterm_hook_live-} ]] || __aterm_mend
     local __aterm_in_fn=""
     case $__aterm_flags:${__aterm_hook_live-} in *T*|*:?*) __aterm_in_fn=${FUNCNAME[1]-} ;; esac
     if [[ -n "$__aterm_prev_debug_handler" || -z "$__aterm_last_command" ]]; then
@@ -1042,9 +1193,8 @@ __aterm_preexec_run() {
     # a body a hook reloads runs in bash's `source` frame. `pc` is the person's scalar
     # PROMPT_COMMAND, whose top level runs in `__aterm_body_prompt_command` and is theirs.
     # An entry's first line, and a call of aterm's wherever it is made (the top level of
-    # PROMPT_COMMAND and PS0, the `$(…)` of the prompt aterm draws, a person's wrapper of
-    # PROMPT_COMMAND), are told by their text, so a frame bash 3.2 left stale never hides a
-    # person's command.
+    # PROMPT_COMMAND and PS0, a person's wrapper of PROMPT_COMMAND), are told by their
+    # text, so a frame bash 3.2 left stale never hides a person's command.
     if [[ -n "$__aterm_prev_debug_handler" ]]; then
         local __aterm_rc_skip=""
         case ${__aterm_hook_live-}:$2:$BASH_COMMAND in
@@ -1232,9 +1382,9 @@ else
         fi
         # History saved the line, but nothing ran unless bash's count moved.
         [[ "$__aterm_no" == [0-9]* && "$__aterm_no" != "$__aterm_cmd" ]] || return 0
-        # Bash 5 forks for the line found alone, so also where `__aterm_history_line`
-        # forks for none (Git Bash before 5.3).
-        (( BASH_VERSINFO[0] < 5 )) || REPLY=$(HISTTIMEFORMAT= builtin history 1)
+        # Bash 5 reads the line found alone, and forks for it only where
+        # `__aterm_history_line` reads none (Git Bash before 5.3).
+        (( BASH_VERSINFO[0] < 5 )) || __aterm_history_line || REPLY=$(HISTTIMEFORMAT= builtin history 1)
         REPLY="${REPLY#*[0-9][* ] }"
         [[ -n "$REPLY" ]] || return 0
         # Its marks are written now, so they carry a key the host handed meanwhile.
@@ -1250,6 +1400,8 @@ fi
 # `taskkill /F` under MSYS2, which reports exit 0). After any failed command or
 # any command that ran for >= 1 s, check `stty -a` and restore
 # `isig icanon iexten echo icrnl opost` if `-isig` is set (leaving `ixon` alone).
+# No builtin reads the terminal's modes, so this is the one program a plain prompt
+# runs, exec'd, never in a subshell (`__aterm_prog`).
 __aterm_line_ran_a_second() {
     local __aterm_t0=${__aterm_line_t0-} __aterm_now
     case $__aterm_t0 in
@@ -1264,11 +1416,15 @@ __aterm_line_ran_a_second() {
 }
 
 __aterm_tty_repair() {
-    local __aterm_tty_state=""
-    __aterm_tty_state="$(command stty -a 2>/dev/null)" || return 0
-    __aterm_tty_state=" ${__aterm_tty_state//$'\n'/ } "
+    local REPLY __aterm_tty_state
+    if __aterm_out_ok; then
+        __aterm_out __aterm_prog stty -a || return 0
+    else
+        REPLY=$(command stty -a 2>/dev/null) || return 0
+    fi
+    __aterm_tty_state=" ${REPLY//$'\n'/ } "
     case "$__aterm_tty_state" in
-        *" -isig "*) command stty isig icanon iexten echo icrnl opost 2>/dev/null ;;
+        *" -isig "*) __aterm_prog stty isig icanon iexten echo icrnl opost ;;
     esac
     return 0
 }
@@ -1278,13 +1434,17 @@ __aterm_tty_repair() {
 # Emit `AtermStartRc`, `AtermStartFlags`, and `AtermStart` (`cold` or `spare`)
 # once at the first prompt after startup files finish.
 __aterm_start_mark() {
-    local REPLY="$HOME" __aterm_j=-
+    local REPLY __aterm_j=-
     if [[ $1 == spare ]]; then
-        local __aterm_jl
-        __aterm_jl=$(jobs -p 2>/dev/null)
-        local -a __aterm_ja=($__aterm_jl)
+        if __aterm_out_ok; then
+            __aterm_out jobs -p || :
+        else
+            REPLY=$(jobs -p 2>/dev/null)
+        fi
+        local -a __aterm_ja=($REPLY)
         __aterm_j=${#__aterm_ja[@]}
     fi
+    REPLY=$HOME
     case $REPLY in *[\\\;\ [:cntrl:]]*) __aterm_encode_cmd "$REPLY" ;; esac
     printf '\033]633;P;AtermStartRc=%s%s\a\033]633;P;AtermStartFlags=pre:0,s:0,j:%s,r:0%s\a\033]633;P;AtermStart=%s%s\a' \
         "$REPLY" "$__aterm_id_suffix_str" "$__aterm_j" "$__aterm_id_suffix_str" \
@@ -1444,6 +1604,7 @@ __aterm_body_pc_close() {
 
     # Unexport PS1 so child processes cannot inherit the embedded nonce.
     export -n PS1
+    __aterm_prompt_segments
 
     # Arm `__aterm_prompt_end` if array elements remain, or capture `$HISTCMD` now.
     # A joined shell needs neither (bash-preexec is its gate and hands it the line),
@@ -1480,8 +1641,8 @@ __aterm_set_prompt() {
     local s="\[\033[38;5;${sc}m\]"
     local r="\[\033[0m\]"
 
-    local git_seg="${g}\$(__aterm_git_segment)${r}"
-    local err="\$(__aterm_err_prompt)"
+    local git_seg="${g}\${__aterm_git_seg-}${r}"
+    local err="\${__aterm_err_ps-}"
     local mark_b_id=""
     [[ -n "$__aterm_shell_nonce" ]] && mark_b_id=";id=${__aterm_shell_nonce};aterm_input=start"
     local mark_b="\[\033]133;B${mark_b_id}\a\]"
@@ -1500,22 +1661,47 @@ __aterm_set_prompt() {
     __aterm_prompt_has_mark_b=1
 }
 
-# Error-aware prompt character (`\001`/`\002` raw markers for `$()` inside PS1).
-__aterm_err_prompt() {
-    { local __aterm_hook_live=1; set +axv; } 2>/dev/null
-    if [[ ${__aterm_last_exit:-0} -ne 0 ]]; then
-        printf '\001\033[38;5;%sm\002$\001\033[0m\002 ' "${ATERM_PROMPT_ERROR_COLOR:-1}"
-    else
-        printf '\001\033[38;5;%sm\002$\001\033[0m\002 ' "${ATERM_PROMPT_SEP_COLOR:-8}"
+# The prompt's segments, set before bash draws it: its PS1 reads them by `${…}`, so
+# drawing it starts no subshell (`__aterm_out`). The prompt character takes the last
+# status's color and the git segment names the branch (`git`, the one program, run
+# by `__aterm_prog` only where the prompt shows it). Their `\001`/`\002` mark what
+# readline must not count, as `\[`/`\]` do in PS1's own text, which bash decodes
+# before it expands the values.
+__aterm_prompt_segments() {
+    if [[ $PS1 == *'${__aterm_err_ps-}'* ]]; then
+        local __aterm_c=${ATERM_PROMPT_SEP_COLOR:-8}
+        [[ ${__aterm_last_exit:-0} == 0 ]] || __aterm_c=${ATERM_PROMPT_ERROR_COLOR:-1}
+        __aterm_err_ps=$'\001\033[38;5;'"$__aterm_c"$'m\002$\001\033[0m\002 '
     fi
+    [[ $PS1 == *'${__aterm_git_seg-}'* ]] || return 0
+    local REPLY __aterm_nl=$'\n'
+    __aterm_git_seg=
+    if __aterm_out_ok; then
+        __aterm_out __aterm_prog git rev-parse --abbrev-ref HEAD || return 0
+    else
+        REPLY=$(command git rev-parse --abbrev-ref HEAD 2>/dev/null) || return 0
+    fi
+    while [[ "$REPLY" == *"$__aterm_nl" ]]; do
+        REPLY=${REPLY%"$__aterm_nl"}
+    done
+    [[ -z "$REPLY" ]] || __aterm_git_seg=" ($REPLY)"
 }
 
-__aterm_git_segment() {
-    { local __aterm_hook_live=1; set +axv; } 2>/dev/null
-    local branch
-    branch=$(command git rev-parse --abbrev-ref HEAD 2>/dev/null) || return
-    [[ -n "$branch" ]] && printf ' (%s)' "$branch"
+# A body that drew the prompt by `$(…)` left that PS1 in the shell: the same prompt
+# reads the segments instead, split out with quoted `%%`/`#` patterns (inside double
+# quotes bash 3.2 keeps the quotes of a quoted `/` replacement).
+__aterm_ps1_swap() {
+    local __aterm_rest=$PS1 __aterm_new=
+    [[ $__aterm_rest == *"$1"* ]] || return 0
+    while [[ $__aterm_rest == *"$1"* ]]; do
+        __aterm_new=$__aterm_new${__aterm_rest%%"$1"*}$2
+        __aterm_rest=${__aterm_rest#*"$1"}
+    done
+    PS1=$__aterm_new$__aterm_rest
 }
+__aterm_ps1_swap '$(__aterm_git_segment)' '${__aterm_git_seg-}'
+__aterm_ps1_swap '$(__aterm_err_prompt)' '${__aterm_err_ps-}'
+unset -f __aterm_git_segment __aterm_err_prompt __aterm_ps1_swap
 
 # Initialize prompt setup flags once per shell (`set -u` safe).
 if [[ -z "${__aterm_prompt_has_mark_b+x}" ]]; then

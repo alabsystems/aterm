@@ -1579,8 +1579,8 @@ pub(crate) fn video_empty_ledger_note(
                  verb aimed at any session but the front tab's focused pane (`@<sid>` naming a \
                  background tab or an unfocused split pane, or `@self` sent from one), a fenced \
                  `key`/`send` (`if=`, `if-gen=`, `if-fp=`, `if-human=`) wherever it is aimed, or \
-                 aterm's own guarded presses anywhere in this process (a `turn` submit guard, a \
-                 fact-menu slash command, a worker's launch line). Drive the front tab's focused \
+                 aterm's own guarded presses anywhere in this process (a `turn` submit under a \
+                 guard or `if-human=`, a fact-menu slash command, a worker's launch line). Drive the front tab's focused \
                  pane instead: flagless `key`/`ctrl`/`send`/`feed`/`paste`, or `@<sid>` naming it."
             ));
         }
@@ -2212,7 +2212,7 @@ fn run_encode_job(job: EncodeJob, permit: Option<CapturePermit>) {
                  \"input_semantics\": \"pre-routing attempts (`ch` = character, `key` = named key with no character); not PTY-delivery or visible-glyph receipts\",\n    \
                  \"keys_requested\": {keys_enabled}, \"inputs_logged\": {}, \"unlogged_inputs\": {unlogged_inputs},\n    \
                  \"unlogged_other_window\": {unlogged_other_window}, \"unlogged_over_cap\": {unlogged_over_cap}, \"inputs_cap\": {inputs_cap},\n    \
-                 \"unlogged_input_semantics\": \"input attempts during this take that are not in inputs[], from three causes. (1) The CONTROL-THREAD path: input written to the PTY off the App input seam this ledger hooks: a verb aimed at any session but the front tab's focused pane (`@<sid>` naming a background tab or an unfocused split pane; `@self` when the driving session is not that pane), any fenced `key`/`send` (`if=`, `if-gen=`, `if-fp=`, `if-human=`) wherever it is aimed, and aterm's own guarded presses (a `turn` submit guard, a fact-menu slash command, a worker's launch line). (2) `unlogged_other_window`: attempts that DID pass the seam but arrived on a window this take was not capturing — no frame here can answer them, so stamping them would fabricate a key->frame latency. (3) `unlogged_over_cap`: attempts on the recorded window after inputs[] reached inputs_cap rows — counted, not stamped. unlogged_inputs is the TOTAL and includes unlogged_other_window and unlogged_over_cap. Same unit as inputs_logged (one per would-be inputs[] row); cause (1) is process-wide, delta over this take. Non-zero means attempts happened that inputs[] does NOT contain.\",\n    \
+                 \"unlogged_input_semantics\": \"input attempts during this take that are not in inputs[], from three causes. (1) The CONTROL-THREAD path: input written to the PTY off the App input seam this ledger hooks: a verb aimed at any session but the front tab's focused pane (`@<sid>` naming a background tab or an unfocused split pane; `@self` when the driving session is not that pane), any fenced `key`/`send` (`if=`, `if-gen=`, `if-fp=`, `if-human=`) wherever it is aimed, and aterm's own guarded presses (a `turn` submit under a guard or `if-human=`, a fact-menu slash command, a worker's launch line). (2) `unlogged_other_window`: attempts that DID pass the seam but arrived on a window this take was not capturing — no frame here can answer them, so stamping them would fabricate a key->frame latency. (3) `unlogged_over_cap`: attempts on the recorded window after inputs[] reached inputs_cap rows — counted, not stamped. unlogged_inputs is the TOTAL and includes unlogged_other_window and unlogged_over_cap. Same unit as inputs_logged (one per would-be inputs[] row); cause (1) is process-wide, delta over this take. Non-zero means attempts happened that inputs[] does NOT contain.\",\n    \
                  \"stamp_semantics\": \"{stamp_semantics}\",\n    \
                  \"wall_start_us\": {started_us}, \"wall_stop_us\": {stop_us},\n    \
                  \"requested_ms\": {requested_ms}, \"covered_us\": {covered_us},\n    \
@@ -2391,7 +2391,8 @@ struct CaptureCompanionSongSync<'a> {
     cursor_trail_enabled: bool,
     cursor_companions_allowed: bool,
     pet_mode: bool,
-    pet_flies: bool,
+    /// The flier the pet setting keeps: the cat flies in its body ([`crate::kitty_cursor::CursorCat::set_body`]).
+    pet_flier: Option<aterm_effects::kitty_pet::PetSpecies>,
     now: Instant,
     detector: &'a mut aterm_effects::kitty_sing::KittySing,
     cat: &'a mut crate::kitty_cursor::CursorCat,
@@ -2405,7 +2406,7 @@ fn sync_capture_companion_song(sync: CaptureCompanionSongSync<'_>) -> f32 {
         cursor_trail_enabled,
         cursor_companions_allowed,
         pet_mode,
-        pet_flies,
+        pet_flier,
         now,
         detector,
         cat,
@@ -2432,6 +2433,7 @@ fn sync_capture_companion_song(sync: CaptureCompanionSongSync<'_>) -> f32 {
         detector.settle(now);
         *riff_bar = None;
     }
+    cat.set_body(pet_flier);
     cat.set_singing(
         now,
         crate::kitty_cursor::SingSync {
@@ -2442,7 +2444,7 @@ fn sync_capture_companion_song(sync: CaptureCompanionSongSync<'_>) -> f32 {
     crate::app_render::retire_kitty_cursor_without_owner(
         cursor_trail_enabled && cursor_companions_allowed,
         pet_mode,
-        pet_flies,
+        pet_flier.is_some(),
         style,
         drive,
         cat,
@@ -3193,7 +3195,7 @@ impl App {
                 cursor_trail_enabled: glow_cfg.enabled,
                 cursor_companions_allowed,
                 pet_mode,
-                pet_flies: trail_presentation.pet_flies,
+                pet_flier: trail_presentation.pet_flier,
                 now,
                 detector,
                 cat,
@@ -3469,7 +3471,7 @@ impl App {
                 cursor_trail_enabled: glow_cfg.enabled,
                 cursor_companions_allowed,
                 pet_mode,
-                pet_flies: trail_presentation.pet_flies,
+                pet_flier: trail_presentation.pet_flier,
                 now,
                 detector,
                 cat,
@@ -4217,12 +4219,14 @@ impl App {
         self.mark_capture_present(wid, false);
     }
 
+    /// Marks window `wid`'s redraws as a capture's (`on`), or no longer (`!on`): a hidden window
+    /// presents a capture's frame (`docs/ATERM_DESIGN.md` §7.4), as its GPU target does.
     fn mark_capture_present(&mut self, wid: crate::WindowId, on: bool) {
-        if let Some(crate::PresentTarget::Gpu { window_gpu, .. }) = self
-            .windows
-            .get_mut(&wid)
-            .and_then(|window| window.present.as_mut())
-        {
+        let Some(window) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        window.capture_redraw = on;
+        if let Some(crate::PresentTarget::Gpu { window_gpu, .. }) = window.present.as_mut() {
             window_gpu.set_capture_present(on);
         }
     }

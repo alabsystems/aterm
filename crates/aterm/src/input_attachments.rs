@@ -635,7 +635,12 @@ impl BackgroundStartup {
 }
 
 pub(super) fn spawn() -> Option<aterm_gui::HostMaintenance> {
-    supervisor(Notifications {
+    supervisor(window_notifications()).map(window_keeper)
+}
+
+/// What the window's keeper tells the window.
+fn window_notifications() -> Notifications {
+    Notifications {
         invalidated: super::invalidate_input_observations,
         changed: || {
             super::request_observation(
@@ -649,8 +654,128 @@ pub(super) fn spawn() -> Option<aterm_gui::HostMaintenance> {
         console_return: Some(super::wake_setup_for_console),
         pending: Some(super::wake_setup_facts),
         ended: Some(Arc::new(aterm_gui::wake_host_maintenance)),
-    })
-    .map(|mut owner| Box::new(move || owner.maintain()) as aterm_gui::HostMaintenance)
+    }
+}
+
+/// The control of the window's keeper in the process that runs one ([`window_keeper`]): what
+/// [`focus_gained`] and [`work_requested`] hint. It names no keeper anywhere else.
+static WINDOW_KEEPER: Mutex<std::sync::Weak<watch::Control>> = Mutex::new(std::sync::Weak::new());
+
+/// The window's upkeep of `owner`, whose worker [`focus_gained`] and [`work_requested`] hint
+/// from here on.
+fn window_keeper(mut owner: Supervisor) -> aterm_gui::HostMaintenance {
+    *WINDOW_KEEPER.lock().unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&owner.wake);
+    Box::new(move || owner.maintain())
+}
+
+/// One of this process's windows gained focus: a hint to the window's keeper.
+pub(super) fn focus_gained() {
+    hint(watch::Causes::FOCUS);
+}
+
+/// This process asked for work a round of the window's keeper does (a deferred-preference
+/// follow-up, a Caps Lock live reading to publish again, a setup reader to start again): a
+/// hint to that keeper.
+pub(super) fn work_requested() {
+    hint(watch::Causes::REQUEST);
+}
+
+/// Whether a window's keeper heard each hint this module's callers send it.
+#[cfg(test)]
+pub(super) struct Heard {
+    pub(super) focus: bool,
+    pub(super) request: bool,
+}
+
+/// Run `act` beside a keeper registered as [`spawn`] registers the window's, which starts no
+/// worker here, and say what a wait on that keeper's control then tells. One at a time.
+#[cfg(test)]
+pub(super) fn heard_by_a_window_keeper(act: impl FnOnce()) -> Heard {
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let owner = Supervisor::new(Notifications {
+        changed: || {},
+        invalidated: || {},
+        console_return: None,
+        pending: None,
+        ended: None,
+    });
+    let control = Arc::clone(&owner.wake);
+    let upkeep = window_keeper(owner);
+    act();
+    // The wake ends the wait where `act` hinted nothing.
+    control.wake();
+    let stopped = AtomicBool::new(false);
+    let mut watch = watch::Watch::private(Arc::clone(&control), &stopped, || {
+        panic!("a pending wake needs no blocking wait")
+    });
+    let woke = watch.wait(&stopped, Instant::now() + BACKSTOP);
+    drop(watch);
+    drop(upkeep);
+    let watch::Woke::Hint(causes) = woke else {
+        panic!("the wait ended without the pending wake: {woke:?}");
+    };
+    Heard {
+        focus: causes.contains(watch::Causes::FOCUS),
+        request: causes.contains(watch::Causes::REQUEST),
+    }
+}
+
+/// What a round of the window's keeper found of the window's own work, and the wait it chose.
+#[cfg(test)]
+pub(super) struct WindowRound {
+    pub(super) caps_stand: bool,
+    pub(super) dispatch: Option<Duration>,
+    pub(super) wait: Duration,
+}
+
+/// Two rounds of the window's keeper as its worker runs them ([`keeper_round`] with
+/// [`window_notifications`]), over a system off the console, which reads no hardware, with no
+/// follow-up asked for: the first finds a new sample, `between` runs, and the second is told.
+/// Its wait is the one [`next_wait`] chooses with every hint source armed.
+#[cfg(test)]
+pub(super) fn window_round_off_the_console(between: impl FnOnce()) -> WindowRound {
+    let sys = aterm_machines::port::Fake::root();
+    let actor = Mutex::new(Actor {
+        follow_up: super::withheld_preferences::Coordinator::caught_up(),
+        ..Actor::default()
+    });
+    let notifications = window_notifications();
+    let ports = Ports {
+        sys: &sys,
+        scope: &|| Ok(InputSetupScope::Inactive),
+        activate: &|_, _, _| panic!("a keeper off the console activates nothing"),
+        records: None,
+        chose: &|_, _, _| {},
+        pace: PACE,
+    };
+    let clock = Instant::now();
+    let none = watch::Causes::default();
+    let first = keeper_round(&actor, clock, &notifications, &ports, none);
+    assert!(first.moved, "a keeper's first sample is new");
+    between();
+    let facts = keeper_round(&actor, clock, &notifications, &ports, none);
+    assert!(!facts.moved, "the same sample again");
+    let armed = Coverage {
+        devices: true,
+        console: true,
+        records: true,
+    };
+    WindowRound {
+        caps_stand: facts.caps_stand,
+        dispatch: facts.dispatch,
+        wait: next_wait(&facts, armed, PACE),
+    }
+}
+
+fn hint(cause: watch::Causes) {
+    let keeper = WINDOW_KEEPER
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .upgrade();
+    if let Some(keeper) = keeper {
+        keeper.hint(cause);
+    }
 }
 
 fn supervisor_allowed() -> bool {
@@ -664,6 +789,113 @@ fn supervisor(notifications: Notifications) -> Option<Supervisor> {
     let mut owner = Supervisor::new(notifications);
     let _ = owner.maintain();
     Some(owner)
+}
+
+/// How long a round's result stands before the next round reads again: the keeper's timer
+/// while a round owes another, and the least time between two rounds that only hints started.
+const PACE: Duration = Duration::from_secs(2);
+
+/// How long a settled keeper waits with no hint before it reads again: the longest pause its
+/// own retries already keep. It bounds how long a change that nothing announces stays unseen.
+const BACKSTOP: Duration = Duration::from_millis(aterm_secrets::converge::LONGEST_RETRY_MS);
+
+/// Which hint sources of a keeper's worker are armed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Coverage {
+    /// Every keyboard lifecycle notification.
+    devices: bool,
+    /// The console user's key.
+    console: bool,
+    /// The watch of the setup records' folder.
+    records: bool,
+}
+
+impl Coverage {
+    const fn whole(self) -> bool {
+        self.devices && self.console && self.records
+    }
+}
+
+/// What a round found that decides how long the worker waits after it ([`next_wait`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RoundFacts {
+    /// What the wait before the round heard.
+    causes: watch::Causes,
+    /// The round's sample differed from the one before, or it changed a mapping, or it failed.
+    moved: bool,
+    /// The window's round sampled under a pending scope, where a keyboard becoming readable
+    /// tells nobody; false in a background keeper, whose pending sample nudges nothing.
+    pending_scope: bool,
+    /// An attachment is left unfinished, held or failed: the keeper retries it.
+    attempted: bool,
+    /// A console return's wake of setup failed and is kept for the next round.
+    console_return: bool,
+    /// The window's deferred-preference follow-up; idle in a background keeper.
+    follow_up: super::withheld_preferences::Owed,
+    /// The readings hold the Caps Lock live reading this round found; true in a background
+    /// keeper, which publishes none.
+    caps_stand: bool,
+    /// When the window's setup reader is next started for a batch it never read; `None` where
+    /// none is kept, and in a background keeper.
+    dispatch: Option<Duration>,
+    /// The window's loop is owed the setup readings, which a round publishes again until the
+    /// loop took them; false in a background keeper.
+    undelivered: bool,
+}
+
+/// How long the worker waits after a round before the next, a hint apart. Each of these keeps
+/// the timer, `pace`:
+/// - a keyboard or console notice ended the wait before: the notice can come before the census
+///   or the console's owner shows the change, so one more round confirms it;
+/// - the round moved something: the next reads what that left;
+/// - a pending scope, an unfinished attachment, a kept console return, a running follow-up
+///   attempt, a Caps Lock live reading the readings do not hold, or readings the window's loop
+///   has not taken: each waits on something that tells nobody when it changes;
+/// - a hint source that did not arm: the timer stands in for it.
+///
+/// Otherwise the round is settled: the worker waits for a hint, for the follow-up's or the
+/// reader's own next time, or for [`BACKSTOP`], and never less than `pace`.
+fn next_wait(facts: &RoundFacts, coverage: Coverage, pace: Duration) -> Duration {
+    use super::withheld_preferences::Owed;
+    let confirm = watch::Causes::DEVICE.union(watch::Causes::CONSOLE);
+    if facts.causes.intersects(confirm)
+        || facts.moved
+        || facts.pending_scope
+        || facts.attempted
+        || facts.console_return
+        || facts.follow_up == Owed::Running
+        || !facts.caps_stand
+        || facts.undelivered
+        || !coverage.whole()
+    {
+        return pace;
+    }
+    let follow_up = match facts.follow_up {
+        Owed::In(left) => left,
+        Owed::Idle | Owed::Running => BACKSTOP,
+    };
+    BACKSTOP
+        .min(follow_up)
+        .min(facts.dispatch.unwrap_or(BACKSTOP))
+        .max(pace)
+}
+
+/// Attach the accepted mapping to these keyboards of this revision, calling the last argument
+/// before the first change.
+type Activate<'a> =
+    dyn Fn(u64, &[u64], &dyn Fn()) -> Result<Option<KeyboardAttachmentActivation>, String> + 'a;
+
+/// What a keeper's worker reads and does outside this module.
+struct Ports<'a> {
+    sys: &'a dyn aterm_machines::port::System,
+    /// The accepted or pending Caps Lock scope, from the setup records.
+    scope: &'a dyn Fn() -> Result<InputSetupScope, String>,
+    activate: &'a Activate<'a>,
+    /// The folder the records `scope` reads are published in, where there is one to watch.
+    records: Option<std::path::PathBuf>,
+    /// Told after each round what it found, which hint sources are armed and the wait chosen.
+    chose: &'a dyn Fn(&RoundFacts, Coverage, Duration),
+    pace: Duration,
 }
 
 fn spawn_worker(
@@ -681,98 +913,305 @@ fn spawn_worker(
         clock,
         notifications,
         move |actor, stop, clock, notifications| {
-            use aterm_machines::port::System as _;
             let _ = aterm_log::wait_for_logger(super::EARLY_LOG_WAIT);
             let sys = aterm_machines::port::Live::new();
-            // Arm lifecycle notifications before the first full census. This worker
-            // owns their run loop and context; events only interrupt its fallback wait.
-            let mut watch = watch::Watch::new(wake, &stop);
-            while !stop.load(Ordering::Acquire) {
-                if notifications.pending.is_some() {
-                    super::maintain_observation_dispatch();
-                }
-                let live_scope = notifications
-                    .pending
-                    .is_some()
-                    .then(super::capture_caps_live_scope)
-                    .flatten();
-                let mut actor = actor.lock().unwrap_or_else(PoisonError::into_inner);
-                let Actor {
-                    inputs,
-                    console,
-                    follow_up,
-                    follow_up_said,
-                    said,
-                } = &mut *actor;
-                // One current console sample and one canonical input-scope read select accepted
-                // activation or the narrowly scoped observation of still-owed Caps work.
-                let at_console = sys.euid() != 0 && !aterm_machines::console::remote(&sys);
-                if let Some(wake) = notifications.console_return {
-                    let _ = console.recover(at_console, wake);
-                }
-                let now = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if notifications.pending.is_some() {
-                    match follow_up.round(now) {
-                        Ok(()) => *follow_up_said = None,
-                        Err(why) if follow_up_said.as_ref() != Some(&why) => {
-                            aterm_log::info!("deferred preferences wait for a worker: {why}");
-                            *follow_up_said = Some(why);
-                        }
-                        Err(_) => {}
-                    }
-                }
-                let scope = aterm_cli::macos_doctor::input_setup_scope();
-                let needs_observation = std::cell::Cell::new(false);
-                let invalidate = || {
-                    needs_observation.set(true);
-                    (notifications.invalidated)();
-                };
-                let result = inputs.round(
-                    at_console,
-                    now,
-                    || scope.clone(),
-                    || sys.keyboard_service_ids(),
-                    || sys.keyboard_service_observations(),
-                    |revision, ids| {
-                        let (result, retired) = activate_observing(|changing| {
-                            aterm_cli::macos_doctor::activate_input_attachments(
-                                revision,
-                                ids,
-                                super::setup_stop_requested,
-                                changing,
-                            )
-                        });
-                        needs_observation.set(needs_observation.get() || retired);
-                        result
+            live_worker(
+                &actor,
+                &stop,
+                clock,
+                &notifications,
+                &wake,
+                &Outside {
+                    sys: &sys,
+                    scope: &aterm_cli::macos_doctor::input_setup_scope,
+                    activate: &|revision, ids, changing| {
+                        aterm_cli::macos_doctor::activate_input_attachments(
+                            revision,
+                            ids,
+                            super::setup_stop_requested,
+                            changing,
+                        )
                     },
-                    &notifications.pending.unwrap_or(|| {}),
-                    &invalidate,
-                );
-                let live = result.as_ref().ok().and(inputs.live);
-                match result {
-                    Ok(true) => {
-                        if needs_observation.get() {
-                            (notifications.changed)();
-                        }
-                        *said = None;
-                    }
-                    Ok(false) => {}
-                    Err(why) if said.as_ref() != Some(&why) => {
-                        aterm_log::info!("keyboard attachment activation waits: {why}");
-                        *said = Some(why);
-                    }
-                    Err(_) => {}
-                }
-                drop(actor);
-                if notifications.pending.is_some() {
-                    super::publish_caps_live(live_scope, live);
-                }
-                // Property drift and console changes need the complete original timer
-                // even when a device family emits no usable lifecycle notification.
-                watch.wait_until(&stop, Instant::now() + Duration::from_secs(2));
-            }
+                    records: aterm_cli::macos_doctor::initial_setup_records(),
+                    chose: &|facts, coverage, wait| {
+                        aterm_log::debug!(
+                            "the keyboard keeper's round after {:?} waits {wait:?}: {facts:?}, \
+                             {coverage:?}",
+                            facts.causes
+                        );
+                    },
+                },
+            );
         },
     )
+}
+
+/// What the keeper's thread is handed from outside this module: [`Ports`] but for the pace,
+/// which [`live_worker`] sets.
+struct Outside<'a> {
+    sys: &'a dyn aterm_machines::port::System,
+    scope: &'a dyn Fn() -> Result<InputSetupScope, String>,
+    activate: &'a Activate<'a>,
+    records: Option<std::path::PathBuf>,
+    chose: &'a dyn Fn(&RoundFacts, Coverage, Duration),
+}
+
+/// What the keeper's thread runs: [`keeper_worker`] at [`PACE`], on a watch that registers
+/// this Mac's keyboard notices and the console user's key on this thread's run loop.
+fn live_worker(
+    actor: &Mutex<Actor>,
+    stop: &AtomicBool,
+    clock: Instant,
+    notifications: &Notifications,
+    wake: &Arc<watch::Control>,
+    outside: &Outside<'_>,
+) {
+    // Arm lifecycle notifications before the first full census. This worker
+    // owns their run loop and context; events only end its wait.
+    let mut watch = watch::Watch::new(Arc::clone(wake), stop);
+    keeper_worker(
+        actor,
+        stop,
+        clock,
+        notifications,
+        wake,
+        &mut watch,
+        &Ports {
+            sys: outside.sys,
+            scope: outside.scope,
+            activate: outside.activate,
+            records: outside.records.clone(),
+            chose: outside.chose,
+            pace: PACE,
+        },
+    );
+}
+
+/// Hint `control` at each settled burst of records published into or removed from `folder`, and
+/// once at the watch's first look, which folds in a change made before it armed. `None` where
+/// the watch cannot start. The watch's thread blocks on the folder's events; where no event
+/// tells of the folder (its arm refused, or a volume that does not report every writer's
+/// change) it looks at the folder every half second instead, as every
+/// [`aterm_uds::file_watch::FileWatch`] does, and tells what the look finds.
+fn watch_records(
+    control: Arc<watch::Control>,
+    folder: std::path::PathBuf,
+) -> Option<aterm_uds::file_watch::FileWatch> {
+    let records = aterm_uds::file_watch::FileWatch::platform(
+        "aterm-input-records",
+        Box::new(move |_| control.hint(watch::Causes::RECORDS)),
+    )
+    .ok()?;
+    records.watch_directory(0, folder);
+    Some(records)
+}
+
+/// A keeper's worker, from its first round to its stop: what the thread runs once it has its
+/// system and its watch. `control` is the one `watch` waits on.
+fn keeper_worker(
+    actor: &Mutex<Actor>,
+    stop: &AtomicBool,
+    clock: Instant,
+    notifications: &Notifications,
+    control: &Arc<watch::Control>,
+    watch: &mut impl Waits,
+    ports: &Ports<'_>,
+) {
+    // Held for the worker's life: its thread blocks in the kernel between the folder's events.
+    let records = ports
+        .records
+        .clone()
+        .and_then(|folder| watch_records(Arc::clone(control), folder));
+    keeper_loop(
+        |causes| keeper_round(actor, clock, notifications, ports, causes),
+        ports.chose,
+        watch,
+        stop,
+        records.is_some(),
+        ports.pace,
+    );
+}
+
+/// The clock a keeper's loop reads, the wait it makes on it, and which of the wait's own hint
+/// sources are armed.
+trait Waits {
+    fn now(&self) -> Instant;
+    fn wait(&mut self, stopped: &AtomicBool, deadline: Instant) -> watch::Woke;
+    fn armed(&self) -> watch::Armed;
+}
+
+impl Waits for watch::Watch {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn armed(&self) -> watch::Armed {
+        Self::armed(self)
+    }
+
+    fn wait(&mut self, stopped: &AtomicBool, deadline: Instant) -> watch::Woke {
+        Self::wait(self, stopped, deadline)
+    }
+}
+
+/// Run `round`, then wait as long as [`next_wait`] says for what it found, until stop; `chose`
+/// is told each choice. A keyboard notice or [`watch::Control::wake`] ends the wait at once.
+/// Any other hint starts the next round too, but no sooner than `pace` after the last round
+/// ended. Each round is handed what the wait before it heard.
+///
+/// A round that owes another, or whose hint sources did not all arm (`records` says whether the
+/// records watch did), keeps the two-second timer. A settled round does not: the next round
+/// comes at a hint or at [`BACKSTOP`]. The backstop is for the changes nothing announces: a
+/// mapping another program resets on a keyboard that stays attached, a keyboard whose driver
+/// family posts no lifecycle notice, a console owner that changed long after its notice, a
+/// record rewritten in place.
+fn keeper_loop(
+    mut round: impl FnMut(watch::Causes) -> RoundFacts,
+    chose: impl Fn(&RoundFacts, Coverage, Duration),
+    waits: &mut impl Waits,
+    stop: &AtomicBool,
+    records: bool,
+    pace: Duration,
+) {
+    let at_once = watch::Causes::DEVICE.union(watch::Causes::WAKE);
+    let mut heard = watch::Causes::default();
+    while !stop.load(Ordering::Acquire) {
+        let facts = round(std::mem::take(&mut heard));
+        let watch::Armed { devices, console } = waits.armed();
+        let coverage = Coverage {
+            devices,
+            console,
+            records,
+        };
+        let wait = next_wait(&facts, coverage, pace);
+        chose(&facts, coverage, wait);
+        let ended = waits.now();
+        let paced = ended + pace;
+        let mut deadline = ended + wait;
+        loop {
+            match waits.wait(stop, deadline) {
+                watch::Woke::Stopped => return,
+                watch::Woke::Deadline => break,
+                watch::Woke::Hint(causes) => {
+                    heard = heard.union(causes);
+                    if causes.intersects(at_once) {
+                        break;
+                    }
+                    deadline = deadline.min(paced);
+                }
+            }
+        }
+    }
+}
+
+/// One round: the window's upkeep where this is the window's keeper, then one console sample,
+/// one scope read and the census and activation that scope admits. `causes` is what the wait
+/// before it heard; the facts are what the next wait is chosen by.
+fn keeper_round(
+    actor: &Mutex<Actor>,
+    clock: Instant,
+    notifications: &Notifications,
+    ports: &Ports<'_>,
+    causes: watch::Causes,
+) -> RoundFacts {
+    let sys = ports.sys;
+    if notifications.pending.is_some() {
+        super::maintain_observation_dispatch();
+    }
+    let live_scope = notifications
+        .pending
+        .is_some()
+        .then(super::capture_caps_live_scope)
+        .flatten();
+    let mut actor = actor.lock().unwrap_or_else(PoisonError::into_inner);
+    let Actor {
+        inputs,
+        console,
+        follow_up,
+        follow_up_said,
+        said,
+    } = &mut *actor;
+    // One current console sample and one canonical input-scope read select accepted
+    // activation or the narrowly scoped observation of still-owed Caps work.
+    let at_console = sys.euid() != 0 && !aterm_machines::console::remote(sys);
+    if let Some(wake) = notifications.console_return {
+        let _ = console.recover(at_console, wake);
+    }
+    let now = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if notifications.pending.is_some() {
+        match follow_up.round(now) {
+            Ok(()) => *follow_up_said = None,
+            Err(why) if follow_up_said.as_ref() != Some(&why) => {
+                aterm_log::info!("deferred preferences wait for a worker: {why}");
+                *follow_up_said = Some(why);
+            }
+            Err(_) => {}
+        }
+    }
+    let scope = (ports.scope)();
+    let needs_observation = std::cell::Cell::new(false);
+    let invalidate = || {
+        needs_observation.set(true);
+        (notifications.invalidated)();
+    };
+    let result = inputs.round(
+        at_console,
+        now,
+        || scope.clone(),
+        || sys.keyboard_service_ids(),
+        || sys.keyboard_service_observations(),
+        |revision, ids| {
+            let (result, retired) =
+                activate_observing(|changing| (ports.activate)(revision, ids, changing));
+            needs_observation.set(needs_observation.get() || retired);
+            result
+        },
+        &notifications.pending.unwrap_or(|| {}),
+        &invalidate,
+    );
+    let live = result.as_ref().ok().and(inputs.live);
+    let moved = needs_observation.get() || !matches!(result, Ok(false));
+    match result {
+        Ok(true) => {
+            if needs_observation.get() {
+                (notifications.changed)();
+            }
+            *said = None;
+        }
+        Ok(false) => {}
+        Err(why) if said.as_ref() != Some(&why) => {
+            aterm_log::info!("keyboard attachment activation waits: {why}");
+            *said = Some(why);
+        }
+        Err(_) => {}
+    }
+    let window = notifications.pending.is_some();
+    let facts = RoundFacts {
+        causes,
+        moved,
+        pending_scope: window && inputs.pending.is_some(),
+        attempted: inputs.keeper.attempted.is_some(),
+        console_return: console.pending,
+        follow_up: if window {
+            follow_up.owed(u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX))
+        } else {
+            super::withheld_preferences::Owed::Idle
+        },
+        caps_stand: true,
+        dispatch: None,
+        undelivered: false,
+    };
+    drop(actor);
+    if !window {
+        return facts;
+    }
+    super::publish_caps_live(live_scope, live);
+    RoundFacts {
+        caps_stand: super::caps_live_stands(live),
+        dispatch: super::observation_dispatch_owed(),
+        undelivered: aterm_gui::initial_setup_readings_undelivered(),
+        ..facts
+    }
 }
 
 fn spawn_worker_with(

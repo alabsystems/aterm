@@ -2788,67 +2788,69 @@ fn an_accepted_workspace_policy_is_ok_and_a_local_seal_only_warns() {
 }
 
 #[test]
-fn a_local_trust_is_a_note_only_when_no_managed_build_is_served() {
-    let l = unserved_platform_store("unserved-local-trust", false);
-    let home = synthetic_home("unserved-local-trust");
-    let path = std::env::join_paths([l.bin_dir()]).unwrap();
-    let local = home.join("trust-41d79979");
-    std::fs::create_dir_all(&local).unwrap();
-    let mut probes = Probes {
-        local_seal: Some(LocalSealProbe {
-            link: PathBuf::from("/home/me/.rustup/toolchains/trust"),
-            link_target: local.clone(),
-            trustc: "41d799797b".into(),
-            stale: None,
-            trust_unserved: true,
-        }),
-        ..Probes::default()
-    };
-    let report = |probes: &Probes| {
-        let rows = report_with(&l, Some(&home), Some(&path), 0, None, probes);
-        (
-            render(&rows, "doctor", Detail::Everything).joined(),
-            render(&rows, "doctor", Detail::Problems).joined(),
-        )
-    };
-    let warned = "warn — rustup `trust` names a local toolchain, not the managed one";
+fn local_trust_diagnostics_follow_publication_and_link_state() {
     for unserved in [false, true] {
-        probes.local_seal.as_mut().unwrap().trust_unserved = unserved;
-        let (out, shown) = report(&probes);
-        if unserved {
-            let note = out
-                .lines()
-                .find(|line| line.contains("note — rustup `trust`"))
-                .unwrap_or_else(|| panic!("a note on the local trust: {out}"));
-            assert!(
-                note.contains(&local.display().to_string()),
-                "it names the toolchain: {note}"
-            );
-            assert!(!out.contains("warn — rustup `trust`"), "{out}");
-            assert!(!shown.contains("rustup `trust`"), "not counted: {shown}");
-        } else {
-            assert!(out.contains(warned), "{out}");
-            assert!(!out.contains("note — rustup `trust`"), "{out}");
-            assert!(shown.contains("rustup `trust`"), "counted: {shown}");
+        let l = unserved_platform_store("unserved-local-trust", false);
+        let home = synthetic_home("unserved-local-trust");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let local = home.join("trust-41d79979");
+        std::fs::create_dir_all(&local).unwrap();
+        let mut probes = Probes {
+            local_seal: Some(LocalSealProbe {
+                link: PathBuf::from("/home/me/.rustup/toolchains/trust"),
+                link_target: local.clone(),
+                trustc: "41d799797b".into(),
+                stale: None,
+                trust_unserved: unserved,
+            }),
+            ..Probes::default()
+        };
+        let report = |probes: &Probes| {
+            report_with(&l, Some(&home), Some(&path), 0, None, probes)
+                .into_iter()
+                .find(|row| c::is(&row.id, c::RUSTUP_LOCAL))
+                .expect("the local toolchain has a diagnostic row")
+        };
+        let row = report(&probes);
+        assert_eq!(
+            row.outcome,
+            if unserved {
+                Outcome::NotApplicable
+            } else {
+                Outcome::Planned
+            }
+        );
+        assert_eq!(
+            mark(&row),
+            Some(if unserved { Mark::Note } else { Mark::Warn })
+        );
+        assert_eq!(said_by_default(&row), !unserved);
+        assert_eq!(row.explain.as_ref().unwrap().remedy, Remedy::None);
+        assert!(
+            row.explain
+                .as_ref()
+                .unwrap()
+                .why
+                .contains(&local.display().to_string())
+        );
+        if let Some(seal) = probes.local_seal.as_mut() {
+            seal.link_target = home.join("gone");
         }
+        let row = report(&probes);
+        assert_eq!(mark(&row), Some(Mark::Warn));
+        assert!(said_by_default(&row));
+        if let Some(seal) = probes.local_seal.as_mut() {
+            seal.link_target = local.clone();
+        }
+        install(&l, "trust", 6808);
+        let row = report(&probes);
+        assert_eq!(mark(&row), Some(Mark::Warn));
+        assert!(said_by_default(&row));
+        assert!(matches!(
+            row.explain.as_ref().unwrap().remedy,
+            Remedy::Command(_)
+        ));
     }
-    if let Some(seal) = probes.local_seal.as_mut() {
-        seal.link_target = home.join("gone");
-    }
-    let (out, shown) = report(&probes);
-    assert!(
-        out.contains("warn — rustup `trust` names ") && out.contains("which no longer exists"),
-        "{out}"
-    );
-    assert!(shown.contains("rustup `trust`"), "counted: {shown}");
-    if let Some(seal) = probes.local_seal.as_mut() {
-        seal.link_target = local.clone();
-    }
-    install(&l, "trust", 6808);
-    let (out, shown) = report(&probes);
-    assert!(out.contains(warned), "{out}");
-    assert!(out.contains("to use the managed one: "), "{out}");
-    assert!(shown.contains("rustup `trust`"), "counted: {shown}");
 }
 
 #[cfg(unix)]

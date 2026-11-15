@@ -1882,7 +1882,14 @@ const fn fold_into(f: f32, lo: f32, hi: f32) -> f32 {
 }
 
 #[inline]
-const fn tine(f: f32, touch: Touch, tau: f32, roof: f32, mallet_only: bool, flow: f32) -> Voice {
+pub(super) const fn tine(
+    f: f32,
+    touch: Touch,
+    tau: f32,
+    roof: f32,
+    mallet_only: bool,
+    flow: f32,
+) -> Voice {
     let (p1, p2, p3, mallet) = match touch {
         Touch::Step => {
             let (p1, p2) = flow_partials(flow);
@@ -2110,7 +2117,7 @@ const fn breath(delay: f32) -> Voice {
 }
 
 #[inline]
-const fn bass_dyad(root: f32, partner: f32, decay: f32, delay: f32) -> Voice {
+pub(super) const fn bass_dyad(root: f32, partner: f32, decay: f32, delay: f32) -> Voice {
     Voice {
         delay,
         dur: TAIL_DUR_PER_TAU * decay,

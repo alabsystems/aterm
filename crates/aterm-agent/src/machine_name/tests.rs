@@ -123,7 +123,17 @@ fn a_bound_registry_name_precedes_legacy_books_and_roster_without_making_a_local
     );
     assert_eq!(name.migration, None);
     assert_eq!(name.by, None);
-    assert_eq!(name.undo, None);
+    assert_eq!(
+        whats(&name),
+        [(
+            Why::First,
+            None,
+            Some(num(86)),
+            None,
+            "MissBunny".to_owned()
+        )],
+        "the first name, by no one"
+    );
     assert!(name.was.is_empty());
     assert_eq!(file::read(root.path()).expect("reads"), Some(name));
 }
@@ -306,7 +316,18 @@ fn registry_names_remain_the_edit_base_despite_newer_old_own_book_records() {
         "a nickname edit does not strengthen its number"
     );
     assert_eq!(nicked.rev, 1);
-    assert!(nicked.undo.is_none());
+    assert_eq!(
+        whats(&nicked)[0],
+        (
+            Why::Nickname,
+            Some(num(86)),
+            Some(num(86)),
+            Some("MissBunny".to_owned()),
+            "Bunny".to_owned()
+        ),
+        "the nickname change, newest"
+    );
+    assert_eq!(nicked.history.len(), 2, "after the first name");
 
     let to = NameTo {
         num: num(87),
@@ -323,13 +344,9 @@ fn registry_names_remain_the_edit_base_despite_newer_old_own_book_records() {
     )
     .expect("previews a local rename");
     assert_eq!(
-        preview
-            .name
-            .undo
-            .as_ref()
-            .expect("the previous local claim")
-            .num,
-        Some(num(86))
+        (preview.name.history[0].from, preview.name.history[0].to),
+        (Some(num(86)), Some(num(87))),
+        "the preview's History holds the rename it would make"
     );
     assert_eq!(file::read(root.path()).expect("reads"), Some(nicked));
     let renamed = set_name(
@@ -345,11 +362,23 @@ fn registry_names_remain_the_edit_base_despite_newer_old_own_book_records() {
     .name;
     assert_eq!(renamed.title(), "m87 Bunny");
     assert_eq!(renamed.rev, 2);
-    let undo = renamed.undo.expect("the actual previous local claim");
+    let change = &renamed.history[0];
     assert_eq!(
-        (undo.num, undo.class, undo.since),
-        (Some(num(86)), Class::Seeded, IMPLIED_SINCE)
+        (
+            change.why,
+            change.from,
+            change.to,
+            change.by.map(|by| by.kind)
+        ),
+        (
+            Why::Named,
+            Some(num(86)),
+            Some(num(87)),
+            Some(ByKind::Person)
+        ),
+        "the actual previous local number, in History"
     );
+    assert_eq!(renamed.history.len(), 3, "first name, nickname, rename");
     assert_eq!(
         renamed.was.iter().map(|was| was.num).collect::<Vec<_>>(),
         [num(86)]
@@ -360,6 +389,28 @@ fn registry_names_remain_the_edit_base_despite_newer_old_own_book_records() {
 
 fn num(n: u32) -> Number {
     Number::new(n).expect("a number")
+}
+
+/// What one History entry says: why, from, to, and the nickname before and after.
+pub(crate) type What = (Why, Option<Number>, Option<Number>, Option<String>, String);
+
+/// What each History entry of `name` says, newest first ([`What`]).
+pub(crate) fn whats(name: &MachineName) -> Vec<What> {
+    name.history
+        .iter()
+        .map(|change| {
+            (
+                change.why,
+                change.from,
+                change.to,
+                change
+                    .nick_from
+                    .as_ref()
+                    .map(|nick| nick.as_str().to_owned()),
+                change.nick_to.as_str().to_owned(),
+            )
+        })
+        .collect()
 }
 
 fn never(_: &str) -> bool {
@@ -476,11 +527,18 @@ fn a_chosen_number_and_nickname_are_one_change_with_the_prior_claim_kept() {
     assert_eq!(set.name.prev, before.num);
     assert_eq!(set.name.was[0].num, num(7));
     assert_eq!(set.name.migration, None);
-    let undo = set.name.undo.as_ref().expect("the old claim");
     assert_eq!(
-        (undo.num, undo.class, undo.since),
-        (before.num, before.class, before.since)
+        whats(&set.name)[0],
+        (
+            Why::Named,
+            before.num,
+            Some(num(86)),
+            Some(before.display_nick()),
+            "MissBunny".to_owned()
+        ),
+        "one change replaced the old number and nickname"
     );
+    assert_eq!(set.name.history[0].at_ms, NOW);
     assert_eq!(
         file::read(root.path()).expect("reads"),
         Some(set.name.clone())
@@ -499,7 +557,7 @@ fn a_chosen_number_and_nickname_are_one_change_with_the_prior_claim_kept() {
     assert!(!again.changed);
     assert_eq!(
         again.name, set.name,
-        "no new revision, actor or undo for a no-op"
+        "no new revision, actor or History entry for a no-op"
     );
 }
 
@@ -831,7 +889,7 @@ fn an_exhausted_random_name_pool_cannot_save_a_duplicate() {
         false,
     )
     .unwrap_err();
-    assert!(why.to_string().contains("already used"), "{why}");
+    assert_eq!(why.kind(), io::ErrorKind::AlreadyExists, "{why}");
     assert_eq!(file::read(root.path()).unwrap(), Some(before));
 }
 
@@ -1006,9 +1064,21 @@ fn choosing_the_held_seeded_number_never_weakens_its_claim_against_a_rival() {
         (same.name.class, same.name.since, same.name.act)
     );
     assert_eq!(
-        (nick.name.undo, nick.name.prev, nick.name.was),
-        (same.name.undo, same.name.prev, same.name.was)
+        (&nick.name.prev, &nick.name.was),
+        (&same.name.prev, &same.name.was)
     );
+    assert_eq!(
+        whats(&nick.name)[0],
+        (
+            Why::Named,
+            Some(num(7)),
+            Some(num(7)),
+            Some(same.name.display_nick()),
+            "MissBunny".to_owned()
+        ),
+        "a nickname chosen with the held number"
+    );
+    assert_eq!(nick.name.history[1..], same.name.history[..]);
 }
 
 #[test]
@@ -1216,7 +1286,7 @@ fn a_nickname_change_is_chosen_raises_rev_and_keeps_the_claim() {
     );
 }
 
-/// IN A FLEET IS THE VAULT'S STANDING (§11.85): a member is in; let in, asking or seatless is
+/// IN A FLEET IS THE VAULT'S STANDING (§5.2): a member is in; let in, asking or seatless is
 /// joining; never in, taken out or let go is out; an unreadable state says why; and a fleet key
 /// that reads stands for membership, until the one-mesh design's D2, wherever the vault did not
 /// take this Mac out or let it go (`members_cli`'s
@@ -1323,9 +1393,9 @@ fn a_fleet_key_reports_its_custody_without_discarding_the_key() {
     assert!(super::standing_vault().is_none(), "a test reads no vault");
 }
 
-/// The vault's labels on today's lab (§11.86): a number its roster or log gives another Mac is
-/// refused with what holds it, changing nothing; the same number with no labels read renames,
-/// which shows the labels are what refuse.
+/// The vault's labels on today's lab (§5.3): a number its roster or log gives another Mac is
+/// refused with what holds it (`Cause::Vault`, each hold its own), changing nothing; the same
+/// number with no labels read renames, which shows the labels are what refuse.
 #[test]
 fn a_number_the_vault_gives_another_mac_is_refused_with_its_holder() {
     let root = state();
@@ -1334,7 +1404,14 @@ fn a_number_the_vault_gives_another_mac_is_refused_with_its_holder() {
         num: num(20),
         nick: Some(Nickname::parse("Heron").expect("a nickname")),
     };
-    for hold in [LabelHold::Label, LabelHold::Seat, LabelHold::Denied] {
+    for hold in [
+        LabelHold::Label,
+        LabelHold::Alias,
+        LabelHold::Claim,
+        LabelHold::VaultName,
+        LabelHold::Seat,
+        LabelHold::Denied,
+    ] {
         let lab = LabLabels {
             held: BTreeMap::from([(num(20), hold)]),
             ..LabLabels::default()
@@ -1349,7 +1426,11 @@ fn a_number_the_vault_gives_another_mac_is_refused_with_its_holder() {
             false,
         )
         .expect_err("another Mac's number");
-        assert_eq!(why.to_string(), format!("m20 is {}", hold.phrase()));
+        assert_eq!(
+            Refused::of(&why).map(|refused| &refused.cause),
+            Some(&Cause::Vault(hold)),
+            "{why}"
+        );
         assert_eq!(
             file::read(root.path()).expect("reads"),
             Some(before.clone()),
@@ -1396,7 +1477,11 @@ fn a_move_off_the_policys_server_name_is_refused() {
         false,
     )
     .expect_err("the server's name");
-    assert!(why.to_string().contains("dial as m8.local"), "{why}");
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Server(num(8))),
+        "{why}"
+    );
     assert_eq!(file::read(root.path()).expect("reads"), Some(before));
     // Negative control: a server the policy names by another number lets the move through.
     set_name(
@@ -1430,7 +1515,11 @@ fn a_move_off_the_policys_server_name_is_refused() {
         false,
     )
     .expect_err("the chosen number is the server's name");
-    assert!(why.to_string().contains("dial as m88.local"), "{why}");
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Server(num(88))),
+        "{why}"
+    );
     set_name(
         root.path(),
         &to(88),
@@ -1528,7 +1617,11 @@ fn keeping_the_stored_number_reads_no_labels_but_a_number_change_requires_them()
         false,
     )
     .expect_err("a number change needs its labels");
-    assert!(why.to_string().contains("the vault is busy"), "{why}");
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Unread),
+        "{why}"
+    );
 }
 
 /// No vault read holds nothing; a home with no vault set up holds nothing either.
@@ -1575,7 +1668,11 @@ fn a_preview_judges_each_number_in_the_words_the_set_refuses_it() {
     };
     let preview = rename_preview(root.path(), || Ok(lab.clone()), unread, NOW).expect("a read");
     assert_eq!(preview.name(), &before);
-    for n in [86, 20] {
+    let theirs = node_of(other.node()).expect("their node");
+    for (n, cause) in [
+        (86, Cause::Verdict(Verdict::HeldByPerson { by: theirs })),
+        (20, Cause::Vault(LabelHold::Label)),
+    ] {
         let to = NameTo {
             num: num(n),
             nick: None,
@@ -1590,7 +1687,9 @@ fn a_preview_judges_each_number_in_the_words_the_set_refuses_it() {
             true,
         )
         .expect_err("held");
-        assert_eq!(preview.judge(num(n)), Err(refused.to_string()), "m{n}");
+        let refused = Refused::of(&refused).expect("a refusal");
+        assert_eq!(refused.cause, cause, "m{n}");
+        assert_eq!(preview.judge(num(n)).as_ref(), Err(refused), "m{n}");
     }
     assert_eq!(preview.judge(num(7)), Ok(Verdict::Same));
     assert_eq!(preview.judge(num(87)), Ok(Verdict::Free));
@@ -1604,8 +1703,8 @@ fn a_preview_judges_each_number_in_the_words_the_set_refuses_it() {
     )
     .expect("a read");
     assert_eq!(
-        unlabelled.judge(num(87)),
-        Err("the vault's labels are unread: busy".to_owned())
+        unlabelled.judge(num(87)).map_err(|refused| refused.cause),
+        Err(Cause::Unread)
     );
     assert_eq!(
         unlabelled.unchecked(num(87)),
@@ -1660,7 +1759,7 @@ fn a_preview_judges_each_number_in_the_words_the_set_refuses_it() {
         true,
     )
     .expect_err("a move off the server's name");
-    assert_eq!(served.judge(num(87)), Err(refused.to_string()));
+    assert_eq!(served.judge(num(87)).as_ref().err(), Refused::of(&refused));
     // A number a migration waits on holds no claim: the read says so and judges it as a move, and
     // the set then makes the claim.
     assert!(!preview.waits());
@@ -1674,7 +1773,10 @@ fn a_preview_judges_each_number_in_the_words_the_set_refuses_it() {
     assert!(waiting.judge(num(7)).is_ok());
     let unlabelled =
         rename_preview(root.path(), || Err(io::Error::other("busy")), unread, NOW).expect("a read");
-    assert_eq!(unlabelled.judge(num(7)), Err("busy".to_owned()));
+    assert_eq!(
+        unlabelled.judge(num(7)).map_err(|refused| refused.cause),
+        Err(Cause::Unread)
+    );
     let claimed = set_name(
         root.path(),
         &NameTo {
@@ -1728,7 +1830,7 @@ fn a_move_judged_without_the_vault_s_labels_is_refused() {
         labels: &BTreeMap::new(),
     };
     let refused = judge(num(87), &held, None, &fleet, node).expect_err("unread labels");
-    assert!(refused.contains("rename again"), "{refused}");
+    assert_eq!(refused.cause, Cause::Moved, "{refused}");
     assert_eq!(
         judge(num(87), &held, Some(&LabLabels::default()), &fleet, node),
         Ok(Verdict::Free)
@@ -1737,5 +1839,1126 @@ fn a_move_judged_without_the_vault_s_labels_is_refused() {
     let mut waiting = held;
     waiting.migration = Some(Migration::Waiting);
     let refused = judge(num(7), &waiting, None, &fleet, node).expect_err("a waiting number moves");
-    assert!(refused.contains("rename again"), "{refused}");
+    assert_eq!(refused.cause, Cause::Moved, "{refused}");
+}
+
+/// History keeps the newest sixteen changes, newest first: a first name and sixteen nickname
+/// changes leave the first name out, while (the control) a first name and fourteen keep all
+/// fifteen, the first name last.
+#[test]
+fn history_keeps_the_newest_sixteen_newest_first() {
+    for changes in [16_u64, 14] {
+        let root = state();
+        let (first, _) = ensure(root.path(), no_roster, never, NOW).expect("a first name");
+        for i in 1..=changes {
+            let word = Nickname::parse(&format!("Bird{i}")).expect("a nickname");
+            set_nick(
+                root.path(),
+                &NickTo::Word(word),
+                ByKind::Person,
+                unread,
+                NOW + i,
+                false,
+            )
+            .expect("renames");
+        }
+        let name = file::read(root.path()).expect("reads").expect("a name");
+        let kept = usize::try_from(changes).expect("small") + 1;
+        assert_eq!(
+            name.history.len(),
+            kept.min(file::HISTORY_MAX),
+            "{changes} changes"
+        );
+        assert_eq!(name.history[0].nick_to.as_str(), format!("Bird{changes}"));
+        assert!(
+            name.history
+                .windows(2)
+                .all(|pair| pair[0].at_ms > pair[1].at_ms),
+            "newest first: {:?}",
+            name.history
+        );
+        let last = name.history.last().expect("an entry");
+        if kept > file::HISTORY_MAX {
+            assert_eq!(
+                (last.why, last.nick_to.as_str()),
+                (Why::Nickname, "Bird1"),
+                "the first name is the one left out"
+            );
+        } else {
+            assert_eq!(
+                (last.why, &last.nick_to, last.at_ms),
+                (Why::First, &first.shown_nick(), NOW),
+                "every change kept"
+            );
+        }
+    }
+}
+
+/// A chosen m86 MissBunny over the seeded m7 a roster gave, as History's newest change.
+fn renamed_from_m7(root: &aterm_tempfile::TempDir) -> (MachineName, MachineName) {
+    let (before, _) = ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    let to = NameTo {
+        num: num(86),
+        nick: Some(Nickname::parse("MissBunny").expect("a nickname")),
+    };
+    let set = set_name(
+        root.path(),
+        &to,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 1,
+        false,
+    )
+    .expect("renames")
+    .name;
+    (before, set)
+}
+
+/// Labels a test must never read: an undo that keeps the number reads none.
+fn unreadable() -> io::Result<LabLabels> {
+    Err(io::Error::other("the vault is busy"))
+}
+
+/// Undo takes the last change back: the number and nickname it replaced return, as a new chosen
+/// claim and never the seeded rank it replaced, the change is marked undone and the undo
+/// recorded as History's newest; the preview answers the same, and a dry run writes nothing. A
+/// nickname change's undo returns the nickname alone, reads no labels and leaves the claim as it
+/// is. Its negative controls: a mutant that passed no nickname to the rename back failed the
+/// first assert, the undo the preview names, and History recording the stored nickname rather
+/// than the shown one failed the title assert (the drawn noun came back lowercase, `puffin`
+/// where the title had shown `Puffin`).
+#[test]
+fn undo_returns_to_the_number_and_nickname_the_last_change_replaced() {
+    let root = state();
+    let (before, set) = renamed_from_m7(&root);
+    let back = UndoTo::Name(NameTo {
+        num: num(7),
+        nick: Some(before.shown_nick()),
+    });
+    let preview = rename_preview(root.path(), no_labels, unread, NOW + 2).expect("a read");
+    assert_eq!(preview.undo(), Ok(back.clone()));
+    assert_eq!(undo_to(&set), Ok(back));
+    let dry = undo_last(
+        root.path(),
+        None,
+        no_labels,
+        ByKind::Agent,
+        unread,
+        NOW + 2,
+        true,
+    )
+    .expect("a dry run");
+    assert!(dry.changed);
+    assert_eq!(
+        file::read(root.path()).expect("reads"),
+        Some(set.clone()),
+        "a dry run writes nothing"
+    );
+    let undone = undo_last(
+        root.path(),
+        None,
+        no_labels,
+        ByKind::Agent,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect("undoes")
+    .name;
+    assert_eq!(undone, dry.name, "the dry run said what the undo does");
+    assert_eq!(undone.title(), before.title());
+    assert_eq!(
+        (undone.class, undone.nick_class, undone.migration),
+        (Class::Chosen, NickClass::Chosen, None),
+        "a new explicit claim and a chosen nickname"
+    );
+    assert_ne!(undone.since, before.since, "never the seeded rank");
+    assert_eq!(
+        undone.was.iter().map(|was| was.num).collect::<Vec<_>>(),
+        [num(86)]
+    );
+    assert_eq!(undone.rev, set.rev + 1);
+    assert_eq!(
+        whats(&undone),
+        [
+            (
+                Why::Undone,
+                Some(num(86)),
+                Some(num(7)),
+                Some("MissBunny".to_owned()),
+                before.display_nick()
+            ),
+            (
+                Why::Named,
+                Some(num(7)),
+                Some(num(86)),
+                Some(before.display_nick()),
+                "MissBunny".to_owned()
+            ),
+            (Why::First, None, Some(num(7)), None, before.display_nick()),
+        ]
+    );
+    assert_eq!(
+        undone
+            .history
+            .iter()
+            .map(|change| change.undone)
+            .collect::<Vec<_>>(),
+        [false, true, false],
+        "only the change taken back is marked"
+    );
+    assert_eq!(undone.history[0].by.map(|by| by.kind), Some(ByKind::Agent));
+    assert_eq!(
+        file::read(root.path()).expect("reads"),
+        Some(undone.clone())
+    );
+
+    let heron = Nickname::parse("Heron").expect("a nickname");
+    let nicked = set_nick(
+        root.path(),
+        &NickTo::Word(heron),
+        ByKind::Person,
+        unread,
+        NOW + 3,
+        false,
+    )
+    .expect("a nickname change")
+    .name;
+    let preview = rename_preview(root.path(), unreadable, unread, NOW + 4).expect("a read");
+    assert_eq!(preview.undo(), Ok(UndoTo::Nickname(before.shown_nick())));
+    let back = undo_last(
+        root.path(),
+        None,
+        unreadable,
+        ByKind::Person,
+        unread,
+        NOW + 4,
+        false,
+    )
+    .expect("a nickname undo reads no labels")
+    .name;
+    assert_eq!(
+        (back.display_nick(), back.nick_class),
+        (before.display_nick(), NickClass::Chosen),
+        "the nickname as it was shown, chosen by the undo"
+    );
+    assert_eq!(
+        (back.num, back.class, back.since, back.act, &back.was),
+        (
+            nicked.num,
+            nicked.class,
+            nicked.since,
+            nicked.act,
+            &nicked.was
+        ),
+        "the claim as it was"
+    );
+    assert_eq!(
+        (back.history[0].why, back.history[1].undone),
+        (Why::Undone, true)
+    );
+}
+
+/// Undo is refused once another Mac holds the old number by a person's choice, with that
+/// holder's verdict, and nothing changes. Controls: an automatic holder gives `TakesAuto`, which
+/// an undo refuses too, since it never displaces a holder; an older build's implied claim gives
+/// `HeldByOlderBuild`, today's production case, since no shipped code signs a record; and with
+/// no holder the same undo goes through.
+#[test]
+fn undo_is_refused_when_another_mac_now_holds_the_old_number_by_choice() {
+    let root = state();
+    node_identity(root.path()).expect("our identity");
+    let (_, set) = renamed_from_m7(&root);
+    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
+    let theirs = node_of(other.node()).expect("their node");
+    let mut auto = record(&other, Some(7), 3, Some("Otter"));
+    auto.claim.class = Class::Auto;
+    let implied = Peer::own(&other, ("m7.local", 7485, "0.160.0"), NOW)
+        .with_primary_name(&other, Some("m7"))
+        .line()
+        + "\n";
+    for (book, verdict) in [
+        (
+            entry(&other, &record(&other, Some(7), 3, Some("Otter"))),
+            Verdict::HeldByPerson { by: theirs },
+        ),
+        (entry(&other, &auto), Verdict::TakesAuto { from: theirs }),
+        (implied, Verdict::HeldByOlderBuild { by: theirs }),
+    ] {
+        write_private(root.path(), PEERS_FILE, book.as_bytes()).expect("their claim on m7");
+        let why = undo_last(
+            root.path(),
+            None,
+            no_labels,
+            ByKind::Person,
+            unread,
+            NOW + 2,
+            false,
+        )
+        .expect_err("m7 is held");
+        assert_eq!(
+            Refused::of(&why).and_then(Refused::verdict),
+            Some(&verdict),
+            "{why}"
+        );
+        let preview = rename_preview(root.path(), no_labels, unread, NOW + 2).expect("a read");
+        assert_eq!(preview.undo().as_ref().err(), Refused::of(&why));
+        assert_eq!(file::read(root.path()).expect("reads"), Some(set.clone()));
+    }
+    write_private(root.path(), PEERS_FILE, b"").expect("no holder");
+    let back = undo_last(
+        root.path(),
+        None,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect("the control: m7 is free");
+    assert_eq!(back.name.num, Some(num(7)));
+}
+
+/// Undo is refused once the vault gives the old number to another Mac, by any hold, with that
+/// hold, the preview answering the same, and nothing changes; with no labels (the control) the
+/// same undo goes through.
+#[test]
+fn undo_is_refused_once_the_vault_gives_the_old_number_to_another_mac() {
+    let root = state();
+    let (_, set) = renamed_from_m7(&root);
+    for hold in [
+        LabelHold::Label,
+        LabelHold::Alias,
+        LabelHold::Claim,
+        LabelHold::VaultName,
+        LabelHold::Seat,
+        LabelHold::Denied,
+    ] {
+        let lab = LabLabels {
+            held: BTreeMap::from([(num(7), hold)]),
+            ..LabLabels::default()
+        };
+        let why = undo_last(
+            root.path(),
+            None,
+            || Ok(lab.clone()),
+            ByKind::Person,
+            unread,
+            NOW + 2,
+            false,
+        )
+        .expect_err("another Mac's number");
+        assert_eq!(
+            Refused::of(&why).map(|refused| &refused.cause),
+            Some(&Cause::Vault(hold)),
+            "{why}"
+        );
+        let preview =
+            rename_preview(root.path(), || Ok(lab.clone()), unread, NOW + 2).expect("a read");
+        assert_eq!(preview.undo().as_ref().err(), Refused::of(&why));
+        assert_eq!(file::read(root.path()).expect("reads"), Some(set.clone()));
+    }
+    let back = undo_last(
+        root.path(),
+        None,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect("the control: no labels");
+    assert_eq!(back.name.num, Some(num(7)));
+}
+
+/// Undo is refused while another Mac's record carries the nickname it would bring back, whether
+/// it takes the number back with it or the nickname alone, with the preview answering the same,
+/// and nothing changes. Control: once that record carries another word, each undo goes through.
+#[test]
+fn undo_is_refused_when_another_mac_now_carries_the_old_nickname() {
+    let root = state();
+    node_identity(root.path()).expect("our identity");
+    let (before, set) = renamed_from_m7(&root);
+    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
+    // Each record is newer than the last, so the book takes it over the one before.
+    let carries = |word: &str, rev: u64| {
+        write_private(
+            root.path(),
+            PEERS_FILE,
+            entry(&other, &record(&other, Some(11), rev, Some(word))).as_bytes(),
+        )
+        .expect("their record");
+    };
+    let refused = |labels: fn() -> io::Result<LabLabels>, now: u64| {
+        let why = undo_last(
+            root.path(),
+            None,
+            labels,
+            ByKind::Person,
+            unread,
+            now,
+            false,
+        )
+        .expect_err("their nickname");
+        assert_eq!(
+            Refused::of(&why).map(|refused| &refused.cause),
+            Some(&Cause::Nickname),
+            "{why}"
+        );
+        let preview = rename_preview(root.path(), labels, unread, now).expect("a read");
+        assert_eq!(preview.undo().as_ref().err(), Refused::of(&why));
+    };
+    let old = before.shown_nick();
+    carries(old.as_str(), 3);
+    refused(no_labels, NOW + 2);
+    assert_eq!(file::read(root.path()).expect("reads"), Some(set));
+    carries("Kestrel", 4);
+    let back = undo_last(
+        root.path(),
+        None,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect("the control: the number and nickname come back")
+    .name;
+    assert_eq!(back.title(), before.title());
+
+    let nicked = set_nick(
+        root.path(),
+        &NickTo::Word(Nickname::parse("Heron").expect("a nickname")),
+        ByKind::Person,
+        unread,
+        NOW + 3,
+        false,
+    )
+    .expect("a nickname change")
+    .name;
+    carries(old.as_str(), 5);
+    refused(unreadable, NOW + 4);
+    assert_eq!(file::read(root.path()).expect("reads"), Some(nicked));
+    carries("Kestrel", 6);
+    let back = undo_last(
+        root.path(),
+        None,
+        unreadable,
+        ByKind::Person,
+        unread,
+        NOW + 4,
+        false,
+    )
+    .expect("the control: the nickname alone comes back")
+    .name;
+    assert_eq!(back.title(), before.title());
+}
+
+/// Undo takes back only History's newest change, and only while the name stands as that change
+/// left it: after a change History does not hold (a writer that keeps no History, as an older
+/// build is), of the number or of the nickname alone, it is refused as superseded and nothing
+/// changes, and once such a writer drops History it finds nothing to take back. Control: before
+/// that write, the same undo passes.
+#[test]
+fn undo_is_refused_after_a_newer_change_made_elsewhere() {
+    let superseded = |root: &aterm_tempfile::TempDir| {
+        let why = undo_last(
+            root.path(),
+            None,
+            no_labels,
+            ByKind::Person,
+            unread,
+            NOW + 2,
+            false,
+        )
+        .expect_err("superseded");
+        assert_eq!(
+            Refused::of(&why).map(|refused| &refused.cause),
+            Some(&Cause::Superseded),
+            "{why}"
+        );
+        assert_eq!(
+            rename_preview(root.path(), no_labels, unread, NOW + 2)
+                .expect("a read")
+                .undo()
+                .map_err(|refused| refused.cause),
+            Err(Cause::Superseded)
+        );
+    };
+    let renicked = state();
+    renamed_from_m7(&renicked);
+    let elsewhere = file::replace(renicked.path(), |name| {
+        name.nick = Nickname::parse("Kestrel").expect("a nickname");
+        name.rev += 1;
+        Ok(())
+    })
+    .expect("a nickname change History does not hold, the number kept");
+    superseded(&renicked);
+    assert_eq!(file::read(renicked.path()).expect("reads"), Some(elsewhere));
+
+    let root = state();
+    renamed_from_m7(&root);
+    undo_last(
+        root.path(),
+        None,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        true,
+    )
+    .expect("the control: the change is current");
+    let elsewhere = file::replace(root.path(), |name| {
+        name.num = Some(num(90));
+        name.rev += 1;
+        Ok(())
+    })
+    .expect("a change History does not hold");
+    superseded(&root);
+    assert_eq!(file::read(root.path()).expect("reads"), Some(elsewhere));
+    file::replace(root.path(), |name| {
+        name.history.clear();
+        Ok(())
+    })
+    .expect("an older build's write keeps no History");
+    let why = undo_last(
+        root.path(),
+        None,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect_err("nothing kept");
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Nothing),
+        "{why}"
+    );
+}
+
+/// Undo is single-level: the undo it records is never undone, and a change marked undone is not
+/// taken back again; the first name is nothing to take back. Control: the first undo passes.
+#[test]
+fn undo_does_not_undo_an_undo() {
+    let cause = |state: &aterm_tempfile::TempDir| {
+        let why = undo_last(
+            state.path(),
+            None,
+            no_labels,
+            ByKind::Person,
+            unread,
+            NOW + 3,
+            false,
+        )
+        .expect_err("refused");
+        Refused::of(&why).map(|refused| refused.cause.clone())
+    };
+    let root = state();
+    renamed_from_m7(&root);
+    let undone = undo_last(
+        root.path(),
+        None,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect("the control: the first undo")
+    .name;
+    assert_eq!(cause(&root), Some(Cause::Undone), "an undo");
+    assert_eq!(file::read(root.path()).expect("reads"), Some(undone));
+    file::replace(root.path(), |name| {
+        name.history.remove(0);
+        Ok(())
+    })
+    .expect("a change marked undone as the newest");
+    assert_eq!(cause(&root), Some(Cause::Undone), "undone already");
+
+    let fresh = state();
+    ensure(fresh.path(), label("m7"), never, NOW).expect("a first name");
+    assert_eq!(cause(&fresh), Some(Cause::Nothing), "the first name");
+}
+
+/// No undo leaves a Mac unnumbered: the change that gave it its first number is refused, while
+/// (the control) a nickname change while unnumbered is taken back.
+#[test]
+fn undo_leaves_no_mac_unnumbered() {
+    let root = state();
+    let (first, _) = ensure(root.path(), no_roster, never, NOW).expect("unnumbered");
+    let heron = Nickname::parse("Heron").expect("a nickname");
+    set_nick(
+        root.path(),
+        &NickTo::Word(heron),
+        ByKind::Person,
+        unread,
+        NOW + 1,
+        false,
+    )
+    .expect("a nickname");
+    let back = undo_last(
+        root.path(),
+        None,
+        unreadable,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect("the control: an unnumbered nickname change")
+    .name;
+    assert_eq!(
+        (back.num, back.display_nick()),
+        (None, first.display_nick())
+    );
+    set_name(
+        root.path(),
+        &NameTo {
+            num: num(86),
+            nick: None,
+        },
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 3,
+        false,
+    )
+    .expect("a first number");
+    let why = undo_last(
+        root.path(),
+        None,
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 4,
+        false,
+    )
+    .expect_err("no undo leaves it unnumbered");
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Unnumbered),
+        "{why}"
+    );
+}
+
+/// The numbers offered beside a taken one are those a rename takes as `Free`: past each number a
+/// signed node holds, each the vault keeps for another Mac, this Mac's own and another Mac's
+/// earlier number; none where the vault's labels are unread. Control: with no other node and no
+/// labels, the next numbers in order.
+#[test]
+fn free_after_skips_every_held_number() {
+    use aterm_types::machine_name::Was;
+    let root = state();
+    node_identity(root.path()).expect("our identity");
+    ensure(root.path(), label("m7"), never, NOW).expect("a seeded name");
+    let fresh = rename_preview(root.path(), no_labels, unread, NOW).expect("a read");
+    assert_eq!(
+        fresh.free_after(num(86), 3),
+        [num(87), num(88), num(89)],
+        "the control: the next in order"
+    );
+    set_name(
+        root.path(),
+        &NameTo {
+            num: num(88),
+            nick: None,
+        },
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW,
+        false,
+    )
+    .expect("this Mac takes m88");
+    let holder = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("an identity");
+    let earlier = NodeIdentity::from_seed(&"c3".repeat(16), &[0x33; 32]).expect("an identity");
+    let mut moved = record(&earlier, Some(95), 4, Some("Puffin"));
+    moved.claim.was = vec![Was {
+        num: num(89),
+        retired: false,
+        lost: false,
+    }];
+    write_private(
+        root.path(),
+        PEERS_FILE,
+        (entry(&holder, &record(&holder, Some(87), 3, Some("Otter"))) + &entry(&earlier, &moved))
+            .as_bytes(),
+    )
+    .expect("two other Macs");
+    let lab = LabLabels {
+        held: BTreeMap::from([(num(90), LabelHold::Label)]),
+        ..LabLabels::default()
+    };
+    let preview = rename_preview(root.path(), || Ok(lab.clone()), unread, NOW).expect("a read");
+    assert_eq!(preview.free_after(num(86), 3), [num(91), num(92), num(93)]);
+    assert_eq!(preview.free_after(num(86), 0), []);
+    assert_eq!(
+        preview.free_after(num(Number::MAX - 1), 3),
+        [num(Number::MAX)],
+        "none past the last number"
+    );
+    let unlabelled = rename_preview(root.path(), unreadable, unread, NOW).expect("a read");
+    assert_eq!(unlabelled.free_after(num(86), 3), []);
+}
+
+/// Retiring an earlier number stops it raising `top` past a person's cap, as an active one does
+/// whatever the cap; restoring it (the control) raises `top` again. Neither touches the NAME, the
+/// nickname or History, and a number this Mac never went by is not found.
+#[test]
+fn a_retired_earlier_number_no_longer_raises_top() {
+    use aterm_types::machine_name::{Cap, top};
+    let root = state();
+    ensure(root.path(), label("m90"), never, NOW).expect("a seeded name");
+    set_name(
+        root.path(),
+        &NameTo {
+            num: num(7),
+            nick: None,
+        },
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW,
+        false,
+    )
+    .expect("m90 becomes an earlier number");
+    let active = file::replace(root.path(), |name| {
+        name.cap = Some(Cap {
+            value: 10,
+            since: NOW,
+        });
+        Ok(())
+    })
+    .expect("a person's cap");
+    let top_of = |name: &MachineName| {
+        let node = NodeId::new(&[1; 16]).expect("a node id");
+        top(
+            &BTreeMap::from([(node, Entry::Record(current_record(name)))]),
+            &[],
+            [],
+            0,
+        )
+    };
+    assert_eq!(top_of(&active), 90, "the control: an active earlier number");
+    let retired = retire_was(root.path(), num(90), true, ByKind::Person).expect("retires");
+    assert!(retired.changed);
+    assert!(retired.name.was[0].retired);
+    assert_eq!(top_of(&retired.name), 10, "only up to the cap");
+    assert_eq!(
+        (retired.name.rev, retired.name.by.map(|by| by.kind)),
+        (active.rev + 1, Some(ByKind::Person))
+    );
+    assert_eq!(
+        (&retired.name.title(), &retired.name.history),
+        (&active.title(), &active.history)
+    );
+    assert_eq!(
+        file::read(root.path()).expect("reads"),
+        Some(retired.name.clone())
+    );
+    let again = retire_was(root.path(), num(90), true, ByKind::Agent).expect("retired already");
+    assert!(!again.changed);
+    assert_eq!(again.name, retired.name);
+    let restored = retire_was(root.path(), num(90), false, ByKind::Person).expect("restores");
+    assert_eq!(top_of(&restored.name), 90);
+    let missing = retire_was(root.path(), num(5), true, ByKind::Person).expect_err("never m5");
+    assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    assert_eq!(file::read(root.path()).expect("reads"), Some(restored.name));
+}
+
+/// A preview names this Mac's node only once it has one: a keyless Mac is judged as an absent
+/// node, whose stand-in is no identity to show.
+#[test]
+fn a_preview_names_this_macs_node_only_once_it_has_one() {
+    let root = state();
+    ensure(root.path(), label("m7"), never, NOW).unwrap();
+    let keyless = rename_preview(root.path(), no_labels, unread, NOW).unwrap();
+    assert_eq!(keyless.node(), None, "no node key yet");
+    let me = node_identity(root.path()).unwrap();
+    let keyed = rename_preview(root.path(), no_labels, unread, NOW).unwrap();
+    assert_eq!(
+        keyed.node(),
+        node_of(me.node()),
+        "the identity the read found"
+    );
+    assert!(keyed.node().is_some(), "this Mac's node");
+}
+
+/// A drawn noun no test nickname is: a nickname change to `Heron` then always changes it.
+fn not_heron(word: &str) -> bool {
+    word.eq_ignore_ascii_case("heron")
+}
+
+/// What an undo of the name in `root` does as a dry run over the newest change it read, and
+/// that change's undo target: the title [`UndoTo::title`] names is the title the dry run gives.
+fn undo_titled(root: &aterm_tempfile::TempDir) -> (MachineName, UndoTo, MachineName) {
+    let held = file::read(root.path()).expect("reads").expect("a name");
+    let to = undo_to(&held).expect("a change to take back");
+    let dry = undo_last(
+        root.path(),
+        held.history.first(),
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        true,
+    )
+    .expect("a dry run")
+    .name;
+    assert_eq!(to.title(&held), dry.title(), "{to:?}");
+    (held, to, dry)
+}
+
+/// The title an undo names ([`UndoTo::title`]) is the title its dry run gives, for a number and
+/// nickname taken back, a number alone under a drawn nickname, and a nickname alone. Control:
+/// the drawn nickname's stored spelling (`heron` where the title shows `Heron`) gives another
+/// title, which is the mutant `UndoTo::title` must not be.
+#[test]
+fn an_undo_names_the_title_its_dry_run_gives() {
+    let both = state();
+    renamed_from_m7(&both);
+    let (_, to, _) = undo_titled(&both);
+    assert!(
+        matches!(to, UndoTo::Name(NameTo { nick: Some(_), .. })),
+        "{to:?}"
+    );
+
+    let number = state();
+    let (seeded, _) = ensure(number.path(), label("m7"), never, NOW).expect("a seeded name");
+    assert_eq!(seeded.nick_class, NickClass::Auto, "a drawn nickname");
+    set_name(
+        number.path(),
+        &NameTo {
+            num: num(86),
+            nick: None,
+        },
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 1,
+        false,
+    )
+    .expect("renames, keeping the drawn nickname");
+    let (held, to, dry) = undo_titled(&number);
+    assert_eq!(
+        to,
+        UndoTo::Name(NameTo {
+            num: num(7),
+            nick: None
+        })
+    );
+    assert_ne!(
+        file::title_of(Some(num(7)), held.nick.as_str()),
+        dry.title(),
+        "the control: the stored spelling is not the title the undo leaves"
+    );
+
+    let nick = state();
+    ensure(nick.path(), label("m7"), not_heron, NOW).expect("a seeded name");
+    set_nick(
+        nick.path(),
+        &NickTo::Word(Nickname::parse("Heron").expect("a nickname")),
+        ByKind::Person,
+        unread,
+        NOW + 1,
+        false,
+    )
+    .expect("a nickname change");
+    let (_, to, _) = undo_titled(&nick);
+    assert!(matches!(to, UndoTo::Nickname(_)), "{to:?}");
+}
+
+/// An undo takes back only the change its caller read: once a later change replaced History's
+/// newest, an undo over the change read before it is refused as unseen and writes nothing.
+/// Controls: an undo over a fresh read's newest change takes that change back, and a change to
+/// the name that records no History (retiring an earlier number, which raises `rev`) between that
+/// read and the undo still lets it through, which a fence on `rev` would refuse.
+#[test]
+fn an_undo_takes_back_only_the_change_it_read() {
+    let root = state();
+    renamed_from_m7(&root);
+    let seen = rename_preview(root.path(), no_labels, unread, NOW + 2)
+        .expect("a read")
+        .name()
+        .history[0]
+        .clone();
+    let later = set_name(
+        root.path(),
+        &NameTo {
+            num: num(90),
+            nick: None,
+        },
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect("a later change")
+    .name;
+    let why = undo_last(
+        root.path(),
+        Some(&seen),
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 3,
+        false,
+    )
+    .expect_err("the change read is no longer the newest");
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Unseen),
+        "{why}"
+    );
+    assert_eq!(
+        file::read(root.path()).expect("reads"),
+        Some(later.clone()),
+        "nothing undone"
+    );
+
+    let fresh = later.history[0].clone();
+    let dry = undo_last(
+        root.path(),
+        Some(&fresh),
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 3,
+        true,
+    )
+    .expect("the control: the fresh read's newest change");
+    assert_eq!(dry.name.num, Some(num(86)));
+    let retired = retire_was(root.path(), num(7), true, ByKind::Person)
+        .expect("retires m7")
+        .name;
+    assert_eq!(
+        (retired.rev, &retired.history),
+        (later.rev + 1, &later.history),
+        "rev rises, History does not"
+    );
+    let back = undo_last(
+        root.path(),
+        Some(&fresh),
+        no_labels,
+        ByKind::Person,
+        unread,
+        NOW + 3,
+        false,
+    )
+    .expect("the control: History's newest is still the change read")
+    .name;
+    assert_eq!(back.num, Some(num(86)));
+    assert!(back.history[1].undone, "the change read is the one undone");
+    assert_eq!(back.history[1], {
+        let mut undone = fresh;
+        undone.undone = true;
+        undone
+    });
+}
+
+/// Over unread vault labels, Undo Last Rename's offer leaves the number to the undo, as the live
+/// line leaves Save, answering why the labels were not read where [`RenamePreview::undo`] refuses
+/// it as unread; the undo itself reads the labels again and refuses it while they stay unread.
+/// Control: the nickname is judged either way, so another node's record carrying the old
+/// nickname refuses the offer.
+#[test]
+fn undo_unchecked_leaves_an_unread_number_to_the_undo() {
+    let root = state();
+    node_identity(root.path()).expect("our identity");
+    let (before, set) = renamed_from_m7(&root);
+    let preview = rename_preview(root.path(), unreadable, unread, NOW + 2).expect("a read");
+    let (to, why) = preview.undo_unchecked().expect("left to the undo");
+    assert_eq!(
+        to,
+        UndoTo::Name(NameTo {
+            num: num(7),
+            nick: Some(before.shown_nick()),
+        })
+    );
+    assert!(why.is_some(), "why the labels were not read");
+    assert_eq!(why, preview.unchecked(num(7)));
+    assert_eq!(
+        preview.undo().map_err(|refused| refused.cause),
+        Err(Cause::Unread)
+    );
+    let refused = undo_last(
+        root.path(),
+        set.history.first(),
+        unreadable,
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect_err("the undo checks the number");
+    assert_eq!(
+        Refused::of(&refused).map(|refused| &refused.cause),
+        Some(&Cause::Unread),
+        "{refused}"
+    );
+    assert_eq!(file::read(root.path()).expect("reads"), Some(set));
+
+    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
+    write_private(
+        root.path(),
+        PEERS_FILE,
+        entry(
+            &other,
+            &record(&other, Some(11), 3, Some(before.shown_nick().as_str())),
+        )
+        .as_bytes(),
+    )
+    .expect("their record carries the old nickname");
+    let preview = rename_preview(root.path(), unreadable, unread, NOW + 2).expect("a read");
+    assert_eq!(
+        preview.undo_unchecked().map_err(|refused| refused.cause),
+        Err(Cause::Nickname),
+        "the control: the nickname is judged over unread labels too"
+    );
+}
+
+/// Another Mac's claim or hold on a number refuses that number alone, so the next free numbers
+/// are offered beside it ([`RenamePreview::next_free`], the first [`FREE_SHOWN`] of
+/// [`RenamePreview::free_after`]): the vault's label, a person's, an automatic and an older
+/// build's claim. Controls: the policy's server name, unread labels and an undo's `Nothing`
+/// refuse any number, and offer none, even where free numbers are there to offer.
+#[test]
+fn held_by_another_is_another_macs_claim_or_hold() {
+    let labelled = state();
+    ensure(labelled.path(), label("m7"), never, NOW).expect("a seeded name");
+    let lab = LabLabels {
+        held: BTreeMap::from([(num(20), LabelHold::Label)]),
+        ..LabLabels::default()
+    };
+    let preview = rename_preview(labelled.path(), || Ok(lab.clone()), unread, NOW).expect("a read");
+    let vault = preview.judge(num(20)).expect_err("the vault's label");
+    assert_eq!(vault.cause, Cause::Vault(LabelHold::Label));
+    assert!(vault.held_by_another());
+    let free = preview.next_free(num(20), &vault);
+    assert_eq!(free, preview.free_after(num(20), FREE_SHOWN));
+    assert_eq!(free.len(), FREE_SHOWN);
+
+    let root = state();
+    node_identity(root.path()).expect("our identity");
+    renamed_from_m7(&root);
+    let other = NodeIdentity::from_seed(&"b2".repeat(16), &[0x22; 32]).expect("another identity");
+    let theirs = node_of(other.node()).expect("their node");
+    let mut auto = record(&other, Some(7), 3, Some("Otter"));
+    auto.claim.class = Class::Auto;
+    let implied = Peer::own(&other, ("m7.local", 7485, "0.160.0"), NOW)
+        .with_primary_name(&other, Some("m7"))
+        .line()
+        + "\n";
+    for (book, verdict) in [
+        (
+            entry(&other, &record(&other, Some(7), 3, Some("Otter"))),
+            Verdict::HeldByPerson { by: theirs },
+        ),
+        (entry(&other, &auto), Verdict::TakesAuto { from: theirs }),
+        (implied, Verdict::HeldByOlderBuild { by: theirs }),
+    ] {
+        write_private(root.path(), PEERS_FILE, book.as_bytes()).expect("their claim on m7");
+        let preview = rename_preview(root.path(), no_labels, unread, NOW + 2).expect("a read");
+        let held = preview.judge(num(7)).expect_err("m7 is held");
+        assert_eq!(held.verdict(), Some(&verdict));
+        assert!(held.held_by_another(), "{verdict:?}");
+        let free = preview.next_free(num(7), &held);
+        assert_eq!(free, preview.free_after(num(7), FREE_SHOWN), "{verdict:?}");
+        assert_eq!(free.len(), FREE_SHOWN, "{verdict:?}");
+    }
+
+    let served = state();
+    ensure(served.path(), label("m8"), never, NOW).expect("a seeded name");
+    let serves = LabLabels {
+        own: BTreeSet::from([num(8)]),
+        label: Some(num(8)),
+        servers: BTreeSet::from([num(8)]),
+        ..LabLabels::default()
+    };
+    let preview =
+        rename_preview(served.path(), || Ok(serves.clone()), unread, NOW).expect("a read");
+    let server = preview.judge(num(87)).expect_err("the server's name");
+    assert_eq!(server.cause, Cause::Server(num(8)));
+    assert!(!server.held_by_another(), "the control: a server name");
+    assert_eq!(preview.next_free(num(87), &server), []);
+
+    let preview = rename_preview(served.path(), unreadable, unread, NOW).expect("a read");
+    let unchecked = preview.judge(num(87)).expect_err("unread labels");
+    assert_eq!(unchecked.cause, Cause::Unread);
+    assert!(!unchecked.held_by_another(), "the control: unread labels");
+    assert_eq!(preview.next_free(num(87), &unchecked), []);
+
+    let preview = rename_preview(labelled.path(), no_labels, unread, NOW).expect("a read");
+    let nothing = undo_to(preview.name()).expect_err("only the first name");
+    assert_eq!(nothing.cause, Cause::Nothing);
+    assert!(
+        !nothing.held_by_another(),
+        "the control: no number's refusal"
+    );
+    assert_eq!(
+        preview.free_after(num(20), FREE_SHOWN).len(),
+        FREE_SHOWN,
+        "free numbers are there"
+    );
+    assert_eq!(
+        preview.next_free(num(20), &nothing),
+        [],
+        "and none is offered"
+    );
+}
+
+/// An undo publishes under the number it takes back, which it claims as chosen, and a nickname
+/// undo under the chosen number it keeps ([`undo_publishes`]). Controls: the stored chosen number
+/// alone ([`chosen_number`]) is the wrong one for a number undo; a nickname undo on an automatic
+/// or seeded number, or one a migration waits on, publishes nothing; nor does a name with nothing
+/// to take back.
+#[test]
+fn an_undo_publishes_the_number_it_takes_back_or_the_chosen_one_it_keeps() {
+    let root = state();
+    let (_, set) = renamed_from_m7(&root);
+    assert_eq!(undo_publishes(&set), Some(num(7)));
+    assert_eq!(
+        chosen_number(&set),
+        Some(num(86)),
+        "the control: the stored number is not the one the undo claims"
+    );
+    let nicked = set_nick(
+        root.path(),
+        &NickTo::Word(Nickname::parse("Heron").expect("a nickname")),
+        ByKind::Person,
+        unread,
+        NOW + 2,
+        false,
+    )
+    .expect("a nickname change")
+    .name;
+    assert!(matches!(undo_to(&nicked), Ok(UndoTo::Nickname(_))));
+    assert_eq!(undo_publishes(&nicked), Some(num(86)));
+    let mut waiting = nicked;
+    waiting.migration = Some(Migration::Waiting);
+    assert_eq!(undo_publishes(&waiting), None, "a waiting migration");
+
+    let fresh = state();
+    let (first, _) = ensure(fresh.path(), label("m7"), not_heron, NOW).expect("a seeded name");
+    assert_eq!(undo_publishes(&first), None, "nothing to take back");
+    let seeded = set_nick(
+        fresh.path(),
+        &NickTo::Word(Nickname::parse("Heron").expect("a nickname")),
+        ByKind::Person,
+        unread,
+        NOW + 1,
+        false,
+    )
+    .expect("a nickname change")
+    .name;
+    assert_eq!(seeded.class, Class::Seeded);
+    assert!(matches!(undo_to(&seeded), Ok(UndoTo::Nickname(_))));
+    assert_eq!(undo_publishes(&seeded), None, "a seeded number");
+    let mut auto = seeded;
+    auto.class = Class::Auto;
+    assert_eq!(undo_publishes(&auto), None, "an automatic number");
 }

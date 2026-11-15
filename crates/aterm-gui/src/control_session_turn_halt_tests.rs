@@ -125,7 +125,7 @@ fn a_guarded_enter_stops_retrying_once_its_turn_is_preempted() {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    use super::{GuardedSubmit, guarded_submit};
+    use super::{FencedSubmit, fenced_submit};
 
     let handle = test_handle(0);
     let (term, ctx) = (handle.term.clone(), handle.ctx.clone());
@@ -139,8 +139,17 @@ fn a_guarded_enter_stops_retrying_once_its_turn_is_preempted() {
     let preempted = || looks.fetch_add(1, Ordering::SeqCst) + 1 >= 3;
     let hang = Instant::now() + Duration::from_secs(60);
     assert!(matches!(
-        guarded_submit(&term, &ctx, &*guard, None, hang, None, &preempted),
-        GuardedSubmit::Preempted
+        fenced_submit(
+            &term,
+            &ctx,
+            "enter",
+            Some(&*guard),
+            None,
+            hang,
+            None,
+            &preempted
+        ),
+        FencedSubmit::Preempted
     ));
     assert_eq!(
         looks.load(Ordering::SeqCst),
@@ -150,8 +159,17 @@ fn a_guarded_enter_stops_retrying_once_its_turn_is_preempted() {
     // CONTROL: never preempted, the queued input runs a short window out.
     let soon = Instant::now() + Duration::from_millis(20);
     assert!(matches!(
-        guarded_submit(&term, &ctx, &*guard, None, soon, None, &|| false),
-        GuardedSubmit::Busy
+        fenced_submit(
+            &term,
+            &ctx,
+            "enter",
+            Some(&*guard),
+            None,
+            soon,
+            None,
+            &|| false
+        ),
+        FencedSubmit::Busy
     ));
     ctx.sink.retire_ordered_egress();
 }
@@ -170,7 +188,7 @@ fn a_guarded_enter_judges_its_turn_s_slot_under_the_lock_it_writes_under() {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
-    use super::{GuardedSubmit, guarded_submit};
+    use super::{FencedSubmit, fenced_submit};
 
     let (master, mut program) = std::os::unix::net::UnixStream::pair().expect("a pair");
     let handle = crate::session_store::test_handle_on(0, master.as_raw_fd());
@@ -205,7 +223,18 @@ fn a_guarded_enter_judges_its_turn_s_slot_under_the_lock_it_writes_under() {
     };
     let outcome = std::thread::scope(|s| {
         let held = crate::term_lock(&term);
-        let trying = s.spawn(|| guarded_submit(&term, &ctx, &*guard, None, hang, None, &preempted));
+        let trying = s.spawn(|| {
+            fenced_submit(
+                &term,
+                &ctx,
+                "enter",
+                Some(&*guard),
+                None,
+                hang,
+                None,
+                &preempted,
+            )
+        });
         while looks.load(Ordering::SeqCst) == 0 {
             assert!(Instant::now() < hang, "the try never looked for its slot");
             aterm_uds::deadline::poll_yield();
@@ -214,12 +243,21 @@ fn a_guarded_enter_judges_its_turn_s_slot_under_the_lock_it_writes_under() {
         drop(held);
         trying.join().expect("the try ran")
     });
-    assert!(matches!(outcome, GuardedSubmit::Preempted));
+    assert!(matches!(outcome, FencedSubmit::Preempted));
     assert!(written(&mut program).is_empty(), "no Enter was written");
     // CONTROL: a slot that stands, the Enter is written.
     assert!(matches!(
-        guarded_submit(&term, &ctx, &*guard, None, hang, None, &|| false),
-        GuardedSubmit::Pressed
+        fenced_submit(
+            &term,
+            &ctx,
+            "enter",
+            Some(&*guard),
+            None,
+            hang,
+            None,
+            &|| false
+        ),
+        FencedSubmit::Pressed
     ));
     assert_eq!(written(&mut program), b"\r");
 }

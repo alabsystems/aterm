@@ -434,7 +434,7 @@ fn a_keyless_wire_row_stays_the_wires_after_the_carry() {
     let mut c = fresh(now);
     c.seed_carried(&carry, stamp(2), now);
     let _ = c.drain_shelved_for_persist();
-    assert!(c.dismiss(id, now + secs(1)));
+    assert!(c.dismiss(id, stamp(1_002), now + secs(1)));
     let shelves: Vec<Shelf> = c
         .drain_shelved_for_persist()
         .into_iter()
@@ -684,7 +684,7 @@ fn a_restated_mark_still_rides_the_retired_line() {
         },
         now + secs(1),
     ));
-    assert!(c.dismiss(id, now + secs(2)));
+    assert!(c.dismiss(id, stamp(2_001), now + secs(2)));
     let lines: Vec<LogLine> = c
         .drain_shelved_for_persist()
         .into_iter()
@@ -736,7 +736,7 @@ fn a_seeded_rows_restated_mark_rides_its_retired_line() {
     let mut c = MessageCenter::new(boot, now);
     c.seed_carried(&carry, stamp(2), now);
     let _ = c.drain_shelved_for_persist();
-    assert!(c.dismiss(id, now + secs(2)));
+    assert!(c.dismiss(id, stamp(2_002), now + secs(2)));
     let lines: Vec<LogLine> = c
         .drain_shelved_for_persist()
         .into_iter()
@@ -895,7 +895,7 @@ fn a_late_parked_rows_restated_mark_rides_its_retired_line() {
     let mut disk = MessageLog::empty();
     disk.replay_all(file.clone());
     c.merge_reloaded_log(&disk);
-    assert!(c.dismiss(id, now + secs(2)));
+    assert!(c.dismiss(id, stamp(2_002), now + secs(2)));
     let lines: Vec<LogLine> = c
         .drain_shelved_for_persist()
         .into_iter()

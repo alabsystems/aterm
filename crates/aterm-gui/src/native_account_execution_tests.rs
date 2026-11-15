@@ -232,6 +232,7 @@ fn token_command() -> RestartCommand {
             login: None,
             owner: Some("work".into()),
             entry: accounts::TokenEntry::parse("aterm-claude-token-ac-0123456789abcdef").unwrap(),
+            purpose: aterm_agent::harness::accounts_pool::Purpose::Select,
         })),
         program: "/image-9".into(),
         argv: [
@@ -265,6 +266,7 @@ fn the_seat_admits_a_stored_login_and_a_vault_token() {
         login: None,
         owner: Some("work".into()),
         generation: "cd".repeat(32),
+        purpose: aterm_agent::harness::accounts_pool::Purpose::Select,
     };
     assert!(seat_admitted(&stored));
     assert!(!seat_admitted(&ExecutionIntent::external()));

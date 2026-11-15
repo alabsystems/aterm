@@ -506,7 +506,7 @@ fn the_connection_past_the_cap_takes_the_stalest_place_and_tabs_still_open() {
     for index in 0..3 {
         let reply = held[newest].request("spawn");
         assert!(
-            reply.starts_with("OK s-"),
+            aterm_agent::spawned_tab_id(&reply).is_some(),
             "tab {index} could not open with {cap} control connections held: {reply:?}"
         );
     }

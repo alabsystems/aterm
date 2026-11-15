@@ -23,11 +23,11 @@ fn land() -> Vec<Check> {
                 c,
                 Check::Fmt
                     | Check::ReleasedShim
+                    | Check::CandidateShim
                     | Check::Census
                     | Check::ExportScan
                     | Check::Forge
                     | Check::Cells
-                    | Check::WasmSmoke
                     | Check::WasmGlue
                     | Check::Browser
                     | Check::Measure
@@ -129,8 +129,14 @@ impl FakeRepo {
         )
     }
 
+    /// Its AppKit groups keep their runtime under this repo's own base, beside the candidate
+    /// root and removed with it, so no other test, test binary or verifier holds its
+    /// `windowed.lock` or clears its working directory.
     fn ctx_with_windows(&self, checks: &[Check], scope: Scope) -> Ctx {
-        self.ctx(checks, scope).with_no_windows(false)
+        let base = self.root.parent().expect("the repo's base");
+        self.ctx(checks, scope)
+            .with_no_windows(false)
+            .with_appkit_runtime(base.join("appkit-runtime"))
     }
 
     fn run(&self, checks: &[Check], scope: Scope) -> (String, i32) {
@@ -330,7 +336,7 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     let (ladder, code) = repo.run(&land(), Scope::workspace());
 
     assert_eq!(code, exit::FAILED, "{ladder}");
-    assert!(labels_with(&ladder, "FAIL").len() >= 4, "{ladder}");
+    assert!(labels_with(&ladder, "FAIL").len() >= 3, "{ladder}");
     assert!(
         labels_with(&ladder, "NOT RUN")
             .iter()
@@ -438,86 +444,24 @@ fn a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection() {
     );
 }
 
+/// A doctest that fails fails the test check, on the doctest row the stage runs last. NEGATIVE
+/// CONTROL: the same selection whose doctests pass is green
+/// (`a_scoped_run_narrows_the_driver_where_the_check_reads_the_selection`).
 #[test]
-fn the_doctests_run_rustdoc_only_where_a_doctest_lives_over_the_test_compiles_selection() {
+fn a_failing_doctest_fails_the_test_check_on_its_own_row() {
     let repo = FakeRepo::new();
-    for (name, lib) in [
-        (
-            "documented",
-            "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n",
-        ),
-        ("plain", "//! ```text\n//! not rust\n//! ```\n"),
-    ] {
-        let dir = repo.root.join("crates").join(name);
-        fs::create_dir_all(dir.join("src")).expect("mkdir");
-        fs::write(
-            dir.join("Cargo.toml"),
-            format!("[package]\nname = \"{name}\"\n"),
-        )
-        .expect("manifest");
-        fs::write(dir.join("src/lib.rs"), lib).expect("lib");
-    }
     repo.with_stage2_body(
-        "echo \"argv: $*\"\n\
-         st=0\n\
-         for p in documented plain; do\n\
-         echo \"   Doc-tests $p\"\n\
-         CARGO_PKG_NAME=$p \"$RUSTDOC\" --crate-name $p --test crates/$p/src/lib.rs || st=101\n\
-         done\n\
-         exit $st",
+        "case \"$*\" in\n  *config*get*build.target*)\n    echo 'error: config value \
+         `build.target` is not set' >&2\n    exit 101 ;;\n  *' --doc '*)\n    echo 'test \
+         src/lib.rs - f (line 1) ... FAILED'\n    exit 101 ;;\nesac\nexit 0",
     );
-    let trustdoc = repo.stage2.join("trustdoc");
-    let ran = |code: i32| {
-        format!(
-            "echo \"trustdoc ran $CARGO_PKG_NAME with $*: RUSTDOC=$RUSTDOC \
-             driver=${{ATERM_VERIFY_DOC_DRIVER-unset}} skip=${{ATERM_VERIFY_DOC_SKIP-unset}} \
-             runtool=${{ATERM_VERIFY_DOCTEST_RUNTOOL-unset}}\"\n\
-             printf '\\nrunning 1 test\\ntest src/lib.rs - f (line 1) ... ok\\n\\ntest result: ok. 1 \
-             passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\\n\\n'\n\
-             exit {code}"
-        )
-    };
-    let doc_run = || {
-        let mut ctx = repo.ctx(&[Check::Doc], Scope::workspace());
-        ctx.test_recorder = Some(aterm_tempfile::bin_exe("aterm-verify"));
-        run_ctx(&ctx)
-    };
+    let (ladder, code) = repo.run(&[Check::Test], Scope::crate_only("aterm-grid"));
 
-    common::standin_body(&trustdoc, &ran(0));
-    let (ladder, code) = doc_run();
-    assert_eq!(code, exit::PASS, "{ladder}");
-    let config = aterm_toolchain::build_cache::TEST_GRAPH_CONFIG.join(" ");
-    let flag = aterm_toolchain::build_cache::TEST_GRAPH_FLAG;
-    assert!(
-        ladder.contains(&format!(
-            "--unverified {config} test {flag} --doc --workspace --no-fail-fast"
-        )),
-        "{ladder}"
-    );
-    let want = format!(
-        "trustdoc ran documented with --crate-name documented --test crates/documented/src/lib.rs \
-         --test-runtool {} --test-runtool-arg {}: RUSTDOC={} driver=unset skip=unset runtool={}",
-        aterm_tempfile::bin_exe("aterm-verify").display(),
-        aterm_verify::docdriver::RUNTOOL_FLAG,
-        fs::canonicalize(&repo.stage2)
-            .expect("canonical")
-            .join("trustdoc")
-            .display(),
-        aterm_tempfile::bin_exe("aterm-verify").display(),
-    );
-    assert!(ladder.contains(&want), "missing {want:?} in:\n{ladder}");
-    assert!(!ladder.contains("trustdoc ran plain"), "{ladder}");
-    assert!(
-        ladder
-            .lines()
-            .any(|l| l.starts_with("aterm-verify: ") && l.contains("plain's docs")),
-        "the skip says why:\n{ladder}"
-    );
-
-    common::standin_body(&trustdoc, &ran(101));
-    let (ladder, code) = doc_run();
     assert_eq!(code, exit::FAILED, "{ladder}");
-    assert!(ladder.contains("trustdoc ran documented"), "{ladder}");
+    let red = labels_with(&ladder, "FAIL");
+    assert_eq!(red.len(), 1, "{ladder}");
+    assert!(red[0].contains("--doc"), "{ladder}");
+    assert_eq!(tags(&ladder).last(), Some(&"FAIL"), "{ladder}");
 }
 
 #[test]
@@ -852,11 +796,16 @@ fn whole_and_shaped_compiles_are_followed_by_one_fresh_recording_pass() {
         );
         let calls = fs::read_to_string(repo.scratch.join("cargo-starts")).unwrap();
         let calls: Vec<_> = calls.lines().collect();
-        assert_eq!(calls.len(), expected.len() + 1, "{calls:?}");
+        assert_eq!(calls.len(), expected.len() + 2, "{calls:?}");
         for (got, wanted) in calls.iter().zip(&expected) {
             assert_eq!(*got, wanted);
         }
-        let recording = calls.last().unwrap();
+        assert_eq!(
+            *calls.last().unwrap(),
+            stages::main_targo(&ctx, stages::doctest_args(&ctx.scope)).argv()[1..].join(" "),
+            "the doctests run last, over the test compile's selection"
+        );
+        let recording = calls[calls.len() - 2];
         assert!(!recording.contains("--no-run"));
         assert!(recording.contains(aterm_verify::testrun::RECORD_FLAG));
         assert!(recording.contains("--message-format=json-render-diagnostics"));
@@ -917,14 +866,15 @@ fn recording_metadata_names_the_fresh_executable_and_target() {
         .unwrap();
     let report = stages::run_stage(&ctx, run);
     let block = report.render();
-    assert_eq!(tags(&block), ["FAIL"], "{block}");
+    assert_eq!(tags(&block), ["FAIL", "ok"], "{block}");
     assert_eq!(fs::read_to_string(ran).unwrap(), "fresh\n");
     assert_eq!(
         fs::read_to_string(repo.scratch.join("cargo-starts"))
             .unwrap()
             .lines()
             .count(),
-        2
+        3,
+        "the compile, the recording pass and the doctests"
     );
     assert_eq!(
         report
@@ -962,14 +912,18 @@ fn an_overriding_runner_cannot_escape_the_exact_host_recorder() {
         .unwrap();
     let report = stages::run_stage(&ctx, &spec);
     let block = report.render();
-    assert_eq!(tags(&block), ["NOT RUN"], "{block}");
+    assert_eq!(tags(&block), ["NOT RUN", "ok"], "{block}");
     assert!(
         block.contains("exact-host recording runner left no record"),
         "{block}"
     );
     assert!(!ran.exists(), "an unrecorded binary ran: {block}");
     let calls = fs::read_to_string(repo.scratch.join("cargo-starts")).unwrap();
-    assert_eq!(calls.lines().count(), 1, "{calls}");
+    assert_eq!(
+        calls.lines().count(),
+        2,
+        "the recording pass and the doctests: {calls}"
+    );
     assert!(!calls.contains("--no-run"));
 }
 
@@ -1011,11 +965,11 @@ fn missing_recording_artifacts_cannot_reuse_the_previous_compile() {
         .unwrap();
     let report = stages::run_stage(&ctx, run);
     let block = report.render();
-    assert_eq!(tags(&block), ["NOT RUN"], "{block}");
+    assert_eq!(tags(&block), ["NOT RUN", "ok"], "{block}");
     assert!(block.contains("recording did not add up"), "{block}");
     assert!(!ran.exists(), "an executable without metadata ran: {block}");
     let calls = fs::read_to_string(repo.scratch.join("cargo-starts")).unwrap();
-    assert_eq!(calls.lines().count(), 2, "{calls}");
+    assert_eq!(calls.lines().count(), 3, "{calls}");
     assert_eq!(
         calls
             .lines()
@@ -1058,7 +1012,7 @@ fn a_failed_recording_build_is_not_replayed_after_valid_metadata() {
         .unwrap();
     let report = stages::run_stage(&ctx, &spec);
     let block = report.render();
-    assert_eq!(tags(&block), ["FAIL"], "{block}");
+    assert_eq!(tags(&block), ["FAIL", "ok"], "{block}");
     assert!(
         block.contains("error: current recording build failed"),
         "{block}"
@@ -1069,7 +1023,8 @@ fn a_failed_recording_build_is_not_replayed_after_valid_metadata() {
             .unwrap()
             .lines()
             .count(),
-        1
+        2,
+        "the recording pass and the doctests"
     );
 }
 
@@ -1236,7 +1191,7 @@ fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time() {
     let report = stages::run_stage(&ctx, &spec);
     let block = report.render();
 
-    assert_eq!(tags(&block), ["FAIL"], "{block}");
+    assert_eq!(tags(&block), ["FAIL", "ok"], "{block}");
     // Each binary's run is one sample of its row, at the threads it ran at, with its outcome
     // and the tests libtest said it runs.
     let kept = aterm_verify::test_history::load(&history);
@@ -1362,7 +1317,7 @@ fn binary_order_uses_recorded_duration_then_memory() {
     let ran = |ctx: &aterm_verify::Ctx| {
         fs::remove_file(&order).ok();
         let block = stages::run_stage(ctx, &spec).render();
-        assert_eq!(tags(&block), ["FAIL"], "{block}");
+        assert_eq!(tags(&block), ["FAIL", "ok"], "{block}");
         fs::read_to_string(&order).expect("order")
     };
     assert_eq!(ran(&ctx), "a\nb\nc\n");
@@ -1372,7 +1327,6 @@ fn binary_order_uses_recorded_duration_then_memory() {
     assert!(!kept.seen("-p fixture --test a").expect("a was kept").failed);
     let took = |wall_ms: u64, outcome: &str| aterm_verify::test_history::Sample {
         partition: None,
-        exe_sha256: None,
         at_ms: 1,
         outcome: outcome.to_owned(),
         wall_ms,
@@ -1447,7 +1401,6 @@ fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
             "-p fixture --test b".to_owned(),
             aterm_verify::test_history::Sample {
                 partition: None,
-                exe_sha256: None,
                 at_ms: 1,
                 outcome: "ok".to_owned(),
                 wall_ms: 10,
@@ -1467,7 +1420,7 @@ fn a_failed_test_reruns_at_the_width_its_binary_ran_at() {
         .expect("test stage");
     let report = stages::run_stage(&ctx, &spec);
     let block = report.render();
-    assert_eq!(tags(&block), ["FAIL"], "{block}");
+    assert_eq!(tags(&block), ["FAIL", "ok"], "{block}");
     let findings = report.findings();
     let reruns: Vec<_> = findings
         .iter()
@@ -1551,7 +1504,7 @@ fn the_first_failing_test_binary_ends_a_halted_run_and_nothing_else_does() {
     let (block, ran, words) = run(armed(), failed);
     assert_eq!(ran, ["a"], "nothing started after the red:\n{block}");
     assert_eq!(words.as_deref(), Some(WORDS));
-    assert_eq!(tags(&block), ["FAIL", "NOT RUN"], "{block}");
+    assert_eq!(tags(&block), ["FAIL", "NOT RUN", "NOT RUN"], "{block}");
     assert!(
         labels_with(&block, "NOT RUN")
             .iter()
@@ -1566,7 +1519,7 @@ fn the_first_failing_test_binary_ends_a_halted_run_and_nothing_else_does() {
     let (block, ran, words) = run(armed(), refused);
     assert_eq!(ran, ["a", "b", "c"], "a refusal is no red:\n{block}");
     assert_eq!(words, None);
-    assert_eq!(tags(&block), ["NOT RUN"], "{block}");
+    assert_eq!(tags(&block), ["NOT RUN", "ok"], "{block}");
 
     let (block, ran, words) = run(Halt::off(), failed);
     assert_eq!(
@@ -1575,7 +1528,7 @@ fn the_first_failing_test_binary_ends_a_halted_run_and_nothing_else_does() {
         "a bare run keeps its whole sweep:\n{block}"
     );
     assert_eq!(words, None);
-    assert_eq!(tags(&block), ["FAIL"], "{block}");
+    assert_eq!(tags(&block), ["FAIL", "ok"], "{block}");
 }
 
 /// A JSON BINARY ENDS AT ITS FIRST DECISIVE RED CASE (ATERM-KI-1105-18): binary a, asked in
@@ -1660,7 +1613,7 @@ fn a_json_binary_ends_at_its_first_decisive_red_case_and_nothing_else_does() {
         true,
     );
     assert_eq!(ran, ["a"], "nothing started after the red:\n{block}");
-    assert_eq!(tags(&block), ["FAIL", "NOT RUN"], "{block}");
+    assert_eq!(tags(&block), ["FAIL", "NOT RUN", "NOT RUN"], "{block}");
     assert!(
         block.contains("test cases: seen as they fail (libtest JSON)"),
         "{block}"
@@ -1683,7 +1636,7 @@ fn a_json_binary_ends_at_its_first_decisive_red_case_and_nothing_else_does() {
     ] {
         let (block, ran, _) = run(said, false);
         assert_eq!(ran, ["a", "b", "c"], "a spared case is no red:\n{block}");
-        assert_eq!(tags(&block), ["NOT RUN"], "{block}");
+        assert_eq!(tags(&block), ["NOT RUN", "ok"], "{block}");
     }
 }
 
@@ -1726,7 +1679,7 @@ fn a_refused_probe_runs_every_binary_in_the_human_format() {
         marks.join("a").exists() && marks.join("b").exists(),
         "{block}"
     );
-    assert_eq!(tags(&block), ["ok"], "{block}");
+    assert_eq!(tags(&block), ["ok", "ok"], "{block}");
     assert!(
         block.contains(
             "test cases: decided at each binary's end — libtest refused JSON: error: The \"json\" \
@@ -1784,13 +1737,13 @@ fn a_probe_a_crash_leaves_unanswered_asks_the_next_binary() {
         stages::run_stage(&ctx, &spec).render()
     };
     let block = run(DISCOVER, true);
-    assert_eq!(tags(&block), ["ok"], "{block}");
+    assert_eq!(tags(&block), ["ok", "ok"], "{block}");
     assert!(
         block.contains("test cases: seen as they fail (libtest JSON)"),
         "{block}"
     );
     let block = run(CRASH, false);
-    assert_eq!(tags(&block), ["ok"], "{block}");
+    assert_eq!(tags(&block), ["ok", "ok"], "{block}");
     assert!(
         block.contains("no binary answered libtest's JSON probe: -p fixture --test b"),
         "{block}"
@@ -1833,14 +1786,18 @@ fn a_recording_that_does_not_add_up_fails_closed_without_running_a_binary() {
             .expect("the test stage");
         let report = stages::run_stage(&ctx, &spec);
         let block = report.render();
-        assert_eq!(tags(&block), ["NOT RUN"], "{extra}:\n{block}");
+        assert_eq!(tags(&block), ["NOT RUN", "ok"], "{extra}:\n{block}");
         assert!(
             !ran.exists(),
             "an unrecorded binary ran for {extra}:\n{block}"
         );
         let calls = fs::read_to_string(&trace)
             .unwrap_or_else(|error| panic!("no targo trace ({error}) for {extra}:\n{block}"));
-        assert_eq!(calls.lines().count(), 1, "{block}");
+        assert_eq!(
+            calls.lines().count(),
+            2,
+            "the recording pass and the doctests: {block}"
+        );
         let t = tally(std::slice::from_ref(&report));
         assert!(t.gate_failures.is_empty(), "{extra}:\n{block}");
         assert_eq!(t.could_not_run.len(), 1, "{extra}:\n{block}");
@@ -1866,7 +1823,7 @@ fn a_runner_that_ran_no_test_is_could_not_run_never_ok() {
     let block = report.render();
     assert_eq!(
         tags(&block),
-        ["NOT RUN"],
+        ["NOT RUN", "ok"],
         "a run of no test passed:\n{block}"
     );
     let t = tally(std::slice::from_ref(&report));
@@ -1907,7 +1864,7 @@ fn a_recorded_binary_that_cannot_start_is_its_own_could_not_run_row() {
         .expect("the test stage");
     let report = stages::run_stage(&ctx, &spec);
     let block = report.render();
-    assert_eq!(tags(&block), ["NOT RUN", "FAIL"], "{block}");
+    assert_eq!(tags(&block), ["NOT RUN", "FAIL", "ok"], "{block}");
     assert!(
         labels_with(&block, "NOT RUN")
             .iter()

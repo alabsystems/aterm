@@ -611,6 +611,7 @@ impl Object {
         match result {
             Ok(mut child) => {
                 let pid = child.child_mut().id();
+                crate::resource_observation::born(&self.binding(), pid);
                 // Retain actual child before fallible identity/watch reads.
                 self.state = State::Bound(Box::new(Bound {
                     child,
@@ -648,7 +649,8 @@ impl Object {
                     "native object target did not start: {why}"
                 )))
             }
-            Err(LaunchError::Unbound { spawned, error }) => {
+            Err(LaunchError::Unbound { mut spawned, error }) => {
+                crate::resource_observation::born(&self.binding(), spawned.child_mut().id());
                 self.state = State::Unbound(Some(spawned));
                 Err(error)
             }
@@ -977,7 +979,7 @@ impl Object {
                     .artifact
                     .as_ref()
                     .map(|artifact| artifact.observation().clone()),
-                completion: control::MetadataCompletion {
+                completion: Box::new(control::MetadataCompletion {
                     finished: control::StatusFrame {
                         root_attempt: prepared.request.key.graph.query.binding.root_attempt,
                         member_attempt: prepared.request.key.operation,
@@ -988,7 +990,7 @@ impl Object {
                         },
                     },
                     inputs_unchanged,
-                },
+                }),
                 observation: control::accounting::Observation {
                     scope: control::accounting::Scope::ChildAndWaitedDescendantsV1,
                     cpu_times: waited.accounting.cpu_times.map(|cpu| {

@@ -827,6 +827,7 @@ fn unavailable_outlook_gallery() {
             &roster,
             &read,
             &enrolled,
+            None,
             mode != Mode::Off,
             Some("me"),
             Some("me@example.test"),
@@ -965,6 +966,7 @@ fn paused_outlook_gallery() {
         &roster,
         &read,
         &enrolled,
+        None,
         true,
         Some("me"),
         Some("me@example.test"),
@@ -1002,7 +1004,7 @@ fn paused_outlook_gallery() {
                 .set_agent_reader_program_for_test(Some(aterm_phase::Program::Claude));
             if paused {
                 ctx.meta.lock().unwrap().set_autopilot(
-                    Some(aterm_agent::supervise::Autopilot::Off.word().into()),
+                    Some(alab_policy::config::Autopilot::Off.word().into()),
                     None,
                 );
             }
@@ -1195,6 +1197,7 @@ fn watching_account_observations_gallery() {
         &roster,
         &read,
         &enrolled,
+        None,
         true,
         Some("me"),
         Some("me@example.test"),
@@ -1470,6 +1473,7 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
         &roster,
         state,
         enrolled,
+        None,
         true,
         Some("me"),
         Some("me@example.test"),
@@ -1552,6 +1556,7 @@ fn seeded_card(
         roster,
         &state,
         &enrolled,
+        None,
         true,
         Some("me"),
         Some("me@example.test"),
@@ -1574,6 +1579,7 @@ fn card_of_me(
         roster,
         state,
         enrolled,
+        signing_in: None,
         logins: &accounts::Logins::default(),
         session: account_card::Session {
             label: Some("me"),

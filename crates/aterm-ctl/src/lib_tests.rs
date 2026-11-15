@@ -1983,6 +1983,9 @@ fn a_turn_cut_after_its_verdict_exits_75_never_1() {
 fn reply_is_timeout_detects_await_and_turn_forms() {
     assert!(reply_is_timeout("OK timeout"));
     assert!(reply_is_timeout(
+        "OK timeout status=timeout free_bytes=1024 need_bytes=2048 vol=/data freed_bytes=0 demand=pending pass_in_flight=true"
+    ));
+    assert!(reply_is_timeout(
         "OK 24 turn submitted=1 status=timeout seq=9"
     ));
     assert!(!reply_is_timeout(

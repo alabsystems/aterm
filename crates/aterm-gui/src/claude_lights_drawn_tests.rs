@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 
 use super::super::gesture_tests::{
     BYPASS, Hosted, PGID, app, cols, draw_claude, feed, frame, host, publish_facts,

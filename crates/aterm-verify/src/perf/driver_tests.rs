@@ -212,8 +212,12 @@ fn nested_build_reuses_artifacts_across_launcher_metadata() {
         cmd.args(["--offline", "--message-format=json", "--verbose"])
             .current_dir(&root);
         record_launcher_context(&cmd, &driver, &root);
-        let output = aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
-            .expect("Cargo completed");
+        let output = aterm_uds::deadline::output_while_process_progressing(
+            &mut cmd,
+            aterm_spec::wait::MUST_HAPPEN,
+            "Cargo's build of the fixture",
+        )
+        .expect("Cargo completed");
         std::fs::write(root.join("build.json"), &output.stdout).unwrap();
         std::fs::write(root.join("build.stderr"), &output.stderr).unwrap();
         assert!(
@@ -301,17 +305,28 @@ fn nested_build_reuses_artifacts_across_launcher_metadata() {
     run.env("CARGO_MANIFEST_DIR", root)
         .env("OUT_DIR", &runtime_out);
     super::super::bench_build::Targo::new(driver).environment(&mut run);
-    let output = aterm_uds::deadline::output_within(&mut run, aterm_spec::wait::MUST_HAPPEN)
-        .expect("the runtime fixture completed");
+    let expected = format!("{}|{}", root.display(), runtime_out.display());
+    let qualified =
+        aterm_uds::deadline::output_within(&mut run, aterm_uds::deadline::FIRST_EXEC_HANG)
+            .expect("the newly built runtime fixture qualifies");
+    assert!(qualified.status.success(), "{qualified:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&qualified.stdout).trim(),
+        expected,
+        "the runtime fixture proves its body ran"
+    );
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut run,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the runtime fixture",
+    )
+    .expect("the runtime fixture completed");
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        format!("{}|{}", root.display(), runtime_out.display())
-    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
 }
 
 #[test]

@@ -13,8 +13,8 @@ use crate::model::{Clocks, Mode};
 pub const USAGE: &str = "\
 aterm acaffeine — a menu-bar mug that keeps this Mac awake: a click fills it (no
 idle sleep of the system or the display) until the next click; a right click or
-Control-click picks 1, 8 or 24 hours or forever, Keep Awake with Lid Closed,
-Enable at Startup, or Quit. With the lid closed it holds nothing (the mode stays
+Control-click opens aterm or picks 1, 8 or 24 hours or forever, Keep Awake with
+Lid Closed, Enable at Startup, or Quit. With the lid closed it holds nothing (the mode stays
 on and holds again when the lid opens) unless you turn lid on.
 
 USAGE:

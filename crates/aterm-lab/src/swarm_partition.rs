@@ -346,9 +346,9 @@ pub struct EntryAfter {
     pub name: String,
     /// The island that set it.
     pub island: Island,
-    /// The member Macs whose `~/.secrets/<name>` holds its value.
+    /// The member Macs whose verified store holds its value.
     pub on: Vec<String>,
-    /// The member Macs whose file is missing or holds another value.
+    /// The member Macs whose store lacks it or holds another value.
     pub missing: Vec<String>,
 }
 
@@ -2129,11 +2129,14 @@ impl Lane {
         }
     }
 
-    /// Whether `mac`'s `~/.secrets/<name>` holds the fixture `name` was set to.
+    /// Whether `mac`'s verified store holds the fixture `name` was set to, read in place.
     fn holds_value(&self, mac: &str, name: &str) -> bool {
-        let file = self.home(mac).join(".secrets").join(name);
-        match (crate::util::read_regular_file(&file), self.values.get(name)) {
-            (Ok(bytes), Some(want)) => bytes == *want,
+        let paths = aterm_secrets::client::Paths::locate_for_home(&self.home(mac));
+        match (
+            aterm_secrets::client::read_in_place(&paths, name),
+            self.values.get(name),
+        ) {
+            (Ok(Some(held)), Some(want)) => held.as_slice() == want.as_slice(),
             _ => false,
         }
     }

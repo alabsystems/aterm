@@ -20,7 +20,8 @@ fn observer() -> MachineIdentity {
 }
 
 /// A current Active publication whose one peer was last heard past the presence window, naming
-/// `observer` as its observer, with its history in `history`.
+/// `observer` as its observer, listening since it last heard that peer, with its history in
+/// `history`.
 fn publication_of(
     sampled: Instant,
     wall_ms: u64,
@@ -31,6 +32,7 @@ fn publication_of(
     Publication::new(
         NetworkObservation {
             observed_at_ms: wall_ms,
+            listening_since_ms: Some(heard),
             visibility: Visibility::Active,
             history,
             observer,
@@ -136,6 +138,187 @@ fn an_observer_that_takes_no_contacts_lapses_no_claim() {
         );
         assert_eq!(presence(&observation), None, "{history:?}");
     }
+}
+
+/// A current Active publication that names its observer but no listening gives no presence: its
+/// observer is not listening now (it has not observed since this run confirmed it, or its
+/// producer names none), so it has had no time to hear any peer, and no lease lapses by it. One
+/// that names it judges a peer last heard before listening began from when it began.
+///
+/// Negative control: with `presence` gated on visibility and a named observer alone, the
+/// publication that names no listening lapsed the peer's lease (`a publication that names no
+/// listening lapsed a peer's lease`).
+#[test]
+fn a_publication_that_names_no_listening_lapses_no_claim() {
+    let wall = 2_000_000_000;
+    let now = Instant::now();
+    let since = |listening_since_ms| {
+        let mut observation = publication(now, wall).observation().clone();
+        observation.listening_since_ms = listening_since_ms;
+        observation_at(Publication::new(observation, now), now, Some(wall))
+    };
+    let unlistened = since(None);
+    assert_eq!(unlistened.visibility, Visibility::Active, "PRECONDITION");
+    assert_eq!(unlistened.observer, Some(observer()), "PRECONDITION");
+    assert!(
+        !unheard(&unlistened, wall),
+        "a publication that names no listening lapsed a peer's lease"
+    );
+    assert_eq!(presence(&unlistened), None);
+    let ttl_ms = claims::PRESENCE_TTL_S.unsigned_abs() * 1000;
+    assert!(
+        !unheard(&since(Some(wall - ttl_ms)), wall),
+        "listened for exactly the presence window"
+    );
+    assert!(unheard(&since(Some(wall - ttl_ms - 1000)), wall));
+    // Rounded up to the second, a listening start is never earlier than it was.
+    assert!(!unheard(&since(Some(wall - ttl_ms - 999)), wall));
+}
+
+/// How a test's observer resumes after a gap.
+#[derive(Debug, Clone, Copy)]
+enum Resumed {
+    /// The aterm quit and started again: its runtime dropped the observer, closing its history.
+    Restarted,
+    /// The aterm was killed and started again: its history was left open.
+    Killed,
+    /// The Mac slept and woke: the same observer, its monotonic clock (macOS's uptime clock, the
+    /// one `Instant` reads) standing still while the wall clock ran.
+    Woke,
+}
+
+/// A resumed observer judges a peer absent only over time it has listened: a peer is gone once
+/// this Mac has heard its peers for the presence window (`claims::PRESENCE_TTL_S`) and not heard
+/// it, so one the observer has had no time to hear yet is not gone, and its leases stand. An aterm
+/// that restarts (its observer dropped, its history closed; or killed, the history left open) and
+/// a Mac that wakes from sleep each resume after a gap longer than that window, and publish,
+/// Active and naming their confirmed observer, the peers they retained, each with its last
+/// contact from before the gap. Read before any new contact, a peer still on the LAN is no more
+/// absent than the resumed observer has listened (`listening_since_ms`: a reopened history has
+/// not listened, and a wake is a break on the wall clock that `Instant`, macOS's uptime clock,
+/// does not see). Driven through the real observer (`aterm_db::network_state::TestObserver`),
+/// its publication as this process reads it (`observation_at`), this adapter's `presence` and
+/// the harness's `View::live`.
+///
+/// Controls: before the gap the peer is heard and its lease live; a peer the resumed observer
+/// has listened for over the presence window, one observation a second, and not heard, reads gone
+/// and its lease lapses (genuine absence still lapses).
+///
+/// Negative control (found reading 1748353020b, whose `presence` took each retained peer's last
+/// contact as when it was last heard, with no listening start): the first observation after the
+/// gap read every retained peer gone (`a resumed observer read a peer it has not had time to
+/// hear as gone, its lease lapsed: [Restarted, Killed, Woke]`), and its leases lapsed on this Mac
+/// until the observer contacted it again, about one contact period: a claim made in that window
+/// took an account the peer still used.
+#[test]
+fn a_resumed_observer_lapses_no_lease_of_a_peer_it_has_not_had_time_to_hear() {
+    use aterm_db::network_state::{ObservationHandle, TestObserver};
+    const BEFORE_MS: u64 = 1_790_000_000_000;
+    let gap_ms = (claims::PRESENCE_TTL_S.unsigned_abs() + 5 * 60) * 1000;
+    let window_s = claims::PRESENCE_TTL_S.unsigned_abs() + 60;
+    let identity = |machine: u8| MachineIdentity {
+        machine_id: [machine; 16],
+        incarnation: [1; 16],
+        label: None,
+    };
+    let trust = aterm_secrets::commons::journal::Trust {
+        network: [1; 16],
+        authority: [2; 32],
+        genesis: [3; 32],
+    };
+    // The peer's row: a lease it has held for an hour, its row renewed for a day.
+    let claim = claims::Claim {
+        key: claims::LeaseKey::new("claude", "a@example.test").unwrap(),
+        kind: claims::Kind::Lease,
+        since: secs(BEFORE_MS) - 3600,
+    };
+    let row = Row {
+        machine: hex::encode_lower(&[2; 16]),
+        label: "m2".to_owned(),
+        counter: 1,
+        until: secs(BEFORE_MS) + claims::HORIZON_S,
+        claims: vec![claim.clone()],
+        ranks_homes: false,
+    };
+    // Whether the peer's lease is live to this Mac at wall `wall_ms` and monotonic `now`, as the
+    // observer's current publication says.
+    let live = |published: &ObservationHandle, now: Instant, wall_ms: u64| {
+        let observation = observation_at(
+            published.try_publication().expect("a publication"),
+            now,
+            Some(wall_ms),
+        );
+        assert_eq!(
+            observation.visibility,
+            Visibility::Active,
+            "PRECONDITION: a current publication"
+        );
+        assert_eq!(
+            observation.observer,
+            Some(identity(1)),
+            "PRECONDITION: its observer confirmed"
+        );
+        claims::View {
+            me: hex::encode_lower(&[1; 16]),
+            presence: presence(&observation),
+            ..claims::View::default()
+        }
+        .live(&row, &claim, secs(wall_ms))
+    };
+    let mut lapsed = Vec::new();
+    for resumed in [Resumed::Restarted, Resumed::Killed, Resumed::Woke] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let config = root.path().join("config");
+        let published = ObservationHandle::default();
+        let mut observer = TestObserver::open(&config, published.clone()).unwrap();
+        observer.local(identity(1), trust).unwrap();
+        let before = Instant::now();
+        observer.contact(identity(2), BEFORE_MS, before);
+        observer.observe(Visibility::Active, BEFORE_MS, before);
+        assert!(
+            live(&published, before, BEFORE_MS),
+            "PRECONDITION: the peer heard, its lease live ({resumed:?})"
+        );
+        let wall = BEFORE_MS + gap_ms;
+        let (mut observer, published, now) = match resumed {
+            Resumed::Woke => (observer, published, before + Duration::from_secs(1)),
+            Resumed::Restarted | Resumed::Killed => {
+                if matches!(resumed, Resumed::Killed) {
+                    observer.kill();
+                } else {
+                    drop(observer);
+                }
+                let published = ObservationHandle::default();
+                let mut observer = TestObserver::open(&config, published.clone()).unwrap();
+                observer.local(identity(1), trust).unwrap();
+                (observer, published, Instant::now())
+            }
+        };
+        observer.observe(Visibility::Active, wall, now);
+        if !live(&published, now, wall) {
+            lapsed.push(resumed);
+        }
+        for s in 1..=window_s {
+            observer.observe(
+                Visibility::Active,
+                wall + s * 1000,
+                now + Duration::from_secs(s),
+            );
+        }
+        assert!(
+            !live(
+                &published,
+                now + Duration::from_secs(window_s),
+                wall + window_s * 1000
+            ),
+            "a peer unheard for the presence window of listening kept its lease ({resumed:?})"
+        );
+    }
+    assert!(
+        lapsed.is_empty(),
+        "a resumed observer read a peer it has not had time to hear as gone, its lease lapsed: \
+         {lapsed:?}"
+    );
 }
 
 /// The newest row this Mac's earlier writer seat signed (the db read's `former`) goes into the

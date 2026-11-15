@@ -147,6 +147,44 @@ fn record_reset_record_publishes_the_survivor() {
     );
 }
 
+#[test]
+fn quantile_intervals_contain_the_recorded_values_in_both_layouts() {
+    fn check<const N: usize>() {
+        let h = super::HistogramBins::<N>::new();
+        assert_eq!(h.copy_out().percentile_bounds(0.99), None);
+        for value in [
+            0,
+            1,
+            7_500_000,
+            7_900_000,
+            8_100_000,
+            8_500_000,
+            1 << 50,
+            u64::MAX,
+        ] {
+            h.record(value);
+            let copy = h.copy_out();
+            let bounds = copy.percentile_bounds(0.99).unwrap();
+            assert!(
+                bounds.lower_ns <= value && value <= bounds.upper_ns,
+                "{value}: {bounds:?}"
+            );
+            if value >= 1 << 36 {
+                assert_eq!(bounds.upper_ns, u64::MAX, "the last bucket is clamped");
+            }
+            h.reset();
+            assert_eq!(h.copy_out().percentile_bounds(0.99), None);
+            assert_eq!(
+                copy.percentile_bounds(0.99),
+                Some(bounds),
+                "a reset cannot change an existing snapshot"
+            );
+        }
+    }
+    check::<H_BUCKETS>();
+    check::<{ super::LATENCY_BUCKETS }>();
+}
+
 /// A stamp keeps its OLDEST opening until a close takes it, and a close
 /// with nothing open takes nothing.
 #[test]

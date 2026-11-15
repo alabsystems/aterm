@@ -303,9 +303,13 @@ impl<D: MemberResources> OwnedAttempt<D> {
     fn accept_launch(&mut self, result: Result<CohortChild, LaunchError>) {
         self.uncertain = false;
         self.state = match result {
-            Ok(child) => State::Bound(Box::new(Bound::new(child, self.wake))),
+            Ok(mut child) => {
+                crate::resource_observation::born(&self.binding, child.child_mut().id());
+                State::Bound(Box::new(Bound::new(child, self.wake)))
+            }
             Err(LaunchError::NotSpawned(proof)) => State::NoChild(Some(proof)),
-            Err(LaunchError::Unbound { spawned, error }) => {
+            Err(LaunchError::Unbound { mut spawned, error }) => {
+                crate::resource_observation::born(&self.binding, spawned.child_mut().id());
                 self.failure = Some(format!("bind: {error:?}"));
                 self.uncertain = true;
                 State::Unbound(Some(spawned))

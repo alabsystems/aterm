@@ -13,7 +13,7 @@
 use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 
 use crate::harness_host::credit_claim;
 use crate::retired_workers::{Retired, forget_results};

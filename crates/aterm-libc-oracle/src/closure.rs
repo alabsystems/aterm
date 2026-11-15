@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use aterm_json::Value;
 
-use crate::rustdoc::{Doc, Entry, Public, Result};
+use crate::rustdoc::{Doc, Entry, FormatError, Public, Result, kind_of};
 
 /// The `core::ffi` primitives the shim re-exports on every cell.
 pub const PRIMS: [&str; 14] = [
@@ -184,7 +184,7 @@ fn named(source: &str, into: &mut BTreeSet<String>) {
 fn signature_types<'d>(doc: &'d Doc, entry: &Entry<'d>) -> Result<Vec<&'d Value>> {
     let inner = entry.inner()?;
     let null = &Value::Null;
-    Ok(match entry.kind {
+    let mut types = match entry.kind {
         "constant" | "type_alias" => vec![inner.get("type").unwrap_or(null)],
         "function" => {
             let sig = inner.get("sig").unwrap_or(null);
@@ -216,12 +216,21 @@ fn signature_types<'d>(doc: &'d Doc, entry: &Entry<'d>) -> Result<Vec<&'d Value>
                 .unwrap_or_default()
         }
         _ => Vec::new(),
-    })
+    };
+    if matches!(entry.kind, "struct" | "union" | "enum") {
+        for item in doc.public_inherent_items(inner) {
+            let (kind, _) = kind_of(item).ok_or_else(|| {
+                FormatError("malformed public inherent item in signature closure".into())
+            })?;
+            types.extend(signature_types(doc, &Entry { kind, item })?);
+        }
+    }
+    Ok(types)
 }
 
 /// `names` plus every name in `public` their signatures reach, transitively.
 /// # Errors
-/// When a reached item lacks its `inner` object.
+/// When a reached item or its public inherent item lacks its `inner` object.
 pub fn closure(doc: &Doc, public: &Public<'_>, names: &[String]) -> Result<BTreeSet<String>> {
     let mut have: BTreeSet<String> = names.iter().cloned().collect();
     let mut frontier: Vec<String> = have.iter().cloned().collect();

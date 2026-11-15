@@ -1039,6 +1039,81 @@ fn ptsname_r_errors_come_from_its_return_value() {
     assert_eq!(after_stale(-1), Some(libc::EBADF), "-1 reads errno");
 }
 
+/// The Safety-mode limits reach the shell: its soft open-file and address-space limits read as
+/// the parent planned them (each value clamped to the parent's hard ceiling), not as inherited.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_shell_runs_under_the_limits_it_was_given() {
+    use std::time::Duration;
+    // SAFETY: the trusted-launcher contract holds in a test that mints its own caps.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let limits = aterm_sandbox::Limits::shell_default();
+    let hard = |resource| {
+        let mut now = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `now` is a live out-param for `getrlimit`.
+        assert_eq!(unsafe { libc::getrlimit(resource, &mut now) }, 0);
+        now.rlim_max
+    };
+    let soft = |value: Option<u64>, hard: u64| {
+        let soft = value.expect("Safety mode sets it").min(hard);
+        if soft == u64::MAX {
+            "unlimited".to_owned()
+        } else {
+            soft.to_string()
+        }
+    };
+    let files = soft(limits.open_files, hard(libc::RLIMIT_NOFILE));
+    let space_bytes = limits
+        .address_space
+        .map(|bytes| bytes.min(hard(libc::RLIMIT_AS)));
+    let space = space_bytes.map_or_else(|| "unlimited".to_owned(), |b| (b / 1024).to_string());
+    let probe = "echo \"LIMITS $(ulimit -n) $(ulimit -v)\"; exec sleep 30";
+    let exec: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), probe.into()];
+    let sh = spawn_shell_with_pid_cell_px(
+        24,
+        80,
+        &spawn_cap,
+        &sandbox_cap,
+        &[],
+        None,
+        None,
+        None,
+        Some(&exec),
+        None,
+        None,
+        limits,
+        None,
+        None,
+    )
+    .expect("the probe shell starts");
+    set_nonblocking(sh.master, true).expect("nonblocking master");
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + HANG_DETECTOR;
+    while std::time::Instant::now() < deadline && !seen.ends_with(b"\n") {
+        let mut buf = [0u8; 256];
+        let n = read(sh.master, &mut buf);
+        if n > 0 {
+            seen.extend_from_slice(&buf[..n as usize]);
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    hangup(sh.pid);
+    close_fd(sh.master);
+    reap(sh.pid);
+    let seen = String::from_utf8_lossy(&seen).into_owned();
+    assert_eq!(
+        seen.trim(),
+        format!("LIMITS {files} {space}"),
+        "the shell's soft open-file and address-space limits (KiB) are the planned ones"
+    );
+}
+
 #[test]
 fn sandbox_apply_failure_in_child_fails_closed_no_unconfined_shell() {
     // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
@@ -1186,6 +1261,7 @@ fn an_unrelated_exec_inherits_no_end_of_a_live_pty_or_status_channel() {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn racy_status_pipe() -> (libc::c_int, libc::c_int) {
     let (rd, wr) = aterm_uds::pipe().expect("pipe");
     let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
@@ -1196,6 +1272,7 @@ fn racy_status_pipe() -> (libc::c_int, libc::c_int) {
     (rd, wr)
 }
 
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn a_stranger_holding_the_write_end_cannot_block_the_status_wait_forever() {
     const BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
@@ -1470,6 +1547,84 @@ fn a_spawn_takes_a_ready_kit_and_gives_it_its_winsize() {
     kits.ready.clear();
     drop(kits);
     TEST_KITS.with(|kits| kits.set(None));
+}
+
+/// A pty another session holds as its controlling terminal answers `fstat` and `tcgetattr`, so
+/// the parent's check passes it, but no new session can take it (`TIOCSCTTY` says EPERM): the
+/// child stops at its terminal step, and the spawn replaces that pty once, as it does a dead
+/// one, and starts its shell on the fresh one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pty_another_session_holds_is_replaced_and_the_shell_starts_on_a_fresh_one() {
+    // SAFETY: the trusted-launcher contract holds in a test that mints its own caps.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let pool: &'static std::sync::Mutex<KitPool> =
+        Box::leak(Box::new(std::sync::Mutex::new(KitPool::new())));
+    TEST_KITS.with(|kits| kits.set(Some(pool)));
+    let exec: Vec<std::ffi::OsString> =
+        vec!["/bin/sh".into(), "-c".into(), "exec sleep 600".into()];
+    let spawn = || {
+        spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&exec),
+            None,
+            None,
+            aterm_sandbox::Limits::inherit(),
+            None,
+            None,
+        )
+    };
+    let holder = spawn().expect("the holding session's shell starts");
+    let held = pts_name(holder.master).expect("the held pty's name");
+    assert_eq!(fill_kits(pool, 1).expect("a kit opens"), 1);
+    {
+        let mut kits = pool.lock().unwrap();
+        let kit = &mut kits.ready[0];
+        close_fd(kit.master);
+        close_fd(kit.slave);
+        // SAFETY: `F_DUPFD_CLOEXEC` takes integers; `held` is a NUL-terminated path.
+        (kit.master, kit.slave) = unsafe {
+            (
+                libc::fcntl(holder.master, libc::F_DUPFD_CLOEXEC, 3),
+                libc::open(
+                    held.as_ptr(),
+                    libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+                ),
+            )
+        };
+        assert!(
+            kit.master > 2 && kit.slave > 2,
+            "the held pty as a ready kit: {}",
+            io::Error::last_os_error()
+        );
+    }
+    let _ = spawn_trace::take();
+    let started = spawn();
+    let tried = spawn_trace::take();
+    TEST_KITS.with(|kits| kits.set(None));
+    hangup(holder.pid);
+    close_fd(holder.master);
+    reap(holder.pid);
+    let shell = started.expect("the spawn starts its shell on a fresh pty");
+    let fresh = pts_name(shell.master).expect("the shell's pty name");
+    hangup(shell.pid);
+    close_fd(shell.master);
+    reap(shell.pid);
+    assert_eq!(
+        tried,
+        vec![held.clone(), fresh.clone()],
+        "the spawn tried the held pty, then the one fresh pty it started on"
+    );
+    assert_ne!(fresh, held, "the shell runs on a pty of its own");
 }
 
 #[test]
@@ -2053,15 +2208,15 @@ enum ProbePass {
 /// `aterm_uds::keep_out_of_children` sets there (off Apple it sets nothing).
 const FD_CLOFORK: libc::c_int = 2;
 
-/// The exec-status carrier a spawn here uses unless its atomic one cannot be made.
+/// The exec-status carrier a spawn here uses unless its atomic one cannot be made. A Linux
+/// shell's verdict comes by its clone's own report, so no shell spawn there uses one.
 #[cfg(target_os = "macos")]
 const ATOMIC_EXEC_STATUS_CARRIER: ExecStatusCarrier = ExecStatusCarrier::Fifo;
-#[cfg(target_os = "linux")]
-const ATOMIC_EXEC_STATUS_CARRIER: ExecStatusCarrier = ExecStatusCarrier::Pipe2;
 
 /// A spawn tells the exec-status carrier of the kit it took, wherever that kit was opened: a
 /// lent kit whose channel is the racy pipe is this spawn's racy carrier, and a fresh kit after it
 /// the atomic one. Nothing it tells is another thread's, whose spawns run at once with this one.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_spawn_tells_the_exec_status_carrier_of_the_kit_it_took() {
     // SAFETY: the trusted-launcher contract holds in a test that mints its own caps.
@@ -2212,6 +2367,7 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>, pass: ProbePass)
         at,
     });
     let exec: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), script.into()];
+    #[cfg(target_os = "macos")]
     let _ = exec_carrier_seen::take();
     let sh = spawn_shell_with_pid_cell_px(
         41,
@@ -2237,6 +2393,7 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>, pass: ProbePass)
         "{pass:?}: the spawn returns while its program runs, so nothing the child holds past \
          its exec keeps the exec-status channel open"
     );
+    #[cfg(target_os = "macos")]
     let carrier = exec_carrier_seen::take();
     let marked_after = fd_flags(pipe_rd, "the passed read end") & FD_CLOFORK;
     for fd in [parked, pipe_rd, pipe_wr] {
@@ -2345,6 +2502,7 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>, pass: ProbePass)
     );
     // SAFETY: `cfgetospeed` only reads the termios.
     assert_eq!(unsafe { libc::cfgetospeed(&termios) }, libc::B230400);
+    #[cfg(target_os = "macos")]
     assert_eq!(
         carrier,
         Some(ATOMIC_EXEC_STATUS_CARRIER),

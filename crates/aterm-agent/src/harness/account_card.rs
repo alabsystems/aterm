@@ -378,14 +378,16 @@ pub enum NoTable {
 /// Which Macs hold the account now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Claims {
-    /// The claims table was read: every Mac with a live claim, the earliest claim first, then
-    /// each Mac this Mac only holds the account for. Empty means no Mac claims it.
+    /// The claims table was read: every Mac with a live claim, and each Mac this Mac only holds
+    /// the account for, in the order their claims rank ([`claims::Book::ranked`]): the senior
+    /// first, so a hold, the earliest of all, before every claim. Empty means no Mac claims it.
     Read(Vec<Holder>),
     /// No table spoke of the account, for the reason given, but this Mac's accounts state holds
     /// the senior claim it last settled, still live: one holder is known, the others are not.
     Senior(Holder, NoTable),
     /// This process reads no claims table (a debug build, a lab instance), or claims do not
-    /// apply here (no pool file) and the table names nobody.
+    /// apply to the account here (no pool file, and the lab names this Mac no home of it) and
+    /// the table names nobody.
     Absent,
     /// The table could not be read just now.
     Unreadable,
@@ -462,13 +464,15 @@ impl LoginHalf {
     /// ([`accounts::login_forecast`]).
     #[must_use]
     pub fn of_row(row: &Row, logins: &Logins, state: &State, enrolled: bool, now: i64) -> Self {
-        match accounts::login_here(row, state, enrolled) {
+        match accounts::login_here(row, state, enrolled, now) {
             accounts::LoginHere::NotMade => return Self::SignedOut { at: None },
             accounts::LoginHere::SignedOut => {
                 return Self::SignedOut {
                     at: accounts::login_ended_at(row, logins, state),
                 };
             }
+            // Its token carries its sessions past its stored login's end, as a token in use does.
+            accounts::LoginHere::OnToken => return Self::InUse,
             accounts::LoginHere::In => {}
         }
         match accounts::login_forecast(row, logins, state) {
@@ -571,6 +575,11 @@ pub struct AccountCard {
     /// The account's stored login here: a roster row's whose login was made on this Mac. `None`
     /// for a row never signed in here, and for an outside login, whose end nothing here knows.
     pub login: Option<LoginHalf>,
+    /// Whether the card says `signing in` of the account: its row has no login to run on here and
+    /// its sign-in runs on this Mac now ([`Inputs::signing_in`]), by the one rule line E and the
+    /// card's items read ([`Figure::login`]). Its Login line then says so, whatever the tab runs
+    /// on; a login that is here keeps its words while it is renewed.
+    pub signing_in: bool,
     /// Its budget.
     pub budget: Budget,
     /// Its history on this Mac.
@@ -610,6 +619,9 @@ pub struct Inputs<'a> {
     pub state: &'a State,
     /// The rows whose login is made on this Mac.
     pub enrolled: &'a BTreeSet<String>,
+    /// The label of the row whose sign-in runs on this Mac now
+    /// ([`accounts::Store::signing_in`]), where one does.
+    pub signing_in: Option<&'a str>,
     /// The login records.
     pub logins: &'a Logins,
     /// The session.
@@ -761,51 +773,85 @@ fn seen_of_wall(state: &State, wall: &accounts::Wall, now: i64) -> Option<Seen> 
         })
 }
 
-/// One of the journal's windows as a [`Seen`] at `now`: a standing wall, else its figure where
-/// its reset is known and ahead and its reading's clock admits it.
-fn seen_of_journal(state: &State, window: &alab_seen::WindowSeen, now: i64) -> Option<Seen> {
+/// A peer's admitted bound of one window ([`alab_seen::bound_of`]) as a [`Seen`]: a standing
+/// wall as out until its end, else a lower bound of use until its reset, never an exact figure
+/// (a peer's reading is evidence the account was used, never that it has room).
+fn seen_of_bound(state: &State, bound: &alab_seen::Bound) -> Seen {
+    match bound {
+        alab_seen::Bound::Used {
+            pct_x10,
+            reset,
+            read,
+            by,
+            ..
+        } => Seen {
+            figure: Figure::AtLeast((*pct_x10).min(1000)),
+            reset: Some(*reset),
+            at: Some(*read),
+            by: Some(Mac::of(state, by)),
+        },
+        alab_seen::Bound::Wall { until, read, by } => Seen {
+            figure: Figure::Out,
+            reset: Some(*until),
+            at: Some(*read),
+            by: Some(Mac::of(state, by)),
+        },
+    }
+}
+
+/// What this Mac itself logged to the journal of one window (`me`: its own Commons uuids,
+/// [`alab_seen::Seen::me`]) as a [`Seen`] at `now`: its standing wall, else its figure where its
+/// reset is known and ahead and its reading's clock admits it. A peer's fact says nothing here.
+fn seen_of_own(window: &alab_seen::WindowSeen, me: &BTreeSet<String>, now: i64) -> Option<Seen> {
     let window = window.as_of(now);
-    let (at, by) = match &window.read {
-        Some((t, mac, _)) => (Some(*t), Some(Mac::of(state, mac)).filter(|mac| !mac.ours)),
-        None => (None, None),
-    };
-    if let Some(until) = window.wall_until {
+    let own = |uuid: &str| me.contains(uuid);
+    if let (Some(until), Some((t, _, uuid))) = (window.wall_until, &window.wall_by)
+        && own(uuid)
+    {
         return Some(Seen {
             figure: Figure::Out,
             reset: until,
-            at,
-            by,
+            at: Some(*t),
+            by: None,
         });
     }
+    own(window.reader.as_deref()?).then_some(())?;
+    let at = window.read.as_ref().map(|(t, ..)| *t)?;
     match window.figure? {
         alab_seen::Figure::Used {
             pct_x10,
             reset: Some(reset),
         } => {
-            let figure = Figure::of_reading(u32::from(pct_x10), reset, at?, now);
+            let figure = Figure::of_reading(u32::from(pct_x10), reset, at, now);
             (figure != Figure::Unread).then_some(Seen {
                 figure,
                 reset: Some(reset),
-                at,
-                by,
+                at: Some(at),
+                by: None,
             })
         }
         alab_seen::Figure::Used { reset: None, .. } | alab_seen::Figure::ResetUnread { .. } => None,
     }
 }
 
-/// The journal's own window `word` (`5h`, `7d`) of the account, never a workspace's.
+/// The journal's own window `word` (`5h`, `7d`) of the account, never a workspace's: the bound
+/// the display admits of a peer's evidence ([`alab_seen::bound_of`]), else what this Mac itself
+/// logged of it ([`seen_of_own`]).
 fn journal_window(
     state: &State,
-    journal: Option<&AccountSeen>,
+    journal: Option<(&AccountSeen, &BTreeSet<String>)>,
     word: &str,
     now: i64,
 ) -> Option<Seen> {
-    journal?
+    let (account, me) = journal?;
+    let window = account
         .windows
         .iter()
-        .find(|w| w.window == word && w.sub.is_none())
-        .and_then(|w| seen_of_journal(state, w, now))
+        .find(|w| w.window == word && w.sub.is_none())?;
+    match alab_seen::bound_of(window, me, now) {
+        Some(bound) => Some(seen_of_bound(state, &bound)),
+        None => seen_of_own(window, me, now),
+    }
 }
 
 /// A per-model week's name: the one the stats view gives (`Fable`), else its bucket's.
@@ -841,7 +887,7 @@ fn budget_of(
     cli: Cli,
     state: &State,
     who: &Who,
-    journal: Option<&AccountSeen>,
+    journal: Option<(&AccountSeen, &BTreeSet<String>)>,
     now: i64,
 ) -> Budget {
     let account = who.label().and_then(|label| state.accounts.get(label));
@@ -1026,9 +1072,16 @@ fn claims_of(inputs: &Inputs<'_>, who: &Who) -> Claims {
     }
     match inputs.claims {
         Ok(Some((view, book))) => {
+            // Each Mac once, where its claim first ranks, the senior first
+            // (`claims::Book::ranked`), so a card that names who holds the account names the Mac
+            // that does.
+            let mut order: Vec<String> = Vec::new();
             let mut holders: BTreeMap<String, Holder> = BTreeMap::new();
             for key in &keys {
-                for held in book.live_claims(key, view, inputs.now) {
+                for held in book.ranked(key, view, inputs.now) {
+                    if !order.contains(&held.machine) {
+                        order.push(held.machine.clone());
+                    }
                     let mut mac = Mac::of(state, &held.label);
                     mac.ours |= held.machine == view.me;
                     if mac.ours && !mac.named {
@@ -1056,12 +1109,19 @@ fn claims_of(inputs: &Inputs<'_>, who: &Who) -> Claims {
                         .or_insert(holder);
                 }
             }
-            let mut holders: Vec<Holder> = holders.into_values().collect();
-            holders.sort_by(|a, b| {
-                (a.since.is_none(), a.since, &a.mac).cmp(&(b.since.is_none(), b.since, &b.mac))
-            });
-            if holders.is_empty() && inputs.pool.is_none() {
-                // Claims are made only where a pool file is: an empty table proves nothing here.
+            let holders: Vec<Holder> = order
+                .iter()
+                .filter_map(|machine| holders.remove(machine))
+                .collect();
+            if holders.is_empty()
+                && inputs.pool.is_none()
+                && !keys
+                    .iter()
+                    .any(|key| view.kind(&view.me, key) == claims::Kind::Home)
+            {
+                // Where no pool file is, claims are made only on the accounts the lab names this
+                // Mac a home of (`claims::Scope::Homes`): of any other, an empty table proves
+                // nothing here.
                 return unseen(NoTable::Absent, Claims::Absent);
             }
             Claims::Read(holders)
@@ -1109,6 +1169,12 @@ pub fn build(inputs: &Inputs<'_>) -> AccountCard {
             or_the_journals(Arc::new(History::none(HistoryFrom::NotRead)), seen, now)
         }
     };
+    let signing_in = who.label().is_some_and(|label| {
+        roster.row(label).is_some_and(|row| {
+            let condition = accounts::condition(row, state, inputs.enrolled.contains(label), now);
+            Figure::login(&condition, inputs.signing_in == Some(label)) == Some(Figure::SigningIn)
+        })
+    });
     let (home, used_day) = home_of(inputs, &who);
     let machine = Machine {
         home,
@@ -1131,7 +1197,16 @@ pub fn build(inputs: &Inputs<'_>) -> AccountCard {
         journal,
     };
     AccountCard {
-        budget: budget_of(inputs.cli, state, &who, seen, now),
+        budget: budget_of(
+            inputs.cli,
+            state,
+            &who,
+            match inputs.journal {
+                Journal::Read(read) => seen.map(|account| (account, &read.me)),
+                Journal::Off | Journal::NotReadYet => None,
+            },
+            now,
+        ),
         who,
         names: roster
             .rows
@@ -1141,6 +1216,7 @@ pub fn build(inputs: &Inputs<'_>) -> AccountCard {
         pool_size: roster.rows.len(),
         this_mac: state.swarm_label.clone(),
         login,
+        signing_in,
         history,
         machine,
         pinned: state

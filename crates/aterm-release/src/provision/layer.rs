@@ -59,15 +59,11 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// `publish/site.toml` exists and does not parse.
     fn site(&self) -> Result<Option<PathBuf>, String>;
 
-    /// The service-account key `ship site` deploys with, where one is named
-    /// (`crate::site::Env::sa_key`).
+    /// The service-account key `ship site` deploys with: this Mac's store entry, read in place
+    /// ([`crate::site::deployer_key`]).
     /// # Errors
-    /// `publish/site.toml` exists and does not parse.
-    fn site_key(&self) -> Result<Option<PathBuf>, String>;
-
-    /// Where the vault delivers the deployer's key: its catalog path under this account's
-    /// home (`aterm_secrets::need::Want::hold_path`).
-    fn catalog_site_key(&self) -> Option<PathBuf>;
+    /// Why this Mac holds none.
+    fn site_key(&self) -> Result<aterm_uds::secret::Secret, String>;
 
     /// This Mac's need for the deployer's key (docs/DESIGN-credential-requests-2026-10-27.md
     /// §12.1), moved by `step`, as the need's line: `None` when there is none on file.
@@ -81,13 +77,13 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// The listing failed or did not finish: git's last line.
     fn reach(&self, url: &str) -> Result<(), String>;
 
-    /// Whether Google accepts the deployer's key at `key` and lets its account update the
+    /// Whether Google accepts the deployer's key `key` and lets its account update the
     /// configured Hosting site, as `ship site --check-access` asks: a token exchange, a read
     /// of the site and an IAM permission test, none of which deploys or changes policy. `Ok`
     /// is the line to show.
     /// # Errors
     /// The key, the site or the permission could not be verified: why.
-    fn site_access(&self, key: &Path) -> Result<String, String>;
+    fn site_access(&self, key: &aterm_uds::secret::Secret) -> Result<String, String>;
 
     /// Whether the origin of the site checkout at `site` would take a push from this Mac's
     /// git: a dry run to a ref no sync writes ([`PUSH_PROBE`]), which sends nothing.
@@ -137,7 +133,7 @@ pub(crate) enum SigningGap {
 pub(crate) enum NeedStep {
     /// Only read where it stands (`--check`, and every audit).
     Read,
-    /// The key is missing at the catalog path: ask the lab for it.
+    /// This Mac's registry holds no key: file it with the lab.
     Raise,
     /// The deployer's check passed: the need, if any, is met.
     Satisfied,
@@ -428,26 +424,18 @@ impl LayerItem {
     /// Validate the key with the deployment parser, without sending a token request.
     fn probe_site_key(&self) -> Probe {
         match self.host.site_key() {
-            Err(why) => Probe::Unusable { why },
-            Ok(None) => Probe::Person {
-                step: self.id.into(),
-                how: format!(
-                    "no service-account key is named for the site deploy (FIREBASE_SA_KEY, or \
-                     publish/site.toml's firebase_sa_key){}",
-                    self.site_key_lab()
-                ),
+            Err(why) => Probe::Blocked {
+                why: format!("{why}{}", self.site_key_lab()),
             },
-            Ok(Some(key)) => match validate_site_key(&key) {
+            Ok(key) => match validate_site_key(&key) {
                 Ok(()) => Probe::Ok {
-                    now: format!(
-                        "{} parses as a signing key for Google's token endpoint; Google authentication is not checked",
-                        key.display()
-                    ),
+                    now: "the store's site-deployer-key parses as a signing key for Google's \
+                          token endpoint; Google authentication is not checked"
+                        .into(),
                 },
-                Err(why) => Probe::Person {
-                    step: self.id.into(),
-                    how: format!(
-                        "the site's service-account key is unusable: {why}{}",
+                Err(why) => Probe::Blocked {
+                    why: format!(
+                        "the store's site-deployer-key is unusable: {why}{}",
                         self.site_key_lab()
                     ),
                 },
@@ -458,23 +446,21 @@ impl LayerItem {
     /// Google's own answer for the deployer's key, asked only of a key that parses.
     fn probe_site_access(&self) -> Probe {
         let key = match self.host.site_key() {
-            Ok(Some(key)) if validate_site_key(&key).is_ok() => key,
-            Ok(_) => {
+            Ok(key) if validate_site_key(&key).is_ok() => key,
+            _ => {
                 return Probe::Blocked {
                     why: format!(
                         "not asked of Google: the deployer's key is not usable yet ({SITE_KEY})"
                     ),
                 };
             }
-            Err(why) => return Probe::Unusable { why },
         };
         match self.host.site_access(&key) {
             Ok(now) => Probe::Ok { now },
             Err(why) => Probe::Person {
                 step: self.id.into(),
                 how: format!(
-                    "Google does not let the deployer's key at {} update the site: {why}",
-                    key.display()
+                    "Google does not let the store's site-deployer-key update the site: {why}"
                 ),
             },
         }
@@ -612,15 +598,10 @@ impl LayerItem {
             Kind::Site => Remedy::Command(
                 "clone the site repo and name it: SITE_DIR, or publish/site.toml's dir".into(),
             ),
-            Kind::SiteKey => Remedy::Command(
-                "`aterm secrets need site-deployer-key` (the vault lands it where \
-                 publish/site.toml's firebase_sa_key names it)"
-                    .into(),
-            ),
+            Kind::SiteKey => Remedy::Command("`aterm secrets need site-deployer-key`".into()),
             Kind::SiteAccess => Remedy::Command(
                 "grant the deployer's service account Firebase Hosting's update permission on \
-                 the site, or put its current key where the deploy reads it; `targo \
-                 --unverified ship site --check-access` asks Google again"
+                 the site; `targo --unverified ship site --check-access` asks Google again"
                     .into(),
             ),
             Kind::SitePush => Remedy::Command(format!(
@@ -739,6 +720,9 @@ impl Item for LayerItem {
                 "{} provision --id <this machine's roster id>",
                 crate::publish::SHIP_COMMAND
             )),
+            // A key the registry holds that does not parse is the vault's value: a need cannot
+            // replace it, since a delivery writes only where this Mac holds no file.
+            (Kind::SiteKey, Probe::Blocked { .. }) if self.host.site_key().is_ok() => Remedy::None,
             _ => self.remedy(),
         };
         Explain { why, remedy }
@@ -863,48 +847,18 @@ fn audit_selected(host: &Arc<dyn ReleaseHost>, audit: Audit) -> Vec<(&'static st
     }
 }
 
-/// What a provision does about the deployer key's need: the step to take, or the line that
-/// says why the lab is not asked (`None` where the settings could not be read). A key missing
-/// at the catalog path is asked of the lab, a locally valid key meets the need, and a key
-/// named somewhere else, or named nowhere, is never asked for, since the vault delivers only
-/// to its catalog path and the deploy reads only the path it names.
-fn site_key_step(host: &Arc<dyn ReleaseHost>) -> Result<NeedStep, Option<String>> {
-    let key = host.site_key().map_err(|_| None)?;
-    match key.as_ref().map(|key| validate_site_key(key)) {
-        Some(Ok(())) => return Ok(NeedStep::Satisfied),
-        Some(Err(why))
-            if key
-                .as_ref()
-                .is_some_and(|key| std::fs::symlink_metadata(key).is_ok()) =>
-        {
-            return Err(Some(format!(
+/// What a provision does about the deployer key's need: a key this Mac's registry holds that
+/// parses meets it, and one it does not hold is filed. One it holds that does not parse moves
+/// nothing, since a delivery writes only where this Mac holds no file: the line says why.
+fn site_key_step(host: &Arc<dyn ReleaseHost>) -> Result<NeedStep, String> {
+    match host.site_key() {
+        Err(_) => Ok(NeedStep::Raise),
+        Ok(key) => match validate_site_key(&key) {
+            Ok(()) => Ok(NeedStep::Satisfied),
+            Err(why) => Err(format!(
                 "the deployer's key is unusable: {why}; the need is not marked fulfilled"
-            )));
-        }
-        _ => {}
-    }
-    match (&key, host.catalog_site_key()) {
-        (Some(key), Some(catalog)) if same_missing_destination(key, &catalog) => {
-            Ok(NeedStep::Raise)
-        }
-        (Some(key), Some(catalog)) => Err(Some(format!(
-            "the deployer's key is named at {}, not at {}, where the vault delivers it: the lab \
-             is not asked, so name {} in publish/site.toml's firebase_sa_key, or put the key \
-             where it is named",
-            key.display(),
-            catalog.display(),
-            catalog.display()
-        ))),
-        (None, _) => Err(Some(
-            "no key is named for the deploy (FIREBASE_SA_KEY, or publish/site.toml's \
-             firebase_sa_key), so a key the vault delivers would go unread: the lab is not asked"
-                .to_owned(),
-        )),
-        (Some(_), None) => Err(Some(
-            "this account's home gives the deployer's key no catalog path, so the vault cannot \
-             deliver it here: the lab is not asked"
-                .to_owned(),
-        )),
+            )),
+        },
     }
 }
 
@@ -916,7 +870,7 @@ pub(crate) fn settle_site_key(host: &Arc<dyn ReleaseHost>) -> Option<String> {
             Ok(line) => line,
             Err(why) => Some(format!("the need ledger: {why}")),
         },
-        Err(line) => line,
+        Err(line) => Some(line),
     }
 }
 
@@ -925,13 +879,13 @@ pub(crate) fn settle_site_key(host: &Arc<dyn ReleaseHost>) -> Option<String> {
 /// checkout, the deployer's key and Google's grant to it, the site checkout's push, and the
 /// routed identities' push to the repositories and the tap. Each is a read or a dry run.
 ///
-/// A deployer key missing where the vault delivers it is asked of the lab here, by the need
-/// `aterm secrets need` raises: a real run raises and posts it, and its row says so with the
-/// remedy; a dry run (`dry`) raises nothing and says a real run would. A real run whose key
-/// Google accepted marks the need met.
+/// A deployer key this Mac's registry does not hold is filed with the lab here (`aterm secrets
+/// need site-deployer-key`): a real run raises and posts it, and its row names the filing; a
+/// dry run (`dry`) raises nothing and says a real run would. A real run whose key Google
+/// accepted marks the need met.
 pub(crate) fn distribution(host: &Arc<dyn ReleaseHost>, dry: bool) -> Vec<(&'static str, Check)> {
     let mut rows = audit_selected(host, Audit::Distribution);
-    let (vault, line) = match site_key_step(host) {
+    let (filed, line) = match site_key_step(host) {
         Ok(NeedStep::Raise) if dry => {
             let now = match host.site_key_need(NeedStep::Read) {
                 Ok(Some(line)) => format!(" (the need now: {line})"),
@@ -939,15 +893,15 @@ pub(crate) fn distribution(host: &Arc<dyn ReleaseHost>, dry: bool) -> Vec<(&'sta
                 Err(why) => format!(" (the need ledger: {why})"),
             };
             (
-                true,
-                Some(format!("a real run asks the lab's vault for it{now}")),
+                false,
+                Some(format!("a real run files it with the lab{now}")),
             )
         }
         Ok(NeedStep::Raise) => {
             let asked = match host.site_key_need(NeedStep::Raise) {
-                Ok(Some(line)) => format!("asked of the lab's vault now ({line})"),
-                Ok(None) => "asked of the lab's vault now".to_owned(),
-                Err(why) => format!("the lab's vault could not be asked (the need ledger: {why})"),
+                Ok(Some(line)) => format!("filed with the lab ({line})"),
+                Ok(None) => "filed with the lab".to_owned(),
+                Err(why) => format!("could not be filed (the need ledger: {why})"),
             };
             let posted = match host.post_site_key_need() {
                 Ok(()) => String::new(),
@@ -965,7 +919,7 @@ pub(crate) fn distribution(host: &Arc<dyn ReleaseHost>, dry: bool) -> Vec<(&'sta
             }
             (false, None)
         }
-        Err(line) => (false, line),
+        Err(line) => (false, Some(line)),
     };
     if let Some(line) = line
         && let Some((_, Check::Fail { what, fix })) =
@@ -973,56 +927,23 @@ pub(crate) fn distribution(host: &Arc<dyn ReleaseHost>, dry: bool) -> Vec<(&'sta
     {
         what.push_str("; ");
         what.push_str(&line);
-        if vault {
-            let at = host
-                .catalog_site_key()
-                .map(|path| format!(" to {}", path.display()))
-                .unwrap_or_default();
-            *fix = format!(
-                "wait for the vault to deliver the key{at}: a Mac that holds it answers the \
-                 request, and `aterm secrets need ls` shows where it stands"
-            );
+        if filed {
+            *fix = "a Mac that holds the key answers the filed request; `aterm secrets need ls` \
+                    shows where it stands"
+                .into();
         }
     }
     rows
 }
 
-/// Parse the same bounded regular file as deployment, admitting only Google's endpoint.
+/// Parse the key as deployment does, admitting only Google's endpoint.
 /// This proves local signing material, not remote authorization.
-fn validate_site_key(path: &Path) -> Result<(), String> {
-    let key = crate::site::hosting::Key::read(path)?;
+fn validate_site_key(key: &aterm_uds::secret::Secret) -> Result<(), String> {
+    let key = crate::site::hosting::Key::parse(key)?;
     crate::site::hosting::Origins::google()
         .admit(&key.token_uri)
         .map(|_| ())
         .map_err(|_| "the service-account token endpoint is not Google's admitted endpoint".into())
-}
-
-/// Resolve existing parents as the deployer would, without opening a key or treating a
-/// dangling leaf symlink as a file the vault may replace. Missing parents are not guessed.
-fn same_missing_destination(named: &Path, catalog: &Path) -> bool {
-    let absent = |path| {
-        std::fs::symlink_metadata(path)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    };
-    if !absent(named) || !absent(catalog) {
-        return false;
-    }
-    if named == catalog {
-        return true;
-    }
-    let Some(name) = named.file_name() else {
-        return false;
-    };
-    if catalog.file_name() != Some(name) {
-        return false;
-    }
-    match (
-        named.parent().and_then(|p| p.canonicalize().ok()),
-        catalog.parent().and_then(|p| p.canonicalize().ok()),
-    ) {
-        (Some(named), Some(catalog)) => named == catalog,
-        _ => false,
-    }
 }
 
 /// This machine.
@@ -1199,24 +1120,19 @@ impl ReleaseHost for System {
         crate::site::Env::from_process(&self.repo, None).map(|env| env.site_dir)
     }
 
-    fn site_key(&self) -> Result<Option<PathBuf>, String> {
-        crate::site::Env::from_process(&self.repo, None).map(|env| match &env.site_dir {
-            Some(dir) => env.sa_key(dir),
-            None => env.firebase_sa_key,
-        })
-    }
-
-    fn catalog_site_key(&self) -> Option<PathBuf> {
-        aterm_secrets::need::Want::SiteDeployerKey.hold_path(&self.home)
+    fn site_key(&self) -> Result<aterm_uds::secret::Secret, String> {
+        crate::site::deployer_key(Some(&self.home))
     }
 
     fn site_key_need(&self, step: NeedStep) -> Result<Option<String>, String> {
         use aterm_secrets::need::{self, Purpose, Want};
-        let paths = aterm_secrets::client::Paths::live().map_err(|e| e.to_string())?;
+        let paths = aterm_secrets::client::Paths::for_home(&self.home);
         let want = Want::SiteDeployerKey;
         let purpose = Purpose::ReleaseSiteKey;
         let found = match step {
-            NeedStep::Raise => need::raise(&paths, want, purpose).map(Some),
+            NeedStep::Raise => {
+                return crate::site::raise_deployer_key(&self.home).map(|need| Some(need.line));
+            }
             NeedStep::Satisfied => need::satisfied(&paths, &want, purpose),
             NeedStep::Read => need::peek(&paths).map(|needs| {
                 needs
@@ -1249,7 +1165,7 @@ impl ReleaseHost for System {
             ))
     }
 
-    fn site_access(&self, key: &Path) -> Result<String, String> {
+    fn site_access(&self, key: &aterm_uds::secret::Secret) -> Result<String, String> {
         crate::site::access_of(&self.repo, key)
     }
 

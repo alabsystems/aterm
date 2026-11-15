@@ -343,7 +343,7 @@ pub(super) fn read_summaries(config: &Path, conversation: &str) -> Result<String
 /// Returns `true` when `rows` show `agy` authoritatively idle with no active surface.
 #[must_use]
 pub(super) fn screen_idle(rows: &[String]) -> bool {
-    aterm_phase::agy::phase(rows) == (aterm_phase::Phase::Idle, true)
+    aterm_phase::agy::phase(rows) == (alab_policy::vocab::Phase::Idle, true)
         && aterm_phase::agy::wall(rows).is_none()
 }
 
@@ -353,7 +353,7 @@ pub(super) fn screen_idle(rows: &[String]) -> bool {
 pub(super) fn screen_quota_wall(rows: &[String]) -> bool {
     matches!(
         aterm_phase::agy::phase(rows),
-        (aterm_phase::Phase::Limited { .. }, true)
+        (alab_policy::vocab::Phase::Limited { .. }, true)
     ) && aterm_phase::agy::wall(rows).is_some_and(|w| w.kind.reads_limited())
 }
 
@@ -587,6 +587,9 @@ pub(super) fn upgrade_visit(
     match plan(opts, &st, k) {
         Ok(_) => {}
         Err(super::NoPlan::Wait(why)) => return Some(said(r, format!("wait:{why}"))),
+        Err(super::NoPlan::Account(refusal)) => {
+            return Some(said(r, format!("wait:{}", refusal.kind.word())));
+        }
         Err(super::NoPlan::Refused { why, .. }) => return Some(said(r, format!("skip:{why}"))),
     }
     if super::super::super::relaunch::running_cmdline(&mut c, &tab)

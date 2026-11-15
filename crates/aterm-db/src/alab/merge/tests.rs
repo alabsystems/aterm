@@ -10,7 +10,7 @@ use crate::{
     alab::{
         import::{
             self, Input, KnownMac, Mode, Sheet,
-            tests::{SEALER, Stand, vault},
+            tests::{Stand, store, vault},
         },
         registry::SOURCE,
     },
@@ -244,7 +244,7 @@ fn import_input<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac]) -> Input<'a> {
         sheets,
         macs,
         vendors: &Stand,
-        sealer: &SEALER,
+        store: store(),
         now_ms: 1_800_000_000_000,
         births: crate::alab::import::Births::Listed,
         unread: &[],
@@ -331,7 +331,7 @@ fn assert_settled(cells: &Cells, sheets: &[Sheet], macs: &[KnownMac], keep: &str
     let settled = run(cells, &[], &["m104"]);
     assert!(settled.rows.is_empty() && settled.merges.is_empty());
     assert!(settled.held.is_empty());
-    let (found, _) = crate::alab::checks::lab(cells);
+    let (found, _) = crate::alab::checks::lab(&crate::alab::registry::REGISTRY_3, cells);
     assert!(
         !found
             .iter()

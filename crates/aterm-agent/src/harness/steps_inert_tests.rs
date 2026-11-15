@@ -176,7 +176,7 @@ fn made(rows: &[&str]) -> Made {
             .chain(&b.steps)
             .map(|s| (s.pos.off, s.pos.at_ms, s.state, s.ev))
             .collect(),
-        lost: a.lost + b.lost,
+        lost: a.lost() + b.lost(),
         overflow: a.overflow + b.overflow,
         ends,
         end: b.end,

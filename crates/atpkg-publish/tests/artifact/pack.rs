@@ -90,6 +90,7 @@ impl World {
             upload: false,
             env: Vec::new(),
             build_within: None,
+            build_queue: None,
         }
     }
 
@@ -887,6 +888,7 @@ fn a_bounded_build_is_ended_at_its_bound_and_nothing_of_it_is_signed() {
     let within = Duration::from_secs(3600);
     let bounded = PackRequest {
         build_within: Some(within),
+        build_queue: None,
         ..w.request(X86_64_UNKNOWN_LINUX_GNU)
     };
     // The bound is the build child's own deadline; a pack that names none builds unbounded.
@@ -908,6 +910,7 @@ fn a_bounded_build_is_ended_at_its_bound_and_nothing_of_it_is_signed() {
     hung.overruns = Some("build");
     let bounded = PackRequest {
         build_within: Some(within),
+        build_queue: None,
         ..w.request(X86_64_UNKNOWN_LINUX_GNU)
     };
     let err = pack::pack_with(&w.ctx, &bounded, &hung).expect_err("the build overran");
@@ -1463,36 +1466,40 @@ fn an_upload_without_the_staging_token_is_refused_before_anything_is_built() {
     let ctx = Keys::mint("m3", &[])
         .ctx(tmp.path(), Arc::new(FakeHost::new()))
         .with_host_choice(HostChoice::Gh);
-    let e = upload::token_preflight(&ctx).expect_err("no token file");
+    let e = upload::token_preflight(&ctx).expect_err("no vault entry");
     assert!(
         e.to_string()
-            .contains("--upload needs the staging owner's token at ~/.secrets/"),
+            .contains("--upload needs the staging owner's token, the vault entry gh_access_token"),
         "{e}"
     );
-    std::fs::create_dir_all(ctx.tokens.staging.parent().expect("dir")).expect("mkdir");
-    std::fs::write(&ctx.tokens.staging, "").expect("empty");
+    // An old build's file under ~/.secrets is no token: only the store's entry is read.
+    let old = ctx.home.join(".secrets");
+    std::fs::create_dir_all(&old).expect("mkdir");
+    std::fs::write(old.join("gh_access_token"), "t0ken\n").expect("an old build's file");
     assert!(
         upload::token_preflight(&ctx).is_err(),
-        "an empty file is no token"
+        "a file under ~/.secrets is no token"
     );
-    std::fs::write(&ctx.tokens.staging, "  \n\t\r\n").expect("whitespace");
+    ctx.tokens.staging.put_for_tests(Some(b"  \n\t\r\n"));
     assert!(
         upload::token_preflight(&ctx).is_err(),
-        "a whitespace-only file is no token"
+        "a whitespace-only entry is no token"
     );
-    std::fs::write(&ctx.tokens.staging, b"t0ken with space\n").expect("invalid byte");
+    ctx.tokens
+        .staging
+        .put_for_tests(Some(b"t0ken with space\n"));
     let bad = upload::token_preflight(&ctx).expect_err("invalid byte refused");
     assert!(
         bad.to_string()
-            .contains("--upload needs the staging owner's token at ~/.secrets/"),
+            .contains("--upload needs the staging owner's token, the vault entry gh_access_token"),
         "{bad}"
     );
     assert!(
         !bad.to_string().contains(&ctx.home.display().to_string()),
         "home path redacted: {bad}"
     );
-    std::fs::write(&ctx.tokens.staging, "t0ken\n").expect("token");
-    upload::token_preflight(&ctx).expect("a token file");
+    ctx.tokens.staging.put_for_tests(Some(b"t0ken\n"));
+    upload::token_preflight(&ctx).expect("a vault entry");
 }
 
 /// A harness checkout at `w.root/<dir>` with no origin: one commit, `/target/` ignored, as

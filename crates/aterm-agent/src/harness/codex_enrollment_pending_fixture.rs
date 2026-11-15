@@ -113,7 +113,7 @@ impl PendingCustodyFixture {
             codex_login: None,
             agy_conversation: None,
             now: 1_790_000_000,
-            sid: "s-isolated-custody-fixture".into(),
+            sid: "t0dyfjxtvre".into(),
             sock: None,
             config: Some(config_path),
             claude_tmp: None,

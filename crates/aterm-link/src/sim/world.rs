@@ -298,6 +298,12 @@ pub(crate) enum Mutant {
     JudgePinBeforeRecovery,
     /// An own record whose `acked` write or in-flight entry's unlink failed is delivered with its entry standing (`Bridge::settled_before_delivery`).
     DeliverPastAStandingEntry,
+    /// An own record whose in-flight entry stands for aterm's drain drops the broker link, as
+    /// every build before ATERM-KI-1111-3 did, where the bridge holds it alone
+    /// (`Bridge::hold_record`).
+    DropTheLinkAtAHeldOwnRecord,
+    /// The inbox commit passes a held own record (`Bridge::inbox_commit_floor`).
+    CommitPastAHeldOwnRecord,
     /// The mirror's floor is trusted as it reads.
     TrustTheFloorThatReads,
     /// An attach that could not write the state dir's witness of the log goes on and delivers on it.
@@ -401,6 +407,16 @@ pub(crate) enum Mutant {
     /// The deadline sweep publishes `expired` for every ask whose deadline passed, reading
     /// nothing of the asker's lane (`Bridge::settled_on_bus`): an answered ask expires.
     SweepIgnoresAnswers,
+    /// The deadline sweep reads the asker's lane on the bus alone, not the inbox records the
+    /// mailbox holds read and not yet handled (`Bridge::answer_queued`), as every build before
+    /// ATERM-KI-1114-2241: an answer pumped before a cut gave it up expires its ask, and is then
+    /// handed to the asker after the `expired`.
+    SweepIgnoresQueuedAnswers,
+    /// A refused post's later entries leave the in-flight journal lowest sequence first
+    /// (`Bridge::drop_behind_a_refused_post`), as every build before ATERM-KI-1114-56: a stop
+    /// after the first drop leaves later entries the replay publishes ahead of the dropped
+    /// post's send from the drain, out of its sender's order.
+    DropBehindLowestFirst,
     /// A hand-off whose heads the disk refused unlinks the journal all the same, as before item
     /// F4 (`StateDir::hand_posts_to_files`): the next bridge publishes each record in flight
     /// again at its pin without reading it back, and past a cut that dropped its key a post or
@@ -568,6 +584,20 @@ pub(crate) enum Mutant {
     /// carried the winner's record below the base, unread, and dropped its dedup key, the
     /// re-post lands a second copy of its key beside the one its reader is still handed.
     KeyedRepostWithoutReadingBack,
+    /// A keyed re-post's retry reads back no attempt of its own by its words, as every build
+    /// before ATERM-KI-1111-4's lossy keyed seeds (`Bridge::keyed_repost_own_attempt`): an
+    /// attempt no replay entry and no claim names (an answer lost on a lane nothing journals, a
+    /// verified landing held when its key could not be moved), its record carried past a cut
+    /// that dropped its dedup key, is published again as a second copy of its key.
+    KeyedRepostReadsNoOwnAttempt,
+    /// A key's winner whose record at its key pin's offset retention gave up is not read on past
+    /// that cut (`Bridge::keyed_winner_past_a_cut`), as every build before ATERM-KI-1114-858: the
+    /// owner's own words published again at its sequence above the cut are not found, and a
+    /// re-post under the key is published as a further copy of it.
+    KeyedWinnerNotReadPastACut,
+    /// Replay by dedup sequence instead of journal publication order: a keyed re-post can
+    /// pass an earlier post when both surviving entries are published onto another log.
+    ReplayBySequence,
     /// An in-flight entry journaled on a log before ANOTHER LOG is read back from nowhere on it
     /// (`Bridge::read_back_from`'s `None`), so a copy an earlier replay on this log published,
     /// its settle refused by the disk, is published again once a cut dropped its key
@@ -592,6 +622,25 @@ pub(crate) enum Mutant {
     /// replay published there, its answer unknown, is published again once a cut dropped its
     /// dedup key.
     PinHeadGoneOnAnotherLog,
+    /// astream's "outcome unknown" refusal (the op whose own full flush poisoned the log) is
+    /// judged the broker's answer, the link kept, as every build before ATERM-KI-1111-4's seed
+    /// 590 (`Bridge::refusal_answers`): the publish's in-flight entry is dropped as a refused
+    /// one's, and once the log is reopened, its record shown and carried below a cut that dropped
+    /// its dedup key, the next attach publishes it again with nothing that says to read it back.
+    OutcomeUnknownIsAnAnswer,
+    /// Another log's drop of the mirror's pin is written under the pin's fence alone, not on the
+    /// media (`Bridge::write_dropped_pin`), as every build before ATERM-KI-1111-4's seed 355: a
+    /// power cut brings the old log's window ledger back under the new log's witness, and the
+    /// window budget holds the mirror on offsets the new log's oldest stays below.
+    DroppedPinUnderTheFence,
+    /// The log the self-lane window's `acked` file names is unread, as every build before the
+    /// lossy-log world's seed 3483: a load whose bus-log witness a power cut tore knows no log
+    /// (`Bridge::new`'s `last_log`), and an attach that judges no log replaced keeps the window
+    /// whatever log it was kept on (`Bridge::drop_a_window_of_another_log` skipped). On another
+    /// log an own-lane record whose ack is unread sits below the old log's floor, unaccused, and
+    /// is delivered while its in-flight entry stands; a kill leaves the entry, which the next
+    /// attach publishes again on another log, and the session holds the record twice.
+    UnboundWindow,
     /// A key's own post whose pin is rebuilt from its key's (its own pin's write refused after
     /// the key's took) keeps the key pin's missing head, as every build before it did: no retry
     /// of it reads its attempt back, so past a cut that carried that attempt unread and dropped
@@ -612,6 +661,8 @@ pub(crate) struct Opts {
     pub(crate) table: Escalation,
     pub(crate) arm: ArmMutant,
     pub(crate) mutants: BTreeSet<Mutant>,
+    /// The discovery target, independent of other intentionally disabled protections.
+    pub(crate) controlled_mutant: Option<Mutant>,
     pub(crate) power_cuts: bool,
     /// The broker's log may lose power alone.
     pub(crate) bus_losses: bool,
@@ -743,7 +794,7 @@ pub(crate) struct Opts {
 }
 
 /// The session the other writer under the node's producer id posts from ([`Opts::strays`]).
-pub(crate) const STRAY_SID: &str = "s-stray";
+pub(crate) const STRAY_SID: &str = "tstray00000";
 
 /// The deadlines an ask draws ([`Opts::deadlines`]), in ms: from one that passes before its
 /// target can decide it to one a decision meets in time.
@@ -753,7 +804,7 @@ pub(crate) const DEADLINES_MS: [u64; 5] = [1_000, 5_000, 20_000, 60_000, 180_000
 pub(crate) const TOPICS: [&str; 2] = ["alpha", "beta"];
 
 /// The peer's session that says on [`TOPICS`].
-pub(crate) const SAYER: &str = "s-sayer";
+pub(crate) const SAYER: &str = "tsayer00000";
 
 /// How long past an ask's deadline (judged from where its post retired) the sweep may take
 /// to say so, the settle's clocks being the bridge's: its roster refresh re-arms it, and a
@@ -761,7 +812,7 @@ pub(crate) const SAYER: &str = "s-sayer";
 const DEADLINE_SLACK_MS: u64 = 30_000;
 
 /// The sibling's one session ([`Opts::sibling`]).
-pub(crate) const SIBLING_SID: &str = "s-sibling";
+pub(crate) const SIBLING_SID: &str = "tsbng000000";
 
 /// A scaled world's rules' bytes ([`Opts::scaled`]): the bulk stream's, the mail lanes' and
 /// every other subject's, a few dozen of the world's records each.
@@ -848,6 +899,7 @@ impl Opts {
             table: Escalation::aterm(),
             arm: ArmMutant::None,
             mutants: BTreeSet::new(),
+            controlled_mutant: None,
             power_cuts: seed % 2 == 1,
             bus_losses: seed.is_multiple_of(2),
             cut_weight: 1,
@@ -927,6 +979,14 @@ impl Opts {
     /// `self` with one bridge rule switched off.
     pub(crate) fn with(mut self, m: Mutant) -> Self {
         self.mutants.insert(m);
+        self
+    }
+
+    /// Disable the rule whose necessity this discovery world tests. Secondary
+    /// switches added with `with` do not change which rule its control restores.
+    pub(crate) fn testing(mut self, target: Mutant) -> Self {
+        self.mutants.insert(target);
+        self.controlled_mutant = Some(target);
         self
     }
 
@@ -1406,7 +1466,9 @@ const WAITING: [&str; 2] = ["ask", "task"];
 /// where a node sent it on that session's behalf (`fabric::traffic_of`), else `src`.
 fn sender(src: &str, body: &Body) -> String {
     match body.from.as_deref() {
-        Some(from) if src.starts_with("n-") && from.starts_with("s-") => from.to_string(),
+        Some(from) if src.starts_with("n-") && crate::subject::is_session_id(from) => {
+            from.to_string()
+        }
         _ => src.to_string(),
     }
 }
@@ -1718,7 +1780,7 @@ impl World {
         for name in ["a", "b"] {
             let local = self.next_local;
             self.next_local += 1;
-            let sid = format!("s-{name}{}", self.epoch);
+            let sid = format!("t{name}{:0>9}", self.epoch);
             self.ep.create(local, &sid, self.stamp());
             self.note(format!("session {local} {sid}"));
         }
@@ -1742,7 +1804,7 @@ impl World {
     fn open_session(&mut self) -> u64 {
         let local = self.next_local;
         self.next_local += 1;
-        let sid = format!("s-n{local}e{}", self.epoch);
+        let sid = format!("tn{local:0>4}e{:0>4}", self.epoch);
         self.ep.create(local, &sid, self.stamp());
         self.note(format!("session {local} {sid} opens"));
         self.push_event(&format!("EVENT * session-created {sid}"));
@@ -4458,14 +4520,18 @@ fn quarantine_copies(dir: &std::path::Path, names: &[String]) -> Vec<String> {
     bad
 }
 
-/// Worlds that may run at once in this process: one per two cores, at most six. Each world's
-/// state dirs are real folders whose every write is a create and a rename, and past six worlds
-/// at once those metadata calls queue in the kernel: on 18 cores the lib's tests at nine took
-/// 224 CPU-s for 25 s, at six 170 CPU-s for 27 s, the same instructions either way. Every test
-/// thread's worlds share these slots, so they count the whole binary's grant.
+/// Worlds that may run at once in this process: one per core the binary may use (its grant per
+/// libtest thread times its width, [`aterm_cores::binary_parallelism`]), at most six. Each
+/// world's state dirs are real folders whose every write is a create and a rename, and past six
+/// worlds at once those metadata calls queue in the kernel: on 18 cores the lib's tests at nine
+/// took 224 CPU-s for 25 s, at six 170 CPU-s for 27 s, the same instructions either way. Every
+/// test thread's worlds share these slots, and each sweep already takes at most its thread's
+/// grant of workers (`aterm_spec::check::each`), so the slots bind only below the binary's grant.
+/// At one world per two cores they did: a sweep's workers waited for a slot while cores the
+/// binary was granted sat idle.
 static WORLD_SLOTS: LazyLock<(Mutex<usize>, Condvar)> = LazyLock::new(|| {
     let cores = aterm_cores::binary_parallelism().map_or(4, std::num::NonZeroUsize::get);
-    (Mutex::new((cores / 2).clamp(1, 6)), Condvar::new())
+    (Mutex::new(cores.clamp(1, 6)), Condvar::new())
 });
 
 /// One of [`WORLD_SLOTS`], given back when the world ends (a panic included).
@@ -5035,6 +5101,166 @@ pub(crate) fn run_reworded(opts: &Opts, other_node: bool, landed: bool) -> Rewor
     }
 }
 
+/// What [`run_busy`] found.
+pub(crate) struct Busy {
+    pub(crate) violations: Vec<String>,
+    /// The bridge held the sender's own note in hand while aterm answered its `outbox sent` busy.
+    pub(crate) held: bool,
+    /// Another session's mail, posted after the note, reached its ring while the note waited.
+    pub(crate) other_while_held: bool,
+    /// The `outbox sent` lines aterm answered busy.
+    pub(crate) answered_busy: u64,
+    /// The links said down for an error (`link down reason=error`, every one at a record this
+    /// world holds: it refuses no write).
+    pub(crate) drops: u64,
+    /// The note reached its recipient's ring once the world settled.
+    pub(crate) delivered: bool,
+    /// With `kill_while_held`, the inbox group's commit had passed the peer's mail held behind
+    /// the note when the bridge was killed (only `Mutant::CommitPastAHeldOwnRecord` sends one).
+    pub(crate) committed_past_the_held: bool,
+    /// With `kill_while_held`, the records the bridge held in hand when it was killed.
+    pub(crate) held_at_the_kill: usize,
+    pub(crate) trace: Vec<String>,
+}
+
+/// One step of a scenario world: a readable connection pumped, or a pass of the bridge.
+fn step(w: &mut World) {
+    match w.core.readable().first() {
+        Some(&(conn, _)) => {
+            w.core.pump(conn);
+        }
+        None => w.pass(),
+    }
+    w.collect_notes();
+    w.check_always();
+}
+
+/// Whether session `sid`'s ring holds a row of `marker`.
+fn in_ring(w: &World, sid: &str, marker: &str) -> bool {
+    lock(&w.ep.state)
+        .sessions
+        .values()
+        .any(|s| s.sid == sid && s.rows.iter().any(|r| r.text == marker))
+}
+
+/// ATERM'S UPDATE COMMIT FENCES A SENDER'S RETIREMENTS (ATERM-KI-1111-3): aterm opens three
+/// sessions beside its two; the first's `outbox sent` is answered `ERR busy update-committing`
+/// ([`super::endpoint::EpState::busy`]) while it posts a note to the second, one of this node's
+/// own lanes, so the note's in-flight entry stands for the drain's retry when the live tail
+/// meets its record. The second then posts to the third, whose mail comes on the node's same
+/// inbox subscription. Then aterm's commit ends, its retirements answer again, and the world
+/// settles: every law is judged, the model's tap among them (a commit past the held note
+/// before it is delivered), and `liveness`. With `kill_while_held` a peer's mail to the note's
+/// session is held behind the note, the third session's mail is delivered (a commit's chance
+/// to pass both), and the bridge is killed while it holds them; the next bridge settles the
+/// world, whose laws (`lost:` and `dup delivery` among them) hold both delivered once: the
+/// note's in-flight entry offers it again, and the peer's mail, held in the killed bridge's
+/// memory alone, is offered again by the next bridge's refill of its lane.
+pub(crate) fn run_busy(opts: &Opts, kill_while_held: bool) -> Busy {
+    let _slot = WorldSlot::take();
+    let mut w = World::new(Opts {
+        lossless_device: true,
+        ..opts.clone()
+    });
+    w.launch();
+    w.settle();
+    let (a, b, c) = (w.open_session(), w.open_session(), w.open_session());
+    w.settle();
+    let (Some(from), Some(to), Some(other)) = (w.ep.sid(a), w.ep.sid(b), w.ep.sid(c)) else {
+        unreachable!("the three sessions just opened are hosted");
+    };
+    lock(&w.ep.state).busy.insert(from.clone());
+    w.post_as(a, &from, &format!("@{to}"), "note", Some(to.clone()));
+    let note = format!("m{}", w.marker);
+    let mut held = false;
+    for _ in 0..2_000 {
+        held = w.live.as_ref().is_some_and(|l| l.bridge.held_in_hand() > 0);
+        if held || w.live.is_none() || w.stats.held_for_the_disk > 0 {
+            break;
+        }
+        step(&mut w);
+    }
+    w.note(format!("seam: {from}'s note {note} held in hand: {held}"));
+    w.post_as(b, &to, &format!("@{other}"), "note", Some(other.clone()));
+    let mail = format!("m{}", w.marker);
+    let mut other_while_held = false;
+    for _ in 0..2_000 {
+        if in_ring(&w, &other, &mail) {
+            other_while_held = !in_ring(&w, &to, &note);
+            break;
+        }
+        if w.live.is_none() {
+            break;
+        }
+        step(&mut w);
+    }
+    w.note(format!(
+        "seam: {other} handed {mail} while {note} waited: {other_while_held}; aterm's commit ends"
+    ));
+    let mut committed_past_the_held = false;
+    let mut held_at_the_kill = 0;
+    if kill_while_held {
+        // A peer's mail to the note's session, held behind the note in memory alone (no
+        // in-flight entry stands for it, as one does for the note), then the third session's
+        // mail, whose delivery is the next commit's chance to pass it.
+        w.peer_mail_to(to.clone());
+        let behind = format!("m{}", w.marker);
+        for _ in 0..2_000 {
+            if w.live.as_ref().is_none_or(|l| l.bridge.held_in_hand() >= 2) {
+                break;
+            }
+            step(&mut w);
+        }
+        w.post_as(b, &to, &format!("@{other}"), "note", Some(other.clone()));
+        let after = format!("m{}", w.marker);
+        for _ in 0..2_000 {
+            if w.live.is_none() || in_ring(&w, &other, &after) {
+                break;
+            }
+            step(&mut w);
+        }
+        let group = crate::subject::inbox_group(FLEET, NODE);
+        let at = w
+            .bus_markers()
+            .get(&behind)
+            .and_then(|offs| offs.first().copied());
+        for _ in 0..200 {
+            committed_past_the_held = at.is_some_and(|off| w.core.broker.group_start(&group) > off);
+            if committed_past_the_held || w.live.is_none() {
+                break;
+            }
+            step(&mut w);
+        }
+        held_at_the_kill = w.live.as_ref().map_or(0, |l| l.bridge.held_in_hand());
+        w.note(format!(
+            "seam: the bridge is killed holding {held_at_the_kill} records, {note} and {behind} \
+             behind it; the commit passed {behind}: {committed_past_the_held}"
+        ));
+        w.kill();
+    }
+    lock(&w.ep.state).busy.remove(&from);
+    w.settle();
+    w.collect_notes();
+    w.check_settled();
+    let delivered = in_ring(&w, &to, &note);
+    let answered_busy = lock(&w.ep.state).answered_busy;
+    let trace = w.core.trace();
+    if let Some(live) = w.live.take() {
+        live.process.kill();
+    }
+    Busy {
+        violations: w.violations,
+        held,
+        other_while_held,
+        answered_busy,
+        drops: w.stats.held_for_the_disk,
+        delivered,
+        committed_past_the_held,
+        held_at_the_kill,
+        trace,
+    }
+}
+
 /// Whether `text` is one of the world's message markers (`m<digits>`).
 fn is_marker(text: &str) -> bool {
     text.strip_prefix('m')
@@ -5051,3 +5277,7 @@ fn witnessed_by(rows: &[(String, Option<u64>, Option<u64>)], inc: u64) -> Option
         .then(|| dead.zip(*mark))
         .flatten()
 }
+
+#[cfg(test)]
+#[path = "world_tests.rs"]
+mod tests;

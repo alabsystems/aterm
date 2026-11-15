@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use agh::error::{Kind, Sub};
-use agh::identity::{self, InlineToken, LoadError, MapEnv, Profile, Source};
+use agh::identity::{self, InlineToken, LoadError, Profile, Source};
 use agh::policy::{
     Decision, PermitTarget, Presence, RefusalCode, RouteRequest, RouteTarget, Router, Tier,
 };
@@ -32,9 +32,9 @@ fn fleet() -> Profile {
 /// Each profile's presence on `router`, as the client judges it, with no environment.
 fn presence_on(router: &Router) -> impl Fn(&str) -> Presence + '_ {
     |name: &str| {
-        router.profile(name).map_or(Presence::Absent, |profile| {
-            identity::presence(profile, &MapEnv::new())
-        })
+        router
+            .profile(name)
+            .map_or(Presence::Absent, identity::presence)
     }
 }
 
@@ -88,8 +88,8 @@ fn an_inline_profile_is_present_and_never_release() {
     let dev = fleet();
     assert!(matches!(dev.source, Source::Inline(_)));
     assert_eq!(dev.login.as_deref(), Some("fixture-dev-bot"));
-    assert_eq!(identity::presence(&dev, &MapEnv::new()), Presence::Present);
-    let cred = identity::load_for_tests(&dev, &MapEnv::new()).expect("a credential");
+    assert_eq!(identity::presence(&dev), Presence::Present);
+    let cred = identity::load_for_tests(&dev).expect("a credential");
     assert_eq!(cred.fingerprint(), identity::fingerprint(t.as_bytes()));
     assert_eq!(cred.profile(), "fleet");
     assert_eq!(cred.tier(), Tier::Dev);

@@ -46,6 +46,10 @@ pub const SHARED_READS_MS: u64 = 60_000;
 
 /// The kernel reads the leftover reader takes beyond a run judgment's ([`Kernel`]).
 pub trait LeftKernel: Kernel {
+    /// Read the terminals' masters together, in input order. A failed read remains unknown.
+    fn tty_masters_held(&self, devs: &[u32]) -> Vec<Option<bool>> {
+        devs.iter().map(|dev| self.tty_master_held(*dev)).collect()
+    }
     /// This uid's processes holding a listening unix-domain socket, from one table read
     /// ([`crate::holders::scan_unix_listeners`]), with those whose descriptors could not be
     /// matched; `None` when unread.
@@ -114,6 +118,9 @@ impl Kernel for Live {
 }
 
 impl LeftKernel for Live {
+    fn tty_masters_held(&self, devs: &[u32]) -> Vec<Option<bool>> {
+        crate::holders::pty_masters_held(devs)
+    }
     fn listeners(&self) -> Option<HolderScan> {
         crate::holders::scan_unix_listeners().ok()
     }
@@ -431,6 +438,8 @@ struct Pass<'p> {
     /// New candidate reads left this reading; `None` for no bound.
     budget: Option<usize>,
     bounded: bool,
+    /// Whether this pass has shared the descriptor walk across its terminals.
+    masters_read: bool,
 }
 
 impl Pass<'_> {
@@ -466,6 +475,44 @@ impl Pass<'_> {
     }
 
     fn master_held(&mut self, dev: u32) -> Option<bool> {
+        // An action re-proves just one candidate and never reuses a reading's cache.
+        if self.keep_ms == 0 {
+            return self.k.tty_master_held(dev);
+        }
+        if !self.masters_read
+            && !self
+                .shared
+                .masters
+                .get(&dev)
+                .is_some_and(|(at, _)| self.fresh(*at))
+        {
+            self.masters_read = true;
+            // The sweep does not carry controlling terminals. Read only lineage here;
+            // facts_of still reads each candidate's current identity before its facts.
+            let mut devs: BTreeSet<_> = self
+                .by_pid
+                .keys()
+                .filter_map(|pid| i32::try_from(*pid).ok())
+                .filter_map(|pid| self.k.lineage(pid))
+                .filter_map(|lin| lin.tty)
+                .collect();
+            devs.insert(dev);
+            let devs: Vec<_> = devs
+                .into_iter()
+                .filter(|dev| {
+                    !self
+                        .shared
+                        .masters
+                        .get(dev)
+                        .is_some_and(|(at, _)| self.fresh(*at))
+                })
+                .collect();
+            if !devs.is_empty() {
+                for (dev, held) in devs.iter().zip(self.k.tty_masters_held(&devs)) {
+                    self.shared.masters.insert(*dev, (self.known.now_ms, held));
+                }
+            }
+        }
         match self.shared.masters.get(&dev) {
             Some(&(at, held)) if self.fresh(at) => held,
             _ => {
@@ -804,6 +851,7 @@ impl Reader {
             coalition: None,
             budget: bounds.new_reads,
             bounded: false,
+            masters_read: false,
         };
         let mut seen = HashSet::new();
         let mut facts = Vec::new();

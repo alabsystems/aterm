@@ -649,6 +649,18 @@ impl Mailbox {
         !self.lock().inbox.records.is_empty()
     }
 
+    /// The subject and body of each inbox-group record queued for the loop whose subject starts
+    /// with `prefix`: read off the bus, not yet handled.
+    pub(crate) fn inbox_queued_on(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        self.lock()
+            .inbox
+            .records
+            .iter()
+            .filter(|((_, subject, _), ..)| subject.starts_with(prefix))
+            .map(|((_, subject, body), ..)| (subject.clone(), body.clone()))
+            .collect()
+    }
+
     /// Current incarnation of broker source `s` for stamping a new reader.
     #[must_use]
     pub fn broker_generation(&self, s: Source) -> u64 {

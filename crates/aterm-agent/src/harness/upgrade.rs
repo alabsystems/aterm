@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
 
+use super::harness_mark;
 use super::steps::{BASH_INPUT, BASH_STDERR, BASH_STDOUT, INTERRUPTED, TASK_NOTIFICATION};
 use crate::supervise::approvals::Typed;
 use crate::supervise::policy::turn_end;
@@ -2256,18 +2257,18 @@ pub fn ended_prompt(ended: Ended<'_>) -> String {
 /// irreversible act ([`checking`]).
 #[must_use]
 pub fn done_said(words: &str) -> (bool, bool) {
-    let done = turn_end::says_done(Some(words));
+    let done = alab_policy::words::says_done(Some(words));
     let irreversible = done
         && matches!(
-            turn_end::classify_said(Some(words)),
-            turn_end::Said::Irreversible(_)
+            alab_policy::words::classify_said(Some(words)),
+            alab_policy::words::Said::Irreversible(_)
         );
     (done, irreversible)
 }
 
 /// Appends the post-restart verification instruction to `text`: Cruise's done check, without its
 /// sentence that the go-ahead is no need where the person's hour `held` it, as the loop's own
-/// check within that hour ([`crate::supervise::policy::go_ahead::unless_held`]).
+/// check within that hour ([`alab_policy::go_ahead::unless_held`]).
 #[must_use]
 pub fn checking(text: &str, irreversible: bool, held: bool) -> String {
     text.strip_suffix(CARRY_ON).map_or_else(
@@ -2276,7 +2277,7 @@ pub fn checking(text: &str, irreversible: bool, held: bool) -> String {
             let check = turn_end::done_check_text(None, irreversible);
             format!(
                 "{facts}{}",
-                crate::supervise::policy::go_ahead::unless_held(&check, held)
+                alab_policy::go_ahead::unless_held(&check, held)
             )
         },
     )
@@ -2285,7 +2286,7 @@ pub fn checking(text: &str, irreversible: bool, held: bool) -> String {
 pub const CARRY_ON: &str = concat!(
     "Continue where you left off. If you were waiting on the user, nobody is here to answer: \
      decide for yourself, prefer reversible steps, and keep going. ",
-    crate::supervise::policy::needs::needs_hint!()
+    alab_policy::needs_hint!()
 );
 
 /// Prompt typed after a quiet restart when the resumed build warned of unrestored state.
@@ -2522,7 +2523,7 @@ impl FinishedScan {
     }
 
     /// Returns whether the model's last text turn is a clean defense of its work or its
-    /// `Could not finish:` ([`turn_end::reply_for_the_loop`]), with no prompt written after it.
+    /// `Could not finish:` ([`alab_policy::open_work::reply_for_the_loop`]), with no prompt written after it.
     #[must_use]
     pub const fn defended(&self) -> bool {
         self.defended
@@ -2582,14 +2583,15 @@ impl FinishedScan {
         if !self.notice {
             (self.done_said, self.done_irreversible) = done_said(&words);
         }
-        self.defended = turn_end::reply_for_the_loop(Some(&words));
+        self.defended = alab_policy::open_work::reply_for_the_loop(Some(&words));
         // THE LAND CHECK'S ANSWER LANDS A TASK (`land-check@v1`): `LANDED` alone, read as
         // the policy reads it; a defense's words land nothing, but where an older build's act
         // asked for it, as that build landed there.
         let checked_landed = self.land_checked
-            && crate::supervise::policy::land_check::land_check_answer(&words, None, false)
-                == crate::supervise::policy::land_check::CheckAnswer::Landed;
-        let retired_landed = self.land_retired && turn_end::clean_defense(Some(&words));
+            && alab_policy::land_check::land_check_answer(&words, None, false)
+                == alab_policy::land_check::CheckAnswer::Landed;
+        let retired_landed =
+            self.land_retired && alab_policy::open_work::clean_defense(Some(&words));
         if self.land && (checked_landed || retired_landed) {
             (self.finished, self.said, self.settled) = (true, true, true);
         } else if self.said {
@@ -3000,7 +3002,10 @@ fn asked_by(row: &Value, ours: &[Typed]) -> Asked {
 }
 
 fn is_done_check(text: &str) -> bool {
-    let checks = || std::iter::once(turn_end::DONE_CHECK).chain(turn_end::RETIRED_DONE_CHECKS);
+    let checks = || {
+        std::iter::once(alab_policy::words::DONE_CHECK)
+            .chain(alab_policy::words::RETIRED_DONE_CHECKS)
+    };
     checks().any(|check| opens_with(check, text))
         || (text.starts_with(HARNESS_MARK) && {
             let words: Vec<&str> = text.split_whitespace().collect();
@@ -3014,39 +3019,39 @@ fn is_done_check(text: &str) -> bool {
 /// Whether `text` opens Land's instruction or its nudge (its contradiction among them), today's
 /// or an older build's, the switch's why before it (v6 §14.17 item 3) read past.
 fn is_land_instruction(text: &str) -> bool {
-    let text = turn_end::past_switch_why(text);
+    let text = alab_policy::words::past_switch_why(text);
     let text = text.as_ref();
     [
-        turn_end::LAND,
-        turn_end::LAND_NUDGE,
-        turn_end::LAND_CONTRADICTED_HEAD,
+        alab_policy::words::LAND,
+        alab_policy::words::LAND_NUDGE,
+        alab_policy::words::LAND_CONTRADICTED_HEAD,
     ]
     .into_iter()
-    .chain(turn_end::RETIRED_LANDS)
-    .chain(turn_end::RETIRED_LAND_NUDGES)
+    .chain(alab_policy::words::RETIRED_LANDS)
+    .chain(alab_policy::words::RETIRED_LAND_NUDGES)
     .any(|head| opens_with(head, text))
 }
 
 /// Whether `text` opens a Land instruction or nudge only an older build typed (one that landed on
 /// a clean defense, before the land check).
 fn is_retired_land(text: &str) -> bool {
-    turn_end::RETIRED_LANDS
+    alab_policy::words::RETIRED_LANDS
         .into_iter()
-        .chain(turn_end::RETIRED_LAND_NUDGES)
+        .chain(alab_policy::words::RETIRED_LAND_NUDGES)
         .any(|head| opens_with(head, text))
 }
 
 /// Whether `text` opens the land check (`land-check@v1`), plain or hinted.
 pub(crate) fn is_land_check_prompt(text: &str) -> bool {
-    opens_with(turn_end::LAND_CHECK_HEAD, text)
+    opens_with(alab_policy::land_check::LAND_CHECK_HEAD, text)
 }
 
 /// Returns whether `text` opens an Autopilot Land act: its instruction, nudge, answer or check.
 pub(crate) fn is_land_act(text: &str) -> bool {
     is_land_instruction(text)
         || is_land_check_prompt(text)
-        || std::iter::once(turn_end::LAND_ANSWER)
-            .chain(turn_end::RETIRED_LAND_ANSWERS)
+        || std::iter::once(alab_policy::words::LAND_ANSWER)
+            .chain(alab_policy::words::RETIRED_LAND_ANSWERS)
             .any(|answer| opens_with(answer, text))
 }
 
@@ -3060,11 +3065,11 @@ fn vendor_continues(row: &Value) -> bool {
 fn lands_answer(row: &Value, ours: &[Typed]) -> bool {
     row.get("isMeta").and_then(Value::as_bool) != Some(true)
         && first_text(row).map(typed_words).is_some_and(|t| {
-            std::iter::once(turn_end::LAND_ANSWER)
-                .chain(turn_end::RETIRED_LAND_ANSWERS)
+            std::iter::once(alab_policy::words::LAND_ANSWER)
+                .chain(alab_policy::words::RETIRED_LAND_ANSWERS)
                 .any(|answer| opens_with(answer, t))
                 && typed_by(ours, t, recorded_ms(row), |o| {
-                    o.rule == turn_end::RULE_LAND_ANSWER
+                    o.rule == alab_policy::words::RULE_LAND_ANSWER
                 })
         })
 }
@@ -3311,11 +3316,16 @@ fn announcement_has(message: &Value, marker: &str) -> bool {
     }
 }
 
+/// Whether the transcript row `v` is Claude Code's lost-login answer: its main chain's
+/// `authentication_failed` API error, unless its words are Cloudflare's block or challenge page
+/// answering in the API's place, which Claude Code types `authentication_failed` too (2.1.323,
+/// [`aterm_phase::wall::edge_block`]): a network block, never a login wall.
 fn is_auth_wall_row(v: &Value) -> bool {
     v.get("type").and_then(Value::as_str) == Some("assistant")
         && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
         && v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
         && v.get("error").and_then(Value::as_str) == Some("authentication_failed")
+        && !row_texts(v).any(aterm_phase::wall::edge_block)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3657,7 +3667,8 @@ fn row_texts(v: &Value) -> impl Iterator<Item = &str> {
 }
 
 fn is_spend_row(v: &Value) -> bool {
-    row_texts(v).any(|text| aterm_phase::classify_wall(text) == Some(aterm_phase::WallKind::Spend))
+    row_texts(v)
+        .any(|text| aterm_phase::classify_wall(text) == Some(alab_policy::vocab::WallKind::Spend))
 }
 
 /// Returns the timestamp until which the session stands at a usage limit in `jsonl`.
@@ -4027,7 +4038,7 @@ pub fn login_wall(agent: Agent, rows: &[String]) -> bool {
         .program()
         .reader()
         .wall(rows)
-        .is_some_and(|w| w.kind == aterm_phase::WallKind::Auth)
+        .is_some_and(|w| w.kind == alab_policy::vocab::WallKind::Auth)
 }
 
 /// Computes the ask count for the next [`Step::Announce`] in `phase`.

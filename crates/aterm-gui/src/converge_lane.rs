@@ -44,7 +44,13 @@ pub(crate) fn env_set(name: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaneWake {
     Network(crate::network_moved::Woke),
-    Inputs(aterm_secrets::converge::RepositoryWork),
+    /// An input look called for this work: with what moved the inputs' mark in the looks that
+    /// called for work since the snapshot before, as classes, and how many such looks there were.
+    Inputs(
+        aterm_secrets::converge::RepositoryWork,
+        aterm_secrets::converge::MarkMoved,
+        u32,
+    ),
 }
 
 /// Start the lane: a pass at once, then one every [`crate::secrets_join::MEND_EVERY`] or once
@@ -77,10 +83,12 @@ pub(crate) fn spawn_lane() -> bool {
                     },
                 );
                 let _ = inputs.snapshot();
+                let clock = std::time::Instant::now();
                 lane(
-                    &mut |trigger, work| pass(&exe, trigger, work),
+                    &mut |trigger, work, note| pass(&exe, trigger, work, note),
                     &mut |line| aterm_log::info!("{line}"),
                     &mut |every| until_moved(&mut moved, &mut wake, &mut inputs, every),
+                    &mut || u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX),
                 );
             },
         );
@@ -98,26 +106,63 @@ pub(crate) fn spawn_lane() -> bool {
     }
 }
 
+/// One pass of the lane ([`lane`]): started under its trigger, its work and its start's note, it
+/// says how the pass ended and the CPU its reap measured, where it measured one.
+#[cfg(unix)]
+type LanePass<'a> = dyn FnMut(
+        &str,
+        aterm_secrets::converge::RepositoryWork,
+        &aterm_secrets::converge::StartNote,
+    ) -> (Ended, Option<std::time::Duration>)
+    + 'a;
+
 /// The lane's rounds: a window pass at once ([`aterm_secrets::converge::WINDOW`]), then, each
 /// time `wait` waited out the recheck or bounded retry, or was woken by a move, another;
 /// `log` gets a pass's [`ended_line`] once per change of how passes end, and the source of each
 /// move that started one ([`moved_line`]). It returns once `wait` says to stop (`None`), which
-/// the live lane's never does.
+/// the live lane's never does. Each pass is handed the note of its start
+/// ([`aterm_secrets::converge::StartNote`]): why it runs (the first pass; a timer, by how the
+/// pass before it ended; a network move; an input, with what moved the inputs' mark), with the
+/// causes and the mark's moves of a pass that found the lock held carried to the pass that
+/// follows it, how many passes in a row found it held, the CPU `pass` measured for them, and
+/// how long ago the first of them ended on `now_ms`, the lane's elapsed milliseconds.
 #[cfg(unix)]
 fn lane(
-    pass: &mut dyn FnMut(&str, aterm_secrets::converge::RepositoryWork) -> Ended,
+    pass: &mut LanePass<'_>,
     log: &mut dyn FnMut(&str),
     wait: &mut dyn FnMut(std::time::Duration) -> Option<LaneWake>,
+    now_ms: &mut dyn FnMut() -> u64,
 ) {
-    let clock = std::time::Instant::now();
+    use aterm_secrets::converge::{Causes, MarkMoved, RepositoryWork, StartNote};
     let mut retry = aterm_secrets::converge::RunnerRetry::default();
     let mut said = None;
-    let mut work = aterm_secrets::converge::RepositoryWork::Refresh;
+    let mut work = RepositoryWork::Refresh;
+    let mut note = StartNote {
+        causes: Causes::FIRST,
+        ..StartNote::default()
+    };
+    let mut held_since = None;
     loop {
         retry.started();
-        let ended = pass(aterm_secrets::converge::WINDOW, work);
-        let now_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-        retry.reaped(ended.last(), now_ms);
+        let (ended, cpu) = pass(aterm_secrets::converge::WINDOW, work, &note);
+        let ended_ms = now_ms();
+        retry.reaped(ended.last(), ended_ms);
+        // What the next start's note keeps of this pass: one that found the lock held is still
+        // owed for the same causes and the same moves of the mark; any other end settles them
+        // and the held count.
+        let (carried, carried_moved) = if ended == Ended::Held {
+            note.held = note.held.saturating_add(1);
+            note.held_cpu_ms = note.held_cpu_ms.saturating_add(
+                cpu.map_or(0, |cpu| u64::try_from(cpu.as_millis()).unwrap_or(u64::MAX)),
+            );
+            held_since.get_or_insert(ended_ms);
+            (note.causes, (note.moved, note.moves))
+        } else {
+            note.held = 0;
+            note.held_cpu_ms = 0;
+            held_since = None;
+            (Causes::default(), (MarkMoved::default(), 0))
+        };
         if said.as_ref() != Some(&ended) {
             if let Some(line) = ended_line(&ended) {
                 log(&line);
@@ -125,30 +170,48 @@ fn lane(
             said = Some(ended.clone());
         }
         let every = retry
-            .remaining(now_ms)
+            .remaining(ended_ms)
             .map_or(crate::secrets_join::MEND_EVERY, |pause| {
                 pause.min(crate::secrets_join::MEND_EVERY)
             });
-        match wait(every) {
+        let mut moved = (MarkMoved::default(), 0);
+        let cause = match wait(every) {
             None => return,
             Some(LaneWake::Network(crate::network_moved::Woke::Timer)) => {
                 if ended == Ended::Ran {
-                    work = aterm_secrets::converge::RepositoryWork::Refresh;
+                    work = RepositoryWork::Refresh;
+                }
+                match ended {
+                    Ended::Ran => Causes::TIMER,
+                    Ended::Held => Causes::RETRY_HELD,
+                    Ended::Unfinished => Causes::RETRY_UNFINISHED,
+                    Ended::Failed(_) | Ended::Unstarted(_) => Causes::RETRY_FAILED,
                 }
             }
             Some(LaneWake::Network(woke)) => {
-                work = aterm_secrets::converge::RepositoryWork::Refresh;
+                work = RepositoryWork::Refresh;
                 log(&moved_line(woke));
+                Causes::NETWORK
             }
-            Some(LaneWake::Inputs(requested)) => {
+            Some(LaneWake::Inputs(requested, classes, looks)) => {
+                moved = (classes, looks);
                 // A failed/unfinished request still owes its original stronger policy.
                 work = if ended == Ended::Ran {
                     requested
                 } else {
                     work.max(requested)
                 };
+                // Identity debt arrives as a repair and is not told apart here.
+                match requested {
+                    RepositoryWork::Repair => Causes::INPUT_REPAIR,
+                    RepositoryWork::Refresh => Causes::INPUT_REFRESH,
+                }
             }
-        }
+        };
+        note.causes = carried.with(cause);
+        note.moved = carried_moved.0.with(moved.0);
+        note.moves = carried_moved.1.saturating_add(moved.1);
+        note.waited_ms = held_since.map_or(0, |since: u64| now_ms().saturating_sub(since));
     }
 }
 
@@ -186,7 +249,8 @@ fn until_moved(
                 // the event generation. Newer events during capture/child stay outstanding.
                 wake.acknowledge(generation);
                 if let Some(work) = work {
-                    return Some(LaneWake::Inputs(work));
+                    let (moved, looks) = snapshot.moved;
+                    return Some(LaneWake::Inputs(work, moved, looks));
                 }
                 continue;
             }
@@ -271,37 +335,53 @@ impl Ended {
     }
 }
 
-/// Run one pass for `trigger` from `exe` and wait for it.
+/// Run one pass for `trigger` from `exe`, started under `note`
+/// ([`aterm_secrets::converge::noting`]), and wait for it: how it ended and the CPU it spent.
 #[cfg(unix)]
 fn pass(
     exe: &std::path::Path,
     trigger: &str,
     work: aterm_secrets::converge::RepositoryWork,
-) -> Ended {
+    note: &aterm_secrets::converge::StartNote,
+) -> (Ended, Option<std::time::Duration>) {
     pass_starting(
-        || aterm_secrets::converge::start(exe, trigger, work),
+        || {
+            aterm_secrets::converge::noting(note, || {
+                aterm_secrets::converge::start(exe, trigger, work)
+            })
+        },
         pass_ended,
     )
 }
 
+/// How the pass `start` starts ended, and the CPU it spent where the wait that reaped it
+/// measured that (64-bit Darwin and Linux; elsewhere the plain wait reaps it and no CPU is
+/// given).
 #[cfg(unix)]
 fn pass_starting(
     start: impl FnOnce() -> std::io::Result<aterm_uds::spawnfd::Child>,
     ended: impl FnOnce(),
-) -> Ended {
+) -> (Ended, Option<std::time::Duration>) {
     let mut child = match start() {
         Ok(child) => child,
-        Err(error) => return Ended::Unstarted(error.to_string()),
+        Err(error) => return (Ended::Unstarted(error.to_string()), None),
     };
-    match child.wait() {
-        Ok(status) => {
+    let waited = match child.wait_with_rusage() {
+        Ok(usage) => Ok((usage.status, Some(usage.cpu))),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            child.wait().map(|status| (status, None))
+        }
+        Err(error) => Err(error),
+    };
+    match waited {
+        Ok((status, cpu)) => {
             let result = ended_status(status);
             if result != Ended::Held {
                 ended();
             }
-            result
+            (result, cpu)
         }
-        Err(error) => Ended::Unstarted(error.to_string()),
+        Err(error) => (Ended::Unstarted(error.to_string()), None),
     }
 }
 

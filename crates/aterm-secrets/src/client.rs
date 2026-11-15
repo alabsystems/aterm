@@ -5,7 +5,7 @@
 
 use crate::age::{self, Identity, Recipient};
 use crate::envelope::{self, Envelope, Floor, Locker, Pin, Retired, Unsigned, Verdict};
-use crate::materialize::{self, Manifest, Report};
+use crate::pass_counts::{self, Count, Phase};
 use crate::text::{self, Audience, Document, Entry};
 use crate::transport::{self, Fetched, Source};
 use crate::{Error, SecretBytes, fsx, join};
@@ -38,6 +38,11 @@ mod creation;
 pub mod custodian;
 mod enrollment;
 mod entry;
+mod registry_store;
+pub use registry_store::{
+    EntryWrite, Holding, InPlace, fleet_holding, fleet_in_place, put_entry, remove_entry,
+    vault_name,
+};
 mod fan_out;
 mod fleet;
 mod foundation;
@@ -105,7 +110,7 @@ pub use entry::{
     EntryAdmission, EntryClaim, EntryClaimRelation, EntryObservation, EntryOrigin, EntryRead,
     EntryReader, EntrySnapshot, EntryVersion, MAX_ENTRY_CLAIM_BYTES, PublicRosterPair,
     PublicRosterRead, VerifiedEntry, current_public_roster, observe_verified_entry,
-    read_account_bound_entry, read_verified_entry,
+    read_account_bound_entry, read_verified_entry, read_verified_entry_until, read_verified_set,
 };
 #[path = "client/mailbox_index.rs"]
 mod mailbox_index;
@@ -264,6 +269,8 @@ mod own_head_tests;
 #[cfg(test)]
 mod parent_history_tests;
 #[cfg(test)]
+mod pass_counts_tests;
+#[cfg(test)]
 mod peer_candidates_tests;
 mod peer_selection;
 #[cfg(test)]
@@ -291,6 +298,8 @@ mod received_records_tests;
 mod records_push_tests;
 #[cfg(test)]
 mod records_sync_tests;
+#[cfg(test)]
+mod selection_pass_tests;
 
 /// Where a machine keeps its vault state, under one home.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -801,6 +810,25 @@ pub enum JoinOutcome {
         /// Names written or already right.
         names: Vec<String>,
     },
+}
+
+/// What one apply recorded, by entry name, never a value: the vault's entries this Mac reads in
+/// place from its verified store, and those it reads under no name. An apply writes no file
+/// (`docs/DESIGN-secrets-2026-10-20.md` §4); what an older build wrote under the home stays as it
+/// is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    /// The entries read by name from the store ([`crate::entry_class::EntryClass::read_by_name`]),
+    /// sorted.
+    pub held: Vec<String>,
+    /// The entries read under no name, the name and why: one set apart by its name
+    /// ([`crate::entry_class::set_apart_refusal`]: an AI CLI's login file, a home path aterm does
+    /// not name, a case variant of a held or consumed name), which a vault an older or modified
+    /// build wrote may hold, and both names of a folded pair
+    /// ([`crate::entry_class::folded_pairs`]). The rest of the vault is applied all the same.
+    pub refused: Vec<(String, String)>,
+    /// Whether what this Mac reads changed: another set of entries or another value of one.
+    pub changed: bool,
 }
 
 /// How a sync ended.
@@ -2633,26 +2661,21 @@ struct State {
     /// The tag ([`join::proof_tag`]) of a proof an admin Mac's verdict refused
     /// ([`read_verdict`]).
     refused: Option<String>,
-    /// The last apply left a file of one of the vault's entries unwritten ([`apply_failed`]):
-    /// the next fetch of the same version applies again.
+    /// An apply began and has not recorded its selection ([`prepare_materialization`]): the next
+    /// fetch of the same version applies again.
     failed: bool,
-    manifest: Manifest,
-    /// Entry name → digest of each value a pass is to write, saved before it writes and cleared
-    /// by its own save (a save that applies nothing keeps it; an apply keeps the digests of
-    /// the entries it failed, whose write may have landed all the same), so the next apply
-    /// still counts the files a cut-short pass wrote as the vault's
-    /// ([`materialize::apply_resuming`]).
-    pending: materialize::Pending,
-    /// The entries the last apply left this Mac's own (an unanchored ` if-absent` entry left in
-    /// place, a plain entry adopted): out of the manifest, so [`gaps`] looks at them apart, and
-    /// one whose file is gone since is a gap the next pass fills. `None` in a state no apply of
-    /// this record wrote (an older aterm's), until the next apply.
-    own: Option<BTreeSet<String>>,
-    /// The names `aterm secrets keep` made this Mac's own ([`keep`]): each stays in the
-    /// manifest while its entry does, so its anchored set and a new value behave as before,
-    /// and the pass that drops its entry is handed a manifest without it, so the file is left
-    /// as the Mac's own instead of taken back ([`apply_entries`]).
-    kept: BTreeSet<String>,
+    /// The entries the last apply recorded ([`record_applied`]), each name with [`held_digest`]
+    /// of its entry (`[held]`): what this Mac reads by name from its store. `None` in a state no
+    /// apply of this build recorded (an older aterm's), until the next apply.
+    held: Option<BTreeMap<String, String>>,
+    /// `[manifest]` as an older aterm wrote it, the name of each file it wrote and the digest of
+    /// that file's bytes. Carried so an older aterm on this Mac still reads what it wrote, and
+    /// only ever pruned ([`record_applied`]): a name whose entry is gone or whose value changed
+    /// leaves it, so no older build takes a file back or overwrites one in place on this
+    /// build's word. Nothing adds a name.
+    legacy_manifest: BTreeMap<String, String>,
+    /// `own` as an older aterm wrote it, pruned as [`Self::legacy_manifest`] is.
+    legacy_own: Option<BTreeSet<String>>,
 }
 
 /// Fingerprint the successful-round inputs relevant to a service health receipt. Ordinary
@@ -2671,7 +2694,6 @@ pub(crate) fn service_health_version(paths: &Paths) -> crate::Result<[u8; 32]> {
         "configured_source":source.map(|d|hex(&d)),
         "membership":state.membership.word(),
         "failed":state.failed,
-        "pending":state.pending,
     });
     let bytes = aterm_json::to_vec(&value).map_err(|e| Error::new(e.to_string()))?;
     Ok(sha256(&bytes))
@@ -2711,8 +2733,17 @@ fn read_state(paths: &Paths) -> crate::Result<Option<State>> {
         }
         digests
     };
-    let manifest = Manifest {
-        files: digests("manifest"),
+    let names = |key: &str| {
+        table
+            .get(key)
+            .and_then(aterm_toml::Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(aterm_toml::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
     };
     Ok(Some(State {
         seq: int("seq"),
@@ -2744,29 +2775,13 @@ fn read_state(paths: &Paths) -> crate::Result<Option<State>> {
             .get("failed")
             .and_then(aterm_toml::Value::as_bool)
             .unwrap_or(false),
-        manifest,
-        pending: digests("pending"),
-        kept: table
-            .get("kept")
-            .and_then(aterm_toml::Value::as_array)
-            .map(|names| {
-                names
-                    .iter()
-                    .filter_map(aterm_toml::Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        own: table
-            .get("own")
-            .and_then(aterm_toml::Value::as_array)
-            .map(|names| {
-                names
-                    .iter()
-                    .filter_map(aterm_toml::Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            }),
+        held: table
+            .get("held")
+            .and_then(aterm_toml::Value::as_table)
+            .is_some()
+            .then(|| digests("held")),
+        legacy_manifest: digests("manifest"),
+        legacy_own: names("own"),
     }))
 }
 
@@ -2892,21 +2907,19 @@ fn ordinary_state(state: &State, heard: bool) -> String {
     if state.failed {
         text.push_str("failed = true\n");
     }
-    if !state.kept.is_empty() {
-        let names: Vec<String> = state.kept.iter().map(|name| toml_str(name)).collect();
-        text.push_str(&format!("kept = [{}]\n", names.join(", ")));
-    }
-    if let Some(own) = &state.own {
+    if let Some(own) = &state.legacy_own {
         let names: Vec<String> = own.iter().map(|name| toml_str(name)).collect();
         text.push_str(&format!("own = [{}]\n", names.join(", ")));
     }
-    text.push_str("\n[manifest]\n");
-    for (name, digest) in &state.manifest.files {
-        text.push_str(&format!("{} = {}\n", toml_str(name), toml_str(digest)));
+    if let Some(held) = &state.held {
+        text.push_str("\n[held]\n");
+        for (name, digest) in held {
+            text.push_str(&format!("{} = {}\n", toml_str(name), toml_str(digest)));
+        }
     }
-    if !state.pending.is_empty() {
-        text.push_str("\n[pending]\n");
-        for (name, digest) in &state.pending {
+    if !state.legacy_manifest.is_empty() {
+        text.push_str("\n[manifest]\n");
+        for (name, digest) in &state.legacy_manifest {
             text.push_str(&format!("{} = {}\n", toml_str(name), toml_str(digest)));
         }
     }
@@ -3049,24 +3062,46 @@ pub fn status(paths: &Paths) -> crate::Result<Status> {
     })
 }
 
-/// Names in this machine's applied registry, read from metadata without opening its
-/// vault identity or any materialized credential.
+/// THE NAMES THIS MAC'S STORE HOLDS, value-free, as `aterm secrets ls` lists them: the
+/// verified recipient view of a signed vault ([`entry::held_names`]), or the entries of the
+/// person's own plain file where it lies. No value is returned and no file under the home is
+/// read. Empty where no vault is configured.
 ///
 /// # Errors
-/// The saved client state cannot be read or parsed.
+/// The view cannot be authenticated just now (a pending or denied membership, or a writer still
+/// holding the vault state past a minute), which says nothing of what the vault holds, so a
+/// caller never takes it as empty; or local state cannot be read.
 pub fn registered_names(paths: &Paths) -> crate::Result<Vec<String>> {
-    Ok(registry_names(&load_state(paths)?))
+    let state = load_state(paths)?;
+    let Some(expected) = config(paths)? else {
+        return Ok(Vec::new());
+    };
+    if expected.signer.is_some() {
+        return entry::held_names(paths, &expected)?.ok_or_else(|| {
+            Error::new("this Mac's vault view is not verified just now; no entry names are read")
+        });
+    }
+    let Source::Path(path) = &expected.source else {
+        return Ok(Vec::new());
+    };
+    if state.membership != Stored::Plain || !source_bound(&expected, &state) {
+        return Ok(Vec::new());
+    }
+    Ok(plain_entries(&expected, path)?
+        .into_iter()
+        .map(|entry| entry.name)
+        .filter(|name| !crate::reserved_name(name))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
 }
 
 fn registry_names(state: &State) -> Vec<String> {
     state
-        .manifest
-        .files
-        .keys()
-        .chain(state.own.iter().flatten())
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+        .held
+        .iter()
+        .flatten()
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
@@ -3141,107 +3176,6 @@ pub fn conflicts(paths: &Paths) -> crate::Result<Vec<Conflict>> {
             token: crate::entry_class::claude_token(&name),
         })
         .collect())
-}
-
-/// The files the vault wrote on this Mac, each at its path under `paths.home`
-/// ([`materialize::target_path`]): its manifest's entries, and those a pass that was cut short
-/// was writing. Read from local state alone: no key, source or written file is read, and a Mac
-/// with no vault has none.
-/// # Errors
-/// The vault's local state cannot be read.
-pub fn delivered_files(paths: &Paths) -> crate::Result<BTreeSet<PathBuf>> {
-    let state = load_state(paths)?;
-    Ok(state
-        .manifest
-        .files
-        .keys()
-        .chain(state.pending.keys())
-        .filter_map(|name| materialize::target_path(&paths.home, name).ok())
-        .collect())
-}
-
-/// What [`keep`] did with one name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Kept {
-    /// Recorded kept: its file, which holds what the vault wrote, is left as the Mac's own once
-    /// its entry goes, as an adopted file is.
-    Kept,
-    /// Nothing changed for this name: why (never the value).
-    Not(String),
-}
-
-/// `aterm secrets keep <name>…`: make each file the vault wrote on this Mac the Mac's own
-/// (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.9, step A14), so a later `Delete` or dropped
-/// entry leaves it. A name is kept only while the manifest (or a cut pass's pending) holds it
-/// and its file holds, by digest, what the vault wrote; a name the manifest does not hold, a
-/// reserved name, an AI CLI's login and a missing or changed file change nothing.
-///
-/// The name is recorded in [`State::kept`] and stays in the manifest while its entry does: taken
-/// out at once, an ` if-absent` file would count as the Mac's own and the vault's files anchored
-/// to it would be withdrawn by the next pass. The pass that drops its entry is handed a manifest
-/// without it, so that pass leaves the file and the name leaves both ([`apply_entries`]). Under
-/// the state lock, so no pass runs between the look and the save. Reads only local state and
-/// digests of the files: no value is returned, and a Mac with no vault state keeps nothing and
-/// creates nothing.
-/// # Errors
-/// The vault's local state cannot be read, locked or saved.
-pub fn keep(paths: &Paths, names: &[String]) -> crate::Result<Vec<(String, Kept)>> {
-    let mut unique: Vec<&String> = Vec::new();
-    for name in names {
-        if !unique.contains(&name) {
-            unique.push(name);
-        }
-    }
-    let not_held = |name: &str| {
-        Kept::Not(format!(
-            "{name} is not in this Mac's manifest: the vault did not write its file here"
-        ))
-    };
-    if matches!(fsx::kind(&paths.state_file()), Ok(fsx::Kind::Missing)) {
-        return Ok(unique
-            .into_iter()
-            .map(|name| (name.clone(), not_held(name)))
-            .collect());
-    }
-    let _lock = StateLock::take(paths)?;
-    let mut state = load_state(paths)?;
-    let mut done = Vec::with_capacity(unique.len());
-    let mut changed = false;
-    for name in unique {
-        let wrote: Vec<&String> = [state.manifest.files.get(name), state.pending.get(name)]
-            .into_iter()
-            .flatten()
-            .collect();
-        let verdict = match materialize::target_path(&paths.home, name) {
-            Err(why) => Kept::Not(format!("{name}: {}", why.0)),
-            Ok(_) if wrote.is_empty() => not_held(name),
-            Ok(target) if matches!(fsx::kind(&target), Ok(fsx::Kind::Missing)) => {
-                Kept::Not(format!(
-                    "{name}: {} is missing: there is no file to keep",
-                    target.display()
-                ))
-            }
-            Ok(target)
-                if !wrote
-                    .iter()
-                    .any(|digest| materialize::holds_digest(&paths.home, name, digest)) =>
-            {
-                Kept::Not(format!(
-                    "{name}: {} does not hold what the vault wrote (changed, unreadable or not a plain file)",
-                    target.display()
-                ))
-            }
-            Ok(_) => {
-                changed |= state.kept.insert(name.clone());
-                Kept::Kept
-            }
-        };
-        done.push((name.clone(), verdict));
-    }
-    if changed {
-        save_state(paths, &state)?;
-    }
-    Ok(done)
 }
 
 /// Whether this machine's join request included a join-password proof.
@@ -3338,7 +3272,7 @@ pub fn read_verdict_within_admitted(
 /// The local configuration or state cannot be safely read, or a writer held the state lock past
 /// the wait ([`crate::ErrorKind::VaultBusy`]).
 pub fn materialization_ready(paths: &Paths) -> crate::Result<bool> {
-    materialization_ready_with(paths, None, local_files_intact)
+    materialization_ready_with(paths, None, local_intact)
 }
 
 /// Setup readiness, including an owned legacy lock that ordinary sync can repair.
@@ -3360,7 +3294,7 @@ pub fn materialization_ready_for_setup(paths: &Paths) -> crate::Result<bool> {
 /// # Errors
 /// As [`materialization_ready`]'s.
 pub fn materialization_ready_for(paths: &Paths, expected: &Config) -> crate::Result<bool> {
-    materialization_ready_with(paths, Some(expected), local_files_intact)
+    materialization_ready_with(paths, Some(expected), local_intact)
 }
 
 /// Local materialization facts that can change a setup retry's answer.
@@ -3404,7 +3338,7 @@ pub fn materialization_mark(paths: &Paths) -> crate::Result<Option<Materializati
     let ready = pin_admitted(&config, None)
         && matches!(state.membership, Stored::In | Stored::Plain)
         && (source_bound(&config, &state) || log_only_source_bound(&config, &state))
-        && files_intact(paths, &state)
+        && applied_intact(paths, &state)
         && !(state.membership == Stored::In
             && config.signer.is_some()
             && steward::local_recipient_denied_in_roster(paths));
@@ -3417,7 +3351,7 @@ pub fn materialization_mark(paths: &Paths) -> crate::Result<Option<Materializati
     if let Some(digest) = state.digest.or(state.records_digest) {
         mark.update(digest);
     }
-    for (name, digest) in &state.manifest.files {
+    for (name, digest) in state.held.iter().flatten() {
         mark.update((name.len() as u64).to_be_bytes());
         mark.update(name.as_bytes());
         mark.update((digest.len() as u64).to_be_bytes());
@@ -3433,7 +3367,8 @@ pub struct MaterializationSnapshot {
     config: Config,
     seq: u64,
     digest: Option<[u8; 32]>,
-    manifest: Manifest,
+    /// What the apply recorded ([`State::held`]): each name with its entry's digest.
+    held: BTreeMap<String, String>,
     /// A caller's registered input entries; `None` observes the whole materialization.
     entries: Option<BTreeSet<String>>,
     network_materialization: Option<VaultNetworkMaterialization>,
@@ -3445,7 +3380,7 @@ impl PartialEq for MaterializationSnapshot {
         self.config == other.config
             && self.seq == other.seq
             && self.digest == other.digest
-            && self.manifest == other.manifest
+            && self.held == other.held
             && self.entries == other.entries
     }
 }
@@ -3493,8 +3428,9 @@ pub enum MaterializationBlocker {
     Dropped,
     /// The applied state is not bound to the configured source and signing identity.
     SourceChanged,
-    /// Apply, signed cache or tracked files are not complete and intact.
-    LocalFilesIncomplete,
+    /// The apply has not finished, the signed cache is not whole, or the applied selection is
+    /// not the current one.
+    ApplyIncomplete,
 }
 
 /// A local readiness verdict taken under the same guard as its successful input read.
@@ -3509,7 +3445,7 @@ const CURRENT_WAIT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 std::thread_local! {
-    /// A test's own [`CURRENT_WAIT`] on this thread ([`with_current_wait`]).
+    /// A test's own [`CURRENT_WAIT`] and [`READ_WAIT`] on this thread ([`with_current_wait`]).
     static TEST_CURRENT_WAIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
 }
 
@@ -3522,8 +3458,8 @@ fn current_wait() -> Duration {
     CURRENT_WAIT
 }
 
-/// Run `read` with `wait` in place of [`CURRENT_WAIT`] on this thread, so a test of a writer
-/// that outlasts the wait ends in a moment.
+/// Run `read` with `wait` in place of [`CURRENT_WAIT`] and [`READ_WAIT`] on this thread, so a
+/// test of a writer that outlasts the wait ends in a moment.
 #[cfg(test)]
 pub(crate) fn with_current_wait<T>(wait: Duration, read: impl FnOnce() -> T) -> T {
     struct Restore(Option<Duration>);
@@ -3587,8 +3523,8 @@ impl MaterializationSnapshot {
             .map_err(|_| Error::new("the refused credential source is unavailable"))?;
         if state.seq != self.seq
             || state.digest.or(state.records_digest) != self.digest
-            || !self.matches_manifest(&state.manifest)
-            || !files_intact(paths, &state)
+            || !self.matches_held(state.held.as_ref())
+            || !applied_intact(paths, &state)
         {
             return Err(Error::new("the refused credential version changed"));
         }
@@ -3605,9 +3541,7 @@ impl MaterializationSnapshot {
         read: impl FnOnce() -> crate::Result<T>,
     ) -> crate::Result<T> {
         if entries.is_empty()
-            || entries
-                .iter()
-                .any(|entry| !self.manifest.files.contains_key(entry))
+            || entries.iter().any(|entry| !self.held.contains_key(entry))
             || self
                 .entries
                 .as_ref()
@@ -3620,12 +3554,14 @@ impl MaterializationSnapshot {
         match with_ready_state_reusing(
             paths,
             Some(&self.config),
-            local_files_intact,
+            local_intact,
             None,
             Some(&self.selection),
             OnWriter::Wait,
             |now| {
-                if now.seq != self.seq || now.digest != self.digest || !now.holds_the_files_of(self)
+                if now.seq != self.seq
+                    || now.digest != self.digest
+                    || !now.holds_the_entries_of(self)
                 {
                     return Err(Error::new("the captured credential version changed"));
                 }
@@ -3662,14 +3598,14 @@ impl MaterializationSnapshot {
             match with_ready_state_reusing(
                 paths,
                 Some(&self.config),
-                local_files_intact,
+                local_intact,
                 None,
                 Some(&self.selection),
                 OnWriter::Wait,
                 |_| Ok(()),
             )? {
                 MaterializationObservation::Ready(current) => {
-                    current.snapshot.holds_the_files_of(self)
+                    current.snapshot.holds_the_entries_of(self)
                 }
                 MaterializationObservation::Blocked(_) => false,
             },
@@ -3695,22 +3631,24 @@ impl MaterializationSnapshot {
         else {
             return Ok(false);
         };
-        Ok(!state.failed && state.pending.is_empty() && self.matches_manifest(&state.manifest))
+        Ok(!state.failed && self.matches_held(state.held.as_ref()))
     }
 
-    /// The same vault, with the same files at the same digests ([`Self::is_current`]).
-    fn holds_the_files_of(&self, then: &Self) -> bool {
-        self.config == then.config && then.matches_manifest(&self.manifest)
+    /// The same vault, with the same entries holding the same values ([`Self::is_current`]).
+    fn holds_the_entries_of(&self, then: &Self) -> bool {
+        self.config == then.config && then.matches_held(Some(&self.held))
     }
 
-    fn matches_manifest(&self, manifest: &Manifest) -> bool {
+    fn matches_held(&self, held: Option<&BTreeMap<String, String>>) -> bool {
+        let Some(held) = held else {
+            return false;
+        };
         match &self.entries {
-            None => self.manifest == *manifest,
+            None => self.held == *held,
             Some(entries) => entries.iter().all(|name| {
-                self.manifest
-                    .files
+                self.held
                     .get(name)
-                    .is_some_and(|digest| manifest.files.get(name) == Some(digest))
+                    .is_some_and(|digest| held.get(name) == Some(digest))
             }),
         }
     }
@@ -3730,7 +3668,7 @@ pub fn with_materialization_ready<T>(
     with_ready_state(
         paths,
         Some(expected),
-        local_files_intact,
+        local_intact,
         None,
         OnWriter::Wait,
         |_| read(),
@@ -3762,7 +3700,7 @@ pub fn with_materialization_ready_for_entries<T>(
     with_ready_state(
         paths,
         Some(expected),
-        local_files_intact,
+        local_intact,
         Some(entries),
         OnWriter::Wait,
         |_| read(),
@@ -3786,7 +3724,7 @@ pub fn observe_materialization<T>(
     with_ready_state(
         paths,
         Some(expected),
-        local_files_intact,
+        local_intact,
         None,
         OnWriter::Answer,
         |_| read(),
@@ -3922,27 +3860,29 @@ fn with_ready_state_reusing<T>(
         return blocked(Blocker::Revoked);
     }
     if !intact(paths, &state) {
-        return blocked(Blocker::LocalFilesIncomplete);
+        return blocked(Blocker::ApplyIncomplete);
     }
     let Some(applied) = state.materialization_selection else {
-        return blocked(Blocker::LocalFilesIncomplete);
+        return blocked(Blocker::ApplyIncomplete);
     };
     let Some(selection) =
         materialization_selection::observe(paths, &config, &state, &observation, prior)
             .ok()
             .flatten()
     else {
-        return blocked(Blocker::LocalFilesIncomplete);
+        return blocked(Blocker::ApplyIncomplete);
     };
     if selection.meaning != applied {
-        return blocked(Blocker::LocalFilesIncomplete);
+        return blocked(Blocker::ApplyIncomplete);
     }
     let entries = if let Some(entries) = entries {
-        if entries
-            .iter()
-            .any(|name| !state.manifest.files.contains_key(*name))
-        {
-            return blocked(Blocker::LocalFilesIncomplete);
+        if entries.iter().any(|name| {
+            !state
+                .held
+                .as_ref()
+                .is_some_and(|held| held.contains_key(*name))
+        }) {
+            return blocked(Blocker::ApplyIncomplete);
         }
         Some(entries.iter().map(|name| (*name).to_owned()).collect())
     } else {
@@ -3954,7 +3894,7 @@ fn with_ready_state_reusing<T>(
         config,
         seq: state.seq,
         digest: state.digest.or(state.records_digest),
-        manifest: state.manifest,
+        held: state.held.unwrap_or_default(),
         entries,
     };
     Ok(MaterializationObservation::Ready(Box::new(Materialized {
@@ -4038,7 +3978,7 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
         return Ok(None);
     };
     let state = load_state(paths)?;
-    if state.membership != Stored::In || state.failed || !state.pending.is_empty() {
+    if state.membership != Stored::In || state.failed {
         return Ok(None);
     }
     if state.digest.is_none() && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
@@ -4339,7 +4279,7 @@ pub(crate) fn observe_commons(paths: &Paths) -> crate::Result<crate::commons::Ob
     if state.membership != Stored::In {
         return unavailable(Unavailable::NotAdmitted);
     }
-    if state.failed || !state.pending.is_empty() {
+    if state.failed {
         return unavailable(Unavailable::IncompleteApply);
     }
     if state.digest.is_none() && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
@@ -4587,6 +4527,82 @@ fn open_commons_control_from_log(
     Ok(control)
 }
 
+/// The value of `name` this Mac reads in place ([`read_in_place`]), for a test: `None` where it
+/// reads none or the read fails.
+#[cfg(test)]
+pub(crate) fn stored(paths: &Paths, name: &str) -> Option<Vec<u8>> {
+    read_in_place(paths, name)
+        .ok()
+        .flatten()
+        .map(|value| value.as_slice().to_vec())
+}
+
+/// ONE ENTRY'S VALUE, READ IN PLACE FROM THIS MAC'S STORE: the verified envelope or log for a
+/// signed vault ([`read_verified_entry`]), or the person's own plain text file for a plain source,
+/// parsed where it lies. No file under `~/.secrets` or any other home path is read. `Ok(None)`
+/// where no vault is configured, this Mac is not in it, or the entry is absent. A writer holding
+/// the vault state is waited for up to [`READ_WAIT`].
+///
+/// # Errors
+/// The name is invalid, reserved, set apart or a Claude Code token (which only its typed read
+/// hands out), the vault state stayed busy past [`READ_WAIT`], or local state cannot be read.
+pub fn read_in_place(paths: &Paths, name: &str) -> crate::Result<Option<SecretBytes>> {
+    if crate::entry_class::claude_token(&name.to_ascii_lowercase())
+        || crate::reserved_name(name)
+        || !text::valid_entry_name(name)
+        || matches!(
+            crate::entry_class::of(name),
+            crate::entry_class::EntryClass::SetApart(_)
+        )
+    {
+        return Err(Error::new(
+            "invalid, reserved or set-apart secret entry name",
+        ));
+    }
+    let Some(expected) = config(paths)? else {
+        return Ok(None);
+    };
+    if expected.signer.is_some() {
+        return Ok(read_verified_entry_until(
+            paths,
+            &expected,
+            name,
+            Instant::now() + read_wait(),
+        )?
+        .map(|entry| entry.into_parts().0));
+    }
+    let Source::Path(path) = &expected.source else {
+        return Ok(None);
+    };
+    let state = load_state(paths)?;
+    if state.membership != Stored::Plain || !source_bound(&expected, &state) {
+        return Ok(None);
+    }
+    let entries = plain_entries(&expected, path)?;
+    if crate::entry_class::folded_pairs(entries.iter().map(|entry| entry.name.as_str()))
+        .contains_key(name)
+    {
+        return Ok(None);
+    }
+    Ok(entries
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.value))
+}
+
+/// How long [`read_in_place`] waits for a writer holding this Mac's vault state (a pass applying
+/// a version) before it says the store is busy.
+pub const READ_WAIT: Duration = Duration::from_secs(30);
+
+/// [`READ_WAIT`], or a test's own wait on this thread ([`with_current_wait`]).
+fn read_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = TEST_CURRENT_WAIT.with(std::cell::Cell::get) {
+        return wait;
+    }
+    READ_WAIT
+}
+
 fn plain_entries(config: &Config, path: &Path) -> crate::Result<Vec<Entry>> {
     let bytes = fsx::read_private(path, text::MAX_TEXT)?
         .ok_or_else(|| Error::new(format!("{}: no such file", path.display())))?;
@@ -4802,129 +4818,80 @@ fn keep_config_with(paths: &Paths, into: &Path, expected: ExpectedConfig<'_>) ->
     Ok(())
 }
 
-fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::Result<Report> {
-    let mut resumed = std::mem::take(&mut state.pending);
-    // A kept name whose entry this pass drops is the Mac's own from here: held back from the
-    // manifest (and from a cut pass's pending) this pass is handed, so it is not taken back.
-    let names: BTreeSet<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-    let released: Vec<String> = state
-        .kept
+/// The digest `[held]` records of `entry` ([`State::held`]): of its whole encoding, name, audience,
+/// value and policies ([`entry::fingerprint`]), so another value or policy is another digest.
+fn held_digest(entry: &Entry) -> String {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm/held-entry/1\0");
+    hash.update(entry::fingerprint(entry).as_slice());
+    hex(&hash.finalize())
+}
+
+/// Record `entries` as what this Mac now reads in place from its verified store: the applied
+/// selection, the names read by name with [`held_digest`] of each, and the older aterm's
+/// `[manifest]` and `own` pruned to the names whose entry still holds what that build wrote
+/// ([`State::legacy_manifest`]). It writes, moves and removes no file: the store is the only
+/// copy of a value this build keeps, and what an older build wrote under the home stays as it is.
+fn record_applied(state: &mut State, entries: &[Entry]) -> Report {
+    let folded = crate::entry_class::folded_pairs(entries.iter().map(|entry| entry.name.as_str()));
+    let refused: Vec<(String, String)> = entries
         .iter()
-        .filter(|name| !names.contains(name.as_str()))
-        .cloned()
+        .filter_map(|entry| {
+            let why = match folded.get(entry.name.as_str()) {
+                Some(other) => Some(format!(
+                    "{}, so neither is read",
+                    crate::entry_class::folded_pair_refusal(&entry.name, other)
+                )),
+                None => crate::entry_class::set_apart_refusal(&entry.name),
+            };
+            why.map(|why| (entry.name.clone(), why))
+        })
         .collect();
-    let mut held = state.manifest.clone();
-    for name in &released {
-        held.files.remove(name);
-        resumed.remove(name);
-    }
-    let mut pended = materialize::Pending::new();
-    let applied = materialize::apply_resuming(
-        &paths.home,
-        entries,
-        &held,
-        &resumed,
-        now(),
-        &mut |held, pending| {
-            pended.clone_from(pending);
-            if pending.is_empty() {
-                return Ok(());
-            }
-            let mut ahead = load_state(paths)?;
-            ahead.manifest = held.clone();
-            ahead.pending = pending.clone();
-            ahead.materialization_selection = None;
-            save_state(paths, &ahead)
-        },
-    );
-    match applied {
-        Ok((manifest, report)) => {
-            state.pending = landed(&paths.home, pended, &report.failed);
-            state.own = Some(own_entries(entries, &manifest, &report));
-            state.manifest = manifest;
-            state.materialization_selection = Some(materialization_selection::Meaning::of(entries));
-            state.kept.retain(|name| names.contains(name.as_str()));
-            Ok(report)
-        }
-        Err(error) => {
-            state.pending = resumed;
-            Err(error)
-        }
-    }
-}
-
-/// The digests a pass pended (`pended`) of the entries it `failed` whose file holds that value
-/// all the same: a write that failed after its rename (the directory's flush failing). Kept
-/// pending, the file counts as the vault's next pass, never adopted as this Mac's own. A failed
-/// write whose file does not hold it wrote nothing, so a file a person writes with that value
-/// later stays theirs.
-fn landed(
-    home: &Path,
-    mut pended: materialize::Pending,
-    failed: &[(String, String)],
-) -> materialize::Pending {
-    pended.retain(|name, digest| {
-        failed.iter().any(|(failed, _)| failed == name)
-            && materialize::holds_digest(home, name, digest)
-    });
-    pended
-}
-
-/// The entries an apply left this Mac's own that it would write once their file is gone
-/// ([`State::own`]): plain entries adopted, and ` if-absent` entries left whose anchors, all
-/// the way along, the vault wrote this pass (an anchor of this Mac's own, or one not looked
-/// at, leaves a gone file unfilled, so a file anchored to one is never named: it would be a
-/// gap no pass fills).
-fn own_entries(entries: &[Entry], manifest: &Manifest, report: &Report) -> BTreeSet<String> {
+    let held: BTreeMap<String, String> = entries
+        .iter()
+        .filter(|entry| {
+            !crate::reserved_name(&entry.name)
+                && crate::entry_class::of(&entry.name).read_by_name()
+                && !folded.contains_key(entry.name.as_str())
+        })
+        .map(|entry| (entry.name.clone(), held_digest(entry)))
+        .collect();
     let by_name: BTreeMap<&str, &Entry> = entries
         .iter()
         .map(|entry| (entry.name.as_str(), entry))
         .collect();
-    let vaults = |name: &str| {
-        manifest.files.contains_key(name) && !report.left.iter().any(|left| left == name)
+    state.legacy_manifest.retain(|name, digest| {
+        held.contains_key(name)
+            && by_name
+                .get(name.as_str())
+                .is_some_and(|entry| crate::digest_hex(entry.value.as_slice()) == *digest)
+    });
+    if let Some(own) = &mut state.legacy_own {
+        own.retain(|name| held.contains_key(name));
+    }
+    let meaning = materialization_selection::Meaning::of(entries);
+    let changed =
+        state.held.as_ref() != Some(&held) || state.materialization_selection != Some(meaning);
+    let report = Report {
+        held: held.keys().cloned().collect(),
+        refused,
+        changed,
     };
-    let anchored_to_vaults = |entry: &Entry| {
-        let mut seen = BTreeSet::new();
-        let mut anchor = entry.anchor.as_deref();
-        while let Some(name) = anchor {
-            if !seen.insert(name) || !vaults(name) {
-                return false;
-            }
-            anchor = by_name
-                .get(name)
-                .and_then(|anchored| anchored.anchor.as_deref());
-        }
-        true
-    };
-    entries
-        .iter()
-        .filter(|entry| !manifest.files.contains_key(&entry.name))
-        .filter(|entry| {
-            if entry.if_absent {
-                report.left.contains(&entry.name) && anchored_to_vaults(entry)
-            } else {
-                report.unchanged.contains(&entry.name)
-            }
-        })
-        .map(|entry| entry.name.clone())
-        .collect()
+    state.held = Some(held);
+    state.materialization_selection = Some(meaning);
+    state.failed = false;
+    report
 }
 
 fn names_of(report: &Report) -> Vec<String> {
-    let mut names: Vec<String> = report
-        .written
-        .iter()
-        .chain(report.unchanged.iter())
-        .cloned()
-        .collect();
-    names.sort();
-    names
+    report.held.clone()
 }
 
 fn floor(paths: &Paths, state: &State, name: &str, config: &Config) -> Option<Floor> {
     let pin = config.signer?;
     let cached = chain_cache::held(&paths.cache_file()).ok().flatten();
     let verified = |parsed: &chain_cache::Parsed| {
+        pass_counts::add(Count::FreshFloor);
         envelope::verify_for_reader(parsed.bytes(), name, &pin, &config.followed, None)
             .ok()
             .map(|(envelope, _, _)| envelope)
@@ -4962,72 +4929,26 @@ fn chain_keys(envelope: &Envelope) -> Vec<[u8; 32]> {
     envelope.handoff.iter().map(|(key, _)| *key).collect()
 }
 
-fn files_intact(paths: &Paths, state: &State) -> bool {
-    local_files_intact(paths, state) && materialization_selection_current(paths, state)
+fn applied_intact(paths: &Paths, state: &State) -> bool {
+    local_intact(paths, state) && materialization_selection_current(paths, state)
 }
 
-/// Physical ownership and cache checks, separate from the current selected meaning.
-fn local_files_intact(paths: &Paths, state: &State) -> bool {
+/// The apply finished and the store it reads in place is whole: the verified cache, or a Mac
+/// that holds its vault as a log alone, its trusted log. Apart from the current selected meaning.
+fn local_intact(paths: &Paths, state: &State) -> bool {
     !state.failed
-        && state.pending.is_empty()
         && (cache_intact(paths, state)
             || config(paths)
                 .ok()
                 .flatten()
                 .is_some_and(|config| log_only_intact(paths, &config, state)))
-        && unsettled(paths, state).is_empty()
 }
 
 fn materialization_selection_current(paths: &Paths, state: &State) -> bool {
-    state.materialization_selection.is_some_and(|applied| {
-        materialization_selection::current(paths, state)
-            .is_ok_and(|current| current.is_some_and(|current| current.meaning == applied))
-    })
-}
-
-/// The files a pass would write again at the version `state` holds: [`changed_files`] and
-/// [`gaps`].
-fn unsettled(paths: &Paths, state: &State) -> BTreeSet<String> {
-    let mut unsettled = changed_files(paths, state);
-    unsettled.extend(gaps(paths, state));
-    unsettled
-}
-
-/// The entries [`State::own`] names whose file is gone since, where a pass would write it
-/// ([`materialize::is_gap`], never a reserved name or an AI CLI's login, which have no file the
-/// vault writes): the vault fills a gap at the version it holds.
-fn gaps(paths: &Paths, state: &State) -> BTreeSet<String> {
-    state
-        .own
-        .iter()
-        .flatten()
-        .filter(|name| materialize::is_gap(&paths.home, name))
-        .cloned()
-        .collect()
-}
-
-/// The files `state`'s manifest names that are not as the vault wrote them (changed, missing or
-/// unreadable); one behind a link is left out, as the vault never writes through one, and so is
-/// a name set apart that a build that did not refuse it wrote (an AI CLI's login, a home path
-/// aterm does not name), the Mac's own file now ([`materialize::Report::refused`]).
-fn changed_files(paths: &Paths, state: &State) -> BTreeSet<String> {
-    state
-        .manifest
-        .files
-        .iter()
-        .filter(|(name, digest)| {
-            !materialize::behind_a_link(&paths.home, name)
-                && !matches!(
-                    crate::entry_class::of(name),
-                    crate::entry_class::EntryClass::SetApart(_)
-                )
-                && materialize::target_path(&paths.home, name)
-                    .ok()
-                    .and_then(|path| fsx::read_private(&path, text::MAX_VALUE).ok().flatten())
-                    .is_none_or(|bytes| materialize::digest_hex(bytes.as_slice()) != **digest)
-        })
-        .map(|(name, _)| name.clone())
-        .collect()
+    // No applied selection is never current: answered without a resolve of this Mac's entries.
+    state.materialization_selection.is_some()
+        && materialization_selection::current(paths, state)
+            .is_ok_and(|current| current.is_some_and(|current| current.applied))
 }
 
 fn cache_intact(paths: &Paths, state: &State) -> bool {
@@ -5126,25 +5047,6 @@ fn missing(config: &Config) -> Error {
         "the source holds no vault named {}; a Mac in the vault puts its copy back",
         config.name
     ))
-}
-
-/// Whether a pass left one of the vault's own entries unapplied ([`State::failed`], which
-/// keeps every read of the applied copy back). A reserved name's file an older build wrote whose
-/// removal failed is reported failed and kept in the manifest, so the next pass tries again, but
-/// every entry the vault holds is in place: it keeps no read back (the fleet code, the Commons
-/// control).
-fn apply_failed(report: &Report) -> bool {
-    report
-        .failed
-        .iter()
-        .any(|(name, _)| !crate::reserved_name(name))
-}
-
-const fn quiet(report: &Report) -> bool {
-    report.written.is_empty()
-        && report.removed.is_empty()
-        && report.moved_aside.is_empty()
-        && report.failed.is_empty()
 }
 
 /// The configured source, or why there is none to sync.
@@ -6118,6 +6020,8 @@ fn sync_records_until(
         // here, on this thread, where a test sets it ([`servers_within`]).
         let fetched = match bounded::budget(pulls_by, servers_within(PROBE_DEADLINE)) {
             Ok(within) => {
+                pass_counts::add(Count::RecordsFanouts);
+                pass_counts::add_n(Count::RecordsPeers, peers.len());
                 let ids = |url: &str| {
                     peer_named
                         .iter()
@@ -6156,8 +6060,9 @@ fn sync_records_until(
         // Where nothing waits, every peer is asked too, and beside the primary rather than after
         // it: a primary that does not answer must not spend a bounded pass's whole deadline
         // (readmit's freshness read) before any peer is asked.
+        let started = pass_counts::starting();
         std::thread::scope(|scope| {
-            let primary = scope.spawn(fetch_primary);
+            let primary = scope.spawn(|| started.run(fetch_primary));
             let peers = collect_peers();
             let peer_batches = fetch_peers(&peers);
             let primary = primary
@@ -6815,15 +6720,93 @@ fn subscriber_recipient(paths: &Paths) -> Option<String> {
         .map(|identity| identity.recipient().to_bech32())
 }
 
+/// The policy's servers as a pass reads them, held from its start to its end ([`PassScope`]): its
+/// records exchange and its envelope fetch each collect their peers, and each collect read the
+/// policy entry again, which resolved this Mac's entries again (ATERM-KI-1113-902). Read again
+/// where one of the files an entry read is judged by moved ([`vault_memo::entry_read_stamps`]), as
+/// the records the exchange took do. Nothing outlives the pass.
+type PassPolicies = Vec<(PathBuf, Config, vault_memo::InputStamps, Vec<String>)>;
+
+thread_local! {
+    static PASS_POLICIES: std::cell::RefCell<Option<PassPolicies>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A sync pass on this thread, from [`PassScope::enter`] to its drop: the outermost holds what its
+/// reads of the policy's servers found ([`PassPolicies`]) and lets it go at its end.
+struct PassScope {
+    outermost: bool,
+}
+
+impl PassScope {
+    fn enter() -> Self {
+        let outermost = PASS_POLICIES.with(|held| {
+            let mut held = held.borrow_mut();
+            let outermost = held.is_none();
+            if outermost {
+                *held = Some(Vec::new());
+            }
+            outermost
+        });
+        Self { outermost }
+    }
+}
+
+impl Drop for PassScope {
+    fn drop(&mut self) {
+        if self.outermost {
+            PASS_POLICIES.with(|held| held.borrow_mut().take());
+        }
+    }
+}
+
 fn policy_peer_urls(paths: &Paths, config: &Config) -> Vec<String> {
+    let in_pass = PASS_POLICIES.with(|held| held.borrow().is_some());
+    let Some(stamps) = in_pass
+        .then(|| vault_memo::entry_read_stamps(paths))
+        .flatten()
+    else {
+        return read_policy_peer_urls(paths, config).0;
+    };
+    let kept = PASS_POLICIES.with(|held| {
+        held.borrow().as_ref().and_then(|held| {
+            held.iter()
+                .find(|(dir, kept, at, _)| *dir == paths.dir && kept == config && *at == stamps)
+                .map(|(_, _, _, urls)| urls.clone())
+        })
+    });
+    if let Some(urls) = kept {
+        return urls;
+    }
+    let (urls, settled) = read_policy_peer_urls(paths, config);
+    // Kept only where the read saw no writer and returned an answer: a busy state or a failed
+    // read answers no servers, which the next read may not.
+    if settled && vault_memo::entry_read_stamps(paths).as_ref() == Some(&stamps) {
+        PASS_POLICIES.with(|held| {
+            if let Some(held) = held.borrow_mut().as_mut() {
+                held.retain(|(dir, _, _, _)| *dir != paths.dir);
+                held.push((paths.dir.clone(), config.clone(), stamps, urls.clone()));
+            }
+        });
+    }
+    urls
+}
+
+/// The policy's servers, and whether the read was settled: it observed the state with no writer
+/// holding it and authenticated the policy entry or its absence. An unsettled read answers none.
+fn read_policy_peer_urls(paths: &Paths, config: &Config) -> (Vec<String>, bool) {
     let mut out = Vec::new();
-    if let Ok(Some(entry)) = entry::read_reserved_entry(paths, config, crate::SWARM_POLICY_ENTRY)
+    let observed = entry::observe_reserved_entry(paths, config, crate::SWARM_POLICY_ENTRY);
+    let settled = matches!(observed, Ok(Some(_)));
+    if let Ok(Some(EntryObservation {
+        entry: Some(entry), ..
+    })) = observed
         && let Ok(text) = std::str::from_utf8(entry.value().as_slice())
         && let Ok(policy) = crate::swarm_roster::SwarmPolicy::from_toml(text)
     {
         ledger_publish::push_policy_server_urls(&policy, &config.name, |u| out.push(u.to_owned()));
     }
-    out
+    (out, settled)
 }
 
 /// A subscriber's discovery source and independent record/envelope selection cursors.
@@ -6861,6 +6844,7 @@ fn collect_sync_peer_urls(
     found: Option<Found<'_>>,
     purpose: PeerUse,
 ) -> Vec<String> {
+    let _peers = pass_counts::within(Phase::Peers);
     if let Some(selected) = found.and_then(|source| source.preselected(config, primary_url)) {
         return selected;
     }
@@ -6885,35 +6869,49 @@ struct SyncPeerHead {
 }
 
 /// The head of the vault the peer at `url` served in `fetched`, where it verifies under `pin`,
-/// with the network evidence `attempt` binds to its bytes.
+/// with the network evidence `attempt` binds to its bytes. A body that is exactly the held
+/// vault's bytes (`held`, its cache entry) is verified by that entry, which parsed them once
+/// ([`chain_cache::verify_as_held`]); any other body is parsed and verified whole.
 fn sync_peer_head(
     url: &str,
     fetched: Fetched,
     attempt: Option<network_observation::Attempt>,
     config: &Config,
     pin: &[u8; 32],
+    held: Option<&chain_cache::Parsed>,
 ) -> Option<SyncPeerHead> {
     let network_body = attempt.and_then(|attempt| attempt.received(&fetched));
     let Fetched::Body(body) = fetched else {
         return None;
     };
-    let (envelope, _, _) =
-        envelope::verify_for_reader(&body, &config.name, pin, &config.followed, None).ok()?;
-    let digest = envelope.digest();
+    let (seq, digest, parents) = chain_cache::verify_as_held(
+        held,
+        &body,
+        chain_cache::Reader {
+            name: &config.name,
+            pin,
+            followed: &config.followed,
+            floor: None,
+        },
+        (Count::MemoProbe, Count::FreshProbe),
+        |envelope, _| (envelope.seq, envelope.digest(), envelope.parents.clone()),
+    )
+    .ok()?;
     Some(SyncPeerHead {
         url: url.to_owned(),
-        seq: envelope.seq,
+        seq,
         digest,
-        parents: envelope.parents,
+        parents,
         envelope: body,
         network_body,
     })
 }
 
 /// The verified heads every one of `urls` serves `subscriber`, read at once within `total`
-/// ([`fan_out::envelopes_within`]), each read's lookup and connect within
+/// (as [`fan_out::envelopes_within`] reads them), each read's lookup and connect within
 /// [`transport::PROBE_CONNECT`]: in `urls`' order, without the peers that served none in time or
-/// served one that does not verify. A mirror of `read_only`'s is not told the subscriber.
+/// served one that does not verify. A mirror of `read_only`'s is not told the subscriber. A
+/// subscriber's pass counts what each peer answered ([`pass_counts`]).
 fn probe_peers_for_sync(
     paths: &Paths,
     urls: &[String],
@@ -6927,17 +6925,41 @@ fn probe_peers_for_sync(
         return Vec::new();
     }
     let attempt = network_observation::Attempt::start(paths, config, VaultNetworkSource::PeerUrl);
-    fan_out::envelopes_within(
+    // The held vault's entry, looked up once for the whole fan-out: at rest every peer serves
+    // these very bytes, which the entry parsed once.
+    let held = chain_cache::held(&paths.cache_file()).ok().flatten();
+    let held = held.as_deref();
+    pass_counts::add(Count::Probes);
+    pass_counts::add_n(Count::ProbePeers, urls.len());
+    fan_out::reads_within(
+        fan_out::ENVELOPES,
         urls,
         total,
         |url, left, limit| {
             let connect = Some(transport::PROBE_CONNECT.min(left));
             let subscriber = read_only.subscriber_for(url, subscriber);
+            // The fan-out asks a peer a second time, for its whole answer, only where the
+            // first read found it longer than the peek.
+            if limit > fan_out::ENVELOPES.peek {
+                pass_counts::add(Count::ProbeWholeReads);
+            }
             transport::get_within_as(url, left, connect, subscriber, limit)
         },
-        |url, fetched| sync_peer_head(url, fetched, attempt, config, pin),
+        |url, read| {
+            pass_counts::add(peer_answer(&read));
+            match read {
+                Ok(transport::Pulled::Fetched(fetched)) => {
+                    if let Fetched::Body(body) = &fetched {
+                        pass_counts::add_n(Count::ProbeBytes, body.len());
+                    }
+                    sync_peer_head(url, fetched, attempt, config, pin, held)
+                }
+                Ok(transport::Pulled::Larger) | Err(_) => None,
+            }
+        },
     )
     .into_iter()
+    .flatten()
     .flatten()
     .collect()
 }
@@ -7026,7 +7048,7 @@ fn peer_subsumes_held(
     })
 }
 
-/// [`sync`], where a subscriber's pass of a vault at a path writes the files of a version it
+/// [`sync`], where a subscriber's pass of a vault at a path records the entries of a version it
 /// holds again only as [`put_back_due`] rules, by `repaired`.
 fn sync_repairing(
     paths: &Paths,
@@ -7041,6 +7063,39 @@ thread_local! {
     /// The negative control of the vault pass's reach: while set, only a member whose vault is at
     /// a URL runs it, as before the exchange stopped signing.
     pub(crate) static URL_ONLY_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Which count a source's answer to a pass's request is ([`answer_count`]), or a failure.
+fn source_answer(observed: &crate::Result<transport::ObservedFetch>) -> Count {
+    match observed {
+        Ok(observed) => answer_count(&observed.fetched, observed.http204.is_some()),
+        Err(_) => Count::PrimaryError,
+    }
+}
+
+/// Which count what a source answered is: a body, a 404, a 204 that named its seq, a 204 that
+/// named none (`replied_204`: a 204 reply was received), or a request the source held to its
+/// deadline and answered nothing (no news and no 204 reply; a 204 whose time of arrival could
+/// not be read counts here too).
+const fn answer_count(fetched: &Fetched, replied_204: bool) -> Count {
+    match (fetched, replied_204) {
+        (Fetched::Body(_), _) => Count::PrimaryBody,
+        (Fetched::Missing, _) => Count::PrimaryMissing,
+        (Fetched::NoNewer(Some(_)), _) => Count::PrimarySeq204,
+        (Fetched::NoNewer(None), true) => Count::PrimaryBare204,
+        (Fetched::NoNewer(None), false) => Count::PrimaryHeldOut,
+    }
+}
+
+/// Which count a probed peer's answer is: a body, a 204, a 404, or nothing that was read whole
+/// in time (no answer, a failure, a body longer than any envelope).
+const fn peer_answer(read: &crate::Result<transport::Pulled>) -> Count {
+    match read {
+        Ok(transport::Pulled::Fetched(Fetched::Body(_))) => Count::ProbeBodies,
+        Ok(transport::Pulled::Fetched(Fetched::NoNewer(_))) => Count::ProbeNoNewer,
+        Ok(transport::Pulled::Fetched(Fetched::Missing)) => Count::ProbeMissing,
+        Ok(transport::Pulled::Larger) | Err(_) => Count::ProbeUnanswered,
+    }
 }
 
 /// [`sync`] with `extra_peers` as its candidates, mirroring diverged servers where
@@ -7058,20 +7113,18 @@ fn sync_repairing_inner(
     subscribing: Option<(Found<'_>, &std::cell::Cell<SourceSaid>)>,
     posts_by: Option<Instant>,
 ) -> crate::Result<SyncOutcome> {
+    let _pass = PassScope::enter();
     let mut config = configured(paths)?;
     let mut before = load_state(paths)?;
     let browsed = subscribing.map(|(found, _)| found);
     let selected = (before.membership == Stored::In
         && !before.failed
-        && before.pending.is_empty()
         && (source_bound(&config, &before) || log_only_source_bound(&config, &before)))
     .then(|| materialization_selection::current(paths, &before));
     let selection_due = selected.as_ref().is_some_and(|selected| {
-        !selected.as_ref().is_ok_and(|current| {
-            current
-                .as_ref()
-                .is_some_and(|current| Some(current.meaning) == before.materialization_selection)
-        })
+        !selected
+            .as_ref()
+            .is_ok_and(|current| current.as_ref().is_some_and(|current| current.applied))
     });
     // A missing or unreadable cached selection needs incoming records/bytes, not an
     // unconditional local apply error before the network has its chance to heal it. Once
@@ -7100,6 +7153,7 @@ fn sync_repairing_inner(
         before = load_state(paths)?;
     }
     if matches!(config.source, Source::Url(_)) {
+        let _records = pass_counts::within(Phase::Records);
         let _ = sync_records_inner(paths, None, extra_peers, browsed, posts_by);
     }
     // Every log member's vault pass, a vault at a path included: its records come from Commons
@@ -7109,6 +7163,7 @@ fn sync_repairing_inner(
     #[cfg(not(test))]
     let pass = true;
     if pass {
+        let _removal = pass_counts::within(Phase::Removal);
         remove::vault_pass(paths, posts_by);
     }
     let pending_records = log_entries::current_records_digest(paths, &config, &before)
@@ -7128,20 +7183,24 @@ fn sync_repairing_inner(
         let http204_request =
             http204_observation::Request::start(paths, &config, after, subscriber.as_deref());
         let asked = Instant::now();
-        let observed = match (&config.source, wait) {
-            (Source::Url(_), Some(wait)) if !pending_records => transport::fetch_as_observed(
-                &config.source,
-                after,
-                wait.saturating_add(Duration::from_secs(10)),
-                subscriber.as_deref(),
-            ),
-            _ => transport::fetch_as_observed(
-                &config.source,
-                None,
-                Duration::from_secs(30),
-                subscriber.as_deref(),
-            ),
+        let observed = {
+            let _primary = pass_counts::within(Phase::Primary);
+            match (&config.source, wait) {
+                (Source::Url(_), Some(wait)) if !pending_records => transport::fetch_as_observed(
+                    &config.source,
+                    after,
+                    wait.saturating_add(Duration::from_secs(10)),
+                    subscriber.as_deref(),
+                ),
+                _ => transport::fetch_as_observed(
+                    &config.source,
+                    None,
+                    Duration::from_secs(30),
+                    subscriber.as_deref(),
+                ),
+            }
         };
+        pass_counts::add(source_answer(&observed));
         refresh.observed(&observed);
         let http204 = observed.as_ref().ok().and_then(|observed| observed.http204);
         let mut primary_result = observed.map(|observed| observed.fetched);
@@ -7156,6 +7215,7 @@ fn sync_repairing_inner(
             http204_observation::retain(paths, &config, request, http204.as_ref());
         }
         if waited_on_primary && matches!(primary_result, Ok(Fetched::Body(_))) {
+            let _records = pass_counts::within(Phase::Records);
             let _ = sync_records_inner(paths, None, extra_peers, browsed, posts_by);
         }
         // The source's body is news only as far as it verifies under the pin (the servers found are
@@ -7163,6 +7223,7 @@ fn sync_repairing_inner(
         // LAN can answer at the source's name or address) must not keep the servers found unread.
         let primary_advanced = match (&primary_result, config.signer.as_ref()) {
             (Ok(Fetched::Body(bytes)), Some(pin)) => {
+                pass_counts::add(Count::FreshPrimary);
                 envelope::verify_for_reader(bytes, &config.name, pin, &config.followed, None)
                     .is_ok_and(|(envelope, pinned, _)| {
                         peer_selection::primary_advances(&before, &envelope, pinned)
@@ -7192,25 +7253,30 @@ fn sync_repairing_inner(
         let read_only =
             || read_only.get_or_init(|| mirrors::ReadOnly::of(paths, &config, extra_peers));
         let mut max_peer_seq: Option<u64> = None;
-        let is_local_admin = allow_mirror
-            && admin_text_here(paths, &config, &before)
+        let is_local_admin = allow_mirror && {
+            let _admin = pass_counts::within(Phase::Admin);
+            admin_text_here(paths, &config, &before)
                 .ok()
                 .flatten()
-                .is_some();
+                .is_some()
+        };
         if let (Source::Url(primary_url), Some(pin)) = (&config.source, config.signer.as_ref())
             && (!primary_advanced || (is_local_admin && wait.is_none()))
         {
             let peers = peer_urls();
             if !peers.is_empty() {
-                let found = probe_peers_for_sync(
-                    paths,
-                    peers,
-                    &config,
-                    pin,
-                    servers_within(PROBE_DEADLINE),
-                    subscriber.as_deref(),
-                    read_only(),
-                );
+                let found = {
+                    let _probe = pass_counts::within(Phase::Probe);
+                    probe_peers_for_sync(
+                        paths,
+                        peers,
+                        &config,
+                        pin,
+                        servers_within(PROBE_DEADLINE),
+                        subscriber.as_deref(),
+                        read_only(),
+                    )
+                };
                 max_peer_seq = found.iter().map(|p| p.seq).max();
                 if is_local_admin && !found.is_empty() {
                     // A mirror takes no admin publish, so its head is none an admin's heal can
@@ -7222,6 +7288,7 @@ fn sync_repairing_inner(
                         .collect();
                     match &primary_result {
                         Ok(Fetched::Body(bytes)) => {
+                            pass_counts::add(Count::FreshPrimary);
                             if let Ok((env, _, _)) = envelope::verify_for_reader(
                                 bytes,
                                 &config.name,
@@ -7255,15 +7322,19 @@ fn sync_repairing_inner(
                         }
                     }
                 }
-                if let Some(peer) = peer_selection::select(
-                    paths,
-                    &config,
-                    &before,
-                    &primary_result,
-                    found,
-                    true,
-                    None,
-                )? {
+                let selected = {
+                    let _select = pass_counts::within(Phase::Select);
+                    peer_selection::select(
+                        paths,
+                        &config,
+                        &before,
+                        &primary_result,
+                        found,
+                        true,
+                        None,
+                    )
+                };
+                if let Some(peer) = selected? {
                     network_body = peer.network_body;
                     primary_result = Ok(Fetched::Body(peer.envelope));
                 }
@@ -7340,18 +7411,22 @@ fn sync_repairing_inner(
         if network_body.is_some() {
             refresh.peer_response();
         }
-        match apply_response_until(
-            paths,
-            config.clone(),
-            before,
-            primary_result.map(|fetched| network_observation::Received {
-                fetched,
-                body: network_body,
-            }),
-            repaired.as_deref_mut(),
-            None,
-            wait.is_none(),
-        ) {
+        let applied = {
+            let _apply = pass_counts::within(Phase::Apply);
+            apply_response_until(
+                paths,
+                config.clone(),
+                before,
+                primary_result.map(|fetched| network_observation::Received {
+                    fetched,
+                    body: network_body,
+                }),
+                repaired.as_deref_mut(),
+                None,
+                wait.is_none(),
+            )
+        };
+        match applied {
             Ok(outcome) => Ok(outcome),
             Err(err)
                 if err.kind() == crate::ErrorKind::NotStored
@@ -7382,6 +7457,7 @@ fn sync_repairing_inner(
                     }
                 }
                 let verified_peer_seq = max_peer_seq.or_else(|| {
+                    let _probe = pass_counts::within(Phase::Probe);
                     probe_peers_for_sync(
                         paths,
                         peers,
@@ -7517,9 +7593,8 @@ fn long_poll_after(config: &Config, before: &State) -> Option<u64> {
     (before.membership != Stored::None
         && !pin_gives_way(config)
         && source_bound(config, before)
-        && (!matches!(before.membership, Stored::In | Stored::Plain)
-            || (!before.failed && before.pending.is_empty())))
-    .then_some(before.seq)
+        && (!matches!(before.membership, Stored::In | Stored::Plain) || !before.failed))
+        .then_some(before.seq)
 }
 
 /// Apply a test's supplied response through the ordinary sync admission and locked readback.
@@ -7540,7 +7615,7 @@ fn apply_fetched(
 }
 
 /// [`apply_fetched`], where a subscriber's pass of a vault at a path holds `repaired` to rule on
-/// writing the files of a version it holds again ([`put_back_due`]).
+/// recording the entries of a version it holds again ([`put_back_due`]).
 fn apply_fetched_repairing(
     paths: &Paths,
     config: Config,
@@ -7634,6 +7709,7 @@ fn apply_until_admitted(
     }
     let requested_config = config.clone();
     let mut state = load_state(paths)?;
+    let log_progress = peer_selection::LogProgress::default();
     let at_applied_heads = matches!(&input, ApplyInput::CachedAtAppliedHeads);
     if at_applied_heads {
         let version = |state: &State| {
@@ -7648,7 +7724,6 @@ fn apply_until_admitted(
         if version(&state) != version(&before)
             || state.membership != Stored::In
             || state.failed
-            || !state.pending.is_empty()
             || !materialization_selection::current(paths, &state)
                 .ok()
                 .flatten()
@@ -7687,7 +7762,7 @@ fn apply_until_admitted(
                 None,
                 &mut None,
             )
-            .or_else(|| peer_selection::cached_log_progress(paths, &config, &state, &mut None)) else {
+            .or_else(|| log_progress.of(paths, &config, &state, &mut None)) else {
                 return Ok(SyncOutcome::Unchanged { seq: state.seq });
             };
             Fetched::Body(copy).into()
@@ -7706,9 +7781,7 @@ fn apply_until_admitted(
                 &mut None,
             ) {
                 Fetched::Body(copy).into()
-            } else if let Some(copy) =
-                peer_selection::cached_log_progress(paths, &config, &state, &mut None)
-            {
+            } else if let Some(copy) = log_progress.of(paths, &config, &state, &mut None) {
                 Fetched::Body(copy).into()
             } else {
                 return Err(error);
@@ -7719,7 +7792,7 @@ fn apply_until_admitted(
         Fetched::Missing | Fetched::NoNewer(_) => true,
         Fetched::Body(bytes) => envelope::parse(bytes)
             .is_ok_and(|body| body.name == config.name && body.seq < state.seq),
-    } && let Some(copy) = peer_selection::cached_log_progress(paths, &config, &state, &mut body)
+    } && let Some(copy) = log_progress.of(paths, &config, &state, &mut body)
     {
         // Local record progress must not depend on repairing an unavailable or older
         // envelope server. The normal verifier below still checks the cached head and log.
@@ -7769,9 +7842,7 @@ fn apply_until_admitted(
                 &mut body,
             ) {
                 copy
-            } else if let Some(copy) =
-                peer_selection::cached_log_progress(paths, &config, &state, &mut body)
-            {
+            } else if let Some(copy) = log_progress.of(paths, &config, &state, &mut body) {
                 // A log admission can activate a pending reader. Reading that
                 // progress does not require permission to publish this body.
                 body = None;
@@ -7841,9 +7912,7 @@ fn apply_until_admitted(
             &mut body,
         ) {
             bytes = copy;
-        } else if let Some(copy) =
-            peer_selection::cached_log_progress(paths, &config, &state, &mut body)
-        {
+        } else if let Some(copy) = log_progress.of(paths, &config, &state, &mut body) {
             bytes = copy;
             body = None;
         } else {
@@ -7860,8 +7929,7 @@ fn apply_until_admitted(
             ));
         }
         let entries = plain_entries(&config, path)?;
-        // The text is the version: the same text with the same files not as written is
-        // put back once, not every minute.
+        // The text is the version: a subscriber records the same text once, not every minute.
         let version = (
             sha256(&[source_identity(&config).as_slice(), bytes.as_slice()].concat()),
             0,
@@ -7869,27 +7937,24 @@ fn apply_until_admitted(
         let settled = state.membership == Stored::Plain
             && source_bound(&config, &state)
             && !state.failed
-            && state.pending.is_empty()
-            && state.own.is_some()
+            && state.held.is_some()
             && state.materialization_selection
                 == Some(materialization_selection::Meaning::of(&entries));
-        if settled
-            && repaired.is_some_and(|repaired| !put_back_due(paths, &state, version, repaired))
-        {
+        if settled && repaired.is_some_and(|repaired| !put_back_due(version, repaired)) {
             state.heard = heard_now(state.heard);
             current()?;
             save_state(paths, &state)?;
             return Ok(SyncOutcome::Unchanged { seq: 0 });
         }
         current()?;
-        let report = apply_entries(paths, &mut state, &entries)?;
+        let changed = state.membership != Stored::Plain || !source_bound(&config, &state);
+        let report = record_applied(&mut state, &entries);
         state.membership = Stored::Plain;
-        state.failed = apply_failed(&report);
-        state.source_identity = (!state.failed).then(|| source_identity(&config));
+        state.source_identity = Some(source_identity(&config));
         state.heard = heard_now(state.heard);
         current()?;
         save_state(paths, &state)?;
-        if quiet(&report) {
+        if !changed && !report.changed {
             return Ok(SyncOutcome::Unchanged { seq: 0 });
         }
         return Ok(SyncOutcome::Applied { seq: 0, report });
@@ -8003,20 +8068,8 @@ fn apply_until_admitted(
         && state.records_digest == current_records_digest
         && state.membership == Stored::In
         && source_bound(&config, &state)
-        && state.own.is_some()
-        && (files_intact(paths, &state)
-            || (!state.failed
-                && state.pending.is_empty()
-                && cache_intact(paths, &state)
-                && materialization_selection_current(paths, &state)
-                && repaired.is_some_and(|repaired| {
-                    !put_back_due(
-                        paths,
-                        &state,
-                        (source_identity(&config), state.seq),
-                        repaired,
-                    )
-                })))
+        && state.held.is_some()
+        && applied_intact(paths, &state)
     {
         current()?;
         network_observation::record(
@@ -8132,7 +8185,7 @@ fn apply_until_admitted(
         return Ok(SyncOutcome::NotIn);
     };
     current()?;
-    let report = apply_entries(paths, &mut state, &entries)?;
+    let report = record_applied(&mut state, &entries);
     if state.membership != Stored::In
         || (handover::holds_allowed(paths) && log_entries::addressed_to(&envelope, &identity)?)
     {
@@ -8142,7 +8195,6 @@ fn apply_until_admitted(
         handover::forget_allowed(paths);
     }
     state.membership = Stored::In;
-    state.failed = apply_failed(&report);
     state.source_identity = Some(source_identity(&config));
     current()?;
     network_observation::record(
@@ -8175,11 +8227,11 @@ fn apply_configured_log(
     if state.records_digest == Some(digest)
         && state.membership == Stored::In
         && log_only_source_bound(config, state)
-        && state.own.is_some()
+        && state.held.is_some()
         && opened.as_ref().is_some_and(|entries| {
             state.materialization_selection == Some(materialization_selection::Meaning::of(entries))
         })
-        && local_files_intact(paths, state)
+        && local_intact(paths, state)
     {
         save_state(paths, state)?;
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
@@ -8194,9 +8246,8 @@ fn apply_configured_log(
         save_state(paths, state)?;
         return Ok(SyncOutcome::NotIn);
     };
-    let report = apply_entries(paths, state, &entries)?;
+    let report = record_applied(state, &entries);
     state.membership = Stored::In;
-    state.failed = apply_failed(&report);
     state.source_identity = Some(source_identity(config));
     save_state(paths, state)?;
     let _ = mailbox_index::record_applied(paths, config, state, &entries);
@@ -8207,6 +8258,10 @@ fn apply_configured_log(
 }
 
 /// Long-poll the source to apply new versions and run the admin approver loop.
+///
+/// The subscriber counts its passes and says them in `log` as its 1st, 2nd, 4th ... 256th pass
+/// ends and then as each 256th does ([`crate::pass_counts`]): on a running Mac,
+/// `grep 'pass counts' ~/.config/aterm/secrets/systems.alab.aterm-secrets.log`.
 pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     beside_the_approver(
         |stop| approver_loop(paths, log, stop),
@@ -8471,8 +8526,8 @@ fn pause_after(
 ) -> Duration {
     let pause = match (source, outcome) {
         (Source::Path(_), _) => Duration::from_secs(60),
-        (_, SyncOutcome::Applied { report, .. }) if report.failed.is_empty() => Duration::ZERO,
-        (_, SyncOutcome::Applied { .. } | SyncOutcome::PutBack { served: None, .. }) => {
+        (_, SyncOutcome::Applied { .. }) => Duration::ZERO,
+        (_, SyncOutcome::PutBack { served: None, .. }) => {
             let pause = *failing;
             *failing = failing.saturating_mul(2).min(LONGEST_RETRY);
             return pause;
@@ -8485,8 +8540,8 @@ fn pause_after(
     pause
 }
 
-/// The entries a pass refused, named after its counts ([`materialize::Report::refused`]); empty
-/// where it refused none.
+/// The entries a pass refused, named after its count ([`Report::refused`]); empty where it
+/// refused none.
 fn refused_words(report: &Report) -> String {
     if report.refused.is_empty() {
         return String::new();
@@ -8497,7 +8552,7 @@ fn refused_words(report: &Report) -> String {
         .map(|(name, _)| name.as_str())
         .collect();
     format!(
-        "; not written, as no Mac writes these names as files (an AI CLI's login, a home path aterm does not name, another spelling of a held or consumed name, or two spellings of one file): {}",
+        "; not read, as no Mac reads an entry by these names (an AI CLI's login, a home path aterm does not name, another spelling of a held or consumed name, or two spellings of one name): {}",
         names.join(", ")
     )
 }
@@ -8510,16 +8565,14 @@ fn pass_line(
 ) -> Option<String> {
     let (line, again) = match outcome {
         SyncOutcome::Applied { seq, report } => (
+            // `, 0 failed` stays for the harness's reader of this line (aterm-agent's
+            // `sign_in_ladder`): an apply writes no file, so none fails.
             Some(format!(
-                "applied seq {seq}: {} written, {} unchanged, {} removed, {} moved aside, {} failed{}",
-                report.written.len(),
-                report.unchanged.len(),
-                report.removed.len(),
-                report.moved_aside.len(),
-                report.failed.len(),
+                "applied seq {seq}: {} read in place, 0 failed{}",
+                report.held.len(),
                 refused_words(report)
             )),
-            !report.failed.is_empty(),
+            false,
         ),
         SyncOutcome::Unchanged { .. } => (None, false),
         SyncOutcome::PutBack {
@@ -8556,8 +8609,8 @@ fn pass_line(
 }
 
 /// The last repair a subscriber made: of which version (source and seq, or for a plain file at a
-/// path the digest of its source and text, and 0), and the files that were not as written then.
-type Repaired = Option<(([u8; 32], u64), BTreeSet<String>)>;
+/// path the digest of its source and text, and 0).
+type Repaired = Option<([u8; 32], u64)>;
 
 /// Re-acknowledge the raw, verified membership log when the applied digest alone prevents any
 /// read. The explicit repair retains the prior state before changing only that digest, and never
@@ -8591,11 +8644,11 @@ pub(crate) fn repair_legacy_frontier(paths: &Paths, deadline: Instant) -> crate:
     Ok(true)
 }
 
-/// Whether this pass repairs the files a version wrote, rather than long-polling: when they are
-/// not as written, or one an entry left this Mac's own is gone ([`unsettled`]), once per
-/// version and set of such files. Another file changed since (or one put back that changed
-/// again with another) is repaired again; the same set is not, so a file a program on this Mac
-/// keeps rewriting is put back once, not every pass.
+/// Whether this pass applies the version it holds again, rather than long-polling: when its cache
+/// is not whole or the selection it applied is not the current one, or when no apply of this
+/// build recorded what it reads ([`State::held`], a state an older aterm wrote), once per version.
+/// The same version is not applied again for the same reason, so a pass that cannot heal it
+/// does not loop.
 fn repair_due(paths: &Paths, repaired: &mut Repaired) -> bool {
     let Ok(state) = load_state(paths) else {
         return false;
@@ -8603,45 +8656,28 @@ fn repair_due(paths: &Paths, repaired: &mut Repaired) -> bool {
     let Some(source) = state.source_identity else {
         return false;
     };
-    if state.membership != Stored::In || state.failed || !state.pending.is_empty() {
+    if state.membership != Stored::In || state.failed {
         return false;
     }
     let version = (source, state.seq);
     if !cache_intact(paths, &state) || !materialization_selection_current(paths, &state) {
-        *repaired = Some((version, BTreeSet::new()));
+        *repaired = Some(version);
         return true;
     }
-    // A state with no record of the entries this Mac holds as its own is applied once to
-    // write one, as the files are then not known to be settled.
-    let changed = unsettled(paths, &state);
-    let due = (!changed.is_empty() || state.own.is_none())
-        && repaired
-            .as_ref()
-            .is_none_or(|(last, files)| *last != version || *files != changed);
+    let due = state.held.is_none() && *repaired != Some(version);
     if due {
-        *repaired = Some((version, changed));
+        *repaired = Some(version);
     }
     due
 }
 
 /// Whether a subscriber's pass of a vault at a path, which reads it every minute in place of a
-/// long-poll, writes the files of `version` (its source and seq, or a plain file's text) again:
-/// the first time it meets that version, then as [`repair_due`] rules for a URL, once per set of
-/// files not as written ([`unsettled`]), so a file a program on this Mac keeps rewriting is put
-/// back once, not every minute.
-fn put_back_due(
-    paths: &Paths,
-    state: &State,
-    version: ([u8; 32], u64),
-    repaired: &mut Repaired,
-) -> bool {
-    let changed = unsettled(paths, state);
-    let due = match repaired.as_ref() {
-        Some((last, files)) if *last == version => !changed.is_empty() && *files != changed,
-        _ => true,
-    };
+/// long-poll, records the entries of `version` (its source and seq, or a plain file's text)
+/// again: the first time it meets that version, never again for it.
+fn put_back_due(version: ([u8; 32], u64), repaired: &mut Repaired) -> bool {
+    let due = *repaired != Some(version);
     if due {
-        *repaired = Some((version, changed));
+        *repaired = Some(version);
     }
     due
 }
@@ -9240,6 +9276,10 @@ fn subscriber_loop_projecting(
         return Ok(());
     }
     let mut notary = release::NotaryRounds::default();
+    // What this loop counts of its passes, and its thread's time by phase, said in `log` as
+    // passes end ([`pass_counts`]).
+    let counts = std::sync::Arc::new(pass_counts::PassCounts::default());
+    let _metered = pass_counts::metered(&counts);
     // `[swarm] enabled = false` holds every round: no ask, long-poll, apply or converge pass
     // until it is on again, looked at each [`SWARM_LOOK`] at the cost of one `stat`.
     if projection.allowed() {
@@ -9248,6 +9288,7 @@ fn subscriber_loop_projecting(
         projection.failed();
     }
     loop {
+        pass_counts::enter(Phase::Before);
         if stop() {
             return Ok(());
         }
@@ -9267,6 +9308,7 @@ fn subscriber_loop_projecting(
         if !projection.allowed() {
             projection.failed();
             (hearing.hold)();
+            pass_counts::enter(Phase::Pause);
             std::thread::sleep(SWARM_LOOK);
             continue;
         }
@@ -9300,7 +9342,12 @@ fn subscriber_loop_projecting(
         let routes = crate::server::route_sources();
         let started = Instant::now();
         let said = std::cell::Cell::new(SourceSaid::AtOnce);
-        match subscriber_pass_saying(paths, &mut repaired, hearing.found, &said) {
+        let passed = subscriber_pass_saying(paths, &mut repaired, hearing.found, &said);
+        pass_counts::enter(Phase::After);
+        for line in counts.pass_ended().into_iter().flatten() {
+            log(&line);
+        }
+        match passed {
             Ok((config, outcome)) => {
                 let _ = crate::service_health::after_round(paths);
                 let after = progress();
@@ -9336,6 +9383,7 @@ fn subscriber_loop_projecting(
                     return Ok(());
                 }
                 let pause = pause_after(&config.source, &outcome, &mut failing, pass);
+                pass_counts::enter(Phase::Pause);
                 if failed_over_idle(pass) {
                     // The source is away and the servers found hold nothing newer: asked
                     // again as after an error, never in a loop.
@@ -9360,6 +9408,7 @@ fn subscriber_loop_projecting(
                 if stop() {
                     return Ok(());
                 }
+                pass_counts::enter(Phase::Pause);
                 let moved = nap_after_failing(hearing, routes, listener.limit(backoff), log);
                 backoff = retry_after(backoff, moved, (hearing.away)());
             }
@@ -9472,6 +9521,8 @@ fn subscriber_pass_saying(
     found: Found<'_>,
     said: &std::cell::Cell<SourceSaid>,
 ) -> crate::Result<(Config, SyncOutcome)> {
+    let _pass = pass_counts::within(Phase::Rest);
+    pass_counts::add(Count::Passes);
     creation::resume(paths)?;
     alab_join::resume(paths)?;
     let config = config(paths)?
@@ -9607,8 +9658,9 @@ fn admin_text_here(
     };
     let cached = chain_cache::held(&paths.cache_file())?
         .ok_or_else(|| Error::new("no cached vault to check approval"))?;
-    let (envelope, _, _) =
-        envelope::verify_for_reader(cached.bytes(), &config.name, &pin, &config.followed, None)?;
+    // The entry verifies the bytes it was parsed from: they are not parsed again.
+    pass_counts::add(Count::MemoAdmin);
+    let (envelope, _, _) = cached.verify_for_reader(&config.name, &pin, &config.followed, None)?;
     if envelope.seq != state.seq || Some(envelope.digest()) != state.digest {
         return Err(Error::new("the cached vault is not the recorded version"));
     }
@@ -9625,7 +9677,7 @@ fn admin_text_here(
     };
     let opened = parse_admin(&plain)?;
     opened.admissions.validate(&opened.doc, envelope.seq)?;
-    if admin_removed_in_log(paths, config, &envelope, &identity, &opened.doc) {
+    if admin_removed_in_log(paths, config, envelope, &identity, &opened.doc) {
         return Ok(None);
     }
     Ok(Some(opened))

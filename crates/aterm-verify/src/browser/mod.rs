@@ -3,10 +3,9 @@
 
 //! `verify browser`: both web modules in real headless browsers.
 //!
-//! The modules are `verify wasm-smoke`'s dev build ([`crate::wasm_smoke::
-//! build_dev`], a STOCK EXCEPTION: Trust has no wasm32 std), bound for a page
-//! by `verify glue`. [`mod@page`] runs the wasm lanes' drivers in the same
-//! Chromium.
+//! The modules are a dev build for wasm32 ([`build_dev`], a STOCK EXCEPTION:
+//! Trust has no wasm32 std), bound for a page by `verify glue`. [`mod@page`]
+//! runs the wasm lanes' drivers in the same Chromium.
 pub(crate) mod cdp;
 pub(crate) mod chromium;
 pub(crate) mod firefox;
@@ -392,7 +391,7 @@ fn build_site(ctx: &Ctx, r: &mut Report, site: &Path, t0: Instant) -> Option<Cos
             return None;
         }
     };
-    let modules = crate::wasm_smoke::build_dev(ctx, r, &toolchain, "browser", LABEL)?;
+    let modules = build_dev(ctx, r, &toolchain)?;
     let built_s = t0.elapsed().as_secs_f64();
     let t_bind = Instant::now();
     if let Err(why) = assemble(&ctx.root, &modules, site) {
@@ -537,6 +536,59 @@ const SITE_FILES: [&str; 10] = [
     "gpu",
     recorded::IN_SITE,
 ];
+
+/// Both web modules built in the DEV profile for wasm32 on the stock pin `toolchain`, into the
+/// cells lane's `web-dev` directory: the directory the `.wasm` files land in, or `None` once a
+/// refusal is recorded on `r`.
+fn build_dev(ctx: &Ctx, r: &mut Report, toolchain: &crate::rustup::Toolchain) -> Option<PathBuf> {
+    let target_dir = crate::plan::cells_dir(ctx).join("web-dev");
+    let cwd = ctx.scratch.join("browser");
+    if let Err(e) = std::fs::create_dir_all(&cwd) {
+        r.cannot_run(format!("{LABEL} — could not create {}: {e}", cwd.display()));
+        return None;
+    }
+    let mut build = crate::exec::Cmd::new(&toolchain.cargo)
+        .env("RUSTC", &toolchain.rustc)
+        .env("RUSTUP_TOOLCHAIN", &toolchain.name)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .args([
+            "build",
+            "--locked",
+            "--profile",
+            "dev",
+            "--target",
+            "wasm32-unknown-unknown",
+            "-p",
+            "aterm-wasm",
+            "-p",
+            "aterm-gpu-web",
+            "--manifest-path",
+        ])
+        .arg(ctx.root.join("Cargo.toml"))
+        .demoted();
+    build.cwd = Some(cwd);
+    if let Some(jobs) =
+        crate::stages::lane_jobs(crate::plan::Lane::CellsTarget, ctx.build_jobs_ceiling())
+    {
+        build = build.env("CARGO_BUILD_JOBS", jobs.to_string());
+    }
+    if let Some((var, value)) = toolchain.loader_env() {
+        build = build.env(var, value);
+    }
+    let built = crate::exec::run(&build, ctx.exec_env());
+    if !built.ok {
+        r.fail_child(
+            &built,
+            format!(
+                "browser build (aterm-wasm + aterm-gpu-web, wasm32 dev, on {})",
+                toolchain.name
+            ),
+        );
+        r.raw(built.output.as_str());
+        return None;
+    }
+    Some(target_dir.join("wasm32-unknown-unknown/debug"))
+}
 
 /// First entry of [`SITE_FILES`] missing from `site`, if any.
 fn site_lacks(site: &Path) -> Option<&'static str> {

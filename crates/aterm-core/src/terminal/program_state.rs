@@ -8,7 +8,7 @@
 //! The program status protocol's wire grammar is `OSC 7501 ; key=value(:key=value)* ST`: `state`
 //! required, `app` the program, `kind` on a `blocked` report, `id` naming a child record (absent:
 //! the root record), base64 `title` and `msg`, and `progress`. This reader takes the root record
-//! of the two programs it knows by their `app` ([`ProgramApp`]) and leaves every child record
+//! of the programs it knows by their `app` ([`ProgramApp`]) and leaves every child record
 //! alone: a subagent's report, or the `clear` of one, says nothing of the session.
 
 /// The state word of an OSC 7501 report.
@@ -90,6 +90,8 @@ impl ProgramBlockedKind {
 /// The program an OSC 7501 report names in its `app`, of the ones this reader takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ProgramApp {
+    /// Claude Code (`app=claude-code`).
+    ClaudeCode,
     /// Codex (`app=codex`): the vendor build and codex-alab.
     Codex,
     /// xAI's Grok Build (`app=grok-build`), read out of its 1.0.70 binary: its root report
@@ -99,11 +101,12 @@ pub enum ProgramApp {
 }
 
 impl ProgramApp {
-    /// Its wire word: `codex`, `grok-build`.
+    /// Its wire word: `claude-code`, `codex`, `grok-build`.
     #[must_use]
     #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::GrokBuild => "grok-build",
         }
@@ -112,6 +115,7 @@ impl ProgramApp {
     #[inline]
     fn parse(word: &str) -> Option<Self> {
         Some(match word {
+            "claude-code" => Self::ClaudeCode,
             "codex" => Self::Codex,
             "grok-build" => Self::GrokBuild,
             _ => return None,

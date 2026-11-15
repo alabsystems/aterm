@@ -350,7 +350,7 @@ impl ContextReply {
 /// member request to an execution of another kind.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Call {
-    Member(Request),
+    Member(Box<Request>),
     Context(ContextQuery),
 }
 impl Call {
@@ -360,7 +360,7 @@ impl Call {
             if !request.role.is_proxy_member() {
                 return Err(invalid());
             }
-            Ok(Self::Member(request))
+            Ok(Self::Member(Box::new(request)))
         } else {
             ContextQuery::decode(bytes).map(Self::Context)
         }
@@ -437,7 +437,7 @@ impl ContextUnavailable {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContextResponse {
-    Ready(ContextReply),
+    Ready(Box<ContextReply>),
     Unavailable(ContextUnavailable),
 }
 impl ContextResponse {
@@ -449,7 +449,7 @@ impl ContextResponse {
     }
     pub fn decode(bytes: &[u8], query: &ContextQuery) -> io::Result<Self> {
         if header(bytes, 7).is_ok() {
-            ContextReply::decode(bytes, query).map(Self::Ready)
+            ContextReply::decode(bytes, query).map(Box::new).map(Self::Ready)
         } else {
             ContextUnavailable::decode(bytes, query).map(Self::Unavailable)
         }

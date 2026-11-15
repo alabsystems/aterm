@@ -36,14 +36,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use alab_policy::config::TurnEndTiming;
+use alab_policy::guard::row_guard;
 use aterm_agent::harness::accounts::{self, LOGIN_ENV, Roster, Row, Store};
 use aterm_agent::harness::headless_oauth::{MAILBOX_TOML_FILE, SECRETS_MAILBOX_TOML_FILE};
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::exception::LOGIN_BACKED_OUT;
-use aterm_agent::supervise::policy::guard::row_guard;
 use aterm_agent::supervise::policy::login::RULE_LOGIN_BACK_OUT;
 use aterm_agent::supervise::policy::notice::LOGIN_CHOOSE;
-use aterm_agent::supervise::policy::turn_end::{RULE_LOGIN, TurnEndTiming};
+use aterm_agent::supervise::policy::turn_end::RULE_LOGIN;
 use aterm_agent::supervise::tape::codec::{self, Item};
 use aterm_agent::supervise::tape::{corpus, doors, show};
 

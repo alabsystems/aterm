@@ -31,6 +31,14 @@
 //! kept runs measured each binary's memory and timing at. What the live share moves is how many
 //! binaries run side by side.
 //!
+//! THE TURN'S HOLDER RUNS AT FULL WIDTH. A run that holds the judgment turn
+//! ([`aterm_capacity::Heavy`], `crate::turn`) is the one heavy judgment the machine runs: its
+//! share is what it asked, bounded by the cores no claim holds or reserves, as the ledger grants
+//! the holder's own claims (`ranked_grant`'s CORES-GRANT). The fair share's divisor would count
+//! the other judgments' compiles, which claim no cores, as work it shares with, and so held each
+//! of N concurrent judgments to about a quarter of the machine
+//! (`docs/DESIGN-landing-economy.md` §1.1).
+//!
 //! THE SUBPROCESS SLOTS FOLLOW THE SHARE ([`Slots`]). The run's pool of multi-process test
 //! stacks is made for the cores asked, and the run itself holds the slots the share does not
 //! cover, so the stacks its binaries boot rise and fall with the binaries it runs.
@@ -59,6 +67,9 @@ pub(crate) struct Others {
     pub(crate) waiting: u32,
     /// The cores of those waiters that wait for cores alone, which the ledger keeps for them.
     pub(crate) reserved: u32,
+    /// Whether the asker, or the process it runs under, holds the judgment turn
+    /// ([`aterm_capacity::Heavy`]): its share is then all the room ([`fair`]).
+    pub(crate) turn: bool,
 }
 
 /// Who asks: this run's dispatch, placed among the ledger's claims as one claim made when the
@@ -106,7 +117,15 @@ impl Others {
     /// is asked for.
     pub(crate) fn of(records: &[Record], asker: &Asker, now_ms: u64) -> Others {
         let tau = aterm_capacity::admit::LOAD5_TIME_CONSTANT.as_secs_f64();
-        let mut others = Others::default();
+        let mut others = Others {
+            turn: records.iter().any(|r| {
+                r.accounting == aterm_capacity::Accounting::Holder
+                    && (r.pid == asker.pid || asker.ancestors.contains(&r.pid))
+                    && r.held.is_some()
+                    && r.need.heavy.is_some()
+            }),
+            ..Others::default()
+        };
         for r in records.iter().filter(|r| r.need.cores > 0) {
             let kin = r.accounting == aterm_capacity::Accounting::Holder
                 && asker.ancestors.contains(&r.pid);
@@ -146,7 +165,17 @@ impl Others {
 /// At least one, where the ledger grants a new claim none once every core is held or reserved:
 /// this bounds what runs beside a binary already running, and a binary with none beside it asks
 /// the ledger, which holds it at none until a core is free.
+///
+/// A run that holds the judgment turn ([`Others::turn`]) is not shared: its share is the `asked`
+/// cores, bounded by those no claim holds or reserves.
 pub(crate) fn fair(asked: u32, machine: &Reading, others: &Others, own_load: f64) -> u32 {
+    let room = machine
+        .cores
+        .saturating_sub(others.held)
+        .saturating_sub(others.reserved);
+    if others.turn {
+        return asked.min(room).max(1);
+    }
     let cores = f64::from(machine.cores.max(1));
     let unclaimed = machine.load5.map_or(0.0, |load| {
         (load - others.in_load - own_load.max(0.0)).max(0.0)
@@ -164,10 +193,6 @@ pub(crate) fn fair(asked: u32, machine: &Reading, others: &Others, own_load: f64
     } else {
         1
     };
-    let room = machine
-        .cores
-        .saturating_sub(others.held)
-        .saturating_sub(others.reserved);
     share.min(asked).min(room).max(1)
 }
 

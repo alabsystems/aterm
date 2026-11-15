@@ -79,7 +79,7 @@ fn the_rule_reads_the_key_surface_and_the_whole_checkout() {
     use crate::scan_set::test_fixtures::disk_tree;
     let key = random_phrase();
     let fixture = "const PAPER: &str = \"0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0\";\n";
-    let mut files: Vec<(String, String)> = KEY_SURFACE[1..4]
+    let mut files: Vec<(String, String)> = KEY_SURFACE[1..5]
         .iter()
         .map(|rel| ((*rel).to_string(), "fn ok() {}\n".to_string()))
         .collect();

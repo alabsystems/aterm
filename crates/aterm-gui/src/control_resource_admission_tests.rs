@@ -25,6 +25,11 @@ fn exact_owner_and_bounded_pid_free_grammar() {
         parse("inspect session=s-a912afd80a5a598f9ace"),
         Some(Command::Inspect("s-a912afd80a5a598f9ace"))
     );
+    assert_eq!(
+        parse("inspect session=tqn5r6e0148"),
+        Some(Command::Inspect("tqn5r6e0148")),
+        "a t tab"
+    );
     assert_eq!(parse("attach"), Some(Command::Attach));
     assert_eq!(
         parse("attach-accounted-original-store-v1"),
@@ -49,6 +54,9 @@ fn exact_owner_and_bounded_pid_free_grammar() {
         "inspect session=s-a cpu_units=1",
         "inspect session=s-A",
         "inspect session=s-",
+        "inspect session=T0000000000",
+        "inspect session=t000000000",
+        "inspect session=tqn5r6e014u",
         "capabilities extra",
         "enroll nonce=a",
         "enroll nonce=ABC",

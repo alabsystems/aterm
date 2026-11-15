@@ -28,6 +28,14 @@ const AIRBORNE: &[&str] = &[
     "pet_dog_leap_rise",
     "pet_dog_run_1",
     "pet_dog_run_3",
+    "pet_fly",
+    "pet_fly_blink",
+    "pet_fly_happy",
+    "pet_fly_oof",
+    "pet_dog_fly",
+    "pet_dog_fly_blink",
+    "pet_dog_fly_happy",
+    "pet_dog_fly_oof",
 ];
 
 fn art_dir() -> PathBuf {
@@ -547,7 +555,7 @@ fn the_dog_shows_a_leather_drop_ear_and_a_snout_at_ship_size() {
         .into_iter()
         .filter(|p| p.id.starts_with("pet_dog_"))
         .collect();
-    assert_eq!(dogs.len(), 67, "the dog roster");
+    assert_eq!(dogs.len(), 71, "the dog roster");
     for p in &dogs {
         let ear = ear_leather_px(p, ship);
         assert!(
@@ -638,5 +646,234 @@ fn a_profile_dog_s_flicked_ear_still_hangs() {
         ear_hang(&before) < EAR_HANG,
         "negative control: the pre-flick tab passed as a hanging ear ({:.2})",
         ear_hang(&before)
+    );
+}
+
+/// The pose budget `art/pet/README.md` and the brand guide state: 14 layers and 360 path
+/// commands (a close counts as one), whatever a pose draws.
+const POSE_MAX_LAYERS: usize = 14;
+const POSE_MAX_COMMANDS: usize = 360;
+
+/// A pose's layer and path-command counts.
+fn budget(p: &Pose) -> (usize, usize) {
+    let commands = layers(p)
+        .iter()
+        .flat_map(|layer| {
+            layer
+                .get("paths")
+                .and_then(aterm_toml::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        })
+        .map(|d| {
+            parse_path(d.as_str().expect("a path is a string"))
+                .unwrap_or_else(|| panic!("{}: unparseable path", p.id))
+                .len()
+        })
+        .sum();
+    (layers(p).len(), commands)
+}
+
+/// Whether a pose of `(layers, commands)` keeps the pose budget.
+const fn within_budget((layers, commands): (usize, usize)) -> bool {
+    layers <= POSE_MAX_LAYERS && commands <= POSE_MAX_COMMANDS
+}
+
+#[test]
+fn every_pose_keeps_the_pet_budget() {
+    let all = poses();
+    for p in &all {
+        let (layers, commands) = budget(p);
+        assert!(
+            within_budget((layers, commands)),
+            "{}: {layers} layers and {commands} commands exceed {POSE_MAX_LAYERS} and {POSE_MAX_COMMANDS}",
+            p.id
+        );
+    }
+    // The control: the largest pose with one command more fails the budget.
+    let most = all
+        .iter()
+        .map(budget)
+        .map(|(_, c)| c)
+        .max()
+        .expect("a pose");
+    assert!(most <= POSE_MAX_COMMANDS);
+    assert!(
+        !within_budget((1, POSE_MAX_COMMANDS + 1)),
+        "control: a pose of {} commands must fail the budget",
+        POSE_MAX_COMMANDS + 1
+    );
+}
+
+/// The roles a glide face may change: the face's own features (the nose's layer carries the
+/// startle's gasp, which the baker draws at every size). Every other layer is the body.
+const FACE_ROLES: [&str; 7] = [
+    "eye",
+    "iris",
+    "detail",
+    "catch_light",
+    "mouth",
+    "blush",
+    "nose",
+];
+
+/// The body layers of `pose` (every layer whose role is not a face role), as written.
+fn body_layers(pose: &Pose) -> Vec<String> {
+    layers(pose)
+        .iter()
+        .filter(|layer| {
+            !FACE_ROLES.contains(
+                &layer
+                    .get("role")
+                    .and_then(aterm_toml::Value::as_str)
+                    .unwrap_or(""),
+            )
+        })
+        .map(|layer| format!("{layer:?}"))
+        .collect()
+}
+
+/// The flying cat's four faces are one body: a reaction swaps face pixels only and moves no
+/// edge, so a face swap mid-air cannot read as the cat jolting.
+#[test]
+fn glide_faces_share_one_body() {
+    let all = poses();
+    let pose = |id: &str| {
+        all.iter()
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("{id}"))
+    };
+    for family in ["pet_fly", "pet_dog_fly"] {
+        let body = body_layers(pose(family));
+        assert!(!body.is_empty(), "{family}: no body layers");
+        for face in ["blink", "happy", "oof"] {
+            let id = format!("{family}_{face}");
+            assert_eq!(body_layers(pose(&id)), body, "{id}: the glide's body moved");
+        }
+    }
+    // The control: a different pose of the same cat does not share the glide's body.
+    assert_ne!(
+        body_layers(pose("pet_leap")),
+        body_layers(pose("pet_fly")),
+        "control: the comparison must tell pet_leap's body from the glide's"
+    );
+}
+
+/// Pixels of `a` and `b` (one size) that differ by more than 40 in any channel.
+fn differing_px(a: &Tile, b: &Tile) -> usize {
+    a.pixels()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.pixels().as_chunks::<4>().0)
+        .filter(|(p, q)| p.iter().zip(q.iter()).any(|(x, y)| x.abs_diff(*y) > 40))
+        .count()
+}
+
+/// The least count of dark pixels a shut or happy glide face has fewer of than the open one:
+/// the coat inside the lid's curve ([`the_glide_faces_read_apart_at_ship_size`]).
+const LID_HOLLOW_MIN_PX: usize = 7;
+
+/// The least count of pixels two glide faces differ by at the flier's ship sizes
+/// ([`the_glide_faces_read_apart_at_ship_size`]).
+const FACE_APART_MIN_PX: usize = 6;
+
+/// THE GLIDE'S FACES READ APART AT SHIP SIZE. A face change is the glide's only reaction (its
+/// body is rigid), so each pair of its four faces differs by at least [`FACE_APART_MIN_PX`]
+/// pixels (more than 40 in a channel), baked as the flier draws them (`PetBakeKey`, the
+/// glide's tile at a 16, 20 and 26 px cell), in the shipped walker's coat and a tabby's, on a
+/// white page and a dark one. Before the glide's own lids and gasp, the startle did not differ
+/// from the cruise at a 16 px cell at all, and the blink and the delight were both a dark slab
+/// 3 to 6 px apart. And each lid (the blink's ‿, the delight's ^) keeps coat in its curve: it
+/// inks at least [`LID_HOLLOW_MIN_PX`] dark pixels fewer than the open eyes, where a slab inks
+/// as many. Controls: a face that duplicates the cruise is not apart from it, and with the
+/// baker's core plug back in a shallow eye (`SHALLOW_EYE_PLUG`) the blink is a slab.
+#[test]
+fn the_glide_faces_read_apart_at_ship_size() {
+    use aterm_effects::kitty_pet::{PetSpecies, glide_faces, glide_tile_size};
+    let pages = [(0x00FF_FFFF, 0x001F_2328), (0x001A_1B26, 0x00C0_CAF5)];
+    let mut worst = (usize::MAX, String::new());
+    for species in [PetSpecies::Cat, PetSpecies::Dog] {
+        let g = glide_faces(species);
+        let faces = [
+            ("cruise", g.fly),
+            ("blink", g.blink),
+            ("happy", g.happy),
+            ("oof", g.oof),
+        ];
+        for cell_h in [16_u16, 20, 26] {
+            let (w, h) = glide_tile_size(cell_h);
+            for coat in [8_u8, 12] {
+                for &(bg, fg) in &pages {
+                    let bake = |pose| {
+                        PetBakeKey {
+                            pose,
+                            coat,
+                            iris: 4,
+                            colors: CatColorKey::from_rgb(bg, fg, bg),
+                            w,
+                            h,
+                        }
+                        .bake()
+                    };
+                    let tiles: Vec<Tile> = faces.iter().map(|&(_, f)| bake(f)).collect();
+                    let open = ink(&tiles[0]);
+                    for k in [1, 2] {
+                        let shut = ink(&tiles[k]);
+                        assert!(
+                            shut + LID_HOLLOW_MIN_PX <= open,
+                            "{species:?} {} at {cell_h} px, coat {coat}, page {bg:06X}: {shut} dark px to the open eyes' {open}: a slab, not a lid",
+                            faces[k].0
+                        );
+                    }
+                    for i in 0..faces.len() {
+                        for j in i + 1..faces.len() {
+                            let n = differing_px(&tiles[i], &tiles[j]);
+                            let at = format!(
+                                "{species:?} {} vs {} at {cell_h} px, coat {coat}, page {bg:06X}",
+                                faces[i].0, faces[j].0
+                            );
+                            eprintln!("{at}: {n} px");
+                            if n < worst.0 {
+                                worst = (n, at);
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        differing_px(&tiles[0], &bake(g.fly)),
+                        0,
+                        "control: a face that duplicates the cruise is not apart from it"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        worst.0 >= FACE_APART_MIN_PX,
+        "{}: {} px apart, under {FACE_APART_MIN_PX}",
+        worst.1,
+        worst.0
+    );
+    // The control of the lids' hollow: with the core plug back in a shallow eye, the blink
+    // inks as much as the open eyes do.
+    aterm_effects::pet_baker::SHALLOW_EYE_PLUG.with(|c| c.set(true));
+    let (w, h) = glide_tile_size(16);
+    let g = glide_faces(PetSpecies::Cat);
+    let bake = |pose| {
+        PetBakeKey {
+            pose,
+            coat: 8,
+            iris: 4,
+            colors: CatColorKey::from_rgb(pages[0].0, pages[0].1, pages[0].0),
+            w,
+            h,
+        }
+        .bake()
+    };
+    let (open, shut) = (ink(&bake(g.fly)), ink(&bake(g.blink)));
+    aterm_effects::pet_baker::SHALLOW_EYE_PLUG.with(|c| c.set(false));
+    assert!(
+        shut + LID_HOLLOW_MIN_PX > open,
+        "control: plugged, the blink is a slab: {shut} dark px to the open eyes' {open}"
     );
 }

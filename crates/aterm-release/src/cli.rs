@@ -113,6 +113,14 @@ USAGE
       accept the journaled artifact after all other release checks passed.
       Keeps the failed report and its digest; never writes a passing verification.
 
+  targo --unverified ship accept-check-failure CHECK REPORT REASON
+      Only on the owner's explicit instruction to ship a known failure of a check that
+      runs the product's tests (test, spec, appkit or measure): accept the journaled
+      release's recorded FAIL of CHECK, read from REPORT (the log its record names).
+      Keeps the failed report and its digest; never writes a passing verification.
+      Every other check still needs its own ok record; a FAIL of a source-shape check
+      (candidate-shim, fmt, lint, census, forge, libc) is never accepted.
+
   targo --unverified ship release --prefreeze
       After refreshing origin/main, build its cutter in the persistent compiler
       checkout. Runs at Background priority, yields to Release,
@@ -141,9 +149,10 @@ USAGE
         an open version with no fleet line                         → --prepare --commit
                                                                      <the commit that opened it>
         a fleet line and no journal here                           → waits, naming its holder;
-                                                                     with --adopt: --prepare
-                                                                     (adopts it, or exit 4
-                                                                     names its live holder)
+                                                                     with --adopt: waits while
+                                                                     its lease is live and its
+                                                                     holder not proven dead,
+                                                                     then --prepare (adopts it)
         this clone's unfinished line                               → --prepare (resume)
         a journal here of a version another clone cut              → waits: a session runs
                                                                      --forget
@@ -160,12 +169,15 @@ USAGE
         a refusal no worker is on                                  → waits until the journal
                                                                      or main changes
         exit 3 (could not run)                                     → the same verb, with backoff
-        exit 4 (another live holder)                               → waits; no second line
+        exit 4 (another live holder)                               → runs nothing while the
+                                                                     line's record says it is
+                                                                     held; no second line
       A run that completes no row for max(30 min, twice its step's p95) while its
       processes do nothing for as long is STALLED: it is said, and a --prepare is
       interrupted and resumed (a publish is only said).
       It never runs --forget, --bump, --supersede or --abandon. A line it starts
-      takes the Linux declaration given here, else PUMP_LINUX_DEFAULT in main's
+      or adopts, and one it resumes whose journal holds none, takes the Linux
+      declaration given here, else PUMP_LINUX_DEFAULT in main's
       publish/config.sh. --once runs one cycle; --dry-run prints the decision and
       runs nothing. One pump per clone; its memory is .git/aterm-release/pump.toml.
         --adopt            also take over a fleet line this clone holds no journal
@@ -234,8 +246,8 @@ USAGE
                            on the Windows host (see `cut`); journaled, so it may
                            come on the run after the cut stopped for the pair
         --release-credentials <profile.toml>
-                           the cut's signing profile (default
-                           ~/.aterm/release-ring/release-credentials.toml)
+                           an operator's signing profile file (default: the
+                           store's release ring, read as one set)
         --engine DIRECTORY the publication engine whose origin the release
                            clones its own engine from, into the clone's
                            .git/aterm-release/.ubd/engine, which it alone runs and
@@ -376,10 +388,10 @@ USAGE
                            nothing a writer of the carry cannot set, so no pair
                            is admitted without it or with another digest
         --release-credentials <profile.toml>
-                           the signing profile: a rostered, unrevoked machine key
-                           and its notary credential (`provision` writes
-                           ~/.aterm/release-ring/release-credentials.toml). Without one the
-                           cut refuses before it claims
+                           an operator's signing profile file: a rostered,
+                           unrevoked machine key and its notary credential
+                           (default: the store's release ring). Without
+                           either the cut refuses before it claims
 
   targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>] [--mint-developer-id]
                            make this machine a publisher (without the Trust
@@ -395,9 +407,10 @@ USAGE
                            developer-id:<id>`), a live-tested notary credential,
                            the credentials profile, the channel token) and prints
                            every gap with its remedy. Only a clean pass mints
-                           this machine's key, by the join ceremony: the paper
-                           phrase, typed once, is the only input, and a roster id
-                           is never spent on a machine that cannot release. A
+                           this machine's key, by the join ceremony under the
+                           vault's master phrase (else it files `aterm secrets
+                           need paper-master`), and a roster id is never spent
+                           on a machine that cannot release. A
                            provisioned machine is audited, never re-minted. Ends
                            READY TO CUT (ROSTERED on a host that cannot cut,
                            such as a non-Mac)
@@ -566,6 +579,14 @@ USAGE
                            to the current epoch's floor in
                            crates/aterm-release/trust/credit.tsv. Exit 0 pass, 1 fail,
                            2 undecided or could not run, 4 narrowed by memory
+  targo --unverified ship trust reduce --report PATH --package NAME --repo PATH --out PATH
+        [--manifest-path PATH]
+                           reduce an existing compiler report to its per-obligation
+                           record at a new output path, using --repo's source anchors. Validates
+                           the full report, including its footer and counts, without
+                           running the prover or changing facts or ratchets.
+                           Counts describe parsed retained evidence; no new proof
+                           claim is made. Exit 0 parsed and written, 2 refused or I/O failed.
   targo --unverified ship trust judge [--commit REV] [--prover BIN-DIR] [--update-ratchet [--reason WHY]]
                            the lane's full report for the facts a whole-tree run
                            filed for REV (default HEAD) with the prover (--prover
@@ -648,6 +669,11 @@ pub enum PinSource {
 pub enum Cmd {
     Help,
     AcceptMeasure {
+        report: std::path::PathBuf,
+        reason: String,
+    },
+    AcceptCheck {
+        check: aterm_verify::checks::Check,
         report: std::path::PathBuf,
         reason: String,
     },
@@ -873,6 +899,31 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                 return Err("accept-measure-failure requires REPORT REASON".into());
             }
             Ok(Cmd::AcceptMeasure { report, reason })
+        }
+        "accept-check-failure" => {
+            const USAGE: &str = "accept-check-failure requires CHECK REPORT REASON";
+            let name = it.next().ok_or(USAGE)?;
+            let check = aterm_verify::checks::RELEASE
+                .into_iter()
+                .find(|check| check.name() == name)
+                .filter(|check| crate::check_record::acceptable(*check))
+                .ok_or_else(|| {
+                    format!(
+                        "accept-check-failure: {name} is not a check whose FAIL is accepted \
+                         ({})",
+                        crate::check_record::acceptable_names().join(", ")
+                    )
+                })?;
+            let report = it.next().ok_or(USAGE)?.into();
+            let reason = it.next().ok_or(USAGE)?.to_string();
+            if it.next().is_some() {
+                return Err(USAGE.into());
+            }
+            Ok(Cmd::AcceptCheck {
+                check,
+                report,
+                reason,
+            })
         }
         "pin-verifier" => match (it.next(), it.next(), it.next(), it.next()) {
             (Some("--from-release"), Some(tag), None, None) if !tag.starts_with('-') => {
@@ -1745,9 +1796,19 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
         }
         Cmd::StageLocal(args) => crate::stage_local::run(&args),
         Cmd::Build => crate::artifact::run_build(&repo_root()?),
-        Cmd::AcceptMeasure { report, reason } => {
-            crate::accepted_measure::record(&repo_root()?, &report, &reason).map_err(Error::new)
-        }
+        Cmd::AcceptMeasure { report, reason } => crate::accepted_measure::record(
+            &repo_root()?,
+            aterm_verify::checks::Check::Measure,
+            &report,
+            &reason,
+        )
+        .map_err(Error::new),
+        Cmd::AcceptCheck {
+            check,
+            report,
+            reason,
+        } => crate::accepted_measure::record(&repo_root()?, check, &report, &reason)
+            .map_err(Error::new),
         Cmd::Cut {
             abandon: Some(v), ..
         } => verify::run_abandon(&repo_root()?, &v),
@@ -1798,10 +1859,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             release_credentials,
             no_draft_posted,
         } => {
-            let creds = crate::sign::ReleaseCredentials::resolve(
-                release_credentials.as_deref(),
-                &repo_root()?,
-            )?;
+            let creds = crate::sign::ReleaseCredentials::resolve(release_credentials.as_deref())?;
             publish::run_recover_lost(
                 &repo_root()?,
                 &version,

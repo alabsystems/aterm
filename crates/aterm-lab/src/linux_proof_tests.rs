@@ -4,6 +4,148 @@
 use super::*;
 
 #[test]
+fn report_publication_requires_a_fresh_writable_destination_and_preserves_failures() {
+    for verdict in [Verdict::Pass, Verdict::Fail] {
+        let top = aterm_tempfile::tempdir().unwrap();
+        let prior = Row {
+            name: "completed tests".into(),
+            verdict,
+            secs: 1.0,
+            detail: "complete".into(),
+        };
+        let expected = if verdict == Verdict::Fail {
+            1
+        } else {
+            linux::NOT_RUN
+        };
+        let existing = top.path().join("existing.txt");
+        std::fs::write(&existing, b"retained original").unwrap();
+        let blocked = top.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        let parent_file = top.path().join("parent-is-file");
+        std::fs::write(&parent_file, b"parent").unwrap();
+        for path in [
+            existing.clone(),
+            blocked.clone(),
+            parent_file.join("report.txt"),
+        ] {
+            let mut rows = vec![prior.clone()];
+            assert!(!publish_report("fixture", &mut rows, &[], 2.0, &path));
+            assert_eq!(rows[0], prior);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1].verdict, Verdict::NotRun);
+            assert!(!rows[1].detail.is_empty());
+            assert_eq!(exit_code(&rows), expected);
+        }
+        assert_eq!(std::fs::read(&existing).unwrap(), b"retained original");
+        assert!(blocked.is_dir());
+        assert_eq!(std::fs::read(&parent_file).unwrap(), b"parent");
+
+        let fresh = top.path().join("fresh.txt");
+        let mut rows = vec![prior.clone()];
+        assert!(publish_report("fixture", &mut rows, &[], 2.0, &fresh));
+        assert_eq!(rows, [prior]);
+        assert_eq!(
+            std::fs::read_to_string(fresh).unwrap(),
+            render_as("fixture", &rows, &[], 2.0)
+        );
+    }
+}
+
+#[test]
+fn a_report_write_error_is_not_run_without_hiding_a_prior_failure_or_partial_file() {
+    use std::io::Write as _;
+    for verdict in [Verdict::Pass, Verdict::Fail] {
+        let top = aterm_tempfile::tempdir().unwrap();
+        let path = top.path().join("report.txt");
+        let prior = Row {
+            name: "completed tests".into(),
+            verdict,
+            secs: 1.0,
+            detail: "complete".into(),
+        };
+        let mut rows = vec![prior.clone()];
+        assert!(!report_publication(&mut rows, &path, || {
+            let mut file = crate::util::create_new_regular_file(&path, 0o600)?;
+            file.write_all(b"partial report")?;
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        }));
+        assert_eq!(std::fs::read(path).unwrap(), b"partial report");
+        assert_eq!(rows[0], prior);
+        assert_eq!(rows[1].verdict, Verdict::NotRun);
+        assert_eq!(
+            exit_code(&rows),
+            if verdict == Verdict::Fail {
+                1
+            } else {
+                linux::NOT_RUN
+            }
+        );
+    }
+}
+
+#[test]
+fn refused_gui_admission_cannot_pass_on_completed_build_rows() {
+    for earlier in [Verdict::Pass, Verdict::Fail] {
+        for (code, signal, admission_verdict) in [
+            (linux::NOT_RUN, None, Verdict::NotRun),
+            (1, None, Verdict::Fail),
+            (130, Some(2), Verdict::NotRun),
+        ] {
+            let prior = Row {
+                name: "aarch64 (native) build aterm-gui".into(),
+                verdict: earlier,
+                secs: 1.0,
+                detail: String::new(),
+            };
+            let mut rows = vec![prior.clone()];
+            let failure = Fail {
+                code,
+                stopped: signal,
+                msg: signal
+                    .is_none()
+                    .then(|| "quiet claim did not qualify".into()),
+            };
+            let failure =
+                gui_admission(&mut rows, "aarch64 (native)", || Err::<(), _>(failure)).unwrap_err();
+            assert_eq!(failure.code, code);
+            assert_eq!(failure.stopped, signal);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0], prior);
+            assert_eq!(rows[1].verdict, admission_verdict);
+            assert!(!rows[1].detail.is_empty());
+            let expected = if earlier == Verdict::Fail || admission_verdict == Verdict::Fail {
+                1
+            } else {
+                linux::NOT_RUN
+            };
+            assert_eq!(exit_code(&rows), expected);
+            let report = render(&rows, &[], 1.0);
+            assert!(report.ends_with(if expected == 1 {
+                "verdict: FAIL\n"
+            } else {
+                "verdict: NOT RUN\n"
+            }));
+        }
+    }
+}
+
+#[test]
+fn successful_gui_admission_keeps_the_claim_without_a_refusal_row() {
+    let mut rows = vec![Row {
+        name: "aarch64 (native) build aterm-gui".into(),
+        verdict: Verdict::Pass,
+        secs: 1.0,
+        detail: String::new(),
+    }];
+    let before = rows.clone();
+    let claim = gui_admission(&mut rows, "aarch64 (native)", || Ok(42)).unwrap();
+    assert_eq!(claim, 42);
+    assert_eq!(rows, before);
+    assert_eq!(exit_code(&rows), 0);
+}
+
+#[test]
 fn a_frame_requires_a_fresh_successful_copy_of_a_decodable_png() {
     let top = aterm_tempfile::tempdir().unwrap();
     let image = "OK 1 1 /private/guest/frame.png";
@@ -733,15 +875,8 @@ fn a_test_not_run_under_rosetta_is_listed_in_the_x86_64_cell_and_fails_any_other
     };
     let text = "test a ... ok\ntest m::t ... NOT RUN under Rosetta: m::t: why\nok\n";
     let listed = translator_not_runs(row(), text, Arch::X86_64);
-    assert_eq!(listed.verdict, Verdict::Pass);
-    assert!(
-        listed.detail.ends_with(
-            "1 not runnable under Rosetta, which a real x86_64 CPU decides:\n    \
-             NOT RUN under Rosetta: m::t: why"
-        ),
-        "{}",
-        listed.detail
-    );
+    assert_eq!(listed.verdict, Verdict::NotRun);
+    assert!(listed.detail.contains("NOT RUN under Rosetta: m::t: why"));
     let native = translator_not_runs(row(), text, Arch::Aarch64);
     assert_eq!(native.verdict, Verdict::Fail, "{}", native.detail);
     let other = "NOT RUN under a translator (x86_64 code on an aarch64 kernel): m::t: why\n";
@@ -753,4 +888,21 @@ fn a_test_not_run_under_rosetta_is_listed_in_the_x86_64_cell_and_fails_any_other
         translator_not_runs(row(), "test a ... ok\n", Arch::X86_64),
         row()
     );
+    for malformed in [
+        "NOT RUN under Rosetta:",
+        "NOT RUN under Rosetta: m::t",
+        "NOT RUN under Rosetta: : why",
+        "NOT RUN under Rosetta: m::t: ",
+    ] {
+        assert_eq!(
+            translator_not_runs(row(), malformed, Arch::X86_64).verdict,
+            Verdict::Fail
+        );
+    }
+    let mut failed = row();
+    failed.verdict = Verdict::Fail;
+    let still_failed = translator_not_runs(failed, text, Arch::X86_64);
+    assert_eq!(still_failed.verdict, Verdict::Fail);
+    assert_eq!(exit_code(&[row(), listed.clone()]), linux::NOT_RUN);
+    assert_eq!(exit_code(&[listed, still_failed]), 1);
 }

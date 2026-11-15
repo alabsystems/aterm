@@ -284,6 +284,7 @@ const PARTS: [(&str, usize, usize); 8] = [
 ];
 
 /// A salted pipeline built faster than this hit Metal's function cache.
+#[cfg(target_os = "macos")]
 const COLD_PIPELINE_MIN_NS: u64 = 2_000_000;
 
 /// Exit status of a run stopped by a G3 failure, with its summary written.
@@ -391,6 +392,13 @@ enum Stop {
     /// A defect: a C0 mismatch, a refusal or a failure no gate voids (exit 1).
     Defect(String),
     /// A G3 failure: a job not `Completed` or a qualification refused (exit 3).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            dead_code,
+            reason = "only Metal's G arm fails a G3 gate; off macOS that arm is a defect"
+        )
+    )]
     Gpu(String),
 }
 

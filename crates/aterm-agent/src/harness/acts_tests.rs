@@ -303,7 +303,7 @@ fn every_face_prints_its_own_status_word() {
 
 #[test]
 fn each_act_is_one_log_word() {
-    use crate::supervise::policy::turn_end::RULE_LAND_NUDGE;
+    use alab_policy::words::RULE_LAND_NUDGE;
     let cases = [
         (
             "read-only@v3",

@@ -294,14 +294,22 @@ fn a_drives_requester_is_kept_apart_from_its_driver_for_the_guard() {
 fn requester_sid_shape_matches_minted_sid() {
     let minted = SessionId::generate();
     let mut cases = vec![minted.as_str().to_owned()];
-    for (at, swap) in [(0, 'S'), (1, '_'), (2, 'A'), (21, 'g'), (5, 'f'), (9, '0')] {
+    let last = minted.as_str().len() - 1;
+    for (at, swap) in [
+        (0, 'S'),
+        (1, '_'),
+        (2, 'A'),
+        (last, 'i'),
+        (5, 'f'),
+        (9, '0'),
+    ] {
         let mut chars: Vec<char> = minted.as_str().chars().collect();
         chars[at] = swap;
         cases.push(chars.into_iter().collect());
     }
-    cases.push(minted.as_str()[..21].to_owned());
+    cases.push(minted.as_str()[..last].to_owned());
     cases.push(format!("{}0", minted.as_str()));
-    cases.extend(["", "s-", "s-7725", "worker"].map(str::to_owned));
+    cases.extend(["", "s-", "t0000007725", "worker"].map(str::to_owned));
     for case in &cases {
         assert_eq!(
             aterm_types::control_verbs::is_minted_sid(case),

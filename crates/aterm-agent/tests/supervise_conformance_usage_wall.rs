@@ -5,17 +5,18 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use alab_policy::config::{Autopilot, TurnEndTiming};
+use alab_policy::vocab::Phase;
+use alab_policy::words::{LAND, LAND_NUDGE, RULE_CONTINUE, RULE_LAND, RULE_LAND_NUDGE};
 use aterm_agent::harness::tap::Window;
+use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::limit::{ResetSpec, place_reset, within_a_session_window};
-use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::login::{OVER_LIMIT_UNUSED, RULE_LOGIN_OVER_LIMIT};
 use aterm_agent::supervise::policy::turn_end::{
-    Cleared, Clearing, FIRED_EARLY, LAND, LAND_NUDGE, RULE_CONTINUE, RULE_LAND, RULE_LAND_NUDGE,
-    RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, cleared_text,
-    decide_turn_end,
+    Cleared, Clearing, FIRED_EARLY, RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading, TurnEndState,
+    cleared_text, decide_turn_end,
 };
 use aterm_agent::supervise::tap_clock::{TapClock, TapWindow, UsageWindow, timed};
-use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_usage_wall_model;
 use aterm_phase::prompt::fixtures::screen;
 use aterm_spec::derive::Model;
@@ -457,7 +458,7 @@ fn reading_of(
     let mut read = read.clone();
     if run.credits_as_wall && st["credits"] == 1 && read.credits.is_some() {
         let mut w = aterm_phase::Wall {
-            kind: aterm_phase::WallKind::Spend,
+            kind: alab_policy::vocab::WallKind::Spend,
             message: "Now using usage credits".to_string(),
             reset: None,
             row: 0,

@@ -194,7 +194,7 @@ pub use github::roster_freshness_projection;
 #[cfg(all(target_os = "macos", debug_assertions))]
 pub use install::dmg_acceptance;
 
-/// The plain `exec` that puts sigpipe back when it fails (`exec_plain`).
+/// A plain `exec` that excludes process-table reads and restores SIGPIPE on failure.
 #[cfg(unix)]
 pub use exec_plain::exec_keeping_sigpipe;
 

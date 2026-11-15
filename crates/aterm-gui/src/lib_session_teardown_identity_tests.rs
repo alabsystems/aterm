@@ -131,7 +131,7 @@ fn dropping_an_adopted_session_before_commit_leaves_its_shell_alive() {
     }
 }
 
-/// Dropping an adopted session before Commit preserves the predecessor's rekey, body, and trap files while withdrawing uncommitted writes.
+/// Dropping an adopted session before Commit preserves the predecessor's rekey, body, trap and output files while withdrawing uncommitted writes.
 #[test]
 fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_body_files() {
     let Some(_env) = crate::seamless::tests::env_alone() else {
@@ -151,9 +151,13 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
         let mut trap = rekey.clone().into_os_string();
         trap.push(aterm_core::shell_integration::DEBUG_TRAP_SUFFIX);
         let trap = std::path::PathBuf::from(trap);
+        let mut out = rekey.clone().into_os_string();
+        out.push(aterm_core::shell_integration::OUTPUT_SUFFIX);
+        let out = std::path::PathBuf::from(out);
         std::fs::write(&rekey, "parent-key\n").expect("the parent's re-key");
         std::fs::write(&body, "parent-body\n").expect("the parent's body pointer");
         std::fs::write(&trap, "trap -- ': rc' DEBUG\n").expect("the shell's trap read");
+        std::fs::write(&out, "").expect("the shell's output file");
         commit.hold(crate::shell_rekey::Pending::body(
             &body,
             "successor-body",
@@ -170,8 +174,9 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
         drop(session);
         if committed {
             assert!(
-                !rekey.exists() && !body.exists() && !trap.exists(),
-                "a committed session's untaken files, and its shell's trap read, go with it"
+                !rekey.exists() && !body.exists() && !trap.exists() && !out.exists(),
+                "a committed session's untaken files, and its shell's trap read and output file, \
+                 go with it"
             );
             continue;
         }
@@ -179,11 +184,13 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
             (
                 std::fs::read_to_string(&rekey).ok(),
                 std::fs::read_to_string(&body).ok(),
-                trap.exists()
+                trap.exists(),
+                out.exists()
             ),
             (
                 Some("parent-key\n".to_string()),
                 Some("parent-body\n".to_string()),
+                true,
                 true
             ),
             "an uncommitted drop deleted the files the predecessor handed its shell"
@@ -197,6 +204,7 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
         let _ = std::fs::remove_file(&rekey);
         let _ = std::fs::remove_file(&body);
         let _ = std::fs::remove_file(&trap);
+        let _ = std::fs::remove_file(&out);
     }
 }
 

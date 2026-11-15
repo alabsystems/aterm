@@ -177,6 +177,7 @@ pub const KINDS: &[&str] = &[
     "token-fallback",
     "token-offered",
     "token-removed",
+    "token-stopped",
     "seen",
 ];
 /// Every window word a note can carry.
@@ -220,6 +221,8 @@ pub const WHYS: &[&str] = &[
     "held",
     "busy",
     "unverified",
+    "awaiting-basis",
+    "differ",
     "ended",
     "rejected",
     "mismatched",
@@ -236,6 +239,16 @@ pub const WHYS: &[&str] = &[
     // works: an `error` for the log, never the account's sign-in word ([`observe`]).
     "sign-in-failed",
     "wrong-account",
+    // What stopped a token step (`TokenEvent::Stopped`, `token_steps::Stopped::why`), beside
+    // `wrong-account` and `failed` above.
+    "human-check",
+    "bot-check",
+    "block-page",
+    "window-closed",
+    "no-desktop",
+    "code-no-mailbox",
+    "deadline",
+    "consent-unproven",
 ];
 
 /// A Mac's sign-in word for one account, as the journal's fold holds it
@@ -400,6 +413,9 @@ pub enum TokenEvent {
     Offered,
     /// The verb removed the account's token from the vault (`token-removed`).
     Removed,
+    /// A check, or what another try alone does not pass, stopped the verb's capture, and the
+    /// account's step is held with no clock (`token-stopped`, with the stop's word).
+    Stopped,
 }
 
 impl TokenEvent {
@@ -414,17 +430,20 @@ impl TokenEvent {
             Self::Fallback => "token-fallback",
             Self::Offered => "token-offered",
             Self::Removed => "token-removed",
+            Self::Stopped => "token-stopped",
         }
     }
 }
 
 /// The note of `event` about Claude Code's `account` at `t`: the verb's own steps (minted,
-/// removed, offered) are a sign-in flow's, the rest Claude Code's output. `why` is one of
-/// [`WHYS`] (a minted token's `printed` or `assumed` end), or none.
+/// removed, offered, stopped) are a sign-in flow's, the rest Claude Code's output. `why` is one
+/// of [`WHYS`] (a minted token's `printed` or `assumed` end, a stopped step's word), or none.
 #[must_use]
 pub fn token_note(event: TokenEvent, account: Key, t: u64, why: Option<&'static str>) -> Note {
     let src = match event {
-        TokenEvent::Minted | TokenEvent::Removed | TokenEvent::Offered => "signin-flow",
+        TokenEvent::Minted | TokenEvent::Removed | TokenEvent::Offered | TokenEvent::Stopped => {
+            "signin-flow"
+        }
         TokenEvent::Served | TokenEvent::Verified | TokenEvent::Rejected | TokenEvent::Fallback => {
             "cli-output"
         }
@@ -1034,7 +1053,9 @@ fn of_ledger(
                     .map(super::accounts::AttemptOutcome::as_str),
                 Some(SignWord::Failed),
             ),
-            SignInStep::Begun | SignInStep::Window | SignInStep::SignedIn => return None,
+            SignInStep::Begun | SignInStep::Window | SignInStep::SignedIn | SignInStep::OnToken => {
+                return None;
+            }
         },
         Kind::Displaced => ("displaced", "signin-flow", None, Some(SignWord::Out)),
         Kind::Wall
@@ -1054,6 +1075,32 @@ fn of_ledger(
         note.to = to;
     }
     Some((word, note))
+}
+
+/// The notes a reset's ledger row becomes ([`of_ledger`]'s `note`): one `reset-used` for each
+/// window the row says the reset refilled ([`Event::refilled`]), of the account's workspace
+/// (`sub`) where it has one as its readings and walls are, so a Mac's fold cuts that window's
+/// earlier readings and walls and no other window's. A row that names no window the journal
+/// holds (a reset spent with the limit still standing, a row written before rows named them) is
+/// one note of no window, which says a reset was used and cuts nothing.
+fn refills(note: Note, event: &Event, sub: Option<SubKey>) -> Vec<Note> {
+    let mut windows: Vec<&'static str> = Vec::new();
+    for window in event.refilled.iter().filter_map(|w| window_word(w)) {
+        if !windows.contains(&window) {
+            windows.push(window);
+        }
+    }
+    let note = Note { sub, ..note };
+    if windows.is_empty() {
+        return vec![note];
+    }
+    windows
+        .into_iter()
+        .map(|window| Note {
+            window: Some(window),
+            ..note
+        })
+        .collect()
 }
 
 /// The time a note that tells `word` carries, where it would naturally carry `natural` and the
@@ -1268,6 +1315,13 @@ fn notes_of(
     told: Option<&mut BTreeMap<String, Told>>,
 ) -> Vec<Note> {
     let key = |label: &str| key_of(after, label).or_else(|| key_of(before, label));
+    let workspace = |label: &str| {
+        [after, before]
+            .into_iter()
+            .find_map(|state| state.accounts.get(label))
+            .and_then(|account| account.key.as_ref())
+            .and_then(SubKey::workspace)
+    };
     let mut notes = Vec::new();
     let mut stated: BTreeMap<Key, Vec<(SignWord, Note)>> = BTreeMap::new();
     for event in events.iter_mut() {
@@ -1279,6 +1333,9 @@ fn notes_of(
         match of_ledger(cli, event, pk, to) {
             Some((Some(word), note)) if told.is_some() => {
                 stated.entry(pk).or_default().push((word, note));
+            }
+            Some((_, note)) if matches!(event.kind, Kind::ResetUsed | Kind::Reset) => {
+                notes.extend(refills(note, event, workspace(&event.account)));
             }
             Some((_, note)) => notes.push(note),
             None => {}

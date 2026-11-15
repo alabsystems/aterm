@@ -36,6 +36,7 @@ fn completed_cold_intent_survives_with_or_without_a_future_observation() {
             login: Some("/private/login".into()),
             owner: Some("work".into()),
             generation: "5".repeat(64),
+            purpose: crate::harness::accounts_pool::Purpose::Select,
         },
     ] {
         let text = aterm_json::to_string(&intent.to_value()).unwrap();

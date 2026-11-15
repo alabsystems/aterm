@@ -37,10 +37,10 @@
 //! Main's rule fails it: its `api-retry@v1` at the first minute is an act typed into the outage
 //! that is no try, and a second resume after the lift is one resume too many.
 
+use alab_policy::ladder::doubling;
 use aterm_agent::harness::acts::FACT_SEPARATOR;
-use aterm_agent::supervise::Outage;
-use aterm_agent::supervise::ladder::doubling;
 use aterm_agent::supervise::policy::turn_end::{self, Cleared, Clearing, RULE_OUTAGE_RESUME};
+use aterm_agent::supervise::{Outage, config};
 
 use super::surfaces::held::stall_of;
 use super::surfaces::{Ctx, observed, page_field};
@@ -61,7 +61,7 @@ pub const MODE: &str = "outage";
 /// The outage the stub stands: Claude Code reads its 529 as an overload.
 pub const WALL: Outage = Outage::Overload;
 
-/// The factor the outage modes scale the loop's ladders by (`turn_end::LADDER_SCALE_SEAM`): three
+/// The factor the outage modes scale the loop's ladders by (`config::LADDER_SCALE_SEAM`): three
 /// eighths, so the first rung (45 s) outlasts the take window (30 s, unscaled) a Cruise act that
 /// meets the outage is waited on for, as the shipped 2 min does, and the chain fits its
 /// [`LIMIT_MS`].
@@ -71,7 +71,7 @@ pub const SCALE: f64 = 0.375;
 /// [`SCALE`], which only a development build reads.
 #[must_use]
 pub fn env() -> String {
-    format!("{}={SCALE}", turn_end::LADDER_SCALE_SEAM)
+    format!("{}={SCALE}", config::LADDER_SCALE_SEAM)
 }
 
 /// How many acts meet the outage before the lab lifts it: its first three rungs, so the resume is
@@ -108,10 +108,10 @@ pub fn spec() -> J {
 }
 
 /// Rung `n` (from 1) of the outage's back-off, in ms: the policy's own ladder, `outage_first`
-/// doubled to `outage_cap` ([`turn_end::TurnEndTiming`]), scaled by `scale`.
+/// doubled to `outage_cap` ([`alab_policy::config::TurnEndTiming`]), scaled by `scale`.
 #[must_use]
 pub fn rung_ms(n: u32, scale: f64) -> i64 {
-    let t = turn_end::TurnEndTiming::default().ladder_scaled(scale);
+    let t = alab_policy::config::TurnEndTiming::default().ladder_scaled(scale);
     let rung = doubling(t.outage_first, n.max(1) - 1, t.outage_cap);
     i64::try_from(rung.as_millis()).unwrap_or(i64::MAX)
 }
@@ -828,7 +828,7 @@ fn judge_landed(
         ));
     };
     let before: Vec<&Act<'_>> = later.iter().filter(|a| a.at < done.0).collect();
-    let checked = matches!(before[..], [a] if a.rule == turn_end::RULE_LAND_CHECK);
+    let checked = matches!(before[..], [a] if a.rule == alab_policy::land_check::RULE_LAND_CHECK);
     if let Some(a) = before.first().filter(|_| !checked) {
         return Verdict::Fail(format!(
             "{said}; NOT LANDED ON THE RESUME'S ANSWER: {} typed at +{} before the landing at +{}",

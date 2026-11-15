@@ -3,7 +3,7 @@
 
 //! Synthetic accounts for tests of what the outlook and the glass say: a roster, an accounts
 //! state and series rows built through the stores' own writers ([`Fx`]), and the glass design's
-//! four cases (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1) at its now, Thu 5 Nov 2026
+//! five cases (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1) at its now, Thu 5 Nov 2026
 //! 17:00, UTC. The outlook's and the quota view's tests build on it, and so do the window's
 //! (its quota row's gallery draws [`cases`]) and its private-dev `harness-layouts` scene, which a
 //! debug build or one with `dev-seams` compiles; no shipped build reaches it.
@@ -36,6 +36,8 @@ pub struct Fx {
     pub enrolled: BTreeSet<String>,
     pub series: BTreeMap<String, Vec<SeriesRow>>,
     pub renewals: BTreeMap<String, String>,
+    /// Each label's peer bounds ([`Inputs::lab`]).
+    pub lab: BTreeMap<String, super::alab_seen::Bounds>,
     pub mode: Mode,
     pub credits: bool,
     pub now: i64,
@@ -70,6 +72,7 @@ impl Fx {
             enrolled,
             series: BTreeMap::new(),
             renewals: BTreeMap::new(),
+            lab: BTreeMap::new(),
             mode: Mode::Early,
             credits: false,
             now: NOW,
@@ -175,6 +178,7 @@ impl Fx {
             enrolled: &self.enrolled,
             series: &self.series,
             renewals: &self.renewals,
+            lab: &self.lab,
             mode: self.mode,
             credits: self.credits,
             now: self.now,
@@ -267,6 +271,37 @@ pub fn case_d() -> Fx {
     fx
 }
 
+/// Case (e): three accounts named by their emails, `main` (`ledgerbooks@example.com`) at 86% of
+/// its week and read now, and two pool accounts with no figure whose addresses share their
+/// first twelve characters: `pool1` (`tidepool.m1.2@example.com`) never read, and `pool2`
+/// (`tidepool.m1.5@example.com`) read before a reset that has passed. A plain cut of each
+/// local part to twelve cells reads `tidepool.m1…` twice, and neither has a figure to show:
+/// the row names them apart and says why each has none (§2.1, §2.5).
+pub fn case_e() -> Fx {
+    let mut fx = Fx::new(&[
+        ("main", Class::Preferred),
+        ("pool1", Class::Pool),
+        ("pool2", Class::Pool),
+    ]);
+    fx.now = T5;
+    for (row, email) in fx.roster.rows.iter_mut().zip([
+        "ledgerbooks@example.com",
+        "tidepool.m1.2@example.com",
+        "tidepool.m1.5@example.com",
+    ]) {
+        row.email = Some(email.to_owned());
+    }
+    fx.plan("main", "max", Some("20x"), T5 - H);
+    for (t, x10) in [(T5 - 24 * H, 760), (T5 - 12 * H, 810)] {
+        fx.fig("main", t, None, Some((x10, SAT7)));
+    }
+    fx.read("main", None, Some((860, SAT7)), T5);
+    fx.read("pool2", None, Some((400, T5 - D)), T5 - 3 * D);
+    fx.ran("main", T5);
+    fx.session("s-main", "main", T5);
+    fx
+}
+
 /// The words the tap prints under the composer's bottom rule for the tab `view` is of
 /// ([`super::tap::Reading::week_words`]), said on [`utc`] at the view's now: its account's week,
 /// as the view reads it, and its reset; no figure (`week · no figure yet`) where the view has
@@ -309,9 +344,10 @@ pub fn tap_words(view: &QuotaView) -> String {
     .week_words(view.as_of, Some(&utc()))
 }
 
-/// The design's four cases as `main`'s tab sees them, each named by its letter: one account
+/// The design's cases as `main`'s tab sees them, each named by its letter: one account
 /// with room (a), one that runs out before its reset (b), three whose work moves and then
-/// waits (c), and one never read (d).
+/// waits (c), one never read (d), and one read beside two unread accounts whose names a plain
+/// cut makes one (e).
 #[must_use]
 pub fn cases() -> Vec<(&'static str, QuotaView)> {
     [
@@ -319,6 +355,7 @@ pub fn cases() -> Vec<(&'static str, QuotaView)> {
         ("b", case_b()),
         ("c", case_c()),
         ("d", case_d()),
+        ("e", case_e()),
     ]
     .into_iter()
     .map(|(name, fx)| (name, fx.outlook().quota("main", None, true)))

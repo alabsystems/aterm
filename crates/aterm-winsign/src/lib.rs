@@ -13,6 +13,10 @@ use std::process::Command;
 
 pub use aterm_update_core::pins;
 
+pub mod msix;
+pub mod principal;
+use principal::{Miss, Principal};
+
 /// Tier WINDOWS, read off the committed anchor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tier {
@@ -130,10 +134,20 @@ pub const fn decode_winsign_summary_le(bytes: [u8; 16]) -> (u64, i32, u32) {
     (publisher_hash, code as i32, flags)
 }
 
+/// A file opened for reading at any offset (a package [`msix`] reads by its ZIP directory).
+pub trait ReadSeek: std::io::Read + std::io::Seek {}
+
+impl<T: std::io::Read + std::io::Seek> ReadSeek for T {}
+
 /// Everything this tool needs from the machine, behind one trait so every decision is testable against a fake.
 pub trait Host {
     fn env(&self, key: &str) -> Option<String>;
     fn is_file(&self, path: &Path) -> bool;
+    /// The file at `path`, for reading.
+    ///
+    /// # Errors
+    /// Why it could not be opened, naming `path`.
+    fn open(&self, path: &Path) -> Result<Box<dyn ReadSeek + '_>, String>;
     /// Directory entry names, or empty when the directory cannot be read.
     fn list_dir(&self, path: &Path) -> Vec<String>;
     fn write(&self, path: &Path, text: &str) -> Result<(), String>;
@@ -143,11 +157,16 @@ pub trait Host {
     fn home(&self) -> Option<PathBuf>;
     /// The SDK's `bin\<version>\<arch>` subdirectory for this machine.
     fn sdk_arch(&self) -> &'static str;
-    /// Run a tool with extra environment (`DOTNET_ROOT` for the Trusted Signing
-    /// plug-in when the runtime is a user-local install).
+    /// Run a tool with extra environment (for the Trusted Signing plug-in, the Azure principal
+    /// and, when the runtime is a user-local install, `DOTNET_ROOT`).
     fn run(&self, program: &Path, args: &[String], env: &[(String, String)])
     -> Result<Ran, String>;
     fn is_windows(&self) -> bool;
+    /// Lane A's Azure principal ([`principal::from_vault`]).
+    ///
+    /// # Errors
+    /// Why this host holds none; with [`Miss::File`], also the request filed for it.
+    fn azure_principal(&self, miss: Miss) -> Result<Principal, String>;
 }
 
 /// The real machine.
@@ -185,6 +204,11 @@ impl Host for RealHost {
     }
     fn is_file(&self, path: &Path) -> bool {
         path.is_file()
+    }
+    fn open(&self, path: &Path) -> Result<Box<dyn ReadSeek + '_>, String> {
+        std::fs::File::open(path)
+            .map(|f| Box::new(std::io::BufReader::new(f)) as Box<dyn ReadSeek>)
+            .map_err(|e| format!("{}: {e}", path.display()))
     }
     fn list_dir(&self, path: &Path) -> Vec<String> {
         std::fs::read_dir(path)
@@ -285,8 +309,12 @@ impl Host for RealHost {
         args: &[String],
         env: &[(String, String)],
     ) -> Result<Ran, String> {
-        let out = Command::new(program)
-            .args(args)
+        let mut command = Command::new(program);
+        command.args(args);
+        for name in stripped(env, std::env::vars_os().map(|(name, _)| name)) {
+            command.env_remove(name);
+        }
+        let out = command
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .map_err(|e| format!("could not run {}: {e}", program.display()))?;
@@ -298,6 +326,9 @@ impl Host for RealHost {
     }
     fn is_windows(&self) -> bool {
         cfg!(windows)
+    }
+    fn azure_principal(&self, miss: Miss) -> Result<Principal, String> {
+        principal::from_vault(miss)
     }
 }
 
@@ -317,7 +348,7 @@ pub enum Lane {
 /// Tier WINDOWS's Lane A identity, committed beside its anchor
 /// (`pins::WINDOWS_SIGNING_PUBLISHER`): the Azure Artifact Signing endpoint, account and
 /// certificate profile, empty until the identity exists. None of the three is a secret; the
-/// plug-in authenticates the Azure principal itself.
+/// principal that signs comes from the vault ([`principal`]).
 pub const TRUSTED_SIGNING: [&str; 3] = ["", "", ""];
 
 /// Tier WINDOWS's Lane B identity: the SHA-1 thumbprint of a certificate in
@@ -581,8 +612,23 @@ pub fn find_dotnet_runtime(host: &dyn Host) -> Result<DotnetRuntime, String> {
     ))
 }
 
-/// The Trusted Signing metadata file the dlib reads (`/dmdf`). It excludes the plug-in's
-/// interactive browser credential, so a `sign` never waits on a person's sign-in.
+/// Every credential the plug-in's chain tries but the environment's, which carries the vault's
+/// principal: no az, PowerShell, azd or Visual Studio session, managed or workload identity,
+/// token cache or browser sign-in signs in its place, and no `sign` waits on a person.
+pub const EXCLUDED_CREDENTIALS: [&str; 9] = [
+    "ManagedIdentityCredential",
+    "WorkloadIdentityCredential",
+    "SharedTokenCacheCredential",
+    "VisualStudioCredential",
+    "VisualStudioCodeCredential",
+    "AzureCliCredential",
+    "AzurePowerShellCredential",
+    "AzureDeveloperCliCredential",
+    "InteractiveBrowserCredential",
+];
+
+/// The Trusted Signing metadata file the dlib reads (`/dmdf`), excluding
+/// [`EXCLUDED_CREDENTIALS`].
 #[must_use]
 pub fn trusted_signing_metadata(endpoint: &str, account: &str, profile: &str) -> String {
     fn esc(s: &str) -> String {
@@ -600,11 +646,16 @@ pub fn trusted_signing_metadata(endpoint: &str, account: &str, profile: &str) ->
         }
         out
     }
+    let excluded: Vec<String> = EXCLUDED_CREDENTIALS
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect();
     format!(
-        "{{\n  \"Endpoint\": \"{}\",\n  \"CodeSigningAccountName\": \"{}\",\n  \"CertificateProfileName\": \"{}\",\n  \"ExcludeCredentials\": [\"InteractiveBrowserCredential\"]\n}}\n",
+        "{{\n  \"Endpoint\": \"{}\",\n  \"CodeSigningAccountName\": \"{}\",\n  \"CertificateProfileName\": \"{}\",\n  \"ExcludeCredentials\": [{}]\n}}\n",
         esc(endpoint),
         esc(account),
-        esc(profile)
+        esc(profile),
+        excluded.join(", ")
     )
 }
 
@@ -824,13 +875,20 @@ pub const USAGE: &str =
     "aterm-winsign — Authenticode signing of the shipped Windows exe (Tier WINDOWS)
 
 USAGE
-  targo --unverified winsign sign   [options] <exe>...   sign, then read the signature back and judge it
-  targo --unverified winsign verify [options] <exe>...   read the signature back and judge it (no signing)
+  targo --unverified winsign sign   [options] <file>...  sign, then read the signature back and judge it
+  targo --unverified winsign verify [options] <file>...  read the signature back and judge it (no signing)
   targo --unverified winsign doctor [options]            what this machine can sign with, and what is missing
   targo --unverified winsign help
 
 The identity it signs with is committed: TRUSTED_SIGNING (Lane A) or THUMBPRINT
 (Lane B) in crates/aterm-winsign/src/lib.rs, beside pins::WINDOWS_SIGNING_PUBLISHER.
+
+A package (.msix, .appx, .msixbundle, .appxbundle) installs only when its
+manifest's Identity Publisher is its signer's subject (else 0x80080204). `sign`
+refuses one whose Publisher is missing or malformed, or, under an active tier,
+whose CN is not the pinned publisher, before signtool runs; `sign` and `verify`
+refuse a signed one whose Publisher is not the signer's subject as Windows
+writes it.
 
 OPTIONS
   --signtool <path>      signtool.exe (default: PATH, then the newest Windows SDK)
@@ -839,9 +897,12 @@ OPTIONS
 EXIT
   0 verdict accepted, `doctor` READY, or `help`
   1 bad signing or verdict: unsigned, untrusted chain, refused by the active
-    tier, or signtool ran and exited non-zero (its output printed)
+    tier, a signed package whose Publisher is not its signer's subject, or
+    signtool ran and exited non-zero (its output printed)
   2 nothing signed and no verdict read: bad arguments, no pinned identity,
-    or a missing tool
+    no Azure principal in this host's vault (a miss is filed with the lab),
+    a package whose Publisher is missing, malformed or not the pinned
+    publisher's, or a missing tool
 
 Identity: Azure Artifact Signing or a publicly trusted code-signing
 certificate; apps/aterm-win/SIGNING.md is the runbook.";
@@ -878,6 +939,21 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
 
 /// Run the tool against the committed [`tier()`] and [`pinned_lane()`]. An invalid pin fails
 /// only the verbs that sign with it (`sign`, `doctor`); `help` and `verify` need no lane.
+/// THE INHERITED VARIABLES A RUN THAT CARRIES THE PRINCIPAL (`env`) DROPS: every `AZURE_*` of
+/// winsign's own, so the vault's principal alone decides where its secret goes (no inherited
+/// authority host or extra tenant steers it). A run with no principal drops nothing.
+fn stripped(
+    env: &[(String, String)],
+    inherited: impl Iterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    if env.is_empty() {
+        return Vec::new();
+    }
+    inherited
+        .filter(|name| name.to_string_lossy().starts_with("AZURE_"))
+        .collect()
+}
+
 pub fn run(args: Vec<String>, host: &dyn Host) -> i32 {
     let pinned = pinned_lane();
     exit_code(run_inner(
@@ -916,7 +992,7 @@ fn run_inner(
         "doctor" => Ok(doctor(host, tier, lane, &flags)),
         "verify" => {
             if flags.files.is_empty() {
-                return Err("verify needs at least one exe".into());
+                return Err("verify needs at least one file".into());
             }
             let signtool = find_signtool(host, flags.signtool.as_deref())?;
             let mut code = 0;
@@ -935,23 +1011,6 @@ fn run_inner(
 /// Why `sign` has nothing to sign with: a fact about the committed identity, not a request.
 const NO_IDENTITY: &str = "no Windows signing identity is pinned (TRUSTED_SIGNING and THUMBPRINT in crates/aterm-winsign/src/lib.rs are empty)";
 
-/// Why Lane A has no Azure principal: a fact about this host, not a request.
-const NO_PRINCIPAL: &str = "no Azure signing principal on this host (no AZURE_TENANT_ID, AZURE_CLIENT_ID and AZURE_CLIENT_SECRET, no az CLI)";
-
-/// The non-interactive source the plug-in authenticates the Azure principal from, if any.
-fn azure_principal(host: &dyn Host) -> Option<&'static str> {
-    if ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"]
-        .iter()
-        .all(|k| host.env(k).is_some())
-    {
-        Some("service-principal environment")
-    } else if find_on_path(host, "az").is_some() {
-        Some("az CLI session")
-    } else {
-        None
-    }
-}
-
 fn run_sign(
     host: &dyn Host,
     tier: &Tier,
@@ -960,11 +1019,18 @@ fn run_sign(
 ) -> Result<i32, String> {
     let files = &flags.files;
     if files.is_empty() {
-        return Err("sign needs at least one exe".into());
+        return Err("sign needs at least one file".into());
     }
     for f in files {
         if !host.is_file(f) {
             return Err(format!("not a file: {}", f.display()));
+        }
+    }
+    for f in files {
+        if let Some(kind) = msix::Kind::of(f) {
+            msix::publisher(host, f, kind)
+                .and_then(|publisher| msix::admit(tier, &publisher))
+                .map_err(|why| format!("{}: {why}", f.display()))?;
         }
     }
     let Some(lane) = lane else {
@@ -972,6 +1038,10 @@ fn run_sign(
             Tier::Active { .. } => Err(format!("{tier}; {NO_IDENTITY}")),
             Tier::Inactive => Err(NO_IDENTITY.into()),
         };
+    };
+    let principal = match lane {
+        Lane::TrustedSigning { .. } => Some(host.azure_principal(Miss::File)?),
+        Lane::Thumbprint(_) => None,
     };
     let signtool = find_signtool(host, flags.signtool.as_deref())?;
     eprintln!("{tier}");
@@ -984,7 +1054,6 @@ fn run_sign(
             account,
             profile,
         } => {
-            let principal = azure_principal(host).ok_or(NO_PRINCIPAL)?;
             let dlib = find_dlib(host, flags.dlib.as_deref())?;
             let runtime = find_dotnet_runtime(host)?;
             if runtime.needs_root_env {
@@ -993,6 +1062,9 @@ fn run_sign(
                     runtime.root.display().to_string(),
                 ));
             }
+            if let Some(principal) = &principal {
+                child_env.extend_from_slice(principal.env());
+            }
             let meta = win_join(
                 host.temp_dir(),
                 [format!("aterm-winsign-{}.json", host.pid()).as_str()],
@@ -1000,7 +1072,7 @@ fn run_sign(
             host.write(&meta, &trusted_signing_metadata(endpoint, account, profile))?;
             eprintln!("lane: Azure Artifact Signing — {account} / {profile} at {endpoint}");
             eprintln!("dlib: {}", dlib.display());
-            eprintln!("azure identity: {principal}");
+            eprintln!("azure principal: from this host's vault, in signtool's environment");
             eprintln!(
                 "dotnet: {} at {}{}",
                 runtime.version,
@@ -1038,12 +1110,32 @@ fn run_sign(
     Ok(code)
 }
 
-/// Verify one file, print the verdict, and say whether the tier accepts it.
+/// Verify one file, print the verdict, and say whether the tier accepts it. A signed package is
+/// accepted only when its manifest `Publisher` is the signer's subject ([`msix::signed_as_published`]).
 fn report_file(host: &dyn Host, signtool: &Path, tier: &Tier, file: &Path) -> Result<bool, String> {
     let ran = host.run(signtool, &verify_args(file), &[])?;
     let report = parse_verify_output(&ran);
+    let accepted = report_verdict(file, &ran, &report, tier);
+    let Some(kind) = msix::Kind::of(file).filter(|_| report.signed) else {
+        return Ok(accepted);
+    };
     let name = file.display();
-    match judge(tier, &report) {
+    match msix::signed_as_published(host, file, kind) {
+        Ok(subject) => {
+            println!("{name}: manifest Publisher is the signer's subject `{subject}`");
+            Ok(accepted)
+        }
+        Err(why) => {
+            println!("{name}: REFUSED — {why}");
+            Ok(false)
+        }
+    }
+}
+
+/// Print the tier's verdict on one verified file and say whether it accepts it.
+fn report_verdict(file: &Path, ran: &Ran, report: &VerifyReport, tier: &Tier) -> bool {
+    let name = file.display();
+    match judge(tier, report) {
         Ok(()) => {
             if report.verified {
                 println!(
@@ -1056,10 +1148,10 @@ fn report_file(host: &dyn Host, signtool: &Path, tier: &Tier, file: &Path) -> Re
                         "NOT timestamped"
                     }
                 );
-                Ok(true)
+                true
             } else if !report.signed {
                 println!("{name}: UNSIGNED; Smart App Control may refuse it at any time");
-                Ok(false)
+                false
             } else {
                 println!(
                     "{name}: signed by `{}`, chain NOT trusted ({}); Code Integrity refuses it like an unsigned exe (apps/aterm-win/SIGNING.md)",
@@ -1071,13 +1163,13 @@ fn report_file(host: &dyn Host, signtool: &Path, tier: &Tier, file: &Path) -> Re
                     }
                 );
                 eprint!("{}{}", ran.stdout, ran.stderr);
-                Ok(false)
+                false
             }
         }
         Err(why) => {
             println!("{name}: REFUSED — {why}");
             eprint!("{}{}", ran.stdout, ran.stderr);
-            Ok(false)
+            false
         }
     }
 }
@@ -1140,10 +1232,10 @@ fn doctor(host: &dyn Host, tier: &Tier, lane: Result<Option<&Lane>, &str>, flags
                     ok = false;
                 }
             }
-            match azure_principal(host) {
-                Some(p) => println!("azure identity: {p}"),
-                None => {
-                    println!("azure identity: MISSING — {NO_PRINCIPAL}");
+            match host.azure_principal(Miss::Report) {
+                Ok(_) => println!("azure principal: held in this host's vault"),
+                Err(why) => {
+                    println!("azure principal: MISSING — {why}");
                     ok = false;
                 }
             }

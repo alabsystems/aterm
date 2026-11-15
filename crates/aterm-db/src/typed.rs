@@ -176,13 +176,21 @@ pub enum Ty {
     Hex(usize),
     /// Exactly this many decimal digits, kept as text (a phone's last four, `0101`).
     Digits(usize),
-    /// An address: personal, masked on every surface.
+    /// An address: ordinary data, shown as it is.
     Email,
+    /// A phone number: ordinary data, held in the registry's one stored form, its digits, 4 to
+    /// 15 of them, a US number without its leading 1 (`cell::phone_digits`' own output).
+    Phone,
     /// An https URL with no query or fragment.
     Url,
-    /// `{vault, entry, item?}`: names of a vault entry, never its value.
+    /// `{vault, entry, item?}`: the name of an `aterm secrets` entry, never its value. Every
+    /// secret a table knows of is one: the value lives only in the secret store.
     SecretRef,
-    /// An inner-sealed secret, revealed only through the local audited API.
+    /// A sealed `sec1:` token, as the registry's first and second generations hold a password,
+    /// TOTP seed or phone number: the type builds up to 0.200.0 read there. This build seals
+    /// no secret into one: a roll reseals a token from the generation before (`alab::roll`),
+    /// and a phone's number, which is ordinary data ([`Column::sealed_ordinary`]), is sealed
+    /// there because those builds read no other form.
     Secret,
     /// A structural row or set-element key, without a target-collection relation.
     Key,
@@ -212,15 +220,17 @@ impl Ty {
         }
     }
 
-    /// Whether a value of this type can hold an address, so every surface masks it.
-    pub const fn pii(&self) -> bool {
+    /// Whether a value of this type can hold an address. Nothing masks by it: it is the `pii`
+    /// member of a stored schema row ([`Collection::schema_row`]), which builds through 0.200.0
+    /// publish.
+    pub(crate) const fn holds_address(&self) -> bool {
         match self {
             Self::Email => true,
-            Self::Set(inner) | Self::List(inner, _) => inner.pii(),
+            Self::Set(inner) | Self::List(inner, _) => inner.holds_address(),
             Self::Struct(members) => {
                 let mut i = 0;
                 while i < members.len() {
-                    if members[i].ty.pii() {
+                    if members[i].ty.holds_address() {
                         return true;
                     }
                     i += 1;
@@ -246,6 +256,7 @@ impl Ty {
             Self::Hex(n) => json!({"hex": n}),
             Self::Digits(n) => json!({"digits": n}),
             Self::Email => json!("email"),
+            Self::Phone => json!("phone"),
             Self::Url => json!("url"),
             Self::SecretRef => json!("secret_ref"),
             Self::Secret => json!("secret"),
@@ -341,6 +352,14 @@ impl Column {
         self.writer = writer;
         self
     }
+    /// Whether this column holds ordinary data that its generation keeps sealed: a
+    /// [`Ty::Secret`] column whose name is no secret's ([`secret_named`]), as a phone's `number`
+    /// in the registry generations builds up to 0.200.0 read. Every reader of the table sees its
+    /// value, opened with nothing recorded (`att::open_ordinary`), and a write seals it.
+    pub const fn sealed_ordinary(&self) -> bool {
+        matches!(self.ty, Ty::Secret) && !secret_named(self.name)
+    }
+
     /// Whether the column exists at collection version `version`.
     pub const fn live_at(&self, version: u32) -> bool {
         self.since <= version
@@ -370,8 +389,9 @@ pub struct Collection {
 /// The default cap of an owned row (design §3.1).
 pub const MAX_OWNED_ROW: usize = 32 * 1024;
 
-/// Whether `name` contains one of the secret column words (the `contacts.rs` detail rule).
-const fn secret_named(name: &str) -> bool {
+/// Whether `name` contains one of the secret column words (the `contacts.rs` detail rule): such
+/// a column holds its own cell's secret, so it is a `SecretRef` bound to its cell's entries.
+pub const fn secret_named(name: &str) -> bool {
     let words: [&[u8]; 7] = [
         b"password",
         b"token",
@@ -482,7 +502,7 @@ impl Collection {
     }
 
     /// Whether this compiled declaration is well formed: the grammars, no reused column
-    /// name, secret-named columns only as Secret, a lifecycle column on every
+    /// name, secret-named columns only as SecretRef, a lifecycle column on every
     /// cells collection, and writers that fit the kind. Called by [`att_collection!`] at
     /// compile time, so a bad schema never builds.
     ///
@@ -517,8 +537,11 @@ impl Collection {
             if !column_name(column.name) {
                 return Err("column name breaks the column grammar");
             }
-            if secret_named(column.name) && !matches!(column.ty, Ty::Secret) {
-                return Err("a secret-named column must be Secret");
+            if secret_named(column.name) && !matches!(column.ty, Ty::SecretRef | Ty::Secret) {
+                return Err(
+                    "a secret-named column names a secret-store entry (SecretRef), or holds a \
+                     sealed token in a generation before the third (Secret)",
+                );
             }
             if let Some(claim) = column.claim {
                 if !matches!(self.kind, Kind::Cells) {
@@ -603,9 +626,12 @@ impl Collection {
                     Writer::Mine => "self",
                     Writer::Seed => "seed",
                 };
+                // `pii` is a retired member: no surface masks an address. It stays because a
+                // row's content is fixed at its collection version, and two different rows at
+                // one version are a split schema; it goes only with a version or format move.
                 let mut encoded = json!({"name": c.name, "type": c.ty.word(), "null": c.null,
                     "on_conflict": conflict, "since": c.since, "retired": c.retired,
-                    "pii": c.ty.pii(), "writer": writer});
+                    "pii": c.ty.holds_address(), "writer": writer});
                 if let Some(claim) = c.claim {
                     encoded.as_object_mut().unwrap().insert(
                         "claim".into(),
@@ -656,6 +682,19 @@ impl Table {
     /// The collection named `name`.
     pub fn collection(&self, name: &str) -> Option<&'static Collection> {
         self.collections.iter().copied().find(|c| c.name == name)
+    }
+
+    /// Whether a secret cell of this table names a secret-store entry: one of its secret-named
+    /// columns ([`secret_named`]) is a [`Ty::SecretRef`]. A table without one holds its secrets,
+    /// if any, as sealed tokens ([`Ty::Secret`]).
+    #[must_use]
+    pub fn names_store(&self) -> bool {
+        self.collections.iter().any(|collection| {
+            collection
+                .columns
+                .iter()
+                .any(|column| matches!(column.ty, Ty::SecretRef) && secret_named(column.name))
+        })
     }
 }
 

@@ -7,12 +7,13 @@
 //! 1. **Negative control (mailbox config withheld)**: starts the instance with an unenrolled
 //!    Claude roster row and no `ai-mailbox.toml`, verifying window upkeep records
 //!    `AttemptOutcome::NoRoute` (`"no-route"`) and leaves the row unenrolled.
-//! 2. **Positive flow (mailbox config supplied)**: supplies `~/.secrets/ai-mailbox.toml` +
+//! 2. **Positive flow (mailbox config supplied)**: publishes the scratch vault's `ai-mailbox.toml` +
 //!    incoming verification email, wakes upkeep, measures sign-in latency until the row is
 //!    enrolled via `Route::Mailbox`, launches `claude` on the newly bound login directory, and
 //!    serves a turn (`state.account(&label).ran_at.is_some()` and `logins[&label].served_at.is_some()`).
 //! 3. **`--live` mode**: runs the same measured proof against the host's real `claude` binary and
-//!    `~/.secrets/ai-mailbox.toml` (or `--mailbox PATH`).
+//!    the vault's `ai-mailbox.toml` entry, read in place from this Mac's verified store (or
+//!    `--mailbox PATH`).
 //!
 //! A passing run, in either mode, writes what it measured to the lab's state,
 //! `results/claude-mailbox-signin-<UTC time>.md` ([`write_measured_report`]).
@@ -334,24 +335,19 @@ pub fn write_verification_email(maildir: &Path, email: &str, otp: &str) -> Resul
     Ok(path)
 }
 
-/// Write `~/.secrets/ai-mailbox.toml` (`0600`) pointing at `maildir` with a password for `email`.
+/// Publish the scratch `home`'s vault entry `ai-mailbox.toml`, pointing at `maildir` with a
+/// password for `email`, read in place by a stand-in run under that home.
 pub fn write_hermetic_ai_mailbox_toml(
     home: &Path,
     maildir: &Path,
     email: &str,
-) -> Result<PathBuf, String> {
-    let secrets = home.join(".secrets");
-    crate::util::create_private_dir_all(&secrets)
-        .map_err(|e| format!("create {}: {e}", secrets.display()))?;
-    let path = secrets.join(SECRETS_MAILBOX_TOML_FILE);
+) -> Result<(), String> {
     let body = format!(
         "dir = \"{}\"\n\n[passwords]\n\"{}\" = \"hermetic-mailbox-pass\"\n",
         escape(&maildir.to_string_lossy()),
         escape(&email.to_ascii_lowercase()),
     );
-    sys::put(&path, 0o600, &sys::PutSrc::Bytes(body.as_bytes()))
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(path)
+    crate::util::publish_scratch_entry(home, SECRETS_MAILBOX_TOML_FILE, body.as_bytes())
 }
 
 fn resolve_host_claude() -> Option<PathBuf> {
@@ -423,43 +419,36 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
     let aterm = resolve_aterm(opts.aterm.clone())?;
 
     let (live_mailbox_bytes, label, email, host_claude) = if opts.live {
-        let mbx_src = opts.mailbox.as_deref().map_or_else(
-            || {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("/var/empty"))
-                    .join(".secrets")
-                    .join(SECRETS_MAILBOX_TOML_FILE)
-            },
-            PathBuf::from,
-        );
-        if !mbx_src.is_file() {
-            return Err(Fail::die(format!(
-                "swarm mailbox-signin --live: {} does not exist; publish it first with \
-                 `aterm secrets set ai-mailbox.toml --file <path>`",
-                mbx_src.display()
-            )));
-        }
-        let raw = crate::util::read_regular_file(&mbx_src)
-            .map_err(|e| format!("read {}: {e}", mbx_src.display()))?;
+        // An explicit `--mailbox PATH` is the operator's own file; with none, the vault's
+        // entry is read in place from this Mac's verified store, never from a file.
+        let (raw, mbx_src) = if let Some(path) = opts.mailbox.as_deref() {
+            let path = PathBuf::from(path);
+            let raw = crate::util::read_regular_file(&path)
+                .map_err(|e| format!("read {}: {e}", path.display()))?;
+            (raw, path.display().to_string())
+        } else {
+            let paths = aterm_secrets::client::Paths::locate()
+                .map_err(|e| format!("locate this Mac's vault: {e}"))?;
+            let held = aterm_secrets::client::read_in_place(&paths, SECRETS_MAILBOX_TOML_FILE)
+                .map_err(|e| format!("read the vault entry {SECRETS_MAILBOX_TOML_FILE}: {e}"))?
+                .ok_or_else(|| {
+                    Fail::die(format!(
+                        "swarm mailbox-signin --live: this Mac's vault holds no \
+                         {SECRETS_MAILBOX_TOML_FILE} entry; publish it first with \
+                         `aterm secrets set {SECRETS_MAILBOX_TOML_FILE} --file <path>`"
+                    ))
+                })?;
+            (
+                held.as_slice().to_vec(),
+                format!("the vault entry {SECRETS_MAILBOX_TOML_FILE}"),
+            )
+        };
         let tmp_check = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
         // `sys::put` refuses a link in its path, as macOS's `/var` is.
         let tmp_root = std::fs::canonicalize(tmp_check.path()).map_err(|e| e.to_string())?;
-        let tmp_secrets = tmp_root.join(".secrets");
-        std::fs::create_dir_all(&tmp_secrets).map_err(|e| e.to_string())?;
-        sys::put(
-            &tmp_secrets.join(SECRETS_MAILBOX_TOML_FILE),
-            0o600,
-            &sys::PutSrc::Bytes(&raw),
-        )
-        .map_err(|e| e.to_string())?;
-        let parsed =
-            headless_oauth::discover_mailbox_config(Some(&tmp_root), None).ok_or_else(|| {
-                Fail::die(format!(
-                    "{} parsed no mailbox configuration",
-                    mbx_src.display()
-                ))
-            })?;
+        crate::util::publish_scratch_entry(&tmp_root, SECRETS_MAILBOX_TOML_FILE, &raw)?;
+        let parsed = headless_oauth::discover_mailbox_config(Some(&tmp_root), None)
+            .ok_or_else(|| Fail::die(format!("{mbx_src} parsed no mailbox configuration")))?;
         let email = pick_live_email(&parsed, opts.email.as_deref()).ok_or_else(|| {
             Fail::die(
                 "swarm mailbox-signin --live: pass `--email <addr>` or list an email under [passwords] in ai-mailbox.toml",

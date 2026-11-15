@@ -12,8 +12,8 @@
 //! every one, so no table takes back as its own word what that edit withdrew. Its header row is
 //! every column the table's rows or their concurrent values hold: the known ones in
 //! [`DUMP_TABLES`] order, then any other in name order, so **every column is carried or
-//! reported**. [`DUMP_TABLES`] says where each known column goes: a registry cell, a `Secret`
-//! cell, a relation the registry already states another way, the row's key, or nowhere by the
+//! reported**. [`DUMP_TABLES`] says where each known column goes: a registry cell, a secret cell
+//! (its value put into a named secret-store entry, the cell naming the entry), a relation the registry already states another way, the row's key, or nowhere by the
 //! design's word (`ip`: addresses come from presence). A column it does not name is an
 //! [`Kind::Unmapped`] finding, by name only, and its text never enters the sheet: it may be a
 //! credential by a word no list here holds, and a review shows the text at a finding's coordinates.
@@ -59,7 +59,7 @@ pub(super) const REDACTED: &str = "<redacted>";
 pub enum Carry {
     /// A registry cell: `collection.column`.
     Cell(&'static str, &'static str),
-    /// A registry `Secret` cell.
+    /// A registry secret cell: the value goes into a secret-store entry, which the cell names.
     Secret(&'static str, &'static str),
     /// The registry states it as a relation (an address's `phone`, a preference): named.
     Relation(&'static str),
@@ -79,7 +79,7 @@ pub const DUMP_TABLES: [DumpTable; 4] = [
         "phones",
         Dump::Phones,
         &[
-            ("phone", Carry::Secret("phone", "number")),
+            ("phone", Carry::Cell("phone", "number")),
             ("label", Carry::Cell("phone", "label")),
             ("owner_carrier", Carry::Cell("phone", "carrier")),
             ("line_type", Carry::Cell("phone", "line_type")),

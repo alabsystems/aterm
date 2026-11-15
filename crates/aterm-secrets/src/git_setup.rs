@@ -133,7 +133,7 @@ impl Image {
         let bytes = fsx::read_owned(program, 512 * 1024 * 1024)?
             .ok_or_else(|| error("protected developer image disappeared"))?;
         protected(program)?;
-        let digest = crate::materialize::digest_hex(&bytes);
+        let digest = crate::digest_hex(&bytes);
         let path = home
             .join(".local/libexec/aterm/git-helper")
             .join(&digest)
@@ -372,27 +372,6 @@ fn apply(home: &Path, program: &Path, changes: &[Change]) -> crate::Result<Optio
 pub fn setup(home: &Path, program: &Path, write: bool) -> crate::Result<Report> {
     let image = Image::prepare(home, program)?;
     let changes = plan(home, &image.path)?;
-    let paths = crate::client::Paths::locate_for_home(home);
-    let tracked = crate::client::delivered_files(&paths)?;
-    for change in &changes {
-        if tracked.contains(&change.path) {
-            let expected = crate::client::config(&paths)?
-                .ok_or_else(|| error("tracked Git configuration has no vault source"))?;
-            let rel = change
-                .path
-                .strip_prefix(home)
-                .map_err(|_| error("configuration leaves the actual home"))?;
-            let name = format!("~/{}", rel.display());
-            let entry = crate::client::read_verified_entry(&paths, &expected, &name)?
-                .ok_or_else(|| error("Git configuration is not an intact authenticated default"))?;
-            if !entry.unanchored_default() || entry.value().as_slice() != change.original.as_slice()
-            {
-                return Err(error(
-                    "always-managed or anchored Git configuration requires its owner's change; local setup did nothing",
-                ));
-            }
-        }
-    }
     let backup = if write {
         image.install()?;
         apply(home, &image.path, &changes)?

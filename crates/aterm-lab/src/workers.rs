@@ -195,10 +195,7 @@ impl Plan {
                 continue;
             }
             steps.push(say(&w.token, &w.defense));
-            steps.push(say(
-                &w.token,
-                aterm_agent::supervise::policy::land_check::LANDED,
-            ));
+            steps.push(say(&w.token, alab_policy::land_check::LANDED));
         }
         J::Arr(steps)
     }
@@ -620,6 +617,25 @@ fn rides_parent_mode(argv: &[String]) -> bool {
     argv.windows(2).any(|pair| pair == PARENT_MODE)
 }
 
+fn spawn_sid(result: &str) -> Option<&str> {
+    let result = result.trim();
+    aterm_agent::spawned_tab_id(result)?;
+    result.strip_prefix("OK ")?.split_whitespace().next()
+}
+
+fn spawn_time(mgr: &[Row], sid: &str) -> Option<i64> {
+    mgr.iter()
+        .find(|r| r.kind == "user" && r.result.as_deref().and_then(spawn_sid) == Some(sid))
+        .and_then(|r| r.ts)
+}
+
+fn spawn_times(mgr: &[Row]) -> Vec<i64> {
+    mgr.iter()
+        .filter(|r| r.result.as_deref().and_then(spawn_sid).is_some())
+        .filter_map(|r| r.ts)
+        .collect()
+}
+
 /// The sids of the manager's spawn results, in order (`OK <sid>`, the first word after `OK`: a
 /// spawn from an agent's tab names its request after it, `OK <sid> req=<id>`), each tool result
 /// once.
@@ -636,14 +652,8 @@ pub(crate) fn spawned(mgr: &[Row]) -> Vec<String> {
             }
             seen.push(r.tool_id.as_str());
         }
-        if let Some(h) = t
-            .trim()
-            .strip_prefix("OK ")
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|sid| sid.strip_prefix("s-"))
-            .filter(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
-            out.push(format!("s-{h}"));
+        if let Some(sid) = spawn_sid(t) {
+            out.push(sid.to_owned());
         }
     }
     out
@@ -1155,15 +1165,7 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
             wrote.trim() == w.token,
             &format!("{label}: its Bash ran: {} holds its token", w.file),
         );
-        let spawn_ms = mgr
-            .iter()
-            .find(|r| {
-                r.kind == "user"
-                    && r.result
-                        .as_deref()
-                        .is_some_and(|t| t.trim() == format!("OK {sid}"))
-            })
-            .and_then(|r| r.ts);
+        let spawn_ms = spawn_time(mgr, sid);
         let prompt_ms = first_prompt(wt).and_then(|r| r.ts);
         let reply_ms = wt
             .iter()
@@ -1332,7 +1334,7 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
     )];
     for (k, w) in plan.workers.iter().enumerate() {
         if let Some(s) = sids.get(k) {
-            let landed = aterm_agent::supervise::policy::land_check::LANDED;
+            let landed = alab_policy::land_check::LANDED;
             asked_said.push((s.clone(), w.token.clone(), head(landed), end(landed)));
         }
     }
@@ -1357,7 +1359,14 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
     })?;
     let survey_wait = now() - t_end;
     let text = survey.stdout.clone();
-    let session_lines: Vec<&str> = text.lines().filter(|l| l.starts_with("s-")).collect();
+    let session_lines: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            l.split(' ')
+                .next()
+                .is_some_and(aterm_types::tab_id::is_tab_id)
+        })
+        .collect();
     let shown = survey_shown(&text, &asked_said);
     let long = session_lines
         .iter()
@@ -1464,15 +1473,7 @@ fn run_workers(tag: &str, upgrade: Option<&str>, early: bool) -> Result<Verdict,
             secs(wall_ms(last), w_ts)
         );
     }
-    let spawn_results: Vec<i64> = mgr
-        .iter()
-        .filter(|r| {
-            r.result
-                .as_deref()
-                .is_some_and(|t| t.trim().starts_with("OK s-"))
-        })
-        .filter_map(|r| r.ts)
-        .collect();
+    let spawn_results = spawn_times(mgr);
     if let (Some(first), Some(last)) = (spawn_results.first(), spawn_results.last()) {
         println!(
             "  spawns    prompt -> first OK <sid> {}; first -> third {}",

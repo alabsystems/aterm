@@ -7,7 +7,7 @@
 mod native {
     use aterm_spec::wait::{MUST_HAPPEN, until_within};
     use aterm_uds::process::{Identity, read_identity};
-    use aterm_uds::spawnfd::{Child, Tether as _, command};
+    use aterm_uds::spawnfd::{Child, command};
     use std::path::{Path, PathBuf};
 
     const WORLD: &str = "ATERM_TETHER_IMAGE_TEST_WORLD";
@@ -98,9 +98,11 @@ mod native {
                 "parent" | "recover" | "prepared" | "qualified" => {
                     let prepared = match role.as_str() {
                         "prepared" => aterm_uds::tether::executable().map(Path::to_path_buf),
-                        "qualified" => aterm_uds::tether::prepared_executable()
-                            .expect("qualify helper before update")
-                            .map(Path::to_path_buf),
+                        "qualified" => aterm_uds::tether::prepared_executable_within(
+                            aterm_uds::deadline::FIRST_EXEC_HANG,
+                        )
+                        .expect("qualify helper before update")
+                        .map(Path::to_path_buf),
                         _ => None,
                     };
                     if matches!(role.as_str(), "prepared" | "qualified") {
@@ -161,7 +163,7 @@ mod native {
                         .arg("worker")
                         .env(WORLD, &world)
                         .process_group(0)
-                        .tether();
+                        .require_tether();
                     let mut worker = Owned(worker.spawn().unwrap());
                     line(&world, "worker-pid", &worker.0.id().to_string());
                     if default {

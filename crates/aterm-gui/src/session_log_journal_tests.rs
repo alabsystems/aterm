@@ -15,8 +15,13 @@ use aterm_slog::{
 
 use super::fs::mem::{Fault, MemFs};
 use super::fs::{JournalFs, Meta, list};
-use super::read::{Budgets, Index, JournalRead, view_with};
+use super::read::{Budgets, Index, JournalRead, view_picked};
 use super::*;
+
+/// Read `sid`'s newest log from `fs` within `b`.
+fn view_with(fs: &dyn JournalFs, index: &Mutex<Index>, sid: &ShortId, b: Budgets) -> JournalRead {
+    view_picked(fs, index, sid, aterm_slog::journal::Pick::Newest, b)
+}
 use crate::session_timeline::SessionTimeline;
 
 const HANG: Duration = Duration::from_secs(60);
@@ -3143,7 +3148,12 @@ fn a_cold_read_decodes_no_more_than_a_warm_one() {
     let sid = ShortId::new("s-cold").expect("sid");
     let index = Mutex::new(Index::default());
     let read = |cost: &mut super::read::ReadCost| match super::read::view_costed(
-        &rig.fs, &index, &sid, b, cost,
+        &rig.fs,
+        &index,
+        &sid,
+        aterm_slog::journal::Pick::Newest,
+        b,
+        cost,
     ) {
         JournalRead::View(v) => all(&v.log),
         other => panic!("found: {other:?}"),
@@ -3161,7 +3171,14 @@ fn a_cold_read_decodes_no_more_than_a_warm_one() {
     );
     assert_eq!(warm.indexed, 0, "nothing new to index");
     let mut whole = super::read::ReadCost::default();
-    let _ = super::read::view_costed(&rig.fs, &index, &sid, Budgets::READER, &mut whole);
+    let _ = super::read::view_costed(
+        &rig.fs,
+        &index,
+        &sid,
+        aterm_slog::journal::Pick::Newest,
+        Budgets::READER,
+        &mut whole,
+    );
     assert!(whole.decoded > bound, "{whole:?}");
 }
 

@@ -11,12 +11,18 @@ use aterm_agent::harness::native_act::Process;
 use aterm_agent::harness::native_act::{Constructor, Image};
 use aterm_agent::supervise::SupervisorConfig;
 
+#[cfg(unix)]
+#[path = "codex_retained_service.rs"]
+mod retained_service;
+
 pub(crate) const fn cold_restart_qualified() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
 #[derive(Default)]
 pub(crate) struct SessionPolicy {
+    #[cfg(unix)]
+    retained: std::sync::Mutex<Vec<retained_service::Controller>>,
     #[cfg(all(unix, any(test, debug_assertions)))]
     fixture: Option<FixturePolicy>,
     #[cfg(all(unix, any(test, debug_assertions)))]
@@ -24,6 +30,108 @@ pub(crate) struct SessionPolicy {
 }
 
 impl SessionPolicy {
+    #[cfg(all(unix, debug_assertions))]
+    pub(crate) fn observe_retained_backends(
+        &self,
+    ) -> Result<
+        Vec<aterm_agent::harness::native_act::Process>,
+        aterm_agent::harness::codex_source_registry::Error,
+    > {
+        use aterm_agent::harness::codex_source_registry::Error;
+        let services = self.retained.try_lock().map_err(|_| Error::Busy)?;
+        if services.is_empty() {
+            return Err(Error::Unavailable);
+        }
+        services
+            .iter()
+            .map(|service| service.observe_owned_backend())
+            .collect()
+    }
+    #[cfg(all(unix, debug_assertions))]
+    pub(crate) fn retained_qualification_stages(&self) -> Vec<&'static str> {
+        self.retained
+            .lock()
+            .map(|services| {
+                services
+                    .iter()
+                    .flat_map(|service| service.qualification_stages())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn retained_attach(
+        &self,
+        sources: &std::sync::Arc<aterm_agent::harness::codex_source_registry::Registry>,
+        foreground: &aterm_agent::harness::codex_source_registry::FrontendMember<'_>,
+        frontend: aterm_agent::harness::codex_source_registry::ServiceFrontend,
+        service: &str,
+        callback: &std::path::Path,
+        operation: &str,
+    ) -> Result<(), aterm_agent::harness::codex_source_registry::Error> {
+        use aterm_agent::harness::codex_source_registry::Error;
+        if !self.retained_constructor_enabled() {
+            return Err(Error::Unsupported);
+        }
+        let delivery = {
+            let services = self.retained.lock().map_err(|_| Error::Unavailable)?;
+            services
+                .iter()
+                .find(|controller| controller.id() == service && controller.in_namespace(sources))
+                .ok_or(Error::Stale)?
+                .delivery()
+        };
+        // The live native request keeps its original PTY borrow across IO.
+        // No policy mutex is held during delivery; response loss cannot replay it.
+        delivery.attach(frontend, foreground, operation, callback)
+    }
+
+    #[cfg(unix)]
+    fn retained_constructor_enabled(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        if let Some(fixture) = &self.fixture {
+            return fixture.constructors.enabled(Constructor::PrivateRestart);
+        }
+        false
+    }
+    #[cfg(unix)]
+    pub(crate) fn retained_start(
+        &self,
+        ctx: &std::sync::Arc<crate::SessionCtx>,
+        sources: &std::sync::Arc<aterm_agent::harness::codex_source_registry::Registry>,
+        lifetime: &aterm_agent::harness::account_work::Lifetime,
+        peer: &aterm_agent::harness::codex_source_registry::Peer,
+        settings: retained_service::Settings,
+    ) -> Result<(String, &'static str), aterm_agent::harness::codex_source_registry::Error> {
+        use aterm_agent::harness::codex_source_registry::Error;
+        // No production qualification is advertised before the native/source
+        // service pair has passed its actual SDK and handover qualification.
+        if !self.retained_constructor_enabled() {
+            return Err(Error::Unsupported);
+        }
+        let selection =
+            retained_service::Selection::capture(peer, &settings.arguments, settings.environment)
+                .inspect_err(|_error| {
+                #[cfg(debug_assertions)]
+                eprintln!("Retained native startup: selection={_error:?}");
+            })?;
+        let mut services = self.retained.lock().map_err(|_| Error::Unavailable)?;
+        if let Some(service) = services
+            .iter()
+            .find(|service| service.matches(&selection, sources))
+        {
+            return Ok((service.id().into(), service.state()?));
+        }
+        let service = retained_service::Controller::start(ctx, sources, lifetime, selection)
+            .inspect_err(|_error| {
+                #[cfg(debug_assertions)]
+                eprintln!("Retained native startup: controller={_error:?}");
+            })?;
+        let result = (service.id().into(), service.state()?);
+        services.push(service);
+        Ok(result)
+    }
     /// This call site follows the actual successful native SIGTERM syscall;
     /// recorded/replayed RPC acknowledgements never emit another effect.
     #[cfg(all(unix, any(test, debug_assertions)))]
@@ -133,6 +241,17 @@ impl SessionPolicy {
                 && fixture.constructors.enabled(Constructor::PrivateRestart);
         }
         // Account selection still requires fresh, identity-bound weekly usage.
+        aterm_agent::harness::codex_rotation::QUOTA_ROTATION_QUALIFIED
+    }
+
+    /// Whether this host moves a native Codex session whose login was lost to another row
+    /// already signed in here (`codex-login-rotation`): qualified as the usage-limit handoff is.
+    pub(crate) fn login_rotation_enabled(&self) -> bool {
+        #[cfg(all(unix, any(test, debug_assertions)))]
+        if let Some(fixture) = &self.fixture {
+            return fixture.login_rotation
+                && fixture.constructors.enabled(Constructor::PrivateRestart);
+        }
         aterm_agent::harness::codex_rotation::QUOTA_ROTATION_QUALIFIED
     }
 
@@ -304,6 +423,7 @@ pub struct FixturePolicy {
     constructors: FixtureConstructors,
     renewal_fault_root: Option<std::path::PathBuf>,
     quota_rotation: bool,
+    login_rotation: bool,
     quota_roots: Option<Vec<Vec<u8>>>,
 }
 
@@ -353,6 +473,7 @@ impl FixturePolicy {
             constructors,
             renewal_fault_root: None,
             quota_rotation: false,
+            login_rotation: false,
             quota_roots: None,
         })
     }
@@ -370,6 +491,14 @@ impl FixturePolicy {
     #[must_use]
     pub fn with_quota_rotation(mut self) -> Self {
         self.quota_rotation = true;
+        self
+    }
+
+    /// Enable a lost login's move in this isolated Rust fixture. Its private restart constructor
+    /// must also be enabled before the fixture can move a session.
+    #[must_use]
+    pub fn with_login_rotation(mut self) -> Self {
+        self.login_rotation = true;
         self
     }
 
@@ -417,3 +546,18 @@ impl crate::SessionCtx {
 #[cfg(all(test, unix))]
 #[path = "native_session_policy_tests.rs"]
 mod tests;
+
+impl SessionPolicy {
+    #[cfg(unix)]
+    pub(crate) fn retained_settings(
+        &self,
+        foreground: &aterm_agent::harness::codex_source_registry::FrontendMember<'_>,
+        callback: &std::path::Path,
+    ) -> Result<retained_service::Settings, aterm_agent::harness::codex_source_registry::Error>
+    {
+        if !self.retained_constructor_enabled() {
+            return Err(aterm_agent::harness::codex_source_registry::Error::Unsupported);
+        }
+        retained_service::receive_settings(foreground, callback)
+    }
+}

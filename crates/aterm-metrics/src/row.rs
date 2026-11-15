@@ -16,20 +16,22 @@
 //! **Words and numbers only.** No row field is for an address, password, token, cookie, URL,
 //! path, prompt, transcript text, command line or provider error text (§4.14 "Who can read
 //! what"): every text field is a [`Word`] (`[a-z0-9_-]`), a roster [`Label`], a key
-//! ([`AccountKey`], [`HomeKey`]), a session id ([`Sid`]) or a node id ([`Node`]), each checked
+//! ([`AccountKey`], [`HomeKey`]), a tab ID ([`TabId`]) or a node id ([`Node`]), each checked
 //! on the way in and on the way out. Those grammars refuse an email address, a URL, a path, a
 //! `host:port` and a sentence; a roster label is the person's own dotted name for an account
 //! (`work.max-2`), which the roster's grammar allows and this one keeps. A word the reader does
 //! not know (a condition a later build adds) still reads, as itself.
 //!
-//! **One encoding per value.** Every row starts with a kind byte and a version byte; every
+//! **One encoding per value.** Every row starts with a kind byte and [`VERSION`]; every
 //! number after them is an unsigned LEB128 varint, every text a length byte and its bytes,
 //! every `Option` a tag byte (0 none, 1 some) before its value, every list a count before
-//! its entries. Decoding is strict: a different kind, an unknown version, a truncation,
-//! trailing bytes, a non-minimal varint, a tag or bool byte other than 0 or 1, a text its
-//! grammar refuses, a bound passed, or a body that disagrees with its subject is refused,
-//! never misread. So every accepted body is the one [`Row::encode`] writes for its value,
-//! and a publisher detects a change by comparing bytes.
+//! its entries. A tab ID is its text (`tqn5r6e0148`, or the `s-` and 20 hex digits of a tab
+//! opened before the `t` form, which keeps that ID until it closes), read back by
+//! [`TabId::parse`], which takes both. Decoding is strict: a different kind, an unknown
+//! version, a truncation, trailing bytes, a non-minimal varint, a tag or bool byte other than
+//! 0 or 1, a text its grammar refuses, a bound passed, or a body that disagrees with its
+//! subject is refused, never misread. So every accepted body is the one [`Row::encode`] writes
+//! for its value, and a publisher detects a change by comparing bytes.
 //!
 //! **A reader takes what a writer writes.** A list longer than its bound is written to its
 //! bound (its first entries), and a percent or a share past its bound at the bound, so no
@@ -58,8 +60,13 @@
 use std::fmt;
 
 use astream_wire::summary::{DecodeError, Summary, SummaryId, Window};
+pub use aterm_types::tab_id::TabId;
 
 use crate::subject::{AccountKey, Cli, HomeKey, Metric, Node, Now, Subject, Width};
+
+/// A row's session: its tab ID, in either form. The name the GUI's callers still use until LT-01
+/// moves them onto [`TabId`] (slice S3), when it goes.
+pub type Sid = TabId;
 
 /// The kind byte of a [`QuotaRow`].
 pub const KIND_QUOTA: u8 = b'Q';
@@ -75,7 +82,7 @@ pub const KIND_UNREAD: u8 = b'U';
 pub const KIND_ACTIVITY: u8 = b'T';
 /// The kind byte of a [`WindowRecord`].
 pub const KIND_WINDOW: u8 = b'W';
-/// The one version of every row this build writes and reads.
+/// The version of every row kind, the one this build writes and reads.
 pub const VERSION: u8 = 1;
 
 /// The highest percent a window reads: the harness's own bound (`accounts.rs` `PCT_MAX`), past
@@ -150,7 +157,7 @@ impl fmt::Display for RowError {
                 char::from(*found),
                 char::from(*expected)
             ),
-            RowError::Version(v) => write!(f, "row version {v}, this build reads {VERSION}"),
+            RowError::Version(v) => write!(f, "row version {v}, which this build does not read"),
             RowError::Varint => f.write_str("a number that is not a minimal 64-bit varint"),
             RowError::Tag => f.write_str("a flag byte other than 0 or 1"),
             RowError::Text(what) => write!(f, "{what} is not in its grammar"),
@@ -234,30 +241,6 @@ impl fmt::Display for Label {
     }
 }
 
-/// A minted session id: `s-` and 20 lowercase hex digits (`aterm-session` `id::is_minted_sid`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Sid([u8; 10]);
-
-impl Sid {
-    /// `s-<20 lowercase hex>`; anything else is `None`.
-    #[must_use]
-    pub fn parse(word: &str) -> Option<Sid> {
-        crate::subject::parse_hex::<10>(word.strip_prefix("s-")?).map(Sid)
-    }
-
-    #[must_use]
-    const fn to_ascii_bytes(self) -> [u8; 22] {
-        crate::subject::format_hex_lower::<10, 22>(b"s-", &self.0)
-    }
-}
-
-impl fmt::Display for Sid {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let buf = self.to_ascii_bytes();
-        f.write_str(std::str::from_utf8(&buf).unwrap_or_default())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The codec
 // ---------------------------------------------------------------------------
@@ -315,11 +298,11 @@ impl Out {
         }
     }
 
-    fn sid(&mut self, sid: Sid) {
-        self.bytes(&sid.to_ascii_bytes());
+    fn sid(&mut self, sid: TabId) {
+        self.text(sid.as_str());
     }
 
-    fn opt_sid(&mut self, sid: Option<Sid>) {
+    fn opt_sid(&mut self, sid: Option<TabId>) {
         self.flag(sid.is_some());
         if let Some(sid) = sid {
             self.sid(sid);
@@ -448,11 +431,11 @@ impl<'a> In<'a> {
         }
     }
 
-    fn sid(&mut self, what: &'static str) -> Result<Sid, RowError> {
-        Sid::parse(self.text()?).ok_or(RowError::Text(what))
+    fn sid(&mut self, what: &'static str) -> Result<TabId, RowError> {
+        TabId::parse(self.text()?).ok_or(RowError::Text(what))
     }
 
-    fn opt_sid(&mut self, what: &'static str) -> Result<Option<Sid>, RowError> {
+    fn opt_sid(&mut self, what: &'static str) -> Result<Option<TabId>, RowError> {
         if self.flag()? {
             self.sid(what).map(Some)
         } else {
@@ -843,14 +826,14 @@ impl PlaceRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NeedEntry {
     /// The session.
-    pub sid: Sid,
+    pub sid: TabId,
     /// The need word (`frozen`, `stopped`, `stalled`, `login`, `memory`, `wall`, `ask`,
     /// `approval`, `question`).
     pub word: Word,
     /// Whether the harness carries the session on by itself (`needs_by=harness`).
     pub harness: bool,
     /// The manager session it works for.
-    pub worker_of: Option<Sid>,
+    pub worker_of: Option<TabId>,
     /// Since when, Unix seconds.
     pub since: Option<u64>,
 }
@@ -859,7 +842,7 @@ pub struct NeedEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeldEntry {
     /// The session.
-    pub sid: Sid,
+    pub sid: TabId,
     /// The hold word (`person`, `remote`, `local`, `bridge`).
     pub hold: Word,
     /// The Mac that holds it, when another Mac does.
@@ -872,7 +855,7 @@ pub struct HeldEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagerEntry {
     /// The manager session.
-    pub sid: Sid,
+    pub sid: TabId,
     /// How many workers it runs.
     pub workers: u32,
 }
@@ -945,17 +928,17 @@ impl NeedsRow {
         let mut needs = Vec::with_capacity(n);
         for _ in 0..n {
             needs.push(NeedEntry {
-                sid: r.sid("a session id")?,
+                sid: r.sid("a tab id")?,
                 word: r.word("a need word")?,
                 harness: r.flag()?,
-                worker_of: r.opt_sid("a manager's session id")?,
+                worker_of: r.opt_sid("a manager's tab id")?,
                 since: r.opt()?,
             });
         }
         let n = r.count(NEEDS_MAX, "held sessions")?;
         let mut held = Vec::with_capacity(n);
         for _ in 0..n {
-            let sid = r.sid("a session id")?;
+            let sid = r.sid("a tab id")?;
             let hold = r.word("a hold word")?;
             let by = if r.flag()? {
                 Some(Node::parse(r.text()?).ok_or(RowError::Text("the holding node"))?)
@@ -973,7 +956,7 @@ impl NeedsRow {
         let mut managers = Vec::with_capacity(n);
         for _ in 0..n {
             managers.push(ManagerEntry {
-                sid: r.sid("a manager's session id")?,
+                sid: r.sid("a manager's tab id")?,
                 workers: r.u32("a manager's workers")?,
             });
         }
@@ -1048,7 +1031,7 @@ impl UnreadRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentEntry {
     /// The session.
-    pub sid: Sid,
+    pub sid: TabId,
     /// What it is doing: `busy`, `idle`, `waiting`, `walled` or `unknown`. A word a later build
     /// adds reads as itself.
     pub word: Word,
@@ -1155,7 +1138,7 @@ impl ActivityRow {
         row.sessions.reserve(n);
         for _ in 0..n {
             row.sessions.push(AgentEntry {
-                sid: r.sid("a session id")?,
+                sid: r.sid("a tab id")?,
                 word: r.word("an agent word")?,
                 detail: r.opt_word("an agent word's detail")?,
             });

@@ -4,9 +4,11 @@
 //! `reveal`: whether the process asking may be shown a secret in plaintext, decided by the
 //! session of this instance its process lineage leads to (docs/DESIGN-alab-one-mesh-2026-11-05.md
 //! §4.8, §11 A7). An agent marker in the environment cannot decide it: every shell aterm spawns
-//! loses the agents' variables, and `ctl spawn` gives a command a real terminal. So `aterm db
-//! emails --show-passwords`, `phones --show-numbers` and `--edit` ask here, and show plaintext only
-//! on `allowed`.
+//! loses the agents' variables, and `ctl spawn` gives a command a real terminal. So fleet_db's
+//! `aterm db … --show-passwords` and `dump <file>` ask here (`aterm_db::alab::command::session`)
+//! and show plaintext only on `allowed`. No view of the registry's tables shows a secret (its
+//! cell names the secret-store entry that holds it, or shows the mask where a generation still
+//! holds it sealed), so they ask nothing.
 //!
 //! The verdict is the first that holds, in this order ([`reveal_verdict`]): `remote` (the bridge
 //! or a fleet driver asked: not a process of this Mac), `indirect` (the kernel names no peer

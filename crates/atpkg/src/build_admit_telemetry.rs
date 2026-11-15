@@ -20,7 +20,8 @@
 //!   a lower bound read every 500 ms (`meter=sampled`), never below the root's own resident peak
 //!   where the process that saw it end reaped it (a supervising front, the host job), from that
 //!   reap's accounting (`wait4`: the root's and its reaped descendants', no other child's of that
-//!   process); none read is unknown.
+//!   process; on Linux also what the fork that launched the root copied of that process's
+//!   resident memory, which the root's exec folds in); none read is unknown.
 //! - `outcome`, `stop`, `code`, `sig`: as the end site knows the end ([`BuildEnd`]).
 //! - `cpu_ms=na`: no end site but the host job reads the build's CPU, and that is the work's,
 //!   which its command or agent-call row carries; `cache=?targo`: Targo names no cache tier yet.

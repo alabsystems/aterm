@@ -21,8 +21,10 @@ pub(super) fn value(observation: &RepairObservation) -> Value {
     })
 }
 
-pub(super) fn read(row: &Value) -> Result<Option<RepairObservation>> {
-    let Some(value) = row.get("last_repair").filter(|value| !value.is_null()) else {
+/// The repair metadata `row` keeps under `key` (a peer's `last_repair`, a record's
+/// `last_catalog_repair`), none where it keeps none there.
+pub(super) fn read(row: &Value, key: &str) -> Result<Option<RepairObservation>> {
+    let Some(value) = row.get(key).filter(|value| !value.is_null()) else {
         return Ok(None);
     };
     let completed_at_ms = number(value, "completed_at_ms")?;
@@ -113,8 +115,29 @@ fn outcome(outcome: RepairOutcome) -> &'static str {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`Observer::repair`], on for one test thread: a round over the catalog is
+    /// kept only as its peer's latest round, as before one was kept apart.
+    static CATALOG_UNKEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Observer {
     /// Only current membership may associate an attempt with an already observed incarnation.
+    ///
+    /// The attempt becomes the peer's latest ([`PeerObservation::last_repair`]). One over the
+    /// lab's catalog that said something of it ([`RepairObservation::spoke`]) is also kept as
+    /// the lab's latest over the catalog ([`NetworkObservation::last_catalog_repair`]),
+    /// through the attempts over other tables that follow it with any peer: a round repairs
+    /// one table, and a reader that asks what the lab last said of the catalog
+    /// (`crate::alab`'s import guard) would otherwise find it only in a peer whose next round
+    /// has not come. An attempt over the catalog that failed or was stopped with nothing
+    /// leaves the kept one: in a lab of dozens some peer's round fails on every pass, and it
+    /// says nothing the kept one did not. One that deferred or brought records replaces it,
+    /// so what the lab was last heard to hold is never read past a round that found more.
+    /// Rounds with two peers end in either order: one sampled before the kept one leaves it.
+    /// The catalog is this observer's own lab's ([`Observer::local`]), so an attempt names it
+    /// only by the table it selected.
     pub(crate) fn repair(
         &mut self,
         identity: &MachineIdentity,
@@ -147,11 +170,29 @@ impl Observer {
         // Counts and table scans are published live and retained by the periodic checkpoint,
         // like continuing authenticated contacts. A reader that needs the latest round takes
         // the live observation, or a history its observer closed (`read_closed_history`).
-        self.dirty |= peer
-            .last_repair
-            .as_ref()
-            .is_none_or(|old| old.stage != observation.stage || old.outcome != observation.outcome);
-        peer.last_repair = Some(observation);
+        let moved = |old: Option<&RepairObservation>| {
+            old.is_none_or(|old| {
+                old.stage != observation.stage || old.outcome != observation.outcome
+            })
+        };
+        self.dirty |= moved(peer.last_repair.as_ref());
+        let catalog = self
+            .trust
+            .map(|trust| crate::catalog::scope(trust).digest());
+        #[cfg(test)]
+        let catalog = catalog.filter(|_| !CATALOG_UNKEPT.with(std::cell::Cell::get));
+        peer.last_repair = Some(observation.clone());
+        if observation.table.is_some()
+            && observation.table == catalog
+            && observation.spoke()
+            && self.catalog_sampled.is_none_or(|old| old <= sampled_at)
+        {
+            self.catalog_sampled = Some(sampled_at);
+            let kept = self.state.last_catalog_repair.as_ref();
+            self.dirty |= moved(kept)
+                || kept.is_some_and(|old| old.left_nothing() != observation.left_nothing());
+            self.state.last_catalog_repair = Some(observation);
+        }
         self.changed = true;
     }
 }

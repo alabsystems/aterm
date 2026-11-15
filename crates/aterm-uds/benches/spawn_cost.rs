@@ -190,9 +190,362 @@ mod bench {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod bench {
+    use aterm_uds::spawnfd::terminal::{self, Start, Started};
+    use aterm_uds::spawnfd::{InheritNothing as _, Tether as _, command};
+    use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The resident sizes measured: a small process, the atpkg lib's test process with its
+    /// suite loaded (1.3 GB) and the window on this host (2.4 GB). A size the machine cannot
+    /// hold twice over is named and passed over.
+    const SIZES_MB: [usize; 3] = [100, 1_300, 2_400];
+    /// Each mapping's size: the resident memory is many mappings, as glibc's arenas are.
+    const MAPPING: usize = 64 * 1024 * 1024;
+    /// Spawns timed per lane and size, and rewrites timed after a spawn.
+    const SPAWNS: usize = 40;
+    const REWRITES: usize = 5;
+    /// How long the sibling thread sleeps between its page touches.
+    const TICK: Duration = Duration::from_millis(1);
+    /// A sibling gap longer than this is a frame dropped at 60 Hz.
+    const FRAME: Duration = Duration::from_millis(16);
+
+    /// A `kB` field of a `/proc` file, in bytes.
+    fn kb_field(file: &str, field: &str) -> usize {
+        let text = std::fs::read_to_string(file).expect(file);
+        let kb: usize = text
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .expect(field);
+        kb * 1024
+    }
+
+    /// `bytes` of anonymous memory in [`MAPPING`]-sized mappings with no huge pages, every
+    /// page written: what a process that size holds resident. Unmapped on drop.
+    struct Resident {
+        maps: Vec<(*mut u8, usize)>,
+        page: usize,
+    }
+
+    impl Resident {
+        fn new(bytes: usize) -> Self {
+            // SAFETY: `sysconf` reads one value.
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page");
+            let mut maps = Vec::new();
+            let mut left = bytes;
+            while left > 0 {
+                let len = left.min(MAPPING);
+                // SAFETY: a fresh anonymous private mapping this bench alone uses.
+                let base = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(base, libc::MAP_FAILED, "mmap");
+                // SAFETY: the mapping above, whole.
+                assert_eq!(
+                    unsafe { libc::madvise(base, len, libc::MADV_NOHUGEPAGE) },
+                    0
+                );
+                maps.push((base.cast::<u8>(), len));
+                left -= len;
+            }
+            let held = Self { maps, page };
+            held.rewrite();
+            held
+        }
+
+        /// Write one byte of every page; how long that took.
+        fn rewrite(&self) -> Duration {
+            let started = Instant::now();
+            for &(base, len) in &self.maps {
+                for at in (0..len).step_by(self.page) {
+                    // SAFETY: inside a writable mapping `new` made.
+                    unsafe { base.add(at).write_volatile(1) };
+                }
+            }
+            started.elapsed()
+        }
+    }
+
+    impl Drop for Resident {
+        fn drop(&mut self) {
+            for &(base, len) in &self.maps {
+                // SAFETY: a mapping `new` made, which nothing uses now.
+                unsafe { libc::munmap(base.cast(), len) };
+            }
+        }
+    }
+
+    /// A thread that maps, writes and unmaps a page every [`TICK`], as a window's render and
+    /// I/O threads touch memory, keeping its longest gap and its gaps over a [`FRAME`].
+    struct Sibling {
+        stop: Arc<AtomicBool>,
+        worst_us: Arc<AtomicU64>,
+        dropped: Arc<AtomicU64>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Sibling {
+        fn start() -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let worst_us = Arc::new(AtomicU64::new(0));
+            let dropped = Arc::new(AtomicU64::new(0));
+            let (s, w, d) = (
+                Arc::clone(&stop),
+                Arc::clone(&worst_us),
+                Arc::clone(&dropped),
+            );
+            let thread = std::thread::spawn(move || {
+                let mut last = Instant::now();
+                while !s.load(Ordering::Relaxed) {
+                    // SAFETY: a fresh one-page mapping, written once and unmapped.
+                    unsafe {
+                        let page = libc::mmap(
+                            std::ptr::null_mut(),
+                            4096,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        );
+                        if page != libc::MAP_FAILED {
+                            page.cast::<u8>().write_volatile(1);
+                            libc::munmap(page, 4096);
+                        }
+                    }
+                    let now = Instant::now();
+                    let gap = now - last;
+                    last = now;
+                    w.fetch_max(
+                        u64::try_from(gap.as_micros()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
+                    if gap > FRAME {
+                        d.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(TICK);
+                }
+            });
+            Self {
+                stop,
+                worst_us,
+                dropped,
+                thread: Some(thread),
+            }
+        }
+
+        /// Forget the gaps so far; the thread runs on.
+        fn reset(&self) {
+            self.worst_us.store(0, Ordering::Relaxed);
+            self.dropped.store(0, Ordering::Relaxed);
+        }
+
+        /// The longest gap in ms, and the gaps over a frame, since [`Self::reset`].
+        fn read(&self) -> (f64, u64) {
+            (
+                self.worst_us.load(Ordering::Relaxed) as f64 / 1e3,
+                self.dropped.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    impl Drop for Sibling {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// The p50, p95 and p99 of `samples`, in milliseconds.
+    fn percentiles(mut samples: Vec<Duration>) -> [f64; 3] {
+        samples.sort_unstable();
+        let at = |q: usize| samples[(samples.len() - 1) * q / 100].as_secs_f64() * 1e3;
+        [at(50), at(95), at(99)]
+    }
+
+    /// A fresh pty's master and slave, each close-on-exec.
+    fn pty() -> (OwnedFd, OwnedFd) {
+        // SAFETY: `posix_openpt`, `grantpt` and `unlockpt` take flags and the master's number;
+        // `name` is a live buffer `ptsname_r` fills, and `open` reads the path it holds.
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+            assert!(master >= 0, "posix_openpt");
+            let master = OwnedFd::from_raw_fd(master);
+            assert_eq!(libc::grantpt(master.as_raw_fd()), 0);
+            assert_eq!(libc::unlockpt(master.as_raw_fd()), 0);
+            let mut name = [0_u8; 64];
+            assert_eq!(
+                libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr().cast(), name.len()),
+                0
+            );
+            let slave = libc::open(
+                name.as_ptr().cast(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            );
+            assert!(slave >= 0, "open the slave");
+            (master, OwnedFd::from_raw_fd(slave))
+        }
+    }
+
+    pub fn run() {
+        // A spawn, and its reap, which answers the child's `maxrss` where the lane reads one.
+        type Spawn = Box<dyn Fn() -> Box<dyn FnOnce() -> Option<u64>>>;
+        let lanes: [(&str, Spawn); 5] = [
+            (
+                "spawnfd::command",
+                Box::new(|| {
+                    let mut child = command("/bin/true").spawn().expect("spawn");
+                    Box::new(move || {
+                        let usage = child.wait_with_rusage().expect("wait");
+                        assert!(usage.status.success());
+                        Some(usage.maxrss)
+                    })
+                }),
+            ),
+            (
+                "spawnfd::command, tethered",
+                Box::new(|| {
+                    let mut child = command("/bin/true").tether().spawn().expect("spawn");
+                    Box::new(move || {
+                        let usage = child.wait_with_rusage().expect("wait");
+                        assert!(usage.status.success());
+                        Some(usage.maxrss)
+                    })
+                }),
+            ),
+            (
+                "terminal::start, a tab's shell's (its pty opened in the lane)",
+                Box::new(|| {
+                    let (master, slave) = pty();
+                    let started = terminal::start(
+                        &Start {
+                            program: c"/bin/true",
+                            argv: &[c"true".to_owned()],
+                            envp: &[],
+                            cwd: None,
+                            limits: &[],
+                            pass: None,
+                        },
+                        slave.as_fd(),
+                        Duration::from_secs(60),
+                    )
+                    .expect("start");
+                    let Started::Running(pid) = started else {
+                        panic!("a terminal start of /bin/true: {started:?}");
+                    };
+                    Box::new(move || {
+                        let mut status = 0;
+                        // SAFETY: this lane's own child; `status` is a live local.
+                        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+                        drop((master, slave));
+                        None
+                    })
+                }),
+            ),
+            (
+                "std Command + InheritNothing (fork + strip)",
+                Box::new(|| {
+                    #[expect(
+                        clippy::disallowed_types,
+                        reason = "the measured lane: std's fork with the strip installed"
+                    )]
+                    let mut child = std::process::Command::new("/bin/true")
+                        .inherit_nothing()
+                        .spawn()
+                        .expect("spawn");
+                    Box::new(move || {
+                        assert!(child.wait().expect("wait").success());
+                        None
+                    })
+                }),
+            ),
+            (
+                "std Command, no hook (glibc posix_spawn floor)",
+                Box::new(|| {
+                    #[expect(
+                        clippy::disallowed_types,
+                        reason = "the measured floor: std's own spawn"
+                    )]
+                    let mut child = std::process::Command::new("/bin/true")
+                        .spawn()
+                        .expect("spawn");
+                    Box::new(move || {
+                        assert!(child.wait().expect("wait").success());
+                        None
+                    })
+                }),
+            ),
+        ];
+        let sibling = Sibling::start();
+        for mb in SIZES_MB {
+            let bytes = mb * 1024 * 1024;
+            let available = kb_field("/proc/meminfo", "MemAvailable:");
+            if available < 2 * bytes {
+                println!(
+                    "{mb} MB: not run, {} MB available",
+                    available / (1024 * 1024)
+                );
+                continue;
+            }
+            let held = Resident::new(bytes);
+            let rss = kb_field("/proc/self/status", "VmRSS:") / (1024 * 1024);
+            let alone = percentiles((0..REWRITES).map(|_| held.rewrite()).collect());
+            println!(
+                "{mb} MB: VmRSS {rss} MB; rewrite with no spawn p50 {:.1} ms",
+                alone[0]
+            );
+            for (name, spawn) in &lanes {
+                sibling.reset();
+                let mut maxrss = None;
+                let spawns = percentiles(
+                    (0..SPAWNS)
+                        .map(|_| {
+                            let started = Instant::now();
+                            let reap = spawn();
+                            let took = started.elapsed();
+                            maxrss = maxrss.max(reap());
+                            took
+                        })
+                        .collect(),
+                );
+                let (worst, dropped) = sibling.read();
+                let bills = percentiles(
+                    (0..REWRITES)
+                        .map(|_| {
+                            let _ = spawn()();
+                            held.rewrite()
+                        })
+                        .collect(),
+                );
+                let maxrss = maxrss.map_or("unread".to_owned(), |b| format!("{} MB", b >> 20));
+                println!(
+                    "  {name}: spawn() n {SPAWNS} p50 {:.2} p95 {:.2} p99 {:.2} ms; \
+                     rewrite after it p50 {:.1} ms; sibling's worst gap {worst:.1} ms, \
+                     {dropped} over 16 ms; a child's maxrss {maxrss}",
+                    spawns[0], spawns[1], spawns[2], bills[0]
+                );
+            }
+            drop(held);
+        }
+    }
+}
+
 fn main() {
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     bench::run();
-    #[cfg(not(target_vendor = "apple"))]
-    println!("spawn_cost measures macOS's region walk; nothing to measure on this target");
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    println!("spawn_cost measures macOS's region walk and Linux's fork; nothing to measure here");
 }

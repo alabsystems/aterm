@@ -4708,6 +4708,7 @@ fn a_renewal_with_no_email_names_a_step_that_keeps_the_roster_admitted() {
     let lab = crate::harness::alab_roster::Lab {
         me: Some(test_machine("m16")),
         settled: true,
+        bound: Default::default(),
         accounts: Vec::new(),
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
@@ -5529,13 +5530,11 @@ fn the_report_names_the_sync_that_folds_a_twin_only_where_one_does() {
     assert_eq!(json["next"]["twin"]["sync_folds"], Value::from(false));
 
     let home = pool.env.home.as_deref().expect("a home");
-    let secrets = home.join(".secrets");
-    std::fs::create_dir_all(&secrets).expect(".secrets");
-    std::fs::write(
-        secrets.join(crate::harness::accounts_sync::cli_fleet_file(Cli::Codex)),
+    crate::vault_entry::put(
+        home,
+        &crate::harness::accounts_sync::cli_fleet_file(Cli::Codex),
         "[[account]]\nlabel = \"twin\"\nemail = \"ann@example.com\"\nmachines = [\"m16\"]\n",
-    )
-    .expect("the fleet file");
+    );
     pool.config("[fleet]\nmachine = \"m16\"\n");
     let (text, json) = pool.report_on(&host);
     assert!(

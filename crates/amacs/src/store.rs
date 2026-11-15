@@ -10,6 +10,17 @@ use std::sync::Arc;
 
 use aterm_buffer::{Edit as SurfaceEdit, LineId, Seq, Surface, TxnOutcome, WriteCap};
 
+pub use crate::prepared::{
+    PreparationReservation, PreparedText, RetirementDrainer, RetirementExecutor, RetirementService,
+    WeakRetirementService,
+};
+#[cfg(any(test, debug_assertions))]
+pub use crate::prepared::{
+    PreparationWork, RetirementObservation, RetirementReceipt, record_preparation_work,
+    take_preparation_work,
+};
+pub use crate::prepared_directory::{DirectoryPreparationBase, PreparedDirectoryUpdate};
+
 /// Stable process-local identity shared by every presentation of one canonical document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentId(NonZeroU64);
@@ -25,6 +36,15 @@ impl DocumentId {
 /// A view reference is deliberately independent of app kind: Markdown and Editor views participate in the same last-reference close decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentViewId(pub u64);
+
+/// Exclusive rollback authority for one attachment that has never been published.
+#[derive(Debug)]
+pub struct UnpublishedAttachment {
+    owner: Arc<()>,
+    document: DocumentId,
+    view: DocumentViewId,
+    generation: u64,
+}
 
 /// What no reader of a document gets but the person's own eyes on its window (one-mesh design
 /// §4.8, "Revealed values stay out of the accessibility tree"): a revealed secret's grid's
@@ -76,12 +96,29 @@ pub struct DirectoryListing {
     pub entries: Vec<(Range<usize>, String)>,
 }
 
+#[cfg(any(test, debug_assertions))]
+impl Drop for DirectoryListing {
+    fn drop(&mut self) {
+        record_preparation_work(PreparationWork {
+            retired_directory_entries: self.entries.len(),
+            ..Default::default()
+        });
+    }
+}
+
 impl DirectoryListing {
     /// The exact navigation target on the line containing `point`.
     pub fn target_at(&self, point: usize) -> Option<&str> {
         self.entries
             .iter()
-            .find(|(range, _)| range.contains(&point))
+            .find(|(range, _)| {
+                #[cfg(any(test, debug_assertions))]
+                record_preparation_work(PreparationWork {
+                    directory_entry_visits: 1,
+                    ..Default::default()
+                });
+                range.contains(&point)
+            })
             .map(|(_, uri)| uri.as_str())
     }
 
@@ -89,7 +126,14 @@ impl DirectoryListing {
     pub fn point_for(&self, target: Option<&str>) -> usize {
         self.entries
             .iter()
-            .find(|(_, uri)| Some(uri.as_str()) == target)
+            .find(|(_, uri)| {
+                #[cfg(any(test, debug_assertions))]
+                record_preparation_work(PreparationWork {
+                    directory_entry_visits: 1,
+                    ..Default::default()
+                });
+                Some(uri.as_str()) == target
+            })
             .or_else(|| self.entries.first())
             .map_or(0, |(range, _)| range.start)
     }
@@ -133,6 +177,7 @@ pub struct EditDelta {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocumentError {
     UnknownDocument,
+    PreparedConsumed,
     ReadOnly,
     UnknownView,
     Closing,
@@ -157,9 +202,9 @@ pub enum DocumentCloseReadiness {
     Blocked { requested: Seq },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Document {
-    directory: Option<DirectoryListing>,
+    directory: Option<Arc<DirectoryListing>>,
     /// Opened to be read and never changed ([`DocumentStore::set_read_only`]): every transaction
     /// is refused, as a directory listing's is.
     read_only: bool,
@@ -178,6 +223,8 @@ struct Document {
     /// Each attached view's published sequence, updated in the same synchronous lane as the Surface commit, before another input event can be routed.
     views: BTreeMap<DocumentViewId, Seq>,
     phase: DocumentPhase,
+    // Last: ordinary fields release their roots before reserved retirement.
+    prepared: Option<crate::prepared::PendingStorage>,
 }
 
 impl Document {
@@ -223,6 +270,9 @@ pub struct DocumentStore {
     by_uri: BTreeMap<String, DocumentId>,
     /// The buffer-write cap every Surface edit presents, granted in `warm_prologue`.
     write: WriteCap,
+    attachment_owner: Option<Arc<()>>,
+    next_attachment: u64,
+    unpublished: BTreeMap<(DocumentId, DocumentViewId), u64>,
 }
 
 impl DocumentStore {
@@ -232,6 +282,9 @@ impl DocumentStore {
             documents: BTreeMap::new(),
             by_uri: BTreeMap::new(),
             write,
+            attachment_owner: None,
+            next_attachment: 1,
+            unpublished: BTreeMap::new(),
         }
     }
 
@@ -246,17 +299,38 @@ impl DocumentStore {
         if let Some(id) = self.by_uri.get(&canonical_uri) {
             return *id;
         }
+        let id = self
+            .open_prepared(canonical_uri, PreparedText::new(text))
+            .expect("fresh synchronous storage");
+        self.publish_prepared(id);
+        id
+    }
+
+    /// Allocate canonical identity and install worker-prepared storage.
+    pub fn open_prepared(
+        &mut self,
+        canonical_uri: String,
+        text: PreparedText,
+    ) -> Result<DocumentId, DocumentError> {
+        if let Some(id) = self.by_uri.get(&canonical_uri) {
+            return Ok(*id);
+        }
+        let prepared = text.take_graph().ok_or(DocumentError::PreparedConsumed)?;
+        #[cfg(any(test, debug_assertions))]
+        record_preparation_work(PreparationWork {
+            adoptions: 1,
+            ..PreparationWork::default()
+        });
         let raw = self.next_id.max(1);
         self.next_id = raw.saturating_add(1);
         let nonzero = NonZeroU64::new(raw).expect("document ids start at one");
         let id = DocumentId(nonzero);
         let mut surface = Surface::new();
-        let projection: Arc<str> = Arc::from(text.as_str());
-        surface.apply(&self.write, SurfaceEdit::AppendLine(text));
+        let (line, projection, text_rope, directory) = prepared.parts();
+        surface.append_shared_line(&self.write, line);
         let head = surface.seq();
-        let text_rope = crate::text::TextRope::from(projection.as_ref());
         let document = Document {
-            directory: None,
+            directory,
             read_only: false,
             concealed: None,
             id,
@@ -269,10 +343,75 @@ impl DocumentStore {
             failed_checkpoint: None,
             views: BTreeMap::new(),
             phase: DocumentPhase::Suspended,
+            prepared: Some(prepared),
         };
         self.by_uri.insert(canonical_uri, id);
         self.documents.insert(id, document);
-        id
+        Ok(id)
+    }
+
+    /// Install a base-bound prepared replacement. The base projection is a shared
+    /// identity witness, so validation never scans document contents.
+    pub fn adopt_prepared_text(
+        &mut self,
+        id: DocumentId,
+        base: Seq,
+        witness: &Arc<str>,
+        text: PreparedText,
+    ) -> Result<Seq, DocumentError> {
+        let document = self
+            .documents
+            .get_mut(&id)
+            .ok_or(DocumentError::UnknownDocument)?;
+        if document.directory.is_some() || document.read_only {
+            return Err(DocumentError::ReadOnly);
+        }
+        if !matches!(
+            document.phase,
+            DocumentPhase::Active | DocumentPhase::Suspended
+        ) {
+            return Err(DocumentError::Closing);
+        }
+        if document.prepared.is_none()
+            || document.head() != base
+            || !Arc::ptr_eq(&document.projection, witness)
+        {
+            return Err(DocumentError::InvalidRange);
+        }
+        #[cfg(any(test, debug_assertions))]
+        record_preparation_work(PreparationWork {
+            adoptions: 1,
+            ..PreparationWork::default()
+        });
+        let prepared = text.take_graph().ok_or(DocumentError::PreparedConsumed)?;
+        let (line, projection, rope, directory) = prepared.parts();
+        if directory.is_some() {
+            return Err(DocumentError::ReadOnly);
+        }
+        let TxnOutcome::Committed(seq) =
+            document
+                .surface
+                .set_shared_line(&self.write, base, LineId(0), line)
+        else {
+            return Err(DocumentError::InvalidRange);
+        };
+        document.text = rope;
+        document.projection = projection;
+        document.prepared = Some(prepared);
+        document.revision = document.revision.saturating_add(1);
+        for observed in document.views.values_mut() {
+            *observed = seq;
+        }
+        Ok(seq)
+    }
+
+    /// Transfer an installed provisional head to ordinary live document ownership.
+    pub fn publish_prepared(&mut self, id: DocumentId) {
+        if let Some(document) = self.documents.get_mut(&id)
+            && let Some(prepared) = document.prepared.take()
+        {
+            prepared.publish(&document.projection, document.directory.as_ref());
+        }
     }
 
     pub fn id_for_uri(&self, canonical_uri: &str) -> Option<DocumentId> {
@@ -284,7 +423,7 @@ impl DocumentStore {
     }
 
     pub fn directory(&self, id: DocumentId) -> Option<&DirectoryListing> {
-        self.documents.get(&id)?.directory.as_ref()
+        self.documents.get(&id)?.directory.as_deref()
     }
 
     /// Make document `id` read-only for the rest of its life: from now on every transaction on
@@ -336,16 +475,112 @@ impl DocumentStore {
             .is_some_and(|document| document.directory.is_some() || document.read_only)
     }
 
-    /// Replace a generated listing without making it a user edit or a dirty buffer.
-    pub fn set_directory(
+    /// Capture only shared immutable roots; directory scans stay on the worker.
+    pub fn directory_preparation_base(
+        &self,
+        id: DocumentId,
+        target: &PreparedText,
+    ) -> Option<DirectoryPreparationBase> {
+        let document = self.documents.get(&id)?;
+        if !matches!(
+            document.phase,
+            DocumentPhase::Active | DocumentPhase::Suspended
+        ) {
+            return None;
+        }
+        Some(DirectoryPreparationBase::capture(
+            document.head(),
+            document.projection.clone(),
+            document.text.clone(),
+            document.directory.as_ref()?.clone(),
+            target,
+        ))
+    }
+    /// Adopt an ordinary reopen's prepared directory refresh at its exact base.
+    pub fn adopt_directory_update(
         &mut self,
         id: DocumentId,
-        listing: DirectoryListing,
-    ) -> Result<(), DocumentError> {
+        update: PreparedDirectoryUpdate,
+    ) -> Result<(Seq, Vec<crate::editor::PreparedDirectoryCoordinates>), DocumentError> {
         let document = self
             .documents
             .get_mut(&id)
             .ok_or(DocumentError::UnknownDocument)?;
+        if !matches!(
+            document.phase,
+            DocumentPhase::Active | DocumentPhase::Suspended
+        ) {
+            return Err(DocumentError::Closing);
+        }
+        if document.head() != update.base.seq
+            || !Arc::ptr_eq(&document.projection, &update.base.projection)
+            || !document
+                .directory
+                .as_ref()
+                .is_some_and(|listing| Arc::ptr_eq(listing, update.base.listing()))
+        {
+            return Err(DocumentError::InvalidRange);
+        }
+        let prepared = update
+            .target
+            .take_graph()
+            .ok_or(DocumentError::PreparedConsumed)?;
+        let (line, projection, rope, directory) = prepared.parts();
+        if directory.is_none() {
+            return Err(DocumentError::ReadOnly);
+        }
+        let seq = if update.changed {
+            let base = document.head();
+            let TxnOutcome::Committed(seq) =
+                document
+                    .surface
+                    .set_shared_line(&self.write, base, LineId(0), line)
+            else {
+                return Err(DocumentError::InvalidRange);
+            };
+            document.text = rope;
+            document.projection = projection;
+            document.revision = document.revision.saturating_add(1);
+            for observed in document.views.values_mut() {
+                *observed = seq;
+            }
+            seq
+        } else {
+            document.head()
+        };
+        document.directory = directory;
+        document.checkpoint_seq = seq;
+        if update.changed {
+            document.prepared = Some(prepared);
+            #[cfg(any(test, debug_assertions))]
+            record_preparation_work(PreparationWork {
+                adoptions: 1,
+                ..Default::default()
+            });
+            self.publish_prepared(id);
+        }
+        // If text is unchanged, the unused new graph retires; current text wins.
+        Ok((seq, update.coordinates))
+    }
+
+    /// Replace a generated listing without making it a user edit or a dirty buffer.
+    pub fn set_directory(
+        &mut self,
+        id: DocumentId,
+        listing: impl Into<Arc<DirectoryListing>>,
+    ) -> Result<(), DocumentError> {
+        let listing = listing.into();
+        let document = self
+            .documents
+            .get_mut(&id)
+            .ok_or(DocumentError::UnknownDocument)?;
+        if document
+            .directory
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &listing))
+        {
+            return Ok(());
+        }
         if !matches!(
             document.phase,
             DocumentPhase::Active | DocumentPhase::Suspended
@@ -451,6 +686,93 @@ impl DocumentStore {
         let observed = document.head();
         document.views.insert(view, observed);
         document.phase = DocumentPhase::Active;
+        self.unpublished.remove(&(id, view));
+        Ok(())
+    }
+
+    /// Attach a new, unpublished view. An existing published view cannot be made
+    /// rollbackable, and the returned authority belongs only to this store.
+    pub fn attach_unpublished_view(
+        &mut self,
+        id: DocumentId,
+        view: DocumentViewId,
+    ) -> Result<UnpublishedAttachment, DocumentError> {
+        if self
+            .documents
+            .get(&id)
+            .ok_or(DocumentError::UnknownDocument)?
+            .views
+            .contains_key(&view)
+        {
+            return Err(DocumentError::CloseNotReady);
+        }
+        let generation = self.next_attachment;
+        self.next_attachment = generation
+            .checked_add(1)
+            .ok_or(DocumentError::CloseNotReady)?;
+        self.attach_view(id, view)?;
+        self.unpublished.insert((id, view), generation);
+        let owner = Arc::clone(self.attachment_owner.get_or_insert_with(|| Arc::new(())));
+        Ok(UnpublishedAttachment {
+            owner,
+            document: id,
+            view,
+            generation,
+        })
+    }
+
+    fn owns_unpublished(&self, attachment: &UnpublishedAttachment) -> bool {
+        self.attachment_owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &attachment.owner))
+            && self
+                .unpublished
+                .get(&(attachment.document, attachment.view))
+                == Some(&attachment.generation)
+            && self
+                .documents
+                .get(&attachment.document)
+                .is_some_and(|document| document.views.contains_key(&attachment.view))
+    }
+
+    /// Check rollback/publication custody without changing either attachment.
+    pub fn holds_attachment(&self, attachment: &UnpublishedAttachment) -> bool {
+        self.owns_unpublished(attachment)
+    }
+
+    /// Commit publication. The consumed token can no longer bypass an ordinary close.
+    pub fn publish_attachment(
+        &mut self,
+        attachment: UnpublishedAttachment,
+    ) -> Result<(), DocumentError> {
+        if !self.owns_unpublished(&attachment) {
+            return Err(DocumentError::CloseNotReady);
+        }
+        self.unpublished
+            .remove(&(attachment.document, attachment.view));
+        Ok(())
+    }
+
+    /// Undo only an unpublished attachment, retaining its document, edits and checkpoint.
+    pub fn rollback_attachment(
+        &mut self,
+        attachment: UnpublishedAttachment,
+    ) -> Result<(), DocumentError> {
+        if !self.owns_unpublished(&attachment) {
+            return Err(DocumentError::CloseNotReady);
+        }
+        self.unpublished
+            .remove(&(attachment.document, attachment.view));
+        let document = self
+            .documents
+            .get_mut(&attachment.document)
+            .ok_or(DocumentError::UnknownDocument)?;
+        document.views.remove(&attachment.view);
+        document.phase = if document.views.is_empty() {
+            DocumentPhase::Suspended
+        } else {
+            DocumentPhase::Active
+        };
         Ok(())
     }
 
@@ -539,6 +861,11 @@ impl DocumentStore {
             return DocumentTxnOutcome::Rejected(DocumentError::InvalidRange);
         };
         let next = next_text.to_flat_string();
+        #[cfg(any(test, debug_assertions))]
+        record_preparation_work(PreparationWork {
+            projection_input_bytes: next.len(),
+            ..Default::default()
+        });
         let next_projection: Arc<str> = Arc::from(next.as_str());
         let deltas = edits
             .iter()

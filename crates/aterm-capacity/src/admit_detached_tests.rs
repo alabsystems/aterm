@@ -34,19 +34,32 @@ fn held(accounting: Accounting) -> Record {
 
 fn decide_with(machine: &Fixed, records: &[Record]) -> Result<Grant, Shortfall> {
     let procs = machine.procs();
-    let records = counted(records.iter().collect(), CONTENDER, procs.as_ref(), None);
-    let roots: Vec<_> = records
-        .iter()
-        .flat_map(|record| std::iter::once(record.pid).chain(record.credit.iter().copied()))
-        .collect();
-    let trees = procs
-        .as_ref()
-        .map(|procs| procs.trees(&roots))
-        .unwrap_or_default();
+    // The look reads its own claim beside the others ([`crate::tests::asking`]).
+    let asking = crate::tests::asking(CONTENDER);
+    let read: Vec<&Record> = records.iter().chain(std::iter::once(&asking)).collect();
+    let trees = process_use(&read, CONTENDER, procs.as_ref()).trees;
+    // Unread memory: no lead is sure ([`sure_leads`]).
+    let unread = crate::Reading::default();
+    let reckoned = ledgerwide(&read, &trees, procs.as_ref(), &unread).reckoned;
+    // Reckoned by this look's own turn ([`Other::reckoned`] `None`).
+    let wide = Ledgerwide {
+        holders: claims_by_holder(read.iter().copied()),
+        insides: own_counts(&read, procs.as_ref(), &reckoned, &unread),
+        ..Ledgerwide::default()
+    };
+    let counted = counted(
+        records.iter().collect(),
+        CONTENDER,
+        procs.as_ref(),
+        &reckoned,
+        &unread,
+    );
     let others = others(
-        &records,
-        records.iter().map(|record| record.pid).collect(),
+        &counted,
+        read.iter().map(|record| record.pid).collect(),
         &trees,
+        &HashMap::new(),
+        &wide,
     );
     decide(
         &Need::new("independent contender").mem_gib(2).margin(MARGIN),
@@ -135,11 +148,11 @@ fn reused_owner_ancestor_cannot_exclude_or_cover_detached_memory() {
     ]);
     let machine = fixed(procs.clone());
     let ordinary = held(Accounting::Holder);
-    assert!(counted(vec![&ordinary], CONTENDER, Some(&procs), None).is_empty());
+    assert!(crate::tests::counted_by(vec![&ordinary], CONTENDER, Some(&procs), None).is_empty());
     assert!(decide_with(&machine, &[ordinary]).is_ok());
     let mut detached = held(Accounting::Detached);
     assert_eq!(
-        counted(vec![&detached], CONTENDER, Some(&procs), None).len(),
+        crate::tests::counted_by(vec![&detached], CONTENDER, Some(&procs), None).len(),
         1
     );
     assert_full_budget_refused(&machine, detached.clone());

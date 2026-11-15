@@ -389,7 +389,7 @@ fn keep_lines_are_left_out_of_the_body_land_reads() {
          server the person asked for, still running\nKEEP {other}: the docs watcher, still \
          running\n2. keep {linux}, still running\n- keep it running for now\n- keep `{TOKEN}`"
     );
-    let kept = needs::kept_tokens(&defense);
+    let kept = crate::harness::leftover::kept_identities(&defense);
     assert_eq!(
         kept,
         [TOKEN, other, linux]
@@ -398,7 +398,7 @@ fn keep_lines_are_left_out_of_the_body_land_reads() {
             .collect::<Vec<_>>(),
         "each token once, in order"
     );
-    assert!(needs::kept_tokens(DEFENSE).is_empty());
+    assert!(crate::harness::leftover::kept_identities(DEFENSE).is_empty());
     let only_kept = format!(
         "{DEFENSE}\n- keep `{TOKEN}`: the dev server the person asked for, still running\nkeep \
          {other}, still running"
@@ -766,7 +766,7 @@ fn a_keep_line_reads_as_sys_left_prints_it_and_never_inside_a_need() {
         kept[0], kept[1], kept[2]
     );
     assert_eq!(
-        needs::kept_tokens(&copied),
+        crate::harness::leftover::kept_identities(&copied),
         kept.iter()
             .map(|t| token_of(t).expect("a token"))
             .collect::<Vec<_>>()
@@ -776,9 +776,9 @@ fn a_keep_line_reads_as_sys_left_prints_it_and_never_inside_a_need() {
         kept[0]
     );
     assert!(
-        needs::kept_tokens(&asked).is_empty(),
+        crate::harness::leftover::kept_identities(&asked).is_empty(),
         "{:?}",
-        needs::kept_tokens(&asked)
+        crate::harness::leftover::kept_identities(&asked)
     );
 }
 

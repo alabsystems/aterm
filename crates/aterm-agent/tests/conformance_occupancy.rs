@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::disk::Level;
 use aterm_agent::supervise::facts::{EpisodeKey, FactKind, FactsReading, FactsState, SeedOutcome};
 use aterm_agent::supervise::occupancy::door::host_step_may_go;
@@ -30,7 +31,7 @@ use aterm_agent::supervise::occupancy::{
     AtWrite, Books, Guards, HoldClock, HoldEvent, HoldSeen, OccupancyReading, RuleId, SlotsSeen,
     StuckVerdict, Verdict, WakeSeen, WakeSight, WakesSeen, decide, stuck_at_break, write_held,
 };
-use aterm_agent::supervise::{Autopilot, BackgroundCall, Guard, SupervisorConfig};
+use aterm_agent::supervise::{BackgroundCall, Guard, SupervisorConfig};
 use aterm_models_harness::occupancy_door_model;
 use aterm_spec::derive::Model;
 use aterm_spec::xref::StepEvidence;

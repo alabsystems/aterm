@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Guarded lab fabric broker in scratch state: its layout ([`lay`]), the proofs' unjailed broker
-//! ([`Fabric::start`]) and the wait for a broker's socket both share ([`await_listening`]).
+//! ([`Fabric::start`]), the wait for a broker's socket both share ([`await_listening`]) and the
+//! bridge's `ev` records read back through the broker ([`Fabric::ev_reader`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -15,6 +16,10 @@ pub const FLEET: &str = "lab";
 /// How long a broker the lab started may take to listen: a hang detector, never a latency
 /// budget ([`await_listening`]).
 pub const LISTEN_HANG: Duration = Duration::from_secs(60);
+
+/// The timeout of each socket read or write on an [`EvReader`]'s connection: a hang detector,
+/// never a latency budget.
+const READ_HANG: Duration = Duration::from_secs(60);
 
 /// A mint: `aterm link mint <grant> --secret-file <secret>`'s argv in, its standard output (one
 /// `<grant> <tag-hex>` line) out, or why it failed ([`lay`]).
@@ -311,6 +316,12 @@ pub struct Fabric {
     pub table: String,
     /// The bridge's `--state` dir (its `topics/<sid>` cursors among it).
     pub state: PathBuf,
+    /// The broker's socket, which [`Fabric::ev_reader`] reads the bus through.
+    sock: PathBuf,
+    /// The mint secret, which mints [`Fabric::ev_reader`]'s read cap.
+    secret: PathBuf,
+    /// The node id the bridge publishes under.
+    node: String,
 }
 
 impl Fabric {
@@ -352,6 +363,9 @@ impl Fabric {
             _lifeline: lifeline,
             table: laid.table,
             state: laid.state,
+            sock: laid.sock.clone(),
+            secret: laid.secret,
+            node: laid.node,
         };
         let listened = await_listening(
             &laid.sock,
@@ -422,6 +436,86 @@ impl Fabric {
         }
         let _ = broker.kill();
         let _ = broker.wait();
+    }
+
+    /// A reader of the `ev` records the node's bridge publishes ([`ev_filter`]), through the
+    /// broker under a read cap minted from the lab's own secret: the broker's log is sealed at
+    /// rest (a broker with a mint secret beside its log mints `rest.key` there and seals the
+    /// log), so a search of its bytes finds nothing. Its first [`EvReader::read`] starts at the
+    /// oldest record the broker keeps.
+    /// # Errors
+    /// The secret could not be read, the cap minted, the broker dialled, or the attach refused
+    /// or not answered within a minute (a hang detector).
+    pub fn ev_reader(&self) -> Result<EvReader, String> {
+        let secret = crate::util::read_regular_file(&self.secret)
+            .map_err(|e| format!("{}: {e}", self.secret.display()))?;
+        let cap = astream_cap::mint(&secret, &format!("ro:/f/{FLEET}/>"))?;
+        let (mut conn, _closer) =
+            aterm_link::transport::connect(&self.sock.to_string_lossy(), READ_HANG)
+                .map_err(|e| format!("dial the broker at {}: {e}", self.sock.display()))?;
+        conn.attach(&cap.filter, &cap.tag)
+            .map_err(|e| format!("attach a bus reader: {e}"))?;
+        Ok(EvReader {
+            conn,
+            filter: ev_filter(&self.node),
+            at: 0,
+        })
+    }
+}
+
+/// The faces `node`'s bridge publishes its `ev` records on, its node face and each session's:
+/// `/f/lab/pub/<node>/*/ev`. It names those alone, so the broker sends no presence, ack or
+/// other record of the node to be passed over, and lies under the broker's `ev` rule
+/// (`aterm_link::broker_rules::EV_FILTER`).
+fn ev_filter(node: &str) -> String {
+    format!("/f/{FLEET}/pub/{node}/*/ev")
+}
+
+/// The words of a bridge's `ev` record (its body `v=1 t=<ms> ev=<pct>`), decoded; `None` for a
+/// body with no `ev` field.
+fn ev_of(body: &[u8]) -> Option<String> {
+    let (body, _) = aterm_link::body::Body::decode(body);
+    let ev = body.unknown.get("ev")?;
+    Some(aterm_link::pct::decode(ev))
+}
+
+/// One connection that reads a node's `ev` records on from where its last read ended
+/// ([`Fabric::ev_reader`]).
+pub struct EvReader {
+    /// The broker connection, attached under the read cap.
+    conn: aterm_link::transport::Conn,
+    /// [`ev_filter`] of the node.
+    filter: String,
+    /// The offset the next read starts at.
+    at: u64,
+}
+
+impl EvReader {
+    /// The words of every `ev` record ([`ev_of`]) published since the last read ended, oldest
+    /// first, up to the log's head, where the next read starts. A read from below the filter's
+    /// oldest (retention gave records up there) reads on from that oldest instead
+    /// (`aterm_link::transport::fetch_kept`): what was given up is missing from it, and nothing
+    /// is read twice.
+    /// # Errors
+    /// A page refused, or not answered within a minute (a hang detector); after one that was
+    /// not answered, every later read on the connection fails too.
+    pub fn read(&mut self) -> Result<Vec<String>, String> {
+        let mut evs = Vec::new();
+        loop {
+            let ((rows, (next, head)), floor) = aterm_link::transport::fetch_kept(
+                &mut self.conn,
+                self.at,
+                &self.filter,
+                aterm_link::transport::ROW_PAGE,
+            )
+            .map_err(|e| format!("fetch {} from @{}: {e}", self.filter, self.at))?;
+            let from = floor.unwrap_or(self.at);
+            evs.extend(rows.iter().filter_map(|(_, _, body)| ev_of(body)));
+            self.at = from.max(next);
+            if next >= head || next <= from {
+                return Ok(evs);
+            }
+        }
     }
 }
 

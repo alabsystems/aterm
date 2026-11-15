@@ -189,6 +189,24 @@ pub fn write(dir: PathBuf, facts: &HostFacts, row: &Row, lost: &Lost) -> bool {
     wrote(append(dir, facts, &[row.line()], lost), lost)
 }
 
+/// Append `lines` (each one whole line of a log of its own schema, ending in a line feed: the
+/// capacity ledger's admission log, whose rows are not [`Row`]s) to `log` in one write, under
+/// one wait for its lock of what `log` was made [`crate::Log::waiting`] for, after a gap line for
+/// the rows `lost` holds that no line has said yet: `false` when they were not written, each of
+/// them counted in `lost` unless the failed write may have left some ([`crate::log::left_lines`]:
+/// missing at worst, never said twice), as [`write`] counts its row.
+pub fn write_lines(log: &crate::Log, lines: &[String], lost: &Lost) -> bool {
+    match append_to(log, lines, lost) {
+        Ok(()) => true,
+        Err((dir, left)) => {
+            if !left {
+                lost.lose(&dir, lines.len() as u64);
+            }
+            false
+        }
+    }
+}
+
 /// Whether a row's append ([`append_to`]) wrote it, counting it in `lost` where it did not and
 /// the failed write left none of it.
 fn wrote(appended: Result<(), (PathBuf, bool)>, lost: &Lost) -> bool {

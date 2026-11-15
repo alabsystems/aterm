@@ -534,13 +534,7 @@ fn dry_run_and_loopback_recording_never_learn_unrecorded_vault_tokens() {
             (vault::Slot::Release, "unlearned-release", "new-release"),
         ] {
             let token = agh_fake::token(seed);
-            let path = slot.path(&w.dirs.home);
-            std::fs::create_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
-            common::write_token(
-                path.parent().unwrap(),
-                path.file_name().unwrap().to_str().unwrap(),
-                &token,
-            );
+            common::vault_entry(&w.dirs.home, slot.entry(), &token);
             w.fake.add_token(&token, login);
         }
         let tape = w.root.path().join("dry.atape");

@@ -39,7 +39,7 @@ mod contained;
 mod produced;
 pub use contained::{
     CompletedProducedOperation, ContainedProducedError, ContainedProducedMember,
-    SuccessfulProducedCompletion,
+    CoordinatorDescriptors, SuccessfulProducedCompletion,
 };
 mod refusal;
 pub use produced::{ProducedError, ProducedFailureObservation, ProducedMember, ProducedResult};
@@ -453,11 +453,10 @@ fn ordered(request: &impl NativeQuery, descriptions: Vec<OwnedFd>) -> io::Result
             let mut selected = None;
             for (number, fd) in &descriptors {
                 let meta = File::from(fd.try_clone()?).metadata()?;
-                if (meta.dev(), meta.ino()) == (lock.backing.device, lock.backing.inode) {
-                    if selected.replace(*number).is_some() {
+                if (meta.dev(), meta.ino()) == (lock.backing.device, lock.backing.inode)
+                    && selected.replace(*number).is_some() {
                         return Err(invalid("duplicate original output description"));
                     }
-                }
             }
             result.push(
                 descriptors

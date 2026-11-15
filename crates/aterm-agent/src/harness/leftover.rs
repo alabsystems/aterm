@@ -58,6 +58,23 @@ pub fn token_of(word: &str) -> Option<Identity> {
     Identity::parse_shaped(word, word.contains(':'))
 }
 
+/// THE ROWS A DEFENSE KEEPS RUNNING: each token a keep line under `tail`'s `Nothing left:`
+/// defense names ([`alab_policy::needs::kept_tokens`]) as the process it names ([`token_of`]), in
+/// order and each once.
+#[must_use]
+pub fn kept_identities(tail: &str) -> Vec<Identity> {
+    let mut kept = Vec::new();
+    for row in alab_policy::needs::kept_tokens(tail)
+        .iter()
+        .filter_map(|word| token_of(word))
+    {
+        if !kept.contains(&row) {
+            kept.push(row);
+        }
+    }
+    kept
+}
+
 /// THE DONE LINE'S `left=` WORD: what the landing's yield read of the agent's left rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeftWord {

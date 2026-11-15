@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::TokenCount;
 use std::time::{Duration, Instant};
 
 fn take(pool: &Jobserver) -> Vec<crate::Token<'_>> {
@@ -10,6 +11,18 @@ fn take(pool: &Jobserver) -> Vec<crate::Token<'_>> {
         held.push(token);
     }
     held
+}
+
+/// Each branch's sole adopter counts its FIFO whole after `step`: nothing minted, nothing read
+/// out.
+fn counted_whole(clients: &[Jobserver; 2], step: &str) {
+    for (branch, client) in clients.iter().enumerate() {
+        let count = client.count_alone(&|| true).unwrap();
+        assert!(
+            matches!(count, TokenCount::Whole { .. }),
+            "after {step}, branch {branch} counted {count:?}"
+        );
+    }
 }
 
 fn fixture_loan(shares: &BranchShares) -> FixtureShare<'_> {
@@ -112,20 +125,33 @@ fn resuming_an_admitted_tree_moves_a_free_token_without_reminting_live_build_wor
                 let shares =
                     BranchShares::new(&dir.path().join("jobs"), slots, export, [true, true])
                         .unwrap();
+                // Each branch's one adopter holds that branch's live work, and counts its FIFO
+                // after every step: bytes and its live tokens are always the allocation.
+                let clients = [false, true]
+                    .map(|tree| Jobserver::adopt(&shares.pool(tree).handed()).unwrap());
                 let barrier = shares.reserve_initial().unwrap();
+                for client in &clients {
+                    assert!(matches!(
+                        client.count_alone(&|| true).unwrap(),
+                        TokenCount::Unsettled(_)
+                    ));
+                }
                 assert!(!shares.serial_tree_waiting());
                 assert!(!shares.resume_admitted_tree().unwrap());
                 barrier.release_to_build().unwrap();
-                let mut live_build = take(shares.pool(false));
+                counted_whole(&clients, "serial escape");
+                let mut live_build = take(&clients[0]);
                 assert!(shares.serial_tree_waiting());
                 assert!(!shares.resume_admitted_tree().unwrap());
                 // One compiler returns its byte; every other client remains live. Recovering
                 // the whole branch here would duplicate those clients' outstanding tokens.
                 drop(live_build.pop().unwrap());
+                counted_whole(&clients, "a compiler returned its byte");
                 assert!(shares.resume_admitted_tree().unwrap());
-                let tree = take(shares.pool(true));
+                counted_whole(&clients, "resumed");
+                let tree = take(&clients[1]);
                 assert_eq!(tree.len(), 1);
-                assert!(take(shares.pool(false)).is_empty());
+                assert!(take(&clients[0]).is_empty());
                 assert_eq!(
                     live_build.len() + tree.len() + export as usize,
                     slots as usize
@@ -135,18 +161,32 @@ fn resuming_an_admitted_tree_moves_a_free_token_without_reminting_live_build_wor
                 drop(live_build);
                 drop(tree);
                 shares.build_compilers_drained();
-                assert_eq!(take(shares.pool(true)).len(), (slots - export) as usize);
+                counted_whole(&clients, "compilers drained");
+                assert_eq!(take(&clients[1]).len(), (slots - export) as usize);
+                let fixture = fixture_loan(&shares);
+                counted_whole(&clients, "fixture loan");
+                // The producer takes the loan's byte and gives it back before it is reaped.
+                assert_eq!(take(&clients[0]).len(), 1);
+                drop(fixture);
+                counted_whole(&clients, "fixture returned");
                 for branch in order {
                     shares.finish(branch);
+                    counted_whole(&clients, "a branch ended");
                     let state = shares.qualify_allocations.lock().unwrap();
                     assert_eq!(
-                        take(shares.pool(false)).len()
-                            + take(shares.pool(true)).len()
+                        take(&clients[0]).len()
+                            + take(&clients[1]).len()
                             + state.allocated[2] as usize,
                         slots as usize
                     );
                 }
-                assert_eq!(take(shares.pool(true)).len(), slots as usize);
+                assert_eq!(take(&clients[1]).len(), slots as usize);
+                let state = shares.qualify_allocations.lock().unwrap();
+                assert_eq!(
+                    (state.shortfalls, state.surpluses),
+                    (0, 0),
+                    "no reap count of conserved work is short or over"
+                );
             }
         }
     }
@@ -428,6 +468,382 @@ fn leak(pool: &Jobserver, expected: usize) {
     assert!(output.contains(&format!(
         "reads={expected} writes=0 held_on_exit={expected}"
     )));
+}
+
+/// Marks the run of [`token_client`] its parent test started, and says what it does once it
+/// holds its token: `hold` dies by SIGKILL holding it; `return` gives it back and exits;
+/// `wait-hold` and `wait-return` first wait for its standard input to close.
+const TOKEN_CLIENT: &str = "ATERM_BRANCH_TOKEN_CLIENT";
+
+/// A jobserver client of the pool its parent handed it: it adopts the pool, takes one token,
+/// says so on standard output, and then does what [`TOKEN_CLIENT`] says.
+#[test]
+fn token_client() {
+    let Some(how) = std::env::var_os(TOKEN_CLIENT) else {
+        return;
+    };
+    use std::io::{Read as _, Write as _};
+    let pool = Jobserver::inherited().unwrap().unwrap();
+    let token = pool.try_acquire().unwrap().expect("a free token");
+    println!("token-client pid={} held=1", std::process::id());
+    std::io::stdout().flush().unwrap();
+    let how = how.to_str().unwrap();
+    if how.starts_with("wait-") {
+        let mut rest = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut rest);
+    }
+    if how.ends_with("hold") {
+        let _held = token;
+        aterm_uds::process::kill_self_now();
+    }
+    drop(token);
+    println!("token-client returned=1");
+}
+
+/// [`token_client`] doing `how`, handed `pool` by `hand`, with its standard input and output
+/// piped.
+fn token_client_command(
+    how: &str,
+    hand: impl FnOnce(&mut aterm_uds::spawnfd::Command),
+) -> aterm_uds::spawnfd::Command {
+    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "branch_shares::tests::token_client",
+            "--nocapture",
+        ])
+        .env(TOKEN_CLIENT, how)
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped());
+    hand(&mut child);
+    child
+}
+
+/// Run `command` to its end: its pid, how it ended, and what it printed.
+fn reap_token_client(
+    command: &mut aterm_uds::spawnfd::Command,
+) -> (u32, std::process::ExitStatus, String) {
+    let child = command.spawn().unwrap();
+    let pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    (
+        pid,
+        output.status,
+        String::from_utf8(output.stdout).unwrap(),
+    )
+}
+
+/// THE NAMED CASE. A real jobserver client, handed the build FIFO by `hand_to`, takes a token
+/// and dies by SIGKILL holding it. Once it is reaped and noted, build's reap point
+/// (`build_compilers_drained`) counts two of build's three tokens: the record names the branch,
+/// both counts and that client, the `.allocation` record carries it, and the re-mint leaves the
+/// tree FIFO holding all four. A second client, handed the tree FIFO, dies the same way, and
+/// tree's end counts three of four: the second shortfall's record names that client on the
+/// tree FIFO alone, the FIFO is made whole again, and the first shortfall still names the
+/// first. A command handed neither FIFO is noted on neither. CONTROL: clients that return their
+/// token before exiting leave no record and no extra token.
+#[test]
+fn a_client_killed_holding_a_token_is_recorded_and_made_whole_at_its_reap() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let program = std::env::current_exe()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    for hold in [true, false] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let shares = BranchShares::new(&dir.path().join("jobs"), 4, 0, [true, true]).unwrap();
+        let how = if hold { "hold" } else { "return" };
+        let ended = if hold { "signal=9" } else { "exit=0" };
+        let killed = |tree: bool| {
+            let mut client = token_client_command(how, |cmd| {
+                shares.hand_to(cmd, tree).unwrap();
+            });
+            let (pid, status, said) = reap_token_client(&mut client);
+            assert!(said.contains("held=1"), "the client held its token: {said}");
+            assert_eq!(status.signal(), hold.then_some(9));
+            shares.reaped(&client, pid, Some(status));
+            format!("pid={pid} program={program} ended={ended}")
+        };
+        let first = killed(false);
+        // Handed no FIFO: noted on neither branch.
+        let unhanded = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        shares.reaped(&unhanded, 1, None);
+        shares.build_compilers_drained();
+        let first_shortfall = hold.then_some(Recovery {
+            branch: 0,
+            recipient: 1,
+            assigned: 3,
+            returned: Some(2),
+            read_error: None,
+        });
+        let first_reaped = if hold { vec![first.clone()] } else { vec![] };
+        {
+            let state = shares.qualify_allocations.lock().unwrap();
+            assert_eq!(
+                (&state.first_shortfall, &state.first_shortfall_reaped),
+                (&first_shortfall, &first_reaped),
+                "the first shortfall names the branch, both counts and the client reaped"
+            );
+            assert_eq!((state.shortfalls, state.surpluses), (u32::from(hold), 0));
+        }
+        let allocation =
+            std::fs::read_to_string(shares.pool(true).path().with_extension("allocation")).unwrap();
+        assert!(
+            allocation.contains(&format!("shortfalls={}", u32::from(hold))),
+            "{allocation}"
+        );
+        let tree = take(shares.pool(true));
+        assert_eq!(tree.len(), 4, "the FIFO holds its whole allocation again");
+        drop(tree);
+
+        let second = killed(true);
+        shares.finish(1);
+        assert_eq!(
+            shares.pool(true).last_count().map(|record| record.reaped),
+            hold.then(|| vec![second]),
+            "the second shortfall names the client handed the tree FIFO, and only it"
+        );
+        let state = shares.qualify_allocations.lock().unwrap();
+        assert_eq!(
+            (state.shortfalls, state.surpluses),
+            (2 * u32::from(hold), 0),
+            "each loss is one shortfall; a whole count records nothing"
+        );
+        assert_eq!(
+            (&state.first_shortfall, &state.first_shortfall_reaped),
+            (&first_shortfall, &first_reaped),
+            "a later shortfall never replaces the first"
+        );
+        drop(state);
+        assert_eq!(take(shares.pool(true)).len(), 4, "made whole again");
+    }
+}
+
+/// A token returned after its branch was counted and re-minted is a surplus: a live build
+/// client holds one of build's three tokens when build's compilers are reported drained, so
+/// that count is short (its adopter alive) and re-mints the whole allocation to tree; the
+/// client then gives its token back to the build FIFO, and build's end reads it out as a
+/// surplus, not a token to re-mint. The tree FIFO ends at its allocation, no more.
+#[test]
+fn a_token_returned_after_its_branch_was_reminted_is_read_out_as_a_surplus() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let shares = BranchShares::new(&dir.path().join("jobs"), 4, 0, [true, true]).unwrap();
+    let client = Jobserver::adopt(&shares.pool(false).handed()).unwrap();
+    let late = client.try_acquire().unwrap().expect("a build token");
+    shares.build_compilers_drained();
+    assert_eq!(
+        shares
+            .pool(false)
+            .last_count()
+            .map(|record| record.evidence),
+        Some("the coordinator's reap point; adopters=alive".to_owned()),
+        "the count says an adopter still lives"
+    );
+    drop(late);
+    shares.finish(0);
+    {
+        let state = shares.qualify_allocations.lock().unwrap();
+        assert_eq!((state.shortfalls, state.surpluses), (1, 1));
+    }
+    assert_eq!(
+        shares
+            .pool(false)
+            .last_count()
+            .map(|record| (record.outcome, record.changed)),
+        Some(("over", 1))
+    );
+    assert!(take(shares.pool(false)).is_empty(), "the surplus is gone");
+    assert_eq!(
+        take(shares.pool(true)).len(),
+        4,
+        "tree holds its allocation"
+    );
+}
+
+/// A sole adopter's own count ([`Jobserver::count_alone`]). The tree FIFO's one adopter (the
+/// verifier) hands it to a child, which takes a token. While that child lives, its hold of the
+/// clients lock keeps the count unjudged, recorded as unjudged, and nothing is minted; it is
+/// reaped holding its token, and a count the caller says a child may still be alive for is
+/// unjudged too, not recorded again, and the notes are kept. The count once it is alone finds
+/// three of four, mints one, and records it as the first shortfall with every
+/// client noted since; the next is whole, with the adopter's own four tokens counted as held.
+/// A second loss is recorded too, but not as the first. A byte minted twice is read out as a
+/// surplus. CONTROL: a child that gives its token back before it exits leaves the FIFO whole,
+/// never over-full. CONTROL: while the creator holds the transfer lock with a byte it took out
+/// of the FIFO to move (as `recover` drains before it re-mints), the count is unjudged and
+/// mints nothing, so the FIFO ends at the allocation once the creator puts it back.
+#[test]
+fn a_sole_adopter_counts_its_fifo_whole_only_when_no_other_holder_lives() {
+    use std::io::{BufRead as _, BufReader};
+    use std::os::unix::process::ExitStatusExt as _;
+    for hold in [true, false] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let shares = BranchShares::new(&dir.path().join("jobs"), 4, 0, [false, true]).unwrap();
+        let creator = shares.pool(true);
+        let verifier = Jobserver::adopt(&creator.handed()).unwrap();
+        assert_eq!(
+            verifier.count_alone(&|| true).unwrap(),
+            TokenCount::Whole { allocated: 4 }
+        );
+        verifier.note_reaped("earlier".to_owned());
+        let mut command =
+            token_client_command(if hold { "wait-hold" } else { "wait-return" }, |cmd| {
+                verifier.hand_to(cmd);
+            });
+        let mut child = command.spawn().unwrap();
+        let mut said = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("held=1") {
+            line.clear();
+            assert_ne!(
+                said.read_line(&mut line).unwrap(),
+                0,
+                "the client never held"
+            );
+        }
+        assert_eq!(
+            verifier.count_alone(&|| true).unwrap(),
+            TokenCount::Unsettled("another handle has adopted this pool"),
+            "a live client's token is not a loss"
+        );
+        let unjudged = verifier.last_count();
+        assert_eq!(
+            unjudged.as_ref().map(|record| (
+                record.outcome,
+                record.first,
+                record.evidence.as_str(),
+                record.reaped.as_slice()
+            )),
+            Some((
+                "short-unjudged",
+                true,
+                "another handle has adopted this pool",
+                &["earlier".to_owned()][..]
+            )),
+            "a shortfall it cannot judge is recorded, as unjudged"
+        );
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), hold.then_some(9));
+        let client = format!("pid={} ended={status}", child.id());
+        verifier.note_reaped(client.clone());
+        assert!(
+            matches!(
+                verifier.count_alone(&|| false).unwrap(),
+                TokenCount::Unsettled(_)
+            ),
+            "a count with a child perhaps alive is never judged"
+        );
+        assert_eq!(
+            verifier.last_count(),
+            unjudged,
+            "an unjudged shortfall is recorded once"
+        );
+        verifier.note_reaped("later".to_owned());
+        let count = verifier.count_alone(&|| true).unwrap();
+        assert_eq!(
+            count,
+            if hold {
+                TokenCount::Short {
+                    allocated: 4,
+                    found: 3,
+                    reminted: 1,
+                }
+            } else {
+                TokenCount::Whole { allocated: 4 }
+            }
+        );
+        assert_eq!(
+            verifier.last_count(),
+            if hold {
+                Some(crate::jobserver::CountRecord {
+                    outcome: "short",
+                    first: true,
+                    allocated: 4,
+                    in_fifo: 3,
+                    held: 0,
+                    changed: 1,
+                    evidence: "sole client".to_owned(),
+                    reaped: vec!["earlier".to_owned(), client.clone(), "later".to_owned()],
+                    unlisted: 0,
+                })
+            } else {
+                unjudged
+            },
+            "the first shortfall names every client noted since the last whole count; a whole \
+             count records nothing"
+        );
+        let held = take(&verifier);
+        assert_eq!(held.len(), 4, "the FIFO holds its allocation, no more");
+        assert_eq!(
+            verifier.count_alone(&|| true).unwrap(),
+            TokenCount::Whole { allocated: 4 },
+            "the counter's own tokens are held, not lost"
+        );
+        drop(held);
+
+        // Another loss: a dead client's byte, read out of the FIFO and never written back.
+        std::mem::forget(creator.try_acquire().unwrap().expect("a token"));
+        assert_eq!(
+            verifier.count_alone(&|| true).unwrap(),
+            TokenCount::Short {
+                allocated: 4,
+                found: 3,
+                reminted: 1,
+            }
+        );
+        assert_eq!(
+            verifier
+                .last_count()
+                .map(|record| (record.outcome, record.first)),
+            Some(("short", !hold)),
+            "a shortfall after the first is not the first"
+        );
+
+        // A byte minted twice.
+        let moving = creator.moving();
+        creator.remint(1, &moving);
+        drop(moving);
+        assert_eq!(
+            verifier.count_alone(&|| true).unwrap(),
+            TokenCount::Over {
+                allocated: 4,
+                found: 5,
+                discarded: 1,
+            },
+            "a surplus is read out"
+        );
+        assert_eq!(
+            take(&verifier).len(),
+            4,
+            "and the FIFO holds its allocation"
+        );
+
+        let moving = creator.moving();
+        std::mem::forget(
+            creator
+                .try_acquire_moving(&moving)
+                .unwrap()
+                .expect("a token to move"),
+        );
+        assert_eq!(
+            verifier.count_alone(&|| true).unwrap(),
+            TokenCount::Unsettled(
+                "the creator is moving an allocation or holds tokens outside the FIFO"
+            ),
+            "a transfer in flight is never judged"
+        );
+        creator.remint(1, &moving);
+        drop(moving);
+        assert_eq!(
+            take(&verifier).len(),
+            4,
+            "the transfer's own byte, and no minted one"
+        );
+    }
 }
 
 #[test]

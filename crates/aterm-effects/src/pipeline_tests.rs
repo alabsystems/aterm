@@ -2240,6 +2240,30 @@ fn chrome_geom_identity_and_padded_derivation() {
     assert_eq!((g.win_w, g.win_h), (80 * 9, 24 * 18));
 }
 
+/// A window whose pad over the grid is not its pad round it (`aterm-gui`'s 4 px over a Retina
+/// grid in its 24 px round it) lays the effects' origin at that pad over the grid, and its frame
+/// ends one pad under the grid. Negative control: without it the origin is the even pad's,
+/// 20 px lower.
+#[test]
+fn chrome_pad_top_moves_the_origin_to_the_window_s_pad_over_the_grid() {
+    let mut p = EffectsPipeline::new();
+    p.set_chrome(24, 0);
+    let even = p.chrome_geom(14, 72, 15, 28);
+    assert_eq!(
+        (even.origin_x, even.origin_y, even.win_h),
+        (24, 24, 392 + 48)
+    );
+    p.set_chrome_pad_top(Some(4));
+    let g = p.chrome_geom(14, 72, 15, 28);
+    assert_eq!((g.origin_x, g.origin_y), (24, 4));
+    assert_eq!((g.win_w, g.win_h), (1080 + 48, 4 + 392 + 24));
+    p.set_chrome(24, 6);
+    let g = p.chrome_geom(14, 72, 15, 28);
+    assert_eq!((g.origin_y, g.win_h, g.head), (10, 4 + 392 + 24 + 6, 6));
+    p.set_chrome_pad_top(None);
+    assert_eq!(p.chrome_geom(14, 72, 15, 28).origin_y, 30);
+}
+
 #[test]
 fn fire_glow_splices_field_streams_into_the_head_band() {
     let (cell_w, cell_h) = (10usize, 19usize);
@@ -3902,6 +3926,7 @@ fn the_flying_head_names_the_body_it_drew() {
         geom: g,
         cursor,
         look: crate::kitty_registry::KittyLook::default(),
+        body: crate::kitty_cursor::CursorBody::Head,
         colors: crate::cat_baker::CatColorKey::default(),
         bob: 0.0,
         lift: 0.0,
@@ -3919,6 +3944,7 @@ fn the_flying_head_names_the_body_it_drew() {
                     geom: g,
                     cursor,
                     look: crate::kitty_registry::KittyLook::default(),
+                    body: crate::kitty_cursor::CursorBody::Head,
                     bob: 0.0,
                     lift: 0.0,
                 },
@@ -3988,4 +4014,139 @@ fn the_flying_head_names_the_body_it_drew() {
     p.advance(1e300);
     let _ = p.now();
     let _ = p.wake();
+}
+
+/// A replay's pipeline keeping (or not) the flier, fed a fast line of typing: whether it ever
+/// published the flying head's body (`head_body=`) and a free sprite.
+fn flier_typed(flier: Option<PetSpecies>) -> (bool, bool) {
+    let mut p = EffectsPipeline::new();
+    p.set_cursor_glow(
+        true,
+        "rainbow",
+        crate::cursor_fx::TrailColor::Automatic,
+        None,
+        400,
+        24,
+        0.9,
+        0.9,
+        true,
+        0x0050_FA7B,
+    );
+    p.set_cursor_pet(false, 0x5EED);
+    p.set_cursor_flier(flier);
+    let mut term = Terminal::new(6, 60);
+    let mut input = term.cell_frame(6, 60);
+    p.apply(&mut term, &mut input, 10, 19);
+    let (mut head, mut sprite) = (false, false);
+    for ch in b"the quick brown fox jumps over the lazy dog" {
+        commit_ascii(&mut p, &mut term, &mut input, &[*ch], 60.0);
+        head |= p.cursor().glow.head_body_window_box().is_some();
+        sprite |= !free_sprites(&input).is_empty();
+    }
+    (head, sprite)
+}
+
+#[test]
+fn the_replay_pipeline_draws_the_flier() {
+    assert_eq!(
+        flier_typed(Some(PetSpecies::Cat)),
+        (true, true),
+        "a film keeping the flier must fly it in and draw it"
+    );
+    // The control: with no flier the replay's pipeline draws no head, as before.
+    assert_eq!(flier_typed(None), (false, false));
+}
+
+/// Each frame's cell colours and the sprites drawn over them while a pinned-colour prompt takes
+/// a typed line, with the flier `flier`.
+fn flier_cells(flier: Option<PetSpecies>) -> (Vec<Vec<(u32, u32)>>, usize) {
+    let mut p = EffectsPipeline::new();
+    p.set_cursor_glow(
+        true,
+        "rainbow",
+        crate::cursor_fx::TrailColor::Automatic,
+        None,
+        400,
+        24,
+        0.9,
+        0.9,
+        true,
+        0x0050_FA7B,
+    );
+    p.set_cursor_pet(false, 0x5EED);
+    p.set_cursor_flier(flier);
+    let mut term = Terminal::new(6, 60);
+    term.process(b"\x1b[38;2;200;30;30;48;2;10;90;10mpinned\x1b[0m \x1b[38;5;33mindexed\x1b[0m $ ");
+    let mut input = term.cell_frame(6, 60);
+    p.apply(&mut term, &mut input, 10, 19);
+    let mut frames = Vec::new();
+    let mut sprites = 0;
+    for ch in b"the quick brown fox jumps over the lazy dog" {
+        commit_ascii(&mut p, &mut term, &mut input, &[*ch], 60.0);
+        frames.push(
+            input
+                .cells
+                .iter()
+                .flatten()
+                .map(|c| {
+                    (
+                        aterm_render::rgb_to_u32(c.fg),
+                        aterm_render::rgb_to_u32(c.bg),
+                    )
+                })
+                .collect(),
+        );
+        sprites += free_sprites(&input).len();
+    }
+    (frames, sprites)
+}
+
+/// The first frame in which a cell's colours differ between `with` and `without`, and the cell.
+fn first_recoloured(
+    with: &[Vec<(u32, u32)>],
+    without: &[Vec<(u32, u32)>],
+) -> Option<(usize, usize)> {
+    with.iter()
+        .zip(without)
+        .enumerate()
+        .find_map(|(i, (a, b))| {
+            a.iter()
+                .zip(b)
+                .position(|(x, y)| x != y)
+                .map(|cell| (i, cell))
+        })
+}
+
+/// Never recolour a pinned colour: the flier is drawn over the grid, so every cell's colours,
+/// the program's pinned truecolour and indexed runs among them, are the same frame for frame
+/// with the flier as without it. Controls: the two runs do differ, in the sprites drawn; the
+/// frames hold the pinned truecolour pair; and the same comparison names the frame and cell
+/// where one pinned cell of the flier's run is recoloured.
+#[test]
+fn the_flier_never_recolours_a_cell() {
+    let (with, drawn) = flier_cells(Some(PetSpecies::Cat));
+    let (without, bare) = flier_cells(None);
+    assert_eq!(with.len(), without.len());
+    assert_eq!(
+        first_recoloured(&with, &without),
+        None,
+        "the flier changed a cell's colours (frame, cell)"
+    );
+    assert!(
+        drawn > bare,
+        "control: the flier was drawn ({drawn} sprites against {bare})"
+    );
+    let pinned = (0x00C8_1E1E, 0x000A_5A0A);
+    let frame = with.len() / 2;
+    let cell = with[frame]
+        .iter()
+        .position(|&c| c == pinned)
+        .expect("control: the frames hold the pinned truecolour cell");
+    let mut recoloured = with.clone();
+    recoloured[frame][cell].0 ^= 0x0000_0101;
+    assert_eq!(
+        first_recoloured(&recoloured, &without),
+        Some((frame, cell)),
+        "control: a recoloured pinned cell is caught"
+    );
 }

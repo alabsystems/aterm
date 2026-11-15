@@ -14,11 +14,18 @@ const LEG: Duration = crate::await_task::LEG_MAX;
 
 const REDIAL_POLL: Duration = Duration::from_millis(250);
 
+/// The head of the window's answer when it met another aterm process writing the file's draft
+/// (its lock was held, or the draft changed under the open): `ERR busy drafts (<why>)`.
+const BUSY_DRAFTS: &str = "ERR busy drafts";
+
 /// Why `edit` opened no view.
 #[derive(Debug)]
 pub enum EditErr {
-    /// The window answered `ERR …` and opened nothing.
+    /// The window answered any other `ERR …` and opened nothing.
     Refused(String),
+    /// The window answered `ERR busy drafts (…)` and opened nothing: another aterm process is
+    /// writing the file's draft, so an editor opened beside it would split that draft.
+    Busy(String),
     /// The window answered `ERR timeout ticket=<t>`.
     TimedOut(String),
     /// No window could be asked.
@@ -32,12 +39,13 @@ pub enum EditErr {
 }
 
 impl EditErr {
-    /// Whether the client edits in its own terminal instead.
+    /// Whether the client edits in its own terminal instead: not for [`Self::Busy`], whose draft
+    /// another process is writing, nor for an answer that may mean a view opened.
     #[must_use]
     pub const fn falls_back_to_terminal(&self) -> bool {
         match self {
             Self::Refused(_) | Self::Unreachable(_) | Self::Unsendable(_) => true,
-            Self::TimedOut(_) | Self::NoAnswer(_) | Self::Unreadable(_) => false,
+            Self::Busy(_) | Self::TimedOut(_) | Self::NoAnswer(_) | Self::Unreadable(_) => false,
         }
     }
 }
@@ -45,7 +53,7 @@ impl EditErr {
 impl std::fmt::Display for EditErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Refused(line) | Self::TimedOut(line) => f.write_str(line),
+            Self::Refused(line) | Self::Busy(line) | Self::TimedOut(line) => f.write_str(line),
             Self::Unreachable(e) => write!(f, "no aterm window could be asked ({e})"),
             Self::NoAnswer(e) => write!(f, "the aterm window did not answer ({e})"),
             Self::Unreadable(line) => write!(f, "the aterm window answered {line:?}"),
@@ -143,7 +151,7 @@ fn edit_selector(sid: &str) -> Result<String, String> {
     if crate::redial::target_sid(&selector).is_some_and(|named| named.as_str() == sid) {
         Ok(selector)
     } else {
-        Err("expected an s-<hex> session id".to_string())
+        Err("expected a tab id (tqn5r6e0148, or an earlier tab's s-<hex>)".to_string())
     }
 }
 
@@ -153,6 +161,12 @@ fn edit_reply(reply: &str) -> Result<EditOk, EditErr> {
     }
     if reply.starts_with("ERR timeout ticket=") {
         return Err(EditErr::TimedOut(reply.to_string()));
+    }
+    if reply
+        .strip_prefix(BUSY_DRAFTS)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    {
+        return Err(EditErr::Busy(reply.to_string()));
     }
     if reply == "ERR" || reply.starts_with("ERR ") {
         return Err(EditErr::Refused(reply.to_string()));

@@ -24,7 +24,7 @@ fn fixture() -> (Fake, NativeRepositories) {
     let (sys, item) = bare();
     sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
     script::launcher(&sys, &item.user);
-    source(&sys, "/Users//alice/.secrets/gh_access_token");
+    token_source(&sys, "/Users//alice");
     metadata(&sys, &item.user, aterm_json::json!([]));
     answer(
         &sys,
@@ -56,25 +56,15 @@ fn bare() -> (Fake, NativeRepositories) {
     (sys, item)
 }
 
-fn source(sys: &Fake, path: &str) {
-    sys.file(path, TOKEN.as_bytes())
-        .stat_of(path, stat(false, 0o600));
+/// The vault's development token in the store under `home`, read in place.
+fn token_source(sys: &Fake, home: &str) {
+    sys.vault_set(home, crate::init_github::TOKEN_ENTRY, TOKEN.as_bytes());
 }
 
-/// [`source`] at `user`'s synced token file, owned by `user`: a live account, in a test whose
-/// git runs for real, is not the fixtures' 501.
+/// [`source`] in `user`'s own store: a live account, in a test whose git runs for real, is not
+/// the fixtures' 501.
 pub(crate) fn owned_source(sys: &Fake, user: &User) {
-    let path = crate::init_github::token_file(Path::new(&user.home));
-    let path = path.to_str().unwrap();
-    source(sys, path);
-    sys.stat_of(
-        path,
-        Stat {
-            uid: user.uid,
-            gid: user.gid,
-            ..stat(false, 0o600)
-        },
-    );
+    token_source(sys, &user.home);
 }
 
 /// `user`'s account on `sys` listing one repository of hers, `name`, already a worktree in
@@ -89,8 +79,7 @@ pub(in crate::init_github) fn converged(sys: &Fake, user: &User, name: &str) {
     sys.executable(git, b"synthetic git");
     script::launcher(sys, user);
     sys.stat_of(&user.home, stat(true, 0o700));
-    let home = Path::new(&user.home);
-    source(sys, crate::init_github::token_file(home).to_str().unwrap());
+    token_source(sys, &user.home);
     answer(sys, user, "/user", aterm_json::json!({"login": user.name}));
     present_repository(sys, user, name);
     script::lookups_hold(sys, user, GITHUB, &user.name, TOKEN);
@@ -117,7 +106,7 @@ fn a_captured_local_blocker_is_not_reread_after_capture() {
     let captured = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
     // A later local reading could succeed. The frozen capture must still
     // report its original blocker, without reading files again.
-    source(&sys, "/Users//alice/.secrets/gh_access_token");
+    token_source(&sys, "/Users//alice");
     answer(
         &sys,
         &item.user,
@@ -163,23 +152,18 @@ fn answer(sys: &Fake, user: &User, endpoint: &str, body: aterm_json::Value) {
     );
 }
 
-/// `user`'s private repository inventory from the vault, listing `repositories`, owned by
-/// `user`.
+/// `user`'s private repository inventory in the vault's store, listing `repositories`.
 pub(crate) fn metadata(sys: &Fake, user: &User, repositories: aterm_json::Value) {
-    let path = super::super::inventory::file(&user.home);
     let bytes = aterm_json::to_vec(&aterm_json::json!({
         "schema":2,"account":user.name,"repositories":repositories
     }))
     .unwrap();
-    sys.file(path.to_str().unwrap(), &bytes).stat_of(
-        path.to_str().unwrap(),
-        Stat {
-            uid: user.uid,
-            gid: user.gid,
-            len: bytes.len() as u64,
-            ..stat(false, 0o600)
-        },
-    );
+    inventory_entry(sys, user, &bytes);
+}
+
+/// `bytes` as the inventory entry of `user`'s store.
+fn inventory_entry(sys: &Fake, user: &User, bytes: &[u8]) {
+    sys.vault_set(&user.home, super::super::inventory::ENTRY, bytes);
 }
 
 fn scope(sys: &Fake, user: &User) {
@@ -728,8 +712,22 @@ struct ReadbackFixture {
     sys: Fake,
     who: User,
     ctx: Ctx,
-    token: std::path::PathBuf,
     _root: aterm_tempfile::TempDir,
+}
+
+impl ReadbackFixture {
+    /// The fake's store holds `bytes` as the development token, as a sync of the real one
+    /// delivered it.
+    fn token_set(&self, bytes: &[u8]) {
+        self.sys
+            .vault_set(&self.who.home, crate::init_github::TOKEN_ENTRY, bytes);
+    }
+
+    /// The fake's store holds no development token, as a sync of the real one left it.
+    fn token_remove(&self) {
+        self.sys
+            .vault_remove(&self.who.home, crate::init_github::TOKEN_ENTRY);
+    }
 }
 
 fn readback_fixture(git: bool) -> ReadbackFixture {
@@ -791,9 +789,7 @@ fn materialized_fixture(
     if git {
         sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
     }
-    let token = super::super::token_file(home);
-    sys.file(token.to_str().unwrap(), TOKEN.as_bytes())
-        .stat_of(token.to_str().unwrap(), stat(false, 0o600));
+    token_source(&sys, &who.home);
     metadata(&sys, &who, inventory["repositories"].clone());
     script::launcher(&sys, &who);
     script::lookups_hold(&sys, &who, GITHUB, "alice", TOKEN);
@@ -805,7 +801,6 @@ fn materialized_fixture(
         sys,
         who,
         ctx,
-        token,
         _root: root,
     }
 }
@@ -942,7 +937,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         + "\n";
     aterm_uds::atomic_file::write(&cold.source, inventory_only.as_bytes(), 0o600).unwrap();
     client::sync(&cold.paths, None).unwrap();
-    cold.sys.remove(&cold.token).unwrap();
+    cold.token_remove();
     cold.sys
         .remove(Path::new(crate::items::github::CLT_GIT))
         .unwrap();
@@ -1056,7 +1051,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
             + "\n";
         aterm_uds::atomic_file::write(&fixture.source, inventory_only.as_bytes(), 0o600).unwrap();
         client::sync(&fixture.paths, None).unwrap();
-        fixture.sys.remove(&fixture.token).unwrap();
+        fixture.token_remove();
         aterm_secrets::need::test_alab_policy(&fixture.paths);
         let selected = super::super::RepositorySelection::capture(&fixture.sys, &fixture.ctx)
             .unwrap()
@@ -1147,7 +1142,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
             + "\n";
         aterm_uds::atomic_file::write(&fixture.source, inventory_only.as_bytes(), 0o600).unwrap();
         client::sync(&fixture.paths, None).unwrap();
-        fixture.sys.remove(&fixture.token).unwrap();
+        fixture.token_remove();
         aterm_secrets::need::test_alab_policy(&fixture.paths);
         let selected = super::super::RepositorySelection::capture(&fixture.sys, &fixture.ctx)
             .unwrap()
@@ -1205,9 +1200,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
     // delivery through the request protocol nor remote GitHub authentication.
     aterm_uds::atomic_file::write(&cold.source, cold.source_text.as_bytes(), 0o600).unwrap();
     client::sync(&cold.paths, None).unwrap();
-    cold.sys
-        .file(cold.token.to_str().unwrap(), TOKEN.as_bytes())
-        .stat_of(cold.token.to_str().unwrap(), stat(false, 0o600));
+    cold.token_set(TOKEN.as_bytes());
     cold.sys
         .executable(crate::items::github::CLT_GIT, b"synthetic git");
     cold.sys.simulate(|_, command| {
@@ -1253,7 +1246,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
     assert_eq!(stage(&confirmed).outcome, crate::model::Outcome::Ok);
     aterm_uds::atomic_file::write(&cold.source, inventory_only.as_bytes(), 0o600).unwrap();
     client::sync(&cold.paths, None).unwrap();
-    cold.sys.remove(&cold.token).unwrap();
+    cold.token_remove();
     cold.sys
         .remove(Path::new(crate::items::github::CLT_GIT))
         .unwrap();
@@ -1408,16 +1401,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
     assert_ne!(reenabled.id, rearmed_id);
     assert!(!reenabled.state.ended());
     let reenabled_bytes = std::fs::read(&ledger_file).unwrap();
-    let inventory_file = super::super::inventory::file(&cold.who.home);
-    cold.sys
-        .file(inventory_file.to_str().unwrap(), b"not-json")
-        .stat_of(
-            inventory_file.to_str().unwrap(),
-            Stat {
-                len: 8,
-                ..stat(false, 0o600)
-            },
-        );
+    inventory_entry(&cold.sys, &cold.who, b"not-json");
     assert!(super::super::RepositoryCredentialWithdrawal::capture(&cold.sys, &cold.ctx).is_err());
     let unknown_rows = run_with(
         &cold.sys,
@@ -1622,7 +1606,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         + "\n";
     aterm_uds::atomic_file::write(&forbidden.source, without_credential.as_bytes(), 0o600).unwrap();
     client::sync(&forbidden.paths, None).unwrap();
-    forbidden.sys.remove(&forbidden.token).unwrap();
+    forbidden.token_remove();
     let denied = run_with(
         &forbidden.sys,
         &forbidden.ctx,
@@ -2524,6 +2508,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
                 if_absent: false,
                 anchor: client::Anchor::Keep,
                 fleet_reads_anchors: false,
+                read_as: None,
             },
             client::OnBusy::Refuse(std::time::Instant::now() + std::time::Duration::from_secs(60))
         )
@@ -2545,22 +2530,23 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
     assert_eq!(snapshot().sequence(), 0);
     assert!(!logged.paths.dir.join("vault").exists());
     assert_eq!(
-        std::fs::read(logged.paths.home.join(".secrets/gh_access_token")).unwrap(),
+        aterm_secrets::client::read_in_place(&logged.paths, "gh_access_token")
+            .unwrap()
+            .unwrap()
+            .as_slice(),
         UPDATED.as_bytes()
     );
-    logged
-        .sys
-        .file(logged.token.to_str().unwrap(), UPDATED.as_bytes());
+    logged.token_set(UPDATED.as_bytes());
     let helper_read = logged
         .sys
         .calls()
         .into_iter()
         .find(|call| call.contains(" credential fill"))
         .expect("the ordinary route already read back its helper");
-    let helper_token = logged.token.clone();
+    let helper_paths = logged.paths.clone();
     logged.sys.simulate(move |_, command| {
         (command.display() == helper_read).then(|| {
-            let token = aterm_secrets::fsx::read_private(&helper_token, INPUT_MAX)
+            let token = aterm_secrets::client::read_in_place(&helper_paths, "gh_access_token")
                 .expect("the synchronized fixture token is readable")
                 .expect("the synchronized fixture token exists");
             let token = token.as_str().expect("the fixture token is UTF-8");
@@ -2690,7 +2676,10 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         .unwrap();
         assert!(client::load_records(&recipient).unwrap().log().is_none());
         assert_eq!(
-            std::fs::read(recipient.home.join(".secrets/gh_access_token")).unwrap(),
+            aterm_secrets::client::read_in_place(&recipient, "gh_access_token")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
             TOKEN.as_bytes()
         );
         // Server guards precede the root owner in this aggregate's drop order.
@@ -2931,14 +2920,12 @@ fn captured_automatic_readiness_fences_unlocked_helper_work_with_one_scoped_vaul
             sys,
             who,
             ctx,
-            token,
             _root,
         } = readback_fixture(true);
         if changed == "capture-profile" {
             let selected = who.clone();
-            let token_path = token.clone();
-            sys.on_owned_read(move |sys, path| {
-                if path == token_path {
+            sys.on_vault_read(move |sys, name| {
+                if name == crate::init_github::TOKEN_ENTRY {
                     scope(sys, &selected);
                 }
             });
@@ -3058,10 +3045,9 @@ fn native_dependency_batch_checks_stop_and_real_input_changes_after_each_downloa
                 match change {
                     "stop" => pressed.store(true, Ordering::SeqCst),
                     "token" => {
-                        sys.file(
-                            super::super::token_file(Path::new(&who.home))
-                                .to_str()
-                                .unwrap(),
+                        sys.vault_set(
+                            &who.home,
+                            crate::init_github::TOKEN_ENTRY,
                             b"fixture_rotated_token",
                         );
                     }
@@ -3139,7 +3125,7 @@ fn default_credential_reads_private_vault_inventory_without_github_discovery() {
 fn missing_or_invalid_private_inventory_never_falls_back_to_public_discovery() {
     let (sys, item) = bare();
     sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
-    source(&sys, "/Users//alice/.secrets/gh_access_token");
+    token_source(&sys, "/Users//alice");
     answer(
         &sys,
         &item.user,
@@ -3150,9 +3136,7 @@ fn missing_or_invalid_private_inventory_never_falls_back_to_public_discovery() {
     assert_eq!(blocked.wait, Some(Wait::RepositoryInventory));
     assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
 
-    let path = super::super::inventory::file(&item.user.home);
-    sys.file(path.to_str().unwrap(), b"not JSON")
-        .stat_of(path.to_str().unwrap(), stat(false, 0o600));
+    inventory_entry(&sys, &item.user, b"not JSON");
     assert_eq!(
         item.plan(&sys).err().unwrap().wait,
         Some(Wait::RepositoryInventory)
@@ -3296,7 +3280,7 @@ fn a_native_repository_batch_respects_late_stop_but_not_an_explicit_older_hold()
 fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs() {
     use aterm_secrets::client::{self, JoinOptions, JoinPassword, Paths};
     for ordinary in [false, true] {
-        for changed in ["unrelated", "token", "inventory", "missing", "incomplete"] {
+        for changed in ["unrelated", "token", "inventory", "missing"] {
             let root = aterm_tempfile::tempdir().unwrap();
             let home = root.path().join("home");
             let source = root.path().join("team.secrets");
@@ -3333,9 +3317,7 @@ fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs(
             sys.logged_in(&who);
             sys.stat_of(home.to_str().unwrap(), stat(true, 0o700));
             sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
-            let token_path = super::super::token_file(&home);
-            sys.file(token_path.to_str().unwrap(), TOKEN.as_bytes())
-                .stat_of(token_path.to_str().unwrap(), stat(false, 0o600));
+            token_source(&sys, &who.home);
             metadata(
                 &sys,
                 &who,
@@ -3372,11 +3354,6 @@ fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs(
                             .filter(|line| !line.starts_with("github-repositories.json="))
                             .collect::<Vec<_>>()
                             .join("\n"),
-                        "incomplete" => {
-                            std::fs::create_dir_all(syncing.home.join(".config/gh/hosts.yml"))
-                                .unwrap();
-                            format!("{source_text}~/.config/gh/hosts.yml=cannot-materialize\n")
-                        }
                         _ => unreachable!(),
                     };
                     aterm_uds::atomic_file::write(&source, next.as_bytes(), 0o600).unwrap();
@@ -3447,10 +3424,9 @@ fn ordinary_local_repository_batches_refuse_input_changes_and_allow_unrelated_se
                 match change {
                     "inventory" => metadata(sys, &who, aterm_json::json!([])),
                     "token" => {
-                        sys.file(
-                            super::super::token_file(Path::new(&who.home))
-                                .to_str()
-                                .unwrap(),
+                        sys.vault_set(
+                            &who.home,
+                            crate::init_github::TOKEN_ENTRY,
                             b"fixture_rotated_local_token",
                         );
                     }
@@ -3497,12 +3473,15 @@ fn ordinary_local_repository_batches_refuse_input_changes_and_allow_unrelated_se
 fn an_unready_lazy_capture_can_retry_but_a_successful_generation_cannot_rebase() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (sys, item) = fixture();
-    let path = super::super::token_file(Path::new(&item.user.home));
-    let path_for_hook = path.clone();
+    let home = item.user.home.clone();
     let changed = AtomicBool::new(false);
-    sys.on_owned_read(move |sys, path| {
-        if path == path_for_hook && !changed.swap(true, Ordering::SeqCst) {
-            sys.file(path.to_str().unwrap(), b"fixture_changed_while_capturing");
+    sys.on_vault_read(move |sys, name| {
+        if name == crate::init_github::TOKEN_ENTRY && !changed.swap(true, Ordering::SeqCst) {
+            sys.vault_set(
+                &home,
+                crate::init_github::TOKEN_ENTRY,
+                b"fixture_changed_while_capturing",
+            );
         }
     });
     let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
@@ -3515,7 +3494,7 @@ fn an_unready_lazy_capture_can_retry_but_a_successful_generation_cannot_rebase()
         "an unready capture must not be cached"
     );
     assert!(item.plan(&sys).is_ok(), "a coherent retry may be admitted");
-    sys.file(path.to_str().unwrap(), TOKEN.as_bytes());
+    token_source(&sys, &item.user.home);
     assert!(
         item.plan(&sys).is_err(),
         "a successful capture never silently adopts a new generation"
@@ -3617,11 +3596,10 @@ fn failed_native_inventory_never_persists_credentials_or_clones() {
 }
 
 #[test]
-fn explicit_admitted_profile_uses_its_source_and_scope_and_refuses_identity_mismatch() {
+fn explicit_admitted_profile_uses_the_vault_token_in_its_scope_and_refuses_identity_mismatch() {
     let (sys, item) = fixture();
     let profile = "/Users//alice/.config/aterm/init.toml";
-    let bytes =
-        b"[github]\naccount='alice'\nowner='team'\ntoken_file='~/.secrets/custom_development'\n";
+    let bytes = b"[github]\naccount='alice'\nowner='team'\n";
     sys.file(profile, bytes).stat_of(
         profile,
         Stat {
@@ -3629,7 +3607,6 @@ fn explicit_admitted_profile_uses_its_source_and_scope_and_refuses_identity_mism
             ..stat(false, 0o600)
         },
     );
-    source(&sys, "/Users//alice/.secrets/custom_development");
     answer(
         &sys,
         &item.user,
@@ -3646,7 +3623,7 @@ fn explicit_admitted_profile_uses_its_source_and_scope_and_refuses_identity_mism
     assert!(!sys.calls().iter().any(|call| call.contains(ACCESSIBLE)));
 
     let (sys, item) = fixture();
-    let bytes = b"[github]\naccount='someone-else'\nowner='someone-else'\ntoken_file='~/.secrets/gh_access_token'\n";
+    let bytes = b"[github]\naccount='someone-else'\nowner='someone-else'\n";
     sys.file(profile, bytes).stat_of(
         profile,
         Stat {
@@ -3687,7 +3664,7 @@ fn every_blocked_step_says_why_in_system_states_words() {
     let signed_out = || {
         let (sys, item) = bare();
         sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
-        source(&sys, "/Users//alice/.secrets/gh_access_token");
+        token_source(&sys, "/Users//alice");
         scope(&sys, &item.user);
         (sys, item)
     };
@@ -3696,7 +3673,7 @@ fn every_blocked_step_says_why_in_system_states_words() {
             "no git",
             {
                 let (sys, item) = bare();
-                source(&sys, "/Users//alice/.secrets/gh_access_token");
+                token_source(&sys, "/Users//alice");
                 metadata(
                     &sys,
                     &item.user,
@@ -3716,10 +3693,10 @@ fn every_blocked_step_says_why_in_system_states_words() {
             Some(Wait::Token),
         ),
         (
-            "a token others can read",
+            "a store that cannot be read",
             {
                 let (sys, item) = signed_out();
-                sys.stat_of("/Users//alice/.secrets/gh_access_token", stat(false, 0o644));
+                sys.vault_unreadable(std::io::ErrorKind::PermissionDenied);
                 (sys, item)
             },
             Some(Wait::TokenUnusable),
@@ -3757,7 +3734,7 @@ fn every_blocked_step_says_why_in_system_states_words() {
                 let (sys, item) = fixture();
                 with_profile(
                     &sys,
-                    b"[github]\naccount='someone-else'\nowner='someone-else'\ntoken_file='~/.secrets/gh_access_token'\n",
+                    b"[github]\naccount='someone-else'\nowner='someone-else'\n",
                 );
                 (sys, item)
             },
@@ -3843,7 +3820,7 @@ fn every_blocked_step_says_why_in_system_states_words() {
 fn an_apply_github_did_not_answer_keeps_the_reason_it_decided() {
     let (sys, item) = bare();
     sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
-    source(&sys, "/Users//alice/.secrets/gh_access_token");
+    token_source(&sys, "/Users//alice");
     scope(&sys, &item.user);
     sys.fail_github_api(&item.user, "/user", GithubFailure::Unreached);
     let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
@@ -4229,14 +4206,11 @@ fn captured_repository_inputs_do_not_reread_a_new_synced_token() {
     let (sys, mut item) = fixture();
     let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
     let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
-    let token_path = format!("{}/.secrets/gh_access_token", item.user.home);
     let newer = "fixture_partial_sync_token_only";
-    sys.file(&token_path, newer.as_bytes()).stat_of(
-        &token_path,
-        Stat {
-            len: newer.len() as u64,
-            ..stat(false, 0o600)
-        },
+    sys.vault_set(
+        &item.user.home,
+        crate::init_github::TOKEN_ENTRY,
+        newer.as_bytes(),
     );
     answer(
         &sys,
@@ -4934,7 +4908,6 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
         let old = case.starts_with("old git").then(|| old_git.clone());
         let paths = works.clone();
         let bare = repos.origin.clone();
-        let inventory = super::super::inventory::file(&repos.who.home);
         let profile = Path::new(&repos.who.home).join(".config/aterm/init.toml");
         let (uid, gid) = (repos.who.uid, repos.who.gid);
         let who = repos.who.clone();
@@ -4997,10 +4970,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
                 seen.0.lock().unwrap().0 -= 1;
             }
             if remote && case == "parallel stopped" {
-                sys.file(
-                    inventory.to_str().unwrap(),
-                    b"source withdrawn during remote read",
-                );
+                inventory_entry(sys, &who, b"source withdrawn during remote read");
             }
             if remote && case == "parallel rebound" {
                 let subject = work.join(".git/objects");
@@ -5040,10 +5010,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
                 }
             }
             if case == "changed source" && command.args.iter().any(|arg| arg == "--symref") {
-                sys.file(
-                    inventory.to_str().unwrap(),
-                    b"source withdrawn during remote read",
-                );
+                inventory_entry(sys, &who, b"source withdrawn during remote read");
             }
             if matches!(case, "late recorded" | "unchanged develop")
                 && command.args.iter().any(|arg| arg == "--symref")
@@ -5475,19 +5442,18 @@ fn node_and_subscriber_share_a_source_refresh_wave_using_the_alignment_record() 
     let changed_mark = super::super::repository_input_mark(&sys).unwrap();
     assert_eq!(changed_mark.refresh_scope(), Some(changed_scope));
     let fourth = repos.advance("fourth.txt", "source four\n");
-    let (rows, refused) = apply(changed.clone(), forced);
-    assert_eq!(
-        stage(&rows).outcome,
-        crate::model::Outcome::Failed,
-        "{rows:?}"
-    );
-    assert_eq!(repos.head(&repos.work), third);
+    // A request made for the old source is admitted for the source there is now: it asked
+    // for a refresh after its boundary, and the wave it gets reads the new source. Refused
+    // instead (0.200.0), the pass failed and was asked again with the same stale scope.
+    let (rows, adopted) = apply(changed.clone(), forced);
+    assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+    assert_eq!(repos.head(&repos.work), fourth);
     assert_eq!(
         network(),
-        (2, 2),
-        "an old request cannot refresh a new admitted source"
+        (3, 3),
+        "an old request refreshes the source admitted now, once"
     );
-    assert_eq!(refused, refreshed);
+    assert_ne!(adopted, refreshed, "the new source is a new generation");
     let Some(RepositoryRequest::Refresh(changed_request)) = node_cursor.observe(
         Some(&changed_mark),
         before_change,
@@ -6174,7 +6140,7 @@ fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
     let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&bare.user));
     match item(&bare.user, None, true, RepositoryWork::Refresh, None, None).probe(&sys, &context) {
         Probe::NotApplicable { why } => {
-            assert!(why.contains("~/.secrets/gh_access_token"), "{why}");
+            assert!(why.contains("gh_access_token entry"), "{why}");
             assert!(why.contains("on this Mac yet"), "{why}");
         }
         other => panic!("{other:?}"),
@@ -6186,7 +6152,7 @@ fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         "{:?}",
         sys.calls()
     );
-    source(&sys, "/Users//alice/.secrets/gh_access_token");
+    token_source(&sys, "/Users//alice");
     metadata(
         &sys,
         &bare.user,
@@ -6204,13 +6170,13 @@ fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         Probe::NotApplicable { why } => assert!(why.contains("on this machine yet"), "{why}"),
         other => panic!("{other:?}"),
     }
-    // So does an init.toml `[github]` account's step, whose token file is not there yet
+    // So does an init.toml `[github]` account's step, whose token entry is not here yet
     // (with the distribution's git there, so the step reaches the token): a blocked
     // operation, never a person's step.
     linux.executable(crate::items::github::SYSTEM_GIT, b"synthetic git");
     match item(&bare.user, None, false, RepositoryWork::Refresh, None, None).probe(&linux, &context)
     {
-        Probe::Blocked { why } => assert!(why.contains("is not on this machine yet"), "{why}"),
+        Probe::Blocked { why } => assert!(why.contains("vault copy yet"), "{why}"),
         other => panic!("{other:?}"),
     }
 }

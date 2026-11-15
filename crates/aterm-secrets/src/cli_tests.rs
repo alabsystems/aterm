@@ -126,7 +126,7 @@ fn a_seated_mac_sets_with_no_admin_and_status_says_so() {
     assert_eq!(code, std::process::ExitCode::SUCCESS);
     crate::client::sync(m22, None).expect("m22 syncs");
     assert_eq!(
-        std::fs::read(m22.home.join(".secrets/gh_access_token")).unwrap(),
+        crate::client::stored(&m22, "gh_access_token").unwrap(),
         b"token-v9"
     );
 
@@ -165,7 +165,7 @@ fn a_seated_mac_unsets_with_no_admin() {
     crate::client::sync(m22, None).expect("m22 syncs");
     crate::client::sync(m7, None).expect("m7 syncs");
     assert!(
-        m22.home.join(".secrets/gh_access_token").exists(),
+        crate::client::stored(&m22, "gh_access_token").is_some(),
         "CONTROL"
     );
 
@@ -173,8 +173,8 @@ fn a_seated_mac_unsets_with_no_admin() {
     assert_eq!(code, std::process::ExitCode::SUCCESS);
     crate::client::sync(m22, None).expect("m22 syncs");
     assert!(
-        !m22.home.join(".secrets/gh_access_token").exists(),
-        "m22 takes its file back"
+        crate::client::stored(&m22, "gh_access_token").is_none(),
+        "m22 reads it no more"
     );
     let error = unix::unset(m7, "gh_access_token", &[]).expect_err("absent");
     assert_eq!(error.0, "no entry gh_access_token in [everyone]");
@@ -187,9 +187,9 @@ fn a_seated_mac_unsets_with_no_admin() {
     );
     crate::client::sync(m22, None).expect("m22 syncs");
     assert_eq!(
-        std::fs::read(m22.home.join(format!(".secrets/{held}"))).unwrap(),
-        b"token-v1",
-        "the held file stays"
+        crate::client::stored(m22, held).as_deref(),
+        Some(b"token-v1".as_slice()),
+        "the held entry stays"
     );
     let error =
         unix::unset(m7, "gh_access_token", &["m7".to_owned()]).expect_err("--for is an admin's");
@@ -559,21 +559,6 @@ fn removing_an_unknown_mirror_never_echoes_url_credentials() {
     );
 }
 
-#[test]
-fn keep_takes_one_or_more_names_and_no_flag() {
-    assert_eq!(
-        parse(&[
-            "keep".into(),
-            "signing".into(),
-            "~/.aterm/machine.key".into()
-        ])
-        .unwrap(),
-        Command::Keep(vec!["signing".into(), "~/.aterm/machine.key".into()])
-    );
-    assert!(parse(&["keep".into()]).is_err());
-    assert!(parse(&["keep".into(), "--all".into()]).is_err());
-}
-
 #[cfg(unix)]
 #[test]
 fn sync_diagnostic_reports_a_real_config_failure_without_its_path_or_contents() {
@@ -603,24 +588,52 @@ fn sync_diagnostic_reports_a_real_config_failure_without_its_path_or_contents() 
 
 #[cfg(unix)]
 #[test]
-fn signed_get_refuses_materialized_bytes_changed_after_sync() {
-    use crate::{client, fsx, materialize, text::Audience};
+fn signed_get_reads_the_vault_in_place_whatever_the_file_holds() {
+    use crate::{client, fsx, text::Audience};
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = client::Paths::for_home(&root.path().join("admin"));
     let source = root.path().join("test.vault");
     client::create(&paths, source.to_str().unwrap(), None, Some("admin")).unwrap();
-    let admin = client::admin_open(&paths).unwrap();
-    let mut doc = admin.doc.clone();
-    doc.set_entry(&Audience::Everyone, "token", b"authentic-value")
-        .unwrap();
-    client::admin_publish(&paths, &admin, &doc).unwrap();
+    let publish = |change: &dyn Fn(&mut crate::text::Document)| {
+        let admin = client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        change(&mut doc);
+        client::admin_publish(&paths, &admin, &doc).unwrap();
+    };
+    publish(&|doc| {
+        doc.set_entry(&Audience::Everyone, "token", b"authentic-value")
+            .unwrap();
+    });
     assert_eq!(
         unix::get_value(&paths, "token").unwrap().as_slice(),
         b"authentic-value"
     );
-    let path = materialize::target_path(&paths.home, "token").unwrap();
+    // The file an older build wrote, changed after the sync, then gone: get returns the vault's
+    // bytes each time.
+    let path = aterm_types::vault_entry::plain_entry_path(&paths.home, "token");
+    fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
     fsx::write_atomic(&path, b"changed-after-sync", 0o600).unwrap();
+    assert_eq!(
+        unix::get_value(&paths, "token").unwrap().as_slice(),
+        b"authentic-value"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"changed-after-sync");
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        unix::get_value(&paths, "token").unwrap().as_slice(),
+        b"authentic-value"
+    );
+    // NEGATIVE CONTROL: the vault is what get follows; an entry unset there is gone, whatever
+    // file stands at its old path.
+    publish(&|doc| {
+        doc.unset_entry(&Audience::Everyone, "token").unwrap();
+    });
+    fsx::write_atomic(&path, b"authentic-value", 0o600).unwrap();
     assert!(unix::get_value(&paths, "token").is_err());
+    publish(&|doc| {
+        doc.set_entry(&Audience::Everyone, "token", b"authentic-value")
+            .unwrap();
+    });
     let config_file = paths.dir.join("source.toml");
     let source_text = fsx::read_private(&config_file, 64 * 1024).unwrap().unwrap();
     let unsigned = source_text
@@ -643,10 +656,96 @@ fn signed_get_refuses_materialized_bytes_changed_after_sync() {
     );
 }
 
+/// A vault an older build wrote can hold `[everyone]` entries no reading may hand out
+/// (DESIGN-secrets §4): an AI CLI's login file, a home path aterm does not name, another spelling
+/// of a held name and a name in the Claude Code token namespace outside its grammar. Each is in
+/// the log, and `read_verified_entry`, `read_in_place` and `get` refuse it. Two names that fold
+/// alike are one name: neither spelling reads. NEGATIVE CONTROL: an ordinary name in the same
+/// vault reads through all three.
 #[cfg(unix)]
 #[test]
-fn plaintext_get_retains_local_reads_without_authenticated_evidence() {
-    use crate::{client, fsx, materialize};
+fn every_read_refuses_set_apart_names_and_folded_pairs_an_older_vault_holds() {
+    use crate::client;
+    use crate::entry_class::{EntryClass, SetApart};
+    const SET_APART: [(&str, SetApart); 4] = [
+        ("~/.claude/.credentials.json", SetApart::CliLogin),
+        ("~/.zshrc", SetApart::HomePath),
+        ("GH_ACCESS_TOKEN_ALABSYSTEMS", SetApart::CaseVariant),
+        ("aterm-claude-token-not-a-key", SetApart::TokenNamespace),
+    ];
+    const FOLDED: [&str; 2] = ["pair_token", "PAIR_TOKEN"];
+    let macs = client::two_log_macs_for_test(&[]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    for (name, why) in SET_APART {
+        assert_eq!(
+            crate::entry_class::of(name),
+            EntryClass::SetApart(why),
+            "{name}"
+        );
+        client::test_put_everyone(m22, name, b"inert-set-apart-value").expect(name);
+    }
+    for name in FOLDED {
+        client::test_put_everyone(m22, name, b"inert-folded-value").expect(name);
+    }
+    client::test_put_everyone(m22, "shared-control", b"control-value").unwrap();
+    client::sync(m7, None).unwrap();
+    let expected = client::config(m7).unwrap().unwrap();
+    let in_log = |name: &str| {
+        let identity = client::read_identity(m7).unwrap().unwrap();
+        let records = client::load_records(m7).unwrap();
+        let opened = records
+            .log()
+            .unwrap()
+            .open_audience_entries(&identity)
+            .unwrap()
+            .unwrap();
+        opened
+            .by_audience
+            .get(&crate::text::Audience::Everyone)
+            .is_some_and(|entries| entries.contains_key(name))
+    };
+    for (name, _) in SET_APART {
+        assert!(in_log(name), "the vault holds {name}");
+        assert!(
+            client::read_verified_entry(m7, &expected, name).is_err(),
+            "{name}"
+        );
+        assert!(client::read_in_place(m7, name).is_err(), "{name}");
+        assert!(unix::get_value(m7, name).is_err(), "{name}");
+    }
+    for name in FOLDED {
+        assert!(in_log(name), "the vault holds {name}");
+        assert!(
+            client::read_verified_entry(m7, &expected, name)
+                .unwrap()
+                .is_none(),
+            "{name}"
+        );
+        assert!(client::read_in_place(m7, name).unwrap().is_none(), "{name}");
+        assert!(unix::get_value(m7, name).is_err(), "{name}");
+    }
+    let control = client::read_verified_entry(m7, &expected, "shared-control")
+        .unwrap()
+        .expect("CONTROL");
+    assert_eq!(control.into_parts().0.as_slice(), b"control-value");
+    assert_eq!(
+        client::read_in_place(m7, "shared-control")
+            .unwrap()
+            .expect("CONTROL")
+            .as_slice(),
+        b"control-value"
+    );
+    assert_eq!(
+        unix::get_value(m7, "shared-control").unwrap().as_slice(),
+        b"control-value",
+        "CONTROL"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn plaintext_get_reads_the_plain_source_in_place_and_never_the_old_file() {
+    use crate::{client, fsx};
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = client::Paths::for_home(&root.path().join("reader"));
     let source = root.path().join("plain.secrets");
@@ -674,18 +773,35 @@ fn plaintext_get_retains_local_reads_without_authenticated_evidence() {
     assert!(
         client::read_verified_entry(&paths, &expected, "token")
             .unwrap()
-            .is_none()
+            .is_none(),
+        "a plain source has no authenticated entry"
     );
+    // An edit to the file at the old path changes nothing.
+    let old = aterm_types::vault_entry::plain_entry_path(&paths.home, "token");
+    fsx::ensure_private_dir(old.parent().unwrap()).unwrap();
+    fsx::write_atomic(&old, b"local-edit", 0o600).unwrap();
+    assert_eq!(
+        unix::get_value(&paths, "token").unwrap().as_slice(),
+        b"plain-value"
+    );
+    // The person's own plain file is the store: its edit is what the next get reads, in place.
+    fsx::write_atomic(&source, b"token=edited-plain-value\n", 0o600).unwrap();
+    assert_eq!(
+        unix::get_value(&paths, "token").unwrap().as_slice(),
+        b"edited-plain-value"
+    );
+    assert_eq!(std::fs::read(&old).unwrap(), b"local-edit");
+    // NEGATIVE CONTROL: a name the plain file does not hold is no secret, whatever file stands
+    // at its old path.
     fsx::write_atomic(
-        &materialize::target_path(&paths.home, "token").unwrap(),
-        b"local-edit",
+        &aterm_types::vault_entry::plain_entry_path(&paths.home, "absent"),
+        b"local-only",
         0o600,
     )
     .unwrap();
-    assert_eq!(
-        unix::get_value(&paths, "token").unwrap().as_slice(),
-        b"local-edit"
-    );
+    assert!(unix::get_value(&paths, "absent").is_err());
+    std::fs::remove_file(&source).unwrap();
+    assert!(unix::get_value(&paths, "token").is_err());
 }
 
 fn words(line: &str) -> Vec<String> {
@@ -2594,7 +2710,7 @@ fn an_edit_draft_holds_no_claude_token() {
 }
 
 /// `secrets get` refuses a Claude Code token entry, in any spelling, and prints nothing; `ls
-/// --describe` lists the token and its meta with no file pointer, the token's row with its
+/// --describe` lists the token and its meta, the token's row with its
 /// account and state, and no byte of the value (DESIGN-claude-setup-token §4.2, §5.10).
 /// CONTROL: a shared entry reads through `get`.
 #[cfg(unix)]
@@ -2612,6 +2728,7 @@ fn get_refuses_a_claude_token_and_ls_describe_names_no_file() {
         expiry_from: crate::claude_token::ExpiryFrom::Assumed,
         minted_on: "m7".into(),
         cli: "2.1.318".into(),
+        minted_by: None,
         verified: None,
     };
     let soon = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -2656,18 +2773,21 @@ fn get_refuses_a_claude_token_and_ls_describe_names_no_file() {
             .any(|w| value.windows(8).any(|v| v == w))
     };
     assert!(text.contains(&format!(
-        "{}\tno file\tClaude Code token for inert@example.invalid",
+        "{}\tClaude Code token for inert@example.invalid",
         key.entry()
     )));
     assert!(text.contains("unverified"), "the row says its state");
     assert!(text.contains("ends 2100-01-01"), "and when it ends");
     assert!(text.contains(&format!(
-        "{}\tno file\tmetadata for that token (no secret)",
+        "{}\tmetadata for that token (no secret)",
         key.meta_entry()
     )));
+    assert!(!text.contains("~/.secrets"), "no file is named");
     assert!(
-        !text.contains("~/.secrets/aterm-claude-token"),
-        "no pointer"
+        names
+            .iter()
+            .all(|name| !name.starts_with("aterm-claude-token")),
+        "the store's names leave the token class to its typed listing"
     );
     assert!(!holds(&text, VALUE), "no byte of the value");
     let json = super::inventory::listing(&names, &rows, false, true).unwrap();
@@ -2679,7 +2799,7 @@ fn get_refuses_a_claude_token_and_ls_describe_names_no_file() {
         .iter()
         .find(|row| row["name"].as_str() == Some(key.entry().as_str()))
         .expect("the token's row");
-    assert_eq!(token["pointer"], aterm_json::Value::Null);
+    assert!(token.get("pointer").is_none(), "no file pointer");
     assert!(!holds(&json, VALUE));
     let plain = super::inventory::listing(&names, &rows, false, false).unwrap();
     assert!(plain.lines().any(|line| line == key.entry()));
@@ -3639,8 +3759,6 @@ fn git_credential_parses_options_and_operations() {
         parse(&words("git-credential")),
         Ok(Command::GitCredential {
             dev_user: None,
-            token_file: None,
-            token_key: None,
             operation: None,
         })
     );
@@ -3648,8 +3766,6 @@ fn git_credential_parses_options_and_operations() {
         parse(&words("git-credential get")),
         Ok(Command::GitCredential {
             dev_user: None,
-            token_file: None,
-            token_key: None,
             operation: Some("get".into()),
         })
     );
@@ -3657,19 +3773,6 @@ fn git_credential_parses_options_and_operations() {
         parse(&words("git-credential --dev-user octo-cat get")),
         Ok(Command::GitCredential {
             dev_user: Some("octo-cat".into()),
-            token_file: None,
-            token_key: None,
-            operation: Some("get".into()),
-        })
-    );
-    assert_eq!(
-        parse(&words(
-            "git-credential --dev-user octo-cat --token-file /t/env --token-key GH_TOKEN get"
-        )),
-        Ok(Command::GitCredential {
-            dev_user: Some("octo-cat".into()),
-            token_file: Some("/t/env".into()),
-            token_key: Some("GH_TOKEN".into()),
             operation: Some("get".into()),
         })
     );
@@ -3679,10 +3782,8 @@ fn git_credential_parses_options_and_operations() {
         "git-credential --dev-user a--b get",
         "git-credential --dev-user a --dev-user b get",
         "git-credential --unknown get",
-        "git-credential --token-file relative/token get",
-        "git-credential --token-file /a --token-file /b get",
+        "git-credential --token-file /t/token get",
         "git-credential --token-key GH_TOKEN get",
-        "git-credential --token-file /t --token-key GH-TOKEN get",
     ] {
         assert!(parse(&words(refused)).is_err(), "{refused}");
     }
@@ -3691,110 +3792,49 @@ fn git_credential_parses_options_and_operations() {
 #[cfg(unix)]
 #[test]
 fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
+    use crate::{client, text::Audience};
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let home = root.path().join("home");
-    let secrets = home.join(".secrets");
-    crate::fsx::ensure_private_dir(&secrets).expect("secrets dir");
-    let dev_path = secrets.join("gh_access_token");
-    let rel_path = secrets.join("gh_access_token_alabsystems");
-    crate::fsx::write_atomic(&dev_path, b"ghp_dev_token_1\n", 0o600).expect("dev token");
-    crate::fsx::write_atomic(&rel_path, b"ghp_rel_token_2\n", 0o600).expect("rel token");
-    // The applied registry names both GitHub entries: the one path the helper resolves them by.
-    let paths = crate::client::Paths::locate_for_home(&home);
-    crate::fsx::ensure_private_dir(&paths.dir).expect("vault dir");
-    let registry = |text: &str| {
-        crate::fsx::write_atomic(&paths.dir.join("state.toml"), text.as_bytes(), 0o600)
-            .expect("state.toml");
+    // A signed vault holds both GitHub entries; the helper reads them in place from it.
+    let paths = client::Paths::for_home(&home);
+    let source = root.path().join("test.vault");
+    client::create(&paths, source.to_str().unwrap(), None, Some("admin")).expect("vault");
+    let put = |name: &str, value: Option<&[u8]>| {
+        let admin = client::admin_open(&paths).expect("admin");
+        let mut doc = admin.doc.clone();
+        match value {
+            Some(value) => doc
+                .set_entry(&Audience::Everyone, name, value)
+                .expect("set"),
+            None => {
+                doc.unset_entry(&Audience::Everyone, name).expect("unset");
+            }
+        }
+        client::admin_publish(&paths, &admin, &doc).expect("publish");
     };
-    registry("[manifest]\ngh_access_token = 'a'\ngh_access_token_alabsystems = 'b'\n");
+    let (dev, rel) = ("gh_access_token", "gh_access_token_alabsystems");
+    put(dev, Some(b"ghp_dev_token_1\n"));
+    put(rel, Some(b"ghp_rel_token_2\n"));
+    let dev_path = aterm_types::vault_entry::plain_entry_path(&home, dev);
+    crate::fsx::ensure_private_dir(dev_path.parent().unwrap()).unwrap();
 
-    let answer = |dev: &unix::DevToken<'_>,
-                  dev_user: Option<&str>,
+    let answer = |dev_user: Option<&str>,
                   op: Option<&str>,
                   term: bool,
                   stdin: &[u8]|
      -> (String, Option<crate::need::GhProfile>) {
         let mut cursor = std::io::Cursor::new(stdin);
-        let answer = unix::git_credential_reply(Some(&paths), dev_user, dev, op, term, &mut cursor);
+        let answer = unix::git_credential_reply(Some(&paths), dev_user, op, term, &mut cursor);
         (
             String::from_utf8(answer.reply.as_slice().to_vec()).expect("utf8"),
             answer.missing,
         )
     };
-    let ask_from = |dev: &unix::DevToken<'_>,
-                    dev_user: Option<&str>,
-                    op: Option<&str>,
-                    term: bool,
-                    stdin: &[u8]|
-     -> String { answer(dev, dev_user, op, term, stdin).0 };
     let ask = |dev_user: Option<&str>, op: Option<&str>, term: bool, stdin: &[u8]| -> String {
-        ask_from(&unix::DevToken::Vault, dev_user, op, term, stdin)
+        answer(dev_user, op, term, stdin).0
     };
-
-    // A --token-file answers in the vault file's place, whole or by its --token-key line;
-    // a loose file, or a key assigned twice, answers quit=1.
-    let raw = root.path().join("profile_token");
-    crate::fsx::write_atomic(&raw, b"ghp_profile_3\n", 0o600).expect("profile token");
-    let env = root.path().join("profile.env");
-    crate::fsx::write_atomic(&env, b"# x\nexport GH_TOKEN='ghp_keyed_4'\n", 0o600)
-        .expect("profile env");
-    let request = b"protocol=https\nhost=github.com\n\n";
-    assert_eq!(
-        ask_from(
-            &unix::DevToken::File {
-                file: &raw,
-                key: None
-            },
-            Some("octocat"),
-            Some("get"),
-            false,
-            request
-        ),
-        "username=octocat\npassword=ghp_profile_3\n"
-    );
-    assert_eq!(
-        ask_from(
-            &unix::DevToken::File {
-                file: &env,
-                key: Some("GH_TOKEN")
-            },
-            Some("octocat"),
-            Some("get"),
-            false,
-            request
-        ),
-        "username=octocat\npassword=ghp_keyed_4\n"
-    );
-    crate::fsx::write_atomic(&env, b"GH_TOKEN=a\nGH_TOKEN=b\n", 0o600).expect("twice");
-    assert_eq!(
-        ask_from(
-            &unix::DevToken::File {
-                file: &env,
-                key: Some("GH_TOKEN")
-            },
-            Some("octocat"),
-            Some("get"),
-            false,
-            request
-        ),
-        "quit=1\n"
-    );
-    std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(
-        ask_from(
-            &unix::DevToken::File {
-                file: &raw,
-                key: None
-            },
-            Some("octocat"),
-            Some("get"),
-            false,
-            request
-        ),
-        "quit=1\n"
-    );
 
     // Without a known login, an unnamed github.com lookup gets the dev token as x-access-token.
     assert_eq!(
@@ -3827,38 +3867,29 @@ fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
         "username=alabsystems\npassword=ghp_rel_token_2\n"
     );
 
-    // NEGATIVE CONTROL: a token file the registry does not name is no token. git's request
-    // fails and the helper names gh:dev to file in the need ledger; the same with no registry.
+    // NEGATIVE CONTROL: a token file at the old path that the vault does not hold is no token.
+    // git's request fails and the helper names gh:dev to file in the need ledger; the same with
+    // no vault configured, whatever the file holds.
     let unnamed = b"protocol=https\nhost=github.com\n\n";
-    registry("[manifest]\ngh_access_token_alabsystems = 'b'\n");
+    put(dev, None);
+    crate::fsx::write_atomic(&dev_path, b"ghp_dev_token_1\n", 0o600).unwrap();
     assert_eq!(
-        answer(&unix::DevToken::Vault, None, Some("get"), false, unnamed),
+        answer(None, Some("get"), false, unnamed),
         ("quit=1\n".to_owned(), Some(crate::need::GhProfile::Dev))
     );
-    std::fs::remove_file(paths.dir.join("state.toml")).unwrap();
+    put(dev, Some(b"ghp_dev_token_1\n"));
+    let config_file = paths.dir.join("source.toml");
+    let kept_config = root.path().join("kept-source.toml");
+    std::fs::rename(&config_file, &kept_config).unwrap();
     assert_eq!(
-        answer(&unix::DevToken::Vault, None, Some("get"), false, unnamed),
+        answer(None, Some("get"), false, unnamed),
         ("quit=1\n".to_owned(), Some(crate::need::GhProfile::Dev))
     );
-    // A --token-file is no registry token: its absence files nothing.
-    assert_eq!(
-        answer(
-            &unix::DevToken::File {
-                file: &root.path().join("absent"),
-                key: None
-            },
-            None,
-            Some("get"),
-            false,
-            unnamed
-        ),
-        ("quit=1\n".to_owned(), None)
-    );
-    registry("[manifest]\ngh_access_token = 'a'\ngh_access_token_alabsystems = 'b'\n");
+    std::fs::rename(&kept_config, &config_file).unwrap();
 
     // A named login answers only where --dev-user or init.toml's [github] account names it;
     // stranger usernames, non-get ops, other hosts and plain HTTP get no answer.
-    crate::fsx::write_atomic(&dev_path, b"ghp_rotated_token\n", 0o600).unwrap();
+    put(dev, Some(b"ghp_rotated_token\n"));
     assert_eq!(
         ask(
             None,
@@ -3951,7 +3982,8 @@ fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
         );
     }
 
-    // Terminal stdin, loose mode, empty/malformed content, symlink or missing token -> quit=1.
+    // Terminal stdin, an empty or malformed vault value, or a token the vault no longer holds ->
+    // quit=1.
     assert_eq!(
         ask(
             Some("octocat"),
@@ -3961,7 +3993,9 @@ fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
         ),
         "quit=1\n"
     );
+    // The file at the old path loosened, then edited, changes nothing: the vault's token answers.
     std::fs::set_permissions(&dev_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    crate::fsx::write_atomic(&dev_path, b"ghp_forged_token\n", 0o644).unwrap();
     assert_eq!(
         ask(
             None,
@@ -3969,29 +4003,22 @@ fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
             false,
             b"protocol=https\nhost=github.com\n\n"
         ),
-        "quit=1\n"
+        "username=octocat\npassword=ghp_rotated_token\n"
     );
-    crate::fsx::write_atomic(&dev_path, b"   \n", 0o600).unwrap();
-    assert_eq!(
-        ask(
-            None,
-            Some("get"),
-            false,
-            b"protocol=https\nhost=github.com\n\n"
-        ),
-        "quit=1\n"
-    );
-    crate::fsx::write_atomic(&dev_path, b"two words\n", 0o600).unwrap();
-    assert_eq!(
-        ask(
-            None,
-            Some("get"),
-            false,
-            b"protocol=https\nhost=github.com\n\n"
-        ),
-        "quit=1\n"
-    );
-    std::fs::remove_file(&dev_path).unwrap();
+    for unusable in [&b"   \n"[..], b"two words\n"] {
+        put(dev, Some(unusable));
+        assert_eq!(
+            ask(
+                None,
+                Some("get"),
+                false,
+                b"protocol=https\nhost=github.com\n\n"
+            ),
+            "quit=1\n"
+        );
+    }
+    put(dev, None);
+    crate::fsx::write_atomic(&dev_path, b"ghp_forged_token\n", 0o600).unwrap();
     assert_eq!(
         ask(
             None,
@@ -4001,10 +4028,15 @@ fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
         ),
         "quit=1\n"
     );
-    std::fs::remove_file(&rel_path).unwrap();
+    put(rel, None);
+    crate::fsx::write_atomic(
+        &aterm_types::vault_entry::plain_entry_path(&home, rel),
+        b"ghp_forged_token\n",
+        0o600,
+    )
+    .unwrap();
     assert_eq!(
         answer(
-            &unix::DevToken::Vault,
             None,
             Some("get"),
             false,
@@ -4012,6 +4044,50 @@ fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
         ),
         ("quit=1\n".to_owned(), Some(crate::need::GhProfile::Release))
     );
+}
+
+/// A store that cannot answer is no missing token: with a writer holding this Mac's vault state
+/// past the read's wait, git's request fails (`quit=1`) and the helper names no profile to file in
+/// the need ledger. NEGATIVE CONTROL: with the state free, before the hold and after it ends, the
+/// vault's token answers.
+#[cfg(unix)]
+#[test]
+fn git_credential_quits_without_a_need_while_the_store_stays_busy() {
+    use crate::{client, text::Audience};
+
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let paths = client::Paths::for_home(&root.path().join("home"));
+    let source = root.path().join("test.vault");
+    client::create(&paths, source.to_str().unwrap(), None, Some("admin")).expect("vault");
+    let admin = client::admin_open(&paths).expect("admin");
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, "gh_access_token", b"ghp_dev_token_1\n")
+        .expect("set");
+    client::admin_publish(&paths, &admin, &doc).expect("publish");
+    let answer = || {
+        let mut cursor = std::io::Cursor::new(&b"protocol=https\nhost=github.com\n\n"[..]);
+        let answer =
+            unix::git_credential_reply(Some(&paths), None, Some("get"), false, &mut cursor);
+        (
+            String::from_utf8(answer.reply.as_slice().to_vec()).expect("utf8"),
+            answer.missing,
+        )
+    };
+    let token = (
+        "username=x-access-token\npassword=ghp_dev_token_1\n".to_owned(),
+        None,
+    );
+    assert_eq!(answer(), token, "CONTROL: the state is free");
+
+    let held = client::test_hold_state_lock(&paths).expect("hold");
+    let (busy, tries) = client::test_while_state_lock_held(
+        || {},
+        || client::with_current_wait(std::time::Duration::from_millis(50), answer),
+    );
+    assert!(tries > 0, "the read waited on the writer");
+    assert_eq!(busy, ("quit=1\n".to_owned(), None));
+    drop(held);
+    assert_eq!(answer(), token, "CONTROL: the hold ended");
 }
 
 #[cfg(unix)]

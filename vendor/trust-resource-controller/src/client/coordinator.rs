@@ -15,7 +15,7 @@ pub use broker::{
     CoordinatorBroker, CoordinatorBrokerEndpoint, CoordinatorBrokerServer,
     CoordinatorCompilerCapture, GraphAcknowledgement, PublicationAcknowledgement,
 };
-pub use scope::{CompilerScope, CompilerScopeError};
+pub use scope::{CompilerScope, CompilerScopeError, CompilerScopeInputs};
 
 pub struct AuthenticatedCoordinator {
     reply: OriginalReply,
@@ -119,9 +119,12 @@ impl AuthenticatedCoordinator {
     }
     /// Failed validation preserves the entire original capsule for the owning
     /// abort/retention path. It never returns an apparently unused CPU unit.
-    pub fn into_parts(self, deadline: Instant) -> Result<CoordinatorOriginals, (io::Error, Self)> {
+    pub fn into_parts(
+        self,
+        deadline: Instant,
+    ) -> Result<CoordinatorOriginals, (io::Error, Box<Self>)> {
         if let Err(error) = self.validate(deadline) {
-            return Err((error, self));
+            return Err((error, Box::new(self)));
         }
         Ok(CoordinatorOriginals {
             reply: self.reply,

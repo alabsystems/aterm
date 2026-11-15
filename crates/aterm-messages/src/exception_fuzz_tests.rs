@@ -427,7 +427,7 @@ fn a_key_is_never_both_a_live_row_and_an_open_exception() {
                 4 => {
                     let ids: Vec<_> = c.live_rows().map(|l| l.id).collect();
                     if !ids.is_empty() {
-                        let _ = c.mark_seen(ids[rng.below(ids.len())], now);
+                        let _ = c.mark_seen(ids[rng.below(ids.len())], st, now);
                     }
                 }
                 5 => {

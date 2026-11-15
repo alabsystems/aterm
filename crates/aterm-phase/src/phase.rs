@@ -7,48 +7,14 @@ use std::borrow::Cow;
 use std::fmt;
 
 use crate::prompt::parse_prompt;
-use crate::wall::{Placement, Wall, WallKind, classify_wall};
+use crate::wall::{Placement, Wall, classify_wall};
+use alab_policy::vocab::{Phase, WallKind};
 
 /// The Claude Code (`claude`) harness version, `MAJOR.MINOR` with no third part.
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 36, "0.36");
-
-/// The worker's phase.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Phase {
-    /// A turn (or a background shell, workflow, agent or monitor) is running.
-    Busy,
-    /// An approval box is showing ([`parse_prompt`] is `Some`).
-    Prompt,
-    /// Not busy, no prompt, and the worker's last turn ended on a usage or rate limit notice.
-    Limited {
-        /// The notice as Claude Code says it (`You've reached your Fable limit. …`).
-        message: String,
-        /// When it resets, if the notice says (`7:30pm (America/Los_Angeles)`).
-        reset: Option<String>,
-    },
-    /// Not busy, no prompt, the last thing said does not end in `?`.
-    Idle,
-    /// Not busy, no prompt, and the last thing the worker said ([`last_said_row`]) ends with `?`.
-    Question,
-}
-
-impl Phase {
-    /// The lowercase word the CLI prints.
-    #[inline]
-    #[must_use]
-    pub const fn name(&self) -> &'static str {
-        match self {
-            Phase::Busy => "busy",
-            Phase::Prompt => "prompt",
-            Phase::Limited { .. } => "limited",
-            Phase::Idle => "idle",
-            Phase::Question => "question",
-        }
-    }
-}
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 37, "0.37");
 
 /// The glyphs Claude Code's spinner cycles through, plus the static ones it leaves mid-thought.
 const SPINNERS: &[char] = &['✢', '✽', '✻', '✶', '✳', '✧', '✦', '⚡', '·', '*'];
@@ -2813,7 +2779,7 @@ fn notice_placed(rows: &[String], transcript: &Transcript<'_>) -> Option<Wall> {
         && let Some(prev) = last_said_before(&said[..echo], echo, None)
         && let Some(mut cause) = notice_at(said, prev, width)
         && let text = goal_echo_text(said, echo, last)
-        && echo_names_the_cause_of(&text, cause.kind)
+        && echo_names_the_cause_of(&text, &cause)
     {
         cause.message = format!("{} \u{2014} {text}", cause.message);
         return Some(cause);
@@ -2821,23 +2787,29 @@ fn notice_placed(rows: &[String], transcript: &Transcript<'_>) -> Option<Wall> {
     notice_at(said, last, width)
 }
 
-/// Whether a `/goal` echo's own reason can come from a wall of `cause`'s kind.
-fn echo_names_the_cause_of(echo: &str, cause: WallKind) -> bool {
+/// Whether a `/goal` echo's own reason can come from the wall `cause` its error row names. Claude
+/// Code clears a goal `(authentication failed)` at Cloudflare's block page too, which it words as
+/// a lost login (2.1.323, [`crate::wall::edge_block`]): the echo is read through to that page's
+/// row, the network block it is, never read alone as the lost login its words say.
+fn echo_names_the_cause_of(echo: &str, cause: &Wall) -> bool {
     let e = echo.to_lowercase().replace('\u{2019}', "'");
     let has = |needle: &str| e.contains(needle);
-    let api = matches!(cause, WallKind::ApiError { .. } | WallKind::Overloaded);
+    let (kind, edge) = (cause.kind, crate::wall::edge_block(&cause.message));
+    let api = matches!(kind, WallKind::ApiError { .. } | WallKind::Overloaded);
     if has("unrecoverable error") {
-        return if has("authentication failed") || has("organization verification required") {
-            cause == WallKind::Auth
+        return if has("authentication failed") {
+            kind == WallKind::Auth || edge
+        } else if has("organization verification required") {
+            kind == WallKind::Auth
         } else if has("credit balance too low") {
-            cause == WallKind::Spend
+            kind == WallKind::Spend
         } else if has("context limit reached") {
-            cause == WallKind::Context
+            kind == WallKind::Context
         } else {
             false
         };
     }
-    (has("usage limit reached") || has("the request was rate limited")) && cause.reads_limited()
+    (has("usage limit reached") || has("the request was rate limited")) && kind.reads_limited()
         || (has("the api ") || has("connection dropped") || has("the last turn could not finish"))
             && api
 }

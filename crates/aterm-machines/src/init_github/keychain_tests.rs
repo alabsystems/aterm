@@ -302,17 +302,10 @@ fn the_off_switch_and_an_init_toml_it_cannot_admit_write_nothing() {
 
 /// The vault's token, as the helper would read it.
 fn token(sys: &Fake, who: &User) {
-    let file = format!("{}/.secrets/gh_access_token", who.home);
-    sys.file(&file, b"fixture_token_only").stat_of(
-        &file,
-        crate::port::Stat {
-            uid: who.uid,
-            gid: 20,
-            mode: 0o600,
-            dir: false,
-            symlink: false,
-            len: 18,
-        },
+    sys.vault_set(
+        &who.home,
+        crate::init_github::TOKEN_ENTRY,
+        b"fixture_token_only",
     );
 }
 

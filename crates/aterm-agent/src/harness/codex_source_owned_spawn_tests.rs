@@ -8,11 +8,30 @@ use aterm_uds::spawnfd::{BirthAttempt, SpawnFailure};
 fn starter(fixture: &Fixture) -> worker::Starter {
     fixture.starter.clone()
 }
-fn cli() -> &'static worker::WorkerCli {
-    worker::WORKERS
-        .iter()
-        .find(|row| row.agent == aterm_phase::Program::Codex)
-        .expect("Codex has a native worker admission row")
+
+#[test]
+fn required_backend_control_refuses_without_a_native_watcher_before_birth() {
+    assert!(aterm_uds::tether::executable().is_none());
+    let mut fixture = Fixture::new(true);
+    let admitted = worker::Admitted::assumed(starter(&fixture));
+    let attempt = BirthAttempt::new().unwrap();
+    let key = attempt.key().clone();
+    let failure = fixture
+        .reservation
+        .take()
+        .unwrap()
+        .spawn_with_required_control(admitted, fixture.home.path(), attempt)
+        .unwrap_err();
+    match failure.outcome {
+        SpawnFailure::NotSpawned(receipt) => {
+            assert_eq!(receipt.key(), &key);
+            assert_eq!(receipt.error().kind(), std::io::ErrorKind::Unsupported);
+        }
+        SpawnFailure::Unbound { .. } => panic!("missing watcher started a backend"),
+        SpawnFailure::Refused(_) => panic!("current birth attempt was refused"),
+    }
+    assert!(fixture.constructor_state().is_err());
+    assert!(fixture.child.child.try_wait().unwrap().is_none());
 }
 
 #[test]
@@ -21,15 +40,7 @@ fn owned_start_binds_real_birth_and_drop_reaps_its_cohort() {
     let admitted = worker::Admitted::assumed(starter(&fixture));
     let attempt = BirthAttempt::new().unwrap();
     let owner = fixture.reservation.take().unwrap();
-    let mut running = owner
-        .spawn(
-            admitted,
-            cli(),
-            Some(fixture.home.path()),
-            fixture.home.path(),
-            attempt,
-        )
-        .unwrap();
+    let mut running = owner.spawn(admitted, fixture.home.path(), attempt).unwrap();
     assert_eq!(running.check_control_binding(), Err(Error::Unsupported));
     let process = running.process().unwrap();
     assert_ne!(process.pid, fixture.child.child.id());
@@ -98,6 +109,28 @@ fn owned_start_binds_real_birth_and_drop_reaps_its_cohort() {
 }
 
 #[test]
+fn failed_service_transfer_keeps_the_actual_child_for_settlement() {
+    let mut fixture = Fixture::new(true);
+    let admitted = worker::Admitted::assumed(starter(&fixture));
+    let mut running = fixture
+        .reservation
+        .take()
+        .unwrap()
+        .spawn(admitted, fixture.home.path(), BirthAttempt::new().unwrap())
+        .unwrap();
+    let original = running.process().unwrap();
+    let mut failure = match running.into_service() {
+        Ok(_) => panic!("a child without a control socket cannot become a retained service"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.reason, Error::Unsupported);
+    assert_eq!(failure.worker.process().unwrap(), original);
+    assert!(fixture.child.child.owns_unreaped());
+    failure.worker.stop().unwrap();
+    assert!(Process::observe(original.pid).is_none_or(|now| now.birth != original.birth));
+}
+
+#[test]
 fn cancelled_start_retains_genuine_no_child_receipt_for_its_exact_attempt() {
     let mut fixture = Fixture::new(true);
     let admitted = worker::Admitted::assumed(starter(&fixture));
@@ -108,13 +141,7 @@ fn cancelled_start_retains_genuine_no_child_receipt_for_its_exact_attempt() {
         .reservation
         .take()
         .unwrap()
-        .spawn(
-            admitted,
-            cli(),
-            Some(fixture.home.path()),
-            fixture.home.path(),
-            attempt,
-        )
+        .spawn(admitted, fixture.home.path(), attempt)
         .unwrap_err();
     assert_eq!(failure.reason, Error::Stale);
     let proof = failure.outcome.into_not_spawned().unwrap();
@@ -142,13 +169,7 @@ fn exited_environment_producer_refuses_birth_with_the_original_no_child_receipt(
         .reservation
         .take()
         .unwrap()
-        .spawn(
-            admitted,
-            cli(),
-            Some(fixture.home.path()),
-            fixture.home.path(),
-            attempt,
-        )
+        .spawn(admitted, fixture.home.path(), attempt)
         .unwrap_err();
     assert_eq!(failure.reason, Error::Stale);
     assert_eq!(failure.outcome.into_not_spawned().unwrap().key(), &key);
@@ -164,13 +185,7 @@ fn custody_transfer_keeps_original_child_and_attempt_until_actual_stop() {
         .reservation
         .take()
         .unwrap()
-        .spawn(
-            admitted,
-            cli(),
-            Some(fixture.home.path()),
-            fixture.home.path(),
-            attempt,
-        )
+        .spawn(admitted, fixture.home.path(), attempt)
         .unwrap();
     let mut actual = running.into_spawned().unwrap();
     assert_eq!(actual.key(), &key);
@@ -203,13 +218,7 @@ fn native_spawn_failure_preserves_the_exact_no_child_attempt() {
         .reservation
         .take()
         .unwrap()
-        .spawn(
-            admitted,
-            cli(),
-            Some(fixture.home.path()),
-            &fixture.home.path().join("absent-cwd"),
-            attempt,
-        )
+        .spawn(admitted, &fixture.home.path().join("absent-cwd"), attempt)
         .unwrap_err();
     match failure.outcome {
         SpawnFailure::NotSpawned(proof) => assert_eq!(proof.key(), &key),
@@ -220,7 +229,7 @@ fn native_spawn_failure_preserves_the_exact_no_child_attempt() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn observation_failure_after_execution_keeps_actual_child_and_revokes_constructor() {
+fn executed_foreign_command_cannot_bind_the_constructor_and_keeps_actual_custody() {
     let mut fixture = Fixture::new(true);
     let owner = fixture.reservation.take().unwrap();
     let proof = fixture.home.path().join("executed");
@@ -237,19 +246,24 @@ fn observation_failure_after_execution_keeps_actual_child_and_revokes_constructo
         .stderr(Stdio::null());
     let attempt = BirthAttempt::new().unwrap();
     let key = attempt.key().clone();
-    let result = aterm_uds::spawnfd::with_exec_status_observation_fault_for_tests(
-        &proof,
-        &mut command,
-        |command| owner.finish_spawn(command.spawn_cohort(attempt)),
-    );
-    let failure = result.unwrap_err();
-    let mut spawned = match failure.outcome {
-        SpawnFailure::Unbound { spawned, .. } => spawned,
-        other => panic!("post-execution observation failure lost actual custody: {other:?}"),
-    };
+    let mut spawned = command.spawn_cohort(attempt).unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !std::fs::read_to_string(&proof).is_ok_and(|text| text == "executed retained image\n") {
+        assert!(
+            std::time::Instant::now() < until,
+            "execution proof hang detector"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // The shell's file precedes its exec. A reply from cat proves that exec
+    // completed before the constructor reads the child's process facts.
+    let input = aterm_uds::deadline::cat_echoes(spawned.child_mut());
+    // Actual target execution is not admitted constructor custody. This raw
+    // result also cannot supply the sealed path's private InstalledSpawn.
+    assert_eq!(owner.bind(spawned.child_mut()), Err(Error::Denied));
+    drop(owner);
     let actual_key = spawned.key().clone();
     let original = spawned.is_original_child();
-    let input = aterm_uds::deadline::cat_echoes(spawned.child_mut());
     spawned.kill_group().unwrap();
     spawned.child_mut().wait().unwrap();
     drop(input);
@@ -274,13 +288,7 @@ fn reaped_leader_cannot_acknowledge_a_group_with_an_unreaped_member() {
         .reservation
         .take()
         .unwrap()
-        .spawn(
-            admitted,
-            cli(),
-            Some(fixture.home.path()),
-            fixture.home.path(),
-            BirthAttempt::new().unwrap(),
-        )
+        .spawn(admitted, fixture.home.path(), BirthAttempt::new().unwrap())
         .unwrap();
     let group = running.process().unwrap().pid;
     let program = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/cat"));
@@ -354,13 +362,7 @@ fn private_control_socket_reaches_only_the_bound_child_without_sdk_authority() {
         .reservation
         .take()
         .unwrap()
-        .spawn_with_control(
-            admitted,
-            cli(),
-            Some(fixture.home.path()),
-            fixture.home.path(),
-            BirthAttempt::new().unwrap(),
-        )
+        .spawn_with_control(admitted, fixture.home.path(), BirthAttempt::new().unwrap())
         .unwrap();
     let process = running.process().unwrap();
     assert_eq!(process.parent, std::process::id());
@@ -404,13 +406,7 @@ fn control_challenge_is_tied_to_actual_owned_child_and_constructor_connection() 
         .reservation
         .take()
         .unwrap()
-        .spawn_with_control(
-            admitted,
-            cli(),
-            Some(fixture.home.path()),
-            fixture.home.path(),
-            BirthAttempt::new().unwrap(),
-        )
+        .spawn_with_control(admitted, fixture.home.path(), BirthAttempt::new().unwrap())
         .unwrap();
     assert_eq!(running.check_control_binding(), Err(Error::Busy));
     let process = running.process().unwrap();
@@ -427,21 +423,32 @@ fn control_challenge_is_tied_to_actual_owned_child_and_constructor_connection() 
     };
     let connection = fixture.registry.fixture_connection();
     let foreign = fixture.registry.fixture_connection();
+    let controller_operation = "a".repeat(32);
     let member = fixture
         .registry
-        .open_member(&peer, &connection, &"a".repeat(32))
+        .open_frontend_controller(&peer, &connection, &controller_operation, &fixture.scope)
         .unwrap()
         .member;
     let operation = "b".repeat(32);
     assert_eq!(
-        fixture
-            .registry
-            .begin_owned_control(&peer, &foreign, &member, &operation),
-        Err(Error::Denied)
+        fixture.registry.begin_owned_control(
+            &peer,
+            &foreign,
+            &member,
+            &controller_operation,
+            &operation
+        ),
+        Err(Error::Stale)
     );
     fixture
         .registry
-        .begin_owned_control(&peer, &connection, &member, &operation)
+        .begin_owned_control(
+            &peer,
+            &connection,
+            &member,
+            &controller_operation,
+            &operation,
+        )
         .unwrap();
     assert_eq!(running.check_control_binding(), Err(Error::Busy));
     let mut output = running.take_stdout().unwrap();
@@ -459,23 +466,96 @@ fn control_challenge_is_tied_to_actual_owned_child_and_constructor_connection() 
     let nonce = std::str::from_utf8(&bytes[8..]).unwrap();
     fixture
         .registry
-        .acknowledge_owned_control(&peer, &connection, &member, &operation, nonce)
+        .acknowledge_owned_control(
+            &peer,
+            &connection,
+            &member,
+            &controller_operation,
+            &operation,
+            nonce,
+        )
         .unwrap();
     fixture
         .registry
-        .acknowledge_owned_control(&peer, &connection, &member, &operation, nonce)
+        .acknowledge_owned_control(
+            &peer,
+            &connection,
+            &member,
+            &controller_operation,
+            &operation,
+            nonce,
+        )
         .unwrap();
     running.check_control_binding().unwrap();
     assert_eq!(running.check_sdk_construction(), Err(Error::Busy));
-    assert!(fixture.registry.state.lock().unwrap().members.is_empty());
-    fixture.registry.connection_closed(connection.id);
-    assert_eq!(running.check_control_binding(), Err(Error::Stale));
-    assert_eq!(
+    assert!(
+        fixture.registry.state.lock().unwrap().actors.is_empty(),
+        "physical process control must not allocate a credential actor"
+    );
+    let source_connection = fixture.registry.fixture_connection();
+    let source_operation = "d".repeat(32);
+    let source_member = fixture
+        .registry
+        .open_member(&peer, &source_connection, &source_operation)
+        .unwrap()
+        .member;
+    assert!(
         fixture
             .registry
-            .acknowledge_owned_control(&peer, &connection, &member, &operation, nonce),
+            .begin_owned_control(
+                &peer,
+                &source_connection,
+                &source_member,
+                &source_operation,
+                &operation
+            )
+            .is_err(),
+        "a credential member cannot substitute for an independent controller"
+    );
+
+    // Control allocation alone is not foreground permission, even for this
+    // actual backend child with a successfully bound physical control socket.
+    let second_controller_operation = "c".repeat(32);
+    let controller_id = fixture
+        .registry
+        .open_frontend_controller(
+            &peer,
+            &connection,
+            &second_controller_operation,
+            &fixture.scope,
+        )
+        .unwrap()
+        .member;
+    let controller = fixture
+        .registry
+        .frontend_controller(
+            &peer,
+            &connection,
+            &controller_id,
+            &second_controller_operation,
+        )
+        .unwrap();
+    let no_pty = std::fs::File::open("/dev/null").unwrap();
+    use std::os::fd::AsFd;
+    assert!(matches!(
+        controller.foreground(no_pty.as_fd()),
+        Err(Error::Denied)
+    ));
+    assert!(fixture.registry.state.lock().unwrap().members.is_empty());
+    let mut service = running.into_service().unwrap();
+    fixture.registry.connection_closed(connection.id);
+    assert_eq!(
+        fixture.registry.acknowledge_owned_control(
+            &peer,
+            &connection,
+            &member,
+            &controller_operation,
+            &operation,
+            nonce
+        ),
         Err(Error::Stale)
     );
-    drop(running);
+    service.stop().unwrap();
+    drop(service);
     assert!(!peer.current());
 }

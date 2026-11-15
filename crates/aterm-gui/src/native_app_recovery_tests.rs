@@ -20,6 +20,7 @@ fn recovery(capability: Option<RecoveryCapability>) -> RecoveryApp {
         reason: "The original reader state could not be restored safely".to_string(),
         metadata,
         capability,
+        origin: RecoveryOrigin::Restore,
     }
 }
 
@@ -392,4 +393,301 @@ fn diagnostics_only_recovery_exposes_literal_disabled_reasons() {
         .find(|command| command.id.as_str() == "recovery/open-original")
         .unwrap();
     assert!(!original.enabled);
+}
+
+/// A Recovery tab standing for a document the person asked to open, which did not; `entry` when
+/// that open was a directory listing's Enter its read never resolved.
+fn failed_open_from(capability: Option<RecoveryCapability>, entry: bool) -> RecoveryApp {
+    RecoveryApp {
+        restore_tag: "markdown".to_string(),
+        reason: crate::app_documents::DRAFTS_BUSY_PROBLEM.to_string(),
+        metadata: crate::app_documents::InstallFailure::DRAFTS_BUSY.to_string(),
+        capability,
+        origin: RecoveryOrigin::Open {
+            path: "/tmp/notes/Guide.md".to_string(),
+            reveal: Some(crate::app_documents::DocumentReveal::MarkdownFragment(
+                "usage".to_string(),
+            )),
+            entry,
+            asked: None,
+        },
+    }
+}
+
+fn failed_open(capability: Option<RecoveryCapability>) -> RecoveryApp {
+    failed_open_from(capability, false)
+}
+
+fn guide_document() -> Option<RecoveryCapability> {
+    Some(RecoveryCapability::Document {
+        kind: AppKind::Markdown,
+        uri: "file:///tmp/notes/Guide.md".to_string(),
+        config_editor: false,
+    })
+}
+
+/// A failed open's page says what went wrong and names the file, not a restore type; its tab is
+/// the file's name with no attention mark (the person is looking at the window that asked), and
+/// Retry opens the file again. NEGATIVE CONTROL (scratch): drawing the Open origin with the
+/// Restore arm's second line fails the "Restore type" check.
+#[test]
+fn an_open_origin_page_names_the_file_and_asks_for_no_attention() {
+    let app = failed_open(guide_document());
+    let view = RecoveryViewState::default();
+    let lines = recovery_page_projection_at_scale(
+        &app,
+        &view,
+        LogicalRect::new(0.0, 0.0, 1_200.0, 800.0),
+        1.0,
+    )
+    .lines
+    .into_iter()
+    .map(|line| line.text)
+    .collect::<Vec<_>>();
+    assert!(
+        !lines.iter().any(|line| line.contains("Restore type")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("/tmp/notes/Guide.md")),
+        "the page names the file: {lines:?}"
+    );
+    let presentation = app.presentation(&view);
+    assert_eq!(presentation.title, "Guide.md");
+    assert!(!presentation.indicators.attention);
+    assert!(
+        presentation
+            .tooltip
+            .as_deref()
+            .is_some_and(|tooltip| tooltip.contains("/tmp/notes/Guide.md")),
+        "{:?}",
+        presentation.tooltip
+    );
+    let viewport = LogicalRect::new(0.0, 0.0, 800.0, 600.0);
+    let compiled = app
+        .view(
+            &view,
+            &ViewCx {
+                viewport,
+                animation_phase_ms: 0,
+                motion: ViewMotionCx::default(),
+                terminal_font_px: 13.0,
+                terminal_scale: 1.0,
+                semantic_font: None,
+                document: None,
+            },
+        )
+        .compile(viewport)
+        .unwrap();
+    let heading = compiled
+        .semantics
+        .iter()
+        .find(|node| node.role == crate::native_ui::SemanticRole::Heading)
+        .expect("the page's heading");
+    assert!(
+        heading.label.contains("Guide.md"),
+        "the heading names the file: {}",
+        heading.label
+    );
+    let retry_of = |app: &RecoveryApp| {
+        let mut commands = Vec::new();
+        app.commands(&view, &mut commands);
+        commands
+            .into_iter()
+            .find(|command| command.id.as_str() == "recovery/retry")
+            .unwrap()
+    };
+    let retry = retry_of(&app);
+    assert!(retry.enabled);
+
+    let restored = recovery(guide_document());
+    assert!(restored.presentation(&view).indicators.attention);
+    assert_ne!(
+        retry.title,
+        retry_of(&restored).title,
+        "an open's Retry is not a restore's"
+    );
+    let without = failed_open(None);
+    let mut commands = Vec::new();
+    without.commands(&view, &mut commands);
+    assert!(
+        commands
+            .iter()
+            .filter(|command| command.id.as_str() != "recovery/copy")
+            .all(|command| !command.enabled),
+        "no URI, no Retry and no Open Original"
+    );
+}
+
+/// The Open origin's reducer refines the same single-flight model as a restored leaf's: Retry
+/// starts one typed Reopen carrying the open's reveal, Open Original one Reopen in the editor, and
+/// a matching Started completion clears pending like any other. NEGATIVE CONTROL: a Started
+/// completion for another operation is StaleComplete and leaves pending.
+#[test]
+fn an_open_origin_retry_reopens_through_admission_and_started_clears_pending() {
+    let model = native_recovery_interaction_model();
+    let mut runtime = NativeRuntime::new();
+    let instance = runtime
+        .insert_instance(NativeApp::Recovery(failed_open(guide_document())))
+        .unwrap();
+    let view_id = ViewId::from_stored(92);
+    runtime
+        .attach_view(
+            view_id,
+            instance,
+            AppViewState::Recovery(RecoveryViewState::default()),
+        )
+        .unwrap();
+    let real_view = |runtime: &NativeRuntime| match runtime.view_state(view_id).unwrap() {
+        AppViewState::Recovery(view) => view.clone(),
+        _ => unreachable!(),
+    };
+    let act = |runtime: &mut NativeRuntime, id: &str| {
+        runtime
+            .dispatch(
+                instance,
+                view_id,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(id),
+                    value: None,
+                }),
+            )
+            .unwrap()
+    };
+
+    let before = recovery_model_projection(&model, &real_view(&runtime), 0, 0, 0);
+    let report = act(&mut runtime, "recovery/retry");
+    let operation = match report.effects.as_slice() {
+        [
+            AppEffect::Recovery {
+                request:
+                    RecoveryRequest::Reopen {
+                        kind: AppKind::Markdown,
+                        uri,
+                        reveal:
+                            Some(crate::app_documents::DocumentReveal::MarkdownFragment(fragment)),
+                        entry: false,
+                    },
+                reply,
+            },
+        ] if uri == "file:///tmp/notes/Guide.md" && fragment == "usage" => reply.operation,
+        effects => panic!("expected one typed Reopen, got {effects:?}"),
+    };
+    assert!(
+        real_view(&runtime).notice.is_some(),
+        "the tab says it is opening"
+    );
+    let pending = recovery_model_projection(&model, &real_view(&runtime), 1, 0, 0);
+    assert_recovery_transition(&model, &before, &pending, "BeginRetry");
+
+    runtime
+        .dispatch(
+            instance,
+            view_id,
+            AppEvent::RecoveryFinished {
+                operation: OperationId(operation.get().saturating_add(10_000)),
+                outcome: RecoveryOutcome::Started {
+                    message: "stale".to_string(),
+                },
+            },
+        )
+        .unwrap();
+    let stale = recovery_model_projection(&model, &real_view(&runtime), 1, 1, 1);
+    assert_recovery_transition(&model, &pending, &stale, "StaleComplete");
+
+    runtime
+        .dispatch(
+            instance,
+            view_id,
+            AppEvent::RecoveryFinished {
+                operation,
+                outcome: RecoveryOutcome::Started {
+                    message: "Opening Guide.md…".to_string(),
+                },
+            },
+        )
+        .unwrap();
+    let started = recovery_model_projection(&model, &real_view(&runtime), 1, 2, 0);
+    assert_recovery_transition(&model, &stale, &started, "MatchingComplete");
+    assert_eq!(real_view(&runtime).pending, None);
+    assert_eq!(
+        real_view(&runtime).notice.as_deref(),
+        Some("Opening Guide.md…"),
+        "the started outcome's own message"
+    );
+
+    let report = act(&mut runtime, "recovery/open-original");
+    assert!(
+        matches!(
+            report.effects.as_slice(),
+            [AppEffect::Recovery {
+                request: RecoveryRequest::Reopen {
+                    kind: AppKind::Editor,
+                    reveal: None,
+                    entry: false,
+                    ..
+                },
+                ..
+            }]
+        ),
+        "Open Original opens the file in the editor through admission: {:?}",
+        report.effects
+    );
+}
+
+/// A failed directory entry's Open Original follows the entry's link as its Retry does, so a link
+/// whose target now exists opens: only the kind changes. NEGATIVE CONTROL (scratch): an Open
+/// Original that drops the entry fails it.
+#[test]
+fn an_entrys_open_original_follows_its_link() {
+    let mut runtime = NativeRuntime::new();
+    let instance = runtime
+        .insert_instance(NativeApp::Recovery(failed_open_from(
+            guide_document(),
+            true,
+        )))
+        .unwrap();
+    let view_id = ViewId::from_stored(93);
+    runtime
+        .attach_view(
+            view_id,
+            instance,
+            AppViewState::Recovery(RecoveryViewState::default()),
+        )
+        .unwrap();
+    for (action, kind) in [
+        ("recovery/open-original", AppKind::Editor),
+        ("recovery/retry", AppKind::Markdown),
+    ] {
+        if let Some(AppViewState::Recovery(view)) = runtime.view_state_mut(view_id) {
+            view.pending = None;
+        }
+        let report = runtime
+            .dispatch(
+                instance,
+                view_id,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(action),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                report.effects.as_slice(),
+                [AppEffect::Recovery {
+                    request: RecoveryRequest::Reopen {
+                        kind: requested,
+                        entry: true,
+                        ..
+                    },
+                    ..
+                }] if *requested == kind
+            ),
+            "{action}: {:?}",
+            report.effects
+        );
+    }
 }

@@ -544,7 +544,7 @@ fn neither_gitleaks_report_nor_the_verdict_holds_the_secret() {
 /// the scan held the export to. NEGATIVE CONTROL: the same row, committed, is a finding.
 #[test]
 fn an_uncommitted_engine_row_is_not_the_engines_until_it_is_committed() {
-    let (_dir, ctx) = checkout("// a fixture\n// wombatword\n");
+    let (_dir, mut ctx) = checkout("// a fixture\n// wombatword\n");
     let engine = std::path::PathBuf::from(ctx.env.engine_var("PUBLICATION_ENGINE").expect("named"));
     let rows = engine.join(rows::BASELINE);
     std::fs::write(&rows, "# Paths\nquokkaword\nwombatword\n").expect("edit");
@@ -565,6 +565,8 @@ fn an_uncommitted_engine_row_is_not_the_engines_until_it_is_committed() {
         "the label names the commit: {labels:#?}"
     );
     git(&engine, &["commit", "-q", "-am", "row"]);
+    // A run reads its engine once (`Ctx::engine`): the next run reads it afresh.
+    ctx.engine = std::sync::OnceLock::new();
     let (_, committed) = scan(&ctx);
     assert!(
         committed.contains(&"crates/x/src/lib.rs:2".to_string()),
@@ -628,6 +630,8 @@ fn without_the_engine_the_exports_own_rows_still_hold() {
         ["crates/x/src/lib.rs:1", "crates/x/src/lib.rs:2"]
     );
     ctx.env.publication_engine = None;
+    // A run reads its engine once (`Ctx::engine`): the next run reads it afresh.
+    ctx.engine = std::sync::OnceLock::new();
     let mut r = Report::new("export-scan");
     run_with(&ctx, &mut r, || Err("no signed scanner in fixture".into()));
     let rows: Vec<(Outcome, String)> = r.outcomes().map(|(o, l)| (o, l.to_string())).collect();
@@ -924,9 +928,13 @@ fn export_scan_consumes_the_pinned_baseline_after_the_named_engine_moves() {
     let (_, pinned, _) = verdict(&ctx, Err("fixture scanner unavailable".into()));
     assert!(!pinned.contains(&"crates/x/src/lib.rs:2".to_string()));
     ctx.env.publication_engine_commit = Some(head().into());
+    // A run reads its engine once (`Ctx::engine`): the next run reads it afresh.
+    ctx.engine = std::sync::OnceLock::new();
     let (_, successor, _) = verdict(&ctx, Err("fixture scanner unavailable".into()));
     assert!(successor.contains(&"crates/x/src/lib.rs:2".to_string()));
     ctx.env.publication_engine_commit = None;
+    // A run reads its engine once (`Ctx::engine`): the next run reads it afresh.
+    ctx.engine = std::sync::OnceLock::new();
     let (_, _, refused) = verdict(&ctx, Err("fixture scanner unavailable".into()));
     assert!(
         shown(&refused).contains("publication engine pin requires"),

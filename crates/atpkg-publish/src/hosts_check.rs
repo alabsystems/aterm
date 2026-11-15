@@ -7,8 +7,8 @@
 //!
 //! It reads explicit configuration, recorded vault identities, and the trust checkout's origin
 //! and the seed ledger its origin/main carries, and sends nothing. A writer whose token is not
-//! in a token file fails its check: a lane unit carries no token variable, and agh's git
-//! credential helper reads only token files, so a unit reads what this check read. `--lane linux` additionally reads and authenticates the fresh signed
+//! in a vault entry or token file fails its check: a lane unit carries no token variable, and
+//! agh's git credential helper reads only those, so a unit reads what this check read. `--lane linux` additionally reads and authenticates the fresh signed
 //! channel to select the repositories that lane may serve; the generic inventory sends nothing.
 
 use agh::config::Dirs;
@@ -272,26 +272,16 @@ fn writer(
             slot.sync_step()
         ));
     };
-    // A lane unit carries no token variable, and agh's git runner refuses a credentialed run
-    // whose profile keeps its token anywhere but a token file, so only a file serves a lane.
+    // agh.toml names every token by its vault entry or file, which is what a lane unit's helper
+    // reads.
     let profile = router.profile(name);
-    if let Some(profile) = profile
-        && !matches!(profile.source, agh::identity::Source::File(_))
-    {
-        return Err(format!(
-            "{name} writes {owner}, and its token is not in a token file: a lane unit carries \
-             no token variable and git's credential helper reads only token files; {} \
-             ({RUNBOOK})",
-            slot.sync_step()
-        ));
-    }
     match client.presence(name) {
         agh::policy::Presence::Present => Ok(name.to_string()),
         other => Err(format!(
             "{name} writes {owner}, and its token is {}: {}",
             other.slug(),
             profile
-                .and_then(agh::identity::vault::absent_step)
+                .and_then(agh::identity::vault::token_step)
                 .unwrap_or_else(|| slot.sync_step())
         )),
     }
@@ -299,9 +289,11 @@ fn writer(
 
 /// Whether a lane whose `--keyless` is `keyless` stages only, and so never writes the public
 /// owner: `--keyless` lets a builder with no machine key install, and the Linux lane's run is
-/// keyed whenever `ctx.identity.key` is a file, whatever its unit's flags said.
+/// keyed whenever this Mac holds a key (the store's release ring or the minted key file),
+/// whatever its unit's flags said; a store that cannot be read now stages nothing alone, so the
+/// run signs and names why it cannot.
 pub(crate) fn stages_only(ctx: &Ctx, keyless: bool) -> bool {
-    keyless && !ctx.identity.key.is_file()
+    keyless && matches!(crate::identity::keyed(ctx), Ok(false))
 }
 
 /// Every check, for the environment a lane unit runs with (`Dirs::resolve(home,

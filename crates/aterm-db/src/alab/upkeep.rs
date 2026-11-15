@@ -17,6 +17,10 @@
 //! whether or not the owner is serving, and each pass writes only under `~/.aterm/files`. The
 //! same thread runs the shared files' publisher before each pass (`crate::file::publish`): the
 //! writes this Mac queued are signed there, one record each.
+//!
+//! The registry's secret store is swept on an `alab-secrets` thread ([`Secrets`]), hourly: what
+//! an ended run left owed is removed from the vault once no cell names it
+//! (`super::secret::housekeep`). A pass with nothing owed reads one directory of this Mac's.
 
 use super::journal::{Presence, Spool, Word, flush::Flushed};
 use aterm_secrets::client::Paths;
@@ -304,6 +308,7 @@ fn presence_live(paths: &Paths) -> Presence {
 /// or not ([`Materializer`]).
 pub(crate) struct Upkeep {
     journal: Option<Journal>,
+    secrets: Option<Secrets>,
 }
 
 impl Upkeep {
@@ -315,13 +320,61 @@ impl Upkeep {
                 next: now + FIRST,
                 running: None,
             }),
+            // This crate's tests run their labs' runtimes without touching a vault's store.
+            secrets: (!cfg!(test)).then(|| Secrets {
+                next: now + FIRST,
+                running: None,
+            }),
         }
     }
 
-    /// Collect a finished journal pass, then start the next one when it is due.
+    /// Collect a finished journal pass, then start the next one when it is due; the same for
+    /// the registry store's sweep.
     pub(crate) fn tick(&mut self, paths: &Paths, now: Instant) {
         if let Some(journal) = &mut self.journal {
             journal.tick(paths, now);
+        }
+        if let Some(secrets) = &mut self.secrets {
+            secrets.tick(paths, now);
+        }
+    }
+}
+
+/// A sweep of the registry's secret store at most this often ([`Secrets`]).
+pub(crate) const SECRETS_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// The registry store's sweep on its own `alab-secrets` thread
+/// ([`super::secret::housekeep`]): what an ended run left owed (a failed removal, a refused
+/// write's put, a late roll's dropped entries) is collected once no cell names it, though this
+/// Mac writes no secret again. A pass reads this Mac's owed record and, only where it lists an
+/// ended run's entry, the registry. Every [`SECRETS_EVERY`], [`RETRY`] after one that failed.
+struct Secrets {
+    next: Instant,
+    running: Option<JoinHandle<bool>>,
+}
+
+impl Secrets {
+    fn tick(&mut self, paths: &Paths, now: Instant) {
+        if self.running.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(handle) = self.running.take()
+        {
+            let swept = handle.join().unwrap_or(false);
+            self.next = now + if swept { SECRETS_EVERY } else { RETRY };
+        }
+        if self.running.is_some() || now < self.next {
+            return;
+        }
+        let paths = paths.clone();
+        self.running = std::thread::Builder::new()
+            .name("alab-secrets".into())
+            .spawn(move || {
+                let handle = crate::att::Handle::at(paths.clone(), &crate::att::REGISTRY);
+                let store = super::secret::store(&paths);
+                super::secret::housekeep(&handle, &store).is_ok()
+            })
+            .ok();
+        if self.running.is_none() {
+            self.next = now + RETRY;
         }
     }
 }

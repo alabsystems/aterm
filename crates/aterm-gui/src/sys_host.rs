@@ -368,6 +368,10 @@ impl Shared {
                 let _hardware = force.then(|| hardware.arm());
                 self.fresh_why(fresh, force)
             }
+            View::Overview | View::Tab | View::Aterm | View::Global | View::Mem => {
+                let _armed = split.arm();
+                self.fresh_by(fresh, fresh_ms == 0, Part::Split, false)
+            }
             View::Left => {
                 let _armed = jobs.arm();
                 self.fresh_by(fresh, fresh_ms == 0, Part::Left, false)
@@ -414,7 +418,7 @@ impl Shared {
             && landed(h).is_some_and(|t| t.elapsed() <= fresh)
             && whole(&h.snap)
         {
-            return (have.clone(), Freshness::Fresh);
+            return (have.clone(), answered(&h.snap));
         }
         let old_seq = have.as_ref().map(|h| h.snap.seq);
         let old_split = have.as_ref().and_then(|h| split_ns(&h.snap));
@@ -450,7 +454,7 @@ impl Shared {
                     && landed(h).is_some_and(|l| l >= t)
                     && whole(&h.snap)
                 {
-                    return (have.clone(), Freshness::Fresh);
+                    return (have.clone(), answered(&h.snap));
                 }
             }
             None => {
@@ -486,8 +490,10 @@ impl Shared {
                 && whole(&h.snap)
                 && (!split
                     || !h.snap.coal_lane.on()
+                    || stalled(&h.snap, "why")
                     || split_ns(&h.snap).is_some_and(|ns| Some(ns) != old_split))
                 && (!matches!(part, Part::Jobs | Part::Left)
+                    || stalled(&h.snap, if part == Part::Jobs { "jobs" } else { "left" })
                     || landed(h).is_some_and(|at| {
                         if force {
                             at >= now
@@ -497,7 +503,7 @@ impl Shared {
                     }))
                 && sampled(h)
             {
-                return (Some(h.clone()), Freshness::Fresh);
+                return (Some(h.clone()), answered(&h.snap));
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() || crate::control::caller_hung_up() {
@@ -635,14 +641,31 @@ impl Shared {
     }
 }
 
-/// Whether `snap` is a whole reading with CPU, aterm, and process rates within [`WINDOW_MAX`].
+/// Whether `snap` is a whole reading with CPU, aterm, and process rates within [`WINDOW_MAX`];
+/// or with CPU and every other figure where its process reads stalled ([`stalled`]), which
+/// leaves aterm's and the processes' figures unknown and waits for none of them.
 pub(crate) fn whole(snap: &Snapshot) -> bool {
     !snap.machine_only
         && snap.cpu.is_some()
-        && snap.aterm.is_some()
-        && snap
-            .procs_window_ns
-            .is_some_and(|w| u128::from(w) <= WINDOW_MAX.as_nanos())
+        && (stalled(snap, "aterm")
+            || (snap.aterm.is_some()
+                && snap
+                    .procs_window_ns
+                    .is_some_and(|w| u128::from(w) <= WINDOW_MAX.as_nanos())))
+}
+
+/// Whether a lane stalled at `snap` feeds `figure` ([`aterm_vitals::lanes`]).
+pub(crate) fn stalled(snap: &Snapshot, figure: &str) -> bool {
+    aterm_vitals::lanes::stalls(&snap.stalled, figure).is_some()
+}
+
+/// How fresh a snapshot that answers in time is: fresh, or partial where a lane stalled.
+fn answered(snap: &Snapshot) -> Freshness {
+    if snap.stalled.is_empty() {
+        Freshness::Fresh
+    } else {
+        Freshness::Partial
+    }
 }
 
 fn split_landed(h: &Held) -> Option<Instant> {
@@ -672,7 +695,7 @@ fn split_cold(h: &Held) -> bool {
 }
 
 fn freshness(h: &Held, otherwise: Freshness) -> Freshness {
-    if h.snap.cpu.is_none() || h.snap.aterm.is_none() {
+    if h.snap.cpu.is_none() || (h.snap.aterm.is_none() && !stalled(&h.snap, "aterm")) {
         Freshness::Warming
     } else {
         otherwise

@@ -691,6 +691,13 @@ fn a_healthy_run_relaunches_at_once_and_a_young_death_escalates_from_the_floor()
 
 /// What the loop itself waits, not only what [`next_backoff`] answers: nothing between a
 /// healthy run and the next launch, and the floor, doubling, after each that dies young.
+///
+/// A run counts from its launch, which starts the bridge before it returns, so a launch that
+/// comes back late takes nothing off its run: here the healthy launch returns a second after
+/// starting a bridge that outlives [`RELAUNCH_HEALTHY`] by a tenth of one. Counted from the
+/// launch's return, that run read as a young death and the loop waited `[400ms, 800ms, 1.6s]`,
+/// the waits a workspace run on a loaded Linux arm64 host read without the late return
+/// (2026-11-12).
 #[test]
 fn the_loop_waits_nothing_after_a_healthy_run_and_the_floor_after_a_young_death() {
     let healthy = vec![
@@ -711,11 +718,15 @@ fn the_loop_waits_nothing_after_a_healthy_run_and_the_floor_after_a_young_death(
         |argv| {
             let first = launches.get() == 0;
             launches.set(launches.get() + 1);
-            launch_serving(
+            let launched = launch_serving(
                 if first { &healthy } else { argv },
                 |_, _, _| true,
                 untold(),
-            )
+            );
+            if first {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            launched
         },
         || launches.get() == 3,
         |waited| paused.borrow_mut().push(waited),

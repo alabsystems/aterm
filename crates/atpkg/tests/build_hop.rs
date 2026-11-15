@@ -80,9 +80,13 @@ fn whole_normal_reader_preflight_binds_both_real_managed_routes() {
     std::fs::create_dir_all(&bin).unwrap();
     let write = |name: &str, helper: &Path, environment: &atpkg::shim_env::ShimEnv| {
         let shim = bin.join(name);
-        let rendered =
-            atpkg::platform::build_hop_fixture(&shim, &s.root().join(name), environment, helper)
-                .unwrap();
+        let rendered = atpkg::platform::canonical_build_hop_shim(
+            &shim,
+            &s.root().join(name),
+            environment,
+            helper,
+        )
+        .unwrap();
         atpkg::lay::write_in_process(&rendered).unwrap();
     };
     let run = |supported: bool| {
@@ -177,7 +181,22 @@ fn standin_touches_and_waits() {
 }
 
 struct Scratch {
-    dir: aterm_tempfile::TempDir,
+    dir: Option<aterm_tempfile::TempDir>,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(dir) = self.dir.take()
+        {
+            let kept = dir.keep();
+            let _ = writeln!(
+                std::io::stderr(),
+                "KEPT {}: preserving native build-hop images after a panic",
+                kept.display()
+            );
+        }
+    }
 }
 
 impl Scratch {
@@ -186,18 +205,39 @@ impl Scratch {
             .prefix("atpkg-build-hop-")
             .tempdir()
             .expect("scratch");
-        let s = Self { dir };
+        let s = Self { dir: Some(dir) };
         std::fs::create_dir_all(s.home()).expect("home");
         std::fs::create_dir_all(s.ledger()).expect("ledger");
         let targo = s.targo();
         std::fs::write(&targo, STANDIN).expect("the stand-in");
         std::fs::set_permissions(&targo, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("runnable");
+        let mut qualify = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"));
+        qualify
+            .arg("__qualify_retained_helper")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", s.home())
+            .env("ATERM_STATE_HOME", s.state());
+        let qualified =
+            aterm_uds::deadline::output_within(&mut qualify, aterm_uds::deadline::FIRST_EXEC_HANG)
+                .expect("native helper qualification");
+        assert!(qualified.status.success(), "{qualified:?}");
+        assert_eq!(qualified.stdout, b"retained helper prepared\n");
         s
     }
 
     fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().expect("the scratch's path")
+        self.dir
+            .as_ref()
+            .expect("owned scratch")
+            .path()
+            .canonicalize()
+            .expect("the scratch's path")
+    }
+
+    fn keep(mut self) -> PathBuf {
+        self.dir.take().expect("owned scratch").keep()
     }
 
     fn home(&self) -> PathBuf {
@@ -684,6 +724,38 @@ fn a_holder_that_does_not_arm_leaves_the_build_under_its_front() {
     }
 }
 
+/// A CLAIMED FRONT WITH A PROCESS-TABLE READ STILL IN THE KERNEL DOES NOT BECOME ITS BUILD: an
+/// exec would wait on that read's thread for as long as another process's exec takes (m72,
+/// 2026-11-12: seven fronts that exec'ed over theirs never finished, and the Mac could not
+/// restart). It keeps its claim and runs the build under it as its child, says why in one line,
+/// and ends as the build ends. The read is the front's own seam (`READ_HELD_ENV`), counted in
+/// its exec gate and never in the kernel.
+/// NEGATIVE CONTROL: with no read held the build is the front's own process (the first test);
+/// and (by hand: `front_exec_bounded` without its gate's `close`) the front hands its claim to a
+/// holder and says the build runs as its child, not under this front.
+#[test]
+fn a_claimed_front_with_a_table_read_in_the_kernel_runs_its_build_under_its_claim() {
+    let s = Scratch::new();
+    let child = s.front(
+        &["--unverified", "check"],
+        &[(atpkg::build_admit::READ_HELD_ENV, "1"), ("HOP_EXIT", "3")],
+    );
+    let front = child.id();
+    let seen = s.seen();
+    assert_eq!(seen.ppid, front, "its parent is the front: {seen:?}");
+    assert_ne!(seen.pid, front);
+    let listed = s.listed();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].pid, front, "the front keeps the claim");
+    let (status, err) = finish(child);
+    assert_eq!(status.code(), Some(3), "{err}");
+    assert!(
+        err.contains("still in the kernel") && err.contains("runs under this front"),
+        "{err}"
+    );
+    assert!(s.listed().is_empty(), "the front let it go");
+}
+
 /// How a front's admission went, as [`admitted_or_waits`] read it.
 #[derive(Debug, PartialEq, Eq)]
 enum Went {
@@ -1096,7 +1168,7 @@ fn a_killed_builds_claim_is_kept_while_its_survivor_works() {
             "cleanup.json",
             &aterm_json::json!({"original_identity_no_longer_observed": original_identity_no_longer_observed}),
         );
-        let retained = s.dir.keep();
+        let retained = s.keep();
         eprintln!(
             "survivor failure evidence retained at {}: {before}",
             retained.display()
@@ -1141,9 +1213,25 @@ fn a_build_keeps_the_signals_its_front_was_started_ignoring() {
     use std::os::unix::process::ExitStatusExt as _;
     for ignored in [None, Some("PIPE INT")] {
         let s = Scratch::new();
-        let child = s.front_ignoring(ignored, &["--version"], &[("HOP_PROBE", "signals")]);
+        let stderr_path = s.root().join("front-stderr");
+        let stderr = std::fs::File::create(&stderr_path).expect("front stderr");
+        let mut command = s.front_command(ignored, &["--version"], &[("HOP_PROBE", "signals")]);
+        command.stderr(stderr);
+        let mut child = started(&mut command);
+        let reported =
+            aterm_spec::wait::within(MUST_HAPPEN, std::time::Duration::from_millis(10), || {
+                let status = child.try_wait().expect("front status");
+                (s.out().exists() || status.is_some()).then_some(status)
+            });
+        assert!(
+            s.out().exists(),
+            "front {} ignoring {ignored:?} did not report: {reported:?}; stderr: {}",
+            child.id(),
+            std::fs::read_to_string(&stderr_path).expect("front stderr")
+        );
         assert!(s.seen().held.is_none(), "this probe needs no admission");
-        let (status, err) = finish(child);
+        let (status, _) = finish(child);
+        let err = std::fs::read_to_string(&stderr_path).expect("front stderr");
         let mut said = s.out().into_os_string();
         said.push(".signals");
         if ignored.is_some() {

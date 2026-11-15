@@ -23,7 +23,7 @@ path = "src/lib.rs"
 # workspace already holds). `aterm-toml`'s comment-preserving document model
 # reads the policy file, whose comments carry the fork reasons.
 aterm-toml = { workspace = true }
-# The shared source walk, the [patch] classification and the census review
+# The shared source walk, the [patch] classification and the fork ledger's reader
 # (`reviewed_forks`, read from vendor/forge.toml), so each has one definition.
 aterm-census = { workspace = true }
 # Parses cargo's metadata JSON and the crates.io index's rows.

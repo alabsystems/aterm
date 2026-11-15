@@ -74,6 +74,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
             .sessions
             .into_iter()
             .map(|r| SessionRecord {
+                pinned: false,
                 local_id: r.local_id,
                 sid: r.sid,
                 parent: r.parent,
@@ -1020,6 +1021,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         outgoing_build: Some(crate::running_build_number()),
         held: Vec::new(),
         sessions: vec![SessionRecord {
+            pinned: false,
             local_id: 0,
             sid: "s-0".to_string(),
             parent: None,

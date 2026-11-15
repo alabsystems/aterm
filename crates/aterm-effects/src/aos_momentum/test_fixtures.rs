@@ -16,8 +16,8 @@ use super::corpus::{GOLDEN_TRACE_TARGET, SplitMix};
 use super::m4::Evaluator;
 use super::policy::PolicyRefusal;
 use super::{
-    HostMode, Hosted, MOMENTUM_MAX_EVENTS, MOMENTUM_QUEUE_CAP, MomentumCode, MomentumHost,
-    MomentumSchema, NoStrandedLight, PrebuiltMomentum, Sched,
+    Attached, HostMode, MOMENTUM_MAX_EVENTS, MOMENTUM_QUEUE_CAP, MomentumCode, MomentumEngine,
+    MomentumHost, MomentumSchema, NoStrandedLight, PrebuiltMomentum, Sched,
 };
 use crate::cursor_glow::Geom;
 use crate::cursor_momentum::{
@@ -546,7 +546,7 @@ pub(super) fn strand(
 }
 
 /// The attached task inside a host.
-pub(super) fn hosted(h: &MomentumHost) -> &Hosted {
+pub(super) fn hosted(h: &MomentumHost) -> &Attached<MomentumEngine> {
     match &h.mode {
         HostMode::Hosted(h) => h,
         HostMode::Direct(_) => panic!("fixture: the host is attached"),
@@ -554,7 +554,7 @@ pub(super) fn hosted(h: &MomentumHost) -> &Hosted {
 }
 
 /// The attached task inside a host, mutably.
-pub(super) fn hosted_mut(h: &mut MomentumHost) -> &mut Hosted {
+pub(super) fn hosted_mut(h: &mut MomentumHost) -> &mut Attached<MomentumEngine> {
     match &mut h.mode {
         HostMode::Hosted(h) => h,
         HostMode::Direct(_) => panic!("fixture: the host is attached"),
@@ -594,7 +594,7 @@ pub(super) fn attached(epoch: Instant, code: MomentumCode) -> MomentumHost {
 /// A host attached at `t0` running `sched` with one log epoch for a whole lane run, so its log replayed from the attach checkpoint is the whole run.
 pub(super) fn attached_for_lane(t0: Instant, sched: Sched) -> MomentumHost {
     let mut h = MomentumHost::default();
-    h.attach_sched(t0, sched, BUILD, 1, MOMENTUM_QUEUE_CAP, MOMENTUM_MAX_EVENTS);
+    h.attach_code(t0, sched, BUILD, 1, MOMENTUM_QUEUE_CAP, MOMENTUM_MAX_EVENTS);
     h
 }
 

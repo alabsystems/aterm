@@ -518,7 +518,7 @@ impl InitialRepositoryInputs {
                 return inputs;
             }
         };
-        let default = match super::asked(table, user) {
+        let default = match super::asked(table) {
             Ok(Asked::Default) => true,
             Ok(_) => false,
             Err(why) => {
@@ -667,13 +667,7 @@ impl InitialRepositoryInputs {
         }
         repos::admit_destination(sys, user)?;
         let configured = configuration(sys, user).map_err(Block::of(Wait::Settings))?;
-        let source = configured.clone().unwrap_or_else(|| Github {
-            account: String::new(),
-            owner: String::new(),
-            token_file: super::token_file(Path::new(&user.home)),
-            token_key: None,
-        });
-        let token = Arc::new(read_token(sys, user, &source).map_err(Block::token)?);
+        let token = Arc::new(read_token(sys, user).map_err(Block::token)?);
         let inventory = if configured.is_none() {
             Some(
                 super::inventory::Inventory::read(sys, user)
@@ -796,7 +790,7 @@ impl NativeRepositories {
 
 impl Item for NativeRepositories {
     fn id(&self) -> String {
-        format!("init.github.native@{}", self.user.name)
+        format!("{}.native@{}", super::ID, self.user.name)
     }
     fn family(&self) -> &'static str {
         "github"
@@ -1632,7 +1626,7 @@ impl Block {
     /// The probe's answer for this block (System State design §3.6): a person's step where only
     /// their act on settings or a destination ends the wait ([`Wait::kind`]), so its row needs
     /// them and no pass retries it, else a wait that ends by itself. For `aterm init`'s default
-    /// (`unasked`), a machine the vault wrote no token to has no stage to run, which asks nobody
+    /// (`unasked`), a machine the vault delivered no token to has no stage to run, which asks nobody
     /// anything; `machine` names it ([`System::machine`]). A token wait is a blocked operation,
     /// never a person's: the default vault source files its need through
     /// [`super::RepositorySelection`]'s protocol.
@@ -1640,10 +1634,8 @@ impl Block {
         match self.wait {
             Some(Wait::Token) if unasked => Probe::NotApplicable {
                 why: format!(
-                    "no GitHub token on this {} yet: the ALab vault's sync writes {} \
-                     (init.toml [github] token_file names another)",
-                    machine,
-                    agh::identity::vault::Slot::Dev.pointer()
+                    "no GitHub token on this {machine} yet: the ALab vault delivers its {} entry",
+                    super::TOKEN_ENTRY
                 ),
             },
             Some(wait) if wait.kind() == FailureKind::NeedsPerson => Probe::Person {
@@ -1730,8 +1722,8 @@ impl NativeRepositories {
             Some(_) => return Err("the captured repository account changed".to_owned().into()),
             None if self.unasked
                 && sys
-                    .stat(&super::token_file(Path::new(&self.user.home)))
-                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                    .vault_entry(Path::new(&self.user.home), super::TOKEN_ENTRY)
+                    .is_ok_and(|token| token.is_none())
                 && configuration(sys, &self.user)
                     .map_err(Block::of(Wait::Settings))?
                     .is_none()
@@ -1858,18 +1850,10 @@ fn configuration(sys: &dyn System, user: &User) -> Result<Option<Github>, String
         }
     };
     // A table that turns the stage off is System State's choice there, not a scope here.
-    let configured = match asked(decode(&bytes)?.github, user)? {
-        Asked::Scoped(config) | Asked::Profile(config) => Some(config),
+    let configured = match asked(decode(&bytes)?.github)? {
+        Asked::Scoped(config) => Some(config),
         Asked::Default | Asked::Off => None,
     };
-    if configured.as_ref().is_some_and(|config| {
-        config
-            .token_file
-            .file_name()
-            .is_some_and(|name| name == agh::identity::vault::Slot::Release.entry())
-    }) {
-        return Err("public release credentials are not a development repository source".into());
-    }
     Ok(configured)
 }
 

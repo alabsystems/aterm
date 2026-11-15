@@ -115,7 +115,9 @@ impl Drop for Spawning {
 
 /// Hold across the one call that copies this process's descriptor table into a child
 /// (`posix_spawn`, `fork`), and only that call: a descriptor created through
-/// [`crate::kept_out`] waits for it, and no spawn waits for another.
+/// [`crate::kept_out`] waits for it, and no spawn waits for another. A `std::process::Command`
+/// spawn is not that call (with a `pre_exec` hook it forks and then waits for the child's
+/// `exec`): it goes through [`spawn_std`], which releases the hold at the fork.
 ///
 /// Off Apple it holds nothing. On a thread inside [`crate::kept_out`]'s `create` (which must not
 /// spawn) it holds nothing either, as that thread already excludes every spawn.
@@ -205,6 +207,41 @@ impl Drop for Handing {
     }
 }
 
+/// Spawn std's `command`, handing its child `handed` as [`handing`] does, with the spawn lock held
+/// across its fork alone.
+///
+/// With a `pre_exec` hook (every reviewed std spawn has one: [`crate::spawnfd::InheritNothing`])
+/// std forks and then blocks its parent on the exec-status pipe until the child execs or fails,
+/// which under load (the kernel's and `syspolicyd`'s checks of the new image) takes seconds. A
+/// guard held around `command.spawn()` would hold the lock across all of that, and every creation
+/// ([`crate::kept_out`]: each `accept`, each socket and pipe of this process) would wait for
+/// another process's exec. Here the hold ends in the fork's parent half (a `pthread_atfork`
+/// handler on the forking thread), once the child has its copy of the descriptor table and before
+/// std waits: each handed descriptor's mark is back and the lock is released then. A spawn that
+/// never forks (it failed first, or std chose `posix_spawn`, which is itself the copy) releases it
+/// when `spawn` returns.
+///
+/// Off Apple, `command.spawn()`: the lock holds nothing there.
+///
+/// # Errors
+/// `spawn`'s, or on Apple `pthread_atfork`'s when the release handler cannot be registered (then
+/// nothing is spawned).
+#[cfg(unix)]
+pub fn spawn_std(
+    command: &mut crate::spawnfd::StdCommand,
+    handed: &[std::os::fd::RawFd],
+) -> io::Result<std::process::Child> {
+    #[cfg(target_vendor = "apple")]
+    {
+        apple::spawn_std(command, handed)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = handed;
+        command.spawn()
+    }
+}
+
 /// Run `create` and then `mark` with no spawn in flight: the body of [`crate::kept_out`].
 #[cfg(unix)]
 pub(crate) fn creating<T, E>(
@@ -234,6 +271,137 @@ mod apple {
         /// creation takes nothing more and a spawn (which `create` must not make) does not wait
         /// for itself.
         static CREATING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Apple's `pthread_key_t`.
+    type PthreadKey = std::ffi::c_ulong;
+
+    // Apple's libc crate binds none of these.
+    unsafe extern "C" {
+        fn pthread_atfork(
+            prepare: Option<extern "C" fn()>,
+            parent: Option<extern "C" fn()>,
+            child: Option<extern "C" fn()>,
+        ) -> std::ffi::c_int;
+        fn pthread_key_create(
+            key: *mut PthreadKey,
+            destructor: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+        ) -> std::ffi::c_int;
+        fn pthread_getspecific(key: PthreadKey) -> *mut std::ffi::c_void;
+        fn pthread_setspecific(key: PthreadKey, value: *const std::ffi::c_void) -> std::ffi::c_int;
+    }
+
+    /// A std spawn in flight on one thread ([`spawn_std`]).
+    struct InFlight {
+        /// The spawn's hold, which the fork's parent half releases ([`released_at_fork`]); it is
+        /// still here when the spawn returns only where the spawn made no fork.
+        hold: Option<super::Handing>,
+        /// The process that armed it. A child forked with it armed has a copy, which a fork of
+        /// its own (in a `pre_exec` hook) must not release, as no lock call is safe there.
+        armed_by: libc::pid_t,
+    }
+
+    /// The pthread key under which a thread keeps its [`InFlight`] while it is inside
+    /// [`spawn_std`], or the errno that refused the key or the fork handler. A key and not a
+    /// `thread_local!`: every thread of the process pays for the image's whole thread-local
+    /// template (`aterm-gui`'s `thread_local_template` test), and only a thread that spawns
+    /// needs this slot.
+    static IN_FLIGHT: std::sync::OnceLock<Result<PthreadKey, std::ffi::c_int>> =
+        std::sync::OnceLock::new();
+
+    /// The key, made with the fork handler registered, once.
+    fn in_flight_key() -> std::io::Result<PthreadKey> {
+        IN_FLIGHT
+            .get_or_init(|| {
+                let mut key: PthreadKey = 0;
+                // SAFETY: `key` is a live out-parameter, and no destructor is registered: the
+                // slot is emptied before `spawn_std` returns or unwinds (`Armed`).
+                let made = unsafe { pthread_key_create(&raw mut key, None) };
+                if made != 0 {
+                    return Err(made);
+                }
+                // SAFETY: registers one `extern "C"` function that lives as long as the process
+                // and cannot unwind.
+                let registered = unsafe { pthread_atfork(None, Some(released_at_fork), None) };
+                if registered != 0 {
+                    return Err(registered);
+                }
+                Ok(key)
+            })
+            .map_err(std::io::Error::from_raw_os_error)
+    }
+
+    /// The `pthread_atfork` parent handler: on the forking thread, once `fork(2)` has returned
+    /// in the parent. It releases the hold of a std spawn in flight on this thread (each handed
+    /// descriptor marked again first, then the lock), and does nothing for any other fork. It
+    /// cannot unwind: it reads one slot, and the release only sets flags and unlocks.
+    extern "C" fn released_at_fork() {
+        let Some(&Ok(key)) = IN_FLIGHT.get() else {
+            return;
+        };
+        // SAFETY: `key` is the live key `in_flight_key` made; the slot holds null or the
+        // `InFlight` this thread's `spawn_std` boxed, which stays allocated until its `Armed`
+        // drops, after `fork` (and so this handler) has returned.
+        let Some(in_flight) = (unsafe { pthread_getspecific(key).cast::<InFlight>().as_mut() })
+        else {
+            return;
+        };
+        // SAFETY: `getpid` takes nothing and cannot fail.
+        if in_flight.armed_by == unsafe { libc::getpid() } {
+            drop(in_flight.hold.take());
+        }
+    }
+
+    /// Empties the thread's slot when [`spawn_std`]'s spawn returns (or unwinds), releasing a
+    /// hold the fork did not.
+    struct Armed(PthreadKey);
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            // SAFETY: the key is live; the slot holds null or the pointer `spawn_std` took from
+            // `Box::into_raw` on this thread, which nothing else frees.
+            let in_flight = unsafe { pthread_getspecific(self.0).cast::<InFlight>() };
+            // SAFETY: a non-null slot names that live box, and no other reference to it exists:
+            // the fork handler's ended when `fork` returned.
+            let Some(live) = (unsafe { in_flight.as_mut() }) else {
+                return;
+            };
+            // Released and disarmed before the slot is emptied, so that a store the system
+            // refuses still leaves nothing held and nothing a later fork's handler would release.
+            drop(live.hold.take());
+            live.armed_by = 0;
+            // SAFETY: the key is live. Once the slot no longer names the box it is owned here
+            // alone. A refused store keeps the disarmed box allocated, since the slot still
+            // names it and a later fork on this thread reads it.
+            unsafe {
+                if pthread_setspecific(self.0, std::ptr::null()) == 0 {
+                    drop(Box::from_raw(in_flight));
+                }
+            }
+        }
+    }
+
+    /// [`super::spawn_std`] on Apple.
+    pub(super) fn spawn_std(
+        command: &mut crate::spawnfd::StdCommand,
+        handed: &[std::os::fd::RawFd],
+    ) -> std::io::Result<std::process::Child> {
+        let key = in_flight_key()?;
+        let in_flight = Box::into_raw(Box::new(InFlight {
+            hold: Some(super::handing(handed)),
+            // SAFETY: `getpid` takes nothing and cannot fail.
+            armed_by: unsafe { libc::getpid() },
+        }));
+        // SAFETY: the key is live, and the pointer is this thread's own until `Armed` frees it.
+        let stored = unsafe { pthread_setspecific(key, in_flight.cast_const().cast()) };
+        if stored != 0 {
+            // SAFETY: the store was refused, so the box is still owned here alone; dropping it
+            // releases the hold before anything is spawned.
+            drop(unsafe { Box::from_raw(in_flight) });
+            return Err(std::io::Error::from_raw_os_error(stored));
+        }
+        let _armed = Armed(key);
+        command.spawn()
     }
 
     /// [`super::spawning`]'s guard: `None` on a thread that already holds the lock exclusively.

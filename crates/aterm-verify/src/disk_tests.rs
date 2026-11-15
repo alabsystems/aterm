@@ -11,7 +11,7 @@ fn nonincremental_observations_cannot_bound_incremental_runs() {
         crate::EnvSnapshot::default(),
         PathBuf::from("/tmp/x"),
     )
-    .with_checks(&[Check::Lint, Check::Test, Check::Doc]);
+    .with_checks(&[Check::Lint, Check::Test]);
     let lean = selection_of(&ctx);
     let mut old = lean.clone();
     old.work = old.work.replace(" --no-incremental", "");
@@ -389,10 +389,8 @@ fn a_runs_selection_is_its_work_and_the_crates_it_did_it_for() {
         sel("cells--pulled cells:tree lint", Some(&["a"]))
     );
     assert_eq!(
-        selection_of(
-            &at(p(&["a"]), &[Check::Test, Check::Doc, Check::Lint]).with_checkers_in_tests(true)
-        ),
-        sel("as-release doc lint test", Some(&["a"]))
+        selection_of(&at(p(&["a"]), &[Check::Test, Check::Lint]).with_checkers_in_tests(true)),
+        sel("as-release lint test", Some(&["a"]))
     );
     assert_eq!(
         selection_of(&at(p(&["a"]), &[Check::Lint]).with_checkers_in_tests(true)),
@@ -402,8 +400,8 @@ fn a_runs_selection_is_its_work_and_the_crates_it_did_it_for() {
     // export-scan writes its export into the run's temporary directory, which no footprint
     // measures, so it is not in the work: a run with it and one without write the same.
     let dev = at(p(&["a"]), &crate::checks::DEV);
-    assert_eq!(selection_of(&dev), sel("doc lint test", Some(&["a"])));
-    assert_eq!(scope_of(&dev), "doc lint test -p a --no-incremental");
+    assert_eq!(selection_of(&dev), sel("lint test", Some(&["a"])));
+    assert_eq!(scope_of(&dev), "lint test -p a --no-incremental");
     assert!(
         run_of(&at(
             p(&["a"]),
@@ -444,13 +442,13 @@ fn a_kept_run_of_more_checks_bounds_a_run_of_fewer() {
         scope: None,
     };
     let mut m = aterm_capacity::MachineFootprints::default();
-    m.push(kept("doc lint test--compile-only"), wrote(9));
+    m.push(kept("lint test--compile-only"), wrote(9));
     assert_eq!(
         m.cover(&asked, 0, COLD_BYTES),
         None,
         "a compile-only test did less"
     );
-    m.push(kept("cells:tree doc lint test"), wrote(3));
+    m.push(kept("cells:tree lint test"), wrote(3));
     let cover = m
         .cover(&asked, 0, COLD_BYTES)
         .expect("the wider run covers it");
@@ -466,12 +464,11 @@ fn a_kept_run_of_more_checks_bounds_a_run_of_fewer() {
 /// ([`atpkg::admit_disk::Selection::does`]), and a run without it bounds one with it. `measure`
 /// with no `--app` builds nothing (its measuring stages are named skips, its prebuild is not
 /// planned), and with `--app` builds the measuring benches, so the absent app is the narrowing
-/// (`measure--no-app`). `--compile-only` keeps the test compile alone of the whole plan, so it
-/// narrows a pulled `wasm-smoke` too, and `--cursor-pacing` keeps the burst alone.
+/// (`measure--no-app`). `--compile-only` keeps the test compile alone of the whole plan, and
+/// `--cursor-pacing` keeps the burst alone.
 /// NEGATIVE CONTROLS, each the direction that would under-claim: a no-app `measure` run does
-/// not bound one with `--app`; a compile-only `test` run that pulled `wasm-smoke` (which then
-/// did not run) does not bound a `wasm-smoke` run; a cursor-pacing run does not bound a whole
-/// `measure` run.
+/// not bound one with `--app`; a compile-only `test` run does not bound a `test` run; a
+/// cursor-pacing run does not bound a whole `measure` run.
 #[test]
 fn a_narrowing_word_is_a_run_that_does_less() {
     let at = |scope: crate::Scope, checks: &[Check]| {
@@ -506,17 +503,11 @@ fn a_narrowing_word_is_a_run_that_does_less() {
     assert!(!pacing.does(&with_app));
     assert!(with_app.does(&pacing));
 
-    let compiled =
-        selection_of(&at(whole(), &[Check::Test, Check::WasmSmoke]).with_compile_only(true));
-    assert_eq!(compiled, sel("--compile-only test wasm-smoke:tree"));
-    assert!(
-        !compiled.does(&sel("wasm-smoke:tree")),
-        "it ran no wasm smoke"
-    );
-    assert!(!compiled.does(&sel("test wasm-smoke:tree")));
-    assert!(compiled.does(&sel("--compile-only test")));
-    let ran = selection_of(&at(whole(), &[Check::Test, Check::WasmSmoke]));
-    assert!(ran.does(&compiled), "a run of both did more");
+    let compiled = selection_of(&at(whole(), &[Check::Test]).with_compile_only(true));
+    assert_eq!(compiled, sel("--compile-only test"));
+    assert!(!compiled.does(&sel("test")), "it ran no test");
+    let ran = selection_of(&at(whole(), &[Check::Test]));
+    assert!(ran.does(&compiled), "a run of the tests did more");
 
     let windowless = selection_of(&at(whole(), &[Check::Appkit]).with_no_windows(true));
     let windowed = selection_of(&at(whole(), &[Check::Appkit]));

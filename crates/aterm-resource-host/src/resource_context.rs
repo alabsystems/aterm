@@ -125,7 +125,9 @@ fn serve_role(
         return Err(refused());
     }
     let response = match observe(peer, query.clone()) {
-        Ok(reply) if !require_sdk || reply.context.sdk.is_some() => ContextResponse::Ready(reply),
+        Ok(reply) if !require_sdk || reply.context.sdk.is_some() => {
+            ContextResponse::Ready(Box::new(reply))
+        }
         Ok(_) => ContextResponse::Unavailable(ContextUnavailable::for_query(
             &query,
             "original inherited SDK keeper unavailable".into(),

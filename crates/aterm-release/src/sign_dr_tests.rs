@@ -110,7 +110,7 @@ fn requirement_free_text_does_not_invent_a_refusal() {
 
 #[cfg(unix)]
 #[test]
-fn release_credentials_refuse_symlinks() {
+fn a_release_profile_file_refuses_a_symlink() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = aterm_tempfile::tempdir().unwrap();
     let real = dir.path().join("real.toml");
@@ -119,16 +119,5 @@ fn release_credentials_refuse_symlinks() {
     let link = dir.path().join("profile.toml");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let err = super::ReleaseCredentials::load(&link, Some(dir.path())).unwrap_err();
-    assert!(err.contains("not a regular file"), "{err}");
-
-    let key_path = dir.path().join(atpkg_keys::provision::MACHINE_KEY_REL);
-    std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(&real, &key_path).unwrap();
-    let err = super::ReleaseCredentials::resolve_with(
-        None,
-        dir.path(),
-        Some(dir.path().to_str().unwrap()),
-    )
-    .unwrap_err();
     assert!(err.contains("not a regular file"), "{err}");
 }

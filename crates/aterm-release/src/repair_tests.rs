@@ -465,26 +465,26 @@ fn a_reports_last_verdict_line_names_the_fix_or_the_reason() {
 #[test]
 fn a_workers_report_is_read_from_its_task_state_then_its_verdict() {
     use crate::pump::Report;
-    let unread = || -> Result<String, String> { panic!("a working task's result is not read") };
+    let unread = |_| -> Result<String, String> { panic!("a working task's result is not read") };
     assert_eq!(
         report_from(Ok("OK state=working rev=3 from=s-1".into()), unread),
         Report::Working
     );
     assert_eq!(
-        report_from(Ok("OK state=done rev=9".into()), || Ok(format!(
+        report_from(Ok("OK state=done rev=9".into()), |_| Ok(format!(
             "done\nFIX {HOP}"
         ))),
         Report::Fix(HOP.into())
     );
     assert_eq!(
-        report_from(Ok("OK state=exited rev=9".into()), || Ok(
+        report_from(Ok("OK state=exited rev=9".into()), |_| Ok(
             "NO-FIX a credential".into()
         )),
         Report::NoFix("a credential".into())
     );
     assert!(matches!(
-        report_from(Ok("OK state=stalled rev=2".into()), || Ok("ran out".into())),
-        Report::NoFix(why) if why.contains("stalled")
+        report_from(Ok("OK state=stalled rev=2".into()), |_| Ok("ran out".into())),
+        Report::NoFix(why) if why.contains("stalled") && why.contains("none of its replies")
     ));
     assert_eq!(
         report_from(Err("no aterm answered".into()), unread),
@@ -495,7 +495,7 @@ fn a_workers_report_is_read_from_its_task_state_then_its_verdict() {
         Report::Unread(why) if why.contains("names no state")
     ));
     assert_eq!(
-        report_from(Ok("OK state=done".into()), || Err(
+        report_from(Ok("OK state=done".into()), |_| Err(
             "result unavailable".into()
         )),
         Report::Unread("result unavailable".into())
@@ -505,14 +505,14 @@ fn a_workers_report_is_read_from_its_task_state_then_its_verdict() {
     // as a worker still on it, and it is not unread for good.
     // NEGATIVE CONTROL: read as Working (or Unread), the pump waits on it without end.
     assert_eq!(
-        report_from(Ok("OK state=failed rev=4".into()), || Ok(format!(
+        report_from(Ok("OK state=failed rev=4".into()), |_| Ok(format!(
             "it broke\nFIX {HOP}"
         ))),
         Report::Fix(HOP.into()),
         "a failed task that still named its fix"
     );
     assert!(matches!(
-        report_from(Ok("OK state=failed rev=4".into()), || Ok("it broke".into())),
+        report_from(Ok("OK state=failed rev=4".into()), |_| Ok("it broke".into())),
         Report::NoFix(why) if why.contains("failed")
     ));
     assert_eq!(
@@ -525,7 +525,7 @@ fn a_workers_report_is_read_from_its_task_state_then_its_verdict() {
         Report::NoFix(why) if why.contains("its session is gone")
     ));
     assert!(matches!(
-        report_from(Ok("OK state=done".into()), || Err(gone.into())),
+        report_from(Ok("OK state=done".into()), |_| Err(gone.into())),
         Report::NoFix(why) if why.contains("its session is gone")
     ));
     // A state this does not know is still working: only a named end is one.
@@ -533,6 +533,60 @@ fn a_workers_report_is_read_from_its_task_state_then_its_verdict() {
         report_from(Ok("OK state=paused".into()), unread),
         Report::Working
     );
+
+    // R43: under Autopilot Land the last reply answers the land check; the fix was named in
+    // the reply before it. The newest verdict line across the whole exchange is the answer.
+    let land = |full: bool| -> Result<String, String> {
+        Ok(if full {
+            format!(
+                "What to do: ... end your report with one line: `NO-FIX <what it is>`.\n\
+                 Fixed the cause.\nFIX {HOP}\n[aterm harness] Land check: ... reply with only \
+                 LANDED\nLANDED\n"
+            )
+        } else {
+            "LANDED\n".into()
+        })
+    };
+    assert_eq!(
+        report_from(Ok("OK state=done rev=7".into()), land),
+        Report::Fix(HOP.into()),
+        "a fix named before the land check's LANDED"
+    );
+    // The newest line wins: a NO-FIX after an earlier FIX is the worker's last word.
+    assert_eq!(
+        report_from(Ok("OK state=done rev=7".into()), |full: bool| Ok(if full {
+            format!("FIX {HOP}\nthe fix did not hold\nNO-FIX this machine\nLANDED\n")
+        } else {
+            "LANDED".into()
+        })),
+        Report::NoFix("this machine".into())
+    );
+    // The last reply's own verdict is taken without reading the exchange.
+    assert_eq!(
+        report_from(Ok("OK state=done rev=7".into()), |full: bool| {
+            assert!(!full, "a verdict in the last reply reads no more");
+            Ok(format!("FIX {HOP}"))
+        }),
+        Report::Fix(HOP.into())
+    );
+    // NEGATIVE CONTROL: an exchange with neither line (the task prompt's wording alone) is
+    // still no fix, and so is one that cannot be read.
+    assert!(matches!(
+        report_from(Ok("OK state=done rev=7".into()), |full: bool| Ok(if full {
+            "end your report with one line: `NO-FIX <what it is>`.\nworked on it\nLANDED\n".into()
+        } else {
+            "LANDED".into()
+        })),
+        Report::NoFix(why) if why.contains("none of its replies")
+    ));
+    assert!(matches!(
+        report_from(Ok("OK state=done rev=7".into()), |full: bool| if full {
+            Err("ERR result unavailable why=no-transcript".into())
+        } else {
+            Ok("LANDED".into())
+        }),
+        Report::NoFix(why) if why.contains("could not be read") && why.contains("no-transcript")
+    ));
 }
 
 /// ONE RED OF `--open-next` IS ONE FAILURE AT EVERY TIP. Each try judges whatever commit main's

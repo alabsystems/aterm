@@ -18,6 +18,7 @@ fn facts(policy: SupervisorConfig) -> PolicyFacts {
     PolicyFacts {
         generation: 7,
         codex_rotation: false,
+        codex_login_rotation: false,
         effective: effective(&policy, posture()),
         policy,
         session_questions: None,
@@ -55,6 +56,43 @@ fn quota_capability_requires_host_support_and_is_owner_only() {
     assert!(bound.bytes().all(|b| b.is_ascii_digit()), "{bound}");
     for word in WORDS {
         assert_eq!(field(&reply(&value, None, false), word), None, "{word}");
+    }
+    assert_eq!(
+        field(&line, "codex_rotation_login"),
+        None,
+        "the quota words alone"
+    );
+}
+
+/// THE LOST-LOGIN MOVE'S WORD IS THE OWNER'S, AND STANDS APART FROM THE QUOTA WORDS: with the
+/// native policy's login rotation on, the owner's reply carries ` codex_rotation_login=1` whether
+/// or not quota rotation is on, and the quota words are as they were; with it off, or for an edge
+/// token, the reply carries no such word.
+#[test]
+fn the_lost_login_word_is_owner_only_and_independent_of_the_quota_words() {
+    for quota in [false, true] {
+        let mut value = facts(SupervisorConfig::default());
+        value.codex_rotation = quota;
+        let without = reply(&value, None, true);
+        assert_eq!(field(&without, "codex_rotation_login"), None, "{without}");
+        value.codex_login_rotation = true;
+        let line = reply(&value, None, true);
+        assert_eq!(field(&line, "codex_rotation_login").as_deref(), Some("1"));
+        assert_eq!(
+            field(&line, "codex_rotation"),
+            field(&without, "codex_rotation"),
+            "quota={quota}"
+        );
+        assert_eq!(
+            field(&line, "codex_rotation_five_hour"),
+            field(&without, "codex_rotation_five_hour"),
+            "quota={quota}"
+        );
+        assert_eq!(
+            field(&reply(&value, None, false), "codex_rotation_login"),
+            None
+        );
+        assert_eq!(reply(&value, None, false), "OK effective=on\n");
     }
 }
 
@@ -150,7 +188,10 @@ fn every_refusal_reads_its_own_word_first_refusal_first() {
         (true, "enabled")
     );
     let table_off = SupervisorConfig {
-        autopilot: Autopilot::Off,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot: Autopilot::Off,
+            ..full.turn_end.clone()
+        },
         ..full
     };
     assert_eq!(effective(&table_off, posture()), (false, "autopilot-off"));
@@ -212,7 +253,7 @@ fn the_owners_reply_is_every_key_in_its_own_spelling_and_reads_back() {
     assert_eq!(back.texts(), cfg.texts());
     assert_eq!(
         field(&line, "continue_text").map(|v| aterm_control::wire::pct_decode(&v)),
-        Some(cfg.continue_text.clone())
+        Some(cfg.turn_end.continue_text.clone())
     );
 }
 
@@ -272,7 +313,7 @@ fn continue_text_carries_the_standing_rules_as_the_loops_continuation_does() {
     let line = reply(&facts(cfg.clone()), Some("never force-push"), true);
     let text = aterm_control::wire::pct_decode(&field(&line, "continue_text").expect("a text"));
     assert_eq!(text, continuation_text(&cfg, Some("never force-push")));
-    assert_ne!(text, cfg.continue_text);
+    assert_ne!(text, cfg.turn_end.continue_text);
     assert!(text.ends_with("never force-push)"), "{text}");
 }
 
@@ -317,8 +358,9 @@ fn act_texts_of(line: &str) -> Vec<(&'static str, String)> {
 
 #[test]
 fn the_texts_are_the_loops_own_words_composed_as_it_composes_them() {
-    use aterm_agent::supervise::policy::turn_end::{
-        LAND, LAND_ANSWER, LAND_CHECK, LAND_NUDGE, done_check_words,
+    use alab_policy::{
+        land_check::LAND_CHECK,
+        words::{LAND, LAND_ANSWER, LAND_NUDGE, done_check_words},
     };
     let cfg = SupervisorConfig::default();
     let bare = act_texts_of(&reply(&facts(cfg.clone()), None, true));
@@ -374,9 +416,7 @@ fn the_texts_are_the_loops_own_words_composed_as_it_composes_them() {
 /// (that needs aterm's reader of the report).
 #[test]
 fn land_check_text_is_served_by_harness_policy() {
-    use aterm_agent::supervise::policy::land_check::{
-        LAND_CHECK, LAND_CHECK_HEAD, LAND_CHECK_HINT_OPEN,
-    };
+    use alab_policy::land_check::{LAND_CHECK, LAND_CHECK_HEAD, LAND_CHECK_HINT_OPEN};
     let rules = "never force-push";
     for (rules, want) in [
         (None, LAND_CHECK.to_string()),
@@ -404,9 +444,8 @@ fn land_check_text_is_served_by_harness_policy() {
 /// hold.
 #[test]
 fn the_angles_round_trip_and_a_reply_without_them_reads_as_one_text() {
-    use aterm_agent::supervise::policy::turn_end::{
-        DONE_CHECK, DONE_CHECK_FIXED_BEFORE, done_check_act,
-    };
+    use alab_policy::words::{DONE_CHECK, DONE_CHECK_FIXED_BEFORE};
+    use aterm_agent::supervise::policy::turn_end::done_check_act;
     let cfg = SupervisorConfig::default();
     let rules = "never force-push";
     let line = reply(&facts(cfg), Some(rules), true);
@@ -469,7 +508,10 @@ fn the_angles_round_trip_and_a_reply_without_them_reads_as_one_text() {
 #[test]
 fn lands_dialog_text_is_its_own_key_and_questions_never_says_land() {
     let land = SupervisorConfig {
-        autopilot: Autopilot::Land,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot: Autopilot::Land,
+            ..alab_policy::config::PolicyConfig::default()
+        },
         ..SupervisorConfig::default()
     };
     let line = reply(&facts(land.clone()), Some("never force-push"), true);

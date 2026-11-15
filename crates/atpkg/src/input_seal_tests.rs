@@ -719,6 +719,36 @@ fn another_os_build_hashes_again_into_another_identity() {
     assert!(bench.opened > opened, "it read the inputs again");
 }
 
+/// A held seal names its content digest apart from the facts: another OS build is another
+/// identity over the same digest, which is the walk's of the roots. NEGATIVE CONTROLS: a take
+/// whose inputs had not settled holds no seal and so names no digest; changed content is
+/// another digest.
+#[cfg(unix)]
+#[test]
+fn a_held_seal_names_its_content_digest_apart_from_the_facts() {
+    let mut bench = Bench::new();
+    let mut process = process(None, None);
+    assert_eq!(process.digest(), None, "no call, no seal");
+    let before = bench.ask(&mut process).unwrap();
+    let walked = digest_roots(&[("inputs", &bench.root)]).unwrap();
+    assert_eq!(process.digest(), Some(walked.as_str()));
+    bench.os_build = Some("25C5".into());
+    let after = bench.ask(&mut process).unwrap();
+    assert_ne!(after, before, "the facts are in the identity");
+    assert_eq!(
+        process.digest(),
+        Some(walked.as_str()),
+        "and not in the digest"
+    );
+    std::fs::write(bench.root.join("lib/std.rlib"), "std, rebuilt").unwrap();
+    bench.ask(&mut process).unwrap();
+    assert_ne!(process.digest(), Some(walked.as_str()));
+    let mut unsettled = Process::unstarted(TEST);
+    bench.settled = false;
+    bench.ask(&mut unsettled).unwrap();
+    assert_eq!(unsettled.digest(), None);
+}
+
 /// Another Trust build is another identity, hashed again though no input's status moved: a
 /// seal names the build it covers. CONTROL: the same build holds. NEGATIVE CONTROL: drop
 /// [`Facts::trust_build`] from [`identity_under`], and both builds read one identity.

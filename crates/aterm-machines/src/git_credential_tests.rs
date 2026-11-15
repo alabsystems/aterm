@@ -857,8 +857,8 @@ fn lookups_ask_atermss_helper_alone_and_hand_back_only_the_token() {
 }
 
 /// A network git carries aterm's route last on the command line: the helper list
-/// and the account reset, then aterm's helper by the launcher's path, the options a token
-/// file names shell-quoted; with no helper, the resets alone. A helper that would ask in a
+/// and the account reset, then aterm's helper by the launcher's path, shell-quoted; with no
+/// helper, the resets alone. A helper that would ask in a
 /// window is told not to, and the read-back names no account.
 #[test]
 fn the_route_resets_every_helper_then_names_atermss_own() {
@@ -872,20 +872,6 @@ fn the_route_resets_every_helper_then_names_atermss_own() {
          credential fill"
     );
     let sys = Fake::default();
-    script::launcher(&sys, &who);
-    let helper = Helper::token_file(
-        &sys,
-        &who,
-        "alice",
-        Path::new("/Users//alice/my secrets/github.env"),
-        Some("GH_TOKEN"),
-    )
-    .unwrap();
-    assert_eq!(
-        helper.value(),
-        "!/Users//alice/.local/bin/aterm secrets git-credential --dev-user alice \
-         --token-file '/Users//alice/my secrets/github.env' --token-key GH_TOKEN"
-    );
     let bare = pinned(Cmd::new("/usr/bin/git"), None)
         .arg("fetch")
         .display();
@@ -943,10 +929,6 @@ fn helper_requires_a_nonempty_executable_launcher() {
             }
             let admitted = executable && !bytes.is_empty();
             assert_eq!(Helper::vault(&sys, &who).is_some(), admitted);
-            assert_eq!(
-                Helper::token_file(&sys, &who, "alice", Path::new("/token"), None).is_some(),
-                admitted
-            );
         }
     }
     let sys = Fake::default();

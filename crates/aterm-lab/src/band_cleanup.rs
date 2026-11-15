@@ -59,6 +59,14 @@ impl std::fmt::Display for CleanupError {
 }
 impl std::error::Error for CleanupError {}
 
+pub(super) fn invalid_identity() -> CleanupError {
+    CleanupError::new(
+        CleanupFailure::Unknown,
+        "identity",
+        "job label differs from its original world, owner and launch generation",
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Registration {
     Present,

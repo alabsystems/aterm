@@ -10,7 +10,7 @@ use aterm_net::fleet_member::name_record::{ByKind, FLOOR_MS};
 use aterm_secrets::client::LabLabels;
 use aterm_types::machine_name::{Nickname, Number};
 
-use super::{change_nickname, change_number, naming};
+use super::{change_nickname, change_number, change_undo, naming};
 
 const NOW: u64 = FLOOR_MS + 300 * 86_400_000;
 
@@ -139,21 +139,28 @@ impl publish::SystemNames for Names {
     }
 }
 
+/// Set `scratch`'s name to `number` and Heron, as a person's rename does, at `at`.
+fn renamed(scratch: &Scratch, number: u32, at: u64) -> file::MachineName {
+    set_name(
+        &scratch.state,
+        &request(number),
+        || Ok(LabLabels::default()),
+        ByKind::Person,
+        || Ok(None),
+        at,
+        false,
+    )
+    .unwrap()
+    .name
+}
+
 #[test]
 fn naming_policy_refuses_before_the_canonical_set_or_any_system_operation() {
     for policy in ["[identity]\nname = false\n", "[identity\n"] {
         let scratch = fresh();
-        let before = set_name(
-            &scratch.state,
-            &request(8),
-            || Ok(LabLabels::default()),
-            ByKind::Person,
-            || Ok(None),
-            NOW,
-            false,
-        )
-        .unwrap()
-        .name;
+        renamed(&scratch, 8, NOW);
+        // A second rename, so Undo Last Rename has m8 to take back and a number to publish.
+        let before = renamed(&scratch, 9, NOW);
         std::fs::write(&scratch.config, policy).unwrap();
         let names = Names::new(false);
         assert!(
@@ -179,10 +186,103 @@ fn naming_policy_refuses_before_the_canonical_set_or_any_system_operation() {
             )
             .is_err()
         );
+        assert!(
+            change_undo(
+                &scratch.state,
+                &scratch.config,
+                &before.history[0],
+                &names,
+                || panic!("a rejected policy must not enter the undo"),
+                || panic!("a rejected policy must not read the roster"),
+                NOW + 1,
+            )
+            .is_err()
+        );
         assert_eq!(file::read(&scratch.state).unwrap(), Some(before));
         assert_eq!(std::fs::read(&scratch.config).unwrap(), policy.as_bytes());
         assert!(names.calls.borrow().is_empty());
     }
+}
+
+/// Undo Last Rename takes back the change the page showed and publishes what it leaves as a
+/// Save does: the number goes back, History records the undo over the change it marks undone,
+/// and macOS is given the names of the number it went back to.
+/// NEGATIVE CONTROL: a change shown before a later rename is no longer History's newest, so the
+/// undo is refused as `undo_last` refuses it (`Unseen`), writing nothing and publishing nothing.
+#[test]
+fn an_undo_takes_back_the_last_change_and_publishes_it_as_a_set_does() {
+    use aterm_agent::machine_name::{Cause, Refused, undo_last};
+    use file::Why;
+    let scratch = fresh();
+    renamed(&scratch, 8, NOW);
+    let seen = renamed(&scratch, 86, NOW).history[0].clone();
+    let names = Names::new(false);
+    let undone = change_undo(
+        &scratch.state,
+        &scratch.config,
+        &seen,
+        &names,
+        || Ok(LabLabels::default()),
+        || Ok(None),
+        NOW + 2,
+    )
+    .expect("the undo");
+    assert!(undone.changed);
+    assert!(undone.publication.is_none(), "{:?}", undone.publication);
+    let saved = file::read(&scratch.state).unwrap().expect("a name");
+    assert_eq!(saved, undone.name);
+    assert_eq!(saved.num, Some(Number::new(8).unwrap()));
+    assert_eq!(saved.history[0].why, Why::Undone);
+    assert!(saved.history[1].undone);
+    assert_eq!(
+        saved.history[1],
+        file::Change {
+            undone: true,
+            ..seen
+        }
+    );
+    assert!(
+        names
+            .calls
+            .borrow()
+            .contains(&Call::Apply(Number::new(8).unwrap())),
+        "{:?}",
+        names.calls.borrow()
+    );
+
+    let scratch = fresh();
+    renamed(&scratch, 8, NOW);
+    let stale = renamed(&scratch, 86, NOW).history[0].clone();
+    let later = renamed(&scratch, 90, NOW + 1);
+    let names = Names::new(false);
+    let Err(refused) = change_undo(
+        &scratch.state,
+        &scratch.config,
+        &stale,
+        &names,
+        || Ok(LabLabels::default()),
+        || Ok(None),
+        NOW + 2,
+    ) else {
+        panic!("the change shown is no longer the newest");
+    };
+    let writer = undo_last(
+        &scratch.state,
+        Some(&stale),
+        || Ok(LabLabels::default()),
+        ByKind::Person,
+        || Ok(None),
+        NOW + 2,
+        true,
+    )
+    .expect_err("undo_last refuses it");
+    assert_eq!(
+        Refused::of(&writer).map(|refused| &refused.cause),
+        Some(&Cause::Unseen)
+    );
+    assert_eq!(refused, writer.to_string());
+    assert_eq!(file::read(&scratch.state).unwrap(), Some(later));
+    assert!(names.calls.borrow().is_empty());
 }
 
 #[test]

@@ -3,13 +3,10 @@
 
 //! Authenticated `agh` read client for an admitted initial-setup development token.
 
-use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt as _;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agh::identity::{EnvSource, ProcessEnv};
+use agh::identity::{InlineToken, ProcessEnv};
 use agh::policy::{RouteRequest, RouteTarget, Router};
 use agh::retry::RetryPolicy;
 use agh::wire::http::HttpTransport;
@@ -18,32 +15,12 @@ use agh::{Call, GithubBuilder};
 use super::{GithubError, GithubFailure, GithubResponse, Secret};
 
 const PROFILE: &str = "initial-setup-development";
-const TOKEN_SOURCE: &str = "ATERM_INITIAL_SETUP_ADMITTED_TOKEN";
 const RESPONSE_MAX: u64 = 1 << 20;
-const CONFIG: &str = "[profiles.initial-setup-development]\n\
-                      env = 'ATERM_INITIAL_SETUP_ADMITTED_TOKEN'\n\
-                      tier = 'dev'\n\
-                      [default]\n\
-                      read = ['initial-setup-development']\n";
-
-struct AdmittedToken(Secret);
-
-impl EnvSource for AdmittedToken {
-    fn var_os(&self, name: &str) -> Option<OsString> {
-        (name == TOKEN_SOURCE).then(|| OsString::from_vec(self.0.bytes().to_vec()))
-    }
-}
 
 fn client(token: &Secret) -> Result<GithubBuilder, String> {
-    let config =
-        agh::config::parse(CONFIG).map_err(|_| "the initial GitHub routing profile is invalid")?;
-    let validated = agh::config::validate(&config, Path::new("/"), &|_| None)
-        .map_err(|_| "the initial GitHub routing profile is invalid")?;
-    let identity = AdmittedToken(
-        Secret::new(token.bytes()).map_err(|_| "the development GitHub token is too long")?,
-    );
-    Ok(GithubBuilder::new(Router::from_validated(validated))
-        .env(Arc::new(identity))
+    let token = InlineToken::new(aterm_uds::secret::Secret::new(token.bytes()))
+        .map_err(|_| "the development GitHub token is not one GitHub token")?;
+    Ok(GithubBuilder::new(Router::default_reader(PROFILE, token))
         .transport(Arc::new(HttpTransport::new(Arc::new(ProcessEnv))))
         .caller("aterm-initial-setup")
         .retry(RetryPolicy::NONE)

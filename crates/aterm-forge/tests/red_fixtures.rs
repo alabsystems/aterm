@@ -190,8 +190,6 @@ impl Fixture {
              version = \"{}\"\n\
              path = \"vendor/{FORK}\"\n\
              license = \"{FORK_LICENSE}\"\n\
-             census.mode = \"scanned\"\n\
-             census.namespace = \"{FORK}\"\n\
              \n",
             fork_version()
         ));

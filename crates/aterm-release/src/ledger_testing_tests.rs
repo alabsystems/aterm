@@ -12,8 +12,9 @@ pub(crate) use aterm_uds::fixture_git::git;
 pub(crate) const CHOSEN_GIT_ENV: &str = "ATERM_FIXTURE_GIT_CHOSEN";
 
 /// The [`GitRunner`](super::GitRunner) a test hands the code under test:
-/// [`GitCli`](super::GitCli)'s `git -C <repo> <args…>`, run by [`git`] (the direct git,
-/// isolated from this machine) rather than the trampolined `git` on PATH.
+/// [`GitCli`](super::GitCli)'s `git -C <repo> <args…>`, its reads under `GIT_NO_LAZY_FETCH=1`,
+/// run by [`git`] (the direct git, isolated from this machine) rather than the trampolined `git`
+/// on PATH.
 pub(crate) struct Git {
     repo: PathBuf,
 }
@@ -46,10 +47,95 @@ impl super::GitRunner for Git {
         })
     }
 
+    fn git_read(&self, args: &[&str]) -> super::Result<super::RunOut> {
+        self.git_env(args, &[("GIT_NO_LAZY_FETCH", "1")])
+    }
+
     fn git_input(&self, args: &[&str], input: &[u8]) -> super::Result<super::RunOut> {
         let mut cmd = git();
         cmd.arg("-C").arg(&self.repo);
         super::run_with_input(cmd, args, input)
+    }
+
+    fn git_read_input(&self, args: &[&str], input: &[u8]) -> super::Result<super::RunOut> {
+        let mut cmd = git();
+        cmd.arg("-C").arg(&self.repo).env("GIT_NO_LAZY_FETCH", "1");
+        super::run_with_input(cmd, args, input)
+    }
+}
+
+/// A promisor pair: `partial.git` lacks the one object `promisor.git` holds (the blob of its own
+/// `HEAD` file) and reaches it only through the `-c` pairs [`Promised::promisor`] names (a local
+/// path, so no fetch leaves this machine), so a git run without them answers for `partial.git`'s
+/// own objects and cannot fetch.
+pub(crate) struct Promised {
+    _dir: aterm_tempfile::TempDir,
+    promisor: PathBuf,
+    /// The bare repository that lacks [`Promised::object`].
+    pub(crate) partial: PathBuf,
+    /// The object only `promisor.git` holds.
+    pub(crate) object: String,
+}
+
+impl Promised {
+    /// # Panics
+    /// When git cannot set the pair up.
+    pub(crate) fn new() -> Self {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("aterm-release-promised-")
+            .suffix(".noindex")
+            .tempdir()
+            .unwrap();
+        let promisor = dir.path().join("promisor.git");
+        let partial = dir.path().join("partial.git");
+        for repository in [&promisor, &partial] {
+            let out = git()
+                .args(["init", "--bare", "--template=", "--quiet", "--"])
+                .arg(repository)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        let out = git()
+            .arg("--git-dir")
+            .arg(&promisor)
+            .args(["hash-object", "-w", "--no-filters", "--"])
+            .arg(promisor.join("HEAD"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let object = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+        Self {
+            _dir: dir,
+            promisor,
+            partial,
+            object,
+        }
+    }
+
+    /// The `-c` pairs that make `promisor.git` `partial.git`'s promisor remote.
+    pub(crate) fn promisor(&self) -> [String; 4] {
+        [
+            "-c".into(),
+            format!("remote.origin.url={}", self.promisor.display()),
+            "-c".into(),
+            "remote.origin.promisor=true".into(),
+        ]
+    }
+
+    /// Whether `partial.git` holds the object now, asked with no promisor named.
+    ///
+    /// # Panics
+    /// When git does not run.
+    pub(crate) fn holds(&self) -> bool {
+        git()
+            .arg("--git-dir")
+            .arg(&self.partial)
+            .args(["cat-file", "-e", &self.object])
+            .output()
+            .unwrap()
+            .status
+            .success()
     }
 }
 

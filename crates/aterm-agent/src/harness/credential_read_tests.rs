@@ -3,18 +3,10 @@
 
 use super::*;
 
+/// A vault under `home` that delivers each of `names`, which this Mac reads in place.
 fn applied(home: &std::path::Path, names: &[&str]) {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = home.join(".config/aterm/secrets");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let state = dir.join("state.toml");
-    let rows: String = names
-        .iter()
-        .map(|n| format!("{n:?} = 'metadata-digest'\n"))
-        .collect();
-    std::fs::write(&state, format!("[manifest]\n{rows}")).unwrap();
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let entries: Vec<(&str, &[u8])> = names.iter().map(|name| (*name, &b"fixture"[..])).collect();
+    crate::vault_entry::seed(home, &entries);
 }
 
 fn resolution<'a>(read: &'a CredentialRead, want: &str) -> &'a Resolution {
@@ -24,7 +16,7 @@ fn resolution<'a>(read: &'a CredentialRead, want: &str) -> &'a Resolution {
     &all.iter().find(|(w, _)| w == want).expect(want).1
 }
 
-/// FOUND: a want the registry holds an entry for resolves to that entry, its pointer and purpose,
+/// FOUND: a want the registry holds an entry for resolves to that entry and its purpose,
 /// and nothing else, never a value; nothing is filed for it.
 #[test]
 fn a_held_want_resolves_to_its_registry_entry() {
@@ -39,10 +31,6 @@ fn a_held_want_resolves_to_its_registry_entry() {
     };
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "release-notary");
-    assert_eq!(
-        entries[0].pointer.as_deref(),
-        Some("~/.secrets/release-notary")
-    );
     assert!(!format!("{read:?}").contains("digest"));
     assert!(
         !home

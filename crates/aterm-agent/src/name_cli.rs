@@ -16,13 +16,16 @@ aterm name — this machine's name: its NAME (`m8`, or `unnumbered` until it is 
   aterm name sync [--json]
   aterm name set <mN|N> [--nick <word>] [--dry-run] [--json]
   aterm name nick <word> | --random  [--dry-run] [--json]
+  aterm name undo [--dry-run] [--json]
+  aterm name history [--json]
 
   `aterm name` prints `m8 Heron  class=seeded fleet=in node=<node id>` (`fleet=` is in,
   joining, out, paused where custody refuses traffic, or unread where the vault's state cannot be read), or with `--json` one
   object of its fields; the first run to find no `machine-name.toml` makes it. `set` chooses
   this machine's number, optionally its nickname in the same change; a number another signed
-  node currently holds is refused. A successful set also records the explicit naming policy
-  and publishes the checked fleet name. On macOS the existing setup authorization changes all three system names,
+  node currently holds is refused, and the next free numbers above it are named. A successful
+  set also records the explicit naming policy and publishes the checked fleet name. On macOS
+  the existing setup authorization changes all three system names,
   generated from the saved number and nickname. Missing authorization stays pending; this
   command does not open a password prompt.
   `sync` aligns only the three macOS names with the fresh saved number and nickname,
@@ -32,8 +35,14 @@ aterm name — this machine's name: its NAME (`m8`, or `unnumbered` until it is 
   `nick` sets the
   nickname to <word> (one argument: quote `Blue Heron`) or to a noun drawn again, as a chosen
   nickname, and prints the name as it then stands; `--dry-run` changes no nickname (a first
-  run still makes the name, as any read does). `aterm help name` has the page. Unix only for
-  now.
+  run still makes the name, as any read does). `undo` takes back the last change: the number
+  it replaced, checked as `set` checks one (refused while another machine holds it or its
+  vault gives it to another Mac), and the nickname it replaced; an undo is not undone, and
+  none leaves this machine unnumbered; it refuses, changing nothing, when the name changed
+  after it read it. A real undo publishes as `set` and `nick` do.
+  `history` lists the newest 16 changes, newest first: when, why, the name before and
+  after, who made it, and whether it was undone. `aterm help name` has the page. Unix only
+  for now.
 ";
 
 /// What `aterm name …` asks for, decided without running it so a test can read it.
@@ -49,6 +58,10 @@ enum Mode {
     Set { to: Name, dry_run: bool, json: bool },
     /// `nick`: set the nickname, then show the name as `Show` does.
     Nick { to: Nick, dry_run: bool, json: bool },
+    /// `undo`: take back the last change, then show the name as `Show` does.
+    Undo { dry_run: bool, json: bool },
+    /// `history`: the changes History keeps, newest first.
+    History { json: bool },
 }
 
 /// What `aterm name nick` sets the nickname to.
@@ -78,23 +91,53 @@ fn parse(argv: &[OsString]) -> Result<Mode, String> {
     if words.first() == Some(&"set") {
         return parse_set(&words[1..]);
     }
-    let sync = words.first() == Some(&"sync");
-    let words = if sync { &words[1..] } else { &words[..] };
+    if words.first() == Some(&"undo") {
+        return parse_undo(&words[1..]);
+    }
+    let verb = words
+        .first()
+        .copied()
+        .filter(|word| matches!(*word, "sync" | "history"));
+    let words = if verb.is_some() {
+        &words[1..]
+    } else {
+        &words[..]
+    };
     let mut json = false;
     for &word in words {
         match word {
             "-h" | "--help" => return Ok(Mode::Help),
             "--json" if json => return Err("`--json` is given twice".to_owned()),
             "--json" => json = true,
-            "nick" => return Err("`nick` comes first: `aterm name nick …`".to_owned()),
+            "nick" | "undo" | "history" => {
+                return Err(format!("`{word}` comes first: `aterm name {word} …`"));
+            }
             arg => return Err(format!("`{arg}` is no `aterm name` argument")),
         }
     }
-    Ok(if sync {
-        Mode::Sync { json }
-    } else {
-        Mode::Show { json }
+    Ok(match verb {
+        Some("sync") => Mode::Sync { json },
+        Some(_) => Mode::History { json },
+        None => Mode::Show { json },
     })
+}
+
+fn parse_undo(words: &[&str]) -> Result<Mode, String> {
+    if words.iter().any(|word| matches!(*word, "-h" | "--help")) {
+        return Ok(Mode::Help);
+    }
+    let (mut dry_run, mut json) = (false, false);
+    for &word in words {
+        let flag = match word {
+            "--dry-run" => &mut dry_run,
+            "--json" => &mut json,
+            arg => return Err(format!("`{arg}` is no `aterm name undo` argument")),
+        };
+        if std::mem::replace(flag, true) {
+            return Err(format!("`{word}` is given twice"));
+        }
+    }
+    Ok(Mode::Undo { dry_run, json })
 }
 
 fn parse_set(words: &[&str]) -> Result<Mode, String> {
@@ -198,6 +241,8 @@ pub fn main_entry(
         }
         Ok(Mode::Set { to, dry_run, json }) => set(&to, dry_run, json),
         Ok(Mode::Nick { to, dry_run, json }) => nick(&to, dry_run, json),
+        Ok(Mode::Undo { dry_run, json }) => undo(dry_run, json),
+        Ok(Mode::History { json }) => history(json),
         Err(why) => {
             eprintln!("aterm name: {why}\n(`aterm name --help` says what it takes)");
             ExitCode::from(2)
@@ -288,6 +333,16 @@ fn set(to: &Name, dry_run: bool, json: bool) -> ExitCode {
         }
         Err(why) => {
             eprintln!("aterm name: {why}");
+            if let Some(note) = unix::next_free_note(
+                &state,
+                vault.as_ref(),
+                to.num,
+                &why,
+                crate::machine_name::vault_roster_label,
+                aterm_netplace::unix_ms_now(),
+            ) {
+                eprintln!("aterm name: {note}");
+            }
             ExitCode::from(1)
         }
     }
@@ -404,21 +459,7 @@ fn nick(to: &Nick, dry_run: bool, json: bool) -> ExitCode {
         eprintln!("aterm name: no state directory: $HOME is not set");
         return ExitCode::from(1);
     };
-    let policy = (|| {
-        let current = crate::machine_name::file::read(&state).map_err(|why| why.to_string())?;
-        let Some(number) = current
-            .filter(|name| {
-                name.class == aterm_types::machine_name::Class::Chosen
-                    && name.migration != Some(crate::machine_name::file::Migration::Waiting)
-            })
-            .and_then(|name| name.num)
-        else {
-            return Ok(None);
-        };
-        let config = aterm_types::dirs::aterm_config_path().ok_or("no aterm configuration path")?;
-        let policy = crate::machine_name::publish::Policy::read(&config, number)?;
-        Ok::<_, String>(Some((config, policy)))
-    })();
+    let policy = policy_after(&state, crate::machine_name::chosen_number);
     let policy = match policy {
         Ok(policy) => policy,
         Err(why) => {
@@ -476,6 +517,148 @@ fn nick(_to: &Nick, _dry_run: bool, _json: bool) -> ExitCode {
     show(false)
 }
 
+/// aterm.toml's naming policy for `number`, read before the change it publishes, so a naming
+/// hold or an aterm.toml that cannot be edited changes no name: `None` where that change
+/// publishes nothing (`number` is `None`).
+#[cfg(unix)]
+fn policy_for(
+    number: Option<aterm_types::machine_name::Number>,
+) -> Result<Option<(std::path::PathBuf, crate::machine_name::publish::Policy)>, String> {
+    let Some(number) = number else {
+        return Ok(None);
+    };
+    let config = aterm_types::dirs::aterm_config_path().ok_or("no aterm configuration path")?;
+    let policy = crate::machine_name::publish::Policy::read(&config, number)?;
+    Ok(Some((config, policy)))
+}
+
+/// aterm.toml's naming policy ([`policy_for`]) for the number `number` reads off the stored
+/// name, read before the change it publishes.
+#[cfg(unix)]
+fn policy_after(
+    state: &std::path::Path,
+    number: impl FnOnce(
+        &crate::machine_name::file::MachineName,
+    ) -> Option<aterm_types::machine_name::Number>,
+) -> Result<Option<(std::path::PathBuf, crate::machine_name::publish::Policy)>, String> {
+    let current = crate::machine_name::file::read(state).map_err(|why| why.to_string())?;
+    policy_for(current.as_ref().and_then(number))
+}
+
+/// `aterm name undo`: the name is read once, and the policy the undone name publishes under is
+/// read from it first (a dry run's too), as `set` and `nick` read theirs: the number it takes
+/// back, which it claims as chosen, or for a nickname undo the chosen number it keeps
+/// ([`crate::machine_name::undo_publishes`]). Then the undo of the newest change that read
+/// showed, and only that one ([`crate::machine_name::undo_last`]'s `seen`), so the policy read
+/// and the change taken back cannot disagree; then, for a real one, its publication.
+#[cfg(unix)]
+fn undo(dry_run: bool, json: bool) -> ExitCode {
+    let Some(state) = aterm_types::dirs::state_dir() else {
+        eprintln!("aterm name: no state directory: $HOME is not set");
+        return ExitCode::from(1);
+    };
+    let current = match crate::machine_name::file::read(&state) {
+        Ok(current) => current,
+        Err(why) => {
+            eprintln!("aterm name: {why}; no name changed");
+            return ExitCode::from(1);
+        }
+    };
+    let policy = policy_for(
+        current
+            .as_ref()
+            .and_then(crate::machine_name::undo_publishes),
+    );
+    let policy = match policy {
+        Ok(policy) => policy,
+        Err(why) => {
+            eprintln!("aterm name: {why}; no name changed");
+            return ExitCode::from(1);
+        }
+    };
+    let vault = crate::machine_name::standing_vault();
+    let ask = unix::UndoAsk {
+        kind: caller(session_status().as_deref()),
+        dry_run,
+        seen: current.as_ref().and_then(|name| name.history.first()),
+    };
+    match unix::undo(
+        &state,
+        vault.as_ref(),
+        &ask,
+        json,
+        crate::machine_name::vault_roster_label,
+        aterm_netplace::unix_ms_now(),
+    ) {
+        Ok((text, notes)) => {
+            if !dry_run && let Some((config, policy)) = &policy {
+                #[cfg(target_os = "macos")]
+                let system: Option<&dyn crate::machine_name::publish::SystemNames> =
+                    Some(&SystemNaming);
+                #[cfg(not(target_os = "macos"))]
+                let system: Option<&dyn crate::machine_name::publish::SystemNames> = None;
+                if let Err(pending) =
+                    crate::machine_name::publish::publish(&state, config, policy, system)
+                {
+                    eprintln!(
+                        "aterm name: the undo was saved; name synchronization pending: {}",
+                        pending.why()
+                    );
+                    return ExitCode::from(1);
+                }
+            }
+            for note in notes {
+                eprintln!("aterm name: {}", note.text(&state));
+            }
+            aterm_uds::stdout::answer_exit("aterm name", &text, 0)
+        }
+        Err(why) => {
+            eprintln!("aterm name: {why}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn undo(_dry_run: bool, _json: bool) -> ExitCode {
+    show(false)
+}
+
+/// `aterm name history`: the changes History keeps, made first, as any read does, where no
+/// name is there yet.
+#[cfg(unix)]
+fn history(json: bool) -> ExitCode {
+    let Some(state) = aterm_types::dirs::state_dir() else {
+        eprintln!("aterm name: no state directory: $HOME is not set");
+        return ExitCode::from(1);
+    };
+    match unix::history(
+        &state,
+        json,
+        crate::machine_name::vault_roster_label,
+        aterm_netplace::unix_ms_now(),
+    ) {
+        Ok((text, narrowed)) => {
+            if let Some(was) = narrowed {
+                eprintln!(
+                    "aterm name: {} was open to other users ({was:o}); it is 0700 now",
+                    state.display()
+                );
+            }
+            aterm_uds::stdout::answer_exit("aterm name", &text, 0)
+        }
+        Err(why) => {
+            eprintln!("aterm name: {why}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn history(_json: bool) -> ExitCode {
+    show(false)
+}
+
 #[cfg(unix)]
 mod unix {
     use std::io;
@@ -485,7 +668,10 @@ mod unix {
 
     use aterm_secrets::client::Paths;
 
-    use crate::machine_name::file::{MachineName, class_word, migration_word, nick_class_word};
+    use crate::machine_name::file::{
+        Change, MachineName, NO_HISTORY, by_kind_word, class_word, migration_word, nick_class_word,
+        why_word,
+    };
     use crate::machine_name::{InFleet, Origin, ensure_in_view};
 
     /// The report of this machine's name in `state`, made first where no file is there
@@ -581,12 +767,23 @@ mod unix {
         pub(super) dry_run: bool,
     }
 
+    /// What `aterm name undo` asks for: the kind of caller that asks, whether it only says
+    /// what would change, and the newest change the command read, the only one it takes back
+    /// (`None` where it read no name).
+    pub(super) struct UndoAsk<'a> {
+        pub(super) kind: aterm_net::fleet_member::name_record::ByKind,
+        pub(super) dry_run: bool,
+        pub(super) seen: Option<&'a Change>,
+    }
+
     /// Choose a number and optional nickname, then report the resulting or previewed name.
     /// Whether it is in a fleet is [`InFleet::read`] over `state` and the vault at `vault`,
     /// where one is read.
     ///
     /// # Errors
-    /// As [`report`]; the requested change cannot be validated or written ([`crate::machine_name::set_name`]).
+    /// As [`report`]; the requested change cannot be validated or written
+    /// ([`crate::machine_name::set_name`]), a refusal carrying its
+    /// [`crate::machine_name::Refused`].
     pub(super) fn rename(
         state: &Path,
         vault: Option<&Paths>,
@@ -594,13 +791,11 @@ mod unix {
         json: bool,
         roster: impl FnOnce() -> io::Result<Option<String>>,
         now_ms: u64,
-    ) -> Result<(String, Vec<Note>), String> {
+    ) -> io::Result<(String, Vec<Note>)> {
         let NameAsk { to, kind, dry_run } = *ask;
-        let narrowed =
-            aterm_uds::private_file::ensure_private_dir(state).map_err(|e| e.to_string())?;
+        let narrowed = aterm_uds::private_file::ensure_private_dir(state)?;
         let lab = || crate::machine_name::lab_labels(vault);
-        let set = crate::machine_name::set_name(state, to, lab, kind, roster, now_ms, dry_run)
-            .map_err(|e| e.to_string())?;
+        let set = crate::machine_name::set_name(state, to, lab, kind, roster, now_ms, dry_run)?;
         let me = report_node(state);
         let mut notes: Vec<Note> = narrowed.into_iter().map(Note::Narrowed).collect();
         if !set.changed {
@@ -625,7 +820,9 @@ mod unix {
     /// as it stands (or would, after a dry run), with the [`Note`]s said beside it.
     ///
     /// # Errors
-    /// As [`report`]; the requested change cannot be validated or written ([`crate::machine_name::set_nick`]).
+    /// As [`report`]; the requested change cannot be validated or written
+    /// ([`crate::machine_name::set_nick`]), a refusal carrying its
+    /// [`crate::machine_name::Refused`].
     pub(super) fn renick(
         state: &Path,
         vault: Option<&Paths>,
@@ -633,12 +830,10 @@ mod unix {
         json: bool,
         roster: impl FnOnce() -> io::Result<Option<String>>,
         now_ms: u64,
-    ) -> Result<(String, Vec<Note>), String> {
+    ) -> io::Result<(String, Vec<Note>)> {
         let NickAsk { to, kind, dry_run } = *ask;
-        let narrowed =
-            aterm_uds::private_file::ensure_private_dir(state).map_err(|e| e.to_string())?;
-        let set = crate::machine_name::set_nick(state, to, kind, roster, now_ms, dry_run)
-            .map_err(|e| e.to_string())?;
+        let narrowed = aterm_uds::private_file::ensure_private_dir(state)?;
+        let set = crate::machine_name::set_nick(state, to, kind, roster, now_ms, dry_run)?;
         let me = report_node(state);
         let mut notes: Vec<Note> = narrowed.into_iter().map(Note::Narrowed).collect();
         let nick = set.name.display_nick();
@@ -658,6 +853,152 @@ mod unix {
             node: me.as_ref().map(|me| me.node()),
         };
         Ok((if json { shown.json() } else { shown.line() }, notes))
+    }
+
+    /// [`crate::machine_name::undo_last`] as `aterm name undo` runs it, then the report of the
+    /// name as it stands (or would, after a dry run), with the [`Note`]s said beside it.
+    ///
+    /// # Errors
+    /// As [`report`]; there is nothing to take back, or the undo is refused or cannot be written
+    /// ([`crate::machine_name::undo_last`]), a refusal carrying its
+    /// [`crate::machine_name::Refused`].
+    pub(super) fn undo(
+        state: &Path,
+        vault: Option<&Paths>,
+        ask: &UndoAsk<'_>,
+        json: bool,
+        roster: impl FnOnce() -> io::Result<Option<String>>,
+        now_ms: u64,
+    ) -> io::Result<(String, Vec<Note>)> {
+        let UndoAsk {
+            kind,
+            dry_run,
+            seen,
+        } = *ask;
+        let narrowed = aterm_uds::private_file::ensure_private_dir(state)?;
+        let lab = || crate::machine_name::lab_labels(vault);
+        let set = crate::machine_name::undo_last(state, seen, lab, kind, roster, now_ms, dry_run)?;
+        let me = report_node(state);
+        let mut notes: Vec<Note> = narrowed.into_iter().map(Note::Narrowed).collect();
+        if set.shared {
+            notes.push(Note::Shared(set.name.display_nick()));
+        }
+        if dry_run {
+            notes.push(Note::NameDryRun);
+        }
+        let shown = Shown {
+            name: &set.name,
+            origin: set.origin,
+            fleet: InFleet::read(state, vault),
+            node: me.as_ref().map(|me| me.node()),
+        };
+        Ok((if json { shown.json() } else { shown.line() }, notes))
+    }
+
+    /// The changes History keeps in `state`'s name, newest first, made first where no file is
+    /// there ([`ensure_in_view`]): one line each, or with `json` one array of objects, with the
+    /// mode `state` was narrowed from when it was open to others.
+    ///
+    /// # Errors
+    /// As [`report`].
+    pub(super) fn history(
+        state: &Path,
+        json: bool,
+        roster: impl FnOnce() -> io::Result<Option<String>>,
+        now_ms: u64,
+    ) -> Result<(String, Option<u32>), String> {
+        let narrowed =
+            aterm_uds::private_file::ensure_private_dir(state).map_err(|e| e.to_string())?;
+        let (name, _) = ensure_in_view(state, roster, now_ms).map_err(|e| e.to_string())?;
+        let text = if json {
+            let changes = name.history.iter().map(change_json).collect();
+            let mut text =
+                aterm_json::to_string(&aterm_json::Value::Array(changes)).unwrap_or_default();
+            text.push('\n');
+            text
+        } else if name.history.is_empty() {
+            format!("{NO_HISTORY}\n")
+        } else {
+            name.history
+                .iter()
+                .map(|change| change.line() + "\n")
+                .collect()
+        };
+        Ok((text, narrowed))
+    }
+
+    /// The next free numbers `aterm name set`'s refusal names beside `num`, which `error`
+    /// refused: where it is another Mac's claim or hold on `num`
+    /// ([`crate::machine_name::Refused::held_by_another`]), the numbers a fresh read of what the
+    /// set judges by takes as free ([`crate::machine_name::RenamePreview::next_free`]), in the
+    /// words every surface uses ([`crate::machine_name::next_free_words`]). `None` for an error
+    /// that carries no such refusal, a read that fails, or no free number found. The read runs
+    /// only on this refusal path; a set rechecks whatever number is typed next.
+    pub(super) fn next_free_note(
+        state: &Path,
+        vault: Option<&Paths>,
+        num: aterm_types::machine_name::Number,
+        error: &io::Error,
+        roster: impl FnOnce() -> io::Result<Option<String>>,
+        now_ms: u64,
+    ) -> Option<String> {
+        let refused = crate::machine_name::Refused::of(error).filter(|r| r.held_by_another())?;
+        let preview = crate::machine_name::rename_preview(
+            state,
+            || crate::machine_name::lab_labels(vault),
+            roster,
+            now_ms,
+        )
+        .ok()?;
+        crate::machine_name::next_free_words(&preview.next_free(num, refused))
+    }
+
+    /// One change as `aterm name history --json` prints it, keys in order.
+    fn change_json(change: &Change) -> aterm_json::Value {
+        use aterm_json::Value;
+        let number = |num: Option<aterm_types::machine_name::Number>| {
+            num.map_or(Value::Null, |num| Value::from(u64::from(num.get())))
+        };
+        let mut object = aterm_json::Map::new();
+        object.insert(
+            "at".to_owned(),
+            Value::String(aterm_types::rfc3339::format_rfc3339(change.at_ms / 1_000)),
+        );
+        object.insert("at_ms".to_owned(), Value::from(change.at_ms));
+        object.insert(
+            "by".to_owned(),
+            change.by.map_or(Value::Null, |by| {
+                let mut by_object = aterm_json::Map::new();
+                by_object.insert(
+                    "kind".to_owned(),
+                    Value::String(by_kind_word(by.kind).to_owned()),
+                );
+                by_object.insert(
+                    "node".to_owned(),
+                    Value::String(aterm_net::fleet_member::name_record::node_word(by.node)),
+                );
+                Value::Object(by_object)
+            }),
+        );
+        object.insert("from".to_owned(), number(change.from));
+        object.insert(
+            "nick_from".to_owned(),
+            change
+                .nick_from
+                .as_ref()
+                .map_or(Value::Null, |nick| Value::String(nick.as_str().to_owned())),
+        );
+        object.insert(
+            "nick_to".to_owned(),
+            Value::String(change.nick_to.as_str().to_owned()),
+        );
+        object.insert("to".to_owned(), number(change.to));
+        object.insert("undone".to_owned(), Value::Bool(change.undone));
+        object.insert(
+            "why".to_owned(),
+            Value::String(why_word(change.why).to_owned()),
+        );
+        Value::Object(object)
     }
 
     /// What `aterm name` says of `name`.

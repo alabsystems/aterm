@@ -98,6 +98,33 @@ pub(crate) fn copy_regular_file(from: &Path, to: &Path) -> std::io::Result<std::
     Ok(meta)
 }
 
+/// Rename `from` to `to` only while `to` is absent: an existing `to` is an `AlreadyExists` error
+/// and both are left as they were. Unix uses the kernel's NOREPLACE rename, so an entry created
+/// meanwhile is never replaced.
+#[cfg(unix)]
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    aterm_dirfd::renameat_with(
+        aterm_dirfd::CWD,
+        from,
+        aterm_dirfd::CWD,
+        to,
+        aterm_dirfd::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+/// [`rename_noreplace`] where no NOREPLACE rename exists: a look, then the rename.
+#[cfg(not(unix))]
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "the destination already exists",
+        ));
+    }
+    std::fs::rename(from, to)
+}
+
 #[cfg(unix)]
 pub(crate) fn set_regular_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -138,10 +165,99 @@ fn read_key_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The store entries of this Mac's release ring a publish signs with: its key and its record.
+#[cfg(unix)]
+const STORE_RING: [&str; 2] = [
+    aterm_secrets::entry_class::RELEASE_RING[0],
+    aterm_secrets::entry_class::RELEASE_RING[1],
+];
+
+/// How a store-held ring is named in a refusal.
+const STORE_RING_SHOWN: &str = "the store's release ring";
+
+/// THE STORE'S RELEASE RING under [`IdentityPaths::store`](crate::ctx::IdentityPaths::store):
+/// the key's bytes and the record's text, read in place as one set from one verified version,
+/// never written anywhere. `None` where no store is named, no vault is configured or it holds no
+/// ring here.
+///
+/// # Errors
+/// The store cannot be read just now (a writer still holding it past a minute, local state that
+/// cannot be read): a sync in progress is never taken for a Mac with no ring.
+fn store_ring(ctx: &Ctx) -> Result<Option<(aterm_secrets::SecretBytes, String)>> {
+    let Some(home) = &ctx.identity.store else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    {
+        use aterm_secrets::client;
+        let paths = client::Paths::locate_for_home(home);
+        let read =
+            |e: aterm_secrets::Error| Error::refused(format!("read {STORE_RING_SHOWN}: {e}"));
+        let Some(expected) = client::config(&paths).map_err(read)? else {
+            return Ok(None);
+        };
+        let Some(ring) = client::read_verified_set(&paths, &expected, &STORE_RING).map_err(read)?
+        else {
+            return Ok(None);
+        };
+        let mut ring = ring.into_iter().map(|entry| entry.into_parts().0);
+        let (Some(key), Some(record)) = (ring.next(), ring.next()) else {
+            return Ok(None);
+        };
+        let record = record.as_str().map(str::to_owned).ok_or_else(|| {
+            Error::refused(format!("{STORE_RING_SHOWN}: its machine.toml is not UTF-8"))
+        })?;
+        Ok(Some((key, record)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = home;
+        Ok(None)
+    }
+}
+
+/// What this Mac lacks to sign, by name (`machine key`, `machine record`), or `None` where the
+/// store's release ring or both minted files are here: a lane's preflight probe. The ring's
+/// values are read to authenticate it and dropped zeroized.
+///
+/// # Errors
+/// As [`store_ring`]: a store that cannot be read just now is not a Mac with no ring.
+pub fn missing(ctx: &Ctx) -> Result<Option<&'static str>> {
+    if store_ring(ctx)?.is_some() {
+        return Ok(None);
+    }
+    if !ctx.identity.key.is_file() {
+        return Ok(Some("machine key"));
+    }
+    if !ctx.identity.record.is_file() {
+        return Ok(Some("machine record"));
+    }
+    Ok(None)
+}
+
+/// Whether this Mac holds a key to sign with ([`missing`]).
+///
+/// # Errors
+/// As [`missing`].
+pub fn keyed(ctx: &Ctx) -> Result<bool> {
+    Ok(missing(ctx)? != Some("machine key"))
+}
+
+/// Where this Mac's key is shown in a refusal: the store's ring where it holds one, else the
+/// key file.
+#[must_use]
+pub fn key_shown(ctx: &Ctx) -> String {
+    if matches!(store_ring(ctx), Ok(Some(_))) {
+        STORE_RING_SHOWN.to_owned()
+    } else {
+        ctx.shown(&ctx.identity.key)
+    }
+}
+
 /// The secret machine key, loaded.
 pub struct MachineKey {
     pkcs8: Vec<u8>,
-    path: PathBuf,
+    origin: String,
 }
 
 impl Drop for MachineKey {
@@ -153,7 +269,7 @@ impl Drop for MachineKey {
 impl std::fmt::Debug for MachineKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MachineKey")
-            .field("path", &self.path)
+            .field("origin", &self.origin)
             .finish_non_exhaustive()
     }
 }
@@ -174,12 +290,27 @@ impl MachineKey {
                 ctx.shown(path)
             ))
         })?;
-        let key = Self {
-            pkcs8,
-            path: path.to_path_buf(),
-        };
+        Self::checked(pkcs8, ctx.shown(path))
+    }
+
+    /// This Mac's key: the store's release ring where it holds one, else the minted key file.
+    ///
+    /// # Errors
+    ///
+    /// As [`store_ring`] and [`Self::load`].
+    pub fn this_machine(ctx: &Ctx) -> Result<Self> {
+        match store_ring(ctx)? {
+            Some((pkcs8, _)) => {
+                Self::checked(pkcs8.as_slice().to_vec(), STORE_RING_SHOWN.to_owned())
+            }
+            None => Self::load(ctx, &ctx.identity.key),
+        }
+    }
+
+    fn checked(pkcs8: Vec<u8>, origin: String) -> Result<Self> {
+        let key = Self { pkcs8, origin };
         atpkg_keys::pubkey_b64(&key.pkcs8)
-            .map_err(|e| Error::refused(format!("{}: {e}", ctx.shown(path))))?;
+            .map_err(|e| Error::refused(format!("{}: {e}", key.origin)))?;
         Ok(key)
     }
 
@@ -246,18 +377,31 @@ pub struct Signer {
 /// revoked id, a key the roster does not list, a roster that lists it under another id, or
 /// an entry past its horizon.
 pub fn signer_for(ctx: &Ctx, roster: &aterm_update_core::Roster) -> Result<Signer> {
-    let key = MachineKey::load(ctx, &ctx.identity.key)?;
+    let (key, key_shown, record_shown, record) = match store_ring(ctx)? {
+        Some((pkcs8, text)) => {
+            let key = MachineKey::checked(pkcs8.as_slice().to_vec(), STORE_RING_SHOWN.to_owned())?;
+            let shown = format!("{STORE_RING_SHOWN}'s machine.toml");
+            let record = parse_record(&text, &shown, &key.pubkey_b64()?)?;
+            (key, STORE_RING_SHOWN.to_owned(), shown, record)
+        }
+        None => {
+            let key = MachineKey::load(ctx, &ctx.identity.key)?;
+            let record = read_record(ctx, &key.pubkey_b64()?)?;
+            (
+                key,
+                ctx.shown(&ctx.identity.key),
+                ctx.shown(&ctx.identity.record),
+                record,
+            )
+        }
+    };
     let key_pub = key.pubkey_b64()?;
-    let record = read_record(ctx, &key_pub)?;
     if record.pubkey != key_pub {
         return Err(Error::refused(format!(
             "{} is NOT the key {} names — the record says {}, the key file is {}. Two \
              provisioning runs have been crossed; sort out which machine this is before \
              signing anything as it",
-            ctx.shown(&ctx.identity.key),
-            ctx.shown(&ctx.identity.record),
-            record.pubkey,
-            key_pub
+            key_shown, record_shown, record.pubkey, key_pub
         )));
     }
     if roster.is_revoked(&record.id) {
@@ -275,8 +419,8 @@ pub fn signer_for(ctx: &Ctx, roster: &aterm_update_core::Roster) -> Result<Signe
     let Some(listed) = roster.machines.iter().find(|m| m.pubkey == key_pub) else {
         return Err(Error::refused(format!(
             "machine '{id}' is NOT on the roster this publish would ship (roster_seq {seq}): \
-             its key is not listed. If that roster is older than this machine, install the \
-             current pair (from a machine that has it) at {roster}. Otherwise mint a \
+             its key is not listed. If that roster is older than this machine, the vault admin \
+             publishes the current pair to the store (or install it at {roster}). Otherwise mint a \
              rostered key (needs the paper master): `atpkg-keys join --id {id} --key <new \
              path>`, then point the identity at that key",
             id = record.id,
@@ -290,9 +434,7 @@ pub fn signer_for(ctx: &Ctx, roster: &aterm_update_core::Roster) -> Result<Signe
              travels INSIDE the signed bytes and the client binds it to the key that \
              verified, so this index would be refused as a relabelling. Fix the local record \
              to match the roster; the roster is the authority",
-            listed.id,
-            ctx.shown(&ctx.identity.record),
-            record.id
+            listed.id, record_shown, record.id
         )));
     }
     if let Err(why) = roster.machine(&record.id, ctx.now_unix) {
@@ -332,13 +474,20 @@ fn read_record(ctx: &Ctx, key_pub: &str) -> Result<MachineRecord> {
                 restore()
             ))
         })?;
-    let table: aterm_toml::Table = text.parse().map_err(|e| {
-        Error::refused(format!(
-            "{} does not parse ({e}) — {}",
-            ctx.shown(&ctx.identity.record),
-            restore()
-        ))
-    })?;
+    parse_record(&text, &ctx.shown(&ctx.identity.record), key_pub)
+}
+
+/// The record `text` holds, `shown` naming it in a refusal.
+fn parse_record(text: &str, shown: &str, key_pub: &str) -> Result<MachineRecord> {
+    let restore = || {
+        format!(
+            "restore it by hand, with the id the roster lists for this key:\n  id = \"<roster \
+             id>\"\n  pubkey = \"{key_pub}\""
+        )
+    };
+    let table: aterm_toml::Table = text
+        .parse()
+        .map_err(|e| Error::refused(format!("{shown} does not parse ({e}) — {}", restore())))?;
     let field = |k: &str| {
         table
             .get(k)
@@ -349,8 +498,7 @@ fn read_record(ctx: &Ctx, key_pub: &str) -> Result<MachineRecord> {
     match (field("id"), field("pubkey")) {
         (Some(id), Some(pubkey)) => Ok(MachineRecord { id, pubkey }),
         _ => Err(Error::refused(format!(
-            "{} has no id/pubkey pair — {}",
-            ctx.shown(&ctx.identity.record),
+            "{shown} has no id/pubkey pair — {}",
             restore()
         ))),
     }

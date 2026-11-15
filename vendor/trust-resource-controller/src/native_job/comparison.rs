@@ -214,11 +214,10 @@ impl Selection {
             {
                 return Err(invalid());
             }
-            if let Some(previous) = action_cases.insert(&pair.action, pair.baseline) {
-                if !same_case(plan, previous, pair.baseline)? {
+            if let Some(previous) = action_cases.insert(&pair.action, pair.baseline)
+                && !same_case(plan, previous, pair.baseline)? {
                     return Err(invalid());
                 }
-            }
             let before_node = &plan.nodes[pair.baseline.0 as usize];
             let after_node = &plan.nodes[pair.candidate.0 as usize];
             if before_node.timeout_ns != after_node.timeout_ns {

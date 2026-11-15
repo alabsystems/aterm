@@ -262,11 +262,9 @@ impl Begin {
                 source,
                 destination,
             } = intent
-            {
-                if source == destination {
+                && source == destination {
                     return Err(invalid());
                 }
-            }
         }
         Ok(())
     }

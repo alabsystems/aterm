@@ -623,7 +623,9 @@ pub(crate) fn browse_names(budget: Duration) -> crate::Result<Vec<String>> {
 
 /// Resolve each of `instances` of the vault's type ([`vault_type`]; none where it names no lab
 /// service), all at once within `budget`, through the LAN broker: the first answer of each, as
-/// `read` takes it.
+/// `read` takes it. Where this thread works for a subscriber's pass, each name's thread adds its
+/// CPU time to the pass's counts as it ends ([`crate::pass_counts::Started::run`]); where it runs
+/// a server's round, to that server's ([`crate::serve_counts::Resolving::run`]).
 #[cfg(all(target_os = "macos", not(test)))]
 fn resolve_each_vault(
     instances: &[String],
@@ -636,12 +638,19 @@ fn resolve_each_vault(
     let service = service.as_str();
     let resolve_budget = (budget / 3).clamp(Duration::from_millis(40), Duration::from_millis(250));
     let read = &read;
+    let started = &crate::pass_counts::starting();
+    let serving = &crate::serve_counts::resolving();
     std::thread::scope(|scope| {
         let handles: Vec<_> = instances
             .iter()
             .map(|name| {
                 scope.spawn(move || {
-                    resolve_first(name, service, resolve_budget).and_then(|event| read(&event))
+                    started.run(|| {
+                        serving.run(|| {
+                            resolve_first(name, service, resolve_budget)
+                                .and_then(|event| read(&event))
+                        })
+                    })
                 })
             })
             .collect();
@@ -818,6 +827,10 @@ impl std::fmt::Debug for Watch {
 #[cfg(any(test, debug_assertions))]
 type Resolver = Box<dyn Fn(&str) -> Option<Advert> + Send + Sync>;
 
+/// What a test's watch resolves its vault servers' names through ([`Watch::idle_resolving_vaults`]).
+#[cfg(test)]
+type VaultResolver = Box<dyn Fn(&[String], Duration) -> Vec<DiscoveredVault> + Send + Sync>;
+
 struct Watched {
     /// The service watched (`_alab-vault._tcp`, `_alab._tcp`).
     service: &'static str,
@@ -854,6 +867,10 @@ struct Watched {
     /// What [`Watch::adverts`] resolves through in place of a service resolve, a test's.
     #[cfg(any(test, debug_assertions))]
     resolve: Option<Resolver>,
+    /// What [`Watch::peer_vaults`] and [`Watch::alab_holders`] resolve through in place of the
+    /// LAN broker, a test's.
+    #[cfg(test)]
+    resolve_vaults: Option<VaultResolver>,
 }
 
 impl Watch {
@@ -940,6 +957,23 @@ impl Watch {
         }
     }
 
+    /// Seam: [`Watch::idle`] whose [`Watch::peer_vaults`] and [`Watch::alab_holders`] hand the
+    /// names they would resolve through the LAN broker to `resolve` instead, for a test that
+    /// feeds the watch ([`Watch::hear`]) and runs a server's round over what it resolves.
+    #[cfg(test)]
+    pub(crate) fn idle_resolving_vaults(
+        bell: &Arc<Bell>,
+        own: &[&str],
+        resolve: impl Fn(&[String], Duration) -> Vec<DiscoveredVault> + Send + Sync + 'static,
+    ) -> Watch {
+        let service = crate::server::SERVICE_TYPE;
+        let mut watched = Watched::new(service, Some(service.to_owned()), bell, own);
+        watched.resolve_vaults = Some(Box::new(resolve));
+        Watch {
+            watched: Arc::new(watched),
+        }
+    }
+
     /// Seam: take it that a browse began `ago` ago, as the standing browse does at each browse it
     /// starts with `ago` zero: what is heard while the browse is younger than the watch's settle
     /// window is its baseline, held but ringing nothing.
@@ -1021,18 +1055,22 @@ impl Watch {
 
     /// Resolve peer instances heard now (excluding this server's own primary instance names), at
     /// most [`MAX_CANDIDATES`] ([`rotated`]: each call takes the next of them), within `budget`
-    /// (`DESIGN-fluid-swarm` §4.1 F6). A watch of another service than `_alab-vault._tcp`
-    /// resolves none.
+    /// (`DESIGN-fluid-swarm` §4.1 F6): how many names it handed its resolver, and what they
+    /// resolved to. A watch of another service than `_alab-vault._tcp` resolves none.
     #[must_use]
-    pub fn peer_vaults(&self, budget: Duration) -> Vec<DiscoveredVault> {
+    pub fn peer_vaults(&self, budget: Duration) -> (usize, Vec<DiscoveredVault>) {
         if !self.watched.is_vault() {
-            return Vec::new();
+            return (0, Vec::new());
         }
         let names = self.peer_names();
         if names.is_empty() {
-            return Vec::new();
+            return (0, Vec::new());
         }
-        resolve_all(&names, budget)
+        #[cfg(test)]
+        if let Some(resolve) = &self.watched.resolve_vaults {
+            return (names.len(), resolve(&names, budget));
+        }
+        (names.len(), resolve_all(&names, budget))
     }
 
     /// The instances [`Watch::peer_vaults`] resolves now.
@@ -1058,15 +1096,20 @@ impl Watch {
 
     /// Resolve a rotating batch of at most [`MAX_CANDIDATES`] `alab-secrets` /
     /// `alab-secrets (<N>)` instances without collapsing equal-URL collisions
-    /// (`DESIGN-fluid-swarm` §4.1 F7). Its cursor is independent of other lookups;
-    /// a watch of another service than `_alab-vault._tcp` resolves none.
+    /// (`DESIGN-fluid-swarm` §4.1 F7): how many names it handed its resolver, and what they
+    /// resolved to. Its cursor is independent of other lookups; a watch of another service than
+    /// `_alab-vault._tcp` resolves none.
     #[must_use]
-    pub fn alab_holders(&self, budget: Duration) -> Vec<DiscoveredVault> {
+    pub fn alab_holders(&self, budget: Duration) -> (usize, Vec<DiscoveredVault>) {
         let names = self.holder_names();
         if names.is_empty() {
-            return Vec::new();
+            return (0, Vec::new());
         }
-        resolve_alab_holders(&names, budget)
+        #[cfg(test)]
+        if let Some(resolve) = &self.watched.resolve_vaults {
+            return (names.len(), resolve(&names, budget));
+        }
+        (names.len(), resolve_alab_holders(&names, budget))
     }
 
     fn holder_names(&self) -> Vec<String> {
@@ -1165,6 +1208,8 @@ impl Watched {
             closed: AtomicBool::new(false),
             #[cfg(any(test, debug_assertions))]
             resolve: None,
+            #[cfg(test)]
+            resolve_vaults: None,
         }
     }
 

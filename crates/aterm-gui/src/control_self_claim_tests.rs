@@ -3188,6 +3188,18 @@ fn put_needs_entry(ctx: &crate::SessionCtx, text: Option<&str>) {
         .expect("a slot");
 }
 
+/// `meta set|unset harness_needs` as the dispatch serves it, its moves read as one change
+/// ([`super::control_session::NeedsMoved::any`]).
+fn cmd_meta_harness_needs(
+    ctx: &crate::SessionCtx,
+    conn: Option<u64>,
+    prove: &dyn Fn(&str) -> Option<Proven>,
+    rest: &str,
+) -> Option<(String, bool)> {
+    super::control_session::cmd_meta_harness_needs(ctx, conn, prove, rest)
+        .map(|(reply, moved)| (reply, moved.any()))
+}
+
 /// The needs the session's live proven self-claim told last and the entry's text they were told
 /// with, whatever entry stands, and whether a set is kept at all, whatever the claim stands at.
 fn needs_kept(ctx: &crate::SessionCtx, at: u64) -> (Option<(Vec<String>, String)>, bool) {
@@ -3232,7 +3244,7 @@ fn strings(needs: &[&str]) -> Vec<String> {
 /// nothing reaches another session, nor the timeline's set (aterm's own loop's).
 #[test]
 fn only_a_proven_claims_holder_tells_its_own_needs_set() {
-    use super::control_session::{HARNESS_NEEDS_MAX, cmd_meta_harness_needs};
+    use super::control_session::HARNESS_NEEDS_MAX;
     use crate::needs::NEED_TOLD_MAX;
     let h = crate::session_store::test_handle_on(7548, -1);
     let other = crate::session_store::test_handle_on(7549, -1);
@@ -3694,7 +3706,6 @@ fn a_self_claimants_needs_set_lapses_with_its_claim() {
 /// the renewal made while the claim stood kept it.
 #[test]
 fn a_needs_set_told_before_a_lapse_never_comes_back_with_the_next_claim() {
-    use super::control_session::cmd_meta_harness_needs;
     let h = crate::session_store::test_handle_on(7551, -1);
     let ctx = h.ctx.as_ref();
     let me = format!("codex-alab@{}", stand_in());
@@ -3757,7 +3768,6 @@ fn a_needs_set_told_before_a_lapse_never_comes_back_with_the_next_claim() {
 /// entry that then stands is read; once the claim ends, aterm's own loop's set is read again.
 #[test]
 fn a_self_claims_set_waits_for_its_entry_and_describes_no_other() {
-    use super::control_session::cmd_meta_harness_needs;
     let store = crate::session_store::new_store();
     let h = crate::session_store::test_handle_on(7552, -1);
     store.write().unwrap().register(h.clone());
@@ -4513,7 +4523,7 @@ fn a_rostered_harness_claims_its_scope_through_meta_proven_or_refused_whole() {
 
 /// claude-code-alab THROUGH THE REAL `meta` DISPATCH (`docs/DESIGN-harness-repos-2026-10-24.md`
 /// §11 D53): now it is rostered, its claim without `contract=` (the v2 grammar, a lease included)
-/// is `ERR usage` and stores nothing, as is a duty outside its row; its `scope=upgrade` claim,
+/// is `ERR usage` and stores nothing, as is a word that names no duty; its `scope=upgrade` claim,
 /// the one its launch makes, is proven or refused whole, replaces the window host's claim, keeps
 /// its scope and versions and reads `supervisor_proven=1` on `meta`; the same connection widens
 /// it to `relaunch,upgrade`.
@@ -4555,8 +4565,8 @@ fn claude_code_alab_claims_through_meta_under_contract_three_alone() {
         format!("set supervisor {me} ttl=500"),
         format!("set supervisor {me} scope=upgrade"),
         format!("set supervisor {me} contract=2 scope=upgrade"),
-        format!("set supervisor {me} contract=3 scope=upgrade,turn-end"),
-        format!("set supervisor {me} contract=3 scope=walls"),
+        format!("set supervisor {me} contract=3 scope=upgrade,bogus"),
+        format!("set supervisor {me} contract=3 scope=Turn-End"),
     ] {
         let reply = serve(&bad, true);
         assert!(reply.starts_with("ERR usage"), "{bad}: {reply}");
@@ -4607,6 +4617,442 @@ fn claude_code_alab_claims_through_meta_under_contract_three_alone() {
         scoped_now().0.map(|(scope, _)| scope).as_deref(),
         Some("relaunch,upgrade")
     );
+}
+
+/// claude-code-alab TAKES THE TYPING DUTIES THROUGH THE REAL `meta` DISPATCH
+/// (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2, HX-07): its roster row allows every duty,
+/// so its claim naming `turn-end` is proven, replaces the window host's claim, reads
+/// `supervisor_proven=1` on `meta` and holds the proof a turn end's acts, stop, Land hold and
+/// NEEDS YOU are admitted under (`SupervisorClaim::act_proof`); the same connection widens it to
+/// every duty, which speaks for the boxes and walls. NEGATIVE CONTROLS: the same claim unproven is
+/// `ERR unproven:` and the host still holds; a claim naming a word that is no duty (`bogus`) is
+/// `ERR usage`, and the claim before it stands.
+#[test]
+fn claude_code_alab_claims_the_typing_duties_under_contract_three() {
+    use crate::session_timeline::SupervisorClaim;
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7522, -1);
+    store.write().unwrap().register(h.clone());
+    let ctx = h.ctx.as_ref();
+    let host = format!("aterm-harness@{}", std::process::id());
+    claim_supervisor_as(
+        ctx,
+        &host,
+        None,
+        None,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the host's claim");
+    let me = format!("claude-code-alab@{}", stand_in());
+    let serve = |rest: &str, proves: bool| {
+        let prove = move |_: &str| proves.then(running);
+        super::meta_wakes_proving_for_test(&store, &h.term, 7522, &h.ctx, rest, Some(4), &prove).0
+    };
+    // The live scoped claim's scope, whether it is proven, whether it holds the act proof, and
+    // whether it speaks for the boxes and walls (the host's claim, no scoped one, takes them all).
+    let scoped_now = || {
+        let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = crate::metrics::now_us();
+        let scoped = meta
+            .live_claim(now)
+            .filter(|c: &&SupervisorClaim| c.scoped.is_some());
+        (
+            scoped
+                .and_then(|c| c.scoped.as_ref())
+                .map(|s| s.claim.scopes.words()),
+            meta.claim_proven(now),
+            scoped.is_some_and(|c| c.act_proof().is_some()),
+            scoped.is_some_and(SupervisorClaim::speaks_for_boxes_and_walls),
+        )
+    };
+    let turn_end = format!(
+        "set supervisor {me} contract=3 scope=upgrade,relaunch,turn-end version=0.3.0 \
+         vendor=2.1.310"
+    );
+    let reply = serve(&turn_end, false);
+    assert!(reply.starts_with("ERR unproven:"), "{reply}");
+    assert_eq!(
+        shown(ctx),
+        (Some(host.clone()), false),
+        "refused whole: the host still holds"
+    );
+    assert_eq!(scoped_now(), (None, false, false, false));
+    assert_eq!(serve(&turn_end, true), "OK\n");
+    assert_eq!(shown(ctx), (Some(me.clone()), false));
+    let typing = Some("relaunch,upgrade,turn-end".to_string());
+    assert_eq!(scoped_now(), (typing.clone(), true, true, false));
+    let read = serve("", true);
+    assert!(
+        read.contains(&format!(" supervisor={me} supervisor_proven=1 ")),
+        "{read}"
+    );
+    let reply = serve(
+        &format!("set supervisor {me} contract=3 scope=turn-end,bogus"),
+        true,
+    );
+    assert!(reply.starts_with("ERR usage"), "{reply}");
+    assert_eq!(
+        scoped_now(),
+        (typing, true, true, false),
+        "the claim before it stands"
+    );
+    assert_eq!(
+        serve(
+            &format!(
+                "set supervisor {me} contract=3 \
+                 scope=relaunch,upgrade,turn-end,approvals,questions,walls version=0.3.0 \
+                 vendor=2.1.310"
+            ),
+            true
+        ),
+        "OK\n"
+    );
+    assert_eq!(
+        scoped_now(),
+        (
+            Some("relaunch,upgrade,turn-end,approvals,questions,walls".to_string()),
+            true,
+            true,
+            true
+        )
+    );
+}
+
+/// Put `holder`'s proven contract 3 claim of `duties` on `ctx`'s session, bound to connection
+/// `conn`, proven as the running stand-in ([`running`]). The scope is a fixture
+/// ([`Scopes::for_test`](aterm_agent::harness::contract::Scopes::for_test)), so it may name a
+/// duty `holder`'s roster row does not allow.
+fn claim_scoped(
+    ctx: &crate::SessionCtx,
+    holder: &str,
+    duties: &[aterm_agent::harness::contract::Scope],
+    conn: u64,
+) {
+    let aterm_agent::harness::contract::Words::Scoped(mut claim) =
+        aterm_agent::harness::contract::read(holder, &["contract=3", "scope=upgrade"])
+    else {
+        panic!("the roster admits {holder}");
+    };
+    claim.scopes = aterm_agent::harness::contract::Scopes::for_test(duties);
+    crate::session_timeline::claim_supervisor_scoped(
+        ctx,
+        holder,
+        Some(conn),
+        crate::harness_claim::Scoped {
+            proven: running(),
+            claim,
+        },
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the proven scoped claim");
+}
+
+/// What a session keeps of its claimant's own reports: its stop, its Land hold, its NEEDS YOU set
+/// (each as read while the claim stands), and the acts on its timeline.
+fn reports(ctx: &crate::SessionCtx) -> (bool, bool, bool, usize) {
+    let now = crate::metrics::now_us();
+    let acts = ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .since(None)
+        .filter(|e| e.kind == crate::session_timeline::HARNESS_ACT)
+        .count();
+    let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+    (
+        meta.self_held(now).is_some(),
+        meta.self_land(now).is_some(),
+        meta.self_needs(now)
+            .is_some_and(|told| told.current().is_some()),
+        acts,
+    )
+}
+
+/// HX-06'S ACT ADMISSION, FOR CONTRACT 3 (`docs/DESIGN-harness-interface-2026-11-12.md` §2.2): an
+/// act, the stop, Land's hold, NEEDS YOU and the continuation report are admitted for any proven
+/// claim that holds `turn-end`, the duty they report on: codex-alab's contract 2 self-claim, as
+/// before, and a rostered harness's proven contract 3 claim naming `turn-end` (claude-code-alab's,
+/// whose row allows it, as a scope fixture), on its own connection or a connection its very process
+/// proves; each write is then read as that claim's while it stands. NEGATIVE CONTROLS: another
+/// connection that proves nothing is `ERR denied`; the same claim renewed without `turn-end` (a
+/// new revision) writes nothing more and its stop, hold and set go, and they do not come back when
+/// it takes `turn-end` again.
+#[test]
+fn an_act_is_admitted_for_any_proven_claim_that_holds_its_scope() {
+    use super::control_session::{
+        cmd_meta_harness_act, cmd_meta_harness_activity, cmd_meta_harness_held,
+        cmd_meta_harness_land,
+    };
+    use aterm_agent::harness::contract::Scope;
+    let h = crate::session_store::test_handle_on(7560, -1);
+    let ctx = h.ctx.as_ref();
+    let no_proof = |_: &str| -> Option<Proven> { None };
+    let proof = |_: &str| -> Option<Proven> { Some(running()) };
+    let denied = Some(("ERR denied\n".to_string(), false));
+    let act = |conn: u64, prove: &dyn Fn(&str) -> Option<Proven>, act: &str| {
+        cmd_meta_harness_act(
+            ctx,
+            None,
+            Some(conn),
+            aterm_slog::Actor::Ctl,
+            prove,
+            &format!("set harness_act {act}"),
+        )
+    };
+    let entry = needs_entry();
+    let tell_all = |conn: u64, prove: &dyn Fn(&str) -> Option<Proven>| {
+        [
+            cmd_meta_harness_held(ctx, Some(conn), prove, "set harness_held no-work"),
+            cmd_meta_harness_land(
+                ctx,
+                Some(conn),
+                prove,
+                &format!("set harness_land since={SINCE_MS} nudges=1"),
+            ),
+            cmd_meta_harness_needs(
+                ctx,
+                Some(conn),
+                prove,
+                &format!("set harness_needs entry={entry} need=sign%200.48.0"),
+            ),
+            cmd_meta_harness_activity(
+                ctx,
+                Some(conn),
+                prove,
+                "set harness_activity reason=waiting wait_ms=- seq=1",
+            ),
+        ]
+    };
+    put_needs_entry(ctx, Some(NEEDS_ENTRY));
+
+    // codex-alab's contract 2 self-claim: its proof is the one it always was.
+    let codex = format!("codex-alab@{}", stand_in());
+    claim_supervisor_as(
+        ctx,
+        &codex,
+        Some(1),
+        None,
+        Some(running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("codex-alab's proven self-claim");
+    assert_eq!(
+        act(1, &no_proof, "codex-act@v1"),
+        Some(("OK\n".to_string(), true))
+    );
+    assert!(release_supervisor(
+        ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl
+    ));
+
+    let me = format!("claude-code-alab@{}", stand_in());
+    claim_scoped(ctx, &me, &Scope::ALL, 2);
+    assert_eq!(
+        act(2, &no_proof, "continue"),
+        Some(("OK\n".to_string(), true))
+    );
+    assert_eq!(
+        act(3, &proof, "approve"),
+        Some(("OK\n".to_string(), true)),
+        "a connection its very process proves"
+    );
+    assert_eq!(
+        act(3, &no_proof, "approve"),
+        denied,
+        "a connection that proves nothing"
+    );
+    let lease = cmd_meta_harness_act(
+        ctx,
+        None,
+        Some(2),
+        aterm_slog::Actor::Ctl,
+        &no_proof,
+        "prepare harness_act",
+    )
+    .expect("the act verb");
+    assert!(lease.0.starts_with("OK until_us="), "{lease:?}");
+    for (told, line) in tell_all(3, &no_proof)
+        .into_iter()
+        .zip(["held", "land", "needs", "activity"])
+    {
+        assert_eq!(told, denied, "{line}: a connection that proves nothing");
+    }
+    for (told, line) in tell_all(2, &no_proof)
+        .into_iter()
+        .zip(["held", "land", "needs", "activity"])
+    {
+        assert_eq!(told, Some(("OK\n".to_string(), true)), "{line}");
+    }
+    assert_eq!(
+        reports(ctx),
+        (true, true, true, 3),
+        "each read as the claim's own"
+    );
+    let booked = ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .last_act()
+        .map(str::to_owned);
+    assert_eq!(booked.as_deref(), Some("approve"));
+
+    // The same process renews its claim without turn-end: a new revision that reports nothing.
+    claim_scoped(
+        ctx,
+        &me,
+        &[
+            Scope::Relaunch,
+            Scope::Upgrade,
+            Scope::Approvals,
+            Scope::Questions,
+            Scope::Walls,
+        ],
+        2,
+    );
+    assert_eq!(
+        act(2, &no_proof, "continue"),
+        denied,
+        "no act without turn-end"
+    );
+    for (told, line) in tell_all(2, &no_proof)
+        .into_iter()
+        .zip(["held", "land", "needs", "activity"])
+    {
+        assert_eq!(told, denied, "{line}: no report without turn-end");
+    }
+    assert_eq!(reports(ctx), (false, false, false, 3));
+    claim_scoped(
+        ctx,
+        &me,
+        &[Scope::Relaunch, Scope::Upgrade, Scope::TurnEnd],
+        2,
+    );
+    assert_eq!(
+        reports(ctx),
+        (false, false, false, 3),
+        "a stop, hold or set told before the narrowing never comes back"
+    );
+    assert_eq!(
+        act(2, &no_proof, "resume@v1"),
+        Some(("OK\n".to_string(), true))
+    );
+}
+
+/// A CLAIM HOLDING ONLY `relaunch,upgrade` WRITES NO ACT: claude-code-alab's and grok-alab's
+/// proven contract 3 claims of `relaunch,upgrade`, on their own connection and on a connection
+/// their process proves, are `ERR denied` for every act, its lease, the stop, Land's hold, NEEDS
+/// YOU and the continuation report, and nothing is kept: no act on the timeline, no stop, hold or
+/// set read or stored. CONTROL: the same claimant widened to `turn-end` (a scope fixture) on the
+/// same connection records its act, so the refusal is the scope's.
+#[test]
+fn a_claim_holding_only_relaunch_and_upgrade_writes_no_act() {
+    use super::control_session::{
+        cmd_meta_harness_act, cmd_meta_harness_activity, cmd_meta_harness_held,
+        cmd_meta_harness_land,
+    };
+    use aterm_agent::harness::contract::Scope;
+    let denied = Some(("ERR denied\n".to_string(), false));
+    let no_proof = |_: &str| -> Option<Proven> { None };
+    let proof = |_: &str| -> Option<Proven> { Some(running()) };
+    for (port, id) in [(7562, "claude-code-alab"), (7563, "grok-alab")] {
+        let h = crate::session_store::test_handle_on(port, -1);
+        let ctx = h.ctx.as_ref();
+        put_needs_entry(ctx, Some(NEEDS_ENTRY));
+        let me = format!("{id}@{}", stand_in());
+        claim_scoped(ctx, &me, &[Scope::Relaunch, Scope::Upgrade], 2);
+        let entry = needs_entry();
+        for (conn, prove) in [
+            (2, &no_proof as &dyn Fn(&str) -> Option<Proven>),
+            (3, &proof as &dyn Fn(&str) -> Option<Proven>),
+        ] {
+            for line in ["set harness_act continue", "prepare harness_act"] {
+                assert_eq!(
+                    cmd_meta_harness_act(
+                        ctx,
+                        None,
+                        Some(conn),
+                        aterm_slog::Actor::Ctl,
+                        prove,
+                        line
+                    ),
+                    denied,
+                    "{id} on {conn}: {line}"
+                );
+            }
+            assert_eq!(
+                cmd_meta_harness_held(ctx, Some(conn), prove, "set harness_held same-reply"),
+                denied,
+                "{id} on {conn}"
+            );
+            assert_eq!(
+                cmd_meta_harness_land(
+                    ctx,
+                    Some(conn),
+                    prove,
+                    &format!("set harness_land since={SINCE_MS} nudges=0")
+                ),
+                denied,
+                "{id} on {conn}"
+            );
+            assert_eq!(
+                cmd_meta_harness_needs(
+                    ctx,
+                    Some(conn),
+                    prove,
+                    &format!("set harness_needs entry={entry} need=a")
+                ),
+                denied,
+                "{id} on {conn}"
+            );
+            assert_eq!(
+                cmd_meta_harness_activity(
+                    ctx,
+                    Some(conn),
+                    prove,
+                    "set harness_activity reason=waiting wait_ms=- seq=1"
+                ),
+                denied,
+                "{id} on {conn}"
+            );
+        }
+        assert_eq!(reports(ctx), (false, false, false, 0), "{id}: nothing read");
+        {
+            let meta = ctx.meta.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                meta.claim_held.is_none()
+                    && meta.claim_land.is_none()
+                    && meta.claim_needs.is_none(),
+                "{id}: nothing stored"
+            );
+            assert!(meta.continuation_activity.is_none(), "{id}: no report kept");
+        }
+        if id == "claude-code-alab" {
+            claim_scoped(
+                ctx,
+                &me,
+                &[Scope::Relaunch, Scope::Upgrade, Scope::TurnEnd],
+                2,
+            );
+            assert_eq!(
+                cmd_meta_harness_act(
+                    ctx,
+                    None,
+                    Some(2),
+                    aterm_slog::Actor::Ctl,
+                    &no_proof,
+                    "set harness_act continue"
+                ),
+                Some(("OK\n".to_string(), true)),
+                "CONTROL: the claim widened to turn-end records its act"
+            );
+        }
+    }
 }
 
 /// A scoped renewal publishes semantic scope and version changes through MetaChanged and moves the
@@ -4874,4 +5320,954 @@ fn a_reconfirmation_in_place_keeps_the_sealed_authority_and_a_moved_claim_ends_i
         moved.revision(),
         "the claim under a new birth is a new authority"
     );
+}
+
+/// A CREDENTIAL IS NO PERSON'S NEED, WHOEVER RUNS THE LOOP: a self-claim's set (codex-alab's
+/// `meta set harness_needs`) loses its credential lines at ingest, read by aterm's own loop's
+/// reader (`credential_need`), and each want they name goes on the one path (the registry, else
+/// `aterm secrets need`). The claimant's `owner=needs` entry is read against what it said, never
+/// against the entry aterm stands for it: an entry leading with a credential stands for no one
+/// until its set says what else it counts (an await task's rev never moves for it); a set of
+/// credentials alone stands nothing; a mixed set stands the entry rebuilt for the person's needs,
+/// rebuilt again when the claimant tells another set under its unchanged entry, and the
+/// claimant's own entry stands again once its set holds no credential; a set told before its
+/// entry stands once that entry comes. NEGATIVE CONTROLS: a set with no credential line keeps the
+/// claimant's entry and set as told, moves no entry and files nothing; a malformed line naming a
+/// credential still answers its usage and files nothing; a release's want (the release
+/// machine's) is not filed.
+#[test]
+fn a_self_claims_credential_needs_reach_no_person() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7556, -1);
+    store.write().unwrap().register(h.clone());
+    let ctx = h.ctx.as_ref();
+    mark_session_task(&h.ctx, h.local_id, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    let me = format!("codex-alab@{}", stand_in());
+    let serve = |rest: &str| {
+        let prove = |_: &str| Some(running());
+        super::meta_wakes_proving_for_test(&store, &h.term, 7556, &h.ctx, rest, Some(4), &prove)
+    };
+    let pct = aterm_control::wire::pct_encode;
+    let put = |entry: &str| serve(&format!("set attention owner=needs kind=ask {entry}")).0;
+    let tell = |entry: &str, needs: &[&str]| {
+        let needs: Vec<String> = needs.iter().map(|n| format!("need={}", pct(n))).collect();
+        serve(&format!(
+            "set harness_needs entry={} {}",
+            pct(entry),
+            needs.join(" ")
+        ))
+    };
+    let standing = || {
+        ctx.meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .attention_owners
+            .get(crate::harness_host::NEEDS_ATTENTION_OWNER)
+            .map(str::to_string)
+    };
+    let rev = || {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .task()
+            .map(|task| task.rev)
+    };
+    let filed = || super::control_session::CREDENTIALS_RESOLVED.take();
+    let meta_moved = |wakes: &[crate::Wake]| {
+        wakes
+            .iter()
+            .any(|w| matches!(w, crate::Wake::MetaChanged { session: 7556 }))
+    };
+    let codex = |words: &str| format!("Codex needs you: {words} \u{2014} carrying on");
+    assert_eq!(serve(&format!("set supervisor {me}")).0, "OK\n");
+    filed();
+
+    let one = codex("the GitHub token for alabsystems");
+    let before = rev();
+    assert_eq!(put(&one), "OK\n");
+    assert_eq!(standing(), None, "an entry leading with a credential");
+    assert_eq!(tell(&one, &["the GitHub token for alabsystems"]).0, "OK\n");
+    assert_eq!((standing(), needs_read(ctx)), (None, None));
+    assert_eq!(needs_kept(ctx, crate::metrics::now_us()).0, None);
+    assert_eq!(filed(), vec![strings(&["gh:release"])]);
+
+    let two = codex("the notary password (+1 more)");
+    assert_eq!(put(&two), "OK\n");
+    assert_eq!(standing(), None, "its set has yet to say what it counts");
+    let (reply, wakes) = tell(
+        &two,
+        &["the notary password", "an SSH deploy key for the site"],
+    );
+    assert_eq!(reply, "OK\n");
+    assert!(!meta_moved(&wakes), "no entry ever stood: {wakes:?}");
+    assert_eq!((standing(), needs_read(ctx)), (None, None));
+    assert_eq!(rev(), before, "no await task woke for a credential");
+    assert_eq!(filed(), vec![strings(&["notary", "site-deployer-key"])]);
+
+    let notes = "approve the 0.48.0 release notes";
+    let screen = "grant Screen Recording to com.aterm.aterm";
+    let changelog = "review the changelog for 0.48.0";
+    let mixed = codex("the GitHub token for alabsystems (+2 more)");
+    assert_eq!(put(&mixed), "OK\n");
+    let (reply, wakes) = tell(&mixed, &["the GitHub token for alabsystems", notes, screen]);
+    assert_eq!(reply, "OK\n");
+    assert!(meta_moved(&wakes), "the entry was rebuilt: {wakes:?}");
+    assert_eq!(
+        standing(),
+        Some(codex("approve the 0.48.0 release notes (+1 more)"))
+    );
+    assert_eq!(needs_read(ctx), Some(strings(&[notes, screen])));
+    assert_eq!(filed(), vec![strings(&["gh:release"])]);
+
+    // The claimant's first need and count stay, so it writes no new entry: its next set is read
+    // against what it said, and the entry aterm stood for the last one is rebuilt.
+    let (reply, wakes) = tell(
+        &mixed,
+        &["the GitHub token for alabsystems", changelog, screen],
+    );
+    assert_eq!(reply, "OK\n");
+    assert!(meta_moved(&wakes), "{wakes:?}");
+    assert_eq!(
+        standing(),
+        Some(codex("review the changelog for 0.48.0 (+1 more)"))
+    );
+    assert_eq!(needs_read(ctx), Some(strings(&[changelog, screen])));
+    filed();
+
+    let first = codex("approve the 0.48.0 release notes (+1 more)");
+    assert_eq!(put(&first), "OK\n");
+    assert_eq!(
+        standing().as_deref(),
+        Some(first.as_str()),
+        "a person's need leads"
+    );
+    assert_eq!(tell(&first, &[notes, "the notary password"]).0, "OK\n");
+    assert_eq!(standing(), Some(codex(notes)));
+    assert_eq!(needs_read(ctx), Some(strings(&[notes])));
+    let (reply, wakes) = tell(&first, &[notes, screen]);
+    assert_eq!(reply, "OK\n");
+    assert!(
+        meta_moved(&wakes),
+        "the claimant's own entry is back: {wakes:?}"
+    );
+    assert_eq!(standing().as_deref(), Some(first.as_str()));
+    assert_eq!(needs_read(ctx), Some(strings(&[notes, screen])));
+    filed();
+
+    let late = codex("an SSH deploy key for the site (+1 more)");
+    assert_eq!(
+        tell(&late, &["an SSH deploy key for the site", changelog]).0,
+        "OK\n"
+    );
+    assert_eq!(
+        standing().as_deref(),
+        Some(first.as_str()),
+        "a set told before its entry waits for it"
+    );
+    assert_eq!(put(&late), "OK\n");
+    assert_eq!(standing(), Some(codex(changelog)));
+    assert_eq!(needs_read(ctx), Some(strings(&[changelog])));
+    assert_eq!(filed(), vec![strings(&["site-deployer-key"])]);
+
+    let release =
+        "Codex needs you: the release signing certificate (+1 more) \u{2014} waits on you";
+    assert_eq!(put(release), "OK\n");
+    assert_eq!(
+        standing(),
+        None,
+        "an entry leading with a credential comes down"
+    );
+    assert_eq!(
+        tell(release, &["the release signing certificate", notes]).0,
+        "OK\n"
+    );
+    assert_eq!(
+        standing().as_deref(),
+        Some("Codex needs you: approve the 0.48.0 release notes \u{2014} waits on you")
+    );
+    assert_eq!(needs_read(ctx), Some(strings(&[notes])));
+    assert_eq!(filed(), Vec::<Vec<String>>::new(), "the release machine's");
+
+    assert_eq!(put(NEEDS_ENTRY), "OK\n");
+    let (reply, wakes) = tell(NEEDS_ENTRY, &["a", "b", "c"]);
+    assert_eq!(reply, "OK\n");
+    assert!(
+        !meta_moved(&wakes),
+        "CONTROL: no credential, no entry move: {wakes:?}"
+    );
+    assert_eq!(standing().as_deref(), Some(NEEDS_ENTRY));
+    assert_eq!(needs_read(ctx), Some(strings(&["a", "b", "c"])));
+    assert_eq!(filed(), Vec::<Vec<String>>::new());
+
+    let (reply, _) = serve(&format!(
+        "set harness_needs entry={} need={} bogus=1",
+        needs_entry(),
+        pct("the notary password")
+    ));
+    assert!(
+        reply.starts_with("ERR usage: meta set harness_needs"),
+        "{reply}"
+    );
+    assert_eq!(needs_read(ctx), Some(strings(&["a", "b", "c"])), "CONTROL");
+    assert_eq!(filed(), Vec::<Vec<String>>::new(), "CONTROL: nothing filed");
+}
+
+/// What HX-07's claimant writes.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hx07Verb {
+    Send,
+    Key,
+    /// A turn with the default submit: its Enter pressed through the seam.
+    Turn,
+    /// A turn whose Enter is `submit=guarded:<re>`'s, pressed under the terminal lock.
+    GuardedTurn,
+}
+
+/// Where HX-07 puts a person's key against one of the claimant's writes.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hx07Window {
+    /// Only the person's free-running keys, in bursts, wherever they fall.
+    Free,
+    /// The person's hands off for the whole write: what it does when nobody types.
+    Hushed,
+    /// One key processed after the claimant read `human_seq` and before it wrote.
+    BeforeWrite,
+    /// The person's hands off but for one key processed inside a turn, after every look the turn
+    /// takes before its Enter and before that Enter is written
+    /// ([`super::control_session::set_before_submit_for_test`]).
+    BeforeEnter,
+}
+
+/// One write of HX-07's claimant: the `human_seq` it read, its bytes, and its reply.
+#[cfg(unix)]
+#[derive(Debug)]
+struct Hx07Write {
+    verb: Hx07Verb,
+    window: Hx07Window,
+    read: u64,
+    text: Vec<u8>,
+    reply: String,
+}
+
+#[cfg(unix)]
+impl Hx07Write {
+    /// The first line of its reply.
+    fn head(&self) -> &str {
+        self.reply.lines().next().unwrap_or_default()
+    }
+
+    /// A word `<key>=<n>` of its reply's first line.
+    fn count(&self, key: &str) -> Option<usize> {
+        self.head().split_whitespace().find_map(|w| {
+            w.strip_prefix(key)
+                .and_then(|w| w.strip_prefix('='))
+                .and_then(|n| n.parse().ok())
+        })
+    }
+
+    /// How many Enters a turn's reply says it pressed: `pressed=<n>`, else one for a submitted
+    /// turn and none for any other.
+    fn presses(&self) -> usize {
+        self.count("pressed")
+            .unwrap_or(usize::from(self.head().contains(" submitted=1 ")))
+    }
+
+    /// The bytes its reply says reached the program, in the order they did: a `send`'s or
+    /// `key`'s whole text on `OK` and nothing otherwise; a turn's text where it pasted or
+    /// pressed, then each Enter it pressed.
+    fn landed(&self) -> Vec<u8> {
+        match self.verb {
+            Hx07Verb::Send | Hx07Verb::Key if self.head() == "OK" => self.text.clone(),
+            Hx07Verb::Send | Hx07Verb::Key => Vec::new(),
+            Hx07Verb::Turn | Hx07Verb::GuardedTurn => {
+                let presses = self.presses();
+                let mut bytes = Vec::new();
+                if presses > 0 || self.count("pasted").is_some_and(|n| n > 0) {
+                    bytes.extend_from_slice(&self.text);
+                }
+                bytes.extend(std::iter::repeat_n(b'\r', presses));
+                bytes
+            }
+        }
+    }
+
+    /// Whether it took effect: a `send` or `key` answered `OK`, a turn that pressed Enter.
+    fn went(&self) -> bool {
+        match self.verb {
+            Hx07Verb::Send | Hx07Verb::Key => self.head() == "OK",
+            Hx07Verb::Turn | Hx07Verb::GuardedTurn => self.presses() > 0,
+        }
+    }
+
+    /// Whether its reply is the person's skip: `OK skipped reason=person`, or a turn's.
+    fn yielded(&self) -> bool {
+        let head = self.head();
+        head.starts_with("OK") && head.contains("skipped reason=person")
+    }
+}
+
+/// One HX-07 run: every byte the program read, the person's keys in the order the main thread
+/// took them (each with `human_seq` as that key left it), and the claimant's writes.
+#[cfg(unix)]
+struct Hx07Run {
+    out: Vec<u8>,
+    person: Vec<(u8, u64)>,
+    writes: Vec<Hx07Write>,
+}
+
+/// What the main thread is handed: a person's key (acknowledged once it is written, where the
+/// claimant forces one), or a control write delivered as `Wake::Input` delivers one.
+#[cfg(unix)]
+enum Hx07Main {
+    Person(u8, Option<std::sync::mpsc::Sender<()>>),
+    /// Answered once everything handed before it was taken.
+    Sync(std::sync::mpsc::Sender<()>),
+    Control(Box<Hx07Control>),
+}
+
+/// A control write for the main thread: the event, its mark and fence, and where its outcome goes.
+#[cfg(unix)]
+struct Hx07Control {
+    ev: crate::input::InputEvent,
+    mark: crate::control_input_ack::InputMark,
+    fence: Option<crate::session_timeline::SupervisorInputDelivery>,
+    reply: std::sync::mpsc::Sender<crate::input::InputOutcome>,
+}
+
+/// HX-07's script: per round, each verb once with a person's key forced between its read and
+/// its write; each turn once more with one forced before its Enter is written; each turn once
+/// with the person's hands off; and the rest left to the person's free-running bursts.
+#[cfg(unix)]
+fn hx07_script() -> Vec<(Hx07Verb, Hx07Window)> {
+    let mut script = Vec::new();
+    for _ in 0..3 {
+        for verb in [Hx07Verb::Send, Hx07Verb::Key] {
+            script.push((verb, Hx07Window::BeforeWrite));
+            script.extend(std::iter::repeat_n((verb, Hx07Window::Free), 6));
+        }
+        for verb in [Hx07Verb::Turn, Hx07Verb::GuardedTurn] {
+            script.push((verb, Hx07Window::BeforeWrite));
+            script.push((verb, Hx07Window::BeforeEnter));
+            script.push((verb, Hx07Window::Hushed));
+            script.extend(std::iter::repeat_n((verb, Hx07Window::Free), 3));
+        }
+    }
+    script
+}
+
+/// One HX-07 run on a headless window whose session's program reads a pipe: claude-code-alab's
+/// proven claim of every duty stands (a scope fixture, as wide as its roster row); a person
+/// types `a`-`y` through the window's own input path (`as=person`'s route,
+/// [`crate::control::control_input::person_input`]) while the claimant,
+/// on its own connection, types [`hx07_script`]'s `send`, `key` and `turn` with
+/// `if-supervisor=`, `if-supervisor-revision=` and `harness-duty=turn-end`, and, where `fenced`,
+/// `if-human=` the `human_seq` it read just before. Each write takes the route the dispatch
+/// gives it: a fenced `send`/`key` the fenced arm under the terminal lock
+/// ([`super::control_input::cmd_send_fenced_observed`]), as does the Enter of a turn under
+/// `if-human=` or `submit=guarded:`; an unfenced one and every other write of a turn go by the
+/// seam, delivered on the main thread as `Wake::Input` delivers it (the scoped fence checked
+/// again, then [`crate::App::input_to_session_observed`]). The program echoes what the harness
+/// types.
+#[cfg(unix)]
+fn hx07_run(fenced: bool) -> Hx07Run {
+    use super::control_input::{InputFence, cmd_key_fenced_observed, cmd_send_fenced_observed};
+    use super::control_session::{TurnIo, cmd_turn, turn_paste_event};
+    use crate::control_input_ack::InputMark;
+    use crate::input::{InputEvent, InputOutcome, Source};
+    use crate::session_timeline::{
+        SupervisorInputCaller, SupervisorInputDelivery, SupervisorInputFence,
+    };
+    use aterm_agent::harness::contract::Scope;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    const PATIENCE: Duration = Duration::from_secs(60);
+    const CONN: u64 = 74;
+
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    aterm_pty::set_nonblocking(rd.as_raw_fd(), true).expect("nonblocking program end");
+    let mut program = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+    let wr = wr.into_raw_fd();
+    aterm_pty::set_nonblocking(wr, true).expect("nonblocking master");
+    let mut app =
+        crate::App::headless_for_test_with_sink(Arc::new(aterm_session::sink::SinkWriter::new(wr)));
+    let (term, ctx) = {
+        let session = app.pool.get(0).expect("session 0");
+        (Arc::clone(&session.term), Arc::clone(&session.ctx))
+    };
+    ctx.sink.note_master_nonblocking(true);
+    let store = app.store.clone();
+    let holder = format!("claude-code-alab@{}", stand_in());
+    claim_scoped(&ctx, &holder, &Scope::ALL, CONN);
+    let revision = ctx
+        .meta
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .supervisor_authority(crate::metrics::now_us())
+        .revision();
+    let caller = SupervisorInputCaller {
+        principal: super::Principal::Instance,
+        connection: Some(CONN),
+        peer: Some(stand_in()),
+        proof: Some(running()),
+    };
+
+    let (main_tx, main_rx) = mpsc::channel::<Hx07Main>();
+    let claimant_done = AtomicBool::new(false);
+    let hushed = Mutex::new(false);
+    let drained = AtomicBool::new(false);
+    let mut person: Vec<(u8, u64)> = Vec::new();
+    let (writes, out) = std::thread::scope(|s| {
+        // The program: it echoes what the harness types (an Enter draws a response) and not the
+        // person's letters, so the screen is quiet whenever the harness is.
+        let reader = s.spawn(|| {
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let stopping = drained.load(Ordering::Acquire);
+                match program.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut echo = Vec::new();
+                        for &b in &buf[..n] {
+                            match b {
+                                b'\r' => echo.extend_from_slice(b"\r\nresponse\r\n"),
+                                b if b.is_ascii_lowercase() => {}
+                                b => echo.push(b),
+                            }
+                        }
+                        term.lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .process(&echo);
+                        out.extend_from_slice(&buf[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopping {
+                            break;
+                        }
+                        aterm_uds::deadline::poll_yield();
+                    }
+                    Err(e) => panic!("read the program's input: {e}"),
+                }
+            }
+            out
+        });
+        // The person: bursts of one to eight keys a millisecond apart, and pauses from 2 ms to
+        // a third of a second between them, so a key falls anywhere in a write; held off while
+        // `hushed` holds, checked and handed under its lock so no key follows a hush.
+        let typist = {
+            let main = main_tx.clone();
+            let (done, hushed) = (&claimant_done, &hushed);
+            s.spawn(move || {
+                const PAUSES_MS: [u64; 7] = [2, 5, 20, 80, 160, 240, 320];
+                let mut letters = (b'a'..=b'y').cycle();
+                for burst in 0usize.. {
+                    for _ in 0..=burst % 8 {
+                        if done.load(Ordering::Acquire) {
+                            return;
+                        }
+                        {
+                            let hush = hushed.lock().unwrap_or_else(PoisonError::into_inner);
+                            if !*hush {
+                                let c = letters.next().expect("cycles");
+                                if main.send(Hx07Main::Person(c, None)).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    std::thread::sleep(Duration::from_millis(PAUSES_MS[burst % PAUSES_MS.len()]));
+                }
+            })
+        };
+        let claimant = {
+            let main = main_tx.clone();
+            let (ctx, term, store, holder, caller) = (&ctx, &term, &store, &holder, &caller);
+            let (done, hushed) = (&claimant_done, &hushed);
+            s.spawn(move || {
+                // Hold the person off (`on`) or let them go on; a hush takes every key handed
+                // before it first.
+                let hush = |on: bool| {
+                    *hushed.lock().unwrap_or_else(PoisonError::into_inner) = on;
+                    if on {
+                        let (ack, acked) = mpsc::channel();
+                        main.send(Hx07Main::Sync(ack))
+                            .expect("the main thread syncs");
+                        acked
+                            .recv_timeout(PATIENCE)
+                            .expect("hang: the main thread never synced");
+                    }
+                };
+                let force = || hx07_force(&main);
+                let post = |ev: InputEvent, mark: InputMark| -> Result<InputOutcome, String> {
+                    let fence = super::carried_fence();
+                    let mark = mark
+                        .supervised(fence.as_ref().and_then(SupervisorInputDelivery::batch))
+                        .pending_supervisor();
+                    if !mark.supervisor_queue_ready() {
+                        return Err(crate::session_timeline::SCOPED_INPUT_DENIED.to_string());
+                    }
+                    let (reply, replied) = mpsc::channel();
+                    main.send(Hx07Main::Control(Box::new(Hx07Control {
+                        ev,
+                        mark,
+                        fence,
+                        reply,
+                    })))
+                    .map_err(|e| e.to_string())?;
+                    Ok(replied
+                        .recv_timeout(PATIENCE)
+                        .expect("hang: the main thread never answered a control write"))
+                };
+                let mut writes = Vec::new();
+                for (n, (verb, window)) in hx07_script().into_iter().enumerate() {
+                    hush(matches!(
+                        window,
+                        Hx07Window::Hushed | Hx07Window::BeforeEnter
+                    ));
+                    let read = ctx.human_input.seq();
+                    let text: Vec<u8> = match verb {
+                        Hx07Verb::Send => format!("S{n:02}X").into_bytes(),
+                        Hx07Verb::Key => vec![b"0123456789"[n % 10]],
+                        Hx07Verb::Turn => format!("T{n:02}X").into_bytes(),
+                        Hx07Verb::GuardedTurn => format!("G{n:02}X").into_bytes(),
+                    };
+                    let body = String::from_utf8(text.clone()).expect("ascii");
+                    let human = if fenced {
+                        format!(" if-human={read}")
+                    } else {
+                        String::new()
+                    };
+                    let word = match verb {
+                        Hx07Verb::Send => "send",
+                        Hx07Verb::Key => "key",
+                        Hx07Verb::Turn | Hx07Verb::GuardedTurn => "turn",
+                    };
+                    let tail = match verb {
+                        Hx07Verb::Turn => " idle=20 timeout=60000",
+                        Hx07Verb::GuardedTurn => " idle=20 timeout=60000 submit=guarded:G[0-9]+X",
+                        Hx07Verb::Send | Hx07Verb::Key => "",
+                    };
+                    let line = format!(
+                        "if-supervisor={holder} if-supervisor-revision={revision} \
+                         harness-duty=turn-end{human}{tail} {body}"
+                    );
+                    if window == Hx07Window::BeforeWrite {
+                        force();
+                    }
+                    let (opts, rest) = super::control_input::take_leading_options(
+                        aterm_types::control_verbs::input_of(word),
+                        &line,
+                    );
+                    assert!(opts.refusal.is_none(), "{word} {line}: {:?}", opts.refusal);
+                    let request = opts.supervisor_request().expect("the typed group");
+                    let fence = SupervisorInputFence::authorize(
+                        ctx,
+                        request,
+                        caller,
+                        crate::metrics::now_us(),
+                    )
+                    .expect("claude-code-alab's typing claim admits the write");
+                    let delivery = SupervisorInputDelivery::new(ctx, fence);
+                    delivery
+                        .check(ctx, crate::metrics::now_us())
+                        .expect("the claim still stands");
+                    let _carried = super::CarriedFence::enter(delivery.clone());
+                    let _producer = delivery.producer();
+                    let input_verb = match verb {
+                        Hx07Verb::Send => crate::session_log::InputVerb::Send,
+                        Hx07Verb::Key => crate::session_log::InputVerb::Key,
+                        Hx07Verb::Turn | Hx07Verb::GuardedTurn => {
+                            crate::session_log::InputVerb::Turn
+                        }
+                    };
+                    let mark = InputMark::at_epoch(
+                        ctx,
+                        0,
+                        aterm_slog::Actor::Ctl,
+                        input_verb,
+                        None,
+                        matches!(verb, Hx07Verb::Turn | Hx07Verb::GuardedTurn),
+                    )
+                    .supervised(delivery.batch());
+                    let reply = match verb {
+                        Hx07Verb::Send | Hx07Verb::Key if opts.if_human.is_some() => {
+                            let fence = InputFence {
+                                human: opts.if_human,
+                                ..InputFence::default()
+                            };
+                            if verb == Hx07Verb::Key {
+                                cmd_key_fenced_observed(
+                                    term,
+                                    ctx,
+                                    &fence,
+                                    rest,
+                                    Some(mark.completion()),
+                                )
+                            } else {
+                                cmd_send_fenced_observed(
+                                    term,
+                                    ctx,
+                                    &fence,
+                                    rest,
+                                    Some(mark.completion()),
+                                )
+                            }
+                        }
+                        Hx07Verb::Send => super::control_input::input_reply_to_str(post(
+                            InputEvent::KeySequence(super::control_input::send_bytes(rest)),
+                            mark.completion().into_mark(),
+                        )),
+                        Hx07Verb::Key => super::control_input::input_reply_to_str(post(
+                            super::parse_key(rest).expect("a key"),
+                            mark.completion().into_mark(),
+                        )),
+                        Hx07Verb::Turn | Hx07Verb::GuardedTurn => {
+                            if window == Hx07Window::BeforeEnter {
+                                let main = main.clone();
+                                let forced = std::cell::Cell::new(false);
+                                super::control_session::set_before_submit_for_test(Some(Box::new(
+                                    move || {
+                                        if !forced.replace(true) {
+                                            hx07_force(&main);
+                                        }
+                                    },
+                                )));
+                            }
+                            let refused = std::cell::RefCell::new(None);
+                            let applied = |ev: InputEvent| {
+                                let wrote = super::turn_write(ctx, Some(&delivery), || {
+                                    post(ev, mark.completion().into_mark())
+                                });
+                                let delivered = wrote.is_ok();
+                                *refused.borrow_mut() = wrote.err().flatten();
+                                delivered
+                            };
+                            let paste = |text: &str| applied(turn_paste_event(text));
+                            let press = |name: &str| super::parse_key(name).is_some_and(applied);
+                            let momentum = || Ok((0.0, std::time::Instant::now()));
+                            let reply = cmd_turn(
+                                term,
+                                store,
+                                0,
+                                rest,
+                                ctx,
+                                &TurnIo {
+                                    paste: &paste,
+                                    press: &press,
+                                    key: &applied,
+                                    momentum: &momentum,
+                                    mark: Some(&mark),
+                                    refused: &|| refused.take(),
+                                    ..TurnIo::paste_only()
+                                },
+                            );
+                            super::control_session::set_before_submit_for_test(None);
+                            reply
+                        }
+                    };
+                    writes.push(Hx07Write {
+                        verb,
+                        window,
+                        read,
+                        text,
+                        reply,
+                    });
+                }
+                done.store(true, Ordering::Release);
+                writes
+            })
+        };
+        drop(main_tx);
+        let wid = crate::WindowId(0);
+        loop {
+            match main_rx.recv_timeout(PATIENCE) {
+                Ok(Hx07Main::Person(c, ack)) => {
+                    let ev = super::parse_key(&char::from(c).to_string()).expect("a letter");
+                    let outcome = app.input_to_session_observed(
+                        wid,
+                        ev,
+                        Source::Human,
+                        Some(0),
+                        crate::app_input::PressPhase::Initial,
+                        None,
+                    );
+                    assert_eq!(
+                        outcome,
+                        InputOutcome::Ok,
+                        "the person's key {}",
+                        char::from(c)
+                    );
+                    person.push((c, ctx.human_input.seq()));
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
+                }
+                Ok(Hx07Main::Sync(ack)) => {
+                    let _ = ack.send(());
+                }
+                Ok(Hx07Main::Control(control)) => {
+                    let Hx07Control {
+                        ev,
+                        mark,
+                        fence,
+                        reply,
+                    } = *control;
+                    if fence
+                        .as_ref()
+                        .is_some_and(|fence| fence.check(&ctx, crate::metrics::now_us()).is_err())
+                    {
+                        let _ = reply.send(InputOutcome::WriteFailed);
+                        continue;
+                    }
+                    let outcome = app.input_to_session_observed(
+                        wid,
+                        ev,
+                        Source::Controller,
+                        Some(0),
+                        crate::app_input::PressPhase::Initial,
+                        Some(mark.completion()),
+                    );
+                    let _ = reply.send(outcome);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => panic!("hang: no input for a minute"),
+            }
+        }
+        typist.join().expect("the person");
+        let writes = claimant.join().expect("the claimant");
+        let since = std::time::Instant::now();
+        while ctx.sink.ordered_egress_count() > 0 || ctx.sink.spilled_bytes() > 0 {
+            assert!(
+                since.elapsed() < PATIENCE,
+                "hang: queued input never reached the program"
+            );
+            aterm_uds::deadline::poll_yield();
+        }
+        drained.store(true, Ordering::Release);
+        (writes, reader.join().expect("the reader"))
+    });
+    ctx.sink.sever_input();
+    Hx07Run {
+        out,
+        person,
+        writes,
+    }
+}
+
+/// A person's key, forced: handed to the main thread, which acknowledges it once it is written.
+#[cfg(unix)]
+fn hx07_force(main: &std::sync::mpsc::Sender<Hx07Main>) {
+    let (ack, acked) = std::sync::mpsc::channel();
+    main.send(Hx07Main::Person(b'z', Some(ack)))
+        .expect("the main thread takes the key");
+    acked
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("hang: the person's forced key was never written");
+}
+
+/// HX-07's detector over one run: every way the run broke the law that the person's keys arrive
+/// whole and in order and that each of the claimant's writes either lands whole, behind every
+/// key the person typed before its read and ahead of every key typed after, or answers the
+/// person's skip having written nothing it should not. A turn cut after its text names the
+/// person and leaves that text, its Enter unpressed.
+#[cfg(unix)]
+fn hx07_breaks(run: &Hx07Run) -> Vec<String> {
+    let mut breaks = Vec::new();
+    let typed: Vec<u8> = run
+        .out
+        .iter()
+        .copied()
+        .filter(u8::is_ascii_lowercase)
+        .collect();
+    let injected: Vec<u8> = run.person.iter().map(|(c, _)| *c).collect();
+    if typed != injected {
+        let at = typed
+            .iter()
+            .zip(&injected)
+            .position(|(a, b)| a != b)
+            .unwrap_or(typed.len().min(injected.len()));
+        breaks.push(format!(
+            "the person's keys: {} typed, {} reached the program, first apart at {at}",
+            injected.len(),
+            typed.len()
+        ));
+    }
+    // Every byte that is not the person's, with its place in what the program read.
+    let harness: Vec<(usize, u8)> = run
+        .out
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, b)| !b.is_ascii_lowercase())
+        .collect();
+    let persons_before = |at: usize| {
+        run.out[..at]
+            .iter()
+            .filter(|b| b.is_ascii_lowercase())
+            .count()
+    };
+    let mut h = 0;
+    for (n, w) in run.writes.iter().enumerate() {
+        let landed = w.landed();
+        let got: Vec<u8> = harness
+            .iter()
+            .skip(h)
+            .take(landed.len())
+            .map(|(_, b)| *b)
+            .collect();
+        if got != landed {
+            breaks.push(format!(
+                "write {n} ({:?} {:?}, read {}) answered {:?}: {:?} should have reached the \
+                 program next, {:?} did",
+                w.verb,
+                w.window,
+                w.read,
+                w.reply.lines().next().unwrap_or_default(),
+                String::from_utf8_lossy(&landed),
+                String::from_utf8_lossy(&got)
+            ));
+            break;
+        }
+        if landed.is_empty() {
+            continue;
+        }
+        let first = harness[h].0;
+        let last = harness[h + landed.len() - 1].0;
+        h += landed.len();
+        if w.went() {
+            let ahead = persons_before(last + 1);
+            if let Some(&(c, seq)) = ahead.checked_sub(1).and_then(|k| run.person.get(k))
+                && seq > w.read
+            {
+                breaks.push(format!(
+                    "write {n} ({:?} {:?}) read human_seq={} and went whole ({:?}) behind the \
+                     person's {:?}, typed at human_seq={seq}",
+                    w.verb,
+                    w.window,
+                    w.read,
+                    w.reply.lines().next().unwrap_or_default(),
+                    char::from(c)
+                ));
+            }
+        }
+        let seen = run.person.iter().filter(|(_, seq)| *seq <= w.read).count();
+        if persons_before(first) < seen {
+            breaks.push(format!(
+                "write {n} ({:?} {:?}) overtook a key the person typed before its read \
+                 (human_seq={})",
+                w.verb, w.window, w.read
+            ));
+        }
+        if matches!(w.verb, Hx07Verb::Send | Hx07Verb::Key)
+            && run.out[first..=last].iter().any(u8::is_ascii_lowercase)
+        {
+            breaks.push(format!(
+                "write {n} ({:?}) was torn by a person's key",
+                w.verb
+            ));
+        }
+    }
+    if h != harness.len() && breaks.is_empty() {
+        breaks.push(format!(
+            "{} bytes reached the program that no write answered for: {:?}",
+            harness.len() - h,
+            String::from_utf8_lossy(&harness[h..].iter().map(|(_, b)| *b).collect::<Vec<_>>())
+        ));
+    }
+    breaks
+}
+
+/// The run's replies, counted per verb and window, for a failure message.
+#[cfg(unix)]
+fn hx07_tally(run: &Hx07Run) -> String {
+    let mut tally = std::collections::BTreeMap::<String, usize>::new();
+    for w in &run.writes {
+        let first = w.reply.lines().next().unwrap_or_default();
+        let word = if w.went() {
+            "went"
+        } else if w.yielded() {
+            "person"
+        } else {
+            first
+        };
+        *tally
+            .entry(format!("{:?}/{:?}: {word}", w.verb, w.window))
+            .or_default() += 1;
+    }
+    format!("{} person keys; {tally:?}", run.person.len())
+}
+
+/// HX-07 (`docs/DESIGN-harness-interface-2026-11-12.md` §5): A TAB'S OWN PROCESS TYPES UNDER
+/// `if-human=` WHILE A PERSON TYPES, AND NONE OF THE PERSON'S KEYS IS LOST OR REORDERED.
+/// claude-code-alab's proven claim of every duty stands on a headless window's session (a scope
+/// fixture, as wide as its roster row); a person types through the window's own input path, in
+/// bursts, with hands off, and once forced into each of the claimant's windows (between its read
+/// of `human_seq` and its write; inside a turn, after every look it takes before its Enter and
+/// before that Enter is written), while the claimant types `send`, `key`, `turn` and a
+/// `submit=guarded:` turn with the typed group and `if-human=` ([`hx07_run`]). The detector
+/// ([`hx07_breaks`]) holds the person's keys to arriving whole and in order and each write to
+/// landing whole behind the keys before its read and ahead of those after, or to answering the
+/// person's skip. A turn's Enter, default or guarded, is written under the terminal lock that
+/// compares `human_seq` (`fenced_submit`), so a key forced before it is the person's skip, the
+/// text left unsubmitted. NEGATIVE CONTROL: the same run without `if-human=` breaks that law for
+/// each verb, so the detector sees the interleaving the fence is there to prevent.
+#[test]
+#[cfg(unix)]
+fn a_tabs_own_process_types_under_if_human_while_keys_are_injected_and_none_is_lost_or_reordered() {
+    let control = hx07_run(false);
+    let control_breaks = hx07_breaks(&control);
+    for verb in [
+        Hx07Verb::Send,
+        Hx07Verb::Key,
+        Hx07Verb::Turn,
+        Hx07Verb::GuardedTurn,
+    ] {
+        assert!(
+            control_breaks
+                .iter()
+                .any(|b| b.contains(&format!("({verb:?} "))),
+            "NEGATIVE CONTROL: without if-human= a {verb:?} lands behind a newer key: {} {:#?}",
+            hx07_tally(&control),
+            control_breaks
+        );
+    }
+    let fenced = hx07_run(true);
+    let breaks = hx07_breaks(&fenced);
+    assert!(
+        breaks.is_empty(),
+        "HX-07: {} {:#?}",
+        hx07_tally(&fenced),
+        breaks
+    );
+    for verb in [
+        Hx07Verb::Send,
+        Hx07Verb::Key,
+        Hx07Verb::Turn,
+        Hx07Verb::GuardedTurn,
+    ] {
+        let forced: Vec<&Hx07Write> = fenced
+            .writes
+            .iter()
+            .filter(|w| {
+                w.verb == verb
+                    && matches!(w.window, Hx07Window::BeforeWrite | Hx07Window::BeforeEnter)
+            })
+            .collect();
+        assert!(
+            forced.iter().all(|w| w.yielded()),
+            "a {verb:?} after the person's key answers the person's skip: {forced:#?}"
+        );
+        assert!(
+            fenced.writes.iter().any(|w| w.verb == verb && w.went()),
+            "some {verb:?} went whole: {}",
+            hx07_tally(&fenced)
+        );
+    }
 }

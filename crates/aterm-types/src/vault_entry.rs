@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Where the vault's subscriber writes a plain entry, and the two GitHub token entries, named
-//! once. aterm-secrets classes and materializes the entries (`entry_class`,
-//! `materialize::target_path`), and agh adopts the two tokens; neither links the other, so the
+//! Where an older build's vault subscriber wrote a plain entry, and the two GitHub token entries,
+//! named once. aterm-secrets classes the entries and reads them in place (`entry_class`,
+//! `client::read_in_place`), and agh adopts the two tokens; neither links the other, so the
 //! names live here, below both.
 
 use std::path::{Path, PathBuf};
@@ -19,8 +19,9 @@ pub const DEV_GH_TOKEN: &str = "gh_access_token";
 /// `gh:release` want.
 pub const RELEASE_GH_TOKEN: &str = "gh_access_token_alabsystems";
 
-/// Where plain entry `name` lands under `home`: `home/.secrets/name`. It does not judge the
-/// name; `aterm_secrets::materialize::target_path` does, and lands a plain name here.
+/// Where an older build's subscriber wrote plain entry `name` under `home`: `home/.secrets/name`.
+/// No build writes or reads it now; a test plants an older build's file there. It does not judge
+/// the name.
 #[must_use]
 pub fn plain_entry_path(home: &Path, name: &str) -> PathBuf {
     home.join(SECRETS_DIR).join(name)

@@ -156,9 +156,7 @@ impl App {
                 .theme_session_target(session)
                 .and_then(|sid| self.set_session_theme_checked(sid, &selector)),
             ThemeCtlOp::SessionClear => self.theme_session_target(session).map(|sid| {
-                if self.pool.theme(sid).is_some() {
-                    self.set_session_theme(sid, None);
-                }
+                self.commit_session_theme(sid, None);
                 self.session_theme_status_line(sid)
             }),
         };
@@ -191,7 +189,7 @@ impl App {
         if let Some(why) = self.session_theme_unavailable(selector) {
             return Err(format!("theme session {selector:?}: {why}"));
         }
-        self.set_session_theme(
+        self.commit_session_theme(
             sid,
             Some(crate::session_theme::SessionTheme {
                 selector: selector.to_string(),

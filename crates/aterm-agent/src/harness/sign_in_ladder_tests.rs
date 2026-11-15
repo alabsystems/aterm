@@ -45,9 +45,11 @@ fn a_machine_with_nothing_has_no_route_and_names_every_one_it_tried() {
 }
 
 /// Each route's words at their longest (every field's longest word, the longest vault finding,
-/// many hosts, the longest way a run ends with its opener's longest reason, a failed run's
-/// prefix) fit the record and the ledger reason whole, the upkeep's and a renewal by hand's, so
-/// no route a no-route or failed record names, and no reason, is ever cut off.
+/// many hosts, the longest way a recorded run ends with its opener's longest reason, a failed
+/// run's prefix) fit the record and the ledger reason whole, the upkeep's and a renewal by
+/// hand's, so no route a no-route or failed record names, and no reason, is ever cut off. A
+/// deferred run is no record's: the ladder returns before it records one, and a renewal by hand
+/// records none (`cli::note_hand_renewal`); its words are the Account card's diagnostic alone.
 #[test]
 fn the_longest_words_fit_the_record_and_the_ledger_whole() {
     use super::super::accounts::{
@@ -142,7 +144,7 @@ fn the_longest_words_fit_the_record_and_the_ledger_whole() {
     .into_iter()
     .flat_map(|renewal| {
         mets.iter()
-            .map(move |met| how_it_ended(renewal, Some(i32::MIN), met.as_ref()))
+            .map(move |met| how_it_ended(renewal, Some(i32::MIN), met.as_ref(), None))
     })
     .collect();
     assert!(
@@ -199,12 +201,12 @@ fn the_longest_words_fit_the_record_and_the_ledger_whole() {
 #[test]
 fn a_run_that_made_no_login_says_how_it_exited_and_claims_no_refusal() {
     use super::super::cli::Renewal;
-    let said = how_it_ended(Renewal::AuthFailed, Some(1), None);
+    let said = how_it_ended(Renewal::AuthFailed, Some(1), None, None);
     assert!(
         said.contains("exited 1") && said.contains("no login made"),
         "{said}"
     );
-    assert!(!how_it_ended(Renewal::AuthFailed, None, None).contains("refused"));
+    assert!(!how_it_ended(Renewal::AuthFailed, None, None, None).contains("refused"));
     assert!(!said.contains("refused"), "{said}");
 }
 
@@ -218,7 +220,7 @@ fn a_run_that_made_no_login_says_how_it_exited_and_claims_no_refusal() {
 fn a_run_that_met_a_bot_check_names_it_on_record_and_keeps_its_backoff_key() {
     use super::super::cli::Renewal;
     let bot = Met::new(MetWord::BotCheck, Some("claude.ai"));
-    let said = how_it_ended(Renewal::AuthFailed, Some(1), Some(&bot));
+    let said = how_it_ended(Renewal::AuthFailed, Some(1), Some(&bot), None);
     let after = |said: &str, what: &str| {
         said.find(what)
             .is_some_and(|at| said.find(&bot.words()).is_some_and(|met| at < met))
@@ -231,10 +233,10 @@ fn a_run_that_met_a_bot_check_names_it_on_record_and_keeps_its_backoff_key() {
         said.contains("Cloudflare") && said.contains("claude.ai") && !said.contains("person"),
         "{said}"
     );
-    let unfinished = how_it_ended(Renewal::Failed, None, Some(&bot));
+    let unfinished = how_it_ended(Renewal::Failed, None, Some(&bot), None);
     assert!(
         unfinished.contains(&bot.words())
-            && unfinished.starts_with(&how_it_ended(Renewal::Failed, None, None)),
+            && unfinished.starts_with(&how_it_ended(Renewal::Failed, None, None, None)),
         "{unfinished}"
     );
     for met in [
@@ -243,18 +245,18 @@ fn a_run_that_met_a_bot_check_names_it_on_record_and_keeps_its_backoff_key() {
         Met::new(MetWord::BlockPage, Some("claude.ai")),
         Met::new(MetWord::Stall, Some("claude.com")),
     ] {
-        let said = how_it_ended(Renewal::AuthFailed, Some(1), Some(&met));
+        let said = how_it_ended(Renewal::AuthFailed, Some(1), Some(&met), None);
         assert!(
             said.contains("exited 1") && said.ends_with(&met.words()),
             "{said}"
         );
     }
     assert_eq!(
-        how_it_ended(Renewal::Renewed, Some(0), Some(&bot)),
-        how_it_ended(Renewal::Renewed, Some(0), None),
+        how_it_ended(Renewal::Renewed, Some(0), Some(&bot), None),
+        how_it_ended(Renewal::Renewed, Some(0), None, None),
         "a run that signed in names nothing it met"
     );
-    let before = how_it_ended(Renewal::AuthFailed, Some(1), None);
+    let before = how_it_ended(Renewal::AuthFailed, Some(1), None, None);
     assert!(
         before.contains("exited 1") && !before.contains("Cloudflare"),
         "{before}"
@@ -267,7 +269,7 @@ fn a_run_that_met_a_bot_check_names_it_on_record_and_keeps_its_backoff_key() {
     };
     let record = failed_words(Route::Profile, &said, &read);
     assert!(
-        record.starts_with("profile: claude auth login exited 1")
+        record.starts_with("profile: the sign-in exited 1")
             && record.contains(&bot.words())
             && record.contains("headless-browser(installed)"),
         "{record}"
@@ -700,15 +702,15 @@ fn a_move_ends_every_wait_but_that_of_a_row_a_page_stopped() {
 fn a_run_with_no_exit_says_why_it_failed() {
     use crate::harness::cli::Renewal;
     assert_eq!(
-        how_it_ended_because(Renewal::Failed, None, None, Some("it will not run")),
+        how_it_ended(Renewal::Failed, None, None, Some("it will not run")),
         format!(
             "{}: it will not run",
-            how_it_ended(Renewal::Failed, None, None)
+            how_it_ended(Renewal::Failed, None, None, None)
         )
     );
     assert_eq!(
-        how_it_ended_because(Renewal::AuthFailed, Some(1), None, Some("stale")),
-        how_it_ended(Renewal::AuthFailed, Some(1), None),
+        how_it_ended(Renewal::AuthFailed, Some(1), None, Some("stale")),
+        how_it_ended(Renewal::AuthFailed, Some(1), None, None),
         "only a run with no ending of its own takes the cause"
     );
     let met = crate::harness::open_url::Met::new(
@@ -716,9 +718,157 @@ fn a_run_with_no_exit_says_why_it_failed() {
         Some("claude.ai"),
     );
     assert_eq!(
-        how_it_ended_because(Renewal::Failed, None, Some(&met), Some("past its deadline")),
-        how_it_ended(Renewal::Failed, None, Some(&met)),
+        how_it_ended(Renewal::Failed, None, Some(&met), Some("past its deadline")),
+        how_it_ended(Renewal::Failed, None, Some(&met), None),
         "what the page met says more than the deadline"
+    );
+}
+
+/// A run's end has one wording wherever it is read: the row's record ([`how_it_ended`]), a
+/// shared-custody run's diagnostic and the fact menu's `LoginDiagnostic` all say it from one
+/// function, name no provider's command, say how the run ended once, and keep what it met and,
+/// for a deferred run, its exit. The record a shared-custody run writes is tied to it by
+/// `shared_failure_diagnostics_do_not_change_custody_or_retry_policy`.
+#[test]
+fn a_runs_end_has_one_wording_wherever_it_is_read() {
+    use crate::harness::accounts::Row;
+    use crate::harness::accounts_sync::LoginDiagnostic;
+    use crate::harness::cli::{Renewal, RenewalExit, RenewalFailure, RenewalObservation};
+    let said_once =
+        |words: &str| words.matches(" exited ").count() + words.matches(" ended").count() <= 1;
+    let mets = [
+        None,
+        Some(Met::new(MetWord::BotCheck, Some("claude.ai"))),
+        Some(Met::new(MetWord::BrowserControl, None)),
+    ];
+    for renewal in [
+        Renewal::AuthFailed,
+        Renewal::Failed,
+        Renewal::BotCheck,
+        Renewal::NeedsPerson,
+        Renewal::Deferred,
+    ] {
+        for met in &mets {
+            for outcome in [
+                Ok(RenewalExit {
+                    code: 1,
+                    met: met.clone(),
+                }),
+                Err(RenewalFailure::new(
+                    "synthetic capture failure",
+                    met.clone(),
+                )),
+            ] {
+                let observed = RenewalObservation::from_outcome(&outcome);
+                let words = observed.ended(renewal);
+                assert!(
+                    !words.contains("claude auth login") && !words.contains("provider"),
+                    "{words}"
+                );
+                assert!(said_once(&words), "{words}");
+                assert!(
+                    met.as_ref().is_none_or(|met| words.contains(&met.words())),
+                    "what the run met is said wherever it is known: {words}"
+                );
+                assert!(
+                    !words.contains("synthetic capture failure"),
+                    "a failure's own text stays off the record: {words}"
+                );
+                assert_eq!(
+                    words,
+                    how_it_ended(renewal, observed.exit_code(), observed.met(), None),
+                    "a host's failure says no cause"
+                );
+            }
+        }
+    }
+    // A deferred run keeps its exit as every other end does.
+    let deferred = RenewalObservation::from_outcome(&Ok(RenewalExit { code: 1, met: None }))
+        .ended(Renewal::Deferred);
+    assert!(deferred.contains("the sign-in exited 1"), "{deferred}");
+    let row = Row {
+        label: "m2-3".into(),
+        ..Row::default()
+    };
+    for met in mets {
+        assert_eq!(
+            LoginDiagnostic::from_exit_for_test(&row, 0, 1, met.clone()).words(),
+            RenewalObservation::from_outcome(&Ok(RenewalExit { code: 1, met }))
+                .ended(Renewal::AuthFailed),
+        );
+    }
+}
+
+/// A RUN THAT DID NOT FINISH SAYS WHY IN CLOSED WORDS, the same whichever custody ran it: the
+/// capture's own error (`align`'s, which can name a path) is read once into [`Unfinished`]
+/// where aterm's capture makes its failure (`RenewalFailure::unfinished`), a run a signal ended
+/// says so (`RenewalExit::from_capture`), and the record says those words and never the error's
+/// text, nor that an exit was missed where nothing ran. NEGATIVE CONTROL: a host's own failure
+/// says no cause.
+#[test]
+fn a_run_that_did_not_finish_says_why_in_closed_words() {
+    use crate::harness::align::Captured;
+    use crate::harness::cli::{Renewal, RenewalExit, RenewalFailure, RenewalObservation};
+    let capture = |error: &str| {
+        RenewalObservation::from_outcome(&Err(RenewalFailure::unfinished(error.to_owned(), None)))
+            .ended(Renewal::Failed)
+    };
+    for (error, why) in [
+        (
+            "it will not run: No such file or directory (os error 2) /x/claude",
+            Unfinished::NotStarted,
+        ),
+        (
+            "it will not run: this aterm's executable was replaced since it started",
+            Unfinished::NotStarted,
+        ),
+        ("it ran past its 300000 ms deadline", Unfinished::TimedOut),
+        (
+            "it closed its output and did not exit before its deadline",
+            Unfinished::TimedOut,
+        ),
+        ("its output was unreadable: /x/pipe", Unfinished::Unread),
+    ] {
+        let words = capture(error);
+        assert_eq!(
+            words,
+            format!("the sign-in did not finish: {}", why.words()),
+            "{error}"
+        );
+        assert!(!words.contains("/x/"), "{words}");
+    }
+    let signal = RenewalObservation::from_outcome(&RenewalExit::from_capture((
+        Captured {
+            stdout: Vec::new(),
+            code: None,
+        },
+        None,
+    )))
+    .ended(Renewal::authentication_failed(None));
+    assert_eq!(signal, "the sign-in did not finish: a signal ended it");
+    assert_eq!(
+        capture("it could not be reaped: x"),
+        "the sign-in did not finish",
+        "an error none of the words names gives no cause"
+    );
+    assert_eq!(
+        RenewalObservation::from_outcome(&Err(RenewalFailure::new(
+            "it will not run: a host's own words",
+            None
+        )))
+        .ended(Renewal::Failed),
+        "the sign-in did not finish",
+        "NEGATIVE CONTROL: a host's failure says no cause"
+    );
+    // A run whose exit says it did not finish says that exit; a check after a clean exit does
+    // not claim one.
+    assert_eq!(
+        how_it_ended(Renewal::Failed, Some(130), None, None),
+        "the sign-in did not finish: it exited 130"
+    );
+    assert_eq!(
+        how_it_ended(Renewal::Failed, Some(0), None, None),
+        "the sign-in did not finish"
     );
 }
 
@@ -828,15 +978,54 @@ fn a_started_sign_in_is_named_until_it_ends() {
     assert_eq!(store.signing_in(), None, "its end ends the record");
     assert!(!running_path(&store).exists());
 
-    let record = |pid: u32| Running {
+    // The record names its holder by identity: a live process read as the same process.
+    let me = holder(std::process::id()).expect("this process's identity reads");
+    let record = |holder: aterm_uds::process::Identity| Running {
         cli: Cli::Claude.id().to_owned(),
         label: "m2-3".to_owned(),
         at: now,
-        pid,
+        holder,
     };
     let write = |text: &str| std::fs::write(running_path(&store), text).unwrap();
-    write(&record(std::process::id()).text());
+    write(&record(me).text());
     assert_eq!(store.signing_in().as_deref(), Some("m2-3"));
+    // NEGATIVE CONTROL for the identity: a pid alone says this process is alive in each case
+    // below, so a rule that read the number alone would name `m2-3` in each.
+    let reused = aterm_uds::process::Identity {
+        birth: aterm_uds::process::Birth(me.birth.0 + 1),
+        ..me
+    };
+    assert!(aterm_uds::process::pid_alive(me.pid.unsigned_abs()));
+    write(&record(reused).text());
+    assert_eq!(
+        store.signing_in(),
+        None,
+        "a process killed mid sign-in whose number this live process took is not its holder"
+    );
+    if let Some(version) = me.idversion {
+        write(
+            &record(aterm_uds::process::Identity {
+                idversion: Some(version + 1),
+                ..me
+            })
+            .text(),
+        );
+        assert_eq!(
+            store.signing_in(),
+            None,
+            "a holder that exec'd holds the close-on-exec lock no more"
+        );
+    }
+    write(&format!(
+        "aterm-signin-running-v1\n{} m2-3 {now} {}\n",
+        Cli::Claude.id(),
+        std::process::id()
+    ));
+    assert_eq!(
+        store.signing_in(),
+        None,
+        "a v1 record names its process by number alone, which names nothing"
+    );
     #[cfg(windows)]
     let mut command = {
         let mut cmd = aterm_uds::spawnfd::command("cmd");
@@ -846,19 +1035,18 @@ fn a_started_sign_in_is_named_until_it_ends() {
     #[cfg(not(windows))]
     let mut command = aterm_uds::spawnfd::Command::new(crate::test_program::kept("/usr/bin/true"));
     let mut child = command.spawn().expect("spawn");
-    let ended = child.id();
+    let ended = i32::try_from(child.id()).unwrap();
     child.wait().expect("reap");
-    for gone in [0, ended] {
-        write(&record(gone).text());
-        assert_eq!(store.signing_in(), None, "no process {gone} runs it");
-    }
-    let live = record(std::process::id()).text();
+    write(&record(aterm_uds::process::Identity { pid: ended, ..me }).text());
+    assert_eq!(store.signing_in(), None, "no process {ended} runs it");
+    let live = record(me).text();
     for text in [
         String::new(),
         live.replace(RUNNING_HEAD, "aterm-signin-running-v0"),
         live.replace("m2-3", "not/a/label"),
         format!("{live}more\n"),
-        live.replace(&format!(" {}\n", std::process::id()), " soon\n"),
+        live.replace(&format!(" {}\n", me.token()), " soon\n"),
+        live.replace(&format!(" {}\n", me.token()), &format!(" {}\n", me.pid)),
     ] {
         write(&text);
         assert_eq!(store.signing_in(), None, "{text:?}");

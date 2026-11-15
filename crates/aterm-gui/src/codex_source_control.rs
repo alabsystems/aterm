@@ -24,6 +24,8 @@ pub(super) use policy_control::serve as serve_policy;
 mod context_control;
 #[path = "codex_source_derived_control.rs"]
 mod derived_control;
+#[path = "codex_frontend_control.rs"]
+mod frontend_control;
 #[path = "codex_source_plain_retirement_control.rs"]
 mod plain_retirement_control;
 #[path = "codex_source_ready_control.rs"]
@@ -129,8 +131,20 @@ enum Action {
         auth: Option<registry::AuthState>,
     },
     Open,
-    ControlBegin,
+    ControlBegin {
+        controller_operation: String,
+    },
+    ServiceStart {
+        controller_operation: String,
+        settings: std::path::PathBuf,
+    },
+    ServiceAttach {
+        controller_operation: String,
+        service: String,
+        callback: std::path::PathBuf,
+    },
     ControlAck {
+        controller_operation: String,
         nonce: String,
     },
     Preload,
@@ -422,13 +436,91 @@ impl Request {
                 })
             }
             "member-open" => Action::Open,
-            "member-control-begin" => Action::ControlBegin,
-            "member-control-ack" => {
+            "controller-control-begin" => {
+                let controller_operation = fields.remove("controller_operation")?;
+                if !hex(controller_operation, 32) {
+                    return None;
+                }
+                Action::ControlBegin {
+                    controller_operation: controller_operation.into(),
+                }
+            }
+            "controller-service-attach" => {
+                let controller_operation = fields.remove("controller_operation")?;
+                if !hex(controller_operation, 32) {
+                    return None;
+                }
+                use std::os::unix::ffi::OsStringExt;
+                let service = fields.remove("service")?;
+                let callback = fields.remove("callback")?;
+                if !hex(service, 32)
+                    || !callback.len().is_multiple_of(2)
+                    || !hex(callback, callback.len())
+                {
+                    return None;
+                }
+                let bytes: Option<Vec<u8>> = callback
+                    .as_bytes()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+                    .collect();
+                let bytes = bytes?;
+                if bytes.contains(&0) {
+                    return None;
+                }
+                let callback = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+                if !callback.is_absolute() {
+                    return None;
+                }
+                Action::ServiceAttach {
+                    controller_operation: controller_operation.into(),
+                    service: service.into(),
+                    callback,
+                }
+            }
+            "controller-service-start" => {
+                let controller_operation = fields.remove("controller_operation")?;
+                if !hex(controller_operation, 32) {
+                    return None;
+                }
+                use std::os::unix::ffi::OsStringExt;
+                let encoded = fields.remove("settings")?;
+                if !encoded.len().is_multiple_of(2) || !hex(encoded, encoded.len()) {
+                    return None;
+                }
+                let bytes: Option<Vec<u8>> = encoded
+                    .as_bytes()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+                    .collect();
+                let bytes = bytes?;
+                if bytes.contains(&0) {
+                    return None;
+                }
+                let settings = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes));
+                if !settings.is_absolute() {
+                    return None;
+                }
+                Action::ServiceStart {
+                    controller_operation: controller_operation.into(),
+                    settings,
+                }
+            }
+            "controller-control-ack" => {
+                let controller_operation = fields.remove("controller_operation")?;
+                if !hex(controller_operation, 32) {
+                    return None;
+                }
                 let nonce = fields.remove("nonce")?;
                 if !hex(nonce, 32) {
                     return None;
                 }
                 Action::ControlAck {
+                    controller_operation: controller_operation.into(),
                     nonce: nonce.into(),
                 }
             }
@@ -559,8 +651,10 @@ impl Request {
             Action::Census { .. } => "member-census",
             Action::Quiesce { .. } => "member-quiescent",
             Action::Open => "member-open",
-            Action::ControlBegin => "member-control-begin",
-            Action::ControlAck { .. } => "member-control-ack",
+            Action::ControlBegin { .. } => "controller-control-begin",
+            Action::ServiceStart { .. } => "controller-service-start",
+            Action::ServiceAttach { .. } => "controller-service-attach",
+            Action::ControlAck { .. } => "controller-control-ack",
             Action::Preload => "member-preload",
             Action::Ready { .. } => "member-ready",
             Action::ReaderReady { .. } => "member-reader-ready",
@@ -575,7 +669,7 @@ impl Request {
 pub(super) fn handles(line: &str) -> bool {
     line.split_ascii_whitespace()
         .next()
-        .is_some_and(|action| action.starts_with("member-"))
+        .is_some_and(|action| action.starts_with("member-") || action.starts_with("controller-"))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -661,15 +755,22 @@ fn frame(name: &str, value: &aterm_json::Value) -> Option<String> {
     let line = format!("OK codex-auth {name} {body}\n");
     (line.len() <= MAX_FRAME).then_some(line)
 }
+struct Host<'a> {
+    ctx: &'a Arc<crate::SessionCtx>,
+    lifetime: &'a account_work::Lifetime,
+    epoch: &'a str,
+    master: Option<BorrowedFd<'a>>,
+}
 fn execute(
-    registry: &registry::Registry,
+    registry: &Arc<registry::Registry>,
     connection: &registry::Connection,
     peer: registry::Peer,
     request: &Request,
     caller: &Caller,
-    epoch: &str,
+    host: Host<'_>,
     scope: &account_work::Scope,
 ) -> Result<String, registry::Error> {
+    let epoch = host.epoch;
     let mut value = completed_envelope(request, caller, epoch, request.member.as_deref());
     let member = request.member.as_deref().unwrap_or("");
     match &request.action {
@@ -794,16 +895,76 @@ fn execute(
                 .ok_or(registry::Error::Unavailable)?
                 .insert("member".into(), aterm_json::json!(allocation.member));
         }
-        Action::ControlBegin => {
-            registry.begin_owned_control(&peer, connection, member, &request.operation)?;
+        Action::ControlBegin {
+            controller_operation,
+        } => {
+            registry.begin_owned_control(
+                &peer,
+                connection,
+                member,
+                controller_operation,
+                &request.operation,
+            )?;
         }
-        Action::ControlAck { nonce } => {
+        Action::ControlAck {
+            controller_operation,
+            nonce,
+        } => {
             registry.acknowledge_owned_control(
                 &peer,
                 connection,
                 member,
+                controller_operation,
                 &request.operation,
                 nonce,
+            )?;
+        }
+        Action::ServiceStart {
+            controller_operation,
+            settings,
+        } => {
+            let controller =
+                registry.frontend_controller(&peer, connection, member, controller_operation)?;
+            let master = host.master.ok_or(registry::Error::Denied)?;
+            let foreground = controller.foreground(master)?;
+            let frontend = registry.service_frontend(&controller, scope)?;
+            let settings = host
+                .ctx
+                .native_policy
+                .retained_settings(&foreground, settings)
+                .inspect_err(|_error| {
+                    #[cfg(debug_assertions)]
+                    eprintln!("Retained native startup: settings={_error:?}");
+                })?;
+            frontend.current()?;
+            let (id, state) = host.ctx.native_policy.retained_start(
+                host.ctx,
+                registry,
+                host.lifetime,
+                &peer,
+                settings,
+            )?;
+            let object = value.as_object_mut().ok_or(registry::Error::Unavailable)?;
+            object.insert("service".into(), aterm_json::json!(id));
+            object.insert("state".into(), aterm_json::json!(state));
+        }
+        Action::ServiceAttach {
+            controller_operation,
+            service,
+            callback,
+        } => {
+            let controller =
+                registry.frontend_controller(&peer, connection, member, controller_operation)?;
+            let master = host.master.ok_or(registry::Error::Denied)?;
+            let foreground = controller.foreground(master)?;
+            let frontend = registry.service_frontend(&controller, scope)?;
+            host.ctx.native_policy.retained_attach(
+                registry,
+                &foreground,
+                frontend,
+                service,
+                callback,
+                &request.operation,
             )?;
         }
         Action::Preload => {
@@ -1305,6 +1466,9 @@ pub(super) fn serve(
     registry: &Arc<registry::Registry>,
     connection_id: Option<u64>,
 ) -> String {
+    if frontend_control::handles(line) {
+        return frontend_control::serve(ctx, master, line, lifetime, registry, connection_id);
+    }
     let Some(request) = Request::parse(line) else {
         return "ERR codex-auth invalid request\n".into();
     };
@@ -1369,29 +1533,64 @@ pub(super) fn serve(
     };
     if start {
         if let Some(scope) = lifetime.enter() {
-            let reservation_scope = scope.clone();
-            let worker = Arc::clone(&job);
-            let registry = Arc::clone(registry);
-            if std::thread::Builder::new()
-                .name("codex-source-member".into())
-                .spawn(scope.wrap(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        execute(
-                            &registry,
-                            &connection,
-                            peer,
-                            &worker.request,
-                            &worker.caller,
+            if matches!(
+                &request.action,
+                Action::ServiceStart { .. } | Action::ServiceAttach { .. }
+            ) {
+                // This dispatch retains the actual server-side PTY for the call.
+                // Never copy its descriptor number to an asynchronous worker.
+                // SAFETY: master is the borrowed native session PTY of this live dispatch.
+                let master = unsafe { BorrowedFd::borrow_raw(master) };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute(
+                        registry,
+                        &connection,
+                        peer,
+                        &job.request,
+                        &job.caller,
+                        Host {
+                            ctx,
+                            lifetime,
                             epoch,
-                            &reservation_scope,
-                        )
-                    }))
-                    .unwrap_or(Err(registry::Error::Unavailable));
-                    worker.finish(result);
+                            master: Some(master),
+                        },
+                        &scope,
+                    )
                 }))
-                .is_err()
-            {
-                job.finish(Err(registry::Error::Unavailable));
+                .unwrap_or(Err(registry::Error::Unavailable));
+                job.finish(result);
+            } else {
+                let reservation_scope = scope.clone();
+                let worker = Arc::clone(&job);
+                let registry = Arc::clone(registry);
+                let ctx = Arc::clone(ctx);
+                let lifetime = lifetime.clone();
+                if std::thread::Builder::new()
+                    .name("codex-source-member".into())
+                    .spawn(scope.wrap(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            execute(
+                                &registry,
+                                &connection,
+                                peer,
+                                &worker.request,
+                                &worker.caller,
+                                Host {
+                                    ctx: &ctx,
+                                    lifetime: &lifetime,
+                                    epoch,
+                                    master: None,
+                                },
+                                &reservation_scope,
+                            )
+                        }))
+                        .unwrap_or(Err(registry::Error::Unavailable));
+                        worker.finish(result);
+                    }))
+                    .is_err()
+                {
+                    job.finish(Err(registry::Error::Unavailable));
+                }
             }
         } else {
             job.finish(Err(registry::Error::Unavailable));

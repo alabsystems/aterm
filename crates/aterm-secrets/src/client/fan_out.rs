@@ -34,6 +34,10 @@ pub(super) const MOST_AT_ONCE: usize = 8 * crate::discover::MAX_CANDIDATES;
 /// exchange panicked. It returns once every exchange has ended, so no worker outlives the call.
 /// Where the system starts fewer threads, the ones it started take the rest of the items, this
 /// one at least.
+///
+/// Where this thread works for a subscriber's pass, each thread started here counts for that pass
+/// and adds its CPU time to the pass's counts as it ends ([`crate::pass_counts::Started::run`]);
+/// this thread's own share of the exchanges stays in its own time.
 pub(super) fn each_at_once<I: Sync, T: Send>(
     name: &str,
     items: &[I],
@@ -54,12 +58,13 @@ pub(super) fn each_at_once<I: Sync, T: Send>(
             }
         }
     };
+    let started = crate::pass_counts::starting();
     // `work` holds only shared borrows, so each thread takes a copy of it.
     std::thread::scope(|scope| {
         for _ in 1..items.len().min(MOST_AT_ONCE) {
             let spawned = std::thread::Builder::new()
                 .name(name.to_owned())
-                .spawn_scoped(scope, work);
+                .spawn_scoped(scope, || started.run(work));
             if spawned.is_err() {
                 break;
             }

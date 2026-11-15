@@ -15,14 +15,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::approvals::{self, Ledger};
-use super::classify::DEFAULT_PYTHON_ALLOW;
 use super::config::Approve;
-use super::config::{Autopilot, SupervisorConfig};
+use super::config::SupervisorConfig;
 use super::fx::Fx;
 use super::journal::{CLEARED_MEMORY, CLEARED_TURN_END, Journal};
 use super::limit::{self, ResetSpec};
 use super::phase::{
-    Phase, busy_seen, busy_signal, last_said_index, last_said_line, last_said_row, status_row,
+    busy_seen, busy_signal, last_said_index, last_said_line, last_said_row, status_row,
 };
 use super::policy::approval::{Decision, footer_mode, readings_read_only};
 use super::policy::exception::Exception;
@@ -30,11 +29,15 @@ use super::policy::reset::{
     KeepWhy, ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOffer, ResetOutcome, ResetWord,
 };
 use super::policy::sleeps::{FirstLook, SleepBook, SleepStamp};
+/// The host's word on the agent, which only this module's tests name since the door answers
+/// [`HostAgent`].
+#[cfg(test)]
+use super::policy::turn_end::AgentResumed;
 use super::policy::turn_end::{
-    AccountAdvice, AccountBad, AccountPoint, AgentResumed, Composer, FirstRead, GaveUp,
-    ModelSwitch, PERSON_TYPING, ProbeGate, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY,
-    RULE_LIMIT_RESUME, RULE_OUTAGE_RESUME, Reach, TurnEndAction, TurnEndReading, TurnEndState,
-    TurnEndTiming, WaitKind, is_continue_rule, said_mark,
+    AccountAdvice, AccountBad, AccountPoint, Composer, FirstRead, HostAgent, ModelSwitch,
+    ProbeGate, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_LIMIT_RESUME,
+    RULE_OUTAGE_RESUME, Reach, TurnEndAction, TurnEndReading, TurnEndState, WaitKind,
+    is_continue_rule, said_mark,
 };
 use super::prompt::{
     CancelEffect, Prompt, PromptKind, PromptV2, parse_prompt, prompt_box_first_row, prompt_box_span,
@@ -42,6 +45,10 @@ use super::prompt::{
 use super::screen::{COMPOSER_COL, HumanInput, Screen, cursor_home, parse_text_json};
 use crate::harness::agent_image::Act;
 use crate::harness::contract::Scope;
+use alab_policy::classify::DEFAULT_PYTHON_ALLOW;
+use alab_policy::config::{Autopilot, TurnEndTiming};
+use alab_policy::vocab::Phase;
+use alab_policy::words::{GaveUp, PERSON_TYPING};
 use aterm_phase::{Program, ScreenReader};
 pub use duty::BuiltinAuthority;
 
@@ -461,7 +468,7 @@ pub enum Lasting {
     /// loop's grace, or the hold's bound), `None` where the loop knows no such time.
     Credits { lifts_unix: Option<i64> },
     /// A wall on screen that is no usage limit ([`Guard::Wall`]), by its kind's wire word
-    /// ([`aterm_phase::WallKind::wire`]): `wall:auth`, a sign-in only a person can do, or another
+    /// ([`alab_policy::vocab::WallKind::wire`]): `wall:auth`, a sign-in only a person can do, or another
     /// the loop waits out.
     Wall { wire: &'static str },
 }
@@ -1125,7 +1132,7 @@ fn box_anchor(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
         .get(header + 1..esc)?
         .iter()
         .find(|r| !r.trim().is_empty())?;
-    Some(super::policy::row_guard(row))
+    Some(alab_policy::guard::row_guard(row))
 }
 
 type BusyMatch = Box<dyn Fn(&str) -> bool + Send + Sync>;
@@ -1358,7 +1365,7 @@ type EndedBefore = (
 
 fn ended_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Option<EndedBefore> {
     let sid = sid.map(|s| s.trim_start_matches('@'));
-    let land = format!("rule={}", super::policy::turn_end::RULE_LAND);
+    let land = format!("rule={}", alab_policy::words::RULE_LAND);
     let receipt_line = format!("\"line\":\"{} ", crate::harness::land_receipt::RECEIPT);
     let mut later: Vec<super::journal::JournalRecord> = Vec::new();
     let mut note: Option<Option<u64>> = None;
@@ -1410,7 +1417,7 @@ fn ended_before(journal: &str, sid: Option<&str>, last_ms: Option<i64>) -> Optio
                 failed = Some(GaveUp::of_journal_line(&rec.line)?);
             }
             noted_ms = rec.ended.map_or(rec.t, |first| first.min(rec.t));
-            by_wake = rec.line.contains(super::policy::turn_end::WAKE_KEPT);
+            by_wake = rec.line.contains(alab_policy::words::WAKE_KEPT);
             receipt = after
                 .take()
                 .filter(|(at, _)| Some(*at) == seq)
@@ -1750,7 +1757,7 @@ fn short_held(why: &str) -> Option<(u32, i64)> {
 }
 
 fn retry_held(hold: &Hold, timing: &TurnEndTiming) -> Option<approvals::RetryMark> {
-    use aterm_phase::{ApiCause, WallKind};
+    use alab_policy::vocab::{ApiCause, WallKind};
     let (wall, n) = hold.why.rsplit_once(" retry ")?;
     let n: usize = crate::parse_uint(n).filter(|n| *n > 0)?;
     let api = |cause: ApiCause| WallKind::ApiError {
@@ -1781,7 +1788,7 @@ fn retry_held(hold: &Hold, timing: &TurnEndTiming) -> Option<approvals::RetryMar
         n.checked_sub(1)
     };
     let wait = rung.map_or(Some(Duration::ZERO), |r| {
-        crate::supervise::ladder::Ladder(ladder).at(r)
+        alab_policy::ladder::Ladder(ladder).at(r)
     })?;
     let wait_ms = i64::try_from(wait.as_millis()).ok()?;
     Some(approvals::RetryMark {
@@ -2341,6 +2348,10 @@ pub struct Session<'a, C: Ctl> {
     books_last_ms: Option<i64>,
     pub(super) first_frame: FirstFrame,
     pub(super) left_keys: Vec<String>,
+    /// The last `LEFT` row written while the host's read of the agent had not answered
+    /// (`approvals::LEFT_UNREAD`): its key, the reason it began with and its screen's sequence,
+    /// for the correction a read that takes the exchange back owes ([`Session::ledger_left_taken_back`]).
+    pub(super) left_unread: Option<(String, &'static str, u64)>,
     pub(super) repo_seen: Option<(Option<u64>, Instant, crate::harness::repo_work::RepoRead)>,
     /// The agent's left rows the host last read for the same done words, as [`Self::repo_seen`]
     /// keeps the repository's ([`Session::left_read`]).
@@ -2350,10 +2361,13 @@ pub struct Session<'a, C: Ctl> {
     pub(super) credentials_seen: Option<(
         Option<u64>,
         Instant,
-        super::policy::credential_need::CredentialRead,
+        alab_policy::credential_need::CredentialRead,
     )>,
     /// A fresh repository probe read [`crate::harness::repo_work::RepoRead::Unread`], not yet journaled.
     pub(super) repo_unread_unsaid: bool,
+    /// Why the point just decided types no restore of the goal it reads lost, not yet journaled
+    /// ([`super::policy::goal_restore::Held`]; said at its act, once a change).
+    pub(super) goal_unsaid: Option<String>,
     pub(super) left_at_wall_seq: Option<u64>,
     box_reason: Option<(String, String)>,
     changed_streak: u32,
@@ -2599,7 +2613,8 @@ pub struct Session<'a, C: Ctl> {
     decided_withheld: bool,
     login_notice_told: Option<u32>,
     /// What the host was last told of the session's own login this turn
-    /// ([`super::policy::turn_end::LoginSeen`]); a turn that runs forgets it.
+    /// ([`super::policy::turn_end::LoginSeen`]); a turn that runs, or works to a new point,
+    /// forgets it.
     login_fact_told: Option<super::policy::turn_end::LoginSeen>,
     account_stamp: Option<u64>,
     account_news_at: Option<Instant>,
@@ -2622,7 +2637,7 @@ pub struct Session<'a, C: Ctl> {
     probe_hold: Option<Instant>,
     reset: ResetStep,
     reset_taken: Option<(ResetGo, Instant)>,
-    reset_kinds: Vec<aterm_phase::ResetKind>,
+    reset_kinds: Vec<alab_policy::vocab::ResetKind>,
     reset_passed: Option<String>,
     reset_again: u8,
     reset_fallback: Option<Decision>,
@@ -2659,6 +2674,9 @@ pub struct Session<'a, C: Ctl> {
     facts: facts_loop::FactsWatch,
     /// Cruise's carries at breaks of the agent's own background work ([`Self::cruise_carry`]).
     cruise_carry: cruise_carry_loop::CarryWatch,
+    /// The login a turn worked to such a break served, watched under every Autopilot
+    /// ([`Self::break_login`]).
+    break_login: break_login::BreakLogin,
     stall_suspect: bool,
     /// A turn-end act at the handed point was withheld for [`Self::stall_suspect`] before
     /// [`Self::hold_for_stall`] held it: if the next probe finds no stall, re-execute it.
@@ -2810,10 +2828,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             books_last_ms: None,
             first_frame: FirstFrame::Owed { held: false },
             left_keys: Vec::new(),
+            left_unread: None,
             repo_seen: None,
             left_seen: None,
             credentials_seen: None,
             repo_unread_unsaid: false,
+            goal_unsaid: None,
             left_at_wall_seq: None,
             box_reason: None,
             changed_streak: 0,
@@ -2983,6 +3003,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             hold: occupancy_loop::HoldWatch::default(),
             facts: facts_loop::FactsWatch::default(),
             cruise_carry: cruise_carry_loop::CarryWatch::default(),
+            break_login: break_login::BreakLogin::default(),
             stall_suspect: false,
             stall_withheld: false,
             withheld_ask: None,
@@ -4728,14 +4749,13 @@ impl<'a, C: Ctl> Session<'a, C> {
                 self.wall_refusal_over();
             }
             if !writing {
-                if !off {
-                    self.host_steps_in_background(
-                        &screen,
-                        &mut background_since,
-                        opts.map(|o| &o.policy),
-                        review,
-                    )?;
-                }
+                self.background_steps(
+                    &screen,
+                    &mut background_since,
+                    off,
+                    opts.map(|o| &o.policy),
+                    review,
+                )?;
                 self.stuck_busy_note(&screen, background_since, review);
             }
             if !(writing && unsettled) {
@@ -5104,16 +5124,23 @@ impl<'a, C: Ctl> Session<'a, C> {
             carries.retain(|&(ts, _)| ts >= launch);
         }
         if !lifted_off
-            && let Some((last_ms, streak)) =
-                super::policy::cruise_carry::BackgroundCarries::replayed(
-                    &self.turn_end.timing,
-                    &carries,
-                    now_ms,
-                )
+            && let Some((last_ms, streak)) = alab_policy::cruise_carry::BackgroundCarries::replayed(
+                &self.turn_end.timing.carry(),
+                &carries,
+                now_ms,
+            )
         {
             let ago =
                 Duration::from_millis(u64::try_from(now_ms.saturating_sub(last_ms)).unwrap_or(0));
             self.cruise_carry.seed(ago, streak, self.fx.mono());
+        }
+        // The goal restore a loop before this one typed: once per clear, and the wait after it,
+        // hold across loops as within one ([`super::policy::goal_restore::GoalRestores::seed`]).
+        if let Some((ts, clear, rung)) = approvals::goal_restore_in(body, self.setup.sid.as_deref())
+        {
+            let ago = Duration::from_millis(u64::try_from(now_ms.saturating_sub(ts)).unwrap_or(0));
+            self.turn_end
+                .seed_goal_restore(clear, rung, ago, self.fx.mono());
         }
         let typed = approvals::typed_at_in(body, self.setup.sid.as_deref());
         let ages: Vec<Duration> = typed
@@ -5486,7 +5513,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     fn drive_loop(&mut self, opts: &SuperviseOpts, review: &mut dyn Review) -> Result<End, String> {
-        self.metadata_global = opts.policy.autopilot;
+        self.metadata_global = opts.policy.turn_end.autopilot;
         let start = self.fx.mono();
         let mut deadline = deadline_after(start, opts.max);
         let allow = opts.allow();
@@ -6258,7 +6285,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         failed: u32,
     ) -> Result<(), Fail> {
         let tries = failed.saturating_add(1);
-        let pause = super::ladder::Ladder(&self.setup.survey_retry)
+        let pause = alab_policy::ladder::Ladder(&self.setup.survey_retry)
             .step(usize::try_from(tries - 1).unwrap_or(usize::MAX));
         let at = self.fx.mono() + pause;
         *survey = Survey::Retry { tries, at };
@@ -6476,7 +6503,7 @@ impl<C: Ctl> Session<'_, C> {
 
     /// `at`, the reset a wall's words name (unix seconds), where the loop waits to it
     /// ([`TurnEndTiming::reset_placed`]): as named, unless a development build scaled the time to
-    /// it (`turn_end::RESET_SPAN_SCALE_SEAM`), when the wall clock is read again, to the
+    /// it (`config::RESET_SPAN_SCALE_SEAM`), when the wall clock is read again, to the
     /// millisecond, to place it from. Only a scaled timing reads that clock, so a run under the
     /// shipped one reads, and tapes, what it did before.
     pub(super) fn on_reset_clock(&self, at: i64) -> i64 {
@@ -7123,9 +7150,9 @@ impl<C: Ctl> Session<'_, C> {
         self.sleeps.add(by, wall_then, wall_now);
         self.turn_end.slept(by);
         self.person_slept(by);
-        let woke_at = wall_now.div_euclid(1000);
-        self.settle_wake(woke_at, mono_now);
-        self.slept_at = Some(woke_at);
+        let (woke_ms, woke) = self.dated_wake(wall_then, wall_now, mono_now);
+        self.settle_wake(woke_ms.div_euclid(1000), woke);
+        self.slept_at = Some(wall_now.div_euclid(1000));
         let carried = self.retry_seen.clone();
         self.woken = self
             .running
@@ -7152,6 +7179,21 @@ impl<C: Ctl> Session<'_, C> {
             .draft_seen
             .take()
             .and_then(|(draft, at, cell)| Some((draft, at.checked_sub(by)?, cell)));
+    }
+
+    /// When the wake [`Self::watch_sleep`] noticed at `wall_now` (unix ms, `mono_now` on the
+    /// awake clock) happened, after the loop's previous look at `wall_then`: the system's record
+    /// of its last sleep where that wake falls in the gap, as a loop that follows dates the same
+    /// wake ([`Self::look_at_sleep`]), else the moment it was noticed. Dated alike, the two loops
+    /// place one settle and the same share of it ([`Self::settle_wake`]); the noticed moment
+    /// trails the wake by up to a poll, and a follower's settle fell that much sooner.
+    fn dated_wake(&self, wall_then: i64, wall_now: i64, mono_now: Instant) -> (i64, Instant) {
+        match self.fx.last_sleep() {
+            Some((_, woke_ms)) if wall_then < woke_ms && woke_ms <= wall_now => {
+                (woke_ms, self.instant_of_ms(woke_ms))
+            }
+            _ => (wall_now, mono_now),
+        }
     }
 
     fn recount_sleep(&mut self) -> Option<Duration> {
@@ -7963,7 +8005,7 @@ impl<C: Ctl> Session<'_, C> {
         let login_wall = reading
             .wall
             .as_ref()
-            .is_some_and(|w| w.kind == aterm_phase::WallKind::Auth);
+            .is_some_and(|w| w.kind == alab_policy::vocab::WallKind::Auth);
         // An open episode is the limit's only where no other wall stands: at any other wall the
         // loop withholds every point, whatever the upgrade's look found.
         let limit_held = !spent && (limit_wall || (self.limit.is_some() && reading.wall.is_none()));
@@ -9029,14 +9071,14 @@ mod approval_loop;
 mod beside;
 #[path = "capture_loop.rs"]
 mod capture_loop;
-#[cfg(test)]
-pub(crate) use approval_loop::reask_pause;
 /// Re-exports whole-box approval decision evaluation for tape explanation.
 pub(crate) use approval_loop::whole_box_decision;
 #[path = "box_head.rs"]
 mod box_head;
 /// Re-exports approval box header search helpers for tape replay.
 pub(crate) use box_head::{SEARCH as HEAD_SEARCH, head_row, head_rows, joined_box, same_box};
+#[path = "break_login.rs"]
+mod break_login;
 #[path = "claim.rs"]
 mod claim;
 #[path = "duty.rs"]
@@ -9048,6 +9090,7 @@ pub use claim::{CLAIM_HELD, CLAIM_RENEW};
 mod cruise_carry_loop;
 #[path = "escalate.rs"]
 mod escalate;
+pub use escalate::needs_attention_text;
 #[path = "host_door.rs"]
 pub(crate) mod host_door;
 pub use host_door::IdleHost;
@@ -9088,8 +9131,6 @@ mod woken_turn;
 /// The dark wake's cap, which a line held in custody waits to at most
 /// ([`super::custody::CUSTODY_CAP`]).
 pub(crate) use turn_end_loop::DARK_WAKE_CAP;
-/// Re-exports composer cursor-row guard constructors.
-pub(crate) use turn_end_loop::composer_guard;
 pub use turn_end_loop::standing_rules;
 /// The loop's two wake gates, for the outage replay (`policy::turn_end`'s `sysmsg_replay` tests).
 #[cfg(test)]

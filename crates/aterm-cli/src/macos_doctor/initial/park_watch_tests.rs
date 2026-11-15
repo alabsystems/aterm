@@ -177,8 +177,6 @@ fn a_write_in_a_watched_folder_tells_the_park() {
     watcher.wake().unwrap();
 }
 
-static MATERIALIZED_FIRED: AtomicUsize = AtomicUsize::new(0);
-
 static GIT_FIRED: AtomicUsize = AtomicUsize::new(0);
 
 static REPOSITORY_INPUT_FIRED: AtomicUsize = AtomicUsize::new(0);
@@ -378,57 +376,6 @@ fn packaged_git_activation_wakes_a_park_waiting_for_git() {
     watcher.wake().unwrap();
 }
 
-fn materialized_fired() {
-    MATERIALIZED_FIRED.fetch_add(1, Ordering::SeqCst);
-}
-
-#[test]
-fn a_materialized_file_repair_wakes_without_a_vault_state_write() {
-    let home = aterm_tempfile::TempDir::new().unwrap();
-    let state_dir = home.path().join(".config/aterm/secrets");
-    let output = home.path().join(".secrets");
-    std::fs::create_dir_all(&state_dir).unwrap();
-    std::fs::create_dir(&output).unwrap();
-    let state = state_dir.join("state.toml");
-    std::fs::write(&state, "seq = 7\n").unwrap();
-    let credential = output.join("test_credential");
-    std::fs::write(&credential, "before").unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let lost = Arc::new(AtomicBool::new(false));
-    let watcher = watch_folders(
-        secrets_folders(home.path()),
-        Arc::clone(&stop),
-        Arc::clone(&lost),
-        materialized_fired,
-    )
-    .unwrap();
-    let replacement = output.join("replacement");
-    std::fs::write(&replacement, "after").unwrap();
-    std::fs::rename(replacement, credential).unwrap();
-    until("the materialized repair was never heard", || {
-        MATERIALIZED_FIRED.load(Ordering::SeqCst) > 0
-    });
-    assert_eq!(std::fs::read_to_string(state).unwrap(), "seq = 7\n");
-    assert!(!lost.load(Ordering::Acquire));
-    stop.store(true, Ordering::Release);
-    watcher.wake().unwrap();
-}
-
-#[test]
-fn a_materialized_root_symlink_is_watched_at_its_parent() {
-    let home = aterm_tempfile::TempDir::new().unwrap();
-    let elsewhere = aterm_tempfile::TempDir::new().unwrap();
-    std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".secrets")).unwrap();
-    let watcher = atpkg::dirwatch::Watcher::new().unwrap();
-    let mut folders = Folders::new(secrets_folders(home.path()));
-    folders.arm(&watcher).unwrap();
-    assert_eq!(
-        folders.watched[1].as_ref().map(|(path, _)| path.as_path()),
-        Some(home.path()),
-        "materialization refuses the symlink; only its replacement can make progress"
-    );
-}
-
 static MEMBERSHIP_FIRED: AtomicUsize = AtomicUsize::new(0);
 
 fn membership_fired() {
@@ -591,7 +538,6 @@ fn a_retargeted_config_link_keeps_hearing_the_new_vault() {
     for root in [first.path(), second.path()] {
         std::fs::create_dir_all(root.join("aterm/secrets")).unwrap();
     }
-    std::fs::create_dir(home.path().join(".secrets")).unwrap();
     let config = home.path().join(".config");
     std::os::unix::fs::symlink(first.path(), &config).unwrap();
     let replacement = home.path().join("next-config");

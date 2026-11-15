@@ -7,9 +7,9 @@ use std::ops::Range;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::acts::{Act, TaskFace};
 use aterm_agent::harness::lights::{Light, Mode, Reading};
-use aterm_agent::supervise::Autopilot;
 
 use super::gesture_tests::{BYPASS, Hosted, app, draw_claude, frame, host, publish_facts};
 use super::*;

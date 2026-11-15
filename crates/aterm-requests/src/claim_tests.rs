@@ -142,6 +142,11 @@ fn request() -> Request {
         review: None,
         kept: None,
         replies: Vec::new(),
+        clean: None,
+        archives: Vec::new(),
+        gone: Vec::new(),
+        uncleaned: None,
+        cleaned: None,
     }
 }
 
@@ -231,5 +236,106 @@ fn keep_of_keeps_older_contested_unattributed_touched_unpushed_and_unread() {
             now
         ),
         None
+    );
+}
+
+#[test]
+fn keep_words_are_short_and_read_back() {
+    for keep in Keep::ALL {
+        assert!(keep.word().len() <= 12, "{}", keep.word());
+        assert_eq!(Keep::of(keep.word()), Some(keep));
+    }
+    // NEGATIVE: a cut word names none.
+    assert_eq!(Keep::of("unarchive"), None);
+}
+
+#[test]
+fn clean_verdict_keeps_kept_replaced_in_use_unlisted_unarchived_and_stale_measures() {
+    let clean_at = OPENED + 100_000;
+    let now = OPENED + 120_000;
+    let born = OPENED + 1_000;
+    let fresh = Measured {
+        at_ms: clean_at + 5,
+        bytes: Some(1),
+        complete: true,
+        unpushed: Some(false),
+    };
+    let held = HeldClaim {
+        claim: claim(Some(born), Some(true)),
+        at_ms: OPENED + 2_000,
+    };
+    let none: Vec<String> = Vec::new();
+    let host = HostFacts {
+        clean_at_ms: clean_at,
+        born_now: Some(born),
+        cwds: &none,
+        listed: true,
+        archived: true,
+    };
+    let r = request();
+    // NEGATIVE first: a born, alone, untouched, freshly measured, listed and archived claim goes.
+    assert_eq!(clean_verdict(&r, &held, Some(&fresh), &host, now), None);
+    // Each flag alone.
+    let mut kept = request();
+    kept.kept = Some(("human".to_owned(), OPENED + 90_000));
+    assert_eq!(
+        clean_verdict(&kept, &held, Some(&fresh), &host, now),
+        Some(Keep::Kept)
+    );
+    let stale = Measured {
+        at_ms: clean_at - 1,
+        ..fresh
+    };
+    assert_eq!(
+        clean_verdict(&r, &held, Some(&stale), &host, now),
+        Some(Keep::Unmeasured),
+        "a measure from before the cleanup began is none"
+    );
+    for born_now in [None, Some(born + 1)] {
+        let moved = HostFacts { born_now, ..host };
+        assert_eq!(
+            clean_verdict(&r, &held, Some(&fresh), &moved, now),
+            Some(Keep::Replaced),
+            "{born_now:?}"
+        );
+    }
+    let cwds = vec!["/Users//a/x/deeper".to_owned()];
+    let used = HostFacts {
+        cwds: &cwds,
+        ..host
+    };
+    assert_eq!(
+        clean_verdict(&r, &held, Some(&fresh), &used, now),
+        Some(Keep::InUse)
+    );
+    // NEGATIVE: a sibling whose name only starts the same is no use of it.
+    let sibling = vec!["/Users//a/xy".to_owned(), "/Users//a".to_owned()];
+    let beside = HostFacts {
+        cwds: &sibling,
+        ..host
+    };
+    assert_eq!(clean_verdict(&r, &held, Some(&fresh), &beside, now), None);
+    let unlisted = HostFacts {
+        listed: false,
+        ..host
+    };
+    assert_eq!(
+        clean_verdict(&r, &held, Some(&fresh), &unlisted, now),
+        Some(Keep::Unlisted)
+    );
+    let unarchived = HostFacts {
+        archived: false,
+        ..host
+    };
+    assert_eq!(
+        clean_verdict(&r, &held, Some(&fresh), &unarchived, now),
+        Some(Keep::Unarchived)
+    );
+    // keep_of's reasons come before the host's.
+    let mut touched = request();
+    touched.touched.insert("/Users//a/x".to_owned());
+    assert_eq!(
+        clean_verdict(&touched, &held, Some(&fresh), &unarchived, now),
+        Some(Keep::Touched)
     );
 }

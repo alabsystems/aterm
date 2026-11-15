@@ -9,7 +9,6 @@ struct Fake {
     develop: Vec<(&'static str, State)>,
     openssl: Option<String>,
     site: Option<PathBuf>,
-    site_key: Option<PathBuf>,
     bootstrap_error: Option<Bootstrap>,
     source_signing_error: Option<SigningGap>,
     source_signing_calls: std::sync::atomic::AtomicUsize,
@@ -57,11 +56,9 @@ impl ReleaseHost for Fake {
     fn site(&self) -> Result<Option<PathBuf>, String> {
         Ok(self.site.clone())
     }
-    fn site_key(&self) -> Result<Option<PathBuf>, String> {
-        Ok(self.site_key.clone())
-    }
-    fn catalog_site_key(&self) -> Option<PathBuf> {
-        Some(self.home.join("deployer.json"))
+    /// The real lookup, over the store [`write_deployer_key`] seeds under the fake's home.
+    fn site_key(&self) -> Result<aterm_uds::secret::Secret, String> {
+        crate::site::deployer_key(Some(&self.home))
     }
     fn site_key_need(&self, step: NeedStep) -> Result<Option<String>, String> {
         let mut needs = self.needs.lock().unwrap();
@@ -81,11 +78,8 @@ impl ReleaseHost for Fake {
             Ok(())
         }
     }
-    fn site_access(&self, key: &Path) -> Result<String, String> {
-        self.asked
-            .lock()
-            .unwrap()
-            .push(format!("access {}", key.display()));
+    fn site_access(&self, _key: &aterm_uds::secret::Secret) -> Result<String, String> {
+        self.asked.lock().unwrap().push("access store".into());
         self.site_access_error.clone().map_or_else(
             || Ok("Hosting site s in project p reports firebasehosting.sites.update".into()),
             Err,
@@ -136,12 +130,19 @@ fn executable(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// This Mac's store under `home` holds the deployer's key, a valid one.
 fn write_deployer_key(home: &Path) {
-    std::fs::write(
-        home.join("deployer.json"),
-        crate::site::hosting::key::tests::key_json("https://oauth2.googleapis.com/token"),
-    )
-    .unwrap();
+    crate::site::tests::registry_under(
+        home,
+        Some(&crate::site::hosting::key::tests::key_json(
+            "https://oauth2.googleapis.com/token",
+        )),
+    );
+}
+
+/// This Mac's store under `home` holds the deployer key's entry as `value`, or none.
+fn deployer(home: &Path, value: Option<&str>) {
+    crate::site::tests::registry_under(home, value);
 }
 
 fn whole(home: &Path) -> Fake {
@@ -154,12 +155,11 @@ fn whole(home: &Path) -> Fake {
     whole_keeping(home)
 }
 
-fn closing(home: &Path, checks: &[(&'static str, Check)]) -> crate::ledger::Result<()> {
-    closing_as(home, checks, false, true)
+fn closing(checks: &[(&'static str, Check)]) -> crate::ledger::Result<()> {
+    closing_as(checks, false, true)
 }
 
 fn closing_as(
-    home: &Path,
     checks: &[(&'static str, Check)],
     check_only: bool,
     key_exists: bool,
@@ -167,7 +167,6 @@ fn closing_as(
     let (fails, waiting) = super::super::tally(checks);
     super::super::close(super::super::Closing {
         id: "fake-host",
-        home: home.to_str().unwrap(),
         check_only,
         report: None,
         profile: None,
@@ -241,26 +240,25 @@ fn each_release_items_gap_fails_naming_what_is_missing() {
         other => panic!("{other:?}"),
     }
 
-    let mut fake = whole(home);
-    fake.site_key = None;
+    let fake = whole(home);
+    deployer(home, None);
     match line_of(fake, "release.site-key") {
         Check::Fail { what, fix } => {
-            assert!(what.contains("no service-account key"), "{what}");
-            assert!(fix.contains("firebase_sa_key"), "{fix}");
+            assert!(what.contains("holds no site-deployer-key entry"), "{what}");
+            assert_eq!(fix, "`aterm secrets need site-deployer-key`");
         }
         other => panic!("{other:?}"),
     }
-    std::fs::remove_file(home.join("deployer.json")).unwrap();
+    deployer(home, Some("not a service-account key"));
     match line_of(whole_keeping(home), "release.site-key") {
-        Check::Fail { what, .. } => assert!(what.contains("deployer.json"), "{what}"),
+        // A held value no need replaces names no need.
+        Check::Fail { what, fix } => {
+            assert!(what.contains("is unusable"), "{what}");
+            assert!(!fix.contains("aterm secrets need"), "{fix}");
+        }
         other => panic!("{other:?}"),
     }
-    let mut fake = whole(home);
-    fake.site_key = Some(home.join("site"));
-    match line_of(fake, "release.site-key") {
-        Check::Fail { what, .. } => assert!(what.contains("site"), "{what}"),
-        other => panic!("{other:?}"),
-    }
+    write_deployer_key(home);
     assert!(matches!(
         line_of(whole(home), "release.site-key"),
         Check::Pass(_)
@@ -274,7 +272,6 @@ fn whole_keeping(home: &Path) -> Fake {
         develop: vec![("fish", State::Present(home.join("fish")))],
         openssl: Some("LibreSSL 3.3.6".into()),
         site: Some(home.join("site")),
-        site_key: Some(home.join("deployer.json")),
         bootstrap_error: None,
         source_signing_error: None,
         source_signing_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -293,19 +290,18 @@ fn row<'r>(rows: &'r [(&'static str, Check)], id: &str) -> &'r Check {
     &rows.iter().find(|(row, _)| *row == id).unwrap().1
 }
 
-/// A DEPLOYER KEY MISSING WHERE THE VAULT DELIVERS IT IS ASKED OF THE VAULT BY THE RELEASE'S
-/// STEP 1, and its row says so with the remedy: the 0.199.0 release met this gap at step 9 and
-/// a person raised the need by hand. A dry run raises and posts nothing and says a real run
-/// would.
-/// NEGATIVE CONTROLS: a key that is there raises nothing and passes; a key named somewhere
-/// the vault does not deliver to is not asked for, and says why.
+/// A DEPLOYER KEY THIS MAC'S REGISTRY DOES NOT HOLD IS FILED WITH THE LAB BY THE RELEASE'S
+/// STEP 1, and its row names the filing: the 0.199.0 release met this gap at step 9. A dry
+/// run raises and posts nothing and says a real run would.
+/// NEGATIVE CONTROLS: a key that is there raises nothing and passes; a key the registry holds
+/// that does not parse is not filed, since a delivery would not replace it.
 #[test]
-fn step_one_asks_the_vault_for_a_missing_deployer_key() {
+fn step_one_files_a_deployer_key_this_mac_lacks() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let home = dir.path();
     let missing = || {
         let fake = whole(home);
-        std::fs::remove_file(home.join("deployer.json")).unwrap();
+        deployer(home, None);
         Arc::new(fake)
     };
     let posted = |fake: &Fake| fake.posted.load(std::sync::atomic::Ordering::SeqCst);
@@ -314,15 +310,13 @@ fn step_one_asks_the_vault_for_a_missing_deployer_key() {
     let rows = distribution(&(Arc::clone(&fake) as Arc<dyn ReleaseHost>), false);
     match row(&rows, "release.site-key") {
         Check::Fail { what, fix } => {
-            assert!(what.contains("service-account key is unusable"), "{what}");
+            assert!(what.contains("holds no site-deployer-key entry"), "{what}");
             assert!(
-                what.contains("asked of the lab's vault now (posted to the lab)"),
+                what.contains("filed with the lab (posted to the lab)"),
                 "{what}"
             );
             assert!(
-                fix.contains("wait for the vault to deliver the key to")
-                    && fix.contains("deployer.json")
-                    && fix.contains("aterm secrets need ls"),
+                fix.contains("answers the filed request") && fix.contains("aterm secrets need ls"),
                 "{fix}"
             );
         }
@@ -347,12 +341,12 @@ fn step_one_asks_the_vault_for_a_missing_deployer_key() {
 
     // A pass that cannot be run now leaves the need on file and says so.
     let mut fake = whole(home);
-    std::fs::remove_file(home.join("deployer.json")).unwrap();
+    deployer(home, None);
     fake.post_error = Some("no installed aterm".into());
     let rows = distribution(&(Arc::new(fake) as Arc<dyn ReleaseHost>), false);
     assert!(
         matches!(row(&rows, "release.site-key"), Check::Fail { what, .. }
-            if what.contains("asked of the lab's vault now")
+            if what.contains("filed with the lab")
                 && what.contains("posted at this Mac's next pass (no installed aterm)")),
         "{rows:#?}"
     );
@@ -362,13 +356,10 @@ fn step_one_asks_the_vault_for_a_missing_deployer_key() {
     match row(&rows, "release.site-key") {
         Check::Fail { what, fix } => {
             assert!(
-                what.contains("a real run asks the lab's vault for it (no need is on file yet)"),
+                what.contains("a real run files it with the lab (no need is on file yet)"),
                 "{what}"
             );
-            assert!(
-                fix.contains("wait for the vault to deliver the key"),
-                "{fix}"
-            );
+            assert_eq!(fix, "`aterm secrets need site-deployer-key`");
         }
         other => panic!("{other:?}"),
     }
@@ -388,13 +379,12 @@ fn step_one_asks_the_vault_for_a_missing_deployer_key() {
     assert!(!fake.needs.lock().unwrap().contains(&NeedStep::Raise));
     assert_eq!(posted(&fake), 0);
 
-    let mut fake = whole(home);
-    fake.site_key = Some(home.join("elsewhere/deployer.json"));
-    let fake = Arc::new(fake);
+    let fake = Arc::new(whole(home));
+    deployer(home, Some("{}"));
     let rows = distribution(&(Arc::clone(&fake) as Arc<dyn ReleaseHost>), false);
     assert!(
         matches!(row(&rows, "release.site-key"), Check::Fail { what, .. }
-            if what.contains("the lab is not asked")),
+            if what.contains("the need is not marked fulfilled")),
         "{rows:#?}"
     );
     assert!(!fake.needs.lock().unwrap().contains(&NeedStep::Raise));
@@ -434,7 +424,7 @@ fn step_one_proves_each_distribution_write_by_a_read() {
     assert_eq!(
         asked,
         [
-            "access ".to_owned() + home.join("deployer.json").to_str().unwrap(),
+            "access store".to_owned(),
             "can alabsystems/homebrew-tap".into(),
             "can owner/aterm".into(),
             "can owner/aterm-staging".into(),
@@ -600,51 +590,10 @@ fn identity_dependent_signing_is_checked_after_provisioning_not_as_its_prerequis
     );
 }
 
+/// A key this Mac's registry does not hold is filed only by a provision run, never by an audit;
+/// a valid key meets the need.
 #[test]
-fn deployer_key_discovery_recognizes_an_equivalent_missing_destination() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let home = dir.path();
-    std::fs::create_dir_all(home.join("site/inner")).unwrap();
-    let fake = Arc::new(Fake {
-        site_key: Some(home.join("site/inner/../../deployer.json")),
-        ..whole_keeping(home)
-    });
-    let host: Arc<dyn ReleaseHost> = fake.clone();
-    assert_eq!(settle_site_key(&host).as_deref(), Some("posted to the lab"));
-    assert_eq!(*fake.needs.lock().unwrap(), [NeedStep::Raise]);
-    assert!(!home.join("deployer.json").exists());
-}
-
-#[cfg(unix)]
-#[test]
-fn deployer_key_discovery_respects_symlinks_before_parent_components() {
-    use std::os::unix::fs::symlink;
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let home = dir.path();
-    std::fs::create_dir_all(home.join("elsewhere/deep")).unwrap();
-    symlink(home.join("elsewhere/deep"), home.join("alias")).unwrap();
-    let fake = Arc::new(Fake {
-        site_key: Some(home.join("alias/../deployer.json")),
-        ..whole_keeping(home)
-    });
-    let host: Arc<dyn ReleaseHost> = fake.clone();
-    assert!(settle_site_key(&host).unwrap().contains("is not asked"));
-    assert!(fake.needs.lock().unwrap().is_empty());
-    assert!(!same_missing_destination(
-        &home.join("absent/../deployer.json"),
-        &home.join("deployer.json"),
-    ));
-    symlink(home.join("missing-key"), home.join("deployer.json")).unwrap();
-    assert!(!same_missing_destination(
-        &home.join("deployer.json"),
-        &home.join("deployer.json"),
-    ));
-}
-
-/// A key missing at the catalog path is asked of the lab only by a provision run, never by
-/// an audit; a key named elsewhere is never asked for; a valid key meets the need.
-#[test]
-fn the_deployer_key_row_asks_the_lab_only_for_the_catalog_path_and_only_on_a_run() {
+fn the_deployer_key_is_filed_only_on_a_run() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let home = dir.path();
     let row = |host: &Arc<dyn ReleaseHost>| {
@@ -679,31 +628,11 @@ fn the_deployer_key_row_asks_the_lab_only_for_the_catalog_path_and_only_on_a_run
         ]
     );
 
-    std::fs::remove_file(home.join("deployer.json")).unwrap();
-    let elsewhere = Arc::new(Fake {
-        site_key: Some(home.join("other.json")),
-        ..whole_keeping(home)
-    });
-    let host: Arc<dyn ReleaseHost> = elsewhere.clone();
-    let line = settle_site_key(&host).unwrap();
-    assert!(
-        line.contains("not at") && line.contains("is not asked"),
-        "{line}"
-    );
-    assert!(
-        elsewhere.needs.lock().unwrap().is_empty(),
-        "a key named away from the catalog path is never raised"
-    );
-    let unnamed = Arc::new(Fake {
-        site_key: None,
-        ..whole_keeping(home)
-    });
-    let host: Arc<dyn ReleaseHost> = unnamed.clone();
-    assert!(settle_site_key(&host).is_some(), "the row says why");
-    assert!(
-        unnamed.needs.lock().unwrap().is_empty(),
-        "a deploy that names no key is never raised for: nothing would read the delivery"
-    );
+    let held_none = Arc::new(whole_keeping(home));
+    deployer(home, None);
+    let host: Arc<dyn ReleaseHost> = held_none.clone();
+    assert_eq!(settle_site_key(&host).as_deref(), Some("posted to the lab"));
+    assert_eq!(*held_none.needs.lock().unwrap(), [NeedStep::Raise]);
 }
 
 #[test]
@@ -722,7 +651,7 @@ fn malformed_deployer_keys_neither_pass_the_audit_nor_fulfill_the_need() {
             "invalid-private-marker",
         ),
     ] {
-        std::fs::write(home.join("deployer.json"), bytes).unwrap();
+        deployer(home, Some(&bytes));
         let checks = audit(&host);
         let check = &checks
             .iter()
@@ -846,9 +775,9 @@ fn an_unminted_check_with_a_gap_fails_naming_it() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let home = dir.path();
     let fake: Arc<dyn ReleaseHost> = Arc::new(whole(home));
-    assert!(closing_as(home, &audit(&fake), true, false).is_ok());
+    assert!(closing_as(&audit(&fake), true, false).is_ok());
     std::fs::remove_file(home.join("publication/bin/pub")).unwrap();
-    let said = closing_as(home, &audit(&fake), true, false)
+    let said = closing_as(&audit(&fake), true, false)
         .expect_err("an open item fails the audit")
         .to_string();
     assert!(
@@ -868,13 +797,13 @@ fn a_missing_release_item_fails_the_run_naming_it() {
         "{checks:#?}"
     );
     assert!(
-        closing(home, &checks).is_ok(),
+        closing(&checks).is_ok(),
         "the whole layer closes READY TO CUT"
     );
 
     std::fs::remove_file(home.join("publication/bin/pub")).unwrap();
     let checks = audit(&fake);
-    let err = closing(home, &checks).expect_err("a missing release item fails the run");
+    let err = closing(&checks).expect_err("a missing release item fails the run");
     let said = err.to_string();
     assert!(said.contains("release.publication (gap)"), "{said}");
     assert!(
@@ -919,7 +848,7 @@ fn base_and_develop_name_their_commands() {
         other => panic!("{other:?}"),
     }
     assert!(matches!(find("release.openssl"), Check::Pass(p) if p.starts_with("not needed")));
-    let said = closing(home, &checks).unwrap_err().to_string();
+    let said = closing(&checks).unwrap_err().to_string();
     assert!(said.contains("base (gap), develop (gap)"), "{said}");
 }
 

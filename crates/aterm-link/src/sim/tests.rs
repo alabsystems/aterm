@@ -24,8 +24,10 @@ const SIBLING_SEEDS: u64 = 32;
 
 const RARE_SEEDS: u64 = 20000;
 
-/// The search for a rule rarer still: since the receipt heads (ATERM-KI-1111-7) the first seed
-/// that reaches the incarnation lease's collision is 46058; after the asks journal (C04) one was
+/// The search for a rule rarer still: since the receipt heads (ATERM-KI-1111-7) composed with
+/// ATERM-KI-1111-4's seed 590 and 355 fixes the first seed that reaches the incarnation lease's
+/// collision was 38386 (46058 with the receipt heads alone), and is 37095 since the self-lane
+/// window names its log (the seed 3483 review); after the asks journal (C04) one was
 /// 84750, where 54518 had been the first in 60,000 and,
 /// before the post journal (B19), 8483 the first in 20,000. Four and sixteen times the power
 /// cuts reach it nowhere in the first 8,000 seeds.
@@ -783,10 +785,31 @@ fn breaking_at(
 
 fn with_every_rule(mut o: Opts) -> Opts {
     o.mutants.clear();
+    o.controlled_mutant = None;
     o.ep = EpRules::default();
     o.table = Escalation::aterm();
     o.arm = ArmMutant::None;
     o
+}
+
+/// Restore the protection under test, retaining any deliberately disabled
+/// secondary protection. Non-mutant endpoint, arm and table controls restore
+/// their production configurations as before.
+fn with_target_rule(mut o: Opts) -> Opts {
+    match o.controlled_mutant.take() {
+        Some(target) => {
+            o.mutants.remove(&target);
+            o
+        }
+        None => with_every_rule(o),
+    }
+}
+
+fn discovery_controls(off: Opts) -> (Outcome, Outcome) {
+    (
+        run(&with_target_rule(off.clone())),
+        run(&with_every_rule(off)),
+    )
 }
 
 #[test]
@@ -864,7 +887,7 @@ fn each_rule_switched_off_is_caught() {
         ),
         (
             "the inbox commit waits for the record's delivery",
-            Box::new(|s| Opts::seed(s).with(Mutant::CommitBeforeDelivery)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::CommitBeforeDelivery)),
             "model:",
             12,
         ),
@@ -884,7 +907,7 @@ fn each_rule_switched_off_is_caught() {
         (
             "the attach reads the lineage of a moved generation",
             Box::new(|s| {
-                let mut o = Opts::seed(s).with(Mutant::IgnoreLineage);
+                let mut o = Opts::seed(s).testing(Mutant::IgnoreLineage);
                 o.tier = Some(Tier::Ordered);
                 o
             }),
@@ -893,20 +916,20 @@ fn each_rule_switched_off_is_caught() {
         ),
         (
             "a post's retry reuses its pinned sequence",
-            Box::new(|s| Opts::seed(s).with(Mutant::FreshSeqOnRetry)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::FreshSeqOnRetry)),
             "dup post",
             1,
         ),
         (
             "a receipt's retry reuses its pinned sequence",
-            Box::new(|s| Opts::seed(s).with(Mutant::FreshReceiptSeq)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::FreshReceiptSeq)),
             "answered 2 times",
             16,
         ),
         (
             "a sender keeps one post in flight against a broker that does not gap-fence",
             Box::new(|s| {
-                let mut o = Opts::seed(s).with(Mutant::PipelineSender);
+                let mut o = Opts::seed(s).testing(Mutant::PipelineSender);
                 o.gap_fences = false;
                 o
             }),
@@ -916,7 +939,7 @@ fn each_rule_switched_off_is_caught() {
         (
             "the bridge asks the broker for the gap fence it pipelines behind",
             Box::new(|s| {
-                let mut o = Opts::seed(s).with(Mutant::NeverAskForTheFence);
+                let mut o = Opts::seed(s).testing(Mutant::NeverAskForTheFence);
                 o.gap_fences = true;
                 o
             }),
@@ -925,14 +948,14 @@ fn each_rule_switched_off_is_caught() {
         ),
         (
             "a post is not sent past an answer that held its sender since its drain reached it",
-            Box::new(|s| Opts::seed(s).with(Mutant::SendPastAHeldSender)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::SendPastAHeldSender)),
             "order:",
             377,
         ),
         (
             "a pipelining drain skips the posts owed at its peek, not those owed as it goes",
             Box::new(|s| {
-                let mut o = Opts::seed(s).with(Mutant::LiveOwedSkip);
+                let mut o = Opts::seed(s).testing(Mutant::LiveOwedSkip);
                 o.refused_batches = false;
                 o
             }),
@@ -941,14 +964,14 @@ fn each_rule_switched_off_is_caught() {
         ),
         (
             "the bridge lifts the gap fences its refused writes set",
-            Box::new(|s| Opts::seed(s).with(Mutant::KeepGapFences)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::KeepGapFences)),
             "liveness",
             29,
         ),
         (
             "a drain sends no listed post that was in flight at its peek",
             Box::new(|s| {
-                let mut o = Opts::seed(s).with(Mutant::PeekPastOwedPost);
+                let mut o = Opts::seed(s).testing(Mutant::PeekPastOwedPost);
                 o.hold_acks = true;
                 o
             }),
@@ -958,7 +981,7 @@ fn each_rule_switched_off_is_caught() {
         (
             "an idle loop reads its posts' answers before it parks",
             Box::new(|s| {
-                let mut o = Opts::seed(s).with(Mutant::IdlePostLeftToBackstop);
+                let mut o = Opts::seed(s).testing(Mutant::IdlePostLeftToBackstop);
                 o.hold_acks = true;
                 o
             }),
@@ -970,17 +993,17 @@ fn each_rule_switched_off_is_caught() {
             Box::new(|s| {
                 without_retention(
                     both_ways(s)
-                        .with(Mutant::LeaseAcrossBoots)
+                        .testing(Mutant::LeaseAcrossBoots)
                         .with(Mutant::TrustTheFloorThatReads),
                 )
             }),
             "cap-compromised",
-            46058,
+            37095,
         ),
         (
             "a move of the log drops the mirror's pinned batch",
             Box::new(|s| {
-                let mut o = Opts::seed(s).with(Mutant::KeepMirrorPinAcrossMove);
+                let mut o = Opts::seed(s).testing(Mutant::KeepMirrorPinAcrossMove);
                 o.mirror = true;
                 o.tier = Some(Tier::Relaxed);
                 o
@@ -1006,7 +1029,7 @@ fn each_rule_switched_off_is_caught() {
         (
             "a relaunched bridge republishes the mirror's pinned batch at its sequences",
             Box::new(|s| {
-                let mut o = Opts::seed(s).with(Mutant::FreshMirrorTake);
+                let mut o = Opts::seed(s).testing(Mutant::FreshMirrorTake);
                 o.mirror = true;
                 o.tier = Some(Tier::Strict);
                 o
@@ -1019,7 +1042,7 @@ fn each_rule_switched_off_is_caught() {
         // 13) off its law; each is the first seed within its bound that shows it again.
         (
             "`session-exited` publishes the session's `exited` row",
-            Box::new(|s| Opts::seed(s).with(Mutant::SkipExitedRow)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::SkipExitedRow)),
             "presence:",
             322,
         ),
@@ -1038,89 +1061,90 @@ fn each_rule_switched_off_is_caught() {
         ),
         (
             "a ghost row is swept",
-            Box::new(|s| Opts::seed(s).with(Mutant::NoGhostSweep)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::NoGhostSweep)),
             "presence:",
             3,
         ),
         (
             "a later bridge reads its state dir's mark on a row (F4)",
-            Box::new(|s| Opts::seed(s).with(Mutant::ReadNoMark)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::ReadNoMark)),
             "presence:",
             2,
         ),
         (
             "the attach records the predecessor's will it read",
-            Box::new(|s| Opts::with_a_sibling(s).with(Mutant::IgnoreWitnessedWill)),
+            Box::new(|s| Opts::with_a_sibling(s).testing(Mutant::IgnoreWitnessedWill)),
             "presence:",
             32,
         ),
         (
             "a lower incarnation's row under another state dir's mark is not its own",
-            Box::new(|s| Opts::with_a_sibling(s).with(Mutant::RetireEveryEarlierIncarnation)),
+            Box::new(|s| Opts::with_a_sibling(s).testing(Mutant::RetireEveryEarlierIncarnation)),
             "presence:",
             2,
         ),
         (
             "a bridge tells aterm what its quarantine holds",
-            Box::new(|s| Opts::seed(s).with(Mutant::TellMovedNotHeld)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::TellMovedNotHeld)),
             "quarantine:",
             7,
         ),
         (
             "the recovery a write error stopped is done before the run record",
-            Box::new(|s| Opts::seed(s).with(Mutant::BeginRunPastAFailedRecovery)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::BeginRunPastAFailedRecovery)),
             "liveness",
             59,
         ),
         (
             "the mirror judges its pin once the recovery reconciled it",
-            Box::new(|s| Opts::seed(s).with(Mutant::JudgePinBeforeRecovery)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::JudgePinBeforeRecovery)),
             "mirror",
             31,
         ),
         (
             "an own record is delivered only once its in-flight entry is gone",
-            Box::new(|s| Opts::seed(s).with(Mutant::DeliverPastAStandingEntry)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::DeliverPastAStandingEntry)),
             "dup delivery",
             42,
         ),
         (
             "a mirror takes only once its open made the pin's fence durable (D06)",
-            Box::new(|s| Opts::seed(s).with(Mutant::TakeAheadOfTheFence)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::TakeAheadOfTheFence)),
             "mirror fence:",
             2,
         ),
         (
             "a settled fence is held only once the broker answered its settle (F07)",
-            Box::new(|s| same_device(s).with(Mutant::FenceBeforeTheSettle)),
+            Box::new(|s| same_device(s).testing(Mutant::FenceBeforeTheSettle)),
             "mirror fence:",
             62,
         ),
         (
             "the pin's settle goes only once its barriers returned (F07)",
-            Box::new(|s| same_device(s).with(Mutant::SettleAheadOfTheBarrier)),
+            Box::new(|s| same_device(s).testing(Mutant::SettleAheadOfTheBarrier)),
             "mirror fence:",
             3,
         ),
         (
             "only a flush of the state dir's own device settles its pin (F07)",
-            Box::new(|s| Opts::seed(s).with(Mutant::TrustAnotherDevicesFlush)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::TrustAnotherDevicesFlush)),
             "mirror fence:",
             2,
         ),
         (
             "a mirror floor covers a batch only once this open made it durable",
-            Box::new(|s| Opts::seed(s).with(Mutant::TrustTheFloorThatReads)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::TrustTheFloorThatReads)),
             "mirror total",
             2795,
         ),
-        // Explicit discovery on the composed budget scope and per-node hand-over found this
-        // first witness within the original 20,000-seed bound.
+        // Explicit discovery on the composed budget scope and per-node hand-over found 1465
+        // first within the original 20,000-seed bound; since the self-lane window names its log
+        // (the seed 3483 review) discovery finds 2170 first.
         (
             "an attach delivers on a new log only once its witness is written",
-            Box::new(|s| both_ways(s).with(Mutant::AttachPastAnUnwrittenWitness)),
+            Box::new(|s| both_ways(s).testing(Mutant::AttachPastAnUnwrittenWitness)),
             "dup delivery",
-            1465,
+            2170,
         ),
         // Critic item E07's grouped landing moved this rule's first seed in the world with write
         // errors and quits past 20,000 (to 27907); where power is lost both ways a recovery is
@@ -1130,14 +1154,14 @@ fn each_rule_switched_off_is_caught() {
         (
             "a run whose recovery is owed makes no clean stop",
             Box::new(|s| {
-                both_ways_erring_quitting(s).with(Mutant::CleanStopOverAnOwedRecovery)
+                both_ways_erring_quitting(s).testing(Mutant::CleanStopOverAnOwedRecovery)
             }),
             "mirror",
             167,
         ),
         (
             "a recovery tried again moves each file once",
-            Box::new(|s| both_ways_erring(s).with(Mutant::CopyOnEveryTry)),
+            Box::new(|s| both_ways_erring(s).testing(Mutant::CopyOnEveryTry)),
             "quarantine copies:",
             3,
         ),
@@ -1187,116 +1211,118 @@ fn each_rule_switched_off_is_caught() {
         ),
         (
             "a session's refill reads on from a floor retention raised",
-            Box::new(|s| Opts::seed(s).with(Mutant::RefillWithoutTheFloor)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::RefillWithoutTheFloor)),
             "liveness",
             6,
         ),
         (
             "an attach's refill of sessions together reads from the lowest start",
-            Box::new(|s| Opts::seed(s).with(Mutant::RefillTogetherFromTheHighest)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::RefillTogetherFromTheHighest)),
             "refill:",
             2,
         ),
         (
             "a session below the node inbox's oldest reads its own lane up to it",
-            Box::new(|s| Opts::seed(s).with(Mutant::RefillJoinBelowTheOldest)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::RefillJoinBelowTheOldest)),
             "refill:",
             5,
         ),
         (
             "the inbox's gap notice moves no commit past the held records in it",
-            Box::new(|s| scaled(s).with(Mutant::CommitPastTheGap)),
+            Box::new(|s| scaled(s).testing(Mutant::CommitPastTheGap)),
             "model:",
             10,
         ),
         (
             "the inbox's gap notice is told to aterm",
-            Box::new(|s| scaled(s).with(Mutant::TellNoGap)),
+            Box::new(|s| scaled(s).testing(Mutant::TellNoGap)),
             "given up untold",
             190,
         ),
         (
             "the mirror's window takes the broker's oldest=",
-            Box::new(|s| windowed(s).with(Mutant::MirrorIgnoresOldest)),
+            Box::new(|s| windowed(s).testing(Mutant::MirrorIgnoresOldest)),
             "mirror",
             1,
         ),
         (
             "a read back that meets its subject's floor reads again told",
-            Box::new(|s| Opts::seed(s).with(Mutant::ReadBackWithoutTheHeld)),
+            Box::new(|s| Opts::seed(s).testing(Mutant::ReadBackWithoutTheHeld)),
             "dup post",
             602,
         ),
         (
             "a read of one offset below its filter's oldest reads again told (F3)",
-            Box::new(|s| fetching(s).with(Mutant::ReadAtWithoutTheHeld)),
+            Box::new(|s| fetching(s).testing(Mutant::ReadAtWithoutTheHeld)),
             "fetch:",
             4,
         ),
         (
             "the deadline sweep reads on from a floor retention raised (F4)",
-            Box::new(|s| asking(s).with(Mutant::SweepWithAPlainFetch)),
+            Box::new(|s| asking(s).testing(Mutant::SweepWithAPlainFetch)),
             "neither answered nor expired",
             20,
         ),
         (
             "a topic replay reads on from a floor retention raised (F4)",
-            Box::new(|s| asking(s).with(Mutant::TopicReplayWithAPlainFetch)),
+            Box::new(|s| asking(s).testing(Mutant::TopicReplayWithAPlainFetch)),
             "topic:",
             5,
         ),
         (
             "a topic replay tells aterm what retention gave up of the topic (F4)",
-            Box::new(|s| asking(s).with(Mutant::TopicReplayTellsNoGap)),
+            Box::new(|s| asking(s).testing(Mutant::TopicReplayTellsNoGap)),
             "silent skip",
-            13,
+            25,
         ),
         (
             "a topic catch-up tells the uncounted notice below the first broadcast it delivers (F4)",
-            Box::new(|s| asking(s).with(Mutant::TopicReplayDropsAnUncountedNotice)),
+            Box::new(|s| asking(s).testing(Mutant::TopicReplayDropsAnUncountedNotice)),
             "silent skip",
             46,
         ),
         (
             "the broadcast face's gap notice hands its cursors to the catch-up (F4)",
-            Box::new(|s| asking(s).with(Mutant::SayFaceGapUntold)),
+            Box::new(|s| asking(s).testing(Mutant::SayFaceGapUntold)),
             "silent skip",
-            25,
+            32,
         ),
         (
             "the deadline sweep reads the asker's lane for an answer (F4)",
-            Box::new(|s| asking(s).with(Mutant::SweepIgnoresAnswers)),
+            Box::new(|s| asking(s).testing(Mutant::SweepIgnoresAnswers)),
             "which the broker holds",
             1,
         ),
         (
             "a hand-off whose heads the disk refuses keeps the journal (F4)",
-            Box::new(|s| asking_erring(s).with(Mutant::HandOffWithoutTheHeads)),
+            Box::new(|s| asking_erring(s).testing(Mutant::HandOffWithoutTheHeads)),
             "dup post|answered 2 times| expired 2 times",
             466,
         ),
         (
             "an answer is delivered only once the deadline it settles is off the disk (F4)",
-            Box::new(|s| asking_erring(s).with(Mutant::DeliverOverAnUnwrittenSettle)),
+            Box::new(|s| asking_erring(s).testing(Mutant::DeliverOverAnUnwrittenSettle)),
             "was handed",
             1662,
         ),
         // This committed witness still reaches the hand-off bug after both scheduling changes.
         (
             "an attach takes a hand-off's files before its incarnation (F4)",
-            Box::new(|s| asking_erring(s).with(Mutant::AdoptAfterTheAttach)),
+            Box::new(|s| asking_erring(s).testing(Mutant::AdoptAfterTheAttach)),
             "dup post|answered 2 times| expired 2 times",
             244,
         ),
+        // The t-form session names of the tab-ID grammar (LT-19) moved this witness from 60 to
+        // 2961, the first within 20,000.
         (
             "an adoption names the attach of the hand-off it takes (F4)",
-            Box::new(|s| asking_erring(s).with(Mutant::AdoptWithoutTheAttach)),
+            Box::new(|s| asking_erring(s).testing(Mutant::AdoptWithoutTheAttach)),
             "dup post|answered 2 times| expired 2 times",
-            60,
+            2961,
         ),
         (
             "a post retires only once its deadline is on disk (F4)",
-            Box::new(|s| asking_erring(s).with(Mutant::RetireOverAnUnwrittenDeadline)),
+            Box::new(|s| asking_erring(s).testing(Mutant::RetireOverAnUnwrittenDeadline)),
             "neither answered nor expired",
             36,
         ),
@@ -1306,7 +1332,7 @@ fn each_rule_switched_off_is_caught() {
         // the bug is a control here, not a found row: its first seed is this row's.
         (
             "a keyed re-post reads its key's winner back before it is published (F23)",
-            Box::new(|s| keyed(s).with(Mutant::KeyedRepostWithoutReadingBack)),
+            Box::new(|s| keyed(s).testing(Mutant::KeyedRepostWithoutReadingBack)),
             "key:",
             1,
         ),
@@ -1315,19 +1341,19 @@ fn each_rule_switched_off_is_caught() {
         // a dedup answer it cannot vouch for (case 5).
         (
             "an unverifiable answer holds its own sender (F21)",
-            Box::new(|s| strayed(s).with(Mutant::UnverifiableHoldsNothing)),
+            Box::new(|s| strayed(s).testing(Mutant::UnverifiableHoldsNothing)),
             "order:",
             6,
         ),
         (
             "an unverifiable answer leaves the link up (F21)",
-            Box::new(|s| strayed(s).with(Mutant::UnverifiableDropsTheLink)),
+            Box::new(|s| strayed(s).testing(Mutant::UnverifiableDropsTheLink)),
             "order:",
             115,
         ),
         (
             "the attach's replay holds an unverifiable entry's lane (F21)",
-            Box::new(|s| strayed(s).with(Mutant::ReplayPastAnUnverifiableEntry)),
+            Box::new(|s| strayed(s).testing(Mutant::ReplayPastAnUnverifiableEntry)),
             "order:",
             115,
         ),
@@ -1337,25 +1363,25 @@ fn each_rule_switched_off_is_caught() {
         // seed in the hundreds or the thousands.
         (
             "an entry journaled before another log is read back from its start (KI-1111-4)",
-            Box::new(|s| Opts::lossy_logs(s).with(Mutant::NoReadBackOnAnotherLog)),
+            Box::new(|s| Opts::lossy_logs(s).testing(Mutant::NoReadBackOnAnotherLog)),
             "dup post",
-            4748,
+            975,
         ),
         (
             "another log brings a pin's head to its start (KI-1111-4)",
-            Box::new(|s| Opts::lossy_logs(s).with(Mutant::PinHeadGoneOnAnotherLog)),
+            Box::new(|s| Opts::lossy_logs(s).testing(Mutant::PinHeadGoneOnAnotherLog)),
             "dup post",
-            2201,
+            5779,
         ),
         (
             "another log takes every pin's offset out (KI-1111-4)",
-            Box::new(|s| lossy_keyed(s).with(Mutant::ForgetPinResetsOnAnotherLog)),
+            Box::new(|s| lossy_keyed_unread(s).testing(Mutant::ForgetPinResetsOnAnotherLog)),
             "key:",
-            3113,
+            588,
         ),
         (
             "a replay that lands a key's winner tells the key where (KI-1111-4)",
-            Box::new(|s| lossy_keyed(s).with(Mutant::ReplayLeavesTheKeysWinnerUntold)),
+            Box::new(|s| lossy_keyed(s).testing(Mutant::ReplayLeavesTheKeysWinnerUntold)),
             "key:",
             216,
         ),
@@ -1364,21 +1390,21 @@ fn each_rule_switched_off_is_caught() {
         // carried its first attempt unread and dropped its dedup key, landed a second copy.
         (
             "a key's own post rebuilt from its key's pin keeps a head",
-            Box::new(|s| lossy_keyed(s).with(Mutant::OwnersPinFromItsKeyHeadless)),
+            Box::new(|s| lossy_keyed(s).testing(Mutant::OwnersPinFromItsKeyHeadless)),
             "key:",
-            590,
+            603,
         ),
         (
             "another log keeps no offset of the old one (KI-1111-4)",
-            Box::new(|s| Opts::lossy_logs(s).with(Mutant::KeepFloorOnAnotherLog)),
+            Box::new(|s| Opts::lossy_logs(s).testing(Mutant::KeepFloorOnAnotherLog)),
             "lost:|dup|key:|order:",
-            82994,
+            73516,
         ),
         (
             "another log is not read as a move (KI-1111-4)",
-            Box::new(|s| Opts::lossy_logs(s).with(Mutant::AnotherLogAsAMove)),
+            Box::new(|s| Opts::lossy_logs(s).testing(Mutant::AnotherLogAsAMove)),
             "lost:",
-            974,
+            1846,
         ),
     ];
     // Critic item F21's other two rules have no sim witness: in 3,000 seeds of the stray world
@@ -1435,22 +1461,36 @@ fn each_rule_switched_off_is_caught() {
         // unverifiable answer, or a replay past one, sends a sender's later post ahead of it.
         "an unverifiable answer leaves the link up (F21)",
         "the attach's replay holds an unverifiable entry's lane (F21)",
-        // KI-1111-4's: none within 64 of its world; the seeds are 4748, 2201, 3113, 216 and 974
-        // (of the keyed lossy world none within 20,000 meets the kept floor). The kept floor
-        // moved from 16892 past 20,000, to 82994 (RAREST below).
+        // KI-1111-4's: none within 64 of its world; the first seeds are 975, 5779, 588, 216 and
+        // 1846 (of the keyed lossy world none within 20,000 meets the kept floor), found again by
+        // explicit discovery within 20,000 on the tree that composes the receipt heads
+        // (ATERM-KI-1111-7) with the seed 590 and 355 fixes (an outcome unknown no answer,
+        // another log's pin drop on the media). Seed 590, which before those fixes broke `key:`
+        // with every pin's offset kept, holds every law with every rule on (FOUND_LOSSY), so
+        // 3113, the receipt heads' pick past it, no longer matters: 588 is first and holds the
+        // law with the rule on.
         "an entry journaled before another log is read back from its start (KI-1111-4)",
         "another log takes every pin's offset out (KI-1111-4)",
         "another log brings a pin's head to its start (KI-1111-4)",
         "a replay that lands a key's winner tells the key where (KI-1111-4)",
         "another log is not read as a move (KI-1111-4)",
         // Met where a key's own post's pin write is refused after its key's took, its attempt
-        // then landing unanswered and carried past a cut: none within 64; 590 is the first.
+        // then landing unanswered and carried past a cut: none within 64; 603 is the first within
+        // 20,000 on the tree that composes it with ATERM-KI-1111-4's outcome-unknown rule (590
+        // before: either rule alone now holds seed 590's law).
         "a key's own post rebuilt from its key's pin keeps a head",
     ];
     const RAREST: &[&str] = &[
         "the incarnation lease is trusted only in the boot that wrote it",
-        // Since the receipt heads (ATERM-KI-1111-7) no seed of its world to 20,000 reaches it;
-        // 82994 is the first to 100,000.
+        // 73516 is the first seed to 100,000 that reaches it, and holds the law with the rule on
+        // (searched with every seed 1..=73516, 2026-11-13). Seed 3483 seemed to reach it first:
+        // it broke `dup delivery` with every rule on, a self-lane window kept from a log no
+        // witness named (FOUND_LOSSY's seed 3483, `Mutant::UnboundWindow`). With that window
+        // bound to its log it holds every law with this rule off as well (run 2026-11-13): its
+        // witness, torn, names no high, so the move its attach judges from the log `acked` names
+        // keeps no offset (82994 was the pick before the seed 590 and 355 fixes). This pin is
+        // checked to reach the rule, not to be the first: the search from 1 last ran before the
+        // seed 3483 review.
         "another log keeps no offset of the old one (KI-1111-4)",
     ];
     for rare in RARE.iter().chain(RAREST) {
@@ -1472,22 +1512,19 @@ fn each_rule_switched_off_is_caught() {
             opts.as_ref(),
             *witness,
             limit,
-            &|out| breaks_law(out, law),
+            &|out| checked_discovery_control(out, law, || discovery_controls(opts(out.seed))),
             mode,
         );
-        let on = off
-            .as_ref()
-            .map(|out| run(&with_every_rule(opts(out.seed))));
-        (off, on, limit, stale)
+        (off, limit, stale)
     });
     let mut missed = Vec::new();
     let mut stale = Vec::new();
-    for ((rule, _, law, _), (off, on, limit, was)) in rules.iter().zip(&shown) {
+    for ((rule, _, law, _), (off, limit, was)) in rules.iter().zip(&shown) {
         if let Some(was) = was {
             stale.push(format!("{rule}: {was}"));
         }
-        match (off, on) {
-            (Some(out), Some(committed)) => {
+        match off {
+            Some(out) => {
                 eprintln!(
                     "OFF: {rule} -> seed {} breaks `{law}`: {}",
                     out.seed,
@@ -1495,11 +1532,6 @@ fn each_rule_switched_off_is_caught() {
                         .iter()
                         .find(|v| breaks(v, law))
                         .map_or("", String::as_str)
-                );
-                assert!(
-                    !breaks_law(committed, law),
-                    "with the rule on, the same seed still breaks `{law}`: {}",
-                    report(committed)
                 );
             }
             _ => missed.push(format!(
@@ -1598,14 +1630,17 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
         400,
         "a sweep a write error stopped, closed by the run record",
     ),
+    // Composing the receipt heads (ATERM-KI-1111-7) with ATERM-KI-1111-4's seed 590 and 355
+    // fixes moved 15 off this bug; explicit discovery found 27 first within 60,000.
     (
-        15,
+        27,
         400,
         "a pin judged before the reconcile a write error stopped",
     ),
     // After composing grouped landing with the power-cut repairs, 1435 no longer reaches it.
     // Explicit discovery returned this first witness in the same world and 60,000-seed bound,
-    // 443, which critic item F20's floor written at the attach moved to 2795.
+    // 443, which critic item F20's floor written at the attach moved to 2795; seed 3483's first
+    // fix moved it to 6603, and its review, the self-lane window bound to its log, back to 2795.
     (2795, 400, "a floor whose flush failed trusted as it read"),
     // Sim item B05: a cut dropped the dedup key of a record an in-flight entry named.
     (
@@ -1645,9 +1680,10 @@ const FOUND_ERRING: &[(u64, usize, &str)] = &[
 const FOUND_BOTH_WAYS: &[(u64, usize, &str)] = &[
     // Grouped landing moved 3273 off it, the E07 review's fix 558, critic item F17's self-lane
     // log 7324, F20's floor written at the attach 2127, and G04's one subject-budget read a
-    // drain 4431. With C3b's per-node hand-over, discovery found 1465 first within 60,000.
+    // drain 4431. With C3b's per-node hand-over, discovery found 1465 first within 60,000, and
+    // since the self-lane window names its log (the seed 3483 review) 2170.
     (
-        1465,
+        2170,
         400,
         "an attach delivered on a log the state dir's witness does not name",
     ),
@@ -1664,8 +1700,9 @@ const FOUND_BOTH_WAYS_ERRING: &[(u64, usize, &str)] = &[
     // steps, and 6751's, 7755's, 735's, 2270's, 3018's and 6371's trajectories off this bug (each
     // holds every law still); the first seed of this world to 60,000 that reaches it with its
     // rule off ([`found_again`]). G04's one subject-budget read a drain moved 210 to 7759;
-    // composing C3b moved it to 22763, discovered within the same 60,000-seed bound, and the
-    // receipt heads' writes (ATERM-KI-1111-7) to 7759.
+    // composing C3b moved it to 22763, discovered within the same 60,000-seed bound, and both
+    // the receipt heads' writes (ATERM-KI-1111-7) and another log's pin drop written on the media
+    // (ATERM-KI-1111-4's seed 355) to 7759, still the first to 60,000 with the two composed.
     (
         7759,
         400,
@@ -1700,6 +1737,24 @@ const FOUND_RETAINED: &[FoundIn] = &[
         400,
         "a hello's judge that said the mirror runs kept the wait it no longer showed",
     ),
+    // ATERM-KI-1114-858: the owner's post given up at @78 was published again at @148, its key
+    // still naming @78; the re-post under the key read nothing there and landed a third copy.
+    // The t-form session names of the tab-ID grammar (LT-19) moved seed 858 to 27354, the
+    // first within 60,000.
+    (
+        windowed_keyed,
+        27354,
+        400,
+        "a key's winner given up at its pin was not read on to its owner's copy past the cut",
+    ),
+    // ATERM-KI-1114-56: a refused post's later entries were dropped lowest first; a kill after
+    // #7's drop left #8 to #11 for the replay (@553 to @556), ahead of #7 from the drain (@560).
+    (
+        windowed,
+        56,
+        1200,
+        "a stop between the drops behind a refused post let the replay overtake the drain",
+    ),
 ];
 
 const FOUND_QUITTING: &[FoundIn] = &[
@@ -1723,24 +1778,28 @@ const FOUND_QUITTING: &[FoundIn] = &[
     // Each row reaches its bug with the rule off and holds every law with it on. After
     // composing G04 and C3b, the first witness still does; explicit discovery found 2375
     // first for the second within the original 60,000-seed bound. The receipt heads' writes
-    // (ATERM-KI-1111-7) moved the first's 3397 to 2403.
+    // (ATERM-KI-1111-7) moved the first's 3397 to 2403; ATERM-KI-1111-4's seed 355 and 590
+    // fixes moved the second's 2375 to 10354, and composing the two, to 15, each the first
+    // within 60,000. The t-form session names of the tab-ID grammar (LT-19) moved the first's
+    // 2403 to 4847, the first within 60,000.
     (
         both_ways_erring_quitting,
-        2403,
+        4847,
         400,
         "a clean stop left the heads it kept unflushed",
     ),
     (
         both_ways_erring_quitting,
-        2375,
+        15,
         400,
         "an entry sent ahead of a post of its sender's with none",
     ),
     (
-        // Critic item F20's floor written at the attach moved 13679 to 3400, and G04's one
-        // subject-budget read a drain 3400 to 55609.
+        // Critic item F20's floor written at the attach moved 13679 to 3400, G04's one
+        // subject-budget read a drain 3400 to 55609, and the t-form session names of the tab-ID
+        // grammar (LT-19) 55609 to 697, the first within 60,000.
         both_ways_erring_quitting,
-        55609,
+        697,
         400,
         "a retired record's copy ended the memory of its torn file's",
     ),
@@ -1752,12 +1811,80 @@ const FOUND_QUITTING: &[FoundIn] = &[
 /// session's cursor to the fork, a move the session had yet to be told, a delivery below its
 /// `since` (`Mutant::FollowOnTheBrokersLog` reads it so again). The first seed of 10,000 that
 /// meets it on the tree merged with critic item B09.
-const FOUND_ASKING: &[FoundIn] = &[(
-    asking,
-    6340,
-    400,
-    "a follow judged on a log its session had yet to be told",
-)];
+const FOUND_ASKING: &[FoundIn] = &[
+    (
+        asking,
+        6340,
+        400,
+        "a follow judged on a log its session had yet to be told",
+    ),
+    // ATERM-KI-1114-2241: the answer at @17 was pumped, a cut at 20 gave it up, and the deadline
+    // sweep, reading the bus alone, published `expired` at @24 before the loop handed @17 over.
+    // 1186 reaches it too.
+    (
+        asking,
+        2241,
+        400,
+        "the deadline sweep expired an ask whose answer the mailbox held unhandled",
+    ),
+];
+
+/// Found seeds of the lossy-log worlds ([`Opts::lossy_logs`], and [`lossy_keyed`] over it), each
+/// past the committed seeds and found by a witness search (ATERM-KI-1111-4).
+const FOUND_LOSSY: &[FoundIn] = &[
+    (
+        lossy_keyed,
+        1498,
+        400,
+        "a keyed re-post replayed before an earlier post on another log",
+    ),
+    // The replay's publish was answered astream's "outcome unknown" (its full flush failed and
+    // poisoned the log); taken as an answer, the link kept, its entry was dropped, and once the
+    // log was reopened its record, shown and carried below a cut that dropped its dedup key, was
+    // published again by a later attach. Seed 590 was the first; composed with the head a key's
+    // own post keeps when its pin is rebuilt from its key's (`Mutant::OwnersPinFromItsKeyHeadless`),
+    // either rule alone holds seed 590, and 1514 is the first to 60,000 that reaches this one with
+    // its rule off and holds every law with it on.
+    // Since a keyed re-post reads its own attempt back (`Bridge::keyed_repost_own_attempt`),
+    // that read alone also holds it, so it is pinned where the read is off ([`lossy_keyed_unread`]).
+    (
+        lossy_keyed_unread,
+        1514,
+        400,
+        "an outcome unknown taken as an answer dropped its publish's entry",
+    ),
+    // Another log's drop of the mirror's pin was written under the pin's fence alone; a power
+    // cut brought the old log's window ledger back under the new log's witness, and the window
+    // budget held the mirror on an offset (@153) the new log's oldest stayed below.
+    (
+        Opts::lossy_logs,
+        355,
+        400,
+        "another log's pin drop a power cut undid held the mirror on the old log's window",
+    ),
+    // A power cut tore the bus-log witness, so the next start knew no log and kept the self-lane
+    // window of the log the last bridge read (floor @40) in force when its broker had retired
+    // that log: a post onto a session of the node's own landed at @9 of another log, below that
+    // floor, so it was delivered before its ack was read, its in-flight entry standing; a kill
+    // left the entry, and the next attach, on yet another log, published the ask again at @7,
+    // which the session was handed a second time (`dup delivery`).
+    (
+        Opts::lossy_logs,
+        3483,
+        400,
+        "a window kept on another log let an own record past its unread ack",
+    ),
+    // A keyed re-post's retry (its key an earlier post's, its pin at the key's sequence) read
+    // back only a replay entry's claimed copy and its key's winner, so its own attempt, named by
+    // neither and carried past a cut that dropped its dedup key, was published again: a second
+    // copy of its key. 3794 is the first to 5,000 with the read off; 4380 reaches it too.
+    (
+        lossy_keyed,
+        3794,
+        400,
+        "a keyed re-post's attempt no entry or claim names was published again past a cut",
+    ),
+];
 
 /// Every found seed, at the world it broke a law in.
 fn found() -> Vec<FoundIn> {
@@ -1782,6 +1909,7 @@ fn found() -> Vec<FoundIn> {
         .chain(FOUND_QUITTING.iter().copied())
         .chain(FOUND_RETAINED.iter().copied())
         .chain(FOUND_ASKING.iter().copied())
+        .chain(FOUND_LOSSY.iter().copied())
         .collect()
 }
 
@@ -1812,6 +1940,31 @@ fn the_seeds_that_broke_a_law_hold_every_law() {
 /// law's own reading, not a bridge rule ([`FOUND_ASKING`]): its mutant puts the misreading
 /// back, and the seed's false violation returns.
 const FOUND_RULES: &[(&str, Mutant, &str)] = &[
+    (
+        "a keyed re-post replayed before an earlier post on another log",
+        Mutant::ReplayBySequence,
+        "order",
+    ),
+    (
+        "a keyed re-post's attempt no entry or claim names was published again past a cut",
+        Mutant::KeyedRepostReadsNoOwnAttempt,
+        "dup post",
+    ),
+    (
+        "a key's winner given up at its pin was not read on to its owner's copy past the cut",
+        Mutant::KeyedWinnerNotReadPastACut,
+        "key",
+    ),
+    (
+        "the deadline sweep expired an ask whose answer the mailbox held unhandled",
+        Mutant::SweepIgnoresQueuedAnswers,
+        "deadline",
+    ),
+    (
+        "a stop between the drops behind a refused post let the replay overtake the drain",
+        Mutant::DropBehindLowestFirst,
+        "order",
+    ),
     (
         "a pin judged before the reconcile a write error stopped",
         Mutant::JudgePinBeforeRecovery,
@@ -1892,6 +2045,21 @@ const FOUND_RULES: &[(&str, Mutant, &str)] = &[
         Mutant::FollowOnTheBrokersLog,
         "it follows it from",
     ),
+    (
+        "an outcome unknown taken as an answer dropped its publish's entry",
+        Mutant::OutcomeUnknownIsAnAnswer,
+        "dup post",
+    ),
+    (
+        "another log's pin drop a power cut undid held the mirror on the old log's window",
+        Mutant::DroppedPinUnderTheFence,
+        "mirror:",
+    ),
+    (
+        "a window kept on another log let an own record past its unread ack",
+        Mutant::UnboundWindow,
+        "dup delivery",
+    ),
 ];
 
 /// **NEGATIVE CONTROL: EACH BUG A FOUND SEED PINS IS REACHED AGAIN WITH ITS
@@ -1921,9 +2089,11 @@ fn each_found_bug_is_reached_again_with_its_rule_off() {
         .collect();
     let reached = aterm_spec::check::each(&runs, |&(i, (world, seed, steps, _))| {
         let (_, rule, law) = FOUND_RULES[i];
-        let mut o = world(seed).with(rule);
+        let mut o = world(seed).testing(rule);
         o.steps = steps;
-        (i, seed, breaks_law(&run(&o), law))
+        let off = run(&o);
+        let hit = checked_discovery_control(&off, law, || discovery_controls(o));
+        (i, seed, hit)
     });
     let missed: Vec<String> = reached
         .iter()
@@ -1954,16 +2124,44 @@ fn each_found_bug_is_reached_again_with_its_rule_off() {
 /// recorded beside [`FOUND`]'s rows ran to.
 const FOUND_SEARCH: u64 = 60_000;
 
+fn checked_discovery_control(
+    off: &Outcome,
+    law: &str,
+    controls: impl FnOnce() -> (Outcome, Outcome),
+) -> bool {
+    if !breaks_law(off, law) {
+        return false;
+    }
+    let (conditional, production) = controls();
+    assert!(
+        production.violations.is_empty(),
+        "a fully enabled production world failed during negative-witness discovery; \
+         it must not be filtered out: {}",
+        report(&production)
+    );
+    if !conditional.violations.is_empty() {
+        eprintln!(
+            "REJECTED CONDITIONAL WITNESS seed {}: restoring the target alone still breaks {:?}; \
+             all production protections hold every law",
+            off.seed, conditional.violations
+        );
+        return false;
+    }
+    true
+}
+
 /// EXPLICIT DISCOVERY OF A FOUND BUG'S NEXT SEED ([`each_found_bug_is_reached_again_with_its_rule_off`]):
 /// the first seed to [`FOUND_SEARCH`] of the world and steps of the failing row that
 /// breaks `law` with `rule` off and holds every law with it on, said for the row to record.
+/// A rules-enabled failure encountered by the search fails discovery instead of
+/// being silently excluded while the search continues to a different candidate.
 fn found_again((world, last, steps, _): FoundIn, rule: Mutant, law: &str) -> String {
     let at = |seed: u64| Opts {
         steps,
         ..world(seed)
     };
-    let next = first_within(&|seed| at(seed).with(rule), FOUND_SEARCH, &|out| {
-        breaks_law(out, law) && run(&at(out.seed)).violations.is_empty()
+    let next = first_within(&|seed| at(seed).testing(rule), FOUND_SEARCH, &|out| {
+        checked_discovery_control(out, law, || discovery_controls(at(out.seed).testing(rule)))
     });
     match next {
         Some(out) => format!(
@@ -4231,6 +4429,34 @@ fn lossy_keyed(seed: u64) -> Opts {
     }
 }
 
+/// The keyed lossy-log world with a keyed re-post's own-attempt read off
+/// (`Mutant::KeyedRepostReadsNoOwnAttempt`): a rule that keeps such an attempt named (its entry
+/// standing for the replay, its pin's offsets on another log) is then the only one between it
+/// and a second copy, as before that read. Seed 1514 with an outcome unknown taken as an answer,
+/// and seed 588 with every pin's offset kept on another log, each hold every law with either
+/// rule on and break with both off.
+fn lossy_keyed_unread(seed: u64) -> Opts {
+    lossy_keyed(seed).with(Mutant::KeyedRepostReadsNoOwnAttempt)
+}
+
+/// [`keyed`] with power cuts and bus losses both on (ATERM-KI-1114-479).
+fn keyed_both_ways(seed: u64) -> Opts {
+    Opts {
+        power_cuts: true,
+        bus_losses: true,
+        ..keyed(seed)
+    }
+}
+
+/// [`windowed`] with keys (ATERM-KI-1114-858): the mirror's small window over keyed notes and
+/// their re-posts under their keys.
+fn windowed_keyed(seed: u64) -> Opts {
+    Opts {
+        keys: true,
+        ..windowed(seed)
+    }
+}
+
 /// The stray world (critic item F23, [`Opts::strays`]): the seed's world over a retained broker,
 /// another writer under the node's producer id taking the sequence of one refused publish in
 /// two, a cut landing after one dedup answer in two. Retained, as every broker aterm ships: on
@@ -4395,6 +4621,28 @@ fn every_seed_of_the_fetching_world_holds_every_law() {
 /// in-flight entry the attach's replay settles at its key's winner (counted too; its rule's
 /// tests are bridge's `a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner`
 /// and `a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy`).
+/// THE KEYED WORLD WITH CUTS AND LOSSES BOTH ON ([`keyed_both_ways`], ATERM-KI-1114-479): every
+/// committed seed, and 479, whose round a move kept between its pump and its delivery, holds
+/// every law, FabricExactlyOnce's refinement included. No committed world ran keys with both
+/// before: [`Opts::seed`] turns cuts on for odd seeds and losses on for even ones.
+#[test]
+fn every_seed_of_the_keyed_world_with_cuts_and_losses_holds_every_law() {
+    let mut outs = run_all(&keyed_both_ways, 1..=SEEDS);
+    outs.push(run(&keyed_both_ways(479)));
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} seeds of the keyed world with cuts and losses broke a law:\n{}",
+        failures.len(),
+        outs.len(),
+        failures.join("\n")
+    );
+}
+
 #[test]
 fn every_seed_of_the_keyed_world_holds_every_law() {
     let outs = run_all(&keyed, 1..=SEEDS);
@@ -4642,7 +4890,7 @@ fn a_post_the_log_lost_stays_lost_after_a_later_power_cut() {
         o
     };
     let republishing = move |s: u64| world(s).with(Mutant::RepublishInFlightOfAnEarlierBoot);
-    let out = breaking_at(&republishing, "order:", 561, RARE_SEEDS)
+    let out = breaking_at(&republishing, "order:", 308, RARE_SEEDS)
         .expect("NEGATIVE CONTROL: the old republish puts some post out of its sender's order");
     eprintln!(
         "the old republish at seed {}: {}",
@@ -5017,4 +5265,176 @@ fn a_retry_whose_words_left_its_pin_is_read_back_and_never_held_for_good() {
         }
     }
     assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// **AN OWN RECORD HELD FOR ATERM'S DRAIN HOLDS ITS OWN LANE, NOT THE LINK** (ATERM-KI-1111-3):
+/// aterm answers a sender's `outbox sent` with `ERR busy update-committing` while its own note
+/// to another of this node's sessions lands ([`super::world::run_busy`]). The bridge holds the
+/// note in hand, says no link down, hands a third session the mail posted after it, and once
+/// aterm's commit ends delivers the note; every law of the world holds, the model's tap and
+/// `liveness` among them, and so they do where the bridge is killed while it holds the note and
+/// a peer's mail behind it, and the next bridge delivers both. NEGATIVE CONTROLS: the link
+/// dropped at the held note, as every build before (`Mutant::DropTheLinkAtAHeldOwnRecord`),
+/// says it down; a commit past the held note (`Mutant::CommitPastAHeldOwnRecord`) passes a
+/// record no session was handed, which the model's tap refuses, in the killed worlds too,
+/// where it passed the peer's mail held behind the note. A kill does not turn that commit
+/// into a loss here: the note's entry and the next bridge's refill of the note's lane, which
+/// reads from the lane's own watermark, offer both again, so `lost:` cannot be its law; the
+/// commit is still one the model forbids, for a session the refill does not read.
+#[test]
+fn an_own_record_held_for_aterms_drain_drops_no_link_and_stalls_no_other_lane() {
+    let worlds: Vec<(u64, Tier, bool)> = (1..=4)
+        .flat_map(|seed| {
+            [Tier::Strict, Tier::Ordered, Tier::Relaxed]
+                .into_iter()
+                .flat_map(move |tier| [false, true].map(|kill| (seed, tier, kill)))
+        })
+        .collect();
+    let run_with = |control: Option<Mutant>, kill: bool| {
+        let worlds: Vec<(u64, Tier, bool)> =
+            worlds.iter().copied().filter(|w| w.2 == kill).collect();
+        aterm_spec::check::each(&worlds, |&(seed, tier, kill)| {
+            let opts = Opts::reclaiming(seed, tier);
+            let opts = match control {
+                Some(m) => opts.with(m),
+                None => opts,
+            };
+            ((seed, tier, kill), super::world::run_busy(&opts, kill))
+        })
+    };
+    let mut failed = Vec::new();
+    for kill in [false, true] {
+        for ((seed, tier, kill), out) in run_with(None, kill) {
+            if !out.violations.is_empty()
+                || !out.held
+                || !out.other_while_held
+                || out.drops != 0
+                || !out.delivered
+                || out.answered_busy == 0
+                || out.committed_past_the_held
+                || (kill && out.held_at_the_kill < 2)
+            {
+                failed.push(format!(
+                    "seed {seed} {tier:?} kill {kill}: held {} other while held {} drops {} \
+                     delivered {} busy {} committed past {} held at the kill {}; {:#?}\n{}",
+                    out.held,
+                    out.other_while_held,
+                    out.drops,
+                    out.delivered,
+                    out.answered_busy,
+                    out.committed_past_the_held,
+                    out.held_at_the_kill,
+                    out.violations,
+                    out.trace.join("\n")
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n\n"));
+    let dropped = run_with(Some(Mutant::DropTheLinkAtAHeldOwnRecord), false);
+    assert!(
+        dropped.iter().all(|(_, out)| out.drops > 0 && !out.held),
+        "NEGATIVE CONTROL: with DropTheLinkAtAHeldOwnRecord a world said no link down: {:?}",
+        dropped
+            .iter()
+            .filter(|(_, out)| out.drops == 0)
+            .map(|(w, _)| w)
+            .collect::<Vec<_>>()
+    );
+    let passed = run_with(Some(Mutant::CommitPastAHeldOwnRecord), false);
+    assert!(
+        passed
+            .iter()
+            .any(|(_, out)| out.violations.iter().any(|v| breaks(v, "model:"))),
+        "NEGATIVE CONTROL: with CommitPastAHeldOwnRecord no world broke the model's tap: {:#?}",
+        passed
+            .iter()
+            .map(|(w, out)| (w, &out.violations))
+            .collect::<Vec<_>>()
+    );
+    let killed = run_with(Some(Mutant::CommitPastAHeldOwnRecord), true);
+    assert!(
+        killed.iter().any(|(_, out)| out.committed_past_the_held)
+            && killed.iter().all(|(_, out)| {
+                !out.committed_past_the_held || out.violations.iter().any(|v| breaks(v, "model:"))
+            }),
+        "NEGATIVE CONTROL: with CommitPastAHeldOwnRecord no killed world's commit passed the \
+         held mail, or one that did went unrefused: {:#?}",
+        killed
+            .iter()
+            .map(|(w, out)| (w, out.committed_past_the_held, &out.violations))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn discovery_does_not_filter_a_rules_enabled_failure() {
+    let opts = |seed| Opts {
+        steps: 0,
+        ..Opts::seed(seed)
+    };
+    let mut off = run(&opts(1));
+    off.violations.push("dup post: synthetic candidate".into());
+    for conditional_bad in [false, true] {
+        for production_bad in [false, true] {
+            let mut conditional = run(&opts(2));
+            let mut production = run(&opts(3));
+            assert!(conditional.violations.is_empty() && production.violations.is_empty());
+            if conditional_bad {
+                conditional
+                    .violations
+                    .push("conditional: secondary fault".into());
+            }
+            if production_bad {
+                production
+                    .violations
+                    .push("production: rules-enabled failure".into());
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                checked_discovery_control(&off, "dup post", || (conditional, production))
+            }));
+            if production_bad {
+                assert!(
+                    result.is_err(),
+                    "a failing production control was silently filtered out"
+                );
+            } else {
+                assert!(matches!(result, Ok(accepted) if accepted == !conditional_bad));
+            }
+        }
+    }
+    off.violations.clear();
+    assert!(!checked_discovery_control(&off, "dup post", || {
+        panic!("a non-candidate must not run its controls")
+    }));
+}
+
+#[test]
+fn conditional_discovery_restores_only_its_target() {
+    let off = lossy_keyed_unread(1162).testing(Mutant::OutcomeUnknownIsAnAnswer);
+    let conditional = with_target_rule(off.clone());
+    assert_eq!(
+        conditional.mutants,
+        std::collections::BTreeSet::from([Mutant::KeyedRepostReadsNoOwnAttempt])
+    );
+    assert!(with_every_rule(off).mutants.is_empty());
+
+    // This existing control constructs its secondary switch after its target.
+    // Construction order must not turn the lease fault back on in the control.
+    let lease = without_retention(
+        both_ways(37095)
+            .testing(Mutant::LeaseAcrossBoots)
+            .with(Mutant::TrustTheFloorThatReads),
+    );
+    assert_eq!(
+        with_target_rule(lease.clone()).mutants,
+        std::collections::BTreeSet::from([Mutant::TrustTheFloorThatReads])
+    );
+    let (conditional, production) = discovery_controls(lease);
+    assert!(
+        conditional.violations.is_empty(),
+        "{}",
+        report(&conditional)
+    );
+    assert!(production.violations.is_empty(), "{}", report(&production));
 }

@@ -960,7 +960,7 @@ fn the_card_opens_from_its_fact_steps_and_closes_with_it() {
     assert!(app.autopilot_menu.is_some(), "the fact is there: it stays");
     let lines = app.fact_menu_controls();
     assert!(
-        lines[0].starts_with("fact-menu open=true session=s-"),
+        lines[0].starts_with("fact-menu open=true session=t"),
         "{lines:?}"
     );
     assert!(
@@ -3008,7 +3008,7 @@ fn grouped_card() -> Vec<MenuRow> {
         MenuRow::Section("Switch this Mac to".into()),
         trailed("alpha@example.test", "61% left", true, true),
         trailed("beta@example.test", "\u{2264}88% left", true, false),
-        trailed("gamma@example.test", "not signed in", false, false),
+        trailed("gamma@example.test", "signed out", false, false),
     ]
 }
 
@@ -3237,7 +3237,7 @@ fn an_items_trail_ends_where_a_check_begins_in_the_rows_own_ink() {
         (
             GROUP_DISABLED,
             "\u{2386}  gamma@example.test",
-            "not signed in",
+            "signed out",
             (c.quiet(), c.ground, false),
         ),
     ] {
@@ -3264,7 +3264,7 @@ fn an_items_trail_ends_where_a_check_begins_in_the_rows_own_ink() {
     assert_eq!((text_start, text_end), (1, 29), "no room: no padding");
     let painted = paint(narrow, &rows, MenuViewport::default(), None, theme, None);
     let cells = &painted[1 + GROUP_DISABLED];
-    let trail = "not signed in";
+    let trail = "signed out";
     let from = text_end - CHECK_CELLS - trail.len();
     assert_eq!(said(&cells[from..text_end - CHECK_CELLS]), trail);
     let label = said(&cells[text_start..from]);
@@ -3449,7 +3449,7 @@ fn a_grouped_card_is_read_by_controls_and_named_in_row_order() {
             said.ends_with(&[
                 "alpha@example.test, 61% left",
                 "beta@example.test, \u{2264}88% left",
-                "gamma@example.test, not signed in"
+                "gamma@example.test, signed out"
             ]),
             "{said:?}"
         );

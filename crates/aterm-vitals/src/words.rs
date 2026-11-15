@@ -962,7 +962,17 @@ fn scope_cell(res: Resource, fig: &ScopeFig, starts: bool) -> ScopeCell {
         return words2("–");
     };
     let forms = match res {
-        Resource::Cpu => vec![format!("{} cores", fixed(v, 1))],
+        Resource::Cpu => vec![format!(
+            "{} cores",
+            fixed(
+                if fig.unread > 0 {
+                    (v * 10.0).floor() / 10.0
+                } else {
+                    v
+                },
+                1
+            )
+        )],
         Resource::Memory => {
             let g = v / GIB;
             vec![format!("{} GiB", fixed(g, if g < 0.995 { 2 } else { 1 }))]
@@ -989,10 +999,27 @@ fn scope_cell(res: Resource, fig: &ScopeFig, starts: bool) -> ScopeCell {
         Resource::Gpu => return words2("not per app"),
     };
     ScopeCell {
-        forms,
+        forms: if fig.unread > 0 {
+            forms.into_iter().map(|text| format!("≥{text}")).collect()
+        } else {
+            forms
+        },
         ink: InkKind::Words,
     }
 }
+
+/// A separately retained kernel CPU charge when it cannot be identified with actual CPU.
+#[must_use]
+pub fn cpu_charge_words(fig: &ScopeFig) -> Option<String> {
+    let charge = fig.cpu_charge?;
+    let actual = fig.now?;
+    let charge = fixed(charge, 2);
+    (charge != fixed(actual, 2)).then(|| format!("counter charge {charge} cores"))
+}
+
+/// Why a CPU charge is kept apart from proved actual CPU.
+pub const CPU_CHARGE_NOTE: &str =
+    "Child counter estimates can repeat or miss CPU time; confirmed CPU is shown separately.";
 
 fn writes_forms(bytes_per_s: f64) -> Vec<String> {
     let mb = bytes_per_s / 1e6;
@@ -1045,10 +1072,20 @@ pub fn well(res: Resource, view: &ResourceView) -> Option<(Mark, InkKind)> {
     })
 }
 
-/// Strip-spanning status sentence forms when a resource has no live cells.
+/// Strip-spanning status sentence forms when a resource has no live cells: the Processes row's
+/// while its sweep is stalled ([`crate::lanes`]), whatever its ring holds.
 #[must_use]
 pub fn strip_words(res: Resource, snap: &Snapshot) -> Option<Vec<String>> {
     let view = &snap.resources[res.index()];
+    if res == Resource::Processes
+        && let Some(stall) = snap.stalled.iter().find(|l| l.figures().contains(&"procs"))
+    {
+        return Some(vec![
+            format!("stalled \u{b7} process table \u{b7} {}", stall.call),
+            "stalled \u{b7} process table".into(),
+            "stalled".into(),
+        ]);
+    }
     match res {
         Resource::Gpu if snap.seq > 0 && view.ring.iter().all(|c| c.mean.is_none()) => Some(vec![
             "no GPU reading on this system".into(),
@@ -1415,6 +1452,7 @@ fn busiest(snap: &Snapshot) -> Option<Clause> {
     let place = match g.scope {
         Some(ProcScope::Tab(key)) => snap.tab(key).map(|t| format!(" in {}", t.label)),
         Some(ProcScope::Aterm) => Some(" in aterm".into()),
+        Some(ProcScope::Shared) => Some(" in shared aterm work".into()),
         Some(ProcScope::Other) | None => None,
     }
     .unwrap_or_default();
@@ -2191,6 +2229,16 @@ fn scope_sentences(
             .iter()
             .map(|f| format!("{}.", f.said())),
     );
+    if res == Resource::Cpu {
+        for (who, figure) in [(Some("aterm"), &view.aterm), (label.as_deref(), &view.tab)] {
+            if let Some((who, charge)) = who.zip(cpu_charge_words(figure)) {
+                out.push(format!("{who} {charge}."));
+            }
+        }
+        if cpu_charge_words(&view.aterm).is_some() || cpu_charge_words(&view.tab).is_some() {
+            out.push(CPU_CHARGE_NOTE.into());
+        }
+    }
     out
 }
 

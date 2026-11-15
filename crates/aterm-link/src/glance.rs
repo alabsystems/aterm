@@ -46,7 +46,7 @@ pub struct Row {
     pub offset: u64,
     /// The publishing node, from the subject's fifth segment.
     pub node: String,
-    /// The face the row describes: a literal `node`, or a hosted `s-<hex>`.
+    /// The face the row describes: a literal `node`, or a hosted session's tab ID.
     pub owner: String,
     /// Verbatim pct-encoded `key=value` body tokens plus guaranteed keys.
     pub fields: BTreeMap<String, String>,
@@ -73,7 +73,7 @@ impl Row {
             return None;
         }
         let owner = segs[5];
-        if owner != "node" && !(owner.starts_with("s-") && crate::subject::is_principal(owner)) {
+        if owner != "node" && !crate::subject::is_session_id(owner) {
             return None;
         }
         Some(Row {

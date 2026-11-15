@@ -24,6 +24,61 @@ fn keys_for(tag: u8, handoff: Option<&Handoff>) -> aterm_tempfile::TempDir {
     dir
 }
 
+/// A Mac's `bus.log` served on a socket in a folder of its own, as the node service serves it.
+/// Its drop shuts the handle down while the socket is there to wake its acceptor, then the
+/// folder goes. A handle that outlived its socket's folder (one under a bridge's lane, dropped
+/// with the lane) spent all of astream's acceptor wake rounds, a second, dialing a name that was
+/// gone, and abandoned its acceptor: 83 replays of three rotations took the own-inbox move's
+/// conformance 265 s on one worker. A shutdown that abandons its acceptor fails the test, so a
+/// socket whose name goes first is red rather than a second slower
+/// ([`a_served_socket_whose_folder_went_first_is_red`]).
+struct Served {
+    handle: Option<astream_broker::BrokerHandle>,
+    broker: std::sync::Arc<astream_broker::Broker>,
+    dir: aterm_tempfile::TempDir,
+}
+
+impl Served {
+    /// `mac`'s `bus.log` served on a socket of its own, and that socket's path.
+    fn on(mac: &Mac) -> (Self, std::path::PathBuf) {
+        let dir = crate::test_scratch_dir("sock");
+        let socket = dir.path().join("bus.sock");
+        let handle = mac.broker.serve(&socket).expect("bus.log served");
+        (
+            Self {
+                handle: Some(handle),
+                broker: std::sync::Arc::clone(&mac.broker),
+                dir,
+            },
+            socket,
+        )
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let before = self.broker.stats().acceptors_abandoned;
+        drop(self.handle.take());
+        let abandoned = self.broker.stats().acceptors_abandoned - before;
+        assert!(
+            abandoned == 0 || std::thread::panicking(),
+            "the served socket's name went before its handle: its shutdown abandoned the \
+             acceptor after a second of wake rounds"
+        );
+    }
+}
+
+/// NEGATIVE CONTROL of [`Served`]'s drop: a socket whose folder went before its handle abandons
+/// its acceptor, and the drop fails.
+#[test]
+#[should_panic(expected = "abandoned the acceptor")]
+fn a_served_socket_whose_folder_went_first_is_red() {
+    let mac = Mac::new(7);
+    let (served, _) = Served::on(&mac);
+    std::fs::remove_dir_all(served.dir.path()).expect("the socket's folder removed");
+    drop(served);
+}
+
 /// A bridge for `mac` with the mesh on, its node key and hand-off in `keys`, hosting `sid`, on a
 /// fresh state dir or the one at `state`, its ring minted for its node: not yet attached.
 fn bridge_on(
@@ -32,7 +87,7 @@ fn bridge_on(
     keys: &std::path::Path,
     state: Option<&std::path::Path>,
     fx: crate::fx::Fx,
-) -> (FakeVerbLane, Bridge, astream_broker::BrokerHandle) {
+) -> (FakeVerbLane, Bridge, Served) {
     bridge_hosting(mac, &[(1, sid)], keys, state, fx)
 }
 
@@ -43,7 +98,7 @@ fn bridge_hosting(
     keys: &std::path::Path,
     state: Option<&std::path::Path>,
     fx: crate::fx::Fx,
-) -> (FakeVerbLane, Bridge, astream_broker::BrokerHandle) {
+) -> (FakeVerbLane, Bridge, Served) {
     let mesh = MeshPaths {
         keys: keys.to_path_buf(),
         root: keys.to_path_buf(),
@@ -55,8 +110,7 @@ fn bridge_hosting(
         "the node is its key's, on the one fleet"
     );
     bridge.fx = fx;
-    let socket = lane.dir.path().join("bus.sock");
-    let server = mac.broker.serve(&socket).expect("bus.log served");
+    let (server, socket) = Served::on(mac);
     bridge.cfg.broker = socket.to_string_lossy().into_owned();
     bridge.caps = crate::enable::node_rules(FLEET, &mac.node)
         .into_iter()
@@ -73,11 +127,7 @@ fn bridge_hosting(
 }
 
 /// [`bridge_on`], attached.
-fn attached(
-    mac: &Mac,
-    sid: &str,
-    keys: &std::path::Path,
-) -> (FakeVerbLane, Bridge, astream_broker::BrokerHandle) {
+fn attached(mac: &Mac, sid: &str, keys: &std::path::Path) -> (FakeVerbLane, Bridge, Served) {
     let (lane, mut bridge, server) = bridge_on(mac, sid, keys, None, crate::fx::Fx::os());
     assert!(bridge.attach_broker(), "the bridge attaches to its bus.log");
     (lane, bridge, server)
@@ -116,7 +166,7 @@ fn queue(lane: &FakeVerbLane, sid: &str, id: u64, to: &str, kind: &str, text: &s
 }
 
 /// **A POST TO ANOTHER MAC REACHES ITS RING, AND THE RECEIPT NAMES THE ASKER'S RECORD**: a
-/// session on A asks `@s-b@<B>`; A's bridge writes the ask on A's own `bus.log`, and A's push
+/// session on A asks `@tb000000000@<B>`; A's bridge writes the ask on A's own `bus.log`, and A's push
 /// carries it one hop to B's, under A's producer, numbered by its offset on A. B's bridge's
 /// receipt for it, written on B's log, comes back the same way and names the ask by its offset on
 /// A, where the asker waits on it, though B's log numbers it otherwise.
@@ -132,8 +182,8 @@ fn a_post_to_another_mac_reaches_its_ring_and_the_receipt_names_the_askers_recor
             keys_for(41, Some(&members(&ma, &nodes))),
             keys_for(42, Some(&members(&mb, &nodes))),
         );
-        let (lane_a, mut a, _served_a) = attached(&ma, "s-a", ka.path());
-        let (_lane_b, mut b, _served_b) = attached(&mb, "s-b", kb.path());
+        let (lane_a, mut a, _served_a) = attached(&ma, "ta000000000", ka.path());
+        let (_lane_b, mut b, _served_b) = attached(&mb, "tb000000000", kb.path());
         // B's log runs ahead of A's, so an offset on one names another record on the other.
         for _ in 0..7 {
             b.try_publish_ev_for(None, "filler").expect("filler");
@@ -144,14 +194,14 @@ fn a_post_to_another_mac_reaches_its_ring_and_the_receipt_names_the_askers_recor
 
         queue(
             &lane_a,
-            "s-a",
+            "ta000000000",
             1,
-            &format!("@s-b@{}", mb.node),
+            &format!("@tb000000000@{}", mb.node),
             "ask",
             "hello",
         );
         a.drain_outbox();
-        let ask = format!("/f/{FLEET}/in/{}/s-b/{}/ask", mb.node, ma.node);
+        let ask = format!("/f/{FLEET}/in/{}/tb000000000/{}/ask", mb.node, ma.node);
         let sent = ma.holds(&ask);
         assert_eq!(
             sent.len(),
@@ -183,16 +233,16 @@ fn a_post_to_another_mac_reaches_its_ring_and_the_receipt_names_the_askers_recor
             b.cfg.mesh = None;
         }
         b.send_receipt(&OwedReceipt {
-            sid: "s-b".to_owned(),
+            sid: "tb000000000".to_owned(),
             rid: 1,
             off: at_b,
             verdict: "handled".to_owned(),
             kind: "ask".to_owned(),
-            from: format!("s-a@{}", ma.node),
+            from: format!("ta000000000@{}", ma.node),
             earlier_log: false,
         })
         .expect("the receipt goes");
-        let ack = format!("/f/{FLEET}/in/{}/s-a/{}/ack", ma.node, mb.node);
+        let ack = format!("/f/{FLEET}/in/{}/ta000000000/{}/ack", ma.node, mb.node);
         until(&format!("{case}: the receipt reaches A's log"), || {
             !ma.holds(&ack).is_empty()
         });
@@ -227,16 +277,16 @@ fn routing_to_another_mac_fails_closed_without_a_current_hand_off() {
     let far = node_of(&key_of(44));
     let nodes = [ma.node.as_str(), far.as_str()];
     let keys = keys_for(43, None);
-    let (lane, mut a, _served) = attached(&ma, "s-a", keys.path());
+    let (lane, mut a, _served) = attached(&ma, "ta000000000", keys.path());
     let current = members(&ma, &nodes);
     let stale = Handoff {
         me: node_of(&key_of(45)),
         ..current.clone()
     };
-    let to = format!("@s-b@{far}");
-    let lane_far = format!("/f/{FLEET}/in/{far}/s-b/{}/note", ma.node);
-    let own = Route::To(format!("/f/{FLEET}/in/{}/s-a/{}", ma.node, ma.node));
-    let session_ev = subject::session_face(FLEET, &ma.node, "s-a", "ev");
+    let to = format!("@tb000000000@{far}");
+    let lane_far = format!("/f/{FLEET}/in/{far}/tb000000000/{}/note", ma.node);
+    let own = Route::To(format!("/f/{FLEET}/in/{}/ta000000000/{}", ma.node, ma.node));
+    let session_ev = subject::session_face(FLEET, &ma.node, "ta000000000", "ev");
     let cases: [(&str, &dyn Fn()); 4] = [
         ("hand-off-missing", &|| {}),
         ("hand-off-stale", &|| {
@@ -251,7 +301,7 @@ fn routing_to_another_mac_fails_closed_without_a_current_hand_off() {
     ];
     for (id, (why, set)) in (1u64..).zip(cases) {
         set();
-        queue(&lane, "s-a", id, &to, "note", "hi");
+        queue(&lane, "ta000000000", id, &to, "note", "hi");
         a.drain_outbox();
         let sent = lane.sent.lock().unwrap().clone();
         if why.is_empty() {
@@ -259,7 +309,9 @@ fn routing_to_another_mac_fails_closed_without_a_current_hand_off() {
         } else {
             assert!(ma.holds(&lane_far).is_empty(), "{why}: nothing written");
             assert!(
-                sent.contains(&format!("outbox sent s-a {id} off=- reason=unroutable")),
+                sent.contains(&format!(
+                    "outbox sent ta000000000 {id} off=- reason=unroutable"
+                )),
                 "{why}: the post is retired: {sent:?}"
             );
             let said = format!("undeliverable to={to} reason=unroutable why={why}");
@@ -270,12 +322,12 @@ fn routing_to_another_mac_fails_closed_without_a_current_hand_off() {
                 evs_on(&a, &node_ev)
             );
             a.send_receipt(&OwedReceipt {
-                sid: "s-a".to_owned(),
+                sid: "ta000000000".to_owned(),
                 rid: id,
                 off: 1,
                 verdict: "handled".to_owned(),
                 kind: "ask".to_owned(),
-                from: format!("s-b@{far}"),
+                from: format!("tb000000000@{far}"),
                 earlier_log: false,
             })
             .expect("recorded unsent");
@@ -287,7 +339,7 @@ fn routing_to_another_mac_fails_closed_without_a_current_hand_off() {
             );
         }
         assert_eq!(
-            a.resolve_to("@s-a", None).expect("a route"),
+            a.resolve_to("@ta000000000", None).expect("a route"),
             own,
             "{why}: this Mac's own sessions are routed to"
         );
@@ -337,8 +389,8 @@ fn the_bridge_is_its_logs_one_writer_under_its_nodes_producer() {
             keys_for(46, Some(&members(&ma, &nodes))),
             keys_for(47, Some(&members(&mb, &nodes))),
         );
-        let (lane_a, mut a, _served_a) = attached(&ma, "s-a", ka.path());
-        let (lane_b, mut b, _served_b) = attached(&mb, "s-b", kb.path());
+        let (lane_a, mut a, _served_a) = attached(&ma, "ta000000000", ka.path());
+        let (lane_b, mut b, _served_b) = attached(&mb, "tb000000000", kb.path());
         let net = Arc::new(Net::default());
         let mut peers_of_a = vec![Peer::of(&mb)];
         if control {
@@ -353,39 +405,39 @@ fn the_bridge_is_its_logs_one_writer_under_its_nodes_producer() {
 
         queue(
             &lane_a,
-            "s-a",
+            "ta000000000",
             1,
-            &format!("@s-b@{}", mb.node),
+            &format!("@tb000000000@{}", mb.node),
             "note",
             "a to b",
         );
         a.drain_outbox();
         queue(
             &lane_b,
-            "s-b",
+            "tb000000000",
             1,
-            &format!("@s-a@{}", ma.node),
+            &format!("@ta000000000@{}", ma.node),
             "note",
             "b to a",
         );
         b.drain_outbox();
         queue(
             &lane_a,
-            "s-a",
+            "ta000000000",
             2,
-            &format!("@s-x@{looped}"),
+            &format!("@tx000000000@{looped}"),
             "note",
             "a to x",
         );
         a.drain_outbox();
         let (ab, ba) = (
-            format!("/f/{FLEET}/in/{}/s-b/{}/note", mb.node, ma.node),
-            format!("/f/{FLEET}/in/{}/s-a/{}/note", ma.node, mb.node),
+            format!("/f/{FLEET}/in/{}/tb000000000/{}/note", mb.node, ma.node),
+            format!("/f/{FLEET}/in/{}/ta000000000/{}/note", ma.node, mb.node),
         );
         until(&format!("{case}: mail both ways"), || {
             !mb.holds(&ab).is_empty() && !ma.holds(&ba).is_empty()
         });
-        let loop_lane = format!("/f/{FLEET}/in/{looped}/s-x/{}/note", ma.node);
+        let loop_lane = format!("/f/{FLEET}/in/{looped}/tx000000000/{}/note", ma.node);
         if control {
             // astream refuses the push onto its own log outright ...
             let looping = Lane::Mail {
@@ -446,12 +498,12 @@ fn a_bridge_restarted_without_its_state_numbers_above_the_last() {
         let ka = keys_for(49, Some(&members(&ma, &nodes)));
         let net = Arc::new(Net::default());
         let to_b = pushes(&ma, &[&mb], &net, &members(&ma, &nodes));
-        let (lane, mut first, served) = attached(&ma, "s-a", ka.path());
+        let (lane, mut first, served) = attached(&ma, "ta000000000", ka.path());
         queue(
             &lane,
-            "s-a",
+            "ta000000000",
             1,
-            &format!("@s-b@{}", mb.node),
+            &format!("@tb000000000@{}", mb.node),
             "note",
             "before",
         );
@@ -460,7 +512,7 @@ fn a_bridge_restarted_without_its_state_numbers_above_the_last() {
         first.close_subscriptions();
         // The bridge goes; the log stays served, as the node service keeps it.
         drop((first, lane));
-        let ab = format!("/f/{FLEET}/in/{}/s-b/{}/note", mb.node, ma.node);
+        let ab = format!("/f/{FLEET}/in/{}/tb000000000/{}/note", mb.node, ma.node);
         until(&format!("{case}: the first note reaches B"), || {
             mb.holds(&ab).len() == 1
         });
@@ -471,7 +523,7 @@ fn a_bridge_restarted_without_its_state_numbers_above_the_last() {
         } else {
             crate::fx::Fx::os()
         };
-        let (lane, mut again, _served_again) = bridge_on(&ma, "s-a", ka.path(), None, fx);
+        let (lane, mut again, _served_again) = bridge_on(&ma, "ta000000000", ka.path(), None, fx);
         let attached = again.attach_broker();
         if control {
             let first_seq = again.next_seq().expect("a sequence");
@@ -489,9 +541,9 @@ fn a_bridge_restarted_without_its_state_numbers_above_the_last() {
         );
         queue(
             &lane,
-            "s-a",
+            "ta000000000",
             1,
-            &format!("@s-b@{}", mb.node),
+            &format!("@tb000000000@{}", mb.node),
             "note",
             "after",
         );
@@ -527,7 +579,7 @@ fn the_bridge_names_the_topics_its_sessions_hold_on_its_nodes_face() {
     };
     let ma = Mac::new(47);
     let keys = keys_for(47, None);
-    let (_lane, mut a, _served) = attached(&ma, "s-a", keys.path());
+    let (_lane, mut a, _served) = attached(&ma, "ta000000000", keys.path());
     let named = || -> Vec<BTreeSet<String>> {
         ma.holds(&topics_face(&ma.node))
             .into_iter()
@@ -536,7 +588,7 @@ fn the_bridge_names_the_topics_its_sessions_hold_on_its_nodes_face() {
     };
     assert_eq!(named(), [set(&[])], "the attach names none held");
     let hold = |bridge: &mut Bridge, words: &str| {
-        bridge.topic_change("s-a", &mut words.split_whitespace());
+        bridge.topic_change("ta000000000", &mut words.split_whitespace());
         assert!(bridge.sync_say_face());
     };
     hold(&mut a, "add build since=@0");
@@ -549,7 +601,7 @@ fn the_bridge_names_the_topics_its_sessions_hold_on_its_nodes_face() {
         "one record per change, none for a sync that changed nothing"
     );
 
-    let (_lane, mut off, _server) = rig_with_broker(&[(1, "s-a")]);
+    let (_lane, mut off, _server) = rig_with_broker(&[(1, "ta000000000")]);
     assert!(off.cfg.mesh.is_none());
     off.refresh_sessions().expect("sessions");
     hold(&mut off, "add build since=@0");
@@ -571,15 +623,15 @@ fn rounds_until(what: &str, bridge: &mut Bridge, mut done: impl FnMut() -> bool)
     });
 }
 
-/// **UNREAD MAIL FOR A MAC'S OLD NODE REACHES ITS SESSION ONCE** (§11 C3b): B's ask to `s-a`
+/// **UNREAD MAIL FOR A MAC'S OLD NODE REACHES ITS SESSION ONCE** (§11 C3b): B's ask to `ta000000000`
 /// landed on A's `bus.log` for A's node after A's bridge had read and passed a note there, and
 /// before A's node key rotated. A's node service, under the new node on the same log, moves what
 /// the old node's group had not passed to the new node's lanes, under their subjects; A's bridge,
-/// attached as the new node, delivers the ask to `s-a` once, beside a note to the new node, and
+/// attached as the new node, delivers the ask to `ta000000000` once, beside a note to the new node, and
 /// never the note its old bridge delivered; its receipt names the ask by its offset on B, where
 /// the asker waits on it, read where the ask came from under the node service's reader's ring
 /// ([`crate::federate::OLD_READS_FILE`]), though the bridge attached before the hand-off named
-/// the old node. An ask A's own session wrote under the old node moves too, reaches `s-a` from
+/// the old node. An ask A's own session wrote under the old node moves too, reaches `ta000000000` from
 /// that session, and its receipt names it by its offset on A, where that asker waits, on the lane
 /// of the node A holds now. A person's post on A to the old node moves the same
 /// way, and A's person carry (§11 C3c) leaves it to the move, saying nothing of it. A restart of
@@ -587,7 +639,7 @@ fn rounds_until(what: &str, bridge: &mut Bridge, mut done: impl FnMut() -> bool)
 /// turned, follows the first alone.
 /// NEGATIVE CONTROL: [`crate::federate::ONE_NODE`], the pushes before C3b: no such push, so the
 /// bridge's one inbox, the new node's, never reads the ask, and the old group holds it, while
-/// the note to the new node reaches `s-a`; and the carry calls the old node no member. And
+/// the note to the new node reaches `ta000000000`; and the carry calls the old node no member. And
 /// without the reader's ring the late ask's receipt names it by its offset on A's log.
 #[test]
 fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
@@ -604,10 +656,10 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
             rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
-        // B's mail for `s-a` at `dst`, as B's push writes it on A's log: under B's producer,
+        // B's mail for `ta000000000` at `dst`, as B's push writes it on A's log: under B's producer,
         // numbered by its offset on B.
         let from_b = |dst: &str, kind: &str, on_b: u64, text: &str| -> u64 {
-            let subject = format!("/f/{FLEET}/in/{dst}/s-a/{}/{kind}", mb.node);
+            let subject = format!("/f/{FLEET}/in/{dst}/ta000000000/{}/{kind}", mb.node);
             let mut push = ma.client(
                 mb.key,
                 &[format!(
@@ -616,7 +668,7 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
                 )],
             );
             let mut body = Body::new(0);
-            body.from = Some("s-b".to_owned());
+            body.from = Some("tb000000000".to_owned());
             body.text = text.to_owned();
             push.publish(pid(&mb.node), on_b, &subject, &body.encode())
                 .expect("B's push lands")
@@ -625,7 +677,7 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
 
         // A's bridge as the old node reads the first note and its group passes it.
         let k_old = keys_for(53, Some(&before));
-        let (lane_old, mut old, served_old) = attached(&ma, "s-a", k_old.path());
+        let (lane_old, mut old, served_old) = attached(&ma, "ta000000000", k_old.path());
         let read = from_b(&ma.node, "note", 3, "read before");
         rounds_until(
             &format!("{case}: the old node's bridge delivers the note"),
@@ -639,7 +691,7 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
         // The bridge goes; the log stays served, as the node service keeps it.
         drop((old, lane_old));
         let ask = from_b(&ma.node, "ask", 7, "unread");
-        // And an ask of A's own session `s-x`, as A's bridge wrote it under the old node: under
+        // And an ask of A's own session `tx000000000`, as A's bridge wrote it under the old node: under
         // that node's producer, numbered in the bridge's incarnation past what it wrote above.
         let local = {
             let mut own = ma.client(
@@ -647,9 +699,9 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
                 &[format!("rw,p={0}:/f/{FLEET}/in/{0}/*/{0}/*", ma.node)],
             );
             let mut body = Body::new(0);
-            body.from = Some("s-x".to_owned());
+            body.from = Some("tx000000000".to_owned());
             body.text = "asked here".to_owned();
-            let subject = format!("/f/{FLEET}/in/{0}/s-a/{0}/ask", ma.node);
+            let subject = format!("/f/{FLEET}/in/{0}/ta000000000/{0}/ask", ma.node);
             let (at, deduped) = own
                 .publish(pid(&ma.node), (1 << 32) | 1000, &subject, &body.encode())
                 .expect("A's own ask lands");
@@ -658,15 +710,18 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
         };
 
         // A's bridge, as the node A holds next, attaches under a hand-off that names no rotation
-        // yet; `s-x` is a session of A's too, so its bridge vouches for no sender by that name,
-        // and the ask reads as `s-x`'s only where the bridge knows the node it came under is A's.
+        // yet; `tx000000000` is a session of A's too, so its bridge vouches for no sender by that name,
+        // and the ask reads as `tx000000000`'s only where the bridge knows the node it came under is A's.
         let unturned = Handoff {
             moved: BTreeMap::new(),
             ..after.clone()
         };
         let k_new = keys_for(63, Some(&unturned));
-        let (lane, mut a, _served) = attached(&new, "s-a", k_new.path());
-        lane.sessions.lock().unwrap().push((2, "s-x".to_owned()));
+        let (lane, mut a, _served) = attached(&new, "ta000000000", k_new.path());
+        lane.sessions
+            .lock()
+            .unwrap()
+            .push((2, "tx000000000".to_owned()));
         a.refresh_sessions().expect("the sessions");
 
         // A's node key rotates: the node service's next generation, on the same bus.log, writes
@@ -693,14 +748,14 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
             routes
         };
         let routes = start();
-        let moved_lane = format!("/f/{FLEET}/in/{}/s-a/{}/ask", new.node, mb.node);
+        let moved_lane = format!("/f/{FLEET}/in/{}/ta000000000/{}/ask", new.node, mb.node);
         let moved = || -> Vec<u64> {
             new.holds(&moved_lane)
                 .into_iter()
                 .map(|(off, _, _, _)| off)
                 .collect()
         };
-        let own_lane = format!("/f/{FLEET}/in/{}/s-a/{}/ask", new.node, ma.node);
+        let own_lane = format!("/f/{FLEET}/in/{}/ta000000000/{}/ask", new.node, ma.node);
         let moved_own = || -> Vec<u64> {
             new.holds(&own_lane)
                 .into_iter()
@@ -719,7 +774,7 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
         // it, and the person carry, which carries a person's posts to the other Macs, leaves it
         // be, where under ONE_NODE it takes the old node for no member and says so. Each post
         // goes in order, so the notice for a later post to no member says the first was taken.
-        let person_lane = format!("/f/{FLEET}/in/{}/s-q/h-andrew/note", new.node);
+        let person_lane = format!("/f/{FLEET}/in/{}/tq000000000/h-andrew/note", new.node);
         let post = |dst: &str, seq| {
             person_posts(
                 &ma,
@@ -781,21 +836,21 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
             continue;
         }
         assert!(
-            lane.deliveries()[0].contains(&format!("from=s-b@{}", mb.node)),
+            lane.deliveries()[0].contains(&format!("from=tb000000000@{}", mb.node)),
             "{case}: from B's asker: {:?}",
             lane.deliveries()
         );
         a.send_receipt(&OwedReceipt {
-            sid: "s-a".to_owned(),
+            sid: "ta000000000".to_owned(),
             rid: 1,
             off: want[0],
             verdict: "handled".to_owned(),
             kind: "ask".to_owned(),
-            from: format!("s-b@{}", mb.node),
+            from: format!("tb000000000@{}", mb.node),
             earlier_log: false,
         })
         .expect("the receipt goes");
-        let ack = format!("/f/{FLEET}/in/{}/s-b/{}/ack", mb.node, new.node);
+        let ack = format!("/f/{FLEET}/in/{}/tb000000000/{}/ack", mb.node, new.node);
         let receipts = new.holds(&ack);
         assert_eq!(receipts.len(), 1, "{case}: the receipt is on A's log");
         assert_eq!(
@@ -810,21 +865,21 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
             lane.deliveries()
                 .iter()
                 .any(|line| line.contains(&format!(" off={own} "))
-                    && line.contains(&format!("from=s-x@{}", ma.node))),
+                    && line.contains(&format!("from=tx000000000@{}", ma.node))),
             "{case}: from A's own asker: {:?}",
             lane.deliveries()
         );
         a.send_receipt(&OwedReceipt {
-            sid: "s-a".to_owned(),
+            sid: "ta000000000".to_owned(),
             rid: 3,
             off: own,
             verdict: "handled".to_owned(),
             kind: "ask".to_owned(),
-            from: format!("s-x@{}", ma.node),
+            from: format!("tx000000000@{}", ma.node),
             earlier_log: false,
         })
         .expect("the receipt goes");
-        let own_ack = format!("/f/{FLEET}/in/{0}/s-x/{0}/ack", new.node);
+        let own_ack = format!("/f/{FLEET}/in/{0}/tx000000000/{0}/ack", new.node);
         assert_eq!(
             new.holds(&own_ack)
                 .iter()
@@ -866,12 +921,12 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
         std::fs::remove_file(k_new.path().join(crate::federate::OLD_READS_FILE))
             .expect("the ring goes");
         a.send_receipt(&OwedReceipt {
-            sid: "s-a".to_owned(),
+            sid: "ta000000000".to_owned(),
             rid: 2,
             off: held[1].0,
             verdict: "handled".to_owned(),
             kind: "ask".to_owned(),
-            from: format!("s-b@{}", mb.node),
+            from: format!("tb000000000@{}", mb.node),
             earlier_log: false,
         })
         .expect("the receipt goes");
@@ -890,7 +945,7 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
 
 /// **UNREAD MAIL UNDER THE NODE A MAC RETIRED LAST REACHES ITS SESSION ONCE** (§11 C3b): A's seat
 /// retired one more node than a ring names, the one it retired last the greatest in node order,
-/// and B's asks to `s-a` wait unread on A's `bus.log` under that node and under the one A retired
+/// and B's asks to `ta000000000` wait unread on A's `bus.log` under that node and under the one A retired
 /// first. A's node service moves the mail of the nodes its seat retired last
 /// ([`Handoff::ringed`]) and writes the reader's ring that reads them; A's bridge follows that
 /// ring, whichever nodes it reads, so it delivers the ask under the node retired last once, and
@@ -898,7 +953,7 @@ fn unread_mail_for_a_macs_old_node_reaches_its_session_once() {
 /// node retired first stays on its old group, unread.
 /// NEGATIVE CONTROL: [`crate::federate::NODE_ORDER_RING`], the choice before the second recency
 /// phase: the moves and the reader's ring take the first nodes in node order, so the ask under
-/// the node retired last never reaches `s-a` and its old group holds it, while the one under the
+/// the node retired last never reaches `ta000000000` and its old group holds it, while the one under the
 /// node retired first moves.
 #[test]
 fn unread_mail_under_the_node_a_mac_retired_last_reaches_its_session_once() {
@@ -925,10 +980,10 @@ fn unread_mail_under_the_node_a_mac_retired_last_reaches_its_session_once() {
             rank: olds.iter().rev().cloned().zip(0..).collect(),
             gone: BTreeSet::new(),
         };
-        // B's ask to `s-a` at `dst`, as B's push writes it on A's log: under B's producer,
+        // B's ask to `ta000000000` at `dst`, as B's push writes it on A's log: under B's producer,
         // numbered by its offset on B.
         let from_b = |dst: &str, on_b: u64, text: &str| -> u64 {
-            let subject = format!("/f/{FLEET}/in/{dst}/s-a/{}/ask", mb.node);
+            let subject = format!("/f/{FLEET}/in/{dst}/ta000000000/{}/ask", mb.node);
             let mut push = ma.client(
                 mb.key,
                 &[format!(
@@ -937,7 +992,7 @@ fn unread_mail_under_the_node_a_mac_retired_last_reaches_its_session_once() {
                 )],
             );
             let mut body = Body::new(0);
-            body.from = Some("s-b".to_owned());
+            body.from = Some("tb000000000".to_owned());
             body.text = text.to_owned();
             push.publish(pid(&mb.node), on_b, &subject, &body.encode())
                 .expect("B's push lands")
@@ -962,7 +1017,7 @@ fn unread_mail_under_the_node_a_mac_retired_last_reaches_its_session_once() {
         let routes = routes_as(&ma, (&now.node, now.key), &olds, Vec::new(), &net, false);
         NODE_ORDER_RING.with(|on| on.set(false));
         routes.set(&after, &BTreeSet::new());
-        let moved_lane = format!("/f/{FLEET}/in/{}/s-a/{}/ask", now.node, mb.node);
+        let moved_lane = format!("/f/{FLEET}/in/{}/ta000000000/{}/ask", now.node, mb.node);
         until(&format!("{case}: the ask under {moves} moves"), || {
             now.holds(&moved_lane).len() == 1
                 && ma.broker.group_start(&mail_group(moves))
@@ -980,27 +1035,27 @@ fn unread_mail_under_the_node_a_mac_retired_last_reaches_its_session_once() {
             "{case}: the ask under {stays} stays on its old group, unread"
         );
 
-        let (lane, mut a, _served) = attached(&now, "s-a", keys.path());
+        let (lane, mut a, _served) = attached(&now, "ta000000000", keys.path());
         rounds_until(&format!("{case}: the bridge delivers"), &mut a, || {
             lane.delivery_offsets() == [copy]
         });
         if control {
             // The one copy is the ask under the node retired first: the one under the node
-            // retired last never reaches s-a.
+            // retired last never reaches ta000000000.
             drop(routes);
             continue;
         }
         a.send_receipt(&OwedReceipt {
-            sid: "s-a".to_owned(),
+            sid: "ta000000000".to_owned(),
             rid: 1,
             off: copy,
             verdict: "handled".to_owned(),
             kind: "ask".to_owned(),
-            from: format!("s-b@{}", mb.node),
+            from: format!("tb000000000@{}", mb.node),
             earlier_log: false,
         })
         .expect("the receipt goes");
-        let ack = format!("/f/{FLEET}/in/{}/s-b/{}/ack", mb.node, now.node);
+        let ack = format!("/f/{FLEET}/in/{}/tb000000000/{}/ack", mb.node, now.node);
         let receipts = now.holds(&ack);
         assert_eq!(receipts.len(), 1, "{case}: the receipt is on A's log");
         assert_eq!(
@@ -1013,7 +1068,7 @@ fn unread_mail_under_the_node_a_mac_retired_last_reaches_its_session_once() {
 }
 
 /// **MAIL UNREAD ACROSS TWO ROTATIONS OF A MAC'S KEY REACHES ITS SESSION ONCE** (§11 C3b): B's ask
-/// to `s-a` lands on A's `bus.log` for A's node, and A's key rotates twice before `s-a` reads it.
+/// to `ta000000000` lands on A's `bus.log` for A's node, and A's key rotates twice before `ta000000000` reads it.
 /// The node service under the second new node moves the first move's copy on, and A's bridge
 /// delivers the ask once, naming its first offset on A (`was=`) through both moves; its receipt
 /// follows the copy back through both moves, under the node service's reader's ring, to the ask
@@ -1027,7 +1082,7 @@ fn mail_unread_across_two_rotations_reaches_its_session_once() {
         let case = format!("control={control}");
         let (ma, mb) = (Mac::new(65), Mac::new(66));
         let (mid, last) = (ma.rotated(67), ma.rotated(68));
-        let lane_of = |node: &str| format!("/f/{FLEET}/in/{node}/s-a/{}/ask", mb.node);
+        let lane_of = |node: &str| format!("/f/{FLEET}/in/{node}/ta000000000/{}/ask", mb.node);
         let held = |node: &str| -> Vec<u64> {
             ma.holds(&lane_of(node))
                 .into_iter()
@@ -1043,7 +1098,7 @@ fn mail_unread_across_two_rotations_reaches_its_session_once() {
                 )],
             );
             let mut body = Body::new(0);
-            body.from = Some("s-b".to_owned());
+            body.from = Some("tb000000000".to_owned());
             body.text = "unread twice".to_owned();
             push.publish(pid(&mb.node), 7, &lane_of(&ma.node), &body.encode())
                 .expect("B's push lands");
@@ -1089,7 +1144,7 @@ fn mail_unread_across_two_rotations_reaches_its_session_once() {
         })
         .expect("the node service's reader's ring");
         let (lane, mut a, _served) =
-            bridge_on(&last, "s-a", keys.path(), None, crate::fx::Fx::os());
+            bridge_on(&last, "ta000000000", keys.path(), None, crate::fx::Fx::os());
         a.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
         assert!(
             a.attach_broker(),
@@ -1110,17 +1165,17 @@ fn mail_unread_across_two_rotations_reaches_its_session_once() {
         );
         ONE_HOP.with(|on| on.set(control));
         let sent = a.send_receipt(&OwedReceipt {
-            sid: "s-a".to_owned(),
+            sid: "ta000000000".to_owned(),
             rid: 1,
             off: copy,
             verdict: "handled".to_owned(),
             kind: "ask".to_owned(),
-            from: format!("s-b@{}", mb.node),
+            from: format!("tb000000000@{}", mb.node),
             earlier_log: false,
         });
         ONE_HOP.with(|on| on.set(false));
         sent.expect("the receipt goes");
-        let ack = format!("/f/{FLEET}/in/{}/s-b/{}/ack", mb.node, last.node);
+        let ack = format!("/f/{FLEET}/in/{}/tb000000000/{}/ack", mb.node, last.node);
         assert_eq!(
             ma.holds(&ack)
                 .iter()
@@ -1134,12 +1189,12 @@ fn mail_unread_across_two_rotations_reaches_its_session_once() {
 }
 
 /// **AN ASK TO A PERSON UNREAD ACROSS TWO ROTATIONS NAMES ITSELF AS ITS SENDER'S MAC DOES** (§11
-/// C3d): B's push brings `s-b`'s ask to `h-andrew` to A's lane back to the person, and A's key
+/// C3d): B's push brings `tb000000000`'s ask to `h-andrew` to A's lane back to the person, and A's key
 /// rotates twice before A's bridge reads it. The node service moves it to each new node, and A's
 /// bridge under the second hands it to the person's lane here once, stamped with its offset on B
 /// and B's producer ([`crate::person::WIRE_RE_TOKEN`]), followed back through both moves as a
 /// session's answer names what it answers ([`Bridge::wire_re`]), so the person's answer ends
-/// `s-b`'s wait. The ask brings a stamp of its own, which is not the bridge's: it is dropped.
+/// `tb000000000`'s wait. The ask brings a stamp of its own, which is not the bridge's: it is dropped.
 /// NEGATIVE CONTROL: [`ONE_HOP`]: the copy is followed back one move alone, to a record the first
 /// move wrote, whose origin names no offset on B: the copy carries no stamp, neither the bridge's
 /// nor the one the ask brought.
@@ -1167,7 +1222,7 @@ fn an_ask_to_a_person_unread_across_two_rotations_names_itself_as_its_senders_ma
                 )],
             );
             let mut body = Body::new(0);
-            body.from = Some("s-b".to_owned());
+            body.from = Some("tb000000000".to_owned());
             body.text = "ship it?".to_owned();
             body.unknown.insert(
                 WIRE_RE_TOKEN.to_owned(),
@@ -1215,7 +1270,7 @@ fn an_ask_to_a_person_unread_across_two_rotations_names_itself_as_its_senders_ma
         })
         .expect("the node service's reader's ring");
         let (_lane, mut a, _served) =
-            bridge_on(&last, "s-a", keys.path(), None, crate::fx::Fx::os());
+            bridge_on(&last, "ta000000000", keys.path(), None, crate::fx::Fx::os());
         a.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
         assert!(
             a.attach_broker(),
@@ -1234,7 +1289,7 @@ fn an_ask_to_a_person_unread_across_two_rotations_names_itself_as_its_senders_ma
         let body = Body::decode(&handed[0].2).0;
         assert_eq!(
             body.from.as_deref(),
-            Some(format!("s-b@{}", mb.node).as_str()),
+            Some(format!("tb000000000@{}", mb.node).as_str()),
             "{case}"
         );
         assert_eq!(
@@ -1272,13 +1327,14 @@ fn an_ask_from_a_mac_that_rotated_its_key_is_stamped_by_the_push_that_brought_it
                 )],
             );
             let mut body = Body::new(0);
-            body.from = Some("s-q".to_owned());
+            body.from = Some("tq000000000".to_owned());
             body.text = "ship it?".to_owned();
             push.publish(pid(&second.node), 7, &asked, &body.encode())
                 .expect("Q's push under its next node lands");
         }
         let keys = keys_for(83, None);
-        let (_lane, mut p, _served) = bridge_on(&mp, "s-p", keys.path(), None, crate::fx::Fx::os());
+        let (_lane, mut p, _served) =
+            bridge_on(&mp, "tp000000000", keys.path(), None, crate::fx::Fx::os());
         assert!(p.attach_broker(), "{case}: the bridge attaches");
         let person = format!("/f/{FLEET}/in/p/h-andrew/{}/>", mp.node);
         STAMP_BY_SENDER_SEQ.with(|on| on.set(control));
@@ -1294,7 +1350,7 @@ fn an_ask_from_a_mac_that_rotated_its_key_is_stamped_by_the_push_that_brought_it
         let body = Body::decode(raw).0;
         assert_eq!(
             body.from.as_deref(),
-            Some(format!("s-q@{}", first.node).as_str()),
+            Some(format!("tq000000000@{}", first.node).as_str()),
             "{case}: from the session under the node it asked from"
         );
         assert_eq!(
@@ -1325,12 +1381,12 @@ fn an_ask_from_a_mac_that_rotated_its_key_is_stamped_by_the_push_that_brought_it
                     &mut reader,
                     (FLEET, "h-andrew"),
                     &handoff,
-                    ("s-q", &now.node),
+                    ("tq000000000", &now.node),
                     *copy,
                 )
                 .expect("the person's lanes read"),
                 (!control).then_some(7),
-                "{case}: the person's answer to s-q on Q, now {}",
+                "{case}: the person's answer to tq000000000 on Q, now {}",
                 now.node
             );
         }
@@ -1342,7 +1398,7 @@ fn an_ask_from_a_mac_that_rotated_its_key_is_stamped_by_the_push_that_brought_it
 /// move of the old node's unread mail waits while that bridge may still deliver, its state dir
 /// naming the old node. The bridge goes with no broker to commit on and hands its commit over;
 /// A's bridge as the new node starts on the same state dir, and the move, open now, makes that
-/// commit first: it moves B's later ask alone, which reaches `s-a` once, and the note reaches it
+/// commit first: it moves B's later ask alone, which reaches `ta000000000` once, and the note reaches it
 /// no second time.
 /// NEGATIVE CONTROL: [`crate::federate::UNGATED_INBOX`]: the move opens at once, while the old
 /// node's bridge still runs, and moves the note that bridge delivered, which the new node's
@@ -1362,9 +1418,9 @@ fn a_record_the_old_nodes_bridge_delivered_does_not_move() {
             rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
-        // B's mail for `s-a` at `dst`, as B's push writes it on A's log.
+        // B's mail for `ta000000000` at `dst`, as B's push writes it on A's log.
         let from_b = |dst: &str, kind: &str, on_b: u64, text: &str| -> u64 {
-            let subject = format!("/f/{FLEET}/in/{dst}/s-a/{}/{kind}", mb.node);
+            let subject = format!("/f/{FLEET}/in/{dst}/ta000000000/{}/{kind}", mb.node);
             let mut push = ma.client(
                 mb.key,
                 &[format!(
@@ -1373,7 +1429,7 @@ fn a_record_the_old_nodes_bridge_delivered_does_not_move() {
                 )],
             );
             let mut body = Body::new(0);
-            body.from = Some("s-b".to_owned());
+            body.from = Some("tb000000000".to_owned());
             body.text = text.to_owned();
             push.publish(pid(&mb.node), on_b, &subject, &body.encode())
                 .expect("B's push lands")
@@ -1384,14 +1440,19 @@ fn a_record_the_old_nodes_bridge_delivered_does_not_move() {
         // A's bridge as the old node, on the state dir aterm gives it beside A's bus.log, takes
         // B's note: the endpoint has it, and the bridge holds its group's commit for the burst.
         let k_old = keys_for(81, Some(&before));
-        let (lane_old, mut old, served_old) =
-            bridge_on(&ma, "s-a", k_old.path(), Some(&state), crate::fx::Fx::os());
+        let (lane_old, mut old, served_old) = bridge_on(
+            &ma,
+            "ta000000000",
+            k_old.path(),
+            Some(&state),
+            crate::fx::Fx::os(),
+        );
         assert!(
             old.attach_broker(),
             "{case}: the old node's bridge attaches"
         );
         let read = from_b(&ma.node, "note", 3, "read before");
-        let note_lane = format!("/f/{FLEET}/in/{}/s-a/{}/note", ma.node, mb.node);
+        let note_lane = format!("/f/{FLEET}/in/{}/ta000000000/{}/note", ma.node, mb.node);
         let rec: BrokerRecord = ma
             .holds(&note_lane)
             .into_iter()
@@ -1430,8 +1491,8 @@ fn a_record_the_old_nodes_bridge_delivered_does_not_move() {
         let inbox = Lane::Inbox {
             old: ma.node.clone(),
         };
-        let moved_note = format!("/f/{FLEET}/in/{}/s-a/{}/note", new.node, mb.node);
-        let moved_ask = format!("/f/{FLEET}/in/{}/s-a/{}/ask", new.node, mb.node);
+        let moved_note = format!("/f/{FLEET}/in/{}/ta000000000/{}/note", new.node, mb.node);
+        let moved_ask = format!("/f/{FLEET}/in/{}/ta000000000/{}/ask", new.node, mb.node);
         if control {
             until(
                 &format!("{case}: the move takes the note and the ask"),
@@ -1455,7 +1516,7 @@ fn a_record_the_old_nodes_bridge_delivered_does_not_move() {
         }
 
         // The old node's bridge goes with no broker to commit on, handing its commit over.
-        old.state.set_seen_off("s-a", read).expect("seen");
+        old.state.set_seen_off("ta000000000", read).expect("seen");
         old.conn = None;
         old.wind_down();
         assert_eq!(
@@ -1466,8 +1527,13 @@ fn a_record_the_old_nodes_bridge_delivered_does_not_move() {
         drop((old, lane_old));
 
         // A's bridge as the new node starts on the same state dir, naming itself there.
-        let (lane, mut a, _served) =
-            bridge_on(&new, "s-a", k_new.path(), Some(&state), crate::fx::Fx::os());
+        let (lane, mut a, _served) = bridge_on(
+            &new,
+            "ta000000000",
+            k_new.path(),
+            Some(&state),
+            crate::fx::Fx::os(),
+        );
         assert!(a.attach_broker(), "{case}: the new node's bridge attaches");
         // In place of the push's next back-off (at most BACKOFF_MAX), which a one-minute hang
         // detector would race: nothing in production kicks the move as the bridge names itself.
@@ -1490,7 +1556,7 @@ fn a_record_the_old_nodes_bridge_delivered_does_not_move() {
             assert_eq!(
                 lane.delivery_offsets(),
                 [notes[0], asked],
-                "{case}: the note the old bridge delivered reaches s-a again"
+                "{case}: the note the old bridge delivered reaches ta000000000 again"
             );
         } else {
             assert_eq!(notes, [], "{case}: the note never moves");
@@ -1512,7 +1578,7 @@ fn a_record_the_old_nodes_bridge_delivered_does_not_move() {
 /// bridge runs as the new node on the same state dir, moves the ask that bridge delivered. The
 /// new node's bridge delivers the copy naming the offset the ask was first at (`was=`), from
 /// which aterm answers it as the row the ask got before (`aterm_gui_fabric`'s
-/// `a_moved_copy_of_mail_shown_before_the_move_is_not_shown_again`), so `s-a` is not shown it
+/// `a_moved_copy_of_mail_shown_before_the_move_is_not_shown_again`), so `ta000000000` is not shown it
 /// again: whether the copy comes live, the bridge attached as the move opens, or in the refill of
 /// a bridge that attaches once the move has run. The bridge knows the copy for one by the origin
 /// the read that brought it stamped, and reads the bus only to follow a copy back: B's fresh
@@ -1543,7 +1609,7 @@ fn a_moved_copy_of_what_a_killed_bridge_delivered_names_where_it_was_first() {
             rank: BTreeMap::new(),
             gone: BTreeSet::new(),
         };
-        let lane_on = |node: &str| format!("/f/{FLEET}/in/{node}/s-a/{}/ask", mb.node);
+        let lane_on = |node: &str| format!("/f/{FLEET}/in/{node}/ta000000000/{}/ask", mb.node);
         let from_b = |dst: &str, on_b: u64, text: &str| -> u64 {
             let mut push = ma.client(
                 mb.key,
@@ -1553,7 +1619,7 @@ fn a_moved_copy_of_what_a_killed_bridge_delivered_names_where_it_was_first() {
                 )],
             );
             let mut body = Body::new(0);
-            body.from = Some("s-b".to_owned());
+            body.from = Some("tb000000000".to_owned());
             body.text = text.to_owned();
             push.publish(pid(&mb.node), on_b, &lane_on(dst), &body.encode())
                 .expect("B's push lands")
@@ -1565,8 +1631,13 @@ fn a_moved_copy_of_what_a_killed_bridge_delivered_names_where_it_was_first() {
         // A's bridge as the old node delivers the ask, holding its group's commit, and is
         // killed: no wind-down, so nothing is committed or handed over.
         let k_old = keys_for(84, Some(&before));
-        let (lane_old, mut old, served_old) =
-            bridge_on(&ma, "s-a", k_old.path(), Some(&state), crate::fx::Fx::os());
+        let (lane_old, mut old, served_old) = bridge_on(
+            &ma,
+            "ta000000000",
+            k_old.path(),
+            Some(&state),
+            crate::fx::Fx::os(),
+        );
         assert!(
             old.attach_broker(),
             "{case}: the old node's bridge attaches"
@@ -1609,8 +1680,13 @@ fn a_moved_copy_of_what_a_killed_bridge_delivered_names_where_it_was_first() {
             &net,
             false,
         );
-        let (lane, mut a, _served) =
-            bridge_on(&new, "s-a", k_new.path(), Some(&state), crate::fx::Fx::os());
+        let (lane, mut a, _served) = bridge_on(
+            &new,
+            "ta000000000",
+            k_new.path(),
+            Some(&state),
+            crate::fx::Fx::os(),
+        );
         a.endpoint_lane = if case == "an older lane" {
             LINK_MOVED_LANE - 1
         } else {
@@ -1686,17 +1762,17 @@ fn a_moved_copy_of_what_a_killed_bridge_delivered_names_where_it_was_first() {
 
         // The row the old bridge delivered is answered now, through the new node's bridge.
         let receipt = |rid: u64| OwedReceipt {
-            sid: "s-a".to_owned(),
+            sid: "ta000000000".to_owned(),
             rid,
             off: read,
             verdict: "handled".to_owned(),
             kind: "ask".to_owned(),
-            from: format!("s-b@{}", mb.node),
+            from: format!("tb000000000@{}", mb.node),
             earlier_log: false,
         };
         OWN_LANES_ONLY.with(|on| on.set(true));
         let sent = a.send_receipt(&receipt(1));
-        let fetched = a.fetch_record("s-a", read);
+        let fetched = a.fetch_record("ta000000000", read);
         OWN_LANES_ONLY.with(|on| on.set(false));
         sent.expect("the receipt goes");
         assert!(
@@ -1704,7 +1780,7 @@ fn a_moved_copy_of_what_a_killed_bridge_delivered_names_where_it_was_first() {
             "{case}: CONTROL: on this node's lanes alone the old row is no record"
         );
         a.send_receipt(&receipt(2)).expect("the receipt goes");
-        let ack = format!("/f/{FLEET}/in/{}/s-b/{}/ack", mb.node, new.node);
+        let ack = format!("/f/{FLEET}/in/{}/tb000000000/{}/ack", mb.node, new.node);
         assert_eq!(
             new.holds(&ack)
                 .iter()
@@ -1714,11 +1790,11 @@ fn a_moved_copy_of_what_a_killed_bridge_delivered_names_where_it_was_first() {
             "{case}: read on the old node's lane, the receipt names the ask by its offset on B"
         );
         let (fields, text) = a
-            .fetch_record("s-a", read)
+            .fetch_record("ta000000000", read)
             .unwrap_or_else(|_| panic!("{case}: the old row's body is fetched"));
         assert_eq!(text, "read before", "{case}: {fields}");
         assert!(
-            fields.contains(&format!("from=s-b@{}", mb.node)),
+            fields.contains(&format!("from=tb000000000@{}", mb.node)),
             "{case}: {fields}"
         );
         drop((routes, served_old));
@@ -1780,7 +1856,7 @@ fn shown_to(lines: &[String], sid: &str) -> Vec<u64> {
 /// (§11 C3b's residual duplicates, second class).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Floor {
-    /// aterm answered `s-o`'s delivery with no verdict: its lane is owed.
+    /// aterm answered `t0000000004`'s delivery with no verdict: its lane is owed.
     OwedLane,
     /// A record left unaccounted, as `account_inbox` leaves one aterm's connection lost.
     AtermLost,
@@ -1789,16 +1865,16 @@ enum Floor {
 }
 
 /// **MAIL A BRIDGE DELIVERED ABOVE ITS HELD COMMIT IS SHOWN ONCE ACROSS THE MOVE** (§11 C3b's
-/// residual duplicates, C3e): A's bridge as its old node could not account B's note to `s-o` (its
+/// residual duplicates, C3e): A's bridge as its old node could not account B's note to `t0000000004` (its
 /// lane owed, aterm's connection lost while it went, or its `undeliverable` notice held), so its
-/// inbox commit stands below that note, and then delivered B's ask to `s-a`, above it. It goes,
+/// inbox commit stands below that note, and then delivered B's ask to `ta000000000`, above it. It goes,
 /// handing over that floor, and A's key rotates. The move carries both from the floor, and the
 /// new node's bridge delivers each copy naming where its mail was first (`was=`): aterm shows the
-/// ask to `s-a` once, its copy answered from the memory of the ask's first offset, and the note
-/// to `s-o`, which no session was shown, once.
+/// ask to `ta000000000` once, its copy answered from the memory of the ask's first offset, and the note
+/// to `t0000000004`, which no session was shown, once.
 /// NEGATIVE CONTROL: an endpoint on a lane before
 /// [`aterm_types::control_verbs::LINK_MOVED_LANE`], the path before C3b's residual duplicates were
-/// closed: the copy names no first offset, and `s-a` is shown the ask twice.
+/// closed: the copy names no first offset, and `ta000000000` is shown the ask twice.
 #[test]
 fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
     use crate::federate::{mail_group, tests::routes_as};
@@ -1834,7 +1910,7 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
                 )],
             );
             let mut body = Body::new(0);
-            body.from = Some("s-b".to_owned());
+            body.from = Some("tb000000000".to_owned());
             body.text = text.to_owned();
             let raw = body.encode();
             let off = push
@@ -1849,13 +1925,13 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
         let k_old = keys_for(91, Some(&before));
         let (lane_old, mut old, served_old) = bridge_hosting(
             &ma,
-            &[(1, "s-a"), (2, "s-o")],
+            &[(1, "ta000000000"), (2, "t0000000004")],
             k_old.path(),
             Some(&state),
             crate::fx::Fx::os(),
         );
         if floor == Floor::OwedLane {
-            lane_old.answer_deliveries_to("s-o", SHIPPED_DELIVER_USAGE);
+            lane_old.answer_deliveries_to("t0000000004", SHIPPED_DELIVER_USAGE);
         }
         assert!(
             old.attach_broker(),
@@ -1863,8 +1939,8 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
         );
         // B's mail lands once the bridge is attached, so it is the bridge's tail that takes it,
         // as each record is handed here.
-        let note = from_b("s-o", "note", 3, "held below");
-        let ask = from_b("s-a", "ask", 4, "delivered above");
+        let note = from_b("t0000000004", "note", 3, "held below");
+        let ask = from_b("ta000000000", "ask", 4, "delivered above");
         old.in_round = true;
         match floor {
             Floor::OwedLane => {
@@ -1874,7 +1950,10 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
                 old.commit_floor = Some(note.0);
             }
             Floor::HeldNotice => {
-                let notice = format!("/f/{FLEET}/in/{}/s-b/{}/undeliverable", mb.node, ma.node);
+                let notice = format!(
+                    "/f/{FLEET}/in/{}/tb000000000/{}/undeliverable",
+                    mb.node, ma.node
+                );
                 old.notices_held.insert(note.0, (notice, Vec::new()));
             }
         }
@@ -1922,7 +2001,7 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
         );
         let (lane, mut a, _served) = bridge_hosting(
             &new,
-            &[(1, "s-a"), (2, "s-o")],
+            &[(1, "ta000000000"), (2, "t0000000004")],
             k_new.path(),
             Some(&state),
             crate::fx::Fx::os(),
@@ -1936,8 +2015,8 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
         routes.set(&after, &BTreeSet::new());
         routes.kick();
         let (moved_note, moved_ask) = (
-            lane_on(&new.node, "s-o", "note"),
-            lane_on(&new.node, "s-a", "ask"),
+            lane_on(&new.node, "t0000000004", "note"),
+            lane_on(&new.node, "ta000000000", "ask"),
         );
         until(&format!("{case}: the move carries both"), || {
             new.holds(&moved_note).len() == 1 && new.holds(&moved_ask).len() == 1
@@ -1953,7 +2032,7 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
         );
         let lines: Vec<String> = old_lines.into_iter().chain(taken(&lane)).collect();
         assert_eq!(
-            shown_to(&lines, "s-a"),
+            shown_to(&lines, "ta000000000"),
             if control {
                 vec![ask.0, ask_copy]
             } else {
@@ -1962,7 +2041,7 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
             "{case}: the ask: {lines:?}"
         );
         assert_eq!(
-            shown_to(&lines, "s-o"),
+            shown_to(&lines, "t0000000004"),
             [note_copy],
             "{case}: the note, never shown before the move: {lines:?}"
         );
@@ -1971,17 +2050,17 @@ fn mail_delivered_above_a_held_commit_is_shown_once_across_the_move() {
 }
 
 /// **A MOVE'S BURST MOVED TWICE ACROSS A SECOND ROTATION IS SHOWN ONCE** (§11 C3b's residual
-/// duplicates, C3e): B's ask to `s-a` lies unread on A's `bus.log` for A's first node. Under the
+/// duplicates, C3e): B's ask to `ta000000000` lies unread on A's `bus.log` for A's first node. Under the
 /// second, the node service's move lands it as that node's (its producer, numbered by the ask's
 /// offset) and the burst is never acknowledged: the old node's group is not committed past it.
 /// A's key rotates again. Under the third node the move of the first node's mail carries the ask
 /// again, and the move of the second's carries the first copy on, so A's `bus.log` holds two
 /// copies for the third node. Its bridge delivers both, each naming the ask's first offset
-/// (`was=`), the second through both moves; aterm shows the ask to `s-a` once. Where the second
+/// (`was=`), the second through both moves; aterm shows the ask to `ta000000000` once. Where the second
 /// node's bridge delivered the first copy before the second rotation, aterm answers both later
 /// copies from its memory of it.
 /// NEGATIVE CONTROL: an endpoint on a lane before
-/// [`aterm_types::control_verbs::LINK_MOVED_LANE`]: no copy names a first offset, and `s-a` is
+/// [`aterm_types::control_verbs::LINK_MOVED_LANE`]: no copy names a first offset, and `ta000000000` is
 /// shown the ask once per copy.
 #[test]
 fn a_burst_moved_twice_across_a_second_rotation_is_shown_once() {
@@ -1991,7 +2070,7 @@ fn a_burst_moved_twice_across_a_second_rotation_is_shown_once() {
         let case = format!("mid delivers={mid_delivers} control={control}");
         let (ma, mb) = (Mac::new(94), Mac::new(95));
         let (mid, last) = (ma.rotated(96), ma.rotated(97));
-        let lane_of = |node: &str| format!("/f/{FLEET}/in/{node}/s-a/{}/ask", mb.node);
+        let lane_of = |node: &str| format!("/f/{FLEET}/in/{node}/ta000000000/{}/ask", mb.node);
         let held = |node: &str| -> Vec<(u64, Vec<u8>)> {
             ma.holds(&lane_of(node))
                 .into_iter()
@@ -1999,7 +2078,7 @@ fn a_burst_moved_twice_across_a_second_rotation_is_shown_once() {
                 .collect()
         };
         let mut body = Body::new(0);
-        body.from = Some("s-b".to_owned());
+        body.from = Some("tb000000000".to_owned());
         body.text = "moved twice".to_owned();
         let raw = body.encode();
         let first = ma
@@ -2044,7 +2123,7 @@ fn a_burst_moved_twice_across_a_second_rotation_is_shown_once() {
             })
             .expect("the node service's reader's ring");
             let (lane, mut m, served) =
-                bridge_on(&mid, "s-a", keys.path(), None, crate::fx::Fx::os());
+                bridge_on(&mid, "ta000000000", keys.path(), None, crate::fx::Fx::os());
             m.endpoint_lane = if control {
                 LINK_MOVED_LANE - 1
             } else {
@@ -2101,7 +2180,7 @@ fn a_burst_moved_twice_across_a_second_rotation_is_shown_once() {
         })
         .expect("the node service's reader's ring");
         let (lane, mut a, _served) =
-            bridge_on(&last, "s-a", keys.path(), None, crate::fx::Fx::os());
+            bridge_on(&last, "ta000000000", keys.path(), None, crate::fx::Fx::os());
         a.endpoint_lane = if control {
             LINK_MOVED_LANE - 1
         } else {
@@ -2145,7 +2224,7 @@ fn a_burst_moved_twice_across_a_second_rotation_is_shown_once() {
             mid_delivers || copies.len() == 2,
             "{case}: PRECONDITION: the burst moves twice"
         );
-        assert_eq!(shown_to(&lines, "s-a"), want, "{case}: {lines:?}");
+        assert_eq!(shown_to(&lines, "ta000000000"), want, "{case}: {lines:?}");
         drop((routes, serving));
     }
 }
@@ -2180,10 +2259,10 @@ fn an_old_nodes_row_held_below_its_lanes_oldest_is_read_there() {
                 mb.node, ma.node, mb.node
             )],
         );
-        let lane = format!("/f/{FLEET}/in/{}/s-a/{}/ask", ma.node, mb.node);
+        let lane = format!("/f/{FLEET}/in/{}/ta000000000/{}/ask", ma.node, mb.node);
         let mut publish = |on_b: u64, text: &str| -> u64 {
             let mut body = Body::new(0);
-            body.from = Some("s-b".to_owned());
+            body.from = Some("tb000000000".to_owned());
             body.text = text.to_owned();
             push.publish(pid(&mb.node), on_b, &lane, &body.encode())
                 .expect("B's push lands")
@@ -2198,7 +2277,7 @@ fn an_old_nodes_row_held_below_its_lanes_oldest_is_read_there() {
             .set_retention(super::lanes_whole_from_the_base(false))
             .expect("the rules after the cut");
         let old_lane =
-            astream_wire::Filter::new(format!("/f/{FLEET}/in/{}/s-a/>", ma.node)).unwrap();
+            astream_wire::Filter::new(format!("/f/{FLEET}/in/{}/ta000000000/>", ma.node)).unwrap();
         assert!(
             ma.broker.oldest(&old_lane) > read,
             "PRECONDITION: the old lane's oldest lies above the record the broker holds"
@@ -2214,25 +2293,25 @@ fn an_old_nodes_row_held_below_its_lanes_oldest_is_read_there() {
         } else {
             crate::fx::Fx::os()
         };
-        let (_lane, mut a, _served) = bridge_on(&new, "s-a", keys.path(), None, fx);
+        let (_lane, mut a, _served) = bridge_on(&new, "ta000000000", keys.path(), None, fx);
         assert!(a.attach_broker(), "the new node's bridge attaches");
         a.send_receipt(&OwedReceipt {
-            sid: "s-a".to_owned(),
+            sid: "ta000000000".to_owned(),
             rid: 1,
             off: read,
             verdict: "handled".to_owned(),
             kind: "ask".to_owned(),
-            from: format!("s-b@{}", mb.node),
+            from: format!("tb000000000@{}", mb.node),
             earlier_log: false,
         })
         .expect("the receipt goes");
-        let ack = format!("/f/{FLEET}/in/{}/s-b/{}/ack", mb.node, new.node);
+        let ack = format!("/f/{FLEET}/in/{}/tb000000000/{}/ack", mb.node, new.node);
         let re: Vec<_> = new
             .holds(&ack)
             .iter()
             .map(|(_, _, body, _)| Body::decode(body).0.re)
             .collect();
-        let fetched = a.fetch_record("s-a", read);
+        let fetched = a.fetch_record("ta000000000", read);
         if control {
             assert_eq!(re, [Some(read)], "CONTROL: named by its offset on A");
             assert!(
@@ -2263,7 +2342,7 @@ fn a_reply_from_where_a_rotation_moved_the_asked_node_is_no_stray() {
     let mine_was = node_of(&key_of(58));
     let other = node_of(&key_of(59));
     let keys = keys_for(55, None);
-    let (_lane, mut a, _served) = attached(&ma, "s-a", keys.path());
+    let (_lane, mut a, _served) = attached(&ma, "ta000000000", keys.path());
     a.note_asked(5, &peer_was);
     a.note_asked(6, &mine_was);
     for rotated in [true, false] {
@@ -2313,7 +2392,7 @@ enum Seal<'a> {
     Elsewhere(&'a std::path::Path),
 }
 
-/// A post of h-andrew on `mac` to session `s-q` of `dst`, as `aterm fabric post` writes one with
+/// A post of h-andrew on `mac` to session `tq000000000` of `dst`, as `aterm fabric post` writes one with
 /// the mesh on (§11 C3c): on the person's own lane, under the person's producer at `seq`, sealed
 /// as `seal` says. Its offset on `mac`'s log.
 fn person_posts(
@@ -2335,7 +2414,7 @@ fn person_posts_re(
 ) -> u64 {
     use crate::person_key::{post_address, read_cert, PersonKey};
     let person = "h-andrew";
-    let lane = subject::post_lane(FLEET, dst, "s-q", person, kind);
+    let lane = subject::post_lane(FLEET, dst, "tq000000000", person, kind);
     let mut body = Body::new(crate::now_ms());
     body.text = text.to_owned();
     body.re = re;
@@ -2348,7 +2427,11 @@ fn person_posts_re(
     if let Some((key_dir, cert_dir)) = sealer {
         let key = PersonKey::read(key_dir).expect("reads").expect("made");
         let cert = read_cert(cert_dir).expect("reads").expect("vouched");
-        key.seal(&cert, &post_address(FLEET, "s-q", person, kind), &mut body);
+        key.seal(
+            &cert,
+            &post_address(FLEET, "tq000000000", person, kind),
+            &mut body,
+        );
     }
     let mut client = mac.client(
         mac.key,
@@ -2366,19 +2449,19 @@ fn person_posts_re(
 }
 
 /// **A PERSON'S POST REACHES THE SESSION ON ANOTHER MAC ONCE, AS THE PERSON'S** (§11 C3c): a
-/// person on P posts an ask to `@s-q@<Q>`, sealed by P's person key under the certificate of P's
+/// person on P posts an ask to `@tq000000000@<Q>`, sealed by P's person key under the certificate of P's
 /// node key. P's carry verifies the seal and writes the ask on P's own lane to Q, naming the
 /// person, the lane keeping its row; P's push carries it to Q's log once; and Q's
 /// bridge verifies the seal again, under the certificate's node key, which names P, and hands it
-/// to s-q once, `from=h-andrew@<P> kind=ask trust=human`. A note to a node whose seat rotated to
-/// Q is carried to Q and handed to s-q the same way. Restarted, the carry carries nothing twice. A post with no seal, one sealed by another Mac's person key under P's certificate, one
+/// to tq000000000 once, `from=h-andrew@<P> kind=ask trust=human`. A note to a node whose seat rotated to
+/// Q is carried to Q and handed to tq000000000 the same way. Restarted, the carry carries nothing twice. A post with no seal, one sealed by another Mac's person key under P's certificate, one
 /// under another Mac's certificate, and one to a Mac that is no member are not carried: P's carry
 /// counts each and says why on the person's lane on P, where the person's inbox reads it
 /// (`reason=`), and Q's log holds none of them.
 /// NEGATIVE CONTROLS: with [`crate::federate::UNSEALED_CARRY`] P carries every one but the post to
 /// no member, and Q's bridge refuses each
-/// (`undeliverable … reason=person-unsealed|person-bad-seal|person-not-vouched`), handing s-q
-/// none; with [`TRUST_ANY_PERSON`] on Q too, s-q is handed each as a human's.
+/// (`undeliverable … reason=person-unsealed|person-bad-seal|person-not-vouched`), handing tq000000000
+/// none; with [`TRUST_ANY_PERSON`] on Q too, tq000000000 is handed each as a human's.
 #[test]
 fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
     use crate::federate::{CARRIER, NOTICE_REASON, UNSEALED_CARRY};
@@ -2400,7 +2483,7 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
         let retired = node_of(&key_of(55));
         let mut handoff_p = members(&mp, &both);
         handoff_p.moved.insert(retired.clone(), mq.node.clone());
-        let (lane_q, mut q, _served_q) = attached(&mq, "s-q", kq.path());
+        let (lane_q, mut q, _served_q) = attached(&mq, "tq000000000", kq.path());
         let net = Arc::new(Net::default());
         let start = || {
             UNSEALED_CARRY.with(|on| on.set(arm != "checked"));
@@ -2438,7 +2521,10 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
             (carried, 6 - carried),
             "{arm}: {status:?}"
         );
-        let on_p = mp.holds(&format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node));
+        let on_p = mp.holds(&format!(
+            "/f/{FLEET}/in/{}/tq000000000/{}/ask",
+            mq.node, mp.node
+        ));
         assert_eq!(
             on_p.iter().map(|row| row.3).collect::<Vec<_>>(),
             vec![Some((astream_cap::producer_id_of(CARRIER), genuine))],
@@ -2455,7 +2541,7 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
             .collect();
         let lanes: Vec<String> = ["ask", "note"]
             .iter()
-            .map(|kind| subject::post_lane(FLEET, &mq.node, "s-q", &mp.node, kind))
+            .map(|kind| subject::post_lane(FLEET, &mq.node, "tq000000000", &mp.node, kind))
             .collect();
         assert_eq!(
             rows,
@@ -2466,7 +2552,7 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
             mp.holds(&format!("/f/{FLEET}/in/{stranger}/>")).len() == 1,
             "{arm}: the post to no member stays the person's alone"
         );
-        let on_q = format!("/f/{FLEET}/in/{}/s-q/{}/>", mq.node, mp.node);
+        let on_q = format!("/f/{FLEET}/in/{}/tq000000000/{}/>", mq.node, mp.node);
         until(&format!("{arm}: what P carried reaches Q's log"), || {
             mq.holds(&on_q).len() == carried as usize
         });
@@ -2519,7 +2605,7 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
         let deliveries = lane_q.deliveries();
         let delivered: Vec<&String> = deliveries
             .iter()
-            .filter(|line| line.starts_with("deliver s-q "))
+            .filter(|line| line.starts_with("deliver tq000000000 "))
             .collect();
         for (kind, text) in [("ask", "genuine"), ("note", "moved")] {
             let human = format!("from=h-andrew@{} kind={kind} trust=human", mp.node);
@@ -2532,7 +2618,7 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
                 "{arm}: the person's {kind}, once, as the person's: {delivered:?}"
             );
         }
-        let face = subject::session_face(FLEET, &mq.node, "s-q", "ev");
+        let face = subject::session_face(FLEET, &mq.node, "tq000000000", "ev");
         let refusals: Vec<String> = evs_on(&q, &face)
             .into_iter()
             .filter(|ev| ev.starts_with("undeliverable ") && ev.contains("reason=person-"))
@@ -2546,7 +2632,7 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
                 assert_eq!(
                     delivered.len(),
                     2,
-                    "{arm}: Q handed s-q none of them: {delivered:?}"
+                    "{arm}: Q handed tq000000000 none of them: {delivered:?}"
                 );
                 let reasons: Vec<&str> = refusals
                     .iter()
@@ -2590,11 +2676,11 @@ fn a_persons_post_reaches_the_session_on_another_mac_once_as_the_persons() {
 }
 
 /// **AN ANSWER AND A RECEIPT TO A PERSON'S POST REACH THE PERSON ON THEIR OWN MAC** (§11 C3d): a
-/// person on P asks `@s-q@<Q>`; P's carry carries it and Q's bridge hands it to s-q as
-/// `from=h-andrew@<P>`. Q's receipt for it, and s-q's answer `to=@h-andrew@<P>`, go on Q's lane
+/// person on P asks `@tq000000000@<Q>`; P's carry carries it and Q's bridge hands it to tq000000000 as
+/// `from=h-andrew@<P>`. Q's receipt for it, and tq000000000's answer `to=@h-andrew@<P>`, go on Q's lane
 /// to P under the person's name, naming the carried copy by its offset on P, and Q's push carries
 /// both to P's log. P's bridge hands each to the person's lane on P, where their inbox reads it
-/// as s-q's on Q, once though offered again: `from=s-q@<Q>`, `re=` the offset of the person's own
+/// as tq000000000's on Q, once though offered again: `from=tq000000000@<Q>`, `re=` the offset of the person's own
 /// post, and no token that speaks as a person.
 /// NEGATIVE CONTROLS: with [`NO_WAY_BACK`] on Q, Q has no lane back, as before C3d: the receipt is
 /// journaled `unacked … reason=no-lane`, the answer goes nowhere, and P's log holds nothing from
@@ -2610,8 +2696,8 @@ fn an_answer_and_a_receipt_to_a_persons_post_reach_the_person_on_their_own_mac()
             keys_for(62, Some(&members(&mq, &both))),
         );
         assert!(crate::person_key::vouch(kp.path(), &[61; 32], crate::now_ms()).is_ok());
-        let (lane_q, mut q, _served_q) = attached(&mq, "s-q", kq.path());
-        let (_lane_p, mut p, _served_p) = attached(&mp, "s-p", kp.path());
+        let (lane_q, mut q, _served_q) = attached(&mq, "tq000000000", kq.path());
+        let (_lane_p, mut p, _served_p) = attached(&mp, "tp000000000", kp.path());
         let net = Arc::new(Net::default());
         let from_p = pushes(&mp, &[&mq], &net, &members(&mp, &both));
         let to_p = pushes(&mq, &[&mp], &net, &members(&mq, &both));
@@ -2622,7 +2708,7 @@ fn an_answer_and_a_receipt_to_a_persons_post_reach_the_person_on_their_own_mac()
             (&mq.node, 1, "ask", "which branch?"),
             Seal::Own,
         );
-        let ask = format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node);
+        let ask = format!("/f/{FLEET}/in/{}/tq000000000/{}/ask", mq.node, mp.node);
         until(&format!("{arm}: the carried ask reaches Q's log"), || {
             !mq.holds(&ask).is_empty()
         });
@@ -2640,15 +2726,15 @@ fn an_answer_and_a_receipt_to_a_persons_post_reach_the_person_on_their_own_mac()
             lane_q
                 .deliveries()
                 .iter()
-                .any(|line| line.starts_with("deliver s-q ")
+                .any(|line| line.starts_with("deliver tq000000000 ")
                     && line.contains(&format!(" from={person} kind=ask trust=human"))),
-            "{arm}: s-q was handed the person's ask: {:?}",
+            "{arm}: tq000000000 was handed the person's ask: {:?}",
             lane_q.deliveries()
         );
 
         NO_WAY_BACK.with(|on| on.set(arm == "no-way-back"));
         q.send_receipt(&OwedReceipt {
-            sid: "s-q".to_owned(),
+            sid: "tq000000000".to_owned(),
             rid: 1,
             off: at_q,
             verdict: "handled".to_owned(),
@@ -2659,7 +2745,7 @@ fn an_answer_and_a_receipt_to_a_persons_post_reach_the_person_on_their_own_mac()
         .expect("the receipt goes");
         let text = "main has it";
         *lane_q.outbox.lock().unwrap() = Some(format!(
-            "post sid=s-q id=1 to=@{person} kind=answer re={at_q} len={}\n{text}",
+            "post sid=tq000000000 id=1 to=@{person} kind=answer re={at_q} len={}\n{text}",
             text.len()
         ));
         q.drain_outbox();
@@ -2668,7 +2754,7 @@ fn an_answer_and_a_receipt_to_a_persons_post_reach_the_person_on_their_own_mac()
         let back = format!("/f/{FLEET}/in/{}/h-andrew/{}/>", mp.node, mq.node);
         let handed = format!("/f/{FLEET}/in/p/h-andrew/{}/>", mp.node);
         if arm == "no-way-back" {
-            let face = subject::session_face(FLEET, &mq.node, "s-q", "ev");
+            let face = subject::session_face(FLEET, &mq.node, "tq000000000", "ev");
             assert!(
                 evs_on(&q, &face)
                     .iter()
@@ -2723,7 +2809,7 @@ fn an_answer_and_a_receipt_to_a_persons_post_reach_the_person_on_their_own_mac()
             let body = Body::decode(raw).0;
             assert_eq!(
                 body.from.as_deref(),
-                Some(format!("s-q@{}", mq.node).as_str()),
+                Some(format!("tq000000000@{}", mq.node).as_str()),
                 "{arm}"
             );
             assert_eq!(body.re, Some(names), "{arm}: names the person's post");
@@ -2759,22 +2845,22 @@ fn an_answer_and_a_receipt_to_a_persons_post_reach_the_person_on_their_own_mac()
         );
         assert!(
             line.contains(&format!(
-                " answer  from=s-q@{} trust=agent re={names}",
+                " answer  from=tq000000000@{} trust=agent re={names}",
                 mq.node
             )),
-            "{arm}: the person's inbox reads it as s-q's on Q: {line}"
+            "{arm}: the person's inbox reads it as tq000000000's on Q: {line}"
         );
         drop((from_p, to_p));
     }
 }
 
-/// **A PERSON'S ANSWER ENDS THE WAIT OF THE SESSION ON ANOTHER MAC THAT ASKED** (§11 C3d): s-q on
+/// **A PERSON'S ANSWER ENDS THE WAIT OF THE SESSION ON ANOTHER MAC THAT ASKED** (§11 C3d): tq000000000 on
 /// Q asks `@h-andrew@<P>` with a deadline. Q notes that the ask went to P and arms its deadline;
 /// Q's push carries it to P's log, and P's bridge hands it to the person's lane on P, stamped with
 /// the ask's offset on Q ([`crate::person::WIRE_RE_TOKEN`]). The person answers the copy by its
 /// offset in their inbox, as `aterm fabric post` does ([`crate::person::wire_re`]): the sealed
 /// answer names the ask by its offset on Q, P's carry and push bring it to Q, and Q's bridge hands
-/// it to s-q as the person's answer to that ask, from where the ask went (P, whose lane brought
+/// it to tq000000000 as the person's answer to that ask, from where the ask went (P, whose lane brought
 /// it), and settles the ask's deadline.
 /// NEGATIVE CONTROLS: with [`UNSTAMPED_COPY`] on P, the copy carries no offset on Q, as before:
 /// the answer names the copy's offset on P, and the ask's deadline on Q stands; with
@@ -2800,21 +2886,25 @@ fn a_persons_answer_ends_the_wait_of_the_session_on_another_mac_that_asked() {
                 .publish(pid(&mq.node), (1 << 20) + seq, &ev, b"v=1 t=1")
                 .expect("an ev record");
         }
-        let (lane_q, mut q, _served_q) = attached(&mq, "s-q", kq.path());
-        let (_lane_p, mut p, _served_p) = attached(&mp, "s-p", kp.path());
+        let (lane_q, mut q, _served_q) = attached(&mq, "tq000000000", kq.path());
+        let (_lane_p, mut p, _served_p) = attached(&mp, "tp000000000", kp.path());
         let net = Arc::new(Net::default());
         let from_p = pushes(&mp, &[&mq], &net, &members(&mp, &both));
         let to_p = pushes(&mq, &[&mp], &net, &members(&mq, &both));
 
         let text = "ship it?";
         *lane_q.outbox.lock().unwrap() = Some(format!(
-            "post sid=s-q id=1 to=@h-andrew@{} kind=ask dl=600000 len={}\n{text}",
+            "post sid=tq000000000 id=1 to=@h-andrew@{} kind=ask dl=600000 len={}\n{text}",
             mp.node,
             text.len()
         ));
         q.drain_outbox();
         let asked = format!("/f/{FLEET}/in/{}/h-andrew/{}/ask", mp.node, mq.node);
-        let ask = mq.holds(&asked).first().expect("s-q's ask on Q's log").0;
+        let ask = mq
+            .holds(&asked)
+            .first()
+            .expect("tq000000000's ask on Q's log")
+            .0;
         assert!(
             q.deadlines.contains_key(&ask),
             "{arm}: Q arms the ask's deadline"
@@ -2835,7 +2925,7 @@ fn a_persons_answer_ends_the_wait_of_the_session_on_another_mac_that_asked() {
         let body = Body::decode(raw).0;
         assert_eq!(
             body.from.as_deref(),
-            Some(format!("s-q@{}", mq.node).as_str()),
+            Some(format!("tq000000000@{}", mq.node).as_str()),
             "{arm}"
         );
         assert_eq!(
@@ -2855,7 +2945,7 @@ fn a_persons_answer_ends_the_wait_of_the_session_on_another_mac_that_asked() {
             &mut person,
             (FLEET, "h-andrew"),
             &handoff,
-            ("s-q", &mq.node),
+            ("tq000000000", &mq.node),
             *copy,
         )
         .expect("the person's lane reads");
@@ -2869,7 +2959,7 @@ fn a_persons_answer_ends_the_wait_of_the_session_on_another_mac_that_asked() {
                 &mut person,
                 (FLEET, "h-andrew"),
                 &handoff,
-                ("s-other", &mq.node),
+                ("t0ther00000", &mq.node),
                 *copy,
             )
             .expect("reads"),
@@ -2881,12 +2971,12 @@ fn a_persons_answer_ends_the_wait_of_the_session_on_another_mac_that_asked() {
                 &mut person,
                 (FLEET, "h-andrew"),
                 &handoff,
-                ("s-q", &mp.node),
+                ("tq000000000", &mp.node),
                 *copy,
             )
             .expect("reads"),
             None,
-            "{arm}: the copy is from s-q on Q, so it names nothing of an s-q on P"
+            "{arm}: the copy is from tq000000000 on Q, so it names nothing of an tq000000000 on P"
         );
         // Unstamped, `aterm fabric post` refuses the answer ([`crate::person::wire_re`]); posted
         // anyway, naming the copy's offset on P, as it was before §11 C3d, it names no ask on Q.
@@ -2898,7 +2988,7 @@ fn a_persons_answer_ends_the_wait_of_the_session_on_another_mac_that_asked() {
             Some(re),
             Seal::Own,
         );
-        let carried = format!("/f/{FLEET}/in/{}/s-q/{}/answer", mq.node, mp.node);
+        let carried = format!("/f/{FLEET}/in/{}/tq000000000/{}/answer", mq.node, mp.node);
         until(
             &format!("{arm}: the person's answer reaches Q's log"),
             || !mq.holds(&carried).is_empty(),
@@ -2913,8 +3003,8 @@ fn a_persons_answer_ends_the_wait_of_the_session_on_another_mac_that_asked() {
         let deliveries = lane_q.deliveries();
         let line = deliveries
             .iter()
-            .find(|line| line.starts_with("deliver s-q ") && line.ends_with(" text=yes"))
-            .unwrap_or_else(|| panic!("{arm}: s-q was handed the answer: {deliveries:?}"));
+            .find(|line| line.starts_with("deliver tq000000000 ") && line.ends_with(" text=yes"))
+            .unwrap_or_else(|| panic!("{arm}: tq000000000 was handed the answer: {deliveries:?}"));
         let kind = if arm == "as-sender" { "note" } else { "answer" };
         assert!(
             line.contains(&format!(
@@ -2958,7 +3048,7 @@ fn a_persons_answer_ends_the_wait_of_the_session_on_another_mac_that_asked() {
                     &mut person,
                     (FLEET, "h-andrew"),
                     &handoff,
-                    ("s-q", &mq.node),
+                    ("tq000000000", &mq.node),
                     *copy,
                 )
                 .expect("a read below the oldest record is no failure"),
@@ -2990,7 +3080,7 @@ fn a_copy_held_below_the_persons_lanes_oldest_still_names_the_ask_it_copies() {
         let mut bridge = mp.client(mp.key, &[format!("rw,p={}:{lane}", mp.node)]);
         let mut hand = |seq: u64, text: &str| {
             let mut body = Body::new(0);
-            body.from = Some(format!("s-q@{}", mq.node));
+            body.from = Some(format!("tq000000000@{}", mq.node));
             body.text = text.to_owned();
             body.unknown
                 .insert(WIRE_RE_TOKEN.to_owned(), wire_stamp(seq, pid(&mq.node)));
@@ -3026,7 +3116,7 @@ fn a_copy_held_below_the_persons_lanes_oldest_still_names_the_ask_it_copies() {
             &mut person,
             (FLEET, "h-andrew"),
             &members(&mp, &both),
-            ("s-q", &mq.node),
+            ("tq000000000", &mq.node),
             copy,
         );
         UNTOLD_WIRE_RE.with(|on| on.set(false));
@@ -3041,7 +3131,7 @@ fn a_copy_held_below_the_persons_lanes_oldest_still_names_the_ask_it_copies() {
 /// **A PERSON'S POST OUTLIVES A CARRY OUTAGE ACROSS A RETENTION CUT** (§11 C3d): a Mac's mesh
 /// `bus.log` holds its mail lanes until the person carry has read them as well as the push
 /// ([`crate::broker_rules::mesh_rules`]). P's carry carries a first post, then goes down while
-/// P's push to Q runs on: a person's ask to `@s-q@<Q>`, then a note of P's own to Q that the push
+/// P's push to Q runs on: a person's ask to `@tq000000000@<Q>`, then a note of P's own to Q that the push
 /// carries, committing its group past both, lie below a retention cut. The cut keeps the ask;
 /// once the carry is back it carries the ask to Q, and the next cut releases it on P.
 /// NEGATIVE CONTROL: under [`crate::broker_rules::default_rules`], which hold mail for the push
@@ -3110,7 +3200,7 @@ fn a_persons_post_outlives_a_carry_outage_across_a_retention_cut() {
         });
         assert_eq!(routes.carry_status().carried, 0, "{arm}: the carry is down");
         cut();
-        let posts = format!("/f/{FLEET}/in/{}/s-q/h-andrew/ask", mq.node);
+        let posts = format!("/f/{FLEET}/in/{}/tq000000000/h-andrew/ask", mq.node);
         let kept: Vec<u64> = mp.holds(&posts).iter().map(|row| row.0).collect();
         assert_eq!(
             kept,
@@ -3121,7 +3211,7 @@ fn a_persons_post_outlives_a_carry_outage_across_a_retention_cut() {
 
         mp.carry_down.store(false, SeqCst);
         let routes = start();
-        let carried = format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node);
+        let carried = format!("/f/{FLEET}/in/{}/tq000000000/{}/ask", mq.node, mp.node);
         until(
             &format!("{arm}: the carry, back, passed P's own note"),
             || mp.broker.group_start(&carry_group()) > after,
@@ -3154,7 +3244,7 @@ fn a_persons_post_outlives_a_carry_outage_across_a_retention_cut() {
 }
 
 /// **A CARRIED POST REACHES ITS MAC THOUGH THE NODE SERVICE RESTARTS BEFORE ITS PUSH RAN** (§11
-/// C3d): with Q cut off, P's carry carries a person's ask to `@s-q@<Q>` onto P's lane to Q, and
+/// C3d): with Q cut off, P's carry carries a person's ask to `@tq000000000@<Q>` onto P's lane to Q, and
 /// P's node service stops before its push to Q carried it. Started again, its watch reads the
 /// lane's row and plans the push (a note of P's own to R, a push it starts after reading every
 /// row, shows the read is done), and once Q is back the ask reaches Q's log, once.
@@ -3203,7 +3293,7 @@ fn a_carried_post_reaches_its_mac_though_the_node_service_restarts_before_its_pu
         );
         net.heal(&mq.node);
         routes.kick();
-        let carried = format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node);
+        let carried = format!("/f/{FLEET}/in/{}/tq000000000/{}/ask", mq.node, mp.node);
         if control {
             until(&format!("{case}: P's note reaches R"), || {
                 !mr.mail_for(&mr.node).is_empty()
@@ -3222,9 +3312,9 @@ fn a_carried_post_reaches_its_mac_though_the_node_service_restarts_before_its_pu
 /// **A CARRIED LANE'S CHARGE GOES BACK ONCE RETENTION GAVE IT UP** (§11 C3d): the carry gives
 /// no lane back itself (a watch that starts again plans its push from the lane's row), so the mesh
 /// rule forgets ([`crate::broker_rules::mesh_rules`]). P's carry carries a person's ask to
-/// `@s-q@<Q>` and P's push carries it to Q; once both groups passed it, a retention cut gives up
+/// `@tq000000000@<Q>` and P's push carries it to Q; once both groups passed it, a retention cut gives up
 /// the person's post and the carried copy, and the same tick forgets both lanes: they leave P's
-/// last-value index and the carry's subject budget counts none. A later ask to s-q opens the
+/// last-value index and the carry's subject budget counts none. A later ask to tq000000000 opens the
 /// carried lane again and reaches Q, once.
 /// NEGATIVE CONTROL: [`crate::broker_rules::mesh_rules_scaled_unforgetting`], the mesh rules
 /// without the forget: the cut gives the records up all the same, yet both lanes keep their rows
@@ -3250,8 +3340,8 @@ fn a_carried_lanes_charge_goes_back_once_retention_gave_it_up() {
         let net = Arc::new(Net::default());
         let routes = routes_of(&mp, vec![Peer::of(&mq)], &net, false);
         routes.set(&members(&mp, &both), &BTreeSet::new());
-        let posts = format!("/f/{FLEET}/in/{}/s-q/h-andrew/ask", mq.node);
-        let carried = format!("/f/{FLEET}/in/{}/s-q/{}/ask", mq.node, mp.node);
+        let posts = format!("/f/{FLEET}/in/{}/tq000000000/h-andrew/ask", mq.node);
+        let carried = format!("/f/{FLEET}/in/{}/tq000000000/{}/ask", mq.node, mp.node);
         let passed = |at: u64| {
             mp.broker.group_start(&carry_group()) > at
                 && mp.broker.group_start(&mail_group(&mq.node)) > at
@@ -3333,7 +3423,7 @@ fn a_carried_lanes_charge_goes_back_once_retention_gave_it_up() {
 }
 
 /// One run of `FabricMoves`' world: A's `bus.log` under three nodes of A's key in turn, B's ask to
-/// `s-a` on it for the first, each node's bridge on the one bridge state dir with its own aterm
+/// `ta000000000` on it for the first, each node's bridge on the one bridge state dir with its own aterm
 /// endpoint lane (one aterm throughout: [`shown_to`] reads their lines in order), and the node
 /// service's moves run by [`crate::federate::tests::move_once`].
 struct Moves {
@@ -3343,7 +3433,7 @@ struct Moves {
     lanes: Vec<FakeVerbLane>,
     bridge: Option<Bridge>,
     keys: Vec<aterm_tempfile::TempDir>,
-    serving: Vec<astream_broker::BrokerHandle>,
+    serving: Vec<Served>,
     sender: String,
     endpoint: u32,
     r: usize,
@@ -3380,7 +3470,7 @@ impl Moves {
         let mb = Mac::new(104);
         let subject = run.lane(0);
         let mut body = Body::new(0);
-        body.from = Some("s-b".to_owned());
+        body.from = Some("tb000000000".to_owned());
         body.text = "moved".to_owned();
         let raw = body.encode();
         let off = run.nodes[0]
@@ -3404,12 +3494,12 @@ impl Moves {
         run
     }
 
-    /// `s-a`'s lanes for node `i`, B's node left off.
+    /// `ta000000000`'s lanes for node `i`, B's node left off.
     fn lane(&self, i: usize) -> String {
-        format!("/f/{FLEET}/in/{}/s-a", self.nodes[i].node)
+        format!("/f/{FLEET}/in/{}/ta000000000", self.nodes[i].node)
     }
 
-    /// The copies node `i`'s lanes hold for `s-a`.
+    /// The copies node `i`'s lanes hold for `ta000000000`.
     fn held(&self, i: usize) -> Vec<crate::federate::tests::HeldRecord> {
         self.nodes[0].holds(&format!("{}/>", self.lane(i)))
     }
@@ -3440,7 +3530,7 @@ impl Moves {
         }
         let (lane, mut bridge, served) = bridge_hosting(
             &self.nodes[i],
-            &[(1, "s-a")],
+            &[(1, "ta000000000")],
             keys.path(),
             Some(&self.state),
             crate::fx::Fx::os(),
@@ -3577,7 +3667,7 @@ impl Moves {
             ("db", flag(took(2, zb))),
             ("kx", flag(names(x))),
             ("ky", flag(y.is_some_and(names))),
-            ("shown", shown_to(&lines, "s-a").len() as i64),
+            ("shown", shown_to(&lines, "ta000000000").len() as i64),
             ("lost", 0),
         ]
         .into_iter()
@@ -3599,7 +3689,7 @@ impl Moves {
 /// **THE OWN-INBOX MOVE REFINES `FabricMoves`** (§11 C3e, C7's "mail delivered once per destination
 /// session"): in every state the model reaches, every action it enables takes A's `bus.log` and
 /// what aterm shows where the model goes. Across two rotations, a move's unacknowledged burst
-/// moved again, and every bridge's commit held below what it delivered, `s-a` is shown B's ask
+/// moved again, and every bridge's commit held below what it delivered, `ta000000000` is shown B's ask
 /// once, and shown it once some node's bridge runs.
 /// NEGATIVE CONTROL: an endpoint before [`aterm_types::control_verbs::LINK_MOVED_LANE`] (mutant
 /// 1): the run leaves the model at `Deliver1`, the first copy shown again. (Mutant 2, a copy
@@ -3672,4 +3762,48 @@ fn the_own_inbox_move_conforms_to_the_fabric_moves_model() {
         "the first copy shown again"
     );
     assert!(!model.check_invariant("ShownOnce", seen.last().unwrap()));
+}
+
+/// **ANOTHER MAC'S ANSWER FROM AN EARLIER TAB REACHES A PERSON HERE.** A tab opened before the
+/// tab-ID update keeps its `s-` ID until it closes: its answer to a person of this Mac, on the
+/// lane back to them, is handed to the person's inbox from `<s- id>@<its node>`, as a `t` tab's
+/// is. NEGATIVE CONTROL: a body whose `from=` is a malformed ID of either form is handed over
+/// to no one.
+#[test]
+fn an_earlier_tabs_answer_reaches_a_person_on_their_own_mac() {
+    let (mp, mq) = (Mac::new(71), Mac::new(72));
+    let both = [mp.node.as_str(), mq.node.as_str()];
+    let kp = keys_for(71, Some(&members(&mp, &both)));
+    let (_lane_p, mut p, _served_p) = attached(&mp, "t000000000p", kp.path());
+    let back = format!("/f/{FLEET}/in/{}/h-andrew/{}/answer", mp.node, mq.node);
+    let handed = format!("/f/{FLEET}/in/p/h-andrew/{}/>", mp.node);
+    let froms = |mac: &Mac| -> Vec<Option<String>> {
+        mac.holds(&handed)
+            .iter()
+            .map(|(_, _, raw, _)| Body::decode(raw).0.from)
+            .collect()
+    };
+    for (off, from) in [(40, "s-0123456789abcdef0123"), (41, "t000000000q")] {
+        let raw = format!("v=1 t=1 from={from} text=main%20has%20it");
+        assert_eq!(
+            p.deliver_record(off, &back, raw.as_bytes(), None),
+            Delivery::Accounted
+        );
+    }
+    assert_eq!(
+        froms(&mp),
+        [
+            Some(format!("s-0123456789abcdef0123@{}", mq.node)),
+            Some(format!("t000000000q@{}", mq.node)),
+        ],
+        "each answer is handed to the person from its tab"
+    );
+    for (off, from) in [(42, "tqn5r6e014i"), (43, "s-0123456789ABCDEF0123")] {
+        let raw = format!("v=1 t=1 from={from} text=x");
+        assert_eq!(
+            p.deliver_record(off, &back, raw.as_bytes(), None),
+            Delivery::Accounted
+        );
+    }
+    assert_eq!(froms(&mp).len(), 2, "a malformed from= is handed to no one");
 }

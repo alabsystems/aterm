@@ -47,6 +47,75 @@ fn of(pairs: &[(&str, &str)]) -> ProcessLogin {
     ProcessLogin::of_exec_env(&exec_env(pairs)).expect("a read environment")
 }
 
+/// THE WRAPPER NAMES WHICH TOKEN OF THE ENTRY IT SERVED (§5.2, §5.6): [`ServedToken::of`] reads
+/// the `minted_at` beside the marker; where the variable is unset, the session is an earlier
+/// wrapper's, which named none, and its birth is kept; a value that is not a number, or two
+/// different values, name nothing. What the session is to the vault's token ([`ServedToken::on`]):
+/// the named token alone; for an earlier wrapper's session, a token made before it began, and no
+/// later one. It leaves the route's shape as it is: alone, beside no descriptor or marker, the
+/// variable names nothing, so it is not part of the token state a relaunch line unsets
+/// ([`TOKEN_STATE_ENV`]).
+#[test]
+fn the_wrapper_names_which_token_of_the_entry_it_served() {
+    let read = |pairs: &[(&str, &str)]| ServedToken::of(pairs.iter().copied(), Some(1_000));
+    let served = [
+        (DESCRIPTOR_ENV, "3"),
+        (MARKER_ENV, WORK),
+        (MINTED_ENV, "1790000000"),
+    ];
+    assert_eq!(read(&served), ServedToken::Named(1_790_000_000));
+    assert_eq!(
+        of(&served).route,
+        AuthRoute::VaultToken { entry: entry(WORK) }
+    );
+    assert_eq!(
+        read(&[(DESCRIPTOR_ENV, "3"), (MARKER_ENV, WORK)]),
+        ServedToken::Unnamed(Some(1_000)),
+        "a wrapper that named no token"
+    );
+    for (why, value) in [("empty", ""), ("a word", "soon"), ("negative", "-5")] {
+        assert_eq!(read(&[(MINTED_ENV, value)]), ServedToken::Garbled, "{why}");
+    }
+    assert_eq!(
+        read(&[(MINTED_ENV, "5"), (MINTED_ENV, "6")]),
+        ServedToken::Garbled,
+        "two tokens named"
+    );
+    assert_eq!(
+        read(&[(MINTED_ENV, "5"), (MINTED_ENV, "5")]),
+        ServedToken::Named(5)
+    );
+    assert_eq!(ServedToken::Named(5).on(5), OnToken::Named);
+    assert_eq!(
+        ServedToken::Named(5).on(6),
+        OnToken::Other,
+        "a replaced token"
+    );
+    assert_eq!(
+        ServedToken::Unnamed(Some(1_000)).on(999),
+        OnToken::Unnamed,
+        "made before the session began"
+    );
+    for (why, served, minted_at) in [
+        (
+            "made after it began",
+            ServedToken::Unnamed(Some(1_000)),
+            1_001,
+        ),
+        ("made as it began", ServedToken::Unnamed(Some(1_000)), 1_000),
+        ("no birth", ServedToken::Unnamed(None), 1),
+        ("garbled", ServedToken::Garbled, 1),
+    ] {
+        assert_eq!(served.on(minted_at), OnToken::Other, "{why}");
+    }
+    assert_eq!(
+        of(&[(MINTED_ENV, "1790000000")]).route,
+        AuthRoute::Stored,
+        "alone it names no token"
+    );
+    assert!(!TOKEN_STATE_ENV.contains(&MINTED_ENV));
+}
+
 /// THE TOKEN ROUTE'S SHAPE IN A PROCESS'S OWN ENVIRONMENT (§5.2): the descriptor and the marker
 /// together, nothing else; and the gate keeps it only for the account whose entry the marker
 /// names, an absent login being the default row's.
@@ -285,6 +354,8 @@ fn the_judgment_runs_its_steps_in_order() {
         (TokenFact::Absent, "absent"),
         (TokenFact::Busy, "busy"),
         (TokenFact::Unverified, "unverified"),
+        (TokenFact::AwaitingBasis, "awaiting-basis"),
+        (TokenFact::Differ, "differ"),
         (TokenFact::Ended, "ended"),
         (TokenFact::Rejected, "rejected"),
         (TokenFact::Mismatched, "mismatched"),
@@ -523,9 +594,11 @@ fn only_a_claude_build_in_the_store_is_a_program_the_token_serves() {
 }
 
 /// THE ROUTE MOVE A RUNNING SESSION IS OFFERED (§5.5): a stored session moves onto a token in use
-/// here; a token session moves back only on its token's refusal, removal, end or mismatch, and
-/// only where a stored login is here; an exposed token (in use) and an unsettled read move
-/// nothing.
+/// here; a token session moves back only on its token's refusal, removal, end, mismatch,
+/// differing windows or, on a Mac that did not mint it, its not being in use there before its
+/// verification (`unverified`: a token made at a terminal or by a meta that names no route,
+/// `MintedBy::serves_unverified`), and only where a stored login is here; an exposed token (in
+/// use), an unsettled read and a token held for its basis move nothing.
 ///
 /// NEGATIVE CONTROL: drop `if stored_here` from `route_move`, and the "no stored login" rows move
 /// back onto a login that is not here.
@@ -546,6 +619,8 @@ fn a_running_session_moves_onto_its_token_and_back_only_where_the_other_route_is
         TokenFact::Absent,
         TokenFact::Busy,
         TokenFact::Unverified,
+        TokenFact::AwaitingBasis,
+        TokenFact::Differ,
         TokenFact::Ended,
         TokenFact::Rejected,
         TokenFact::Mismatched,
@@ -555,6 +630,8 @@ fn a_running_session_moves_onto_its_token_and_back_only_where_the_other_route_is
     }
     for fact in [
         TokenFact::Absent,
+        TokenFact::Unverified,
+        TokenFact::Differ,
         TokenFact::Ended,
         TokenFact::Rejected,
         TokenFact::Mismatched,
@@ -570,10 +647,12 @@ fn a_running_session_moves_onto_its_token_and_back_only_where_the_other_route_is
             "{fact:?}: no stored login here, so it stays"
         );
     }
+    // Held for its basis, a session on the stored login stays to give it, and one already on
+    // the token stays on it.
     for fact in [
         TokenFact::InUse,
         TokenFact::Busy,
-        TokenFact::Unverified,
+        TokenFact::AwaitingBasis,
         TokenFact::Unreadable,
     ] {
         assert_eq!(route_move(token, fact, true), None, "{fact:?}");
@@ -587,6 +666,104 @@ fn a_running_session_moves_onto_its_token_and_back_only_where_the_other_route_is
     }
     for fact in [TokenFact::InUse, TokenFact::Absent, TokenFact::Rejected] {
         assert_eq!(route_move(AuthRoute::Outside, fact, true), None, "{fact:?}");
+    }
+}
+
+/// A SESSION ON A TOKEN THE VAULT NO LONGER HOLDS MOVES (§5.5, §5.6): its own token serves
+/// nowhere now, so [`stale_move`] takes it onto the vault's token where that is in use here, else
+/// onto the stored login where it is here, whatever kept the vault's token from use (refused,
+/// windows different, held for its basis, not verified for this Mac); with no stored login here
+/// it stays, and a vault not read just now moves nothing. Such a session is one its wrapper
+/// served an earlier token, one whose wrapper named nothing it could read, and one an earlier
+/// wrapper served before the vault's token was made ([`ServedToken::off`]); one on the vault's
+/// token is none of them. CONTROL: [`route_move`], which judges the vault's token as the
+/// session's, moves none of them off a token whose replacement is in use or held for its basis.
+#[test]
+fn a_session_on_a_token_the_vault_no_longer_holds_moves() {
+    let token = AuthRoute::VaultToken { entry: entry(WORK) };
+    for served in [
+        ServedToken::Named(5),
+        ServedToken::Garbled,
+        ServedToken::Unnamed(Some(6)),
+        ServedToken::Unnamed(Some(5)),
+    ] {
+        assert!(served.off(6), "{served:?}");
+    }
+    for served in [ServedToken::Named(6), ServedToken::Unnamed(Some(7))] {
+        assert!(!served.off(6), "{served:?}: on the vault's token");
+    }
+    assert_eq!(stale_move(TokenFact::InUse, true), Some(RouteTo::Token));
+    assert_eq!(stale_move(TokenFact::InUse, false), Some(RouteTo::Token));
+    assert_eq!(
+        route_move(token, TokenFact::InUse, true),
+        None,
+        "CONTROL: judged as the session's own token"
+    );
+    for fact in [
+        TokenFact::Rejected,
+        TokenFact::Differ,
+        TokenFact::AwaitingBasis,
+        TokenFact::Unverified,
+        TokenFact::Absent,
+    ] {
+        assert_eq!(stale_move(fact, true), Some(RouteTo::Stored), "{fact:?}");
+        assert_eq!(
+            stale_move(fact, false),
+            None,
+            "{fact:?}: no stored login here"
+        );
+    }
+    assert_eq!(
+        route_move(token, TokenFact::AwaitingBasis, true),
+        None,
+        "CONTROL"
+    );
+    assert_eq!(stale_move(TokenFact::Busy, true), None, "a vault not read");
+}
+
+/// A SESSION OF UNKNOWN BIRTH MOVES ONLY WHERE BOTH READINGS AGREE (§5.5, §5.6): an earlier
+/// wrapper served it, naming no token, and its process birth cannot be read, so it may run on the
+/// vault's token as well as on an earlier one. Its readings count for neither
+/// ([`ServedToken::on`] says [`OnToken::Other`]), but it is not known to be off the vault's token
+/// ([`ServedToken::off`]), so it is judged as a session on it ([`route_move`]). Where the vault's
+/// token was refused, found `differ`, ended, mismatched or is unverified for this Mac, a session
+/// on it and one on an earlier token both move back to the stored login where it is here, and so
+/// does this one. Where the vault's token is in use or held for its basis, a session on an earlier
+/// token would move ([`stale_move`]) and one on the vault's token would stay; this one stays: a
+/// relaunch onto the vault's token might only serve it again. The offered move over a scratch
+/// vault is `the_offered_move_reads_the_vault_and_the_roster`'s.
+#[test]
+fn a_session_of_unknown_birth_moves_only_where_both_readings_agree() {
+    let unknown = ServedToken::Unnamed(None);
+    assert_eq!(unknown.on(1), OnToken::Other, "its readings stay apart");
+    assert!(!unknown.off(1), "it may run on the vault's token");
+    let token = AuthRoute::VaultToken { entry: entry(WORK) };
+    for fact in [
+        TokenFact::Rejected,
+        TokenFact::Differ,
+        TokenFact::Unverified,
+        TokenFact::Ended,
+        TokenFact::Mismatched,
+    ] {
+        assert_eq!(
+            stale_move(fact, true),
+            route_move(token, fact, true),
+            "{fact:?}: the readings agree"
+        );
+        assert_eq!(
+            route_move(token, fact, true),
+            Some(RouteTo::Stored),
+            "{fact:?}"
+        );
+        assert_eq!(route_move(token, fact, false), None, "{fact:?}");
+    }
+    for fact in [TokenFact::InUse, TokenFact::AwaitingBasis] {
+        assert_ne!(
+            stale_move(fact, true),
+            route_move(token, fact, true),
+            "{fact:?}: the readings disagree"
+        );
+        assert_eq!(route_move(token, fact, true), None, "{fact:?}: it stays");
     }
 }
 
@@ -671,4 +848,431 @@ fn a_line_for_a_store_build_types_the_wrapper_ahead_of_it() {
             "a line with its own settings is no shape the token serves"
         );
     });
+}
+
+/// THE MOVE A RUNNING SESSION IS OFFERED, READ FROM THE VAULT (§5.5, §5.6): over a scratch seated
+/// vault holding a token minted here with nothing compared yet, a session on the row's stored
+/// login is offered the token while no login record of the row's account is here, and nothing
+/// once one is (the token is held for its basis, the roster saying which login is the row's). A
+/// session on a token the vault no longer holds (served an earlier token, or named none and began
+/// before the vault's token was made) moves onto the vault's token while it is in use, and onto
+/// the stored login while it is held; one on the vault's token stays, and so does one an earlier
+/// wrapper served whose birth is not known. Once this Mac records the vault's token refused, every
+/// session on a token moves back to the stored login, that one included. NEGATIVE CONTROLS:
+/// judged with no roster, the held token reads in use and the stored-login session is offered it;
+/// judged as on the vault's token, the stale session is offered nothing; and (applied to
+/// [`offered_move`], then reverted) a session of unknown birth judged as one on an earlier token,
+/// `served.on(..) == OnToken::Other`, is offered the vault's token while it is in use,
+/// `left: Some(Token)`, while one offered nothing whatever the token's standing, as before, stays
+/// on the refused token, `left: None`.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_offered_move_reads_the_vault_and_the_roster() {
+    use crate::harness::accounts::ProcessLogin;
+    use crate::harness::accounts_tokens::tests::Lab;
+    use aterm_secrets::claude_token::{self, ExpiryFrom, Key, Meta};
+    use aterm_secrets::client::{MemberWritten, OnBusy};
+    const KEY: &str = "ac-fedcba9876543210";
+    const NOW: u64 = 1_800_000_000;
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some(KEY.to_owned())
+    }
+    let lab = Lab::new();
+    let minted_at = NOW - 86_400;
+    let meta = Meta {
+        email: "person@example.com".to_owned(),
+        account_id: "c-0123456789ab".to_owned(),
+        minted_at,
+        expires_at: NOW + 300 * 86_400,
+        expiry_from: ExpiryFrom::Printed,
+        minted_on: "m22".to_owned(),
+        cli: "2.1.318".to_owned(),
+        minted_by: None,
+        verified: None,
+    };
+    let written = claude_token::write(
+        &lab.paths,
+        &Key::parse(KEY).expect("a key"),
+        &aterm_secrets::SecretBytes::from(crate::harness::setup_token::tests::token().as_bytes()),
+        &meta,
+        OnBusy::Refuse(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+    )
+    .expect("the write");
+    assert!(
+        matches!(written, MemberWritten::Posted | MemberWritten::SignedHere),
+        "{written:?}"
+    );
+    let state = aterm_tempfile::Builder::new()
+        .prefix("aterm-offered-move-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("scratch");
+    let store = accounts::Store::at(state.path());
+    let roster = Roster::parse_for(
+        accounts::Cli::Claude,
+        "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \"person@example.com\"\n",
+    )
+    .expect("the roster");
+    let home = lab.paths.home.clone();
+    let on = |route: AuthRoute, served: ServedToken| {
+        let who = ProcessLogin {
+            login: None,
+            default_home: true,
+            route,
+        };
+        crate::harness::journal::with_keyer(keyer, || {
+            offered_move(
+                &home,
+                &lab.paths,
+                &store,
+                Some(&roster),
+                (&who, served),
+                NOW,
+            )
+        })
+    };
+    let token = AuthRoute::VaultToken {
+        entry: entry(&format!("aterm-claude-token-{KEY}")),
+    };
+    let earlier = ServedToken::Named(minted_at - 600);
+    let before_it = ServedToken::Unnamed(Some(minted_at - 1));
+    let on_it = [
+        ServedToken::Named(minted_at),
+        ServedToken::Unnamed(Some(minted_at + 1)),
+    ];
+    assert_eq!(
+        on(AuthRoute::Stored, ServedToken::Unnamed(None)),
+        Some(RouteTo::Token)
+    );
+    for stale in [earlier, before_it] {
+        assert_eq!(on(token, stale), Some(RouteTo::Token), "{stale:?}");
+    }
+    for served in on_it {
+        assert_eq!(on(token, served), None, "{served:?}");
+    }
+    assert_eq!(
+        on(token, ServedToken::Unnamed(None)),
+        None,
+        "a session of unknown birth may be on the vault's token: it is not relaunched onto it"
+    );
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"person@example.com"}}"#,
+    )
+    .expect("the login record");
+    assert_eq!(
+        on(AuthRoute::Stored, ServedToken::Unnamed(None)),
+        None,
+        "held for its basis"
+    );
+    for stale in [earlier, before_it] {
+        assert_eq!(on(token, stale), Some(RouteTo::Stored), "{stale:?}");
+    }
+    for served in on_it {
+        assert_eq!(on(token, served), None, "{served:?}");
+    }
+    assert_eq!(
+        on(token, ServedToken::Unnamed(None)),
+        None,
+        "a session of unknown birth is not moved off a token held for its basis"
+    );
+    let Ok(claude_token::Lookup::Found(standing)) =
+        claude_token::standing(&lab.paths, &Key::parse(KEY).expect("a key"))
+    else {
+        panic!("the vault holds the token");
+    };
+    assert!(
+        crate::harness::accounts_tokens::note_rejected(&lab.paths, &store, &standing, NOW)
+            .expect("recorded"),
+        "this Mac saw the vault's token refused"
+    );
+    for served in [earlier, before_it, ServedToken::Unnamed(None)]
+        .into_iter()
+        .chain(on_it)
+    {
+        assert_eq!(
+            on(token, served),
+            Some(RouteTo::Stored),
+            "{served:?}: off a refused token, whichever it runs on"
+        );
+    }
+}
+
+/// One Mac of the fleet for [`judge`]: its own token table and accounts state in `scratch`, the
+/// roster beside it, and the vault's standing of the account's token as it reads it.
+#[cfg(unix)]
+struct MacOf<'a> {
+    scratch: &'a crate::harness::accounts_tokens::tests::Scratch,
+    found: aterm_secrets::claude_token::Lookup<aterm_secrets::claude_token::Standing>,
+    now: u64,
+}
+
+#[cfg(unix)]
+impl MacOf<'_> {
+    fn roster(&self) -> Roster {
+        Roster::load_for(
+            accounts::Cli::Claude,
+            &self.scratch.path().join("accounts.toml"),
+        )
+        .expect("the roster")
+    }
+
+    /// The one judgment of a session-starting launch on `work`'s stored login on this Mac.
+    fn decision(&self) -> Decision {
+        let argv = words(&["claude"]);
+        let facts = Facts {
+            macos: true,
+            no_harness: false,
+            argv: &argv,
+            store_build: true,
+        };
+        judge(&facts, self)
+    }
+}
+
+#[cfg(unix)]
+impl Ask for MacOf<'_> {
+    fn account(&self) -> Result<(Account, Option<TokenEntry>), String> {
+        use crate::harness::accounts_tokens::tests::{EMAIL, key};
+        Ok((
+            Account {
+                label: Some("work".to_owned()),
+                email: EMAIL.to_owned(),
+            },
+            TokenEntry::parse(&key().entry()),
+        ))
+    }
+    fn claims(&self, _account: &Account) -> Option<Fallback> {
+        None
+    }
+    fn token(&self, _entry: TokenEntry, account: &Account) -> TokenFact {
+        standing_judged(
+            &self.found,
+            &aterm_secrets::client::Paths::locate_for_home(&self.scratch.path().join("home")),
+            &self.scratch.store(),
+            Some(&self.roster()),
+            &crate::harness::accounts_tokens::tests::key(),
+            account,
+            self.now,
+        )
+    }
+}
+
+/// A WINDOW-MINTED TOKEN FROM ANOTHER MAC SERVES HERE FROM MINT, AND A TERMINAL-MINTED ONE ONLY
+/// ONCE VERIFIED (§5.1, §5.3): m7 minted `work`'s token in aterm's window, which signed in as the
+/// account and refused a token for any other, and nobody has verified it; every other Mac reading
+/// the same vault starts a launch on it. A token m7 made at its terminal, or one whose meta names
+/// no route (an earlier build's), starts launches on m7 alone until it is verified, then on every
+/// Mac. CONTROLS, in one fixture: refused here, the window token is `Stored (rejected)` here while
+/// a second Mac reading the same vault decides `Token`; this Mac's comparison finding its windows
+/// different stops it here alone (`differ`); ended, it is `Stored (ended)`; with this Mac's stored
+/// login of the account signed in and no basis yet it is `Stored (awaiting-basis)` and the row the
+/// stored login's reading records the basis on is made here, and with that login signed out it is
+/// `Token`; a meta with `minted_by` stripped serves only its minting Mac.
+#[cfg(unix)]
+#[test]
+fn a_window_minted_token_from_another_mac_serves_here_from_mint_and_a_terminal_minted_one_only_once_verified()
+ {
+    use crate::harness::accounts_tokens::tests::{
+        A_YEAR, Answer, EMAIL, NOW, Scratch, key, standing as standing_of,
+    };
+    use crate::harness::accounts_tokens::{Served, Windows, note_basis, note_served};
+    use aterm_secrets::claude_token::{Check, Lookup, MintedBy, Standing};
+    // The account's token, made on m7 (or here, `here`) by `by`, verified or not, ending at
+    // `expires_at`.
+    let token = |by: Option<MintedBy>, verified: bool, here: bool, expires_at: u64| {
+        let Answer::Found(mut token) =
+            standing_of(Check::Readable, expires_at, verified, here, &[])
+        else {
+            panic!("a standing");
+        };
+        token.meta.as_mut().expect("a meta").minted_by = by;
+        *token
+    };
+    fn mac<'a>(scratch: &'a Scratch, standing: &Standing) -> MacOf<'a> {
+        MacOf {
+            scratch,
+            found: Lookup::Found(standing.clone()),
+            now: NOW,
+        }
+    }
+    let fell_to = |decided: Decision| decided.fallback().map(Fallback::word);
+    let window = token(Some(MintedBy::Window), false, false, NOW + A_YEAR);
+    let (here, there) = (Scratch::new("route-here"), Scratch::new("route-there"));
+    assert!(
+        matches!(mac(&here, &window).decision(), Decision::Token { .. }),
+        "the window token serves this Mac, which did not mint it, unverified"
+    );
+    assert!(matches!(
+        mac(&there, &window).decision(),
+        Decision::Token { .. }
+    ));
+
+    // This Mac's refusal is read into its standing (`claude_token::note_refused`, beside its
+    // vault state); the second Mac's standing of the same vault carries none.
+    let refused_here = Standing {
+        refused_at: Some(NOW),
+        ..window.clone()
+    };
+    assert_eq!(
+        mac(&here, &refused_here).decision(),
+        Decision::Stored(Fallback::Rejected),
+        "CONTROL: refused here"
+    );
+    assert!(
+        matches!(mac(&there, &window).decision(), Decision::Token { .. }),
+        "CONTROL: a second Mac reading the same vault still starts on it"
+    );
+
+    let compared = Scratch::new("route-differ");
+    let (stored, theirs) = (
+        Windows {
+            week_reset: Some(i64::try_from(NOW).unwrap() + 3 * 86_400),
+            session_reset: Some(i64::try_from(NOW).unwrap() + 7_200),
+        },
+        Windows {
+            week_reset: Some(i64::try_from(NOW).unwrap() + 5 * 86_400),
+            session_reset: Some(i64::try_from(NOW).unwrap() + 3_600),
+        },
+    );
+    assert!(
+        note_basis(&compared.store(), &window, "work", &stored, &[], NOW)
+            .unwrap()
+            .recorded()
+    );
+    let served = Served {
+        label: "work".to_owned(),
+        reading: theirs,
+        others: Vec::new(),
+        named: true,
+    };
+    note_served(&compared.store(), &window, &served, NOW).unwrap();
+    assert_eq!(
+        mac(&compared, &window).decision(),
+        Decision::Stored(Fallback::Differ),
+        "CONTROL: windows that differ here stop it here"
+    );
+    assert!(matches!(
+        mac(&there, &window).decision(),
+        Decision::Token { .. }
+    ));
+
+    let ended = token(Some(MintedBy::Window), false, false, NOW - 1);
+    assert_eq!(
+        fell_to(mac(&there, &ended).decision()),
+        Some("ended"),
+        "CONTROL: ended"
+    );
+
+    let signed_in = Scratch::new("route-hold");
+    std::fs::write(
+        signed_in.path().join("home/.claude.json"),
+        format!(r#"{{"oauthAccount":{{"emailAddress":"{EMAIL}"}}}}"#),
+    )
+    .expect("the login record");
+    assert!(
+        signed_in.table().rows.is_empty(),
+        "PRECONDITION: no row here"
+    );
+    assert_eq!(
+        mac(&signed_in, &window).decision(),
+        Decision::Stored(Fallback::AwaitingBasis),
+        "CONTROL: this Mac's stored login signed in, with no basis yet"
+    );
+    let row = signed_in
+        .table()
+        .rows
+        .remove(key().as_str())
+        .expect("CONTROL: the row the basis goes on, made here");
+    assert_eq!(
+        (row.minted_at, row.label.as_deref()),
+        (
+            window.meta.as_ref().map(|meta| meta.minted_at),
+            Some("work")
+        )
+    );
+    let roster = mac(&signed_in, &window).roster();
+    let work = roster.row("work").expect("the row").clone();
+    let mut note = None;
+    signed_in
+        .store()
+        .transact_logins(i64::try_from(NOW).unwrap(), &mut note, |state, logins| {
+            Ok(accounts::note_login_end(
+                state,
+                logins,
+                &work.label,
+                i64::try_from(NOW).unwrap(),
+            ))
+        })
+        .expect("the login's end");
+    assert!(
+        matches!(mac(&signed_in, &window).decision(), Decision::Token { .. }),
+        "CONTROL: that login signed out, the token serves"
+    );
+
+    for (case, by) in [
+        ("made at m7's terminal", Some(MintedBy::Terminal)),
+        ("its meta's minted_by stripped", None),
+    ] {
+        let elsewhere = Scratch::new("route-terminal");
+        let unverified = token(by, false, false, NOW + A_YEAR);
+        assert_eq!(
+            fell_to(mac(&elsewhere, &unverified).decision()),
+            Some("unverified"),
+            "{case}: not on a Mac that did not mint it, unverified"
+        );
+        assert!(
+            matches!(
+                mac(&elsewhere, &token(by, false, true, NOW + A_YEAR)).decision(),
+                Decision::Token { .. }
+            ),
+            "{case}: on the Mac that minted it"
+        );
+        assert!(
+            matches!(
+                mac(&elsewhere, &token(by, true, false, NOW + A_YEAR)).decision(),
+                Decision::Token { .. }
+            ),
+            "{case}: on every Mac once verified"
+        );
+    }
+}
+
+/// A LOST LOGIN IS A TOKEN'S REFUSAL ONLY WHERE CLAUDE CODE'S NEWEST API ERROR ANSWERED `401`
+/// (§5.6): the status read off a session's transcript is its newest main-chain API error's, so a
+/// `403`, Cloudflare's block page that Claude Code writes as `authentication_failed`, is read as
+/// `403`, an earlier `401` behind it counting for nothing, and a sidechain's error and a reply
+/// count for nothing either. NEGATIVE CONTROL: the newest error's status reads `401` where it
+/// answered `401`, a notice that names no status reads none, and a tail with no API error none.
+#[test]
+fn the_newest_api_errors_status_is_what_judges_a_refusal() {
+    let notice = |status: Option<u16>, sidechain: bool| {
+        let status = status.map_or(String::new(), |s| format!(r#","apiErrorStatus":{s}"#));
+        format!(
+            r#"{{"type":"assistant","isSidechain":{sidechain},"isApiErrorMessage":true,"error":"authentication_failed"{status},"message":{{"model":"<synthetic>","role":"assistant","content":[{{"type":"text","text":"Please run /login"}}]}}}}"#
+        )
+    };
+    let reply = r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#;
+    let tail = |lines: &[String]| lines.join("\n") + "\n";
+    let cloudflare = tail(&[notice(Some(401), false), notice(Some(403), false)]);
+    assert_eq!(newest_api_error_status(&cloudflare), Some(403));
+    assert_ne!(
+        newest_api_error_status(&cloudflare),
+        Some(REFUSED_STATUS),
+        "an earlier 401 behind it is not the newest"
+    );
+    let refused = tail(&[
+        notice(Some(403), false),
+        notice(Some(401), false),
+        notice(Some(403), true),
+        reply.to_owned(),
+    ]);
+    assert_eq!(
+        newest_api_error_status(&refused),
+        Some(REFUSED_STATUS),
+        "CONTROL: a sidechain's error and a reply after it count for nothing"
+    );
+    assert_eq!(newest_api_error_status(&tail(&[notice(None, false)])), None);
+    assert_eq!(newest_api_error_status(&tail(&[reply.to_owned()])), None);
+    assert_eq!(newest_api_error_status(""), None);
 }

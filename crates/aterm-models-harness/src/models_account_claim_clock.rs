@@ -8,8 +8,9 @@ use aterm_spec::derive::Model;
 /// peer's stale senior lease on its home row; it may run a session on a row that is not its home.
 /// Peer B reads A as skewed or not, and holds a claim on A's home row or not.
 ///
-/// `st`: Unknown (0), Agrees (1), Split (2), Off (3). `plive`: A's view shows a peer's senior lease
-/// on A's home row. `lease`: A runs a session on a row that is not its home. `turned`: a turn end
+/// `st`: Unknown (0), Agrees (1), Split (2), Off (3). `plive`: A's view shows a peer's senior claim
+/// on A's home row (a co-home's earlier claim, a hold, or a lease where A's lab does not name A its
+/// home). `lease`: A runs a session on a row that is not its home. `turned`: a turn end
 /// passed since `st` last changed. `homeok`: the verdict on A's home row, not yet judged since the
 /// standing or the view changed (2), refused (0) or Ok (1). `askew`: B's latest reading of A holds
 /// A (it does not agree within `T/4`), as B's every table read now says. `bseen`: B read A as held

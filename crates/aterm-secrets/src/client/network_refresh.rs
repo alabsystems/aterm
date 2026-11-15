@@ -132,9 +132,7 @@ pub(super) fn run(
         // PutBack returns only after the ordinary source publication completed.
         refresh.peer_response();
     }
-    let completed = result.as_ref().is_ok_and(
-        |outcome| !matches!(outcome, SyncOutcome::Applied { report, .. } if apply_failed(report)),
-    );
+    let completed = result.is_ok();
     if let (Some(attempt), Some(outcome), Some(completed_at_ms)) = (
         attempt,
         refresh.outcome(completed),

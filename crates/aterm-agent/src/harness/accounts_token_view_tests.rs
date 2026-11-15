@@ -54,10 +54,11 @@ fn standing(expires_at: u64, exposed: &[&str]) -> Standing {
             expiry_from: ExpiryFrom::Printed,
             minted_on: "m7".to_owned(),
             cli: "2.1.318".to_owned(),
+            minted_by: Some(aterm_secrets::claude_token::MintedBy::Window),
             verified: Some(Verified {
                 on: "m7".to_owned(),
                 at: NOW - 3_600,
-                by: "windows".to_owned(),
+                by: aterm_secrets::claude_token::BY_WINDOWS.to_owned(),
                 seven_day_resets_at: None,
                 five_hour_resets_at: None,
             }),
@@ -66,6 +67,7 @@ fn standing(expires_at: u64, exposed: &[&str]) -> Standing {
         signer: Some("m7".to_owned()),
         minted_here: false,
         exposed: exposed.iter().map(|m| (*m).to_owned()).collect(),
+        refused_at: None,
     }
 }
 
@@ -151,6 +153,7 @@ fn a_write_waiting_here_offers_nothing_and_says_not_yet_in_vault() {
         accounts: vec![waiting],
         peers: PeersShown::NotRead,
         sessions: None,
+        steps: BTreeMap::new(),
     };
     let text = report.text();
     assert!(text.contains("not yet in vault"), "{text}");
@@ -171,8 +174,9 @@ fn a_write_waiting_here_offers_nothing_and_says_not_yet_in_vault() {
     assert!(free.offer.is_some());
 }
 
-/// THE STEP FOR `soon` AND `exposed` CARRIES `--replace`; for `none`, `ended` and `rejected` it is
-/// a bare run; `active` and `unknown` offer nothing.
+/// THE STEP FOR `soon` AND `exposed` CARRIES `--replace`, and so does the one for a token rejected
+/// here that the vault's records put in use on other Macs (this one is verified); for `none` and
+/// `ended` it is a bare run; `active` and `unknown` offer nothing.
 #[test]
 fn the_step_for_soon_and_exposed_carries_replace() {
     /// A world: its name, the vault's standing, this Mac's row, and whether the step replaces.
@@ -182,9 +186,9 @@ fn the_step_for_soon_and_exposed_carries_replace() {
         Option<TokenRow>,
         Option<bool>,
     );
-    let rejected = TokenRow {
-        rejected_at: Some(NOW - 60),
-        ..row()
+    let rejected = Standing {
+        refused_at: Some(NOW - 60),
+        ..standing(NOW + 300 * DAY, &[])
     };
     let cases: [Case; 7] = [
         (
@@ -206,12 +210,7 @@ fn the_step_for_soon_and_exposed_carries_replace() {
             None,
             Some(false),
         ),
-        (
-            "rejected",
-            Lookup::Found(standing(NOW + 300 * DAY, &[])),
-            Some(rejected),
-            Some(false),
-        ),
+        ("rejected", Lookup::Found(rejected), Some(row()), Some(true)),
         (
             "active",
             Lookup::Found(standing(NOW + 300 * DAY, &[])),
@@ -259,7 +258,6 @@ fn row() -> TokenRow {
         vault: InVault::InVault,
         verified: Some(NOW - 3_600),
         verification: Verification::default(),
-        rejected_at: None,
         removed_at: None,
     }
 }
@@ -282,9 +280,10 @@ fn the_report_carries_the_fields() {
         sessions: Some(sessions_of(&[format!(
             "session local=1 sid=s-1 account=work auth=token token={KEY}"
         )])),
+        steps: BTreeMap::new(),
     };
     let text = report.text();
-    for field in [entry.as_str(), "m7", "@s-1", "token"] {
+    for field in [entry.as_str(), "m7 in aterm's window", "@s-1", "token"] {
         assert!(text.contains(field), "{field}: {text}");
     }
     let json = report.json();
@@ -299,6 +298,7 @@ fn the_report_carries_the_fields() {
         "expires_at",
         "expiry_from",
         "minted_on",
+        "minted_by",
         "signer",
         "used_on",
         "vault",
@@ -310,6 +310,7 @@ fn the_report_carries_the_fields() {
         assert!(account.get(field).is_some(), "{field}: {json}");
     }
     assert_eq!(account["state"], Value::from("active"));
+    assert_eq!(account["minted_by"], Value::from("window"));
     assert_eq!(account["entry"], Value::from(entry));
     assert_eq!(account["used_on"]["peers"][0], Value::from("m9"));
     assert_eq!(account["used_on"]["peers_read"], Value::from(true));
@@ -675,6 +676,7 @@ fn the_view_covers_a_rowless_session_login_in_one_read() {
         fn verify(
             &self,
             _: &Key,
+            _: u64,
             _: Verified,
             _: aterm_secrets::client::OnBusy,
         ) -> Result<aterm_secrets::client::MemberWritten, String> {
@@ -729,11 +731,106 @@ fn the_view_covers_a_rowless_session_login_in_one_read() {
     assert!(elsewhere[0].phrase(i64::try_from(NOW).unwrap()).is_none());
 }
 
-/// A vault whose post a server takes where `takes`, counting the posts it was asked for; it
-/// answers nothing else.
+/// WHILE A REPLACEMENT IS ON ITS WAY, THE VIEW JUDGES THE VAULT'S TOKEN BY ITS OWN FACTS (§5.6):
+/// the vault holds a token made here whose windows were found to differ here, or that was refused
+/// here (its standing's `refused_at`); a `--replace` of it waits in this Mac's vault writes, so the
+/// table's row for the account is the waiting token's and the vault's token's facts are its kept
+/// row. Every surface's read
+/// says what the route, the verb and execution admission say ([`tokens::Table::row_for`]): the
+/// token's own state, not in use (so its login half is not taken for one on the token), not yet
+/// in vault, and no offer while the write waits. NEGATIVE CONTROL (applied to [`view`], then
+/// reverted): judged by the waiting token's row, `table.rows.get(..)`, it reads `unverified
+/// (awaiting a stored-login reading)` and in use.
+#[test]
+fn a_waiting_replacement_leaves_the_view_judging_the_vaults_token_by_its_own_facts() {
+    use crate::harness::accounts_tokens::Verdict;
+    use crate::harness::accounts_tokens::tests::{Answer, FakeVault};
+    let mut held = standing(NOW + 300 * DAY, &[]);
+    held.minted_here = true;
+    if let Some(meta) = held.meta.as_mut() {
+        meta.verified = None;
+        meta.minted_on = "m22".to_owned();
+    }
+    let differ = TokenRow {
+        verified: None,
+        verification: Verification {
+            verdict: Some(Verdict::Differ),
+            ..Verification::default()
+        },
+        ..row()
+    };
+    let refused = TokenRow {
+        verified: None,
+        ..row()
+    };
+    for (case, kept, refused_at, words) in [
+        ("differ", differ, None, "unverified (windows differ)"),
+        ("rejected", refused, Some(NOW - 60), "rejected"),
+    ] {
+        let (_dir, store) = scratch();
+        tokens::update_table(&store, |table: &mut Table| {
+            table.rows.insert(
+                KEY.to_owned(),
+                TokenRow {
+                    minted_at: Some(NOW - DAY + 600),
+                    vault: InVault::Waiting("it waits for the vault's new key".to_owned()),
+                    verified: None,
+                    used_on: UsedOn::default(),
+                    ..row()
+                },
+            );
+            table.replaced.insert(KEY.to_owned(), kept);
+        })
+        .expect("the table");
+        let mut vault = FakeVault::new(Answer::Found(Box::new(Standing {
+            refused_at,
+            ..held.clone()
+        })));
+        vault.pending = true;
+        let shown = journal::with_keyer(
+            |_, _| Some(KEY.to_owned()),
+            || {
+                view(
+                    &Places {
+                        store: &store,
+                        roster: None,
+                        logins: &[],
+                        now: i64::try_from(NOW).unwrap(),
+                        offers: true,
+                        enrolled: &accounts::enrolled,
+                    },
+                    &vault,
+                )
+            },
+        );
+        assert_eq!(shown.len(), 1, "{case}");
+        assert_eq!(shown[0].state.words(), words, "{case}");
+        assert!(!shown[0].state.in_use(), "{case}");
+        assert_eq!(shown[0].login, LoginHere::Unread, "{case}: no token in use");
+        assert!(
+            shown[0].not_yet(),
+            "{case}: the replacement is not yet in vault"
+        );
+        assert!(shown[0].offer.is_none(), "{case}: none while it waits");
+    }
+}
+
+/// A vault whose post a server takes where `takes`, counting the posts it was asked for, and
+/// keeping the keys each ask named (raising one need for each); it answers nothing else.
 struct Posting {
     takes: bool,
     posts: RefCell<u32>,
+    asked: RefCell<Vec<String>>,
+}
+
+impl Posting {
+    fn new(takes: bool) -> Self {
+        Self {
+            takes,
+            posts: RefCell::new(0),
+            asked: RefCell::new(Vec::new()),
+        }
+    }
 }
 
 impl TokenVault for Posting {
@@ -771,6 +868,7 @@ impl TokenVault for Posting {
     fn verify(
         &self,
         _: &Key,
+        _: u64,
         _: Verified,
         _: aterm_secrets::client::OnBusy,
     ) -> Result<aterm_secrets::client::MemberWritten, String> {
@@ -779,6 +877,12 @@ impl TokenVault for Posting {
     fn post(&self) -> Result<bool, String> {
         *self.posts.borrow_mut() += 1;
         Ok(self.takes)
+    }
+    fn ask(&self, keys: &[Key]) -> Result<usize, String> {
+        self.asked
+            .borrow_mut()
+            .extend(keys.iter().map(|key| key.as_str().to_owned()));
+        Ok(keys.len())
     }
 }
 
@@ -816,10 +920,7 @@ fn a_signed_here_row_turns_in_vault_once_a_server_takes_its_write() {
             NOW,
         )]
     };
-    let offline = Posting {
-        takes: false,
-        posts: RefCell::new(0),
-    };
+    let offline = Posting::new(false);
     let mut accounts = read();
     assert!(accounts[0].not_yet(), "CONTROL: signed here");
     assert_eq!(
@@ -835,10 +936,7 @@ fn a_signed_here_row_turns_in_vault_once_a_server_takes_its_write() {
     );
     assert_eq!(*offline.posts.borrow(), 1, "at most once a minute");
 
-    let online = Posting {
-        takes: true,
-        posts: RefCell::new(0),
-    };
+    let online = Posting::new(true);
     let mut accounts = read();
     assert_eq!(
         note_posted(&store, &mut accounts, &online, NOW + POST_EVERY_S).unwrap(),
@@ -897,6 +995,7 @@ fn each_session_names_the_account_its_login_record_names() {
         accounts: vec![shown.clone()],
         peers: PeersShown::NotRead,
         sessions: Some(named),
+        steps: BTreeMap::new(),
     };
     let text = report.text();
     assert!(
@@ -915,4 +1014,148 @@ fn each_session_names_the_account_its_login_record_names() {
     );
     assert_eq!(unnamed[0].login, None, "CONTROL: no default login record");
     assert_eq!(unnamed[1].login.as_deref(), Some(KEY), "CONTROL: the row's");
+}
+
+/// A STOPPED TOKEN STEP IS SHOWN ON DEMAND WHILE ITS RECORD HOLDS (FL-136): the report's line
+/// says when, what stopped it and what tries it again, its JSON carries the word and when, and
+/// neither names a host; a record a later token released is not shown.
+/// NEGATIVE CONTROL: with `held_steps` keeping every record, the account whose token was made
+/// after its stop still shows it: `` a released record was shown ``.
+#[test]
+fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
+    use crate::harness::open_url::MetWord;
+    let (_dir, store) = scratch();
+    let none = account(
+        covered(LoginHalf::Ok),
+        &Lookup::Absent,
+        None,
+        Some(false),
+        NOW,
+    );
+    let step = Stopped::new(MetWord::WindowHumanCheck, NOW, "2.1.318", "").expect("a record");
+    token_steps::put(&store, KEY, Some(&step)).unwrap();
+    let steps = held_steps(&store, std::slice::from_ref(&none), None, || {
+        Some("2.1.318".to_owned())
+    });
+    assert_eq!(steps.get(KEY), Some(&step));
+    let report = Report::Accounts {
+        accounts: vec![none.clone()],
+        peers: PeersShown::NotRead,
+        sessions: None,
+        steps,
+    };
+    let text = report.text();
+    assert!(
+        text.contains(
+            "\n    token step: stopped 2027-01-15: the consent page held Authorize behind a \
+             human check; it is tried again only at the account's next sign-in in aterm's \
+             sign-in window or on its headless browser profile, with a new Claude Code or aterm \
+             build, or by `aterm harness accounts token work`"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("claude.ai"), "{text}");
+    let json = report.json();
+    assert_eq!(
+        json["accounts"][0]["step"]["word"],
+        Value::from("window-human-check")
+    );
+    assert_eq!(json["accounts"][0]["step"]["at"], Value::from(NOW));
+    // A new Claude Code build releases it, and so does a token made after the stop.
+    assert!(
+        held_steps(&store, std::slice::from_ref(&none), None, || {
+            Some("2.1.319".to_owned())
+        })
+        .is_empty()
+    );
+    let made = account(
+        covered(LoginHalf::Ok),
+        &Lookup::Found(standing(NOW + 300 * DAY, &[])),
+        None,
+        Some(false),
+        NOW + 2 * DAY,
+    );
+    let mut later = step.clone();
+    later.at = NOW - 2 * DAY;
+    token_steps::put(&store, KEY, Some(&later)).unwrap();
+    assert!(
+        held_steps(&store, std::slice::from_ref(&made), None, || None).is_empty(),
+        "a released record was shown"
+    );
+}
+
+/// THE LAB IS ASKED FOR AN OFFERED TOKEN NOTHING ANSWERS HERE, NEVER FOR ONE IN USE (§5.9): an
+/// offer for an account with no token, an ended one or one Claude Code refused here is asked of
+/// the lab under the account's key; an offer whose token is verified and in use (`soon`), which
+/// that request would count as met at once, asks nothing, nor does an account with no offer (a
+/// write of this Mac's still waits, or no session here is logged into it).
+///
+/// NEGATIVE CONTROL (2026-11-14, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `ask_lab`'s in-use filter removed, `soon` reads
+/// `left: (Soon, true, ["ac-fedcba9876543210"])`, `right: (Soon, true, [])`.
+#[test]
+fn an_offer_with_no_token_in_use_asks_the_lab_and_one_in_use_asks_nothing() {
+    let vault = Posting::new(false);
+    let asked = |shown: AccountToken| {
+        vault.asked.borrow_mut().clear();
+        let raised = ask_lab(std::slice::from_ref(&shown), &vault, NOW).expect("asked");
+        let asked = vault.asked.borrow().clone();
+        assert_eq!(raised, asked.len());
+        (shown.state, shown.offer.is_some(), asked)
+    };
+    let here = |found: Lookup<Standing>, pending: bool| {
+        account(covered(LoginHalf::Ok), &found, None, Some(pending), NOW)
+    };
+    let mut refused = standing(NOW + 300 * DAY, &[]);
+    refused.refused_at = Some(NOW - 60);
+    // Made here at a terminal, never verified: it serves this Mac alone, so its refusal here
+    // leaves it in use nowhere.
+    let mut refused_alone = refused.clone();
+    refused_alone.minted_here = true;
+    if let Some(meta) = refused_alone.meta.as_mut() {
+        meta.minted_on = "m2".to_owned();
+        meta.minted_by = Some(aterm_secrets::claude_token::MintedBy::Terminal);
+        meta.verified = None;
+    }
+    for (case, found, state) in [
+        ("none", Lookup::Absent, TokenState::None),
+        (
+            "ended",
+            Lookup::Found(standing(NOW - DAY / 2, &[])),
+            TokenState::Ended,
+        ),
+        (
+            "refused here, in use on other Macs",
+            Lookup::Found(refused),
+            TokenState::Rejected { elsewhere: true },
+        ),
+        (
+            "refused here, the Mac that made it alone",
+            Lookup::Found(refused_alone),
+            TokenState::Rejected { elsewhere: false },
+        ),
+    ] {
+        assert_eq!(
+            asked(here(found, false)),
+            (state, true, vec![KEY.to_owned()]),
+            "{case}"
+        );
+    }
+    assert_eq!(
+        asked(here(Lookup::Found(standing(NOW + 10 * DAY, &[])), false)),
+        (TokenState::Soon, true, Vec::new()),
+        "soon: offered, and in use"
+    );
+    assert_eq!(
+        asked(here(Lookup::Absent, true)),
+        (TokenState::None, false, Vec::new()),
+        "a write of this Mac's waits"
+    );
+    let mut away = covered(LoginHalf::Ok);
+    away.logged_in = false;
+    assert_eq!(
+        asked(account(away, &Lookup::Absent, None, Some(false), NOW)),
+        (TokenState::None, false, Vec::new()),
+        "no session here is logged into it"
+    );
 }

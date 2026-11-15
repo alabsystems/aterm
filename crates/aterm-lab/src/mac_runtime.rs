@@ -5,9 +5,11 @@
 //! its submodule, and the resolved compiler are transported as data; the guest builds its own
 //! verifier once. The bundle is never executed on the host. Every take retains its complete
 //! stdout, stderr, exit status, guest resource usage, and host load, including failed takes.
+//! Complete output is bounded at 16 MiB per stream; a capture refusal is never a complete take.
 
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aterm_json::{Value, json};
 use aterm_uds::spawnfd::{Stdio, command};
@@ -19,6 +21,8 @@ use crate::{Fail, Res, stop};
 
 mod count_compare;
 mod measure_costs;
+#[path = "mac_runtime_snapshot.rs"]
+mod snapshot;
 
 pub(crate) const COUNT_USAGE: &str = "  count-ranks --record DIR [--candidate DIR]\n                Recompute B14's exact count ranks from retained Q4 logs; no product is run.\n                Candidate is five later default-policy takes on the same bundle and guest shape.\n                Relative directories are resolved from this checkout's root.\n  settle-ranks --record DIR\n                Recompute the matched idle-RSS setup experiment, including every row's verdicts.\n  wait-ranks --record DIR\n                Recompute the matched Count-readiness experiments, including setup spans.\n";
 
@@ -272,27 +276,148 @@ fn write_json(path: &Path, value: &Value) -> Result<(), Fail> {
     write(path, &bytes)
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureReceipt {
+    schema: String,
+    complete: bool,
+    exit: Option<i32>,
+    signal: Option<i32>,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    error: Option<String>,
+}
+
+impl CaptureReceipt {
+    fn parse(bytes: &[u8]) -> Result<Self, Fail> {
+        let receipt: Self = aterm_json::from_slice(bytes)
+            .map_err(|error| not_run(format!("guest capture receipt: {error}")))?;
+        let status_valid = matches!(
+            (receipt.exit, receipt.signal),
+            (Some(0..=255), None) | (None, Some(1..=126))
+        );
+        let unknown = receipt.exit.is_none() && receipt.signal.is_none();
+        if receipt.schema != "aterm-runtime-capture-v1"
+            || (!status_valid && !unknown)
+            || receipt.stdout_bytes > aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES
+            || receipt.stderr_bytes > aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES
+            || (receipt.complete && (!status_valid || receipt.error.is_some()))
+            || (!receipt.complete && receipt.error.as_ref().is_none_or(String::is_empty))
+        {
+            return Err(not_run(
+                "guest capture receipt has invalid completion evidence",
+            ));
+        }
+        Ok(receipt)
+    }
+
+    fn status(&self) -> Option<std::process::ExitStatus> {
+        match (self.exit, self.signal) {
+            (Some(code), None) => Some(std::process::ExitStatus::from_raw(code << 8)),
+            (None, Some(signal)) => Some(std::process::ExitStatus::from_raw(signal)),
+            _ => None,
+        }
+    }
+}
+
+fn preserve_observed(status: Option<std::process::ExitStatus>, error: Fail) -> Fail {
+    match status {
+        Some(status) => preserve_failure(&[status.code()], error),
+        None => error,
+    }
+}
+
+/// Retain raw transport bytes before applying receipt validation or collecting artifacts. A
+/// completed phase requires the guest's direct status, both producer EOFs and exact file lengths.
+fn retain_phase<T>(
+    record: &Path,
+    phase: &str,
+    script: &str,
+    mut output: std::process::Output,
+    receipt: Result<CaptureReceipt, Fail>,
+    collect: impl FnOnce(&std::process::Output) -> Result<T, Fail>,
+) -> Result<(std::process::Output, T), Fail> {
+    write(&record.join(format!("{phase}.stdout")), &output.stdout)?;
+    write(&record.join(format!("{phase}.stderr")), &output.stderr)?;
+    let status = receipt.as_ref().ok().and_then(CaptureReceipt::status);
+    let ready = receipt.and_then(|receipt| {
+        if !output.status.success() {
+            Err(not_run(format!(
+                "guest output transfer exited {}",
+                output.status
+            )))
+        } else if !receipt.complete {
+            Err(not_run(receipt.error.unwrap_or_else(|| {
+                "producer capture was incomplete".into()
+            })))
+        } else if output.stdout.len() != receipt.stdout_bytes
+            || output.stderr.len() != receipt.stderr_bytes
+        {
+            Err(not_run(
+                "guest output lengths differ from the sealed capture receipt",
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    write_json(
+        &record.join(format!("{phase}.execution.json")),
+        &json!({"phase": phase, "command": script, "exit": status.and_then(|status| status.code()),
+            "signal": status.and_then(|status| status.signal()),
+            "success": status.map(|status| status.success()), "output_complete": ready.is_ok(),
+            "capture_error": ready.as_ref().err().and_then(|error| error.msg.as_ref()),
+            "transport_exit": output.status.code(),
+            "stdout_bytes": output.stdout.len(), "stderr_bytes": output.stderr.len(),
+            "usage": usage(&String::from_utf8_lossy(&output.stderr))}),
+    )?;
+    ready.map_err(|error| preserve_observed(status, error))?;
+    output.status =
+        status.ok_or_else(|| not_run("completed guest capture has no direct status"))?;
+    let artifacts = collect(&output).map_err(|error| preserve_observed(status, error))?;
+    Ok((output, artifacts))
+}
+
+/// An incomplete later capture cannot erase any already observed failed execution.
+fn preserve_failure(codes: &[Option<i32>], mut error: Fail) -> Fail {
+    if codes.iter().any(|code| matches!(code, None | Some(1))) {
+        error.code = 1;
+    }
+    error
+}
+
+/// Transport an artifact as bytes with proven complete stdout and a successful guest read.
+fn guest_bytes(vm: &Vm, script: &str) -> Result<Vec<u8>, Fail> {
+    let output = vm.exec_output(script, crate::mac::STEP).map_err(not_run)?;
+    if !output.status.success() {
+        return Err(not_run(format!(
+            "guest artifact read exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(output.stdout)
+}
+
 /// Timing drivers belong to the console's app band. An Interactive job is still a daemon
 /// task: neither its driver nor its subjects can take the UI role the instrument requests.
-/// launchd owns the job; the result file is written only after the measured child exits.
-fn app_job(root: &Path, phase: &str, script: &str) -> Value {
+/// Driver diagnostics are separate from the producer files its pipe capture seals.
+fn app_job(root: &Path, phase: &str, arguments: &[String]) -> Value {
     let dir = root.join(phase);
-    let path = |name: &str| q(&dir.join(name).display().to_string());
-    let program = format!(
-        "printf started > {}; /bin/sh -c {}; result=$?; printf '%s\\n' \"$result\" > {}; /bin/mv {} {}",
-        path("started"),
-        q(script),
-        path("exit.tmp"),
-        path("exit.tmp"),
-        path("exit")
-    );
     json!({
         "Label": format!("systems.alab.aterm.runtime.{phase}"),
-        "ProgramArguments": ["/bin/sh", "-c", program],
+        "ProgramArguments": arguments,
         "ProcessType": "App", "RunAtLoad": true,
-        "StandardOutPath": dir.join("stdout").display().to_string(),
-        "StandardErrorPath": dir.join("stderr").display().to_string()
+        "StandardOutPath": dir.join("driver.stdout").display().to_string(),
+        "StandardErrorPath": dir.join("driver.stderr").display().to_string()
     })
+}
+
+fn reserve_phase(root: &Path, phase: &str) -> String {
+    format!(
+        "mkdir -p {}; mkdir {}",
+        q(&root.display().to_string()),
+        q(&root.join(phase).display().to_string())
+    )
 }
 
 fn app_exec(
@@ -301,33 +426,94 @@ fn app_exec(
     phase: &str,
     script: &str,
     limit: Duration,
-) -> Result<std::process::Output, Fail> {
-    let job = app_job(&Path::new(ROOT).join("driver"), phase, script);
+) -> Result<(std::process::Output, Value), Fail> {
+    let deadline = Instant::now() + limit;
+    let dir = format!("{ROOT}/driver/{phase}");
+    let reservation = reserve_phase(&Path::new(ROOT).join("driver"), phase);
+    let job = app_job(
+        &Path::new(ROOT).join("driver"),
+        phase,
+        &[
+            format!("{ROOT}/target.noindex/debug/aterm-verify"),
+            "--runtime-capture".into(),
+            "run".into(),
+            dir.clone(),
+            limit.as_secs().to_string(),
+            script.into(),
+        ],
+    );
     write_json(&ask.record.join(format!("{phase}.driver.json")), &job)?;
     let encoded = aterm_json::to_string(&job).map_err(|e| format!("driver JSON: {e}"))?;
-    let dir = format!("{ROOT}/driver/{phase}");
     let label = job["Label"].as_str().expect("job label");
     let command = format!(
-        "set -eu; mkdir -p {dir}; printf '%s' {} > {dir}/job.json; \
+        "set -eu; {reservation}; printf '%s' {} > {dir}/job.json; \
          /usr/bin/plutil -convert xml1 -o {dir}/job.plist {dir}/job.json; \
          uid=$(id -u); /bin/launchctl bootstrap gui/$uid {dir}/job.plist; \
-         count=0; while ! test -f {dir}/exit; do \
-           if ! test -f {dir}/started && test \"$count\" -ge 60; then \
-             /bin/launchctl print gui/$uid/{label} >&2; exit 3; \
-           fi; count=$((count + 1)); sleep 1; \
-         done; \
-         /bin/launchctl print gui/$uid/{label} > {dir}/launchd.txt 2>&1 || true; \
-         /bin/launchctl bootout gui/$uid/{label} >/dev/null 2>&1 || true; \
-         cat {dir}/stdout; cat {dir}/stderr >&2; exit \"$(cat {dir}/exit)\"",
-        q(&encoded)
+         {ROOT}/target.noindex/debug/aterm-verify --runtime-capture wait {dir} {seconds} gui/$uid/{label}",
+        q(&encoded),
+        seconds = limit.as_secs()
     );
-    let out = vm.exec(&command, limit)?;
-    let state = vm.exec(&format!("cat {dir}/launchd.txt"), crate::mac::STEP)?;
+    let ready = vm.exec_output(&command, limit).map_err(not_run)?;
     write(
-        &ask.record.join(format!("{phase}.launchd.txt")),
-        &state.stdout,
+        &ask.record.join(format!("{phase}.driver-wait.stdout")),
+        &ready.stdout,
     )?;
-    Ok(out)
+    write(
+        &ask.record.join(format!("{phase}.driver-wait.stderr")),
+        &ready.stderr,
+    )?;
+    let transfer = format!(
+        "result=0; cat {dir}/stdout || result=$?; cat {dir}/stderr >&2 || result=$?; exit \"$result\""
+    );
+    if !ready.status.success() {
+        let reason = not_run(format!(
+            "guest capture driver wait exited {}; see {phase}.driver-wait.stderr",
+            ready.status
+        ));
+        // A missing receipt supplies no producer verdict. Retain any available prefixes as
+        // incomplete transport evidence before the disposable guest and its files disappear.
+        return match vm.exec_output(&transfer, crate::mac::STEP) {
+            Ok(output) => retain_phase(
+                &ask.record,
+                phase,
+                script,
+                output,
+                Err(reason),
+                |_| -> Result<Value, Fail> {
+                    unreachable!("an unavailable capture cannot start optional collection")
+                },
+            ),
+            Err(_) => Err(reason),
+        };
+    }
+    write(
+        &ask.record.join(format!("{phase}.capture.json")),
+        &ready.stdout,
+    )?;
+    // Hold a parse error until raw bytes are retained. If transport fails first, an authentic
+    // observed producer failure still takes precedence over the later unavailable transfer.
+    let receipt = CaptureReceipt::parse(&ready.stdout);
+    let status = receipt.as_ref().ok().and_then(CaptureReceipt::status);
+    let out = vm
+        .exec_output(
+            &transfer,
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(crate::mac::STEP),
+        )
+        .map_err(|error| preserve_observed(status, not_run(error)))?;
+    let (out, artifacts) = retain_phase(&ask.record, phase, script, out, receipt, |out| {
+        let state = guest_bytes(
+            vm,
+            &format!(
+                "uid=$(id -u); /bin/launchctl print gui/$uid/{label} > {dir}/launchd.txt 2>&1 || true; \
+             /bin/launchctl bootout gui/$uid/{label} >/dev/null 2>&1 || true; cat {dir}/launchd.txt"
+            ),
+        )?;
+        write(&ask.record.join(format!("{phase}.launchd.txt")), &state)?;
+        collect(vm, ask, phase, &String::from_utf8_lossy(&out.stdout))
+    })?;
+    Ok((out, artifacts))
 }
 
 /// `time -lp`'s own fields, not the program's numbers. Missing resource readings stay null.
@@ -427,22 +613,24 @@ fn relative_member(path: &str) -> bool {
 fn collect(vm: &Vm, ask: &Ask, name: &str, stdout: &str) -> Result<Value, Fail> {
     let mut artifacts = aterm_json::Map::new();
     if let Some(path) = verifier_log(stdout) {
-        let log = vm.sh(&format!("cat -- {}", q(path)), crate::mac::STEP)?;
+        let log = guest_bytes(vm, &format!("cat -- {}", q(path)))?;
         let file = format!("{name}.verifier.log");
-        write(&ask.record.join(&file), log.as_bytes())?;
+        write(&ask.record.join(&file), &log)?;
         artifacts.insert("verifier_log".into(), json!(file));
     } else if matches!(ask.lane.as_str(), "measure" | "cursor") {
         return Err(not_run("guest measure named no row-level log to retain"));
     }
     if !matches!(ask.lane.as_str(), "measure" | "cursor") {
         let ledgers = perf_ledgers();
-        let listed = vm.sh(
+        let listed = guest_bytes(
+            vm,
             &format!(
                 "if [ -d {l} ]; then find {l} -type f | LC_ALL=C sort; fi",
                 l = q(&ledgers)
             ),
-            crate::mac::STEP,
         )?;
+        let listed = String::from_utf8(listed)
+            .map_err(|error| not_run(format!("guest perf listing is not UTF-8: {error}")))?;
         let files = listed
             .lines()
             .map(|f| {
@@ -452,15 +640,9 @@ fn collect(vm: &Vm, ask: &Ask, name: &str, stdout: &str) -> Result<Value, Fail> 
             .collect::<Result<Vec<_>, _>>()?;
         if !files.is_empty() {
             let args = files.iter().map(|f| q(f)).collect::<Vec<_>>().join(" ");
-            let out = vm.exec(
-                &format!("tar -C {} -cf - -- {args}", q(&ledgers)),
-                crate::mac::STEP,
-            )?;
-            if !out.status.success() {
-                return Err(not_run("guest perf records could not be archived"));
-            }
+            let archive = guest_bytes(vm, &format!("tar -C {} -cf - -- {args}", q(&ledgers)))?;
             let file = format!("{name}.records.tar");
-            write(&ask.record.join(&file), &out.stdout)?;
+            write(&ask.record.join(&file), &archive)?;
             artifacts.insert("perf_records".into(), json!(file));
         }
     }
@@ -614,7 +796,7 @@ pub(crate) fn run(args: &[String]) -> Res {
     if let Err(e) = &result {
         write_json(
             &ask.record.join("incomplete.json"),
-            &json!({"schema": "aterm-mac-runtime-v1", "complete": false, "reason": e.msg}),
+            &json!({"schema": "aterm-mac-runtime-v1", "complete": false, "exit": e.code, "reason": e.msg}),
         )?;
     }
     result
@@ -652,7 +834,7 @@ fn resolve_tools(
 
 fn run_in(ask: &Ask) -> Res {
     let repo = &paths().repo;
-    let dirty = checked("git", &["status".into(), "--porcelain".into()], repo)?;
+    let dirty = snapshot::git(repo, ["status", "--porcelain"])?;
     if !dirty.is_empty() {
         return Err(Fail::usage(
             "runtime measures committed code: commit the checkout first",
@@ -671,12 +853,8 @@ fn run_in(ask: &Ask) -> Res {
             Ok((app, sha))
         })
         .transpose()?;
-    let source = checked("git", &["rev-parse".into(), "HEAD".into()], repo)?;
-    let submodule = checked(
-        "git",
-        &["rev-parse".into(), "HEAD".into()],
-        &repo.join("vendor/astream"),
-    )?;
+    let source = snapshot::git(repo, ["rev-parse", "HEAD"])?;
+    let submodule = snapshot::astream_pin(repo, &source)?;
     let home = Path::new(&paths().real_home);
     let prefix = aterm_toolchain::atpkg_prefix(
         home,
@@ -743,21 +921,7 @@ fn run_in(ask: &Ask) -> Res {
         .map_err(|e| format!("runtime scratch: {e}"))?;
     let share = scratch.path().join("share");
     std::fs::create_dir(&share).map_err(|e| format!("share: {e}"))?;
-    for (dir, name) in [
-        (repo.clone(), "source.tar"),
-        (repo.join("vendor/astream"), "astream.tar"),
-    ] {
-        checked(
-            "git",
-            &[
-                "archive".into(),
-                "--format=tar".into(),
-                format!("--output={}", share.join(name).display()),
-                "HEAD".into(),
-            ],
-            &dir,
-        )?;
-    }
+    snapshot::archive(repo, &source, &submodule, &share)?;
     checked(
         "/usr/bin/tar",
         &[
@@ -842,11 +1006,12 @@ fn run_in(ask: &Ask) -> Res {
     let mut setup = format!(
         "set -eu; test \"$HOME\" = /Users//admin; mkdir -p {ROOT}/source {ROOT}/toolchain {ROOT}/tmp; \
         tar -xf {share}/source.tar -C {ROOT}/source; \
-        tar -xf {share}/astream.tar -C {ROOT}/source/vendor/astream; \
         tar -xf {share}/toolchain.tar -C {ROOT}/toolchain; \
         ditto -x -k {share}/app.zip {ROOT}/unpack; \
         mv {ROOT}/unpack/{app_name} {ROOT}/aterm.app; \
-        {env} git init -q; git add .; git -c user.name='Andrew Yates' -c user.email='lab@localhost' commit -qm 'Q4 snapshot {source}'; \
+        {env} test \"$(git rev-parse HEAD)\" = {source}; \
+        test \"$(git rev-parse HEAD:vendor/astream)\" = {submodule}; \
+        test \"$(git -C vendor/astream rev-parse HEAD)\" = {submodule}; \
         test \"$(shasum -a 256 {ROOT}/aterm.app/Contents/MacOS/aterm | cut -d ' ' -f 1)\" = {app_sha}; \
         {ROOT}/toolchain/bin/trustc -Vv; \
         {ROOT}/toolchain/bin/targo --config {build_dir_config} --unverified build -p aterm-verify; ",
@@ -856,6 +1021,8 @@ fn run_in(ask: &Ask) -> Res {
             .and_then(|n| n.to_str())
             .ok_or_else(|| Fail::usage("bundle name is not UTF-8"))?),
         env = environment(admitted.jobs),
+        source = q(&source),
+        submodule = q(&submodule),
         build_dir_config = q(&format!(
             "build.build-dir='{}'",
             aterm_toolchain::build_cache::target_build_path(Path::new(&format!(
@@ -874,7 +1041,7 @@ fn run_in(ask: &Ask) -> Res {
             sha=q(sha),
         ));
     }
-    let setup_out = vm.exec(&setup, BUILD)?;
+    let setup_out = vm.exec_output(&setup, BUILD).map_err(not_run)?;
     write(&ask.record.join("setup.stdout"), &setup_out.stdout)?;
     write(&ask.record.join("setup.stderr"), &setup_out.stderr)?;
     if !setup_out.status.success() {
@@ -889,7 +1056,7 @@ fn run_in(ask: &Ask) -> Res {
         environment(admitted.jobs)
     );
     if matches!(ask.lane.as_str(), "measure" | "cursor") {
-        let out = vm.exec(&prebuild, BUILD)?;
+        let out = vm.exec_output(&prebuild, BUILD).map_err(not_run)?;
         write(&ask.record.join("prebuild.stdout"), &out.stdout)?;
         write(&ask.record.join("prebuild.stderr"), &out.stderr)?;
         if !out.status.success() {
@@ -900,7 +1067,7 @@ fn run_in(ask: &Ask) -> Res {
     }
     let focused = matches!(ask.lane.as_str(), "rewind" | "rewind-control");
     let command = if focused {
-        let out = vm.exec(&format!("{} {ROOT}/toolchain/bin/targo --unverified bench --profile test -p aterm-conformance --bench rewind --no-run --message-format=json", environment(admitted.jobs)), BUILD)?;
+        let out = vm.exec_output(&format!("{} {ROOT}/toolchain/bin/targo --unverified bench --profile test -p aterm-conformance --bench rewind --no-run --message-format=json", environment(admitted.jobs)), BUILD).map_err(not_run)?;
         write(&ask.record.join("prebuild.stdout"), &out.stdout)?;
         write(&ask.record.join("prebuild.stderr"), &out.stderr)?;
         if !out.status.success() {
@@ -943,10 +1110,8 @@ fn run_in(ask: &Ask) -> Res {
         } else {
             "warmup".into()
         };
-        let warm = app_exec(&vm, ask, &name, &arm_command(&untimed, arm), BUILD)?;
-        write(&ask.record.join(format!("{name}.stdout")), &warm.stdout)?;
-        write(&ask.record.join(format!("{name}.stderr")), &warm.stderr)?;
-        let artifacts = collect(&vm, ask, &name, &String::from_utf8_lossy(&warm.stdout))?;
+        let (warm, artifacts) = app_exec(&vm, ask, &name, &arm_command(&untimed, arm), BUILD)
+            .map_err(|error| preserve_failure(&codes, error))?;
         let row = json!({"arm": arm, "exit": warm.status.code(), "success": warm.status.success(), "artifacts": artifacts});
         write_json(&ask.record.join(format!("{name}.json")), &row)?;
         warmups.push(row);
@@ -976,14 +1141,19 @@ fn run_in(ask: &Ask) -> Res {
             "mac runtime: {} take {take}/{TAKES} {arm}, bundle {sha}",
             ask.lane
         );
+        write_json(
+            &ask.record.join(format!("{name}.context.json")),
+            &json!({"take":take, "arm":arm, "bundle_sha256":sha, "command":selected}),
+        )?;
         let (out, loads) = sampled(|| app_exec(&vm, ask, &name, &selected, TAKE));
-        let out = out?;
+        write_json(
+            &ask.record.join(format!("{name}.host-load.json")),
+            &json!({"host_load_samples":loads, "host_max_load_1m":max_load(&loads)}),
+        )?;
+        let (out, artifacts) = out.map_err(|error| preserve_failure(&codes, error))?;
         codes.push(out.status.code());
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let artifacts = collect(&vm, ask, &name, &stdout)?;
-        write(&ask.record.join(format!("{name}.stdout")), &out.stdout)?;
-        write(&ask.record.join(format!("{name}.stderr")), &out.stderr)?;
         let resource = usage(&stderr);
         if let Some(n) = resource["real"].as_f64() {
             real.push(n);

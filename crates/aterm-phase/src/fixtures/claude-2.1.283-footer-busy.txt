@@ -6,7 +6,7 @@
 
 
 ⏺ agents-md: no CLAUDE.md found; AGENTS.md loaded:
-  /Users//user00/aterm/AGENTS.md
+  /Users/_user0/aterm/AGENTS.md
 
 ❯ Count from 1 to 30, one number per line, nothing else.
 

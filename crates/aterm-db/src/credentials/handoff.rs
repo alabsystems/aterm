@@ -146,7 +146,7 @@ impl Round<'_> {
                 let mut best: Option<(Digest, [u8; 16])> = None;
                 for (operation, command) in eligible {
                     if operation.header.actor != self.peer
-                        || self.owner.offered_before(&operation.header.id)
+                        || self.owner.offer_in_flight(&operation.header.id)
                         || inert_ids.contains(&operation.header.id)
                         || !command.changes().is_some_and(
                             |changes| matches!(changes, [change] if change.collection == "offer"),
@@ -200,6 +200,7 @@ pub(crate) fn exchange(
     local: Actor,
     peer: Actor,
     side: Side,
+    bidirectional: bool,
     stream: &mut (impl Read + Write),
 ) -> Result<usize> {
     let round = Round {
@@ -210,10 +211,18 @@ pub(crate) fn exchange(
         local,
         peer,
     };
-    match side {
+    let first = match side {
         Side::Initiator => take(&round, stream),
         Side::Responder => give(&round, stream),
+    }?;
+    if !bidirectional {
+        return Ok(first);
     }
+    let second = match side {
+        Side::Initiator => give(&round, stream),
+        Side::Responder => take(&round, stream),
+    }?;
+    Ok(first + second)
 }
 
 fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
@@ -233,10 +242,10 @@ fn take(round: &Round<'_>, stream: &mut (impl Read + Write)) -> Result<usize> {
             "the vault signer changed before credential custody",
         ));
     }
-    if !round.owner.try_offer(offer) {
+    let Some(_offer) = round.owner.try_offer(offer) else {
         send(stream, b"AQN1")?;
         return Ok(0);
-    }
+    };
     let started = Instant::now();
     let nonce = crate::crypto::random::<32>()?;
     let mut hello = [0u8; 100];

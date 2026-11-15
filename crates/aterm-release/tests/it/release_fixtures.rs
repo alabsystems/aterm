@@ -1591,19 +1591,35 @@ fn an_unproven_main_recorder_is_held_before_another_compile() {
     );
 }
 
-impl GitRunner for Raced<'_> {
-    fn git(&self, args: &[&str]) -> crate::ledger::Result<RunOut> {
+impl Raced<'_> {
+    fn local(args: &[&str]) {
         assert!(
             !args
                 .iter()
                 .any(|word| matches!(*word, "fetch" | "push" | "ls-remote")),
             "fixture landing must use typed Origin: {args:?}"
         );
+    }
+}
+
+impl GitRunner for Raced<'_> {
+    fn git(&self, args: &[&str]) -> crate::ledger::Result<RunOut> {
+        Self::local(args);
         self.inner.git(args)
+    }
+
+    fn git_read(&self, args: &[&str]) -> crate::ledger::Result<RunOut> {
+        Self::local(args);
+        self.inner.git_read(args)
     }
 
     fn git_input(&self, args: &[&str], input: &[u8]) -> crate::ledger::Result<RunOut> {
         self.inner.git_input(args, input)
+    }
+
+    fn git_read_input(&self, args: &[&str], input: &[u8]) -> crate::ledger::Result<RunOut> {
+        Self::local(args);
+        self.inner.git_read_input(args, input)
     }
 }
 

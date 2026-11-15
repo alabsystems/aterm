@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use crate::testrun::{Binary, Passed};
+use crate::testrun::Binary;
 
 const LONG: Duration = Duration::from_secs(120);
 
@@ -73,44 +73,25 @@ fn split(binary: &Binary, prefix: &str) -> [Binary; 2] {
     [selected, rest]
 }
 
-fn spec_boundary<'a>(spec: &'a str, parent: &str) -> Option<&'a str> {
-    let suffix = spec.strip_prefix(parent)?.strip_prefix(" -- ")?;
-    let prefix = suffix.strip_prefix("--skip ").unwrap_or(suffix);
-    valid(prefix).then_some(prefix)
-}
-
-/// Use a prior hop's boundary first, preserving its commands for carry. Otherwise use the
-/// latest learned boundary. Unknown case times, custom harnesses and caller filters keep the
-/// original invocation. Nothing runs, and no observation grants a verdict.
-pub(crate) fn expand(
-    binaries: Vec<Binary>,
-    history: &crate::test_history::History,
-    passed: Option<&Passed>,
-) -> Vec<Binary> {
+/// Use the latest learned boundary. Unknown case times, custom harnesses and caller filters keep
+/// the original invocation. Nothing runs, and no observation grants a verdict.
+pub(crate) fn expand(binaries: Vec<Binary>, history: &crate::test_history::History) -> Vec<Binary> {
     let mut expanded = Vec::new();
     for binary in binaries {
         let long = history
             .seen(&binary.spec)
             .is_some_and(|seen| seen.wall >= LONG);
         if long && binary.harness && binary.record.argv.len() == 1 {
-            let prefix = passed
-                .and_then(|passed| {
-                    passed
-                        .keys()
-                        .find_map(|spec| spec_boundary(spec, &binary.spec))
-                })
-                .or_else(|| {
-                    history
-                        .row(&binary.spec)?
-                        .samples
-                        .iter()
-                        .rev()
-                        .filter_map(|sample| sample.partition.as_deref())
-                        .find(|prefix| valid(prefix))
-                });
+            let prefix = history.row(&binary.spec).and_then(|row| {
+                row.samples
+                    .iter()
+                    .rev()
+                    .filter_map(|sample| sample.partition.as_deref())
+                    .find(|prefix| valid(prefix))
+            });
             if let Some(prefix) = prefix {
                 let halves = split(&binary, prefix);
-                // Events and carry identify the exact rerun spec; never introduce a clipped key.
+                // Events identify the exact rerun spec; never introduce a clipped key.
                 if halves.iter().any(|half| {
                     half.spec
                         .chars()

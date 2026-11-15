@@ -266,7 +266,7 @@ pub(super) fn configuration_binding(config: &Config) -> [u8; 32] {
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "DbVaultNetworkMaterializationAdmission",
-        action = "PendingApply",
+        action = "UnselectedApply",
         project = "aterm_secrets::client::network_observation::conformance_tests::admission_transition"
     )
 )]
@@ -298,7 +298,7 @@ pub(super) fn configuration_binding(config: &Config) -> [u8; 32] {
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "DbVaultNetworkMaterializationAdmission",
-        action = "FileMissing",
+        action = "StaleSelection",
         project = "aterm_secrets::client::network_observation::conformance_tests::admission_transition"
     )
 )]
@@ -306,7 +306,7 @@ pub(super) fn configuration_binding(config: &Config) -> [u8; 32] {
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "DbVaultNetworkMaterializationAdmission",
-        action = "FileChanged",
+        action = "CacheChanged",
         project = "aterm_secrets::client::network_observation::conformance_tests::admission_transition"
     )
 )]
@@ -364,8 +364,7 @@ pub(super) fn record(
         || !pin_admitted(config, None)
         || state.membership != Stored::In
         || state.failed
-        || !state.pending.is_empty()
-        || state.own.is_none()
+        || state.held.is_none()
         || !source_bound(config, state)
         || state.seq != envelope.seq
         || state.digest != Some(body.digest)
@@ -377,7 +376,7 @@ pub(super) fn record(
             .map(|key| key.recipient().0)
             != Some(body.attempt.recipient)
         || steward::local_recipient_denied_in_roster_held(paths, lock)
-        || !files_intact(paths, state)
+        || !applied_intact(paths, state)
     {
         return false;
     }

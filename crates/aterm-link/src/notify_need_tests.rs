@@ -6,7 +6,7 @@ use aterm_slog::{
     Actor, Close, Conf, Fields, Kind, Log, Mark, Node, Open, Out, RunOut, Src, Stamp, Tier,
 };
 
-const FACE: &str = "/f/f1/pub/n-a/s-x/ev";
+const FACE: &str = "/f/f1/pub/n-a/tx000000000/ev";
 
 fn mirrored(log: &mut Log) -> Vec<String> {
     mirrored_at(log, Stamp::new(9, 9))
@@ -889,18 +889,18 @@ fn a_watchs_live_marks_go_with_their_space_and_their_session() {
     );
     for i in 0..fabric_brief::SESSIONS_MAX {
         off += 1;
-        let face = format!("/f/f1/pub/n-b/s-{i}/ev");
+        let face = format!("/f/f1/pub/n-b/t{i:010}/ev");
         watch.step(off, &face, start[0].as_bytes());
     }
     assert!(
         !watch
             .read
             .sessions
-            .contains_key(&("n-a".into(), "s-x".into())),
+            .contains_key(&("n-a".into(), "tx000000000".into())),
         "PRECONDITION: the stalest session was evicted"
     );
     off += 1;
-    watch.step(off, "/f/f1/pub/n-b/s-last/ev", start[0].as_bytes());
+    watch.step(off, "/f/f1/pub/n-b/t1ast000000/ev", start[0].as_bytes());
     assert_eq!(
         watch.live_eps().len(),
         fabric_brief::SESSIONS_MAX,

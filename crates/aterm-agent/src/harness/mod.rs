@@ -3,13 +3,9 @@
 
 //! The harness core: the pure judgments behind the aterm wrapper (`docs/DESIGN-aterm-wrapper-2026-09-17.md`) and the read verbs over them.
 
-/// [`upgrade::HARNESS_MARK`] as a literal for `concat!`: every turn the harness types into an agent's conversation begins with it.
-macro_rules! harness_mark {
-    () => {
-        "[aterm harness]"
-    };
-}
-pub(crate) use harness_mark;
+/// [`upgrade::HARNESS_MARK`] as a literal for `concat!` (`alab_policy::mark`): every turn the
+/// harness types into an agent's conversation begins with it.
+pub(crate) use alab_policy::mark as harness_mark;
 
 mod account_backfill;
 pub mod account_card;
@@ -59,8 +55,6 @@ pub mod claims;
 #[cfg(unix)]
 pub mod claude_homes;
 pub mod claude_model;
-#[cfg(unix)]
-mod claude_oauth_vault;
 pub mod cli;
 mod codex_account_custody;
 pub mod codex_alab;
@@ -71,6 +65,7 @@ pub mod codex_enrollment;
 pub mod codex_exec_handoff;
 pub mod codex_facts;
 mod codex_grant_owner;
+pub mod codex_login_rotation;
 mod codex_native_retirement;
 mod codex_native_row;
 pub mod codex_renewal;
@@ -189,6 +184,9 @@ pub mod timings;
 /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.3).
 pub mod token_route;
 pub mod token_state;
+/// A token step that a check stopped, held with no clock (plan package FL-136).
+#[cfg(unix)]
+pub mod token_steps;
 pub use timings::Timings;
 pub(crate) mod transcript;
 pub use transcript::{claude_reads, codex_reads};

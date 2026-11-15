@@ -697,3 +697,458 @@ fn passed_sockets_read_what_arrives_after_the_pass_every_time() {
         assert_eq!((&buf[..n], from), (&b"ping"[..], at), "UDP round {round}");
     }
 }
+
+fn counts_clock() -> u64 {
+    static NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NOW.fetch_add(1000, std::sync::atomic::Ordering::Relaxed) + 1000
+}
+
+fn counts_cpu() -> u64 {
+    7
+}
+
+/// The law of the broker's counts: each connection the accept loop takes is counted once, each
+/// full check where it is called, each requesting process by its whole token with what its
+/// check said, each request by its kind, each name resolution's thread and each connection by
+/// the one way it ended; and the counts file is written when they are due, after the connection
+/// they were due at was handed on, holding counts and pids and nothing a request carried.
+///
+/// The connections are real ones to a served socket, taken by the production accept loop's turn
+/// ([`Server::step`]) and served by the production connection path on this thread where that
+/// turn hands them on, so every count is in before it is read. Admission is
+/// [`Admission::Scripted`]: the token and the verdict are the script's, the path that counts
+/// them the one [`Admission::Code`] takes (which
+/// `a_connection_admitted_by_code_is_counted_with_its_check` drives with a real check). Not
+/// driven here: `no_thread` (no thread could be started), `hello_unsent` (a peer gone before
+/// the hello), and the CPU totals, which are clocks' readings.
+///
+/// Negative controls: delete `counts.add(Count::ChecksRun)` in `full_check` (`checks_run` reads
+/// 0, wants 22); return `Count::ClosedUnsaid` for the hello alone (`hello_only` reads 0, wants
+/// 2); delete `shared.counts.add(ended)` in `connection_clock` (every ending reads 0); write
+/// the counts before the hand-off in `Server::step` (the file's previous snapshot reads
+/// `checks_run` 7, wants 8); resolve a `Resolve` request's name with `here::resolve` (the
+/// resolutions' threads counted read 0, wants 5).
+#[test]
+fn the_broker_counts_each_connection_once_by_how_it_ended() {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use aterm_keeper::identity::CheckError;
+    use aterm_uds::lan::wire::{self, Frame};
+    use aterm_uds::peer::AuditToken;
+
+    use crate::counts::{Count, Sink};
+    use crate::server::{Scripted, connection_at};
+
+    let token = |pid: u32, version: u32| AuditToken([0, 501, 20, 501, 20, pid, 0, version]);
+    let (first, exec, second) = (token(500, 1), token(500, 2), token(600, 1));
+    let (refused, unchecked, unanswered) = (token(900, 1), token(901, 1), token(902, 1));
+    // The token the kernel is said to give each connection, in the order they are served.
+    let tokens: Arc<Mutex<VecDeque<Option<AuditToken>>>> = Arc::default();
+    let said = Arc::clone(&tokens);
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let socket = root.path().join("run").join("broker.sock");
+    let (started, starts) = mpsc::channel();
+    let served_under = loopback_local();
+    let mut server = seam_here(served_under.clone(), || {
+        Server::bind(
+            &socket,
+            Admission::Scripted(Scripted {
+                token: Box::new(move |_| said.lock().unwrap().pop_front().unwrap()),
+                full_check: Box::new(|token| match token.map(|token| token.pid()) {
+                    Some(900) => Err(CheckError::Refused("scripted".into())),
+                    Some(901) => Err(CheckError::Unchecked("scripted".into())),
+                    Some(902) => Err(CheckError::Unanswered("scripted".into())),
+                    _ => Ok(()),
+                }),
+            }),
+            Box::new(Fake(Mutex::new(started))),
+        )
+        .unwrap()
+    });
+    server.sink = Sink::beside_with(&socket, counts_clock, counts_cpu);
+    let client_seam = Seam {
+        socket: Some(socket.clone()),
+        ..served_under.clone()
+    };
+
+    // One turn of the accept loop: the one connection waiting is served here, where the turn
+    // hands it on, as the process `token` names.
+    let serve_one = |server: &mut Server, token: Option<AuditToken>| {
+        tokens.lock().unwrap().push_back(token);
+        let mut served = false;
+        server
+            .step(|shared, stream| {
+                seam_here(served_under.clone(), || {
+                    connection_at(shared, &stream, std::time::Instant::now());
+                });
+                shared.live.fetch_sub(1, Ordering::AcqRel);
+                served = true;
+            })
+            .unwrap();
+        assert!(served, "the broker was not serving its most");
+    };
+    // A real client's one call, on a thread of its own, served here.
+    fn client<T: Send + 'static>(
+        seam: &Seam,
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> std::thread::JoinHandle<T> {
+        let seam = seam.clone();
+        std::thread::spawn(move || seam_here(seam, call))
+    }
+    // A client that writes `bytes` and stays open, its writing end closed: served here.
+    let raw = |bytes: &[u8]| {
+        let mut raw =
+            aterm_uds::connect::until(&socket, std::time::Instant::now() + MUST_HAPPEN).unwrap();
+        raw.write_all(bytes).unwrap();
+        raw.shutdown(std::net::Shutdown::Write).unwrap();
+        raw
+    };
+    let hello = |protocol: u32| {
+        wire::encode(&Frame::Hello {
+            protocol,
+            build: "law".into(),
+        })
+        .unwrap()
+    };
+    let resolve = wire::encode(&Frame::Request(Request::Resolve {
+        name: "localhost".into(),
+        within_ms: 1000,
+    }))
+    .unwrap();
+    let ours = aterm_uds::lan::PROTOCOL;
+
+    // 1 to 5: five resolves from one process.
+    for _ in 0..5 {
+        let asked = client(&client_seam, || broker::resolve("localhost", MUST_HAPPEN));
+        serve_one(&mut server, Some(first));
+        asked.join().unwrap().unwrap();
+    }
+    // 6 to 8: three connects from another.
+    let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = target.local_addr().unwrap();
+    for _ in 0..3 {
+        let asked = client(&client_seam, move || {
+            broker::connect(
+                &Target::Addr(addr),
+                addr.port(),
+                MUST_HAPPEN,
+                ConnectOptions::default(),
+            )
+        });
+        serve_one(&mut server, Some(second));
+        asked.join().unwrap().unwrap();
+    }
+    // 9 and 10: a hello alone from the first process, then from its pid after an exec.
+    for token in [first, exec] {
+        let asked = client(&client_seam, broker::hello);
+        serve_one(&mut server, Some(token));
+        asked.join().unwrap().unwrap();
+    }
+    // 11 to 13: one refused, one that could not be checked, one trustd did not answer.
+    for token in [refused, unchecked, unanswered] {
+        let asked = client(&client_seam, broker::hello);
+        serve_one(&mut server, Some(token));
+        let told = asked.join().unwrap().unwrap_err();
+        assert_eq!(
+            matches!(told, LanError::Unavailable(Unavailable::Refused(_))),
+            token == refused,
+            "{told:?}"
+        );
+    }
+    // 14 to 20: the endings a well-behaved client never makes, from clients the kernel gave no
+    // token for.
+    let mut held = Vec::new();
+    // Another protocol.
+    held.push(raw(&hello(ours + 1)));
+    serve_one(&mut server, None);
+    // A first frame that is no hello.
+    held.push(raw(&resolve));
+    serve_one(&mut server, None);
+    // A hello that cannot be read: a frame longer than any.
+    let oversized = u32::try_from(wire::MAX_FRAME + 1).unwrap().to_be_bytes();
+    held.push(raw(&oversized));
+    serve_one(&mut server, None);
+    // Closed before its hello.
+    held.push(raw(&[]));
+    serve_one(&mut server, None);
+    // A second hello where the request belongs.
+    held.push(raw(&[hello(ours), hello(ours)].concat()));
+    serve_one(&mut server, None);
+    // A request that cannot be read: closed inside its frame.
+    held.push(raw(
+        &[&hello(ours)[..], &resolve[..resolve.len() - 1]].concat()
+    ));
+    serve_one(&mut server, None);
+    // A byte past the one request.
+    held.push(raw(&[&hello(ours)[..], &resolve[..], b"x"].concat()));
+    serve_one(&mut server, None);
+    // 21: a request that fails (a name off the local network).
+    let asked = client(&client_seam, || broker::resolve("example.com", MUST_HAPPEN));
+    serve_one(&mut server, None);
+    asked.join().unwrap().unwrap_err();
+    // 22: one more than the broker serves at once.
+    server.shared.live.fetch_add(MAX_LIVE, Ordering::AcqRel);
+    let asked = client(&client_seam, broker::hello);
+    server
+        .step(|_, _| panic!("one more than the most is handed on"))
+        .unwrap();
+    assert!(matches!(
+        asked.join().unwrap().unwrap_err(),
+        LanError::Unavailable(Unavailable::Unchecked(_))
+    ));
+    server.shared.live.fetch_sub(MAX_LIVE, Ordering::AcqRel);
+    // 23: a standing browse that hears one instance, then its client goes.
+    let asked = client(&client_seam, move || {
+        let mut events = broker::browse("_alab._tcp", "").unwrap();
+        let mut started = starts.recv_timeout(MUST_HAPPEN).unwrap();
+        started.hear(Event::Added(Instance {
+            name: "m11".into(),
+            service: "_alab._tcp.".into(),
+            domain: "local.".into(),
+            interface: 4,
+        }));
+        events.next_within(MUST_HAPPEN).unwrap().unwrap();
+        // The client goes as this thread ends; the fake's operation is handed back, so the
+        // drive ends on the client's hang-up and never on the fake's.
+        started
+    });
+    serve_one(&mut server, Some(second));
+    let _started = asked.join().unwrap();
+    drop(held);
+
+    let counts = &server.shared.counts;
+    let read: Vec<(&str, u64)> = Count::ALL
+        .into_iter()
+        .map(|what| (what.name(), counts.get(what)))
+        .filter(|(_, n)| *n != 0)
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("accepted", 23),
+            ("busy", 1),
+            ("checks_run", 22),
+            ("new_requesters", 6),
+            ("refused", 1),
+            ("unchecked", 1),
+            ("unanswered", 1),
+            ("admitted", 19),
+            ("closed_unsaid", 1),
+            ("wrong_protocol", 1),
+            ("wrong_first_frame", 1),
+            ("read_error", 2),
+            ("hello_only", 2),
+            ("wrong_request_frame", 1),
+            ("trailing_bytes", 1),
+            ("connect", 3),
+            ("resolve", 6),
+            ("browse", 1),
+            ("answered", 9),
+            ("failed", 1),
+        ]
+    );
+    let listed = |pid, connections, admitted, since_accepted| crate::counts::Listed {
+        pid,
+        connections,
+        admitted,
+        since_accepted,
+    };
+    assert_eq!(
+        counts.requesters(),
+        [
+            listed(500, 6, 6, 1),
+            listed(600, 4, 4, 6),
+            listed(500, 1, 1, 10),
+            listed(900, 1, 0, 11),
+            listed(901, 1, 0, 12),
+            listed(902, 1, 0, 13),
+        ]
+    );
+    // The five resolves of a name each ran on a thread of their own, counted as its lookup
+    // returned; the name off the local network was never looked up.
+    assert_eq!(counts.resolve_threads.ended.load(Ordering::Relaxed), 5);
+
+    // The file was last written at the 16th connection, once that one was handed on and (here)
+    // served: its previous snapshot is the 8th's, a second of the scripted clock earlier.
+    let file = std::fs::read_to_string(socket.with_file_name(aterm_uds::lan::COUNTS_NAME)).unwrap();
+    let lines: Vec<&str> = file.lines().collect();
+    let field = |line: &str, name: &str| -> u64 {
+        line.split(' ')
+            .find_map(|field| field.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no {name} in {line}"))
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(lines[0], crate::counts::HEAD);
+    assert_eq!(lines[1], "previous");
+    assert_eq!(field(lines[2], "accepted"), 8);
+    assert_eq!(field(lines[2], "checks_run"), 8);
+    let current = lines.iter().position(|line| *line == "current").unwrap();
+    assert_eq!(field(lines[current + 1], "accepted"), 16);
+    assert_eq!(field(lines[current + 1], "checks_run"), 16);
+    assert_eq!(field(lines[current + 1], "wrong_first_frame"), 1);
+    assert_eq!(field(lines[current + 1], "resolve_threads"), 5);
+    assert_eq!(field(lines[current + 1], "process_cpu_ns"), 7);
+    assert_eq!(
+        field(lines[current + 1], "at_ms") - field(lines[2], "at_ms"),
+        1000
+    );
+    assert_eq!(
+        lines[current + 2..],
+        [
+            "requester pid=500 connections=6 admitted=6 since_accepted=1",
+            "requester pid=600 connections=3 admitted=3 since_accepted=6",
+            "requester pid=500 connections=1 admitted=1 since_accepted=10",
+            "requester pid=900 connections=1 admitted=0 since_accepted=11",
+            "requester pid=901 connections=1 admitted=0 since_accepted=12",
+            "requester pid=902 connections=1 admitted=0 since_accepted=13",
+        ]
+    );
+    // Counts and pids only: every word is a bare word or a name and a number.
+    for word in file.split_whitespace() {
+        let numbered = word
+            .split_once('=')
+            .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let bare = word.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') || word == "1";
+        assert!(numbered || bare, "{word:?} in the counts file");
+    }
+}
+
+/// A standing operation's thread may never end, so [`crate::bonjour::drive`] says each time the
+/// operation heard something, which is where the accept loop's thread adds its CPU time: once
+/// for each batch heard, before the batch is sent.
+///
+/// Negative control: delete `heard();` in `drive` (reads 0, wants 1).
+#[test]
+fn a_standing_operation_says_each_time_it_heard() {
+    use aterm_uds::lan::wire::{Frame, Reader};
+    let (started, starts) = mpsc::channel();
+    let fake = Fake(Mutex::new(started));
+    let mut live = fake
+        .start(&Request::Browse {
+            service: "_alab._tcp".into(),
+            domain: String::new(),
+        })
+        .unwrap();
+    let mut started = starts.recv_timeout(MUST_HAPPEN).unwrap();
+    let (client, server) = CtlStream::pair().unwrap();
+    let heard = Instance {
+        name: "m11".into(),
+        service: "_alab._tcp.".into(),
+        domain: "local.".into(),
+        interface: 4,
+    };
+    started.hear(Event::Added(heard.clone()));
+    // The client reads the one event and goes, which ends the drive.
+    let reads = std::thread::spawn(move || {
+        let mut reader = Reader::new(0);
+        let deadline = Some(std::time::Instant::now() + MUST_HAPPEN);
+        reader.frame(&client, deadline).unwrap()
+    });
+    let mut times = 0;
+    crate::bonjour::drive(&server, live.as_mut(), &mut || times += 1).unwrap();
+    assert_eq!(
+        reads.join().unwrap(),
+        Some(Frame::Event(Event::Added(heard)))
+    );
+    assert_eq!(times, 1);
+}
+
+/// The live law of the broker's own admission ([`Admission::Code`], what `aterm lan serve`
+/// admits by): a real connection from this process, taken by the accept loop's turn and served
+/// by the production connection path, is admitted by a real check of this process's code
+/// against this image's own requirement (macOS's `SecCodeCopyGuestWithAttributes` and
+/// `SecCodeCheckValidity`), and is counted as one call of the full check, one check whose
+/// helper returned, and one connection of one requester, this pid. The first connection's
+/// counts are in the file the turn writes. It counts; `check_cpu_ns` is a clock's reading and
+/// is asserted nowhere.
+///
+/// Negative control: have the `Code` arm of `Admission::check` call `identity.check_named`
+/// (the check runs and admits, its cost counted nowhere: `checks_returned` reads 0, wants 1).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_connection_admitted_by_code_is_counted_with_its_check() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use aterm_keeper::identity::{Identity, IdentityPolicy};
+
+    use crate::counts::{Count, Listed};
+    use crate::server::connection_at;
+
+    aterm_uds::deadline::require_trust_service();
+    let identity = Identity::for_self(IdentityPolicy::Designated)
+        .expect("own requirement")
+        .regardless_of_uid();
+    let root = aterm_tempfile::tempdir().unwrap();
+    let socket = root.path().join("run").join("broker.sock");
+    let (started, _starts) = mpsc::channel();
+    let served_under = loopback_local();
+    let mut server = seam_here(served_under.clone(), || {
+        Server::bind(
+            &socket,
+            Admission::Code(Arc::new(identity)),
+            Box::new(Fake(Mutex::new(started))),
+        )
+        .unwrap()
+    });
+    let client_seam = Seam {
+        socket: Some(socket.clone()),
+        ..served_under.clone()
+    };
+    let asked = std::thread::spawn(move || seam_here(client_seam, broker::hello));
+    server
+        .step(|shared, stream| {
+            seam_here(served_under.clone(), || {
+                connection_at(shared, &stream, std::time::Instant::now());
+            });
+            shared.live.fetch_sub(1, Ordering::AcqRel);
+        })
+        .unwrap();
+    asked
+        .join()
+        .unwrap()
+        .expect("the broker admits this process's own code");
+
+    let counts = &server.shared.counts;
+    let read: Vec<(&str, u64)> = Count::ALL
+        .into_iter()
+        .map(|what| (what.name(), counts.get(what)))
+        .filter(|(_, n)| *n != 0)
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("accepted", 1),
+            ("checks_run", 1),
+            ("new_requesters", 1),
+            ("admitted", 1),
+            ("hello_only", 1),
+        ]
+    );
+    assert_eq!(counts.check_cost.checks.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        counts.requesters(),
+        [Listed {
+            pid: std::process::id(),
+            connections: 1,
+            admitted: 1,
+            since_accepted: 1,
+        }]
+    );
+    let file = std::fs::read_to_string(socket.with_file_name(aterm_uds::lan::COUNTS_NAME)).unwrap();
+    assert!(
+        file.contains(" checks_run=1 ") && file.contains(" checks_returned=1 "),
+        "{file}"
+    );
+    assert!(
+        file.contains(&format!(
+            "requester pid={} connections=1 admitted=1 since_accepted=1",
+            std::process::id()
+        )),
+        "{file}"
+    );
+}

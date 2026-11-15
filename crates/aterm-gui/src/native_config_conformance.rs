@@ -762,6 +762,7 @@ fn installed_custom_kitty_projection(
                 geom,
                 cursor,
                 look: aterm_effects::kitty_registry::KittyLook::default(),
+                body: aterm_effects::kitty_cursor::CursorBody::Head,
                 colors: aterm_effects::cat_baker::CatColorKey::default(),
                 bob: 0.0,
                 lift: 0.0,

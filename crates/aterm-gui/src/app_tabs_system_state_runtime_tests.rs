@@ -185,7 +185,7 @@ fn system_state_opens_from_control_reuses_singleton_and_reopens_without_pty_chur
         .unwrap();
     assert_eq!(descriptor, crate::restore::NativeTabRestore::SystemState);
     app.close_active_native_tab(wid).unwrap();
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     let reopened = app.active_native_view(wid).unwrap();
     assert_ne!(original, reopened, "closed runtime identities are retired");
     assert_eq!(
@@ -252,7 +252,7 @@ fn system_state_restore_mints_a_view_and_shares_the_existing_controller() {
         },
         0,
     );
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     let reopened = app.active_native_view(wid).unwrap();
     assert_eq!(
         existing.0, reopened.0,

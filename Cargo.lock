@@ -18,6 +18,7 @@ dependencies = [
  "aterm-json",
  "aterm-models-agh",
  "aterm-regex",
+ "aterm-secrets",
  "aterm-serde",
  "aterm-spec",
  "aterm-spec-anchor",
@@ -40,6 +41,10 @@ dependencies = [
  "aterm-tempfile",
  "aterm-uds",
 ]
+
+[[package]]
+name = "alab-policy"
+version = "0.0.0"
 
 [[package]]
 name = "amacs"
@@ -65,6 +70,7 @@ dependencies = [
  "astream-wire",
  "aterm-buffer",
  "aterm-cap",
+ "aterm-cores",
  "aterm-digest",
  "aterm-dirfd",
  "aterm-durable",
@@ -151,15 +157,17 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.201.0"
+version = "0.202.0"
 dependencies = [
  "agh",
+ "alab-policy",
  "astream-broker",
  "astream-cap",
  "astream-wire",
  "aterm-acaffeine",
  "aterm-agent",
  "aterm-aos-pane",
+ "aterm-bench",
  "aterm-capacity",
  "aterm-cli",
  "aterm-codec",
@@ -257,6 +265,7 @@ name = "aterm-agent"
 version = "0.0.0"
 dependencies = [
  "agh-fake",
+ "alab-policy",
  "astream-effects",
  "astream-sys",
  "astream-wire",
@@ -326,6 +335,7 @@ version = "0.0.0"
 dependencies = [
  "astream-wire",
  "aterm-digest",
+ "aterm-heap-count",
  "aterm-models-aos",
  "aterm-spec",
 ]
@@ -442,6 +452,7 @@ dependencies = [
  "aterm-vitals",
  "libc",
  "trust-build-cpu",
+ "trust-exec-policy",
  "trust-resource-provenance",
 ]
 
@@ -454,7 +465,6 @@ dependencies = [
  "aterm-digest",
  "aterm-hash",
  "aterm-regex",
- "aterm-stamp",
  "aterm-tempfile",
  "aterm-zstd",
 ]
@@ -570,6 +580,7 @@ dependencies = [
  "aterm-json",
  "aterm-serde",
  "aterm-tempfile",
+ "aterm-uds",
  "libc",
 ]
 
@@ -889,6 +900,7 @@ dependencies = [
 name = "aterm-gui"
 version = "0.0.0"
 dependencies = [
+ "alab-policy",
  "amacs",
  "amacs-files",
  "astream-broker",
@@ -904,6 +916,7 @@ dependencies = [
  "aterm-capacity",
  "aterm-cg",
  "aterm-codec",
+ "aterm-conformance",
  "aterm-containment",
  "aterm-control",
  "aterm-core",
@@ -1050,6 +1063,7 @@ dependencies = [
 name = "aterm-gui-tabs"
 version = "0.0.0"
 dependencies = [
+ "aterm-capacity",
  "aterm-core",
  "aterm-models-gui",
  "aterm-serde",
@@ -1139,6 +1153,7 @@ dependencies = [
 name = "aterm-lab"
 version = "0.0.0"
 dependencies = [
+ "alab-policy",
  "astream-cap",
  "astream-wire",
  "aterm-agent",
@@ -1158,6 +1173,7 @@ dependencies = [
  "aterm-json",
  "aterm-lan",
  "aterm-link",
+ "aterm-models-capacity",
  "aterm-net",
  "aterm-netplace",
  "aterm-phase",
@@ -1250,6 +1266,7 @@ dependencies = [
  "aterm-dirfd",
  "aterm-durable",
  "aterm-hash",
+ "aterm-heap-count",
  "aterm-json",
  "aterm-mesh-core",
  "aterm-models-core",
@@ -1424,6 +1441,7 @@ dependencies = [
  "astream-wire",
  "aterm-spec",
  "aterm-tempfile",
+ "aterm-types",
 ]
 
 [[package]]
@@ -1661,6 +1679,7 @@ dependencies = [
 name = "aterm-phase"
 version = "0.0.0"
 dependencies = [
+ "alab-policy",
  "aterm-agent-names",
  "aterm-core",
  "aterm-cores",
@@ -1731,6 +1750,7 @@ dependencies = [
  "aterm-sandbox",
  "aterm-spec",
  "aterm-spec-anchor",
+ "aterm-sysprobe",
  "aterm-tempfile",
  "aterm-types",
  "aterm-uds",
@@ -1780,6 +1800,7 @@ dependencies = [
  "aterm-update",
  "aterm-update-core",
  "aterm-verify",
+ "aterm-win32",
  "aterm-winship",
  "atpkg",
  "atpkg-keys",
@@ -2026,6 +2047,7 @@ dependencies = [
  "aterm-spec",
  "aterm-spec-anchor",
  "aterm-tempfile",
+ "aterm-types",
  "aterm-uds",
  "libc",
 ]
@@ -2043,6 +2065,7 @@ dependencies = [
  "aterm-spec",
  "aterm-sysprobe",
  "aterm-tempfile",
+ "aterm-types",
  "aterm-uds",
  "libc",
 ]
@@ -2064,6 +2087,7 @@ version = "0.0.0"
 name = "aterm-slog"
 version = "0.0.0"
 dependencies = [
+ "alab-policy",
  "astream-wire",
  "aterm-codec",
  "aterm-messages",
@@ -2216,11 +2240,13 @@ dependencies = [
 name = "aterm-types"
 version = "0.0.0"
 dependencies = [
+ "alab-policy",
  "astream-wire",
  "aterm-alloc",
  "aterm-codec",
  "aterm-durable",
  "aterm-hash",
+ "aterm-heap-count",
  "aterm-json",
  "aterm-log",
  "aterm-models-setup",
@@ -2270,6 +2296,7 @@ dependencies = [
  "aterm-spec",
  "aterm-spec-anchor",
  "aterm-stamp",
+ "aterm-sysprobe",
  "aterm-tempfile",
  "aterm-time",
  "aterm-toml",
@@ -2330,7 +2357,7 @@ dependencies = [
  "aterm-land",
  "aterm-models-capacity",
  "aterm-models-misc",
- "aterm-phase",
+ "aterm-net",
  "aterm-png",
  "aterm-pty",
  "aterm-serde",
@@ -2396,7 +2423,7 @@ dependencies = [
 name = "aterm-wasm"
 version = "0.0.0"
 dependencies = [
- "aterm-control",
+ "aterm-codec",
  "aterm-core",
  "aterm-effects",
  "aterm-messages",
@@ -2504,6 +2531,8 @@ dependencies = [
 name = "aterm-winsign"
 version = "0.0.0"
 dependencies = [
+ "aterm-codec",
+ "aterm-secrets",
  "aterm-tempfile",
  "aterm-update-core",
 ]
@@ -2586,12 +2615,11 @@ dependencies = [
  "aterm-codec",
  "aterm-durable",
  "aterm-models-release",
- "aterm-pty",
+ "aterm-secrets",
  "aterm-spec",
  "aterm-tempfile",
  "aterm-time",
  "aterm-types",
- "aterm-uds",
  "aterm-update-core",
  "aterm-zstd",
  "atpkg",
@@ -2614,6 +2642,7 @@ dependencies = [
  "aterm-durable",
  "aterm-json",
  "aterm-models-atpkg",
+ "aterm-secrets",
  "aterm-serde",
  "aterm-spec",
  "aterm-sysprobe",
@@ -2754,7 +2783,7 @@ dependencies = [
 
 [[package]]
 name = "trust-exec-policy"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "libc",
 ]

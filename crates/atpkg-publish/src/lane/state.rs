@@ -21,9 +21,9 @@ pub const STALLED_AFTER_SECS: i64 = 12 * 3600;
 /// Attempt counters and notification stamps older than this are swept.
 pub const PRUNE_AFTER_SECS: i64 = 30 * 86_400;
 
-/// The tip lane's per-build evidence (step logs, receipts, retired records) older than this is
-/// swept, except what a `BLOCKED` latch still points a person at: nearly every pass is a new
-/// build, so what a pass leaves must not outlive its use.
+/// The tip lane's per-build evidence (each attempt's step logs and receipt, retired records)
+/// older than this is swept, except what a `BLOCKED` latch still points a person at: nearly
+/// every pass is a new build, so what a pass leaves must not outlive its use.
 pub const EVIDENCE_KEEP_SECS: i64 = 7 * 86_400;
 
 const STAMP: &str = "# pins-resolved-for ";
@@ -462,26 +462,21 @@ impl LaneState {
     }
 
     /// Sweep the tip lane's per-build evidence older than [`EVIDENCE_KEEP_SECS`]: a build's
-    /// step logs (`logs/<program>-<build>/`), its receipt (`receipts/<program>-<build>.json`)
+    /// attempts (`logs/<program>-<build>/`, each `attempt-<n>/` its step logs and receipt)
     /// and retired ready records (`retired/`). What a `BLOCKED-<program>-<build>.md` latch
     /// names is kept for as long as the latch stands.
     pub fn prune_evidence(&self, now_unix: i64) {
         let latched = |stem: &str| self.dir.join(format!("BLOCKED-{stem}.md")).exists();
-        for (folder, suffix) in [("logs", ""), ("receipts", ".json"), ("retired", "")] {
+        for folder in ["logs", "retired"] {
             let Ok(entries) = std::fs::read_dir(self.dir.join(folder)) else {
                 continue;
             };
             for e in entries.flatten() {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
-                // `<program>-<build>`: the whole name of a log folder, a receipt's stem, and
-                // what a retired record's name starts with.
-                let stem = name
-                    .strip_suffix(suffix)
-                    .unwrap_or(&name)
-                    .split(super::ready::SUFFIX)
-                    .next()
-                    .unwrap_or_default();
+                // `<program>-<build>`: the whole name of a build's log folder, and what a
+                // retired record's name starts with.
+                let stem = name.split(super::ready::SUFFIX).next().unwrap_or_default();
                 if latched(stem) || !age(&e, now_unix).is_some_and(|a| a > EVIDENCE_KEEP_SECS) {
                     continue;
                 }

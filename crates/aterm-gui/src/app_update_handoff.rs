@@ -1697,19 +1697,37 @@ const EXPECTED_BUILD_ENV: &str = "ATERM_UPDATE_EXPECTED_BUILD";
 const EXPECTED_COMMIT_ENV: &str = "ATERM_UPDATE_EXPECTED_COMMIT";
 const EXPECTED_DIGEST_ENV: &str = "ATERM_UPDATE_EXPECTED_DMG_SHA256";
 
+/// The successor's expected-artifact variables: each the attempt's value, or removed (`None`)
+/// with no attempt, so none is inherited from this process.
+fn expected_update_artifact_env(
+    attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
+) -> [(&'static str, Option<String>); 3] {
+    [
+        (
+            EXPECTED_BUILD_ENV,
+            attempt.map(|attempt| attempt.target_build().to_string()),
+        ),
+        (
+            EXPECTED_COMMIT_ENV,
+            attempt.map(|attempt| attempt.target_commit().to_owned()),
+        ),
+        (
+            EXPECTED_DIGEST_ENV,
+            attempt.map(|attempt| attempt.target_dmg_sha256().to_owned()),
+        ),
+    ]
+}
+
+#[cfg(unix)]
 fn bind_expected_update_artifact(
     command: &mut aterm_uds::spawnfd::StdCommand,
     attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
 ) {
-    command
-        .env_remove(EXPECTED_BUILD_ENV)
-        .env_remove(EXPECTED_COMMIT_ENV)
-        .env_remove(EXPECTED_DIGEST_ENV);
-    if let Some(attempt) = attempt {
-        command
-            .env(EXPECTED_BUILD_ENV, attempt.target_build().to_string())
-            .env(EXPECTED_COMMIT_ENV, attempt.target_commit())
-            .env(EXPECTED_DIGEST_ENV, attempt.target_dmg_sha256());
+    for (key, value) in expected_update_artifact_env(attempt) {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
     }
 }
 
@@ -2517,11 +2535,9 @@ fn spawn_fork_lane_successor(
 ) -> std::io::Result<std::process::Child> {
     // Where the kernel retains FD_CLOFORK, ends from aterm_uds::pipe would close before
     // pre_exec. Lift only marks actually present for this spawn and restore the parent's flags
-    // afterward. Kernels ignoring the request use normal inheritance and the pre-exec keep-list.
-    let spawning = aterm_uds::spawn_lock::handing(handed);
-    let spawned = command.spawn();
-    drop(spawning);
-    spawned
+    // once the fork returns (the spawn lock is held across that fork alone, not the successor's
+    // exec). Kernels ignoring the request use normal inheritance and the pre-exec keep-list.
+    aterm_uds::spawn_lock::spawn_std(command, handed)
 }
 
 #[cfg(unix)]
@@ -4993,7 +5009,12 @@ impl App {
                     std::env::args_os().skip(1),
                 ))
                 .env("ATERM_UPDATED_FROM", build.to_string());
-                bind_expected_update_artifact(&mut cmd, apply_attempt.as_ref());
+                for (key, value) in expected_update_artifact_env(apply_attempt.as_ref()) {
+                    match value {
+                        Some(value) => cmd.env(key, value),
+                        None => cmd.env_remove(key),
+                    };
+                }
                 match cmd.spawn() {
                     Ok(_) => std::process::exit(0),
                     Err(error) => Err(error),

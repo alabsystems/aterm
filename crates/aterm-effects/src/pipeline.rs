@@ -276,6 +276,11 @@ pub struct EffectsPipeline {
     /// for them ([`Self::set_probe_flanks`]): `None` while it does not.
     #[cfg(any(test, debug_assertions))]
     probe_flanks: Option<(Vec<char>, Vec<char>)>,
+    /// A test's window ground ([`Self::ground_as_window`]): the latch [`Self::apply`] runs on
+    /// each frame as a window's host does, and the page it lays its light on. `None` while no
+    /// test asks for one, and then the frame latches no light (the web host's).
+    #[cfg(any(test, debug_assertions))]
+    window_ground: Option<(crate::host::TrailGround, crate::host::PageFacts)>,
     /// The caret row the flying head last sat in the sky seat over
     /// ([`crate::rainbow_kitty::companion::SeatQuery::held_sky`]).
     flying_sky_row: Option<u16>,
@@ -302,6 +307,10 @@ pub struct EffectsPipeline {
     /// Embedder window chrome in px for window-absolute emissions.
     chrome_pad: u16,
     chrome_head: u16,
+    /// A test's window pad over the grid ([`Self::set_chrome_pad_top`]), where it is not
+    /// `chrome_pad`: `None` while it is, as on every web host.
+    #[cfg(any(test, debug_assertions))]
+    chrome_pad_top: Option<u16>,
     /// Height in px of the rows the host prepends above the grid after `apply`.
     host_rows_px: u16,
     /// Raw `Lexicon::conflicts()` from the last `rebuild_sparkle` (empty while sparkle is off).
@@ -358,8 +367,26 @@ pub struct EffectsPipeline {
     /// The flying head's body drawn into [`Self::pane_free`], pane pixels,
     /// until [`Self::place_pane_sprites`] places it in the window grid.
     pane_head: Option<(i32, i32, i32, i32)>,
+    /// The flier a film keeps ([`Self::set_cursor_flier`]): the replay's pipeline flies the
+    /// head itself, as the window's host does (`aterm-gui`'s `step_cursor_companions`).
+    #[cfg(any(test, debug_assertions))]
+    cursor_flier: Option<PetSpecies>,
+    /// The flier's frame as this frame drew it ([`Self::cursor_flier_frame`]).
+    #[cfg(any(test, debug_assertions))]
+    flier_shown: Option<crate::kitty_cursor::CatFrame>,
     /// Output streak per visible terminal pane of a composed frame, keyed `(session, pane slot)`.
     streak_panes: std::collections::BTreeMap<(u64, usize), OutputStreak>,
+}
+
+/// The flier a film keeps, routed and placed for this frame's draw
+/// ([`EffectsPipeline::set_cursor_flier`]).
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Copy)]
+struct FilmFlier {
+    frame: crate::kitty_cursor::CatFrame,
+    cell: (u16, u16),
+    lift: f32,
+    placement: crate::word_decorations::KittyCursorPlacement,
 }
 
 impl Default for EffectsPipeline {
@@ -430,6 +457,8 @@ impl EffectsPipeline {
             row_probe_scratch: Vec::new(),
             #[cfg(any(test, debug_assertions))]
             probe_flanks: None,
+            #[cfg(any(test, debug_assertions))]
+            window_ground: None,
             flying_sky_row: None,
             flying_fit: crate::rainbow_kitty::companion::HeadFit::WHOLE,
             flying_fit_goal: None,
@@ -450,6 +479,10 @@ impl EffectsPipeline {
             companion: CompanionOwner::default(),
             look: crate::companion_look::LookPolicy::default(),
             companions: crate::companions::Companions::default(),
+            #[cfg(any(test, debug_assertions))]
+            cursor_flier: None,
+            #[cfg(any(test, debug_assertions))]
+            flier_shown: None,
             streak: None,
             streak_cfg: StreakConfig::default(),
             streak_reduced_motion: false,
@@ -465,6 +498,8 @@ impl EffectsPipeline {
             rain_add_scratch: Vec::new(),
             chrome_pad: 0,
             chrome_head: 0,
+            #[cfg(any(test, debug_assertions))]
+            chrome_pad_top: None,
             host_rows_px: 0,
             pane_deco: Vec::new(),
             pane_ink: Vec::new(),
@@ -482,6 +517,31 @@ impl EffectsPipeline {
         self.chrome_head = head;
     }
 
+    /// A test's host: the window's pad over the grid, px, where it is not its pad round the
+    /// grid ([`Self::set_chrome`]'s `pad`): `aterm-gui`'s window, whose grid sits
+    /// `PAD_TOP_LOGICAL_PX` under its top edge and `PAD_LOGICAL_PX` in from the others
+    /// (`effects_origin_win`'s origin `(pad, pad_top + head)`). The effects then lay their
+    /// window-absolute light at that origin, over a renderer laid out the same way
+    /// (`Renderer::set_pad_top`), and the window ends `pad` under the grid. `None` (the default)
+    /// is the web host's even pad. Set before the first frame: the cursor engines bind their
+    /// pixel geometry then.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_chrome_pad_top(&mut self, pad_top: Option<u16>) {
+        self.chrome_pad_top = pad_top;
+    }
+
+    /// The window's pad over the grid, px: `chrome_pad`, unless a test's host set its own
+    /// ([`Self::set_chrome_pad_top`]).
+    #[inline]
+    const fn chrome_top(&self) -> u16 {
+        #[cfg(any(test, debug_assertions))]
+        if let Some(top) = self.chrome_pad_top {
+            return top;
+        }
+        self.chrome_pad
+    }
+
     /// Set the height in px of the rows the host prepends above the grid after the next `apply`.
     #[inline]
     pub const fn set_host_rows_px(&mut self, px: u16) {
@@ -493,6 +553,7 @@ impl EffectsPipeline {
     #[inline]
     const fn chrome_geom(&self, rows: usize, cols: usize, cell_w: usize, cell_h: usize) -> Geom {
         let pad = self.chrome_pad;
+        let top = self.chrome_top();
         let head = self.chrome_head;
         let w = cols.saturating_mul(cell_w);
         let h = rows.saturating_mul(cell_h);
@@ -512,10 +573,11 @@ impl EffectsPipeline {
             rows,
             cols,
             origin_x: pad,
-            origin_y: pad.saturating_add(head),
+            origin_y: top.saturating_add(head),
             win_w: grid_w.saturating_add(pad.saturating_mul(2)),
             win_h: grid_h
-                .saturating_add(pad.saturating_mul(2))
+                .saturating_add(top)
+                .saturating_add(pad)
                 .saturating_add(head),
             head,
         }
@@ -806,6 +868,18 @@ impl EffectsPipeline {
             PetInputKind::Submit => self.cursor.glow.note_return(now),
             PetInputKind::Paste => self.cursor.glow.note_user_gesture(now),
             PetInputKind::Text => {}
+        }
+        // The flier a film keeps hears the keys the window's input path hands the cursor cat
+        // (`aterm-gui`'s `app_input`): a delete startles it, a kill chord too, Return cheers.
+        #[cfg(any(test, debug_assertions))]
+        if self.cursor_flier.is_some() {
+            let cat = &mut self.companions.cursor_cat;
+            match kind {
+                PetInputKind::Delete => cat.on_key(now, false),
+                PetInputKind::Kill | PetInputKind::KillForward => cat.on_kill(now),
+                PetInputKind::Submit => cat.on_enter(now),
+                PetInputKind::Navigate | PetInputKind::Paste | PetInputKind::Text => {}
+            }
         }
     }
 
@@ -1103,6 +1177,22 @@ impl EffectsPipeline {
         self.probe_flanks = on.then(Default::default);
     }
 
+    /// A test's host: with `Some(page)`, [`Self::apply`] grounds its glow config as a window's
+    /// frame does (`aterm-gui`'s `app_render`, before its cursor step): a [`TrailGround`] of its
+    /// own runs on every frame on the frame's live page (`input.default_fg`, `input.default_bg`),
+    /// keyed by the terminal's render identity and configured pair, at the live level, on `page`
+    /// with its `thin_ink` read as the window reads it, off the glyph ink the frame observed
+    /// (`CursorGlow::observe_glyph_ink`; `1` while none was). A light page's frame then carries
+    /// the window's light, and the glass draws where the window's would: what `lab trail-film
+    /// --glass` films. `None` (the default) restores the web host's frame, which latches none.
+    ///
+    /// [`TrailGround`]: crate::host::TrailGround
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn ground_as_window(&mut self, page: Option<crate::host::PageFacts>) {
+        self.window_ground = page.map(|page| (crate::host::TrailGround::default(), page));
+    }
+
     /// A test's negative control: `on == false` pins the frame's `head_dx` to `0.5`, so every
     /// light the caret seats sits at the block's centre behind a bar too.
     #[cfg(any(test, debug_assertions))]
@@ -1336,10 +1426,146 @@ impl EffectsPipeline {
         self.companion.set_enabled_seed(enabled, seed);
     }
 
+    /// The flier a film keeps (`cursor_pet = "flying cat"`): the replay's pipeline then flies
+    /// the cursor cat at the rainbow's head as the window's host does, so `lab trail-film`
+    /// films it. `None` flies nothing (the walkers and `off`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_cursor_flier(&mut self, flier: Option<PetSpecies>) {
+        self.cursor_flier = flier;
+        if flier.is_none() {
+            self.flier_shown = None;
+        }
+    }
+
+    /// The flier's frame as the last [`Self::apply`] drew it ([`Self::set_cursor_flier`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn cursor_flier_frame(&self) -> Option<crate::kitty_cursor::CatFrame> {
+        self.flier_shown
+    }
+
     /// Which animal the resident pet is ([`crate::cursor_pet`]).
     #[inline]
     pub const fn set_cursor_pet_species(&mut self, species: PetSpecies) {
         self.companion.set_species(species);
+    }
+
+    /// The flier's route for this frame ([`Self::set_cursor_flier`]): the cat's look and
+    /// pulse as the window's host gives them, its frame, its seat and its placement, by the
+    /// same calls `aterm-gui`'s `route_single_cursor_companion` makes. `None` where nothing
+    /// flies; the head's impulse is spent unread then, as before.
+    #[cfg(any(test, debug_assertions))]
+    fn route_film_flier(
+        &mut self,
+        pulse: Option<crate::cursor_glow::CursorCatMotionPulse>,
+        cells: &[Vec<aterm_core::terminal::RenderCell>],
+        now: Instant,
+        geom: EffectGeom,
+        cur: Option<(u16, u16)>,
+        animate: bool,
+    ) -> Option<FilmFlier> {
+        let owned = self.glow_cfg.enabled && matches!(self.glow_cfg.style, GlowStyle::RainbowKitty);
+        if self.cursor_flier.is_none() || !owned {
+            self.flier_shown = None;
+            let _ = self.cursor.glow.take_companion_impulse();
+            if self.cursor_flier.is_some() {
+                self.companions.cursor_cat.retire_unowned_cursor_motion();
+            }
+            return None;
+        }
+        let cat = &mut self.companions.cursor_cat;
+        cat.set_body(self.cursor_flier);
+        cat.set_look(crate::kitty_registry::KittyLook::DEFAULT);
+        if let Some(pulse) = pulse {
+            cat.on_motion_pulse(pulse);
+        }
+        let mut frame = if animate {
+            cat.frame(now)
+        } else {
+            cat.static_frame(now)
+        };
+        let duty = match cur {
+            Some(cell) if frame.alpha > 0 => crate::companion::CompanionDuty::FlyingHead { cell },
+            _ => crate::companion::CompanionDuty::Idle,
+        };
+        let seat = self.route_flying_head(duty, cells, now, geom, &mut frame, animate);
+        self.flier_shown = Some(frame);
+        let crate::companion::CompanionDuty::FlyingHead { cell } = duty else {
+            return None;
+        };
+        let layout = crate::word_decorations::KittyCursorLayout {
+            geom,
+            cursor: cell,
+            look: frame.render_look(),
+            body: frame.body,
+            bob: frame.bob,
+            lift: seat.lift,
+        };
+        let motion = self.companions.cursor_cat.placement_frame(now);
+        let placement = self.prepare_flying_head(layout, motion, frame.pose, cells)?;
+        Some(FilmFlier {
+            frame,
+            cell,
+            lift: seat.lift,
+            placement,
+        })
+    }
+
+    /// Draw the flier [`Self::route_film_flier`] placed, in the colours the window's host
+    /// samples under it (`aterm-gui`'s `emit_routed_cursor_companion`). Its fingerprint, or 0.
+    #[cfg(any(test, debug_assertions))]
+    fn draw_film_flier(
+        &mut self,
+        flier: Option<FilmFlier>,
+        cells: &[Vec<aterm_core::terminal::RenderCell>],
+        geom: EffectGeom,
+        default_bg: u32,
+        cursor_color: u32,
+    ) -> u64 {
+        let Some(FilmFlier {
+            frame,
+            cell,
+            lift,
+            placement,
+        }) = flier
+        else {
+            if self.cursor_flier.is_some() {
+                self.cursor.glow.note_head_body(None);
+            }
+            return 0;
+        };
+        let accent = self.glow_cfg.accent;
+        let cat = &mut self.companions.cursor_cat;
+        let colors = cat.episode_colors().unwrap_or_else(|| {
+            cat.colors_for_episode(crate::companion::cursor_cat_color_key(
+                cells,
+                geom,
+                placement.sample,
+                default_bg,
+                cursor_color,
+                accent,
+            ))
+        });
+        self.draw_flying_head(
+            CanvasInk::Window,
+            crate::word_decorations::KittyCursorFrame {
+                geom,
+                cursor: cell,
+                look: frame.render_look(),
+                body: frame.body,
+                colors,
+                bob: frame.bob,
+                lift,
+                alpha: frame.alpha,
+                pose: frame.pose,
+                sing: frame.sing,
+                notes: [None; crate::kitty_sing::MAX_NOTES],
+            },
+            placement,
+        )
+        .unwrap_or(0)
     }
 
     /// The host's stable reduce-motion preference for every effect.
@@ -1904,7 +2130,8 @@ impl EffectsPipeline {
     /// The web host's frame latches no light scheme (`docs/design/PRISM-GLASS.md` §15.2 1.11):
     /// its glow config's light stays [`crate::cursor_glow::Light::OFF`] on every page, light
     /// ones included, so it draws main's frame and no light arm, and its frame light
-    /// ([`Self::frame_light`]) is OFF.
+    /// ([`Self::frame_light`]) is OFF. A test that grounds it as a window
+    /// ([`Self::ground_as_window`]) gets the window's light instead.
     #[inline]
     pub fn apply(
         &mut self,
@@ -1947,6 +2174,7 @@ impl EffectsPipeline {
                 self.block_fill = None;
             }
             input.cursor_fill_override = None;
+            input.cursor_keyline_tint = None;
             input.cursor_effect_style_override = None;
             // The last lit frame's gate goes with its light (a terminal that never lit one reads Open).
             input.bloom_gate = aterm_core::render::BloomGate::Open;
@@ -1992,11 +2220,35 @@ impl EffectsPipeline {
             None
         };
         // Main's page, and no light: the web host latches no scheme (§15.2 1.11), so nothing
-        // here writes `glow_cfg.light`, which stays OFF as `new` and `resolve_glow` leave it.
+        // here writes `glow_cfg.light`, which stays OFF as `new` and `resolve_glow` leave it,
+        // unless a test grounds the frame as a window's (`Self::ground_as_window`).
         self.glow_cfg.dark_theme =
             input.default_bg == aterm_core::render::COLOR_UNSET || theme_is_dark(input.default_bg);
         self.glow_cfg.theme_fg = input.default_fg;
         self.glow_cfg.theme_bg = input.default_bg;
+        #[cfg(any(test, debug_assertions))]
+        if let Some((ground, page)) = self.window_ground.as_mut() {
+            let (fg, bg) = (input.default_fg, input.default_bg);
+            let thin_ink = self.cursor.glow.glyph_ink().map_or(1.0, |ink| {
+                ink.thin_share(
+                    aterm_render::linear_luminance(fg),
+                    aterm_render::linear_luminance(bg),
+                )
+            });
+            let (scheme_fg, scheme_bg) = term.configured_colors();
+            let rgb = |c: aterm_types::Rgb| aterm_render::rgb_to_u32([c.r, c.g, c.b]);
+            ground.ground(
+                &mut self.glow_cfg,
+                (fg, bg),
+                crate::host::light_latch::LatchKey {
+                    session: term.render_identity(),
+                    fg: rgb(scheme_fg),
+                    bg: rgb(scheme_bg),
+                },
+                crate::host::PageFacts { thin_ink, ..*page },
+                now,
+            );
+        }
         let cursor_color_pinned = term.cursor_color_recoloured();
         if input.cursor_color != aterm_core::render::COLOR_UNSET {
             crate::cursor_fx::follow_live_cursor(
@@ -2130,6 +2382,7 @@ impl EffectsPipeline {
             self.block_fill = fx.block_fill;
         }
         input.cursor_fill_override = fx.caret_fill();
+        input.cursor_keyline_tint = fx.keyline_tint;
         input.cursor_effect_style_override =
             compose_caret_style_override(fx.bolt_cursor, fx.twinkle_cursor, fx.momentum_steady);
 
@@ -2162,7 +2415,7 @@ impl EffectsPipeline {
                 cell_h: geom.cell_h,
                 origin_px: (
                     i32::from(self.chrome_pad),
-                    i32::from(self.chrome_pad)
+                    i32::from(self.chrome_top())
                         + i32::from(self.chrome_head)
                         + i32::from(self.host_rows_px),
                 ),
@@ -2202,6 +2455,11 @@ impl EffectsPipeline {
         }
         let pet = self.companion.tick(pet);
         self.offer_pet_v2(&pet.pet, glow_geom, (0, 0), now);
+        // The flier a film keeps is routed here, as the window's host routes it; with none, the
+        // head's impulse is spent unread.
+        #[cfg(any(test, debug_assertions))]
+        let flier = self.route_film_flier(step.motion_pulse, &input.cells, now, geom, cur, animate);
+        #[cfg(not(any(test, debug_assertions)))]
         let _ = self.cursor.glow.take_companion_impulse();
 
         // The word pass and the pet refill the sprite channel from empty (it is
@@ -2307,11 +2565,19 @@ impl EffectsPipeline {
             &mut self.decos,
             &mut self.free_scratch,
         );
+        #[cfg(any(test, debug_assertions))]
+        let pet_fp = pet_fp
+            ^ self
+                .draw_film_flier(flier, &input.cells, geom, default_bg, term_cursor_color)
+                .rotate_left(29);
         let deco_fp = deco_fp ^ pet_fp ^ pet.fp.rotate_left(53);
         std::mem::swap(&mut input.word_decorations, &mut self.deco_scratch);
         std::mem::swap(&mut input.ink, &mut self.ink_scratch);
         self.sprite_layers
             .publish(&self.free_scratch, &mut input.fx_layers);
+        // Every host's word publish yields the step's glass to the words before the icons'
+        // shade (`Self::publish_words`); a frame with no glass, every web frame, is left as is.
+        self.yield_glass(input);
         self.shade_word_icons(input);
         let streak_fp = if let Some(streak) = self.streak.as_deref_mut() {
             let mut cfg = self.streak_cfg;

@@ -220,6 +220,79 @@ fn bogus_exec_command_fails_closed_no_session() {
     });
 }
 
+/// A program that is no image for this machine (a script named `.exe`) fails the spawn with the
+/// loader's error (`ERROR_BAD_EXE_FORMAT`, 193, or `ERROR_EXE_MACHINE_TYPE_MISMATCH`, 216), at once
+/// and with no system box: the backend's `CreateProcessW` runs with the starting thread's error
+/// boxes off, where Windows would otherwise raise "This version of %1 is not compatible" and wait
+/// in that thread for a person to answer it. The spawn runs in a re-exec given the default error
+/// mode (`CREATE_DEFAULT_ERROR_MODE`), where the box is on whatever mode this run inherited.
+/// NEGATIVE CONTROL: drop `quiet_errors` from `windows::ffi::CreateProcessW` and, in a desktop
+/// session (`lab windows exec --desktop`), the re-exec waits on the box until the hang detector.
+/// In session 0, where an SSH session's processes run, a box has no desktop to wait on and answers
+/// its default at once, so the spawn errs with or without the guard: the test ends COULD NOT RUN
+/// there rather than pass on nothing.
+#[test]
+fn a_program_that_is_no_image_fails_the_spawn_and_raises_no_box() {
+    const NAME: &str = "a_program_that_is_no_image_fails_the_spawn_and_raises_no_box";
+    const SCRIPT: &str = "ATERM_PTY_NO_IMAGE_SCRIPT";
+    /// `CREATE_DEFAULT_ERROR_MODE` (`WinBase.h`): the child gets the default error mode.
+    const CREATE_DEFAULT_ERROR_MODE: u32 = 0x0400_0000;
+    /// `SEM_FAILCRITICALERRORS` (`WinBase.h`): the critical-error boxes are off.
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetErrorMode() -> u32;
+    }
+    if let Some(script) = std::env::var_os(SCRIPT) {
+        // SAFETY: no arguments; it reads this process's error mode.
+        let mode = unsafe { GetErrorMode() };
+        assert_eq!(
+            mode & SEM_FAILCRITICALERRORS,
+            0,
+            "the box is on here: {mode:#x}"
+        );
+        let (spawn_cap, sandbox_cap) = caps();
+        let err = aterm_pty::spawn_shell_with_pid(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&[script]),
+            None,
+            None,
+            aterm_sandbox::Limits::inherit(),
+        )
+        .expect_err("a program that is no image must fail the spawn, not hand back a session");
+        assert!(
+            matches!(err.raw_os_error(), Some(193 | 216)),
+            "the loader's error, not another: {err:?}"
+        );
+        return;
+    }
+    aterm_uds::host::could_not_run_in_session_zero("a desktop for the box the guard keeps off");
+    let dir = aterm_tempfile::tempdir().expect("scratch directory");
+    let script = dir.path().join("not-a-program.exe");
+    std::fs::write(&script, "#!/bin/sh\necho hi\n").expect("write the script");
+    let mut isolated =
+        aterm_uds::spawnfd::command(std::env::current_exe().expect("this test binary"));
+    isolated
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(SCRIPT, &script);
+    aterm_uds::spawn::set_flags(&mut isolated, CREATE_DEFAULT_ERROR_MODE);
+    let output = aterm_uds::deadline::output_within(&mut isolated, aterm_spec::wait::MUST_HAPPEN)
+        .expect("the spawn answers within the hang detector");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the spawn in a process whose box is on:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn bare_cmd_shim_resolves_via_pathext_and_launches() {
     run_with_deadline("bare_cmd_shim_resolves_via_pathext_and_launches", || {

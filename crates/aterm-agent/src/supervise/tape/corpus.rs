@@ -253,7 +253,7 @@ impl Scrub {
     }
 
     /// Take `from` as `to`, and — where the press guard spells it otherwise
-    /// (a `.` as `\.`, a space as `\x20`: `policy::guard::row_guard`, which
+    /// (a `.` as `\.`, a space as `\x20`: `alab_policy::guard::row_guard`, which
     /// writes the `key if=<re>` a press is bound to the judged row by) — its
     /// guard spelling as the token's.
     fn add(&mut self, from: &[u8], to: &str, word: bool) {
@@ -264,12 +264,9 @@ impl Scrub {
         };
         push(from.to_vec(), to.to_string());
         let text = String::from_utf8_lossy(from);
-        let guarded = crate::supervise::policy::guard::literal(&text);
+        let guarded = alab_policy::guard::literal(&text);
         if guarded != text {
-            push(
-                guarded.into_bytes(),
-                crate::supervise::policy::guard::literal(to),
-            );
+            push(guarded.into_bytes(), alab_policy::guard::literal(to));
         }
     }
 

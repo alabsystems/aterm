@@ -881,3 +881,165 @@ fn an_empty_wait_states_itself_without_minting_or_retrying() {
     );
     drop(held);
 }
+
+/// A wait of this handle that says `Reading` without the reader thread it names, as one is
+/// from the moment it says so until its read ends, so a test can hold that moment.
+fn reading_wait(pool: &Jobserver) {
+    // SAFETY: pthread_self has no preconditions.
+    let me = unsafe { pthread_self() };
+    pool.waiters.lock().unwrap().each.insert(
+        u64::MAX,
+        Waiter {
+            reader: Reader::Reading(me),
+            handed: None,
+        },
+    );
+}
+
+/// A count beside a wait whose reader is in its read cannot tell whether that reader has taken
+/// a byte. Here it has (its byte read out of the FIFO while it says `Reading`): the FIFO holds
+/// two of three and the handle counts none, and the count is unjudged rather than minting a
+/// fourth. Once the reader's byte is back in the FIFO and no reader is in doubt, the count is
+/// whole and the FIFO never held more than the allocation.
+#[test]
+fn a_count_never_mints_a_byte_a_reader_in_its_read_may_hold() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let shares = crate::BranchShares::new(&dir.path().join("jobs"), 3, 0, [false, true]).unwrap();
+    let pool = Jobserver::adopt(&shares.pool(true).handed()).unwrap();
+    reading_wait(&pool);
+    let mut byte = [0];
+    (&pool.wait).read_exact(&mut byte).unwrap();
+    assert_eq!(
+        pool.count_alone(&|| true).unwrap(),
+        TokenCount::Unsettled("a wait of this handle is in its read"),
+        "the reader's byte is not a loss"
+    );
+    // Held until the reader in doubt is gone: a token returned beside it would be handed to it.
+    let rest = every_free_token(&pool);
+    assert_eq!(rest.len(), 2, "nothing was minted");
+    pool.waiters.lock().unwrap().each.remove(&u64::MAX);
+    drop(rest);
+    (&pool.file).write_all(&byte).unwrap();
+    assert_eq!(
+        pool.count_alone(&|| true).unwrap(),
+        TokenCount::Whole { allocated: 3 }
+    );
+    assert_eq!(every_free_token(&pool).len(), 3);
+}
+
+/// A count beside a wait whose reader is in its read, but has not yet taken the byte it will,
+/// finds the FIFO whole: it reads nothing out, so the byte is there for the reader, and it
+/// records nothing, so the clients noted stay for the next count that is not whole. The same
+/// count with a reader that holds nothing beside a handle holding every token is unjudged too.
+/// NEGATIVE CONTROL: with no reader in doubt, the whole FIFO is whole.
+#[test]
+fn a_count_never_reads_out_a_byte_a_reader_has_yet_to_take() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let shares = crate::BranchShares::new(&dir.path().join("jobs"), 3, 0, [false, true]).unwrap();
+    let pool = Jobserver::adopt(&shares.pool(true).handed()).unwrap();
+    pool.note_reaped("noted".to_owned());
+    reading_wait(&pool);
+    assert_eq!(
+        pool.count_alone(&|| true).unwrap(),
+        TokenCount::Unsettled("a wait of this handle is in its read")
+    );
+    assert_eq!(pool.last_count(), None, "nothing was recorded");
+    let held = every_free_token(&pool);
+    assert_eq!(held.len(), 3, "nothing was read out");
+    assert_eq!(
+        pool.count_alone(&|| true).unwrap(),
+        TokenCount::Unsettled("a wait of this handle is in its read"),
+        "every token held and a reader in doubt"
+    );
+    // Removed before the tokens go back: one returned beside it would be handed to it.
+    pool.waiters.lock().unwrap().each.remove(&u64::MAX);
+    drop(held);
+    assert_eq!(
+        pool.notes.lock().unwrap().reaped,
+        ["noted"],
+        "the notes stay for the next count"
+    );
+    assert_eq!(
+        pool.count_alone(&|| true).unwrap(),
+        TokenCount::Whole { allocated: 3 }
+    );
+    assert_eq!(every_free_token(&pool).len(), 3);
+}
+
+/// A token a blocking wait's reader took from the FIFO is counted as held: another holder of
+/// the pool has the one token this handle does not hold, this handle's wait blocks in its read
+/// for it, and the holder writes it back; once the wait has its token, the count finds the FIFO
+/// empty and this handle holding all three, whole, and mints nothing.
+#[test]
+fn a_token_a_blocking_wait_took_is_held_not_lost() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let shares = crate::BranchShares::new(&dir.path().join("jobs"), 3, 0, [false, true]).unwrap();
+    let pool = Jobserver::adopt(&shares.pool(true).handed()).unwrap();
+    let mut elsewhere = [0];
+    (&shares.pool(true).file)
+        .read_exact(&mut elsewhere)
+        .unwrap();
+    let held = every_free_token(&pool);
+    assert_eq!(held.len(), 2);
+    let started = Instant::now();
+    let stopped = || started.elapsed() >= MUST_HAPPEN;
+    let (waiting, is_waiting) = mpsc::channel();
+    let waited = std::thread::scope(|scope| {
+        let waiter = scope
+            .spawn(|| pool.acquire_waking(&stopped, MUST_HAPPEN, &|| waiting.send(()).unwrap()));
+        // The wait found the FIFO empty: only its reader's read can take the byte now.
+        is_waiting.recv().unwrap();
+        (&shares.pool(true).file).write_all(&elsewhere).unwrap();
+        waiter.join().unwrap().unwrap()
+    });
+    assert_eq!(
+        pool.count_alone(&|| true).unwrap(),
+        TokenCount::Whole { allocated: 3 },
+        "the wait's token is held"
+    );
+    drop((waited, held));
+    assert_eq!(every_free_token(&pool).len(), 3, "and none was minted");
+}
+
+/// ONE COUNT AT A TIME. Two counts of one handle hold `<fifo>.transfer` by the same descriptor,
+/// and `flock` belongs to the open file description, so that lock keeps neither from the other:
+/// a count that began while another of its handle counted (two binaries ending together each
+/// count) waited behind the first's locks and went on once the first's end had let the
+/// transfer lock go, beside a creator then free to move an allocation. Here a second count
+/// starts while the first holds its locks (when the first asks `alone`): it answers at once
+/// that it was not judged, and the first is whole with nothing minted.
+#[test]
+fn a_count_while_another_count_of_its_handle_runs_is_unjudged_at_once() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let shares = crate::BranchShares::new(&dir.path().join("jobs"), 3, 0, [false, true]).unwrap();
+    let pool = Jobserver::adopt(&shares.pool(true).handed()).unwrap();
+    let pool = &pool;
+    let (go, gone) = mpsc::channel::<()>();
+    let (told, tell) = mpsc::channel();
+    let second = std::cell::Cell::new(None);
+    let first = std::thread::scope(|scope| {
+        let counter = scope.spawn(move || {
+            gone.recv().unwrap();
+            let _ = told.send(pool.count_alone(&|| true).unwrap());
+        });
+        let alone = || {
+            if second.get().is_none() {
+                go.send(()).unwrap();
+                second.set(Some(tell.recv_timeout(MUST_HAPPEN).ok()));
+            }
+            true
+        };
+        let first = pool.count_alone(&alone).unwrap();
+        counter.join().unwrap();
+        first
+    });
+    assert_eq!(
+        second.get(),
+        Some(Some(TokenCount::Unsettled(
+            "another count of this handle is running"
+        ))),
+        "the second count answered while the first held its locks"
+    );
+    assert_eq!(first, TokenCount::Whole { allocated: 3 });
+    assert_eq!(every_free_token(pool).len(), 3, "nothing was minted");
+}

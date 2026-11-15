@@ -14,7 +14,9 @@ use crate::cat_baker::{CatColorKey, EyesFrame};
 use crate::cat_glyphs_gen::CatGlyphId;
 use crate::cursor_glow::{Geom, InkRole, push_halo_rows};
 use crate::effect_util::{push_fx_rect, twinkle_rgb};
+use crate::kitty_pet::PetSpecies;
 use crate::kitty_registry::KittyLook;
+use crate::pet_glyphs_gen::PetGlyphId;
 use crate::rainbow_kitty::companion::{FLYING_LEAD_MAX, Flight};
 use crate::typing_momentum::TypingMomentum;
 
@@ -115,6 +117,23 @@ const LAND_DECAY: f32 = 3.0;
 
 const SING_SQUASH: f32 = 0.14;
 const SING_SWAY: f32 = 0.12;
+
+/// The flier's breath: its glide rises this many times a second and settles again
+/// ([`GLIDE_BOB_PX`], [`glide_lift`], [`glide_bob_cells`]), in place of the head's stride bob.
+pub const FLIER_BOB_HZ: f32 = 1.0;
+/// The breath's rise, device pixels: never 0 (a still flier reads as parked). The glide rests
+/// and rises, two levels, so a pixel under a thin line of its art turns twice a breath, not
+/// the four times a rise and a fall about the rest would turn it: the flash law's six turns a
+/// second leave room for a reaction's move on top (`the_flier_never_flashes`).
+pub const GLIDE_BOB_PX: f32 = 1.0;
+/// Beats of the song to one dance of the glide: a body rises once a bar, not on every beat.
+const GLIDE_DANCE_BEATS: f32 = 4.0;
+// A rest-and-rise breath turns a pixel at most twice a cycle: under the flash bound with room
+// for a reaction's out-and-back (four turns).
+const _: () = assert!(2.0 * FLIER_BOB_HZ + 4.0 <= 2.0 * crate::effect_util::TWINKLE_FLASH_BOUND_HZ);
+// The glide's dance is no faster than its breath.
+const _: () = assert!(crate::kitty_sing::SING_BPM / 60.0 / GLIDE_DANCE_BEATS <= FLIER_BOB_HZ);
+const _: () = assert!(GLIDE_BOB_PX >= 1.0);
 
 /// One frame's sing-along sync from the host: the drive/beat pair the dance rides, shared by both render paths.
 #[derive(Clone, Copy, Debug)]
@@ -234,6 +253,56 @@ enum State {
     FadeOut(Instant),
 }
 
+/// What the cursor cat draws: a collected head (the singing walker's, a collection hello's), or
+/// the flier's whole body in its glide, one of its four faces
+/// ([`crate::kitty_pet::glide_faces`]), baked by the walker's own baker in the walker's look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorBody {
+    /// The collected head ([`CatFrame::render_look`]).
+    Head,
+    /// The flier's glide, in this face.
+    Glide(PetGlyphId),
+}
+
+/// The least time a glide face stands before another replaces it: at most four swaps a second,
+/// which with the breath's two turns keeps the flash law's six
+/// ([`crate::effect_util::TWINKLE_FLASH_BOUND_HZ`]). At 200 ms a flurry of oops and Enter
+/// turned the glide's eyes seven times a second (`the_flier_never_flashes`).
+pub const FACE_DWELL: Duration = Duration::from_millis(250);
+const _: () = assert!(
+    1000.0 / (FACE_DWELL.as_millis() as f32) + 2.0 * FLIER_BOB_HZ
+        <= 2.0 * crate::effect_util::TWINKLE_FLASH_BOUND_HZ
+);
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of [`FACE_DWELL`]: the face follows every reaction at once.
+    pub static FACE_LATCH_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the glide's calm: the head's motion comes back under the glide
+    /// (the stride's bob and footfall squash, every squash and stretch, the lean that follows
+    /// speed, the oops and wince recoils, the wince's tumble and the every-beat dance).
+    pub static FLIER_CALM_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The glide's rise at `phase` (cycles): `0..=`[`BOB_AMP`], resting at whole cycles.
+#[inline]
+fn glide_lift(phase: f32) -> f32 {
+    BOB_AMP * 0.5 * (1.0 - crate::supernova::sin_cos_f32(std::f32::consts::TAU * phase).1)
+}
+
+/// The flier's bob (a fraction of cell height, `0..=`[`BOB_AMP`] for the glide) as whole device
+/// pixels at a `cell_h` cell: scaled to [`GLIDE_BOB_PX`] before it is rounded, so the breath
+/// reads exactly 0 or +1 px wherever it is drawn (`(bob * cell_h).round()`), never a sub-pixel
+/// shimmer.
+#[must_use]
+#[inline]
+pub fn glide_bob_cells(bob: f32, cell_h: u16) -> f32 {
+    if cell_h == 0 {
+        return 0.0;
+    }
+    (bob / BOB_AMP * GLIDE_BOB_PX).round() / f32::from(cell_h)
+}
+
 /// One frame's resolved cat state for the host.
 #[derive(Clone, Copy, Debug)]
 pub struct CatFrame {
@@ -257,6 +326,9 @@ pub struct CatFrame {
     pub pose: CatPose,
     /// Sing-along drive 0..=1 (`crate::kitty_sing`), easing to 0 through the wind-down.
     pub sing: f32,
+    /// What this frame draws: the collected head, or the flier's glide in one face
+    /// ([`CursorCat::set_body`]).
+    pub body: CursorBody,
 }
 
 const MARKED_GLYPHS: [bool; crate::cat_glyphs_gen::GLYPHS.len()] = {
@@ -347,6 +419,10 @@ impl CatFrame {
             Some(a) => a as u64 + 1,
             None => 0,
         };
+        let body = match self.body {
+            CursorBody::Head => 0u64,
+            CursorBody::Glide(face) => face as u64 + 1,
+        };
         let values = [
             self.alpha as u64,
             (self.fade_out * 255.0) as u64,
@@ -365,6 +441,7 @@ impl CatFrame {
             sy_q,
             lead_q,
             sing_q,
+            body,
         ];
         let mut h = aterm_hash::FNV64_OFFSET;
         let mut i = 0;
@@ -391,6 +468,7 @@ const fn hidden_frame(look: KittyLook) -> CatFrame {
         bob: 0.0,
         sing: 0.0,
         pose: CatPose::STILL,
+        body: CursorBody::Head,
     }
 }
 
@@ -479,6 +557,14 @@ pub struct CursorCat {
     /// Resting direction after a reverse fold. An active fold's own direction
     /// wins in [`Self::placement_frame`].
     facing_left: bool,
+    /// The animal the cat flies as, in its glide ([`Self::set_body`]); `None` draws the head.
+    body: Option<PetSpecies>,
+    /// A body synced while on screen, applied at the next appearance so one appearance is one
+    /// body.
+    pending_body: Option<Option<PetSpecies>>,
+    /// The glide face on glass and since when ([`FACE_DWELL`]).
+    face_shown: Option<PetGlyphId>,
+    face_since: Option<Instant>,
     rng: u32,
 }
 
@@ -505,10 +591,7 @@ impl CursorCat {
             stride: 0.0,
             stride_at: None,
             stride_shown: 0.0,
-            look: KittyLook {
-                variant: CatGlyphId::SpecStretch,
-                ..KittyLook::DEFAULT
-            },
+            look: KittyLook::DEFAULT,
             pending_look: None,
             reaction: CatReaction::Cruise,
             reaction_until: None,
@@ -532,6 +615,10 @@ impl CursorCat {
             sing_beat: 0.0,
             fold: None,
             facing_left: false,
+            body: None,
+            pending_body: None,
+            face_shown: None,
+            face_since: None,
             rng: 0x2545_F491,
         }
     }
@@ -716,6 +803,11 @@ impl CursorCat {
         if let Some(pending) = self.pending_look.take() {
             self.look = pending;
         }
+        if let Some(pending) = self.pending_body.take() {
+            self.body = pending;
+        }
+        self.face_shown = None;
+        self.face_since = None;
         self.state = State::FadeIn(now);
         self.flight = Some(now);
     }
@@ -890,6 +982,53 @@ impl CursorCat {
         }
     }
 
+    /// Install the body the pet setting flies (the flier's species, in its glide; `None`, the
+    /// head), latched like [`Self::set_look`]: one appearance is one body.
+    #[inline]
+    pub const fn set_body(&mut self, body: Option<PetSpecies>) {
+        let same = match (body, self.body) {
+            (Some(a), Some(b)) => a as u8 == b as u8,
+            (None, None) => true,
+            _ => false,
+        };
+        if self.is_active() || self.collection_hello {
+            self.pending_body = if same { None } else { Some(body) };
+        } else {
+            self.body = body;
+            self.pending_body = None;
+        }
+    }
+
+    /// The body the cat flies as ([`Self::set_body`]).
+    #[must_use]
+    #[inline]
+    pub const fn body(&self) -> Option<PetSpecies> {
+        self.body
+    }
+
+    /// Whether this appearance is the flier's glide (a body, not a collection hello's head):
+    /// a rigid body at the lean's full reach that breathes at [`FLIER_BOB_HZ`] and rises once
+    /// a bar to a song; its reactions are its faces.
+    #[inline]
+    fn glides(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        if FLIER_CALM_OFF.with(std::cell::Cell::get) {
+            return false;
+        }
+        self.body.is_some() && !self.collection_hello
+    }
+
+    /// The song's phase the dance rides: every beat for a head, once in [`GLIDE_DANCE_BEATS`]
+    /// for the glide.
+    #[inline]
+    fn dance_beat(&self) -> f32 {
+        if self.glides() {
+            self.sing_beat / GLIDE_DANCE_BEATS
+        } else {
+            self.sing_beat
+        }
+    }
+
     /// The hello for a cat the user chose (a favourite pin or `wear`).
     #[inline]
     pub fn on_collect(&mut self, now: Instant, look: KittyLook) {
@@ -1057,8 +1196,13 @@ impl CursorCat {
 
     /// The airborne hover-bob (fraction of cell height) and stride cosine, a pure read of the stride pump.
     #[inline]
-    const fn bob_and_stride_cos(&self) -> (f32, Option<f32>) {
+    fn bob_and_stride_cos(&self, now: Instant) -> (f32, Option<f32>) {
         match self.flight {
+            Some(t0) if self.glides() => {
+                // The glide breathes: no footfall, so no squash (`Some(0.0)`).
+                let t = now.saturating_duration_since(t0).as_secs_f32();
+                (glide_lift(FLIER_BOB_HZ * t), Some(0.0))
+            }
             Some(_) => {
                 let (sin, cos) =
                     crate::supernova::sin_cos_f32(std::f32::consts::TAU * self.stride_shown);
@@ -1132,7 +1276,14 @@ impl CursorCat {
         let bank = smoothstep((self.disp - BANK_LO) * INV_BANK_SPAN);
         let mut scale_x = 1.0 + STRETCH_X * bank;
         let mut scale_y = 1.0 - THIN_Y * bank;
-        let mut lead = LEAD_MAX * bank;
+        // The glide rides at the lean's full reach: a lean that follows each change in speed
+        // steps its art a pixel to and fro over the pixels under it, past the flash law with
+        // its breath and its faces.
+        let mut lead = if self.glides() {
+            LEAD_MAX
+        } else {
+            LEAD_MAX * bank
+        };
         if let Some(m) = self.meteor {
             if now >= m.settled_at() {
                 self.meteor = None;
@@ -1183,7 +1334,11 @@ impl CursorCat {
                     None => 1.0,
                 };
                 let env = attack * settle;
-                lead = lead * (1.0 - env) - OOPS_RECOIL * env;
+                // The glide's oops is its face: a recoil there and back slides its art's lines
+                // over the pixels under it, past the flash law with its breath.
+                if !self.glides() {
+                    lead = lead * (1.0 - env) - OOPS_RECOIL * env;
+                }
                 scale_y *= 1.0 - OOPS_SQUASH * env;
                 scale_x *= 1.0 + OOPS_SQUASH * 0.6 * env;
             }
@@ -1213,7 +1368,10 @@ impl CursorCat {
                                 .abs();
                     let strength = 1.0 + 0.18 * f32::from(chain.saturating_sub(1));
                     let env = env_base * pulse * strength;
-                    lead = lead * (1.0 - env.min(1.0)) - WINCE_RECOIL * env;
+                    // The glide's wince is its face, as its oops is.
+                    if !self.glides() {
+                        lead = lead * (1.0 - env.min(1.0)) - WINCE_RECOIL * env;
+                    }
                     scale_y *= 1.0 - WINCE_SQUASH * env;
                     scale_x *= 1.0 + WINCE_SQUASH * 0.7 * env;
                     let omega =
@@ -1221,7 +1379,11 @@ impl CursorCat {
                     let swing = crate::color_math::exp_f32(-WINCE_TUMBLE_DECAY * elapsed)
                         * crate::supernova::sin_cos_f32(omega * elapsed).0;
                     let swing_env = swing * env_base;
-                    lead += WINCE_TUMBLE * swing_env;
+                    // The glide does not tumble: a 3 Hz sway of a detailed body turns its
+                    // pixels past the flash law (`the_flier_never_flashes`).
+                    if !self.glides() {
+                        lead += WINCE_TUMBLE * swing_env;
+                    }
                     let wobble = 0.05 * swing_env;
                     scale_x *= 1.0 + wobble;
                     scale_y *= 1.0 - wobble;
@@ -1260,12 +1422,13 @@ impl CursorCat {
             CatReaction::Cruise | CatReaction::Celebrate | CatReaction::Discovery => {}
         }
         if self.sing > 0.0 {
-            let one_minus_u = 1.0 - self.sing_beat.fract();
+            let beat = self.dance_beat();
+            let one_minus_u = 1.0 - beat.fract();
             let pulse_sing = one_minus_u * one_minus_u * self.sing;
             scale_y *= 1.0 - SING_SQUASH * pulse_sing;
             scale_x *= 1.0 + SING_SQUASH * 0.7 * pulse_sing;
             lead += SING_SWAY
-                * crate::supernova::sin_cos_f32(std::f32::consts::PI * self.sing_beat).0
+                * crate::supernova::sin_cos_f32(std::f32::consts::PI * beat).0
                 * self.sing;
         }
         let eyes = match reaction {
@@ -1294,6 +1457,15 @@ impl CursorCat {
                 }
             }
         };
+        if self.glides() {
+            // The glide is a rigid body: every squash and stretch (the bank, the landing, the
+            // oops, the wince, the delight, the song) slides its outline and markings across
+            // the pixels under it, and on a white page each one turns them past the flash law
+            // (`the_flier_never_flashes`). Its reactions are its faces, its life is its
+            // breath, and it moves only on a meteor's flight and a song's slow sway.
+            scale_x = 1.0;
+            scale_y = 1.0;
+        }
         CatPose {
             scale_x,
             scale_y,
@@ -1338,14 +1510,35 @@ impl CursorCat {
         if let Some(pending) = self.pending_look.take() {
             self.look = pending;
         }
+        if let Some(pending) = self.pending_body.take() {
+            self.body = pending;
+        }
+        self.face_shown = None;
+        self.face_since = None;
         self.stride_at = None;
         self.stride_shown = self.stride;
         self.reset_spine();
     }
 
-    /// The reduced-motion frame, with no fade or bob: a collection hello is an opaque still for its bounded hold, then gone in one step.
+    /// The reduced-motion frame, with no fade or bob: a collection hello is an opaque still for its bounded hold, then gone in one step. A flier holds its glide's cruise face.
     #[inline]
     pub fn static_frame(&mut self, now: Instant) -> CatFrame {
+        let mut frame = self.static_frame_head(now);
+        frame.body = match self.body {
+            Some(species)
+                if frame.alpha > 0
+                    && !frame.collection_hello
+                    && !matches!(self.state, State::Hidden) =>
+            {
+                CursorBody::Glide(crate::kitty_pet::glide_faces(species).fly)
+            }
+            _ => CursorBody::Head,
+        };
+        frame
+    }
+
+    #[inline]
+    fn static_frame_head(&mut self, now: Instant) -> CatFrame {
         self.fold = None;
         self.facing_left = false;
         let now = self.collection_sample_time(now);
@@ -1368,6 +1561,7 @@ impl CursorCat {
                 bob: 0.0,
                 sing: 0.0,
                 pose: CatPose::STILL,
+                body: CursorBody::Head,
             };
         }
         if self.collection_hello {
@@ -1386,6 +1580,7 @@ impl CursorCat {
                 bob: 0.0,
                 sing: self.sing,
                 pose: CatPose::STILL,
+                body: CursorBody::Head,
             };
         }
         if self.sing == 0.0 && !matches!(self.state, State::Hidden) {
@@ -1477,9 +1672,62 @@ impl CursorCat {
         self.colors
     }
 
-    /// Advance the fade/exit machine one frame and resolve the draw state.
+    /// Advance the fade/exit machine one frame and resolve the draw state, the flier's body and
+    /// face with it ([`Self::set_body`]).
     #[inline]
     pub fn frame(&mut self, now: Instant) -> CatFrame {
+        let mut frame = self.frame_head(now);
+        frame.body = self.resolve_body(now, &frame);
+        frame
+    }
+
+    /// The flier's body for `frame`: the glide face its reaction and eyes ask for, held at least
+    /// [`FACE_DWELL`] once on glass; the head where nothing flies, for a collection hello (the
+    /// collected head itself) and once hidden.
+    #[inline]
+    fn resolve_body(&mut self, now: Instant, frame: &CatFrame) -> CursorBody {
+        let Some(species) = self.body else {
+            return CursorBody::Head;
+        };
+        if frame.collection_hello || matches!(self.state, State::Hidden) {
+            return CursorBody::Head;
+        }
+        let g = crate::kitty_pet::glide_faces(species);
+        let flourish = matches!(frame.exit, CatExit::StarWink | CatExit::HeartMeow)
+            && frame.fade_out >= EXIT_FACE_FADE;
+        let want = match frame.reaction {
+            CatReaction::Startled => g.oof,
+            CatReaction::Celebrate => g.happy,
+            _ if crate::companion::sing_face_live(frame.sing) || flourish => g.happy,
+            _ => match frame.pose.eyes {
+                EyesFrame::Blink => g.blink,
+                EyesFrame::Happy => g.happy,
+                EyesFrame::Open => g.fly,
+            },
+        };
+        #[cfg(any(test, debug_assertions))]
+        let latch_off = FACE_LATCH_OFF.with(std::cell::Cell::get);
+        #[cfg(not(any(test, debug_assertions)))]
+        let latch_off = false;
+        let held = match (self.face_shown, self.face_since) {
+            (Some(shown), Some(since)) => {
+                shown != want && !latch_off && now.saturating_duration_since(since) < FACE_DWELL
+            }
+            _ => false,
+        };
+        match self.face_shown {
+            Some(shown) if held => CursorBody::Glide(shown),
+            Some(shown) if shown == want => CursorBody::Glide(shown),
+            _ => {
+                self.face_shown = Some(want);
+                self.face_since = Some(now);
+                CursorBody::Glide(want)
+            }
+        }
+    }
+
+    #[inline]
+    fn frame_head(&mut self, now: Instant) -> CatFrame {
         let now = self.collection_sample_time(now);
         let discovery_until = self.discovery_until;
         let discovery = self.discovery_active(now);
@@ -1507,7 +1755,7 @@ impl CursorCat {
                 if t >= 1.0 {
                     self.state = State::Shown;
                 }
-                let (bob, stride_cos) = self.frame_bob();
+                let (bob, stride_cos) = self.frame_bob(now);
                 let pose = self.resolve_pose(now, s, reaction, CatExit::Plain, stride_cos);
                 CatFrame {
                     alpha: (t * 255.0) as u8,
@@ -1520,10 +1768,11 @@ impl CursorCat {
                     bob,
                     sing: self.sing,
                     pose,
+                    body: CursorBody::Head,
                 }
             }
             State::Shown => {
-                let (bob, stride_cos) = self.frame_bob();
+                let (bob, stride_cos) = self.frame_bob(now);
                 let pose = self.resolve_pose(now, s, reaction, CatExit::Plain, stride_cos);
                 CatFrame {
                     alpha: 255,
@@ -1536,6 +1785,7 @@ impl CursorCat {
                     bob,
                     sing: self.sing,
                     pose,
+                    body: CursorBody::Head,
                 }
             }
             State::FadeOut(t0) => {
@@ -1546,7 +1796,7 @@ impl CursorCat {
                     self.settle_hidden();
                     return hidden_frame(self.look);
                 }
-                let (bob, stride_cos) = self.frame_bob();
+                let (bob, stride_cos) = self.frame_bob(now);
                 let pose = self.resolve_pose(now, s, reaction, self.exit, stride_cos);
                 CatFrame {
                     alpha: ((1.0 - t) * 255.0) as u8,
@@ -1559,22 +1809,26 @@ impl CursorCat {
                     bob,
                     sing: self.sing,
                     pose,
+                    body: CursorBody::Head,
                 }
             }
         }
     }
 
     #[inline]
-    const fn frame_bob(&self) -> (f32, Option<f32>) {
+    fn frame_bob(&self, now: Instant) -> (f32, Option<f32>) {
         if self.sing <= 0.0 {
-            self.bob_and_stride_cos()
+            self.bob_and_stride_cos(now)
         } else {
-            let dance =
-                crate::supernova::sin_cos_f32(std::f32::consts::TAU * self.sing_beat).0 * BOB_AMP;
+            let dance = if self.glides() {
+                glide_lift(self.dance_beat())
+            } else {
+                crate::supernova::sin_cos_f32(std::f32::consts::TAU * self.sing_beat).0 * BOB_AMP
+            };
             if self.sing >= 1.0 {
                 (dance, None)
             } else {
-                let (cruise, stride_cos) = self.bob_and_stride_cos();
+                let (cruise, stride_cos) = self.bob_and_stride_cos(now);
                 (cruise + (dance - cruise) * self.sing, stride_cos)
             }
         }
@@ -1900,3 +2154,7 @@ pub fn resample_nearest_into(
 #[cfg(test)]
 #[path = "kitty_cursor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "kitty_cursor_flier_tests.rs"]
+mod flier_tests;

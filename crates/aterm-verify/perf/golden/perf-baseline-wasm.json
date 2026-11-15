@@ -1,5 +1,5 @@
 {
-  "_comment": "aterm WASM-BENCH baseline (E0): the SHIPPED wasm modules (CPU aterm-wasm + GPU aterm-gpu-web), bound as ES modules by verify glue and driven by crates/aterm-verify/perf/wasm/bench.mjs in a cross-origin-isolated page of the pinned chrome-headless-shell (HeadlessChrome/155.0.8059.84: V8, performance.now() at 5 us), on the tree's DejaVu Sans Mono — ingest, scroll/typing present, search build/query, restore, the Wave-6 present lanes (uniform_flood / scrolled_stream / styled_scrub), GPU wasm-side frame build. All BIGGER-IS-BETTER. Re-record with targo --unverified verify perf --record wasm (needs verify provision's browser and wasm-opt, and the checkout's stock pin with its wasm32 target; the values below were recorded on rustup's stable). Every key re-recorded 2026-10-23 UTC on the M5 Max (S10, node out of dev): one median of 5 after 1 warmup, wasm-opt'd modules. The node floors before it (2026-07-22 to 2026-10-16, node v26) measured another engine and older code and are not comparable; pooled with three check runs (n=20 per key), every sample cleared its floor.",
+  "_comment": "aterm WASM-BENCH: shipped CPU/GPU modules. The 13 unrelated E0 rate values and pass_ratio are unchanged from the 2026-10-23 baseline. Only the two incompatible GPU frame-build metrics were replaced on 2026-11-14: the old pre-init render call now refuses before frame construction, so it measured errors. The replacement rates use initialized OffscreenCanvas WebGL2 rendering, include gl.finish in each timed batch of 20 frames, and require a dirty frame before every render and a clean frame afterward. A deliberate no-op render fails the guard. Recorded on m62 from fa44eb5c56d plus the benchmark fix, with HeadlessChrome/155.0.8059.84, pinned ANGLE SwiftShader (software, not hardware GPU or on-glass latency), Rust 1.97.1 and the shipping Binaryen 133 -O3 pass. Each median has five samples after one warmup: typing 369.720 frames/s, scrolling 192.105 frames/s. All samples are retained, including the first typing sample of 102.399. Payload budgets are judged independently of these rate baselines; decision 5 of docs/DESIGN-host-boundary-2026-08-30.md records the subsequent glyph shrink and explicit GPU payload budget. Re-record every rate with targo --unverified verify perf --record wasm only for an intentional whole-baseline update.",
   "wasm_cpu_ingest_mixed_mbps": 431.064,
   "wasm_cpu_ingest_replog_mbps": 354.777,
   "wasm_cpu_ingest_str_ascii_mbps": 265.802,
@@ -13,7 +13,7 @@
   "wasm_cpu_scrolled_stream_present_fps": 30007.502,
   "wasm_cpu_styled_scrub_present_fps": 1211.570,
   "wasm_gpu_ingest_mixed_mbps": 435.088,
-  "wasm_gpu_frame_build_fps": 396039.608,
-  "wasm_gpu_scroll_frame_build_fps": 216216.199,
+  "wasm_gpu_typing_render_fps": 369.72,
+  "wasm_gpu_scroll_render_fps": 192.105,
   "pass_ratio": 0.450
 }

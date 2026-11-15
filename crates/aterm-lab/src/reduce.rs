@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 
+use alab_policy::vocab::WallKind;
 use aterm_agent::ai::codex_limits::{CodexLimits, rollout_rate_limits};
 use aterm_agent::harness::codex_rollout::{Row as SpendRow, TurnReader};
 use aterm_agent::harness::codex_steps::CodexStepFold;
@@ -20,7 +21,6 @@ use aterm_agent::harness::upgrade::{
 };
 use aterm_agent::harness::{claude_reads, codex_reads};
 use aterm_json::Value;
-use aterm_phase::WallKind;
 
 use crate::{Fail, LAB, Res};
 
@@ -721,14 +721,18 @@ pub fn phrases() -> Vec<&'static str> {
     ]
 }
 
-fn coded(code: u16) -> [String; 2] {
+/// The `API Error` forms printing `code`: the bare status, the refusal's, and Cloudflare's page
+/// in the API's place (`aterm_phase::wall::edge_block`: its titles end `| Cloudflare`), which
+/// reads as a retried network block where the bare 403 reads as a refusal or a lost login.
+fn coded(code: u16) -> [String; 3] {
     [
         format!("API Error: {code}"),
         format!("API Error: {code} can't help with this"),
+        format!("API Error: {code} | Cloudflare"),
     ]
 }
 
-/// THE CANONICAL PHRASE of a notice whose text is `text` (T7): the first phrase ([`phrases`], or an `API Error` printing the status the source printed) whose [`Reading`] is the source's, with its reset clause rebased ([`reset_clause`]) when the source names one and the phrase reads the same with it.
+/// THE CANONICAL PHRASE of a notice whose text is `text` (T7): the first phrase ([`phrases`], or an `API Error` printing the status the source printed, Cloudflare's page's form among them) whose [`Reading`] is the source's, with its reset clause rebased ([`reset_clause`]) when the source names one and the phrase reads the same with it.
 /// # Errors
 /// No phrase reads as the source does: the notice is refused, never kept.
 pub fn canonical(text: &str, joins: usize, shift: i64, year: i64) -> Result<String, String> {
@@ -1578,7 +1582,8 @@ impl Standing {
 pub struct Readings {
     /// The step fold's steps, oldest first.
     pub steps: Vec<StepRead>,
-    /// Rows past the seed the fold could not read.
+    /// Facts of rows past the seed the fold could not hand on (its `Lost` steps, counted apart
+    /// from [`Self::steps`]).
     pub lost: u64,
     /// Steps dropped from a full queue.
     pub overflow: u64,
@@ -1645,11 +1650,12 @@ fn readings_of(rows: &[&str], program: Program) -> Readings {
                 r.reads.push(claude_reads(line));
             }
             let (a, b) = (f.take(), f.take());
-            (r.lost, r.overflow, r.end) = (a.lost + b.lost, a.overflow + b.overflow, b.end);
+            (r.lost, r.overflow, r.end) = (a.lost() + b.lost(), a.overflow + b.overflow, b.end);
             r.steps = a
                 .steps
                 .iter()
                 .chain(&b.steps)
+                .filter(|s| !matches!(s.ev, StepEvent::Lost { .. }))
                 .map(|s| StepRead {
                     row: row_of(s.pos.off, &ends_at),
                     at_ms: s.pos.at_ms,
@@ -1671,10 +1677,11 @@ fn readings_of(rows: &[&str], program: Program) -> Readings {
                 r.reads.push(codex_reads(line));
             }
             let b = f.take();
-            (r.lost, r.overflow, r.end) = (b.lost, b.overflow, b.end);
+            (r.lost, r.overflow, r.end) = (b.lost(), b.overflow, b.end);
             r.steps = b
                 .steps
                 .iter()
+                .filter(|s| !matches!(s.ev, StepEvent::Lost { .. }))
                 .map(|s| StepRead {
                     row: row_of(s.pos.off, &ends_at),
                     at_ms: s.pos.at_ms,
@@ -1724,6 +1731,7 @@ const fn kind(e: &StepEvent) -> &'static str {
         StepEvent::Compact => "compact",
         StepEvent::Model { .. } => "model",
         StepEvent::Off { .. } => "off",
+        StepEvent::Lost { .. } => "lost",
     }
 }
 
@@ -1762,6 +1770,7 @@ fn same_event(a: &StepEvent, b: &StepEvent, ids: &mut OneToOne) -> Result<(), St
         | (E::EndWall { .. }, E::EndWall { .. })
         | (E::Model { .. }, E::Model { .. })
         | (E::Off { .. }, E::Off { .. })
+        | (E::Lost { .. }, E::Lost { .. })
             if a == b =>
         {
             Ok(())

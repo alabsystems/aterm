@@ -9,12 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use aterm_slog::journal::View;
 #[cfg(unix)]
 use aterm_slog::journal::{
     self, ChainRead, FORMAT, Frame, Inst, Liveness, SegmentRead, ViewRules, complete_lines,
     decode_line, is_end_line, line_subject, parse_segment_name, segment_version,
 };
+use aterm_slog::journal::{Pick, View};
 use aterm_slog::{Cursor, ShortId};
 
 #[cfg(unix)]
@@ -115,8 +115,14 @@ impl Reader {
         }
     }
 
-    /// What the journal answers for `sid` (no directory: [`JournalRead::Absent`]).
+    /// What the journal answers for `sid`'s newest log (no directory: [`JournalRead::Absent`]).
     pub(crate) fn view(&self, sid: &ShortId) -> JournalRead {
+        self.view_picked(sid, Pick::Newest)
+    }
+
+    /// What the journal answers for the log of `sid` that `pick` names (no directory:
+    /// [`JournalRead::Absent`]).
+    pub(crate) fn view_picked(&self, sid: &ShortId, pick: Pick) -> JournalRead {
         let _one = self.flight.lock().unwrap_or_else(|p| p.into_inner());
         #[cfg(unix)]
         {
@@ -128,11 +134,11 @@ impl Reader {
                     return JournalRead::Cut;
                 }
             };
-            view_with(&dir, &self.index, sid, Budgets::READER)
+            view_picked(&dir, &self.index, sid, pick, Budgets::READER)
         }
         #[cfg(not(unix))]
         {
-            let _ = (&self.logs, &self.index, sid);
+            let _ = (&self.logs, &self.index, sid, pick);
             JournalRead::Absent
         }
     }
@@ -195,23 +201,25 @@ pub(crate) struct ReadCost {
     pub(crate) decoded: u64,
 }
 
-/// Read `sid` from `fs` within `b`.
+/// Read the log of `sid` that `pick` names from `fs` within `b`.
 #[cfg(unix)]
-pub(crate) fn view_with(
+pub(crate) fn view_picked(
     fs: &dyn JournalFs,
     index: &Mutex<Index>,
     sid: &ShortId,
+    pick: Pick,
     b: Budgets,
 ) -> JournalRead {
-    view_costed(fs, index, sid, b, &mut ReadCost::default())
+    view_costed(fs, index, sid, pick, b, &mut ReadCost::default())
 }
 
-/// [`view_with`], adding what it spent to `cost`.
+/// [`view_picked`], adding what it spent to `cost`.
 #[cfg(unix)]
 pub(crate) fn view_costed(
     fs: &dyn JournalFs,
     index: &Mutex<Index>,
     sid: &ShortId,
+    pick: Pick,
     b: Budgets,
     cost: &mut ReadCost,
 ) -> JournalRead {
@@ -391,7 +399,7 @@ pub(crate) fn view_costed(
             }
         })
         .collect();
-    match journal::view_of(sid, &chains, unread, ViewRules::READER) {
+    match journal::view_picked(sid, &chains, unread, ViewRules::READER, pick) {
         Some(view) => JournalRead::View(Box::new(view)),
         None if unread => JournalRead::Cut,
         None => JournalRead::Absent,

@@ -157,7 +157,10 @@ impl ClaudeOauth {
             .renew_outcome_with_inputs(path, email, browser, staged.path())
         {
             Ok(exit) if exit.code == 0 => Execution::Completed,
-            Ok(exit) => Execution::Unknown(exit.failure_words()),
+            Ok(exit) => {
+                let renewal = Renewal::authentication_failed(Some(exit.code));
+                Execution::Unknown(RenewalObservation::from_outcome(&Ok(exit)).ended(renewal))
+            }
             Err(why) if why.is_deferred() => Execution::Deferred(why.to_string()),
             Err(why) => Execution::Unknown(why.to_string()),
         }
@@ -261,7 +264,10 @@ impl Provider for ClaudeOauth {
         };
         match context.host.renew_outcome(path, email, browser) {
             Ok(exit) if exit.code == 0 => Execution::Completed,
-            Ok(exit) => Execution::Unknown(exit.failure_words()),
+            Ok(exit) => {
+                let renewal = Renewal::authentication_failed(Some(exit.code));
+                Execution::Unknown(RenewalObservation::from_outcome(&Ok(exit)).ended(renewal))
+            }
             Err(why) if why.is_deferred() => Execution::Deferred(why.to_string()),
             Err(why) => Execution::Unknown(why.to_string()),
         }

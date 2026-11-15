@@ -49,6 +49,7 @@
 //! (a `git worktree prune` or `git gc` dropped it) stays: nothing can then say what was put in
 //! it since.
 
+use crate::git_lazy_fetch as lazy_fetch;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -60,9 +61,6 @@ mod registry;
 
 #[path = "build_cache_retired_history.rs"]
 mod history;
-
-#[path = "build_cache_retired_lazy_fetch.rs"]
-mod lazy_fetch;
 
 /// Nothing in a leftover was written for this long before it goes.
 pub const UNWRITTEN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -218,9 +216,9 @@ impl GitCli {
 /// The git program at a path, its reads kept from fetching an object a partial clone lacks:
 /// `GIT_NO_LAZY_FETCH=1` on every run, which a child git inherits, and `--no-lazy-fetch` where
 /// git takes it; a git that refuses the option runs only where it was seen to obey the variable
-/// ([`lazy_fetch::guard`]). Any other git starts no run, so it cannot authorize snapshot
-/// retirement. No run inherits a `GIT_*` variable this process holds
-/// ([`lazy_fetch::without_git_environment`]).
+/// ([`lazy_fetch::guard`]: agh's answer, asked of it run [`lazy_fetch::Hermetic`]ally). Any other
+/// git starts no run, so it cannot authorize snapshot retirement. No run inherits a `GIT_*`
+/// variable this process holds ([`lazy_fetch::without_git_environment`]).
 struct GitProgram<'a>(&'a Path);
 
 /// `path` without a Windows verbatim drive prefix (`\\?\C:\…`), which git reads as a host name.
@@ -302,9 +300,9 @@ impl GitProgram<'_> {
         alt: Option<&Path>,
         until: Option<Instant>,
     ) -> Answer {
-        let guard = match lazy_fetch::guard(self.0) {
+        let guard = match lazy_fetch::guard(&lazy_fetch::Hermetic::new(self.0)) {
             Ok(guard) => guard,
-            Err(why) => return Answer::unrun(why),
+            Err(why) => return Answer::unrun(why.to_string()),
         };
         let mut cmd = aterm_uds::spawnfd::command(self.0);
         lazy_fetch::without_git_environment(&mut cmd);
@@ -356,9 +354,9 @@ impl Git for GitProgram<'_> {
         objects: Option<&Path>,
         deadline: std::time::Instant,
     ) -> Answer {
-        let guard = match lazy_fetch::guard(self.0) {
+        let guard = match lazy_fetch::guard(&lazy_fetch::Hermetic::new(self.0)) {
             Ok(guard) => guard,
-            Err(why) => return Answer::unrun(why),
+            Err(why) => return Answer::unrun(why.to_string()),
         };
         let mut cmd = aterm_uds::spawnfd::command(self.0);
         lazy_fetch::without_git_environment(&mut cmd);

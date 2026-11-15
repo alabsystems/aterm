@@ -108,7 +108,7 @@ fn linux_comm_name(pid: u32) -> Option<String> {
 /// executable's path.
 #[cfg(target_os = "macos")]
 fn macos_exe_name(pid: u32) -> Option<String> {
-    exe_name_of_procargs2(&aterm_uds::procargs::read(pid)?)
+    exe_name_of_procargs2(&aterm_uds::procargs::read(pid).ok()?)
 }
 
 /// The basename of the exec path a `KERN_PROCARGS2` buffer leads with, read whether or not
@@ -171,7 +171,7 @@ fn env_value<'a>(kv: &'a str, key: &str, fold: fn(char) -> char) -> Option<&'a s
 pub fn process_args(pid: u32) -> Option<ProcArgs> {
     #[cfg(target_os = "macos")]
     {
-        parse_procargs2(&aterm_uds::procargs::read(pid)?)
+        parse_procargs2(&aterm_uds::procargs::read(pid).ok()?)
     }
     #[cfg(target_os = "linux")]
     {

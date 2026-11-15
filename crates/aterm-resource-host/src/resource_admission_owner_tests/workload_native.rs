@@ -59,12 +59,14 @@ fn workload_budget(repetitions: u32) -> Duration {
 struct FixtureProgress {
     path: PathBuf,
     last_completed: Instant,
+    observed_root_bytes: u64,
 }
 impl FixtureProgress {
     fn new(path: PathBuf, now: Instant) -> Self {
         Self {
             path,
             last_completed: now,
+            observed_root_bytes: 0,
         }
     }
     fn completed(&mut self, stage: &str) {
@@ -82,6 +84,13 @@ impl FixtureProgress {
     fn stalled_at(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.last_completed) >= HANG
     }
+    fn observe_root_at(&mut self, path: &std::path::Path, now: Instant) {
+        let bytes = fs::metadata(path).map_or(0, |file| file.len());
+        if bytes > self.observed_root_bytes {
+            self.observed_root_bytes = bytes;
+            self.completed_at("native-root-action-completed", now);
+        }
+    }
     fn assert_progressing(&self) {
         assert!(
             !self.stalled_at(Instant::now()),
@@ -89,6 +98,34 @@ impl FixtureProgress {
             fs::read_to_string(&self.path).unwrap_or_default()
         );
     }
+}
+
+#[test]
+fn only_new_completed_root_stages_renew_the_fixture_hang_window() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let root = scratch.path().join("native-progress");
+    let started = Instant::now();
+    let mut progress = FixtureProgress::new(scratch.path().join("progress"), started);
+    progress.completed_at("original-resources-held", started);
+    progress.observe_root_at(&root, started + HANG - Duration::from_secs(2));
+    assert!(progress.stalled_at(started + HANG));
+
+    fs::write(&root, "native-root-entered\n").unwrap();
+    let first = started + HANG - Duration::from_secs(1);
+    progress.observe_root_at(&root, first);
+    assert!(!progress.stalled_at(first + HANG - Duration::from_nanos(1)));
+    progress.observe_root_at(&root, first + HANG - Duration::from_secs(2));
+    assert!(progress.stalled_at(first + HANG));
+
+    fs::write(&root, "x").unwrap();
+    progress.observe_root_at(&root, first + HANG - Duration::from_secs(1));
+    assert!(progress.stalled_at(first + HANG));
+    fs::write(&root, "native-root-entered\nnative-output-lock-retained\n").unwrap();
+    let second = first + HANG - Duration::from_millis(500);
+    progress.observe_root_at(&root, second);
+    assert!(second.duration_since(started) > HANG);
+    assert!(!progress.stalled_at(second + HANG - Duration::from_nanos(1)));
+    assert!(progress.stalled_at(second + HANG));
 }
 
 #[test]
@@ -299,8 +336,6 @@ fn host_process() {
     // Keep genuine payload images and output evidence, including a silent
     // successful LLD. Never unlink its copied Mach-O during OS assessment.
     scratch.preserve = linker::selected(&case);
-    let (mut owner, namespace, retirement) = World::prepare(&scratch);
-    progress.completed("original-authorities-prepared");
     let artifacts = scratch.path.join("managed-sdk");
     let layout = atpkg::store::Layout {
         prefix: artifacts.join("manager"),
@@ -312,18 +347,24 @@ fn host_process() {
     let service = build.join("bin/targo");
     let compiler = build.join("bin/trustc");
     fs::copy(program.path(), &service).unwrap();
+    crate::native_fixture::qualify_image(&service);
     progress.completed("service-copied");
     fs::copy(program.path(), &compiler).unwrap();
+    crate::native_fixture::qualify_image(&compiler);
     progress.completed("compiler-copied");
     if linker::selected(&case) {
         linker::install(&build);
     } else {
-        fs::copy(program.path(), build.join("bin/rust-lld")).unwrap();
+        let linker = build.join("bin/rust-lld");
+        fs::copy(program.path(), &linker).unwrap();
+        crate::native_fixture::qualify_image(&linker);
     }
     progress.completed("linker-prepared");
     atpkg::platform::install_shim_to(&layout.bin_dir().join("targo"), &service).unwrap();
     atpkg::store::mark_build_ready(&build).unwrap();
     progress.completed("sdk-ready");
+    let (mut owner, namespace, retirement) = World::prepare(&scratch);
+    progress.completed("original-authorities-prepared");
     let source = scratch.path.join("source");
     let cargo_home = scratch.path.join("cargo-home");
     let output = scratch.path.join("output");
@@ -420,7 +461,9 @@ fn host_process() {
     let mut fd_trace = File::create(scratch.path.join("host-descriptors")).unwrap();
     writeln!(fd_trace, "soft={original_fd_limit}").unwrap();
     let mut peak_descriptors = 0;
+    let native_progress = source.join("native-progress");
     while !crate::actor::idle() {
+        progress.observe_root_at(&native_progress, Instant::now());
         let actual_bytes =
             fs::metadata(source.join("contained-descriptors")).map_or(0, |stat| stat.len());
         if actual_bytes != progress_bytes {

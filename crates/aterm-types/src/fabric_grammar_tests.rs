@@ -138,6 +138,24 @@ fn a_principal_is_bounded_and_class_prefixed() {
 }
 
 #[test]
+fn a_tab_id_of_either_form_is_a_principal() {
+    for tab in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        assert!(is_principal(tab), "{tab}");
+        assert!(via_ok(&format!("n-a,{tab}")), "{tab} is a hop");
+    }
+    // Negative controls: a malformed ID of each form names nobody.
+    for bad in [
+        "tqn5r6e014",
+        "tqn5r6e014i",
+        "Tqn5r6e0148",
+        "s-0123456789ABCDEF0123",
+    ] {
+        assert!(!is_principal(bad), "{bad}");
+        assert!(!via_ok(&format!("n-a,{bad}")), "{bad}");
+    }
+}
+
+#[test]
 fn a_topic_is_one_bounded_lowercase_segment() {
     for good in [
         "say",
@@ -170,7 +188,7 @@ fn a_topic_is_one_bounded_lowercase_segment() {
 
 #[test]
 fn a_via_chain_is_bounded_in_hops_and_bytes() {
-    let hop = format!("s-{}", "a".repeat(PRINCIPAL_NAME_MAX));
+    let hop = format!("n-{}", "a".repeat(PRINCIPAL_NAME_MAX));
     let full = vec![hop.as_str(); VIA_MAX_HOPS].join(",");
     assert_eq!(
         full.len(),
@@ -183,7 +201,9 @@ fn a_via_chain_is_bounded_in_hops_and_bytes() {
         "one hop too many"
     );
     assert!(!via_ok(""), "a relay claim naming no relay still demotes");
-    assert!(!via_ok("s-a@n-b"), "a hop is a BARE principal");
-    assert!(!via_ok("s-a,,n-b"), "an empty hop is not a principal");
-    assert!(via_ok("s-a,n-b,h-c"));
+    assert!(!via_ok("a-a@n-b"), "a hop is a BARE principal");
+    assert!(!via_ok("a-a,,n-b"), "an empty hop is not a principal");
+    assert!(!via_ok("s-a,n-b,h-c"), "a loose s- word is no session");
+    assert!(via_ok("tqn5r6e0148,n-b,h-c"));
+    assert!(via_ok("s-0123456789abcdef0123,n-b,h-c"));
 }

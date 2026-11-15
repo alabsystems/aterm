@@ -3192,8 +3192,8 @@ fn count_glass_exit() {
 
 /// The glass's exits this thread ran since the last take, zeroed: the glass envelopes folded
 /// (opacity and height), the glass slab prices ([`glass_frame_price`]) and the glass cadences
-/// ([`Ribbon::next_change_deadline`]'s one-pixel steps). The host's light-fork pin holds it at
-/// zero on every dark ground. Debug and test builds only.
+/// ([`Ribbon::next_change_deadline`]'s height and line-opacity steps). The host's light-fork
+/// pin holds it at zero on every dark ground. Debug and test builds only.
 #[cfg(any(test, debug_assertions))]
 pub fn take_glass_exits() -> usize {
     GLASS_EXITS.with(|n| n.replace(0))
@@ -3493,10 +3493,9 @@ pub struct Ribbon {
     /// tail's fine lay ([`RUN_END_FINE_CELLS`]).
     #[cfg(test)]
     tail_stair: bool,
-    /// Test-only: step the glass's cadence by main's coverage levels, the negative control of
-    /// its one-pixel steps ([`Ribbon::next_change_deadline`]).
+    /// Test-only: book pixel steps alone, without the line opacity deadlines.
     #[cfg(test)]
-    glass_level_steps: bool,
+    glass_pixel_steps: bool,
     /// Test-only: centre the hot edge on the row's top under a kept box, the
     /// negative control of its inset.
     #[cfg(test)]
@@ -3839,7 +3838,7 @@ impl Ribbon {
             #[cfg(test)]
             tail_stair: false,
             #[cfg(test)]
-            glass_level_steps: false,
+            glass_pixel_steps: false,
             #[cfg(test)]
             hot_edge_on_bar: false,
             #[cfg(test)]
@@ -10602,16 +10601,13 @@ impl Ribbon {
             }
             None => (None, None, None),
         };
-        // On glass (§15.2 1.8) the exits move the glass's height, not its opacity: each cell's
-        // steps are one pixel of its reach at the hand, its ember the glass's height floor.
-        #[cfg(test)]
-        let glass_px = if self.glass_level_steps {
-            0.0
-        } else {
-            self.glass_px
-        };
-        #[cfg(not(test))]
+        // Glass height moves in pixels, while the line under it fades in opacity levels.
+        // Book whichever changes first; both share the same exit envelope.
         let glass_px = self.glass_px;
+        #[cfg(test)]
+        let line_peak = if self.glass_pixel_steps { 0.0 } else { 255.0 };
+        #[cfg(not(test))]
+        let line_peak = 255.0;
         #[cfg(any(test, debug_assertions))]
         if glass_px > 0.0 {
             count_glass_exit();
@@ -10668,7 +10664,7 @@ impl Ribbon {
                 continue;
             }
             let base = if glass_px > 0.0 {
-                GLASS_UP_CH * glass_px
+                (GLASS_UP_CH * glass_px).max(line_peak * glass_px / self.cell_h)
             } else {
                 UNDER_COV_CAP * cell.cov0
             };
@@ -10704,7 +10700,7 @@ impl Ribbon {
             let (ember_floor, f_e) = match ember_spend {
                 Some(s) => {
                     let floor = if glass_px > 0.0 {
-                        glass_height_floor(carried * (GLASS_TAIL_UP_CH / GLASS_UP_CH))
+                        glass_height_floor(GLASS_TAIL_UP_CH * glass_px * melt * f_r * f_s * f_m)
                     } else {
                         self.ember_floor_of(carried, cell.t)
                     };

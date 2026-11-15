@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 use crate::harness::account_series::{Fig, Said, SeriesRow};
 use crate::harness::accounts::{Class, Mode, State};
+use crate::harness::alab_seen::Bound;
 pub(crate) use crate::harness::quota_scenes::{
     D, Fx, H, MACHINE, MIN, NOW, SAT7, SAT14, T5, case_b, utc,
 };
@@ -74,7 +75,7 @@ fn alt1_read_at(fx: &mut Fx, week: u32, at: i64) {
 
 /// Scenario A with `alt1` read 16:30 and idle here since: `idle-here`, a bound, since another
 /// Mac may prefer and run it too.
-fn scenario_a_idle() -> Fx {
+pub(crate) fn scenario_a_idle() -> Fx {
     let mut fx = scenario_a();
     fx.state.accounts.remove("alt1");
     fx.series.remove("alt1");
@@ -1083,11 +1084,11 @@ fn a_lean_bounds_both_ways() {
     let words = out.verdict_phrase().unwrap();
     assert_ne!(words.ink, Role::Warn, "a lean is not a stop");
     assert!(
-        words.full.starts_with("? pool1 unread from ~"),
+        words.full.starts_with("pool1 not read from ~") && !words.short.contains('?'),
         "{}",
         words.full
     );
-    // Both branches stop: a stop with `?`.
+    // Both branches stop: a stop, whatever the unread row holds.
     let mut both = scenario_c();
     both.read("pool1", None, Some((990, SAT8)), NOW - 5 * H);
     let out = both.outlook();
@@ -2531,11 +2532,12 @@ fn a_wall_says_out_never_100() {
 /// `≤60% left`), since another Mac may have used it since; so is the carrier's own reading an
 /// hour and a half old while in use (`stale`, whose pace is refused but whose figure stays true:
 /// `≤42% left`, as
-/// [`Figure::of_reading`] says the same reading); a reading whose reset passed is unread (`?`);
+/// [`Figure::of_reading`] says the same reading); a reading whose reset passed is unread (`not
+/// read`, its row's reason `not read since reset`: words, never a mark alone);
 /// under 100 is never said 100; and a bound rounds down, so it stays true (62.5% is `≥62%`),
 /// where an exact figure rounds half up (`63%`). Negative controls: an aged reading said exact
 /// prints `31%` for alt1; `of_week` showing only the classes `shows_figure` admits (the slice
-/// before this fix) says `?` for the stale carrier; a bound rounded half up says `≥63%`.
+/// before this fix) says the stale carrier unread; a bound rounded half up says `≥63%`.
 #[test]
 fn a_lower_bound_says_at_least() {
     let out = scenario_a_idle().outlook();
@@ -2550,7 +2552,16 @@ fn a_lower_bound_says_at_least() {
     assert_eq!(fig("alt1").spoken(), "at most 69 percent left");
     assert_eq!(fig("pool1").words(), "\u{2264}60% left");
     assert_eq!(fig("alt2"), Figure::Unread);
-    assert_eq!(fig("alt2").words(), "?");
+    assert_eq!(fig("alt2").words(), "not read");
+    let alt2 = out.rows.iter().find(|r| r.label == "alt2").unwrap();
+    assert_eq!(alt2.unread(out.as_of), Some(Why::ResetUnread));
+    assert_eq!(Why::ResetUnread.words(), "not read since reset");
+    let me = out.rows.iter().find(|r| r.label == "me").unwrap();
+    assert_eq!(
+        me.unread(out.as_of),
+        None,
+        "a row with a figure is not unread"
+    );
     assert_eq!(Figure::of_reading(996, THU9, NOW, NOW).words(), "1% left");
     assert_eq!(Figure::of_reading(1000, THU9, NOW, NOW).words(), "0% left");
     assert_eq!(
@@ -2582,4 +2593,318 @@ fn a_lower_bound_says_at_least() {
     assert_eq!(Figure::Exact(625).words(), "37% left");
     assert_eq!(Figure::Exact(995).words(), "1% left");
     assert_eq!(Figure::Out.words(), "out");
+}
+
+/// A peer's bound of `label`'s week: `used` tenths read three hours ago on m13, resetting `reset`.
+fn peer_week(fx: &mut Fx, label: &str, used: u16, reset: i64) {
+    fx.lab.insert(
+        label.into(),
+        crate::harness::alab_seen::Bounds {
+            week: Some(crate::harness::alab_seen::Bound::Used {
+                pct_x10: used,
+                reset,
+                read: NOW - 3 * H,
+                by: "m13".into(),
+                src: "statusline".into(),
+            }),
+            five: None,
+        },
+    );
+}
+
+/// T8: A ROW WHOSE RESET PASSED HERE SAYS A PEER'S BOUND: `alt2`'s week, read here before a
+/// reset that passed, says what m13 read of the window now, as an upper bound of what is left
+/// with its reset, age, source and Mac, and that others may use it; the class stays this Mac's
+/// own (`reset-unread`), the JSON carries the bound beside it, and a row read now here keeps its
+/// own figure whatever a peer read.
+/// NEGATIVE CONTROL: with no bound the line still says `passed, not read since`, and with
+/// `window_line` not saying the bound (its `lab` arm removed) the bound's assertion fails.
+#[test]
+fn a_row_whose_reset_passed_here_says_a_peers_bound() {
+    let control = scenario_a().outlook();
+    let line = control.row_lines("alt2").remove(0);
+    assert!(line.contains("passed, not read since"), "CONTROL: {line}");
+    let mut fx = scenario_a();
+    peer_week(&mut fx, "alt2", 320, SAT8);
+    peer_week(&mut fx, "alt1", 990, FRI14);
+    let out = fx.outlook();
+    let week = out.rows[2].window(Window::Week).unwrap();
+    assert_eq!(
+        week.fresh,
+        Fresh::ResetUnread,
+        "the class is this Mac's own"
+    );
+    assert_eq!(week.used_x10, None, "no figure of its own");
+    let line = out.row_lines("alt2").remove(0);
+    assert!(
+        line.starts_with("       week  \u{2264}68% left \u{b7} \u{267b} ")
+            && line.ends_with(" (in 5d12h) \u{b7} as of 3h (statusline, m13), others may use it"),
+        "{line}"
+    );
+    assert!(!line.contains("passed"), "{line}");
+    let json = out.json();
+    assert_eq!(
+        json["lab"]["alt2"]["seven_day"]["used_x10"].as_u64(),
+        Some(320)
+    );
+    assert_eq!(json["lab"]["alt2"]["seven_day"]["by"].as_str(), Some("m13"));
+    assert!(json["lab"].get("alt1").is_none(), "alt1 was read here now");
+    assert!(
+        out.row_lines("alt1")[0].contains("69% left"),
+        "{:?}",
+        out.row_lines("alt1")
+    );
+}
+
+/// THE LEAN'S BEST CASE COUNTS A PEER'S BOUND, NEVER A FRESH WEEK: `pool1`, never read here, is
+/// a lean; where m13 read its week at 99% the best case holds that bound to its reset, so both
+/// branches stop (a stop with `?`) where a fresh week ran on; the worst case is unchanged and the
+/// main chain decides nothing on the bound. The lean says what its best case assumed, in the
+/// text's header and in the JSON: the bound m13 read, and a fresh week only where it assumed one.
+/// NEGATIVE CONTROLS: with `assume_best` ignoring `lab_week` the verdict stays `Lean`; with the
+/// header chosen by the row's class (as it once was), the text says `if it has a fresh week:`
+/// over the pass that held the bound, and `the header names the bound` fails.
+#[test]
+fn the_leans_best_case_counts_a_peers_bound() {
+    let fresh = scenario_c().outlook();
+    assert!(
+        matches!(&fresh.verdict, Verdict::Lean { row, .. } if row == "pool1"),
+        "CONTROL: {:?}",
+        fresh.verdict
+    );
+    let mut fx = scenario_c();
+    peer_week(&mut fx, "pool1", 990, SAT8);
+    let out = fx.outlook();
+    assert!(
+        matches!(&out.verdict, Verdict::Stop { lean: Some(row), .. } if row == "pool1"),
+        "{:?}",
+        out.verdict
+    );
+    let lean = |o: &Outlook| {
+        o.week
+            .as_ref()
+            .and_then(|p| p.lean.clone())
+            .expect("a lean")
+    };
+    assert_eq!(
+        lean(&out).worst,
+        lean(&fresh).worst,
+        "the worst case is unchanged"
+    );
+    assert_eq!(
+        out.week.as_ref().map(|p| &p.chain),
+        fresh.week.as_ref().map(|p| &p.chain),
+        "the main chain is unchanged"
+    );
+    let best = lean(&out).best;
+    assert!(!best.stops.is_empty(), "the best case stops on the bound");
+    assert_eq!(lean(&fresh).assumed, Assumed::Fresh);
+    assert!(
+        matches!(&lean(&out).assumed, Assumed::Peer(Bound::Used { by, pct_x10: 990, .. }) if by == "m13"),
+        "{:?}",
+        lean(&out).assumed
+    );
+    assert!(
+        fresh.text().contains("  if it has a fresh week:\n"),
+        "CONTROL: {}",
+        fresh.text()
+    );
+    let text = out.text();
+    assert!(
+        text.contains(&format!(
+            "  if it holds what m13 read (\u{2264}1% left until {}):\n",
+            long_when(SAT8, &utc())
+        )),
+        "the header names the bound: {text}"
+    );
+    assert!(!text.contains("fresh week"), "{text}");
+    let json = out.json();
+    let lean_json = &json["passes"][0]["lean"];
+    assert_eq!(lean_json["assumed"].as_str(), Some("peer"), "{lean_json}");
+    assert_eq!(lean_json["peer"]["by"].as_str(), Some("m13"));
+    assert_eq!(lean_json["peer"]["used_x10"].as_u64(), Some(990));
+    assert_eq!(
+        fresh.json()["passes"][0]["lean"]["assumed"].as_str(),
+        Some("fresh")
+    );
+}
+
+/// A ROW NEVER READ HERE SAYS A PEER'S FIVE-HOUR BOUND: `pool1`'s five-hour window, never read
+/// here, says what m13 read of it (`≤60% left`, its reset, age, source and Mac); with no bound it
+/// says no five-hour line at all.
+/// NEGATIVE CONTROL: with `row_lines` showing a window only where it was read here or is the week
+/// (its `w.lab.is_some()` arm removed), no five-hour line is said and `the five-hour bound` fails.
+#[test]
+fn a_row_never_read_here_says_a_peers_five_hour_bound() {
+    let control = scenario_c().outlook();
+    assert!(
+        control
+            .row_lines("pool1")
+            .iter()
+            .all(|line| !line.trim_start().starts_with("5h")),
+        "CONTROL: {:?}",
+        control.row_lines("pool1")
+    );
+    let mut fx = scenario_c();
+    fx.lab.insert(
+        "pool1".into(),
+        crate::harness::alab_seen::Bounds {
+            week: None,
+            five: Some(Bound::Used {
+                pct_x10: 400,
+                reset: NOW + 2 * H,
+                read: NOW - 30 * MIN,
+                by: "m13".into(),
+                src: "statusline".into(),
+            }),
+        },
+    );
+    let out = fx.outlook();
+    let row = out.rows.iter().find(|r| r.label == "pool1").unwrap();
+    assert_eq!(row.window(Window::Five).unwrap().fresh, Fresh::NeverRead);
+    let lines = out.row_lines("pool1");
+    let five = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("5h"))
+        .unwrap_or_else(|| panic!("the five-hour bound: {lines:?}"));
+    assert!(
+        five.starts_with("       5h    \u{2264}60% left \u{b7} \u{267b} ")
+            && five.ends_with(" (in 2h) \u{b7} as of 30m (statusline, m13), others may use it"),
+        "{five}"
+    );
+    assert_eq!(
+        out.json()["lab"]["pool1"]["five_hour"]["used_x10"].as_u64(),
+        Some(400)
+    );
+}
+
+/// T9: AN OUTLOOK WRITES NOTHING WITH THE JOURNAL ON OR OFF: over a store on disk, `state.json`,
+/// the ledger and the series stay byte-identical whether the outlook is given a peer's bound
+/// (and shows it) or none, and the live state loads back unchanged.
+/// NEGATIVE CONTROL: the bound reaches the outlook: given to `me` (a row read now here) in place
+/// of `pool1` it is not shown and `the journal was on` fails; with `build` saving its replay
+/// clone through `Store::save`, `state.json` moves and `no file changed` fails.
+#[test]
+fn an_outlook_writes_nothing_with_the_journal_on_or_off() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-outlook-t9-")
+        .tempdir()
+        .expect("temp dir");
+    let mut fx = scenario_c();
+    let store = accounts::Store::at(dir.path());
+    store.save(&fx.state).expect("save");
+    store
+        .append(&[accounts::Event::new(NOW - H, accounts::Kind::Sample, "me")])
+        .expect("ledger");
+    let snapshot = || {
+        walk(dir.path())
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).expect("read");
+                (path, bytes)
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before = snapshot();
+    let loaded = store.load(NOW).expect("load").0;
+    let off = outlook(&Inputs {
+        state: &loaded,
+        ..fx.inputs()
+    });
+    peer_week(&mut fx, "pool1", 400, SAT8);
+    let on = outlook(&Inputs {
+        state: &loaded,
+        ..fx.inputs()
+    });
+    assert!(
+        off.json()["lab"]
+            .as_object()
+            .is_some_and(|lab| lab.is_empty())
+    );
+    assert!(
+        on.json()["lab"].get("pool1").is_some(),
+        "the journal was on"
+    );
+    assert_eq!(loaded, store.load(NOW).expect("load").0, "the live state");
+    assert_eq!(before, snapshot(), "no file changed");
+}
+
+/// T7: THE PICKS NEVER READ A PEER'S READING: with a journal installed in which m13 read
+/// `alt2`'s week (its reset passed here, so the display admits the bound) at 99% used,
+/// `candidates`' order and verdicts, at a wall and at a turn's end, and `launch_row` are the same
+/// as with no journal; only the outlook given the bound shows it.
+/// NEGATIVE CONTROL: with `condition` counting `alab_seen::current(false)`'s admitted week as the
+/// row's own reading (a mutant feeding the lab bound into `Rank`), `alt2` is ranked as nearly
+/// full and the `candidates` assertion fails: `left: [("alt1", Ok(…)), ("alt2", Ok(…)), …]`.
+#[test]
+fn the_picks_are_the_same_with_the_journal_on_and_off() {
+    use crate::harness::accounts::{Cli, Point, candidates, launch_row};
+    use crate::harness::alab_seen::{self, AccountSeen, Figure, Seen, WindowSeen};
+    const ALT2: &str = "ac-00000000000000a2";
+    const PEER: &str = "13000000000000000000000000000013";
+    const OWN: &str = "02000000000000000000000000000002";
+    let keyer: fn(&str, &str) -> Option<String> =
+        |_, email| (email == "alt2@example.test").then(|| ALT2.to_owned());
+    let mut fx = scenario_a();
+    fx.roster.rows[2].email = Some("alt2@example.test".into());
+    let seen = Seen {
+        me: [OWN.to_owned()].into(),
+        at: NOW,
+        accounts: [(
+            ALT2.to_owned(),
+            AccountSeen {
+                windows: vec![WindowSeen {
+                    window: alab_seen::WEEK.into(),
+                    sub: None,
+                    figure: Some(Figure::Used {
+                        pct_x10: 990,
+                        reset: Some(SAT8),
+                    }),
+                    read: Some((NOW - 3 * H, "m13".into(), "statusline".into())),
+                    reader: Some(PEER.into()),
+                    wall_until: None,
+                    wall_by: None,
+                }],
+                ..AccountSeen::default()
+            },
+        )]
+        .into(),
+    };
+    let lab = crate::harness::journal::with_keyer(keyer, || {
+        alab_seen::bounds(Cli::Claude, &fx.roster, &seen, NOW)
+    });
+    assert!(
+        lab.get("alt2").is_some_and(|b| b.week.is_some()),
+        "CONTROL: the display admits the bound: {lab:?}"
+    );
+    let picks = || {
+        crate::harness::journal::with_keyer(keyer, || {
+            let points = [
+                Point::Wall {
+                    window: "seven_day".into(),
+                    at: None,
+                },
+                Point::TurnEnd,
+            ];
+            let ranked = points
+                .iter()
+                .map(|point| {
+                    candidates(&fx.roster, &fx.state, &fx.enrolled, Some("me"), point, NOW)
+                })
+                .collect::<Vec<_>>();
+            let launch =
+                launch_row(&fx.roster, &fx.state, &fx.enrolled, NOW).map(|row| row.label.clone());
+            (ranked, launch)
+        })
+    };
+    let off = picks();
+    let on = alab_seen::with_seen(seen.clone(), picks);
+    assert_eq!(on, off, "the picks are the journal's off picks");
+    let mut shown = scenario_a();
+    shown.roster = fx.roster.clone();
+    shown.lab = lab;
+    assert!(
+        shown.outlook().row_lines("alt2")[0].contains("others may use it"),
+        "the outlook given the bound shows it"
+    );
 }

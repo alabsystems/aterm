@@ -981,10 +981,7 @@ fn sync_with_candidates_escapes_frozen_or_offline_primary_and_rejects_forged_hig
     let pin_b64 = crate::b64::encode_padded(&pin);
     join_host(&st_fresh, &format!("{url_fresh}#{pin_b64}"), "m5");
     join_host(&member, &format!("{url_primary}#{pin_b64}"), "m9");
-    assert_eq!(
-        std::fs::read(member.home.join(".secrets/shared-key")).unwrap(),
-        b"v1"
-    );
+    assert_eq!(crate::client::stored(&member, "shared-key").unwrap(), b"v1");
 
     // Advance `s_fresh` to seq 3 while `s_primary` stays frozen at seq 2!
     {
@@ -1002,10 +999,7 @@ fn sync_with_candidates_escapes_frozen_or_offline_primary_and_rejects_forged_hig
         matches!(frozen_out, SyncOutcome::Unchanged { seq: 2 }),
         "expected Unchanged seq 2 on frozen primary, got {frozen_out:?}"
     );
-    assert_eq!(
-        std::fs::read(member.home.join(".secrets/shared-key")).unwrap(),
-        b"v1"
-    );
+    assert_eq!(crate::client::stored(&member, "shared-key").unwrap(), b"v1");
 
     // Positive check 1: `sync_with_candidates` ignores `s_rogue`'s unverified `seq = 5` and
     // advances `member` from `s_fresh` (`seq = 3`), keeping `source.toml` pinned to `url_primary`!
@@ -1015,10 +1009,7 @@ fn sync_with_candidates_escapes_frozen_or_offline_primary_and_rejects_forged_hig
         matches!(escaped_out, SyncOutcome::Applied { seq: 3, .. }),
         "expected Applied seq 3 from verified peer, got {escaped_out:?}"
     );
-    assert_eq!(
-        std::fs::read(member.home.join(".secrets/shared-key")).unwrap(),
-        b"v2"
-    );
+    assert_eq!(crate::client::stored(&member, "shared-key").unwrap(), b"v2");
     assert_eq!(
         config(&member).unwrap().unwrap().source,
         Source::Url(url_primary.clone()),
@@ -1054,10 +1045,7 @@ fn sync_with_candidates_escapes_frozen_or_offline_primary_and_rejects_forged_hig
         matches!(offline_failover, SyncOutcome::Applied { seq: 4, .. }),
         "expected Applied seq 4 on offline failover, got {offline_failover:?}"
     );
-    assert_eq!(
-        std::fs::read(member.home.join(".secrets/shared-key")).unwrap(),
-        b"v3"
-    );
+    assert_eq!(crate::client::stored(&member, "shared-key").unwrap(), b"v3");
 
     s_fresh.stop();
     s_rogue.stop();
@@ -1124,10 +1112,7 @@ fn dead_source() -> DeadSource {
         assert_eq!(admin_publish(&st_fresh, &a_fresh, &doc).unwrap().seq, 3);
     }
     s_primary.stop();
-    assert_eq!(
-        std::fs::read(member.home.join(".secrets/shared-key")).unwrap(),
-        b"v1"
-    );
+    assert_eq!(crate::client::stored(&member, "shared-key").unwrap(), b"v1");
     // The browse's TXT hints are hints: the rogue's names a higher seq than any.
     let hint = |seq| {
         Some(crate::server::VaultTxt {
@@ -1362,7 +1347,7 @@ fn an_exact_peer_recovers_a_damaged_cache_after_a_bodyless_primary_response() {
 }
 
 #[test]
-fn an_intact_cache_repairs_missing_files_after_a_bodyless_primary_response() {
+fn an_intact_cache_repairs_an_unrecorded_apply_after_a_bodyless_primary_response() {
     let _answering = ServersAnswering::set();
     for bodyless in [false, true] {
         let at = dead_source();
@@ -1374,33 +1359,38 @@ fn an_intact_cache_repairs_missing_files_after_a_bodyless_primary_response() {
         let config = configured(&at.member).unwrap();
         let observation = network_observation::project(&at.member, &config, &before);
         assert!(observation.is_some());
-        let file = at.member.home.join(".secrets/shared-key");
-        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert_eq!(
+            crate::client::stored(&at.member, "shared-key").unwrap(),
+            b"v2"
+        );
         assert!(materialization_ready(&at.member).unwrap());
         if bodyless {
             primary.answer_with(Some(
                 b"HTTP/1.1 204 No Content\r\nETag: \"3\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
             ));
         }
-        std::fs::remove_file(&file).unwrap();
-        assert!(!materialization_ready(&at.member).unwrap());
+        unrecord_apply(&at.member);
         subscriber_pass(&at.member, &mut repaired, &FOUND_NONE).unwrap();
         assert!(
-            materialization_ready(&at.member).unwrap(),
+            load_state(&at.member).unwrap().held.is_some(),
             "bodyless={bodyless}"
         );
-        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert!(materialization_ready(&at.member).unwrap());
+        assert_eq!(
+            crate::client::stored(&at.member, "shared-key").unwrap(),
+            b"v2"
+        );
         assert_eq!(load_state(&at.member).unwrap().digest, before.digest);
         if bodyless {
             assert_eq!(
                 network_observation::project(&at.member, &config, &load_state(&at.member).unwrap()),
                 observation
             );
-            // A repeatedly removed file is still the same repair set at this
-            // version; the subscriber must not keep fighting the local writer.
-            std::fs::remove_file(&file).unwrap();
+            // A state that again records no apply is still the same repair at this
+            // version; the subscriber applies a version once for that reason, never in a loop.
+            unrecord_apply(&at.member);
             subscriber_pass(&at.member, &mut repaired, &FOUND_NONE).unwrap();
-            assert!(!file.exists());
+            assert!(load_state(&at.member).unwrap().held.is_none());
             // Explicit readers still request a repair, including the bounded
             // Commons recovery path. Neither grants a new network receipt.
             super::super::bounded::sync_reader_with_candidates_until(
@@ -1409,23 +1399,27 @@ fn an_intact_cache_repairs_missing_files_after_a_bodyless_primary_response() {
                 &[],
             )
             .unwrap();
-            assert_eq!(std::fs::read(&file).unwrap(), b"v2");
-            std::fs::remove_file(&file).unwrap();
+            assert!(load_state(&at.member).unwrap().held.is_some());
+            unrecord_apply(&at.member);
             super::super::sync(&at.member, None).unwrap();
-            assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+            assert!(load_state(&at.member).unwrap().held.is_some());
             for etag in ["", "ETag: \"2\"\r\n"] {
                 primary.answer_with(Some(format!(
                     "HTTP/1.1 204 No Content\r\n{etag}Content-Length: 0\r\nConnection: close\r\n\r\n"
                 ).into_bytes()));
-                std::fs::remove_file(&file).unwrap();
+                unrecord_apply(&at.member);
                 super::super::bounded::sync_reader_with_candidates_until(
                     &at.member,
                     Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                     &[],
                 )
                 .unwrap();
-                assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+                assert!(load_state(&at.member).unwrap().held.is_some());
             }
+            assert_eq!(
+                crate::client::stored(&at.member, "shared-key").unwrap(),
+                b"v2"
+            );
             assert_eq!(
                 network_observation::project(&at.member, &config, &load_state(&at.member).unwrap()),
                 observation
@@ -1466,7 +1460,7 @@ fn bounded_log_only_readers_recover_before_contacting_an_endpoint() {
                 remove_member_in_log(&lab.m22, request.binding().actor()).unwrap();
                 save_records(&reader, &load_records(&lab.m22).unwrap().encode()).unwrap();
             }
-            "repair" => std::fs::remove_file(reader.home.join(".secrets/shared")).unwrap(),
+            "repair" => unrecord_apply(&reader),
             _ => unreachable!(),
         }
         lab.server.stop();
@@ -1499,7 +1493,7 @@ fn bounded_log_only_readers_recover_before_contacting_an_endpoint() {
         } else {
             assert!(matches!(outcome, SyncOutcome::Applied { .. }));
             assert_eq!(
-                std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
+                crate::client::stored(&reader, "shared").unwrap(),
                 if change == "update" { b"new" } else { b"old" }
             );
             assert!(materialization_ready(&reader).unwrap());
@@ -1535,10 +1529,6 @@ fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
             admin_publish(&lab.m22, &admin, &doc).unwrap();
         }
         save_records(&lab.m7, &load_records(&lab.m22).unwrap().encode()).unwrap();
-        assert!(
-            changed_files(&lab.m7, &before).is_empty() && gaps(&lab.m7, &before).is_empty(),
-            "old files remain physically intact"
-        );
         assert_ne!(
             log_entries::current_records_digest(&lab.m7, &config, &before),
             before.records_digest,
@@ -1579,10 +1569,7 @@ fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
             assert!(!materialization_ready(&lab.m7).unwrap());
         } else {
             assert!(matches!(outcome, SyncOutcome::Applied { .. }));
-            assert_eq!(
-                std::fs::read(lab.m7.home.join(".secrets/shared")).unwrap(),
-                b"new"
-            );
+            assert_eq!(crate::client::stored(&lab.m7, "shared").unwrap(), b"new");
             assert!(materialization_ready(&lab.m7).unwrap());
         }
     }
@@ -1595,13 +1582,8 @@ fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
         let original = network_observation::project(&reader, &config, &before);
         assert_eq!(original.is_none(), log_only);
         let observed = receipt(&before);
-        let catalog = std::fs::read(
-            reader
-                .home
-                .join(".secrets")
-                .join(crate::entry_class::GITHUB_REPOSITORIES),
-        )
-        .unwrap();
+        let catalog = crate::client::stored(&reader, crate::entry_class::GITHUB_REPOSITORIES)
+            .expect("the registered repository input is read in place");
         lab.server.stop();
         let primary = StandIn::at(
             &lab.url,
@@ -1629,7 +1611,7 @@ fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
             "local repair changes no authenticated source version"
         );
         assert_eq!(
-            std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
+            crate::client::stored(&reader, "shared").unwrap(),
             b"current"
         );
         assert_eq!(
@@ -1645,18 +1627,14 @@ fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
             &reader,
             &config,
             &[crate::entry_class::GITHUB_REPOSITORIES],
-            || {
-                Ok(std::fs::read(
-                    reader
-                        .home
-                        .join(".secrets")
-                        .join(crate::entry_class::GITHUB_REPOSITORIES),
-                )?)
-            },
+            || Ok(()),
         )
         .unwrap()
         .expect("the unchanged registered repository input is ready after repair");
-        assert_eq!(captured.inputs, catalog);
+        assert_eq!(
+            crate::client::stored(&reader, crate::entry_class::GITHUB_REPOSITORIES),
+            Some(catalog)
+        );
         assert!(captured.snapshot.is_current(&reader).unwrap());
         let repeated =
             apply_until(&reader, config, after, ApplyInput::Cached, None, None, true).unwrap();
@@ -1721,7 +1699,7 @@ fn pending_readers_apply_local_admission_or_continue_to_the_network() {
         assert!(matches!(outcome, SyncOutcome::Applied { .. }));
         assert_eq!(load_state(&reader).unwrap().membership, Stored::In);
         assert_eq!(
-            std::fs::read(reader.home.join(".secrets/shared")).unwrap(),
+            crate::client::stored(&reader, "shared").unwrap(),
             b"newly admitted"
         );
         if let Some(primary) = primary {
@@ -1734,7 +1712,7 @@ fn pending_readers_apply_local_admission_or_continue_to_the_network() {
 }
 
 #[test]
-fn an_intact_cache_repairs_missing_files_when_every_endpoint_fails() {
+fn an_intact_cache_repairs_an_unrecorded_apply_when_every_endpoint_fails() {
     let _answering = ServersAnswering::set();
     for reply in [
         None,
@@ -1803,14 +1781,16 @@ fn an_intact_cache_repairs_missing_files_when_every_endpoint_fails() {
             network_observation::project(&at.member, &config, &repaired_legacy),
             observation
         );
-        let file = at.member.home.join(".secrets/shared-key");
-        std::fs::remove_file(&file).unwrap();
-        assert!(!materialization_ready(&at.member).unwrap());
+        unrecord_apply(&at.member);
         let said = std::cell::Cell::new(SourceSaid::AtOnce);
         let (_, outcome) = subscriber_pass_saying(&at.member, &mut repaired, &FOUND_NONE, &said)
-            .expect("offline cache repairs the missing file");
+            .expect("offline cache repairs the unrecorded apply");
         assert!(matches!(outcome, SyncOutcome::Applied { seq: 3, .. }));
-        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert!(load_state(&at.member).unwrap().held.is_some());
+        assert_eq!(
+            crate::client::stored(&at.member, "shared-key").unwrap(),
+            b"v2"
+        );
         assert!(materialization_ready(&at.member).unwrap());
         assert!(failed_over_idle(Pass {
             source: said.get(),
@@ -1837,11 +1817,11 @@ fn an_intact_cache_repairs_missing_files_when_every_endpoint_fails() {
             network_refresh::VaultNetworkRefreshOutcome::Failed
         );
 
-        // Offline repair has the same debounce as an online repair. A repeated
-        // local edit is left alone; an explicit reader can still restore it.
-        std::fs::remove_file(&file).unwrap();
+        // Offline repair has the same debounce as an online repair. A state that again
+        // records no apply at this version is left alone; an explicit reader still applies it.
+        unrecord_apply(&at.member);
         assert!(subscriber_pass(&at.member, &mut repaired, &FOUND_NONE).is_err());
-        assert!(!file.exists());
+        assert!(load_state(&at.member).unwrap().held.is_none());
         let asked = primary.asked();
         let before_local = network_refresh::project(
             &config,
@@ -1857,7 +1837,7 @@ fn an_intact_cache_repairs_missing_files_when_every_endpoint_fails() {
             &[],
         )
         .unwrap();
-        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert!(load_state(&at.member).unwrap().held.is_some());
         assert_eq!(
             primary.asked(),
             asked,
@@ -1875,14 +1855,26 @@ fn an_intact_cache_repairs_missing_files_when_every_endpoint_fails() {
             before_local,
             "a local-only repair makes no network attempt"
         );
-        std::fs::remove_file(&file).unwrap();
+        unrecord_apply(&at.member);
         super::super::sync(&at.member, None).unwrap();
-        assert_eq!(std::fs::read(&file).unwrap(), b"v2");
+        assert!(load_state(&at.member).unwrap().held.is_some());
+        assert_eq!(
+            crate::client::stored(&at.member, "shared-key").unwrap(),
+            b"v2"
+        );
         assert_eq!(
             network_observation::project(&at.member, &config, &load_state(&at.member).unwrap()),
             observation
         );
     }
+}
+
+/// Make the state at `paths` one an older aterm wrote: no apply of this build recorded what it
+/// reads ([`State::held`]), so a subscriber's pass applies the version it holds again, once.
+fn unrecord_apply(paths: &Paths) {
+    let mut state = load_state(paths).unwrap();
+    state.held = None;
+    save_state(paths, &state).unwrap();
 }
 
 /// A source that answers with a body claiming a newer seq that does not verify (a host that
@@ -1916,7 +1908,7 @@ fn a_forged_newer_seq_at_the_source_does_not_stop_the_failover() {
         "{outcome:?}"
     );
     assert_eq!(
-        std::fs::read(at.member.home.join(".secrets/shared-key")).unwrap(),
+        crate::client::stored(&at.member, "shared-key").unwrap(),
         b"v2"
     );
     assert!(source.asked() >= 1, "the pass asked the source first");
@@ -1995,7 +1987,7 @@ fn a_dead_source_fails_over_to_a_browsed_server_with_a_newer_seq() {
         "{outcome:?}"
     );
     assert_eq!(
-        std::fs::read(at.member.home.join(".secrets/shared-key")).unwrap(),
+        crate::client::stored(&at.member, "shared-key").unwrap(),
         b"v2"
     );
     assert_eq!(
@@ -2037,7 +2029,7 @@ fn a_forged_higher_seq_on_a_browsed_server_is_ignored() {
         "{outcome:?}"
     );
     assert_eq!(
-        std::fs::read(at.member.home.join(".secrets/shared-key")).unwrap(),
+        crate::client::stored(&at.member, "shared-key").unwrap(),
         b"v2"
     );
     for server in at.servers {
@@ -2333,10 +2325,7 @@ fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_stead
         ),
         "{member_healed:?}"
     );
-    assert_eq!(
-        std::fs::read(member.home.join(".secrets/note")).unwrap(),
-        b"base"
-    );
+    assert_eq!(crate::client::stored(&member, "note").unwrap(), b"base");
 
     s1.stop();
     s2.stop();
@@ -2758,7 +2747,7 @@ fn a_server_pulls_a_newer_head_from_a_browsed_peer() {
     // Sync `admin_paths` (configured ONLY against `url1`) and verify `v2` arrived through `s1`.
     sync(&admin_paths, None).expect("sync from caught-up s1");
     assert_eq!(
-        std::fs::read(admin_paths.home.join(".secrets/shared-key")).unwrap(),
+        crate::client::stored(&admin_paths, "shared-key").unwrap(),
         b"v2"
     );
 
@@ -2894,7 +2883,7 @@ fn a_publish_reaches_every_candidate_server() {
     assert_eq!(s2.held_seq("alab"), Some(3));
     assert_eq!(s3.held_seq("alab"), Some(3));
     assert_eq!(
-        std::fs::read(admin_paths.home.join(".secrets/token")).unwrap(),
+        crate::client::stored(&admin_paths, "token").unwrap(),
         b"t-seq3"
     );
 
@@ -4575,18 +4564,9 @@ fn unequal_partition_recovers(reader: PartitionReader) {
     ));
     assert_eq!(load_state(&b3).unwrap().membership, Stored::In);
     for host in [&b1, &b2, &b3] {
-        assert_eq!(
-            std::fs::read(host.home.join(".secrets/f8-a-1")).unwrap(),
-            b"from-a-1"
-        );
-        assert_eq!(
-            std::fs::read(host.home.join(".secrets/f8-a-2")).unwrap(),
-            b"from-a-2"
-        );
-        assert_eq!(
-            std::fs::read(host.home.join(".secrets/f8-b-1")).unwrap(),
-            b"from-b-1"
-        );
+        assert_eq!(crate::client::stored(&host, "f8-a-1").unwrap(), b"from-a-1");
+        assert_eq!(crate::client::stored(&host, "f8-a-2").unwrap(), b"from-a-2");
+        assert_eq!(crate::client::stored(&host, "f8-b-1").unwrap(), b"from-b-1");
     }
 
     s1.stop();

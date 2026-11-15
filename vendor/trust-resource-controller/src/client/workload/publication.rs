@@ -293,10 +293,12 @@ impl LocalIoScope {
             self.budget.publish_local_file(
                 &self.selected,
                 source,
-                destination,
-                self.life.request.key.operation,
-                index as u64,
-                &self.exclusions,
+                crate::descriptors::LocalFilePublication {
+                    destination,
+                    operation: self.life.request.key.operation,
+                    ordinal: index as u64,
+                    exclusions: &self.exclusions,
+                },
                 self.deadline,
             )
         };
@@ -338,7 +340,7 @@ fn hex_digest(value: &str) -> io::Result<[u8; 32]> {
         return Err(refused());
     }
     let mut result = [0; 32];
-    for (output, pair) in result.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+    for (output, pair) in result.iter_mut().zip(value.as_bytes().as_chunks::<2>().0.iter()) {
         let digit = |value: u8| match value {
             b'0'..=b'9' => Some(value - b'0'),
             b'a'..=b'f' => Some(value - b'a' + 10),

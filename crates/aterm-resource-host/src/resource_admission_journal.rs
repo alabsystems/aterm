@@ -32,6 +32,7 @@ pub(super) struct Journal {
     done: PathBuf,
     authority: PathBuf,
     identity: (u64, u64),
+    directory: File,
     debt: ExternalDebt,
     readiness: Value,
     faults: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
@@ -98,19 +99,12 @@ fn exists(path: &std::path::Path) -> io::Result<bool> {
     }
 }
 fn name(binding: &Binding) -> io::Result<String> {
-    let suffix = binding
-        .session
-        .strip_prefix("s-")
-        .filter(|value| {
-            !value.is_empty()
-                && value.len() <= 62
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        .ok_or_else(|| refused("invalid host attempt session"))?;
+    let session = &binding.session;
+    if !aterm_types::control_verbs::is_minted_sid(session) {
+        return Err(refused("invalid host attempt session"));
+    }
     Ok(format!(
-        "s-{suffix}.{}.json",
+        "{session}.{}.json",
         aterm_codec::hex::encode_lower(&binding.attempt)
     ))
 }
@@ -137,6 +131,7 @@ impl Journal {
             done,
             authority,
             identity: identity(&directory)?,
+            directory,
             debt: debt.clone(),
             readiness: expected,
             faults: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -168,7 +163,9 @@ impl Journal {
     }
     fn validate(&self) -> io::Result<()> {
         self.namespace.validate()?;
-        if identity(&private(&self.root, true)?)? != self.identity {
+        if identity(&self.directory)? != self.identity
+            || identity(&private(&self.root, true)?)? != self.identity
+        {
             return Err(refused("host journal directory changed"));
         }
         if readiness(&self.namespace, &self.root, &self.debt)? != self.readiness
@@ -371,6 +368,38 @@ impl Journal {
             self.authority.clone(),
             name(binding)?.replace(".json", ".cap"),
         ))
+    }
+
+    /// Fresh operation-local storage beneath this actual original host journal.
+    /// It creates no source/SDK/admission owner and cannot adopt a prior attempt.
+    pub(super) fn materialization_workspace(
+        &self,
+        binding: &Binding,
+        graph: [u8; 16],
+        deadline: Instant,
+    ) -> io::Result<atpkg::private_input::MaterializationWorkspace> {
+        use std::os::fd::AsFd as _;
+        self.validate()?;
+        name(binding)?;
+        // An injectively framed full binding is naming DATA only. A collision
+        // still refuses fresh creation; it cannot adopt a prior owner.
+        let mut subject = b"aterm-bootstrap-materialization-name-v1\0".to_vec();
+        subject.extend_from_slice(&(binding.session.len() as u64).to_be_bytes());
+        subject.extend_from_slice(binding.session.as_bytes());
+        subject.extend_from_slice(&binding.attempt);
+        subject.extend_from_slice(&graph);
+        let leaf = format!(
+            "materialization-{}",
+            aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(&subject),)
+        );
+        let workspace = atpkg::private_input::MaterializationWorkspace::create_original_parent(
+            &self.root,
+            &leaf,
+            self.directory.as_fd(),
+            deadline,
+        );
+        self.validate()?;
+        workspace
     }
     pub(super) fn outstanding(&self) -> io::Result<Vec<Value>> {
         self.validate()?;

@@ -86,7 +86,6 @@ thread_local! {
     static LATENCY_STAMPS_TOUCHED: Cell<usize> = const { Cell::new(0) };
     static STATUS_PROBES: Cell<usize> = const { Cell::new(0) };
     static CLIPBOARD_WORKERS: Cell<usize> = const { Cell::new(0) };
-    static TITLE_TAB_TOUCHES: Cell<usize> = const { Cell::new(0) };
     static RETAINED_RECORDS_TOUCHED: Cell<usize> = const { Cell::new(0) };
     static RING_ROWS_FORMATTED: Cell<usize> = const { Cell::new(0) };
     static STYLED_FRAMES_GATHERED: Cell<usize> = const { Cell::new(0) };
@@ -177,13 +176,6 @@ pub(crate) fn status_probe() {
 }
 pub(crate) fn take_status_probes() -> usize {
     take(&STATUS_PROBES)
-}
-
-pub(crate) fn title_tab_touched() {
-    bump(&TITLE_TAB_TOUCHES);
-}
-pub(crate) fn take_title_tab_touches() -> usize {
-    take(&TITLE_TAB_TOUCHES)
 }
 
 pub(crate) fn retained_record_touched() {

@@ -3372,22 +3372,15 @@ fn a_glass_frame_stays_within_the_ribbon_quad_budget() {
     }
 }
 
-/// A SETTLED GLASS IDLES TO EXACTLY ZERO (`docs/design/PRISM-GLASS.md` §15.2 1.8): woken only
-/// at its own deadlines ([`Ribbon::next_change_deadline`]), the settled band of
-/// [`type_run`]'s 12 keys, its phrase held past its life so its drawn melt alone takes it,
-/// wakes not once until the melt moves it a pixel; it then steps down by its height (at
-/// most two wakes a pixel of its reach, its cells stepping at their own instants), its
-/// opacity whole and its height never rising, until it lays nothing at all, books no
-/// deadline and rests: no faint glass and no wake is left. The negative control is the same
-/// glass stepped by main's coverage levels, which wakes before it moves a pixel and half
-/// again as often.
+/// The idle melt is sampled at the deadlines the host receives, including the line's
+/// opacity. The negative control restores pixel-only scheduling.
 #[test]
-fn a_settled_glass_idles_to_exactly_zero() {
+fn a_settled_glass_line_fades_smoothly_and_idles_to_zero() {
     let lit = glass_cfg(cfg(false, true));
-    let idle = |level_steps: bool| {
+    let idle = |pixel_only: bool| {
         let t0 = Instant::now();
         let mut rib = Ribbon::new();
-        rib.glass_level_steps = level_steps;
+        rib.glass_pixel_steps = pixel_only;
         type_run(&mut rib, t0, 10, 12, &lit, 0.9);
         for coh in &mut rib.cohorts {
             coh.grace_s = 1000.0;
@@ -3395,66 +3388,44 @@ fn a_settled_glass_idles_to_exactly_zero() {
         for cell in &mut rib.cells {
             cell.life_s = 8.0;
         }
-        let settled = at(t0, 11 * 60 + 100);
-        let mut now = settled;
+        let mut now = at(t0, 11 * 60 + 100);
         let mut sink = Sink::default();
-        let mut wakes = Vec::new();
-        let mut first = None;
+        let mut light = Vec::new();
+        let mut previous_height = f32::INFINITY;
         loop {
             let cx = ctx(now, &lit, (2, 22), 0.9);
             rib.plan(&cx);
             rib.emit(&cx, &mut sink.frame());
-            let (cov, up) = plan_peaks(&rib);
-            if let Some(&(_, before)) = wakes.last() {
-                assert!(
-                    up <= before + 0.01,
-                    "wake {}: the glass rises from {before} to {up} px",
-                    wakes.len()
-                );
-            }
-            assert!(
-                cov == 0 || cov >= 250,
-                "wake {}: the glass at {cov}",
-                wakes.len()
-            );
-            if now > settled && first.is_none() {
-                first = Some(up);
-            }
-            wakes.push((now, up));
+            let (coverage, height) = plan_peaks(&rib);
+            assert!(coverage == 0 || coverage >= 250, "the glass stays opaque");
+            assert!(height <= previous_height + 0.01, "the glass never rises");
+            previous_height = height;
+            light.push(rail_light(&rib, &sink));
             let Some(next) = rib.next_change_deadline(now) else {
                 break;
             };
-            assert!(wakes.len() < 100_000, "the glass never settles");
-            now = next.max(now + Duration::from_millis(1));
+            assert!(light.len() < 1000, "the glass never settles");
+            assert!(next > now, "the deadline must advance");
+            now = next;
         }
-        (rib, sink, wakes, first.unwrap_or(0.0))
+        assert!(light[0] > 0.0, "the fixture lays a line");
+        assert!(rib.at_rest() && sink.under.is_empty());
+        assert!(!rib.glass_drew_at(now));
+        assert!(light.windows(2).all(|w| w[1] <= w[0] + 0.001));
+        light
+            .windows(2)
+            .map(|w| (w[0] - w[1]) / light[0])
+            .fold(0.0f32, f32::max)
     };
-    let (rib, sink, wakes, first) = idle(false);
-    let reach = wakes[0].1;
-    let now = wakes[wakes.len() - 1].0;
-    assert!(reach > 0.8 * 18.0, "fixture: the glass stands {reach} px");
+    let smooth = idle(false);
+    let stepped = idle(true);
     assert!(
-        reach - first >= 0.5,
-        "the glass's first wake moves it {} px",
-        reach - first
+        smooth < 0.035,
+        "the line loses {smooth} of its light in one idle step (pixel-only: {stepped})"
     );
     assert!(
-        sink.under.is_empty() && !rib.glass_drew_at(now),
-        "the settled glass still lays {} quads",
-        sink.under.len()
-    );
-    assert!(rib.at_rest(), "the settled glass holds cells");
-    let steps = wakes.len() - 1;
-    assert!(
-        steps > 0 && steps as f32 <= 2.0 * reach.ceil(),
-        "the glass wakes {steps} times to leave {reach} px"
-    );
-    let (_, _, level_wakes, level_first) = idle(true);
-    assert!(
-        reach - level_first < 0.5 && 2 * (level_wakes.len() - 1) >= 3 * steps,
-        "control: main's level steps wake the glass {} times, first by {} px, against {steps}",
-        level_wakes.len() - 1,
-        reach - level_first
+        stepped > 0.04 && stepped > smooth * 1.5,
+        "pixel-only control: {stepped}, opacity deadlines: {smooth}"
     );
 }
 

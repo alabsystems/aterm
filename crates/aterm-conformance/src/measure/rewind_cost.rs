@@ -79,7 +79,7 @@ pub const THROUGHPUT: CostRow = CostRow::Throughput {
     min_milli: 970,
 };
 
-/// ATERM_DESIGN.md §7.2's idle target for the whole app, in bytes. [`CostRow::IdleRss`] reports it on every bundle and judges it only on one that records by default: it measures the app, not recording (an idle instance with recording off misses it too), and design §14.5 R4 holds the default off until an idle recording pane meets it.
+/// ATERM_DESIGN.md §7.2's idle target for the whole app, in bytes of phys_footprint (Activity Monitor's Memory), or of resident size off macOS, which has no footprint to read. [`CostRow::IdleRss`] reports the recording arm's median against it on every bundle and judges it only on one that records by default (aterm-gui's `DEFAULT_TEMPORAL_RECORDING`): it measures the app, not recording, so a bundle that records only when asked is not failed on it.
 pub const APP_IDLE_TARGET_BYTES: u64 = 25_000_000;
 
 /// What a cost row measures.
@@ -335,7 +335,8 @@ impl Settled {
     }
 }
 
-/// The portable resident-size collector, also exercised on macOS.
+/// The portable resident-size collector, also exercised on macOS. A zero is refused: `ps`
+/// prints it for a child that exited and was not reaped, and no live process has none.
 #[cfg(any(test, not(target_os = "macos")))]
 fn rss_from_ps(pid: u32, budget: Budget) -> Result<u64, CouldNotRun> {
     let mut command = aterm_uds::spawnfd::command(Path::new("/bin/ps"));
@@ -350,8 +351,10 @@ fn rss_from_ps(pid: u32, budget: Budget) -> Result<u64, CouldNotRun> {
     String::from_utf8_lossy(&out.stdout)
         .trim()
         .parse::<u64>()
+        .ok()
+        .filter(|&kib| kib > 0)
         .map(|kib| kib.saturating_mul(1024))
-        .map_err(|_| CouldNotRun::Refused(format!("ps named no resident size for {pid}")))
+        .ok_or_else(|| CouldNotRun::Refused(format!("ps named no resident size for {pid}")))
 }
 
 /// CPU accounting is diagnostic and never substitutes for the throughput verdict.

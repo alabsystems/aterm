@@ -2775,6 +2775,37 @@ impl Ports for Live {
         aterm_log::info!("{line}");
     }
 
+    /// The note this runner's starter set on it, where it is one
+    /// ([`aterm_secrets::converge::note_word`]).
+    fn start_note(&self) -> Option<String> {
+        std::env::var_os(aterm_secrets::converge::START_NOTE_ENV)
+            .and_then(|value| aterm_secrets::converge::note_word(&value))
+    }
+
+    /// This process's readings: the time since its first reading, the programs every
+    /// [`aterm_machines::port::Live`] of this process started (the pass's rows each make their
+    /// own), and `getrusage`'s CPU for this process and for the children it has waited for. A
+    /// child a row starts without that port (`scutil` for this Mac's names is one) is in the
+    /// CPU once waited for, and not in the counts.
+    fn spent(&self) -> aterm_machines::sync::Spent {
+        static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let (spawns, gits) = aterm_machines::port::Live::new().runs();
+        let (cpu_ms, child_cpu_ms) = aterm_machines::sync::cost::cpu_ms();
+        aterm_machines::sync::Spent {
+            mono_ms: u64::try_from(
+                FIRST
+                    .get_or_init(std::time::Instant::now)
+                    .elapsed()
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            spawns,
+            gits,
+            child_cpu_ms,
+            cpu_ms,
+        }
+    }
+
     fn installed_release_elsewhere(&self) -> Option<PathBuf> {
         if !cfg!(target_os = "macos") {
             return None;

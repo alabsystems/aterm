@@ -13,8 +13,8 @@ use super::super::policy::approval::{
 use super::super::policy::question::{
     Pane, answer_question, focus_position, recommended_set, target_focus,
 };
-use super::super::policy::row_guard;
 use super::*;
+use alab_policy::guard::row_guard;
 
 /// No question dialog on the screen.
 pub const EXIT_NO_BOX: u8 = 1;
@@ -558,7 +558,7 @@ impl<C: Ctl> Session<'_, C> {
                 &digit.guard,
                 &digit.n.to_string(),
                 screen,
-                super::super::policy::KeyAct::Answer,
+                alab_policy::guard::KeyAct::Answer,
             )
             .map_err(fail_text)?
         {
@@ -646,7 +646,7 @@ impl<C: Ctl> Session<'_, C> {
                     &focus.guard,
                     &screen,
                     Some(person),
-                    Some(super::super::policy::KeyAct::Answer),
+                    Some(alab_policy::guard::KeyAct::Answer),
                 )
                 .map_err(fail_text)?
             {

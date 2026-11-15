@@ -36,11 +36,11 @@ fn the_reads_parse_what_aterm_and_launch_services_print() {
     assert_eq!(pid_of_info("[ NULL ]\n"), None);
     assert_eq!(
         front_sid(
-            "OK 2\n0 0 s-aaaa - alive aterm meta=0 window=0 active=0 wfocus=1\n\
-             0 1 s-bbbb - alive aterm meta=0 window=0 active=1 wfocus=1\n"
+            "OK 2\n0 0 t000000aaaa - alive aterm meta=0 window=0 active=0 wfocus=1\n\
+             0 1 t000000bbbb - alive aterm meta=0 window=0 active=1 wfocus=1\n"
         )
         .as_deref(),
-        Some("s-bbbb")
+        Some("t000000bbbb")
     );
     assert_eq!(front_sid("OK 0\n"), None);
     assert_eq!(

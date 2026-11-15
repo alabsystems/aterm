@@ -18,9 +18,15 @@ aterm-core = { workspace = true }
 aterm-session = { workspace = true }
 
 [dev-dependencies]
+# The lookup microbenchmark accepts measurements only under a qualified timing claim.
+aterm-capacity = { workspace = true }
 # The pane tree's Tier-1 bind to its derived model.
 aterm-spec = { workspace = true }
 aterm-models-gui = { workspace = true }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "active_tab_lookup"
+test = false

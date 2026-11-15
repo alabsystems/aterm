@@ -617,3 +617,576 @@ fn sixty_eight_commits_and_377_paths_bind_tree_cone_tools_and_environment() {
         start.elapsed().as_secs_f64()
     );
 }
+
+/// A repository with a committer, as these fixtures make them.
+fn repository(path: &Path) {
+    std::fs::create_dir_all(path).unwrap();
+    git(path, &["init", "-q"]);
+    git(path, &["config", "user.name", "Fixture"]);
+    git(path, &["config", "user.email", "fixture@example.invalid"]);
+}
+
+/// Write each `(path, content)` (`None` removes it) in `repo`, commit everything, and name the
+/// commit.
+fn commit(repo: &Path, files: &[(&str, Option<&str>)]) -> String {
+    for (path, content) in files {
+        let at = repo.join(path);
+        match content {
+            Some(content) => {
+                std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                std::fs::write(at, content).unwrap();
+            }
+            None => std::fs::remove_file(at).unwrap(),
+        }
+    }
+    git(repo, &["add", "-A", "."]);
+    git(repo, &["commit", "-qm", "fixture"]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+/// Git's configuration that cuts a checkout short: when it writes `path`, its smudge filter
+/// leaves `dir`'s `cut` marker and sends that git `signal`, and git dies having written the files
+/// it sorts before `path`, removed `path`'s old file and written neither its index nor HEAD.
+/// `INT` is a person's ^C, on which Git removes its index lock; `KILL` is a Git killed outright,
+/// as by a power loss, which leaves that lock.
+fn cut_at(dir: &Path, path: &str, signal: &str) -> [(&'static str, String); 2] {
+    let attributes = dir.join("attributes");
+    std::fs::write(&attributes, format!("{path} filter=cut\n")).unwrap();
+    [
+        ("core.attributesFile", attributes.display().to_string()),
+        (
+            "filter.cut.smudge",
+            format!(
+                "touch '{}'; kill -{signal} $PPID; cat",
+                dir.join("cut").display()
+            ),
+        ),
+    ]
+}
+
+/// The absolute path of Git's lock on the index of the checkout at `top`.
+fn index_lock(top: &Path) -> PathBuf {
+    PathBuf::from(git(
+        top,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index.lock",
+        ],
+    ))
+}
+
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap()
+}
+
+/// AN INTERRUPTED CHECKOUT OF THE INPUT CHECKOUT IS ITS OWN RESIDUE, NOT A PERSON'S EDITS. A
+/// ^C cuts the move from B to T short: HEAD and the index stay at B over some of T's files, and
+/// the file Git was writing is gone. The retry recognises that from its receipt and carries it
+/// to T, clean, with nothing forced.
+/// NEGATIVE CONTROLS: a byte beside that residue that is neither B's nor T's, on a path the two
+/// trees disagree on or on one they share, is refused and kept, with HEAD still at B, and so is
+/// a staged edit of a path they share.
+#[test]
+fn an_interrupted_checkout_resumes_to_its_target_and_edits_beside_it_are_kept() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    repository(&source);
+    let before = commit(
+        &source,
+        &[
+            ("a", Some("a1")),
+            ("b", Some("b1")),
+            ("d/x", Some("d1")),
+            ("gone", Some("g")),
+            ("z", Some("z1")),
+        ],
+    );
+    let target = commit(
+        &source,
+        &[
+            ("a", Some("a2")),
+            ("d/x", Some("d2")),
+            ("gone", None),
+            ("new", Some("n")),
+            ("z", Some("z2")),
+            ("zz", Some("zz2")),
+        ],
+    );
+    let owned = directory(dir.path());
+    let runner = crate::ledger::GitCli::new(&source);
+    let no_child = |_: &crate::ledger::GitCli| -> Result<(), String> {
+        unreachable!("the fixture has no input submodule")
+    };
+    checkout_with(&runner, &owned, &before, no_child).unwrap();
+    for (key, value) in cut_at(dir.path(), "z", "INT") {
+        git(&source, &["config", key, &value]);
+    }
+    let cut = checkout_with(&runner, &owned, &target, no_child);
+    assert!(cut.is_err() && dir.path().join("cut").exists(), "{cut:?}");
+    git(&source, &["config", "--unset", "core.attributesFile"]);
+    git(&source, &["config", "--unset", "filter.cut.smudge"]);
+    assert_eq!(git(&owned, &["rev-parse", "HEAD"]), before);
+    assert!(pending_path(&owned).is_file());
+    assert_eq!(read(&owned.join("a")), "a2", "the checkout wrote some of T");
+    assert!(
+        !owned.join("z").exists() && !owned.join("zz").exists(),
+        "and was cut short writing z, which it removed first"
+    );
+
+    for (path, edit, kept) in [("a", "a person's a", "a2"), ("b", "a person's b", "b1")] {
+        std::fs::write(owned.join(path), edit).unwrap();
+        let refused = checkout_with(&runner, &owned, &target, no_child).unwrap_err();
+        assert!(
+            refused.contains("tracked edits; no work was discarded"),
+            "{refused}"
+        );
+        assert_eq!(read(&owned.join(path)), edit);
+        assert_eq!(git(&owned, &["rev-parse", "HEAD"]), before);
+        std::fs::write(owned.join(path), kept).unwrap();
+    }
+    // A person's staged edit of a path both trees hold alike: Git's checkout would carry it to
+    // T untouched, so only the index shows it. It is refused at B, staged as it was.
+    std::fs::write(owned.join("b"), "a person's staged b").unwrap();
+    git(&owned, &["add", "b"]);
+    let refused = checkout_with(&runner, &owned, &target, no_child).unwrap_err();
+    assert!(
+        refused.contains("tracked edits; no work was discarded"),
+        "{refused}"
+    );
+    assert_eq!(git(&owned, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git(&owned, &["show", ":b"]), "a person's staged b");
+    std::fs::write(owned.join("b"), "b1").unwrap();
+    git(&owned, &["add", "b"]);
+
+    checkout_with(&runner, &owned, &target, no_child).unwrap();
+    assert_eq!(git(&owned, &["rev-parse", "HEAD"]), target);
+    assert!(!pending_path(&owned).exists());
+    assert_eq!(git(&owned, &["status", "--porcelain", "--ignored"]), "");
+    for (path, content) in [
+        ("a", "a2"),
+        ("b", "b1"),
+        ("d/x", "d2"),
+        ("new", "n"),
+        ("z", "z2"),
+        ("zz", "zz2"),
+    ] {
+        assert_eq!(read(&owned.join(path)), content, "{path}");
+    }
+    assert!(!owned.join("gone").exists());
+    git(
+        &source,
+        &["worktree", "remove", "--force", owned.to_str().unwrap()],
+    );
+}
+
+/// A CHECKOUT CUT SHORT AMONG FILES NEW TO ITS TARGET RESUMES TOO. The move from B to T wrote
+/// `n1`, which B does not hold, and was cut writing `n2`: HEAD and the index are B's, nothing
+/// tracked differs, and `n1` is a file Git's checkout of T would refuse to overwrite. The retry
+/// recognises it from its receipt as that checkout's own and carries it to T.
+/// NEGATIVE CONTROL: bytes at `n1` that are not T's are refused by Git's checkout, which names
+/// the file, and kept, with HEAD still at B.
+#[test]
+fn a_checkout_cut_short_among_files_new_to_its_target_resumes() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    repository(&source);
+    let before = commit(&source, &[("a", Some("a1"))]);
+    let target = commit(&source, &[("n1", Some("n1")), ("n2", Some("n2"))]);
+    let owned = directory(dir.path());
+    let runner = crate::ledger::GitCli::new(&source);
+    let no_child = |_: &crate::ledger::GitCli| -> Result<(), String> {
+        unreachable!("the fixture has no input submodule")
+    };
+    checkout_with(&runner, &owned, &before, no_child).unwrap();
+    for (key, value) in cut_at(dir.path(), "n2", "INT") {
+        git(&source, &["config", key, &value]);
+    }
+    let cut = checkout_with(&runner, &owned, &target, no_child);
+    assert!(cut.is_err() && dir.path().join("cut").exists(), "{cut:?}");
+    git(&source, &["config", "--unset", "core.attributesFile"]);
+    git(&source, &["config", "--unset", "filter.cut.smudge"]);
+    assert_eq!(git(&owned, &["rev-parse", "HEAD"]), before);
+    assert!(pending_path(&owned).is_file());
+    assert_eq!(read(&owned.join("n1")), "n1", "the checkout wrote n1");
+    assert!(!owned.join("n2").exists(), "and was cut short writing n2");
+    assert_eq!(git(&owned, &["status", "--porcelain"]), "?? n1");
+
+    std::fs::write(owned.join("n1"), "a person's n1").unwrap();
+    let refused = checkout_with(&runner, &owned, &target, no_child).unwrap_err();
+    assert!(
+        refused.contains("untracked working tree files would be overwritten")
+            && refused.contains("n1"),
+        "{refused}"
+    );
+    assert_eq!(read(&owned.join("n1")), "a person's n1");
+    assert_eq!(git(&owned, &["rev-parse", "HEAD"]), before);
+    std::fs::write(owned.join("n1"), "n1").unwrap();
+
+    checkout_with(&runner, &owned, &target, no_child).unwrap();
+    assert_eq!(git(&owned, &["rev-parse", "HEAD"]), target);
+    assert!(!pending_path(&owned).exists());
+    assert_eq!(git(&owned, &["status", "--porcelain", "--ignored"]), "");
+    for (path, content) in [("a", "a1"), ("n1", "n1"), ("n2", "n2")] {
+        assert_eq!(read(&owned.join(path)), content, "{path}");
+    }
+    git(
+        &source,
+        &["worktree", "remove", "--force", owned.to_str().unwrap()],
+    );
+}
+
+/// A CHECKOUT KILLED OUTRIGHT NAMES THE LOCK IT LEFT, AND RESUMES ONCE A PERSON REMOVES IT. Git
+/// killed (`SIGKILL`, as by a power loss) while it moved B to T leaves its index lock as well as
+/// the residue a ^C leaves. Every retry refuses naming that lock and the act that clears it, with
+/// HEAD, the index and the files as they were; once the lock is gone the retry carries the
+/// residue to T, clean.
+/// NEGATIVE CONTROL: the retry before the lock's removal changes nothing a later retry relies on,
+/// so the same receipt then completes.
+#[test]
+fn a_checkout_killed_outright_names_its_lock_and_resumes_once_it_is_removed() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    repository(&source);
+    let before = commit(&source, &[("a", Some("a1")), ("z", Some("z1"))]);
+    let target = commit(
+        &source,
+        &[("a", Some("a2")), ("n", Some("n")), ("z", Some("z2"))],
+    );
+    let owned = directory(dir.path());
+    let runner = crate::ledger::GitCli::new(&source);
+    let no_child = |_: &crate::ledger::GitCli| -> Result<(), String> {
+        unreachable!("the fixture has no input submodule")
+    };
+    checkout_with(&runner, &owned, &before, no_child).unwrap();
+    for (key, value) in cut_at(dir.path(), "z", "KILL") {
+        git(&source, &["config", key, &value]);
+    }
+    let cut = checkout_with(&runner, &owned, &target, no_child);
+    assert!(cut.is_err() && dir.path().join("cut").exists(), "{cut:?}");
+    git(&source, &["config", "--unset", "core.attributesFile"]);
+    git(&source, &["config", "--unset", "filter.cut.smudge"]);
+    let lock = index_lock(&owned);
+    assert!(lock.is_file(), "the killed Git left its lock");
+    assert_eq!(read(&owned.join("a")), "a2", "the checkout wrote some of T");
+    assert!(!owned.join("z").exists());
+
+    for _ in 0..2 {
+        let refused = checkout_with(&runner, &owned, &target, no_child).unwrap_err();
+        assert!(
+            refused.contains(&format!("remove {}", lock.display()))
+                && refused.contains("still running, or one was killed outright"),
+            "{refused}"
+        );
+        assert_eq!(git(&owned, &["rev-parse", "HEAD"]), before);
+        assert_eq!(git(&owned, &["show", ":a"]), "a1", "the index is B's");
+        assert_eq!(read(&owned.join("a")), "a2");
+        assert!(lock.is_file() && pending_path(&owned).is_file());
+    }
+
+    std::fs::remove_file(&lock).unwrap();
+    checkout_with(&runner, &owned, &target, no_child).unwrap();
+    assert_eq!(git(&owned, &["rev-parse", "HEAD"]), target);
+    assert!(!pending_path(&owned).exists());
+    assert_eq!(git(&owned, &["status", "--porcelain", "--ignored"]), "");
+    for (path, content) in [("a", "a2"), ("n", "n"), ("z", "z2")] {
+        assert_eq!(read(&owned.join(path)), content, "{path}");
+    }
+    git(
+        &source,
+        &["worktree", "remove", "--force", owned.to_str().unwrap()],
+    );
+}
+
+/// A FIRST CHECKOUT CUT SHORT WITH ITS GIT COMPLETES FROM ITS RECEIPT. `git worktree add` removes
+/// what it made when it fails or is signalled. Killed outright (`SIGKILL`, a power loss) before
+/// it pointed the new checkout's HEAD at the target, it leaves that checkout's `.git` file over
+/// nothing, its HEAD missing (or, from some Git versions, a placeholder of zeros); after, the
+/// target's HEAD over no index, some of the target's files, and the lock of the index its
+/// checkout was writing. The retry recognises each from its receipt: it points the HEAD at the
+/// target, refuses naming the lock until a person removes it, and completes the checkout with
+/// nothing forced.
+/// NEGATIVE CONTROLS: bytes at a path of the target that are not the target's are refused as
+/// edits and kept; a first checkout that completed (its index written) and kept its receipt, as
+/// one whose hydration failed does, holds a person's deletion, which is refused and kept.
+#[test]
+fn a_first_checkout_cut_short_with_its_git_completes_from_its_receipt() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    repository(&source);
+    let target = commit(
+        &source,
+        &[("a", Some("a1")), ("b", Some("b1")), ("d/c", Some("c1"))],
+    );
+    let owned = directory(dir.path());
+    let runner = crate::ledger::GitCli::new(&source);
+    let no_child = |_: &crate::ledger::GitCli| -> Result<(), String> {
+        unreachable!("the fixture has no input submodule")
+    };
+    // The receipt of a first checkout at `root` whose `worktree add` failed and removed what it
+    // made, then the worktree `add` (with its own arguments) leaves there.
+    let attributes = dir.path().join("attributes");
+    std::fs::write(&attributes, "b filter=fail\n").unwrap();
+    let first = |root: &Path, add: &[&str]| {
+        for (key, value) in [
+            ("core.attributesFile", attributes.to_str().unwrap()),
+            ("filter.fail.smudge", "false"),
+            ("filter.fail.required", "true"),
+        ] {
+            git(&source, &["config", key, value]);
+        }
+        assert!(checkout_with(&runner, root, &target, no_child).is_err());
+        git(&source, &["config", "--unset", "core.attributesFile"]);
+        git(&source, &["config", "--remove-section", "filter.fail"]);
+        assert!(pending_path(root).is_file() && !root.exists());
+        let mut args = vec!["worktree", "add", "-q"];
+        args.extend(add);
+        args.extend(["--detach", root.to_str().unwrap(), target.as_str()]);
+        git(&source, &args);
+    };
+
+    let completed = directory(&dir.path().join("completed"));
+    first(&completed, &[]);
+    std::fs::remove_file(completed.join("b")).unwrap();
+    let refused = checkout_with(&runner, &completed, &target, no_child).unwrap_err();
+    assert!(
+        refused.contains("tracked edits; no work was discarded"),
+        "{refused}"
+    );
+    assert!(!completed.join("b").exists(), "the deletion is kept");
+    assert!(pending_path(&completed).is_file());
+
+    // What a `worktree add` killed with its checkout leaves: the target's HEAD, no index, and
+    // one of the target's files.
+    first(&owned, &["--no-checkout"]);
+    std::fs::write(owned.join("a"), "a1").unwrap();
+    assert_eq!(git(&owned, &["ls-files", "--cached"]), "");
+
+    std::fs::create_dir(owned.join("d")).unwrap();
+    std::fs::write(owned.join("d/c"), "a person's c").unwrap();
+    let refused = checkout_with(&runner, &owned, &target, no_child).unwrap_err();
+    assert!(
+        refused.contains("tracked edits; no work was discarded"),
+        "{refused}"
+    );
+    assert_eq!(read(&owned.join("d/c")), "a person's c");
+    assert_eq!(git(&owned, &["ls-files", "--cached"]), "");
+    std::fs::remove_file(owned.join("d/c")).unwrap();
+
+    // The killed Git's checkout held its index lock, which it left.
+    let lock = index_lock(&owned);
+    std::fs::write(&lock, "").unwrap();
+    let refused = checkout_with(&runner, &owned, &target, no_child).unwrap_err();
+    assert!(
+        refused.contains(&format!("remove {}", lock.display())),
+        "{refused}"
+    );
+    assert_eq!(git(&owned, &["ls-files", "--cached"]), "");
+    std::fs::remove_file(&lock).unwrap();
+
+    // Killed before it pointed HEAD at the target: Git cannot open the checkout it registered.
+    let unborn = |name: &str, head: Option<&str>| {
+        let root = directory(&dir.path().join(name));
+        first(&root, &["--no-checkout"]);
+        let pointer = read(&root.join(".git"));
+        let admin = root.join(pointer.trim_end().strip_prefix("gitdir: ").unwrap());
+        match head {
+            Some(head) => std::fs::write(admin.join("HEAD"), head).unwrap(),
+            None => std::fs::remove_file(admin.join("HEAD")).unwrap(),
+        }
+        let _ = std::fs::remove_file(admin.join("index"));
+        std::fs::write(admin.join("locked"), "initializing").unwrap();
+        root
+    };
+    let missing = unborn("missing", None);
+    let placeholder = unborn(
+        "placeholder",
+        Some(&format!("{}\n", "0".repeat(target.len()))),
+    );
+
+    for worktree in [&owned, &missing, &placeholder] {
+        checkout_with(&runner, worktree, &target, no_child).unwrap();
+        assert_eq!(git(worktree, &["rev-parse", "HEAD"]), target);
+        assert!(!pending_path(worktree).exists());
+        assert_eq!(git(worktree, &["status", "--porcelain", "--ignored"]), "");
+        for (path, content) in [("a", "a1"), ("b", "b1"), ("d/c", "c1")] {
+            assert_eq!(read(&worktree.join(path)), content, "{path}");
+        }
+    }
+    for worktree in [&owned, &completed, &missing, &placeholder] {
+        git(
+            &source,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                worktree.to_str().unwrap(),
+            ],
+        );
+    }
+}
+
+/// THE INPUT SUBMODULE'S INTERRUPTED CHECKOUT IS RECOGNISED THE SAME WAY, from L1 to L2 and on
+/// its first checkout of L2 in a clone whose default HEAD, L3, is past that pin. Each retry
+/// finishes at L2, clean. A submodule checkout killed outright refuses naming the lock it left,
+/// with its HEAD unmoved, until a person removes that lock.
+/// NEGATIVE CONTROLS: an untracked file beside the residue is work, named as work: the retry
+/// refuses before it moves anything and keeps it, from L1 and on a first checkout alike.
+#[test]
+fn an_interrupted_submodule_checkout_resumes_to_its_pin() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    repository(&library);
+    let first_pin = commit(&library, &[("lib", Some("l1")), ("libz", Some("z1"))]);
+    let source = dir.path().join("source");
+    repository(&source);
+    git(
+        &source,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            library.to_str().unwrap(),
+            INPUT_SUBMODULE,
+        ],
+    );
+    let first = commit(&source, &[("input", Some("first"))]);
+    let second_pin = commit(&library, &[("lib", Some("l2")), ("libz", Some("z2"))]);
+    let source_library = source.join(INPUT_SUBMODULE);
+    git(
+        &source_library,
+        &["-c", "protocol.file.allow=always", "fetch", "-q", "origin"],
+    );
+    git(&source_library, &["checkout", "-q", &second_pin]);
+    let second = commit(&source, &[("input", Some("second"))]);
+    // The library moves on past the pin: a fresh clone's default HEAD is L3.
+    let third = commit(&library, &[("lib3", Some("l3"))]);
+    let runner = crate::ledger::GitCli::new(&source);
+    // Git's update of the submodule, cut short writing `libz` by `cut`'s signal; `note`, written
+    // once that update ends, is a person's file beside what it left.
+    let hydrate = |cut: Option<&'static str>, note: Option<PathBuf>| {
+        let dir = dir.path().to_path_buf();
+        move |own: &crate::ledger::GitCli| {
+            let settings: Vec<String> = cut.map_or_else(Vec::new, |signal| {
+                cut_at(&dir, "libz", signal)
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect()
+            });
+            let mut args = vec!["-c", "protocol.file.allow=always"];
+            for setting in &settings {
+                args.extend(["-c", setting.as_str()]);
+            }
+            args.extend([
+                "submodule",
+                "update",
+                "--init",
+                "--checkout",
+                INPUT_SUBMODULE,
+            ]);
+            let updated = git_run(own, &args);
+            if let Some(note) = &note {
+                std::fs::write(note, "keep me").unwrap();
+            }
+            updated
+        }
+    };
+    let cut_fired = || std::fs::remove_file(dir.path().join("cut")).is_ok();
+    let finished = |worktree: &Path| {
+        let library = worktree.join(INPUT_SUBMODULE);
+        assert_eq!(git(&library, &["rev-parse", "HEAD"]), second_pin);
+        assert_eq!(read(&library.join("libz")), "z2");
+        assert!(!library.join("lib3").exists());
+        assert_eq!(git(&library, &["status", "--porcelain", "--ignored"]), "");
+        assert!(!pending_path(worktree).exists());
+    };
+
+    // From L1 to L2.
+    let owned = directory(dir.path());
+    checkout_with(&runner, &owned, &first, hydrate(None, None)).unwrap();
+    let owned_library = owned.join(INPUT_SUBMODULE);
+    assert_eq!(git(&owned_library, &["rev-parse", "HEAD"]), first_pin);
+    assert!(checkout_with(&runner, &owned, &second, hydrate(Some("INT"), None)).is_err());
+    assert!(cut_fired(), "the cut fired");
+    assert_eq!(git(&owned_library, &["rev-parse", "HEAD"]), first_pin);
+    assert_eq!(read(&owned_library.join("lib")), "l2");
+    assert!(
+        !owned_library.join("libz").exists(),
+        "Git removed the file it was writing"
+    );
+    std::fs::write(owned_library.join("note"), "keep me").unwrap();
+    let refused = checkout_with(&runner, &owned, &second, hydrate(None, None)).unwrap_err();
+    assert!(
+        refused.contains("input submodule contains work"),
+        "{refused}"
+    );
+    assert_eq!(read(&owned_library.join("note")), "keep me");
+    assert_eq!(
+        git(&owned_library, &["rev-parse", "HEAD"]),
+        first_pin,
+        "refused before hydration moved it"
+    );
+    std::fs::remove_file(owned_library.join("note")).unwrap();
+    checkout_with(&runner, &owned, &second, hydrate(None, None)).unwrap();
+    finished(&owned);
+
+    // From L1 to L2, its Git killed outright: the lock it left is named until it is removed.
+    let killed = directory(&dir.path().join("killed"));
+    checkout_with(&runner, &killed, &first, hydrate(None, None)).unwrap();
+    let killed_library = killed.join(INPUT_SUBMODULE);
+    assert!(checkout_with(&runner, &killed, &second, hydrate(Some("KILL"), None)).is_err());
+    assert!(cut_fired(), "the cut fired");
+    let lock = index_lock(&killed_library);
+    assert!(lock.is_file(), "the killed Git left its lock");
+    let refused = checkout_with(&runner, &killed, &second, hydrate(None, None)).unwrap_err();
+    assert!(
+        refused.contains(&format!("remove {}", lock.display())),
+        "{refused}"
+    );
+    assert_eq!(git(&killed_library, &["rev-parse", "HEAD"]), first_pin);
+    assert_eq!(read(&killed_library.join("lib")), "l2");
+    std::fs::remove_file(&lock).unwrap();
+    checkout_with(&runner, &killed, &second, hydrate(None, None)).unwrap();
+    finished(&killed);
+
+    // The first checkout of L2, cut short in a fresh clone at L3, completes from its unborn
+    // HEAD at once: Git's update failed, and what it left is that checkout's alone.
+    let fresh = directory(&dir.path().join("fresh"));
+    checkout_with(&runner, &fresh, &second, hydrate(Some("INT"), None)).unwrap();
+    assert!(cut_fired(), "the cut fired");
+    finished(&fresh);
+
+    // The same first checkout with a person's file beside what it left: that is work, named as
+    // work, and the clone stays at its default HEAD with the file kept.
+    let noted = directory(&dir.path().join("noted"));
+    let noted_library = noted.join(INPUT_SUBMODULE);
+    let refused = checkout_with(
+        &runner,
+        &noted,
+        &second,
+        hydrate(Some("INT"), Some(noted_library.join("note"))),
+    )
+    .unwrap_err();
+    assert!(cut_fired(), "the cut fired");
+    assert!(
+        refused.contains("input submodule contains work; no work was discarded"),
+        "{refused}"
+    );
+    assert_eq!(read(&noted_library.join("note")), "keep me");
+    assert_eq!(git(&noted_library, &["rev-parse", "HEAD"]), third);
+    assert!(pending_path(&noted).is_file());
+    std::fs::remove_file(noted_library.join("note")).unwrap();
+    checkout_with(&runner, &noted, &second, hydrate(None, None)).unwrap();
+    finished(&noted);
+
+    for worktree in [&owned, &killed, &fresh, &noted] {
+        git(
+            &source,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+    }
+}

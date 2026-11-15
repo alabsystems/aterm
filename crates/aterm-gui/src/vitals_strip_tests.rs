@@ -17,8 +17,8 @@ use aterm_vitals::ring::{
 };
 
 use super::{
-    BASE_FILE, LEGACY_FILE, STRIP_MAX_BYTES, StripStore, TAIL_FILE, base_json, base_of, line_json,
-    strip_dir,
+    BASE_FILE, LEGACY_FILE, STRIP_MAX_BYTES, STRIP_SCHEMA, StripStore, TAIL_FILE, base_json,
+    base_of, line_json, strip_dir,
 };
 use crate::vitals_host::StripLock;
 
@@ -164,9 +164,8 @@ fn longs(strip: &SavedStrip) -> Vec<Vec<(i64, Agg)>> {
 
 /// Record §9: the schema-1 file a build before the append-only checkpoint wrote restores
 /// nothing, so no bucket's read time, minimum or start meaning is invented, and goes at the first
-/// base written; a base of schema 1 restores nothing either, in the old layout or in schema 2's
-/// own, where only the schema guard refuses it, and nor does one of schema 3. None panics.
-/// CONTROL: the same strip written at schema 2 restores.
+/// base written. A prior schema cannot prove the scope coverage the current schema preserves.
+/// CONTROL: the same strip written at the current schema restores.
 #[test]
 fn a_schema_one_strip_file_restores_nothing() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
@@ -197,20 +196,65 @@ fn a_schema_one_strip_file_restores_nothing() {
     assert_eq!(
         (back.last_wall_ms, back.proc_starts),
         (T0 + 500, Some(true)),
-        "CONTROL: schema 2 restores the base the first reading wrote"
+        "CONTROL: the current schema restores the base the first reading wrote"
     );
     let base = strip_dir(home).join(BASE_FILE);
-    let two = std::fs::read_to_string(&base).expect("the base");
-    assert!(two.starts_with("{\"schema\":2,"), "{two}");
-    for other in [1, 3] {
-        let relabelled = two.replacen("{\"schema\":2,", &format!("{{\"schema\":{other},"), 1);
+    let current = std::fs::read_to_string(&base).expect("the base");
+    let schema = format!("{{\"schema\":{STRIP_SCHEMA},");
+    assert!(current.starts_with(&schema), "{current}");
+    for other in [1, 2, STRIP_SCHEMA + 1] {
+        let relabelled = current.replacen(&schema, &format!("{{\"schema\":{other},"), 1);
         std::fs::write(&base, relabelled).expect("a base of another schema");
         assert_eq!(
             store_in(home).1,
             SavedStrip::default(),
-            "a schema-{other} base in schema 2's layout"
+            "a schema-{other} base in the current layout"
         );
     }
+}
+
+#[test]
+fn prior_coverage_schema_preserves_measurements_without_claiming_they_were_complete() {
+    let saved = SavedStrip {
+        last_wall_ms: T0 + 7 * 3_600_000,
+        aterm: std::array::from_fn(|i| fullest_ring(i as f64)),
+        rings: std::array::from_fn(|i| fullest_ring(i as f64 + 10.0)),
+        ..SavedStrip::default()
+    };
+    let mut document: super::BaseDoc =
+        aterm_json::from_str(&base_json(&saved, 3).unwrap()).unwrap();
+    document.schema = 2;
+    document.rings.truncate(17);
+    let (_, migrated) = base_of(&aterm_json::to_string(&document).unwrap()).unwrap();
+    assert_eq!(
+        migrated.rings, saved.rings,
+        "the machine's measured history survives"
+    );
+    assert_eq!(
+        migrated.aterm, saved.aterm,
+        "historical scope figures survive too"
+    );
+    for (figure, coverage) in [(0, 1), (2, 0)] {
+        let old = &saved.aterm[figure];
+        let mark = &migrated.aterm_unread[coverage];
+        assert_eq!(mark.buckets.len(), old.buckets.len());
+        assert_eq!(mark.recent.len(), old.recent.len());
+        assert!(
+            mark.buckets
+                .iter()
+                .all(|(_, agg)| agg.mean == 1.0 && agg.max == 1.0)
+        );
+        assert!(mark.recent.iter().all(|(_, value, _, _)| *value == 1.0));
+        assert_eq!(mark.buckets[0].1.tau_ms, old.buckets[0].1.tau_ms);
+    }
+    assert!(
+        migrated.aterm_cpu_charge.is_empty(),
+        "the old format never measured a child charge"
+    );
+    assert_eq!(
+        base_of(&base_json(&migrated, 4).unwrap()),
+        Some((4, migrated))
+    );
 }
 
 /// A ring at its fullest: an hour of 10 s buckets, [`LONG_BUCKETS`] ten-minute ones and

@@ -5,6 +5,17 @@
 //! belongs to the actual receiving handler, not an actor message or reply.
 use super::*;
 
+#[path = "custody/configuration.rs"]
+mod configuration;
+pub(crate) use configuration::ConfigurationTransfer;
+pub(super) use configuration::OriginalConfiguration;
+#[path = "custody/materialization.rs"]
+mod materialization;
+pub(crate) use materialization::MaterializationTransfer;
+#[path = "custody/materialization_inputs.rs"]
+mod materialization_inputs;
+pub(in crate::actor::owner) use materialization_inputs::OriginalMaterializationInputs;
+
 #[derive(Default)]
 pub(super) struct State {
     attempt: Option<Attempt>,
@@ -20,6 +31,14 @@ struct Attempt {
     control: Option<OwnedFd>,
     source_requested: Option<wire::SourceAttachment>,
     source: Option<Arc<OriginalSource>>,
+    configuration_requested: Option<wire::ConfigurationAttachment>,
+    materialization_requested: Option<wire::MaterializationPreparation>,
+    configuration: Vec<Arc<OriginalConfiguration>>,
+    configuration_budget: wire::configuration::ConfigurationBudget,
+    configuration_rejected: Vec<OwnedFd>,
+    workspace: Option<atpkg::private_input::MaterializationWorkspace>,
+    materialization_inputs: Option<Arc<OriginalMaterializationInputs>>,
+    configuration_anchor: Instant,
     output_requested: Option<wire::OutputAttachment>,
     output: Option<Arc<[OwnedFd; 2]>>,
 }
@@ -172,6 +191,9 @@ pub(crate) struct Preparing {
     deadline: Instant,
     submitted: bool,
     source_submitted: bool,
+    configuration_budget: wire::configuration::ConfigurationBudget,
+    materialization_submitted: bool,
+    configuration_anchor: Instant,
     output_submitted: bool,
 }
 pub(crate) struct EnrollmentAttachment {
@@ -273,6 +295,53 @@ impl OutputTransfer {
     }
 }
 impl State {
+    pub(super) fn input_deadline(&self) -> Option<Instant> {
+        let attempt = self.attempt.as_ref()?;
+        if let Some(inputs) = &attempt.materialization_inputs {
+            return Some(inputs.original_deadline());
+        }
+        let workspace = attempt.workspace.as_ref().map(|owner| owner.deadline());
+        let configuration = attempt.configuration.iter().map(|owner| owner.deadline());
+        workspace.into_iter().chain(configuration).min()
+    }
+
+    pub(super) fn check_current(&self, deadline: Instant) -> io::Result<()> {
+        let Some(attempt) = &self.attempt else {
+            return Ok(());
+        };
+        if attempt.materialization_inputs.is_some() {
+            return self
+                .original_materialization_inputs(&attempt.request.key, deadline)
+                .map(|_| ());
+        }
+        if attempt.materialization_requested.is_none()
+            && attempt.workspace.is_none()
+            && attempt.configuration.is_empty()
+        {
+            return Ok(());
+        }
+        let workspace = attempt
+            .workspace
+            .as_ref()
+            .ok_or_else(|| refused("materialization has no retained original workspace"))?;
+        let current = (|| {
+            workspace.check_current()?;
+            attempt
+                .source
+                .as_ref()
+                .ok_or_else(|| refused("materialization lost its original source"))?
+                .check_current(deadline)?;
+            for configuration in &attempt.configuration {
+                configuration.check_current(deadline)?;
+            }
+            workspace.check_current()
+        })();
+        if current.is_err() {
+            workspace.quarantine();
+        }
+        current
+    }
+
     pub(super) fn original_source(
         &self,
         key: &wire::Key,
@@ -407,6 +476,7 @@ impl Owner {
         root.gnu.check()?;
         root.queries.bind_enrollment(&request.key)?;
         let active = Arc::new(AtomicBool::new(true));
+        let configuration_anchor = Instant::now();
         root.inputs.attempt = Some(Attempt {
             request: request.clone(),
             binding: job.binding.clone(),
@@ -418,6 +488,14 @@ impl Owner {
             control: None,
             source_requested: None,
             source: None,
+            configuration_requested: None,
+            materialization_requested: None,
+            configuration: Vec::new(),
+            configuration_budget: Default::default(),
+            configuration_rejected: Vec::new(),
+            workspace: None,
+            materialization_inputs: None,
+            configuration_anchor,
             output_requested: None,
             output: None,
         });
@@ -429,6 +507,9 @@ impl Owner {
             deadline: root.deadline(),
             submitted: false,
             source_submitted: false,
+            configuration_budget: Default::default(),
+            materialization_submitted: false,
+            configuration_anchor,
             output_submitted: false,
         })
     }
@@ -597,6 +678,7 @@ impl Owner {
             || attempt.source.is_none()
             || attempt.output_requested.is_some()
             || attempt.output.is_some()
+            || attempt.materialization_inputs.is_some()
         {
             return Err(refused(
                 "Bootstrap output is foreign, unprepared or repeated",
@@ -622,14 +704,19 @@ impl Owner {
                 "Bootstrap live context changed during output offer",
             ));
         }
-        let attempt = self
+        let root = self
             .jobs
             .get_mut(&(
                 token.request.key.query.binding.session.clone(),
                 token.request.key.query.binding.root_attempt,
             ))
             .and_then(|job| job.bootstrap_graph.as_mut())
-            .and_then(|root| root.inputs.attempt.as_mut())
+            .ok_or_else(|| refused("Bootstrap output has no original Root"))?;
+        let deadline = root.deadline();
+        let attempt = root
+            .inputs
+            .attempt
+            .as_mut()
             .ok_or_else(|| refused("Bootstrap output has no original enrollment"))?;
         if attempt.output_requested.as_ref() != Some(&token.request)
             || !Arc::ptr_eq(&attempt.active, &token.active)
@@ -651,6 +738,10 @@ impl Owner {
         // The selected original SDK's unsafe sender contract preserves actual
         // OutputLock lineage. These observations never construct a lock/lease.
         attempt.output = Some(Arc::new(descriptions));
+        // Retain the delivered output originals before this fallible final
+        // input-custody transition. It grants no funded operation/availability.
+        root.inputs
+            .seal_materialization_inputs(&token.request.key, deadline)?;
         Ok(context)
     }
 }

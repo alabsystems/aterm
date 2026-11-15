@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TOML 1.0.0 conformance tests ([`VALID`]).
+//! TOML 1.1.0 conformance tests ([`VALID`]).
 
 const VALID: &[&str] = &[
     "key = 1\nbare_key = 2\nbare-key = 3\n1234 = 4\n",
@@ -129,9 +129,8 @@ const INVALID: &[(&str, &str)] = &[
     ),
     (
         "str = \"\\x invalid escape\"\n",
-        "`\\x` escapes are outside TOML 1.0",
+        "a two-digit unicode escape needs hexadecimal digits",
     ),
-    ("str = \"\\e\"\n", "`\\e` escapes are outside TOML 1.0"),
     (
         "str = \"\\uD800\"\n",
         "a lone surrogate is not a scalar value",
@@ -153,20 +152,11 @@ const INVALID: &[(&str, &str)] = &[
     ("bool = True\n", "a capitalised boolean"),
     ("bool = TRUE\n", "an upper-case boolean"),
     ("arr = [1, 2\n", "an unterminated array"),
-    (
-        "t = { a = 1,\n b = 2 }\n",
-        "a newline inside an inline table",
-    ),
-    (
-        "t = { a = 1, }\n",
-        "a trailing comma inside an inline table",
-    ),
     ("[]\n", "an empty table header"),
     ("[a.]\n", "a trailing dot in a header"),
     ("[.a]\n", "a leading dot in a header"),
     ("[a\n", "an unterminated header"),
     ("[[a]\n", "a mismatched array-of-tables header"),
-    ("dt = 1979-05-27T07:32\n", "a TOML 1.0 time without seconds"),
     ("dt = 1979-13-01\n", "an impossible month"),
     ("dt = 2023-02-29\n", "a day that does not exist"),
     ("dt = 1979-05-27T25:00:00Z\n", "an impossible hour"),

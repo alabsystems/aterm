@@ -8,8 +8,8 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
-const A: &str = "s-a";
-const B: &str = "s-b";
+const A: &str = "ta000000000";
+const B: &str = "tb000000000";
 
 /// A bridge attached to a lane that names `seq`, its roster read at that count.
 fn at_count(
@@ -145,7 +145,7 @@ fn a_peek_that_names_no_count_is_no_look() {
 #[test]
 fn a_burst_to_a_sid_this_node_does_not_host_reads_the_roster_at_most_once() {
     let burst = |ids: std::ops::RangeInclusive<u64>| -> String {
-        ids.map(|id| format!("post sid={A} id={id} to=@s-x kind=note len=2\nhi"))
+        ids.map(|id| format!("post sid={A} id={id} to=@tx000000000 kind=note len=2\nhi"))
             .collect()
     };
     let (lane, mut bridge, _push, _reader, _server) = at_count(Some(5));
@@ -171,7 +171,7 @@ fn a_burst_to_a_sid_this_node_does_not_host_reads_the_roster_at_most_once() {
     );
     assert_eq!(
         roster_reads_of(&lane, || {
-            let _ = bridge.resolve_to("@s-x", Some(A));
+            let _ = bridge.resolve_to("@tx000000000", Some(A));
         }),
         1,
         "outside a drain an unknown sid still asks"
@@ -186,7 +186,7 @@ fn a_resolve_outside_a_drain_reads_for_every_unknown_sid() {
     assert_eq!(
         roster_reads_of(&lane, || {
             for _ in 0..3 {
-                let _ = bridge.resolve_to("@s-x", Some(A));
+                let _ = bridge.resolve_to("@tx000000000", Some(A));
             }
         }),
         3

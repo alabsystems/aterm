@@ -177,7 +177,7 @@ fn since_ms_never_runs_ahead_of_ago_ms() {
         now,
     );
     c.commit_rows(now, 3);
-    assert!(c.dismiss(p.id, now + Duration::from_millis(300)));
+    assert!(c.dismiss(p.id, stamp(10_300), now + Duration::from_millis(300)));
     let rec = c.log().get(p.id).unwrap();
     let field = |row: &str, key: &str| -> u64 {
         row.split(' ')
@@ -307,7 +307,7 @@ fn message_rows_carry_state_glass_and_progress() {
         "{row}"
     );
     assert!(row.contains(" state=live glass=- "), "{row}");
-    c.dismiss(p.id, now + Duration::from_millis(250));
+    c.dismiss(p.id, stamp(5_250), now + Duration::from_millis(250));
     let rec = c.log().get(p.id).unwrap();
     let row = message_row(rec, None, Glass::Band, None, 9_000, &pct_encode);
     assert!(row.contains(" state=dismissed glass=- "), "{row}");
@@ -1505,6 +1505,33 @@ fn dismiss_takes_down_what_a_person_could() {
     );
     assert_eq!(c.revision(), revision);
     assert!(c.live(working).is_some() && c.live(ask).is_some());
+}
+
+/// A person's `notice dismiss` a minute after the Mac woke from a 30 h sleep is filed at the
+/// request's stamp, the host's wall clock at the press, which is the clock a re-post's stamp comes
+/// from. NEGATIVE CONTROL: `apply_dismiss` handing `MessageCenter::dismiss` any other stamp, or
+/// `dismiss` filing at the row's own reading (`Live::wall_at`, the post's wall plus the
+/// monotonic time since, which the sleep left 30 h behind), files it at T0 + 1 min.
+#[test]
+fn a_dismiss_after_a_sleep_is_filed_at_the_requests_stamp() {
+    let now = t0();
+    let (mut c, mut g) = fresh(now);
+    let id = c
+        .post(
+            Message::new(tags::RENDER, Severity::Error, "GPU lost").hold(Hold::STANDING),
+            stamp(0),
+            now,
+        )
+        .id;
+    let pressed = stamp(30 * 3_600_000 + 60_000);
+    let req = NoticeRequest::parse(&format!("dismiss {id}")).unwrap();
+    let a = apply(&mut c, &mut g, req, pressed, now + ms(60_000));
+    assert_eq!(a.reply, format!("OK dismissed={id}"));
+    assert_eq!(
+        c.log().get(id).unwrap().retired_unix_ms,
+        Some(pressed.unix_ms),
+        "filed when the person dismissed it"
+    );
 }
 
 #[test]

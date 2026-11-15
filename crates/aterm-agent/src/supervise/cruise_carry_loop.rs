@@ -2,26 +2,28 @@
 // Copyright 2026 Andrew Yates
 
 //! Supervision-loop seam of Cruise's carry at a break of the agent's own background work
-//! ([`super::super::policy::cruise_carry`]), and of the needs such a break's report names.
+//! ([`alab_policy::cruise_carry`]), and of the needs such a break's report names.
 
 use std::time::{Duration, Instant};
 
 use aterm_types::control_verbs::TURN_SUBMIT_BUSY_REPLY;
 
-use super::super::config::{Autopilot, SupervisorConfig};
-use super::super::policy::cruise_carry::{
-    BackgroundCarries, RULE_BACKGROUND, RULE_BACKGROUND_RESET, carry_words, recovery_words,
-};
-use super::super::policy::go_ahead::{self, RULE_GO_AHEAD};
-use super::super::policy::needs;
+use super::super::config::SupervisorConfig;
+use super::super::policy::goal_restore;
 use super::super::policy::turn_end::{
-    GO_AHEAD_REFUSED, GO_AHEAD_WAIT, GoAheadVerdict, TurnEndAction, TurnEndReading, TurnEndTiming,
-    go_ahead_answer, go_ahead_answers_on, needs_words,
+    GoAheadVerdict, TurnEndAction, TurnEndReading, go_ahead_answer, go_ahead_answers_on,
 };
 use super::approvals::Outcome;
 use super::turn_end_loop::Written;
 use super::*;
 use crate::harness::upgrade::HARNESS_MARK;
+use alab_policy::config::{Autopilot, TurnEndTiming};
+use alab_policy::cruise_carry::{
+    BackgroundCarries, RULE_BACKGROUND, RULE_BACKGROUND_RESET, carry_words, recovery_words,
+};
+use alab_policy::go_ahead::{self, RULE_GO_AHEAD};
+use alab_policy::needs;
+use alab_policy::words::{GO_AHEAD_REFUSED, GO_AHEAD_WAIT, needs_words};
 
 /// Cruise's carries at breaks: their pacing books and what the journal last said of them.
 #[derive(Debug, Default)]
@@ -386,7 +388,7 @@ impl CarryWatch {
             return (again, Some((turn.from, turn.busy)));
         }
         (
-            self.start_again(Again::Work, |books| books.ended(timing, turn.busy)),
+            self.start_again(Again::Work, |books| books.ended(&timing.carry(), turn.busy)),
             Some((turn.from, turn.busy)),
         )
     }
@@ -648,7 +650,7 @@ impl<C: Ctl> Session<'_, C> {
         let due = self
             .cruise_carry
             .books
-            .due_within(&self.turn_end.timing, at, cap);
+            .due_within(&self.turn_end.timing.carry(), at, cap);
         if now < due {
             self.carry_said(seq, CarrySaid::Waits(due), review);
             return Ok(false);
@@ -707,48 +709,73 @@ impl<C: Ctl> Session<'_, C> {
             .as_ref()
             .and_then(|path| self.fx.read_text(path))
             .and_then(|text| super::turn_end_loop::standing_rules_in(&text));
+        // THE GOAL CLAUDE CODE CLEARED AFTER AN ERROR goes in the plain carry's place, as at a
+        // point in a continuation's ([`goal_restore::replaces`]): a break is where a Cruise session
+        // whose agent keeps background work running spends its turn ends.
+        let restore = self.restore_at_break(
+            screen,
+            &host,
+            (owed.is_none() && park.is_none() && !spent, now),
+            review,
+        );
         // The owed continuation is the policy's act, typed on one line as a point types it.
-        let (text, rule, act, why) = match (owed, &park) {
-            (Some(rule), _) => {
-                let words =
-                    self.turn_end
-                        .owed_words(rule, cfg, rules.as_deref(), parked.is_some(), now);
-                let text = super::turn_end_loop::one_turn(&words);
-                let act = TurnEndAction::Type {
-                    text: words,
-                    rule_id: rule,
-                };
-                (text, rule, Some(act), None)
-            }
-            (None, Some(park)) => (
-                go_ahead_answer(park, false, rules.as_deref()),
-                RULE_GO_AHEAD,
-                None,
+        let (text, rule, act, why) = if let Some(line) = restore.as_deref() {
+            (
+                goal_restore::command(line),
+                goal_restore::RULE_GOAL_RESTORE,
+                Some(goal_restore::restore(line)),
                 Some(
-                    "the agent parked its own reversible work on a person's go-ahead at a break \
+                    "the goal Claude Code cleared after an error, set again at a break of the \
+                     agent's own background work (autopilot cruise)",
+                ),
+            )
+        } else {
+            match (owed, &park) {
+                (Some(rule), _) => {
+                    let words = self.turn_end.owed_words(
+                        rule,
+                        cfg,
+                        rules.as_deref(),
+                        parked.is_some(),
+                        now,
+                    );
+                    let text = super::turn_end_loop::one_turn(&words);
+                    let act = TurnEndAction::Type {
+                        text: words,
+                        rule_id: rule,
+                    };
+                    (text, rule, Some(act), None)
+                }
+                (None, Some(park)) => (
+                    go_ahead_answer(park, false, rules.as_deref()),
+                    RULE_GO_AHEAD,
+                    None,
+                    Some(
+                        "the agent parked its own reversible work on a person's go-ahead at a break \
                      of its background work (autopilot cruise)",
+                    ),
                 ),
-            ),
-            // With answers off the carry goes, but never says the go-ahead is no need over a
-            // park the person chose to answer themselves.
-            (None, None) if spent => (
-                recovery_words(rules.as_deref()),
-                RULE_BACKGROUND,
-                None,
-                Some("the standing decision was refused; changing approach and continuing"),
-            ),
-            (None, None) => (
-                go_ahead::unless_held(
-                    &carry_words(rules.as_deref()),
-                    self.turn_end.go_ahead_held(now) || parked.is_some(),
-                )
-                .into_owned(),
-                RULE_BACKGROUND,
-                None,
-                Some(
-                    "the turn ended while the agent's own background work runs (autopilot cruise)",
+                // With answers off the carry goes, but never says the go-ahead is no need over a
+                // park the person chose to answer themselves.
+                (None, None) if spent => (
+                    recovery_words(rules.as_deref()),
+                    RULE_BACKGROUND,
+                    None,
+                    Some("the standing decision was refused; changing approach and continuing"),
                 ),
-            ),
+                (None, None) => (
+                    go_ahead::unless_held(
+                        &carry_words(rules.as_deref()),
+                        self.turn_end.go_ahead_held(now) || parked.is_some(),
+                    )
+                    .into_owned(),
+                    RULE_BACKGROUND,
+                    None,
+                    Some(
+                        "the turn ended while the agent's own background work runs (autopilot cruise)",
+                    ),
+                ),
+            }
         };
         // The write is a semantic duty's, as a point's act is (`Session::turn_end_execute`): the
         // continuation owed goes under its own where its rule names one; any other line goes
@@ -811,11 +838,17 @@ impl<C: Ctl> Session<'_, C> {
         self.hold_line(seq, Some(cfg), review);
         host.break_taken();
         host.inform(&text);
-        review.say(&format!("CONTINUED seq={seq} rule={rule} {}", clip(&text)))?;
+        let word = if restore.is_some() {
+            "TYPED"
+        } else {
+            "CONTINUED"
+        };
+        review.say(&format!("{word} seq={seq} rule={rule} {}", clip(&text)))?;
         let reason = why.map_or_else(
             || super::approvals::act_reason_after(self.carried(), self.turn_end.limit_try()),
             str::to_string,
         );
+        let reason = self.goal_reason(rule, reason);
         // The row names the streak it went at, the carry's as what went in its place (the
         // go-ahead, the continuation owed: all go on the carry's ladder), so a later loop takes
         // the ladder up as it stands, where it started again in memory alone too.
@@ -823,6 +856,35 @@ impl<C: Ctl> Session<'_, C> {
             super::approvals::background_carry_reason(&reason, self.cruise_carry.books.streak());
         self.ledger_row(rule, Outcome::Typed, &text, &reason, seq);
         Ok(true)
+    }
+
+    /// THE GOAL RESTORE A SETTLED CRUISE BREAK TYPES in the plain carry's place, its write guards
+    /// passed: the session's goal read as at a point ([`Self::goal_read`]), folded
+    /// ([`super::super::policy::turn_end::TurnEndState::goal_at_break`]) and its records booked
+    /// ([`Self::goal_books`]); the line to type where the goal reads lost and the restore is free
+    /// ([`super::super::policy::turn_end::TurnEndState::goal_restore_at_break`]) and `plain` (no
+    /// continuation owed, no go-ahead and no change of approach in the carry's place), at `now`.
+    /// Elsewhere the journal says why, once a change, and the break types what it would.
+    fn restore_at_break(
+        &mut self,
+        screen: &Screen,
+        host: &Arc<dyn IdleHost>,
+        (plain, now): (bool, Instant),
+        review: &mut dyn Review,
+    ) -> Option<String> {
+        let program = self.reader(&screen.rows).program();
+        let goal = self.goal_read(program, Autopilot::Cruise, Some(host));
+        self.turn_end.goal_at_break(&goal, now);
+        self.goal_books(&goal, screen.seq);
+        let held = match self.turn_end.goal_restore_at_break(&goal, now)? {
+            Ok(line) if plain => return Some(line),
+            Ok(_) => goal_restore::Held::Act,
+            Err(held) => held,
+        };
+        if self.turn_end.goal_said(&goal, held) {
+            review.note(&self.goal_held_line(screen.seq, held));
+        }
+        None
     }
 
     /// THE NEEDS A BREAK'S REPORT NAMES: a turn that ends with the agent's own background work

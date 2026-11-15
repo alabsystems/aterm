@@ -103,6 +103,9 @@ pub fn default_cells() -> Vec<Cell> {
     ]
 }
 
+/// The browser `cdylib` root crates, which the Electron renderer page loads.
+pub(crate) const WASM_ROOT_CRATES: &[&str] = &["crates/aterm-gpu-web", "crates/aterm-wasm"];
+
 /// Returns wasm crate roots in `roots` that lack a `wasm32-unknown-unknown` cell in `cells`.
 pub(crate) fn unmeasured_wasm_roots<'a>(cells: &[Cell], roots: &[&'a str]) -> Vec<&'a str> {
     roots

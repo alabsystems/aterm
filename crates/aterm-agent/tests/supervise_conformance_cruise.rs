@@ -6,17 +6,18 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use alab_policy::config::Autopilot;
+use alab_policy::go_ahead::RULE_GO_AHEAD;
+use alab_policy::vocab::{Phase, WallKind};
+use alab_policy::words::{DONE_CHECK, RULE_CONTINUE, RULE_DONE_CHECK, done_check_words};
 use aterm_agent::harness::repo_work::RepoWork;
-use aterm_agent::supervise::phase::Phase;
-use aterm_agent::supervise::policy::go_ahead::RULE_GO_AHEAD;
+use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, DONE_CHECK, Outage, RULE_API_CUTOFF, RULE_CONTINUE, RULE_DONE_CHECK, Reach,
-    TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD, WaitKind, decide_turn_end,
-    done_check_words, is_answer_rule, open_work_suffix, own_repo_work_suffix,
+    Composer, Outage, RULE_API_CUTOFF, Reach, TurnEndAction, TurnEndReading, TurnEndState,
+    UNREACHABLE_HOLD, WaitKind, decide_turn_end, is_answer_rule, open_work_suffix,
+    own_repo_work_suffix,
 };
-use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_cruise_model;
-use aterm_phase::wall::WallKind;
 use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
@@ -27,7 +28,7 @@ type State = BTreeMap<&'static str, i64>;
 const OVERLONG: WallKind = WallKind::ApiError {
     code: None,
     retryable: true,
-    cause: aterm_phase::ApiCause::Overlong,
+    cause: alab_policy::vocab::ApiCause::Overlong,
 };
 const OVERLONG_MESSAGE: &str = "API Error: Claude's response exceeded the 32000 output token \
                                 maximum. To configure this behavior, set the \
@@ -164,7 +165,8 @@ fn point(
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(dirty.then(finding)),
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
-        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: aterm_agent::harness::goal::GoalRead::Unread,
         fact: None,
         wake: None,
     }
@@ -186,9 +188,7 @@ enum Verdict {
 
 fn verdict(a: &TurnEndAction) -> Verdict {
     match a {
-        TurnEndAction::Type { text, .. }
-            if text == aterm_agent::supervise::policy::turn_end::FORWARD_RECOVERY =>
-        {
+        TurnEndAction::Type { text, .. } if text == alab_policy::words::FORWARD_RECOVERY => {
             Verdict::Recover
         }
         TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_CONTINUE => Verdict::Continue,
@@ -372,7 +372,7 @@ impl Real {
     /// The shell ends: the idle screen it leaves, the turn's work as the busy
     /// reads measured it — the claim's point.
     /// The measured outage's cap passes (`OutageCapDue`): the clock moves to when the hold of
-    /// the outage standing ends (`TurnEndTiming::outage_holds_until`), the reach still Down.
+    /// the outage standing ends (`turn_end::outage_holds_until`), the reach still Down.
     fn outage_cap_passes(&mut self) {
         let since = self.down.expect("an outage stands");
         self.now = self.now.max(since + self.st.timing.outage_cap);

@@ -4,18 +4,17 @@
 //! Supervisor turn-end event loop driving `turn_end` policy decisions against `Fx`.
 use super::super::policy::approval::squashed;
 use super::super::policy::exception::{Exception, exception_for};
-use super::super::policy::needs;
 use super::super::policy::notice;
 use super::super::policy::sleeps::InTurn;
 use super::super::policy::trace::{Outcome as TraceOutcome, TraceStep};
 use super::super::policy::turn_end::{
     ANSWERS_OFF, AccountAnswer, AccountAt, BackBy, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD,
     Composer, ComposerRead, Conversation, CreditsCarry, GoAheadVerdict, LOGIN_SHARED_LOOK,
-    ProbeGate, RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_MODEL_RESTORE,
-    RULE_USAGE_PROBE, RecordTurn, Restart, RestartAnswer, RestartAsk, RestartClaim, RouteTo,
-    Sampled, TRY_ANSWER_SLACK, WAKE_KEPT, account_hold, act_turn_work, budget_frees,
-    conversation_mark, decide_turn_end, decide_turn_end_traced, done_row_work, is_wait_resume,
-    outage_of, reads_conversation,
+    ProbeGate, RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LOGIN, RULE_MODEL_RESTORE, RULE_USAGE_PROBE,
+    RecordTurn, Restart, RestartAnswer, RestartAsk, RestartClaim, RouteTo, Sampled,
+    TRY_ANSWER_SLACK, account_hold, act_turn_work, budget_frees, conversation_mark,
+    decide_turn_end, decide_turn_end_traced, done_row_work, grace_for, is_wait_resume, outage_of,
+    reads_conversation,
 };
 use super::super::tap_clock::{TapClock, TapSays, Timed, UsageWindow, timed};
 use super::wall_confirm::{Check, LeftRead};
@@ -32,6 +31,9 @@ use crate::supervise::custody::{self, CustodyGate, LeftStands};
 #[cfg(test)]
 pub(super) use crate::supervise::custody::{CUSTODY_CAP, CUSTODY_STEP, custody_step};
 pub(super) use crate::supervise::custody::{ECHO_HANG, Settles};
+use alab_policy::guard::composer_guard_at;
+use alab_policy::needs;
+use alab_policy::words::{RULE_LAND, RULE_LEFT, WAKE_KEPT};
 use aterm_types::control_verbs::{ScreenGen, TURN_SUBMIT_BUSY_REPLY};
 
 /// Usage-tap state and timing at a single wall ([`Session::tap_reset`]).
@@ -69,12 +71,12 @@ pub(super) const LOGIN_LOOK_EVERY: Duration = Duration::from_secs(5);
 
 /// Whether a wall of `kind` is the account's own, lifted by a login on
 /// another account: a usage limit or a model bucket ([`TurnEndReading::login_moved`]).
-const fn moves_with_login(kind: aterm_phase::WallKind) -> bool {
+const fn moves_with_login(kind: alab_policy::vocab::WallKind) -> bool {
     matches!(
         kind,
-        aterm_phase::WallKind::UsageSession
-            | aterm_phase::WallKind::UsageWeekly
-            | aterm_phase::WallKind::ModelBucket { .. }
+        alab_policy::vocab::WallKind::UsageSession
+            | alab_policy::vocab::WallKind::UsageWeekly
+            | alab_policy::vocab::WallKind::ModelBucket { .. }
     )
 }
 
@@ -121,12 +123,6 @@ pub(super) const REPRINT_JUMPS_MAX: u32 = 4;
 /// How long past its placement a reset is doubted at all ([`REPRINT_JUMPS_MAX`]).
 const REPRINT_HOLD_WINDOW_S: i64 = 2 * 3600;
 
-/// The longest text the cursor-row guard names whole, as `^❯ <text>`.
-const GUARD_TAIL_CHARS: usize = 40;
-
-/// The most of the text's last word a longer text's guard names.
-const GUARD_WORD_CHARS: usize = 16;
-
 /// `yield=<floor>` on every `turn` this policy types.
 const TURN_YIELD: &str = "yield=0.2";
 
@@ -151,36 +147,6 @@ pub(crate) fn one_turn(text: &str) -> String {
     } else {
         text.to_string()
     }
-}
-
-/// Build the cursor-row input fence guard for `text` typed at `caret`.
-pub(crate) fn composer_guard(caret: char, text: &str) -> String {
-    composer_guard_at(caret, 0, text)
-}
-
-/// Build [`composer_guard`] when the caret is drawn `column` cells from the left margin.
-pub(crate) fn composer_guard_at(caret: char, column: usize, text: &str) -> String {
-    let lead = "\\s".repeat(column);
-    if text.chars().count() <= GUARD_TAIL_CHARS {
-        let guard = super::super::policy::row_guard(&format!("{caret} {text}"));
-        let lit = super::super::policy::row_guard(&caret.to_string());
-        let lit = lit
-            .strip_prefix('^')
-            .and_then(|l| l.strip_suffix(super::super::policy::guard::ROW_END))
-            .unwrap_or(&lit);
-        return guard.replacen(&format!("^{lit}\\x20"), &format!("^{lead}{lit}\\s"), 1);
-    }
-    let word = text.split_whitespace().last().unwrap_or(text);
-    let n = word.chars().count();
-    let tail: String = word
-        .chars()
-        .skip(n.saturating_sub(GUARD_WORD_CHARS))
-        .collect();
-    let anchored = super::super::policy::row_guard(&tail);
-    format!(
-        "^{lead}[{caret}\\s]\\s.*{}",
-        anchored.trim_start_matches('^')
-    )
 }
 
 /// Post-wake settle window before typing into an agent session.
@@ -655,14 +621,14 @@ pub(super) fn unmoved_since(screen: &Screen, at: u64, epoch: Option<u64>) -> boo
         .is_some_and(|now| Some(now.epoch) == epoch && now.seq <= at)
 }
 
-/// A wall the host's measure of the API's reach answers ([`aterm_phase::ApiCause`]).
-const fn answered_by_the_network(kind: aterm_phase::WallKind) -> bool {
+/// A wall the host's measure of the API's reach answers ([`alab_policy::vocab::ApiCause`]).
+const fn answered_by_the_network(kind: alab_policy::vocab::WallKind) -> bool {
     matches!(
         kind,
-        aterm_phase::WallKind::ApiError {
-            cause: aterm_phase::ApiCause::Unreachable
-                | aterm_phase::ApiCause::CutOff
-                | aterm_phase::ApiCause::Config,
+        alab_policy::vocab::WallKind::ApiError {
+            cause: alab_policy::vocab::ApiCause::Unreachable
+                | alab_policy::vocab::ApiCause::CutOff
+                | alab_policy::vocab::ApiCause::Config,
             ..
         }
     )
@@ -689,8 +655,8 @@ pub(super) fn answered_age(now_ms: i64, at: Option<i64>) -> Option<Duration> {
 }
 
 /// The walls a usage window's reset lifts.
-const fn resumes_at_reset(kind: aterm_phase::WallKind) -> bool {
-    use aterm_phase::WallKind as K;
+const fn resumes_at_reset(kind: alab_policy::vocab::WallKind) -> bool {
+    use alab_policy::vocab::WallKind as K;
     matches!(
         kind,
         K::UsageSession | K::UsageWeekly | K::Spend | K::ModelBucket { .. }
@@ -1044,7 +1010,7 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn wall_reset_at(
         &mut self,
         text: Option<&str>,
-        kind: aterm_phase::WallKind,
+        kind: alab_policy::vocab::WallKind,
         session_window: bool,
         live: bool,
         answered: bool,
@@ -1114,7 +1080,7 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn tap_reset(
         &mut self,
         host: Option<&Arc<dyn IdleHost>>,
-        kind: aterm_phase::WallKind,
+        kind: alab_policy::vocab::WallKind,
         message: &str,
         text: Option<&str>,
         program: Program,
@@ -1222,7 +1188,7 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn seed_tap(
         &mut self,
         key: String,
-        kind: aterm_phase::WallKind,
+        kind: alab_policy::vocab::WallKind,
         message: &str,
         at: i64,
         now: i64,
@@ -1309,7 +1275,7 @@ impl<C: Ctl> Session<'_, C> {
     pub(super) fn login_moved_at(
         &mut self,
         host: Option<&Arc<dyn IdleHost>>,
-        wall: Option<aterm_phase::WallKind>,
+        wall: Option<alab_policy::vocab::WallKind>,
         program: Program,
         check: Check,
     ) -> bool {
@@ -1499,10 +1465,10 @@ impl<C: Ctl> Session<'_, C> {
             .stamp_ms()
             .saturating_sub(i64::try_from(back.as_millis()).unwrap_or(i64::MAX));
         self.ledger_row(
-            super::super::policy::turn_end::RULE_GO_AHEAD_HOUR,
+            alab_policy::words::RULE_GO_AHEAD_HOUR,
             approvals::Outcome::Waiting,
             &format!("from={from_ms}"),
-            super::super::policy::turn_end::GO_AHEAD_HOUR_BOOKED,
+            alab_policy::words::GO_AHEAD_HOUR_BOOKED,
             seq,
         );
     }
@@ -1665,7 +1631,7 @@ impl<C: Ctl> Session<'_, C> {
         let Some(over) = aterm_phase::login_over_limit(rows) else {
             return;
         };
-        let session_window = over.kind == aterm_phase::WallKind::UsageSession
+        let session_window = over.kind == alab_policy::vocab::WallKind::UsageSession
             && limit::names_a_session_window(&over.message);
         let notice = self.wall_reset_at(
             over.reset.as_deref(),
@@ -1703,7 +1669,7 @@ impl<C: Ctl> Session<'_, C> {
                 at,
                 jitter,
                 limit::resumes_by_itself(&over.message),
-                limit::ResetClock::of(over.reset.as_deref()),
+                limit::reset_clock(over.reset.as_deref()),
                 self.fx.mono(),
             );
             let conv = self
@@ -1785,7 +1751,7 @@ impl<C: Ctl> Session<'_, C> {
         let reset_at = match &reading.wall {
             Some(w) => {
                 let text = w.reset.clone();
-                let session_window = w.kind == aterm_phase::WallKind::UsageSession
+                let session_window = w.kind == alab_policy::vocab::WallKind::UsageSession
                     && limit::names_a_session_window(&w.message);
                 let left = self.left_read.as_ref().filter(|l| l.seq == screen.seq);
                 let undated = left.is_some_and(|l| !l.dated);
@@ -1989,7 +1955,7 @@ impl<C: Ctl> Session<'_, C> {
             .and_then(|m| super::super::memory::judge(opts.policy.memory_ceiling, &m))
             .filter(super::super::memory::MemoryOver::acts);
         let measured = self.memory_seen.filter(|_| {
-            r.wall != Some(aterm_phase::WallKind::Memory)
+            r.wall != Some(alab_policy::vocab::WallKind::Memory)
                 && matches!(r.phase, Phase::Idle | Phase::Limited { .. })
         });
         self.memory_wall = measured.is_some();
@@ -2013,10 +1979,10 @@ impl<C: Ctl> Session<'_, C> {
         // discovery runs once (the upkeep's sync, which adopts the default login's address as a
         // row at once), so a login whose address aterm can read takes the roster row's wait, and
         // its sign-in ladder's, in place of a `/login` only a person could finish.
-        let unnamed = r.wall == Some(aterm_phase::WallKind::Auth)
+        let unnamed = r.wall == Some(alab_policy::vocab::WallKind::Auth)
             && self
                 .turn_end
-                .wall_attempts(aterm_phase::WallKind::Auth)
+                .wall_attempts(alab_policy::vocab::WallKind::Auth)
                 .unwrap_or(0)
                 == 0;
         if !unnamed && !login_track {
@@ -2035,7 +2001,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         let lost = host.filter(|_| {
             login_label.is_some()
-                && (r.wall == Some(aterm_phase::WallKind::Auth)
+                && (r.wall == Some(alab_policy::vocab::WallKind::Auth)
                     || (login_track && (r.login_screen.is_some() || r.login_interrupted)))
         });
         let stamp = lost.map(|h| h.account_stamp());
@@ -2046,7 +2012,7 @@ impl<C: Ctl> Session<'_, C> {
         let login_method = host
             .filter(|_| {
                 super::super::policy::login::carried(r.program)
-                    && (r.wall == Some(aterm_phase::WallKind::Auth)
+                    && (r.wall == Some(alab_policy::vocab::WallKind::Auth)
                         || r.login_screen.is_some()
                         || r.login_interrupted)
             })
@@ -2054,7 +2020,7 @@ impl<C: Ctl> Session<'_, C> {
         let login_shared = host
             .filter(|_| {
                 super::super::policy::login::carried(r.program)
-                    && (r.wall == Some(aterm_phase::WallKind::Auth)
+                    && (r.wall == Some(alab_policy::vocab::WallKind::Auth)
                         || (login_track && (r.login_screen.is_some() || r.login_interrupted)))
             })
             .and_then(|h| h.login_shared());
@@ -2132,7 +2098,7 @@ impl<C: Ctl> Session<'_, C> {
         let mut whole_turn = None;
         if check == Check::Decide
             && (reading.said_cut || turn_cut)
-            && (super::super::policy::turn_end::says_done(reading.said_tail.as_deref())
+            && (alab_policy::words::says_done(reading.said_tail.as_deref())
                 || self.turn_end.reads_turn_whole(&reading, worked.is_some()))
         {
             let read = self.turn_read_whole(screen, reader, true);
@@ -2176,6 +2142,7 @@ impl<C: Ctl> Session<'_, C> {
             reading.repo = self.repo_read(&reading, host, worked.is_some());
             reading.leftover = self.left_read(&reading, host, worked.is_some());
             reading.credentials = self.credentials_read(&reading, host, worked.is_some());
+            reading.goal = self.goal_read(reading.program, reading.autopilot, host);
         }
         if check == Check::Decide
             && !self.left_keys.is_empty()
@@ -2233,7 +2200,7 @@ impl<C: Ctl> Session<'_, C> {
         if super::super::policy::turn_end::has_fable_fallback(reading.program)
             && (matches!(
                 reading.wall,
-                Some(aterm_phase::WallKind::ModelBucket { .. })
+                Some(alab_policy::vocab::WallKind::ModelBucket { .. })
             ) || reading.credits.as_ref().is_some_and(|c| c.model.is_some()))
             && let Some(h) = host
         {
@@ -2250,7 +2217,7 @@ impl<C: Ctl> Session<'_, C> {
             self.turn_end.fable_recorded(recorded);
         }
         if let Some(over) = measured {
-            reading.wall = Some(aterm_phase::WallKind::Memory);
+            reading.wall = Some(alab_policy::vocab::WallKind::Memory);
             reading.wall_message = over.fact();
             reading.wall_remembered = false;
         }
@@ -2433,6 +2400,7 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.cruise_carry
             .live(self.turn_end.typed_untaken(), || self.fx.mono());
+        self.break_login_live();
         // A turn ran after a line held in custody (`custody::Line::took`).
         if let Some(c) = self.custody.as_mut() {
             c.line.took();
@@ -2528,10 +2496,11 @@ impl<C: Ctl> Session<'_, C> {
         {
             let current = host.agent_resumed();
             self.turn_end.host_agent_resumed(current);
+            self.ledger_left_taken_back();
             // The host may read the process only now (it forgets an exited agent's snapshot): its
             // start is the agent's before the point is observed, so a program begun in the turn
             // is known at its first point. The clock is read only for a start not told before.
-            if let Some(started) = current.and_then(|cur| cur.started)
+            if let Some(started) = current.read().and_then(|cur| cur.started)
                 && self.turn_end.agent_start_unix() != Some(started)
             {
                 let at = self.instant_of(started);
@@ -2540,7 +2509,7 @@ impl<C: Ctl> Session<'_, C> {
             }
             // The model switch is scoped to that process too, before the point is decided: a fresh
             // program the reading could not name never has the switch's return made onto it.
-            if let Some(cur) = current
+            if let Some(cur) = current.read()
                 && let Some(started) = cur.started
             {
                 self.scope_model_switch_at_point(host, cur.pid, started, seq);
@@ -2564,6 +2533,7 @@ impl<C: Ctl> Session<'_, C> {
             )
         });
         self.observe_point(r, now, seq);
+        self.goal_books(&r.goal, seq);
         let returned = self.turn_end.take_login_returned();
         if let Some(host) = opts.idle_host.as_ref() {
             if returned {
@@ -2741,8 +2711,8 @@ impl<C: Ctl> Session<'_, C> {
         reading: &TurnEndReading,
         host: Option<&Arc<dyn IdleHost>>,
         worked: bool,
-    ) -> super::super::policy::credential_need::CredentialRead {
-        use super::super::policy::credential_need::{CredentialRead, host_wants};
+    ) -> alab_policy::credential_need::CredentialRead {
+        use alab_policy::credential_need::{CredentialRead, host_wants};
         let wants = host_wants(&reading.credential_lines());
         if wants.is_empty() || self.fx.replay_lacks_host_door("host.credentials") {
             return CredentialRead::NotAsked;
@@ -2773,6 +2743,68 @@ impl<C: Ctl> Session<'_, C> {
         read
     }
 
+    /// THE SESSION'S GOAL AS ITS TRANSCRIPT READS IT at a decided point or a settled Cruise break
+    /// ([`IdleHost::goal`]): asked where a goal Claude Code cleared after an error is put back
+    /// ([`super::super::policy::goal_restore::restores_for`]: `program` Claude Code under Cruise or
+    /// Land), not anywhere else, nor where a tape recorded without the door replays.
+    pub(super) fn goal_read(
+        &self,
+        program: Program,
+        autopilot: Autopilot,
+        host: Option<&Arc<dyn IdleHost>>,
+    ) -> crate::harness::goal::GoalRead {
+        use crate::harness::goal::GoalRead;
+        if !super::super::policy::goal_restore::restores_for(program, autopilot)
+            || self.fx.replay_lacks_host_door("host.goal")
+        {
+            return GoalRead::Unread;
+        }
+        host.map_or(GoalRead::Unread, |h| h.goal())
+    }
+
+    /// THE GOAL'S RECORDS at a point or break that read `goal` ([`super::super::policy::goal_restore`]):
+    /// what followed the goal this loop put back, once (set again, moved on, or the clear still
+    /// standing), and a clear whose condition cannot be typed back as it was, once per clear, a
+    /// skipped row that leaves it cleared.
+    pub(super) fn goal_books(&mut self, goal: &crate::harness::goal::GoalRead, seq: u64) {
+        use super::super::policy::goal_restore;
+        if let Some(outcome) = self.turn_end.goal_restored(goal) {
+            self.ledger_row(
+                goal_restore::RULE_GOAL_RESTORE,
+                approvals::Outcome::Waiting,
+                &goal_restore::command(outcome.condition()),
+                &outcome.reason(),
+                seq,
+            );
+        }
+        if let Some(why) = self.turn_end.goal_untypable(goal) {
+            self.ledger_row(
+                goal_restore::RULE_GOAL_RESTORE,
+                approvals::Outcome::Skipped,
+                "",
+                &format!(
+                    "the goal Claude Code cleared after an error is left cleared: {}",
+                    why.why()
+                ),
+                seq,
+            );
+        }
+    }
+
+    /// The journal's line for why a point or break that reads the goal lost types no restore
+    /// ([`super::super::policy::goal_restore::Held`]), at screen `seq`.
+    pub(super) fn goal_held_line(
+        &self,
+        seq: u64,
+        held: super::super::policy::goal_restore::Held,
+    ) -> String {
+        format!(
+            "DEFERRED seq={seq} {} {}",
+            super::super::policy::goal_restore::RULE_GOAL_RESTORE,
+            held.why(&|at| self.stamp_in(at))
+        )
+    }
+
     /// WHERE THE HOST'S PROBES ARE READ ([`Self::repo_read`], [`Self::left_read`]): a done claim, a
     /// finished record, an awaited land check, or a reply that parks on Land's go-ahead.
     fn repo_reads(&self, reading: &TurnEndReading) -> bool {
@@ -2780,7 +2812,7 @@ impl<C: Ctl> Session<'_, C> {
         // lands nothing a probe finds. Land's go-ahead rides the Repo leg
         // ([`TurnEndState::go_ahead_owed`]): a reply that parks on one is probed as a done claim is.
         let parks = reading.autopilot == Autopilot::Land && reading.go_ahead().is_some();
-        super::super::policy::turn_end::says_done(reading.said_tail.as_deref())
+        alab_policy::words::says_done(reading.said_tail.as_deref())
             || reading.finished_record == Some(true)
             || self.turn_end.land_check_awaited()
             || parks
@@ -3462,6 +3494,10 @@ impl<C: Ctl> Session<'_, C> {
         self.record_looked_again = false;
         if worked.is_some() {
             self.draft_left = None;
+            // A turn that worked to this point is new evidence of its login, though no live read
+            // of it ran ([`Self::took`]): a turn read only under a background wait or a carried
+            // transcript still tells its served point.
+            self.login_fact_told = None;
         }
         // A `/login` DIALOG'S ERROR STATE NAMES NO PROGRAM (`aterm_phase::identify` knows Claude
         // Code's dialog by its own words, which the failure lacks): where no `status` named the
@@ -3918,6 +3954,12 @@ impl<C: Ctl> Session<'_, C> {
         self.exception_now = (r.autopilot != Autopilot::Off)
             .then(|| exception_for(&self.turn_end, &r, &cfg, now))
             .flatten();
+        // Why a point that reads the goal lost types no restore, said once a change at its act
+        // (`Session::say_goal_held`).
+        self.goal_unsaid = self
+            .turn_end
+            .goal_held(&r, &action, now)
+            .map(|held| self.goal_held_line(judged.seq, held));
         // The go-ahead's lines are off the menu bar from the decision that types it, or waits out
         // its back-off, and back with any other (DESIGN-harness-autopilot §15.6).
         let refused = self.exception_now.as_ref().is_some_and(Exception::refuses);
@@ -4085,8 +4127,18 @@ impl<C: Ctl> Session<'_, C> {
         format!("said:{:016x}", aterm_hash::fnv1a_64(said.as_bytes()))
     }
 
+    /// A `LEFT` row's `reason`, saying where the exchange was left only because the host's read
+    /// of the agent had not answered ([`TurnEndState::exchange_unread`]).
+    fn left_words(&self, reason: &str) -> String {
+        if self.turn_end.exchange_unread() {
+            format!("{reason}{}", approvals::LEFT_UNREAD)
+        } else {
+            reason.to_string()
+        }
+    }
+
     /// Record a `skipped` ledger row under [`RULE_LEFT`] for a person's own exchange.
-    fn ledger_left(&mut self, screen: &Screen, opts: &SuperviseOpts, seq: u64) {
+    pub(super) fn ledger_left(&mut self, screen: &Screen, opts: &SuperviseOpts, seq: u64) {
         let said = self
             .reader(&screen.rows)
             .read(&screen.rows, Some(screen.cursor_col))
@@ -4097,9 +4149,37 @@ impl<C: Ctl> Session<'_, C> {
         if self.left_keys.contains(&key) {
             return;
         }
-        let reason = approvals::left_reason(approvals::LEFT_REASON, self.turn_end.exchange_opens());
+        self.ledger_left_row(key, approvals::LEFT_REASON, seq);
+    }
+
+    /// Write the `LEFT` row of the person's exchange keyed `key`, its reason `why` as the policy
+    /// judged the exchange, and keep where it was left only for want of a read
+    /// ([`Self::ledger_left_taken_back`]).
+    fn ledger_left_row(&mut self, key: String, why: &'static str, seq: u64) {
+        let reason = approvals::left_reason(&self.left_words(why), self.turn_end.exchange_opens());
         self.ledger_row(RULE_LEFT, approvals::Outcome::Skipped, &key, &reason, seq);
+        self.left_unread = self
+            .turn_end
+            .exchange_unread()
+            .then(|| (key.clone(), why, seq));
         self.left_keys.push(key);
+    }
+
+    /// A read that answered took back the person's exchange left only because the host's read of
+    /// the agent had not answered (`TurnEndState::take_exchange_taken_back`): its `LEFT` row said
+    /// it opened the session ([`approvals::LEFT_OPENS`]), which it did not, so the row is written
+    /// again for the same exchange and screen, closed by [`approvals::LEFT_TAKEN_BACK`] and not by
+    /// [`approvals::LEFT_OPENS`]. A loop that seeds from the ledger reads the last row
+    /// (`approvals::left_after_work_in`) and takes the exchange back as this one did.
+    fn ledger_left_taken_back(&mut self) {
+        if !self.turn_end.take_exchange_taken_back() {
+            return;
+        }
+        let Some((key, why, seq)) = self.left_unread.take() else {
+            return;
+        };
+        let reason = format!("{why}{}", approvals::LEFT_TAKEN_BACK);
+        self.ledger_row(RULE_LEFT, approvals::Outcome::Skipped, &key, &reason, seq);
     }
 
     /// Record a `skipped` ledger row under [`RULE_LEFT`] for a person's own exchange answered by a
@@ -4119,12 +4199,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.left_keys.contains(&key) {
             return;
         }
-        let reason = approvals::left_reason(
-            approvals::LEFT_AT_WALL_REASON,
-            self.turn_end.exchange_opens(),
-        );
-        self.ledger_row(RULE_LEFT, approvals::Outcome::Skipped, &key, &reason, seq);
-        self.left_keys.push(key);
+        self.ledger_left_row(key, approvals::LEFT_AT_WALL_REASON, seq);
     }
 
     /// Whether the policy's escalation at a point of `phase` is the point's own
@@ -4342,6 +4417,9 @@ impl<C: Ctl> Session<'_, C> {
         self.say_wall_refused(review);
         self.say_sleep_unknown(seq, review);
         self.say_repo_unread(seq, review);
+        if let Some(line) = self.goal_unsaid.take() {
+            review.note(&line);
+        }
         let backing_out = matches!(
             action,
             TurnEndAction::Cancel { rule_id } if rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT
@@ -4538,6 +4616,7 @@ impl<C: Ctl> Session<'_, C> {
             TurnEndAction::Nothing | TurnEndAction::WaitUntil { .. }
         );
         self.cruise_carry.point();
+        self.break_login.point();
         self.hold_point(&point.screen, acts, Some(&opts.policy), review);
         let (text, rule) = match &action {
             TurnEndAction::Nothing => {
@@ -4564,11 +4643,11 @@ impl<C: Ctl> Session<'_, C> {
                         .standing_needs()
                         .first()
                         .cloned()
-                        .unwrap_or_else(|| super::super::policy::needs::UNREAD_NEED.to_string());
+                        .unwrap_or_else(|| alab_policy::needs::UNREAD_NEED.to_string());
                     review.note(&format!(
                         "WAITING seq={seq} rule={} {}: {need}",
-                        super::super::policy::land_check::RULE_LAND_CHECK,
-                        super::super::policy::land_check::WAITS_ON_YOU
+                        alab_policy::land_check::RULE_LAND_CHECK,
+                        alab_policy::land_check::WAITS_ON_YOU
                     ));
                 }
                 return Ok(());
@@ -4800,7 +4879,7 @@ impl<C: Ctl> Session<'_, C> {
         if !land && self.turn_end.land_episode().0 {
             self.land_report = self.point_said.clone();
         }
-        if rule == crate::supervise::policy::land_check::RULE_LAND_CHECK {
+        if rule == alab_policy::land_check::RULE_LAND_CHECK {
             self.land_defense_said = self.point_said.clone();
         }
         self.land_over(land, seq);
@@ -4811,8 +4890,21 @@ impl<C: Ctl> Session<'_, C> {
         };
         review.say(&format!("{word} seq={seq} rule={rule} {}", clip(&text)))?;
         let reason = approvals::act_reason_after(self.carried(), self.turn_end.limit_try());
+        let reason = self.goal_reason(rule, reason);
         self.ledger_row(rule, approvals::Outcome::Typed, &text, &reason, seq);
         Ok(())
+    }
+
+    /// A typed act's ledger reason: a goal restore's names the clear it answers and its rung
+    /// ([`super::super::policy::goal_restore::typed_reason`]), which a later loop takes up.
+    pub(super) fn goal_reason(&self, rule: &str, reason: String) -> String {
+        use super::super::policy::goal_restore;
+        match self.turn_end.goal_restore_last() {
+            Some((clear, rung)) if rule == goal_restore::RULE_GOAL_RESTORE => {
+                goal_restore::typed_reason(&reason, clear, rung)
+            }
+            _ => reason,
+        }
     }
 
     /// Publish any change in the standing exception ([`exception_for`]). `backing_out`: the
@@ -5210,7 +5302,7 @@ impl<C: Ctl> Session<'_, C> {
                 let r = self.turn_end_reread(&point.screen, opts);
                 let due = r
                     .reset_at
-                    .map(|at| at + self.turn_end.timing.grace_for(r.program) + r.jitter);
+                    .map(|at| at + grace_for(&self.turn_end.timing, r.program) + r.jitter);
                 self.restart_later(seq, why, step, due, review)
             }
             (Some("busy"), Some(step)) if step == "busy:another-sweep" => {
@@ -5266,7 +5358,11 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The Mac woke ([`Self::watch_sleep`]).
+    /// The Mac woke at `wall_now` (unix seconds), `at` on the awake clock, as
+    /// [`Self::watch_sleep`] and a following loop's first look ([`Self::look_at_sleep`]) both
+    /// date it ([`Self::dated_wake`]): the settle falls [`WAKE_SETTLE`] past it plus the
+    /// session's share of [`WAKE_SPREAD`] for that minute, one settle for every loop that sees
+    /// the wake.
     pub(super) fn settle_wake(&mut self, wall_now: i64, at: Instant) {
         let share = self.setup.sid.as_deref().map_or(Duration::ZERO, |sid| {
             resume_jitter(sid, wall_now.div_euclid(60), WAKE_SPREAD)
@@ -5354,7 +5450,7 @@ impl<C: Ctl> Session<'_, C> {
         let Some(falls) = self.turn_end_due.as_ref().map(|due| self.falls_at(due)) else {
             return;
         };
-        let pause = crate::supervise::ladder::Ladder(&self.turn_end.timing.restart_backoff)
+        let pause = alab_policy::ladder::Ladder(&self.turn_end.timing.restart_backoff)
             .step(usize::try_from(self.restart_waits).unwrap_or(usize::MAX));
         self.restart_waits = self.restart_waits.saturating_add(1);
         let until = self.fx.mono() + pause;
@@ -5381,7 +5477,7 @@ impl<C: Ctl> Session<'_, C> {
         cut_at: Option<Instant>,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        let pause = crate::supervise::ladder::Ladder(&self.turn_end.timing.restart_backoff)
+        let pause = alab_policy::ladder::Ladder(&self.turn_end.timing.restart_backoff)
             .step(usize::try_from(self.restart_waits).unwrap_or(usize::MAX));
         self.restart_waits = self.restart_waits.saturating_add(1);
         let now = self.fx.mono();
@@ -6419,7 +6515,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.unserved(&r) {
             return Err(Fail::Lost(format!("help send failed: {}", r.stderr.trim())));
         }
-        let known = r.ok() && super::super::policy::server_fences_send(&r.stdout);
+        let known = r.ok() && alab_policy::guard::server_fences_send(&r.stdout);
         self.caps.send_gen = Some(known);
         Ok(known)
     }
@@ -6545,7 +6641,7 @@ impl<C: Ctl> Session<'_, C> {
         };
         let person = format!("if-human={human}");
         let fence = format!("if-gen={generation}");
-        let guard = format!("if={}", super::super::policy::row_guard(&rows[caret]));
+        let guard = format!("if={}", alab_policy::guard::row_guard(&rows[caret]));
         let r = self.call(&["send", &person, &fence, &guard, "--", text])?;
         match self.refused_press(&r, &format!("{person} {fence} {guard} (send)"))? {
             None => {}
@@ -6619,7 +6715,7 @@ impl<C: Ctl> Session<'_, C> {
             )?;
             return Ok(Some(Written::Left));
         };
-        let guard = super::super::policy::row_guard(&now.rows[caret]);
+        let guard = alab_policy::guard::row_guard(&now.rows[caret]);
         let (r, args) = self.fenced_key(&guard, "enter", &generation, Some(&person))?;
         let turn = self.turn_of(now);
         match self.refused_press(&r, &args)? {
@@ -6735,8 +6831,8 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<Option<(CtlReply, String)>, Fail> {
         let seq = point.screen.seq;
-        let guard = super::super::policy::row_guard(row);
-        let args = super::super::policy::key_args(&guard, "enter", Some(generation));
+        let guard = alab_policy::guard::row_guard(row);
+        let args = alab_policy::guard::key_args(&guard, "enter", Some(generation));
         let mut words: Vec<&str> = vec!["key"];
         words.extend(args.split(' '));
         let r = self.call(&words)?;
@@ -7453,7 +7549,7 @@ impl<C: Ctl> Session<'_, C> {
         };
         let person = format!("if-human={human}");
         let fence = format!("if-gen={generation}");
-        let guard = format!("if={}", super::super::policy::row_guard(&rows[caret]));
+        let guard = format!("if={}", alab_policy::guard::row_guard(&rows[caret]));
         let r = self.call(&["send", &person, &fence, &guard, "--", USAGE_COMMAND])?;
         match self.refused_press(&r, &format!("{person} {fence} {guard} (send)"))? {
             None => {}
@@ -7564,7 +7660,7 @@ impl<C: Ctl> Session<'_, C> {
         ) else {
             return left(ProbeMiss::NotWritten, ECHO_OTHER);
         };
-        let guard = super::super::policy::row_guard(&now.rows[caret]);
+        let guard = alab_policy::guard::row_guard(&now.rows[caret]);
         let person = format!("if-human={human}");
         let (r, args) = self.fenced_key(&guard, "enter", &generation, Some(&person))?;
         let stamp = r.seq().unwrap_or(now.seq);
@@ -7646,7 +7742,7 @@ impl<C: Ctl> Session<'_, C> {
             skipped("the judged read carries no fence for its Enter", review);
             return Ok(());
         };
-        let guard = super::super::policy::row_guard(&rows[caret]);
+        let guard = alab_policy::guard::row_guard(&rows[caret]);
         let person = point.screen.human_seq.map(|n| format!("if-human={n}"));
         let (r, args) = self.fenced_key(&guard, "enter", &generation, person.as_deref())?;
         match self.refused_press(&r, &args)? {
@@ -7708,7 +7804,7 @@ impl<C: Ctl> Session<'_, C> {
             );
             return Ok(());
         };
-        let guard = super::super::policy::row_guard(row);
+        let guard = alab_policy::guard::row_guard(row);
         let person = format!("if-human={human_seq}");
         let (r, args) = self.fenced_key(&guard, key, &generation, Some(&person))?;
         match self.refused_press(&r, &args)? {
@@ -7804,7 +7900,7 @@ impl<C: Ctl> Session<'_, C> {
             } => (own, since, tries, told),
         };
         let tries = failed.saturating_add(1);
-        let pause = crate::supervise::ladder::Ladder(&self.setup.survey_retry)
+        let pause = alab_policy::ladder::Ladder(&self.setup.survey_retry)
             .step(usize::try_from(tries - 1).unwrap_or(usize::MAX));
         let stuck = !off && tries >= PROBE_STUCK_AT && !told;
         self.probe = UsageProbe::Closing {
@@ -8005,7 +8101,7 @@ fn session_word_can_decide(action: &TurnEndAction) -> bool {
 }
 
 /// The words a wall's reset is placed and remembered under ([`Session::wall_reset_at`]).
-fn reset_key(kind: aterm_phase::WallKind, text: Option<&str>) -> String {
+fn reset_key(kind: alab_policy::vocab::WallKind, text: Option<&str>) -> String {
     approvals::wall_reset_key(kind, text)
 }
 

@@ -12,8 +12,8 @@ use super::super::super::config::Approve;
 use super::super::approval::{
     Answer, AnswerTarget, ApprovalCtx, Choice, Decision, PriorityWord, QuestionPriority, decide,
 };
-use super::super::guard::row_guard;
 use super::*;
+use alab_policy::guard::row_guard;
 
 fn recommended_answer(p: &aterm_phase::PromptV2, rows: &[String]) -> Decision {
     answer_question(

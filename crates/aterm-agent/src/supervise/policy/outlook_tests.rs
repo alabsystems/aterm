@@ -66,15 +66,15 @@ fn every_wall_kind_has_an_outlook() {
     let refused = WallKind::ApiError {
         code: Some(400),
         retryable: false,
-        cause: aterm_phase::ApiCause::Request,
+        cause: alab_policy::vocab::ApiCause::Request,
     };
     assert_eq!(
         outlook(refused, false, false, &c, true),
         Outlook::ResumesAndAsks(ExceptionKind::Refused)
     );
     for cause in [
-        aterm_phase::ApiCause::Server,
-        aterm_phase::ApiCause::Overlong,
+        alab_policy::vocab::ApiCause::Server,
+        alab_policy::vocab::ApiCause::Overlong,
     ] {
         let kind = WallKind::ApiError {
             code: None,

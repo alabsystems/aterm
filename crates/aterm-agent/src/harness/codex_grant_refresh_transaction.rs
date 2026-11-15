@@ -487,7 +487,9 @@ fn reconcile_held_with_lineage(
                 // longer blocks other grants while this grant waits for that local proof.
                 return Err("refresh refusal settlement pending".into());
             };
-            let settlement = anchor.record_settled_refusal(&witness, settled_at)?;
+            let reason =
+                codex_app_login::owned_refresh_refusal_reason(response.status, body.as_slice());
+            let settlement = anchor.record_settled_refusal(&witness, settled_at, reason)?;
             anchor.retire_catalogue(env, &settlement)?;
             changed = true;
             return Ok(changed);

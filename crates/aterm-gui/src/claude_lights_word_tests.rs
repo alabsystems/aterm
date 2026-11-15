@@ -8,7 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 use aterm_core::terminal::RenderCell;
 use aterm_window::event::{ElementState, MouseButton};
 

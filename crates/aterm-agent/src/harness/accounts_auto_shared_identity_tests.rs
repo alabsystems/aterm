@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::harness::cli::{RenewalExit, RenewalObservation};
+use crate::harness::cli::{Renewal, RenewalExit, RenewalObservation};
 
 fn read_activity(
     bed: &Bed,
@@ -261,7 +261,10 @@ fn an_active_replacement_cannot_clear_or_complete_another_rows_owner() {
     active.complete(
         &replacement,
         NOW + 1,
-        RenewalObservation::from_outcome(&Ok(RenewalExit::from(1))),
+        (
+            Renewal::AuthFailed,
+            RenewalObservation::from_outcome(&Ok(RenewalExit::from(1))),
+        ),
     );
     let rows = read_activity(&bed, &guard, clock);
     assert_eq!(
@@ -285,7 +288,10 @@ fn an_active_replacement_cannot_clear_or_complete_another_rows_owner() {
     active.complete(
         original,
         NOW + 1,
-        RenewalObservation::from_outcome(&Ok(RenewalExit::from(1))),
+        (
+            Renewal::AuthFailed,
+            RenewalObservation::from_outcome(&Ok(RenewalExit::from(1))),
+        ),
     );
     assert_eq!(
         read_activity(&bed, &guard, clock)

@@ -3514,11 +3514,17 @@ fn a_local_commands_output_in_a_system_row_starts_no_task() {
 #[test]
 fn the_supervisors_own_turns_by_its_ledger_are_no_task() {
     let cfg = crate::supervise::SupervisorConfig {
-        continue_text: "keep going".to_string(),
+        turn_end: alab_policy::config::PolicyConfig {
+            continue_text: "keep going".to_string(),
+            ..alab_policy::config::PolicyConfig::default()
+        },
         ..crate::supervise::SupervisorConfig::default()
     };
     let ours: Vec<Typed> = [
-        (cfg.continue_text.as_str(), turn_end::RULE_CONTINUE),
+        (
+            cfg.turn_end.continue_text.as_str(),
+            alab_policy::words::RULE_CONTINUE,
+        ),
         (cfg.answer_text.as_str(), turn_end::RULE_ANSWER),
         ("/compact", turn_end::RULE_COMPACT),
     ]
@@ -3564,10 +3570,10 @@ fn the_harnesss_marked_acts_are_no_task_ledger_or_not() {
         j[1..j.len() - 1].to_string()
     };
     for act in [
-        crate::supervise::config::CONTINUE_TEXT.to_string(),
-        turn_end::DONE_CHECK.to_string(),
-        turn_end::land_text(None),
-        turn_end::land_nudge_text(Some("never push to main")),
+        alab_policy::config::CONTINUE_TEXT.to_string(),
+        alab_policy::words::DONE_CHECK.to_string(),
+        alab_policy::words::land_text(None),
+        alab_policy::words::land_nudge_text(Some("never push to main")),
     ] {
         let chain = [
             prompt_row("[aterm harness] Upgraded: this session was restarted on 2.1.283."),
@@ -3707,19 +3713,19 @@ fn a_restarts_cruise_prompt_lands_nothing_in_the_record() {
         reopened.push(typed_row(check));
         assert!(!finished(&reopened), "it opens a landed task: {check}");
     }
-    let land = turn_end::land_text(None);
+    let land = alab_policy::words::land_text(None);
     assert!(
         !finished(&answered(&land, DEFENSE)),
         "CONTROL: Land's instruction answered with a defense lands nothing"
     );
     assert!(
-        finished(&answered(turn_end::LAND_CHECK, LANDED)),
+        finished(&answered(alab_policy::land_check::LAND_CHECK, LANDED)),
         "the land check answered LANDED"
     );
     let mut carried = landing_rows();
     carried.push(typed_row(&carry_on));
     assert!(finished(&carried), "the plain carry-on opens nothing");
-    let quoted = format!("Please read this: {}", turn_end::LAND_CHECK);
+    let quoted = format!("Please read this: {}", alab_policy::land_check::LAND_CHECK);
     assert!(
         !finished(&answered(&quoted, LANDED)),
         "CONTROL: a person's prompt"
@@ -3732,12 +3738,12 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
     let retry = turn_end::wall_retry_text(
         turn_end::RULE_API_RETRY,
-        aterm_phase::WallKind::Overloaded,
+        alab_policy::vocab::WallKind::Overloaded,
         aterm_phase::Program::Claude,
     );
     let ours: Vec<Typed> = [
         (retry.as_str(), turn_end::RULE_API_RETRY),
-        ("keep going", turn_end::RULE_CONTINUE),
+        ("keep going", alab_policy::words::RULE_CONTINUE),
         ("/compact", turn_end::RULE_COMPACT),
     ]
     .into_iter()
@@ -3764,11 +3770,15 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
         }
         scan
     };
-    let check = || typed_row(turn_end::DONE_CHECK);
+    let check = || typed_row(alab_policy::words::DONE_CHECK);
     // The land act a wall cuts whose retry decides the landing is the land check: its `LANDED`
     // lands, a defense answering Land's instruction or nudge never does.
-    let land = || typed_row(turn_end::LAND_CHECK);
-    let nudge = || typed_row(&turn_end::land_nudge_text(Some("never push to main")));
+    let land = || typed_row(alab_policy::land_check::LAND_CHECK);
+    let nudge = || {
+        typed_row(&alab_policy::words::land_nudge_text(Some(
+            "never push to main",
+        )))
+    };
     let defense = || model_row(DEFENSE);
     let done = || model_row(LANDED);
     let going = || model_row("Running the last suite before I say done.");
@@ -3795,7 +3805,7 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
         (
             "a land nudge defended, the check cut, retried",
             vec![
-                typed_row(&turn_end::land_text(None)),
+                typed_row(&alab_policy::words::land_text(None)),
                 going(),
                 nudge(),
                 defense(),
@@ -3902,9 +3912,9 @@ fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_land_act_again() {
         for row in [
             typed_row("Fix the lexer and land it."),
             model_row("All done: the parser and the lexer are in."),
-            typed_row(&turn_end::land_text(None)),
+            typed_row(&alab_policy::words::land_text(None)),
             model_row(DEFENSE),
-            typed_row(turn_end::LAND_CHECK),
+            typed_row(alab_policy::land_check::LAND_CHECK),
             wall.clone(),
             at(typed_row("keep going")),
             model_row(LANDED),
@@ -3918,7 +3928,7 @@ fn only_a_walls_retry_by_its_ledger_rule_delivers_the_cut_land_act_again() {
         resumed.finished(),
         "the usage resume delivers the land check again"
     );
-    let continued = scan(turn_end::RULE_CONTINUE);
+    let continued = scan(alab_policy::words::RULE_CONTINUE);
     assert!(
         !continued.finished(),
         "a plain continuation after the wall delivers no act"
@@ -3956,7 +3966,7 @@ fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() 
         }
         scan
     };
-    let land = typed_row(&turn_end::land_text(None));
+    let land = typed_row(&alab_policy::words::land_text(None));
     let s = scan(&[land.clone(), wall.clone(), auto.clone(), done.clone()]);
     assert!(
         !s.finished() && s.said_done(),
@@ -3965,7 +3975,7 @@ fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() 
     let s = scan(&[
         land.clone(),
         done.clone(),
-        typed_row(turn_end::LAND_CHECK),
+        typed_row(alab_policy::land_check::LAND_CHECK),
         wall.clone(),
         auto.clone(),
         model_row(LANDED),
@@ -3977,7 +3987,7 @@ fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() 
     let s = scan(&[
         land.clone(),
         done.clone(),
-        typed_row(turn_end::LAND_CHECK),
+        typed_row(alab_policy::land_check::LAND_CHECK),
         wall.clone(),
         notification_row(),
         model_row(LANDED),
@@ -3994,7 +4004,7 @@ fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() 
         (
             "the Cruise prompt before the limit",
             vec![
-                typed_row(turn_end::DONE_CHECK),
+                typed_row(alab_policy::words::DONE_CHECK),
                 wall.clone(),
                 auto.clone(),
                 done.clone(),
@@ -4014,9 +4024,9 @@ fn the_vendors_own_continuation_delivers_the_cut_land_act_again_to_the_record() 
 #[test]
 fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
-    let land = || typed_row(&turn_end::land_text(None));
+    let land = || typed_row(&alab_policy::words::land_text(None));
     let question = || model_row("Should I squash the two commits or keep them apart?");
-    let answer = || at(typed_row(turn_end::LAND_ANSWER));
+    let answer = || at(typed_row(alab_policy::words::LAND_ANSWER));
     let done = || {
         model_row(
             "Kept them apart and pushed.\nNothing left: both commits are merged into the remote \
@@ -4026,7 +4036,7 @@ fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
     let scan = |rows: &[String], rule: &str| {
         let ours = [Typed {
             at_ms: 1_000,
-            text: turn_end::LAND_ANSWER.to_string(),
+            text: alab_policy::words::LAND_ANSWER.to_string(),
             rule: rule.to_string(),
         }];
         let mut scan = FinishedScan::default();
@@ -4045,7 +4055,7 @@ fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
     let closed = r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":180000,"messageCount":4,"isMeta":false}"#.to_string();
     let defended = scan(
         &[land(), question(), answer(), done()],
-        turn_end::RULE_LAND_ANSWER,
+        alab_policy::words::RULE_LAND_ANSWER,
     );
     assert!(
         !defended.finished() && defended.said_done(),
@@ -4057,18 +4067,18 @@ fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
             question(),
             answer(),
             done(),
-            typed_row(turn_end::LAND_CHECK),
+            typed_row(alab_policy::land_check::LAND_CHECK),
             model_row(LANDED),
             closed,
         ],
-        turn_end::RULE_LAND_ANSWER,
+        alab_policy::words::RULE_LAND_ANSWER,
     );
     assert!(landed.finished(), "the land check after it lands it");
     for (what, rows, rule) in [
         (
             "no instruction before it",
             vec![question(), answer(), done()],
-            turn_end::RULE_LAND_ANSWER,
+            alab_policy::words::RULE_LAND_ANSWER,
         ),
         (
             "a person's prompt between",
@@ -4079,7 +4089,7 @@ fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
                 answer(),
                 done(),
             ],
-            turn_end::RULE_LAND_ANSWER,
+            alab_policy::words::RULE_LAND_ANSWER,
         ),
         (
             "its words under another rule",
@@ -4094,7 +4104,7 @@ fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
     let claim = model_row("No lander is running; all queued work has landed.\n\nATERM-TASK-DONE");
     let s = scan(
         &[land(), question(), answer(), claim],
-        turn_end::RULE_LAND_ANSWER,
+        alab_policy::words::RULE_LAND_ANSWER,
     );
     assert!(
         !s.finished() && s.said_done(),
@@ -4108,18 +4118,21 @@ const DEFENSE: &str = "Landed the fix and verified it.\nNothing left: it is merg
                        remote main branch.";
 
 /// The land check's answer that lands a task.
-const LANDED: &str = crate::supervise::policy::land_check::LANDED;
+const LANDED: &str = alab_policy::land_check::LANDED;
 
 /// The land check asked, then answered `LANDED`: what lands a task after its defense.
 fn checked_rows() -> [String; 2] {
-    [typed_row(turn_end::LAND_CHECK), model_row(LANDED)]
+    [
+        typed_row(alab_policy::land_check::LAND_CHECK),
+        model_row(LANDED),
+    ]
 }
 
 fn landing_rows() -> Vec<String> {
     let mut rows = vec![
         typed_row("Fix the lexer and land it."),
         model_row("The lexer is fixed and its tests pass."),
-        typed_row(&turn_end::land_text(None)),
+        typed_row(&alab_policy::words::land_text(None)),
         model_row(DEFENSE),
     ];
     rows.extend(checked_rows());
@@ -4214,12 +4227,12 @@ fn finished_holds_until_someone_asks() {
     assert!(!scan.line(&typed_row("Now add the flag.")));
     let rules = format!(
         "{} (standing rules: never force-push)",
-        turn_end::DONE_CHECK
+        alab_policy::words::DONE_CHECK
     );
     for check in [
-        turn_end::DONE_CHECK,
+        alab_policy::words::DONE_CHECK,
         rules.as_str(),
-        turn_end::DONE_CHECK_BEFORE,
+        alab_policy::words::DONE_CHECK_BEFORE,
     ] {
         assert!(!finished(&with(&[typed_row(check)])), "{check}: opened");
         for said in ["DONE", DEFENSE] {
@@ -4296,7 +4309,7 @@ fn lands_instruction_typed_again_after_a_compaction_is_a_land_act_to_the_record(
         "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>",
     );
     let summary = r#"{"type":"user","uuid":"s-1","isSidechain":false,"isCompactSummary":true,"message":{"role":"user","content":"This session is being continued."}}"#.to_string();
-    let land = turn_end::land_text(None);
+    let land = alab_policy::words::land_text(None);
     let scan = |continuation: &str| {
         let mut s = FinishedScan::default();
         for row in [
@@ -4304,7 +4317,7 @@ fn lands_instruction_typed_again_after_a_compaction_is_a_land_act_to_the_record(
             model_row("All tasks are complete and verified; nothing is left to do."),
             typed_row(&land),
             model_row(DEFENSE),
-            typed_row(turn_end::LAND_CHECK),
+            typed_row(alab_policy::land_check::LAND_CHECK),
             wall.clone(),
             compact.clone(),
             summary.clone(),
@@ -4315,7 +4328,7 @@ fn lands_instruction_typed_again_after_a_compaction_is_a_land_act_to_the_record(
         }
         s
     };
-    let again = scan(turn_end::LAND_CHECK);
+    let again = scan(alab_policy::land_check::LAND_CHECK);
     assert!(again.finished(), "{again:?}");
     let going = scan("keep going");
     assert!(!going.finished(), "{going:?}");
@@ -4332,15 +4345,15 @@ fn lands_acts_are_read_by_their_words_whoever_typed_them() {
         }
         s
     };
-    let hinted = crate::supervise::policy::land_check::land_check_text(
+    let hinted = alab_policy::land_check::land_check_text(
         Some("the docs PR is still open"),
         true,
         Some("never push to main"),
     );
     for land in [
-        turn_end::land_text(None),
-        turn_end::land_text(Some("never push to main")),
-        turn_end::land_nudge_text(None),
+        alab_policy::words::land_text(None),
+        alab_policy::words::land_text(Some("never push to main")),
+        alab_policy::words::land_nudge_text(None),
     ] {
         let defended = [
             ask.clone(),
@@ -4353,20 +4366,23 @@ fn lands_acts_are_read_by_their_words_whoever_typed_them() {
             !s.finished() && s.said_done(),
             "a defense lands nothing: {land}"
         );
-        for check in [turn_end::LAND_CHECK, hinted.as_str()] {
+        for check in [alab_policy::land_check::LAND_CHECK, hinted.as_str()] {
             let rows = [&defended[..], &[typed_row(check), model_row(LANDED)]].concat();
             assert!(scan(&rows).finished(), "no ledger: {land}: {check}");
         }
     }
     for check in [
-        turn_end::DONE_CHECK.to_string(),
+        alab_policy::words::DONE_CHECK.to_string(),
         turn_end::done_check_text(Some("never push to main"), true),
     ] {
         let mut rows = landing_rows();
         rows.push(typed_row(&check));
         assert!(!scan(&rows).finished(), "no ledger, opened: {check}");
     }
-    let quoted = format!("Is this wording right? {}", turn_end::LAND_CHECK);
+    let quoted = format!(
+        "Is this wording right? {}",
+        alab_policy::land_check::LAND_CHECK
+    );
     let s = scan(&[ask, report, typed_row(&quoted), model_row(LANDED)]);
     assert!(!s.finished(), "{s:?}");
 }
@@ -4381,7 +4397,7 @@ fn old_challenge(irreversible: bool) -> String {
         turn_end::OPEN_ITEMS_HEAD
     );
     if irreversible {
-        format!("{text} {}", turn_end::DONE_CHECK_REVERSIBLE)
+        format!("{text} {}", alab_policy::words::DONE_CHECK_REVERSIBLE)
     } else {
         text
     }
@@ -4396,8 +4412,8 @@ fn the_retired_challenges_are_checks_to_the_record() {
     let at = |row: String| row.replacen('{', r#"{"timestamp":"1970-01-01T00:00:01.000Z","#, 1);
     let challenge = old_challenge(false);
     let ours: Vec<Typed> = [
-        (challenge.as_str(), turn_end::RULE_OPEN_ITEMS),
-        ("keep going", turn_end::RULE_CONTINUE),
+        (challenge.as_str(), alab_policy::words::RULE_OPEN_ITEMS),
+        ("keep going", alab_policy::words::RULE_CONTINUE),
     ]
     .into_iter()
     .map(|(text, rule)| Typed {
@@ -4507,7 +4523,7 @@ fn legacy_land_instructions_land_on_a_clean_defense() {
         ]
         .join("\n")
     };
-    for prompt in [turn_end::LAND, turn_end::LAND_NUDGE] {
+    for prompt in [alab_policy::words::LAND, alab_policy::words::LAND_NUDGE] {
         assert!(
             !transcript_finished(&answered(prompt, DEFENSE), &[]),
             "CONTROL: today's act lands on its check, never its defense: {prompt}"
@@ -4515,8 +4531,8 @@ fn legacy_land_instructions_land_on_a_clean_defense() {
     }
     for prompt in [instruction, nudge]
         .into_iter()
-        .chain(turn_end::RETIRED_LANDS)
-        .chain(turn_end::RETIRED_LAND_NUDGES)
+        .chain(alab_policy::words::RETIRED_LANDS)
+        .chain(alab_policy::words::RETIRED_LAND_NUDGES)
     {
         assert!(
             transcript_finished(&answered(prompt, DEFENSE), &[]),
@@ -4549,17 +4565,17 @@ fn only_the_land_checks_landed_lands_the_task_in_the_record() {
     };
     let reversible = format!(
         "{} {}",
-        turn_end::DONE_CHECK,
-        turn_end::DONE_CHECK_REVERSIBLE
+        alab_policy::words::DONE_CHECK,
+        alab_policy::words::DONE_CHECK_REVERSIBLE
     );
     let rules = format!("{reversible} (standing rules: never force-push)");
     let checks = [
-        turn_end::DONE_CHECK,
+        alab_policy::words::DONE_CHECK,
         reversible.as_str(),
         rules.as_str(),
         TOKEN_CHECK_FIXTURE,
-        turn_end::DONE_CHECK_TOKEN_BEFORE,
-        turn_end::DONE_CHECK_BEFORE,
+        alab_policy::words::DONE_CHECK_TOKEN_BEFORE,
+        alab_policy::words::DONE_CHECK_BEFORE,
     ];
     let claims = [
         "Verified on main.\n\nATERM-TASK-DONE",
@@ -4573,31 +4589,34 @@ fn only_the_land_checks_landed_lands_the_task_in_the_record() {
             assert!(!finished(&answered(check, said)), "{check}: {said}");
         }
     }
-    let land = turn_end::land_text(None);
-    let nudge = turn_end::land_nudge_text(Some("never push to main"));
+    let land = alab_policy::words::land_text(None);
+    let nudge = alab_policy::words::land_nudge_text(Some("never push to main"));
     let acts = [
         land.as_str(),
         nudge.as_str(),
-        turn_end::LAND,
-        turn_end::LAND_NUDGE,
+        alab_policy::words::LAND,
+        alab_policy::words::LAND_NUDGE,
     ]
     .into_iter()
-    .chain(turn_end::RETIRED_LANDS)
-    .chain(turn_end::RETIRED_LAND_NUDGES);
+    .chain(alab_policy::words::RETIRED_LANDS)
+    .chain(alab_policy::words::RETIRED_LAND_NUDGES);
     let needs =
         format!("{DEFENSE}\nNEEDS YOU: decide whether to publish 1.5.0 to the public tier.");
     let open_work = "Pushed the lexer fix.\nNothing left: the parser's follow-up is still open.";
     let checked = |act: &str, said: &str, answer: &str| {
         [
             &answered(act, said)[..],
-            &[typed_row(turn_end::LAND_CHECK), model_row(answer)],
+            &[
+                typed_row(alab_policy::land_check::LAND_CHECK),
+                model_row(answer),
+            ],
         ]
         .concat()
     };
     for act in acts {
-        let retired = turn_end::RETIRED_LANDS
+        let retired = alab_policy::words::RETIRED_LANDS
             .into_iter()
-            .chain(turn_end::RETIRED_LAND_NUDGES)
+            .chain(alab_policy::words::RETIRED_LAND_NUDGES)
             .any(|r| r == act);
         assert_eq!(
             finished(&answered(act, DEFENSE)),
@@ -4643,9 +4662,9 @@ fn a_wait_at_lands_yield_is_reopened_by_its_own_wake() {
         [
             typed_row("Fix the lexer and land it."),
             model_row("All done."),
-            typed_row(&turn_end::land_text(None)),
+            typed_row(&alab_policy::words::land_text(None)),
             model_row(DEFENSE),
-            typed_row(turn_end::LAND_CHECK),
+            typed_row(alab_policy::land_check::LAND_CHECK),
             model_row(said),
             notification_row(),
             model_row("The release build passed. Next I'll publish the notes."),
@@ -4673,9 +4692,9 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
     let finished = |rows: &[String]| transcript_finished(&rows.join("\n"), &[]);
     let ask = in_turn(&typed_row("Make the compiler build itself."), "p0");
     let report = model_row("Stage 1 builds; stage 2 next.");
-    let land = in_turn(&typed_row(&turn_end::land_text(None)), "p1");
+    let land = in_turn(&typed_row(&alab_policy::words::land_text(None)), "p1");
     let defense = model_row(DEFENSE);
-    let check = in_turn(&typed_row(turn_end::LAND_CHECK), "p2");
+    let check = in_turn(&typed_row(alab_policy::land_check::LAND_CHECK), "p2");
     let landed_word = model_row(LANDED);
     let landed = || {
         vec![
@@ -4723,9 +4742,9 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
     let rows = [
         typed_row("Make the compiler build itself."),
         report.clone(),
-        typed_row(&turn_end::land_text(None)),
+        typed_row(&alab_policy::words::land_text(None)),
         defense.clone(),
-        typed_row(turn_end::LAND_CHECK),
+        typed_row(alab_policy::land_check::LAND_CHECK),
         landed_word.clone(),
         hook.clone(),
         work.clone(),
@@ -4745,9 +4764,9 @@ fn a_turn_its_own_goal_keeps_going_takes_the_landing_back() {
     let rows = [
         typed_row("Make the compiler build itself."),
         report,
-        typed_row(&turn_end::land_text(None)),
+        typed_row(&alab_policy::words::land_text(None)),
         defense,
-        typed_row(turn_end::LAND_CHECK),
+        typed_row(alab_policy::land_check::LAND_CHECK),
         landed_word,
         unnumbered_wake,
         model_row("The land log shows nothing new."),
@@ -4830,7 +4849,10 @@ fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() 
     assert!(!finished(&defended, &[]), "absorbed, then the defense");
     let relanded = [
         wake,
-        vec![typed_row(&turn_end::land_text(None)), model_row(DEFENSE)],
+        vec![
+            typed_row(&alab_policy::words::land_text(None)),
+            model_row(DEFENSE),
+        ],
         checked_rows().to_vec(),
     ]
     .concat();
@@ -4838,7 +4860,7 @@ fn a_shell_command_asks_nothing_and_a_prompt_typed_while_it_works_is_someones() 
     let ours = [Typed {
         at_ms: 1_000,
         text: "keep going".to_string(),
-        rule: turn_end::RULE_CONTINUE.to_string(),
+        rule: alab_policy::words::RULE_CONTINUE.to_string(),
     }];
     let note = queued(
         "task-notification",
@@ -7114,9 +7136,8 @@ fn claudes_own_continuation_past_a_limit_row_ends_the_standing_limit() {
 /// prefix is not.
 #[test]
 fn every_angled_check_is_the_done_checks_prompt_in_the_transcript() {
-    use crate::supervise::policy::turn_end::{
-        DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, done_check_act, done_check_words,
-    };
+    use crate::supervise::policy::turn_end::done_check_act;
+    use alab_policy::words::{DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, done_check_words};
     let mut texts: Vec<String> = (0..DONE_ANGLES.len())
         .flat_map(|n| {
             [

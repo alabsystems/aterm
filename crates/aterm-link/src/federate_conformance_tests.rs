@@ -216,7 +216,7 @@ fn shared_of(macs: &[Mac; 3], i: usize, wide: bool) -> Shared {
 
 /// A's session log record, which no push carries.
 fn ev_subject(node: &str) -> String {
-    format!("/f/{FLEET}/pub/{node}/s-1/ev")
+    format!("/f/{FLEET}/pub/{node}/t0000000001/ev")
 }
 
 /// One run of `FabricRouting`'s world.

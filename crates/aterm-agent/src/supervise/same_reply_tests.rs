@@ -5,9 +5,9 @@
 //! ([`TurnEndState::repeats`]) at a wall no reader names.
 
 use super::*;
-use crate::supervise::config::Autopilot;
 use crate::supervise::policy::exception::FUTILE_AFTER_TRIES;
-use aterm_phase::WallKind;
+use alab_policy::config::Autopilot;
+use alab_policy::vocab::WallKind;
 use aterm_phase::muse::fixtures as muse;
 use aterm_phase::prompt::fixtures::screen;
 
@@ -99,7 +99,7 @@ impl<'a> Driver<'a> {
         let mut notes = Vec::new();
         s.ledger = approvals::Ledger::open(Some(ledger), Some("@s-1"), &mut notes);
         let mut opts = hosted(30);
-        opts.policy.autopilot = autopilot;
+        opts.policy.turn_end.autopilot = autopilot;
         s.set_clock(base + first, PDT);
         s.set_mono_standing();
         s.set_clock_running();
@@ -1680,7 +1680,7 @@ fn work_scrolled_above_a_wall_keeps_its_tries_going_and_a_529_is_never_held() {
             WallKind::ApiError {
                 code: Some(400),
                 retryable: false,
-                cause: aterm_phase::ApiCause::Request,
+                cause: alab_policy::vocab::ApiCause::Request,
             },
         ),
     ] {

@@ -26,7 +26,7 @@ fn boot(prefix: &str) -> Instance {
 fn spawn(inst: &Instance) -> String {
     let body = ctl_ok(inst, &["spawn"]);
     body.split_whitespace()
-        .find(|w| w.starts_with("s-"))
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .unwrap_or_else(|| panic!("a sid: {body}"))
         .to_string()
 }

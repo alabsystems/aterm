@@ -2,7 +2,7 @@
 name: system-state
 description: Read what this machine, every aterm process and this tab are doing now (CPU per core, GPU, memory and swap, disk space, which processes use them, and which commands stopped making progress). Use for "slow", "hung", "stuck", "frozen", "out of memory", "swap", "disk full", "which process", "load", "is my command still working", "wait for a quiet machine", or "benchmark".
 ---
-<!-- aterm skill v9 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v10 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # System state in aterm
 
@@ -10,10 +10,12 @@ description: Read what this machine, every aterm process and this tab are doing 
 list names the `aterm help sys <section>` pages that hold the detail. This skill is how to use
 it.
 
-Scopes: `tab` (this tab's shell and everything under it), `aterm` (this aterm instance's
-processes) and `global` (the machine). Bare `sys`'s `rest` line splits the machine's CPU into
-this tab, the rest of aterm, your other processes and services (by subtraction, so it can print
-negative); `sys global` splits it into aterm, others and services.
+Scopes: `tab` (this tab's shell and its owned work), `aterm` (the app, its tabs and shared
+services) and `global` (the machine). Bare `sys`'s `rest` line splits the machine's CPU into
+this tab, the rest of aterm, your other processes, services and an unassigned remainder;
+`sys global` shows the same account without separating this tab. A signed remainder keeps
+unread work and counter skew visible. `cpu_charge_mc` is an inherited counter estimate,
+separate from confirmed CPU; child counters can repeat or miss descendants' time.
 
 ## Read
 
@@ -36,7 +38,10 @@ aterm ctl @self sys [<view>] since=<cursor>  # what changed since the same reque
 - `2.3c` is 2.3 cores' worth of CPU per second. `sys cores` shows each cluster's busy cores and
   `sys procs` each process's cores' worth; neither says which core a process ran on.
 - `≥`/`≤` mark bounds (a process refused a read). `unavailable(<why>)` is never zero.
-  `state=stale` keeps the last values with their age.
+  `state=stale` keeps the last values with their age. `state=partial stalled=procs` means the
+  kernel holds a read of other processes (the line `stalled procs: <call> pid=…` names it and
+  since when): process figures read `unavailable(stalled)`, and CPU, memory, swap, disk, GPU and
+  network are still fresh. `ps` and `top` hang on the same read.
 - Writes are storage writes processes issued (a floor), not disk growth. Records use base units
   (`cpu_mc=`, `fp_bytes=`, `write_bps=`); `aterm help sys output` lists every unit.
 

@@ -4,7 +4,8 @@
 //! Tests for the stand-in's frames, steps and keys: every frame read by the readers the harness
 //! reads a real Claude Code with.
 
-use aterm_phase::phase::{Phase, background_wait, in_process_work, worker_phase};
+use alab_policy::vocab::Phase;
+use aterm_phase::phase::{background_wait, in_process_work, worker_phase};
 use aterm_phase::reader::{ClaudeReader, ScreenReader};
 
 use super::*;

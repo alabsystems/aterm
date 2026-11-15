@@ -57,6 +57,7 @@ impl App {
         window.last_present = None;
         self.resync_active_or_window(wid);
         self.sync_active_session();
+        self.note_restore_focus_intent(wid);
         if let Some(window) = self
             .windows
             .get(&wid)
@@ -71,8 +72,9 @@ impl App {
     /// Restore mints a fresh view even when the process already hosts About.
     pub(crate) fn stage_about_tab(
         &mut self,
-        wid: WindowId,
+        target: impl Into<crate::app_tabs::NativeInstallTarget>,
     ) -> Result<(TabId, ViewId), crate::app_tabs::NativeTabInstallError> {
+        let target = target.into();
         let state = AppViewState::About(Box::default());
         let presentation = crate::tab_model::TabPresentation {
             title: "About aterm".into(),
@@ -83,10 +85,10 @@ impl App {
             tooltip: Some("About aterm".into()),
         };
         if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::About) {
-            self.install_native_tab(wid, instance, state, presentation)
+            self.install_native_tab(target, instance, state, presentation)
         } else {
             self.install_new_native_tab(
-                wid,
+                target,
                 NativeApp::About(Box::new(crate::native_about::AboutApp::new())),
                 state,
                 presentation,

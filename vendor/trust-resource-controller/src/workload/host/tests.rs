@@ -63,7 +63,7 @@ fn workload_queries_cannot_enter_legacy_proxy_or_resolver_dispatch() {
     assert!(CompilerQuery::decode(&bytes).unwrap() == request);
     assert!(crate::resolver::SealedResolverQueryRequest::decode(&bytes).is_err());
     assert!(crate::Call::decode(&request.member.encode().unwrap()).is_err());
-    assert!(crate::Call::Member(request.member.clone()).encode().is_err());
+    assert!(crate::Call::Member(Box::new(request.member.clone())).encode().is_err());
     assert!(
         crate::accounting::AccountedRequest {
             request: request.member.clone(),

@@ -7,9 +7,9 @@
 //! Settings ▸ Harness's mode buttons; the forever lab (`aterm-lab`) judges the chip's title
 //! against the same rows. The table lives beside [`Autopilot`] so both read the one source.
 
-use super::Autopilot;
 use crate::harness::acts::{LandReceipt, ReceiptLeg};
 use crate::harness::hold_said::NeedTail;
+use alab_policy::config::Autopilot;
 
 /// One mode's sentence in the form each surface renders it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

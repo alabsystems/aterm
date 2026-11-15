@@ -6,132 +6,6 @@ use crate::EnvSnapshot;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
-/// Removing the production Census call to the structural guard removes this gate failure.
-#[test]
-fn census_refuses_an_entry_a_branch_adds_outside_a_released_section() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let root = dir.path();
-    let env = EnvSnapshot {
-        path: std::env::var_os("PATH").unwrap_or_default(),
-        ..Default::default()
-    };
-    let git = |args: &[&str]| {
-        let out = crate::changed::git(root, &env.path)
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.name", "A"]);
-    git(&["config", "user.email", "a@example.invalid"]);
-    let kept = "## [Unreleased]\n\n### Fixed\n\n- Kept note.\n";
-    std::fs::write(root.join("CHANGELOG.md"), kept).unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-qm", "base"]);
-    git(&["branch", "base"]);
-    std::fs::create_dir_all(root.join(CHECKOUT_MARKER).parent().unwrap()).unwrap();
-    std::fs::write(root.join(CHECKOUT_MARKER), "").unwrap();
-    let ctx = Ctx::new(
-        root.to_path_buf(),
-        Scope::changed("base", vec![], false),
-        env.clone(),
-        root.join("scratch"),
-    );
-    for stray in [
-        format!("- Stray entry.\n\n{kept}"),
-        format!("{kept}\n- Another note.\n"),
-    ] {
-        std::fs::write(root.join("CHANGELOG.md"), stray).unwrap();
-        let mut report = Report::new("census");
-        census(&ctx, &mut report);
-        assert!(report.outcomes().any(|(outcome, label)| outcome
-            == Outcome::Fail(Severity::GateFailed)
-            && label == "changelog structure"));
-    }
-    std::fs::write(root.join("CHANGELOG.md"), kept).unwrap();
-    std::fs::write(root.join("unrelated.txt"), "work").unwrap();
-    let mut report = Report::new("census");
-    census(&ctx, &mut report);
-    assert!(
-        !report
-            .outcomes()
-            .any(|(_, label)| label == "changelog structure")
-    );
-}
-
-#[test]
-fn census_reports_harness_debt_as_a_gate_failure() {
-    let temp = aterm_tempfile::TempDir::new().expect("scratch repository");
-    let root = temp.path();
-    let git = |args: &[&str]| {
-        let out = crate::git_provider::command()
-            .current_dir(root)
-            .args(args)
-            .output()
-            .expect("git runs");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.name", "A"]);
-    git(&["config", "user.email", "a@example.invalid"]);
-    let version_file = aterm_phase::CliHarness::ClaudeCode.version_file();
-    let source = "crates/aterm-agent/src/harness/upgrade_drive.rs";
-    for path in [version_file, source, CHECKOUT_MARKER] {
-        std::fs::create_dir_all(root.join(path).parent().expect("parent")).expect("mkdir");
-    }
-    std::fs::write(
-        root.join("Cargo.toml"),
-        "[workspace]\n[workspace.package]\nversion = \"0.1.0\"\n",
-    )
-    .expect("manifest");
-    std::fs::write(
-        root.join(version_file),
-        format!("{}\n", aterm_phase::harness_version::source_line((0, 1))),
-    )
-    .expect("version source");
-    std::fs::write(root.join(source), "fn drive() {}\n").expect("harness source");
-    std::fs::write(root.join(CHECKOUT_MARKER), "").expect("checkout marker");
-    git(&["add", "."]);
-    git(&["commit", "-qm", "public release"]);
-    git(&["tag", "-am", "public release", "v0.1.0"]);
-    std::fs::write(root.join(source), "fn drive() { changed(); }\n")
-        .expect("changed harness source");
-    git(&["add", "."]);
-    git(&["commit", "-qm", "unbumped harness source"]);
-
-    let ctx = Ctx::new(
-        root.to_path_buf(),
-        Scope::workspace(),
-        EnvSnapshot {
-            // This fixture runs genuine Git, including its normal user-prefix launcher.
-            path: std::env::var_os("PATH").unwrap_or_default(),
-            ..EnvSnapshot::default()
-        },
-        root.join("scratch"),
-    );
-    let mut report = Report::new("census");
-    census(&ctx, &mut report);
-    let rows: Vec<_> = report.outcomes().collect();
-    // NEGATIVE CONTROL: removing Census's harness-debt call leaves no debt-labelled gate
-    // failure even though the source changed after the public tag.
-    assert!(
-        rows.iter().any(|(outcome, label)| {
-            *outcome == Outcome::Fail(Severity::GateFailed)
-                && label.contains("harness landing debt since public v0.1.0")
-        }),
-        "production Census stage did not report the debt: {rows:?}"
-    );
-}
-
 /// THE CENSUS WALK HOLDS CAPTURES TO THE BASELINE OF THE ENGINE'S COMMIT: a capture holding a
 /// word only the named engine's committed baseline lists is a `capture-privacy` finding of
 /// the guard census. NEGATIVE CONTROL: the same word left uncommitted in that engine's
@@ -184,103 +58,61 @@ fn the_census_walk_holds_captures_to_the_engines_committed_baseline() {
     let log = |outcomes: Vec<aterm_census::CensusOutcome>| {
         outcomes.into_iter().map(|o| o.log).collect::<String>()
     };
-    let uncommitted = log(census_walk(&root, &var, &guards, None).0);
+    let walk = || {
+        let engine = crate::engine::Files::read(
+            &root,
+            &var,
+            &crate::engine::bounded,
+            &crate::engine::native,
+        );
+        log(census_walk(&root, &census_baseline(&engine), &guards))
+    };
+    let uncommitted = walk();
     assert!(
         !uncommitted.contains("base.ptylog"),
         "NEGATIVE CONTROL: an uncommitted row is no part of the engine: {uncommitted}"
     );
     git(&engine, &["commit", "-q", "-am", "row"]);
-    let committed = log(census_walk(&root, &var, &guards, None).0);
+    let committed = walk();
     assert!(
         committed.contains("base.ptylog"),
         "the committed row holds: {committed}"
     );
 }
 
-/// A cone lints all the targets of what the change touched and the default targets of the rest,
-/// matching by package name whichever spec the cone holds it by. CONTROL: `-p`, `--all`, an
-/// empty cone, a cone where everything is touched (a lock row's) stay one `--all-targets` pass;
-/// and a list that matches nothing never reaches [`Scope::args`], which would answer
-/// `--workspace`.
+/// EVERY SCOPE LINTS IN ONE PASS OVER EVERY TARGET of what it selects, a cone's crates by the
+/// specs it holds them by, a dependent's and a dev dependent's test targets included, with the
+/// deny list ([`LINT_TAIL`]), under the ordinary feature unification. CONTROL: `-p` and the
+/// workspace, linted as a dev run lints them, are one pass too.
 #[test]
-fn a_cone_lints_all_the_targets_of_what_the_change_touched() {
+fn every_scope_lints_in_one_pass_over_every_target() {
     let spec = "path+file:///r/crates/aterm-x#x@1.0.0";
-    let crates = vec![
-        "aterm-gui".to_string(),
-        "aterm-uds".to_string(),
-        "getrandom@0.2.17".to_string(),
-        spec.to_string(),
-    ];
-    let cone = |touched: &[&str]| {
-        Scope::changed("main", crates.clone(), true)
-            .with_all_targets(touched.iter().map(ToString::to_string).collect())
-    };
-    let tail = |all: bool| -> Vec<String> {
-        let tail: &[&str] = if all {
-            &LINT_TAIL
-        } else {
-            &["--keep-going", "--", "-D", "warnings"]
-        };
-        tail.iter().map(ToString::to_string).collect()
-    };
-    let select = |names: &[&str]| -> Vec<String> {
-        names
-            .iter()
-            .flat_map(|name| ["-p".to_string(), (*name).to_string()])
-            .collect()
-    };
-    let args = |scope: &Scope| -> Vec<Vec<String>> {
-        tippy_passes(scope).into_iter().map(|p| p.args).collect()
-    };
+    let names = ["aterm-gui", "aterm-uds", "getrandom@0.2.17", spec];
+    let cone = Scope::changed("main", names.map(String::from).to_vec(), true);
+    let mut want: Vec<String> = names
+        .iter()
+        .flat_map(|name| ["-p".to_string(), (*name).to_string()])
+        .collect();
+    want.extend(LINT_TAIL.map(String::from));
+    assert_eq!(tippy_args(&cone), want);
+    let passes = lint_invocations(&cone, &[], false);
     assert_eq!(
-        args(&cone(&["aterm-uds", "getrandom", "x"])),
-        [
-            [select(&["aterm-uds", "getrandom@0.2.17", spec]), tail(true)].concat(),
-            [select(&["aterm-gui"]), tail(false)].concat(),
-        ]
+        passes,
+        [TippyPass {
+            label: format!("-p aterm-gui -p aterm-uds -p getrandom@0.2.17 -p {spec}"),
+            args: lint_unified(want),
+        }]
     );
-    let passes = tippy_passes(&cone(&["aterm-uds"]));
-    assert_eq!(passes[0].label, "-p aterm-uds --all-targets");
-    assert!(
-        passes[1]
-            .label
-            .starts_with("-p aterm-gui -p getrandom@0.2.17")
-    );
-    assert!(!passes[1].label.contains("--all-targets"), "{passes:?}");
-    // What the cone holds only by a dev edge is in neither pass, matched by package name.
-    let left_out = |names: &[&str]| {
-        cone(&["aterm-uds"]).with_unlinted(names.iter().map(ToString::to_string).collect())
-    };
-    assert_eq!(
-        args(&left_out(&["aterm-gui", "getrandom"])),
-        [
-            [select(&["aterm-uds"]), tail(true)].concat(),
-            [select(&[spec]), tail(false)].concat(),
-        ]
-    );
-    assert_eq!(
-        args(&left_out(&["aterm-gui", "getrandom", "x"])),
-        [[select(&["aterm-uds"]), tail(true)].concat()],
-        "with none of the rest left, no second pass"
-    );
-    // The whole cone: a lock row the change reached.
-    let whole = Scope::changed("main", crates.clone(), true);
-    assert_eq!(args(&whole), [tippy_args(&whole)]);
     for scope in [Scope::workspace(), Scope::crate_only("aterm-gui")] {
-        assert_eq!(args(&scope), [tippy_args(&scope)], "{scope:?}");
+        assert_eq!(
+            lint_invocations(&scope, &[], false)
+                .into_iter()
+                .map(|pass| pass.args)
+                .collect::<Vec<_>>(),
+            [lint_unified(tippy_args(&scope))],
+            "{scope:?}"
+        );
     }
-    let empty = Scope::changed("main", Vec::new(), false);
-    assert!(empty.selects_nothing());
-    assert_eq!(args(&empty), [tippy_args(&empty)]);
-    assert_eq!(
-        args(&cone(&[])),
-        [[
-            select(&["aterm-gui", "aterm-uds", "getrandom@0.2.17", spec]),
-            tail(false)
-        ]
-        .concat()],
-        "no list that matches nothing widens to --workspace"
-    );
 }
 
 #[test]
@@ -1151,15 +983,6 @@ fn gated_fixture_root() -> PathBuf {
     root
 }
 
-/// A cone of `crates`, of which the change touched `touched` and `direct` depend on one directly.
-fn gated_cone(crates: &[&str], touched: &[&str], direct: &[&str]) -> Scope {
-    let owned = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
-    Scope::changed("main", owned(crates), true)
-        .with_seeds(owned(touched))
-        .with_all_targets(owned(touched))
-        .with_direct_dependents(owned(direct))
-}
-
 /// The `-p` packages and the `--features` of the required-features pass among `runs`, or
 /// `None` when none is.
 fn gated_pass(runs: &[TippyPass]) -> Option<(Vec<String>, String)> {
@@ -1175,88 +998,70 @@ fn gated_pass(runs: &[TippyPass]) -> Option<(Vec<String>, String)> {
     Some((packages, pass.args[at + 1].clone()))
 }
 
-/// A change cone lints the `required-features` targets of the packages it touched and of those
-/// one edge from them, under the ordinary passes' feature unification, after them and before
-/// the shipped build's: 1bda125b88 narrowed a method of aterm-gui's to `cfg(test)` that its
-/// `bench-support` module still called, the cone's lint never compiled that module, and the
-/// release's lint was the first that did (0.189.0, E0599). The workspace and `-p` lint those of
-/// every package they select. CONTROLS: a package with gated targets the cone holds only further
-/// away, and a cone holding no package with gated targets, get no such pass.
+/// ONLY A WHOLE-WORKSPACE LINT RUNS THE GATED AND SHIPPED PASSES: `verify lint --all`, the
+/// follower and the release (package by package) lint the `required-features` targets of the
+/// packages that have them, under the ordinary pass's feature unification, after it and before
+/// the shipped build's `-p aterm --release`. CONTROL: a cone or `-p` run, even one holding
+/// aterm-gui and aterm, runs its one ordinary pass and leaves both to those runs.
 #[test]
-fn a_cone_lints_the_gated_targets_of_what_it_touched_and_what_names_it() {
+fn only_a_whole_workspace_lint_runs_the_gated_and_shipped_passes() {
     let gated = fixture_gated();
-    let gui = (
-        vec!["aterm-gui".to_string()],
-        "aterm-gui/bench-support,aterm-gui/control-conformance".to_string(),
-    );
-    let touched = gated_cone(&["aterm", "aterm-gui"], &["aterm-gui"], &["aterm"]);
-    let runs = lint_invocations(&touched, &gated);
-    assert_eq!(gated_pass(&runs), Some(gui.clone()), "{runs:?}");
-    let at = runs
-        .iter()
-        .position(|run| run.label.starts_with("required-features"))
-        .expect("the gated pass");
-    assert!(
-        at == tippy_passes(&touched).len() && runs[at + 1].label == "-p aterm --release",
-        "after the ordinary passes, before the shipped build's: {runs:?}"
-    );
+    let runs = lint_invocations(&Scope::workspace(), &gated, true);
+    assert_eq!(runs.len(), 3, "{runs:?}");
     assert_eq!(
-        runs[at].args,
-        lint_unified(tippy_gated_args(&touched, &gated).expect("gated")),
-        "the ordinary passes' feature unification, so it shares their dependency units"
-    );
-    assert!(runs[at].args.ends_with(&LINT_TAIL.map(String::from)));
-    let named = gated_cone(
-        &["aterm-core", "aterm-gui", "aterm-scrollback"],
-        &["aterm-core"],
-        &["aterm-gui"],
-    );
-    assert_eq!(
-        gated_pass(&lint_invocations(&named, &gated)),
-        Some(gui),
-        "a direct dependent's gated targets, not those of one further away"
-    );
-    let further = gated_cone(&["aterm-core", "aterm-scrollback"], &["aterm-core"], &[]);
-    assert_eq!(gated_pass(&lint_invocations(&further, &gated)), None);
-    let none = gated_cone(
-        &["aterm-core", "aterm-verify"],
-        &["aterm-core"],
-        &["aterm-verify"],
-    );
-    let runs = lint_invocations(&none, &gated);
-    assert_eq!(gated_pass(&runs), None);
-    assert!(
-        runs.iter()
-            .all(|run| !run.args.iter().any(|a| a == "--features")),
-        "{runs:?}"
-    );
-    assert_eq!(
-        gated_pass(&lint_invocations(&Scope::workspace(), &gated)),
+        gated_pass(&runs),
         Some((
             vec!["aterm-gui".to_string(), "aterm-scrollback".to_string()],
             "aterm-gui/bench-support,aterm-gui/control-conformance,aterm-scrollback/disk-tier"
                 .to_string()
         ))
     );
+    assert!(
+        runs[1].label.starts_with("required-features targets"),
+        "{runs:?}"
+    );
+    assert_eq!(
+        runs[1].args,
+        lint_unified(tippy_gated_args(&Scope::workspace(), &gated).expect("gated")),
+        "the ordinary pass's feature unification, so it shares its dependency units"
+    );
+    assert!(runs[1].args.ends_with(&LINT_TAIL.map(String::from)));
+    assert_eq!(runs[2].label, "-p aterm --release");
     assert_eq!(
         gated_pass(&lint_invocations(
             &Scope::crate_only("aterm-scrollback"),
-            &gated
+            &gated,
+            true
         )),
         Some((
             vec!["aterm-scrollback".to_string()],
             "aterm-scrollback/disk-tier".to_string()
-        ))
+        )),
+        "the release's lint of one package"
     );
+    for scope in [
+        Scope::changed("main", vec!["aterm".into(), "aterm-gui".into()], true),
+        Scope::crate_only("aterm-gui"),
+    ] {
+        let runs = lint_invocations(&scope, &gated, false);
+        assert_eq!(runs.len(), 1, "{scope:?}: {runs:?}");
+        assert!(
+            !runs[0]
+                .args
+                .iter()
+                .any(|a| a == "--features" || a == "--release"),
+            "{runs:?}"
+        );
+    }
 }
 
-/// The lint stage of a dev run, not a release, runs a cone's gated pass: a recording
-/// `targo-tippy` stand-in, over the fixture's manifests, sees `--features aterm-gui/…` for a
-/// cone that touched aterm-gui. CONTROL: for a cone holding no package with gated targets it
-/// sees no `--features`, and as many runs as that cone has ordinary passes.
+/// The lint stage of a dev run runs a cone's one pass: a recording `targo-tippy` stand-in, over
+/// the fixture's manifests, sees one run for a cone that holds aterm-gui, with every target and
+/// the deny list and no `--features`. CONTROL: a dev run over the whole workspace also runs the
+/// gated pass and the shipped build's.
 #[cfg(unix)]
 #[test]
-fn a_dev_lint_stage_runs_the_cones_gated_pass() {
+fn a_dev_lint_stage_runs_a_cones_one_pass() {
     let root = gated_fixture_root();
     std::fs::create_dir_all(root.join("scratch")).expect("the run's scratch");
     let argv = |scope: Scope| -> Vec<String> {
@@ -1287,19 +1092,31 @@ fn a_dev_lint_stage_runs_the_cones_gated_pass() {
             .map(str::to_string)
             .collect()
     };
-    let touched = argv(gated_cone(&["aterm-gui"], &["aterm-gui"], &[]));
-    let none = argv(gated_cone(&["aterm-core"], &["aterm-core"], &[]));
+    let cone = argv(Scope::changed("main", vec!["aterm-gui".into()], true));
+    let whole = argv(Scope::workspace());
     std::fs::remove_dir_all(&root).ok();
-    assert_eq!(touched.len(), 2, "{touched:?}");
+    // The driver's arguments, after the `--` the run's message format goes before.
+    let driver = LINT_TAIL[2..].join(" ");
+    assert_eq!(cone.len(), 1, "{cone:?}");
     assert!(
-        touched[1].contains(
-            "-p aterm-gui --features aterm-gui/bench-support,aterm-gui/control-conformance \
-             --all-targets --keep-going"
-        ) && touched[1].ends_with(" -- -D warnings"),
-        "{touched:?}"
+        cone[0].contains("-p aterm-gui --all-targets --keep-going ")
+            && cone[0].ends_with(&driver)
+            && !cone[0].contains("--features"),
+        "{cone:?}"
     );
-    assert_eq!(none.len(), 1, "{none:?}");
-    assert!(!none[0].contains("--features"), "{none:?}");
+    assert_eq!(whole.len(), 3, "{whole:?}");
+    assert!(
+        whole[1].contains(
+            "-p aterm-gui -p aterm-scrollback --features \
+             aterm-gui/bench-support,aterm-gui/control-conformance,aterm-scrollback/disk-tier \
+             --all-targets --keep-going "
+        ) && whole[1].ends_with(&driver),
+        "{whole:?}"
+    );
+    assert!(
+        whole[2].starts_with("-p aterm --release --keep-going ") && whole[2].ends_with(&driver),
+        "{whole:?}"
+    );
 }
 
 #[test]
@@ -1526,7 +1343,7 @@ fn libc_oracle_reads_the_gates_verdict_before_the_machine() {
 
 #[cfg(unix)]
 #[test]
-fn a_machine_with_no_doc_driver_anywhere_is_diagnosed_on_the_doctests_row() {
+fn a_machine_with_no_doc_driver_anywhere_is_diagnosed_on_the_test_stages_doctest_row() {
     let spec = |id| StageSpec {
         id,
         title: "t".into(),
@@ -1575,21 +1392,17 @@ fn a_machine_with_no_doc_driver_anywhere_is_diagnosed_on_the_doctests_row() {
     };
     let cc = no_driver(Scope::workspace());
 
+    // The test binaries ran; the doctests after them could not, and say why, once.
     let r = run_stage(&cc, &spec(StageId::Test));
     let outcomes: Vec<Outcome> = r.outcomes().map(|(o, _)| o).collect();
-    assert_eq!(outcomes, [Outcome::Ok], "{}", r.render());
+    assert_eq!(
+        outcomes,
+        [Outcome::Ok, Outcome::Fail(Severity::CouldNotRun)],
+        "{}",
+        r.render()
+    );
 
-    let r = run_stage(&cc, &spec(StageId::Doctests));
-    let outcomes: Vec<_> = r.outcomes().collect();
-    assert_eq!(outcomes.len(), 1, "doctests decided once");
-    assert_eq!(outcomes[0].0, Outcome::Fail(Severity::CouldNotRun));
-
-    let cb = no_driver(Scope::changed("main", vec!["aterm-lab".into()], false));
-    let r = run_stage(&cb, &spec(StageId::Doctests));
-    let outcomes: Vec<_> = r.outcomes().collect();
-    assert_eq!(outcomes.len(), 1, "bin-only doctests decided once");
-    assert_eq!(outcomes[0].0, Outcome::Skip, "{}", outcomes[0].1);
-
+    // A selection with no library has no doctests: the test stage runs its binaries alone.
     let bin_only = tmp.join("crates/binonly");
     std::fs::create_dir_all(bin_only.join("src")).unwrap();
     std::fs::write(
@@ -1599,29 +1412,20 @@ fn a_machine_with_no_doc_driver_anywhere_is_diagnosed_on_the_doctests_row() {
     .unwrap();
     let mut cx = no_driver(Scope::crate_only("binonly"));
     cx.root = tmp.clone();
-    let r = run_stage(&cx, &spec(StageId::Doctests));
-    let outcomes: Vec<_> = r.outcomes().collect();
-    assert_eq!(outcomes[0].0, Outcome::Skip, "{}", outcomes[0].1);
-
-    std::fs::write(
-        bin_only.join("src/lib.rs"),
-        "//! ```text\n//! not rust\n//! ```\n",
-    )
-    .unwrap();
-    let r = run_stage(&cx, &spec(StageId::Doctests));
-    let outcomes: Vec<_> = r.outcomes().collect();
-    assert_eq!(outcomes[0].0, Outcome::Ok, "{}", outcomes[0].1);
-    std::fs::write(bin_only.join("src/lib.rs"), "//! ```\n//! 1;\n//! ```\n").unwrap();
-    let r = run_stage(&cx, &spec(StageId::Doctests));
-    let outcomes: Vec<_> = r.outcomes().collect();
-    assert_eq!(
-        outcomes[0].0,
-        Outcome::Fail(Severity::CouldNotRun),
-        "{}",
-        outcomes[0].1
-    );
     let r = run_stage(&cx, &spec(StageId::Test));
-    assert!(r.outcomes().all(|(o, _)| o == Outcome::Ok));
+    assert!(
+        r.outcomes().all(|(o, _)| o == Outcome::Ok),
+        "{}",
+        r.render()
+    );
+    std::fs::write(bin_only.join("src/lib.rs"), "//! ```\n//! 1;\n//! ```\n").unwrap();
+    let r = run_stage(&cx, &spec(StageId::Test));
+    assert_eq!(
+        r.outcomes().last().map(|(o, _)| o),
+        Some(Outcome::Fail(Severity::CouldNotRun)),
+        "{}",
+        r.render()
+    );
     std::fs::remove_dir_all(&tmp).ok();
 }
 
@@ -1660,77 +1464,28 @@ fn the_doctests_select_exactly_what_the_test_compile_selects() {
         assert_eq!(selection(&doc), selection(&test_compile_args(&scope)));
         let mut c = ctx(scope);
         c.tools.trustdoc = PathBuf::from("/stage2/trustdoc");
-        for skip in [&[][..], &["plain".to_string()][..]] {
-            let cmd = doctest_cmd(&c, &DocDriver::Stage2, skip).expect("an exact driver");
-            let unified = aterm_toolchain::build_cache::with_test_graph(&doc);
-            assert!(
-                cmd.args.ends_with(
-                    &unified
-                        .iter()
-                        .map(std::ffi::OsString::from)
-                        .collect::<Vec<_>>()
-                ),
-                "{:?}",
-                cmd.args
-            );
-        }
+        let cmd = doctest_cmd(&c, true);
+        let unified = aterm_toolchain::build_cache::with_test_graph(&doc);
+        assert!(
+            cmd.args.ends_with(
+                &unified
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>()
+            ),
+            "{:?}",
+            cmd.args
+        );
+        assert_eq!(
+            env_of(&cmd, "RUSTDOC"),
+            Some(c.tools.trustdoc.clone().into_os_string())
+        );
+        assert_eq!(
+            cmd.hang_after,
+            Some(exec::TEST_BINARY_HANG),
+            "a doctest that hangs ends as a test binary that hangs does"
+        );
     }
-}
-
-#[test]
-fn the_doctests_split_the_scopes_libraries_by_what_their_docs_hold() {
-    let tmp = crate::mktemp_dir("atv-doc-split").expect("mktemp");
-    for (name, file, text) in [
-        (
-            "documented",
-            "lib.rs",
-            "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n",
-        ),
-        ("plain", "lib.rs", "//! ```text\n//! not rust\n//! ```\n"),
-        (
-            "binonly",
-            "main.rs",
-            "/// ```\n/// 1;\n/// ```\nfn main() {}\n",
-        ),
-    ] {
-        let dir = tmp.join("crates").join(name);
-        std::fs::create_dir_all(dir.join("src")).expect("mkdir");
-        std::fs::write(
-            dir.join("Cargo.toml"),
-            format!("[package]\nname = \"{name}\"\n"),
-        )
-        .expect("manifest");
-        std::fs::write(dir.join("src").join(file), text).expect("source");
-    }
-    let split = |scope, root: &std::path::Path| {
-        let mut c = ctx(scope);
-        c.root = root.to_path_buf();
-        doctest_split(&c)
-    };
-    let names = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
-    assert_eq!(
-        split(Scope::workspace(), &tmp),
-        Some(DocSplit {
-            run: names(&["documented"]),
-            skip: names(&["plain"]),
-        })
-    );
-    assert_eq!(
-        split(Scope::packages(&names(&["plain", "ghost"])), &tmp),
-        Some(DocSplit {
-            run: names(&["ghost"]),
-            skip: names(&["plain"]),
-        })
-    );
-    assert_eq!(
-        split(Scope::crate_only("plain"), &tmp),
-        Some(DocSplit {
-            run: Vec::new(),
-            skip: names(&["plain"]),
-        })
-    );
-    assert_eq!(split(Scope::workspace(), &tmp.join("no-members")), None);
-    std::fs::remove_dir_all(&tmp).ok();
 }
 
 fn env_of(cmd: &Cmd, k: &str) -> Option<std::ffi::OsString> {
@@ -1936,19 +1691,10 @@ fn checker_policy_is_explicit_and_every_other_child_scrubs_it() {
         assert!(shaped_compile.exact_env);
         assert!(run.exact_env);
         assert_eq!(
-            env_of(
-                &doctest_cmd(context, &DocDriver::Stage2, &[]).expect("the stage2 doc driver"),
-                aterm_capacity::RELEASE_RUN_ENV
-            ),
+            env_of(&doctest_cmd(context, true), aterm_capacity::RELEASE_RUN_ENV),
             marker
         );
-        assert_eq!(
-            env_of(
-                &doctest_cmd(context, &DocDriver::Stage2, &[]).expect("the stage2 doc driver"),
-                CHECKERS_ENV
-            ),
-            want
-        );
+        assert_eq!(env_of(&doctest_cmd(context, true), CHECKERS_ENV), want);
         assert_eq!(run.args, test_cmds(&c, false)[1].args);
     }
     let checker = spec_checkers_cmd(&c);
@@ -2076,204 +1822,6 @@ fn a_release_workspaces_closing_graph_includes_folded_benches() {
             .collect::<Vec<_>>(),
         ["base"]
     );
-}
-
-#[test]
-fn the_stand_in_drives_rustdoc_only_where_the_scan_cleared_a_library() {
-    let (driver, skip_env) = (crate::docdriver::DRIVER_ENV, crate::docdriver::SKIP_ENV);
-    let stage2 = std::path::absolute("/stage2/trustdoc").expect("absolute");
-    let caller = std::path::absolute("/caller/rustdoc").expect("absolute");
-    let recorder = std::path::absolute("/bin/aterm-verify").expect("absolute");
-    let mut c = ctx(Scope::workspace());
-    c.tools.trustdoc = stage2.clone();
-    c.test_recorder = Some(recorder.clone());
-    c.env.rustdoc_override = Some(caller.clone().into_os_string());
-    c = c.with_checkers_in_tests(true);
-    let skip = ["other".to_string(), "plain".to_string()];
-    for (kind, real) in [(DocDriver::Stage2, &stage2), (DocDriver::Ambient, &caller)] {
-        let cmd = doctest_cmd(&c, &kind, &skip).expect("an exact driver");
-        assert_eq!(
-            env_of(&cmd, "RUSTDOC"),
-            Some(recorder.clone().into_os_string()),
-            "{kind:?}"
-        );
-        assert_eq!(
-            env_of(&cmd, driver),
-            Some(real.clone().into_os_string()),
-            "{kind:?}"
-        );
-        assert_eq!(
-            env_of(&cmd, skip_env),
-            Some("other,plain".into()),
-            "{kind:?}"
-        );
-        let cmd = doctest_cmd(&c, &kind, &[]).expect("an exact driver");
-        assert_eq!(
-            env_of(&cmd, driver),
-            Some(real.clone().into_os_string()),
-            "{kind:?}"
-        );
-        assert_eq!(env_of(&cmd, skip_env), None, "{kind:?}");
-        assert_eq!(
-            env_of(&cmd, "RUSTDOC"),
-            Some(recorder.clone().into_os_string()),
-            "{kind:?}"
-        );
-        assert_eq!(
-            env_of(&cmd, crate::docdriver::RUNTOOL_ENV),
-            Some(recorder.clone().into_os_string()),
-            "{kind:?}"
-        );
-        for inherited in [
-            crate::docdriver::DRIVER_ENV,
-            crate::docdriver::SKIP_ENV,
-            crate::docdriver::RUNTOOL_ENV,
-            crate::docdriver::RUNTOOL_SCRATCH_ENV,
-            crate::docdriver::RUNTOOL_SAMPLES_ENV,
-            crate::docdriver::RUNTOOL_HALT_ENV,
-        ] {
-            assert!(
-                cmd.remove_envs.iter().any(|name| name == inherited),
-                "{kind:?} did not scrub inherited {inherited}"
-            );
-        }
-    }
-    let compile = test_compile_cmd(&c, false, test_compile_args(&c.scope));
-    assert!(compile.exact_env);
-    assert_eq!(env_of(&compile, "RUSTDOC"), Some(caller.into_os_string()));
-}
-
-/// THE STAND-IN RUNS THE FILE CARGO WOULD HAVE RUN, named absolutely. With
-/// no override cargo takes the plain `trustdoc` beside the targo it runs,
-/// the file a link to it resolves to, before PATH; a bare name the stand-in
-/// looked up on its own PATH could be another file.
-#[cfg(unix)]
-#[test]
-fn the_stand_in_is_told_the_driver_cargo_resolves() {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
-    let tmp =
-        std::fs::canonicalize(crate::mktemp_dir("atv-doc-driver").expect("mktemp")).expect("real");
-    let file = |p: &std::path::Path| {
-        std::fs::create_dir_all(p.parent().expect("a parent")).expect("mkdir");
-        std::fs::write(p, "").expect("write");
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    };
-    let (build, links, path) = (tmp.join("build"), tmp.join("links"), tmp.join("path"));
-    for f in [
-        build.join("targo"),
-        build.join("trustdoc"),
-        path.join("trustdoc"),
-    ] {
-        file(&f);
-    }
-    file(&tmp.join("elsewhere/trustdoc"));
-    std::fs::create_dir_all(&links).expect("mkdir");
-    symlink(build.join("targo"), links.join("targo")).expect("symlink");
-    let mut c = ctx(Scope::workspace());
-    c.tools.targo = links.join("targo");
-    c.tools.trustdoc = links.join("trustdoc");
-    c.path_env = std::env::join_paths([&links, &path]).expect("join");
-    c.test_recorder = Some(PathBuf::from("/bin/aterm-verify"));
-    let resolved = |c: &Ctx, kind| cargo_doc_driver(c, &kind);
-    assert_eq!(
-        resolved(&c, DocDriver::BarePath),
-        Some(build.join("trustdoc"))
-    );
-    let cmd =
-        doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]).expect("the resolved driver");
-    assert_eq!(env_of(&cmd, "RUSTDOC"), Some("/bin/aterm-verify".into()));
-    assert_eq!(
-        env_of(&cmd, crate::docdriver::DRIVER_ENV),
-        Some(build.join("trustdoc").into_os_string())
-    );
-    c.env.rustdoc_override = Some("".into());
-    assert_eq!(
-        resolved(&c, DocDriver::Ambient),
-        Some(build.join("trustdoc"))
-    );
-    for (value, want) in [
-        ("/caller/rustdoc", Some(PathBuf::from("/caller/rustdoc"))),
-        ("tools/rustdoc", Some(PathBuf::from("/repo/tools/rustdoc"))),
-        ("trustdoc", Some(path.join("trustdoc"))),
-        ("rustdoc", None),
-        (
-            "tools\\rustdoc",
-            Some(PathBuf::from("/repo/tools\\rustdoc")),
-        ),
-    ] {
-        c.env.rustdoc_override = Some(value.into());
-        assert_eq!(resolved(&c, DocDriver::Ambient), want, "{value}");
-    }
-    let root = tmp.join("repo");
-    std::fs::create_dir_all(root.join(".cargo")).expect("mkdir");
-    let repo = std::mem::replace(&mut c.root, root.clone());
-    for (config, named) in [
-        (
-            "[build]\nrustdocflags = ['--cfg', 'x']\n# rustdoc = 'no'\n",
-            true,
-        ),
-        ("[build]\nrustdoc = '/config/rustdoc'\n", false),
-    ] {
-        std::fs::write(root.join(".cargo/config.toml"), config).expect("config");
-        c.env.rustdoc_override = None;
-        assert_eq!(
-            resolved(&c, DocDriver::BarePath).is_some(),
-            named,
-            "{config}"
-        );
-        c.env.rustdoc_override = Some("".into());
-        assert_eq!(
-            resolved(&c, DocDriver::Ambient).is_some(),
-            named,
-            "{config}"
-        );
-    }
-    c.env.rustdoc_override = Some("/caller/rustdoc".into());
-    assert_eq!(
-        resolved(&c, DocDriver::Ambient),
-        Some(PathBuf::from("/caller/rustdoc"))
-    );
-    assert!(
-        doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]).is_err(),
-        "a configured driver verify cannot resolve is refused"
-    );
-    c.root = repo;
-    c.env.rustdoc_override = Some("".into());
-    std::fs::remove_file(build.join("trustdoc")).expect("rm");
-    symlink(tmp.join("elsewhere/trustdoc"), build.join("trustdoc")).expect("symlink");
-    assert_eq!(
-        resolved(&c, DocDriver::BarePath),
-        Some(path.join("trustdoc"))
-    );
-    c.path_env = links.into_os_string();
-    assert_eq!(resolved(&c, DocDriver::BarePath), None);
-    assert!(
-        doctest_cmd(&c, &DocDriver::BarePath, &["plain".to_string()]).is_err(),
-        "an unresolved driver is refused rather than run unmonitored"
-    );
-    assert_eq!(resolved(&c, DocDriver::Absent), None);
-    std::fs::remove_dir_all(&tmp).ok();
-}
-
-#[test]
-fn a_config_names_a_doc_driver_only_by_its_key() {
-    for line in [
-        "rustdoc = '/x/rustdoc'",
-        "rustdoc=\"trustdoc\"",
-        "build.rustdoc = 'r'",
-        "\"rustdoc\" = 'r'",
-        "build = { jobs = 4, rustdoc = 'r' }",
-    ] {
-        assert!(names_rustdoc(line), "{line}");
-    }
-    for line in [
-        "rustdocflags = ['--cfg', 'docsrs']",
-        "my-rustdoc = 'r'",
-        "rustc = 'rustdoc'",
-        "[build]",
-    ] {
-        assert!(!names_rustdoc(line), "{line}");
-    }
 }
 
 /// A narrow test build on the main lane resolves the workspace's features, so it builds only
@@ -2573,7 +2121,6 @@ fn an_empty_change_selection_compiles_nothing_in_any_of_those_stages() {
     for stage in [
         StageId::TestCompile,
         StageId::Test,
-        StageId::Doctests,
         StageId::Tippy,
         StageId::SpecCheckers,
     ] {
@@ -2746,7 +2293,7 @@ fn compile_only_children_yield_and_children_that_run_code_do_not() {
         let (_, measuring) = measuring_cmd(&c, &artifact, measuring_args());
         assert!(
             !measuring.demoted,
-            "the measuring benches run the paint, spin, aos and rewind guards"
+            "the measuring benches run the paint, spin, aos, rewind and size guards"
         );
     }
     assert!(
@@ -2840,15 +2387,11 @@ fn the_gated_pass_narrows_with_the_scope_and_disappears_when_it_has_nothing_to_r
 
 #[test]
 fn the_shipped_build_is_linted_with_debug_assertions_off() {
-    let want = [
-        "-p",
-        "aterm",
-        "--release",
-        "--keep-going",
-        "--",
-        "-D",
-        "warnings",
-    ];
+    let want: Vec<String> = ["-p", "aterm", "--release"]
+        .into_iter()
+        .chain(LINT_TAIL[1..].iter().copied())
+        .map(String::from)
+        .collect();
     for scope in [
         Scope::workspace(),
         Scope::changed("main", vec!["aterm-font".into(), "aterm".into()], true),
@@ -2866,7 +2409,11 @@ fn the_shipped_build_is_linted_with_debug_assertions_off() {
             .count()
     };
     for release in [false, true] {
-        assert_eq!(row(release, Scope::crate_only("aterm")), 1);
+        assert_eq!(
+            row(release, Scope::crate_only("aterm")),
+            usize::from(release),
+            "a dev `-p` run leaves the shipped build's pass to a whole-workspace lint"
+        );
         assert_eq!(row(release, Scope::workspace()), 1);
         assert_eq!(row(release, Scope::crate_only("aterm-font")), 0);
         assert_eq!(row(release, Scope::changed("main", Vec::new(), false)), 0);
@@ -3497,11 +3044,10 @@ fn no_targo_is_fail_closed_at_the_test_compile_and_honest_everywhere_after() {
         "{label}"
     );
 
-    let dependent: [fn(&Ctx, &mut Report); 9] = [
+    let dependent: [fn(&Ctx, &mut Report); 8] = [
         test,
         measuring_tests,
         measure_prebuild,
-        doctests,
         spec_check,
         spec_checkers,
         export,
@@ -3811,6 +3357,7 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
                 cwd_seen.display()
             ),
         );
+        let runtime_home = crate::mktemp_dir("atv-appkit-runtime").expect("runtime home");
         let mut c = Ctx::new(
             root.clone(),
             Scope::workspace(),
@@ -3820,7 +3367,8 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
             },
             scratch.clone(),
         )
-        .with_carry_context(Some(CONTEXT.to_owned()));
+        .with_carry_context(Some(CONTEXT.to_owned()))
+        .with_appkit_runtime(runtime_home.join("runtime"));
         c.tools.targo = targo;
         let paths = [(REDRAW_CONFORMANCE_BIN, binary.clone())];
         let mut prepared = Report::new("prepare exact prior AppKit runtime");
@@ -3879,19 +3427,9 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
             assert_ne!(prior.content_key, env_drift.content_key);
         }
         drop(prior_runtime);
-        // Arrange crashed-run residue under the same lock as the real runtime: another
-        // concurrent group may otherwise clear it, or observe it in its own empty cwd.
-        {
-            let _stale_fixture_lock = aterm_uds::private_file::PrivateLock::take(
-                runtime_cwd.parent().expect("runtime parent"),
-                "windowed.lock",
-                std::time::Duration::from_secs(60),
-                "another AppKit verifier still owns the stale-fixture runtime",
-            )
-            .expect("stale-fixture lock");
-            aterm_uds::private_file::create_private_dir(&runtime_cwd).expect("stale cwd");
-            std::fs::write(runtime_cwd.join("stale"), b"not an input").expect("stale entry");
-        }
+        // A crashed earlier run's private residue is removed before the runtime is re-keyed.
+        aterm_uds::private_file::create_private_dir(&runtime_cwd).expect("stale cwd");
+        std::fs::write(runtime_cwd.join("stale"), b"not an input").expect("stale entry");
         c.passed_appkit_groups = Some(BTreeMap::from([(prior.group.clone(), prior)]));
         let mut report = Report::new("redraw conformance");
         redraw_conformance(&c, &mut report);
@@ -3912,20 +3450,9 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
                 runtime_cwd.display().to_string()
             );
         }
-        // Read the stable cwd under the lock the runtime held: a concurrent AppKit group may
-        // take it the moment ours is released and recreate the same cwd, which it removes
-        // before releasing the lock in turn.
-        {
-            let _cleaned_lock = aterm_uds::private_file::PrivateLock::take(
-                runtime_cwd.parent().expect("runtime parent"),
-                "windowed.lock",
-                std::time::Duration::from_secs(60),
-                "another AppKit verifier still owns the runtime",
-            )
-            .expect("cleaned-cwd lock");
-            assert!(!runtime_cwd.exists(), "the stable group cwd is cleaned");
-        }
+        assert!(!runtime_cwd.exists(), "the stable group cwd is cleaned");
         std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(runtime_home).ok();
     }
 }
 
@@ -3933,6 +3460,7 @@ fn appkit_group_carry_builds_then_skips_only_an_exact_windowed_driver() {
 #[test]
 fn appkit_group_replacement_after_a_drive_fails_closed() {
     let root = crate::mktemp_dir("atv-appkit-replaced").expect("root");
+    let runtime_home = crate::mktemp_dir("atv-appkit-replaced-runtime").expect("runtime home");
     let scratch = root.join("scratch");
     std::fs::create_dir(&scratch).expect("scratch");
     let binary = root.join(REDRAW_CONFORMANCE_BIN);
@@ -3943,7 +3471,8 @@ fn appkit_group_replacement_after_a_drive_fails_closed() {
         EnvSnapshot::default(),
         scratch,
     )
-    .with_carry_context(Some("a".repeat(64)));
+    .with_carry_context(Some("a".repeat(64)))
+    .with_appkit_runtime(runtime_home.join("runtime"));
     let paths = [(REDRAW_CONFORMANCE_BIN, binary.clone())];
     let mut prepared = Report::new("prepare exact AppKit runtime");
     let runtime = appkit_group_runtime(
@@ -3974,7 +3503,92 @@ fn appkit_group_replacement_after_a_drive_fails_closed() {
         "{}",
         report.render()
     );
+    drop(runtime);
     std::fs::remove_dir_all(root).ok();
+    std::fs::remove_dir_all(runtime_home).ok();
+}
+
+/// A constructed context's AppKit runtime (its empty cwd and `windowed.lock`) lives where the
+/// context says, so tests never share the stable per-user directory with each other or with a
+/// real release run; a context that names none keeps that stable directory.
+#[cfg(unix)]
+#[test]
+fn appkit_runtime_belongs_to_the_context_that_names_it() {
+    let root = crate::mktemp_dir("atv-appkit-owned").expect("root");
+    let scratch = root.join("scratch");
+    std::fs::create_dir(&scratch).expect("scratch");
+    let binary = root.join(REDRAW_CONFORMANCE_BIN);
+    std::fs::write(&binary, b"driver").expect("binary");
+    let paths = [(REDRAW_CONFORMANCE_BIN, binary)];
+    let stable = std::path::Path::new("/tmp").join(format!(
+        "aterm-verify-appkit-{}.noindex",
+        aterm_uds::peer::our_uid()
+    ));
+    let context = || {
+        Ctx::new(
+            root.clone(),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            scratch.clone(),
+        )
+    };
+    // Negative control: without a named runtime the context resolves to the shared one.
+    let shared = appkit_runtime_parent(&context());
+    assert_eq!(
+        shared.file_name(),
+        stable.file_name(),
+        "{}",
+        shared.display()
+    );
+    assert!(shared.starts_with("/tmp"), "{}", shared.display());
+
+    let homes = [
+        crate::mktemp_dir("atv-appkit-owned-a").expect("home a"),
+        crate::mktemp_dir("atv-appkit-owned-b").expect("home b"),
+    ];
+    let contexts = homes
+        .iter()
+        .map(|home| context().with_appkit_runtime(home.join("runtime")))
+        .collect::<Vec<_>>();
+    // Both runtimes are held at once: separate locks, separate stable cwds, no shared state.
+    let runtimes = contexts
+        .iter()
+        .map(|c| {
+            let mut prepared = Report::new("prepare owned AppKit runtime");
+            appkit_group_runtime(
+                c,
+                &mut prepared,
+                crate::appkit_content::REDRAW_GROUP,
+                &paths,
+            )
+            .unwrap_or_else(|| panic!("{}", prepared.render()))
+        })
+        .collect::<Vec<_>>();
+    for (runtime, home) in runtimes.iter().zip(&homes) {
+        let home = std::fs::canonicalize(home).expect("physical home");
+        assert_eq!(
+            runtime.cwd,
+            home.join("runtime")
+                .join(crate::appkit_content::REDRAW_GROUP)
+        );
+        assert!(!runtime.cwd.starts_with(&shared));
+        assert_eq!(
+            runtime.commands[0].cwd.as_deref(),
+            Some(runtime.cwd.as_path())
+        );
+    }
+    let cwds = runtimes
+        .iter()
+        .map(|runtime| runtime.cwd.clone())
+        .collect::<Vec<_>>();
+    drop(runtimes);
+    for cwd in &cwds {
+        assert!(!cwd.exists(), "an owned runtime cleans its own cwd");
+    }
+    std::fs::remove_dir_all(root).ok();
+    for home in homes {
+        std::fs::remove_dir_all(home).ok();
+    }
 }
 
 #[test]
@@ -4315,8 +3929,11 @@ fn decide_measured(ok: bool, output: String, subject: &Subject) -> Vec<(Outcome,
 fn a_measuring_child_requires_complete_decided_matrices() {
     let result = measured_result;
     let paint = result("paint", 23, 23, 0, 0);
-    let spin =
-        result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &result("rewind", 2, 2, 0, 0);
+    let size = result("size", 1, 1, 0, 0);
+    let spin = result("spin", 2, 2, 0, 0)
+        + &result("aos", 1, 1, 0, 0)
+        + &result("rewind", 2, 2, 0, 0)
+        + &size;
     let decide = |ok: bool, output: String| {
         decide_measured(ok, output, &measured_subject(true))
             .into_iter()
@@ -4368,7 +3985,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
              unanswered=0 undecided={undecided}\n"
         )
     };
-    let base = paint.clone() + &result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0);
+    let base = paint.clone() + &result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &size;
     let one = undecided("cost") + &spread(1, 1);
     let (outcome, label) = decide(true, base.clone() + &one);
     assert_eq!(
@@ -4391,6 +4008,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
     let all_undecided = result("paint", 23, 0, 0, 0).replace("undecided=0", "undecided=23")
         + &result("spin", 2, 0, 0, 0).replace("undecided=0", "undecided=2")
         + &result("aos", 1, 0, 0, 0).replace("undecided=0", "undecided=1")
+        + &result("size", 1, 0, 0, 0).replace("undecided=0", "undecided=1")
         + &undecided("cost,steps")
         + &spread(0, 2);
     let (outcome, label) = decide(true, all_undecided.clone());
@@ -4431,6 +4049,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
             result("paint", 23, 22, 1, 0)
                 + &result("spin", 2, 2, 0, 0)
                 + &result("aos", 1, 1, 0, 0)
+                + &size
                 + &spread(2, 0)
                 + loaded
         )
@@ -4440,7 +4059,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
     );
     let refused = "measure paint: COULD NOT RUN — cannot acquire its exclusive timing \
                    claim: timing not qualified: no CPU window formed at its patience bound\n";
-    let rest = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &spread(2, 0);
+    let rest = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &size + &spread(2, 0);
     assert_eq!(
         decide(false, rest.clone() + refused).0,
         could_not_run,
@@ -4451,7 +4070,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
         Outcome::Fail(Severity::GateFailed),
         "a missing summary with no refusal and a nonzero exit is the child's failure"
     );
-    let crashed = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + refused;
+    let crashed = result("spin", 2, 2, 0, 0) + &result("aos", 1, 1, 0, 0) + &size + refused;
     assert_eq!(
         decide(false, crashed).0,
         Outcome::Fail(Severity::GateFailed),
@@ -4463,6 +4082,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
             result("paint", 23, 22, 1, 0)
                 + &result("spin", 2, 2, 0, 0)
                 + &result("aos", 1, 1, 0, 0)
+                + &size
                 + &one
         )
         .0,
@@ -4485,6 +4105,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
                 + &result("spin", 2, 0, 0, 2)
                 + &result("aos", 1, 0, 0, 1)
                 + &result("rewind", 2, 0, 0, 2)
+                + &result("size", 1, 0, 0, 1)
         )
         .0,
         could_not_run,
@@ -4497,6 +4118,7 @@ fn a_measuring_child_requires_complete_decided_matrices() {
                 + &result("spin", 2, 0, 0, 2)
                 + &result("aos", 1, 0, 0, 1)
                 + &result("rewind", 2, 0, 0, 2)
+                + &result("size", 1, 0, 0, 1)
         )
         .0,
         Outcome::Fail(Severity::GateFailed),
@@ -4532,7 +4154,7 @@ fn an_unanswered_row_fails_heads_build_and_is_named_on_another() {
                 measure result: spin planned=3 passed=2 failed=0 refused=0 unanswered=1 undecided=0\n";
     let aos = "measure row: aos::a_repair UNANSWERED\naos repair named no main_us=\n\
                measure result: aos planned=1 passed=0 failed=0 refused=0 unanswered=1 undecided=0\n";
-    let rewind = measured_result("rewind", 2, 2, 0, 0);
+    let rewind = measured_result("rewind", 2, 2, 0, 0) + &measured_result("size", 1, 1, 0, 0);
     let output = paint.clone()
         + spin
         + &bench_exit("spin", "exit status: 3")
@@ -4594,7 +4216,9 @@ fn an_unanswered_row_never_hides_a_crash_after_the_summaries() {
                   ctl metrics percentiles does not report n_rewind_shown\n\
                   measure result: rewind planned=2 passed=1 failed=0 refused=0 unanswered=1 undecided=0\n";
     let paint = measured_result("paint", 23, 23, 0, 0);
-    let rest = measured_result("spin", 2, 2, 0, 0) + &measured_result("aos", 1, 1, 0, 0);
+    let rest = measured_result("spin", 2, 2, 0, 0)
+        + &measured_result("aos", 1, 1, 0, 0)
+        + &measured_result("size", 1, 1, 0, 0);
     let other = measured_subject(false);
     let first = |output: String| decide_measured(false, output, &other)[0].clone();
     let decided = |output: String| first(output).0;
@@ -5072,6 +4696,40 @@ fn the_linux_lane_runs_the_main_targets_lab_and_its_not_run_is_never_a_pass() {
     assert!(line.starts_with("verify: COULD NOT RUN — linux"), "{line}");
     let (line, code) = verdict_over(codex_alab_proof_outcome(Some(3), transcript));
     assert_eq!(code, crate::exit::PASS, "{line}");
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_runtime_requires_this_runs_successful_build_even_with_a_stale_lab() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mut c = ctx(Scope::workspace());
+    c.target_dir = root.path().join("target");
+    let lab = main_bin(&c, "aterm-lab");
+    std::fs::create_dir_all(lab.parent().unwrap()).unwrap();
+    // It is never executed: this fixture tests the command's producer gate.
+    std::fs::write(&lab, b"stale lab").unwrap();
+    std::fs::set_permissions(&lab, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(is_executable_file(&lab));
+    assert!(prepared_linux_lane(&c).is_err());
+
+    let mut refused = Report::new("refused build");
+    build_linux_lab(&c, &mut refused, |_, _| false);
+    assert!(prepared_linux_lane(&c).is_err());
+
+    let mut built = Report::new("built lab");
+    build_linux_lab(&c, &mut built, |_, _| true);
+    assert_eq!(prepared_linux_lane(&c).unwrap().program, lab);
+    build_linux_lab(&c, &mut refused, |_, _| false);
+    assert!(prepared_linux_lane(&c).is_err());
+    build_linux_lab(&c, &mut built, |_, _| true);
+    c.tools.targo = root.path().join("missing-targo");
+    assert!(!c.tools.have_targo());
+    linux_lab_build(&c, &mut refused);
+    assert!(prepared_linux_lane(&c).is_err());
+    build_linux_lab(&c, &mut built, |_, _| true);
+    std::fs::remove_file(&lab).unwrap();
+    assert!(prepared_linux_lane(&c).is_err());
 }
 
 #[test]

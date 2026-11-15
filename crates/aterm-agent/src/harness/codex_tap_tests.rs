@@ -130,7 +130,7 @@ fn a_measured_codex_alab_thread_binds_at_its_build_and_is_read_on() {
         &[opening(THREAD, ALAB), ctx(T0 + 1000, "turn-1")].concat(),
     );
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    tap.arm(0, None, Some(ALAB));
+    tap.arm(0, 0, None, Some(ALAB));
     assert!(tap.read(FOLD_BUDGET).is_some_and(|r| r.complete));
     assert!(tap.is_bound() && tap.refused().is_none());
     let got = said(&mut tap);
@@ -194,7 +194,7 @@ fn a_build_nobody_measured_is_read_partial_and_an_unknown_meta_binds_nothing() {
         let path = rollout_in(home.path(), DAY, THREAD);
         append(&path, &[meta, ctx(T0 + 1000, "turn-1")].concat());
         let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-        tap.arm(0, None, Some(ALAB));
+        tap.arm(0, 0, None, Some(ALAB));
         let read = tap.read(FOLD_BUDGET);
         let mut got = said(&mut tap);
         let at = tap.reads_at();
@@ -322,7 +322,7 @@ fn an_unmeasured_builds_rollout_is_read_partial() {
         let home = scratch_home("relabelled");
         append(&rollout_in(home.path(), DAY, THREAD), text);
         let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-        tap.arm(0, None, Some(running));
+        tap.arm(0, 0, None, Some(running));
         assert!(
             tap.read(FOLD_BUDGET).is_some_and(|r| r.complete),
             "{running}"
@@ -330,7 +330,7 @@ fn an_unmeasured_builds_rollout_is_read_partial() {
         assert!(tap.is_bound() && tap.refused().is_none(), "{running}");
         let at = tap.reads_at();
         let batch = tap.take();
-        assert_eq!((batch.lost, batch.overflow), (0, 0), "{running}");
+        assert_eq!((batch.lost(), batch.overflow), (0, 0), "{running}");
         (at, batch.steps)
     };
     let (on_at, on) = read_as(&own, newest);
@@ -396,7 +396,7 @@ fn an_unmeasured_builds_rollout_is_read_partial() {
 fn a_thread_binds_only_its_own_rollout_once_written_whole() {
     let home = scratch_home("own");
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    tap.arm(0, None, Some(ALAB));
+    tap.arm(0, 0, None, Some(ALAB));
     assert!(tap.read(FOLD_BUDGET).is_none());
     assert_eq!(tap.refused(), Some(Refusal::NoRollout));
     let path = rollout_in(home.path(), DAY, THREAD);
@@ -414,7 +414,7 @@ fn a_thread_binds_only_its_own_rollout_once_written_whole() {
         &opening("019a0000-0000-7000-8000-00000000000b", ALAB),
     );
     let mut tap = RolloutTap::new(THREAD, other.path()).expect("a thread id");
-    tap.arm(0, None, Some(ALAB));
+    tap.arm(0, 0, None, Some(ALAB));
     assert!(tap.read(FOLD_BUDGET).is_none());
     assert_eq!(tap.refused(), Some(Refusal::OtherThread));
     assert!(RolloutTap::new("not-a-thread", other.path()).is_none());
@@ -438,7 +438,12 @@ fn history_below_the_floor_or_the_watermark_is_never_queued() {
     .concat();
     append(&path, &history);
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    tap.arm(u64::try_from(T0 + 2500).expect("a stamp"), None, Some(ALAB));
+    tap.arm(
+        u64::try_from(T0 + 2500).expect("a stamp"),
+        0,
+        None,
+        Some(ALAB),
+    );
     let _ = tap.read(FOLD_BUDGET);
     assert_eq!(words(&said(&mut tap)), ["bind 0"]);
     append(&path, &ctx(T0 + 3000, "turn-2"));
@@ -458,7 +463,7 @@ fn history_below_the_floor_or_the_watermark_is_never_queued() {
         off: history.len() as u64,
     };
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    tap.arm(0, Some(given), Some(ALAB));
+    tap.arm(0, 0, Some(given), Some(ALAB));
     let _ = tap.read(FOLD_BUDGET);
     let got = said(&mut tap);
     assert_eq!(
@@ -503,7 +508,7 @@ fn a_codex_alab_own_line_package_is_tapped_at_its_client_version() {
     );
     let running = alab_build(&exe);
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    tap.arm(0, None, running.as_deref());
+    tap.arm(0, 0, None, running.as_deref());
     assert!(
         tap.read(FOLD_BUDGET).is_some_and(|r| r.complete),
         "running {running:?}, refused {:?}",
@@ -562,7 +567,7 @@ fn a_compound_package_is_tapped_at_its_client_version_and_never_at_a_build_it_do
     let running = alab_build(&exe);
     assert_eq!(running.as_deref(), Some(CLIENT), "the client version");
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    tap.arm(0, None, running.as_deref());
+    tap.arm(0, 0, None, running.as_deref());
     assert!(
         tap.read(FOLD_BUDGET).is_some_and(|r| r.complete),
         "running {running:?}, refused {:?}",
@@ -584,7 +589,7 @@ fn a_compound_package_is_tapped_at_its_client_version_and_never_at_a_build_it_do
         let running = alab_build(&exe);
         assert_eq!(running, None, "{client:?}");
         let mut tap = RolloutTap::new(THREAD, other.path()).expect("a thread id");
-        tap.arm(0, None, running.as_deref());
+        tap.arm(0, 0, None, running.as_deref());
         assert!(tap.read(FOLD_BUDGET).is_some(), "{client:?}");
         assert!(tap.is_bound() && tap.refused().is_none(), "{client:?}");
         assert_eq!(tap.reads_at(), Some(StepState::Partial), "{client:?}");
@@ -620,7 +625,7 @@ fn a_claimant_running_an_unmeasured_build_is_read_partial() {
         (None, "-"),
     ] {
         let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-        tap.arm(0, None, running);
+        tap.arm(0, 0, None, running);
         assert!(tap.read(FOLD_BUDGET).is_some(), "{running:?}");
         assert!(tap.is_bound() && tap.refused().is_none(), "{running:?}");
         assert_eq!(tap.reads_at(), Some(StepState::Partial), "{running:?}");
@@ -640,7 +645,7 @@ fn a_claimant_running_an_unmeasured_build_is_read_partial() {
         );
     }
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    tap.arm(0, None, Some(ALAB_MANAGED));
+    tap.arm(0, 0, None, Some(ALAB_MANAGED));
     assert!(tap.read(FOLD_BUDGET).is_some());
     let got = said(&mut tap);
     assert_eq!(
@@ -652,7 +657,7 @@ fn a_claimant_running_an_unmeasured_build_is_read_partial() {
         "NEGATIVE CONTROL: {got:?}"
     );
     append(&path, &call(T0 + 1500, "call_r0010"));
-    tap.arm(0, None, Some(UNMEASURED));
+    tap.arm(0, 0, None, Some(UNMEASURED));
     assert!(tap.read(FOLD_BUDGET).is_some());
     assert_eq!(tap.reads_at(), Some(StepState::Partial));
     let got = said(&mut tap);
@@ -664,7 +669,7 @@ fn a_claimant_running_an_unmeasured_build_is_read_partial() {
     assert!(got.iter().all(|(_, s)| *s == StepState::Partial), "{got:?}");
     assert!(tap.is_bound() && tap.refused().is_none());
     append(&path, &done(T0 + 3000, "turn-1", 2000));
-    tap.arm(0, None, Some(ALAB));
+    tap.arm(0, 0, None, Some(ALAB));
     assert!(tap.read(FOLD_BUDGET).is_some());
     assert_eq!(tap.reads_at(), Some(StepState::On));
     assert_eq!(
@@ -683,7 +688,7 @@ fn a_file_replaced_at_the_watermarks_path_is_history_to_any_tap() {
         &[opening(THREAD, ALAB), ctx(T0 + 1000, "turn-1")].concat(),
     );
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    tap.arm(0, None, Some(ALAB));
+    tap.arm(0, 0, None, Some(ALAB));
     let _ = tap.read(FOLD_BUDGET);
     assert_eq!(
         words(&said(&mut tap)),
@@ -705,7 +710,7 @@ fn a_file_replaced_at_the_watermarks_path_is_history_to_any_tap() {
     std::fs::write(&swap, &held).expect("the replacement");
     std::fs::rename(&swap, &path).expect("renamed over it");
     let mut fresh = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    fresh.arm(0, Some(given), Some(ALAB));
+    fresh.arm(0, 0, Some(given), Some(ALAB));
     let _ = fresh.read(FOLD_BUDGET);
     assert_eq!(
         words(&said(&mut fresh)),
@@ -720,7 +725,7 @@ fn a_file_replaced_at_the_watermarks_path_is_history_to_any_tap() {
         ..given
     };
     let mut other = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    other.arm(0, Some(elsewhere), Some(ALAB));
+    other.arm(0, 0, Some(elsewhere), Some(ALAB));
     let _ = other.read(FOLD_BUDGET);
     assert_eq!(
         words(&said(&mut other)),
@@ -747,13 +752,13 @@ fn a_line_longer_than_the_cap_is_skipped_once() {
     );
     append(&path, &[meta, long, ctx(T0 + 1000, "turn-1")].concat());
     let mut tap = RolloutTap::new(THREAD, home.path()).expect("a thread id");
-    tap.arm(0, None, Some(ALAB));
+    tap.arm(0, 0, None, Some(ALAB));
     let mut got = Vec::new();
     let mut lost = 0;
     for _ in 0..8 {
         let _ = tap.read(cap);
         let batch = tap.take();
-        lost += batch.lost;
+        lost += batch.lost();
         got.extend(batch.steps.into_iter().map(|s| s.ev));
     }
     assert!(

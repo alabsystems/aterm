@@ -697,7 +697,7 @@ impl App {
         let Some(entry) = self.pool.get(session) else {
             return GuardedInput::Pressed(Delivery::Failed);
         };
-        let pattern = aterm_agent::supervise::policy::row_guard(&read.rows[row]);
+        let pattern = alab_policy::guard::row_guard(&read.rows[row]);
         let Ok(Some(guard)) = crate::control::compile_guard(Some(&pattern)) else {
             return GuardedInput::Skipped;
         };

@@ -237,6 +237,7 @@ fn custom_kitty_sprite_skips_exact_size_resample_and_reuses_cache_across_reloads
         geom,
         cursor: (2, 2),
         look: KittyLook::default(),
+        body: crate::kitty_cursor::CursorBody::Head,
         colors: CatColorKey::default(),
         bob: 0.0,
         lift: 0.0,

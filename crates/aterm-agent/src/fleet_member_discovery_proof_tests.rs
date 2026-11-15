@@ -4,6 +4,83 @@
 use super::*;
 
 #[test]
+fn current_protocol_routes_require_a_live_log_key_and_the_existing_node_binding() {
+    const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
+    let node = "11111111111111111111111111111111";
+    let other_node = "22222222222222222222222222222222";
+    let server = NodeIdentity::from_seed(node, &[41; 32]).unwrap();
+    let client = NodeIdentity::from_seed(other_node, &[42; 32]).unwrap();
+    let secret = FleetSecret::new(&[19; 32]).unwrap();
+    for (standing, bound, wrong_claim, expected) in [
+        (Some(member::Standing::Member), true, false, true),
+        (
+            Some(member::Standing::Out("removed".into())),
+            true,
+            false,
+            false,
+        ),
+        (None, true, false, false),
+        (Some(member::Standing::Member), false, false, false),
+        (Some(member::Standing::Member), true, true, false),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        aterm_uds::keep_out_of_children(&listener).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = if wrong_claim {
+            NodeIdentity::from_seed(other_node, &[41; 32]).unwrap()
+        } else {
+            server.clone()
+        };
+        let secret_server = secret.clone();
+        let worker = std::thread::spawn(move || {
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
+            aterm_net::fleet::server_handshake_as(
+                tcp,
+                &secret_server,
+                Some(&serving),
+                FleetScope::Facts,
+                &[FleetOp::Survey],
+                HANG,
+            )
+            .unwrap();
+        });
+        let members: member::MemberKeys = standing.into_iter().map(|s| (server.key(), s)).collect();
+        let old_endpoint = Peer::own(&server, ("old.invalid", 7100, "0.199.0"), 1);
+        let bindings = if bound {
+            member::Keyring::of([&old_endpoint])
+        } else {
+            member::Keyring::default()
+        };
+        let hint = aterm_secrets::discover::Advert {
+            instance: "opaque".into(),
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            txt: vec![
+                ("v".into(), "1".into()),
+                ("fleet".into(), addr.port().to_string()),
+                ("role".into(), "member".into()),
+                ("window".into(), "0".into()),
+            ],
+        };
+        let route = prove_fleet_route(&hint, (&secret, Some(&client)), (&members, &bindings), HANG);
+        assert_eq!(
+            route.is_some(),
+            expected,
+            "bound={bound}, wrong_claim={wrong_claim}"
+        );
+        if expected {
+            assert_eq!(route, Some((node.into(), addr)));
+        }
+        worker.join().unwrap();
+    }
+}
+
+#[test]
 fn only_a_handshake_proving_a_current_members_mesh_id_populates_discovery() {
     const HANG: Duration = Duration::from_secs(60);
     let identity = |seed: u8| {

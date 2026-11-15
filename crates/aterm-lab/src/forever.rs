@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use alab_policy::needs::NEEDS_ACK;
 use aterm_agent::supervise::approvals::{self, RULE_POINT, RULE_TASK_DONE, TASK_DONE};
-use aterm_agent::supervise::policy::needs::NEEDS_ACK;
+use aterm_agent::supervise::config;
 use aterm_agent::supervise::policy::turn_end;
 use aterm_agent::supervise::tape::show;
 
@@ -69,12 +70,12 @@ const N4_HEAD: &str = "Hardened the parser's error paths in this turn.";
 const LONG_DELAY_MS: i64 = 10_000;
 const LONG_PACE_MS: i64 = 7_000;
 /// How long a reply of real work holds its agent before it streams: past the turn-end policy's
-/// floor ([`turn_end::MIN_WORK`], 2 min), so its turn is work and the short streak starts over.
+/// floor ([`alab_policy::config::MIN_WORK`], 2 min), so its turn is work and the short streak starts over.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "two minutes and ten seconds in ms"
 )]
-const WORK_TURN_MS: i64 = turn_end::MIN_WORK.as_millis() as i64 + 10_000;
+const WORK_TURN_MS: i64 = alab_policy::config::MIN_WORK.as_millis() as i64 + 10_000;
 #[expect(
     clippy::cast_precision_loss,
     reason = "a few seconds in ms, exact in an f64"
@@ -93,31 +94,31 @@ const LAND_KEY: &str = "Autopilot is Land:";
 
 /// What only Land's one ask at the person's switch over a held tab says (v6 §14.17 item 3): the
 /// close of its why, which `switch-over-held`'s stand-in answers slowly.
-const SWITCH_KEY: &str = turn_end::SWITCH_WHY_TAIL;
+const SWITCH_KEY: &str = alab_policy::words::SWITCH_WHY_TAIL;
 
 /// How long `switch-over-held`'s stand-in takes over its answer to Land's one ask: long enough
-/// that a look reads the ask standing, short of real work (`turn_end::MIN_WORK`).
+/// that a look reads the ask standing, short of real work (`alab_policy::config::MIN_WORK`).
 pub const SWITCH_ASK_DELAY_MS: i64 = 30_000;
 const NUDGE_KEY: &str = "Still landing:";
 /// The land check's words the stub's rules answer (`land-check@v1`): its fixed head, ahead of a
 /// chain's `MARK` and `NUDGE_KEY` rules, so no other rule answers the check.
-const LAND_CHECK_KEY: &str = turn_end::LAND_CHECK_HEAD;
+const LAND_CHECK_KEY: &str = alab_policy::land_check::LAND_CHECK_HEAD;
 /// The one answer to the land check that lands.
-const LANDED: &str = aterm_agent::supervise::policy::land_check::LANDED;
+const LANDED: &str = alab_policy::land_check::LANDED;
 /// LAND'S CONTRADICTION'S HEAD (slice 4c): the stub's rule for land-contradicted's answer to it,
 /// ahead of `NUDGE_KEY`'s, whose words it opens with.
-const CONTRADICTED_KEY: &str = turn_end::LAND_CONTRADICTED_HEAD;
+const CONTRADICTED_KEY: &str = alab_policy::words::LAND_CONTRADICTED_HEAD;
 /// land-contradicted's answer to the contradiction, given once the lab has landed
 /// `wip-notes.txt` for it ([`land_contradicted_work`]): what it did, then a defense of other words
 /// than [`CLEAN`]'s, so it is no same reply.
 pub const LANDED_NOTES: &str = "Committed wip-notes.txt and pushed it to origin/main.\n\
                                 Nothing left: the parser and its notes are on origin/main.";
 /// The head of Land's nudge quoting the agent's own list
-/// ([`land_check::LISTED_OPEN`](aterm_agent::supervise::policy::land_check::LISTED_OPEN)).
-const LISTED_KEY: &str = aterm_agent::supervise::policy::land_check::LISTED_OPEN;
+/// ([`land_check::LISTED_OPEN`](alab_policy::land_check::LISTED_OPEN)).
+const LISTED_KEY: &str = alab_policy::land_check::LISTED_OPEN;
 /// The hinted check's quote opening
-/// ([`land_check::LAND_CHECK_HINT_OPEN`](aterm_agent::supervise::policy::land_check::LAND_CHECK_HINT_OPEN)).
-const HINT_OPEN: &str = aterm_agent::supervise::policy::land_check::LAND_CHECK_HINT_OPEN;
+/// ([`land_check::LAND_CHECK_HINT_OPEN`](alab_policy::land_check::LAND_CHECK_HINT_OPEN)).
+const HINT_OPEN: &str = alab_policy::land_check::LAND_CHECK_HINT_OPEN;
 /// L2's list, its answer to the check: its report's leftover, said alone.
 pub const CHECK_LIST: &str = "The docs PR is still open.";
 /// land-same-list's list.
@@ -233,7 +234,7 @@ pub const DONE_CLAIM_KEY: &str = "Merged the parser";
 
 /// What the journal's `EVENT idle` row keeps of [`DONE_CLAIM`] and [`W_DONE`]: their last line,
 /// the token, which no other reply of a chain that says either one ends with.
-pub const DONE_CLAIM_READ: &str = turn_end::FINISHED;
+pub const DONE_CLAIM_READ: &str = alab_policy::words::FINISHED;
 
 /// The `[harness]` line that sets [`OWNER_CONTINUE`] as the lab's `continue_text`: a TOML basic
 /// string, its line breaks escaped.
@@ -268,7 +269,12 @@ pub fn cap_reason() -> String {
 /// The cap's window (`TurnEndTiming::window`), in ms.
 #[must_use]
 pub fn cap_window_ms() -> i64 {
-    i64::try_from(turn_end::TurnEndTiming::default().window.as_millis()).unwrap_or(i64::MAX)
+    i64::try_from(
+        alab_policy::config::TurnEndTiming::default()
+            .window
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
 }
 const PAST_WINDOW_MS: i64 = 30_000;
 const RESUMED: &str = "carry on with the parser and land it";
@@ -281,12 +287,15 @@ const WALL_LIFT_EARLY_MS: i64 = 3_000;
 const WALL_LOST_MS: i64 = 5 * 60_000;
 
 /// The grace past a reset the harness waits on `program` ([`Harness::name`]) before it goes on
-/// (`TurnEndTiming::grace_for`): 60 s for a program with no auto-continue (Muse Code, agy),
+/// (`turn_end::grace_for`): 60 s for a program with no auto-continue (Muse Code, agy),
 /// 150 s for Claude Code, whose own continue comes 30 to 90 s past the reset.
 #[must_use]
 pub fn wall_grace_ms(program: &str) -> i64 {
     let p = Harness::of(program).map_or(aterm_phase::Program::Generic, Harness::program);
-    i64::try_from(turn_end::TurnEndTiming::default().grace_for(p).as_millis()).unwrap_or(i64::MAX)
+    i64::try_from(
+        turn_end::grace_for(&alab_policy::config::TurnEndTiming::default(), p).as_millis(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 const WALL_HID_AHEAD_MS: i64 = 420_000;
@@ -402,7 +411,7 @@ pub fn tool_after(h: Harness) -> &'static str {
     }
 }
 
-/// The factor `--mode ladder` scales the short back-off ladder by (`turn_end::LADDER_SCALE_SEAM`):
+/// The factor `--mode ladder` scales the short back-off ladder by (`config::LADDER_SCALE_SEAM`):
 /// an eighth, so the steps of 2 to 60 min are 15 s to 7.5 min, and the ladder to its cap and the
 /// cap decided again fit in about 16 min.
 pub const LADDER_SCALE: f64 = 0.125;
@@ -416,7 +425,7 @@ const STEP_SLACK_MS: i64 = 2_500;
 /// [`LADDER_SCALE`], which only a development build reads.
 #[must_use]
 pub fn ladder_env() -> String {
-    format!("{}={LADDER_SCALE}", turn_end::LADDER_SCALE_SEAM)
+    format!("{}={LADDER_SCALE}", config::LADDER_SCALE_SEAM)
 }
 
 /// The shipped short back-off ladder in minutes, one step per short turn in a row: 2 min doubled
@@ -2138,11 +2147,11 @@ impl Chain {
     }
 
     /// Whether the first prompt's reply is real work past the short-turn floor
-    /// (`turn_end::MIN_WORK`), so the first point closes no short turn (`cruise-angles`'): every
+    /// (`alab_policy::config::MIN_WORK`), so the first point closes no short turn (`cruise-angles`'): every
     /// other chain's comes within seconds and closes one ([`p3_faults`]).
     #[must_use]
     pub fn first_reply_works(self) -> bool {
-        let floor = i64::try_from(turn_end::MIN_WORK.as_millis()).unwrap_or(i64::MAX);
+        let floor = i64::try_from(alab_policy::config::MIN_WORK.as_millis()).unwrap_or(i64::MAX);
         self.first_reply_ms() >= floor
     }
 
@@ -3268,14 +3277,14 @@ pub fn first_point_line(seen: &Seen, t0: i64) -> String {
 
 /// The ladder's next step after a point that closed `streak` short turns: the wait before the next
 /// act, were the ladder still going (none for a worker its manager waits on, through its first
-/// [`turn_end::MANAGED_SHORT_TURNS`]).
+/// [`alab_policy::words::MANAGED_SHORT_TURNS`]).
 #[must_use]
 pub fn next_step_ms(streak: u32, managed: bool) -> i64 {
-    if managed && streak <= turn_end::MANAGED_SHORT_TURNS {
+    if managed && streak <= alab_policy::words::MANAGED_SHORT_TURNS {
         return 0;
     }
-    let t = turn_end::TurnEndTiming::default();
-    let d = aterm_agent::supervise::ladder::doubling(
+    let t = alab_policy::config::TurnEndTiming::default();
+    let d = alab_policy::ladder::doubling(
         t.short_backoff,
         streak.saturating_sub(1),
         t.short_backoff_max,
@@ -3324,10 +3333,10 @@ pub fn judge(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Scenario
 
 fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Scenario, Verdict)> {
     let done = seen.first_after("DONE ", t0);
-    let land = seen.acts(turn_end::RULE_LAND).first().copied();
-    let nudges = seen.acts(turn_end::RULE_LAND_NUDGE);
+    let land = seen.acts(alab_policy::words::RULE_LAND).first().copied();
+    let nudges = seen.acts(alab_policy::words::RULE_LAND_NUDGE);
     let land_nudge_after = |t: i64| nudges.iter().copied().find(|(at, _)| *at > t);
-    let checks = seen.acts(turn_end::RULE_LAND_CHECK);
+    let checks = seen.acts(alab_policy::land_check::RULE_LAND_CHECK);
     let land_check_after = |t: i64| checks.iter().copied().find(|(at, _)| *at > t);
     let mut out = Vec::new();
     for &s in chain.scenarios() {
@@ -3447,7 +3456,7 @@ fn judge_long_landing(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Ver
     };
     let busy = d - t1;
     let mut bad = Vec::new();
-    if !line.contains(&format!("rule={}", turn_end::RULE_LAND)) {
+    if !line.contains(&format!("rule={}", alab_policy::words::RULE_LAND)) {
         bad.push(format!("the DONE names another rule: {line}"));
     }
     if !seen.status_said("task", "landed", d - 5000) {
@@ -3485,7 +3494,7 @@ fn judge_land_act(
         Some((t, _)) if done.is_some_and(|(d, _)| d < t) => {
             Verdict::Fail("a DONE came before the land instruction".into())
         }
-        Some((t, _)) => match seen.typed_row(turn_end::RULE_LAND, *t) {
+        Some((t, _)) => match seen.typed_row(alab_policy::words::RULE_LAND, *t) {
             Some(_) => Verdict::Pass(format!(
                 "land@v1 typed at +{}, ledger row typed",
                 at(t0, *t)
@@ -3533,10 +3542,13 @@ impl Want {
     /// reader's words, the repository's, the needs ack or a way out ([`ESCAPES`]).
     const fn listed_contradicted(named: &'static [&'static str]) -> Want {
         Want {
-            leads: Some(turn_end::LAND_CONTRADICTED_HEAD),
-            head: turn_end::CONTRADICTED_LISTED,
+            leads: Some(alab_policy::words::LAND_CONTRADICTED_HEAD),
+            head: alab_policy::words::CONTRADICTED_LISTED,
             named,
-            says: &[turn_end::CONTRADICTED_LISTED_ASK, turn_end::NO_REPOSITORY],
+            says: &[
+                alab_policy::words::CONTRADICTED_LISTED_ASK,
+                alab_policy::words::NO_REPOSITORY,
+            ],
             not_named: &[],
             not_anywhere: &[
                 OPEN_SUFFIX,
@@ -3556,10 +3568,13 @@ impl Want {
     const fn repo(repo: Repo) -> Want {
         let (named, not_named) = repo.named();
         Want {
-            leads: Some(turn_end::LAND_CONTRADICTED_HEAD),
-            head: turn_end::CONTRADICTED_GIT,
+            leads: Some(alab_policy::words::LAND_CONTRADICTED_HEAD),
+            head: alab_policy::words::CONTRADICTED_GIT,
             named,
-            says: &[turn_end::CONTRADICTED_GIT_ASK, turn_end::NO_REPOSITORY],
+            says: &[
+                alab_policy::words::CONTRADICTED_GIT_ASK,
+                alab_policy::words::NO_REPOSITORY,
+            ],
             not_named,
             not_anywhere: &[
                 OPEN_SUFFIX,
@@ -3653,7 +3668,7 @@ fn judge_nudge<'a>(
         ));
     };
     let t2 = nudge.0;
-    let text = seen.act_text(turn_end::RULE_LAND_NUDGE, nudge);
+    let text = seen.act_text(alab_policy::words::RULE_LAND_NUDGE, nudge);
     let suffix = match nudge_words(text, want) {
         Ok(suffix) => suffix,
         Err(why) => return Verdict::Fail(format!("the nudge at +{} {why}", at(t0, t2))),
@@ -3758,7 +3773,7 @@ fn judge_needs<'a>(
     // text read off its own ledger row.
     let act = nudge
         .and_then(|(_, l)| act_rule(l))
-        .unwrap_or(turn_end::RULE_LAND_NUDGE);
+        .unwrap_or(alab_policy::words::RULE_LAND_NUDGE);
     let nudge_text = nudge.map(|n| seen.act_text(act, n));
     let carry_on = nudge_text.is_some_and(|t| t.contains(NEEDS_ACK));
     let stray: Vec<&str> = [OPEN_SUFFIX, REPO_SUFFIX]
@@ -3825,7 +3840,7 @@ fn landing_quiet(
 ) -> (Vec<String>, String, i64) {
     let t3 = *t3;
     let mut bad = Vec::new();
-    if !line.contains(&format!("rule={}", turn_end::RULE_LAND)) {
+    if !line.contains(&format!("rule={}", alab_policy::words::RULE_LAND)) {
         bad.push(format!("the DONE line names another rule: {line}"));
     }
     let landed = seen.status_said("task", "landed", t3 - 5000);
@@ -4040,7 +4055,7 @@ fn judge_tasked(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
 
 /// The land checks typed after `t` (`land-check@v1`), in order.
 fn checks_after(seen: &Seen, t: i64) -> Vec<&(i64, String)> {
-    seen.acts(turn_end::RULE_LAND_CHECK)
+    seen.acts(alab_policy::land_check::RULE_LAND_CHECK)
         .into_iter()
         .filter(|(at, _)| *at > t)
         .collect()
@@ -4051,8 +4066,8 @@ fn checks_after(seen: &Seen, t: i64) -> Vec<&(i64, String)> {
 fn rest_of(seen: &Seen) -> Option<&(i64, String)> {
     seen.journal.iter().find(|(_, l)| {
         l.starts_with("WAITING ")
-            && word(l, "rule").as_deref() == Some(turn_end::RULE_LAND_CHECK)
-            && l.contains(aterm_agent::supervise::policy::land_check::WAITS_ON_YOU)
+            && word(l, "rule").as_deref() == Some(alab_policy::land_check::RULE_LAND_CHECK)
+            && l.contains(alab_policy::land_check::WAITS_ON_YOU)
     })
 }
 
@@ -4070,7 +4085,7 @@ fn the_check(seen: &Seen, t1: i64, t0: i64) -> Result<&(i64, String), Verdict> {
         )));
     }
     if let Some((t, l)) = seen
-        .acts(turn_end::RULE_LAND_NUDGE)
+        .acts(alab_policy::words::RULE_LAND_NUDGE)
         .into_iter()
         .find(|(t, _)| *t > t1)
     {
@@ -4092,10 +4107,10 @@ fn the_check(seen: &Seen, t1: i64, t0: i64) -> Result<&(i64, String), Verdict> {
 /// What a check's text must and must not say: its head, hinted quoting `hint` or plain.
 fn check_text_faults(text: &str, hint: Option<&str>) -> Vec<String> {
     let mut bad = Vec::new();
-    if !text.starts_with(turn_end::LAND_CHECK_HEAD) {
+    if !text.starts_with(alab_policy::land_check::LAND_CHECK_HEAD) {
         bad.push(format!(
             "the check does not open with \"{}\": {}",
-            turn_end::LAND_CHECK_HEAD,
+            alab_policy::land_check::LAND_CHECK_HEAD,
             crate::util::one_line(text, 120)
         ));
     }
@@ -4171,7 +4186,7 @@ fn judge_landed(seen: &Seen, land: Option<&(i64, String)>, managed: bool, t0: i6
     };
     let (mut bad, said, window) = landing_quiet(seen, done, managed, t0);
     bad.extend(check_text_faults(
-        seen.act_text(turn_end::RULE_LAND_CHECK, check),
+        seen.act_text(alab_policy::land_check::RULE_LAND_CHECK, check),
         None,
     ));
     let checks = checks_after(seen, *t1).len();
@@ -4179,7 +4194,7 @@ fn judge_landed(seen: &Seen, land: Option<&(i64, String)>, managed: bool, t0: i6
         bad.push(format!("{checks} land checks typed, not one"));
     }
     if let Some((tn, _)) = seen
-        .acts(turn_end::RULE_LAND_NUDGE)
+        .acts(alab_policy::words::RULE_LAND_NUDGE)
         .into_iter()
         .find(|(t, _)| *t > *t1 && *t < done.0)
     {
@@ -4269,7 +4284,10 @@ fn judge_listed<'a>(
         Ok(c) => c,
         Err(v) => return v,
     };
-    let mut bad = check_text_faults(seen.act_text(turn_end::RULE_LAND_CHECK, check), hint);
+    let mut bad = check_text_faults(
+        seen.act_text(alab_policy::land_check::RULE_LAND_CHECK, check),
+        hint,
+    );
     let checks = checks_after(seen, *t1).len();
     if checks != 1 {
         bad.push(format!("{checks} land checks typed, not one"));
@@ -4325,7 +4343,10 @@ fn judge_rest(
         Err(v) => return v,
     };
     let t2 = check.0;
-    let mut bad = check_text_faults(seen.act_text(turn_end::RULE_LAND_CHECK, check), None);
+    let mut bad = check_text_faults(
+        seen.act_text(alab_policy::land_check::RULE_LAND_CHECK, check),
+        None,
+    );
     let needs = seen.first_after("NEEDS ", *t1);
     let entry = needs_entry(seen, *t1);
     if needs.is_none() || entry.is_none() {
@@ -4358,8 +4379,8 @@ fn judge_rest(
         let why = format!(
             "land-check@v1 typed at +{}, but no rest said (WAITING … rule={} … {})",
             at(t0, t2),
-            turn_end::RULE_LAND_CHECK,
-            aterm_agent::supervise::policy::land_check::WAITS_ON_YOU
+            alab_policy::land_check::RULE_LAND_CHECK,
+            alab_policy::land_check::WAITS_ON_YOU
         );
         return match lost_after(seen, t2, t0) {
             Some(lost) => Verdict::Fail(format!("{why}: {lost}{}", tail_of(&bad))),
@@ -4423,19 +4444,19 @@ fn judge_hinted(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
         ));
     };
     let (mut bad, said, window) = landing_quiet(seen, done, false, t0);
-    let text = seen.act_text(turn_end::RULE_LAND_CHECK, check);
+    let text = seen.act_text(alab_policy::land_check::RULE_LAND_CHECK, check);
     bad.extend(check_text_faults(text, Some(HINT_KEY)));
     let checks = checks_after(seen, *t1).len();
     if checks != 1 {
         bad.push(format!("{checks} land checks typed, not one"));
     }
-    if let Some((tn, _)) = seen.acts(turn_end::RULE_LAND_NUDGE).first() {
+    if let Some((tn, _)) = seen.acts(alab_policy::words::RULE_LAND_NUDGE).first() {
         bad.push(format!("a land-nudge@v1 typed at +{}", at(t0, *tn)));
     }
     let held = match &seen.cover.check_texts {
         None => "the stub's copy UNREAD".to_string(),
         Some(texts) => {
-            let close = aterm_agent::supervise::policy::land_check::LAND_CHECK_HINT_CLOSE;
+            let close = alab_policy::land_check::LAND_CHECK_HINT_CLOSE;
             if texts
                 .iter()
                 .any(|t| t.contains(HINT_OPEN) && t.contains(HINT_KEY) && t.contains(close))
@@ -4476,7 +4497,7 @@ fn judge_relisted(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict
         Ok(c) => c,
         Err(v) => return v,
     };
-    let nudges = seen.acts(turn_end::RULE_LAND_NUDGE);
+    let nudges = seen.acts(alab_policy::words::RULE_LAND_NUDGE);
     let Some(quoting) = nudges.iter().copied().find(|(t, _)| *t > first.0) else {
         return match lost_after(seen, first.0, t0) {
             Some(lost) => Verdict::Fail(format!("no nudge after the check's list: {lost}")),
@@ -4486,8 +4507,11 @@ fn judge_relisted(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict
             )),
         };
     };
-    let mut bad = check_text_faults(seen.act_text(turn_end::RULE_LAND_CHECK, first), None);
-    let text = seen.act_text(turn_end::RULE_LAND_NUDGE, quoting);
+    let mut bad = check_text_faults(
+        seen.act_text(alab_policy::land_check::RULE_LAND_CHECK, first),
+        None,
+    );
+    let text = seen.act_text(alab_policy::words::RULE_LAND_NUDGE, quoting);
     let suffix = text.find(LISTED_KEY).map_or("", |i| &text[i..]);
     if !suffix.contains(RELEASE_KEY) {
         bad.push(format!(
@@ -4579,12 +4603,15 @@ fn judge_reworded(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict
         Ok(c) => c,
         Err(v) => return v,
     };
-    let mut bad = check_text_faults(seen.act_text(turn_end::RULE_LAND_CHECK, first), None);
-    let nudges = seen.acts(turn_end::RULE_LAND_NUDGE);
+    let mut bad = check_text_faults(
+        seen.act_text(alab_policy::land_check::RULE_LAND_CHECK, first),
+        None,
+    );
+    let nudges = seen.acts(alab_policy::words::RULE_LAND_NUDGE);
     let quoting = |after: i64, key: &str| {
         nudges.iter().copied().find(|n| {
             n.0 > after && {
-                let text = seen.act_text(turn_end::RULE_LAND_NUDGE, n);
+                let text = seen.act_text(alab_policy::words::RULE_LAND_NUDGE, n);
                 text.find(LISTED_KEY)
                     .is_some_and(|i| text[i..].contains(key))
             }
@@ -4686,14 +4713,15 @@ fn through_check(chain: Chain, seen: &Seen, t0: i64, v: Verdict) -> Verdict {
     if chain.autopilot() != "land" {
         return v;
     }
-    let checks = seen.acts(turn_end::RULE_LAND_CHECK);
+    let checks = seen.acts(alab_policy::land_check::RULE_LAND_CHECK);
     let fault = if chain == Chain::LandContradicted {
         contradicted_check_fault(seen, &checks, t0)
     } else if chain.repo().reads_clean() {
         seen.journal
             .iter()
             .find(|(_, l)| {
-                l.starts_with("DONE ") && l.contains(&format!("rule={}", turn_end::RULE_LAND))
+                l.starts_with("DONE ")
+                    && l.contains(&format!("rule={}", alab_policy::words::RULE_LAND))
             })
             .filter(|(d, _)| !checks.iter().any(|(t, _)| t < d))
             .map(|(d, _)| {
@@ -4735,7 +4763,7 @@ fn contradicted_check_fault(seen: &Seen, checks: &[&(i64, String)], t0: i64) -> 
     seen.journal
         .iter()
         .find(|(_, l)| {
-            l.starts_with("DONE ") && l.contains(&format!("rule={}", turn_end::RULE_LAND))
+            l.starts_with("DONE ") && l.contains(&format!("rule={}", alab_policy::words::RULE_LAND))
         })
         .filter(|(d, _)| !checks.iter().any(|(t, _)| *t > landed && t < d))
         .map(|(d, _)| {
@@ -4771,7 +4799,7 @@ fn judge_contradicted<'a>(
             )),
         };
     };
-    let text = seen.act_text(turn_end::RULE_LAND_NUDGE, nudge);
+    let text = seen.act_text(alab_policy::words::RULE_LAND_NUDGE, nudge);
     let said = match nudge_words(text, &Want::repo(Repo::Untracked)) {
         Ok(suffix) => format!(
             "land-nudge@v1 typed at +{} leading with the contradiction: \"{}\"",
@@ -4802,7 +4830,7 @@ fn judge_contradicted<'a>(
     };
     let Some((d, dl)) = seen
         .first_after("DONE ", landed)
-        .filter(|(_, l)| l.contains(&format!("rule={}", turn_end::RULE_LAND)))
+        .filter(|(_, l)| l.contains(&format!("rule={}", alab_policy::words::RULE_LAND)))
     else {
         let why = format!(
             "{said}; wip-notes.txt landed at +{}, but no landing within {}",
@@ -4816,7 +4844,7 @@ fn judge_contradicted<'a>(
         };
     };
     let nudges = seen
-        .acts(turn_end::RULE_LAND_NUDGE)
+        .acts(alab_policy::words::RULE_LAND_NUDGE)
         .into_iter()
         .filter(|(t, _)| *t > *t1 && t < d)
         .count();
@@ -4893,7 +4921,7 @@ fn judge_contradicted_list<'a>(
             )),
         };
     };
-    let text = seen.act_text(turn_end::RULE_LAND_NUDGE, contra);
+    let text = seen.act_text(alab_policy::words::RULE_LAND_NUDGE, contra);
     let said = match nudge_words(text, &Want::listed_contradicted(&[OPEN_KEY])) {
         Ok(suffix) => format!(
             "{listed}; then land-nudge@v1 at +{} leading with the contradiction: \"{}\"",
@@ -4954,13 +4982,17 @@ fn judge_contradicted_list<'a>(
 }
 
 fn judge_check(seen: &Seen, t0: i64) -> Verdict {
-    let Some(check) = seen.acts(turn_end::RULE_DONE_CHECK).first().copied() else {
+    let Some(check) = seen
+        .acts(alab_policy::words::RULE_DONE_CHECK)
+        .first()
+        .copied()
+    else {
         return Verdict::Fail(format!(
             "no continue-done-check@v1 typed within {}",
             at(t0, seen.end_ms)
         ));
     };
-    let Some(row) = seen.typed_row(turn_end::RULE_DONE_CHECK, check.0) else {
+    let Some(row) = seen.typed_row(alab_policy::words::RULE_DONE_CHECK, check.0) else {
         return Verdict::Fail(format!(
             "continue-done-check@v1 journaled at +{}, but NO ledger row typed",
             at(t0, check.0)
@@ -4987,7 +5019,7 @@ fn judge_check(seen: &Seen, t0: i64) -> Verdict {
 }
 
 fn judge_cruise_goes_on(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> Verdict {
-    let checks = seen.acts(turn_end::RULE_DONE_CHECK);
+    let checks = seen.acts(alab_policy::words::RULE_DONE_CHECK);
     let Some((t1, _)) = checks.first() else {
         return Verdict::Unobserved("no done check was typed (C1 failed)".into());
     };
@@ -5053,7 +5085,12 @@ fn judge_cruise_goes_on(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> V
 }
 
 pub(crate) fn take_window_ms() -> i64 {
-    i64::try_from(turn_end::TurnEndTiming::default().take_within.as_millis()).unwrap_or(i64::MAX)
+    i64::try_from(
+        alab_policy::config::TurnEndTiming::default()
+            .take_within
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 /// Acts typed with no point judged between them: no `WAITING` (but a worker's take), `DONE` or
@@ -5124,14 +5161,14 @@ fn backoff_due(line: &str) -> Option<i64> {
 
 /// CRUISE'S WAIT BEFORE ITS REQUEST FOR A DIFFERENT APPROACH (the continuous-forward design of
 /// 2026-11-01, `docs/DESIGN-continuous-forward-2026-11-01.md`): `WAITING … until=<t>
-/// <turn_end::REPEAT_RECOVERY_WAIT>`, the loop's answer to a repeated report under Cruise. It
+/// <alab_policy::words::REPEAT_RECOVERY_WAIT>`, the loop's answer to a repeated report under Cruise. It
 /// waits the short back-off ladder's step for the streak its point closed, and names none.
 #[must_use]
 pub fn recovery_wait(line: &str) -> bool {
     line.starts_with("WAITING ")
         && line.split_once(" until=").is_some_and(|(_, rest)| {
             rest.split_once(' ')
-                .is_some_and(|(_, words)| words.trim() == turn_end::REPEAT_RECOVERY_WAIT)
+                .is_some_and(|(_, words)| words.trim() == alab_policy::words::REPEAT_RECOVERY_WAIT)
         })
 }
 
@@ -5276,7 +5313,7 @@ fn early_acts(seen: &Seen, t0: i64) -> Vec<String> {
         }
         // A switch of the tab's word to Land between the back-off and the act decides the act
         // anew: Land's instruction waits no back-off (v6 §14.10).
-        if act_rule(la) == Some(turn_end::RULE_LAND)
+        if act_rule(la) == Some(alab_policy::words::RULE_LAND)
             && seen
                 .cover
                 .words
@@ -5363,7 +5400,7 @@ fn p3_faults(seen: &Seen, t0: i64, first_works: bool) -> Vec<String> {
         .find(|r| r.rule == RULE_POINT && r.ts >= from)
     {
         let left = seen.ledger.iter().any(|r| {
-            r.rule == turn_end::RULE_LEFT
+            r.rule == alab_policy::words::RULE_LEFT
                 && r.decision == "skipped"
                 && (r.ts - first.ts).abs() <= AT_DONE_MS
         });
@@ -5495,7 +5532,7 @@ fn judge_instant_land(
         .collect();
     // land@v1 at its due, and the land check its clean defense gets at once (§14.17 item 5).
     let checked = before.len() == 2
-        && act_rule(&before[1].1) == Some(turn_end::RULE_LAND_CHECK)
+        && act_rule(&before[1].1) == Some(alab_policy::land_check::RULE_LAND_CHECK)
         && before[1].0 > *t1;
     if before.len() != 1 && !checked {
         bad.push(format!(
@@ -5548,7 +5585,7 @@ fn judge_instant_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> V
             )
         ));
     };
-    if act_rule(l1) != Some(turn_end::RULE_DONE_CHECK) {
+    if act_rule(l1) != Some(alab_policy::words::RULE_DONE_CHECK) {
         return Verdict::Fail(format!(
             "the first act at +{} is {}, not continue-done-check@v1",
             at(t0, *t1),
@@ -7542,7 +7579,7 @@ fn window_witness(run: &Run, tab: &Tab) -> Option<StubSeen> {
             let t1 = if c == Chain::CruiseWall {
                 walls::cruise_met(&tab.seen)?
             } else {
-                tab.seen.acts(turn_end::RULE_LAND).first()?.0
+                tab.seen.acts(alab_policy::words::RULE_LAND).first()?.0
             };
             Some(StubSeen::within(
                 &dumps_of(run, &token),
@@ -7698,7 +7735,7 @@ fn wall_step(run: &Run, tab: &mut Tab, now: i64) -> Result<(), Fail> {
 }
 
 fn waits_on_the_wall(s: &Seen) -> bool {
-    let Some((t1, _)) = s.acts(turn_end::RULE_LAND).first().copied() else {
+    let Some((t1, _)) = s.acts(alab_policy::words::RULE_LAND).first().copied() else {
         return false;
     };
     let points: Vec<Option<String>> = s
@@ -8483,12 +8520,13 @@ fn open_need_gate(run: &Run, tab: &mut Tab, window: bool) {
 }
 
 /// THE CONTRADICTION'S TYPED ROW (slice 4c): the first `land-nudge@v1` the ledger says was typed
-/// with [`turn_end::LAND_CONTRADICTED_HEAD`] leading.
+/// with [`alab_policy::words::LAND_CONTRADICTED_HEAD`] leading.
 fn contradiction_row(seen: &Seen) -> Option<&Row> {
     seen.ledger.iter().find(|r| {
-        r.rule == turn_end::RULE_LAND_NUDGE
+        r.rule == alab_policy::words::RULE_LAND_NUDGE
             && r.decision == "typed"
-            && r.command.starts_with(turn_end::LAND_CONTRADICTED_HEAD)
+            && r.command
+                .starts_with(alab_policy::words::LAND_CONTRADICTED_HEAD)
     })
 }
 
@@ -8546,7 +8584,7 @@ fn ask_due(s: &Seen, now: i64) -> bool {
     let Some((t1, _)) = s
         .all_acts()
         .into_iter()
-        .find(|(_, l)| act_rule(l) == Some(turn_end::RULE_DONE_CHECK))
+        .find(|(_, l)| act_rule(l) == Some(alab_policy::words::RULE_DONE_CHECK))
     else {
         return false;
     };
@@ -8587,7 +8625,7 @@ fn finished(tab: &Tab, now: i64) -> bool {
             .find(|(_, l)| act_rule(l) == Some(rule))
             .map(|(t, _)| *t)
     };
-    let nudge = first(turn_end::RULE_LAND_NUDGE);
+    let nudge = first(alab_policy::words::RULE_LAND_NUDGE);
     let done_since = |ms: i64| done.is_some_and(|d| now - d >= ms);
     match tab.chain {
         Chain::LandA
@@ -8652,15 +8690,19 @@ fn finished(tab: &Tab, now: i64) -> bool {
         // land-contradicted-list's hold comes after its second nudge, the contradiction: the
         // first's back-off is no end of its watch.
         Chain::LandContradictedList => {
-            (s.acts(turn_end::RULE_LAND_NUDGE).len() >= 2 && surfaces::held::watched_past(s, now))
+            (s.acts(alab_policy::words::RULE_LAND_NUDGE).len() >= 2
+                && surfaces::held::watched_past(s, now))
                 || done_since(20_000)
         }
         // land-reworded's hold comes after the nudge quoting its new words, the first past its
         // second check: the back-off before that nudge is no end of its watch.
         Chain::LandReworded => {
-            let second_check = s.acts(turn_end::RULE_LAND_CHECK).get(1).map(|(t, _)| *t);
+            let second_check = s
+                .acts(alab_policy::land_check::RULE_LAND_CHECK)
+                .get(1)
+                .map(|(t, _)| *t);
             let quoted = second_check.is_some_and(|c| {
-                s.acts(turn_end::RULE_LAND_NUDGE)
+                s.acts(alab_policy::words::RULE_LAND_NUDGE)
                     .iter()
                     .any(|(t, _)| *t > c)
             });
@@ -8719,13 +8761,13 @@ fn finished(tab: &Tab, now: i64) -> bool {
                 || (s.all_acts().is_empty() && now - tab.t0 > 300_000)
         }
         Chain::Cruise | Chain::WroteC => {
-            let check = first(turn_end::RULE_DONE_CHECK);
+            let check = first(alab_policy::words::RULE_DONE_CHECK);
             (check.is_some_and(|c| s.all_acts().iter().any(|(t, _)| *t > c))
                 && surfaces::held::watched_past(s, now))
                 || done_since(20_000)
         }
         Chain::CruiseO => {
-            first(turn_end::RULE_CONTINUE).is_some_and(|c| {
+            first(alab_policy::words::RULE_CONTINUE).is_some_and(|c| {
                 s.all_acts().iter().any(|(t, _)| *t > c)
                     || s.yield_after(c, None, Some(DONE_CLAIM_READ))
                         .event
@@ -9913,7 +9955,7 @@ pub mod surfaces;
 /// check's answer. Records that have a check, or no landing, are left as they are.
 #[cfg(test)]
 pub(crate) fn with_land_check(mut seen: Seen) -> Seen {
-    let landing = format!("rule={}", turn_end::RULE_LAND);
+    let landing = format!("rule={}", alab_policy::words::RULE_LAND);
     let Some(i) = seen
         .journal
         .iter()
@@ -9924,7 +9966,7 @@ pub(crate) fn with_land_check(mut seen: Seen) -> Seen {
     let d = seen.journal[i].0;
     if seen.journal[..i]
         .iter()
-        .any(|(_, l)| act_rule(l) == Some(turn_end::RULE_LAND_CHECK))
+        .any(|(_, l)| act_rule(l) == Some(alab_policy::land_check::RULE_LAND_CHECK))
     {
         return seen;
     }
@@ -9955,8 +9997,8 @@ pub(crate) fn with_land_check(mut seen: Seen) -> Seen {
             t,
             format!(
                 "CONTINUED seq={seq} rule={} {}",
-                turn_end::RULE_LAND_CHECK,
-                turn_end::LAND_CHECK_HEAD
+                alab_policy::land_check::RULE_LAND_CHECK,
+                alab_policy::land_check::LAND_CHECK_HEAD
             ),
         ),
     );
@@ -9970,9 +10012,9 @@ pub(crate) fn with_land_check(mut seen: Seen) -> Seen {
         at,
         Row {
             ts: t,
-            rule: turn_end::RULE_LAND_CHECK.into(),
+            rule: alab_policy::land_check::RULE_LAND_CHECK.into(),
             decision: "typed".into(),
-            command: turn_end::LAND_CHECK.into(),
+            command: alab_policy::land_check::LAND_CHECK.into(),
             reason: "the turn-end policy (short turns in a row: 1)".into(),
             box_seq: None,
         },

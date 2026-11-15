@@ -263,7 +263,9 @@ const VOICES: &[SoundVoice] = SoundVoice::ALL;
 const fn is_music_box(voice: SoundVoice, style: GlowStyle) -> bool {
     matches!(
         voice,
-        SoundVoice::RainbowKittyV2 | SoundVoice::Of(GlowStyle::RainbowKitty)
+        SoundVoice::RainbowKittyV2
+            | SoundVoice::MusicBoxII
+            | SoundVoice::Of(GlowStyle::RainbowKitty)
     ) || (matches!(voice, SoundVoice::Style) && matches!(style, GlowStyle::RainbowKitty))
 }
 

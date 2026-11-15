@@ -24,8 +24,8 @@
 
 use super::acts::FACT_SEPARATOR;
 use super::repo_work::RepoRead;
-use crate::supervise::policy::land_check::RULE_LAND_CHECK;
-use crate::supervise::policy::turn_end::RULE_LAND;
+use alab_policy::land_check::RULE_LAND_CHECK;
+use alab_policy::words::RULE_LAND;
 use aterm_types::land_trailer;
 
 /// How many hex digits of `HEAD` a receipt names, on every surface.
@@ -459,7 +459,7 @@ fn is_head(hex: &str) -> bool {
 /// line and every line after it, as one line.
 #[must_use]
 pub fn said_of(tail: &str) -> String {
-    crate::supervise::policy::needs::defense_and_after(tail)
+    alab_policy::needs::defense_and_after(tail)
         .map(|lines| said_of_line(&lines.join(" ")))
         .unwrap_or_default()
 }

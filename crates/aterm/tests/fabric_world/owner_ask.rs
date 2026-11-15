@@ -668,7 +668,7 @@ fn spawn_tab(inst: &Inst) -> String {
     assert!(r.ok(), "spawn: {}", r.header());
     r.header()
         .split_whitespace()
-        .find(|w| w.starts_with("s-"))
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .unwrap_or_else(|| panic!("spawn names its sid: {}", r.header()))
         .to_string()
 }
@@ -734,18 +734,18 @@ const HARNESS_HANDS_OVER: &str = "[harness]\napprove = \"none\"\n";
 const RESET_SPAN: f64 = 0.05;
 
 /// The reset's development seams: the time to the wall's reset at [`RESET_SPAN`]
-/// ([`aterm_agent::supervise::policy::turn_end::RESET_SPAN_SCALE_SEAM`]) and the grace and jitter
-/// past it at a thousandth ([`aterm_agent::supervise::policy::turn_end::RESET_SCALE_SEAM`]), so
+/// ([`aterm_agent::supervise::config::RESET_SPAN_SCALE_SEAM`]) and the grace and jitter
+/// past it at a thousandth ([`aterm_agent::supervise::config::RESET_SCALE_SEAM`]), so
 /// the harness's carry-on comes three seconds after the wall that says `in 1m`, its grace and
 /// jitter a fraction of a second, and the wait for it is that reset and the hang detector.
 fn reset_soon() -> Vec<(String, String)> {
-    use aterm_agent::supervise::policy::turn_end;
+    use aterm_agent::supervise::config;
     vec![
         (
-            turn_end::RESET_SPAN_SCALE_SEAM.to_string(),
+            config::RESET_SPAN_SCALE_SEAM.to_string(),
             RESET_SPAN.to_string(),
         ),
-        (turn_end::RESET_SCALE_SEAM.to_string(), "0.001".to_string()),
+        (config::RESET_SCALE_SEAM.to_string(), "0.001".to_string()),
     ]
 }
 
@@ -845,9 +845,22 @@ fn summarizing(owner: &Owner, name: &str) -> Opts {
     }
 }
 
-/// `invoke SummarizeFleet` on `inst`, then the worker tab's screen once its stand-in said
-/// `summary-end`.
+/// Wait for the resolved Summarize row, invoke it once, then read the worker tab's screen
+/// after its stand-in said `summary-end`.
 fn summarize(inst: &Inst) -> String {
+    until("Summarize's enabled menu action", || {
+        let controls = inst.verb("controls menu");
+        assert!(controls.ok(), "controls menu: {}", controls.header());
+        controls
+            .rows()
+            .iter()
+            .any(|row| {
+                row.starts_with("menu row ")
+                    && kv(row, "action") == Some("SummarizeFleet")
+                    && kv(row, "enabled") == Some("true")
+            })
+            .then_some(())
+    });
     let before = sids(inst);
     let r = inst.verb("invoke SummarizeFleet");
     assert!(r.ok(), "invoke SummarizeFleet: {}", r.header());
@@ -1492,12 +1505,20 @@ fn opens_cmd(log: &str, fields: &str) -> bool {
     })
 }
 
+/// The op, node, kind and first field of a `log` reply's record row, its seq left out.
+fn row_head(row: &str) -> Vec<&str> {
+    row.split_whitespace().skip(1).take(4).collect()
+}
+
 /// **LEG 1 (D3, 6A-2, 6C-4, U47): THE JOURNAL ACROSS A QUIT AND A KILL.** On the default config
 /// a shell session's command (its second word a sentinel) and a harness-hosted stand-in's turn
 /// land in a private journal that keeps the command's first word and never its second; a quit
-/// and a relaunch answer the earlier process's records by its sids, the restored session's old
-/// cursor answers `gap why=reset` and then the relaunch's own open, and the node log says how
-/// the process before ended: `clean` after a quit, `killed` after a SIGKILL by PID.
+/// and a relaunch restore each tab under its own ID (LT-01) with a new log, and answer the log
+/// each kept before the quit as `@<sid> log prev`, from the journal; the restored tab's old cursor
+/// answers `gap why=reset` and then the relaunch's own open, and the node log says how the
+/// process before ended: `clean` after a quit, `killed` after a SIGKILL by PID. After the kill's
+/// relaunch the shell's `log prev` is the log the killed process kept, which the journal reads
+/// crashed (`gap why=crash`, `out=gone`), and `prev=2` the one it kept before the quit.
 #[test]
 fn the_journal_across_a_quit_and_a_kill() {
     let owner = Owner::boot();
@@ -1555,11 +1576,22 @@ fn the_journal_across_a_quit_and_a_kill() {
             .then_some(())
     });
 
-    // A quit, then a relaunch on the same roots.
+    // A quit, then a relaunch on the same roots: the cold restore keeps each tab's ID and starts
+    // it a new log, so what each logged before the quit is its `log prev`.
     quit(&mut a);
     a.launch();
     a.wait_ready(&owner);
-    let shell_then = a.text(&format!("@{shell} log"));
+    // The relaunch spawns the first tab as it boots and places the others from its restore
+    // pass, which runs after the instance reports ready: wait for both (a hang detector).
+    // Until `s` is live, `@{s} log prev` counts back from the journal's newest log of `s`, the one
+    // it kept before the quit, and finds none earlier.
+    let mut now = Vec::new();
+    let kept = aterm_spec::wait::within(DEADLINE, Duration::from_millis(25), || {
+        now = sids(&a);
+        (now.contains(&shell) && now.contains(&s)).then_some(())
+    });
+    assert!(kept.is_some(), "the restore keeps {shell} and {s}: {now:?}");
+    let shell_then = a.text(&format!("@{shell} log prev"));
     // The sweep numbers the runs: under load it names the `sh` group in front before the
     // script prints its OSC 133 C, so a `prog` run can open first and take `r1`.
     assert!(
@@ -1568,21 +1600,20 @@ fn the_journal_across_a_quit_and_a_kill() {
         "{shell_then}"
     );
     assert!(!shell_then.contains("QZP6SECRET1"), "{shell_then}");
-    let s_then = a.text(&format!("@{s} log"));
+    let s_then = a.text(&format!("@{s} log prev"));
     assert!(
         s_then.contains(" open t1 turn ")
             && s_then.contains(" close t1 turn out=done ")
             && s_then.contains(" close - spawn out=app-quit "),
         "{s_then}"
     );
-    let restored = sids(&a)
-        .into_iter()
-        .find(|n| {
-            a.text(&format!("@{n} log"))
-                .contains(&format!(" prev={shell} "))
-        })
-        .unwrap_or_else(|| panic!("no session restored from {shell}: {}", a.text("sessions")));
-    let since = a.text(&format!("@{restored} log since={} ep={}", old.0, old.1));
+    let shell_now = a.text(&format!("@{shell} log"));
+    assert!(
+        shell_now.contains(" mark - tab act=open why=restored ")
+            && !opens_cmd(&shell_now, "blk=0 detail=echo"),
+        "NEGATIVE CONTROL: the plain read is the relaunch's own log: {shell_now}"
+    );
+    let since = a.text(&format!("@{shell} log since={} ep={}", old.0, old.1));
     let rows: Vec<&str> = since.lines().skip(1).collect();
     assert!(
         rows.first()
@@ -1600,6 +1631,19 @@ fn the_journal_across_a_quit_and_a_kill() {
             .contains(" amend n start prev_end=clean ")
             .then_some(())
     });
+    // The journal's writer coalesces on its own thread: before the kill, wait until it holds the
+    // relaunch's own log of the shell (a hang detector), so the kill ends a log the journal holds.
+    let restored = format!("s1\t{shell}\t");
+    until("a journal holding the relaunch's log of the shell", || {
+        journals(&a)
+            .iter()
+            .any(|(_, b)| {
+                String::from_utf8_lossy(b).lines().any(|l| {
+                    l.starts_with(&restored) && l.contains(" mark - tab act=open why=restored ")
+                })
+            })
+            .then_some(())
+    });
 
     // A SIGKILL by PID, then a relaunch.
     let pid = a.pid();
@@ -1612,6 +1656,39 @@ fn the_journal_across_a_quit_and_a_kill() {
             .contains(" amend n start prev_end=killed ")
             .then_some(())
     });
+    // The kill's relaunch restores the shell under its ID again with a log of its own, so `prev`
+    // is the log the shell kept in the killed process, which the journal reads crashed (its
+    // closes derived), and `prev=2` the one it kept before the quit.
+    let mut now = Vec::new();
+    let kept = aterm_spec::wait::within(DEADLINE, Duration::from_millis(25), || {
+        now = sids(&a);
+        now.contains(&shell).then_some(())
+    });
+    assert!(kept.is_some(), "the kill's relaunch keeps {shell}: {now:?}");
+    let shell_killed = a.text(&format!("@{shell} log prev"));
+    assert!(
+        shell_killed.contains(" mark - tab act=open why=restored ")
+            && !shell_killed.contains("out=app-quit")
+            && !opens_cmd(&shell_killed, "blk=0 detail=echo"),
+        "the log the killed process kept: {shell_killed}"
+    );
+    // The kill left the log open, so the journal derives its crash's closes, last: the gap, then
+    // the session's close by aterm.
+    let mut rows = shell_killed.lines().rev();
+    let (close, gap) = (rows.next().unwrap_or(""), rows.next().unwrap_or(""));
+    assert!(
+        row_head(gap) == ["gap", "-", "gap", "why=crash"]
+            && row_head(close) == ["close", "-", "spawn", "out=gone"]
+            && close.contains(" by=aterm "),
+        "the journal reads the killed log crashed: {shell_killed}"
+    );
+    let shell_first = a.text(&format!("@{shell} log prev=2"));
+    assert!(
+        opens_cmd(&shell_first, "blk=0 detail=echo")
+            && shell_first.contains(" close - spawn out=app-quit ")
+            && !shell_first.contains("why=crash"),
+        "the log kept before the quit: {shell_first}"
+    );
     for (path, bytes) in journals(&a) {
         assert_eq!(mode_of(&path), 0o600, "{}", path.display());
         assert!(!holds(&bytes, "QZP6SECRET1"), "{}", path.display());
@@ -2465,6 +2542,19 @@ fn cold_native_settled() -> ColdNative {
     )
     .unwrap();
     std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut wrapper_proof = aterm_uds::spawnfd::command(&twin);
+    wrapper_proof.arg("--version");
+    let output = aterm_uds::deadline::output_within(
+        &mut wrapper_proof,
+        aterm_uds::deadline::FIRST_EXEC_HANG,
+    )
+    .expect("the private wrapper executes the qualified native build");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "2.1.318 (Claude Code)",
+        "the native body answered through its unchanged private wrapper"
+    );
     let s = spawn_tab(&a);
     until_on(&a, &s, DEADLINE, "the shell's integration", || {
         (kv(&status_of(&a, &s), "integration") == Some("on")).then_some(())
@@ -3527,6 +3617,21 @@ fn privacy_sweep(sealed: bool) {
         );
     }
 
+    // Inspect live subscription files before the restored session's empty topic set retires
+    // them. The scans below still inspect every file that remains after the relaunch.
+    for dir in ["link/keys", "link/topics"] {
+        let files: Vec<PathBuf> = std::fs::read_dir(a.root.join(dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(!files.is_empty(), "nothing under {dir}");
+        for path in files {
+            assert_eq!(mode_of(&path), 0o600, "{}", path.display());
+        }
+    }
+
     // A quits with the hold standing; what it leaves at rest, before any launch takes the restore
     // store aside: `session.toml` holds the title, the person's attention and the hold (its
     // positive control), 0600. A quit writes no carry: the carry is a seamless update's, which
@@ -3582,18 +3687,6 @@ fn privacy_sweep(sealed: bool) {
         x_then.as_bytes(),
         &[8, 9],
     );
-    for dir in ["link/keys", "link/topics"] {
-        let files: Vec<PathBuf> = std::fs::read_dir(a.root.join(dir))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        assert!(!files.is_empty(), "nothing under {dir}");
-        for path in files {
-            assert_eq!(mode_of(&path), 0o600, "{}", path.display());
-        }
-    }
     sweep.files("A", &a.root, &kept_on_disk);
     sweep.files("B", &b.root, &kept_on_disk);
     let broker_dir = owner.tmp.join("broker");

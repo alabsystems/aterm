@@ -253,18 +253,19 @@ impl RepositoryPass {
     }
 
     /// Admit scheduling work only after the caller validated its real captured
-    /// account/source. Publishing this claim does not admit a Git effect.
+    /// account/source, `scope`, which is what is admitted: a request that named other inputs
+    /// was made before they moved, and what it asked for is a refresh of the inputs there
+    /// are. Refused instead, it ended the pass failed and was asked again with the same
+    /// stale scope, pass after pass (0.200.0, each time a vault version rewrote the
+    /// catalog under a pass). Publishing this claim does not admit a Git effect.
     /// # Errors
-    /// The request changed source, counters exhausted, or the record write failed.
+    /// Counters exhausted, or the record write failed.
     pub fn admit(
         &self,
         request: RefreshRequest,
         scope: RefreshScope,
         now: u64,
     ) -> Result<Admission, String> {
-        if request.scope.is_some_and(|expected| expected != scope) {
-            return Err("repository refresh inputs changed before the request was admitted".into());
-        }
         let mut record = self.record.lock().unwrap_or_else(PoisonError::into_inner);
         let mut state = record.repositories.clone().unwrap_or_default();
         let changed = state.scope != Some(scope)
@@ -423,3 +424,7 @@ impl Job {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "repository_refresh_tests.rs"]
+mod tests;

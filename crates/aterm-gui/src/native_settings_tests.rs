@@ -12752,7 +12752,7 @@ fn search_result_groups_keep_their_identity_whatever_page_search_started_on() {
 }
 
 #[test]
-fn the_security_page_shows_this_mac_under_its_row() {
+fn the_security_page_shows_machine_settings_under_its_row() {
     use atpkg::machine::{HomePosture, UcPosture};
     let (mut runtime, instance, view) = setup();
     {
@@ -12807,7 +12807,7 @@ fn the_security_page_shows_this_mac_under_its_row() {
             .semantics
             .iter()
             .all(|node| !node.key.as_str().starts_with("settings/machine/heading")),
-        "one This Mac group, no second card"
+        "one Machine settings group, no second card"
     );
     let row = compiled
         .semantic(&UiKey::new(row_key.as_str()))
@@ -12820,8 +12820,12 @@ fn the_security_page_shows_this_mac_under_its_row() {
     let group = compiled
         .semantics
         .iter()
-        .find(|node| node.key.as_str().starts_with("settings/group/this-mac/"))
-        .expect("the This Mac group")
+        .find(|node| {
+            node.key
+                .as_str()
+                .starts_with("settings/group/machine-settings/")
+        })
+        .expect("the Machine settings group")
         .rect;
     assert!(status.y >= row.bottom(), "under the row");
     assert!(
@@ -29564,6 +29568,7 @@ fn settings_route_at(state: &SettingsViewState, cx: &ViewCx<'_>) -> crate::nativ
         &PackagesState::unobserved().projection(),
         &MessagesState::empty(),
         &HarnessState::unobserved().projection(),
+        &MachinePageState::default(),
         cx,
     )
     .compile(cx.viewport)
@@ -29601,6 +29606,7 @@ fn a_frame_that_changes_the_toolbars_listing_draws_what_the_next_draws() {
                 &PackagesState::unobserved().projection(),
                 &MessagesState::empty(),
                 &HarnessState::unobserved().projection(),
+                &MachinePageState::default(),
                 cx,
             )
             .compile(cx.viewport)
@@ -34712,6 +34718,7 @@ fn the_tab_color_wheel_reports_and_shows_keyboard_focus() {
         &PackagesState::unobserved().projection(),
         &MessagesState::empty(),
         &HarnessState::unobserved().projection(),
+        &MachinePageState::default(),
         &cx,
     );
     let wheel = UiKey::new("settings/color/active_tab_color/wheel");
@@ -36015,6 +36022,10 @@ mod harness;
 /// Settings ▸ Harness ▸ ai CLIs' page, with this module's fixtures and readers.
 #[path = "native_settings_ai_tests.rs"]
 mod ai;
+
+/// Settings ▸ This Mac's page, with this module's fixtures and readers.
+#[path = "native_settings_machine_tests.rs"]
+mod machine;
 
 /// The system pages at phone width and large text, with this module's fixtures and readers.
 #[path = "settings_narrow_tests.rs"]

@@ -40,15 +40,8 @@ pub(super) fn fixture() -> (
     let cli = aterm_agent::harness::worker::worker_cli(aterm_phase::Program::Codex).unwrap();
     let mut starter = cli.plain();
     starter.exe = alias;
-    let admitted = aterm_agent::harness::worker::admit(
-        cli,
-        starter,
-        Some(&home),
-        |_| true,
-        |_| None,
-        |_| Ok(()),
-    )
-    .unwrap();
+    let admitted =
+        aterm_agent::harness::worker::admit(cli, starter, |_| true, |_| None, |_| Ok(())).unwrap();
     let mut env = Env::from_process().unwrap();
     env.home = Some(home.clone());
     env.cwd = root.path().into();
@@ -60,7 +53,7 @@ pub(super) fn fixture() -> (
     let preparation = Preparation::with_context(
         host_registry.clone(),
         env,
-        "s-constructor-fixture".into(),
+        "tc0nstrvct0".into(),
         lifetime.enter().unwrap(),
     )
     .unwrap();
@@ -86,7 +79,7 @@ fn unobserved_constructor_outcome_revokes_only_unclaimed_permission() {
     let home = preparation.env.home.clone().unwrap();
     assert!(!exclusive(&home));
     let cli = aterm_agent::harness::worker::worker_cli(aterm_phase::Program::Codex).unwrap();
-    let admitted = preparation.arm(admitted, cli).unwrap();
+    let admitted = preparation.arm(admitted).unwrap();
     assert!(
         admitted
             .starter()
@@ -119,8 +112,7 @@ fn unobserved_constructor_outcome_revokes_only_unclaimed_permission() {
 fn observed_write_retains_native_reservation_after_launcher_returns() {
     let (_root, mut preparation, admitted, _host_registry, _lifetime) = fixture();
     let home = preparation.env.home.clone().unwrap();
-    let cli = aterm_agent::harness::worker::worker_cli(aterm_phase::Program::Codex).unwrap();
-    let admitted = preparation.arm(admitted, cli).unwrap();
+    let admitted = preparation.arm(admitted).unwrap();
     preparation.typed().unwrap();
     assert!(preparation.check(&admitted).is_err());
     let reservation = preparation.reservation.take().unwrap();
@@ -143,16 +135,9 @@ fn unsupported_legacy_constructor_never_adopts_native_owned_source() {
         .env
         .push(("CODEX_AUTH_PATH".into(), custom.to_str().unwrap().into()));
     starter.unset.extend(["CODEX_AUTH_SLOT", "CODEX_HOME"]);
-    let admitted = aterm_agent::harness::worker::admit(
-        cli,
-        starter,
-        preparation.env.home.as_deref(),
-        |_| true,
-        |_| None,
-        |_| Ok(()),
-    )
-    .unwrap();
-    let admitted = preparation.arm(admitted, cli).unwrap();
+    let admitted =
+        aterm_agent::harness::worker::admit(cli, starter, |_| true, |_| None, |_| Ok(())).unwrap();
+    let admitted = preparation.arm(admitted).unwrap();
     assert!(preparation.reservation.is_none());
     assert!(
         !admitted
@@ -165,15 +150,38 @@ fn unsupported_legacy_constructor_never_adopts_native_owned_source() {
     let marker = PathBuf::from(format!("{}.aterm-owner", custom.display()));
     std::fs::write(&marker, b"malformed-is-still-owned").unwrap();
     assert!(preparation.check(&admitted).is_err());
-    assert!(preparation.arm(admitted.clone(), cli).is_err());
+    let refused = preparation.arm(admitted.clone()).unwrap_err();
+    assert_eq!(
+        refused,
+        Refused::Preparation("this Codex build cannot read the native-owned source".into())
+    );
+    preparation_not_signin(&refused);
     std::fs::remove_file(&marker).unwrap();
     let (slot, ()) = admitted
-        .prepare(cli, preparation.env.home.as_deref(), |mut starter| {
+        .prepare(|mut starter| {
             starter
                 .env
                 .push(("CODEX_AUTH_SLOT".into(), "native-slot-declaration".into()));
             Ok((starter, ()))
         })
         .unwrap();
-    assert!(preparation.arm(slot, cli).is_err());
+    preparation_not_signin(&preparation.arm(slot).unwrap_err());
+}
+
+/// A CONSTRUCTOR THAT CANNOT BE ARMED IS A PREPARATION'S FAILURE, NOT A SIGN-OUT: its task reads
+/// `stalled why=startup` with the constructor's own words, and no person is asked to sign in.
+/// NEGATIVE CONTROL: the launcher mapped every such failure to `Refused::SignedOut`, which read
+/// `why=signin` and "signed out, a person must sign in".
+fn preparation_not_signin(refused: &Refused) {
+    assert!(matches!(refused, Refused::Preparation(_)), "{refused:?}");
+    assert_eq!(crate::task_launch::refused_why(refused), "startup");
+    assert_ne!(
+        crate::task_launch::refused_why(refused),
+        crate::task_record::WHY_SIGNIN
+    );
+    assert_eq!(
+        refused.short(),
+        refused.why(),
+        "its own words, not a sign-in"
+    );
 }

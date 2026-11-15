@@ -56,11 +56,43 @@ pub(super) struct Fact {
     pub(super) meaning: Meaning,
 }
 
-/// Current meaning and the frontier that actually selected it. An authenticated envelope
-/// fallback has no selected log; an unavailable selection never constructs this reading.
+/// Whether the current selection is the one `state` says was applied, and the frontier that
+/// actually selected it. An authenticated envelope fallback has no selected log; an unavailable
+/// selection never constructs this reading.
+#[derive(Clone, Copy)]
 pub(super) struct Current {
-    pub(super) meaning: Meaning,
+    /// The current selection's [`Meaning`] is `state`'s `materialization_selection`.
+    pub(super) applied: bool,
     pub(super) records: Option<[u8; 32]>,
+}
+
+/// What a kept [`Current`] was read for beside the files its memo stamps
+/// ([`vault_memo::selection_now`]): the configuration and the fields of the caller's `state` a
+/// selection reads, which a caller may hold ahead of `state.toml`. The applied meaning is the
+/// commitment `state.toml` itself keeps, never one this read derived.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Basis {
+    config: Config,
+    sequence: u64,
+    envelope: Option<[u8; 32]>,
+    records: Option<[u8; 32]>,
+    source: Option<[u8; 32]>,
+    membership: Stored,
+    applied: Option<Meaning>,
+}
+
+impl Basis {
+    fn of(config: &Config, state: &State) -> Self {
+        Self {
+            config: config.clone(),
+            sequence: state.seq,
+            envelope: state.digest,
+            records: state.records_digest,
+            source: state.source_identity,
+            membership: state.membership,
+            applied: state.materialization_selection,
+        }
+    }
 }
 
 struct Selected {
@@ -147,22 +179,36 @@ fn selected(paths: &Paths, config: &Config, state: &State) -> crate::Result<Opti
     })
 }
 
+/// The current selection as [`Current`] reads it. A signed vault's is kept
+/// ([`vault_memo::selection_now`]) under the stamps of the files it is read from, `state.toml` by
+/// what it holds but `heard` and the rounds' receipts, and the caller's [`Basis`]: a pass asks it
+/// at each of its checks (the selection due, the files intact, the cached log's progress) and,
+/// read each time, each ask opened, hashed and wiped every counted `Put` and `Delete` of the log
+/// (ATERM-KI-1113-902). What is kept is one bit and the records' heads digest: no entry, value or
+/// [`Meaning`] read from the log. A plain vault's source file is outside those stamps and is read
+/// each time.
 pub(super) fn current(paths: &Paths, state: &State) -> crate::Result<Option<Current>> {
-    let before = vault_memo::selection_inputs(paths);
     let Some(config) = config(paths)? else {
         return Ok(None);
     };
-    let selected = selected(paths, &config, state)?;
-    if before
-        .as_ref()
-        .is_some_and(|before| vault_memo::selection_inputs(paths).as_ref() != Some(before))
-    {
-        return Ok(None);
+    let read = |paths: &Paths| {
+        let before = vault_memo::selection_inputs(paths);
+        let selected = selected(paths, &config, state)?;
+        if before
+            .as_ref()
+            .is_some_and(|before| vault_memo::selection_inputs(paths).as_ref() != Some(before))
+        {
+            return Ok(None);
+        }
+        Ok(selected.map(|selected| Current {
+            applied: state.materialization_selection == Some(Meaning::of(&selected.entries)),
+            records: selected.records,
+        }))
+    };
+    if config.signer.is_none() {
+        return read(paths);
     }
-    Ok(selected.map(|selected| Current {
-        meaning: Meaning::of(&selected.entries),
-        records: selected.records,
-    }))
+    vault_memo::selection_now(paths, &Basis::of(&config, state), read)
 }
 
 /// A prior fact is reused only under a current shared state observation and identical source,

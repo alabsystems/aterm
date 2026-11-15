@@ -352,8 +352,8 @@ fn a_tally_round_in_an_unknown_wait_format_is_refused() {
     }
 }
 
-/// The committed baseline holds every key the lane's worlds report and no other, each inside
-/// its law.
+/// The committed baseline holds every key the lane's worlds report but the floors', and no
+/// other, each inside its law.
 #[test]
 fn the_committed_baseline_holds_every_expected_key_inside_its_law() {
     let path = super::super::floors::golden_dir().join(BASELINE_FILE);
@@ -365,15 +365,19 @@ fn the_committed_baseline_holds_every_expected_key_inside_its_law() {
         .filter(|k| *k != "_comment")
         .collect();
     keys.sort();
-    let mut want = expected();
+    let mut want: Vec<String> = expected()
+        .into_iter()
+        .filter(|k| !k.contains("_pages_passed") && !k.contains("_cold_reads_least"))
+        .collect();
     want.sort();
     assert_eq!(keys, want.iter().collect::<Vec<_>>());
     for n in ATTACH {
         let n = u64::from(n);
         let at = |key: String| baseline.get(&key).and_then(Value::as_u64).expect("a count");
         assert_eq!(at(format!("attach_{n}_lane_meta")), 0);
-        assert!(at(format!("restart_{n}_cold_reads_first")) < 2 * n);
-        assert!(at(format!("restart_{n}_cold_reads_later")) < n);
+        let wanted = u64::from(WANTED) * n;
+        assert!(at(format!("restart_{n}_cold_reads_first")) < 2 * n + wanted);
+        assert!(at(format!("restart_{n}_cold_reads_later")) < n + wanted);
     }
 }
 
@@ -399,4 +403,158 @@ fn spec_words_and_groups_read_as_the_bench_writes_them() {
     assert_eq!(spec_word(&report, "broker_process"), None);
     assert_eq!(attach_sessions("attach, 32 session(s)"), Some(32));
     assert_eq!(attach_sessions("handoff, 2 session(s)"), None);
+}
+
+/// The attach backlog shape for F11c: a backlog of `BACKLOG` records with one wanted note to
+/// every session, and each population's pages passed in each restart.
+fn pages_report(at_8: &[u64], at_32: &[u64]) -> Value {
+    let tiers = |passed: &[u64]| {
+        passed
+            .iter()
+            .map(|p| aterm_json::json!({"walks": 3, "rows": 40, "passed_pages": *p}))
+            .collect::<Vec<_>>()
+    };
+    aterm_json::json!({
+        "attach": {
+            "backlog": {
+                "records": BACKLOG,
+                "wanted_per_session": 1,
+                "sizes": [
+                    {"sessions": 8, "tier_per_restart": tiers(at_8)},
+                    {"sessions": 32, "tier_per_restart": tiers(at_32)},
+                ],
+            },
+        },
+    })
+}
+
+/// F11c's skip is a floor: the fewest pages any restart passed whole is held to the backlog's
+/// whole pages less one and one a wanted note (100,008 / 256 = 390, so 381 at 8 sessions, and
+/// 100,032 / 256 = 390, so 357 at 32, below the 393-395 and 370-376 three runs of the lane read in a later restart). A
+/// refill that lost `Tier::passing`'s skip passes none and fails (the negative control), and so
+/// does one that passes some pages but not the backlog's (a skip that stopped at one fetch). No
+/// baseline holds the count, a recording writes none, and a build that counts nothing yields
+/// none.
+#[test]
+fn the_judge_holds_f11cs_pages_passed_from_below() {
+    assert_eq!(pages_floor(u64::from(BACKLOG), 8), 381);
+    assert_eq!(pages_floor(u64::from(BACKLOG), 32), 357);
+    assert_eq!(pages_floor(0, 0), 1);
+    let held = counts(&pages_report(&[782, 393], &[699, 370])).expect("reads");
+    assert_eq!(value_of(&held, "restart_8_pages_passed"), 393);
+    assert_eq!(value_of(&held, "restart_32_pages_passed"), 370);
+    assert_eq!(judge(&held, None).status, Status::Pass);
+
+    let lost = counts(&pages_report(&[0, 0], &[200, 357])).expect("reads");
+    let failed = findings(&judge(&lost, None));
+    assert_eq!(failed.len(), 2, "{failed:?}");
+    assert!(
+        failed[0].contains("restart_8_pages_passed 0 < 381") && failed[0].contains("F11c"),
+        "{failed:?}"
+    );
+    assert!(
+        failed[1].contains("restart_32_pages_passed 200 < 357"),
+        "{failed:?}"
+    );
+
+    let baseline: Value =
+        aterm_json::from_str("{\"restart_8_pages_passed\": 999}").expect("parses");
+    assert_eq!(judge(&held, Some(&baseline)).status, Status::Pass);
+    assert!(!baseline_json(&held).contains("pages_passed"));
+
+    let uncounted: Value = aterm_json::from_str(
+        "{\"attach\": {\"backlog\": {\"sizes\": [{\"sessions\": 8, \"tier_per_restart\": \
+         [null, null]}]}}}",
+    )
+    .expect("parses");
+    assert_eq!(counts(&uncounted).expect("reads"), Vec::new());
+    let shapeless: Value = aterm_json::from_str(
+        "{\"attach\": {\"backlog\": {\"records\": 1, \"sizes\": [{\"sessions\": 8, \
+         \"tier_per_restart\": [{\"walks\": 1}]}]}}}",
+    )
+    .expect("parses");
+    assert!(counts(&shapeless).unwrap_err().contains("passed_pages"));
+}
+
+/// The attach backlog object of `report`.
+fn backlog_mut(report: &mut Value) -> &mut aterm_json::Map {
+    report
+        .as_object_mut()
+        .and_then(|r| r.get_mut("attach"))
+        .and_then(Value::as_object_mut)
+        .and_then(|a| a.get_mut("backlog"))
+        .and_then(Value::as_object_mut)
+        .expect("a backlog")
+}
+
+/// With K wanted notes to every session among the backlog, each cold-read bound grows by the
+/// K × N the refill reads again cold, and the fewest any restart read is held from below by
+/// them: a restart that stopped reading the notes cold fails instead of passing as a ratchet. A
+/// report whose log took no more past the newest note, where the notes really landed, than the
+/// resident window holds is refused, and so is one that does not say: those notes would not be
+/// cold.
+#[test]
+fn wanted_mail_widens_the_cold_bounds_by_its_notes_and_must_be_cold() {
+    let mut report = cold_report();
+    let backlog = backlog_mut(&mut report);
+    backlog.insert("wanted_per_session".to_string(), Value::from(1u64));
+    backlog.insert(
+        "sizes".to_string(),
+        aterm_json::json!([
+            {"sessions": 8, "cold_reads_per_restart": [23, 15, 15], "wanted_past_records": 95_000},
+            {"sessions": 32, "cold_reads_per_restart": [95, 63, 63], "wanted_past_records": 80_000},
+        ]),
+    );
+    let held = counts(&report).expect("reads");
+    let bound = |key: &str| {
+        held.iter()
+            .find(|c| c.key == key)
+            .unwrap_or_else(|| panic!("no {key}"))
+            .bound
+    };
+    assert_eq!(bound("restart_8_cold_reads_first"), 15 + 8);
+    assert_eq!(bound("restart_8_cold_reads_later"), 7 + 8);
+    assert_eq!(bound("restart_32_cold_reads_first"), 63 + 32);
+    assert_eq!(bound("restart_32_cold_reads_later"), 31 + 32);
+    assert_eq!(bound("restart_8_cold_reads_least"), 8);
+    assert_eq!(bound("restart_32_cold_reads_least"), 32);
+    assert_eq!(value_of(&held, "restart_8_cold_reads_least"), 15);
+    assert_eq!(judge(&held, None).status, Status::Pass);
+    assert!(!baseline_json(&held).contains("cold_reads_least"));
+    assert_eq!(cold_path_reached(&report), Ok(()));
+
+    // The notes stopped being read cold in a later restart: 7 is under the later bound and a
+    // baseline of 15, and fails the floor of the 8 notes.
+    let sizes = |at_8: [u64; 3], past_32: Value| {
+        aterm_json::json!([
+            {"sessions": 8, "cold_reads_per_restart": at_8, "wanted_past_records": 95_000},
+            {"sessions": 32, "cold_reads_per_restart": [95, 63, 63], "wanted_past_records": past_32},
+        ])
+    };
+    backlog_mut(&mut report).insert("sizes".to_string(), sizes([23, 7, 15], 80_000.into()));
+    let lost = counts(&report).expect("reads");
+    let baseline: Value =
+        aterm_json::from_str("{\"restart_8_cold_reads_later\": 15}").expect("parses");
+    let failed = findings(&judge(&lost, Some(&baseline)));
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].contains("restart_8_cold_reads_least 7 < 8") && failed[0].contains("F11c"),
+        "{failed:?}"
+    );
+
+    // 78,766 records of 213 B fill the 16 MiB window: the notes landed resident.
+    backlog_mut(&mut report).insert("sizes".to_string(), sizes([23, 15, 15], 78_766.into()));
+    let why = cold_path_reached(&report).unwrap_err();
+    assert!(
+        why.starts_with("32 sessions:") && why.contains("no restart reads the wanted mail cold"),
+        "{why}"
+    );
+    backlog_mut(&mut report).insert("sizes".to_string(), sizes([23, 15, 15], 78_767.into()));
+    assert_eq!(cold_path_reached(&report), Ok(()));
+    backlog_mut(&mut report).insert("sizes".to_string(), sizes([23, 15, 15], Value::Null));
+    assert!(
+        cold_path_reached(&report)
+            .unwrap_err()
+            .contains("names no records past it")
+    );
 }

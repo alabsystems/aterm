@@ -481,42 +481,57 @@ fn model_under_ty(ty: &Path, all: &[Model]) -> (Vec<String>, usize) {
             };
             let (held, evidence) = verify::ty_check_derived(ty, &at, &at.to_cfg(), LABEL);
             compared += 1;
-            match (interpreted, held) {
-                (Ok(states), true) => {
-                    let explored = verify::ty_states_explored(&evidence);
-                    if explored != Some(states as u64) {
-                        findings.push(format!(
-                            "{label} at Buggy={dial}: ty explored {explored:?} states, the \
-                             interpreter {states}: one tier's proof is about a space the other \
-                             never saw\n{evidence}"
-                        ));
-                    }
-                }
-                (Err((state, inv)), false) if dial == 0 => findings.push(format!(
-                    "{label}: both tiers find `{inv}` violated with no mutant on, at \
-                     {state:?}\n{evidence}"
-                )),
-                (Err((state, inv)), false) => {
-                    let named = verify::ty_violated_law(&evidence);
-                    if !at.invariants.iter().any(|law| Some(law.name) == named) {
-                        findings.push(format!(
-                            "{label} at Buggy={dial}: ty failed without refuting a law, where \
-                             the interpreter refutes `{inv}` at {state:?}\n{evidence}"
-                        ));
-                    }
-                }
-                (Ok(states), false) => findings.push(format!(
-                    "{label} at Buggy={dial}: ty refutes what the interpreter proves over \
-                     {states} states\n{evidence}"
-                )),
-                (Err((state, inv)), true) => findings.push(format!(
-                    "{label} at Buggy={dial}: ty proves what the interpreter refutes (`{inv}` \
-                     at {state:?}) — a false proof\n{evidence}"
-                )),
+            if let Some(finding) =
+                model_verdict_finding(&at, &label, dial, interpreted, held, &evidence)
+            {
+                findings.push(finding);
             }
         }
     }
     (findings, compared)
+}
+
+fn model_verdict_finding(
+    at: &Model,
+    label: &str,
+    dial: i64,
+    interpreted: Result<usize, (interp::State, &'static str)>,
+    held: bool,
+    evidence: &str,
+) -> Option<String> {
+    match (interpreted, held) {
+        (Ok(states), true) => {
+            let explored = verify::ty_states_explored(evidence);
+            (explored != Some(states as u64)).then(|| {
+                format!(
+                    "{label} at Buggy={dial}: ty explored {explored:?} states, the \
+                     interpreter {states}: one tier's proof is about a space the other \
+                     never saw\n{evidence}"
+                )
+            })
+        }
+        (Err((state, inv)), false) if dial == 0 => Some(format!(
+            "{label}: both tiers find `{inv}` violated with no mutant on, at \
+             {state:?}\n{evidence}"
+        )),
+        (Err((state, inv)), false) => {
+            let named = verify::ty_violated_law(evidence);
+            (!at.invariants.iter().any(|law| Some(law.name) == named)).then(|| {
+                format!(
+                    "{label} at Buggy={dial}: ty failed without refuting a law, where \
+                     the interpreter refutes `{inv}` at {state:?}\n{evidence}"
+                )
+            })
+        }
+        (Ok(states), false) => Some(format!(
+            "{label} at Buggy={dial}: ty refutes what the interpreter proves over \
+             {states} states\n{evidence}"
+        )),
+        (Err((state, inv)), true) => Some(format!(
+            "{label} at Buggy={dial}: ty proves what the interpreter refutes (`{inv}` \
+             at {state:?}) — a false proof\n{evidence}"
+        )),
+    }
 }
 
 fn function_valued_under_ty(ty: &Path, all: &[Model]) -> (Vec<String>, usize) {

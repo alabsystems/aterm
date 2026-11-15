@@ -14,6 +14,12 @@ mod publication;
 #[path = "codex_rotation_canary_tests.rs"]
 mod canary_ownership;
 
+#[path = "codex_rotation_session_tests.rs"]
+mod session_scope;
+
+#[path = "codex_login_rotation_tests.rs"]
+mod login_rotation;
+
 struct Reader {
     calls: RefCell<Vec<PathBuf>>,
     answers: BTreeMap<PathBuf, IdentifiedUsage>,

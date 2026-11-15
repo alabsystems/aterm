@@ -6,6 +6,7 @@ use crate::restore::{RestoredSplitTree, TerminalLeafRestore};
 
 fn terminal(label: &str) -> RestoredView {
     RestoredView::Terminal(TerminalLeafRestore {
+        pinned: false,
         sid: None,
         lineage: None,
         log_ep: None,
@@ -184,7 +185,7 @@ fn dual_ledgers_tier1_conform_and_reject_double_record_negative_control() {
 
     let (before_view, after_view) = step(&mut app, "CloseView", &close_leaf);
     step(&mut app, "ReopenView", &|app| {
-        app.reopen_last_closed_view().unwrap();
+        app.reopen_closed_view_and_wait_for_test().unwrap();
     });
     step(&mut app, "CloseView", &close_leaf);
     step(&mut app, "CloseTab", &close_tab);
@@ -200,19 +201,19 @@ fn dual_ledgers_tier1_conform_and_reject_double_record_negative_control() {
     let (before_full_tab, at_tab_cap) = step(&mut app, "CloseTab", &close_tab);
     assert_eq!(at_tab_cap["tab_ledger"], 3);
     let (_, reopened_tab) = step(&mut app, "ReopenTab", &|app| {
-        app.reopen_last_closed_tab().unwrap();
+        app.reopen_closed_tab_and_wait_for_test().unwrap();
     });
 
     let views = app.closed_recovery.views.len();
     let tabs = app.closed_recovery.tabs.len();
     app.windows.clear();
     app.frontmost_window = None;
-    assert!(app.reopen_last_closed_view().is_err());
+    assert!(app.reopen_closed_view_and_wait_for_test().is_err());
     assert_eq!(app.closed_recovery.views.len(), views);
     let mut after_view_failure = reopened_tab.clone();
     after_view_failure.insert("failures", 1);
     assert_step(&model, &reopened_tab, &after_view_failure, "FailView");
-    assert!(app.reopen_last_closed_tab().is_err());
+    assert!(app.reopen_closed_tab_and_wait_for_test().is_err());
     assert_eq!(app.closed_recovery.tabs.len(), tabs);
     let mut after_tab_failure = after_view_failure.clone();
     after_tab_failure.insert("failures", 2);

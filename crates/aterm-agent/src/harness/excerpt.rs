@@ -5,7 +5,7 @@
 
 use aterm_json::Value;
 
-use crate::supervise::policy::turn_end::without_finished_lines;
+use alab_policy::words::without_finished_lines;
 
 /// The most bytes one excerpt keeps (`…` included when it was cut).
 pub const EXCERPT_BYTES: usize = 400;

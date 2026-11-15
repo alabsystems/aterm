@@ -6,7 +6,7 @@
 
 use super::super::{
     Input, Mode, Plan, Sheet, SheetKind, Step, covered, dump_sheets, plan_cells as plan,
-    tests::{SEALER, Stand, logins, vault},
+    tests::{Stand, logins, store, vault},
 };
 use super::*;
 use crate::{
@@ -32,7 +32,7 @@ fn input<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac]) -> Input<'a> {
         sheets,
         macs,
         vendors: &Stand,
-        sealer: &SEALER,
+        store: store(),
         now_ms: 1_800_000_000_000,
         births: Births::Named,
         unread: &[],

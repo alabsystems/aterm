@@ -188,7 +188,7 @@ fn constructor_quota_borrows_only_its_actual_scope_and_gate_incarnation() {
     registry.state.lock().unwrap().launches.insert(
         token.clone(),
         Launch {
-            sid: "s-quota-constructor-fixture".into(),
+            sid: "t00000qv0ta".into(),
             image: process.image.clone(),
             expected_env: Vec::new(),
             expected_unset: Vec::new(),
@@ -237,7 +237,7 @@ fn revoking_unclaimed_typed_permission_releases_gate_but_not_claimed_process() {
         registry.state.lock().unwrap().launches.insert(
             token.into(),
             Launch {
-                sid: "s-revocation-fixture".into(),
+                sid: "trev0catj0n".into(),
                 image: process.image.clone(),
                 expected_env: Vec::new(),
                 expected_unset: Vec::new(),
@@ -285,7 +285,7 @@ fn unrelated_completion_retires_constructor_without_minting_a_source() {
     let home = aterm_tempfile::tempdir().unwrap();
     let process = Process::observe(std::process::id()).unwrap();
     let caller = slot::Caller {
-        sid: "s-unrelated-fixture".into(),
+        sid: "t0vnre1ated".into(),
         pid: process.pid,
         birth: process.birth,
     };
@@ -413,7 +413,7 @@ fn app_pause_revokes_only_cancelled_unclaimed_permissions_and_bind_transfers_sco
     let lifetime = super::super::account_work::Lifetime::default();
     let registry = Registry::default();
     let launch = |scope| Launch {
-        sid: "s-drain-fixture".into(),
+        sid: "t00000drajn".into(),
         image: process.image.clone(),
         expected_env: Vec::new(),
         expected_unset: Vec::new(),
@@ -486,7 +486,7 @@ fn orderly_allocation_retirement_is_bounded_and_never_reuses_member_ids() {
     // image plus the actual PTY/constructor; this uses our real kernel PID.
     let process = Process::observe(std::process::id()).unwrap();
     let caller = slot::Caller {
-        sid: "s-allocation-fixture".into(),
+        sid: "ta110catj0n".into(),
         pid: process.pid,
         birth: process.birth,
     };

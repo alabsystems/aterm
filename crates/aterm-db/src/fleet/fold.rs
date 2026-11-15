@@ -728,6 +728,7 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
                     usage_7d_pct: agent.usage_7d_pct,
                     account,
                     model: agent.model.clone(),
+                    pinned: agent.pinned,
                     read_at_ms: answered.at_ms,
                     how,
                     proven,

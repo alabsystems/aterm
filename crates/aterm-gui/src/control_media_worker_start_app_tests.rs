@@ -22,6 +22,7 @@ fn worker() -> WorkerStart {
             task: b"the task".to_vec(),
             agent: aterm_phase::Program::Claude,
             model: None,
+            effort: None,
             caller: None,
             manager_node: None,
             trusted_cwd: None,
@@ -62,46 +63,6 @@ fn supervising_app() -> App {
     app.session_factory.integrate = true;
     app.session_factory.shell_override = Some("/bin/zsh".to_string());
     app
-}
-
-/// `spawn agent=grok` IS REFUSED, BEFORE ANY TAB OPENS, WHILE NO READER SEES GROK BUILD'S
-/// TURN END: its task could never be marked done and `await task` would never wake, so the
-/// reply says why (fail closed) instead of starting a worker nobody can see end. Muse Code,
-/// whose turn end aterm reads, passes the same check in the same app (the control). The test
-/// does not follow `Program::supervisable`: flipping it for Grok Build lifts this refusal, so
-/// the flip turns this red and is made on purpose
-/// (`docs/DESIGN-harness-repos-2026-10-24.md` D40).
-#[test]
-fn a_grok_worker_is_refused_while_its_turn_end_is_unseen() {
-    use super::{SpawnAim, WorkerBlock};
-    let app = supervising_app();
-    assert!(
-        app.worker_shell(aterm_phase::Program::Muse).is_ok(),
-        "PRECONDITION: this app starts a supervised agent's worker"
-    );
-    let block = app.worker_shell(aterm_phase::Program::Grok).expect_err(
-        "refused: lifting this is a deliberate change that reads Grok Build's turn end and \
-         keeps WorkerCli::signed_out on the sign-in gate (D40)",
-    );
-    assert!(
-        matches!(&block, WorkerBlock::Unseen(why) if why.contains("Grok Build")),
-        "{block:?}"
-    );
-    let refusal = block.refusal("agent=grok");
-    assert!(refusal.starts_with("spawn agent=grok: "), "{refusal}");
-    assert!(refusal.contains("await task"), "{refusal}");
-    let order = TaskOrder::of_frame(
-        Some(b"the task".to_vec()),
-        aterm_phase::Program::Grok,
-        None,
-        None,
-        None,
-    )
-    .expect("a well-formed order");
-    let Err(why) = app.resolve_spawn(SpawnAim::Front, Some(order)) else {
-        panic!("a Grok Build worker was planned");
-    };
-    assert_eq!(why, refusal);
 }
 
 /// A PROGRAM WORKER NEEDS THE WINDOW HARNESS AND SHELL INTEGRATION, NOT AN AGENT'S SWITCHES:
@@ -182,54 +143,6 @@ fn a_program_worker_is_checked_for_its_harness_and_shell_alone() {
     );
     app.harness = None;
     assert_eq!(app.program_shell().err(), Some(WorkerBlock::Unhosted));
-}
-
-#[test]
-fn a_grok_worker_is_refused_as_grok_before_this_macs_harness_is_asked() {
-    use super::{SpawnAim, WorkerBlock};
-    let unsupervised: [fn(&mut App); 3] = [
-        |app| app.harness = None,
-        |app| {
-            app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-                crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
-            );
-        },
-        |app| {
-            app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-                crate::app_config::HarnessPolicy::read(
-                    "[harness]\nenabled = true\nheadless = true\nautopilot = \"off\"\n",
-                ),
-            );
-        },
-    ];
-    for turn_off in unsupervised {
-        let mut app = supervising_app();
-        turn_off(&mut app);
-        let muse = app.worker_shell(aterm_phase::Program::Muse);
-        assert!(
-            matches!(
-                muse,
-                Err(WorkerBlock::Unhosted | WorkerBlock::Unsupervised(_))
-            ),
-            "PRECONDITION: this Mac supervises no worker: {muse:?}"
-        );
-        let block = app
-            .worker_shell(aterm_phase::Program::Grok)
-            .expect_err("refused");
-        assert!(matches!(block, WorkerBlock::Unseen(_)), "{block:?}");
-        let order = TaskOrder::of_frame(
-            Some(b"the task".to_vec()),
-            aterm_phase::Program::Grok,
-            None,
-            None,
-            None,
-        )
-        .expect("a well-formed order");
-        let Err(why) = app.resolve_spawn(SpawnAim::Front, Some(order)) else {
-            panic!("a Grok Build worker was planned");
-        };
-        assert!(why.starts_with("spawn agent=grok: "), "{why}");
-    }
 }
 
 fn sid_of(app: &App, local: u64) -> String {
@@ -320,6 +233,66 @@ fn a_started_workers_record_keeps_its_managers_mac_only_for_a_manager_not_here()
     });
 }
 
+/// A SPAWNED AGENT WORKER'S RECORD KEEPS ITS TASK'S FIRST LINE (tracker ST-02): the first line of
+/// the task as the spawn gave it that draws something, never the fact line aterm ends its task
+/// file with, so its tab is named by it once the file is gone. CONTROL: a program worker's task
+/// is its program's input, and its record keeps no line.
+#[test]
+fn a_spawned_agent_worker_keeps_its_tasks_first_line_and_a_program_worker_none() {
+    use crate::app_workers_tests::land_worker;
+    let mut app = App::headless_for_test();
+    let host = crate::harness_host::HostHandle::for_supervised_test(
+        Vec::new(),
+        Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+    );
+    app.harness = Some(host.clone());
+    let started = |app: &mut App, local: u64, ask: WorkerStart| {
+        let sid = sid_of(app, local);
+        let seed = ask.seed();
+        drop(app.ready_worker(&sid, ask, seed).expect("a worker"));
+    };
+    let line = |app: &App, local: u64| {
+        ctx_of(app, local)
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .task()
+            .expect("its record")
+            .line
+            .clone()
+    };
+
+    let plain = land_worker(&mut app);
+    started(&mut app, plain, worker());
+    assert_eq!(line(&app, plain).as_deref(), Some("the task"));
+
+    let lines = land_worker(&mut app);
+    let mut ask = worker();
+    ask.order.task = b"\n\n  Fix the flaky title test\nthen run verify".to_vec();
+    started(&mut app, lines, ask);
+    assert_eq!(
+        line(&app, lines).as_deref(),
+        Some("Fix the flaky title test"),
+        "the first line that draws, trimmed, without the rest"
+    );
+
+    let bench = land_worker(&mut app);
+    let mut ask = worker();
+    ask.order = TaskOrder::of_program_frame(
+        Some(b"exit 3".to_vec()),
+        crate::program_worker::ProgramRun {
+            program: "/opt/lab/bench".to_owned(),
+            args: Vec::new(),
+        },
+        None,
+        None,
+    )
+    .expect("a well-formed order");
+    started(&mut app, bench, ask);
+    assert_eq!(line(&app, bench), None, "CONTROL: a program worker's");
+    host.shutdown_and_join();
+}
+
 /// A PROGRAM WORKER'S TAB IS NAMED BY ITS PROGRAM WHILE ITS SHELL TITLES IT: its shell titles
 /// the tab by its folder at a prompt and by the line its launcher typed, which quotes the
 /// program's path and words (and, for a store binary, opens with its shim's environment
@@ -328,14 +301,15 @@ fn a_started_workers_record_keeps_its_managers_mac_only_for_a_manager_not_here()
 /// and a worker whose line never ran had the row `the program`. Each names it by its
 /// `program=`'s file name now, a busy terminal's as the strip last read it, never by its words,
 /// its environment words or its folder. CONTROLS: a title its program gives the tab names it
-/// while it stands; an agent's worker is named by its agent, and a program worker kept as a tab
-/// and a person's tab running the same line by that line, as their chips read.
+/// while it stands; an agent's worker is named by its task's first line (tracker ST-02), and a
+/// program worker kept as a tab and a person's tab running the same line by that line, as their
+/// chips read.
 #[test]
 fn a_program_workers_tab_is_named_by_its_program_while_its_shell_titles_it() {
     use crate::app_workers_tests::{land_worker, line_starts, prompt_in};
     use crate::program_worker::ProgramRun;
     use crate::task_record::{TaskMark, mark_session_task};
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let mut app = App::headless_for_test();
     let host = crate::harness_host::HostHandle::for_supervised_test(
         Vec::new(),
@@ -491,8 +465,8 @@ fn a_program_workers_tab_is_named_by_its_program_while_its_shell_titles_it() {
     );
     assert_eq!(
         app.tab_label_of_session(claude),
-        "Claude Code",
-        "CONTROL: an agent's worker is named by its agent"
+        "the task",
+        "CONTROL: an agent's worker is named by its task's first line"
     );
 
     let kept = land_worker(&mut app);
@@ -816,7 +790,7 @@ fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
     if !crate::test_alone::alone() {
         return;
     }
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let state = aterm_tempfile::Builder::new()
         .prefix("aterm-worker-word")
         .tempdir()
@@ -831,6 +805,11 @@ fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
             (4, "agent=agy len=8", Autopilot::Land),
             (5, "agent=muse len=8", Autopilot::Land),
             (6, "agent=codex autopilot=cruise len=8", Autopilot::Cruise),
+            (
+                7,
+                "agent=codex model=gpt-6.1-sol effort=ultra len=8",
+                Autopilot::Land,
+            ),
         ] {
             app.push_stub_tab(wid, crate::stub_session(local));
             let Ok(super::SpawnForm::Plain {
@@ -838,6 +817,7 @@ fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
                     Some(super::AgentSpec::Worker {
                         agent,
                         model,
+                        effort,
                         autopilot,
                         from,
                     }),
@@ -851,6 +831,7 @@ fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
                 Some(b"the task".to_vec()),
                 agent,
                 model,
+                effort,
                 autopilot,
                 from,
                 cwd.as_deref(),
@@ -867,6 +848,11 @@ fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
             );
             let pending = app.ready_worker(&sid, start, seed).expect("a worker");
             assert_eq!(pending.launch.agent, agent, "{args}: the line's agent");
+            assert_eq!(
+                pending.launch.effort.as_deref(),
+                args.contains("effort=ultra").then_some("ultra"),
+                "{args}: the native effort reaches the launcher"
+            );
             assert_eq!(
                 ctx_of(&app, local).meta.lock().unwrap().autopilot_word(),
                 Some(word),
@@ -886,9 +872,9 @@ fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
                 "{args}: the agent its startup is read by"
             );
         }
-        app.push_stub_tab(wid, crate::stub_session(7));
+        app.push_stub_tab(wid, crate::stub_session(8));
         assert_eq!(
-            ctx_of(&app, 7)
+            ctx_of(&app, 8)
                 .timeline
                 .lock()
                 .unwrap()
@@ -1175,37 +1161,38 @@ fn a_refused_admission_names_its_member_and_cause_under_its_own_why() {
             crate::task_record::mark_session_task(&ctx, 1, &crate::task_record::TaskMark::new(to))
                 .expect("unfenced");
         };
-        let refuse = |refused: Refused| {
+        let refuse = |agent: aterm_phase::Program, refused: Refused| {
             let taken = crate::task_launch::take_admission(
                 &ctx,
                 1,
-                aterm_phase::Program::Codex,
+                agent,
                 Err::<(aterm_agent::harness::worker::Admitted, ()), _>(refused),
                 None,
                 || Some("m22".to_owned()),
             );
             assert!(taken.is_none(), "a refused worker goes no further");
         };
+        let (agy, codex) = (aterm_phase::Program::Agy, aterm_phase::Program::Codex);
 
         mark(TaskState::Done);
-        refuse(Refused::SignedOut("signed out".to_owned()));
+        refuse(agy, Refused::SignedOut("signed out".to_owned()));
         assert_eq!(
             attention(),
             None,
             "CONTROL: a record that moved on raises nothing"
         );
 
-        for (refused, why, cause) in [
+        for (agent, refused, why, cause) in [
             (
+                agy,
                 Refused::SignedOut(
-                    "Grok Build is signed out for this worker (no sign-in at \
-                     /Users//someone/.grok/auth.json), so no worker was started"
-                        .to_owned(),
+                    "Native Google staged renewal did not complete: NeedsPerson".to_owned(),
                 ),
                 crate::task_record::WHY_SIGNIN,
                 "signed out, a person must sign in",
             ),
             (
+                codex,
                 Refused::Program(
                     "atpkg's install of codex failed: vendor head unreachable".to_owned(),
                 ),
@@ -1213,13 +1200,16 @@ fn a_refused_admission_names_its_member_and_cause_under_its_own_why() {
                 "install failed: vendor head unreachable",
             ),
             (
-                Refused::Preparation("Native Google pool location is unavailable".to_owned()),
+                codex,
+                Refused::Preparation(
+                    "this Codex build cannot read the native-owned source".to_owned(),
+                ),
                 "startup",
-                "Native Google pool location is unavailable",
+                "this Codex build cannot read the native-owned source",
             ),
         ] {
             mark(TaskState::Working);
-            refuse(refused);
+            refuse(agent, refused);
             let record = ctx.timeline.lock().unwrap().task().cloned();
             assert_eq!(
                 record.map(|record| (record.state, record.why)),
@@ -1229,8 +1219,9 @@ fn a_refused_admission_names_its_member_and_cause_under_its_own_why() {
             assert_eq!(
                 said,
                 format!(
-                    "{}no Codex started on m22: {cause} (its task is marked stalled why={why})",
-                    crate::harness_host::STARTUP_HEAD
+                    "{}no {} started on m22: {cause} (its task is marked stalled why={why})",
+                    crate::harness_host::STARTUP_HEAD,
+                    agent.product(),
                 )
             );
         }
@@ -1618,5 +1609,48 @@ fn a_workers_launcher_starts_only_once_its_reply_is_taken() {
         for fd in dropped.into_iter().chain(taken) {
             unsafe { libc::close(fd) };
         }
+    });
+}
+
+/// A WORKER A PINNED SESSION SPAWNS STARTS UNPINNED: the pin is its manager's mark, and its own
+/// tab's `status` says `pinned=0` while the manager's says `pinned=1`.
+/// CONTROL: a start that copies the manager's pin onto its worker fails it.
+#[test]
+fn a_worker_of_a_pinned_session_starts_unpinned() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let state = aterm_tempfile::Builder::new()
+        .prefix("aterm-worker-pin")
+        .tempdir()
+        .expect("scratch state home");
+    crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, crate::stub_session(1));
+        app.push_stub_tab(wid, crate::stub_session(2));
+        let manager = ctx_of(&app, 1);
+        assert_eq!(
+            crate::session_pin::cmd(&manager, true, "", aterm_slog::Actor::Ctl),
+            ("OK pinned=1\n".to_owned(), true)
+        );
+        let sid = sid_of(&app, 2);
+        let mut ask = worker();
+        ask.order.caller = Some(SessionId::new(sid_of(&app, 1)));
+        ask.caller = Some(1);
+        let seed = ask.seed();
+        let pending = app.ready_worker(&sid, ask, seed).expect("a worker");
+        assert!(pending.launch.caller.is_some(), "PRECONDITION: a manager");
+        drop(pending);
+        let pinned_word = |local: u64| {
+            let record = app.session_status_record(local).expect("live");
+            record
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix("pinned="))
+                .map(str::to_owned)
+        };
+        assert!(!ctx_of(&app, 2).meta.lock().unwrap().pinned);
+        assert_eq!(pinned_word(2).as_deref(), Some("0"), "the worker");
+        assert_eq!(pinned_word(1).as_deref(), Some("1"), "its manager");
     });
 }

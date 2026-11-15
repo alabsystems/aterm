@@ -49,98 +49,176 @@ const SETTLE: Duration = Duration::from_secs(30);
 const COMPACT: usize = MAX_BYTES;
 /// How long a publication stays current, and the shortest contact lease ([`Contact::lease`]).
 const REACHABLE: Duration = Duration::from_millis(aterm_types::network_state::REACHABLE_MS);
-/// The longest contact lease: no peer reads Reachable on a contact older than this.
+/// The longest contact lease: no peer reads Reachable on a contact older than this, whatever
+/// its contact was promised.
 const LEASE_MAX: Duration = Duration::from_millis(aterm_types::network_state::LEASE_MAX_MS);
+/// The most a contact keeps of its lease once what promised it no longer stands
+/// ([`Observer::curtail`]): two minutes, in which a scheduler that starts over, or looks again
+/// after this Mac's network changed, reaches each peer that is still there.
+const CURTAILED: Duration = Duration::from_millis(aterm_types::network_state::CURTAILED_MS);
 
-/// A peer's latest authenticated contact on this process's monotonic clock, and the contact
-/// period measured from the ones before it.
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of the lease, on for one test thread: a contact keeps its peer Reachable for
+    /// [`REACHABLE`] whatever it was promised, so a peer contacted as promised, minutes apart,
+    /// reads LastSeen between two of its contacts.
+    static UNPROMISED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Observer::left`], on for one test thread: a peer found gone keeps its lease.
+    static LEFT_STANDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Observer::left`], on for one test thread: a later contact forgets that the
+    /// peer was found gone, so one that authenticated before the departure and is observed
+    /// after it reads Reachable.
+    static LEFT_FORGOTTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Observer::curtail`], on for one test thread: it shortens no lease.
+    static UNCURTAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Observer::curtail`], on for one test thread: it counts from now whatever it
+    /// was asked, so a contact from before this Mac's network changed keeps two more minutes.
+    static CURTAILS_FROM_NOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Observer::curtail`], on for one test thread: it counts from the contact
+    /// whatever it was asked, so a scheduler that starts over finds every peer it has not
+    /// contacted for two minutes LastSeen before it had its two minutes to reach them.
+    static CURTAILS_FROM_CONTACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of [`Observer::contact`], on for one test thread: a contact made before this
+    /// Mac's network changed and told after it keeps its whole promise, so a round that
+    /// authenticated before a sleep and ended after it reads its peer Reachable for minutes.
+    static LATE_PROMISED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn mutant(cell: &'static std::thread::LocalKey<std::cell::Cell<bool>>) -> bool {
+    cell.with(std::cell::Cell::get)
+}
+
+/// A peer's latest authenticated contact on this process's monotonic clock, and how long it
+/// keeps the peer Reachable.
 ///
-/// Contacts come from completed repair rounds, and the transport makes a bounded number of
-/// rounds at once, so one peer's period grows with the number of peers: in a lab of dozens it
-/// is longer than [`REACHABLE`]. A fixed window then expires every healthy peer between two of
-/// its scheduled contacts, and each one alternates Reachable and LastSeen for good. The lease is
-/// measured instead: a peer stays Reachable while its next contact comes within twice its
-/// measured period, so it reads LastSeen only once it has missed a whole scheduled contact.
-///
-/// A gap the lease in force did not cover is not a period by itself: the peer read LastSeen
-/// in it, and it may have been away (asleep, off the network) and not merely slow. Such a gap
-/// is held as a candidate and becomes the period only when the next gap is at least half of
-/// it; a peer that returns to its pace keeps the period it had. A gap longer than
-/// [`LEASE_MAX`] is an absence whatever follows it: no lease could have covered it, so it is
-/// neither a candidate nor the confirmation of one, however many of them come in a row.
+/// Contacts come from completed repair rounds, and the transport's dial scheduler decides when
+/// the next round with a peer is due, so the observer measures no pace. Each contact comes with
+/// the scheduler's promise, the time within which that peer's next round is due
+/// (`crate::runtime`'s transport), and the peer stays Reachable for that long: it reads LastSeen
+/// only once a promised round did not come, and a peer contacted as promised makes no
+/// reachability transition. Two things end a lease early. The transport found the peer gone
+/// ([`Observer::left`]), or what made the promise no longer stands ([`Observer::curtail`]).
 #[derive(Clone, Copy, Debug)]
 struct Contact {
     at: Instant,
-    /// `None` until a gap measures it.
-    period: Option<Duration>,
-    /// The latest gap, where the lease then in force did not cover it and the next gap has
-    /// not yet confirmed or dismissed it.
-    candidate: Option<Duration>,
+    /// How long after [`Self::at`] the peer reads Reachable: the promise, within [`REACHABLE`]
+    /// and [`LEASE_MAX`], less what [`Observer::curtail`] took.
+    lease: Duration,
+    /// When the peer was last found gone ([`Observer::left`]): a contact older than this keeps
+    /// nobody Reachable.
+    left: Option<Instant>,
 }
 
 impl Contact {
-    fn first(at: Instant) -> Self {
+    fn first(at: Instant, promise: Duration) -> Self {
+        #[cfg(test)]
+        let promise = if mutant(&UNPROMISED) {
+            REACHABLE
+        } else {
+            promise
+        };
         Self {
             at,
-            period: None,
-            candidate: None,
+            lease: promise.clamp(REACHABLE, LEASE_MAX),
+            left: None,
         }
     }
 
-    /// This contact followed by one at `at`.
-    ///
-    /// A gap within the lease in force measures the period: a longer one becomes the period at
-    /// once, a shorter one lowers it by a quarter of the difference, so a peer contacted at
-    /// uneven intervals keeps the lease of its slower ones. A gap past the lease is a candidate
-    /// and leaves the period as it is. The gap after a candidate confirms it when it is at
-    /// least half of it (the peer is that slow: the longer of the two becomes the period),
-    /// and otherwise dismisses it (the peer was away) and measures as any other gap. A gap
-    /// past [`LEASE_MAX`] leaves the period as it is and holds no candidate, so the period is
-    /// never past [`LEASE_MAX`], and one past half of it is not kept: its lease is the longest
-    /// there is.
-    fn then(self, at: Instant) -> Self {
-        let Some(gap) = at
-            .checked_duration_since(self.at)
-            .filter(|gap| !gap.is_zero())
-        else {
+    /// This contact followed by one at `at` that was promised `promise`. A contact that is not
+    /// later than this one changes nothing: rounds end out of the order they authenticated in,
+    /// and the later authentication is the latest evidence. A later one takes its own promise
+    /// whole, so what was curtailed of this one is not carried, and stands unless the peer was
+    /// found gone after it.
+    fn then(self, at: Instant, promise: Duration) -> Self {
+        if at <= self.at {
             return self;
-        };
-        let (period, candidate) = match self.candidate {
-            // No lease covers a gap past the longest one, so such a gap measures no pace a
-            // lease could keep: the peer was away.
-            _ if gap > LEASE_MAX => (self.period, None),
-            Some(candidate) if gap >= candidate / 2 => (Some(candidate.max(gap)), None),
-            _ if gap > self.lease() => (self.period, Some(gap)),
-            _ => (
-                Some(match self.period {
-                    Some(period) if gap < period => period - (period - gap) / 4,
-                    _ => gap,
-                }),
-                None,
-            ),
-        };
+        }
+        #[cfg(test)]
+        if mutant(&LEFT_FORGOTTEN) {
+            return Self::first(at, promise);
+        }
         Self {
-            at,
-            period: period.map(|period| period.min(LEASE_MAX / 2)),
-            candidate,
+            left: self.left.filter(|left| at < *left),
+            ..Self::first(at, promise)
         }
     }
 
-    /// How long this contact keeps its peer Reachable: twice the measured period, at least
-    /// [`REACHABLE`] (also the lease of a peer whose period is not measured yet) and at most
-    /// [`LEASE_MAX`].
-    ///
-    /// Invariant: a peer whose period was measured and whose every next contact comes within
-    /// twice its measured period, up to [`LEASE_MAX`], makes no reachability transition. A peer
-    /// slower than [`REACHABLE`] is measured by its third contact (its second gap confirms its
-    /// first), so it reads LastSeen twice per run before that, and once more each time its pace
-    /// slows past its lease. A peer that was away keeps the lease it had: after its last
-    /// contact it reads LastSeen within twice the period measured before it left, however
-    /// many contacts it made between absences longer than [`LEASE_MAX`].
+    /// Whether the peer was found gone after this contact.
+    fn ended(self) -> bool {
+        #[cfg(test)]
+        if mutant(&LEFT_STANDS) {
+            return false;
+        }
+        self.left.is_some_and(|left| self.at < left)
+    }
+
+    /// How long this contact keeps its peer Reachable: its lease, and nothing once the peer was
+    /// found gone after it.
     fn lease(self) -> Duration {
-        self.period.map_or(REACHABLE, |period| {
-            period.saturating_mul(2).clamp(REACHABLE, LEASE_MAX)
-        })
+        if self.ended() {
+            Duration::ZERO
+        } else {
+            self.lease
+        }
+    }
+}
+
+/// Where [`Observer::curtail`] counts a contact's remaining time from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Since {
+    /// From the contact: this Mac's network changed or it woke, so a peer contacted before then
+    /// may be on a network this Mac left; or the scheduler that made the promises ended with
+    /// none to follow it at once, so nothing keeps them.
+    Contact,
+    /// From now: the scheduler that made the promises ended and another starts, which reaches
+    /// every peer again from here.
+    Now,
+}
+
+/// An observer's unbroken stretch of listening for its peers
+/// ([`NetworkObservation::listening_since_ms`]): when it began on the wall clock, and the latest
+/// observation in it on both clocks.
+///
+/// An observation continues the stretch only where it follows the one before within
+/// [`REACHABLE`] on the wall clock and on the monotonic one. Anything longer is a break: the
+/// publication expired in it, so no reader heard this observer, and it heard no peer (a serving
+/// loop observes every few seconds while it runs). A sleep is such a break: macOS's `Instant`
+/// (its uptime clock) stands still while the Mac sleeps and the wall clock runs on, so the
+/// first observation after a wake follows the last before it by the sleep on the wall clock.
+/// So is a stalled loop (both clocks run on), and a wall clock that steps back or ahead by more
+/// than [`REACHABLE`], whose earlier stamps no longer measure time listened on it.
+#[derive(Clone, Copy, Debug)]
+struct Listening {
+    since_ms: u64,
+    at_ms: u64,
+    at: Instant,
+}
+
+impl Listening {
+    /// A stretch beginning with the observation at wall `at_ms` and monotonic `at`.
+    fn first(at_ms: u64, at: Instant) -> Self {
+        Self {
+            since_ms: at_ms,
+            at_ms,
+            at,
+        }
+    }
+
+    /// This stretch with the observation at wall `at_ms` and monotonic `at`: continued where it
+    /// follows the latest within [`REACHABLE`] on both clocks, else begun again there.
+    fn then(self, at_ms: u64, at: Instant) -> Self {
+        let follows = at_ms
+            .checked_sub(self.at_ms)
+            .is_some_and(|gap| Duration::from_millis(gap) <= REACHABLE)
+            && at
+                .checked_duration_since(self.at)
+                .is_some_and(|gap| gap <= REACHABLE);
+        if follows {
+            Self { at_ms, at, ..self }
+        } else {
+            Self::first(at_ms, at)
+        }
     }
 }
 
@@ -151,6 +229,11 @@ mod repair;
 pub(crate) use relay::{
     error_stage as live_error_stage, read_publication as read_live_publication,
 };
+
+/// The longest lease a contact may be promised and still be read by this Mac's other processes:
+/// what the observation's local relay carries in the version it writes. A Reachable peer with a
+/// longer one stops the relay answering at all.
+pub(crate) const RELAYED_LEASE: Duration = relay::WRITTEN_LEASE;
 
 /// A second address for the current transport owner's observation, kept only while
 /// that runtime holds the corresponding Commons lease.
@@ -250,8 +333,9 @@ impl Publication {
                     .contact_ages
                     .get(&peer.slot)
                     .and_then(|age| age.checked_add(elapsed));
-                // The producer's measured lease ([`Contact::lease`]), which stays on a peer
-                // that still reads Reachable so a later reader ages it against the same window.
+                // The lease the producer gave the contact ([`Contact::lease`]), which stays on a
+                // peer that still reads Reachable so a later reader ages it against the same
+                // window.
                 let lease = Duration::from_millis(peer.reachable_for_ms());
                 peer.reachability = match (
                     age(peer.last_seen_ms),
@@ -273,6 +357,8 @@ impl Publication {
                     peer.reachability = Reachability::Unknown;
                 }
             }
+            // An observation that is not current and Active says nothing of listening now.
+            state.listening_since_ms = None;
         }
         for peer in &mut state.peers {
             if peer.reachability != Reachability::Reachable {
@@ -472,6 +558,7 @@ fn encode_value(
     json!({"version":1,"revision":observation.revision,"observed":observation.observed_at_ms,
         "observer":observation.observer.as_ref().map(identity_value),"limited":observation.retention_limited,"peers":peers,
         "accounts_exchange":observation.accounts_exchange.as_ref().map(accounts_exchange_value),
+        "last_catalog_repair":observation.last_catalog_repair.as_ref().map(repair::value),
         "trust":trust.map(|t|json!({"network":aterm_codec::hex::encode_lower(&t.network),"authority":aterm_codec::hex::encode_lower(&t.authority),"genesis":aterm_codec::hex::encode_lower(&t.genesis)}))})
 }
 #[cfg(test)]
@@ -546,7 +633,7 @@ fn decode_value(value: &Value) -> Result<NetworkObservation> {
             first_seen_ms: number(row, "first")?,
             last_seen_ms: number(row, "last")?,
             last_checked_ms: None,
-            last_repair: repair::read(row)?,
+            last_repair: repair::read(row, "last_repair")?,
             last_authenticated_endpoint: endpoint(row)?,
             reachability: Reachability::Unknown,
             instances: None,
@@ -573,6 +660,8 @@ fn decode_value(value: &Value) -> Result<NetworkObservation> {
         observed_at_ms: number(value, "observed")?,
         observer,
         accounts_exchange: accounts_exchange(value)?,
+        // A record from before a round over the catalog was kept names none.
+        last_catalog_repair: repair::read(value, "last_catalog_repair")?,
         history: HistoryState::Ready,
         detail: "Retained history; current reachability has not been checked".into(),
         peers,
@@ -694,6 +783,10 @@ pub(crate) struct Observer {
     log: Option<BrokerLog>,
     dir: PathBuf,
     seen: BTreeMap<[u8; 16], Contact>,
+    /// When this Mac's network last changed or it last woke ([`Self::curtail`] counting from the
+    /// contact): a contact made by then is promised no more than [`CURTAILED`], however late
+    /// its round ends and it is told here ([`Self::contact`]).
+    moved: Option<Instant>,
     /// When the journal was last written, or this observer opened.
     checkpoint: Instant,
     /// The journal's latest complete checkpoint, which every compaction keeps.
@@ -712,8 +805,14 @@ pub(crate) struct Observer {
     trust: Option<aterm_secrets::commons::journal::Trust>,
     accepting: bool,
     local_verified: bool,
+    /// This run's current stretch of listening, as of its latest observation; none in a history
+    /// just opened, which every run begins without, and while it does not listen.
+    listening: Option<Listening>,
     accounts_exchange_sampled: Option<Instant>,
     repair_sampled: BTreeMap<[u8; 16], Instant>,
+    /// When the kept round over the catalog was sampled
+    /// ([`NetworkObservation::last_catalog_repair`]): one sampled before it does not replace it.
+    catalog_sampled: Option<Instant>,
 }
 impl Observer {
     /// Publish this observer beside its transport lease. Failure leaves repair running;
@@ -810,6 +909,7 @@ impl Observer {
             for peer in &mut state.peers {
                 peer.last_repair = None;
             }
+            state.last_catalog_repair = None;
         }
         let mut observer = Self {
             relay: None,
@@ -819,6 +919,7 @@ impl Observer {
             log: Some(log),
             dir,
             seen: BTreeMap::new(),
+            moved: None,
             checkpoint: Instant::now(),
             latest,
             published_at: Instant::now(),
@@ -830,8 +931,10 @@ impl Observer {
             trust,
             accepting: true,
             local_verified: false,
+            listening: None,
             accounts_exchange_sampled: None,
             repair_sampled: BTreeMap::new(),
+            catalog_sampled: None,
         };
         observer.publish();
         observer.relay = relay::Server::start(&observer.dir, observer.published.clone()).ok();
@@ -849,6 +952,7 @@ impl Observer {
             log: None,
             dir: directory(config),
             seen: BTreeMap::new(),
+            moved: None,
             checkpoint: Instant::now(),
             latest: None,
             published_at: Instant::now(),
@@ -860,15 +964,17 @@ impl Observer {
             trust: None,
             accepting: false,
             local_verified: false,
+            listening: None,
             accounts_exchange_sampled: None,
             repair_sampled: BTreeMap::new(),
+            catalog_sampled: None,
         };
         observer.publish();
         observer
     }
     /// End as a killed process's observer does: its relay gone and its journal released, with
     /// nothing written and the history left as its last checkpoint has it.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn die(mut self) {
         drop(self.relay.take());
         self.log = None;
@@ -971,8 +1077,15 @@ impl Observer {
                 for peer in &mut self.state.peers {
                     peer.last_repair = None;
                 }
+                // This installation's catalog is its own: no round of the one before speaks
+                // for it.
+                self.state.last_catalog_repair = None;
                 self.repair_sampled.clear();
+                self.catalog_sampled = None;
             }
+            // Contacts until now were taken for another identity: listening for this one begins
+            // with its first observation.
+            self.listening = None;
             self.state.observer = Some(identity);
             self.dirty = true;
             self.urgent = true;
@@ -991,11 +1104,11 @@ impl Observer {
     /// longer hears goes unheard from its last contact (as across a restart), and a reader that
     /// waits while a peer is known (the registry import's empty-view guard) still knows it. What
     /// the earlier seat's rounds produced as another Commons actor is dropped, as a reopen and a
-    /// change of incarnation drop it: each peer's latest repair round, the account exchange, the
-    /// live contacts and their sampling. A peer that is `identity` itself leaves the list, since
-    /// an observer never contacts itself. The revision goes on counting. [`Self::local`] then
-    /// records the new identity, which the next observation checkpoints at once, as it does any
-    /// change of this Mac's own identity.
+    /// change of incarnation drop it: each peer's latest repair round, the lab's kept round over
+    /// the catalog, the account exchange, the live contacts and their sampling. A peer that is
+    /// `identity` itself leaves the list, since an observer never contacts itself. The revision
+    /// goes on counting. [`Self::local`] then records the new identity, which the next
+    /// observation checkpoints at once, as it does any change of this Mac's own identity.
     fn take_up(&mut self, identity: &MachineIdentity) {
         self.state
             .peers
@@ -1003,6 +1116,8 @@ impl Observer {
         for peer in &mut self.state.peers {
             peer.last_repair = None;
         }
+        self.state.last_catalog_repair = None;
+        self.catalog_sampled = None;
         self.state.accounts_exchange = None;
         self.seen.clear();
         self.repair_sampled.clear();
@@ -1012,10 +1127,33 @@ impl Observer {
     }
     /// Only callers resolving a completed authenticated exchange to a verified
     /// Commons binding may add an identity. Discovery addresses never call this.
-    pub(crate) fn contact(&mut self, identity: MachineIdentity, at_ms: u64, now: Instant) {
+    ///
+    /// `promise` is the time within which the caller's dial scheduler promises this peer its
+    /// next round, counted from `now`, the contact: the contact keeps the peer Reachable that
+    /// long ([`Contact`]). Only an authenticated round makes a promise; nothing heard without
+    /// one (a beacon, an address) reaches here. A contact made by the time this Mac's network
+    /// last changed ([`Self::curtail`], counting from the contact) is promised what the
+    /// contacts curtailed then kept, [`CURTAILED`] at most: rounds end, and are told here, out
+    /// of the order they authenticated in.
+    pub(crate) fn contact(
+        &mut self,
+        identity: MachineIdentity,
+        at_ms: u64,
+        now: Instant,
+        promise: Duration,
+    ) {
         if !self.accepting {
             return;
         }
+        #[cfg(test)]
+        let moved = self.moved.filter(|_| !mutant(&LATE_PROMISED));
+        #[cfg(not(test))]
+        let moved = self.moved;
+        let promise = if moved.is_some_and(|moved| now <= moved) {
+            promise.min(CURTAILED)
+        } else {
+            promise
+        };
         let key = identity.machine_id;
         if self
             .state
@@ -1031,16 +1169,26 @@ impl Observer {
             .iter_mut()
             .find(|p| p.identity.machine_id == key)
         {
-            self.dirty |= p.identity != identity || p.reachability != Reachability::Reachable;
             if p.identity.incarnation != identity.incarnation {
                 p.last_authenticated_endpoint = None;
                 p.last_repair = None;
                 self.repair_sampled.remove(&key);
+                // What the installation before this one was promised, and its departure, say
+                // nothing of this one.
+                self.seen.remove(&key);
             }
+            // A contact from before the peer was found gone is retained evidence of that
+            // contact and no reachability: only one after it reads Reachable again.
+            let stands = self
+                .seen
+                .get(&key)
+                .is_none_or(|held| !held.then(now, promise).ended());
+            let returns = stands && p.reachability != Reachability::Reachable;
+            self.dirty |= p.identity != identity || returns;
             p.identity = identity;
             p.last_seen_ms = at_ms;
             p.last_checked_ms = Some(at_ms);
-            if p.reachability != Reachability::Reachable {
+            if returns {
                 self.state.retention_limited |= p.samples.len() == MAX_SAMPLES;
                 sample(p, at_ms, Reachability::Reachable);
             }
@@ -1079,9 +1227,65 @@ impl Observer {
         let contact = self
             .seen
             .get(&key)
-            .map_or(Contact::first(now), |previous| previous.then(now));
+            .map_or(Contact::first(now, promise), |previous| {
+                previous.then(now, promise)
+            });
         self.seen.insert(key, contact);
         self.changed = true;
+    }
+    /// The transport found this exact peer gone, by a dial that began at `at`: a contact older
+    /// than `at` keeps it Reachable no longer, whatever it was promised, and the next
+    /// [`Self::observe`] reads it LastSeen. A contact at `at` or later stands, as does every
+    /// other peer's. A peer with no contact in this observer's lifetime has no lease to end,
+    /// and another installation of the machine is another peer.
+    ///
+    /// Only the transport's own evidence of a departure may call this: a dial of an endpoint
+    /// the peer authenticated at that reached nobody, or the second in a row that failed
+    /// (`crate::runtime`'s dial scheduler). It grants nothing: it sets no contact and no time
+    /// anything else reads.
+    pub(crate) fn left(&mut self, identity: &MachineIdentity, at: Instant) {
+        if !self.accepting
+            || !self.state.peers.iter().any(|peer| {
+                peer.identity.machine_id == identity.machine_id
+                    && peer.identity.incarnation == identity.incarnation
+            })
+        {
+            return;
+        }
+        if let Some(contact) = self.seen.get_mut(&identity.machine_id) {
+            contact.left = Some(contact.left.map_or(at, |left| left.max(at)));
+        }
+    }
+    /// What promised the contacts made by `now` no longer stands, so each keeps at most
+    /// [`CURTAILED`] of its lease, counted `since` the contact or now ([`Since`]). A lease is
+    /// only ever shortened: a contact with less left keeps what it had, and one made after `now`
+    /// keeps its promise. Counted from the contact, that holds for a contact made by `now` and
+    /// told later too ([`Self::contact`]); counted from now, the scheduler that made the
+    /// promises has ended and tells no more.
+    pub(crate) fn curtail(&mut self, now: Instant, since: Since) {
+        #[cfg(test)]
+        let since = if mutant(&UNCURTAILED) {
+            return;
+        } else if mutant(&CURTAILS_FROM_NOW) {
+            Since::Now
+        } else if mutant(&CURTAILS_FROM_CONTACT) {
+            Since::Contact
+        } else {
+            since
+        };
+        if since == Since::Contact {
+            self.moved = Some(self.moved.map_or(now, |moved| moved.max(now)));
+        }
+        for contact in self.seen.values_mut() {
+            let Some(age) = now.checked_duration_since(contact.at) else {
+                continue;
+            };
+            let most = match since {
+                Since::Contact => CURTAILED,
+                Since::Now => age.saturating_add(CURTAILED),
+            };
+            contact.lease = contact.lease.min(most);
+        }
     }
     /// Attach only runtime-validated endpoint evidence to an already observed exact identity.
     /// This does not refresh contact time or reachability.
@@ -1129,6 +1333,18 @@ impl Observer {
             }
         }
         let available = visibility == Visibility::Active && self.accepting;
+        // It listens while it takes every contact as this Mac's confirmed observer with
+        // discovery Active ([`Listening`]); a change of when it began is published at once, so
+        // no reader judges an absence over a break.
+        let listening =
+            (available && self.local_verified && at_ms != 0).then(|| match self.listening {
+                Some(listening) => listening.then(at_ms, now),
+                None => Listening::first(at_ms, now),
+            });
+        if listening.map(|l| l.since_ms) != self.listening.map(|l| l.since_ms) {
+            self.changed = true;
+        }
+        self.listening = listening;
         let detail = if self.poisoned {
             "Network history checkpoint unavailable"
         } else if !self.accepting {
@@ -1235,6 +1451,12 @@ impl Observer {
         if !self.local_verified {
             observation.observer = None;
         }
+        // When this run's listening began travels with the live observation, as the lease
+        // below does, and is never part of `self.state`: a restored history has not listened.
+        observation.listening_since_ms = self
+            .listening
+            .filter(|_| self.local_verified)
+            .map(|listening| listening.since_ms);
         // The lease each Reachable peer is read against travels with the live observation and
         // is never part of `self.state`, which the journal stores.
         for peer in &mut observation.peers {
@@ -1260,6 +1482,61 @@ impl Observer {
                 })
                 .collect(),
         });
+    }
+}
+
+/// This Mac's network observer as another crate's test drives it: opened on the history its
+/// configuration names, confirmed as this Mac's own identity, told of contacts and observations
+/// as the Commons runtime's serving loop tells it, and ended as a stopping runtime ends it
+/// (dropped: its history closed) or as a killed process does ([`Self::kill`]: its history left
+/// open). Its publication is read through the [`ObservationHandle`] it opened with, as the
+/// runtime's readers read it (the account claims' presence,
+/// `crates/aterm/src/account_claims_tests.rs`). No runtime path reaches it.
+#[doc(hidden)]
+#[cfg(any(test, debug_assertions))]
+pub struct TestObserver(Observer);
+
+#[cfg(any(test, debug_assertions))]
+impl TestObserver {
+    /// Open the history `config` names, publishing to `published`.
+    ///
+    /// # Errors
+    /// Another observer owns the history, or it is invalid or unavailable.
+    pub fn open(config: &Path, published: ObservationHandle) -> Result<Self> {
+        Observer::open(config, published)
+            .map(Self)
+            .map_err(|_| bad())
+    }
+
+    /// Confirm `identity` in the `trust` context as this history's observer, succeeding no
+    /// other machine.
+    ///
+    /// # Errors
+    /// The history is refused.
+    pub fn local(
+        &mut self,
+        identity: MachineIdentity,
+        trust: aterm_secrets::commons::journal::Trust,
+    ) -> Result<()> {
+        self.0.local(identity, trust, Vec::new)
+    }
+
+    /// An authenticated contact of `identity` at wall `at_ms` and monotonic `now`, its next round
+    /// promised within [`REACHABLE`], the shortest promise a contact keeps.
+    pub fn contact(&mut self, identity: MachineIdentity, at_ms: u64, now: Instant) {
+        self.0.contact(identity, at_ms, now, REACHABLE);
+    }
+
+    /// One observation, as the serving loop makes one each tick, at wall `at_ms` and monotonic
+    /// `now`.
+    pub fn observe(&mut self, visibility: Visibility, at_ms: u64, now: Instant) {
+        self.0.observe(visibility, 0, "observing", at_ms, now);
+    }
+
+    /// End as a killed process's observer does: nothing written, the history left as its last
+    /// checkpoint has it.
+    pub fn kill(self) {
+        self.0.die();
     }
 }
 
@@ -1305,9 +1582,11 @@ pub fn value(observation: &NetworkObservation) -> Value {
     json!({"revision":observation.revision,"observed_at_ms":observation.observed_at_ms,
         "via_local_process":observation.via_local_process,
         "visibility":visibility,"history":history,"detail":observation.detail,
-        "observer":observation.observer.as_ref().map(identity_value),"unverified_endpoints":observation.unverified_endpoints,
+        "observer":observation.observer.as_ref().map(identity_value),
+        "listening_since_ms":observation.listening_since_ms,"unverified_endpoints":observation.unverified_endpoints,
         "retention_limited":observation.retention_limited,"instances":Value::Null,
         "accounts_exchange":observation.accounts_exchange.as_ref().map(accounts_exchange_value),
+        "last_catalog_repair":observation.last_catalog_repair.as_ref().map(repair::value),
         "peers":observation.peers.iter().map(|p|json!({"slot":p.slot,"identity":identity_value(&p.identity),"first_seen_ms":p.first_seen_ms,
             "last_seen_ms":p.last_seen_ms,"reachability":state_value(p.reachability),"instances":Value::Null,
             "last_repair":p.last_repair.as_ref().map(repair::value),

@@ -92,7 +92,7 @@ pub enum CredentialAnswer {
         /// The profile.
         profile: String,
         /// That profile's own tier, as the router holds it (`Router::profile`), never the
-        /// slug's. `project_answer` reads it.
+        /// slug's. `project_admitted` reads it.
         tier: Tier,
     },
     /// `quit=1` and nothing more: git asks no other helper and fails the request.
@@ -123,135 +123,140 @@ fn quit(why: impl Into<String>) -> CredentialAnswer {
     CredentialAnswer::Quit { why: why.into() }
 }
 
-/// The helper's decision (design §6.9). In order:
-/// 1. stdin a terminal → `Quit`;
-/// 2. `op` other than `get` → `Quit` (store and erase are no-ops);
-/// 3. no `path`, or a `path` that names no repository → `Quit`. A path names one only when
-///    `req.slug()` reads a slug from it: exactly `OWNER/REPO` or `OWNER/REPO.git`, each part
-///    as `Slug::new` accepts it, so extra segments or a percent-encoded owner quit. Rules 5
-///    and 6 read that slug;
-/// 4. `protocol` not `https`, or `host` not `github.com` → `Quit`. The one exception holds
-///    only in a test or debug build: `protocol=http` with `host` equal to `asked.loopback`.
-///    A runner sets `AGH_GIT_LOOPBACK` only when its URL is a loopback endpoint, so a debug
-///    build that talks to github.com never answers over plain http, and neither does a
-///    redirect to another port;
-/// 5. dev or external tier:
-///    - the live grant `asked.nonce` names, for exactly this slug, answers its profile when
-///      that profile is `router.writer_of(owner)`, is not release tier, and is Present. That
-///      is the writer a runner's `PushDelete` routed;
-///    - that grant, naming `router.writer_of(owner)`, when the writer cannot answer (it is
-///      release tier, or not Present) → `Quit`. A push the runner routed to the writer never
-///      falls to the read chain, whose head may have push rights of its own;
-///    - otherwise (no nonce, no live grant for this slug, or a grant naming a profile other
-///      than the writer) the owner routes as a Read (`decide`), and the first profile of the
-///      read chain that is present answers. Anonymous → `Quit`.
-///
-///    A grant that names a release-tier profile never answers here (the model's
-///    `ReleaseStaysHome`);
-/// 6. release tier: only the live grant `asked.nonce` names (`GrantView::find` at
-///    `asked.now`), for exactly this slug, whose spawner is this process's ancestor with the
-///    grant's start, answers the grant's profile, and only when that profile is
-///    `router.writer_of(owner)`, its row is release tier, and it is Present. No nonce, or
-///    anything else → `Quit`.
-///
-/// Before rule 1, off unix, every request is `Quit`: no token file is read there, so the
-/// helper answers nothing, and `agh whoami --git` says so.
+/// The helper's complete decision, retaining the exact immutable credential admitted for
+/// output. Selecting a profile alone never establishes the credential that may be emitted.
+pub(crate) struct CredentialAdmission {
+    pub(crate) answer: CredentialAnswer,
+    pub(crate) granted: bool,
+    pub(crate) credential: Option<std::sync::Arc<crate::identity::Credential>>,
+}
+
+/// Validate request, route and the same loaded or pinned credential whose bytes the helper
+/// will emit. Every supplied operation grant must be live and match its repository, writer,
+/// tier and full credential commitment. An invalid grant never falls back to the read chain.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "AghGitGrant",
         action = "Answer",
-        project = "agh::git::credential::project_answer"
+        project = "agh::git::grant_conformance_tests::project_admitted"
     )
 )]
-#[must_use]
-pub(crate) fn answer(
+pub(crate) fn admitted(
     req: &CredentialRequest,
     asked: &Asked<'_>,
     router: &Router,
     grants: &dyn GrantView,
-    presence: &dyn Fn(&str) -> Presence,
-) -> CredentialAnswer {
-    explained(req, asked, router, grants, presence).0
+    pinned: &[std::sync::Arc<crate::identity::Credential>],
+) -> CredentialAdmission {
+    let presence = |name: &str| {
+        if pinned.iter().any(|cred| cred.profile() == name) {
+            Presence::Present
+        } else {
+            router.presence(name)
+        }
+    };
+    let (answer, grant) = select(req, asked, router, grants, &presence);
+    let refused = |why| CredentialAdmission {
+        answer: quit(why),
+        granted: false,
+        credential: None,
+    };
+    let CredentialAnswer::Credential { profile, tier } = &answer else {
+        return CredentialAdmission {
+            answer,
+            granted: false,
+            credential: None,
+        };
+    };
+    let credential = match pinned.iter().find(|cred| cred.profile() == profile) {
+        Some(credential) => std::sync::Arc::clone(credential),
+        None => {
+            let Some(row) = router.profile(profile) else {
+                return refused("the selected credential profile is unavailable");
+            };
+            let Ok(credential) = crate::identity::load(row) else {
+                return refused("the selected credential could not be loaded");
+            };
+            std::sync::Arc::new(credential)
+        }
+    };
+    if credential.profile() != profile || credential.tier() != *tier {
+        return refused("the loaded credential differs from the selected profile");
+    }
+    if grant.as_ref().is_some_and(|grant| {
+        !aterm_digest::ct_eq(&grant.credential_binding, &credential.git_grant_binding())
+    }) {
+        return refused("the credential differs from this Git operation's grant");
+    }
+    CredentialAdmission {
+        answer,
+        granted: grant.is_some(),
+        credential: Some(credential),
+    }
 }
 
-/// `answer`, and whether a grant answered (rule 6, or rule 5's writer grant): what
-/// `agh whoami --git` prints as `grant`.
-pub(crate) fn explained(
+/// Route selection is only preparation: [`admitted`] judges the exact credential next.
+fn select(
     req: &CredentialRequest,
     asked: &Asked<'_>,
     router: &Router,
     grants: &dyn GrantView,
     presence: &dyn Fn(&str) -> Presence,
-) -> (CredentialAnswer, bool) {
+) -> (CredentialAnswer, Option<super::grant::Grant>) {
+    let refuse = |why: String| (quit(why), None);
     if !cfg!(unix) {
-        return (quit("agh's git helper answers only on unix"), false);
+        return refuse("agh's git helper answers only on unix".into());
     }
     if asked.stdin_is_terminal {
-        return (quit("stdin is a terminal: git asks, never a person"), false);
+        return refuse("stdin is a terminal: git asks, never a person".into());
     }
     if req.op != "get" {
-        let why = format!("{} is a no-op: agh keeps no credential for git", req.op);
-        return (quit(why), false);
+        return refuse(format!(
+            "{} is a no-op: agh keeps no credential for git",
+            req.op
+        ));
     }
     let Some(path) = req.path.as_deref() else {
-        return (
-            quit("no path: git must send credential.useHttpPath=true"),
-            false,
-        );
+        return refuse("no path: git must send credential.useHttpPath=true".into());
     };
     let Some(slug) = req.slug() else {
-        let why = format!("{path} names no repository (want OWNER/REPO or OWNER/REPO.git)");
-        return (quit(why), false);
+        return refuse(format!(
+            "{path} names no repository (want OWNER/REPO or OWNER/REPO.git)"
+        ));
     };
     if let Some(why) = foreign(req, asked) {
-        return (quit(why), false);
+        return refuse(why);
     }
     let owner = slug.owner();
-    let writer = router.writer_of(owner);
-    let grant = asked
-        .nonce
-        .and_then(|nonce| grants.find(nonce, &slug, asked.now));
-    if router.tier_of(owner) == Tier::Release {
-        let answered = grant.filter(|grant| {
-            writer == Some(grant.profile.as_str())
-                && router
-                    .profile(&grant.profile)
-                    .is_some_and(|row| row.tier == Tier::Release)
-                && presence(&grant.profile) == Presence::Present
-        });
-        return match answered {
-            Some(grant) => (credential(router, &grant.profile), true),
-            None => (
-                quit(format!(
-                    "{slug} is release tier: only a live grant for it answers"
-                )),
-                false,
-            ),
+    let release = router.tier_of(owner) == Tier::Release;
+    if let Some(nonce) = asked.nonce {
+        let Some(grant) = grants.find(nonce, &slug, asked.now) else {
+            return refuse("the supplied Git operation grant is unavailable or invalid".into());
         };
-    }
-    if let Some(grant) = grant.filter(|grant| writer == Some(grant.profile.as_str())) {
-        let can = router
-            .profile(&grant.profile)
-            .is_some_and(|row| row.tier != Tier::Release)
-            && presence(&grant.profile) == Presence::Present;
-        if can {
-            return (credential(router, &grant.profile), true);
+        if router.writer_of(owner) != Some(grant.profile.as_str())
+            || router
+                .profile(&grant.profile)
+                .is_none_or(|row| (row.tier == Tier::Release) != release)
+            || presence(&grant.profile) != Presence::Present
+        {
+            return refuse(format!(
+                "the supplied Git operation grant's writer {} cannot answer for {slug}",
+                grant.profile
+            ));
         }
-        let why = format!(
-            "the grant's writer {} cannot answer for {slug}",
-            grant.profile
-        );
-        return (quit(why), false);
+        return (credential(router, &grant.profile), Some(grant));
+    }
+    if release {
+        return refuse(format!(
+            "{slug} is release tier: only a live grant for it answers"
+        ));
     }
     let read = RouteRequest::read(RouteTarget::Repo(slug.clone()));
     match router.decide(&read, presence) {
-        Decision::Send { profile, .. } => (credential(router, &profile), false),
-        Decision::Anonymous { .. } => (
-            quit(format!("the read chain for {owner} ends anonymous")),
-            false,
-        ),
-        Decision::Refuse(refusal) => (quit(refusal.why), false),
+        Decision::Send { profile, .. } => (credential(router, &profile), None),
+        Decision::Anonymous { .. } => refuse(format!("the read chain for {owner} ends anonymous")),
+        Decision::Refuse(refusal) => refuse(refusal.why),
     }
 }
 
@@ -288,27 +293,6 @@ fn credential(router: &Router, profile: &str) -> CredentialAnswer {
     }
 }
 
-/// The model's view of an answer (`AghGitGrant`'s `(phase, used)`):
-/// - a credential whose profile is release tier (`CredentialAnswer::Credential`'s `tier`) →
-///   (1, 2);
-/// - any other credential → (1, 1);
-/// - `Quit` → (2, 0).
-///
-/// It reads the tier of the profile that answered, never the slug's. So a release credential
-/// answered for a dev slug projects (1, 2), which breaks `ReleaseStaysHome`.
-#[cfg(any(test, debug_assertions))]
-#[must_use]
-pub fn project_answer(answer: &CredentialAnswer) -> (i64, i64) {
-    match answer {
-        CredentialAnswer::Credential {
-            tier: Tier::Release,
-            ..
-        } => (1, 2),
-        CredentialAnswer::Credential { .. } => (1, 1),
-        CredentialAnswer::Quit { .. } => (2, 0),
-    }
-}
-
 /// The helper's three streams, as `serve_with` takes them. One struct, so that `serve_with`
 /// keeps to plan §1 rule 4's seven parameters.
 pub struct HelperIo<'a> {
@@ -321,8 +305,15 @@ pub struct HelperIo<'a> {
 }
 
 /// `name` in `env`, when it is set and UTF-8.
-pub(crate) fn var(env: &dyn EnvSource, name: &str) -> Option<String> {
+#[cfg(any(test, debug_assertions))]
+fn var(env: &dyn EnvSource, name: &str) -> Option<String> {
     env.var_os(name).and_then(|value| value.into_string().ok())
+}
+
+/// Preserve the presence of an invalid operation nonce so it cannot become an ordinary read.
+pub(crate) fn operation_nonce(env: &dyn EnvSource) -> Option<String> {
+    env.var_os(crate::git::GRANT_VAR)
+        .map(|value| value.into_string().unwrap_or_default())
 }
 
 /// could_not_run, `Sub::Local`: the answer could not be written to git.
@@ -345,8 +336,8 @@ pub(crate) fn write_quit(stdout: &mut dyn std::io::Write) -> Result<()> {
 /// The whole helper: read the request from `io.stdin`, decide, load the profile's token and
 /// print `username=…\npassword=…\n` to `io.stdout`, or `quit=1\n`. A token that does not load
 /// is `quit=1`. Off unix it always answers `quit=1`. For a profile in `pinned` it sends exactly
-/// that credential in place of a fresh load of the profile's file: the tokens vault adoption
-/// judged (`Adoption::pinned`), so a vault file rewritten after adoption judged it never
+/// that credential in place of a fresh load of the profile's token: the tokens vault adoption
+/// judged (`Adoption::pinned`), so a vault entry rotated after adoption judged it never
 /// speaks for the rows adoption derived from it (design §6.10); with no pins every profile's
 /// token is loaded fresh. A stdin that is a terminal, and an op other than `get`, is
 /// `quit=1` before anything is read from it.
@@ -389,7 +380,7 @@ pub fn serve_with(
     let Ok(req) = CredentialRequest::parse(op, text) else {
         return write_quit(stdout);
     };
-    let nonce = var(env, crate::git::GRANT_VAR);
+    let nonce = operation_nonce(env);
     #[cfg(any(test, debug_assertions))]
     let loopback = var(env, crate::git::LOOPBACK_VAR);
     #[cfg(not(any(test, debug_assertions)))]
@@ -400,23 +391,9 @@ pub fn serve_with(
         loopback: loopback.as_deref(),
         now,
     };
-    let presence = |name: &str| router.presence(name, env);
-    let CredentialAnswer::Credential { profile, .. } =
-        answer(&req, &asked, router, grants, &presence)
-    else {
+    let admitted = admitted(&req, &asked, router, grants, pinned);
+    let Some(cred) = admitted.credential else {
         return write_quit(stdout);
-    };
-    let cred = match pinned.iter().find(|cred| cred.profile() == profile) {
-        Some(cred) => std::sync::Arc::clone(cred),
-        None => {
-            let Some(row) = router.profile(&profile) else {
-                return write_quit(stdout);
-            };
-            let Ok(cred) = crate::identity::load(row, env) else {
-                return write_quit(stdout);
-            };
-            std::sync::Arc::new(cred)
-        }
     };
     let written = (|| {
         stdout.write_all(b"username=")?;
@@ -472,15 +449,9 @@ impl HelperRoute {
     /// profile answers nothing of its own. A run with no grant is answered by the read chain:
     /// the owner routed as a Read must name `profile`.
     #[cfg(unix)]
-    pub(crate) fn answers_as(
-        &self,
-        slug: &Slug,
-        profile: &str,
-        granted: bool,
-        env: &dyn EnvSource,
-    ) -> bool {
+    pub(crate) fn answers_as(&self, slug: &Slug, profile: &str, granted: bool) -> bool {
         let router = &self.router;
-        let presence = |name: &str| router.presence(name, env);
+        let presence = |name: &str| router.presence(name);
         let owner = slug.owner();
         let release = router.tier_of(owner) == Tier::Release;
         if granted {
@@ -499,7 +470,7 @@ impl HelperRoute {
 }
 
 /// The helper's route, as the runner's client routes (`Ctx::github`), asking GitHub nothing:
-/// `route_for(env, dirs, loose)`, `loose` when `env` holds `AGH_GIT_LOOSE=1` (a runner sets it
+/// `route_for(dirs, loose)`, `loose` when `env` holds `AGH_GIT_LOOSE=1` (a runner sets it
 /// only for a profile whose `legacy_loose()` is true).
 ///
 /// # Errors
@@ -509,7 +480,7 @@ pub(crate) fn helper_route(env: &dyn EnvSource, dirs: &crate::config::Dirs) -> R
     let loose = env
         .var_os(crate::git::LOOSE_VAR)
         .is_some_and(|value| value == "1");
-    route_for(env, dirs, loose)
+    route_for(dirs, loose)
 }
 
 /// The route the helper takes under `loose` or not. Not loose: `config::load(dirs)`, then,
@@ -525,15 +496,11 @@ pub(crate) fn helper_route(env: &dyn EnvSource, dirs: &crate::config::Dirs) -> R
 ///
 /// `config::load`'s (or `load_for_host`'s) refusal of an invalid agh.toml, then adoption's
 /// refusal (`vault::Adoption::router`).
-pub(crate) fn route_for(
-    env: &dyn EnvSource,
-    dirs: &crate::config::Dirs,
-    loose: bool,
-) -> Result<HelperRoute> {
+pub(crate) fn route_for(dirs: &crate::config::Dirs, loose: bool) -> Result<HelperRoute> {
     let resolved = if loose {
-        crate::routing::view_for_host(dirs, env)?
+        crate::routing::view_for_host(dirs)?
     } else {
-        crate::routing::view(dirs, env)?
+        crate::routing::view(dirs)?
     };
     if let Some(adoption) = resolved.adoption() {
         return Ok(HelperRoute {
@@ -548,7 +515,7 @@ pub(crate) fn route_for(
     Ok(HelperRoute::over(resolved.router()?.clone()))
 }
 
-/// Refused unless git's credential helper, routing over `dirs` as `route_for(env, dirs,
+/// Refused unless git's credential helper, routing over `dirs` as `route_for(dirs,
 /// loose)` routes (`AGH_GIT_LOOSE=1` is `loose`), answers a request for `slug` as `profile`
 /// (`HelperRoute::answers_as`, `granted` when the run writes a grant naming `profile`). agh's
 /// git runner asks it before it spawns a credentialed git, and so does a caller that mounts the
@@ -563,15 +530,14 @@ pub(crate) fn route_for(
 /// `route_for`'s refusal, naming `slug`'s repository; Refused as above.
 #[cfg(unix)]
 pub fn require_answer(
-    env: &dyn EnvSource,
     dirs: &crate::config::Dirs,
     slug: &Slug,
     profile: &str,
     granted: bool,
     loose: bool,
 ) -> Result<()> {
-    let route = route_for(env, dirs, loose).map_err(|error| error.with_repo(slug.to_string()))?;
-    if route.answers_as(slug, profile, granted, env) {
+    let route = route_for(dirs, loose).map_err(|error| error.with_repo(slug.to_string()))?;
+    if route.answers_as(slug, profile, granted) {
         return Ok(());
     }
     let vault_row = route.adopted && crate::identity::vault::Slot::named(profile).is_some();

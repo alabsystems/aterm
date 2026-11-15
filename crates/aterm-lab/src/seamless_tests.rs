@@ -85,17 +85,59 @@ fn a_brief_links_a_turn_only_with_the_tilde() {
     assert!(brief_links("t1 open mail=@x~").is_empty());
 }
 
+/// The gaptopic leg counts the bridge's `gap <local> events-dropped=<n>` records for the shell
+/// tab's local and nothing else on its `ev` faces. Negative control: the parked branch's test
+/// (any record that contains `events-dropped=`) counts 5, not 2; dropping the local test from
+/// [`bus_gaps`] (any second word) counts the other tabs' gaps, 4, and a prefix test
+/// (`starts_with`) counts `gap 31`, 3; dropping the `events-dropped=` test counts the bare
+/// `gap 3` and the log gap, 4.
 #[test]
-fn the_broker_log_count_is_of_whole_needles() {
+fn the_bus_gap_count_is_of_the_shell_tabs_gap_records() {
+    let evs = [
+        "gap 0 events-dropped=255",
+        "presence s-1 idle",
+        "gap 3 events-dropped=9",
+        "gap 3",
+        "gap 3 log-lost=2 why=handoff resync_to=9 ep=3",
+        "note gap 3 events-dropped=1",
+        "gap 31 events-dropped=2",
+        "gap 3 events-dropped=4",
+    ]
+    .map(str::to_string);
     assert_eq!(
-        count_of(
-            b"gap 1 events-dropped=3 .. gap 1 events-dropped=9",
-            b"events-dropped="
-        ),
-        2
+        bus_gaps(&evs, "3"),
+        2,
+        "local 3's two gap records that name a count"
     );
-    assert_eq!(count_of(b"events-dropped", b"events-dropped="), 0);
-    assert_eq!(count_of(b"abc", b""), 0);
+    assert_eq!(bus_gaps(&evs, "0"), 1);
+    assert_eq!(bus_gaps(&[], "3"), 0);
+}
+
+/// `ev` records read off the bus, as [`crate::bus::EvReader::read`] returns them.
+fn evs_read(evs: &[&str]) -> Result<Vec<String>, String> {
+    Ok(evs.iter().copied().map(str::to_string).collect())
+}
+
+/// The wait for the bridge's gap record answers on a read that holds one for the shell tab's
+/// local, reads again on one that holds only other records or when no local is known, and ends
+/// at once on a read that failed, its verdict naming why. Negative control: taking a failed
+/// read as one that found nothing (`read.unwrap_or_default()` in [`gap_step`]) has the wait read
+/// on and its verdict say a bare 0, and the failed read's assertion fails.
+#[test]
+fn a_failed_bus_read_ends_the_wait_and_names_why() {
+    assert_eq!(gap_step(evs_read(&[]), Some("3")), None, "nothing yet");
+    let others = evs_read(&["gap 7 events-dropped=4", "gap 3 log-lost=2"]);
+    assert_eq!(gap_step(others, Some("3")), None, "none of local 3");
+    let gap = || evs_read(&["presence s-1 idle", "gap 3 events-dropped=9"]);
+    assert_eq!(gap_step(gap(), Some("3")), Some(Ok(1)));
+    assert_eq!(gap_step(gap(), None), None, "no local known");
+    let why = "dial the broker at b.sock: refused";
+    assert_eq!(
+        gap_step(Err(why.to_string()), Some("3")),
+        Some(Err(why.to_string()))
+    );
+    assert_eq!(gaps_text(&Err(why.to_string())), format!("unread: {why}"));
+    assert_eq!(gaps_text(&Ok(1)), "1");
 }
 
 fn figures(n: u64, p: [f64; 3]) -> Figures {

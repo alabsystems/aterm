@@ -4554,8 +4554,8 @@ fn a_stacked_head_sets_every_title_on_one_edge() {
     });
 }
 
-/// A NARROW 2X FILTERS CARD TAKES ITS TIGHTER FORMS BEFORE IT STACKS (N12): at 2x in a 318pt
-/// window the severity chips stand side by side on the ends the painter keeps, and the count takes
+/// A NARROW 2X FILTERS CARD TAKES ITS TIGHTER FORMS BEFORE IT STACKS (N12): in a window just
+/// short of its measured roomy chip width the chips stand side by side on the ends the painter keeps, and the count takes
 /// Copy All beside it, Open Log Folder under them, so the card leaves the list room under it.
 /// Negative control: All · 8 stacked over the Problems chip, and the count stood on a line of
 /// its own over Copy All over Open Log Folder: a 339pt card, no entry on the first screen until
@@ -4578,7 +4578,26 @@ fn a_narrow_filters_card_takes_its_tighter_forms() {
             }
         }
         assert!(runtime.replace_settings_messages(log, 8));
-        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(318.0, 544.0));
+        let roomy = compile_settings_view(&runtime, instance, view, &view_cx_at(1_000.0, 544.0));
+        let roomy_width = roomy
+            .semantic(&UiKey::new("settings/messages/severity"))
+            .expect("the roomy severity segments")
+            .rect
+            .width;
+        // Establish that roomy ends cannot fit, using page geometry rather than the outcome
+        // under test. A fixed 318pt window can be narrower than even snug ends in another face.
+        let width = (128_u16..=1_000)
+            .rev()
+            .map(f32::from)
+            .find(|&width| {
+                let mode = SettingsWidth::for_viewport(width);
+                settings_page_content_width(width, mode, PageLayout::Form.maximum(mode))
+                    - 2.0 * MESSAGES_FILTERS_PAD_X
+                    < roomy_width - 0.5
+            })
+            .expect("a compact window just short of the roomy ends");
+        assert!(SettingsWidth::for_viewport(width) == SettingsWidth::Compact);
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(width, 544.0));
         let rect = |key: &str| {
             compiled
                 .semantic(&UiKey::new(key))
@@ -4593,6 +4612,8 @@ fn a_narrow_filters_card_takes_its_tighter_forms() {
             (all.y - warn.y).abs() < 0.5,
             "the chips stand side by side: {all:?} {warn:?}"
         );
+        let cut = cut_words(&compiled, &["settings/messages/filter/"]);
+        assert!(cut.is_empty(), "the snug chips keep their words: {cut:?}");
         let (status, copy) = (
             rect("settings/messages/status"),
             rect("settings/messages/copy-all"),

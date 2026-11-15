@@ -22,7 +22,7 @@ pub(crate) const SELF_CLAIM_LANDED: &str = aterm_agent::harness::acts::RULE_LAND
 pub(crate) fn self_claim_act_face(act: &str) -> Option<TaskFace> {
     if act == SELF_CLAIM_LANDED {
         Some(TaskFace::Landed)
-    } else if act == aterm_agent::supervise::policy::turn_end::RULE_LEFT {
+    } else if act == alab_policy::words::RULE_LEFT {
         Some(TaskFace::Theirs)
     } else if act == aterm_agent::harness::acts::RULE_UPGRADE {
         None

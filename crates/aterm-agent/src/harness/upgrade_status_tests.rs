@@ -9597,3 +9597,46 @@ fn the_press_words_claims_read_bounds_its_probe() {
         "an answered roster is read"
     );
 }
+
+/// EVERY ACCOUNT REFUSAL A RELAUNCH WAITS ON HAS A CLASS AND A CLAUDE WORD
+/// (`accounts_pool::RefusalKind`): a lock or a change is under way, an unread route or record a
+/// tab aterm cannot read, selection policy, integrity and a vault token out of use here the
+/// person's, a usage limit the limit's, and the bare `account` the relaunch's own admission under
+/// way; none is a wait aterm does not classify (which posts `harness-stuck` at its horizon), each
+/// prints a person's words of at most 64 characters and never its wait word, with or without a
+/// `release:` prefix. CONTROL: an `account-` word no kind names stays unclassified.
+#[test]
+fn every_account_refusal_wait_has_a_class_and_words() {
+    use crate::harness::accounts_pool::RefusalKind;
+    for kind in RefusalKind::ALL {
+        let word = kind.word();
+        let class = wait_class(word);
+        assert_ne!(class, WaitClass::Unclassified, "{word}");
+        assert_eq!(wait_class(&format!("release:{word}")), class, "{word}");
+        let expected = match kind {
+            RefusalKind::Lock | RefusalKind::Changing => WaitClass::UnderWay,
+            RefusalKind::Unattributed | RefusalKind::Unread => WaitClass::TabUnread,
+            RefusalKind::Limited => WaitClass::Limit,
+            RefusalKind::Integrity
+            | RefusalKind::Token
+            | RefusalKind::SignedOut
+            | RefusalKind::Pin
+            | RefusalKind::Lease
+            | RefusalKind::Held => WaitClass::Person,
+        };
+        assert_eq!(class, expected, "{word}");
+        let said = wait_words_of(upgrade::Agent::Claude, word).expect("Claude words");
+        assert!(said.chars().count() <= 64, "{word}: {said}");
+        assert!(!said.contains(word), "{word}: {said}");
+        let row = Row {
+            wait_seen: NOW,
+            ..pending_with(word)
+        };
+        assert_ne!(row.cause_word(NOW), "unclassified", "{word}");
+        let words = row.stall_words(NOW).expect("overdue");
+        assert!(!words.contains(word), "{word}: {words}");
+    }
+    assert_eq!(wait_class("account"), WaitClass::UnderWay);
+    assert!(wait_words_of(upgrade::Agent::Claude, "account").is_some());
+    assert_eq!(wait_class("account-policy-new"), WaitClass::Unclassified);
+}

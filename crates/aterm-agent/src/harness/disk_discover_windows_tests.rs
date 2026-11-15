@@ -942,7 +942,6 @@ fn a_windows_directory_is_on_its_volumes_serial() {
 /// `read_process` reads a running stand-in Claude Code process and resolves its home via `USERPROFILE`.
 #[test]
 fn a_running_claude_code_is_read_whole_and_homed_by_its_userprofile() {
-    use std::os::windows::process::CommandExt as _;
     let tmp = Tmp::new("discover-win-census");
     let system = super::super::win::system_directory().expect("System32");
     let program = mkdirs(&tmp.path().join("claude")).join("cmd.exe");

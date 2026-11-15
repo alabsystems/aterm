@@ -29,6 +29,8 @@ pub(crate) struct Replica {
     skewed: Vec<SkewedPeer>,
     /// The peers the table holds for beyond those it names skewed (F22).
     held: Vec<SkewedPeer>,
+    /// Each account's homes as this Mac's lab names them; `None` where it reads no lab.
+    homes: Option<Homes>,
 }
 
 impl Replica {
@@ -42,6 +44,15 @@ impl Replica {
             clock: None,
             skewed: Vec::new(),
             held: Vec::new(),
+            homes: None,
+        }
+    }
+
+    /// [`Self::new`], its lab naming `homes`.
+    pub(crate) fn with_homes(me: &str, homes: Homes) -> Self {
+        Self {
+            homes: Some(homes),
+            ..Self::new(me)
         }
     }
 
@@ -74,6 +85,7 @@ impl Table for Replica {
             clock: self.clock.clone(),
             skewed: self.skewed.clone(),
             held: self.skewed.iter().chain(&self.held).cloned().collect(),
+            homes: self.homes.clone(),
         })
     }
 
@@ -87,11 +99,13 @@ impl Table for Replica {
     }
 }
 
-/// A Mac in the lab: its replica, its accounts store's state, and when it last heard each peer.
+/// A Mac in the lab: its replica, its accounts store's state, when it last heard each peer, and
+/// which accounts its claims cover ([`Scope::Every`], as with a pool file, unless a test says).
 struct Mac {
     table: Replica,
     state: State,
     heard: BTreeMap<String, i64>,
+    scope: Scope,
 }
 
 impl Mac {
@@ -104,6 +118,7 @@ impl Mac {
                 ..State::default()
             },
             heard: BTreeMap::new(),
+            scope: Scope::Every,
         }
     }
 
@@ -124,17 +139,21 @@ impl Mac {
     fn touch(&mut self, act: Act<'_>, now: i64) -> Touched {
         let presence = Presence {
             at: now,
+            listening_since: i64::MIN,
             heard: self.heard.clone(),
         };
-        touch_with(
+        touch_using(
             &self.table,
+            self.scope,
             std::path::Path::new("/nonexistent/home"),
             Some(presence),
             &mut self.state,
             Cli::Claude,
             &keys(Cli::Claude, &roster()),
+            &[],
             act,
             now,
+            Ok(None),
         )
     }
 
@@ -199,6 +218,21 @@ fn enrolled() -> BTreeSet<String> {
 
 fn key(label: &str) -> LeaseKey {
     LeaseKey::new("claude", &format!("{label}@example.test")).expect("a key")
+}
+
+/// The homes a lab names: each `(account, machine)` pair's Mac a home of the account.
+fn homes(of: &[(&str, &str)]) -> Homes {
+    Homes::of_machines(
+        of.iter()
+            .map(|(account, machine)| (key(account), (*machine).to_owned())),
+    )
+}
+
+/// Each of `macs` reads a lab naming `of`'s homes ([`homes`]).
+fn lab(macs: &mut [&mut Mac], of: &[(&str, &str)]) {
+    for mac in macs {
+        mac.table.homes = Some(homes(of));
+    }
 }
 
 #[test]
@@ -274,6 +308,7 @@ fn a_failed_account_transaction_is_unrecorded_not_inapplicable() {
     let table = Replica::new("aa01");
     let result = touch_on(
         &table,
+        Scope::Every,
         root.path(),
         &blocked,
         Some(&roster),
@@ -409,6 +444,7 @@ fn a_writer_successor_keeps_the_seniority_of_the_claims_it_still_uses() {
         table: Replica::new("ee01"),
         state: earlier.state.clone(),
         heard: BTreeMap::from([("dd04".to_owned(), at)]),
+        scope: Scope::Every,
     };
     replicate(&m4, &successor);
     let carried = earlier.table.row("aa01").expect("the earlier seat's row");
@@ -1248,6 +1284,7 @@ fn a_juniors_move_the_relaunch_defers_is_advised_again_as_its_yield() {
 fn home_use_during_a_split_blocks_a_cold_claim_elsewhere() {
     let (mut m1, mut m2) = (Mac::new("aa01", "m1"), Mac::new("bb02", "m2"));
     m1.state.home_accounts = ["pool-a".to_owned()].into_iter().collect();
+    lab(&mut [&mut m1, &mut m2], &[("pool-a", "aa01")]);
     m1.hear(&m2, NOW);
     m2.hear(&m1, NOW);
 
@@ -1289,6 +1326,7 @@ fn a_row_round_trips_and_an_unreadable_claim_drops_alone() {
     let me = Mine {
         machine: "aa01".into(),
         label: "m1".into(),
+        ranks_homes: true,
     };
     let row = claimed(None, &me, &key("pool-b"), Kind::Lease, |_| true, NOW).expect("a first row");
     let row = claimed(
@@ -1302,6 +1340,20 @@ fn a_row_round_trips_and_an_unreadable_claim_drops_alone() {
     .expect("a second");
     assert_eq!((row.counter, row.until), (2, NOW + MIN + HORIZON_S));
     assert_eq!(Row::from_value("aa01", &row.to_value()), Ok(row.clone()));
+    assert_eq!(row.to_value().get("v").and_then(Value::as_u64), Some(2));
+
+    // A row of version 1, or of none, is a first-come Mac's.
+    for version in [Some(1), None] {
+        let mut body = row.to_value();
+        let fields = body.as_object_mut().expect("object");
+        match version {
+            Some(v) => fields.insert("v".to_owned(), Value::from(v)),
+            None => fields.remove("v"),
+        };
+        let read = Row::from_value("aa01", &body).expect("a row");
+        assert!(!read.ranks_homes, "{version:?}");
+        assert_eq!(read.to_value().get("v").and_then(Value::as_u64), Some(1));
+    }
 
     // A claim of a kind this build does not know is left out; the rest of the row stands.
     let mut body = row.to_value();
@@ -1330,6 +1382,7 @@ fn a_mac_writes_its_row_only_when_its_claims_change_or_come_due() {
     let me = Mine {
         machine: "aa01".into(),
         label: "m1".into(),
+        ranks_homes: false,
     };
     let all = |_: &Claim| true;
     let claim = |current: Option<&Row>, account: &str, kind: Kind, now: i64| {
@@ -1342,6 +1395,25 @@ fn a_mac_writes_its_row_only_when_its_claims_change_or_come_due() {
     assert_eq!(again.claim(&key("pool-a")).map(|c| c.since), Some(NOW));
     let home = claim(Some(&first), "pool-a", Kind::Home, NOW + MIN).expect("kind");
     assert_eq!(home.claim(&key("pool-a")).map(|c| c.kind), Some(Kind::Home));
+    // A Mac that comes to read the lab's homes says so at once, its claims' since kept.
+    let ranking = Mine {
+        ranks_homes: true,
+        ..me.clone()
+    };
+    let homes_first = claimed(
+        Some(&first),
+        &ranking,
+        &key("pool-a"),
+        Kind::Lease,
+        all,
+        NOW + MIN,
+    )
+    .expect("ranks homes first now");
+    assert!(homes_first.ranks_homes);
+    assert_eq!(
+        homes_first.claim(&key("pool-a")).map(|c| c.since),
+        Some(NOW)
+    );
 
     // A lapsed row starts its claims afresh.
     let late = NOW + HORIZON_S + MIN;
@@ -1416,12 +1488,14 @@ fn a_presence_reading_lapses_only_on_current_evidence() {
             kind: Kind::Lease,
             since: NOW,
         }],
+        ranks_homes: false,
     };
     let claim = &row.claims[0];
     let view = |at: i64, heard: Option<i64>| View {
         me: "aa01".into(),
         presence: Some(Presence {
             at,
+            listening_since: NOW,
             heard: heard.map(|h| ("bb02".to_owned(), h)).into_iter().collect(),
         }),
         ..View::default()
@@ -1457,6 +1531,110 @@ fn a_presence_reading_lapses_only_on_current_evidence() {
     assert!(!none.live(&row, claim, row.until), "the row lapsed");
 }
 
+/// A MAC THAT READS NO LAB TAKES A CLAIM'S WORD FOR ITS LIFE ALONE: while its registry is not read
+/// (or is off), m2 keeps m1's claim worded `home` live though it has not heard m1 for
+/// [`PRESENCE_TTL_S`], as every Mac did before homes ranked first, and ranks it as a lease. A Mac
+/// that reads the lab takes the lab's word, so the same claim lapses there where the lab names m1
+/// no home of the account, and stays live where it names m1 one.
+///
+/// NEGATIVE CONTROL: read home use from the lab alone (`View::home_use` with no lab reading no
+/// home), and the lab-less reader lapsed the home's claim (`a lab-less reader keeps a home's
+/// word`).
+#[test]
+fn a_mac_that_reads_no_lab_keeps_a_home_worded_claim_live() {
+    let row = Row {
+        machine: "aa01".into(),
+        label: "m1".into(),
+        counter: 1,
+        until: NOW + HORIZON_S,
+        claims: vec![Claim {
+            key: key("pool-a"),
+            kind: Kind::Home,
+            since: NOW,
+        }],
+        ranks_homes: true,
+    };
+    let claim = &row.claims[0];
+    let late = NOW + PRESENCE_TTL_S + MIN;
+    let view = |homes: Option<Homes>| View {
+        me: "bb02".into(),
+        presence: Some(Presence {
+            at: late,
+            listening_since: i64::MIN,
+            heard: BTreeMap::from([("aa01".to_owned(), NOW)]),
+        }),
+        homes,
+        ..View::default()
+    };
+    assert!(
+        view(None).live(&row, claim, late),
+        "a lab-less reader keeps a home's word"
+    );
+    assert_eq!(view(None).kind("aa01", &key("pool-a")), Kind::Lease);
+    assert!(view(Some(homes(&[("pool-a", "aa01")]))).live(&row, claim, late));
+    assert!(
+        !view(Some(homes(&[("pool-a", "cc03")]))).live(&row, claim, late),
+        "the lab names m1 no home"
+    );
+}
+
+/// A peer is unheard only over time this Mac has listened ([`Presence::listening_since`]): a
+/// Commons that has just resumed (an aterm restarted, a Mac woken from sleep) reads each peer it
+/// kept with its last contact from before the gap, and a peer it has had no time to hear yet is
+/// not gone, so its lease stands. Once this Mac has listened past [`PRESENCE_TTL_S`] without
+/// hearing it, the peer is gone and its lease lapses, however recently listening began; a peer
+/// heard since listening began is measured from that contact. Home use never lapses so.
+///
+/// Negative control: with `unheard` measuring from the last contact alone, the resumed reading
+/// lapsed the lease (`a peer this Mac has not listened long enough to hear read gone`).
+#[test]
+fn a_peer_is_unheard_only_over_time_listened() {
+    let row = |kind| Row {
+        machine: "bb02".into(),
+        label: "m2".into(),
+        counter: 1,
+        until: NOW + HORIZON_S,
+        claims: vec![Claim {
+            key: key("pool-a"),
+            kind,
+            since: NOW - 2 * HOUR,
+        }],
+        ranks_homes: false,
+    };
+    let lease = row(Kind::Lease);
+    let view = |at: i64, heard: i64| View {
+        me: "aa01".into(),
+        presence: Some(Presence {
+            at,
+            listening_since: NOW,
+            heard: [("bb02".to_owned(), heard)].into_iter().collect(),
+        }),
+        ..View::default()
+    };
+    // Last heard an hour before this Mac began listening.
+    let before = NOW - HOUR;
+    assert!(
+        view(NOW, before).live(&lease, &lease.claims[0], NOW),
+        "a peer this Mac has not listened long enough to hear read gone"
+    );
+    let full = NOW + PRESENCE_TTL_S;
+    assert!(
+        view(full, before).live(&lease, &lease.claims[0], full),
+        "listened for exactly the TTL"
+    );
+    assert!(
+        !view(full + 1, before).live(&lease, &lease.claims[0], full + 1),
+        "listened past the TTL without hearing it, the peer kept its lease"
+    );
+    // Heard since listening began: measured from that contact.
+    let heard = NOW + 5 * MIN;
+    assert!(view(full + 1, heard).live(&lease, &lease.claims[0], full + 1));
+    let after = heard + PRESENCE_TTL_S + 1;
+    assert!(!view(after, heard).live(&lease, &lease.claims[0], after));
+    let home = row(Kind::Home);
+    assert!(view(after, heard).live(&home, &home.claims[0], after));
+}
+
 #[test]
 fn a_future_presence_read_cannot_make_a_peer_lease_claimable() {
     let (mut m1, mut m2) = (Mac::new("aa01", "m1"), Mac::new("bb02", "m2"));
@@ -1471,6 +1649,7 @@ fn a_future_presence_read_cannot_make_a_peer_lease_claimable() {
         std::path::Path::new("/nonexistent/home"),
         Some(Presence {
             at: later + 1,
+            listening_since: i64::MIN,
             heard: m2.heard.clone(),
         }),
         &mut m2.state,
@@ -1573,6 +1752,7 @@ fn large_claim_sets_round_trip_without_count_truncation() {
         let mine = Mine {
             machine: "aa01".into(),
             label: "m1".into(),
+            ranks_homes: false,
         };
         let mut row = None;
         for index in 0..256 {
@@ -1622,6 +1802,7 @@ fn large_claim_sets_round_trip_without_count_truncation() {
 fn a_sleeping_macs_claims_lapse_elsewhere_two_hours_after_it_slept() {
     let (mut m1, mut m2) = (Mac::new("aa01", "m1"), Mac::new("bb02", "m2"));
     m1.state.home_accounts = ["pool-a".to_owned()].into_iter().collect();
+    lab(&mut [&mut m1, &mut m2], &[("pool-a", "aa01")]);
     m1.hear(&m2, NOW);
     m2.hear(&m1, NOW);
     m1.runs("pool-a", NOW);
@@ -1683,6 +1864,7 @@ fn a_sleeping_macs_claims_lapse_elsewhere_two_hours_after_it_slept() {
 fn a_mac_that_powers_off_frees_its_accounts_on_every_other_mac() {
     let (mut m1, mut m2) = (Mac::new("aa01", "m1"), Mac::new("bb02", "m2"));
     m1.state.home_accounts = ["pool-a".to_owned()].into_iter().collect();
+    lab(&mut [&mut m1, &mut m2], &[("pool-a", "aa01")]);
     m1.hear(&m2, NOW);
     m2.hear(&m1, NOW);
     m1.runs("pool-a", NOW);
@@ -1693,6 +1875,7 @@ fn a_mac_that_powers_off_frees_its_accounts_on_every_other_mac() {
     let view = View {
         me: "bb02".into(),
         presence: None,
+        homes: m2.table.homes.clone(),
         ..View::default()
     };
     let senior = |mac: &Mac, account: &str, now: i64| {
@@ -1833,6 +2016,7 @@ impl Mac {
     fn touch_holding(&mut self, act: Act<'_>, homes: &[(LeaseKey, String)], now: i64) -> Touched {
         let presence = Presence {
             at: now,
+            listening_since: i64::MIN,
             heard: self.heard.clone(),
         };
         touch_homes(
@@ -1909,6 +2093,7 @@ fn an_off_mac_keeps_its_home_row_behind_a_stale_lease() {
 fn a_tie_refuses_leases_and_keeps_home_claims() {
     let mut a = Mac::new("aa01", "m1");
     a.state.home_accounts.insert("pool-a".into());
+    lab(&mut [&mut a], &[("pool-a", "aa01")]);
     a.clock(Some(clock_split()));
     a.runs("pool-a", NOW);
     a.runs("pool-b", NOW);
@@ -2368,4 +2553,934 @@ fn account_claim_clock_conforms() {
     let mut held = unheld;
     held.insert("askew", 1);
     assert_eq!(claim_clock_transition(&held, "BCold")["bcold"], 0);
+}
+
+/// A home (`cc03`, m2) and a borrower (`bb02`, m13, a label that sorts before the home's), both
+/// reading a lab that names m2 pool-a's home; each hears the other at `NOW`.
+fn home_and_borrower() -> (Mac, Mac) {
+    let (mut home, mut borrower) = (Mac::new("cc03", "m2"), Mac::new("bb02", "m13"));
+    lab(&mut [&mut home, &mut borrower], &[("pool-a", "cc03")]);
+    home.hear(&borrower, NOW);
+    borrower.hear(&home, NOW);
+    (home, borrower)
+}
+
+/// A HOME OUTRANKS A BORROWER (the owner's ruling of 2026-11-11, "Accounts on their own
+/// machine"): m13 has borrowed pool-a since `NOW`; m2, its home, claims it a minute later and
+/// ranks senior though its claim is the later, on both Macs. The borrower's lease never bars the
+/// home: its verdict is Ok and its claim lands. The home sees its own claim and keeps the
+/// account at its turn end; the borrower sees `LeasedElsewhere`, its claim is held elsewhere, and
+/// it yields at its next turn end, so one Mac uses the account.
+///
+/// NEGATIVE CONTROL: rank first-come (`senior_of` passing `homes_first` false), and the home was
+/// refused its own account (`the borrower's lease bars the home`: `left:
+/// Err(LeasedElsewhere { until: 1790086400 })`, `right: Ok(())`).
+#[test]
+fn a_homes_later_claim_outranks_a_borrowers_earlier_lease() {
+    let (mut home, mut borrower) = home_and_borrower();
+    borrower.runs("pool-a", NOW);
+    assert_eq!(borrower.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    replicate(&borrower, &home);
+
+    let at = NOW + MIN;
+    assert_eq!(home.touch(Act::Look, at), Touched::Looked);
+    assert_eq!(
+        home.state.lease_verdict("pool-a", at),
+        Ok(()),
+        "the borrower's lease bars the home"
+    );
+    home.runs("pool-a", at);
+    assert_eq!(home.touch(Act::Claim("pool-a"), at), Touched::Claimed);
+    let row = home.table.row("cc03").expect("the home's row");
+    assert!(row.ranks_homes);
+    assert_eq!(
+        row.claim(&key("pool-a"))
+            .map(|claim| (claim.kind, claim.since)),
+        Some((Kind::Home, at))
+    );
+    assert_eq!(
+        home.state
+            .leases
+            .get("pool-a")
+            .map(|lease| lease.holder.as_str()),
+        Some("m2"),
+        "the home holds its own claim"
+    );
+    assert!(home.stays_on("pool-a", at));
+
+    replicate(&home, &borrower);
+    let next = at + MIN;
+    assert_eq!(borrower.touch(Act::Look, next), Touched::Looked);
+    assert_eq!(
+        borrower.state.lease_verdict("pool-a", next),
+        Err(WhyNot::LeasedElsewhere {
+            until: at + HORIZON_S
+        })
+    );
+    match borrower.touch(Act::Claim("pool-a"), next) {
+        Touched::HeldElsewhere(holder) => assert_eq!(
+            (holder.machine.as_str(), holder.kind, holder.since),
+            ("cc03", Kind::Home, at)
+        ),
+        other => panic!("the borrower's claim: {other:?}"),
+    }
+    assert_eq!(users(&[&home, &borrower], "pool-a", next), ["m2"]);
+}
+
+/// THE BORROWER CLAIMS AGAIN ONCE THE HOME'S CLAIM LAPSES WITH ITS USE: after the home took
+/// pool-a and the borrower moved onto pool-b, the home's session ends; an hour on ([`IDLE_S`])
+/// its look gives the claim up, and the borrower's next look reads pool-a free and claims it,
+/// keeping it at its turn end.
+///
+/// NEGATIVE CONTROL: keep a home's claims at a look whatever their use (`Act::Look` releasing
+/// only claims `view.kind` reads as leases), and the home's look kept its idle claim (`the idle
+/// claim is given up`: `left: Some(Claim { .., kind: Home, since: 1790000060 })`, `right: None`).
+#[test]
+fn a_homes_idle_claim_frees_its_account_for_the_borrower() {
+    let (mut home, mut borrower) = home_and_borrower();
+    borrower.runs("pool-a", NOW);
+    assert_eq!(borrower.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    replicate(&borrower, &home);
+    let at = NOW + MIN;
+    home.runs("pool-a", at);
+    assert_eq!(home.touch(Act::Claim("pool-a"), at), Touched::Claimed);
+    replicate(&home, &borrower);
+    assert_eq!(borrower.touch(Act::Look, at + MIN), Touched::Looked);
+    assert!(
+        !borrower.stays_on("pool-a", at + MIN),
+        "the borrower yields"
+    );
+    accounts::forget_session(&mut borrower.state, "s-pool-a");
+    borrower.runs("pool-b", at + MIN);
+    assert_eq!(
+        borrower.touch(Act::Claim("pool-b"), at + MIN),
+        Touched::Claimed
+    );
+
+    // The home's session ends at once; its claim stands an hour more, then its look gives it up.
+    accounts::forget_session(&mut home.state, "s-pool-a");
+    let still = at + IDLE_S - MIN;
+    assert_eq!(home.touch(Act::Look, still), Touched::Looked);
+    assert!(
+        home.table
+            .row("cc03")
+            .is_some_and(|row| row.claim(&key("pool-a")).is_some()),
+        "a claim lasts its idle hour"
+    );
+    let idle = at + IDLE_S + MIN;
+    home.hear(&borrower, idle);
+    borrower.hear(&home, idle);
+    assert_eq!(home.touch(Act::Look, idle), Touched::Looked);
+    let row = home.table.row("cc03").expect("the home's row");
+    assert_eq!(
+        row.claim(&key("pool-a")),
+        None,
+        "the idle claim is given up"
+    );
+
+    replicate(&home, &borrower);
+    assert_eq!(borrower.touch(Act::Look, idle), Touched::Looked);
+    assert_eq!(borrower.state.lease_verdict("pool-a", idle), Ok(()));
+    borrower.runs("pool-a", idle);
+    assert_eq!(borrower.touch(Act::Claim("pool-a"), idle), Touched::Claimed);
+    assert!(borrower.stays_on("pool-a", idle));
+    // The home takes it back at its next launch on it: the borrower's lease bars it nothing.
+    replicate(&borrower, &home);
+    assert_eq!(home.touch(Act::Look, idle + MIN), Touched::Looked);
+    assert_eq!(home.state.lease_verdict("pool-a", idle + MIN), Ok(()));
+}
+
+/// TWO HOMES OF A POOL ACCOUNT KEEP FIRST-COME: the lab names both m1 and m2 pool-a's homes (a
+/// pool account each of whose preferred Macs is a home). m2 claims it first; m1's later claim is
+/// junior, its verdict `LeasedElsewhere` and its claim held elsewhere by m2's home claim.
+///
+/// NEGATIVE CONTROL: let a home's claim it has not made yet win against every holder (`settle`
+/// clearing the lease wherever `view.kind` reads this Mac a home), and m1 read the account free
+/// (`left: Ok(())`, `right: Err(LeasedElsewhere { until: 1790086400 })`).
+#[test]
+fn two_homes_of_a_pool_account_keep_first_come() {
+    let (mut m1, mut m2) = (Mac::new("aa01", "m1"), Mac::new("bb02", "m2"));
+    lab(
+        &mut [&mut m1, &mut m2],
+        &[("pool-a", "aa01"), ("pool-a", "bb02")],
+    );
+    m2.runs("pool-a", NOW);
+    assert_eq!(m2.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    replicate(&m2, &m1);
+    let at = NOW + MIN;
+    assert_eq!(m1.touch(Act::Look, at), Touched::Looked);
+    assert_eq!(
+        m1.state.lease_verdict("pool-a", at),
+        Err(WhyNot::LeasedElsewhere {
+            until: NOW + HORIZON_S
+        })
+    );
+    m1.runs("pool-a", at);
+    match m1.touch(Act::Claim("pool-a"), at) {
+        Touched::HeldElsewhere(holder) => assert_eq!(
+            (holder.machine.as_str(), holder.kind, holder.since),
+            ("bb02", Kind::Home, NOW)
+        ),
+        other => panic!("the later home's claim: {other:?}"),
+    }
+    assert!(m1.table.row("aa01").is_none(), "m1 wrote no claim");
+    assert_eq!(users(&[&m1, &m2], "pool-a", at), ["m2"]);
+}
+
+/// A BORROWER CANNOT WORD ITSELF A HOME: m13's row says its claim on pool-a is `home`, but the lab
+/// m2 reads names only m2 the account's home, so m2 reads the claim as a lease: m2's later claim
+/// outranks it, and the claim lapses once m2 has not heard m13 for [`PRESENCE_TTL_S`] as any
+/// lease does, where a home's would not.
+///
+/// NEGATIVE CONTROL: take a claim's kind from its row (the holder's kind and `View::home_use`
+/// reading the row's word), and the forged claim ranked as a home's (`left: Some(Home)`, `right:
+/// Some(Lease)`).
+#[test]
+fn a_borrower_wording_its_claim_home_still_ranks_as_a_borrower() {
+    let (mut home, mut borrower) = home_and_borrower();
+    borrower.runs("pool-a", NOW);
+    assert_eq!(borrower.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    let row = borrower.table.row("bb02").expect("the borrower's row");
+    assert_eq!(
+        row.claim(&key("pool-a")).map(|claim| claim.kind),
+        Some(Kind::Lease),
+        "an honest borrower words its claim a lease"
+    );
+    let forged = Row {
+        counter: row.counter + 1,
+        claims: row
+            .claims
+            .iter()
+            .map(|claim| Claim {
+                kind: Kind::Home,
+                ..claim.clone()
+            })
+            .collect(),
+        ..row
+    };
+    let forged = Row::from_value("bb02", &forged.to_value()).expect("a row");
+    home.table
+        .book
+        .lock()
+        .expect("replica")
+        .insert(forged.clone());
+
+    let at = NOW + MIN;
+    let view = View {
+        me: "cc03".into(),
+        homes: home.table.homes.clone(),
+        ..View::default()
+    };
+    let book = Book::of([forged.clone()]);
+    assert_eq!(
+        book.senior(&key("pool-a"), &view, at).map(|held| held.kind),
+        Some(Kind::Lease)
+    );
+    assert_eq!(home.touch(Act::Look, at), Touched::Looked);
+    assert_eq!(
+        home.state.lease_verdict("pool-a", at),
+        Ok(()),
+        "the forged home claim bars the home"
+    );
+    home.runs("pool-a", at);
+    assert_eq!(home.touch(Act::Claim("pool-a"), at), Touched::Claimed);
+
+    // Unheard past the presence life, the forged claim lapses as a lease does.
+    let late = NOW + PRESENCE_TTL_S + MIN;
+    let heard = View {
+        presence: Some(Presence {
+            at: late,
+            listening_since: i64::MIN,
+            heard: BTreeMap::from([("bb02".to_owned(), NOW)]),
+        }),
+        ..view
+    };
+    let claim = forged.claim(&key("pool-a")).expect("the forged claim");
+    assert!(
+        !heard.live(&forged, claim, late),
+        "a forged home claim lapses"
+    );
+}
+
+/// A FIRST-COME BORROWER NEVER REFUSES A HOME (the session lead's decision of 2026-11-14, on the
+/// owner's ruling of 2026-11-11, "Accounts on their own machine"): m13 reads no lab (as a build
+/// from before homes ranked first reads none), so its row ranks first-come (version 1), and it
+/// has held pool-a since `NOW`. The home, with a pool file or none ([`Scope::Homes`]), reads its
+/// account free, claims it and keeps it at its turn end; m13 keeps it too while its row ranks
+/// first-come, as both did before homes ranked first. Once m13 reads the lab, its claim is held
+/// elsewhere and it yields at its next turn end.
+///
+/// NEGATIVE CONTROL: rank first-come for every reader while a live holder's row does
+/// (`Book::homes_first` without its home arm and reading borrowers' rows too, the rule before),
+/// and the home was refused its own account (`the first-come borrower bars the home`: `left:
+/// Err(LeasedElsewhere { until: 1790086400 })`, `right: Ok(())`).
+#[test]
+fn a_first_come_borrower_never_refuses_a_home() {
+    for scope in [Scope::Every, Scope::Homes] {
+        let (mut home, mut borrower) = home_and_borrower();
+        home.scope = scope;
+        borrower.table.homes = None;
+        borrower.runs("pool-a", NOW);
+        assert_eq!(borrower.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+        let row = borrower.table.row("bb02").expect("the borrower's row");
+        assert!(!row.ranks_homes);
+        assert_eq!(row.to_value().get("v").and_then(Value::as_u64), Some(1));
+        replicate(&borrower, &home);
+
+        let at = NOW + MIN;
+        home.runs("pool-a", at);
+        assert_eq!(home.touch(Act::Look, at), Touched::Looked, "{scope:?}");
+        assert_eq!(
+            home.state.lease_verdict("pool-a", at),
+            Ok(()),
+            "{scope:?}: the first-come borrower bars the home"
+        );
+        assert_eq!(
+            home.touch(Act::Claim("pool-a"), at),
+            Touched::Claimed,
+            "{scope:?}"
+        );
+        replicate(&home, &borrower);
+        assert_eq!(borrower.touch(Act::Look, at), Touched::Looked);
+        assert_eq!(
+            users(&[&home, &borrower], "pool-a", at),
+            ["m2", "m13"],
+            "{scope:?}: both keep it while the borrower ranks first-come"
+        );
+
+        // The borrower comes to read the lab: the home's claim holds the account, and it yields.
+        borrower.table.homes = home.table.homes.clone();
+        let later = at + RECHECK_S;
+        assert!(matches!(
+            borrower.touch(Act::Claim("pool-a"), later),
+            Touched::HeldElsewhere(holder) if holder.machine == "cc03"
+        ));
+        assert_eq!(borrower.touch(Act::Look, later), Touched::Looked);
+        assert_eq!(
+            users(&[&home, &borrower], "pool-a", later),
+            ["m2"],
+            "{scope:?}"
+        );
+        assert_eq!(home.touch(Act::Look, later), Touched::Looked);
+        assert_eq!(home.state.lease_verdict("pool-a", later), Ok(()));
+    }
+}
+
+/// TWO HOMES KEEP FIRST-COME THOUGH ONE'S ROW RANKS FIRST-COME: the lab names m1 and m2 pool-a's
+/// homes, and m2 reads no lab, so its row ranks first-come (version 1). Whichever claims first
+/// holds the account on both Macs, and the later home's claim is held elsewhere: a home is
+/// refused its account for another home's senior claim, whatever that home's row says.
+///
+/// NEGATIVE CONTROL: rank a claim whose row ranks first-come as no home's (`Book::live_claims`
+/// giving such a claim `Kind::Lease`, so a home skips it as it skips a borrower's), and m1 read
+/// the account free beside m2 (`left: Ok(())`, `right: Err(LeasedElsewhere { until: 1790086400
+/// })`).
+#[test]
+fn two_homes_keep_first_come_though_one_ranks_first_come() {
+    let pair = || {
+        let (mut m1, mut m2) = (Mac::new("aa01", "m1"), Mac::new("bb02", "m2"));
+        lab(
+            &mut [&mut m1, &mut m2],
+            &[("pool-a", "aa01"), ("pool-a", "bb02")],
+        );
+        m2.table.homes = None;
+        m1.hear(&m2, NOW);
+        m2.hear(&m1, NOW);
+        (m1, m2)
+    };
+    // The first-come home claims first.
+    let (mut m1, mut m2) = pair();
+    m2.runs("pool-a", NOW);
+    assert_eq!(m2.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    replicate(&m2, &m1);
+    let at = NOW + MIN;
+    m1.runs("pool-a", at);
+    assert_eq!(m1.touch(Act::Look, at), Touched::Looked);
+    assert_eq!(
+        m1.state.lease_verdict("pool-a", at),
+        Err(WhyNot::LeasedElsewhere {
+            until: NOW + HORIZON_S
+        })
+    );
+    assert!(matches!(
+        m1.touch(Act::Claim("pool-a"), at),
+        Touched::HeldElsewhere(holder) if holder.machine == "bb02" && holder.kind == Kind::Home
+    ));
+    assert_eq!(users(&[&m1, &m2], "pool-a", at), ["m2"]);
+
+    // The home that ranks homes first claims first.
+    let (mut m1, mut m2) = pair();
+    m1.runs("pool-a", NOW);
+    assert_eq!(m1.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    replicate(&m1, &m2);
+    m2.runs("pool-a", at);
+    assert_eq!(m2.touch(Act::Look, at), Touched::Looked);
+    assert!(matches!(
+        m2.touch(Act::Claim("pool-a"), at),
+        Touched::HeldElsewhere(holder) if holder.machine == "aa01"
+    ));
+    assert_eq!(users(&[&m1, &m2], "pool-a", at), ["m1"]);
+}
+
+/// A BORROWER RANKS FIRST-COME AGAINST A HOME WHOSE ROW DOES: m2 is pool-a's home but reads no
+/// lab, so its row ranks first-come. m13 has borrowed pool-a since `NOW`, and m2 claimed it a
+/// minute later, before m13's row reached it. m2 ranks first-come and yields to m13, so m13 ranks
+/// first-come too and keeps the account: one user, never none. Among borrowers it is first-come
+/// whatever their rows: m7, whose row ranks first-come, claimed pool-b before m13, and m13's claim
+/// on it is held elsewhere.
+///
+/// NEGATIVE CONTROL: rank homes first for a borrower whatever the home's row (`Book::homes_first`
+/// always true), and m13 yielded to m2, which yields to m13 (`left: [], right: ["m13"]`).
+#[test]
+fn a_borrower_ranks_first_come_against_a_home_whose_row_does() {
+    let (mut home, mut borrower) = home_and_borrower();
+    home.table.homes = None;
+    borrower.runs("pool-a", NOW);
+    assert_eq!(borrower.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    let at = NOW + MIN;
+    home.runs("pool-a", at);
+    assert_eq!(home.touch(Act::Claim("pool-a"), at), Touched::Claimed);
+    assert!(home.table.row("cc03").is_some_and(|row| !row.ranks_homes));
+    replicate(&home, &borrower);
+    replicate(&borrower, &home);
+    let next = at + MIN;
+    assert_eq!(home.touch(Act::Look, next), Touched::Looked);
+    assert_eq!(borrower.touch(Act::Look, next), Touched::Looked);
+    assert_eq!(users(&[&home, &borrower], "pool-a", next), ["m13"]);
+
+    let mut m7 = Mac::new("aa07", "m7");
+    m7.runs("pool-b", NOW);
+    assert_eq!(m7.touch(Act::Claim("pool-b"), NOW), Touched::Claimed);
+    replicate(&m7, &borrower);
+    borrower.hear(&m7, next);
+    borrower.runs("pool-b", next);
+    assert!(matches!(
+        borrower.touch(Act::Claim("pool-b"), next),
+        Touched::HeldElsewhere(holder) if holder.machine == "aa07"
+    ));
+}
+
+/// EVERY READER RANKS AN ACCOUNT BY THE SAME RULE, WHATEVER IT HEARS: m2 is pool-a's home, m13 has
+/// borrowed it since `NOW`, and m7, a borrower whose row ranks first-come, claimed it a minute
+/// later, before m13's row reached it, and has not given that claim up. m13 still hears m7; m2
+/// last heard it more than [`PRESENCE_TTL_S`] ago, so m7's claim is live on m13 and lapsed on m2.
+/// m2 claims its account. A borrower's row decides no rank, so m13 ranks homes first as m2 does:
+/// m13 reads pool-a held by m2 and yields at its next turn end, and only m2 keeps it.
+///
+/// NEGATIVE CONTROL: decide a borrower's rank from the live holders' rows (`homes_first` = every
+/// holder m13 reads live ranks homes first, m7 among them on m13 alone), and m13 ranked
+/// first-come and held pool-a itself beside m2 (`left: Some("m13")`, `right: Some("m2")`).
+#[test]
+fn every_reader_ranks_an_account_by_the_same_rule_whatever_it_hears() {
+    let (mut home, mut borrower) = home_and_borrower();
+    let mut m7 = Mac::new("aa07", "m7");
+    m7.runs("pool-a", NOW + MIN);
+    borrower.runs("pool-a", NOW);
+    assert_eq!(borrower.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    assert_eq!(m7.touch(Act::Claim("pool-a"), NOW + MIN), Touched::Claimed);
+    assert!(m7.table.row("aa07").is_some_and(|row| !row.ranks_homes));
+    for to in [&home, &borrower] {
+        replicate(&m7, to);
+    }
+    replicate(&borrower, &home);
+
+    let at = NOW + PRESENCE_TTL_S + 2 * MIN;
+    home.hear(&borrower, at);
+    borrower.hear(&home, at);
+    borrower.hear(&m7, at);
+    home.heard.insert("aa07".to_owned(), NOW + MIN);
+    home.runs("pool-a", at);
+    assert_eq!(home.touch(Act::Claim("pool-a"), at), Touched::Claimed);
+    replicate(&home, &borrower);
+
+    let next = at + MIN;
+    assert_eq!(borrower.touch(Act::Look, next), Touched::Looked);
+    assert_eq!(home.touch(Act::Look, next), Touched::Looked);
+    assert_eq!(
+        borrower
+            .state
+            .leases
+            .get("pool-a")
+            .map(|lease| lease.holder.as_str()),
+        Some("m2")
+    );
+    assert_eq!(users(&[&home, &borrower], "pool-a", next), ["m2"]);
+}
+
+/// A MAC WITH NO POOL FILE CLAIMS ITS HOMES AND NOTHING ELSE ([`Scope::Homes`]): m2 has no
+/// `ai-pool.toml`; its lab names it pool-a's home. m13 borrows pool-a and pool-b since `NOW`. m2
+/// claims pool-a as it uses it, a home's claim, and m13 then reads `LeasedElsewhere` and yields it
+/// at its turn end. pool-b, no home of m2's, m2 neither claims nor settles: m13's claim on it
+/// refuses m2 nothing, as before m2 claimed anything. A claim m2 cannot record (its table
+/// unwritable, its clock read Off) answers `NotApplicable` and marks nothing in its store, so no
+/// launch of m2's is refused for it.
+///
+/// NEGATIVE CONTROL: claim under `Scope::Homes` as under `Scope::Every` (`touch_using`'s `every`
+/// always true), and m2's look settled m13's claim on pool-b, no home of its (`m2 settles no
+/// account that is not its home`).
+#[test]
+fn a_mac_with_no_pool_file_claims_its_homes_and_nothing_else() {
+    let (mut home, mut borrower) = home_and_borrower();
+    home.scope = Scope::Homes;
+    for account in ["pool-a", "pool-b"] {
+        borrower.runs(account, NOW);
+        assert_eq!(borrower.touch(Act::Claim(account), NOW), Touched::Claimed);
+    }
+    replicate(&borrower, &home);
+
+    let at = NOW + MIN;
+    assert_eq!(home.touch(Act::Look, at), Touched::Looked);
+    assert_eq!(home.state.lease_verdict("pool-a", at), Ok(()));
+    assert!(
+        !home.state.leases.contains_key("pool-b"),
+        "m2 settles no account that is not its home"
+    );
+    assert_eq!(home.state.lease_verdict("pool-b", at), Ok(()));
+    home.runs("pool-a", at);
+    home.runs("pool-b", at);
+    assert_eq!(home.touch(Act::Claim("pool-a"), at), Touched::Claimed);
+    assert_eq!(
+        home.touch(Act::Claim("pool-b"), at),
+        Touched::NotApplicable,
+        "m2 claims no account that is not its home"
+    );
+    let row = home.table.row("cc03").expect("the home's row");
+    assert!(row.ranks_homes);
+    assert_eq!(
+        row.claims
+            .iter()
+            .map(|claim| (claim.key.clone(), claim.kind))
+            .collect::<Vec<_>>(),
+        [(key("pool-a"), Kind::Home)]
+    );
+
+    replicate(&home, &borrower);
+    let next = at + MIN;
+    assert_eq!(borrower.touch(Act::Look, next), Touched::Looked);
+    assert_eq!(
+        borrower.state.lease_verdict("pool-a", next),
+        Err(WhyNot::LeasedElsewhere {
+            until: at + HORIZON_S
+        })
+    );
+    assert!(!borrower.stays_on("pool-a", next), "the borrower yields");
+    assert!(borrower.stays_on("pool-b", next));
+
+    // A claim it cannot record refuses it nothing and marks nothing.
+    let mut cut = Mac::new("cc03", "m2");
+    cut.scope = Scope::Homes;
+    cut.table.homes = home.table.homes.clone();
+    cut.table.writable = Err("table operation capacity exhausted".to_owned());
+    cut.runs("pool-a", at);
+    assert_eq!(cut.touch(Act::Claim("pool-a"), at), Touched::NotApplicable);
+    cut.clock(Some(clock_off()));
+    assert_eq!(cut.touch(Act::Claim("pool-a"), at), Touched::NotApplicable);
+    assert!(!cut.state.unrecorded);
+    assert!(cut.state.clock.is_none());
+    for account in ["pool-a", "pool-b"] {
+        assert_eq!(cut.state.lease_verdict(account, at), Ok(()), "{account}");
+    }
+}
+
+/// A MAC WITH NO POOL FILE YIELDS A BORROWED ACCOUNT TO ITS HOME ([`Scope::Homes`]; the owner's
+/// "no." of 2026-11-12 to an account's continued sharing away from its home): m2 has no pool file,
+/// and its lab names it pool-a's home and m13 pool-b's. m2 runs pool-b and claims nothing on it. m7,
+/// a borrower with a pool file, claims pool-b first: a borrower's claim refuses m2 nothing. Then
+/// m13, pool-b's home, claims it: m2 reads it held elsewhere, its launch's claim on it is held
+/// elsewhere, and it yields at its next turn end. Once m13 gives its claim up with its use, m2
+/// reads pool-b free again.
+///
+/// NEGATIVE CONTROL: settle under `Scope::Homes` only the accounts the lab names this Mac's
+/// (`touch_using`'s `borrowed` always empty), and m2 read pool-b free beside its home (`left:
+/// Ok(())`, `right: Err(LeasedElsewhere { until: 1790086460 })`).
+#[test]
+fn a_mac_with_no_pool_file_yields_a_borrowed_account_to_its_home() {
+    let (mut m2, mut m13, mut m7) = (
+        Mac::new("cc03", "m2"),
+        Mac::new("dd04", "m13"),
+        Mac::new("aa07", "m7"),
+    );
+    m2.scope = Scope::Homes;
+    lab(
+        &mut [&mut m2, &mut m13, &mut m7],
+        &[("pool-a", "cc03"), ("pool-b", "dd04")],
+    );
+    m2.hear(&m13, NOW);
+    m2.hear(&m7, NOW);
+    m13.hear(&m2, NOW);
+    m13.hear(&m7, NOW);
+    m7.runs("pool-b", NOW);
+    assert_eq!(m7.touch(Act::Claim("pool-b"), NOW), Touched::Claimed);
+    replicate(&m7, &m2);
+    let at = NOW + MIN;
+    m2.runs("pool-b", at);
+    assert_eq!(m2.touch(Act::Look, at), Touched::Looked);
+    assert_eq!(
+        m2.state.lease_verdict("pool-b", at),
+        Ok(()),
+        "a borrower's claim refuses m2 nothing"
+    );
+    assert_eq!(m2.touch(Act::Claim("pool-b"), at), Touched::NotApplicable);
+    assert!(m2.stays_on("pool-b", at));
+
+    m13.runs("pool-b", at);
+    replicate(&m7, &m13);
+    assert_eq!(m13.touch(Act::Claim("pool-b"), at), Touched::Claimed);
+    replicate(&m13, &m2);
+    let next = at + MIN;
+    assert_eq!(m2.touch(Act::Look, next), Touched::Looked);
+    assert_eq!(
+        m2.state.lease_verdict("pool-b", next),
+        Err(WhyNot::LeasedElsewhere {
+            until: at + HORIZON_S
+        })
+    );
+    assert!(!m2.stays_on("pool-b", next), "m2 yields pool-b to its home");
+    match m2.touch(Act::Claim("pool-b"), next) {
+        Touched::HeldElsewhere(holder) => {
+            assert_eq!((holder.machine.as_str(), holder.kind), ("dd04", Kind::Home))
+        }
+        other => panic!("m2's claim on pool-b: {other:?}"),
+    }
+    assert!(
+        m2.table.row("cc03").is_none(),
+        "m2 claims no account it is not the home of"
+    );
+
+    // The home's use ends; its claim goes at its look an idle hour on, and m2 reads pool-b free.
+    accounts::forget_session(&mut m13.state, "s-pool-b");
+    let idle = at + IDLE_S + MIN;
+    assert_eq!(m13.touch(Act::Look, idle), Touched::Looked);
+    replicate(&m13, &m2);
+    assert_eq!(m2.touch(Act::Look, idle), Touched::Looked);
+    assert_eq!(m2.state.lease_verdict("pool-b", idle), Ok(()));
+}
+
+/// A MAC WITH NO POOL FILE REFUSES NOTHING ON AN ACCOUNT ITS LAB STOPS NAMING ([`Scope::Homes`]): m1
+/// and m2 are pool-a's homes, m2 with no pool file; m1 claims pool-a first, so m2 records it held
+/// elsewhere. The lab then names no home of pool-a (m2 stays pool-b's): m2 claims and settles
+/// nothing on pool-a any more, so its next look drops that record and pool-a is no longer refused
+/// it.
+///
+/// NEGATIVE CONTROL: keep the records of the accounts `Scope::Homes` no longer settles (no
+/// `retain` of `state.leases` after `settle_borrowed`), and m2's look kept pool-a held elsewhere
+/// (`left: Err(LeasedElsewhere { until: 1790086400 })`, `right: Ok(())`).
+#[test]
+fn a_mac_with_no_pool_file_refuses_nothing_on_an_account_its_lab_stops_naming() {
+    let (mut m1, mut m2) = (Mac::new("aa01", "m1"), Mac::new("cc03", "m2"));
+    m2.scope = Scope::Homes;
+    lab(
+        &mut [&mut m1, &mut m2],
+        &[("pool-a", "aa01"), ("pool-a", "cc03"), ("pool-b", "cc03")],
+    );
+    m1.hear(&m2, NOW);
+    m2.hear(&m1, NOW);
+    m1.runs("pool-a", NOW);
+    assert_eq!(m1.touch(Act::Claim("pool-a"), NOW), Touched::Claimed);
+    replicate(&m1, &m2);
+    let at = NOW + MIN;
+    assert_eq!(m2.touch(Act::Look, at), Touched::Looked);
+    assert_eq!(
+        m2.state.lease_verdict("pool-a", at),
+        Err(WhyNot::LeasedElsewhere {
+            until: NOW + HORIZON_S
+        }),
+        "CONTROL: another home's senior claim holds pool-a"
+    );
+
+    m2.table.homes = Some(homes(&[("pool-b", "cc03")]));
+    let next = at + MIN;
+    assert_eq!(m2.touch(Act::Look, next), Touched::Looked);
+    assert_eq!(m2.state.lease_verdict("pool-a", next), Ok(()));
+    assert!(!m2.state.leases.contains_key("pool-a"));
+}
+
+/// The lab's homes are the Macs it binds that prefer the account, keyed by registry machine:
+/// each of a pool account's preferred Macs, under its login and its provider identity. A Mac
+/// that runs the account by a place row without preferring it, a Mac whose label is a preferred
+/// Mac's but whose key is not (two machines both labelled m34), a preferred Mac no facts row
+/// binds, and an address two accounts answer to, name no home.
+///
+/// NEGATIVE CONTROL: take every bound Mac for a home of every account (`Homes::of` without its
+/// `preferred_on` filter), and the Mac that runs the account by a place row read as a home (`a
+/// borrower by place row is no home`).
+#[test]
+fn the_labs_homes_are_the_bound_macs_that_prefer_an_account() {
+    use crate::harness::accounts::Vendor;
+    use crate::harness::alab_roster::{LabAccount, MachineKey, MachineRef, Placements};
+    let account = |pk: &str, email: &str, identity: Option<&str>, preferred: &[&str]| LabAccount {
+        pk: pk.to_owned(),
+        cli: Cli::Claude,
+        vendor: Vendor::default(),
+        label: format!("claude-{pk}"),
+        legacy_label: None,
+        email: email.to_owned(),
+        identity: identity.map(str::to_owned),
+        browser: None,
+        joinable: true,
+        preferred: preferred
+            .iter()
+            .map(|machine| {
+                (
+                    MachineRef::from_registry(*machine, Some("m34".to_owned())),
+                    Some(1),
+                )
+            })
+            .collect(),
+    };
+    let lab = Lab {
+        bound: BTreeMap::from([
+            ("aa01".to_owned(), MachineKey::from_registry("mc-home")),
+            ("bb02".to_owned(), MachineKey::from_registry("mc-pool")),
+            ("cc03".to_owned(), MachineKey::from_registry("mc-borrower")),
+            ("dd04".to_owned(), MachineKey::from_registry("mc-other-m34")),
+        ]),
+        accounts: vec![
+            account(
+                "ac-a",
+                "pool-a@example.test",
+                Some("pool-a-id@example.test"),
+                &["mc-home", "mc-pool", "mc-unbound"],
+            ),
+            account("ac-b", "shared@example.test", None, &["mc-home"]),
+            account("ac-c", "shared@example.test", None, &["mc-pool"]),
+        ],
+        places: Placements {
+            by_account: BTreeMap::from([(
+                "ac-a".to_owned(),
+                vec![("m13".to_owned(), "borrow".to_owned())],
+            )]),
+        },
+        ..Lab::default()
+    };
+    let homes = Homes::of(&lab);
+    let identity = LeaseKey::new("claude", "pool-a-id@example.test").expect("a key");
+    for key in [key("pool-a"), identity] {
+        assert!(homes.home(&key, "aa01"), "{key:?}");
+        assert!(homes.home(&key, "bb02"), "a pool account's other home");
+        assert!(
+            !homes.home(&key, "cc03"),
+            "a borrower by place row is no home"
+        );
+        assert!(!homes.home(&key, "dd04"), "dd04 is no home");
+    }
+    let shared = LeaseKey::new("claude", "shared@example.test").expect("a key");
+    assert!(!homes.home(&shared, "aa01"));
+    assert!(!homes.home(&shared, "bb02"));
+    assert_eq!(
+        Homes::of(&Lab {
+            bound: BTreeMap::new(),
+            ..lab
+        }),
+        Homes::default(),
+        "no Mac is bound, so none is a home"
+    );
+}
+
+/// The code's step for each `AccountClaimRank` action. H (`cc03`, m2) is pool-a's home in the lab
+/// both Macs read; B (`bb02`, m13) borrows it, and where `old` says, B reads no lab, so its row
+/// ranks first-come (version 1) and it ranks so. Where `bc` says, B claimed it at `NOW`, with a
+/// session where `bs` says; where `hc` says, H claimed it a minute later, with a session where
+/// `hs` says; where `lie`, B's row words its claim `home` on both Macs. `HClaim` and `BClaim` are
+/// a launch (a look, `lease_verdict` and the claim), `BTurn` B's look and its turn-end advice,
+/// `HIdle` and `BIdle` a look past [`IDLE_S`] with no session. `HStop`, `Lie` and `Old` (the
+/// environment) step as the model does. H has a pool file ([`Scope::Every`]); [`claim_rank_step`]
+/// runs H without one too.
+pub(crate) fn claim_rank_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    claim_rank_step(state, action, Scope::Every)
+}
+
+/// [`claim_rank_transition`] with H's claims covering `scope`: under [`Scope::Homes`], H has no
+/// pool file and claims only the accounts its lab names it a home of, pool-a among them.
+fn claim_rank_step(
+    state: &aterm_spec::interp::State,
+    action: &str,
+    scope: Scope,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    let (mut h, mut b) = (Mac::new("cc03", "m2"), Mac::new("bb02", "m13"));
+    h.scope = scope;
+    lab(&mut [&mut h, &mut b], &[("pool-a", "cc03")]);
+    if state["old"] == 1 {
+        b.table.homes = None;
+    }
+    let (b_at, h_at, at) = (NOW, NOW + MIN, NOW + 2 * MIN);
+    if state["bc"] == 1 {
+        if state["bs"] == 1 {
+            b.runs("pool-a", b_at);
+        }
+        assert_eq!(b.touch(Act::Claim("pool-a"), b_at), Touched::Claimed);
+        replicate(&b, &h);
+    }
+    if state["hc"] == 1 {
+        if state["hs"] == 1 {
+            h.runs("pool-a", h_at);
+        }
+        assert_eq!(
+            h.touch(Act::Claim("pool-a"), h_at),
+            Touched::Claimed,
+            "a home claims its account over a borrower's lease"
+        );
+        replicate(&h, &b);
+    }
+    if state["lie"] == 1
+        && let Some(row) = b.table.row("bb02")
+    {
+        let forged = Row {
+            counter: row.counter + 1,
+            claims: row
+                .claims
+                .iter()
+                .map(|claim| Claim {
+                    kind: Kind::Home,
+                    ..claim.clone()
+                })
+                .collect(),
+            ..row
+        };
+        for mac in [&h, &b] {
+            mac.table
+                .book
+                .lock()
+                .expect("replica")
+                .insert(forged.clone());
+        }
+    }
+    // A launch on pool-a at `at`: whether the Mac may use it and its claim stands.
+    let launches = |mac: &mut Mac| {
+        mac.runs("pool-a", at);
+        mac.touch(Act::Look, at);
+        mac.state.lease_verdict("pool-a", at).is_ok()
+            && matches!(
+                mac.touch(Act::Claim("pool-a"), at),
+                Touched::Claimed | Touched::Held
+            )
+    };
+    // Whether the Mac's row still claims pool-a after its look past an idle hour from `since`.
+    let idles = |mac: &mut Mac, since: i64| {
+        let later = since + IDLE_S + MIN;
+        mac.touch(Act::Look, later);
+        let me = mac.table.me.clone();
+        mac.table
+            .row(&me)
+            .is_some_and(|row| row.until > later && row.claim(&key("pool-a")).is_some())
+    };
+    match action {
+        "HClaim" => {
+            if launches(&mut h) {
+                next.insert("hc", 1);
+                next.insert("hs", 1);
+                next.insert("hidle", 0);
+            } else {
+                next.insert("hwait", 1);
+            }
+        }
+        "HStop" => {
+            next.insert("hs", 0);
+        }
+        "HIdle" => {
+            let held = idles(&mut h, h_at);
+            next.insert("hc", i64::from(held));
+            next.insert("hidle", 1);
+            if !held {
+                next.insert("bturn", 0);
+            }
+        }
+        "BClaim" => {
+            if launches(&mut b) {
+                next.insert("bc", 1);
+                next.insert("bs", 1);
+                next.insert("bturn", 0);
+            } else if state["hidle"] == 1 {
+                next.insert("bwait", 1);
+            }
+        }
+        "BTurn" => {
+            b.touch(Act::Look, at);
+            if state["hc"] == 1 {
+                next.insert("bturn", 1);
+            }
+            if !b.stays_on("pool-a", at) {
+                next.insert("bs", 0);
+            }
+        }
+        "BIdle" => {
+            let held = idles(&mut b, b_at);
+            next.insert("bc", i64::from(held));
+        }
+        "Lie" => {
+            next.insert("lie", 1 - state["lie"]);
+        }
+        "Old" => {
+            next.insert("old", 1 - state["old"]);
+            next.insert("bturn", 0);
+        }
+        other => panic!("no AccountClaimRank step {other}"),
+    }
+    next
+}
+
+/// Every enabled `AccountClaimRank` step of the code is a model successor, from every state the
+/// model reaches, and the model holds its laws with each of its mutants caught. A home with no
+/// pool file ([`Scope::Homes`]) steps exactly as one with a pool file, from every such state.
+///
+/// Negative controls: the model's own, a home refused its account for a borrower's earlier lease
+/// is no `HClaim` successor and breaks `HomeNotRefusedByABorrower`. In the code:
+/// - with first-come ranking (`senior_of` passing `homes_first` false), the home was refused for
+///   the borrower's lease (`HClaim from {"bc": 1, "bs": 1, .., "hc": 0, .., "hwait": 0, "lie": 0}
+///   gave {.., "hwait": 1, ..}`);
+/// - with a claim's kind taken from its row, the same refusal once the borrower's row lies
+///   (`HClaim from {.., "lie": 1} gave {.., "hwait": 1, ..}`);
+/// - with a home's claims kept at a look whatever their use, the idle home kept its claim
+///   (`HIdle from {.., "hc": 1, "hidle": 0, ..} gave {.., "hc": 1, "hidle": 1, ..}`);
+/// - with every reader ranking first-come while a live holder's row does (the rule before the
+///   session lead's decision of 2026-11-14), the home was refused for the first-come borrower's
+///   lease (`HClaim from {.., "bc": 1, .., "hc": 0, .., "old": 1, ..} gave {.., "hwait": 1, ..}`).
+#[test]
+fn account_claim_rank_conforms() {
+    let model = aterm_models_harness::account_claim_rank_model();
+    assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
+    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
+    assert!(faults.is_empty(), "{faults:#?}");
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if !model.action_enabled(action.name, &state) {
+                continue;
+            }
+            let next = claim_rank_transition(&state, action.name);
+            assert!(
+                model.successors(action.name, &state).contains(&next),
+                "{} from {state:?} gave {next:?}",
+                action.name
+            );
+            // A home with no pool file steps exactly as one with a pool file.
+            assert_eq!(
+                claim_rank_step(&state, action.name, Scope::Homes),
+                next,
+                "{} from {state:?}, H with no pool file",
+                action.name
+            );
+        }
+    }
+    for old in [0, 1] {
+        let lent = aterm_spec::interp::State::from([
+            ("hc", 0),
+            ("bc", 1),
+            ("hs", 0),
+            ("bs", 1),
+            ("bturn", 0),
+            ("lie", 0),
+            ("old", old),
+            ("hidle", 0),
+            ("hwait", 0),
+            ("bwait", 0),
+        ]);
+        let mut refused = lent.clone();
+        refused.insert("hwait", 1);
+        assert!(!model.successors("HClaim", &lent).contains(&refused));
+        assert!(!model.check_invariant("HomeNotRefusedByABorrower", &refused));
+    }
 }

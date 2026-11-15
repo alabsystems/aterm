@@ -211,7 +211,11 @@ fn the_migration_keeps_the_pet_a_cursor_had() {
             "{flying}"
         );
         let look = resolve_trail_presentation("rainbow", drawn.cursor_pet_raw());
-        assert_eq!((look.pet_species, look.pet_flies), (None, true), "{flying}");
+        assert_eq!(
+            (look.pet_species, look.pet_flier),
+            (None, Some(aterm_effects::kitty_pet::PetSpecies::Cat)),
+            "{flying}"
+        );
     }
     // The retired master on with no style drew the default style and its cat on every
     // platform, Windows included: the cat is written, and drawn before it is.
@@ -280,7 +284,7 @@ mod on_disk {
             let dir = scratch.path().join("config");
             std::fs::create_dir(&dir).expect("the config folder");
             let path = dir.join("aterm.toml");
-            std::fs::write(&path, text).expect("the old file");
+            crate::test_scratch::write_config(&path, text);
             let stamp = CursorMigrationStamp::at(scratch.path().join("state").join("stamp"));
             Self {
                 _scratch: scratch,

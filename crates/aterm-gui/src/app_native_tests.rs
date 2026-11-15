@@ -2005,9 +2005,24 @@ fn saturated_boot_health_queue_retains_nonblocking_retry() {
 
 #[test]
 fn recovery_host_revalidates_capabilities_and_never_interprets_diagnostics() {
+    let recover = |app: &mut App, request| {
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let received = std::rc::Rc::clone(&outcome);
+        app.execute_recovery_request(
+            WindowId(0),
+            request,
+            |_| true,
+            move |_, result| {
+                *received.borrow_mut() = Some(result);
+                Ok(())
+            },
+        )
+        .unwrap();
+        outcome.take().expect("headless recovery completed")
+    };
     let mut app = App::headless_for_test();
-    let denied = app.execute_recovery_request(
-        WindowId(0),
+    let denied = recover(
+        &mut app,
         crate::native_app::RecoveryRequest::OpenOriginal {
             uri: "file:///tmp/safe.md\nhttps://attacker.example".to_string(),
         },
@@ -2017,8 +2032,8 @@ fn recovery_host_revalidates_capabilities_and_never_interprets_diagnostics() {
         crate::native_app::RecoveryOutcome::Denied { .. }
     ));
 
-    let invalid_route = app.execute_recovery_request(
-        WindowId(0),
+    let invalid_route = recover(
+        &mut app,
         crate::native_app::RecoveryRequest::Retry(
             crate::native_app::RecoveryCapability::Settings {
                 route: "../../diagnostics-from-metadata".to_string(),
@@ -2030,8 +2045,8 @@ fn recovery_host_revalidates_capabilities_and_never_interprets_diagnostics() {
         crate::native_app::RecoveryOutcome::Denied { .. }
     ));
 
-    let settings = app.execute_recovery_request(
-        WindowId(0),
+    let settings = recover(
+        &mut app,
         crate::native_app::RecoveryRequest::Retry(
             crate::native_app::RecoveryCapability::Settings {
                 route: "/about".to_string(),
@@ -2069,6 +2084,7 @@ fn recovery_host_revalidates_capabilities_and_never_interprets_diagnostics() {
                     capability: Some(RecoveryCapability::Settings {
                         route: SettingsRoute::About.path().to_string(),
                     }),
+                    origin: crate::native_app::RecoveryOrigin::Restore,
                 }),
                 AppViewState::Recovery(Default::default()),
                 crate::tab_model::TabPresentation {
@@ -2190,6 +2206,113 @@ fn recovery_host_revalidates_capabilities_and_never_interprets_diagnostics() {
         assert!(app.structural_invariants_ok());
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn document_actions_from_closed_views_do_not_open_tabs() {
+    use crate::native_app::{
+        ActionInvocation, AppKind, AppViewState, NativeApp, RecoveryApp, RecoveryCapability,
+    };
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = scratch.path().join("retry.md");
+    std::fs::write(&path, "# A document\n").unwrap();
+    let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+    for recovery in [false, true] {
+        for close_source in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let (instance, tab, view, effect) = if recovery {
+                let (instance, tab, view) = app
+                    .install_new_native_tab(
+                        wid,
+                        NativeApp::Recovery(RecoveryApp {
+                            restore_tag: "markdown".into(),
+                            reason: "The saved document needs reopening".into(),
+                            metadata: String::new(),
+                            capability: Some(RecoveryCapability::Document {
+                                kind: AppKind::Markdown,
+                                uri: uri.clone(),
+                                config_editor: false,
+                            }),
+                            origin: crate::native_app::RecoveryOrigin::Restore,
+                        }),
+                        AppViewState::Recovery(Default::default()),
+                        crate::tab_model::TabPresentation {
+                            title: "Recovery".into(),
+                            icon: Some(crate::tab_model::TabIconKind::Recovery),
+                            indicators: Default::default(),
+                            conn: None,
+                            closable: true,
+                            tooltip: None,
+                        },
+                    )
+                    .unwrap();
+                let effect = app
+                    .native_runtime
+                    .dispatch(
+                        instance,
+                        view,
+                        AppEvent::Action(ActionInvocation {
+                            id: crate::native_ui::ActionId::new("recovery/retry"),
+                            value: None,
+                        }),
+                    )
+                    .unwrap()
+                    .effects
+                    .into_iter()
+                    .find(|effect| matches!(effect, AppEffect::Recovery { .. }))
+                    .unwrap();
+                (instance, tab, view, effect)
+            } else {
+                app.open_document_tab_in_window(wid, AppKind::Markdown, &uri)
+                    .unwrap();
+                let (instance, view) = app.active_native_view(wid).unwrap();
+                let tab = app.windows[&wid].tab_set.active_id().unwrap();
+                let document = app.native_runtime.document_id(instance).unwrap();
+                (
+                    instance,
+                    tab,
+                    view,
+                    AppEffect::OpenDocumentEditor { document },
+                )
+            };
+            if close_source {
+                app.close_view_keeping_front(wid, tab, view).unwrap();
+                assert!(app.locate_native_view(view).is_err());
+            }
+            let before = app.windows[&wid].tab_set.len();
+            crate::app_documents::take_document_requests_for_test();
+            app.execute_native_effect(wid, instance, view, effect)
+                .unwrap();
+            assert_eq!(
+                crate::app_documents::take_document_requests_for_test(),
+                usize::from(!close_source),
+                "only a live source requests admission: recovery={recovery}, close_source={close_source}",
+            );
+            assert_eq!(
+                app.windows[&wid].tab_set.len(),
+                before + usize::from(recovery && !close_source),
+                "recovery={recovery}, close_source={close_source}"
+            );
+            if !close_source {
+                let (opened, _) = app.active_native_view(wid).unwrap();
+                assert_eq!(
+                    app.native_runtime.app(opened).unwrap().kind(),
+                    AppKind::Editor
+                );
+                if recovery {
+                    let Some(AppViewState::Recovery(state)) = app.native_runtime.view_state(view)
+                    else {
+                        panic!("source recovery remains")
+                    };
+                    assert!(state.pending.is_none());
+                    assert!(state.notice.is_some());
+                }
+            }
+            assert!(app.structural_invariants_ok());
+        }
+    }
 }
 
 #[test]
@@ -3185,7 +3308,9 @@ fn boot_health_handlers_follow_the_confirmation_model() {
             continue;
         }
         let app_at_state = || {
-            let mut app = App::headless_for_test();
+            // The transition arms retain several fixtures; keep their full App values off
+            // this model walk's stack while each handler still receives a fresh instance.
+            let mut app = Box::new(App::headless_for_test());
             app.native_updater_service =
                 crate::native_updater_service::NativeUpdaterService::new(12, "1.0.12", true);
             app.boot_health_confirmation = match state["state"] {
@@ -10890,7 +11015,8 @@ fn a_wait_that_begins_after_a_read_one_ended_is_said_again() {
         app.try_pending_native_auto_apply(false);
     }
     let first = waits_row(&app).expect("PRECONDITION: the exhaustion said the wait");
-    assert!(app.messages.mark_seen(first, std::time::Instant::now()));
+    let (wall, now) = (app.messages_wall.now(), std::time::Instant::now());
+    assert!(app.messages.mark_seen(first, wall, now));
     app.note_update_blockers(&[App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY.to_string()], true);
     assert!(
         waits_row(&app).is_none(),
@@ -13054,6 +13180,92 @@ fn bare_return_activates_the_pages_primary_default_button() {
         state.feedback.is_some(),
         "unfocused Return must fire the page's Primary (default) button"
     );
+}
+
+/// Settings ▸ This Mac's primary is its page's default only over words the person typed, so an
+/// unfocused Return on arrival, with nothing typed, presses nothing: not the Save an unchanged
+/// seeded number offers, which would rename this Mac with no word of the person's. Once a field
+/// holds typed words and the keyboard is in no control, Return presses Save, as About's default
+/// above; it is a person-only write, so the same Return in a control client's input dispatch (an
+/// `hwkey` burst's mark) is refused at dispatch and asks the host for nothing. NEGATIVE CONTROL:
+/// the person's own Return over typed words reaches the host, which answers it on the page's
+/// notice (no name writer runs in this process).
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unfocused_return_saves_this_mac_only_over_a_persons_typed_words() {
+    use crate::machine_title::page::fixture::{Names, found, named};
+    use crate::native_app::ActionInvocation;
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    let wid = WindowId(0);
+    let scratch = named(aterm_types::machine_name::Class::Seeded, 7, "Heron");
+    let names = Names::authorized(Ok(true));
+    let enter = crate::input::InputEvent::Key {
+        key: Key::Named(NamedKey::Enter),
+        mods: Modifiers::empty(),
+        base_layout: None,
+        layout_text: None,
+        event_type: KeyEventType::Press,
+    };
+    let default = |app: &App| {
+        app.compiled_native_ui(wid)
+            .unwrap()
+            .default_action
+            .map(|(key, _)| key)
+    };
+    for person in [false, true] {
+        let mut app = App::headless_for_test();
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.cols = 160;
+            ws.rows = 60;
+        }
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Machine));
+        let seq = app.machine_page.reads;
+        app.machine_page_read(seq, found(&scratch, &[], &names));
+        assert_eq!(
+            default(&app),
+            None,
+            "an unchanged seeded number's Save acts on nothing typed, so it is no default"
+        );
+        assert!(
+            !app.activate_native_focus(wid).unwrap_or(false),
+            "the page holds no activatable focus, so Return falls to the default"
+        );
+        app.with_controller_mark(!person, |app| app.native_input_event(wid, &enter));
+        assert_eq!(
+            app.machine_page.state.notice, None,
+            "person={person}: a Return on arrival asks the host for nothing"
+        );
+
+        let (_, view) = app.active_native_view(wid).unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            crate::native_app::AppEvent::Action(ActionInvocation {
+                id: crate::native_ui::ActionId::new("name/field/nick"),
+                value: Some(crate::native_app::SemanticInput::Text("Wren".to_owned())),
+            }),
+        )
+        .expect("the Nickname field takes the words");
+        app.native_runtime
+            .view_state_mut(view)
+            .expect("the view")
+            .common_mut()
+            .last_focus = None;
+        assert_eq!(
+            default(&app),
+            Some(crate::native_ui::UiKey::new("name/primary")),
+            "a typed nickname's Save is the default"
+        );
+        assert!(!app.activate_native_focus(wid).unwrap_or(false));
+        app.with_controller_mark(!person, |app| app.native_input_event(wid, &enter));
+        let notice = app.machine_page.state.notice.clone();
+        assert_eq!(
+            notice.is_some(),
+            person,
+            "person={person}: the host was asked only by the person's Return ({notice:?})"
+        );
+    }
 }
 
 #[test]
@@ -15522,6 +15734,119 @@ fn tab_reaches_every_control_of_a_settings_list_at_220x12() {
     }
     crate::native_appearance::install_preferences(preferences);
     assert!(walked > 10, "{walked} pages walked");
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+/// Read-state twin of [`tab_reaches_every_control_of_a_settings_list_at_220x12`], whose sweep
+/// draws Settings ▸ This Mac only while it reads: at 220x12 with 2x text, over a read holding
+/// the widest nickname on the largest number, renamed once so Undo Last Rename is available
+/// under LAST CHANGE and HISTORY lists two renames, Page Down by Page Down draws every control
+/// of the page, and Tab and Shift-Tab from the search field each reach every one drawn.
+#[cfg(target_os = "macos")]
+#[test]
+fn page_down_walks_the_read_page() {
+    use crate::machine_title::page::fixture::{Names, WIDEST_NICK, found, named, rename};
+    use crate::native_settings::SettingsRoute;
+    use aterm_types::machine_name::Class;
+    let scratch = named(Class::Chosen, 999_999, WIDEST_NICK);
+    rename(&scratch, Class::Chosen, 999_998, WIDEST_NICK);
+    let names = Names::authorized(Err("not readable here".to_owned()));
+    let preferences = crate::native_appearance::current_preferences();
+    crate::native_appearance::install_preferences(
+        crate::native_appearance::AppearancePreferences {
+            text_scale: 2.0,
+            ..preferences
+        },
+    );
+    let chrome = |key: &crate::native_ui::UiKey| {
+        let key = key.as_str();
+        key.starts_with("settings/nav/")
+            || key.starts_with("settings/search")
+            || key.starts_with("settings/compact-navigation")
+    };
+    let wid = WindowId(0);
+    let fresh = || {
+        let mut app = App::headless_for_test();
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.cols = 220;
+            ws.rows = 12;
+        }
+        assert!(app.open_settings_tab(SettingsRoute::Machine));
+        let seq = app.machine_page.reads;
+        app.machine_page_read(seq, found(&scratch, &[], &names));
+        app
+    };
+    let mut app = fresh();
+    let mut drawn = std::collections::BTreeSet::new();
+    let mut screen_before = None;
+    for _ in 0..48 {
+        let compiled = app.compiled_native_ui(wid).unwrap();
+        let screen = compiled
+            .paint
+            .iter()
+            .map(|node| (node.key.as_str().to_string(), node.rect.y.to_bits()))
+            .collect::<Vec<_>>();
+        if screen_before.as_ref() == Some(&screen) {
+            break;
+        }
+        drawn.extend(
+            compiled
+                .focus_order
+                .iter()
+                .filter(|key| !chrome(key))
+                .map(|key| key.as_str().to_string()),
+        );
+        screen_before = Some(screen);
+        if app
+            .dispatch_native_event(wid, crate::native_app::AppEvent::ScrollPage(1))
+            .is_err()
+        {
+            break;
+        }
+    }
+    let mut faults = Vec::new();
+    for key in [
+        "name/field/number",
+        "name/field/nick",
+        "name/primary",
+        "name/press/undo",
+    ] {
+        if !drawn.contains(key) {
+            faults.push(format!("Page Down never draws {key}: {drawn:?}"));
+        }
+    }
+    for backwards in [false, true] {
+        let mut app = fresh();
+        let _ = app.compiled_native_ui(wid).unwrap();
+        let (_, view) = app.active_native_view(wid).expect("Settings");
+        app.focus_native_control(
+            wid,
+            view,
+            crate::native_ui::UiKey::new("settings/search"),
+            true,
+        )
+        .unwrap();
+        let mut reached = std::collections::BTreeSet::new();
+        for _ in 0..(2 * drawn.len() + 12) {
+            app.move_native_focus(wid, backwards).unwrap();
+            let _ = app.compiled_native_ui(wid).unwrap();
+            if let Some(key) = app
+                .native_runtime
+                .view_state(view)
+                .and_then(|state| state.common().last_focus.clone())
+            {
+                reached.insert(key.as_str().to_string());
+            }
+        }
+        let missed = drawn.difference(&reached).collect::<Vec<_>>();
+        if !missed.is_empty() {
+            faults.push(format!(
+                "{}: Tab never reaches {missed:?}",
+                if backwards { "backwards" } else { "forwards" }
+            ));
+        }
+    }
+    crate::native_appearance::install_preferences(preferences);
     assert!(faults.is_empty(), "{}", faults.join("\n"));
 }
 

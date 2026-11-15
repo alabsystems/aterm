@@ -329,6 +329,7 @@ pub(crate) fn host_error(path: &Path, error: &DocumentHostError) -> String {
 const fn store_words(error: &DocumentError) -> &'static str {
     match error {
         DocumentError::UnknownDocument | DocumentError::UnknownView => "the buffer is gone",
+        DocumentError::PreparedConsumed => "the document changed while it was opening",
         DocumentError::ReadOnly => "the directory is read-only",
         DocumentError::Closing | DocumentError::CloseNotReady => "the buffer is closing",
         DocumentError::InvalidRange | DocumentError::OverlappingEdits => {
@@ -449,12 +450,9 @@ impl Tui {
             .grant_admitted(admitted, GrantAccess::ReadWrite)
             .map_err(refused)?;
         let mut store = DocumentStore::new(self.write);
-        let document = store.open(uri, granted.text.clone());
-        if let Some(listing) = granted.directory {
-            store
-                .set_directory(document, listing)
-                .map_err(|error| format!("directory open failed: {error:?}"))?;
-        }
+        let document = store
+            .open_prepared(uri, granted.prepared_text.clone())
+            .map_err(|error| named(format!("document preparation: {error:?}")))?;
         // A file whose every line ends CRLF is held with LF: a yank writes a kill's CRLF as LF.
         self.workspace.crlf_on_disk = matches!(
             granted.observed.encoding().eol,
@@ -462,7 +460,7 @@ impl Tui {
         );
         let mut persistence = DocumentPersistenceStore::default();
         persistence
-            .register(document, granted.grant.id, granted.observed, &granted.text)
+            .register_prepared(document, &granted)
             .map_err(|_| named("it is already open in this run".to_string()))?;
         self.workspace.forget(document);
         let view_id = DocumentViewId(self.next_view);
@@ -471,12 +469,13 @@ impl Tui {
             .workspace
             .attach(&mut store, document, view_id)
             .map_err(|e| named(error_text(&e).to_string()))?;
+        store.publish_prepared(document);
         if let Some(listing) = store.directory(document) {
             view.selections = vec![Selection::caret(
                 listing.entries.first().map_or(0, |(range, _)| range.start),
             )];
         }
-        let text: Arc<str> = Arc::from(granted.text.as_str());
+        let text: Arc<str> = granted.prepared_text.projection();
         if let Some((line, column)) = target.line {
             view.selections = vec![Selection::caret(line_column_offset(&text, line, column))];
             view.primary = 0;
@@ -1116,7 +1115,7 @@ impl Tui {
     }
 }
 
-fn read_disk(buffer: &Buffer, saving: bool) -> Result<files::GrantedDocument, String> {
+fn read_disk(buffer: &Buffer, saving: bool) -> Result<files::ObservedDocument, String> {
     let words = |failure: &Failure<'_>| save_words::words(Speaker::Amacs, &buffer.path, failure);
     let grant = buffer
         .persistence

@@ -885,13 +885,42 @@ fn space_numbers(
     out
 }
 
-/// The view of session `sid` over the chains a read gathered.
+/// Which of a session's logs a read answers. A log is a seq space of its own base, and one sid
+/// can name several: a tab keeps its ID across a cold restore (LT-01), and each launch that
+/// restores it starts it a log above every epoch its last one reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// The newest log.
+    Newest,
+    /// The `back`-th log (`1`: the one just before) before the log whose base is `below`, or
+    /// before the newest log where `below` is `None`; `back = 0` picks none.
+    Before {
+        /// The base of the log the pick counts back from (`None`: the newest log's).
+        below: Option<u32>,
+        /// How many logs back.
+        back: u32,
+    },
+}
+
+/// The view of session `sid`'s newest log over the chains a read gathered.
 #[must_use]
 pub fn view_of(
     sid: &ShortId,
     chains: &[ChainRead],
     unread: bool,
     rules: ViewRules,
+) -> Option<View> {
+    view_picked(sid, chains, unread, rules, Pick::Newest)
+}
+
+/// The view of the log of session `sid` that `pick` names, over the chains a read gathered.
+#[must_use]
+pub fn view_picked(
+    sid: &ShortId,
+    chains: &[ChainRead],
+    unread: bool,
+    rules: ViewRules,
+    pick: Pick,
 ) -> Option<View> {
     let numbers = space_numbers(sid, chains, rules);
     let number = |ci: usize, base: u32| numbers.get(&(ci, base)).copied().unwrap_or(0);
@@ -1011,8 +1040,25 @@ pub fn view_of(
             }
         }
     }
-    let ((base, _), sp) = spaces.into_iter().next_back()?;
+    let ((base, _), sp) = picked(spaces, pick)?;
     build(base, sp, chains, &handed, unread, rules)
+}
+
+/// The space `pick` names among `spaces`, keyed `(base, number)` and so ordered oldest first.
+fn picked(spaces: BTreeMap<(u32, u32), Space>, pick: Pick) -> Option<((u32, u32), Space)> {
+    let mut newest_first = spaces.into_iter().rev();
+    match pick {
+        Pick::Newest => newest_first.next(),
+        Pick::Before {
+            below: Some(below),
+            back,
+        } => newest_first
+            .filter(|((base, _), _)| *base < below)
+            .nth(usize::try_from(back.checked_sub(1)?).ok()?),
+        Pick::Before { below: None, back } => {
+            newest_first.nth(usize::try_from(back).ok().filter(|b| *b > 0)?)
+        }
+    }
 }
 
 fn build(

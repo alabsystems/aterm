@@ -8,15 +8,14 @@
 
 use std::path::Path;
 
-use aterm_agent::supervise::journal::Word;
-use aterm_agent::supervise::policy::go_ahead::{
+use alab_policy::config::TurnEndTiming;
+use alab_policy::go_ahead::{
     GO_AHEAD_ANSWER, GO_AHEAD_DROP, RULE_GO_AHEAD, TOKEN_CLOSE, TOKEN_OPEN,
 };
-use aterm_agent::supervise::policy::needs::NEEDS_YOU;
+use alab_policy::needs::NEEDS_YOU;
+use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND};
+use aterm_agent::supervise::journal::Word;
 use aterm_agent::supervise::policy::outlook::ExceptionKind;
-use aterm_agent::supervise::policy::turn_end::{
-    RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, TurnEndTiming,
-};
 
 use crate::forever::{self, Chain, Repo};
 use crate::lab::Launch;

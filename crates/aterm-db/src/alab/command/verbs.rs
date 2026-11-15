@@ -1084,11 +1084,11 @@ fn edited(name: &str) -> Result<&'static crate::typed::Collection> {
     }
 }
 
-/// `edit accounts|preferences|machines|mail [--show-addresses]`: the collection as a grid in
+/// `edit accounts|preferences|machines|mail`: the collection as a grid in
 /// amacs, written back through the grid's three-way save (`att::edit`): a cell is written only
 /// while its candidates are the exported ones, a cell that changed meanwhile reopens with both
 /// values, a deleted row retires (a preference ends), a new row is born under its derived key.
-/// Addresses show masked unless `--show-addresses`.
+/// Addresses show as they are; a secret cell shows the store entry it names, read-only.
 pub(super) fn edit(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value> {
     let [name] = args.operands.as_slice() else {
         return Err(Error::new(
@@ -1099,15 +1099,7 @@ pub(super) fn edit(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value>
     let handle = Handle::at(paths.clone(), &att::REGISTRY);
     let mut problems = Vec::new();
     let mut report = |line: &str| problems.push(line.to_owned());
-    let edited = att::edit_grid(
-        &handle,
-        collection,
-        &[],
-        args.reveal,
-        None,
-        &mut *io.open,
-        &mut report,
-    )?;
+    let edited = att::edit_grid(&handle, collection, &[], &mut *io.open, &mut report)?;
     Ok(json!({
         "collection": collection.name,
         "rounds": edited.rounds,

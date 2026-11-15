@@ -579,12 +579,12 @@ fn another_harness_processs_hand_is_no_outside_hand() {
 
 #[test]
 fn who_roster_exposes_a_unique_foreground_group_without_a_window_hop() {
-    let body = "0 s-a driving=- watchers=0 turns=0 alive nonce=0123456789abcdef0123456789abcdef fgpgid=101\n\
-                1 s-b driving=- watchers=1 turns=3 alive nonce=abcdef0123456789abcdef0123456789 fgpgid=-\n";
+    let body = "0 t000000000a driving=- watchers=0 turns=0 alive nonce=0123456789abcdef0123456789abcdef fgpgid=101\n\
+                1 t000000000b driving=- watchers=1 turns=3 alive nonce=abcdef0123456789abcdef0123456789 fgpgid=-\n";
     let tabs = parse_host_roster("OK 2", body).expect("who roster");
     assert_eq!(tabs[0].fgpgid, Some(101));
     assert_eq!(tabs[1].fgpgid, None);
-    assert_eq!(unique_tab_for_group(&tabs, 101), Some("s-a"));
+    assert_eq!(unique_tab_for_group(&tabs, 101), Some("t000000000a"));
     assert_eq!(parse_host_roster("OK 0", ""), Some(Vec::new()));
     assert_eq!(parse_host_roster("OK 1", body), None);
     assert_eq!(parse_host_roster("OK 3", body), None);
@@ -594,14 +594,14 @@ fn who_roster_exposes_a_unique_foreground_group_without_a_window_hop() {
     assert_eq!(parse_host_roster("ERR busy", body), None);
     assert_eq!(parse_host_roster("OKAY", body), None);
     assert_eq!(
-        parse_host_roster("OK 2", &body.replace("s-b", "s-a")),
+        parse_host_roster("OK 2", &body.replace("t000000000b", "t000000000a")),
         None,
         "duplicate tab ids are not an ownership roster"
     );
     let ambiguous = [
         tabs[0].clone(),
         LiveTab {
-            sid: "s-c".to_string(),
+            sid: "t000000000c".to_string(),
             fgpgid: Some(101),
         },
     ];
@@ -2732,19 +2732,14 @@ fn parked_bare() -> Command {
     c
 }
 
-/// Wait until `pid` runs this test binary (a fork not yet exec'd still reads
-/// as its parent).
+/// Wait until `pid` runs this test binary with its arguments laid out
+/// (`aterm_uds::deadline::execd`). A spawn's child reads as this process until
+/// its exec, and inside the exec, once the parent's spawn has returned, its
+/// arguments still read empty until the kernel lays them out; the stand-in is
+/// this same binary, so only its argument record tells the exec is done.
 fn wait_exec(pid: u32) {
     let me = std::env::current_exe().expect("exe");
-    for _ in 0..3_000 {
-        if atpkg::caller_shell::process_args(pid)
-            .is_some_and(|a| Path::new(&a.exec_path).file_name() == me.file_name())
-        {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("the stand-in agent {pid} never started");
+    aterm_uds::deadline::execd(i32::try_from(pid).expect("a pid"), &me);
 }
 
 /// Claude's session file for `pid`, with the kernel's start time.
@@ -2910,9 +2905,9 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder() {
     let model = aterm_models_harness::harness_upgrade_notice_owner_model();
     let nine = Version::parse("9.9.9").expect("version");
     for (name, b_tab, recycled, holder) in [
-        ("gone-same-tab", "s-a", false, "Resume"),
-        ("gone-other-tab", "s-b", false, "OtherTab"),
-        ("gone-recycled", "s-a", true, "Recycled"),
+        ("gone-same-tab", "t000000000a", false, "Resume"),
+        ("gone-other-tab", "t000000000b", false, "OtherTab"),
+        ("gone-recycled", "t000000000a", true, "Recycled"),
     ] {
         let dir = scratch(name);
         let (sock, asked) = instance_of(&dir, b_tab);
@@ -2941,7 +2936,7 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder() {
         let sf_b = register(&opts.home, b.id(), SESSION);
         let mut a = (!recycled).then(|| {
             let a = parked()
-                .env("ATERM_PARENT_SESSION_ID", "s-a")
+                .env("ATERM_PARENT_SESSION_ID", "t000000000a")
                 .spawn()
                 .expect("A");
             wait_exec(a.id());
@@ -2967,7 +2962,7 @@ fn a_notice_whose_process_is_gone_is_asked_afresh_of_the_live_holder() {
             pending_since: salt,
             last_seq: 77,
             seq_since_s: now - 3_600,
-            tab: "s-a".to_string(),
+            tab: "t000000000a".to_string(),
             notice_pid,
             notice_start: squash(&notice_start),
             ..St::default()
@@ -3757,18 +3752,18 @@ pub(super) fn fake_tab(
 fn the_roster_names_another_supervisors_tabs_and_the_off_ones_never_the_windows_own() {
     const ROSTER: &str = concat!(
         "OK 8\n",
-        "1 s-a - live claude meta=1 window=1 supervisor=aterm-supervise:42 autopilot=off \
+        "1 t000000000a - live claude meta=1 window=1 supervisor=aterm-supervise:42 autopilot=off \
          upgrade=-\n",
-        "2 s-b - live claude meta=1 window=1 supervisor=aterm-harness@777 autopilot=cruise \
+        "2 t000000000b - live claude meta=1 window=1 supervisor=aterm-harness@777 autopilot=cruise \
          upgrade=-\n",
-        "3 s-c - live zsh meta=0 window=1 supervisor=- autopilot=- upgrade=-\n",
-        "4 s-d s-a live supervisor=aterm-supervise:9 meta=0 window=1 supervisor=- autopilot=- \
+        "3 t000000000c - live zsh meta=0 window=1 supervisor=- autopilot=- upgrade=-\n",
+        "4 t000000000d t000000000a live supervisor=aterm-supervise:9 meta=0 window=1 supervisor=- autopilot=- \
          upgrade=-\n",
-        "5 s-e - live claude meta=1 window=1 supervisor=aterm-harness%40778 autopilot=land \
+        "5 t000000000e - live claude meta=1 window=1 supervisor=aterm-harness%40778 autopilot=land \
          upgrade=-\n",
-        "6 s-f - live claude meta=1 window=1 supervisor=a%20script upgrade=-\n",
-        "7 s-g - live claude meta=1 window=1 supervisor=- autopilot=off upgrade=-\n",
-        "8 s-h - live autopilot=off meta=1 window=1 supervisor=- autopilot=cruise upgrade=-",
+        "6 t000000000f - live claude meta=1 window=1 supervisor=a%20script upgrade=-\n",
+        "7 t000000000g - live claude meta=1 window=1 supervisor=- autopilot=off upgrade=-\n",
+        "8 t000000000h - live autopilot=off meta=1 window=1 supervisor=- autopilot=cruise upgrade=-",
     );
     // Each fake answers: its roster read waits the hang detector, not the 2 s claims wait.
     let (mut c, server) = fake_tab(vec![ROSTER]);
@@ -3777,8 +3772,8 @@ fn the_roster_names_another_supervisors_tabs_and_the_off_ones_never_the_windows_
     assert_eq!(
         aside,
         Some(Aside {
-            claimed: ["s-a", "s-f"].map(str::to_string).into(),
-            off: ["s-a", "s-g"].map(str::to_string).into(),
+            claimed: ["t000000000a", "t000000000f"].map(str::to_string).into(),
+            off: ["t000000000a", "t000000000g"].map(str::to_string).into(),
             ..Aside::default()
         }),
         "another's claim, never the window's own; the owner's Off"
@@ -3806,19 +3801,19 @@ fn the_roster_names_another_supervisors_tabs_and_the_off_ones_never_the_windows_
 #[test]
 fn the_aside_of_every_instance_is_one() {
     let (a, _) = fake_tab(vec![
-        "OK 1\n1 s-a - live claude meta=1 window=1 supervisor=aterm-supervise:42 upgrade=-",
+        "OK 1\n1 t000000000a - live claude meta=1 window=1 supervisor=aterm-supervise:42 upgrade=-",
     ]);
     let (b, _) = fake_tab(vec![concat!(
         "OK 2\n",
-        "1 s-b - live claude meta=1 window=1 supervisor=a%20script upgrade=-\n",
-        "2 s-o - live claude meta=1 window=1 supervisor=- autopilot=off upgrade=-",
+        "1 t000000000b - live claude meta=1 window=1 supervisor=a%20script upgrade=-\n",
+        "2 t0000000000 - live claude meta=1 window=1 supervisor=- autopilot=off upgrade=-",
     )]);
     let (refused, _) = fake_tab(vec!["ERR denied"]);
     assert_eq!(
         aside_of_within([a, refused, b], &[], aterm_spec::wait::MUST_HAPPEN),
         Aside {
-            claimed: ["s-a", "s-b"].map(str::to_string).into(),
-            off: ["s-o"].map(str::to_string).into(),
+            claimed: ["t000000000a", "t000000000b"].map(str::to_string).into(),
+            off: ["t0000000000"].map(str::to_string).into(),
             ..Aside::default()
         }
     );
@@ -3832,8 +3827,8 @@ fn a_switched_off_agents_tab_is_set_aside_as_its_switchs_on_status() {
     let roster = || {
         fake_tab(vec![concat!(
             "OK 2\n",
-            "1 s-x - live codex meta=1 window=1 program=codex supervisor=- autopilot=off upgrade=-\n",
-            "2 s-c - live claude meta=1 window=1 program=claude supervisor=- autopilot=off upgrade=-",
+            "1 t000000000x - live codex meta=1 window=1 program=codex supervisor=- autopilot=off upgrade=-\n",
+            "2 t000000000c - live claude meta=1 window=1 program=claude supervisor=- autopilot=off upgrade=-",
         )])
         .0
     };
@@ -3842,8 +3837,11 @@ fn a_switched_off_agents_tab_is_set_aside_as_its_switchs_on_status() {
         &[aterm_phase::Program::Codex],
         aterm_spec::wait::MUST_HAPPEN,
     );
-    assert_eq!(aside.agent_off, ["s-x"].map(str::to_string).into());
-    assert_eq!(aside.off, ["s-c", "s-x"].map(str::to_string).into());
+    assert_eq!(aside.agent_off, ["t000000000x"].map(str::to_string).into());
+    assert_eq!(
+        aside.off,
+        ["t000000000c", "t000000000x"].map(str::to_string).into()
+    );
     assert!(
         aside_of_within([roster()], &[], aterm_spec::wait::MUST_HAPPEN)
             .agent_off
@@ -10655,7 +10653,7 @@ fn stand_in_shell_with(cwd: Option<&Path>, env: &[(&str, Option<&str>)]) -> Shel
         };
     }
     let mut child = command.spawn().expect("bash");
-    aterm_uds::deadline::prints(&mut child, "ran", aterm_uds::deadline::ECHO_HANG);
+    aterm_uds::deadline::prints(&mut child, "ran", aterm_uds::deadline::FIRST_EXEC_HANG);
     image.ran();
     ShellChild {
         child,
@@ -15341,7 +15339,16 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         crate::harness::relaunch::ProcessLifetime::capture(pid).is_some(),
         "negative control: this owned fixture PID really does name a live process"
     );
-    let live = snapshot_with(&opts, &Live).map(|s| s.session);
+    // A loaded Mac's process table can stay unread past its wait, and that read refuses as
+    // unread. The read under test is the one that answers, so it is asked until the table is read.
+    let live = aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "a read of the process table",
+        || {
+            let read = snapshot_with(&opts, &Live).map(|s| s.session);
+            (read != Err(crate::harness::relaunch::TERMINAL_UNREAD)).then_some(read)
+        },
+    );
     let execd = PaneProgram::execd(pid);
     let snap = snapshot_with(&opts, &execd);
     let me = std::process::id();
@@ -15367,6 +15374,7 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         homedir: None,
         login: None,
         route: crate::harness::accounts::AuthRoute::Outside,
+        running: None,
         launch_env: None,
         serve: crate::harness::relaunch::Serve::Judge,
     };
@@ -15374,6 +15382,7 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         Ok(p) => Ok(p.line),
         Err(NoPlan::Refused { what, .. }) => Err(what),
         Err(NoPlan::Wait(why)) => Err(format!("wait:{why}")),
+        Err(NoPlan::Account(refusal)) => Err(format!("wait:{}", refusal.kind.word())),
     };
     let restart = restart_with(
         &opts,
@@ -16619,9 +16628,9 @@ fn user_row(text: &str) -> String {
 /// Land's instruction as a [`user_row`], its words escaped for JSON.
 #[cfg(unix)]
 fn land_row() -> String {
-    let json = aterm_json::to_string(&aterm_json::Value::from(
-        crate::supervise::policy::turn_end::land_text(None),
-    ))
+    let json = aterm_json::to_string(&aterm_json::Value::from(alab_policy::words::land_text(
+        None,
+    )))
     .expect("json");
     user_row(&json[1..json.len() - 1])
 }
@@ -16636,7 +16645,7 @@ const LANDED_JSON: &str =
 #[cfg(unix)]
 fn land_check_row() -> String {
     let json = aterm_json::to_string(&aterm_json::Value::from(
-        crate::supervise::policy::turn_end::LAND_CHECK,
+        alab_policy::land_check::LAND_CHECK,
     ))
     .expect("json");
     user_row(&json[1..json.len() - 1])
@@ -16644,7 +16653,7 @@ fn land_check_row() -> String {
 
 /// The land check's answer that lands a task ([`land_check_row`]).
 #[cfg(unix)]
-const LANDED_WORD: &str = crate::supervise::policy::land_check::LANDED;
+const LANDED_WORD: &str = alab_policy::land_check::LANDED;
 
 /// [`user_row`], recorded `at` (Claude Code's `timestamp`).
 #[cfg(unix)]
@@ -18501,6 +18510,7 @@ fn a_relaunch_into_the_shells_own_directory_spelled_another_way_needs_no_cd() {
         let launch = crate::harness::relaunch::Launch {
             auth_observed: true,
             route: crate::harness::accounts::AuthRoute::Outside,
+            running: None,
             launch_env: None,
             serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
@@ -18524,6 +18534,9 @@ fn a_relaunch_into_the_shells_own_directory_spelled_another_way_needs_no_cd() {
         match crate::harness::relaunch::plan(&opts, &launch, pid, &table) {
             Ok(plan) => plan.line,
             Err(crate::harness::relaunch::NoPlan::Wait(what)) => panic!("no plan: wait {what}"),
+            Err(crate::harness::relaunch::NoPlan::Account(refusal)) => {
+                panic!("no plan: account {refusal:?}")
+            }
             Err(crate::harness::relaunch::NoPlan::Refused { why, .. }) => panic!("refused: {why}"),
         }
     };
@@ -18562,6 +18575,7 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
         let launch = crate::harness::relaunch::Launch {
             auth_observed: true,
             route: crate::harness::accounts::AuthRoute::Stored.unless(!stored),
+            running: None,
             launch_env: None,
             serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
@@ -18622,6 +18636,7 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
             auth_observed: true,
             login: Some(renewed),
             route: crate::harness::accounts::AuthRoute::Stored,
+            running: None,
             launch_env: None,
             serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
@@ -22782,17 +22797,24 @@ fn an_attended_ready_session_is_never_signalled_without_the_owners_now() {
 /// AN UPGRADE ENDS NO AGENT ITS RELAUNCH COULD NOT ADMIT, as a restart in place ends none
 /// (`permission_click::a_click_ends_no_agent_its_relaunch_could_not_admit`): an agent on an
 /// outside route records no launch environment, so its relaunch reads the route again at the
-/// shell, and a shell whose environment names no `HOME` admits none there. The upgrade waits
-/// `account` with nothing signalled and the announced record as it was. NEGATIVE CONTROL: the
-/// same upgrade over the shell with its `HOME` signals its agent.
+/// shell, and a shell whose environment names no `HOME`, or names it but not the agent's route
+/// variable (as where an rc file or a typed `export` set it), admits none there. The upgrade waits
+/// `account-unattributed` (the refusal's own word, its reason noted with it), a tab aterm cannot
+/// read and never a change under way, since that shell's environment never changes, with nothing
+/// signalled and the announced record as it was. NEGATIVE CONTROL: the same upgrade over the
+/// shell with its `HOME` and the route signals its agent.
 #[cfg(unix)]
 #[test]
 fn an_upgrade_ends_no_agent_its_relaunch_could_not_admit() {
     use std::os::unix::process::ExitStatusExt as _;
     let marker = "ATERM-UPGRADE-READY-0badf00d";
     let route = ("ANTHROPIC_BASE_URL", Some("https://gateway.invalid"));
-    for no_home in [true, false] {
-        let dir = scratch(&format!("upgrade-account-{no_home}"));
+    for (case, why) in [
+        ("no-home", "home"),
+        ("no-route", "no longer present"),
+        ("control", ""),
+    ] {
+        let dir = scratch(&format!("upgrade-account-{case}"));
         let (sock, asked) = instance_with(&dir, Answers::default());
         let opts = Opts {
             sock: Some(sock),
@@ -22822,26 +22844,34 @@ fn an_upgrade_ends_no_agent_its_relaunch_could_not_admit() {
         };
         std::fs::write(state_path(&h.opts, SESSION), announced.to_json()).expect("state");
         let ended = h.reaped();
-        let shell = if no_home {
-            tty_zsh_with(&[route, ("HOME", None)])
-        } else {
-            tty_zsh_with(&[route])
-        };
+        // The no-route shell is the agent's user's (its `HOME` the drive's home), so only the
+        // route it lacks refuses.
+        let home = h.opts.home.display().to_string();
+        let shell = tty_zsh_with(&match case {
+            "no-home" => vec![route, ("HOME", None)],
+            "no-route" => vec![(route.0, None), ("HOME", Some(home.as_str()))],
+            _ => vec![route],
+        });
         let r = h.visit_under(shell.id());
-        if no_home {
+        if case != "control" {
             shell.end();
-            assert_eq!(r.step, crate::harness::relaunch::WAIT_ACCOUNT, "{r:?}");
+            assert_eq!(r.step, "wait:account-unattributed", "{case}: {r:?}");
+            assert_eq!(
+                super::upgrade_status::wait_class("account-unattributed"),
+                super::upgrade_status::WaitClass::TabUnread,
+                "{case}"
+            );
             let asked = h.asked.lock().map(|a| a.clone()).unwrap_or_default();
             assert!(
                 !asked.iter().any(|l| l.contains(" signal ")),
-                "never signalled: {asked:#?}"
+                "{case}: never signalled: {asked:#?}"
             );
-            assert!(h.details("terminated").is_empty(), "{r:?}");
-            assert_eq!(
-                load(&h.opts, SESSION).map(|st| st.phase),
-                Some(announced.phase.clone()),
-                "the announced record as it was"
-            );
+            assert!(h.details("terminated").is_empty(), "{case}: {r:?}");
+            let st = load(&h.opts, SESSION).expect("record");
+            assert_eq!(st.phase, announced.phase, "the announced record as it was");
+            let noted = st.waits.last().expect("the wait noted");
+            assert_eq!(noted.word, "account-unattributed", "{case}");
+            assert!(noted.note.contains(why), "{case}: its reason: {noted:?}");
         } else {
             let status = ended.recv_timeout(HANG_DETECTOR).expect("the agent ended");
             shell.end();
@@ -27522,18 +27552,24 @@ fn a_pending_round_that_owes_its_agent_a_release_is_carried_on_not_quiet() {
 fn what_the_tabs_own_supervisor_typed_is_no_task() {
     let shell = dead_pid();
     let cfg = crate::supervise::SupervisorConfig {
-        continue_text: "keep going".to_string(),
+        turn_end: alab_policy::config::PolicyConfig {
+            continue_text: "keep going".to_string(),
+            ..alab_policy::config::PolicyConfig::default()
+        },
         ..crate::supervise::SupervisorConfig::default()
     };
     let rows = vec![
         harness_row("Claude Code 2.1.283 (managed) is installed"),
         turn_by("claude-haiku-4-5", "I cannot stop now."),
-        user_row_at(&cfg.continue_text, "1970-01-01T00:00:01.000Z"),
+        user_row_at(&cfg.turn_end.continue_text, "1970-01-01T00:00:01.000Z"),
         turn_by("claude-haiku-4-5", "What would you like me to work on?"),
         user_row_at(&cfg.answer_text, "1970-01-01T00:00:01.000Z"),
         turn_by("claude-haiku-4-5", "Please tell me what to do."),
     ];
-    let typed = [cfg.continue_text.as_str(), cfg.answer_text.as_str()];
+    let typed = [
+        cfg.turn_end.continue_text.as_str(),
+        cfg.answer_text.as_str(),
+    ];
     for (name, ledger, want) in [
         ("ours-ledgered", Some(&typed[..]), "would-restart:fresh"),
         ("ours-unknown", None, "would-announce"),
@@ -27559,11 +27595,14 @@ fn what_the_tabs_own_supervisor_typed_is_no_task() {
 fn the_loops_words_in_another_conversation_are_no_turn_of_this_one() {
     let shell = dead_pid();
     let cfg = crate::supervise::SupervisorConfig {
-        continue_text: "keep going".to_string(),
+        turn_end: alab_policy::config::PolicyConfig {
+            continue_text: "keep going".to_string(),
+            ..alab_policy::config::PolicyConfig::default()
+        },
         ..crate::supervise::SupervisorConfig::default()
     };
     let rows = vec![
-        user_row_at(&cfg.continue_text, "2026-09-30T12:00:00.000Z"),
+        user_row_at(&cfg.turn_end.continue_text, "2026-09-30T12:00:00.000Z"),
         turn_by("claude-haiku-4-5", "Picking up the plan where it stopped."),
     ];
     let (r, _, typed) = visit_seen(
@@ -27573,7 +27612,7 @@ fn the_loops_words_in_another_conversation_are_no_turn_of_this_one() {
         &Script::new(shell, usize::MAX, None),
         77,
         None,
-        Some(&[cfg.continue_text.as_str()][..]),
+        Some(&[cfg.turn_end.continue_text.as_str()][..]),
     );
     assert_eq!(r.step, "would-announce", "{r:?}");
     assert_eq!(typed, 0, "a dry run types nothing");
@@ -28527,8 +28566,8 @@ fn an_older_restores_tab_is_linked_to_its_earlier_tab_by_the_upgrade_ledger() {
 /// [`ledger_tabs`]: every other tab the upgrade ledger names a conversation in, oldest first.
 #[test]
 fn the_upgrade_ledger_names_the_tabs_a_conversation_was_moved_in() {
-    const A: &str = "s-0a";
-    const B: &str = "s-0b";
+    const A: &str = "t000000000a";
+    const B: &str = "t000000000b";
     let row = |t: u64, tab: &str, session: &str| {
         format!(r#"{{"t":{t},"tab":"{tab}","session":"{session}","step":"done"}}"#)
     };
@@ -28609,11 +28648,11 @@ fn the_earlier_tabs_are_the_conversations_and_ride_every_record() {
     assert_eq!(
         earlier_tabs(
             "now",
-            &(0..12).map(|i| format!("s-{i}")).collect::<Vec<_>>()
+            &(0..12).map(|i| format!("t{i:010}")).collect::<Vec<_>>()
         )
         .first()
         .map(String::as_str),
-        Some("s-4"),
+        Some("t0000000004"),
         "the newest EARLIER_TABS"
     );
     for (name, was, kept) in [
@@ -28988,8 +29027,8 @@ fn a_finished_conversation_is_carried_on_with_nothing() {
 #[cfg(unix)]
 #[test]
 fn a_relaunchs_done_check_is_cut_within_the_persons_hour() {
-    use crate::supervise::policy::go_ahead::{NEVER_A_NEED, unless_held};
-    use crate::supervise::policy::turn_end::done_check_words;
+    use alab_policy::go_ahead::{NEVER_A_NEED, unless_held};
+    use alab_policy::words::done_check_words;
     let done = vec![
         user_row("Fix the lexer and land it."),
         turn_by(
@@ -29029,7 +29068,8 @@ fn a_relaunchs_done_check_is_cut_within_the_persons_hour() {
 #[test]
 fn a_relaunch_into_a_done_claim_asks_the_done_check() {
     use super::super::relaunch::CAUSE_MEMORY;
-    use crate::supervise::policy::turn_end::{DONE_CHECK, DONE_CHECK_REVERSIBLE, HostTurn};
+    use crate::supervise::policy::turn_end::HostTurn;
+    use alab_policy::words::{DONE_CHECK, DONE_CHECK_REVERSIBLE};
     let done = vec![
         user_row("Fix the lexer and land it."),
         turn_by(
@@ -29238,8 +29278,10 @@ fn a_relaunch_into_a_done_claim_asks_the_done_check() {
 #[cfg(unix)]
 #[test]
 fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
-    use crate::supervise::policy::turn_end::{
-        DONE_CHECK, LAND, LAND_CHECK, RULE_API_RETRY, wall_retry_text,
+    use crate::supervise::policy::turn_end::{RULE_API_RETRY, wall_retry_text};
+    use alab_policy::{
+        land_check::LAND_CHECK,
+        words::{DONE_CHECK, LAND},
     };
     let at = "2026-10-15T10:00:00.000Z";
     let t_ms = i64::try_from(super::super::unix_time::parse_utc(at).expect("a time"))
@@ -29247,7 +29289,7 @@ fn a_relaunch_into_a_task_a_land_act_landed_types_nothing() {
         * 1000;
     let retry = wall_retry_text(
         RULE_API_RETRY,
-        aterm_phase::WallKind::Overloaded,
+        alab_policy::vocab::WallKind::Overloaded,
         aterm_phase::Program::Claude,
     );
     let wall = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 529 Overloaded"}]},"isApiErrorMessage":true,"error":"unknown"}"#.to_string();
@@ -29462,7 +29504,7 @@ fn a_relaunch_the_tabs_loop_resumed_first_is_carried_on_with_nothing() {
 fn an_owed_relaunch_is_settled_by_its_loops_own_act() {
     use super::super::relaunch::settle;
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::{DONE_CHECK, RULE_DONE_CHECK};
+    use alab_policy::words::{DONE_CHECK, RULE_DONE_CHECK};
     let open = vec![
         user_row("Fix the lexer and land it."),
         turn_by(
@@ -29562,7 +29604,7 @@ fn an_owed_relaunch_is_settled_by_its_loops_own_act() {
 fn a_warning_written_just_after_the_loops_act_is_still_read() {
     use super::super::relaunch::{RESTORE_LOOK, settle};
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::{DONE_CHECK, RULE_DONE_CHECK};
+    use alab_policy::words::{DONE_CHECK, RULE_DONE_CHECK};
     let open = vec![
         user_row("Watch the artifact's comments and answer them."),
         turn_by("claude-opus-5-5", "Watching the comments."),
@@ -29770,7 +29812,7 @@ fn a_settle_the_loops_last_point_missed_is_settled_again_off_the_points() {
 fn an_open_tasks_restore_line_is_the_idle_points_until_its_bound() {
     use super::super::relaunch::{BUSY, RESTORE_LOOK, settle, settles_again};
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::{DONE_CHECK, RULE_DONE_CHECK};
+    use alab_policy::words::{DONE_CHECK, RULE_DONE_CHECK};
     let open = vec![
         user_row("Watch the artifact's comments and answer them."),
         turn_by("claude-opus-5-5", "Watching the comments."),
@@ -29892,7 +29934,8 @@ fn an_open_tasks_restore_line_is_the_idle_points_until_its_bound() {
 #[test]
 fn a_relaunch_keeps_ledger_read_refusals_distinct_from_no_standing_evidence() {
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::{RULE_API_RETRY, RULE_LEFT};
+    use crate::supervise::policy::turn_end::RULE_API_RETRY;
+    use alab_policy::words::RULE_LEFT;
     #[derive(Clone, Copy)]
     enum Book {
         Missing,
@@ -30073,7 +30116,7 @@ fn a_relaunch_preserves_unknown_lineage_and_upgrade_ledger_evidence() {
 #[test]
 fn a_relaunch_into_a_persons_own_exchange_types_nothing() {
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::RULE_LEFT;
+    use alab_policy::words::RULE_LEFT;
     let exchange = vec![
         r#"{"type":"user","uuid":"u-1","promptId":"p-1","isSidechain":false,"message":{"role":"user","content":"Hi"},"origin":{"kind":"human"},"promptSource":"typed"}"#
             .to_string(),
@@ -30200,7 +30243,8 @@ fn a_relaunch_into_a_persons_own_exchange_types_nothing() {
 #[test]
 fn a_relaunch_into_a_persons_exchange_retried_at_a_wall_types_nothing() {
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::{RULE_API_RETRY, RULE_COMPACT, RULE_LEFT};
+    use crate::supervise::policy::turn_end::{RULE_API_RETRY, RULE_COMPACT};
+    use alab_policy::words::RULE_LEFT;
     let retry = "Claude Code reported an overloaded API (529). Carry on.";
     let rows = |answer_ms: u64| {
         vec![
@@ -30293,7 +30337,7 @@ pub(super) fn idle_compaction_rows(kb: usize) -> Vec<String> {
 #[test]
 fn a_relaunch_after_an_idle_compaction_types_nothing_into_a_persons_exchange() {
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::RULE_LEFT;
+    use alab_policy::words::RULE_LEFT;
     let exchange = [
         r#"{"type":"user","uuid":"u-1","isSidechain":false,"message":{"role":"user","content":"Hi"},"origin":{"kind":"human"},"promptSource":"typed"}"#,
         r#"{"type":"assistant","uuid":"a-1","isSidechain":false,"message":{"model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"Hello! How can I help?"}]}}"#,
@@ -30378,7 +30422,7 @@ fn the_finished_memo_keys_the_turn_under_an_idle_compaction() {
 #[test]
 fn a_restored_tabs_loop_reads_the_exchange_its_earlier_tab_left() {
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::RULE_LEFT;
+    use alab_policy::words::RULE_LEFT;
     let dir = scratch("lefts-beside");
     let root = dir.join("aterm-state");
     let opts = Opts {
@@ -30655,7 +30699,7 @@ fn a_finished_conversation_is_moved_quietly_under_upgrade_ask() {
 #[test]
 fn a_persons_own_exchange_left_to_them_is_moved_quietly_under_upgrade_ask() {
     use crate::supervise::approvals;
-    use crate::supervise::policy::turn_end::RULE_LEFT;
+    use alab_policy::words::RULE_LEFT;
     let shell = dead_pid();
     let kernel = || Script::new(shell, usize::MAX, None);
     let idle = Some("OK schema=1 hold=0 hand=- agent=idle agent_since_ms=30000");
@@ -33249,18 +33293,23 @@ fn a_dev_links_twin_is_no_managed_build() {
 #[test]
 fn earlier_tab_notes_cannot_split_one_restored_identity_into_other_tabs() {
     let root = Path::new("/this-ram-test-does-not-open-files");
-    let tab = "s-cafe";
+    let tab = "t000000cafe";
     let decode =
         |body: &str| super::noted_earlier_tabs_read(root, tab, &|_| Some(body.to_string()));
-    let first = super::earlier_tab_note(tab, "s-aaaa", Vec::new()).expect("one earlier tab");
-    assert_eq!(decode(&first), ["s-aaaa"]);
-    assert!(super::earlier_tab_note(tab, "s-aaaa", decode(&first)).is_none());
-    let next = super::earlier_tab_note(tab, "s-bbbb", decode(&first)).expect("another earlier tab");
-    assert_eq!(decode(&next), ["s-aaaa", "s-bbbb"]);
+    let first = super::earlier_tab_note(tab, "t000000aaaa", Vec::new()).expect("one earlier tab");
+    assert_eq!(decode(&first), ["t000000aaaa"]);
+    assert!(super::earlier_tab_note(tab, "t000000aaaa", decode(&first)).is_none());
+    let next =
+        super::earlier_tab_note(tab, "t000000bbbb", decode(&first)).expect("another earlier tab");
+    assert_eq!(decode(&next), ["t000000aaaa", "t000000bbbb"]);
     assert!(super::earlier_tab_note(tab, tab, decode(&next)).is_none());
 
     let mut introduced = Vec::new();
-    for malformed in ["s-aaaa\ns-bbbb", "s-aaaa\r\ns-bbbb", " s-aaaa"] {
+    for malformed in [
+        "t000000aaaa\nt000000bbbb",
+        "t000000aaaa\r\nt000000bbbb",
+        " t000000aaaa",
+    ] {
         let tabs = super::earlier_tab_note(tab, malformed, Vec::new())
             .map(|body| decode(&body))
             .unwrap_or_default();
@@ -34624,6 +34673,7 @@ fn a_token_decision_types_the_wrapper_before_the_store_build() {
         let launch = crate::harness::relaunch::Launch {
             auth_observed: true,
             route: crate::harness::accounts::AuthRoute::Stored,
+            running: None,
             launch_env: None,
             serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
@@ -34756,6 +34806,7 @@ fn a_route_move_serves_its_target_and_a_token_session_comes_back_through_the_wra
         let launch = relaunch::Launch {
             auth_observed: true,
             route,
+            running: None,
             launch_env: None,
             serve,
             session: SESSION,
@@ -34797,6 +34848,7 @@ fn a_route_move_serves_its_target_and_a_token_session_comes_back_through_the_wra
         match planned(AuthRoute::Stored, Serve::Must, fact) {
             Err(NoPlan::Refused { why, .. }) => assert_eq!(why, relaunch::ROUTE_UNSERVED),
             Err(NoPlan::Wait(word)) => panic!("{fact:?}: waits on {word}"),
+            Err(NoPlan::Account(refusal)) => panic!("{fact:?}: waits on {refusal:?}"),
             Ok(plan) => panic!("{fact:?}: {}", plan.line),
         }
     }
@@ -34907,6 +34959,7 @@ fn a_store_shaped_build_outside_atpkgs_store_is_never_served_the_token() {
         let launch = relaunch::Launch {
             auth_observed: true,
             route: AuthRoute::Stored,
+            running: None,
             launch_env: None,
             serve,
             session: SESSION,
@@ -34930,6 +34983,7 @@ fn a_store_shaped_build_outside_atpkgs_store_is_never_served_the_token() {
     match planned(&outside, Serve::Must) {
         Err(NoPlan::Refused { why, .. }) => assert_eq!(why, relaunch::ROUTE_UNSERVED),
         Err(NoPlan::Wait(word)) => panic!("waits on {word}"),
+        Err(NoPlan::Account(refusal)) => panic!("waits on {refusal:?}"),
         Ok(plan) => panic!("a move onto the token typed: {}", plan.line),
     }
     let judged = planned(&outside, Serve::Judge).unwrap_or_else(|_| panic!("a plan"));
@@ -34995,4 +35049,222 @@ fn session_folders_reached_by_a_link_are_read_through_it() {
         .collect();
     assert_eq!(listed, [found]);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tab opened before the `t` form keeps its `s-` ID until it closes, so the roster, the
+/// earlier-tab notes and the earlier tabs read a tab ID of either form, and a `t` tab restored
+/// from an `s-` one (the cross-form case) names it as its earlier tab. NEGATIVE CONTROLS: a
+/// malformed ID of each form is no roster row, no note and no earlier tab.
+#[test]
+fn the_roster_and_the_earlier_tabs_read_a_tab_id_of_either_form() {
+    const TAB: &str = "tqn5r6e0148";
+    const EARLIER: &str = "s-0123456789abcdef0123";
+    const NOT_TABS: [&str; 6] = [
+        "tqn5r6e014",
+        "TQN5R6E0148",
+        "tqn5r6e014u",
+        "s-0123456789abcdef012",
+        "s-0123456789ABCDEF0123",
+        "s-abc",
+    ];
+    let rows = roster_rows(&format!("1 {TAB} fgpgid=7\n2 {EARLIER} fgpgid=8")).expect("both rows");
+    let sids: Vec<&str> = rows.iter().map(|(_, t)| t.sid.as_str()).collect();
+    assert_eq!(sids, [TAB, EARLIER]);
+    for bad in NOT_TABS {
+        assert!(
+            roster_rows(&format!("1 {TAB} fgpgid=7\n2 {bad} fgpgid=8")).is_none(),
+            "NEGATIVE CONTROL: {bad} is no roster row"
+        );
+    }
+
+    let root = Path::new("/this-ram-test-does-not-open-files");
+    let decode = |tab: &str, body: &str| {
+        super::noted_earlier_tabs_read(root, tab, &|_| Some(body.to_string()))
+    };
+    let note = super::earlier_tab_note(TAB, EARLIER, Vec::new()).expect("a t tab notes its s- tab");
+    assert_eq!(decode(TAB, &note), [EARLIER]);
+    let back = super::earlier_tab_note(EARLIER, TAB, Vec::new()).expect("and the other way");
+    assert_eq!(decode(EARLIER, &back), [TAB]);
+    for bad in NOT_TABS {
+        assert!(
+            super::earlier_tab_note(TAB, bad, Vec::new()).is_none(),
+            "NEGATIVE CONTROL: {bad} is noted as no earlier tab"
+        );
+        assert!(
+            super::earlier_tab_note(bad, EARLIER, Vec::new()).is_none(),
+            "NEGATIVE CONTROL: {bad} is no tab to note for"
+        );
+    }
+    let seen: Vec<String> = [EARLIER, "t0000000001"]
+        .into_iter()
+        .chain(NOT_TABS)
+        .chain([TAB])
+        .map(str::to_string)
+        .collect();
+    let mut got = earlier_tabs(TAB, &seen);
+    got.sort();
+    assert_eq!(got, ["s-0123456789abcdef0123", "t0000000001"]);
+}
+
+/// A QUIET UPGRADE RESTARTS AN IDLE AGENT WHOSE OWN ROW READS SIGNED OUT (five Claude Code tabs
+/// left at `upgrade=pending/…/account` for good): the agent runs on the default home's stored
+/// login, which roster row `m16` owns and whose recorded word is a stale signed out, its turn
+/// done and idle an hour. Its relaunch keeps that login, so its account admission checks
+/// integrity alone: the agent is signalled and its record carries a same-login intent for `m16`,
+/// which the relaunch's admission at exec takes too, never `wait:account`. NEGATIVE CONTROL: the same visit after the agent ended (no live process
+/// replaced, so a relaunch would add a runner) is the selection's, and waits the policy's word.
+#[cfg(unix)]
+#[test]
+fn a_quiet_upgrade_restarts_an_idle_agent_whose_row_reads_signed_out() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let pending = St {
+        phase: Phase::Pending,
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        last_seq: 77,
+        seq_since_s: now_s() - 3_600,
+        ..St::default()
+    };
+    let mut h = quietly(|| Parked::new("signed-out-row", Answers::default(), pending, 3_600));
+    let roster = h.opts.account_roster.clone().expect("a roster");
+    let work = h.dir.join("logins/work-2");
+    std::fs::create_dir_all(&work).expect("work-2's login");
+    std::fs::create_dir_all(roster.parent().expect("config")).expect("config");
+    std::fs::write(
+        &roster,
+        format!(
+            "[[account]]\nlabel = \"m16\"\nclass = \"dedicated\"\n\n[[account]]\n\
+             label = \"work-2\"\nclass = \"dedicated\"\ndir = {}\n",
+            crate::harness::host_path::toml(&work)
+        ),
+    )
+    .expect("the roster");
+    let (state, home) = (h.opts.state.clone(), h.opts.home.clone());
+    let seat = crate::harness::accounts_pool::Seat {
+        config_dir: roster.parent().expect("config"),
+        state: &state,
+        home: &home,
+        now: now_s() as i64,
+    };
+    seat.store(crate::harness::accounts::Cli::Claude)
+        .transact(now_s() as i64, &mut None, |state| {
+            state.home_accounts.extend(["m16".into(), "work-2".into()]);
+            crate::harness::accounts::note_auth(
+                state,
+                "m16",
+                crate::harness::accounts::Auth::SignedOut,
+                now_s() as i64,
+            );
+            Ok(Vec::new())
+        })
+        .expect("m16 recorded signed out");
+    let ended = h.reaped();
+    let shell = tty_zsh();
+    let table = vec![(shell.id(), 1, "zsh".into())];
+    let kernel = Script::new(shell.id(), usize::MAX, None);
+    let r = visit(&h.opts, &h.sf, &table, &newer(), &h.parked(&kernel));
+    let status = ended.recv_timeout(HANG_DETECTOR).expect("the agent ended");
+    shell.end();
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{r:?}");
+    assert!(!r.step.starts_with("wait:account"), "{r:?}");
+    let st = load(&h.opts, SESSION).expect("record");
+    assert!(st.line.contains("'--resume'"), "{}", st.line);
+    let intent = st
+        .account_intent
+        .as_ref()
+        .expect("the relaunch's account intent");
+    let crate::harness::accounts_pool::ExecutionIntent::Stored { owner, purpose, .. } = intent
+    else {
+        panic!("a stored intent: {intent:?}");
+    };
+    assert_eq!(
+        (owner.as_deref(), *purpose),
+        (
+            Some("m16"),
+            crate::harness::accounts_pool::Purpose::SameLogin
+        )
+    );
+    assert!(
+        crate::harness::accounts_pool::admit_execution(
+            &seat,
+            crate::harness::accounts::Cli::Claude,
+            intent
+        )
+        .is_ok(),
+        "the relaunch's own admission at exec takes the intent it carries"
+    );
+    let target = newer().managed.expect("a managed build");
+    let argv = ["claude".to_string()];
+    let launch = crate::harness::relaunch::Launch {
+        running: None,
+        ..launch_of(
+            &h.sf,
+            &argv,
+            &target,
+            None,
+            true,
+            None,
+            None,
+            crate::harness::accounts::AuthRoute::Stored,
+            true,
+        )
+    };
+    match crate::harness::relaunch::plan(&h.opts, &launch, table[0].0, &table) {
+        Err(crate::harness::relaunch::NoPlan::Account(refusal)) => assert_eq!(
+            refusal.kind,
+            crate::harness::accounts_pool::RefusalKind::SignedOut,
+            "{refusal:?}"
+        ),
+        Ok(plan) => panic!("a selection planned: {}", plan.line),
+        Err(crate::harness::relaunch::NoPlan::Wait(word)) => panic!("wait {word}"),
+        Err(crate::harness::relaunch::NoPlan::Refused { why, .. }) => panic!("refused {why}"),
+    }
+}
+
+/// A CONVERSATION'S `/goal` IS READ FROM ITS OWN RECORD ([`GoalOf::of_snapshot`], what the window's
+/// host answers its loop's `goal` door with), on from where the last ask stopped: the goal set,
+/// then Claude Code's clear after an error. Negative controls: a snapshot naming no session, and
+/// another agent's, read nothing.
+#[cfg(unix)]
+#[test]
+fn a_conversations_goal_is_read_from_its_record_as_it_grows() {
+    use crate::harness::goal::GoalRead;
+    let dir = scratch("goal-of");
+    let measured =
+        include_str!("testdata/goal/claude-2.1.323-transcript-goal-cleared-by-error.jsonl");
+    let rows: Vec<String> = measured.lines().map(str::to_owned).collect();
+    write_transcript(&dir, &rows[..3]);
+    let snap = users_agent(SESSION);
+    let mut memo = GoalOf::default();
+    let condition = "the account registry and automated account switching just works";
+    assert_eq!(
+        memo.of_snapshot(&dir, &snap),
+        GoalRead::Active(condition.to_owned())
+    );
+    write_transcript(&dir, &rows);
+    assert!(
+        matches!(memo.of_snapshot(&dir, &snap), GoalRead::Lost(lost) if lost.served),
+        "the clear after the error, a served answer after it"
+    );
+    let unnamed = Snapshot {
+        session: None,
+        ..snap.clone()
+    };
+    assert_eq!(
+        GoalOf::default().of_snapshot(&dir, &unnamed),
+        GoalRead::Unread
+    );
+    let agy = Snapshot {
+        run: crate::harness::relaunch::AgentRun::Agy(crate::harness::relaunch::AgyRun {
+            config: dir.to_path_buf(),
+            env: Vec::new(),
+            lock: None,
+            crash: None,
+            started_ms: 0,
+            block: None,
+        }),
+        ..snap
+    };
+    assert_eq!(GoalOf::default().of_snapshot(&dir, &agy), GoalRead::Unread);
 }

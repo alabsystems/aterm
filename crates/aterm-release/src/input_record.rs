@@ -287,6 +287,359 @@ fn parent_clean(git: &dyn GitRunner) -> Result<(), String> {
     git_run(git, args).map_err(|_| "input checkout has tracked edits; no work was discarded".into())
 }
 
+/// One side of a path: absent, or its mode and object as a tree records them.
+type Side = Option<(String, String)>;
+
+/// The paths of a raw `-z` diff (`diff-tree`, `diff-index`, `diff-files`) with their two sides.
+fn raw_sides(text: &str) -> Result<std::collections::BTreeMap<String, (Side, Side)>, String> {
+    let side =
+        |mode: &str, object: &str| (mode != "000000").then(|| (mode.to_owned(), object.to_owned()));
+    let mut fields = text.split('\0');
+    let mut sides = std::collections::BTreeMap::new();
+    while let Some(header) = fields.next().filter(|header| !header.is_empty()) {
+        let parts: Vec<_> = header.trim_start_matches(':').split(' ').collect();
+        let path = fields.next().ok_or("input checkout diff is malformed")?;
+        let [before, after, old, new, _] = parts[..] else {
+            return Err("input checkout diff is malformed".into());
+        };
+        sides.insert(path.to_owned(), (side(before, old), side(after, new)));
+    }
+    Ok(sides)
+}
+
+/// Git's executable bit: the owner's.
+#[cfg(unix)]
+fn executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode() & 0o100 != 0
+}
+
+#[cfg(not(unix))]
+fn executable(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// What the working tree holds at each of `paths` under `top`, as a tree would record it: a
+/// regular file's mode and object (Git's clean filters applied, as for the index), a symlink's
+/// target, or absent (a directory or nothing). Anything else is a mode no tree holds.
+fn working_sides(git: &dyn GitRunner, top: &Path, paths: &[&str]) -> Result<Vec<Side>, String> {
+    let mut sides = Vec::with_capacity(paths.len());
+    let mut files = Vec::new();
+    for path in paths {
+        let meta = match top.join(path).symlink_metadata() {
+            Ok(meta) => meta,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                sides.push(None);
+                continue;
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        if meta.is_symlink() {
+            let target = std::fs::read_link(top.join(path)).map_err(|e| e.to_string())?;
+            let out = git
+                .git_input(
+                    &["hash-object", "-t", "blob", "--no-filters", "--stdin"],
+                    target.as_os_str().as_encoded_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+            if !out.success() {
+                return Err(out.stderr_utf8());
+            }
+            sides.push(Some(("120000".into(), out.stdout_utf8().trim().to_owned())));
+        } else if meta.is_dir() {
+            sides.push(None);
+        } else if meta.is_file() && !path.contains('\n') {
+            let mode = if executable(&meta) {
+                "100755"
+            } else {
+                "100644"
+            };
+            files.push((sides.len(), path));
+            sides.push(Some((mode.into(), String::new())));
+        } else {
+            sides.push(Some(("foreign".into(), String::new())));
+        }
+    }
+    if !files.is_empty() {
+        let list: String = files.iter().map(|(_, path)| format!("{path}\n")).collect();
+        let out = git
+            .git_input(&["hash-object", "--stdin-paths"], list.as_bytes())
+            .map_err(|e| e.to_string())?;
+        if !out.success() {
+            return Err(out.stderr_utf8());
+        }
+        let text = out.stdout_utf8();
+        let objects: Vec<_> = text.lines().collect();
+        if objects.len() != files.len() {
+            return Err("input checkout hashing named a different number of files".into());
+        }
+        for ((at, _), object) in files.iter().zip(objects) {
+            if let Some((_, slot)) = &mut sides[*at] {
+                object.clone_into(slot);
+            }
+        }
+    }
+    Ok(sides)
+}
+
+/// Refuse while the lock Git takes on `git`'s index stands, naming it. Git holds that lock for a
+/// whole checkout and removes it when it stops of its own accord (a failure, a ^C), so a lock
+/// that stands is a Git still running in `top`, or one killed outright (`SIGKILL`, the Mac losing
+/// power), which leaves its index unwritten and its lock in place. Nothing here can tell those
+/// two apart: a Git a killed release started outlives it. Only a person who knows no Git runs
+/// there removes the lock, and the transition then resumes.
+fn index_unlocked(git: &dyn GitRunner, top: &Path) -> Result<(), String> {
+    let lock = git_path(
+        git,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index.lock",
+        ],
+    )?;
+    match lock.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+        Ok(_) => Err(format!(
+            "the input checkout {} is locked by Git's {}: a Git command there is still running, \
+             or one was killed outright and left its lock; nothing was changed. Once no Git \
+             runs in {}, remove {} and run again: the interrupted checkout then resumes",
+            top.display(),
+            lock.display(),
+            top.display(),
+            lock.display()
+        )),
+    }
+}
+
+/// Whether `top`'s checkout holds what a checkout of `target` from `before` leaves there when it
+/// is cut short, and nothing else. `before` is the tree its index and files stood at when that
+/// checkout began: its HEAD, for Git's `checkout`, which writes HEAD last; the empty tree, for a
+/// first checkout, which had none. A Git killed outright left its index lock, and nothing is
+/// judged until a person removes it ([`index_unlocked`]). Git writes a checkout's files first,
+/// then its index, so a checkout cut short leaves files of both trees under the old index, and
+/// Git removes a file before it writes its replacement, so the path it was writing holds
+/// nothing. That residue is recognised path by path: every path where the index or the working
+/// tree differs from `before` is one the two trees disagree on, and holds exactly `before`'s or
+/// `target`'s state there, or nothing (whose bytes either tree holds); a byte that is neither is
+/// someone's work, and nothing is changed (`Ok(false)`). Residue is described in the index as
+/// it stands on disk (each entry an object of `before` or `target`; an empty path at
+/// `before`'s), so the checkout of `target` that follows (Git's `checkout`, or for a first
+/// checkout of the parent its one-tree read of HEAD, [`admit_parent`]) carries it to `target`
+/// with no file forced and nothing discarded. A gitlink's working tree is its submodule's and is
+/// judged there.
+fn interrupted_checkout(
+    git: &dyn GitRunner,
+    top: &Path,
+    before: &str,
+    target: &str,
+) -> Result<bool, String> {
+    index_unlocked(git, top)?;
+    let raw = |args: &[&str]| git_read(git, args).and_then(|text| raw_sides(&text));
+    let gitlink = |side: &Side| side.as_ref().is_some_and(|(mode, _)| mode == "160000");
+    let changed = raw(&["diff-tree", "-r", "-z", "--no-renames", before, target])?;
+    let staged = raw(&[
+        "diff-index",
+        "--cached",
+        "-z",
+        "--no-renames",
+        "--ignore-submodules=none",
+        before,
+        "--",
+    ])?;
+    if staged
+        .iter()
+        .any(|(path, (_, index))| changed.get(path).is_none_or(|(_, theirs)| theirs != index))
+    {
+        return Ok(false);
+    }
+    // Only stat data changes here: the comparisons below then read content, not timestamps.
+    // Without `-q`, Git names what stops it (a quiet refresh exits 128 and says nothing); a path
+    // whose content changed only exits 1.
+    let refresh = git
+        .git(&["update-index", "--refresh"])
+        .map_err(|e| e.to_string())?;
+    if refresh.status > 1 {
+        return Err(format!(
+            "the input checkout's index could not be refreshed in {}: {}",
+            top.display(),
+            refresh.stderr_utf8().trim()
+        ));
+    }
+    let unstaged = raw(&[
+        "diff-files",
+        "-z",
+        "--no-renames",
+        "--ignore-submodules=none",
+    ])?;
+    if unstaged.iter().any(|(path, (index, _))| {
+        !gitlink(index)
+            && changed
+                .get(path)
+                .is_none_or(|(old, new)| gitlink(old) || gitlink(new))
+    }) {
+        return Ok(false);
+    }
+    let files: Vec<_> = changed
+        .iter()
+        .filter(|(_, (old, new))| !gitlink(old) && !gitlink(new))
+        .collect();
+    let paths: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+    let mut describe = Vec::new();
+    for ((path, (old, new)), present) in files.iter().zip(working_sides(git, top, &paths)?) {
+        if present.is_some() && present != *old && present != *new {
+            return Ok(false);
+        }
+        // A path that holds nothing keeps (or gets back) `before`'s entry, which the checkout
+        // writes over as it does every path still at `before`; one Git removed from under a
+        // `before` entry it would otherwise refuse to write as a staged deletion.
+        let wanted = present.as_ref().or(old.as_ref());
+        let index = staged
+            .get(*path)
+            .map_or(old.as_ref(), |(_, index)| index.as_ref());
+        if wanted != index {
+            describe.push(match wanted {
+                Some((mode, object)) => format!("{mode} {object}\t{path}\0"),
+                None => format!("0 {}\t{path}\0", "0".repeat(before.len())),
+            });
+        }
+    }
+    if !describe.is_empty() {
+        let out = git
+            .git_input(
+                &["update-index", "-z", "--index-info"],
+                describe.concat().as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+        if !out.success() {
+            return Err(out.stderr_utf8());
+        }
+        git.git(&["update-index", "-q", "--refresh"])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(true)
+}
+
+/// Admit the input checkout, at `head` in `pending`'s transition, to the checkout of its target
+/// that follows: a clean one as it is, and where this run resumes the transition (`resuming`),
+/// one that transition's own checkout cut short ([`interrupted_checkout`]), its residue then
+/// described in the index. That checkout is Git's `checkout` from `before`, which writes HEAD
+/// last, so its residue sits under `before`'s HEAD: files of the target, whether `before` holds
+/// their paths or not, and paths emptied. For a first checkout it is `git worktree add`, which
+/// removes what it made when it fails or is signalled. Killed outright once it pointed HEAD at
+/// the target (before that, [`point_unborn_checkout`]), it leaves the target's HEAD over no index,
+/// some of the target's files, and the lock of the index its checkout was writing, which is
+/// refused until a person removes it ([`index_unlocked`]); the files are then completed here by
+/// Git's one-tree read of HEAD, which writes only the paths that hold nothing. Anything else is
+/// work, refused with nothing changed: tracked work here, and untracked bytes in the target's
+/// way by Git's checkout, which names them.
+fn admit_parent(
+    own: &dyn GitRunner,
+    root: &Path,
+    pending: &CheckoutPending,
+    head: &str,
+    resuming: bool,
+) -> Result<(), String> {
+    if head != pending.target {
+        if resuming && interrupted_checkout(own, root, head, &pending.target)? {
+            return Ok(());
+        }
+        return parent_clean(own);
+    }
+    let Err(edits) = parent_clean(own) else {
+        return Ok(());
+    };
+    if !(resuming
+        && pending.before.is_none()
+        && git_read(own, &["ls-files", "--cached", "-z"])?.is_empty()
+        && interrupted_checkout(own, root, &empty_tree(own)?, &pending.target)?)
+    {
+        return Err(edits);
+    }
+    git_run(
+        own,
+        &[
+            "-c",
+            "submodule.recurse=false",
+            "read-tree",
+            "-m",
+            "-u",
+            "HEAD",
+        ],
+    )
+}
+
+/// A first checkout's `git worktree add` registers the new checkout and writes its `.git` file
+/// before it points that checkout's HEAD at the target (until then the HEAD is missing, or, from
+/// some Git versions, a placeholder of zeros), and only then writes its files and index. Killed
+/// outright in between, it left a checkout Git cannot open, over nothing but its `.git` file.
+/// Where `root` is such a checkout of `git`'s repository, point its HEAD at `target` as the add
+/// would have next, through the repository's name for it (`worktrees/<id>/HEAD`); the first
+/// checkout then completes ([`admit_parent`]). Any other `root` is left as it is, for
+/// [`owned_head`] to judge.
+fn point_unborn_checkout(git: &dyn GitRunner, root: &Path, target: &str) -> Result<(), String> {
+    match root.symlink_metadata() {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    }
+    if !empty_directory(root, true)? {
+        return Ok(());
+    }
+    let pointer = match crate::durable::read_regular_text(&root.join(".git"), 4096) {
+        Ok(pointer) => pointer,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let Some(admin) = pointer.trim_end_matches('\n').strip_prefix("gitdir: ") else {
+        return Ok(());
+    };
+    let worktrees = git_path(
+        git,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?
+    .join("worktrees");
+    let (Ok(admin), Ok(worktrees)) = (root.join(admin).canonicalize(), worktrees.canonicalize())
+    else {
+        return Ok(());
+    };
+    let Some(id) = admin
+        .file_name()
+        .and_then(|id| id.to_str())
+        .filter(|_| admin.parent() == Some(worktrees.as_path()))
+    else {
+        return Ok(());
+    };
+    let reference = format!("worktrees/{id}/HEAD");
+    let head = git
+        .git_read(&["rev-parse", "--verify", "-q", &reference])
+        .map_err(|e| e.to_string())?
+        .stdout_utf8();
+    if head.trim().bytes().any(|byte| byte != b'0') {
+        return Ok(());
+    }
+    git_run(git, &["update-ref", "--no-deref", &reference, target])
+}
+
+/// The empty tree's object in `git`'s repository: the `before` of a first checkout.
+fn empty_tree(git: &dyn GitRunner) -> Result<String, String> {
+    let out = git
+        .git_input(&["mktree", "-z"], b"")
+        .map_err(|e| e.to_string())?;
+    if out.success() {
+        Ok(out.stdout_utf8().trim().to_owned())
+    } else {
+        Err(out.stderr_utf8())
+    }
+}
+
 fn child_gitdir(git: &dyn GitRunner) -> Result<PathBuf, String> {
     let directory = git_path(git, &["rev-parse", "--absolute-git-dir"])?;
     let expected = git_path(
@@ -424,10 +777,17 @@ fn module_origin(root: &Path, expected: &Path) -> Result<Option<String>, String>
     )?))
 }
 
+/// The input submodule's state against its recorded transition: `Ok(None)` while it is still an
+/// initialization with nothing materialized, `Ok(Some(head))` at a clean `before` or `target`.
+/// Where a receipt records this transition (`receipt`) and it is not yet `complete`, the
+/// residue of an interrupted checkout of `target` ([`interrupted_checkout`]) counts as no work:
+/// from `before`, and for a first checkout from the clone's default HEAD, whose files it never
+/// wrote. Anything else in it is work, and refuses with nothing discarded.
 fn child_state(
     root: &Path,
     child: &ChildPending,
     complete: bool,
+    receipt: bool,
 ) -> Result<Option<String>, String> {
     let path = root.join(INPUT_SUBMODULE);
     if let Ok(meta) = path.symlink_metadata()
@@ -474,6 +834,33 @@ fn child_state(
     if child.origin.as_ref() != Some(&origin) {
         return Err("input submodule origin changed during its transition".into());
     }
+    let status = || {
+        git_read(
+            &own,
+            &[
+                "status",
+                "--porcelain",
+                "-z",
+                "--no-renames",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--ignore-submodules=none",
+            ],
+        )
+    };
+    // Once residue is described in the index ([`interrupted_checkout`]) only tracked paths may
+    // differ, each staged or emptied by Git: an untracked or ignored file, or any other change
+    // the index does not hold, is not the checkout's.
+    let only_residue = |status: &str| {
+        status
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .all(|entry| {
+                entry.get(..2).is_some_and(|code| {
+                    !code.starts_with(['?', '!']) && (code.ends_with(' ') || code.ends_with('D'))
+                })
+            })
+    };
     // Git's initial clone is --no-checkout. An interrupted clone can have a default HEAD,
     // but may not have indexed or materialized someone else's checkout.
     if !complete
@@ -485,22 +872,31 @@ fn child_state(
     }
     let head = git_read(&own, &["rev-parse", "HEAD"])?;
     let head = head.trim();
+    let dirty = !status()?.is_empty();
+    let interrupted = receipt && !complete && dirty;
+    // A first checkout cut short leaves the clone's default HEAD over files of `target` alone:
+    // still an initialization, which completes from an unborn HEAD ([`finish_empty_clone`]).
+    // Anything else under that HEAD is work, whichever commit the clone's default is.
+    if interrupted && child.before.is_none() && object_id(head) {
+        if interrupted_checkout(&own, &path, &empty_tree(&own)?, &child.target)?
+            && only_residue(&status()?)
+        {
+            return Ok(None);
+        }
+        if head != child.target {
+            return Err("input submodule contains work; no work was discarded".into());
+        }
+    }
     if !object_id(head)
         || (head != child.target && (complete || child.before.as_deref() != Some(head)))
     {
         return Err("input submodule HEAD is outside its recorded transition".into());
     }
-    if !git_read(
-        &own,
-        &[
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--ignored=matching",
-            "--ignore-submodules=none",
-        ],
-    )?
-    .is_empty()
+    if dirty
+        && !(interrupted
+            && head != child.target
+            && interrupted_checkout(&own, &path, head, &child.target)?
+            && only_residue(&status()?))
     {
         return Err("input submodule contains work; no work was discarded".into());
     }
@@ -519,7 +915,7 @@ fn finish_empty_clone(root: &Path, child: &ChildPending) -> Result<bool, String>
     let path = root.join(INPUT_SUBMODULE);
     if child.before.is_some()
         || empty_directory(&path, false)?
-        || child_state(root, child, false)?.is_some()
+        || child_state(root, child, false, true)?.is_some()
     {
         return Ok(false);
     }
@@ -567,7 +963,7 @@ fn finish_empty_clone(root: &Path, child: &ChildPending) -> Result<bool, String>
             &child.target,
         ],
     )?;
-    child_state(root, child, true)?;
+    child_state(root, child, true, true)?;
     Ok(true)
 }
 
@@ -619,6 +1015,8 @@ fn checkout_with(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e.to_string()),
         };
+        // A receipt read here is a transition an earlier run entered and did not finish.
+        let resuming = loaded.is_some();
         let mut pending = if let Some(pending) = loaded {
             if pending.format != 1
                 || pending.repository != repository
@@ -680,7 +1078,7 @@ fn checkout_with(
                             &["config", "--get", "remote.origin.url"],
                         )?);
                         // Before a new transition, even a clean manually moved HEAD is refused.
-                        let state = child_state(root, &child, false)?;
+                        let state = child_state(root, &child, false, false)?;
                         if state != child.before {
                             return Err("input submodule is off its prior gitlink".into());
                         }
@@ -714,15 +1112,18 @@ fn checkout_with(
             save_pending(&receipt, &pending)?;
             pending
         };
+        if resuming && pending.before.is_none() {
+            point_unborn_checkout(git, root, &pending.target)?;
+        }
         let head = owned_head(git, root)?;
         if head.as_deref() != Some(pending.target.as_str()) && head != pending.before {
             return Err("input checkout HEAD is outside its recorded transition".into());
         }
-        if head.is_some() {
+        if let Some(at) = &head {
             let own = crate::ledger::GitCli::new(root);
-            parent_clean(&own)?;
+            admit_parent(&own, root, &pending, at, resuming)?;
             if let Some(child) = &pending.child {
-                child_state(root, child, false)?;
+                child_state(root, child, false, true)?;
             }
             if head.as_deref() != Some(pending.target.as_str()) {
                 git_run(
@@ -770,7 +1171,9 @@ fn checkout_with(
             }
             child.origin = Some(origin);
             save_pending(&receipt, &pending)?;
-            child_state(root, pending.child.as_ref().unwrap(), false)?;
+            child_state(root, pending.child.as_ref().unwrap(), false, true)?;
+            // A first checkout cut short completes from its unborn HEAD after Git's update,
+            // whether that update refused the residue or carried part of it to the pin.
             let hydration = hydrate(&own);
             let initialized = finish_empty_clone(root, pending.child.as_ref().unwrap())?;
             if let Err(why) = hydration
@@ -780,7 +1183,7 @@ fn checkout_with(
                     "{why}; input hydration is pending and will resume on retry"
                 ));
             }
-            child_state(root, pending.child.as_ref().unwrap(), true)?;
+            child_state(root, pending.child.as_ref().unwrap(), true, true)?;
         }
         if owned_head(git, root)?.as_deref() != Some(pending.target.as_str()) {
             return Err("input checkout changed during hydration".into());

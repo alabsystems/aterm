@@ -726,8 +726,22 @@ fn a_size_switch_regrids_each_tab_once_booked_deck() {
 /// A snapshot after three readings: ten cores in two clusters, memory, a
 /// GPU, a volume, aterm with one tab running claude.
 pub(crate) fn snapshot() -> Snapshot {
+    snapshot_with_footprints(true)
+}
+
+/// The same readings with process footprint coverage supplied at the probe boundary, so
+/// every derived process, program group and unread count describes the same evidence.
+fn snapshot_with_footprints(read: bool) -> Snapshot {
     let mut v = aterm_vitals::Vitals::new();
-    let mk = sample_at;
+    let mk = |t, busy: &[u64], cpu: &[u64]| {
+        let mut sample = sample_at(t, busy, cpu);
+        if !read {
+            for process in sample.procs.iter_mut().flatten() {
+                process.footprint = None;
+            }
+        }
+        sample
+    };
     let _ = v.absorb(&mk(10, &[0; 10], &[0, 0]));
     let _ = v.absorb(&mk(11, &[20, 30, 10, 0, 5, 5, 5, 5, 5, 5], &[100, 400]));
     v.absorb(&mk(
@@ -1879,8 +1893,8 @@ fn the_this_mac_fill_is_the_percent_and_nested_fills_never_widen_it() {
     // around it, whose fill stops it. Speech and the Memory lens say each such footprint,
     // and only then: aterm's against used memory and this tab's against aterm's, each below,
     // equal to and above it; and with aterm unread, this tab's against this Mac's. The lens
-    // says it whether its processes report footprints, Biggest now listing them, or report
-    // none, Biggest now one line of the scopes' figures (the owner's scene, and an idle tab
+    // says it whether its processes report footprints, Biggest now listing their programs, or
+    // report none, Biggest now one line of the scopes' figures (the owner's scene, and an idle tab
     // under Bar::Tab: the R3 lens fixes' review, 2026-11-06).
     use crate::stats_lens::{Lens, LensGeom, Opened, lay_lens};
     const ATERM: &str = "aterm's footprint is larger than this Mac's used memory";
@@ -1919,12 +1933,15 @@ fn the_this_mac_fill_is_the_percent_and_nested_fills_never_widen_it() {
                 "no process's footprint read"
             }
         );
-        let mut snap = snapshot();
-        if !procs {
-            for t in &mut snap.top {
-                t.footprint = None;
-            }
-        }
+        let mut snap = snapshot_with_footprints(procs);
+        assert!(
+            !snap.programs.is_empty()
+                && snap.programs.iter().all(|group| {
+                    group.footprint.is_some() == procs
+                        && group.footprint_unread == if procs { 0 } else { group.n }
+                }),
+            "PRECONDITION {at}: complete program groups retain the real footprint coverage"
+        );
         if ka.is_none() {
             snap.aterm = None;
         }
@@ -1967,7 +1984,7 @@ fn the_this_mac_fill_is_the_percent_and_nested_fills_never_widen_it() {
         assert_eq!(
             biggest.contains("claude"),
             procs,
-            "PRECONDITION {at}: Biggest now lists the processes exactly when they report \
+            "PRECONDITION {at}: Biggest now lists the programs exactly when their processes report \
              footprints: {biggest}"
         );
         for clause in want {
@@ -2232,4 +2249,60 @@ fn a11y_meters() {
     }
     assert_eq!(reading.meters.len(), DECK_RESOURCES.len());
     assert!(reading.cores.is_empty());
+}
+
+/// A reading whose process sweep stalled names it on the Processes row ("stalled · process
+/// table"), while CPU, Memory, Disk, GPU and Network keep their figures; CONTROL: the same
+/// reading with its sweep's lane answered says nothing of a stall.
+#[test]
+fn deck_names_a_stalled_process_lane_and_keeps_machine_rows() {
+    let mut v = aterm_vitals::Vitals::new();
+    let _ = v.absorb(&sample_at(10, &[0; 10], &[0, 0]));
+    let _ = v.absorb(&sample_at(
+        11,
+        &[20, 30, 10, 0, 5, 5, 5, 5, 5, 5],
+        &[100, 400],
+    ));
+    let mut stalled = sample_at(
+        12,
+        &[120, 130, 60, 10, 10, 10, 10, 10, 10, 10],
+        &[200, 1200],
+    );
+    stalled.procs = None;
+    stalled.stalled = vec![aterm_vitals::lanes::LaneStall {
+        lane: aterm_vitals::lanes::PROCS,
+        call: "proc_pid_rusage",
+        pid: Some(4321),
+        name: Some("aterm-verify".into()),
+        since_unix_ms: 1_792_185_500_000,
+        for_ms: 192_000,
+    }];
+    let snap = v.absorb(&stalled);
+    let m = crate::deck_face::deck_metrics();
+    let rows = |snap: &Snapshot| DeckWords::new(&input(snap), &m).rows;
+    let strip = |row: &RowWords| {
+        row.strip_text
+            .as_ref()
+            .map(|forms| forms.iter().map(|t| t.s.clone()).collect::<Vec<_>>())
+    };
+    for row in rows(&snap) {
+        if row.res == Resource::Processes {
+            let forms = strip(&row).expect("the Processes row says its sweep stalled");
+            assert!(
+                forms.contains(&"stalled \u{b7} process table".to_owned()),
+                "{forms:?}"
+            );
+        } else {
+            assert_eq!(strip(&row), None, "{:?} keeps its figures", row.res);
+        }
+    }
+    assert!(snap.cpu.is_some() && snap.mem.is_some() && snap.volume.is_some());
+    let answered = snapshot();
+    for row in rows(&answered) {
+        assert!(
+            strip(&row).is_none_or(|forms| forms.iter().all(|f| !f.contains("stalled"))),
+            "{:?}",
+            row.res
+        );
+    }
 }

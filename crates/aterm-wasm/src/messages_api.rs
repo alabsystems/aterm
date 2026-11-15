@@ -576,7 +576,7 @@ impl WebTerminal {
                 &pct_encode,
                 now,
             ) {
-                Ok((index, label)) => match self.band_act_at(*id, index, now) {
+                Ok((index, label)) => match self.band_act_at(*id, index, now, wall) {
                     Some((_, performed)) => wire::acted_reply(label, performed, &pct_encode),
                     None => wire::no_live_reply(*id),
                 },
@@ -590,14 +590,15 @@ impl WebTerminal {
         applied.reply
     }
 
-    /// A press on capsule `index` of row `id` — native's `notice act` after
-    /// its target is named: the engine's `act` logs the press (`Acted`) and
-    /// hands back the intent, and the band settles.
+    /// A press on capsule `index` of row `id` at the page's wall clock `wall` — native's
+    /// `notice act` after its target is named: the engine's `act` logs the press (`Acted`)
+    /// and files what it ends at `wall`, hands back the intent, and the band settles.
     pub(crate) fn band_act_at(
         &mut self,
         id: MessageId,
         index: ActionIndex,
         now: Instant,
+        wall: WallStamp,
     ) -> Option<(&'static str, bool)> {
         if index.is_details() && !self.band.details {
             return self
@@ -606,7 +607,7 @@ impl WebTerminal {
                 .live(id)
                 .map(|_| (Intent::Details.label(), false));
         }
-        let intent = self.band.center.act(id, index, now)?;
+        let intent = self.band.center.act(id, index, wall, now)?;
         let _ = self.messages_tick_at(now);
         Some((intent.label(), intent == Intent::Details))
     }
@@ -825,8 +826,14 @@ impl WebTerminal {
         true
     }
 
-    /// [`Self::band_press`] at `now`.
-    pub(crate) fn band_press_at(&mut self, x: f64, y: f64, now: Instant) -> String {
+    /// [`Self::band_press`] at `now`, on the page's wall clock `wall`.
+    pub(crate) fn band_press_at(
+        &mut self,
+        x: f64,
+        y: f64,
+        now: Instant,
+        wall: WallStamp,
+    ) -> String {
         let m = self.band_metrics();
         let Some((row, col)) = self.band.cell_under(x, y, self.cols, m) else {
             return "OK none".to_string();
@@ -839,7 +846,7 @@ impl WebTerminal {
                 return "OK none".to_string();
             }
         };
-        match self.band_act_at(id, index, now) {
+        match self.band_act_at(id, index, now, wall) {
             Some((label, performed)) => format!(
                 "{} id={id}",
                 wire::acted_reply(label, performed, &pct_encode)
@@ -1038,7 +1045,7 @@ macro_rules! bind {
 
             /// Handle a press at frame pixel `(x, y)`.
             pub fn band_press(&mut self, x: f64, y: f64) -> String {
-                self.band_press_at(x, y, Instant::now())
+                self.band_press_at(x, y, Instant::now(), wall_now())
             }
 
             /// Return `m1` log lines since `cursor`.

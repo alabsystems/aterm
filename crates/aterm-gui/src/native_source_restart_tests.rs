@@ -51,7 +51,7 @@ fn a_dispatch_admits_a_renewal_constructor_from_its_own_app_registry() {
         heal: None,
         dialect: aterm_agent::harness::upgrade::Dialect::Zsh,
     };
-    let sid = "s-fixture-renewal-attach";
+    let sid = "t0f1xtvre00";
     assert!(
         prepare_in(&env, sid, &command, &child).is_err(),
         "no dispatch lends a registry"

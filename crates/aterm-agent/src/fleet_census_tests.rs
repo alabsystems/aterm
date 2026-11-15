@@ -128,7 +128,9 @@ fn sample_facts(
         moves: None,
         server_heard: Vec::new(),
         home: None,
+        home_dir: None,
         home_free_mb: None,
+        machine: None,
         repos: None,
         update: None,
     }
@@ -177,6 +179,7 @@ fn census_joins_five_sources_identically_across_stewards_and_classifies_straggle
             kind: claims::Kind::Lease,
             since,
         }],
+        ranks_homes: false,
     };
     let leases = claims::Book::of([
         lease("aa100", "m100", now_i64 - 60),
@@ -1069,6 +1072,7 @@ fn a_lease_whose_mac_the_census_host_has_not_heard_counts_for_nobody() {
                 kind: claims::Kind::Lease,
                 since: now - 3600,
             }],
+            ranks_homes: false,
         }]),
         ..CensusInputs::default()
     };
@@ -1076,6 +1080,7 @@ fn a_lease_whose_mac_the_census_host_has_not_heard_counts_for_nobody() {
         me: "aa1".to_owned(),
         presence: Some(claims::Presence {
             at: now,
+            listening_since: i64::MIN,
             heard: [("aa100".to_owned(), last)].into_iter().collect(),
         }),
         ..claims::View::default()
@@ -1107,6 +1112,7 @@ fn the_census_host_reads_its_claims_with_what_its_commons_hears() {
     std::fs::create_dir_all(&home).unwrap();
     let presence = claims::Presence {
         at: now,
+        listening_since: i64::MIN,
         heard: [("bb02".to_owned(), now - 60)].into_iter().collect(),
     };
     let table = std::sync::Arc::new(claims::tests::Replica::new("aa01"));
@@ -1738,6 +1744,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
                 kind: crate::harness::claims::Kind::Lease,
                 since: (now_s - 500) as i64,
             }],
+            ranks_homes: false,
         },
         crate::harness::claims::Row {
             machine: "00000000000000000000000000000002".to_owned(),
@@ -1749,6 +1756,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
                 kind: crate::harness::claims::Kind::Lease,
                 since: (now_s - 100) as i64,
             }],
+            ranks_homes: false,
         },
     ]);
     inputs.server_heard.push(ServerHeardFact {

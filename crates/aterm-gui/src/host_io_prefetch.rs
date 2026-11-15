@@ -7,7 +7,7 @@
 
 use std::cell::RefCell;
 
-use aterm_core::terminal::kitty_graphics::{KittyAction, KittyMedium, parse_kitty_command};
+use aterm_core::terminal::kitty_graphics::{KittyAction, KittyMedium, parse_kitty_control};
 use aterm_core::terminal::{ClipboardSelection, Terminal};
 
 const ESC: u8 = 0x1b;
@@ -64,7 +64,10 @@ struct Fetched {
 }
 
 thread_local! {
-    static FETCHED: RefCell<Fetched> = RefCell::new(Fetched::default());
+    // Boxed: inline it was 120 bytes of every thread's thread-local template
+    // (`tests/thread_local_template.rs`). The pointer is read once as a slice begins, once as its
+    // burst drops and once for each request taken, never inside the scan.
+    static FETCHED: Box<RefCell<Fetched>> = Box::new(RefCell::new(Fetched::default()));
 }
 
 /// A PTY reader's side of the prefetch.
@@ -300,7 +303,8 @@ fn could_be_osc52_query(body: &[u8]) -> bool {
 
 /// A whole APC body the engine resolves through the host.
 fn kitty_medium_request(body: &[u8]) -> Option<Request> {
-    let command = parse_kitty_command(body)?;
+    let parsed = parse_kitty_control(body)?;
+    let command = parsed.command();
     let reads = matches!(
         command.action,
         KittyAction::Transmit | KittyAction::TransmitAndDisplay | KittyAction::Frame
@@ -308,6 +312,7 @@ fn kitty_medium_request(body: &[u8]) -> Option<Request> {
     if !reads || command.more || command.medium == KittyMedium::Direct {
         return None;
     }
+    let command = parsed.decode_payload();
     let name = String::from_utf8(command.payload).ok()?;
     (!name.is_empty()).then_some(Request::Kitty(command.medium, name))
 }
@@ -318,6 +323,11 @@ fn kitty_medium_request(body: &[u8]) -> Option<Request> {
 #[cfg(test)]
 pub(crate) fn feed_as_reader(term: &std::sync::Mutex<Terminal>, bytes: &[u8]) {
     let mut prefetch = Prefetch::default();
+    feed_as_reader_with(&mut prefetch, term, bytes);
+}
+
+#[cfg(test)]
+fn feed_as_reader_with(prefetch: &mut Prefetch, term: &std::sync::Mutex<Terminal>, bytes: &[u8]) {
     let mut off = 0;
     while off < bytes.len() {
         let fetched = prefetch.reads(term, &bytes[off..]);
@@ -332,3 +342,7 @@ pub(crate) fn feed_as_reader(term: &std::sync::Mutex<Terminal>, bytes: &[u8]) {
 #[cfg(test)]
 #[path = "host_io_prefetch_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "host_io_prefetch_measure_tests.rs"]
+mod measure_tests;

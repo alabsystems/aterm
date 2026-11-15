@@ -651,6 +651,7 @@ fn polling_keeps_composable_tips_and_cuts_only_a_new_incompatible_tip() {
         assert!(!watch.poll(
             &mut moot,
             &mut |_| Ok("main1".into()),
+            &mut |_, _| Ok(false),
             &mut policy,
             &mut |_| panic!("unexpected failed read")
         ));
@@ -665,6 +666,7 @@ fn polling_keeps_composable_tips_and_cuts_only_a_new_incompatible_tip() {
         assert!(!watch.poll(
             &mut moot,
             &mut |_| Ok("main-conflicting".into()),
+            &mut |_, _| Ok(false),
             &mut |_| {
                 held.set(held.get() + 1);
                 Ok(Composition::Held("the merge conflicts".into()))
@@ -676,12 +678,14 @@ fn polling_keeps_composable_tips_and_cuts_only_a_new_incompatible_tip() {
     assert!(watch.poll(
         &mut moot,
         &mut |_| Ok("main2".into()),
+        &mut |_, _| Ok(false),
         &mut |_| Ok(Composition::Doomed("changed input".into())),
         &mut |_| panic!("no failure")
     ));
     assert!(watch.poll(
         &mut moot,
         &mut |_| panic!("no read after a cut"),
+        &mut |_, _| panic!("no ancestry"),
         &mut |_| panic!("no composition"),
         &mut |_| panic!("no failure")
     ));
@@ -699,6 +703,7 @@ fn failed_or_moot_remote_reads_never_supply_a_tip_or_repeated_diagnostic() {
         assert!(!watch.poll(
             &mut || false,
             &mut |_| Err("unavailable".into()),
+            &mut |_, _| panic!("no tip to place"),
             &mut |_| panic!("no observed tip"),
             &mut |why| notes.borrow_mut().push(why.to_owned())
         ));
@@ -707,23 +712,99 @@ fn failed_or_moot_remote_reads_never_supply_a_tip_or_repeated_diagnostic() {
     assert!(!watch.poll(
         &mut || true,
         &mut |_| Err("ended".into()),
+        &mut |_, _| panic!("no tip to place"),
         &mut |_| panic!("no tip"),
         &mut |_| panic!("moot read is silent")
     ));
     assert!(!watch.poll(
         &mut || false,
         &mut |_| Ok("main0".into()),
+        &mut |_, _| panic!("same main needs no ancestry"),
         &mut |_| panic!("same main needs no composition"),
         &mut |_| panic!("healthy read")
     ));
     assert!(!watch.poll(
         &mut || false,
         &mut |_| Err("unavailable".into()),
+        &mut |_, _| panic!("no tip to place"),
         &mut |_| panic!("no tip"),
         &mut |why| notes.borrow_mut().push(why.to_owned())
     ));
     assert_eq!(*notes.borrow(), ["unavailable", "unavailable"]);
     assert!(watch.into_doomed().is_none());
+}
+
+/// Main does not move back short of a force-push, so a read of a tip the composed one already
+/// holds is stale (another reader's older snapshot): said once as a read the poll cannot use,
+/// never tested and never a cut. That holds for a tip behind the base, which does not descend
+/// from it and so would be doomed, and for one behind a later composed tip; a new tip that does
+/// not compose still cuts. NEGATIVE CONTROL: the same tip behind the base, its ancestry unread,
+/// is tested, and its doomed composition cuts the run.
+#[test]
+fn a_stale_read_behind_the_composed_tip_is_no_news_and_never_cuts() {
+    // One line of history, oldest first; the judgment's base is main1.
+    const HISTORY: [&str; 4] = ["main0", "main1", "main2", "main3"];
+    let at = |tip: &str| HISTORY.iter().position(|known| *known == tip).unwrap();
+    let mut behind = |tip: &str, composed: &str| Ok(at(tip) < at(composed));
+    let tested = std::cell::RefCell::new(Vec::new());
+    let mut composition = |tip: &str| {
+        tested.borrow_mut().push(tip.to_owned());
+        Ok(match tip {
+            "main2" => Composition::Composes {
+                tree: "tree".into(),
+                why: "disjoint".into(),
+            },
+            "main3" => Composition::Doomed("changed input".into()),
+            _ => Composition::Doomed("it does not descend from main1".into()),
+        })
+    };
+    let notes = std::cell::RefCell::new(Vec::new());
+    let mut watch = Watch::new("main1");
+    for read in ["main0", "main0", "main2", "main1", "main0"] {
+        assert!(
+            !watch.poll(
+                &mut || false,
+                &mut |_| Ok(read.into()),
+                &mut behind,
+                &mut composition,
+                &mut |why| notes.borrow_mut().push(why.to_owned()),
+            ),
+            "a read of {read} cut the run"
+        );
+    }
+    assert_eq!(*tested.borrow(), ["main2"], "only the new tip is tested");
+    assert_eq!(
+        *notes.borrow(),
+        [
+            "it read main0, which main1 already holds: a stale read, or main was rewound",
+            "it read main1, which main2 already holds: a stale read, or main was rewound",
+            "it read main0, which main2 already holds: a stale read, or main was rewound",
+        ]
+    );
+    assert!(watch.poll(
+        &mut || false,
+        &mut |_| Ok("main3".into()),
+        &mut behind,
+        &mut composition,
+        &mut |_| panic!("a new tip reads"),
+    ));
+    assert_eq!(
+        watch.into_doomed(),
+        Some(("main3".into(), "changed input".into()))
+    );
+
+    let mut control = Watch::new("main1");
+    assert!(control.poll(
+        &mut || false,
+        &mut |_| Ok("main0".into()),
+        &mut |_, _| Ok(false),
+        &mut composition,
+        &mut |_| panic!("a tested read"),
+    ));
+    assert_eq!(
+        control.into_doomed(),
+        Some(("main0".into(), "it does not descend from main1".into()))
+    );
 }
 
 /// A qualification the host cannot run in this image yields before it runs: the loop ends

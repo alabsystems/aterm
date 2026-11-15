@@ -6,6 +6,13 @@ use super::*;
 use crate::descriptors::{AdmittedRootDirectory, AdmittedRootFile, DescriptorBudget};
 use crate::workload::host::coordinator::{SCOPE_MARKER, ScopeFile, ScopeReply, ScopeRequest};
 
+/// Actual input owners retained together for the original compiler scope.
+/// Grouping them adds no admission or authority.
+pub struct CompilerScopeInputs {
+    pub directory: Arc<AdmittedRootDirectory>,
+    pub dependencies: Vec<(Arc<AdmittedRootFile>, [u8; 16])>,
+}
+
 pub struct CompilerScope {
     request: ScopeRequest,
     directory: Arc<AdmittedRootDirectory>,
@@ -188,11 +195,11 @@ impl Client {
         query: &crate::ContextQuery,
         coordinator: [u8; 16],
         member: [u8; 16],
-        directory: Arc<AdmittedRootDirectory>,
-        dependencies: Vec<(Arc<AdmittedRootFile>, [u8; 16])>,
+        inputs: CompilerScopeInputs,
         budget: &Arc<DescriptorBudget>,
         deadline: Instant,
     ) -> Result<Arc<CompilerScope>, CompilerScopeError> {
+        let CompilerScopeInputs { directory, dependencies } = inputs;
         if dependencies.len() > crate::workload::host::coordinator::MAX_SCOPE_FILES {
             return Err(CompilerScopeError::BeforeRequest(refused()));
         }

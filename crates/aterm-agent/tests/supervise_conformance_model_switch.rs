@@ -13,15 +13,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use alab_policy::config::TurnEndTiming;
+use alab_policy::vocab::{Phase, WallKind};
 use aterm_agent::supervise::SupervisorConfig;
-use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
     BackBy, Composer, FABLE_FALLBACK, LaunchModel, ModelSwitch, RULE_LIMIT_RESUME, Restart,
-    Sampled, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, decide_turn_end,
-    fable_rung,
+    Sampled, TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end, fable_rung,
 };
 use aterm_models_harness::supervisor_model_switch_model;
-use aterm_phase::WallKind;
 use aterm_spec::derive::Model;
 
 use crate::common::cnst;
@@ -117,7 +116,7 @@ fn base_reading() -> TurnEndReading {
         seat: Default::default(),
         account: None,
         route: None,
-        autopilot: aterm_agent::supervise::Autopilot::Cruise,
+        autopilot: alab_policy::config::Autopilot::Cruise,
         login_label: None,
         autopilot_by_person: false,
         login_superseded: false,
@@ -139,7 +138,8 @@ fn base_reading() -> TurnEndReading {
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
-        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: aterm_agent::harness::goal::GoalRead::Unread,
         fact: None,
         wake: None,
     }

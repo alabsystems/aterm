@@ -24,3 +24,17 @@ validation and creates no publication, resource or installation authority.
 
 Generic receiver acceptance is not an independently trusted Host installation
 receipt and cannot authorize managed governor bypass or campaign admission.
+
+The native archive client and its exact three source paths are also maintained
+from Trust `b8c2c0b648ca9bf7f93a13a1b627817b1cc8c74a`. The client records the
+bound operation exchange; its completion is no SDK, Seed or resource-return
+authority, and the second Host EOF is not an ACK receipt. All other native
+source overlays above remain in place.
+
+`src/validate.rs` `validate_session` is an explicit overlay: a session is aterm's tab ID, `t`
+and 10 lower-case Crockford base32 characters, as well as the earlier `s-` and lower-case hex
+form the canonical source accepts (aterm LT-01). Its test is `src/tests.rs`
+`a_session_is_an_aterm_tab_id_in_either_form`. The controller keeps the canonical source's
+wider `s-` rule (1 to 62 hex digits); aterm admits only a whole tab ID (`s-` and exactly 20 hex
+digits) at its own wire (`aterm_types::resource_admission`), so every binding that reaches the
+controller is one aterm's journal can name.

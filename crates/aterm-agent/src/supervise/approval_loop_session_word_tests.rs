@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::supervise::policy::question::LAND_TEXT;
-use crate::supervise::policy::turn_end::is_land_rule;
+use alab_policy::words::is_land_rule;
 
 /// A SESSION WORD NEVER YIELDS LAND'S PRIORITY: each word a person sets answers by itself, a
 /// priority other than Land's whose text is not Land's and whose prose rule is no land rule,

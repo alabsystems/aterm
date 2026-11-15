@@ -10,7 +10,7 @@ use crate::harness::upgrade_drive::load;
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
 
-const TAB: &str = "s-disabled-native-caller";
+const TAB: &str = "ttjveca11er";
 const SESSION: &str = "bbbbbbbb-0000-0000-0000-0000000000ca";
 
 fn options(world: &Path) -> Opts {
@@ -513,6 +513,7 @@ fn retained_account_attribution_round_trips_but_legacy_or_missing_namespace_is_n
             default_home: true,
             route: crate::harness::accounts::AuthRoute::Stored,
         },
+        super::super::accounts_pool::Purpose::Select,
     )
     .unwrap();
     let mut st = state(false);
@@ -655,14 +656,20 @@ fn helper_refused_during_observation_keeps_the_same_operation_and_owed_work() {
     );
 }
 
+/// An external route the shell's environment does not carry (the agent's came from an rc file
+/// or a typed `export`) refuses as unattributed: that environment never changes, so the refusal
+/// is no change the next look clears (`upgrade_status` reads it as a tab aterm cannot read, with
+/// its `harness-stuck` horizon).
 #[test]
 fn external_shell_admission_never_falls_back_to_the_default_login() {
-    use super::super::accounts_pool::ExecutionIntent;
+    use super::super::accounts_pool::{ExecutionIntent, RefusalKind};
     let world = aterm_tempfile::tempdir().unwrap();
     let opts = options(world.path());
     let inherited = vec![format!("HOME={}", opts.home.display())];
     let mut intent = ExecutionIntent::external();
-    assert!(external_from_env(&opts, &intent, &inherited, None).is_err());
+    let refusal = external_from_env(&opts, &intent, &inherited, None).unwrap_err();
+    assert_eq!(refusal.kind, RefusalKind::Unattributed, "{refusal:?}");
+    assert!(refusal.why.contains("no longer present"), "{refusal:?}");
     let mut external = inherited.clone();
     external.push("ANTHROPIC_API_KEY=synthetic-credential".into());
     assert!(external_from_env(&opts, &intent, &external, None).is_ok());
@@ -2251,6 +2258,7 @@ fn a_cold_line_past_the_twin_commands_the_build_it_types() {
         homedir: None,
         login: None,
         route: super::super::accounts::AuthRoute::Stored,
+        running: None,
         serve: Serve::Judge,
         auth_observed: true,
         launch_env: None,

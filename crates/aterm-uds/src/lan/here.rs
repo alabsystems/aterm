@@ -270,18 +270,41 @@ static RESOLVING: Slots = Slots::new(MAX_RESOLVING);
 /// `InvalidInput` for a zero `within`, `WouldBlock` (`EAGAIN`) for a name with
 /// [`MAX_RESOLVING`] running, `TimedOut`, or the resolver's error.
 pub fn resolve(name: &str, port: u16, within: Duration) -> io::Result<Vec<SocketAddr>> {
-    resolve_in(&RESOLVING, name, port, within, |asked, port| {
-        (asked, port).to_socket_addrs().map(Iterator::collect)
-    })
+    resolve_in(&RESOLVING, name, port, within, None, system_lookup)
+}
+
+/// [`resolve`], the thread a name's resolution runs on counted in `threads` as its lookup
+/// returns, with its CPU time to there ([`crate::cpu::ThreadsCpu::ending`]): the same lookup and
+/// the same answer. The thread is counted before it sends its answer, so a caller that heard the
+/// answer finds it counted; one whose caller stopped waiting is counted when its lookup returns,
+/// and one that never returns is not. A literal address starts no thread and counts none.
+///
+/// # Errors
+/// As [`resolve`].
+pub fn resolve_counted(
+    name: &str,
+    port: u16,
+    within: Duration,
+    threads: &std::sync::Arc<crate::cpu::ThreadsCpu>,
+) -> io::Result<Vec<SocketAddr>> {
+    let threads = Some(std::sync::Arc::clone(threads));
+    resolve_in(&RESOLVING, name, port, within, threads, system_lookup)
+}
+
+/// The system resolver's answer for `name`, each address on `port`.
+fn system_lookup(name: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    (name, port).to_socket_addrs().map(Iterator::collect)
 }
 
 /// [`resolve`] with `lookup` as the resolver, on a thread holding one of `slots`, for a name
-/// that is not a literal address.
+/// that is not a literal address; the thread is counted in `threads`, where given, as `lookup`
+/// returns.
 fn resolve_in(
     slots: &'static Slots,
     name: &str,
     port: u16,
     within: Duration,
+    threads: Option<std::sync::Arc<crate::cpu::ThreadsCpu>>,
     lookup: impl FnOnce(&str, u16) -> io::Result<Vec<SocketAddr>> + Send + 'static,
 ) -> io::Result<Vec<SocketAddr>> {
     let deadline = deadline_in(within)?;
@@ -297,7 +320,11 @@ fn resolve_in(
         .name("lan-resolve".into())
         .spawn(move || {
             let _slot = slot;
-            let _ = answer.send(lookup(&asked, port));
+            let resolved = match &threads {
+                Some(threads) => threads.ending(|| lookup(&asked, port)),
+                None => lookup(&asked, port),
+            };
+            let _ = answer.send(resolved);
         })?;
     match heard.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(resolved) => resolved,

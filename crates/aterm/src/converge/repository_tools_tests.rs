@@ -38,19 +38,12 @@ fn inventory_bytes(required: Option<&[&str]>) -> Vec<u8> {
     .unwrap()
 }
 
+/// The repository inventory as this Mac's store holds it, read in place.
 fn inventory(sys: &Fake, home: &str, required: Option<&[&str]>) {
-    let bytes = inventory_bytes(required);
-    let path = std::path::Path::new(home).join(".secrets/github-repositories.json");
-    sys.file(path.to_str().unwrap(), &bytes).stat_of(
-        path.to_str().unwrap(),
-        aterm_machines::port::Stat {
-            uid: 501,
-            gid: 20,
-            mode: 0o600,
-            dir: false,
-            symlink: false,
-            len: bytes.len() as u64,
-        },
+    sys.vault_set(
+        std::path::Path::new(home),
+        "github-repositories.json",
+        &inventory_bytes(required),
     );
 }
 

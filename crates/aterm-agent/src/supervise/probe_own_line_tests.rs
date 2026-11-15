@@ -15,7 +15,8 @@ use super::super::super::turn_end_loop::{
 };
 use super::*;
 use crate::harness::usage::USAGE_COMMAND;
-use crate::supervise::policy::turn_end::{PERSON_TYPING, RULE_USAGE_PROBE};
+use crate::supervise::policy::turn_end::RULE_USAGE_PROBE;
+use alab_policy::words::PERSON_TYPING;
 
 /// How long the program holds the probe's write unread before it draws it: past the echo's hang.
 const DRAWN_AFTER: Duration = Duration::from_secs(75);

@@ -38,7 +38,9 @@ pub const ACCOUNTED_ATTACHED: &str = "OK resource-admission-v3 accounted-v1 atta
 /// Exact session and unique submission-attempt binding, never a credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {
-    /// Exact canonical session identity (`s-` plus 1..62 lowercase hex digits).
+    /// The session's tab ID in either form ([`crate::control_verbs::is_minted_sid`]): a minted `t`
+    /// ID, or the `s-` ID a tab opened before the `t` form keeps until it closes. The host names
+    /// its journal file by it, so the wire admits exactly what the journal can name.
     pub session: String,
     /// Unique attempt identity, checked for replay by the host.
     pub attempt: [u8; 16],
@@ -228,16 +230,11 @@ fn header(bytes: &[u8], kind: u8) -> io::Result<(Binding, Decoder<'_>)> {
     Ok((binding, d))
 }
 fn validate_binding(b: &Binding) -> io::Result<()> {
-    let suffix = b.session.strip_prefix("s-").ok_or_else(bad)?;
-    if suffix.is_empty()
-        || suffix.len() > 62
-        || !suffix
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-    {
-        return Err(bad());
+    if crate::control_verbs::is_minted_sid(&b.session) {
+        Ok(())
+    } else {
+        Err(bad())
     }
-    Ok(())
 }
 impl Submission {
     /// Check field counts, Unix byte-string constraints, and positive resources.

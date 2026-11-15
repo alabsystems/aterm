@@ -3,7 +3,26 @@
 
 use super::*;
 use crate::spawnfd::{Stdio, command};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::os::fd::AsFd as _;
+
+const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn job_event<'a>(child: &'a mut Child, wake: &crate::childwake::ChildWake) -> ChildObservation<'a> {
+    let until = std::time::Instant::now() + HANG;
+    loop {
+        if child.try_job_event().unwrap().is_some() {
+            // The observation above consumes nothing and this test is its sole owner.
+            return child.wait_job_event().unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "owned child made no job event"
+        );
+        crate::ready::until(wake.as_fd(), crate::ready::Interest::Read, until).unwrap();
+        wake.drain().unwrap();
+    }
+}
 
 struct Owned(Child);
 impl std::ops::Deref for Owned {
@@ -26,22 +45,24 @@ impl Drop for Owned {
 
 #[test]
 fn acknowledged_stops_preserve_ownership_until_the_actual_accounted_exit() {
+    let wake = crate::childwake::ChildWake::new().unwrap();
     let mut child = Owned(
         command("/bin/sh")
             .args([
                 "-c",
-                "kill -STOP $$; read first; kill -STOP $$; read second; exit 7",
+                "kill -STOP $$; read first; printf x; kill -STOP $$; read second; printf x; exit 7",
             ])
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
     );
     let pid = child.id();
     let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
     for line in [b"first\n".as_slice(), b"second\n".as_slice()] {
-        let observed = child.wait_job_event().unwrap();
+        let observed = job_event(&mut child, &wake);
         assert_eq!(observed.id(), pid);
         assert_eq!(
             observed.notice(),
@@ -59,8 +80,15 @@ fn acknowledged_stops_preserve_ownership_until_the_actual_accounted_exit() {
         );
         child.resume().unwrap();
         input.write_all(line).unwrap();
+        // SIGCONT being accepted does not prove the shell ran. Observe its progress
+        // beyond this read before asking for another stop or the final exit.
+        let until = std::time::Instant::now() + HANG;
+        crate::ready::until(output.as_fd(), crate::ready::Interest::Read, until).unwrap();
+        let mut proof = [0];
+        output.read_exact(&mut proof).unwrap();
+        assert_eq!(proof, *b"x");
     }
-    let observed = child.wait_job_event().unwrap();
+    let observed = job_event(&mut child, &wake);
     assert_eq!(observed.notice(), ChildNotice::Exited);
     let Some(ChildEvent::Exited(usage)) = observed.acknowledge().unwrap() else {
         panic!("actual exit was not accounted")

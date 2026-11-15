@@ -12,6 +12,14 @@ use crate::snapshot::CacheRoot;
 #[path = "artifact_use.rs"]
 mod in_use;
 
+/// Remove the directory `dir` unless a process runs a program in it, a managed service names one
+/// there, or an unproved first execution still holds it: `Ok(true)` removed, `Ok(false)` there
+/// was none, `Err` why it stays. The store's own rule, for the release tool's other folders of
+/// executables ([`crate::release_leftovers`]).
+pub(crate) fn remove_unused_dir(dir: &Path) -> Result<bool, String> {
+    in_use::remove_unused(dir)
+}
+
 /// The record's schema, and what the key and the bundle digest are taken under.
 pub const SCHEMA: &str = "aterm-release-artifact-v2";
 

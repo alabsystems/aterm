@@ -491,6 +491,9 @@ pub fn cmd(args: &[String]) -> Res {
     drop(before_journal);
     drop(before);
 
+    // Readiness holds each contact to this run: one made before its hosts started says nothing
+    // of them.
+    let since_ms = aterm_time::unix_millis().ok_or_else(|| Fail::die("no wall clock"))?;
     let mut node = Node::start(&source, &aterm, port, "node.log")?;
     active(&source, node.0.id(), &out, "source-active.json")?;
     let mut window = start_window(&recipient, &aterm, port, suppressed)?;
@@ -504,6 +507,7 @@ pub fn cmd(args: &[String]) -> Res {
         &mut node,
         &mut window,
         log_backed,
+        since_ms,
         &out,
     )?;
 

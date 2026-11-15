@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::supervise::occupancy::{due, rules};
-use crate::supervise::policy::turn_end::RESET_MINUTE;
 use crate::supervise::tape::header::{Reader, Roots, VERBATIM, Writer};
+use alab_policy::config::RESET_MINUTE;
 
 /// The hosted loop's hand-over flag ([`Session::set_handover`]), as a setup holds it.
 #[derive(Debug, Clone, Default)]
@@ -154,7 +154,7 @@ impl SessionSetup {
             claim_renew: claim::CLAIM_RENEW,
             claim_ttl_ms: claim::ttl_ms(&crate::harness::Timings::for_build()),
             redecide_after_skip: crate::harness::Timings::for_build().redecide_after_skip,
-            turn_end_timing: TurnEndTiming::for_build(),
+            turn_end_timing: crate::supervise::config::timing_for_build(),
             press_badge_after: approval_loop::PRESS_BADGE_AFTER,
             survey_retry: SURVEY_RETRY,
             survey_settle: SURVEY_SETTLE,

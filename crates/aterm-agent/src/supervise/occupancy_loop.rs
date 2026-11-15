@@ -978,7 +978,7 @@ impl<C: Ctl> Session<'_, C> {
     /// read it (`Session::managed_at_write`), the composer's read (a composer the read cannot
     /// judge is a draft), the host's `taskless` and its reach (`IdleHost::reach_peek`, then
     /// `IdleHost::reach` on a Down, which holds the line only within its cap:
-    /// `TurnEndTiming::outage_holds_until`); `Err` with the guard that holds where a read itself
+    /// `turn_end::outage_holds_until`); `Err` with the guard that holds where a read itself
     /// says nothing (`Guard::Person` for the status, `Guard::Managed` for the record).
     /// Every line at a break goes through it: the door's ([`Self::door_holds`]), the stuck
     /// fact's (`Session::stuck_break`, through `door::stuck_at_break`) and the host's own fact's
@@ -1554,12 +1554,10 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Whether `reach`, read at `now`, still holds a line (`Guard::Reach`): a measured outage
-    /// within its cap ([`super::super::policy::turn_end::TurnEndTiming::outage_holds_until`]),
+    /// within its cap ([`crate::supervise::policy::turn_end::outage_holds_until`]),
     /// the same bound a point's act is held to, so no stale or wrong Down holds a break past it.
     fn outage_holds(&self, reach: Reach, now: Instant) -> bool {
-        self.turn_end
-            .timing
-            .outage_holds_until(reach, now)
+        crate::supervise::policy::turn_end::outage_holds_until(&self.turn_end.timing, reach, now)
             .is_some()
     }
 

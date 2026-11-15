@@ -100,6 +100,72 @@ fn complete_linear_negative_batches_local_commit_reads() {
 }
 
 #[test]
+fn complete_braided_negative_reuses_cached_original_frontiers() {
+    let world = World::canonical("commit-ancestry-braided-batches");
+    let store = bare_repo(world.path(), "source");
+    let root = host_git(&store, &["rev-parse", "main"]);
+    let tree = host_git(&store, &["rev-parse", "main^{tree}"]);
+    let unrelated = host_git(&store, &["commit-tree", &tree, "-m", "unrelated"]);
+    let body = world.path().join("commit-body");
+    let mut tips = Vec::new();
+    // Distinct lane clocks make Git's date-ordered advice differ from a FIFO
+    // parent walk. Every lane still consists of actual original parent edges.
+    for lane in 0..16 {
+        let mut tip = root.clone();
+        for step in 0..16 {
+            let timestamp = 1_700_000_100 + lane * 1000 + step;
+            std::fs::write(
+                &body,
+                format!(
+                    "tree {tree}\nparent {tip}\nauthor fixture <fixture> {timestamp} +0000\ncommitter fixture <fixture> {timestamp} +0000\n\nlane {lane} step {step}\n"
+                ),
+            )
+            .unwrap();
+            tip = host_git(
+                &store,
+                &["hash-object", "-w", "-t", "commit", body.to_str().unwrap()],
+            );
+        }
+        tips.push(tip);
+    }
+    let mut merge = format!("tree {tree}\n");
+    for tip in &tips {
+        merge.push_str(&format!("parent {tip}\n"));
+    }
+    merge.push_str(
+        "author fixture <fixture> 1700020000 +0000\ncommitter fixture <fixture> 1700020000 +0000\n\nmerge all lanes\n",
+    );
+    std::fs::write(&body, merge).unwrap();
+    let tip = host_git(
+        &store,
+        &["hash-object", "-w", "-t", "commit", body.to_str().unwrap()],
+    );
+    let gh = world.client(git_env()).build();
+    let result = answer(&gh, &store, &unrelated, &tip).unwrap();
+    assert_eq!(result["queries"][0]["contained"], json!(false));
+    assert_eq!(result["acquired_commits"], json!(0));
+    assert_eq!(result["api_body_bytes"], json!(0));
+    assert!(world.fake.seen().is_empty(), "the complete DAG is local");
+    let reads = gh
+        .fx()
+        .children_run()
+        .iter()
+        .filter(|child| child.args.iter().any(|arg| arg == "cat-file"))
+        .count();
+    eprintln!(
+        "258-commit braided original negative: {reads} cat-file children; 0 acquisitions/API bytes"
+    );
+    assert!(
+        reads <= 64,
+        "a complete braided negative used {reads} cat-file children"
+    );
+    assert_eq!(
+        answer(&gh, &store, &root, &tip).unwrap()["queries"][0]["contained"],
+        json!(true)
+    );
+}
+
+#[test]
 fn corrupt_intermediate_commit_cannot_supply_a_positive_parent_path() {
     let world = World::canonical("commit-ancestry-corrupt-intermediate");
     let store = bare_repo(world.path(), "source");
@@ -1129,7 +1195,7 @@ fn filtered_metadata_never_admits_duplicate_or_other_guarded_source_configuratio
         "[remote \"origin\"]\npromisor = true\n",
         "[remote \"origin\"]\npartialclonefilter = tree:0\n",
         "[remote \"origin\"]\nproxy = https://elsewhere.invalid/\n",
-        "[core]\nhooksPath = /untrusted\n",
+        "[hook \"x\"]\ncommand = untrusted\n",
         "[core]\nalternateRefsCommand = untrusted\n",
         "[extensions]\npartialClone = origin\n",
         "[http]\nsslVerify = false\n",
@@ -1151,4 +1217,72 @@ fn filtered_metadata_never_admits_duplicate_or_other_guarded_source_configuratio
             .iter()
             .all(|call| !call.path_and_query.contains("/git/commits/"))
     );
+}
+
+#[test]
+fn commit_reads_keep_an_active_hook_directory_inert_and_unchanged() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let world = World::canonical("commit-hook-directory");
+    let fixture = filtered_store(&world);
+    let hooks = world.path().join("active hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(&hook, b"#!/bin/sh\nprintf 'ran\\n' >> \"${0%/*}/ran\"\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    host_git(
+        &fixture.store,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let marker = hooks.join("ran");
+    host_git(
+        &fixture.store,
+        &["update-ref", "refs/heads/hook-control", &fixture.tip],
+    );
+    assert!(
+        marker.is_file(),
+        "the actual configured hook must run in its ordinary Git control"
+    );
+    host_git(
+        &fixture.store,
+        &["update-ref", "-d", "refs/heads/hook-control"],
+    );
+    std::fs::remove_file(&marker).unwrap();
+
+    let config = std::fs::read(fixture.store.join("config")).unwrap();
+    let refs = host_git(&fixture.store, &["show-ref"]);
+    std::fs::write(fixture.store.join("FETCH_HEAD"), b"original fetch head\n").unwrap();
+    let tree = host_git(&fixture.donor, &["rev-parse", "main^{tree}"]);
+    let future = host_git(
+        &fixture.donor,
+        &["commit-tree", &tree, "-p", &fixture.tip, "-m", "future"],
+    );
+    api_commit(&world, &fixture.donor, &future);
+    assert!(!local_object(&fixture.store, &future));
+    let gh = world.client(git_env()).build();
+    for (tip, acquired) in [(&fixture.tip, 0), (&future, 1)] {
+        let result = answer(&gh, &fixture.store, &fixture.first, tip).unwrap();
+        assert_eq!(result["queries"][0]["contained"], json!(true));
+        assert_eq!(result["acquired_commits"], json!(acquired));
+        assert_eq!(result["refs_written"], json!(false));
+        assert_eq!(result["checkout_complete"], json!(false));
+        assert!(
+            !marker.exists(),
+            "commit reads must never execute the configured hook"
+        );
+        assert_eq!(std::fs::read(fixture.store.join("config")).unwrap(), config);
+        assert_eq!(host_git(&fixture.store, &["show-ref"]), refs);
+        assert_eq!(
+            std::fs::read(fixture.store.join("FETCH_HEAD")).unwrap(),
+            b"original fetch head\n"
+        );
+    }
+    assert!(local_object(&fixture.store, &future));
+    assert!(!local_object(&fixture.store, &fixture.retired));
+    assert!(gh.fx().children_run().iter().all(|child| {
+        !child
+            .args
+            .iter()
+            .any(|arg| arg == "fetch" || arg == "update-ref")
+    }));
 }

@@ -9,8 +9,9 @@ use super::command::{print, print_schema, shown, sources_line};
 use super::fixture;
 use super::fold::{AGENTS_KEEP_MS, FleetTables, Inputs, REACH_KEEP_MS, Source, fold};
 use super::read::{
-    AccountWord, AgentSeen, Answer, Answered, At, Harness, Latest, MachineSeen, OWN_ID, Read,
-    SIGHTED_KEEP_MS, State, Tally, word,
+    AccountWord, AgentSeen, Answer, Answered, At, Harness, Latest, Look, MachineSeen,
+    OUTPUT_KEEP_MS, OWN_ID, OutSrc, Rate, Read, SIGHTED_KEEP_MS, State, Tally, TurnFacts, Work,
+    word,
 };
 use super::rows::{
     self, AccountRef, Cell, EvidenceHow, Reach, Row, UNREGISTERED, Via, WindowState,
@@ -121,6 +122,11 @@ fn live<T>(value: T, at_ms: u64) -> Source<Arc<T>> {
 }
 
 fn agent(sid: &str, harness: Harness, state: State, account: Option<&str>) -> AgentSeen {
+    // An older aterm's row, its agent's word `busy` where it is busy.
+    let turn = TurnFacts {
+        word_turn: state == State::Busy,
+        ..TurnFacts::OLDER
+    };
     AgentSeen {
         sid: sid.to_owned(),
         harness,
@@ -133,6 +139,16 @@ fn agent(sid: &str, harness: Harness, state: State, account: Option<&str>) -> Ag
         usage_7d_pct: None,
         account: account.and_then(AccountWord::new),
         model: None,
+        pinned: None,
+        turn,
+        tok_in: None,
+        tok_out: None,
+        tok_for_ms: None,
+        turns: None,
+        tools: None,
+        work: Work::of(state, &turn),
+        answer_at_ms: None,
+        rate: None,
     }
 }
 
@@ -142,14 +158,20 @@ fn answered(sessions: u32, agents: Vec<AgentSeen>) -> Answer {
     for agent in &agents {
         tally.add(agent.state);
     }
-    Answer::Answered(Answered {
+    Answer::Answered(Box::new(Answered {
         build: Some("0.141.0".to_owned()),
+        answer_at_ms: None,
         home_free_mb: Some(50_000),
+        look: Look::UNREAD,
+        access: None,
+        drive: None,
         sessions: Some(sessions),
         tally: Some(tally),
+        work: None,
+        wait: None,
         agents,
         agents_more: 0,
-    })
+    }))
 }
 
 fn peer(label: &str, answer: Answer) -> MachineSeen {
@@ -663,7 +685,8 @@ fn no_address_appears_in_an_agents_row() {
     assert_eq!(cell_of(unresolved[0], "account"), Cell::Unread);
     assert_eq!(shown_of(unresolved[0], "account"), "?");
 
-    // The accounts relation holds each login and prints it masked.
+    // The accounts relation holds each login and prints it as it is: an address is ordinary
+    // data.
     assert!(tables.accounts.iter().all(|row| {
         row.login
             .as_deref()
@@ -674,14 +697,27 @@ fn no_address_appears_in_an_agents_row() {
             .expect("accounts print")
             .text;
         assert!(
-            !printed.contains("fixture.example"),
-            "a login prints masked"
+            printed.contains("pool000@fixture.example"),
+            "a login prints as it is"
         );
+        assert!(!printed.contains("…@…"), "no login is abbreviated");
+    }
+
+    // A login another writer's build stored though it is no address reads the same on both
+    // faces: withheld. NEGATIVE CONTROL: with `cell_json` giving every cell's own JSON, the
+    // JSON face prints the stored text and the first assertion fails for `json=true`.
+    const STORED: &str = concat!("ghp", "_cccccccccccccccccccccccc");
+    let mut odd = tables.clone();
+    odd.accounts[0].login = Some(STORED.to_owned());
+    for json in [false, true] {
+        let printed = print(&odd, "accounts", &[], json)
+            .expect("accounts print")
+            .text;
         assert!(
-            printed.contains("po…@…"),
-            "{}",
-            &printed[..400.min(printed.len())]
+            !printed.contains(STORED),
+            "json={json}: a refused login is not printed"
         );
+        assert!(printed.contains(grid::REFUSED), "json={json}");
     }
 }
 
@@ -923,10 +959,51 @@ fn every_schema_is_well_formed_and_every_fixture_cell_is_of_its_columns_type() {
         .expect("relations");
     assert_eq!(relations.len(), 1);
     assert!(
-        one.contains("\"pii\":true"),
-        "the login column says it is masked"
+        one.contains("\"name\":\"login\"") && !one.contains("\"pii\""),
+        "the login column is ordinary data: no column is marked"
     );
     assert!(print_schema(Some("nothing"), false).is_err());
+}
+
+/// THE FIXTURE'S MACHINES SAY WHAT A REAL ONE CAN: no use passes the capacity it is read
+/// against (memory, swap, a link's traffic), so a pair or a ratio built on the fixture meets
+/// no use over a zero capacity; and this Mac's own answer reads no drive grant, as its windows
+/// answer a local read that asks for none. CONTROL: some machine has swap in use and some has a
+/// grant, so neither law holds by everything being unread or zero.
+#[test]
+fn the_fixtures_looks_keep_use_within_capacity_and_its_own_mac_reads_no_grant() {
+    let inputs = fixture::inputs(NOW);
+    let latest = inputs.read.value().expect("the fixture's read");
+    let within = |used: Option<u64>, total: Option<u64>| match (used, total) {
+        (Some(used), Some(total)) => used <= total,
+        (Some(used), None) => used == 0,
+        (None, _) => true,
+    };
+    let (mut swapping, mut granted) = (0, 0);
+    for (id, sighted) in &latest.machines {
+        let Some(answered) = sighted.answered.as_ref().map(|at| &at.v) else {
+            continue;
+        };
+        let look = &answered.look;
+        assert!(
+            within(look.mem_used_mb, look.mem_total_mb),
+            "{id}: {look:?}"
+        );
+        assert!(
+            within(look.swap_used_mb, look.swap_total_mb),
+            "{id}: {look:?}"
+        );
+        if let Some(link) = look.net_link_kbps {
+            assert!(within(look.net_rx_kbps, Some(link)), "{id}: {look:?}");
+            assert!(within(look.net_tx_kbps, Some(link)), "{id}: {look:?}");
+        }
+        swapping += usize::from(look.swap_used_mb.is_some_and(|used| used > 0));
+        granted += usize::from(answered.drive == Some(true));
+        if id == OWN_ID {
+            assert_eq!(answered.drive, None, "{answered:?}");
+        }
+    }
+    assert!(swapping > 0 && granted > 0, "{swapping} {granted}");
 }
 
 #[test]
@@ -2017,4 +2094,614 @@ fn a_table_prints_by_its_schema_and_a_relation_nobody_read_says_so() {
         sources_line(&unread.sources),
         "registry=never journal=never network=never fleet_read=never"
     );
+}
+
+/// A LOAD SCORE IS TWO HUNDREDTHS OR NONE: `load=<level>:<over>` names the machine's dial in
+/// hundredths, each part `0..=100`; `-`, one part alone, a third part, a sign, a decimal, an
+/// empty part or one past 100 names no score, and a read `0:0` is a machine at rest. An over the
+/// machine could not judge (`<level>:-`) reads unread beside its level, never an over of 0.
+#[test]
+fn a_load_score_is_two_hundredths_or_none() {
+    use super::read::Load;
+    let score = |level_x100, over_x100| {
+        Some(Load {
+            level_x100,
+            over_x100,
+        })
+    };
+    assert_eq!(Load::of("72:15"), score(72, Some(15)));
+    assert_eq!(Load::of("0:0"), score(0, Some(0)));
+    assert_eq!(Load::of("100:100"), score(100, Some(100)));
+    assert_eq!(Load::of("007:012"), score(7, Some(12)));
+    assert_eq!(Load::of("100:-"), score(100, None));
+    for bad in [
+        "-",
+        "",
+        ":",
+        "72",
+        "72:",
+        ":15",
+        "72:15:1",
+        "101:0",
+        "72:101",
+        "-:15",
+        "-:-",
+        "72:--",
+        "+7:15",
+        "7.5:15",
+        "x:y",
+        "18446744073709551616:0",
+    ] {
+        assert_eq!(Load::of(bad), None, "{bad}");
+    }
+}
+
+/// THE AGENTS RELATION SAYS WHETHER EACH AGENT IS PINNED, as its machine's row said it:
+/// `aterm db fleet agents` prints `true`, `false`, or `?` (JSON `null`) for a row that said
+/// neither, and the schema names the column. CONTROL: an unread pin is never printed `false`.
+#[test]
+fn an_agents_row_says_its_pin_and_an_unsaid_pin_is_unread() {
+    let pinned = |sid: &str, pinned: Option<bool>| AgentSeen {
+        pinned,
+        ..agent(sid, Harness::Claude, State::Busy, None)
+    };
+    let tables = tables(&Inputs {
+        lab: live(lab_of(&["m1"]), NOW),
+        read: read_of(vec![peer(
+            "m1",
+            answered(
+                3,
+                vec![
+                    pinned("s1", Some(true)),
+                    pinned("s2", Some(false)),
+                    pinned("s3", None),
+                ],
+            ),
+        )]),
+        ..Inputs::default()
+    });
+    let pins: Vec<(&str, Option<bool>)> = tables
+        .agents
+        .iter()
+        .map(|row| (row.sid.as_str(), row.pinned))
+        .collect();
+    assert_eq!(
+        pins,
+        [("s1", Some(true)), ("s2", Some(false)), ("s3", None)]
+    );
+    let at = rows::AGENTS.position("pinned").expect("a pinned column");
+    let cells: Vec<Cell> = tables
+        .agents
+        .iter()
+        .map(|row| row.cells()[at].clone())
+        .collect();
+    assert_eq!(
+        cells,
+        [
+            Cell::Value(Value::Bool(true)),
+            Cell::Value(Value::Bool(false)),
+            Cell::Unread
+        ]
+    );
+    let json = print(&tables, "agents", &[], true)
+        .expect("agents print")
+        .text;
+    assert!(json.contains("\"pinned\":true"), "{json}");
+    assert!(json.contains("\"pinned\":false"), "{json}");
+    assert!(json.contains("\"pinned\":null"), "{json}");
+    let schema = print_schema(Some("agents"), false).expect("the schema prints");
+    assert!(
+        grid_of(&schema).iter().any(|line| line[1] == "pinned"),
+        "{schema}"
+    );
+}
+
+/// An agent of sid `sid` whose row sends its whole conversation's counters `(tok_in, tok_out)`,
+/// counted for `for_ms` unbroken.
+fn counting(sid: &str, tokens: (u64, u64), for_ms: u64) -> AgentSeen {
+    AgentSeen {
+        tok_in: Some(tokens.0),
+        tok_out: Some(tokens.1),
+        tok_for_ms: Some(for_ms),
+        ..agent(sid, Harness::Claude, State::Busy, None)
+    }
+}
+
+/// An answer of `agents`, answered at `answer_at_ms` on the machine's own clock: one reply, which
+/// listed every agent.
+fn answered_at(answer_at_ms: Option<u64>, agents: Vec<AgentSeen>) -> Answer {
+    let agents = agents
+        .into_iter()
+        .map(|agent| AgentSeen {
+            answer_at_ms,
+            ..agent
+        })
+        .collect();
+    replied(answer_at_ms, agents)
+}
+
+/// An answer of `agents`, answered at `answer_at_ms` (its first reply's time); each agent keeps
+/// the time of the reply that listed it.
+fn replied(answer_at_ms: Option<u64>, agents: Vec<AgentSeen>) -> Answer {
+    let sessions = u32::try_from(agents.len()).expect("a few agents");
+    let Answer::Answered(mut answer) = answered(sessions, agents) else {
+        unreachable!("answered answers")
+    };
+    answer.answer_at_ms = answer_at_ms;
+    Answer::Answered(answer)
+}
+
+/// Each agent's token rate as the reads so far say it, by sid, of the one machine `m1`.
+fn rates_of(latest: &Latest) -> Vec<(String, Option<Rate>)> {
+    let sighted = latest.machines.values().next().expect("m1 sighted");
+    let answer = &sighted.answered.as_ref().expect("m1 answered").v;
+    answer
+        .agents
+        .iter()
+        .map(|agent| (agent.sid.clone(), agent.rate))
+        .collect()
+}
+
+/// Two reads of `m1`: the first at `NOW` answering `then` at `then_at`, the second `read_gap`
+/// later answering `now` at `now_at`. The reads so far after both. An agent that names its own
+/// reply's time keeps it; the rest take the answer's.
+fn two_reads(
+    (then_at, then): (Option<u64>, Vec<AgentSeen>),
+    read_gap: u64,
+    (now_at, now): (Option<u64>, Vec<AgentSeen>),
+) -> Latest {
+    let stamped = |at: Option<u64>, agents: Vec<AgentSeen>| {
+        let agents = agents
+            .into_iter()
+            .map(|agent| AgentSeen {
+                answer_at_ms: agent.answer_at_ms.or(at),
+                ..agent
+            })
+            .collect();
+        peer("m1", replied(at, agents))
+    };
+    Latest::default()
+        .with(whole(NOW, vec![stamped(then_at, then)]))
+        .with(whole(NOW + read_gap, vec![stamped(now_at, now)]))
+}
+
+/// A RATE IS NEVER TAKEN AGAINST AN ANSWER OF ANOTHER PROOF STATE: the machine the book dials
+/// as `m1` answers twice a minute apart; where one answer proved its node key and the other did
+/// not (a claim, which any peer that read the sid could make), the later answer's agent has no
+/// rate, whichever came first. Two proven answers give one, and so do two claims: a claim's
+/// rate is kept as a claim, on a row marked unproven, as everything else a claim says.
+/// CONTROL: the proof states not compared (a proven row's rate taken against a claim's
+/// counters) is caught.
+#[test]
+fn a_rate_is_never_taken_against_an_answer_of_another_proof_state() {
+    let answer = |unproven: bool, at: u64, agent: AgentSeen| {
+        let seen = peer("m1", answered_at(Some(at), vec![agent]));
+        if unproven { seen.unproven() } else { seen }
+    };
+    for (then_unproven, now_unproven, read) in [
+        (false, false, true),
+        (true, false, false),
+        (false, true, false),
+        (true, true, true),
+    ] {
+        let latest = Latest::default()
+            .with(whole(
+                NOW,
+                vec![answer(then_unproven, NOW, counting("s1", (0, 0), 600_000))],
+            ))
+            .with(whole(
+                NOW + 60_000,
+                vec![answer(
+                    now_unproven,
+                    NOW + 60_000,
+                    counting("s1", (9_000_000, 5_000_000), 600_000),
+                )],
+            ));
+        assert_eq!(
+            rates_of(&latest)[0].1.is_some(),
+            read,
+            "then unproven {then_unproven}, now unproven {now_unproven}"
+        );
+    }
+}
+
+/// A TOKEN RATE NEEDS TWO READS OF ONE SESSION: the first read of a session has none, however
+/// large and however long-counted its totals; the second, a minute later, has what the counters
+/// gained over that minute; a session the earlier answer did not list has none.
+/// CONTROL: a rate made from one read (its totals over how long they counted) is caught.
+#[test]
+fn a_token_rate_needs_two_reads_of_one_session() {
+    let first = Latest::default().with(whole(
+        NOW,
+        vec![peer(
+            "m1",
+            answered_at(Some(NOW), vec![counting("s1", (900_000, 60_000), 600_000)]),
+        )],
+    ));
+    assert_eq!(rates_of(&first), [("s1".to_owned(), None)]);
+    let latest = two_reads(
+        (Some(NOW), vec![counting("s1", (900_000, 60_000), 600_000)]),
+        60_000,
+        (
+            Some(NOW + 60_000),
+            vec![
+                counting("s1", (930_000, 61_200), 660_000),
+                counting("s2", (5_000, 400), 900_000),
+            ],
+        ),
+    );
+    assert_eq!(
+        rates_of(&latest),
+        [
+            (
+                "s1".to_owned(),
+                Some(Rate {
+                    in_per_min: 30_000,
+                    out_per_min: 1_200,
+                    over_ms: 60_000
+                })
+            ),
+            ("s2".to_owned(), None),
+        ]
+    );
+    // Over two minutes, the gain is halved to a minute's.
+    let latest = two_reads(
+        (Some(NOW), vec![counting("s1", (900_000, 60_000), 600_000)]),
+        120_000,
+        (
+            Some(NOW + 120_000),
+            vec![counting("s1", (930_000, 61_200), 720_000)],
+        ),
+    );
+    assert_eq!(
+        rates_of(&latest)[0]
+            .1
+            .map(|rate| (rate.in_per_min, rate.out_per_min)),
+        Some((15_000, 600))
+    );
+}
+
+/// A COUNTER THAT WENT BACK GIVES NO RATE: input or output lower than the earlier read's is
+/// another counter (a new conversation, a restart), never 0 tokens a minute. A counter the
+/// earlier read did not hold gives none either. CONTROL: a saturating difference is caught.
+#[test]
+fn a_counter_that_went_back_gives_no_rate() {
+    for (n, now) in [
+        counting("s1", (899_999, 61_000), 660_000),
+        counting("s1", (950_000, 59_999), 660_000),
+        AgentSeen {
+            tok_out: None,
+            ..counting("s1", (950_000, 61_000), 660_000)
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let latest = two_reads(
+            (Some(NOW), vec![counting("s1", (900_000, 60_000), 600_000)]),
+            60_000,
+            (Some(NOW + 60_000), vec![now]),
+        );
+        assert_eq!(rates_of(&latest), [("s1".to_owned(), None)], "{n}");
+    }
+    // The earlier read without its input counter: no rate.
+    let latest = two_reads(
+        (
+            Some(NOW),
+            vec![AgentSeen {
+                tok_in: None,
+                ..counting("s1", (900_000, 60_000), 600_000)
+            }],
+        ),
+        60_000,
+        (
+            Some(NOW + 60_000),
+            vec![counting("s1", (930_000, 61_000), 660_000)],
+        ),
+    );
+    assert_eq!(rates_of(&latest), [("s1".to_owned(), None)]);
+}
+
+/// A RATE OVER TOO SHORT OR TOO LONG AN INTERVAL IS UNREAD: 30 s to 300 s, both ends kept.
+/// CONTROL: either bound removed is caught.
+#[test]
+fn a_rate_over_too_short_or_too_long_an_interval_is_unread() {
+    for (gap, read) in [
+        (29_999, false),
+        (30_000, true),
+        (300_000, true),
+        (300_001, false),
+    ] {
+        let latest = two_reads(
+            (Some(NOW), vec![counting("s1", (900_000, 60_000), 600_000)]),
+            gap,
+            (
+                Some(NOW + gap),
+                vec![counting("s1", (930_000, 61_000), 3_600_000)],
+            ),
+        );
+        let rate = rates_of(&latest)[0].1;
+        assert_eq!(rate.is_some(), read, "{gap}");
+        assert_eq!(rate.map(|rate| rate.over_ms), read.then_some(gap), "{gap}");
+    }
+}
+
+/// A RATE IS TIMED BY THE ANSWERER'S CLOCK: two answers a minute apart on the machine's own
+/// clock, heard by reads 90 s apart (the second waited on a slow peer), cover a minute. Where
+/// either answer sends no time (an aterm before it), the two reads' times are the interval.
+/// Where a machine answers in several replies (this Mac's windows), an agent is timed by the
+/// reply that listed it, never by the first reply's clock: its counters were read there.
+/// CONTROLS: the observer's read times used where both answers say their time is caught; the
+/// answer's first reply timing an agent another reply listed is caught.
+#[test]
+fn a_rate_is_timed_by_the_answerers_clock() {
+    const ANSWERER: u64 = 1_700_000_000_000;
+    let latest = two_reads(
+        (
+            Some(ANSWERER),
+            vec![counting("s1", (900_000, 60_000), 600_000)],
+        ),
+        90_000,
+        (
+            Some(ANSWERER + 60_000),
+            vec![counting("s1", (930_000, 61_200), 660_000)],
+        ),
+    );
+    assert_eq!(
+        rates_of(&latest)[0].1,
+        Some(Rate {
+            in_per_min: 30_000,
+            out_per_min: 1_200,
+            over_ms: 60_000
+        })
+    );
+    for (then_at, now_at) in [(None, Some(ANSWERER + 60_000)), (Some(ANSWERER), None)] {
+        let latest = two_reads(
+            (then_at, vec![counting("s1", (900_000, 60_000), 600_000)]),
+            90_000,
+            (now_at, vec![counting("s1", (930_000, 61_200), 690_000)]),
+        );
+        assert_eq!(
+            rates_of(&latest)[0].1,
+            Some(Rate {
+                in_per_min: 20_000,
+                out_per_min: 800,
+                over_ms: 90_000
+            }),
+            "{then_at:?} {now_at:?}"
+        );
+    }
+    // Two replies: the first (another window) answered at 1 000 000 and 1 060 000, the one that
+    // lists s1 at 1 009 000 and 1 060 500, so s1's counters cover 51.5 s, not 60 s. They have
+    // counted 55 s: a rate over s1's own interval, which the first reply's minute would refuse.
+    let latest = two_reads(
+        (
+            Some(1_000_000),
+            vec![AgentSeen {
+                answer_at_ms: Some(1_009_000),
+                ..counting("s1", (900_000, 100_000), 600_000)
+            }],
+        ),
+        60_000,
+        (
+            Some(1_060_000),
+            vec![AgentSeen {
+                answer_at_ms: Some(1_060_500),
+                ..counting("s1", (1_003_000, 151_500), 55_000)
+            }],
+        ),
+    );
+    assert_eq!(
+        rates_of(&latest)[0].1,
+        Some(Rate {
+            in_per_min: 120_000,
+            out_per_min: 60_000,
+            over_ms: 51_500
+        }),
+        "the reply that listed it times it"
+    );
+    // An answerer's clock that went back gives no interval and no rate.
+    let latest = two_reads(
+        (
+            Some(ANSWERER),
+            vec![counting("s1", (900_000, 60_000), 600_000)],
+        ),
+        60_000,
+        (
+            Some(ANSWERER - 1),
+            vec![counting("s1", (930_000, 61_200), 660_000)],
+        ),
+    );
+    assert_eq!(rates_of(&latest)[0].1, None);
+}
+
+/// A COUNTER YOUNGER THAN THE INTERVAL GIVES NO RATE: counters that have counted this
+/// conversation for less than the time between the reads began inside it (a resumed
+/// conversation's whole total, a catch-up), so their gain is no minute's work; unsaid, they
+/// give none; counted exactly as long, they give one. CONTROL: `tok_for_ms` ignored is caught.
+#[test]
+fn a_counter_younger_than_the_interval_gives_no_rate() {
+    for (for_ms, read) in [
+        (Some(45_000), false),
+        (Some(59_999), false),
+        (None, false),
+        (Some(60_000), true),
+    ] {
+        let latest = two_reads(
+            (Some(NOW), vec![counting("s1", (10_000, 1_000), 600_000)]),
+            60_000,
+            (
+                Some(NOW + 60_000),
+                vec![AgentSeen {
+                    tok_for_ms: for_ms,
+                    ..counting("s1", (2_400_000, 90_000), 0)
+                }],
+            ),
+        );
+        assert_eq!(rates_of(&latest)[0].1.is_some(), read, "{for_ms:?}");
+    }
+}
+
+/// An agent in an open turn whose row says `step_ms`, `out_ms` and `out_src` as given.
+fn in_turn(step_ms: Option<u64>, out: Option<(u64, OutSrc)>) -> TurnFacts {
+    TurnFacts {
+        turn_open: Some(true),
+        turn_age_ms: Some(1_800_000),
+        turn_end_age_ms: Some(3_600_000),
+        step_age_ms: step_ms,
+        out_age_ms: out.map(|(ms, _)| ms),
+        out_src: out.map(|(_, src)| src),
+        bg: Some(0),
+        older: false,
+        word_turn: true,
+    }
+}
+
+/// AN AGENT AT A BOX IS ASKING, ONE IN A LONG TOOL CALL IS TOOL, AND NEITHER IS NO OUTPUT: in a
+/// turn, an agent waiting on a person is `asking` however old its output, and one with a step
+/// open (a 25-minute build writes no transcript row) is `tool`. Without either, output older
+/// than ten minutes is `no-output`; transcript output within them `with-output`; a fresh screen
+/// alone (a spinner) or no output age `output-unread`. A wall is `held` and an unknown state
+/// `unknown`, before the turn is asked. CONTROL: the step ignored, and `waiting` classed by its
+/// output age, are caught.
+#[test]
+fn an_agent_at_a_box_is_asking_one_in_a_long_tool_call_is_tool_and_neither_is_no_output() {
+    let stale = Some((25 * 60_000, OutSrc::Transcript));
+    let fresh = Some((120_000, OutSrc::Transcript));
+    let cases = [
+        (State::Waiting, in_turn(None, stale), Work::Asking),
+        (State::Waiting, in_turn(None, fresh), Work::Asking),
+        (State::Busy, in_turn(Some(25 * 60_000), stale), Work::Tool),
+        (State::Busy, in_turn(None, stale), Work::NoOutput),
+        (
+            State::Busy,
+            in_turn(None, Some((25 * 60_000, OutSrc::Screen))),
+            Work::NoOutput,
+        ),
+        (State::Busy, in_turn(None, fresh), Work::WithOutput),
+        (
+            State::Busy,
+            in_turn(None, Some((OUTPUT_KEEP_MS, OutSrc::Transcript))),
+            Work::WithOutput,
+        ),
+        (
+            State::Busy,
+            in_turn(None, Some((120_000, OutSrc::Screen))),
+            Work::OutputUnread,
+        ),
+        (State::Busy, in_turn(None, None), Work::OutputUnread),
+        (State::Walled, in_turn(None, fresh), Work::Held),
+        (State::Unknown, in_turn(None, fresh), Work::Unknown),
+        (
+            State::Waiting,
+            TurnFacts {
+                turn_open: Some(false),
+                ..in_turn(None, stale)
+            },
+            Work::NoTurn,
+        ),
+    ];
+    for (n, (state, row, work)) in cases.into_iter().enumerate() {
+        assert_eq!(Work::of(state, &row), work, "{n}: {state:?} {row:?}");
+    }
+    assert_eq!(
+        Work::WORDS,
+        [
+            Work::Held,
+            Work::NoTurn,
+            Work::Asking,
+            Work::Tool,
+            Work::WithOutput,
+            Work::NoOutput,
+            Work::OutputUnread,
+            Work::Unknown
+        ]
+        .map(Work::word)
+    );
+}
+
+/// BACKGROUND WORK IS A TURN ONLY WITH OUTPUT AFTER THE LAST TURN CLOSED: an agent with no turn
+/// open and a background shell is in a turn where its transcript wrote output after its last
+/// turn closed and within ten minutes; output older than the close is the closed turn's own, a
+/// screen that moved proves nothing, and with no background work an idle agent is in no turn.
+/// CONTROL: `bg` ignored, and an idle agent with a background shell taken as in a turn, are
+/// caught.
+#[test]
+fn background_work_is_a_turn_only_with_output_after_the_last_turn_closed() {
+    let idle = |bg: Option<u32>, out: Option<(u64, OutSrc)>, end: Option<u64>| TurnFacts {
+        turn_open: Some(false),
+        turn_age_ms: None,
+        turn_end_age_ms: end,
+        step_age_ms: None,
+        out_age_ms: out.map(|(ms, _)| ms),
+        out_src: out.map(|(_, src)| src),
+        bg,
+        older: false,
+        word_turn: false,
+    };
+    let after = Some((120_000, OutSrc::Transcript));
+    let cases = [
+        (idle(Some(1), after, Some(300_000)), Work::WithOutput),
+        (idle(Some(2), after, None), Work::WithOutput),
+        (
+            idle(Some(1), Some((360_000, OutSrc::Transcript)), Some(300_000)),
+            Work::NoTurn,
+        ),
+        (
+            idle(Some(1), Some((300_000, OutSrc::Transcript)), Some(300_000)),
+            Work::NoTurn,
+        ),
+        (
+            idle(Some(1), Some((720_000, OutSrc::Transcript)), Some(900_000)),
+            Work::NoTurn,
+        ),
+        (
+            idle(Some(1), Some((120_000, OutSrc::Screen)), Some(300_000)),
+            Work::NoTurn,
+        ),
+        (idle(Some(1), None, Some(300_000)), Work::NoTurn),
+        (idle(Some(0), after, Some(300_000)), Work::NoTurn),
+        (idle(None, after, Some(300_000)), Work::NoTurn),
+    ];
+    for (n, (row, work)) in cases.into_iter().enumerate() {
+        assert_eq!(Work::of(State::Idle, &row), work, "{n}: {row:?}");
+    }
+}
+
+/// AN OLDER ROW IS IN A TURN WHERE ITS AGENT'S OWN WORD OPENS ONE: a row that says no `turn=`
+/// (an aterm before the turn) is classed as that aterm's session log would class it, by the
+/// word its turn tracker reads: `busy` and a box (`prompt`) open a turn, so an agent waiting at
+/// a box is `asking` (its state `waiting`, whatever its output), and a busy or stalled one is
+/// in a turn with its output unread; `question` (the agent ended its turn on one) and `idle`
+/// close it, so an agent that waits on a person after its turn is in none. A row that says
+/// `turn=` is never classed by its word.
+/// CONTROLS: the fallback read from the state alone (`busy`, an agent at a box in no turn),
+/// and from `busy` or `waiting` (an agent that ended its turn on a question asking), are caught.
+#[test]
+fn an_older_row_is_in_a_turn_where_its_agents_own_word_opens_one() {
+    let older = |word_turn: bool| TurnFacts {
+        word_turn,
+        ..TurnFacts::OLDER
+    };
+    let cases = [
+        (State::Busy, older(true), Work::OutputUnread),
+        (State::Stuck, older(true), Work::OutputUnread),
+        (State::Waiting, older(true), Work::Asking),
+        (State::Waiting, older(false), Work::NoTurn),
+        (State::Idle, older(false), Work::NoTurn),
+        (State::Walled, older(true), Work::Held),
+        (State::Unknown, older(true), Work::Unknown),
+        (
+            State::Busy,
+            TurnFacts {
+                turn_open: Some(false),
+                older: false,
+                ..older(true)
+            },
+            Work::NoTurn,
+        ),
+    ];
+    for (n, (state, row, work)) in cases.into_iter().enumerate() {
+        assert_eq!(Work::of(state, &row), work, "{n}: {state:?} {row:?}");
+    }
 }

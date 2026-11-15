@@ -83,8 +83,6 @@ impl View {
         table: &Table,
         collection: &'static Collection,
         filters: &[grid::Where],
-        reveal: bool,
-        opened: Option<&grid::Opened>,
     ) -> Result<grid::Export> {
         grid::export_projected(
             table,
@@ -92,8 +90,6 @@ impl View {
             &self.cells,
             &self.project(collection),
             filters,
-            reveal,
-            opened,
         )
     }
 

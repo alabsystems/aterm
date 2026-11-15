@@ -8,7 +8,8 @@ use super::fixtures::{
 use super::*;
 use crate::prompt::fixtures::{bash_one_row, composer as claude_composer, rows, screen};
 use crate::reader::{Program, identify, program_of, read};
-use crate::wall::{Placement, WallKind};
+use crate::wall::Placement;
+use alab_policy::vocab::WallKind;
 
 #[test]
 fn the_measured_context_counters_keep_the_241_composer_readable() {

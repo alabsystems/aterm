@@ -8,8 +8,8 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use super::{
-    past_the_budget, refused_for_good, Bridge, Opens, ReadAt, Then, DEADLINE_RETRY, IDLE_ACK_GRACE,
-    LINK_MIRROR_WAIT_LANE, PIPELINE_WINDOW,
+    outcome_unknown, past_the_budget, refused_for_good, Bridge, Opens, ReadAt, Then,
+    DEADLINE_RETRY, IDLE_ACK_GRACE, LINK_MIRROR_WAIT_LANE, PIPELINE_WINDOW,
 };
 use crate::ctl::Reply;
 use crate::mirror::{self, Bucket, LandedWord, LogMode, Pin, PinSlot};
@@ -1884,6 +1884,15 @@ impl Bridge {
                 );
                 Outcome::Owed
             }
+            Err(e) if outcome_unknown(&e) => {
+                // No answer: the full flush under the slot failed and the link was taken; the
+                // slot is sent again on the next link, which the log's reopen settles.
+                stderr_line!(
+                    "aterm-link: mirror: a slot's outcome is unknown ({e}); sent again on the \
+                     next link"
+                );
+                Outcome::Owed
+            }
             Err(e) if astream_broker::broker_refusal(&e).is_some() => {
                 stderr_line!(
                     "aterm-link: mirror: the broker refused a slot for now ({e}); sent again"
@@ -2214,6 +2223,12 @@ impl Bridge {
     /// again and drops the batch again (aterm-link B05 review: an attach
     /// that went on past it left the batch on disk, which the hello then judged and recovered
     /// onto the moved log, a slot of a lost batch landed and the batch never mirrored again).
+    /// Written on the media ([`crate::state::StateDir::set_logpin_durable`]), not under the
+    /// fence this open holds: the witness's own write is not ordered behind it, and a power cut
+    /// that brought an older pin back under the new log's witness would leave its batch and its
+    /// window ledger unjudged. ATERM-KI-1111-4's seed 355 of the sim's `Opts::lossy_logs`: another log's drop,
+    /// rolled back by a cut, left the old log's ledger (a batch at @153) standing on a log whose
+    /// oldest stayed below it, so the window budget held the mirror for good.
     ///
     /// # Errors
     /// The dropped pin's write.
@@ -2227,18 +2242,35 @@ impl Bridge {
             // broker's rules, and then the hello, after the attach saw the move): the mirror
             // that judges it later would recover its batch onto this log (sim item B05). So is
             // one whose drop an earlier attach's write did not put there.
+            // An empty pin is written on the media there too.
             return self.mirror_forget_pinned_batch();
         }
         m.pin.win.clear();
         m.clear_batch();
         m.repin = false;
         m.owed = true;
-        let written = self.state.set_logpin(&m.pin.render());
+        let text = m.pin.render();
+        let written = self.write_dropped_pin(&text);
         self.refused_drop(written)
     }
 
+    /// A dropped pin's write, on the media ([`Bridge::mirror_forget_log`]); under the fence alone
+    /// with the sim's control ([`crate::sim::world::Mutant::DroppedPinUnderTheFence`]).
+    fn write_dropped_pin(&self, text: &str) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::DroppedPinUnderTheFence)
+        {
+            return self.state.set_logpin(text);
+        }
+        self.state.set_logpin_durable(text)
+    }
+
     /// [`Bridge::mirror_forget_log`] for the pin on disk: its batch and its window ledger go,
-    /// its total and key stay. A pin that does not read is the hello's to judge, as before.
+    /// its total and key stay, and the pin is written on the media even when it is already
+    /// empty, so no earlier write under the fence can be rolled back under the new log's
+    /// witness. A pin that does not read is the hello's to judge, as before.
     fn mirror_forget_pinned_batch(&mut self) -> io::Result<()> {
         #[cfg(test)]
         if self
@@ -2253,15 +2285,15 @@ impl Bridge {
         let Ok(pin) = Pin::parse(&text) else {
             return Ok(());
         };
-        if pin.slots.is_empty() && pin.win.is_empty() {
-            return Ok(());
-        }
+        // An empty pin is written again, on the media: a write under the fence may have emptied
+        // it (a pruned window, a cleared batch), and the version a power cut brings back can
+        // still hold the old log's ledger or its slots.
         let pin = Pin {
             win: Vec::new(),
             slots: Vec::new(),
             ..pin
         };
-        let written = self.state.set_logpin(&pin.render());
+        let written = self.write_dropped_pin(&pin.render());
         self.refused_drop(written)
     }
 

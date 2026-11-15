@@ -40,16 +40,32 @@ fn rig() -> TrailRig {
     rig
 }
 
-/// The window's under stream as its frame left it, and the glow's own (uncut) one.
+/// Glass in window pixels. A present's prepended tab strip retags rows into its materialized
+/// grid, while a retained capture keeps terminal row tags. Those tags do not change these
+/// absolute pixel positions or paint data. Comparing them would also make the uncut stream
+/// a false negative-control witness merely because its row space differs.
+fn physical_glass(quads: &[GlowQuad], ramps: &GlowRamps) -> (Vec<GlowQuad>, GlowRamps) {
+    let mut quads = quads.to_vec();
+    let mut ramps = ramps.clone();
+    for quad in &mut quads {
+        quad.row = 0;
+    }
+    for ramp in &mut ramps.items {
+        ramp.row = 0;
+    }
+    (quads, ramps)
+}
+
+/// The window's physical under stream as its frame left it, and the glow's own uncut one.
 fn streams(app: &App, wid: WindowId) -> ((Vec<GlowQuad>, GlowRamps), (Vec<GlowQuad>, GlowRamps)) {
     let ws = &app.windows[&wid];
     let glow = &ws.fx.cursor().glow;
     (
-        (
-            ws.input_scratch.glow_under.clone(),
-            ws.input_scratch.glow_under_ramps.clone(),
+        physical_glass(
+            &ws.input_scratch.glow_under,
+            &ws.input_scratch.glow_under_ramps,
         ),
-        (glow.under_quads().to_vec(), glow.under_ramps().clone()),
+        physical_glass(glow.under_quads(), glow.under_ramps()),
     )
 }
 

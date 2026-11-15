@@ -300,7 +300,8 @@ pub(crate) fn contains(bytes: &[u8], needle: &str) -> bool {
 
 /// Limit-reset templates matched against vendor bundles.
 pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
-    use crate::reset::ResetKind;
+    use crate::reset::ResetDrawn;
+    use alab_policy::vocab::ResetKind;
     let escaped = |id: &str| anchor(id).replace('·', "\\xB7");
     let limit_name = |limit_type: &str| {
         crate::reset::reset_limit_name(limit_type).expect("a window the confirmation names")

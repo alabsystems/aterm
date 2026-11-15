@@ -955,3 +955,135 @@ fn object_intake_refuses_a_different_valid_pack_under_the_expected_hash_name() {
         }
     }
 }
+
+/// An unrelated incomplete ref must not make a complete main snapshot cold.
+/// An incomplete snapshot itself must still fetch every missing object.
+#[test]
+fn main_lends_only_its_complete_snapshot_despite_an_unrelated_partial_ref() {
+    use std::sync::{Mutex, OnceLock, Weak};
+    for complete in [true, false] {
+        let world = World::canonical("main-snapshot-have");
+        let bare = bare_repo(world.path(), "app");
+        let work = world.path().join("app-work");
+        std::fs::write(work.join("payload"), b"required main snapshot body\n").unwrap();
+        host_git(&work, &["add", "payload"]);
+        host_git(&work, &["commit", "--quiet", "-m", "main payload"]);
+        host_git(&work, &["push", "--quiet", bare.to_str().unwrap(), "main"]);
+        host_git(&bare, &["config", "uploadpack.allowFilter", "true"]);
+        let target = world.path().join("target.git");
+        host_git(
+            world.path(),
+            &["init", "--quiet", "--bare", target.to_str().unwrap()],
+        );
+        let slug = common::slug("fixture-dev/app");
+        let gh = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &bare)
+            .build();
+        let request = GitRun::fetch_main(&slug, &target, "refs/agh/main");
+        gh.run_git(&if complete {
+            request
+        } else {
+            request.without_blobs()
+        })
+        .unwrap();
+        let snapshot = host_git(&bare, &["rev-parse", "main"]);
+        std::fs::write(
+            work.join("unrelated"),
+            b"absent from the complete snapshot\n",
+        )
+        .unwrap();
+        host_git(&work, &["add", "unrelated"]);
+        host_git(
+            &work,
+            &["commit", "--quiet", "-m", "unrelated partial branch"],
+        );
+        host_git(
+            &work,
+            &[
+                "push",
+                "--quiet",
+                bare.to_str().unwrap(),
+                "HEAD:refs/heads/partial",
+            ],
+        );
+        let partial = host_git(&work, &["rev-parse", "HEAD"]);
+        // The metadata main operation produces the same unrelated incomplete closure.
+        host_git(&bare, &["update-ref", "refs/heads/main", &partial]);
+        gh.run_git(&GitRun::fetch_main(&slug, &target, "refs/agh/partial").without_blobs())
+            .unwrap();
+        host_git(&bare, &["update-ref", "refs/heads/main", &snapshot]);
+        assert!(
+            host_git(
+                &target,
+                &["rev-list", "--objects", "--all", "--missing=print"]
+            )
+            .lines()
+            .any(|line| line.starts_with('?'))
+        );
+        let effects = Arc::new(OnceLock::<Weak<Fx>>::new());
+        let observed = Arc::clone(&effects);
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&counts);
+        let fx = Arc::new(
+            Fx::simulated(live_start()).with_git_child_observer_for_tests(move |span| {
+                let fx = observed.get().and_then(Weak::upgrade).unwrap();
+                let specs = fx.children_run();
+                let spec = &specs[span.ordinal];
+                if spec.args.iter().any(|arg| arg == "fetch") {
+                    let scratch = spec.cwd.as_ref().unwrap();
+                    assert!(
+                        host_git(
+                            scratch,
+                            &["rev-list", "--alternate-refs", "--not", "refs/agh/source"]
+                        )
+                        .is_empty(),
+                        "the borrowed store's other refs must not become negotiation haves"
+                    );
+                    let count = host_git(scratch, &["count-objects", "-v"]);
+                    let received = count
+                        .lines()
+                        .filter_map(|line| {
+                            let (key, value) = line.split_once(": ")?;
+                            matches!(key, "count" | "in-pack")
+                                .then(|| value.parse::<usize>().unwrap())
+                        })
+                        .sum::<usize>();
+                    recorded.lock().unwrap().push(received > 0);
+                }
+            }),
+        );
+        assert!(effects.set(Arc::downgrade(&fx)).is_ok());
+        let gh = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &bare)
+            .fx(fx)
+            .build();
+        gh.run_git(&GitRun::fetch_main(&slug, &target, "refs/agh/main"))
+            .unwrap();
+        let notes = gh.fx().retry_notes();
+        assert_eq!(
+            notes
+                .iter()
+                .any(|note| note.contains("snapshot refs/agh/main is incomplete")),
+            !complete
+        );
+        assert_eq!(
+            *counts.lock().unwrap(),
+            vec![!complete],
+            "a complete snapshot downloads no objects; an incomplete one must start cold"
+        );
+        assert!(
+            !host_git(
+                &target,
+                &["rev-list", "--objects", "refs/agh/main", "--missing=print"]
+            )
+            .lines()
+            .any(|line| line.starts_with('?'))
+        );
+        assert_eq!(
+            host_git(&target, &["rev-parse", "refs/agh/partial"]),
+            partial
+        );
+    }
+}

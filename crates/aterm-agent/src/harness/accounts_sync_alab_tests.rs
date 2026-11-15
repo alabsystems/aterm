@@ -114,6 +114,7 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
     let lab = Lab {
         me: Some(test_machine("m22")),
         settled: false,
+        bound: Default::default(),
         accounts: vec![
             lab_account("ann", "claude-aaaaaa", &[("m22", Some(1))]),
             lab_account("cy", "claude-cccccc", &[("m20", Some(1))]),
@@ -246,6 +247,7 @@ fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
     let lab = |settled: bool| Lab {
         me: Some(test_machine("m16")),
         settled,
+        bound: Default::default(),
         accounts: vec![LabAccount {
             cli,
             vendor: accounts::Vendor {
@@ -355,6 +357,7 @@ fn a_cli_sync_from_a_lab_that_prefers_nothing_here_keeps_every_row_and_clears_ho
     let lab = Lab {
         me: Some(test_machine("m16")),
         settled: true,
+        bound: Default::default(),
         accounts: vec![LabAccount {
             cli,
             vendor: region,
@@ -514,6 +517,7 @@ fn lab_of(settled: bool, accounts: Vec<LabAccount>) -> Lab {
     Lab {
         me: Some(test_machine("m22")),
         settled,
+        bound: Default::default(),
         accounts,
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),
@@ -844,7 +848,6 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     let state_dir = root.path().join("state");
     let config_dir = home.join(".config/aterm");
     fs::create_dir_all(&config_dir).unwrap();
-    fs::create_dir_all(home.join(".secrets")).unwrap();
     let toml = config_dir.join("aterm.toml");
     crate::test_config::write(&toml, "").unwrap();
     let roster_path = config_dir.join(accounts::ACCOUNTS_FILE);
@@ -860,8 +863,8 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
         .unwrap(),
     )
     .unwrap();
-    let sheet = home.join(".secrets").join(ACCOUNTS_CSV_FILE);
-    let edit = |text: &str| fs::write(&sheet, text).unwrap();
+    let edit =
+        |text: &str| crate::vault_entry::seed(&home, &[(ACCOUNTS_CSV_FILE, text.as_bytes())]);
     let lab = lab_of(
         false,
         vec![lab_account("ann", "claude-aaaaaa", &[("m22", Some(1))])],
@@ -878,11 +881,11 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     store.retire_source_held(&held, NOW).unwrap();
     drop(held);
     let (claude, kimi) = alab_roster::with_lab(lab.clone(), || {
-        assert!(
-            !has_fleet_source(&home.join(".secrets"), &store),
-            "no fleet source"
-        );
-        assert!(!sheet_names_this_machine(Some(&toml), &sheet));
+        assert!(!has_fleet_source(&home, &store), "no fleet source");
+        assert!(!sheet_names_this_machine(
+            Some(&toml),
+            &VaultSource::read(&home, ACCOUNTS_CSV_FILE)
+        ));
         assert!(
             !init_sync_needed(&home, &state_dir, &roster_path, NOW, true),
             "the roster holds what the lab prefers"
@@ -898,10 +901,10 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     let (moved_claude, moved_kimi) = digests();
     assert_ne!(moved_claude, bare_claude, "with no lab the sheet is read");
     assert_ne!(moved_kimi, bare_kimi);
-    assert!(has_fleet_source(&home.join(".secrets"), &store));
+    assert!(has_fleet_source(&home, &store));
     let pending_kimi = alab_roster::while_pending(|| {
         assert!(
-            !has_fleet_source(&home.join(".secrets"), &store),
+            !has_fleet_source(&home, &store),
             "a lab not read yet reads no sheet"
         );
         digests().1
@@ -1041,6 +1044,7 @@ fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
         let lab = Lab {
             me: Some(test_machine("m16")),
             settled: true,
+            bound: Default::default(),
             accounts: vec![
                 codex("ann", "codex-aaaaaa", &[("m16", Some(1))]),
                 codex("bea", "codex-bbbbbb", &[("m16", Some(2))]),
@@ -1231,7 +1235,7 @@ fn a_known_codex_default_enrolls_without_a_local_preference() {
                 );
                 let env = quiet_env(&home, &state, &config, NOW);
                 let converge = || {
-                    let mut sources = ResyncSources::new(&env, &home, &read_local_source_text);
+                    let mut sources = ResyncSources::new(&env, &home);
                     read_cli_resync(Cli::Codex, &state, &config, NOW, &mut sources, &mut None)
                         .due
                         .unwrap()

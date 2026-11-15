@@ -375,6 +375,8 @@ thread_local! {
 pub fn parse(bytes: &[u8]) -> crate::Result<Envelope> {
     #[cfg(test)]
     TEST_PARSES.with(|parses| parses.set(parses.get() + 1));
+    #[cfg(unix)]
+    crate::pass_counts::add(crate::pass_counts::Count::Parses);
     if bytes.len() > MAX_ENVELOPE {
         return Err(Error::new(format!(
             "envelope: larger than {MAX_ENVELOPE} bytes"
@@ -717,6 +719,8 @@ impl Envelope {
     pub fn verify_signature(&self) -> crate::Result<()> {
         #[cfg(test)]
         TEST_SIGNATURES.with(|asks| asks.set(asks.get() + 1));
+        #[cfg(unix)]
+        crate::pass_counts::add(crate::pass_counts::Count::SignatureAsks);
         if crate::ed25519::verifies_cached(
             &self.signer,
             &self.raw[..self.signed_len],
@@ -913,6 +917,8 @@ pub(crate) fn verify_for_reader_with(
     held: Option<&Floor>,
     retired: &Retired,
 ) -> crate::Result<(Envelope, Pin, Verdict)> {
+    #[cfg(unix)]
+    crate::pass_counts::add(crate::pass_counts::Count::Verifies);
     let envelope = parse(bytes)?;
     let (pin, verdict) =
         judge_for_reader(&envelope, expect_name, pin, followed, held, retired, || {

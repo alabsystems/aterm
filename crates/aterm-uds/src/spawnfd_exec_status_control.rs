@@ -48,7 +48,11 @@ pub(super) fn run(world: &Path) {
 
     // Qualify the real retained helper before arming any observation fault. The fixture's
     // main calls tether::entry before threads; the target retains its Cargo binary name.
-    assert!(crate::tether::prepared_executable().unwrap().is_some());
+    assert!(
+        crate::tether::prepared_executable_within(crate::deadline::FIRST_EXEC_HANG)
+            .unwrap()
+            .is_some()
+    );
     let executable = std::env::current_exe().unwrap();
     let mut results = Vec::new();
     for case in ["healthy", "exec-refusal", "observation-fault"] {

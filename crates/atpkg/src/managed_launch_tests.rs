@@ -81,8 +81,12 @@ fn run(path: &Path, args: &[&str]) -> Vec<String> {
         &mut command,
         std::time::Instant::now() + std::time::Duration::from_secs(60),
     )
-    .unwrap();
-    assert!(output.status.success(), "{output:?}");
+    .unwrap_or_else(|error| panic!("{} {args:?}: {error}", path.display()));
+    assert!(
+        output.status.success(),
+        "{} {args:?}: {output:?}",
+        path.display()
+    );
     String::from_utf8(output.stdout)
         .unwrap()
         .lines()

@@ -16,7 +16,7 @@ use crate::mac_component::{capture, copy_image, fail, json_file, save, unavailab
 use crate::util::shell_quote as q;
 use crate::{Fail, Res, stop};
 
-const USAGE: &str = "mac codex-source-proof --aterm FILE --package DIR --record NEW_DIR [--image REF]\n\
+const USAGE: &str = "mac codex-source-proof --aterm FILE --package DIR --record NEW_DIR [--image REF] [--kind source|retained] [--replacement-package DIR]\n\
   Run the debug SDK's existing native source component wholly inside a disposable SIP-on\n\
   macOS guest. Preserve its IP and real-home guards and require no pre-existing Codex process.\n\
   Copy and verify the exact host, lab, package metadata and SDK image; retain input hashes,\n\
@@ -34,12 +34,16 @@ const COMPONENT: Duration = Duration::from_secs(3600);
 struct Ask {
     aterm: PathBuf,
     package: PathBuf,
+    replacement: Option<PathBuf>,
     record: PathBuf,
     image: String,
+    retained: bool,
 }
 
 fn parse(args: &[String]) -> Result<Ask, Fail> {
     let (mut aterm, mut package, mut record, mut image) = (None, None, None, None);
+    let mut kind = None;
+    let mut replacement = None;
     let mut at = 0;
     while at < args.len() {
         let flag = &args[at];
@@ -53,10 +57,16 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
             "--package" if package.is_none() => {
                 package = Some(PathBuf::from(crate::paths::from_caller(value)))
             }
+            "--replacement-package" if replacement.is_none() => {
+                replacement = Some(PathBuf::from(crate::paths::from_caller(value)))
+            }
             "--record" if record.is_none() => {
                 record = Some(PathBuf::from(crate::paths::from_caller(value)))
             }
             "--image" if image.is_none() && !value.is_empty() => image = Some(value.clone()),
+            "--kind" if kind.is_none() && matches!(value.as_str(), "source" | "retained") => {
+                kind = Some(value.clone())
+            }
             _ => {
                 return Err(Fail::usage(format!(
                     "unexpected argument {flag:?}\n{USAGE}"
@@ -65,7 +75,13 @@ fn parse(args: &[String]) -> Result<Ask, Fail> {
         }
         at += 2;
     }
+    let retained = kind.as_deref() == Some("retained");
+    if replacement.is_some() && !retained {
+        return Err(Fail::usage("replacement package requires --kind retained"));
+    }
     Ok(Ask {
+        retained,
+        replacement,
         aterm: aterm.ok_or_else(|| Fail::usage(USAGE))?,
         package: package.ok_or_else(|| Fail::usage(USAGE))?,
         record: record.ok_or_else(|| Fail::usage(USAGE))?,
@@ -96,19 +112,19 @@ fn world_from_output(bytes: &[u8]) -> Option<String> {
     .then(|| world.to_owned())
 }
 
-fn inputs(ask: &Ask, share: &Path) -> Result<Value, Fail> {
-    let manifest = crate::util::read_regular_text(&ask.package.join(codex_alab::PACKAGE_JSON))
-        .map_err(fail)?;
+fn package_input(source: &Path, share: &Path, name: &str) -> Result<Value, Fail> {
+    let manifest =
+        crate::util::read_regular_text(&source.join(codex_alab::PACKAGE_JSON)).map_err(fail)?;
     if codex_alab::package_entrypoint(&manifest).as_deref() != Some(Path::new("bin/codex")) {
         return Err(Fail::usage("the macOS debug package must enter bin/codex"));
     }
-    let sdk = ask.package.join("bin/codex");
+    let sdk = source.join("bin/codex");
     if !codex_alab::isolated_source_proof_candidate(&sdk).map_err(fail)? {
         return Err(Fail::usage(
             "package lacks the explicit debug source proof feature",
         ));
     }
-    let package = share.join("candidate");
+    let package = share.join(name);
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -117,18 +133,37 @@ fn inputs(ask: &Ask, share: &Path) -> Result<Value, Fail> {
     let sdk = copy_image(&sdk, &package, "bin/codex")?;
     let mut metadata = Vec::new();
     for name in [codex_alab::PACKAGE_JSON, codex_alab::ALAB_BUILD_JSON] {
-        let bytes = crate::util::read_regular_file(&ask.package.join(name)).map_err(fail)?;
+        let bytes = crate::util::read_regular_file(&source.join(name)).map_err(fail)?;
         save(&package, name, &bytes)?;
         metadata.push(json!({"name":name,"bytes":bytes.len(),
             "sha256":crate::windows::sha256_file(&package.join(name))?}));
     }
+    Ok(json!({"sdk":sdk,"metadata":metadata}))
+}
+
+fn inputs(ask: &Ask, share: &Path) -> Result<Value, Fail> {
+    let before = package_input(&ask.package, share, "candidate")?;
+    let replacement = ask
+        .replacement
+        .as_ref()
+        .map(|package| package_input(package, share, "replacement"))
+        .transpose()?;
+    if replacement
+        .as_ref()
+        .is_some_and(|after| after["sdk"]["sha256"] == before["sdk"]["sha256"])
+    {
+        return Err(Fail::usage(
+            "replacement qualification requires different executable bytes",
+        ));
+    }
     Ok(json!({"aterm":copy_image(&ask.aterm,share,"native-host")?,
         "lab":copy_image(&std::env::current_exe().map_err(fail)?,share,"aterm-lab")?,
-        "sdk":sdk,"metadata":metadata,"image":ask.image,
+        "sdk":before["sdk"],"metadata":before["metadata"],"replacement":replacement,"image":ask.image,
         "guest":{"cpus":CPUS,"memory_mib":MEMORY_MIB,"disk_gb":DISK_GB,"tart_graphics":false},
         "component_transport_ceiling_seconds":COMPONENT.as_secs(),
         "guest_compilation":false,"host_app_execution":false,"qualification_only":true,
-        "runtime_activation":false,"inner_home_and_ip_guards_preserved":true}))
+        "runtime_activation":false,"inner_home_and_ip_guards_preserved":true,
+        "qualification_kind": if ask.retained { "retained" } else { "source" }}))
 }
 
 fn guest(vm: &Vm, ask: &Ask, inputs: &Value) -> Res {
@@ -141,11 +176,20 @@ fn guest(vm: &Vm, ask: &Ask, inputs: &Value) -> Res {
          cp -R {share}/candidate {ROOT}/candidate; chmod 700 {ROOT}/native-host {ROOT}/aterm-lab {ROOT}/candidate/bin/codex; ",
         share = q(mac::GUEST_SHARE),
     );
-    let hashes = [
+    if ask.replacement.is_some() {
+        setup.push_str(&format!("cp -R {share}/replacement {ROOT}/replacement; chmod 700 {ROOT}/replacement/bin/codex; ", share=q(mac::GUEST_SHARE)));
+    }
+    let mut hashes = vec![
         ("native-host", inputs["aterm"]["sha256"].as_str()),
         ("aterm-lab", inputs["lab"]["sha256"].as_str()),
         ("candidate/bin/codex", inputs["sdk"]["sha256"].as_str()),
     ];
+    if ask.replacement.is_some() {
+        hashes.push((
+            "replacement/bin/codex",
+            inputs["replacement"]["sdk"]["sha256"].as_str(),
+        ));
+    }
     for (name, hash) in hashes {
         setup.push_str(&format!(
             "test \"$(/usr/bin/shasum -a 256 {ROOT}/{name} | /usr/bin/cut -d ' ' -f 1)\" = {}; ",
@@ -159,6 +203,19 @@ fn guest(vm: &Vm, ask: &Ask, inputs: &Value) -> Res {
             "test \"$(/usr/bin/shasum -a 256 {path} | /usr/bin/cut -d ' ' -f 1)\" = {}; ",
             q(metadata["sha256"].as_str().expect("metadata hash")),
         ));
+    }
+    if ask.replacement.is_some() {
+        for metadata in inputs["replacement"]["metadata"]
+            .as_array()
+            .expect("hashed replacement metadata")
+        {
+            let name = metadata["name"].as_str().expect("metadata name");
+            let path = q(&format!("{ROOT}/replacement/{name}"));
+            setup.push_str(&format!(
+                "test \"$(/usr/bin/shasum -a 256 {path} | /usr/bin/cut -d ' ' -f 1)\" = {}; ",
+                q(metadata["sha256"].as_str().expect("metadata hash"))
+            ));
+        }
     }
     let setup = vm.exec_complete(&setup, mac::STEP).map_err(Fail::die)?;
     save(&ask.record, "setup.stdout", &setup.stdout)?;
@@ -189,9 +246,19 @@ fn guest(vm: &Vm, ask: &Ask, inputs: &Value) -> Res {
             "guest has an unavailable or non-empty Codex consumer census",
         ));
     }
+    let retained_argument = if ask.retained {
+        "--retained-service"
+    } else {
+        ""
+    };
+    let replacement_argument = if ask.replacement.is_some() {
+        format!("--replacement-package {ROOT}/replacement")
+    } else {
+        String::new()
+    };
     let command = format!(
         "umask 077; cd {ROOT}; ulimit -n 65536; export TMPDIR=/tmp; \
-         ./aterm-lab codex-source-proof --aterm {ROOT}/native-host --package {ROOT}/candidate --keep \
+         ./aterm-lab codex-source-proof --aterm {ROOT}/native-host --package {ROOT}/candidate --keep {retained_argument} {replacement_argument} \
          > {ROOT}/stdout 2> {ROOT}/stderr; code=$?; printf '%s\\n' \"$code\" > {ROOT}/exit"
     );
     let ran = vm.exec_complete(&command, COMPONENT);

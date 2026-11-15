@@ -1749,7 +1749,7 @@ pub fn plan_or_apply_only(
         send(env, job, agent_archive.as_ref().map(|a| &a.archive))
     });
     // Every host's key calls share one agh client, so agh paces the run's key writes.
-    let key_calls = super::github::KeyCalls::new(env.sys, &env.paths);
+    let key_calls = super::github::KeyCalls::new(env.sys);
     for (job, outcome) in jobs.iter().zip(outcomes) {
         match outcome {
             Ok(mut report) => {
@@ -2448,7 +2448,7 @@ fn after_run(env: &Env<'_>, inv: &Inventory, host: &Host, report: HostReport, so
         host,
         report,
         source,
-        &super::github::KeyCalls::new(env.sys, &env.paths),
+        &super::github::KeyCalls::new(env.sys),
     );
 }
 
@@ -3320,7 +3320,7 @@ pub fn github_revoke(env: &Env<'_>, name: &str) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let ids: Vec<u64> = state.github_keys.iter().map(|(_, id)| *id).collect();
-    let deleted = match super::github::revoke_via(env.sys, &env.paths, github, &ids) {
+    let deleted = match super::github::revoke_via(env.sys, github, &ids) {
         Ok(deleted) => deleted,
         Err(why) => {
             errln!("aterm machines github revoke: {}: {why}", host.name);
@@ -3880,11 +3880,11 @@ fn here_report(
             Err(e) => refuse!(ExitCode::FAILURE, "aterm machines here: {e}"),
         }
     };
-    // The compiled setup transaction disables data-volume indexing alongside its other
-    // root work. Refresh the naming permission too, so matching bytes with an old read
+    // The compiled setup transaction stops Spotlight indexing the console account's other
+    // home folders alongside its other root work. Refresh the naming permission too, so matching bytes with an old read
     // ACL are repaired within that authorization. User baselines keep their policy.
     if matches!(source, HereBaseline::BuiltIn(_)) && !name_rule_only {
-        items.push(Box::new(crate::init_spotlight::Indexing));
+        items.push(Box::new(crate::init_spotlight::Scope));
         for item in &mut items {
             if item.id() == "names.admitted-name-rule" {
                 *item = Box::new(crate::root_steps::NameRule::refresh());
@@ -3932,16 +3932,13 @@ fn here_report(
                 _ => Err(other()),
             };
         }
-        // The tools, an applicable broker and Spotlight repair must finish before root custody
-        // ends successfully. Optional naming and debugger failures remain journaled;
-        // they cannot cause another automatic administrator episode.
+        // The tools and an applicable broker must finish before root custody ends
+        // successfully. Optional naming, debugger and Spotlight-scope failures remain
+        // journaled; they cannot cause another automatic administrator episode (a scope that
+        // failed leaves `init_spotlight::SCOPE_REFUSED`, so it is not owed again either).
         let unfinished = rows
             .iter()
-            .filter(|row| {
-                row.id == crate::items::github::CLT_ITEM
-                    || row.id == "lan.broker"
-                    || row.id == "init.spotlight.indexing"
-            })
+            .filter(|row| row.id == crate::items::github::CLT_ITEM || row.id == "lan.broker")
             .find(|row| {
                 !matches!(
                     row.outcome,

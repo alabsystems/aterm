@@ -38,7 +38,7 @@ fn cancel_is_bound_to_attempt_and_session() {
     assert!(Cancel::decode(&bytes, &b).is_ok());
     for other in [
         Binding {
-            session: "s-3".into(),
+            session: "s-a912afd80a5a598f9acf".into(),
             ..b.clone()
         },
         Binding {
@@ -48,7 +48,14 @@ fn cancel_is_bound_to_attempt_and_session() {
     ] {
         assert!(Cancel::decode(&bytes, &other).is_err())
     }
-    for session in ["s-", "s-G", "s-A", "a-12", "s-12\n"] {
+    for session in [
+        "s-",
+        "s-G",
+        "s-A",
+        "a-12",
+        "s-12\n",
+        "s-a912afd80a5a598f9ace\n",
+    ] {
         let malformed = Cancel {
             binding: Binding {
                 session: session.into(),
@@ -57,18 +64,65 @@ fn cancel_is_bound_to_attempt_and_session() {
         };
         assert!(malformed.encode().is_err());
     }
-    // Exact spelling remains distinct, even when two IDs parse to the
-    // same integer. Session identity is never padded or normalized.
-    let short = Binding {
-        session: "s-1".into(),
+    // Exact spelling remains distinct: a `t` ID never matches an earlier `s-` one.
+    let minted = Binding {
+        session: "t0000000001".into(),
         ..b.clone()
     };
-    let padded = Binding {
-        session: "s-01".into(),
-        ..b
-    };
-    let bytes = Cancel { binding: short }.encode().unwrap();
-    assert!(Cancel::decode(&bytes, &padded).is_err());
+    let bytes = Cancel { binding: minted }.encode().unwrap();
+    assert!(Cancel::decode(&bytes, &b).is_err());
+}
+/// A binding's session is a tab ID in either form `TabId::parse` reads, exactly what the host's
+/// journal can name its file by, so nothing the wire admits is refused later in the pipeline.
+/// NEGATIVE CONTROL: a malformed ID of each form is refused on encode and on decode, including
+/// an `s-` ID of other than 20 hex digits, which the earlier wire rule (`s-` and 1 to 62 hex)
+/// admitted and the journal then refused.
+#[test]
+fn a_binding_session_is_a_tab_id_in_either_form() {
+    for session in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        let mut s = sample();
+        s.binding.session = session.into();
+        let encoded = s.encode().unwrap();
+        assert!(Submission::decode(&encoded).unwrap() == s, "{session}");
+        let bytes = Cancel {
+            binding: s.binding.clone(),
+        }
+        .encode()
+        .unwrap();
+        assert!(Cancel::decode(&bytes, &s.binding).is_ok(), "{session}");
+        assert!(
+            crate::control_verbs::is_minted_sid(session),
+            "the journal names {session}"
+        );
+    }
+    let long = format!("s-{}", "a".repeat(62));
+    for session in [
+        "s-acde",
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
+        long.as_str(),
+        "S-0123456789ABCDEF0123",
+        "tqn5r6e014",
+        "tqn5r6e01488",
+        "tqn5r6e014u",
+        "TQN5R6E0148",
+    ] {
+        let mut s = sample();
+        s.binding.session = session.into();
+        assert!(s.encode().is_err(), "CONTROL encode: {session}");
+    }
+    // Decode, too: patch a well-formed `t` binding to an `s-` session of the same length that
+    // the earlier rule admitted.
+    let mut s = sample();
+    s.binding.session = "tqn5r6e0148".into();
+    let encoded = s.encode().unwrap();
+    let at = encoded
+        .windows(11)
+        .position(|w| w == b"tqn5r6e0148")
+        .unwrap();
+    let mut patched = encoded.clone();
+    patched[at..at + 11].copy_from_slice(b"s-acdeacde0");
+    assert!(Submission::decode(&patched).is_err(), "CONTROL decode");
 }
 #[test]
 fn started_and_finished_are_separate_from_queue() {

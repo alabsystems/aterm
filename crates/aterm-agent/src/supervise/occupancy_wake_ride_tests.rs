@@ -629,7 +629,7 @@ fn a_tape_without_slice_twos_doors_carries_no_wake_on_a_points_act() {
         ..hosted(30)
     };
     let action = TurnEndAction::Type {
-        text: opts.policy.continue_text.clone(),
+        text: opts.policy.turn_end.continue_text.clone(),
         rule_id: RULE_CONTINUE,
     };
     let run = |slice2: bool| {

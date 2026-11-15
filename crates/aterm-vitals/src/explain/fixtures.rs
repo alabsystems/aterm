@@ -347,7 +347,7 @@ impl Scene {
                 uid: Some(p.uid),
                 pgid: p.pid,
                 state: ProcState::Run,
-                coalition: split.then_some(p.coalition),
+                coalition: Some(p.coalition),
                 birth_ms: Some(p.birth_ms),
                 ..ProcSample::default()
             })
@@ -519,7 +519,7 @@ pub fn spotlight_1032() -> Scene {
         coalitions: vec![
             Coal {
                 started: 6725,
-                exited: 6705,
+                exited: 6721,
                 ..Coal::new(1342, 400)
             },
             Coal::new(1092, 660),
@@ -584,8 +584,14 @@ pub fn two_coalitions_1421() -> Scene {
         self_uid: 501,
         tabs: vec![tab(1, 6100), tab(2, 7100)],
         coalitions: vec![
-            Coal::new(55954, 4120),
-            Coal::new(55990, 5640),
+            Coal {
+                started: 2,
+                ..Coal::new(55954, 4120)
+            },
+            Coal {
+                started: 3,
+                ..Coal::new(55990, 5640)
+            },
             Coal::new(60001, 30),
             Coal::new(393, 120),
             Coal::new(1, 60),
@@ -636,7 +642,10 @@ pub fn delegated_1032(mc: u64, launcher_mc: u64) -> Scene {
     let born = 1_792_517_500_000;
     let mut scene = spotlight_1032();
     scene.busy_mc += 600;
-    scene.coalitions.push(Coal::new(4000, 600));
+    scene.coalitions.push(Coal {
+        started: 2,
+        ..Coal::new(4000, 600)
+    });
     scene.procs.push(Proc::new(
         4001,
         1,
@@ -668,6 +677,12 @@ pub fn delegated_1032(mc: u64, launcher_mc: u64) -> Scene {
 pub fn shared_launcher_1032() -> Scene {
     let born = 1_792_517_500_000;
     let mut scene = spotlight_1032();
+    scene
+        .coalitions
+        .iter_mut()
+        .find(|c| c.id == 1342)
+        .unwrap()
+        .started += 1;
     scene.tabs.push(tab(2, 1250));
     scene.procs.push(Proc::new(
         1250,
@@ -679,7 +694,10 @@ pub fn shared_launcher_1032() -> Scene {
         0,
     ));
     scene.busy_mc += 900;
-    scene.coalitions.push(Coal::new(4000, 900));
+    scene.coalitions.push(Coal {
+        started: 3,
+        ..Coal::new(4000, 900)
+    });
     scene
         .procs
         .push(Proc::new(4001, 1, 501, 4000, born, "app-server", 100));
@@ -710,6 +728,7 @@ pub fn delegated_in_aterm_1032(mc: u64) -> Scene {
     for c in &mut scene.coalitions {
         if c.id == 1342 {
             c.mc += mc;
+            c.started += 1;
         }
     }
     scene
@@ -1033,7 +1052,10 @@ pub fn tab2_build_1048() -> Scene {
         self_uid: 501,
         tabs: vec![tab(1, 1200), tab(2, 1300)],
         coalitions: vec![
-            Coal::new(1342, 6500),
+            Coal {
+                started: 9,
+                ..Coal::new(1342, 6500)
+            },
             Coal {
                 deferred_mc: 240,
                 ..Coal::new(307, 300)
@@ -1057,6 +1079,12 @@ pub fn tab2_build_1048() -> Scene {
 #[must_use]
 pub fn wrapped_1218() -> Scene {
     let mut scene = spotlight_1032();
+    scene
+        .coalitions
+        .iter_mut()
+        .find(|c| c.id == 1342)
+        .unwrap()
+        .started += 1;
     scene.tabs.push(tab(2, 159));
     scene.procs.push(Proc::new(
         159,

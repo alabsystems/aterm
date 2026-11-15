@@ -863,3 +863,121 @@ fn a_live_download_reads_a_release_asset_on_the_api_route_while_the_download_hos
     );
     assert!(!dir.path().join("other").exists());
 }
+
+/// EACH RUN ENTRY RAISES ITS PORT'S COUNT BY EXACTLY ONE, AND A GIT IS COUNTED APART: one call
+/// of `run` (either way it waits), `run_complete_stdout`, `run_complete_output`,
+/// `run_complete_stdout_input`, `run_repository`, `run_fed` and `run_tty` each adds one start,
+/// a program named `git` one git as well, a spawn that failed included; a run refused before its
+/// command is built (a program that is not an absolute path, refused with its argv) adds none.
+/// The counts are this port's own: another port counting apart, run in between, moves nothing
+/// here.
+/// NEGATIVE CONTROL: counting in `run` alone (the count taken out of [`Live::command`] and
+/// `run_tty`) leaves the count at 1 after `run_until_deadline`'s start.
+#[test]
+fn each_run_entry_raises_its_ports_count_by_exactly_one() {
+    const TRUE: &str = "/usr/bin/true";
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let git = dir.path().join("git");
+    std::os::unix::fs::symlink(TRUE, &git).unwrap();
+    let live = Live::new().counting_apart();
+    let beside = Live::new().counting_apart();
+    assert_eq!(live.runs(), (0, 0));
+    let mut expected = (0_u64, 0_u64);
+    let mut counted = |what: &str, gits: u64| {
+        expected = (expected.0 + 1, expected.1 + gits);
+        assert_eq!(live.runs(), expected, "after {what}");
+    };
+
+    assert_eq!(live.run(&Cmd::new(TRUE)).unwrap().status, Some(0));
+    counted("run", 0);
+    let mut kept = Cmd::new(TRUE);
+    kept.keep_on_timeout = true;
+    assert_eq!(live.run(&kept).unwrap().status, Some(0));
+    counted("run, keeping a timed-out tail", 0);
+    assert_eq!(beside.run(&Cmd::new(&git)).unwrap().status, Some(0));
+    assert_eq!(beside.runs(), (1, 1));
+    assert_eq!(
+        live.run_complete_stdout(&Cmd::new(TRUE)).unwrap().status,
+        Some(0)
+    );
+    counted("run_complete_stdout", 0);
+    assert_eq!(
+        live.run_complete_output(&Cmd::new(TRUE)).unwrap().status,
+        Some(0)
+    );
+    counted("run_complete_output", 0);
+    assert_eq!(
+        live.run_complete_stdout_input(&Cmd::new(TRUE), b"")
+            .unwrap()
+            .status,
+        Some(0)
+    );
+    counted("run_complete_stdout_input", 0);
+    // A git that is not there: its spawn fails, and it was still one start, of a git.
+    let mut progress = crate::repository_progress::Progress::new(
+        "law",
+        std::path::PathBuf::from("/nonexistent-aterm-law/checkout"),
+    );
+    assert!(
+        live.run_repository(&Cmd::new("/nonexistent-aterm-law/bin/git"), &mut progress)
+            .is_err()
+    );
+    counted("run_repository", 1);
+    assert_eq!(
+        live.run_fed(&Cmd::new(TRUE), &Secret::new(b"fed").unwrap())
+            .unwrap()
+            .status,
+        Some(0)
+    );
+    counted("run_fed", 0);
+    assert_eq!(
+        live.run_tty(&Cmd::new(TRUE), &mut |_| Ok(())).unwrap(),
+        Some(0)
+    );
+    counted("run_tty", 0);
+    assert_eq!(
+        live.run(&Cmd::new(&git).arg("status")).unwrap().status,
+        Some(0)
+    );
+    counted("run, of a git", 1);
+    assert_eq!(expected, (9, 2));
+
+    assert!(matches!(
+        live.run(&Cmd::new("relative/git")),
+        Err(RunFailed::Refused(_))
+    ));
+    assert!(matches!(
+        live.run_complete_stdout(&Cmd::new("relative/git")),
+        Err(RunFailed::Refused(_))
+    ));
+    assert_eq!(live.runs(), (9, 2), "a refused run starts nothing");
+    assert_eq!(beside.runs(), (1, 1));
+}
+
+/// EVERY `Live::new` OF A PROCESS COUNTS INTO ONE SUM, WHICH A CONVERGE PASS READS: the pass's
+/// rows each make a port of their own, and the runner reads what they started from yet another
+/// fresh one (`aterm`'s `Ports::spent`), so a start through any port of this process shows in
+/// every other's [`Live::runs`]. Other tests of this process only raise the sum, so it is read
+/// as at least what these starts added.
+/// NEGATIVE CONTROL: a `Live::new` that counts apart (`runs: Default::default()`) reads `(0, 0)`
+/// after both starts, where at least `(2, 1)` more than before is wanted.
+#[test]
+fn every_live_of_a_process_counts_into_one_sum() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let git = dir.path().join("git");
+    std::os::unix::fs::symlink("/usr/bin/true", &git).unwrap();
+    let before = Live::new().runs();
+    assert_eq!(Live::new().run(&Cmd::new(&git)).unwrap().status, Some(0));
+    assert_eq!(
+        Live::new()
+            .run_complete_stdout(&Cmd::new("/usr/bin/true"))
+            .unwrap()
+            .status,
+        Some(0)
+    );
+    let after = Live::new().runs();
+    assert!(
+        after.0 >= before.0 + 2 && after.1 > before.1,
+        "{after:?} after {before:?}"
+    );
+}

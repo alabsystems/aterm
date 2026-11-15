@@ -211,6 +211,12 @@ fn a_leg_names_each_targets_baseline() {
     assert_eq!(row_rev("garbage"), None);
     assert_eq!(row_sid(row), Some("s-a"));
     assert_eq!(row_sid("@3 rev=1"), None, "a row names a global sid");
+    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        assert_eq!(row_sid(&format!("@{sid} rev=1")), Some(sid), "either form");
+    }
+    for bad in ["tqn5r6e014", "tqn5r6e014i", "s-0123456789abcdeg0123"] {
+        assert_eq!(row_sid(&format!("@{bad} rev=1")), None, "{bad}");
+    }
     assert!(!row_closed(row));
     assert_eq!(
         closed_row(Some(row), &targets[0]),

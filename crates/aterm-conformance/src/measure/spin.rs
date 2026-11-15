@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use super::Rig;
 use super::instance::{
-    Budget, CouldNotRun, Ctl, Instance, Scratch, World, could_not_run, field, uint_field,
-    unanswered,
+    Budget, CouldNotRun, Ctl, Instance, Scratch, World, could_not_run, field, recording_line,
+    require_recording, uint_field, unanswered,
 };
 use super::starvation::ShapeVerdict;
 
@@ -23,6 +23,17 @@ pub enum SpinScene {
     Idle,
     /// A recording `/bin/sh` prompt frozen in an open Rewind view.
     Rewound,
+    /// [`Self::Rewound`] in a window under `motion = "reduced"`, as [`Self::Windowed`]: the GPU
+    /// present of a rewound pane (its band, border and past screen) on AppKit's loop, which runs
+    /// the cursor blink and the proxy deadlines a headless instance never arms. A focused
+    /// window blinks a live caret ([`BLINK_LANE`]); over a rewound pane it must not, so the take
+    /// raises its window and waits for the focus before it settles, and decides only where the
+    /// window is focused ([`FOCUSED`]) as its measured window opens and as it ends, and was drawn
+    /// by the GPU renderer.
+    /// The reduced motion is also what leaves the caret to the blink clock: at full motion the
+    /// shipped rainbow cursor owns a blinking block's caret, and the blink lane fires for no
+    /// pane, live or rewound.
+    WindowedRewound,
     /// A bare `/bin/sh` prompt in a window: AppKit's loop and its proxies, which a headless
     /// instance never runs. Under `motion = "reduced"`: a focused window's motion (the Deck's live
     /// edge, the pet) wakes it many times a second, and the rig does not decide whether the window
@@ -45,25 +56,88 @@ pub enum SpinScene {
     /// `resting=true` as it opens and as it ends, and, since any window event would wake it, only
     /// with no window event other than a redraw.
     Resting,
+    /// A `/bin/sh` prompt in a window at full motion under the pet, raised, then minimised
+    /// (`invoke Minimize`) while a counter it was typed prints a line once a second
+    /// ([`HIDDEN_COUNTER`]), measured once the window reads `sight=off-glass` (`trail status`): a
+    /// window on no glass composes and presents nothing (`docs/ATERM_DESIGN.md` §7.4), however
+    /// much its pane prints, and its clocks plan no frame. The take decides only on a window that
+    /// reads off-glass as it opens and as it ends ([`hidden_unready`]), with no window event
+    /// other than a redraw between (a show or a focus would be one). A build whose `trail status`
+    /// reports no `sight=` ([`hidden_unanswered`]), or whose metrics report no
+    /// `redraw_hidden_parked`, leaves it unanswered.
+    Hidden,
 }
 
 impl SpinScene {
     /// Whether the scene opens a window.
     #[must_use]
     pub const fn windowed(self) -> bool {
-        matches!(self, Self::Windowed | Self::PetAsleep | Self::Resting)
+        matches!(
+            self,
+            Self::Windowed | Self::PetAsleep | Self::Resting | Self::WindowedRewound | Self::Hidden
+        )
     }
 
     /// Whether the scene measures a focused window's sleeping pet ([`PET_READY`]).
     const fn pet(self) -> bool {
         matches!(self, Self::PetAsleep | Self::Resting)
     }
+
+    /// Whether the scene opens a Rewind view on its pane, which needs a recording pane.
+    #[must_use]
+    pub const fn rewound(self) -> bool {
+        matches!(self, Self::Rewound | Self::WindowedRewound)
+    }
+
+    /// The scene's own config lines, before the row's recording line ([`head`]).
+    #[must_use]
+    pub fn config(self) -> String {
+        match self {
+            Self::Windowed | Self::WindowedRewound => "motion = \"reduced\"".to_string(),
+            // `full`, not the shipped `auto`: what `auto` resolves to on a Mac whose Reduce
+            // Motion is off, so the take's pet animates whatever this Mac's accessibility setting
+            // says.
+            // The awake control turns the window's rest off, so the deck it measures is a
+            // focused window's whatever the default; the resting scene turns it on at 30 s.
+            Self::PetAsleep => {
+                format!(
+                    "motion = \"full\"\ncursor_trail_style = \"{PET_STYLE}\"\ncursor_pet = \"cat\"\nidle_rest_secs = 0"
+                )
+            }
+            Self::Resting => {
+                format!(
+                    "motion = \"full\"\ncursor_trail_style = \"{PET_STYLE}\"\ncursor_pet = \"cat\"\nidle_rest_secs = 30"
+                )
+            }
+            // The pet the typed counter wakes would ask frames of a window that cannot show them.
+            Self::Hidden => {
+                format!(
+                    "motion = \"full\"\ncursor_trail_style = \"{PET_STYLE}\"\ncursor_pet = \"cat\""
+                )
+            }
+            Self::ClaudeShaped | Self::Idle | Self::Rewound => {
+                "# effect settings: the shipped defaults".to_string()
+            }
+        }
+    }
+}
+
+/// A row's config head: its scene's lines, then its recording ([`recording_line`]), set either
+/// way so the row records or not whatever the shipped default is.
+#[must_use]
+pub fn head(row: &SpinRow) -> String {
+    format!("{}\n{}", row.scene.config(), recording_line(row.recording))
 }
 
 /// One spin row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpinRow {
     pub scene: SpinScene,
+    /// Whether the instance records (`temporal_recording`), written either way: on is the
+    /// shipped default's arm, and off the arm of a person who turns Settings > Terminal > Rewind
+    /// off. A take whose `temporal status` reads the other arm decides nothing
+    /// ([`require_recording`]).
+    pub recording: bool,
     /// The measured interval, opening as the client starts.
     pub window: Duration,
     pub max_arms: u64,
@@ -87,6 +161,27 @@ pub struct SpinRow {
     /// The frames the window presented (`frames`), where the row bounds them; `None` bounds
     /// nothing.
     pub max_frames: Option<u64>,
+    /// The fewest redraws a hidden window parks in the window (`redraw_hidden_parked`), where the
+    /// row asks for them: the output its pane printed reached the window and was held, so a
+    /// take whose output never came, or a build that parks nothing, passes no frame bound by
+    /// drawing nothing. `None` asks for none.
+    pub min_hidden_parked: Option<u64>,
+}
+
+impl SpinRow {
+    /// The combinations that could not measure what they claim: a Rewind view opens only on a
+    /// recording pane.
+    /// # Errors
+    /// The row contradicts itself.
+    pub fn validate(&self) -> Result<(), CouldNotRun> {
+        if self.scene.rewound() && !self.recording {
+            return could_not_run(format!(
+                "the {:?} scene opens a Rewind view, which needs a recording pane",
+                self.scene
+            ));
+        }
+        Ok(())
+    }
 }
 
 const SETTLE_QUIET_MS: &str = "3000";
@@ -98,6 +193,13 @@ pub const EFFECT_LANE: &str = "cursor_effect";
 /// deck clock's (`aterm-gui`'s `stats_clock.rs`), the synthetic grid's ticks and a display
 /// link's resumes.
 pub const NEEDLE_LANE: &str = "deck_clock";
+
+/// The deadline owner the cursor blink fires as: a focused window's live caret only.
+pub const BLINK_LANE: &str = "blink";
+
+/// What a windowed Rewound take's `trail status` must read for its blink bound to decide
+/// anything: a window without the focus blinks no caret, so a 0 read there passes any build.
+pub const FOCUSED: (&str, &str) = ("focused", "true");
 
 /// The deadline owner the stats deck's live edge (its glide, slide, beat and steam) fires as.
 pub const LIVE_LANE: &str = "stats_live";
@@ -169,11 +271,35 @@ fn rest_unready(scene: SpinScene, line: &str) -> Option<String> {
     let ready = match scene {
         SpinScene::Resting => resting == Some("true"),
         SpinScene::PetAsleep => resting != Some("true"),
-        SpinScene::ClaudeShaped | SpinScene::Idle | SpinScene::Rewound | SpinScene::Windowed => {
-            true
-        }
+        SpinScene::ClaudeShaped
+        | SpinScene::Idle
+        | SpinScene::Rewound
+        | SpinScene::Windowed
+        | SpinScene::WindowedRewound
+        | SpinScene::Hidden => true,
     };
     (!ready).then(|| format!("resting={}", resting.unwrap_or("?")))
+}
+
+/// What the hidden scene types into its prompt before the window is minimised: a line once a
+/// second for longer than any take, so the pane prints all through the measured window.
+pub const HIDDEN_COUNTER: &str =
+    "i=0; while [ $i -lt 600 ]; do i=$((i+1)); echo tick $i; sleep 1; done";
+
+/// Why a build cannot answer the hidden scene, from its `trail status` reply before the window is
+/// minimised: one from before the field reports no `sight=`, so its window could never read off
+/// every glass, and the row is unanswered rather than refused.
+fn hidden_unanswered(line: &str) -> Option<&'static str> {
+    field(line, "sight")
+        .is_none()
+        .then_some("ctl trail status does not report sight")
+}
+
+/// Where `trail status` says a hidden take's window can be seen, as `sight=value` (`?` for a reply
+/// without it) when it is not off every glass; `None` when the take can decide.
+fn hidden_unready(line: &str) -> Option<String> {
+    let sight = field(line, "sight");
+    (sight != Some("off-glass")).then(|| format!("sight={}", sight.unwrap_or("?")))
 }
 
 /// How often a windowed take reads the instance's footprint ([`super::usage`]).
@@ -298,6 +424,8 @@ pub const MAX_OS_EVENTS: u64 = 30;
 fn os_events_unidle(scene: SpinScene, input: u64) -> Option<&'static str> {
     if scene.pet() {
         (input > 0).then_some("its pet may answer any of them")
+    } else if scene == SpinScene::Hidden {
+        (input > 0).then_some("a minimised window takes none until it is shown")
     } else {
         (input > MAX_OS_EVENTS).then_some("more than an idle window takes")
     }
@@ -329,12 +457,16 @@ pub struct SpinReport {
     pub owner_fires: Vec<(&'static str, Option<u64>)>,
     /// The dial's needle in the window, as the metrics read it.
     pub needle: NeedleCounts,
+    /// The redraws a hidden window parked in the window (`redraw_hidden_parked`).
+    pub hidden_parked: Option<u64>,
     /// Display-clock counters over the observation window, for wake diagnosis.
     pub deck_clock: Vec<(&'static str, Option<u64>)>,
     /// A pet take's [`PET_FIELDS`] as the window opened.
     pub pet_open: Option<String>,
     /// A pet take's [`PET_FIELDS`] at the end of the window.
     pub pet: Option<String>,
+    /// A windowed Rewound take's renderer (`backend=`), read once its window ended focused.
+    pub backend: Option<String>,
     /// A windowed take's window events other than a redraw (at most [`MAX_OS_EVENTS`]; none for
     /// the pet scene).
     pub os_events: Option<u64>,
@@ -351,16 +483,18 @@ impl std::fmt::Display for SpinReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SPIN scene={:?} window={:?} past_deadline_arms={} max_arms={} stale_arm_heals={:?} \
+            "SPIN scene={:?} recording={} window={:?} past_deadline_arms={} max_arms={} \
+             stale_arm_heals={:?} \
              frames={:?} timer_wakes={:?} max_timer_wakes={:?} wakes={:?} max_wakes={} \
              owner_fires={:?} max_owner_fires={:?} needle_fires={:?} needle_sweeps={:?} \
              needle_frames_owed={:?} needle_episode_left={:?} needle_owed={} deck_clock={:?} \
              wait_cancelled_wakes={:?} turns={:?} \
              wakes_by_variant={:?} fires_by_owner={:?} os_events={:?} os_event_kinds={:?} \
-             pet_open={:?} pet={:?} \
-             reasons={:?} max_frames={:?} {} \
+             pet_open={:?} pet={:?} backend={:?} \
+             reasons={:?} max_frames={:?} hidden_parked={:?} min_hidden_parked={:?} {} \
              verdict={:?} {}",
             self.row.scene,
+            self.row.recording,
             self.row.window,
             self.past_deadline_arms,
             self.row.max_arms,
@@ -386,8 +520,11 @@ impl std::fmt::Display for SpinReport {
             self.os_event_kinds,
             self.pet_open,
             self.pet,
+            self.backend,
             self.reasons,
             self.row.max_frames,
+            self.hidden_parked,
+            self.row.min_hidden_parked,
             self.sampled
                 .map_or_else(|| "sampled=none".to_string(), |s| s.to_string()),
             self.verdict,
@@ -407,6 +544,8 @@ pub struct Counts<'a> {
     pub wakes: Option<u64>,
     /// The frames presented in the window (`frames`).
     pub frames: Option<u64>,
+    /// The redraws a hidden window parked in the window (`redraw_hidden_parked`).
+    pub hidden_parked: Option<u64>,
 }
 
 /// The dial's needle in a window: its owner's fires ([`NEEDLE_LANE`]), the readings in the
@@ -433,8 +572,9 @@ const fn within(max: Option<u64>, n: Option<u64>) -> bool {
 /// The row's bounds against the window's counters: past-deadline arms, timer wakes, each
 /// bounded owner's fires ([`SpinRow::max_owner_fires`]), the needle's fires by the frames its
 /// readings owed ([`SpinRow::needle_owed`]), every loop wake (`wakes`) beyond the needle's own
-/// and, where the row bounds them, the frames ([`SpinRow::max_frames`]); an unreported count
-/// never passes its bound.
+/// and, where the row bounds them, the frames ([`SpinRow::max_frames`]) and a hidden window's
+/// parked redraws from below ([`SpinRow::min_hidden_parked`]); an unreported count never passes
+/// its bound.
 #[must_use]
 pub fn judge(row: &SpinRow, c: Counts<'_>) -> ShapeVerdict {
     let owners = row.max_owner_fires.iter().all(|&(owner, max)| {
@@ -466,6 +606,9 @@ pub fn judge(row: &SpinRow, c: Counts<'_>) -> ShapeVerdict {
         && needle.is_some()
         && within(Some(row.max_wakes), wakes)
         && within(row.max_frames, c.frames)
+        && row
+            .min_hidden_parked
+            .is_none_or(|min| c.hidden_parked.is_some_and(|n| n >= min))
     {
         ShapeVerdict::Pass
     } else {
@@ -549,6 +692,29 @@ fn pet_take(ctl: &Ctl, scene: SpinScene, edge: &str) -> Result<String, CouldNotR
     Ok(fields)
 }
 
+/// How long the hidden scene waits after its window reads off-glass before its counters open:
+/// the minimise animation and the focus it moves end well inside it.
+const HIDDEN_SETTLE: Duration = Duration::from_secs(2);
+
+/// Refuses the hidden scene's take where `trail status` does not read its window off every glass
+/// as its window `edge` (opened, ended) ([`hidden_unready`]).
+fn hidden_take(ctl: &Ctl, edge: &str) -> Result<(), CouldNotRun> {
+    let trail = ctl.call(&["trail", "status"]);
+    if !trail.ok() {
+        return could_not_run(format!(
+            "the hidden scene's window gave no trail status as its window {edge} ({} {})",
+            trail.stdout.trim(),
+            trail.stderr.trim()
+        ));
+    }
+    match hidden_unready(&trail.stdout) {
+        None => Ok(()),
+        Some(off) => could_not_run(format!(
+            "the hidden scene's window read {off} as its window {edge}, not minimised"
+        )),
+    }
+}
+
 /// Wait for the same state the observation's two edges require. Probe traffic precedes the
 /// metrics reset. A failed read ends this attempt; a missing state never becomes a pass.
 fn await_pet_ready(
@@ -573,8 +739,9 @@ fn await_pet_ready(
         .map_err(|error| error.map(|why| format!("{why}; last trail state: {last}")))?
 }
 
-/// Raise the sole test session's native window before waiting for readiness.
-/// Sending a PTY focus report would not establish this OS precondition.
+/// Raise the sole test session's native window and wait for its focus: a pet scene's readiness
+/// wait starts from it, and the hidden scene minimises the front window. Sending a PTY focus
+/// report would not establish this OS precondition.
 fn prepare_pet_focus(ctl: &Ctl) -> Result<(), CouldNotRun> {
     let sessions = ctl.call(&["ls"]);
     if !sessions.ok() {
@@ -590,11 +757,29 @@ fn prepare_pet_focus(ctl: &Ctl) -> Result<(), CouldNotRun> {
     })
 }
 
+/// Whether a windowed Rewound take's window reads [`FOCUSED`] as its measured window `edge`
+/// (opened or ended): an unfocused window blinks no caret, so its 0 blink fires decide nothing.
+fn rewound_focused(ctl: &Ctl, edge: &str) -> Result<(), CouldNotRun> {
+    let trail = ctl.call(&["trail", "status"]);
+    let (key, want) = FOCUSED;
+    let read = field(&trail.stdout, key)
+        .filter(|_| trail.ok())
+        .unwrap_or("?");
+    if read == want {
+        return Ok(());
+    }
+    could_not_run(format!(
+        "the rewound window {edge} {key}={read}, not {key}={want}: an unfocused window blinks no \
+         caret, so its 0 blink fires decide nothing (trail status: {} {})",
+        trail.stdout.trim(),
+        trail.stderr.trim()
+    ))
+}
+
 fn sole_session(list: &str) -> Option<&str> {
-    let mut ids = list.split_whitespace().filter(|word| {
-        word.strip_prefix("s-")
-            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    });
+    let mut ids = list
+        .split_whitespace()
+        .filter(|word| aterm_types::tab_id::is_tab_id(word));
     let sid = ids.next()?;
     ids.next().is_none().then_some(sid)
 }
@@ -610,14 +795,19 @@ fn pet_fields(line: &str) -> String {
 
 /// Measure one row.
 /// # Errors
-/// [`CouldNotRun`] when first-exec warm-up is unavailable, the instance did not start, a counter is missing, the
+/// [`CouldNotRun`] when the row contradicts itself ([`SpinRow::validate`]), first-exec warm-up is
+/// unavailable, the instance did not start, its `temporal status` does not read the row's
+/// recording ([`require_recording`]), a counter is missing, the
 /// claude scene was not the shape it claims (off the alt screen, or its output
 /// moved the grid), the window took more than [`MAX_OS_EVENTS`] events other than
 /// a redraw (a person's pointer or keys: not idle) or the pet scene's took any
 /// ([`os_events_unidle`]), or a pet scene's window was not a focused window's
 /// deeply sleeping pet at full motion ([`PET_READY`]), resting as its scene needs
-/// ([`rest_unready`]), as it opened or as it ended, or its footprint could not be read.
+/// ([`rest_unready`]), as it opened or as it ended, or its footprint could not be read, or a
+/// windowed Rewound scene's window did not end focused ([`FOCUSED`]) or was not drawn by the GPU
+/// renderer.
 pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
+    row.validate()?;
     let _one = super::take(false);
     static WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _window = row.scene.windowed().then(|| {
@@ -637,28 +827,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     if std::env::var_os("ATERM_PAINT_KEEP").is_some() {
         scratch.keep();
     }
-    let head = match row.scene {
-        SpinScene::Rewound => "temporal_recording = true".to_string(),
-        SpinScene::Windowed => "motion = \"reduced\"".to_string(),
-        // `full`, not the shipped `auto`: what `auto` resolves to on a Mac whose Reduce Motion is
-        // off, so the take's pet animates whatever this Mac's accessibility setting says.
-        // The awake control turns the window's rest off, so the deck it measures is a focused
-        // window's whatever the default; the resting scene turns it on at 30 s.
-        SpinScene::PetAsleep => {
-            format!(
-                "motion = \"full\"\ncursor_trail_style = \"{PET_STYLE}\"\ncursor_pet = \"cat\"\nidle_rest_secs = 0"
-            )
-        }
-        SpinScene::Resting => {
-            format!(
-                "motion = \"full\"\ncursor_trail_style = \"{PET_STYLE}\"\ncursor_pet = \"cat\"\nidle_rest_secs = 30"
-            )
-        }
-        SpinScene::ClaudeShaped | SpinScene::Idle => {
-            "# effect settings: the shipped defaults".to_string()
-        }
-    };
-    let world = World::prepare(scratch.path(), &head)
+    let world = World::prepare(scratch.path(), &head(row))
         .map_err(|e| CouldNotRun::Refused(format!("cannot lay out the scratch world: {e}")))?;
     let inst = if row.scene.windowed() {
         Instance::launch_windowed(&rig.aterm, &world, budget)?
@@ -667,10 +836,12 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     };
     let ctl = &inst.ctl;
     phases.end("launch");
-    if row.scene.pet() {
+    if row.scene.pet() || row.scene == SpinScene::Hidden || row.scene == SpinScene::WindowedRewound
+    {
         prepare_pet_focus(ctl)?;
     }
     ctl.ok(&["await", "idle", SETTLE_QUIET_MS, "timeout=60000"])?;
+    require_recording(ctl, row.recording)?;
     if row.scene.pet() {
         let started = std::time::Instant::now();
         await_pet_ready(ctl.budget(), row.scene, || {
@@ -691,7 +862,26 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
             started.elapsed().as_secs_f64()
         );
     }
-    if row.scene == SpinScene::Rewound {
+    if row.scene == SpinScene::Hidden {
+        let trail = ctl.call(&["trail", "status"]);
+        if let Some(why) = trail
+            .ok()
+            .then(|| hidden_unanswered(&trail.stdout))
+            .flatten()
+        {
+            return unanswered(why);
+        }
+        ctl.ok(&["send", HIDDEN_COUNTER])?;
+        ctl.ok(&["key", "enter"])?;
+        ctl.ok(&["invoke", "Minimize"])?;
+        ctl.await_event("the hidden scene's window to read off every glass", || {
+            let reply = ctl.call(&["trail", "status"]);
+            (reply.ok() && hidden_unready(&reply.stdout).is_none()).then_some(())
+        })?;
+        // The minimise's own animation and focus change, before the window's counters open.
+        std::thread::sleep(HIDDEN_SETTLE);
+    }
+    if row.scene.rewound() {
         ctl.ok(&["send", "printf 'rewind spin\\n'"])?;
         ctl.ok(&["key", "enter"])?;
         ctl.ok(&["await", "idle", SETTLE_QUIET_MS, "timeout=60000"])?;
@@ -712,6 +902,12 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         None
     };
     let opened = ctl.ok(&["metrics"])?;
+    if row.scene == SpinScene::Hidden {
+        hidden_take(ctl, "opened")?;
+    }
+    if row.scene == SpinScene::WindowedRewound {
+        rewound_focused(ctl, "opened")?;
+    }
     let before = field(&opened, "past_deadline_arms")
         .ok_or_else(|| {
             CouldNotRun::Unanswered("ctl metrics does not report past_deadline_arms".into())
@@ -748,7 +944,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         }
         reasons = Some(why);
     }
-    if row.scene == SpinScene::Rewound {
+    if row.scene.rewound() {
         let status = ctl.ok(&["rewind", "status"])?;
         if field(&status, "view") != Some("open") {
             return could_not_run(format!("the Rewind view closed in the window ({status})"));
@@ -760,6 +956,23 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     } else {
         None
     };
+    let mut backend = None;
+    if row.scene == SpinScene::WindowedRewound {
+        rewound_focused(ctl, "ended")?;
+        let drawn = field(&metrics, "backend").ok_or_else(|| {
+            CouldNotRun::Unanswered(format!("ctl metrics reported no backend ({metrics})"))
+        })?;
+        if drawn != "gpu" {
+            return could_not_run(format!(
+                "the rewound window was drawn by the {drawn} renderer, not the GPU the shipped \
+                 artifact renders on"
+            ));
+        }
+        backend = Some(drawn.to_string());
+    }
+    if row.scene == SpinScene::Hidden {
+        hidden_take(ctl, "ended")?;
+    }
     let mut os_events = None;
     let mut os_event_kinds = None;
     if row.scene.windowed() {
@@ -808,6 +1021,12 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
     if row.max_frames.is_some() && frames.is_none() {
         return unanswered("ctl metrics does not report frames");
     }
+    let hidden_parked = uint_field(&metrics, "redraw_hidden_parked")
+        .zip(uint_field(&opened, "redraw_hidden_parked"))
+        .map(|(end, start)| end.saturating_sub(start));
+    if row.min_hidden_parked.is_some() && hidden_parked.is_none() {
+        return unanswered("ctl metrics does not report redraw_hidden_parked");
+    }
     let arms = after.saturating_sub(before);
     let deck_clock = [
         "deck_clock_ticks",
@@ -840,6 +1059,7 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         fires_by_owner: field(&metrics, "deadline_fires_by_owner").map(str::to_string),
         pet_open,
         pet,
+        backend,
         os_events,
         os_event_kinds,
         reasons,
@@ -852,10 +1072,12 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
                 needle,
                 wakes,
                 frames,
+                hidden_parked,
             },
         ),
         owner_fires: fired,
         needle,
+        hidden_parked,
         deck_clock,
         checks: super::instance::replay_checks(ctl),
     };

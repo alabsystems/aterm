@@ -1062,19 +1062,11 @@ fn discover_on(
         && w.on_device(&home)
         && w.outside_sync_root(&home)
     {
-        for (name, child, ty) in w.children(&home) {
-            let n = name.to_string_lossy();
-            if !ty.is_dir() || n.starts_with('.') || home_skipped(&name) {
-                continue;
-            }
-            if !w.same_device(&child) {
-                continue;
-            }
-            w.checkout(&child);
-            for wt in worktrees(&child, &[&home, roots.home.as_deref().unwrap_or(&home)]) {
-                w.checkout(&wt);
-            }
-        }
+        w.checkouts_below(
+            &home,
+            &[&home, roots.home.as_deref().unwrap_or(&home)],
+            true,
+        );
     }
     if let Some(home) = roots.home.as_deref() {
         w.build_cache(&atpkg::build_cache::cache_root(home));
@@ -1733,6 +1725,31 @@ impl Walk {
         })
     }
 
+    fn checkouts_below(&mut self, parent: &Path, home_aliases: &[&Path], scratch: bool) {
+        for (name, child, ty) in self.children(parent) {
+            let n = name.to_string_lossy();
+            if !ty.is_dir() || home_skipped(&name) || !self.same_device(&child) {
+                continue;
+            }
+            // Agent worktrees are deliberately placed under this hidden scratch
+            // parent. Preserve each checkout as the origin, rather than treating
+            // the container as one checkout or searching other hidden folders.
+            if scratch && n == ".ubd" {
+                if !self.fenced(&child) && self.outside_sync_root(&child) {
+                    self.checkouts_below(&child, home_aliases, false);
+                }
+                continue;
+            }
+            if n.starts_with('.') || self.fenced(&child) || !self.outside_sync_root(&child) {
+                continue;
+            }
+            self.checkout(&child);
+            for wt in worktrees(&child, home_aliases) {
+                self.checkout(&wt);
+            }
+        }
+    }
+
     fn checkout(&mut self, root: &Path) {
         let Ok(root) = std::fs::canonicalize(root) else {
             return;
@@ -1808,7 +1825,7 @@ impl Walk {
             // An x.py checkout's build tree, by either name (in another case where the volume
             // takes it for that name) or wherever its `build` link leads, is bootstrap's
             // ([`Walk::bootstrap`]): never a checkout's build directory.
-            if n.starts_with('.')
+            if (n.starts_with('.') && n != ".ubd")
                 || (xpy && xpy::tree_name(dir, &name).is_some())
                 || linked.as_ref() == Some(&path)
                 || self.named.contains(&path)

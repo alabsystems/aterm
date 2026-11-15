@@ -3,11 +3,13 @@
 
 //! Transcript wall-check tests against Claude Code 2.1.294 fixtures.
 
-use aterm_phase::{ApiCause, WallKind, classify_wall};
+use alab_policy::vocab::{ApiCause, WallKind};
+use aterm_phase::classify_wall;
 
 use super::{
     Entry, TranscriptEnd, confirms, ended_with_nothing_pending, found_named, limit_named,
-    limit_words, refined, transcript_ends_on, transcript_wall, unanswered, waits_on_background,
+    limit_words, refined, served_since, transcript_ends_on, transcript_wall, unanswered,
+    waits_on_background,
 };
 
 fn fixture(name: &str) -> &'static str {
@@ -49,6 +51,9 @@ fn fixture(name: &str) -> &'static str {
         "local-commands" => include_str!("fixtures/claude-2.1.294-transcript-local-commands.jsonl"),
         "bucket-cancelled-then-model" => {
             include_str!("fixtures/claude-2.1.302-transcript-bucket-cancelled-then-model.jsonl")
+        }
+        "cloudflare-403" => {
+            include_str!("fixtures/claude-2.1.323-transcript-cloudflare-403.jsonl")
         }
         other => panic!("no fixture {other}"),
     }
@@ -1369,5 +1374,94 @@ fn a_tail_names_the_model_chosen_since_a_notice() {
         chosen_since_notice(&unprinted, notice),
         None,
         "no `/model` printed it"
+    );
+}
+
+/// CLOUDFLARE'S BLOCK PAGE IN THE TRANSCRIPT IS AN API WALL, NEVER A LOST LOGIN: Claude Code 2.1.323
+/// wrote it as its `<synthetic>` `authentication_failed` answer with status 403 (measured on m2,
+/// 2026-11-13), and the same process served turns on the same login 90 minutes later. It names
+/// the retried API error with its status, confirms no login wall the screen may read, and stands
+/// no login wall in the transcript's login scan; read by its status alone it is no lost login
+/// either. CONTROL: `Not logged in` (2.1.294) and a 401 refusal (2.1.294's invalid key) stay the
+/// lost login, and so does a 403 with no page of Cloudflare's typed `authentication_failed`.
+#[test]
+fn cloudflares_block_page_is_an_api_wall_and_a_401_still_the_lost_login() {
+    use crate::harness::upgrade::transcript_login_wall;
+    let blocked = WallKind::ApiError {
+        code: Some(403),
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    let edge = fixture("cloudflare-403");
+    let end = transcript_ends_on(edge);
+    assert!(end.closed, "{end:?}");
+    assert!(
+        matches!(&end.last, Entry::Notice { error: Some(e), status: Some(403), .. }
+            if e == "authentication_failed"),
+        "{end:?}"
+    );
+    assert_eq!(transcript_wall(&end), Some(blocked));
+    assert!(confirms(blocked, &end));
+    assert!(!confirms(WallKind::Auth, &end), "no login wall confirmed");
+    assert!(!transcript_login_wall(edge), "no login wall stands");
+    let by_status = edge.replace("Please run /login · API Error: 403", "API Error: 403");
+    let end = transcript_ends_on(&by_status);
+    assert_eq!(transcript_wall(&end), Some(blocked));
+    assert!(!confirms(WallKind::Auth, &end));
+
+    for name in ["not-logged-in", "invalid-key"] {
+        let end = transcript_ends_on(fixture(name));
+        assert_eq!(
+            transcript_wall(&end),
+            Some(WallKind::Auth),
+            "CONTROL: {name}"
+        );
+        assert!(confirms(WallKind::Auth, &end), "CONTROL: {name}");
+        assert!(transcript_login_wall(fixture(name)), "CONTROL: {name}");
+    }
+    let forbidden = edge.replace(
+        "Please run /login · API Error: 403 Attention Required! | Cloudflare",
+        "API Error: 403 Forbidden",
+    );
+    let end = transcript_ends_on(&forbidden);
+    assert_eq!(
+        transcript_wall(&end),
+        Some(WallKind::Auth),
+        "CONTROL: a 403 with no page of Cloudflare's"
+    );
+    assert!(transcript_login_wall(&forbidden), "CONTROL: its login wall");
+}
+
+/// THE API LAST ANSWERED A PROCESS WITH THE MODEL'S OWN REPLY: read where no point reads its login
+/// (a break of the agent's own background work). The measured block page's transcript was last
+/// answered by the page; a model reply after it, since the process started before it, is served,
+/// dated by the reply's own stamp (2026-11-13T11:49:41Z), never by when it is read.
+/// CONTROL: a reply written before `since` (the process's start, or its turn's opening) is no
+/// news of it, and a notice after the reply ends it.
+#[test]
+fn a_reply_after_the_process_started_is_its_login_serving() {
+    let edge = fixture("cloudflare-403");
+    let started = transcript_ends_on(edge).at.expect("dated") - 3600;
+    assert_eq!(served_since(edge, started), None, "the page answered last");
+    let reply = format!(
+        "{edge}{}\n",
+        r#"{"parentUuid":"5c0d6a7e-1f00-4b2a-9e3d-000000000005","isSidechain":false,"type":"assistant","uuid":"5c0d6a7e-1f00-4b2a-9e3d-000000000006","timestamp":"2026-11-13T11:49:41.000Z","message":{"id":"msg_fixture","model":"claude-fable-5","role":"assistant","type":"message","content":[{"type":"text","text":"Back on the work."}]},"version":"2.1.323"}"#
+    );
+    assert_eq!(served_since(&reply, started), Some(1_794_570_581));
+    let after = transcript_ends_on(&reply).at.expect("dated") + 1;
+    assert_eq!(
+        served_since(&reply, after),
+        None,
+        "CONTROL: a reply before `since`"
+    );
+    let notice = edge
+        .lines()
+        .find(|l| l.contains(r#""isApiErrorMessage":true"#))
+        .expect("the notice row");
+    let walled = format!("{reply}{notice}\n");
+    assert_eq!(
+        served_since(&walled, started),
+        None,
+        "CONTROL: a notice after it"
     );
 }

@@ -4,8 +4,8 @@
 //! Account-bound authority for provider reads (`DESIGN-alab-one-mesh-2026-11-05.md` §4.15).
 //! A natural use mints one non-clonable [`Use`]. The read consumes it, checks its account and
 //! records its own probe before contacting the provider. Launch picks share a finite allowance.
-//! The census guard follows the minting paths as a backstop against timers. The composing
-//! executable installs the journal sink; unit tests capture probes without publishing them.
+//! The composing executable installs the journal sink; unit tests capture probes without
+//! publishing them.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -41,9 +41,11 @@ mod sealed {
     pub trait LaunchDoor {}
     impl LaunchDoor for super::super::accounts_pool::LaunchUse {}
     impl LaunchDoor for super::super::agy_quota_store::LaunchUse {}
+    impl LaunchDoor for super::super::codex_login_rotation::LaunchUse {}
     impl LaunchDoor for super::super::codex_rotation::LaunchUse {}
     pub trait WallDoor {}
     impl WallDoor for super::super::agy_quota_store::WallUse {}
+    impl WallDoor for super::super::codex_login_rotation::WallUse {}
     impl WallDoor for super::super::codex_rotation::WallUse {}
 }
 

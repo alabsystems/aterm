@@ -67,8 +67,8 @@ pub(crate) const PAGE: Page = Page {
         row(
             "harness",
             "supervisor_contract supervisor_scope supervisor_revision supervisor supervisor_proven \
-         supervisor_version supervisor_vendor supervisor_act autopilot human_ms human_typed_ms \
-         human_seq launch launch_seq path_evidence copy upgrade history_lost journal \
+         supervisor_version supervisor_vendor supervisor_act autopilot pinned human_ms \
+         human_typed_ms human_seq launch launch_seq path_evidence copy upgrade history_lost journal \
          journal_off journal_tail journal_ring_lag journal_ring journal_bytes \
          journal_ledger_lag restore restore_why in_flight_lost tail_overflow marks_lost \
          resizes_unjournaled integration_rev born render resizes flaps",
@@ -343,7 +343,8 @@ pub(crate) const PAGE: Page = Page {
                     "`supervisor_contract=<n|-> supervisor_scope=<scope,…|-> \
                      supervisor_revision=<n> supervisor= supervisor_proven= supervisor_version= \
                      supervisor_vendor= supervisor_act=<on|observe|-> \
-                     autopilot=<off|cruise|land|-> human_ms= human_typed_ms= human_seq= \
+                     autopilot=<off|cruise|land|-> pinned=<0|1> human_ms= human_typed_ms= \
+                     human_seq= \
                      launch=<person|since|typed|boxed|other|pending|none> launch_seq= \
                      path_evidence= copy=<managed|foreign|-> upgrade= history_lost= \
                      journal=<live|off> … integration_rev= born=<cold|spare-<tier>> \
@@ -372,6 +373,12 @@ pub(crate) const PAGE: Page = Page {
                      and the agent's `Nothing left:` defense passes its check), `off` (it types \
                      nothing: Off, the harness off or off for this agent), `-` with no agent in \
                      front (`meta set autopilot` switches it)",
+                ),
+                row(
+                    "pinned=",
+                    "`1` while the session is pinned (`aterm ctl @<sid> pin`, `unpin`): a \
+                     person's or a lead agent's mark that keeps it first among its Mac's agents \
+                     in the fleet band; a worker it spawns starts at `0`",
                 ),
                 row(
                     "journal=",

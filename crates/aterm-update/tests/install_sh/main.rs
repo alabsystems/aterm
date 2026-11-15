@@ -17,6 +17,7 @@ mod guard;
 mod linux_verify;
 mod options;
 mod ownership;
+mod post_swap;
 mod root_run;
 mod source_build;
 mod support;

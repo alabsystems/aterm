@@ -601,3 +601,125 @@ fn two_issues_at_once_leave_no_key_in_a_file() {
     }
     assert_eq!((left, live), (0, 0), "(files left, live keys in them)");
 }
+
+/// A SESSION'S FILES GO AGAIN ONCE ITS SHELL HAS (unit BASH32H): a shell outlives its session for
+/// as long as its hang-up takes, and a bash hook that runs then makes `<sid>.out` anew, so the
+/// session's drop hands a second removal to the reaper ([`discard_once_gone`]), which asks
+/// whether the shell is gone ([`aterm_pty::ShellIdentity::verify`], a stand-in child here): the
+/// re-key file and both companions stay through a look that found it alive, and all three go once
+/// it is reaped. NEGATIVE CONTROL, scratch: with [`remove_once`] removing at its first look
+/// whatever `gone` answers, the files are gone after a look that found the shell alive.
+#[test]
+fn a_sessions_files_go_again_once_its_shell_has() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const GAP: std::time::Duration = std::time::Duration::from_millis(10);
+    let dir = scratch("rk-gone");
+    let path = dir.path().join("s-7e0001");
+    let files: Vec<PathBuf> = [
+        "",
+        aterm_core::shell_integration::DEBUG_TRAP_SUFFIX,
+        aterm_core::shell_integration::OUTPUT_SUFFIX,
+    ]
+    .into_iter()
+    .map(|suffix| {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        PathBuf::from(file)
+    })
+    .collect();
+    for file in &files {
+        std::fs::write(file, "").expect("a session file");
+    }
+    let mut command = aterm_uds::spawnfd::command("/bin/sleep");
+    command.arg("60");
+    let mut shell = command.spawn().expect("a stand-in shell");
+    let pid = i32::try_from(shell.id()).expect("a pid");
+    let identity = aterm_pty::ShellIdentity::from_parts(pid, aterm_pty::process_birth(pid), true);
+    let alive_looks = Arc::new(AtomicUsize::new(0));
+    let looks = Arc::clone(&alive_looks);
+    remove_once(path.clone(), move || {
+        let alive = identity.verify();
+        if alive {
+            looks.fetch_add(1, Ordering::AcqRel);
+        }
+        !alive
+    });
+    let looked = aterm_spec::wait::within(aterm_spec::wait::MUST_HAPPEN, GAP, || {
+        (alive_looks.load(Ordering::Acquire) > 0).then_some(())
+    });
+    assert!(looked.is_some(), "the reaper never looked at the shell");
+    for file in &files {
+        assert!(
+            file.exists(),
+            "{}: removed while the shell lived",
+            file.display()
+        );
+    }
+    // SAFETY: `kill` takes no pointer; `pid` is this test's own child, unreaped until the wait.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    shell.wait().expect("the stand-in reaped");
+    let gone = aterm_spec::wait::within(aterm_spec::wait::MUST_HAPPEN, GAP, || {
+        files.iter().all(|file| !file.exists()).then_some(())
+    });
+    assert!(
+        gone.is_some(),
+        "left after the shell went: {:?}",
+        files
+            .iter()
+            .filter(|file| file.exists())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The re-key path of a tab an earlier build opened is `<control dir>/rekey/<its s- id>`, the
+/// very path that build's shell captured as `ATERM_REKEY_PATH`, so a degraded adoption's re-key
+/// (`spawn::hydrate_adopted_engine`, handed the path `path_for` gives the adopted ID) writes the
+/// key where the shell reads it. A `t` tab's path is its own file, which that shell never reads;
+/// a malformed ID of either form names no file at all.
+#[test]
+fn an_earlier_tabs_rekey_lands_where_its_shell_reads() {
+    let Some(_env) = crate::seamless::tests::env_alone() else {
+        return;
+    };
+    let _scratch = crate::seamless::tests::ScratchEnv::runtime("rk-earlier");
+    let earlier = SessionId::parse("s-1a2b3c4d5e6f70819203").expect("an earlier tab's id");
+    let control = crate::control_auth::socket_dir().expect("scratch control dir");
+    let captured = control.join("rekey").join("s-1a2b3c4d5e6f70819203");
+    let path = path_for(&earlier).expect("the rekey dir");
+    assert_eq!(path, captured, "the path the earlier shell captured");
+    let t = SessionId::parse("tqn5r6e0148").expect("a t tab's id");
+    let minted = path_for(&t).expect("the rekey dir");
+    assert_eq!(minted, control.join("rekey").join("tqn5r6e0148"));
+    assert_ne!(minted, captured, "a t ID names another file");
+    for malformed in ["s-../x", "s-", "t000000000", "T0000000000", "tqn5r6e014u"] {
+        assert_eq!(
+            path_for(&SessionId::new(malformed)),
+            None,
+            "{malformed} names no file"
+        );
+    }
+
+    let term = Mutex::new(Terminal::new(24, 80));
+    crate::spawn::hydrate_adopted_engine(
+        &term,
+        Some(&carry_without_nonce()),
+        None,
+        Some(&path),
+        None,
+        1,
+        &mut crate::handoff_history::AdoptedHistory::default(),
+    );
+    let key = key_in(&captured);
+    assert!(!minted.exists(), "nothing is written under another ID");
+    let mut engine = term.lock().unwrap();
+    engine.process(cycle(&format!(";id={key}")).as_bytes());
+    assert_eq!(
+        engine.shell_integration_posture(),
+        ShellIntegrationPosture::On,
+        "the shell that read its captured path is healed"
+    );
+    drop(engine);
+    discard(&earlier);
+    assert!(!captured.exists(), "discard finds the s- file too");
+}

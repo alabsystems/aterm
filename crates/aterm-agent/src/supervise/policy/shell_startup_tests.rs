@@ -945,6 +945,8 @@ fn a_git_variable_a_zshenv_names_fails_a_git_read() {
     for (text, var) in [
         ("export GIT_EXTERNAL_DIFF=/tmp/x\n", "GIT_EXTERNAL_DIFF"),
         ("export XDG_CONFIG_HOME=\"$HOME/.cfg\"\n", "XDG_CONFIG_HOME"),
+        ("export LD_PRELOAD=/tmp/loader.so\n", "LD_PRELOAD"),
+        ("export DYLD_PRINT_LIBRARIES=\n", "DYLD_PRINT_LIBRARIES"),
         (
             "DEVELOPER_DIR=/tmp/dev; export DEVELOPER_DIR\n",
             "DEVELOPER_DIR",
@@ -960,6 +962,9 @@ fn a_git_variable_a_zshenv_names_fails_a_git_read() {
         "export PATH=\"$HOME/bin:$PATH\"\n",
         "# export GIT_DIR=/tmp/x\n",
         "export GIT_PAGER=delta\n",
+        "# export DYLD_PRINT_LIBRARIES=\n",
+        "export MY_LD_PRELOAD=/tmp/loader.so\n",
+        "export MY_DYLD_PRINT_LIBRARIES=1\n",
     ] {
         std::fs::write(&zshenv, text).expect("zshenv");
         let state = s.read(&s.worker("/bin/zsh", &[])).expect(text);

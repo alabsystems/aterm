@@ -938,8 +938,8 @@ impl MenuAction {
 pub(crate) struct AgentsLive {
     /// A session of this aterm has a need ([`MenuAction::NextNeed`]).
     pub needs_local: bool,
-    /// This Mac is in a fleet ([`MenuAction::ReadFleet`]).
-    pub in_fleet: bool,
+    /// Whether this Mac is in a fleet ([`MenuAction::ReadFleet`]); `None` before discovery.
+    pub in_fleet: Option<bool>,
     /// A window exists ([`MenuAction::Overview`]).
     pub any_window: bool,
     /// Why Summarize cannot start a worker here, `None` when it can.
@@ -951,10 +951,15 @@ impl AgentsLive {
     #[cfg(any(target_os = "macos", test))]
     pub(crate) const UNPUBLISHED: AgentsLive = AgentsLive {
         needs_local: false,
-        in_fleet: false,
+        in_fleet: None,
         any_window: true,
         summarize_block: None,
     };
+
+    /// Discovery completed and the launch checks admit a summary.
+    pub(crate) fn summarize_ready(&self) -> bool {
+        self.in_fleet.is_some() && self.summarize_block.is_none()
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -981,11 +986,11 @@ pub(crate) fn agents_live() -> AgentsLive {
 }
 
 /// Summarize's title: the fleet's, or this Mac's with no fleet.
-pub(crate) const fn summarize_title(in_fleet: bool) -> &'static str {
-    if in_fleet {
-        "Summarize the Fleet in a New Tab"
-    } else {
-        "Summarize This Mac in a New Tab"
+pub(crate) const fn summarize_title(in_fleet: Option<bool>) -> &'static str {
+    match in_fleet {
+        Some(true) => "Summarize the Fleet in a New Tab",
+        Some(false) => "Summarize This Mac in a New Tab",
+        None => "Summarize in a New Tab",
     }
 }
 
@@ -1184,8 +1189,8 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
             let live = match action {
                 MenuAction::NextNeed => agents.needs_local,
                 MenuAction::Overview => agents.any_window,
-                MenuAction::ReadFleet | MenuAction::FleetMachines => agents.in_fleet,
-                _ => agents.summarize_block.is_none(),
+                MenuAction::ReadFleet | MenuAction::FleetMachines => agents.in_fleet == Some(true),
+                _ => agents.summarize_ready(),
             };
             if !live {
                 return false;
@@ -1952,7 +1957,7 @@ const AGENTS_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Item {
-        label: summarize_title(true),
+        label: summarize_title(None),
         action: MenuAction::SummarizeFleet,
         key: "",
         mods: MenuMods::None,

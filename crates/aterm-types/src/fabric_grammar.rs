@@ -7,8 +7,9 @@
 
 use astream_wire::{ReceiptVerdict, WakeClass};
 
-/// Principal class prefixes for `<src>` segments (§3.2): session, node, human, agent.
-pub const PRINCIPAL_CLASSES: [&str; 4] = ["s-", "n-", "h-", "a-"];
+/// Principal class prefixes for `<src>` segments (§3.2): node, human, agent. A session is named
+/// by its tab ID ([`is_principal`]).
+pub const PRINCIPAL_CLASSES: [&str; 3] = ["n-", "h-", "a-"];
 
 const CLASS_PREFIX_LEN: usize = 2;
 
@@ -21,10 +22,15 @@ pub const PRINCIPAL_MAX: usize = CLASS_PREFIX_LEN + PRINCIPAL_NAME_MAX;
 /// Maximum topic name length.
 pub const TOPIC_MAX: usize = PRINCIPAL_NAME_MAX;
 
-/// Whether `p` is a well-formed bare principal (`s-`/`n-`/`h-`/`a-` plus `[a-z0-9-]{1,32}`).
+/// Whether `p` is a well-formed bare principal: a session's tab ID
+/// ([`crate::tab_id::is_tab_id`]) or a legacy tab's ID ([`crate::tab_id::is_legacy`]), whose
+/// shell still reads its own inbox, or `n-`/`h-`/`a-` plus `[a-z0-9-]{1,32}`.
 #[inline]
 #[must_use]
 pub fn is_principal(p: &str) -> bool {
+    if crate::tab_id::is_tab_id(p) || crate::tab_id::is_legacy(p) {
+        return true;
+    }
     let Some(name) = PRINCIPAL_CLASSES.iter().find_map(|c| p.strip_prefix(c)) else {
         return false;
     };

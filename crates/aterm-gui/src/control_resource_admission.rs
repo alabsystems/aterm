@@ -29,14 +29,10 @@ enum Command<'a> {
     Inspect(&'a str),
     Enroll(&'a str),
 }
+/// Whether `sid` names a tab: a session ID this Mac's tabs hold
+/// ([`aterm_session::is_minted_sid`]), a legacy tab's included.
 fn canonical_session(sid: &str) -> bool {
-    sid.strip_prefix("s-").is_some_and(|suffix| {
-        !suffix.is_empty()
-            && suffix.len() <= 62
-            && suffix
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
+    aterm_session::is_minted_sid(sid)
 }
 fn parse(rest: &str) -> Option<Command<'_>> {
     if rest.len() > MAX_COMMAND {

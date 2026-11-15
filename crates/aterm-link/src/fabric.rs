@@ -1948,14 +1948,14 @@ pub struct Traffic {
 }
 
 /// The sender of an `in` record the writer `src` wrote, its body naming `body_from`: a node's
-/// session, `<sid>@<src>`, when a node names a bare session (`s-`); on a person's lane
+/// session, `<sid>@<src>`, when a node names a bare session (its tab ID); on a person's lane
 /// (`person_lane`, `/f/<F>/in/p/<person>/<node>/<kind>`) written by a node, a `<sid>@<node>` as
 /// it is, the session on another Mac whose answer or receipt this Mac's bridge handed the person
 /// (§11 C3d): only this Mac's own bridge writes `in/p/*/<this node>/*`, since no peer's ring
 /// reaches a person's lane; else `src`.
 fn render_from(person_lane: bool, src: &str, body_from: Option<&str>) -> String {
     let principal = crate::subject::is_principal;
-    let session = |sid: &str| sid.starts_with("s-") && principal(sid);
+    let session = crate::subject::is_session_id;
     let by_node = src.starts_with("n-");
     match body_from {
         Some(sid) if by_node && session(sid) => format!("{sid}@{src}"),
@@ -2116,7 +2116,7 @@ fn in_sender(
     now_ms: u64,
 ) -> (String, &'static str) {
     let (sid, src, kind) = (segs[5], segs[6], segs[7]);
-    let session = sid.starts_with("s-") && crate::subject::is_principal(sid);
+    let session = crate::subject::is_session_id(sid);
     let carried = if session {
         crate::person_key::carried_by(fleet, sid, src, kind, body, now_ms)
     } else {
@@ -2342,12 +2342,12 @@ fn verdicts_kept(
 fn verdict_lane(fleet: &str, subject: &str, from: Option<&str>) -> String {
     let src = subject.split('/').nth(6).unwrap_or("");
     let principal = crate::subject::is_principal;
-    let session = from.filter(|sid| sid.starts_with("s-") && principal(sid));
+    let session = from.filter(|sid| crate::subject::is_session_id(sid));
     if src.starts_with("n-") && principal(src) {
         if let Some(sid) = session {
             return format!("/f/{fleet}/in/{src}/{sid}/*");
         }
-    } else if !src.starts_with("s-") && principal(src) {
+    } else if !crate::subject::is_session_id(src) && principal(src) {
         return format!("/f/{fleet}/in/p/{src}/*");
     }
     format!("/f/{fleet}/in/*/*/*")
@@ -5630,7 +5630,7 @@ fn traffic_json(t: &Traffic) -> Vec<(&'static str, J)> {
 }
 
 /// The node and session a record's subject names: `/f/<F>/pub|in/<node>/<sid>/…`, the node an
-/// `n-` principal and the sid an `s-` one (a node's own face, a person's lane and the fleet's
+/// `n-` principal and the sid a session id (`subject::is_session_id`; a node's own face, a person's lane and the fleet's
 /// lanes name no session).
 fn subject_session<'a>(fleet: &str, subject: &'a str) -> (Option<&'a str>, Option<&'a str>) {
     let segs: Vec<&str> = subject.split('/').collect();
@@ -5639,11 +5639,13 @@ fn subject_session<'a>(fleet: &str, subject: &'a str) -> (Option<&'a str>, Optio
         && segs[1] == "f"
         && segs[2] == fleet
         && matches!(segs[3], "pub" | "in");
-    let named = |seg: &'a str, class: &str| {
-        Some(seg).filter(|s| s.starts_with(class) && crate::subject::is_principal(s))
-    };
-    match faced.then(|| named(segs[4], "n-")).flatten() {
-        Some(node) => (Some(node), named(segs[5], "s-")),
+    let node =
+        |seg: &'a str| Some(seg).filter(|s| s.starts_with("n-") && crate::subject::is_principal(s));
+    match faced.then(|| node(segs[4])).flatten() {
+        Some(node) => (
+            Some(node),
+            Some(segs[5]).filter(|s| crate::subject::is_session_id(s)),
+        ),
         None => (None, None),
     }
 }

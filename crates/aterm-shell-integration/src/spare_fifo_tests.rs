@@ -50,20 +50,28 @@ fn the_sweep_releases_only_the_fifos_whose_owner_has_ended() {
     let me = i32::try_from(std::process::id()).expect("pid");
     let my_birth = birth_of(me);
 
-    let dead = format!("{gone_pid}-{gone_birth}-s-0a");
+    let dead = format!("{gone_pid}-{gone_birth}-t000000000a");
     mkfifo(&at(&dead));
-    link(&dead, "s-0a");
-    mkfifo(&at(&format!("{me}-{}-s-0b", my_birth + 1)));
-    let live = format!("{me}-{my_birth}-s-0c");
+    link(&dead, "t000000000a");
+    mkfifo(&at(&format!("{me}-{}-t000000000b", my_birth + 1)));
+    let live = format!("{me}-{my_birth}-t000000000c");
     mkfifo(&at(&live));
-    link(&live, "s-0c");
-    mkfifo(&at("s-0d"));
-    let not_fifo = format!("{gone_pid}-{gone_birth}-s-0e");
+    link(&live, "t000000000c");
+    mkfifo(&at("t000000000d"));
+    let not_fifo = format!("{gone_pid}-{gone_birth}-t000000000e");
     std::fs::write(at(&not_fifo), b"").expect("file");
-    let unread = format!("{me}-0-s-0f");
+    let unread = format!("{me}-0-t000000000f");
     mkfifo(&at(&unread));
-    mkfifo(&at(&format!("{gone_pid}-0-s-10")));
-    mkfifo(&at(&format!("{zombie_pid}-{zombie_birth}-s-11")));
+    mkfifo(&at(&format!("{gone_pid}-0-t0000000010")));
+    mkfifo(&at(&format!("{zombie_pid}-{zombie_birth}-t0000000011")));
+    // A tab opened before the update holds its FIFO under its earlier `s-` ID: an ended owner's
+    // goes like any other.
+    let earlier = format!("{gone_pid}-{gone_birth}-s-0123456789abcdef0123");
+    mkfifo(&at(&earlier));
+    link(&earlier, "s-0123456789abcdef0123");
+    // An ended owner's FIFO whose name ends in no tab ID is not a hold's: it stays.
+    let not_a_tab = format!("{gone_pid}-{gone_birth}-s-0123456789abcdef012");
+    mkfifo(&at(&not_a_tab));
 
     sweep_dead(dir.path());
     zombie.wait().expect("reap");
@@ -73,7 +81,14 @@ fn the_sweep_releases_only_the_fifos_whose_owner_has_ended() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     left.sort();
-    let mut kept = vec![live, "s-0c".to_owned(), "s-0d".to_owned(), not_fifo, unread];
+    let mut kept = vec![
+        live,
+        "t000000000c".to_owned(),
+        "t000000000d".to_owned(),
+        not_fifo,
+        unread,
+        not_a_tab,
+    ];
     kept.sort();
     assert_eq!(left, kept);
 }
@@ -94,7 +109,7 @@ fn unread_owners_keep_their_fifos_until_exit_or_reuse_is_proved() {
         (20, 0, None, ProcessPresence::Absent, false),
     ];
     for (pid, birth, ..) in rows {
-        let sid = format!("s-{pid:x}");
+        let sid = format!("t{pid:010x}");
         let name = format!("{pid}-{birth}-{sid}");
         mkfifo(&dir.path().join(&name));
         std::os::unix::fs::symlink(&name, dir.path().join(&sid)).expect("link");
@@ -114,7 +129,7 @@ fn unread_owners_keep_their_fifos_until_exit_or_reuse_is_proved() {
     );
     let mut expected = Vec::new();
     for (pid, birth, _, _, keep) in rows {
-        let sid = format!("s-{pid:x}");
+        let sid = format!("t{pid:010x}");
         let name = format!("{pid}-{birth}-{sid}");
         let path = dir.path().join(&name);
         let link = dir.path().join(&sid);
@@ -145,9 +160,9 @@ fn unread_owners_keep_their_fifos_until_exit_or_reuse_is_proved() {
 #[test]
 fn a_failed_wake_open_keeps_both_names_for_a_later_release() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let name = "7-1-s-0a";
+    let name = "7-1-t000000000a";
     let path = dir.path().join(name);
-    let link = dir.path().join("s-0a");
+    let link = dir.path().join("t000000000a");
     // A real read/write-open error, independent of uid or descriptor limits. This models
     // the failure boundary, not the EMFILE cause that can also reach it for a real FIFO.
     std::fs::create_dir(&path).unwrap();
@@ -193,10 +208,10 @@ fn a_full_pipe_never_holds_the_release() {
     use std::io::{Read as _, Write as _};
     use std::os::unix::fs::OpenOptionsExt as _;
     let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("7-1-s-0a");
+    let path = dir.path().join("7-1-t000000000a");
     mkfifo(&path);
-    let link = dir.path().join("s-0a");
-    std::os::unix::fs::symlink("7-1-s-0a", &link).expect("link");
+    let link = dir.path().join("t000000000a");
+    std::os::unix::fs::symlink("7-1-t000000000a", &link).expect("link");
     // Read-write, so the bytes it writes stay in the pipe; it reads them only to free a release
     // left waiting, so the test ends at its assertion rather than in a thread that never returns.
     let stray = std::fs::OpenOptions::new()
@@ -300,9 +315,9 @@ fn names_in(dir: &Path) -> Vec<String> {
 #[test]
 fn a_shell_opening_its_fifo_after_the_sweep_reads_the_end_line_then_end_of_file() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("7-1-s-0a");
+    let path = dir.path().join("7-1-t000000000a");
     mkfifo(&path);
-    std::os::unix::fs::symlink("7-1-s-0a", dir.path().join("s-0a")).expect("link");
+    std::os::unix::fs::symlink("7-1-t000000000a", dir.path().join("t000000000a")).expect("link");
     // The FIFO as the shell holds it once it has resolved the link: a name the sweep keeps.
     let late = dir.path().join("late");
     std::fs::hard_link(&path, &late).expect("hard link");
@@ -329,10 +344,10 @@ fn a_shell_in_its_fifos_open_reads_the_line_only_once_both_names_are_gone() {
     use std::io::BufRead as _;
     use std::sync::mpsc::channel;
     let dir = aterm_tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("7-1-s-0a");
+    let path = dir.path().join("7-1-t000000000a");
     mkfifo(&path);
-    let link = dir.path().join("s-0a");
-    std::os::unix::fs::symlink("7-1-s-0a", &link).expect("link");
+    let link = dir.path().join("t000000000a");
+    std::os::unix::fs::symlink("7-1-t000000000a", &link).expect("link");
     let late = dir.path().join("late");
     std::fs::hard_link(&path, &late).expect("hard link");
     let (opened, opened_rx) = channel();
@@ -408,8 +423,8 @@ fn a_kept_wake_closes_once_its_fifo_is_read_or_its_minute_is_up() {
             .expect("a reader")
     };
     let mut buf = [0u8; 8];
-    let (read_wake, read_late) = released("s-0a");
-    let (unread_wake, unread_late) = released("s-0b");
+    let (read_wake, read_late) = released("t000000000a");
+    let (unread_wake, unread_late) = released("t000000000b");
     let t0 = Instant::now();
     let mut keeper = Keeper::default();
     keeper.keep(read_wake, t0);

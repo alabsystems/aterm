@@ -91,6 +91,30 @@ fn same_identity(left: &MachineIdentity, right: &MachineIdentity) -> bool {
     left.machine_id == right.machine_id && left.incarnation == right.incarnation
 }
 
+/// How long a stage's wait may take before it has hung. A stopped peer reads LastSeen only once
+/// the lease of its last contact ran out: the time its observer's dial scheduler promised that
+/// contact its next round (`PeerObservation::reachable_for_ms`, as the stage before read it), or
+/// sooner where the observer found it gone. So the lost stage waits out that lease, then the
+/// hang detector. No other stage waits on a lease.
+fn patience(
+    stage: Stage,
+    previous: Option<&NetworkObservation>,
+    peer: &MachineIdentity,
+) -> Duration {
+    let lease = previous
+        .filter(|_| matches!(stage, Stage::Lost))
+        .and_then(|previous| {
+            previous
+                .peers
+                .iter()
+                .find(|p| same_identity(&p.identity, peer))
+        })
+        .map_or(Duration::ZERO, |peer| {
+            Duration::from_millis(peer.reachable_for_ms())
+        });
+    HANG + lease
+}
+
 fn matches_stage(
     observed: &NetworkObservation,
     pid: u32,
@@ -182,7 +206,7 @@ impl Cycle<'_> {
     ) -> Result<StageEvidence, Fail> {
         let config = self.recipient.cfg.join("aterm/aterm.toml");
         let paths = Paths::for_home(&self.recipient.home);
-        let until = Instant::now() + HANG;
+        let until = Instant::now() + patience(stage, previous, peer);
         let mut last_network = None;
         loop {
             stop::check()?;

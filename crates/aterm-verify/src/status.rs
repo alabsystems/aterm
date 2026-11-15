@@ -347,6 +347,7 @@ fn observe_one(text: &str) -> Observed {
                 checks: rows,
                 secs: 0,
                 finished: Some(finished.clone()),
+                ..Judged::default()
             };
             if record.whole() {
                 "matching-observed-rows"

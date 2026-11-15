@@ -208,7 +208,7 @@ const WORKER_RESOLUTION: &str = "if [ -n \"$ATERM_TASK_FILE\" ]; then\n\
 fn sid_of(stdout: &str) -> String {
     stdout
         .split_whitespace()
-        .find(|w| w.starts_with("s-"))
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .unwrap_or_else(|| panic!("a sid: {stdout}"))
         .to_string()
 }
@@ -447,13 +447,7 @@ fn a_command_only_instance_spawns_a_worker_without_typing_into_its_command() {
         ],
     );
     let (_, original) = boot_session(&inst);
-    let cat_pid = || {
-        let tree = headless_boot::process_tree(&inst);
-        tree.lines()
-            .find(|line| line.split_whitespace().nth(5) == Some("/bin/cat"))
-            .and_then(|line| line.split_whitespace().next())
-            .map(str::to_owned)
-    };
+    let cat_pid = || headless_boot::descendant_running(&inst, "/bin/cat");
     let original_pid = aterm_spec::wait::until_within(HANG, "the direct command's cat", cat_pid);
     let before = aterm_spec::wait::until_within(HANG, "the direct command's environment", || {
         let text = ctl_ok(&inst, &[&format!("@{original}"), "text", "trim"]);

@@ -119,8 +119,9 @@ fn the_output_streak_switch_is_a_row_seeded_where_the_engine_starts() {
 
 #[test]
 fn the_harness_rows_round_trip_through_set_and_unset() {
+    use alab_policy::config::Autopilot;
     use aterm_agent::supervise::config::Approve;
-    use aterm_agent::supervise::{Autopilot, PriorityWord, SupervisorConfig};
+    use aterm_agent::supervise::{PriorityWord, SupervisorConfig};
     let seed = |cfg: &Config, key: &str| {
         editable_fields(cfg)
             .into_iter()
@@ -145,7 +146,7 @@ fn the_harness_rows_round_trip_through_set_and_unset() {
             |p| !p.enabled,
         ),
         (super::EDIT_HARNESS_AUTOPILOT, None, "Land", "land", |p| {
-            p.autopilot == Autopilot::Land && p.enabled
+            p.turn_end.autopilot == Autopilot::Land && p.enabled
         }),
         (super::EDIT_HARNESS_APPROVE, None, "safe", "safe", |p| {
             p.approve == Approve::Safe && p.enabled

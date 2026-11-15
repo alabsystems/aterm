@@ -123,6 +123,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         Some(AgentSpec::Worker {
             agent: aterm_phase::Program::Claude,
             model: None,
+            effort: None,
             autopilot: None,
             from: None
         })
@@ -132,6 +133,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         Some(AgentSpec::Worker {
             agent: aterm_phase::Program::Claude,
             model: Some("claude-opus-4.1".to_string()),
+            effort: None,
             autopilot: None,
             from: Some(aterm_session::SessionId::new("s-ab12")),
         })
@@ -141,6 +143,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         Some(AgentSpec::Worker {
             agent: aterm_phase::Program::Agy,
             model: Some("gemini-2.5-pro-".to_string()),
+            effort: None,
             autopilot: None,
             from: Some(aterm_session::SessionId::new("s-ab12")),
         })
@@ -151,19 +154,21 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         Some(AgentSpec::Worker {
             agent: aterm_phase::Program::Claude,
             model: Some(longest.clone()),
+            effort: None,
             autopilot: None,
             from: None,
         })
     );
     for (word, autopilot) in [
-        ("land", aterm_agent::supervise::Autopilot::Land),
-        ("cruise", aterm_agent::supervise::Autopilot::Cruise),
+        ("land", alab_policy::config::Autopilot::Land),
+        ("cruise", alab_policy::config::Autopilot::Cruise),
     ] {
         assert_eq!(
             agent_of(&format!("agent=claude autopilot={word} len=1")),
             Some(AgentSpec::Worker {
                 agent: aterm_phase::Program::Claude,
                 model: None,
+                effort: None,
                 autopilot: Some(autopilot),
                 from: None,
             })
@@ -173,7 +178,6 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         aterm_phase::Program::Codex,
         aterm_phase::Program::Agy,
         aterm_phase::Program::Muse,
-        aterm_phase::Program::Grok,
     ] {
         assert_eq!(
             agent_of(&format!(
@@ -183,7 +187,8 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
             Some(AgentSpec::Worker {
                 agent: program,
                 model: Some("m-1".to_string()),
-                autopilot: Some(aterm_agent::supervise::Autopilot::Cruise),
+                effort: None,
+                autopilot: Some(alab_policy::config::Autopilot::Cruise),
                 from: Some(aterm_session::SessionId::new("s-ab12")),
             }),
             "a worker of {program:?}"
@@ -216,7 +221,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         "agent=muse model=-x len=1",
         "agent=claude model=- len=1",
         "agent=Grok len=1",
-        "agent=grok model=--always-approve len=1",
+        "agent=grok len=1",
         "agent=kimi len=1",
         "connected=controlled place=tab of=s-a len=3",
     ] {
@@ -227,43 +232,7 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         usage.contains(
             "agent=<claude|codex|agy|muse> [model=<m>] [autopilot=<land|cruise>] \
              [from=<sid>] len=<n>"
-        ) || aterm_phase::Program::Grok.supervisable(),
-        "{usage}"
-    );
-}
-
-/// `agent=grok` IS A WORKER WORD: `spawn agent=grok` parses to a Grok Build worker with its
-/// model, Autopilot and starter, as every other row's word does (it was `ERR usage` while
-/// `WORKERS` had no Grok row); the usage line names it only once a spawn starts it.
-#[test]
-fn agent_grok_parses_as_a_grok_build_worker() {
-    assert_eq!(
-        parse_spawn_args("agent=grok model=grok-code-fast-1 from=s-ab12 len=9"),
-        Ok(SpawnForm::Plain {
-            window: None,
-            raise: None,
-            cwd: None,
-            split: None,
-            theme: None,
-            agent: Some(AgentSpec::Worker {
-                agent: aterm_phase::Program::Grok,
-                model: Some("grok-code-fast-1".to_string()),
-                autopilot: None,
-                from: Some(aterm_session::SessionId::new("s-ab12")),
-            }),
-            why: None,
-            req: None,
-        })
-    );
-    assert_eq!(
-        crate::task_launch::worker_word(Some("grok")),
-        "grok",
-        "the frame's replies name grok, not the claude fallback"
-    );
-    let usage = super::spawn_usage();
-    assert_eq!(
-        usage.contains("|grok>"),
-        aterm_phase::Program::Grok.supervisable(),
+        ),
         "{usage}"
     );
 }
@@ -620,4 +589,41 @@ fn spawn_takes_one_req_and_refuses_it_on_the_connected_form() {
         Err(None)
     );
     assert!(super::spawn_usage().contains("[req=<id>]"));
+}
+
+#[test]
+fn a_spawn_effort_is_explicit_codex_configuration() {
+    let Ok(SpawnForm::Plain {
+        agent:
+            Some(AgentSpec::Worker {
+                agent,
+                model,
+                effort,
+                ..
+            }),
+        ..
+    }) = parse_spawn_args("agent=codex model=gpt-6.1-sol effort=ultra len=1")
+    else {
+        panic!("Codex model and effort are accepted together");
+    };
+    assert_eq!(agent, aterm_phase::Program::Codex);
+    assert_eq!(model.as_deref(), Some("gpt-6.1-sol"));
+    assert_eq!(effort.as_deref(), Some("ultra"));
+    for bad in [
+        "agent=codex effort=ultra effort=low len=1",
+        "agent=codex model=a model=b len=1",
+        "agent=codex effort=bogus len=1",
+        "agent=codex effort= len=1",
+        "agent=codex effort=--yolo len=1",
+        "agent=claude effort=ultra len=1",
+        "agent=agy effort=ultra len=1",
+        "agent=muse effort=ultra len=1",
+        "program=/bin/echo effort=ultra len=1",
+        "effort=ultra",
+    ] {
+        assert!(
+            parse_spawn_args(bad).is_err(),
+            "must not silently drop {bad:?}"
+        );
+    }
 }

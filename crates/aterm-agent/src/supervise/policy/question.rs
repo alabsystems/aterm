@@ -10,7 +10,7 @@ use aterm_phase::{
 };
 
 use super::approval::{Answer, AnswerTarget, Choice, Decision, QuestionPriority};
-use super::guard::row_guard;
+use alab_policy::guard::row_guard;
 
 /// The rule id of an answered question (the ledger's, the journal's).
 pub const RULE_ANSWER_RECOMMENDED: &str = "answer-recommended@v1";
@@ -32,7 +32,7 @@ pub const SHORT_TERM_TEXT: &str = "Decide yourself: choose the option that gets 
                                    asked.)";
 
 /// Autopilot Land's policy text ([`QuestionPriority::Land`]) for a question's free-text row: Land's
-/// answer ([`super::turn_end::LAND_ANSWER`]) under the policy texts' rules (no comma, semicolon,
+/// answer ([`alab_policy::words::LAND_ANSWER`]) under the policy texts' rules (no comma, semicolon,
 /// hyphen or digit), opening `Decide yourself:` so no reader of a land act takes it for one.
 pub const LAND_TEXT: &str = "Decide yourself: take the option that lands all of this work on \
                              remote main soonest and starts no new work. Never force push or \
@@ -413,10 +413,10 @@ pub fn text_keeps_its_rows(text: &str, cols: u16, label_col: usize) -> bool {
 
 /// The destructive word the question's own row names: an act every answer to it bears on.
 fn asks_to(question: &QuestionText) -> Option<&'static str> {
-    super::turn_end::destructive_word(&question.text.to_lowercase())
+    alab_policy::words::destructive_word(&question.text.to_lowercase())
 }
 
-/// How one option's own words bear on a destructive act ([`super::turn_end::destructive_word`]).
+/// How one option's own words bear on a destructive act ([`alab_policy::words::destructive_word`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Bears {
     /// The first act its words name outside a negation: what taking it would do.
@@ -451,11 +451,11 @@ fn negates(word: &str) -> bool {
 /// The destructive act that starts at `words[k]`: the word itself, or it and the next where the
 /// act is two words (`rewrite history`, `push -f`).
 fn act_at(words: &[&str], k: usize) -> Option<&'static str> {
-    super::turn_end::destructive_word(words[k]).or_else(|| {
+    alab_policy::words::destructive_word(words[k]).or_else(|| {
         let next = words.get(k + 1)?;
-        super::turn_end::destructive_word(next)
+        alab_policy::words::destructive_word(next)
             .is_none()
-            .then(|| super::turn_end::destructive_word(&format!("{} {next}", words[k])))
+            .then(|| alab_policy::words::destructive_word(&format!("{} {next}", words[k])))
             .flatten()
     })
 }
@@ -495,7 +495,7 @@ fn bears(label: &str, description: &str) -> Bears {
         }
     }
     if read.does.is_none() && read.declines.is_empty() {
-        read.does = super::turn_end::destructive_word(&text);
+        read.does = alab_policy::words::destructive_word(&text);
     }
     read
 }
@@ -667,7 +667,7 @@ fn destructive(question: &QuestionText, options: &[QuestionOption]) -> Option<&'
         text.push('\n');
         text.push_str(&o.description.to_lowercase());
     }
-    super::turn_end::destructive_word(&text)
+    alab_policy::words::destructive_word(&text)
 }
 
 fn refuses(label: &str) -> bool {
@@ -1380,7 +1380,7 @@ fn note_answer(
                 text.push('\n');
                 text.push_str(&o.label.to_lowercase());
             }
-            if let Some(w) = super::turn_end::destructive_word(&text) {
+            if let Some(w) = alab_policy::words::destructive_word(&text) {
                 return fallback(&format!(
                     "a question with no recommended option that would {w} is not the worker's"
                 ));
@@ -1444,7 +1444,7 @@ fn answer_by_role(prompt: &PromptV2, rows: &[String]) -> Decision {
     let mut o = chosen.unwrap_or(first);
     if chosen.is_none() {
         let asked = format!("{}\n{}", prompt.title, prompt.description).to_lowercase();
-        if let Some(w) = super::turn_end::destructive_word(&asked) {
+        if let Some(w) = alab_policy::words::destructive_word(&asked) {
             match the_refusal(w, &answers, |o| (o.label.as_str(), "")) {
                 Ok(refusal) => {
                     o = refusal;

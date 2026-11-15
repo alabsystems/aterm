@@ -6,7 +6,7 @@
 //! CRUISE NEVER PARKS.
 
 use super::*;
-use crate::supervise::policy::cruise_carry::{BACKGROUND_CARRY, RULE_BACKGROUND};
+use alab_policy::cruise_carry::{BACKGROUND_CARRY, RULE_BACKGROUND};
 
 /// A turn that ended with the agent's own dynamic workflows running, its report `said` (each
 /// line under the first in the reply's gutter).
@@ -50,8 +50,11 @@ const DONE: &[&str] = &[
 /// nothing of its own).
 fn under(autopilot: Autopilot) -> SupervisorConfig {
     SupervisorConfig {
-        autopilot,
         continue_policy: true,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot,
+            ..policy(Occupancy::Observe).turn_end.clone()
+        },
         ..policy(Occupancy::Observe)
     }
 }
@@ -87,7 +90,7 @@ fn is_carry(request: &str) -> bool {
     // no need (`go_ahead::unless_held`).
     request.starts_with("send ")
         && [false, true].into_iter().any(|held| {
-            let carry = crate::supervise::policy::go_ahead::unless_held(BACKGROUND_CARRY, held);
+            let carry = alab_policy::go_ahead::unless_held(BACKGROUND_CARRY, held);
             request.ends_with(&format!(" -- {carry}"))
         })
 }
@@ -724,6 +727,86 @@ fn a_short_answer_backs_the_next_carry_off_on_the_ladder() {
     );
 }
 
+/// A TURN WORKED TO A BREAK OF THE AGENT'S OWN BACKGROUND WORK IS ITS LOGIN SERVING, told the
+/// host once a turn and dated by the model's own reply ([`IdleHost::login_served_at`]): no point
+/// is reached there, so before this a session whose every turn ended while its background work
+/// ran never told its login's return, and a row Cloudflare's block page had recorded signed out
+/// stayed so while its own process served it (m2, 2026-11-13: its transcript ends on the measured
+/// page, then on the model's replies). The time told is the reply's stamp in the transcript
+/// (2026-11-13T11:49:41Z), never the loop's clock at the settled read (2025-10-09), so the host
+/// lifts no strike recorded between the reply and the read. It is told whatever the Autopilot,
+/// as a point's login is: under Off, whose breaks step nothing else
+/// ([`Session::background_steps`]), the same turns tell it (before this, the break's tell rode
+/// Cruise's judgment of the break, which Off skips, and told nothing). CONTROLS: the same breaks
+/// over a transcript the page answered last tell nothing, nor do breaks no turn worked to, nor a
+/// reply written after the process started but before the turn opened (no news of that turn).
+#[test]
+fn a_turn_served_to_a_break_tells_the_host_its_login_served_once_a_turn() {
+    let edge = include_str!("fixtures/claude-2.1.323-transcript-cloudflare-403.jsonl");
+    let reply_at = |stamp: &str| {
+        format!(
+            "{edge}{}\n",
+            r#"{"parentUuid":"5c0d6a7e-1f00-4b2a-9e3d-000000000005","isSidechain":false,"type":"assistant","uuid":"5c0d6a7e-1f00-4b2a-9e3d-000000000006","timestamp":"STAMP","message":{"id":"msg_fixture","model":"claude-fable-5","role":"assistant","type":"message","content":[{"type":"text","text":"Back on the work."}]},"version":"2.1.323"}"#
+                .replace("STAMP", stamp)
+        )
+    };
+    let reply = reply_at("2026-11-13T11:49:41.000Z");
+    // The loop's clock opens at T0 (2025-10-09T08:53:20Z) and the turns at T0 + 40 s and
+    // T0 + 170 s: this reply was written an hour after a process started, before either opened.
+    let stale = reply_at("2025-10-09T08:53:20.000Z");
+    let run = |tag: &str, autopilot: Autopilot, tail: &str, started: i64, worked: bool| {
+        let cfg = under(autopilot);
+        let host = Arc::new(DoorHost::default());
+        *host.tail.lock().expect("tail") = Some(tail.to_string());
+        *host.started.lock().expect("started") = Some(started);
+        let drawn = |_| waiting(PLAIN);
+        let steps = move |_| {
+            if autopilot == Autopilot::Off {
+                Step::Off
+            } else {
+                Step::Stepped
+            }
+        };
+        let ran = Script {
+            policy: cfg.clone(),
+            drawn: &drawn,
+            host: Arc::clone(&host),
+            steps: &steps,
+            ..Script::new(tag, Occupancy::Observe, &[30, 40, 60, 160, 170, 300])
+        }
+        .run(&mut |s, i| {
+            if worked && (i == 1 || i == 4) {
+                s.took(7, Some(&cfg), &mut Heard::default());
+            }
+        });
+        ran.calls
+            .into_iter()
+            .filter(|c| c.starts_with("login_"))
+            .collect::<Vec<_>>()
+    };
+    // The process started before the page answered it (2026-11-13T09:00:00Z).
+    let started = 1_794_560_400;
+    for autopilot in [Autopilot::Cruise, Autopilot::Off] {
+        assert_eq!(
+            run("break-served", autopilot, &reply, started, true),
+            ["login_served_at:1794570581", "login_served_at:1794570581"],
+            "{autopilot:?}: once for each turn worked to a break, dated by its reply"
+        );
+        assert!(
+            run("break-walled", autopilot, edge, started, true).is_empty(),
+            "{autopilot:?}, CONTROL: the page answered last"
+        );
+        assert!(
+            run("break-idle", autopilot, &reply, started, false).is_empty(),
+            "{autopilot:?}, CONTROL: no turn worked to the break"
+        );
+        assert!(
+            run("break-stale", autopilot, &stale, T0 / 1000 - 3600, true).is_empty(),
+            "{autopilot:?}, CONTROL: a reply from before the turn opened"
+        );
+    }
+}
+
 /// The session's own mode, switched from the chip since the loop last read it, is read afresh
 /// just before the carry is typed: Land or Off there types nothing, Cruise there types it.
 #[test]
@@ -1060,7 +1143,7 @@ fn a_measured_outage_holds_the_carry_until_its_return() {
 }
 
 /// AN OUTAGE PAST ITS CAP HOLDS NO CARRY: the same cap a point's act is held to
-/// (`TurnEndTiming::outage_holds_until`, `outage_cap` from when the outage began) bounds a break's
+/// (`turn_end::outage_holds_until`, `outage_cap` from when the outage began) bounds a break's
 /// line, so a Down older than the cap, whether the host reads it afresh at the write or the loop
 /// read it at its last point, holds nothing and the first settled break carries the session
 /// (2026-10-26: Cruise never parks; a probe that reads Down while the agent's own requests get
@@ -1070,7 +1153,8 @@ fn a_measured_outage_holds_the_carry_until_its_return() {
 /// capped run carries nothing and fails at "a Down past its cap holds no carry".
 #[test]
 fn an_outage_past_its_cap_holds_no_carry() {
-    use crate::supervise::policy::turn_end::{Reach, TurnEndTiming};
+    use crate::supervise::policy::turn_end::Reach;
+    use alab_policy::config::TurnEndTiming;
     let cap = TurnEndTiming::default().outage_cap;
     let run = |age: Duration| {
         let host = Arc::new(DoorHost::default());
@@ -2340,7 +2424,7 @@ fn ledger_of(ledger: String) -> Earlier {
 /// the session lifted off Off. And a person's message after the restart starts the books again.
 #[test]
 fn a_restarted_loop_keeps_the_background_ladder() {
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, RULE_LEFT};
+    use alab_policy::words::{RULE_CONTINUE, RULE_LEFT};
     use approvals::Outcome::{Skipped, Typed, Waiting};
     // Six carries 2, 4, 8, 16 and 32 minutes apart, each answered short, the last 5 minutes
     // before the loop's start: the next waits the ladder's 60 minutes from it, to 55 minutes in.
@@ -2769,10 +2853,9 @@ fn a_limit_episode_past_its_reset_holds_no_carry() {
 /// 7ab54b4e39, and lost in the merge ff6b099179.)
 #[test]
 fn a_compactions_owed_continuation_is_typed_at_the_break() {
-    use crate::supervise::policy::go_ahead::{NEVER_A_NEED, unless_held};
-    use crate::supervise::policy::turn_end::{
-        GO_AHEAD_ACTS, RULE_COMPACT, Then, continuation_text,
-    };
+    use crate::supervise::policy::turn_end::{RULE_COMPACT, Then, continuation_text};
+    use alab_policy::go_ahead::{NEVER_A_NEED, unless_held};
+    use alab_policy::words::GO_AHEAD_ACTS;
     /// What else the break holds.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Also {
@@ -2800,7 +2883,10 @@ fn a_compactions_owed_continuation_is_typed_at_the_break() {
     // The shipped continuation, which says the go-ahead is no need (this harness's own is short).
     let cruise = |answers: bool| SupervisorConfig {
         answer_questions: answers,
-        continue_text: crate::supervise::config::CONTINUE_TEXT.to_string(),
+        turn_end: alab_policy::config::PolicyConfig {
+            continue_text: alab_policy::config::CONTINUE_TEXT.to_string(),
+            ..under(Autopilot::Cruise).turn_end.clone()
+        },
         ..under(Autopilot::Cruise)
     };
     let continuation = continuation_text(&cruise(true), None);
@@ -2840,7 +2926,7 @@ fn a_compactions_owed_continuation_is_typed_at_the_break() {
                 };
                 s.turn_end.acted(&compact, &reading, s.fx.mono());
                 if r.spent {
-                    let park = crate::supervise::policy::go_ahead::parked("", &PARKED.join("\n"))
+                    let park = alab_policy::go_ahead::parked("", &PARKED.join("\n"))
                         .expect("the existing positive go-ahead fixture");
                     for _ in 0..GO_AHEAD_ACTS {
                         s.turn_end.go_ahead_typed(&park, s.fx.mono());
@@ -3367,8 +3453,8 @@ fn a_turn_read_running_after_a_loops_first_carry_ends_no_ladder() {
 /// streak; a point judged, before its turn-ran row or alone; the books started again.
 #[test]
 fn the_books_walk_takes_each_rung_its_row_names() {
-    use crate::supervise::policy::cruise_carry::RULE_BACKGROUND_RESET;
-    use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
+    use alab_policy::cruise_carry::RULE_BACKGROUND_RESET;
+    use alab_policy::go_ahead::RULE_GO_AHEAD;
     use approvals::Outcome::{Typed, Waiting};
     let named = |min_ago: i64, rule: &str, streak: u32| {
         row_before(
@@ -3431,7 +3517,7 @@ fn the_books_walk_takes_each_rung_its_row_names() {
 /// streak and ends the run (`the_books_walk_takes_each_rung_its_row_names`).
 #[test]
 fn a_restart_takes_the_ladder_up_from_a_go_ahead_at_a_break() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
     let cfg = SupervisorConfig {
         answer_questions: true,
         ..under(Autopilot::Cruise)
@@ -3498,8 +3584,8 @@ fn a_restart_takes_the_ladder_up_from_a_go_ahead_at_a_break() {
 /// (`the_books_walk_takes_each_rung_its_row_names`).
 #[test]
 fn what_goes_in_the_carrys_place_names_its_streak() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
     use crate::supervise::policy::turn_end::{RULE_COMPACT, Then};
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
     let walk = |ran: &Ran| -> Vec<Option<u32>> {
         approvals::background_carries_in(&ran.ledger, Some("@s-1"))
             .into_iter()
@@ -3591,9 +3677,7 @@ fn sent(ran: &Ran) -> Vec<String> {
 /// up.
 #[test]
 fn a_break_that_parks_on_a_go_ahead_gets_the_owners_standing_go_ahead() {
-    use crate::supervise::policy::go_ahead::{
-        GO_AHEAD_ANSWER, RULE_GO_AHEAD, TOKEN_CLOSE, TOKEN_OPEN,
-    };
+    use alab_policy::go_ahead::{GO_AHEAD_ANSWER, RULE_GO_AHEAD, TOKEN_CLOSE, TOKEN_OPEN};
     let drawn = |_| waiting(PARKED);
     let cruise = Script {
         policy: SupervisorConfig {
@@ -3635,14 +3719,14 @@ fn a_break_that_parks_on_a_go_ahead_gets_the_owners_standing_go_ahead() {
     let carried = self::sent(&off);
     assert_eq!(
         carried,
-        vec![crate::supervise::policy::go_ahead::unless_held(BACKGROUND_CARRY, true).into_owned()],
+        vec![alab_policy::go_ahead::unless_held(BACKGROUND_CARRY, true).into_owned()],
         "{:#?}",
         off.writes()
     );
     assert!(
         carried
             .iter()
-            .all(|s| !s.contains(crate::supervise::policy::go_ahead::NEVER_A_NEED)),
+            .all(|s| !s.contains(alab_policy::go_ahead::NEVER_A_NEED)),
         "{carried:#?}"
     );
     let up = raised(&off);
@@ -3660,7 +3744,7 @@ fn a_break_that_parks_on_a_go_ahead_gets_the_owners_standing_go_ahead() {
 /// CONTROL: the need on one row, a pane wide enough.
 #[test]
 fn a_wrapped_park_at_a_break_gets_the_go_ahead_and_never_goes_up() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
     const NEED: &str = "NEEDS YOU: say \"rerun the checks\" so I can build and test my parser \
                         branch and push it to main with the small fix Claude Code needs.";
     const LAST: &str = "The suite runs in the background; the docs are next.";
@@ -3713,7 +3797,7 @@ fn a_wrapped_park_at_a_break_gets_the_go_ahead_and_never_goes_up() {
 /// break with no key of theirs get the go-ahead.
 #[test]
 fn a_persons_turn_ending_at_a_break_holds_the_hour() {
-    use crate::supervise::policy::go_ahead::{GO_AHEAD_ANSWER, unless_held};
+    use alab_policy::go_ahead::{GO_AHEAD_ANSWER, unless_held};
     let prompt = "❯ Commit it, but don't push until I say so.";
     let at_break = waiting_under(&[prompt, ""], PARKED);
     let live = live_under(&[prompt], "⏺ Committing.");
@@ -3763,8 +3847,8 @@ fn a_persons_turn_ending_at_a_break_holds_the_hour() {
 /// restated at the break gets the go-ahead at once.
 #[test]
 fn a_turn_the_harness_opened_ending_at_a_break_is_no_persons() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
-    let prompt = format!("❯ {}", crate::supervise::config::CONTINUE_TEXT);
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
+    let prompt = format!("❯ {}", alab_policy::config::CONTINUE_TEXT);
     let restated = ["The build is waiting only for your go-ahead to rerun the checks."];
     let at_break = waiting_under(&[&prompt, ""], &restated);
     let live = live_under(&[&prompt], "⏺ Committing.");
@@ -3805,7 +3889,7 @@ fn a_turn_the_harness_opened_ending_at_a_break_is_no_persons() {
 /// holds that break's go-ahead.
 #[test]
 fn a_key_older_than_the_breaks_turn_holds_nothing_past_its_own_hour() {
-    use crate::supervise::policy::go_ahead::{GO_AHEAD_ANSWER, unless_held};
+    use alab_policy::go_ahead::{GO_AHEAD_ANSWER, unless_held};
     let live = live_under(&[], "⏺ Checking the workflows.");
     let run = |tag: &str, late: i64| {
         let cfg = SupervisorConfig {
@@ -3860,7 +3944,7 @@ fn a_key_older_than_the_breaks_turn_holds_nothing_past_its_own_hour() {
 /// key, and the go-ahead goes at that next break.
 #[test]
 fn a_persons_key_during_background_work_holds_the_go_ahead() {
-    use crate::supervise::policy::go_ahead::{GO_AHEAD_ANSWER, unless_held};
+    use alab_policy::go_ahead::{GO_AHEAD_ANSWER, unless_held};
     let run = |tag: &str, keyed: bool| {
         let cfg = SupervisorConfig {
             answer_questions: true,
@@ -3903,7 +3987,7 @@ fn a_persons_key_during_background_work_holds_the_go_ahead() {
 /// so the carry goes, not the go-ahead.
 #[test]
 fn a_break_whose_turn_plans_an_outward_act_gets_the_carry_not_the_go_ahead() {
-    use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
+    use alab_policy::go_ahead::RULE_GO_AHEAD;
     let drawn = |_| {
         waiting_under(
             &[
@@ -3951,7 +4035,7 @@ fn a_break_whose_turn_plans_an_outward_act_gets_the_carry_not_the_go_ahead() {
 /// go-ahead.
 #[test]
 fn a_break_whose_plan_scrolled_off_gets_the_carry_not_the_go_ahead() {
-    use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
+    use alab_policy::go_ahead::RULE_GO_AHEAD;
     let run = |tag: &str, first: &'static str| {
         let mut lines: Vec<String> = ["❯ ship 0.145.0", "", first, ""]
             .map(ToString::to_string)
@@ -4068,7 +4152,7 @@ fn tall_parked_turn(first: &str) -> (Vec<String>, Vec<String>) {
 /// runs the other way: a plan in the first turn withholds no go-ahead from a plain second one.
 #[test]
 fn a_breaks_whole_read_is_its_own_turns() {
-    use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
+    use alab_policy::go_ahead::RULE_GO_AHEAD;
     let plan = "⏺ Plan: delete the stale release tags on the remote, then push my branch to main.";
     let plain = "⏺ Checked the parser; the suite is next.";
     let live = live_under(&[], "⏺ Checking the workflows.");
@@ -4154,7 +4238,7 @@ fn a_breaks_whole_read_is_its_own_turns() {
 /// that restates the park keeps its line off.
 #[test]
 fn a_break_that_judges_no_go_ahead_holds_back_no_persons_need() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
     let park = waiting(&[
         "Build started.",
         "NEEDS YOU: say \"go\" when you're back so",
@@ -4212,7 +4296,7 @@ fn a_break_that_judges_no_go_ahead_holds_back_no_persons_need() {
 /// where it would at a turn end (2026-10-29 review).
 #[test]
 fn a_break_that_asks_an_irreversible_step_gets_the_carry_not_the_go_ahead() {
-    use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
+    use alab_policy::go_ahead::RULE_GO_AHEAD;
     // The reader parks it (its force-push is negated), and the base reads an irreversible ask.
     let drawn = |_| {
         waiting(&[
@@ -4394,8 +4478,8 @@ fn a_line_held_for_the_go_ahead_stays_off_behind_the_hosts_line() {
 /// carry goes at the break between.
 #[test]
 fn a_break_that_parks_nothing_starts_the_go_ahead_count_again() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
-    use crate::supervise::policy::turn_end::GO_AHEAD_ACTS;
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
+    use alab_policy::words::GO_AHEAD_ACTS;
     let cfg = SupervisorConfig {
         answer_questions: true,
         ..under(Autopilot::Cruise)
@@ -4445,7 +4529,7 @@ fn a_break_that_parks_nothing_starts_the_go_ahead_count_again() {
 /// nothing gets no carry before the ladder's 60 minutes.
 #[test]
 fn a_go_ahead_at_a_break_waits_no_longer_than_at_a_point() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
     let cfg = SupervisorConfig {
         answer_questions: true,
         ..under(Autopilot::Cruise)
@@ -4502,8 +4586,8 @@ fn a_go_ahead_at_a_break_waits_no_longer_than_at_a_point() {
 /// Exhausting routine answers changes approach on the carry ladder without an owner alert.
 #[test]
 fn a_park_at_breaks_recovers_after_its_routine_answer_limit() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
-    use crate::supervise::policy::turn_end::GO_AHEAD_ACTS;
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
+    use alab_policy::words::GO_AHEAD_ACTS;
     let cfg = SupervisorConfig {
         answer_questions: true,
         ..under(Autopilot::Cruise)
@@ -4560,8 +4644,8 @@ fn a_park_at_breaks_recovers_after_its_routine_answer_limit() {
 /// The pacing interval remains in force after the routine answer budget is exhausted.
 #[test]
 fn a_spent_park_at_a_break_waits_for_recovery_without_alerting() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
-    use crate::supervise::policy::turn_end::GO_AHEAD_ACTS;
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
+    use alab_policy::words::GO_AHEAD_ACTS;
     let cfg = SupervisorConfig {
         answer_questions: true,
         ..under(Autopilot::Cruise)
@@ -4611,7 +4695,7 @@ fn a_spent_park_at_a_break_waits_for_recovery_without_alerting() {
 /// not recovery; a short answer that stands for an hour changes approach without alerting.
 #[test]
 fn a_break_after_an_hour_of_work_gets_the_go_ahead_again() {
-    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    use alab_policy::go_ahead::GO_AHEAD_ANSWER;
     let cfg = SupervisorConfig {
         answer_questions: true,
         ..under(Autopilot::Cruise)
@@ -4685,4 +4769,172 @@ pub(crate) fn observe_row_cruise_carry() -> &'static [&'static str] {
         &mut nothing,
     );
     &[BACKGROUND_CARRY, " enter"]
+}
+
+/// The measured error clear (Claude Code 2.1.323, m2, 2026-11-13; ids synthetic).
+const CLEARED_BY_ERROR: &str =
+    include_str!("../harness/testdata/goal/claude-2.1.323-transcript-goal-cleared-by-error.jsonl");
+
+/// The goal the window's host reads of `transcript` ([`crate::harness::goal::ClaudeGoal`]).
+fn goal_of(transcript: &str) -> crate::harness::goal::GoalRead {
+    let mut goal = crate::harness::goal::ClaudeGoal::default();
+    for line in transcript.lines() {
+        goal.line(line);
+    }
+    goal.read()
+}
+
+/// The breaks of one turn that ended on its background work, read at `at_s` under `autopilot`
+/// with the session's transcript reading `goal`, the books of a loop before this one `earlier`
+/// (taken up at the first read where not empty).
+fn goal_ran(
+    tag: &str,
+    autopilot: Autopilot,
+    goal: &crate::harness::goal::GoalRead,
+    at_s: &[i64],
+    earlier: (String, i64),
+) -> Ran {
+    let host = Arc::new(DoorHost::default());
+    *host.goal.lock().expect("goal") = goal.clone();
+    let drawn = |_| waiting(PLAIN);
+    let books = crate::supervise::test_scratch_path("goal-books", tag).join("s-1.jsonl");
+    let (ledger, start) = earlier.clone();
+    Script {
+        policy: under(autopilot),
+        drawn: &drawn,
+        host,
+        seed: Some(earlier),
+        virtual_time: true,
+        ..Script::new(tag, Occupancy::Observe, at_s)
+    }
+    .run(&mut |s, i| {
+        if i == 0 && !ledger.is_empty() {
+            s.seed_from_ledger_text(&books, &ledger, start, false);
+        }
+    })
+}
+
+/// The `/goal` lines a run typed.
+fn goals_sent(ran: &Ran) -> Vec<String> {
+    sent(ran)
+        .into_iter()
+        .filter(|s| s.starts_with("/goal "))
+        .collect()
+}
+
+/// T2 AT A BREAK: THE GOAL CLAUDE CODE CLEARED AFTER AN ERROR IS SET AGAIN WHERE CRUISE CARRIES.
+/// On 2026-11-13 every line the harness typed after the clear was the carry at a break of the
+/// agent's own background work, so a restore decided only at idle points never came. The measured
+/// error clear, folded as the window's host folds it, read at a settled break under Cruise:
+/// exactly `/goal <condition>` is typed in the carry's place, once, its row naming the clear it
+/// answers and its rung; the break's next carry is the carry. Negative controls: a person's `/goal
+/// clear` after the clear (the goal read off) gets the carry alone, and Off and Land type nothing.
+#[test]
+fn a_goal_cleared_by_an_error_is_set_again_at_a_background_break() {
+    use crate::harness::goal::GoalRead;
+    let lost = goal_of(CLEARED_BY_ERROR);
+    assert!(
+        matches!(&lost, GoalRead::Lost(l) if l.served),
+        "PRECONDITION: the fixture reads lost and served: {lost:?}"
+    );
+    let at = [0, 30, 10 * 60];
+    let ran = goal_ran(
+        "goal-break",
+        Autopilot::Cruise,
+        &lost,
+        &at,
+        (String::new(), T0),
+    );
+    let condition = "the account registry and automated account switching just works";
+    assert_eq!(
+        goals_sent(&ran),
+        [format!("/goal {condition}")],
+        "{:#?}",
+        ran.noted
+    );
+    assert_eq!(
+        sent(&ran),
+        [format!("/goal {condition}")],
+        "in the carry's place, and nothing over it while it is untaken"
+    );
+    assert!(
+        ran.ledger.contains(&format!(
+            "\"rule_id\":\"{}\"",
+            crate::supervise::policy::goal_restore::RULE_GOAL_RESTORE
+        )) && ran.ledger.contains(
+            "restore of goal clear: 00000000-0000-4000-8000-000000000005; restores in a row: 1"
+        ),
+        "{}",
+        ran.ledger
+    );
+
+    let person = format!(
+        "{CLEARED_BY_ERROR}{}",
+        include_str!("../harness/testdata/goal/claude-2.1.323-goal-clear-with-no-goal-set.jsonl")
+    );
+    let off = goal_of(&person);
+    assert_eq!(off, GoalRead::Off, "PRECONDITION: the person's clear");
+    let ran = goal_ran(
+        "goal-break-person",
+        Autopilot::Cruise,
+        &off,
+        &at,
+        (String::new(), T0),
+    );
+    assert!(goals_sent(&ran).is_empty(), "{:#?}", sent(&ran));
+    assert!(carries(&ran) >= 1, "the carry goes: {:#?}", sent(&ran));
+    for mode in [Autopilot::Off, Autopilot::Land] {
+        let ran = goal_ran("goal-break-mode", mode, &lost, &at, (String::new(), T0));
+        assert!(ran.writes().is_empty(), "{mode:?}: {:#?}", ran.writes());
+    }
+}
+
+/// ONCE PER CLEAR HOLDS ACROSS LOOPS: a loop that takes up the books of the loop that restored a
+/// clear (an aterm restart, an upgrade's relaunch, a re-attach) types no second restore of it, and
+/// its break gets the carry. Negative control: the same loop without those books restores it.
+#[test]
+fn a_later_loop_types_no_second_restore_of_a_clear() {
+    let lost = goal_of(CLEARED_BY_ERROR);
+    let before = goal_ran(
+        "goal-books-before",
+        Autopilot::Cruise,
+        &lost,
+        &[0, 30],
+        (String::new(), T0 - 5 * MIN),
+    );
+    assert_eq!(
+        goals_sent(&before).len(),
+        1,
+        "PRECONDITION: {:#?}",
+        sent(&before)
+    );
+    let restarted = goal_ran(
+        "goal-books-after",
+        Autopilot::Cruise,
+        &lost,
+        &[0, 10 * 60],
+        (before.ledger.clone(), T0),
+    );
+    assert!(
+        goals_sent(&restarted).is_empty(),
+        "{:#?} {:#?}",
+        sent(&restarted),
+        restarted.noted
+    );
+    assert!(
+        restarted
+            .noted
+            .iter()
+            .any(|n| n.contains("goal-restore@v1 restored once already")),
+        "the journal says why: {:#?}",
+        restarted.noted
+    );
+    let fresh = goal_ran(
+        "goal-books-none",
+        Autopilot::Cruise,
+        &lost,
+        &[0, 10 * 60],
+        (String::new(), T0),
+    );
+    assert_eq!(goals_sent(&fresh).len(), 1, "{:#?}", sent(&fresh));
 }

@@ -6,9 +6,10 @@
 use std::path::Path;
 use std::time::Duration;
 
+use alab_policy::config::Autopilot;
 use aterm_agent::supervise::occupancy::door::{self, Told};
 use aterm_agent::supervise::occupancy::wakes::{Atom, SourceAtom, Token, WakeReq};
-use aterm_agent::supervise::{Autopilot, Occupancy, SupervisorConfig};
+use aterm_agent::supervise::{Occupancy, SupervisorConfig};
 
 use super::*;
 use crate::scn::{Plan, scenarios};
@@ -128,7 +129,7 @@ fn its_scratch_aterm_toml_grants_prompt_under_cruise_with_continue_off() {
     ));
     assert!(notes.is_empty(), "{notes:?}");
     assert_eq!(cfg.occupancy, Occupancy::Prompt);
-    assert_eq!(cfg.autopilot, Autopilot::Cruise);
+    assert_eq!(cfg.turn_end.autopilot, Autopilot::Cruise);
     assert!(!cfg.continue_policy);
     assert_eq!(cfg.human_grace_s, 5);
     let (plain, _) =

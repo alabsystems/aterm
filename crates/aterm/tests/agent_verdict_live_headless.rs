@@ -54,7 +54,7 @@ fn status_until(
     let tree = headless_boot::process_tree(inst);
     panic!(
         "{what}: not within {within:?}; last status: {last}\nscreen:\n{screen}\n\
-         processes under the instance (pid ppid stat wchan etime command):\n{tree}"
+         processes under the instance (pid ppid stat command):\n{tree}"
     );
 }
 

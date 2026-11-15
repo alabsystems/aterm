@@ -356,7 +356,7 @@ fn vault_blockers_never_claim_usable_entries_or_reuse_a_previous_revision() {
             ServiceAvailability::Unknown,
         ),
         (
-            MaterializationBlocker::LocalFilesIncomplete,
+            MaterializationBlocker::ApplyIncomplete,
             ServiceAvailability::Unknown,
         ),
     ] {
@@ -928,7 +928,7 @@ fn unavailable_or_unsigned_membership_never_advertises_access() {
 
 #[test]
 fn an_actual_204_stays_historical_when_local_materialization_is_unavailable() {
-    use aterm_secrets::{age::Identity, fsx, materialize};
+    use aterm_secrets::{age::Identity, fsx};
 
     let fixture = VaultFixture::new();
     let paths = &fixture.paths;
@@ -973,15 +973,16 @@ fn an_actual_204_stays_historical_when_local_materialization_is_unavailable() {
         assert_eq!(unavailable.last_success_ms, None);
     }
     fsx::write_atomic(&state_path, state.as_bytes(), 0o600).unwrap();
-    let token_path = materialize::target_path(&paths.home, "token").unwrap();
-    let token = std::fs::read(&token_path).unwrap();
-    fsx::write_atomic(&token_path, b"locally-changed", 0o600).unwrap();
+    // A cache that is not the verified envelope is an incomplete store (`client::Paths`' `vault`).
+    let cache_path = paths.dir.join("vault");
+    let cache = std::fs::read(&cache_path).unwrap();
+    fsx::write_atomic(&cache_path, b"not the verified envelope", 0o600).unwrap();
     let incomplete = secrets(paths, now_ms + 20_000);
     assert_eq!(incomplete.availability, ServiceAvailability::Unknown);
     assert_eq!(incomplete.http204_response, Some(response));
     assert_eq!(incomplete.network_materialization, None);
     assert_eq!(incomplete.last_success_ms, None);
-    fsx::write_atomic(&token_path, &token, 0o600).unwrap();
+    fsx::write_atomic(&cache_path, &cache, 0o600).unwrap();
 
     let source_path = paths.dir.join("source.toml");
     let source = std::fs::read_to_string(&source_path).unwrap();

@@ -327,6 +327,7 @@ fn a_completed_cold_predecessor_keeps_the_new_asked_prepare_exact_across_lost_ac
                     login: None,
                     owner: None,
                     generation: "22".repeat(32),
+                    purpose: crate::harness::accounts_pool::Purpose::Select,
                 }),
             }
         ),
@@ -1083,6 +1084,7 @@ fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_wit
         login: Some("/selected-account".into()),
         owner: Some("work".into()),
         generation: "22".repeat(32),
+        purpose: crate::harness::accounts_pool::Purpose::Select,
     };
     let observed = SavedObservation {
         registration: Registration {
@@ -2029,6 +2031,7 @@ fn a_completed_token_forward_rolls_back_from_the_build_it_settled_on() {
             login: None,
             owner: Some("work".into()),
             entry: TokenEntry::parse("aterm-claude-token-ac-fedcba9876543210").unwrap(),
+            purpose: crate::harness::accounts_pool::Purpose::Select,
         }),
         ..planned()
     };
@@ -2230,8 +2233,13 @@ fn rollback_phase_checkpoint_failure_never_sends_precommit_or_commit() {
 #[test]
 fn passive_observation_refuses_symlinked_state_directories() {
     use super::super::native_observe::{ObservationBinding, Registration};
-    use super::observation::{Observed, read, save};
+    use super::observation::{Observed, Turn};
 
+    let read = |opts: &Opts, tab: &str| super::observation::read(&opts.state, tab);
+    let save = |opts: &Opts, tab: &str, observed: &Observed| {
+        let turn = Turn::take(&opts.state, tab).expect("no other observer of the record");
+        super::observation::save(&turn, observed)
+    };
     let dir = aterm_tempfile::tempdir().unwrap();
     let real_opts = opts(&dir.path().join("real"));
     let proc = Process::observe(std::process::id()).expect("actual test process");

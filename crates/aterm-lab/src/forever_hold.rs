@@ -3,7 +3,7 @@
 
 //! WHY LAND STILL HOLDS.
 
-use aterm_agent::supervise::policy::{land_check, turn_end};
+use alab_policy::land_check;
 
 use super::super::{at, word};
 use super::held::unstopped;
@@ -36,9 +36,9 @@ fn fields(s: &str) -> Option<[String; 3]> {
 /// The first land act (`land@v1`): its journal time and its ledger row's
 /// second.
 fn began(seen: &Seen) -> Option<(i64, Option<i64>)> {
-    let t = seen.acts(turn_end::RULE_LAND).first()?.0;
+    let t = seen.acts(alab_policy::words::RULE_LAND).first()?.0;
     let row = seen
-        .typed_row(turn_end::RULE_LAND, t)
+        .typed_row(alab_policy::words::RULE_LAND, t)
         .map(|r| r.ts.div_euclid(1000));
     Some((t, row))
 }
@@ -52,7 +52,7 @@ fn landed_after(seen: &Seen, t: i64) -> i64 {
 
 /// The nudges (`land-nudge@v1`) journaled after `from` and before `until`.
 fn nudges_between(seen: &Seen, from: i64, until: i64) -> usize {
-    seen.acts(turn_end::RULE_LAND_NUDGE)
+    seen.acts(alab_policy::words::RULE_LAND_NUDGE)
         .iter()
         .filter(|(t, _)| *t > from && *t < until)
         .count()
@@ -325,24 +325,27 @@ pub const DEFENSE: Legs = Legs {
 /// quote spells it: the list's items ([`land_check::listed_items`]) in the curly quotes the glass
 /// quotes in; `None` before such a nudge.
 fn listed_quote(seen: &Seen, t1: i64) -> Option<Vec<String>> {
-    seen.acts(turn_end::RULE_LAND_NUDGE)
+    seen.acts(alab_policy::words::RULE_LAND_NUDGE)
         .into_iter()
         .filter(|(t, _)| *t > t1)
         .find_map(|nudge| {
-            let text = seen.act_text(turn_end::RULE_LAND_NUDGE, nudge);
+            let text = seen.act_text(alab_policy::words::RULE_LAND_NUDGE, nudge);
             let list = listed_in_nudge(text)?;
             Some(list.split("; ").map(quoted).collect())
         })
 }
 
 /// The agent's list as a land nudge quotes it: after Land's nudge's opening
-/// (`land_check::LISTED_OPEN`) or its contradiction's (`turn_end::CONTRADICTED_LISTED`, slice 4c),
+/// (`land_check::LISTED_OPEN`) or its contradiction's (`alab_policy::words::CONTRADICTED_LISTED`, slice 4c),
 /// up to the closing quote mark, which the contradiction follows with its own words, not `.`.
 pub(crate) fn listed_in_nudge(text: &str) -> Option<&str> {
-    let after = [land_check::LISTED_OPEN, turn_end::CONTRADICTED_LISTED]
-        .into_iter()
-        .filter_map(|open| text.find(open).map(|i| &text[i + open.len()..]))
-        .next()?;
+    let after = [
+        land_check::LISTED_OPEN,
+        alab_policy::words::CONTRADICTED_LISTED,
+    ]
+    .into_iter()
+    .filter_map(|open| text.find(open).map(|i| &text[i + open.len()..]))
+    .next()?;
     let close = land_check::LISTED_CLOSE.trim_end_matches('.');
     Some(after.split_once(close)?.0)
 }
@@ -606,7 +609,7 @@ pub fn reworded(seen: &Seen, cx: &Ctx<'_>) -> Verdict {
                 .is_none_or(|(_, f)| open(f))
     };
     let second = seen
-        .acts(turn_end::RULE_LAND_CHECK)
+        .acts(alab_policy::land_check::RULE_LAND_CHECK)
         .iter()
         .filter(|(t, _)| *t > t1)
         .nth(1)

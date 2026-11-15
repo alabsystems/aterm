@@ -41,9 +41,11 @@ fn snapshot(paths: &Paths) -> Result<Value, Fail> {
         &View {
             me: me.clone(),
             presence: None,
-            // Synthetic snapshot: this view holds for no peer, as it applies no presence.
+            // Synthetic snapshot: this view holds for no peer, as it applies no presence, and
+            // reads no lab, so it ranks the synthetic account's claims first-come.
             held: Vec::new(),
             skewed: std::collections::BTreeMap::new(),
+            homes: None,
         },
         at,
     );
@@ -117,6 +119,8 @@ pub(super) fn write(
             .transpose()?
             .into_iter()
             .collect(),
+        // The probe reads no lab: its row ranks first-come.
+        ranks_homes: false,
     };
     aterm_db::accounts::claims::write(&paths, &row.to_value()).map_err(fail)?;
     snapshot(&paths)

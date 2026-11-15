@@ -34,18 +34,22 @@ fn inline(work: Box<dyn FnOnce() + Send>) -> io::Result<()> {
 
 /// The upkeep's effects with every sign-in run inline, each run of `claude auth login` ending
 /// as `ends` and each browser it is handed kept, and every line the ladder logs kept.
-struct Bench {
+pub(super) struct Bench {
     cooldown: Mutex<Option<Instant>>,
     rediscovery: Mutex<Rediscovery>,
-    guard: Arc<Mutex<AutoRenewGuard>>,
-    browser: bool,
+    pub(super) guard: Arc<Mutex<AutoRenewGuard>>,
+    pub(super) browser: bool,
     logged: Arc<Mutex<Vec<String>>>,
     handed: Arc<Mutex<Vec<RenewBrowser>>>,
     ends: Renewal,
+    /// The vault's sync: this machine is in none unless a test says so.
+    pub(super) vault_sync: fn(&Path, Option<&crate::harness::account_work::Scope>) -> Vault,
+    /// Which rows run on their vault token here: unknown unless a test says so.
+    pub(super) tokens_here: TokensRead,
 }
 
 impl Bench {
-    fn ending(ends: Renewal) -> Self {
+    pub(super) fn ending(ends: Renewal) -> Self {
         Self {
             cooldown: Mutex::new(None),
             rediscovery: Mutex::new(Rediscovery::default()),
@@ -54,6 +58,8 @@ impl Bench {
             logged: Arc::default(),
             handed: Arc::default(),
             ends,
+            vault_sync: |home, _scope| not_a_member(home),
+            tokens_here: |_, _, _, _| None,
         }
     }
 
@@ -71,14 +77,14 @@ impl Bench {
             rediscovery: &self.rediscovery,
             renew_guard: &self.guard,
             find_browser,
-            vault_sync: |home, _scope| not_a_member(home),
+            vault_sync: self.vault_sync,
             spawn_vault: &inline,
             default_check: |_: &Path, _scope| {
                 crate::harness::cli::LoginCheck::CouldNotRun(String::new())
             },
             mailbox: &ladder_mailbox_files,
             log: Arc::new(move |line: &str| logged.lock().unwrap().push(line.to_owned())),
-            save_oauth: |_, _| Ok("inert".into()),
+            tokens_here: self.tokens_here,
             shared: shared_renewal::Effects::default(),
             run_attempt: Some(Arc::new(move |browser: &RenewBrowser, _headless: bool| {
                 handed.lock().unwrap().push(browser.clone());
@@ -88,21 +94,21 @@ impl Bench {
     }
 
     /// One upkeep's sign-in pass at `now`: whether a sign-in started.
-    fn pass(&self, desk: &Desk, now: i64) -> bool {
+    pub(super) fn pass(&self, desk: &Desk, now: i64) -> bool {
         auto_renew_next_account(&desk.home, &desk.state, &desk.roster(), now, &self.fx())
     }
 
-    fn handed(&self) -> Vec<RenewBrowser> {
+    pub(super) fn handed(&self) -> Vec<RenewBrowser> {
         self.handed.lock().unwrap().clone()
     }
 
-    fn logged(&self) -> Vec<String> {
+    pub(super) fn logged(&self) -> Vec<String> {
         self.logged.lock().unwrap().clone()
     }
 
     /// Ends the 15-minute cooldown a started sign-in sets ([`AutoRenewPermit`]), so a pass
     /// that starts nothing is the ladder's own backoff holding.
-    fn cool(&self) {
+    pub(super) fn cool(&self) {
         self.guard.lock().unwrap().last_attempt.clear();
     }
 }
@@ -127,7 +133,7 @@ fn runs_signed_out(desk: &Desk, label: &str, at: i64) {
 /// A roster written by hand: the default login `main`, and `w3`, a row with an email and an
 /// empty login directory that a session here runs on, signed out ([`runs_signed_out`]), its desk
 /// browser profile named where `desk_browser` asks.
-fn hand_roster(desk: &Desk, desk_browser: bool) {
+pub(super) fn hand_roster(desk: &Desk, desk_browser: bool) {
     let store = desk.store();
     let w3_dir = store.logins_dir().join("w3");
     fs::create_dir_all(&w3_dir).unwrap();
@@ -156,7 +162,7 @@ fn hand_roster(desk: &Desk, desk_browser: bool) {
     runs_signed_out(desk, "w3", NOW - 60);
 }
 
-fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAttempt> {
+pub(super) fn attempt_of(desk: &Desk, label: &str) -> Option<accounts::SignInAttempt> {
     desk.store()
         .load_logins(NOW)
         .unwrap()
@@ -230,9 +236,7 @@ fn a_page_stop_holds_its_row_until_six_hours_or_a_persons_window() {
     stop(NOW);
     let restarted = aterm();
     assert!(!restarted.pass(&desk, NOW + 60), "a restart");
-    let secrets = desk.home.join(".secrets");
-    fs::create_dir_all(&secrets).unwrap();
-    fs::write(secrets.join("synced-from-the-vault"), "new").unwrap();
+    crate::vault_entry::seed(&desk.home, &[("synced-from-the-vault", b"new")]);
     assert!(!restarted.pass(&desk, NOW + 120), "a changed secret");
     restarted.guard.lock().unwrap().ladder.moved(Instant::now());
     assert!(!restarted.pass(&desk, NOW + 180), "a move");
@@ -1114,7 +1118,7 @@ fn an_unattended_run_is_handed_nothing_where_aterm_links_no_opener() {
 /// a row whose mailbox route ran and failed stays in its backoff: the rewrite delivered nothing.
 /// The vault's own bookkeeping, a rewrite of when it heard the vault or a new version that wrote
 /// nothing here, neither ends a row's backoff nor resets its step, so the next failure doubles
-/// it; a file the vault delivers to `~/.secrets` ends the backoff at once.
+/// it; an entry the vault delivers ends the backoff at once.
 ///
 /// Unix only, where aterm links the opener an unattended run's page is handed to
 /// (`cli::opener_link`); off Unix `an_unattended_run_is_handed_nothing_where_aterm_links_no_opener`
@@ -1131,18 +1135,24 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
             .join(crate::harness::open_url::DEFAULT_MAILBOX_DIR),
     )
     .unwrap();
+    // A real store this home administers; its subscriber's bookkeeping is the `heard` line of
+    // its `state.toml`, and a version that writes nothing here is a publication of the same
+    // entries.
+    crate::vault_entry::seed(&desk.home, &[("vault-fixture", b"fixture\n")]);
     let vault = desk.home.join(".config/aterm/secrets");
-    fs::create_dir_all(&vault).unwrap();
-    fs::write(vault.join("source.toml"), "# a vault member\n").unwrap();
-    let heard = |seq: u64, at: i64| {
+    let heard = |republish: bool, at: i64| {
+        if republish {
+            crate::vault_entry::seed(&desk.home, &[("vault-fixture", b"fixture\n")]);
+        }
         let state = vault.join("state.toml");
-        fs::write(
-            &state,
-            format!(
-                "membership = \"member\"\nseq = {seq}\ndigest = \"{seq:064x}\"\nheard = {at}\n"
-            ),
-        )
-        .unwrap();
+        let text = fs::read_to_string(&state).unwrap();
+        let mut lines: Vec<String> = text
+            .lines()
+            .filter(|line| !line.starts_with("heard = "))
+            .map(str::to_owned)
+            .collect();
+        lines.push(format!("heard = {at}"));
+        fs::write(&state, lines.join("\n") + "\n").unwrap();
         let later =
             std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(at).unwrap_or(0));
         fs::File::options()
@@ -1152,7 +1162,7 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
             .set_modified(later)
             .unwrap();
     };
-    heard(51, NOW);
+    heard(false, NOW);
     let bench = Bench::ending(Renewal::AuthFailed);
     assert!(bench.pass(&desk, NOW), "the mailbox route started");
     assert_eq!(bench.handed().len(), 1);
@@ -1161,13 +1171,13 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
         Some(accounts::AttemptOutcome::Failed)
     );
 
-    heard(51, NOW + 60);
+    heard(false, NOW + 60);
     bench.cool();
     assert!(
         !bench.pass(&desk, NOW + 60),
         "a rewrite of when it heard is no delivery"
     );
-    heard(52, NOW + 90);
+    heard(true, NOW + 90);
     bench.cool();
     assert!(
         !bench.pass(&desk, NOW + 90),
@@ -1192,16 +1202,16 @@ fn the_vaults_own_bookkeeping_never_ends_a_backoff_and_a_delivery_does() {
         "the step the bookkeeping left doubles the wait: {waits:?}"
     );
 
-    let secrets = desk.home.join(".secrets");
-    fs::create_dir_all(&secrets).unwrap();
-    fs::write(
-        secrets.join(crate::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-        "http_url = \"http://127.0.0.1:9/inbox\"\n",
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &desk.home,
+        &[(
+            crate::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            b"http_url = \"http://127.0.0.1:9/inbox\"\n",
+        )],
+    );
     assert!(
         bench.pass(&desk, NOW + 120),
-        "a delivered file ends the backoff and the sign-in cooldown"
+        "a delivered entry ends the backoff and the sign-in cooldown"
     );
     assert_eq!(bench.handed().len(), 3);
 }
@@ -1224,13 +1234,13 @@ fn a_row_only_a_credential_names_is_not_signed_in_before_a_session_needs_it() {
         "{\"oauthAccount\":{\"emailAddress\":\"sun.m27.3@example.test\"}}\n",
     )
     .unwrap();
-    let secrets = desk.home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
-    fs::write(
-        secrets.join(crate::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-        "[passwords]\n\"codex.m27.2@example.test\" = \"pw\"\n",
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &desk.home,
+        &[(
+            crate::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            b"[passwords]\n\"codex.m27.2@example.test\" = \"pw\"\n",
+        )],
+    );
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("discovered");
     assert_eq!(
         fleet_file_opt_in(&desk.fleet_file()),
@@ -1460,13 +1470,13 @@ fn the_upkeeps_run_is_handed_the_window_only_where_the_window_reads_the_rows_mai
 
     let desk = Desk::new("m30");
     hand_roster(&desk, false);
-    let secrets = desk.home.join(".secrets");
-    fs::create_dir_all(&secrets).unwrap();
-    fs::write(
-        secrets.join(crate::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-        "webmail_url = \"https://mail.example.test/inbox\"\npassword = \"a fixture's word\"\n",
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &desk.home,
+        &[(
+            crate::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            b"webmail_url = \"https://mail.example.test/inbox\"\npassword = \"a fixture's word\"\n",
+        )],
+    );
     let store = desk.store();
     assert!(has_configured_mailbox_for_row_with(
         &|_| None,
@@ -1560,16 +1570,26 @@ fn the_upkeep_opens_no_window_for_a_row_left_to_a_person() {
     ));
 }
 
-/// The log's line for a window's token step holds the row's label and no address: the token
-/// verb names the account to a person, and the upkeep's log is read by nobody who asked.
+/// The log's line for a token step after a sign-in holds the row's label and no address (the
+/// token verb names the account to a person, and the upkeep's log is read by nobody who asked),
+/// and says where the token was made: in the sign-in window, or on the row's headless profile.
+/// NEGATIVE CONTROL: with the line naming the window whatever the sign-in was, the headless
+/// step reads `made in the sign-in window`.
+#[cfg(unix)]
 #[test]
 fn the_token_steps_log_line_holds_no_address() {
+    use crate::harness::accounts_tokens::SignedIn;
     assert_eq!(
-        token_step_line("w3", "  \n"),
+        token_step_line("w3", SignedIn::Window, "  \n"),
         "w3: token: made in the sign-in window"
+    );
+    assert_eq!(
+        token_step_line("w3", SignedIn::Headless, ""),
+        "w3: token: made on its headless browser profile"
     );
     let line = token_step_line(
         "w3",
+        SignedIn::Headless,
         "aterm harness accounts token: a token for w3.m30.3@example.test is being made in \
          another tab\n",
     );

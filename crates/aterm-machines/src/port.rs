@@ -641,24 +641,9 @@ pub struct KeyboardMapChange {
     pub user: Option<Vec<(i64, i64)>>,
 }
 
-/// One look at this machine, read in this process with no child process: what `hello`'s vitals
-/// map ([`crate::facts::gather_vitals`]). Each OS reading is taken once, so every figure a hello
-/// carries from one of them comes from the same moment.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct MachineReading {
-    /// The logical cores ([`aterm_sysprobe::cpu_layout`]); `None` where the layout reads none.
-    pub cores: Option<u32>,
-    /// The 1-, 5- and 15-minute load averages ([`aterm_sysprobe::load_average`]).
-    pub load: Option<[f64; 3]>,
-    /// The memory classes ([`aterm_sysprobe::memory_detail`]): total, available, used, wired,
-    /// compressed, swap and pressure.
-    pub memory: Option<aterm_sysprobe::MemoryDetail>,
-    /// The GPU ([`aterm_sysprobe::gpu`]): its device utilization, name and core count.
-    pub gpu: Option<aterm_sysprobe::GpuReading>,
-    /// The volume holding the account's home, placed as admission places it
-    /// ([`aterm_capacity::reading::volume_of`]); `None` where no home was given or it is unread.
-    pub volume: Option<aterm_sysprobe::volumes::Reading>,
-}
+/// One look at this machine ([`aterm_capacity::host_vitals::Look`]): what `hello`'s vitals map
+/// ([`crate::facts::gather_vitals`]).
+pub use aterm_capacity::host_vitals::Look as MachineReading;
 
 /// A passive read of one keyboard service. An unreadable filter stays unknown rather
 /// than becoming an empty mapping or evidence that an earlier activation still holds.
@@ -1161,6 +1146,23 @@ pub trait System: Sync {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// Entry `name` of the secret store under `home`, read in place from its verified copy
+    /// (`aterm_secrets::client::read_in_place`): `Ok(None)` where no vault is configured, the
+    /// account is not in it, or it holds no such entry. No file under the home is opened, so a
+    /// file an older build wrote to `~/.secrets` neither supplies nor blocks a read. This
+    /// default, a test double's, holds no store.
+    ///
+    /// # Errors
+    /// The name is invalid or reserved, or the store's local state cannot be read.
+    fn vault_entry(
+        &self,
+        home: &Path,
+        name: &str,
+    ) -> io::Result<Option<aterm_secrets::SecretBytes>> {
+        let _ = (home, name);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// The file I/O of this account's record of aterm's own Command Line Tools ask
     /// ([`aterm_types::clt_mark`]), which System State's window reads and writes through the same
     /// code: this Mac's ([`aterm_types::clt_mark::Live`]) on the live system, a test double's own
@@ -1611,6 +1613,33 @@ pub struct Identity {
     pub os_version: String,
 }
 
+/// How many programs [`Live`]s started ([`Live::runs`]): every one, and those among them named
+/// `git`.
+#[derive(Debug, Default)]
+struct RunCounts {
+    all: std::sync::atomic::AtomicU64,
+    git: std::sync::atomic::AtomicU64,
+}
+
+impl RunCounts {
+    /// Count one start of `program`, the program the caller asked for (not the `sudo` a run as
+    /// another user goes through).
+    fn note(&self, program: &Path) {
+        use std::sync::atomic::Ordering;
+        self.all.fetch_add(1, Ordering::Relaxed);
+        if program.file_name() == Some(std::ffi::OsStr::new("git")) {
+            self.git.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The counts every [`Live::new`] of this process shares. A converge pass is one process whose
+/// rows each make a `Live` of their own, so what they started together is the pass's count.
+fn process_runs() -> std::sync::Arc<RunCounts> {
+    static RUNS: std::sync::OnceLock<std::sync::Arc<RunCounts>> = std::sync::OnceLock::new();
+    std::sync::Arc::clone(RUNS.get_or_init(Default::default))
+}
+
 /// The live operating system.
 #[derive(Debug, Clone)]
 pub struct Live {
@@ -1618,6 +1647,9 @@ pub struct Live {
     pub agent_exe: PathBuf,
     /// What [`System::full_disk_access`] answers: the runner's own measurement.
     full_disk_access: Option<bool>,
+    /// The programs this port started ([`Live::runs`]), counted with every other [`Live::new`]
+    /// of this process.
+    runs: std::sync::Arc<RunCounts>,
     /// The loopback origins [`System::download`] reads from in a test, instead of github.com.
     #[cfg(test)]
     release_origins: Option<aterm_update_core::github_rest::Origins>,
@@ -1630,9 +1662,44 @@ impl Live {
         Self {
             agent_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/nonexistent")),
             full_disk_access: None,
+            runs: process_runs(),
             #[cfg(test)]
             release_origins: None,
         }
+    }
+
+    /// How many programs this process's [`Live`]s have started, and how many of those were
+    /// named `git`: one for each [`System::run`], [`System::run_complete_stdout`],
+    /// [`System::run_complete_output`], [`System::run_complete_stdout_input`],
+    /// [`System::run_repository`], [`System::run_fed`] and [`System::run_tty`], counted as the
+    /// run's child command is built, once its argv was admitted. So a run that fails or is
+    /// refused after that and before its child starts (its stdin file not opened, a pipe or a
+    /// staging file not made, a stop seen just before the spawn) is counted, as is one whose
+    /// spawn failed; one refused before it (its argv not admitted, a stop seen first) is not. A
+    /// child started detached ([`System::spawn_detached`], [`System::stage_detached`]), a
+    /// relay's runs and a child a caller starts without this port are not counted.
+    #[must_use]
+    pub fn runs(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.runs.all.load(Ordering::Relaxed),
+            self.runs.git.load(Ordering::Relaxed),
+        )
+    }
+
+    /// This port counting its starts apart from every other `Live`'s, so a test reads its own.
+    #[cfg(test)]
+    pub(crate) fn counting_apart(mut self) -> Self {
+        self.runs = Default::default();
+        self
+    }
+
+    /// `cmd`'s child as each waited run but [`System::run_tty`]'s starts it ([`fixed_command`]
+    /// over `program` and `args`, which [`Self::argv`] made of it), counted once
+    /// ([`Self::runs`]).
+    fn command(&self, cmd: &Cmd, program: &Path, args: &[OsString]) -> aterm_uds::spawnfd::Command {
+        self.runs.note(&cmd.program);
+        fixed_command(program, args, &self.child_env(cmd), cmd.cwd.as_deref())
     }
 
     /// The release-asset reader [`System::download`] reads through: one per read, so each read
@@ -1771,7 +1838,7 @@ impl Live {
                 .open(staged.path())
                 .map_err(failed)
         };
-        let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
+        let mut child = self.command(cmd, &program, &args);
         let stdin = open_stdin_file(cmd.stdin.as_deref())?;
         child
             .process_group(0)
@@ -2095,7 +2162,7 @@ fn complete_capture(live: &Live, cmd: &Cmd, streams: CompleteStreams) -> Result<
     }
     live.capture_current()?;
     let (program, args) = live.argv(cmd)?;
-    let mut child = fixed_command(&program, &args, &live.child_env(cmd), cmd.cwd.as_deref());
+    let mut child = live.command(cmd, &program, &args);
     let stdin = open_stdin_file(cmd.stdin.as_deref())?;
     let capture = match streams {
         CompleteStreams::Stdout => aterm_uds::deadline::output_until_complete_stdout_from_unless,
@@ -2128,7 +2195,7 @@ impl System for Live {
         }
         self.capture_current()?;
         let (program, args) = self.argv(cmd)?;
-        let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
+        let mut child = self.command(cmd, &program, &args);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut parser = crate::repository_progress::GitProgress::default();
@@ -2302,7 +2369,7 @@ impl System for Live {
         }
         self.capture_current()?;
         let (program, args) = self.argv(cmd)?;
-        let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
+        let mut child = self.command(cmd, &program, &args);
         let stdin = open_stdin_file(cmd.stdin.as_deref())?;
         let deadline = deadline_after(cmd.budget);
         match aterm_uds::deadline::output_until_from_unless(
@@ -2356,6 +2423,7 @@ impl System for Live {
                 )));
             }
             let (program, args) = self.argv(&cmd)?;
+            self.runs.note(&cmd.program);
             let mut child = aterm_uds::spawnfd::command(&program);
             for (key, value) in &cmd.env {
                 child.env(key, value);
@@ -2386,7 +2454,7 @@ impl System for Live {
         }
         self.capture_current()?;
         let (program, args) = self.argv(cmd)?;
-        let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
+        let mut child = self.command(cmd, &program, &args);
         let (reader, mut writer) =
             aterm_uds::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
         writer
@@ -2595,6 +2663,18 @@ impl System for Live {
         private: bool,
     ) -> io::Result<Vec<u8>> {
         read_owned_file::read_scoped(path, uid, max, private)
+    }
+
+    fn vault_entry(
+        &self,
+        home: &Path,
+        name: &str,
+    ) -> io::Result<Option<aterm_secrets::SecretBytes>> {
+        aterm_secrets::client::read_in_place(
+            &aterm_secrets::client::Paths::locate_for_home(home),
+            name,
+        )
+        .map_err(|why| io::Error::other(why.to_string()))
     }
 
     fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
@@ -3052,18 +3132,7 @@ impl System for Live {
     }
 
     fn machine_reading(&self, home: Option<&Path>) -> Option<MachineReading> {
-        let memory = aterm_sysprobe::memory_detail();
-        Some(MachineReading {
-            cores: u32::try_from(aterm_sysprobe::cpu_layout().logical_cores())
-                .ok()
-                .filter(|n| *n > 0),
-            load: aterm_sysprobe::load_average(),
-            memory,
-            gpu: aterm_sysprobe::gpu(),
-            volume: home.and_then(|home| {
-                aterm_capacity::reading::volume_of(home, &aterm_sysprobe::volumes::table()).ok()
-            }),
-        })
+        Some(MachineReading::now(home))
     }
 
     fn running_app(&self) -> Option<PathBuf> {
@@ -3379,6 +3448,11 @@ mod fake {
         /// held the update boundary ([`Fake::guarded_renames`]).
         guarded_renames: Mutex<Vec<PathBuf>>,
         files: Mutex<BTreeMap<PathBuf, (Vec<u8>, u32)>>,
+        /// The entries each home's secret store holds ([`Fake::vault_set`]), read in place by
+        /// [`System::vault_entry`]: a stand-in for the verified store, never a file.
+        vault: Mutex<BTreeMap<(PathBuf, String), Vec<u8>>>,
+        /// What every [`System::vault_entry`] answers instead ([`Fake::vault_unreadable`]).
+        vault_error: Mutex<Option<io::ErrorKind>>,
         runtime_refusals: Mutex<BTreeMap<PathBuf, String>>,
         stats: Mutex<BTreeMap<PathBuf, Stat>>,
         file_ids: Mutex<BTreeMap<PathBuf, FileId>>,
@@ -3457,6 +3531,9 @@ mod fake {
         /// What a [`System::sleep`] does besides recording itself ([`Fake::on_sleep`]).
         on_sleep: Mutex<Option<SleepHook>>,
         on_owned_read: Mutex<Option<OwnedReadHook>>,
+        /// What runs after each [`System::vault_entry`] read copied its value
+        /// ([`Fake::on_vault_read`]), with the entry's name.
+        on_vault_read: Mutex<Option<VaultReadHook>>,
         on_chown: Mutex<Option<OwnedReadHook>>,
         app_check: Mutex<Option<AppCheckHook>>,
         /// What [`System::low_data_mode`] answers: unknown unless a test sets it.
@@ -3513,6 +3590,7 @@ mod fake {
 
     type SleepHook = Arc<dyn Fn(&Fake, std::time::Duration) + Send + Sync>;
     type OwnedReadHook = Arc<dyn Fn(&Fake, &Path) + Send + Sync>;
+    type VaultReadHook = Arc<dyn Fn(&Fake, &str) + Send + Sync>;
     type AppCheckHook =
         Arc<dyn Fn(&Fake, &Path) -> Result<(), aterm_keeper::identity::CheckError> + Send + Sync>;
 
@@ -3718,6 +3796,13 @@ mod fake {
             self
         }
 
+        /// Interleave a store change after a [`System::vault_entry`] read copied its value; the
+        /// hook is given the entry's name.
+        pub fn on_vault_read(&self, hook: impl Fn(&Fake, &str) + Send + Sync + 'static) -> &Self {
+            *self.on_vault_read.lock().unwrap() = Some(Arc::new(hook));
+            self
+        }
+
         /// Interleave another filesystem owner after a real ownership operation.
         pub fn on_chown(&self, hook: impl Fn(&Fake, &Path) + Send + Sync + 'static) -> &Self {
             *self.on_chown.lock().unwrap() = Some(Arc::new(hook));
@@ -3787,6 +3872,32 @@ mod fake {
                 terminal: true,
                 ..Self::default()
             }
+        }
+
+        /// Put entry `name` with `bytes` in the secret store under `home`
+        /// ([`System::vault_entry`]).
+        pub fn vault_set(&self, home: impl AsRef<Path>, name: &str, bytes: &[u8]) -> &Self {
+            self.vault.lock().unwrap().insert(
+                (home.as_ref().to_path_buf(), name.to_owned()),
+                bytes.to_vec(),
+            );
+            self
+        }
+
+        /// Take entry `name` out of the secret store under `home`.
+        pub fn vault_remove(&self, home: impl AsRef<Path>, name: &str) -> &Self {
+            self.vault
+                .lock()
+                .unwrap()
+                .remove(&(home.as_ref().to_path_buf(), name.to_owned()));
+            self
+        }
+
+        /// Make every [`System::vault_entry`] fail with `kind`: a store whose local state cannot
+        /// be read.
+        pub fn vault_unreadable(&self, kind: io::ErrorKind) -> &Self {
+            *self.vault_error.lock().unwrap() = Some(kind);
+            self
         }
 
         /// Return the next deterministic scratch path without allocating it.
@@ -5193,6 +5304,27 @@ mod fake {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             self.read_owned_file(path, uid, max, private)
+        }
+
+        fn vault_entry(
+            &self,
+            home: &Path,
+            name: &str,
+        ) -> io::Result<Option<aterm_secrets::SecretBytes>> {
+            if let Some(kind) = *self.vault_error.lock().unwrap() {
+                return Err(kind.into());
+            }
+            let value = self
+                .vault
+                .lock()
+                .unwrap()
+                .get(&(home.to_path_buf(), name.to_owned()))
+                .map(|bytes| aterm_secrets::SecretBytes::new(bytes.clone()));
+            let hook = self.on_vault_read.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(self, name);
+            }
+            Ok(value)
         }
 
         fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {

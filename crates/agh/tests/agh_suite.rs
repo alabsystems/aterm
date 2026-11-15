@@ -38,7 +38,6 @@ mod hop;
 #[cfg(unix)]
 mod identity_files;
 #[cfg(unix)]
-mod import_gh;
 mod inline_source;
 #[cfg(unix)]
 mod intents_cli;

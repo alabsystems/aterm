@@ -53,3 +53,35 @@ fn a_row_is_read_only_for_its_exact_identity() {
     );
     assert_eq!(id.read("release_line alive=0 data=%7B%7D"), None);
 }
+
+#[test]
+fn the_registry_is_in_the_harness_state_folder_and_a_relative_one_is_no_registry() {
+    let state = std::path::PathBuf::from("/state/aterm");
+    assert_eq!(
+        registry_from(None, Some(state.clone())),
+        Some(state.join("harness/claude-harness/release-lines"))
+    );
+    assert_eq!(
+        registry_from(Some("/elsewhere/harness".into()), Some(state.clone())),
+        Some(std::path::PathBuf::from("/elsewhere/harness/release-lines"))
+    );
+    // Negative controls: a relative override names no folder and is not replaced by the
+    // default, and no state root is no registry.
+    assert_eq!(registry_from(Some("harness".into()), Some(state)), None);
+    assert_eq!(registry_from(None, None), None);
+}
+
+#[test]
+fn a_record_name_ends_with_its_identity_whatever_the_version() {
+    let id = identity();
+    assert_eq!(
+        id.record_name("0.200.0"),
+        "0.200.0-79550-3306349674200.json"
+    );
+    assert!(id.record_name("1.0.0").ends_with(&id.record_suffix()));
+    let other = Identity {
+        start: id.start + 1,
+        ..id.clone()
+    };
+    assert!(!other.record_name("0.200.0").ends_with(&id.record_suffix()));
+}

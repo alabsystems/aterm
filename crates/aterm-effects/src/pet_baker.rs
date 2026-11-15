@@ -59,6 +59,23 @@ pub const EYE_DOT_ROUND_ASPECT_MAX: f32 = 1.4;
 /// Smallest grown open-eye diameter that carries a reflection: the far eye at 34–36 px (~3 px) clears it; tiny 1× eyes keep a plain dot.
 pub const EYE_REFLECTION_MIN_PX: f32 = 2.4;
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of the shallow eye's open curve: a shallow eye gets the open eye's
+    /// solid core plug, as before.
+    pub static SHALLOW_EYE_PLUG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a shallow eye gets the core plug ([`SHALLOW_EYE_PLUG`], tests only).
+#[inline]
+fn shallow_plug_on() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    if SHALLOW_EYE_PLUG.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
+}
+
 /// Primary catch-light radius as a fraction of the grown eye's smaller diameter, bounded in device pixels: the floor survives 4×4 coverage at ship size, the ceiling stops a headlamp.
 pub const EYE_REFLECTION_PRIMARY_FRAC: f32 = 0.13;
 pub const EYE_REFLECTION_PRIMARY_MIN_PX: f32 = 0.55;
@@ -218,7 +235,7 @@ fn paint_eye_dots(
     col: (f32, f32, f32),
     alpha: f32,
     xform: PathTransform,
-    reflections: bool,
+    (reflections, curved_lids): (bool, bool),
     eye_mask: &mut Option<Tile>,
 ) {
     let bounds = &eye_meta.bounds[..eye_meta.paths.len()];
@@ -324,7 +341,13 @@ fn paint_eye_dots(
             );
         }
         let gx = anchor_x + (cx - anchor_x) * kx;
-        {
+        // The flier's glide (`curved_lids`) draws a shallow eye (its blink's ‿, its delight's ^)
+        // as its curve, grown to its dash height: a plug at its middle filled the hollow under
+        // the ^ and over the ‿ and turned both into one dark slab, a scowl, so a face change,
+        // the glide's only reaction, could not be told at ship size (`pet_art_quality`'s
+        // `the_glide_faces_read_apart_at_ship_size`). Every other pose keeps the plug, its
+        // eye's dark core (`face_lod_keeps_a_dark_eye_core_at_ship_size`).
+        if !(shallow && curved_lids) || shallow_plug_on() {
             let allowed_w = allowed_w.max(core_min_w_px);
             let plug_w = EYE_DASH_CORE_PX.min(w_px * kx).min(allowed_w);
             let plug_h = EYE_DASH_CORE_PX.min(h_px * ky);
@@ -483,7 +506,17 @@ fn paint_pose_onto(
         }
         let (col, alpha) = resolve_layer(layer, fills);
         if face_lod && layer.role == GlyphRole::Eye {
-            paint_eye_dots(tile, eye_meta, col, alpha, xform, reflections, eye_mask);
+            // The glide's lids keep their curve ([`paint_eye_dots`]'s `curved_lids`).
+            let curved_lids = crate::kitty_pet::glide_species(pose).is_some();
+            paint_eye_dots(
+                tile,
+                eye_meta,
+                col,
+                alpha,
+                xform,
+                (reflections, curved_lids),
+                eye_mask,
+            );
             continue;
         }
         if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {

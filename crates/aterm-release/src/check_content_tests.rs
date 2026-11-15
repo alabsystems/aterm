@@ -41,7 +41,15 @@ fn a_test_only_edit_moves_only_the_bounded_check_inputs() {
     let before = plan(&base, "context-a");
     let after = plan(&hop, "context-a");
     assert_ne!(before.input("test").key, after.input("test").key);
-    for undeclared in ["fmt", "lint", "doc", "census", "forge", "libc", "spec"] {
+    for undeclared in [
+        "candidate-shim",
+        "fmt",
+        "lint",
+        "census",
+        "forge",
+        "libc",
+        "spec",
+    ] {
         assert!(!before.input(undeclared).bounded(), "{undeclared}");
         assert!(!after.input(undeclared).bounded(), "{undeclared}");
     }
@@ -77,7 +85,15 @@ fn a_fixture_change_moves_the_test_input_without_pretending_it_is_source() {
     let before = plan(&base, "context");
     let after = plan(&hop, "context");
     assert_ne!(before.input("test").key, after.input("test").key);
-    for undeclared in ["fmt", "lint", "doc", "census", "forge", "libc", "spec"] {
+    for undeclared in [
+        "candidate-shim",
+        "fmt",
+        "lint",
+        "census",
+        "forge",
+        "libc",
+        "spec",
+    ] {
         assert!(!before.input(undeclared).bounded(), "{undeclared}");
         assert!(!after.input(undeclared).bounded(), "{undeclared}");
     }

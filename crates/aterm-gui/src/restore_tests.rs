@@ -439,6 +439,7 @@ fn a_restore_write_fault_says_whether_its_cause_passes() {
 
 fn terminal(id: Option<u64>, title: &str) -> RestoredSplitTree {
     RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+        pinned: false,
         sid: None,
         lineage: None,
         log_ep: None,
@@ -2038,6 +2039,7 @@ fn a_leaf_names_its_session_and_lineage_and_older_peers_read_past_them() {
         workers_in_front: false,
         restored_tabs: vec![RestoredTab {
             root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                pinned: false,
                 sid,
                 lineage,
                 log_ep: None,
@@ -3939,4 +3941,27 @@ fn held_codex_resume_line_at_routes_off_recorded_limited_or_unenrolled_row() {
         )),
         "unenrolled default row `main` routes onto serving `work`"
     );
+}
+
+/// A restore leaf carries its tab's ID in either form: the `s-` ID a tab opened before the `t`
+/// form keeps, and a `t` ID; a malformed ID of either form is never carried.
+#[test]
+fn a_leaf_carries_a_tab_id_in_either_form() {
+    for kept in ["s-1a2b3c4d5e6f70819203", "tqn5r6e0148", "t0000000000"] {
+        assert!(carried_sid(kept), "{kept}");
+    }
+    for malformed in [
+        "",
+        "s-",
+        "s-../x",
+        "S-1a2b",
+        "t",
+        "t000000000",
+        "t00000000000",
+        "T0000000000",
+        "tqn5r6e014u",
+        "tQN5R6E0148",
+    ] {
+        assert!(!carried_sid(malformed), "{malformed}");
+    }
 }

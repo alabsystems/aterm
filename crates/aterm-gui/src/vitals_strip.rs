@@ -30,11 +30,10 @@ pub(super) const TAIL_FILE: &str = "tail.jsonl";
 /// Where a build before the append-only checkpoint kept the strip, whole, at schema 1: it restores
 /// nothing (record §9) and goes at the first base written.
 pub(super) const LEGACY_FILE: &str = "vitals-strip.json";
-/// Schema 2: time-weighted buckets, seven hours of ten-minute ones (`LONG_BUCKETS` 43), and a
-/// Processes ring that holds starts where a start counter reads.
-pub(super) const STRIP_SCHEMA: u32 = 2;
+/// Schema 3: preserves scope coverage and raw CPU charge alongside the primary CPU figures.
+pub(super) const STRIP_SCHEMA: u32 = 3;
 /// The bound a base is read under; a full one is held under 85 % of it by a test.
-pub(super) const STRIP_MAX_BYTES: u64 = 1024 * 1024;
+pub(super) const STRIP_MAX_BYTES: u64 = STRIP_RINGS as u64 * 64 * 1024;
 /// The bound a tail is read under: four hours of lines at their fullest. A base is written
 /// hourly, so only an hourly base that cannot be written lets a tail grow past an hour's, and an
 /// append never takes it past this bound ([`StripStore::keep`]).
@@ -539,11 +538,14 @@ pub(super) fn base_json(strip: &SavedStrip, generation: u64) -> Option<String> {
     aterm_json::to_string(&doc).ok()
 }
 
-/// The base in `text` and its generation; `None` unless it parses at [`STRIP_SCHEMA`] with a
-/// reading.
+/// The base in `text` and its generation. Schema 2 retains its measured history with explicitly
+/// unknown scope coverage; schema 3 reads that coverage directly.
 pub(super) fn base_of(text: &str) -> Option<(u64, SavedStrip)> {
     let doc: BaseDoc = aterm_json::from_str(text).ok()?;
-    if doc.schema != STRIP_SCHEMA || doc.last_wall_ms <= 0 {
+    let old_coverage = doc.schema == 2 && doc.rings.len() == 17;
+    if !(old_coverage || doc.schema == STRIP_SCHEMA && doc.rings.len() == STRIP_RINGS)
+        || doc.last_wall_ms <= 0
+    {
         return None;
     }
     let mut strip = SavedStrip {
@@ -560,6 +562,9 @@ pub(super) fn base_of(text: &str) -> Option<(u64, SavedStrip)> {
         if let Some(dst) = strip.ring_mut(slot) {
             *dst = ring.into_saved();
         }
+    }
+    if old_coverage {
+        strip.mark_scope_coverage_unknown();
     }
     Some((doc.generation, strip))
 }

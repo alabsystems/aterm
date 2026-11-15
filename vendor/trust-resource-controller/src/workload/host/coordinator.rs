@@ -317,7 +317,7 @@ impl Plan {
             _ => Err(invalid()),
         };
         let bytes = hex
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|pair| Ok((digit(pair[0])? << 4) | digit(pair[1])?))
             .collect::<io::Result<Vec<_>>>()?;
         Self::decode(&bytes)

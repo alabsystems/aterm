@@ -6,7 +6,6 @@
 use std::sync::Mutex;
 
 use super::*;
-use crate::supervise::config::Autopilot;
 use crate::supervise::occupancy::fault::{self, Fault};
 use crate::supervise::occupancy::templates;
 use crate::supervise::occupancy::wakes::WakeBook;
@@ -16,7 +15,9 @@ use crate::supervise::occupancy::{
     SaidReadyIdle, SaidVerdict, SaidWake, SlotsSeen, WakeClaim, WakeDoor, WakeFacts, WakeSeen,
     WakesSeen,
 };
-use crate::supervise::policy::turn_end::{HostTurn, RULE_LAND};
+use crate::supervise::policy::turn_end::HostTurn;
+use alab_policy::config::Autopilot;
+use alab_policy::words::RULE_LAND;
 
 const NUDGE: &str = "wait-nudge@v1";
 const ROOM: &str = "hold-room@v1";
@@ -94,6 +95,13 @@ struct DoorHost {
     reach: Mutex<crate::supervise::policy::turn_end::Reach>,
     /// The needs the loop last told the host stand ([`IdleHost::needs_standing`]), whole.
     standing: Mutex<Vec<String>>,
+    /// The session's `/goal` as its transcript reads ([`IdleHost::goal`]).
+    goal: Mutex<crate::harness::goal::GoalRead>,
+    /// The agent's transcript as the host reads it ([`IdleHost::transcript_tail`]); `None`, none.
+    tail: Mutex<Option<String>>,
+    /// When the agent's process started ([`IdleHost::agent_started`], unix seconds); `None`,
+    /// unread.
+    started: Mutex<Option<i64>>,
 }
 
 impl DoorHost {
@@ -149,6 +157,18 @@ impl IdleHost for DoorHost {
     }
     fn needs_standing(&self, needs: &[String], _entry: &str) {
         *self.standing.lock().expect("standing") = needs.to_vec();
+    }
+    fn transcript_tail(&self) -> Option<String> {
+        self.tail.lock().expect("tail").clone()
+    }
+    fn agent_started(&self) -> Option<i64> {
+        *self.started.lock().expect("started")
+    }
+    fn login_seen(&self, seen: crate::supervise::policy::turn_end::LoginSeen) {
+        self.called(format!("login_seen:{seen:?}"));
+    }
+    fn login_served_at(&self, at: i64) {
+        self.called(format!("login_served_at:{at}"));
     }
     fn taskless(&self) -> bool {
         self.taskless.load(Ordering::SeqCst)
@@ -264,6 +284,9 @@ impl IdleHost for DoorHost {
     }
     fn launch(&self) -> Option<i64> {
         self.launch
+    }
+    fn goal(&self) -> crate::harness::goal::GoalRead {
+        self.goal.lock().expect("goal").clone()
     }
     fn task_fact(&self, word: Option<FactWord>) -> NoteOutcome {
         self.called(format!(
@@ -540,7 +563,8 @@ enum Step {
     /// The loop came back to it afresh, as after a lost call rode out: the break's start is read
     /// again from it.
     Again,
-    /// Read under Off: a live turn is still taken, the break's steps skipped.
+    /// Read under Off: a live turn is still taken and its login watched, the break's steps
+    /// skipped ([`Session::background_steps`]).
     Off,
     /// The break's steps run on it and a call among them is lost ([`Fail::Lost`]), which the loop
     /// rides out: it comes back to the read after it afresh, so a test steps that one
@@ -652,13 +676,16 @@ impl<'a> Script<'a> {
                 let screen = s.screen().expect("the break's read");
                 s.clock_marks = Some((s.fx.mono(), at_ms));
                 let step = (self.steps)(i);
-                match step {
-                    Step::Off => continue,
-                    Step::Again => since = None,
-                    Step::Stepped | Step::Lost => {}
+                if step == Step::Again {
+                    since = None;
                 }
-                let stepped =
-                    s.host_steps_in_background(&screen, &mut since, Some(&self.policy), &mut heard);
+                let stepped = s.background_steps(
+                    &screen,
+                    &mut since,
+                    step == Step::Off,
+                    Some(&self.policy),
+                    &mut heard,
+                );
                 if step == Step::Lost {
                     assert!(
                         matches!(stepped, Err(Fail::Lost(_))),
@@ -1100,7 +1127,7 @@ fn each_guard_holds_the_due_line_and_nothing_is_written() {
                 ..Script::new(&tag, occupancy, &[0, 31 * 60])
             };
             if let Some(autopilot) = case.autopilot {
-                script.policy.autopilot = autopilot;
+                script.policy.turn_end.autopilot = autopilot;
             }
             script.run(&mut |s, _| (case.session)(s))
         };
@@ -2087,7 +2114,7 @@ fn a_fact_row_closes_no_remembered_wall() {
     let reason = approvals::wall_wait_reason(
         Some(TEST_NOW + 3600),
         Some("3pm"),
-        aterm_phase::WallKind::UsageSession,
+        alab_policy::vocab::WallKind::UsageSession,
         "Session limit reached",
     );
     let wall = approvals::Row {
@@ -2149,7 +2176,7 @@ fn first_ready_idle(ran: &Ran) -> Option<&OccupancySaid> {
 fn a_due_line_held_k_looks_is_said_ready_idle_under_prompt_alone() {
     let run = |occupancy| {
         let mut script = Script::new("write-k-land", occupancy, &minutely(31, 42));
-        script.policy.autopilot = Autopilot::Land;
+        script.policy.turn_end.autopilot = Autopilot::Land;
         script.run(&mut nothing)
     };
     let ran = run(Occupancy::Prompt);
@@ -2290,7 +2317,7 @@ fn a_successor_says_the_carried_line_ready_idle_when_its_predecessor_would_have(
             seed,
             ..Script::new(tag, Occupancy::Prompt, at_s)
         };
-        script.policy.autopilot = Autopilot::Land;
+        script.policy.turn_end.autopilot = Autopilot::Land;
         script.run(&mut nothing)
     };
     let first = land("write-k-first", &minutely(31, 36), None);
@@ -2419,7 +2446,7 @@ fn a_successor_counts_a_crashed_line_from_its_intent_and_a_typed_one_not_at_all(
             seed: Some((stamped(body, T0 + 31 * MIN), T0 + 35 * MIN)),
             ..Script::new(tag, Occupancy::Prompt, &at_s)
         };
-        script.policy.autopilot = Autopilot::Land;
+        script.policy.turn_end.autopilot = Autopilot::Land;
         script.run(&mut nothing)
     };
     let carried = successor("write-k-intent-crashed", &crashed);
@@ -2547,7 +2574,7 @@ fn managed_room(
         host,
         ..Script::new(tag, occupancy, &at_s)
     };
-    script.policy.autopilot = autopilot;
+    script.policy.turn_end.autopilot = autopilot;
     let cfg = script.policy.clone();
     script.run(&mut |s, i| {
         s.turn_end.set_managed(true);
@@ -2712,7 +2739,7 @@ fn the_holds_close_clears_the_word_the_door_noted() {
 fn a_land_workers_managed_nudge_is_never_noted() {
     let run = |tag: &str| {
         let mut script = Script::new(tag, Occupancy::Prompt, &[0, 31 * 60, 32 * 60]);
-        script.policy.autopilot = Autopilot::Land;
+        script.policy.turn_end.autopilot = Autopilot::Land;
         script.run(&mut |s, _| s.turn_end.set_managed(true))
     };
     let ran = run("write-task-land");
@@ -4360,7 +4387,7 @@ fn a_fact_at_a_background_break_keeps_the_act_awaited_before_it() {
             s.turn_end.seed_land_owed(RULE_LAND);
             s.turn_end.seed_land_act(1, 1, Duration::ZERO, now);
             assert!(s.turn_end.seed_awaited(
-                crate::supervise::policy::turn_end::RULE_CONTINUE,
+                alab_policy::words::RULE_CONTINUE,
                 Duration::ZERO,
                 crate::supervise::policy::turn_end::FirstRead::Unknown,
                 false,

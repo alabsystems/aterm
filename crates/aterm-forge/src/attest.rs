@@ -1142,7 +1142,7 @@ fn ob1_patch_vendor_agreement(
     if root.join("crates/aterm-census/src/scan_set.rs").is_file() {
         let ledger = aterm_census::scan_set::FORK_LEDGER;
         let registry = aterm_census::scan_set::reviewed_forks(root).unwrap_or_else(|e| {
-            let _ = writeln!(log, "  ✗ FAIL [OB-1] the census review is unreadable: {e}");
+            let _ = writeln!(log, "  ✗ FAIL [OB-1] the fork ledger is unreadable: {e}");
             fails += 1;
             Vec::new()
         });
@@ -1201,8 +1201,8 @@ fn ob1_patch_vendor_agreement(
                 let _ = writeln!(
                     log,
                     "  ✗ FAIL [OB-1] absorbed crate `{}` (`{}`) has no matching \
-                     aterm_census::scan_set::ABSORBED_CRATES row — the lock-order census \
-                     needs its identity namespace and platform slices.",
+                     aterm_census::scan_set::ABSORBED_CRATES row — the fork roster \
+                     (`fork_packages`) is read from it.",
                     crate_.name, crate_.rel
                 );
                 fails += 1;
@@ -1226,7 +1226,7 @@ fn ob1_patch_vendor_agreement(
         }
         let _ = writeln!(
             log,
-            "    [OB-1] cross-checked against the census review in vendor/forge.toml ({} \
+            "    [OB-1] cross-checked against the fork ledger in vendor/forge.toml ({} \
              reviewed fork(s)), \
              ABSORBED_CRATES ({} absorbed) and aterm_forge::provenance::FIRST_PARTY_VENDORED \
              ({} first-party vendored root(s)).",
@@ -1237,7 +1237,7 @@ fn ob1_patch_vendor_agreement(
     } else {
         let _ = writeln!(
             log,
-            "  • NOTE [OB-1] the census-review cross-check was SKIPPED: the compiled-in \
+            "  • NOTE [OB-1] the fork-ledger cross-check was SKIPPED: the compiled-in \
              ABSORBED_CRATES rows describe the aterm workspace and this root has no \
              crates/aterm-census/src/scan_set.rs. Patch ↔ vendor/ agreement itself was still \
              checked."

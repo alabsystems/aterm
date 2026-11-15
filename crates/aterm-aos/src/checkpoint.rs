@@ -77,7 +77,7 @@ pub enum CheckpointFault {
     NotACheckpoint,
     /// Encoding only: the body of `len` bytes exceeds the `limit` a frame carries.
     TooLarge {
-        /// The body length.
+        /// The body length, or `usize::MAX` when its encoded length cannot be represented.
         len: usize,
         /// The most a frame carries.
         limit: usize,
@@ -161,6 +161,15 @@ pub struct Checkpoint {
     state_digest: Digest,
 }
 
+/// The wire length of a length-prefixed string or byte slice ([`Enc::bytes`]).
+fn encoded_bytes_len(len: usize) -> Option<usize> {
+    let prefix = match u32::try_from(len) {
+        Ok(short) if short < u32::MAX => 4,
+        _ => 12,
+    };
+    len.checked_add(prefix)
+}
+
 impl Checkpoint {
     /// Captures `state` (as its canonical encoding) with its provenance.
     #[must_use]
@@ -204,13 +213,21 @@ impl Checkpoint {
         Digest::of(CHECKPOINT_DOMAIN, &[e.as_bytes(), &self.state_digest.0])
     }
 
-    /// The checkpoint's bytes.
+    /// The checkpoint's bytes, refusing an oversized body before allocating its frame.
+    ///
+    /// # Errors
+    /// [`CheckpointFault::TooLarge`] when the complete encoded body exceeds the frame cap.
     pub fn encode(&self) -> Result<Vec<u8>, CheckpointFault> {
-        let mut e = Enc::with_capacity(
-            HEADER_SIZE
-                .saturating_add(self.state.len())
-                .saturating_add(256),
-        );
+        let len = self.encoded_body_len().unwrap_or(usize::MAX);
+        let too_large = || CheckpointFault::TooLarge {
+            len,
+            limit: MAX_PAYLOAD_LEN,
+        };
+        if len > MAX_PAYLOAD_LEN {
+            return Err(too_large());
+        }
+        let capacity = HEADER_SIZE.checked_add(len).ok_or_else(too_large)?;
+        let mut e = Enc::with_capacity(capacity);
         e.raw(&[0u8; HEADER_SIZE]);
         e.raw(&CHECKPOINT_MAGIC);
         e.u8(CHECKPOINT_VERSION);
@@ -226,6 +243,27 @@ impl Checkpoint {
             })?;
         framed[..HEADER_SIZE].copy_from_slice(&hdr);
         Ok(framed)
+    }
+
+    /// Exact wire size without materializing provenance, state or their frame. Keep the
+    /// field order and widths paired with `encode_provenance` and the encoding above.
+    fn encoded_body_len(&self) -> Option<usize> {
+        let mut len = CHECKPOINT_MAGIC.len().checked_add(1)?;
+        let id = &self.provenance.identity;
+        for artifact in [&id.task, &id.code, &id.contract, &id.schema, &id.profile] {
+            len = len
+                .checked_add(1)?
+                .checked_add(encoded_bytes_len(artifact.name.len())?)?
+                .checked_add(4)?
+                .checked_add(artifact.digest.0.len())?;
+        }
+        // Five u64 fields, then the parent option tag and its optional digest.
+        len = len.checked_add(5 * 8)?.checked_add(1)?;
+        if let Some(parent) = &self.provenance.parent {
+            len = len.checked_add(parent.0.len())?;
+        }
+        len.checked_add(self.state_digest.0.len())?
+            .checked_add(encoded_bytes_len(self.state.len())?)
     }
 
     /// Reads a checkpoint.
@@ -310,3 +348,7 @@ impl Checkpoint {
         Ok(state)
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint_size_tests.rs"]
+mod size_tests;

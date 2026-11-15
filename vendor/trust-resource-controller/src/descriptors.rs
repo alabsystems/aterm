@@ -27,6 +27,14 @@ use trust_resource_provenance::program::{
 
 use crate::FileIdentity;
 
+/// Destination data and the unchanged writer-exclusion owner for one local publication.
+pub(crate) struct LocalFilePublication<'a> {
+    pub destination: &'a Path,
+    pub operation: [u8; 16],
+    pub ordinal: u64,
+    pub exclusions: &'a PublicationExclusions,
+}
+
 const RESERVE: usize = 128;
 const EXTRA_PER_ROOT: usize = 16;
 const MAX_FENCES: usize = 127;
@@ -128,7 +136,7 @@ fn kernel_max(fallback: libc::rlim_t) -> io::Result<libc::rlim_t> {
         if size != std::mem::size_of_val(&count) || count <= 0 {
             return Err(refused("native kernel descriptor ceiling is unknown"));
         }
-        return Ok((count as libc::rlim_t).min(fallback));
+        Ok((count as libc::rlim_t).min(fallback))
     }
     #[cfg(target_os = "linux")]
     {
@@ -154,7 +162,7 @@ fn occupied() -> io::Result<usize> {
                 0,
             )
         };
-        if wanted <= 0 || wanted as usize % width != 0 {
+        if wanted <= 0 || !(wanted as usize).is_multiple_of(width) {
             return Err(refused("original native descriptor census unavailable"));
         }
         let bytes = (wanted as usize)
@@ -174,10 +182,10 @@ fn occupied() -> io::Result<usize> {
                     .map_err(|_| refused("native descriptor census size overflow"))?,
             )
         };
-        if got <= 0 || got as usize >= bytes || got as usize % width != 0 {
+        if got <= 0 || got as usize >= bytes || !(got as usize).is_multiple_of(width) {
             return Err(refused("original native descriptor census is incomplete"));
         }
-        return Ok(got as usize / width);
+        Ok(got as usize / width)
     }
     #[cfg(target_os = "linux")]
     {
@@ -696,12 +704,10 @@ impl DescriptorBudget {
         self: &Arc<Self>,
         output: &HeldOutputRoot,
         source: &AdmittedRootFile,
-        destination: &Path,
-        operation: [u8; 16],
-        ordinal: u64,
-        exclusions: &PublicationExclusions,
+        publication: LocalFilePublication<'_>,
         deadline: Instant,
     ) -> io::Result<Arc<AdmittedRootFile>> {
+        let LocalFilePublication { destination, operation, ordinal, exclusions } = publication;
         let (mut reservation, before, reserved) =
             self.reserve_shared(HeldRootFile::publication_descriptor_bound())?;
         self.verify_local_file(output, source, deadline)?;

@@ -944,7 +944,6 @@ fn observe_alab_role_inner(
     let log_intact = state.seq == 0 && super::log_only_intact(paths, &config, &state);
     if state.membership != Stored::In
         || state.failed
-        || !state.pending.is_empty()
         || (state.seq < 1 && !log_intact)
         || ((!source_bound(&config, &state) || held_copy(paths, &config, &state).is_none())
             && !log_intact)

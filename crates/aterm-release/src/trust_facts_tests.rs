@@ -4,7 +4,7 @@
 use super::*;
 
 fn log(text: &str) -> Measured {
-    Measured::of_log(text.as_bytes(), "0")
+    Measured::of_log(text.as_bytes(), "0").unwrap()
 }
 
 #[test]
@@ -75,6 +75,203 @@ const DONE: &str = "Summary: 5 proved, 3 failed, 8 runtime-checked, 0 assumed, 0
                     Coverage: 9/9 eligible function bodies verified (complete)\n\
                     \x20 Gate: FAIL [advisory lane, exit 1] (5 proved / 21 total)\n";
 
+/// A complete-looking prefix followed by either a real EOF or an injected read failure.
+struct LogTail<'a> {
+    remaining: &'a [u8],
+    fail: bool,
+}
+
+impl std::io::Read for LogTail<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.fill_buf()?;
+        let n = available.len().min(out.len());
+        out[..n].copy_from_slice(&available[..n]);
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for LogTail<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.remaining.is_empty() && self.fail {
+            Err(std::io::Error::other("injected log read failure"))
+        } else {
+            Ok(self.remaining)
+        }
+    }
+    fn consume(&mut self, n: usize) {
+        self.remaining = &self.remaining[n..];
+    }
+}
+
+#[test]
+fn a_complete_summary_requires_a_clean_log_eof() {
+    let scratch = crate::test_scratch_dir("log-reader-errors");
+    for name in ["alpha", "beta"] {
+        fs::write(scratch.path().join(format!("{name}@1.0.0.log.rc")), "1\n").unwrap();
+    }
+    for fail in [false, true] {
+        let reader = || LogTail {
+            remaining: DONE.as_bytes(),
+            fail,
+        };
+        let parsed = Measured::of_log(reader(), "1");
+        if fail {
+            assert_eq!(parsed.unwrap_err().to_string(), "injected log read failure");
+        } else {
+            let m = parsed.unwrap();
+            assert_eq!(parse_summary(&m.summary), (Some(5), Some(21)));
+            assert!(m.ended.is_empty());
+        }
+        let mut plan = Plan::parse(&format!("{PLAN_MAGIC}\nlogdir {}\ncrate alpha\talpha@1.0.0\tgate\ncrate beta\tbeta@1.0.0\tgate\n", scratch.path().display())).unwrap();
+        let before = plan.facts.clone();
+        let measured = plan.measure_with(|path, rc| {
+            if path.ends_with("alpha@1.0.0.log") {
+                Measured::of_log(DONE.as_bytes(), rc)
+            } else {
+                Measured::of_log(reader(), rc)
+            }
+        });
+        let Decision::Gate(m) = &plan.facts.crates[0].decision else {
+            panic!("gated")
+        };
+        if fail {
+            assert!(
+                measured
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected log read failure")
+            );
+            assert!(m.summary.is_empty(), "a partial measurement is never kept");
+            assert_eq!(
+                plan.facts, before,
+                "no earlier crate's partial facts survive"
+            );
+        } else {
+            measured.unwrap();
+            assert_eq!(parse_summary(&m.summary), (Some(5), Some(21)));
+        }
+    }
+}
+
+#[test]
+fn present_obligation_records_must_parse_before_any_measurement_is_kept() {
+    let scratch = crate::test_scratch_dir("obligation-record-errors");
+    for name in ["alpha", "beta"] {
+        fs::write(scratch.path().join(format!("{name}@1.0.0.log")), DONE).unwrap();
+        fs::write(scratch.path().join(format!("{name}@1.0.0.log.rc")), "1\n").unwrap();
+    }
+    let valid = crate::trust_oblig::Record {
+        package: "beta".into(),
+        unit: "beta".into(),
+        functions: 0,
+        rows: Vec::new(),
+    }
+    .to_text();
+    let path = scratch.path().join("beta@1.0.0.log.oblig.tsv");
+    for record in [
+        None,
+        Some(valid.as_str()),
+        Some(""),
+        Some("not a record\n"),
+        Some(valid.trim_end_matches("end\t0\n")),
+        Some(&valid.replace("total\t0", "total\t1")),
+    ] {
+        if let Some(record) = record {
+            fs::write(&path, record).unwrap();
+        } else if path.exists() {
+            fs::remove_file(&path).unwrap();
+        }
+        let mut plan = Plan::parse(&format!("{PLAN_MAGIC}\nlogdir {}\ncrate alpha\talpha@1.0.0\tgate\ncrate beta\tbeta@1.0.0\tgate\n", scratch.path().display())).unwrap();
+        let before = plan.facts.clone();
+        let measured = plan.measure();
+        if record.is_none() || record == Some(valid.as_str()) {
+            measured.unwrap();
+            assert_eq!(
+                parse_summary(&gated(&plan.facts).summary),
+                (Some(5), Some(21))
+            );
+            let Decision::Gate(beta) = &plan.facts.crates[1].decision else {
+                panic!("gated")
+            };
+            assert_eq!(beta.backstops.is_some(), record.is_some());
+        } else {
+            let error = measured.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                error.to_string().contains("beta@1.0.0.log.oblig.tsv"),
+                "{error}"
+            );
+            assert_eq!(
+                plan.facts, before,
+                "the earlier crate must not commit partial facts"
+            );
+        }
+    }
+}
+
+#[test]
+fn execution_status_requires_the_receipts_native_integer_format() {
+    let scratch = crate::test_scratch_dir("execution-status");
+    let status = scratch.path().join("compiler.log.rc");
+    for code in ["0", "1", "2", "3", "101", "137", "-1073741819"] {
+        fs::write(&status, format!("{code}\n")).unwrap();
+        assert_eq!(execution_status(&status).unwrap(), code);
+    }
+    for malformed in ["", "?", "unknown", "0\n1", "+0", "01", "2147483648"] {
+        fs::write(&status, malformed).unwrap();
+        assert_eq!(
+            execution_status(&status).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+    fs::remove_file(&status).unwrap();
+    assert_eq!(
+        execution_status(&status).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn an_overlong_diagnostic_cannot_synthesize_summary_or_coverage_lines() {
+    const OLD_CHUNK: usize = 1024 * 1024;
+    let mut opaque = "x".repeat(OLD_CHUNK);
+    opaque.push_str("Summary: 999 proved (999 total)\n");
+    opaque.push_str(&"x".repeat(OLD_CHUNK));
+    opaque.push_str("Coverage: 999/999 eligible function bodies verified (complete)\n");
+    // Each token starts exactly where the old bounded reader began a continuation chunk,
+    // but neither token starts a logical line in the compiler log.
+    let m = Measured::of_log(opaque.as_bytes(), "0").unwrap();
+    assert!(m.summary.is_empty(), "{}", m.summary);
+    let mut followed = opaque.clone();
+    followed.push_str(DONE);
+    let m = Measured::of_log(
+        std::io::BufReader::with_capacity(4093, followed.as_bytes()),
+        "1",
+    )
+    .unwrap();
+    assert_eq!(parse_summary(&m.summary), (Some(5), Some(21)));
+    assert!(m.ended.is_empty(), "{}", m.ended);
+
+    let mut no_coverage = opaque.clone();
+    no_coverage.push_str("Summary: 5 proved (21 total)\n");
+    let m = Measured::of_log(no_coverage.as_bytes(), "1").unwrap();
+    assert!(m.ended.contains("no Coverage line"), "{}", m.ended);
+
+    let mut tail = DONE.to_string();
+    tail.push_str(&"x".repeat(OLD_CHUNK + 1));
+    let clean = Measured::of_log(tail.as_bytes(), "1").unwrap();
+    assert_eq!(parse_summary(&clean.summary), (Some(5), Some(21)));
+    let failed = Measured::of_log(
+        LogTail {
+            remaining: tail.as_bytes(),
+            fail: true,
+        },
+        "1",
+    );
+    assert_eq!(failed.unwrap_err().to_string(), "injected log read failure");
+}
+
 const KILLED: &str = "error: could not compile `aterm-census` (lib); 216 warnings emitted\n\nCaused by:\n\
                       \x20 process didn't exit successfully: `/Users//x/toolchains/trust-6606d3bd/bin/trustc --crate-name aterm_census --edition=2024 crates/aterm-census/src/lib.rs --crate-type lib` (signal: 15, SIGTERM: termination signal)\n\
                       === Trust Verification Report ===\n\
@@ -87,8 +284,8 @@ const KILLED: &str = "error: could not compile `aterm-census` (lib); 216 warning
 
 #[test]
 fn a_check_that_did_not_finish_says_so_in_its_own_record() {
-    let ended = |text: &str, rc: &str| Measured::of_log(text.as_bytes(), rc).ended;
-    let m = Measured::of_log(KILLED.as_bytes(), "101");
+    let ended = |text: &str, rc: &str| Measured::of_log(text.as_bytes(), rc).unwrap().ended;
+    let m = Measured::of_log(KILLED.as_bytes(), "101").unwrap();
     assert_eq!(
         parse_summary(&m.summary),
         (Some(207), Some(2037)),
@@ -121,7 +318,7 @@ fn a_check_that_did_not_finish_says_so_in_its_own_record() {
         format!("  [UNKNOWN] [transport:missing-json] missing structured Trust JSON transport (targo-trust)\n{DONE}")
             .as_bytes(),
         "2",
-    );
+    ).unwrap();
     assert!(
         m.transport && m.ended.is_empty(),
         "missing-json is `transport`: {m:?}"
@@ -361,7 +558,7 @@ fn targo_trusts_own_could_not_run_is_undecided_and_never_the_codes() {
     const NO_COMPILER: &str = "targo trust: COULD NOT RUN: interrupted by SIGTERM. The run started no compiler, so it has no verdict\n";
     let ratchet = format!("alpha\t3\t3\t{DRV}\nbeta\t3\t3\t{DRV}\n");
     let judged = |log: &str, rc: &str| {
-        let m = Measured::of_log(log.as_bytes(), rc);
+        let m = Measured::of_log(log.as_bytes(), rc).unwrap();
         // A run with a refused path is never filed, so its record keeps none.
         let filed = m.path_refused.is_empty();
         let f = facts(vec![
@@ -438,7 +635,7 @@ fn the_lanes_budget_mark_is_read_into_the_facts() {
         dir.display()
     ))
     .unwrap();
-    p.measure();
+    p.measure().unwrap();
     let got: Vec<(String, bool)> = p
         .facts
         .crates
@@ -919,6 +1116,32 @@ fn conclude_files_only_what_a_release_may_read() {
     assert!(l.starts_with("FACTS: none"), "{l}");
     let done = run("");
     assert_eq!(done.verdict.word, "PASS");
+}
+
+#[test]
+fn an_unreadable_log_prevents_conclusion_and_ratchet_changes() {
+    let w = World::new("unreadable-log");
+    w.commit(&[(RATCHET, &floor(3))]);
+    let logs = w.root.join("logs");
+    fs::create_dir_all(logs.join("alpha@1.0.0.log")).unwrap();
+    fs::write(logs.join("alpha@1.0.0.log.rc"), "0\n").unwrap();
+    let ratchet = fs::read(w.work().join(RATCHET)).unwrap();
+    for update in [Update::NONE, Update::RAISE] {
+        let mut plan = Plan::parse(&format!(
+            "{PLAN_MAGIC}\nlogdir {}\nratchet {}\nstore {}\nfile \ncrate alpha\talpha@1.0.0\tgate\n",
+            logs.display(), w.work().join(RATCHET).display(), w.store().display(),
+        )).unwrap();
+        let error = conclude(&w.cli(), &w.work(), &mut plan, update).unwrap_err();
+        assert!(
+            error
+                .0
+                .contains("compiler execution receipts could not be measured")
+                && error.0.contains("alpha@1.0.0.log"),
+            "{error}"
+        );
+        assert_eq!(fs::read(w.work().join(RATCHET)).unwrap(), ratchet);
+        assert!(!w.store().exists(), "no facts were filed");
+    }
 }
 
 #[test]
@@ -1548,7 +1771,7 @@ fn measured_check(
         dir.display()
     ))
     .unwrap();
-    p.measure();
+    p.measure().unwrap();
     p.facts.driver = "/store/trust/15698/bin/targo".into();
     p.facts.driver_id = DRV.into();
     p.facts
@@ -2874,7 +3097,7 @@ fn refusal(path: &str, why: Refused) -> PathRefusal {
 
 #[test]
 fn a_refused_path_is_read_in_targos_own_words() {
-    let m = Measured::of_log(REFUSED_LOG.as_bytes(), "2");
+    let m = Measured::of_log(REFUSED_LOG.as_bytes(), "2").unwrap();
     assert!(m.transport && m.summary.is_empty(), "{m:?}");
     assert_eq!(
         m.path_refused,
@@ -2985,10 +3208,10 @@ fn a_refused_path_is_read_in_targos_own_words() {
     ];
     for (text, want) in cases {
         let log = format!("{head}{text}{text}targo trust: error: verification did not run\n");
-        let m = Measured::of_log(log.as_bytes(), "2");
+        let m = Measured::of_log(log.as_bytes(), "2").unwrap();
         assert_eq!(m.path_refused, [want], "{text}");
     }
-    let m = Measured::of_log(REFUSED_TRUSTD.as_bytes(), "2");
+    let m = Measured::of_log(REFUSED_TRUSTD.as_bytes(), "2").unwrap();
     assert_eq!(m.launch, "other");
     for text in [
         head,
@@ -2999,7 +3222,7 @@ fn a_refused_path_is_read_in_targos_own_words() {
         "error: the directory `/x` holding verified tool launcher launch path symlink `/x/t` is not a plain directory\n",
         "error: failed to inspect verified tool launcher path component `/x`\n",
     ] {
-        let m = Measured::of_log(text.as_bytes(), "1");
+        let m = Measured::of_log(text.as_bytes(), "1").unwrap();
         assert!(m.path_refused.is_empty(), "{text}: {:?}", m.path_refused);
     }
 }
@@ -3008,7 +3231,7 @@ fn a_refused_path_is_read_in_targos_own_words() {
 fn a_refused_path_is_said_once_with_every_library_it_failed() {
     let me = aterm_uds::peer::our_uid();
     let mine = REFUSED_LOG.replace("uid=1000", &format!("uid={me}"));
-    let gated = |text: &str| Decision::Gate(Measured::of_log(text.as_bytes(), "2"));
+    let gated = |text: &str| Decision::Gate(Measured::of_log(text.as_bytes(), "2").unwrap());
     let ratchet = format!("eps\t5\t21\t{DRV}\n");
     let v = judge(
         &facts(vec![

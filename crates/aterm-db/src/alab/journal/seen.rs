@@ -21,8 +21,13 @@
 //!   the reset-less readings made inside the window (readings are snapshots and never add up, and
 //!   a lower reading frees nothing), shows the reset as unknown where those groups disagree beyond
 //!   their resolution, and says "reset at T, not read since" once every reset read has passed with
-//!   nothing read since, never a guessed 0. A
-//!   workspace's readings are its sub-account's (`sa-` key) and are folded under the account.
+//!   nothing read since, never a guessed 0. A `reset-used` (a limit reset spent) from any Mac
+//!   cuts the window it names, of its key: a reading or a wall of that window made before the
+//!   newest one is from before the refill and says nothing of the window now, and a reading
+//!   another Mac dated within the clock-skew bound after it counts only until a later reading
+//!   the refill surely precedes. One that names no window (the limit still stood) cuts nothing,
+//!   and one dated past the skew bound ahead of the read is not believed. A workspace's
+//!   readings are its sub-account's (`sa-` key) and are folded under the account.
 
 use super::{
     EV, PLACE, RELAY, SUM, USE,
@@ -130,6 +135,14 @@ pub struct Seen {
     /// Each Mac's latest `sum` row (32 hex uuid to the row): its label, version, OS, the count
     /// of accounts it used and its `journal` word, as that Mac wrote it.
     pub sums: BTreeMap<String, Value>,
+    /// Each window's newest refill, by account (or sub-account) and window: the newest
+    /// `reset-used` that names the window, from any Mac. Its readings and walls made before it
+    /// are from before the refill ([`usage`], [`Self::quota`]).
+    resets_used: BTreeMap<String, BTreeMap<Window, Cut>>,
+    /// This Mac's own Commons uuids (32 hex): its seat's, and each seat it succeeded where its
+    /// writer's lineage reads ([`read`]). A record one of them wrote is this Mac's own, whatever
+    /// the registry binds it to; empty where no Commons was read (a fixture).
+    pub me: std::collections::BTreeSet<String>,
     /// Each account's live claims-ring claims ([`Self::claim`]): which Macs hold it now.
     pub claims: BTreeMap<String, Vec<Claimed>>,
     /// When the read was made, Unix seconds.
@@ -146,6 +159,19 @@ pub struct Claimed {
     pub until: u64,
 }
 
+/// The clock-skew bound, in seconds: the claims ring reads a Mac's clock as split past 15
+/// minutes.
+const SKEW_S: u64 = 900;
+
+/// One window's refill as the fold holds it ([`Seen::quota`]): the newest `reset-used` naming it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Cut {
+    /// When, by the clock of the Mac that logged it, and never after the read's `now`.
+    t: u64,
+    /// That Mac (32 hex): its own readings are dated by the cut's clock.
+    uuid: String,
+}
+
 /// How far apart two readings' resets may be and still name one window: each reading's
 /// resolution (§7: exact for status-line and API resets, an hour for "Resets 1pm", a day for
 /// "Resets Sep 23", the clock-skew bound for a local `now + reset_after`). An exact reset still
@@ -155,8 +181,7 @@ const fn tolerance(res: Option<Res>) -> u64 {
         Some(Res::Exact | Res::Minute) => 60,
         Some(Res::Hour) => 3_600,
         Some(Res::Day) => 86_400,
-        // The clock-skew bound: the claims ring reads a Mac's clock as split past 15 minutes.
-        Some(Res::Local) | None => 900,
+        Some(Res::Local) | None => SKEW_S,
     }
 }
 
@@ -450,10 +475,32 @@ impl Seen {
             },
             None => None,
         };
+        let pk = sub_pk.as_deref().unwrap_or(account.as_str());
         let Some(window) = event.window else {
+            // A reset that names no window refilled none (one spent with the limit still
+            // standing): it cuts nothing.
             return;
         };
-        let pk = sub_pk.as_deref().unwrap_or(account.as_str());
+        if event.kind == Kind::ResetUsed {
+            // A refill cuts the window it names. One dated more than the skew bound ahead of now
+            // is no evidence of now; one inside it holds from now.
+            if event.t <= self.now.saturating_add(SKEW_S) {
+                let cut = Cut {
+                    t: event.t.min(self.now),
+                    uuid: uuid.to_owned(),
+                };
+                let held = self
+                    .resets_used
+                    .entry(pk.to_owned())
+                    .or_default()
+                    .entry(window)
+                    .or_insert_with(|| cut.clone());
+                if (held.t, &held.uuid) < (cut.t, &cut.uuid) {
+                    *held = cut;
+                }
+            }
+            return;
+        }
         match event.kind {
             Kind::Quota => {
                 if let Some(pct_x10) = event.pct_x10 {
@@ -568,13 +615,17 @@ impl Seen {
             if readings.is_none() && walls.is_none() {
                 continue;
             }
+            let cuts = self.resets_used.get(pk);
             for &window in Window::ALL {
+                let cut = cuts.and_then(|by_window| by_window.get(&window));
                 let usage = readings
                     .and_then(|by_window| by_window.get(&window))
-                    .and_then(|readings| usage(window, readings, self.now));
+                    .and_then(|readings| usage(window, readings, cut, self.now));
+                // A wall seen before the window's refill no longer stands.
                 let wall = walls
                     .and_then(|by_window| by_window.get(&window))
                     .filter(|wall| wall.until.is_none_or(|until| until > self.now))
+                    .filter(|wall| cut.is_none_or(|cut| wall.t >= cut.t))
                     .cloned();
                 if usage.is_some() || wall.is_some() {
                     out.push(WindowQuota {
@@ -671,7 +722,12 @@ fn figure<'r>(list: impl IntoIterator<Item = &'r Reading>) -> Option<&'r Reading
         .max_by(|a, b| (a.pct_x10, a.t, &a.uuid).cmp(&(b.pct_x10, b.t, &b.uuid)))
 }
 
-/// One window's usage from its readings at `now` (§7).
+/// One window's usage from its readings at `now` (§7), less every reading made before `cut`
+/// (the window's newest refill: a reading from before it is no reading of the window now, however
+/// used it says the window was). A reading another Mac dated less than the skew bound after the
+/// cut may be from before the refill on a clock that runs ahead: it counts until a later reading
+/// the refill surely precedes (the refilling Mac's own, or one dated the skew bound past the
+/// cut) says what the window holds.
 ///
 /// Readings that name a reset are grouped by it (window identity, each within its resolution's
 /// tolerance). A group a later group's reset puts a whole window before it is an earlier window
@@ -680,7 +736,7 @@ fn figure<'r>(list: impl IntoIterator<Item = &'r Reading>) -> Option<&'r Reading
 /// inside the window, credited to that reading. More than one group left gives an unknown reset.
 /// Once every reset has passed, a reset-less reading made since is the figure (its reset
 /// unknown); with none, the window says "reset at T, not read since".
-fn usage(window: Window, readings: &[Reading], now: u64) -> Option<Usage> {
+fn usage(window: Window, readings: &[Reading], cut: Option<&Cut>, now: u64) -> Option<Usage> {
     let current_of = |r: &Reading| Usage::Current {
         pct_x10: r.pct_x10,
         reset: None,
@@ -688,8 +744,18 @@ fn usage(window: Window, readings: &[Reading], now: u64) -> Option<Usage> {
         by: r.uuid.clone(),
         src: r.src.clone(),
     };
-    let (reset_known, reset_less): (Vec<&Reading>, Vec<&Reading>) =
-        readings.iter().partition(|r| r.reset.is_some());
+    let since: Vec<&Reading> = readings
+        .iter()
+        .filter(|r| cut.is_none_or(|cut| r.t >= cut.t))
+        .collect();
+    let sure = |r: &Reading| {
+        cut.is_none_or(|cut| r.uuid == cut.uuid || r.t >= cut.t.saturating_add(SKEW_S))
+    };
+    let newest_sure = since.iter().filter(|r| sure(r)).map(|r| r.t).max();
+    let (reset_known, reset_less): (Vec<&Reading>, Vec<&Reading>) = since
+        .into_iter()
+        .filter(|r| sure(r) || newest_sure.is_none_or(|newest| newest <= r.t))
+        .partition(|r| r.reset.is_some());
     let reset_of = |r: &Reading| r.reset.unwrap_or(0);
     let Some(last_reset) = reset_known.iter().map(|r| reset_of(r)).max() else {
         // No reading names its window: the newest one, its reset unknown.
@@ -792,6 +858,28 @@ fn usage(window: Window, readings: &[Reading], now: u64) -> Option<Usage> {
     })
 }
 
+/// This Mac's own Commons uuids as `session` reads them: its seat's, and each seat its writer's
+/// lineage succeeded ([`crate::generation::lineage_in`]); a seat that is no writer, or a lineage
+/// that does not read, leaves its own seat alone.
+fn own_uuids(
+    paths: &aterm_secrets::client::Paths,
+    session: &crate::table::Session<'_>,
+    deadline: std::time::Instant,
+) -> std::collections::BTreeSet<String> {
+    let seat = session.members().ok().and_then(|members| {
+        members
+            .iter()
+            .find(|binding| binding.actor() == session.actor())
+            .map(|binding| hex::encode_lower(binding.machine()))
+    });
+    crate::generation::lineage_in(paths, session, deadline)
+        .unwrap_or_default()
+        .iter()
+        .map(|binding| hex::encode_lower(binding.machine()))
+        .chain(seat)
+        .collect()
+}
+
 /// The journal window as this Mac holds it at `now` (Unix seconds), read as a member, with this
 /// Mac's heard archive from `since` on where `spool` names it; `None` where this Mac holds no
 /// Commons it is a member of.
@@ -835,7 +923,9 @@ pub(super) fn read_started(
         let directory = Directory::new(&selected, bootstrap.trust());
         let window = super::flush::window(&session, &directory, now)?;
         let resolve = owned::commons::historical(&session);
-        Seen::of(&window.ops, &resolve, now)
+        let mut seen = Seen::of(&window.ops, &resolve, now);
+        seen.me = own_uuids(paths, &session, deadline);
+        seen
     };
     if let Some((spool, since)) = heard {
         // The archive is this Mac's own; one that cannot be read leaves the window's log.

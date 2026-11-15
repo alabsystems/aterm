@@ -72,7 +72,7 @@ fn gits_token_is_in_its_environment_alone_never_its_argv_or_a_file() {
     let token_file = dir.path().join("token");
     std::fs::write(&token_file, format!("{secret}\n")).expect("the token file");
     let host = RestHost::at(
-        Some(token_file),
+        Some(TokenSource::File(token_file)),
         Origins::github(),
         "https://github.com".to_string(),
     );
@@ -120,7 +120,7 @@ fn gits_token_is_in_its_environment_alone_never_its_argv_or_a_file() {
     planted.arg(format!("https://x:{secret}@github.com/o/r.git"));
     assert_eq!(shows(&planted, secret).len(), 2);
     let local = RestHost::at(
-        host.token_file.clone(),
+        host.token_source.clone(),
         Origins::github(),
         "file:///r".into(),
     );
@@ -139,7 +139,7 @@ fn gits_token_is_in_its_environment_alone_never_its_argv_or_a_file() {
     let anon = RestHost::at(None, Origins::github(), "https://github.com".into());
     assert!(crate::host::ReleaseHost::reads_anonymously(&anon));
     let absent = RestHost::at(
-        Some(dir.path().join("missing-token")),
+        Some(TokenSource::File(dir.path().join("missing-token"))),
         Origins::github(),
         "https://github.com".into(),
     );
@@ -148,7 +148,11 @@ fn gits_token_is_in_its_environment_alone_never_its_argv_or_a_file() {
 
     let blank = dir.path().join("blank-token");
     std::fs::write(&blank, "  \n\t\r\n").expect("blank token");
-    let blank_host = RestHost::at(Some(blank), Origins::github(), "https://github.com".into());
+    let blank_host = RestHost::at(
+        Some(TokenSource::File(blank)),
+        Origins::github(),
+        "https://github.com".into(),
+    );
     assert!(
         crate::host::ReleaseHost::reads_anonymously(&blank_host),
         "whitespace-only token file reads anonymously through CDN probes"
@@ -157,7 +161,7 @@ fn gits_token_is_in_its_environment_alone_never_its_argv_or_a_file() {
     let corrupt = dir.path().join("corrupt-token");
     std::fs::write(&corrupt, b"ghp_bad\x00token\n").expect("corrupt token");
     let corrupt_host = RestHost::at(
-        Some(corrupt),
+        Some(TokenSource::File(corrupt)),
         Origins::github(),
         "https://github.com".into(),
     );
@@ -293,7 +297,7 @@ fn every_network_git_carries_the_pins_at_the_url_it_is_given() {
     let token = dir.path().join("token");
     std::fs::write(&token, "github_pat_fixture\n").expect("the token file");
     let slug = Slug::new("fixture-dev", "packs");
-    for token_file in [None, Some(token)] {
+    for token_file in [None, Some(TokenSource::File(token))] {
         let path = if token_file.is_some() {
             "credentialed"
         } else {
@@ -457,19 +461,27 @@ fn only_tokenless_canonical_github_git_selects_the_anonymous_policy() {
     );
 
     let missing = RestHost::at(
-        Some(dir.path().join("missing")),
+        Some(TokenSource::File(dir.path().join("missing"))),
         Origins::github(),
         "https://github.com".into(),
     );
     assert!(missing.canonical_anonymous_git(url).unwrap());
     let blank = dir.path().join("blank");
     std::fs::write(&blank, " \n\t").expect("blank token");
-    let blank = RestHost::at(Some(blank), Origins::github(), "https://github.com".into());
+    let blank = RestHost::at(
+        Some(TokenSource::File(blank)),
+        Origins::github(),
+        "https://github.com".into(),
+    );
     assert!(blank.canonical_anonymous_git(url).unwrap());
 
     let token = dir.path().join("token");
     std::fs::write(&token, "github_pat_fixture\n").expect("token");
-    let credentialed = RestHost::at(Some(token), Origins::github(), "https://github.com".into());
+    let credentialed = RestHost::at(
+        Some(TokenSource::File(token)),
+        Origins::github(),
+        "https://github.com".into(),
+    );
     assert!(!credentialed.canonical_anonymous_git(url).unwrap());
     let custom = RestHost::at(None, Origins::github(), "https://mirror.example".into());
     assert!(!custom.canonical_anonymous_git(url).unwrap());

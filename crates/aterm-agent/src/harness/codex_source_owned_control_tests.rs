@@ -82,3 +82,205 @@ fn disconnected_pending_challenge_is_stale_instead_of_waiting_forever() {
     registry.connection_closed(connection.id);
     assert_eq!(control.bound().err(), Some(Error::Stale));
 }
+
+#[test]
+fn attachment_rights_travel_only_after_the_original_physical_binding() {
+    use std::io::Write;
+    let registry = Registry::default();
+    let connection = registry.fixture_connection();
+    let (native, mut child) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    child
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    let control = Control::new(native).unwrap();
+    let (endpoint, mut frontend) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    frontend
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    assert_eq!(control.send_attachment(&endpoint), Err(Error::Busy));
+    let member = "e".repeat(32);
+    let operation = "f".repeat(32);
+    control.begin(&connection, &member, &operation).unwrap();
+    let mut challenge = [0; 40];
+    child.read_exact(&mut challenge).unwrap();
+    assert_eq!(control.send_attachment(&endpoint), Err(Error::Busy));
+    control
+        .acknowledge(
+            &connection,
+            &member,
+            &operation,
+            std::str::from_utf8(&challenge[8..]).unwrap(),
+        )
+        .unwrap();
+    let receiver = std::thread::spawn(move || {
+        let mut marker = [0];
+        let mut received = aterm_uds::fdpass::recv_with_fds(&child, &mut marker, 1).unwrap();
+        assert_eq!(received.bytes, 1);
+        assert_eq!(&marker, b"A");
+        assert_eq!(received.fds.len(), 1);
+        let stream = aterm_uds::CtlStream::from(received.fds.pop().unwrap());
+        let mut nonce = [0; 32];
+        child.read_exact(&mut nonce).unwrap();
+        child.write_all(&nonce).unwrap();
+        (stream, child)
+    });
+    control.send_attachment(&endpoint).unwrap();
+    drop(endpoint);
+    let (mut stream, _child) = receiver.join().unwrap();
+    stream.write_all(b"original").unwrap();
+    let mut bytes = [0; 8];
+    frontend.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"original");
+    registry.connection_closed(connection.id);
+    assert_eq!(control.send_attachment(&stream), Err(Error::Stale));
+}
+
+#[test]
+fn physical_attachment_receipt_survives_contended_control_metadata() {
+    use std::io::Write;
+    let registry = Registry::default();
+    let connection = registry.fixture_connection();
+    let (native, mut child) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    child
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    let control = Control::new(native).unwrap();
+    let member = "a".repeat(32);
+    let operation = "b".repeat(32);
+    control.begin(&connection, &member, &operation).unwrap();
+    let mut challenge = [0; 40];
+    child.read_exact(&mut challenge).unwrap();
+    control
+        .acknowledge(
+            &connection,
+            &member,
+            &operation,
+            std::str::from_utf8(&challenge[8..]).unwrap(),
+        )
+        .unwrap();
+    let (endpoint, mut frontend) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    frontend
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    std::thread::scope(|threads| {
+        let sender = threads.spawn(|| control.send_attachment(&endpoint));
+        let mut marker = [0];
+        let mut received = aterm_uds::fdpass::recv_with_fds(&child, &mut marker, 1).unwrap();
+        assert_eq!(marker, *b"A");
+        assert_eq!(received.bytes, 1);
+        assert_eq!(received.fds.len(), 1);
+        let mut received = aterm_uds::CtlStream::from(received.fds.pop().unwrap());
+        let mut nonce = [0; 32];
+        child.read_exact(&mut nonce).unwrap();
+        // Force contention exactly after native send and before its receipt.
+        // This is physical custody only; admission remains Busy until unlocked.
+        let metadata = control.state.lock().unwrap();
+        child.write_all(&nonce).unwrap();
+        assert_eq!(sender.join().unwrap(), Ok(()));
+        assert_eq!(control.bound().err(), Some(Error::Busy));
+        drop(metadata);
+        control.bound().unwrap();
+        received.write_all(b"kept").unwrap();
+        let mut bytes = [0; 4];
+        frontend.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"kept");
+        child.set_nonblocking(true).unwrap();
+        assert_eq!(
+            child.read(&mut marker).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the one delivery emitted no duplicate right or challenge"
+        );
+    });
+}
+
+#[test]
+fn received_socket_pair_survives_senders_and_carrier_closure() {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    // Kernel transport only: no constructor/member/Source/SDK admission.
+    let (backend, frontend) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    let fence = aterm_uds::kept_out(|| frontend.try_clone()).unwrap();
+    let (control, receiver) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    let (callback, client) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    assert_eq!(
+        aterm_uds::fdpass::send_with_fds(&control, b"A", &[backend.as_fd()]).unwrap(),
+        1
+    );
+    assert_eq!(
+        aterm_uds::fdpass::send_with_fds(&callback, b"F", &[frontend.as_fd()]).unwrap(),
+        1
+    );
+    let mut marker = [0];
+    let mut back = aterm_uds::fdpass::recv_with_fds(&receiver, &mut marker, 1).unwrap();
+    assert_eq!(back.bytes, 1);
+    assert_eq!(back.fds.len(), 1);
+    assert_eq!(marker, *b"A");
+    let mut back = aterm_uds::CtlStream::from(back.fds.pop().unwrap());
+    let mut front = aterm_uds::fdpass::recv_with_fds(&client, &mut marker, 1).unwrap();
+    assert_eq!(front.bytes, 1);
+    assert_eq!(front.fds.len(), 1);
+    assert_eq!(marker, *b"F");
+    let mut front = aterm_uds::CtlStream::from(front.fds.pop().unwrap());
+    // Match Control::send_attachment: sender custody ends only after actual
+    // reception. A successful SCM_RIGHTS write alone is not a physical receipt.
+    drop(backend);
+    drop(frontend);
+    drop(control);
+    drop(receiver);
+    drop(callback);
+    drop(client);
+    back.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    front
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    front.write_all(b"ping").unwrap();
+    let mut bytes = [0; 4];
+    back.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"ping");
+    back.write_all(b"pong").unwrap();
+    front.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"pong");
+    fence.shutdown(std::net::Shutdown::Both).unwrap();
+    assert_eq!(back.read(&mut bytes).unwrap(), 0);
+    assert_eq!(
+        front.write(b"after fence").unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+}
+
+#[test]
+fn wrong_physical_receipt_poisoning_cannot_be_replayed_as_another_delivery() {
+    use std::io::Write;
+    // Protocol principal fixture only: no native Source or SDK Ready grant.
+    let registry = Registry::default();
+    let connection = registry.fixture_connection();
+    let (native, mut child) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    let control = Control::new(native).unwrap();
+    let member = "a".repeat(32);
+    let operation = "b".repeat(32);
+    control.begin(&connection, &member, &operation).unwrap();
+    let mut challenge = [0; 40];
+    child.read_exact(&mut challenge).unwrap();
+    control
+        .acknowledge(
+            &connection,
+            &member,
+            &operation,
+            std::str::from_utf8(&challenge[8..]).unwrap(),
+        )
+        .unwrap();
+    let (endpoint, _frontend) = aterm_uds::kept_out(aterm_uds::CtlStream::pair).unwrap();
+    let receiver = std::thread::spawn(move || {
+        let mut marker = [0];
+        let _received = aterm_uds::fdpass::recv_with_fds(&child, &mut marker, 1).unwrap();
+        let mut nonce = [0; 32];
+        child.read_exact(&mut nonce).unwrap();
+        nonce[0] = if nonce[0] == b'0' { b'1' } else { b'0' };
+        child.write_all(&nonce).unwrap();
+    });
+    assert_eq!(control.send_attachment(&endpoint), Err(Error::Denied));
+    receiver.join().unwrap();
+    assert_eq!(control.bound().err(), Some(Error::Stale));
+    assert_eq!(control.send_attachment(&endpoint), Err(Error::Stale));
+}

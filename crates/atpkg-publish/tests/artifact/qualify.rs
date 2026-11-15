@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use atpkg_publish::artifact::qualify::{self, Plan, Receipt, Runner, Site, Stage, Verdict};
-use atpkg_publish::artifact::tools::{Ran, Run, RunError};
+use atpkg_publish::artifact::tools::{Queue, Ran, Run, RunError};
 use atpkg_publish::triple::AARCH64_APPLE_DARWIN as ARM;
 
 use super::super::shared::scratch;
@@ -577,12 +577,13 @@ fn the_steps_stop_at_the_first_that_does_not_pass() {
 #[test]
 fn the_builds_bound_is_judged_when_the_pack_returns() {
     let plan = plan(&[BUILD, VERSION]);
-    let built = Receipt::build(plan.build(), Duration::from_secs(900), Ok(()));
+    let none = Duration::ZERO;
+    let built = Receipt::build(plan.build(), Duration::from_secs(900), none, Ok(()));
     assert_eq!(
         (built.exit, built.verdict.clone()),
         (Some(0), Verdict::Passed)
     );
-    let slow = Receipt::build(plan.build(), Duration::from_secs(3601), Ok(()));
+    let slow = Receipt::build(plan.build(), Duration::from_secs(3601), none, Ok(()));
     assert!(
         why(&slow).contains("past its committed bound of 3600 s"),
         "{}",
@@ -591,8 +592,95 @@ fn the_builds_bound_is_judged_when_the_pack_returns() {
     let refused = Receipt::build(
         plan.build(),
         Duration::from_secs(5),
+        none,
         Err("the pack failed for aarch64-apple-darwin: no bin".into()),
     );
     assert_eq!(refused.exit, Some(1));
     assert!(why(&refused).contains("no bin"));
+}
+
+/// A runner whose command's builds waited `queued` to be admitted before it answered.
+struct Queued {
+    queued: Duration,
+    answer: std::result::Result<Ran, RunError>,
+}
+
+impl Runner for Queued {
+    fn run(&self, run: &Run) -> std::result::Result<Ran, RunError> {
+        run.queue
+            .as_ref()
+            .expect("a source step carries its queue")
+            .set_waited(self.queued);
+        self.answer.clone()
+    }
+}
+
+#[test]
+fn time_queued_for_admission_is_recorded_and_no_part_of_a_steps_bound() {
+    let tmp = scratch("qualify-queued");
+    let plan = plan(&[FMT, UNIT, BUILD, VERSION]);
+    let logs = tmp.path().join("logs");
+    let site = source_site(tmp.path(), &logs);
+    // The queue is the checkout's the step builds in, and a packed control, which builds
+    // nothing, has none.
+    let runner = Scripted::default()
+        .on("test --locked", exit(0, &summary(60, 0, 0), ""))
+        .on("--version", exit(0, "demo 1.0.0\n", ""));
+    qualify::run_step(&runner, &plan.source()[1], &site).expect("the step ran");
+    let unpacked = tmp.path().join("unpacked");
+    let packed = Site {
+        cwd: tmp.path(),
+        packed: Some((unpacked.as_path(), ARM)),
+        logs: &logs,
+    };
+    qualify::run_step(&runner, &plan.packed()[0], &packed).expect("the control ran");
+    let asked = runner.asked();
+    assert_eq!(asked[0].queue, Some(Queue::of(tmp.path())));
+    assert_eq!(asked[1].queue, None);
+
+    // 72 minutes in the queue, more than twice the step's bound of 1800 s: a pass, with the
+    // wait on its receipt beside its own time.
+    let queued = Duration::from_secs(4320);
+    let waited = Queued {
+        queued,
+        answer: exit(0, &summary(60, 0, 0), ""),
+    };
+    let receipt = qualify::run_step(&waited, &plan.source()[1], &site).expect("the step ran");
+    assert_eq!(receipt.verdict, Verdict::Passed, "{}", receipt.line());
+    assert_eq!(receipt.queued_millis, 4_320_000);
+    assert!(receipt.millis < 1_800_000, "{}", receipt.line());
+    assert!(
+        receipt
+            .line()
+            .contains("(after 4320 s queued for admission)"),
+        "{}",
+        receipt.line()
+    );
+    // Ended at its bound after such a wait, it says the wait was not what ended it.
+    let hung = Queued {
+        queued,
+        answer: Err(RunError::TimedOut),
+    };
+    let receipt = qualify::run_step(&hung, &plan.source()[1], &site).expect("the step ran");
+    assert!(
+        why(&receipt).contains(
+            "did not finish within its committed bound of 1800 s, the 4320 s it queued for \
+             admission not counted"
+        ),
+        "{}",
+        receipt.line()
+    );
+
+    // The build likewise: 4500 s that held 4320 s of queue is inside its 3600 s, and the same
+    // 4500 s with nothing queued is over it.
+    let whole = Duration::from_secs(4500);
+    let built = Receipt::build(plan.build(), whole, queued, Ok(()));
+    assert_eq!(built.verdict, Verdict::Passed, "{}", built.line());
+    assert_eq!((built.millis, built.queued_millis), (180_000, 4_320_000));
+    let slow = Receipt::build(plan.build(), whole, Duration::ZERO, Ok(()));
+    assert!(
+        why(&slow).contains("took 4500 s, past its committed bound of 3600 s"),
+        "{}",
+        slow.line()
+    );
 }

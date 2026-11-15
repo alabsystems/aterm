@@ -298,14 +298,19 @@ pub(crate) const PAGE: Page = Page {
                      within `timeout=` for it to close and judges the fence on it; any other \
                      turn waits as `text` does, and a frame still open has moved.",
                 ),
-                para(
+                para(concat!(
                     "`if-human=<n>` (`status human_seq=`, the `text --json` read's `human_seq`) \
                      fences on the person: any gesture since, one that moves no fenced row among \
                      them, is `OK 0 turn skipped reason=person submitted=0 seq=<n> id=<n>`, \
-                     judged under the fence's lock, and again before a plain turn's paste and \
-                     before the first submit press (`reason=person typed=<k> pasted=<p>`, the \
-                     text left unsubmitted).",
-                ),
+                     judged under the fence's lock, again before a plain turn's paste, and at \
+                     each submit press under the terminal lock that press is written under, as a \
+                     guarded submit is: one before the first press is `reason=person typed=<k> \
+                     pasted=<p>`, the text left unsubmitted, and one before a re-press stops the \
+                     re-presses. As a guarded submit's, a first press the sink takes none of \
+                     before `submit_window=` (or `timeout=`, if sooner) ends is `",
+                    turn_submit_busy_reply!(),
+                    "`, the text typed and not submitted.",
+                )),
                 para(
                     "`if-supervisor=<holder>` fences on the live supervisor claim (`meta set \
                      supervisor`), judged at each write (`help turn stops`). `cause=` links the \

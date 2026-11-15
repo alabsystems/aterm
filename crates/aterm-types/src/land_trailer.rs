@@ -18,14 +18,18 @@
 //! One `Aterm-Checked` line per judgment that came to a verdict, in the order they ran: the first
 //! judged the branch over the cone since the main commit it merged (`base`), and each re-judge the
 //! delta a later merge of main brought, since the commit judged before it. One
-//! `Aterm-Interrupted` line per judgment a main tip that could not compose interrupted, in the
-//! order they ran: the tree it was judging, its `base`, that `tip` (the base of the judgment after
-//! it) and how long it ran; it is no verdict, and nothing reads it as one. One `Aterm-Rechecked`
-//! line per recheck (`docs/DESIGN-landing-economy.md` §2.1): a passed judgment met a main tip
-//! whose shared paths were only Markdown no build, include or test reads, so the tool merged
-//! that tip (`onto`) and reran only the source readers (fmt, census and export-scan) on the merge
-//! (`tree`), over the cone since `base`. Each follows the `Aterm-Checked` line it extends, so a
-//! receipt's line order says whether its last judgment was a recheck; it is no re-judge.
+//! `Aterm-Interrupted` line per judgment a main tip interrupted because no round could answer for
+//! its merge, in the order they ran: the tree it was judging, its `base`, that `tip` (the base of
+//! the judgment after it) and how long it ran, less its wait for the judgment turn; it is no
+//! verdict, and nothing reads it as one. One `Aterm-Rechecked` line per round
+//! (`docs/DESIGN-landing-economy.md` §2.1): a passed judgment met a main tip that shares a path
+//! with the branch, so the tool merged that tip (`onto`), or a
+//! person did where the two conflicted, and judged the merge (`tree`) since `base`. Where the
+//! shared paths of a merge Git made are only Markdown no build, include or test reads, the round
+//! is the source readers alone (fmt, census and export-scan); otherwise it also runs the dev set
+//! over the crates of the merge's cone that the shared paths or main's change reach. Each
+//! follows the `Aterm-Checked` line it extends, so a receipt's line order says whether its last
+//! judgment was a round; it is no re-judge.
 //! `Aterm-Composed-Onto` names the main commit the last judgment was composed onto without a run;
 //! `Aterm-Inherited` is one red item main already had outside the branch's crates per line.
 
@@ -33,7 +37,7 @@
 pub const CHECKED: &str = "Aterm-Checked";
 /// One interrupted judgment's trailer key.
 pub const INTERRUPTED: &str = "Aterm-Interrupted";
-/// One recheck's trailer key.
+/// One round's trailer key.
 pub const RECHECKED: &str = "Aterm-Rechecked";
 /// The trailer key naming the main commit a judged tree was composed onto.
 pub const COMPOSED_ONTO: &str = "Aterm-Composed-Onto";
@@ -79,18 +83,21 @@ pub struct Interrupted {
     pub base: String,
     /// The main tip that did not compose, which the judgment after it merged.
     pub tip: String,
-    /// The run's wall seconds until it ended.
+    /// The run's wall seconds until it ended, less any wait for the judgment turn
+    /// (`docs/DESIGN-landing-economy.md` §2.3): the judging the cut discarded. A judgment cut
+    /// while it still waited for its turn judged nothing, and counts only its start.
     pub secs: u64,
 }
 
-/// One recheck: the merge of a passed judgment with a main tip that shared only no-reach
-/// Markdown, the source readers' rows on it, the commit their cone was computed from, the tip it
-/// merged, and how long they ran.
+/// One round: the merge of a passed judgment with a main tip that shares a path with the branch,
+/// each row the round ran on it, the commit its cone was computed from, the tip it merged, and
+/// how long it ran.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Rechecked {
     /// The merge's tree object id: what the landing pushes, or what a later composition merges.
     pub tree: String,
-    /// Each source reader's row, in the order the run finished them.
+    /// Each row the round ran, in the order the run finished them: the source readers', and
+    /// each other check's where the round judged crates.
     pub rows: Vec<Row>,
     /// The commit the run's cone was computed from (`verify --base`).
     pub base: String,

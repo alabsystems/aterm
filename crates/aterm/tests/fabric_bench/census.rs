@@ -85,7 +85,7 @@ pub fn class_of(subject: &str) -> String {
         .map(|seg| {
             if seg.starts_with("n-") {
                 "<node>"
-            } else if seg.starts_with("s-") {
+            } else if seg.starts_with("s-") || aterm_types::tab_id::is_tab_id(seg) {
                 "<sid>"
             } else if seg.starts_with("h-") || seg.starts_with("a-") {
                 "<principal>"

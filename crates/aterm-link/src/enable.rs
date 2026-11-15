@@ -5123,7 +5123,7 @@ fn session_sids(ctl: &mut Ctl) -> Vec<String> {
         .filter(crate::ctl::Reply::ok)
         .map(|r| {
             fabric::session_ids(r.rows())
-                .filter(|s| s.starts_with("s-"))
+                .filter(|s| crate::subject::is_session_id(s))
                 .map(str::to_string)
                 .collect()
         })

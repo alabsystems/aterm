@@ -28,6 +28,9 @@ workspace = true
 dev-seams = []
 
 [dependencies]
+# The readers of an agent's reply words and the texts the turn-end policy types (needs, Land's
+# check, the go-ahead, Cruise's carry, press guards, the read-only command classifier).
+alab-policy = { workspace = true }
 aterm-mail = { workspace = true }
 # This Mac's network place: `aterm fleet peers` names it under its first line and says why no
 # member answers from another network, in the words every reporter uses (`fleet_member`).

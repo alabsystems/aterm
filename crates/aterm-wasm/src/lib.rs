@@ -27,6 +27,8 @@ mod frame_geometry_api;
 #[cfg(test)]
 use facade_api::selection_range_for;
 mod host;
+mod json;
+use json::{json_string, write_json_string};
 mod messages_api;
 mod notifications_api;
 mod predict_api;
@@ -932,48 +934,6 @@ impl SelectionRange {
     pub const fn end_y(&self) -> u16 {
         self.end_y
     }
-}
-
-/// JSON-escape `s` and wrap it in double quotes.
-pub(crate) fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Classify a matched span: 1=url (scheme or www. host), 2=file_path (absolute,
-/// relative, home, or contains `/` with no scheme), else 3=other (plain word).
-fn classify(s: &str) -> u8 {
-    let lower = s.to_ascii_lowercase();
-    if lower.starts_with("http://")
-        || lower.starts_with("https://")
-        || lower.starts_with("ftp://")
-        || lower.starts_with("file://")
-        || lower.starts_with("www.")
-    {
-        return 1;
-    }
-    if s.starts_with('/')
-        || s.starts_with("./")
-        || s.starts_with("../")
-        || s.starts_with("~/")
-        || (s.contains('/') && !s.contains("://"))
-    {
-        return 2;
-    }
-    3
 }
 
 #[cfg(not(target_arch = "wasm32"))]

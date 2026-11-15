@@ -3,13 +3,13 @@
 
 //! The owner's views on a real lab: a scratch Commons whose registry a fixture fleet_db replica
 //! filled, read in place. No live vault, no window: the grid's opener is a closure that edits
-//! the file as the owner would, and the session's answer is injected.
+//! the file as the owner would, and the secret store is an in-memory one ([`Memory`]).
 
 use super::*;
 use crate::alab::command::tests::{NOW, email_row, replica_fixture, words};
 use crate::alab::import::tests::Stand;
 use crate::table::tests::Lab;
-use crate::typed::{grid::tests::put, keys};
+use crate::typed::{grid::tests::put, keys, secret::Memory};
 use aterm_secrets::commons::roster::Role;
 use std::path::Path;
 
@@ -40,7 +40,7 @@ fn a_rekey_cut_short_after_its_rename_refuses_fleet_db_and_the_import() {
         assert!(refused.to_string().contains("aterm db rekey"), "{refused}");
     }
     let mut never = |_: &Path| -> Result<()> { panic!("no review") };
-    let refused = super::super::run(
+    let refused = crate::alab::command::tests::run(
         paths,
         &words(&["import", "--fleet-db", "--authoritative"]),
         Some(&Stand),
@@ -52,12 +52,13 @@ fn a_rekey_cut_short_after_its_rename_refuses_fleet_db_and_the_import() {
 }
 
 /// A lab whose registry holds `n` imported mailbox logins, each password
-/// `synthetic-pass-<n>`.
+/// `synthetic-pass-<n>` in the replica.
 fn imported(n: usize) -> Lab {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], NOW);
     replica_fixture(&lab.paths[0], n, "active");
     let mut never = |_: &Path| -> Result<()> { panic!("no review") };
-    super::super::run(
+    crate::alab::command::tests::run(
         &lab.paths[0],
         &words(&["import", "--fleet-db", "--authoritative", "--apply"]),
         Some(&Stand),
@@ -68,376 +69,727 @@ fn imported(n: usize) -> Lab {
     lab
 }
 
-/// Run one view with the session's answer `gate`, the grid opener `open`, standard input
-/// `stdin`, and the reveal journal in `journal`.
+/// Run one view with the grid opener `open`, standard input `stdin`, and the secret store
+/// `store`.
 fn view(
     paths: &Paths,
     noun: Noun,
     list: &[&str],
-    gate: &dyn Fn() -> Result<Place>,
-    open: &mut dyn FnMut(&Opening<'_>) -> Result<()>,
+    open: &mut dyn FnMut(&Path, usize) -> Result<()>,
     stdin: &[u8],
-    journal: &Journal,
+    store: &Memory,
 ) -> Result<Value> {
     let bytes = stdin.to_vec();
     let mut read = move || Ok(zeroize::Zeroizing::new(bytes.clone()));
     let mut io = ViewIo {
-        gate,
         open,
         read_stdin: &mut read,
-        journal,
+        store,
+        // A test's refusing floor stands for one Mac holding the roll back.
+        holding: &|| Ok(usize::from(store.admit().is_err())),
         now_ms: NOW,
     };
     run(paths, noun, &words(list), &mut io)
 }
 
-/// The session's answer outside aterm: no session holds the caller, so its terminal is the
-/// person's own.
-fn allowed() -> Result<Place> {
-    Ok(Place::Outside)
-}
-
-/// The session's answer in a person's aterm tab.
-fn in_tab() -> Result<Place> {
-    Ok(Place::Tab(TAB.to_owned()))
-}
-
-/// The person's tab [`in_tab`] names.
-const TAB: &str = "s-0a17";
-
-fn spawned() -> Result<Place> {
-    Err(Error::new("plaintext is not shown here: spawned"))
-}
-
-fn no_grid(_: &Opening<'_>) -> Result<()> {
+fn no_grid(_: &Path, _: usize) -> Result<()> {
     panic!("no grid opens")
 }
 
-/// The reveal journal's records: one line per revealed cell, coordinates only.
-fn journaled(dir: &Path) -> Vec<Value> {
-    std::fs::read_to_string(dir.join("reveals.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .map(|line| aterm_json::from_str(line).unwrap())
-        .collect()
-}
-
-/// The emails view shows every row with its password masked and addresses masked; with
-/// `--show-passwords` in a session that may reveal, each password in plaintext, each reveal
-/// journaled first by coordinates only; in a session that may not (a `ctl spawn`ed one), it
-/// refuses before any cell is opened and journals nothing.
-/// NEGATIVE CONTROL: with `run` skipping the gate for `--show-passwords`, the spawned session
-/// reveals: `` assertion failed: refused.is_err() ``.
-#[test]
-fn emails_mask_passwords_and_reveal_only_where_the_session_may() {
-    let lab = imported(3);
-    let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
-    let plain = view(
-        paths,
-        Noun::Emails,
-        &[],
-        &spawned,
-        &mut no_grid,
-        b"",
-        &journal,
-    )
-    .unwrap();
-    let rows = plain["emails"].as_array().unwrap();
-    assert_eq!(rows.len(), 3, "{plain}");
-    let text = aterm_json::to_string(&plain).unwrap();
-    assert!(
-        !text.contains("synthetic-pass") && !text.contains("box01@"),
-        "{text}"
-    );
-    assert!(
-        rows.iter().all(|r| r["password"] == json!(MASK_TEXT)),
-        "{plain}"
-    );
-    let refused = view(
-        paths,
-        Noun::Emails,
-        &["--show-passwords"],
-        &spawned,
-        &mut no_grid,
-        b"",
-        &journal,
-    );
-    assert!(refused.is_err());
-    assert!(journaled(scratch.path()).is_empty(), "nothing was opened");
-    let shown = view(
-        paths,
-        Noun::Emails,
-        &["--show-passwords"],
-        &allowed,
-        &mut no_grid,
-        b"",
-        &journal,
-    )
-    .unwrap();
-    let box01 = keys::address_pk("box01@proton.example").unwrap();
-    let row = shown["emails"]
+/// The row of a listing whose `ad` key is `address`'s.
+fn email(listed: &Value, address: &str) -> Value {
+    let pk = keys::address_pk(address).unwrap();
+    listed["emails"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| r["ad"] == json!(box01))
-        .unwrap();
-    assert_eq!(row["password"], json!("synthetic-pass-01"));
-    assert_eq!(row["addr"], json!("box01@proton.example"));
-    let records = journaled(scratch.path());
-    assert_eq!(records.len(), 3);
-    let record = aterm_json::to_string(&records).unwrap();
-    assert!(!record.contains("synthetic-pass"), "{record}");
-    assert!(records.iter().all(|r| r["surface"] == json!("Terminal")));
+        .find(|r| r["ad"] == json!(pk))
+        .unwrap()
+        .clone()
 }
 
-/// In a person's aterm tab, `--show-passwords` prints no value: it opens the `--edit` grid
-/// read-only, every password revealed, in a private folder beside that tab's session, returns
-/// nothing to print, and removes the folder when the tab closes. What the file holds when it
-/// closes is never read back: the table is as it was. Each reveal is journaled as the grid's.
-/// NEGATIVE CONTROL: with `run` printing whatever the gate's place, the tab gets the values:
-/// `` printed in the tab: {"complete":… ``.
+/// The emails view shows every row with its address as it is (ordinary data, no flag to show
+/// it) and no password's text anywhere: a table holds no secret to show. The flags that showed a
+/// secret or digested a table are gone and refused as unknown.
+/// NEGATIVE CONTROL: with `shown_row` masking addresses (as `--show-addresses` once gated),
+/// `` left: String("••••••") right: String("box01@proton.example") ``.
 #[test]
-fn in_a_persons_tab_show_passwords_opens_a_read_only_grid_beside_it() {
+fn emails_show_addresses_as_they_are_and_no_password() {
     let lab = imported(3);
     let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
-    let mut folders = Vec::new();
-    let mut open = |opening: &Opening<'_>| -> Result<()> {
-        assert_eq!(opening.beside, Some(TAB), "beside the person's tab");
-        assert!(opening.read_only, "opened to be read");
-        assert_eq!(opening.line, 1);
-        // The password column, by the header the grid writes, is named to the window as
-        // concealed (`edit … secret=`): no reader of it but the person's eyes gets those cells.
-        assert_eq!(opening.secret, ["password".to_string()]);
-        let path = opening.file;
-        let header = std::fs::read_to_string(path).unwrap();
-        let header = header.lines().next().unwrap_or_default();
-        assert!(
-            header.split('\t').any(|named| named == "password"),
-            "the named header is the grid's own: {header}"
-        );
-        assert!(
-            aterm_types::private_edit::is_private(path),
-            "{}",
-            path.display()
-        );
-        let shown = path.to_string_lossy();
-        assert!(
-            !shown.contains("synthetic") && !shown.contains('@'),
-            "{shown}"
-        );
-        folders.push(path.parent().unwrap().to_owned());
-        let held = std::fs::read_to_string(path).unwrap();
-        for n in 1..=3 {
-            assert!(held.contains(&format!("synthetic-pass-0{n}")), "{held}");
-        }
-        assert!(held.contains("box01@proton.example"), "addresses shown");
-        // Whatever the person's buffer did, nothing is read back.
-        std::fs::write(path, held.replace("synthetic-pass-01", "typed-in-the-grid")).unwrap();
-        Ok(())
-    };
-    let shown = view(
-        paths,
-        Noun::Emails,
-        &["--show-passwords"],
-        &in_tab,
-        &mut open,
-        b"",
-        &journal,
-    )
-    .unwrap();
+    let store = Memory::default();
+    let listed = view(paths, Noun::Emails, &[], &mut no_grid, b"", &store).unwrap();
+    assert_eq!(listed["emails"].as_array().unwrap().len(), 3, "{listed}");
     assert_eq!(
-        shown,
-        Value::Null,
-        "printed in the tab: {}",
-        aterm_json::to_string(&shown).unwrap()
+        email(&listed, "box01@proton.example")["addr"],
+        json!("box01@proton.example")
     );
-    assert_eq!(folders.len(), 1);
-    assert!(!folders[0].exists(), "the folder goes when the tab closes");
-    let records = journaled(scratch.path());
-    assert_eq!(records.len(), 3, "{records:?}");
-    assert!(records.iter().all(|r| r["surface"] == json!("Grid")));
-    assert!(
-        !aterm_json::to_string(&records)
-            .unwrap()
-            .contains("synthetic")
-    );
-    let printed = view(
-        paths,
-        Noun::Emails,
-        &["--show-passwords"],
-        &allowed,
-        &mut no_grid,
-        b"",
-        &journal,
-    )
-    .unwrap();
-    let text = aterm_json::to_string(&printed).unwrap();
-    assert!(
-        text.contains("synthetic-pass-01") && !text.contains("typed-in-the-grid"),
-        "outside aterm it prints, and the read-only grid wrote nothing: {text}"
-    );
-}
-
-/// In a person's aterm tab, `--edit` opens the editable grid beside that tab's session, never in
-/// the terminal; outside aterm, in the terminal. A refused gate opens nothing.
-#[test]
-fn in_a_persons_tab_the_editable_grid_opens_beside_it() {
-    let lab = imported(1);
-    let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
-    for (gate, beside) in [
-        (&in_tab as &dyn Fn() -> Result<Place>, Some(TAB)),
-        (&allowed, None),
+    let text = aterm_json::to_string(&listed).unwrap();
+    assert!(!text.contains("synthetic-pass"), "{text}");
+    for gone in [
+        "--show-addresses",
+        "--show-passwords",
+        "--show-numbers",
+        "--digest",
     ] {
-        let mut opened = Vec::new();
-        let mut open = |opening: &Opening<'_>| -> Result<()> {
-            opened.push((opening.beside.map(str::to_owned), opening.read_only));
-            assert_eq!(
-                opening.secret,
-                ["password".to_string()],
-                "revealed, editable"
-            );
-            Ok(())
-        };
-        let edited = view(
-            paths,
-            Noun::Emails,
-            &["--edit"],
-            gate,
-            &mut open,
-            b"",
-            &journal,
-        )
-        .unwrap();
-        assert_eq!(edited["cells"], json!(0), "{edited}");
-        assert_eq!(opened, [(beside.map(str::to_owned), false)]);
+        let refused = view(paths, Noun::Emails, &[gone], &mut no_grid, b"", &store).unwrap_err();
+        assert!(refused.to_string().contains("unknown option"), "{refused}");
     }
-    assert!(
-        view(
-            paths,
-            Noun::Phones,
-            &["--show-numbers"],
-            &spawned,
-            &mut no_grid,
-            b"",
-            &journal
-        )
-        .is_err()
-    );
 }
 
-/// A grid names to the window, as concealed, each live `Secret` column by the header it writes:
-/// the plain name where the column is revealed, `=`-marked where it shows masked and read-only;
-/// a table with no `Secret` column names none.
+/// `set … password --stdin` puts the value into the secret store and writes only the reference
+/// to its entry: the listing and the grid show the entry's name, the table's cells hold
+/// `{vault, entry}`, and the JSON the verb prints names the entry and never the value. A value on
+/// argv or shaped like a flag is refused with nothing stored. An empty value clears the cell and
+/// removes the entry.
+/// NEGATIVE CONTROL: every value [`Memory::every`] was ever handed is absent from each printed
+/// output, every table cell and the grid file; with `set` writing the plaintext into the cell
+/// (`Value::String(text)` in place of the reference), the stored value is in the table:
+/// `` the value reached the table ``.
 #[test]
-fn a_grid_names_its_secret_columns_by_the_headers_it_writes() {
-    use crate::alab::registry::{ADDRESS, MACHINE, PHONE};
-    assert_eq!(grid::secret_headers(&ADDRESS, true), ["password"]);
-    assert_eq!(grid::secret_headers(&ADDRESS, false), ["=password"]);
-    assert_eq!(grid::secret_headers(&PHONE, true), ["number"]);
-    assert!(grid::secret_headers(&MACHINE, true).is_empty());
-}
-
-/// The one line a tab gets names the Editor tab and what it holds, never a value.
-#[test]
-fn the_tab_gets_one_line_naming_the_editor_tab() {
-    let line = opened_line(Noun::Emails, 7);
-    assert_eq!(
-        line,
-        "aterm db emails: the passwords are in the read-only Editor tab beside this one (view 7); \
-         close it when done"
-    );
-    assert!(!line.contains('\n'));
-    assert!(opened_line(Noun::Phones, 9).contains("the numbers are in"));
-}
-
-/// The masked spelling every surface shows a set `Secret` cell in.
-const MASK_TEXT: &str = crate::typed::secret::MASK;
-
-/// `set` writes one cell as the owner: a password only from standard input (a trailing newline
-/// from a pipe removed), never on argv, never a flag-shaped value; any other column from argv.
-/// It is not session-gated: it shows no value.
-/// NEGATIVE CONTROL: with `set` taking a `Secret` value from argv, the password on the command
-/// line is written: `` assertion failed: on_argv.is_err() ``.
-#[test]
-fn set_takes_a_password_only_from_stdin() {
+fn set_puts_a_password_in_the_store_and_only_its_entry_name_in_the_table() {
     let lab = imported(2);
     let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
+    let store = Memory::default();
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    let mut printed = Vec::new();
+
     let on_argv = view(
         paths,
         Noun::Emails,
         &["set", "box01@proton.example", "password", "argv-password-1"],
-        &spawned,
         &mut no_grid,
         b"",
-        &journal,
+        &store,
     );
     assert!(on_argv.is_err());
     let flag = view(
         paths,
         Noun::Emails,
         &["set", "box01@proton.example", "password", "--stdin"],
-        &spawned,
         &mut no_grid,
         b"1\n",
-        &journal,
+        &store,
     );
     assert!(flag.unwrap_err().to_string().contains("flag"));
+    assert!(store.every().is_empty(), "nothing refused was stored");
+
     let written = view(
         paths,
         Noun::Emails,
         &["set", "box01@proton.example", "password", "--stdin"],
-        &spawned,
         &mut no_grid,
         b"piped-password-new\n",
-        &journal,
+        &store,
+    )
+    .unwrap();
+    // The new value takes a fresh tagged entry of the cell's, and the entry the replaced
+    // candidate named is removed.
+    let entry = written["entry"].as_str().unwrap().to_owned();
+    assert!(
+        secret::bound("address", "password", &box01, &entry),
+        "{entry}"
+    );
+    assert_eq!(written["written"], json!(1), "{written}");
+    assert_eq!(written["removed"], json!(1), "{written}");
+    assert_eq!(
+        store.held(&entry).as_deref(),
+        Some("piped-password-new"),
+        "the trailing newline is removed and the value is in the store"
+    );
+    printed.push(written);
+
+    let cell = addresses(paths).rows[&box01].get("password").cloned();
+    assert_eq!(
+        cell,
+        Some(secret::reference(Memory::VAULT, &entry)),
+        "the cell holds the reference only"
+    );
+    let listed = view(paths, Noun::Emails, &[], &mut no_grid, b"", &store).unwrap();
+    assert_eq!(
+        email(&listed, "box01@proton.example")["password"],
+        json!(entry)
+    );
+    printed.push(listed);
+
+    let mut grid_text = String::new();
+    let mut open = |file: &Path, _: usize| -> Result<()> {
+        grid_text = std::fs::read_to_string(file).unwrap();
+        Ok(())
+    };
+    printed.push(view(paths, Noun::Emails, &["--edit"], &mut open, b"", &store).unwrap());
+    let header: Vec<&str> = grid_text.lines().next().unwrap().split('\t').collect();
+    assert!(
+        header.contains(&"=password"),
+        "{header:?}: a secret column is read-only in the grid"
+    );
+    assert!(grid_text.contains(&entry), "the grid names the entry");
+
+    // The negative control: no value the store was handed reached any output or any cell.
+    let cells = format!(
+        "{:?}",
+        crate::alab::Registry::at(paths.clone())
+            .view()
+            .unwrap()
+            .cells
+    );
+    let every = store.every();
+    assert_eq!(every, ["piped-password-new"]);
+    for value in &every {
+        for out in &printed {
+            let text = aterm_json::to_string(out).unwrap();
+            assert!(!text.contains(value.as_str()), "printed: {text}");
+        }
+        assert!(
+            !cells.contains(value.as_str()),
+            "the value reached the table"
+        );
+        assert!(
+            !grid_text.contains(value.as_str()),
+            "the value reached the grid"
+        );
+    }
+
+    // An empty value clears the cell and removes the entry.
+    let cleared = view(
+        paths,
+        Noun::Emails,
+        &["set", "box01@proton.example", "password", "--stdin"],
+        &mut no_grid,
+        b"",
+        &store,
+    )
+    .unwrap();
+    assert_eq!(cleared["written"], json!(1), "{cleared}");
+    assert_eq!(cleared["entry"], Value::Null);
+    assert_eq!(store.held(&entry), None, "the entry is removed");
+    assert!(
+        addresses(paths).rows[&box01]
+            .get("password")
+            .is_none_or(Value::is_null),
+        "the reference is cleared"
+    );
+}
+
+/// A revert of a secret write, a clear included, is refused, naming why: its preimage names the
+/// entry the write removed once it landed, and the new entry would stay with no cell naming it.
+/// The cell keeps naming what it named, and the store keeps its value.
+/// NEGATIVE CONTROL: with `Handle::revert` skipping `refuse_secret_revert`, the revert lands and
+/// the cell names the removed entry: `` called `Result::unwrap_err()` on an `Ok` value ``.
+#[test]
+fn a_revert_never_restores_a_secret_cell() {
+    use crate::typed::cell::Field;
+    let lab = imported(1);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    let set = |stdin: &[u8]| {
+        view(
+            paths,
+            Noun::Emails,
+            &["set", "box01@proton.example", "password", "--stdin"],
+            &mut no_grid,
+            stdin,
+            &store,
+        )
+        .unwrap()
+    };
+    let handle = crate::att::Handle::at(paths.clone(), &crate::att::REGISTRY);
+    let last_write = || match addresses(paths).rows[&box01].fields.get("password") {
+        Some(Field::Value(candidate)) => candidate.operation,
+        other => panic!("one candidate: {other:?}"),
+    };
+    let written = set(b"piped-password-new\n");
+    let entry = written["entry"].as_str().unwrap().to_owned();
+    let refused = handle
+        .revert([7; 16], last_write())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("a revert never restores a secret cell (address.password)"),
+        "{refused}"
+    );
+    assert_eq!(
+        addresses(paths).rows[&box01].get("password").cloned(),
+        Some(secret::reference(Memory::VAULT, &entry))
+    );
+    assert_eq!(store.held(&entry).as_deref(), Some("piped-password-new"));
+
+    set(b"");
+    let refused = handle
+        .revert([8; 16], last_write())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("a revert never restores a secret cell"),
+        "{refused}"
+    );
+    assert!(
+        addresses(paths).rows[&box01]
+            .get("password")
+            .is_none_or(Value::is_null)
+    );
+}
+
+/// A secret write that landed reports what it wrote even when the settle after it fails (the
+/// owed record cannot be written): the cell names the new entry, the report says so, counts as
+/// owed each entry the write replaced and its own put (whose payment the failed settle may not
+/// have recorded), and names the settle's failure, never a value. A retry would put yet another
+/// entry.
+/// NEGATIVE CONTROL: with `settle_set(…)?` evaluated before `committed?` (before the fix), the
+/// set fails with the settle's error: `` called `Result::unwrap()` on an `Err` value: Error("the
+/// memory store's owed record cannot be written") ``.
+#[test]
+fn a_landed_set_reports_its_outcome_when_its_settle_fails() {
+    let lab = imported(1);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
+    store.break_records();
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    let written = view(
+        paths,
+        Noun::Emails,
+        &["set", "box01@proton.example", "password", "--stdin"],
+        &mut no_grid,
+        b"piped-password-new\n",
+        &store,
     )
     .unwrap();
     assert_eq!(written["written"], json!(1), "{written}");
-    assert!(!aterm_json::to_string(&written).unwrap().contains("piped"));
+    let entry = written["entry"].as_str().unwrap().to_owned();
+    assert_eq!(
+        addresses(paths).rows[&box01].get("password").cloned(),
+        Some(secret::reference(Memory::VAULT, &entry))
+    );
+    let why = written["settle_error"].as_str().unwrap();
+    assert!(why.contains("owed record"), "{written}");
+    assert!(!why.contains("piped-password-new"));
+    assert_eq!(written["removed"], json!(0), "{written}");
+    assert_eq!(
+        written["owed"].as_u64(),
+        written["replaced"].as_u64().map(|replaced| replaced + 1),
+        "each replaced entry and the put itself: {written}"
+    );
+}
+
+/// A protected row takes no secret: `set … password --stdin` on one is refused before anything
+/// is stored.
+/// NEGATIVE CONTROL: with `set` skipping the protected check, the value is stored:
+/// `` assertion failed: store.every().is_empty() ``.
+#[test]
+fn a_protected_row_takes_no_password() {
+    let lab = imported(1);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    crate::alab::Registry::at(paths.clone())
+        .write(vec![vec![put(&ADDRESS, &box01, "protected", json!(true))]])
+        .unwrap();
+    let refused = view(
+        paths,
+        Noun::Emails,
+        &["set", "box01@proton.example", "password", "--stdin"],
+        &mut no_grid,
+        b"protected-row-password\n",
+        &store,
+    )
+    .unwrap_err();
+    assert!(refused.to_string().contains("protected"), "{refused}");
+    assert!(!refused.to_string().contains("protected-row-password"));
+    assert!(store.every().is_empty());
+}
+
+/// A phone's number is ordinary data: `set <row> number <value>` takes it from argv, stores the
+/// registry's one form of it (its digits), the listing shows it as stored, and a value that is
+/// no phone number is refused. Nothing goes to the secret store.
+/// NEGATIVE CONTROL: with `number` a secret column, the argv value is refused: `` called
+/// `Result::unwrap()` on an `Err` value: Error("a number never goes on the command line…") ``.
+#[test]
+fn a_phone_number_is_written_and_shown_plainly() {
+    let lab = imported(1);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
+    let phone = keys::random_pk(keys::Random::Phone).unwrap();
+    crate::alab::Registry::at(paths.clone())
+        .write(vec![vec![
+            put(&PHONE, &phone, "last4", json!("1234")),
+            put(&PHONE, &phone, "label", json!("desk")),
+            put(&PHONE, &phone, "row", json!("live")),
+        ]])
+        .unwrap();
+    let written = view(
+        paths,
+        Noun::Phones,
+        &["set", "desk", "number", "+15550101234"],
+        &mut no_grid,
+        b"",
+        &store,
+    )
+    .unwrap();
+    assert_eq!(written["written"], json!(1), "{written}");
+    assert!(written.get("entry").is_none(), "{written}");
+    let listed = view(paths, Noun::Phones, &[], &mut no_grid, b"", &store).unwrap();
+    let row = listed["phones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["ph"] == json!(phone))
+        .unwrap()
+        .clone();
+    assert_eq!(row["number"], json!("5550101234"), "{listed}");
+    assert!(
+        view(
+            paths,
+            Noun::Phones,
+            &["set", "desk", "number", "not-a-number"],
+            &mut no_grid,
+            b"",
+            &store,
+        )
+        .is_err()
+    );
+    assert!(store.every().is_empty());
+}
+
+/// A lab whose registry is at the generation a new lab starts at, one builds up to 0.200.0 read
+/// (its secret columns and a phone's number sealed tokens), with `n` imported mailbox logins,
+/// each with its password sealed into its cell.
+fn imported_sealed(n: usize) -> Lab {
+    let lab = Lab::new(&[Role::Writer]);
+    replica_fixture(&lab.paths[0], n, "active");
+    let mut never = |_: &Path| -> Result<()> { panic!("no review") };
+    crate::alab::command::tests::run(
+        &lab.paths[0],
+        &words(&["import", "--fleet-db", "--authoritative", "--apply"]),
+        Some(&Stand),
+        &mut never,
+        NOW,
+    )
+    .unwrap();
+    lab
+}
+
+/// A phone row labelled `desk` in `paths`' registry, with no number yet: its key.
+fn desk_phone(paths: &Paths) -> String {
+    let phone = keys::random_pk(keys::Random::Phone).unwrap();
+    crate::alab::Registry::at(paths.clone())
+        .write(vec![vec![
+            put(&PHONE, &phone, "last4", json!("1234")),
+            put(&PHONE, &phone, "label", json!("desk")),
+            put(&PHONE, &phone, "row", json!("live")),
+        ]])
+        .unwrap();
+    phone
+}
+
+/// Seals `text` into `column` of `noun`'s row `pk`, as a build up to 0.200.0 sealed whatever its
+/// `set … --stdin` or its grid was given.
+fn seal_cell(paths: &Paths, noun: Noun, pk: &str, column: &str, text: &str) {
+    crate::alab::Registry::at(paths.clone())
+        .seal_as_older(noun.collection().name, pk, column, text)
+        .unwrap();
+}
+
+/// What the sealed token in `column` of `noun`'s row `pk` opens to: a test's own read of it.
+fn opened_cell(paths: &Paths, noun: Noun, pk: &str, column: &str) -> Option<String> {
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    let collection = noun.collection_at(&handle).name;
+    let token = stored_cell(paths, noun, pk, column)?.as_str()?.to_owned();
+    handle
+        .open_cells(&[(collection, pk, column, token.as_str())])
+        .unwrap()
+        .pop()
+        .flatten()
+        .map(|secret| secret.plaintext().to_owned())
+}
+
+/// What `noun`'s row `pk` holds in `column`, as stored.
+fn stored_cell(paths: &Paths, noun: Noun, pk: &str, column: &str) -> Option<Value> {
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    let held = handle.view().unwrap().project(noun.collection_at(&handle));
+    held.rows[pk].get(column).cloned()
+}
+
+/// The `phones` view's row `pk`.
+fn phone_row(paths: &Paths, pk: &str) -> Value {
+    let store = Memory::default();
+    let listed = view(paths, Noun::Phones, &[], &mut no_grid, b"", &store).unwrap();
+    listed["phones"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["ph"] == json!(pk))
+        .unwrap()
+        .clone()
+}
+
+/// Where the generation holds a phone's number sealed (the form builds up to 0.200.0 read), it
+/// is still ordinary data: `phones` shows it with no flag, and `set <row> number` takes it on
+/// the command line or from `--stdin`, holds what is typed to a number's shape, and stores the
+/// registry's one form of it (the importer's digits) with the row's `last4`, sealed, so the
+/// stored cell is still a token. An empty value clears the number and leaves `last4`. Nothing
+/// goes to the secret store.
+/// NEGATIVE CONTROL: with `run` skipping `att::open_ordinary` for a noun's ordinary column
+/// (`grid::Opened::new()` in its place), the view shows the sealed number as a mask:
+/// `` left: String("••••••") right: String("5550101234") ``.
+#[test]
+fn a_sealed_generation_shows_a_phone_number_and_seals_the_one_set() {
+    let lab = imported_sealed(1);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
+    let phone = desk_phone(paths);
+    let set = |value: &[&str], stdin: &[u8]| {
+        let mut words = vec!["set", "desk", "number"];
+        words.extend_from_slice(value);
+        view(paths, Noun::Phones, &words, &mut no_grid, stdin, &store)
+    };
+    assert_eq!(phone_row(paths, &phone)["number"], Value::Null);
+    let written = set(&[" +15550101234 "], b"").unwrap();
+    assert_eq!(written["written"], json!(1), "last4 already says 1234");
+    assert!(written.get("entry").is_none(), "{written}");
+    assert_eq!(phone_row(paths, &phone)["number"], json!("5550101234"));
+    let token = stored_cell(paths, Noun::Phones, &phone, "number");
+    assert!(
+        token
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(crate::typed::secret::is_sealed),
+        "this generation holds the number sealed"
+    );
+    let again = set(&["+15550101234"], b"").unwrap();
+    assert_eq!(again["written"], json!(0), "the number it already holds");
+    assert_eq!(stored_cell(paths, Noun::Phones, &phone, "number"), token);
+    let piped = set(&["--stdin"], b"15550109999\n").unwrap();
+    assert_eq!(piped["written"], json!(2), "the number and its last4");
+    let row = phone_row(paths, &phone);
+    assert_eq!(row["number"], json!("5550109999"));
+    assert_eq!(row["last4"], json!("9999"));
+    for shape in ["555 0101", "123456", "not-a-number", "+1 (202) 555-0149 x2"] {
+        let refused = set(&[shape], b"").unwrap_err().to_string();
+        assert!(refused.contains("7 to 15 digits"), "{shape}: {refused}");
+    }
+    assert_eq!(
+        phone_row(paths, &phone)["number"],
+        json!("5550109999"),
+        "a refusal wrote none"
+    );
+    let cleared = set(&[""], b"").unwrap();
+    assert_eq!(cleared["written"], json!(1), "{cleared}");
+    let row = phone_row(paths, &phone);
+    assert_eq!(row["number"], Value::Null);
+    assert_eq!(row["last4"], json!("9999"), "a clear leaves last4");
+    assert!(store.every().is_empty());
+}
+
+/// What a sealed `number` cell holds is shown only when it reads as a phone number: text a build
+/// up to 0.200.0 sealed there under a secret's contract (any `--stdin` text, a credential
+/// included) stays masked, and so does a token that does not open at its own coordinates.
+/// NEGATIVE CONTROL: with `att::open_ordinary` keeping every opened value (`numbers` always
+/// true in `open_with`), the view prints the sealed sentence: `` left: String("5550149 pin
+/// 482913") right: String("••••••") ``.
+#[test]
+fn a_sealed_number_cell_that_holds_no_number_stays_masked() {
+    // In halves, so the export guard never reads a token here.
+    const TOKEN: &str = concat!("ghp", "_cccccccccccccccccccccccc");
+    let lab = imported_sealed(1);
+    let paths = &lab.paths[0];
+    let phone = desk_phone(paths);
+    for held in ["5550149 pin 482913", TOKEN] {
+        seal_cell(paths, Noun::Phones, &phone, "number", held);
+        assert_eq!(
+            phone_row(paths, &phone)["number"],
+            json!(crate::typed::secret::MASK),
+            "a sealed cell that is no number"
+        );
+    }
+    // A number as an older build's `--stdin` took it, separators and all, still shows.
+    seal_cell(paths, Noun::Phones, &phone, "number", "+1 (202) 555-0149");
+    assert_eq!(
+        phone_row(paths, &phone)["number"],
+        json!("+1 (202) 555-0149")
+    );
+    // Another row's token does not open at this row's coordinates.
+    let token = stored_cell(paths, Noun::Phones, &phone, "number").unwrap();
+    let other = keys::random_pk(keys::Random::Phone).unwrap();
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    let sealed_phone = Noun::Phones.collection_at(&handle);
+    crate::alab::Registry::at(paths.clone())
+        .write(vec![vec![
+            put(&PHONE, &other, "last4", json!("0149")),
+            put(&PHONE, &other, "label", json!("spare")),
+            put(&PHONE, &other, "row", json!("live")),
+            put(sealed_phone, &other, "number", token),
+        ]])
+        .unwrap();
+    assert_eq!(
+        phone_row(paths, &other)["number"],
+        json!(crate::typed::secret::MASK),
+        "a token that does not open"
+    );
+}
+
+/// Only a column whose values are ordinary data opens with nothing journaled: asked for a
+/// password, the same opener opens nothing, whatever the cell holds (here text that would read
+/// as a number).
+/// NEGATIVE CONTROL: with `open_with` taking every `Ty::Secret` column (`sealed_ordinary`
+/// answering true for a secret-named one), the password is opened: `` address.password ``.
+#[test]
+fn the_unjournaled_opener_opens_no_secret_column() {
+    let lab = imported_sealed(1);
+    let paths = &lab.paths[0];
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    seal_cell(paths, Noun::Emails, &box01, "password", "5550104321");
+    let phone = desk_phone(paths);
+    seal_cell(paths, Noun::Phones, &phone, "number", "5550101234");
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    let cells = handle.view().unwrap().cells;
+    let address = Noun::Emails.collection_at(&handle);
+    let phones = Noun::Phones.collection_at(&handle);
+    assert!(
+        stored_cell(paths, Noun::Emails, &box01, "password")
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(crate::typed::secret::is_sealed),
+        "control: the lab holds a sealed password"
+    );
+    for (collection, column) in [
+        (address, "password"),
+        (address, "number"),
+        (phones, "label"),
+    ] {
+        let opened = att::open_ordinary(&handle, collection, column, &cells).unwrap();
+        assert!(opened.is_empty(), "{}.{column}", collection.name);
+    }
+    assert!(
+        att::open_every_ordinary(&handle, address, &cells)
+            .unwrap()
+            .is_empty()
+    );
+    let opened = att::open_ordinary(&handle, phones, "number", &cells).unwrap();
+    assert_eq!(opened.len(), 1, "control: the number opens");
+}
+
+/// Where the generation holds a password as a sealed token (the form builds up to 0.200.0 read),
+/// no view shows it and none reveals it: the listing says the mask, and the flags that showed a
+/// secret are unknown options. A `set … --stdin` there seals the value into its cell, the one
+/// form those builds read: the secret store is not asked and the reply names no entry. The same
+/// value again is sealed again, so a write never says whether a value was the held one. A value
+/// on the command line and one shaped like a flag are refused, and an empty one clears the cell.
+/// NEGATIVE CONTROL: with `set`'s `Holds::SealedSecret` arm writing `Value::Null` for any value,
+/// the cell holds no token after the set: `the value is sealed into its cell`.
+#[test]
+fn a_sealed_generation_masks_a_password_and_seals_one_from_stdin() {
+    let lab = imported_sealed(2);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    let token = |paths: &Paths| {
+        stored_cell(paths, Noun::Emails, &box01, "password")
+            .as_ref()
+            .and_then(Value::as_str)
+            .filter(|text| crate::typed::secret::is_sealed(text))
+            .map(str::to_owned)
+    };
+    let imported = token(paths).expect("the import sealed the fixture's password");
+    assert_eq!(
+        opened_cell(paths, Noun::Emails, &box01, "password").as_deref(),
+        Some("synthetic-pass-01")
+    );
+    let listed = view(paths, Noun::Emails, &[], &mut no_grid, b"", &store).unwrap();
+    for address in ["box01@proton.example", "box02@proton.example"] {
+        assert_eq!(
+            email(&listed, address)["password"],
+            json!(crate::typed::secret::MASK)
+        );
+    }
+    let text = aterm_json::to_string(&listed).unwrap();
+    assert!(!text.contains("synthetic-pass") && !text.contains(&imported));
+    for gone in ["--show-passwords", "--digest"] {
+        let refused = view(paths, Noun::Emails, &[gone], &mut no_grid, b"", &store).unwrap_err();
+        assert!(refused.to_string().contains("unknown option"), "{refused}");
+    }
+    let set = |stdin: &[u8]| {
+        view(
+            paths,
+            Noun::Emails,
+            &["set", "box01@proton.example", "password", "--stdin"],
+            &mut no_grid,
+            stdin,
+            &store,
+        )
+    };
+    let written = set(b"piped-password-9\n").unwrap();
+    assert_eq!(written["written"], json!(1), "{written}");
+    assert!(written.get("entry").is_none(), "{written}");
+    assert!(
+        !aterm_json::to_string(&written)
+            .unwrap()
+            .contains("piped-password-9")
+    );
+    let sealed = token(paths).expect("the value is sealed into its cell");
+    assert_ne!(sealed, imported);
+    assert_eq!(
+        opened_cell(paths, Noun::Emails, &box01, "password").as_deref(),
+        Some("piped-password-9")
+    );
+    assert!(
+        store.every().is_empty(),
+        "a sealed generation asks nothing of the store"
+    );
+    let again = set(b"piped-password-9\n").unwrap();
+    assert_eq!(again["written"], json!(1), "{again}");
+    assert_ne!(token(paths).expect("sealed again"), sealed);
+    let held = token(paths);
+    let flag = set(b"yes\n").unwrap_err().to_string();
+    assert!(flag.contains("shaped like a flag"), "{flag}");
+    let on_argv = view(
+        paths,
+        Noun::Emails,
+        &["set", "box01@proton.example", "password", "typed-on-argv"],
+        &mut no_grid,
+        b"",
+        &store,
+    )
+    .unwrap_err();
+    assert!(on_argv.to_string().contains("command line"), "{on_argv}");
+    assert_eq!(token(paths), held, "a refused set leaves the cell");
+    let listed = view(paths, Noun::Emails, &[], &mut no_grid, b"", &store).unwrap();
+    assert_eq!(
+        email(&listed, "box01@proton.example")["password"],
+        json!(crate::typed::secret::MASK)
+    );
+    let cleared = set(b"").unwrap();
+    assert_eq!(cleared["written"], json!(1), "{cleared}");
+    assert!(cleared.get("entry").is_none(), "{cleared}");
+    assert_eq!(
+        stored_cell(paths, Noun::Emails, &box01, "password").filter(|cell| !cell.is_null()),
+        None,
+        "an empty value clears it"
+    );
+    assert!(store.every().is_empty());
+}
+
+/// `set` writes an ordinary column from argv.
+#[test]
+fn set_writes_an_ordinary_column_from_argv() {
+    let lab = imported(2);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
     let status = view(
         paths,
         Noun::Emails,
         &["set", "box02@proton.example", "status", "disabled"],
-        &spawned,
         &mut no_grid,
         b"",
-        &journal,
+        &store,
     )
     .unwrap();
     assert_eq!(status["written"], json!(1), "{status}");
-    let shown = view(
-        paths,
-        Noun::Emails,
-        &["--show-passwords"],
-        &allowed,
-        &mut no_grid,
-        b"",
-        &journal,
-    )
-    .unwrap();
-    let pk = |address: &str| keys::address_pk(address).unwrap();
-    let row = |address: &str| {
-        shown["emails"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["ad"] == json!(pk(address)))
-            .unwrap()
-            .clone()
-    };
+    let listed = view(paths, Noun::Emails, &[], &mut no_grid, b"", &store).unwrap();
     assert_eq!(
-        row("box01@proton.example")["password"],
-        json!("piped-password-new")
+        email(&listed, "box02@proton.example")["status"],
+        json!("disabled")
     );
-    assert_eq!(row("box02@proton.example")["status"], json!("disabled"));
 }
 
 /// The address rows of `paths`' registry.
@@ -463,19 +815,8 @@ fn addresses(paths: &Paths) -> cell::Projection {
 fn set_names_a_renamed_row_by_its_current_address_and_refuses_a_held_one() {
     let lab = imported(3);
     let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
-    let set = |list: &[&str]| {
-        view(
-            paths,
-            Noun::Emails,
-            list,
-            &spawned,
-            &mut no_grid,
-            b"",
-            &journal,
-        )
-    };
+    let store = Memory::default();
+    let set = |list: &[&str]| view(paths, Noun::Emails, list, &mut no_grid, b"", &store);
     let pk = |address: &str| keys::address_pk(address).unwrap();
     let (box01, box02, box03) = (
         pk("box01@proton.example"),
@@ -597,19 +938,18 @@ fn type_addr(file: &Path, from: &str, to: &str) -> usize {
 fn the_grids_edit_of_an_address_passes_the_owners_rules() {
     let lab = imported(2);
     let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
+    let store = Memory::default();
     let box01 = keys::address_pk("box01@proton.example").unwrap();
     let mut saved: Option<(usize, String)> = None;
     let mut reopened: Option<(usize, String)> = None;
-    let mut colliding = |opening: &Opening<'_>| -> Result<()> {
+    let mut colliding = |file: &Path, line: usize| -> Result<()> {
         match saved {
             None => {
-                let line = type_addr(opening.file, "box01@proton.example", "box02@proton.example");
-                saved = Some((line, std::fs::read_to_string(opening.file).unwrap()));
+                let line = type_addr(file, "box01@proton.example", "box02@proton.example");
+                saved = Some((line, std::fs::read_to_string(file).unwrap()));
             }
             Some(_) => {
-                reopened = Some((opening.line, std::fs::read_to_string(opening.file).unwrap()));
+                reopened = Some((line, std::fs::read_to_string(file).unwrap()));
             }
         }
         Ok(())
@@ -618,10 +958,9 @@ fn the_grids_edit_of_an_address_passes_the_owners_rules() {
         paths,
         Noun::Emails,
         &["--edit"],
-        &allowed,
         &mut colliding,
         b"",
-        &journal,
+        &store,
     )
     .unwrap();
     assert_eq!(collided["rounds"], json!(2), "{collided}");
@@ -640,20 +979,11 @@ fn the_grids_edit_of_an_address_passes_the_owners_rules() {
         addresses(paths).rows[&box01].get("addr"),
         Some(&json!("box01@proton.example"))
     );
-    let mut fresh = |opening: &Opening<'_>| -> Result<()> {
-        type_addr(opening.file, "box01@proton.example", "fresh01@example.test");
+    let mut fresh = |file: &Path, _: usize| -> Result<()> {
+        type_addr(file, "box01@proton.example", "fresh01@example.test");
         Ok(())
     };
-    let edited = view(
-        paths,
-        Noun::Emails,
-        &["--edit"],
-        &allowed,
-        &mut fresh,
-        b"",
-        &journal,
-    )
-    .unwrap();
+    let edited = view(paths, Noun::Emails, &["--edit"], &mut fresh, b"", &store).unwrap();
     assert_eq!(edited["cells"], json!(2), "addr and domain: {edited}");
     let rows = addresses(paths);
     assert_eq!(
@@ -666,182 +996,16 @@ fn the_grids_edit_of_an_address_passes_the_owners_rules() {
     );
 }
 
-/// `--digest` names the `[everyone]` epoch it was keyed under and the rows with a password, is
-/// stable, moves when a password does, and refuses where no `[everyone]` key is held; it prints
-/// no value.
-/// NEGATIVE CONTROL: with `digest` keyed by a constant in place of the epoch key, two epochs'
-/// digests agree: `` assertion `left != right` failed ``.
-#[test]
-fn the_emails_digest_names_its_epoch_and_moves_with_a_password() {
-    use crate::alab::command::tests::EVERYONE;
-    let lab = imported(2);
-    let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
-    let go = |list: &[&str], stdin: &[u8]| {
-        view(
-            paths,
-            Noun::Emails,
-            list,
-            &spawned,
-            &mut no_grid,
-            stdin,
-            &journal,
-        )
-    };
-    EVERYONE.with(|held| held.set(None));
-    assert!(go(&["--digest"], b"").is_err(), "no [everyone] key held");
-    EVERYONE.with(|held| held.set(Some(([0x5e; 32], [0x33; 32]))));
-    let first = go(&["--digest"], b"").unwrap();
-    assert_eq!(first, go(&["--digest"], b"").unwrap());
-    assert_eq!(first["epoch"], json!("5e5e5e5e"), "{first}");
-    assert_eq!(first["with_password"], json!(2), "{first}");
-    assert!(!aterm_json::to_string(&first).unwrap().contains("synthetic"));
-    EVERYONE.with(|held| held.set(Some(([0x6f; 32], [0x44; 32]))));
-    assert_ne!(go(&["--digest"], b"").unwrap()["digest"], first["digest"]);
-    EVERYONE.with(|held| held.set(Some(([0x5e; 32], [0x33; 32]))));
-    go(
-        &["set", "box02@proton.example", "password", "--stdin"],
-        b"another-password\n",
-    )
-    .unwrap();
-    let moved = go(&["--digest"], b"").unwrap();
-    assert_eq!(moved["epoch"], first["epoch"]);
-    assert_ne!(moved["digest"], first["digest"]);
-    EVERYONE.with(|held| held.set(None));
-}
-
-/// The grid round trip on a `Secret` column: `--edit` opens the emails grid with the password
-/// column revealed and editable in a private folder (`*.private.noindex`, which amacs keeps no
-/// draft of), whose path carries no value; the owner's changed password is sealed and written,
-/// an unchanged one is not, a flag-shaped one reopens the file with nothing written, and the
-/// folder is gone once the session ends. A session that may not reveal never opens the grid.
-/// NEGATIVE CONTROL: with `export_opened` ignoring `opened` (the column masked and read-only),
-/// the grid's password column is read-only: `` […, "=password", "=pk"]: editable, not
-/// `=password` ``.
-#[test]
-fn the_grid_round_trips_a_password_column_in_a_private_folder() {
-    let lab = imported(2);
-    let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
-    let refused = view(
-        paths,
-        Noun::Emails,
-        &["--edit"],
-        &spawned,
-        &mut no_grid,
-        b"",
-        &journal,
-    );
-    assert!(refused.is_err());
-    let mut folders = Vec::new();
-    let mut rounds = 0;
-    let mut open = |opening: &Opening<'_>| -> Result<()> {
-        let path = opening.file;
-        assert_eq!(opening.beside, None, "outside aterm, in this terminal");
-        assert!(!opening.read_only);
-        rounds += 1;
-        assert!(
-            aterm_types::private_edit::is_private(path),
-            "{}",
-            path.display()
-        );
-        let shown = path.to_string_lossy();
-        assert!(
-            !shown.contains("synthetic") && !shown.contains('@'),
-            "{shown}"
-        );
-        folders.push(path.parent().unwrap().to_owned());
-        let held = std::fs::read_to_string(path).unwrap();
-        let mut lines: Vec<String> = held.lines().map(str::to_owned).collect();
-        let header: Vec<&str> = lines[0].split('\t').collect();
-        assert!(
-            header.contains(&"password"),
-            "{header:?}: editable, not `=password`"
-        );
-        let at = header.iter().position(|h| *h == "password").unwrap();
-        let row = lines
-            .iter()
-            .position(|l| l.contains("box01@proton.example"))
-            .unwrap();
-        if rounds == 1 {
-            assert!(held.contains("synthetic-pass-01"));
-        }
-        let mut cells: Vec<String> = lines[row].split('\t').map(str::to_owned).collect();
-        cells[at] = if rounds == 1 {
-            "1".to_owned()
-        } else {
-            "grid-password-01".to_owned()
-        };
-        lines[row] = cells.join("\t");
-        std::fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
-        Ok(())
-    };
-    let edited = view(
-        paths,
-        Noun::Emails,
-        &["--edit"],
-        &allowed,
-        &mut open,
-        b"",
-        &journal,
-    )
-    .unwrap();
-    assert_eq!(rounds, 2, "the flag-shaped save reopened: {edited}");
-    assert_eq!(edited["cells"], json!(1), "{edited}");
-    let text = aterm_json::to_string(&edited).unwrap();
-    assert!(
-        !text.contains("grid-password") && !text.contains("synthetic"),
-        "{text}"
-    );
-    for folder in &folders {
-        assert!(
-            !folder.exists(),
-            "the grid's folder is gone: {}",
-            folder.display()
-        );
-    }
-    assert!(
-        journaled(scratch.path())
-            .iter()
-            .all(|r| r["surface"] == json!("Grid"))
-    );
-    let shown = view(
-        paths,
-        Noun::Emails,
-        &["--show-passwords"],
-        &allowed,
-        &mut no_grid,
-        b"",
-        &journal,
-    )
-    .unwrap();
-    let password = |address: &str| {
-        let pk = keys::address_pk(address).unwrap();
-        shown["emails"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["ad"] == json!(pk))
-            .unwrap()["password"]
-            .clone()
-    };
-    assert_eq!(password("box01@proton.example"), json!("grid-password-01"));
-    assert_eq!(password("box02@proton.example"), json!("synthetic-pass-02"));
-}
-
 /// A grid folder a killed session left (its maker's pid no longer runs) is swept when the next
 /// grid opens; one whose maker runs is kept.
 #[test]
 fn a_killed_sessions_grid_folder_is_swept_at_the_next_edit() {
     let lab = imported(1);
     let paths = &lab.paths[0];
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
+    let store = Memory::default();
     let mut planted = Vec::new();
-    let mut open = |opening: &Opening<'_>| -> Result<()> {
-        let parent = opening.file.parent().unwrap().parent().unwrap();
+    let mut open = |file: &Path, _: usize| -> Result<()> {
+        let parent = file.parent().unwrap().parent().unwrap();
         if planted.is_empty() {
             // A pid no process holds (above the macOS pid ceiling) and our own.
             for pid in [99_999_999u32, std::process::id()] {
@@ -856,26 +1020,8 @@ fn a_killed_sessions_grid_folder_is_swept_at_the_next_edit() {
         }
         Ok(())
     };
-    view(
-        paths,
-        Noun::Emails,
-        &["--edit"],
-        &allowed,
-        &mut open,
-        b"",
-        &journal,
-    )
-    .unwrap();
-    view(
-        paths,
-        Noun::Emails,
-        &["--edit"],
-        &allowed,
-        &mut open,
-        b"",
-        &journal,
-    )
-    .unwrap();
+    view(paths, Noun::Emails, &["--edit"], &mut open, b"", &store).unwrap();
+    view(paths, Noun::Emails, &["--edit"], &mut open, b"", &store).unwrap();
     assert!(!planted[0].exists(), "the dead maker's folder is swept");
     assert!(planted[1].exists(), "a running maker's folder is kept");
     std::fs::remove_dir_all(&planted[1]).unwrap();
@@ -894,9 +1040,8 @@ fn the_nouns_never_read_fleet_db_whatever_the_registry_holds() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     replica_fixture(paths, 1, "active");
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
-    let read = |noun: Noun| view(paths, noun, &[], &spawned, &mut no_grid, b"", &journal).unwrap();
+    let store = Memory::default();
+    let read = |noun: Noun| view(paths, noun, &[], &mut no_grid, b"", &store).unwrap();
 
     let emails = read(Noun::Emails);
     assert_eq!(emails["state"].as_str(), Some("never"), "{emails}");
@@ -912,9 +1057,9 @@ fn the_nouns_never_read_fleet_db_whatever_the_registry_holds() {
         Some("lab/machines"),
         "{computers}"
     );
-
+    crate::alab::tests::newest(paths, NOW);
     let mut never = |_: &Path| -> Result<()> { panic!("no review") };
-    super::super::run(
+    crate::alab::command::tests::run(
         paths,
         &words(&["import", "--fleet-db", "--authoritative", "--apply"]),
         Some(&Stand),
@@ -1174,6 +1319,295 @@ fn seen_on_lapses_without_a_sighting_and_counts_heard_tabs() {
     assert!(alone[UNICORN].macs.is_empty(), "{alone:?}");
 }
 
+/// Replacing or clearing a secret cell removes the entries its candidates named, whatever entry
+/// that was (a roll's `.2` included), and a write never lands on an entry that holds another
+/// value no candidate names (a concurrent writer's): that value survives.
+/// NEGATIVE CONTROLS: the entry recomputed from the coordinates alone (the cell's own) holds the
+/// concurrent value after the replace and the clear; with `set` removing that recomputed entry,
+/// `` the concurrent value survives `` fails, and with `held_entries` empty the rolled `.2`
+/// survives: `` the replaced entry is removed ``.
+#[test]
+fn replacing_or_clearing_a_secret_cell_removes_the_entries_its_candidates_named() {
+    use crate::typed::secret::Store;
+    let lab = imported(2);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    let own = secret::entry_name("address", "password", &box01).unwrap();
+    let rolled = crate::typed::secret::test_entry(("address", "password", &box01), 2);
+    store
+        .put(&rolled, &secret::Secret::new("rolled-value-2".into()))
+        .unwrap();
+    crate::alab::Registry::at(paths.clone())
+        .write(vec![vec![
+            cell::change(
+                &ADDRESS,
+                CellKey {
+                    pk: &box01,
+                    col: "password",
+                    elem: None,
+                },
+                &CellValue::owner(ADDRESS.version, secret::reference(Memory::VAULT, &rolled)),
+            )
+            .unwrap(),
+        ]])
+        .unwrap();
+    // Another writer's value sits in the cell's own entry, which no candidate here names.
+    store
+        .put(&own, &secret::Secret::new("concurrent-value-1".into()))
+        .unwrap();
+
+    let set = |input: &[u8]| {
+        view(
+            paths,
+            Noun::Emails,
+            &["set", "box01@proton.example", "password", "--stdin"],
+            &mut no_grid,
+            input,
+            &store,
+        )
+        .unwrap()
+    };
+    let replaced = set(b"replaced-value-3\n");
+    let third = replaced["entry"].as_str().unwrap().to_owned();
+    assert!(
+        secret::bound("address", "password", &box01, &third),
+        "{third}"
+    );
+    assert!(third != own && third != rolled, "{third}");
+    assert_eq!(replaced["removed"], json!(1), "{replaced}");
+    assert_eq!(store.held(&rolled), None, "the replaced entry is removed");
+    assert_eq!(store.held(&third).as_deref(), Some("replaced-value-3"));
+    assert_eq!(
+        store.held(&own).as_deref(),
+        Some("concurrent-value-1"),
+        "the concurrent value survives"
+    );
+    assert_eq!(
+        addresses(paths).rows[&box01].get("password"),
+        Some(&secret::reference(Memory::VAULT, &third))
+    );
+
+    let cleared = set(b"");
+    assert_eq!(cleared["removed"], json!(1), "{cleared}");
+    assert_eq!(store.held(&third), None, "the cleared entry is removed");
+    assert_eq!(
+        store.held(&own).as_deref(),
+        Some("concurrent-value-1"),
+        "the concurrent value survives"
+    );
+}
+
+/// A write naming another cell's entry, or a credential's, is refused before it is written, and a
+/// candidate another writer stored naming one makes the column raw, and the grid shows the mask,
+/// never the entry it names (the sign-in never reads it: `alab::mail`'s tests).
+/// NEGATIVE CONTROL: the same write naming the cell's own entry passes.
+#[test]
+fn a_secret_cell_naming_an_entry_it_does_not_own_is_refused_and_never_read() {
+    let lab = imported(1);
+    let paths = &lab.paths[0];
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    let key = CellKey {
+        pk: &box01,
+        col: "password",
+        elem: None,
+    };
+    let at =
+        |entry: &str| CellValue::owner(ADDRESS.version, secret::reference(Memory::VAULT, entry));
+    for stolen in ["gh_access_token", "alab-address-password-ad-other"] {
+        assert!(
+            cell::change(&ADDRESS, key, &at(stolen)).is_err(),
+            "{stolen}"
+        );
+    }
+    let own = secret::entry_name("address", "password", &box01).unwrap();
+    assert!(cell::change(&ADDRESS, key, &at(&own)).is_ok());
+    // A writer that skipped the check: its candidate is unreadable here and shown masked.
+    let stray = vec![crate::database::Change {
+        collection: ADDRESS.name.to_owned(),
+        key: key.encode().unwrap(),
+        value: Some(at("gh_access_token").encode()),
+    }];
+    crate::alab::Registry::at(paths.clone())
+        .write(vec![stray])
+        .unwrap();
+    assert!(addresses(paths).rows[&box01].raw.contains("password"));
+    let view = crate::alab::Registry::at(paths.clone()).view().unwrap();
+    let handle = crate::att::Handle::at(paths.clone(), &crate::att::REGISTRY);
+    let grid =
+        crate::typed::grid::export(handle.compiled().table, &ADDRESS, &view.cells, &[]).unwrap();
+    assert!(!grid.text.contains("gh_access_token"), "{}", grid.text);
+    assert!(grid.text.contains(secret::MASK));
+}
+
+/// A set removes exactly the entry its landed write replaced; one whose removal fails stays owed.
+/// A value another run put and has not committed yet survives every set while that run is live,
+/// and once it has ended a later set's sweep removes it with what the failed removal left: no
+/// value stays in the store with no cell naming it, and no run removes another's put.
+/// NEGATIVE CONTROLS: the stuck entry still holds its value after the second set (`owed` 1);
+/// with `settle_set` skipping the retire, the second set owes nothing (`owed` 0); with `sweep`
+/// reading every owed entry instead of `orphaned`, the second set collects what live runs owe
+/// (`owed` 2); with `settle_set` skipping the sweep, `` a removal that failed is collected ``
+/// fails.
+#[test]
+fn a_set_retires_what_it_replaced_and_never_another_live_runs_put() {
+    let lab = imported(1);
+    let paths = &lab.paths[0];
+    let store = Memory::default();
+    let box01 = keys::address_pk("box01@proton.example").unwrap();
+    let set = |input: &[u8]| {
+        view(
+            paths,
+            Noun::Emails,
+            &["set", "box01@proton.example", "password", "--stdin"],
+            &mut no_grid,
+            input,
+            &store,
+        )
+        .unwrap()
+    };
+    let first = set(b"first-value-1\n");
+    let first_entry = first["entry"].as_str().unwrap().to_owned();
+    store.stick(&first_entry);
+    let second = set(b"second-value-2\n");
+    assert_eq!(second["owed"], json!(1), "{second}");
+    assert_eq!(store.held(&first_entry).as_deref(), Some("first-value-1"));
+    let second_entry = second["entry"].as_str().unwrap().to_owned();
+    // Another run's write, its value put and its reference not yet committed.
+    let uncommitted = secret::store_cell(
+        &store,
+        "address",
+        "password",
+        &box01,
+        &secret::Secret::new("uncommitted-value-3".into()),
+    )
+    .unwrap();
+    let uncommitted = secret::entry_of(&uncommitted).unwrap().to_owned();
+
+    store.unstick(&first_entry);
+    let third = set(b"third-value-4\n");
+    assert_eq!(
+        store.held(&second_entry),
+        None,
+        "the replaced entry is removed"
+    );
+    assert_eq!(
+        store.held(&uncommitted).as_deref(),
+        Some("uncommitted-value-3"),
+        "another live run's put survives"
+    );
+    let third_entry = third["entry"].as_str().unwrap().to_owned();
+
+    store.end_runs();
+    let fourth = set(b"fourth-value-5\n");
+    assert_eq!(fourth["owed"], json!(0), "{fourth}");
+    assert_eq!(
+        store.held(&first_entry),
+        None,
+        "a removal that failed is collected"
+    );
+    assert_eq!(
+        store.held(&uncommitted),
+        None,
+        "the uncommitted value is removed"
+    );
+    assert_eq!(store.held(&third_entry), None);
+    let fourth_entry = fourth["entry"].as_str().unwrap();
+    assert_eq!(store.held(fourth_entry).as_deref(), Some("fourth-value-5"));
+    assert_eq!(store.names(), [fourth_entry.to_owned()]);
+    assert!(store.owed().is_empty());
+}
+
+/// On a registry at a generation builds up to 0.200.0 read (the first, then the second), a
+/// secret this build writes is a sealed token in its cell, the one form those builds read: an
+/// import seals each password it writes and an `emails set` seals the one piped to it, nothing
+/// goes into the store, and no reference reaches the registry. The roll from the first
+/// generation to the second runs; the one to the third, whose secret cells name store entries,
+/// is held back by this Mac's fleet floor (no release is named as the first that writes no
+/// secret file, so every Mac holds it), and the registry stays at the second.
+/// NEGATIVE CONTROL: with `Registry::roll_with` not asking the floor, the registry rolls to the
+/// third generation: `` called `Result::unwrap_err()` on an `Ok` value ``.
+#[test]
+fn below_the_third_generation_a_secret_is_sealed_in_its_cell_and_no_roll_reaches_the_third() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    replica_fixture(paths, 1, "active");
+    let registry = crate::alab::Registry::at(paths.clone());
+    registry.open().unwrap();
+    let store = Memory::default();
+    let import = || {
+        let mut never = |_: &Path| -> Result<()> { panic!("no review") };
+        crate::alab::command::tests::run(
+            paths,
+            &words(&["import", "--fleet-db", "--authoritative", "--apply"]),
+            Some(&Stand),
+            &mut never,
+            NOW,
+        )
+    };
+    let set = || {
+        view(
+            paths,
+            Noun::Emails,
+            &["set", "box01@proton.example", "password", "--stdin"],
+            &mut no_grid,
+            b"piped-password-9\n",
+            &store,
+        )
+    };
+    // The secret cells that hold a sealed token, and those that hold anything else.
+    let secrets = || {
+        let cells = crate::alab::Registry::at(paths.clone())
+            .view()
+            .unwrap()
+            .cells;
+        let mut sealed = 0;
+        let mut other = 0;
+        for ((_, key), cell) in &cells {
+            if !CellKey::parse(key).is_ok_and(|key| typed::secret_named(key.col)) {
+                continue;
+            }
+            for (_, value) in crate::typed::cell::origins_refs(cell) {
+                match &value["x"] {
+                    Value::Null => {}
+                    Value::String(text) if crate::typed::secret::is_sealed(text) => sealed += 1,
+                    _ => other += 1,
+                }
+            }
+        }
+        (sealed, other)
+    };
+    for generation in [1, 2] {
+        assert_eq!(registry.generation().generation, generation);
+        let report = import().unwrap();
+        assert!(report.get("secrets_waiting").is_none(), "{report}");
+        let written = set().unwrap();
+        assert_eq!(written["written"], json!(1), "{generation}: {written}");
+        assert!(written.get("entry").is_none(), "{written}");
+        assert!(
+            store.every().is_empty(),
+            "a sealed generation asks nothing of the store"
+        );
+        let (sealed, other) = secrets();
+        assert!(sealed >= 1, "generation {generation} holds the password");
+        assert_eq!(
+            other, 0,
+            "a secret of generation {generation} is not sealed"
+        );
+        if generation == 1 {
+            let rolled = registry.roll(true, NOW).unwrap();
+            assert!(rolled.sealed, "{rolled:?}");
+        }
+    }
+    let refused = registry.roll(true, NOW).unwrap_err().to_string();
+    assert!(
+        refused.contains("no registry secret is written until every Mac reading the vault"),
+        "{refused}"
+    );
+    assert_eq!(registry.generation().generation, 2);
+    assert!(registry.generation().successor.is_some());
+}
+
 /// `--registry` keeps the nouns' own projection, read through custody, with what the snapshot
 /// does not hold yet: `ai-accounts` carries `seen_on` and `last_seen`, `computers` each live seat
 /// no machine row binds. The plain view is the shared file's snapshot and carries neither. It
@@ -1202,10 +1636,8 @@ fn the_registry_view_keeps_the_observed_columns_and_the_unbound_seats() {
             put(&ACCOUNT, &account, "status", json!("pending")),
         ]])
         .unwrap();
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
-    let read =
-        |noun: Noun, list: &[&str]| view(paths, noun, list, &spawned, &mut no_grid, b"", &journal);
+    let store = Memory::default();
+    let read = |noun: Noun, list: &[&str]| view(paths, noun, list, &mut no_grid, b"", &store);
 
     let accounts = read(Noun::AiAccounts, &["--registry"]).unwrap();
     assert_eq!(accounts["state"].as_str(), Some("live"), "{accounts}");
@@ -1245,7 +1677,7 @@ fn the_registry_view_keeps_the_observed_columns_and_the_unbound_seats() {
 
     for (noun, list) in [
         (Noun::Emails, &["--registry"][..]),
-        (Noun::AiAccounts, &["--registry", "--digest"]),
+        (Noun::AiAccounts, &["--registry", "set", "x", "label", "y"]),
         (Noun::Computers, &["--registry", "--edit"]),
     ] {
         assert!(read(noun, list).is_err(), "{noun:?} {list:?}");

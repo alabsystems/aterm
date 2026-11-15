@@ -57,18 +57,28 @@ fn a_motion_frames_rows_upload_as_named_and_an_unnamed_card_is_compared() {
 }
 
 #[test]
-fn a_minimized_window_parks_all_but_a_captures_present() {
+fn a_hidden_window_parks_all_but_an_awaited_present() {
     let mut win = WindowGpu::new();
-    assert!(!win.parks_while_minimized(), "a visible window presents");
+    assert!(!win.parks_while_hidden(), "a visible window presents");
     win.set_occluded_hint(true);
-    assert!(win.parks_while_minimized(), "a minimized one parks");
+    assert!(win.parks_while_hidden(), "a hidden one parks");
     win.set_capture_present(true);
-    assert!(!win.parks_while_minimized(), "but presents for a capture");
+    assert!(win.present_awaited());
+    assert!(!win.parks_while_hidden(), "but presents for a capture");
     win.set_capture_present(false);
-    assert!(win.parks_while_minimized(), "and parks again after it");
+    assert!(win.parks_while_hidden(), "and parks again after it");
     win.set_occluded_hint(false);
     win.set_capture_present(true);
-    assert!(!win.parks_while_minimized());
+    assert!(!win.parks_while_hidden());
+    win.set_capture_present(false);
+    win.set_occluded_hint(true);
+    win.set_frame_awaited(true);
+    assert!(
+        !win.parks_while_hidden(),
+        "nor a frame the frontend waits on"
+    );
+    win.set_frame_awaited(false);
+    assert!(win.parks_while_hidden());
 }
 
 #[test]
@@ -2165,6 +2175,7 @@ fn the_first_frame_warm_builds_what_a_default_windows_first_frames_build() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_warmed_arm_builds_no_pipeline_on_the_render_thread() {
+    use super::PipelineWarmStanding;
     use crate::device_layer::TexelFormat;
     use crate::metal::warm::{PresentKnobs, bindable};
     if crate::metal::ffi::Device::preferred_listed().is_none() {
@@ -2182,9 +2193,8 @@ fn a_warmed_arm_builds_no_pipeline_on_the_render_thread() {
         (TexelFormat::Rgba16Float, 2.0),
     ] {
         let mut gpu = every_pass_on();
-        gpu.warm_effect_pipelines();
         assert!(
-            gpu.metal_arm_ready(),
+            gpu.warm_effect_pipelines_now(),
             "the mint: {}",
             gpu.metal_start_error()
         );
@@ -2214,12 +2224,33 @@ fn a_warmed_arm_builds_no_pipeline_on_the_render_thread() {
             Vec::new(),
             "{format:?}: built on the render thread after the warm"
         );
+        assert_eq!(
+            gpu.pipeline_warm_standing(),
+            PipelineWarmStanding {
+                owed: 0,
+                frame_builds: 0
+            },
+            "{format:?}: the shipped standing reads the warm landed and no frame built"
+        );
 
         let mut cold = every_pass_on();
         present_first_frames(&mut cold, format, edr);
+        let built_here = cold.metal_built_here_for_test();
         assert!(
-            !cold.metal_built_here_for_test().is_empty(),
+            !built_here.is_empty(),
             "{format:?}: without the warm the frames build their own"
+        );
+        let pipelines_built_here = built_here
+            .iter()
+            .filter(|item| !matches!(item, crate::metal::warm::WarmItem::FetchProbe))
+            .count();
+        assert_eq!(
+            cold.pipeline_warm_standing(),
+            PipelineWarmStanding {
+                owed: 0,
+                frame_builds: u64::try_from(pipelines_built_here).expect("a few builds")
+            },
+            "{format:?}: the shipped standing counts each pipeline state the frames built"
         );
     }
 }

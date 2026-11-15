@@ -14,6 +14,7 @@ pub(super) enum Profile {
     NativeJob,
     BootstrapFixed,
     BootstrapGraph,
+    BootstrapArchive,
 }
 impl Profile {
     fn section(self) -> &'static [u8; 16] {
@@ -25,6 +26,7 @@ impl Profile {
             Self::NativeJob => b"__trust_jobroot\0",
             Self::BootstrapFixed => b"__trust_btfix\0\0\0",
             Self::BootstrapGraph => b"__trust_bgraph\0\0",
+            Self::BootstrapArchive => b"__trust_barch\0\0\0",
         }
     }
     fn magic(self) -> &'static [u8; 16] {
@@ -36,6 +38,7 @@ impl Profile {
             Self::NativeJob => b"TRUSTNATIVEJOB01",
             Self::BootstrapFixed => b"TRUSTBTFIX000001",
             Self::BootstrapGraph => b"TRUSTBGRAPH00002",
+            Self::BootstrapArchive => b"TRUSTBARCH000002",
         }
     }
     fn fields(self) -> [u64; 6] {
@@ -47,6 +50,7 @@ impl Profile {
             Self::NativeJob => [3, 6, 7, 106, 48, 3],
             Self::BootstrapFixed => [1, 1, 1, 1, 0, 0],
             Self::BootstrapGraph => [3, 71, 72, 73, 74, 2],
+            Self::BootstrapArchive => [2, 118, 119, 120, 121, 122],
         }
     }
 }
@@ -512,7 +516,7 @@ mod tests {
     fn put64(bytes: &mut [u8], offset: usize, value: u64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
-    fn expected(profile: Profile) -> [u8; 64] {
+    pub(super) fn expected(profile: Profile) -> [u8; 64] {
         let mut out = [0; 64];
         out[..16].copy_from_slice(profile.magic());
         for (index, value) in profile.fields().iter().enumerate() {
@@ -520,7 +524,7 @@ mod tests {
         }
         out
     }
-    fn image(profile: Profile) -> Vec<u8> {
+    pub(super) fn image(profile: Profile) -> Vec<u8> {
         let mut bytes = vec![0u8; 320];
         put(&mut bytes, 0, 0xfeed_facf);
         put(&mut bytes, 4, 0x0100_000c);
@@ -713,3 +717,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "protocol_marker/archive_tests.rs"]
+mod archive_tests;

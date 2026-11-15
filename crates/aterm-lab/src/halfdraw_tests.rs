@@ -192,7 +192,7 @@ fn with_no_running_title_a_gap_is_the_busy_row_gone() {
     let reader = Program::Claude.reader();
     assert_eq!(
         reader.phase(&torn),
-        aterm_phase::phase::Phase::Busy,
+        alab_policy::vocab::Phase::Busy,
         "the reader reads the spinner"
     );
     let mode = torn

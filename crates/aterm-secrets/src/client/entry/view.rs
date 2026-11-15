@@ -18,7 +18,6 @@ pub(super) enum Request<'a> {
 }
 
 pub(super) struct View {
-    pub(super) state: State,
     pub(super) entries: Vec<Entry>,
     pub(super) version: VaultVersion,
     pub(super) is_admin: bool,
@@ -36,18 +35,15 @@ pub(super) fn read(
     _observation: &StateLock,
 ) -> crate::Result<Option<View>> {
     let (reading, requested, reading_roster) = match request {
-        Request::View => (Reading::Materialized, None, false),
+        Request::View => (Reading::Ordinary, None, false),
         Request::Entry { name, reading } => (
             reading,
             Some([name, crate::SWARM_ROSTER_ENTRY]),
             name == crate::SWARM_ROSTER_ENTRY,
         ),
     };
-    let materialized = matches!(
-        reading,
-        Reading::Materialized | Reading::SigningMaterial | Reading::PublicationMaterial
-    );
-    let requested = if materialized {
+    let ordinary = matches!(reading, Reading::Ordinary | Reading::PublicationMaterial);
+    let requested = if ordinary {
         None
     } else {
         requested.as_ref().map(|names| names.as_slice())
@@ -63,8 +59,7 @@ pub(super) fn read(
     let check_state = !SKIP_STATE.get();
     #[cfg(not(test))]
     let check_state = true;
-    if check_state && (state.membership != Stored::In || state.failed || !state.pending.is_empty())
-    {
+    if check_state && (state.membership != Stored::In || state.failed) {
         return Ok(None);
     }
     let Some(identity) = read_identity(paths)? else {
@@ -168,7 +163,6 @@ pub(super) fn read(
         log_ids,
     };
     Ok(Some(View {
-        state,
         entries,
         version,
         is_admin,

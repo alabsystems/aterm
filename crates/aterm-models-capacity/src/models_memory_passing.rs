@@ -28,21 +28,46 @@ use aterm_spec::derive::*;
 /// runs alone no other claim starts. `SmallRefused` is the look that refuses a small claim that
 /// fits what is available, behind a waiting head: where the rule does not admit it.
 ///
+/// PARENTS: the held claim may be the head's parent (`kin`, set before the head queues: its
+/// holder is an ancestor of the head's process, so the head is part of the work it holds). Then,
+/// once the head has queued, it ends only after the head has run (it may end before the head
+/// queues), its end is none the head's turn can wait for, and the head's own look leaves it out:
+/// that look admits a head of no margin ALONE beside it once no small claim is held. A head with
+/// a margin that only the parent's end would fund is stuck.
+///
+/// OUTER: a head with a margin under its parent may queue behind another process's waiter
+/// (`outer`, set as the head queues), a budget of `Outer` with a unit beside it, which no look
+/// sees the use of and which waits as long as the head does. The head's own look, inside its
+/// parent's claim, leaves that waiter out, so its turn counts neither its reservation nor its
+/// end, and it is stuck; the claims behind them are held to what the outer waiter spares, which
+/// is one unit exactly where the held claim alone is left and the outer waiter lacks one.
+///
 /// The laws are written apart from the rule, on what each look did. `SmallStarts` marks a claim
-/// that went first past a waiting head that keeps its place (one some set of ends starts, or one
-/// of no margin) beyond what it spares (`delayed` for a head with a margin, `starved` for one of
-/// none), and `SmallRefused` marks a claim held back behind a stuck head (`held_back`). Each
-/// mutant dial changes the rule in both guards, as one change to `memory_turn` changes every
-/// look: Buggy 1 lets a claim go first past every head with a margin that cannot start
-/// (`FundedHeadKeepsItsTurn` falls); Buggy 2 is the rule before KI-1111-25, which held every
-/// claim behind a stuck head (`StuckHeadHoldsNoClaimBack`); Buggy 3 treats a head of no margin
-/// that cannot start as stuck (`AloneHeadKeepsItsPlace`).
+/// that went first past a waiting head that keeps its place (one some set of ends it can wait
+/// for starts, or one of no margin) beyond what it spares (`delayed` for a head with a margin,
+/// `starved` for one of none), and `SmallRefused` marks a claim held back behind a stuck head
+/// (`held_back`). Each mutant dial changes the rule in both guards, as one change to
+/// `memory_turn` changes every look: Buggy 1 lets a claim go first past every head with a margin
+/// that cannot start (`FundedHeadKeepsItsTurn` falls); Buggy 2 is the rule before KI-1111-25,
+/// which held every claim behind a stuck head (`StuckHeadHoldsNoClaimBack`); Buggy 3 treats a
+/// head of no margin that cannot start as stuck (`AloneHeadKeepsItsPlace`); Buggy 4 is the rule
+/// before KI-1113-21, which counted the parent's end among those a head's turn waits for and
+/// held a claim behind a head only that end would fund (`StuckHeadHoldsNoClaimBack`); Buggy 5 is
+/// the rule before KI-1113-342, which stood an inside head beside the outer waiter, counting its
+/// reservation and its end with as much again unseen, and held a claim behind a stuck head that
+/// the outer waiter spared (`StuckHeadHoldsNoClaimBack`).
 ///
 /// The production projection (the conformance test in `aterm-capacity`'s `admit_stuck_tests`):
 /// each unit is a GiB, the margin one GiB, the held claim and each small claim another process
-/// whose tree the look reads, holding what it claims, and each look a `decide` on that ledger.
-/// A held claim whose processes' use the look does not see, which keeps a head that its end may
-/// start in its place sparing nothing, is not modelled: `admit_stuck_tests` pins it.
+/// whose tree the look reads, holding what it claims, the held claim's process the head's
+/// process's parent in the look's process sweep where `kin` is set, the outer waiter a
+/// cohort-owned claim of another process asked first where `outer` is, and each look a `decide`
+/// on the claims its own look counts. A held claim whose processes' use the look does not see,
+/// which keeps a head that its end may start in its place sparing nothing, is not modelled, nor
+/// is a parent whose tree holds less than it claims, whose reservation the head's own look and
+/// its turn in every other look leave out, nor a cohort-owned head, which has no kin, since its
+/// own look counts its parent's claim, nor a sure lead an inside head counts: `admit_stuck_tests`
+/// pins all four, a kin's unseen use included.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn memory_passing_model() -> Model {
@@ -55,11 +80,17 @@ pub fn memory_passing_model() -> Model {
             const Tree = 2;
             const Small = 1;
             const Smalls = 2;
+            const Outer = 8;
 
             // Memory no claim holds: `Outside` taken, or none.
             var out = 3;
             // The held claim's tree: `Tree` while it is held, 0 once it ends.
             var tree = 2;
+            // Whether the held claim is the head's PARENT (its holder an ancestor of the head's
+            // process), which, once the head has queued, ends only after the head has run.
+            var kin = 0;
+            // Whether another process's waiter asked ahead of an inside head (OUTER), waiting.
+            var outer = 0;
             // The head: 0 not yet queued, 1 waiting, 2 running, 3 ended.
             var head = 0;
             // Whether the head asks a unit beside its need (never admitted alone).
@@ -81,6 +112,9 @@ pub fn memory_passing_model() -> Model {
             // spares.
             var starved = 0;
 
+            action HolderSpawnsHead when (head == 0 && tree == Tree && kin == 0) {
+                kin = 1;
+            }
             action HeadQueuesWithMargin when (head == 0) {
                 head = 1;
                 margin = 1;
@@ -89,13 +123,18 @@ pub fn memory_passing_model() -> Model {
                 head = 1;
                 margin = 0;
             }
+            action HeadQueuesInsideBehindOuter when (head == 0 && kin == 1 && tree == Tree) {
+                head = 1;
+                margin = 1;
+                outer = 1;
+            }
             action HeadStarts when (head == 1
                 && Need + margin <= Memory - out - tree - small) {
                 head = 2;
                 running = Need;
             }
-            action HeadRunsAlone when (head == 1 && margin == 0 && tree == 0 && small == 0
-                && Need > Memory - out) {
+            action HeadRunsAlone when (head == 1 && margin == 0 && (tree == 0 || kin == 1)
+                && small == 0 && Need > Memory - out - tree) {
                 head = 2;
                 running = Need;
                 alone = 1;
@@ -105,7 +144,7 @@ pub fn memory_passing_model() -> Model {
                 running = 0;
                 alone = 0;
             }
-            action HolderEnds when (tree == Tree) {
+            action HolderEnds when (tree == Tree && (kin == 0 || head == 0 || head == 3)) {
                 tree = 0;
             }
             action OutsideFrees when (out == Outside) {
@@ -116,19 +155,28 @@ pub fn memory_passing_model() -> Model {
             }
             action SmallStarts when (alone == 0 && Smalls > small
                 && Small <= Memory - out - tree - small - running
+                && (outer == 0 || Outer + 1 > Memory - out
+                    || (small == 0 && Memory - out == Outer + 2))
                 && (head == 0 || head > 1
                     || (Need + margin <= Memory - out - tree - small
                         && Need + Small <= Memory - out - tree - small)
-                    || ((Buggy <= 1 || Buggy > 2) && margin == 1 && Need + margin > Memory - out)
-                    || (Need + margin <= Memory - out && tree == Tree && small == 0
+                    || ((Buggy <= 1 || Buggy > 2) && margin == 1
+                        && (Buggy <= 4 || Buggy > 5 || outer == 0 || Outer + 1 > Memory - out)
+                        && (Need + margin > Memory - out
+                            || ((Buggy <= 3 || Buggy > 4) && kin == 1
+                                && Need + margin > Memory - out - tree)))
+                    || ((kin == 0 || Buggy == 4) && Need + margin <= Memory - out
+                        && tree == Tree && small == 0
                         && Memory - out - tree + 1 == Need + margin)
                     || (Buggy == 1 && head == 1 && margin == 1)
                     || (Buggy == 3 && head == 1 && margin == 0 && Need > Memory - out))) {
                 small = small + 1;
                 delayed = if (head == 1 && margin == 1 && Need + margin <= Memory - out
+                    && (kin == 0 || Need + margin <= Memory - out - tree)
                     && (Need + margin > Memory - out - tree - small
                         || Need + Small > Memory - out - tree - small)
-                    && (Tree > tree || small > 0 || Memory - out - tree + 1 > Need + margin
+                    && (kin == 1 || Tree > tree || small > 0
+                        || Memory - out - tree + 1 > Need + margin
                         || Need + margin > Memory - out - tree + 1)) {
                     1
                 } else {
@@ -137,7 +185,7 @@ pub fn memory_passing_model() -> Model {
                 starved = if (head == 1 && margin == 0
                     && (Need > Memory - out - tree - small
                         || Need + Small > Memory - out - tree - small)
-                    && (Need > Memory - out || Tree > tree || small > 0
+                    && (kin == 1 || Need > Memory - out || Tree > tree || small > 0
                         || Memory - out - tree + 1 > Need || Need > Memory - out - tree + 1)) {
                     1
                 } else {
@@ -148,14 +196,25 @@ pub fn memory_passing_model() -> Model {
                 && Small <= Memory - out - tree - small
                 && (Need + margin > Memory - out - tree - small
                     || Need + Small > Memory - out - tree - small)
-                && (Buggy == 2 || margin == 0 || Need + margin <= Memory - out)
-                && (Need + margin > Memory - out || Tree > tree || small > 0
+                && (Buggy == 2 || margin == 0
+                    || (Need + margin <= Memory - out
+                        && (kin == 0 || Buggy == 4 || Need + margin <= Memory - out - tree))
+                    || (outer == 1 && Outer + 1 <= Memory - out
+                        && (small > 0 || Memory - out > Outer + 2 || Outer + 2 > Memory - out))
+                    || (Buggy == 5 && outer == 1 && Outer + 1 <= Memory - out))
+                && ((kin == 1 && (Buggy <= 3 || Buggy > 4))
+                    || Need + margin > Memory - out || Tree > tree || small > 0
                     || Memory - out - tree + 1 > Need + margin
                     || Need + margin > Memory - out - tree + 1)
-                && (Buggy == 0 || Buggy > 1 || margin == 0)
+                && (Buggy == 0 || Buggy > 1 || margin == 0
+                    || (outer == 1 && Outer + 1 <= Memory - out
+                        && (small > 0 || Memory - out > Outer + 2 || Outer + 2 > Memory - out)))
                 && (Buggy <= 2 || Buggy > 3 || margin == 1 || Need <= Memory - out)) {
                 refused = 1;
-                held_back = if (margin == 1 && Need + margin > Memory - out) {
+                held_back = if (margin == 1 && (Need + margin > Memory - out
+                    || (kin == 1 && Need + margin > Memory - out - tree))
+                    && (outer == 0 || Outer + 1 > Memory - out
+                        || (small == 0 && Memory - out == Outer + 2))) {
                     1
                 } else {
                     held_back
@@ -168,7 +227,9 @@ pub fn memory_passing_model() -> Model {
             invariant FundedHeadKeepsItsTurn: delayed == 0;
             invariant StuckHeadHoldsNoClaimBack: held_back == 0;
             invariant AloneHeadKeepsItsPlace: starved == 0;
-            bound PassingIsFinite: out <= Outside && tree <= Tree && head <= 3 && margin <= 1
+            bound PassingIsFinite: out <= Outside && tree <= Tree && kin <= 1 && outer <= 1
+                && head <= 3
+                && margin <= 1
                 && running <= Need && alone <= 1 && small <= Smalls && refused <= 1
                 && delayed <= 1 && held_back <= 1 && starved <= 1;
         }

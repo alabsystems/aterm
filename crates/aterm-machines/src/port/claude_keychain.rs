@@ -310,7 +310,7 @@ fn stage_text(stage: &Path) -> Result<&str, ReadError> {
 
 #[cfg(any(target_os = "macos", test))]
 fn service(text: &str) -> String {
-    let digest = aterm_secrets::materialize::digest_hex(text.as_bytes());
+    let digest = aterm_secrets::digest_hex(text.as_bytes());
     format!("Claude Code-credentials-{}", &digest[..8])
 }
 

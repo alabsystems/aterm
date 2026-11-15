@@ -777,6 +777,7 @@ fn each_level_emits_exactly_its_fields() {
         "account",
         "auth",
         "token",
+        "upgrade",
         "detail",
         "doing",
         "role",
@@ -795,6 +796,18 @@ fn each_level_emits_exactly_its_fields() {
         "bells",
         "bells_sounded",
         "last_bell",
+        "turn",
+        "turn_ms",
+        "turn_end_ms",
+        "step_ms",
+        "out_ms",
+        "out_src",
+        "tok_in",
+        "tok_out",
+        "tok_for_ms",
+        "turns",
+        "tools",
+        "pinned",
     ];
     const CONTENT: &[&str] = &[
         "user_title",
@@ -1340,10 +1353,13 @@ fn codex_survey() -> CodexSurvey {
             usage_5h_pct: None,
             usage_7d_pct: Some(12),
             cwd: Some("/private/tmp/codex-work".into()),
+            tok_in: None,
+            tok_out: None,
         },
         branch: Some("feat/parser".into()),
         task: None,
         goal: None,
+        thread: "019a0000-0000-7000-8000-00000000c0de".into(),
     }
 }
 
@@ -1701,7 +1717,9 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
         )]),
         server_heard: Vec::new(),
         home: None,
+        home_dir: None,
         home_free_mb: None,
+        machine: None,
         repos: None,
         update: None,
     };
@@ -2185,7 +2203,9 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
             at: 1_793_159_999,
         }],
         home: None,
+        home_dir: None,
         home_free_mb: None,
+        machine: None,
         repos: None,
         update: None,
     };
@@ -2229,7 +2249,9 @@ fn a_survey_says_the_home_and_its_checkouts_at_content_alone() {
         version: "0.147.0".to_owned(),
         operation_lines: Vec::new(),
         home: Some("/Users//a".to_owned()),
+        home_dir: None,
         home_free_mb: Some(812_345),
+        machine: None,
         repos: Some(HomeRepos {
             read_ms: 1_793_159_000_000,
             repos: vec![HomeRepo {
@@ -2322,7 +2344,9 @@ fn a_survey_says_where_the_updater_stands_at_either_level() {
         moves: None,
         server_heard: Vec::new(),
         home: None,
+        home_dir: None,
         home_free_mb: None,
+        machine: None,
         repos: None,
         update: Some(held.clone()),
     };
@@ -2529,7 +2553,9 @@ fn a_listener_snapshot_whose_roster_was_unread_is_read_afresh() {
         session_accounts: std::collections::BTreeMap::new(),
         server_heard: Vec::new(),
         home: None,
+        home_dir: None,
         home_free_mb: None,
+        machine: None,
         repos: None,
         update: None,
     };
@@ -2558,6 +2584,96 @@ fn a_listener_snapshot_whose_roster_was_unread_is_read_afresh() {
     assert!(
         !serves_cached(at, &read, soon, Some("n-2")),
         "the control: another node's snapshot is not served"
+    );
+}
+
+/// A LISTENER'S CACHED FACTS TAKE THE LATEST LOOK IN AN ANSWER AND NONE IN A PUSH: facts the
+/// listener kept from a minute ago go out in an answer with the machine's look as it is at
+/// this reply (its own time, `m_at_ms`, within the look's keep of now) and the free space that
+/// look read, not with the look the snapshot held. The header that carries it still ends with
+/// the access word. The same facts taken for the 3-minute push take no look (a look is taken
+/// only inside an answer) and keep their free space.
+/// NEGATIVE CONTROL (2026-11-12): with the look served from the snapshot, the reply says the
+/// stale look's time and its cores.
+#[test]
+fn a_listeners_cached_facts_take_the_latest_look() {
+    use aterm_agent::survey_facts::{MachineFacts, SwarmSurveyFacts};
+    use aterm_capacity::machine_look::{LOOK_KEEP, MachineLook};
+
+    let before = aterm_time::unix_millis().expect("a clock after the epoch");
+    // What the snapshot holds: a look of another moment, with figures no machine here reads.
+    let stale = MachineFacts {
+        look: MachineLook {
+            at_unix_ms: Some(1),
+            cores: Some(4096),
+            disk_free_mb: Some(7),
+            ..MachineLook::UNREAD
+        },
+        up_since_ms: None,
+        os: None,
+        target: None,
+    };
+    let mut facts = SwarmSurveyFacts {
+        operation_lines: Vec::new(),
+        node: Some("n-1".to_owned()),
+        label: Some("m5".to_owned()),
+        roster_unread: false,
+        version: "0.199.0".to_owned(),
+        window: true,
+        window_last: None,
+        sessions: 0,
+        ssh_host_key: None,
+        moves: None,
+        accounts: Vec::new(),
+        accounts_unread: Vec::new(),
+        session_accounts: std::collections::BTreeMap::new(),
+        server_heard: Vec::new(),
+        home: None,
+        home_dir: None,
+        home_free_mb: Some(7),
+        machine: None,
+        repos: None,
+        update: None,
+    };
+    let mut pushed = facts.clone();
+    take_latest(&mut pushed, Taking::NoLook);
+    assert_eq!(
+        (pushed.machine, pushed.home_free_mb),
+        (None, Some(7)),
+        "the push takes no look"
+    );
+    facts.machine = Some(stale);
+    take_latest(&mut facts, Taking::Look);
+    let machine = facts.machine.clone().expect("the facts still carry a look");
+    let at = machine.look.at_unix_ms.expect("a look taken on this clock");
+    let keep = u64::try_from(LOOK_KEEP.as_millis()).expect("ten seconds");
+    assert!(
+        at >= before.saturating_sub(keep),
+        "a look of this reply, not the snapshot's: {at} before {before}"
+    );
+    assert_eq!(
+        machine.look.cores,
+        u32::try_from(aterm_sysprobe::cpu_layout().logical_cores()).ok(),
+        "this machine's cores"
+    );
+    assert_eq!(
+        (facts.home_free_mb, machine.look.disk_free_mb),
+        (None, None),
+        "the free space is the look's: no home, no volume read"
+    );
+
+    let store = crate::session_store::new_store();
+    let here = Here {
+        facts: Some(facts),
+        ..here()
+    };
+    let out = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &here);
+    let head = out.lines().nth(1).expect("the instance line");
+    assert_eq!(fields(head)["m_at_ms"], at.to_string(), "{head}");
+    assert!(head.contains(" home_free_mb=- os="), "{head}");
+    assert!(
+        head.ends_with(&format!(" roster_unread=0 access={}", here.access.word())),
+        "{head}"
     );
 }
 
@@ -2911,4 +3027,881 @@ fn a_fallback_why_reads_one_to_a_drive_as_at_facts() {
         (row["request"].as_str(), row["request_why"].as_str()),
         (given.as_str(), "a test's request")
     );
+}
+
+/// `h` with `program` in front in group `pgid`, its reader `reader`'s, at rest.
+fn agent_in_front(h: &SessionHandle, pgid: i32, program: &str, reader: aterm_phase::Program) {
+    let mut tl = h.ctx.timeline.lock().unwrap();
+    tl.note_foreground_group(pgid);
+    tl.set_program(pgid, Some(program.into()));
+    tl.publish_agent(
+        "idle",
+        None,
+        None,
+        Some(reader),
+        crate::session_timeline::AgentStamp {
+            generation: crate::control::ScreenGen { epoch: 1, seq: 7 },
+            fp: 0x5eed,
+        },
+    );
+}
+
+/// The status sweep over `h` with its shell's group 100 and `pgid` in front: the session log
+/// opens the run of the program there.
+fn swept(h: &SessionHandle, pgid: i32) {
+    let mut tl = h.ctx.timeline.lock().unwrap();
+    tl.note_root_group(100);
+    let _ = tl.sweep_slog(&crate::session_log::BlockRead::default(), false, 100, pgid);
+}
+
+/// `h`'s agent in front (group `pgid`, its program's run opened by the status sweep) with its
+/// transcript join bound: `source`'s tap bound a file, as a live Claude Code's (or a
+/// codex-alab's rollout) does once its tap finds it. Only then does a row count its tool steps.
+fn join_bound(h: &SessionHandle, pgid: i32, source: crate::session_log::transcript::Source) {
+    use aterm_agent::harness::steps::{Step, StepBatch, StepEvent, StepPos, StepState};
+    swept(h, pgid);
+    let bind = StepBatch {
+        steps: vec![Step {
+            pos: StepPos {
+                fp: 1,
+                id: None,
+                off: 0,
+                at_ms: 0,
+            },
+            state: StepState::Partial,
+            ev: StepEvent::Bind { len: 0 },
+        }],
+        ..StepBatch::default()
+    };
+    let _ = crate::session_log::transcript::apply_batch(&h.ctx.timeline, source, &bind, false);
+}
+
+/// `h`'s facts row as read at `now` (Unix ms).
+fn row_at(h: &SessionHandle, now: u64) -> std::collections::HashMap<String, String> {
+    fields(
+        &session_row(
+            h,
+            SurveyLevel::Facts,
+            None,
+            (crate::metrics::now_us(), now, 0),
+        )
+        .text,
+    )
+}
+
+/// `f` over `h`'s session log.
+fn in_log<R>(h: &SessionHandle, f: impl FnOnce(&mut aterm_slog::Log) -> R) -> R {
+    let mut tl = h.ctx.timeline.lock().unwrap();
+    f(tl.slog_mut().log_mut_for_tests())
+}
+
+/// The stamp of wall-clock instant `at` (Unix ms).
+const fn wall(at: u64) -> aterm_slog::Stamp {
+    aterm_slog::Stamp::new(at, at)
+}
+
+/// An agent run opened at `run_at` and a turn under it opened at `turn_at`: the turn.
+fn open_turn(log: &mut aterm_slog::Log, run_at: u64, turn_at: u64) -> aterm_slog::Node {
+    use aterm_slog::{Conf, Kind, Lvl, Open, Src};
+    let run = match log.deepest_open(Lvl::Run) {
+        Some(run) => run,
+        None => log
+            .open(
+                Open::new(Kind::Agent, Src::Status, Conf::Strong),
+                wall(run_at),
+            )
+            .expect("the agent run"),
+    };
+    log.open(
+        Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+        wall(turn_at),
+    )
+    .expect("the turn")
+}
+
+/// A tool step the transcript opens under `turn` at `at`.
+fn open_tool(log: &mut aterm_slog::Log, turn: aterm_slog::Node, at: u64) -> aterm_slog::Node {
+    use aterm_slog::{Conf, Fields, Key, Kind, Open, Src};
+    log.open(
+        Open::new(Kind::Tool, Src::Transcript, Conf::Strong)
+            .under(turn)
+            .by(aterm_slog::Actor::Vendor)
+            .fields(Fields::new().word(Key::Cls, "shell").expect("cls")),
+        wall(at),
+    )
+    .expect("the tool step")
+}
+
+fn close_turn(log: &mut aterm_slog::Log, turn: aterm_slog::Node, at: u64) {
+    use aterm_slog::{Close, Conf, Out, Src, TurnOut};
+    log.close(
+        turn,
+        Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong),
+        wall(at),
+    )
+    .expect("the turn closes");
+}
+
+fn close_tool(log: &mut aterm_slog::Log, step: aterm_slog::Node, at: u64) {
+    use aterm_slog::{Close, Conf, Out, Src, StepOut};
+    log.close(
+        step,
+        Close::new(Out::Step(StepOut::Ok), Src::Transcript, Conf::Strong),
+        wall(at),
+    )
+    .expect("the step closes");
+}
+
+/// The eleven keys a row says its agent's turn, step, output and tokens with.
+const PROGRESS_KEYS: [&str; 11] = [
+    "turn",
+    "turn_ms",
+    "turn_end_ms",
+    "step_ms",
+    "out_ms",
+    "out_src",
+    "tok_in",
+    "tok_out",
+    "tok_for_ms",
+    "turns",
+    "tools",
+];
+
+/// A SESSION SAYS ITS OPEN TURN AND HOW LONG IT HAS BEEN OPEN: `turn=1` and `turn_ms=` from its
+/// session log's open turn (when it opened), never the reader's word age (`agent_ms=`, which
+/// moves with every screen word); once the turn closes, `turn=0`, no open age, and
+/// `turn_end_ms=` how long ago it closed. `turns=` counts the turns opened.
+#[test]
+fn a_session_says_its_open_turn_and_how_long_it_has_been_open() {
+    let h = crate::session_store::test_handle(21);
+    agent_in_front(&h, 4242, "claude", aterm_phase::Program::Claude);
+    let now = aterm_gui_timing::wall_ms();
+    let before = row_at(&h, now);
+    assert_eq!(before["turn"], "0", "no turn yet: {before:?}");
+    let turns: u32 = before["turns"].parse().expect("a count");
+    let turn = in_log(&h, |log| open_turn(log, now - 600_000, now - 90_000));
+    let open = row_at(&h, now);
+    assert_eq!(
+        (open["turn"].as_str(), open["turn_ms"].as_str()),
+        ("1", "90000"),
+        "{open:?}"
+    );
+    assert_ne!(open["agent_ms"], "90000", "PRECONDITION: two ages apart");
+    assert_eq!(open["turns"], (turns + 1).to_string(), "{open:?}");
+    in_log(&h, |log| close_turn(log, turn, now - 30_000));
+    let closed = row_at(&h, now);
+    assert_eq!(
+        (
+            closed["turn"].as_str(),
+            closed["turn_ms"].as_str(),
+            closed["turn_end_ms"].as_str()
+        ),
+        ("0", "-", "30000"),
+        "{closed:?}"
+    );
+}
+
+/// A SESSION SAYS ITS OPEN STEP AND WHEN ITS LAST TURN CLOSED: `step_ms=` is the age of the step
+/// open now (a tool call in flight), never the age of the newest one that closed; with none open
+/// it is `-`. `turn_end_ms=` is the previous turn's close while a newer one is open, and a
+/// transcript reader's last output is its newest step (`out_src=transcript`). `tools=` counts
+/// tool steps.
+#[test]
+fn a_session_says_its_open_step_and_when_its_last_turn_closed() {
+    let h = crate::session_store::test_handle(22);
+    agent_in_front(&h, 4242, "claude", aterm_phase::Program::Claude);
+    join_bound(&h, 4242, crate::session_log::transcript::Source::Transcript);
+    let now = aterm_gui_timing::wall_ms();
+    let tools: u32 = row_at(&h, now)["tools"].parse().expect("a count");
+    let step = in_log(&h, |log| {
+        let first = open_turn(log, now - 900_000, now - 800_000);
+        close_turn(log, first, now - 400_000);
+        let turn = open_turn(log, now - 900_000, now - 300_000);
+        let done = open_tool(log, turn, now - 200_000);
+        close_tool(log, done, now - 150_000);
+        open_tool(log, turn, now - 40_000)
+    });
+    let row = row_at(&h, now);
+    for (key, want) in [
+        ("turn", "1"),
+        ("turn_ms", "300000"),
+        ("turn_end_ms", "400000"),
+        ("step_ms", "40000"),
+        ("out_ms", "40000"),
+        ("out_src", "transcript"),
+    ] {
+        assert_eq!(row[key], want, "{key}: {row:?}");
+    }
+    assert_eq!(row["tools"], (tools + 2).to_string(), "{row:?}");
+    in_log(&h, |log| close_tool(log, step, now - 10_000));
+    let row = row_at(&h, now);
+    assert_eq!(
+        (row["step_ms"].as_str(), row["out_ms"].as_str()),
+        ("-", "10000"),
+        "no step open; the closed one is the newest output: {row:?}"
+    );
+}
+
+/// A SPINNER MOVES THE SCREEN AND NOT THE TRANSCRIPT'S LAST OUTPUT: a Claude Code row's
+/// `out_ms=` is its transcript's newest time (the agent's newest text row, the API's last
+/// served row), however recently its screen moved: a spinner keeps the screen fresh while the
+/// agent writes nothing.
+#[test]
+fn a_spinner_moves_the_screen_and_not_the_transcripts_last_output() {
+    let h = crate::session_store::test_handle(23);
+    agent_in_front(&h, 4242, "claude", aterm_phase::Program::Claude);
+    assert!(
+        h.ctx
+            .screen_moves
+            .fed(crate::control::ScreenGen { epoch: 1, seq: 99 }),
+        "a spinner's frame moves the screen"
+    );
+    let now = aterm_gui_timing::wall_ms();
+    let moved = h.ctx.screen_moves.moved_ms();
+    assert!(moved > 0 && now - moved < 300_000, "PRECONDITION: {moved}");
+    let said = |tl: &mut crate::session_timeline::SessionTimeline, at: u64| {
+        tl.set_claude_excerpts(
+            4242,
+            Some(ClaudeExcerpts {
+                excerpts: Excerpts {
+                    said: Some("Building the release.".into()),
+                    said_at_ms: Some(i64::try_from(at).unwrap()),
+                    ..Excerpts::default()
+                },
+                ..ClaudeExcerpts::default()
+            }),
+        );
+    };
+    said(&mut h.ctx.timeline.lock().unwrap(), now - 300_000);
+    let row = row_at(&h, now);
+    assert_eq!(
+        (row["out_ms"].as_str(), row["out_src"].as_str()),
+        ("300000", "transcript"),
+        "{row:?}"
+    );
+    let served_s = (now - 120_000) / 1000;
+    assert!(h.ctx.timeline.lock().unwrap().set_claude_footer(
+        4242,
+        None,
+        Some(FooterFacts {
+            usage: Some(aterm_agent::harness::session_usage::UsageFacts {
+                served_at: Some(i64::try_from(served_s).unwrap()),
+                ..Default::default()
+            }),
+            ..FooterFacts::default()
+        }),
+    ));
+    let row = row_at(&h, now);
+    assert_eq!(
+        (row["out_ms"].clone(), row["out_src"].as_str()),
+        ((now - served_s * 1000).to_string(), "transcript"),
+        "the API served a row after the newest text: {row:?}"
+    );
+}
+
+/// A whole conversation's usage as Claude Code's footer reads it: 120,000 tokens in and 8,000
+/// out, `complete` the refresh read every file, `unread` subagent files it did not, `walk_cut` a
+/// walk cut short.
+fn claude_usage(
+    complete: bool,
+    unread: usize,
+    walk_cut: bool,
+) -> aterm_agent::harness::session_usage::UsageFacts {
+    aterm_agent::harness::session_usage::UsageFacts {
+        models: vec![aterm_agent::harness::session_usage::ModelTokens {
+            label: "opus".into(),
+            input: 120_000,
+            output: 8_000,
+        }],
+        complete,
+        unread,
+        unread_more: walk_cut,
+        ..Default::default()
+    }
+}
+
+/// Claude Code's footer for `conversation` with `usage`.
+fn usage_footer(
+    usage: aterm_agent::harness::session_usage::UsageFacts,
+    conversation: &str,
+) -> FooterFacts {
+    FooterFacts {
+        usage: Some(usage),
+        owner: Some(aterm_agent::harness::footer::FactsOwner {
+            floor: None,
+            session_id: conversation.into(),
+        }),
+        ..FooterFacts::default()
+    }
+}
+
+/// TOKEN COUNTERS ARE DASHES UNTIL THE USAGE READ IS WHOLE: a Claude Code row sends
+/// `tok_in= tok_out=` only once the refresh that folded them read every file of the
+/// conversation, its subagents' included and its walk not cut short; before, the totals are a
+/// prefix, and sent as counts a restart's catch-up would read as one minute's burst. A codex-alab
+/// row sends its rollout's own running total, and `-` for a counter it does not give.
+#[test]
+fn token_counters_are_dashes_until_the_usage_read_is_whole() {
+    let h = crate::session_store::test_handle(24);
+    agent_in_front(&h, 4242, "claude", aterm_phase::Program::Claude);
+    let now = aterm_gui_timing::wall_ms();
+    let tokens = |h: &SessionHandle, at: u64| {
+        let row = row_at(h, at);
+        [
+            row["tok_in"].clone(),
+            row["tok_out"].clone(),
+            row["tok_for_ms"].clone(),
+        ]
+    };
+    let dashes = ["-", "-", "-"].map(str::to_owned);
+    assert_eq!(tokens(&h, now), dashes, "no usage read");
+    for (usage, why) in [
+        (
+            claude_usage(false, 0, false),
+            "the refresh has not caught up",
+        ),
+        (claude_usage(true, 2, false), "two subagent files unread"),
+        (claude_usage(true, 0, true), "the walk was cut short"),
+    ] {
+        assert!(h.ctx.timeline.lock().unwrap().set_claude_footer(
+            4242,
+            None,
+            Some(usage_footer(usage, "conv-a"))
+        ));
+        assert_eq!(tokens(&h, now), dashes, "{why}");
+    }
+    assert!(h.ctx.timeline.lock().unwrap().set_claude_footer(
+        4242,
+        None,
+        Some(usage_footer(claude_usage(true, 0, false), "conv-a"))
+    ));
+    assert_eq!(tokens(&h, now), ["120000", "8000", "0"].map(str::to_owned));
+    assert_eq!(
+        tokens(&h, now + 60_000),
+        ["120000", "8000", "60000"].map(str::to_owned),
+        "whole since the first row that sent them"
+    );
+
+    let codex = crate::session_store::test_handle(25);
+    codex_session(&codex);
+    assert!(
+        codex
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .set_codex_survey(CODEX_PGID, codex_survey())
+    );
+    assert_eq!(tokens(&codex, now), dashes, "a rollout that named no total");
+    let survey = codex_survey();
+    assert!(codex.ctx.timeline.lock().unwrap().set_codex_survey(
+        CODEX_PGID,
+        CodexSurvey {
+            facts: aterm_agent::harness::codex_facts::CodexFacts {
+                tok_in: Some(95_000),
+                tok_out: None,
+                ..survey.facts.clone()
+            },
+            ..survey
+        }
+    ));
+    assert_eq!(tokens(&codex, now), ["95000", "-", "0"].map(str::to_owned));
+}
+
+/// THE TOKEN EPOCH RESTARTS WITH THE CONVERSATION: `tok_for_ms=` is how long the counters have
+/// counted the conversation in front unbroken, so an observer takes a rate only inside it. A new
+/// or resumed conversation, the same conversation in a restarted process, and a read that is not
+/// whole each start it again.
+#[test]
+fn the_token_epoch_restarts_with_the_conversation() {
+    let h = crate::session_store::test_handle(26);
+    agent_in_front(&h, 4242, "claude", aterm_phase::Program::Claude);
+    let t0 = aterm_gui_timing::wall_ms();
+    let footer = |pgid: i32, conversation: &str, whole: bool| {
+        assert!(h.ctx.timeline.lock().unwrap().set_claude_footer(
+            pgid,
+            None,
+            Some(usage_footer(claude_usage(whole, 0, false), conversation))
+        ));
+    };
+    let for_ms = |at: u64| row_at(&h, t0 + at)["tok_for_ms"].clone();
+    footer(4242, "conv-a", true);
+    assert_eq!(for_ms(0), "0");
+    assert_eq!(for_ms(60_000), "60000");
+    footer(4242, "conv-b", true);
+    assert_eq!(for_ms(120_000), "0", "a resumed conversation counts anew");
+    assert_eq!(for_ms(180_000), "60000");
+    agent_in_front(&h, 4243, "claude", aterm_phase::Program::Claude);
+    footer(4243, "conv-b", true);
+    assert_eq!(
+        for_ms(240_000),
+        "0",
+        "the same conversation, a restarted process"
+    );
+    footer(4243, "conv-b", false);
+    assert_eq!(for_ms(300_000), "-", "a read that is not whole");
+    footer(4243, "conv-b", true);
+    assert_eq!(for_ms(360_000), "0", "whole again: counting anew");
+    // A conversation that comes while the clock is unread (`0`) starts no epoch: its counters
+    // go out and their age does not, and its epoch starts at the first read clock, never at 0
+    // (which every later row would send as the whole Unix time).
+    footer(4243, "conv-c", true);
+    let unread = row_at(&h, 0);
+    assert_eq!(
+        (unread["tok_in"].as_str(), unread["tok_for_ms"].as_str()),
+        ("120000", "-"),
+        "{unread:?}"
+    );
+    assert_eq!(
+        for_ms(420_000),
+        "0",
+        "the epoch starts at the first read clock"
+    );
+    assert_eq!(for_ms(480_000), "60000");
+}
+
+/// A TOOL COUNT IS UNREAD UNTIL THE TRANSCRIPT JOIN BINDS: a Claude Code or codex-alab row's
+/// tool steps reach the session log only through its transcript (rollout) join, so while the
+/// join binds nothing (no file found yet, a rollout tap that refused) the row says `tools=-`,
+/// never a count of 0 tool calls, however many it ran; its turns still count. Once the join is
+/// bound the row counts every tool step its run holds.
+/// CONTROL: the bound check removed (a reader's count sent whatever its join holds) is caught.
+#[test]
+fn a_tool_count_is_unread_until_the_transcript_join_binds() {
+    use crate::session_log::transcript::Source;
+    for (id, pgid, program, reader, source) in [
+        (
+            30,
+            7101,
+            "claude",
+            aterm_phase::Program::Claude,
+            Source::Transcript,
+        ),
+        (
+            31,
+            7102,
+            "codex",
+            aterm_phase::Program::Codex,
+            Source::Rollout,
+        ),
+    ] {
+        let h = crate::session_store::test_handle(id);
+        agent_in_front(&h, pgid, program, reader);
+        swept(&h, pgid);
+        let now = aterm_gui_timing::wall_ms();
+        in_log(&h, |log| {
+            let turn = open_turn(log, now - 900_000, now - 600_000);
+            let step = open_tool(log, turn, now - 500_000);
+            close_tool(log, step, now - 400_000);
+        });
+        let row = row_at(&h, now);
+        assert_eq!(row["tools"], "-", "{program}: no join bound: {row:?}");
+        assert_ne!(row["turns"], "-", "{program}: {row:?}");
+        join_bound(&h, pgid, source);
+        assert!(
+            h.ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .slog()
+                .transcript_whole(reader),
+            "PRECONDITION: {program}'s join is bound"
+        );
+        let row = row_at(&h, now);
+        let tools: u32 = row["tools"]
+            .parse()
+            .unwrap_or_else(|_| panic!("{program}: a count once bound: {row:?}"));
+        assert!(tools >= 1, "{program}: {row:?}");
+    }
+}
+
+/// `batch` applied by `source`'s tap to `h`'s session log, as its tap hands it on.
+fn tap_batch(
+    h: &SessionHandle,
+    source: crate::session_log::transcript::Source,
+    batch: &aterm_agent::harness::steps::StepBatch,
+) {
+    let _ = crate::session_log::transcript::apply_batch(&h.ctx.timeline, source, batch, true);
+}
+
+/// A TOOL COUNT IS UNREAD ONCE THE JOIN STOPS HOLDING IT WHOLE: a bound join puts its run's tool
+/// steps in the log only while it reads them all. After its fold latches `state=off` on a row it
+/// could not read (every later step of that file dropped), or after it lost rows (the fold's
+/// `Lost` rows, a queue's overflow), the log's count is frozen or short, so the row says `tools=-`
+/// rather than that count as exact, for the rest of the run: a bind of another file reads that
+/// file's rows, not the ones lost. Turns still count. A reader that stopped (a rollout tap
+/// dropped; Claude Code's footer resolver stopped, its tab status turned off) reads nothing, so
+/// its row says `-` until a transcript fact says it reads again, and then counts.
+/// CONTROLS: the latch's row not counted lost (`TxEvent::Off` adding nothing, the latch case, at
+/// once or after the rebind), the `dropped=` check removed (the loss and overflow cases), the
+/// stopped check removed (the stopped cases) and the Claude stop leaving its run unmarked (the
+/// Claude stopped case) are each caught.
+#[test]
+fn a_tool_count_is_unread_once_the_join_stops_holding_it_whole() {
+    use crate::session_log::transcript::Source;
+    use aterm_agent::harness::steps::{Step, StepBatch, StepEvent, StepPos, StepState};
+    let at = |fp: u64, ev: StepEvent| StepBatch {
+        steps: vec![Step {
+            pos: StepPos {
+                fp,
+                id: None,
+                off: 0,
+                at_ms: 0,
+            },
+            state: StepState::Partial,
+            ev,
+        }],
+        ..StepBatch::default()
+    };
+    let off = at(1, StepEvent::Off { why: "unknown" });
+    let another_file = at(2, StepEvent::Bind { len: 0 });
+    // A lost row of the bound file, past its watermark.
+    let lost = StepBatch {
+        steps: vec![Step {
+            pos: StepPos {
+                fp: 1,
+                id: None,
+                off: 1,
+                at_ms: 0,
+            },
+            state: StepState::Partial,
+            ev: StepEvent::Lost { n: 1 },
+        }],
+        ..StepBatch::default()
+    };
+    let overflow = StepBatch {
+        overflow: 1,
+        ..StepBatch::default()
+    };
+    let mut id = 40;
+    for (program, reader, source) in [
+        ("claude", aterm_phase::Program::Claude, Source::Transcript),
+        ("codex", aterm_phase::Program::Codex, Source::Rollout),
+    ] {
+        for (case, batch) in [("off", &off), ("lost", &lost), ("overflow", &overflow)] {
+            id += 1;
+            let pgid = 7200 + i32::try_from(id).expect("small");
+            let h = crate::session_store::test_handle(id);
+            agent_in_front(&h, pgid, program, reader);
+            let now = aterm_gui_timing::wall_ms();
+            join_bound(&h, pgid, source);
+            in_log(&h, |log| {
+                let turn = open_turn(log, now - 900_000, now - 600_000);
+                let step = open_tool(log, turn, now - 500_000);
+                close_tool(log, step, now - 400_000);
+            });
+            let row = row_at(&h, now);
+            assert_ne!(
+                row["tools"], "-",
+                "PRECONDITION: {program} {case}: a whole join counts: {row:?}"
+            );
+            tap_batch(&h, source, batch);
+            let row = row_at(&h, now);
+            assert_eq!(row["tools"], "-", "{program} {case}: {row:?}");
+            assert_ne!(row["turns"], "-", "{program} {case}: {row:?}");
+            tap_batch(&h, source, &another_file);
+            let row = row_at(&h, now);
+            assert_eq!(
+                row["tools"], "-",
+                "{program} {case}, then another file bound: {row:?}"
+            );
+        }
+    }
+    let h = crate::session_store::test_handle(49);
+    agent_in_front(&h, 7299, "codex", aterm_phase::Program::Codex);
+    let now = aterm_gui_timing::wall_ms();
+    join_bound(&h, 7299, Source::Rollout);
+    in_log(&h, |log| {
+        let turn = open_turn(log, now - 900_000, now - 600_000);
+        let step = open_tool(log, turn, now - 500_000);
+        close_tool(log, step, now - 400_000);
+    });
+    assert_ne!(row_at(&h, now)["tools"], "-", "PRECONDITION: whole");
+    h.ctx.timeline.lock().unwrap().slog_mut().rollout_stopped();
+    let row = row_at(&h, now);
+    assert_eq!(row["tools"], "-", "codex stopped: {row:?}");
+    join_bound(&h, 7299, Source::Rollout);
+    let row = row_at(&h, now);
+    assert_ne!(row["tools"], "-", "codex reads again: {row:?}");
+    let h = crate::session_store::test_handle(47);
+    agent_in_front(&h, 7298, "claude", aterm_phase::Program::Claude);
+    join_bound(&h, 7298, Source::Transcript);
+    in_log(&h, |log| {
+        let turn = open_turn(log, now - 900_000, now - 600_000);
+        let step = open_tool(log, turn, now - 500_000);
+        close_tool(log, step, now - 400_000);
+    });
+    assert_ne!(row_at(&h, now)["tools"], "-", "PRECONDITION: whole");
+    crate::claude_footer::stop_session_taken(47, &h.ctx.timeline);
+    let row = row_at(&h, now);
+    assert_eq!(row["tools"], "-", "claude stopped: {row:?}");
+    join_bound(&h, 7298, Source::Transcript);
+    let row = row_at(&h, now);
+    assert_ne!(row["tools"], "-", "claude reads again: {row:?}");
+}
+
+/// `n` tool steps the agent run open in `h`'s log (the newest one) takes in one turn, each
+/// opened and closed before `now`.
+fn agents_tools(h: &SessionHandle, n: u64, now: u64) {
+    use aterm_slog::{Conf, Kind, Open, Src};
+    in_log(h, |log| {
+        let run = log
+            .open_nodes()
+            .iter()
+            .rev()
+            .find(|e| e.kind == Kind::Agent)
+            .map(|e| e.node)
+            .expect("an agent run open");
+        let turn = log
+            .open(
+                Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
+                wall(now - 900_000),
+            )
+            .expect("the turn");
+        for i in 0..n {
+            let step = open_tool(log, turn, now - 800_000 + i * 1_000);
+            close_tool(log, step, now - 800_000 + i * 1_000 + 500);
+        }
+        close_turn(log, turn, now - 600_000);
+    });
+}
+
+/// THE TOOL COUNT IS THE RUN IN FRONT'S: `tools=` counts the tool steps of the agent run in
+/// front, as its transcript join holds them, never the session's. The join judged whole is that
+/// run's own (each run has its own), so a session total after an earlier run lost rows would be
+/// short yet sent as exact: a run that logged 2 then lost a row, then a run that logged 3, says
+/// 3. A fresh run whose join is whole says its own count (0 before its first tool step), and a
+/// run whose join is not whole says `-`.
+/// CONTROL: the session's total sent for a whole join (`log.totals.tools`) is caught.
+#[test]
+fn the_tool_count_is_the_run_in_fronts_not_the_sessions() {
+    use crate::session_log::transcript::Source;
+    let h = crate::session_store::test_handle(50);
+    let (pgid, claude) = (7301, aterm_phase::Program::Claude);
+    let now = aterm_gui_timing::wall_ms();
+    agent_in_front(&h, pgid, "claude", claude);
+    join_bound(&h, pgid, Source::Transcript);
+    assert_eq!(
+        row_at(&h, now)["tools"],
+        "0",
+        "a fresh run, nothing run yet"
+    );
+    agents_tools(&h, 2, now);
+    assert_eq!(row_at(&h, now)["tools"], "2", "a fresh run, its join whole");
+    let lost = {
+        use aterm_agent::harness::steps::{Step, StepBatch, StepEvent, StepPos, StepState};
+        StepBatch {
+            steps: vec![Step {
+                pos: StepPos {
+                    fp: 1,
+                    id: None,
+                    off: 1,
+                    at_ms: 0,
+                },
+                state: StepState::Partial,
+                ev: StepEvent::Lost { n: 1 },
+            }],
+            ..StepBatch::default()
+        }
+    };
+    tap_batch(&h, Source::Transcript, &lost);
+    assert_eq!(row_at(&h, now)["tools"], "-", "the first run lost a row");
+    // The first run ends (the shell is back in front) and a second one starts.
+    {
+        let mut tl = h.ctx.timeline.lock().unwrap();
+        let _ = tl.sweep_slog(&crate::session_log::BlockRead::default(), false, 100, 100);
+        assert!(
+            tl.slog().transcript_view(Source::Transcript).is_none(),
+            "PRECONDITION: no agent run open"
+        );
+    }
+    assert_eq!(row_at(&h, now)["tools"], "-", "no agent run open");
+    agent_in_front(&h, pgid + 1, "claude", claude);
+    join_bound(&h, pgid + 1, Source::Transcript);
+    agents_tools(&h, 3, now);
+    assert!(
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .slog()
+            .transcript_whole(claude),
+        "PRECONDITION: the second run's join is whole"
+    );
+    let row = row_at(&h, now);
+    assert_eq!(row["tools"], "3", "the second run's own count: {row:?}");
+}
+
+/// A HARNESS WITH NO TRANSCRIPT SAYS SCREEN AND NO TOKENS: agy's and Muse Code's rows take their
+/// last output from the screen's last move (`out_src=screen`), whatever words or steps aterm
+/// read of them, send no token counters (`-`, never `0`) and no tool count, and still say their
+/// turn.
+#[test]
+fn a_harness_with_no_transcript_says_screen_and_no_tokens() {
+    for (id, pgid, program, reader) in [
+        (27, 7001, "agy", aterm_phase::Program::Agy),
+        (28, 7002, "muse", aterm_phase::Program::Muse),
+    ] {
+        let h = crate::session_store::test_handle(id);
+        agent_in_front(&h, pgid, program, reader);
+        assert!(
+            h.ctx
+                .screen_moves
+                .fed(crate::control::ScreenGen { epoch: 1, seq: 99 })
+        );
+        let now = aterm_gui_timing::wall_ms();
+        let moved = h.ctx.screen_moves.moved_ms();
+        {
+            let mut tl = h.ctx.timeline.lock().unwrap();
+            tl.set_claude_excerpts(
+                pgid,
+                Some(ClaudeExcerpts {
+                    excerpts: Excerpts {
+                        said: Some("Done.".into()),
+                        said_at_ms: Some(i64::try_from(now - 300_000).unwrap()),
+                        ..Excerpts::default()
+                    },
+                    ..ClaudeExcerpts::default()
+                }),
+            );
+            tl.set_claude_footer(
+                pgid,
+                None,
+                Some(usage_footer(claude_usage(true, 0, false), "conv-m")),
+            );
+        }
+        in_log(&h, |log| {
+            let turn = open_turn(log, now - 900_000, now - 600_000);
+            let step = open_tool(log, turn, now - 500_000);
+            close_tool(log, step, now - 400_000);
+        });
+        let row = row_at(&h, now);
+        for (key, want) in [
+            ("out_ms", (now - moved).to_string()),
+            ("out_src", "screen".to_owned()),
+            ("tok_in", "-".to_owned()),
+            ("tok_out", "-".to_owned()),
+            ("tok_for_ms", "-".to_owned()),
+            ("tools", "-".to_owned()),
+            ("turn", "1".to_owned()),
+            ("turn_ms", "600000".to_owned()),
+        ] {
+            assert_eq!(row[key], want, "{program} {key}: {row:?}");
+        }
+        assert_ne!(row["turns"], "-", "{program}: {row:?}");
+    }
+}
+
+/// A ROW THAT IS NO AGENT'S SENDS DASHES: a shell's row says nothing of a turn, a step, an
+/// output or tokens (`-` for each of the eleven, never `turn=0`), whatever its log or screen
+/// holds.
+#[test]
+fn a_row_that_is_no_agents_sends_dashes() {
+    let h = crate::session_store::test_handle(29);
+    {
+        let mut tl = h.ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(9000);
+        tl.set_program(9000, Some("zsh".into()));
+    }
+    assert!(
+        h.ctx
+            .screen_moves
+            .fed(crate::control::ScreenGen { epoch: 1, seq: 99 })
+    );
+    let now = aterm_gui_timing::wall_ms();
+    in_log(&h, |log| {
+        let turn = open_turn(log, now - 900_000, now - 600_000);
+        open_tool(log, turn, now - 500_000);
+    });
+    let row = row_at(&h, now);
+    assert_eq!(row["program_kind"], "shell", "PRECONDITION: {row:?}");
+    for key in PROGRESS_KEYS {
+        assert_eq!(row[key], "-", "{key}: {row:?}");
+    }
+}
+
+/// A SESSION ROW SAYS WHETHER IT IS PINNED, at `facts` as at `content`: `pinned=1` once a person
+/// or a lead agent pinned it, `pinned=0` before and after. CONTROL: a row that does not read the
+/// pin says 0 for a pinned session.
+#[test]
+fn a_session_row_says_whether_it_is_pinned() {
+    let h = crate::session_store::test_handle(31);
+    let now = aterm_gui_timing::wall_ms();
+    let content = |h: &SessionHandle| {
+        fields(
+            &session_row(
+                h,
+                SurveyLevel::Content,
+                None,
+                (crate::metrics::now_us(), now, 0),
+            )
+            .text,
+        )
+    };
+    assert_eq!(row_at(&h, now)["pinned"], "0");
+    assert!(crate::session_timeline::set_pinned(
+        &h.ctx,
+        true,
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(row_at(&h, now)["pinned"], "1");
+    assert_eq!(content(&h)["pinned"], "1");
+    assert!(crate::session_timeline::set_pinned(
+        &h.ctx,
+        false,
+        aterm_slog::Actor::Ctl
+    ));
+    assert_eq!(row_at(&h, now)["pinned"], "0");
+}
+
+/// A row carries its harness upgrade word as `status` prints it (`upgrade=`), at facts and at
+/// content, `-` where the host sent none, so a fleet read shows a held one (on 2026-11-13 five
+/// tabs on one Mac stood at `pending/2.1.325/account` for hours and no fleet read could show it).
+/// NEGATIVE CONTROL: a producer that writes `upgrade=-` whatever the timeline holds fails the
+/// pending arm, and one that writes the kept row after the host sent none fails the cleared arm.
+#[test]
+fn a_rows_upgrade_word_is_the_one_status_prints() {
+    use aterm_agent::harness::upgrade::Phase;
+    use aterm_agent::harness::upgrade_drive::Row;
+    let store = crate::session_store::new_store();
+    let claude = crate::session_store::test_handle(5);
+    claude_session(&claude);
+    store.write().unwrap().register(claude.clone());
+    let word_at = |level| {
+        let reply = survey_rows(&store, level, usize::MAX, &here());
+        fields(reply.lines().nth(2).expect("the claude row"))["upgrade"].clone()
+    };
+    for level in [SurveyLevel::Facts, SurveyLevel::Content] {
+        assert_eq!(word_at(level), "-", "{level:?}: no upgrade row");
+    }
+    // Whole hours behind, so a second's skew between this read and the survey's leaves the age.
+    let now = aterm_time::unix_secs().unwrap_or(0);
+    let row = Row {
+        tab: claude.sid.as_str().to_owned(),
+        from: "2.1.324".into(),
+        to: "2.1.325".into(),
+        phase: Phase::Pending,
+        behind_since: now - 2 * 3_600,
+        wait: "account".into(),
+        wait_since: now - 2 * 3_600,
+        ..Row::default()
+    };
+    assert!(claude.ctx.timeline.lock().unwrap().set_upgrade(Some(row)));
+    let (_, status) = claude
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .owner_columns(false, now);
+    let printed = status
+        .rsplit_once(" upgrade=")
+        .map(|(_, word)| word.to_owned())
+        .expect("status prints upgrade=");
+    assert_eq!(printed, "pending/2.1.325/account/2h", "{status}");
+    for level in [SurveyLevel::Facts, SurveyLevel::Content] {
+        assert_eq!(word_at(level), printed, "{level:?}: the word status prints");
+    }
+    // A host that sends none leaves the word: the kept row is the top rule's, not a pending one.
+    assert!(claude.ctx.timeline.lock().unwrap().set_upgrade(None));
+    assert_eq!(word_at(SurveyLevel::Facts), "-", "cleared");
 }

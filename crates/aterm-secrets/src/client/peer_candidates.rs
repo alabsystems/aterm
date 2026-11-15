@@ -438,6 +438,7 @@ impl Plan {
         resolve: impl FnOnce(&[String], Duration) -> Vec<DiscoveredVault>,
     ) -> Vec<String> {
         if !self.names.is_empty() && budget >= Duration::from_millis(40) {
+            crate::pass_counts::add_n(crate::pass_counts::Count::NamesResolved, self.names.len());
             self.ready.extend(resolve(&self.names, budget));
         }
         self.ready.retain_mut(|item| {

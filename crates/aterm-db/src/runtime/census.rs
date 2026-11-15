@@ -21,8 +21,8 @@ pub(crate) enum Event {
     OwnerTick,
     /// A transport read a discovery datagram that its multicast socket's checks passed.
     Beacon,
-    /// A transport's turn took what local appends announced since the turn before
-    /// (`super::announce`): one count, however many appends.
+    /// A transport's look found this Mac's Commons state moved (`super::moved`), which its
+    /// dials then offer: one count a look, however much moved.
     Announce,
     /// An exchange started its `db-exchange-deadline` thread (`crate::network::Deadline`).
     DeadlineSpawn,
@@ -62,8 +62,8 @@ pub struct Cadence {
     pub owner_ticks: u64,
     /// Discovery datagrams its transports read.
     pub beacons: u64,
-    /// Turns of its transports that took the announce of local appends: one for the appends
-    /// that came since the turn before, however many.
+    /// Looks of its transports that found this Mac's Commons state moved, whoever wrote it: one
+    /// a look, however much moved.
     pub announces: u64,
     /// Fleet book entries' signatures this process checked, by any caller
     /// (`aterm_net::fleet_member::signature_checks`).

@@ -30,6 +30,7 @@ use aterm_window::event_loop::EventLoopProxy;
 use crate::Wake;
 
 pub(crate) mod naming;
+pub(crate) mod page;
 mod panel_reads;
 #[cfg(test)]
 mod publication_tests;
@@ -74,7 +75,7 @@ pub(crate) struct MachineView {
     /// The display spelling the Name field starts with (`Heron`).
     pub(crate) word: String,
     /// Whether this machine is in a fleet: its vault's standing, or a key with admitted custody
-    /// ([`InFleet`], §11.85).
+    /// ([`InFleet`], §5.2).
     pub(crate) fleet: InFleet,
 }
 
@@ -313,12 +314,16 @@ pub(crate) const NAME_NOT_ASKED: &str = "nothing was changed: aterm could not sh
 pub(crate) const NAME_PERSON_ONLY: &str =
     "Rename This Mac\u{2026} is the person's own act at the window; from a shell, `aterm name set`";
 
-enum NameChange {
+#[derive(Debug)]
+pub(crate) enum NameChange {
     Nickname(NickTo),
     Name(NameTo),
     Synchronize(Number),
     /// A successful explicit permission tab: reread canonical targets, never an old panel name.
     SynchronizeCurrent,
+    /// Undo Last Rename: take back this change, the newest the page's read showed, and no other
+    /// ([`aterm_agent::machine_name::undo_last`]'s `seen`).
+    Undo(aterm_agent::machine_name::file::Change),
 }
 
 /// What Rename's answer `to` sets: a nickname alone, another number
@@ -373,8 +378,9 @@ pub(crate) struct NameUnset {
     pub(crate) why: String,
 }
 
-/// The window's single writer processes edits, and Rename This Mac…'s reads, in the order their
-/// menu presses submitted them, so a read sees every change pressed before it.
+/// The window's single writer processes edits, and Rename This Mac…'s and Settings ▸ This Mac's
+/// reads, in the order their presses submitted them, so a read sees every change pressed before
+/// it, from either surface.
 pub(crate) struct NameWriter {
     jobs: mpsc::Sender<Job>,
 }
@@ -384,12 +390,26 @@ enum Job {
     Change(NameJob),
     /// Read what Rename This Mac… judges a number by, for press `press`'s alert.
     Preview(u64),
+    /// Read what Settings ▸ This Mac shows, as its read `seq` ([`page::read_page`]).
+    PageRead(u64),
+}
+
+/// Which surface asked for a name write: the menu's Rename This Mac… or Settings ▸ This Mac.
+/// Each counts its own writes (`App::machine_sets`, `MachinePageHost::sets`) and hears only its
+/// own failures, so a failed page Save never leads the next Rename panel, nor a panel's failure
+/// the page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    Panel,
+    Page,
 }
 
 struct NameJob {
     to: NameChange,
+    /// Which of `origin`'s writes this is.
     generation: u64,
     asked: Asked,
+    origin: Origin,
 }
 
 impl NameWriter {
@@ -403,6 +423,7 @@ impl NameWriter {
                 write_changes(queued, |job| match job {
                     Job::Change(job) => apply_change(&proxy, job),
                     Job::Preview(press) => read_preview(press, &discovery, &diagnostics),
+                    Job::PageRead(seq) => page::read_page(seq, &proxy),
                 });
             })?;
         Ok(Self { jobs })
@@ -418,11 +439,54 @@ fn write_changes<J>(jobs: mpsc::Receiver<J>, mut apply: impl FnMut(J)) {
 
 fn report_unset(proxy: &EventLoopProxy<Wake>, job: &NameJob, why: String) {
     aterm_log::warn!("machine name: the person's change was not set: {why}");
-    let _ = proxy.send_event(Wake::MachineNameNotSet(unset_of(
+    let _ = proxy.send_event(not_set_wake(
+        job.origin,
         job.generation,
         &job.asked,
-        &why,
-    )));
+        format!("Last attempt: {why}"),
+    ));
+}
+
+/// Where write `generation`'s failure, or its pending publication, goes: back to the surface
+/// that asked (`origin`) as that surface's write, never to the other one. Rename This Mac…
+/// keeps it with the press's `asked` for its next press ([`crate::App::machine_name_not_set`]);
+/// Settings ▸ This Mac says it in its notice ([`crate::App::machine_page_not_set`]). `why` is
+/// the whole sentence the surface shows.
+fn not_set_wake(origin: Origin, generation: u64, asked: &Asked, why: String) -> Wake {
+    match origin {
+        Origin::Panel => Wake::MachineNameNotSet(NameUnset {
+            generation,
+            asked: asked.clone(),
+            why,
+        }),
+        Origin::Page => Wake::MachinePage(page::PageWake::NotSet(generation, why)),
+    }
+}
+
+/// What a saved change's `pending` publication tells the surface that asked (`origin`): it asks
+/// for no field again, since the untouched fields follow the fresh name. Settings ▸ This Mac's
+/// own read observes neither macOS's names nor the naming rule, so a pending macOS step also
+/// names Rename This Mac…, whose primary retries it ([`page::RETRIED_IN_THE_PANEL`]), in a
+/// process that is its account's own. In one that is not (`not_own`, as
+/// [`aterm_types::dirs::not_own_account`] says why: a private state root, root, or another
+/// `HOME`), the panel's retry runs the same registered operation, which refuses it
+/// ([`aterm_agent::machine_name::publish::apply_registered`]), so the notice names no surface.
+fn pending_wake(
+    origin: Origin,
+    generation: u64,
+    pending: &aterm_agent::machine_name::publish::Pending,
+    not_own: Option<&str>,
+) -> Wake {
+    use aterm_agent::machine_name::publish::Pending;
+    let mut why = format!("Last synchronization attempt: {}", pending.why());
+    if origin == Origin::Page && not_own.is_none() && matches!(pending, Pending::SystemNames(_)) {
+        why.push_str(page::RETRIED_IN_THE_PANEL);
+    }
+    let asked = Asked {
+        number: None,
+        nick: None,
+    };
+    not_set_wake(origin, generation, &asked, why)
 }
 
 /// Queue `job` on the window's writer, started at its first job: a job it cannot take is
@@ -433,6 +497,14 @@ fn queue(writer: &mut Option<NameWriter>, proxy: EventLoopProxy<Wake>, job: Job)
         Job::Preview(press) => crate::machine_rename_sheet::deliver(
             press,
             crate::machine_rename_sheet::Snapshot::Unread(why),
+        ),
+        Job::PageRead(seq) => page::page_landed(
+            &proxy,
+            seq,
+            page::PageFound {
+                snapshot: crate::machine_rename_sheet::Snapshot::Unread(why),
+                fleet: None,
+            },
         ),
     };
     if writer.is_none() {
@@ -555,6 +627,47 @@ fn change_number(
     })
 }
 
+/// Undo Last Rename: take back `seen`, the newest change the page's read showed, as
+/// `aterm name undo` does ([`aterm_agent::machine_name::undo_last`], a person's), then publish
+/// what it leaves as a Save does. The naming policy is read first, for the number the undo
+/// publishes under ([`aterm_agent::machine_name::undo_publishes`]), so a naming hold or an
+/// unreadable aterm.toml refuses before any name changes.
+///
+/// # Errors
+/// This Mac's name cannot be read, or is none; the policy refuses; or the undo is refused,
+/// `seen` being no longer History's newest among the causes ([`Cause::Unseen`]), in its words.
+///
+/// [`Cause::Unseen`]: aterm_agent::machine_name::Cause::Unseen
+fn change_undo(
+    state: &Path,
+    config: &Path,
+    seen: &aterm_agent::machine_name::file::Change,
+    system: &dyn aterm_agent::machine_name::publish::SystemNames,
+    lab: impl FnOnce() -> io::Result<aterm_secrets::client::LabLabels>,
+    roster: impl FnOnce() -> io::Result<Option<String>>,
+    stamp: u64,
+) -> Result<NameEdit, String> {
+    use aterm_agent::machine_name::{file, publish, undo_last, undo_publishes};
+    use aterm_net::fleet_member::name_record::ByKind;
+    let current = file::read(state)
+        .map_err(|why| why.to_string())?
+        .ok_or("this Mac's saved name is unavailable")?;
+    let policy = undo_publishes(&current)
+        .map(|number| publish::Policy::read(config, number))
+        .transpose()?;
+    let set = undo_last(state, Some(seen), lab, ByKind::Person, roster, stamp, false)
+        .map_err(|why| why.to_string())?;
+    let publication = policy
+        .as_ref()
+        .and_then(|policy| publish::publish(state, config, policy, Some(system)).err());
+    Ok(NameEdit {
+        name: set.name,
+        changed: set.changed,
+        shared: set.shared,
+        publication,
+    })
+}
+
 /// Save a nickname and synchronize its generated OS targets without choosing a number again.
 fn change_nickname(
     state: &Path,
@@ -564,17 +677,12 @@ fn change_nickname(
     roster: impl FnOnce() -> io::Result<Option<String>>,
     stamp: u64,
 ) -> Result<NameEdit, String> {
-    use aterm_agent::machine_name::{file, publish, set_nick};
+    use aterm_agent::machine_name::{chosen_number, file, publish, set_nick};
     use aterm_net::fleet_member::name_record::ByKind;
     let current = file::read(state).map_err(|why| why.to_string())?;
-    let number = current
+    let policy = current
         .as_ref()
-        .filter(|name| {
-            name.class == aterm_types::machine_name::Class::Chosen
-                && name.migration != Some(file::Migration::Waiting)
-        })
-        .and_then(|name| name.num);
-    let policy = number
+        .and_then(chosen_number)
         .map(|number| publish::Policy::read(config, number))
         .transpose()?;
     let set =
@@ -597,19 +705,14 @@ fn synchronize_current(
     config: &Path,
     system: &dyn aterm_agent::machine_name::publish::SystemNames,
 ) -> Result<NameEdit, String> {
-    use aterm_agent::machine_name::file;
+    use aterm_agent::machine_name::{chosen_number, file};
     if !system.authorization(state, config)? {
         return Err("macOS naming permission is not current after authorization".into());
     }
     let saved = file::read(state)
         .map_err(|why| why.to_string())?
         .ok_or("this Mac's saved name is unavailable")?;
-    let number = saved
-        .num
-        .filter(|_| {
-            saved.class == aterm_types::machine_name::Class::Chosen
-                && saved.migration != Some(file::Migration::Waiting)
-        })
+    let number = chosen_number(&saved)
         .ok_or("choose this Mac's canonical number before synchronizing its name")?;
     let publication = naming::synchronize(state, config, number, system).err();
     let name = file::read(state)
@@ -623,6 +726,42 @@ fn synchronize_current(
     })
 }
 
+/// Write `change` to the name in `state`, published by the aterm.toml at `config` and
+/// `system`'s macOS names, at `stamp`: the writer's one dispatch for either surface's change,
+/// whose number and nickname edits, and the page's undo of the change it showed, record the
+/// person and this node in History.
+///
+/// # Errors
+/// Why the change was not set, as the surface that asked says it.
+fn write_change(
+    state: &Path,
+    config: &Path,
+    change: &NameChange,
+    system: &dyn aterm_agent::machine_name::publish::SystemNames,
+    lab: impl FnOnce() -> io::Result<aterm_secrets::client::LabLabels>,
+    roster: impl FnOnce() -> io::Result<Option<String>>,
+    stamp: u64,
+) -> Result<NameEdit, String> {
+    match change {
+        NameChange::Nickname(to) => change_nickname(state, config, to, system, roster, stamp),
+        NameChange::Name(to) => change_number(state, config, to, system, lab, roster, stamp),
+        NameChange::Undo(seen) => change_undo(state, config, seen, system, lab, roster, stamp),
+        NameChange::SynchronizeCurrent => synchronize_current(state, config, system),
+        NameChange::Synchronize(number) => {
+            let publication = naming::synchronize(state, config, *number, system).err();
+            let name = aterm_agent::machine_name::file::read(state)
+                .map_err(|why| why.to_string())?
+                .ok_or("this Mac's saved name is unavailable")?;
+            Ok(NameEdit {
+                name,
+                changed: false,
+                shared: false,
+                publication,
+            })
+        }
+    }
+}
+
 /// Apply one queued edit off the window thread, releasing its persistence locks before
 /// `post_read` serializes the resulting snapshot with the file watcher.
 fn apply_change(proxy: &EventLoopProxy<Wake>, job: NameJob) {
@@ -633,40 +772,20 @@ fn apply_change(proxy: &EventLoopProxy<Wake>, job: NameJob) {
     let roster = aterm_agent::machine_name::vault_roster_label;
     let vault = aterm_agent::machine_name::standing_vault();
     let stamp = aterm_netplace::unix_ms_now();
-    let set = match &job.to {
-        NameChange::Nickname(to) => {
-            let config = aterm_types::dirs::aterm_config_path()
-                .ok_or_else(|| "aterm has no configuration path".to_owned());
-            config.and_then(|config| {
-                change_nickname(&state, &config, to, &MacSystemNames, roster, stamp)
-            })
-        }
-        NameChange::Name(to) => (|| {
-            let config =
-                aterm_types::dirs::aterm_config_path().ok_or("aterm has no configuration path")?;
+    let set = aterm_types::dirs::aterm_config_path()
+        .ok_or_else(|| "aterm has no configuration path".to_owned())
+        .and_then(|config| {
             let lab = || aterm_agent::machine_name::lab_labels(vault.as_ref());
-            change_number(&state, &config, to, &MacSystemNames, lab, roster, stamp)
-        })(),
-        NameChange::SynchronizeCurrent => (|| {
-            let config =
-                aterm_types::dirs::aterm_config_path().ok_or("aterm has no configuration path")?;
-            synchronize_current(&state, &config, &MacSystemNames)
-        })(),
-        NameChange::Synchronize(number) => (|| {
-            let config =
-                aterm_types::dirs::aterm_config_path().ok_or("aterm has no configuration path")?;
-            let publication = naming::synchronize(&state, &config, *number, &MacSystemNames).err();
-            let name = aterm_agent::machine_name::file::read(&state)
-                .map_err(|why| why.to_string())?
-                .ok_or("this Mac's saved name is unavailable")?;
-            Ok(NameEdit {
-                name,
-                changed: false,
-                shared: false,
-                publication,
-            })
-        })(),
-    };
+            write_change(
+                &state,
+                &config,
+                &job.to,
+                &MacSystemNames,
+                lab,
+                roster,
+                stamp,
+            )
+        });
     match set {
         Ok(NameEdit {
             name,
@@ -694,16 +813,13 @@ fn apply_change(proxy: &EventLoopProxy<Wake>, job: NameJob) {
             if let Some(pending) = publication {
                 // The canonical save succeeded. Untouched fields follow the fresh name on
                 // the next panel open; a retry never silently reasserts an older number.
-                let unset = NameUnset {
-                    generation: job.generation,
-                    asked: Asked {
-                        number: None,
-                        nick: None,
-                    },
-                    why: format!("Last synchronization attempt: {}", pending.why()),
-                };
-                aterm_log::info!("machine name: {}", unset.why);
-                let _ = proxy.send_event(Wake::MachineNameNotSet(unset));
+                aterm_log::info!("machine name: publication pending: {}", pending.why());
+                let _ = proxy.send_event(pending_wake(
+                    job.origin,
+                    job.generation,
+                    &pending,
+                    aterm_types::dirs::not_own_account(),
+                ));
             }
         }
         Err(why) => report_unset(proxy, &job, why),
@@ -761,7 +877,7 @@ impl crate::App {
                     end(press);
                     self.machine_unset = None;
                     self.machine_sets = self.machine_sets.wrapping_add(1);
-                    self.open_machine_name_authorization(self.machine_sets);
+                    self.open_machine_name_authorization(Origin::Panel, self.machine_sets);
                     return;
                 }
                 Ok(to) => rename_change(to),
@@ -819,6 +935,7 @@ impl crate::App {
                     to,
                     generation,
                     asked,
+                    origin: Origin::Panel,
                 }),
             );
         }
@@ -826,18 +943,26 @@ impl crate::App {
 
     /// The existing person-owned tab adapter calls this only for its actual terminal result
     /// while the originating window/session is still eligible. No captured target crosses it.
+    /// The result goes back to the surface that asked (`origin`), as its write `generation`.
     pub(crate) fn machine_name_authorization_finished(
         &mut self,
+        origin: Origin,
         generation: u64,
         result: Result<(), String>,
     ) {
-        if generation != self.machine_sets {
+        if !self.machine_write_is_newest(origin, generation) {
             return;
         }
         let asked = Asked {
             number: None,
             nick: None,
         };
+        if origin == Origin::Page {
+            return match result {
+                Err(why) => self.machine_page_not_set(generation, format!("Last attempt: {why}")),
+                Ok(()) => self.queue_machine_page_change(NameChange::SynchronizeCurrent, asked),
+            };
+        }
         if let Err(why) = result {
             return self.machine_name_not_set(unset_of(generation, &asked, &why));
         }
@@ -849,6 +974,7 @@ impl crate::App {
                     to: NameChange::SynchronizeCurrent,
                     generation,
                     asked,
+                    origin,
                 }),
             );
         } else {
@@ -873,10 +999,17 @@ impl crate::App {
 
     /// Accept the next serialized read, retitle the menu, and rebuild the status item's name.
     /// Revision numbers order one name-file lineage, not an identity or file replacement.
+    /// Wherever a Settings view holds Settings ▸ This Mac, on screen or in a background tab or a
+    /// covered window, the page reads again after it, so it follows a change the panel, a shell
+    /// or another aterm made: the title's reader posts each change once, so a page that let one
+    /// pass would show the older name when it came back to the front.
     pub(crate) fn machine_name_read(&mut self, view: MachineView) {
         self.machine_view = Some(view);
         self.refresh_machine_menu();
         self.mark_status_dirty();
+        if self.machine_page_held() {
+            self.queue_machine_page_read();
+        }
     }
 }
 

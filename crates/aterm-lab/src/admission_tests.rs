@@ -107,7 +107,7 @@ fn functional_claim_refuses_now_zero_missing_and_unknown_before_work() {
 }
 
 #[test]
-fn functional_shortage_waits_for_actual_room_and_never_uses_alone() {
+fn non_timing_shortages_wait_for_actual_room_and_never_use_alone() {
     struct RoomAfterLine {
         ready: Cell<bool>,
         start: Instant,
@@ -121,39 +121,42 @@ fn functional_shortage_waits_for_actual_room_and_never_uses_alone() {
             None
         }
     }
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let ledger = Ledger::at(scratch.path().join("ledger"));
-    let machine = RoomAfterLine {
-        ready: Cell::new(false),
-        start: Instant::now(),
-    };
-    let claim = functional_in(
-        Some(&ledger),
-        &machine,
-        functional_need(),
-        "functional fixture",
-        Admit::Wait,
-        Pace {
-            poll: std::time::Duration::ZERO,
-            ..Pace::default()
-        },
-        &mut |line| {
-            if machine.ready.get() {
-                assert!(line.contains("admitted"), "{line}");
-            } else {
-                assert!(line.contains("waits") && line.contains("memory"), "{line}");
-                machine.ready.set(true);
-            }
-        },
-    )
-    .unwrap();
-    assert!(
-        machine.ready.get(),
-        "a zero-room ALONE admission would skip the actual wait"
-    );
-    assert!(!ledger.list().unwrap()[0].held.unwrap().alone);
-    drop(claim);
-    assert!(ledger.list().unwrap().is_empty());
+    for purpose in [ResourcePurpose::Functional, ResourcePurpose::Correctness] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let machine = RoomAfterLine {
+            ready: Cell::new(false),
+            start: Instant::now(),
+        };
+        let claim = resource_in(
+            purpose,
+            Some(&ledger),
+            &machine,
+            purpose.need("window fixture".into(), 2 << 30),
+            "window fixture",
+            Admit::Wait,
+            Pace {
+                poll: std::time::Duration::ZERO,
+                ..Pace::default()
+            },
+            &mut |line| {
+                if machine.ready.get() {
+                    assert!(line.contains("admitted"), "{line}");
+                } else {
+                    assert!(line.contains("waits") && line.contains("memory"), "{line}");
+                    machine.ready.set(true);
+                }
+            },
+        )
+        .unwrap();
+        assert!(
+            machine.ready.get(),
+            "a zero-room ALONE admission would skip the actual wait"
+        );
+        assert!(!ledger.list().unwrap()[0].held.unwrap().alone);
+        drop(claim);
+        assert!(ledger.list().unwrap().is_empty());
+    }
 }
 
 #[test]
@@ -197,6 +200,233 @@ fn functional_memory_must_remain_known_during_admission() {
     assert!(error.msg.unwrap().contains("changed to unknown"));
     assert!(machine.reads.get() > 1);
     assert!(ledger.list().unwrap().is_empty());
+}
+
+#[test]
+fn correctness_admission_ignores_cpu_load_without_issuing_timing_evidence() {
+    for load in [Some(200.0), None] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let mut reading = Reading::of_gib(48, 40, 14);
+        reading.load1 = load;
+        let fixed = Fixed::new(reading);
+        let purpose = ResourcePurpose::Correctness;
+        let mut claim = resource_in(
+            purpose,
+            Some(&ledger),
+            &fixed,
+            purpose.need("correctness fixture".into(), 2 << 30),
+            "correctness fixture",
+            Admit::Wait,
+            Pace::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let records = ledger.list().unwrap();
+        let held = &records[0];
+        assert!(held.need.quiet.is_some());
+        assert_eq!(held.need.quiet_policy, aterm_capacity::QuietPolicy::Load);
+        assert!(held.need.patience.is_none());
+        assert_eq!(held.need.mem, 2 << 30);
+        assert_eq!(held.need.margin, FUNCTIONAL_MARGIN);
+        assert!(!held.held.unwrap().alone);
+        assert!(fixed.cpu_point().is_none());
+        assert_eq!(
+            claim.measurement_entry(),
+            Err(aterm_capacity::TimingIssue::UnknownAdmission)
+        );
+        assert_eq!(
+            claim.timing_admission(),
+            Err(aterm_capacity::TimingIssue::UnknownAdmission)
+        );
+        drop(claim);
+        let refused = quiet_in(
+            Some(&ledger),
+            &fixed,
+            Need::timing("timing control"),
+            "timing control",
+            Admit::Wait,
+            Pace::default(),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, 3);
+        assert!(ledger.list().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn correctness_admission_refuses_invalid_or_unknown_resources() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(scratch.path().join("ledger"));
+    let purpose = ResourcePurpose::Correctness;
+    let need = purpose.need("correctness fixture".into(), 2 << 30);
+    let healthy = Fixed::new(Reading::of_gib(48, 40, 14));
+    for (ledger, need, mode) in [
+        (Some(&ledger), need.clone(), Admit::Now),
+        (Some(&ledger), purpose.need("zero".into(), 0), Admit::Wait),
+        (
+            Some(&ledger),
+            Need::timing("wrong policy")
+                .mem_gib(2)
+                .margin(FUNCTIONAL_MARGIN),
+            Admit::Wait,
+        ),
+        (None, need.clone(), Admit::Wait),
+    ] {
+        assert_eq!(
+            resource_in(
+                purpose,
+                ledger,
+                &healthy,
+                need,
+                "fixture",
+                mode,
+                Pace::default(),
+                &mut |_| {}
+            )
+            .unwrap_err()
+            .code,
+            3
+        );
+    }
+    for reading in [
+        Reading::default(),
+        Reading {
+            available: None,
+            ..Reading::of_gib(48, 40, 14)
+        },
+        Reading {
+            physical: None,
+            ..Reading::of_gib(48, 40, 14)
+        },
+    ] {
+        assert_eq!(
+            resource_in(
+                purpose,
+                Some(&ledger),
+                &Fixed::new(reading),
+                need.clone(),
+                "fixture",
+                Admit::Wait,
+                Pace::default(),
+                &mut |_| {}
+            )
+            .unwrap_err()
+            .code,
+            3
+        );
+        assert!(ledger.list().unwrap().is_empty());
+    }
+}
+
+const CORRECTNESS_PEER: &str = "ATERM_LAB_CORRECTNESS_PEER";
+const CORRECTNESS_PEER_KIND: &str = "ATERM_LAB_CORRECTNESS_PEER_KIND";
+
+#[test]
+fn standin_correctness_quiet_peer() {
+    let Some(dir) = std::env::var_os(CORRECTNESS_PEER).map(PathBuf::from) else {
+        return;
+    };
+    let ledger = Ledger::at(dir.join("ledger"));
+    let machine = machine();
+    let need = match std::env::var(CORRECTNESS_PEER_KIND).as_deref() {
+        Ok("correctness") => ResourcePurpose::Correctness.need("correctness peer".into(), 2 << 30),
+        Ok("timing") => Need::timing("timing peer"),
+        _ => panic!("unknown peer purpose"),
+    };
+    let waiting = aterm_capacity::admit::Waiter::enter(&ledger, &machine, need).unwrap();
+    let mut waiting = match waiting.poll(&machine) {
+        aterm_capacity::admit::Polled::Waiting(waiting, short) => {
+            assert!(short.shorts.iter().any(|short| matches!(
+                short,
+                aterm_capacity::admit::Short::Quiet { held: true, .. }
+            )));
+            Some(waiting)
+        }
+        other => panic!("independent window did not keep quiet exclusion: {other:?}"),
+    };
+    std::fs::write(dir.join("blocked"), b"blocked").unwrap();
+    until_within(MUST_HAPPEN, "parent releases quiet claim", || {
+        dir.join("release").exists().then_some(())
+    });
+    let claim = until_within(
+        MUST_HAPPEN,
+        "peer acquires released quiet claim",
+        || match waiting.take().unwrap().poll(&machine) {
+            aterm_capacity::admit::Polled::Admitted(claim) => Some(claim),
+            aterm_capacity::admit::Polled::Waiting(next, _) => {
+                waiting = Some(next);
+                None
+            }
+            other => panic!("peer admission failed: {other:?}"),
+        },
+    );
+    drop(claim);
+}
+
+#[test]
+fn correctness_and_timing_exclude_each_other_across_processes() {
+    for peer in ["timing", "correctness"] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ledger = Ledger::at(scratch.path().join("ledger"));
+        let held = if peer == "timing" {
+            resource_in(
+                ResourcePurpose::Correctness,
+                Some(&ledger),
+                &machine(),
+                ResourcePurpose::Correctness.need("correctness holder".into(), 2 << 30),
+                "holder",
+                Admit::Wait,
+                Pace::default(),
+                &mut |_| {},
+            )
+            .unwrap()
+        } else {
+            quiet_in(
+                Some(&ledger),
+                &machine(),
+                Need::timing("timing holder"),
+                "holder",
+                Admit::Wait,
+                Pace {
+                    poll: std::time::Duration::ZERO,
+                    ..Pace::default()
+                },
+                &mut |_| {},
+            )
+            .unwrap()
+        };
+        let mut child = Standin(
+            aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "admission::tests::standin_correctness_quiet_peer",
+                    "--test-threads=1",
+                ])
+                .env(CORRECTNESS_PEER, scratch.path())
+                .env(CORRECTNESS_PEER_KIND, peer)
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        until_within(MUST_HAPPEN, "independent quiet exclusion", || {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "peer exited before proving exclusion"
+            );
+            scratch.path().join("blocked").exists().then_some(())
+        });
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert_eq!(ledger.list().unwrap().len(), 2);
+        drop(held);
+        std::fs::write(scratch.path().join("release"), b"release").unwrap();
+        let status = until_within(MUST_HAPPEN, "independent peer completed", || {
+            child.0.try_wait().unwrap()
+        });
+        assert!(status.success(), "{peer}: {status}");
+        assert!(ledger.list().unwrap().is_empty());
+    }
 }
 
 #[test]
@@ -585,4 +815,22 @@ fn admit_is_taken_out_before_the_verb_reads_its_arguments() {
     assert!(strip(&mut words(&["--admit", "soon"])).is_err());
     assert!(strip(&mut words(&["--admit"])).is_err());
     assert!(strip(&mut words(&["--admit", "--", "now"])).is_err());
+}
+
+#[test]
+fn independent_comparison_owners_serialize_until_the_original_guard_releases() {
+    let slot = Mutex::new(());
+    let first = comparison_slot(&slot).unwrap();
+    assert!(
+        comparison_slot(&slot).is_err(),
+        "a second quad cannot acquire independent launch authority"
+    );
+    drop(first);
+    let next = comparison_slot(&slot).unwrap();
+    assert!(comparison_slot(&slot).is_err());
+    drop(next);
+    assert!(
+        comparison_slot(&slot).is_ok(),
+        "release permits a fresh quad to requeue normally"
+    );
 }

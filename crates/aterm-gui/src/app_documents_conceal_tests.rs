@@ -21,7 +21,7 @@ const SECRETS: [&str; 2] = ["hunter2-Zq9", "s3cr3t-Wv7"];
 const EMAILS: [&str; 2] = ["ada@example.test", "bob@example.test"];
 const WID: WindowId = WindowId(0);
 
-/// A reveal's grid as `db alab --show-passwords` writes one: a header row, then records whose
+/// A concealed grid as `amacs --secret=password` opens one: a header row, then records whose
 /// `password` cells hold the secrets.
 fn reveal_text() -> String {
     format!(

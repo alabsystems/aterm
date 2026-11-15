@@ -352,35 +352,32 @@ fn the_keychain_profile_spelling_puts_no_secret_on_the_command_line() {
     assert_eq!(auth.args().len(), 2, "no third argument can carry a secret");
 }
 
+/// A store ring whose profile names no notary profile, and an operator's profile that names
+/// none, give no notary credential: the cut is refused either way.
 #[test]
 fn a_cut_without_a_notary_credential_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
     let scratch = crate::test_scratch_dir("apple");
     let root = scratch.path();
-    let (home, repo) = (root.join("home"), root.join("repo"));
-    std::fs::create_dir_all(home.join(atpkg_keys::provision::RELEASE_RING_REL)).unwrap();
-    std::fs::create_dir_all(&repo).unwrap();
-    let pkcs8 =
-        ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
-    let key = home.join(atpkg_keys::provision::MACHINE_KEY_REL);
-    std::fs::write(&key, pkcs8.as_ref()).unwrap();
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-    let machine = sign::ReleaseCredentials::resolve_with(None, &repo, home.to_str())
-        .expect("machine.key resolves")
-        .expect("machine.key yields credentials");
-    assert!(machine.profile().is_none(), "machine.key is no profile");
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let (encoded, _) = crate::seed_ring(&home, None);
+    let machine = sign::ReleaseCredentials::resolve_with(None, home.to_str())
+        .expect("the store's ring resolves")
+        .expect("the store's ring yields credentials");
     for credentials in [Some(&machine), None] {
         sign::resolve_apple_tier(FAKE_TEAM, credentials)
-            .expect_err("no profile, no notary credential");
+            .expect_err("no notary_profile, no notary credential");
     }
 
-    let encoded = aterm_codec::base64::encode(pkcs8.as_ref()).expect("pkcs8");
     let path = root.join("profile.toml");
     std::fs::write(&path, format!("signing_key = \"{encoded}\"\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let profile = sign::ReleaseCredentials::load(&path, None).expect("the profile loads");
-    assert_eq!(profile.profile(), Some(path.as_path()));
+    assert_eq!(
+        profile.profile(),
+        Some(&sign::ProfileSource::File(path.clone()))
+    );
     sign::resolve_apple_tier(FAKE_TEAM, Some(&profile))
         .expect_err("a profile without notary_profile cannot notarize");
 }

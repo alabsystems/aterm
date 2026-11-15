@@ -325,7 +325,7 @@ pub fn enrich_inventory_with_identity(
                 accounts::AttemptOutcome::NoRoute => Some("no usable sign-in route"),
                 accounts::AttemptOutcome::Failed => Some("sign-in route failed"),
                 accounts::AttemptOutcome::Blocked => Some("sign-in route stopped by its page"),
-                accounts::AttemptOutcome::SignedIn => None,
+                accounts::AttemptOutcome::SignedIn | accounts::AttemptOutcome::OnToken => None,
             };
             if let Some(outcome) = outcome {
                 progress.details.push(format!(

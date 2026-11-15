@@ -174,12 +174,15 @@ fn front_pid() -> Option<i32> {
     pid_of_info(&run(&["info", "-only", "pid", &asn])?)
 }
 
-/// The front tab's session: the `s-…` word of the `ls` row whose tab is in front (`active=1`).
+/// The front tab's session: the tab-ID word of the `ls` row whose tab is in front (`active=1`).
 #[must_use]
 pub fn front_sid(ls: &str) -> Option<String> {
     ls.lines()
         .filter(|l| l.split_whitespace().any(|w| w == "active=1"))
-        .find_map(|l| l.split_whitespace().find(|w| w.starts_with("s-")))
+        .find_map(|l| {
+            l.split_whitespace()
+                .find(|w| aterm_types::tab_id::is_tab_id(w))
+        })
         .map(str::to_string)
 }
 

@@ -108,11 +108,26 @@ struct Head {
     malformed: bool,
 }
 
+/// The first byte of a TLS record carrying a handshake: a TLS client's ClientHello opens with
+/// it, and no HTTP request line does (a method is a token of visible ASCII).
+const TLS_HANDSHAKE: u8 = 0x16;
+
 /// Read one request head as bytes, decoded lossily; `None` when the peer sent no byte (a
-/// wake connection). A head the fake cannot parse is read as far as it goes and marked
+/// wake connection) or opened with a TLS handshake. The fake speaks plain HTTP on loopback
+/// ports any local process can reach, and a port it took may be one a TLS client elsewhere
+/// still dials; that client is no part of the fake's world, so it is neither logged nor
+/// answered. A head the fake cannot parse is read as far as it goes and marked
 /// `malformed`, so it is still logged and answered. Every line, the request line included,
 /// counts toward `HEAD_MAX`, and a read that fails after some bytes is a head cut short.
 fn read_head(reader: &mut BufReader<&TcpStream>) -> Option<Head> {
+    if reader
+        .fill_buf()
+        .ok()?
+        .first()
+        .is_none_or(|b| *b == TLS_HANDSHAKE)
+    {
+        return None;
+    }
     let mut raw = Vec::with_capacity(256);
     let first = u64::try_from(HEAD_MAX + 1).unwrap_or(u64::MAX);
     let ended = reader.by_ref().take(first).read_until(b'\n', &mut raw);

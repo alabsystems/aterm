@@ -6,8 +6,8 @@
 //! The pet is its own setting. It names an animal by a row of [`PETS`], whatever the cursor
 //! trail style is, the plain cursor (`cursor_trail_style = "off"`) included. A pet is a name in
 //! one table, so another pet is another row and not another key. How a pet moves is part of
-//! its row: a walker lives beside the cursor, and a flier is a head that flies in at the
-//! cursor once typing gathers speed.
+//! its row: a walker lives beside the cursor, and a flier is the pet gliding in at the head of
+//! the rainbow once typing gathers speed.
 
 use crate::cursor_glow::spellings::{eq_ascii_ci, trim_whitespace_bytes};
 use crate::kitty_pet::PetSpecies;
@@ -19,9 +19,9 @@ pub struct PetRow {
     pub name: &'static str,
     /// The animal that walks beside the cursor, or `None` for `off` and for a flier.
     pub species: Option<PetSpecies>,
-    /// The pet is the flying head ([`crate::kitty_cursor`]): nothing walks, and the rainbow
-    /// trail's momentum flies the head in at the cursor.
-    pub flies: bool,
+    /// The animal that flies in at the cursor once typing gathers speed ([`crate::kitty_cursor`],
+    /// in its glide); `None` for a walker and for `off`.
+    pub flies: Option<PetSpecies>,
     /// Display label shown in Settings.
     pub label: &'static str,
     /// One-line description for Settings and accessibility.
@@ -33,28 +33,28 @@ pub const PETS: &[PetRow] = &[
     PetRow {
         name: "off",
         species: None,
-        flies: false,
+        flies: None,
         label: "Off",
         blurb: "No pet",
     },
     PetRow {
         name: "cat",
         species: Some(PetSpecies::Cat),
-        flies: false,
+        flies: None,
         label: "Cat",
         blurb: "A cat walks beside your cursor",
     },
     PetRow {
         name: "dog",
         species: Some(PetSpecies::Dog),
-        flies: false,
+        flies: None,
         label: "Dog",
         blurb: "A dog walks beside your cursor",
     },
     PetRow {
         name: FLYING_CAT,
         species: None,
-        flies: true,
+        flies: Some(PetSpecies::Cat),
         label: "Flying cat",
         blurb: "A cat flies in at the head of the rainbow once your typing gathers speed",
     },
@@ -116,13 +116,14 @@ pub const fn species(raw: &str) -> Option<PetSpecies> {
     }
 }
 
-/// Whether `raw` names a flier.
+/// The animal `raw` flies in at the cursor: `None` for a walker, for `off` and for a name no
+/// row has.
 #[inline]
 #[must_use]
-pub const fn flies(raw: &str) -> bool {
+pub const fn flies(raw: &str) -> Option<PetSpecies> {
     match row(raw) {
         Some(r) => r.flies,
-        None => false,
+        None => None,
     }
 }
 

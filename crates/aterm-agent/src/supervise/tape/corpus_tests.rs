@@ -119,10 +119,10 @@ fn a_name_is_taken_in_a_press_guards_spelling_too() {
         .expect("a path")
         .word("host.local", token::HOST)
         .expect("a word");
-    let guard = crate::supervise::policy::guard::row_guard("   cat /Users/_a.b/my lab/x.txt");
+    let guard = alab_policy::guard::row_guard("   cat /Users/_a.b/my lab/x.txt");
     assert_eq!(
         s.text(&guard),
-        crate::supervise::policy::guard::row_guard("   cat /lab/state/x.txt")
+        alab_policy::guard::row_guard("   cat /lab/state/x.txt")
     );
     assert_eq!(s.text(r"^on\x20host\.local\s*$"), r"^on\x20lab-host\s*$");
 }

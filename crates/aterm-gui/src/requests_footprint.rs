@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! A request's footprint on this Mac (ATERM-KI-1109-3, step 4 of the requests design): the
-//! folders it claims and what its tabs' process trees spent. Nothing here deletes.
+//! folders it claims and what its tabs' process trees spent. Nothing here deletes: a cleanup
+//! (`crate::requests_clean`) judges its claims by what this module reads.
 //!
 //! Three ways a folder becomes a request's ([`aterm_requests::ClaimSrc`]):
 //! - its requester names it, [`cmd_request_as`] (`request claim path=…`), on the control thread;
@@ -62,7 +63,7 @@ impl Places {
     /// holds it (everything a person keeps, which no request may mark for a cleanup), it lies in
     /// a folder macOS guards, or it lies in aterm's state home or holds it. With no home known,
     /// nothing can be judged, so every folder is refused.
-    fn refusal(&self, path: &Path) -> Option<&'static str> {
+    pub(crate) fn refusal(&self, path: &Path) -> Option<&'static str> {
         use atpkg::protected::{at_or_under, under_protected_root};
         let Some(home) = self.home.as_deref() else {
             return Some(NO_HOME);
@@ -251,7 +252,7 @@ pub(crate) fn root_of(cwd: &str, places: &Places) -> Option<String> {
 /// The folder `path` (absolute) names, each link on the way followed by hand: a step's path is
 /// judged against the folders macOS guards under `home` before it is looked at, so no link leads
 /// a look into one. The folder it ends at has no link in it.
-fn walk(home: Option<&Path>, path: &Path) -> Result<PathBuf, &'static str> {
+pub(crate) fn walk(home: Option<&Path>, path: &Path) -> Result<PathBuf, &'static str> {
     fn split(path: &Path) -> (PathBuf, VecDeque<OsString>) {
         let mut root = PathBuf::new();
         let mut steps = VecDeque::new();
@@ -303,7 +304,7 @@ fn walk(home: Option<&Path>, path: &Path) -> Result<PathBuf, &'static str> {
 
 /// When the folder at `path` was born, Unix milliseconds, where the filesystem keeps it; never
 /// following a link.
-fn born_ms(path: &Path) -> Option<u64> {
+pub(crate) fn born_ms(path: &Path) -> Option<u64> {
     let born = std::fs::symlink_metadata(path).ok()?.created().ok()?;
     let since = born.duration_since(std::time::UNIX_EPOCH).ok()?;
     u64::try_from(since.as_millis()).ok()
@@ -841,10 +842,11 @@ fn repos_unpushed(path: &Path, home: Option<&Path>) -> Option<bool> {
 }
 
 /// The repos at or under `path`, within [`REPO_DEPTH`] levels: a folder holding `.git` is one,
-/// and is not looked into further. No link is followed. `None` where the search could not see
-/// the whole folder: more than [`REPOS_MAX`] repos, more than [`REPO_LIST_MAX`] entries, a folder
-/// it could not list whole, a folder macOS guards (never listed), or a folder past
-/// [`REPO_DEPTH`] that holds a folder.
+/// and is looked into further (never into its `.git`), since a clone inside it that its own
+/// `.gitignore` names is another repo its status never shows. No link is followed. `None` where
+/// the search could not see the whole folder: more than [`REPOS_MAX`] repos, more than
+/// [`REPO_LIST_MAX`] entries, a folder it could not list whole, a folder macOS guards (never
+/// listed), or a folder past [`REPO_DEPTH`] that holds a folder.
 fn repos_in(path: &Path, home: &Path) -> Option<Vec<PathBuf>> {
     let mut repos = Vec::new();
     let mut listed = 0_usize;
@@ -857,13 +859,12 @@ fn repos_in(path: &Path, home: &Path) -> Option<Vec<PathBuf>> {
             if repos.len() >= REPOS_MAX {
                 return None;
             }
-            repos.push(dir);
-            continue;
+            repos.push(dir.clone());
         }
         let children = read_children(&dir, REPO_LIST_MAX.saturating_sub(listed))?;
         listed += children.len();
         for child in children {
-            if child.dir && !child.link {
+            if child.dir && !child.link && child.name != ".git" {
                 if depth >= REPO_DEPTH {
                     return None;
                 }
@@ -1043,19 +1044,7 @@ fn run(job: Job) {
             probe,
         } => {
             for path in paths {
-                let at_path = Path::new(&path);
-                let walked = (probe.walk)(at_path, home.as_deref());
-                let unpushed = (probe.repos)(at_path, home.as_deref());
-                let measured = Measured {
-                    at_ms: at,
-                    bytes: walked.map(|(bytes, _)| bytes),
-                    complete: walked.is_some_and(|(_, complete)| complete),
-                    unpushed,
-                };
-                MEASURED
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(path, measured);
+                measure_now(at, &path, home.as_deref(), probe);
             }
         }
         #[cfg(test)]
@@ -1063,6 +1052,31 @@ fn run(job: Job) {
             let _ = done.send(());
         }
     }
+}
+
+/// Measure the claimed folder `path` at `at` (Unix ms) on this thread, with `probe`: what a
+/// later reader finds too. Only a thread that may wait on a walk asks: the footprint thread, and
+/// a cleanup's (`crate::requests_clean`).
+pub(crate) fn measure_now(
+    at: u64,
+    path: &str,
+    home: Option<&Path>,
+    probe: MeasureProbe,
+) -> Measured {
+    let at_path = Path::new(path);
+    let walked = (probe.walk)(at_path, home);
+    let unpushed = (probe.repos)(at_path, home);
+    let measured = Measured {
+        at_ms: at,
+        bytes: walked.map(|(bytes, _)| bytes),
+        complete: walked.is_some_and(|(_, complete)| complete),
+        unpushed,
+    };
+    MEASURED
+        .write()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(path.to_owned(), measured);
+    measured
 }
 
 /// Sample the trees of request tabs `tabs` (sid and shell pid) on the footprint thread.

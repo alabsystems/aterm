@@ -70,8 +70,6 @@ fn a_rerun_sets_what_the_test_child_ran_under() {
         .env("TRAIL_LAWS_FULL", "1")
         .env("CARGO_TARGET_DIR", "/t")
         .env("RUSTDOC", "/s/trustdoc")
-        .env(crate::docdriver::DRIVER_ENV, "/s/trustdoc")
-        .env(crate::docdriver::SKIP_ENV, "plain")
         .env(crate::testrun::SUBPROCESS_SLOTS_ENV, "/s/slots")
         .env("ATERM_PAINT_BIN", "/b/My App/aterm");
     let rerun = Rerun::of(&cmd, Some(3));

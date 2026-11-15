@@ -78,3 +78,39 @@ fn the_closure_follows_signatures_fields_aliases_and_array_lengths() {
     let set: Vec<&str> = set.iter().map(String::as_str).collect();
     assert_eq!(set, ["N", "f", "s", "t"]);
 }
+
+#[test]
+fn public_inherent_signatures_extend_the_transitive_declaration_set() {
+    for owner in [
+        r#"{"struct":{"kind":{"plain":{"fields":[]}},"impls":[2,3]}}"#,
+        r#"{"union":{"fields":[],"impls":[2,3]}}"#,
+        r#"{"enum":{"variants":[],"impls":[2,3]}}"#,
+    ] {
+        let index = r#"
+            "1":{"id":1,"name":"owner","inner":@OWNER@},
+            "2":{"id":2,"inner":{"impl":{"trait":null,"items":[4,5]}}},
+            "3":{"id":3,"inner":{"impl":{"trait":{"path":"Unrelated"},"items":[6]}}},
+            "4":{"id":4,"name":"public_method","visibility":"public","inner":{"function":{"sig":{
+                "inputs":[["arg",{"resolved_path":{"path":"method_input","id":7,"args":null}}]],
+                "output":{"resolved_path":{"path":"clock_t","id":8,"args":null}}
+            }}}},
+            "5":{"id":5,"name":"private_method","visibility":"default","inner":{"function":{"sig":{
+                "inputs":[],"output":{"resolved_path":{"path":"private_only","id":10,"args":null}}
+            }}}},
+            "6":{"id":6,"name":"trait_method","visibility":"public","inner":{"function":{"sig":{
+                "inputs":[],"output":{"resolved_path":{"path":"trait_only","id":11,"args":null}}
+            }}}},
+            "7":{"id":7,"name":"method_input","inner":{"type_alias":{"type":{"primitive":"i32"}}}},
+            "8":{"id":8,"name":"clock_t","inner":{"type_alias":{"type":{"resolved_path":{"path":"ticks","id":9,"args":null}}}}},
+            "9":{"id":9,"name":"ticks","inner":{"type_alias":{"type":{"primitive":"i64"}}}},
+            "10":{"id":10,"name":"private_only","inner":{"type_alias":{"type":{"primitive":"i32"}}}},
+            "11":{"id":11,"name":"trait_only","inner":{"type_alias":{"type":{"primitive":"i32"}}}}
+        "#
+        .replace("@OWNER@", owner);
+        let parsed = Doc::parse(&doc(&[1, 7, 8, 9, 10, 11], &index, "")).expect("parses");
+        let public = parsed.public().expect("public");
+        let reached = closure(&parsed, &public, &["owner".into()]).expect("closure");
+        let reached: Vec<&str> = reached.iter().map(String::as_str).collect();
+        assert_eq!(reached, ["clock_t", "method_input", "owner", "ticks"]);
+    }
+}

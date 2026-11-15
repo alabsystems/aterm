@@ -6,7 +6,7 @@ use super::*;
 #[test]
 fn assignment_status_keeps_unknown_cancellation_distinct_from_an_assignment() {
     let session = SessionBinding {
-        sid: "s-fixture".into(),
+        sid: "t000fjxtvre".into(),
         process_pid: 42,
         process_birth: "2026-11-06 12:00:00 UTC".into(),
         epoch: "opaque-host-epoch".into(),

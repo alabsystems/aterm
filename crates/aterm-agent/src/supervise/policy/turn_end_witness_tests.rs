@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
+use alab_policy::config::TurnEndTiming;
 
 // AN OUTAGE CLEARS ON A WITNESS, NOT A BLIND TRY (v6 §14.17.5.4, slice 12c): another session's
 // turn on the same route, finished after the wall's last try, resumes the wait at once and once;

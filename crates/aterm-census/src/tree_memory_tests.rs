@@ -192,11 +192,10 @@ mod tests {
                         entries.iter().map(rel).collect::<Vec<_>>()
                     });
                 format!(
-                    "{r}: read {:?} dir {} file {} exists {} list {:?}",
+                    "{r}: read {:?} dir {} file {} list {:?}",
                     crate::tree::read_to_string(&path).map_err(|e| e.kind()),
                     crate::tree::is_dir(&path),
                     crate::tree::is_file(&path),
-                    crate::tree::exists(&path),
                     listing.map_err(|e| e.kind()),
                 )
             })
@@ -261,6 +260,6 @@ mod tests {
         let file = tree.join("Cargo.toml");
         assert!(crate::tree::is_file(&file));
         drop(tree);
-        assert!(!crate::tree::exists(&file));
+        assert!(!crate::tree::is_file(&file));
     }
 }

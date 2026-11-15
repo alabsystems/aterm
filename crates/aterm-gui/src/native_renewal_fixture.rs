@@ -17,6 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[path = "native_renewal_live_snapshot.rs"]
 mod live_snapshot;
 
+#[cfg(test)]
+#[path = "native_renewal_fixture_tests.rs"]
+mod tests;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeRenewalFixture {
@@ -38,6 +42,18 @@ pub struct NativeRenewalFixture {
     pub continue_policy: Option<bool>,
     #[serde(default)]
     pub weekly_quota: bool,
+    /// A lost login's move (`codex-login-rotation`): the pool, policy and usage server a
+    /// usage-limit handoff's fixture lays out, with the move rather than the handoff enabled.
+    #[serde(default)]
+    pub lost_login: bool,
+}
+
+impl NativeRenewalFixture {
+    /// Whether this fixture moves its session to another account: a usage-limit handoff's or a
+    /// lost login's.
+    const fn moves_account(&self) -> bool {
+        self.weekly_quota || self.lost_login
+    }
 }
 
 fn fixture_pool_root<'a>(
@@ -394,7 +410,7 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
     let pool_root = fixture_pool_root(
         &config.root,
         config.shared_pool_root.as_deref(),
-        config.weekly_quota,
+        config.moves_account(),
         config.adopt.is_some(),
     )?;
     if !config.root.is_absolute()
@@ -440,7 +456,7 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
             aterm_toml::Value::from(old_home.to_str().ok_or("fixture old home")?),
             aterm_toml::Value::from(email.as_str()),
         );
-        if config.weekly_quota {
+        if config.moves_account() {
             let next = config
                 .successor_auth_path
                 .as_ref()
@@ -471,7 +487,7 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         }
         aterm_uds::atomic_file::write(&roster, roster_text.as_bytes(), 0o600)
             .map_err(|e| e.to_string())?;
-        if config.weekly_quota {
+        if config.moves_account() {
             env.accounts_store_for(aterm_agent::harness::accounts::Cli::Codex)
                 .ok_or("quota fixture store")?
                 .transact(env.now, &mut None, |state| {
@@ -604,7 +620,7 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
             images: vec![image],
         }],
         aterm_agent::supervise::SupervisorConfig {
-            accounts: if config.weekly_quota {
+            accounts: if config.moves_account() {
                 aterm_agent::harness::accounts::Mode::Early
             } else {
                 aterm_agent::supervise::SupervisorConfig::default().accounts
@@ -617,14 +633,24 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
     )
     .map_err(str::to_owned)?
     .with_renewal_fault_root(config.root.clone());
-    let policy = if config.weekly_quota {
+    let policy = if config.moves_account() {
         let root = config.root.join("fixture-ca.der");
         let metadata = std::fs::symlink_metadata(&root).map_err(|_| "fixture TLS root missing")?;
         if !metadata.is_file() || metadata.len() > 64 * 1024 {
             return Err("fixture TLS root invalid".into());
         }
         let der = std::fs::read(root).map_err(|_| "fixture TLS root unreadable")?;
-        policy.with_quota_rotation().with_quota_roots(vec![der])
+        let policy = if config.lost_login {
+            policy.with_login_rotation()
+        } else {
+            policy
+        };
+        let policy = if config.weekly_quota {
+            policy.with_quota_rotation()
+        } else {
+            policy
+        };
+        policy.with_quota_roots(vec![der])
     } else {
         policy
     };
@@ -659,46 +685,13 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
             crate::keeper_link::RecoveryCountAdmission::from_retained(Vec::new()),
         ),
     });
-    let stopping = Arc::new(AtomicBool::new(false));
-    let server_stop = Arc::clone(&stopping);
+    let server_stop = Arc::new(AtomicBool::new(false));
     let server_context = Arc::clone(&context);
-    let server = std::thread::spawn(move || {
-        let mut workers: Vec<(CtlStream, std::thread::JoinHandle<io::Result<bool>>)> = Vec::new();
-        while !server_stop.load(Ordering::Acquire) {
-            let mut index = 0;
-            while index < workers.len() {
-                if workers[index].1.is_finished() {
-                    let (_, worker) = workers.swap_remove(index);
-                    let _ = worker.join();
-                } else {
-                    index += 1;
-                }
-            }
-            match aterm_uds::accept(
-                &listener,
-                aterm_uds::AcceptWait::Ready,
-                aterm_uds::AcceptedMode::Blocking,
-            ) {
-                Ok((stream, _)) => {
-                    let retained = stream.try_clone()?;
-                    let context = Arc::clone(&server_context);
-                    let worker =
-                        std::thread::spawn(move || serve_connection_mode(&context, stream, true));
-                    workers.push((retained, worker));
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5))
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        stop_fixture_connections(workers.iter().map(|(stream, _)| stream));
-        for (_, worker) in workers {
-            let _ = worker.join();
-        }
-        Ok(())
+    let server = spawn_fixture_server(listener, Arc::clone(&server_stop), move |stream| {
+        serve_connection_mode(&server_context, stream, true)
     });
-    let reader_stop = Arc::clone(&stopping);
+    let pty_stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&pty_stop);
     let reader_term = Arc::clone(&term);
     let reader_ctx = Arc::clone(&ctx);
     let output = config.root.join("pty.log");
@@ -726,6 +719,13 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         }
         Ok::<_, io::Error>(())
     });
+    let serving = Serving {
+        server_stop,
+        server,
+        pty_stop,
+        pty,
+        reader,
+    };
     let quote = |word: &str| format!("'{}'", word.replace('\'', "'\\''"));
     let line = std::iter::once(config.codex.to_string_lossy().into_owned())
         .chain(config.args.clone())
@@ -801,10 +801,9 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         match live_snapshot::Reader::start(Arc::clone(&ctx), master, opts, config.root.clone()) {
             Ok(reader) => reader,
             Err(why) => {
-                stopping.store(true, Ordering::Release);
-                drop(pty);
-                let _ = reader.join();
-                let _ = server.join();
+                serving.tear_down(None, || {
+                    event_loop.pump_app_events(Some(Duration::from_millis(10)), &mut pump);
+                })?;
                 return Err(why);
             }
         };
@@ -890,7 +889,7 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
                 && !config.root.join("renewed").exists()
                 && let Some(next) = &config.successor_auth_path
             {
-                if config.weekly_quota {
+                if config.moves_account() {
                     aterm_uds::atomic_file::write(
                         &config.root.join("renewed"),
                         b"quota-probe-open\n",
@@ -931,16 +930,111 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         }
         Ok(())
     })();
-    let live_reader_result = live_reader.shutdown(|| {
+    let torn_down = serving.tear_down(Some(live_reader), || {
         event_loop.pump_app_events(Some(Duration::from_millis(10)), &mut pump);
     });
-    stopping.store(true, Ordering::Release);
-    drop(pty);
-    let _ = reader.join();
-    let _ = server.join();
     run_result?;
-    live_reader_result?;
-    Ok(())
+    torn_down
+}
+
+/// What the host serves with: the control server, and the PTY (`P`, whose drop hangs up the
+/// shell) with the thread that reads it.
+struct Serving<P> {
+    server_stop: Arc<AtomicBool>,
+    server: std::thread::JoinHandle<io::Result<()>>,
+    pty_stop: Arc<AtomicBool>,
+    pty: P,
+    reader: std::thread::JoinHandle<io::Result<()>>,
+}
+
+impl<P> Serving<P> {
+    /// End the live reader, then the control server, then the PTY. Hanging up a connection does
+    /// not wake a worker that waits on a main-thread hop (`call_main`, for up to a minute), so
+    /// `pump` runs the event loop until the server has joined every worker, and the PTY is hung
+    /// up only after that. Nothing pumps once it is gone: dispatch reads and writes its master,
+    /// whose number may by then name another file.
+    ///
+    /// # Errors
+    /// The live reader failed.
+    ///
+    /// # Panics
+    /// The live reader or the server outlives its one-minute hang detector.
+    fn tear_down(
+        self,
+        live_reader: Option<live_snapshot::Reader>,
+        mut pump: impl FnMut(),
+    ) -> Result<(), String> {
+        let live = live_reader.map_or(Ok(()), |reader| reader.shutdown(&mut pump));
+        self.server_stop.store(true, Ordering::Release);
+        let _ = join_pumping(
+            self.server,
+            "fixture control server shutdown hang detector",
+            &mut pump,
+        );
+        self.pty_stop.store(true, Ordering::Release);
+        drop(self.pty);
+        let _ = self.reader.join();
+        live
+    }
+}
+
+/// Join `thread`, running `pump` until it has ended, under a one-minute hang detector.
+fn join_pumping<T>(
+    thread: std::thread::JoinHandle<T>,
+    hang: &str,
+    mut pump: impl FnMut(),
+) -> std::thread::Result<T> {
+    let until = Instant::now() + MUST_HAPPEN;
+    while !thread.is_finished() {
+        assert!(Instant::now() < until, "{hang}");
+        pump();
+    }
+    thread.join()
+}
+
+/// Accept control connections on `listener` until `stop`, each served by `serve` on its own
+/// worker; then hang up every connection still open and join every worker.
+fn spawn_fixture_server(
+    listener: CtlListener,
+    stop: Arc<AtomicBool>,
+    serve: impl Fn(CtlStream) -> io::Result<bool> + Send + Sync + 'static,
+) -> std::thread::JoinHandle<io::Result<()>> {
+    let serve = Arc::new(serve);
+    std::thread::spawn(move || {
+        let mut workers: Vec<(CtlStream, std::thread::JoinHandle<io::Result<bool>>)> = Vec::new();
+        while !stop.load(Ordering::Acquire) {
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].1.is_finished() {
+                    let (_, worker) = workers.swap_remove(index);
+                    let _ = worker.join();
+                } else {
+                    index += 1;
+                }
+            }
+            match aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
+                Ok((stream, _)) => {
+                    let retained = stream.try_clone()?;
+                    let serve = Arc::clone(&serve);
+                    let worker = std::thread::spawn(move || serve(stream));
+                    workers.push((retained, worker));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        stop_fixture_connections(workers.iter().map(|(stream, _)| stream));
+        for (_, worker) in workers {
+            let _ = worker.join();
+        }
+        Ok(())
+    })
 }
 
 fn stop_fixture_connections<'a>(connections: impl IntoIterator<Item = &'a CtlStream>) {

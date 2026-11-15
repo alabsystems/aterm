@@ -55,11 +55,10 @@ pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };
 pub use phase::{
-    ApiRetryRow, Phase, RetryCause, api_retry_row, background_only, background_rest,
-    background_rest_seen, background_wait_seen, busy_seen, busy_signal, busy_zone_start,
-    context_left, delegated_shown, limit_notice, notice_reset, opened_by_own_wake, shells_running,
-    title_live, title_rests, title_runs, transcript_end, turn_over_background, worker_phase,
-    worker_phase_seen,
+    ApiRetryRow, RetryCause, api_retry_row, background_only, background_rest, background_rest_seen,
+    background_wait_seen, busy_seen, busy_signal, busy_zone_start, context_left, delegated_shown,
+    limit_notice, notice_reset, opened_by_own_wake, shells_running, title_live, title_rests,
+    title_runs, transcript_end, turn_over_background, worker_phase, worker_phase_seen,
 };
 pub use prompt::{
     Opt, Origin, PromptKind, PromptV2, Role, footer_keys, parse_prompt, parse_prompt_v2,
@@ -76,7 +75,7 @@ pub use reader::{
     retired_agent, shell_alone,
 };
 pub use reset::{
-    ConfirmRead, ResetConfirm, ResetKind, ResetLine, ResetPending, ResetRow, ResetSight,
+    ConfirmRead, ResetConfirm, ResetDrawn, ResetLine, ResetPending, ResetRow, ResetSight,
     ResetSighting, reset_confirm, reset_limit_name, reset_limit_names, reset_line, reset_pending,
     reset_row, reset_sighting, reset_title, spends_reset, uses_a_reset,
 };
@@ -91,8 +90,8 @@ pub use turn::{
     turn_history_stop, turn_said_before, turn_whole, wand_flare,
 };
 pub use wall::{
-    ApiCause, AutoContinue, Placement, SinceLimit, Wall, WallKind, WordsAbove, auto_continue_end,
-    auto_continue_toast, classify_wall, left_wall, limit_words_above, login_expires_in,
-    login_restored, memory_banner_head, since_limit, wall,
+    AutoContinue, Placement, SinceLimit, Wall, WordsAbove, auto_continue_end, auto_continue_toast,
+    classify_wall, left_wall, limit_words_above, login_expires_in, login_restored,
+    memory_banner_head, since_limit, wall,
 };
 pub use wrap::line_start;

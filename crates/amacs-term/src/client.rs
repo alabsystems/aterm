@@ -74,7 +74,9 @@ when it has unsaved changes), C-c C-c saves and closes, C-c C-k closes without
 saving, C-g cancels, C-z suspends. A save refuses when the file changed on disk
 since it was read: C-x C-s again overwrites it, M-x revert-buffer reloads it.
 On Windows there is no terminal editor yet: in these cases amacs says so and
-exits 1.
+exits 1. One refusal never comes here: a FILE whose draft another aterm
+process is writing, which an editor here would split; amacs opens nothing and
+exits 1, and running it again opens it once that draft is free.
 
 EXIT STATUS:
     0    every FILE was closed (with --no-wait: handed to the window)
@@ -328,6 +330,7 @@ pub enum Ending {
 pub const fn handoff_of(error: &EditErr) -> Handoff {
     match error {
         EditErr::Refused(_) => Handoff::Refused,
+        EditErr::Busy(_) => Handoff::Busy,
         EditErr::Unreachable(_) | EditErr::Unsendable(_) => Handoff::Unreachable,
         EditErr::TimedOut(_) | EditErr::NoAnswer(_) | EditErr::Unreadable(_) => Handoff::TimedOut,
     }

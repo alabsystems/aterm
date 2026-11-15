@@ -31,6 +31,15 @@ impl Sandbox {
     }
 }
 
+/// One limit [`Limits::plan`] decided: an `RLIMIT_*` resource and its soft and hard values.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rlimit {
+    pub resource: u32,
+    pub soft: u64,
+    pub hard: u64,
+}
+
 /// Resource limits to apply.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
@@ -112,6 +121,19 @@ impl Limits {
         aterm_cap::require(cap, Tier::Trusted)
             .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
         imp::apply_limits(self)
+    }
+
+    /// Each limit [`Self::apply`] would set, for a child that sets them on itself with no call
+    /// that can allocate or fail on a capability: the resource and its soft and hard values,
+    /// clamped to this process's hard ceilings as `apply` clamps them.
+    ///
+    /// # Errors
+    /// `PermissionDenied` if the capability tier is too low; `getrlimit`'s error.
+    #[cfg(unix)]
+    pub fn plan(&self, cap: &Cap<Sandbox>) -> io::Result<Vec<Rlimit>> {
+        aterm_cap::require(cap, Tier::Trusted)
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
+        imp::plan_limits(self)
     }
 
     /// Apply these limits to the Job Object of a still-suspended ConPTY child.

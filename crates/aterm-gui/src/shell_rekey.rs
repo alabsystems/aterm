@@ -51,15 +51,49 @@ pub(crate) fn deliver(path: &Path, key_hex: &str) -> std::io::Result<()> {
     written
 }
 
-/// Remove session `sid`'s pending re-key file and any companion `<sid>.trap` file
-/// (`aterm_shell_integration::DEBUG_TRAP_SUFFIX`).
+/// Remove session `sid`'s pending re-key file and its companions, `<sid>.trap` and `<sid>.out`
+/// (`aterm_shell_integration::DEBUG_TRAP_SUFFIX`, `OUTPUT_SUFFIX`).
 pub(crate) fn discard(sid: &SessionId) {
     if let Some(path) = path_for(sid) {
-        let mut trap = path.clone().into_os_string();
-        trap.push(aterm_core::shell_integration::DEBUG_TRAP_SUFFIX);
-        let _ = std::fs::remove_file(trap);
-        let _ = std::fs::remove_file(path);
+        remove_with_companions(&path);
     }
+}
+
+/// [`discard`] again once `shell` is gone. A shell outlives its session for as long as its
+/// hang-up takes, and a bash hook that runs then makes `<sid>.out` anew (`__aterm_out_ok`), which
+/// nothing would remove after it.
+#[cfg(unix)]
+pub(crate) fn discard_once_gone(sid: &SessionId, shell: aterm_pty::ShellIdentity) {
+    if let Some(path) = path_for(sid) {
+        remove_once(path, move || !shell.verify());
+    }
+}
+
+/// Remove `path` and its companions on the process-wide reaper's thread (`aterm_uds::reaper`)
+/// at its first look at which `gone` answers yes; each look leaves them while it answers no.
+/// `gone` must not block.
+#[cfg(unix)]
+fn remove_once(path: PathBuf, mut gone: impl FnMut() -> bool + Send + 'static) {
+    aterm_uds::reaper::hand_off(move || {
+        if !gone() {
+            return false;
+        }
+        remove_with_companions(&path);
+        true
+    });
+}
+
+/// Remove the re-key file at `path`, `<path>.trap` and `<path>.out`.
+fn remove_with_companions(path: &Path) {
+    for suffix in [
+        aterm_core::shell_integration::DEBUG_TRAP_SUFFIX,
+        aterm_core::shell_integration::OUTPUT_SUFFIX,
+    ] {
+        let mut companion = path.as_os_str().to_owned();
+        companion.push(suffix);
+        let _ = std::fs::remove_file(companion);
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 /// Re-key an adopted session whose marks are dropped, first half.

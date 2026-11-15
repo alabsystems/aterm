@@ -28,12 +28,25 @@ pub(in super::super) struct WaitingWrite {
     /// A person's save of a name the log holds concurrent values for: a `Delete` goes first, so the
     /// `Put` replaces every sibling ([`Base::resolve`]).
     resolve: bool,
+    /// The member write it came from, numbered as it landed ([`land_member_writes`]): a member
+    /// write signs its entries in one draft (`member::member_write`), so a pass signs every write
+    /// that waits with its number in one draft, or none of them ([`draft_verdicts`]). `None` for
+    /// an edit's write, which a pass judges alone.
+    draft: Option<u64>,
+    /// A member write's entry that stands on the value its writer read ([`MemberEntry::read_as`],
+    /// a verification's), as it landed ([`land_member_writes`]): it settles no conflict, so where
+    /// concurrent values have come beside that value since, it is neither done nor signed over
+    /// them, and the pass drops it, and with it its draft, as overtaken ([`WaitingWrite::done`],
+    /// [`WaitingWrite::stands_over`]). `false` for a person's write, an edit's included.
+    guarded: bool,
 }
 
 impl WaitingWrite {
     fn same(&self, other: &Self) -> bool {
         self.bases == other.bases
             && self.resolve == other.resolve
+            && self.draft == other.draft
+            && self.guarded == other.guarded
             && match (&self.to, &other.to) {
                 (Some(a), Some(b)) => same_entry(a, b),
                 (None, None) => true,
@@ -42,18 +55,24 @@ impl WaitingWrite {
     }
 
     /// Whether the log holds the name as this write leaves it: `read` is its winning value there,
-    /// `conflicted` whether concurrent values stand beside it (a person's save settles those).
+    /// `conflicted` whether concurrent values stand beside it. A person's save settles those, so
+    /// it is not done while they stand; nor is a write that stands on its read
+    /// ([`WaitingWrite::guarded`]), which never leaves its name beside them.
     fn done(&self, read: Option<&Entry>, conflicted: bool) -> bool {
         match (&self.to, read) {
             (None, None) => true,
-            (Some(to), Some(read)) => same_entry(read, to) && !(self.resolve && conflicted),
+            (Some(to), Some(read)) => {
+                same_entry(read, to) && !(conflicted && (self.resolve || self.guarded))
+            }
             _ => false,
         }
     }
 
-    /// Whether the log's value `read` is one this write may be signed over ([`WaitingWrite::bases`]).
-    fn stands_over(&self, read: Option<&Entry>) -> bool {
-        self.bases.contains(&read.map(entry_digest))
+    /// Whether the log's value `read` is one this write may be signed over
+    /// ([`WaitingWrite::bases`]), `conflicted` whether concurrent values stand beside it: a write
+    /// that stands on its read ([`WaitingWrite::guarded`]) is signed over no conflict.
+    pub(super) fn stands_over(&self, read: Option<&Entry>, conflicted: bool) -> bool {
+        self.bases.contains(&read.map(entry_digest)) && !(conflicted && self.guarded)
     }
 }
 
@@ -107,8 +126,11 @@ impl Waiting {
     }
 
     /// The plain text of these writes, one line each: `put <name> <resolve> <bases> <if-absent>
-    /// <anchor> v<value>`, or `keep <name> <bases>` for a name taken back to absent; `<bases>` is
-    /// each base, `-` for none or its hex digest, joined by `+`, a missing anchor `-`, the value in unpadded base64. Names and anchors hold no whitespace.
+    /// <anchor> v<value>`, followed by ` d<draft>` for a member write's, and then by ` read` for
+    /// an entry that stands on its read ([`WaitingWrite::guarded`]), or `keep <name> <bases>` for a
+    /// name taken back to absent; `<bases>` is each base, `-` for none or its hex digest, joined
+    /// by `+`, a missing anchor `-`, the value in unpadded base64, `<draft>` the member write's
+    /// number in decimal ([`WaitingWrite::draft`]). Names and anchors hold no whitespace.
     fn encode(&self) -> zeroize::Zeroizing<Vec<u8>> {
         let mut text = zeroize::Zeroizing::new(String::new());
         for (name, write) in &self.0 {
@@ -131,6 +153,12 @@ impl Waiting {
                 entry.anchor.as_deref().unwrap_or("-"),
             ));
             text.push_str(&crate::b64::encode_nopad(entry.value.as_slice()));
+            if let Some(draft) = write.draft {
+                text.push_str(&format!(" d{draft}"));
+            }
+            if write.guarded {
+                text.push_str(" read");
+            }
             text.push('\n');
         }
         zeroize::Zeroizing::new(text.as_bytes().to_vec())
@@ -163,11 +191,35 @@ impl Waiting {
         for line in text.lines() {
             let words: Vec<&str> = line.split_ascii_whitespace().collect();
             let (name, write) = match words.as_slice() {
-                ["put", name, resolve, base, if_absent, anchor, value] => {
+                [
+                    "put",
+                    name,
+                    resolve,
+                    base,
+                    if_absent,
+                    anchor,
+                    value,
+                    rest @ ..,
+                ] => {
                     let value = value
                         .strip_prefix('v')
                         .and_then(crate::b64::decode_nopad)
                         .ok_or_else(bad)?;
+                    let (draft, guarded) = match rest {
+                        [] => (None, false),
+                        ["read"] => (None, true),
+                        [draft] => (Some(draft), false),
+                        [draft, "read"] => (Some(draft), true),
+                        _ => return Err(bad()),
+                    };
+                    let draft = draft
+                        .map(|word| {
+                            word.strip_prefix('d')
+                                .filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+                                .and_then(|n| n.parse::<u64>().ok())
+                                .ok_or_else(bad)
+                        })
+                        .transpose()?;
                     let entry = Entry {
                         name: (*name).to_owned(),
                         value: SecretBytes::from(value),
@@ -179,6 +231,8 @@ impl Waiting {
                         to: Some(entry),
                         bases: bases(base)?,
                         resolve: flag(resolve)?,
+                        draft,
+                        guarded,
                     };
                     (*name, write)
                 }
@@ -187,6 +241,8 @@ impl Waiting {
                         to: None,
                         bases: bases(base)?,
                         resolve: false,
+                        draft: None,
+                        guarded: false,
                     };
                     (*name, write)
                 }
@@ -259,9 +315,25 @@ fn remove_if_there(path: &Path) -> crate::Result<()> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's other writer of this Mac's state: where set, that many more takes of
+    /// [`waiting_lock`] succeed, and each one after fails, as a take does while a writer holds
+    /// the state past its deadline.
+    pub(in super::super) static WAITING_LOCK_TAKES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// The state lock a change of the waiting or pending writes runs under, taken by `deadline` where
 /// one is given.
 fn waiting_lock(paths: &Paths, deadline: Option<std::time::Instant>) -> crate::Result<StateLock> {
+    #[cfg(test)]
+    if let Some(left) = WAITING_LOCK_TAKES.with(std::cell::Cell::get) {
+        if left == 0 {
+            return Err(Error::new("vault publication lock is busy"));
+        }
+        WAITING_LOCK_TAKES.with(|takes| takes.set(Some(left - 1)));
+    }
     match deadline {
         Some(deadline) => StateLock::take_at_until(paths, &paths.lock_file(), deadline),
         None => StateLock::take(paths),
@@ -981,7 +1053,7 @@ pub(in super::super) fn standing(
             .filter(|(name, write)| {
                 let read = log.and_then(|log| log.get(*name));
                 let conflicted = conflicts.contains(&(Audience::Everyone, (*name).clone()));
-                write.stands_over(read) && !write.done(read, conflicted)
+                write.stands_over(read, conflicted) && !write.done(read, conflicted)
             })
             .map(|(name, write)| (name.clone(), write.clone()))
             .collect(),
@@ -1201,6 +1273,8 @@ pub(in super::super) fn everyone_edit(
             to: to.cloned(),
             bases,
             resolve,
+            draft: None,
+            guarded: false,
         };
         if was.is_some() || (view.is_some() && stands.is_some()) {
             settles.insert(name.clone(), write.clone());
@@ -1218,12 +1292,15 @@ pub(in super::super) fn everyone_edit(
 impl WaitingWrite {
     /// A member's `set` of `entry` (`member::member_set`) over `read`, the log's value its draft
     /// read there. It settles a conflict only where that draft read one (`conflicted`), as a
-    /// person's save does: a first `set` signs no `Delete` ahead of its `Put`.
+    /// person's save does: a first `set` signs no `Delete` ahead of its `Put`. Its draft's number,
+    /// and whether it stands on its read, are given as it lands ([`land_member_writes`]).
     pub(super) fn member(entry: Entry, read: Option<&Entry>, conflicted: bool) -> Self {
         Self {
             to: Some(entry),
             bases: BTreeSet::from([read.map(entry_digest)]),
             resolve: conflicted,
+            draft: None,
+            guarded: false,
         }
     }
 
@@ -1240,25 +1317,44 @@ pub(super) fn waits_here(paths: &Paths, identity: &Identity, name: &str) -> bool
         || pending_names(paths, identity).is_none_or(|names| names.contains(name))
 }
 
-/// Land a member's `write` of `name` (`member::member_set`) in [`waiting_file`] for the next
-/// vault pass, under the state lock taken by `deadline` where one is given. It replaces this
-/// Mac's earlier writes of the name, the one waiting there and each a pending set holds, and is
-/// signed over each value they would have left ([`WaitingWrite::bases`]): the person's later write
-/// is the one that stands, so their earlier one is neither signed after it nor read as a change
-/// that overtook it. Each pending set loses the name, which would otherwise land over this write
-/// once its version lands ([`land_sets`]). Returns the write as it waits.
+/// What [`land_member_writes`] did.
+pub(super) enum Landed {
+    /// The writes wait, as they landed, in order.
+    Waits(Vec<WaitingWrite>),
+    /// Nothing landed: an earlier write of this Mac's of this name, still to be signed, leaves it
+    /// otherwise than the value the member write's entry of it read ([`MemberEntry::read_as`]),
+    /// so that write is newer than the read, and this one would replace it.
+    Changed(String),
+}
+
+/// Land a member write's `writes`, each with the entry it plans (`member::member_write`), in
+/// [`waiting_file`] for the next vault pass, all at once under the state lock taken by `deadline`
+/// where one is given, numbered as one draft ([`WaitingWrite::draft`]): a pass reads all of them
+/// or none, and signs them in one draft or none of them ([`draft_verdicts`]). Each replaces this
+/// Mac's earlier writes of its name, the one waiting there and each a pending set holds, and is
+/// signed over each value they would have left ([`WaitingWrite::bases`]): the person's later
+/// write is the one that stands, so their earlier one is neither signed after it nor read as a
+/// change that overtook it. Each pending set loses the name, which would otherwise land over this
+/// write once its version lands ([`land_sets`]). An entry that stands on the value it read
+/// ([`MemberEntry::read_as`]) replaces no earlier write that leaves its name otherwise than that
+/// value, a held draft's included: nothing lands then ([`Landed::Changed`]), under the same lock,
+/// so no later write is lost to a verification of the value it replaced. Such an entry waits
+/// marked so ([`WaitingWrite::guarded`]): where another value comes beside the one it read
+/// before the pass, the pass drops its draft rather than sign it over that value. The caller
+/// holds the author lock from its read of the log to here (`member::member_write`), so no other
+/// member write, unset or vault pass of this Mac's signs between them. Returns the writes as they
+/// wait, in order.
 ///
 /// # Errors
 /// The state lock is not taken by `deadline`, the waiting or pending writes cannot be read
 /// (a pending set that does not open included, [`read_pending`]), sealed or written, or this
 /// Mac's held drafts do not read ([`held_values`]).
-pub(super) fn land_member_write(
+pub(super) fn land_member_writes(
     paths: &Paths,
     identity: &Identity,
-    name: &str,
-    mut write: WaitingWrite,
+    writes: Vec<(&MemberEntry, WaitingWrite)>,
     deadline: Option<std::time::Instant>,
-) -> crate::Result<WaitingWrite> {
+) -> crate::Result<Landed> {
     let _lock = waiting_lock(paths, deadline)?;
     let mut held = read_waiting(paths, identity)?;
     let mut sets = if waiting_pending(paths) {
@@ -1266,47 +1362,80 @@ pub(super) fn land_member_write(
     } else {
         Vec::new()
     };
-    let earlier = held
-        .0
-        .get(name)
-        .into_iter()
-        .chain(sets.iter().filter_map(|set| set.writes.0.get(name)));
-    for was in earlier {
-        write.bases.insert(was.to.as_ref().map(entry_digest));
-        write.bases.extend(was.bases.iter().copied());
-    }
-    // What this Mac's held drafts leave at the name is its own earlier edit in flight, which the
+    // What this Mac's held drafts leave at a name is its own earlier edit in flight, which the
     // person's later write replaces whichever reaches the log first (one-mesh P3), as an edit's
     // waiting write is signed over it ([`everyone_edit`]).
-    if let Some(store) = super::super::remove::trusted_store(paths)?
-        && let Some(held) = held_values(paths, &store, identity)?.remove(name)
-    {
-        write.bases.extend(held);
-    }
-    for set in &mut sets {
-        if set.writes.0.remove(name).is_some() {
-            write_pending(paths, identity, set)?;
+    let mut in_flight = match super::super::remove::trusted_store(paths)? {
+        Some(store) => held_values(paths, &store, identity)?,
+        None => HeldValues::new(),
+    };
+    // A number no write that waits here carries: this member write's own.
+    let draft = held
+        .0
+        .values()
+        .filter_map(|write| write.draft)
+        .max()
+        .map_or(0, |last| last.saturating_add(1));
+    let mut lost = vec![false; sets.len()];
+    let mut landed = Vec::with_capacity(writes.len());
+    for (entry, mut write) in writes {
+        let name = entry.name.as_str();
+        let earlier: Vec<&WaitingWrite> = held
+            .0
+            .get(name)
+            .into_iter()
+            .chain(sets.iter().filter_map(|set| set.writes.0.get(name)))
+            .collect();
+        let values = in_flight.remove(name).unwrap_or_default();
+        let read = write.to.as_ref().and_then(|to| entry.read_entry(to));
+        if let Some(read) = &read {
+            let read = Some(entry_digest(read));
+            let replaces = earlier
+                .iter()
+                .map(|was| was.to.as_ref().map(entry_digest))
+                .chain(values.iter().copied())
+                .any(|was| was != read);
+            if replaces {
+                return Ok(Landed::Changed(name.to_owned()));
+            }
         }
+        for was in earlier {
+            write.bases.insert(was.to.as_ref().map(entry_digest));
+            write.bases.extend(was.bases.iter().copied());
+        }
+        write.bases.extend(values);
+        for (set, lost) in sets.iter_mut().zip(&mut lost) {
+            *lost |= set.writes.0.remove(name).is_some();
+        }
+        write.draft = Some(draft);
+        write.guarded = read.is_some();
+        held.0.insert(name.to_owned(), write.clone());
+        landed.push(write);
     }
-    held.0.insert(name.to_owned(), write.clone());
+    for (set, _) in sets.iter().zip(&lost).filter(|(_, lost)| **lost) {
+        write_pending(paths, identity, set)?;
+    }
     write_waiting(paths, identity, &held)?;
-    Ok(write)
+    Ok(Landed::Waits(landed))
 }
 
-/// Take back this Mac's own writes of `name` that are still to be signed (`member::member_unset`,
-/// DESIGN-claude-setup-token §3.6), under the state lock taken by `deadline` where one is given:
-/// the one waiting in [`waiting_file`], and the name in each pending set ([`pending_dir`]). A
-/// first `set` that waits is signed over an absent value ([`WaitingWrite::bases`] holds `None`),
-/// so left there, the pass after the rotation would sign it over the absence the unset leaves,
-/// and the value would come back. Returns whether one was there.
+/// Take back this Mac's own writes of `names` that are still to be signed (`member::member_unset`,
+/// DESIGN-claude-setup-token §3.6), all at once under the state lock taken by `deadline` where
+/// one is given: each waiting in [`waiting_file`], and each name in each pending set
+/// ([`pending_dir`]). A first `set` that waits is signed over an absent value
+/// ([`WaitingWrite::bases`] holds `None`), so left there, the pass after the rotation would sign
+/// it over the absence the unset leaves, and the value would come back. One read-modify-write
+/// takes back every name or none, as [`land_member_writes`] lands them: taken back one name at a
+/// time, a take-back that failed after the first would leave the rest of a member write's draft
+/// for the next pass to sign alone. Returns whether any was there.
 ///
 /// # Errors
 /// The state lock is not taken by `deadline`, or the waiting or pending writes cannot be read
 /// (a pending set that does not open included, [`read_pending`]), sealed or written.
-pub(super) fn take_back_member_write(
+pub(super) fn take_back_member_writes(
     paths: &Paths,
     identity: &Identity,
-    name: &str,
+    names: &[&str],
     deadline: Option<std::time::Instant>,
 ) -> crate::Result<bool> {
     let _lock = waiting_lock(paths, deadline)?;
@@ -1316,12 +1445,19 @@ pub(super) fn take_back_member_write(
     } else {
         Vec::new()
     };
-    let mut took = held.0.remove(name).is_some();
+    let mut took = false;
+    for name in names {
+        took |= held.0.remove(*name).is_some();
+    }
     if took {
         write_waiting(paths, identity, &held)?;
     }
     for set in &mut sets {
-        if set.writes.0.remove(name).is_some() {
+        let mut lost = false;
+        for name in names {
+            lost |= set.writes.0.remove(*name).is_some();
+        }
+        if lost {
             write_pending(paths, identity, set)?;
             took = true;
         }
@@ -1329,7 +1465,7 @@ pub(super) fn take_back_member_write(
     Ok(took)
 }
 
-/// Whether `write` still waits at `name` as [`land_member_write`] left it.
+/// Whether `write` still waits at `name` as [`land_member_writes`] left it.
 pub(super) fn still_waits(
     paths: &Paths,
     identity: &Identity,
@@ -1641,6 +1777,56 @@ pub(super) fn sign_everyone(
     Ok(minted)
 }
 
+/// A pass's verdicts on the writes that wait, made one per member write: `own` is each write's
+/// own verdict ([`nle::Verdict::of`]) and `drafts` the member write each came from
+/// ([`WaitingWrite::draft`]), in the same order. A member write signs its entries in one draft,
+/// one actor, `authored_ms` and epoch (`member::member_write`; a Claude Code token's two entries
+/// read as a token only from one draft), so a pass signs them together or not at all. Where a
+/// pending set holds back any write of a draft, the whole draft is left for it; where any is
+/// overtaken, the whole draft is dropped, each write of it that would sign recorded as dropped
+/// with it ([`dropped_with`]), and one the log holds already done; where any signs, each one the
+/// log holds already is signed again beside it, as `member::draft_member_set` signs again an
+/// entry the log holds already, so the draft stays one. A write of no draft, an edit's, keeps its
+/// own verdict.
+fn draft_verdicts(drafts: &[Option<u64>], own: &[nle::Verdict]) -> Vec<nle::Verdict> {
+    use nle::Verdict::{Leaves, Overtaken, Signs};
+    let any = |draft: u64, verdict: nle::Verdict| {
+        drafts
+            .iter()
+            .zip(own)
+            .any(|(of, was)| *of == Some(draft) && *was == verdict)
+    };
+    drafts
+        .iter()
+        .zip(own)
+        .map(|(draft, &verdict)| match *draft {
+            None => verdict,
+            Some(draft) if any(draft, Leaves) => Leaves,
+            Some(draft) if any(draft, Overtaken) => match verdict {
+                Signs => Overtaken,
+                verdict => verdict,
+            },
+            Some(draft) if any(draft, Signs) => Signs,
+            Some(_) => verdict,
+        })
+        .collect()
+}
+
+/// Of the writes [`draft_verdicts`] judged (`drafts` and `own` as there), the one the write at
+/// `at` is dropped with where it is not overtaken itself: the first write of its member write's
+/// draft whose own verdict is overtaken, so its overtaker is the change that dropped the draft.
+/// `None` for a write overtaken itself, one of no draft, or one whose draft no change overtook.
+fn dropped_with(drafts: &[Option<u64>], own: &[nle::Verdict], at: usize) -> Option<usize> {
+    let draft = (*drafts.get(at)?)?;
+    if *own.get(at)? == nle::Verdict::Overtaken {
+        return None;
+    }
+    drafts
+        .iter()
+        .zip(own)
+        .position(|(of, was)| *of == Some(draft) && *was == nle::Verdict::Overtaken)
+}
+
 /// One vault pass's waiting writes ([`Waiting`]): once no newest `[everyone]` epoch wraps a Mac
 /// the log removed, sign each `[everyone]` write waiting here, as the edit would have signed it,
 /// under the epoch a writer seals under ([`sealing_epoch`]), and forget it. A write whose name
@@ -1656,6 +1842,14 @@ pub(super) fn sign_everyone(
 /// the draft of a take-back and its pending set. Each dropped write leaves a record
 /// in this Mac's journal of overtaken writes ([`overtaken_file`]): the entry, the op that holds it
 /// now and when the write was dropped, which the admin view shows once. A record, never an alert.
+/// The writes of one member write ([`WaitingWrite::draft`]) take one verdict ([`draft_verdicts`]):
+/// signed together in the pass's one draft, one the log holds already among them, or left or
+/// dropped together, so a pass never signs part of a member write's draft. A write dropped only
+/// with its draft is recorded as that ([`Overtaken::with`]), by the op that holds the entry whose
+/// own write was overtaken, never by its own name's holder, whose value it would not have
+/// reverted ([`dropped_with`]). An entry that stands on its read ([`WaitingWrite::guarded`])
+/// whose name holds concurrent values now is overtaken, its value held there or not, and so is
+/// its draft: it settles no conflict.
 /// A write whose name a pending set of this Mac writes ([`pending_names`]) is left as it is: that
 /// set is this Mac's own later edit of the name, which lands over it or goes and leaves it, and
 /// is never read as a change that overtook it. So is one whose name a held draft of this Mac
@@ -1771,30 +1965,46 @@ pub(in super::super) fn sign_waiting_writes_by(
         let mut overtaken = Vec::new();
         let mut puts: Vec<&Entry> = Vec::new();
         let mut deletes: Vec<&String> = Vec::new();
-        for (name, write) in &waiting.0 {
-            let read = view.and_then(|view| view.get(name));
-            let conflicted = opened
-                .conflicts
-                .contains(&(Audience::Everyone, name.clone()));
-            // Each write's verdict is no_lost_edit's kernel (one-mesh P3). A take-back not done
-            // here finds the name held: never signed as a `Delete` (F15).
-            let verdict = nle::Verdict::of(
-                deferred.contains(name),
-                write.done(read, conflicted),
-                write.stands_over(read),
-                write.to.is_none(),
-            );
+        // Each write's verdict is no_lost_edit's kernel (one-mesh P3). A take-back not done here
+        // finds the name held: never signed as a `Delete` (F15). A member write's entries then
+        // take one verdict, so its draft stays one ([`draft_verdicts`]).
+        let own: Vec<nle::Verdict> = waiting
+            .0
+            .iter()
+            .map(|(name, write)| {
+                let read = view.and_then(|view| view.get(name));
+                let conflicted = opened
+                    .conflicts
+                    .contains(&(Audience::Everyone, name.clone()));
+                nle::Verdict::of(
+                    deferred.contains(name),
+                    write.done(read, conflicted),
+                    write.stands_over(read, conflicted),
+                    write.to.is_none(),
+                )
+            })
+            .collect();
+        let drafts: Vec<Option<u64>> = waiting.0.values().map(|write| write.draft).collect();
+        let names: Vec<&String> = waiting.0.keys().collect();
+        let verdicts = draft_verdicts(&drafts, &own);
+        for (at, ((name, write), verdict)) in waiting.0.iter().zip(verdicts).enumerate() {
             if verdict == nle::Verdict::Leaves {
                 continue;
             }
             settled.0.insert(name.clone(), write.clone());
             match (verdict, &write.to) {
-                (nle::Verdict::Overtaken, _) => overtaken.push(Overtaken {
-                    name: name.clone(),
-                    by: overtaker(&log, &opened, name),
-                    dropped_ms: now_ms,
-                    shown: false,
-                }),
+                (nle::Verdict::Overtaken, _) => {
+                    // A write dropped only with its draft names the change that overtook the
+                    // draft: its own name's holder is a value it would not have reverted.
+                    let with = dropped_with(&drafts, &own, at).map(|of| names[of].clone());
+                    overtaken.push(Overtaken {
+                        name: name.clone(),
+                        by: overtaker(&log, &opened, with.as_ref().unwrap_or(name)),
+                        with,
+                        dropped_ms: now_ms,
+                        shown: false,
+                    });
+                }
                 (nle::Verdict::Signs, Some(to)) => {
                     if write.resolve {
                         deletes.push(name);
@@ -1886,8 +2096,14 @@ pub(super) fn overtaker(
 pub struct Overtaken {
     /// The `[everyone]` entry the write was of.
     pub name: String,
-    /// The op that holds the entry now; `None` where the log names none.
+    /// The op that holds the overtaken entry now: [`Overtaken::with`] where the write was dropped
+    /// with its draft, else this entry; `None` where the log names none.
     pub by: Option<Overtaker>,
+    /// The entry of the same member write whose own write a later change overtook, where this
+    /// write was dropped only with its draft, which signs whole or not at all ([`dropped_with`]):
+    /// signed, this write would have reverted nothing. `None` where the change overtook this
+    /// entry's own write.
+    pub with: Option<String>,
     /// When this Mac dropped the write (Unix milliseconds).
     pub dropped_ms: u64,
     /// Whether an admin view showed this record already ([`overtaken_seen`]).
@@ -1910,30 +2126,45 @@ pub struct Overtaker {
 impl Overtaken {
     /// The record as a line a person reads, never a value: "shared: m7 wrote it at <when>, so this
     /// Mac's write of it that waited for a removal's new key was dropped at <when> (signed after,
-    /// it would have reverted that)". `when` renders a Unix-millisecond time.
+    /// it would have reverted that)"; for a write dropped with its draft ([`Overtaken::with`]),
+    /// "token: m7 wrote token-meta at <when>, so this Mac's write of token that waited for a
+    /// removal's new key was dropped at <when> with its draft (its write of token-meta, signed
+    /// after, would have reverted that; a draft signs whole or not at all)". `when` renders a
+    /// Unix-millisecond time.
     pub fn line(&self, when: impl Fn(u64) -> String) -> String {
+        let it = self.with.as_deref().unwrap_or("it");
         let change = match &self.by {
             Some(by) => format!(
-                "{} {} it {}",
+                "{} {} {it} {}",
                 by.label,
                 if by.deleted { "deleted" } else { "wrote" },
                 when(by.authored_ms)
             ),
-            None => "a later change took it".to_owned(),
+            None => format!("a later change took {it}"),
         };
-        format!(
-            "{}: {change}, so this Mac's write of it that waited for a removal's new key was \
-             dropped {} (signed after, it would have reverted that)",
-            self.name,
-            when(self.dropped_ms)
-        )
+        let dropped = when(self.dropped_ms);
+        match &self.with {
+            None => format!(
+                "{}: {change}, so this Mac's write of it that waited for a removal's new key was \
+                 dropped {dropped} (signed after, it would have reverted that)",
+                self.name
+            ),
+            Some(with) => format!(
+                "{name}: {change}, so this Mac's write of {name} that waited for a removal's new \
+                 key was dropped {dropped} with its draft (its write of {with}, signed after, \
+                 would have reverted that; a draft signs whole or not at all)",
+                name = self.name
+            ),
+        }
     }
 }
 
 /// This Mac's journal of waiting writes a later change overtook ([`Overtaken`]), one per line,
-/// tab-separated: when it was dropped, whether a view showed it, the entry, then the change
-/// (`put` or `delete`, its record, its signer's label, when it was authored) or `-`. Names only,
-/// never a value. The newest [`MAX_OVERTAKEN`] stay: a record a person may read, never an alert.
+/// tab-separated: when it was dropped, whether a view showed it, the entry, the change (`put` or
+/// `delete`, its record, its signer's label, when it was authored) or `-`, then, for a write
+/// dropped with its draft, the entry whose own write was overtaken ([`Overtaken::with`]); a line
+/// without it is a write overtaken itself, as every line was before that field. Names only, never
+/// a value. The newest [`MAX_OVERTAKEN`] stay: a record a person may read, never an alert.
 fn overtaken_file(paths: &Paths) -> PathBuf {
     paths.dir.join("everyone.overtaken")
 }
@@ -1963,6 +2194,10 @@ fn parse_overtaken(line: &str) -> Option<Overtaken> {
         }
         _ => return None,
     };
+    let (change, with) = match change {
+        ["-", with] | [_, _, _, _, with] => (&change[..change.len() - 1], Some(*with)),
+        _ => (change, None),
+    };
     let by = match change {
         ["-"] => None,
         [kind, record, label, authored] => {
@@ -1986,6 +2221,7 @@ fn parse_overtaken(line: &str) -> Option<Overtaken> {
     Some(Overtaken {
         name: name.to_owned(),
         by,
+        with: with.map(str::to_owned),
         dropped_ms,
         shown,
     })
@@ -1998,29 +2234,36 @@ fn write_overtaken(paths: &Paths, records: &[Overtaken]) -> crate::Result<()> {
     if keep.is_empty() {
         return remove_if_there(&overtaken_file(paths));
     }
-    let clean = |field: &str| field.replace(['\t', '\n'], " ");
-    let mut text = String::new();
-    for record in keep {
-        let change = record.by.as_ref().map_or_else(
-            || "-".to_owned(),
-            |by| {
-                format!(
-                    "{}\t{}\t{}\t{}",
-                    if by.deleted { "delete" } else { "put" },
-                    aterm_codec::hex::encode_lower(&by.record),
-                    clean(&by.label),
-                    by.authored_ms
-                )
-            },
-        );
-        text.push_str(&format!(
-            "{}\t{}\t{}\t{change}\n",
-            record.dropped_ms,
-            u8::from(record.shown),
-            clean(&record.name)
-        ));
-    }
+    let text: String = keep.iter().map(encode_overtaken).collect();
     fsx::write_atomic(&overtaken_file(paths), text.as_bytes(), 0o600)
+}
+
+/// `record` as one line of [`overtaken_file`], its newline included ([`parse_overtaken`] reads
+/// it back).
+fn encode_overtaken(record: &Overtaken) -> String {
+    let clean = |field: &str| field.replace(['\t', '\n'], " ");
+    let change = record.by.as_ref().map_or_else(
+        || "-".to_owned(),
+        |by| {
+            format!(
+                "{}\t{}\t{}\t{}",
+                if by.deleted { "delete" } else { "put" },
+                aterm_codec::hex::encode_lower(&by.record),
+                clean(&by.label),
+                by.authored_ms
+            )
+        },
+    );
+    let with = record
+        .with
+        .as_ref()
+        .map_or_else(String::new, |with| format!("\t{}", clean(with)));
+    format!(
+        "{}\t{}\t{}\t{change}{with}\n",
+        record.dropped_ms,
+        u8::from(record.shown),
+        clean(&record.name)
+    )
 }
 
 /// Add `dropped` to the journal of overtaken writes. The caller holds the state lock.
@@ -2331,6 +2574,8 @@ impl Waiting {
                         to,
                         bases,
                         resolve: false,
+                        draft: None,
+                        guarded: false,
                     };
                     (name.to_owned(), write)
                 })
@@ -2385,6 +2630,8 @@ impl Waiting {
                         to: Some(to),
                         bases: BTreeSet::from([None]),
                         resolve: false,
+                        draft: None,
+                        guarded: false,
                     };
                     (name.to_owned(), write)
                 })
@@ -2418,8 +2665,23 @@ pub(in super::super) fn waiting_values(paths: &Paths, identity: &Identity) -> Va
 #[cfg(test)]
 pub(in super::super) type Values = BTreeMap<String, Vec<u8>>;
 
-/// Whether the write of `name` that waits here may be signed over `read`, the log's value there
-/// ([`WaitingWrite::stands_over`]); `None` where none waits.
+/// Each name that waits ([`waiting_file`]) and the member write it came from
+/// ([`WaitingWrite::draft`]), `None` for an edit's.
+#[cfg(test)]
+pub(in super::super) fn waiting_drafts(
+    paths: &Paths,
+    identity: &Identity,
+) -> BTreeMap<String, Option<u64>> {
+    read_waiting(paths, identity)
+        .expect("waiting")
+        .0
+        .into_iter()
+        .map(|(name, write)| (name, write.draft))
+        .collect()
+}
+
+/// Whether the write of `name` that waits here may be signed over `read`, the log's value there,
+/// with no concurrent value beside it ([`WaitingWrite::stands_over`]); `None` where none waits.
 #[cfg(test)]
 pub(in super::super) fn waits_over(
     paths: &Paths,
@@ -2431,7 +2693,7 @@ pub(in super::super) fn waits_over(
         .expect("waiting")
         .0
         .get(name)
-        .map(|write| write.stands_over(read))
+        .map(|write| write.stands_over(read, false))
 }
 
 /// What waits ([`waiting_file`]) and what is pending ([`pending_dir`]), by version, oldest first,
@@ -2467,3 +2729,9 @@ pub(in super::super) fn pending_reach(
 #[cfg(test)]
 #[path = "waiting_edit_tests.rs"]
 mod edit_tests;
+
+/// A member write's draft among the writes that wait ([`draft_verdicts`], [`Waiting::encode`]),
+/// on its own.
+#[cfg(test)]
+#[path = "waiting_draft_tests.rs"]
+mod draft_tests;

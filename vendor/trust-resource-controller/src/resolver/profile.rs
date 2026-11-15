@@ -79,13 +79,13 @@ pub fn classify_resolver_query(arguments: &[Vec<u8>]) -> io::Result<ResolverQuer
     if unverified {
         remaining = &remaining[1..];
     }
-    if let [flag, crate_type] = remaining {
-        if flag == b"--crate-type" {
+    if let [flag, crate_type] = remaining
+        && flag == b"--crate-type"
+    {
             return Ok(ResolverQueryKind::CrateFileNames {
                 unverified,
                 crate_type: ResolverCrateType::parse(crate_type)?,
             });
-        }
     }
     let expected: &[&[u8]] = &[
         b"--crate-type",

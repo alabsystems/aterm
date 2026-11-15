@@ -13,7 +13,7 @@
 //! as the fabric lane does ([`bench_build::prepare`], the `test` profile), runs three small worlds
 //! on its default in-process broker ([`worlds`]) without waiting for a quiet machine, reports the
 //! load each ran at, and judges every count against its law ([`Law`]) and the committed baseline
-//! (`perf-baseline-fabric-counts.json`), whichever is lower:
+//! (`perf-baseline-fabric-counts.json`), whichever is lower (the floor below, its law alone):
 //!
 //! - `attach_<N>_lane_meta`: the bridge's `@<sid> meta` calls over every restart of the attach
 //!   world at N sessions, from the wait tally: 0 since E05 (640 over ten restarts at 32 before);
@@ -26,9 +26,22 @@
 //! - `restart_<N>_cold_reads_first`, `restart_<N>_cold_reads_later`: the records a restart's
 //!   attach read back from the file with every seeded note behind the broker's resident window:
 //!   at most 2N − 1 in the first restart after the seeding and N − 1 in each later one (D10d:
-//!   the shared refill's N − 1, and the outbox drain's N once).
+//!   the shared refill's N − 1, and the outbox drain's N once), each plus the K × N wanted notes
+//!   among the backlog (`wanted=`, [`WANTED`]) that every restart's refill reads again cold;
+//! - `restart_<N>_cold_reads_least`: the fewest records any restart at N sessions read cold,
+//!   held from below by those K × N wanted notes (F11c): a refill that stopped reading them
+//!   cold (they landed resident, or a refill that starts past them) would otherwise only lower
+//!   the counts above and pass as a ratchet;
+//! - `restart_<N>_pages_passed`: the fewest pages the broker's filtered reads passed whole in any
+//!   restart at N sessions (astream's `TierTally::passed_pages`, F11c). The only count not
+//!   exact: each restart's refill pages the node's inbox over the backlog's
+//!   filler, which no lane names, so it passes at least the filler's whole pages less those the
+//!   wanted notes spoil ([`pages_floor`]), and a pin that loses `Tier::passing`'s page skip
+//!   passes none. The records the restarts write beside the backlog move it by a few pages from
+//!   run to run, so its law judges it and no baseline does.
 //!
-//! A count is exact or it is not judged here. The lane gives no ratio a ceiling and judges no
+//! Neither floor is written to the baseline: their laws alone judge them. Every other count is
+//! exact or it is not judged here. The lane gives no ratio a ceiling and judges no
 //! time: `broker_batches_per_note`, `broker_batches_per_message` and the latencies depend on how
 //! the bridge's writes coalesce, which moves with the load, so each run prints them as measured.
 //! E04's count of paced notes whose sender snapshot lands between delivery and commit is also
@@ -57,11 +70,13 @@ const BASELINE_FILE: &str = "perf-baseline-fabric-counts.json";
 const COMMENT: &str = "aterm FABRIC-COUNTS baseline: exact structural counts of the fabric \
     bench's worlds on its default in-process broker, `test` profile: attach at 8 and 32 \
     sessions with both tallies on and 100,000 records behind every session's refill watermark, \
-    2 restarts each; ping-pong, 200 round trips back to back and 50 paced; messaging, 200 \
+    2 restarts each, 1 wanted note to every session among the backlog's oldest records; ping-pong, 200 round trips back to back and 50 paced; messaging, 200 \
     round trips, a 500-post burst and 20 paced notes, under aterm's default rate limit. \
     SMALLER-OR-EQUAL: a count above its value here fails, and so does one past its law \
     (lane_meta, fleet_mail and rate_limited 0; a restart's cold reads 2N - 1 at the first \
-    restart and N - 1 after), which a recording refuses to write. No ratio and no time is \
+    restart and N - 1 after, each plus the N wanted notes; every restart's cold reads at least \
+    those N notes; a restart's pages passed whole at least the backlog's whole 256-record pages \
+    less one and one a note; this file holds neither floor), which a recording refuses to write. No ratio and no time is \
     judged. The lane runs at the load it finds and reports it. Re-record with targo \
     --unverified verify perf --record fabric-counts.";
 
@@ -77,6 +92,11 @@ const RESTARTS: u32 = 2;
 /// every seeded note is cold when the restarts read it. [`cold_path_reached`] checks this
 /// against the budget the report names.
 const BACKLOG: u32 = 100_000;
+
+/// Notes to every attach session among the backlog's oldest records (F11c, `wanted=`): each
+/// restart's refill reads them again cold, record by record, among the filler pages it passes
+/// whole, and the bench holds every session to list each once after every restart.
+const WANTED: u32 = 1;
 
 /// The messaging world's paced notes: enough to print a paced note's batches as measured; the
 /// paced window's refusals are judged with the others.
@@ -96,6 +116,13 @@ pub(crate) enum Law {
     ColdFirst,
     /// D10d: every later restart reads N − 1 records cold.
     ColdLater,
+    /// F11c: every restart's refill reads the K × N wanted notes among the backlog cold. A
+    /// floor, so no baseline holds it.
+    ColdWanted,
+    /// F11c: every restart's refill passes whole the backlog's pages no lane names
+    /// (`Tier::passing`): at least [`pages_floor`] of them. A floor, and not exact, so no
+    /// baseline holds it.
+    PagesPassed,
 }
 
 impl Law {
@@ -113,11 +140,23 @@ impl Law {
                  records cold and the outbox drain's N"
             }
             Law::ColdLater => "D10d: a later restart reads the shared refill's N - 1 records cold",
+            Law::ColdWanted => {
+                "F11c: every restart's refill reads the wanted notes among the backlog cold"
+            }
+            Law::PagesPassed => {
+                "F11c: a restart's refill passes whole the backlog's pages its lanes do not name"
+            }
         }
+    }
+
+    /// Whether the law's bound is a least count (a floor) rather than a most.
+    const fn is_floor(self) -> bool {
+        matches!(self, Law::ColdWanted | Law::PagesPassed)
     }
 }
 
-/// One count a bench report holds: its key, its value, and the most its law allows.
+/// One count a bench report holds: its key, its value, and its law's bound: the most the law
+/// allows, or the least for a floor law ([`Law::is_floor`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Count {
     pub key: String,
@@ -143,6 +182,7 @@ fn worlds() -> [World; 3] {
                 attach: Some(ATTACH.to_vec()),
                 rounds: Some(RESTARTS),
                 backlog: Some(BACKLOG),
+                wanted: Some(WANTED),
                 tally: true,
                 ..fabric::Args::default()
             },
@@ -177,7 +217,10 @@ fn expected() -> Vec<String> {
         ["latency", "burst", "paced"].map(|window| format!("messaging_{window}_rate_limited")),
     );
     for n in ATTACH {
-        keys.extend(["first", "later"].map(|when| format!("restart_{n}_cold_reads_{when}")));
+        keys.extend(
+            ["first", "later", "least"].map(|when| format!("restart_{n}_cold_reads_{when}")),
+        );
+        keys.push(format!("restart_{n}_pages_passed"));
     }
     keys
 }
@@ -243,6 +286,7 @@ pub(crate) fn counts(report: &Value) -> Result<Vec<Count>, String> {
     fleet_mail(report, &mut out)?;
     rate_limited(report, &mut out)?;
     cold_reads(report, &mut out)?;
+    pages_passed(report, &mut out)?;
     Ok(out)
 }
 
@@ -367,7 +411,10 @@ fn rate_limited(report: &Value, out: &mut Vec<Count>) -> Result<(), String> {
 }
 
 /// `restart_<N>_cold_reads_first` and `_later`: the first restart's cold reads at N sessions, and
-/// the most any later restart read. A backlog before D10d reported none and yields none.
+/// the most any later restart read. A backlog before D10d reported none and yields none. With
+/// wanted mail among the backlog (`wanted_per_session`, K) each bound grows by the K × N notes
+/// the refill reads again cold, and `restart_<N>_cold_reads_least`, the fewest any restart read,
+/// is held from below by them.
 fn cold_reads(report: &Value, out: &mut Vec<Count>) -> Result<(), String> {
     let Some(sizes) = report
         .pointer("/attach/backlog/sizes")
@@ -375,6 +422,10 @@ fn cold_reads(report: &Value, out: &mut Vec<Count>) -> Result<(), String> {
     else {
         return Ok(());
     };
+    let wanted = report
+        .pointer("/attach/backlog/wanted_per_session")
+        .map_or(Some(0), Value::as_u64)
+        .ok_or("the backlog's wanted_per_session is not a count")?;
     for size in sizes {
         let Some(reads) = size.get("cold_reads_per_restart") else {
             continue;
@@ -398,7 +449,7 @@ fn cold_reads(report: &Value, out: &mut Vec<Count>) -> Result<(), String> {
                 key: format!("restart_{n}_cold_reads_first"),
                 value: first,
                 law: Law::ColdFirst,
-                bound: n.saturating_mul(2) - 1,
+                bound: n.saturating_mul(2) - 1 + wanted.saturating_mul(n),
             });
         }
         if let Some(&later) = reads.iter().skip(1).max() {
@@ -406,16 +457,104 @@ fn cold_reads(report: &Value, out: &mut Vec<Count>) -> Result<(), String> {
                 key: format!("restart_{n}_cold_reads_later"),
                 value: later,
                 law: Law::ColdLater,
-                bound: n - 1,
+                bound: n - 1 + wanted.saturating_mul(n),
+            });
+        }
+        if wanted > 0
+            && let Some(&least) = reads.iter().min()
+        {
+            out.push(Count {
+                key: format!("restart_{n}_cold_reads_least"),
+                value: least,
+                law: Law::ColdWanted,
+                bound: wanted.saturating_mul(n),
             });
         }
     }
     Ok(())
 }
 
+/// `restart_<N>_pages_passed`: the fewest pages the broker's filtered reads passed whole in any
+/// restart at N sessions (astream's `TierTally::passed_pages`, which the report carries as
+/// `tier_per_restart`), held from below by [`pages_floor`]. Each restart's shared refill pages
+/// the node's inbox from the watermarks over the backlog, whose filler no lane names, so a
+/// refill that keeps `Tier::passing`'s skip passes the filler's pages whole and one that lost
+/// it passes none. A report from a build that counts nothing (`null` tallies, no debug
+/// assertions) yields none, and so does a backlog before F11c.
+fn pages_passed(report: &Value, out: &mut Vec<Count>) -> Result<(), String> {
+    let Some(sizes) = report
+        .pointer("/attach/backlog/sizes")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    let records = report
+        .pointer("/attach/backlog/records")
+        .and_then(Value::as_u64);
+    let wanted = report
+        .pointer("/attach/backlog/wanted_per_session")
+        .map_or(Some(0), Value::as_u64)
+        .ok_or("the backlog's wanted_per_session is not a count")?;
+    for size in sizes {
+        let Some(tiers) = size.get("tier_per_restart") else {
+            continue;
+        };
+        let n = size
+            .get("sessions")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .ok_or("a backlog size names no sessions")?;
+        let tiers = tiers
+            .as_array()
+            .ok_or_else(|| format!("{n} sessions: tier_per_restart is not a list"))?;
+        if tiers.iter().all(Value::is_null) {
+            continue;
+        }
+        let records = records.ok_or("a backlog with tier tallies names no records")?;
+        let fewest = tiers
+            .iter()
+            .map(|t| {
+                t.get("passed_pages")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        format!("{n} sessions: a restart's tier tally has no passed_pages count")
+                    })
+            })
+            .try_fold(None, |least: Option<u64>, p| {
+                p.map(|p| Some(least.map_or(p, |l| l.min(p))))
+            })?;
+        if let Some(value) = fewest {
+            out.push(Count {
+                key: format!("restart_{n}_pages_passed"),
+                value,
+                law: Law::PagesPassed,
+                bound: pages_floor(records, wanted.saturating_mul(n)),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The fewest pages one refill pass over the attach backlog passes whole: the backlog's
+/// `records` filler and `notes` wanted notes span `(records + notes) / P` whole pages of
+/// astream's `P` ([`bench_spec::TIER_PAGE_RECORDS`]) records, less the one its watermark and the
+/// head may cut and the one each note spoils ([`bench_spec::WANTED_GAP`] keeps each note on a
+/// page of filler alone). What else a page holds (a session's `ev` snapshot, a presence row)
+/// names no inbox lane either, so it is passed as well. Not an exact count: what the restarts
+/// write beside the backlog moves it by a few pages from run to run, so no baseline holds it.
+fn pages_floor(records: u64, notes: u64) -> u64 {
+    let page = bench_spec::TIER_PAGE_RECORDS as u64;
+    (records.saturating_add(notes) / page)
+        .saturating_sub(1)
+        .saturating_sub(notes)
+        .max(1)
+}
+
 /// Why the attach world's restarts did not read the seeded notes cold, if they did not: the
 /// backlog it filled must outgrow the resident window the report names, or the cold-read counts
-/// would hold their bounds at 0 for want of reading anything cold.
+/// would hold their bounds at 0 for want of reading anything cold; and with wanted mail among
+/// it, the records the log took past the newest note, where the notes landed as their inboxes
+/// reported it (`wanted_past_records`), must outgrow that window too at every size.
 fn cold_path_reached(report: &Value) -> Result<(), String> {
     let backlog = report
         .pointer("/attach/backlog/records")
@@ -432,22 +571,59 @@ fn cold_path_reached(report: &Value) -> Result<(), String> {
              {budget} B resident window, so no restart reads the seeded notes cold"
         ));
     }
+    let wanted = report
+        .pointer("/attach/backlog/wanted_per_session")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if wanted > 0 {
+        let sizes = report
+            .pointer("/attach/backlog/sizes")
+            .and_then(Value::as_array)
+            .ok_or("the attach world's backlog names no sizes")?;
+        for size in sizes {
+            let n = size.get("sessions").and_then(Value::as_u64).unwrap_or(0);
+            let past = size
+                .get("wanted_past_records")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    format!(
+                        "{n} sessions: the attach world's wanted mail names no records past it, \
+                         so nothing says it was cold"
+                    )
+                })?;
+            let behind = past.saturating_mul(bench_spec::FILL_RECORD_BYTES as u64);
+            if behind <= budget {
+                return Err(format!(
+                    "{n} sessions: the log took {past} records ({behind} B) past the newest \
+                     wanted note, which fit the broker's {budget} B resident window, so no \
+                     restart reads the wanted mail cold"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
 /// Judge `counts` against their laws and, when there is one, `baseline` (the committed file's
-/// JSON): a count past its law or above its baseline fails; one below its baseline passes and
-/// says a recording would ratchet it.
+/// JSON): a count past its law (above a most, below a floor) or above its baseline fails; one
+/// below its baseline passes and says a recording would ratchet it. A floor law's count is not
+/// exact, so it is judged by its law alone.
 pub(crate) fn judge(counts: &[Count], baseline: Option<&Value>) -> LaneRun {
     let mut run = LaneRun::pass();
     for c in counts {
-        if c.value > c.bound {
+        let floor = c.law.is_floor();
+        let (past, sign) = if floor {
+            (c.value < c.bound, "<")
+        } else {
+            (c.value > c.bound, ">")
+        };
+        if past {
             eprintln!(
-                "    {}: FAILED — {} > {}, its law's bound",
+                "    {}: FAILED — {} {sign} {}, its law's bound",
                 c.key, c.value, c.bound
             );
             run.add_failure(format!(
-                "{} {} > {}, past its law ({})",
+                "{} {} {sign} {}, past its law ({})",
                 c.key,
                 c.value,
                 c.bound,
@@ -455,16 +631,23 @@ pub(crate) fn judge(counts: &[Count], baseline: Option<&Value>) -> LaneRun {
             ));
             continue;
         }
+        if floor {
+            eprintln!(
+                "    {}: GREEN — {} >= {}, its law's floor (no baseline holds a floor)",
+                c.key, c.value, c.bound
+            );
+            continue;
+        }
         match baseline.and_then(|b| b.get(&c.key)).and_then(Value::as_u64) {
-            Some(floor) if c.value > floor => {
-                eprintln!("    {}: FAILED — {} > baseline {floor}", c.key, c.value);
-                run.add_failure(format!("{} {} > its baseline {floor}", c.key, c.value));
+            Some(base) if c.value > base => {
+                eprintln!("    {}: FAILED — {} > baseline {base}", c.key, c.value);
+                run.add_failure(format!("{} {} > its baseline {base}", c.key, c.value));
             }
-            Some(floor) if c.value < floor => eprintln!(
-                "    {}: GREEN — {} < baseline {floor} (--record {LANE} ratchets it)",
+            Some(base) if c.value < base => eprintln!(
+                "    {}: GREEN — {} < baseline {base} (--record {LANE} ratchets it)",
                 c.key, c.value
             ),
-            Some(floor) => eprintln!("    {}: GREEN — {} == baseline {floor}", c.key, c.value),
+            Some(base) => eprintln!("    {}: GREEN — {} == baseline {base}", c.key, c.value),
             None => eprintln!(
                 "    {}: GREEN — {} <= {}, its law's bound (no baseline)",
                 c.key, c.value, c.bound
@@ -479,9 +662,13 @@ pub(crate) fn judge(counts: &[Count], baseline: Option<&Value>) -> LaneRun {
     run
 }
 
-/// The baseline file's text: every count by key.
+/// The baseline file's text: every count by key but a floor law's, which no baseline holds.
 fn baseline_json(counts: &[Count]) -> String {
-    let by_key: BTreeMap<&str, u64> = counts.iter().map(|c| (c.key.as_str(), c.value)).collect();
+    let by_key: BTreeMap<&str, u64> = counts
+        .iter()
+        .filter(|c| !c.law.is_floor())
+        .map(|c| (c.key.as_str(), c.value))
+        .collect();
     let mut s = format!(
         "{{\n  \"_comment\": {}",
         aterm_json::to_string(&Value::String(COMMENT.to_string()))

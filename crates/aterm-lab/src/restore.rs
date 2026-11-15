@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aterm_agent::supervise::policy::land_check::{LAND_CHECK_HEAD, LANDED};
+use alab_policy::land_check::{LAND_CHECK_HEAD, LANDED};
 
 use crate::LAB;
 use crate::door::{Door, Reply};

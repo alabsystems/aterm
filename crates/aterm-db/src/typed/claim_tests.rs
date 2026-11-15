@@ -9,6 +9,289 @@ use crate::{
 use astream_wire::sync::Header;
 use aterm_json::json;
 
+fn provenance_with_past(count: usize) -> Value {
+    let past: Vec<_> = (0..count)
+        .map(|number| {
+            let mut id = [0; 32];
+            id[..8].copy_from_slice(&(number as u64).to_be_bytes());
+            aterm_codec::hex::encode_lower(&id)
+        })
+        .collect();
+    json!({"v": 2, "s": [{"o": aterm_codec::hex::encode_lower(&[255; 32]), "p": past}], "e": [null]})
+}
+
+#[test]
+fn provenance_validation_has_constant_ancestry_allocations() {
+    let _ = aterm_heap_count::allocations_in(|| ());
+    let allocations = |count| {
+        let proof = provenance_with_past(count);
+        let (valid, allocated) =
+            aterm_heap_count::allocations_in(|| valid_context(std::hint::black_box(&proof)));
+        assert!(valid);
+        allocated
+    };
+    let empty = allocations(0);
+    for count in [16, 64] {
+        assert_eq!(
+            allocations(count),
+            empty,
+            "validation must not allocate an owned ancestry index"
+        );
+    }
+}
+
+#[test]
+fn provenance_codec_rejects_malformed_evidence() {
+    let known = provenance_with_past(2);
+    let start = known["s"][0]["o"].clone();
+    let first = known["s"][0]["p"][0].clone();
+    let second = known["s"][0]["p"][1].clone();
+    assert_eq!(
+        Provenance::decode(&known),
+        Some(Provenance::Known(std::collections::BTreeMap::from([(
+            [255; 32],
+            std::collections::BTreeSet::from([digest(&first).unwrap(), digest(&second).unwrap()]),
+        )])))
+    );
+    assert_eq!(Provenance::decode(&Value::Null), Some(Provenance::Unknown));
+    assert_eq!(
+        Provenance::decode(&Value::Bool(false)),
+        Some(Provenance::Invalid)
+    );
+    assert_eq!(Provenance::decode(&known["s"]), Some(Provenance::Unknown));
+    assert_eq!(
+        Provenance::decode(&json!({"v": 2, "s": null, "e": [null]})),
+        Some(Provenance::Unknown)
+    );
+    assert_eq!(
+        Provenance::decode(&json!({"v": 2, "s": false, "e": [null]})),
+        Some(Provenance::Invalid)
+    );
+    assert!(valid_context(&json!({"v": 2, "l": [null]})));
+    for malformed in [
+        json!({"v": 1, "s": known["s"], "e": [null]}),
+        json!({"v": 2, "s": known["s"]}),
+        json!({"v": 2, "s": known["s"], "e": [null], "extra": 0}),
+        json!({"v": 2, "s": [], "e": [null]}),
+        json!({"v": 2, "s": [{"o": start, "p": [start]}], "e": [null]}),
+        json!({"v": 2, "s": [{"o": start, "p": [first, first]}], "e": [null]}),
+        json!({"v": 2, "s": [{"o": start, "p": [second, first]}], "e": [null]}),
+        json!({"v": 2, "s": [known["s"][0], known["s"][0]], "e": [null]}),
+        json!({"v": 2, "s": [{"o": "FF".repeat(32), "p": []}], "e": [null]}),
+        json!({"v": 2, "s": known["s"], "e": [null, null]}),
+        json!({"v": 2, "s": known["s"], "e": [start, null]}),
+        json!({"v": 2, "s": null, "e": [null, null]}),
+        json!([{"o": start, "p": [second, first]}]),
+    ] {
+        assert_eq!(Provenance::decode(&malformed), None, "{malformed:?}");
+        assert!(!valid_context(&malformed), "{malformed:?}");
+    }
+}
+
+#[test]
+fn provenance_codec_counts_epochs_and_ancestry_at_the_budget() {
+    let at_limit = provenance_with_past(crate::database::MAX_RECORDS - 2);
+    assert!(valid_context(&at_limit));
+    assert!(Provenance::decode(&at_limit).is_some());
+    let over_limit = provenance_with_past(crate::database::MAX_RECORDS - 1);
+    assert!(!valid_context(&over_limit));
+    assert!(Provenance::decode(&over_limit).is_none());
+}
+
+/// Isolate lifecycle tracking from otherwise identical all-live claim projection.
+/// The control omits explicit live assertions; both views must expose identical labels.
+#[test]
+#[ignore = "manual paired claim projection allocation and instruction measurement"]
+fn measure_initial_live_claim_projection() {
+    use aterm_bench::measurement_clock::{counters, declare_interactive};
+    use std::hint::black_box;
+    let _ = declare_interactive();
+    for count in [64_usize, 256, 1024] {
+        let mut index = Index::new(count + 8);
+        let mut operations = Vec::new();
+        let mut previous = None;
+        for row in 0..count {
+            let mut id = [0; 32];
+            id[..8].copy_from_slice(&(row as u64 + 1).to_be_bytes());
+            let mut actor = [0; 48];
+            actor[..32].copy_from_slice(&id);
+            index
+                .insert(Header {
+                    id,
+                    actor,
+                    sequence: 1,
+                    previous: None,
+                    parents: previous.into_iter().collect(),
+                })
+                .unwrap();
+            previous = Some(id);
+            let pk = format!("mc-{:016x}", row + 1);
+            operations.push(Op {
+                id,
+                actor,
+                sequence: 1,
+                roster: [0; 32],
+                period: 0,
+                revert: false,
+                changes: [("label", format!("m{}", row + 1)), ("row", "live".into())]
+                    .into_iter()
+                    .map(|(column, value)| Change {
+                        collection: MACHINE.name.into(),
+                        key: format!("{pk}.{column}"),
+                        value: Some(CellValue::automatic(MACHINE.version, json!(value)).encode()),
+                    })
+                    .collect(),
+            });
+        }
+        let raw = cells(&operations.iter().collect::<Vec<_>>());
+        let mut implicit = operations.clone();
+        for operation in &mut implicit {
+            operation
+                .changes
+                .retain(|change| change.key.ends_with(".label"));
+        }
+        let run = |explicit| {
+            let operations = if explicit { &operations } else { &implicit };
+            black_box(project(
+                &MACHINE,
+                black_box(&raw),
+                operations.iter(),
+                &index,
+            ))
+        };
+        for explicit in [false, true] {
+            let read = run(explicit);
+            assert_eq!(read.rows.len(), count);
+            for row in 0..count {
+                assert_eq!(
+                    read.rows[&format!("mc-{:016x}", row + 1)].get("label"),
+                    Some(&json!(format!("m{}", row + 1)))
+                );
+            }
+        }
+        for sample in 0..5 {
+            for explicit in if sample % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let (_, allocations) = aterm_heap_count::allocations_in(|| drop(run(explicit)));
+                let before = counters();
+                drop(run(explicit));
+                let after = counters();
+                let work = before.zip(after).map(|(before, after)| after.since(before));
+                eprintln!(
+                    "CLAIM-PROJECTION rows={count} explicit_live={explicit} sample={sample} allocations={allocations} instructions={:?} cpu_ns={:?}",
+                    work.map(|value| value.instructions),
+                    work.map(|value| value.cpu_ns)
+                );
+            }
+        }
+    }
+}
+
+/// Compare storage layouts with the same signed origins and carried proof context.
+#[test]
+#[ignore = "manual paired carried claim allocation and instruction measurement"]
+fn measure_carried_claim_layout() {
+    use aterm_bench::measurement_clock::{counters, declare_interactive};
+    use std::hint::black_box;
+    let _ = declare_interactive();
+    for count in [24_u8, 48, 96] {
+        let mut native_index = Index::new(usize::from(count) + 8);
+        let mut native = Vec::new();
+        for id in 1..=count {
+            let pk = format!("mc-{id:016x}");
+            let parents = if id == 1 { vec![] } else { vec![id - 1] };
+            let mut op = operation(
+                id,
+                &pk,
+                "label",
+                &format!("m{id}"),
+                &parents,
+                &mut native_index,
+            );
+            op.changes.push(Change {
+                collection: MACHINE.name.into(),
+                key: format!("{pk}.row"),
+                value: Some(CellValue::automatic(MACHINE.version, json!("live")).encode()),
+            });
+            native.push(op);
+        }
+        let raw = cells(&native.iter().collect::<Vec<_>>());
+        let proof = snapshot(&MACHINE, &raw, native.iter(), &native_index).unwrap();
+        let mut combined_index = Index::new(8);
+        let combined = vec![carried_operation(
+            240,
+            &raw,
+            Some(&proof),
+            &mut combined_index,
+        )];
+        let combined_cells = cells(&combined.iter().collect::<Vec<_>>());
+        let mut split_index = Index::new(usize::from(count) + 8);
+        let split: Vec<_> = (1..=count)
+            .map(|id| {
+                let pk = format!("mc-{id:016x}");
+                let row = raw
+                    .iter()
+                    .filter(|((_, key), _)| cell::CellKey::parse(key).unwrap().pk == pk)
+                    .map(|(coordinate, value)| (coordinate.clone(), value.clone()))
+                    .collect();
+                carried_operation(127 + id, &row, Some(&proof), &mut split_index)
+            })
+            .collect();
+        let split_cells = cells(&split.iter().collect::<Vec<_>>());
+        let layouts = [
+            ("native", &raw, &native, &native_index),
+            ("combined", &combined_cells, &combined, &combined_index),
+            ("per_row", &split_cells, &split, &split_index),
+        ];
+        let run = |layout: usize| {
+            let (_, cells, operations, index) = layouts[layout];
+            black_box(project(
+                &MACHINE,
+                black_box(cells),
+                operations.iter(),
+                index,
+            ))
+        };
+        let expected = run(0);
+        for (layout, (_, cells, operations, index)) in layouts.iter().enumerate() {
+            let read = run(layout);
+            assert_eq!(read.rows.len(), usize::from(count));
+            for id in 1..=count {
+                let pk = format!("mc-{id:016x}");
+                assert!(read.rows[&pk].live());
+                assert_eq!(read.rows[&pk].get("label"), Some(&json!(format!("m{id}"))));
+                assert_eq!(read.rows[&pk].fields, expected.rows[&pk].fields);
+            }
+            assert_eq!(
+                snapshot(&MACHINE, cells, operations.iter(), index).unwrap(),
+                proof
+            );
+        }
+        for sample in 0..5 {
+            for layout in if sample % 2 == 0 {
+                [0, 1, 2]
+            } else {
+                [2, 1, 0]
+            } {
+                let (_, allocations) = aterm_heap_count::allocations_in(|| drop(run(layout)));
+                let before = counters();
+                drop(run(layout));
+                let after = counters();
+                let work = before.zip(after).map(|(before, after)| after.since(before));
+                eprintln!(
+                    "CARRIED-CLAIM-LAYOUT rows={count} layout={} sample={sample} allocations={allocations} instructions={:?} cpu_ns={:?}",
+                    layouts[layout].0,
+                    work.map(|value| value.instructions),
+                    work.map(|value| value.cpu_ns)
+                );
+            }
+        }
+    }
+}
+
 pub(super) fn operation(
     id: u8,
     pk: &str,
@@ -38,6 +321,72 @@ pub(super) fn operation(
             key: format!("{pk}.{column}"),
             value: Some(CellValue::automatic(MACHINE.version, json!(value)).encode()),
         }],
+    }
+}
+
+#[test]
+fn collapsed_initial_activity_matches_the_full_causal_walk() {
+    let pk = "mc-0000000000000001";
+    for concurrent in [false, true] {
+        for variant in 0..8 {
+            let mut index = Index::new(8);
+            let first = operation(10, pk, "row", "live", &[], &mut index);
+            let mut second = operation(
+                20,
+                pk,
+                "row",
+                "live",
+                if concurrent { &[] } else { &[10] },
+                &mut index,
+            );
+            second.changes[0].value = match variant {
+                0 => first.changes[0].value.clone(),
+                1 => Some(CellValue::owner(MACHINE.version, json!("live")).encode()),
+                2 => Some(CellValue::automatic(MACHINE.version, json!("retired")).encode()),
+                3 => Some(CellValue::automatic(MACHINE.version, Value::Null).encode()),
+                4 => Some(CellValue::automatic(MACHINE.version + 1, json!("live")).encode()),
+                5 => Some(Value::Null),
+                6 => Some(
+                    cell::carry(
+                        &cell::origins(
+                            &cells(&[&first])[&(MACHINE.name.into(), format!("{pk}.row"))],
+                        )
+                        .into_iter()
+                        .collect(),
+                    )
+                    .unwrap(),
+                ),
+                _ => Some(json!({"future": true})),
+            };
+            let label = operation(30, pk, "label", "m7", &[10, 20], &mut index);
+            let operations = [&first, &second, &label];
+            let collapsed = activity::Activity::read(&MACHINE, &operations, &index);
+            let reference = activity::Activity::read_reference(&MACHINE, &operations, &index);
+            assert_eq!(
+                collapsed.reentries, reference.reentries,
+                "variant={variant} concurrent={concurrent}"
+            );
+            for id in [10, 20, 30] {
+                let a = collapsed.at(pk, &[id; 32]);
+                let b = reference.at(pk, &[id; 32]);
+                assert_eq!(
+                    (a.live, &a.epochs),
+                    (b.live, &b.epochs),
+                    "variant={variant} concurrent={concurrent} id={id}"
+                );
+                assert_eq!(
+                    collapsed.origin_proof(pk, &[id; 32]),
+                    reference.origin_proof(pk, &[id; 32])
+                );
+            }
+            let a = collapsed.current(pk);
+            let b = reference.current(pk);
+            assert_eq!(
+                (a.live, &a.epochs),
+                (b.live, &b.epochs),
+                "variant={variant} concurrent={concurrent}"
+            );
+        }
     }
 }
 
@@ -226,6 +575,79 @@ fn a_partial_carry_cannot_pair_an_old_claim_with_a_new_activity_period() {
 }
 
 #[test]
+fn an_expired_claim_cannot_block_a_sole_unproven_claimant() {
+    let a_pk = "mc-0000000000000001";
+    let b_pk = "mc-0000000000000002";
+    let c_pk = "mc-0000000000000003";
+    for (column, value) in [("label", "m7"), ("node", "0123456789abcdef")] {
+        let mut source = Index::new(8);
+        let a = operation(10, a_pk, column, value, &[], &mut source);
+        let initial = cells(&[&a]);
+        let initial_proof = snapshot(&MACHINE, &initial, [&a].into_iter(), &source).unwrap();
+        let retired = operation(50, a_pk, "row", "retired", &[10], &mut source);
+        let revived = operation(5, a_pk, "row", "live", &[50], &mut source);
+        let operations = [&a, &retired, &revived];
+        let raw = cells(&[&a, &revived]);
+        let mut partial =
+            interpreted_cells(&MACHINE, &raw, operations.into_iter(), &source).into_owned();
+        let proof = snapshot(&MACHINE, &partial, operations.into_iter(), &source).unwrap();
+        partial.remove(&(MACHINE.name.into(), format!("{a_pk}.{column}")));
+        let b = operation(20, b_pk, column, value, &[], &mut source);
+        let c = operation(21, c_pk, column, value, &[], &mut source);
+        let mut target = Index::new(8);
+        let old = carried_operation(100, &initial, Some(&initial_proof), &mut target);
+        let rest = carried_operation(101, &partial, Some(&proof), &mut target);
+        let unknown = carried_operation(102, &cells(&[&b]), None, &mut target);
+        let alone = project(
+            &MACHINE,
+            &cells(&[&unknown]),
+            [&unknown].into_iter(),
+            &target,
+        );
+        assert_eq!(alone.rows[b_pk].get(column), Some(&json!(value)));
+        let operations = [&old, &rest, &unknown];
+        let combined = cells(&operations);
+        let read = project(&MACHINE, &combined, operations.into_iter(), &target);
+        assert_eq!(
+            read.rows[a_pk].get(column),
+            None,
+            "expired tenure stays absent"
+        );
+        assert_eq!(read.rows[a_pk].fields[column].value(), Some(&json!(value)));
+        assert_eq!(
+            read.rows[b_pk].get(column),
+            Some(&json!(value)),
+            "a proved-empty contender cannot block the sole remaining claim"
+        );
+        let proof = snapshot(&MACHINE, &combined, operations.into_iter(), &target).unwrap();
+        let recarried = carried_operation(103, &combined, Some(&proof), &mut target);
+        let read = project(
+            &MACHINE,
+            &cells(&[&recarried]),
+            [&recarried].into_iter(),
+            &target,
+        );
+        assert_eq!(read.rows[a_pk].get(column), None);
+        assert_eq!(read.rows[b_pk].get(column), Some(&json!(value)));
+        let other = carried_operation(104, &cells(&[&c]), None, &mut target);
+        let operations = [&old, &rest, &unknown, &other];
+        let read = project(
+            &MACHINE,
+            &cells(&operations),
+            operations.into_iter(),
+            &target,
+        );
+        for pk in [a_pk, b_pk, c_pk] {
+            assert_eq!(
+                read.rows[pk].get(column),
+                None,
+                "unknown rivals stay withheld"
+            );
+        }
+    }
+}
+
+#[test]
 fn one_native_reactivation_can_restore_multiple_previously_carried_rows() {
     let pks = ["mc-0000000000000001", "mc-0000000000000002"];
     let mut source = Index::new(8);
@@ -266,7 +688,7 @@ fn one_native_reactivation_can_restore_multiple_previously_carried_rows() {
 fn the_importer_adopts_the_canonical_node_holder() {
     use crate::alab::import::{
         self, Input, KnownMac,
-        tests::{SEALER, Stand},
+        tests::{Stand, store},
     };
     let mut index = Index::new(8);
     let node = "0011223344556677";
@@ -302,7 +724,7 @@ fn the_importer_adopts_the_canonical_node_holder() {
         sheets: &[],
         macs: &macs,
         vendors: &Stand,
-        sealer: &SEALER,
+        store: store(),
         now_ms: 0,
         births: crate::alab::import::Births::None,
         unread: &[],
@@ -514,8 +936,7 @@ fn exporting_a_clash_label_and_saving_unchanged_preserves_the_signed_claim() {
         "canonical number lookup must select one holder"
     );
     let shown =
-        super::super::grid::export_projected(&REGISTRY, &MACHINE, &raw, &read, &[], false, None)
-            .unwrap();
+        super::super::grid::export_projected(&REGISTRY, &MACHINE, &raw, &read, &[]).unwrap();
     let clash = read.rows["mc-0000000000000002"]
         .get("label")
         .unwrap()

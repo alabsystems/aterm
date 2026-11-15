@@ -6,7 +6,7 @@
 //! ([`crate::claude_token::Standing`]); it never opens credential files or decrypts their
 //! contents.
 
-use crate::registry::{pointer, purpose as description};
+use crate::registry::purpose as description;
 
 /// One Claude Code token entry as `ls` lists it: its name and what it is, never a value and
 /// never a file (DESIGN-claude-setup-token §5.10).
@@ -17,7 +17,7 @@ pub(super) struct TokenRow {
 
 /// The rows of the tokens `standings` names, at `now` (unix seconds): each token entry described
 /// with its account, its state, where it was minted and when it ends, and its meta entry as
-/// metadata for it. Neither has a file pointer: the class is consumed in place.
+/// metadata for it. The class is consumed in place, like every entry.
 pub(super) fn token_rows(standings: &[crate::claude_token::Standing], now: u64) -> Vec<TokenRow> {
     let mut rows = Vec::with_capacity(standings.len() * 2);
     for standing in standings {
@@ -74,14 +74,12 @@ pub(super) fn listing(
                 aterm_json::json!({
                     "name": name,
                     "description": description(name),
-                    "pointer": pointer(name),
                 })
             })
             .chain(tokens.iter().map(|row| {
                 aterm_json::json!({
                     "name": row.name,
                     "description": row.description,
-                    "pointer": aterm_json::Value::Null,
                 })
             }))
             .collect();
@@ -96,12 +94,8 @@ pub(super) fn listing(
     for name in names {
         if describe {
             out.push_str(&format!(
-                "{}\t{}\t{}\n",
+                "{}\t{}\n",
                 aterm_codec::tty::one_line(name, 512),
-                pointer(name).map_or_else(
-                    || "registry only".into(),
-                    |p| aterm_codec::tty::one_line(&p, 512)
-                ),
                 aterm_codec::tty::one_line(&description(name), 512)
             ));
         } else {
@@ -112,7 +106,7 @@ pub(super) fn listing(
     for row in tokens {
         if describe {
             out.push_str(&format!(
-                "{}\tno file\t{}\n",
+                "{}\t{}\n",
                 aterm_codec::tty::one_line(&row.name, 512),
                 aterm_codec::tty::one_line(&row.description, 512)
             ));

@@ -715,6 +715,7 @@ mod harness_screen;
 mod harness_task;
 #[cfg(windows)]
 mod hdr_win;
+mod heap_relief;
 mod holder_image;
 mod host_io_prefetch;
 mod host_quit;
@@ -722,6 +723,7 @@ mod host_record;
 mod human_input;
 mod hwkey;
 mod identity_claim;
+mod idle_draw;
 #[cfg(windows)]
 mod image_decode_win;
 #[cfg(test)]
@@ -734,6 +736,7 @@ mod jumplist_win;
 mod lab_accounts;
 mod lab_deck;
 mod lab_screen;
+mod machine_page;
 #[cfg(all(windows, debug_assertions))]
 pub use jumplist_win::the_shell_keeps_what_a_commit_puts_in_a_test_identitys_jump_list;
 #[cfg(all(unix, any(debug_assertions, feature = "dev-seams")))]
@@ -766,6 +769,7 @@ mod present;
 #[cfg(test)]
 mod press_custody_conformance;
 mod relaunch_notice;
+mod requests_clean;
 mod requests_footprint;
 mod requests_host;
 mod requests_review;
@@ -791,6 +795,9 @@ mod app_restore;
 mod closed_recovery;
 mod deadline_heal;
 mod diagnostics;
+mod output_cadence;
+#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+mod restore_measurement;
 mod restored_worker;
 pub use diagnostics::{
     ThemeListFormat, theme_catalog_entry, theme_font_available, theme_list_report,
@@ -915,6 +922,7 @@ mod card_verb;
 mod harness_claim;
 mod harness_fact_verb;
 mod harness_policy_verb;
+mod harness_probe_verb;
 mod harness_recovery_verb;
 mod kitty_animation;
 mod login_notice_verb;
@@ -976,6 +984,7 @@ mod session_log;
 mod session_log_journal;
 mod session_log_mirror;
 mod session_log_node;
+mod session_pin;
 mod session_status;
 mod session_store;
 mod session_timeline;
@@ -1017,6 +1026,7 @@ mod sys_host;
 mod sys_naming;
 mod system_quit;
 mod tab_bar;
+mod tab_ids;
 mod tab_label;
 mod tab_menu;
 pub(crate) use aterm_gui_tabs::tab_model;
@@ -1058,6 +1068,7 @@ mod rename_reentry_drive;
 pub use rename_reentry_drive::run_rename_reentry_drive;
 mod diskwalk_host;
 mod resource_jobs;
+mod restore_focus;
 mod tray_raster;
 mod turn_ledger;
 mod type_scale;
@@ -1091,7 +1102,7 @@ use platform::AppRt;
 use spawn::{SessionFactory, spawn_session};
 
 #[cfg(target_os = "macos")]
-const FONT_PX: f32 = 12.0;
+const FONT_PX: f32 = aterm_render::WINDOW_FONT_PX_MACOS;
 #[cfg(windows)]
 const FONT_PX: f32 = 17.0;
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -1283,14 +1294,14 @@ pub(crate) fn effective_display_faces(config: &app_config::Config) -> Vec<&'stat
 }
 
 /// Interior padding at scale 1.0 (logical px) between the window edge and the grid, scaled by the display scale factor (`round(12·scale)`).
-pub(crate) const PAD_LOGICAL_PX: f32 = 12.0;
+pub(crate) const PAD_LOGICAL_PX: f32 = aterm_render::WINDOW_PAD_LOGICAL_PX;
 
 fn pad_for_scale(scale: f64) -> usize {
     logical_to_device_px(PAD_LOGICAL_PX, scale)
 }
 
 /// Top interior padding at scale 1.0 (logical px), small because the chrome `head` band already separates the grid from the top edge.
-pub(crate) const PAD_TOP_LOGICAL_PX: f32 = 2.0;
+pub(crate) const PAD_TOP_LOGICAL_PX: f32 = aterm_render::WINDOW_PAD_TOP_LOGICAL_PX;
 
 fn pad_top_for_scale(scale: f64) -> usize {
     logical_to_device_px(PAD_TOP_LOGICAL_PX, scale)
@@ -1932,7 +1943,7 @@ pub(crate) fn term_try_lock(term: &Mutex<Terminal>) -> Option<TermGuard<'_>> {
 pub(crate) enum ReadOn {
     /// A control connection's thread (a socket verb, the supervisor's); its caller's hang-up ends the wait.
     Control,
-    /// A control thread finishing what its caller's hang-up does not undo (a turn's guarded Enter).
+    /// A control thread finishing what its caller's hang-up does not undo (a turn's fenced submit).
     Committed,
     /// The event loop (the find bar, the footer's slash press, a worker's launch line).
     EventLoop,
@@ -3149,6 +3160,12 @@ enum Wake {
     /// A record a control worker made (`end`'s `proc.end`): logged, never on the glass.
     Record(aterm_messages::Message),
     AccountMenuRead(account_menu_read::Completion),
+    /// A background fleet or agent-path observation completed; refresh its menu facts.
+    AgentsDiscoveryReady,
+    /// One cold-restore document read finished; its owner may resume.
+    RestoreDocumentReady,
+    #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+    RestoreMeasurementReady,
     WorkstationSetup(workstation_setup::Request),
     /// The second of a watch for Apple's Command Line Tools, on a Mac that lacks them, with what it
     /// read of this Mac's installers on its own thread; `None` once the tools exist and the watch
@@ -3567,6 +3584,9 @@ enum Wake {
     TrailLight {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
+    TrailWarm {
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
     KittyCollection {
         reply: std::sync::mpsc::Sender<Result<Vec<String>, String>>,
     },
@@ -3670,6 +3690,17 @@ enum Wake {
         sessions: Vec<u64>,
         by: session_store::ExitActor,
         reply: std::sync::mpsc::Sender<usize>,
+    },
+    /// `request clean`: close a request's tabs (local id and sid) by `by`, each even where a
+    /// command runs in it where `force`, only where the cleanup still waits (`ticket`); the reply
+    /// is what was closed and the working folder of every tab still standing
+    /// ([`requests_clean`]).
+    CloseRequestTabs {
+        tabs: Vec<(u64, String)>,
+        by: session_store::ExitActor,
+        force: bool,
+        ticket: requests_clean::Ticket,
+        reply: std::sync::mpsc::Sender<requests_clean::Closed>,
     },
     RaiseSession {
         session: u64,
@@ -3821,10 +3852,15 @@ enum Wake {
     /// reader: the menu bar's machine title follows it.
     #[cfg(target_os = "macos")]
     MachineName(machine_title::MachineView),
-    /// A machine-name edit failed: the next matching menu press shows the reason
-    /// ([`App::machine_name_not_set`]).
+    /// A Rename This Mac… edit failed, or left its publication pending: the panel's next
+    /// matching press shows the reason ([`App::machine_name_not_set`]). A Settings ▸ This Mac
+    /// edit's comes back as [`Self::MachinePage`] instead.
     #[cfg(target_os = "macos")]
     MachineNameNotSet(machine_title::NameUnset),
+    /// Settings ▸ This Mac's read landed, or one of its writes failed
+    /// ([`App::machine_page_wake`]).
+    #[cfg(target_os = "macos")]
+    MachinePage(machine_title::page::PageWake),
     FleetRead,
     FabricRead,
     #[cfg(target_os = "macos")]
@@ -5728,7 +5764,8 @@ impl Drop for Session {
         drop(self.child_proxy.take());
         self.ctx.fabric.close();
         let predecessor_owns = self.predecessor_owns();
-        if self.rekey_channel && !predecessor_owns {
+        let rekey_files = self.rekey_channel && !predecessor_owns;
+        if rekey_files {
             crate::shell_rekey::discard(&self.ctx.self_id);
         }
         if self.body_loader && !predecessor_owns {
@@ -5736,6 +5773,12 @@ impl Drop for Session {
         }
         crate::shell_rekey::forget_typed(&self.ctx.self_id);
         self.hang_up_and_reap(predecessor_owns);
+        // The shell can still run a hook until its hang-up lands, and a bash hook makes its
+        // output file anew: the same files go again once it is gone.
+        #[cfg(unix)]
+        if rekey_files {
+            crate::shell_rekey::discard_once_gone(&self.ctx.self_id, self.shell_identity);
+        }
         drop(self.ctx.witness.take_fifo());
         self.ctx.sink.sever_input();
         if self.wake_wr >= 0 {
@@ -5761,6 +5804,7 @@ impl TabIndex {
         TabIndex { active, count }
     }
 
+    #[cfg(test)]
     const fn add(&mut self) -> usize {
         self.count += 1;
         self.active = self.count - 1;
@@ -5849,6 +5893,7 @@ const QUIT_READER_STOP: Duration = Duration::from_millis(250);
 struct SessionPool {
     sessions: std::collections::HashMap<u64, PooledSession>,
     insert_epoch: u64,
+    output_holds: output_cadence::Frontier,
 }
 
 struct PooledSession {
@@ -5856,6 +5901,8 @@ struct PooledSession {
     views: u32,
     rain_override: Option<bool>,
     theme: Option<session_theme::SessionTheme>,
+    /// A committed per-session theme choice, including an explicit clear, in this process.
+    theme_decided: bool,
     own_colors: Option<Arc<aterm_core::config::TerminalConfig>>,
     focus_arms_told: u32,
     rewind: Option<rewind::RewindView>,
@@ -5864,6 +5911,7 @@ struct PooledSession {
 impl SessionPool {
     fn insert(&mut self, session: Session) -> u64 {
         let id = session.id;
+        self.output_holds.forget(id);
         self.insert_epoch = self.insert_epoch.wrapping_add(1);
         let focus_arms_told = session.ctx.modes.focus_arms();
         self.sessions.insert(
@@ -5873,6 +5921,7 @@ impl SessionPool {
                 views: 1,
                 rain_override: None,
                 theme: None,
+                theme_decided: false,
                 own_colors: None,
                 focus_arms_told,
                 rewind: None,
@@ -5957,6 +6006,15 @@ impl SessionPool {
     }
     fn set_theme(&mut self, id: u64, theme: Option<session_theme::SessionTheme>) {
         if let Some(p) = self.sessions.get_mut(&id) {
+            p.theme = theme;
+        }
+    }
+    fn theme_decided(&self, id: u64) -> bool {
+        self.sessions.get(&id).is_some_and(|p| p.theme_decided)
+    }
+    fn commit_theme(&mut self, id: u64, theme: Option<session_theme::SessionTheme>) {
+        if let Some(p) = self.sessions.get_mut(&id) {
+            p.theme_decided = true;
             p.theme = theme;
         }
     }
@@ -6100,6 +6158,7 @@ impl SessionPool {
         if let Some(p) = self.sessions.get_mut(&id) {
             p.views = p.views.saturating_sub(1);
             if p.views == 0 {
+                self.output_holds.forget(id);
                 self.sessions.remove(&id);
                 return true;
             }
@@ -7318,12 +7377,15 @@ struct WindowState {
     composed_cursor_effect_valid: bool,
     composed_cursor_effect_session: Option<u64>,
     composed_cursor_fill: Option<u32>,
+    composed_cursor_keyline_tint: Option<u32>,
     composed_cursor_style_override: Option<aterm_core::terminal::CursorStyle>,
     composed_cursor_trail_color: u32,
     trick_listener: aterm_effects::typed_tricks::TrickListener,
     trick_fire: crate::app_input::TrickLineFire,
     verdict_spent: Option<(u64, std::time::Instant)>,
     verdict_hush: bool,
+    /// The session whose shell prompt took the last plain Enter, on a line with something on it; `None` once that Enter's sound was sent, and after an Enter anywhere else.
+    prompt_enter: Option<u64>,
     pet_pointer_sampled_px: Option<(f64, f64)>,
     delivery_seen: Option<(u64, u64)>,
     installed_config_assets: Option<std::sync::Arc<app_config::ConfigAssetCatalog>>,
@@ -7384,6 +7446,18 @@ struct WindowState {
     last_present_at: Option<Instant>,
     content_pending: bool,
     capture_present_serial: u64,
+    /// A capture's redraw is under way (`App::redraw_capture_frame`): a hidden window presents
+    /// it (`docs/ATERM_DESIGN.md` §7.4).
+    capture_redraw: bool,
+    /// The hidden window is minimised or its app hidden ([`idle_draw::Sight`]).
+    off_glass: bool,
+    /// When the covered window's last paced frame drew (§7.4).
+    covered_frame_at: Option<Instant>,
+    /// The covered window parked a frame since its last paced one.
+    covered_frame_owed: bool,
+    /// The window gained the focus while hidden: its next present is awaited, until one presents
+    /// or its occlusion changes (§7.4, [`WindowState::note_raised_while_hidden`]).
+    raised_while_hidden: bool,
     capture_present_invert: bool,
     capture_present_overlay: Option<crate::app_render::OverlayGlow>,
     capture_present_frame: Option<(u32, u32)>,
@@ -7496,6 +7570,7 @@ struct WindowState {
     last_present: Option<RepaintKey>,
     redraws_proved_unchanged: u64,
     pending_reveal: Option<Instant>,
+    passive_reveal: bool,
     preedit: String,
     preedit_caret: Option<usize>,
     ime_compose: Option<(std::time::Instant, bool)>,
@@ -7561,6 +7636,20 @@ struct WindowState {
     wallpaper_ink_scratch: Vec<aterm_core::render::InkCell>,
 }
 
+/// Whether the OS says `window` is hidden, its app hidden (`docs/ATERM_DESIGN.md` §7.4). Only
+/// macOS has that read (`Window::is_visible` is macOS-only in aterm-window); elsewhere a minimise
+/// is the one read.
+#[cfg(target_os = "macos")]
+fn os_window_hidden(window: &Window) -> bool {
+    window.is_visible() == Some(false)
+}
+
+/// Whether the OS says `window` is hidden: off macOS aterm-window has no such read, so never.
+#[cfg(not(target_os = "macos"))]
+const fn os_window_hidden(_window: &Window) -> bool {
+    false
+}
+
 impl WindowState {
     fn tracked_held(&self) -> bool {
         app_restore::TRACKS_NORMAL_FRAME
@@ -7591,6 +7680,131 @@ impl WindowState {
         {
             window_gpu.invalidate_present();
         }
+    }
+
+    /// Whether an assistive client reads this window: its accessibility tree is built from the
+    /// frames it draws, so a hidden window it reads keeps them (`docs/ATERM_DESIGN.md` §7.4).
+    #[cfg(a11y_tree)]
+    const fn assistive_client(&self) -> bool {
+        self.a11y_active
+    }
+
+    #[cfg(not(a11y_tree))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the accessibility platforms read the window's client"
+    )]
+    const fn assistive_client(&self) -> bool {
+        false
+    }
+
+    /// Whether the frontend waits on this window's next present even while it is hidden (§7.4):
+    /// a capture of it (`image`), a recording (`recording`), an assistive client reading it, the
+    /// frame it is revealed with, the frame of a raise that gave it the focus, or its first
+    /// present at all.
+    const fn frontend_awaits_present(&self, recording: bool) -> bool {
+        recording
+            || self.capture_redraw
+            || self.assistive_client()
+            || self.pending_reveal.is_some()
+            || self.raised_while_hidden
+            || self.capture_present_serial == 0
+    }
+
+    /// The window gained the focus (§7.4). Hidden, its next present is awaited, so a raise shows
+    /// its current state at once rather than the frame it parked on until the occlusion change
+    /// that follows the raise. It stays hidden until that change: a key window behind a lock
+    /// screen, display sleep or a screen saver gets none, so focus alone never puts it on screen
+    /// for the readers of `occluded` (the message band's look, System State's on-screen steps).
+    /// Whether it was hidden, so the caller asks for that frame.
+    const fn note_raised_while_hidden(&mut self) -> bool {
+        self.raised_while_hidden = self.occluded;
+        self.raised_while_hidden
+    }
+
+    /// Reads whether this hidden window is off every glass (minimised, or its app hidden) from
+    /// its OS window, which a headless window has none of: it keeps what it was told.
+    fn refresh_off_glass(&mut self) {
+        if let Some(w) = self.os_window.as_deref() {
+            self.off_glass = w.is_minimized() == Some(true) || os_window_hidden(w);
+        }
+    }
+
+    /// The window's occlusion state changed to `occluded` (§7.4). Visible again, nothing is owed:
+    /// `App::on_occlusion_changed` asks for the frame of its current state.
+    fn note_occlusion(&mut self, occluded: bool) {
+        self.occluded = occluded;
+        self.covered_frame_owed = false;
+        self.covered_frame_at = None;
+        self.raised_while_hidden = false;
+        if occluded {
+            self.refresh_off_glass();
+        } else {
+            self.off_glass = false;
+        }
+    }
+
+    /// Where this window's frames can be seen, as its last occlusion change and off-glass read
+    /// left it (§7.4).
+    const fn sight(&self) -> idle_draw::Sight {
+        idle_draw::Sight::of(self.occluded, self.off_glass)
+    }
+
+    /// §7.4 at the top of a redraw at `now`: whether this window's frame parks before any compose
+    /// ([`idle_draw::hidden_frame`]). A covered window's parked frame is owed at its period's end
+    /// ([`Self::covered_frame_deadline`]). A GPU target learns whether the frontend waits on the
+    /// frame, and adds its own captures, snapshots and recordings (`WindowGpu::present_awaited`),
+    /// so its present parks exactly where this does.
+    fn park_hidden_frame(&mut self, recording: bool, now: Instant) -> bool {
+        if self.occluded {
+            self.refresh_off_glass();
+        }
+        let frontend = self.frontend_awaits_present(recording);
+        let target = match self.present.as_mut() {
+            Some(PresentTarget::Gpu { window_gpu, .. }) => {
+                window_gpu.set_frame_awaited(frontend);
+                window_gpu.present_awaited()
+            }
+            _ => false,
+        };
+        let sight = self.sight();
+        match idle_draw::hidden_frame(sight, frontend || target, self.covered_frame_at, now) {
+            idle_draw::HiddenFrame::Draws => false,
+            idle_draw::HiddenFrame::Paced => {
+                self.covered_frame_at = Some(now);
+                self.covered_frame_owed = false;
+                if let Some(PresentTarget::Gpu { window_gpu, .. }) = self.present.as_mut() {
+                    window_gpu.set_frame_awaited(true);
+                }
+                false
+            }
+            idle_draw::HiddenFrame::Parks => {
+                self.covered_frame_owed |= sight == idle_draw::Sight::Covered;
+                // What the parked frame held is not on glass: the frame that next draws reveals
+                // it, so the output's wait through the park books no output-to-present latency,
+                // as a window shown again does (`App::on_occlusion_changed`).
+                self.last_visible_views.clear();
+                true
+            }
+        }
+    }
+
+    /// When a covered window's parked frame is owed (§7.4): its last paced frame plus
+    /// [`idle_draw::COVERED_FRAME_PERIOD`].
+    fn covered_frame_deadline(&self) -> Option<Instant> {
+        self.covered_frame_owed
+            .then_some(self.covered_frame_at)
+            .flatten()
+            .map(|at| at + idle_draw::COVERED_FRAME_PERIOD)
+    }
+
+    /// `new_events`' edge for a covered window's owed frame at `now`: whether it must draw.
+    fn covered_frame_due(&mut self, now: Instant) -> bool {
+        if self.covered_frame_deadline().is_some_and(|due| now >= due) {
+            self.covered_frame_owed = false;
+            return true;
+        }
+        false
     }
 
     fn rearm_present(&mut self, request_even_if_ready: bool) {
@@ -7788,6 +8002,7 @@ impl WindowState {
         self.present_retry.on_presented();
         self.bootstrap_present_retry_available = false;
         self.capture_present_serial = self.capture_present_serial.wrapping_add(1);
+        self.raised_while_hidden = false;
     }
 
     const fn painted_for_handoff(&self) -> bool {
@@ -8196,6 +8411,7 @@ impl WindowState {
         self.composed_cursor_effect_valid = false;
         self.composed_cursor_effect_session = None;
         self.composed_cursor_fill = None;
+        self.composed_cursor_keyline_tint = None;
         self.composed_cursor_style_override = None;
         self.composed_cursor_trail_color = 0;
 
@@ -8210,6 +8426,7 @@ impl WindowState {
         self.input_scratch.fire_halo.clear();
         self.input_scratch.cursor_effect_style_override = None;
         self.input_scratch.cursor_fill_override = None;
+        self.input_scratch.cursor_keyline_tint = None;
         self.input_scratch.word_decorations.clear();
         self.input_scratch.ink.clear();
         self.input_scratch.nova_add.clear();
@@ -8467,6 +8684,7 @@ impl WindowState {
             installed_kitty_asset_fp: 0,
             verdict_spent: None,
             verdict_hush: false,
+            prompt_enter: None,
             pet_pointer_sampled_px: None,
             delivery_seen: None,
             poof_row_buf: Vec::new(),
@@ -8493,6 +8711,7 @@ impl WindowState {
             composed_cursor_effect_valid: false,
             composed_cursor_effect_session: None,
             composed_cursor_fill: None,
+            composed_cursor_keyline_tint: None,
             composed_cursor_style_override: None,
             composed_cursor_trail_color: 0,
             heterogeneous_output_streak_staged: Vec::new(),
@@ -8531,6 +8750,11 @@ impl WindowState {
             last_present_at: None,
             content_pending: false,
             capture_present_serial: 0,
+            capture_redraw: false,
+            off_glass: false,
+            covered_frame_at: None,
+            covered_frame_owed: false,
+            raised_while_hidden: false,
             capture_present_invert: false,
             capture_present_overlay: None,
             capture_present_frame: None,
@@ -8632,6 +8856,7 @@ impl WindowState {
             last_present: None,
             redraws_proved_unchanged: 0,
             pending_reveal: None,
+            passive_reveal: false,
             preedit: String::new(),
             preedit_caret: None,
             ime_compose: None,
@@ -8722,6 +8947,17 @@ fn active_tab_displays_session(
             .and_then(tab_model::View::terminal_session)
             == Some(session)
     })
+}
+
+/// A terminal labels a tab only where one of its current views is that tab's focused leaf.
+fn tabs_label_session(
+    tabs: &tab_model::TabSet,
+    views: &tab_model::ViewStore,
+    session: u64,
+) -> bool {
+    views
+        .terminal_views(session)
+        .any(|view| tabs.contains_focused_view(view))
 }
 
 /// Why the automatic intent's current retry deadline exists. A completion may shorten only the
@@ -9308,11 +9544,14 @@ impl Wake {
             | Wake::DiskWalk
             | Wake::HostNote(harness_host::HostNote::DiskLooked)
             | Wake::SiblingScan(_)
+            | Wake::AgentsDiscoveryReady
             | Wake::FleetRead => true,
+            #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+            Wake::RestoreMeasurementReady => true,
             #[cfg(unix)]
             Wake::FleetTraffic => true,
             #[cfg(target_os = "macos")]
-            Wake::MachineName(_) | Wake::MachineNameNotSet(_) => true,
+            Wake::MachineName(_) | Wake::MachineNameNotSet(_) | Wake::MachinePage(_) => true,
             _ => false,
         }
     }
@@ -10176,6 +10415,8 @@ struct App {
     /// whose reader reads the services' states as the band does.
     network_inspected: Option<Instant>,
     lab_screen: lab_screen::LabScreen,
+    /// Settings ▸ This Mac's reads, writes and published state.
+    machine_page: machine_page::MachinePageHost,
     harness_progress_next_poll: Option<Instant>,
     workstation_setup: workstation_setup::Host,
     system_state_host: system_state_host::Host,
@@ -10258,6 +10499,7 @@ struct App {
     native_documents: app_documents::DocumentHostRuntime,
     editor_workspace: native_editor::EditorWorkspace,
     closed_recovery: closed_recovery::ClosedRecoveryLedgers,
+    closed_reopens: Vec<app_restore::closed::Pending>,
     tab_ids: tab_model::IdAllocator<tab_model::TabId>,
     ever_shared: bool,
     resize_live_drag: bool,
@@ -10340,12 +10582,14 @@ struct App {
     focus_reported: Option<u64>,
     focus_order: Vec<WindowId>,
     carried_window_show: Option<window_show::CarriedShow>,
+    restore_focus: restore_focus::Intent,
     physical_press_owners:
         std::collections::HashMap<aterm_window::keyboard::PhysicalKey, PhysicalPressOwner>,
     boosted_sessions: std::collections::HashSet<u64>,
     next_window_id: u64,
     pending_restore: Option<restore::RestoreManifest>,
     restore_drain: Option<Box<app_restore::RestoreDrain>>,
+    restore_leaf_staging: Option<app_restore::RestoreLeafStaging>,
     /// The park's queued restore pass waiting for the first window to reach the glass.
     restore_glass: RestoreGlassWait,
     /// The clocks of the update lane's own hold backstops (`App::tick_lane_hold_clocks`).
@@ -10510,14 +10754,17 @@ struct App {
     /// The machine title's view, from [`Wake::MachineName`]; `None` until its reader's first read.
     #[cfg(target_os = "macos")]
     machine_view: Option<machine_title::MachineView>,
-    /// The last machine-name edit's failure, kept for its next menu press.
+    /// The last Rename This Mac… edit's failure, kept for the panel's next press; Settings ▸
+    /// This Mac keeps its own (`MachinePageHost`'s notice).
     #[cfg(target_os = "macos")]
     machine_unset: Option<machine_title::NameUnset>,
-    /// How many machine-name edits have started: each failure names its own, so one a
-    /// later press superseded is dropped.
+    /// How many Rename This Mac… edits have started: each failure names its own, so one a
+    /// later press superseded is dropped. Settings ▸ This Mac counts its own
+    /// (`MachinePageHost::sets`).
     #[cfg(target_os = "macos")]
     machine_sets: u64,
-    /// One queue preserves the order of edits submitted by the machine menus.
+    /// One queue preserves the order of the edits and reads Rename This Mac… and Settings ▸
+    /// This Mac submit.
     #[cfg(target_os = "macos")]
     machine_writer: Option<machine_title::NameWriter>,
     _status_item: Option<status_item::StatusItemHandle>,
@@ -15360,6 +15607,7 @@ impl App {
             native_documents: app_documents::DocumentHostRuntime::new(),
             editor_workspace: native_editor::EditorWorkspace::new(),
             closed_recovery: closed_recovery::ClosedRecoveryLedgers::default(),
+            closed_reopens: Vec::new(),
             tab_ids,
             ever_shared: false,
             resize_live_drag: false,
@@ -15378,6 +15626,7 @@ impl App {
             network_next_poll: None,
             network_inspected: None,
             lab_screen: lab_screen::LabScreen::default(),
+            machine_page: machine_page::MachinePageHost::default(),
             harness_progress_next_poll: None,
             vitals: vitals_host::VitalsHost::default(),
             diskwalk: diskwalk_host::DiskwalkHost::default(),
@@ -15483,11 +15732,13 @@ impl App {
             focus_reported,
             focus_order: Vec::new(),
             carried_window_show: None,
+            restore_focus: restore_focus::Intent::default(),
             physical_press_owners: std::collections::HashMap::with_capacity(64),
             boosted_sessions: Default::default(),
             next_window_id: 1,
             pending_restore: None,
             restore_drain: None,
+            restore_leaf_staging: None,
             restore_glass: RestoreGlassWait::default(),
             lane_hold_clocks: native_update_lane_hold::LaneHoldClocks::default(),
             seamless_adopt: Vec::new(),
@@ -16323,15 +16574,9 @@ impl App {
                 seam(self, session);
             }
         });
-        if let Some(s) = self.pool.get(session) {
-            let word = s.output_wake_pending.load(Ordering::Relaxed);
-            let now_ns = u64::try_from(now.saturating_duration_since(self.lat_epoch).as_nanos())
-                .unwrap_or(u64::MAX);
-            s.output_wake_pending.store(
-                crate::spawn::output_latch_after_pass(word, now_ns),
-                Ordering::Relaxed,
-            );
-        }
+        let now_ns = u64::try_from(now.saturating_duration_since(self.lat_epoch).as_nanos())
+            .unwrap_or(u64::MAX);
+        self.pool.output_pass(session, now_ns);
         self.vitals_output_edge(session, now);
         self.session_status.note_output(session, now);
         let session_visible = self.admit_output_redraws(session, now);
@@ -16356,26 +16601,26 @@ impl App {
     }
 
     /// Release every output hold due at `now` (`spawn::release_output_hold`).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OutputCadenceFrontier",
+            action = "Service",
+            project = "aterm_gui::output_cadence::tests::project"
+        )
+    )]
     pub(crate) fn release_output_holds(&mut self, now: Instant) -> Option<Instant> {
         let now_ns = u64::try_from(now.saturating_duration_since(self.lat_epoch).as_nanos())
             .unwrap_or(u64::MAX);
-        let mut earliest: Option<u64> = None;
-        let mut due = Vec::new();
-        for s in self.pool.iter() {
-            match crate::spawn::release_output_hold(&s.output_wake_pending, now_ns) {
-                crate::spawn::HoldRelease::Pending { due_ns } => {
-                    earliest = Some(earliest.map_or(due_ns, |e| e.min(due_ns)));
+        loop {
+            match self.pool.output_hold_work(now_ns) {
+                output_cadence::Work::Due(session) => self.on_output_wake(session, now),
+                output_cadence::Work::Pending(ns) => {
+                    return Some(self.lat_epoch + Duration::from_nanos(ns));
                 }
-                crate::spawn::HoldRelease::Due => due.push(s.id),
-                crate::spawn::HoldRelease::NotHeld | crate::spawn::HoldRelease::Released => {}
+                output_cadence::Work::Idle => return None,
             }
         }
-        for session in due {
-            self.on_output_wake(session, now);
-            let again = now_ns.saturating_add(crate::spawn::OUTPUT_CADENCE_NS);
-            earliest = Some(earliest.map_or(again, |e| e.min(again)));
-        }
-        earliest.map(|ns| self.lat_epoch + Duration::from_nanos(ns))
     }
 
     fn is_visible_session(&self, id: u64) -> bool {
@@ -16451,11 +16696,15 @@ impl App {
         }
     }
 
+    /// `WindowEvent::Occluded` (`windowDidChangeOcclusionState:` on macOS: minimised, fully
+    /// covered, on another Space or hidden). A minimised or hidden window presents nothing, and a
+    /// covered one at most a frame every 5 s (`WindowState::park_hidden_frame`,
+    /// `docs/ATERM_DESIGN.md` §7.4); visible again it draws its current state once.
     fn on_occlusion_changed(&mut self, wid: WindowId, occluded: bool) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        ws.occluded = occluded;
+        ws.note_occlusion(occluded);
         if occluded {
             ws.stats_lens.input.retire();
         }
@@ -16482,8 +16731,11 @@ impl App {
                 self.devtools_helper.forget_opened();
                 self.read_devtools_list(Instant::now());
             }
+            // A window raised while hidden draws its current state at once, and stays hidden
+            // until its occlusion changes (§7.4, `WindowState::note_raised_while_hidden`).
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.rearm_present(false);
+                let raised = ws.note_raised_while_hidden();
+                ws.rearm_present(raised);
             }
             self.on_wall_moved();
             self.refresh_frame_interval(wid, true);
@@ -17164,14 +17416,8 @@ impl App {
                 .app(instance)
                 .map(crate::native_app::NativeApp::kind)
             {
-                let result = crate::native_document_host::path_to_file_uri(path)
-                    .map_err(|error| error.to_string())
-                    .and_then(|uri| self.request_document_tab_in_window(wid, kind, &uri));
-                if let Err(error) = result {
-                    crate::logging::stderr_line!(
-                        "aterm-gui: dropped document was not opened: {error}"
-                    );
-                }
+                // Why it did not open shows in this window (`App::open_path_for_person`).
+                let _ = self.open_path_for_person(wid, kind, path, None);
             }
             return;
         }
@@ -17613,6 +17859,15 @@ impl App {
     }
 
     fn run_restore_pass(&mut self, el: &ActiveEventLoop, site: RestorePassSite) {
+        #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+        if let Some(proxy) = &self.proxy
+            && !crate::restore_measurement::start_allowed(proxy)
+        {
+            return;
+        }
+        self.prepare_restore_focus();
+        #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+        let mut measurement = crate::restore_measurement::Callback::begin();
         // A drain the person's quit (or last window's close) cut short lands
         // nothing more: no window made and no shell forked for a process on
         // its way out. The quit's layout already carries what it owed
@@ -17634,8 +17889,13 @@ impl App {
             self.apply_pending_restore(el);
         }
         crate::metrics::stamp_claim(crate::metrics::ClaimStamp::RestoreDrained);
+        if self.carried_window_show.is_none() {
+            self.restore_focus.finish();
+        }
         self.request_redraw_all_windows();
         self.note_desk_activity();
+        #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+        measurement.finished();
     }
 
     fn maybe_signal_handoff_ready(&mut self) {
@@ -17982,18 +18242,7 @@ impl App {
         let stale = self.title_drift.seen.get(&session).copied() != Some(live_epoch)
             || self.windows.values().any(|ws| {
                 ws.tab_title_epochs.get(&session).copied() != Some(live_epoch)
-                    && ws.tab_set.tabs().iter().any(|tab| {
-                        #[cfg(test)]
-                        {
-                            crate::work_counts::title_tab_touched();
-                            crate::work_counts::title_drift_tab_visited();
-                        }
-                        self.view_store
-                            .get(tab.focus)
-                            .copied()
-                            .and_then(tab_model::View::terminal_session)
-                            == Some(session)
-                    })
+                    && tabs_label_session(&ws.tab_set, &self.view_store, session)
             });
         if !stale {
             return;
@@ -18032,9 +18281,15 @@ impl App {
             .unwrap_or_else(|p| p.into_inner())
             .user_title
             .clone();
+        // The terminal's guard is gone; the strip resolves the same rungs.
+        let task_line = untitled
+            .then(|| crate::app_take_over::task_line_of(&s.ctx))
+            .flatten();
         let resolved_title_rung = crate::app_tabs::resolved_terminal_title_rung(
             user_title.as_deref(),
             &live_title,
+            untitled,
+            task_line.as_deref(),
             live_cwd.as_deref(),
         );
         self.title_drift.pending.remove(&session);
@@ -18071,17 +18326,7 @@ impl App {
         let label_windows: Vec<WindowId> = self
             .windows
             .iter()
-            .filter(|(_, ws)| {
-                ws.tab_set.tabs().iter().any(|tab| {
-                    #[cfg(test)]
-                    crate::work_counts::title_drift_tab_visited();
-                    self.view_store
-                        .get(tab.focus)
-                        .copied()
-                        .and_then(tab_model::View::terminal_session)
-                        == Some(session)
-                })
-            })
+            .filter(|(_, ws)| tabs_label_session(&ws.tab_set, &self.view_store, session))
             .map(|(wid, _)| *wid)
             .collect();
         for wid in label_windows {
@@ -18303,6 +18548,7 @@ impl ApplicationHandler<Wake> for App {
             for (id, ws) in self.windows.iter_mut() {
                 let mut dirty = ws.bell_flash.expire(now);
                 dirty |= ws.flip_due_blink(now);
+                dirty |= ws.covered_frame_due(now);
                 if ws.next_autoscroll.is_some_and(|d| now >= d) {
                     autoscroll_due.push(*id);
                 }
@@ -18384,10 +18630,16 @@ impl ApplicationHandler<Wake> for App {
             }
             for wid in native_preview_due {
                 let unobscured = self.windows.get(&wid).is_some_and(|window| {
+                    let recorded = native_recording_window == Some(wid);
+                    // A hidden window's preview ticks no frame it would park (§7.4).
                     native_preview_may_tick(
-                        window.os_window.is_some(),
+                        idle_draw::clocks_have_glass(
+                            window.os_window.is_some(),
+                            window.occluded,
+                            recorded,
+                        ),
                         window.focused,
-                        native_recording_window == Some(wid),
+                        recorded,
                         window.overlay.is_some(),
                     )
                 });
@@ -18423,6 +18675,8 @@ impl ApplicationHandler<Wake> for App {
             return;
         }
         self.service_restored_workers();
+        self.service_due_document_preparations();
+        self.progress_closed_reopens();
         self.settle_update_boundary_latch();
         self.prune_deferred_gpu_captures();
         self.drain_message_inbox();
@@ -18438,6 +18692,8 @@ impl ApplicationHandler<Wake> for App {
         let mut park_now = Instant::now();
         self.poll_consent_observer(park_now);
         self.tick_consent_lanes(park_now);
+        #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+        crate::restore_measurement::tick_closed_reopen_fixture(self);
         // A headless app has no glass to wait for: its restore pass (a keeper recovery's
         // sessions after session 0 among what it places) runs at its first park, whatever its
         // desk keeps.
@@ -18577,7 +18833,7 @@ impl ApplicationHandler<Wake> for App {
                 && let Some(w) = &ws.os_window
             {
                 ws.last_present = None;
-                w.set_visible(true);
+                crate::app_window::reveal_os_window(w, ws.passive_reveal);
                 crate::metrics::mark_first_window_visible();
                 w.request_redraw();
             }
@@ -18701,7 +18957,13 @@ impl ApplicationHandler<Wake> for App {
                 // clock; recovery recomputes it from live terminal state.
                 Some(false)
             } else if blink_clock_may_run(
-                !headless && ws.os_window.is_some(),
+                // A hidden window arms no blink unless it is recorded (§7.4).
+                !headless
+                    && idle_draw::clocks_have_glass(
+                        ws.os_window.is_some(),
+                        ws.occluded,
+                        native_preview_recording_window == Some(*id),
+                    ),
                 ws.focused,
                 ws.rest.resting(),
             ) {
@@ -18835,6 +19097,15 @@ impl ApplicationHandler<Wake> for App {
                 && let Some(t) = ws.last_present_at
             {
                 let d = t + ws.content_pace_floor(frame_interval);
+                fold_owned_deadline(
+                    &mut deadline,
+                    &mut deadline_owner,
+                    d,
+                    metrics::DeadlineOwner::FrameCap,
+                );
+            }
+            // A covered window's parked frame, owed at its period's end (§7.4).
+            if let Some(d) = ws.covered_frame_deadline() {
                 fold_owned_deadline(
                     &mut deadline,
                     &mut deadline_owner,
@@ -19297,6 +19568,22 @@ impl ApplicationHandler<Wake> for App {
         {
             platform_win::set_end_session_snapshot(snapshot);
         }
+        if let Some(at) = self.agents_discovery_retry(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                at,
+                metrics::DeadlineOwner::AgentsDiscovery,
+            );
+        }
+        if let Some(at) = self.document_preparation_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                at,
+                metrics::DeadlineOwner::CrashJournal,
+            );
+        }
         if let Some(journal_wake) = self.crash_journal_wake(Instant::now()) {
             fold_owned_deadline(
                 &mut deadline,
@@ -19497,7 +19784,13 @@ impl ApplicationHandler<Wake> for App {
             {
                 window.request_redraw();
             }
-            let has_glass = ws.os_window.is_some();
+            // A window nobody can see plans no cursor-effect frame unless it is recorded (§7.4):
+            // the lane parks, and plans again once the window is visible.
+            let has_glass = idle_draw::clocks_have_glass(
+                ws.os_window.is_some(),
+                ws.occluded,
+                native_preview_recording_window == Some(*id),
+            );
             if let Some(d) = ws.plan_terminal_effect_lane_with_recording(
                 effect_now,
                 cursor_cat_motion,
@@ -19523,6 +19816,18 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::AccountDrain,
             );
         }
+        if let Some(restore_wake) = self
+            .restore_drain
+            .as_ref()
+            .and_then(|drain| drain.deadline())
+        {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                restore_wake,
+                metrics::DeadlineOwner::RestoreDrain,
+            );
+        }
         if let Some(glass) = self.restore_glass.deadline(Instant::now()) {
             fold_owned_deadline(
                 &mut deadline,
@@ -19535,7 +19840,12 @@ impl ApplicationHandler<Wake> for App {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(d)),
             None => el.set_control_flow(ControlFlow::Wait),
         }
-        if self.restore_drain.is_some() && !el.exiting() {
+        if self
+            .restore_drain
+            .as_ref()
+            .is_some_and(|drain| drain.runnable(Instant::now()))
+            && !el.exiting()
+        {
             el.set_control_flow(ControlFlow::Poll);
         }
         self.session_factory.loop_idle.went_idle(latch_now_ns);
@@ -19781,6 +20091,16 @@ impl App {
                 self.on_claude_footer_changed(session);
             }
             Wake::AccountMenuRead(completion) => self.on_account_menu_read(completion),
+            Wake::AgentsDiscoveryReady => self.on_agents_discovery_ready(),
+            Wake::RestoreDocumentReady => {
+                self.progress_document_preparations();
+                self.progress_closed_reopens();
+                if let Some(drain) = self.restore_drain.as_mut() {
+                    drain.document_ready();
+                }
+            }
+            #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+            Wake::RestoreMeasurementReady => self.request_redraw_all_windows(),
             Wake::MailChanged => self.on_mail_changed(),
             Wake::TablesChanged => self.on_tables_changed(),
             #[cfg(all(unix, not(test)))]
@@ -20958,6 +21278,20 @@ impl App {
                     .count();
                 let _ = reply.send(kept);
             }
+            Wake::CloseRequestTabs {
+                tabs,
+                by,
+                force,
+                ticket,
+                reply,
+            } => {
+                // A cleanup that gave up waiting closes nothing after.
+                if ticket.take() {
+                    let closing = self.close_request_tabs(&tabs, &by, force);
+                    self.escalate_pending_close(el);
+                    let _ = reply.send(self.request_tabs_closed(closing));
+                }
+            }
             Wake::ConnectionsChanged => self.refresh_connection_surfaces(),
             Wake::SpawnConnectedSession {
                 kind,
@@ -21030,6 +21364,9 @@ impl App {
             }
             Wake::TrailLight { reply } => {
                 let _ = reply.send(self.trail_light());
+            }
+            Wake::TrailWarm { reply } => {
+                let _ = reply.send(self.trail_warm());
             }
             Wake::KittyCollection { reply } => {
                 let _ = reply.send(self.kitty_collection_rows());
@@ -21237,15 +21574,9 @@ impl App {
                         rejected.detail()
                     );
                 }
-                Err(rejected @ app_documents::DocumentAdmissionRejected::Failed(_)) => {
-                    crate::logging::stderr_line!(
-                        "aterm-gui: document was not opened: {}",
-                        rejected.detail()
-                    );
-                    if !self.headless {
-                        menu::notify("Couldn’t Open File", rejected.detail());
-                    }
-                }
+                // The window that asked shows it, and `show_failed_open` wrote its stderr line
+                // and its aterm.log record.
+                Err(app_documents::DocumentAdmissionRejected::Failed(_)) => {}
             },
             #[cfg(target_os = "macos")]
             Wake::Askpass(request) => self.present_askpass_sheet(*request),
@@ -21353,6 +21684,8 @@ impl App {
             #[cfg(target_os = "macos")]
             Wake::MachineNameNotSet(unset) => self.machine_name_not_set(unset),
             #[cfg(target_os = "macos")]
+            Wake::MachinePage(wake) => self.machine_page_wake(wake),
+            #[cfg(target_os = "macos")]
             Wake::NativeTerminateRequested { generation } => {
                 self.on_native_terminate_requested(el, generation);
             }
@@ -21422,6 +21755,7 @@ impl App {
             UpdateHandoffEventClass::Revoking => self.note_update_handoff_activity(),
         }
         self.note_window_input_arrival(&event, self.input_origin);
+        self.note_restore_focus_event(id, &event);
         if self.incoming_handoff_pending
             && !matches!(
                 &event,
@@ -27300,6 +27634,7 @@ pub fn main_entry_with_network(
     let cold_first_frame = cold_first.and_then(|seed| seed.frame);
     if let Some(layout) = restore_manifest.as_ref() {
         session_log::Epochs::process().note_leaves(layout);
+        tab_ids::reserve(layout.leaf_tab_ids());
     }
     if keeper_recovering {
         keeper_link::place_by_owner(
@@ -27321,6 +27656,12 @@ pub fn main_entry_with_network(
     let restore_cwd0: Option<String> = restore_manifest
         .as_ref()
         .and_then(restore::RestoreManifest::first_leaf_cwd);
+    // A cold restore spawns session 0 under its leaf's tab ID: the tab keeps it.
+    let kept0 = restore_manifest
+        .as_ref()
+        .filter(|_| adopt0.is_none())
+        .and_then(restore::RestoreManifest::first_leaf_sid)
+        .and_then(tab_ids::keep);
     let bootstrap_payload =
         withhold_bootstrap_payload(&mut session_factory.exec_command, relaunch_of_running);
     let session0_sink = LaneSink::new();
@@ -27335,6 +27676,7 @@ pub fn main_entry_with_network(
         restore_cwd0.as_deref(),
         None, // not a connected controller spawn
         None, // no worker's task
+        kept0,
         adopt0,
     )
     .unwrap_or_else(|e| {
@@ -28132,6 +28474,13 @@ pub fn main_entry_with_network(
             let _ = proxy.send_event(Wake::SemanticFontReady);
         });
     }
+    #[cfg(unix)]
+    {
+        let proxy = proxy.clone();
+        resource_jobs::set_native_wake(move || {
+            let _ = proxy.send_event(Wake::Vitals);
+        });
+    }
     let focus_reported = ws0
         .front_content
         .and_then(front_content::FrontContent::terminal_session);
@@ -28230,6 +28579,7 @@ pub fn main_entry_with_network(
         native_documents: app_documents::DocumentHostRuntime::opening(),
         editor_workspace: native_editor::EditorWorkspace::new(),
         closed_recovery: closed_recovery::ClosedRecoveryLedgers::default(),
+        closed_reopens: Vec::new(),
         tab_ids,
         ever_shared: false,
         resize_live_drag: false,
@@ -28248,6 +28598,7 @@ pub fn main_entry_with_network(
         network_next_poll: None,
         network_inspected: None,
         lab_screen: lab_screen::LabScreen::default(),
+        machine_page: machine_page::MachinePageHost::default(),
         harness_progress_next_poll: None,
         vitals: vitals_host::VitalsHost::default(),
         diskwalk: diskwalk_host::DiskwalkHost::default(),
@@ -28358,11 +28709,13 @@ pub fn main_entry_with_network(
         focus_reported,
         focus_order: Vec::new(),
         carried_window_show: None,
+        restore_focus: restore_focus::Intent::default(),
         physical_press_owners: std::collections::HashMap::with_capacity(64),
         boosted_sessions: Default::default(),
         next_window_id: 1,
         pending_restore: restore_manifest,
         restore_drain: None,
+        restore_leaf_staging: None,
         restore_glass: RestoreGlassWait::default(),
         lane_hold_clocks: native_update_lane_hold::LaneHoldClocks::default(),
         seamless_adopt,
@@ -28884,6 +29237,7 @@ pub fn main_entry_with_network(
     watchdog::start(move || {
         let _ = wall_proxy.send_event(Wake::WallMoved);
     });
+    heap_relief::start();
     #[cfg(unix)]
     crate::proxy::start_edge_sweeper();
     let consent_proxy = proxy.clone();
@@ -28937,10 +29291,21 @@ fn stub_session(id: u64) -> Session {
     stub_session_with_sink(id, Arc::new(SinkWriter::new(-1)))
 }
 
+/// [`stub_session`] under tab ID `sid` (a restore's kept one).
+#[cfg(test)]
+fn stub_session_as(id: u64, sid: SessionId) -> Session {
+    stub_session_named(id, sid, Arc::new(SinkWriter::new(-1)))
+}
+
 #[cfg(any(test, feature = "bench-support"))]
 fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
+    stub_session_named(id, crate::tab_ids::mint(), sink)
+}
+
+#[cfg(any(test, feature = "bench-support"))]
+fn stub_session_named(id: u64, sid: SessionId, sink: Arc<SinkWriter>) -> Session {
     prime_test_timing();
-    let session = ptyless_session(id, SessionId::generate(), Terminal::new(24, 80), sink);
+    let session = ptyless_session(id, sid, Terminal::new(24, 80), sink);
     #[cfg(test)]
     {
         *session
@@ -29140,6 +29505,10 @@ mod tab_index_tests;
 #[cfg(test)]
 #[path = "lib_scripted_redraw_fixture_tests.rs"]
 pub(crate) mod scripted_redraw_fixture;
+
+#[cfg(test)]
+#[path = "idle_draw_tests.rs"]
+mod idle_draw_tests;
 
 #[cfg(test)]
 #[path = "lib_present_retry_tests.rs"]

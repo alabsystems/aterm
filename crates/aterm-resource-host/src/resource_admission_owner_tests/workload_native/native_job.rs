@@ -86,6 +86,9 @@ pub(super) fn root() -> i32 {
     std::io::stdin().read_exact(&mut raw).unwrap();
     let plan = native::Plan::decode(&raw).unwrap();
     assert!(wire::WorkloadInvocation::decode(&raw).is_err());
+    let source = PathBuf::from(std::ffi::OsStr::from_bytes(&plan.inputs.cwd));
+    let mut progress = FixtureProgress::new(source.join("native-progress"), Instant::now());
+    progress.completed("native-root-entered");
     let end = Instant::now() + HANG;
     let client = store.discover(end).unwrap();
     let actual_store =
@@ -155,7 +158,7 @@ pub(super) fn root() -> i32 {
     }
     connection.revalidate(end).unwrap();
     channel.send(&[1], end).unwrap();
-    let source = PathBuf::from(std::ffi::OsStr::from_bytes(&plan.inputs.cwd));
+    progress.completed("native-originals-validated");
     let case = fs::read_to_string(source.join("step")).unwrap();
     let output = PathBuf::from(std::ffi::OsStr::from_bytes(&plan.inputs.output_root));
     let lock_path = output.join(".cargo-lock");
@@ -200,6 +203,7 @@ pub(super) fn root() -> i32 {
         host::output::Reply::Retained { .. }
     ));
     drop(original);
+    progress.completed("native-output-lock-retained");
     let query_cpu = got.fds[0].try_clone().unwrap();
     let query = native::query::CompilerQuery {
         member: control::Request {
@@ -245,6 +249,7 @@ pub(super) fn root() -> i32 {
         "mismatched native plan must be refused before attachment: {:?}",
         mismatched.as_ref().err(),
     );
+    progress.completed("mismatched-query-refused");
     let mut active = client
         .native_job_query(
             &query,
@@ -254,6 +259,7 @@ pub(super) fn root() -> i32 {
             end,
         )
         .unwrap();
+    progress.completed("native-query-accepted");
     // This closed stand-in is the original bank for exactly one query. It
     // transfers the SAME received description and keeps the original occupied
     // until the Host reports actual member retirement and returns that ticket.
@@ -317,6 +323,11 @@ pub(super) fn root() -> i32 {
                 )
                 .unwrap();
             }
+            progress.completed(if granted {
+                "native-cpu-loan-transferred"
+            } else {
+                "native-cpu-loan-returned"
+            });
         }
         if let Some(result) = active.poll(end).unwrap() {
             break result;
@@ -339,6 +350,7 @@ pub(super) fn root() -> i32 {
     assert_eq!(completed.invocation_sha256, digest);
     assert!(active.workload_completion().is_none());
     assert!(active.paired_completion().is_none());
+    progress.completed("native-query-completed");
     fs::write(
         source.join("original-lock-dropped"),
         "actual native output guard transferred",

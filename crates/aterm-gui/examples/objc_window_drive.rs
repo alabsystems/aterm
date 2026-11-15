@@ -27,7 +27,14 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(macos::rename_reentry_parent() as u8);
     }
     if std::env::var_os(macos::RENAME_REENTRY_CHILD_ENV).is_some() {
-        return std::process::ExitCode::from(aterm_gui::run_rename_reentry_drive() as u8);
+        return std::process::ExitCode::from(aterm_gui::run_rename_reentry_drive(
+            aterm_gui::AppActivation::Accessory,
+        ) as u8);
+    }
+    if std::env::var_os(macos::RENAME_UNFOCUSED_CHILD_ENV).is_some() {
+        return std::process::ExitCode::from(aterm_gui::run_rename_reentry_drive(
+            aterm_gui::AppActivation::Prohibited,
+        ) as u8);
     }
     if std::env::var_os(macos::TERMINATE_REENTRY_CHILD_ENV).is_some() {
         return std::process::ExitCode::from(macos::terminate_reentry_child() as u8);
@@ -63,7 +70,9 @@ mod macos {
     use aterm_window::application::ApplicationHandler;
     use aterm_window::event::WindowEvent;
     use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
-    use aterm_window::platform::macos::{EventLoopExtMacOS as _, MonitorHandleExtMacOS};
+    use aterm_window::platform::macos::{
+        EventLoopExtMacOS as _, MonitorHandleExtMacOS, WindowExtMacOS as _,
+    };
     use aterm_window::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
     use aterm_window::window::{Theme, Window, WindowId};
 
@@ -129,6 +138,8 @@ mod macos {
     pub const RENAME_REENTRY_PARENT_ENV: &str = "ATERM_OBJC_WINDOW_RENAME_REENTRY_PARENT";
     /// Re-executes the real Rename This Mac field editor inside production `run_app`.
     pub const RENAME_REENTRY_CHILD_ENV: &str = "ATERM_OBJC_WINDOW_RENAME_REENTRY_CHILD";
+    /// Prohibits native activation to exercise the rename drive's missing-focus result.
+    pub const RENAME_UNFOCUSED_CHILD_ENV: &str = "ATERM_OBJC_WINDOW_RENAME_UNFOCUSED_CHILD";
     /// A whole-child hang detector covering startup and inner waits, not a latency budget.
     const CHILD_WATCHDOG: Duration = Duration::from_secs(60);
     /// Lets a deferred-handler child fail with its own diagnostic before the parent watchdog.
@@ -1281,6 +1292,33 @@ mod macos {
         }
     }
 
+    fn application_active() -> bool {
+        // SAFETY: `+sharedApplication` is `@@:` and returns the live NSApplication;
+        // `-isActive` is `B@:`. The driver calls this only on AppKit's main thread.
+        unsafe {
+            let shared: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            let app = shared(class(c"NSApplication").as_id(), sel!(sharedApplication));
+            let read: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = checked_msg();
+            read(app, sel!(isActive)).as_bool()
+        }
+    }
+
+    fn previous_application() -> Option<Obj> {
+        // SAFETY: NSWorkspace's singleton and frontmostApplication are `@@:`; the latter
+        // returns an NSRunningApplication retained here across event-loop turns. Its
+        // processIdentifier is `pid_t` (`i32`), not NSInteger.
+        unsafe {
+            let read: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+            let workspace = read(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
+            let running = Obj::retain(read(workspace, sel!(frontmostApplication)))?;
+            let pid: unsafe extern "C-unwind" fn(Id, Sel) -> i32 = checked_msg();
+            u32::try_from(pid(running.id(), sel!(processIdentifier)))
+                .ok()
+                .filter(|pid| *pid != 0 && *pid != std::process::id())
+                .map(|_| running)
+        }
+    }
+
     struct Driver {
         window: Option<Window>,
         /// A permanently hidden Winit window whose view isolates the modal redraw probe from
@@ -1292,6 +1330,13 @@ mod macos {
         resized: usize,
         moved: usize,
         focused: Vec<bool>,
+        /// The key-window control must be observed after AppKit can deliver activation.
+        passive_probe_pending: bool,
+        /// The passive probe stays alive while AppKit finishes deactivating its application.
+        passive_other: Option<Window>,
+        /// Keep the completed probe alive so the exit observer covers its native close too.
+        passive_completed: Option<Window>,
+        previous_application: Option<Obj>,
         close_requested: usize,
         hovered: Vec<String>,
         /// Key-up events that came back through the swizzled `-sendEvent:`.
@@ -1428,6 +1473,28 @@ mod macos {
             if self.done {
                 return;
             }
+            if self.passive_probe_pending {
+                if !self.w().has_focus() {
+                    // Activation can finish only after the handler returns to AppKit. The
+                    // outer one-minute detector bounds a missing control observation.
+                    return;
+                }
+                self.passive_probe_pending = false;
+                self.stage_passive_order_and_key(el);
+            }
+            if self.passive_other.is_some() {
+                let previous_active = self.previous_application.as_ref().is_some_and(|previous| {
+                    // SAFETY: the retained object is an NSRunningApplication; isActive is B@:.
+                    unsafe {
+                        let active: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = checked_msg();
+                        active(previous.id(), sel!(isActive)).as_bool()
+                    }
+                });
+                if application_active() || !previous_active {
+                    return;
+                }
+                self.finish_passive_order_and_key();
+            }
             if self.stage == 15 && self.proxy_events.len() < 2 {
                 // The survivor's real send must wake and drain the loop. The
                 // outer one-minute budget detects a missing delivery.
@@ -1447,7 +1514,11 @@ mod macos {
                 2 => self.stage_style_mask(ns),
                 3 => self.stage_geometry(),
                 4 => self.stage_size_limits(),
-                5 => self.stage_visibility_and_focus(),
+                5 => {
+                    self.stage_visibility_and_focus();
+                    self.passive_probe_pending = true;
+                    self.w().focus_window();
+                }
                 6 => self.stage_theme(),
                 7 => self.stage_drag_and_drop(delegate),
                 8 => self.stage_close(delegate, ns),
@@ -1658,6 +1729,117 @@ mod macos {
             self.w().set_visible(true);
             self.report
                 .note(&format!("Focused events so far: {:?}", self.focused));
+        }
+
+        /// A second real window may become visible and ordered without taking the first
+        /// window's keyboard. Key selection is separate, and neither operation activates an
+        /// inactive application.
+        fn stage_passive_order_and_key(&mut self, el: &ActiveEventLoop) {
+            println!("\n[5a] passive ordering and explicit key selection");
+            self.w().focus_window();
+            if !self.w().has_focus() {
+                self.report.blocked = Some(
+                    "the passive-ordering control could not make its original window key".into(),
+                );
+                return;
+            }
+            let other = match el.create_window(
+                Window::default_attributes()
+                    .with_title("objc-window-drive passive-order probe")
+                    .with_inner_size(aterm_window::dpi::LogicalSize::new(160.0, 100.0))
+                    .with_visible(false),
+            ) {
+                Ok(window) => window,
+                Err(error) => {
+                    self.report.blocked = Some(format!(
+                        "the passive-ordering window could not be created: {error}"
+                    ));
+                    return;
+                }
+            };
+            self.report.check(
+                other.is_visible() == Some(false) && self.w().has_focus(),
+                "creating the hidden probe keeps the original window key",
+            );
+            other.make_key();
+            self.report.check(
+                other.is_visible() == Some(false) && self.w().has_focus() && !other.has_focus(),
+                "make_key leaves a hidden window hidden and preserves the key window",
+            );
+            other.order_front();
+            self.report.check(
+                other.is_visible() == Some(true) && self.w().has_focus() && !other.has_focus(),
+                "order_front reveals the probe without taking the original window's keyboard",
+            );
+            other.make_key();
+            self.report.check(
+                other.has_focus() && !self.w().has_focus(),
+                "make_key selects the already-visible probe",
+            );
+            self.w().make_key();
+            self.report.check(
+                self.w().has_focus(),
+                "make_key selects the original window again",
+            );
+            // The ordinary API deliberately keys a visible window. This positive control
+            // makes a regression back to set_visible(true) observable above.
+            other.set_visible(true);
+            self.report.check(
+                other.has_focus() && !self.w().has_focus(),
+                "CONTROL: ordinary set_visible(true) takes the probe's keyboard",
+            );
+            self.w().make_key();
+            other.set_visible(false);
+
+            let Some(previous) = &self.previous_application else {
+                self.report.blocked =
+                    Some("no other foreground app was observed before the drive".into());
+                return;
+            };
+            // SAFETY: the live NSApplication's `respondsToSelector:` is `B@::` and its
+            // yieldActivationToApplication: is `v@:@` where present (macOS 14+). The retained
+            // NSRunningApplication's activateWithOptions: is `B@:Q`. This restores the app
+            // observed before the drive, without opening or closing any of its windows.
+            let accepted = unsafe {
+                let shared: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
+                let app = shared(class(c"NSApplication").as_id(), sel!(sharedApplication));
+                let responds: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Bool = checked_msg();
+                if responds(
+                    app,
+                    sel!(respondsToSelector:),
+                    sel!(yieldActivationToApplication:),
+                )
+                .as_bool()
+                {
+                    let yield_to: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
+                    yield_to(app, sel!(yieldActivationToApplication:), previous.id());
+                }
+                let activate: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Bool = checked_msg();
+                activate(previous.id(), sel!(activateWithOptions:), 0).as_bool()
+            };
+            if !accepted {
+                self.report.blocked =
+                    Some("the previous foreground app refused cooperative activation".into());
+                return;
+            }
+            self.passive_other = Some(other);
+        }
+
+        fn finish_passive_order_and_key(&mut self) {
+            let other = self.passive_other.take().expect("the inactive-app probe");
+            other.order_front();
+            self.report.check(
+                other.is_visible() == Some(true) && !application_active(),
+                "order_front shows a window without activating an inactive application",
+            );
+            other.make_key();
+            self.report.check(
+                !application_active(),
+                "make_key does not activate an inactive application",
+            );
+            other.set_visible(false);
+            self.passive_completed = Some(other);
+            self.w().focus_window();
         }
 
         /// `+appearanceNamed:`, `-setAppearance:`, `-appearance` and
@@ -2565,9 +2747,9 @@ mod macos {
                 ));
             }
             self.report.check(
-                own_at_exit == 2,
+                own_at_exit == 3,
                 &format!(
-                    "the primary and hidden redraw-probe windows were both live at exit \
+                    "the primary, redraw-probe and passive-probe windows were all live at exit \
                      ({own_at_exit} own windows in {:?})",
                     self.windows_at_exit
                 ),
@@ -2616,6 +2798,8 @@ mod macos {
         };
         let mut child = match aterm_uds::spawnfd::command(exe)
             .env_remove(RENAME_REENTRY_PARENT_ENV)
+            .env_remove(RENAME_REENTRY_CHILD_ENV)
+            .env_remove(RENAME_UNFOCUSED_CHILD_ENV)
             .env(mode_env, "1")
             .stdout(aterm_uds::spawnfd::Stdio::piped())
             .stderr(aterm_uds::spawnfd::Stdio::piped())
@@ -2837,6 +3021,33 @@ mod macos {
 
     fn judge_rename_reentry(report: &mut Report) {
         println!("\n[15g] real Rename This Mac field editor inside production run_app");
+        match run_child(RENAME_UNFOCUSED_CHILD_ENV) {
+            ChildOutcome::Exited(status, stdout, stderr)
+                if status.code() == Some(NOT_RUN) && !stderr.contains("rename-focus:") =>
+            {
+                report.blocked = Some(format!(
+                    "the unfocused rename fixture could not reach its native focus check: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ));
+            }
+            ChildOutcome::Exited(status, _, stderr) => report.check(
+                status.code() == Some(NOT_RUN) && stderr.contains("rename-focus: active=0"),
+                &format!(
+                    "prohibited native activation returns NOT RUN, never PASS: {}",
+                    stderr.trim()
+                ),
+            ),
+            ChildOutcome::Hung(stdout, stderr) => report.check(
+                false,
+                &format!(
+                    "the unfocused rename fixture hung: {}",
+                    child_diagnostic(&stdout, &stderr)
+                ),
+            ),
+            ChildOutcome::CouldNotSpawn(why) => {
+                report.blocked = Some(format!("the unfocused rename fixture could not run: {why}"));
+            }
+        }
         match run_child(RENAME_REENTRY_CHILD_ENV) {
             ChildOutcome::Exited(status, stdout, stderr) if status.success() => {
                 report.check(
@@ -3431,6 +3642,7 @@ mod macos {
             eprintln!("objc-window-drive: NOT RUN — {why}");
             return NOT_RUN;
         }
+        let previous_application = autoreleasepool(|_| previous_application());
         let mut el = match aterm_gui::quiet_driver_event_loop_builder::<u8>().build() {
             Ok(el) => el,
             Err(e) => {
@@ -3447,6 +3659,10 @@ mod macos {
             resized: 0,
             moved: 0,
             focused: Vec::new(),
+            passive_probe_pending: false,
+            passive_other: None,
+            passive_completed: None,
+            previous_application,
             close_requested: 0,
             hovered: Vec::new(),
             key_ups: 0,
@@ -3542,9 +3758,11 @@ mod macos {
         drop(driver.window.take());
         drop(driver.redraw_probe.take());
 
-        if let Some(why) = driver.report.blocked {
+        if let Some(why) = &driver.report.blocked {
             eprintln!("objc-window-drive: NOT RUN — {why}");
-            return NOT_RUN;
+            if driver.report.findings.is_empty() {
+                return NOT_RUN;
+            }
         }
         println!("\n=== VERDICT ===");
         println!("  {} stage(s) ran", driver.report.ran);

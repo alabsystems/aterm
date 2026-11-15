@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use aterm_agent::harness::footer::{FactKind, FactMask};
-use aterm_agent::harness::outlook::Figure;
+use aterm_agent::harness::outlook::{Figure, Why};
 use aterm_agent::harness::profile::{WEEKLY_OUT, WeeklyFigure, WeeklyGap};
 use aterm_agent::harness::session_usage::{TrafficView, runtime_short, tokens_short};
 
@@ -131,7 +131,7 @@ pub(crate) struct AccountMenuRow {
     pub(crate) name: String,
     /// What the row stands at, apart from its name: what is left of its week (`61% left`, an
     /// older reading's upper bound `≤61% left`, a wall's `out`), or why it has none (`signed
-    /// out`, `not signed in`, `not read`); never a bare percentage.
+    /// out`, `not read`), in line E's words; never a bare percentage and never a mark.
     pub(crate) trail: String,
     /// What a screen reader is told of it (`m27@example.com, at most 61 percent left, this
     /// tab's account`).
@@ -143,7 +143,7 @@ pub(crate) struct AccountMenuRow {
 }
 
 /// Whether `figure` says the week is spent: a wall, or a reading of 100% (now or before), which
-/// an account row says as limited.
+/// an account row with a login here says as `out` or `0% left`.
 fn spent(figure: Figure) -> bool {
     matches!(
         figure,
@@ -807,15 +807,19 @@ thread_local! {
 }
 
 /// What one read of a CLI's pool holds, off the event-loop thread: its bound roster, its judged
-/// state, the rows whose login is made on this Mac, and the store they came from. The pool's
-/// rows ([`Self::rows`]) and the account's card ([`crate::account_menu_read`]) are both built
-/// from this one read, so they never disagree about a row.
+/// state, the rows whose login is made on this Mac, the row whose sign-in runs on this Mac now,
+/// and the store they came from. The pool's rows ([`Self::rows`]) and the account's card
+/// ([`crate::account_menu_read`]) are both built from this one read, so they never disagree
+/// about a row.
 pub(crate) struct PoolRead {
     pub(crate) cli: aterm_agent::harness::accounts::Cli,
     pub(crate) store: aterm_agent::harness::accounts::Store,
     pub(crate) roster: aterm_agent::harness::accounts::Roster,
     pub(crate) state: aterm_agent::harness::accounts::State,
     pub(crate) enrolled: std::collections::BTreeSet<String>,
+    /// The label of the row whose sign-in runs on this Mac now
+    /// ([`aterm_agent::harness::accounts::Store::signing_in`]), read once with the rest.
+    pub(crate) signing_in: Option<String>,
 }
 
 impl PoolRead {
@@ -845,12 +849,14 @@ impl PoolRead {
         } else {
             accounts::enrolled_in(cli, &roster, home.ok_or("account home is unavailable")?)
         };
+        let signing_in = store.signing_in();
         Ok(Self {
             cli,
             store,
             roster,
             state,
             enrolled,
+            signing_in,
         })
     }
 
@@ -868,6 +874,7 @@ impl PoolRead {
             roster,
             state,
             &self.enrolled,
+            self.signing_in.as_deref(),
             cli == accounts::Cli::Claude || cli.renews_headlessly(),
             session_account,
             session_email,
@@ -981,22 +988,24 @@ pub(crate) struct SessionWeek {
 }
 
 /// The Account menu's rows of `roster`, each with its condition and quota and whether it can be
-/// chosen. `auto_login` is whether choosing a row with an email starts its sign-in with nobody at
-/// the page (Claude Code's, and another CLI's whose renewal approves its page headlessly,
-/// `Cli::renews_headlessly`): such
-/// a row that is signed out or not signed in can be chosen, and a screen reader is told that
-/// choosing it signs it in. Where it is
-/// false (Grok Build's, whose background renewal never starts) that row is as one with no email:
-/// it names its condition and cannot be chosen, since a choice would start no sign-in.
+/// chosen. `signing_in` is the label of the row whose sign-in runs on this Mac now
+/// ([`PoolRead::signing_in`]). `auto_login` is whether choosing a row with an email starts its
+/// sign-in with nobody at the page (Claude Code's, and another CLI's whose renewal approves its
+/// page headlessly, `Cli::renews_headlessly`): such a row with no login here (signed out, or
+/// never signed in here) can be chosen, and a screen reader is told that choosing it signs it in
+/// unless its sign-in already runs. Where it is false (Grok Build's, whose background renewal
+/// never starts) that row is as one with no email: it names its condition and cannot be chosen,
+/// since a choice would start no sign-in.
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
-    reason = "menu rows bind the roster, its state and enrolled set, whether rows auto-login, the session's account, email and week, and the clock"
+    reason = "menu rows bind the roster, its state, enrolled set and running sign-in, whether rows auto-login, the session's account, email and week, and the clock"
 )]
 pub(crate) fn account_menu_rows_from(
     roster: &aterm_agent::harness::accounts::Roster,
     state: &aterm_agent::harness::accounts::State,
     enrolled: &std::collections::BTreeSet<String>,
+    signing_in: Option<&str>,
     auto_login: bool,
     session_account: Option<&str>,
     session_email: Option<&str>,
@@ -1081,23 +1090,34 @@ pub(crate) fn account_menu_rows_from(
                 })
         };
         let has_email = auto_login && row.email.is_some();
-        // What the row stands at, the first that holds: a wall is `out`, never a percentage;
-        // `0% left` only where a reading said 100; a login that is gone or was never made
-        // before any figure, which nothing can spend until it is signed in; then the week as
-        // what is left, as the glass says it (`harness::left`).
-        let (trail, said): (String, String) = match (cond, week) {
-            (accounts::Condition::Limited { .. }, _) | (_, Some(Figure::Out)) => {
-                ("out".into(), "out".into())
+        let row_signing_in = signing_in == Some(row.label.as_str());
+        // What the row stands at, by line E's rule for it (`RowOutlook::figure`; its lead's for
+        // this tab's own account), the first that holds: a wall is `out`, never a percentage;
+        // a row with no login here says its login in the figure's place (`Figure::login`:
+        // `signed out`, whether none was made or one ended, or `signing in` while its sign-in
+        // runs on this Mac), whatever was read of its week, a reading of 100 included, since
+        // nothing can spend it until it is signed in, and is heard as line E's speech hears it
+        // (`Figure::spoken`); this tab's own account never says a login, its session being the
+        // evidence that it runs, as line E's lead never does; then the week as what is left, as
+        // the glass says it (`harness::left`: `0% left` only where a reading said 100), and an
+        // unread week as line E says it beside a narrow name (`Why::brief`), which says every
+        // unread week alike (`not read`).
+        let walled =
+            matches!(cond, accounts::Condition::Limited { .. }) || week == Some(Figure::Out);
+        let login = Figure::login(&cond, row_signing_in)
+            .filter(|_| session_label != Some(row.label.as_str()));
+        let (trail, said): (String, String) = match (login, week) {
+            _ if walled => ("out".into(), "out".into()),
+            (Some(login), _) => (login.words(), login.spoken()),
+            (None, Some(figure)) => (figure.words(), figure.spoken()),
+            (None, None) => {
+                let words = Why::NeverRead.brief().to_owned();
+                (words.clone(), words)
             }
-            (_, Some(figure)) if spent(figure) => ("0% left".into(), "0 percent left".into()),
-            (accounts::Condition::SignedOut, _) => ("signed out".into(), "signed out".into()),
-            (accounts::Condition::NotEnrolled, _) => {
-                ("not signed in".into(), "not signed in".into())
-            }
-            (_, Some(figure)) => (figure.words(), figure.spoken()),
-            (_, None) => ("not read".into(), "not read".into()),
         };
+        // A choice of a row whose sign-in already runs starts none: it saves the selection.
         let signs_in = has_email
+            && !row_signing_in
             && matches!(
                 cond,
                 accounts::Condition::SignedOut | accounts::Condition::NotEnrolled

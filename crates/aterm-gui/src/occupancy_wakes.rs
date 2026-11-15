@@ -1892,7 +1892,7 @@ fn why_line(wake: &DeclaredWake, inside: bool, source: Option<&str>) -> String {
 // The product: one host, its sources thread, the verbs as the control server serves them.
 // ---------------------------------------------------------------------------------------------
 
-/// THE PROCESS'S HOST (named apart: the lazy-init census merges cells by name).
+/// THE PROCESS'S HOST.
 #[cfg(not(test))]
 static WAKE_HOST: LazyLock<Arc<WakeHost>> = LazyLock::new(|| Arc::new(WakeHost::default()));
 

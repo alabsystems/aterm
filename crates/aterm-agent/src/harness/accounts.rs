@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use alab_policy::vocab::ResetKind;
 use aterm_json::{Map, Value};
-use aterm_phase::ResetKind;
+use aterm_phase::ResetDrawn;
 
 pub use crate::ai::connector::Cli;
 use crate::ai::connector::{Flow, Region, RowKeys, Seam};
@@ -3164,6 +3165,10 @@ pub enum AttemptOutcome {
     Blocked,
     /// A route signed the row in and its login was bound.
     SignedIn,
+    /// The vault route ([`super::sign_in_ladder::Route::Vault`], the record's route word) found the
+    /// row's year token in use here before any browser or window opened: the row runs on its
+    /// token ([`LoginHere::OnToken`]), and no login was made or bound.
+    OnToken,
 }
 
 impl AttemptOutcome {
@@ -3175,13 +3180,20 @@ impl AttemptOutcome {
             Self::Failed => "failed",
             Self::Blocked => "blocked",
             Self::SignedIn => "signed-in",
+            Self::OnToken => "on-token",
         }
     }
 
     fn parse(word: &str) -> Option<Self> {
-        [Self::NoRoute, Self::Failed, Self::Blocked, Self::SignedIn]
-            .into_iter()
-            .find(|outcome| outcome.as_str() == word)
+        [
+            Self::NoRoute,
+            Self::Failed,
+            Self::Blocked,
+            Self::SignedIn,
+            Self::OnToken,
+        ]
+        .into_iter()
+        .find(|outcome| outcome.as_str() == word)
     }
 
     /// Whether the row is still without a login it can be run on.
@@ -4162,6 +4174,12 @@ pub enum LoginState {
     /// and a check that found no login), or its own credential file here shows it lapsed
     /// ([`State::lapsed_logins`]).
     Expired,
+    /// It is signed out here, and the row runs on its vault token here instead
+    /// ([`on_token_here`]): the token carries its sessions until `until`.
+    OnToken {
+        /// When the token ends (unix seconds).
+        until: i64,
+    },
     /// Its forecast end ([`forecast`]) is within [`DUE_S`].
     Due {
         /// The forecast end.
@@ -4179,6 +4197,7 @@ impl LoginState {
     pub const fn as_str(self) -> &'static str {
         match self {
             LoginState::Expired => "expired",
+            LoginState::OnToken { .. } => LoginHere::ON_TOKEN,
             LoginState::Due { .. } => "due",
             LoginState::Ok => "ok",
             LoginState::Idle => "idle",
@@ -4266,13 +4285,129 @@ pub fn signed_out_here(row: &Row, state: &State) -> bool {
             .is_some_and(|account| account.current_auth(row) == Auth::SignedOut)
 }
 
-/// Computes the [`LoginState`] of `row` at `now` from `logins` and `state`: [`LoginState::Expired`]
-/// exactly where [`signed_out_here`] holds, whatever its records forecast, and otherwise what its
-/// records say (`recorded_login_state`).
+/// How long the upkeep's reading of the rows on their vault token here ([`TokensHere`]) stands:
+/// an hour. An older one says nothing, so a stale reading never keeps a row in rotation.
+pub const TOKENS_HERE_FRESH_S: i64 = 3600;
+
+/// The file in Claude Code's accounts store that keeps [`TokensHere`] between upkeep passes.
+pub const TOKENS_HERE_FILE: &str = "tokens_here.json";
+
+/// The largest [`TOKENS_HERE_FILE`] read.
+#[cfg(unix)]
+const MAX_TOKENS_HERE: usize = 64 * 1024;
+
+/// MACHINE-LOCAL, RUNTIME-ONLY: the rows that run on their vault token on this Mac, as the upkeep
+/// last read them from the vault ([`super::accounts_tokens::rows_on_token_read`]) and kept them in
+/// [`TOKENS_HERE_FILE`] under `accounts.lock` ([`Store::note_tokens_here`]). It is a reading, not
+/// an observation: no transaction saves it, no snapshot publishes it, and [`Store::hydrate_lapsed`]
+/// reads it from that file with no vault read. [`on_token_here`] takes it only while it is fresh
+/// ([`TOKENS_HERE_FRESH_S`]) and only for a token whose end has not passed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TokensHere {
+    /// When the upkeep read the vault (unix seconds).
+    pub read_at: i64,
+    /// Each row on its token here, by label, with when its token ends (unix seconds).
+    pub ends: BTreeMap<String, i64>,
+}
+
+impl TokensHere {
+    #[cfg(unix)]
+    fn to_json(&self) -> String {
+        let mut rows = Map::new();
+        for (label, end) in &self.ends {
+            rows.insert(label.clone(), Value::from(*end));
+        }
+        let mut o = Map::new();
+        o.insert("schema".into(), Value::from(1_u64));
+        o.insert("read_at".into(), Value::from(self.read_at));
+        o.insert("rows".into(), Value::Object(rows));
+        Value::Object(o).to_string()
+    }
+
+    #[cfg(unix)]
+    fn from_json(bytes: &[u8]) -> Option<Self> {
+        let value: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
+        if value.get("schema")?.as_u64()? != 1 {
+            return None;
+        }
+        let read_at = value.get("read_at")?.as_i64()?;
+        let ends = value
+            .get("rows")?
+            .as_object()?
+            .iter()
+            .map(|(label, end)| Some((label.clone(), end.as_i64()?)))
+            .collect::<Option<BTreeMap<_, _>>>()?;
+        Some(Self { read_at, ends })
+    }
+}
+
+/// The [`TokensHere`] kept in `dir`, where [`TOKENS_HERE_FILE`] reads as one. The file is a strict
+/// private file ([`aterm_uds::private_file`]), which only Unix has. Off Unix none is kept, and none
+/// is needed: no launch starts on a vault token there ([`super::token_route::LAUNCHES_ON_TOKEN`]).
+#[cfg(unix)]
+fn kept_tokens_here(dir: &Path) -> Option<TokensHere> {
+    aterm_uds::private_file::read_private(dir, TOKENS_HERE_FILE, MAX_TOKENS_HERE)
+        .ok()
+        .and_then(|bytes| TokensHere::from_json(&bytes))
+}
+
+#[cfg(not(unix))]
+fn kept_tokens_here(_dir: &Path) -> Option<TokensHere> {
+    None
+}
+
+/// Keeps `kept` in `dir` as [`TOKENS_HERE_FILE`], or removes that file for `None`, and returns
+/// whether it changed. Unix only, as [`kept_tokens_here`] says: off Unix nothing changes.
+///
+/// # Errors
+/// The file cannot be written or removed.
+#[cfg(unix)]
+fn keep_tokens_here(dir: &Path, kept: Option<&TokensHere>) -> io::Result<bool> {
+    match kept {
+        None => aterm_uds::private_file::remove_private(dir, TOKENS_HERE_FILE),
+        Some(kept) => {
+            aterm_uds::private_file::write_private(dir, TOKENS_HERE_FILE, kept.to_json().as_bytes())
+                .map(|()| true)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn keep_tokens_here(_dir: &Path, _kept: Option<&TokensHere>) -> io::Result<bool> {
+    Ok(false)
+}
+
+/// When `row`'s vault token ends, where the upkeep's fresh reading ([`State::tokens_here`],
+/// [`TOKENS_HERE_FRESH_S`]) names it as in use on this Mac and that end is after `now`; `None`
+/// where no reading stands, it is older than an hour, it does not name the row, or the token has
+/// ended, and on every host where no launch starts on a token
+/// ([`super::token_route::LAUNCHES_ON_TOKEN`]: the judgment's platform step), whatever a file says.
+#[must_use]
+pub fn on_token_here(row: &Row, state: &State, now: i64) -> Option<i64> {
+    on_token_where(super::token_route::LAUNCHES_ON_TOKEN, row, state, now)
+}
+
+/// [`on_token_here`] on a host where a launch starts on a token (`launches`) or none does.
+fn on_token_where(launches: bool, row: &Row, state: &State, now: i64) -> Option<i64> {
+    if !launches {
+        return None;
+    }
+    let read = state.tokens_here.as_ref()?;
+    if read.read_at > now || now.saturating_sub(read.read_at) > TOKENS_HERE_FRESH_S {
+        return None;
+    }
+    read.ends.get(&row.label).copied().filter(|end| *end > now)
+}
+
+/// Computes the [`LoginState`] of `row` at `now` from `logins` and `state`: where
+/// [`signed_out_here`] holds, [`LoginState::OnToken`] while the row runs on its vault token here
+/// ([`on_token_here`]) and [`LoginState::Expired`] otherwise, whatever its records forecast; and
+/// otherwise what its records say (`recorded_login_state`).
 #[must_use]
 pub fn login_state(row: &Row, logins: &Logins, state: &State, now: i64) -> LoginState {
     if signed_out_here(row, state) {
-        return LoginState::Expired;
+        return on_token_here(row, state, now)
+            .map_or(LoginState::Expired, |until| LoginState::OnToken { until });
     }
     recorded_login_state(row, logins, state, now)
 }
@@ -4534,7 +4669,9 @@ pub fn renew_due(
 /// sign-in rather than a renewal, which a report names with its routes once it fails
 /// ([`failing_sign_ins`]). `enrolled` is the set [`super::accounts_sync::rows_of_other_macs`]
 /// reads, [`enrolled_in`] this Mac's home, so no enrolled row is one of [`renewal_due`]'s
-/// `others`, which have no login here, and none is read.
+/// `others`, which have no login here, and none is read. A row the upkeep's reading names as on
+/// its vault token here ([`on_token_here`]) is not one: renewal is off for it, so the upkeep never
+/// renews it, and the reading is this rule's [`OtherMacs::on_token`] with no vault read.
 #[must_use]
 pub fn due_logins_here(
     roster: &Roster,
@@ -4547,7 +4684,9 @@ pub fn due_logins_here(
         .rows
         .iter()
         .filter(|row| {
-            is_enrolled(row, enrolled) && renewal_due(row, logins, state, &OtherMacs::NONE, now)
+            is_enrolled(row, enrolled)
+                && on_token_here(row, state, now).is_none()
+                && renewal_due(row, logins, state, &OtherMacs::NONE, now)
         })
         .map(|row| row.label.clone())
         .collect()
@@ -4572,6 +4711,7 @@ pub fn none_working_within(
     rows.peek().is_some()
         && rows.all(|row| match login_state(row, logins, state, now) {
             LoginState::Expired => true,
+            LoginState::OnToken { until } => until.saturating_sub(now) <= within,
             _ => login_forecast(row, logins, state)
                 .is_some_and(|by| by.saturating_sub(now) <= within),
         })
@@ -4715,10 +4855,12 @@ fn note_sign_in_attempt_by(
         }
         return Vec::new();
     }
-    let step = if outcome.failing() {
-        SignInStep::Failed
-    } else {
-        SignInStep::SignedIn
+    let step = match outcome {
+        AttemptOutcome::NoRoute | AttemptOutcome::Failed | AttemptOutcome::Blocked => {
+            SignInStep::Failed
+        }
+        AttemptOutcome::SignedIn => SignInStep::SignedIn,
+        AttemptOutcome::OnToken => SignInStep::OnToken,
     };
     let mut event = Event::sign_in(at, label, step);
     event.why = one_line(
@@ -4906,6 +5048,65 @@ pub fn note_signed_back(
         return Vec::new();
     }
     note_checked_sign_in(state, logins, label, at)
+}
+
+/// THE STRIKE THAT RECORDED `label` SIGNED OUT, LIFTED AT `at` ON EVIDENCE ITS OWN BOUND LOGIN
+/// SERVED AFTER IT (a served point, a break's served turn, a usage-tap reading; the caller judges
+/// the evidence): its word reads ok again, and what the strike left is cleared, its login's end
+/// (`ended_at`), the renewal it made due (`sign_in_task`) and a failed or blocked sign-in it led
+/// to, while its service raises `served_at`. No credential changed, so this is no sign-in: the
+/// login's renewal (`renewed_at`), the expiry notice it was given (`notice_end`) and its learned
+/// lifetime stand as they were, and the ledger records the word's return alone (`auth ok`, the
+/// journal's "login observed and serving"), never `signed-in` ([`note_signed_back`], which
+/// stamps a renewal from `at` and drops the notice, so a lift through it pushed the row's expiry
+/// forecast past the real one and taught the next real end a lifetime too short). A word on
+/// record later than `at` stands, and a row not signed out is left as it is (a word of another
+/// login's retired, as [`note_signed_back`] reads it, counts as signed out). Return its events
+/// from the enclosing transaction.
+pub fn note_served_back(
+    state: &mut State,
+    logins: &mut Logins,
+    label: &str,
+    at: i64,
+) -> Vec<Event> {
+    let contextual = state.contextual_auth;
+    if state
+        .accounts
+        .get(label)
+        .is_none_or(|a| a.auth != Auth::SignedOut && (contextual || a.managed_auth_is_current()))
+    {
+        return Vec::new();
+    }
+    auth_scope::retire_changed_context(state, logins, label, false);
+    let mut out = note_auth_in_context(state, logins, label, Auth::Ok, at);
+    let lifted = state.accounts.get(label).is_some_and(|account| {
+        let word = if contextual {
+            account.auth
+        } else {
+            account.managed_auth()
+        };
+        word == Auth::Ok && account.auth_at == Some(at)
+    });
+    if !lifted {
+        return out;
+    }
+    workflow_scope::replace(logins, label);
+    if let Some(binding) = logins.labels.get_mut(label) {
+        binding.ended_at = None;
+        binding.sign_in_task = None;
+        binding.clear_failed_sign_in();
+    }
+    workflow_scope::clear_absent(logins, label);
+    if !contextual {
+        auth_scope::clear_absent_lifetime(logins, label);
+    }
+    if logins.labels.contains_key(label) {
+        note_served_login(logins, label, at);
+    }
+    if !out.iter().any(|event| event.kind == Kind::Auth) {
+        out.push(Event::new(at, Kind::Auth, label).because(Auth::Ok.as_str()));
+    }
+    out
 }
 
 /// Record a verified sign-in, including refreshed metadata on an existing binding.
@@ -5500,6 +5701,7 @@ pub(crate) fn remember_forgotten(state: &mut State, pk: String, mut account: Acc
     account.auth_context = None;
     account.renewal_metadata = false;
     account.served_metadata = false;
+    account.auth_refusal = None;
     account.auth_projection = AuthProjection::Unknown;
     account.pk = Some(pk.clone());
     if let Some(held) = state.forgotten.remove(&pk) {
@@ -5520,6 +5722,7 @@ pub(crate) fn take_observations(account: &mut Account) -> Account {
     account.auth_context.clone_from(&observed.auth_context);
     account.renewal_metadata = observed.renewal_metadata;
     account.served_metadata = observed.served_metadata;
+    account.auth_refusal = observed.auth_refusal;
     account.auth_projection = observed.auth_projection.clone();
     observed
 }
@@ -6072,6 +6275,11 @@ pub struct Account {
     pub renewal_metadata: bool,
     /// A served turn was observed in `auth_context`, rather than inherited.
     pub served_metadata: bool,
+    /// Machine-local: why the issuer refused, for good, the refresh token of the login in
+    /// `auth_context`, as native custody recorded it with that login's settled sign-out
+    /// ([`stage_settled_refusal`]): the one closed word, never the answer. It stands only while
+    /// that sign-out is the word on record; any other auth word noted or staged clears it.
+    pub auth_refusal: Option<super::codex_app_login::RefusalReason>,
     /// Read-only applicability projection; never serialized or compared as persisted state.
     pub auth_projection: AuthProjection,
     /// Machine-local: the latest account-wide clearing ([`pin`], [`note_reading`]).
@@ -6129,6 +6337,7 @@ impl PartialEq for Account {
             && self.auth_context == other.auth_context
             && self.renewal_metadata == other.renewal_metadata
             && self.served_metadata == other.served_metadata
+            && self.auth_refusal == other.auth_refusal
             && self.cleared_at == other.cleared_at
             && self.room_at == other.room_at
             && self.ran_at == other.ran_at
@@ -6209,6 +6418,7 @@ impl Account {
         self.auth_context = None;
         self.renewal_metadata = false;
         self.served_metadata = false;
+        self.auth_refusal = None;
         if !matches!(self.auth_projection, AuthProjection::Legacy) {
             self.auth_projection = AuthProjection::Unknown;
         }
@@ -6235,6 +6445,22 @@ impl Account {
             }
             AuthProjection::Unknown | AuthProjection::Current(_) => Auth::Unseen,
         }
+    }
+
+    /// Why native custody recorded this login's refresh token refused for good
+    /// ([`Self::auth_refusal`]), only while its settled sign-out is the word on record for the
+    /// login `row` routes to as `credential` names it now: the retained context is of that row
+    /// and of those credentials. `None` under any other word, context, row or credentials.
+    #[must_use]
+    pub(crate) fn settled_refusal_in(
+        &self,
+        row: &Row,
+        credential: &super::codex_app_login::CredentialContext,
+    ) -> Option<super::codex_app_login::RefusalReason> {
+        let context = self.auth_context.as_ref()?;
+        (self.auth == Auth::SignedOut && context.matches_row(row) && context.uses(credential))
+            .then_some(self.auth_refusal)
+            .flatten()
     }
 
     /// Returns whether a reading at `at` comes before the end of the [`KEY_ADOPT_S`] grace that
@@ -6869,6 +7095,12 @@ pub struct State {
     /// [`login_state`] [`LoginState::Expired`]; not an observation, history or policy.
     #[doc(hidden)]
     pub lapsed_logins: BTreeSet<String>,
+    /// Runtime local read: the rows on their vault token here, as the upkeep last read the vault
+    /// ([`TokensHere`], [`Store::hydrate_lapsed`]), which [`on_token_here`] reads, so a row
+    /// [`signed_out_here`] holds of is [`LoginHere::OnToken`] rather than signed out; not an
+    /// observation, history or policy.
+    #[doc(hidden)]
+    pub tokens_here: Option<TokensHere>,
     /// Machine-local: the one account this home runs on.
     pub active: Option<String>,
     /// Machine-local: the account `active` was before the last rotation or pin ([`strike`]).
@@ -6940,7 +7172,8 @@ pub struct State {
 
 impl Eq for State {}
 
-/// Every field but the runtime scope (`contextual_auth`, `excluded_accounts`, `lapsed_logins`):
+/// Every field but the runtime scope (`contextual_auth`, `excluded_accounts`, `lapsed_logins`,
+/// `tokens_here`):
 /// a transaction saves its state only when this says it changed. The pattern names each field,
 /// so a new one is compared or skipped by a decision here, never left out of a save unseen.
 impl PartialEq for State {
@@ -6953,6 +7186,7 @@ impl PartialEq for State {
             contextual_auth: _,
             excluded_accounts: _,
             lapsed_logins: _,
+            tokens_here: _,
             active,
             previous,
             previous_proven,
@@ -7017,6 +7251,7 @@ impl Default for State {
             contextual_auth: false,
             excluded_accounts: BTreeSet::new(),
             lapsed_logins: BTreeSet::new(),
+            tokens_here: None,
             active: None,
             previous: None,
             previous_proven: false,
@@ -7289,6 +7524,9 @@ fn account_json(a: &Account) -> Value {
             Value::from(a.renewal_metadata),
         );
         o.insert("served_metadata".to_owned(), Value::from(a.served_metadata));
+        if let Some(reason) = a.auth_refusal {
+            o.insert("auth_refusal".to_owned(), Value::from(reason.code()));
+        }
     }
     o.insert("cleared_at".to_owned(), Value::from(a.cleared_at));
     o.insert("room_at".to_owned(), Value::from(a.room_at));
@@ -7487,6 +7725,20 @@ fn account_of(v: &Value, now: i64) -> Account {
         && v.get("served_metadata")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+    let auth = v
+        .get("auth")
+        .and_then(Value::as_str)
+        .map_or(Auth::Unseen, Auth::parse);
+    // The reason is of the settled sign-out in `auth_context` alone, and one closed word: under
+    // any other word, with no context, or spelled as no reason's own code, none is on record.
+    let auth_refusal = v
+        .get("auth_refusal")
+        .and_then(Value::as_str)
+        .filter(|_| auth == Auth::SignedOut && auth_context.is_some())
+        .and_then(|word| {
+            Some(super::codex_app_login::RefusalReason::of_code(word))
+                .filter(|reason| reason.code() == word)
+        });
     Account {
         key: v
             .get("key")
@@ -7507,10 +7759,7 @@ fn account_of(v: &Value, now: i64) -> Account {
             .and_then(SampleContext::parse),
         before: v.get("before").and_then(|s| sample_of(s, cap)),
         offer: v.get("offer").and_then(|o| offer_of(o, cap)),
-        auth: v
-            .get("auth")
-            .and_then(Value::as_str)
-            .map_or(Auth::Unseen, Auth::parse),
+        auth,
         auth_at: stamp(v.get("auth_at"), now),
         auth_scope: ManagedScope::from_retired(
             v.get("auth_retired")
@@ -7519,6 +7768,7 @@ fn account_of(v: &Value, now: i64) -> Account {
         auth_context,
         renewal_metadata,
         served_metadata,
+        auth_refusal,
         auth_projection: AuthProjection::Legacy,
         cleared_at: stamp(v.get("cleared_at"), now),
         room_at: stamp(v.get("room_at"), now),
@@ -8123,6 +8373,7 @@ impl State {
             contextual_auth: false,
             excluded_accounts: BTreeSet::new(),
             lapsed_logins: BTreeSet::new(),
+            tokens_here: None,
             active: label(doc.get("active")),
             previous: label(doc.get("previous")),
             previous_proven: doc
@@ -8394,6 +8645,9 @@ pub enum LoginHere {
     NotMade,
     /// One was made and is signed out here ([`signed_out_here`]).
     SignedOut,
+    /// One was made and is signed out here, and the row runs on its vault token here instead
+    /// ([`on_token_here`]): a session runs on it, so rotation can pick it.
+    OnToken,
     /// One is here and is not signed out.
     In,
 }
@@ -8402,22 +8656,32 @@ impl LoginHere {
     /// What every report says of a row with no login to run on here, whichever way it has none.
     pub const SIGNED_OUT: &'static str = "signed-out";
 
-    /// Whether a login is here and is not signed out.
+    /// What every report says of a row whose stored login is signed out here while it runs on its
+    /// vault token ([`LoginHere::OnToken`], [`LoginState::OnToken`]).
+    pub const ON_TOKEN: &'static str = "on-token";
+
+    /// Whether a session can run on the row here: a login is here and is not signed out, or the
+    /// row runs on its vault token.
     #[must_use]
     pub const fn signed_in(self) -> bool {
-        matches!(self, LoginHere::In)
+        matches!(self, LoginHere::In | LoginHere::OnToken)
     }
 }
 
-/// [`LoginHere`] of `row` given `state` and whether its login is `enrolled` (made on this
-/// machine): a lapsed credential file reads signed out whatever its records say
-/// ([`signed_out_here`]).
+/// [`LoginHere`] of `row` given `state`, whether its login is `enrolled` (made on this machine)
+/// and `now`: a lapsed credential file reads signed out whatever its records say
+/// ([`signed_out_here`]), unless the upkeep's fresh reading names the row as on its vault token
+/// here ([`on_token_here`]).
 #[must_use]
-pub fn login_here(row: &Row, state: &State, enrolled: bool) -> LoginHere {
+pub fn login_here(row: &Row, state: &State, enrolled: bool, now: i64) -> LoginHere {
     if !enrolled {
         LoginHere::NotMade
     } else if signed_out_here(row, state) {
-        LoginHere::SignedOut
+        if on_token_here(row, state, now).is_some() {
+            LoginHere::OnToken
+        } else {
+            LoginHere::SignedOut
+        }
     } else {
         LoginHere::In
     }
@@ -8426,13 +8690,15 @@ pub fn login_here(row: &Row, state: &State, enrolled: bool) -> LoginHere {
 /// Computes the [`Condition`] of `row` at `now` given `state` and whether its login is `enrolled`:
 /// a row with no login to run on here ([`login_here`]) is [`Condition::NotEnrolled`] or
 /// [`Condition::SignedOut`] (the rule [`login_state`] reads as [`LoginState::Expired`]), a lapsed
-/// credential file whatever its records say, so no launch picks it.
+/// credential file whatever its records say, so no launch picks it. A row on its vault token here
+/// ([`LoginHere::OnToken`]) runs: its walls, its low windows and the claims ring judge it as they
+/// judge a signed-in row.
 #[must_use]
 pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Condition {
-    match login_here(row, state, enrolled) {
+    match login_here(row, state, enrolled, now) {
         LoginHere::NotMade => return Condition::NotEnrolled,
         LoginHere::SignedOut => return Condition::SignedOut,
-        LoginHere::In => {}
+        LoginHere::OnToken | LoginHere::In => {}
     }
     let Some(account) = state.accounts.get(&row.label) else {
         return Condition::Unseen;
@@ -8456,6 +8722,21 @@ pub fn condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Conditio
     } else {
         Condition::Unseen
     }
+}
+
+/// [`condition`] as `row`'s stored login alone reads it: a row on its vault token here
+/// ([`LoginHere::OnToken`]) is [`Condition::SignedOut`], as it was before the token put it in
+/// rotation. For a reader the token never serves or must not hide: a one-shot review
+/// (`claude -p --output-format text` is no session-starting shape, so
+/// [`super::token_route::shape_refusal`] runs it on the stored login), and the renewal ranking,
+/// which turns renewal off for a row on its token only by the live read
+/// ([`OtherMacs::on_token`]), never by a reading kept across a vault it could not read.
+#[must_use]
+pub fn stored_login_condition(row: &Row, state: &State, enrolled: bool, now: i64) -> Condition {
+    if login_here(row, state, enrolled, now) == LoginHere::OnToken {
+        return Condition::SignedOut;
+    }
+    condition(row, state, enrolled, now)
 }
 
 /// Returns the labels of accounts in [`Condition::SignedOut`] in roster order.
@@ -9220,6 +9501,77 @@ pub fn launch_row<'a>(
         })
 }
 
+impl State {
+    /// Takes `label` out of this copy's reading of the rows on their vault token
+    /// ([`State::tokens_here`]), so its signed-out login reads [`LoginHere::SignedOut`] again and
+    /// a pick refuses it ([`WhyNot::SignedOut`]): what [`token_guarded`] does to a row whose token
+    /// the launch's judgment would not serve. A runtime edit of a selection's working copy; no
+    /// store is written.
+    pub fn refuse_token(&mut self, label: &str) {
+        if let Some(read) = self.tokens_here.as_mut() {
+            read.ends.remove(label);
+        }
+    }
+}
+
+/// THE LAUNCH-TIME TOKEN GUARD's question: whether a launch must not start on `row`, whose login
+/// here is signed out ([`signed_out_here`]) and which only the upkeep's reading of the vault puts
+/// in rotation ([`LoginHere::OnToken`]), because `serves` (the token judgment at launch, one vault
+/// read: [`super::token_route::row_token_serves`]) says its token would not serve it. Such a
+/// launch would fall back to the row's lapsed stored login and start a session on a dead login.
+/// `serves` is asked only of such a row.
+pub fn token_pick_refused(
+    row: &Row,
+    state: &State,
+    enrolled: bool,
+    now: i64,
+    serves: &mut dyn FnMut(&Row) -> bool,
+) -> bool {
+    login_here(row, state, enrolled, now) == LoginHere::OnToken && !serves(row)
+}
+
+/// THE LAUNCH-TIME TOKEN GUARD: the row `pick` takes from `state`, where a row it takes that
+/// runs here only on its vault token ([`LoginHere::OnToken`]) is one `serves` says the token
+/// judgment would serve; a row it would not is refused ([`State::refuse_token`], so it reads
+/// [`WhyNot::SignedOut`]) and `pick` asked again of that copy. Where `pick` takes none, the launch
+/// stays on `stays` (a worker on its starter's row, [`claude_worker_move`]), which is judged the
+/// same way: where only its token keeps it running and `serves` says no, it is refused and `pick`
+/// asked again, so the launch leaves it as it leaves any signed-out row rather than stay on its
+/// lapsed stored login. A stale reading costs one judgment per row it names, never a session on a
+/// dead login. `enrolled` holds the rows whose login is made here; `None` where the launch takes
+/// no other row.
+pub fn token_guarded<'a>(
+    roster: &'a Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    now: i64,
+    serves: &mut dyn FnMut(&Row) -> bool,
+    stays: Option<&Row>,
+    mut pick: impl FnMut(&State) -> Option<&'a Row>,
+) -> Option<&'a Row> {
+    let mut working: Option<State> = None;
+    // Each refusal takes one row of the roster out of the reading, so this ends within the
+    // roster's length.
+    for _ in 0..=roster.rows.len() {
+        let current = working.as_ref().unwrap_or(state);
+        let refused = match pick(current) {
+            Some(row)
+                if token_pick_refused(row, current, is_enrolled(row, enrolled), now, serves) =>
+            {
+                row
+            }
+            Some(row) => return Some(row),
+            None => stays.filter(|row| {
+                token_pick_refused(row, current, is_enrolled(row, enrolled), now, serves)
+            })?,
+        };
+        working
+            .get_or_insert_with(|| state.clone())
+            .refuse_token(&refused.label);
+    }
+    None
+}
+
 /// Whether a Claude Code worker whose starter runs as `who` may leave its starter's row: rotation
 /// is on, and `who` is this machine's own stored login or its row's vault token. The launcher asks this before it reads
 /// any record, so a launch under `Off` reads none.
@@ -9236,28 +9588,34 @@ pub fn claude_worker_may_move(mode: Mode, who: &ProcessLogin) -> bool {
 
 /// The row a Claude Code worker's starter runs on and the row the worker starts on, where it
 /// moves at all: [`claude_worker_may_move`], the roster lists several, and [`worker_row`] moves
-/// it. The starter's row is the one its `login` reconciles to ([`reconcile`]): the account its
-/// login file names, never the row its environment alone suggests, so a plain start in a home
-/// that holds another account's login is judged as that account, and as no row where no row
-/// lists it. The rows judged enrolled are corrected the same way
-/// ([`super::observe::Login::enrolled`]). This is the one rule the task launcher follows and a
-/// survey and the report state, so what they say a launch would start on cannot drift from what
-/// the launch does.
+/// it, under the launch-time token guard ([`token_guarded`], `serves` its judgment): a row only
+/// its vault token puts in rotation takes the worker only where `serves` says the token would
+/// serve it, and a starter's row only its token keeps running is left where `serves` says no, so
+/// the worker never starts on a lapsed stored login. The starter's row is the one its `login`
+/// reconciles to ([`reconcile`]): the account its login file names, never the row its
+/// environment alone suggests, so a plain start in a home that holds another account's login is
+/// judged as that account, and as no row where no row lists it. The rows judged enrolled are
+/// corrected the same way ([`super::observe::Login::enrolled`]). This is the one rule the task
+/// launcher follows and a survey and the report state, so what they say a launch would start on
+/// cannot drift from what the launch does.
 #[must_use]
 pub fn claude_worker_move<'a>(
     roster: &'a Roster,
     state: &State,
     enrolled: &BTreeSet<String>,
     login: &super::observe::Login,
-    mode: Mode,
-    now: i64,
+    (mode, now): (Mode, i64),
+    serves: &mut dyn FnMut(&Row) -> bool,
 ) -> Option<(&'a Row, &'a Row)> {
     if !claude_worker_may_move(mode, &login.who) || !roster.several() {
         return None;
     }
     let from = login.reconciled(roster).row()?;
     let enrolled = login.enrolled(roster, enrolled);
-    worker_row(roster, state, &enrolled, &from.label, mode, now).map(|row| (from, row))
+    token_guarded(roster, state, &enrolled, now, serves, Some(from), |state| {
+        worker_row(roster, state, &enrolled, &from.label, mode, now)
+    })
+    .map(|row| (from, row))
 }
 
 /// The row a Claude Code worker spawned from a tab on the row `from` starts under, where that is
@@ -9770,6 +10128,9 @@ pub enum SignInStep {
     SignedIn,
     /// It ended with no login bound.
     Failed,
+    /// No browser or window opened: the row's year token is in use here
+    /// ([`AttemptOutcome::OnToken`]).
+    OnToken,
 }
 
 impl SignInStep {
@@ -9781,13 +10142,20 @@ impl SignInStep {
             Self::Window => "window",
             Self::SignedIn => "signed-in",
             Self::Failed => "failed",
+            Self::OnToken => "on-token",
         }
     }
 
     fn parse(word: &str) -> Option<Self> {
-        [Self::Begun, Self::Window, Self::SignedIn, Self::Failed]
-            .into_iter()
-            .find(|step| step.as_str() == word)
+        [
+            Self::Begun,
+            Self::Window,
+            Self::SignedIn,
+            Self::Failed,
+            Self::OnToken,
+        ]
+        .into_iter()
+        .find(|step| step.as_str() == word)
     }
 }
 
@@ -9814,6 +10182,12 @@ pub struct Event {
     /// On a [`Kind::SignIn`] row, how its sign-in stands ([`Event::sign_in`]); a row written
     /// before rows stated it holds none.
     pub step: Option<SignInStep>,
+    /// On a [`Kind::ResetUsed`] or [`Kind::Reset`] row, the windows the reset refilled, by the
+    /// vendor's limit type ([`SESSION_LIMIT`], [`WEEK_LIMIT`], a model's week): the claim's
+    /// window, both windows for a full reset, a window that refilled inside itself. Empty where
+    /// it refilled none ([`ResetDone::Walled`]: a reset spent and the limit still standing) and on
+    /// a row written before rows stated them ([`Event::refilling`]).
+    pub refilled: Vec<String>,
 }
 
 impl Event {
@@ -9830,6 +10204,7 @@ impl Event {
             pk: None,
             workflow: None,
             step: None,
+            refilled: Vec::new(),
         }
     }
 
@@ -9854,6 +10229,13 @@ impl Event {
     #[must_use]
     pub fn with_sid(mut self, sid: &str) -> Event {
         self.sid = Some(one_line(sid, WORD_MAX)).filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Sets the windows a reset refilled ([`Event::refilled`], [`refilled_of`]).
+    #[must_use]
+    pub fn refilling<'w>(mut self, windows: impl IntoIterator<Item = &'w str>) -> Event {
+        self.refilled = refilled_of(windows);
         self
     }
 
@@ -9931,6 +10313,18 @@ impl Event {
         if let Some(step) = self.step.filter(|_| self.kind == Kind::SignIn) {
             o.insert("step".into(), Value::from(step.as_str()));
         }
+        if !self.refilled.is_empty() {
+            o.insert(
+                "refilled".into(),
+                Value::Array(
+                    self.refilled
+                        .iter()
+                        .take(REFILLED_MAX)
+                        .map(|w| Value::from(one_line(w, WORD_MAX)))
+                        .collect(),
+                ),
+            );
+        }
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
@@ -9961,8 +10355,35 @@ impl Event {
                 .get("step")
                 .and_then(Value::as_str)
                 .and_then(SignInStep::parse),
+            refilled: refilled_of(
+                doc.get("refilled")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str),
+            ),
         })
     }
+}
+
+/// The most windows one reset row names ([`Event::refilled`]): the five-hour window, the week
+/// and the model weeks a claim can be at.
+pub const REFILLED_MAX: usize = 4;
+
+/// `windows` as a reset row keeps them ([`Event::refilled`]): each a bounded word, none empty,
+/// once each, at most [`REFILLED_MAX`].
+fn refilled_of<'w>(windows: impl IntoIterator<Item = &'w str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for window in windows {
+        let window = one_line(window, WORD_MAX);
+        if out.len() == REFILLED_MAX {
+            break;
+        }
+        if !window.is_empty() && !out.contains(&window) {
+            out.push(window);
+        }
+    }
+    out
 }
 
 fn account_mut<'a>(state: &'a mut State, label: &str) -> Option<&'a mut Account> {
@@ -10375,6 +10796,7 @@ pub fn note_reading_held(
             auth_context,
             renewal_metadata,
             served_metadata,
+            auth_refusal,
             auth_projection,
             cleared_at: _,
             room_at: _,
@@ -10397,6 +10819,7 @@ pub fn note_reading_held(
             auth_context,
             renewal_metadata,
             served_metadata,
+            auth_refusal,
             auth_projection,
             cleared_at: Some(now),
             keyed_at: Some(now),
@@ -10452,10 +10875,16 @@ pub fn note_reading_held(
                 && w.and_then(|w| anchored(&w)).and_then(|h| h.epoch_at) < Some(epoch)
         });
         if opened {
-            events.push(Event::new(now, Kind::Reset, account).because(&format!(
-                "{bucket} refilled inside its window (resets {})",
-                super::usage::rfc3339_utc(merged.as_ref().map_or(0, |m| m.reset))
-            )));
+            // Dated by the figures that show the refill, as its epoch is: a reading made at that
+            // instant is of the refilled window.
+            events.push(
+                Event::new(at, Kind::Reset, account)
+                    .refilling([bucket])
+                    .because(&format!(
+                        "{bucket} refilled inside its window (resets {})",
+                        super::usage::rfc3339_utc(merged.as_ref().map_or(0, |m| m.reset))
+                    )),
+            );
         }
         // The wall this window raised was observed of the allowance a refill replaced, so it ends
         // at the refill and not at the reset it named. One observed at or after the refill
@@ -10610,6 +11039,7 @@ pub fn note_auth(state: &mut State, account: &str, auth: Auth, at: i64) -> Vec<E
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingAuthKind {
     Word(Auth),
+    SettledRefusal(super::codex_app_login::RefusalReason),
     LoginEnd,
     SignedBack,
     CheckedSignIn,
@@ -10651,6 +11081,28 @@ pub(crate) fn stage_auth(
     at: i64,
 ) {
     stage_auth_kind(state, raw, logins, context, PendingAuthKind::Word(word), at);
+}
+
+/// Stages the sign-out of a login whose refresh token the issuer refused for good, with why
+/// ([`Account::auth_refusal`]): [`stage_auth`]'s [`Auth::SignedOut`], and `reason` kept beside it
+/// in the same context once that sign-out is the word on record. A newer word already on record
+/// keeps both out.
+pub(crate) fn stage_settled_refusal(
+    state: &mut State,
+    raw: &Row,
+    logins: &Logins,
+    context: AuthContext,
+    reason: super::codex_app_login::RefusalReason,
+    at: i64,
+) {
+    stage_auth_kind(
+        state,
+        raw,
+        logins,
+        context,
+        PendingAuthKind::SettledRefusal(reason),
+        at,
+    );
 }
 
 /// Stages a current-login failure including its learned lifetime metadata.
@@ -11089,6 +11541,20 @@ pub fn reset_outcome(
     let claimed = claim.at;
     let window = claim.window.clone();
     let machine = state.machine.clone();
+    // What the reset refilled: the claim's window, and both windows for a full one. A reset spent
+    // with the limit still standing refilled none.
+    let refilled: Vec<String> = match done {
+        ResetDone::Used { kind, .. } => {
+            let both = (*kind == ResetKind::Full).then_some([SESSION_LIMIT, WEEK_LIMIT]);
+            window
+                .as_deref()
+                .into_iter()
+                .chain(both.into_iter().flatten())
+                .map(str::to_owned)
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     let (kind, why) = match done {
         ResetDone::Used { kind, left } => (
             Kind::ResetUsed,
@@ -11169,7 +11635,12 @@ pub fn reset_outcome(
             );
         }
     }
-    vec![Event::new(now, kind, account).with_sid(&sid).because(&why)]
+    vec![
+        Event::new(now, kind, account)
+            .with_sid(&sid)
+            .refilling(refilled.iter().map(String::as_str))
+            .because(&why),
+    ]
 }
 
 /// Returns whether the machine's hourly account-rotation circuit breaker is spent at `now`.
@@ -12179,6 +12650,49 @@ impl Store {
         Some(AuthContext::new(row, credential))
     }
 
+    /// [`Self::capture_auth_context`] of `row`'s login only where the refresh token its file
+    /// holds is the one the issuer refused, whose digest is `refused`
+    /// ([`super::codex_app_login::refused_login_context`], one read of the file for both): the
+    /// context a settled refusal's sign-out and reason are staged in
+    /// ([`stage_settled_refusal`]). `None` too for a file that holds another token or none.
+    pub(crate) fn capture_refused_auth_context(
+        &self,
+        row: &Row,
+        refused: &str,
+    ) -> Option<AuthContext> {
+        if self.cli != Cli::Codex {
+            return None;
+        }
+        let user_home = self.user_home()?;
+        let default = self.default_home()?;
+        let home = row
+            .dir
+            .as_deref()
+            .filter(|dir| !dir.is_empty())
+            .map_or(default.as_path(), Path::new);
+        let credential = super::codex_app_login::refused_login_context(home, user_home, refused)?;
+        Some(AuthContext::new(row, credential))
+    }
+
+    /// What this store holds of `row`'s login for [`super::codex_app_login::row_refusal`] to read
+    /// the settled refusal native custody recorded on it: the row's record in `state` and the
+    /// user home whose Codex configuration routes the login's reads. `None` for another CLI's
+    /// store, for a store that knows no user home, and for a row with no record.
+    #[must_use]
+    pub fn custody_record<'a>(
+        &'a self,
+        state: &'a State,
+        row: &Row,
+    ) -> Option<super::codex_app_login::CustodyRecord<'a>> {
+        if self.cli != Cli::Codex {
+            return None;
+        }
+        Some(super::codex_app_login::CustodyRecord {
+            account: state.accounts.get(&row.label)?,
+            user_home: self.user_home()?,
+        })
+    }
+
     /// Records `row`'s login signed out under its current credential context, as a read that met
     /// the login's wall does (`accounts_pool`'s `Reading::SignedOut`): how a lab world lays out a
     /// login that lapsed here (one-mesh E4, `aterm-lab local-signins`).
@@ -12225,10 +12739,13 @@ impl Store {
         self.hydrate_codex_contexts(state, roster);
     }
 
-    /// [`State::lapsed_logins`] alone ([`Store::hydrate_auth_contexts`]): the runtime set a
-    /// transaction's edit judges rows by, so an edit that picks a row (a restart's advice) skips
-    /// a lapsed one as the report and the launch do.
+    /// [`State::lapsed_logins`] and [`State::tokens_here`] alone
+    /// ([`Store::hydrate_auth_contexts`]): the runtime readings a transaction's edit judges rows
+    /// by, so an edit that picks a row (a restart's advice) skips a lapsed one, and takes one on
+    /// its vault token, as the report and the launch do. The token reading is the upkeep's file
+    /// ([`Store::read_tokens_here`]): no vault is read here.
     pub(crate) fn hydrate_lapsed(&self, state: &mut State, roster: &Roster) {
+        state.tokens_here = self.read_tokens_here();
         let default = self.default_login_home();
         state.lapsed_logins = roster
             .rows
@@ -12245,6 +12762,52 @@ impl Store {
             })
             .map(|row| row.label.clone())
             .collect();
+    }
+
+    /// The upkeep's last reading of the rows on their vault token here ([`TokensHere`]), from
+    /// [`TOKENS_HERE_FILE`] in Claude Code's store: `None` for every other CLI's store, where none
+    /// was kept, or where the file does not read as one. Freshness and each token's end are
+    /// judged where it is read ([`on_token_here`]).
+    #[must_use]
+    pub fn read_tokens_here(&self) -> Option<TokensHere> {
+        if self.cli != Cli::Claude {
+            return None;
+        }
+        kept_tokens_here(&self.dir)
+    }
+
+    /// KEEPS THE UPKEEP'S READING of the rows on their vault token here (`read`, as
+    /// [`super::accounts_tokens::rows_on_token_read`] returns it: each row's token end) under
+    /// `accounts.lock`, read at `now`: a reading naming rows replaces [`TOKENS_HERE_FILE`]; one
+    /// naming none removes it; a vault that could not be read (`None`) keeps the reading before
+    /// it, which ages out by itself ([`TOKENS_HERE_FRESH_S`]). Returns whether the file changed.
+    /// Claude Code's store only.
+    ///
+    /// # Errors
+    /// The store cannot be made, `accounts.lock` stayed held past its ladder, or the file cannot
+    /// be written or removed.
+    pub fn note_tokens_here(
+        &self,
+        read: Option<&BTreeMap<String, u64>>,
+        now: i64,
+    ) -> io::Result<bool> {
+        let Some(read) = read else {
+            return Ok(false);
+        };
+        if self.cli != Cli::Claude || (read.is_empty() && self.read_tokens_here().is_none()) {
+            return Ok(false);
+        }
+        let _held = self
+            .acquire_within(&LOCK_LADDER)?
+            .ok_or_else(|| io::Error::other(LOCK_HELD))?;
+        let kept = (!read.is_empty()).then(|| TokensHere {
+            read_at: now,
+            ends: read
+                .iter()
+                .map(|(label, end)| (label.clone(), i64::try_from(*end).unwrap_or(i64::MAX)))
+                .collect(),
+        });
+        keep_tokens_here(&self.dir, kept.as_ref())
     }
 
     fn hydrate_codex_contexts(&self, state: &mut State, roster: &Roster) {
@@ -12319,6 +12882,10 @@ impl Store {
                     events.extend(note_auth(state, label, word, intent.at));
                     word
                 }
+                PendingAuthKind::SettledRefusal(_) => {
+                    events.extend(note_auth(state, label, Auth::SignedOut, intent.at));
+                    Auth::SignedOut
+                }
                 PendingAuthKind::LoginEnd => {
                     events.extend(note_auth(state, label, Auth::SignedOut, intent.at));
                     events.extend(note_login_end(state, logins, label, intent.at));
@@ -12353,6 +12920,14 @@ impl Store {
                     account.unanswered = None;
                 }
                 account.auth_context = Some(intent.context.clone());
+                // Only the settled refusal's own sign-out carries a reason; every other staged
+                // word leaves none.
+                account.auth_refusal = match intent.kind {
+                    PendingAuthKind::SettledRefusal(reason) if account.auth == Auth::SignedOut => {
+                        Some(reason)
+                    }
+                    _ => None,
+                };
                 account.renewal_metadata = renewal_metadata;
                 account.served_metadata = served_metadata;
                 account.auth_projection = AuthProjection::Current(intent.context);
@@ -12382,9 +12957,11 @@ impl Store {
     }
 
     /// The label of this store's CLI's row whose sign-in runs on this Mac now, in this process or
-    /// another (`accounts renew` in a terminal, the upkeep's ladder): the fact the glass and the
-    /// accounts report say as `signing in`. `None` once the sign-in's process ends, however it
-    /// ends.
+    /// another (`accounts renew` in a terminal, the upkeep's ladder): the fact the glass, the
+    /// Account card's items and its Login line, and the accounts report say as `signing in`.
+    /// `None` once the sign-in's process ends, however it ends: the record names that process,
+    /// the sign-in lock's holder, by its identity, so a process that later takes its number is
+    /// not it (`sign_in_ladder::signing_in`).
     #[must_use]
     pub fn signing_in(&self) -> Option<String> {
         super::sign_in_ladder::signing_in(self, self.cli)

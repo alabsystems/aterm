@@ -67,7 +67,7 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// OSC 7501 (`state=<word>:app=<codex|grok-build>[:kind=<k>]`, `state=clear`), the root record
+    /// OSC 7501 (`state=<word>:app=<claude-code|codex|grok-build>[:kind=<k>]`, `state=clear`), the root record
     /// only ([`super::program_state`]), at the batch's injected wall clock.
     #[inline]
     fn handle_osc_7501(&mut self, params: &[&[u8]]) {

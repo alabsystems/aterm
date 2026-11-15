@@ -96,6 +96,27 @@ macro_rules! dispatch {
 }
 
 impl ScrollbackStorage {
+    /// Create empty replacement storage with the same policy and historical counters.
+    /// Streaming transformations can release input without mixing it with output blocks.
+    #[must_use]
+    pub fn empty_replacement(&self) -> Self {
+        match self {
+            Self::Memory(store) => {
+                let mut replacement =
+                    Scrollback::new(store.hot_limit, store.warm_limit, store.memory_budget);
+                replacement.block_size = store.block_size;
+                replacement.line_limit = store.line_limit;
+                replacement.pressure_evicted_lines = store.pressure_evicted_lines;
+                replacement.image_rows_dropped_by_compression =
+                    store.image_rows_dropped_by_compression;
+                replacement.yellow_threshold = store.yellow_threshold;
+                replacement.yellow_exit_threshold = store.yellow_exit_threshold;
+                replacement.red_threshold = store.red_threshold;
+                Self::Memory(replacement)
+            }
+        }
+    }
+
     /// Borrow a line by index (`0` = oldest) without cloning cached warm/cold [`Line`]s.
     ///
     /// # Errors

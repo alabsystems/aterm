@@ -61,26 +61,27 @@ pub(crate) fn attested_aterms_holder(holder: &str, pid: Option<u32>, own: &str, 
 
 impl Native {
     /// Whether the harness retries this wall on its own clock (an API error, an overload, the API's own 429).
-    pub(crate) const fn wall_retries(kind: aterm_phase::WallKind) -> bool {
+    pub(crate) const fn wall_retries(kind: alab_policy::vocab::WallKind) -> bool {
         matches!(
             kind,
-            aterm_phase::WallKind::ApiError { .. } | aterm_phase::WallKind::Overloaded
+            alab_policy::vocab::WallKind::ApiError { .. }
+                | alab_policy::vocab::WallKind::Overloaded
         )
     }
 }
 
 impl aterm_messages::presence::Host for Native {
-    type Wall = aterm_phase::WallKind;
+    type Wall = alab_policy::vocab::WallKind;
     type Stall = crate::input_stall::InputStallFact;
 
-    fn wall_wire(kind: aterm_phase::WallKind) -> &'static str {
+    fn wall_wire(kind: alab_policy::vocab::WallKind) -> &'static str {
         kind.wire()
     }
 
-    /// A wall that reads `limited` ([`aterm_phase::WallKind::reads_limited`]) keeps that word;
+    /// A wall that reads `limited` ([`alab_policy::vocab::WallKind::reads_limited`]) keeps that word;
     /// an API error the network caused says what went wrong ([`api_cause_words`]); any other
     /// wall is the state it leaves the session in (`needs::wall_words`).
-    fn wall_band(kind: aterm_phase::WallKind) -> &'static str {
+    fn wall_band(kind: alab_policy::vocab::WallKind) -> &'static str {
         if kind.reads_limited() {
             return "limited";
         }
@@ -250,27 +251,27 @@ pub(crate) fn classifier_calls() -> u64 {
 /// Any other login wall (a 401's failure row, a login-ended text) carries none.
 pub(crate) const SIGN_IN_SCREEN: &str = "sign-in screen";
 
-/// Tab and menu words for an unreachable API error ([`aterm_phase::ApiCause::Unreachable`]).
+/// Tab and menu words for an unreachable API error ([`alab_policy::vocab::ApiCause::Unreachable`]).
 pub(crate) const API_UNREACHABLE: &str = "can't reach the API";
-/// … a reply the connection cut off ([`aterm_phase::ApiCause::CutOff`]).
+/// … a reply the connection cut off ([`alab_policy::vocab::ApiCause::CutOff`]).
 pub(crate) const API_CUT_OFF: &str = "reply cut off";
-/// … a certificate or proxy the connection refused ([`aterm_phase::ApiCause::Config`]).
+/// … a certificate or proxy the connection refused ([`alab_policy::vocab::ApiCause::Config`]).
 pub(crate) const API_REFUSED: &str = "TLS/proxy refused";
-/// … a request the API itself refused ([`aterm_phase::ApiCause::Request`]).
+/// … a request the API itself refused ([`alab_policy::vocab::ApiCause::Request`]).
 pub(crate) const API_REQUEST_REFUSED: &str = "request refused";
-/// … a reply past its output token maximum ([`aterm_phase::ApiCause::Overlong`]).
+/// … a reply past its output token maximum ([`alab_policy::vocab::ApiCause::Overlong`]).
 pub(crate) const API_OVERLONG: &str = "reply too long";
 
 /// What an API error the network caused is called on the tab and in the menu.
-pub(crate) const fn api_cause_words(kind: aterm_phase::WallKind) -> Option<&'static str> {
+pub(crate) const fn api_cause_words(kind: alab_policy::vocab::WallKind) -> Option<&'static str> {
     match kind {
-        aterm_phase::WallKind::ApiError { cause, .. } => match cause {
-            aterm_phase::ApiCause::Unreachable => Some(API_UNREACHABLE),
-            aterm_phase::ApiCause::CutOff => Some(API_CUT_OFF),
-            aterm_phase::ApiCause::Config => Some(API_REFUSED),
-            aterm_phase::ApiCause::Request => Some(API_REQUEST_REFUSED),
-            aterm_phase::ApiCause::Overlong => Some(API_OVERLONG),
-            aterm_phase::ApiCause::Server => None,
+        alab_policy::vocab::WallKind::ApiError { cause, .. } => match cause {
+            alab_policy::vocab::ApiCause::Unreachable => Some(API_UNREACHABLE),
+            alab_policy::vocab::ApiCause::CutOff => Some(API_CUT_OFF),
+            alab_policy::vocab::ApiCause::Config => Some(API_REFUSED),
+            alab_policy::vocab::ApiCause::Request => Some(API_REQUEST_REFUSED),
+            alab_policy::vocab::ApiCause::Overlong => Some(API_OVERLONG),
+            alab_policy::vocab::ApiCause::Server => None,
         },
         _ => None,
     }
@@ -655,7 +656,7 @@ pub(crate) fn classify(
         Some(_) if reader.placeholder() => aterm_messages::presence::ComposerState::Unknown,
         Some(_) => aterm_messages::presence::ComposerState::Draft,
     };
-    let wall = |kind: aterm_phase::WallKind, reset: Option<String>| {
+    let wall = |kind: alab_policy::vocab::WallKind, reset: Option<String>| {
         let until = reset
             .as_deref()
             .and_then(countdown_to_reset)
@@ -676,7 +677,7 @@ pub(crate) fn classify(
     // show rests nothing: the title runs for a turn and not for a shell or a monitor
     // ([`aterm_phase::ScreenReader::background_rest_seen`]).
     let read = match r.phase {
-        aterm_phase::Phase::Busy => reader
+        alab_policy::vocab::Phase::Busy => reader
             .background_rest_seen(rows, runs)
             .filter(|rest| {
                 let rested = aterm_phase::Reading {
@@ -690,7 +691,7 @@ pub(crate) fn classify(
                         Cursor::Unknown => true,
                     }
             })
-            .unwrap_or(aterm_phase::Phase::Busy),
+            .unwrap_or(alab_policy::vocab::Phase::Busy),
         p => p,
     };
     let phase = if !r.phase_authoritative {
@@ -702,8 +703,8 @@ pub(crate) fn classify(
         wall(w.kind, w.reset)
     } else {
         match read {
-            aterm_phase::Phase::Busy => AgentPhase::Busy,
-            aterm_phase::Phase::Prompt => {
+            alab_policy::vocab::Phase::Busy => AgentPhase::Busy,
+            alab_policy::vocab::Phase::Prompt => {
                 subject = r
                     .prompt
                     .as_ref()
@@ -713,13 +714,14 @@ pub(crate) fn classify(
                     detail: r.prompt.as_ref().map(prompt_detail),
                 }
             }
-            aterm_phase::Phase::Question => AgentPhase::Question,
-            aterm_phase::Phase::Limited { message, reset } => wall(
-                aterm_phase::classify_wall(&message).unwrap_or(aterm_phase::WallKind::UsageSession),
+            alab_policy::vocab::Phase::Question => AgentPhase::Question,
+            alab_policy::vocab::Phase::Limited { message, reset } => wall(
+                aterm_phase::classify_wall(&message)
+                    .unwrap_or(alab_policy::vocab::WallKind::UsageSession),
                 reset,
             ),
-            aterm_phase::Phase::Idle if r.survey => AgentPhase::Survey,
-            aterm_phase::Phase::Idle => AgentPhase::Idle,
+            alab_policy::vocab::Phase::Idle if r.survey => AgentPhase::Survey,
+            alab_policy::vocab::Phase::Idle => AgentPhase::Idle,
         }
     };
     // The box or question the verdict publishes is the frame a key lands on (fix E8): what each
@@ -749,7 +751,7 @@ fn prompt_detail(p: &aterm_phase::PromptV2) -> String {
     if p.kind != aterm_phase::PromptKind::Bash || p.command.trim().is_empty() {
         return kind;
     }
-    let python_allow: Vec<String> = aterm_agent::supervise::DEFAULT_PYTHON_ALLOW
+    let python_allow: Vec<String> = alab_policy::classify::DEFAULT_PYTHON_ALLOW
         .iter()
         .map(|g| (*g).to_string())
         .collect();

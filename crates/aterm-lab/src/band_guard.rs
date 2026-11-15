@@ -14,7 +14,7 @@ use std::time::Instant;
 use crate::window_guards::{MemoryGuard, WindowGuards};
 use aterm_uds::{CtlListener, CtlStream, fdpass, ready};
 
-const SOCKET: &str = "band.guard.sock";
+pub(super) const SOCKET: &str = "g";
 const OFFER: &str = "aterm-lab-window-guards-v2:";
 const ACK: &str = "aterm-lab-window-guards-ack-v2:";
 const MAX_MESSAGE: usize = 256;

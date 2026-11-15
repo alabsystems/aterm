@@ -5,7 +5,7 @@
 
 use super::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const GIB: u64 = 1 << 30;
 
@@ -155,6 +155,71 @@ fn the_grammar_hands_over_terms_levels_and_an_absolute_volume() {
     assert_eq!(w.vol, Some(PathBuf::from(spaced)));
     assert_eq!(parse("sys free>=1GB vol=rel").err().as_deref(), Some(USAGE));
     assert_eq!(parse("sys free>=1GB vol=").err().as_deref(), Some(USAGE));
+}
+
+#[test]
+fn a_demand_timeout_reports_the_pending_pass_without_claiming_its_end() {
+    let shelf = shelf_at(GIB);
+    shelf.publish(|board| board.look_in_flight = true);
+    let world = World::new(GIB);
+    let reply = run_in(&shelf, "sys free>=30GiB timeout=0", &owner(), &world);
+    assert!(reply.starts_with("OK timeout "), "{reply}");
+    assert!(reply.contains(&format!("free_bytes={GIB}")), "{reply}");
+    assert!(
+        reply.contains(&format!("need_bytes={}", 30 * GIB)),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("demand=pending pass_in_flight=true"),
+        "{reply}"
+    );
+    assert!(!reply.contains("why=spent"), "{reply}");
+    assert_eq!(world.pokes.load(Ordering::SeqCst), 1);
+    assert!(shelf.board_lock().look_in_flight, "the pass remains live");
+}
+
+#[test]
+fn a_demand_timeout_refreshes_changed_pass_state_before_reporting_it() {
+    let shelf = shelf_at(GIB);
+    shelf.publish(|board| board.look_in_flight = true);
+    let world = World::new(GIB);
+    let changed = AtomicBool::new(false);
+    let read = |_: &Path| Ok(reading(world.free.load(Ordering::SeqCst)));
+    let poke = |_: u64| {
+        world.pokes.fetch_add(1, Ordering::SeqCst);
+    };
+    // Publish a watch change after the wait captured its decision. This injected
+    // observer runs at the post-park checkpoint, without a scheduling race.
+    let hung_up = || {
+        if !changed.swap(true, Ordering::SeqCst) {
+            world.free.store(2 * GIB, Ordering::SeqCst);
+            shelf.publish(|board| {
+                board.look_in_flight = false;
+                board.volumes[0] = home_row(2 * GIB);
+            });
+        }
+        false
+    };
+    let env = Env {
+        read: &read,
+        poke: &poke,
+        settings: &|| (false, false, false),
+        lines: &default_lines,
+        hung_up: &hung_up,
+        exited: &|| false,
+    };
+    let wait = parse("sys free>=30GiB timeout=0").unwrap();
+    let reply = run(&shelf, &wait, &owner(), &env);
+    assert!(reply.starts_with("OK timeout status=timeout "), "{reply}");
+    assert!(
+        reply.contains(&format!("free_bytes={}", 2 * GIB)),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("demand=pending pass_in_flight=false"),
+        "{reply}"
+    );
+    assert_eq!(world.pokes.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -490,7 +555,7 @@ fn a_stalled_watch_is_reported_only_while_it_runs() {
     assert_eq!(reply, "ERR unavailable free why=watch-stalled\n");
     shelf.publish(|b| b.watch = Watch::Suspended);
     let reply = run_in(&shelf, "sys free>=30GiB timeout=50", &owner(), &world);
-    assert_eq!(reply, "OK timeout\n");
+    assert!(reply.starts_with("OK timeout "), "{reply}");
     shelf.publish(|b| b.watch = Watch::Running { beat: old });
     let reply = run_in(&shelf, "sys disk=ok timeout=50", &owner(), &world);
     assert_eq!(reply, "OK timeout\n");
@@ -580,10 +645,8 @@ fn a_wait_that_only_just_poked_is_no_stall_however_long_ago_it_armed() {
     let shelf = shelf_at(20 * GIB);
     let old = a_stall_ago();
     shelf.publish(|b| b.watch = Watch::Running { beat: old });
-    assert_eq!(
-        parked_since(&shelf, old, Instant::now(), Duration::from_millis(50)),
-        "OK timeout\n"
-    );
+    let reply = parked_since(&shelf, old, Instant::now(), Duration::from_millis(50));
+    assert!(reply.starts_with("OK timeout "), "{reply}");
 }
 
 /// A PASS THAT TOOK THIS WAIT'S DEMAND ENDS ITS POKES, SO IT CANNOT SPEAK FOR A LOOK THAT DOES NOT
@@ -598,10 +661,8 @@ fn a_wait_whose_demand_a_pass_took_answers_stalled_only_for_a_look_in_flight() {
         b.watch = Watch::Running { beat: old };
         b.last_pass = Some(pass_for(Some(30 * GIB)));
     });
-    assert_eq!(
-        parked_since(&shelf, old, old, Duration::from_millis(50)),
-        "OK timeout\n"
-    );
+    let reply = parked_since(&shelf, old, old, Duration::from_millis(50));
+    assert!(reply.starts_with("OK timeout "), "{reply}");
     shelf.publish(|b| b.look_in_flight = true);
     assert_eq!(
         parked_since(&shelf, old, old, Duration::from_secs(60)),
@@ -709,7 +770,7 @@ fn an_old_beat_with_no_look_in_flight_is_no_stall() {
     };
     shelf.publish(|b| b.watch = Watch::Running { beat: old });
     let reply = run_in(&shelf, "sys free>=30GiB timeout=50", &owner(), &world);
-    assert_eq!(reply, "OK timeout\n");
+    assert!(reply.starts_with("OK timeout "), "{reply}");
 }
 
 #[test]
@@ -985,7 +1046,10 @@ fn an_8_3_spelling_carries_on_its_volumes_row() {
     let reply = run(&shelf, &wait("sys free>=room timeout=600000"), &tab, &env);
     assert!(reply.starts_with("OK sys "), "8.3 tab: {reply}");
     let reply = run(&shelf, &wait("sys free>=600GiB timeout=50"), &tab, &env);
-    assert_eq!(reply, "OK timeout\n", "a demand, never not-reclaimed");
+    assert!(
+        reply.starts_with("OK timeout "),
+        "a demand, never not-reclaimed: {reply}"
+    );
     assert!(
         pokes.load(Ordering::SeqCst) >= 1,
         "the demand poked the watch"

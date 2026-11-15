@@ -16,8 +16,9 @@
 //! ([`Fallback::word`]): the platform (`platform`), `ATERM_NO_HARNESS`
 //! (`no-harness`), the launch's shape (`shape`), the program (`program`), today's judgment of the
 //! launch's login (`outside`), the claims ring for an unlabelled launch (`claimed`, `held`), and
-//! the token's standing here (`absent`, `busy`, `unverified`, `ended`, `rejected`, `mismatched`,
-//! `unreadable`). A reason names a variable or a document, never a value.
+//! the token's standing here (`absent`, `busy`, `unverified`, `awaiting-basis`, `differ`,
+//! `ended`, `rejected`, `mismatched`, `unreadable`). A reason names a variable or a document,
+//! never a value.
 //!
 //! The wrapper serves only a launch today's judgment puts on the row's stored login
 //! ([`super::accounts::ProcessLogin::of_env`], `with_settings`, `with_profile_store`): it strips
@@ -32,15 +33,110 @@ use std::path::{Path, PathBuf};
 /// The marker aterm's wrapper sets beside the descriptor: the token entry it served.
 pub const MARKER_ENV: &str = "ATERM_CLAUDE_TOKEN";
 
+/// The variable aterm's wrapper sets beside the marker: the `minted_at` (unix seconds) of the
+/// token it served, value-free, so a reader knows which token of the entry a session runs on
+/// ([`ServedToken`]): after a `--replace`, a session still on the earlier token names that one.
+pub const MINTED_ENV: &str = "ATERM_CLAUDE_TOKEN_MINTED";
+
 /// The variable Claude Code reads a token's descriptor number from (§2.4).
 pub const DESCRIPTOR_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR";
 
 /// The token state a launch inherits from no one: a Claude relaunch line that replaces a token
-/// session unsets both, and the wrapper makes both afresh (§5.4).
+/// session unsets each, and the wrapper makes each afresh (§5.4). [`MINTED_ENV`] is not one: it
+/// names a token only beside these two (every reader judges it under the token route they make),
+/// so without them it names nothing, and the wrapper unsets and sets it whenever it serves. A
+/// line that drops the wrapper therefore spends no bytes on it, and stays shorter than the line
+/// that keeps the wrapper.
 pub const TOKEN_STATE_ENV: [&str; 2] = [DESCRIPTOR_ENV, MARKER_ENV];
+
+/// Which token of its entry aterm's wrapper served a session on its account's vault token, as the
+/// session's exec-time environment ([`MINTED_ENV`]) and its birth say (§5.6): the marker names the
+/// entry alone, so after a `--replace` a session still on the earlier token reads as one on the
+/// entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServedToken {
+    /// The wrapper named the token it served: its `minted_at`.
+    Named(u64),
+    /// The variable is unset: an earlier aterm's wrapper, which named none, served the session,
+    /// which began at the unix second here, where known.
+    Unnamed(Option<u64>),
+    /// The variable is not a number, or is set twice to different values: it names nothing.
+    Garbled,
+}
+
+/// What a session's reading or refusal is to the vault's token ([`ServedToken::on`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnToken {
+    /// The session runs on it, its wrapper said so: its reading counts for it and is compared for
+    /// its verification, and its refusal is the token's.
+    Named,
+    /// The session runs on it, though its wrapper named no token: the token was made before the
+    /// session began, so no later one can be what it was served. Its reading counts for the token
+    /// and its row, and its refusal is the token's, but nothing of it is compared for the token's
+    /// verification. A replacement that an earlier build's waiting write landed after the session
+    /// began, made before it began, is the one token it can be mistaken for.
+    Unnamed,
+    /// The session may run on another token (one a `--replace` has since replaced), or names
+    /// nothing: nothing of it counts for the vault's token or is known to be the row's.
+    Other,
+}
+
+impl ServedToken {
+    /// What the process whose exec-time environment is `env`, begun at `born` (unix seconds,
+    /// where known), was served.
+    #[must_use]
+    pub fn of<'a>(env: impl IntoIterator<Item = (&'a str, &'a str)>, born: Option<u64>) -> Self {
+        let mut named = None;
+        for (name, value) in env {
+            if name != MINTED_ENV {
+                continue;
+            }
+            let Ok(value) = value.parse::<u64>() else {
+                return Self::Garbled;
+            };
+            if named.is_some_and(|first| first != value) {
+                return Self::Garbled;
+            }
+            named = Some(value);
+        }
+        named.map_or(Self::Unnamed(born), Self::Named)
+    }
+
+    /// What the session is to the vault's token made at `minted_at`.
+    #[must_use]
+    pub fn on(self, minted_at: u64) -> OnToken {
+        match self {
+            Self::Named(served) if served == minted_at => OnToken::Named,
+            Self::Unnamed(Some(born)) if minted_at < born => OnToken::Unnamed,
+            Self::Named(_) | Self::Unnamed(_) | Self::Garbled => OnToken::Other,
+        }
+    }
+
+    /// Whether the session is known to run on another token than the vault's made at
+    /// `minted_at`: its wrapper named another, or named one in words that do not read, or an
+    /// earlier wrapper served it no later than that token was made. A session an earlier wrapper
+    /// served whose birth is not known ([`Self::Unnamed`]`(None)`) may run on that token or an
+    /// earlier one, so it is not, though its readings count for neither ([`Self::on`]).
+    #[must_use]
+    pub const fn off(self, minted_at: u64) -> bool {
+        match self {
+            Self::Named(served) => served != minted_at,
+            Self::Unnamed(Some(born)) => minted_at >= born,
+            Self::Garbled => true,
+            Self::Unnamed(None) => false,
+        }
+    }
+}
 
 /// The program the route serves.
 pub const PROGRAM: &str = "claude";
+
+/// Whether a launch on this host can start on a vault token at all: only on macOS, where spawnfd
+/// keeps a named descriptor across an exec ([`Fallback::Platform`], the judgment's first step).
+/// Everything that says a row runs on its token here takes this step too
+/// ([`accounts::on_token_here`], the upkeep's reading), so no surface counts a token no launch
+/// here could start on.
+pub const LAUNCHES_ON_TOKEN: bool = cfg!(target_os = "macos");
 
 /// The words the wrapper's verb takes after `aterm` (`harness accounts token-run`).
 pub const VERB: [&str; 3] = ["harness", "accounts", "token-run"];
@@ -67,10 +163,18 @@ pub enum Fallback {
     Held(String),
     /// The account has no token entry, or none the lab can key.
     Absent,
-    /// The vault state could not be read in time.
+    /// The vault state, or this Mac's token table, could not be read in time.
     Busy,
-    /// Minted on another Mac and not verified yet.
+    /// Not verified yet, and not in use here before verification: minted on another Mac at a
+    /// person's terminal, or by a meta that names no route.
     Unverified,
+    /// Not verified, in use here by its route, and no session on the row's stored login here has
+    /// reported its windows since (no basis, §5.6), while that stored login is usable here: the
+    /// launch stays on it so that one reports.
+    AwaitingBasis,
+    /// Not verified, and this Mac's comparison found its windows different from the row's basis
+    /// (§5.6).
+    Differ,
     /// Its end has passed.
     Ended,
     /// This Mac saw Claude Code refuse it.
@@ -96,6 +200,8 @@ impl Fallback {
             Self::Absent => "absent",
             Self::Busy => "busy",
             Self::Unverified => "unverified",
+            Self::AwaitingBasis => "awaiting-basis",
+            Self::Differ => "differ",
             Self::Ended => "ended",
             Self::Rejected => "rejected",
             Self::Mismatched => "mismatched",
@@ -168,10 +274,17 @@ pub enum TokenFact {
     InUse,
     /// No entry.
     Absent,
-    /// The vault state could not be read in time.
+    /// The vault state, or this Mac's token table, could not be read in time.
     Busy,
-    /// Minted elsewhere, not verified yet.
+    /// Not verified yet, and not in use here before verification (minted on another Mac at a
+    /// person's terminal, or by a meta that names no route).
     Unverified,
+    /// Not verified, in use here by its route, with no basis here yet, and the row's stored login
+    /// is usable here: sessions stay on it until one reports its windows (§5.6).
+    AwaitingBasis,
+    /// Not verified, and this Mac's comparison found its windows different from the row's basis:
+    /// this Mac starts no session on it.
+    Differ,
     /// Ended.
     Ended,
     /// Refused here.
@@ -242,6 +355,8 @@ pub fn judge(facts: &Facts<'_>, ask: &dyn Ask) -> Decision {
         TokenFact::Absent => Fallback::Absent,
         TokenFact::Busy => Fallback::Busy,
         TokenFact::Unverified => Fallback::Unverified,
+        TokenFact::AwaitingBasis => Fallback::AwaitingBasis,
+        TokenFact::Differ => Fallback::Differ,
         TokenFact::Ended => Fallback::Ended,
         TokenFact::Rejected => Fallback::Rejected,
         TokenFact::Mismatched => Fallback::Mismatched,
@@ -407,16 +522,54 @@ pub fn account_of(
     Ok((account, entry))
 }
 
+/// The HTTP status Claude Code answers a token it refuses with: `401`. Its lost-login wall also
+/// stands over a `403`, Cloudflare's block page, which it writes as `authentication_failed`
+/// (`Please run /login`) with that status, though the credential works (measured 2026-11-13,
+/// 2.1.323); that is no refusal of the token.
+pub const REFUSED_STATUS: u16 = 401;
+
+/// The status Claude Code wrote with the newest API error of a session's transcript tail `jsonl`:
+/// `apiErrorStatus` on its newest main-chain `isApiErrorMessage` row, where that row carries one.
+/// `None` where the tail holds no such row, or its newest names no status.
+#[must_use]
+pub fn newest_api_error_status(jsonl: &str) -> Option<u16> {
+    jsonl
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let v = super::transcript::conversation(line).ok()?;
+            let flag = |key: &str| v.get(key).and_then(aterm_json::Value::as_bool) == Some(true);
+            (v.get("type").and_then(aterm_json::Value::as_str) == Some("assistant")
+                && flag("isApiErrorMessage")
+                && !flag("isSidechain"))
+            .then(|| {
+                v.get("apiErrorStatus")
+                    .and_then(aterm_json::Value::as_u64)
+                    .and_then(|status| u16::try_from(status).ok())
+            })
+        })
+        .flatten()
+}
+
 /// WHETHER A LOST LOGIN ON THE RUNNING SESSION `who` IS ITS VAULT TOKEN'S REFUSAL (§5.6), and if
 /// so, recording it: the session runs on its account's token ([`session_account`],
 /// [`accounts::AuthRoute::for_account`]), so the anchored lost-login wall Claude Code drew
-/// (`aterm_phase::WallKind::Auth` at its placement, which the loop's wall confirmation never reads
-/// from a tool's output under a call, nor from the transcript) is the token's. Its standing is
-/// read value-free from the vault at `paths` and the refusal recorded in this Mac's table in
-/// `store` at `now` ([`super::accounts_tokens::note_rejected`]: `rejected_at`, `token-rejected`).
-/// `None` for a session on its stored login, or off its account's credentials: that point is
-/// the stored login's, handled as before. `Some(false)` where the refusal was recorded before,
-/// or could not be read just now (the next point records it).
+/// (`alab_policy::vocab::WallKind::Auth` at its placement, which the loop's wall confirmation never reads
+/// from a tool's output under a call, nor from the transcript) is the token's, where the session's
+/// newest API error answered [`REFUSED_STATUS`] (`status`, read from its transcript,
+/// [`newest_api_error_status`]). Any other status, a `403` from Cloudflare's block page above all,
+/// or none, records nothing: a refusal holds the token off this Mac until a new one is made, and a
+/// block page says nothing of the token. Its standing is read value-free from the vault at `paths`
+/// and the refusal recorded beside it at `now`, this Mac's table row in `store` following the
+/// refused token ([`super::accounts_tokens::note_rejected`]: the standing's `refused_at`,
+/// `token-rejected`), only where the session runs on the vault's token as `served` says
+/// ([`ServedToken::on`]: its wrapper named it, or an earlier wrapper named none and the token was
+/// made before the session began): a session still on a token a `--replace` has since replaced,
+/// or one whose variable names nothing, met a refusal of its own token, which says nothing of the
+/// vault's. `None` for a session on its stored login, or off its account's credentials: that point
+/// is the stored login's, handled as before. `Some(false)` for a session on its token whose wall
+/// answered no `401`, and where the refusal was recorded before, is of a token the vault no longer
+/// holds, or could not be read just now (the next point records it).
 #[cfg(unix)]
 #[must_use]
 pub fn token_refused(
@@ -424,7 +577,8 @@ pub fn token_refused(
     paths: &aterm_secrets::client::Paths,
     store: &accounts::Store,
     roster: Option<&Roster>,
-    who: &ProcessLogin,
+    (who, served): (&ProcessLogin, ServedToken),
+    status: Option<u16>,
     now: u64,
 ) -> Option<bool> {
     use aterm_secrets::claude_token::{self, Key, Lookup};
@@ -435,14 +589,22 @@ pub fn token_refused(
         accounts::AuthRoute::VaultToken { .. } => {}
         accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => return None,
     }
+    if status != Some(REFUSED_STATUS) {
+        return Some(false);
+    }
     let Some(key) = Key::parse(entry.key().as_str()) else {
         return Some(false);
     };
     Some(match claude_token::standing(paths, &key) {
-        Ok(Lookup::Found(standing)) => {
-            super::accounts_tokens::note_rejected(store, &standing, now).unwrap_or(false)
+        Ok(Lookup::Found(standing))
+            if standing
+                .meta
+                .as_ref()
+                .is_some_and(|meta| served.on(meta.minted_at) != OnToken::Other) =>
+        {
+            super::accounts_tokens::note_rejected(paths, store, &standing, now).unwrap_or(false)
         }
-        Ok(Lookup::Absent | Lookup::Unknown) | Err(_) => false,
+        Ok(Lookup::Found(_) | Lookup::Absent | Lookup::Unknown) | Err(_) => false,
     })
 }
 
@@ -483,7 +645,7 @@ pub fn with_wrapper<T>(aterm: PathBuf, f: impl FnOnce() -> T) -> T {
 /// other program (the twin's block judges a line that types the twin), or with no lasting aterm.
 #[must_use]
 pub fn auto_line(exe: &Path, flags: &[String]) -> Option<(PathBuf, Vec<String>)> {
-    if !cfg!(target_os = "macos") {
+    if !LAUNCHES_ON_TOKEN {
         return None;
     }
     store_build(exe)?;
@@ -551,11 +713,12 @@ pub fn store_build_in(builds: &Path, program: &Path) -> Option<PathBuf> {
 }
 
 /// What the token's state on this Mac says for [`judge`]: in use (and, the caller checks, its
-/// record names the account), or why not.
+/// record names the account, and that it awaits no basis its row's stored login can give,
+/// [`standing_judged`]), or why not.
 #[cfg(unix)]
 #[must_use]
 pub fn fact_of(state: &super::accounts_tokens::TokenState) -> TokenFact {
-    use super::accounts_tokens::TokenState;
+    use super::accounts_tokens::{TokenState, Unverified};
     match state {
         _ if state.in_use() => TokenFact::InUse,
         TokenState::Unknown => TokenFact::Busy,
@@ -563,7 +726,11 @@ pub fn fact_of(state: &super::accounts_tokens::TokenState) -> TokenFact {
         TokenState::Unreadable => TokenFact::Unreadable,
         TokenState::Mismatched(_) => TokenFact::Mismatched,
         TokenState::Ended => TokenFact::Ended,
-        TokenState::Rejected => TokenFact::Rejected,
+        TokenState::Rejected { .. } => TokenFact::Rejected,
+        TokenState::Unverified {
+            why: Unverified::WindowsDiffer,
+            ..
+        } => TokenFact::Differ,
         TokenState::Unverified { .. }
         | TokenState::Exposed(_)
         | TokenState::Soon
@@ -572,13 +739,15 @@ pub fn fact_of(state: &super::accounts_tokens::TokenState) -> TokenFact {
 }
 
 /// The token's standing for `account`'s `entry` in the vault at `paths`, judged with this Mac's
-/// table (`store`) at `now`, waiting no longer than `wait` for a vault writer: in use with its
-/// record naming the account's email, or why not. With the read, where it was found.
+/// table and accounts state (`store`) and `roster` at `now` ([`standing_judged`]), waiting no
+/// longer than `wait` for a vault writer: in use with its record naming the account's email, or
+/// why not. With the read, where it was found.
 #[cfg(unix)]
 #[must_use]
 pub fn standing_fact(
     paths: &aterm_secrets::client::Paths,
     store: &accounts::Store,
+    roster: Option<&Roster>,
     entry: TokenEntry,
     account: &Account,
     now: u64,
@@ -597,26 +766,48 @@ pub fn standing_fact(
         Lookup::Absent => (Lookup::Absent, None),
         Lookup::Found(read) => (Lookup::Found(read.standing.clone()), Some(read)),
     };
-    match standing_judged(&standing, store, &key, account, now) {
+    match standing_judged(&standing, paths, store, roster, &key, account, now) {
         TokenFact::InUse => (TokenFact::InUse, read),
         fact => (fact, None),
     }
 }
 
 /// [`standing_fact`] of a standing already read, value-free (`claude_token::standing`): in use
-/// with its record naming the account's email, or why not.
+/// with its record naming the account's email, or why not. Judged with this Mac's token table in
+/// `store` ([`super::accounts_tokens::TokenState::of`]), which must read: one that does not is
+/// `busy`, never taken for an empty one. A check file that does not read holds `busy` only a
+/// token this Mac compares (minted here, or in use here unverified), whose verdict it holds; any
+/// other is judged by `tokens.json` alone, its verification being the vault's word
+/// ([`super::accounts_tokens::read_table_for`]). The vault's token is judged by this Mac's facts
+/// of that token ([`super::accounts_tokens::Table::row_for`]): while this Mac's write of a
+/// replacement is on its way, the token it replaces keeps its own verdict and refusal, so it
+/// serves where it served before and nowhere else. Beyond the token's state, THE HOLD (§5.6): a
+/// token in use here and not verified, wherever it was minted, whose row here records no basis
+/// with a week still running ([`super::accounts_tokens::Unverified::AwaitingBasis`]), is not in
+/// use while the row's stored login is usable here ([`stored_usable`]): a launch stays on that
+/// stored login, so its session's reading gives the basis a reading of the token is compared
+/// with; where this Mac's table holds no row of the held token (one another Mac minted, or a
+/// mint whose row this Mac did not write), the row that reading records the basis on is made then
+/// ([`super::accounts_tokens::note_held`]). A row whose stored login is not usable here is
+/// not held, so the hold never leaves an account with no route: the token serves it unverified,
+/// and its readings are compared with nothing until a basis comes.
 #[cfg(unix)]
 #[must_use]
 pub fn standing_judged(
     standing: &aterm_secrets::claude_token::Lookup<aterm_secrets::claude_token::Standing>,
+    paths: &aterm_secrets::client::Paths,
     store: &accounts::Store,
+    roster: Option<&Roster>,
     key: &aterm_secrets::claude_token::Key,
     account: &Account,
     now: u64,
 ) -> TokenFact {
+    use super::accounts_tokens::{TokenState, Unverified};
     use aterm_secrets::claude_token::Lookup;
-    let table = super::accounts_tokens::read_table(store).unwrap_or_default();
-    let state = super::accounts_tokens::TokenState::of(standing, table.rows.get(key.as_str()), now);
+    let Ok(table) = super::accounts_tokens::read_table_for(store, standing) else {
+        return TokenFact::Busy;
+    };
+    let state = TokenState::of(standing, table.row_for(key.as_str(), standing), now);
     let fact = fact_of(&state);
     if fact != TokenFact::InUse {
         return fact;
@@ -628,10 +819,134 @@ pub fn standing_judged(
             .is_some_and(|meta| accounts::email_matches(&meta.email, &account.email)),
         Lookup::Absent | Lookup::Unknown => false,
     };
-    if named {
-        TokenFact::InUse
-    } else {
-        TokenFact::Mismatched
+    if !named {
+        return TokenFact::Mismatched;
+    }
+    let awaits = matches!(
+        state,
+        TokenState::Unverified {
+            why: Unverified::AwaitingBasis,
+            ..
+        }
+    );
+    if !awaits || !stored_usable(&paths.home, store, roster, account, now) {
+        return TokenFact::InUse;
+    }
+    // Held with no row of its own here: the row the stored login's reading records the basis on
+    // is made now, so the hold lifts at that reading.
+    if let Some(label) = account.label.as_deref()
+        && let Lookup::Found(found) = standing
+        && table
+            .row_for(key.as_str(), standing)
+            .is_none_or(|row| row.minted_at != found.meta.as_ref().map(|meta| meta.minted_at))
+    {
+        let _ = super::accounts_tokens::note_held(store, found, label);
+    }
+    TokenFact::AwaitingBasis
+}
+
+/// Whether the roster row `account` names has a stored login sessions on this Mac can run on, as
+/// the hold reads it ([`standing_judged`]): the row is in `roster` and held by no other Mac, its
+/// login's record under the user's `home` ([`super::profile::login_record`]) names the account's
+/// email, and the accounts state in `store`, its lapses read from the row's own credential file
+/// ([`accounts::Store::load_judged`]), does not say it is signed out here
+/// ([`accounts::signed_out_here`]). A state that does not read says nothing against the record.
+/// An account no row names has no stored login a row's reading could give a basis for.
+#[cfg(unix)]
+fn stored_usable(
+    home: &Path,
+    store: &accounts::Store,
+    roster: Option<&Roster>,
+    account: &Account,
+    now: u64,
+) -> bool {
+    let Some((roster, row)) = account
+        .label
+        .as_deref()
+        .zip(roster)
+        .and_then(|(label, roster)| Some((roster, roster.row(label)?)))
+    else {
+        return false;
+    };
+    if row.held_by.is_some() {
+        return false;
+    }
+    let Some(record) = super::profile::login_record(home, row.dir.as_deref()) else {
+        return false;
+    };
+    if !accounts::email_matches(&record.email, &account.email) {
+        return false;
+    }
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    store
+        .load_judged(now, roster)
+        .map_or(true, |(state, _)| !accounts::signed_out_here(row, &state))
+}
+
+/// WHETHER A LAUNCH ONTO `row` OF `roster` WOULD START ON A WORKING LOGIN HERE, as the one
+/// judgment's row-wide steps decide it ([`judge`]): macOS (`platform`), a token entry the lab keys
+/// and an email on the row (`absent`), and the token's standing in the vault at `paths`, read
+/// value-free with `claude_token::standing`'s brief wait and judged with this Mac's table in
+/// `store` and `roster` at `now` ([`standing_judged`]): in use, its record naming the row's email,
+/// or held for its basis ([`TokenFact::AwaitingBasis`]), which the judgment says only where the
+/// row's stored login is usable here, so the launch runs on that login. The launch-time guard asks
+/// it of a row that only its token puts in rotation ([`accounts::token_guarded`]): where it says
+/// no, the launch would fall back to the row's lapsed stored login, so the pick is refused. The
+/// launch's own steps (its shape, its program, its environment) are judged at the launch as before.
+#[cfg(unix)]
+#[must_use]
+pub fn row_token_serves(
+    paths: &aterm_secrets::client::Paths,
+    store: &accounts::Store,
+    roster: &Roster,
+    row: &accounts::Row,
+    now: u64,
+) -> bool {
+    if !LAUNCHES_ON_TOKEN {
+        return false;
+    }
+    let (Some(entry), Some(email)) = (TokenEntry::of_row(row), row.expected_identity_email())
+    else {
+        return false;
+    };
+    let Some(key) = aterm_secrets::claude_token::Key::parse(entry.key().as_str()) else {
+        return false;
+    };
+    let account = Account {
+        label: Some(row.label.clone()),
+        email: email.to_owned(),
+    };
+    aterm_secrets::claude_token::standing(paths, &key).is_ok_and(|standing| {
+        matches!(
+            standing_judged(&standing, paths, store, Some(roster), &key, &account, now),
+            TokenFact::InUse | TokenFact::AwaitingBasis
+        )
+    })
+}
+
+/// [`row_token_serves`] for a launch on this Mac under the user's `home`; never off Unix.
+#[must_use]
+pub fn row_token_serves_at(
+    home: &Path,
+    store: &accounts::Store,
+    roster: &Roster,
+    row: &accounts::Row,
+    now: i64,
+) -> bool {
+    #[cfg(unix)]
+    {
+        row_token_serves(
+            &aterm_secrets::client::Paths::for_home(home),
+            store,
+            roster,
+            row,
+            u64::try_from(now).unwrap_or(0),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (home, store, roster, row, now);
+        false
     }
 }
 
@@ -641,11 +956,16 @@ pub fn standing_judged(
 ///
 /// - a session on its stored login moves onto its account's token where that is in use here;
 /// - a session on its token moves back onto the stored login where the token was refused here,
-///   removed, ended or mismatched, and only where the stored login is here: with none, it stays
-///   and the offer of a new token stands (§5.9);
+///   removed, ended or mismatched, or its windows differ here from the row's basis (§5.6: it may
+///   be another account's), or it is not in use here unverified (`unverified`: a token minted on
+///   another Mac at a person's terminal, or by a meta that names no route, which this Mac serves
+///   only once verified), and only where the stored login is here: with none, it stays on the
+///   token, and what §5.9 offers for the token's state stands;
 /// - nothing else moves. An exposed token is in use (`fact_of`), so it moves nothing (§4.3); a
-///   vault that could not be read just now, a token not verified yet for this Mac and one this
-///   Mac cannot open move nothing either: the next turn end asks again.
+///   vault that could not be read just now and a token this Mac cannot open move nothing either:
+///   the next turn end asks again. A token held for its basis (`awaiting-basis`) moves nothing: a
+///   session on the stored login stays there to give the basis, and one already on the token
+///   stays on it (its readings are compared once a basis comes).
 #[must_use]
 pub const fn route_move(
     route: accounts::AuthRoute,
@@ -656,7 +976,12 @@ pub const fn route_move(
         (accounts::AuthRoute::Stored, TokenFact::InUse) => Some(RouteTo::Token),
         (
             accounts::AuthRoute::VaultToken { .. },
-            TokenFact::Absent | TokenFact::Ended | TokenFact::Rejected | TokenFact::Mismatched,
+            TokenFact::Absent
+            | TokenFact::Unverified
+            | TokenFact::Differ
+            | TokenFact::Ended
+            | TokenFact::Rejected
+            | TokenFact::Mismatched,
         ) if stored_here => Some(RouteTo::Stored),
         (
             accounts::AuthRoute::Stored
@@ -699,7 +1024,17 @@ pub fn session_account(
 /// [`route_move`] for a running Claude Code session `who` on this Mac (the GUI host's
 /// `IdleHost::route_move`): its account ([`session_account`]), under the user's `home`, the
 /// vault at `paths` (read value-free, never waiting past `claude_token::standing`'s brief wait)
-/// and this Mac's token table in `store`, at `now`. Nothing moves off
+/// and this Mac's token table in `store`, at `now`. A session on its token known to run on
+/// another token than the vault's (`served`, [`ServedToken::off`]: a `--replace` replaced the one
+/// it was served, what its wrapper named does not read, or it began before the vault's token was
+/// made) is judged by its own token, which no longer serves anywhere: it moves onto the vault's
+/// token where that is in use here, else onto the row's stored login where that is here
+/// ([`stale_move`]). One an earlier wrapper served whose birth is not known may run on the
+/// vault's token or an earlier one, so it is judged as one on the vault's token
+/// ([`route_move`]), which offers only the moves both readings agree on: back to the stored login
+/// where that is here and the vault's token was refused here, removed, ended or mismatched, its
+/// windows differ or this Mac does not read it verified; never a relaunch onto the vault's token,
+/// which might only serve it again, and no move off one held for its basis. Nothing moves off
 /// macOS, or for a session under a custom home.
 #[cfg(unix)]
 #[must_use]
@@ -708,9 +1043,10 @@ pub fn offered_move(
     paths: &aterm_secrets::client::Paths,
     store: &accounts::Store,
     roster: Option<&Roster>,
-    who: &ProcessLogin,
+    (who, served): (&ProcessLogin, ServedToken),
     now: u64,
 ) -> Option<RouteTo> {
+    use aterm_secrets::claude_token::Lookup;
     if !cfg!(target_os = "macos") || !who.default_home {
         return None;
     }
@@ -722,11 +1058,39 @@ pub fn offered_move(
         return None;
     }
     let key = aterm_secrets::claude_token::Key::parse(entry.key().as_str())?;
-    let fact = match aterm_secrets::claude_token::standing(paths, &key) {
-        Ok(standing) => standing_judged(&standing, store, &key, &account, now),
-        Err(_) => TokenFact::Busy,
+    let standing = match aterm_secrets::claude_token::standing(paths, &key) {
+        Ok(standing) => standing,
+        Err(_) => return route_move(route, TokenFact::Busy, record.is_some()),
     };
+    let fact = standing_judged(&standing, paths, store, roster, &key, &account, now);
+    let stale = matches!(route, accounts::AuthRoute::VaultToken { .. })
+        && match &standing {
+            Lookup::Found(found) => found
+                .meta
+                .as_ref()
+                .is_some_and(|meta| served.off(meta.minted_at)),
+            Lookup::Absent | Lookup::Unknown => false,
+        };
+    if stale {
+        return stale_move(fact, record.is_some());
+    }
     route_move(route, fact, record.is_some())
+}
+
+/// The move a session on its token known to run on another token than the vault's is offered
+/// ([`offered_move`], [`ServedToken::off`]), from the vault's token's standing here (`fact`) and
+/// whether the row has a stored login on this Mac (`stored_here`): onto the vault's token where
+/// it is in use here (a relaunch serves it), else onto the stored login where it is here; with
+/// neither, nothing. A vault that could not be read just now moves nothing: the next turn end
+/// asks again.
+#[must_use]
+pub const fn stale_move(fact: TokenFact, stored_here: bool) -> Option<RouteTo> {
+    match fact {
+        TokenFact::InUse => Some(RouteTo::Token),
+        TokenFact::Busy => None,
+        _ if stored_here => Some(RouteTo::Stored),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -1155,7 +1155,10 @@ fn a_standing_row_the_owner_read_is_not_raised_again_for_a_day() {
     let mut c = fresh(now);
     let id = c.post(agent_down(), stamp(0), now).id;
     assert!(c.live(id).is_some() && c.live(id).unwrap().msg.hold.is_standing());
-    assert!(c.mark_seen(id, now), "a read folds a standing row");
+    assert!(
+        c.mark_seen(id, stamp(0), now),
+        "a read folds a standing row"
+    );
     assert!(c.live(id).is_none());
     let again = c.post(agent_down(), stamp(3_600_000), now);
     assert_eq!((again.id, again.outcome), (id, PostOutcome::Suppressed));
@@ -1165,6 +1168,171 @@ fn a_standing_row_the_owner_read_is_not_raised_again_for_a_day() {
         next_day.outcome,
         PostOutcome::New,
         "still down a day later: news"
+    );
+}
+
+/// A standing row the owner reads a minute after the Mac woke from a 30 h sleep stays quiet when
+/// its reporter says it again a minute later: the read is filed at the wall clock the press
+/// carried. NEGATIVE CONTROL: filed at the row's own reading instead (`Live::wall_at`, the post's
+/// wall plus the monotonic time since, which stopped while the Mac slept), the read lands at
+/// T0 + 1 min, its day's quiet lapses six hours before the re-post, and the re-post is `New`.
+#[test]
+fn a_standing_row_read_after_a_sleep_stays_quiet() {
+    let now0 = t0();
+    let at = |secs: u64| now0 + Duration::from_secs(secs);
+    let mut c = fresh(now0);
+    let id = c.post(agent_down(), stamp(0), now0).id;
+    let slept = 30 * 3_600_000; // 30 h of wall clock, none of it on the Instant
+    let read = stamp(slept + 60_000);
+    assert!(c.mark_seen(id, read, at(60)), "the read folds it");
+    assert_eq!(
+        c.log().get(id).unwrap().retired_unix_ms,
+        Some(read.unix_ms),
+        "filed when the owner read it"
+    );
+    let again = c.post(agent_down(), stamp(slept + 120_000), at(120));
+    assert_eq!(
+        (again.id, again.outcome),
+        (id, PostOutcome::Suppressed),
+        "the owner read this row a minute ago"
+    );
+}
+
+/// The inverse: the quiet a read after a sleep starts runs `STANDING_QUIET` from the read and no
+/// longer, so a fact the owner still has comes back the day after the read. NEGATIVE CONTROL:
+/// filed at the row's own sleep-blind reading, the read lands 30 h early and the re-post a minute
+/// before the read's day ends is `New`; filed any later than the press, or held quiet for good,
+/// the re-post at the day's end stays `Suppressed`.
+#[test]
+fn a_standing_row_read_after_a_sleep_is_news_a_day_after_the_read() {
+    let now0 = t0();
+    let at = |secs: u64| now0 + Duration::from_secs(secs);
+    let mut c = fresh(now0);
+    let id = c.post(agent_down(), stamp(0), now0).id;
+    let read_ms = 30 * 3_600_000 + 60_000;
+    assert!(c.mark_seen(id, stamp(read_ms), at(60)));
+    let day = u64::try_from(crate::need::STANDING_QUIET.as_millis()).unwrap();
+    let inside = c.post(agent_down(), stamp(read_ms + day - 60_000), at(120));
+    assert_eq!(
+        (inside.id, inside.outcome),
+        (id, PostOutcome::Suppressed),
+        "a minute before the read's day ends"
+    );
+    let after = c.post(agent_down(), stamp(read_ms + day), at(180));
+    assert_eq!(
+        after.outcome,
+        PostOutcome::New,
+        "the day after the read: news"
+    );
+}
+
+/// A standing row the owner dismisses, and one the owner answers, a minute after the Mac woke from
+/// a 30 h sleep stay quiet when their reporter says them again a minute later: `dismiss` and
+/// `answer` file at the wall clock the press carried. NEGATIVE CONTROL: either one filed at the
+/// row's own reading instead (`Live::wall_at`, the post's wall plus the monotonic time since,
+/// which stopped while the Mac slept) lands at T0 + 1 min, its day's quiet lapses six hours
+/// before the re-post, and that re-post is `New`.
+#[test]
+fn a_standing_row_dismissed_or_answered_after_a_sleep_stays_quiet() {
+    let now0 = t0();
+    let at = |secs: u64| now0 + Duration::from_secs(secs);
+    let answered_row = || agent_down().key("harness.upgrade.s-2");
+    let mut c = fresh(now0);
+    let dismissed = c.post(agent_down(), stamp(0), now0).id;
+    let answered = c.post(answered_row(), stamp(0), now0).id;
+    let slept = 30 * 3_600_000; // 30 h of wall clock, none of it on the Instant
+    let pressed = stamp(slept + 60_000);
+    assert!(c.dismiss(dismissed, pressed, at(60)));
+    assert!(c.answer(answered, "Done", pressed, at(60)));
+    for id in [dismissed, answered] {
+        assert_eq!(
+            c.log().get(id).unwrap().retired_unix_ms,
+            Some(pressed.unix_ms),
+            "message {id} is filed when the owner pressed"
+        );
+    }
+    let later = stamp(slept + 120_000);
+    for (msg, id) in [(agent_down(), dismissed), (answered_row(), answered)] {
+        let again = c.post(msg, later, at(120));
+        assert_eq!(
+            (again.id, again.outcome),
+            (id, PostOutcome::Suppressed),
+            "the owner put this row away a minute ago"
+        );
+    }
+}
+
+/// A standing ask the owner declines with its `Not now` capsule a minute after the Mac woke from
+/// a 30 h sleep stays quiet when its reporter says it again a minute later: `act` logs the press
+/// (its `Acted` line, `last_action`) and files the answer it ends the row with at the wall clock
+/// the press carried. NEGATIVE CONTROL: the press logged or the answer filed at the row's own
+/// reading instead (`Live::wall_at`, which the sleep left 30 h behind) lands at T0 + 1 min; the
+/// answer's day of quiet then lapses six hours before the re-post, and the re-post is `New`.
+#[test]
+fn a_standing_ask_declined_after_a_sleep_stays_quiet() {
+    let now0 = t0();
+    let at = |secs: u64| now0 + Duration::from_secs(secs);
+    let asking = || {
+        agent_down()
+            .action(Intent::ShowTab { tab: 1, window: 1 })
+            .action(Intent::NotNow {
+                decision: crate::model::Decision::FileAccess,
+            })
+    };
+    let mut c = fresh(now0);
+    let id = c.post(asking(), stamp(0), now0).id;
+    let slept = 30 * 3_600_000; // 30 h of wall clock, none of it on the Instant
+    let pressed = stamp(slept + 60_000);
+    let declined = c.act(id, ActionIndex(1), pressed, at(60)).unwrap();
+    assert!(matches!(declined, Intent::NotNow { .. }), "{declined:?}");
+    let rec = c.log().get(id).unwrap();
+    assert_eq!(
+        rec.last_action,
+        Some(("Not now".to_string(), pressed.unix_ms)),
+        "the press is logged when the owner pressed"
+    );
+    assert!(matches!(
+        rec.retired(),
+        Some(Retired::Answered { label }) if label == "Not now"
+    ));
+    assert_eq!(
+        rec.retired_unix_ms,
+        Some(pressed.unix_ms),
+        "the answer is filed when the owner pressed"
+    );
+    let again = c.post(asking(), stamp(slept + 120_000), at(120));
+    assert_eq!(
+        (again.id, again.outcome),
+        (id, PostOutcome::Suppressed),
+        "the owner declined this row a minute ago"
+    );
+}
+
+/// The digest's twin of `a_standing_row_read_after_a_sleep_stays_quiet`: an exception the owner
+/// dismisses a minute after the Mac woke from an 8-day sleep, longer than its 7-day span
+/// (`Resurface::WAIT`), stays quiet when its reporter says it again a minute later, because the
+/// dismissal is filed at the wall clock the press carried. NEGATIVE CONTROL: filed at the entry's
+/// own reading instead (`digest::Entry::wall_at`, the post's wall plus the monotonic time since,
+/// which the sleep left 8 days behind), the dismissal lands at T0 + 1 min, its span ends a day
+/// before the re-post, and the re-post is `New`.
+#[test]
+fn an_exception_dismissed_after_a_sleep_stays_quiet() {
+    let now0 = t0();
+    let at = |secs: u64| now0 + Duration::from_secs(secs);
+    let mut c = fresh(now0);
+    let id = c.post(own_work("tab 1"), stamp(0), now0).id;
+    let slept = 8 * DAY_MS;
+    let dismissed = stamp(slept + 60_000);
+    assert!(c.file_digest_one(id, dismissed, at(60)));
+    assert_eq!(
+        c.log().get(id).unwrap().retired_unix_ms,
+        Some(dismissed.unix_ms)
+    );
+    let again = c.post(own_work("tab 1"), stamp(slept + 120_000), at(120));
+    assert_eq!(
+        (again.id, again.outcome),
+        (id, PostOutcome::Suppressed),
+        "the owner dismissed it a minute ago"
     );
 }
 
@@ -1181,7 +1349,7 @@ fn a_standing_row_whose_read_occurrence_ended_is_news_when_another_begins() {
         !c.end_standing_quiet("harness.upgrade.s-1", stamp(1), now),
         "a live row keeps its own quiet"
     );
-    assert!(c.mark_seen(id, now));
+    assert!(c.mark_seen(id, stamp(0), now));
     assert_eq!(
         c.post(agent_down(), stamp(1_000), now).outcome,
         PostOutcome::Suppressed,
@@ -1212,7 +1380,7 @@ fn a_filing_holds_for_its_episode_until_its_end_is_said() {
     assert!(!c.filed_standing(key, stamp(0)), "never filed");
     let id = c.post(agent_down(), stamp(0), now).id;
     assert!(!c.filed_standing(key, stamp(1)), "live");
-    assert!(c.mark_seen(id, now));
+    assert!(c.mark_seen(id, stamp(0), now));
     assert!(c.filed_standing(key, stamp(1_000)));
     assert!(
         c.filed_standing(key, stamp(3 * DAY_MS)),

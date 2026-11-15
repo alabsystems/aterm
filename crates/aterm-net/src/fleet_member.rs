@@ -3395,7 +3395,12 @@ pub fn record_with_denied(
         } else {
             (peer.via, peer.fleet)
         };
-        let addr = peer.addr.or(known.addr);
+        // An observation belongs to the endpoint it reached. A new signed host or port
+        // invalidates that observation; relayed unsigned addresses remain discarded above.
+        let same_endpoint = peer.host == known.host && peer.port == known.port;
+        let addr = peer
+            .addr
+            .or_else(|| same_endpoint.then_some(known.addr).flatten());
         *known = Peer {
             addr,
             key_from,
@@ -3723,6 +3728,11 @@ pub struct Keyring {
 }
 
 impl Keyring {
+    /// Whether no retained book binds any peer node key.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.own.is_empty() && self.copied.is_empty()
+    }
     /// The keys `peers` bind, a copy's ([`Via::IssuerBook`]) ranked under every other entry's
     /// wherever it stands, and the issuer they name.
     #[must_use]
@@ -6195,19 +6205,25 @@ pub enum BookUnread {
 impl fmt::Display for BookUnread {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Older(at) => write!(
+            Self::Older(_) => write!(
                 f,
-                "the issuer at {at} runs an older aterm, which shares no book"
+                "the issuer runs an older aterm, which shares no book; update aterm there"
             ),
-            Self::NoBook { at, why, .. } => write!(f, "the machine at {at} shares no book: {why}"),
-            Self::NotNow { at, why, .. } => {
-                write!(f, "the issuer at {at} cannot share its book now: {why}")
+            Self::NoBook { why, .. } => write!(
+                f,
+                "the member shares no book: {why}; check fleet membership there"
+            ),
+            Self::NotNow { why, .. } => {
+                write!(
+                    f,
+                    "the issuer cannot share its book now: {why}; check `aterm node status` there"
+                )
             }
             // By a head the issuer's own id does not share: a node that chose an id beginning
             // as the issuer's reads as another.
-            Self::OtherNode { at, said, want } => write!(
+            Self::OtherNode { said, want, .. } => write!(
                 f,
-                "{at} answered as node {}, not this Mac's issuer",
+                "node {} answered instead of this Mac's issuer; run `aterm fleet sync` here",
                 node_head(said, &[want])
             ),
             Self::Unreached(unreached) => write!(f, "{unreached}"),
@@ -6242,58 +6258,86 @@ fn fetch_book_with<'a>(
     issuer: &Target,
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     (deadline, within): (Instant, Duration),
+    (held, first): (Option<&'a HeldAddrs>, Option<(SocketAddr, Opened<'a>)>),
+    resolver: impl Fn(&str, u16) -> Vec<SocketAddr> + Clone + Send + 'static,
+) -> Result<Book, BookUnread> {
+    fetch_book_with_routes(
+        issuer,
+        (secret, me),
+        (deadline, within),
+        (held, first),
+        resolver,
+        &[],
+    )
+}
+
+fn fetch_book_with_routes<'a>(
+    issuer: &Target,
+    (secret, me): (&FleetSecret, Option<&NodeIdentity>),
+    (deadline, within): (Instant, Duration),
     (held, mut first): (Option<&'a HeldAddrs>, Option<(SocketAddr, Opened<'a>)>),
     resolver: impl Fn(&str, u16) -> Vec<SocketAddr> + Clone + Send + 'static,
+    routes: &[SocketAddr],
 ) -> Result<Book, BookUnread> {
     let keys = Keyring {
         issuer: issuer.node.clone(),
         ..Keyring::default()
     };
-    walk_target(issuer, &keys, (deadline, within), resolver, |to| {
-        // Keep the address until read_book_reply has dropped its stream, including a
-        // legacy reply whose header names another node and leaves this walk looking.
-        let mine = match first.take() {
-            Some((at, opened)) if at == to => Some(opened),
-            _ => held.and_then(|held| held.enter_after(to, deadline)),
-        };
-        let reached = reach(
-            to,
-            (secret, me),
-            FleetOp::Book,
-            (deadline, within),
-            &|_, _| None,
-        )
-        .and_then(|reached| {
-            // Judge this address before keeping its exchange: a different member at a
-            // stale address leaves the issuer's other addresses available. An unbound
-            // older issuer still supplies the same unproved book it did before.
-            answered_as(issuer, &keys, to, reached.peer.as_ref())
-                .map(|answered| (reached, answered.is_some_and(|(_, proven)| proven)))
-        })
-        .and_then(|(reached, proven)| {
-            match read_book_reply(reached, issuer, proven, (deadline, within)) {
-                // An older peer proves no node in its handshake: its header supplies
-                // the identity that this same target walk must judge before ending.
-                Err(BookUnread::OtherNode { at, said, want }) => {
-                    Err(Unreached::OtherNode { at, said, want })
+    walk_target_pass_routes(
+        issuer,
+        &keys,
+        (deadline, within),
+        resolver,
+        routes,
+        |to, (deadline, within)| {
+            // Keep the address until read_book_reply has dropped its stream, including a
+            // legacy reply whose header names another node and leaves this walk looking.
+            let mine = match first.take() {
+                Some((at, opened)) if at == to => Some(opened),
+                _ => held.and_then(|held| held.enter_after(to, deadline)),
+            };
+            let reached = reach(
+                to,
+                (secret, me),
+                FleetOp::Book,
+                (deadline, within),
+                &|_, _| None,
+            )
+            .and_then(|reached| {
+                // Judge this address before keeping its exchange: a different member at a
+                // stale address leaves the issuer's other addresses available. An unbound
+                // older issuer still supplies the same unproved book it did before.
+                answered_as(issuer, &keys, to, reached.peer.as_ref())
+                    .map(|answered| (reached, answered.is_some_and(|(_, proven)| proven)))
+            })
+            .and_then(|(reached, proven)| {
+                match read_book_reply(reached, issuer, proven, (deadline, within)) {
+                    // An older peer proves no node in its handshake: its header supplies
+                    // the identity that this same target walk must judge before ending.
+                    Err(BookUnread::OtherNode { at, said, want }) => {
+                        Err(Unreached::OtherNode { at, said, want })
+                    }
+                    result => Ok(result),
                 }
-                result => Ok(result),
-            }
-        });
-        if let Some(mut mine) = mine {
-            match &reached {
-                AtAddr::Passed(why @ Unreached::Connect(..)) => mine.close(Exchanged::Failed {
-                    passed: true,
-                    why: why.copied(),
-                }),
-                AtAddr::Reached(_) | AtAddr::Passed(_) | AtAddr::Ended(_) | AtAddr::Refused(_) => {
-                    mine.close(Exchanged::Unasked);
+            });
+            if let Some(mut mine) = mine {
+                match &reached {
+                    AtAddr::Passed(why @ Unreached::Connect(..)) => mine.close(Exchanged::Failed {
+                        passed: true,
+                        why: why.copied(),
+                    }),
+                    AtAddr::Reached(_)
+                    | AtAddr::Passed(_)
+                    | AtAddr::Ended(_)
+                    | AtAddr::Refused(_) => {
+                        mine.close(Exchanged::Unasked);
+                    }
                 }
             }
-        }
-        reached
-    })
-    .map_err(|unreached| match unreached {
+            reached
+        },
+    )
+    .map_err(|failed| match failed.why {
         Unreached::Handshake(at, FleetError::UnknownOp(_)) => BookUnread::Older(at),
         Unreached::OtherNode { at, said, want } => BookUnread::OtherNode { at, said, want },
         other => BookUnread::Unreached(other),
@@ -6920,6 +6964,72 @@ pub enum Stage {
 }
 
 impl Unreached {
+    /// Cause and next check for a named member, without exposing transport coordinates.
+    /// A timeout alone cannot distinguish sleep, a firewall, and an obsolete route.
+    #[must_use]
+    pub fn guidance(&self) -> &'static str {
+        if matches!(self, Self::Lookup(..)) {
+            // The members desk also reads this lookup marker when classifying a failed join.
+            return "no DNS or multicast-DNS answer; run `aterm fleet sync` here and check aterm there";
+        }
+        if let Self::Handshake(_, error) = self {
+            return match error {
+                FleetError::ListenerWrongSecret => {
+                    "fleet secrets differ; run `aterm fleet sync` on both Macs"
+                }
+                FleetError::Refused => {
+                    "fleet proof refused there; check membership and grants with `aterm fleet peers` on both Macs"
+                }
+                FleetError::DeniedNode => {
+                    "this Mac was denied there; check membership with `aterm fleet peers` there"
+                }
+                FleetError::DenyListUnread => {
+                    "authorization state unread there; admits nobody; run `aterm node status` there"
+                }
+                FleetError::AddressBusy => {
+                    "fleet listener at capacity there; run `aterm node status` there and wait for requests to finish"
+                }
+                FleetError::UnknownOp(_) => {
+                    "operation not served for this Mac; check sharing and grants with `aterm fleet peers` there"
+                }
+                FleetError::Alpn => {
+                    "fleet protocol not agreed; run `aterm fleet sync` on both Macs and check their versions"
+                }
+                _ => {
+                    "fleet handshake did not complete; run `aterm node status` and check membership there"
+                }
+            };
+        }
+        match self.reason() {
+            "no-name" => {
+                "member name was not found here; check aterm is running there, then run `aterm fleet sync` here"
+            }
+            "nothing-listens" => {
+                "saved route refused; run `aterm fleet sync` here and `aterm node status` there"
+            }
+            "no-answer" => {
+                "no connection; cause unknown; run `aterm fleet peers` here and `aterm node status` there"
+            }
+            "no-route" => {
+                "no route from this Mac; check both Macs are online, then run `aterm fleet sync` here"
+            }
+            "refused-here" => {
+                "connection refused here by sandbox or firewall; run outside the sandbox or check its policy"
+            }
+            "lan-broker" => "LAN service unavailable here; run `aterm doctor` here",
+            "reset" | "no-handshake" => {
+                "connected, but no fleet handshake; check `aterm node status` there for restart or load"
+            }
+            "no-reply" => "connected, but no complete answer; run `aterm node status` there",
+            "identity" => {
+                "bound identity was not proved; run `aterm fleet sync` on both Macs; keep identity checks on"
+            }
+            "handshake" => {
+                "fleet handshake refused; check membership and grants on both Macs with `aterm fleet peers`"
+            }
+            _ => "dial unavailable here; run `aterm doctor` here and `aterm node status` there",
+        }
+    }
     /// The same failure again, for each dial of a read that meets the one exchange at an address
     /// ([`HeldAddrs`]).
     fn copied(&self) -> Self {
@@ -7003,7 +7113,7 @@ impl Unreached {
     }
 
     /// One token for the kind of failure, out of [`REASONS`]: what a reader groups and draws by,
-    /// where the words ([`fmt::Display`]) name the address and are for a person. A survey's
+    /// where the words ([`fmt::Display`]) give the cause and next check. A survey's
     /// error row carries it as `"reason"`.
     #[must_use]
     pub fn reason(&self) -> &'static str {
@@ -7159,177 +7269,7 @@ impl Unreached {
 
 impl fmt::Display for Unreached {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Resolve(host) => write!(f, "{host} resolves to no address"),
-            Self::Connect(addr, e) => match e.kind() {
-                io::ErrorKind::ConnectionRefused => write!(
-                    f,
-                    "nothing listens on {addr}: no aterm running there, or no [fleet] listen"
-                ),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
-                    write!(f, "{addr} did not answer in time")
-                }
-                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => write!(
-                    f,
-                    "{addr} reset the connection: its fleet listener closing or restarting; try \
-                     again"
-                ),
-                io::ErrorKind::HostUnreachable => {
-                    write!(f, "no route to {}: off the LAN, asleep or off", addr.ip())
-                }
-                io::ErrorKind::NetworkUnreachable => write!(
-                    f,
-                    "this machine has no route to {addr}: offline, or a VPN holds the LAN's route"
-                ),
-                io::ErrorKind::PermissionDenied => f.write_str(
-                    "a sandbox here (Claude Code's) or firewall refused: run outside it",
-                ),
-                _ => write!(f, "{addr}: {e}"),
-            },
-            Self::Handshake(addr, _) if self.hung_up() => write!(
-                f,
-                "{addr} hung up mid-handshake: listener busy, restarting, or not aterm; try again"
-            ),
-            Self::Handshake(addr, e) => match e {
-                FleetError::ListenerWrongSecret => write!(
-                    f,
-                    "another secret at {addr}: the fleet rotated (join again with the new \
-                     code) or it left"
-                ),
-                FleetError::Refused => write!(
-                    f,
-                    "{addr} refused this machine's proof: this machine holds another fleet's \
-                     secret"
-                ),
-                FleetError::DeniedNode => write!(
-                    f,
-                    "{addr} refused this machine's node: it is on the swarm roster's deny-list"
-                ),
-                FleetError::DenyListUnread => write!(
-                    f,
-                    "{addr} has not read its deny list yet, so it admits no one: try again once \
-                     it has"
-                ),
-                FleetError::Alpn => write!(f, "{addr} is a pre-fleet aterm listener (update it)"),
-                FleetError::AddressBusy => write!(
-                    f,
-                    "{addr} is busy with other reads from this machine's address: try again when \
-                     one ends"
-                ),
-                FleetError::UnknownOp(op) if op == FleetOp::Drive.word() => write!(
-                    f,
-                    "{addr} lets no one drive it: its person runs `aterm fleet allow drive \
-                     --from <this Mac>` (or `--all`, every member) there, or it runs an older \
-                     aterm"
-                ),
-                FleetError::UnknownOp(op) => write!(
-                    f,
-                    "{addr} does not serve `{op}`: an older aterm (update it)"
-                ),
-                FleetError::UnknownScope(scope) => write!(
-                    f,
-                    "{addr} serves a fleet level unknown here: update this aterm (`{}`)",
-                    scope.chars().take(16).collect::<String>()
-                ),
-                FleetError::Tls(e) => write!(f, "{addr} is no fleet listener (TLS: {e})"),
-                other => write!(f, "{addr}: {other}"),
-            },
-            Self::Deadline(stage, within) => {
-                let within = within.as_secs_f64();
-                match stage {
-                    Stage::Connect => write!(f, "no connection within {within:.1}s"),
-                    Stage::Handshake => write!(
-                        f,
-                        "connected, but no fleet handshake within {within:.1}s: an aterm \
-                         stopped or overloaded, or no aterm there"
-                    ),
-                    Stage::Answer => write!(
-                        f,
-                        "authentication completed, but the exchange did not finish within \
-                         {within:.1}s"
-                    ),
-                    Stage::Book => write!(
-                        f,
-                        "proved itself, but sent no book within {within:.1}s: an aterm stopped \
-                         or overloaded"
-                    ),
-                }
-            }
-            Self::Lookup(host, within) => write!(
-                f,
-                "{host} did not resolve within {:.1}s ({LOOKUP_UNANSWERED})",
-                within.as_secs_f64()
-            ),
-            Self::Reply(addr, why) => write!(f, "{addr} {why}"),
-            Self::NotFleet(addr) => write!(
-                f,
-                "{} is no LAN address (loopback, private, link-local): not dialled, a fleet is \
-                 one LAN",
-                addr.ip()
-            ),
-            Self::OtherNode { at, said, want } => write!(
-                f,
-                "{} is node {} now: rejoin this peer, or `aterm fleet peers rm {}` if it left",
-                at.ip(),
-                node_head(said, &[want]),
-                node_head(want, &[said])
-            ),
-            Self::Impostor {
-                at,
-                node,
-                issuer: false,
-            } => write!(
-                f,
-                "{} claims node {} with another key: not read (re-keyed? peers rm it on the \
-                 issuer)",
-                at.ip(),
-                node.get(..8).unwrap_or(node)
-            ),
-            Self::Impostor {
-                at,
-                node,
-                issuer: true,
-            } => write!(
-                f,
-                "{} claims issuer {} with another key: not read (re-keyed? peers rm it here, \
-                 rejoin)",
-                at.ip(),
-                node.get(..8).unwrap_or(node)
-            ),
-            Self::Misnamed {
-                at,
-                proved,
-                claimed,
-            } => write!(
-                f,
-                "{} proved node {}, its survey says node {}: not read (restart aterm there)",
-                at.ip(),
-                node_head(proved, &[claimed]),
-                // As long as the proved node's head, where the two first differ.
-                claimed
-                    .chars()
-                    .take(node_head(proved, &[claimed]).len())
-                    .collect::<String>()
-            ),
-            Self::Unproved { at, node } => write!(
-                f,
-                "{} proves no key for node {}, which is bound to one: not read (update aterm \
-                 there)",
-                at.ip(),
-                node.get(..8).unwrap_or(node)
-            ),
-            Self::Unbound { at, node } => write!(
-                f,
-                "{} proved no node this machine binds a key to{}: not driven (`aterm fleet \
-                 peers` reads the issuer's book)",
-                at.ip(),
-                node.as_deref().map_or_else(String::new, |node| format!(
-                    " (it claims {})",
-                    node.get(..8).unwrap_or(node)
-                ))
-            ),
-            Self::Local(why) => f.write_str(why),
-        }
+        f.write_str(self.guidance())
     }
 }
 
@@ -8392,8 +8332,25 @@ pub fn survey_one_by(
     deadline: (Instant, Duration),
     request: &str,
 ) -> Result<Surveyed, Unreached> {
+    survey_one_routes(target, keys, (secret, me), deadline, request, &[])
+}
+
+/// Survey a bound target through discovered routes, then its saved endpoint.
+/// # Errors
+/// As [`survey_one_by`].
+pub fn survey_one_routes(
+    target: &Target,
+    keys: &Keyring,
+    identity: (&FleetSecret, Option<&NodeIdentity>),
+    deadline: (Instant, Duration),
+    request: &str,
+    routes: &[SocketAddr],
+) -> Result<Surveyed, Unreached> {
     let held = std::sync::Arc::new(HeldAddrs::default());
-    read_one_by(target, keys, (secret, me), deadline, request, &held)
+    walk_target_pass_routes(target, keys, deadline, resolve, routes, |to, by| {
+        ask_at(target, keys, to, identity, by, request, &held)
+    })
+    .map_err(|failed| failed.why)
 }
 
 /// What [`dial`] takes for `peer`, and the node and key it should be.
@@ -8457,11 +8414,39 @@ pub fn read_whole(
     within: Duration,
     request: &str,
 ) -> (Vec<PeerRead>, BookRead) {
+    read_whole_routes(peers, keys, own, (secret, me), within, request, &[])
+}
+
+/// A whole fleet read using discovered endpoints as hints, each still held to the target's
+/// bound key. A port learned after restart need not wait for a book relay.
+#[must_use]
+pub fn read_whole_routes(
+    peers: &[Peer],
+    keys: &Keyring,
+    own: Option<&str>,
+    (secret, me): (&FleetSecret, Option<&NodeIdentity>),
+    within: Duration,
+    request: &str,
+    routes: &[(String, SocketAddr)],
+) -> (Vec<PeerRead>, BookRead) {
+    let hints = |target: &Target| -> Vec<SocketAddr> {
+        routes
+            .iter()
+            .filter(|(node, _)| target.node.as_deref() == Some(node.as_str()))
+            .map(|(_, at)| *at)
+            .collect()
+    };
+    let read_by = |target: &Target, keys: &Keyring, by, held: &HeldAddrs| {
+        walk_target_pass_routes(target, keys, by, resolve, &hints(target), |to, by| {
+            ask_at(target, keys, to, (secret, me), by, request, held)
+        })
+        .map_err(|failed| failed.why)
+    };
     let Some(issuer_at) = peers.iter().position(|peer| peer.via == Via::Issuer) else {
         let targets: Vec<Target> = peers.iter().map(target_of).collect();
         let held = std::sync::Arc::new(HeldAddrs::default());
         let reads = at_once(&targets, AT_ONCE, |target| {
-            read_one(target, keys, (secret, me), within, request, &held)
+            read_by(target, keys, (deadline_after(within), within), &held)
         });
         let reads = peers
             .iter()
@@ -8501,7 +8486,7 @@ pub fn read_whole(
             let Some(((at, target, by, read), keys)) = next else {
                 return done;
             };
-            let answer = read_one_by(&target, &keys, (secret, me), by, request, held);
+            let answer = read_by(&target, &keys, by, held);
             if let Some(node) = refused_for(&answer) {
                 lock().refused(at, node, &keys, by);
             }
@@ -8540,11 +8525,13 @@ pub fn read_whole(
                 };
                 let mut helpers = Vec::new();
                 let mut dropped = Vec::new();
-                let fetched = fetch_book_in(
+                let fetched = fetch_book_with_routes(
                     &issuer,
                     (secret, me),
                     deadline,
                     (Some(held.as_ref()), first),
+                    resolve,
+                    &hints(&issuer),
                 );
                 if let Ok(book) = &fetched {
                     (dropped, helpers) = take(book);
@@ -8553,7 +8540,7 @@ pub fn read_whole(
                     Err(BookUnread::Unreached(unreached))
                         if ends_the_seat(&unreached, deadline.0, Instant::now()) =>
                     {
-                        let why = unreached.to_string();
+                        let why = unreached.guidance().to_owned();
                         (Err(unreached), BookRead::Unread(why))
                     }
                     mut fetched => {
@@ -8562,8 +8549,7 @@ pub fn read_whole(
                             ..issuer.clone()
                         };
                         let keys = std::sync::Arc::clone(&lock().keys);
-                        let issuer_read =
-                            read_one_by(&surveyed, &keys, (secret, me), deadline, request, held);
+                        let issuer_read = read_by(&surveyed, &keys, deadline, held);
                         let want = issuer.node.as_deref();
                         let found = match &issuer_read {
                             Ok(surveyed) if want.is_some() && surveyed.node.as_deref() == want => {
@@ -8988,8 +8974,8 @@ fn read_one_with(
     held: &HeldAddrs,
     resolver: impl Fn(&str, u16) -> Vec<SocketAddr> + Clone + Send + 'static,
 ) -> Result<Surveyed, Unreached> {
-    walk_target(target, keys, deadline, resolver, |to| {
-        ask_at(target, keys, to, identity, deadline, request, held)
+    walk_target(target, keys, deadline, resolver, |to, by| {
+        ask_at(target, keys, to, identity, by, request, held)
     })
 }
 
@@ -9060,15 +9046,30 @@ pub fn drive(
     (secret, me): (&FleetSecret, &NodeIdentity),
     deadline: (Instant, Duration),
 ) -> Result<Driven, Unreached> {
+    drive_routes(target, keys, (secret, me), deadline, &[])
+}
+
+/// Reach a bound node using discovered routes before its recorded endpoint. Hints carry no
+/// authority: every connection must prove the same node key, grant and fleet secret.
+/// # Errors
+/// As [`drive`].
+pub fn drive_routes(
+    target: &Target,
+    keys: &Keyring,
+    identity: (&FleetSecret, &NodeIdentity),
+    deadline: (Instant, Duration),
+    routes: &[SocketAddr],
+) -> Result<Driven, Unreached> {
     let (by, within) = deadline;
     let (reached, node) = passes((by, further_passes_end(deadline)), |by| {
-        reach_node_pass(
+        reach_node_pass_routes(
             target,
             keys,
-            (secret, me),
+            identity,
             FleetOp::Drive,
             (by, within),
             resolve,
+            routes,
         )
     })?;
     driven(reached, node, deadline)
@@ -9120,8 +9121,20 @@ fn reach_node_pass(
     deadline: (Instant, Duration),
     resolver: impl Fn(&str, u16) -> Vec<SocketAddr> + Clone + Send + 'static,
 ) -> Result<(Reached, String), PassFailure> {
-    walk_target_pass(target, keys, deadline, resolver, |to| {
-        reach(to, (secret, Some(me)), op, deadline, &|_, _| None).and_then(|reached| {
+    reach_node_pass_routes(target, keys, (secret, me), op, deadline, resolver, &[])
+}
+
+fn reach_node_pass_routes(
+    target: &Target,
+    keys: &Keyring,
+    (secret, me): (&FleetSecret, &NodeIdentity),
+    op: FleetOp,
+    deadline: (Instant, Duration),
+    resolver: impl Fn(&str, u16) -> Vec<SocketAddr> + Clone + Send + 'static,
+    routes: &[SocketAddr],
+) -> Result<(Reached, String), PassFailure> {
+    walk_target_pass_routes(target, keys, deadline, resolver, routes, |to, by| {
+        reach(to, (secret, Some(me)), op, by, &|_, _| None).and_then(|reached| {
             let at = reached.addr;
             match answered_as(target, keys, at, reached.peer.as_ref())? {
                 Some((node, true)) => Ok((reached, node)),
@@ -9137,12 +9150,14 @@ fn reach_node_pass(
 /// Try every address of one target once under its original deadline. An identity rejected at
 /// one address leaves the rest available; if none reaches the target, the first such error
 /// stands. A refusal proved by the bound target itself is authoritative and ends this pass.
+/// Known alternatives share the remaining deadline; a pending name lookup retains one share.
+/// A numeric signed host is already known and does not wait behind a stale route's full budget.
 fn walk_target<R>(
     target: &Target,
     keys: &Keyring,
     deadline: (Instant, Duration),
     resolver: impl Fn(&str, u16) -> Vec<SocketAddr> + Clone + Send + 'static,
-    attempt: impl FnMut(SocketAddr) -> AtAddr<R>,
+    attempt: impl FnMut(SocketAddr, (Instant, Duration)) -> AtAddr<R>,
 ) -> Result<R, Unreached> {
     walk_target_pass(target, keys, deadline, resolver, attempt).map_err(|failed| failed.why)
 }
@@ -9152,15 +9167,76 @@ fn walk_target_pass<R>(
     keys: &Keyring,
     deadline: (Instant, Duration),
     resolver: impl Fn(&str, u16) -> Vec<SocketAddr> + Clone + Send + 'static,
-    mut attempt: impl FnMut(SocketAddr) -> AtAddr<R>,
+    attempt: impl FnMut(SocketAddr, (Instant, Duration)) -> AtAddr<R>,
+) -> Result<R, PassFailure> {
+    walk_target_pass_routes(target, keys, deadline, resolver, &[], attempt)
+}
+
+fn walk_target_pass_routes<R>(
+    target: &Target,
+    keys: &Keyring,
+    deadline: (Instant, Duration),
+    resolver: impl Fn(&str, u16) -> Vec<SocketAddr> + Clone + Send + 'static,
+    routes: &[SocketAddr],
+    mut attempt: impl FnMut(SocketAddr, (Instant, Duration)) -> AtAddr<R>,
 ) -> Result<R, PassFailure> {
     let mut rejected = false;
-    walk_pass(
-        (&target.host, target.addr, target.port),
-        deadline,
-        (&[], resolver),
+    let numeric = target
+        .host
+        .parse::<IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::new(ip, target.port));
+    let pending_lookup = std::cell::Cell::new(numeric.is_none());
+    let remaining = std::cell::Cell::new(0usize);
+    let offered = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    walk_lookups(
+        (&target.host, None, target.port),
+        deadline.1,
+        &[],
+        || {
+            let recorded = target.addr.map(|ip| SocketAddr::new(ip, target.port));
+            let first: Vec<_> = routes
+                .iter()
+                .copied()
+                .chain(recorded)
+                .chain(numeric)
+                .collect();
+            std::iter::once(Lookup::Found(first))
+                .chain(
+                    std::iter::once_with(|| {
+                        pending_lookup.set(false);
+                        resolve_batches(&target.host, target.port, deadline.0, resolver)
+                    })
+                    .flatten(),
+                )
+                .map(|batch| match batch {
+                    Lookup::Found(mut addresses) => {
+                        addresses.retain(|at| offered.borrow_mut().insert(*at));
+                        remaining.set(addresses.len());
+                        Lookup::Found(addresses)
+                    }
+                    other => other,
+                })
+        },
         |to| {
-            let tried = match attempt(to) {
+            remaining.set(remaining.get().saturating_sub(1));
+            let slots = u32::try_from(
+                remaining
+                    .get()
+                    .saturating_add(1 + usize::from(pending_lookup.get())),
+            )
+            .unwrap_or(u32::MAX);
+            let now = Instant::now();
+            let share = deadline.0.saturating_duration_since(now) / slots;
+            let by = (
+                if slots == 1 { deadline.0 } else { now + share },
+                if slots == 1 {
+                    deadline.1
+                } else {
+                    deadline.1.min(share)
+                },
+            );
+            let tried = match attempt(to, by) {
                 AtAddr::Refused(refused) => {
                     match answered_as(target, keys, to, Some(&refused.peer)) {
                         Ok(Some((_, true))) => return AtAddr::Ended(refused.why),
@@ -9179,6 +9255,9 @@ fn walk_target_pass<R>(
                     | Unreached::Unbound { .. }),
                 ) => {
                     rejected = true;
+                    AtAddr::Passed(why)
+                }
+                AtAddr::Ended(why @ Unreached::Deadline(..)) if Instant::now() < deadline.0 => {
                     AtAddr::Passed(why)
                 }
                 AtAddr::Ended(why @ Unreached::Deadline(..)) if rejected => AtAddr::Passed(why),

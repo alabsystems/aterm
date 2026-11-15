@@ -6,10 +6,8 @@
 
 use super::*;
 use crate::supervise::facts::FactKind;
-use crate::supervise::policy::turn_end::{
-    AccountAt, RULE_ACCOUNT, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT,
-    RULE_LIMIT_RESUME, RULE_LOGIN,
-};
+use crate::supervise::policy::turn_end::{AccountAt, RULE_ACCOUNT, RULE_LIMIT_RESUME, RULE_LOGIN};
+use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT};
 
 const SID: &str = "@s-1";
 
@@ -210,7 +208,7 @@ fn a_fact_line_keeps_a_done_check_owed() {
         1_000,
         RULE_DONE_CHECK,
         Outcome::Typed,
-        super::super::policy::turn_end::DONE_CHECK,
+        alab_policy::words::DONE_CHECK,
         "-",
     );
     invisible(&[check], |b| {
@@ -228,7 +226,7 @@ fn a_fact_line_keeps_a_wall_open() {
         &wall_wait_reason(
             Some(2_000),
             Some("3pm"),
-            aterm_phase::WallKind::UsageSession,
+            alab_policy::vocab::WallKind::UsageSession,
             "Session limit reached",
         ),
     );

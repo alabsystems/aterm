@@ -151,7 +151,7 @@ fn a_wakes_fact_rides_each_of_the_four_acts_whole_and_each_still_reads_as_its_ac
         assert!(text.chars().count() < LINE_CAP, "{text}");
         let reads = match a.rule_id() {
             Some(RULE_CONTINUE) => {
-                text.starts_with(&cfg().continue_text)
+                text.starts_with(&cfg().turn_end.continue_text)
                     && !is_done_check(text)
                     && !is_land_words(text)
             }
@@ -208,7 +208,7 @@ fn a_wakes_fact_never_rides_an_answer_a_retry_a_draft_or_an_upgrade() {
         WallKind::ApiError {
             code: Some(400),
             retryable: false,
-            cause: aterm_phase::ApiCause::Request,
+            cause: alab_policy::vocab::ApiCause::Request,
         },
         "API Error: 400 due to tool use concurrency issues.",
         Some(3 * MIN),

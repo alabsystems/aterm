@@ -58,9 +58,14 @@ fn dev_and_test_resolve_the_same_dependency_profiles() {
         if let Some(mutation) = mutation {
             cmd.args(["--config", mutation]);
         }
-        let output =
-            aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
-                .unwrap();
+        // Cargo resolves the workspace before it answers: on a loaded machine that outlasts
+        // any wall-clock minute while cargo keeps working, so the run is held to its progress.
+        let output = aterm_uds::deadline::output_while_process_progressing(
+            &mut cmd,
+            std::time::Duration::from_secs(60),
+            "cargo's unit graph",
+        )
+        .unwrap();
         assert!(
             output.status.success(),
             "{}",

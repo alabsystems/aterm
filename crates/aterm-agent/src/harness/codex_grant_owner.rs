@@ -2660,18 +2660,23 @@ pub(super) fn with_current_published_grant<R>(
     if process.birth != caller.birth || !consumer_capable(&process, false)? {
         return Err("credential consumer unsupported".into());
     }
-    with_canonical_owner(
+    let phase = std::cell::Cell::new("canonical-owner");
+    let result = with_canonical_owner(
         env,
         binding,
         |grant| {
+            phase.set("catalogue-participant");
             catalogue::require_participant(env, grant.binding, grant.identity)?;
+            phase.set("lineage-consumers");
             lineage_consumers_capable(env, grant.canonical_auth, grant.identity)?;
+            phase.set("consumer-incarnation");
             if Process::observe(caller.pid).as_ref() != Some(&process) {
                 return Err("credential consumer changed".into());
             }
             Ok(())
         },
         |grant| {
+            phase.set("grant-use");
             let result = use_grant(AdmittedGrant {
                 binding: grant.binding,
                 identity: grant.identity,
@@ -2685,7 +2690,15 @@ pub(super) fn with_current_published_grant<R>(
             }
             Ok(result)
         },
-    )
+    );
+    #[cfg(debug_assertions)]
+    if result.is_err() {
+        eprintln!(
+            "Source qualification native: published grant failed phase={}",
+            phase.get()
+        );
+    }
+    result
 }
 
 /// Resolve one target from the same canonical publication used by admission.

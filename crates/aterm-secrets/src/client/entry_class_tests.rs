@@ -71,7 +71,7 @@ fn a_set_apart_put_is_never_written_and_a_shared_one_is() {
     want.sort_unstable();
     assert_eq!(refused, want, "{report:?}");
     assert_eq!(
-        std::fs::read(m7.home.join(".secrets/shared-control")).unwrap(),
+        crate::client::stored(&m7, "shared-control").unwrap(),
         b"runs on every Mac",
         "CONTROL: a shared name is written"
     );
@@ -94,7 +94,7 @@ fn a_claude_token_entry_is_no_file_and_in_no_text() {
         assert!(!paths.home.join(".secrets").join(TOKEN).exists());
         assert!(!paths.home.join(".secrets").join(META).exists());
         assert!(
-            paths.home.join(".secrets/shared-control").exists(),
+            crate::client::stored(&paths, "shared-control").is_some(),
             "CONTROL"
         );
         let config = config(paths).unwrap().unwrap();

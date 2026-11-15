@@ -16,8 +16,11 @@
 //! [`SETTLE`] after it, a sweep of the process table and [`SAMPLE_PAUSE`] a reading (the report
 //! gives the gaps the readings lie apart, [`gaps`]), then read where the world gets to. Two more
 //! opens of this build's broker say where a peak comes from: one of an empty log (the process
-//! alone), one of the same records seeded plaintext. Last, this process times reads of records
-//! the residency budget leaves cold, sealed and plaintext ([`ColdReader`]).
+//! alone), one of the same records seeded plaintext. The sealed log's start after the seed's
+//! clean close takes records past its open's head ([`append_tail`]), is read whole ([`Whole`]) and
+//! `SIGKILL`ed ([`Killed`]), and the start after that
+//! unclean stop is held to serve it alike. Last, this process times reads of records the
+//! residency budget leaves cold, sealed and plaintext ([`ColdReader`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +68,16 @@ pub const SEED_NODE: &str = "n-0000000000000f09";
 
 /// The filler producer the seed publishes under.
 const SEED_PRODUCER: u64 = backlog::FILL_PRODUCER | 0x0f09_0000;
+
+/// The records the sealed log's clean start takes once it serves, before its `SIGKILL`
+/// ([`append_tail`]): past the head its open wrote into the identity sidecar, which no append
+/// rewrites, so the start after the kill finds a file longer than that head vouches for, as after
+/// a crash, and its columns' reservation adds an eighth over these (astream's `tier::predicted`).
+/// A count of its own, not the seed's: under the default rule's bytes at any seed.
+pub const UNCLEAN_TAIL: usize = 10_000;
+
+/// The producer [`append_tail`] publishes under.
+const TAIL_PRODUCER: u64 = backlog::FILL_PRODUCER | 0x7a11_0000;
 
 /// Cold-read passes over each log, the two logs' passes alternating.
 pub const COLD_PASSES: usize = 6;
@@ -231,6 +244,13 @@ pub type Read = (String, Reading, Option<Health>);
 /// records it keeps decoded and the bytes its budget charges them, of those it retains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Health {
+    /// The process that wrote it: a broker killed before it wrote one leaves its last.
+    pub pid: u32,
+    /// The log it describes, at the generation it was written under.
+    pub identity: astream_broker::LogIdentity,
+    /// The lowest retained offset and the head, when it was written.
+    pub base: u64,
+    pub head: u64,
     pub resident_records: Option<u64>,
     pub resident_bytes: Option<u64>,
     pub retained: u64,
@@ -249,6 +269,10 @@ impl Health {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         Some(Self {
+            pid: h.pid,
+            identity: h.identity,
+            base: h.base,
+            head: h.head,
             resident_records: h.resident.map(|r| r.records),
             resident_bytes: h.resident.map(|r| r.bytes),
             retained: h.retained_records,
@@ -259,6 +283,11 @@ impl Health {
     #[must_use]
     pub fn json(self) -> Value {
         json!({
+            "pid": self.pid,
+            "identity": aterm_codec::hex::encode_lower(&self.identity.id),
+            "generation": self.identity.generation,
+            "base": self.base,
+            "head": self.head,
             "resident_records": self.resident_records,
             "resident_bytes": self.resident_bytes,
             "retained_records": self.retained,
@@ -446,9 +475,149 @@ pub fn seed(
     }
 }
 
+/// The subject of the records [`append_tail`] writes: the default rule's, which keeps them all
+/// at [`UNCLEAN_TAIL`], and no world's face or seed's.
+#[must_use]
+pub fn tail_subject() -> String {
+    format!("/f/{FLEET}/bench/tail")
+}
+
+/// Write [`UNCLEAN_TAIL`] filler records through the broker on `sock`, each acknowledged
+/// (written to the page cache, which a `SIGKILL` of the broker keeps).
+///
+/// # Panics
+/// When the broker refuses the god cap or a record.
+pub fn append_tail(sock: &str) {
+    let mut god = harness::broker_client(sock);
+    let cap = astream_cap::mint(SECRET, &format!("/f/{FLEET}/>")).expect("mint the god cap");
+    god.attach(&cap.filter, &cap.tag)
+        .expect("attach the god cap");
+    backlog::fill_records(&mut god, TAIL_PRODUCER, &tail_subject(), UNCLEAN_TAIL)
+        .unwrap_or_else(|e| panic!("append {UNCLEAN_TAIL} records on {sock}: {e}"));
+}
+
 /// `name` in `log`'s directory.
 fn beside(log: &Path, name: &str) -> PathBuf {
     log.with_file_name(name)
+}
+
+/// Every record a broker serves to the god cap, read through it from offset 0 to its head: how
+/// many, how many of them are the seed's, the lowest offset served and the head, and a SHA-256
+/// over each record's offset, subject and body in order. Two brokers that serve one log alike
+/// read equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Whole {
+    pub records: u64,
+    pub seeded: u64,
+    pub first: Option<u64>,
+    pub head: u64,
+    pub digest: String,
+}
+
+impl Whole {
+    /// Read every record the broker on `sock` serves, [`COLD_PAGE`] a fetch.
+    ///
+    /// # Panics
+    /// When the broker refuses the god cap or a fetch, or a fetch moves nowhere short of the
+    /// head.
+    #[must_use]
+    pub fn read(sock: &str) -> Self {
+        let mut client = harness::broker_client(sock);
+        let cap = astream_cap::mint(SECRET, &format!("/f/{FLEET}/>")).expect("mint the god cap");
+        client
+            .attach(&cap.filter, &cap.tag)
+            .expect("attach the god cap");
+        let seed = subject();
+        let mut digest = aterm_digest::Sha256::new();
+        let mut whole = Self {
+            records: 0,
+            seeded: 0,
+            first: None,
+            head: 0,
+            digest: String::new(),
+        };
+        let mut from = 0;
+        loop {
+            let (records, (next, head)) = client
+                .fetch(from, &cap.filter, COLD_PAGE)
+                .unwrap_or_else(|e| panic!("fetch from {from} on {sock}: {e}"));
+            whole.head = head;
+            for (offset, subject, body) in &records {
+                digest.update(offset.to_le_bytes());
+                digest.update((subject.len() as u64).to_le_bytes());
+                digest.update(subject.as_bytes());
+                digest.update((body.len() as u64).to_le_bytes());
+                digest.update(body);
+                whole.records += 1;
+                whole.seeded += u64::from(*subject == seed);
+                whole.first.get_or_insert(*offset);
+            }
+            if next >= head {
+                break;
+            }
+            assert!(
+                next > from,
+                "a fetch from {from} on {sock} moved to {next}, short of its head {head}"
+            );
+            from = next;
+        }
+        whole.digest = aterm_codec::hex::encode_lower(&digest.finalize());
+        whole
+    }
+
+    #[must_use]
+    pub fn json(&self) -> Value {
+        json!({
+            "records": self.records,
+            "seeded_records": self.seeded,
+            "first_offset": self.first,
+            "head": self.head,
+            "sha256": self.digest,
+        })
+    }
+}
+
+/// How a served broker was stopped before the start after an unclean stop: `SIGKILL`ed once it
+/// served and took [`UNCLEAN_TAIL`] records, and what the bench read of that stop.
+#[derive(Debug, Clone)]
+pub struct Killed {
+    /// The signal its exit status names: 9, or the run fails.
+    pub signal: Option<i32>,
+    /// The kill to its reaping, ms (reported, not judged).
+    pub reaped_ms: f64,
+    /// Whether its open rewrote `<log>.id`: the bytes there once it served differ from those the
+    /// seed's clean close left. Only an open's serving record, a clean close, a lossy record or
+    /// a cut write the sidecar, and nothing but the open came between, so the sidecar no longer
+    /// says the log closed clean.
+    pub sidecar_rewritten_by_open: bool,
+    /// Whether `<log>.id` holds, after the kill, the bytes it held once the open was served: no
+    /// clean close replaced it (a clean close writes the log's head into it as closed).
+    pub sidecar_unchanged: bool,
+    /// The records the log took between its open and the kill, past the head the sidecar
+    /// names.
+    pub past_sidecar_head: u64,
+}
+
+impl Killed {
+    /// Whether the stop was the unclean one the start after it is said to follow.
+    #[must_use]
+    pub fn unclean(&self) -> bool {
+        self.signal == Some(9)
+            && self.sidecar_rewritten_by_open
+            && self.sidecar_unchanged
+            && self.past_sidecar_head > 0
+    }
+
+    #[must_use]
+    pub fn json(&self) -> Value {
+        json!({
+            "exit_signal": self.signal,
+            "kill_to_reaped_ms": stats::round3(self.reaped_ms),
+            "sidecar_rewritten_by_open": self.sidecar_rewritten_by_open,
+            "sidecar_unchanged_since_open": self.sidecar_unchanged,
+            "records_past_sidecar_head": self.past_sidecar_head,
+        })
+    }
 }
 
 /// One seeded log opened in this process at a residency budget of 0, served on a socket of its
@@ -520,6 +689,11 @@ impl ColdReader {
         let t0 = Instant::now();
         let mut from = self.broker.base();
         let mut got = 0;
+        // Budget 0 keeps the log's newest record decoded (astream's `tier.rs`: "the newest
+        // always stays, even when it exceeds the budget";
+        // `budget_evicts_oldest_and_always_keeps_newest`): a pass that reaches it (a seed of
+        // exactly [`COLD_RECORDS`] on a log nothing appended to since) reads it warm.
+        let mut newest = 0;
         while got < COLD_RECORDS {
             let want = u32::try_from(COLD_RECORDS - got)
                 .unwrap_or(u32::MAX)
@@ -533,13 +707,15 @@ impl ColdReader {
                 "the log holds {got} seeded records past its base, not {COLD_RECORDS}"
             );
             got += records.len();
+            newest += u64::from(records.last().is_some_and(|r| r.0 + 1 == head));
             from = next;
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3;
         let cold = self.broker.cold_reads().saturating_sub(before);
         assert!(
-            cold >= got as u64,
-            "a pass fetched {got} records and read {cold} cold: the budget kept some decoded"
+            cold + newest >= got as u64,
+            "a pass fetched {got} records ({newest} of them the log's newest) and read {cold} \
+             cold: the budget kept some decoded"
         );
         self.pass_ms.push(ms);
         self.cold.push(cold);
@@ -703,6 +879,105 @@ pub fn cold_table(readers: &[ColdReader; 2]) -> Vec<String> {
     md.push(String::new());
     md
 }
+
+/// A start's split (ATERM-KI-1111-2): each step from the bench's spawn to its read of the
+/// `listening` line, through the phases `aterm link broker` stamps on its stderr
+/// ([`aterm_link::start_stamps`]), all on the machine's continuous clock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Split {
+    /// `(from, to, ns)` in the start's order; a phase the broker did not stamp folds into the
+    /// step after it.
+    pub steps: Vec<(String, String, u64)>,
+}
+
+/// Where a split's steps end: each phase the broker stamps
+/// ([`aterm_link::start_stamps::ORDER`]), then the bench's read of `listening`
+/// ([`aterm_link::start_stamps::SEEN`]).
+pub fn split_ends() -> impl Iterator<Item = &'static str> {
+    aterm_link::start_stamps::ORDER
+        .into_iter()
+        .chain(std::iter::once(aterm_link::start_stamps::SEEN))
+}
+
+impl Split {
+    /// The split a broker's `stderr` stamps, from `spawn` (read just before the spawn) to `seen`
+    /// (read once its `listening` line was); `None` without the stamps' line, a clock read, or
+    /// with stamps no one clock gives.
+    #[must_use]
+    pub fn of(stderr: &str, spawn: Option<u64>, seen: Option<u64>) -> Option<Self> {
+        let stamps = aterm_link::start_stamps::Stamps::find(stderr)?;
+        stamps.steps(spawn?, seen).map(|steps| Self { steps })
+    }
+
+    /// The step that ends at `to`, ms.
+    #[must_use]
+    pub fn ms_to(&self, to: &str) -> Option<f64> {
+        self.steps
+            .iter()
+            .find(|(_, end, _)| end == to)
+            .map(|&(_, _, ns)| ns as f64 / 1e6)
+    }
+
+    /// Spawn to the last step's end, ms.
+    #[must_use]
+    pub fn total_ms(&self) -> f64 {
+        self.steps.iter().map(|&(_, _, ns)| ns).sum::<u64>() as f64 / 1e6
+    }
+
+    /// `spawn -> main 3.1, main -> broker 1.2, …` (ms).
+    #[must_use]
+    pub fn brief(&self) -> String {
+        self.steps
+            .iter()
+            .map(|(from, to, ns)| format!("{from} -> {to} {:.1}", *ns as f64 / 1e6))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[must_use]
+    pub fn json(&self) -> Value {
+        json!({
+            "steps": self
+                .steps
+                .iter()
+                .map(|(from, to, ns)| json!({
+                    "from": from,
+                    "to": to,
+                    "ms": stats::round3(*ns as f64 / 1e6),
+                }))
+                .collect::<Vec<_>>(),
+            "spawn_to_seen_ms": stats::round3(self.total_ms()),
+        })
+    }
+}
+
+/// The report's table of starts split (`(what, split)`): a column for each step, by where it
+/// ends, `–` where that start has none (its time is in the next step's).
+#[must_use]
+pub fn split_table(starts: &[(&str, Option<&Split>)]) -> Vec<String> {
+    let heads: Vec<String> = split_ends().map(|end| format!("-> {end}")).collect();
+    let mut md = vec![
+        format!("| start (ms) | {} | spawn -> seen |", heads.join(" | ")),
+        format!("|---|{}---:|", "---:|".repeat(heads.len())),
+    ];
+    for (what, split) in starts {
+        let cells: Vec<String> = split_ends()
+            .map(|end| {
+                split
+                    .and_then(|s| s.ms_to(end))
+                    .map_or_else(|| "–".to_string(), |ms| format!("{ms:.1}"))
+            })
+            .collect();
+        let total = split.map_or_else(|| "–".to_string(), |s| format!("{:.1}", s.total_ms()));
+        md.push(format!("| {what} | {} | {total} |", cells.join(" | ")));
+    }
+    md.push(String::new());
+    md
+}
+
+#[cfg(test)]
+#[path = "seeded_split_tests.rs"]
+mod split_tests;
 
 #[cfg(test)]
 mod tests {

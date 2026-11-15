@@ -957,7 +957,7 @@ pub(crate) fn cmd_await(
 /// own arguments, so a `gone` pattern that reads `autopilot=…` keeps its meaning. `Ok(None)`
 /// without one; `Err` for a word `meta` never prints (a synonym included) or a second token.
 fn take_autopilot<'a>(args: &mut Vec<&'a str>, from: usize) -> Result<Option<&'a str>, ()> {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let tail = args.split_off(from.min(args.len()));
     let mut read = None;
     for arg in tail {
@@ -1444,7 +1444,8 @@ const fn past_ceiling(minted: u64, ceiling: u64) -> bool {
 pub(crate) struct TurnIo<'a> {
     /// Deliver the message text into the target's input path with PASTE semantics (control bytes stripped by `format_paste`; bracketed-paste framing only when the app itself enabled the mode).
     pub paste: &'a dyn Fn(&str) -> bool,
-    /// Press a named key (the `key` verb vocabulary, e.g. "enter").
+    /// Press a named key (the `key` verb vocabulary, e.g. "enter"): the submit of a turn with no
+    /// fence to judge at its write ([`submit_is_fenced`]); [`fenced_submit`] presses any other.
     pub press: &'a dyn Fn(&str) -> bool,
     /// Press one pre-built key event (`turn typed=1`'s per-grapheme press, built by [`typed_key_events`]) through the same route `press` takes.
     pub key: &'a dyn Fn(InputEvent) -> bool,
@@ -2565,81 +2566,123 @@ pub(crate) fn cmd_await_momentum(
     }
 }
 
-enum GuardedSubmit {
+enum FencedSubmit {
     Pressed,
+    /// The guard matched nothing at the cursor's row: nothing of this press was written.
     Missed,
     /// The person made a gesture since the caller's read (`if-human=`), judged under the lock at
     /// every try: nothing of this press was written.
     Person,
-    /// The sink took none of the Enter, or input queued before it had not all gone, until the
-    /// submit window ended: nothing of this press was written.
+    /// The sink took none of the submit key, or input queued before it had not all gone, until
+    /// the submit window ended: nothing of this press was written.
     Busy,
     /// `lease release force` took the turn's slot before a try: nothing of this press was
     /// written.
     Preempted,
+    /// The turn's `if-supervisor=` fence refused the try whole, the refusal's line here: nothing
+    /// of this press was written.
+    Refused(String),
     Failed(String),
 }
 
-/// The guarded Enter of a turn, tried until `window` while the sink takes none of it or input
-/// queued before it has not all gone, and never once `preempted` says the turn's slot is gone,
-/// judged before each try and again under the terminal lock the try writes under.
-fn guarded_submit(
+/// Whether a turn's submit is pressed by [`fenced_submit`]: where the turn names something to
+/// judge at the very write of its submit key, its guard (`submit=guarded:<re>`) or the person's
+/// count (`if-human=`). The dispatch routes a fenced `send` or `key` the same way
+/// ([`super::control_input::InputFence::is_armed`]): a look on one thread followed by a write on
+/// another lets a person's key land between the two.
+fn submit_is_fenced(
+    guard: Option<&dyn aterm_core::terminal::RowMatch>,
+    human: Option<u64>,
+) -> bool {
+    guard.is_some() || human.is_some()
+}
+
+/// A turn's fenced submit ([`submit_is_fenced`]): the `key` it submits with, written on this
+/// thread under the terminal lock that judges `guard` at the cursor's row and the person's count
+/// against `human`, tried until `window` while the sink takes none of it or input queued before it
+/// has not all gone, and never once `preempted` says the turn's slot is gone, judged before each
+/// try and again under that lock. The turn's `if-supervisor=` fence, which the dispatch carries
+/// ([`super::carried_fence`]), admits each try as it admits each write the turn makes by its
+/// route ([`super::turn_write`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the turn's own state, each read at every try of its submit"
+)]
+fn fenced_submit(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
-    guard: &dyn aterm_core::terminal::RowMatch,
+    key: &str,
+    guard: Option<&dyn aterm_core::terminal::RowMatch>,
     human: Option<u64>,
     window: std::time::Instant,
     mark: Option<&crate::control_input_ack::InputMark>,
     preempted: &(dyn Fn() -> bool + Sync),
-) -> GuardedSubmit {
+) -> FencedSubmit {
     use super::control_input::GuardedInput;
     use crate::input::Delivery;
     const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
     loop {
         if preempted() {
-            return GuardedSubmit::Preempted;
+            return FencedSubmit::Preempted;
         }
-        let Some(enter) = crate::control::parse_key("enter") else {
-            return GuardedSubmit::Failed("ERR internal: `enter` did not parse\n".to_string());
+        let Some(ev) = crate::control::parse_key(key) else {
+            return FencedSubmit::Failed(format!("ERR internal: `{key}` did not parse\n"));
         };
         let stands = || !preempted();
         let fence = super::control_input::InputFence {
-            guard: Some(guard),
+            guard,
             guard_at_cursor: true,
             human,
             standing: Some(&stands),
             ..super::control_input::InputFence::default()
         };
-        match super::control_input::input_if_fenced_observed(
-            term,
-            ctx,
-            enter,
-            &fence,
-            crate::ReadOn::Committed,
-            mark.map(|m| m.completion()),
-        ) {
-            GuardedInput::Pressed(Delivery::Full) => {
-                return GuardedSubmit::Pressed;
+        let decision = super::under_fence(ctx, super::carried_fence().as_ref(), || {
+            super::control_input::input_if_fenced_observed(
+                term,
+                ctx,
+                ev,
+                &fence,
+                crate::ReadOn::Committed,
+                mark.map(|m| m.completion()),
+            )
+        });
+        match decision {
+            Err(refusal) => return FencedSubmit::Refused(refusal),
+            Ok(GuardedInput::Pressed(Delivery::Full)) => {
+                return FencedSubmit::Pressed;
             }
             // A slot lost under the lock is a skip the fence says nothing more of.
-            GuardedInput::Skipped | GuardedInput::Changed if preempted() => {
-                return GuardedSubmit::Preempted;
+            Ok(GuardedInput::Skipped | GuardedInput::Changed) if preempted() => {
+                return FencedSubmit::Preempted;
             }
-            GuardedInput::Skipped | GuardedInput::Changed => return GuardedSubmit::Missed,
-            GuardedInput::Person => return GuardedSubmit::Person,
-            GuardedInput::Queued | GuardedInput::Pressed(Delivery::BusyZero)
+            Ok(GuardedInput::Skipped | GuardedInput::Changed) => return FencedSubmit::Missed,
+            Ok(GuardedInput::Person) => return FencedSubmit::Person,
+            Ok(GuardedInput::Queued | GuardedInput::Pressed(Delivery::BusyZero))
                 if std::time::Instant::now() < window =>
             {
                 std::thread::sleep(BUSY_RETRY);
             }
-            GuardedInput::Queued | GuardedInput::Pressed(Delivery::BusyZero) => {
-                return GuardedSubmit::Busy;
+            Ok(GuardedInput::Queued | GuardedInput::Pressed(Delivery::BusyZero)) => {
+                return FencedSubmit::Busy;
             }
-            decision @ GuardedInput::Pressed(_) => {
-                return GuardedSubmit::Failed(super::control_input::guarded_input_reply(decision));
+            Ok(decision @ GuardedInput::Pressed(_)) => {
+                return FencedSubmit::Failed(super::control_input::guarded_input_reply(decision));
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SUBMIT_FOR_TEST: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A test's hand at this thread's turns: run before each press of a submit key, after every
+/// look the turn takes before that press, by its route or [`fenced_submit`] (`None`: no hand).
+#[cfg(test)]
+pub(crate) fn set_before_submit_for_test(hand: Option<Box<dyn Fn()>>) {
+    BEFORE_SUBMIT_FOR_TEST.with(|slot| *slot.borrow_mut() = hand);
 }
 
 /// `turn`'s usage line.
@@ -3108,7 +3151,7 @@ fn turn_attempt(
     };
     // `lease release force` took the turn's slot (a wedged turn's preemption): the turn writes
     // nothing more, and what it wrote stands, as a halt leaves it. A write already past its
-    // check still goes; each later one, each try of a guarded Enter included, is checked first.
+    // check still goes; each later one, each try of a fenced submit included, is checked first.
     let lease_gone = || {
         !matches!(
             ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner()).as_ref(),
@@ -3519,12 +3562,29 @@ fn turn_attempt(
             };
             note_ctl_input();
             let first = !wrote.replace(true);
-            if let Some(guard) = submit_matcher.as_deref() {
-                let outcome =
-                    guarded_submit(term, ctx, guard, if_human, window, io.mark, &lease_gone);
-                if !matches!(outcome, GuardedSubmit::Pressed | GuardedSubmit::Failed(_)) {
+            #[cfg(test)]
+            BEFORE_SUBMIT_FOR_TEST.with(|slot| {
+                if let Some(hand) = slot.borrow().as_ref() {
+                    hand();
+                }
+            });
+            // The person's count was read above, outside the lock the press writes under: a key
+            // typed after that read and before the write would reach the program ahead of the
+            // submit and go with the text, so a fenced submit is judged again where it writes.
+            if submit_is_fenced(submit_matcher.as_deref(), if_human) {
+                let outcome = fenced_submit(
+                    term,
+                    ctx,
+                    &submit,
+                    submit_matcher.as_deref(),
+                    if_human,
+                    window,
+                    io.mark,
+                    &lease_gone,
+                );
+                if !matches!(outcome, FencedSubmit::Pressed | FencedSubmit::Failed(_)) {
                     term_lock(term).watch_disarm(id);
-                    // None of this Enter was written: one that was to be the turn's first write
+                    // None of this press was written: one that was to be the turn's first write
                     // (a text of control characters alone) leaves the turn unwritten, and its
                     // `id=` goes back, as a fence's skip gives a `key if=` its id back.
                     if first {
@@ -3532,20 +3592,20 @@ fn turn_attempt(
                     }
                 }
                 match outcome {
-                    GuardedSubmit::Pressed => {}
-                    GuardedSubmit::Preempted => {
+                    FencedSubmit::Pressed => {}
+                    FencedSubmit::Preempted => {
                         if press_no > 0 {
                             break;
                         }
                         return stopped("preempted", (typed_keys, pasted()));
                     }
-                    GuardedSubmit::Person => {
+                    FencedSubmit::Person => {
                         if press_no > 0 {
                             break;
                         }
                         return typed_cut(term, "person", typed_keys, pasted(), turn_id);
                     }
-                    GuardedSubmit::Missed => {
+                    FencedSubmit::Missed => {
                         if press_no == 0 {
                             let seq = term_lock(term).content_seq();
                             return format!(
@@ -3555,7 +3615,7 @@ fn turn_attempt(
                         }
                         break;
                     }
-                    GuardedSubmit::Busy => {
+                    FencedSubmit::Busy => {
                         // A re-press the sink took none of wrote nothing, as a missed one: an
                         // earlier Enter went, so the verdict says `pressed=<n>`. A first one is
                         // its own reply, never `ERR busy`: where the text is typed, that head
@@ -3565,7 +3625,16 @@ fn turn_attempt(
                         }
                         return aterm_types::control_verbs::TURN_SUBMIT_BUSY_LINE.to_string();
                     }
-                    GuardedSubmit::Failed(reply) => {
+                    // As the route's refusal of a write whole ([`TurnIo::refused`]): the line
+                    // where the press was the turn's first write, else the bytes before it stand.
+                    FencedSubmit::Refused(refusal) => {
+                        return if first {
+                            refusal
+                        } else {
+                            KEY_DELIVERY_FAILED.to_string()
+                        };
+                    }
+                    FencedSubmit::Failed(reply) => {
                         term_lock(term).watch_disarm(id);
                         return reply;
                     }
@@ -4131,15 +4200,19 @@ pub(crate) fn cmd_meta_by(
                     return match owner.and_then(|owner| {
                         leading_attention_kind(text).map(|(kind, text)| (owner, kind, text))
                     }) {
-                        Ok((owner, kind, text)) => {
-                            attention_owned_reply(crate::session_timeline::write_attention_kind(
-                                ctx,
-                                owner,
-                                MetaEdit::Set(text),
-                                kind,
-                                by,
-                            ))
-                        }
+                        Ok((owner, kind, text)) => attention_owned_reply(
+                            if owner == crate::harness_host::NEEDS_ATTENTION_OWNER {
+                                write_needs_entry(ctx, MetaEdit::Set(text), kind, by)
+                            } else {
+                                crate::session_timeline::write_attention_kind(
+                                    ctx,
+                                    owner,
+                                    MetaEdit::Set(text),
+                                    kind,
+                                    by,
+                                )
+                            },
+                        ),
                         Err(refusal) => (refusal, false),
                     };
                 }
@@ -4170,14 +4243,18 @@ pub(crate) fn cmd_meta_by(
                     );
                 }
                 return match owner {
-                    Ok(owner) => {
-                        attention_owned_reply(crate::session_timeline::write_attention_owned(
-                            ctx,
-                            owner,
-                            MetaEdit::Clear,
-                            by,
-                        ))
-                    }
+                    Ok(owner) => attention_owned_reply(
+                        if owner == crate::harness_host::NEEDS_ATTENTION_OWNER {
+                            write_needs_entry(ctx, MetaEdit::Clear, None, by)
+                        } else {
+                            crate::session_timeline::write_attention_owned(
+                                ctx,
+                                owner,
+                                MetaEdit::Clear,
+                                by,
+                            )
+                        },
+                    ),
                     Err(refusal) => (refusal, false),
                 };
             }
@@ -4248,7 +4325,7 @@ fn meta_set_autopilot_until(
         return refuse(None);
     };
     match crate::session_timeline::normalize_autopilot_value(&word.join(" ")) {
-        Some(stored) if stored == aterm_agent::supervise::Autopilot::Cruise.word() => {}
+        Some(stored) if stored == alab_policy::config::Autopilot::Cruise.word() => {}
         _ => return refuse(Some("until= goes with cruise only".to_string())),
     }
     let Some(when) = parse_when(when) else {
@@ -4260,7 +4337,7 @@ fn meta_set_autopilot_until(
     };
     let write = crate::session_timeline::apply_autopilot(
         ctx,
-        Some(aterm_agent::supervise::Autopilot::Cruise.word().to_string()),
+        Some(alab_policy::config::Autopilot::Cruise.word().to_string()),
         Some(resolved.at_ms),
         by,
         None,
@@ -4317,6 +4394,38 @@ fn leading_attention_kind(
             .map(|kind| (Some(kind), rest))
             .ok_or_else(attention_set_usage),
     }
+}
+
+/// `meta set|unset attention owner=needs …`: the entry stands as a person is shown it. A
+/// credential is no person's need, so the text is read against the set its claimant told
+/// ([`crate::session_timeline::SessionMeta::say_needs_entry`]) and the entry that stands for it is
+/// written in its place, or taken down where it leads with a credential and no set says what else
+/// it counts.
+fn write_needs_entry(
+    ctx: &SessionCtx,
+    edit: MetaEdit<'_>,
+    kind: Option<aterm_types::needs::AttentionKind>,
+    by: aterm_slog::Actor,
+) -> Result<bool, crate::session_timeline::AttentionWriteError> {
+    use crate::session_timeline::{AttentionWriteError, validated_attention_value};
+    let owner = crate::harness_host::NEEDS_ATTENTION_OWNER;
+    let said = validated_attention_value(owner, edit).map_err(AttentionWriteError::Meta)?;
+    if super::caller_hung_up() {
+        return Err(AttentionWriteError::Meta(MetaWriteError::HungUp));
+    }
+    let shown = ctx
+        .meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .say_needs_entry(super::serving_connection(), crate::metrics::now_us(), said);
+    let edit = shown.as_deref().map_or(MetaEdit::Clear, MetaEdit::Set);
+    crate::session_timeline::write_attention_kind(
+        ctx,
+        owner,
+        edit,
+        kind.filter(|_| shown.is_some()),
+        by,
+    )
 }
 
 fn attention_owned_reply(
@@ -4587,7 +4696,7 @@ fn harness_act_request(rest: &str) -> Option<Result<HarnessActRequest<'_>, &'sta
     Some(parsed.ok_or(HARNESS_ACT_USAGE))
 }
 
-/// `meta set harness_act <act> [until_us=<n>]` — an agent that supervises itself records an act it took on the session, so who is driving a session is seen per session. AN ADMITTED ACT IS THE HOLDER'S, SHOWN AND BOOKED AS ITS OWN: queued for the window's glass (`SessionTimeline::queue_self_act`: the chip's act and the trail, worded as the holder's) and booked in the session's ledger once the session's locks are let go (`crate::self_claim::book_act`), which Settings ▸ Harness counts under the holder and `aterm harness ledger` lists; a standing face's act told again (`SessionTimeline::self_act_resent`) is answered as before and neither shown nor booked twice. A refusal (`ERR denied`, an expired or busy act) and a lease (`meta prepare harness_act`) do neither.
+/// `meta set harness_act <act> [until_us=<n>]` — an agent that supervises itself records an act it took on the session, so who is driving a session is seen per session: admitted only from the session's standing claim under its act proof ([`crate::session_timeline::SupervisorClaim::act_proof`]: codex-alab's proven self-claim, or a rostered harness's proven contract 3 claim whose scope names `turn-end`), on that claim's connection or one its very process proves. AN ADMITTED ACT IS THE HOLDER'S, SHOWN AND BOOKED AS ITS OWN: queued for the window's glass (`SessionTimeline::queue_self_act`: the chip's act and the trail, worded as the holder's) and booked in the session's ledger once the session's locks are let go (`crate::self_claim::book_act`), which Settings ▸ Harness counts under the holder and `aterm harness ledger` lists; a standing face's act told again (`SessionTimeline::self_act_resent`) is answered as before and neither shown nor booked twice. A refusal (`ERR denied`, an expired or busy act) and a lease (`meta prepare harness_act`) do neither.
 pub(crate) fn cmd_meta_harness_act(
     ctx: &SessionCtx,
     snapshot: Option<HarnessActSnapshot>,
@@ -4623,7 +4732,7 @@ pub(super) fn cmd_meta_harness_act_with_clock(
     let holder = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         meta.live_claim(now_us()).and_then(|claim| {
-            let proven = claim.proven.as_ref()?;
+            let proven = claim.act_proof()?;
             let bound = conn.is_some() && claim.conn == conn;
             Some((
                 claim.holder.clone(),
@@ -4642,7 +4751,7 @@ pub(super) fn cmd_meta_harness_act_with_clock(
     if meta.supervisor_revision != revision
         || meta
             .live_claim(now_us())
-            .and_then(|claim| claim.proven.as_ref())
+            .and_then(crate::session_timeline::SupervisorClaim::act_proof)
             != Some(&proven)
     {
         return Some(("ERR denied\n".to_string(), false));
@@ -4660,7 +4769,11 @@ pub(super) fn cmd_meta_harness_act_with_clock(
     {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let now = now_us();
-        if meta.live_claim(now).and_then(|claim| claim.proven.as_ref()) != Some(&proven) {
+        if meta
+            .live_claim(now)
+            .and_then(crate::session_timeline::SupervisorClaim::act_proof)
+            != Some(&proven)
+        {
             return Some(("ERR denied\n".to_string(), false));
         }
         if let Some(until_us) = until_us {
@@ -4795,7 +4908,7 @@ fn harness_held_request(
     )
 }
 
-/// `meta set harness_held <same-reply|no-work>` / `meta unset harness_held` — an agent that supervises itself tells that ITS OWN TYPING STOPPED, by which arm of ruling F's hold ([`aterm_agent::harness::acts::HeldBy::word`]), or goes on again, so `status held=` says its stop as it says aterm's own. THE STOP IS ITS CLAIM'S: admitted only from the session's standing proven self-claim ([`self_claim_write`]: by the proof `meta set harness_act` takes, that claim's connection or a connection its very process proves), else `ERR denied`; kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_held`]) and gone wherever a wait written under it lapses (the claim released, replaced or gone with its process, its connection closed), so a new claim starts with none; said while the claim stands ([`crate::App::shown_stop`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
+/// `meta set harness_held <same-reply|no-work>` / `meta unset harness_held` — an agent that supervises itself tells that ITS OWN TYPING STOPPED, by which arm of ruling F's hold ([`aterm_agent::harness::acts::HeldBy::word`]), or goes on again, so `status held=` says its stop as it says aterm's own. THE STOP IS ITS CLAIM'S: admitted only from the session's standing claim under its act proof ([`self_claim_write`]: by the proof `meta set harness_act` takes, that claim's connection or a connection its very process proves), else `ERR denied`; kept with that claim's proof ([`crate::session_timeline::SessionMeta::self_held`]) and gone wherever a wait written under it lapses (the claim released, replaced or gone with its process, its connection closed), so a new claim starts with none; said while the claim stands ([`crate::App::shown_stop`]). `OK` whether or not it moved; only a move is a change, which wakes the window.
 pub(crate) fn cmd_meta_harness_held(
     ctx: &SessionCtx,
     conn: Option<u64>,
@@ -4894,7 +5007,7 @@ pub(crate) fn cmd_meta_harness_activity(
     Some(("OK\n".into(), changed))
 }
 
-/// A WRITE ONLY THE SESSION'S STANDING PROVEN SELF-CLAIM MAKES (`meta set harness_held`, `meta set harness_land`, `meta set harness_needs`, `harness fact`): admitted by the proof `meta set harness_act` takes — the line came on that claim's connection, or `prove` names the very proof of the claim's process — and `write` runs under the meta lock with the claim's proof only where neither [`crate::session_timeline::SessionMeta::supervisor_revision`] nor the live claim's proof moved since the look (a claim that moved between the look and the write admits nothing). The holder and what `write` returned (for a `meta set`, whether it moved what it keeps); `None` for anything else, which the verb answers `ERR denied`.
+/// A WRITE ONLY THE SESSION'S STANDING CLAIM MAKES UNDER ITS ACT PROOF (`meta set harness_held`, `meta set harness_activity`, `meta set harness_land`, `meta set harness_needs`, `harness fact`): admitted by the proof `meta set harness_act` takes ([`crate::session_timeline::SupervisorClaim::act_proof`]: codex-alab's proven self-claim, or a rostered harness's proven contract 3 claim whose scope names `turn-end`; `harness fact` takes codex-alab's alone) — the line came on that claim's connection, or `prove` names the very proof of the claim's process — and `write` runs under the meta lock with the claim's proof only where neither [`crate::session_timeline::SessionMeta::supervisor_revision`] nor the live claim's act proof moved since the look (a claim that moved between the look and the write admits nothing). The holder and what `write` returned (for a `meta set`, whether it moved what it keeps); `None` for anything else, which the verb answers `ERR denied`.
 pub(crate) fn self_claim_write<T>(
     ctx: &SessionCtx,
     conn: Option<u64>,
@@ -4904,7 +5017,7 @@ pub(crate) fn self_claim_write<T>(
     let standing = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         meta.live_claim(crate::metrics::now_us()).and_then(|claim| {
-            let proven = claim.proven.as_ref()?;
+            let proven = claim.act_proof()?;
             let bound = conn.is_some() && claim.conn == conn;
             Some((
                 claim.holder.clone(),
@@ -4920,7 +5033,7 @@ pub(crate) fn self_claim_write<T>(
     if meta.supervisor_revision != revision
         || meta
             .live_claim(crate::metrics::now_us())
-            .and_then(|claim| claim.proven.as_ref())
+            .and_then(crate::session_timeline::SupervisorClaim::act_proof)
             != Some(&proven)
     {
         return None;
@@ -5045,14 +5158,14 @@ pub(crate) const HARNESS_NEEDS_MAX: usize = 32;
 /// The NEEDS YOU set a `meta set harness_needs …` tells (`Some`), or a `meta unset harness_needs`'s take-down (`None`); `None` outright for every other `meta` line, and the usage for a malformed one ([`harness_needs_of`]; an unset with any token after it).
 fn harness_needs_request(
     rest: &str,
-) -> Option<Result<Option<Arc<crate::needs::HarnessNeeds>>, &'static str>> {
+) -> Option<Result<Option<crate::needs::HarnessNeeds>, &'static str>> {
     let mut toks = rest.split_whitespace();
     let sub = toks.next()?;
     if !matches!(sub, "set" | "unset") || toks.next() != Some("harness_needs") {
         return None;
     }
     let told = match sub {
-        "set" => harness_needs_of(toks).map(|told| Some(Arc::new(told))),
+        "set" => harness_needs_of(toks).map(Some),
         _ => toks.next().is_none().then_some(None),
     };
     Some(told.ok_or(HARNESS_NEEDS_USAGE))
@@ -5103,31 +5216,104 @@ fn pct_strict(value: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// `meta set harness_needs entry=<pct text> need=<pct need> [need=<pct need> …]` / `meta unset harness_needs` — an agent that supervises itself tells EVERY NEED ITS `owner=needs` ENTRY STANDS FOR, whole and in its order ([`harness_needs_of`]), or that the entry went, so the hover's lines and `status needs_told=` say its set as they say aterm's own loop's, where its entry alone gives the first need and a count. THE SET IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): told as aterm's own loop's is (`HarnessNeeds::told` then `ToldNeeds::tell` beside the session's `owner=needs` entry as stored now, [`crate::session_timeline::SessionMeta::tell_self_needs`]), so a set told before its entry stands waits for it and one told for another entry's text is never read; kept with that claim's proof, NEVER in the timeline's set (aterm's own loop's), and gone wherever that stop goes; read while the claim stands ([`crate::needs::told_of`]). `OK` whether or not it moved; only a move of what a reader reads beside the standing entry is a change, which wakes the window.
+/// `meta set harness_needs entry=<pct text> need=<pct need> [need=<pct need> …]` / `meta unset harness_needs` — an agent that supervises itself tells EVERY NEED ITS `owner=needs` ENTRY STANDS FOR, whole and in its order ([`harness_needs_of`]), or that the entry went, so the hover's lines and `status needs_told=` say its set as they say aterm's own loop's, where its entry alone gives the first need and a count. THE SET IS ITS CLAIM'S, as `meta set harness_held`'s stop is ([`self_claim_write`], else `ERR denied`): told as aterm's own loop's is (`HarnessNeeds::told` then `ToldNeeds::tell` beside the session's `owner=needs` entry as stored now, [`crate::session_timeline::SessionMeta::tell_self_needs`]), so a set told before its entry stands waits for it and one told for another entry's text is never read; kept with that claim's proof, NEVER in the timeline's set (aterm's own loop's), and gone wherever that stop goes; read while the claim stands ([`crate::needs::told_of`]). A credential line is no person's need: it comes off the set and the entry aterm stands for the rest replaces the claimant's ([`crate::needs::ClaimNeeds::tell`]), and its want goes on the secrets path ([`resolve_credentials`]). `OK` whether or not it moved; a move of what a reader reads beside the standing entry, or of that entry, is a change, which wakes the window ([`NeedsMoved`]).
 pub(crate) fn cmd_meta_harness_needs(
     ctx: &SessionCtx,
     conn: Option<u64>,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
     rest: &str,
-) -> Option<(String, bool)> {
+) -> Option<(String, NeedsMoved)> {
     let told = match harness_needs_request(rest)? {
         Ok(told) => told,
-        Err(usage) => return Some((usage.to_string(), false)),
+        Err(usage) => return Some((usage.to_string(), NeedsMoved::default())),
     };
     let count = told.as_ref().map(|told| told.needs().len());
-    let Some((holder, moved)) = self_claim_write(ctx, conn, prove, |meta, proven| {
-        meta.tell_self_needs(proven, told)
-    }) else {
-        return Some(("ERR denied\n".to_string(), false));
+    let Some((holder, (read, credentials, shown))) =
+        self_claim_write(ctx, conn, prove, |meta, proven| {
+            meta.tell_self_needs(proven, told)
+        })
+    else {
+        return Some(("ERR denied\n".to_string(), NeedsMoved::default()));
     };
-    if moved {
+    // The claimant's entry spoke for the lines taken off, or for lines a set before took off:
+    // aterm puts up the one for the person's needs, the claimant's own where none was taken off,
+    // or takes it down where none is left.
+    let entry = shown.is_some_and(|shown| {
+        crate::session_timeline::write_attention_kind(
+            ctx,
+            crate::harness_host::NEEDS_ATTENTION_OWNER,
+            shown.as_deref().map_or(MetaEdit::Clear, MetaEdit::Set),
+            shown
+                .as_ref()
+                .map(|_| aterm_types::needs::AttentionKind::Ask),
+            aterm_slog::Actor::Aterm,
+        )
+        .unwrap_or(false)
+    });
+    resolve_credentials(ctx.self_id.as_str(), &credentials);
+    let moved = NeedsMoved { read, entry };
+    if moved.any() {
         aterm_log::info!(
-            "self-claim @{}: {holder} told its NEEDS YOU set: needs={}",
+            "self-claim @{}: {holder} told its NEEDS YOU set: needs={} credentials={}",
             ctx.self_id.as_str(),
-            count.map_or_else(|| "-".to_string(), |n| n.to_string())
+            count.map_or_else(|| "-".to_string(), |n| n.to_string()),
+            credentials.len()
         );
     }
     Some(("OK\n".to_string(), moved))
+}
+
+/// What an admitted `meta set|unset harness_needs` line moved ([`cmd_meta_harness_needs`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NeedsMoved {
+    /// What a reader reads beside the standing `owner=needs` entry (a `HarnessFact::Needs`).
+    pub(crate) read: bool,
+    /// The `owner=needs` entry itself, which aterm stands for the person's needs (a meta change).
+    pub(crate) entry: bool,
+}
+
+impl NeedsMoved {
+    /// Whether anything moved.
+    #[must_use]
+    pub(crate) fn any(self) -> bool {
+        self.read || self.entry
+    }
+}
+
+/// THE CREDENTIAL LINES A SELF-CLAIM'S SET NAMED, resolved on the one path aterm's own loop takes
+/// ([`aterm_agent::harness::credential_read::resolve_live`]: the registry, else `aterm secrets
+/// need <want>` filed so the lab's Macs answer it), on a thread of its own so the claim's
+/// connection waits on no vault. A release's want is the release machine's and is not filed.
+fn resolve_credentials(sid: &str, lines: &[String]) {
+    let wants = alab_policy::credential_need::host_wants(lines);
+    if wants.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    {
+        let _ = sid;
+        CREDENTIALS_RESOLVED.with_borrow_mut(|resolved| resolved.push(wants));
+    }
+    #[cfg(not(test))]
+    {
+        let sid = sid.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("harness-needs-credentials".to_string())
+            .spawn(move || {
+                let read = aterm_agent::harness::credential_read::resolve_live(&wants);
+                aterm_log::info!("self-claim @{sid}: credential needs resolved: {read:?}");
+            });
+        if let Err(e) = spawned {
+            aterm_log::warn!("self-claim: credential needs not resolved: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The wants [`resolve_credentials`] was handed on this test's thread, in order.
+    pub(crate) static CREDENTIALS_RESOLVED: std::cell::RefCell<Vec<Vec<String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// `meta set questions|autopilot …` / `meta unset questions|autopilot` from a connection that is not Owner-class: `ERR denied`.
@@ -6637,3 +6823,109 @@ mod typing_pace_tests;
 #[cfg(all(test, unix))]
 #[path = "control_session_needs_tests.rs"]
 mod needs_tests;
+
+/// Build a native settings command only at a proven Codex-alab idle point. The
+/// live record includes queued input/popups in its busy state; an unknown or
+/// occupied composer is never cleared to make room for this command.
+pub(crate) fn agent_settings_turn(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    rest: &str,
+) -> Result<String, String> {
+    let selection = aterm_types::agent_settings::Selection::parse(rest)
+        .map_err(|usage| format!("ERR usage: {usage}\n"))?;
+    if !proven_codex_alab(ctx) {
+        return Err("ERR agent settings: requires a proven Codex-alab session\n".into());
+    }
+    agent_settings_guarded(term, ctx, selection, || {
+        crate::self_claim::live_copy(ctx)
+            .is_some_and(|copy| crate::self_claim::idle_now(ctx, copy.pid, &copy.start))
+    })
+}
+
+/// Snapshot first, then inspect native readiness. The native record is read
+/// outside the terminal lock, so input arriving during it fails the turn fence.
+pub(crate) fn agent_settings_guarded(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    selection: aterm_types::agent_settings::Selection<'_>,
+    ready: impl FnOnce() -> bool,
+) -> Result<String, String> {
+    let human = ctx.human_input.seq();
+    let generation = {
+        let t = term_lock(term);
+        if !agent_settings_composer_empty(&t) {
+            return Err("ERR busy agent settings: no empty native composer\n".into());
+        }
+        super::screen_gen(&t)
+    };
+    let unread = || {
+        ctx.sink
+            .input_backlog()
+            .is_some_and(|backlog| backlog.unread() > 0)
+    };
+    if unread() {
+        return Err("ERR busy agent settings: pending terminal input\n".into());
+    }
+    if !ready() {
+        return Err("ERR busy agent settings: Codex-alab must be idle with an empty composer and no pending input\n".into());
+    }
+    if unread() {
+        return Err("ERR busy agent settings: pending terminal input\n".into());
+    }
+    Ok(format!(
+        "typed=1 settle=submitted if-gen={generation} if-human={human} {}",
+        selection.codex_command()
+    ))
+}
+
+/// Read the native Codex caret, rather than treating a stale idle record as
+/// proof that the terminal has no draft. Dim placeholder text is not input.
+pub(crate) fn agent_settings_composer_empty(t: &Terminal) -> bool {
+    use aterm_core::grid::CellFlags;
+    let cursor = t.cursor();
+    if !t.cursor_visible()
+        || cursor.col != 2
+        || t.grid().display_offset() != 0
+        || cursor.row.checked_add(4) != Some(t.rows())
+    {
+        return false;
+    }
+    let row = super::control_query::visible_row(t, cursor.row as usize);
+    // The row reader trims the prompt's trailing space when no placeholder is shown.
+    if !matches!(row.as_str(), "›" | "»") && !row.starts_with("› ") && !row.starts_with("» ")
+    {
+        return false;
+    }
+    let view = t.grid().screen_row_view(cursor.row);
+    for col in 2..view.len() {
+        let Some(cell) = view.cell(col) else {
+            continue;
+        };
+        let mut text = String::new();
+        view.push_cell_text(col, cell, &mut text);
+        if !text.trim().is_empty() && !cell.flags().contains(CellFlags::DIM) {
+            return false;
+        }
+    }
+    // Accept only the standard one-line native layout: blank separator,
+    // account/model facts, then the agent-shortcuts footer. Unknown layouts
+    // are refused rather than letting a blank line hide a multiline draft.
+    super::control_query::visible_row(t, (cursor.row + 1) as usize)
+        .trim()
+        .is_empty()
+        && !super::control_query::visible_row(t, (cursor.row + 2) as usize)
+            .trim()
+            .is_empty()
+        && super::control_query::visible_row(t, (cursor.row + 3) as usize).contains("for agents")
+}
+
+/// Preserve refusal and skipped-write protocol replies exactly. A native
+/// settings request is submitted only when the ordinary turn path says so.
+pub(crate) fn agent_settings_reply(reply: String) -> String {
+    let (first, tail) = reply.split_once('\n').unwrap_or((&reply, ""));
+    if !first.starts_with("OK") || !first.split_whitespace().any(|word| word == "submitted=1") {
+        return reply;
+    }
+    format!("{first} settings_scope=subsequent-turns confirmation=pending\n{tail}")
+}

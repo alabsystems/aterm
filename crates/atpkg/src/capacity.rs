@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use aterm_capacity::overrun::whole;
 use aterm_capacity::{
-    Accounting, Ledger, Live, Machine as _, Overrun, Reading, Record, Reserve, Spared, TreeUse,
-    Volume, gib, overruns, span,
+    Accounting, Ledger, Live, Machine as _, Overrun, Procs, Reading, Record, Reserve, Spared,
+    TreeUse, Volume, gib, heavy_queue, overruns, span,
 };
 use aterm_json::{Map, Value};
 
@@ -63,14 +63,12 @@ pub(crate) fn verb(rest: &[String]) -> ExitCode {
         Some(Err(e)) => Err(e.to_string()),
         None => Err("no home directory to keep it under".to_owned()),
     };
-    let trees = match &claims {
-        Ok(c) if !c.is_empty() => Live.procs().map(|p| {
-            let pids: Vec<u32> = c
-                .iter()
-                .flat_map(|r| std::iter::once(r.pid).chain(r.credit.iter().copied()))
-                .collect();
-            p.trees(&pids)
-        }),
+    let procs = match &claims {
+        Ok(c) if !c.is_empty() => Live.procs(),
+        _ => None,
+    };
+    let trees = match (&claims, &procs) {
+        (Ok(c), Some(p)) => Some(p.trees(&aterm_capacity::tree_roots(c, p))),
         _ => None,
     };
     let volumes = match &claims {
@@ -83,10 +81,19 @@ pub(crate) fn verb(rest: &[String]) -> ExitCode {
     if json {
         println!(
             "{}",
-            json_of(&reading, &volumes, dir, &claims, trees.as_ref(), now, &cpu)
+            json_of(
+                &reading,
+                &volumes,
+                dir,
+                &claims,
+                (trees.as_ref(), procs.as_ref()),
+                now,
+                &cpu
+            )
         );
     } else {
-        for line in lines(&reading, &volumes, dir, &claims, trees.as_ref(), now, &cpu) {
+        let sweep = (trees.as_ref(), procs.as_ref());
+        for line in lines(&reading, &volumes, dir, &claims, sweep, now, &cpu) {
             println!("{line}");
         }
     }
@@ -130,22 +137,6 @@ fn reserves(
 ) -> Vec<Reserve> {
     let volumes: Vec<Volume> = r.volume.iter().chain(others).cloned().collect();
     aterm_capacity::reserved(claims, trees, &volumes)
-}
-
-/// How each claim stands as a waiter of memory that cannot start now ([`aterm_capacity::spared`],
-/// CAP3): the most a claim behind it may take and go first without delaying its turn
-/// ([`Spared::Within`]), or that no claim's end can start it, so it reserves no memory and the
-/// claims behind it that fit go first ([`Spared::Stuck`]). `None` for each claim where no memory
-/// was read.
-fn spares(
-    r: &Reading,
-    claims: &[Record],
-    trees: Option<&HashMap<u32, TreeUse>>,
-) -> Vec<Option<Spared>> {
-    match r.available.or(r.physical) {
-        Some(available) => aterm_capacity::spared(claims, trees, available, r.reachable()),
-        None => vec![None; claims.len()],
-    }
 }
 
 /// The memory `reserve` holds the claims behind it to: none for a waiter no claim's end can
@@ -194,6 +185,11 @@ fn or_unknown<T>(v: Option<T>, show: impl Fn(T) -> String) -> String {
     v.map_or_else(|| "unknown".to_owned(), show)
 }
 
+/// What the process sweep read of the claims: each claimant's and credited process's tree
+/// ([`aterm_capacity::Procs::trees`]; `None` with no sweep), and the sweep, each waiter's
+/// ancestors in it ([`aterm_capacity::spared`]; `None` with no sweep).
+type Sweep<'a> = (Option<&'a HashMap<u32, TreeUse>>, Option<&'a Procs>);
+
 /// The report a person reads, a line for each of `volumes` (the other volumes claims are on,
 /// [`claim_volumes`]) after `r`'s.
 fn lines(
@@ -201,7 +197,7 @@ fn lines(
     volumes: &[Volume],
     dir: Option<&Path>,
     claims: &Result<Vec<Record>, String>,
-    trees: Option<&HashMap<u32, TreeUse>>,
+    (trees, procs): Sweep<'_>,
     now: u64,
     cpu: &cpu::Report,
 ) -> Vec<String> {
@@ -252,7 +248,7 @@ fn lines(
                 claims.len() - held
             ));
             let overruns = overruns(claims, trees);
-            let spares = spares(r, claims, trees);
+            let spares = aterm_capacity::spared(claims, trees, procs, r);
             for ((c, reserve), spare) in claims
                 .iter()
                 .zip(reserves(r, volumes, claims, trees))
@@ -267,9 +263,37 @@ fn lines(
                     now,
                 ));
             }
+            out.extend(turn_lines(claims, now));
         }
     }
     out
+}
+
+/// The judgment turn's queue ([`aterm_capacity::Heavy`], [`heavy_queue`]): who holds it, then
+/// each waiter in the order it takes it (shortest predicted first, aged by its wait), with what
+/// its work is predicted to take of this machine and how long ago it was first queued. None
+/// where no claim asks for it.
+fn turn_lines(claims: &[Record], now: u64) -> Vec<String> {
+    let mut next = 0;
+    heavy_queue(claims)
+        .into_iter()
+        .filter_map(|c| {
+            let heavy = c.need.heavy?;
+            let who = if c.held.is_some() {
+                format!("held by pid {}", c.pid)
+            } else {
+                next += 1;
+                format!("{next}. pid {} waits", c.pid)
+            };
+            Some(format!(
+                "turn     {who}: predicted {}, queued {} ago (key {})  \"{}\"",
+                span(Duration::from_millis(heavy.predicted_ms)),
+                span(Duration::from_millis(now.saturating_sub(heavy.since_ms))),
+                heavy.key(),
+                c.need.what
+            ))
+        })
+        .collect()
 }
 
 /// What the processes `c` is credited with ([`Record::credit`]) use: `None` without a sweep.
@@ -331,8 +355,8 @@ fn tree_use(c: &Record, trees: Option<&HashMap<u32, TreeUse>>) -> Option<TreeUse
 /// original record PID without attributing a current process to it. A holder's tree is the same
 /// for every claim that process holds, and so is `overrun`, what that tree holds past its held
 /// claims of memory ([`overrun`]). A waiter of memory that cannot start now names what it
-/// `spare`s, or that no claim's end can start it and the claims behind it that fit go first,
-/// background work aside behind a release's claim ([`spares`]).
+/// `spare`s, or that no end of a claim it can wait for can start it and the claims behind it
+/// that fit go first, background work aside behind a release's claim ([`aterm_capacity::spared`]).
 fn claim_line(
     c: &Record,
     reserve: Reserve,
@@ -381,8 +405,9 @@ fn claim_line(
                     gib(s)
                 ),
                 Some(Spared::Stuck) => format!(
-                    ": it cannot start yet and no claim's end can start it (it waits for memory \
-                     no claim holds), so each claim behind it that fits goes first{}",
+                    ": it cannot start yet and no end of a claim it can wait for can start it (it \
+                     waits for memory no claim holds but the work it runs under), so each claim \
+                     behind it that fits goes first{}",
                     if c.need.rank == aterm_capacity::Rank::Release {
                         " (background work aside, which yields to a release's claim)"
                     } else {
@@ -421,6 +446,12 @@ fn claim_line(
     }
     if let Some(q) = c.need.quiet {
         parts.push(format!("quiet at load {q:.1}"));
+    }
+    if let Some(heavy) = c.need.heavy {
+        parts.push(format!(
+            "the judgment turn, predicted {}",
+            span(Duration::from_millis(heavy.predicted_ms))
+        ));
     }
     if let Some(left) = c.reserves(now) {
         parts.push(format!(
@@ -469,15 +500,18 @@ fn volume_json(v: &Volume) -> Value {
 /// phase claims, `stepped` what its holder stepped it to, and `spares` what a waiter of memory
 /// that cannot start now and keeps its place lets a claim behind it take and go first
 /// ([`Spared::Within`]), each `null` where it has none (CAP3). `stuck` is whether it is a waiter
-/// of memory no claim's end can start ([`Spared::Stuck`]): its `spares` is `null` and its
-/// `reserved_mem` `0`, since each claim behind it that fits goes first; `null` where no memory
-/// was read.
+/// of memory no end of a claim it can wait for can start ([`Spared::Stuck`]): its `spares` is
+/// `null` and its `reserved_mem` `0`, since each claim behind it that fits goes first; `null`
+/// where no memory was read. `heavy` is its ask of the judgment turn (`since_ms`, `predicted_ms`
+/// and their sum, `key`; `null` where it asks none), and the top-level `turn` the claims that ask
+/// for it, each by its place in the ledger (`[start_ms, pid, seq]`): its holder first, then its
+/// waiters in the order they take it ([`heavy_queue`]).
 fn json_of(
     r: &Reading,
     volumes: &[Volume],
     dir: Option<&Path>,
     claims: &Result<Vec<Record>, String>,
-    trees: Option<&HashMap<u32, TreeUse>>,
+    (trees, procs): Sweep<'_>,
     now: u64,
     cpu: &cpu::Report,
 ) -> String {
@@ -512,7 +546,7 @@ fn json_of(
         }
         Ok(claims) => {
             let overruns = overruns(claims, trees);
-            let spares = spares(r, claims, trees);
+            let spares = aterm_capacity::spared(claims, trees, procs, r);
             let memory_read = r.available.or(r.physical).is_some();
             let rows = claims
                 .iter()
@@ -574,6 +608,16 @@ fn json_of(
                         },
                     );
                     m.insert("quiet".to_owned(), Value::from(c.need.quiet));
+                    m.insert(
+                        "heavy".to_owned(),
+                        c.need.heavy.map_or(Value::Null, |heavy| {
+                            let mut h = Map::new();
+                            h.insert("since_ms".to_owned(), Value::from(heavy.since_ms));
+                            h.insert("predicted_ms".to_owned(), Value::from(heavy.predicted_ms));
+                            h.insert("key".to_owned(), Value::from(heavy.key()));
+                            Value::Object(h)
+                        }),
+                    );
                     m.insert("next_ms".to_owned(), Value::from(c.next_ms));
                     m.insert(
                         "reserves_ms".to_owned(),
@@ -616,6 +660,21 @@ fn json_of(
                 })
                 .collect::<Vec<_>>();
             o.insert("claims".to_owned(), Value::Array(rows));
+            o.insert(
+                "turn".to_owned(),
+                Value::Array(
+                    heavy_queue(claims)
+                        .into_iter()
+                        .map(|c| {
+                            Value::Array(vec![
+                                Value::from(c.start_ms),
+                                Value::from(c.pid),
+                                Value::from(c.seq),
+                            ])
+                        })
+                        .collect(),
+                ),
+            );
         }
     }
     aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_owned())

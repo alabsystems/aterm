@@ -2173,6 +2173,10 @@ struct MetalArmLive {
     ),
     /// What a pipeline warm is building for this arm and has not handed over.
     warm_owed: Vec<crate::metal::warm::WarmItem>,
+    /// Pipeline states a frame built on this thread because no warm had handed them over
+    /// ([`Self::pso`], [`Self::fetch_pso`], [`Self::present_pso`]): each such build is a
+    /// shader compile on the frame path, tens of milliseconds against a cold shader cache.
+    frame_builds: u64,
     /// The tray-prim pipelines ([`crate::tray_prims`]), built off this thread from the first
     /// ask, or why they cannot be.
     tray_prims: crate::metal::tray_prims::TrayPrimsSlot,
@@ -2323,6 +2327,7 @@ impl MetalArmLive {
             fx_shared_palette: None,
             warmed: std::sync::mpsc::channel(),
             warm_owed: Vec::new(),
+            frame_builds: 0,
             tray_prims: crate::metal::tray_prims::TrayPrimsSlot::Unasked,
             tray_prims_scratch: None,
             #[cfg(test)]
@@ -2392,6 +2397,7 @@ impl MetalArmLive {
         let item = crate::metal::warm::WarmItem::pipeline(row, present);
         self.warm.await_item(item);
         let pso = crate::metal::pipelines::build(self.mint.device(), lib, spec, present)?;
+        self.frame_builds += 1;
         #[cfg(test)]
         self.built_here.push(item);
         self.present_psos.push((key, pso.clone_retained()));
@@ -2611,6 +2617,7 @@ impl MetalArmLive {
                 spec,
                 crate::metal::ffi::PixelFormat::Bgra8Unorm,
             )?);
+            self.frame_builds += 1;
             #[cfg(test)]
             self.built_here.push(item);
         }
@@ -2662,6 +2669,7 @@ impl MetalArmLive {
                 &twin.spec(),
                 crate::metal::ffi::PixelFormat::Bgra8Unorm,
             )?);
+            self.frame_builds += 1;
             #[cfg(test)]
             self.built_here.push(item);
         }
@@ -4055,6 +4063,7 @@ pub struct WindowGpu {
     pub(crate) metal_virtual_off: Option<crate::metal::resources::SealedTexture>,
     occluded_hint: bool,
     capture_present: bool,
+    frame_awaited: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -4124,15 +4133,34 @@ impl WindowGpu {
         self.capture_present = on;
     }
 
-    /// Whether this window's present parks as `Occluded` (Windows): minimized, with no capture,
-    /// one-shot or recording waiting on its frames.
+    /// Mark the frontend's next presents as ones it waits on although the window is hidden
+    /// (`on`: its first present, the frame it is revealed with, a recording or an assistive
+    /// client it serves, a covered window's paced frame), or no longer (`!on`).
+    #[inline]
+    pub const fn set_frame_awaited(&mut self, on: bool) {
+        self.frame_awaited = on;
+    }
+
+    /// Whether a capture, a presented snapshot, a recording or the frontend
+    /// ([`Self::set_frame_awaited`]) waits on this window's frames.
     #[must_use]
     #[inline]
-    pub const fn parks_while_minimized(&self) -> bool {
-        self.occluded_hint
-            && !self.capture_present
-            && self.presented_snapshot.is_none()
-            && self.video.is_none()
+    pub const fn present_awaited(&self) -> bool {
+        self.capture_present
+            || self.frame_awaited
+            || self.presented_snapshot.is_some()
+            || self.video.is_some()
+    }
+
+    /// Whether this window's present parks as `Occluded` before any compose, on Metal and D3D11
+    /// alike: the frontend says it is not visible (minimised, fully covered, on another Space or
+    /// hidden) and nothing waits on its frames ([`Self::present_awaited`]). A window nobody can see
+    /// submits no GPU work, which lets the driver free its render-pass memory
+    /// (`docs/ATERM_DESIGN.md` §7.4).
+    #[must_use]
+    #[inline]
+    pub const fn parks_while_hidden(&self) -> bool {
+        self.occluded_hint && !self.present_awaited()
     }
 
     /// CPU wall time encoding and calling `queue.submit` for the latest successful present.
@@ -4867,6 +4895,15 @@ struct ShimmerRegion {
     band_x0: f32,
     band_w: f32,
     heat: [f32; SHIMMER_BANDS],
+}
+
+/// What [`GpuRenderer::pipeline_warm_standing`] reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PipelineWarmStanding {
+    /// Builds a pipeline warm still owes the arm.
+    pub owed: usize,
+    /// Pipeline states the arm's frames built on the frame thread.
+    pub frame_builds: u64,
 }
 
 impl GpuRenderer {
@@ -8133,6 +8170,11 @@ impl GpuRenderer {
         effects_transport_shift_y: i32,
         resident: bool,
     ) -> Result<(), SurfacePresentFailure> {
+        // A window nobody can see submits no GPU work unless something waits on its frame
+        // (`docs/ATERM_DESIGN.md` §7.4), as the D3D11 arm refuses it.
+        if win.parks_while_hidden() {
+            return Err(SurfacePresentFailure::Occluded);
+        }
         let _pool = crate::metal::ffi::AutoreleasePool::new();
         let source_crop = self
             .resident_present_crop(input, source_crop)
@@ -10470,6 +10512,40 @@ impl GpuRenderer {
         }
     }
 
+    /// [`Self::warm_effect_pipelines`] for a caller that waits for the warm to land
+    /// ([`Self::pipeline_warm_standing`]): the Metal arm is minted now if it has not been, so the
+    /// warm starts now rather than at the first frame's mint, which a frame waiting on the warm
+    /// would never reach. Whether a warm runs: `false` where this renderer has no Metal arm (the
+    /// GL and D3D11 arms, or a mint that failed), which builds every state on its frames.
+    pub fn warm_effect_pipelines_now(&mut self) -> bool {
+        self.warm_effect_pipelines();
+        #[cfg(target_os = "macos")]
+        {
+            self.metal_arm_ready()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// The pipeline warms' standing on the Metal arm, after taking what landed: how many builds
+    /// a warm still owes this arm, and how many pipeline states its frames built on the frame
+    /// thread because no warm had handed them over. `(0, 0)` on an arm not minted yet, and on the
+    /// GL and D3D11 arms, which warm nothing.
+    pub fn pipeline_warm_standing(&mut self) -> PipelineWarmStanding {
+        #[cfg(target_os = "macos")]
+        if let Some(cell) = self.metal_arm.as_mut() {
+            let live = cell.live_mut();
+            live.adopt_warmed();
+            return PipelineWarmStanding {
+                owed: live.warm_owed.len(),
+                frame_builds: live.frame_builds,
+            };
+        }
+        PipelineWarmStanding::default()
+    }
+
     /// Start the Metal arm's pipeline warm under the present switches, if the arm is live.
     #[cfg(target_os = "macos")]
     fn metal_warm_pipelines(&mut self) {
@@ -11679,11 +11755,10 @@ impl GpuRenderer {
             None => frame_cursor,
         };
         let cursor_default_bg = aterm_render::resolved_default_bg_at(input, cr, cc, self.theme.bg);
-        let cursor_fill = aterm_render::floor_cursor_fill(
-            base_cursor,
-            cursor_cell.map_or(cursor_default_bg, |cell| aterm_render::rgb_to_u32(cell.bg)),
-            min_contrast,
-        );
+        let cursor_cell_bg =
+            cursor_cell.map_or(cursor_default_bg, |cell| aterm_render::rgb_to_u32(cell.bg));
+        let cursor_fill =
+            aterm_render::floor_cursor_fill(base_cursor, cursor_cell_bg, min_contrast);
         if matches!(scope, RepaintScope::Dirty(_))
             && let Some((f, last)) = dirty_band
         {
@@ -12422,6 +12497,33 @@ impl GpuRenderer {
                     ],
                     color,
                 });
+            }
+            // The keyline lies over the block and its letter, at the block's opacity: the cursor
+            // stream draws after both, and a block caret puts nothing else in it. Its colour is
+            // worked from the fill drawn and the ground under it, as the CPU renderer's is.
+            if let Some(tint) = input.cursor_keyline_tint
+                && let Some(rects) = aterm_render::block_keyline_rects(
+                    pad + cur_x,
+                    grid_top + cr * ch,
+                    cur_block_w,
+                    ch,
+                )
+            {
+                let keyline = aterm_render::block_keyline_colour(cursor_fill, tint, cursor_cell_bg);
+                let mut color = rgb4_u32(keyline);
+                color[3] = cursor_cov;
+                for [x, y, rw, rh] in rects {
+                    let clipped = match cur_run {
+                        None => Some((x, rw)),
+                        Some((rx0, rx1)) => clip_x_span(x, rw, rx0, rx1),
+                    };
+                    if let Some((x, rw)) = clipped {
+                        self.inst.cursor.push(BgInstance {
+                            rect: [sat_pos_u16(x), sat_pos_u16(y), rw as u16, rh as u16],
+                            color,
+                        });
+                    }
+                }
             }
         }
 
@@ -13806,6 +13908,13 @@ mod fx_hazard_tests;
 #[cfg(test)]
 #[path = "renderer_acquire_wait_failure_tests.rs"]
 mod acquire_wait_failure_tests;
+
+/// `docs/ATERM_DESIGN.md` §7.4 on the Metal arm: a hidden window's present is refused as
+/// `Occluded` before the arm reads its swapchain, encodes or submits anything, unless the
+/// frontend or a capture waits on that frame.
+#[cfg(all(target_os = "macos", test))]
+#[path = "renderer_hidden_present_tests.rs"]
+mod hidden_present_tests;
 
 #[cfg(all(target_os = "macos", test))]
 #[path = "renderer_gpu_park_accounting_tests.rs"]

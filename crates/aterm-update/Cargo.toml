@@ -47,6 +47,8 @@ aterm-tempfile = { workspace = true }
 aterm-spec-anchor = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+# Exclude process-table reads while the updater replaces its process image.
+aterm-sysprobe = { workspace = true }
 # The Linux lane's steady clock is named by the kernel's boot id
 # (`linux::steady_clock`), judged by astream's reader of its text
 # (`parse_boot_id`: a UUID, the all-zero id refused), the reader aterm-link's

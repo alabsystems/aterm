@@ -245,8 +245,11 @@ thread_local! {
     static MEASURING: Cell<Option<Option<ListRoom>>> = const { Cell::new(None) };
     /// How the page built last laid its list out ([`laid_last`]).
     static LAID: Cell<Option<ListRoom>> = const { Cell::new(None) };
-    /// The rows [`list_laid`] laid its list out with, while it lays one out.
-    static LAYING: RefCell<Option<Option<scroll::ListLaid>>> = const { RefCell::new(None) };
+    /// The rows [`list_laid`] laid its list out with, while it lays one out. Boxed: inline it was
+    /// 80 bytes of every thread's thread-local template (`tests/thread_local_template.rs`). The
+    /// box is made the first time a thread measures the page and kept, so a later measure
+    /// allocates nothing for it.
+    static LAYING: Box<RefCell<Option<Option<scroll::ListLaid>>>> = Box::new(RefCell::new(None));
     /// Whether the page measured pins the keyboard's control around its list ([`pin`]).
     static KEYBOARD_PINNED: Cell<bool> = const { Cell::new(false) };
     /// The keyboard's control pinned round the list: how tall, what a bar leaves ([`pin`]).
@@ -578,7 +581,7 @@ pub(in crate::native_settings) fn list_laid(
 ) -> (Option<ListRoom>, Option<scroll::ListLaid>) {
     LAYING.with(|laying| laying.replace(Some(None)));
     let room = list_room(state, width, cx);
-    (room, LAYING.with(RefCell::take).flatten())
+    (room, LAYING.with(|laying| laying.take()).flatten())
 }
 
 fn measuring() -> bool {

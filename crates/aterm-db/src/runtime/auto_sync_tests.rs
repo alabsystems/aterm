@@ -15,12 +15,6 @@ use std::{
     net::Ipv4Addr,
 };
 
-/// Completed application rounds that retain nothing new before a wait calls repair stuck. A round
-/// repairs one table and a peer's rounds take the common tables in turn, so a holder's data is a
-/// few rounds away, however long each round takes on a loaded host. A round that selected no table
-/// or deferred its table counts too ([`Progress::rounds`]).
-const ROUNDS_WITHOUT_PROGRESS: u64 = 64;
-
 /// What a runtime's transports have reported ([`Attachment::observe`]).
 #[derive(Default)]
 struct Progress {
@@ -36,27 +30,19 @@ impl Progress {
     }
 }
 
-/// Whether repair still runs while a wait for one table's operations goes on. It has stopped once
-/// the runtime completes no application round for a hang detector's minute, or once enough of them
-/// complete and retain nothing new on the table. A runtime whose every round fails is silent; one
-/// whose every round defers is not, and stops at the count. Elapsed time judges nothing else: a
-/// chain of slow rounds on a loaded host is repair running, and the data's path through it can
-/// outlast any one budget.
+/// A minute without a higher retained count on the requested table is a hang.
+/// Unrelated or deferred rounds neither exhaust nor renew that table's wait.
 struct Watch {
     table: Digest,
     high_water: usize,
-    rounds: u64,
-    rounds_at_high_water: u64,
-    silent_since: Instant,
+    progressed_at: Instant,
 }
 impl Watch {
     fn new(table: Digest, progress: &Progress, now: Instant) -> Self {
         Self {
             table,
             high_water: progress.held(&table),
-            rounds: progress.rounds,
-            rounds_at_high_water: progress.rounds,
-            silent_since: now,
+            progressed_at: now,
         }
     }
 
@@ -64,17 +50,10 @@ impl Watch {
     fn remaining(&mut self, progress: &Progress, now: Instant) -> Option<Duration> {
         if progress.held(&self.table) > self.high_water {
             self.high_water = progress.held(&self.table);
-            self.rounds_at_high_water = progress.rounds;
-        }
-        if progress.rounds != self.rounds {
-            self.rounds = progress.rounds;
-            self.silent_since = now;
-        }
-        if progress.rounds - self.rounds_at_high_water >= ROUNDS_WITHOUT_PROGRESS {
-            return None;
+            self.progressed_at = now;
         }
         aterm_spec::wait::MUST_HAPPEN
-            .checked_sub(now.saturating_duration_since(self.silent_since))
+            .checked_sub(now.saturating_duration_since(self.progressed_at))
             .filter(|left| !left.is_zero())
     }
 }
@@ -141,61 +120,45 @@ impl Attachment {
     }
 }
 
-/// A wait's verdicts, with the clock in the test's hands. Slow rounds keep repair running past any
-/// one minute; a silent minute is a hang; rounds that retain nothing are stuck however quick.
 #[test]
-fn a_wait_outlasts_slow_rounds_and_stops_when_they_hang_or_retain_nothing() {
+fn a_wait_tracks_its_tables_progress_without_a_round_count_budget() {
     let table = [7; 32];
     let hang = aterm_spec::wait::MUST_HAPPEN;
     let began = Instant::now();
-    let after = |slow_minutes: u32, seconds: u64| {
-        began + hang * slow_minutes + Duration::from_secs(seconds)
-    };
-
     let mut progress = Progress::default();
     let mut watch = Watch::new(table, &progress, began);
     assert_eq!(watch.remaining(&progress, began), Some(hang));
-    assert_eq!(
-        watch.remaining(&progress, after(0, 59)),
-        Some(Duration::from_secs(1))
-    );
-    // Each round ends just inside the minute since the last: three minutes on, nothing retained.
-    for slow_minutes in 1..=3 {
-        progress.rounds += 1;
-        assert!(
-            watch.remaining(&progress, after(slow_minutes, 0)).is_some(),
-            "a slow round is repair running"
-        );
-    }
-    assert_eq!(
-        watch.remaining(&progress, after(3, 59)),
-        Some(Duration::from_secs(1))
-    );
-    assert_eq!(
-        watch.remaining(&progress, after(4, 0)),
-        None,
-        "a silent minute is a hang"
-    );
-
-    let mut progress = Progress::default();
-    let mut watch = Watch::new(table, &progress, began);
-    for round in 1..ROUNDS_WITHOUT_PROGRESS {
-        progress.rounds = round;
-        assert!(watch.remaining(&progress, began).is_some());
-    }
-    progress.retained.insert(table, 1);
-    assert!(
-        watch.remaining(&progress, began).is_some(),
-        "the table's retained count moved"
-    );
-    progress.rounds = 2 * ROUNDS_WITHOUT_PROGRESS - 2;
-    assert!(watch.remaining(&progress, began).is_some());
+    progress.rounds = 128;
+    assert_eq!(watch.remaining(&progress, began), Some(hang));
     progress.retained.insert([8; 32], 9);
+    assert_eq!(
+        watch.remaining(&progress, began + Duration::from_secs(59)),
+        Some(Duration::from_secs(1))
+    );
+    progress.retained.insert(table, 1);
+    assert_eq!(
+        watch.remaining(&progress, began + Duration::from_secs(59)),
+        Some(hang)
+    );
     progress.rounds += 1;
     assert_eq!(
-        watch.remaining(&progress, began),
-        None,
-        "rounds that retain nothing on this table are stuck, whatever another table does"
+        watch.remaining(&progress, began + hang),
+        Some(Duration::from_secs(59))
+    );
+    progress.retained.insert(table, 2);
+    assert_eq!(
+        watch.remaining(&progress, began + Duration::from_secs(118)),
+        Some(hang)
+    );
+    progress.rounds += 128;
+    progress.retained.insert([8; 32], 10);
+    assert_eq!(
+        watch.remaining(&progress, began + Duration::from_secs(177)),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        watch.remaining(&progress, began + Duration::from_secs(178)),
+        None
     );
 }
 
@@ -238,7 +201,6 @@ fn start(
 fn a_later_runtime_discovers_the_request_and_the_custodian_takes_a_holders_value_automatically() {
     use crate::credentials;
     use aterm_secrets::{
-        fsx,
         need::{self, Purpose, Want},
         text::Audience,
     };
@@ -278,19 +240,19 @@ fn a_later_runtime_discovers_the_request_and_the_custodian_takes_a_holders_value
     // The requester joins the running owners through discovery; no endpoint/address is supplied.
     let (requester, requester_attachment) = start(&lab, observers.path(), 2, port);
     holder_attachment.wait_for(scope, 1, "a new runtime's request reaches a running holder");
-    let source = lab.paths[1].home.join(".secrets");
-    fsx::ensure_private_dir(&source).unwrap();
-    fsx::write_atomic(
-        &source.join("automatic_password"),
-        b"automatic-scratch-password",
-        0o600,
-    )
+    // The holder's copy is given by hand: a value its store holds is the vault's, which the
+    // custodian copies itself. Giving it is the holder's local work; it opens no connection.
+    let given = credentials::give_from(&lab.paths[1], "mailbox:automatic", || {
+        Ok(aterm_secrets::SecretBytes::from(
+            b"automatic-scratch-password".as_slice(),
+        ))
+    })
     .unwrap();
-    // This is sync.requests' local holder work. It does not open a connection.
-    assert_eq!(credentials::pass(&lab.paths[1]).unwrap().offered, 1);
+    assert_eq!((given.retained, given.published), (1, 0));
+    // The request, the holder's offer and the custodian's Published.
     requester_attachment.wait_for(
         scope,
-        4,
+        3,
         "an automatic runtime handoff retains Published on the requester",
     );
     requester.stop();
@@ -1479,15 +1441,18 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
     }
 }
 
-/// The registry's default-on owner, not fleet_db's manual server: a cold peer
-/// discovers sealed mailbox rows, edits one, and resumes after both owners restart.
+/// The registry's default-on owner, not fleet_db's manual server: a cold peer discovers sealed
+/// mailbox rows, edits one, and resumes after both owners restart. The generation is one builds
+/// up to 0.200.0 read, which every Mac holds until a roll: a sign-in opens each sealed token in
+/// place and asks nothing of the secret store (the closed store stands in, whose every call
+/// refuses).
 #[test]
 fn registry_mailbox_secrets_discover_bidirectionally_and_survive_owner_restart() {
     use crate::{
         alab::{
             Registry,
             mail::{self, Credential, Withheld},
-            registry::{ADDRESS, MAILBOX},
+            registry::{SEALED_ADDRESS as ADDRESS, SEALED_MAILBOX as MAILBOX},
             secret::Journal,
         },
         att::{Handle, REGISTRY},
@@ -1588,6 +1553,7 @@ fn registry_mailbox_secrets_discover_bidirectionally_and_survive_owner_restart()
         assert_eq!(
             mail::reveal_bound(
                 registry,
+                &crate::alab::secret::Closed,
                 &journal,
                 &mailbox,
                 &[Credential::Password, Credential::Totp],
@@ -1608,6 +1574,7 @@ fn registry_mailbox_secrets_discover_bidirectionally_and_survive_owner_restart()
     assert_eq!(
         mail::reveal_bound(
             &remote,
+            &crate::alab::secret::Closed,
             &journal,
             &mailbox,
             &[Credential::Password, Credential::Totp],
@@ -1632,6 +1599,7 @@ fn registry_mailbox_secrets_discover_bidirectionally_and_survive_owner_restart()
     assert_eq!(
         mail::reveal_bound(
             &remote,
+            &crate::alab::secret::Closed,
             &journal,
             &mailbox,
             &[Credential::Password, Credential::MailboxPassword],
@@ -1719,6 +1687,373 @@ fn registry_mailbox_secrets_discover_bidirectionally_and_survive_owner_restart()
         "changed-after-restart"
     );
     check(&remote, 1, "fixture-reverse-password", SECOND_TOTP);
+}
+
+/// The same at the generation whose secret cells name store entries, which only a test reaches
+/// in this build: a cold peer discovers mailbox rows, edits one, and resumes after both owners
+/// restart. One [`Memory`] store stands for the lab's shared vault; no value is in a row the
+/// peers exchange.
+#[test]
+fn registry_mailbox_references_discover_bidirectionally_and_survive_owner_restart() {
+    use crate::{
+        alab::{
+            Registry,
+            mail::{self, Credential, Withheld},
+            registry::{ADDRESS, MAILBOX},
+            secret::Journal,
+        },
+        att::{Handle, REGISTRY},
+        typed::{
+            cell::{self, CellKey, CellValue},
+            keys,
+            secret::{Memory, Secret, Store, reference, store_cell},
+        },
+    };
+    use aterm_json::json;
+    const FIRST_TOTP: &str = "JBSWY3DPEHPK3PXP";
+    const SECOND_TOTP: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+    let observers = aterm_tempfile::Builder::new()
+        .prefix("registry-owner-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let reservation = Multicast::bind(
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(239, 255, 31, 84),
+        0,
+        LinkScope::Loopback,
+    )
+    .unwrap();
+    let port = reservation.port();
+    for paths in &lab.paths {
+        assert!(!paths.dir.join("commons/tables").exists());
+    }
+    // Both Macs run this build, so the lab starts at the generation that takes references,
+    // declared before the owner runs.
+    let table = Registry::at(lab.paths[0].clone())
+        .open_newest(1_800_000_000_000)
+        .unwrap();
+    let (owner, owner_progress) = start(&lab, observers.path(), 0, port);
+    let (receiver, receiver_progress) = start(&lab, observers.path(), 1, port);
+    for runtime in [&owner, &receiver] {
+        wait_network(
+            &runtime.network_observation(),
+            "owner active before any application",
+            |s| s.visibility == Visibility::Active && s.observer.is_some(),
+        );
+    }
+    let login = keys::address_pk("owner@example.invalid").unwrap();
+    let mailbox = keys::mailbox_pk(&login).unwrap();
+    let put = |collection: &crate::typed::Collection, row: &str, column: &str, value| {
+        cell::change(
+            collection,
+            CellKey {
+                pk: row,
+                col: column,
+                elem: None,
+            },
+            &CellValue::owner(1, value),
+        )
+        .unwrap()
+    };
+    let source = Registry::at(lab.paths[0].clone());
+    let store = Memory::default();
+    let secret = |collection: &str, row: &str, column: &str, value: &str| {
+        store_cell(&store, collection, column, row, &Secret::new(value.into())).unwrap()
+    };
+    let password = secret("address", &login, "password", "fixture-initial-password");
+    let totp = secret("mailbox", &mailbox, "totp", FIRST_TOTP);
+    let totp_entry = crate::typed::secret::entry_of(&totp).unwrap().to_owned();
+    Handle::at(lab.paths[0].clone(), &REGISTRY)
+        .commit_sealed_until(true, crate::admission::deadline(), |_, _| {
+            Ok((
+                (),
+                vec![vec![
+                    put(&ADDRESS, &login, "addr", json!("owner@example.invalid")),
+                    put(&ADDRESS, &login, "password", password),
+                    put(&MAILBOX, &mailbox, "label", json!("fixture-mailbox")),
+                    put(&MAILBOX, &mailbox, "service", json!("proton")),
+                    put(&MAILBOX, &mailbox, "code_path", json!("webmail")),
+                    put(&MAILBOX, &mailbox, "login", json!(login)),
+                    put(&MAILBOX, &mailbox, "totp", totp),
+                    put(
+                        &MAILBOX,
+                        &mailbox,
+                        "webmail",
+                        json!("https://mail.example.invalid/inbox"),
+                    ),
+                ]],
+            ))
+        })
+        .unwrap();
+    let first_count = source.view().unwrap().ops.len();
+    receiver_progress.wait_for(
+        table.digest(),
+        first_count,
+        "cold peer discovers registry and mailbox",
+    );
+    let remote = Registry::at(lab.paths[1].clone());
+    let check = |registry: &Registry, machine: usize, expected: &str, expected_totp: &str| {
+        let rows = mail::sign_in_mailboxes(registry).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].login, "owner@example.invalid");
+        assert!(rows[0].held.contains(&Credential::Password));
+        assert!(rows[0].held.contains(&Credential::Totp));
+        let journal = Journal::at(&observers.path().join(format!("reveals-{machine}")));
+        assert_eq!(
+            mail::reveal_bound(
+                registry,
+                &store,
+                &journal,
+                &mailbox,
+                &[Credential::Password, Credential::Totp],
+                1_000,
+                |found| found.login == "owner@example.invalid"
+                    && found.service.as_deref() == Some("proton"),
+                |values| values.len() == 2
+                    && values[0].as_str() == Some(expected)
+                    && values[1].as_str() == Some(expected_totp),
+            )
+            .unwrap(),
+            Ok(true)
+        );
+    };
+    check(&remote, 1, "fixture-initial-password", FIRST_TOTP);
+    let journal = Journal::at(&observers.path().join("refused-bundles"));
+    let consumed = std::cell::Cell::new(false);
+    assert_eq!(
+        mail::reveal_bound(
+            &remote,
+            &store,
+            &journal,
+            &mailbox,
+            &[Credential::Password, Credential::Totp],
+            1_000,
+            |found| found.login == "another@example.invalid",
+            |_| consumed.set(true),
+        )
+        .unwrap(),
+        Err(Withheld::NoMailbox)
+    );
+    assert!(
+        !consumed.get(),
+        "changed binding exposed a credential bundle"
+    );
+    assert!(
+        !observers
+            .path()
+            .join("refused-bundles/reveals.jsonl")
+            .exists(),
+        "binding was refused before a store entry was read"
+    );
+    assert_eq!(
+        mail::reveal_bound(
+            &remote,
+            &store,
+            &journal,
+            &mailbox,
+            &[Credential::Password, Credential::MailboxPassword],
+            1_000,
+            |found| found.login == "owner@example.invalid",
+            |_| consumed.set(true),
+        )
+        .unwrap(),
+        Err(Withheld::NotSet)
+    );
+    assert!(
+        !consumed.get(),
+        "a missing later part exposed an earlier credential"
+    );
+    // A reference whose entry this Mac's store lacks reveals nothing and journals nothing.
+    store.remove(&totp_entry).unwrap();
+    assert_eq!(
+        mail::reveal_bound(
+            &remote,
+            &store,
+            &journal,
+            &mailbox,
+            &[Credential::Password, Credential::Totp],
+            1_000,
+            |found| found.login == "owner@example.invalid",
+            |_| consumed.set(true),
+        )
+        .unwrap(),
+        Err(Withheld::NotInStore)
+    );
+    assert!(
+        !consumed.get(),
+        "a part the store lacks exposed an earlier credential"
+    );
+    assert!(
+        !observers
+            .path()
+            .join("refused-bundles/reveals.jsonl")
+            .exists(),
+        "a reference the store lacks journals nothing"
+    );
+    // The peer's edit names new entries, so the reverse write changes each cell.
+    let renamed = |entry: &str, value: &str| {
+        store.put(entry, &Secret::new(value.into())).unwrap();
+        reference(Memory::VAULT, entry)
+    };
+    let password = renamed(
+        &crate::typed::secret::test_entry(("address", "password", &login), 2),
+        "fixture-reverse-password",
+    );
+    let totp = renamed(
+        &crate::typed::secret::test_entry(("mailbox", "totp", &mailbox), 2),
+        SECOND_TOTP,
+    );
+    Handle::at(lab.paths[1].clone(), &REGISTRY)
+        .commit_sealed_until(false, crate::admission::deadline(), |_, _| {
+            Ok((
+                (),
+                vec![vec![
+                    put(&ADDRESS, &login, "password", password),
+                    put(&MAILBOX, &mailbox, "totp", totp),
+                ]],
+            ))
+        })
+        .unwrap();
+    let second_count = remote.view().unwrap().ops.len();
+    owner_progress.wait_for(
+        table.digest(),
+        second_count,
+        "original owner receives the reverse write",
+    );
+    check(&source, 0, "fixture-reverse-password", SECOND_TOTP);
+    owner.stop();
+    receiver.stop();
+    let inventory = |registry: &Registry| {
+        registry
+            .view()
+            .unwrap()
+            .ops
+            .into_iter()
+            .map(|o| o.id)
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        inventory(&source),
+        inventory(&remote),
+        "bidirectional equality uses authenticated operation ids"
+    );
+    for (machine, registry) in [(0, &source), (1, &remote)] {
+        check(registry, machine, "fixture-reverse-password", SECOND_TOTP);
+    }
+
+    let (owner, _) = start(&lab, observers.path(), 0, port);
+    let (receiver, progress) = start(&lab, observers.path(), 1, port);
+    source
+        .write(vec![vec![put(
+            &MAILBOX,
+            &mailbox,
+            "label",
+            json!("changed-after-restart"),
+        )]])
+        .unwrap();
+    progress.wait_for(
+        table.digest(),
+        source.view().unwrap().ops.len(),
+        "restarted owners resume automatic repair",
+    );
+    receiver.stop();
+    owner.stop();
+    assert_eq!(inventory(&source), inventory(&remote));
+    assert_eq!(
+        mail::sign_in_mailboxes(&remote).unwrap()[0].label,
+        "changed-after-restart"
+    );
+    check(&remote, 1, "fixture-reverse-password", SECOND_TOTP);
+}
+
+/// A lone peer satisfies the import guard through its rounds over other tables: two runtimes
+/// share the catalog and one application table, and the importing Mac's latest round with its
+/// one peer comes to be over the application table. Its network observation still holds the
+/// latest round over the catalog, which exchanged and left nothing to bring, and the guard of a
+/// first import (a registry no Mac here holds) reads it and holds nothing back.
+///
+/// A resting pair dials nothing without a move, so writes at the peer make the rounds: each is
+/// walked to the importer over the application table, and the follow-up round after it takes
+/// the peer's next regular turn, which alternates between the two tables both list. Within a
+/// few writes, whichever table the first sweep ended on, the importer's latest round is over
+/// the application table; the count of writes is the bound, not the time they take.
+/// MUTANT (`KEPT_UNREAD`, the guard before a round over the catalog was kept): the same
+/// observation makes the import wait, since no latest round is over the registry or the catalog.
+#[test]
+fn a_lone_peers_kept_catalog_round_lets_a_first_import_through_between_its_catalog_rounds() {
+    use crate::alab::command::{KEPT_UNREAD, rounds_wait};
+    let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+    // Darwin limits Unix socket paths to 103 bytes, as above.
+    let observers = aterm_tempfile::Builder::new()
+        .prefix("commons-guard-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let source = Proposals::at(lab.paths[0].clone());
+    let table = source.initialize().unwrap();
+    source
+        .write([1; 16], vec![proposal("beside-the-catalog")])
+        .unwrap();
+    let catalog = crate::catalog::scope(lab.bootstrap(1).trust()).digest();
+    let group = Ipv4Addr::new(239, 255, 31, 84);
+    let reservation = Multicast::bind(Ipv4Addr::LOCALHOST, group, 0, LinkScope::Loopback).unwrap();
+    let port = reservation.port();
+    let (peer, _) = start(&lab, observers.path(), 0, port);
+    let (importer, progress) = start(&lab, observers.path(), 1, port);
+    progress.wait_for(table.digest(), 1, "the importing Mac took its peer's table");
+    let latest = |state: &NetworkObservation| match &state.peers[..] {
+        [peer] => peer.last_repair.clone(),
+        _ => None,
+    };
+    let kept = |state: &NetworkObservation| {
+        state
+            .last_catalog_repair
+            .as_ref()
+            .is_some_and(|round| round.table == Some(catalog) && round.left_nothing())
+    };
+    let mut written = 0;
+    let mut since_ms = 0;
+    let state = loop {
+        let state = wait_network(
+            &importer.network_observation(),
+            "a round with the peer after the last write, and its quiet round over the catalog kept",
+            |state| {
+                kept(state) && latest(state).is_some_and(|round| round.completed_at_ms >= since_ms)
+            },
+        );
+        if latest(&state).is_some_and(|round| round.table.is_some_and(|table| table != catalog)) {
+            break state;
+        }
+        written += 1;
+        assert!(
+            written <= 4,
+            "after each of four writes the latest round was over the catalog: {state:?}"
+        );
+        since_ms = aterm_time::unix_millis().unwrap();
+        // Each write is its own request.
+        let request = [1 + u8::try_from(written).unwrap(); 16];
+        source
+            .write(request, vec![proposal(&format!("walked-{written}"))])
+            .unwrap();
+    };
+    importer.stop();
+    peer.stop();
+    let now_ms = aterm_time::unix_millis().unwrap();
+    // No Mac of this lab holds or declares this table: only the catalog can speak for it.
+    let registry = Some([0x52; 32]);
+    assert_eq!(
+        rounds_wait(&state, registry, Some(catalog), now_ms),
+        None,
+        "{state:?}"
+    );
+    KEPT_UNREAD.with(|flag| flag.set(true));
+    let unread = rounds_wait(&state, registry, Some(catalog), now_ms);
+    KEPT_UNREAD.with(|flag| flag.set(false));
+    assert!(
+        unread.is_some(),
+        "MUTANT: the latest round, over another table, says nothing of the registry"
+    );
 }
 
 /// What `file` reads on the stand-in Mac `paths`: its state word, why, and how many rows.

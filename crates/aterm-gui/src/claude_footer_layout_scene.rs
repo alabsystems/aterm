@@ -58,8 +58,9 @@ struct QuotaSample {
 }
 
 /// The quota samples, widest first, then the samples whose line E shares its row with one of
-/// Claude's notices (§7: "the row ends two cells before a notice").
-const QUOTA_SAMPLES: [QuotaSample; 5] = [
+/// Claude's notices (§7: "the row ends two cells before a notice"), then case (e), whose two
+/// unread accounts a plain cut would name alike (§2.5), on line E and as line D's unit.
+const QUOTA_SAMPLES: [QuotaSample; 7] = [
     QuotaSample {
         case: "b",
         row: 29,
@@ -94,6 +95,20 @@ const QUOTA_SAMPLES: [QuotaSample; 5] = [
         title: "Synthetic: case (b), Claude's launch effort hint on line E's row",
         claimed: true,
         notice: Some(EFFORT_HINT),
+    },
+    QuotaSample {
+        case: "e",
+        row: 49,
+        title: "Synthetic: case (e), two unread accounts with like names: named apart, each saying why",
+        claimed: true,
+        notice: None,
+    },
+    QuotaSample {
+        case: "e",
+        row: 53,
+        title: "Synthetic: case (e), line E not claimed: line D carries the words-only account unit",
+        claimed: false,
+        notice: None,
     },
 ];
 

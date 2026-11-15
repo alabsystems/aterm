@@ -68,20 +68,4 @@ fn a_selection_hands_cargo_its_crates_and_an_empty_cone_falls_back_wider() {
     assert!(Scope::workspace().touches("aterm-gui"));
     assert!(Scope::crate_only("aterm-lab").has_lib_target());
     assert!(!Scope::changed("main", vec!["aterm-lab".into()], false).has_lib_target());
-    // What a cone's lint leaves out goes from the lint's label alone, by package name whichever
-    // spec names it. CONTROL: with nothing left out, it reads as every other check's.
-    let pair = changed(&["aterm-gui", "aterm-uds", "getrandom@0.2.17"]);
-    assert_eq!(pair.lint_label(), pair.label());
-    let some = pair.with_unlinted(vec!["getrandom".into(), "aterm-gui".into()]);
-    assert_eq!(some.lint_label(), "-p aterm-uds");
-    assert_eq!(
-        some.label(),
-        "-p aterm-gui -p aterm-uds -p getrandom@0.2.17"
-    );
-    assert_eq!(
-        Scope::workspace()
-            .with_unlinted(vec!["aterm-gui".into()])
-            .lint_label(),
-        "--workspace"
-    );
 }

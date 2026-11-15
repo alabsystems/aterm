@@ -75,15 +75,18 @@ fn each_occupant_of_a_displaced_rows_directory_answers_for_itself() {
 fn a_sync_that_published_rows_and_refused_the_move_says_no_row_moved() {
     let world = World::new("published-then-refused-");
     let store = world.store();
-    fs::write(
-        world.home.join(".secrets").join(cli_fleet_file(Cli::Codex)),
-        format!(
-            "[[account]]\nlabel='a'\nemail='{A}'\nmachines=['m16']\n\n\
-             [[account]]\nlabel='b'\nemail='{B}'\nmachines=['m16']\n\n\
-             [[account]]\nlabel='c'\nemail='c@example.com'\nmachines=['m16']\n"
-        ),
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &world.home,
+        &[(
+            &cli_fleet_file(Cli::Codex),
+            format!(
+                "[[account]]\nlabel='a'\nemail='{A}'\nmachines=['m16']\n\n\
+                 [[account]]\nlabel='b'\nemail='{B}'\nmachines=['m16']\n\n\
+                 [[account]]\nlabel='c'\nemail='c@example.com'\nmachines=['m16']\n"
+            )
+            .as_bytes(),
+        )],
+    );
     let dir_a = store.login_dir("a").unwrap();
     fs::create_dir_all(dir_a.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/nonexistent-rerun-target", &dir_a).unwrap();
@@ -99,7 +102,7 @@ fn a_sync_that_published_rows_and_refused_the_move_says_no_row_moved() {
 #[test]
 fn the_setup_resync_counts_a_move_it_made_with_nothing_to_read() {
     let world = World::new("setup-resync-");
-    fs::remove_file(world.home.join(".secrets").join(cli_fleet_file(Cli::Codex))).unwrap();
+    crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
     world.login(B);
     let claude = world.config.with_file_name(accounts::ACCOUNTS_FILE);
     let fetch =
@@ -144,7 +147,7 @@ fn upkeep_carries_a_refused_move_and_a_move_with_nothing_to_read_wakes_the_pool(
     assert!(synced.is_err(), "{synced:?}");
 
     let world = World::new("upkeep-moved-");
-    fs::remove_file(world.home.join(".secrets").join(cli_fleet_file(Cli::Codex))).unwrap();
+    crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
     let wake = world.store().wake_path();
     let _ = fs::remove_file(&wake);
     world.login(B);
@@ -168,7 +171,7 @@ fn a_move_leaves_the_row_what_it_left_and_the_receipt_names_it() {
     for source in [true, false] {
         let world = World::new("bound-was-");
         if !source {
-            fs::remove_file(world.home.join(".secrets").join(cli_fleet_file(Cli::Codex))).unwrap();
+            crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
         }
         let store = world.store();
         let dir_b = store.login_dir("b").unwrap();
@@ -203,7 +206,7 @@ fn a_move_leaves_the_row_what_it_left_and_the_receipt_names_it() {
 #[test]
 fn a_broken_roster_is_the_syncs_error_with_nothing_to_read() {
     let world = World::new("broken-roster-");
-    fs::remove_file(world.home.join(".secrets").join(cli_fleet_file(Cli::Codex))).unwrap();
+    crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
     world.login(B);
     fs::write(&world.roster, "[[account\nlabel=").unwrap();
     let synced = world.sync();

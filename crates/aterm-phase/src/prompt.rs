@@ -5021,7 +5021,7 @@ pub mod fixtures {
             "",
             " ▐▛███▛█   Claude Code v2.1.282",
             "▝▜██████▀  Opus 5.5 · Claude Max",
-            "  ▝▝ ▝▝    /Users//user00/aterm",
+            "  ▝▝ ▝▝    /Users/_user0/aterm",
             "",
             &"─".repeat(120),
             composer_row,
@@ -5051,7 +5051,7 @@ pub mod fixtures {
         let mut r = rows(&[
             " Do you trust the files in this folder?",
             "",
-            "   /Users//x/proj",
+            "   /Users/_user0/proj",
             "",
             " Reading untrusted files may lead Claude Code to behave unexpectedly.",
             "",

@@ -601,6 +601,16 @@ impl Process {
         self.saved.as_deref()
     }
 
+    /// The content digest of the seal this process holds: the walk's, under the caller's
+    /// [`Schema::walk`], without the facts [`Process::identity`] binds beside it, so identical
+    /// roots under the same labels read the same on any machine (but for the target text an
+    /// absolute link below a root contributes). `None` while it holds no seal: before its first
+    /// call, and after a take whose inputs had not settled ([`SETTLE_NS`]).
+    #[must_use]
+    pub fn digest(&self) -> Option<&str> {
+        self.seal.as_ref().map(|seal| seal.digest.as_str())
+    }
+
     /// Whether the held seal is `identity` and still stands by status (its roots, facts and every
     /// entry's status are still the ones it hashed), walked to its end whatever
     /// [`Sources::stopped`] says. Unlike [`Process::identity`] it opens no input file, takes,

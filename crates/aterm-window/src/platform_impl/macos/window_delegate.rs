@@ -698,6 +698,32 @@ impl WindowDelegate {
         }
     }
 
+    pub fn order_front(&self) {
+        let _ = self.mtm();
+        // SAFETY: `self.win()` is a live NSWindow on the witnessed main thread.
+        // `-isMiniaturized` is `B@:`, and `-orderFront:` is `v@:@` with a nil sender.
+        // Ordering alone neither makes the window key nor activates its application.
+        unsafe {
+            if !send_bool(self.win(), sel!(isMiniaturized)) {
+                send_v_id(self.win(), sel!(orderFront:), Id::NIL);
+            }
+        }
+    }
+
+    pub fn make_key(&self) {
+        let _ = self.mtm();
+        // SAFETY: `self.win()` is a live NSWindow on the witnessed main thread.
+        // `-isMiniaturized` and `-isVisible` are `B@:`, and `-makeKeyWindow` is `v@:`.
+        // Making a visible window key neither orders it nor activates its application.
+        unsafe {
+            if !send_bool(self.win(), sel!(isMiniaturized))
+                && send_bool(self.win(), sel!(isVisible))
+            {
+                send_v(self.win(), sel!(makeKeyWindow));
+            }
+        }
+    }
+
     #[inline]
     pub fn is_visible(&self) -> Option<bool> {
         // SAFETY: `-isVisible` is `B@:` on `NSWindow`.
@@ -1169,6 +1195,14 @@ impl WindowDelegate {
 }
 
 impl WindowExtMacOS for WindowDelegate {
+    fn order_front(&self) {
+        WindowDelegate::order_front(self);
+    }
+
+    fn make_key(&self) {
+        WindowDelegate::make_key(self);
+    }
+
     // LOCAL PATCH (aterm): see `WinitView::cached_modifiers`.
     fn cached_modifiers(&self) -> ModifiersState {
         self.view().cached_modifiers()

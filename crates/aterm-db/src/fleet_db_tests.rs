@@ -945,11 +945,11 @@ fn a_workbook_that_cannot_be_read_is_named() {
         std::fs::write(sheets.join(name), text).unwrap();
     }
     let mut db = replica(&tmp.path().join("db"));
-    let report = bootstrap_from_secrets(&mut db, &sheets).unwrap();
+    let report = bootstrap_from_secrets(&mut db, Sheets::Dir(&sheets)).unwrap();
     assert_eq!(report["unread_workbooks"], json!(["alab-emails.xlsx"]));
     assert_eq!(report["ok"], json!(false));
     std::fs::remove_file(sheets.join("alab-emails.xlsx")).unwrap();
-    let report = bootstrap_from_secrets(&mut db, &sheets).unwrap();
+    let report = bootstrap_from_secrets(&mut db, Sheets::Dir(&sheets)).unwrap();
     assert_eq!(report.get("unread_workbooks"), None);
     assert_eq!(report["ok"], json!(true));
 }
@@ -1667,14 +1667,14 @@ fn bootstrap_never_stores_a_password_flag_and_a_second_run_writes_nothing() {
     }
     let mut db = replica(&tmp.path().join("db"));
 
-    let first = bootstrap_from_secrets(&mut db, &sheets).unwrap();
+    let first = bootstrap_from_secrets(&mut db, Sheets::Dir(&sheets)).unwrap();
     assert_eq!(first["imported"]["emails"], json!(2));
     let view = db.view();
     let password = |key: &str| get_row(&view, "emails", key).unwrap().unwrap()["password"].clone();
     assert_eq!(password("real@example.com"), json!("pw-synth"));
     assert_eq!(password("flag@example.com"), Value::Null);
 
-    let again = bootstrap_from_secrets(&mut db, &sheets).unwrap();
+    let again = bootstrap_from_secrets(&mut db, Sheets::Dir(&sheets)).unwrap();
     assert_eq!(again["operations_committed"], json!(0));
 
     // A key that stands is left alone, so a mark made since does not refuse the sheet.
@@ -1685,8 +1685,74 @@ fn bootstrap_never_stores_a_password_flag_and_a_second_run_writes_nothing() {
         json!({"email": "flag@example.com", "protected": true}),
     )
     .unwrap();
-    let again = bootstrap_from_secrets(&mut db, &sheets).expect("the mark stands");
+    let again = bootstrap_from_secrets(&mut db, Sheets::Dir(&sheets)).expect("the mark stands");
     assert_eq!(again["operations_committed"], json!(0));
+}
+
+/// With no folder named, `bootstrap` reads the four sheets in place from this Mac's verified
+/// store; a file of the same name under `~/.secrets` is neither read nor needed.
+#[cfg(unix)]
+#[test]
+fn bootstrap_with_no_folder_reads_the_stores_entries_and_never_a_secrets_file() {
+    use aterm_secrets::{client, text::Audience};
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join("home");
+    let paths = client::Paths::for_home(&home);
+    client::create(
+        &paths,
+        tmp.path().join("fixture.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    let mut db = replica(&tmp.path().join("db"));
+    assert!(
+        bootstrap_from_secrets(&mut db, Sheets::Store(&paths))
+            .unwrap_err()
+            .to_string()
+            .contains("holds no alab-phones.csv entry")
+    );
+    let admin = client::admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    for (name, text) in [
+        (
+            "alab-phones.csv",
+            "phone\n555-234-5678,carrier,mobile,dev,note\n",
+        ),
+        (
+            "alab-computers.csv",
+            "label\nm1,Apple,arm64,macOS,M4,128GB,1TB,,desk,,home,note\n",
+        ),
+        (
+            "alab-emails.csv",
+            "email\nreal@example.com,,pw-synth,active,proton,,,\n",
+        ),
+        ("ai-accounts.csv", "m\n,real@example.com,m1,,1,,,,,,note\n"),
+    ] {
+        doc.set_entry(&Audience::Everyone, name, text.as_bytes())
+            .unwrap();
+    }
+    client::admin_publish(&paths, &admin, &doc).unwrap();
+    let old = home.join(".secrets");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(
+        old.join("alab-emails.csv"),
+        "email\nfile@example.com,,pw-file,active,proton,,,\n",
+    )
+    .unwrap();
+    let first = bootstrap_from_secrets(&mut db, Sheets::Store(&paths)).unwrap();
+    assert_eq!(first["imported"]["emails"], json!(1));
+    let view = db.view();
+    assert!(
+        get_row(&view, "emails", "real@example.com")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        get_row(&view, "emails", "file@example.com")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1779,7 +1845,7 @@ fn bootstrap_reads_real_passwords_from_xlsx_when_csv_holds_flags() {
     std::fs::write(sheets.join("AI Email Accounting.xlsx"), zip_bytes).unwrap();
 
     let mut db = replica(&tmp.path().join("db"));
-    bootstrap_from_secrets(&mut db, &sheets).unwrap();
+    bootstrap_from_secrets(&mut db, Sheets::Dir(&sheets)).unwrap();
     let view = db.view();
     let password = |key: &str| get_row(&view, "emails", key).unwrap().unwrap()["password"].clone();
     assert_eq!(password("flag@example.com"), json!("xlsx-real-pw-42"));

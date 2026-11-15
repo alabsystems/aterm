@@ -145,7 +145,7 @@ pub fn scope_of(ctx: &Ctx) -> String {
 /// bounds it only where it did all of its work: the checks it runs that build, each that does
 /// not read the selection marked `:tree` (what it builds does not follow `-p`'s crates: `cells`
 /// named under the change cone lints every cell's whole graph, more than a `-p` run of the same
-/// crates does); `as-release` where its `test` or `doc` carries the checkers (`--as-release`,
+/// crates does); `as-release` where its `test` carries the checkers (`--as-release`,
 /// [`Ctx::checkers_in_tests`]), which they then build too; and what narrows a check, as
 /// `<check>--<how>`, each a run that does less than one without it: the cells `--cell` chose
 /// (`cells--cell=linux,win`), cells the selection pulled (`cells--pulled`: the cone closed over
@@ -153,9 +153,8 @@ pub fn scope_of(ctx: &Ctx) -> String {
 /// opens windows (its windowed stages are named skips), and `measure` with no `--app`
 /// (`measure--no-app`: its measuring stages are named skips and its prebuild is not planned, so
 /// it builds nothing, where `--app` builds the measuring benches). `--compile-only` and
-/// `--cursor-pacing` keep one stage of the whole plan, whatever check holds the rest (a pulled
-/// `wasm-smoke` too: [`crate::plan`]'s `wanted`), so each narrows all of the work
-/// (`--compile-only`, `--cursor-pacing`). Its crates are the selection's, sorted and each once
+/// `--cursor-pacing` keep one stage of the whole plan, whatever check holds the rest, so each
+/// narrows all of the work (`--compile-only`, `--cursor-pacing`). Its crates are the selection's, sorted and each once
 /// (none for the empty cone); `None` for the whole workspace, or where no check that builds reads
 /// the selection.
 #[must_use]
@@ -172,7 +171,7 @@ pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
             }
         })
         .collect();
-    if ctx.checkers_in_tests && (has(Check::Test) || has(Check::Doc)) {
+    if ctx.checkers_in_tests && has(Check::Test) {
         words.push("as-release".to_owned());
     }
     if has(Check::Cells) && !ctx.cells.is_empty() {

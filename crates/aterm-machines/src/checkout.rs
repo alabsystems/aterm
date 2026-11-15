@@ -174,10 +174,21 @@ pub(crate) fn head_commit(sys: &dyn System, user: &User, path: &Path) -> Cmd {
 /// An absent HEAD is an unfinished branch only when its symbolic branch has no ref.
 /// A missing object, detached HEAD or unreadable ref is not an empty checkout.
 pub(crate) fn unborn(sys: &dyn System, user: &User, path: &Path) -> Result<Option<String>, String> {
-    let git = git(sys, user, Some(path));
     let head = sys
         .run_complete_stdout(&head_commit(sys, user, path))
         .map_err(|why| why.to_string())?;
+    unborn_after(sys, user, path, &head)
+}
+
+/// [`unborn`], judged from `head`, a [`head_commit`] read of `path` the caller has just made:
+/// the read is not run again, and everything after it is.
+pub(crate) fn unborn_after(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    head: &Ran,
+) -> Result<Option<String>, String> {
+    let git = git(sys, user, Some(path));
     if head.success() {
         return if oid(head.out().trim()) {
             Ok(None)
@@ -667,11 +678,6 @@ impl Stands {
                 now: format!("left as it is: {why}"),
             },
         }
-    }
-
-    /// Whether an [`align`] would fetch.
-    pub(crate) const fn moves(&self) -> bool {
-        matches!(self, Self::Behind { .. } | Self::Unfetched { .. })
     }
 
     /// The probe this stand reads as when it was judged against origin as last fetched

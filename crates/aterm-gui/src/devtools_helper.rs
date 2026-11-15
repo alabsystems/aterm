@@ -4423,7 +4423,9 @@ pub(crate) mod live {
     const PLACEHOLDER_RADIUS: f64 = 12.0;
 
     thread_local! {
-        static LIVE: RefCell<Option<Live>> = const { RefCell::new(None) };
+        // Boxed: inline it was 192 bytes of every thread's thread-local template
+        // (`tests/thread_local_template.rs`). The box is made on a thread's first read or panel.
+        static LIVE: Box<RefCell<Option<Live>>> = Box::new(RefCell::new(None));
         static LINGER: RefCell<Option<Retained<TileView>>> = const { RefCell::new(None) };
         /// What the last reading of System Settings asking remembered ([`settings_asking`]'s
         /// `seen`): [`settings_asks_now`]'s and the panel's turn's alike.

@@ -66,7 +66,7 @@ fn each_programs_command_forms_are_read_and_its_prompts_are_not() {
         (":wq!", Some(Exit)),
         ("exit\nnow", None),
         ("exits", None),
-        ("/Users//me/shot.png what is wrong here", None),
+        ("/Users/_user0/shot.png what is wrong here", None),
         ("/tmp/build.log explain", None),
         ("/src/lib.rs: read this", None),
         ("  //a comment", None),

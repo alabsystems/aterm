@@ -5281,9 +5281,14 @@ fn ribbon_light_on_the_bar_above(unheld: bool) -> u64 {
 fn the_rainbow_block_s_halo_keeps_off_the_prompt_bar_above() {
     // Held off an inked or filled row next to the caret's as the momentum glow is, the rainbow
     // block's halo rings lay a twelfth or less on the powerline segment over the caret of what
-    // they lay whole (the negative control).
-    let held = ribbon_light_on_the_bar_above(false);
-    let whole = ribbon_light_on_the_bar_above(true);
+    // they lay whole (the negative control): every ring outside the block, as a pinned cursor
+    // colour draws them, and with the innermost one drawn inside the block as its keyline.
+    let (held, whole) = crate::cursor_fx::with_block_rim_outside(|| {
+        (
+            ribbon_light_on_the_bar_above(false),
+            ribbon_light_on_the_bar_above(true),
+        )
+    });
     assert!(
         whole > 2_000,
         "fixture: whole, the rings light the bar ({whole})"
@@ -5291,6 +5296,22 @@ fn the_rainbow_block_s_halo_keeps_off_the_prompt_bar_above() {
     assert!(
         held * 12 <= whole,
         "the rings lay {held} on the bar over the caret, against {whole} whole"
+    );
+    // The innermost ring inside the block: the outer rings are held off the bar as well, and
+    // whole they still light it (the fixture's floor, so the unheld rings fail the bound).
+    let keyed = ribbon_light_on_the_bar_above(false);
+    let keyed_whole = ribbon_light_on_the_bar_above(true);
+    eprintln!(
+        "bar above: outside held {held} whole {whole}; keyed held {keyed} whole {keyed_whole}"
+    );
+    assert!(
+        keyed_whole > 1_000,
+        "fixture: whole, the outer rings light the bar with the innermost inside ({keyed_whole})"
+    );
+    assert!(
+        keyed * 12 <= keyed_whole && keyed <= held,
+        "with the innermost ring inside the block, the rings lay {keyed} on the bar over the \
+         caret, against {keyed_whole} whole and {held} held with it outside"
     );
 }
 

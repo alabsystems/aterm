@@ -30,6 +30,7 @@ fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> Res
         workers_in_front: false,
         restored_tabs: vec![RestoredTab {
             root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                pinned: false,
                 sid: None,
                 lineage: None,
                 log_ep: None,
@@ -168,6 +169,7 @@ fn a_real_topology_change_still_rejects_the_commit() {
     let mut readopted = captured(Some((120, 80)), Some("/work"), "zsh");
     readopted.windows[0].restored_tabs[0].root =
         RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+            pinned: false,
             sid: None,
             lineage: None,
             log_ep: None,

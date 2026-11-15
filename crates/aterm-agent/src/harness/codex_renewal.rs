@@ -41,9 +41,15 @@ fn hex(word: &str, size: usize) -> bool {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Purpose {
+    /// The same account's login back: a renewal's successor on the row's own new login.
     #[default]
     Login,
+    /// A usage-limit handoff to another pool row, committed in the pool's own records.
     WeeklyQuota,
+    /// A lost login's move to another already-signed-in row, for the session alone: the
+    /// source's settled ordinary end ([`super::codex_app_login::RefusalReason::ends_ordinarily`])
+    /// moves it, and nothing in the pool's selection, canary or breaker changes.
+    LoginRotation,
 }
 
 impl Purpose {
@@ -54,7 +60,7 @@ impl Purpose {
     pub fn marker(self) -> &'static str {
         match self {
             Self::Login => "renewal",
-            Self::WeeklyQuota => "rotation",
+            Self::WeeklyQuota | Self::LoginRotation => "rotation",
         }
     }
 
@@ -62,6 +68,39 @@ impl Purpose {
         match self {
             Self::Login => "login-back@v1",
             Self::WeeklyQuota => "usage-rotate@v1",
+            Self::LoginRotation => "login-rotate@v1",
+        }
+    }
+
+    /// Whether its receipt moves the session to another account's login: a destination, a
+    /// receipt of the rotation's shape and the destination's own selection writer.
+    #[must_use]
+    pub const fn moves_account(self) -> bool {
+        match self {
+            Self::WeeklyQuota | Self::LoginRotation => true,
+            Self::Login => false,
+        }
+    }
+
+    /// Whether its receipt is the pool's: a pool deduplication record (`native_rotations`), a
+    /// canary on its destination and the pool's `active` proof follow it. Only a usage-limit
+    /// handoff's is; a lost login's move is the session's alone.
+    #[must_use]
+    pub const fn pool_scoped(self) -> bool {
+        match self {
+            Self::WeeklyQuota => true,
+            Self::Login | Self::LoginRotation => false,
+        }
+    }
+
+    /// Whether its turn ended at an authentication wall ([`History::auth_wall`]), and a
+    /// successor that never attached holds its login off
+    /// ([`ReceiptWriter::note_unattached_login`]).
+    #[must_use]
+    pub const fn auth_wall(self) -> bool {
+        match self {
+            Self::Login | Self::LoginRotation => true,
+            Self::WeeklyQuota => false,
         }
     }
 }
@@ -92,6 +131,11 @@ impl Request {
         Self::parse_for(line, Purpose::WeeklyQuota)
     }
 
+    /// A lost login's move: the rotation's four keys and grammar, under its own purpose.
+    pub fn parse_login_rotation(line: &str) -> Option<Self> {
+        Self::parse_for(line, Purpose::LoginRotation)
+    }
+
     fn parse_for(line: &str, purpose: Purpose) -> Option<Self> {
         let mut words = line.split_ascii_whitespace();
         let verb = words.next()?;
@@ -107,7 +151,9 @@ impl Request {
                 let thread = *fields.get("thread")?;
                 let (wall_key, account_key, user_key) = match purpose {
                     Purpose::Login => ("wall", "account", "user"),
-                    Purpose::WeeklyQuota => ("turn", "source_account", "source_user"),
+                    Purpose::WeeklyQuota | Purpose::LoginRotation => {
+                        ("turn", "source_account", "source_user")
+                    }
                 };
                 let wall = *fields.get(wall_key)?;
                 let account = *fields.get(account_key)?;
@@ -396,6 +442,9 @@ pub fn with_selected_writer<T>(
         Purpose::WeeklyQuota => {
             super::codex_rotation::with_selected_writer(env, receipt, use_selected)
         }
+        Purpose::LoginRotation => {
+            super::codex_rotation::with_session_selected_writer(env, receipt, use_selected)
+        }
     }
 }
 
@@ -406,7 +455,7 @@ impl Intent {
 
     pub fn matches_history(&self, history: &History) -> bool {
         match self.purpose {
-            Purpose::Login => history.auth_wall,
+            Purpose::Login | Purpose::LoginRotation => history.auth_wall,
             Purpose::WeeklyQuota => history.usage_wall,
         }
     }
@@ -514,7 +563,8 @@ mod attempts;
 pub use attempts::{
     Attempt, AttemptRef, Cancellation, CancellationKind, CompletionProgress, IndexKey,
     NativeCancellationProof, NativeUnattachedProof, ReceiptWriter, RootDriver, advance_root,
-    read_active_attempt, read_attempt, read_cancellation, with_receipt_writer,
+    read_active_attempt, read_attempt, read_cancellation, unattached_held_until,
+    with_receipt_writer,
 };
 
 /// Durable metadata only. Native command and operation persistence are retained
@@ -522,8 +572,9 @@ pub use attempts::{
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Receipt {
-    /// A quota move must name a different account. Login renewals have no
-    /// destination field and retain their existing same-identity requirement.
+    /// A move to another account (a usage-limit handoff or a lost login's move,
+    /// [`Purpose::moves_account`]) must name a different account. Login renewals
+    /// have no destination field and retain their existing same-identity requirement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<Identity>,
     pub id: String,
@@ -566,14 +617,14 @@ impl Receipt {
     pub fn target_identity(&self) -> Option<&Identity> {
         match (self.intent.purpose, &self.destination) {
             (Purpose::Login, None) => Some(&self.intent.identity),
-            (Purpose::WeeklyQuota, Some(target))
+            (Purpose::WeeklyQuota | Purpose::LoginRotation, Some(target))
                 if hex(&target.account, 64)
                     && hex(&target.user, 64)
                     && target.account != self.intent.identity.account =>
             {
                 Some(target)
             }
-            _ => None,
+            (Purpose::Login, Some(_)) | (Purpose::WeeklyQuota | Purpose::LoginRotation, _) => None,
         }
     }
     /// The immutable logical binding, independent of mutable attempt progress.
@@ -718,9 +769,14 @@ impl Receipt {
             Phase::Consumed => "consumed",
             Phase::Retired => "retired",
         };
-        if self.intent.purpose == Purpose::WeeklyQuota {
+        let verb = match self.intent.purpose {
+            Purpose::WeeklyQuota => Some("codex-rotation"),
+            Purpose::LoginRotation => Some("codex-login-rotation"),
+            Purpose::Login => None,
+        };
+        if let Some(verb) = verb {
             return format!(
-                "OK codex-rotation state={state} id={} thread={} turn={} source_account={} source_user={} target_account={} target_user={}\n",
+                "OK {verb} state={state} id={} thread={} turn={} source_account={} source_user={} target_account={} target_user={}\n",
                 self.id,
                 self.intent.thread,
                 self.intent.wall,
@@ -1141,7 +1197,7 @@ impl Backoff {
 const FORWARD_US: u64 = 60_000_000;
 
 /// [`drive_connection_paced`] on this host's clock, for the transport tests.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn drive_connection(
     opts: &super::upgrade_drive::Opts,
     sid: &str,

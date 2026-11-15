@@ -597,17 +597,6 @@ fn a_land_hold_is_copy_and_small() {
     );
 }
 
-/// Every word of the tables has its index, and no other word does. That every word a strict reading
-/// names is among them is `every_phrase_keeps_its_contract_on_every_corpus_row`'s.
-#[test]
-fn every_word_of_the_tables_has_an_index() {
-    for w in open_words() {
-        let i = open_word_index(w).expect("indexed");
-        assert_eq!(open_word_at(i), Some(w));
-    }
-    assert_eq!(OpenWord::of("a word no table holds"), None);
-}
-
 #[test]
 fn work_after_a_landing_is_held_from_lands_next_act() {
     let (mut st, now) = instructed();
@@ -956,7 +945,7 @@ fn a_spent_api_walls_hold_under_land_with_repository_work_stays_a_fact_for_later
     let kind = WallKind::ApiError {
         code: None,
         retryable: true,
-        cause: aterm_phase::ApiCause::CutOff,
+        cause: alab_policy::vocab::ApiCause::CutOff,
     };
     let mut w = on_repo(walled(
         kind,
@@ -1090,7 +1079,7 @@ fn the_stop_a_host_is_told_is_the_one_the_decision_applies() {
         wall: Some(WallKind::ApiError {
             code: Some(529),
             retryable: true,
-            cause: aterm_phase::ApiCause::Server,
+            cause: alab_policy::vocab::ApiCause::Server,
         }),
         wall_message: "API Error: 529 Overloaded".to_string(),
         ..at
@@ -1540,7 +1529,7 @@ fn a_switch_to_land_over_a_walls_spent_hold_types_nothing() {
     let kind = WallKind::ApiError {
         code: None,
         retryable: true,
-        cause: aterm_phase::ApiCause::CutOff,
+        cause: alab_policy::vocab::ApiCause::CutOff,
     };
     let mut w = by_person(walled(
         kind,

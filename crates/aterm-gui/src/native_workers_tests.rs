@@ -35,6 +35,7 @@ fn record(state: TaskState, why: Option<&'static str>, exit: Option<i32>) -> Tas
         fact: None,
         program_block: None,
         fact_rev: 0,
+        line: None,
         carried_entered: None,
     }
 }

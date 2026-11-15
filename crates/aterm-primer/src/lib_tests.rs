@@ -157,7 +157,7 @@ fn a_failed_atomic_write_leaves_the_original_intact() {
     let target = home.path().join("CLAUDE.md");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("keep.txt"), "keep").unwrap();
-    write_atomically(&target, b"new").expect_err("a directory in the way fails");
+    write_atomically_if(&target, b"new", || Ok(true)).expect_err("a directory in the way fails");
     assert_eq!(
         std::fs::read_to_string(target.join("keep.txt")).unwrap(),
         "keep"
@@ -246,13 +246,13 @@ fn the_temp_file_is_never_wider_than_the_context_file_it_becomes() {
     );
 
     let fresh = dir.join("CLAUDE.md");
-    write_atomically(&fresh, b"primed\n").unwrap();
+    assert!(write_atomically_if(&fresh, b"primed\n", || Ok(true)).unwrap());
     assert_eq!(mode_of(&fresh) & 0o077, 0, "a new context file is private");
     let existing = dir.join("AGENTS.md");
     std::fs::write(&existing, "old\n").unwrap();
     std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
     let recording = aterm_durable::seam::Recording::start();
-    write_atomically(&existing, b"primed\n").unwrap();
+    assert!(write_atomically_if(&existing, b"primed\n", || Ok(true)).unwrap());
     assert_eq!(
         recording.take(),
         [aterm_durable::Flush::Ordered],
@@ -1349,6 +1349,8 @@ fn an_agent_folder_taken_mid_pass_is_never_made_again() {
     let claude = home.path().join(".claude");
     std::fs::create_dir_all(&claude).unwrap();
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    let lock_name =
+        aterm_durable::write_lock::name(lands_on(&claude.join("CLAUDE.md")).file_name().unwrap());
     let moved = home.path().join("moved");
     let (from, to) = (claude.clone(), moved.clone());
     let mut first = true;
@@ -1361,9 +1363,14 @@ fn an_agent_folder_taken_mid_pass_is_never_made_again() {
         || auto_prime_with(home.path(), &Roots::default()),
     );
     assert!(!claude.exists(), "the taken folder is not made again");
-    assert!(
-        std::fs::read_dir(&moved).unwrap().next().is_none(),
-        "and nothing landed where it went"
+    let left: Vec<_> = std::fs::read_dir(&moved)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        left,
+        [std::ffi::OsString::from(lock_name)],
+        "only the retained writer lock moved; no guidance or temporary landed there"
     );
     let rows: Vec<&str> = pass.agents.iter().map(|a| a.agent).collect();
     assert_eq!(rows, ["claude", "codex"]);
@@ -1390,7 +1397,10 @@ fn counted_pass(home: &Path) -> (AutoPrime, usize) {
     let count = std::rc::Rc::clone(&reads);
     let pass = saving_after_read(
         move |path| {
-            if path.extension() == Some("md".as_ref()) {
+            if AGENT_FILES
+                .iter()
+                .any(|agent| path.file_name() == Path::new(agent.file).file_name())
+            {
                 count.set(count.get() + 1);
             }
         },
@@ -1902,15 +1912,15 @@ fn relocated_config_drives_detection_install_and_remove_in_one_root() {
 }
 
 /// EACH VARIABLE MOVES ONLY ITS OWN ROWS: `$XDG_CONFIG_HOME` a `.config/` path, `$CODEX_HOME`
-/// `.codex` and every path in it, and neither one any other path, which shows as `~/…`.
-/// NEGATIVE CONTROL: with neither set, every path lands under the home, and a name that only
-/// begins with `.codex` stays there with both set.
+/// `.codex`, and `$CLAUDE_CONFIG_DIR` `.claude`, including their children.
+/// NEGATIVE CONTROL: unset roots and names that merely share a prefix remain under the home.
 #[test]
 fn each_variable_moves_only_its_own_rows() {
     let home = Path::new("/h");
     let roots = Roots {
         xdg: Some(PathBuf::from("/x/cfg")),
         codex: Some(PathBuf::from("/x/codex")),
+        claude: Some(PathBuf::from("/x/claude")),
     };
     let unset = Roots::default();
     let cases = [
@@ -1921,14 +1931,17 @@ fn each_variable_moves_only_its_own_rows() {
             ".codex/skills/drive-aterm/SKILL.md",
             "/x/codex/skills/drive-aterm/SKILL.md",
         ),
-        (".claude/CLAUDE.md", "/h/.claude/CLAUDE.md"),
+        (".claude", "/x/claude"),
+        (".claude/CLAUDE.md", "/x/claude/CLAUDE.md"),
+        (".claude.json", "/h/.claude.json"),
+        (".clauderc/CLAUDE.md", "/h/.clauderc/CLAUDE.md"),
         (".codexrc/AGENTS.md", "/h/.codexrc/AGENTS.md"),
     ];
     for (rel, moved) in cases {
         assert_eq!(home_join(home, &roots, rel), PathBuf::from(moved), "{rel}");
         // A moved path shows its variable's folder as given, then each segment as this
         // host joins it (with a backslash on Windows).
-        let shown = ["/x/cfg", "/x/codex"]
+        let shown = ["/x/cfg", "/x/codex", "/x/claude"]
             .into_iter()
             .find_map(|root| Some((root, moved.strip_prefix(root)?)))
             .map_or_else(
@@ -2015,6 +2028,17 @@ fn skill_state_distinguishes_ours_from_the_users() {
     let body = "---\nname: x\n---\n<!-- aterm skill v1 -->\nbody\n";
     let older = "---\nname: x\n---\n<!-- aterm skill v0 -->\nold body\n";
     assert_eq!(skill_state(older, body), SkillState::Stale);
+    assert_eq!(skill_state(body, body), SkillState::Current);
+    let newer = body.replace("skill v1", "skill v2");
+    assert_eq!(skill_state(&newer, body), SkillState::Newer);
+    let equal = format!("{body}changed\n");
+    assert_eq!(skill_state(&equal, body), SkillState::Stale);
+    for marker in ["v", "v4294967296", "unversioned"] {
+        let malformed = body.replace("skill v1", &format!("skill {marker}"));
+        assert_eq!(skill_state(&malformed, body), SkillState::Stale);
+    }
+    let quoted = format!("{older}\n{newer}");
+    assert_eq!(skill_state(&quoted, body), SkillState::Stale);
     let theirs = "---\nname: x\n---\nmy own notes\n";
     assert_eq!(skill_state(theirs, body), SkillState::Foreign);
 }
@@ -3056,4 +3080,390 @@ fn skill_and_statusline_readers_refuse_non_regular_files() {
     let err = read_skill(Path::new("/dev/null"), "body").expect_err("device file refused");
     assert!(err.contains("not a regular file"), "{err}");
     assert!(read_bounded_bytes(Path::new("/dev/null")).is_err());
+}
+
+/// An explicit Claude home receives and reports guidance, preserving foreign content.
+/// Negative controls: the window uses only the default home; removing managed content
+/// preserves both homes' user prose and the explicit home's foreign skill.
+#[test]
+fn claude_guidance_follows_its_explicit_home_but_the_window_does_not() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let config = aterm_tempfile::tempdir().unwrap();
+    let roots = Roots {
+        claude: Some(config.path().to_path_buf()),
+        ..Roots::default()
+    };
+    let default = home.path().join(".claude");
+    std::fs::create_dir_all(&default).unwrap();
+    let user = "My own instructions.\n";
+    for path in [config.path().join("CLAUDE.md"), default.join("CLAUDE.md")] {
+        std::fs::write(path, user).unwrap();
+    }
+    let foreign = config.path().join("skills/drive-aterm/SKILL.md");
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::write(&foreign, "My own skill.\n").unwrap();
+    let run = |verb: &str| {
+        let (out, code) = agents_report_with(home.path(), &[verb.into(), "claude".into()], &roots);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains(&config.path().display().to_string()), "{out}");
+        out
+    };
+    run("install");
+    assert!(
+        std::fs::read_to_string(config.path().join("CLAUDE.md"))
+            .unwrap()
+            .contains(MARK_PREFIX)
+    );
+    assert_eq!(
+        std::fs::read_to_string(default.join("CLAUDE.md")).unwrap(),
+        user
+    );
+    for skill in skills_for("claude").iter().skip(1) {
+        assert_eq!(
+            std::fs::read_to_string(home_join(home.path(), &roots, skill.path)).unwrap(),
+            skill.body
+        );
+    }
+    assert!(run("status").contains("foreign"));
+    let window = roots.window();
+    assert!(window.claude.is_none());
+    let pass = auto_prime_with(home.path(), &window);
+    assert!(pass.agents.iter().any(|a| a.agent == "claude"));
+    assert!(
+        std::fs::read_to_string(default.join("CLAUDE.md"))
+            .unwrap()
+            .contains(MARK_PREFIX)
+    );
+    run("remove");
+    for path in [config.path().join("CLAUDE.md"), default.join("CLAUDE.md")] {
+        assert_eq!(std::fs::read_to_string(path).unwrap(), user);
+    }
+    assert_eq!(std::fs::read_to_string(foreign).unwrap(), "My own skill.\n");
+}
+
+/// Relative Claude homes follow the launch directory; empty or unresolved homes do not move files.
+/// Negative controls: absolute homes need no working directory, and a missing directory
+/// cannot silently turn a relative override into a path below the user's default home.
+#[test]
+fn claude_config_home_resolves_against_the_launch_directory() {
+    let cwd = aterm_tempfile::tempdir().unwrap();
+    let absolute = cwd.path().join("config");
+    assert_eq!(
+        resolve_launch_home(&absolute, || None),
+        Some(absolute.clone())
+    );
+    assert_eq!(
+        resolve_launch_home(Path::new("config"), || Some(cwd.path().into())),
+        Some(absolute)
+    );
+    assert_eq!(resolve_launch_home(Path::new("config"), || None), None);
+    assert_eq!(
+        resolve_launch_home(Path::new(""), || Some(cwd.path().into())),
+        None
+    );
+}
+
+/// A later writer's skills survive automatic and explicit older passes. The
+/// same-version and older bodies are negative controls: both must still update.
+#[test]
+fn newer_skills_survive_mixed_version_install_passes() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    std::fs::create_dir(home.path().join(".claude")).unwrap();
+    auto_prime(home.path());
+    let skill = &skills_for("claude")[0];
+    let path = home.path().join(skill.path);
+    let newer = skill.body.replacen("aterm skill v", "aterm skill v9", 1);
+    std::fs::write(&path, &newer).unwrap();
+    for _ in 0..2 {
+        assert!(!auto_prime(home.path()).changed());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        let (report, code) = agents_report_with(
+            home.path(),
+            &["install".into(), "claude".into()],
+            &Roots::default(),
+        );
+        assert_eq!(code, 0, "{report}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    }
+    let pending = shell_prime_pending(home.path());
+    assert!(
+        pending.due.is_empty() && pending.errors.is_empty(),
+        "{pending:?}"
+    );
+    assert!(status_line_with(home.path(), &Roots::default()).contains("newer"));
+    let (report, code) = agents_report_with(home.path(), &["status".into()], &Roots::default());
+    assert_eq!(code, 0);
+    assert!(report.contains("newer"), "{report}");
+
+    for replace in [
+        skill.body.replace("aterm skill v", "aterm skill v0"),
+        format!("{}changed\n", skill.body),
+    ] {
+        std::fs::write(&path, replace).unwrap();
+        assert!(auto_prime(home.path()).changed());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), skill.body);
+    }
+}
+
+const RACE_OLD: &str = "<!-- aterm skill v1 -->\nolder\n";
+const RACE_NEW: &str = "<!-- aterm skill v2 -->\nnewer\n";
+
+fn interleaved_skill_install(first: &Path, second: &Path) {
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = std::rc::Rc::clone(&reached);
+    let second = second.to_path_buf();
+    SAVE_BEFORE_RENAME.set(Some(Box::new(move |path| {
+        assert!(
+            !observed.replace(true),
+            "one publication reached its final validation"
+        );
+        let contended = aterm_durable::write_lock::Held::try_take(&lands_on(path)).unwrap_err();
+        assert_eq!(contended.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(install_skill_file(&second, RACE_NEW, Room::Anywhere).is_err());
+    })));
+    let wrote = install_skill_file(first, RACE_OLD, Room::Anywhere).unwrap();
+    assert_eq!(wrote, SkillWrite::Installed);
+    SAVE_BEFORE_RENAME.set(None);
+    assert!(reached.get(), "the displaced-save window was exercised");
+    assert_eq!(std::fs::read_to_string(first).unwrap(), RACE_OLD);
+
+    assert_eq!(
+        install_skill_file(first, RACE_NEW, Room::Anywhere).unwrap(),
+        SkillWrite::Updated
+    );
+    assert_eq!(
+        install_skill_file(first, RACE_OLD, Room::Anywhere).unwrap(),
+        SkillWrite::Newer
+    );
+    assert_eq!(std::fs::read_to_string(first).unwrap(), RACE_NEW);
+}
+
+/// A second managed publisher is refused in the displaced-save window, after the
+/// first publisher's final observation but before its rename. Once released, the
+/// newer publisher succeeds and a later older pass cannot downgrade it.
+#[test]
+fn skill_publishers_coordinate_after_final_validation() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("SKILL.md");
+    interleaved_skill_install(&path, &path);
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_publishers_coordinate_through_directory_aliases() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    let alias = dir.path().join("alias");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    interleaved_skill_install(&real.join("SKILL.md"), &alias.join("SKILL.md"));
+}
+
+/// An uncooperative atomic save observed before publication is retained, whether
+/// it carries a newer managed generation or removes the management marker.
+#[test]
+fn skill_publication_keeps_an_observed_newer_or_foreign_save() {
+    for (saved, state) in [
+        (RACE_NEW, SkillWrite::Newer),
+        ("My skill.\n", SkillWrite::Foreign),
+    ] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        let result = saving_after_read(
+            move |path| {
+                let replacement = path.with_extension("saved");
+                std::fs::write(&replacement, saved).unwrap();
+                std::fs::rename(&replacement, path).unwrap();
+            },
+            || install_skill_file(&path, RACE_OLD, Room::Anywhere),
+        )
+        .unwrap();
+        assert_eq!(result, state);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+    }
+}
+
+#[test]
+fn managed_skill_removal_keeps_an_observed_foreign_replacement() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("SKILL.md");
+    std::fs::write(&path, RACE_OLD).unwrap();
+    let removed = saving_after_read(
+        |path| {
+            let replacement = path.with_extension("saved");
+            std::fs::write(&replacement, "My skill.\n").unwrap();
+            std::fs::rename(&replacement, path).unwrap();
+        },
+        || remove_managed_skill(&path),
+    )
+    .unwrap();
+    assert!(matches!(removed, SkillRemoval::Foreign));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "My skill.\n");
+}
+
+#[test]
+fn a_same_contents_replacement_changes_the_observed_generation() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("SKILL.md");
+    std::fs::write(&path, RACE_OLD).unwrap();
+    let observed = AsRead::read(&path).unwrap();
+    let replacement = path.with_extension("saved");
+    std::fs::write(&replacement, RACE_OLD).unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    assert!(!observed.still(&path).unwrap());
+}
+
+#[test]
+fn relative_codex_home_receives_guidance_without_changing_the_window_policy() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let launch = aterm_tempfile::tempdir().unwrap();
+    let active = launch.path().join("codex-local");
+    let default = home.path().join(".codex");
+    for dir in [&active, &default] {
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "My instructions.\n").unwrap();
+    }
+    let roots = Roots::with_home_vars(
+        None,
+        Some(std::ffi::OsStr::new("codex-local")),
+        None,
+        || Some(launch.path().to_path_buf()),
+    )
+    .unwrap();
+    let (report, code) =
+        agents_report_with(home.path(), &["install".into(), "codex".into()], &roots);
+    assert_eq!(code, 0, "{report}");
+    let installed = std::fs::read_to_string(active.join("AGENTS.md")).unwrap();
+    assert!(installed.contains(MARK_BEGIN));
+    assert_eq!(
+        std::fs::read_to_string(default.join("AGENTS.md")).unwrap(),
+        "My instructions.\n"
+    );
+    for skill in skills_for("codex") {
+        assert_eq!(
+            std::fs::read_to_string(home_join(home.path(), &roots, skill.path)).unwrap(),
+            skill.body
+        );
+    }
+    auto_prime_with(home.path(), &roots.window());
+    assert_eq!(
+        std::fs::read_to_string(active.join("AGENTS.md")).unwrap(),
+        installed
+    );
+    assert!(
+        std::fs::read_to_string(default.join("AGENTS.md"))
+            .unwrap()
+            .contains(MARK_BEGIN)
+    );
+
+    let (report, code) =
+        agents_report_with(home.path(), &["remove".into(), "codex".into()], &roots);
+    assert_eq!(code, 0, "{report}");
+    for dir in [&active, &default] {
+        assert_eq!(
+            std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
+            "My instructions.\n"
+        );
+        for skill in skills_for("codex") {
+            assert!(
+                !dir.join(skill.path.strip_prefix(".codex/").unwrap())
+                    .exists()
+            );
+        }
+    }
+}
+
+#[test]
+fn unresolved_relative_agent_homes_do_not_fall_back_to_the_default() {
+    for (codex, claude, agent) in [
+        (Some(std::ffi::OsStr::new("relative")), None, "codex"),
+        (None, Some(std::ffi::OsStr::new("relative")), "claude"),
+    ] {
+        let error = Roots::with_home_vars(None, codex, claude, || None).unwrap_err();
+        let pass = error.prime();
+        assert_eq!(pass.agents.len(), 1);
+        assert_eq!(pass.agents[0].agent, agent);
+        assert_eq!(pass.errors().count(), 1);
+        assert!(!pass.changed());
+    }
+    let roots = Roots::with_home_vars(None, Some(std::ffi::OsStr::new("")), None, || {
+        panic!("a default home needs no launch directory")
+    })
+    .unwrap();
+    assert!(roots.codex.is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_codex_home_uses_the_default_without_reading_the_launch_directory() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let home = aterm_tempfile::tempdir().unwrap();
+    let default = home.path().join(".codex");
+    std::fs::create_dir(&default).unwrap();
+    let invalid = std::ffi::OsString::from_vec(b"relative-\xff".to_vec());
+    let roots = Roots::with_home_vars(None, Some(&invalid), None, || {
+        panic!("Codex ignores a non-Unicode override before resolving a relative home")
+    })
+    .unwrap();
+    assert!(roots.codex.is_none());
+    let (report, code) =
+        agents_report_with(home.path(), &["install".into(), "codex".into()], &roots);
+    assert_eq!(code, 0, "{report}");
+    assert!(
+        std::fs::read_to_string(default.join("AGENTS.md"))
+            .unwrap()
+            .contains(MARK_BEGIN)
+    );
+    for skill in skills_for("codex") {
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(skill.path)).unwrap(),
+            skill.body
+        );
+    }
+
+    // Claude's OS-string override continues to use its known launch directory.
+    let launch = aterm_tempfile::tempdir().unwrap();
+    let claude = Roots::with_home_vars(None, None, Some(&invalid), || {
+        Some(launch.path().to_path_buf())
+    })
+    .unwrap();
+    assert_eq!(claude.claude, Some(launch.path().join(&invalid)));
+}
+
+#[test]
+fn non_utf8_foreign_skill_bytes_remain_untouched() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("SKILL.md");
+    let foreign = b"my skill\xff\n";
+    std::fs::write(&path, foreign).unwrap();
+    assert_eq!(
+        install_skill_file(&path, RACE_OLD, Room::Anywhere).unwrap(),
+        SkillWrite::Foreign
+    );
+    assert_eq!(std::fs::read(path).unwrap(), foreign);
+}
+
+#[test]
+fn non_utf8_context_is_reported_and_preserved() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let config = home.path().join(".codex");
+    std::fs::create_dir(&config).unwrap();
+    let path = config.join("AGENTS.md");
+    let original = b"my instructions\xff\n";
+    std::fs::write(&path, original).unwrap();
+    let roots = Roots::default();
+    let readers = Readers::of(home.path(), &roots, &[]);
+    let codex = AGENT_FILES
+        .iter()
+        .find(|agent| agent.name == "codex")
+        .unwrap();
+    assert!(matches!(
+        situation(home.path(), &roots, codex, &readers),
+        FileSituation::File(Err(_))
+    ));
+    let pass = auto_prime_with(home.path(), &roots);
+    assert_eq!(pass.agents.len(), 1);
+    assert!(matches!(pass.agents[0].outcome, Outcome::Error(_)));
+    assert_eq!(std::fs::read(path).unwrap(), original);
 }

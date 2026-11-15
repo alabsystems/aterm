@@ -61,6 +61,9 @@ pub struct PackRequest {
     /// ended with its process group and the pack is refused: nothing is staged, signed or
     /// uploaded.
     pub build_within: Option<std::time::Duration>,
+    /// The build queue [`PackRequest::build_within`] does not count, where the caller has one
+    /// (`None`: the bound counts every second). The pack leaves the build's wait in it.
+    pub build_queue: Option<crate::artifact::tools::Queue>,
 }
 
 /// What a pack produced.

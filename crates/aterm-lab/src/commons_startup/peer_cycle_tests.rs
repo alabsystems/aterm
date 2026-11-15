@@ -44,6 +44,33 @@ pub(super) fn observation() -> NetworkObservation {
     }
 }
 
+/// A stopped peer reads LastSeen once its last contact's lease ran out, so the lost stage waits
+/// out the lease the stage before read, then the hang detector; every other stage, and a lost
+/// stage with no such peer before it, has the hang detector alone. A row that names no lease
+/// is read against the 15 s floor.
+/// NEGATIVE CONTROL: with every stage given the hang detector alone, the lost stage's wait is
+/// `left: 60s`, `right: 180s`.
+#[test]
+fn the_lost_stage_waits_out_the_lease_its_peer_was_given() {
+    let mut before = observation();
+    let peer = identity(2);
+    before.peers[0].lease_ms = Some(120_000);
+    assert_eq!(
+        patience(Stage::Lost, Some(&before), &peer),
+        HANG + Duration::from_secs(120)
+    );
+    for stage in [Stage::Before, Stage::Restored, Stage::Reconnected] {
+        assert_eq!(patience(stage, Some(&before), &peer), HANG);
+    }
+    assert_eq!(patience(Stage::Lost, None, &peer), HANG);
+    assert_eq!(patience(Stage::Lost, Some(&before), &identity(3)), HANG);
+    before.peers[0].lease_ms = None;
+    assert_eq!(
+        patience(Stage::Lost, Some(&before), &peer),
+        HANG + Duration::from_secs(15)
+    );
+}
+
 #[test]
 fn peer_cycle_requires_a_continuing_observer_and_fresh_contact_after_loss() {
     let before = observation();

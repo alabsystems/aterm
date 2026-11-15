@@ -61,6 +61,8 @@ fn each_honest_guard_bears_its_law() {
         ),
         ("Reraise", is("held", 1), "NoSameReasonReraise"),
         ("Lapse", is("quiet", 1), "LapseOnlyQuiet"),
+        ("Widen", gt(int(4), var("kind")), "NoProducerCopy"),
+        ("Sweep", gt(int(4), var("kind")), "ProducerWaitsOnRequester"),
     ];
     for (action, clause, law) in honest {
         let weakened = without(&model, action, &clause);

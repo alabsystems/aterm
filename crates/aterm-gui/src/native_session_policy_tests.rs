@@ -26,6 +26,24 @@ fn shipping_constructors() -> Vec<Constructor> {
     }
 }
 
+#[test]
+fn retained_service_requires_explicit_debug_factory_authorization() {
+    assert!(!SessionPolicy::default().retained_constructor_enabled());
+    let fixture = fixture();
+    let constructors = fixture.constructors();
+    let policy = SessionPolicy {
+        fixture: Some(fixture),
+        ..Default::default()
+    };
+    assert!(!policy.retained_constructor_enabled());
+    constructors.set_enabled(&[Constructor::ColdRestart]);
+    assert!(!policy.retained_constructor_enabled());
+    constructors.set_enabled(&[Constructor::PrivateRestart]);
+    assert!(policy.retained_constructor_enabled());
+    constructors.set_enabled(&[]);
+    assert!(!policy.retained_constructor_enabled());
+}
+
 // Policy DTOs only: no test feeds these identities to a kernel/process proof.
 fn image(inode: u64) -> Image {
     Image {
@@ -86,8 +104,13 @@ fn fixture_catalog_uses_the_shipping_claim_grammar() {
         policy.read(holder, &["contract=3", "scope=relaunch,upgrade"]),
         Words::Scoped(claim) if claim.scopes.contains(Scope::Relaunch)
     ));
+    // The roster's row allows every duty, a typing one included, and the fixture reads it so.
     assert!(matches!(
         policy.read(holder, &["contract=3", "scope=walls"]),
+        Words::Scoped(claim) if claim.scopes.contains(Scope::Walls)
+    ));
+    assert!(matches!(
+        policy.read(holder, &["contract=3", "scope=walls,bogus"]),
         Words::Refused(_)
     ));
     // The catalog is the fixture's alone: a holder the roster names and it does not is foreign.

@@ -41,3 +41,39 @@ fn plane_settle_needs_every_live_trail_component_dark() {
         assert!(plane_dark(&quiet.replace(old, "")).is_err());
     }
 }
+
+fn head_row(scene: Scene, recording: bool, hosted: bool) -> PaintRow {
+    PaintRow {
+        scene,
+        recording,
+        hosted,
+        ..WARM_ROW
+    }
+}
+
+/// Every take writes its recording either way, before any table its scene opens (a key after a
+/// table header would be that table's), and a hosted take turns the glow on ahead of it too.
+#[test]
+fn a_takes_config_sets_its_recording_ahead_of_every_table() {
+    for recording in [true, false] {
+        let head = config_head(&head_row(Scene::ColdStreamer, recording, true));
+        let table = head.find("[sparkle_words]").expect("the streamer's table");
+        let line = format!("temporal_recording = {recording}");
+        assert!(
+            head.find(&line).expect("the recording line") < table,
+            "{head}"
+        );
+        assert_eq!(head.matches("temporal_recording").count(), 1, "{head}");
+        for glow in HOSTED_GLOW.lines() {
+            assert!(head.find(glow).expect("the glow line") < table, "{head}");
+        }
+        assert!(
+            head.starts_with(Style::Rainbow.config_line().expect("a spelled style")),
+            "{head}"
+        );
+    }
+    assert!(
+        !config_head(&head_row(Scene::Prompt, true, false)).contains("cursor_momentum_glow"),
+        "an unhosted take leaves the glow at its default"
+    );
+}

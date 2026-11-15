@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Who may see a `Secret` cell's plaintext: `--show-passwords`, `--show-numbers` and `--edit`
-//! decide by the session, not the environment (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8).
+//! Who may see plaintext `aterm db` holds: fleet_db's `--show-passwords` and `dump <file>`
+//! decide by the session, not the environment (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8). No
+//! verb of the registry's tables shows a secret, so none asks.
 //!
 //! Standard input and output must both be terminals. Then every aterm instance on this Mac is
 //! asked `reveal` on its control socket. Each names the session of its own the caller's lineage
@@ -82,8 +83,9 @@ pub struct Facts {
 /// Where plaintext may be shown, once [`decide`] allows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Place {
-    /// A person's own aterm tab, session `sid` (`s-<hex>`): plaintext opens in an Editor tab
-    /// beside it, never in the tab, whose text outlives the moment.
+    /// A person's own aterm tab, session `sid` (its tab ID, `tqn5r6e0148`, or the `s-` and 20
+    /// hex digits of a tab opened before that form): plaintext opens in an Editor tab beside it,
+    /// never in the tab, whose text outlives the moment.
     Tab(String),
     /// No aterm session holds this process: the terminal is the person's own, and plaintext is
     /// printed in it.
@@ -115,8 +117,7 @@ pub fn decide(facts: &Facts) -> Result<Place> {
                 .find(|(known, _)| known == word)
                 .map_or("the instance refused it", |(_, why)| why);
             Err(Error::new(&format!(
-                "plaintext is not shown here: {why} ({word}); an agent edits with `set … --stdin` \
-                 and compares `--digest`"
+                "plaintext is not shown here: {why} ({word}); an agent edits with `set … --stdin`"
             )))
         }
         Asked::Failed(why) => Err(Error::new(&format!(
@@ -247,7 +248,10 @@ fn ask_one(sock: &str) -> Asked {
 }
 
 /// The verdict of a `reveal` answer's lines (`verdict=<word> session=<sid|->`), with the session
-/// it names (an `s-<hex>` id, or none for `-`).
+/// it names: an ID aterm minted (`aterm_types::control_verbs::is_minted_sid`: a tab ID, or the
+/// `s-` and 20 lower-case hex digits a tab opened before the `t` form keeps until it closes), or
+/// none for `-`. The instance names its own session, on this Mac, so the legacy form is read
+/// here as every reader of this Mac's own shells reads it; any other word is out of grammar.
 fn parse(lines: &[String]) -> Asked {
     let [line] = lines else {
         return Asked::Failed("an answer of more or fewer than one line".to_owned());
@@ -263,23 +267,13 @@ fn parse(lines: &[String]) -> Asked {
     };
     let session = match field("session=") {
         None | Some("-") => None,
-        Some(sid) if is_sid(sid) => Some(sid.to_owned()),
+        Some(sid) if aterm_types::control_verbs::is_minted_sid(sid) => Some(sid.to_owned()),
         Some(_) => return Asked::Failed("an answer whose session is no session id".to_owned()),
     };
     Asked::Answered {
         word: word.to_owned(),
         session,
     }
-}
-
-/// Whether `word` is a stable session id: `s-` and lowercase hex.
-fn is_sid(word: &str) -> bool {
-    word.strip_prefix("s-").is_some_and(|hex| {
-        !hex.is_empty()
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
 }
 
 #[cfg(test)]

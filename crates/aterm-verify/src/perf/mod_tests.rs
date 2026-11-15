@@ -37,6 +37,29 @@ fn args(s: &str) -> Vec<String> {
 }
 
 #[test]
+fn admission_refusal_retains_completed_results_and_prior_failure() {
+    let mut ran = vec![(Lane::Throughput, LaneRun::pass(), 1.0)];
+    let (report, code) = admission_refused(&ran, Lane::Wasm, "busy machine".into());
+    assert_eq!(exit_code(code), crate::exit::COULD_NOT_RUN);
+    assert!(report.contains(Lane::Throughput.name()));
+    assert!(report.contains(Lane::Wasm.name()));
+
+    ran.push((
+        Lane::Search,
+        LaneRun::fail("query rate below its floor"),
+        2.0,
+    ));
+    let (report, code) = admission_refused(&ran, Lane::Wasm, "busy machine".into());
+    assert_eq!(exit_code(code), crate::exit::FAILED);
+    for lane in [Lane::Throughput, Lane::Search, Lane::Wasm] {
+        assert!(report.contains(lane.name()));
+    }
+
+    let (_, code) = admission_refused(&[], Lane::Wasm, "busy machine".into());
+    assert_eq!(exit_code(code), crate::exit::COULD_NOT_RUN);
+}
+
+#[test]
 fn a_bare_run_is_every_floor_lane_and_no_arena_lane() {
     let cli = parse(&[]).expect("parses");
     assert_eq!(

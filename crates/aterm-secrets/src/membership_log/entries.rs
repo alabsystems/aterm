@@ -643,6 +643,19 @@ fn seal_aead(
 #[cfg(test)]
 thread_local! {
     static ENTRY_AEAD_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Each resolve of this Mac's entries on this thread ([`Log::resolve_audience_entries`]): one
+    /// open, hash and wipe of every counted `Put` and `Delete` of the log.
+    static AUDIENCE_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The resolves of this Mac's entries and the entry records opened on this thread so far, which
+/// a test differences around the pass it counts.
+#[cfg(all(test, unix))]
+pub(crate) fn resolves_and_opens() -> (usize, usize) {
+    (
+        AUDIENCE_RESOLVES.with(std::cell::Cell::get),
+        ENTRY_AEAD_READS.with(std::cell::Cell::get),
+    )
 }
 
 fn open_aead(
@@ -1067,8 +1080,15 @@ fn merge_visible_entries<T>(
     everyone
 }
 
+/// SHA-256 of an opened entry value, through ring's, which runs on the CPU's SHA-256
+/// instructions where it has them (ARMv8's on every Apple silicon Mac): a resolve hashes every
+/// counted `Put` of the log, and the portable [`Sha256`] took most of an open
+/// (ATERM-KI-1113-902). The same digest either way.
 fn value_digest(value: &[u8]) -> [u8; 32] {
-    Sha256::digest(value)
+    let digest = ring::digest::digest(&ring::digest::SHA256, value);
+    let mut out = [0; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
 }
 
 struct CandidateOp {
@@ -2205,6 +2225,8 @@ impl Log {
         identity: &Identity,
         digest: fn(&[u8]) -> [u8; 32],
     ) -> Result<Option<ResolvedEntries>> {
+        #[cfg(test)]
+        AUDIENCE_RESOLVES.with(|resolves| resolves.set(resolves.get() + 1));
         let my_recipient = identity.recipient();
         if self.recipient_is_removed(&my_recipient) {
             return Ok(None);

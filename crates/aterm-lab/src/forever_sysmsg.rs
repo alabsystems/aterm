@@ -801,7 +801,7 @@ pub enum LandOn {
 
 /// LAND CARRIES ON PAST THE RESUME at `resumed` (v6 §14.17.5.6), as in the land lab: it lands
 /// (`DONE … rule=land@v1`) within [`LAND_ON_MS`], typing nothing on the way but its own acts
-/// (`turn_end::is_land_rule`) and no second resume. The chain's stub answers every act of Land's
+/// (`alab_policy::words::is_land_rule`) and no second resume. The chain's stub answers every act of Land's
 /// clean and names no need, so a hold is no carrying on: it parks the session the wait was
 /// meant to keep going. What it did, in the verdict's words ([`land_on_by`]).
 ///
@@ -834,7 +834,10 @@ pub fn land_on_by(seen: &Seen, resumed: i64, by: i64, t0: i64) -> Result<String,
         .into_iter()
         .filter(|a| a.at < end)
         .collect();
-    if let Some(a) = on.iter().find(|a| !turn_end::is_land_rule(a.rule)) {
+    if let Some(a) = on
+        .iter()
+        .find(|a| !alab_policy::words::is_land_rule(a.rule))
+    {
         return Err(LandOn::Fault(format!(
             "NOT LAND'S: {} typed at +{} between the resume and Land's {} at +{}",
             a.rule,
@@ -847,7 +850,9 @@ pub fn land_on_by(seen: &Seen, resumed: i64, by: i64, t0: i64) -> Result<String,
             at(t0, end)
         )));
     }
-    if !line.starts_with("DONE ") || word(line, "rule").as_deref() != Some(turn_end::RULE_LAND) {
+    if !line.starts_with("DONE ")
+        || word(line, "rule").as_deref() != Some(alab_policy::words::RULE_LAND)
+    {
         return Err(LandOn::Fault(format!(
             "HELD, NOT LANDED: Land's run past the resume ended at +{} on {}, where the stub answered each of its acts clean",
             at(t0, end),

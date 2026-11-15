@@ -52,7 +52,9 @@ fn run(argv: &[OsString]) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let hang = std::time::Duration::from_secs(60);
     // The controller may still be qualifying the replacement image's first execution.
     release(&world, "go", aterm_uds::deadline::FIRST_EXEC_HANG + hang)?;
-    let retained = aterm_uds::tether::prepared_executable()?.ok_or("no prepared helper")?;
+    let retained =
+        aterm_uds::tether::prepared_executable_within(aterm_uds::deadline::FIRST_EXEC_HANG)?
+            .ok_or("no prepared helper")?;
     if atpkg::native_launcher_for_test(retained) {
         return Err("retained helper was admitted as original producer".into());
     }

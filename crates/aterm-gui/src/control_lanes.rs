@@ -206,6 +206,18 @@ impl Outbox {
         let action = match words.next()? {
             "member-peer" => "peer",
             "member-open" => "open",
+            "controller-open" => "controller-open",
+            "controller-close" => "controller-close",
+            "controller-control-begin" => "controller-control-begin",
+            "controller-control-ack" => "controller-control-ack",
+            "controller-service-start" => "controller-service-start",
+            "controller-service-attach" => "controller-service-attach",
+            "member-preload" => "preload",
+            "member-ready" => "ready",
+            "member-reader-ready" => "reader-ready",
+            "member-unavailable" => "unavailable-report",
+            "member-retire" => "retire",
+            "member-retire-owned" => "retire-owned",
             _ => return None,
         };
         let Segment::Bytes(bytes) = self.segments.front()? else {
@@ -226,6 +238,8 @@ impl Outbox {
             "stale"
         } else if line.starts_with("ERR codex-auth unsupported") {
             "unsupported"
+        } else if line.starts_with("ERR codex-auth invalid request") {
+            "invalid-request"
         } else {
             "other"
         };
@@ -242,7 +256,9 @@ impl Outbox {
         let (action, body) = line.strip_prefix("OK codex-auth ")?.split_once(' ')?;
         if !matches!(
             action,
-            "member-retire"
+            "controller-open"
+                | "controller-close"
+                | "member-retire"
                 | "member-retire-owned"
                 | "member-work-rebind"
                 | "member-ready"
@@ -257,6 +273,13 @@ impl Outbox {
             return None;
         }
         for name in ["request", "operation", "member"] {
+            if name == "member" && action == "controller-open" {
+                let member = value[name].as_str()?;
+                if !aterm_codec::hex::is_lower(member, 32) {
+                    return None;
+                }
+                continue;
+            }
             let mut values = request
                 .split_ascii_whitespace()
                 .filter_map(|word| word.split_once('='))
@@ -359,6 +382,7 @@ impl Outbox {
         matches!(self.segments.front(), Some(Segment::Bytes(bytes))
             if bytes.starts_with(b"OK codex-renewal state=ready id=")
                 || bytes.starts_with(b"OK codex-rotation state=ready id=")
+                || bytes.starts_with(b"OK codex-login-rotation state=ready id=")
                 || bytes.starts_with(b"OK codex-exec-handoff state=selected thread="))
     }
 

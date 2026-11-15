@@ -94,7 +94,7 @@ impl Client {
                 SupportReply::Supported { context } => {
                     live(&context)?;
                     channel.send(&[1], deadline)?;
-                    Ok(RuntimeInputSupport { reply: context })
+                    Ok(RuntimeInputSupport { reply: *context })
                 }
                 SupportReply::Refused { reason, .. } => {
                     Err(io::Error::new(io::ErrorKind::PermissionDenied, reason))

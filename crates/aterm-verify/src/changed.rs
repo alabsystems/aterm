@@ -162,20 +162,6 @@ pub enum Selection {
         crates: Vec<String>,
         /// Whether any selected crate declares a library target ([`Members::any_has_lib`]).
         any_lib: bool,
-        /// The members, by name, whose test, bench and example targets the cone's lint compiles:
-        /// those whose own files changed, those that observe a changed path of another member,
-        /// and those [`TESTED_BY`] a changed file. A root manifest row, a lock row other than a
-        /// touched member's own entry, or a fork moves code under any member's tests, so any of
-        /// those makes this the whole cone.
-        all_targets: Vec<String>,
-        /// The members, by name, the cone's lint leaves out: those it holds only by a dev edge
-        /// ([`Reach::dev_only`]) and not in `all_targets`. Their libraries and binaries link
-        /// nothing that changed, and the test compile, which takes all of `crates`, fires any
-        /// compile error in their tests.
-        unlinted: Vec<String>,
-        /// The members, by name, one edge from a seed, normal, build or dev ([`Reach::direct`]):
-        /// those whose code can name what the change touched.
-        direct_dependents: Vec<String>,
         /// The members among `seeds`, by name, whose every changed file is confined to the member
         /// itself ([`crate::own_tests`]: its test code, comments no macro reads, a manifest whose
         /// values are the same), whose reads of another package's changed file sit only in its
@@ -240,10 +226,6 @@ pub struct Reach {
     /// The member dev dependents of those that are not among them: only their test, bench and
     /// example targets link the change.
     pub dev_only: Vec<String>,
-    /// The members one edge from the package, normal, build or dev: the code that can name its
-    /// items. A target only a feature switches on (`required-features`) can name them where no
-    /// other target of that member does ([`crate::scope::Changed::direct_dependents`]).
-    pub direct: Vec<String>,
 }
 
 /// Impact of a change to one of [`REPLANNING_PATHS`].
@@ -291,7 +273,7 @@ fn manifest_tables_replan(base: &aterm_toml::Table, work: &aterm_toml::Table) ->
                                     ));
                                 }
                                 // The product version: only the `aterm` bin package, which
-                                // nothing depends on, inherits it (census `identity-read`).
+                                // nothing depends on, inherits it.
                                 seeds.insert("aterm".to_string());
                             }
                         }
@@ -512,16 +494,12 @@ pub fn select(
 
     let (seeds, _) = seeds(paths, manifests, members);
     let mut replanned: BTreeSet<String> = BTreeSet::new();
-    // A root manifest row changes how every dependent builds the package it names, whichever files
-    // changed beside it.
-    let mut root_row = false;
     for p in paths.iter().filter(|p| replans_everything(p)) {
         match replan(p) {
             Replan::Everything(why) => {
                 return Selection::Widened(format!("{p} changed: {why}"));
             }
             Replan::Packages(packages) => {
-                root_row |= p == "Cargo.toml";
                 replanned.extend(packages);
             }
             Replan::Nothing => {}
@@ -640,41 +618,31 @@ pub fn select(
         .collect();
     let mut seeds = seeds;
     seeds.extend(walked.iter().cloned());
-    let own = seeds.clone();
     let mut cone: BTreeSet<String> = seeds.clone();
     cone.extend(replanned.iter().filter(|p| names.contains(*p)).cloned());
     seeds.extend(replanned);
     seeds.extend(forked);
-    let mut dev_only: BTreeSet<String> = BTreeSet::new();
-    let mut direct_dependents: BTreeSet<String> = BTreeSet::new();
     for seed in seeds.iter().filter(|seed| !alone.contains(*seed)) {
         let found = match reach_of(seed, dependents, &names, &mut asked) {
             Ok(found) => found,
             Err(why) => return Selection::Widened(why),
         };
-        cone.extend(found.links.into_iter().filter(|n| names.contains(n)));
-        dev_only.extend(found.dev_only.into_iter().filter(|n| names.contains(n)));
-        direct_dependents.extend(found.direct.into_iter().filter(|n| names.contains(n)));
+        cone.extend(
+            found
+                .links
+                .into_iter()
+                .chain(found.dev_only)
+                .filter(|n| names.contains(n)),
+        );
     }
-    dev_only.retain(|n| !cone.contains(n));
-    cone.extend(dev_only.iter().cloned());
-    let tested: BTreeSet<String> = paths
-        .iter()
-        .flat_map(|p| tested_by(p))
-        .map(str::to_string)
-        .filter(|n| names.contains(n))
-        .chain(watching)
-        .collect();
-    cone.extend(tested.iter().cloned());
-    let (all_targets, unlinted) = if root_row || !seeds.is_subset(&own) {
-        (cone.iter().cloned().collect(), Vec::new())
-    } else {
-        let every: BTreeSet<&String> = own.iter().chain(&tested).collect();
-        (
-            every.into_iter().cloned().collect(),
-            dev_only.difference(&tested).cloned().collect(),
-        )
-    };
+    cone.extend(
+        paths
+            .iter()
+            .flat_map(|p| tested_by(p))
+            .map(str::to_string)
+            .filter(|n| names.contains(n))
+            .chain(watching),
+    );
 
     let named: Vec<String> = cone.into_iter().collect();
     let any_lib = members.any_has_lib(&named);
@@ -682,9 +650,6 @@ pub fn select(
         seeds: seeds.into_iter().collect(),
         crates: named.iter().map(|n| members.spec(n).to_string()).collect(),
         any_lib,
-        all_targets,
-        unlinted,
-        direct_dependents: direct_dependents.into_iter().collect(),
         alone: alone.into_iter().collect(),
     }
 }
@@ -788,9 +753,6 @@ pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
             seeds,
             crates,
             any_lib,
-            all_targets,
-            unlinted,
-            direct_dependents,
             alone,
         } => {
             let dependents = crates.iter().filter(|c| !seeds.contains(c)).count();
@@ -812,9 +774,6 @@ pub fn cone(base: &str, sel: &Selection) -> (Scope, String) {
             (
                 Scope::changed(base, crates.clone(), *any_lib)
                     .with_seeds(seeds.clone())
-                    .with_all_targets(all_targets.clone())
-                    .with_unlinted(unlinted.clone())
-                    .with_direct_dependents(direct_dependents.clone())
                     .with_alone(alone.clone()),
                 format!("the change cone since {base}: {}{more}", named.join(" ")),
             )
@@ -867,6 +826,27 @@ pub fn resolve_paths(
     paths: Vec<String>,
     from: Option<&str>,
 ) -> Selection {
+    resolve_reading(root, tools, path_env, merge_base, paths, &[], from)
+}
+
+/// [`resolve_paths`], where each of `reading` is a file that may read one of `paths` that no
+/// crate owns (Markdown of the no-reach class, which `verify land`'s search found it naming:
+/// [`Round::readers`]). Such a file is a reader of the change as a source that reads another
+/// package's changed file is ([`with_shared_inputs`]), whether it changed or not: its member
+/// is a seed; what reads or spells the file joins as for a changed one; and its member is
+/// judged alone only where its tests, benches and examples alone compile the file and its
+/// build script can read neither it nor the Markdown ([`crate::own_tests::confined`]), else
+/// with every dependent. A file of `reading` that no workspace member owns widens the cone:
+/// nothing then says which crate's rows its reads reach.
+fn resolve_reading(
+    root: &Path,
+    tools: &Toolchain,
+    path_env: &OsStr,
+    merge_base: &str,
+    mut paths: Vec<String>,
+    reading: &[String],
+    from: Option<&str>,
+) -> Selection {
     let members = read_members(root, tools, path_env);
     // Shared-input discovery can only add crates. Once a changed compiler/configuration
     // input already demands every crate, that scan cannot change the selection. Archive
@@ -877,7 +857,7 @@ pub fn resolve_paths(
             return Selection::Widened(format!("{p} changed: {why}"));
         }
     }
-    let listed = if paths.is_empty() {
+    let listed = if paths.is_empty() && reading.is_empty() {
         Vec::new()
     } else {
         match listed_files(root, path_env) {
@@ -886,9 +866,15 @@ pub fn resolve_paths(
         }
     };
     let changed: BTreeSet<String> = paths.iter().cloned().collect();
+    paths.extend(
+        reading
+            .iter()
+            .filter(|file| !changed.contains(*file))
+            .cloned(),
+    );
     let Shared {
         paths,
-        readers,
+        mut readers,
         named,
         adopted,
     } = match with_shared_inputs(root, &listed, paths, &members) {
@@ -896,6 +882,16 @@ pub fn resolve_paths(
         Err(why) => return Selection::Widened(why),
     };
     let manifests = manifests_near(root, &paths);
+    if let Some(file) = reading
+        .iter()
+        .find(|file| owning_member(file, &manifests, &members).is_none())
+    {
+        return Selection::Widened(format!(
+            "{file} may read Markdown the change holds, and no workspace member owns it, so \
+             no cone holds what its reads reach"
+        ));
+    }
+    readers.extend(reading.iter().cloned());
     let checkout = from.map(|base| crate::own_tests::Checkout {
         root,
         path_env,
@@ -981,49 +977,80 @@ pub fn resolve_paths(
     )
 }
 
-/// A round's selection (`verify land`, [`crate::cli::JUDGED`]) of the merge in the working
-/// tree, which merges main tip `base` into the commit `judged`, whose own judgment passed and
-/// is kept. `paths` are the paths the merge shares between the two sides.
+/// What a round of `verify land` names of the merge it judges ([`resolve_round`]), as its words
+/// do ([`crate::cli::JUDGED`], [`crate::cli::SHARED`], [`crate::cli::READERS`],
+/// [`crate::cli::BY_HAND`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Round {
+    /// The commit the merge's first parent is, whose own judgment passed and is kept.
+    pub judged: String,
+    /// The paths the merge shares between the two sides.
+    pub shared: Vec<String>,
+    /// The files of the merge that may read a shared path that is Markdown no cone holds
+    /// (`verify land`'s search: `aterm_census::no_reach::may_read`, and for a spec table any
+    /// string of code that ends in `SPECS.md`), each owned by a workspace member.
+    pub readers: Vec<String>,
+    /// Whether the merge is the one the landing makes of the two sides: Git's, its open-issues
+    /// file merged by entry.
+    pub mechanical: bool,
+}
+
+/// A round's selection (`verify land`) of the merge in the working tree, which merges main tip
+/// `base` into the commit `round.judged`.
 ///
-/// Where Git made the merge (`mechanical`) and no crate may own any of them (each is Markdown
-/// of the no-reach class, [`aterm_census::no_reach::class`]), the two sides' code is disjoint
-/// and the selection is the cone of those paths: no crate, or a reader of one. A merge a
+/// Where the merge is the landing's own (`mechanical`), no crate may own any of the shared
+/// paths (each is Markdown of the no-reach class, [`aterm_census::no_reach::class`]) and no
+/// file may read them (`round.readers` is empty), the two sides' code is disjoint and the
+/// selection is the cone of those paths: no crate, as a composition judges none. A merge a
 /// person made after such Markdown conflicted is not judged so: a conflict was judged in full
-/// before a round answered for it, main's unshared change against the branch included, and
-/// the round judges no less of that.
+/// before a round answered for it, main's unshared change against the branch included, and the
+/// round judges no less of that.
 ///
 /// Else it is what a judgment of the merge since `base` would select ([`resolve`]), less the
-/// crates neither the shared paths nor the merge's change since `judged` reaches ([`meet`]). A
-/// crate so left out builds from the files it had in the judged tree (nothing main changed is
-/// among its inputs), so the kept judgment's row is still its verdict; every crate main's
-/// change reaches within the branch's cone is judged against the branch's change, as a full
-/// judgment of the merge would.
+/// crates neither the shared paths, the files that may read the shared Markdown, nor the
+/// merge's change since the judged commit reaches ([`meet`]). Shared Markdown changes a
+/// verdict only through a file that reads it, so it stands for each such file
+/// ([`resolve_reading`]): that file's member is reached, alone where only its tests, benches
+/// and examples compile the file, else with its dependents, and the round judges it where the
+/// merge's cone holds it, as a full judgment of the merge would; a member outside that cone is
+/// judged by neither. A crate so left out builds from the files it had in the judged tree
+/// (nothing main changed is among its inputs, and no file of it may read the shared Markdown),
+/// so the kept judgment's row is still its verdict; every crate main's change reaches within
+/// the branch's cone is judged against the branch's change, as a full judgment of the merge
+/// would. A reader no workspace member owns widens what the shared paths reach, so the round
+/// is that whole cone.
 ///
-/// The shared paths' own cone is read as a judgment's where Git made the merge (`mechanical`):
-/// each path's file is compared with `judged`'s, so a member whose share is confined to its own
-/// tests brings no dependent. Where a person resolved or edited the merge, a shared path may be
-/// a change of main's that the merge dropped: its file is then `judged`'s own, which that
-/// comparison reads as a change of nothing, so no member is judged alone for a shared path, and
-/// the cone holds every dependent of each path's owner.
+/// The shared paths' own cone is read as a judgment's where the merge is the landing's own
+/// (`mechanical`: Git's merge, its open-issues file merged by entry): each path's file is compared
+/// with the judged commit's, so a member whose share is confined to its own tests brings no
+/// dependent. Where a person resolved or edited the merge, a shared path may be a change of main's
+/// that the merge dropped: its file is then the judged commit's own, which that comparison reads as
+/// a change of nothing, so no member is judged alone for a shared path, and the cone holds every
+/// dependent of each path's owner.
 pub fn resolve_round(
     root: &Path,
     tools: &Toolchain,
     path_env: &OsStr,
     base: &str,
-    judged: &str,
-    paths: Vec<String>,
-    mechanical: bool,
+    round: &Round,
 ) -> Selection {
-    let unowned = no_crate_may_own(root, path_env, &paths);
-    let shared = resolve_paths(
+    let Round {
+        judged,
+        shared,
+        readers,
+        mechanical,
+    } = round;
+    let unowned = no_crate_may_own(root, path_env, shared);
+    let shared = resolve_reading(
         root,
         tools,
         path_env,
         judged,
-        paths,
-        mechanical.then_some(judged),
+        shared.clone(),
+        readers,
+        mechanical.then_some(judged.as_str()),
     );
-    if unowned && mechanical {
+    if unowned && *mechanical && readers.is_empty() {
         return shared;
     }
     let whole = resolve(root, tools, path_env, base);
@@ -1059,25 +1086,14 @@ pub fn meet(
     reached: &[Selection],
     any_lib: &dyn Fn(&[String]) -> bool,
 ) -> Selection {
-    let (seeds, crates, had_lib, all_targets, unlinted, direct_dependents, alone) = match whole {
+    let (seeds, crates, had_lib, alone) = match whole {
         widened @ Selection::Widened(_) => return widened,
         Selection::Narrowed {
             seeds,
             crates,
             any_lib,
-            all_targets,
-            unlinted,
-            direct_dependents,
             alone,
-        } => (
-            seeds,
-            crates,
-            any_lib,
-            all_targets,
-            unlinted,
-            direct_dependents,
-            alone,
-        ),
+        } => (seeds, crates, any_lib, alone),
     };
     let mut keep: BTreeSet<&str> = BTreeSet::new();
     let mut widened = false;
@@ -1113,9 +1129,6 @@ pub fn meet(
         seeds,
         crates,
         any_lib,
-        all_targets,
-        unlinted,
-        direct_dependents,
         alone,
     }
 }
@@ -2187,8 +2200,7 @@ fn tree_package(entry: &str) -> Option<&str> {
 /// that anchors a model, so a change to any of them brings its source-spec closure test into the
 /// cone), but its own dependents build no dev-dependency of it. X is in the closure as the tree's
 /// root, so a package only dev edges reach (`astream-term`, which `aterm-conformance`'s differential
-/// oracle runs on a bump of) still reaches its dev dependents. The members one line under the
-/// root, under any section header, are its direct dependents ([`Reach::direct`]).
+/// oracle runs on a bump of) still reaches its dev dependents.
 ///
 /// `None` on a non-empty line that is neither a section header nor a package one level under what
 /// is printed above it: a misread must widen the cone, never narrow it to whatever did parse. An
@@ -2196,7 +2208,6 @@ fn tree_package(entry: &str) -> Option<&str> {
 fn reached(tree: &str, root_prefix: &str, members: &Members) -> Option<Reach> {
     let mut member_of: BTreeMap<&str, String> = BTreeMap::new();
     let mut closure: BTreeSet<&str> = BTreeSet::new();
-    let mut roots: BTreeSet<&str> = BTreeSet::new();
     let mut edges: Vec<(&str, &str, bool)> = Vec::new();
     // The package at each depth of the line being read, and whether the edges below it are dev.
     let mut path: Vec<(&str, bool)> = Vec::new();
@@ -2225,7 +2236,6 @@ fn reached(tree: &str, root_prefix: &str, members: &Members) -> Option<Reach> {
             Some((dependency, dev)) => edges.push((*dependency, package, *dev)),
             None => {
                 closure.insert(package);
-                roots.insert(package);
             }
         }
         path.push((package, false));
@@ -2243,13 +2253,6 @@ fn reached(tree: &str, root_prefix: &str, members: &Members) -> Option<Reach> {
         })
         .map(|(_, dependent, _)| *dependent)
         .collect();
-    let direct: BTreeSet<&str> = edges
-        .iter()
-        .filter(|(dependency, dependent, _)| {
-            roots.contains(dependency) && !roots.contains(dependent)
-        })
-        .map(|(_, dependent, _)| *dependent)
-        .collect();
     let names = |packages: &BTreeSet<&str>| {
         packages
             .iter()
@@ -2259,7 +2262,6 @@ fn reached(tree: &str, root_prefix: &str, members: &Members) -> Option<Reach> {
     Some(Reach {
         links: names(&closure),
         dev_only: names(&final_hop),
-        direct: names(&direct),
     })
 }
 

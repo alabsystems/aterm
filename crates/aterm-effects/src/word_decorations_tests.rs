@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::genome::CatAge;
 
 /// A sprite's visible window `(x, y, w, h)` and the art row it starts at
 /// (a 1:1 peek's skipped rows).
@@ -2942,8 +2943,8 @@ fn tick_cat(
     tick_cat_at(wd, now, cfg, geom, None, true)
 }
 
-/// The rows a peek sprite shows: its box within its clip (the box is the
-/// whole art; the rise and the descent move the clip).
+/// The rows a peek sprite shows: its box within its clip (the whole art, on
+/// every frame it shows).
 fn shown_h(p: &FreeSprite) -> u32 {
     let v = p.visible();
     u32::try_from(v.y1.saturating_sub(v.y0)).unwrap_or(0)
@@ -2990,6 +2991,7 @@ fn still_frame(geom: EffectGeom, cursor: (u16, u16)) -> KittyCursorFrame {
         geom,
         cursor,
         look: KittyLook::default(),
+        body: crate::kitty_cursor::CursorBody::Head,
         colors: CatColorKey::default(),
         bob: 0.0,
         lift: 0.0,
@@ -3005,8 +3007,37 @@ fn still_layout(geom: EffectGeom, cursor: (u16, u16)) -> KittyCursorLayout {
         geom,
         cursor,
         look: KittyLook::default(),
+        body: crate::kitty_cursor::CursorBody::Head,
         bob: 0.0,
         lift: 0.0,
+    }
+}
+
+/// The bodies a flying-head law is held for: the head, and the flier's glide.
+const FLIER_BODIES: [crate::kitty_cursor::CursorBody; 2] = [
+    crate::kitty_cursor::CursorBody::Head,
+    crate::kitty_cursor::CursorBody::Glide(crate::pet_glyphs_gen::PetGlyphId::PetFly),
+];
+
+fn still_frame_body(
+    geom: EffectGeom,
+    cursor: (u16, u16),
+    body: crate::kitty_cursor::CursorBody,
+) -> KittyCursorFrame {
+    KittyCursorFrame {
+        body,
+        ..still_frame(geom, cursor)
+    }
+}
+
+fn still_layout_body(
+    geom: EffectGeom,
+    cursor: (u16, u16),
+    body: crate::kitty_cursor::CursorBody,
+) -> KittyCursorLayout {
+    KittyCursorLayout {
+        body,
+        ..still_layout(geom, cursor)
     }
 }
 
@@ -3116,8 +3147,9 @@ fn a_downward_peek_is_cut_only_at_the_text_line() {
         "a row-0 word has no habitable side above it — the plan must peek DOWN"
     );
 
-    let mut seen: Vec<(u16, u16, u16)> = Vec::new();
-    for ms in (0..(CAT_RISE_MS + DWELL_QUIET_MS + CAT_DESCEND_MS + 400)).step_by(16) {
+    let mut seen: Vec<(u16, u16, u16, u8)> = Vec::new();
+    let whole = CAT_RISE_MS + CAT_DWELL_CAP_MS + CAT_ANTICIPATION_MS + CAT_DESCEND_MS + 400;
+    for ms in (0..whole).step_by(16) {
         let (free, _, _) = tick_cat_at(&mut wd, t0 + Duration::from_millis(ms), &c, g, None, true);
         for s in free.iter().filter(|s| matches!(s.z, FreeZ::UnderText)) {
             let (_, y, _, h, skip) = window(s);
@@ -3125,7 +3157,7 @@ fn a_downward_peek_is_cut_only_at_the_text_line() {
                 y >= i32::from(g.cell_h) / 2,
                 "no sprite pixel may bury the top-row word it decorates: y={y}"
             );
-            seen.push((y as u16, h, skip));
+            seen.push((y as u16, h, skip, s.alpha));
         }
     }
     assert!(
@@ -3133,14 +3165,19 @@ fn a_downward_peek_is_cut_only_at_the_text_line() {
         "the fixture must actually play a peek: {} frames",
         seen.len()
     );
-    let hmin = seen.iter().map(|s| s.1).min().expect("non-empty");
-    let hmax = seen.iter().map(|s| s.1).max().expect("non-empty");
+    let heights: std::collections::BTreeSet<u16> = seen.iter().map(|s| s.1).collect();
+    assert_eq!(
+        heights.len(),
+        1,
+        "the peek shows its whole box on every frame: {heights:?}"
+    );
+    let (first, last) = (seen[0].3, seen[seen.len() - 1].3);
     assert!(
-        hmax > hmin,
-        "the reveal must actually grow and shrink (h stuck at {hmin})"
+        first < u8::MAX && last < u8::MAX && seen.iter().any(|s| s.3 == u8::MAX),
+        "the peek fades in and out: alpha {first} first, {last} last"
     );
 
-    let bottoms: Vec<u16> = seen.iter().map(|&(_, h, skip)| skip + h).collect();
+    let bottoms: Vec<u16> = seen.iter().map(|&(_, h, skip, _)| skip + h).collect();
     let b0 = bottoms[0];
     assert!(
         bottoms.iter().all(|&b| b == b0),
@@ -4191,55 +4228,6 @@ fn fold_free_covers_every_field_including_z_art_and_clip() {
 }
 
 #[test]
-fn a_settled_keyword_kitty_breathes_without_resizing() {
-    let now = Instant::now();
-    let g = geom20();
-    let build = || WordDecorations {
-        occ: vec![cat_occ(2, 2, 6, 0, now)],
-        cols: 20,
-        have_scanned: true,
-        ..WordDecorations::default()
-    };
-    let sample = |wd: &mut WordDecorations, c: &DecoConfig, ms: u64| {
-        let (fr, _, _) = tick_cat(wd, now + Duration::from_millis(ms), c, g);
-        fr.iter()
-            .find(|s| matches!(s.z, FreeZ::UnderText))
-            .map(|s| {
-                let (x, y, w, h, _) = window(s);
-                (x, y, w, h, s.art.w(), s.art.h())
-            })
-    };
-
-    let c = cfg();
-    let mut wd = build();
-    for t in [100u64, 300, 440, 700] {
-        tick_cat(&mut wd, now + Duration::from_millis(t), &c, g);
-    }
-    let frames: Vec<_> = [900u64, 1150, 1400, 1650, 1900, 2150]
-        .into_iter()
-        .filter_map(|ms| sample(&mut wd, &c, ms))
-        .collect();
-    assert!(
-        frames.len() >= 5,
-        "the fixture must sit in the dwell: {} frames",
-        frames.len()
-    );
-    let origins: std::collections::BTreeSet<(i32, i32)> =
-        frames.iter().map(|f| (f.0, f.1)).collect();
-    assert!(
-        origins.len() > 1,
-        "a settled word-cat must be alive, not a sticker: {origins:?}"
-    );
-    let sizes: std::collections::BTreeSet<(u16, u16, u16, u16)> =
-        frames.iter().map(|f| (f.2, f.3, f.4, f.5)).collect();
-    assert_eq!(
-        sizes.len(),
-        1,
-        "the idle pose translates and never resizes: {sizes:?}"
-    );
-}
-
-#[test]
 fn fresh_episode_latches_phase_clock_at_birth() {
     let lex = lex();
     let c = cfg();
@@ -4359,15 +4347,16 @@ fn one_shot_peek_conformance_real_engine() {
     let total = peek_total_ms(o.ident, o.genome.gkey, false, (2200, 3598));
     tick_cat_at(&mut wd, t0, &c, g, None, true);
     assert!(m.fire("Start", &mut st));
-    let (q, _, _) = tick_cat_at(&mut wd, at(100), &c, g, None, true);
+    let (q, _, _) = tick_cat_at(&mut wd, at(60), &c, g, None, true);
     assert!(!q.is_empty(), "rising");
-    let frozen_q = q.clone();
-    wd.freeze(at(200));
-    wd.thaw(at(3200));
-    let (q, _, _) = tick_cat_at(&mut wd, at(3100 + 200), &c, g, None, true);
+    let frozen = q.iter().map(|s| s.alpha).max().unwrap_or(0);
+    wd.freeze(at(60));
+    wd.thaw(at(3060));
+    let (q, _, _) = tick_cat_at(&mut wd, at(3060 + 16), &c, g, None, true);
     assert!(
-        q.iter().map(shown_h).sum::<u32>() >= frozen_q.iter().map(shown_h).sum::<u32>(),
-        "the thawed rise continues from where it froze"
+        q.iter().map(|s| s.alpha).max().unwrap_or(0) > frozen,
+        "the thawed rise continues from where it froze (alpha {frozen} frozen); a fade that \
+         started again would read far less"
     );
     let sh = |ms: u64| at(3000 + ms);
     let (q_dwell, _, _) = tick_cat_at(&mut wd, sh(CAT_RISE_MS + 300), &c, g, None, true);
@@ -4399,8 +4388,10 @@ fn one_shot_peek_conformance_real_engine() {
         true,
     );
     assert!(
-        !q.is_empty() && q.iter().map(shown_h).sum::<u32>() < expected_h,
-        "descending (shrinking reveal)"
+        !q.is_empty()
+            && q.iter().map(shown_h).sum::<u32>() >= expected_h
+            && q.iter().all(|s| s.alpha < u8::MAX),
+        "descending (fading at its whole height)"
     );
     assert!(m.fire("Step", &mut st));
     let (q, _, _) = tick_cat_at(&mut wd, sh(total + 20), &c, g, None, true);
@@ -6706,6 +6697,43 @@ fn reduced_from_birth_shows_a_static_pose_once_and_un_reducing_spends_it() {
         "the static pose lands on the first focused tick"
     );
     assert_eq!(wd.drain_kitty_sightings().count(), 1, "logs once");
+    // The static pose is the dwell's (CT-48): whole alpha at the rest box a
+    // focused, unreduced peek of the same page stands at mid-dwell.
+    let place = |fr: &[FreeSprite]| -> Vec<_> {
+        fr.iter()
+            .filter(|s| matches!(s.z, FreeZ::UnderText))
+            .map(|s| {
+                (
+                    s.x,
+                    s.y,
+                    s.w,
+                    s.h,
+                    (s.clip.x0, s.clip.y0, s.clip.x1, s.clip.y1),
+                    s.alpha,
+                )
+            })
+            .collect()
+    };
+    let mut lively = Terminal::new(4, 20);
+    lively.process(b"\r\n\r\na happy kitty naps");
+    let mut wd_dwell = WordDecorations::default();
+    wd_dwell.rescan(&lively, 4, 20, &lex, &c, 1, t0);
+    let _ = tick_cat_at(&mut wd_dwell, t0, &c, g, None, true);
+    let (fr_dwell, _, _) = tick_cat_at(&mut wd_dwell, at(1_000), &c, g, None, true);
+    let still = place(&fr1);
+    assert!(
+        !still.is_empty(),
+        "the static pose is an under-text icon: {fr1:?}"
+    );
+    assert!(
+        still.iter().all(|p| p.5 == u8::MAX),
+        "the static pose is whole alpha: {still:?}"
+    );
+    assert_eq!(
+        still,
+        place(&fr_dwell),
+        "the static pose stands at the dwell's rest box"
+    );
     let cat = wd
         .occ
         .iter()
@@ -8296,105 +8324,122 @@ fn invalid_kitty_source_fails_closed_instead_of_using_builtin_art() {
 /// off the caret's cell and every lettered cell, pushed ahead with air
 /// between it and the caret or lifted clear, and the follower carries on
 /// from where it was drawn. Control: `HEAD_KEEPS_OFF_OFF` draws it where
-/// the follower put it, over the caret.
+/// the follower put it, over the caret (for the glide, with the follower it
+/// does not have brought back by `GLIDE_FOLLOWS`).
 #[test]
 fn the_flying_head_keeps_off_the_caret_and_the_letters() {
-    let g = geom20();
-    let (cw, ch) = (i32::from(g.cell_w), i32::from(g.cell_h));
-    let t0 = Instant::now();
-    // Row 3 is lettered from column 0 up to the caret.
-    let ink_to = |end: u16| move |row: u16, col: u16| Some(row == 3 && col < end);
-    let over = |rect: CatFootprint, caret: (u16, u16), end: u16| -> Vec<(i32, i32)> {
-        let mut hits = Vec::new();
-        let (x0, x1) = (rect.x, rect.x + i32::from(rect.w));
-        let (y0, y1) = (rect.y, rect.y + i32::from(rect.h));
-        for r in 0..i32::from(g.rows) {
-            for c in 0..i32::from(g.cols) {
-                let lettered = r == 3 && c < i32::from(end);
-                let is_caret = (r, c) == (i32::from(caret.0), i32::from(caret.1));
-                if (lettered || is_caret)
-                    && x0 < (c + 1) * cw
-                    && x1 > c * cw
-                    && y0 < (r + 1) * ch
-                    && y1 > r * ch
-                {
-                    hits.push((r, c));
+    // Held for the head and for the flier's glide (its footprint is its ink box).
+    for body in FLIER_BODIES {
+        let g = geom20();
+        let (cw, ch) = (i32::from(g.cell_w), i32::from(g.cell_h));
+        let t0 = Instant::now();
+        // Row 3 is lettered from column 0 up to the caret.
+        let ink_to = |end: u16| move |row: u16, col: u16| Some(row == 3 && col < end);
+        let over = |rect: CatFootprint, caret: (u16, u16), end: u16| -> Vec<(i32, i32)> {
+            let mut hits = Vec::new();
+            let (x0, x1) = (rect.x, rect.x + i32::from(rect.w));
+            let (y0, y1) = (rect.y, rect.y + i32::from(rect.h));
+            for r in 0..i32::from(g.rows) {
+                for c in 0..i32::from(g.cols) {
+                    let lettered = r == 3 && c < i32::from(end);
+                    let is_caret = (r, c) == (i32::from(caret.0), i32::from(caret.1));
+                    if (lettered || is_caret)
+                        && x0 < (c + 1) * cw
+                        && x1 > c * cw
+                        && y0 < (r + 1) * ch
+                        && y1 > r * ch
+                    {
+                        hits.push((r, c));
+                    }
                 }
             }
-        }
-        hits
-    };
-    let run = |keep: bool| {
-        HEAD_KEEPS_OFF_OFF.with(|c| c.set(!keep));
-        let mut wd = WordDecorations::default();
-        // A burst: the caret steps a cell every 16 ms from column 4 to 9.
-        let mut worst = Vec::new();
-        let mut gaps = Vec::new();
-        for (i, col) in (4..=9_u16).enumerate() {
-            let at = t0 + Duration::from_millis(16 * i as u64);
-            let caret = (3, col);
-            let mut placement = wd
-                .prepare_kitty_cursor_placement(
-                    still_layout(g, caret),
-                    settled_at(at),
-                    crate::kitty_cursor::CatPose::STILL,
+            hits
+        };
+        // The glide has no follower (it is drawn at its rest, `GLIDE_FOLLOWS`), so its control
+        // brings the follower back as well: the keep-off is what holds a trailed body off.
+        let glide = body != crate::kitty_cursor::CursorBody::Head;
+        let run = |keep: bool| {
+            HEAD_KEEPS_OFF_OFF.with(|c| c.set(!keep));
+            GLIDE_FOLLOWS.with(|c| c.set(glide && !keep));
+            let mut wd = WordDecorations::default();
+            // A burst: the caret steps a cell every 16 ms from column 4 to 9.
+            let mut worst = Vec::new();
+            let mut gaps = Vec::new();
+            for (i, col) in (4..=9_u16).enumerate() {
+                let at = t0 + Duration::from_millis(16 * i as u64);
+                let caret = (3, col);
+                let mut placement = wd
+                    .prepare_kitty_cursor_placement(
+                        still_layout_body(g, caret, body),
+                        settled_at(at),
+                        crate::kitty_cursor::CatPose::STILL,
+                    )
+                    .expect("placeable companion");
+                placement.keep_off_letters(g, caret, ink_to(col));
+                let mut free = Vec::new();
+                wd.kitty_cursor_at_placement(
+                    still_frame_body(g, caret, body),
+                    placement,
+                    &mut free,
                 )
-                .expect("placeable companion");
-            placement.keep_off_letters(g, caret, ink_to(col));
-            let mut free = Vec::new();
-            wd.kitty_cursor_at_placement(still_frame(g, caret), placement, &mut free)
                 .expect("companion emitted");
-            let body = free.last().expect("body").clone();
-            let rect = CatFootprint {
-                x: body.x,
-                y: body.y,
-                w: body.w,
-                h: body.h,
-            };
-            assert_eq!(placement.drawn_footprint(), Some(rect));
-            worst.extend(over(rect, caret, col));
-            gaps.push(rect.x - (i32::from(col) + 1) * cw);
-        }
-        HEAD_KEEPS_OFF_OFF.with(|c| c.set(false));
-        (worst, gaps)
-    };
-    let (kept, gaps) = run(true);
-    assert!(kept.is_empty(), "the head lay on {kept:?}");
-    let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
-    assert!(
-        gaps.iter().all(|&d| d >= gap),
-        "air between the caret and the head: {gaps:?} (at least {gap})"
-    );
-    let (trailed, _) = run(false);
-    assert!(
-        !trailed.is_empty(),
-        "control: the follower trails the head into the caret"
-    );
+                let sprite = free.last().expect("body").clone();
+                let rect = placement.drawn_footprint().expect("drawn");
+                if body == crate::kitty_cursor::CursorBody::Head {
+                    // A head's sprite is its footprint; a glide's is the tile round its ink.
+                    let drawn = CatFootprint {
+                        x: sprite.x,
+                        y: sprite.y,
+                        w: sprite.w,
+                        h: sprite.h,
+                    };
+                    assert_eq!(rect, drawn);
+                }
+                worst.extend(over(rect, caret, col));
+                gaps.push(rect.x - (i32::from(col) + 1) * cw);
+            }
+            HEAD_KEEPS_OFF_OFF.with(|c| c.set(false));
+            GLIDE_FOLLOWS.with(|c| c.set(false));
+            (worst, gaps)
+        };
+        let (kept, gaps) = run(true);
+        assert!(kept.is_empty(), "the head lay on {kept:?}");
+        let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
+        assert!(
+            gaps.iter().all(|&d| d >= gap),
+            "air between the caret and the head: {gaps:?} (at least {gap})"
+        );
+        let (trailed, _) = run(false);
+        assert!(
+            !trailed.is_empty(),
+            "control: the follower trails the head into the caret"
+        );
 
-    // The right margin: no room ahead, so the head is lifted clear of the
-    // caret's row; the follower's state moves with it.
-    let caret = (3, g.cols - 1);
-    let mut wd = WordDecorations::default();
-    let mut placement = wd
-        .prepare_kitty_cursor_placement(
-            still_layout(g, caret),
-            settled_at(t0),
-            crate::kitty_cursor::CatPose::STILL,
-        )
-        .expect("placeable companion");
-    let rect = placement.drawn_footprint().expect("drawn");
-    assert!(
-        !over(rect, caret, caret.1).is_empty(),
-        "the margin's seat lies on the caret before it is kept off"
-    );
-    let settle = placement.drawn.and_then(|d| d.settle);
-    placement.keep_off_letters(g, caret, ink_to(caret.1));
-    let lifted = placement.drawn_footprint().expect("drawn");
-    assert!(over(lifted, caret, caret.1).is_empty(), "{lifted:?}");
-    assert!(lifted.y + i32::from(lifted.h) <= i32::from(caret.0) * ch);
-    assert_eq!(lifted.x, rect.x, "lifted straight up, not across");
-    if let (Some(before), Some(after)) = (settle, placement.drawn.and_then(|d| d.settle)) {
-        assert_eq!(after.1 - before.1, (lifted.y - rect.y) as f32);
+        // The right margin: no room ahead, so the head is lifted clear of the
+        // caret's row; the follower's state moves with it.
+        let caret = (3, g.cols - 1);
+        let mut wd = WordDecorations::default();
+        let mut placement = wd
+            .prepare_kitty_cursor_placement(
+                still_layout_body(g, caret, body),
+                settled_at(t0),
+                crate::kitty_cursor::CatPose::STILL,
+            )
+            .expect("placeable companion");
+        let rect = placement.drawn_footprint().expect("drawn");
+        assert!(
+            !over(rect, caret, caret.1).is_empty(),
+            "the margin's seat lies on the caret before it is kept off"
+        );
+        let settle = placement.drawn.and_then(|d| d.settle);
+        placement.keep_off_letters(g, caret, ink_to(caret.1));
+        let lifted = placement.drawn_footprint().expect("drawn");
+        assert!(over(lifted, caret, caret.1).is_empty(), "{lifted:?}");
+        assert!(lifted.y + i32::from(lifted.h) <= i32::from(caret.0) * ch);
+        assert_eq!(lifted.x, rect.x, "lifted straight up, not across");
+        if let (Some(before), Some(after)) = (settle, placement.drawn.and_then(|d| d.settle)) {
+            assert_eq!(after.1 - before.1, (lifted.y - rect.y) as f32);
+        }
     }
 }
 
@@ -8408,104 +8453,107 @@ fn the_flying_head_keeps_off_the_caret_and_the_letters() {
 /// keeps only the cell, as round 2 did.
 #[test]
 fn the_flying_head_keeps_air_round_the_caret() {
-    let g = geom20();
-    let (cw, ch) = (i32::from(g.cell_w), i32::from(g.cell_h));
-    let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
-    assert!(gap >= 2, "a ring of {gap} px");
-    let t0 = Instant::now();
-    // Row 3 is lettered from column 0 up to the caret.
-    let ink_to = |end: u16| move |row: u16, col: u16| Some(row == 3 && col < end);
-    // The air between the caret's cell and the head, along x and along y
-    // (negative where they overlap on that axis).
-    let air = |rect: CatFootprint, caret: (u16, u16)| -> (i32, i32) {
-        let (c0, c1) = (i32::from(caret.1) * cw, (i32::from(caret.1) + 1) * cw);
-        let (r0, r1) = (i32::from(caret.0) * ch, (i32::from(caret.0) + 1) * ch);
-        let (x1, y1) = (rect.x + i32::from(rect.w), rect.y + i32::from(rect.h));
-        ((rect.x - c1).max(c0 - x1), (rect.y - r1).max(r0 - y1))
-    };
-    // The head drawn at `at` (None: where the follower put it) for the
-    // caret, given its rect and the caret cell's left, right and top
-    // edges, then kept off; the head before and after.
-    type At = fn(CatFootprint, (i32, i32, i32)) -> (i32, i32);
-    let keep = |caret: (u16, u16), at: Option<At>, ring: bool| {
-        HEAD_CARET_RING_OFF.with(|c| c.set(!ring));
-        let mut wd = WordDecorations::default();
-        let mut placement = wd
-            .prepare_kitty_cursor_placement(
-                still_layout(g, caret),
-                settled_at(t0),
-                crate::kitty_cursor::CatPose::STILL,
+    // Held for the head and for the flier's glide (its footprint is its ink box).
+    for body in FLIER_BODIES {
+        let g = geom20();
+        let (cw, ch) = (i32::from(g.cell_w), i32::from(g.cell_h));
+        let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
+        assert!(gap >= 2, "a ring of {gap} px");
+        let t0 = Instant::now();
+        // Row 3 is lettered from column 0 up to the caret.
+        let ink_to = |end: u16| move |row: u16, col: u16| Some(row == 3 && col < end);
+        // The air between the caret's cell and the head, along x and along y
+        // (negative where they overlap on that axis).
+        let air = |rect: CatFootprint, caret: (u16, u16)| -> (i32, i32) {
+            let (c0, c1) = (i32::from(caret.1) * cw, (i32::from(caret.1) + 1) * cw);
+            let (r0, r1) = (i32::from(caret.0) * ch, (i32::from(caret.0) + 1) * ch);
+            let (x1, y1) = (rect.x + i32::from(rect.w), rect.y + i32::from(rect.h));
+            ((rect.x - c1).max(c0 - x1), (rect.y - r1).max(r0 - y1))
+        };
+        // The head drawn at `at` (None: where the follower put it) for the
+        // caret, given its rect and the caret cell's left, right and top
+        // edges, then kept off; the head before and after.
+        type At = fn(CatFootprint, (i32, i32, i32)) -> (i32, i32);
+        let keep = |caret: (u16, u16), at: Option<At>, ring: bool| {
+            HEAD_CARET_RING_OFF.with(|c| c.set(!ring));
+            let mut wd = WordDecorations::default();
+            let mut placement = wd
+                .prepare_kitty_cursor_placement(
+                    still_layout_body(g, caret, body),
+                    settled_at(t0),
+                    crate::kitty_cursor::CatPose::STILL,
+                )
+                .expect("placeable companion");
+            if let (Some(at), Some(draw)) = (at, placement.drawn.as_mut()) {
+                let cell = (
+                    i32::from(caret.1) * cw,
+                    (i32::from(caret.1) + 1) * cw,
+                    i32::from(caret.0) * ch,
+                );
+                let (x, y) = at(draw.rect, cell);
+                draw.rect.x = x;
+                draw.rect.y = y;
+            }
+            let before = placement.drawn_footprint().expect("drawn");
+            placement.keep_off_letters(g, caret, ink_to(caret.1));
+            let after = placement.drawn_footprint().expect("drawn");
+            HEAD_CARET_RING_OFF.with(|c| c.set(false));
+            (before, after)
+        };
+        let caret = (3, 5);
+        // Flush beside the caret, astride its row's top.
+        let flush: At = |r, (_, right, top)| (right, top - i32::from(r.h) / 2);
+        let (before, kept) = keep(caret, Some(flush), true);
+        assert_eq!(
+            air(before, caret).0,
+            0,
+            "the head starts flush beside the caret: {before:?}"
+        );
+        assert_eq!(
+            air(kept, caret).0,
+            gap,
+            "stepped out beside it, not lifted: {kept:?}"
+        );
+        assert_eq!(kept.y, before.y);
+        let (_, glued) = keep(caret, Some(flush), false);
+        assert_eq!(
+            air(glued, caret).0,
+            0,
+            "control: round 2 leaves it on the caret's side"
+        );
+        // A pixel over the caret's top, straight over it.
+        let perched: At = |r, (left, right, top)| {
+            (
+                (left + right - i32::from(r.w)) / 2,
+                top - i32::from(r.h) - 1,
             )
-            .expect("placeable companion");
-        if let (Some(at), Some(draw)) = (at, placement.drawn.as_mut()) {
-            let cell = (
-                i32::from(caret.1) * cw,
-                (i32::from(caret.1) + 1) * cw,
-                i32::from(caret.0) * ch,
-            );
-            let (x, y) = at(draw.rect, cell);
-            draw.rect.x = x;
-            draw.rect.y = y;
-        }
-        let before = placement.drawn_footprint().expect("drawn");
-        placement.keep_off_letters(g, caret, ink_to(caret.1));
-        let after = placement.drawn_footprint().expect("drawn");
-        HEAD_CARET_RING_OFF.with(|c| c.set(false));
-        (before, after)
-    };
-    let caret = (3, 5);
-    // Flush beside the caret, astride its row's top.
-    let flush: At = |r, (_, right, top)| (right, top - i32::from(r.h) / 2);
-    let (before, kept) = keep(caret, Some(flush), true);
-    assert_eq!(
-        air(before, caret).0,
-        0,
-        "the head starts flush beside the caret: {before:?}"
-    );
-    assert_eq!(
-        air(kept, caret).0,
-        gap,
-        "stepped out beside it, not lifted: {kept:?}"
-    );
-    assert_eq!(kept.y, before.y);
-    let (_, glued) = keep(caret, Some(flush), false);
-    assert_eq!(
-        air(glued, caret).0,
-        0,
-        "control: round 2 leaves it on the caret's side"
-    );
-    // A pixel over the caret's top, straight over it.
-    let perched: At = |r, (left, right, top)| {
-        (
-            (left + right - i32::from(r.w)) / 2,
-            top - i32::from(r.h) - 1,
-        )
-    };
-    let (before, kept) = keep(caret, Some(perched), true);
-    assert!(before.y >= 0 && air(before, caret).1 == 1, "{before:?}");
-    assert_eq!(
-        kept.x, before.x,
-        "a grazing head is not thrown across the caret"
-    );
-    assert_eq!(air(kept, caret).1, gap + 1, "{kept:?}");
-    let (_, sat) = keep(caret, Some(perched), false);
-    assert_eq!(air(sat, caret).1, 1, "control: round 2 leaves it perched");
-    // The right margin: the follower's seat lies on the caret; there is no
-    // room ahead, so it is lifted, now over the ring.
-    let caret = (3, g.cols - 1);
-    let (before, lifted) = keep(caret, None, true);
-    assert!(
-        air(before, caret).0 < 0 && air(before, caret).1 < 0,
-        "{before:?}"
-    );
-    assert_eq!(lifted.x, before.x, "lifted straight up");
-    assert_eq!(air(lifted, caret).1, gap + 1, "{lifted:?}");
-    let (_, low) = keep(caret, None, false);
-    assert_eq!(
-        air(low, caret).1,
-        1,
-        "control: round 2 lifts it a pixel over the caret"
-    );
+        };
+        let (before, kept) = keep(caret, Some(perched), true);
+        assert!(before.y >= 0 && air(before, caret).1 == 1, "{before:?}");
+        assert_eq!(
+            kept.x, before.x,
+            "a grazing head is not thrown across the caret"
+        );
+        assert_eq!(air(kept, caret).1, gap + 1, "{kept:?}");
+        let (_, sat) = keep(caret, Some(perched), false);
+        assert_eq!(air(sat, caret).1, 1, "control: round 2 leaves it perched");
+        // The right margin: the follower's seat lies on the caret; there is no
+        // room ahead, so it is lifted, now over the ring.
+        let caret = (3, g.cols - 1);
+        let (before, lifted) = keep(caret, None, true);
+        assert!(
+            air(before, caret).0 < 0 && air(before, caret).1 < 0,
+            "{before:?}"
+        );
+        assert_eq!(lifted.x, before.x, "lifted straight up");
+        assert_eq!(air(lifted, caret).1, gap + 1, "{lifted:?}");
+        let (_, low) = keep(caret, None, false);
+        assert_eq!(
+            air(low, caret).1,
+            1,
+            "control: round 2 lifts it a pixel over the caret"
+        );
+    }
 }
 
 /// A HEAD A BOB LAYS ON A LETTERED ROW STEPS BACK OFF IT (composed r2's
@@ -8520,49 +8568,52 @@ fn the_flying_head_keeps_air_round_the_caret() {
 /// `HEAD_GRAZE_LIFTS` throws it over row 3.
 #[test]
 fn a_head_a_bob_lays_on_a_lettered_row_steps_back_off_it() {
-    let g = geom20();
-    let ch = i32::from(g.cell_h);
-    let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
-    let caret = (4, 2);
-    let ink = |row: u16, col: u16| Some(row == 3 || (row == 4 && col < 2));
-    let t0 = Instant::now();
-    let kept = |rise: i32, lifts: bool| -> (CatFootprint, CatFootprint) {
-        HEAD_GRAZE_LIFTS.with(|c| c.set(lifts));
-        let mut wd = WordDecorations::default();
-        let mut placement = wd
-            .prepare_kitty_cursor_placement(
-                still_layout(g, caret),
-                settled_at(t0),
-                crate::kitty_cursor::CatPose::STILL,
-            )
-            .expect("placeable companion");
-        if let Some(draw) = placement.drawn.as_mut() {
-            // Its top `rise` px into row 3.
-            draw.rect.y = 4 * ch - rise;
+    // Held for the head and for the flier's glide (its footprint is its ink box).
+    for body in FLIER_BODIES {
+        let g = geom20();
+        let ch = i32::from(g.cell_h);
+        let gap = WordDecorations::kitty_cursor_lead_px(g.cell_w) / HEAD_CARET_GAP_DEN;
+        let caret = (4, 2);
+        let ink = |row: u16, col: u16| Some(row == 3 || (row == 4 && col < 2));
+        let t0 = Instant::now();
+        let kept = |rise: i32, lifts: bool| -> (CatFootprint, CatFootprint) {
+            HEAD_GRAZE_LIFTS.with(|c| c.set(lifts));
+            let mut wd = WordDecorations::default();
+            let mut placement = wd
+                .prepare_kitty_cursor_placement(
+                    still_layout_body(g, caret, body),
+                    settled_at(t0),
+                    crate::kitty_cursor::CatPose::STILL,
+                )
+                .expect("placeable companion");
+            if let Some(draw) = placement.drawn.as_mut() {
+                // Its top `rise` px into row 3.
+                draw.rect.y = 4 * ch - rise;
+            }
+            let before = placement.drawn_footprint().expect("drawn");
+            placement.keep_off_letters(g, caret, ink);
+            let after = placement.drawn_footprint().expect("drawn");
+            HEAD_GRAZE_LIFTS.with(|c| c.set(false));
+            (before, after)
+        };
+        for rise in 1..=gap.min(3) {
+            let (before, after) = kept(rise, false);
+            assert!(
+                before.x >= 3 * i32::from(g.cell_w),
+                "fixture: the head sits beside the caret, off its ring: {before:?}"
+            );
+            assert_eq!(after.x, before.x, "a {rise} px graze: {after:?}");
+            assert_eq!(
+                after.y,
+                4 * ch,
+                "a {rise} px graze steps down off row 3, onto its own row's top: {after:?}"
+            );
+            let (_, lifted) = kept(rise, true);
+            assert!(
+                lifted.y + i32::from(lifted.h) <= 3 * ch,
+                "control: a {rise} px graze lifts the head over row 3: {lifted:?}"
+            );
         }
-        let before = placement.drawn_footprint().expect("drawn");
-        placement.keep_off_letters(g, caret, ink);
-        let after = placement.drawn_footprint().expect("drawn");
-        HEAD_GRAZE_LIFTS.with(|c| c.set(false));
-        (before, after)
-    };
-    for rise in 1..=gap.min(3) {
-        let (before, after) = kept(rise, false);
-        assert!(
-            before.x >= 3 * i32::from(g.cell_w),
-            "fixture: the head sits beside the caret, off its ring: {before:?}"
-        );
-        assert_eq!(after.x, before.x, "a {rise} px graze: {after:?}");
-        assert_eq!(
-            after.y,
-            4 * ch,
-            "a {rise} px graze steps down off row 3, onto its own row's top: {after:?}"
-        );
-        let (_, lifted) = kept(rise, true);
-        assert!(
-            lifted.y + i32::from(lifted.h) <= 3 * ch,
-            "control: a {rise} px graze lifts the head over row 3: {lifted:?}"
-        );
     }
 }
 
@@ -8764,6 +8815,7 @@ fn expression_width_swap_preserves_reverse_fold_and_margin_glide() {
                      motion: CursorCatPlacementFrame| {
         let layout = KittyCursorLayout {
             look,
+            body: crate::kitty_cursor::CursorBody::Head,
             ..still_layout(g, cursor)
         };
         let placement = wd
@@ -8773,6 +8825,7 @@ fn expression_width_swap_preserves_reverse_fold_and_margin_glide() {
         wd.kitty_cursor_at_placement(
             KittyCursorFrame {
                 look,
+                body: crate::kitty_cursor::CursorBody::Head,
                 ..still_frame(g, cursor)
             },
             placement,
@@ -8860,6 +8913,7 @@ fn expression_width_swap_preserves_reverse_fold_and_margin_glide() {
     let raw_wide = wd
         .kitty_cursor_footprint(KittyCursorLayout {
             look: wide_look,
+            body: crate::kitty_cursor::CursorBody::Head,
             ..still_layout(g, (2, g.cols - 1))
         })
         .expect("wide footprint");
@@ -9403,5 +9457,147 @@ mod pane_binding {
             feline_episode(&wd).is_some(),
             "surviving tab 10's parked episodes are restored into the live fields"
         );
+    }
+}
+
+/// One peek's frames, by occurrence: each frame's time (ms), its sprite's place
+/// (origin, size and clip), its art and its alpha.
+type PeekFrames = Vec<(u64, (i32, i32, u16, u16, PxRect), usize, u8)>;
+
+/// Play `text` on a fresh 6×20 page every 16 ms from the scan through the
+/// longest peek and 400 ms more, each under-text sprite booked to the
+/// occurrence whose span's middle is nearest its own; with each occurrence's
+/// last dwelling ms (the rise, its dwell and its anticipation).
+fn play_peeks(text: &[u8]) -> Vec<(u64, PeekFrames)> {
+    let c = cfg();
+    let g = geom20();
+    let t0 = Instant::now();
+    let mut term = Terminal::new(g.rows, g.cols);
+    term.process(text);
+    let mut wd = scan_grid(&mut term, &c, g, t0, None);
+    let occs: Vec<(i32, u64)> = wd
+        .occ
+        .iter()
+        .filter(|o| o.spec.graphic.is_some())
+        .map(|o| {
+            let magical = o.class == Class::Feline
+                && (cat_magic(o.genome.magic).is_some() || has_accessory(o.genome.magic));
+            let range = o.spec.graphic.map_or((2200, 3598), |gr| gr.dwell_ms);
+            let held = CAT_RISE_MS
+                + peek_dwell_ms(o.ident, o.genome.gkey, magical, range)
+                + anticipation_ms(o.genome.gkey);
+            let mid = (i32::from(o.start_col) + i32::from(o.end_col) + 1) * i32::from(g.cell_w) / 2;
+            (mid, held)
+        })
+        .collect();
+    let end = occs.iter().map(|o| o.1).max().unwrap_or(0) + CAT_DESCEND_MS + 400;
+    let mut frames: Vec<PeekFrames> = vec![Vec::new(); occs.len()];
+    for ms in (0..=end).step_by(16) {
+        let (free, _, _) = tick_cat_at(&mut wd, t0 + Duration::from_millis(ms), &c, g, None, true);
+        for s in free.iter().filter(|s| matches!(s.z, FreeZ::UnderText)) {
+            let centre = s.x + i32::from(s.w) / 2;
+            let Some(k) = (0..occs.len()).min_by_key(|&k| (occs[k].0 - centre).abs()) else {
+                continue;
+            };
+            let art = Arc::as_ptr(&s.art) as usize;
+            frames[k].push((ms, (s.x, s.y, s.w, s.h, s.clip), art, s.alpha));
+        }
+    }
+    occs.into_iter().map(|o| o.1).zip(frames).collect()
+}
+
+/// The pages the icon tests play: three animal words peeking up from the
+/// fourth row, and a kitty on the top row, which peeks down.
+const PEEK_PAGES: [&[u8]; 2] = [b"\x1b[4;3Hfox dog cat", b"\x1b[1;6Hkitty"];
+
+/// CT-48: a word icon never moves on the glass. Its art slid over fixed
+/// pixels in whole-pixel steps (the rise with its overshoot, the breathing
+/// bob and sway, the descent) and turned them faster than three flashes a
+/// second; now each icon is drawn whole at its rest box on every frame it
+/// shows, and comes and goes by its alpha alone: up over PEEK_FADE_IN_MS
+/// from nothing, held through the dwell, down without rising over the
+/// descent, and gone no earlier than the descent's ease ends.
+///
+/// Control: with the dwell pose that shipped before
+/// (`with_icons_breathing`), a dwelling icon stands in more than one place.
+#[test]
+fn a_word_icon_stands_still_from_its_first_frame_to_its_last() {
+    for page in PEEK_PAGES {
+        let peeks = play_peeks(page);
+        let name = String::from_utf8_lossy(page);
+        assert!(!peeks.is_empty(), "{name}: the page holds an icon word");
+        for (k, (held, frames)) in peeks.iter().enumerate() {
+            assert!(
+                frames.len() > 100,
+                "{name}: icon {k} must play a whole peek: {} frames",
+                frames.len()
+            );
+            let places: std::collections::BTreeSet<_> = frames
+                .iter()
+                .map(|f| {
+                    (
+                        f.1.0,
+                        f.1.1,
+                        f.1.2,
+                        f.1.3,
+                        (f.1.4.x0, f.1.4.y0, f.1.4.x1, f.1.4.y1),
+                        f.2,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                places.len(),
+                1,
+                "{name}: icon {k} must stand in one place with one art on every frame: {places:?}"
+            );
+            assert!(
+                frames[0].0 > 0,
+                "{name}: icon {k} must show nothing at its peek's start"
+            );
+            let alphas: Vec<(u64, u8)> = frames.iter().map(|f| (f.0, f.3)).collect();
+            let full = alphas
+                .iter()
+                .position(|&(_, a)| a == u8::MAX)
+                .expect("the icon reaches full alpha");
+            assert!(
+                alphas[full].0 <= 144,
+                "{name}: icon {k} is fully in by 144 ms: {alphas:?}"
+            );
+            assert!(
+                alphas[..=full].windows(2).all(|w| w[1].1 > w[0].1),
+                "{name}: icon {k} fades in without falling: {alphas:?}"
+            );
+            let last_full = alphas
+                .iter()
+                .rposition(|&(_, a)| a == u8::MAX)
+                .expect("the icon holds full alpha");
+            assert!(
+                alphas[full..=last_full].iter().all(|&(_, a)| a == u8::MAX),
+                "{name}: icon {k} holds full alpha from its fade-in to its descent: {alphas:?}"
+            );
+            assert!(
+                alphas[last_full..].windows(2).all(|w| w[1].1 < w[0].1),
+                "{name}: icon {k} fades out without rising: {alphas:?}"
+            );
+            let last = alphas.last().expect("frames").0;
+            assert!(
+                last >= held + 270,
+                "{name}: icon {k} is gone no earlier than the descent's ease: last frame at \
+                 {last} ms, its descent from {held} ms"
+            );
+        }
+        let breathing = with_icons_breathing(|| play_peeks(page));
+        for (k, (held, frames)) in breathing.iter().enumerate() {
+            let dwelling: std::collections::BTreeSet<(i32, i32)> = frames
+                .iter()
+                .filter(|f| f.0 >= CAT_RISE_MS && f.0 < *held)
+                .map(|f| (f.1.0, f.1.1))
+                .collect();
+            assert!(
+                dwelling.len() > 1,
+                "control: {name}: icon {k} breathing must stand in more than one place: \
+                 {dwelling:?}"
+            );
+        }
     }
 }

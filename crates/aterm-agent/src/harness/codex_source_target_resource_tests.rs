@@ -39,7 +39,7 @@ impl Fixture {
         let registry = Registry::for_app(&lifetime);
         let process = Process::observe(std::process::id()).unwrap();
         let caller = slot::Caller {
-            sid: "s-resource-ledger".into(),
+            sid: "tvrce1edger".into(),
             pid: process.pid,
             birth: process.birth,
         };

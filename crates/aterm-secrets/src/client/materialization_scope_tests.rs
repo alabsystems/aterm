@@ -87,12 +87,12 @@ fn scoped_materialization_allows_unrelated_updates_but_not_changed_or_missing_in
 
 #[test]
 fn scoped_materialization_still_requires_complete_ready_source_and_membership() {
-    for failure in ["incomplete", "source", "revoked"] {
+    for failure in ["damaged", "source", "revoked"] {
         let (_root, paths) = fixture();
         let captured = capture(&paths);
         match failure {
-            "incomplete" => {
-                std::fs::remove_file(paths.home.join(".secrets/unrelated")).unwrap();
+            "damaged" => {
+                std::fs::write(paths.cache_file(), b"damaged").unwrap();
             }
             "source" => {
                 let mut changed = config(&paths).unwrap().unwrap();
@@ -109,8 +109,8 @@ fn scoped_materialization_still_requires_complete_ready_source_and_membership() 
         assert!(!captured.is_current(&paths).unwrap(), "{failure}");
         assert_eq!(
             captured.source_continues(&paths).unwrap(),
-            failure == "incomplete",
-            "file integrity is checked at full boundaries, not by continuation"
+            failure == "damaged",
+            "the store's integrity is checked at full boundaries, not by continuation"
         );
     }
 }
@@ -208,22 +208,17 @@ fn a_writer_that_outlasts_the_wait_is_busy_and_never_a_change() {
     assert!(captured.source_continues(&paths).unwrap());
     drop(writer);
     assert!(captured.is_current(&paths).unwrap());
-    for failure in ["failed", "pending"] {
-        let mut state = load_state(&paths).unwrap();
+    for failure in ["failed", "unrecorded"] {
+        let before = load_state(&paths).unwrap();
+        let mut state = before.clone();
         match failure {
             "failed" => state.failed = true,
-            "pending" => {
-                state
-                    .pending
-                    .insert("inventory".into(), "unfinished".into());
-            }
+            "unrecorded" => state.held = None,
             _ => unreachable!(),
         }
         save_state(&paths, &state).unwrap();
         assert!(!captured.source_continues(&paths).unwrap(), "{failure}");
-        state.failed = false;
-        state.pending.clear();
-        save_state(&paths, &state).unwrap();
+        save_state(&paths, &before).unwrap();
     }
 }
 

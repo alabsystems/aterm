@@ -14,6 +14,15 @@
 //! implicit token, and the GNU auth its rustc workers draw the rest through), any other process
 //! through [`Jobserver::acquire_many`] (its whole charge). So the jobs running across every branch
 //! never hold more than `S` tokens, and only the pool's creator removes the FIFO.
+//!
+//! COUNTING. The GNU protocol names no holder, so a client that dies holding a token takes it
+//! with it. Every FIFO [`Jobserver::new`] makes carries two custody files beside it, by which
+//! the pool's one adopter, when none of its children is alive, counts the FIFO's bytes and the
+//! tokens it holds itself against the allocation published beside the FIFO and makes the
+//! difference good ([`Jobserver::count_alone`]): `<fifo>.transfer`, which the creator holds
+//! while it moves an allocation ([`Jobserver::moving`]), and `<fifo>.clients`, which every
+//! adopting handle holds shared for its life. Only a FIFO whose allocation is published beside
+//! it (`<fifo>.slots`, as [`crate::BranchShares`] publishes each branch's) is counted.
 
 #[cfg(unix)]
 use std::collections::BTreeMap;
@@ -26,8 +35,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU32, Ordering};
-#[cfg(unix)]
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 /// The variable a release hands its branch children its pool in: `<slots>:<absolute FIFO path>`,
@@ -85,12 +93,175 @@ pub struct Jobserver {
     /// Whether this handle made the FIFO ([`Self::new`]), and so removes it when dropped; a
     /// handle adopted from [`POOL_ENV`] leaves it to its creator.
     created: bool,
+    /// The custody files beside the FIFO ([`Custody`]); none where the creator made none.
+    #[cfg(unix)]
+    custody: Option<Custody>,
+    /// How many [`Moving`] guards of this creator live: the first takes `<fifo>.transfer`, the
+    /// last lets it go, so a move nested in another never lets go of the outer one's hold.
+    moves: Mutex<u32>,
+    /// Held shared across each FIFO read or write of a token this handle holds, together with
+    /// the change to `out` it makes; a count holds it exclusive ([`Self::count_alone`]), so no
+    /// token of this handle is between the FIFO and `out` while it counts.
+    traffic: RwLock<()>,
+    /// The tokens this handle has read from the FIFO and not yet written back: those its
+    /// [`Token`]s hold and those its waits hold for their callers.
+    out: AtomicU32,
+    /// What a count reports ([`Self::note_reaped`], [`Self::count_alone`]).
+    notes: Mutex<Notes>,
+    /// Held through each count of this handle, taken without waiting ([`Self::count_alone`]).
+    /// A count's hold of `<fifo>.transfer` is this handle's descriptor's, and `flock` belongs
+    /// to the open file description: a second count of the handle would be granted the same
+    /// lock, and the first count's end would let it go under the second, which the creator
+    /// could then move an allocation beside.
+    #[cfg(unix)]
+    one_count: Mutex<()>,
     /// This handle's waits for a token now ([`Self::acquire`]).
     #[cfg(unix)]
     waiters: Mutex<Waiters>,
     /// Told when a wait's read ends or a token is handed to a wait.
     #[cfg(unix)]
     turn: Condvar,
+}
+
+/// The custody files beside a FIFO ([`Jobserver::count_alone`]).
+#[cfg(unix)]
+#[derive(Debug)]
+struct Custody {
+    /// `<fifo>.transfer`. The creator holds it exclusive while it moves an allocation into or
+    /// out of the FIFO and while it holds tokens of the FIFO outside it ([`Jobserver::moving`]);
+    /// a count holds it exclusive too, one count of a handle at a time (`one_count`: a second
+    /// on the same descriptor would be granted the same lock), so no count sees half a transfer.
+    transfer: File,
+    /// `<fifo>.clients`, on an adopted handle: held shared for the handle's whole life, so a
+    /// handle takes it exclusive only while no other handle has adopted the pool.
+    clients: Option<File>,
+}
+
+/// The clients a caller reaped since this handle's last whole count, and which records it made.
+#[derive(Debug, Default)]
+struct Notes {
+    /// The latest [`NOTED`] of them, oldest first: a note past that many drops the oldest.
+    reaped: Vec<String>,
+    /// How many earlier ones `reaped` no longer lists.
+    unlisted: usize,
+    /// Whether a count of this handle found a shortfall it made good.
+    short_recorded: bool,
+    /// Whether a count of this handle recorded a shortfall it could not judge.
+    unjudged_recorded: bool,
+    /// The latest record this handle wrote, the one its `capacity-event:` line was written from
+    /// ([`Jobserver::count_event`]).
+    last: Option<CountRecord>,
+}
+
+/// How many reaped clients a count's record lists: the latest, with how many earlier ones it
+/// dropped.
+const NOTED: usize = 64;
+
+/// One count's record ([`Jobserver::count_event`]), as its `capacity-event:` line says it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CountRecord {
+    /// `short`, `over` or `short-unjudged`.
+    pub(crate) outcome: &'static str,
+    /// Whether no earlier record of this handle named the same kind of shortfall.
+    pub(crate) first: bool,
+    pub(crate) allocated: u32,
+    pub(crate) in_fifo: u32,
+    pub(crate) held: u32,
+    /// The tokens written for a shortfall, or read out for a surplus.
+    pub(crate) changed: u32,
+    pub(crate) evidence: String,
+    /// The clients reaped since the last whole count, and how many earlier ones were dropped.
+    pub(crate) reaped: Vec<String>,
+    pub(crate) unlisted: usize,
+}
+
+/// What [`Jobserver::count_alone`] found: the FIFO's bytes and the tokens the counting handle
+/// holds, against the allocation published beside the FIFO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenCount {
+    /// Not judged, for the reason given; nothing was written or read.
+    Unsettled(&'static str),
+    /// The FIFO and this handle hold the whole allocation.
+    Whole {
+        /// The allocation published beside the FIFO.
+        allocated: u32,
+    },
+    /// They held fewer: `reminted` new tokens made the FIFO whole.
+    Short {
+        /// The allocation published beside the FIFO.
+        allocated: u32,
+        /// The FIFO's bytes, this handle's tokens, and one for each of its waits in its read
+        /// (IN-DOUBT READERS at [`Jobserver::count_alone`]).
+        found: u32,
+        /// The tokens written to make it whole.
+        reminted: u32,
+    },
+    /// They held more: `discarded` surplus bytes were read from the FIFO and dropped.
+    Over {
+        /// The allocation published beside the FIFO.
+        allocated: u32,
+        /// The FIFO's bytes and this handle's tokens.
+        found: u32,
+        /// The bytes taken out of circulation, at most the FIFO's.
+        discarded: u32,
+    },
+}
+
+impl TokenCount {
+    /// The tokens this count wrote into the FIFO.
+    #[must_use]
+    pub fn reminted(&self) -> u32 {
+        match self {
+            Self::Short { reminted, .. } => *reminted,
+            _ => 0,
+        }
+    }
+}
+
+/// The creator's exclusive hold of a FIFO's `<fifo>.transfer` ([`Jobserver::moving`]): the pool
+/// holds the lock while any of its guards lives, and the last to drop lets it go by `LOCK_UN`
+/// (clippy.toml's flock release rule). Every re-mint and every take of a token to move it out
+/// asks for one ([`Jobserver::remint`], [`Jobserver::try_acquire_moving`]), so no move can be
+/// written outside the lock.
+#[derive(Debug)]
+#[must_use = "the transfer lock is held only while this guard lives"]
+pub(crate) struct Moving<'a> {
+    pool: &'a Jobserver,
+    /// Whether this guard counts in the pool's `moves`: a pool with no custody files, an
+    /// adopted one, or a lock the kernel refused holds nothing.
+    held: bool,
+}
+
+impl Drop for Moving<'_> {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let mut moves = self
+            .pool
+            .moves
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *moves -= 1;
+        #[cfg(unix)]
+        if *moves == 0
+            && let Some(custody) = &self.pool.custody
+        {
+            let _ = custody.transfer.unlock();
+        }
+    }
+}
+
+/// A count's own exclusive hold of an adopter's `<fifo>.transfer` ([`Jobserver::count_alone`]),
+/// let go by `LOCK_UN` as it drops.
+#[cfg(unix)]
+struct Counting<'a>(&'a File);
+
+#[cfg(unix)]
+impl Drop for Counting<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// The waits for a token on one handle, oldest first.
@@ -128,7 +299,9 @@ enum Reader {
 }
 
 impl Jobserver {
-    /// Create a new pool in a private release directory. Existing paths are never replaced.
+    /// Create a new pool in a private release directory: the FIFO at `path`, which must not
+    /// exist yet, and its custody files beside it (`<fifo>.transfer`, `<fifo>.clients`, by
+    /// [`Path::with_extension`]), which replace any a dead run left there.
     /// # Errors
     /// The token count or FIFO path cannot be represented, or creating/opening it fails.
     pub fn new(path: &Path, slots: u32) -> io::Result<Self> {
@@ -161,16 +334,33 @@ impl Jobserver {
             let opened = open(&path).and_then(|mut file| {
                 let wait = blocking_twin(&path, &file)?;
                 file.write_all(&[b'+'; MAX_SLOTS as usize][..tokens as usize])?;
-                Ok((file, wait))
+                // The FIFO is new, so files beside it are a dead run's: an adopter of that run's
+                // FIFO holding them is no client of this one, and must not hold off its counts.
+                for kind in CUSTODY {
+                    let _ = std::fs::remove_file(path.with_extension(kind));
+                }
+                let transfer = custody_file(&path.with_extension(CUSTODY[0]), true)?;
+                custody_file(&path.with_extension(CUSTODY[1]), true)?;
+                Ok((
+                    file,
+                    wait,
+                    Custody {
+                        transfer,
+                        clients: None,
+                    },
+                ))
             });
-            let (file, wait) = match opened {
-                Ok(both) => both,
+            let (file, wait, custody) = match opened {
+                Ok(all) => all,
                 Err(error) => {
                     let _ = std::fs::remove_file(&path);
+                    for kind in CUSTODY {
+                        let _ = std::fs::remove_file(path.with_extension(kind));
+                    }
                     return Err(error);
                 }
             };
-            Ok(Self::holding(path, file, wait, slots, true))
+            Ok(Self::holding(path, file, wait, slots, true, Some(custody)))
         }
         #[cfg(not(unix))]
         Err(io::Error::new(
@@ -180,8 +370,8 @@ impl Jobserver {
     }
 
     /// The pool a release handed this process ([`POOL_ENV`], [`Self::hand_to`]): `None` when the
-    /// variable is unset, and an error when it is set but malformed or names no FIFO this user
-    /// owns ([`Self::adopt`]).
+    /// variable is unset, and an error when it is set but malformed, names no FIFO this user
+    /// owns, or names one whose custody files cannot be opened or locked ([`Self::adopt`]).
     #[must_use]
     pub fn inherited() -> Option<io::Result<Self>> {
         std::env::var_os(POOL_ENV).map(|value| Self::adopt(&value))
@@ -191,7 +381,9 @@ impl Jobserver {
     /// FIFO is opened as [`Self::new`] opens it, and is never removed by this handle: the pool
     /// is its creator's. No token is taken or added.
     /// # Errors
-    /// `value` is not of that form, or the path does not open as a FIFO this user owns.
+    /// `value` is not of that form, the path does not open as a FIFO this user owns, or a
+    /// custody file beside it (`<fifo>.transfer`, `<fifo>.clients`) exists but cannot be opened
+    /// (a link among them), or `<fifo>.clients` cannot be held shared.
     pub fn adopt(value: &OsStr) -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -235,7 +427,33 @@ impl Jobserver {
                 ));
             }
             let wait = blocking_twin(path, &file)?;
-            Ok(Self::holding(path.to_owned(), file, wait, slots, false))
+            // A pool whose creator made no custody files is never counted.
+            let absent = |opened: io::Result<File>| match opened {
+                Ok(file) => Ok(Some(file)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            };
+            let transfer = absent(custody_file(&path.with_extension(CUSTODY[0]), false))?;
+            let clients = absent(custody_file(&path.with_extension(CUSTODY[1]), false))?;
+            let custody = match (transfer, clients) {
+                (Some(transfer), Some(clients)) => {
+                    // Held for the handle's life, before it can take a token.
+                    locked(&clients, false)?;
+                    Some(Custody {
+                        transfer,
+                        clients: Some(clients),
+                    })
+                }
+                _ => None,
+            };
+            Ok(Self::holding(
+                path.to_owned(),
+                file,
+                wait,
+                slots,
+                false,
+                custody,
+            ))
         }
         #[cfg(not(unix))]
         {
@@ -250,7 +468,14 @@ impl Jobserver {
     /// A handle on the FIFO at `path`, opened both ways ([`open`], [`blocking_twin`]), with no
     /// wait yet.
     #[cfg(unix)]
-    fn holding(path: PathBuf, file: File, wait: File, slots: u32, created: bool) -> Self {
+    fn holding(
+        path: PathBuf,
+        file: File,
+        wait: File,
+        slots: u32,
+        created: bool,
+        custody: Option<Custody>,
+    ) -> Self {
         Self {
             path,
             file,
@@ -259,6 +484,12 @@ impl Jobserver {
             observed_slots: AtomicU32::new(slots),
             observed_grant: AtomicU32::new(slots),
             created,
+            custody,
+            moves: Mutex::new(0),
+            traffic: RwLock::new(()),
+            out: AtomicU32::new(0),
+            notes: Mutex::default(),
+            one_count: Mutex::new(()),
             waiters: Mutex::default(),
             turn: Condvar::new(),
         }
@@ -484,11 +715,390 @@ impl Jobserver {
     }
 
     /// Re-mint an allocation whose former branch has drained. Only the share accountant calls
-    /// this; returning a token from a live client must use its guard instead.
-    pub(crate) fn remint(&self, tokens: u32) {
+    /// this, under this pool's transfer lock (`moving`); returning a token from a live client
+    /// must use its guard instead.
+    /// # Panics
+    /// `moving` is another pool's guard.
+    pub(crate) fn remint(&self, tokens: u32, moving: &Moving<'_>) {
+        assert!(
+            std::ptr::eq(moving.pool, self),
+            "a re-mint holds its own pool's transfer lock"
+        );
         for _ in 0..tokens {
             self.give(b'+');
         }
+    }
+
+    /// [`Self::try_acquire`] for a token the share accountant takes out of this FIFO to move or
+    /// drain it, under this pool's transfer lock (`moving`).
+    /// # Errors
+    /// As [`Self::try_acquire`].
+    /// # Panics
+    /// `moving` is another pool's guard.
+    pub(crate) fn try_acquire_moving(&self, moving: &Moving<'_>) -> io::Result<Option<Token<'_>>> {
+        assert!(
+            std::ptr::eq(moving.pool, self),
+            "a move's take holds its own pool's transfer lock"
+        );
+        self.try_acquire()
+    }
+
+    /// Hold this pool's `<fifo>.transfer` exclusive, waiting for a count that holds it: the
+    /// creator does so while it moves an allocation into or out of the FIFO, and while it holds
+    /// tokens of the FIFO outside it, from the first byte it reads or the allocation it
+    /// publishes to the last byte it writes, so no adopter's count sees half of either. Guards
+    /// nest: the pool holds the lock while any lives. A handle that did not create the FIFO, or
+    /// one that made no custody files, holds nothing. A creator that holds tokens of its own
+    /// outside this lock while an adopter lives breaks [`Self::count_alone`]'s premise. LIMIT: a
+    /// lock the kernel refuses (never seen for this local regular file: `flock` fails on it
+    /// only on `EINTR`, which is retried) is said on stderr and not held.
+    pub(crate) fn moving(&self) -> Moving<'_> {
+        #[cfg(unix)]
+        if let Some(custody) = self.custody.as_ref().filter(|_| self.created) {
+            let mut moves = self.moves.lock().unwrap_or_else(PoisonError::into_inner);
+            // Taken by name here, not through `locked`, so the lock-order census sees this
+            // file's own lock under `moves`: no count that holds it ever waits for `moves`.
+            let transfer = &custody.transfer;
+            if *moves == 0 {
+                loop {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "held for the pool's guards: the last `Moving` releases by LOCK_UN"
+                    )]
+                    let taken = transfer.lock();
+                    match taken {
+                        Ok(()) => break,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(error) => {
+                            eprintln!(
+                                "jobserver transfer lock of {} unavailable: {error}",
+                                self.path.display()
+                            );
+                            return Moving {
+                                pool: self,
+                                held: false,
+                            };
+                        }
+                    }
+                }
+            }
+            *moves += 1;
+            return Moving {
+                pool: self,
+                held: true,
+            };
+        }
+        Moving {
+            pool: self,
+            held: false,
+        }
+    }
+
+    /// Note a client of this pool that its caller has reaped, for the record of the next count
+    /// that is not whole ([`Self::count_alone`], [`crate::BranchShares::reaped`]). A whole count
+    /// forgets the clients noted before it, and only the latest [`NOTED`] are listed: an earlier
+    /// one is dropped and only counted.
+    pub fn note_reaped(&self, client: String) {
+        let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        if notes.reaped.len() == NOTED {
+            notes.reaped.remove(0);
+            notes.unlisted += 1;
+        }
+        notes.reaped.push(client);
+    }
+
+    /// The clients noted since the last whole count, and how many more were not listed; the
+    /// notes are cleared.
+    pub(crate) fn take_reaped(&self) -> (Vec<String>, usize) {
+        let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        (
+            std::mem::take(&mut notes.reaped),
+            std::mem::take(&mut notes.unlisted),
+        )
+    }
+
+    /// Whether no handle has adopted this pool now: `<fifo>.clients` taken exclusive and let go
+    /// at once. `None` where the pool has no custody files or the lock cannot be asked.
+    pub(crate) fn adopters_gone(&self) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            let clients = custody_file(&self.path.with_extension(CUSTODY[1]), false).ok()?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "an instant probe: let go by LOCK_UN on the next statement"
+            )]
+            let probed = clients.try_lock();
+            match probed {
+                Ok(()) => {
+                    let _ = clients.unlock();
+                    Some(true)
+                }
+                Err(std::fs::TryLockError::WouldBlock) => Some(false),
+                Err(std::fs::TryLockError::Error(_)) => None,
+            }
+        }
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Count this pool's tokens as its one adopter, with none of its clients alive: the bytes
+    /// in the FIFO and the tokens this handle holds (its [`Token`]s and its waits' tokens)
+    /// against the allocation the creator published beside the FIFO (`<fifo>.slots`). A
+    /// shortfall is a token a client took with it when it died, so it is written back, and a
+    /// surplus, a token minted twice, is read out; either writes a `capacity-event:` record
+    /// with the clients reaped since the last whole count ([`Self::note_reaped`]).
+    ///
+    /// IN-DOUBT READERS. A wait of this handle whose reader is in its read (`Reading`) may or
+    /// may not have taken a byte it has not yet counted as held, so the tokens there are lie
+    /// between the FIFO's bytes and this handle's (`lo`) and `lo` plus one per such reader
+    /// (`hi`). The count is short only when `hi` is below the allocation, and writes back no more
+    /// than that gap; it is over only when `lo` is above it, and reads out no more than that
+    /// excess; otherwise, with a reader in doubt, it is unjudged. So no count mints a byte a
+    /// reader took, and none reads out a byte a reader has yet to take.
+    ///
+    /// SOUND ONLY ON EVIDENCE. Nothing but the following can hold a token of the FIFO, and the
+    /// count is judged only while each is excluded; otherwise it answers
+    /// [`TokenCount::Unsettled`] and changes nothing:
+    /// - the creator, which holds `<fifo>.transfer` while it moves an allocation or holds
+    ///   tokens outside the FIFO ([`Self::moving`]): the count takes it exclusive, without
+    ///   waiting;
+    /// - another adopting handle, in this process or another, which holds `<fifo>.clients`
+    ///   shared while it lives: the count takes it exclusive, without waiting;
+    /// - another thread of this handle, mid-way between the FIFO and its count of what it
+    ///   holds: the count holds that traffic off, without waiting;
+    /// - another count of this handle (ONE COUNT AT A TIME: both would hold `<fifo>.transfer`
+    ///   by the same descriptor, so the lock keeps neither from the other, and the first's end
+    ///   would let it go while the second counts): the count takes the handle's own count
+    ///   lock, without waiting;
+    /// - a child of the caller's, or its descendant, which a GNU client among them may draw
+    ///   from: `alone`, asked once every other exclusion is held, before the FIFO's size is
+    ///   read and again after it, must say both times that none is alive. A child alive while
+    ///   the size is read is alive at one of the two answers, unless the caller both started
+    ///   and reaped it between them; this handle's own tokens cannot move until the count ends.
+    ///
+    /// A shortfall judged on weaker evidence (another adopter, or a child alive) is recorded
+    /// once per handle as unjudged, with nothing written. LIMIT: a process `alone` cannot see
+    /// holding a token (a descendant that left its process group, a member of a group whose
+    /// leader the caller reaped while it lives on, or a child started and reaped between the
+    /// two answers that returned a token after the size was read) is counted as lost and
+    /// written back, so until a later count reads out the surplus its return makes, the pool
+    /// holds that many tokens more than its allocation.
+    /// # Errors
+    /// The custody lock, the FIFO's size or its write or read fails; whatever was written or
+    /// read before the error stays.
+    pub fn count_alone(&self, alone: &dyn Fn() -> bool) -> io::Result<TokenCount> {
+        #[cfg(unix)]
+        {
+            let Some(Custody {
+                transfer,
+                clients: Some(clients),
+            }) = &self.custody
+            else {
+                return Ok(TokenCount::Unsettled(
+                    "only an adopted FIFO whose creator keeps custody files is counted",
+                ));
+            };
+            // Held to the count's end, so it lets go after the transfer lock (ONE COUNT AT A
+            // TIME).
+            let _one = match self.one_count.try_lock() {
+                Ok(one) => one,
+                Err(std::sync::TryLockError::Poisoned(one)) => one.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Ok(TokenCount::Unsettled(
+                        "another count of this handle is running",
+                    ));
+                }
+            };
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "taken into the `Counting` guard below, whose Drop releases by LOCK_UN"
+            )]
+            let free = transfer.try_lock();
+            match free {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Ok(TokenCount::Unsettled(
+                        "the creator is moving an allocation or holds tokens outside the FIFO",
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+            let counting = Counting(transfer);
+            // Held through the count: no token of this handle is given while it counts, and a
+            // wait's reader moves between `Reading` and holding its byte only under it.
+            let waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+            let Ok(traffic) = self.traffic.try_write() else {
+                return Ok(TokenCount::Unsettled("a token of this handle is moving"));
+            };
+            // A reader in its read may or may not have taken a byte it has not yet counted as
+            // held (IN-DOUBT READERS).
+            let reading = waiters
+                .each
+                .values()
+                .filter(|w| matches!(w.reader, Reader::Reading(_)))
+                .count();
+            let reading = u32::try_from(reading).unwrap_or(u32::MAX);
+            // Shared to exclusive: no other counter runs (this one holds the transfer lock and
+            // its handle's count lock), so the moment between the two holds lets no one in who
+            // could count.
+            let _ = clients.unlock();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "returned to a shared hold by the `Shared` guard below"
+            )]
+            let sole = clients.try_lock();
+            let shared = Shared(clients);
+            let unjudged = match sole {
+                Ok(()) => (!alone()).then_some("a child of this process may hold a token"),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    Some("another handle has adopted this pool")
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            };
+            let Some((_, allocated)) = self.published_share() else {
+                return Ok(TokenCount::Unsettled(
+                    "no allocation is published beside the FIFO",
+                ));
+            };
+            let in_fifo = available(&self.path, &self.file)?;
+            // Asked again: a child started after the first answer that took a byte before the
+            // size was read is still alive now, or died holding it.
+            let unjudged = unjudged
+                .or_else(|| (!alone()).then_some("a child of this process may hold a token"));
+            let lo = in_fifo.saturating_add(self.out.load(Ordering::SeqCst));
+            let hi = lo.saturating_add(reading);
+            let held = hi - in_fifo;
+            if let Some(why) = unjudged {
+                if hi < allocated {
+                    self.count_event("short-unjudged", allocated, in_fifo, held, 0, why);
+                }
+                return Ok(TokenCount::Unsettled(why));
+            }
+            let count = if hi < allocated {
+                let reminted = allocated - hi;
+                (&self.file).write_all(&[b'+'; MAX_SLOTS as usize][..reminted as usize])?;
+                TokenCount::Short {
+                    allocated,
+                    found: hi,
+                    reminted,
+                }
+            } else if lo > allocated {
+                let mut surplus = vec![0; (lo - allocated).min(in_fifo) as usize];
+                let discarded = match (&self.file).read(&mut surplus) {
+                    Ok(read) => read,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
+                    Err(error) => return Err(error),
+                };
+                TokenCount::Over {
+                    allocated,
+                    found: lo,
+                    discarded: u32::try_from(discarded).unwrap_or(u32::MAX),
+                }
+            } else if reading > 0 {
+                return Ok(TokenCount::Unsettled(
+                    "a wait of this handle is in its read",
+                ));
+            } else {
+                TokenCount::Whole { allocated }
+            };
+            drop((shared, traffic, waiters, counting));
+            match count {
+                TokenCount::Whole { .. } | TokenCount::Unsettled(_) => drop(self.take_reaped()),
+                TokenCount::Short { reminted, .. } => {
+                    self.count_event("short", allocated, in_fifo, held, reminted, "sole client");
+                }
+                TokenCount::Over { discarded, .. } => {
+                    self.count_event("over", allocated, in_fifo, held, discarded, "sole client");
+                }
+            }
+            Ok(count)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = alone;
+            Ok(TokenCount::Unsettled("FIFO jobservers require Unix"))
+        }
+    }
+
+    /// Write one count's `capacity-event:` record and return its clients: `outcome` (`short`,
+    /// `over` or `short-unjudged`), the published `allocated`, the FIFO's bytes and the tokens
+    /// the counter held, the tokens `changed` (written for a shortfall, read out for a surplus)
+    /// and the `evidence` it was judged on, with the clients reaped since the last whole count
+    /// (the latest [`NOTED`], and how many earlier ones were dropped). A judged count clears
+    /// them; an unjudged shortfall leaves them for the next judged count. `first` says whether
+    /// no earlier record of this handle named the same kind of shortfall; an unjudged one after
+    /// the first is not written again, and returns no clients. The record is kept as the
+    /// handle's latest (`Notes::last`).
+    pub(crate) fn count_event(
+        &self,
+        outcome: &'static str,
+        allocated: u32,
+        in_fifo: u32,
+        held: u32,
+        changed: u32,
+        evidence: &str,
+    ) -> Vec<String> {
+        // Only the notes' own fields are read and written under their lock.
+        let (first, reaped, unlisted) = {
+            let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+            let first = match outcome {
+                "short" => !std::mem::replace(&mut notes.short_recorded, true),
+                "short-unjudged" => !std::mem::replace(&mut notes.unjudged_recorded, true),
+                _ => false,
+            };
+            if outcome != "short-unjudged" {
+                (
+                    first,
+                    Some(std::mem::take(&mut notes.reaped)),
+                    std::mem::take(&mut notes.unlisted),
+                )
+            } else if first {
+                (first, Some(notes.reaped.clone()), notes.unlisted)
+            } else {
+                (first, None, 0)
+            }
+        };
+        let Some(reaped) = reaped else {
+            return Vec::default();
+        };
+        let record = CountRecord {
+            outcome,
+            first,
+            allocated,
+            in_fifo,
+            held,
+            changed,
+            evidence: evidence.to_owned(),
+            reaped,
+            unlisted,
+        };
+        eprintln!(
+            "capacity-event: {}",
+            aterm_json::json!({
+                "schema":1,"event":"jobserver-count","process_id":std::process::id(),
+                "fifo":self.path,"outcome":record.outcome,"first":record.first,
+                "allocated":record.allocated,"in_fifo":record.in_fifo,
+                "held_by_counter":record.held,"changed":record.changed,
+                "evidence":record.evidence,"reaped_since_whole_count":record.reaped,
+                "reaped_unlisted":record.unlisted,
+            })
+        );
+        let reaped = record.reaped.clone();
+        self.notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last = Some(record);
+        reaped
+    }
+
+    /// The latest record this handle wrote ([`Self::count_event`]).
+    #[cfg(test)]
+    pub(crate) fn last_count(&self) -> Option<CountRecord> {
+        self.notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last
+            .clone()
     }
 
     /// [`Self::acquire`], asking `stopped` at least once every `wake`, and telling `waiting` each
@@ -692,6 +1302,11 @@ impl Jobserver {
             }
         });
         let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+        // Counted as held under the lock that ends `Reading`, so a count, which holds it, finds
+        // a byte this reader took either here or among the readers it cannot judge.
+        if let Ok(Some(_)) = read {
+            self.out.fetch_add(1, Ordering::SeqCst);
+        }
         match waiters.each.get_mut(&id) {
             Some(me) => me.reader = Reader::Done(read),
             None => {
@@ -713,7 +1328,7 @@ impl Jobserver {
         }
         #[cfg(not(unix))]
         {
-            let _ = (&self.file).write_all(&[byte]);
+            let _ = self.returned(&[byte]);
         }
     }
 
@@ -729,10 +1344,36 @@ impl Jobserver {
                 self.turn.notify_all();
             }
             None => {
-                let _ = (&self.file).write_all(&[byte]);
+                let _ = self.returned(&[byte]);
                 self.turn.notify_all();
             }
         }
+    }
+
+    /// Write `bytes` this handle held back to the FIFO, and stop counting them as held.
+    /// # Errors
+    /// The write fails: what it did not write is lost, and still counted as held.
+    fn returned(&self, bytes: &[u8]) -> io::Result<()> {
+        // Holds off a count while this token moves between the FIFO and `out`.
+        let _passing = self.traffic.read().unwrap_or_else(PoisonError::into_inner);
+        (&self.file).write_all(bytes)?;
+        let n = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let _ = self
+            .out
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |out| {
+                Some(out.saturating_sub(n))
+            });
+        Ok(())
+    }
+
+    /// Read into `bytes` from the FIFO without waiting, counting what is read as held.
+    fn taken(&self, bytes: &mut [u8]) -> io::Result<usize> {
+        // Holds off a count while this token moves between the FIFO and `out`.
+        let _passing = self.traffic.read().unwrap_or_else(PoisonError::into_inner);
+        let read = (&self.file).read(bytes)?;
+        self.out
+            .fetch_add(u32::try_from(read).unwrap_or(u32::MAX), Ordering::SeqCst);
+        Ok(read)
     }
 
     /// Take `n` tokens, at most the pool's slots, for one process that is no GNU client (a test
@@ -770,7 +1411,7 @@ impl Jobserver {
                     "jobserver wait ended",
                 ));
             }
-            let count = match (&self.file).read(&mut bytes) {
+            let count = match self.taken(&mut bytes) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -800,7 +1441,7 @@ impl Jobserver {
                 // to the FIFO: notifying batch waiters here would let short reads wake each
                 // other forever without any new capacity becoming free.
                 if count != 0 {
-                    (&self.file).write_all(&bytes[..count])?;
+                    self.returned(&bytes[..count])?;
                 }
                 None
             };
@@ -849,7 +1490,13 @@ impl Jobserver {
     /// # Errors
     /// FIFO IO fails.
     pub fn try_acquire(&self) -> io::Result<Option<Token<'_>>> {
-        read_token(&mut &self.file).map(|byte| byte.map(|byte| Token { pool: self, byte }))
+        // Holds off a count while this token moves between the FIFO and `out` ([`Self::taken`]).
+        let _passing = self.traffic.read().unwrap_or_else(PoisonError::into_inner);
+        let byte = read_token(&mut &self.file)?;
+        if byte.is_some() {
+            self.out.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(byte.map(|byte| Token { pool: self, byte }))
     }
 }
 
@@ -888,6 +1535,95 @@ fn representable(path: &Path, slots: u32) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The custody files' extensions beside a FIFO: `<fifo>.transfer`, then `<fifo>.clients`
+/// ([`Custody`]).
+#[cfg(unix)]
+const CUSTODY: [&str; 2] = ["transfer", "clients"];
+
+/// Open a custody file beside a FIFO, made new (0600) when `make`, out of a concurrent spawn's
+/// descriptors and never through a link.
+#[cfg(unix)]
+fn custody_file(path: &Path, make: bool) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    aterm_uds::kept_out(|| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(make)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+    })
+}
+
+/// Take `file`'s lock, exclusive or shared, waiting for a holder of the other kind; a signal
+/// that ends the wait is waited through.
+/// # Errors
+/// `flock` refuses.
+#[cfg(unix)]
+fn locked(file: &File, exclusive: bool) -> io::Result<()> {
+    loop {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a custody hold: `Moving`, `Shared` and the handle's Drop release by LOCK_UN"
+        )]
+        let taken = if exclusive {
+            file.lock()
+        } else {
+            file.lock_shared()
+        };
+        match taken {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            taken => return taken,
+        }
+    }
+}
+
+/// An adopter's `<fifo>.clients`, returned to its shared hold as this drops: after a count took
+/// it exclusive, or tried to and found another adopter ([`Jobserver::count_alone`]).
+#[cfg(unix)]
+struct Shared<'a>(&'a File);
+
+#[cfg(unix)]
+impl Drop for Shared<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = locked(self.0, false) {
+            eprintln!("jobserver adopter's clients lock not restored: {error}");
+        }
+    }
+}
+
+/// The bytes waiting in the FIFO at `path`, which `file` holds, read without taking one
+/// (`FIONREAD`). It asks a read-only descriptor of its own: Darwin answers `FIONREAD` on a FIFO
+/// opened both ways from its write side, which holds nothing (0 for a FIFO of 4 tokens).
+/// # Errors
+/// The open or the ioctl fails, or `path` names another file by now.
+#[cfg(unix)]
+fn available(path: &Path, file: &File) -> io::Result<u32> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let reader = aterm_uds::kept_out(|| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)
+    })?;
+    let (ours, theirs) = (file.metadata()?, reader.metadata()?);
+    if (ours.dev(), ours.ino()) != (theirs.dev(), theirs.ino()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is no longer the FIFO first opened", path.display()),
+        ));
+    }
+    let mut count: libc::c_int = 0;
+    // SAFETY: `reader` owns a live read-only FIFO descriptor; FIONREAD writes exactly one c_int
+    // into `count` and consumes no byte.
+    if unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &raw mut count) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u32::try_from(count).map_err(|_| io::Error::other("negative FIFO byte count"))
 }
 
 /// Open the FIFO for tokens both ways, nonblocking, out of a concurrent spawn's descriptors.
@@ -1011,8 +1747,16 @@ fn interruptible() -> io::Result<()> {
 
 impl Drop for Jobserver {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(clients) = self.custody.as_ref().and_then(|c| c.clients.as_ref()) {
+            let _ = clients.unlock();
+        }
         if self.created {
             let _ = std::fs::remove_file(&self.path);
+            #[cfg(unix)]
+            for kind in CUSTODY {
+                let _ = std::fs::remove_file(self.path.with_extension(kind));
+            }
         }
     }
 }

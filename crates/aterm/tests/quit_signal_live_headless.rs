@@ -79,7 +79,7 @@ fn spawn_worker(inst: &Instance, manager: &str) -> PathBuf {
     assert!(out.status.success(), "spawn: {stdout} {:?}", out.stderr);
     let worker = stdout
         .split_whitespace()
-        .find(|w| w.starts_with("s-"))
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .unwrap_or_else(|| panic!("a sid: {stdout}"));
     let file = inst.tmp.join(format!("state/tasks/{worker}-1.txt"));
     assert!(file.exists(), "the task file is there before the signal");

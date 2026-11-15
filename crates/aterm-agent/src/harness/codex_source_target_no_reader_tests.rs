@@ -23,7 +23,7 @@ impl Fixture {
         let connection = registry.fixture_connection();
         let id = connection.id;
         let caller = slot::Caller {
-            sid: format!("s-no-reader-{id}"),
+            sid: aterm_types::tab_id::TabId::from_bits(id).to_string(),
             pid: process.pid,
             birth: process.birth,
         };

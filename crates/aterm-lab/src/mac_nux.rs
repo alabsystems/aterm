@@ -201,14 +201,14 @@ pub const USAGE: &str = "\
                                    variable). This measures no default ALab enrollment, automatic
                                    subscriber installation, real account authentication or clones;
                                    and the lab's table: once the member is in, the seed
-                                   signs Genesis v2 (the lab's first [everyone] epoch), imports a
-                                   one-row emails sheet (aterm db alab import --apply) and seals a
-                                   random password into it (aterm db emails set … --stdin); once
+                                   signs Genesis v2 (the lab's first [everyone] epoch) and imports
+                                   a one-row emails sheet with an activation phone (aterm db alab
+                                   import --apply), whose number the registry holds sealed; once
                                    the joiner reads In, the guest helper's repair moves the Commons
                                    tables to it over loopback (two homes in one guest share its
                                    address, whose beacons a Commons runtime drops as its own), and
-                                   the row FAILS unless the joiner's aterm db emails --digest is the
-                                   seed's: one epoch, the row and its password, one digest
+                                   the row FAILS unless aterm db emails and aterm db phones show
+                                   the joiner what they show the seed: the row, its number read
                   successor        install.sh --version N (the public release before the latest), its
                                    ordinary selected base.clt item to completion and a recorded attempt,
                                    then the real updater with a window open: the running target build,
@@ -255,9 +255,9 @@ pub const USAGE: &str = "\
                                    any done stage re-run, rows not in place
                 Tree rows (`tree`, or each by name; never in all), each on the person base whatever the flags
                 (its helper holds Accessibility by its identifier) and with no app:
-                  reveal-tab       lab reveal-tab's world in the guest (synthetic logins sealed in a scratch
-                                   Commons, aterm db emails --show-passwords outside aterm and in a windowed
-                                   instance's tab), run by this lab's own debug image against the aterm
+                  reveal-tab       lab reveal-tab's world in the guest (a private grid of synthetic logins
+                                   opened by aterm edit --secret=password in a windowed instance's tab),
+                                   run by this lab's own debug image against the aterm
                                    under test (LAB_ATERM or target/debug/aterm, a debug build) as an agent
                                    of the console's session, the window's accessibility tree read by the
                                    guest helper's ax-texts (started disclaimed, so tccd judges its grant);
@@ -662,18 +662,6 @@ impl Scenario {
                 | Scenario::RevealTab
                 | Scenario::RevealTabControl
         )
-    }
-
-    /// The display its clone boots with, where the image's (1024x768 points) is too small: a tree
-    /// row's instance opens about 2,300 points wide (`reveal_tab::WINDOW`), so that the grid's
-    /// password column is on its first screen, and the window stays whole on this display.
-    #[must_use]
-    pub const fn display(self) -> Option<&'static str> {
-        if self.reads_tree() {
-            Some("2560x1600")
-        } else {
-            None
-        }
     }
 
     /// Whether it reads a window's accessibility tree through the guest helper, so its base is
@@ -3755,17 +3743,6 @@ fn guest(
         if !status.success() {
             return Err(not_run(format!("tart set --disk-size: {status}")));
         }
-    }
-    if let Some(display) = scenario.display() {
-        let status = aterm_uds::spawnfd::command(tart)
-            .args(["set", &vm.name, "--display", display])
-            .stdin(Stdio::null())
-            .status()
-            .map_err(|e| not_run(format!("tart set: {e}")))?;
-        if !status.success() {
-            return Err(not_run(format!("tart set --display {display}: {status}")));
-        }
-        row.cell("guest display", Value::Text(format!("{display} points")));
     }
     crate::mac::boot_sip_on(&mut vm, base)?;
     let zip = format!("{}/aterm.zip", crate::mac::GUEST_SHARE);
@@ -7234,7 +7211,7 @@ else
 for f in "$HOME/Library/Application Support/aterm/command-line-tools-tab.children/"*; do
   [ -f "$f" ] && [ ! -L "$f" ] && [ "$(/usr/bin/stat -f %u "$f")" = "$collector_uid" ] || continue
   collector_sid=$(/usr/bin/sed -n '2p' "$f")
-  printf '%s\n' "$collector_sid" | /usr/bin/grep -Eq '^s-[0-9a-f]{{1,62}}$' || continue
+  printf '%s\n' "$collector_sid" | /usr/bin/grep -Eq '^t[0-9abcdefghjkmnpqrstvwxyz]{{10}}$' || continue
   {ctl} "@$collector_sid" status || collector_status=1
   {ctl} "@$collector_sid" sys procs --json || collector_status=1
 done
@@ -7727,7 +7704,7 @@ mod phrase;
 #[path = "mac_nux_reveal.rs"]
 mod reveal;
 
-/// A release lab image has no `lab reveal-tab` (its scratch registry is a debug build's seam), so
+/// A release lab image has no `lab reveal-tab` (its negative control is a debug build's seam), so
 /// its tree rows are NOT RUN.
 #[cfg(not(debug_assertions))]
 mod reveal {
@@ -7736,7 +7713,7 @@ mod reveal {
     use super::{Guest, Row};
     use crate::Fail;
 
-    const WHY: &str = "the tree rows run lab reveal-tab, which needs a debug lab image for its scratch-registry seams";
+    const WHY: &str = "the tree rows run lab reveal-tab, which needs a debug lab image for its negative-control seam";
 
     pub(super) fn stage(_: &Path) -> Result<(), Fail> {
         Err(crate::mac::not_run(WHY))

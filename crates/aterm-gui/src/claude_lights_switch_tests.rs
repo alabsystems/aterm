@@ -6,7 +6,7 @@
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 use aterm_core::render::{BandIcon, ChromeIcon};
 use aterm_window::event::{ElementState, MouseButton};
 

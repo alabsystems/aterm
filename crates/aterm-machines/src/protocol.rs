@@ -94,7 +94,7 @@ pub struct HostedSession {
     pub instance_pid: u32,
     /// Local tab/session index within that `aterm` instance.
     pub local_id: u64,
-    /// Globally unique session ID (`s-...`).
+    /// Globally unique session ID, a tab ID (`tqn5r6e0148`).
     pub sid: String,
     /// Session lifecycle state (`alive`, `idle`, `running`, …).
     pub state: String,

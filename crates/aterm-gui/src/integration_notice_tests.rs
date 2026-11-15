@@ -78,7 +78,7 @@ fn a_dismissed_row_stays_down_until_news_and_its_heal_still_reads_fixed() {
         .live_by_key(crate::message_reporters::KEY_INTEGRATION_LOST)
         .expect("the row")
         .id;
-    assert!(app.messages.dismiss(first, t));
+    assert!(app.messages.dismiss(first, app.messages_wall.now(), t));
     t += Duration::from_millis(300);
     let _ = app.observe_session_statuses(t);
     assert!(rows(&app).is_empty(), "put down: stays down");

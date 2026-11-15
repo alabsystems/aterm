@@ -12,6 +12,7 @@ pub mod paint_probe;
 pub mod rewind;
 pub mod rewind_cost;
 pub mod scan;
+pub mod size;
 pub mod spin;
 pub mod starvation;
 
@@ -72,7 +73,8 @@ pub struct Usage {
 /// `pid`'s [`Usage`] now.
 /// # Errors
 /// [`instance::CouldNotRun::Refused`] when the pid is out of range, the kernel names no usage for
-/// it (it exited), or the kernel's timebase is unreadable.
+/// it (it exited), its footprint reads zero (it exited and its parent has not reaped it), or the
+/// kernel's timebase is unreadable.
 #[cfg(target_os = "macos")]
 pub fn usage(pid: u32) -> Result<Usage, instance::CouldNotRun> {
     use instance::CouldNotRun;
@@ -95,6 +97,14 @@ pub fn usage(pid: u32) -> Result<Usage, instance::CouldNotRun> {
     }
     // SAFETY: zeroed is a valid `rusage_info_v4` (plain integers), and the kernel filled it.
     let info = unsafe { info.assume_init() };
+    // The kernel still answers for a child that exited and was not reaped, with a zero
+    // footprint (macOS 27.0, 2026-11-13). No live process owns none, and zero is under every
+    // ceiling a row holds, so it is no reading.
+    if info.ri_phys_footprint == 0 {
+        return Err(CouldNotRun::Refused(format!(
+            "proc_pid_rusage named no footprint for {pid} (it exited)"
+        )));
+    }
     let (numer, denom) = aterm_sysprobe::procs::kernel_timebase()
         .ok_or_else(|| CouldNotRun::Refused("the kernel's timebase is unreadable".into()))?;
     let ticks = info.ri_user_time.saturating_add(info.ri_system_time);

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::host::agh::{AghHost, ClientRefusal};
-use crate::host::rest::RestHost;
+use crate::host::rest::{RestHost, TokenSource};
 use crate::host::{Hosts, Slug};
 
 /// The private development owner packs are staged to before publication.
@@ -23,29 +23,34 @@ pub struct Accounts {
     pub public: String,
 }
 
-/// The token files the two identities read (never an ambient credential in a lane).
+/// The tokens the two identities read (never an ambient credential in a lane).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tokens {
     /// Write on the staging owner: the vault's dev token.
-    pub staging: PathBuf,
+    pub staging: TokenSource,
     /// Write on the public channel owner: the vault's release token.
-    pub channel: PathBuf,
+    pub channel: TokenSource,
 }
 
 impl Tokens {
-    /// The token files under `home`: where the vault lands agh's two slots.
+    /// agh's two vault entries, read in place from the store under `home`.
     fn under(home: &Path) -> Self {
         use agh::identity::vault::Slot;
         Self {
-            staging: Slot::Dev.path(home),
-            channel: Slot::Release.path(home),
+            staging: TokenSource::entry(home, Slot::Dev.entry()),
+            channel: TokenSource::entry(home, Slot::Release.entry()),
         }
     }
 }
 
-/// This machine's publishing identity, as files.
+/// This machine's publishing identity: the store's release ring under [`Self::store`] where the
+/// store holds one, else the files `atpkg-keys setup`/`join` minted here, read where they lie.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityPaths {
+    /// The home whose verified store's release ring (key and record read as one set) comes
+    /// first; `None` where an explicit key was named, which only its files sign. The store's
+    /// signed roster pair is a candidate either way.
+    pub store: Option<PathBuf>,
     /// The secret PKCS#8 machine key (`~/.aterm/release-ring/machine.key`).
     pub key: PathBuf,
     /// Its public record (`~/.aterm/release-ring/machine.toml`): the roster id and pubkey.
@@ -74,7 +79,7 @@ pub struct Ctx {
     pub targo_component: Option<String>,
     /// The accounts.
     pub accounts: Accounts,
-    /// The token files.
+    /// The tokens.
     pub tokens: Tokens,
     /// This machine's identity files.
     pub identity: IdentityPaths,
@@ -197,6 +202,7 @@ impl Ctx {
             },
             tokens: Tokens::under(home),
             identity: IdentityPaths {
+                store: Some(home.to_path_buf()),
                 key: home.join(atpkg_keys::provision::MACHINE_KEY_REL),
                 record: home.join(atpkg_keys::provision::MACHINE_PUB_REL),
                 roster: home.join(atpkg_keys::provision::RELEASE_ROSTER_REL),
@@ -233,8 +239,8 @@ impl Ctx {
     fn from_env_hosts_mode(hosts: HostChoice, learn: bool) -> Result<Self> {
         let home = non_empty_env("HOME").ok_or_else(|| {
             Error::cannot_run(
-                "HOME is unset — the machine key, the token files, the state root and the \
-                 atpkg store are all found under it; run with HOME set",
+                "HOME is unset — the machine key, the vault, the state root and the atpkg store \
+                 are all found under it; run with HOME set",
             )
         })?;
         let now = aterm_time::unix_secs()
@@ -395,16 +401,34 @@ impl Ctx {
         }
     }
 
-    /// Whether `path` holds a usable GitHub token (`Ok(false)` when absent or whitespace-only).
+    /// Whether `source` holds a usable GitHub token (`Ok(false)` when absent or
+    /// whitespace-only).
     ///
     /// # Errors
     ///
-    /// Returns the reason (with `path` redacted through [`Self::shown`]) when `path` cannot be
-    /// read or holds a byte outside visible ASCII.
-    pub(crate) fn usable_token(&self, path: &Path) -> std::result::Result<bool, String> {
-        aterm_update_core::github_rest::Token::from_file(path)
+    /// Returns the reason (with a path redacted through [`Self::shown`]) when the token cannot
+    /// be read or holds a byte outside visible ASCII.
+    pub(crate) fn usable_token(&self, source: &TokenSource) -> std::result::Result<bool, String> {
+        source
+            .read()
             .map(|token| token.is_some())
-            .map_err(|why| why.replace(&path.display().to_string(), &self.shown(path)))
+            .map_err(|why| match source {
+                TokenSource::Entry { .. } => why,
+                #[cfg(any(test, debug_assertions))]
+                TokenSource::File(path) => {
+                    why.replace(&path.display().to_string(), &self.shown(path))
+                }
+            })
+    }
+
+    /// How a message names `source`: the vault entry, or a test's file `~/`-relative.
+    #[must_use]
+    pub fn shown_token(&self, source: &TokenSource) -> String {
+        match source {
+            TokenSource::Entry { .. } => source.shown(),
+            #[cfg(any(test, debug_assertions))]
+            TokenSource::File(path) => self.shown(path),
+        }
     }
 }
 

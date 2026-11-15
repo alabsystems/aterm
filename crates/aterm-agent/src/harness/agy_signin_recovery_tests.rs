@@ -881,7 +881,7 @@ fn rejected_encrypted_completion_reaches_native_refresh_handoff() {
                 staging.profile,
                 Some(claim),
                 None,
-                deadline,
+                (deadline, &|| false),
                 |_, _| {
                     observed.set(true);
                     Err(Error::Callback)

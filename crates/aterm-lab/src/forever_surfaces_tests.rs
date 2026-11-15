@@ -11,8 +11,8 @@ use super::*;
 const CHROME: &str = r#"toolbar (none)
 toolbar-tabs count=2 selected=1 labels=["aterm", "land-a"] icons=[None, None] states=[[], ["selected", "busy", "attention"]] tooltips=[None, Some("land-a\nactivity: idle\nNeeds you: rotate the deploy key\ndriven by aterm (land)")]
 menu (none)
-autopilot sid=s-aa window=2 program=claude face=land drawn="⤓" spoken="Autopilot: land."
-autopilot sid=s-bb window=2 program=claude face=cruise drawn=- why=not-drawn spoken=-
+autopilot sid=t00000000aa window=2 program=claude face=land drawn="⤓" spoken="Autopilot: land."
+autopilot sid=t00000000bb window=2 program=claude face=cruise drawn=- why=not-drawn spoken=-
 statusitem title=❯ fleet=off access=read shown=read blocked=no
 statusmenu "This Mac · not in a fleet" enabled=no at=0"#;
 
@@ -186,7 +186,7 @@ fn a_row_cut_off_by_the_pages_bottom_edge_is_off_its_screen() {
 
 #[test]
 fn a_chip_line_is_read_and_its_cells_held_to_its_face() {
-    let a = chip_of(CHROME, "s-aa").unwrap();
+    let a = chip_of(CHROME, "t00000000aa").unwrap();
     assert_eq!(
         a,
         "window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\""
@@ -197,13 +197,17 @@ fn a_chip_line_is_read_and_its_cells_held_to_its_face() {
         ("land", Some("⤓"), None)
     );
     assert!(drawn_is_face(&c));
-    let b = chip(&chip_of(CHROME, "s-bb").unwrap());
+    let b = chip(&chip_of(CHROME, "t00000000bb").unwrap());
     assert_eq!(
         (b.drawn.as_deref(), b.why.as_deref()),
         (None, Some("not-drawn"))
     );
     assert!(!drawn_is_face(&b), "no cells are no face");
-    assert_eq!(chip_of(CHROME, "s-a"), None, "a sid is read whole");
+    assert_eq!(
+        chip_of(CHROME, "t00000000a"),
+        None,
+        "a sid is read whole, never a prefix"
+    );
     assert!(!drawn_is_face(&chip("face=landed drawn=\"⤓ land\"")));
     assert!(drawn_is_face(&chip("face=off drawn=\"○\"")), "Off at rest");
     assert!(
@@ -272,25 +276,33 @@ window id=1 focused=true tabs=2 active=3
     assert_eq!(windows, ["0", "1"]);
     assert_eq!(page, Some(("1".to_string(), "3".to_string())));
     assert_eq!(windows_of("window id=0 focused=true").1, None);
-    let ls = "0 0 s-aa - alive alpha meta=1 window=0 active=1\n0 1 s-bb - alive /p meta=0 window=2 active=1";
-    assert_eq!(window_of(ls, "s-bb").as_deref(), Some("2"));
-    assert_eq!(window_of(ls, "s-b"), None);
+    let ls = "0 0 t00000000aa - alive alpha meta=1 window=0 active=1\n0 1 t00000000bb - alive /p meta=0 window=2 active=1";
+    assert_eq!(window_of(ls, "t00000000bb").as_deref(), Some("2"));
+    assert_eq!(
+        window_of(ls, "t00000000b"),
+        None,
+        "a sid is read whole, never a prefix"
+    );
 }
 
 /// The person's press finds its session's local id on its `ls` line and a Settings view in the
 /// tabs; another sid's line, or a tab of no Settings, gives none.
 #[test]
 fn the_persons_press_reads_the_local_id_and_a_settings_view() {
-    // The client's `ls`, its instance column first; s-bb's child names it as its parent.
-    let ls = "0 3 s-aa - alive alpha meta=1 window=0 active=1\n0 7 s-bb s-aa alive %2Fp meta=0 \
-              window=2\n0 9 s-cc s-bb alive child meta=1 window=2";
-    assert_eq!(local_of(ls, "s-bb").as_deref(), Some("7"));
-    assert_eq!(local_of(ls, "s-aa").as_deref(), Some("3"));
-    assert_eq!(local_of(ls, "s-b"), None);
-    assert_eq!(local_of("OK 2", "s-aa"), None);
+    // The client's `ls`, its instance column first; t00000000bb's child names it as its parent.
+    let ls = "0 3 t00000000aa - alive alpha meta=1 window=0 active=1\n0 7 t00000000bb t00000000aa alive %2Fp meta=0 \
+              window=2\n0 9 t00000000cc t00000000bb alive child meta=1 window=2";
+    assert_eq!(local_of(ls, "t00000000bb").as_deref(), Some("7"));
+    assert_eq!(local_of(ls, "t00000000aa").as_deref(), Some("3"));
+    assert_eq!(
+        local_of(ls, "t00000000b"),
+        None,
+        "a sid is read whole, never a prefix"
+    );
+    assert_eq!(local_of("OK 2", "t00000000aa"), None);
     // The session table's own line, with no instance column.
     assert_eq!(
-        local_of("4 s-dd - alive x meta=0", "s-dd").as_deref(),
+        local_of("4 t00000000dd - alive x meta=0", "t00000000dd").as_deref(),
         Some("4")
     );
     let tabs = "window id=1 focused=true tabs=2 active=3
@@ -372,7 +384,7 @@ fn the_metrics_name_their_owners_and_wakes() {
 fn tab_with(journal: &[(i64, &str)]) -> Tab {
     Tab {
         chain: Chain::Cruise,
-        sid: "s-x".into(),
+        sid: "t000000000x".into(),
         dir: std::path::PathBuf::new(),
         seen: Seen {
             journal: journal
@@ -597,11 +609,11 @@ fn the_title_is_split_off_the_chip_line() {
         None
     );
     let chrome = format!(
-        "autopilot sid=s-c {line}\nautopilot sid=s-d window=2 program=claude face=land drawn=- why=not-drawn spoken=- description=- title=-"
+        "autopilot sid=t000000000c {line}\nautopilot sid=t000000000d window=2 program=claude face=land drawn=- why=not-drawn spoken=- description=- title=-"
     );
     let g = Glance::of(7, &chrome, "");
     let mut front = Window::default();
-    let _ = front.note(&g, "s-c");
+    let _ = front.note(&g, "t000000000c");
     assert_eq!(front.chip, [(7, chip_line)]);
     assert_eq!(front.title.len(), 1);
     assert!(
@@ -610,16 +622,16 @@ fn the_title_is_split_off_the_chip_line() {
             .starts_with("autopilot: cruise — keeps going")
     );
     let mut behind = Window::default();
-    let _ = behind.note(&g, "s-d");
+    let _ = behind.note(&g, "t000000000d");
     assert_eq!(behind.title, [(7, "-".to_string())]);
     let mut old = Window::default();
     let _ = old.note(
         &Glance::of(
             7,
-            "autopilot sid=s-e window=2 program=claude face=off drawn=\"○\" spoken=\"x\"",
+            "autopilot sid=t000000000e window=2 program=claude face=off drawn=\"○\" spoken=\"x\"",
             "",
         ),
-        "s-e",
+        "t000000000e",
     );
     assert_eq!(old.title, [(7, "?".to_string())]);
 }
@@ -663,8 +675,8 @@ fn title_cx(chain: Chain, program: &'static str) -> Ctx<'static> {
 /// title is the others' negative control.
 #[test]
 fn every_chip_title_says_its_modes_sentence_from_mode_words() {
+    use alab_policy::config::Autopilot;
     use aterm_agent::harness::acts::{HeldBy, StopForm, stop_words};
-    use aterm_agent::supervise::Autopilot;
     use aterm_agent::supervise::mode_words::mode_words;
     let title = |mode: &str, m: Autopilot| {
         format!(
@@ -1175,27 +1187,27 @@ window id=2 focused=true tabs=2 active=9
 /// title: a strip a headless window has not drawn since the title was set lacks it.
 #[test]
 fn a_worker_is_read_in_front_once_its_strip_lists_its_title() {
-    assert!(worker_shown(CHROME, "s-aa", "land-a"));
+    assert!(worker_shown(CHROME, "t00000000aa", "land-a"));
     assert!(
-        !worker_shown(CHROME, "s-aa", "worker"),
+        !worker_shown(CHROME, "t00000000aa", "worker"),
         "the strip lacks the title"
     );
     assert!(
-        !worker_shown(CHROME, "s-zz", "land-a"),
+        !worker_shown(CHROME, "t00000000zz", "land-a"),
         "no chip for that tab"
     );
     let unnamed = CHROME.replace(
-        "autopilot sid=s-aa window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\"",
-        "autopilot sid=s-aa window=2 program=claude face=- drawn=- why=not-drawn spoken=-",
+        "autopilot sid=t00000000aa window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\"",
+        "autopilot sid=t00000000aa window=2 program=claude face=- drawn=- why=not-drawn spoken=-",
     );
     assert_ne!(unnamed, CHROME);
     assert!(
-        !worker_shown(&unnamed, "s-aa", "land-a"),
+        !worker_shown(&unnamed, "t00000000aa", "land-a"),
         "its chip names no program yet"
     );
     let bare = unnamed.replace("why=not-drawn", "why=no-footer");
     assert!(
-        worker_shown(&bare, "s-aa", "land-a"),
+        worker_shown(&bare, "t00000000aa", "land-a"),
         "a program with no footer draws no chip"
     );
 }
@@ -1204,10 +1216,10 @@ fn a_worker_is_read_in_front_once_its_strip_lists_its_title() {
 /// the title it gave the tab, and leaves a title that only looks like a mark as it is.
 #[test]
 fn the_strip_is_read_by_title_without_its_team_marks() {
-    let chrome = "toolbar-tabs count=3 selected=0 labels=[\"off\", \"mgr \u{21c9}1\", \"\u{21b3} worker\"] icons=[None, None, None] states=[[\"selected\"], [\"busy\"], [\"busy\"]] tooltips=[None, None, None]\nautopilot sid=s-ww window=2 program=claude face=land drawn=- why=not-drawn spoken=-";
+    let chrome = "toolbar-tabs count=3 selected=0 labels=[\"off\", \"mgr \u{21c9}1\", \"\u{21b3} worker\"] icons=[None, None, None] states=[[\"selected\"], [\"busy\"], [\"busy\"]] tooltips=[None, None, None]\nautopilot sid=t00000000ww window=2 program=claude face=land drawn=- why=not-drawn spoken=-";
     let labels: Vec<String> = strip_tabs(chrome).into_iter().map(|t| t.label).collect();
     assert_eq!(labels, ["off", "mgr", "worker"]);
-    assert!(worker_shown(chrome, "s-ww", "worker"));
+    assert!(worker_shown(chrome, "t00000000ww", "worker"));
     for kept in [
         "mgr \u{21c9}",
         "mgr \u{21c9}1a",
@@ -1224,12 +1236,12 @@ fn the_strip_is_read_by_title_without_its_team_marks() {
 #[test]
 fn only_a_chip_the_frame_left_undrawn_is_waited_on() {
     assert!(undrawn(
-        "autopilot sid=s-ww window=2 program=claude face=land drawn=- why=not-drawn spoken=- description=- title=-"
+        "autopilot sid=t00000000ww window=2 program=claude face=land drawn=- why=not-drawn spoken=- description=- title=-"
     ));
     for read in [
-        "autopilot sid=s-ww window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\" description=- title=\"autopilot: land\"",
-        "autopilot sid=s-ww window=2 program=codex face=- drawn=- why=no-footer spoken=- description=- title=-",
-        "autopilot sid=s-ww window=2 program=agy face=off drawn=- why=switch-only spoken=- description=- title=-",
+        "autopilot sid=t00000000ww window=2 program=claude face=land drawn=\"⤓\" spoken=\"Autopilot: land.\" description=- title=\"autopilot: land\"",
+        "autopilot sid=t00000000ww window=2 program=codex face=- drawn=- why=no-footer spoken=- description=- title=-",
+        "autopilot sid=t00000000ww window=2 program=agy face=off drawn=- why=switch-only spoken=- description=- title=-",
     ] {
         assert!(!undrawn(read), "{read}");
     }
@@ -1317,7 +1329,7 @@ fn a_chain_with_a_window_want_reads_its_window_when_run_alone() {
 /// title lost), as the opening's and END's reads do; a read whose chip is not drawn names none.
 #[test]
 fn a_drawn_chip_that_loses_its_title_mid_run_fails() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     use aterm_agent::supervise::mode_words::mode_words;
     let cruise = format!(
         "autopilot: cruise \u{2014} {} \u{b7} click: land",
@@ -1373,7 +1385,7 @@ fn a_drawn_chip_that_loses_its_title_mid_run_fails() {
 /// a hold only over `face=land`. A title out of step with the chip it hovers fails.
 #[test]
 fn a_past_or_held_title_is_judged_against_its_own_chips_face() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     use aterm_agent::supervise::mode_words::mode_words;
     let land = format!(
         "autopilot: land \u{2014} {} \u{b7} click: off",

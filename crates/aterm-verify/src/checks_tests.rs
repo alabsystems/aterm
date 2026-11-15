@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::scope::Scope;
 
 #[test]
 fn new_independent_exclusion_provenance_changes_still_pull_the_real_attestation() {
@@ -94,12 +93,8 @@ fn list_renders_each_checks_needs_from_the_tools_table() {
         "Apple silicon with Rosetta, limactl (verify provision --linux), network for the first \
          provision"
     );
-    // Census needs no tool; a partial clone's baseline import names the network.
-    let census = needs_of(Check::Census);
-    assert!(
-        census.starts_with("in a blobless partial clone") && census.contains("network"),
-        "{census}"
-    );
+    // Census needs no tool and no network.
+    assert_eq!(needs_of(Check::Census), "-");
     let table = list_table();
     assert!(!table.contains("brew"), "{table}");
     for spec in CHECKS {
@@ -111,7 +106,7 @@ fn list_renders_each_checks_needs_from_the_tools_table() {
         );
     }
     assert!(!table.lines().any(|l| l.starts_with("node ")), "{table}");
-    for check in [Check::Test, Check::WasmSmoke, Check::WasmGlue] {
+    for check in [Check::Test, Check::WasmGlue] {
         assert!(
             needs_of(check).contains("chrome-headless-shell (verify provision)"),
             "{}",
@@ -136,7 +131,6 @@ fn every_word_names_one_thing() {
     assert_eq!(lookup("release"), Some(Word::Release));
     assert_eq!(lookup("list"), Some(Word::List));
     assert_eq!(lookup("lint"), Some(Word::Check(Check::Lint)));
-    assert_eq!(lookup("wasm-smoke"), Some(Word::Check(Check::WasmSmoke)));
     assert_eq!(lookup("wasm-glue"), Some(Word::Check(Check::WasmGlue)));
     assert_eq!(lookup("browser"), Some(Word::Check(Check::Browser)));
     assert_eq!(lookup("contract-probe"), None);
@@ -160,8 +154,8 @@ fn a_dev_lint_of_a_selection_that_compiles_pulls_the_other_oses_cells() {
         [DEV.as_slice(), &[Check::Cells]].concat()
     );
     assert_eq!(
-        with(&[Check::Lint, Check::WasmSmoke], Check::Cells),
-        [Check::Lint, Check::Cells, Check::WasmSmoke],
+        with(&[Check::Lint, Check::WasmGlue], Check::Cells),
+        [Check::Lint, Check::Cells, Check::WasmGlue],
         "in CHECKS order"
     );
     assert!(
@@ -179,107 +173,11 @@ fn a_dev_lint_of_a_selection_that_compiles_pulls_the_other_oses_cells() {
     );
 }
 
+/// A release judges this tree's own shim and helper, which a dev run names only by hand.
+/// CONTROL: the dev set leaves it out.
 #[test]
-fn a_selection_holding_a_web_module_runs_its_replay_with_its_tests() {
-    use crate::changed::{Manifests, Member, Members, Replan, Selection, cone, select};
-    const DEPENDENTS: [(&str, &str); 7] = [
-        (
-            "aterm-types",
-            "aterm-grid aterm-core aterm-gui aterm-wasm aterm-gpu-web",
-        ),
-        (
-            "aterm-grid",
-            "aterm-core aterm-gui aterm-wasm aterm-gpu-web",
-        ),
-        ("aterm-core", "aterm-gui aterm-wasm aterm-gpu-web"),
-        ("aterm-gui", ""),
-        ("aterm-wasm", ""),
-        ("aterm-gpu-web", ""),
-        ("aterm-wasm-abi", ""),
-    ];
-    let members = Members::new(
-        DEPENDENTS
-            .iter()
-            .map(|(n, _)| Member {
-                name: n.to_string(),
-                dir: format!("crates/{n}"),
-                has_lib: true,
-            })
-            .collect(),
-    );
-    let manifests: Manifests = DEPENDENTS
-        .iter()
-        .map(|(n, _)| format!("crates/{n}"))
-        .collect();
-    let scope_after = |changed: &str| {
-        let dependents = |name: &str| {
-            let (_, users) = DEPENDENTS.iter().find(|(dep, _)| *dep == name)?;
-            Some(crate::changed::Reach {
-                links: users
-                    .split_whitespace()
-                    .chain([name])
-                    .map(String::from)
-                    .collect(),
-                ..crate::changed::Reach::default()
-            })
-        };
-        let sel = select(
-            &[format!("crates/{changed}/src/lib.rs")],
-            &std::collections::BTreeSet::new(),
-            &manifests,
-            &members,
-            &|| Some(Vec::new()),
-            &dependents,
-            &|_| Replan::Nothing,
-            &|_, _| false,
-            &std::collections::BTreeMap::new,
-        );
-        assert!(
-            matches!(sel, Selection::Narrowed { .. }),
-            "{changed}: {sel:?}"
-        );
-        cone("origin/main", &sel).0
-    };
-    let dev_after = |changed: &str| {
-        let scope = scope_after(changed);
-        with_pulled(&DEV, false, |p| scope.includes_crate(p))
-    };
-    for engine in ["aterm-grid", "aterm-core", "aterm-types", "aterm-wasm"] {
-        assert_eq!(
-            dev_after(engine),
-            [DEV.as_slice(), &[Check::WasmSmoke]].concat(),
-            "a change to {engine}"
-        );
-    }
-    assert_eq!(
-        dev_after("aterm-gui"),
-        DEV,
-        "no web module builds on aterm-gui"
-    );
-    let abi = scope_after("aterm-wasm-abi");
-    assert_eq!(
-        pulled(&DEV, |p| abi.includes_crate(p)),
-        [(Check::WasmSmoke, "aterm-wasm-abi")],
-        "the modules' host boundary, which they build on wasm32 alone"
-    );
-    let core = scope_after("aterm-core");
-    let holds = |p: &str| core.includes_crate(p);
-    assert_eq!(pulled(&DEV, holds), [(Check::WasmSmoke, "aterm-wasm")]);
-    assert_eq!(with_pulled(&[Check::Lint], false, holds), [Check::Lint]);
-    assert_eq!(
-        with_pulled(&[Check::Test, Check::WasmSmoke], false, holds),
-        [Check::Test, Check::WasmSmoke],
-        "named once"
-    );
-    let narrow = Scope::packages(&["aterm-core".to_string()]);
-    assert_eq!(with_pulled(&DEV, false, |p| narrow.includes_crate(p)), DEV);
-    assert_eq!(
-        pulled(&DEV, |p| p == "aterm-gpu" || p == "aterm-gpu-web"),
-        [(Check::WasmSmoke, "aterm-gpu-web")]
-    );
-    assert_eq!(
-        with_pulled(&RELEASE, true, |_| true),
-        RELEASE,
-        "release runs its set: the stock pin's wasm32 std is no release prerequisite"
-    );
+fn a_release_runs_the_trees_own_shim_and_helper() {
+    assert!(RELEASE_TREE.contains(&Check::CandidateShim));
+    assert!(RELEASE.contains(&Check::CandidateShim));
+    assert!(!DEV.contains(&Check::CandidateShim));
 }

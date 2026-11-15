@@ -250,6 +250,16 @@ fn worker_name(ctx: &crate::SessionCtx) -> Option<String> {
         .or_else(|| timeline.task().and_then(worker_label))
 }
 
+/// The first line of `ctx`'s session's task ([`crate::task_record::TaskRecord::line`]), read under
+/// its timeline's lock alone: a caller holds no terminal guard.
+pub(crate) fn task_line_of(ctx: &crate::SessionCtx) -> Option<String> {
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .task()
+        .and_then(|task| task.line.clone())
+}
+
 /// What `record`'s worker runs ([`crate::task_record::TaskRecord::worker_name`]: its agent, or a
 /// program worker's program) as one line of a label; `None` where it names neither.
 pub(crate) fn worker_label(record: &crate::task_record::TaskRecord) -> Option<String> {
@@ -619,7 +629,7 @@ impl App {
                     .need
                     .is_some()
             }),
-            in_fleet: crate::summarize::in_fleet(),
+            in_fleet: crate::summarize::in_fleet(self.proxy.as_ref()),
             any_window: self.frontmost_window.is_some(),
             summarize_block: self.summarize_start_block().map(|block| block.hint()),
         }
@@ -1200,8 +1210,9 @@ impl App {
     /// rows, `Go to <manager>`, the long-hold entry): the words the person can find on the strip
     /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, §6). A worker's one chip is the Workers
     /// chip, which reads this label, so while nothing it runs has titled its tab
-    /// ([`untitled_by_its_program`]: its shell titled it, or its title says nothing) what it runs
-    /// names it ([`worker_name`]): its agent, or a program worker's program.
+    /// ([`untitled_by_its_program`]: its shell titled it, or its title says nothing) its task's
+    /// first line names it ([`task_line_of`], tracker ST-02), and with none, what it runs
+    /// ([`worker_name`]): its agent, or a program worker's program.
     pub(crate) fn tab_label_of_session(&self, session: u64) -> String {
         let clip = |t: &str| label_line(title_without_agent_glyph(t));
         if let Some(label) = self.named_label_of_session(session) {
@@ -1213,24 +1224,31 @@ impl App {
             let rung = |t: &aterm_core::terminal::Terminal| {
                 use crate::cwd_native::ReportedCwd as _;
                 let cwd = t.native_working_directory();
+                let untitled = untitled_by_its_program(t);
+                // No line here: it is read below, once the guard is gone.
                 let title = crate::app_tabs::resolved_terminal_title_rung(
                     None,
                     title_without_agent_glyph(t.title()),
+                    untitled,
+                    None,
                     cwd.as_deref(),
                 );
-                (title, untitled_by_its_program(t))
+                (title, untitled)
             };
             let (live, untitled) = match s.term.try_lock() {
                 Ok(t) => rung(&t),
                 Err(std::sync::TryLockError::Poisoned(p)) => rung(&p.into_inner()),
                 Err(std::sync::TryLockError::WouldBlock) => self
-                    .windows
-                    .values()
-                    .find_map(|ws| ws.tab_title_cache.get(&session))
+                    .captured_title_of_session(session)
                     .map_or((None, false), |cached| {
                         (Some(cached.title.clone()), cached.untitled)
                     }),
             };
+            // While nothing it runs titles its tab, its task's first line names it, as on the
+            // strip ([`crate::app_tabs::resolved_terminal_title_rung`]).
+            if untitled && let Some(line) = task_line_of(&s.ctx).as_deref().and_then(label_line) {
+                return line;
+            }
             // A shell titles its tab by its folder and by each line it starts, and a worker's
             // line opens with environment words or its program's path and words, and a title that
             // says nothing leaves its folder: what it runs names the worker until that titles the
@@ -1265,6 +1283,18 @@ impl App {
             Some(sid) => aterm_messages::presence::short_sid(sid.as_str()),
             None => format!("tab {session}"),
         }
+    }
+
+    /// `session`'s terminal rungs as the strip last read them (a window's `tab_title_cache`), for
+    /// a reader that finds its terminal busy. A parked worker's tab is among its window's tabs, so
+    /// the strip's refill and the drift path read it too. `None` before either read it.
+    pub(crate) fn captured_title_of_session(
+        &self,
+        session: u64,
+    ) -> Option<&crate::app_tabs::CapturedTitle> {
+        self.windows
+            .values()
+            .find_map(|ws| ws.tab_title_cache.get(&session))
     }
 
     fn tab_position_of_session(&self, session: u64) -> Option<usize> {
@@ -1363,32 +1393,14 @@ impl App {
         }
     }
 
-    /// Open a file this menu wrote as a Markdown tab on `wid`, through the admission every Open
-    /// Markdown… takes; the path is kept for the tests (`last_menu_document`).
+    /// Open a file this menu wrote as a Markdown tab on `wid`, through the person's open every
+    /// File ▸ Open takes, which shows on `wid` why it did not open
+    /// ([`Self::open_path_for_person`]); the path is kept for the tests (`last_menu_document`).
+    /// `true` while `wid` stands to show the document or why it did not open.
     pub(crate) fn open_menu_document(&mut self, wid: WindowId, path: PathBuf) -> bool {
         self.last_menu_document = Some(path.clone());
-        let uri = match crate::native_document_host::path_to_file_uri(&path) {
-            Ok(uri) => uri,
-            Err(e) => {
-                self.menu_failure(
-                    "document",
-                    "Couldn't open the document",
-                    &[&e.to_string(), &path.display().to_string()],
-                );
-                return false;
-            }
-        };
-        if let Err(e) =
-            self.request_document_tab_in_window(wid, crate::native_app::AppKind::Markdown, &uri)
-        {
-            self.menu_failure(
-                "document",
-                "Couldn't open the document",
-                &[&e.to_string(), &path.display().to_string()],
-            );
-            return false;
-        }
-        true
+        let _ = self.open_path_for_person(wid, crate::native_app::AppKind::Markdown, &path, None);
+        self.windows.contains_key(&wid)
     }
 
     fn menu_failure(&mut self, verb: &str, title: &str, lines: &[&str]) {

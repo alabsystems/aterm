@@ -112,6 +112,7 @@ impl Fixture {
             run_attempt: Some(run),
             shared: shared_renewal::Effects::default(),
             hosts: 0,
+            tokens_here: |_, _, _, _| None,
         };
         spawn_row_renewal(
             Cli::Claude,

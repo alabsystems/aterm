@@ -255,12 +255,20 @@ impl From<io::Error> for Refused {
     }
 }
 
-/// The capability an owner write needs (§5, "In Rust"): an explicit verb of `aterm file`, an
-/// explicit commit of a face and the importer are what should make one, and harness and
-/// observer code should reach only [`File::state_mine`]. Nothing enforces that yet: the
-/// constructors are public, so any crate that depends on this one can make an owner act.
-/// Restricting who constructs one is SF-07's (authority).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The capability an owner's word to the outbox needs (§5, "In Rust"): [`File::write`] and
+/// [`File::requeue`] queue an owner write with one, and [`File::drop_intent`] drops a queued or
+/// held intent with one. Every other intent is a Mac's statement of its own row
+/// ([`File::state_mine`]), which harness and observer code makes with none.
+///
+/// Who reaches what is held by clippy.toml's `disallowed-methods` rows, a lint and not the type
+/// system: a call passes where its one statement carries `#[expect(clippy::disallowed_methods,
+/// reason = …)]` naming the explicit `aterm file` verb it is. [`OwnerAct::verb`] is called by
+/// aterm-db's `file::write::verb` (which `aterm file`'s own entry alone runs, under a row of
+/// its own) and by this crate's `outbox drop`; [`owner_act_for_test`] by each crate's one test
+/// helper; and the verbs that settle or remove a queued intent without one ([`File::claim`],
+/// [`File::mark_done`], [`File::dequeue`]) by aterm-db's publisher alone. It is not `Clone`,
+/// so each verb makes its own. The lab importer writes the registry itself and makes none.
+#[derive(Debug)]
 pub struct OwnerAct {
     by: String,
     session: Option<String>,
@@ -283,32 +291,22 @@ impl OwnerAct {
     }
 
     /// A person's or a program's explicit `aterm file` verb. `by` is who says they ran it, a
-    /// word `[a-z][a-z0-9-]{0,19}`; `session` the aterm session it ran in.
+    /// word `[a-z][a-z0-9-]{0,19}`; `session` the aterm session it ran in. `None` where either
+    /// breaks its grammar.
     #[must_use]
     pub fn verb(by: &str, session: Option<&str>) -> Option<Self> {
         Self::new(by, session)
     }
+}
 
-    /// An explicit commit of a face.
-    #[must_use]
-    pub fn commit(by: &str, session: Option<&str>) -> Option<Self> {
-        Self::new(by, session)
-    }
-
-    /// The lab importer.
-    #[must_use]
-    pub fn importer() -> Self {
-        Self {
-            by: "importer".to_owned(),
-            session: None,
-        }
-    }
-
-    /// The word the intent's `by` says.
-    #[must_use]
-    pub fn by(&self) -> &str {
-        &self.by
-    }
+/// An owner act for a test, made as [`OwnerAct::verb`] makes one. A debug-only seam with a
+/// clippy.toml row of its own: `verify census` (`seam-caller`) fails a mention of it in code a
+/// release build compiles, and the row fails one in code a debug build alone compiles (a dev
+/// seam) and every test call but each crate's one helper.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn owner_act_for_test(by: &str, session: Option<&str>) -> Option<OwnerAct> {
+    OwnerAct::new(by, session)
 }
 
 fn edit_json(edit: &Edit) -> Value {
@@ -877,6 +875,14 @@ mod write {
     fn well_formed(draft: &Draft, mine: bool) -> Result<(), Refused> {
         let digest = |text: &str| aterm_codec::hex::is_lower(text, 64);
         if let Some(revert) = &draft.revert {
+            // A revert names no key, so a reader takes it for an owner's write
+            // (`Intent::mine`): only an owner act asks for one.
+            if mine {
+                return Err(Refused::Malformed(
+                    "a Mac's statement of its own row reverts nothing: a revert is an owner's \
+                     write",
+                ));
+            }
             if !digest(revert) || !draft.edits.is_empty() || draft.born {
                 return Err(Refused::Malformed(
                     "a revert names one operation and holds no edit",
@@ -956,7 +962,9 @@ mod write {
             self.file.mark_done_locked(&self.id, mark, now_ms)
         }
 
-        /// Hold the claimed intent under the claim, and release it.
+        /// Hold the claimed intent under the claim, and release it: durable in the held list
+        /// first, then out of the outbox. It is never applied, and leaves only by a person's
+        /// word ([`File::drop_intent`], [`File::requeue`]).
         ///
         /// # Errors
         /// A local file could not be read or written.
@@ -1083,7 +1091,8 @@ mod write {
                     earlier.intent.edits.retain(|edit| !writes(edit));
                     held_changed |= earlier.intent.edits.len() != before;
                 }
-                held.read.retain(|held| !held.intent.edits.is_empty());
+                held.read
+                    .retain(|held| !held.intent.edits.is_empty() || held.intent.revert.is_some());
             }
             let accepted = self.put_accepted(intent, &mut queued, &held)?;
             if held_changed {
@@ -1116,7 +1125,8 @@ mod write {
         /// the signing Mac's uuid.
         ///
         /// # Errors
-        /// As [`Self::write`], or a key does not end `@self`.
+        /// As [`Self::write`], or a key does not end `@self`, or it asks for a revert, which is
+        /// an owner's write.
         pub fn state_mine(&self, by: &str, draft: Draft, now_ms: u64) -> Result<Accepted, Refused> {
             if !crate::name::part(by) {
                 return Err(Refused::Malformed("`by` is one word [a-z][a-z0-9-]{0,19}"));
@@ -1216,25 +1226,15 @@ mod write {
             Ok(true)
         }
 
-        /// Hold the queued intent `id`: durable in the held list first, then out of the outbox.
-        /// It is never applied, and leaves only by a person's word ([`Self::drop_intent`],
-        /// [`Self::requeue`]). `false` where no such intent is queued.
-        ///
-        /// # Errors
-        /// A local file could not be read or written.
-        pub fn hold(&self, id: &str, why: &str, now_ms: u64) -> io::Result<bool> {
-            let _lock = self.outbox_lock()?;
-            self.hold_locked(id, why, now_ms)
-        }
-
-        /// A person's word drops the intent `id`, queued or held. One a record already carries
-        /// (its marker is written) is not dropped: [`Dropped::Published`]. A publisher signing
-        /// it holds a [`Claim`], which this waits for.
+        /// A person's word drops the intent `id`, queued or held, under the [`OwnerAct`] of the
+        /// explicit verb that says so. One a record already carries (its marker is written) is
+        /// not dropped: [`Dropped::Published`]. A publisher signing it holds a [`Claim`], which
+        /// this waits for.
         ///
         /// # Errors
         /// A local file could not be read or written, or the publisher's claim outlasted the
         /// wait for the outbox lock.
-        pub fn drop_intent(&self, id: &str) -> io::Result<Dropped> {
+        pub fn drop_intent(&self, _act: &OwnerAct, id: &str) -> io::Result<Dropped> {
             let _lock = self.outbox_lock()?;
             let (mut queued, mut held, done) = self.stored()?;
             if done.read.iter().any(|done| done.intent.id == id) {

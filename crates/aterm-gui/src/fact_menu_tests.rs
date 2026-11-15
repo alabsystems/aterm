@@ -66,6 +66,7 @@ fn unavailable_manual_admission_disables_only_signin_choices_and_next() {
         &roster,
         &state,
         &enrolled,
+        None,
         true,
         None,
         None,
@@ -1066,6 +1067,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             &roster,
             &state,
             &enrolled,
+            None,
             true,
             None,
             None,
@@ -1083,6 +1085,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
         &roster,
         &observed,
         &enrolled,
+        None,
         true,
         None,
         None,
@@ -1138,6 +1141,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
         &roster,
         &accounts::State::default(),
         &enrolled,
+        None,
         true,
         Some("main"),
         None,
@@ -1181,6 +1185,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             &roster,
             &state,
             &enrolled,
+            None,
             true,
             session,
             None,
@@ -1228,6 +1233,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             &roster,
             &state,
             &enrolled,
+            None,
             true,
             Some("main"),
             None,
@@ -1288,6 +1294,7 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             &roster,
             &state,
             &enrolled,
+            None,
             true,
             label,
             email,
@@ -1360,6 +1367,7 @@ fn quota_rows_keep_only_time_admitted_post_refill_fallbacks() {
             &roster,
             state,
             &enrolled,
+            None,
             true,
             Some("main"),
             None,
@@ -1484,6 +1492,7 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
             &roster,
             &state,
             &enrolled,
+            None,
             true,
             None,
             email,
@@ -1557,16 +1566,16 @@ fn account_menu_shows_the_week_and_rotation_accounts() {
             AccountMenuRow {
                 account: AccountLabel::new("m27-2").unwrap(),
                 name: "m27-2".into(),
-                trail: "not signed in".into(),
-                spoken: "m27-2, not signed in, choosing it signs it in".into(),
+                trail: "signed out".into(),
+                spoken: "m27-2, signed out on this Mac, choosing it signs it in".into(),
                 active: false,
                 enabled: true,
             },
             AccountMenuRow {
                 account: AccountLabel::new("m27-3").unwrap(),
                 name: "m27-3".into(),
-                trail: "not signed in".into(),
-                spoken: "m27-3, not signed in, choosing it signs it in".into(),
+                trail: "signed out".into(),
+                spoken: "m27-3, signed out on this Mac, choosing it signs it in".into(),
                 active: false,
                 enabled: true,
             },
@@ -1750,6 +1759,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
         &roster,
         &state,
         &enrolled,
+        None,
         true,
         Some("m15-2"),
         Some("m15-2@example.test"),
@@ -1795,10 +1805,11 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
             .iter()
             .map(|row| row.trail.as_str())
             .collect::<Vec<_>>(),
+        // A login never made here and one signed out here are one state: no login here.
         [
             "out",
-            "not signed in",
-            "not signed in",
+            "signed out",
+            "signed out",
             "signed out",
             "signed out"
         ],
@@ -1819,6 +1830,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
         &roster,
         &state,
         &enrolled,
+        None,
         false,
         Some("m15-2"),
         Some("m15-2@example.test"),
@@ -1939,13 +1951,13 @@ fn a_default_rows_menu_entry_follows_its_login_file() {
         )
     };
     let gone = main_row();
-    assert_eq!(gone.trail, "not signed in", "{gone:?}");
+    assert_eq!(gone.trail, "signed out", "{gone:?}");
     assert!(!gone.enabled, "{gone:?}");
     assert!(select().is_err(), "a row not signed in here is not pinned");
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
     let back = main_row();
-    assert_ne!(back.trail, "not signed in", "{back:?}");
+    assert_ne!(back.trail, "signed out", "{back:?}");
     assert!(back.enabled, "{back:?}");
     assert!(
         matches!(select(), Ok(PinSelection::Pinned)),
@@ -2349,6 +2361,7 @@ fn no_row_reads_full_without_a_figure() {
         &roster,
         &state,
         &enrolled,
+        None,
         true,
         None,
         None,
@@ -2356,7 +2369,7 @@ fn no_row_reads_full_without_a_figure() {
         NOW,
     );
     let trails: Vec<&str> = rows.iter().map(|row| row.trail.as_str()).collect();
-    assert_eq!(trails, ["not read", "not signed in", "not read"]);
+    assert_eq!(trails, ["not read", "signed out", "not read"]);
     for row in &rows {
         assert!(
             !row.standing()
@@ -2373,13 +2386,364 @@ fn no_row_reads_full_without_a_figure() {
     assert_eq!(signs_in, [false, true, false]);
 }
 
+/// THE CARD'S ITEMS SAY AN ACCOUNT WITH NO FIGURE AS LINE E DOES: from one roster, state and
+/// enrolled set (`quota_scenes::case_e`: `pool1` never read, `pool2` read before a reset that has
+/// passed), and again with `pool2` signed out and with it never signed in here, each of those
+/// two also holding a reading of 100 another Mac published with its reset ahead, each account
+/// line E names with no figure trails, under `Switch this Mac to`, exactly the words line E says
+/// after its narrow name (`QuotaView::said`: `Why::brief`, or the login's `Figure::words`), and
+/// between them the states read `not read` and `signed out`: a login signed out here and one
+/// never made are one state, no login here (`Figure::login`), in one word, said whatever was
+/// read of its week. Negative controls: line E's words of 2026-11-12 said `no login` beside a
+/// narrow name where the card said `not signed in` for a login never made; and the card's
+/// items of 2026-11-13 said a reading of 100 before the login (`0% left`) where line E, the
+/// row's title and its speech said `signed out`.
+#[test]
+fn the_cards_items_say_a_week_with_no_figure_as_line_e_does() {
+    use aterm_agent::harness::accounts;
+    use aterm_agent::harness::quota_scenes::{Fx, case_e};
+    use aterm_agent::harness::quota_view::{Names, QuotaView};
+    let signed_out = |fx: &mut Fx| {
+        let _ = accounts::note_auth(&mut fx.state, "pool2", accounts::Auth::SignedOut, fx.now);
+    };
+    let never_signed_in = |fx: &mut Fx| {
+        fx.enrolled.remove("pool2");
+    };
+    // Another Mac's reading of `pool2`'s week, synced: 100% used, its reset still ahead.
+    let read_spent_elsewhere = |fx: &mut Fx| {
+        let now = fx.now;
+        fx.state
+            .accounts
+            .entry("pool2".into())
+            .or_default()
+            .windows
+            .insert(
+                accounts::WEEK_LIMIT.into(),
+                accounts::WindowFig {
+                    pct_x10: 1000,
+                    reset: now + 86_400,
+                    at: now - 60,
+                    by: "m22".into(),
+                    source: accounts::SOURCE_TAP.into(),
+                    epoch_at: None,
+                },
+            );
+    };
+    let variants: [&[fn(&mut Fx)]; 5] = [
+        &[],
+        &[signed_out],
+        &[never_signed_in],
+        &[signed_out, read_spent_elsewhere],
+        &[never_signed_in, read_spent_elsewhere],
+    ];
+    let mut said = std::collections::BTreeSet::new();
+    for vary in variants {
+        let mut fx = case_e();
+        for step in vary {
+            step(&mut fx);
+        }
+        let view = fx.outlook().quota("main", None, true);
+        let rows = account_menu_rows_from(
+            &fx.roster,
+            &fx.state,
+            &fx.enrolled,
+            None,
+            true,
+            Some("main"),
+            None,
+            SessionWeek::default(),
+            fx.now,
+        );
+        let unread: Vec<_> = view.named.iter().filter(|n| !n.has_figure()).collect();
+        assert_eq!(unread.len(), 2, "{:?}", view.named);
+        for n in unread {
+            let item = rows
+                .iter()
+                .find(|row| row.account.as_str() == n.label)
+                .unwrap_or_else(|| panic!("an item for {}", n.label));
+            let glass = QuotaView::said(n, Names::Local);
+            assert_eq!(
+                item.trail, glass,
+                "{}: {:?} {:?}",
+                n.label, n.figure, n.unread
+            );
+            said.insert(glass);
+        }
+        if !vary.is_empty() {
+            let pool2 = rows
+                .iter()
+                .find(|row| row.account.as_str() == "pool2")
+                .expect("an item for pool2");
+            assert_eq!(pool2.trail, "signed out", "{pool2:?}");
+            assert!(!pool2.spoken.contains("percent"), "{pool2:?}");
+        }
+    }
+    assert_eq!(
+        said.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["not read", "signed out"]
+    );
+}
+
+/// THIS TAB'S OWN ITEM SAYS ITS WEEK, AS LINE E'S LEAD DOES: in `quota_scenes::case_e`, with
+/// the tab's own account `main` signed out here and again never signed in here, and the
+/// footer's own reading of its week (86% used, read now) handed to both, line E's lead says its
+/// week (`RowOutlook::week_figure`: the pane's session is the evidence that its account runs),
+/// and its item under `Switch this Mac to` trails the same words, while a choice of it still
+/// signs it in. Negative control: the card's items of 2026-11-13 said `signed out` for it, its
+/// login before its week, where line E's lead said `14% left`.
+#[test]
+fn this_tabs_own_item_says_its_week_as_line_es_lead_does() {
+    use aterm_agent::harness::accounts;
+    use aterm_agent::harness::profile::WeeklyFigure;
+    use aterm_agent::harness::quota_scenes::{Fx, SAT7, case_e};
+    use aterm_agent::harness::quota_view::{Names, QuotaView};
+    let signed_out = |fx: &mut Fx| {
+        let _ = accounts::note_auth(&mut fx.state, "main", accounts::Auth::SignedOut, fx.now);
+    };
+    let never_signed_in = |fx: &mut Fx| {
+        fx.enrolled.remove("main");
+    };
+    let variants: [fn(&mut Fx); 2] = [signed_out, never_signed_in];
+    for vary in variants {
+        let mut fx = case_e();
+        vary(&mut fx);
+        let own = WeeklyFigure {
+            used_x10: 860,
+            resets_at: SAT7,
+            at: fx.now,
+        };
+        let view = fx
+            .outlook()
+            .quota("main", Some(Figure::of_weekly(&own, fx.now)), true);
+        let lead = view
+            .named
+            .iter()
+            .find(|n| n.this_tab)
+            .expect("line E's lead");
+        let glass = QuotaView::said(lead, Names::Local);
+        assert_eq!(glass, "14% left", "{lead:?}");
+        let rows = account_menu_rows_from(
+            &fx.roster,
+            &fx.state,
+            &fx.enrolled,
+            None,
+            true,
+            Some("main"),
+            None,
+            SessionWeek {
+                label: None,
+                figure: Some(own),
+                said: None,
+            },
+            fx.now,
+        );
+        let item = rows
+            .iter()
+            .find(|row| row.account.as_str() == "main")
+            .expect("an item for main");
+        assert_eq!(item.trail, glass, "{item:?}");
+        assert!(
+            item.spoken
+                .contains("14 percent left, choosing it signs it in"),
+            "{item:?}"
+        );
+    }
+}
+
+/// THE CARD'S ITEMS SAY `signing in` AS LINE E DOES: in `quota_scenes::case_e` with `pool2`
+/// signed out here, and again never signed in here, each also holding m22's reading of 100, and
+/// its sign-in running on this Mac (`PoolRead::signing_in`), `pool2`'s item under `Switch this
+/// Mac to` trails line E's words for it (`QuotaView::said`: `signing in`), is heard exactly as
+/// line E hears it (`Figure::spoken`), and is not told that choosing it signs it in, since its
+/// sign-in runs; `pool1` still says `not read`. This tab's own item says its week while its own
+/// sign-in runs, as line E's lead does. Negative control: the same rows with no running sign-in
+/// named trail `signed out`, which is not line E's word, as the card's items of 2026-11-13 did.
+#[test]
+fn the_cards_items_say_signing_in_as_line_e_does() {
+    use aterm_agent::harness::accounts;
+    use aterm_agent::harness::outlook::{Inputs, outlook};
+    use aterm_agent::harness::profile::WeeklyFigure;
+    use aterm_agent::harness::quota_scenes::{Fx, SAT7, case_e};
+    use aterm_agent::harness::quota_view::{Names, QuotaView};
+    let signed_out = |fx: &mut Fx| {
+        let _ = accounts::note_auth(&mut fx.state, "pool2", accounts::Auth::SignedOut, fx.now);
+    };
+    let never_signed_in = |fx: &mut Fx| {
+        fx.enrolled.remove("pool2");
+    };
+    // Another Mac's reading of `pool2`'s week, synced: 100% used, its reset still ahead.
+    let read_spent_elsewhere = |fx: &mut Fx| {
+        let now = fx.now;
+        fx.state
+            .accounts
+            .entry("pool2".into())
+            .or_default()
+            .windows
+            .insert(
+                accounts::WEEK_LIMIT.into(),
+                accounts::WindowFig {
+                    pct_x10: 1000,
+                    reset: now + 86_400,
+                    at: now - 60,
+                    by: "m22".into(),
+                    source: accounts::SOURCE_TAP.into(),
+                    epoch_at: None,
+                },
+            );
+    };
+    let items = |fx: &Fx, signing_in: Option<&str>, week: SessionWeek| {
+        account_menu_rows_from(
+            &fx.roster,
+            &fx.state,
+            &fx.enrolled,
+            signing_in,
+            true,
+            Some("main"),
+            None,
+            week,
+            fx.now,
+        )
+    };
+    let item = |rows: &[AccountMenuRow], label: &str| {
+        rows.iter()
+            .find(|row| row.account.as_str() == label)
+            .cloned()
+            .unwrap_or_else(|| panic!("an item for {label}"))
+    };
+    let variants: [&[fn(&mut Fx)]; 4] = [
+        &[signed_out],
+        &[never_signed_in],
+        &[signed_out, read_spent_elsewhere],
+        &[never_signed_in, read_spent_elsewhere],
+    ];
+    for vary in variants {
+        let mut fx = case_e();
+        for step in vary {
+            step(&mut fx);
+        }
+        let view = outlook(&Inputs {
+            signing_in: Some("pool2"),
+            ..fx.inputs()
+        })
+        .quota("main", None, true);
+        let named = view
+            .named
+            .iter()
+            .find(|n| n.label == "pool2")
+            .expect("line E names pool2");
+        let glass = QuotaView::said(named, Names::Local);
+        assert_eq!(glass, "signing in", "{named:?}");
+        let rows = items(&fx, Some("pool2"), SessionWeek::default());
+        let pool2 = item(&rows, "pool2");
+        assert_eq!(pool2.trail, glass, "{pool2:?}");
+        assert_eq!(
+            pool2.spoken,
+            format!("{}, signing in on this Mac", pool2.name),
+            "{pool2:?}"
+        );
+        assert_eq!(item(&rows, "pool1").trail, "not read");
+        let unnamed = item(&items(&fx, None, SessionWeek::default()), "pool2");
+        assert_eq!(unnamed.trail, "signed out", "NEGATIVE CONTROL: {unnamed:?}");
+        assert_ne!(unnamed.trail, glass);
+    }
+    // This tab's own account, signed out here while its sign-in runs: its item says its week,
+    // as line E's lead does, never its login.
+    let mut fx = case_e();
+    let _ = accounts::note_auth(&mut fx.state, "main", accounts::Auth::SignedOut, fx.now);
+    let own = WeeklyFigure {
+        used_x10: 860,
+        resets_at: SAT7,
+        at: fx.now,
+    };
+    let view = outlook(&Inputs {
+        signing_in: Some("main"),
+        ..fx.inputs()
+    })
+    .quota("main", Some(Figure::of_weekly(&own, fx.now)), true);
+    let lead = view
+        .named
+        .iter()
+        .find(|n| n.this_tab)
+        .expect("line E's lead");
+    let glass = QuotaView::said(lead, Names::Local);
+    assert_eq!(glass, "14% left", "{lead:?}");
+    let main = item(
+        &items(
+            &fx,
+            Some("main"),
+            SessionWeek {
+                label: None,
+                figure: Some(own),
+                said: None,
+            },
+        ),
+        "main",
+    );
+    assert_eq!(main.trail, glass, "{main:?}");
+    assert!(!main.spoken.contains("signing in"), "{main:?}");
+}
+
+/// A POOL'S READ NAMES THE SIGN-IN ITS STORE RUNS: a Kimi pool's row never signed in here
+/// trails `signing in` while this Mac's record names its sign-in (`Store::signing_in`, which
+/// `PoolRead::load` reads once for the items and the card), and `signed out` once that record's
+/// sign-in ends. Negative control: the read before the record says `signed out`, as a
+/// `PoolRead` that read no record would still say while the record is held.
+#[cfg(unix)]
+#[test]
+fn a_pool_read_names_the_sign_in_its_store_runs() {
+    use aterm_agent::harness::accounts::{Cli, Store};
+    const NOW: i64 = 1_792_660_000;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-pool-menu-signing-")
+        .tempdir()
+        .expect("tempdir");
+    let root = dir.path();
+    let (home, config, state) = (root.join("home"), root.join("config"), root.join("state"));
+    for d in [&home, &config, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let aterm_toml = config.join("aterm.toml");
+    crate::test_scratch::write_config(&aterm_toml, "[fleet]\nmachine = \"m16\"\n");
+    let login = home.join(".aterm/logins/kimi/kimi-1");
+    std::fs::write(
+        config.join("accounts-kimi.toml"),
+        format!(
+            "[[account]]\nlabel = \"kimi-1\"\nclass = \"dedicated\"\ndir = {}\n\
+             email = \"kimi-one@example.com\"\nregion = \"global\"\n",
+            crate::test_host::toml(&login)
+        ),
+    )
+    .unwrap();
+    let trail = || {
+        let rows = pool_menu_rows(
+            Cli::Kimi,
+            (&aterm_toml, &state, Some(home.as_path())),
+            (None, None),
+            SessionWeek::default(),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows[0].trail.clone()
+    };
+    assert_eq!(trail(), "signed out", "NEGATIVE CONTROL: no sign-in runs");
+    let store = Store::at_for(&state, Cli::Kimi, &home);
+    std::fs::create_dir_all(store.shared_dir()).unwrap();
+    let running = store
+        .signing_in_fixture("kimi-1", NOW)
+        .expect("the running record is written");
+    assert_eq!(trail(), "signing in");
+    drop(running);
+    assert_eq!(trail(), "signed out", "its end ends the record");
+}
+
 /// EVERY GLASS WEEK FIGURE SAYS LEFT (owner, 2026-11-09, asked "used or left": "left
 /// everywhere"; `harness::left`). Over Account menu rows of every condition and figure (a wall,
-/// signed out and not signed in each with and without a sign-in a choice starts, a fresh
+/// signed out here and never signed in here, each with and without a sign-in a choice starts, a fresh
 /// reading, an aged one, one of 99.5% used and one of 100%, a warned week, and none), each
 /// trail says what is left of its week (`61% left`, an older reading's bound `≤62% left`, a
 /// wall's `out`, `0% left` only where a reading said 100) or the condition that stands before
-/// any figure (`signed out`, `not signed in`, `not read`), each spoken row says it in words
+/// any figure (`signed out`, `not read`), each spoken row says it in words
 /// (`at most 62 percent left`), and no row says `used`. Negative control: the rows' words of 2026-11-07 to 2026-11-09
 /// (`row_figure`'s `39% used`, an aged one's `≥38% used`, a read 100's `100% used (limited)`)
 /// fail it.
@@ -2468,6 +2832,7 @@ fn every_glass_week_figure_says_left() {
             &roster,
             &state,
             &enrolled,
+            None,
             auto_login,
             None,
             None,
@@ -2496,18 +2861,22 @@ fn every_glass_week_figure_says_left() {
             said("nearly", "1% left", "1 percent left"),
             said("spent", "0% left", "0 percent left"),
             said("warned", "30% left", "30 percent left"),
-            said("gone", "signed out", "signed out, choosing it signs it in"),
-            said("gone-quiet", "signed out", "signed out"),
+            said(
+                "gone",
+                "signed out",
+                "signed out on this Mac, choosing it signs it in"
+            ),
+            said("gone-quiet", "signed out", "signed out on this Mac"),
             said(
                 "away",
-                "not signed in",
-                "not signed in, choosing it signs it in"
+                "signed out",
+                "signed out on this Mac, choosing it signs it in"
             ),
-            said("away-quiet", "not signed in", "not signed in"),
+            said("away-quiet", "signed out", "signed out on this Mac"),
             said(
                 "away-unread",
-                "not signed in",
-                "not signed in, choosing it signs it in"
+                "signed out",
+                "signed out on this Mac, choosing it signs it in"
             ),
             said("unread", "not read", "not read"),
         ]

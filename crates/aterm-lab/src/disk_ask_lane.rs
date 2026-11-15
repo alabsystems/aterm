@@ -404,7 +404,7 @@ const WOULD_FREE: &str = "would free ";
 const REPORT_HEADS: [&str; 2] = ["disk-free filling:", "disk-free owner-only:"];
 
 /// What starts a disk worker's report, as Autopilot Land reads a defense.
-const NOTHING_LEFT: &str = aterm_agent::supervise::policy::needs::NOTHING_LEFT;
+const NOTHING_LEFT: &str = alab_policy::needs::NOTHING_LEFT;
 
 /// `[harness] human_grace_s` in a drafted scenario's lab ([`Scenario::drafted`]): the supervisor
 /// keeps its hands off a tab for an hour after a person's keystroke, the knob's least power, as an

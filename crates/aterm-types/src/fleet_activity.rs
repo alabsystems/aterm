@@ -101,18 +101,21 @@ pub enum Plain {
     Hold,
     /// Closing a session.
     Close,
+    /// Changing an existing session's settings.
+    Configure,
     /// Starting a worker or a shell: a new tab.
     NewJob,
 }
 
 impl Plain {
     /// Every type, lightest first.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Read,
         Self::Message,
         Self::Typed,
         Self::Hold,
         Self::Close,
+        Self::Configure,
         Self::NewJob,
     ];
 
@@ -125,6 +128,7 @@ impl Plain {
             Self::Typed => "typed",
             Self::Hold => "hold",
             Self::Close => "close",
+            Self::Configure => "configure",
             Self::NewJob => "new-job",
         }
     }
@@ -148,6 +152,7 @@ impl Plain {
             (Self::Hold, false) => "holds",
             (Self::Close, true) => "close",
             (Self::Close, false) => "closes",
+            (Self::Configure, _) => "settings changes",
             (Self::NewJob, true) => "new job",
             (Self::NewJob, false) => "new jobs",
         }
@@ -170,6 +175,7 @@ impl Plain {
             // anything, and both need Read and Write.
             DriveKind::Hold | DriveKind::Claim => Some(Self::Hold),
             DriveKind::Close => Some(Self::Close),
+            DriveKind::Configure => Some(Self::Configure),
             DriveKind::Spawn => Some(Self::NewJob),
         }
     }
@@ -223,6 +229,11 @@ pub fn kind_of_request(selected: bool, verb: &str, rest: &str) -> Option<DriveKi
             "key" => DriveKind::Key,
             "send" => DriveKind::Send,
             "close" => DriveKind::Close,
+            "meta" if rest.trim().is_empty() => DriveKind::Read,
+            "meta" if crate::agent_settings::autopilot_write(rest) => DriveKind::Configure,
+            "agent" if crate::agent_settings::Selection::parse(rest).is_ok() => {
+                DriveKind::Configure
+            }
             _ => return None,
         }
     } else {

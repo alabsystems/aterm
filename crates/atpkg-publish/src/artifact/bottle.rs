@@ -950,6 +950,7 @@ pub fn pack_bottle_with(
     let mut ctx = ctx.clone();
     if let Some(key) = &request.key {
         ctx.identity.key.clone_from(key);
+        ctx.identity.store = None;
     }
     let ctx = &ctx;
     let deferred_reference_signing = request.signing == Signing::MachineKey

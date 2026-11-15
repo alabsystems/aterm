@@ -189,3 +189,15 @@ fn survey_refuses_final_aliases_directories_and_fifos() {
     std::fs::write(registry.join("valid.json"), current_record(0)).unwrap();
     assert_eq!(survey(dir.path()).len(), 1);
 }
+
+/// The registry a cutter writes its record in ([`crate::harness::cli::harness_state_dir`]) is
+/// the one agh reads to prove a cut's process tree ([`aterm_ctl::release_holder::registry`]).
+#[test]
+fn the_cutters_registry_is_the_one_agh_reads() {
+    assert_eq!(
+        crate::harness::cli::harness_state_dir()
+            .ok()
+            .map(|state| state.join(DIRECTORY)),
+        aterm_ctl::release_holder::registry()
+    );
+}

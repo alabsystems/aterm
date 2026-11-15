@@ -6,7 +6,7 @@ use super::*;
 fn invocation() -> Invocation {
     Invocation {
         socket: "/private/native-account.sock".into(),
-        session: "s-account".into(),
+        session: "t000acc0vnt".into(),
         binding: Binding {
             id: "a".repeat(32),
             capability: "b".repeat(64),

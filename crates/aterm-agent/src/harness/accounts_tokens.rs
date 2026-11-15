@@ -11,14 +11,17 @@
 //!   of it. Its own file, since an older build that rewrites `state.json` drops fields it does not
 //!   know.
 //! - **The states** ([`TokenState`]) are computed on each read from the vault's standing
-//!   ([`claude_token::standing`]), the table's own facts and the clock, in §5.1's order.
-//! - **The verb** ([`run`]) mints a token for one account in one step: for a person at a terminal
-//!   only; under a per-account lock (never `signin.lock`); after a preflight (a seat in the
-//!   vault's log, no route in the environment, macOS) and the refusal of a bare run while a token
-//!   here is in use or on its way. Then it runs the capture ([`super::setup_token`]), writes both
-//!   entries as a member write, records the row and journals `token-minted`. A busy vault after
-//!   the mint never throws the token away: the write waits, bounded by the hang detector, then
-//!   lands in the vault's waiting writes ("not yet in vault"); Ctrl-C lands it there at once.
+//!   ([`claude_token::standing`], this Mac's refusal of the token beside it), the table's own
+//!   facts and the clock, in §5.1's order.
+//! - **The verb** ([`run`]) mints a token for one account in one step: only through aterm's
+//!   opener, in aterm's own sign-in window at this Mac's desk or on the account's headless
+//!   browser profile right after a headless sign-in proved it, and nobody pastes a code; under a
+//!   per-account lock (never `signin.lock`); after a preflight (a seat in the vault's log, no
+//!   route in the environment, macOS) and the refusal of a bare run while a token here is in use
+//!   or on its way. Then it runs the capture ([`super::setup_token`]), writes both entries as a
+//!   member write, records the row and journals `token-minted`. A busy vault after the mint never
+//!   throws the token away: the write waits, bounded by the hang detector, then lands in the
+//!   vault's waiting writes ("not yet in vault"); Ctrl-C lands it there at once.
 //!
 //! Nothing here prints, journals, logs or writes the token: it lives in the capture's zeroizing
 //! buffer, then in the vault.
@@ -28,11 +31,12 @@ use super::accounts_step::Step;
 use super::cli::{AccountsHost, Env, TokenMode};
 use super::journal::{self, TokenEvent};
 use super::profile;
-use super::setup_token::{self, Capture, Lifetime, Minted, Person, Program};
+use super::setup_token::{self, Capture, Lifetime, Minted, Program, SignIn};
 pub use super::token_state::{TokenState, Unverified};
+use super::token_steps;
 use super::wake_deadline::WakeDeadline;
 use aterm_secrets::SecretBytes;
-use aterm_secrets::claude_token::{self, ExpiryFrom, Key, Lookup, Meta, Standing, State};
+use aterm_secrets::claude_token::{self, ExpiryFrom, Key, Lookup, Meta, MintedBy, Standing, State};
 use aterm_secrets::client::{MemberUnset, MemberWritten, OnBusy, Paths, WaitFor, WriteRoute};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -201,10 +205,9 @@ pub struct TokenRow {
     pub vault: InVault,
     /// When the minting Mac verified it, where it did.
     pub verified: Option<u64>,
-    /// On the minting Mac, what verification by windows found so far (§5.6).
+    /// What this Mac's comparison by windows found so far (§5.6), on any Mac the token is in use
+    /// on.
     pub verification: Verification,
-    /// This Mac's first refusal of it under the route.
-    pub rejected_at: Option<u64>,
     /// When `--remove` removed it.
     pub removed_at: Option<u64>,
 }
@@ -220,44 +223,45 @@ pub struct Table {
     /// When a surface last retried the post of each `signed here` row's write, by account key
     /// (unix seconds; §5.1: at most once a minute).
     pub posts: BTreeMap<String, u64>,
+    /// Each account's kept row of the token the vault holds while the account's row is of a later
+    /// one, by account key ([`row_of_token`]): the row a mint replaced where the vault held its
+    /// token then ([`record`]), or one made for the vault's token where a later write of this
+    /// Mac's is still on its way. The vault's token is judged by its own facts here (its verdict,
+    /// its refusal) until a reading shows the vault holds the row's token or a later one
+    /// ([`Self::row_for`]).
+    pub replaced: BTreeMap<String, TokenRow>,
 }
 
 impl Table {
-    /// The table as `tokens.json` holds it.
+    /// This Mac's row of the account `key` for the vault's token as `found` reads it: the
+    /// account's row, or, where that row is of another token and the kept row
+    /// ([`Self::replaced`]) is the vault's (the same `minted_at`), that token's row. A token is
+    /// judged by this Mac's facts of it ([`TokenState::of`]).
+    #[must_use]
+    pub fn row_for(&self, key: &str, found: &Lookup<Standing>) -> Option<&TokenRow> {
+        let minted_at = match found {
+            Lookup::Found(standing) => standing.meta.as_ref().map(|meta| meta.minted_at),
+            Lookup::Absent | Lookup::Unknown => None,
+        };
+        let row = self.rows.get(key);
+        if minted_at.is_some()
+            && row.is_some_and(|row| row.minted_at != minted_at)
+            && let Some(kept) = self
+                .replaced
+                .get(key)
+                .filter(|kept| kept.minted_at == minted_at)
+        {
+            return Some(kept);
+        }
+        row
+    }
+
+    /// The table as `tokens.json` holds it: its rows with no check of their tokens, which
+    /// [`CHECK_FILE`] holds ([`Self::checks_json`]).
     #[must_use]
     pub fn to_json(&self) -> String {
-        let rows: Vec<aterm_json::Value> = self
-            .rows
-            .values()
-            .map(|row| {
-                aterm_json::json!({
-                    "key": row.key,
-                    "email": row.email,
-                    "account_id": row.account_id,
-                    "label": row.label,
-                    "entry": row.entry,
-                    "minted_at": row.minted_at,
-                    "expires_at": row.expires_at,
-                    "expiry_from": row.expiry_from,
-                    "minted_on": row.minted_on,
-                    "signer": row.signer,
-                    "used_on": {
-                        "here": {
-                            "first_served_at": row.used_on.first_served_at,
-                            "last_served_at": row.used_on.last_served_at,
-                        },
-                        "peers": row.used_on.peers,
-                        "peers_read_at": row.used_on.peers_read_at,
-                    },
-                    "vault": row.vault.word(),
-                    "vault_detail": row.vault.detail(),
-                    "verified": row.verified,
-                    "verification": row.verification.to_json(),
-                    "rejected_at": row.rejected_at,
-                    "removed_at": row.removed_at,
-                })
-            })
-            .collect();
+        let rows: Vec<aterm_json::Value> =
+            self.rows.values().map(|row| row_json(row, false)).collect();
         let offers: Vec<aterm_json::Value> = self
             .offers
             .iter()
@@ -279,7 +283,122 @@ impl Table {
         .unwrap_or_default()
     }
 
-    /// The table `bytes` holds, where it is one of schema 1. A row that does not read is left out.
+    /// This Mac's checks of each row's token as [`CHECK_FILE`] holds them: each row's
+    /// [`Verification`] under its account key and its token's `minted_at`, and each kept row
+    /// ([`Self::replaced`]) whole.
+    #[must_use]
+    pub fn checks_json(&self) -> String {
+        let checks: Vec<aterm_json::Value> = self
+            .rows
+            .values()
+            .filter(|row| row.verification != Verification::default())
+            .map(|row| {
+                aterm_json::json!({
+                    "key": row.key,
+                    "minted_at": row.minted_at,
+                    CHECK_KEY: row.verification.to_json(),
+                })
+            })
+            .collect();
+        let replaced: Vec<aterm_json::Value> = self
+            .replaced
+            .values()
+            .map(|row| row_json(row, true))
+            .collect();
+        aterm_json::to_string(&aterm_json::json!({
+            "schema": SCHEMA,
+            "checks": checks,
+            "replaced": replaced,
+        }))
+        .unwrap_or_default()
+    }
+
+    /// The checks `bytes` holds ([`Self::checks_json`]) put on this table: each row's
+    /// verification where its account key and `minted_at` are the row's, and each kept row.
+    /// `None` where `bytes` is not a check file of schema 1, or a check or a kept row in it names
+    /// a verdict this build does not know ([`Verification::of_json`]).
+    ///
+    /// An earlier build rewrites `tokens.json` without reading this file, moving an account's row
+    /// to another token (the vault's, either way, or one it minted) with no verdict or refusal of
+    /// it, so a check and a row may no longer meet. A check of a token the account's row is no
+    /// longer of is kept as that token's kept row, made from the account's row, where none is
+    /// kept: a token whose windows differ still serves nowhere while the vault holds it. A kept
+    /// row of the token the account's row is of now gives that row its verdict and refusal where
+    /// the row holds none, and goes: it holds this Mac's facts of the very token the row is of
+    /// (the row an earlier build moved onto the vault's token, while this build's write of a later
+    /// one waited), which a check of the later token never displaces.
+    fn with_checks(mut self, bytes: &[u8]) -> Option<Self> {
+        let value: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
+        if value.get("schema")?.as_i64()? != SCHEMA {
+            return None;
+        }
+        let mut apart = Vec::new();
+        for check in value.get("checks")?.as_array()? {
+            let (Some(key), Some(minted_at), Some(verification)) = (
+                check.get("key").and_then(aterm_json::Value::as_str),
+                check.get("minted_at").and_then(aterm_json::Value::as_u64),
+                check.get(CHECK_KEY),
+            ) else {
+                continue;
+            };
+            let verification = Verification::of_json(verification)?;
+            let Some(row) = self.rows.get_mut(key) else {
+                continue;
+            };
+            if row.minted_at == Some(minted_at) {
+                row.verification = verification;
+            } else {
+                apart.push(TokenRow {
+                    minted_at: Some(minted_at),
+                    expires_at: None,
+                    expiry_from: None,
+                    minted_on: None,
+                    signer: None,
+                    used_on: UsedOn::default(),
+                    vault: InVault::InVault,
+                    verified: None,
+                    verification,
+                    removed_at: None,
+                    ..row.clone()
+                });
+            }
+        }
+        for kept in value.get("replaced")?.as_array()? {
+            let verification = match kept.get(CHECK_KEY) {
+                Some(check) => Verification::of_json(check)?,
+                None => Verification::default(),
+            };
+            if let Some(row) = row_of(kept) {
+                self.replaced.insert(
+                    row.key.clone(),
+                    TokenRow {
+                        verification,
+                        ..row
+                    },
+                );
+            }
+        }
+        for kept in apart {
+            self.replaced.entry(kept.key.clone()).or_insert(kept);
+        }
+        let Self { rows, replaced, .. } = &mut self;
+        replaced.retain(|key, kept| {
+            let Some(row) = rows
+                .get_mut(key)
+                .filter(|row| row.minted_at == kept.minted_at)
+            else {
+                return true;
+            };
+            if row.verification == Verification::default() {
+                row.verification = std::mem::take(&mut kept.verification);
+            }
+            false
+        });
+        Some(self)
+    }
+
+    /// The table `bytes` holds, where it is one of schema 1, with no check of its tokens
+    /// ([`CHECK_FILE`]). A row that does not read is left out.
     #[must_use]
     pub fn from_json(bytes: &[u8]) -> Option<Self> {
         let value: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
@@ -340,6 +459,54 @@ impl Table {
     }
 }
 
+/// The file beside the table that holds this Mac's checks of each account's tokens
+/// ([`Table::checks_json`]): each row's [`Verification`] by its account key and its token's
+/// `minted_at`, and each kept row ([`Table::replaced`]). Its own file, which no earlier build
+/// opens: an earlier build rewrites `tokens.json` whole on every `accounts` report and drops
+/// fields it does not know, which would drop a token's verdict (a token whose windows differ
+/// would serve again) and the kept row of the token the vault still holds.
+pub const CHECK_FILE: &str = "tokens-check.json";
+
+/// The key [`CHECK_FILE`] keeps a [`Verification`] under. Rows an earlier build wrote while the
+/// basis was the row's usage `Sample` (which an earlier token's readings fold into) kept it in
+/// `tokens.json` under `verification`, which no build reads now: their basis and verdict were
+/// reached against windows of unknown origin, so such a row reads with none, and its token awaits
+/// a stored-login reading.
+const CHECK_KEY: &str = "windows_check";
+
+/// One row as `tokens.json` holds it, or, `with_check`, as [`CHECK_FILE`] keeps a kept row: with
+/// its [`Verification`].
+fn row_json(row: &TokenRow, with_check: bool) -> aterm_json::Value {
+    let mut value = aterm_json::json!({
+        "key": row.key,
+        "email": row.email,
+        "account_id": row.account_id,
+        "label": row.label,
+        "entry": row.entry,
+        "minted_at": row.minted_at,
+        "expires_at": row.expires_at,
+        "expiry_from": row.expiry_from,
+        "minted_on": row.minted_on,
+        "signer": row.signer,
+        "used_on": {
+            "here": {
+                "first_served_at": row.used_on.first_served_at,
+                "last_served_at": row.used_on.last_served_at,
+            },
+            "peers": row.used_on.peers,
+            "peers_read_at": row.used_on.peers_read_at,
+        },
+        "vault": row.vault.word(),
+        "vault_detail": row.vault.detail(),
+        "verified": row.verified,
+        "removed_at": row.removed_at,
+    });
+    if with_check && let Some(fields) = value.as_object_mut() {
+        fields.insert(CHECK_KEY.to_owned(), row.verification.to_json());
+    }
+    value
+}
+
 fn row_of(value: &aterm_json::Value) -> Option<TokenRow> {
     let text = |of: &aterm_json::Value, key: &str| of.get(key)?.as_str().map(str::to_owned);
     let secs = |of: &aterm_json::Value, key: &str| of.get(key)?.as_u64();
@@ -380,11 +547,7 @@ fn row_of(value: &aterm_json::Value) -> Option<TokenRow> {
                 .and_then(aterm_json::Value::as_str),
         )?,
         verified: secs(value, "verified"),
-        verification: value
-            .get("verification")
-            .map(Verification::of_json)
-            .unwrap_or_default(),
-        rejected_at: secs(value, "rejected_at"),
+        verification: Verification::default(),
         removed_at: secs(value, "removed_at"),
     })
 }
@@ -394,73 +557,251 @@ fn table_dir(store: &Store) -> PathBuf {
     store.shared_dir()
 }
 
-/// The table on this Mac: empty where there is none yet.
-///
-/// # Errors
-/// The file is there and does not read, is not private, or is not a table.
-pub fn read_table(store: &Store) -> io::Result<Table> {
-    match aterm_uds::private_file::read_private(&table_dir(store), TABLE_FILE, MAX_TABLE) {
-        Ok(bytes) => Table::from_json(&bytes)
-            .ok_or_else(|| io::Error::other(format!("{TABLE_FILE} is not a table of schema 1"))),
-        Err(aterm_uds::private_file::PrivateFileError::Missing) => Ok(Table::default()),
-        Err(why) => Err(io::Error::other(format!("{TABLE_FILE}: {why:?}"))),
+/// What one read of the table's two files found ([`read_parts`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableRead {
+    /// The table: with its checks, or `tokens.json`'s rows alone where [`Self::unchecked`] says
+    /// why the check file did not read.
+    pub table: Table,
+    /// Why [`CHECK_FILE`] is there and does not read (a restore with the wrong mode, a truncated
+    /// file, a later schema), where it does not: no verdict or kept row of it is known, and none
+    /// is written over it.
+    pub unchecked: Option<String>,
+}
+
+impl TableRead {
+    /// The table whole.
+    ///
+    /// # Errors
+    /// The check file did not read.
+    pub fn whole(self) -> io::Result<Table> {
+        match self.unchecked {
+            None => Ok(self.table),
+            Some(why) => Err(io::Error::other(why)),
+        }
+    }
+
+    /// The table the vault's token `found` is judged by: whole, or, where the check file did not
+    /// read, `tokens.json`'s rows alone for a token this Mac does not compare ([`compared_here`]:
+    /// one another Mac minted that is verified, or that serves only its minting Mac until it is),
+    /// or for an account whose vault holds none or could not be read. Such a token's verification
+    /// is the vault's word, never this Mac's, and the check file holds no verdict of it; a token
+    /// this Mac compares is judged by its verdict here, which lives in that file alone.
+    ///
+    /// # Errors
+    /// The check file did not read, and this Mac compares the vault's token.
+    pub fn for_token(self, found: &Lookup<Standing>) -> io::Result<Table> {
+        match found {
+            Lookup::Found(standing) if compared_here(standing) => self.whole(),
+            Lookup::Found(_) | Lookup::Absent | Lookup::Unknown => Ok(self.table),
+        }
     }
 }
 
+/// Whether this Mac's verdict of the token `standing` reads (which lives in [`CHECK_FILE`] alone)
+/// is needed to judge it here: it was minted here, or it is not verified and the vault's records
+/// put it in use here ([`Standing::serves_here`]: a token aterm's window or headless route made,
+/// on any Mac), so this Mac compares it with the account's stored login ([`note_served`],
+/// [`note_basis`]) and a verdict here may hold it off this Mac.
+fn compared_here(standing: &Standing) -> bool {
+    standing.minted_here || (!standing.verified() && standing.serves_here())
+}
+
+/// The table on this Mac and its checks ([`CHECK_FILE`]): empty where there is none yet. A check
+/// file that is there and does not read is said once in this process's log for each reason
+/// ([`say_unchecked`]), and the table is `tokens.json`'s rows alone ([`TableRead::unchecked`]).
+///
+/// # Errors
+/// `tokens.json` is there and does not read, is not private, or is not a table of schema 1.
+pub fn read_parts(store: &Store) -> io::Result<TableRead> {
+    let dir = table_dir(store);
+    let read = |file: &str| match aterm_uds::private_file::read_private(&dir, file, MAX_TABLE) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(aterm_uds::private_file::PrivateFileError::Missing) => Ok(None),
+        Err(why) => Err(format!("{file}: {why:?}")),
+    };
+    let table = match read(TABLE_FILE).map_err(io::Error::other)? {
+        Some(bytes) => Table::from_json(&bytes)
+            .ok_or_else(|| io::Error::other(format!("{TABLE_FILE} is not a table of schema 1")))?,
+        None => Table::default(),
+    };
+    let checked = match read(CHECK_FILE) {
+        Ok(Some(bytes)) => table.clone().with_checks(&bytes).ok_or_else(|| {
+            format!("{CHECK_FILE} is not a check file of schema 1 whose verdicts this build knows")
+        }),
+        Ok(None) => Ok(table.clone()),
+        Err(why) => Err(why),
+    };
+    let unchecked = checked.as_ref().err().cloned();
+    say_unchecked(&dir, unchecked.as_deref());
+    Ok(TableRead {
+        table: checked.unwrap_or(table),
+        unchecked,
+    })
+}
+
+/// The table on this Mac, with its checks ([`CHECK_FILE`]): empty where there is none yet.
+///
+/// # Errors
+/// A file is there and does not read, is not private, or is not a table or a check file.
+pub fn read_table(store: &Store) -> io::Result<Table> {
+    read_parts(store)?.whole()
+}
+
+/// The table on this Mac the vault's token `found` is judged by ([`TableRead::for_token`]): with
+/// its checks, or, where the check file does not read, `tokens.json`'s rows alone for a token
+/// this Mac does not compare.
+///
+/// # Errors
+/// `tokens.json` does not read, or the check file does not read and this Mac compares the token.
+pub fn read_table_for(store: &Store, found: &Lookup<Standing>) -> io::Result<Table> {
+    read_parts(store)?.for_token(found)
+}
+
+/// Says once in this process's log, for the folder `dir`, why its check file did not read
+/// (`unchecked`), again only once that reason changes or the file read in between: a record of
+/// the file and the reason for whoever reads the log, never an alert. A check file is never
+/// rewritten over one that does not read, so its verdicts stay for the build that reads it.
+/// Returns whether this call said it.
+fn say_unchecked(dir: &std::path::Path, unchecked: Option<&str>) -> bool {
+    static SAID: std::sync::Mutex<BTreeMap<PathBuf, String>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let mut said = SAID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(why) = unchecked else {
+        said.remove(dir);
+        return false;
+    };
+    if said.get(dir).is_some_and(|was| was == why) {
+        return false;
+    }
+    said.insert(dir.to_owned(), why.to_owned());
+    drop(said);
+    aterm_log::warn!(
+        "claude tokens: {} does not read ({why}): a token this Mac compares is held busy until \
+         it reads, and any other is judged without it; nothing writes over it",
+        dir.join(CHECK_FILE).display()
+    );
+    #[cfg(test)]
+    UNCHECKED_SAID.with(|said| said.borrow_mut().push(why.to_owned()));
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The reasons this thread's reads said of a check file that did not read ([`say_unchecked`]),
+    /// for its tests.
+    pub(super) static UNCHECKED_SAID: std::cell::RefCell<Vec<String>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
 /// Changes the table under `tokens.lock` (waiting for it as `accounts.lock`'s takers do) and
-/// writes it whole, atomically, mode 0600.
+/// writes it whole, atomically, mode 0600: its checks ([`CHECK_FILE`]) first, then `tokens.json`,
+/// so a check is never missing for a row that needs it.
 ///
 /// # Errors
 /// The lock stays held, or the table cannot be read or written.
 pub fn update_table(store: &Store, change: impl FnOnce(&mut Table)) -> io::Result<()> {
+    update_parts(store, None, change)
+}
+
+/// [`update_table`] for a change of this Mac's facts of the vault's token `standing` (its served
+/// facts, its refusal): where the check file does not read and this Mac does not compare the
+/// token ([`TableRead::for_token`]), the change is made on `tokens.json`'s rows alone and only
+/// `tokens.json` is written, the check file left as it is: the change touches no verdict, and a
+/// later read of the check file takes it as it takes an earlier build's rewrite of
+/// `tokens.json`. A token this Mac compares is refused then: its verdict lives in that file alone.
+///
+/// # Errors
+/// The lock stays held, or the table cannot be read or written.
+pub fn update_table_for(
+    store: &Store,
+    standing: &Standing,
+    change: impl FnOnce(&mut Table),
+) -> io::Result<()> {
+    update_parts(store, Some(standing), change)
+}
+
+fn update_parts(
+    store: &Store,
+    standing: Option<&Standing>,
+    change: impl FnOnce(&mut Table),
+) -> io::Result<()> {
     let dir = table_dir(store);
     store.ensure()?;
     let _lock = accounts::lock_at_within(&dir.join(TABLE_LOCK), &accounts::LOCK_LADDER)?
         .ok_or_else(|| io::Error::other(format!("{TABLE_LOCK} stayed held")))?;
-    let mut table = read_table(store)?;
+    let read = read_parts(store)?;
+    let whole = read.unchecked.is_none();
+    let mut table = match standing {
+        Some(standing) => read.for_token(&Lookup::Found(standing.clone()))?,
+        None => read.whole()?,
+    };
     change(&mut table);
+    if whole {
+        aterm_uds::private_file::write_private(&dir, CHECK_FILE, table.checks_json().as_bytes())?;
+    }
     aterm_uds::private_file::write_private(&dir, TABLE_FILE, table.to_json().as_bytes())
 }
 
 /// RECORDS THIS MAC'S REFUSAL OF A TOKEN (§5.6): Claude Code drew its anchored lost-login wall
-/// (`aterm_phase::WallKind::Auth`) on a session the wrapper served the token whose standing is
-/// `standing`, at `now`. The row's `rejected_at` is set for the token its meta names (its
-/// `minted_at`), the row made from that meta where this Mac kept none (a Mac that did not mint
-/// it), so [`TokenState::of`] reads `rejected` until a new token replaces it; `token-rejected` is
-/// journaled once, at the first refusal. It writes nothing else: no stored-login state of the row
-/// (its `Auth`, its learned lifetime), since the stored login was not what was refused, and
-/// nothing to the vault, since a refusal is this Mac's observation (each Mac's sessions meet the
-/// same refusal at their next request). Returns whether this call recorded it first.
+/// (`alab_policy::vocab::WallKind::Auth`) on a session the wrapper served the token whose standing is
+/// `standing`, at `now`. The refusal of the token its meta names (its `minted_at`) is kept beside
+/// this Mac's vault state at `paths` ([`claude_token::note_refused`]), where every reading of the
+/// token's standing finds it, so [`TokenState::of`] and a `claude-token:` need alike read
+/// `rejected`, not in use, until a new token replaces it; never of another token.
+/// `token-rejected` is journaled once, at the first refusal. Before it, this Mac's row of that
+/// token in the table at `store` ([`row_of_token`]: the account's row, made from the meta where
+/// this Mac kept none, or, for a token older than the one the account's row is of while that row's
+/// write is on its way, its kept row, made where none was kept) is made or followed, as a served
+/// reading's is, so the report shows the refused token's own `verified` and reads its peers. It
+/// writes nothing else: no stored-login state (its `Auth`, its learned lifetime), since the stored
+/// login was not what was refused, and nothing to the vault, since a refusal is this Mac's
+/// observation (each Mac's sessions meet the same refusal at their next request). Returns whether
+/// this call recorded it first; a standing with no meta names no token and writes nothing. The
+/// row of a token this Mac does not compare is made or followed in `tokens.json` alone where the
+/// check file does not read ([`update_table_for`]).
 ///
 /// # Errors
-/// The table could not be read or written under `tokens.lock`.
-pub fn note_rejected(store: &Store, standing: &Standing, now: u64) -> io::Result<bool> {
+/// The table could not be read or written under `tokens.lock` (for a token this Mac compares,
+/// the check file did not read), or the refusal could not be written beside this Mac's vault
+/// state; either leaves the refusal for the next lost-login point.
+pub fn note_rejected(
+    paths: &Paths,
+    store: &Store,
+    standing: &Standing,
+    now: u64,
+) -> io::Result<bool> {
     let Some(meta) = standing.meta.as_ref() else {
         return Ok(false);
     };
-    let mut first = false;
-    update_table(store, |table| {
-        let row = row_following(table, standing, meta);
-        if row.rejected_at.is_none() {
-            row.rejected_at = Some(now);
-            first = true;
-        }
+    update_table_for(store, standing, |table| {
+        row_of_token(table, standing, meta);
     })?;
+    let first = claude_token::note_refused(paths, standing, now)
+        .map_err(|why| io::Error::other(why.to_string()))?;
     if first {
         note(TokenNote::Rejected, &standing.key, now);
     }
     Ok(first)
 }
 
-/// The table's row of the account whose token's standing is `standing` and whose meta is `meta`,
-/// made from that meta where this Mac kept none (a Mac that did not mint it), and following the
-/// vault's token where it is a newer one than the row's (another `minted_at`): this Mac's facts
-/// about the older token (its served facts, its verification, its refusal) are of that token,
-/// so they go with it.
-fn row_following<'a>(table: &'a mut Table, standing: &Standing, meta: &Meta) -> &'a mut TokenRow {
-    let key = standing.key.as_str().to_owned();
-    let row = table.rows.entry(key.clone()).or_insert_with(|| TokenRow {
-        key,
+/// Which of this Mac's rows of an account holds its facts of the vault's token
+/// ([`row_of_token`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Held {
+    /// The account's row.
+    Account,
+    /// The kept row ([`Table::replaced`]) of a token older than the one the account's row is of.
+    Replaced,
+}
+
+/// A row of `standing`'s token made from its meta, nothing known of it here yet.
+fn fresh_row(standing: &Standing, meta: &Meta) -> TokenRow {
+    TokenRow {
+        key: standing.key.as_str().to_owned(),
         email: meta.email.clone(),
         account_id: Some(meta.account_id.clone()).filter(|id| !id.is_empty()),
         label: None,
@@ -472,24 +813,80 @@ fn row_following<'a>(table: &'a mut Table, standing: &Standing, meta: &Meta) -> 
         signer: standing.signer.clone(),
         used_on: UsedOn::default(),
         vault: InVault::InVault,
-        verified: meta.verified.as_ref().map(|verified| verified.at),
+        verified: meta.verification().map(|verified| verified.at),
         verification: Verification::default(),
-        rejected_at: None,
         removed_at: None,
-    });
-    if row.minted_at != Some(meta.minted_at) {
-        row.minted_at = Some(meta.minted_at);
-        row.expires_at = Some(meta.expires_at);
-        row.expiry_from = Some(expiry_word(meta.expiry_from).to_owned());
-        row.minted_on = Some(meta.minted_on.clone());
-        row.signer.clone_from(&standing.signer);
-        row.verified = meta.verified.as_ref().map(|verified| verified.at);
-        row.verification = Verification::default();
-        row.used_on.first_served_at = None;
-        row.used_on.last_served_at = None;
-        row.rejected_at = None;
     }
-    row
+}
+
+/// THIS MAC'S ROW OF THE VAULT'S TOKEN, whose standing is `standing` and meta `meta`, where this
+/// Mac's facts of that token (its served facts, its verification, its refusal) go, and which of
+/// the account's rows it is:
+///
+/// - with no row of the account, one made from the meta (a Mac that did not mint it, or a mint
+///   whose row was not written);
+/// - the account's row, where it is of the vault's token (the same `minted_at`);
+/// - where the vault's token is newer than the row's, or the row's own write is gone from the vault
+///   (overtaken, removed), the account's row, following it: the kept row of that token comes back
+///   with its facts, else the row starts afresh from the meta;
+/// - where the vault's token is older than the row's and the row's write is not gone (this Mac's
+///   later write still on its way, or a standing read before it landed), the kept row of the
+///   vault's token ([`Table::replaced`]), made from the meta where none was kept, under the
+///   account's label: the account's row never moves back to an older token on a reading, so a
+///   stale standing never takes this Mac's newest token's row from it.
+///
+/// Once the account's row is the vault's token's, the kept row goes: the vault holds the row's
+/// token or a later one.
+fn row_of_token<'a>(
+    table: &'a mut Table,
+    standing: &Standing,
+    meta: &Meta,
+) -> (&'a mut TokenRow, Held) {
+    let key = standing.key.as_str().to_owned();
+    let Table { rows, replaced, .. } = table;
+    let older = rows.get(&key).and_then(|row| {
+        let later = row.minted_at.is_some_and(|minted| meta.minted_at < minted);
+        let gone = matches!(row.vault, InVault::Overtaken(_) | InVault::Removed);
+        (later && !gone).then(|| row.label.clone())
+    });
+    if let Some(label) = older {
+        let kept = replaced
+            .entry(key)
+            .and_modify(|kept| {
+                if kept.minted_at != Some(meta.minted_at) {
+                    *kept = fresh_row(standing, meta);
+                }
+            })
+            .or_insert_with(|| fresh_row(standing, meta));
+        if kept.label.is_none() {
+            kept.label = label;
+        }
+        return (kept, Held::Replaced);
+    }
+    let row = rows
+        .entry(key.clone())
+        .or_insert_with(|| fresh_row(standing, meta));
+    if row.minted_at != Some(meta.minted_at) {
+        match replaced
+            .remove(&key)
+            .filter(|kept| kept.minted_at == Some(meta.minted_at))
+        {
+            Some(kept) => *row = kept,
+            None => {
+                *row = TokenRow {
+                    label: row.label.take(),
+                    used_on: UsedOn {
+                        peers: std::mem::take(&mut row.used_on.peers),
+                        peers_read_at: row.used_on.peers_read_at,
+                        ..UsedOn::default()
+                    },
+                    ..fresh_row(standing, meta)
+                };
+            }
+        }
+    }
+    replaced.remove(&key);
+    (row, Held::Account)
 }
 
 /// The rate-limit windows a reading or a stored login's sample shows, value-free (§5.6): each
@@ -504,12 +901,15 @@ pub struct Windows {
 
 impl Windows {
     /// The windows `sample` shows still current at `now` ([`accounts::Sample::week`],
-    /// [`accounts::Sample::session`]).
+    /// [`accounts::Sample::session`]), each by the reset the sample names. A window whose reset
+    /// the sample does not name is left out: the end `Sample::week` gives such a figure is the
+    /// latest its window can end, not an instant a reading's reset can be compared with. What
+    /// another account's sample shows is what the shared check reads ([`Served::others`]).
     #[must_use]
     pub fn current(sample: &accounts::Sample, now: i64) -> Self {
         Self {
-            week_reset: sample.week(now).map(|(_, reset)| reset),
-            session_reset: sample.session(now).map(|(_, reset)| reset),
+            week_reset: sample.week(now).and(sample.week_reset),
+            session_reset: sample.session(now).and(sample.session_reset),
         }
     }
 
@@ -522,8 +922,17 @@ impl Windows {
         }
     }
 
+    /// Whether these windows name a week still running at `now`: what a basis must name to be
+    /// compared with ([`Verdict::of`], [`Verification::current_basis`]).
+    #[must_use]
+    pub fn week_running(&self, now: i64) -> bool {
+        self.week_reset.is_some_and(|reset| reset > now)
+    }
+
     /// Whether `reading` shows these windows: the same week, and the same session where both
-    /// name one current at `now`.
+    /// name one current at `now`. A reading's session that has ended by `now` (a reading taken
+    /// before that window reset, handed on later) says nothing of the session these windows are
+    /// in now, and is compared with none.
     #[must_use]
     pub fn shown_by(&self, reading: &Self, now: i64) -> bool {
         let current = |reset: Option<i64>| reset.filter(|reset| *reset > now);
@@ -531,7 +940,7 @@ impl Windows {
             return false;
         };
         reading.week_reset == Some(week)
-            && match (current(self.session_reset), reading.session_reset) {
+            && match (current(self.session_reset), current(reading.session_reset)) {
                 (Some(mine), Some(read)) => mine == read,
                 _ => true,
             }
@@ -556,18 +965,29 @@ impl Windows {
     }
 }
 
-/// What the comparison of a token session's first reading with its row's stored-login windows
-/// found (§5.6).
+/// What this Mac's comparison of a token session's reading with the basis its row recorded found
+/// (§5.6): this Mac's finding alone, which the vault holds only as the minting Mac's `verified`.
+/// `Equal`, `Differ` and `Shared` are final for the token ([`Verdict::is_final`]): `NoBasis` says
+/// only that the reading had nothing to be compared with: the next stored-login reading compares
+/// it ([`note_basis`]) where its week still runs, and the next token reading is compared again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// The reading showed the basis's windows, which no other account here shares: the minting
-    /// Mac writes `verified` (until it is written, each reading tries the write again).
+    /// The reading showed the basis's windows, which no other account here shares: on the Mac
+    /// that minted the token, it writes `verified` (until it is written, each reading tries the
+    /// write again); on another Mac, nothing is written.
     Equal,
-    /// The reading's windows are not the basis's.
+    /// The reading's windows are not the basis's: this Mac starts no session on the token
+    /// ([`TokenState::in_use`]), and its readings are folded into no row ([`Due::Apart`]). Other
+    /// Macs judge it by their own readings.
     Differ,
-    /// They are, and another account's current windows on this Mac are too.
+    /// They are, and another account's current windows on this Mac are too: the comparison could
+    /// not tell the accounts apart, so no verification follows. That is no evidence of another
+    /// account (the windows are the stored login's), so the token serves where its route puts it
+    /// in use: every Mac for one aterm's window or headless route made, only the minting Mac for
+    /// one a person's terminal made or whose meta names no route, whose surfaces there offer its
+    /// replacement ([`TokenState::offer`]).
     Shared,
-    /// There was no stored-login reading for the row in a current window.
+    /// The row recorded no basis that names a week still running. Not final.
     NoBasis,
 }
 
@@ -587,12 +1007,25 @@ impl Verdict {
             .find(|verdict| verdict.word() == word)
     }
 
-    /// The comparison of `reading`, a token session's first reading carrying rate limits, with
-    /// `basis`, the row's stored-login windows recorded before any token reading was folded,
-    /// where `others` are the other accounts' current stored-login windows on this Mac, at `now`.
+    /// Whether this verdict is kept for the token's life: a comparison that had a basis is never
+    /// made again, so a later reading reopens neither windows found different or shared, nor
+    /// equal ones whose write is still due. Only `NoBasis` is not: no comparison was made.
+    #[must_use]
+    pub const fn is_final(self) -> bool {
+        match self {
+            Self::Equal | Self::Differ | Self::Shared => true,
+            Self::NoBasis => false,
+        }
+    }
+
+    /// The comparison of `reading`, a token session's reading naming a week still running at
+    /// `now` ([`note_served`] compares no other), with `basis`, the windows the row recorded for
+    /// it ([`Verification::basis`]), where `others` are the other accounts' current windows on
+    /// this Mac, at `now`. A basis that names no week still running at `now` is none
+    /// ([`Windows::week_running`]).
     #[must_use]
     pub fn of(basis: Option<&Windows>, reading: &Windows, others: &[Windows], now: i64) -> Self {
-        let Some(basis) = basis.filter(|basis| basis.week_reset.is_some_and(|r| r > now)) else {
+        let Some(basis) = basis.filter(|basis| basis.week_running(now)) else {
             return Self::NoBasis;
         };
         if !basis.shown_by(reading, now) {
@@ -605,43 +1038,72 @@ impl Verdict {
     }
 }
 
-/// On the minting Mac, what verification by windows has found of the row's token (§5.6): the
-/// basis (the row's stored-login windows when the first session on the token started, recorded
-/// before any token reading was folded), the first reading under the route that carried rate
-/// limits, and what comparing them found. Empty on every other Mac.
+/// What this Mac's comparison by windows has found of the row's token (§5.6), on any Mac the token
+/// is in use on: the basis (the latest reading of a session on the row's stored login here,
+/// [`note_basis`]), the served reading of the token compared with it, and what comparing them
+/// found. Empty where the token is verified, or not in use here.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Verification {
-    /// The basis and when it was recorded (unix seconds).
+    /// The basis and when it was recorded (unix seconds): the windows of the latest status-line
+    /// reading of a session on the row's stored login since the token was made, each replacing
+    /// the one before ([`note_basis`]). Never a token session's reading, this token's or an
+    /// earlier one's. One that names no week still running is no basis ([`Verdict::of`]).
     pub basis: Option<(u64, Windows)>,
-    /// The first served reading that carried rate limits.
-    pub first_reading: Option<Windows>,
-    /// What the comparison found.
+    /// The served reading `verdict` is of: the first that carried rate limits while the row had
+    /// a current basis, which a final verdict keeps; until then, the latest that carried them,
+    /// which the next stored-login reading compares where its week still runs ([`note_basis`]).
+    pub reading: Option<Windows>,
+    /// What comparing the two found. `no-basis` is not final ([`Verdict::is_final`]): a row
+    /// holding it is compared again at its next served reading.
     pub verdict: Option<Verdict>,
 }
 
 impl Verification {
+    /// The basis a token reading is compared with at `now`: the recorded one, where it names a
+    /// week still running ([`Windows::week_running`]).
+    #[must_use]
+    pub fn current_basis(&self, now: i64) -> Option<&Windows> {
+        self.basis
+            .as_ref()
+            .map(|(_, basis)| basis)
+            .filter(|basis| basis.week_running(now))
+    }
+
+    /// Whether verification of the row's token still waits for a basis at `now`: no final
+    /// verdict ([`Verdict::is_final`]) and no current basis ([`Self::current_basis`]), so a
+    /// reading of the token now would be compared with nothing.
+    #[must_use]
+    pub fn awaits_basis(&self, now: i64) -> bool {
+        !self.verdict.is_some_and(Verdict::is_final) && self.current_basis(now).is_none()
+    }
+
     fn to_json(&self) -> aterm_json::Value {
         aterm_json::json!({
             "basis_at": self.basis.map(|(at, _)| at),
             "basis": self.basis.map(|(_, windows)| windows.to_json()),
-            "first_reading": self.first_reading.map(Windows::to_json),
+            "reading": self.reading.map(Windows::to_json),
             "verdict": self.verdict.map(Verdict::word),
         })
     }
 
-    fn of_json(value: &aterm_json::Value) -> Self {
+    /// The verification `value` holds ([`Self::to_json`]). `None` where it names a verdict this
+    /// build does not know: a later build that made one changed what the check file means, so
+    /// the file does not read here ([`Table::with_checks`]), rather than letting this build take
+    /// the token for one with nothing compared and compare it again.
+    fn of_json(value: &aterm_json::Value) -> Option<Self> {
         let basis_at = value.get("basis_at").and_then(aterm_json::Value::as_u64);
-        Self {
+        let verdict = match value.get("verdict").filter(|v| !v.is_null()) {
+            Some(word) => Some(Verdict::parse(word.as_str()?)?),
+            None => None,
+        };
+        Some(Self {
             basis: basis_at.zip(value.get("basis").map(Windows::of_json)),
-            first_reading: value
-                .get("first_reading")
+            reading: value
+                .get("reading")
                 .filter(|v| !v.is_null())
                 .map(Windows::of_json),
-            verdict: value
-                .get("verdict")
-                .and_then(aterm_json::Value::as_str)
-                .and_then(Verdict::parse),
-        }
+            verdict,
+        })
     }
 }
 
@@ -651,12 +1113,30 @@ impl Verification {
 pub struct Served {
     /// The roster row the session's tap credits.
     pub label: String,
-    /// The row's stored-login windows as the store holds them before this reading's fold.
-    pub basis: Windows,
     /// The reading's windows.
     pub reading: Windows,
-    /// The other accounts' current stored-login windows on this Mac.
+    /// The other accounts' current windows on this Mac, as their samples hold them
+    /// ([`Windows::current`]). A sample holds every reading folded into its row, an unverified
+    /// token's included, so a wrong-account token of another row can put its account's windows
+    /// here; that only ever turns an equal comparison into a shared one, never the reverse.
     pub others: Vec<Windows>,
+    /// Whether the wrapper named the token it served the session, the vault's
+    /// (`token_route::ServedToken::Named`): only such a reading is compared for verification. A
+    /// session an earlier aterm's wrapper served names none; taken for one on the vault's token
+    /// only where that token was made before the session began, its reading counts for the token
+    /// and its row but is never compared.
+    pub named: bool,
+}
+
+/// The evidence [`note_served`] found equal, for [`verify_served`] to write: the token it was read
+/// on (its meta's `minted_at` in the standing the reading was judged against), and the windows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verify {
+    /// The compared token's `minted_at`: [`claude_token::verify`] writes nothing where the vault
+    /// now holds another token.
+    pub minted_at: u64,
+    /// What the meta's `verified` will say.
+    pub evidence: aterm_secrets::claude_token::Verified,
 }
 
 /// What [`note_served`] leaves for its caller to do once the reading's fold is written.
@@ -664,29 +1144,65 @@ pub struct Served {
 pub enum Due {
     /// Nothing.
     Nothing,
-    /// The minting Mac writes `verified` with this evidence ([`verify_served`]).
-    Verify(aterm_secrets::claude_token::Verified),
+    /// This Mac's comparison found the token's windows different from the basis's
+    /// ([`Verdict::Differ`]), or the vault's records do not put the token in use here
+    /// ([`Standing::serves_here`]: made at a terminal or by an earlier build on another Mac, and
+    /// not verified): the reading may be another account's, so the caller folds nothing of it
+    /// into the row.
+    Apart,
+    /// The minting Mac writes `verified` for this token with this evidence ([`verify_served`]).
+    Verify(Verify),
 }
 
 /// RECORDS A SERVED READING OF A TOKEN SESSION (§5.6, §5.7), under `tokens.lock`, BEFORE ITS
-/// FOLD: this Mac's `first_served_at` (journaling `token-served` the first time) and
-/// `last_served_at`, the row's label, and, on the Mac that minted a token not verified yet,
-/// verification by windows:
+/// FOLD, on this Mac's row of the token ([`row_of_token`]): this Mac's `first_served_at`
+/// (journaling `token-served` the first time) and `last_served_at`, the row's label, and, for a
+/// token not verified yet that the vault's records put in use here ([`Standing::serves_here`]:
+/// made in aterm's window or headless route, on any Mac, or minted here), this Mac's comparison by
+/// windows:
 ///
-/// - the first session's first reading records the basis, the row's stored-login windows
-///   (`served.basis`), which its caller read before folding any token reading into the row, so
-///   a token's reading is never compared with itself;
-/// - the first reading that carries rate limits is compared with the basis ([`Verdict::of`]):
-///   its seven-day reset must be the basis's, and its five-hour reset too where both are
-///   current, and no other account's current windows here may show it;
-/// - equal windows leave [`Due::Verify`], for the caller to write once the fold is: the write is
-///   a vault write, never made under a store's lock.
+/// - the basis is what [`note_basis`] recorded from readings of sessions on the row's stored
+///   login here, and nothing else: this writes none, so no token reading, this token's or an
+///   earlier one's folded into the row, is ever compared with itself;
+/// - each reading that carries rate limits is compared with the basis ([`Verdict::of`]) until
+///   one comparison had a basis still in a current window, and that verdict is kept
+///   ([`Verdict::is_final`]): the reading's seven-day reset must be the basis's, and its
+///   five-hour reset too where both are current, and no other account's current windows here may
+///   show it. With no such basis the verdict is `no-basis`, which decides nothing: the reading
+///   is kept, and the next stored-login reading compares it at once where its week still runs
+///   ([`note_basis`]); the next token reading is compared afresh with the basis then recorded,
+///   never a kept reading whose week has ended. A reading that names no seven-day window still
+///   running compares nothing;
+/// - equal windows on the Mac that minted the token leave [`Due::Verify`] at this reading and
+///   each later one until the vault's meta says `verified`, for the caller to write once the fold
+///   is: the write is a vault write, never made under a store's lock. On another Mac they leave
+///   nothing: the vault's `verified` is the minting Mac's to write. Different windows are final:
+///   this Mac starts no session on the token ([`TokenState::in_use`]), and that reading and each
+///   later one leave [`Due::Apart`], so the caller folds none of them into the row. Other Macs
+///   judge the token by their own readings.
+///
+/// A reading of a token the vault's records do not put in use here (made at a terminal or by an
+/// earlier build on another Mac, and not verified) is [`Due::Apart`]: no session here starts on
+/// such a token, and its readings may be another account's.
 ///
 /// A row-less account's token, or a reading from no roster row, is never compared: it stays
-/// `unverified (no roster row)`. `standing` is the token's, read value-free before the fold.
+/// `unverified (no roster row)`. A reading of a session whose wrapper named no token
+/// ([`Served::named`]) is never compared, and leaves no write. A reading that names no week
+/// still running at `now` (one taken before its week reset, handed on later) compares nothing
+/// either, and a reading's five-hour reset that has passed is compared with none
+/// ([`Windows::shown_by`]): neither says what the token's windows are now. The kept row of a
+/// token older than the account's row's ([`Table::replaced`]: this Mac's later write is on its
+/// way) takes the reading's served facts and comparison, and leaves [`Due::Apart`] where its
+/// windows differ, but never a write: a write over it would only be refused
+/// ([`claude_token::verify`]). `standing` is the token's, read value-free before the fold; its
+/// caller hands only a reading of a session the wrapper served this very token
+/// (`harness_host.rs`' `tap_step`). A token this Mac does not compare (one another Mac minted that
+/// is verified, or that serves only its minting Mac until it is) has its served facts written to
+/// `tokens.json` alone where the check file does not read ([`update_table_for`]).
 ///
 /// # Errors
-/// The table could not be read or written under `tokens.lock`.
+/// The table could not be read or written under `tokens.lock`; for a token this Mac compares, the
+/// check file did not read, so its verdict is not known and nothing of the reading is folded.
 pub fn note_served(
     store: &Store,
     standing: &Standing,
@@ -698,42 +1214,43 @@ pub fn note_served(
     };
     let at = i64::try_from(now).unwrap_or(i64::MAX);
     let (mut first, mut due) = (false, Due::Nothing);
-    update_table(store, |table| {
-        let row = row_following(table, standing, meta);
+    update_table_for(store, standing, |table| {
+        let (row, held) = row_of_token(table, standing, meta);
         row.label = Some(served.label.clone());
         if row.used_on.first_served_at.is_none() {
             row.used_on.first_served_at = Some(now);
             first = true;
         }
         row.used_on.last_served_at = Some(now);
-        if !standing.minted_here || standing.verified() || row.verified.is_some() {
+        if standing.verified() {
+            return;
+        }
+        if !standing.serves_here() {
+            due = Due::Apart;
             return;
         }
         let check = &mut row.verification;
-        if check.basis.is_none() && first {
-            check.basis = Some((now, served.basis));
-        }
-        if served.reading.week_reset.is_none() {
-            return;
-        }
-        let reading = *check.first_reading.get_or_insert(served.reading);
-        let verdict = *check.verdict.get_or_insert_with(|| {
-            Verdict::of(
-                check.basis.as_ref().map(|(_, basis)| basis),
-                &reading,
+        if served.named && !check.verdict.is_some_and(Verdict::is_final) {
+            if !served.reading.week_running(at) {
+                return;
+            }
+            check.verdict = Some(Verdict::of(
+                check.current_basis(at),
+                &served.reading,
                 &served.others,
                 at,
-            )
-        });
-        if verdict == Verdict::Equal {
-            due = Due::Verify(aterm_secrets::claude_token::Verified {
-                on: meta.minted_on.clone(),
-                at: now,
-                by: "windows".to_owned(),
-                seven_day_resets_at: reading.week_reset.and_then(|r| u64::try_from(r).ok()),
-                five_hour_resets_at: reading.session_reset.and_then(|r| u64::try_from(r).ok()),
-            });
+            ));
+            check.reading = Some(served.reading);
         }
+        due = match check.verdict {
+            Some(Verdict::Equal)
+                if served.named && held == Held::Account && standing.minted_here =>
+            {
+                Due::Verify(verify_of(meta, check.reading, now))
+            }
+            Some(Verdict::Differ) => Due::Apart,
+            Some(Verdict::Equal | Verdict::Shared | Verdict::NoBasis) | None => Due::Nothing,
+        };
     })?;
     if first {
         note(TokenNote::Served, &standing.key, now);
@@ -741,15 +1258,182 @@ pub fn note_served(
     Ok(due)
 }
 
+/// The evidence of a comparison that found `reading`'s windows equal to its row's basis, for the
+/// token `meta` describes, at `now`: what [`verify_served`] writes into the meta's `verified`.
+fn verify_of(meta: &Meta, reading: Option<Windows>, now: u64) -> Verify {
+    let reset = |reset: Option<i64>| reset.and_then(|r| u64::try_from(r).ok());
+    Verify {
+        minted_at: meta.minted_at,
+        evidence: aterm_secrets::claude_token::Verified {
+            on: meta.minted_on.clone(),
+            at: now,
+            by: aterm_secrets::claude_token::BY_WINDOWS.to_owned(),
+            seven_day_resets_at: reset(reading.and_then(|r| r.week_reset)),
+            five_hour_resets_at: reset(reading.and_then(|r| r.session_reset)),
+        },
+    }
+}
+
+/// Whether this Mac's table holds a row of the account `key` that a stored-login reading may give
+/// a basis ([`note_basis`]): the account's row, or its kept row ([`Table::replaced`]), not removed,
+/// with no final verdict, or an account's row whose write is not yet in vault (the vault may hold
+/// an older token, whose kept row the reading makes). Read without `tokens.lock`, as the cheap
+/// look before the vault is read for the token's standing; [`note_basis`] judges the token again,
+/// where the vault's standing says whether it is verified, in use here and refused here (a row of
+/// a token the vault's records do not put in use here, or one of a token refused here, passes
+/// this look, and records nothing). A table that does not read holds none; an account with no row
+/// has no token here a reading could be the basis of, and a token held for its basis has one, on
+/// any Mac
+/// ([`note_held`]).
+#[must_use]
+pub fn basis_wanted(store: &Store, key: &Key) -> bool {
+    read_table(store).ok().is_some_and(|table| {
+        table
+            .rows
+            .get(key.as_str())
+            .is_some_and(|row| awaits_a_verdict(row) || row.vault.not_yet())
+            || table
+                .replaced
+                .get(key.as_str())
+                .is_some_and(awaits_a_verdict)
+    })
+}
+
+/// Whether `row` is of a token this Mac has not removed, with no final verdict: the row a
+/// stored-login reading gives a basis, unless this Mac saw the token refused, which its standing
+/// says ([`Standing::refused_at`]). Whether the token is verified is the vault's meta's word
+/// ([`Standing::verified`]), never the row's.
+fn awaits_a_verdict(row: &TokenRow) -> bool {
+    row.removed_at.is_none() && !row.verification.verdict.is_some_and(Verdict::is_final)
+}
+
+/// What a stored-login reading made of its account's token's verification ([`note_basis`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Based {
+    /// It recorded nothing.
+    Not,
+    /// It is the row's basis now. Where a token reading was kept with no basis to compare it
+    /// with, it was compared, and found the windows different or shared, or nothing.
+    Recorded,
+    /// It is the row's basis now, and the token reading kept with no basis showed the same
+    /// windows: the Mac that minted the token writes `verified` for it with this evidence
+    /// ([`verify_served`]), as for [`Due::Verify`].
+    Verify(Verify),
+}
+
+impl Based {
+    /// Whether the reading became the row's basis.
+    #[must_use]
+    pub const fn recorded(&self) -> bool {
+        !matches!(self, Self::Not)
+    }
+}
+
+/// RECORDS A STORED-LOGIN READING AS ITS ACCOUNT'S TOKEN'S BASIS (§5.6), under `tokens.lock`:
+/// `reading` is the windows of a status-line reading of a session the harness's attribution
+/// credits to the roster row `label` with the certainty its fold credits it, running on that
+/// row's stored login (no vault token on its process login); `standing` is the account's token as
+/// this Mac's vault reads it, value-free. Where that token is not verified
+/// ([`Standing::verified`]), the vault's records put it in use here ([`Standing::serves_here`]:
+/// made in aterm's window or headless route on any Mac, or minted here) and this Mac did not see
+/// it refused ([`Standing::refused_at`]), and this Mac's row of it ([`row_of_token`]: made or
+/// followed where the account's row is of another token, or the kept row of a token older than
+/// the row's) awaits a verdict ([`awaits_a_verdict`]), the reading's windows become that row's
+/// basis at `now` in place of any earlier one: a newer reading of the stored login is a better
+/// basis, and one whose week has ended compares nothing ([`Verdict::of`]). The row's label
+/// becomes `label`, as a served reading's does. A reading that names no week still running at
+/// `now` records nothing. Nothing ever writes a token session's reading here, so the basis is
+/// never a token's own windows.
+///
+/// A token reading the row kept with no basis to compare it with ([`Verification::reading`],
+/// `no-basis`), whose week still runs at `now`, is compared with the new basis at once, with
+/// `others`, the other accounts' current windows here, as [`note_served`] compares a token
+/// reading that comes after the basis: the token need not serve another session before its
+/// verdict. Windows found different are final at once, so this Mac starts no session on the token
+/// ([`TokenState::in_use`]); found equal, on the account's row of a token minted here, they leave
+/// [`Based::Verify`] for the caller to write once the fold is. A kept reading whose week has ended
+/// compares nothing: the next token reading is compared instead.
+///
+/// # Errors
+/// The table could not be read or written under `tokens.lock`.
+pub fn note_basis(
+    store: &Store,
+    standing: &Standing,
+    label: &str,
+    reading: &Windows,
+    others: &[Windows],
+    now: u64,
+) -> io::Result<Based> {
+    let Some(meta) = standing.meta.as_ref() else {
+        return Ok(Based::Not);
+    };
+    let at = i64::try_from(now).unwrap_or(i64::MAX);
+    if standing.verified()
+        || !standing.serves_here()
+        || standing.refused_at.is_some()
+        || !reading.week_running(at)
+    {
+        return Ok(Based::Not);
+    }
+    let mut based = Based::Not;
+    update_table(store, |table| {
+        let (row, held) = row_of_token(table, standing, meta);
+        if !awaits_a_verdict(row) {
+            return;
+        }
+        row.label = Some(label.to_owned());
+        let check = &mut row.verification;
+        check.basis = Some((now, *reading));
+        based = Based::Recorded;
+        let Some(kept) = check.reading.filter(|kept| kept.week_running(at)) else {
+            return;
+        };
+        let verdict = Verdict::of(check.current_basis(at), &kept, others, at);
+        check.verdict = Some(verdict);
+        if verdict == Verdict::Equal && held == Held::Account && standing.minted_here {
+            based = Based::Verify(verify_of(meta, Some(kept), now));
+        }
+    })?;
+    Ok(based)
+}
+
+/// MAKES THIS MAC'S ROW OF A TOKEN HELD FOR ITS BASIS (§5.6), under `tokens.lock`, where the
+/// table holds none of it: the token route found the vault's token, `standing`, in use here and
+/// awaiting a stored-login reading with no row of its `minted_at` (a token another Mac minted, a
+/// mint whose row was not written, or an account's row of another token), and holds it for the
+/// roster row `label`'s stored login. The row [`row_of_token`] gives it, under `label` where it
+/// names none, is the one [`basis_wanted`] finds, so the stored login's next reading records the
+/// basis and the hold lifts, on the Mac that minted the token and on every other alike.
+///
+/// # Errors
+/// The table could not be read or written under `tokens.lock`.
+pub fn note_held(store: &Store, standing: &Standing, label: &str) -> io::Result<()> {
+    let Some(meta) = standing.meta.as_ref() else {
+        return Ok(());
+    };
+    update_table(store, |table| {
+        let (row, _) = row_of_token(table, standing, meta);
+        if row.label.is_none() {
+            row.label = Some(label.to_owned());
+        }
+    })
+}
+
 /// How long verification's vault write waits for a vault pass to let go: it runs on a session's
 /// attribution, so it never waits like a person's verb; the next reading tries again.
 const VERIFY_WAIT: Duration = Duration::from_secs(2);
 
-/// WRITES `verified` FOR THE ACCOUNT `key`'S TOKEN (§5.6) with `evidence`, the comparison
+/// WRITES `verified` FOR THE ACCOUNT `key`'S TOKEN (§5.6) with `verify`, the comparison
 /// [`note_served`] found equal, through `vault` ([`claude_token::verify`]: the same token and its
-/// meta with `verified` set, in one draft, only on the Mac that minted it), then records it in
-/// this Mac's table and journals `token-verified`. A write the vault holds (busy) or refuses
-/// records nothing: the next served reading tries again. Returns whether it was written.
+/// meta with `verified` set, in one draft, only on the Mac that minted it, only while the vault
+/// still holds the token compared, `verify.minted_at`, and only over the pair it read), then
+/// records it in this Mac's table and journals `token-verified`. A write that waits for the vault
+/// pass counts as written: it stands on the pair it read, so the pass signs it, or drops it whole
+/// where the token or its meta changed by then (a replacement's included), never putting back
+/// what it read; where it was dropped and the vault still holds the token, its meta says no
+/// `verified`, so the token's next served reading leaves the write due again. A write the vault
+/// holds (busy) or refuses records nothing: the next served reading tries again. Returns whether
+/// it was written.
 ///
 /// # Errors
 /// The table could not be written under `tokens.lock`.
@@ -757,10 +1441,15 @@ pub fn verify_served(
     store: &Store,
     vault: &dyn TokenVault,
     key: &Key,
-    evidence: aterm_secrets::claude_token::Verified,
+    verify: Verify,
     now: u64,
 ) -> io::Result<bool> {
-    let written = vault.verify(key, evidence, OnBusy::Refuse(Instant::now() + VERIFY_WAIT));
+    let written = vault.verify(
+        key,
+        verify.minted_at,
+        verify.evidence,
+        OnBusy::Refuse(Instant::now() + VERIFY_WAIT),
+    );
     match written {
         Ok(MemberWritten::Posted | MemberWritten::SignedHere | MemberWritten::Waiting(_)) => {}
         Ok(
@@ -773,7 +1462,11 @@ pub fn verify_served(
         | Err(_) => return Ok(false),
     }
     update_table(store, |table| {
-        if let Some(row) = table.rows.get_mut(key.as_str()) {
+        if let Some(row) = table
+            .rows
+            .get_mut(key.as_str())
+            .filter(|row| row.minted_at == Some(verify.minted_at))
+        {
             row.verified = Some(now);
         }
     })?;
@@ -782,24 +1475,36 @@ pub fn verify_served(
 }
 
 impl Unverified {
-    /// Why, from this Mac's row of the account (`None`: none kept).
+    /// Why, for the token made at `minted_at`, from this Mac's row of the account (`None`: none
+    /// kept), at `now`, on whichever Mac this is. With no final verdict, a row of this token with
+    /// no current basis ([`Verification::awaits_basis`]) awaits a stored-login reading; one with a
+    /// basis awaits a reading of the token. A verdict the row keeps of another token (another
+    /// `minted_at`) says nothing of this one: a token with no row of its own here (one another Mac
+    /// minted, a mint whose row is not written yet or could not be, a table an earlier build
+    /// rewrote) has had nothing compared here, so it awaits a stored-login reading, and is held
+    /// while this account's stored login is usable here (`token_route::standing_judged`), wherever
+    /// it was minted.
     #[must_use]
-    pub fn of(row: Option<&TokenRow>) -> Self {
+    pub fn of(row: Option<&TokenRow>, minted_at: Option<u64>, now: u64) -> Self {
+        let now = i64::try_from(now).unwrap_or(i64::MAX);
         match row {
             Some(row) if row.label.is_none() => Self::NoRosterRow,
-            Some(row) => match row.verification.verdict {
+            Some(row) if row.minted_at == minted_at => match row.verification.verdict {
                 Some(Verdict::Differ) => Self::WindowsDiffer,
                 Some(Verdict::Shared) => Self::WindowsShared,
-                Some(Verdict::Equal | Verdict::NoBasis) | None => Self::NoReadingYet,
+                Some(Verdict::Equal) => Self::WindowsEqual,
+                _ if row.verification.awaits_basis(now) => Self::AwaitingBasis,
+                Some(Verdict::NoBasis) | None => Self::NoReadingYet,
             },
-            None => Self::NoReadingYet,
+            Some(_) | None => Self::AwaitingBasis,
         }
     }
 }
 
 impl TokenState {
-    /// The state of the account whose vault lookup is `found` and whose table row is `row`, at
-    /// `now` (unix seconds).
+    /// The state of the account whose vault lookup is `found` (this Mac's refusal of the token
+    /// included, [`Standing::refused_at`]) and whose table row is `row` (why a token minted here
+    /// is not verified yet), at `now` (unix seconds).
     #[must_use]
     pub fn of(found: &Lookup<Standing>, row: Option<&TokenRow>, now: u64) -> Self {
         let standing = match found {
@@ -807,24 +1512,22 @@ impl TokenState {
             Lookup::Absent => return Self::None,
             Lookup::Found(standing) => standing,
         };
-        let state = standing.state(now);
-        match state {
-            State::Unreadable => return Self::Unreadable,
-            State::Mismatched(why) => return Self::Mismatched(why),
-            State::Ended => return Self::Ended,
-            _ => {}
-        }
         let minted_at = standing.meta.as_ref().map(|meta| meta.minted_at);
-        if row.is_some_and(|row| row.rejected_at.is_some() && row.minted_at == minted_at) {
-            return Self::Rejected;
-        }
-        match state {
+        match standing.state(now) {
+            State::Unreadable => Self::Unreadable,
+            State::Mismatched(why) => Self::Mismatched(why),
+            State::Ended => Self::Ended,
+            State::Rejected => Self::Rejected {
+                elsewhere: standing.serves_elsewhere(),
+            },
             State::Unverified {
-                served_here,
+                minted_here,
+                minted_by,
                 exposed,
             } => Self::Unverified {
-                minted_here: served_here,
-                why: Unverified::of(row),
+                minted_here,
+                minted_by,
+                why: Unverified::of(row, minted_at, now),
                 minted_on: standing
                     .meta
                     .as_ref()
@@ -835,15 +1538,18 @@ impl TokenState {
             State::Exposed(macs) => Self::Exposed(macs),
             State::Soon => Self::Soon,
             State::Active => Self::Active,
-            State::Unreadable | State::Mismatched(_) | State::Ended => Self::Unknown,
         }
     }
 
     /// Why a bare run of the verb (no `--replace`) is refused in this state, where it is (§4.6):
     /// while this Mac reads the account's token as `active`, `soon`, `exposed` or `unverified`,
-    /// wherever it was minted, or while a token made here is not yet in vault (`pending`), so a
-    /// second Mac never replaces a token that awaits verification on the Mac that made it, and a
-    /// re-run never replaces a write still on its way. `expires_at` dates the words.
+    /// wherever it was minted and whatever this Mac's comparison found of it (one whose windows
+    /// differ here is refused too, and replaced only on a person's `--replace`); while it reads
+    /// it `rejected` and the vault's records put it in use on another Mac (one Mac's refusal is
+    /// no other Mac's), or `unreadable here` (this Mac cannot tell what it replaces); or while a
+    /// token made here is not yet in vault (`pending`), so a second Mac never replaces a token in
+    /// use on every Mac or one that awaits verification on the Mac that made it, and a re-run
+    /// never replaces a write still on its way. `expires_at` dates the words.
     #[must_use]
     pub fn bare_refusal(
         &self,
@@ -865,33 +1571,100 @@ impl TokenState {
             Self::Soon => "active (it ends within 30 days)".to_owned(),
             Self::Exposed(macs) => format!("exposed (removed {}) and valid", macs.join(", ")),
             Self::Unverified {
+                why: Unverified::WindowsDiffer,
+                ..
+            } => "unverified and not used here (its windows are not its stored login's here): \
+                  this Mac starts no session on it, and it is valid"
+                .to_owned(),
+            Self::Unverified {
+                minted_here: true,
+                why: Unverified::AwaitingBasis,
+                ..
+            } => "unverified (awaiting a reading of its stored login here), and valid".to_owned(),
+            Self::Unverified {
+                minted_here: true,
+                why: Unverified::WindowsShared,
+                minted_by,
+                ..
+            } if !minted_by.is_some_and(MintedBy::proves_account) => {
+                "unverified and serving only this Mac (another account here shows the same \
+                 windows, so the comparison could not tell the accounts apart), and valid"
+                    .to_owned()
+            }
+            Self::Unverified {
+                minted_here: true,
+                minted_by,
+                ..
+            } if minted_by.is_some_and(MintedBy::proves_account) => {
+                "unverified, in use on every Mac".to_owned()
+            }
+            Self::Unverified {
                 minted_here: true, ..
             } => "unverified, serving this Mac".to_owned(),
-            Self::Unverified { minted_on, .. } => {
-                format!("made on {minted_on}, serving that Mac until it is verified, and valid")
+            Self::Unverified {
+                minted_on,
+                minted_by,
+                ..
+            } if minted_by.is_some_and(MintedBy::proves_account) => {
+                format!("made on {minted_on}, in use on every Mac, and valid")
             }
+            Self::Unverified { minted_on, .. } => {
+                format!("made on {minted_on}, awaiting verification there, and valid")
+            }
+            Self::Rejected { elsewhere: true } => {
+                "refused by Claude Code on this Mac, and in use on other Macs".to_owned()
+            }
+            Self::Unreadable => "unreadable here (this Mac cannot open it), and other Macs may \
+                                 use it"
+                .to_owned(),
             _ => return None,
         };
         Some(format!("a token for {email} is {state}{until}; {replace}"))
     }
 
     /// The step a surface offers for the account `label` (its row's label, or its email) in this
-    /// state (§5.9), where it offers one: for an account with no token in use here (`none`,
-    /// `ended`, `rejected`, `mismatched`, `unreadable here`) a bare run, and for a token that is
-    /// `soon` or `exposed` a `--replace`, so the step always passes the verb's refusal of a bare
-    /// run. None for `unknown`, `active`, an `unverified` token wherever it was minted, or while a
-    /// token made here is not yet in vault (`pending`).
+    /// state (§5.9), where it offers one: for an account whose token is `none`, `ended`,
+    /// `mismatched`, or `rejected` and in use on no other Mac, a bare run, and for a token that
+    /// is `soon` or `exposed`, `rejected` while in use on other Macs, `unverified (windows
+    /// differ)` on the Mac that made it, or `unverified (windows shared)` there where its route
+    /// did not prove the account, a `--replace`, so the step always passes the verb's refusal of
+    /// a bare run. A token whose windows differ on the Mac that made it is not used there, and a
+    /// session running on it moves back to the account's stored login, so it should be replaced;
+    /// another Mac's finding is its own and offers nothing, since a replacement replaces the
+    /// token on every Mac. One made at a person's terminal, or whose meta names no route, whose
+    /// windows another account here shares could not be told from that account's: it serves
+    /// only the Mac that made it and is never verified, so its replacement is compared afresh.
+    /// None for `unknown`, `active`, `unreadable here` (this Mac's vault, not the token, is what
+    /// to mend), any other `unverified` token wherever it was minted (its verification is still
+    /// to come, or its route put it in use on every Mac), or while a token made here is not yet
+    /// in vault (`pending`).
     #[must_use]
     pub fn offer(&self, label: &str, pending: bool) -> Option<Step> {
         if pending {
             return None;
         }
         let replace = match self {
-            Self::None | Self::Ended | Self::Rejected | Self::Mismatched(_) | Self::Unreadable => {
-                false
+            Self::None
+            | Self::Ended
+            | Self::Rejected { elsewhere: false }
+            | Self::Mismatched(_) => false,
+            Self::Soon
+            | Self::Exposed(_)
+            | Self::Rejected { elsewhere: true }
+            | Self::Unverified {
+                minted_here: true,
+                why: Unverified::WindowsDiffer,
+                ..
+            } => true,
+            Self::Unverified {
+                minted_here: true,
+                why: Unverified::WindowsShared,
+                minted_by,
+                ..
+            } if !minted_by.is_some_and(MintedBy::proves_account) => true,
+            Self::Unknown | Self::Active | Self::Unreadable | Self::Unverified { .. } => {
+                return None;
             }
-            Self::Soon | Self::Exposed(_) => true,
-            Self::Unknown | Self::Active | Self::Unverified { .. } => return None,
         };
         Some(Step::Token {
             label: label.to_owned(),
@@ -952,13 +1725,15 @@ pub trait TokenVault {
     /// # Errors
     /// As that call.
     fn remove(&self, key: &Key, by: Instant) -> Result<MemberUnset, String>;
-    /// Write the token's meta again with `verified` set ([`claude_token::verify`]).
+    /// Write the token's meta again with `verified` set ([`claude_token::verify`]), where the
+    /// vault's token is still the one made at `minted_at`.
     ///
     /// # Errors
     /// As that call.
     fn verify(
         &self,
         key: &Key,
+        minted_at: u64,
         evidence: aterm_secrets::claude_token::Verified,
         on_busy: OnBusy,
     ) -> Result<MemberWritten, String>;
@@ -970,6 +1745,16 @@ pub trait TokenVault {
     /// As that call.
     fn post(&self) -> Result<bool, String> {
         Ok(false)
+    }
+    /// Ask the lab for each of `keys`' tokens through this Mac's need ledger
+    /// ([`aterm_secrets::need::ask_for_tokens`]: raised unless a need of the want is under way or
+    /// the latest was withdrawn by hand): how many it raised. A stand-in raises none.
+    ///
+    /// # Errors
+    /// As that call.
+    fn ask(&self, keys: &[Key]) -> Result<usize, String> {
+        let _ = keys;
+        Ok(0)
     }
 }
 
@@ -1015,14 +1800,20 @@ impl TokenVault for Vault {
     fn verify(
         &self,
         key: &Key,
+        minted_at: u64,
         evidence: aterm_secrets::claude_token::Verified,
         on_busy: OnBusy,
     ) -> Result<MemberWritten, String> {
-        claude_token::verify(&self.0, key, evidence, on_busy).map_err(|e| e.to_string())
+        claude_token::verify(&self.0, key, minted_at, evidence, on_busy).map_err(|e| e.to_string())
     }
     fn post(&self) -> Result<bool, String> {
         aterm_secrets::client::post_records_to_servers(&self.0)
             .map(|posted| posted > 0)
+            .map_err(|e| e.to_string())
+    }
+    fn ask(&self, keys: &[Key]) -> Result<usize, String> {
+        aterm_secrets::need::ask_for_tokens(&self.0, keys)
+            .map(|raised| raised.len())
             .map_err(|e| e.to_string())
     }
 }
@@ -1061,17 +1852,8 @@ struct Account {
 }
 
 impl Account {
-    /// How the verb names it: `<label> (<email>)`, or the email.
-    fn named(&self) -> String {
-        match &self.label {
-            Some(label) => format!("{label} ({})", self.email),
-            None => self.email.clone(),
-        }
-    }
-
-    /// How a run nobody asked for names it (a token made by itself in aterm's sign-in window,
-    /// whose lines reach a log or a captured standard error): its row's label, never its
-    /// address.
+    /// How the verb names it (its token is made by itself in aterm's sign-in window, and its
+    /// lines may reach a log or a captured standard error): its row's label, never its address.
     fn quietly(&self) -> String {
         self.label
             .clone()
@@ -1188,14 +1970,34 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    run_with_clock(env, host, name, mode, out, err, Instant::now)
+    run_with_clock(env, host, name, mode, Via::Desk, out, err, Instant::now)
 }
 
+/// Where a run's token page opens ([`run_with_clock`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Via {
+    /// The verb's own route: aterm's sign-in window at this Mac's own desk, and nowhere else.
+    Desk,
+    /// The account's own headless browser profile, right after a headless sign-in proved it
+    /// (plan package FL-137): nobody is asked, and no window opens.
+    Headless,
+}
+
+/// The most a token's capture on the account's headless profile takes from its start to its
+/// end: the opener's own drive ([`super::open_url::AUTHORIZE_TIMEOUT`]) twice over, for the
+/// browser's start and the CLI's own exchange around it.
+const HEADLESS_ROUTE_WITHIN: Duration = Duration::from_secs(3 * 60);
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the verb's inputs, its route, both streams and its clock, each one its own"
+)]
 fn run_with_clock(
     env: &Env,
     host: &dyn AccountsHost,
     name: &str,
     mode: TokenMode,
+    via: Via,
     out: &mut dyn Write,
     err: &mut dyn Write,
     now: impl FnOnce() -> Instant,
@@ -1204,17 +2006,33 @@ fn run_with_clock(
         let _ = writeln!(err, "aterm harness accounts token: {why}");
         ExitCode::from(1)
     };
-    // On macOS, at this Mac's own desk, the token's page opens in aterm's own sign-in window,
-    // which authorizes it by itself; anywhere else it is a person's to authorize in their
-    // browser, at a terminal of their own.
-    let window = host.opens_sign_in_window();
-    if !window && !super::cli::person_at_terminal(host) {
+    // The token's page opens through aterm's opener and nowhere else: nobody pastes a code. At
+    // this Mac's own desk it opens in aterm's own sign-in window, which authorizes it by itself;
+    // right after a headless sign-in, on the profile it proved. Only a Mac's own desk opens that
+    // window; elsewhere (an SSH session, another Mac's request, a tab another Mac's drive started
+    // or typed into) no page of it could be seen, and the token one Mac's desk makes is in the
+    // vault, which serves it to every Mac once it is verified (§5.6). Removal opens nothing: it
+    // is that window's or a person's at a terminal of their own, on any system.
+    let window = via == Via::Desk && host.opens_sign_in_window();
+    if matches!(mode, TokenMode::Remove) {
+        if !window && !super::cli::person_at_terminal(host) {
+            return refuse(
+                err,
+                "a token is removed at this Mac's own desktop or by a person at its terminal \
+                 (not for another Mac or in a tab another Mac's drive started or typed into)",
+            );
+        }
+    } else if !host.on_macos() {
         return refuse(
             err,
-            "a token is made in aterm's own sign-in window on this Mac's own desktop, or by a \
-             person at this Mac's terminal (an SSH session, another Mac's request and a tab \
-             another Mac's drive started or typed into have neither): run it in a terminal of \
-             your own on this Mac",
+            "a token is made only on macOS, where aterm's wrapper serves it",
+        );
+    } else if via == Via::Desk && !window {
+        return refuse(
+            err,
+            "a token is made in aterm's own sign-in window, which opens only at this Mac's own \
+             desktop (not over SSH, for another Mac, or in a tab another Mac's drive started or \
+             typed into)",
         );
     }
     let logins = host.session_logins(env);
@@ -1244,11 +2062,7 @@ fn run_with_clock(
                 err,
                 &format!(
                     "a token for {} is being made in another tab",
-                    if window {
-                        account.quietly()
-                    } else {
-                        account.email.clone()
-                    }
+                    account.quietly()
                 ),
             );
         }
@@ -1266,9 +2080,7 @@ fn run_with_clock(
         Err(why) => return refuse(err, &format!("the vault could not be read: {why}")),
     }
     let now = u64::try_from(host.now().max(env.now)).unwrap_or(0);
-    let row = read_table(&store)
-        .ok()
-        .and_then(|mut table| table.rows.remove(account.key.as_str()));
+    let table = read_table(&store).ok();
     let standing_wait = if matches!(mode, TokenMode::Remove) {
         STANDING_LOOK
     } else {
@@ -1278,6 +2090,12 @@ fn run_with_clock(
         Ok(found) => found,
         Err(why) => return refuse(err, &format!("the vault could not be read: {why}")),
     };
+    // This Mac's facts of the vault's token: the account's row, or the kept row of the token a
+    // later write of this Mac's replaces.
+    let row = table
+        .as_ref()
+        .and_then(|table| table.row_for(account.key.as_str(), &found))
+        .cloned();
     if matches!(mode, TokenMode::Remove) {
         return remove(
             &store,
@@ -1299,16 +2117,13 @@ fn run_with_clock(
             ),
         );
     }
-    if !host.on_macos() {
-        return refuse(
-            err,
-            "a token is made only on macOS, where aterm's wrapper serves it",
-        );
-    }
     let state = TokenState::of(&found, row.as_ref(), now);
     if state == TokenState::Unknown {
         return refuse(err, "the vault could not be read just now; try again");
     }
+    // The token the vault holds at the preflight: the mint keeps its row by later reads of the
+    // vault, and by this one only where those say nothing ([`record`]).
+    let holds = made_at(&found);
     let pending = vault.waiting_here(&account.key).unwrap_or(true);
     let expires_at = match &found {
         Lookup::Found(standing) => standing.meta.as_ref().map(|meta| meta.expires_at),
@@ -1328,98 +2143,142 @@ fn run_with_clock(
             ),
         );
     };
-    if window {
-        // The opener answers in two files of a private folder this run alone holds.
-        let route = match super::cli::opener_link(&store, host) {
-            Ok(opener) => aterm_tempfile::tempdir().ok().map(|dir| {
-                (
-                    setup_token::WindowRoute {
-                        opener,
-                        outcome: dir.path().join("outcome"),
-                        code: dir.path().join("outcome.code"),
-                    },
-                    dir,
-                )
-            }),
-            Err(why) => return refuse(err, &format!("{why}; nothing was made")),
-        };
-        let Some((route, _held)) = route else {
-            return refuse(
-                err,
-                "no private folder could be made for the sign-in window",
-            );
-        };
-        // The window's route ends by itself: its bound is the window's own, not the wait for
-        // a person at a browser.
-        return mint(
-            (
-                &store,
-                vault.as_ref(),
-                &setup_token::WindowWaiter::new(&route),
-            ),
-            (&account, &program, cli_version, &env_vars, Some(&route)),
-            (
-                host.token_hang().min(super::open_url::WINDOW_ROUTE_WITHIN),
-                host.token_write_wait(),
-                now,
-            ),
-            (out, err),
-        );
-    }
-    let Some(person) = host.token_person() else {
-        return refuse(err, "this host has no terminal to sign in at");
+    let page = match via {
+        Via::Headless => setup_token::OpenerPage::Headless {
+            label: account.label.clone(),
+        },
+        Via::Desk => setup_token::OpenerPage::Window,
     };
+    // The opener answers in two files of a private folder this run alone holds.
+    let route = match super::cli::opener_link(&store, host) {
+        Ok(opener) => aterm_tempfile::tempdir().ok().map(|dir| {
+            (
+                setup_token::OpenerRoute {
+                    opener,
+                    page,
+                    outcome: dir.path().join("outcome"),
+                    code: dir.path().join("outcome.code"),
+                },
+                dir,
+            )
+        }),
+        Err(why) => return refuse(err, &format!("{why}; nothing was made")),
+    };
+    let Some((route, _held)) = route else {
+        return refuse(err, "no private folder could be made for aterm's opener");
+    };
+    // The opener's route ends by itself: its bound is its own.
+    let within = match route.page {
+        setup_token::OpenerPage::Window => super::open_url::WINDOW_ROUTE_WITHIN,
+        setup_token::OpenerPage::Headless { .. } => HEADLESS_ROUTE_WITHIN,
+    };
+    let sign_in = host.token_sign_in(&route);
     mint(
-        (&store, vault.as_ref(), person.as_ref()),
-        (&account, &program, cli_version, &env_vars, None),
-        (host.token_hang(), host.token_write_wait(), now),
+        (&store, vault.as_ref(), sign_in.as_ref()),
+        (&account, &program, cli_version, &env_vars, &route),
+        (
+            host.token_hang().min(within),
+            host.token_write_wait(),
+            now,
+            holds,
+        ),
         (out, err),
     )
 }
 
+/// Where the sign-in a run just made of a row was made, which says where its token is made
+/// ([`after_sign_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignedIn {
+    /// In aterm's own sign-in window, in the account's own store, whose session is the row's.
+    Window,
+    /// Headlessly, by aterm's opener, on a browser profile of aterm's own (a renewal nobody is
+    /// at the window for, this Mac's upkeep of a row with a proven profile).
+    Headless,
+    /// Anywhere else (a person's browser, another browser after the headless try): no browser
+    /// session aterm knows to be the row's.
+    Elsewhere,
+}
+
 /// MAKES AN ACCOUNT'S YEAR-LONG TOKEN IN THE RUN THAT JUST SIGNED IT IN: where `label`'s account
-/// has no token in use here and this run could make one ([`due_after_sign_in`]), the bare verb
-/// runs ([`run`]) with every refusal of its own, and its exit is the answer; `None` where no
-/// token is due, with nothing written. The caller holds no sign-in lock (§4.6: a token is made
-/// under its account's lock, never `signin.lock`), and calls this only after the row's own
-/// sign-in in aterm's sign-in window: the token's page opens there too, in the account's own
-/// store, whose session is the row's, with nobody asked ([`setup_token::WindowRoute`]; one
-/// window at a time, so it waits for another sign-in's). Every other sign-in left no session
-/// aterm knows to be the row's, and is offered the step instead ([`offer_after_sign_in`]):
-/// Claude Code's success names no account, and only the browser's own session says whose
-/// token it made.
+/// has no token in the vault, or only one whose end has passed, and this run could make one
+/// ([`due_facts`]), the verb runs with every refusal of its own, and its exit is the answer;
+/// `None` where no token is made, with nothing written, a token the vault holds that only a
+/// person replaces included. The caller holds no sign-in lock (§4.6: a token is made under its
+/// account's lock, never `signin.lock`), and says where the row's sign-in was made
+/// (`signed_in`):
+///
+/// - in aterm's sign-in window, the token's page opens there too, in the account's own store,
+///   whose session is the row's, with nobody asked ([`setup_token::OpenerPage::Window`]; one
+///   window at a time, so it waits for another sign-in's), as the bare verb ([`run`]) does;
+/// - headlessly, the token's page opens on the account's own headless profile, the second
+///   pinned request on the profile that sign-in proved (plan package FL-137;
+///   [`setup_token::OpenerPage::Headless`]), where `Authorize` is pressed only on a page that
+///   shows the account; with no such profile it is offered instead;
+/// - anywhere else no browser session is known to be the row's, and a token made now could be
+///   another account's (Claude Code's success names none): the step is said once, on `out`,
+///   where the bare verb would make one, and nothing is run or written.
+///
+/// The sign-in is itself what a stopped step waits for, so a record a check left
+/// ([`token_steps`]) does not hold this run, and its capture replaces the record or clears it.
 pub fn after_sign_in(
     env: &Env,
     host: &dyn AccountsHost,
     label: &str,
+    signed_in: SignedIn,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Option<ExitCode> {
-    if !due_after_sign_in(env, host, label) {
+    let via = match signed_in {
+        SignedIn::Window => Via::Desk,
+        SignedIn::Headless => Via::Headless,
+        SignedIn::Elsewhere => {
+            offer_after_sign_in(env, host, label, out);
+            return None;
+        }
+    };
+    if due_facts(env, host, label, via).is_none() {
+        if via == Via::Headless {
+            offer_after_sign_in(env, host, label, out);
+        }
         return None;
     }
-    let _ = writeln!(
-        out,
-        "{label}: it has no year-long token in use here, so this run makes one, as `aterm \
-         harness accounts token {label}` does"
-    );
+    let _ = match via {
+        Via::Desk => writeln!(
+            out,
+            "{label}: it has no year-long token in use here, so this run makes one, as `aterm \
+             harness accounts token {label}` does"
+        ),
+        Via::Headless => writeln!(
+            out,
+            "{label}: it has no year-long token in use here, so this run makes one on the \
+             headless browser profile it just signed in on"
+        ),
+    };
     let _ = out.flush();
-    Some(run(env, host, label, TokenMode::Make, out, err))
+    Some(run_with_clock(
+        env,
+        host,
+        label,
+        TokenMode::Make,
+        via,
+        out,
+        err,
+        Instant::now,
+    ))
 }
 
-/// OFFERS THE STEP WHERE THE RUN THAT SIGNED AN ACCOUNT IN MAKES NO TOKEN: where `label`'s
-/// token is due ([`due_after_sign_in`]) and its sign-in was not made in aterm's sign-in
-/// window, no browser session is known to be the account's, and a token made now could be
-/// another account's (Claude Code's success names none). The step is said once, on `out`, and
-/// nothing is run or written.
-pub fn offer_after_sign_in(env: &Env, host: &dyn AccountsHost, label: &str, out: &mut dyn Write) {
-    if !due_after_sign_in(env, host, label) {
+/// Says the step once, on `out`, where the bare verb would make `label`'s token and the run that
+/// signed it in makes none ([`after_sign_in`]); nothing is run or written.
+fn offer_after_sign_in(env: &Env, host: &dyn AccountsHost, label: &str, out: &mut dyn Write) {
+    if due_facts(env, host, label, Via::Desk).is_none() {
         return;
     }
     let _ = writeln!(
         out,
-        "{label}: it has no year-long token in use here; this run did not sign it in in aterm's \
-         sign-in window, so it makes none: run `{}`",
+        "{label}: it has no year-long token in use here; this run signed it in neither in \
+         aterm's sign-in window nor on a headless browser profile a sign-in proved, so it makes \
+         none: run `{}`",
         Step::Token {
             label: label.to_owned(),
             replace: false,
@@ -1427,62 +2286,123 @@ pub fn offer_after_sign_in(env: &Env, host: &dyn AccountsHost, label: &str, out:
     );
 }
 
-/// Whether [`after_sign_in`] makes `label`'s token: this Mac may open its sign-in window or a
-/// person is at its terminal, this is macOS on the default route, this Mac writes its vault,
-/// and the account's state offers a bare run ([`TokenState::offer`]: no token in use here,
-/// and none made here still waiting). A quick look ([`STANDING_LOOK`]) that reads and writes
-/// nothing else; anything it cannot read is not due, and the verb's own surface still offers
-/// the step.
-fn due_after_sign_in(env: &Env, host: &dyn AccountsHost, label: &str) -> bool {
-    if !(host.opens_sign_in_window() || super::cli::person_at_terminal(host))
-        || !host.on_macos()
-        || setup_token::route_in(&host.verb_env()).is_some()
-    {
-        return false;
-    }
-    let Ok(account) = account_of(env, label, &host.session_logins(env)) else {
-        return false;
-    };
-    let (Some(store), Some(vault)) = (env.accounts_store_for(Cli::Claude), host.token_vault())
+/// WHETHER `label`'S TOKEN STEP IS DUE ON A PASS NO EVENT OF ITS OWN STARTED (plan package FL-136;
+/// what FL-138's upkeep asks before it runs the verb): the step is due as it is after a sign-in
+/// ([`due_facts`]), and no stop holds it ([`token_steps::Stopped::holds`]): a record left by a
+/// capture that a check, or what another try alone does not pass, stopped is held until the
+/// Claude Code build a capture would run or this aterm's build differs from the one that met it,
+/// the account's window store or a mailbox configuration is written after it
+/// ([`token_steps::route_at`]), or a token for the account is made after it. No time alone lets
+/// it through. A steps file that does not read holds every step.
+pub fn step_due(env: &Env, host: &dyn AccountsHost, label: &str) -> bool {
+    let Some(StepDue {
+        account,
+        store,
+        found,
+    }) = due_facts(env, host, label, Via::Desk)
     else {
         return false;
     };
+    let Ok(steps) = token_steps::read(&store) else {
+        return false;
+    };
+    let Some(stopped) = steps.get(account.key.as_str()) else {
+        return true;
+    };
+    let cli = host.setup_token_program().map(|(_, version)| version);
+    let aterm = aterm_stamp::build_id();
+    !stopped.holds(&token_steps::Since {
+        cli: cli.as_deref(),
+        aterm: Some(&aterm),
+        route_at: token_steps::route_at(&store, env.home.as_deref(), &account.email),
+        token_at: made_at(&found),
+    })
+}
+
+/// When the token `found` names was made, where the vault holds one with its meta.
+fn made_at(found: &Lookup<Standing>) -> Option<u64> {
+    match found {
+        Lookup::Found(standing) => standing.meta.as_ref().map(|meta| meta.minted_at),
+        Lookup::Absent | Lookup::Unknown => None,
+    }
+}
+
+/// What [`due_facts`] read of an account whose token step is due.
+struct StepDue {
+    account: Account,
+    store: Store,
+    found: Lookup<Standing>,
+}
+
+/// The account `label` names, its store and the vault's standing of its token, where its step
+/// is due on the route `via`: by the verb's own route, this Mac may open its sign-in window; on
+/// the headless route, the account has the headless profile a
+/// sign-in proved ([`super::headless_oauth::has_browser_profile`]). Either way this is macOS on
+/// the default route, this Mac writes its vault, none made here still waits, and the account's
+/// state, judged by this Mac's facts of the vault's token ([`Table::row_for`]), is `none` or
+/// `ended`: a gap to fill. A token the vault holds that this Mac reads otherwise (`rejected`,
+/// `unreadable here`, `mismatched`, or in use) may be every other Mac's, and only a person
+/// replaces it: a run nobody typed never does, and the verb's own surface still offers the step
+/// ([`TokenState::offer`]). A quick look ([`STANDING_LOOK`]) that reads and writes nothing else;
+/// anything it cannot read is not due.
+fn due_facts(env: &Env, host: &dyn AccountsHost, label: &str, via: Via) -> Option<StepDue> {
+    if (via == Via::Desk && !host.opens_sign_in_window())
+        || !host.on_macos()
+        || setup_token::route_in(&host.verb_env()).is_some()
+    {
+        return None;
+    }
+    let account = account_of(env, label, &host.session_logins(env)).ok()?;
+    let (Some(store), Some(vault)) = (env.accounts_store_for(Cli::Claude), host.token_vault())
+    else {
+        return None;
+    };
+    if via == Via::Headless
+        && !super::headless_oauth::has_browser_profile(&store.dir, label, Some(&account.email))
+    {
+        return None;
+    }
     let by = || Instant::now() + STANDING_LOOK;
     if !vault
         .route(by())
         .is_ok_and(|route| route_refusal(route).is_none())
     {
-        return false;
+        return None;
     }
-    let Ok(found) = vault.standing(&account.key, by()) else {
-        return false;
-    };
-    let row = read_table(&store)
-        .ok()
-        .and_then(|mut table| table.rows.remove(account.key.as_str()));
+    let found = vault.standing(&account.key, by()).ok()?;
+    let table = read_table(&store).ok();
+    let row = table
+        .as_ref()
+        .and_then(|table| table.row_for(account.key.as_str(), &found));
     let now = u64::try_from(host.now().max(env.now)).unwrap_or(0);
     let pending = vault.waiting_here(&account.key).unwrap_or(true);
-    matches!(
-        TokenState::of(&found, row.as_ref(), now).offer(label, pending),
-        Some(Step::Token { replace: false, .. })
-    )
+    (!pending
+        && matches!(
+            TokenState::of(&found, row, now),
+            TokenState::None | TokenState::Ended
+        ))
+    .then_some(StepDue {
+        account,
+        store,
+        found,
+    })
 }
 
 /// What [`mint`] makes a token of: the account, the Claude Code build and its version, the
-/// verb's environment, and aterm's sign-in window where the capture's page opens there.
+/// verb's environment, and aterm's opener, through which the capture's page opens.
 type MintInputs<'a> = (
     &'a Account,
     &'a Program,
     String,
     &'a [(std::ffi::OsString, std::ffi::OsString)],
-    Option<&'a setup_token::WindowRoute>,
+    &'a setup_token::OpenerRoute,
 );
 
 /// The steps after the preflight: the capture, the write, the row, the journal, the outcome.
 fn mint(
-    (store, vault, person): (&Store, &dyn TokenVault, &dyn Person),
-    (account, program, cli_version, env_vars, window): MintInputs<'_>,
-    (hang, write_wait, now): (Duration, Option<Duration>, u64),
+    (store, vault, sign_in): (&Store, &dyn TokenVault, &dyn SignIn),
+    (account, program, cli_version, env_vars, route): MintInputs<'_>,
+    (hang, write_wait, now, holds): (Duration, Option<Duration>, u64, Option<u64>),
     (out, err): (&mut dyn Write, &mut dyn Write),
 ) -> ExitCode {
     let refuse = |err: &mut dyn Write, why: &str| {
@@ -1490,33 +2410,48 @@ fn mint(
         ExitCode::from(1)
     };
     let deadline = WakeDeadline::after(hang);
-    person.say(&if window.is_some() {
-        format!(
+    let page = &route.page;
+    sign_in.say(&match page {
+        setup_token::OpenerPage::Window => format!(
             "making a Claude Code token for {} in aterm's sign-in window",
             account.quietly()
-        )
-    } else {
-        format!(
-            "making a Claude Code token for {}: sign in as {}",
-            account.named(),
-            account.email
-        )
+        ),
+        setup_token::OpenerPage::Headless { .. } => format!(
+            "making a Claude Code token for {} on its headless browser profile",
+            account.quietly()
+        ),
     });
     let root = store
         .shared_dir()
         .join(TOKENS_DIR)
         .join(account.key.as_str());
+    let started = Instant::now();
     let minted = setup_token::capture(
         &Capture {
             program,
             store: &root,
             sign_in_as: &account.email,
             env: env_vars,
-            window,
+            opener: route,
             deadline,
         },
-        person,
+        sign_in,
     );
+    // What the capture reached updates the account's step record (FL-136): a stop that holds
+    // the step replaces it, and a token made, which passed the page, clears it. Any other end
+    // (a browser that did not start, an interrupt, a token of another account) leaves it as it
+    // was: the stop it records still stands until an event releases it.
+    let stopped = held_by(&minted, page).and_then(|word| {
+        token_steps::Stopped::new(
+            word,
+            stop_second(now, started),
+            &cli_version,
+            &aterm_stamp::build_id(),
+        )
+    });
+    if stopped.is_some() || minted.is_ok() {
+        hold(store, &account.key, stopped.as_ref(), err);
+    }
     let minted: Minted = match minted {
         Ok(minted) => minted,
         Err(setup_token::Error::Stopped) => {
@@ -1530,21 +2465,29 @@ fn mint(
             note(TokenNote::WrongAccount, &account.key, now);
             return refuse(
                 err,
-                &if window.is_some() {
-                    format!(
-                        "Claude Code made a token for another account than {}'s; nothing was \
-                         stored",
-                        account.quietly()
-                    )
-                } else {
-                    format!(
-                        "Claude Code made a token for another account; sign in as {}",
-                        account.email
-                    )
-                },
+                &format!(
+                    "Claude Code made a token for another account than {}'s; nothing was stored",
+                    account.quietly()
+                ),
             );
         }
-        Err(why) => return refuse(err, &capture_words(&why)),
+        Err(why) => {
+            let mut line = match &why {
+                // The opener's own record says where and why, for this run's words alone: the
+                // step's record keeps its word.
+                setup_token::Error::Opener(word) => opener_words(
+                    &route.page,
+                    &super::open_url::read_outcome(&route.outcome)
+                        .filter(|met| met.word == *word)
+                        .map_or_else(|| word.words(), |met| met.words()),
+                ),
+                _ => capture_words(&why),
+            };
+            if stopped.is_some() {
+                line.push_str(&held_words(account));
+            }
+            return refuse(err, &line);
+        }
     };
     let Some((expires_at, expiry_from)) = minted.expiry() else {
         return refuse(
@@ -1565,10 +2508,30 @@ fn mint(
         expiry_from,
         minted_on,
         cli: cli_version,
+        // aterm's window presses Authorize only on a consent page that names the row's account,
+        // or names none in a store its own acts proved is that account's (the mailbox's code or
+        // link, never a code a person typed: `signin_window`); the headless route presses it only
+        // on a page that shows the account's address and no human check
+        // (`headless_token_consent`); and both refuse a token for another (`WrongAccount`
+        // above), so either mint proved the account.
+        minted_by: Some(match page {
+            setup_token::OpenerPage::Window => MintedBy::Window,
+            setup_token::OpenerPage::Headless { .. } => MintedBy::Headless,
+        }),
         verified: None,
     };
+    // The token the vault holds just before the write, read after the capture's minutes: the one a
+    // standing read before the write lands names, so the one whose row a landed write keeps
+    // ([`record`]). The preflight's word stands only where this read says nothing.
+    let before = vault_holds(
+        vault
+            .standing(&account.key, Instant::now() + STANDING_LOOK)
+            .ok()
+            .as_ref(),
+    )
+    .unwrap_or(holds);
     let patience = write_wait.map_or(deadline, WakeDeadline::after);
-    let written = store_patiently(vault, &account.key, &minted.token, &meta, person, patience);
+    let written = store_patiently(vault, &account.key, &minted.token, &meta, sign_in, patience);
     drop(minted);
     let written = match written {
         Ok(written) => written,
@@ -1582,6 +2545,29 @@ fn mint(
             );
         }
     };
+    // The vault's token once the write has returned, read before the row. Where it is another
+    // token than this one (the write waits, or another Mac's took its place), the row the mint
+    // keeps is that token's ([`record`]): a first `--replace`'s write may have landed while this
+    // one's waited, and its token been found `differ` since. Where it is this one, the write
+    // landed, and the row kept is that of the token the vault held just before it, which
+    // standings read before it landed still name. Where this read says nothing, that one too.
+    let after = match &written {
+        MemberWritten::Posted
+        | MemberWritten::SignedHere
+        | MemberWritten::Waiting(_)
+        | MemberWritten::Overtaken(_) => vault
+            .standing(&account.key, Instant::now() + STANDING_LOOK)
+            .ok(),
+        MemberWritten::Refused(_)
+        | MemberWritten::Busy
+        | MemberWritten::NotSeated
+        | MemberWritten::NoLog => None,
+    };
+    let holds = match vault_holds(after.as_ref()) {
+        Some(Some(at)) if at == meta.minted_at => before,
+        Some(after) => after,
+        None => before,
+    };
     let vault_col = match &written {
         MemberWritten::Posted => InVault::InVault,
         MemberWritten::SignedHere => InVault::SignedHere,
@@ -1590,7 +2576,7 @@ fn mint(
             let by = by
                 .as_ref()
                 .map_or_else(|| "another Mac".to_owned(), |by| by.label.clone());
-            if let Err(why) = record(store, account, &meta, InVault::Overtaken(by.clone()), None) {
+            if let Err(why) = record(store, account, &meta, InVault::Overtaken(by.clone()), holds) {
                 let _ = writeln!(err, "aterm harness accounts token: {TABLE_FILE}: {why}");
             }
             return refuse(
@@ -1626,16 +2612,25 @@ fn mint(
             );
         }
     };
-    let signer = match vault_col {
-        InVault::InVault | InVault::SignedHere => {
-            match vault.standing(&account.key, Instant::now() + STANDING_LOOK) {
-                Ok(Lookup::Found(standing)) => standing.signer,
-                _ => None,
+    // Until the row is written, a session served the new token finds no row of it, which holds
+    // it for its basis ([`Unverified::of`]). Its signer is the read's, where it read this token.
+    let recorded = record(store, account, &meta, vault_col.clone(), holds);
+    if recorded.is_ok()
+        && matches!(vault_col, InVault::InVault | InVault::SignedHere)
+        && let Some(Lookup::Found(standing)) = after
+        && standing.meta.as_ref().map(|m| m.minted_at) == Some(meta.minted_at)
+        && let Some(signer) = standing.signer
+    {
+        let _ = update_table(store, |table| {
+            if let Some(row) = table
+                .rows
+                .get_mut(account.key.as_str())
+                .filter(|row| row.minted_at == Some(meta.minted_at))
+            {
+                row.signer = Some(signer);
             }
-        }
-        _ => None,
-    };
-    let recorded = record(store, account, &meta, vault_col.clone(), signer);
+        });
+    }
     note(
         TokenNote::Minted(meta.expiry_from),
         &account.key,
@@ -1644,9 +2639,16 @@ fn mint(
     let valid = valid_words(minted_lifetime(&meta), meta.expires_at);
     let held = account.held_note();
     let line = match &vault_col {
+        InVault::InVault if meta.minted_by.is_some_and(MintedBy::proves_account) => format!(
+            "stored a Claude Code token for {} in the vault, {valid}; it serves every Mac, each \
+             one where the account's stored login is usable once a session on that login there \
+             has reported its windows{held}",
+            account.email
+        ),
         InVault::InVault => format!(
-            "stored a Claude Code token for {} in the vault, {valid}; it serves this Mac until \
-             its account is verified{held}",
+            "stored a Claude Code token for {} in the vault, {valid}; it serves this Mac once a \
+             session on the account's stored login here has reported its windows, and every Mac \
+             once it is verified{held}",
             account.email
         ),
         InVault::SignedHere => format!(
@@ -1670,6 +2672,67 @@ fn mint(
         );
     }
     ExitCode::SUCCESS
+}
+
+/// What a capture that ended as `end` holds the account's token step on (FL-136): the closed
+/// word of what its opener met, in aterm's sign-in window or on the account's headless profile
+/// (FL-137), where another try alone does not pass it
+/// ([`super::open_url::MetWord::holds_a_token_step`]), or the window's deadline where the
+/// window's route ran out; `None` for any other end, a token included, a headless route that
+/// ran out (its opener names every check it stood on).
+fn held_by(
+    end: &Result<Minted, setup_token::Error>,
+    page: &setup_token::OpenerPage,
+) -> Option<super::open_url::MetWord> {
+    match end {
+        Err(setup_token::Error::Opener(word)) if word.holds_a_token_step() => Some(*word),
+        Err(setup_token::Error::Hang) if *page == setup_token::OpenerPage::Window => {
+            Some(super::open_url::MetWord::WindowDeadline)
+        }
+        _ => None,
+    }
+}
+
+/// The second a capture that started at `started`, in a run whose clock read `now` before it,
+/// ended: never earlier than this Mac's clock reads now, so a file the capture itself wrote is
+/// never read as written after its stop ([`token_steps::Stopped::holds`]).
+fn stop_second(now: u64, started: Instant) -> u64 {
+    aterm_time::unix_secs()
+        .unwrap_or(0)
+        .max(now.saturating_add(started.elapsed().as_secs()))
+}
+
+/// Leaves the account `key`'s step record as a capture that just ended says (FL-136): `stopped`,
+/// journaled `token-stopped` with its word, or none, for a capture that made a token. What
+/// cannot be written is said on `err`; the capture's own outcome stands either way.
+fn hold(store: &Store, key: &Key, stopped: Option<&token_steps::Stopped>, err: &mut dyn Write) {
+    if let Err(why) = token_steps::put(store, key.as_str(), stopped) {
+        let _ = writeln!(
+            err,
+            "aterm harness accounts token: {}: {why}",
+            token_steps::STEPS_FILE
+        );
+    }
+    if let Some(stopped) = stopped {
+        note(TokenNote::Stopped(stopped.why()), key, stopped.at);
+    }
+}
+
+/// What a refusal adds where its stop holds the account's step: what tries it again.
+fn held_words(account: &Account) -> String {
+    let person = account.label.as_ref().map_or_else(String::new, |label| {
+        format!(
+            ", or by `{}`",
+            Step::Token {
+                label: label.clone(),
+                replace: false,
+            }
+        )
+    });
+    format!(
+        "; it is tried again only at the account's next sign-in in aterm's sign-in window or on \
+         its headless browser profile, with a new Claude Code or aterm build{person}"
+    )
 }
 
 /// How long a token's meta says it lasts, as the capture's words would: printed days, else
@@ -1699,6 +2762,22 @@ fn valid_words(lifetime: Lifetime, expires_at: u64) -> String {
     }
 }
 
+/// The verb's words for a capture whose page aterm's opener opened at `page` and that ended on
+/// what the opener met, `met` being that in words.
+fn opener_words(page: &setup_token::OpenerPage, met: &str) -> String {
+    match page {
+        setup_token::OpenerPage::Window => {
+            format!(
+                "the sign-in in aterm's sign-in window did not complete: {met}; nothing was made"
+            )
+        }
+        setup_token::OpenerPage::Headless { .. } => format!(
+            "the token's consent page on the account's headless browser profile did not \
+             complete: {met}; nothing was made"
+        ),
+    }
+}
+
 /// The verb's words for a capture that made no token: fixed sentences, none holding a byte the
 /// child wrote.
 fn capture_words(why: &setup_token::Error) -> String {
@@ -1722,11 +2801,10 @@ fn capture_words(why: &setup_token::Error) -> String {
                 .to_owned()
         }
         Error::Stopped => "stopped; nothing was made".to_owned(),
-        Error::Window(why) => {
-            format!(
-                "the sign-in in aterm's sign-in window did not complete: {why}; nothing was made"
-            )
-        }
+        Error::Opener(word) => format!(
+            "the sign-in aterm's opener ran did not complete: {}; nothing was made",
+            word.words()
+        ),
         Error::NoToken => "Claude Code ended without showing a token".to_owned(),
         Error::TwoTokens => "Claude Code showed two different tokens; nothing was kept".to_owned(),
         Error::Unchecked => {
@@ -1736,7 +2814,8 @@ fn capture_words(why: &setup_token::Error) -> String {
         Error::WrongAccount(_) => "Claude Code made a token for another account".to_owned(),
         Error::Failed(failure) => match failure {
             Failure::CodeIncomplete => {
-                "Claude Code says the pasted code was incomplete; nothing was made".to_owned()
+                "Claude Code did not take the code aterm's opener handed over; nothing was made"
+                    .to_owned()
             }
             Failure::Exchange => {
                 "Claude Code could not exchange the sign-in for a token; nothing was made"
@@ -1754,31 +2833,34 @@ fn capture_words(why: &setup_token::Error) -> String {
     }
 }
 
-/// Writes both entries as a member write, never throwing the made token away (§4.6): each try
-/// waits a tick for a vault pass to let go ([`OnBusy::Refuse`], which leaves nothing behind);
-/// once `deadline` passes, or at Ctrl-C, the write lands in the vault's waiting writes at once
-/// ([`OnBusy::Wait`], `Waiting{LockDeadline}`), for the next vault pass. One line says it waits.
+/// Writes both entries as a member write, never throwing the made token away while the vault can
+/// take it (§4.6): each try waits a tick for a vault pass to let go ([`OnBusy::Refuse`], which
+/// leaves nothing behind); once `deadline` passes, or at Ctrl-C, the write lands in the vault's
+/// waiting writes ([`OnBusy::Wait`], `Waiting{LockDeadline}`), for the next vault pass, as soon
+/// as this Mac's other writers of its vault let it read the log and land, which it waits for up
+/// to a minute for each of the two locks they hold. One line says it waits.
 ///
 /// # Errors
-/// The vault's error.
+/// The vault's error, one where another writer of this Mac's vault held a lock past that minute
+/// included: nothing is stored then.
 pub fn store_patiently(
     vault: &dyn TokenVault,
     key: &Key,
     token: &SecretBytes,
     meta: &Meta,
-    person: &dyn Person,
+    sign_in: &dyn SignIn,
     deadline: WakeDeadline,
 ) -> Result<MemberWritten, String> {
     let mut said = false;
     loop {
-        if person.stopped() || deadline.passed() {
+        if sign_in.stopped() || deadline.passed() {
             return vault.write(key, token, meta, OnBusy::Wait(Instant::now()));
         }
         let by = Instant::now() + deadline.remaining().min(WRITE_TICK);
         match vault.write(key, token, meta, OnBusy::Refuse(by))? {
             MemberWritten::Busy => {
                 if !said {
-                    person.say("waiting for the vault (a vault pass is running)");
+                    sign_in.say("waiting for the vault (a vault pass is running)");
                     said = true;
                 }
             }
@@ -1787,17 +2869,28 @@ pub fn store_patiently(
     }
 }
 
-/// Records the account's row after a mint: every owner-named field, the vault column, the signer.
+/// Records the account's row after a mint: every owner-named field and the vault column (the
+/// signer is set after). The row it replaces, of another token, is kept ([`Table::replaced`])
+/// where it is of the token the vault holds (`holds`: the vault's token once the mint's write
+/// returned, where that is another than the mint's own; else, the write having landed or that
+/// read saying nothing, the one the vault held just before the write; the preflight's word only
+/// where neither read said anything), and so is the row kept before it where that one is: the
+/// vault holds that token until the new one lands (a write that waits), and a standing read
+/// before it landed still names it, so it is judged by its own facts here meanwhile. Which
+/// token the vault holds is the vault's word, never the earlier row's `vault` column, which says
+/// what the vault said of that row's write when it was made. A token the vault does not hold
+/// keeps no row.
 fn record(
     store: &Store,
     account: &Account,
     meta: &Meta,
     vault: InVault,
-    signer: Option<String>,
+    holds: Option<u64>,
 ) -> io::Result<()> {
+    let key = account.key.as_str().to_owned();
     update_table(store, |table| {
-        table.rows.insert(
-            account.key.as_str().to_owned(),
+        let earlier = table.rows.insert(
+            key.clone(),
             TokenRow {
                 key: account.key.as_str().to_owned(),
                 email: meta.email.clone(),
@@ -1808,16 +2901,33 @@ fn record(
                 expires_at: Some(meta.expires_at),
                 expiry_from: Some(expiry_word(meta.expiry_from).to_owned()),
                 minted_on: Some(meta.minted_on.clone()),
-                signer,
+                signer: None,
                 used_on: UsedOn::default(),
                 vault,
                 verified: None,
                 verification: Verification::default(),
-                rejected_at: None,
                 removed_at: None,
             },
         );
+        let held = |row: &TokenRow| {
+            row.minted_at.is_some() && row.minted_at == holds && holds != Some(meta.minted_at)
+        };
+        let kept = table.replaced.remove(&key);
+        if let Some(kept) = earlier.filter(held).or_else(|| kept.filter(held)) {
+            table.replaced.insert(key, kept);
+        }
     })
+}
+
+/// Which token a read of the vault's standing (`read`, `None` where it failed) says the vault
+/// holds: `Some(Some(minted_at))` for one whose meta opens here, `Some(None)` for none, and `None`
+/// where the read says nothing (it failed or could not be settled, or the meta does not open).
+fn vault_holds(read: Option<&Lookup<Standing>>) -> Option<Option<u64>> {
+    match read? {
+        Lookup::Found(standing) => standing.meta.as_ref().map(|meta| Some(meta.minted_at)),
+        Lookup::Absent => Some(None),
+        Lookup::Unknown => None,
+    }
 }
 
 pub(super) const fn expiry_word(from: ExpiryFrom) -> &'static str {
@@ -1844,6 +2954,8 @@ pub(super) enum TokenNote {
     WrongAccount,
     /// `token-offered`: a surface offered a token for the account, once per state pair.
     Offered,
+    /// `token-stopped`, with the stop's word ([`token_steps::Stopped::why`]).
+    Stopped(&'static str),
 }
 
 /// Journals `what` about the account `key` at `t`: value-free, the key naming the account.
@@ -1861,6 +2973,7 @@ pub(super) fn note(what: TokenNote, key: &Key, t: u64) {
         TokenNote::Verified => journal::token_note(TokenEvent::Verified, account, t, None),
         TokenNote::WrongAccount => journal::wrong_token_account(account, t),
         TokenNote::Offered => journal::token_note(TokenEvent::Offered, account, t, None),
+        TokenNote::Stopped(why) => journal::token_note(TokenEvent::Stopped, account, t, Some(why)),
     };
     #[cfg(test)]
     NOTED.with(|noted| noted.borrow_mut().push(note));
@@ -1967,7 +3080,6 @@ fn remove(
                 vault: InVault::Removed,
                 verified: None,
                 verification: Verification::default(),
-                rejected_at: None,
                 removed_at: None,
             });
         table.rows.insert(
@@ -1991,12 +3103,15 @@ fn remove(
 }
 
 /// THE ROWS OF `roster` THAT RUN ON THEIR VAULT TOKEN ON THIS MAC (§5.8), each with its token's
-/// end (unix seconds): a row whose account's token, read value-free from the vault at `paths` in
-/// one read ([`claude_token::listed`]) and judged with this Mac's table in `store` at `now`, is in
-/// use here with its record naming the row's email
-/// ([`super::token_route::standing_judged`]). Renewal is off for them: the upkeep never signs one
-/// in by itself, and `accounts renew <label>` says so. Empty where the vault could not be read
-/// just now (renewal then goes on as before, which signs in nothing a token would have served).
+/// end (unix seconds): a row whose login is made here ([`accounts::enrolled`]) and whose
+/// account's token, read value-free from the vault at `paths` in one read
+/// ([`claude_token::listed`]) and judged with this Mac's table in `store` at `now`, is in use here
+/// with its record naming the row's email ([`super::token_route::standing_judged`]). Renewal is
+/// off for them: the upkeep never signs one in by itself, and `accounts renew <label>` says so.
+/// A row with no login made here is none, whatever its token: no launch starts on it here
+/// ([`accounts::LoginHere::NotMade`]), so its sign-in goes on and makes its login. Empty where the
+/// vault could not be read just now (renewal then goes on as before, which signs in nothing a
+/// token would have served).
 #[must_use]
 pub fn rows_on_token(
     paths: &Paths,
@@ -2017,17 +3132,40 @@ pub fn rows_on_token_read(
     roster: &Roster,
     now: i64,
 ) -> Option<BTreeMap<String, u64>> {
+    rows_on_token_of(
+        paths,
+        claude_token::listed(paths).unwrap_or(Lookup::Unknown),
+        store,
+        roster,
+        now,
+    )
+}
+
+/// [`rows_on_token_read`] over a listing of the vault at `paths` already read (`listed`, as
+/// [`claude_token::listed`] returns it): `None` where it is unknown. `paths` names the home whose
+/// stored logins the judgment's hold reads ([`super::token_route::standing_judged`]); no vault is
+/// read here.
+#[must_use]
+pub fn rows_on_token_of(
+    paths: &Paths,
+    listed: Lookup<Vec<Standing>>,
+    store: &Store,
+    roster: &Roster,
+    now: i64,
+) -> Option<BTreeMap<String, u64>> {
     let mut out = BTreeMap::new();
-    let standings = match claude_token::listed(paths) {
-        Ok(Lookup::Found(standings)) => standings,
-        Ok(Lookup::Absent) => return Some(out),
-        Ok(Lookup::Unknown) | Err(_) => return None,
+    let standings = match listed {
+        Lookup::Found(standings) => standings,
+        Lookup::Absent => return Some(out),
+        Lookup::Unknown => return None,
     };
     let now = u64::try_from(now).unwrap_or(0);
+    let enrolled = accounts::enrolled(roster);
     for row in &roster.rows {
-        let (Some(entry), Some(email)) = (
+        let (Some(entry), Some(email), true) = (
             accounts::TokenEntry::of_row(row),
             row.expected_identity_email(),
+            enrolled.contains(&row.label),
         ) else {
             continue;
         };
@@ -2042,8 +3180,15 @@ pub fn rows_on_token_read(
             email: email.to_owned(),
         };
         let found = Lookup::Found(standing.clone());
-        if super::token_route::standing_judged(&found, store, &standing.key, &account, now)
-            == super::token_route::TokenFact::InUse
+        if super::token_route::standing_judged(
+            &found,
+            paths,
+            store,
+            Some(roster),
+            &standing.key,
+            &account,
+            now,
+        ) == super::token_route::TokenFact::InUse
             && let Some(meta) = standing.meta.as_ref()
         {
             out.insert(row.label.clone(), meta.expires_at);

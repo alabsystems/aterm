@@ -315,7 +315,13 @@ fn a_kept_workers_later_exit_closes_its_task_once_through_the_real_event_loop() 
     );
     let mut ctl = admitted(&sock);
     await_status_of(&mut ctl, sid, "restore", "exact");
-    let working = task(&mut ctl, sid);
+    // The harness host marks the restored worker's task after the restore reports exact
+    // (`credit_claim::note_restored_worker`): wait for that mark (a hang detector).
+    let working = aterm_spec::wait::within(HANG, GAP, || {
+        let record = task(&mut ctl, sid);
+        (fields(&record).get("state") == Some(&"working")).then_some(record)
+    })
+    .unwrap_or_else(|| task(&mut ctl, sid));
     assert_eq!(fields(&working).get("state"), Some(&"working"), "{working}");
     assert_eq!(fields(&working).get("why"), Some(&"restored"), "{working}");
     assert_eq!(

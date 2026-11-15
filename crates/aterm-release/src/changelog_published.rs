@@ -38,13 +38,8 @@ pub(crate) fn gate(
     if input.is_empty() {
         return Ok(());
     }
-    let out = git.git_input(
-        &[
-            "--no-lazy-fetch",
-            "--no-replace-objects",
-            "cat-file",
-            "--batch",
-        ],
+    let out = git.git_read_input(
+        &["--no-replace-objects", "cat-file", "--batch"],
         input.as_bytes(),
     )?;
     if !out.success() || out.stdout.len() > 256 * 1024 * 1024 {
@@ -68,7 +63,6 @@ pub(crate) fn gate(
             let tree = git_read_ok(
                 git,
                 &[
-                    "--no-lazy-fetch",
                     "--no-replace-objects",
                     "ls-tree",
                     &format!("{tag}^{{commit}}"),

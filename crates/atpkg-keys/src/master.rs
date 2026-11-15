@@ -1,14 +1,20 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Paper master phrase generation, terminal prompting, and Ed25519 key derivation.
+//! Paper master phrase generation, its vault store, and Ed25519 key derivation. The vault is the
+//! phrase's one store ([`aterm_secrets::paper_master`]): [`from_vault`] reads it, and
+//! [`MasterPhrase::store_in_vault`] writes a new one; no path prints it or reads it from a
+//! terminal, argv, the environment or stdin.
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
-/// Number of base32 characters in the written master phrase.
-pub const MASTER_PHRASE_LEN: usize = 52;
+/// Number of base32 characters in the master phrase.
+pub const MASTER_PHRASE_LEN: usize = aterm_secrets::paper_master::LEN;
 
-const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+const ALPHABET: &[u8; 32] = aterm_secrets::paper_master::ALPHABET;
+
+/// Reason a master phrase was refused; it holds no symbol of the phrase.
+pub use aterm_secrets::paper_master::PhraseError;
 
 /// Overwrites `buf` with zeroes via volatile writes and a sequential-consistency compiler fence.
 pub fn scrub(buf: &mut [u8]) {
@@ -104,7 +110,7 @@ impl MasterSeed {
     }
 }
 
-/// Written 52-character base32 master phrase, `mlock`ed and volatile-scrubbed on drop.
+/// The 52-character base32 master phrase, `mlock`ed and volatile-scrubbed on drop.
 pub struct MasterPhrase {
     chars: [u8; MASTER_PHRASE_LEN],
 }
@@ -136,6 +142,31 @@ impl MasterPhrase {
         scrub(&mut bytes);
         seed
     }
+
+    /// Writes this new phrase into the vault ([`aterm_secrets::paper_master::store`]), the one
+    /// place it is kept.
+    ///
+    /// # Errors
+    /// The vault refused it: this Mac cannot publish as the vault's admin, or the vault already
+    /// holds a phrase.
+    pub fn store_in_vault(&self, paths: &aterm_secrets::client::Paths) -> Result<(), String> {
+        aterm_secrets::paper_master::store(paths, &self.chars).map_err(|e| {
+            let mut s = String::from("the vault did not take the new master phrase: ");
+            s.push_str(&e.to_string());
+            s
+        })
+    }
+}
+
+/// The master phrase from the vault ([`aterm_secrets::paper_master::read`], which holds the
+/// value to the grammar).
+///
+/// # Errors
+/// This Mac holds no usable phrase: the line names the `aterm secrets need paper-master`
+/// request it filed.
+pub fn from_vault(paths: &aterm_secrets::client::Paths) -> Result<MasterPhrase, String> {
+    let value = aterm_secrets::paper_master::read(paths)?;
+    from_symbols(value.as_slice()).map_err(|e| e.message())
 }
 
 /// Decodes 52 Crockford Base32 characters into the 32-byte seed, masking the 4 trailing pad bits.
@@ -171,67 +202,18 @@ const fn b32_val(c: u8) -> u8 {
     }
 }
 
-/// Reason a typed-back master phrase was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PhraseError {
-    /// Out-of-alphabet character at a 1-based significant character position.
-    BadChar { position: usize },
-    /// Wrong number of significant characters.
-    Length { got: usize },
-}
-
-impl PhraseError {
-    /// Formats the user-facing error message without echoing secret characters.
-    #[must_use]
-    pub fn message(&self) -> String {
-        match self {
-            Self::BadChar { position } => {
-                let mut s = String::from("character ");
-                s.push_str(&position.to_string());
-                s.push_str(
-                    " of the master phrase is not a phrase character (0-9 and a-z \
-                     without i, l, o, u) — check that position against the paper",
-                );
-                s
-            }
-            Self::Length { got } => {
-                let mut s =
-                    String::from("the master phrase must be exactly 52 characters; this one has ");
-                s.push_str(&got.to_string());
-                s
-            }
-        }
-    }
-}
-
-/// Parses and normalizes a typed-back master phrase.
+/// Parses and normalizes a master phrase ([`aterm_secrets::paper_master::symbols_into`]).
 pub fn parse_master(input: &str) -> Result<MasterPhrase, PhraseError> {
-    let mut chars = [0u8; MASTER_PHRASE_LEN];
-    let mut n = 0usize;
-    for c in input.bytes() {
-        if c.is_ascii_whitespace() || c == b'-' {
-            continue;
-        }
-        let c = match c.to_ascii_lowercase() {
-            b'o' => b'0',
-            b'i' | b'l' => b'1',
-            other => other,
-        };
-        if !ALPHABET.contains(&c) {
-            scrub(&mut chars);
-            return Err(PhraseError::BadChar { position: n + 1 });
-        }
-        if n < MASTER_PHRASE_LEN {
-            chars[n] = c;
-        }
-        n += 1;
-    }
-    if n != MASTER_PHRASE_LEN {
-        scrub(&mut chars);
-        return Err(PhraseError::Length { got: n });
-    }
-    let phrase = MasterPhrase { chars };
+    from_symbols(input.as_bytes())
+}
+
+/// The one constructor of a [`MasterPhrase`] from bytes: its symbols, in locked memory.
+fn from_symbols(input: &[u8]) -> Result<MasterPhrase, PhraseError> {
+    let mut phrase = MasterPhrase {
+        chars: [0u8; MASTER_PHRASE_LEN],
+    };
     try_lock(&phrase.chars);
+    aterm_secrets::paper_master::symbols_into(input, &mut phrase.chars)?;
     Ok(phrase)
 }
 
@@ -288,220 +270,6 @@ pub fn fingerprint(pubkey_raw: &[u8]) -> String {
         out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
     }
     out
-}
-
-/// Guard that disables terminal echo on creation and restores it on drop.
-pub struct TtyEcho {
-    fd: std::os::unix::io::RawFd,
-    saved: libc::termios,
-}
-
-impl TtyEcho {
-    fn disable(fd: std::os::unix::io::RawFd) -> Result<Self, String> {
-        // SAFETY: `termios` is a plain-old-data struct initialized by `tcgetattr` before read.
-        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-        // SAFETY: `fd` is an open terminal descriptor and `saved` is a valid out-pointer.
-        if unsafe { libc::tcgetattr(fd, &raw mut saved) } != 0 {
-            return Err("could not read terminal settings from /dev/tty".to_string());
-        }
-        let mut raw = saved;
-        raw.c_lflag &= !libc::ECHO;
-        // SAFETY: `fd` is an open terminal descriptor and `raw` is an initialized `termios`.
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const raw) } != 0 {
-            return Err("could not disable terminal echo; refusing to prompt".to_string());
-        }
-        Ok(Self { fd, saved })
-    }
-}
-
-impl Drop for TtyEcho {
-    fn drop(&mut self) {
-        // SAFETY: `self.fd` is still open: the caller declares this guard after the `File` that
-        // owns the descriptor, so the guard drops first. `self.saved` is the initialized snapshot
-        // taken in `disable`.
-        unsafe {
-            let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &raw const self.saved);
-        }
-    }
-}
-
-const PROMPT_CAP: usize = 256;
-
-/// Controlling terminal (`/dev/tty`) used to read and display the master phrase.
-pub struct Tty {
-    file: std::fs::File,
-    fd: std::os::unix::io::RawFd,
-}
-
-impl std::fmt::Debug for Tty {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Tty(/dev/tty)")
-    }
-}
-
-/// Byte length of a 52-character master phrase formatted in 4-character space-separated groups plus `\n`.
-pub const GROUPED_PHRASE_LEN: usize = MASTER_PHRASE_LEN + MASTER_PHRASE_LEN / 4 - 1 + 1;
-
-/// Formats a 52-character master phrase into 13 space-separated 4-character groups terminated by `\n`.
-#[must_use]
-pub fn format_phrase_line(chars: &[u8; MASTER_PHRASE_LEN]) -> [u8; GROUPED_PHRASE_LEN] {
-    let mut buf = [0u8; GROUPED_PHRASE_LEN];
-    let mut at = 0usize;
-    for (i, &c) in chars.iter().enumerate() {
-        if i > 0 && i % 4 == 0 {
-            buf[at] = b' ';
-            at += 1;
-        }
-        buf[at] = c;
-        at += 1;
-    }
-    buf[GROUPED_PHRASE_LEN - 1] = b'\n';
-    buf
-}
-
-impl Tty {
-    /// Opens `/dev/tty` and verifies it is a terminal.
-    pub fn open() -> Result<Self, String> {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        use std::os::unix::io::AsRawFd as _;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open("/dev/tty")
-            .map_err(|e| {
-                let mut s = String::from(
-                    "cannot open /dev/tty (the master is read from, and written to, the \
-                     terminal only — never stdin, argv, an environment variable, a file, \
-                     or a redirected stdout): ",
-                );
-                s.push_str(&e.to_string());
-                s
-            })?;
-        let fd = file.as_raw_fd();
-        // SAFETY: `fd` is an open descriptor owned by `file`.
-        if unsafe { libc::isatty(fd) } != 1 {
-            return Err("/dev/tty is not a terminal; refusing to handle the master".to_string());
-        }
-        Ok(Self { file, fd })
-    }
-
-    /// Writes the formatted master phrase to `/dev/tty`.
-    pub fn write_phrase(&mut self, phrase: &MasterPhrase) -> Result<(), String> {
-        use std::io::Write as _;
-        let mut buf = format_phrase_line(&phrase.chars);
-        try_lock(&buf);
-        let wrote = self.file.write_all(&buf).and_then(|()| self.file.flush());
-        scrub(&mut buf);
-        try_unlock(&buf);
-        wrote.map_err(|e| {
-            let mut s = String::from(
-                "the master phrase could NOT be written to the terminal, so it has not \
-                 reached anyone and is now unrecoverable: ",
-            );
-            s.push_str(&e.to_string());
-            s
-        })
-    }
-
-    /// Writes one non-secret line with a trailing newline to `/dev/tty`.
-    pub fn write_line(&mut self, line: &str) -> Result<(), String> {
-        use std::io::Write as _;
-        self.file
-            .write_all(line.as_bytes())
-            .and_then(|()| self.file.write_all(b"\n"))
-            .and_then(|()| self.file.flush())
-            .map_err(|e| {
-                let mut s = String::from("writing to the terminal: ");
-                s.push_str(&e.to_string());
-                s
-            })
-    }
-}
-
-/// Prompts for the master phrase on `/dev/tty` with echo disabled and parses one attempt.
-pub fn prompt_master_attempt(prompt: &str) -> Result<Result<MasterPhrase, PhraseError>, String> {
-    use std::io::{Read as _, Write as _};
-
-    let handle = Tty::open()?;
-    let fd = handle.fd;
-    let mut tty = handle.file;
-    let _echo = TtyEcho::disable(fd)?;
-    let _ = tty.write_all(prompt.as_bytes());
-    let _ = tty.flush();
-
-    let mut buf = [0u8; PROMPT_CAP];
-    let mut chars = [0u8; MASTER_PHRASE_LEN];
-    try_lock(&buf);
-    try_lock(&chars);
-    let mut n = 0usize;
-    let mut first_bad: Option<usize> = None;
-    loop {
-        match tty.read(&mut buf) {
-            Ok(0) => break,
-            Ok(read_len) => {
-                let newline_at = buf[..read_len].iter().position(|&b| b == b'\n');
-                let slice = &buf[..newline_at.unwrap_or(read_len)];
-                for &raw in slice {
-                    if raw.is_ascii_whitespace() || raw == b'-' {
-                        continue;
-                    }
-                    let folded = match raw.to_ascii_lowercase() {
-                        b'o' => b'0',
-                        b'i' | b'l' => b'1',
-                        other => other,
-                    };
-                    if !ALPHABET.contains(&folded) {
-                        if first_bad.is_none() {
-                            first_bad = Some(n.saturating_add(1));
-                        }
-                    } else if first_bad.is_none() && n < MASTER_PHRASE_LEN {
-                        chars[n] = folded;
-                    }
-                    n = n.saturating_add(1);
-                }
-                if newline_at.is_some() {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                scrub(&mut buf);
-                scrub(&mut chars);
-                try_unlock(&buf);
-                try_unlock(&chars);
-                let mut s = String::from("reading the master from /dev/tty: ");
-                s.push_str(&e.to_string());
-                return Err(s);
-            }
-        }
-    }
-    let _ = tty.write_all(b"\n");
-    scrub(&mut buf);
-    try_unlock(&buf);
-
-    if let Some(position) = first_bad {
-        scrub(&mut chars);
-        try_unlock(&chars);
-        return Ok(Err(PhraseError::BadChar { position }));
-    }
-    if n != MASTER_PHRASE_LEN {
-        scrub(&mut chars);
-        try_unlock(&chars);
-        return Ok(Err(PhraseError::Length { got: n }));
-    }
-    try_unlock(&chars);
-    let phrase = MasterPhrase { chars };
-    try_lock(&phrase.chars);
-    Ok(Ok(phrase))
-}
-
-/// Prompts for the master phrase via [`prompt_master_attempt`], flattening parse errors.
-pub fn prompt_for_master(prompt: &str) -> Result<MasterPhrase, String> {
-    match prompt_master_attempt(prompt)? {
-        Ok(phrase) => Ok(phrase),
-        Err(e) => Err(e.message()),
-    }
 }
 
 #[cfg(test)]

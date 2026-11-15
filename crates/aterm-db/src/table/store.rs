@@ -63,8 +63,6 @@ mod held;
 #[cfg(test)]
 mod hook_tests;
 mod journals;
-mod listeners;
-pub(crate) use listeners::listen;
 #[cfg(unix)]
 mod pending;
 #[cfg(test)]
@@ -76,6 +74,7 @@ mod witness;
 use replay_index::ReplayIndex;
 use witness::Witness;
 
+pub(crate) use held::claim_dirs;
 pub use held::{Held, held_length, held_lengths, read_held};
 
 #[cfg(test)]
@@ -434,11 +433,9 @@ pub fn with_append_sink<T>(sink: impl Fn(&Appended<'_>) + 'static, run: impl FnO
     run()
 }
 
-/// Hand `record`, an append to a store whose claim lives in `claim_dir`, to that custody's
-/// listeners ([`listen`]), then to this thread's sink or the process's. A store grew, too: the
-/// Commons owner's next upkeep tick materializes the shared files.
-fn appended(record: &Appended<'_>, claim_dir: &Path) {
-    listeners::tell(record, claim_dir);
+/// Hand `record` to this thread's sink or the process's. A store grew, too: the Commons owner's
+/// next upkeep tick materializes the shared files.
+fn appended(record: &Appended<'_>) {
     crate::file::grew();
     #[cfg(any(test, debug_assertions))]
     if let Some(sink) = THREAD_SINK.with(|slot| slot.borrow().clone()) {
@@ -1582,22 +1579,19 @@ impl Store {
             if pending || store.witness != acknowledged {
                 store.publish_witness(store.witness)?;
                 for (offset, conflict, wire) in &adopted {
-                    appended(
-                        &Appended {
-                            table: scope.digest(),
-                            recovery: store.is_recovery(),
-                            kind: if *conflict {
-                                AppendKind::Conflict
-                            } else {
-                                AppendKind::Operation
-                            },
-                            offset: *offset,
-                            length: store.witness.count,
-                            via: Via::Local,
-                            wire: wire.wire(),
+                    appended(&Appended {
+                        table: scope.digest(),
+                        recovery: store.is_recovery(),
+                        kind: if *conflict {
+                            AppendKind::Conflict
+                        } else {
+                            AppendKind::Operation
                         },
-                        &store.claim_dir,
-                    );
+                        offset: *offset,
+                        length: store.witness.count,
+                        via: Via::Local,
+                        wire: wire.wire(),
+                    });
                 }
             }
             // Complete a possible earlier rename whose directory barrier failed.
@@ -1896,22 +1890,19 @@ impl Store {
         };
         self.claim = claim;
         self.witness = witness;
-        appended(
-            &Appended {
-                table: self.scope.digest(),
-                recovery: self.is_recovery(),
-                kind: if subject == CONFLICT_SUBJECT {
-                    AppendKind::Conflict
-                } else {
-                    AppendKind::Operation
-                },
-                offset,
-                length: self.witness.count,
-                via,
-                wire,
+        appended(&Appended {
+            table: self.scope.digest(),
+            recovery: self.is_recovery(),
+            kind: if subject == CONFLICT_SUBJECT {
+                AppendKind::Conflict
+            } else {
+                AppendKind::Operation
             },
-            &self.claim_dir,
-        );
+            offset,
+            length: self.witness.count,
+            via,
+            wire,
+        });
         Ok(Receipt {
             id,
             received_ms,

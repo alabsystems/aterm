@@ -28,6 +28,9 @@ use crate::native_document_io::{
 #[path = "native_document_journal_owner.rs"]
 mod owner;
 
+#[cfg(all(test, unix))]
+pub(crate) use owner::tests as custody_test;
+
 /// Where no image can carry an owner set (neither an extended attribute nor an alternate data stream), nothing is marked and nothing is taken: every journal stays, as it always did there.
 #[cfg(not(any(unix, windows)))]
 mod owner {
@@ -44,7 +47,7 @@ mod owner {
             match *self {}
         }
         #[cfg(test)]
-        pub(crate) fn finished_for_test(
+        pub(super) fn finished_for_test(
             &self,
         ) -> std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>> {
             match *self {}
@@ -163,9 +166,10 @@ impl RecoveryNotice {
 
 #[derive(Clone, Debug)]
 pub(crate) struct JournalOpenDecision {
+    canonical_uri: String,
     pub(crate) key: JournalDocumentKey,
     pub(crate) path: PathBuf,
-    pub(crate) recovered_text: Option<String>,
+    pub(crate) recovered_text: Option<Arc<str>>,
     pub(crate) notice: Option<RecoveryNotice>,
     preserve_existing: bool,
     expected_image: JournalImageGeneration,
@@ -183,12 +187,19 @@ pub(crate) struct JournalOpenDecision {
 
 #[derive(Clone, Debug)]
 pub(crate) struct InitializedJournal {
+    host_identity: Arc<()>,
+    canonical_uri: String,
+    document: DocumentId,
     /// Shared one-shot transfer: cloned preparation results cannot adopt twice.
     ownership: Arc<std::sync::Mutex<ProvisionalOwnership>>,
     pub(crate) key: JournalDocumentKey,
     pub(crate) path: PathBuf,
     pub(crate) durable_seq: Seq,
     pub(crate) durable_text: Arc<str>,
+    /// Fingerprinted by the preparation worker beside the exact disk snapshot.
+    baseline: ContentFingerprint,
+    baseline_seq: Seq,
+    baseline_text: Arc<str>,
     /// The image it published, as an appender holds it.
     pub(crate) tail: JournalTail,
     pub(crate) notice: Option<RecoveryNotice>,
@@ -306,6 +317,7 @@ impl JournalRewritePlan {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DraftJournalHost {
+    identity: Arc<()>,
     root: PathBuf,
     /// Every document key is a MAC under it ([`JournalDocumentKey::keyed`]).
     secret: JournalSecret,
@@ -373,7 +385,7 @@ pub(crate) enum JournalEffect {
     },
 }
 
-/// Re-establish this process's journal after an update's successor wrote over it.
+/// Re-establish the journal after a replacement or an unacknowledged write.
 #[derive(Clone, Debug)]
 pub(crate) struct JournalReseatPlan {
     registration: Option<owner::Registration>,
@@ -466,6 +478,15 @@ pub(crate) fn private_uri(canonical_uri: &str) -> bool {
 }
 
 impl DocumentJournalStore {
+    pub(crate) fn from_admission_host(host: DraftJournalHost) -> Self {
+        Self {
+            host,
+            entries: BTreeMap::new(),
+            declined: BTreeSet::new(),
+            reseat_fenced: false,
+        }
+    }
+
     pub(crate) fn system_default() -> Result<Self, String> {
         Ok(Self {
             host: DraftJournalHost::system_default()?,
@@ -493,13 +514,52 @@ impl DocumentJournalStore {
         self.host.inspect_open(canonical_uri, disk_bytes)
     }
 
+    /// Clone the immutable filesystem custody for an admission worker. The live reducers
+    /// remain on the event loop; the clone retains the same journal-owner lease.
+    pub(crate) fn admission_host(&self) -> DraftJournalHost {
+        self.host.clone()
+    }
+
+    /// [`DraftJournalHost::initialize`], then this store writes the document's journal
+    /// ([`Self::adopt_initialized`]).
+    ///
+    /// # Errors
+    /// As [`DraftJournalHost::initialize`]; an image this store cannot adopt, or a registration
+    /// revoked before it does, is [`JournalFault::Other`].
     pub(crate) fn initialize(
         &mut self,
         decision: JournalOpenDecision,
         disk: &DocumentSnapshot,
         current: &DocumentSnapshot,
-    ) -> Result<InitializedJournal, String> {
+    ) -> Result<InitializedJournal, JournalFault> {
+        let uri = decision.canonical_uri.clone();
         let initialized = self.host.initialize(decision, disk, current)?;
+        self.adopt_initialized(&initialized, &uri, disk, current)?;
+        Ok(initialized)
+    }
+
+    /// Install a worker-published image's reducer without performing filesystem work.
+    /// The caller must still own the unopened URI and reproduce the prepared snapshots.
+    pub(crate) fn adopt_initialized(
+        &mut self,
+        initialized: &InitializedJournal,
+        canonical_uri: &str,
+        disk: &DocumentSnapshot,
+        current: &DocumentSnapshot,
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.host.identity, &initialized.host_identity)
+            || initialized.canonical_uri != canonical_uri
+            || disk.id != current.id
+            || initialized.document != current.id
+            || initialized.baseline_seq != disk.seq
+            || !Arc::ptr_eq(&initialized.baseline_text, &disk.text)
+            || current.seq != initialized.durable_seq
+            || !Arc::ptr_eq(&current.text, &initialized.durable_text)
+            || self.entries.contains_key(&current.id)
+            || self.declined.contains(&current.id)
+        {
+            return Err("prepared recovery image does not match its unopened document".into());
+        }
         self.entries.insert(
             current.id,
             JournalEntry {
@@ -518,7 +578,7 @@ impl DocumentJournalStore {
                 next_rewrite_generation: 1,
                 rewrite_inflight: None,
                 pending_checkpoint: None,
-                baseline: ContentFingerprint::of(disk.text.as_bytes()),
+                baseline: initialized.baseline,
                 baseline_seq: disk.seq,
                 baseline_is_file: true,
                 reseat_owed: false,
@@ -528,7 +588,7 @@ impl DocumentJournalStore {
                 legacy: initialized.legacy.clone(),
             },
         );
-        Ok(initialized)
+        Ok(())
     }
 
     /// Owe a re-seat on every journal this store writes (see [`JournalEntry::reseat_owed`]).
@@ -608,7 +668,11 @@ impl DocumentJournalStore {
         if entry.pending_checkpoint.is_some() {
             return Err(DraftCarryRefusal::Writing);
         }
-        if entry.desired.seq != head.seq || entry.reducer.durable_seq() != head.seq {
+        if entry.desired.seq != head.seq
+            || entry.reducer.durable_seq() != head.seq
+            || entry.desired.text != head.text
+            || entry.durable_text != head.text
+        {
             return Err(DraftCarryRefusal::Behind);
         }
         Ok(DraftCarryCandidate {
@@ -631,9 +695,27 @@ impl DocumentJournalStore {
         self.host.purge(canonical_uri)
     }
 
+    /// Record the private-document policy after its admission worker removed old journals.
+    pub(crate) fn adopt_declined(&mut self, document: DocumentId) {
+        self.entries.remove(&document);
+        self.declined.insert(document);
+    }
+
     /// Whether `document` keeps no journal ([`Self::decline`]).
     pub(crate) fn declined(&self, document: DocumentId) -> bool {
         self.declined.contains(&document)
+    }
+
+    /// Retry a legacy retirement initialization could not finish. A carried
+    /// draft intentionally stays available to an outgoing older process until
+    /// the first edit; it is not a failed cleanup. Re-seat retries only owed
+    /// cleanup without inventing a file checkpoint.
+    pub(crate) fn request_legacy_retirement(&mut self, document: DocumentId) {
+        if let Some(entry) = self.entries.get_mut(&document)
+            && entry.legacy.as_ref().is_some_and(|legacy| !legacy.carried)
+        {
+            entry.reseat_owed = true;
+        }
     }
 
     pub(crate) fn observe_commit(&mut self, snapshot: &DocumentSnapshot) -> Result<(), String> {
@@ -644,6 +726,9 @@ impl DocumentJournalStore {
             .entries
             .get_mut(&snapshot.id)
             .ok_or_else(|| "document journal was not initialized".to_string())?;
+        if snapshot.seq == entry.desired.seq && snapshot.text != entry.desired.text {
+            return Err("document journal observed different text at the same sequence".into());
+        }
         if snapshot.seq < entry.desired.seq {
             return Err("document journal observed a sequence regression".to_string());
         }
@@ -797,6 +882,22 @@ impl DocumentJournalStore {
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
             machine = "NativeUpdateEditorCarry",
+            action = "FailOwned",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "FailPublished",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUpdateEditorCarry",
             action = "Refuse",
             project = "aterm_gui::editor_carry_conformance::Rig::project"
         )
@@ -832,6 +933,10 @@ impl DocumentJournalStore {
             JournalReduction::Failed { stage, message } => {
                 entry.append_text = None;
                 entry.append_failed = true;
+                // An admitted write may have changed the named image before its
+                // acknowledgement failed. Reconcile on the worker before another
+                // append uses the old tail; admission deferral never comes here.
+                entry.reseat_owed = true;
                 JournalCompletion::Failed {
                     document,
                     message: format!("journal append failed at {stage:?}: {message}"),
@@ -840,6 +945,8 @@ impl DocumentJournalStore {
             JournalReduction::Cancelled => {
                 entry.append_text = None;
                 entry.append_failed = true;
+                // Cancellation after admission carries the same uncertainty.
+                entry.reseat_owed = true;
                 JournalCompletion::Failed {
                     document,
                     message: "journal append was cancelled".to_string(),
@@ -850,6 +957,14 @@ impl DocumentJournalStore {
     }
 
     /// Roll back an append that never crossed the worker queue boundary.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUpdateEditorCarry",
+            action = "Defer",
+            project = "aterm_gui::editor_carry_conformance::Rig::project"
+        )
+    )]
     pub(crate) fn defer_append(
         &mut self,
         document: DocumentId,
@@ -1042,13 +1157,15 @@ impl DocumentJournalStore {
         self.reseat_fenced = fenced;
     }
 
-    /// Whether `document`'s journal has nothing left to do: no write on the worker, no re-seat owed, no checkpoint queued, no legacy journal left to retire, and its head durable.
+    /// Whether the exact desired head is durable and no effect is owed. A legacy
+    /// draft intentionally carried for an older process stays until the first
+    /// write; an open canceled without that write leaves it untouched.
     pub(crate) fn settled(&self, document: DocumentId) -> bool {
         self.entries.get(&document).is_none_or(|entry| {
             !entry_busy(entry)
                 && !entry.reseat_owed
                 && entry.pending_checkpoint.is_none()
-                && entry.legacy.is_none()
+                && entry.legacy.as_ref().is_none_or(|legacy| legacy.carried)
                 && entry.desired.seq == entry.reducer.durable_seq()
         })
     }
@@ -1075,6 +1192,20 @@ impl DocumentJournalStore {
         }
     }
 
+    /// End this store as its process would end, before another store opens the same journals:
+    /// drop it, then wait for its custody worker to exit ([`CustodyExit`]).
+    ///
+    /// # Panics
+    /// If its custody worker has not exited within [`aterm_spec::wait::MUST_HAPPEN`], or ended
+    /// without saying so ([`CustodyExit::wait`]).
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn end_for_test(self) {
+        let exit = self.host.custody_exit_for_test();
+        drop(self);
+        exit.wait();
+    }
+
     #[cfg(test)]
     pub(crate) fn durable_seq(&self, document: DocumentId) -> Option<Seq> {
         self.entries
@@ -1082,7 +1213,7 @@ impl DocumentJournalStore {
             .map(|entry| entry.reducer.durable_seq())
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn journal_path(&self, document: DocumentId) -> Option<PathBuf> {
         self.entries.get(&document).map(|entry| entry.path.clone())
     }
@@ -1093,15 +1224,13 @@ impl DocumentJournalStore {
         self.host.key_for(canonical_uri)
     }
 
-    /// The finish signal of this store's journal custody worker, which runs its releases after the store drops.
-    #[cfg(test)]
-    pub(crate) fn custody_finished_for_test(
-        &self,
-    ) -> Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>> {
-        self.host
-            .owner
-            .as_ref()
-            .map(|owner| owner.finished_for_test())
+    /// Gate one actual worker-side replacement after rename, before acknowledgement.
+    #[cfg(all(test, unix))]
+    pub(crate) fn after_replacement_for_test(
+        path: PathBuf,
+        hook: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+    ) -> tests::ReplacementGate {
+        tests::ReplacementGate::install(path, Box::new(hook))
     }
 
     /// The file `canonical_uri`'s journal lives in.
@@ -1110,12 +1239,67 @@ impl DocumentJournalStore {
         self.host.path_for(self.host.key_for(canonical_uri))
     }
 
+    /// `words`, a journal failure's own, with this store's drafts folder said as
+    /// [`DRAFTS_FOLDER_WORD`]: what a surface the person reads (a failed open's page and its
+    /// diagnostics, the `edit` verb's reply) carries, since every journal, lock and copy lives
+    /// in that folder and its path is the one detail there that names their home. stderr keeps
+    /// the words whole.
+    pub(crate) fn unrooted(&self, words: &str) -> String {
+        let root = self.host.root.display().to_string();
+        if root.is_empty() {
+            return words.to_string();
+        }
+        words.replace(&root, DRAFTS_FOLDER_WORD)
+    }
+
     /// The image this store last published for `document`.
     #[cfg(all(test, unix))]
     pub(crate) fn durable_image(&self, document: DocumentId) -> Option<ContentFingerprint> {
         self.entries
             .get(&document)
             .map(|entry| entry.image.fingerprint())
+    }
+}
+
+/// A journal custody worker's exit. The worker lets go of its owner's journals on its own
+/// thread: the last drop of a registration only sends its release, which the worker may settle
+/// under that journal's lock, and the worker drops the owner's lease and exits once the last
+/// handle on the owner is gone. A test that ends one store as its process would end (a crash,
+/// an exit, a successor's stand-down) and then opens or writes the same journals from another
+/// store in this process waits for this exit first: an ended process holds no journal lock and
+/// no lease, while this worker may still be taking that lock, which the other store's take
+/// then meets within its budget.
+#[cfg(test)]
+pub(crate) struct CustodyExit(Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>>);
+
+#[cfg(test)]
+impl CustodyExit {
+    /// Wait until the worker has exited; a store with no owner has no worker, and returns at once.
+    ///
+    /// # Panics
+    /// If the worker has not exited within [`aterm_spec::wait::MUST_HAPPEN`], the hang detector,
+    /// or it ended without saying so.
+    #[track_caller]
+    pub(crate) fn wait(self) {
+        if let Some(finished) = self.0 {
+            finished
+                .lock()
+                .expect("journal custody exit receiver")
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("journal custody worker exited");
+        }
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+impl DocumentJournalStore {
+    /// See [`owner::JournalOwner::inside_next_settle_for_test`].
+    pub(crate) fn inside_next_release_settle_for_test(&self, then: impl FnOnce() + Send + 'static) {
+        self.host
+            .owner
+            .as_ref()
+            .expect("a test journal store takes an owner lease")
+            .inside_next_settle_for_test(then);
     }
 }
 
@@ -1285,7 +1469,7 @@ impl OpenReading {
                 "recovered an unsaved draft from {} journal records",
                 recovered.record_count
             );
-            decision.recovered_text = Some(recovered.text);
+            decision.recovered_text = Some(Arc::from(recovered.text));
             decision.notice = Some(RecoveryNotice::Recovered);
         } else if self.keep_aside {
             decision.notice = Some(RecoveryNotice::DiskConflict);
@@ -1322,6 +1506,14 @@ fn journal_baseline_text(key: JournalDocumentKey, bytes: &[u8]) -> Option<String
 }
 
 /// `patience` carries the caller's thread, exactly as in [`execute_journal_append`].
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeUpdateEditorCarry",
+        action = "ReseatUnchanged",
+        project = "aterm_gui::editor_carry_conformance::Rig::project"
+    )
+)]
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1522,10 +1714,37 @@ impl DraftJournalHost {
             .ok()
             .map(Arc::new);
         Ok(Self {
+            identity: Arc::new(()),
             root,
             secret,
             owner,
         })
+    }
+
+    /// Its custody worker's exit, which a test waits for once this host, every clone of it and
+    /// every store over it are dropped ([`CustodyExit`]).
+    #[cfg(test)]
+    pub(crate) fn custody_exit_for_test(&self) -> CustodyExit {
+        CustodyExit(self.owner.as_ref().map(|owner| owner.finished_for_test()))
+    }
+
+    /// End this host as its process would end: drop it, then wait for its custody worker to
+    /// exit ([`CustodyExit`]), which it does once no clone of it and no store over it is left.
+    ///
+    /// # Panics
+    /// If this host has no owner: it has no custody worker to wait for, and a plain drop ends it.
+    /// Also if its custody worker has not exited within [`aterm_spec::wait::MUST_HAPPEN`], or
+    /// ended without saying so ([`CustodyExit::wait`]).
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn end_for_test(self) {
+        assert!(
+            self.owner.is_some(),
+            "a host with no owner has no custody worker to wait for"
+        );
+        let exit = self.custody_exit_for_test();
+        drop(self);
+        exit.wait();
     }
 
     /// The owner identity this host names on what it publishes.
@@ -1560,6 +1779,7 @@ impl DraftJournalHost {
         let key = self.key_for(canonical_uri);
         let path = self.path_for(key);
         let mut decision = JournalOpenDecision {
+            canonical_uri: canonical_uri.to_owned(),
             key,
             path: path.clone(),
             recovered_text: None,
@@ -1673,21 +1893,49 @@ impl DraftJournalHost {
     }
 
     /// Publish a fresh, sequence-aligned image before any document view becomes visible.
+    ///
+    /// # Errors
+    /// [`JournalFault::Busy`] when another process holds the journal's lock past the event
+    /// loop's budget, [`JournalFault::Changed`] when the image moved since `decision`'s
+    /// inspection, and [`JournalFault::Other`] for any other failure; none writes the image.
     pub(crate) fn initialize(
         &self,
         decision: JournalOpenDecision,
         disk: &DocumentSnapshot,
         current: &DocumentSnapshot,
-    ) -> Result<InitializedJournal, String> {
+    ) -> Result<InitializedJournal, JournalFault> {
+        self.initialize_with_patience(decision, disk, current, JournalLockPatience::EventLoop)
+    }
+
+    /// A preparation worker may wait for the journal lock; the UI receives a result only.
+    ///
+    /// # Errors
+    /// As [`Self::initialize`], with [`JournalFault::Busy`] past the worker's budget.
+    pub(crate) fn initialize_on_worker(
+        &self,
+        decision: JournalOpenDecision,
+        disk: &DocumentSnapshot,
+        current: &DocumentSnapshot,
+    ) -> Result<InitializedJournal, JournalFault> {
+        self.initialize_with_patience(decision, disk, current, JournalLockPatience::Worker)
+    }
+
+    fn initialize_with_patience(
+        &self,
+        decision: JournalOpenDecision,
+        disk: &DocumentSnapshot,
+        current: &DocumentSnapshot,
+        patience: JournalLockPatience,
+    ) -> Result<InitializedJournal, JournalFault> {
         if let Some(owner) = &self.owner {
             let host = self.clone();
             let disk = disk.clone();
             let current = current.clone();
             return owner.run(move |custody| {
-                host.initialize_owned(decision, &disk, &current, Some(custody))
+                host.initialize_owned(decision, &disk, &current, patience, Some(custody))
             })?;
         }
-        self.initialize_owned(decision, disk, current, None)
+        self.initialize_owned(decision, disk, current, patience, None)
     }
 
     fn initialize_owned(
@@ -1695,10 +1943,13 @@ impl DraftJournalHost {
         decision: JournalOpenDecision,
         disk: &DocumentSnapshot,
         current: &DocumentSnapshot,
+        patience: JournalLockPatience,
         custody: Option<&mut owner::Custody>,
-    ) -> Result<InitializedJournal, String> {
+    ) -> Result<InitializedJournal, JournalFault> {
         if disk.id != current.id {
-            return Err("journal initialization mixed document identities".to_string());
+            return Err(JournalFault::Other(
+                "journal initialization mixed document identities".to_string(),
+            ));
         }
         let mut records = vec![JournalRecord::snapshot_for(decision.key, disk)];
         if current.seq != disk.seq || current.text != disk.text {
@@ -1713,19 +1964,19 @@ impl DraftJournalHost {
         } else {
             encode_journal_image(&records)
         };
-        let (bytes, tail) = encoded.map_err(|error| format!("{error:?}"))?;
-        let registration = with_journal_lock(
-            &decision.path,
-            JournalLockPatience::EventLoop,
-            || {
+        let (bytes, tail) = encoded.map_err(|error| JournalFault::Other(format!("{error:?}")))?;
+        let registration =
+            with_journal_lock(&decision.path, patience, || -> Result<_, JournalFault> {
                 let current = observe_journal_image(&decision.path)?;
                 let swept = decision.expected_clean && !current.exists;
                 if current != decision.expected_image && !swept {
-                    return Err(format!(
-                        "journal changed after recovery inspection (expected {:?}, found {:?}); reopen \
-                     the document before initializing recovery",
-                        decision.expected_image, current
-                    ));
+                    aterm_log::info!(
+                        "document journal changed after its open's inspection (expected {:?}, \
+                         found {:?}); the open initializes nothing",
+                        decision.expected_image,
+                        current
+                    );
+                    return Err(JournalFault::Changed);
                 }
                 if decision.preserve_existing && current.exists {
                     self.preserve_locked(&decision.path, current)?;
@@ -1733,18 +1984,19 @@ impl DraftJournalHost {
                 atomic_replace_locked(&decision.path, &bytes, current, self.owner_id())
                     .map_err(|error| error.to_string())?;
                 match (custody, &self.owner) {
-                    (Some(custody), Some(owner)) => custody
-                        .register(owner, &decision.path, decision.key)
-                        .map(Some),
+                    (Some(custody), Some(owner)) => Ok(Some(custody.register(
+                        owner,
+                        &decision.path,
+                        decision.key,
+                    )?)),
                     _ => Ok(None),
                 }
-            },
-        )?;
+            })?;
         let legacy = decision.legacy.filter(|legacy| {
             if legacy.carried {
                 return true;
             }
-            match retire_legacy_journal(legacy, JournalLockPatience::EventLoop) {
+            match retire_legacy_journal(legacy, patience) {
                 Ok(()) => false,
                 Err(error) => {
                     aterm_log::warn!(
@@ -1756,6 +2008,12 @@ impl DraftJournalHost {
             }
         });
         Ok(InitializedJournal {
+            host_identity: Arc::clone(&self.identity),
+            canonical_uri: decision.canonical_uri,
+            document: current.id,
+            baseline: ContentFingerprint::of(disk.text.as_bytes()),
+            baseline_seq: disk.seq,
+            baseline_text: disk.text.clone(),
             ownership: Arc::new(std::sync::Mutex::new(ProvisionalOwnership::Available(
                 registration,
             ))),
@@ -1783,7 +2041,7 @@ impl DraftJournalHost {
     /// and write temporaries (`.<name>.<pid>-<nonce>.tmp`), then sync the root. A file already
     /// gone is no error. Registered cleanup is an acknowledged worker operation,
     /// ordered with releases and writes; it is not the UI retirement/drop path.
-    fn purge(&self, canonical_uri: &str) -> Result<(), String> {
+    pub(crate) fn purge(&self, canonical_uri: &str) -> Result<(), String> {
         if let Some(owner) = &self.owner {
             let host = self.clone();
             let uri = canonical_uri.to_owned();
@@ -2573,19 +2831,72 @@ fn open_journal_file(path: &Path, which: JournalFile) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn with_journal_lock<T>(
+/// What [`DocumentJournalStore::unrooted`] says in place of the drafts folder's path.
+pub(crate) const DRAFTS_FOLDER_WORD: &str = "<drafts>";
+
+/// Why a journal operation under its lock ([`with_journal_lock`]), or a document's journal
+/// initialization ([`DraftJournalHost::initialize`]), did not happen. [`Self::Busy`]'s and
+/// [`Self::Changed`]'s words name no path and give no advice: the surface that shows one says
+/// what to do. [`Self::Other`]'s are the failure's own and can name a file in the drafts folder,
+/// which a surface the person reads says through [`DocumentJournalStore::unrooted`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum JournalFault {
+    /// Another holder kept the journal's lock past the caller's patience, so nothing was
+    /// written.
+    Busy,
+    /// The journal's image moved between the open's inspection and its initialization, so
+    /// nothing was written.
+    Changed,
+    /// Any other failure, in its own words.
+    Other(String),
+}
+
+impl JournalFault {
+    /// What [`Self::Busy`] says.
+    pub(crate) const BUSY: &'static str = "another aterm process is writing this file's draft";
+    /// What [`Self::Changed`] says.
+    pub(crate) const CHANGED: &'static str = "the file's draft changed while it was being opened";
+}
+
+impl std::fmt::Display for JournalFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str(Self::BUSY),
+            Self::Changed => f.write_str(Self::CHANGED),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
+impl From<String> for JournalFault {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<JournalFault> for String {
+    fn from(fault: JournalFault) -> Self {
+        fault.to_string()
+    }
+}
+
+/// Run `operation` under `path`'s journal lock, taken within `patience`'s budget. A caller
+/// whose errors are words keeps `E = String`; [`JournalFault`] keeps a busy lock typed.
+fn with_journal_lock<T, E: From<JournalFault>>(
     path: &Path,
     patience: JournalLockPatience,
-    operation: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
     #[cfg(all(test, any(unix, windows)))]
     owner::check_fs_thread();
+    let other = |error: String| E::from(JournalFault::Other(error));
     let parent = path
         .parent()
-        .ok_or_else(|| "journal has no parent directory".to_string())?;
-    create_private_dir(parent).map_err(|error| format!("journal lock directory: {error}"))?;
-    let lock_path = journal_lock_path(path)?;
-    let _held = take_linked_journal_lock(&lock_path, path, patience)?;
+        .ok_or_else(|| other("journal has no parent directory".to_string()))?;
+    create_private_dir(parent)
+        .map_err(|error| other(format!("journal lock directory: {error}")))?;
+    let lock_path = journal_lock_path(path).map_err(other)?;
+    let _held = take_linked_journal_lock(&lock_path, patience).map_err(E::from)?;
     #[cfg(all(test, unix))]
     copy_held_lock_for_test(_held.file());
     operation()
@@ -2593,9 +2904,8 @@ fn with_journal_lock<T>(
 
 fn take_linked_journal_lock(
     lock_path: &Path,
-    path: &Path,
     patience: JournalLockPatience,
-) -> Result<crate::native_document_host::HeldAdvisoryLock, String> {
+) -> Result<crate::native_document_host::HeldAdvisoryLock, JournalFault> {
     for _ in 0..4 {
         let lock = open_journal_lock(lock_path)
             .map_err(|error| format!("open journal lock {}: {error}", lock_path.display()))?;
@@ -2609,15 +2919,15 @@ fn take_linked_journal_lock(
         }
         #[cfg(test)]
         lock_opened_for_test();
-        let held = take_journal_lock(lock, path, patience.budget())?;
+        let held = take_journal_lock(lock, lock_path, patience.budget())?;
         if owner::names_file(lock_path, held.file()) {
             return Ok(held);
         }
     }
-    Err(format!(
-        "journal lock {} was removed under every take; retry",
+    Err(JournalFault::Other(format!(
+        "journal lock {} was removed under every take",
         lock_path.display()
-    ))
+    )))
 }
 
 /// Which thread takes a journal lock.
@@ -2647,18 +2957,14 @@ impl JournalLockPatience {
 
 fn take_journal_lock(
     lock: File,
-    path: &Path,
+    lock_path: &Path,
     budget: std::time::Duration,
-) -> Result<crate::native_document_host::HeldAdvisoryLock, String> {
+) -> Result<crate::native_document_host::HeldAdvisoryLock, JournalFault> {
     crate::native_document_host::acquire_advisory_lock_within(lock, budget).map_err(|refusal| {
         match refusal {
-            crate::native_document_host::AdvisoryLockRefusal::Busy => format!(
-                "recovery journal {} is busy; retry opening Manual or saving after the \
-                 other aterm process finishes",
-                path.display()
-            ),
+            crate::native_document_host::AdvisoryLockRefusal::Busy => JournalFault::Busy,
             crate::native_document_host::AdvisoryLockRefusal::Failed(error) => {
-                format!("lock journal {}: {error}", path.display())
+                JournalFault::Other(format!("lock journal {}: {error}", lock_path.display()))
             }
         }
     })
@@ -2802,6 +3108,8 @@ fn atomic_replace_locked(
         replace_file(&temporary_path, path, expected.exists)
             .map_err(JournalReplaceError::BeforePublication)?;
         owner::confirm_publication(path, &mark);
+        #[cfg(test)]
+        tests::after_replacement(path).map_err(JournalReplaceError::PublishedUnverified)?;
         sync_directory(parent, Flush::Durable).map_err(JournalReplaceError::PublishedUnverified)?;
         let committed = observe_journal_image(path).map_err(|message| {
             JournalReplaceError::PublishedUnverified(std::io::Error::other(message))

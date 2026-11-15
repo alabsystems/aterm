@@ -6041,8 +6041,8 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
                     {
                         let mut repositories = token_waiting();
                         repositories.detail = Some(
-                            "the GitHub token file (/Users//alice/.secrets/gh_access_token) \
-                             is not on this Mac yet"
+                            "the GitHub token (vault entry gh_access_token) is not in this \
+                             Mac's vault copy yet"
                                 .to_owned(),
                         );
                         repositories

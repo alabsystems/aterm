@@ -432,21 +432,13 @@ pub fn mask_login(login: &str) -> String {
     }
 }
 
-/// The login of every `[[mailboxes]]` entry in the mailbox file at `file` (`ai-mailbox.toml`,
-/// whose entries sit at its root or under `[ai.mailbox]`, `[harness.mailbox]` or `[mailbox]`), as
-/// written: what `crates/aterm/src/alab_view.rs` names a mailbox key's login by. No password,
-/// second password, TOTP seed or `*_file` is read; a missing or unreadable file names none.
+/// The login of every `[[mailboxes]]` entry in the mailbox text `text` (`ai-mailbox.toml`, whose
+/// entries sit at its root or under `[ai.mailbox]`, `[harness.mailbox]` or `[mailbox]`), as
+/// written: what `crates/aterm/src/alab_view.rs` names a mailbox key's login by, from the vault
+/// entry it reads in place. No password, second password, TOTP seed or `*_file` is read; text that
+/// does not parse names none.
 #[must_use]
-pub fn mailbox_logins(file: &std::path::Path) -> Vec<String> {
-    super::accounts::read_bounded(file, 1024 * 1024)
-        .ok()
-        .flatten()
-        .map(|text| logins_in(&text))
-        .unwrap_or_default()
-}
-
-/// [`mailbox_logins`] of the file's `text`.
-fn logins_in(text: &str) -> Vec<String> {
+pub fn mailbox_logins(text: &str) -> Vec<String> {
     let Ok(doc) = aterm_toml::from_str::<aterm_toml::Table>(text) else {
         return Vec::new();
     };
@@ -1275,7 +1267,7 @@ pub fn plan_import(
 /// Where `cfg` (the mailbox file before the import) already keeps a password for `login`, a
 /// new entry for it receiving `receives` would use, in words for the comment the importer writes
 /// in place of its `password` line: the top-level one where `login` is the file's `user` (kept
-/// in the file or beside it, `~/.secrets/proton_password`), else a per-email one
+/// in the file or in the vault entry `proton_password`), else a per-email one
 /// ([`super::headless_oauth::MailboxConfig::completed_route`]).
 fn existing_password(
     cfg: &super::headless_oauth::MailboxConfig,
@@ -1360,7 +1352,23 @@ pub fn run_import(
             return std::process::ExitCode::from(1);
         }
     };
+    let home = home
+        .map(Path::to_path_buf)
+        .or_else(aterm_types::dirs::home_dir);
+    if let Some(home) = home.as_deref()
+        && under_backup(home, into)
+    {
+        let _ = writeln!(err, "{VERB}: {}", backup_refusal());
+        return std::process::ExitCode::from(1);
+    }
     let target = std::fs::canonicalize(into).unwrap_or_else(|_| into.to_path_buf());
+    if let Some(home) = home.as_deref()
+        && under_backup(home, &target)
+    {
+        let _ = writeln!(err, "{VERB}: {}", backup_refusal());
+        return std::process::ExitCode::from(1);
+    }
+    let home = home.as_deref();
     let toml_text = match super::accounts::read_bounded(&target, IMPORT_TOML_MAX) {
         Ok(text) => text,
         Err(e) => {
@@ -1402,6 +1410,26 @@ pub fn run_import(
         }
     );
     std::process::ExitCode::SUCCESS
+}
+
+/// Whether `path` lies in `home`'s `~/.secrets` (spelled under `home` or under its canonical
+/// path, or `~/.secrets/…`): the files older builds wrote there are the owner's backup, which
+/// nothing reads or writes; the mailbox routes are the vault's entry `ai-mailbox.toml`.
+fn under_backup(home: &Path, path: &Path) -> bool {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    path.starts_with("~/.secrets")
+        || absolute.starts_with(home.join(".secrets"))
+        || std::fs::canonicalize(home).is_ok_and(|home| absolute.starts_with(home.join(".secrets")))
+}
+
+fn backup_refusal() -> String {
+    format!(
+        "the mailbox routes are the vault entry `{}`, not a file in ~/.secrets: import into a \
+         draft file elsewhere, then publish it with `aterm secrets set {} --file <draft>`; \
+         nothing was written",
+        super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+        super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+    )
 }
 
 #[cfg(test)]

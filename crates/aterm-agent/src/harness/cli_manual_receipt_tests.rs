@@ -59,6 +59,8 @@ fn transition_with(state: &State, action: &str, early: bool) -> State {
     .unwrap()
     .to_toml_for(Some(OptIn::Discovered));
     std::fs::write(&fleet, &text).unwrap();
+    // The copy of the fleet an earlier build left in `~/.secrets`, newer than the projection:
+    // nothing reads it, retires a source for it or writes it.
     let input = env
         .home
         .as_ref()
@@ -69,14 +71,12 @@ fn transition_with(state: &State, action: &str, early: bool) -> State {
         std::fs::create_dir_all(input.parent().unwrap()).unwrap();
         std::fs::write(&input, &text).unwrap();
         let future = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(4_000_000_000);
-        for path in [&input, &fleet] {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_modified(future)
-                .unwrap();
-        }
+        std::fs::File::options()
+            .write(true)
+            .open(&input)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
     }
     let before_input = std::fs::read(&input).ok();
     let paths = [store.state_file(), store.logins_file(), store.ledger_path()];
@@ -134,7 +134,7 @@ fn transition_with(state: &State, action: &str, early: bool) -> State {
     next.insert("intact", i64::from(intact));
     next.insert(
         "inputs",
-        i64::from(std::fs::read(input).ok() == before_input),
+        i64::from(std::fs::read(&input).ok() == before_input),
     );
     next.insert(
         "records",
@@ -268,18 +268,11 @@ fn a_manual_plan_rechecks_configuration_and_higher_priority_inputs_before_its_re
             crate::test_config::write(env.config.as_ref().unwrap(), "[fleet]\nmachine='m4'\n")
                 .unwrap();
         } else {
-            let source = env
-                .home
-                .as_ref()
-                .unwrap()
-                .join(".secrets")
-                .join(accounts_sync::FLEET_ROSTER_FILE);
-            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
-            std::fs::write(
-                source,
+            crate::vault_entry::put(
+                env.home.as_ref().unwrap(),
+                accounts_sync::FLEET_ROSTER_FILE,
                 "[[account]]\nlabel='remote'\nemail='remote@example.test'\nmachines=['m3']\n",
-            )
-            .unwrap();
+            );
         }
         assert!(publish_plan(&env, &row, &plan).is_err());
         assert_eq!(std::fs::read(fleet).unwrap(), before);

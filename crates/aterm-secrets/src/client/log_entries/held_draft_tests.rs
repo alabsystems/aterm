@@ -221,7 +221,7 @@ fn refused_retry_after_a_lost_reply(single_slot: bool) -> AfterTheRetry {
     let _ = sync(m7, None);
     SINGLE_SLOT_HOLD.with(|cell| cell.set(false));
     let after = AfterTheRetry {
-        m7_reads: std::fs::read(m7.home.join(".secrets/gh-token")).unwrap(),
+        m7_reads: crate::client::stored(&m7, "gh-token").unwrap(),
         m22_covers: log_covers_served(m22, &macs.url),
         m7_covers: log_covers_served(m7, &macs.url),
     };
@@ -306,7 +306,7 @@ fn only_the_refused_version_is_forgotten_and_the_stored_one_is_adopted_by_its_di
     assert!(log_covers_served(m22, &macs.url), "P1's hold is taken in");
     assert_eq!(held(m22), [p2], "P1's hold goes; P2's stays");
     assert_eq!(
-        std::fs::read(m22.home.join(".secrets/gh-token")).unwrap(),
+        crate::client::stored(&m22, "gh-token").unwrap(),
         b"token-v2"
     );
     assert!(
@@ -325,10 +325,7 @@ fn only_the_refused_version_is_forgotten_and_the_stored_one_is_adopted_by_its_di
     );
 
     sync(m7, None).expect("m7 syncs");
-    assert_eq!(
-        std::fs::read(m7.home.join(".secrets/gh-token")).unwrap(),
-        b"token-v2"
-    );
+    assert_eq!(crate::client::stored(&m7, "gh-token").unwrap(), b"token-v2");
     assert!(log_covers_served(m7, &macs.url));
     macs.server.stop();
 }
@@ -667,10 +664,7 @@ fn the_unversioned_hold_of_an_earlier_build_is_adopted_by_the_head_it_completes(
     // m22's next pass sends them, as after any adopted hold.
     let _ = sync(m22, None);
     sync(m7, None).expect("m7 syncs");
-    assert_eq!(
-        std::fs::read(m7.home.join(".secrets/gh-token")).unwrap(),
-        b"token-v2"
-    );
+    assert_eq!(crate::client::stored(&m7, "gh-token").unwrap(), b"token-v2");
     assert!(log_covers_served(m7, &macs.url));
     macs.server.stop();
 }

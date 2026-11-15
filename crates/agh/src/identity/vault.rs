@@ -2,13 +2,14 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Vault adoption (design §6.10): with no agh.toml, the two token files the ALab vault's
-//! subscriber writes route as if `agh auth add` had provisioned them, with no command run and
-//! no file edited by anyone.
+//! Vault adoption (design §6.10): with no agh.toml, the ALab vault's two GitHub entries, read in
+//! place from this Mac's verified secret store (`aterm_secrets::client::read_in_place`), route as
+//! if `agh auth add` had provisioned them, with no command run and no file edited by anyone. No
+//! file under `~/.secrets` is read: those older builds wrote are the owner's backup.
 //!
-//! - `~/.secrets/gh_access_token` is profile `dev`, tier dev, the writer and only reader of the
+//! - The entry `gh_access_token` is profile `dev`, tier dev, the writer and only reader of the
 //!   owner its own login names, and the first reader of every other owner.
-//! - `~/.secrets/gh_access_token_alabsystems` is profile `release`, tier release, the writer of
+//! - The entry `gh_access_token_alabsystems` is profile `release`, tier release, the writer of
 //!   [`aterm_types::channel::PUBLIC_OWNER`] (its reader too while there is no dev token).
 //!
 //! Each token's login is learned with one `GET /user` through the client's effect seam, sent
@@ -19,16 +20,16 @@
 //! leaves to adoption (it names no profile `dev` or `release`). The rows pass the same L1–L10
 //! every agh.toml passes, and `Router::decide` holds the same tier walls over them. A token
 //! whose rows would break a rule is left out (`Found::Faulted`) and the rest still route; when
-//! the two files hold one token, or two tokens of one login, neither's tier is known and
-//! neither routes; the same holds when one file holds the token, or a token of the login, the
-//! record keeps for the other file. A record agh cannot parse routes neither token: the guard
+//! the two entries hold one token, or two tokens of one login, neither's tier is known and
+//! neither routes; the same holds when one entry holds the token, or a token of the login, the
+//! record keeps for the other entry. A record agh cannot parse routes neither token: the guard
 //! against a changed login rests on it. Each adopted profile sends exactly the token adoption
 //! judged: the call's client is handed that credential (`Github::pin`), never a later read of
-//! the file.
+//! the store.
 
 #[cfg(unix)]
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::client::{Github, Meter};
@@ -36,9 +37,9 @@ use crate::client::{Github, Meter};
 use crate::config::{self, DefaultRow, OwnerRow, ProfileRow, WriteField};
 use crate::config::{AghConfig, ConfigFault, Dirs, Validated};
 use crate::error::{Error, IdentityRef, Kind, Result, Sub};
-use crate::identity::{Credential, EnvSource, Profile, TokenKind, tilde};
 #[cfg(unix)]
-use crate::identity::{LoadError, Source};
+use crate::identity::LoadError;
+use crate::identity::{Credential, Profile, Source, TokenKind, tilde};
 use crate::policy::{RefusalCode, Router, Tier};
 
 /// The adoption record, in `Dirs::config`.
@@ -51,61 +52,67 @@ const RECORD_LOCK: &str = ".vault-record.lock";
 #[cfg(unix)]
 const RECORD_MAX: usize = 4 * 1024;
 
-/// Why neither vault token routes when both files hold one token.
+/// Why neither vault token routes when both entries hold one token.
 #[cfg(unix)]
-const ONE_TOKEN: &str = "L7: the vault's dev and release files hold one token, so its tier is \
+const ONE_TOKEN: &str = "L7: the vault's dev and release entries hold one token, so its tier is \
                          unknown and neither routes";
 
-/// The step for the vault's two files when neither's tier is known: the vault's contents, not
+/// The step for the vault's two entries when neither's tier is known: the vault's contents, not
 /// any row of agh's, are what to fix.
 #[must_use]
 pub fn pair_next() -> String {
     format!(
-        "aterm secrets sync applies the vault's current tokens: agh routes neither until {} is \
-         the dev tier's token and {} the release login's",
-        Slot::Dev.pointer(),
-        Slot::Release.pointer()
+        "aterm secrets sync applies the vault's current entries: agh routes neither until the \
+         vault entry {} is the dev tier's token and {} the release login's",
+        Slot::Dev.entry(),
+        Slot::Release.entry()
     )
 }
 
 /// The step for an owner no token agh routes writes: its token is a vault entry, which
-/// `aterm secrets need entry:NAME` asks the lab's Macs for, and an agh.toml row routes the file
-/// it lands in. `name` is the entry and the profile (`NAME` when unknown); `tier` the row's.
+/// `aterm secrets need entry:NAME` asks the lab's Macs for, and an agh.toml row routes it by the
+/// spelling `~/.secrets/NAME`, which names the entry in the store and opens no file. `name` is
+/// the entry and the profile (`NAME` when unknown); `tier` the row's.
 #[must_use]
 pub fn owner_step(owner: &str, name: &str, tier: &str) -> String {
     format!(
         "aterm secrets need entry:{name} asks the lab's Macs for a token that writes {owner}; agh \
-         auth add {name} --file {} --tier {tier} --owner {owner} --write routes it",
+         auth add {name} --file {} --tier {tier} --owner {owner} --write routes the vault entry",
         aterm_types::vault_entry::plain_entry_pointer(name)
     )
 }
 
-/// The step for profile `profile`'s token when its file is absent: a vault slot's
-/// [`Slot::sync_step`], else, for a file the vault lands (`~/.secrets/NAME`), `aterm secrets
-/// need entry:NAME`; `None` for a token the vault does not hold.
+/// The step for profile `profile`'s token when its vault entry holds none agh can use: the
+/// credential's one path. A vault slot's [`Slot::sync_step`], else, for another vault entry,
+/// `aterm secrets sync`, else `aterm secrets need entry:NAME`; `None` for a token file of the
+/// person's own or an inline token, which the vault does not hold.
 #[must_use]
-pub fn absent_step(profile: &Profile) -> Option<String> {
-    let crate::identity::Source::File(path) = &profile.source else {
+pub fn token_step(profile: &Profile) -> Option<String> {
+    let Source::Entry(entry) = &profile.source else {
         return None;
     };
-    if let Some(slot) = Slot::ALL
-        .into_iter()
-        .find(|slot| path.ends_with(slot.path(Path::new(""))))
-    {
-        return Some(slot.sync_step());
-    }
-    let name = path.file_name()?.to_str()?;
-    path.parent()
-        .is_some_and(|dir| dir.ends_with(aterm_types::vault_entry::SECRETS_DIR))
-        .then(|| format!("aterm secrets need entry:{name} asks the lab's Macs for it"))
+    Some(
+        Slot::ALL
+            .into_iter()
+            .find(|slot| slot.entry() == entry.name())
+            .map_or_else(|| entry_step(entry.name()), Slot::sync_step),
+    )
+}
+
+/// The one path for the vault entry `name`: the vault's current version, else the lab.
+fn entry_step(name: &str) -> String {
+    format!(
+        "aterm secrets sync applies the vault's current entries, else aterm secrets need \
+         entry:{name} asks the lab's Macs for the vault entry {name}"
+    )
 }
 
 /// One of the vault's two tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Slot {
-    /// `~/.secrets/gh_access_token`: profile `dev`.
+    /// The vault entry `gh_access_token`: profile `dev`.
     Dev,
-    /// `~/.secrets/gh_access_token_alabsystems`: profile `release`.
+    /// The vault entry `gh_access_token_alabsystems`: profile `release`.
     Release,
 }
 
@@ -146,16 +153,25 @@ impl Slot {
         }
     }
 
-    /// Its file under `home`: where the vault's subscriber lands its entry.
+    /// The file under `home` older builds' subscriber wrote its entry to. agh reads nothing
+    /// there; this is kept only for the callers outside agh that still name it until they read
+    /// the store (LT-04A), and goes with them.
     #[must_use]
-    pub fn path(self, home: &Path) -> PathBuf {
+    pub fn path(self, home: &Path) -> std::path::PathBuf {
         aterm_types::vault_entry::plain_entry_path(home, self.entry())
     }
 
-    /// Its file as `~/…`, the spelling the secrets registry's pointer gives.
+    /// How an agh.toml row names it: `~/.secrets/NAME`, the spelling every build reads, which
+    /// this one reads as the vault entry, opening no file (`config::token_source`).
     #[must_use]
     pub fn pointer(self) -> String {
         aterm_types::vault_entry::plain_entry_pointer(self.entry())
+    }
+
+    /// Its profile's token source: the entry, in the store under `home`.
+    #[must_use]
+    pub fn source(self, home: &Path) -> Source {
+        Source::Entry(crate::identity::VaultEntry::new(self.entry(), home))
     }
 
     /// The other slot.
@@ -176,15 +192,15 @@ impl Slot {
         }
     }
 
-    /// The step for its file when it holds no token agh can use (absent, unusable, or one
-    /// GitHub refuses): the credential's one path, the vault's subscriber, else the lab.
+    /// The step for its entry when it holds no token agh can use (absent, unusable, or one
+    /// GitHub refuses): the credential's one path, the vault's current version, else the lab.
     #[must_use]
     pub fn sync_step(self) -> String {
         format!(
-            "aterm secrets sync writes {} from the vault, else aterm secrets need {} asks the \
-             lab's Macs for it",
-            self.pointer(),
-            self.want()
+            "aterm secrets sync applies the vault's current entries, else aterm secrets need {} \
+             asks the lab's Macs for the vault entry {}",
+            self.want(),
+            self.entry()
         )
     }
 
@@ -202,15 +218,16 @@ impl Slot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Found {
-    /// There is no such file: nothing to adopt.
+    /// The store holds no such entry (or this Mac has no vault): nothing to adopt.
     Absent,
-    /// The file is there and fails the private-file or token rules: reported, never used.
+    /// The entry is there and fails the token rules, or the store cannot be read: reported,
+    /// never used.
     Unusable {
         /// `LoadError::slug`.
         slug: &'static str,
         /// The load's refusal.
         why: String,
-        /// What makes it usable: for a vault file always a step (`vault::remedy`).
+        /// What makes it usable: for a vault entry always its slot's `sync_step`.
         remedy: Option<String>,
     },
     /// Routed as its profile.
@@ -247,7 +264,7 @@ pub enum Found {
         /// Whether GitHub answered that the token does not authenticate (a 401), which no
         /// retry changes: `Slot::sync_step` is its step.
         rejected: bool,
-        /// Whether the record holds another fingerprint for this file: the token rotated, and
+        /// Whether the record holds another fingerprint for this entry: the token rotated, and
         /// the next routed call learns it again, refusing it if its login changed.
         rotated: bool,
     },
@@ -264,13 +281,11 @@ pub enum Found {
     },
 }
 
-/// One vault token, where it is, and what adoption found.
+/// One vault token (its entry is `slot.entry()`), and what adoption found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vaulted {
     /// Which token.
     pub slot: Slot,
-    /// Its file.
-    pub token_file: PathBuf,
     /// What adoption found.
     pub found: Found,
 }
@@ -360,7 +375,7 @@ impl Adoption {
     }
 
     /// The credentials the adopted profiles were judged by. The call's client sends exactly
-    /// these (`Github::pin`), so a token file rewritten after adoption never speaks for the
+    /// these (`Github::pin`), so a vault entry rotated after adoption never speaks for the
     /// rows adoption derived from the token it judged.
     #[must_use]
     pub fn pinned(&self) -> &[Arc<Credential>] {
@@ -385,7 +400,7 @@ impl Adoption {
     /// The step for `error`, from a call that routed by adoption's rows, where the error's own
     /// step names something adoption has none of: a 401 for an adopted token is its slot's
     /// `sync_step`, never an agh.toml edit; an owner with no writer or no reader
-    /// left is the public owner's release file's (`~/.secrets/gh_access_token_alabsystems`) or
+    /// left is the public owner's release entry's (`gh_access_token_alabsystems`) or
     /// the dev token's (its `sync_step` when absent, else its found-and-not-routed step), and
     /// with no agh.toml, an owner the adopted dev token does not write is [`owner_step`]'s, since
     /// there is no row to edit. `None` keeps the error's.
@@ -421,7 +436,7 @@ impl Adoption {
         }
     }
 
-    /// The step for `slot`'s token when it does not route: an absent file's is its
+    /// The step for `slot`'s token when it does not route: an absent entry's is its
     /// `sync_step`.
     fn slot_step(&self, slot: Slot) -> Option<String> {
         let vaulted = self.vaulted.iter().find(|v| v.slot == slot)?;
@@ -434,10 +449,10 @@ impl Adoption {
     /// The stderr lines of a call that routes without a vault token it found: one for the
     /// tokens whose login this call could not reach GitHub to learn, one for each token GitHub
     /// refused (a 401), one for each unusable token, one for the tokens left out for one fault
-    /// (both files, when neither's tier is known), and one when a learned login could not be
+    /// (both entries, when neither's tier is known), and one when a learned login could not be
     /// recorded. Empty when every token found routes and is recorded.
     #[must_use]
-    pub fn note(&self, home: &Path) -> Vec<String> {
+    pub fn note(&self) -> Vec<String> {
         let mut lines = Vec::new();
         let failed: Vec<(&Vaulted, &str)> = self
             .vaulted
@@ -457,9 +472,9 @@ impl Adoption {
             lines.push(note_line(
                 &names.join(","),
                 &format!(
-                    "{} ({}) was not adopted: {why}",
+                    "{} (vault entry {}) was not adopted: {why}",
                     first.slot.profile(),
-                    tilde(&first.token_file, home)
+                    first.slot.entry()
                 ),
                 "this call routes without it; the next call asks again",
             ));
@@ -474,18 +489,18 @@ impl Adoption {
                 } => lines.push(note_line(
                     v.slot.profile(),
                     &format!(
-                        "{} ({}) was not adopted: GitHub refused it: {why}",
+                        "{} (vault entry {}) was not adopted: GitHub refused it: {why}",
                         v.slot.profile(),
-                        tilde(&v.token_file, home)
+                        v.slot.entry()
                     ),
                     &v.slot.sync_step(),
                 )),
                 Found::Unusable { slug, why, .. } => lines.push(note_line(
                     v.slot.profile(),
                     &format!(
-                        "{} ({}) is not used: {slug}: {why}",
+                        "{} (vault entry {}) is not used: {slug}: {why}",
                         v.slot.profile(),
-                        tilde(&v.token_file, home)
+                        v.slot.entry()
                     ),
                     &v.next().unwrap_or_else(|| v.slot.sync_step()),
                 )),
@@ -505,7 +520,7 @@ impl Adoption {
             let names: Vec<&str> = group.iter().map(|v| v.slot.profile()).collect();
             let subjects: Vec<String> = group
                 .iter()
-                .map(|v| format!("{} ({})", v.slot.profile(), tilde(&v.token_file, home)))
+                .map(|v| format!("{} (vault entry {})", v.slot.profile(), v.slot.entry()))
                 .collect();
             let verb = if group.len() == 1 { "is" } else { "are" };
             lines.push(note_line(
@@ -543,15 +558,15 @@ impl Adoption {
     #[cfg(unix)]
     fn judge(mut vaulted: Vec<Vaulted>, home: &Path, base: Option<&AghConfig>) -> Adoption {
         let joined = base.is_some();
-        if let Some((slot, adopted, now, path)) = vaulted.iter().find_map(|v| match &v.found {
-            Found::Changed { adopted, now, .. } => Some((v.slot, adopted, now, &v.token_file)),
+        if let Some((slot, adopted, now)) = vaulted.iter().find_map(|v| match &v.found {
+            Found::Changed { adopted, now, .. } => Some((v.slot, adopted, now)),
             _ => None,
         }) {
             let name = slot.profile();
             let refusal = Error::refused(format!(
-                "the vault's {name} token ({}) now speaks as {now}, and agh adopted it as \
-                 {adopted}: agh never routes a token to another owner unasked",
-                tilde(path, home)
+                "the vault's {name} token (vault entry {}) now speaks as {now}, and agh adopted \
+                 it as {adopted}: agh never routes a token to another owner unasked",
+                slot.entry()
             ))
             .with_next(format!(
                 "agh auth remove {name} forgets {adopted}, and the next call adopts the token as \
@@ -631,7 +646,7 @@ impl Adoption {
 
 impl Vaulted {
     /// The step that makes this token route, when it is found and does not: an unusable
-    /// file's remedy, a left-out token's fix, `Slot::sync_step` for a token GitHub refused, and
+    /// entry's remedy, a left-out token's fix, `Slot::sync_step` for a token GitHub refused, and
     /// for one whose login GitHub could not be reached for, the next call. `None` for an
     /// absent, adopted, unasked or changed one (a change is the call's refusal, which names
     /// its step).
@@ -668,15 +683,15 @@ fn faulted_next(slot: Slot, joined: bool) -> String {
         )
     } else {
         format!(
-            "{} is not used until it holds a {} tier token of its own login: aterm secrets sync \
-             applies the vault's current tokens",
-            slot.pointer(),
+            "the vault entry {} is not used until it holds a {} tier token of its own login: \
+             aterm secrets sync applies the vault's current entries",
+            slot.entry(),
             slot.tier().slug()
         )
     }
 }
 
-/// The vault's two files when neither token's tier is known: both hold one token, or one holds
+/// The vault's two entries when neither token's tier is known: both hold one token, or one holds
 /// the token or a token of the login the record keeps for the other (`run` left each out with
 /// `pair_next`), or GitHub answered one login for the two tokens, which leaves both out here.
 /// Keeping either would be unsafe: the dev slot's rows make its token every owner's first
@@ -754,8 +769,8 @@ fn subsets(slots: &[Slot]) -> Vec<Vec<Slot>> {
     all
 }
 
-/// The rows `agh auth add NAME --file VAULT_FILE --tier T --owner OWNER --write --drafts` writes
-/// for each token in `keep`, as the canonical agh.toml routes (design §6.2): the dev token
+/// The rows `agh auth add NAME --file ~/.secrets/ENTRY --tier T --owner OWNER --write --drafts`
+/// writes for each token in `keep`, as the canonical agh.toml routes (design §6.2): the dev token
 /// reads first for every owner but the release floor's writer reads, the public owner's reads
 /// included, then anonymous; the release token reads the public owner only while there is no
 /// dev token.
@@ -824,37 +839,37 @@ fn joined_rows(base: Option<&AghConfig>, adopted: AghConfig) -> AghConfig {
 }
 
 /// Adoption for a call: `None` when an agh.toml that does not say `vault = true` is there (or
-/// could not be judged absent), and off unix, where no token file is read. A token whose login
+/// could not be judged absent), and off unix, where there is no store. A token whose login
 /// the record does not hold for its fingerprint is learned with one `GET /user` as that token
 /// through `gh` (its effect seam, its transport and its redactor), sent once with no retry, and
 /// what was learned is recorded under adoption's own lock. A failed `GET /user` adopts nothing
 /// for that token, records nothing, and leaves `note`'s line; once one could not reach GitHub,
-/// the other token's is not sent. One token in both files is not sent at all.
+/// the other token's is not sent. One token in both entries is not sent at all.
 #[must_use]
 pub fn adopt(gh: &Github, dirs: &Dirs) -> Option<Adoption> {
-    run(dirs, gh.env(), Some(gh))
+    run(dirs, Some(gh))
 }
 
-/// Adoption as the record and the files stand, asking GitHub nothing: a token the record does
+/// Adoption as the record and the store stand, asking GitHub nothing: a token the record does
 /// not hold for its fingerprint is `Unlearned` (`tried: false`). `agh policy check` and a call
 /// under `--anonymous` read it.
 #[must_use]
-pub fn view(dirs: &Dirs, env: &dyn EnvSource) -> Option<Adoption> {
-    run(dirs, env, None)
+pub fn view(dirs: &Dirs) -> Option<Adoption> {
+    run(dirs, None)
 }
 
 /// The text `agh auth add NAME` starts a new agh.toml from when there is none: `vault = true`,
-/// so the vault's tokens keep joining as adoption derives them, while either vault token file
-/// is there (usable or not). `None` when neither is, and when the new profile is the vault's
-/// own (`dev` or `release`) or its token file (`file`) is one of the vault's files: that
-/// agh.toml routes alone, as any explicit agh.toml does, so the file it names is routed once.
+/// so the vault's tokens keep joining as adoption derives them, while the store holds either
+/// vault entry (usable or not). `None` when it holds neither, and when the new profile is the
+/// vault's own (`dev` or `release`) or its `source` is one of the vault's two entries: that
+/// agh.toml routes alone, as any explicit agh.toml does, so the entry it names is routed once.
 #[cfg(unix)]
 #[must_use]
-pub fn seed(dirs: &Dirs, name: &str, file: Option<&Path>) -> Option<String> {
-    if Slot::named(name).is_some() || file.is_some_and(|file| is_vault_file(dirs, file)) {
+pub fn seed(dirs: &Dirs, name: &str, source: &Source) -> Option<String> {
+    if Slot::named(name).is_some() || is_slot_entry(source) {
         return None;
     }
-    any_file(dirs).then(|| {
+    any_entry(dirs).then(|| {
         "# agh.toml: routing only; no secret lives in this file. vault = true: the vault's\n\
          # tokens join these rows as agh adopts them with no agh.toml (design §6.10).\n\
          vault = true\n"
@@ -862,64 +877,45 @@ pub fn seed(dirs: &Dirs, name: &str, file: Option<&Path>) -> Option<String> {
     })
 }
 
-/// Whether either vault token file is there, usable or not.
+/// Whether this Mac's store holds either vault entry, usable or not: a store that cannot be read
+/// holds none.
 #[cfg(unix)]
-pub(crate) fn any_file(dirs: &Dirs) -> bool {
-    Slot::ALL
-        .into_iter()
-        .any(|slot| std::fs::symlink_metadata(slot.path(&dirs.home)).is_ok())
+pub(crate) fn any_entry(dirs: &Dirs) -> bool {
+    Slot::ALL.into_iter().any(|slot| {
+        crate::identity::vault_value(&dirs.home, slot.entry()).is_ok_and(|value| value.is_some())
+    })
 }
 
-/// Whether `path` ends in one of the vault's token file names (`~/.secrets/gh_access_token`,
-/// `~/.secrets/gh_access_token_alabsystems`), judged by its components alone, where no home
-/// directory is at hand to say whose.
+/// Whether `source` is one of the vault's two GitHub entries (`gh_access_token`,
+/// `gh_access_token_alabsystems`), judged by its name alone.
 #[must_use]
-pub fn names_vault_path(path: &Path) -> bool {
-    Slot::ALL
-        .into_iter()
-        .any(|slot| path.ends_with(slot.path(Path::new(""))))
+pub fn is_slot_entry(source: &Source) -> bool {
+    matches!(source, Source::Entry(entry)
+        if Slot::ALL.into_iter().any(|slot| slot.entry() == entry.name()))
 }
 
-/// Whether `file` is one of the vault's two token files, as named or once both resolve.
-#[cfg(unix)]
-pub(crate) fn is_vault_file(dirs: &Dirs, file: &Path) -> bool {
-    if Slot::ALL
-        .into_iter()
-        .any(|slot| slot.path(&dirs.home) == file)
-    {
-        return true;
-    }
-    let Ok(resolved) = std::fs::canonicalize(file) else {
-        return false;
-    };
-    Slot::ALL
-        .into_iter()
-        .any(|slot| std::fs::canonicalize(slot.path(&dirs.home)).ok().as_ref() == Some(&resolved))
-}
-
-/// Off unix there is no permission check, so no token file is read (design §6.6).
+/// Off unix there is no store, so no vault entry is read (design §6.6).
 #[cfg(not(unix))]
-fn run(dirs: &Dirs, env: &dyn EnvSource, gh: Option<&Github>) -> Option<Adoption> {
-    let _ = (dirs, env, gh);
+fn run(dirs: &Dirs, gh: Option<&Github>) -> Option<Adoption> {
+    let _ = (dirs, gh);
     None
 }
 
 /// `adopt` and `view` on unix.
 #[cfg(unix)]
-fn run(dirs: &Dirs, env: &dyn EnvSource, gh: Option<&Github>) -> Option<Adoption> {
+fn run(dirs: &Dirs, gh: Option<&Github>) -> Option<Adoption> {
     let base = base(dirs)?;
-    run_with_rows(dirs, env, gh, base.as_ref())
+    run_with_rows(dirs, gh, base.as_ref())
 }
 
 /// Compose a previously admitted file snapshot; the shared router owns the one file read.
 #[cfg(not(unix))]
 pub(crate) fn run_with_rows(
     dirs: &Dirs,
-    env: &dyn EnvSource,
     gh: Option<&Github>,
     base: Option<&AghConfig>,
 ) -> Option<Adoption> {
-    let _ = (dirs, env, gh, base);
+    let _ = (dirs, gh, base);
     None
 }
 
@@ -927,7 +923,6 @@ pub(crate) fn run_with_rows(
 #[cfg(unix)]
 pub(crate) fn run_with_rows(
     dirs: &Dirs,
-    env: &dyn EnvSource,
     gh: Option<&Github>,
     base: Option<&AghConfig>,
 ) -> Option<Adoption> {
@@ -940,7 +935,6 @@ pub(crate) fn run_with_rows(
                 .into_iter()
                 .map(|slot| Vaulted {
                     slot,
-                    token_file: slot.path(&dirs.home),
                     found: Found::Absent,
                 })
                 .collect();
@@ -953,7 +947,7 @@ pub(crate) fn run_with_rows(
     };
     let loaded: Vec<(Slot, std::result::Result<Arc<Credential>, Found>)> = Slot::ALL
         .into_iter()
-        .map(|slot| (slot, load_slot(slot, dirs, env)))
+        .map(|slot| (slot, load_slot(slot, dirs)))
         .collect();
     let one_token = matches!(
         loaded.as_slice(),
@@ -1007,11 +1001,7 @@ pub(crate) fn run_with_rows(
                 }
             },
         };
-        vaulted.push(Vaulted {
-            slot,
-            token_file: slot.path(&dirs.home),
-            found,
-        });
+        vaulted.push(Vaulted { slot, found });
     }
     if let Some(why) = misplaced_login(&vaulted, &record) {
         for v in &mut vaulted {
@@ -1098,20 +1088,21 @@ fn unlearned_names(vaulted: &[Vaulted]) -> String {
         .join(",")
 }
 
-/// Why neither token routes when `slot`'s file holds the token the record keeps for the other
-/// file: the two files' contents are crossed, so neither's tier is known.
+/// Why neither token routes when `slot`'s entry holds the token the record keeps for the other
+/// entry: the two entries' contents are crossed, so neither's tier is known.
 #[cfg(unix)]
 fn misplaced_token(slot: Slot) -> String {
     format!(
-        "L7: {} holds the token agh recorded for {}, so its tier is unknown and neither routes",
-        slot.pointer(),
-        slot.other().pointer()
+        "L7: the vault entry {} holds the token agh recorded for {}, so its tier is unknown and \
+         neither routes",
+        slot.entry(),
+        slot.other().entry()
     )
 }
 
 /// Why neither token routes when one speaks (as learned or as recorded) as the login the record
-/// keeps for the other file, whatever that file holds this call: `None` when none does. The
-/// other file's token then may be absent, unusable or not learned this call, so the check
+/// keeps for the other entry, whatever that entry holds this call: `None` when none does. The
+/// other entry's token then may be absent, unusable or not learned this call, so the check
 /// `one_login` makes of two adopted tokens would miss it.
 #[cfg(unix)]
 fn misplaced_login(vaulted: &[Vaulted], record: &Record) -> Option<String> {
@@ -1160,31 +1151,27 @@ struct Learn {
     row: Learned,
 }
 
-/// One vault token loaded by the private-file and token rules: its credential, or what
-/// adoption reports of it (`Absent`, `Unusable`).
+/// One vault token read in place from the store by the token rules: its credential, or what
+/// adoption reports of it (`Absent`, `Unusable`, whose remedy is the slot's `sync_step`: an
+/// entry has no file mode or link to fix).
 #[cfg(unix)]
-fn load_slot(
-    slot: Slot,
-    dirs: &Dirs,
-    env: &dyn EnvSource,
-) -> std::result::Result<Arc<Credential>, Found> {
-    let path = slot.path(&dirs.home);
+fn load_slot(slot: Slot, dirs: &Dirs) -> std::result::Result<Arc<Credential>, Found> {
     let profile = slot_profile(slot, &dirs.home);
-    match super::load(&profile, env) {
+    match super::load(&profile) {
         Ok(cred) => Ok(Arc::new(cred)),
         Err(LoadError::Missing) => Err(Found::Absent),
         Err(error) => Err(Found::Unusable {
             slug: error.slug(),
             why: error.to_string(),
-            remedy: Some(remedy(&error, slot, &path, &dirs.home)),
+            remedy: Some(slot.sync_step()),
         }),
     }
 }
 
-/// The one-file profile a vault token loads and learns as.
+/// The one-entry profile a vault token loads and learns as.
 #[cfg(unix)]
 fn slot_profile(slot: Slot, home: &Path) -> Profile {
-    Profile::new(slot.profile(), Source::File(slot.path(home)), slot.tier())
+    Profile::new(slot.profile(), slot.source(home), slot.tier())
 }
 
 /// What one call learns: the client it asks through (`None`: it asks nothing), the logins it
@@ -1230,7 +1217,7 @@ impl Learning<'_> {
         };
         let Some(gh) = self.gh else {
             let why = if recorded.is_some() {
-                "rotated: the file holds another token than the one agh recorded; the next \
+                "rotated: the entry holds another token than the one agh recorded; the next \
                  routed call learns its login again, and refuses it if that login changed"
             } else {
                 "agh learns its login with GET /user on the next call that routes"
@@ -1323,37 +1310,6 @@ fn learn(
         ));
     }
     Ok(user.login)
-}
-
-/// The remedy for a vault token that does not load, always a step: for a loose file the chmods
-/// (a profile of agh's own would be an agh.toml, which ends adoption), for a link the file
-/// itself, and for any other (content that is not one usable token, a file agh cannot read, or
-/// a loose one no chmod of this user's fixes) the vault's rewrite (`Slot::sync_step`), since
-/// the file is the secrets subscriber's.
-#[cfg(unix)]
-fn remedy(error: &LoadError, slot: Slot, path: &Path, home: &Path) -> String {
-    use crate::identity::{Held, PrivateFix, private_fix};
-    match error {
-        LoadError::Loose(_) => match path
-            .parent()
-            .map(|dir| private_fix(dir, path, home, Held::Token))
-        {
-            Some(PrivateFix::Fix(chmods)) => chmods,
-            Some(PrivateFix::NotAFile) => {
-                format!("{} must be a regular file", tilde(path, home))
-            }
-            Some(PrivateFix::NoChmod | PrivateFix::Unseen) | None => slot.sync_step(),
-        },
-        LoadError::Symlink => format!(
-            "{} must be the file itself, in a real directory of yours: replace the link",
-            tilde(path, home)
-        ),
-        LoadError::Missing
-        | LoadError::Malformed(_)
-        | LoadError::Unsupported(_)
-        | LoadError::Io(_)
-        | LoadError::Unavailable(_) => slot.sync_step(),
-    }
 }
 
 /// One token's login, by the fingerprint `GET /user` answered it for.
@@ -1703,6 +1659,45 @@ pub fn record_for_tests(dirs: &Dirs, rows: &[(Slot, &str, &str)]) -> std::io::Re
         });
     }
     write_record(dirs, &record)
+}
+
+/// Tests: vault entry `name` of the store under `home` set to `value` (`None` removes it), in a
+/// signed file vault this home's Mac administers, which the first call creates beside the home
+/// (`<home>.vault`). The store is what agh reads; no file under `home/.secrets` is read, though
+/// the vault's own subscriber may still write one there.
+/// # Panics
+/// When the vault cannot be created, opened or published: a test's fixture failed.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub fn put_entry_for_tests(home: &Path, name: &str, value: Option<&[u8]>) {
+    use aterm_secrets::{client, text::Audience};
+    std::fs::create_dir_all(home).expect("the home");
+    let paths = client::Paths::locate_for_home(home);
+    if client::config(&paths)
+        .expect("the vault's config")
+        .is_none()
+    {
+        // Beside the home, under a fixed file name: a scratch home's own name need not be a
+        // vault file name.
+        let mut dir = home.as_os_str().to_os_string();
+        dir.push(".vault.d");
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).expect("the vault's folder");
+        let source = dir.join("fixture.vault");
+        let source = source.to_str().expect("a UTF-8 home");
+        client::create(&paths, source, None, Some("m1")).expect("the vault");
+    }
+    let admin = client::admin_open(&paths).expect("the vault's admin");
+    let mut doc = admin.doc.clone();
+    match value {
+        Some(value) => doc
+            .set_entry(&Audience::Everyone, name, value)
+            .expect("the entry"),
+        None => {
+            doc.unset_entry(&Audience::Everyone, name)
+                .expect("the entry removed");
+        }
+    }
+    client::admin_publish(&paths, &admin, &doc).expect("the vault published");
 }
 
 /// The record's lock, held until the guard drops, as another agh call holds it while it writes

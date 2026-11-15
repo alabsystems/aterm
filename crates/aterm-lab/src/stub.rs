@@ -883,14 +883,12 @@ fn tool_results(msgs: &[J]) -> Vec<String> {
         .collect()
 }
 
-/// The first session id (`s-` and hex digits) in `text`.
+/// The first session id (a tab ID in either form, [`aterm_types::tab_id::is_tab_id`]) in
+/// `text`. A word runs over `-` too, so an earlier tab's `s-` ID is one word.
 #[must_use]
 pub fn first_sid(text: &str) -> Option<&str> {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-        .find(|w| {
-            w.strip_prefix("s-")
-                .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
-        })
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
 }
 
 /// `input` with every `@SID:<k>@` in its strings replaced by the first session id of

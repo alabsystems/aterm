@@ -745,8 +745,7 @@ fn the_root_shell_drops_the_channel_before_it_reads_anything() {
     let a = archive(true);
     let s = root_script(&install_of(&a));
     assert!(s.starts_with("exec </dev/null\nset -e\n"), "{s}");
-    let secret = Secret::new(b"x").unwrap();
-    let fed = install_command(&install_of(&a), Sudo::Password(&secret));
+    let fed = install_command(&install_of(&a));
     assert!(
         fed.starts_with("/usr/bin/sudo -S -p '' -- /bin/sh -c 'exec </dev/null"),
         "{fed}"
@@ -756,8 +755,6 @@ fn the_root_shell_drops_the_channel_before_it_reads_anything() {
         "status=$?\n/bin/rm -f /var/folders/yt/x/T/aterm-agent-abababab.zip \
          /var/folders/yt/x/T/aterm-allowed-signers-abababab\nexit $status\n"
     ));
-    let tty = install_command(&install_of(&a), Sudo::Terminal);
-    assert!(tty.starts_with("/usr/bin/sudo -- /bin/sh -c "), "{tty}");
 }
 
 #[test]
@@ -789,7 +786,7 @@ fn the_master_trusts_only_the_vouched_key_and_takes_one_password_by_askpass() {
         assert!(line.contains(want), "{want}: {line}");
     }
     assert_eq!(cmd.env.len(), 2);
-    let remote = remote_sh(&m, "echo ===", false).display();
+    let remote = remote_sh(&m, "echo ===").display();
     assert!(
         remote.ends_with(r"-- admin@192.168.64.2 '/bin/sh -c '\''echo ==='\'''"),
         "{remote}"
@@ -898,7 +895,7 @@ fn enrolling(holder: &str, uuid: &str) -> Fake {
         .as_bytes(),
     );
     sys.on(
-        &remote_sh(&master(), FACTS_SCRIPT, false).display(),
+        &remote_sh(&master(), FACTS_SCRIPT).display(),
         Ran::ok(&vm_facts()),
     );
     sys
@@ -918,14 +915,25 @@ const DENIED: &str =
 const SUDO_WRONG: &str =
     "Sorry, try again.\n\nsudo: no password was provided\nsudo: 1 incorrect password attempt\n";
 const RIGHT: &str = "hunter2-right";
-const TYPO: &str = "hunter2-typo";
 const EXE: &str = "/w/aterm-machines-dev";
 const FLEET: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJpFPtSPTOuLIj6oqQTj8ndNDVNHFp4renP47+wxFYao aterm-machines-fleet@ctl";
 const TMP: &str = "/var/folders/yt/jkgjjlb55fvbjsx8t5xw72280000gn/T";
 const UUID_A: &str = "0A1B2C3D-0000-4000-8000-00000000000A";
 const UUID_B: &str = "0A1B2C3D-0000-4000-8000-00000000000B";
 
+/// [`unvaulted`], its vault holding the admin password [`RIGHT`].
 fn set_up() -> Fake {
+    let sys = unvaulted();
+    super::super::credential::tests::in_vault(
+        &sys,
+        aterm_secrets::need::catalog::MACHINES_ADMIN_ENTRY,
+        Some(RIGHT.as_bytes()),
+    );
+    sys
+}
+
+/// A controller set up to enroll, signed in to no vault.
+fn unvaulted() -> Fake {
     let sys = Fake::root();
     sys.file(&format!("{ROOT}/machines.toml"), b"schema = 1\n");
     sys.file(
@@ -999,15 +1007,9 @@ fn install_key(address: &str) -> String {
         admin: "admin".into(),
         fleet_key: p.fleet_key.clone(),
     };
-    let secret = Secret::new(b"x").unwrap();
     format!(
         "fed {}",
-        remote_sh(
-            &master_of(address),
-            &install_command(&install, Sudo::Password(&secret)),
-            false
-        )
-        .display()
+        remote_sh(&master_of(address), &install_command(&install)).display()
     )
 }
 
@@ -1019,7 +1021,7 @@ fn a_mac(sys: &Fake, address: &str, uuid: &str, local: &str, install: Ran) {
     );
     let master = master_of(address);
     sys.on(
-        &remote_sh(&master, FACTS_SCRIPT, false).display(),
+        &remote_sh(&master, FACTS_SCRIPT).display(),
         Ran::ok(
             &vm_facts()
                 .replace(VM_UUID, uuid)
@@ -1040,7 +1042,6 @@ fn batch(addresses: &[&str], user_given: bool) -> Args {
         found: false,
         user: "admin".into(),
         user_given,
-        user_recorded: false,
         name: None,
         trust: Trust::FirstUse,
         parallel: Some(1),
@@ -1082,10 +1083,11 @@ fn never_shown(sys: &Fake, out: &str, password: &str) {
     }
 }
 
+/// THE ONE PATH: the vault's machines-admin password signs in and sudoes on every Mac, after
+/// every host key is scanned; nobody is asked for it.
 #[test]
-fn one_password_typed_once_logs_in_and_sudoes_on_every_mac() {
+fn the_vaults_admin_password_logs_in_and_sudoes_on_every_mac() {
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     a_mac(
         &sys,
         "lab-02.local",
@@ -1119,18 +1121,10 @@ fn one_password_typed_once_logs_in_and_sudoes_on_every_mac() {
         summary.text()
     );
     let calls = sys.calls();
-    let asks: Vec<&String> = calls.iter().filter(|c| c.starts_with("ask")).collect();
-    assert_eq!(
-        asks,
-        [
-            "ask secret Password for admin on the 2 Macs (typed once, used for each, never \
-             saved): "
-        ]
-    );
-    let asked = calls.iter().position(|c| c.starts_with("ask")).unwrap();
+    assert!(!calls.iter().any(|c| c.starts_with("ask")), "{calls:?}");
     let last_scan = calls.iter().rposition(|c| c.contains(" hostkey@")).unwrap();
     let first_fed = calls.iter().position(|c| c.starts_with("fed ")).unwrap();
-    assert!(last_scan < asked && asked < first_fed, "{calls:?}");
+    assert!(last_scan < first_fed, "{calls:?}");
     let fed = sys.fed();
     assert_eq!(fed.len(), 4, "{fed:?}");
     assert!(fed.iter().all(|(_, bytes)| bytes == RIGHT.as_bytes()));
@@ -1150,83 +1144,11 @@ fn one_password_typed_once_logs_in_and_sudoes_on_every_mac() {
     assert_eq!(inv.hosts.len(), 2);
 }
 
+/// A Mac that refuses the vault's password is skipped with one line naming the password and
+/// `--user`; the rest go on, and nobody is asked again.
 #[test]
-fn a_mac_that_refuses_the_password_is_asked_for_once_more_by_name() {
+fn a_mac_that_refuses_the_vaults_password_is_skipped_with_one_line_and_the_rest_go_on() {
     let sys = set_up();
-    sys.answer(Some(TYPO)).answer(None).answer(Some(RIGHT));
-    a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
-    a_mac(&sys, "lab-04.local", UUID_B, "lab-04", Ran::ok(""));
-    sys.on(&login_key("lab-02.local", 1, PASSWORD_METHOD), Ran::ok(""));
-    sys.on(
-        &login_key("lab-04.local", 2, PASSWORD_METHOD),
-        Ran::exit(255, DENIED),
-    );
-    sys.on(&login_key("lab-04.local", 2, PASSWORD_METHOD), Ran::ok(""));
-    let (done, out) = run_batch(&sys, &batch(&["lab-02.local", "lab-04.local"], false));
-    let summary = done.unwrap();
-    assert_eq!(summary.enrolled.len(), 2, "{out}");
-    let asks: Vec<String> = sys
-        .calls()
-        .into_iter()
-        .filter(|c| c.starts_with("ask"))
-        .collect();
-    assert_eq!(
-        asks,
-        [
-            "ask secret Admin password on the 2 Macs (typed once, used for each, never \
-             saved): "
-                .to_owned(),
-            "ask What is the admin account called on the Macs? (Enter keeps admin): ".to_owned(),
-            "ask secret lab-04 did not take the password for admin. Type it again (Enter \
-             skips it): "
-                .to_owned(),
-        ]
-    );
-    assert!(
-        out.contains(
-            "lab-04: no login as admin with that password (a wrong password, or no account \
-             called admin there)"
-        ),
-        "{out}"
-    );
-    let fed: Vec<(String, Vec<u8>)> = sys.fed();
-    let lab04: Vec<&[u8]> = fed
-        .iter()
-        .filter(|(k, _)| k.contains("lab-04.local"))
-        .map(|(_, b)| b.as_slice())
-        .collect();
-    assert_eq!(
-        lab04,
-        [TYPO.as_bytes(), RIGHT.as_bytes(), RIGHT.as_bytes()],
-        "the typo, then the retyped password to its login and its sudo"
-    );
-    never_shown(&sys, &out, TYPO);
-    never_shown(&sys, &out, RIGHT);
-}
-
-#[test]
-fn a_retyped_password_that_works_is_tried_on_the_others_before_each_is_asked() {
-    let sys = set_up();
-    sys.answer(Some(TYPO)).answer(Some(RIGHT));
-    a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
-    a_mac(&sys, "lab-04.local", UUID_B, "lab-04", Ran::ok(""));
-    for (address, seq) in [("lab-02.local", 1), ("lab-04.local", 2)] {
-        sys.on(
-            &login_key(address, seq, PASSWORD_METHOD),
-            Ran::exit(255, DENIED),
-        );
-        sys.on(&login_key(address, seq, PASSWORD_METHOD), Ran::ok(""));
-    }
-    let (done, out) = run_batch(&sys, &batch(&["lab-02.local", "lab-04.local"], true));
-    assert_eq!(done.unwrap().enrolled.len(), 2, "{out}");
-    let asks = sys.calls().iter().filter(|c| c.starts_with("ask")).count();
-    assert_eq!(asks, 2, "a typo costs one more prompt, not one per Mac");
-}
-
-#[test]
-fn a_mac_that_refuses_every_password_typed_is_skipped_with_one_line_and_the_rest_go_on() {
-    let sys = set_up();
-    sys.answer(Some(RIGHT)).answer(Some(TYPO));
     a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
     a_mac(&sys, "lab-04.local", UUID_B, "lab-04", Ran::ok(""));
     sys.on(
@@ -1242,145 +1164,22 @@ fn a_mac_that_refuses_every_password_typed_is_skipped_with_one_line_and_the_rest
     assert!(
         text.starts_with(
             "enrolled 1 (lab-04); not enrolled: 1\n  lab-02: no login as admin with the \
-             password typed"
-        ) && text.contains("; run the same enroll command again to retry it\nNext:"),
+             vault's machines-admin password"
+        ) && text.contains("--user names another"),
         "{text}"
-    );
-    assert!(
-        out.contains("lab-02: did not take that password either"),
-        "{out}"
     );
     assert!(
         !sys.calls()
             .iter()
-            .any(|c| c.contains("scp") && c.contains("lab-02.local"))
-    );
-}
-
-fn logins(sys: &Fake, user: &str, address: &str, replies: &[bool]) {
-    let seq = if address == "lab-02.local" { 1 } else { 2 };
-    for &ok in replies {
-        let reply = if ok {
-            Ran::ok("")
-        } else {
-            Ran::exit(255, DENIED)
-        };
-        sys.on(&login_key_as(user, address, seq, PASSWORD_METHOD), reply);
-    }
-}
-
-fn asks(sys: &Fake) -> Vec<String> {
-    sys.calls()
-        .into_iter()
-        .filter(|c| c.starts_with("ask"))
-        .collect()
-}
-
-#[test]
-fn a_lab_admin_who_is_not_this_macs_login_types_the_password_once_and_the_name_once() {
-    let sys = set_up();
-    sys.answer(Some(RIGHT)).answer(Some("admin"));
-    a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
-    a_mac(&sys, "lab-04.local", UUID_B, "lab-04", Ran::ok(""));
-    for address in ["lab-02.local", "lab-04.local"] {
-        logins(&sys, "owner", address, &[false]);
-        logins(&sys, "admin", address, &[true]);
-    }
-    let mut args = batch(&["lab-02.local", "lab-04.local"], false);
-    args.user = "owner".into();
-    let (done, out) = run_batch(&sys, &args);
-    let summary = done.unwrap();
-    assert_eq!(summary.enrolled.len(), 2, "{out}");
-    assert!(summary.enrolled.iter().all(|(_, h)| h.user == "admin"));
-    assert_eq!(
-        asks(&sys),
-        [
-            "ask secret Admin password on the 2 Macs (typed once, used for each, never \
-             saved): ",
-            "ask What is the admin account called on the Macs? (Enter keeps owner): ",
-        ],
-        "{out}"
-    );
-    assert!(
-        out.contains("2 Macs (lab-02, lab-04): no login as owner with that password"),
-        "{out}"
-    );
-    assert!(sys.fed().iter().all(|(_, bytes)| bytes == RIGHT.as_bytes()));
-    never_shown(&sys, &out, RIGHT);
-}
-
-#[test]
-fn a_typo_at_one_macs_prompt_costs_it_nothing_when_the_next_password_typed_is_right() {
-    let sys = set_up();
-    sys.answer(Some(TYPO))
-        .answer(Some(TYPO))
-        .answer(Some(RIGHT));
-    a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
-    a_mac(&sys, "lab-04.local", UUID_B, "lab-04", Ran::ok(""));
-    logins(&sys, "admin", "lab-02.local", &[false, false, true]);
-    logins(&sys, "admin", "lab-04.local", &[false, true]);
-    let (done, out) = run_batch(&sys, &batch(&["lab-02.local", "lab-04.local"], true));
-    let summary = done.unwrap();
-    assert_eq!(summary.enrolled.len(), 2, "{out}\n{summary:?}");
-    assert_eq!(asks(&sys).len(), 3, "{:?}", asks(&sys));
-    assert!(
-        out.contains("lab-02: did not take that password either"),
-        "{out}"
-    );
-    let lab02: Vec<Vec<u8>> = sys
-        .fed()
-        .into_iter()
-        .filter(|(k, _)| k.contains("lab-02.local"))
-        .map(|(_, b)| b)
-        .collect();
-    assert_eq!(
-        lab02,
-        [
-            TYPO.as_bytes(),
-            TYPO.as_bytes(),
-            RIGHT.as_bytes(),
-            RIGHT.as_bytes()
-        ],
-        "its two typos, then lab-04's password to its login and its sudo"
-    );
-}
-
-#[test]
-fn a_mac_that_refuses_under_the_new_name_too_is_told_by_that_name() {
-    let sys = set_up();
-    sys.answer(Some(RIGHT)).answer(Some("admin"));
-    a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
-    a_mac(&sys, "lab-04.local", UUID_B, "lab-04", Ran::ok(""));
-    for address in ["lab-02.local", "lab-04.local"] {
-        logins(&sys, "owner", address, &[false]);
-    }
-    logins(&sys, "admin", "lab-02.local", &[true]);
-    logins(&sys, "admin", "lab-04.local", &[false]);
-    let mut args = batch(&["lab-02.local", "lab-04.local"], false);
-    args.user = "owner".into();
-    let (done, out) = run_batch(&sys, &args);
-    let summary = done.unwrap();
-    assert_eq!(summary.enrolled.len(), 1, "{out}");
-    let (label, why) = &summary.skipped[0];
-    assert_eq!(label, "lab-04");
-    assert!(
-        why.starts_with("no login as admin with the password typed")
-            && why.ends_with("not asked again: the prompt was stopped"),
-        "{why}"
-    );
-    assert!(
-        asks(&sys)
-            .last()
-            .is_some_and(|a| a.contains("lab-04 did not take the password for admin.")),
+            .any(|c| c.starts_with("ask") || (c.contains("scp") && c.contains("lab-02.local"))),
         "{:?}",
-        asks(&sys)
+        sys.calls()
     );
 }
 
 #[test]
 fn of_several_macs_one_with_remote_login_off_says_so_before_the_password_is_asked() {
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     scanned(
         &sys,
         "192.168.64.9",
@@ -1408,10 +1207,7 @@ fn of_several_macs_one_with_remote_login_off_says_so_before_the_password_is_aske
         ),
         "{out}"
     );
-    assert_eq!(
-        asks(&sys),
-        ["ask secret Password for admin on lab-02.local (never saved): "]
-    );
+    assert!(!sys.calls().iter().any(|c| c.starts_with("ask")));
     assert!(
         summary.text().starts_with(
             "enrolled 1 (lab-02); not enrolled: 1\n  192.168.64.9: Remote Login is off"
@@ -1435,7 +1231,7 @@ fn a_second_enroll_takes_the_recorded_admin_and_an_enrolled_mac_is_nothing_to_do
     let mut args = batch(&["192.168.64.21"], false);
     args.user = "owner".into();
     let args = with_recorded_admin(args, &inv);
-    assert_eq!((args.user.as_str(), args.user_recorded), ("admin", true));
+    assert_eq!(args.user, "admin");
     let mut given = batch(&["192.168.64.21"], true);
     given.user = "root2".into();
     assert_eq!(with_recorded_admin(given, &inv).user, "root2");
@@ -1451,39 +1247,8 @@ fn a_second_enroll_takes_the_recorded_admin_and_an_enrolled_mac_is_nothing_to_do
 }
 
 #[test]
-fn the_retry_prompt_says_why_it_asks_again_and_that_others_get_the_password_too() {
-    let sys = set_up();
-    sys.answer(Some(TYPO)).answer(None).answer(None);
-    a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
-    a_mac(&sys, "lab-04.local", UUID_B, "lab-04", Ran::ok(""));
-    logins(&sys, "admin", "lab-02.local", &[false]);
-    logins(&sys, "admin", "lab-04.local", &[false]);
-    let (done, out) = run_batch(&sys, &batch(&["lab-02.local", "lab-04.local"], true));
-    assert_eq!(
-        asks(&sys)[1],
-        "ask secret lab-02 did not take the password for admin. Type it again (it is also \
-         tried on the other Macs that refused; Enter skips this Mac): "
-    );
-    let summary = done.unwrap();
-    assert_eq!(summary.skipped.len(), 2, "{out}");
-    assert!(
-        summary.skipped[0].1.ends_with(
-            "skipped at its password prompt: run the same enroll command again to enroll it"
-        ),
-        "{:?}",
-        summary.skipped
-    );
-    assert!(
-        !sys.calls()
-            .iter()
-            .any(|c| c.contains("scp") && c.contains("lab-02.local"))
-    );
-}
-
-#[test]
 fn a_mac_whose_sudo_refuses_is_skipped_naming_sudo() {
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     a_mac(
         &sys,
         "lab-02.local",
@@ -1505,7 +1270,6 @@ fn a_mac_whose_sudo_refuses_is_skipped_naming_sudo() {
 #[test]
 fn a_mac_another_controller_enrolled_is_skipped_with_what_its_agent_said() {
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     let refused = Ran {
         status: Some(2),
         stdout: b"refused: install: this Mac is already enrolled \
@@ -1528,7 +1292,6 @@ fn a_mac_another_controller_enrolled_is_skipped_with_what_its_agent_said() {
 #[test]
 fn a_mac_offering_no_password_method_gets_keyboard_interactive() {
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
     sys.on(
         &login_key("lab-02.local", 1, PASSWORD_METHOD),
@@ -1540,26 +1303,37 @@ fn a_mac_offering_no_password_method_gets_keyboard_interactive() {
     sys.on(&login_key("lab-02.local", 1, KBD_METHOD), Ran::ok(""));
     let (done, out) = run_batch(&sys, &batch(&["lab-02.local"], true));
     assert_eq!(done.unwrap().enrolled.len(), 1, "{out}");
-    assert_eq!(
-        sys.calls().iter().filter(|c| c.starts_with("ask")).count(),
-        1,
-        "the same password, no second prompt"
+    assert!(
+        !sys.calls().iter().any(|c| c.starts_with("ask")),
+        "the same password, nobody asked"
     );
 }
 
 #[test]
-fn a_controller_that_is_not_set_up_refuses_before_the_password_is_asked() {
+fn a_controller_that_is_not_set_up_or_holds_no_password_refuses_before_sending_one() {
     let sys = Fake::root();
     sys.file(&format!("{ROOT}/machines.toml"), b"schema = 1\n");
     let (done, _) = run_batch(&sys, &batch(&["lab-02.local"], true));
     assert!(done.unwrap_err().contains("aterm machines init"));
     assert!(!sys.calls().iter().any(|c| c.starts_with("ask")));
-    let sys = set_up();
-    sys.answer(None);
+    // A vault that holds no machines-admin password: the want is filed with the lab and the run
+    // stops naming it, sending nothing and asking nobody.
+    let sys = unvaulted();
+    super::super::credential::tests::in_vault(
+        &sys,
+        aterm_secrets::need::catalog::MACHINES_ADMIN_ENTRY,
+        None,
+    );
     a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
     let (done, _) = run_batch(&sys, &batch(&["lab-02.local"], true));
-    assert!(done.unwrap_err().contains("no password typed"));
+    let why = done.unwrap_err();
+    assert!(
+        why.starts_with("not run: this Mac holds no usable machines-admin")
+            && why.contains("asked the lab's Macs (request "),
+        "{why}"
+    );
     assert!(sys.fed().is_empty(), "{:?}", sys.calls());
+    assert!(!sys.calls().iter().any(|c| c.starts_with("ask")));
     let sys = set_up();
     scanned(&sys, "lab-02.local", None, Ran::exit(255, ""));
     let (done, _) = run_batch(&sys, &batch(&["lab-02.local"], true));
@@ -1611,7 +1385,6 @@ fn a_mac_with_remote_login_off_is_skipped_with_one_line_and_nothing_asked() {
 #[test]
 fn a_host_at_an_enrolled_macs_address_is_never_trusted_on_first_use() {
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     sys.file(
         &format!("{ROOT}/machines.toml"),
         format!(
@@ -1671,7 +1444,6 @@ fn a_host_at_an_enrolled_macs_address_is_never_trusted_on_first_use() {
 #[test]
 fn with_no_fingerprint_the_first_key_is_the_one_trusted_and_its_fingerprint_printed() {
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
     sys.on(&login_key("lab-02.local", 1, PASSWORD_METHOD), Ran::ok(""));
     let kept = Fake::scratch_path(None, "enroll", 1);
@@ -1689,7 +1461,6 @@ fn with_no_fingerprint_the_first_key_is_the_one_trusted_and_its_fingerprint_prin
 #[test]
 fn a_fingerprint_that_does_not_match_is_refused_before_any_password_is_sent() {
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
     let mut args = batch(&["lab-02.local"], true);
     args.trust = Trust::Fingerprint("SHA256:other".into());
@@ -1703,7 +1474,6 @@ fn a_fingerprint_that_does_not_match_is_refused_before_any_password_is_sent() {
         sys.calls()
     );
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
     sys.on(&login_key("lab-02.local", 1, PASSWORD_METHOD), Ran::ok(""));
     args.trust = Trust::Fingerprint(VM_FP.into());
@@ -1715,7 +1485,6 @@ fn a_fingerprint_that_does_not_match_is_refused_before_any_password_is_sent() {
 #[test]
 fn two_addresses_of_one_mac_enroll_it_once() {
     let sys = set_up();
-    sys.answer(Some(RIGHT));
     a_mac(&sys, "lab-02.local", UUID_A, "lab-02", Ran::ok(""));
     a_mac(&sys, "192.168.64.5", UUID_A, "lab-02", Ran::ok(""));
     sys.on(&login_key("lab-02.local", 1, PASSWORD_METHOD), Ran::ok(""));
@@ -1868,6 +1637,7 @@ fn a_name_another_mac_holds_is_refused_before_anything_is_installed() {
         &master(),
         &vm_key(),
         Path::new("/s"),
+        &Secret::new(b"x").unwrap(),
         &mut out,
     )
     .unwrap_err();
@@ -1884,7 +1654,7 @@ fn a_mac_is_named_by_the_tag_its_local_hostname_starts_with() {
           address = \"192.168.64.3\"\nuser = \"admin\"\n",
     );
     sys.on(
-        &remote_sh(&master(), FACTS_SCRIPT, false).display(),
+        &remote_sh(&master(), FACTS_SCRIPT).display(),
         Ran::ok(&vm_facts().replace(
             "Manageds-Virtual-Machine\n",
             "m10-MacBook-M4-Max-36GB-1TB\n",
@@ -1898,6 +1668,7 @@ fn a_mac_is_named_by_the_tag_its_local_hostname_starts_with() {
         &master(),
         &vm_key(),
         Path::new("/s"),
+        &Secret::new(b"x").unwrap(),
         &mut Vec::new(),
     )
     .unwrap_err();
@@ -1920,6 +1691,7 @@ fn a_name_whose_local_hostname_another_mac_would_get_is_refused_before_anything_
         &master(),
         &vm_key(),
         Path::new("/s"),
+        &Secret::new(b"x").unwrap(),
         &mut Vec::new(),
     )
     .unwrap_err();
@@ -1943,6 +1715,7 @@ fn a_known_hardware_uuid_says_how_to_retire_an_erased_mac_and_not_to_unenroll_a_
         &master(),
         &vm_key(),
         Path::new("/s"),
+        &Secret::new(b"x").unwrap(),
         &mut out,
     )
     .unwrap_err();
@@ -1989,7 +1762,7 @@ fn unenroll_refuses_a_host_whose_state_cannot_be_read_and_leaves_it_enrolled() {
 fn unenroll_deletes_the_keys_over_agh_when_the_row_says() {
     let fake = agh_fake::FakeGithub::start();
     let login = super::super::github_keys_tests::LOGIN;
-    let (sys, _token) = super::super::github_keys_tests::inline_on(Fake::root(), &ctl(), &fake);
+    let (sys, _token) = super::super::github_keys_tests::inline_on(Fake::root(), &fake);
     let inventory = format!(
         "schema = 1\n[github]\naccount = \"{login}\"\nkeys = \"agh-inline\"\n[[host]]\nname \
          = \"lab-03\"\nuuid = \"{VM_UUID}\"\naddress = \"192.168.64.4\"\nuser = \"admin\"\n"

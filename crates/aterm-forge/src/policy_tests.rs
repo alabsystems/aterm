@@ -19,8 +19,6 @@ version = "2.14.0"
 path = "vendor/indexmap"
 license = "Apache-2.0"
 apache_notice = true
-census.mode = "scanned"
-census.namespace = "indexmap"
 
 # smol_str is dual-licensed, so it owes no §4(b) notices.
 [[fork]]
@@ -28,12 +26,10 @@ name = "smol_str"
 version = "0.2.2"
 path = "vendor/smol_str"
 license = "MIT OR Apache-2.0"
-census.mode = "scanned"
-census.namespace = "smol_str"
 "#;
 
 #[test]
-fn forks_are_modeled_including_census_and_notice() {
+fn forks_are_modeled_including_their_notice() {
     let p = parse(SAMPLE).unwrap();
     assert_eq!(p.forks.len(), 2);
     let idx = p
@@ -44,23 +40,19 @@ fn forks_are_modeled_including_census_and_notice() {
     assert_eq!(idx.version, "2.14.0");
     assert_eq!(idx.license, "Apache-2.0");
     assert!(idx.apache_notice);
-    assert_eq!(idx.census_mode, CensusMode::Scanned);
-    assert_eq!(idx.census_namespace.as_deref(), Some("indexmap"));
     let ss = p
         .forks
         .iter()
         .find(|f| f.name == "smol_str")
         .expect("smol_str block");
     assert!(!ss.apache_notice, "apache_notice defaults to false");
-    assert_eq!(ss.census_namespace.as_deref(), Some("smol_str"));
 }
 
 #[test]
 fn a_ledger_that_does_not_parse_cleanly_is_refused() {
     let dup = format!(
         "{SAMPLE}\n[[fork]]\nname = \"indexmap\"\nversion = \"2.14.0\"\n\
-         path = \"vendor/indexmap\"\nlicense = \"Apache-2.0\"\ncensus.mode = \"scanned\"\n\
-         census.namespace = \"indexmap\"\n"
+         path = \"vendor/indexmap\"\nlicense = \"Apache-2.0\"\n"
     );
     let headerless = format!(
         "# --- indexmap{}",
@@ -74,17 +66,6 @@ fn a_ledger_that_does_not_parse_cleanly_is_refused() {
         (
             "an unknown top-level table",
             format!("{SAMPLE}\n[carve]\nwhen = \"soon\"\n"),
-        ),
-        (
-            "a scanned fork without a namespace",
-            SAMPLE.replace("census.namespace = \"indexmap\"\n", ""),
-        ),
-        (
-            "a retired census mode",
-            SAMPLE.replace(
-                "census.mode = \"scanned\"\ncensus.namespace = \"smol_str\"",
-                "census.mode = \"build-dep-only\"",
-            ),
         ),
         (
             "a drifted method string",

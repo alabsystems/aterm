@@ -6,8 +6,8 @@
 //! The word pass draws its icons (a `dog`'s or a `fox`'s face over its word)
 //! after the trail has drawn the frame, so the keep-out the sky and the
 //! ribbon draw by ([`rk::companion::KeepOut`]) is the last frame's icons. An
-//! icon new to the frame (a word a Return completed, a peek rising into a
-//! taller box) found the sky's stars and the Return's flare on it: pink
+//! icon new to the frame (a word a Return completed, a peek's first frame)
+//! found the sky's stars and the Return's flare on it: pink
 //! sparkles on the fox's cheek and chin on paper, its white chin washed lilac
 //! on dark, in every ribbon's `enter-bottom` capture. Once the word pass has
 //! named the frame's icons, [`CursorGlow::shade_word_icons`] lifts what the

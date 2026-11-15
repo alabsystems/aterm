@@ -259,6 +259,9 @@ dev-seams = [
 ]
 
 [dependencies]
+# The turn-end readers and their texts (needs, the read-only command classifier, the press
+# guard, the words the policy types), which the server reads and shows.
+alab-policy = { workspace = true }
 # aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
 aterm-cores = { workspace = true }
 # Source build discovery through Cargo's selected target on every platform.
@@ -537,6 +540,8 @@ aterm-machines = { workspace = true }
 aterm-dbus = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
+# The private metrics fixture exercises the actual conformance parser and judge.
+aterm-conformance = { path = "../aterm-conformance" }
 # The node service's bus.log tests (`node_serve_tests/bus_log.rs`, one-mesh C2) post, read and
 # stream as a local client and a peer would, with astream's own client; aterm-mesh links it
 # already, so this adds no package to the graph.
@@ -576,7 +581,7 @@ aterm-metrics = { path = "../aterm-metrics" }
 aterm-dirfd = { workspace = true }
 # The PTY keeper's client (on by default, `[keeper] enabled`): `keeper_link.rs` registers each
 # master with the keeper and takes its offers at boot. The keeper itself links no GUI
-# framework (census guards `keeper-gui`, `keeper-gui-deps`).
+# framework.
 aterm-keeper = { workspace = true }
 # THE CRASH-RESTORE JOURNAL (`crash_restore.rs`, on wherever the keeper link is):
 # each session's region layout, its single-writer protocols and keyframe policy,
@@ -650,3 +655,9 @@ test = false
 [[bench]]
 name = "job_chunk_cost"
 harness = false
+
+# Native session-counter validation, including index construction, without a GUI host.
+[[bench]]
+name = "native_receipts_cost"
+harness = false
+test = false

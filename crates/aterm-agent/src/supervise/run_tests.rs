@@ -4240,7 +4240,10 @@ fn auto(max_s: u64) -> SuperviseOpts {
 
 fn owners_policy() -> SupervisorConfig {
     SupervisorConfig {
-        continue_text: "keep going".to_string(),
+        turn_end: alab_policy::config::PolicyConfig {
+            continue_text: "keep going".to_string(),
+            ..alab_policy::config::PolicyConfig::default()
+        },
         ..SupervisorConfig::default()
     }
 }
@@ -5029,7 +5032,7 @@ fn the_memory_banner_beside_a_status_line_reply_holds_it_to_its_end() {
     let done = with_banner(STATUSLINE_REPLY_DONE_2_1_311);
     assert_eq!(
         aterm_phase::wall(&mid).map(|w| w.kind),
-        Some(aterm_phase::WallKind::Memory),
+        Some(alab_policy::vocab::WallKind::Memory),
         "fixture guard: the banner reads"
     );
     let frames = vec![mid.clone(), held.clone(), held, done.clone()];
@@ -6605,7 +6608,7 @@ fn drive_phase_prints_the_rest_of_a_turn_over_under_its_own_background_work() {
 
 #[test]
 fn a_boxs_classify_word_is_the_read_only_rules_verdict_on_its_readings() {
-    use crate::supervise::classify::classify_command;
+    use alab_policy::classify::classify_command;
     let turn_for = |rows: Vec<String>| Turn {
         phase: worker_phase(&rows),
         screen: Screen {
@@ -9985,7 +9988,7 @@ const RULES_CONTINUATION: &str = "[aterm harness] The usage limit has cleared; c
 fn continue_request(text: &str) -> String {
     format!(
         "turn submit=guarded:{} idle=600 timeout=2500 yield=0.2 {text}",
-        super::turn_end_loop::composer_guard('❯', text)
+        alab_policy::guard::composer_guard('❯', text)
     )
 }
 fn quick_turn_end(backoff: &[Duration]) -> TurnEndTiming {

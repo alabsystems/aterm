@@ -281,7 +281,7 @@ pub(crate) fn resolve(
         &aterm_secrets::client::Paths,
     ) -> aterm_secrets::Result<aterm_secrets::client::PublicRosterRead>,
 ) -> Result<CurrentRoster> {
-    let source = aterm_secrets::client::Paths::for_home(home);
+    let source = aterm_secrets::client::Paths::locate_for_home(home);
     let (observed, floor) = public_vault_candidate(&source, masters, read)?;
     let mut candidates = read_local_candidates(paths, masters)?;
     if let Some(public) = observed.as_ref() {
@@ -319,7 +319,7 @@ impl CurrentRoster {
 
     pub(crate) fn recheck(&self, home: &Path, masters: &[&str]) -> Result<()> {
         require_public_source(
-            &aterm_secrets::client::Paths::for_home(home),
+            &aterm_secrets::client::Paths::locate_for_home(home),
             self.observed.as_ref(),
             self.floor,
             masters,

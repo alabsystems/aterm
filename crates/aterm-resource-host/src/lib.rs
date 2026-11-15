@@ -35,6 +35,8 @@ mod metadata_prelude;
 #[cfg(unix)]
 mod metadata_transport;
 #[cfg(unix)]
+mod observer_permit;
+#[cfg(unix)]
 mod resolver_transport;
 #[cfg(unix)]
 mod resource_accounting;
@@ -44,6 +46,8 @@ mod resource_context;
 mod resource_machine;
 #[cfg(unix)]
 mod resource_memory;
+#[cfg(unix)]
+pub mod resource_observation;
 #[cfg(unix)]
 mod resource_producer;
 #[cfg(unix)]
@@ -67,8 +71,9 @@ mod subgroup_delegation;
 mod workload_transport;
 #[cfg(unix)]
 pub use client::{
-    authorize, capabilities_at, inspect_at, matches_original_store_at, submit, submit_accounted,
-    submit_accounted_expected,
+    ObservationRead, authorize, capabilities_at, carry_resource_observer, finish_resource_observer,
+    inspect_at, matches_original_store_at, resource_observation, restore_resource_observer, submit,
+    submit_accounted, submit_accounted_expected,
 };
 #[cfg(unix)]
 pub use enrollment::answer as answer_enrollment;

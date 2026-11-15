@@ -4,7 +4,7 @@ use super::*;
 
 fn request() -> Request {
     let job = Binding {
-        session: "s-ab12".into(),
+        session: "s-0000000000000000ab12".into(),
         attempt: [1; 16],
     };
     Request {
@@ -99,7 +99,7 @@ fn ambiguous_targets_replayed_root_and_missing_capability_refuse() {
 fn private_job_context_is_canonical_and_never_a_new_root_request() {
     let context = JobContext {
         job: Binding {
-            session: "s-ab".into(),
+            session: "s-000000000000000000ab".into(),
             attempt: [9; 16],
         },
         capability: Capability::from_bytes([7; 32]),
@@ -112,7 +112,11 @@ fn private_job_context_is_canonical_and_never_a_new_root_request() {
         format!("{encoded}:extra"),
         encoded.replacen("v3:", "v2:", 1),
         encoded.to_uppercase(),
-        format!("v3:s-ab:{}:{}", "09".repeat(16), "00".repeat(32)),
+        format!(
+            "v3:s-000000000000000000ab:{}:{}",
+            "09".repeat(16),
+            "00".repeat(32)
+        ),
     ] {
         assert!(JobContext::decode(&invalid).is_err());
     }
@@ -121,13 +125,14 @@ fn private_job_context_is_canonical_and_never_a_new_root_request() {
     }
     let maximal = JobContext {
         job: Binding {
-            session: format!("s-{}", "a".repeat(62)),
+            session: format!("s-{}", "a".repeat(20)),
             attempt: [9; 16],
         },
         capability: Capability::from_bytes([7; 32]),
     }
     .encode()
     .unwrap();
-    assert_eq!(maximal.len(), 165);
+    // An earlier `s-` ID (22 bytes) is the longer of the two forms (a `t` ID is 11).
+    assert_eq!(maximal.len(), 123);
     assert!(JobContext::decode(&maximal).is_ok());
 }

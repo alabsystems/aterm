@@ -65,26 +65,19 @@ const ENTROPY_RULE: &str = "generic-api-key";
 /// What gitleaks may take before the stage gives it up, as the engine's run allows.
 const GITLEAKS_CEILING_S: u64 = 1800;
 
-/// The engine half the scan reads from one commit of the engine ([`crate::engine::Commit`]),
-/// never a working tree: its baseline and its registry's repository names.
+/// The engine half the scan reads from the run's one read of the engine
+/// ([`crate::engine::Files`], [`Ctx::engine`]), never a working tree: its baseline and its
+/// registry's repository names.
 ///
 /// # Errors
 /// The commit holds no baseline or registry, or the registry names no repository.
-pub fn engine(
-    commit: &crate::engine::Commit,
-    run: crate::engine::RunGit<'_>,
-) -> Result<Engine, String> {
-    let baseline = commit
-        .text(rows::BASELINE, run)
-        .map_err(|e| e.to_string())?;
-    let registry = commit.text(REGISTRY, run).map_err(|e| e.to_string())?;
-    let names = registry_names(&registry)
-        .map_err(|why| format!("{REGISTRY} on {}: {why}", commit.shown()))?;
+pub fn engine(files: &crate::engine::Files) -> Result<Engine, String> {
+    let baseline = files.baseline.clone()?;
+    let registry = files.registry.as_deref().map_err(Clone::clone)?;
+    let names =
+        registry_names(registry).map_err(|why| format!("{REGISTRY} on {}: {why}", files.shown))?;
     Ok(Engine {
-        baseline: (
-            format!("{} on {}", rows::BASELINE, commit.shown()),
-            baseline,
-        ),
+        baseline: (format!("{} on {}", rows::BASELINE, files.shown), baseline),
         names,
     })
 }
@@ -662,11 +655,11 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
             None
         }
     };
-    let run: crate::engine::RunGit<'_> = &crate::engine::bounded;
-    let engine = crate::engine::named(&ctx.root, &|name| ctx.env.engine_var(name))
-        .and_then(|named| crate::engine::Commit::read(&named, run, &crate::engine::native))
-        .map_err(|e| e.to_string())
-        .and_then(|commit| engine(&commit, run).map(|engine| (commit.shown().to_string(), engine)));
+    let engine = ctx
+        .engine()
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|files| engine(files).map(|engine| (files.shown.clone(), engine)));
     if let Err(why) = &engine {
         not_run.push(format!(
             "export-scan — {why}, so neither the publication engine's baseline nor private \
@@ -1023,7 +1016,10 @@ fn gitleaks_leaks(
 /// `[build-dependencies]`, target-specific and `[workspace.dependencies]` ones included,
 /// optional ones too (a feature can turn any on), and with `dev` its
 /// `[dev-dependencies]`.
-fn dependency_rows(manifest: &aterm_toml::Value, dev: bool) -> Vec<(String, Option<String>, bool)> {
+pub(crate) fn dependency_rows(
+    manifest: &aterm_toml::Value,
+    dev: bool,
+) -> Vec<(String, Option<String>, bool)> {
     use aterm_toml::Value;
     const KINDS: [&str; 5] = [
         "dependencies",
@@ -1058,7 +1054,7 @@ fn dependency_rows(manifest: &aterm_toml::Value, dev: bool) -> Vec<(String, Opti
 }
 
 /// `base` joined with the relative `path`, `.` and `..` resolved lexically.
-fn join_lexically(base: &str, path: &str) -> String {
+pub(crate) fn join_lexically(base: &str, path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for part in base.split('/').chain(path.split('/')) {
         match part {

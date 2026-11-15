@@ -5,6 +5,7 @@ use super::*;
 use crate::git_credential::{GITHUB, script};
 use crate::items::defaults::tests::user;
 use crate::port::{Fake, Live, Scratch, Stat};
+use std::path::Path;
 
 const DEV: &str = "fixture_dev_token";
 
@@ -81,9 +82,7 @@ fn bare(who: &User) -> Fake {
 /// [`bare`], with the vault's token.
 fn fake(who: &User) -> Fake {
     let sys = bare(who);
-    let path = token_file(Path::new(&who.home));
-    sys.file(path.to_str().unwrap(), DEV.as_bytes())
-        .stat_of(path.to_str().unwrap(), stat(who, DEV.len()));
+    sys.vault_set(&who.home, crate::init_github::TOKEN_ENTRY, DEV.as_bytes());
     sys
 }
 
@@ -139,17 +138,14 @@ fn a_disabled_stage_reads_neither_git_nor_credentials() {
     );
 }
 
-/// The block goes in every mode but off, whichever token source init.toml names and whether
-/// or not its account is the vault's: the read needs neither the token nor GitHub. With no
-/// block, a custom source's lookups are its own item's to read.
+/// The block goes in every mode but off, whatever account init.toml scopes the stage to: the
+/// read needs neither the token nor GitHub.
 #[test]
 fn the_block_is_due_from_the_settings_alone_in_every_mode() {
     for source in [
         "",
         "[github]\naccount='alice'\nowner='team'\n",
-        "[github]\naccount='someone-else'\ntoken_file='~/.secrets/gh_access_token'\n",
-        "[github]\naccount='alice'\ntoken_file='~/.secrets/custom'\n",
-        "[github]\naccount='alice'\ntoken_file='~/.secrets/custom'\ntoken_key='TOKEN'\n",
+        "[github]\naccount='someone-else'\n",
     ] {
         let who = user("alice", 501);
         let sys = bare(&who);
@@ -160,19 +156,6 @@ fn the_block_is_due_from_the_settings_alone_in_every_mode() {
         assert!(due(&sys).contains("osxkeychain"), "{source}");
         settings_alone(&sys);
     }
-    let who = user("alice", 501);
-    let sys = fake(&who);
-    profiled(
-        &sys,
-        &who,
-        "[github]\naccount='alice'\ntoken_file='~/.secrets/custom'\n",
-    );
-    script::alike(&sys, &who);
-    assert!(matches!(
-        vault_git_credentials(&sys).unwrap(),
-        GithubRead::NotApplicable(_)
-    ));
-    settings_alone(&sys);
 }
 
 /// A section of GitHub CLI's helper can be a person's own, so the pass replaces it only where

@@ -105,7 +105,7 @@ pub(super) fn reserved_fleet(paths: &Paths, expected: &Config) -> crate::Result<
         }));
     }
     let state = load_state(paths)?;
-    if state.membership == Stored::In && (state.failed || !state.pending.is_empty()) {
+    if state.membership == Stored::In && (state.failed) {
         return Err(Error::new(
             "this machine's last vault apply did not finish (`aterm secrets sync` names what \
              failed): the default fleet code is read once it does",

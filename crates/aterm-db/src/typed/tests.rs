@@ -306,7 +306,7 @@ fn cell_keys_fit_the_grammar_and_never_hold_an_address() {
         super::grid::read(&Ty::Key, &format!(" {decimal} ")).unwrap(),
         decimal_key
     );
-    assert_eq!(super::grid::show(&Ty::Key, &decimal_key, false), decimal);
+    assert_eq!(super::grid::show(&Ty::Key, &decimal_key), decimal);
     for bad in [
         "",
         "row.with.dot",
@@ -951,11 +951,12 @@ fn phone_numbers_stay_out_of_every_cell() {
     assert!(last4("10101").is_err());
 }
 
-/// A schema with a secret-named column must use the inner-sealed Secret type.
+/// A schema with a secret-named column must name a secret-store entry (`SecretRef`), and a
+/// stored schema row says nothing of personal data: addresses are ordinary data.
 /// NEGATIVE CONTROL: with `secret_named` answering false, the password column checks and this
 /// fails.
 #[test]
-fn secret_named_columns_must_be_secret() {
+fn secret_named_columns_must_name_a_store_entry() {
     const BAD: Collection = Collection {
         columns: &[
             Column::new("mailbox_password", Ty::Text(64)),
@@ -965,7 +966,7 @@ fn secret_named_columns_must_be_secret() {
     };
     const GOOD: Collection = Collection {
         columns: &[
-            Column::new("mailbox_password", Ty::Secret),
+            Column::new("mailbox_password", Ty::SecretRef),
             Column::new("row", Ty::Enum(LIFE)),
         ],
         ..ADDRESS
@@ -974,9 +975,17 @@ fn secret_named_columns_must_be_secret() {
         columns: &[Column::new("addr", Ty::Email)],
         ..ADDRESS
     };
-    assert_eq!(BAD.check(), Err("a secret-named column must be Secret"));
+    assert_eq!(
+        BAD.check(),
+        Err(
+            "a secret-named column names a secret-store entry (SecretRef), or holds a sealed \
+             token in a generation before the third (Secret)"
+        )
+    );
     assert_eq!(GOOD.check(), Ok(()));
     assert!(NO_LIFECYCLE.check().is_err());
+    // The stored schema row keeps its `pii` member as builds through 0.200.0 publish it: one
+    // version, one row.
     assert!(
         ACCOUNT.schema_row()["x"]["columns"]
             .as_array()

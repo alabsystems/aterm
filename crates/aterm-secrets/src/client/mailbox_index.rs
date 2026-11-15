@@ -2,64 +2,30 @@
 // Copyright 2026 Andrew Yates
 
 //! A non-secret component-presence index, minted while the registered mailbox
-//! entry is already open for authorized use or materialization. Holder probes
-//! read this index and signed-version metadata, never mailbox plaintext.
+//! entry is already open for authorized use. Holder probes read this index and
+//! signed-version metadata, never mailbox plaintext and never a file under the home.
 
 use super::*;
 use crate::mailbox_component::{Component, InlineSource, SOURCE_ENTRY};
-use std::os::unix::fs::MetadataExt as _;
 
 const INDEX: &str = "mailbox-components.toml";
 const MAX_INDEX: usize = 256 * 1024;
 
 struct Index {
     stamp: [u8; 32],
-    file: String,
     components: BTreeSet<Component>,
 }
 
-fn file_stamp(paths: &Paths) -> Option<String> {
-    let path = materialize::target_path(&paths.home, SOURCE_ENTRY).ok()?;
-    let mut parent = path.parent();
-    loop {
-        let directory = parent.filter(|directory| directory.starts_with(&paths.home))?;
-        if fsx::kind(directory).ok()? != fsx::Kind::Dir {
-            return None;
-        }
-        if directory == paths.home {
-            break;
-        }
-        parent = directory.parent();
-    }
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.is_file()
-        || meta.nlink() != 1
-        || meta.uid() != fsx::euid()
-        || meta.mode() & 0o6077 != 0
-        || meta.len() > 4 * 1024 * 1024
-    {
-        return None;
-    }
-    Some(format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        meta.dev(),
-        meta.ino(),
-        meta.len(),
-        meta.mtime(),
-        meta.mtime_nsec(),
-        meta.ctime(),
-        meta.ctime_nsec()
-    ))
-}
+/// What the index's `file` key says. The index is bound to the vault's stamp alone: the entry is
+/// read in place and has no file. Older builds parse the key and compare it with their own file's
+/// stamp, so they find this index stale and mint their own, which is harmless.
+const IN_PLACE: &str = "in-place";
 
 fn write(paths: &Paths, stamp: [u8; 32], value: &SecretBytes) -> crate::Result<()> {
     let Some(source) = value.as_str().and_then(InlineSource::parse) else {
         return Err(Error::new(
             "registered mailbox configuration is not valid inline configuration",
         ));
-    };
-    let Some(file) = file_stamp(paths) else {
-        return Err(Error::new("registered mailbox file is unavailable"));
     };
     let components: Vec<String> = source
         .components()
@@ -68,7 +34,7 @@ fn write(paths: &Paths, stamp: [u8; 32], value: &SecretBytes) -> crate::Result<(
     let text = format!(
         "version = 1\nstamp = {}\nfile = {}\ncomponents = [{}]\n",
         toml_str(&aterm_codec::hex::encode_lower(&stamp)),
-        toml_str(&file),
+        toml_str(IN_PLACE),
         components.join(", ")
     );
     if text.len() > MAX_INDEX {
@@ -95,11 +61,6 @@ fn read(paths: &Paths) -> crate::Result<Option<Index>> {
         .and_then(|s| aterm_codec::hex::decode_vec(s.as_bytes()))
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(invalid)?;
-    let file = table
-        .get("file")
-        .and_then(aterm_toml::Value::as_str)
-        .ok_or_else(invalid)?
-        .to_owned();
     let mut components = BTreeSet::new();
     for word in table
         .get("components")
@@ -114,11 +75,7 @@ fn read(paths: &Paths) -> crate::Result<Option<Index>> {
             return Err(invalid());
         }
     }
-    Ok(Some(Index {
-        stamp,
-        file,
-        components,
-    }))
+    Ok(Some(Index { stamp, components }))
 }
 
 /// Compare only admitted source state and signed encrypted cache/log metadata.
@@ -135,8 +92,6 @@ fn current_stamp(paths: &Paths) -> crate::Result<Option<[u8; 32]>> {
         || !pin_admitted(&config, None)
         || state.membership != Stored::In
         || state.failed
-        || !state.pending.is_empty()
-        || !state.manifest.files.contains_key(SOURCE_ENTRY)
         || !(source_bound(&config, &state) || log_only_source_bound(&config, &state))
     {
         return Ok(None);
@@ -162,9 +117,7 @@ pub fn mailbox_component_held(paths: &Paths, component: Component) -> crate::Res
     let Some(index) = read(paths)? else {
         return Ok(false);
     };
-    Ok(index.components.contains(&component)
-        && file_stamp(paths).as_deref() == Some(index.file.as_str())
-        && current_stamp(paths)? == Some(index.stamp))
+    Ok(index.components.contains(&component) && current_stamp(paths)? == Some(index.stamp))
 }
 
 /// Refresh during an explicitly authorized registered-entry read. The caller
@@ -181,14 +134,15 @@ pub fn refresh_mailbox_component_index(paths: &Paths) -> crate::Result<bool> {
 }
 
 pub(super) fn backfill_after_sync(paths: &Paths) -> crate::Result<()> {
-    if !registered_names(paths)?
-        .iter()
-        .any(|name| name == SOURCE_ENTRY)
+    // What the apply recorded says whether the source is this Mac's, as [`current_stamp`] reads
+    // it, without resolving the view again after the pass resolved it.
+    if !load_state(paths)?
+        .held
+        .is_some_and(|held| held.contains_key(SOURCE_ENTRY))
     {
         return Ok(());
     }
     if let Some(index) = read(paths).ok().flatten()
-        && file_stamp(paths).as_deref() == Some(index.file.as_str())
         && current_stamp(paths)? == Some(index.stamp)
     {
         return Ok(());
@@ -210,12 +164,7 @@ pub(super) fn record_applied(
     state: &State,
     entries: &[Entry],
 ) -> crate::Result<()> {
-    if config.signer.is_none()
-        || state.membership != Stored::In
-        || state.failed
-        || !state.pending.is_empty()
-        || !state.manifest.files.contains_key(SOURCE_ENTRY)
-    {
+    if config.signer.is_none() || state.membership != Stored::In || state.failed {
         return Ok(());
     }
     let Some(value) = entries.iter().find(|entry| entry.name == SOURCE_ENTRY) else {
@@ -240,10 +189,7 @@ pub fn read_mailbox_component(
     let Some(index) = read(paths)? else {
         return Ok(None);
     };
-    if !index.components.contains(&component)
-        || file_stamp(paths).as_deref() != Some(index.file.as_str())
-        || current_stamp(paths)? != Some(index.stamp)
-    {
+    if !index.components.contains(&component) || current_stamp(paths)? != Some(index.stamp) {
         return Ok(None);
     }
     let Some(config) = config(paths)? else {

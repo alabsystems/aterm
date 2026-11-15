@@ -76,22 +76,17 @@ fn secret_get_scan_export_history_and_unknown_reader() {
         old_row.get("password").and_then(Value::as_str),
         Some(token.as_str())
     );
-    for reveal in [false, true] {
-        for value in [
-            get(&view, &COLLECTION, "mb-fixture", reveal).unwrap(),
-            scan(&view, &COLLECTION, &[], reveal).unwrap(),
-        ] {
-            let text = aterm_json::to_string(&value).unwrap();
-            assert!(text.contains(MASK));
-            assert!(!text.contains(password));
-            assert!(!text.contains(&token));
-        }
-        assert_eq!(
-            grid::show(&Ty::Secret, &Value::String(token.clone()), reveal),
-            MASK
-        );
-        // Unknown-column history uses this recursive renderer on the stored cell.
-        let history = grid::raw_masked(change.value.as_ref().unwrap(), reveal);
-        assert!(aterm_json::to_string(&history).unwrap().contains(MASK));
+    for value in [
+        get(&view, &COLLECTION, "mb-fixture").unwrap(),
+        scan(&view, &COLLECTION, &[]).unwrap(),
+    ] {
+        let text = aterm_json::to_string(&value).unwrap();
+        assert!(text.contains(MASK));
+        assert!(!text.contains(password));
+        assert!(!text.contains(&token));
     }
+    assert_eq!(grid::show(&Ty::Secret, &Value::String(token.clone())), MASK);
+    // Unknown-column history uses this recursive renderer on the stored cell.
+    let history = grid::raw_shown(change.value.as_ref().unwrap());
+    assert!(aterm_json::to_string(&history).unwrap().contains(MASK));
 }

@@ -6,6 +6,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -73,9 +74,56 @@ const PLIST: &str = "band.plist";
 
 const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 
+/// One intentional launch, distinct from launchd restarting that same launch.
+/// The private directory is created exclusively; a generation is never rearmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Generation(String);
+
+impl Generation {
+    pub(crate) fn fresh() -> Result<Self, String> {
+        aterm_uds::rand::hex_token::<16>()
+            .map(Self)
+            .map_err(|why| format!("the app-band launch generation: {why}"))
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn parse(word: &str) -> Result<Self, String> {
+        if word.len() != 32
+            || !word
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("invalid app-band launch generation".into());
+        }
+        Ok(Self(word.to_owned()))
+    }
+
+    pub(crate) fn word(&self) -> &str {
+        &self.0
+    }
+
+    fn directory(&self, world: &Path) -> PathBuf {
+        // Keep the full nonce while leaving room for the guard socket in sun_path.
+        world.join(format!("b{}", self.0))
+    }
+
+    fn create_directory(&self, world: &Path) -> Result<PathBuf, String> {
+        aterm_uds::private_file::check_private_dir(world).map_err(|why| why.to_string())?;
+        let dir = self.directory(world);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|why| format!("the app-band generation directory: {why}"))?;
+        Ok(dir)
+    }
+}
+
 /// An instance running as its own launchd job.
 pub struct Job {
     pub label: String,
+    pub(crate) generation: Generation,
+    world: PathBuf,
+    owner: u32,
     /// The job's process's pid ([`band_main`] execs it): a headless aterm's, or a windowed one's
     /// keeper's.
     pub pid: i32,
@@ -94,7 +142,7 @@ impl Job {
         cwd: &Path,
         log: &Path,
     ) -> Result<Job, String> {
-        Self::start_inner(dir, line, env, cwd, log, None)
+        Self::start_inner(dir, line, env, cwd, log, None, Generation::fresh()?)
     }
 
     /// Start a window keeper with the original account lane description handed over before
@@ -103,16 +151,17 @@ impl Job {
     /// Functional memory reservation to the GUI. This supplies no new admission or Timing evidence.
     /// # Errors
     /// As [`Self::start`], or the keeper line, original guard or authenticated handoff refuses.
-    pub fn start_with_guards(
+    pub(crate) fn start_with_guards_generation(
         dir: &Path,
         line: &[String],
         env: &[(String, String)],
         cwd: &Path,
         log: &Path,
         guards: crate::window_guards::WindowGuards,
+        generation: Generation,
     ) -> Result<Job, String> {
         keeper_line(line)?;
-        Self::start_inner(dir, line, env, cwd, log, Some(guards))
+        Self::start_inner(dir, line, env, cwd, log, Some(guards), generation)
     }
 
     fn start_inner(
@@ -122,21 +171,18 @@ impl Job {
         cwd: &Path,
         log: &Path,
         guard: Option<crate::window_guards::WindowGuards>,
+        generation: Generation,
     ) -> Result<Job, String> {
+        let owner = std::process::id();
+        let world = dir.to_path_buf();
+        let label = label_for(dir, owner, &generation);
+        let dir = generation.create_directory(dir)?;
         let offer = guard
-            .map(|guard| guard::Offer::new(dir, guard))
+            .map(|guard| guard::Offer::new(&dir, guard))
             .transpose()
             .map_err(|error| format!("the app-band window guard: {error}"))?;
-        // A kept world reused (`instance --world`) holds what its last job left: its pid, no pid
-        // of the job this launch starts, which alone may write the file read below, and a
-        // lifeline no job opened when that launch failed before its job started.
-        for name in [PID_FILE, LIFELINE] {
-            match std::fs::remove_file(dir.join(name)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("the last job's {name}: {e}")),
-            }
-        }
+        // Every rendezvous belongs to this launch alone, including delayed launchd
+        // starts and its one-use restart. Earlier generations remain sealed.
         let fifo = dir.join(LIFELINE);
         crate::sys::make_fifo(&fifo).map_err(|e| format!("the lifeline FIFO: {e}"))?;
         let held: OwnedFd = OpenOptions::new()
@@ -153,9 +199,8 @@ impl Job {
         }
         crate::util::atomic_write(&dir.join(ENV_FILE), &vars)
             .map_err(|e| format!("cannot write the job's environment: {e}"))?;
-        let label = label_for(dir, std::process::id());
         let end = Instant::now() + crate::instance::BOOT;
-        launch_inner(dir, &label, line, cwd, log, offer.as_ref(), end)?;
+        launch_inner(&dir, &label, line, cwd, log, offer.as_ref(), end)?;
         loop {
             if let Some(pid) = crate::util::read_regular_text(&dir.join(PID_FILE))
                 .ok()
@@ -181,6 +226,9 @@ impl Job {
                 }
                 return Ok(Job {
                     label,
+                    generation,
+                    world,
+                    owner,
                     pid,
                     held: Some(held.into()),
                 });
@@ -209,19 +257,15 @@ impl Job {
         self.held = None;
     }
 
-    /// Remove the owned job, establishing its registration is absent under a common
-    /// operation deadline and finite native kill/reap grace.
+    /// Remove this owned job within the caller's existing operation deadline, establishing its
+    /// registration is absent, with a finite native kill/reap grace.
     /// # Errors
-    /// A command fails, registration stays unknown/present, or observation is interrupted.
-    pub fn remove(&self) -> Result<(), CleanupError> {
-        self.remove_until(Instant::now() + Duration::from_secs(60))
-    }
-
-    /// Remove this owned job within the caller's existing operation deadline. Native
-    /// timeout cleanup has the same finite kill/reap grace as [`Self::remove`].
-    /// # Errors
-    /// As [`Self::remove`], including an already expired caller deadline.
+    /// A command fails, registration stays unknown/present, observation is interrupted, or the
+    /// caller's deadline has already expired.
     pub fn remove_until(&self, deadline: Instant) -> Result<(), CleanupError> {
+        if self.label != label_for(&self.world, self.owner, &self.generation) {
+            return Err(cleanup::invalid_identity());
+        }
         remove_until(&self.label, deadline)
     }
 
@@ -276,17 +320,22 @@ impl Job {
 
 /// The exact label a lab process owns for its private world.
 #[must_use]
-pub(crate) fn label_for(dir: &Path, owner: u32) -> String {
+pub(crate) fn label_for(dir: &Path, owner: u32, generation: &Generation) -> String {
     let world = dir.file_name().map_or_else(String::new, |name| {
         name.to_string_lossy()
             .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
     });
-    format!("aterm-lab.instance.{world}.{owner}")
+    format!("aterm-lab.instance.{world}.{owner}.{}", generation.word())
 }
 
 #[cfg(any(test, debug_assertions))]
-fn checked_owned_label(dir: &Path, owner: u32, label: &str) -> Result<(), String> {
-    if owner <= 1 || dir.file_name().is_none() || label != label_for(dir, owner) {
+fn checked_owned_label(
+    dir: &Path,
+    owner: u32,
+    generation: &Generation,
+    label: &str,
+) -> Result<(), String> {
+    if owner <= 1 || dir.file_name().is_none() || label != label_for(dir, owner, generation) {
         return Err("cleanup must name this original owner's exact private-world job".into());
     }
     Ok(())
@@ -302,9 +351,10 @@ fn checked_owned_label(dir: &Path, owner: u32, label: &str) -> Result<(), String
 pub(crate) fn await_owned_absent_for_qualification(
     dir: &Path,
     owner: u32,
+    generation: &Generation,
     label: &str,
 ) -> Result<(), String> {
-    checked_owned_label(dir, owner, label)?;
+    checked_owned_label(dir, owner, generation, label)?;
     aterm_uds::private_file::check_private_dir(dir).map_err(|why| why.to_string())?;
     cleanup::await_absent(label, Instant::now() + Duration::from_secs(60))
         .map_err(|why| why.to_string())
@@ -320,9 +370,10 @@ pub(crate) fn await_owned_absent_for_qualification(
 pub(crate) fn remove_owned_for_qualification(
     dir: &Path,
     owner: u32,
+    generation: &Generation,
     label: &str,
 ) -> Result<(), String> {
-    checked_owned_label(dir, owner, label)?;
+    checked_owned_label(dir, owner, generation, label)?;
     aterm_uds::private_file::check_private_dir(dir).map_err(|why| why.to_string())?;
     remove(label).map_err(|why| why.to_string())
 }
@@ -478,6 +529,166 @@ pub fn launch_main(args: &[String]) -> i32 {
             eprintln!("aterm-lab band-launch: {e}");
             1
         }
+    }
+}
+
+/// Exercise intentional relaunch through the real Job path, without a GUI. The
+/// integration fixture supplies one private World; launchd's restart must retire
+/// each job before the next intentional generation starts there.
+#[cfg(any(test, debug_assertions))]
+pub fn sequence_main(args: &[String]) -> i32 {
+    let [dir] = args else {
+        return 2;
+    };
+    match sequence(Path::new(dir)) {
+        Ok(()) => 0,
+        Err(why) => {
+            eprintln!("aterm-lab band-sequence: {why}");
+            1
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+fn sequence(dir: &Path) -> Result<(), String> {
+    let log = dir.join("log");
+    let line = vec!["/bin/cat".to_owned()];
+    let env = vec![("HOME".into(), dir.to_string_lossy().into_owned())];
+    let mut previous: Option<(Generation, String)> = None;
+    let mut proof = String::new();
+    for count in 1..=2 {
+        let mut job = Job::start(dir, &line, &env, dir, &log)?;
+        let result = (|| {
+            sequence_echo(
+                &mut job,
+                &log,
+                &mut proof,
+                &format!("launch={count} before\n"),
+            )?;
+            if let Some((generation, label)) = &previous {
+                let old_state = generation.directory(dir);
+                let state = job.generation.directory(dir);
+                let before: Vec<_> = [ENV_FILE, PID_FILE, PLIST]
+                    .into_iter()
+                    .map(|name| crate::util::read_regular_file(&state.join(name)))
+                    .collect::<Result<_, _>>()
+                    .map_err(|why| why.to_string())?;
+                let mut delayed = aterm_uds::spawnfd::command(&paths().exe);
+                delayed
+                    .arg("band")
+                    .arg(&old_state)
+                    .arg(label)
+                    .arg("--cwd")
+                    .arg(dir)
+                    .arg("--log")
+                    .arg(&log)
+                    .arg("--")
+                    .args(&line);
+                let deadline = Instant::now() + crate::instance::BOOT;
+                let retired = cleanup::output("old generation restart", &mut delayed, deadline)
+                    .map_err(|why| why.to_string())?;
+                if !retired.status.success() {
+                    return Err(format!(
+                        "delayed old-generation retirement: {}",
+                        String::from_utf8_lossy(&retired.stderr)
+                    ));
+                }
+                if i32::try_from(
+                    guard::launchd_pid(&job.label, deadline).map_err(|why| {
+                        format!("current job after old-generation retirement: {why}")
+                    })?,
+                )
+                .ok()
+                    != Some(job.pid)
+                    || !job.running()
+                {
+                    return Err("old-generation retirement removed the current job".into());
+                }
+                let after: Vec<_> = [ENV_FILE, PID_FILE, PLIST]
+                    .into_iter()
+                    .map(|name| crate::util::read_regular_file(&state.join(name)))
+                    .collect::<Result<_, _>>()
+                    .map_err(|why| why.to_string())?;
+                if before != after {
+                    return Err("old-generation activity changed current rendezvous state".into());
+                }
+            }
+            sequence_echo(
+                &mut job,
+                &log,
+                &mut proof,
+                &format!("launch={count} after\n"),
+            )?;
+            job.cut();
+            // No explicit bootout: this proves the same generation remains one-use
+            // when launchd tries to restart its exited program.
+            await_owned_absent_for_qualification(
+                dir,
+                std::process::id(),
+                &job.generation,
+                &job.label,
+            )?;
+            if aterm_uds::process::process_presence(job.pid)
+                != aterm_uds::process::ProcessPresence::Absent
+            {
+                return Err("retired sequential job process is still present".into());
+            }
+            let state = job.generation.directory(dir);
+            let marker = state.join(format!("band.{}.ran", job.label));
+            if !marker.is_file() {
+                return Err("retired generation lost its one-use marker".into());
+            }
+            let before = crate::util::read_regular_file(&state.join(PID_FILE))
+                .map_err(|why| why.to_string())?;
+            if let Ok(mut replay) =
+                Job::start_inner(dir, &line, &env, dir, &log, None, job.generation.clone())
+            {
+                replay.cut();
+                return Err(start_failure(
+                    &replay.label,
+                    "a sealed generation was rearmed".into(),
+                ));
+            }
+            if crate::util::read_regular_file(&state.join(PID_FILE))
+                .map_err(|why| why.to_string())?
+                != before
+                || !marker.is_file()
+            {
+                return Err("a refused generation replay changed its previous state".into());
+            }
+            println!(
+                "launch={count} pid={} generation={} job={} absent=yes replay=refused",
+                job.pid,
+                job.generation.word(),
+                job.label
+            );
+            Ok(())
+        })();
+        if let Err(why) = result {
+            job.cut();
+            return Err(start_failure(&job.label, why));
+        }
+        previous = Some((job.generation, job.label));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, debug_assertions))]
+fn sequence_echo(job: &mut Job, log: &Path, proof: &mut String, token: &str) -> Result<(), String> {
+    let mut held = File::from(job.held.take().ok_or("missing current lifeline")?);
+    let sent = held.write_all(token.as_bytes());
+    job.held = Some(held.into());
+    sent.map_err(|why| format!("current lifeline write: {why}"))?;
+    proof.push_str(token);
+    let deadline = Instant::now() + crate::instance::BOOT;
+    loop {
+        if crate::util::read_regular_text(log).ok().as_deref() == Some(proof.as_str()) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("one-minute hang detector: actual child lifeline echo".into());
+        }
+        crate::stop::sleep(Duration::from_millis(20)).map_err(|why| format!("{why:?}"))?;
     }
 }
 

@@ -86,8 +86,8 @@ pub use renderer::RampsFx;
 pub use renderer::WindowTarget;
 pub use renderer::{
     DropOverlay, FetchProbe, FetchStage, FrameShape, GpuRenderer, GpuSurface, OverlayRefusal,
-    PresentCrop, SurfacePresentFailure, TrayDelta, TrayLayer, TrayQuad, TrayScrim, UnormAblation,
-    UnormRoute, WindowGpu, tray_rows_to_upload,
+    PipelineWarmStanding, PresentCrop, SurfacePresentFailure, TrayDelta, TrayLayer, TrayQuad,
+    TrayScrim, UnormAblation, UnormRoute, WindowGpu, tray_rows_to_upload,
 };
 /// A window's own presenter.
 #[cfg(target_os = "linux")]

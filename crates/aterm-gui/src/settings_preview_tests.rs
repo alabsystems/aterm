@@ -3155,7 +3155,7 @@ fn the_fire_preview_shows_the_sustained_blaze() {
         renderer: None,
         without_body_under: std::cell::RefCell::new(None),
     };
-    let mut player = ScenePlayer::new(0, spec.post_fx.companion_look);
+    let mut player = ScenePlayer::new(0, spec.post_fx.companion_look, None);
     let mut cold = Vec::new();
     for at in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
         scene.step(&mut player, &stage, at, true);
@@ -5371,6 +5371,20 @@ struct LitCard {
 /// input and the cell size.
 fn lit_card(
     raw: &str,
+    look: (
+        PreviewTerminalTheme,
+        bool,
+        Option<aterm_effects::kitty_registry::KittyLook>,
+    ),
+    at: (u64, usize, Twin),
+    face: (&crate::tray_raster::PreparedSemanticFont, f32),
+) -> LitCard {
+    lit_card_sized(raw, look, at, face, SettingsPreviewSpec::default().font_px)
+}
+
+/// [`lit_card`] with the card's font at `font_px`, the size the person chose.
+fn lit_card_sized(
+    raw: &str,
     (theme, bloom, look): (
         PreviewTerminalTheme,
         bool,
@@ -5378,13 +5392,17 @@ fn lit_card(
     ),
     (phase, rows, twin): (u64, usize, Twin),
     (prepared, scale): (&crate::tray_raster::PreparedSemanticFont, f32),
+    font_px: f32,
 ) -> LitCard {
-    let spec = SettingsPreviewSpec::cursor(CursorPreviewSpec {
-        blink: false,
-        trail_style: PreviewTrailStyle::parse(raw),
-        trail_style_raw: Arc::from(raw),
-        ..CursorPreviewSpec::default()
-    })
+    let spec = SettingsPreviewSpec {
+        font_px,
+        ..SettingsPreviewSpec::cursor(CursorPreviewSpec {
+            blink: false,
+            trail_style: PreviewTrailStyle::parse(raw),
+            trail_style_raw: Arc::from(raw),
+            ..CursorPreviewSpec::default()
+        })
+    }
     .with_post_fx(CursorPostFxSpec {
         bloom,
         companion_look: look.unwrap_or(CursorPostFxSpec::default().companion_look),
@@ -6220,49 +6238,64 @@ fn the_cards_letters_read_under_every_light() {
 /// Dark, a dim page whose text reads under 4.5, Beam's body under its letters is a page shade
 /// (`cursor_glow::bed::page_lit_body_ink`), which the letter guard holds to the letters it
 /// reaches (`CursorGlow::hold_page_shades`). Every frame of Beam's card loop there, in the
-/// embedded face and, on macOS, the host's, at display scale 1 and 2, keeps every letter at
-/// its bar ([`LEGIBLE`], or [`OWN_SHARE`] of its own reading where that is lower), judged as
-/// [`the_cards_letters_read_under_every_light`] judges one ([`worst_lit_letter`]). Kept whole,
-/// the body's edge put the page's green and its own blue in one ring, whose per-channel
-/// medians read a ground brighter than either: the trail gallery's card read the `&&` of
-/// `git add README.md &&` (4.220 of its own, bar 4.093) at 4.03 to 4.04 on the landed
-/// after-land tree, and reads 4.16 held, three captures of three (macOS, 2026-11-11).
-/// Negative control (`SceneControls::shades_held`): each page shade kept whole, the `&&` falls
-/// under its bar at display scale 1 in each face, 15 frames of the loop: in the host's face to
-/// 4.020 to 4.092 against 4.095, as the gallery read it, and in the embedded face to 3.862
-/// against 3.934. At scale 2 none falls either way (macOS, 2026-11-11).
+/// embedded face and, on macOS, the host's, at the default 14 px (and, off macOS, at 12 px), at
+/// display scale 1 and 2, keeps every letter at its bar ([`LEGIBLE`], or [`OWN_SHARE`] of its
+/// own reading where that is lower), judged as [`the_cards_letters_read_under_every_light`]
+/// judges one ([`worst_lit_letter`]). Kept whole, the body's edge put the page's green and its
+/// own blue in one ring, whose per-channel medians read a ground brighter than either: the trail
+/// gallery's card read the `&&` of `git add README.md &&` (4.220 of its own, bar 4.093) at 4.03
+/// to 4.04 on the landed after-land tree, and reads 4.16 held, three captures of three (macOS,
+/// 2026-11-11). Negative control (`SceneControls::shades_held`): each page shade kept whole,
+/// the `&&` falls under its bar at display scale 1 in each face, 15 frames of the loop: in the
+/// host's face to 4.020 to 4.092 against 4.095, as the gallery read it, and in the embedded face
+/// to 3.862 against 3.934. At scale 2 none falls either way (macOS, 2026-11-11).
+///
+/// The 12 px card is there for the control, and only on the rasterizer it was measured on.
+/// CoreText draws the embedded face on macOS and aterm's own hinted rasterizer elsewhere, and in
+/// that raster Beam's body kept whole leaves the 14 px card as held, pixel for pixel, in all 87
+/// frames at scale 1: no control can bite on it. At 12 px it puts the `D` of `README.md` under
+/// its bar in 4 frames (0.982 of the bar at its worst), and held keeps every letter at its bar
+/// (1.014 of it at the least). Swept over the 17 built-in themes, 12 to 16 px and scales 1 and
+/// 2, in the embedded face and the bundled JetBrains Mono, it was the one card whose letters
+/// the hold kept and the body kept whole did not (Linux arm64, 2026-11-12). On macOS the 14 px
+/// card's control bites in each face (the numbers above), and no 12 px card was measured
+/// there, in CoreText's raster of either face at either scale, so the law does not claim one.
 #[test]
 fn beam_s_body_keeps_a_dim_card_s_letters() {
     let _ = compiled(SettingsPreviewSpec::default());
     let dim = PreviewTerminalTheme::from_scheme(
         &aterm_types::scheme::builtin("Solarized Dark").expect("built-in dim theme"),
     );
-    // Every frame of Beam's loop on Solarized Dark in `prepared` at `scale` whose worst letter
-    // reads under its bar.
-    let under =
-        |(face, prepared, scale): (&str, &crate::tray_raster::PreparedSemanticFont, f32)| {
-            let mut blooms = false;
-            let mut under = Vec::new();
-            for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
-                let at = (phase, 7, Twin::Clean);
-                let mut card = lit_card("beam", (dim, blooms, None), at, (prepared, scale));
-                let gate = card.input.bloom_gate;
-                if !blooms && !(gate.held() || gate.spares_letters()) {
-                    blooms = true;
-                    card = lit_card("beam", (dim, true, None), at, (prepared, scale));
-                }
-                if let Some((reading, bar, row, col)) =
-                    worst_lit_letter(&card.lit, &card.twin, &card.input, card.cell)
-                    && reading < bar
-                {
-                    under.push(format!(
-                        "{face} at {scale}x at {phase} ms: the letter at row {row} col {col} \
-                     reads {reading:.3}:1, under its {bar:.3}"
-                    ));
-                }
+    // Every frame of Beam's loop on Solarized Dark in `prepared` at `scale` and `px` whose
+    // worst letter reads under its bar.
+    let under = |(face, prepared, scale, px): (
+        &str,
+        &crate::tray_raster::PreparedSemanticFont,
+        f32,
+        f32,
+    )| {
+        let mut blooms = false;
+        let mut under = Vec::new();
+        for phase in (0..CURSOR_SCENE_CYCLE_MS).step_by(MOTION_STEP_MS as usize) {
+            let at = (phase, 7, Twin::Clean);
+            let mut card = lit_card_sized("beam", (dim, blooms, None), at, (prepared, scale), px);
+            let gate = card.input.bloom_gate;
+            if !blooms && !(gate.held() || gate.spares_letters()) {
+                blooms = true;
+                card = lit_card_sized("beam", (dim, true, None), at, (prepared, scale), px);
             }
-            under
-        };
+            if let Some((reading, bar, row, col)) =
+                worst_lit_letter(&card.lit, &card.twin, &card.input, card.cell)
+                && reading < bar
+            {
+                under.push(format!(
+                    "{face} at {px} px at {scale}x at {phase} ms: the letter at row {row} col \
+                     {col} reads {reading:.3}:1, under its {bar:.3}"
+                ));
+            }
+        }
+        under
+    };
     let face = |host: bool| {
         #[cfg(target_os = "macos")]
         if host {
@@ -6276,15 +6309,31 @@ fn beam_s_body_keeps_a_dim_card_s_letters() {
             ),
         )
     };
-    let mut items = vec![(false, 1.0), (false, 2.0)];
-    if cfg!(target_os = "macos") {
-        items.extend([(true, 1.0), (true, 2.0)]);
-    }
+    let hosts: &[bool] = if cfg!(target_os = "macos") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    // 12 px only on aterm's own raster, where it was measured (the doc above).
+    let default = SettingsPreviewSpec::default().font_px;
+    let sizes: &[f32] = if cfg!(target_os = "macos") {
+        &[default]
+    } else {
+        &[default, 12.0]
+    };
+    let items: Vec<(bool, f32, f32)> = hosts
+        .iter()
+        .flat_map(|&host| {
+            [1.0, 2.0]
+                .into_iter()
+                .flat_map(move |scale| sizes.iter().map(move |&px| (host, scale, px)))
+        })
+        .collect();
     // Each item plays on its own thread, with that thread's fonts and scene.
-    let found: Vec<String> = aterm_spec::check::each(&items, |&(host, scale)| {
+    let found: Vec<String> = aterm_spec::check::each(&items, |&(host, scale, px)| {
         let _ = compiled(SettingsPreviewSpec::default());
         let (name, prepared) = face(host);
-        under((name, &prepared, scale))
+        under((name, &prepared, scale, px))
     })
     .into_iter()
     .flatten()
@@ -6303,15 +6352,18 @@ fn beam_s_body_keeps_a_dim_card_s_letters() {
             });
         });
     };
-    for &(host, scale) in items.iter().filter(|&&(_, scale)| scale == 1.0) {
+    for &host in hosts {
         set(false);
         let (name, prepared) = face(host);
-        let whole = under((name, &prepared, scale));
+        let whole: Vec<String> = sizes
+            .iter()
+            .flat_map(|&px| under((name, &prepared, 1.0, px)))
+            .collect();
         set(true);
         assert!(
             !whole.is_empty(),
             "negative control: each page shade kept whole, Beam's body on Solarized Dark keeps \
-             every letter of {name} at {scale}x at its bar"
+             every letter of {name} at 1x at its bar, at {sizes:?} px"
         );
     }
 }
@@ -6321,7 +6373,7 @@ fn beam_s_body_keeps_a_dim_card_s_letters() {
 fn flying_cat() -> CursorPreviewSpec {
     CursorPreviewSpec {
         pet: None,
-        pet_flies: true,
+        pet_flier: Some(aterm_effects::kitty_pet::PetSpecies::Cat),
         ..rainbow_cursor("rainbow")
     }
 }
@@ -6429,12 +6481,15 @@ fn the_flying_cat_arrives_partway_through_the_typing() {
 }
 
 /// The flying cat keeps off the scene's letters: no frame of the loop lays a drawn texel
-/// of its head on a lettered cell or the caret's, on dark and light, in every look
-/// [`judged_looks`] names, in a roomy card and a short one. The head is taller than its
-/// row and centred on it, so seated by its row's letters alone
-/// (`rainbow_kitty::companion::placement` before it read the rows beside its own: the
-/// negative control) its ears lay on the letters of the line above, the card's `git c`
-/// at 1.25:1 (looks9's settings round 1).
+/// of it (the brand cat's glide) on a lettered cell or the caret's, on dark and light, in
+/// every look [`judged_looks`] names, in a roomy card and a short one. The glide rides ahead of
+/// the caret on its row, under the line above: rigid and wider for its height, it clears these
+/// cards whether or not its seat reads the rows beside its own, the placement keeps it off and
+/// the fit is read (the preview flies no head without the pet, whose ears those guards were
+/// for). The guards' laws for the glide are `aterm_effects`' own
+/// (`the_flying_head_keeps_off_the_caret_and_the_letters`, whose bodies include the glide, and
+/// the flying head's fit tests). Control: the same frames' glide a row higher, on the line
+/// above, is caught on its letters, so the scene's letters are near enough to judge.
 #[test]
 fn the_flying_cat_keeps_off_the_scenes_letters() {
     let light = PreviewTerminalTheme::from_scheme(
@@ -6442,8 +6497,7 @@ fn the_flying_cat_keeps_off_the_scenes_letters() {
     );
     let cell = (8, 17);
     let grounds = [("dark", None), ("light", Some(light))];
-    let on_letters = |unread: bool| {
-        aterm_effects::rainbow_kitty::companion::set_rows_beside_unread(unread);
+    let on_letters = |raise: bool| {
         let mut on_letters = Vec::new();
         let mut drawn = 0_usize;
         for &(side, ground) in &grounds {
@@ -6468,13 +6522,19 @@ fn the_flying_cat_keeps_off_the_scenes_letters() {
                             ground.map_or_else(Theme::default, PreviewTerminalTheme::into_theme);
                         let (base, _) = build_terminal_specimen_input_rows(&spec, theme, rows);
                         let input = CursorScene::new(&spec, theme, rows).decorate(&base, cell);
-                        let Some(head) = sprites(&input)
+                        let Some(mut head) = sprites(&input)
                             .into_iter()
                             .filter(|sprite| sprite.alpha > 0)
                             .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
                         else {
                             continue;
                         };
+                        if raise {
+                            let up = cell.1 as i32;
+                            head.y -= up;
+                            head.clip.y0 = head.clip.y0.saturating_sub(up);
+                            head.clip.y1 = head.clip.y1.saturating_sub(up);
+                        }
                         drawn += 1;
                         let caret = (input.cursor_row, input.cursor_col);
                         let lettered: Vec<(usize, usize)> = inked_cells(&head, cell)
@@ -6498,10 +6558,8 @@ fn the_flying_cat_keeps_off_the_scenes_letters() {
                 }
             }
         }
-        aterm_effects::rainbow_kitty::companion::set_rows_beside_unread(false);
         (on_letters, drawn)
     };
-    let (control, _) = on_letters(true);
     let (law, drawn) = on_letters(false);
     assert!(drawn >= 100, "the flying cat is drawn: {drawn} frames");
     assert!(
@@ -6510,8 +6568,9 @@ fn the_flying_cat_keeps_off_the_scenes_letters() {
         law.len(),
         &law[..law.len().min(8)]
     );
+    let (control, _) = on_letters(true);
     assert!(
         !control.is_empty(),
-        "negative control: seated by its row's letters alone, its ears lie on the line above"
+        "negative control: a row higher, the glide lies on the line above"
     );
 }

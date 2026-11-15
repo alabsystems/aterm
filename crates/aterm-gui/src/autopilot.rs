@@ -5,7 +5,8 @@
 
 use std::sync::OnceLock;
 
-use aterm_agent::supervise::{Autopilot, SupervisorConfig};
+use alab_policy::config::Autopilot;
+use aterm_agent::supervise::SupervisorConfig;
 use aterm_effects::harness_card::CardPalette;
 
 use crate::{App, WindowId};
@@ -36,9 +37,12 @@ impl HarnessPosture {
         } else if !crate::harness_host::would_supervise(cfg, headless) {
             Self::MasterOff
         } else if cfg.off.is_empty() {
-            Self::On(cfg.autopilot)
+            Self::On(cfg.turn_end.autopilot)
         } else {
-            Self::Restricted(cfg.autopilot, crate::harness_host::admitted_mask(cfg))
+            Self::Restricted(
+                cfg.turn_end.autopilot,
+                crate::harness_host::admitted_mask(cfg),
+            )
         }
     }
 

@@ -12,12 +12,7 @@
 //! is anything else is no reading, so nothing a repository or a branch is named can reach the
 //! typed line.
 
-use aterm_types::control_request::Sid;
-
 use super::facts::EpisodeKey;
-
-/// How long a minted sid is: `s-` and 20 lowercase hex digits.
-const MINTED_SID_LEN: usize = 22;
 
 /// How many sids the sentence names before it counts the rest.
 const SIDS_SHOWN: usize = 3;
@@ -31,17 +26,19 @@ const SIDS_SHOWN: usize = 3;
 /// one in a turn this long, and is no evidence of what its branch changes now.
 pub const OVERLAP_FRESH_MS: i64 = 10 * 60_000;
 
-/// A SESSION ID ATERM MINTED, the only word of a peer's an overlap fact carries: `s-` and 20
-/// lowercase hex digits ([`Self::of`]).
+/// A SESSION ID ATERM MINTED, the only word of a peer's an overlap fact carries: a tab ID, `t`
+/// and 10 lowercase Crockford base32 characters, or the `s-` and 20 lowercase hex digits a tab
+/// opened before that form keeps until it closes ([`Self::of`]).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PeerSid(String);
 
 impl PeerSid {
-    /// `word` as a peer's sid where it is one aterm minted (the control grammar's sid, at the
-    /// minted length), else `None`: a path, a branch or any other word is refused.
+    /// `word` as a peer's sid where it is a session ID aterm minted
+    /// ([`aterm_types::control_verbs::is_minted_sid`]), else `None`: a path, a branch or any
+    /// other word is refused.
     #[must_use]
     pub fn of(word: &str) -> Option<Self> {
-        (word.len() == MINTED_SID_LEN && Sid::parse(word).is_some()).then(|| Self(word.to_string()))
+        aterm_types::control_verbs::is_minted_sid(word).then(|| Self(word.to_owned()))
     }
 
     /// The sid.

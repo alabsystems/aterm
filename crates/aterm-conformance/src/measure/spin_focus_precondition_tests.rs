@@ -66,10 +66,29 @@ fn an_expired_readiness_wait_never_samples_an_unready_pet() {
 #[test]
 fn native_raise_selects_only_the_isolated_session() {
     assert_eq!(
-        sole_session("123 0 s-a12b - alive test active=1"),
-        Some("s-a12b")
+        sole_session("123 0 t000000a12b - alive test active=1"),
+        Some("t000000a12b")
     );
-    assert_eq!(sole_session("OK 1\nsession s-a12b alive\n"), Some("s-a12b"));
-    assert_eq!(sole_session("123 0 s-a12b alive\n123 1 s-c34d alive"), None);
+    assert_eq!(
+        sole_session("OK 1\nsession t000000a12b alive\n"),
+        Some("t000000a12b")
+    );
+    assert_eq!(
+        sole_session("123 0 t000000a12b alive\n123 1 t000000c34d alive"),
+        None
+    );
     assert_eq!(sole_session("ERR unavailable"), None);
+    assert_eq!(sole_session("123 0 t000000a12 alive tabs"), None);
+    assert_eq!(sole_session("123 0 T000000A12B alive"), None);
+    assert_eq!(
+        sole_session("123 0 s-0123456789abcdef0123 - alive"),
+        Some("s-0123456789abcdef0123"),
+        "a tab opened before the update keeps its earlier ID"
+    );
+    assert_eq!(
+        sole_session("123 0 s-0123456789abcdef0123 alive\n123 1 t000000c34d alive"),
+        None,
+        "one tab of each form is two tabs"
+    );
+    assert_eq!(sole_session("123 0 s-000000a12b alive"), None);
 }

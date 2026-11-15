@@ -142,7 +142,7 @@ pub enum CauseId {
     Activity(ActivityId),
     /// A tab's work (its panes' summed), by its key ([`crate::model::TabRoot::tab`]).
     TabWork(u64),
-    /// aterm itself and its helpers.
+    /// aterm's work outside tabs: the app, helpers, services and closed tabs' survivors.
     AtermWork,
     /// An app's coalition, by id.
     AppWork(u64),
@@ -320,7 +320,9 @@ fn member(lead: &Lead, activity: &Activity, vouched: bool) -> bool {
 /// A row's figure in its part: a launcher's less the delegated work its tab
 /// counts.
 fn covered(r: &CoalRow) -> i64 {
-    if r.part == Part::Aterm {
+    if r.ownership_mixed {
+        r.outside_floor_mc
+    } else if r.part == Part::Aterm {
         r.cpu_mc
     } else {
         r.cpu_mc - r.delegated_mc
@@ -410,7 +412,9 @@ fn covering(facts: &WhyFacts, vouched: bool, residual: bool) -> Vec<Candidate> {
     let split = &facts.split;
     let busy = split.global_mc;
     let mut out = Vec::new();
-    let named = |r: &CoalRow, a: &Activity| r.lead.as_ref().is_some_and(|l| member(l, a, vouched));
+    let named = |r: &CoalRow, a: &Activity| {
+        !r.ownership_mixed && r.lead.as_ref().is_some_and(|l| member(l, a, vouched))
+    };
     for a in ACTIVITIES {
         let rows: Vec<&CoalRow> = split.rows.iter().filter(|r| named(r, a)).collect();
         let cpu: i64 = rows.iter().map(|r| covered(r)).sum();
@@ -449,23 +453,38 @@ fn covering(facts: &WhyFacts, vouched: bool, residual: bool) -> Vec<Candidate> {
         evidence: Evidence::Measured,
         contexts: Vec::new(),
     };
-    for &(key, mc) in &split.tabs {
+    for &(key, _) in &split.tabs {
+        let mc = split.tab_actual_of(&[key]);
         if above_floor(mc, busy) {
             out.push(measured(CauseId::TabWork(key), mc));
         }
     }
-    let own = split.own_mc;
-    let largest = [split.others_mc, split.services_mc, split.unaccounted_mc]
-        .into_iter()
-        .chain(split.tabs.iter().map(|t| t.1))
-        .all(|part| own > part);
+    let own = split.own_actual();
+    let tab_total: i64 = split.tabs.iter().map(|t| split.tab_actual_of(&[t.0])).sum();
+    let unassigned = (split.aterm_mc + split.delegated_mc - own - tab_total).max(0);
+    let unknown = split.unaccounted_mc.max(0);
+    let largest = [
+        split.others_mc.saturating_add(unknown),
+        split.services_mc.saturating_add(unknown),
+        unknown,
+    ]
+    .into_iter()
+    // Unknown CPU can belong to any competing owner; unassigned app CPU can also belong
+    // to any tab. Own work is largest only if its floor exceeds each possible competitor.
+    .chain(split.tabs.iter().map(|t| {
+        split
+            .tab_actual_of(&[t.0])
+            .saturating_add(unassigned)
+            .saturating_add(unknown)
+    }))
+    .all(|part| own > part);
     if largest && above_floor(own, busy) {
         out.push(measured(CauseId::AtermWork, own));
     }
     let app = split
         .rows
         .iter()
-        .filter(|r| r.part != Part::Aterm)
+        .filter(|r| r.part != Part::Aterm && !r.ownership_mixed)
         .max_by(|a, b| covered(a).cmp(&covered(b)).then(b.id.cmp(&a.id)));
     if let Some(r) = app.filter(|r| {
         r.lead

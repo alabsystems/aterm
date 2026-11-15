@@ -41,6 +41,7 @@ fn realistic_layout() -> RestoreManifest {
                 ratio: 0.618_034,
                 first: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
                     TerminalLeafRestore {
+                        pinned: false,
                         sid: None,
                         lineage: None,
                         log_ep: None,
@@ -71,6 +72,7 @@ fn realistic_layout() -> RestoreManifest {
                 ))),
                 second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
                     TerminalLeafRestore {
+                        pinned: false,
                         sid: None,
                         lineage: None,
                         log_ep: None,

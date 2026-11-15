@@ -16,6 +16,7 @@ use super::frame::Hint;
 use crate::harness::accounts::Sample;
 use crate::harness::acts::{Act, LandHeld, LandReceipt, TaskFace};
 use crate::harness::disk::Level;
+use crate::harness::goal::{GoalRead, Lost, Untypable};
 use crate::harness::hold_said::HoldSaid;
 use crate::harness::land_receipt::Statement;
 use crate::harness::leftover::LeftRead;
@@ -35,15 +36,14 @@ use crate::supervise::occupancy::{
     WakeClaim, WakeDoor, WakeFacts, WakesSeen,
 };
 use crate::supervise::overlap::OverlapReading;
-use crate::supervise::policy::credential_need::{CredentialRead, Resolution, VaultEntry};
 use crate::supervise::policy::exception::Exception;
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::reset::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOutcome, ResetWord,
 };
 use crate::supervise::policy::turn_end::{
-    AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostTurn, LoginSeen, Reach, Restart,
-    RestartAnswer, RestartAsk, RestartClaim,
+    AccountAdvice, AccountBad, AccountPoint, AgentResumed, HostAgent, HostTurn, LoginSeen, Reach,
+    Restart, RestartAnswer, RestartAsk, RestartClaim,
 };
 use crate::supervise::policy::turn_end::{AskAgain, HeldBy, Ready, RosterWord, SignInNext};
 use crate::supervise::run::{
@@ -51,6 +51,7 @@ use crate::supervise::run::{
     WaitPlan,
 };
 use crate::supervise::tap_clock::{TapWindow, UsageWindow};
+use alab_policy::credential_need::{CredentialRead, Resolution, VaultEntry};
 
 /// A RECORDING run's host ([module docs](self)): `inner`, the window's own (or a test's), asked through the run's door.
 pub(crate) struct TapedHost<H: ?Sized> {
@@ -1079,30 +1080,45 @@ struct AgentResumedWire {
     resumed: bool,
 }
 
+/// The word a tape holds for [`HostAgent::Unread`]: a JSON string, which no recorded agent or
+/// absence (an object, `null`) can be.
+const AGENT_UNREAD: &str = "unread";
+
 /// A DOOR NEWER THAN THE TAPE: a recording build with no `host.agent_resumed` asked nothing there,
-/// so its replay reads `None` ([`TapeValue::absent`]) — where the tape's header says that build
-/// lacked the door, and only there.
-impl TapeValue for Option<AgentResumed> {
+/// so its replay reads [`HostAgent::Absent`] ([`TapeValue::absent`]) — where the tape's header says
+/// that build lacked the door, and only there. A tape recorded before [`HostAgent::Unread`] holds an
+/// agent or `null`, read as before.
+impl TapeValue for HostAgent {
     fn to_tape(&self) -> Vec<u8> {
-        json(&self.map(|r| AgentResumedWire {
-            pid: r.pid,
-            started: r.started,
-            resumed: r.resumed,
-        }))
+        match self {
+            Self::Unread => json(&AGENT_UNREAD),
+            read => json(&read.read().map(|r| AgentResumedWire {
+                pid: r.pid,
+                started: r.started,
+                resumed: r.resumed,
+            })),
+        }
     }
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        if of_json::<String>(bytes).is_ok_and(|word| word == AGENT_UNREAD) {
+            return Ok(Self::Unread);
+        }
+        // A tape's `null` is the host's answer of no agent (older tapes' only word for any
+        // answer without one).
         Ok(
-            of_json::<Option<AgentResumedWire>>(bytes)?.map(|w| AgentResumed {
-                pid: w.pid,
-                started: w.started,
-                resumed: w.resumed,
+            of_json::<Option<AgentResumedWire>>(bytes)?.map_or(Self::Absent, |w| {
+                Self::Read(AgentResumed {
+                    pid: w.pid,
+                    started: w.started,
+                    resumed: w.resumed,
+                })
             }),
         )
     }
 
     fn absent() -> Option<Self> {
-        Some(None)
+        Some(Self::Absent)
     }
 }
 
@@ -1922,7 +1938,8 @@ impl TapeValue for Option<CredentialRead> {
                             Resolution::Held(entries) => ResolutionWire::Held(
                                 entries
                                     .iter()
-                                    .map(|e| (e.name.clone(), e.pointer.clone(), e.purpose.clone()))
+                                    // The tape keeps its three-field row; no pointer is written.
+                                    .map(|e| (e.name.clone(), None, e.purpose.clone()))
                                     .collect(),
                             ),
                             Resolution::Filed => ResolutionWire::Filed,
@@ -1946,11 +1963,7 @@ impl TapeValue for Option<CredentialRead> {
                             ResolutionWire::Held(entries) => Resolution::Held(
                                 entries
                                     .into_iter()
-                                    .map(|(name, pointer, purpose)| VaultEntry {
-                                        name,
-                                        pointer,
-                                        purpose,
-                                    })
+                                    .map(|(name, _pointer, purpose)| VaultEntry { name, purpose })
                                     .collect(),
                             ),
                             ResolutionWire::Filed => Resolution::Filed,
@@ -1965,6 +1978,79 @@ impl TapeValue for Option<CredentialRead> {
 
     fn absent() -> Option<Self> {
         Some(Some(CredentialRead::NotAsked))
+    }
+}
+
+/// `goal`'s answer as a tape holds it ([`GoalRead`]): `unread`, `off`, the goal in force, or the
+/// goal Claude Code cleared after an error with its line (or the word for why none is typed), its
+/// cause, its clear's row id and whether a response was served since.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum GoalReadWire {
+    Unread,
+    Off,
+    Active(String),
+    Lost {
+        condition: String,
+        line: Option<String>,
+        untypable: Option<String>,
+        label: String,
+        clear: String,
+        served: bool,
+    },
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.goal` read no goal, so its replay
+/// reads none ([`TapeValue::absent`]) where the tape's header says that build lacked the door, and
+/// only there.
+impl TapeValue for GoalRead {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&match self {
+            Self::Unread => GoalReadWire::Unread,
+            Self::Off => GoalReadWire::Off,
+            Self::Active(goal) => GoalReadWire::Active(goal.clone()),
+            Self::Lost(lost) => GoalReadWire::Lost {
+                condition: lost.condition.clone(),
+                line: lost.line.as_ref().ok().cloned(),
+                untypable: lost.line.as_ref().err().map(|u| u.word().to_owned()),
+                label: lost.label.clone(),
+                clear: lost.clear.clone(),
+                served: lost.served,
+            },
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(match of_json::<GoalReadWire>(bytes)? {
+            GoalReadWire::Unread => Self::Unread,
+            GoalReadWire::Off => Self::Off,
+            GoalReadWire::Active(goal) => Self::Active(goal),
+            GoalReadWire::Lost {
+                condition,
+                line,
+                untypable,
+                label,
+                clear,
+                served,
+            } => {
+                let line = match (line, untypable.as_deref().map(Untypable::from_word)) {
+                    (Some(line), None) => Ok(line),
+                    (None, Some(Some(why))) => Err(why),
+                    _ => return Err(bad("a lost goal names its line or why none, not both")),
+                };
+                Self::Lost(Lost {
+                    condition,
+                    line,
+                    label,
+                    clear,
+                    served,
+                })
+            }
+        })
+    }
+
+    fn absent() -> Option<Self> {
+        Some(Self::Unread)
     }
 }
 
@@ -2126,7 +2212,7 @@ enum ResetWordWire {
         until: i64,
         long: bool,
         limits: Vec<String>,
-        /// The row's kind by its vendor id (`aterm_phase::ResetKind::word`).
+        /// The row's kind by its vendor id (`alab_policy::vocab::ResetKind::word`).
         kind: String,
         left: u32,
         day: String,
@@ -2188,8 +2274,9 @@ impl TapeValue for ResetWord {
 
 /// A kind of reset by its vendor id, as a tape holds it: one this build
 /// knows, or the value is refused.
-fn kind_of(word: &str) -> Result<aterm_phase::ResetKind, CodecError> {
-    aterm_phase::ResetKind::of_word(word).ok_or(bad("a kind of reset this build does not know"))
+fn kind_of(word: &str) -> Result<alab_policy::vocab::ResetKind, CodecError> {
+    alab_policy::vocab::ResetKind::of_word(word)
+        .ok_or(bad("a kind of reset this build does not know"))
 }
 
 /// [`ResetOutcome`] as a tape holds it; a spend with no kind, as an earlier
@@ -2199,7 +2286,7 @@ fn kind_of(word: &str) -> Result<aterm_phase::ResetKind, CodecError> {
 enum OutcomeWire {
     Pending,
     Spent {
-        /// The kind spent, by its vendor id (`aterm_phase::ResetKind::word`).
+        /// The kind spent, by its vendor id (`alab_policy::vocab::ResetKind::word`).
         kind: String,
         asks: bool,
         left: Option<u32>,

@@ -49,32 +49,17 @@ fn repairing_the_executed_git_shim_wakes_the_same_admitted_build() {
     sys.file(store.join("17.ready").to_str().unwrap(), b"ready");
     sys.link(store.join("current").to_str().unwrap(), "17");
     sys.runtime_ready(&build);
+    // The private inputs are entries of the account's store, read in place.
     let private = [
+        ("gh_access_token", b"inert_fixture_token".as_slice()),
         (
-            home.join(".secrets/gh_access_token"),
-            b"inert_fixture_token".as_slice(),
-        ),
-        (
-            home.join(".secrets/github-repositories.json"),
+            "github-repositories.json",
             br#"{"schema":2,"account":"fixture","repositories":[]}"#.as_slice(),
         ),
     ];
-    for (path, bytes) in &private {
-        sys.file(path.to_str().unwrap(), bytes).stat_of(
-            path.to_str().unwrap(),
-            Stat {
-                uid: user.uid,
-                gid: user.gid,
-                mode: 0o600,
-                dir: false,
-                symlink: false,
-                len: bytes.len() as u64,
-            },
-        );
+    for (name, bytes) in &private {
+        sys.vault_set(&home, name, bytes);
     }
-    let private_versions = private
-        .each_ref()
-        .map(|(path, _)| sys.file_version(path).unwrap());
     let paths = Paths::locate_for_home(&home);
     let mut inputs = Inputs::new(&sys, &paths, true, now);
     let installed = aterm_machines::items::github::installed_git_for(&sys, Some(&home)).unwrap();
@@ -110,12 +95,13 @@ fn repairing_the_executed_git_shim_wakes_the_same_admitted_build() {
         identity
     );
     assert_eq!(sys.file_version(&payload).unwrap(), payload_version);
-    assert_eq!(
-        private
-            .each_ref()
-            .map(|(path, _)| sys.file_version(path).unwrap()),
-        private_versions
-    );
+    for (name, bytes) in &private {
+        assert_eq!(
+            sys.vault_entry(&home, name).unwrap().unwrap().as_slice(),
+            *bytes,
+            "the repair leaves the private inputs as they were"
+        );
+    }
     assert!(
         before != repository_input_mark(&sys).unwrap(),
         "parked setup sees the same repair"
@@ -169,8 +155,7 @@ fn repaired_materialization_parent_wakes_without_changing_the_credential_inode()
     .unwrap();
     assert!(client::materialization_ready(&paths).unwrap());
     let parent = paths.dir.clone();
-    let token = home.join(".secrets/gh_access_token");
-    let before = std::fs::metadata(&token).unwrap();
+    let before = std::fs::metadata(&home).unwrap();
     let held = scratch.path().join("held-secrets");
     std::fs::rename(&parent, &held).unwrap();
     std::os::unix::fs::symlink(&held, &parent).unwrap();
@@ -189,25 +174,8 @@ fn repaired_materialization_parent_wakes_without_changing_the_credential_inode()
     let mut sys = Fake::root();
     sys.euid = user.uid;
     sys.logged_in(&user);
-    for (path, bytes) in [
-        (token.clone(), b"inert_fixture_token".as_slice()),
-        (
-            home.join(".secrets/github-repositories.json"),
-            inventory.as_slice(),
-        ),
-    ] {
-        sys.file(path.to_str().unwrap(), bytes).stat_of(
-            path.to_str().unwrap(),
-            Stat {
-                uid: user.uid,
-                gid: user.gid,
-                mode: 0o600,
-                dir: false,
-                symlink: false,
-                len: bytes.len() as u64,
-            },
-        );
-    }
+    sys.vault_set(&home, "gh_access_token", b"inert_fixture_token");
+    sys.vault_set(&home, "github-repositories.json", inventory);
     sys.stat_of(parent.to_str().unwrap(), Live::new().stat(&parent).unwrap());
     let metadata = Metadata::read(&sys, &paths, None, &mut RepositoryInputPathCache::default())
         .unwrap()
@@ -221,7 +189,6 @@ fn repaired_materialization_parent_wakes_without_changing_the_credential_inode()
     std::fs::remove_file(&parent).unwrap();
     std::fs::rename(&held, &parent).unwrap();
     assert!(client::materialization_ready(&paths).unwrap());
-    assert_eq!(std::fs::metadata(&token).unwrap().ino(), before.ino());
     sys.stat_of(parent.to_str().unwrap(), Live::new().stat(&parent).unwrap());
     assert_eq!(
         metadata.files,
@@ -296,14 +263,28 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
         );
     }
     let file = |path: &str, bytes: &[u8]| seed(&sys, &user, path, bytes);
-    let token = format!("{}/.secrets/gh_access_token", user.home);
-    let inventory = format!("{}/.secrets/github-repositories.json", user.home);
+    // The token and the inventory are entries of the account's store, read in place. A sync
+    // that delivers either rewrites the store's saved state, which is what a watch hears.
+    let state = paths.dir.join("state.toml");
+    let store = std::cell::RefCell::new(std::collections::BTreeMap::<String, Vec<u8>>::new());
+    let entry = |sys: &Fake, name: &str, bytes: &[u8]| {
+        sys.vault_set(&user.home, name, bytes);
+        let mut store = store.borrow_mut();
+        store.insert(name.to_owned(), bytes.to_vec());
+        let held: Vec<u8> = store
+            .iter()
+            .flat_map(|(name, value)| [name.as_bytes(), value.as_slice()].concat())
+            .collect();
+        seed(sys, &user, state.to_str().unwrap(), &held);
+    };
+    let token = |sys: &Fake, bytes: &[u8]| entry(sys, "gh_access_token", bytes);
     let helper = format!("{}/.local/bin/aterm", user.home);
     let profile = format!("{}/.config/aterm/init.toml", user.home);
     file(&profile, b"");
-    file(&token, b"inert_token_one");
-    file(
-        &inventory,
+    token(&sys, b"inert_token_one");
+    entry(
+        &sys,
+        "github-repositories.json",
         br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","clone_url":"https://github.com/fixture/code.git","private":true,"default_branch":"main"}]}"#,
     );
     let directory = Stat {
@@ -315,7 +296,10 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
         len: 0,
     };
     sys.stat_of(&user.home, directory);
-    for parent in std::path::Path::new(&profile).ancestors().skip(1) {
+    for parent in [std::path::Path::new(&profile), state.as_path()]
+        .into_iter()
+        .flat_map(|leaf| leaf.ancestors().skip(1))
+    {
         sys.stat_of(parent.to_str().unwrap(), directory);
     }
     let checkout = format!("{}/code", user.home);
@@ -334,7 +318,14 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
             counted.fetch_add(1, Ordering::SeqCst);
         }
     });
+    let counted = Arc::clone(&private_reads);
+    sys.on_vault_read(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
     let mut inputs = Inputs::new(&sys, &paths, true, now);
+    // What moved the mark is taken with each look that called for work (`take_moved`), as
+    // classes: the first look has no mark before it.
+    assert_eq!(inputs.take_moved(), (MarkMoved::FIRST, 1));
     let context = aterm_machines::items::Ctx {
         facts: aterm_machines::model::HostFacts::default(),
         users: vec![user.clone()],
@@ -380,6 +371,12 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
         inputs.changed(&sys, true, minute(1)).unwrap() == Some(RepositoryWork::Repair),
         "an externally completed checkout is useful input"
     );
+    // The four looks that called for nothing named nothing; this one names the `.git` entry
+    // that arrived and the Git metadata it brought into the watch.
+    assert_eq!(
+        inputs.take_moved(),
+        (MarkMoved::GIT_DIR.with(MarkMoved::ADDED), 1)
+    );
     private_reads.store(0, Ordering::SeqCst);
     assert!(inputs.changed(&sys, true, minute(2)).unwrap().is_none());
     assert_eq!(
@@ -398,6 +395,11 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
     assert!(
         inputs.changed(&sys, true, minute(3)).unwrap() == Some(RepositoryWork::Repair),
         "in-place Git identity repair is useful input"
+    );
+    assert_eq!(
+        inputs.take_moved(),
+        (MarkMoved::GIT_DIR.with(MarkMoved::CONFIG), 1),
+        "a new config moves its own class and its folder's"
     );
     file(&format!("{checkout}/working.txt"), b"unrelated work");
     assert!(
@@ -513,6 +515,16 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
         refused.request(&sys, || true, before, now).is_some(),
         "a held recovery reads current inputs only when allowed again"
     );
+    // The observer's snapshot takes what moved the mark from the admitted inputs
+    // (`Readiness::take_moved`): this first look, made as the hold was let go, once. NEGATIVE
+    // CONTROL: a `Readiness::take_moved` that takes nothing reads `(MarkMoved(0), 0)` where
+    // `(MarkMoved(6291456), 1)` (`first` and `resumed`) is wanted.
+    assert_eq!(
+        refused.take_moved(),
+        (MarkMoved::FIRST.with(MarkMoved::RESUMED), 1),
+        "the admitted inputs' first look, as the hold was let go"
+    );
+    assert_eq!(refused.take_moved(), (MarkMoved::default(), 0), "taken");
     // Receipt first, then local source capture, exactly as the real factory.
     let mut delayed = Inputs::new(&sys, &paths, true, now);
     let mut cursor = RepositoryRefreshCursor::new(before, delayed.seen.as_ref());
@@ -521,7 +533,7 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
             .request(&sys, true, before, &mut cursor, now)
             .is_some()
     );
-    file(&token, b"inert_token_delayed");
+    token(&sys, b"inert_token_delayed");
     let next = repository_input_mark(&sys)
         .unwrap()
         .refresh_scope()
@@ -560,13 +572,13 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
     );
     // An observed intermediate source cannot let an old same-byte success
     // acknowledge the later return before any owner admitted that transition.
-    file(&token, b"inert_token_one");
+    token(&sys, b"inert_token_one");
     let Some(RepositoryRequest::Refresh(away)) =
         delayed.request(&sys, true, winner, &mut cursor, now)
     else {
         panic!("the intermediate source is observed");
     };
-    file(&token, b"inert_token_delayed");
+    token(&sys, b"inert_token_delayed");
     let Some(RepositoryRequest::Refresh(back)) =
         delayed.request(&sys, true, winner, &mut cursor, now)
     else {
@@ -621,6 +633,11 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
         inputs.changed(&sys, true, now).unwrap(),
         Some(RepositoryWork::Refresh)
     );
+    assert_eq!(
+        inputs.take_moved(),
+        (MarkMoved::SOURCE, 1),
+        "a declaration is source, not a checkout"
+    );
     for declared in [
         b"[develop]\ncheckouts=['~/code']\n".as_slice(),
         b"".as_slice(),
@@ -643,8 +660,17 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
         inputs.changed(&sys, true, now).unwrap().is_none(),
         "an empty declaration changes no refresh scope"
     );
+    token(&sys, b"inert_token_two");
+    assert_eq!(
+        inputs.changed(&sys, true, now).unwrap(),
+        Some(RepositoryWork::Refresh),
+        "changed token entry"
+    );
+    assert!(
+        inputs.changed(&sys, true, now).unwrap().is_none(),
+        "one wake for unchanged readiness"
+    );
     for (path, bytes) in [
-        (token.as_str(), b"inert_token_two".as_slice()),
         (helper.as_str(), b"helper two".as_slice()),
         (
             aterm_machines::items::github::CLT_GIT,
@@ -720,27 +746,6 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
         inputs.changed(&sys, true, now).unwrap().is_none(),
         "unrelated settings do not recreate a source change"
     );
-    let selected = format!("{}/selected-token", user.home);
-    file(&selected, b"selected_token_one");
-    let scoped = format!("[github]\naccount='fixture'\ntoken_file='{selected}'\n");
-    file(&profile, scoped.as_bytes());
-    assert!(
-        inputs.changed(&sys, true, now).unwrap().is_some(),
-        "a profile retarget is current input"
-    );
-    assert!(inputs.changed(&sys, true, now).unwrap().is_none());
-    private_reads.store(0, Ordering::SeqCst);
-    file(&token, b"old_unselected_token");
-    assert!(
-        inputs.changed(&sys, true, now).unwrap().is_none(),
-        "old token paths retire"
-    );
-    assert_eq!(private_reads.load(Ordering::SeqCst), 0);
-    file(&selected, b"selected_token_two");
-    assert!(
-        inputs.changed(&sys, true, now).unwrap().is_some(),
-        "new token path remains observed"
-    );
     let parent = std::path::Path::new(&profile).parent().unwrap();
     sys.stat_of(
         parent.to_str().unwrap(),
@@ -749,6 +754,7 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
             ..directory
         },
     );
+    let _ = inputs.take_moved();
     assert!(inputs.changed(&sys, true, now).unwrap().is_some());
     assert!(inputs.changed(&sys, true, now).unwrap().is_none());
     sys.stat_of(parent.to_str().unwrap(), directory);
@@ -757,47 +763,13 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
         "unchanged-leaf parent admission repairs wake"
     );
     assert!(inputs.changed(&sys, true, now).unwrap().is_none());
-    let replacement = format!("{}/replacement-token", user.home);
-    file(&replacement, b"replacement_token_one");
-    let replacement_profile =
-        format!("[github]\naccount='fixture'\ntoken_file='{replacement}'\n").into_bytes();
-    let change_once = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    sys.on_owned_read({
-        let profile = profile.clone();
-        let change_once = Arc::clone(&change_once);
-        move |sys, path| {
-            if path == std::path::Path::new(&profile) && change_once.swap(false, Ordering::SeqCst) {
-                sys.file(&profile, &replacement_profile).stat_of(
-                    &profile,
-                    Stat {
-                        uid: 501,
-                        gid: 20,
-                        mode: 0o600,
-                        dir: false,
-                        symlink: false,
-                        len: replacement_profile.len() as u64,
-                    },
-                );
-            }
-        }
-    });
-    file(
-        &profile,
-        format!("{scoped}# new selection read\n").as_bytes(),
+    assert_eq!(
+        inputs.take_moved(),
+        (MarkMoved::ADMISSION.with(MarkMoved::SOURCE), 2),
+        "two looks, each naming the folder admission that moved and the source read through it"
     );
-    assert!(
-        inputs.changed(&sys, true, now).unwrap().is_some(),
-        "a raced profile read is recaptured, not relabeled"
-    );
-    assert!(inputs.changed(&sys, true, now).unwrap().is_none());
-    file(&replacement, b"replacement_token_two");
-    assert!(
-        inputs.changed(&sys, true, now).unwrap().is_some(),
-        "the raced-in selection remains observable"
-    );
-    assert!(inputs.changed(&sys, true, now).unwrap().is_none());
     private_reads.store(0, Ordering::SeqCst);
-    file(&replacement, b"inert_token_new");
+    token(&sys, b"inert_token_new");
     assert!(
         inputs.changed(&sys, false, now).unwrap().is_none(),
         "Stop/off holds the observer"
@@ -806,6 +778,11 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
     assert!(
         inputs.changed(&sys, true, now).unwrap() == Some(RepositoryWork::Refresh),
         "current authority resumes with fresh inputs"
+    );
+    assert_eq!(
+        inputs.take_moved(),
+        (MarkMoved::SOURCE.with(MarkMoved::RESUMED), 1),
+        "the token moved while the hold lasted"
     );
     assert!(
         sys.calls().iter().all(|call| call == "identity"),
@@ -938,6 +915,8 @@ fn inputs_owe_their_next_look_by_what_no_watch_hears() {
         control: RepositoryInputPathCache::default(),
         checkouts_read: None,
         unsettled: None,
+        moved: MarkMoved::default(),
+        moves: 0,
     };
     assert_eq!(
         inputs.next_look(now),

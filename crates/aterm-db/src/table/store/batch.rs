@@ -258,18 +258,15 @@ impl Store {
                 .records
                 .get(&receipt.id)
                 .ok_or_else(|| Error::new("witnessed batch record unavailable"))?;
-            appended(
-                &Appended {
-                    table: self.scope.digest(),
-                    recovery: self.is_recovery(),
-                    kind: AppendKind::Operation,
-                    offset: receipt.offset,
-                    length: witness.count,
-                    via,
-                    wire: stored.wire.as_slice(),
-                },
-                &self.claim_dir,
-            );
+            appended(&Appended {
+                table: self.scope.digest(),
+                recovery: self.is_recovery(),
+                kind: AppendKind::Operation,
+                offset: receipt.offset,
+                length: witness.count,
+                via,
+                wire: stored.wire.as_slice(),
+            });
         }
         #[cfg(test)]
         super::batch_conformance_tests::acknowledged(self.witness);

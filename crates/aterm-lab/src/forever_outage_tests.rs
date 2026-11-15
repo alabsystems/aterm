@@ -4,10 +4,10 @@
 //! Tests for the outage modes (`--mode outage-land`, `--mode outage-cruise`, v6 §14.17.5.2's 12b)
 //! over records shaped as the loop writes them, the rungs at the outage modes' three eighths.
 
+use alab_policy::vocab::WallKind;
 use aterm_agent::harness::acts::FACT_SEPARATOR;
 use aterm_agent::supervise::policy::turn_end::RULE_OUTAGE_RESUME;
 use aterm_phase::Program;
-use aterm_phase::wall::WallKind;
 
 use super::*;
 use crate::forever::outage::{self, OutageMove};

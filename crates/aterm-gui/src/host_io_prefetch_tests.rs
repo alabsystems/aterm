@@ -189,3 +189,216 @@ fn a_slice_holds_at_most_two_largest_media_and_reads_each_once() {
         assert!(most <= 2 * LARGEST, "cut at {cut}: {most}");
     }
 }
+
+struct Ingested {
+    decodes: (usize, usize),
+    media: Vec<(KittyMedium, String)>,
+    response: String,
+    commands: u64,
+    host_reads: u64,
+    displayed: bool,
+}
+
+/// Use the real prefetch scanner and terminal ingestion, substituting only host I/O.
+fn ingest(parts: &[&[u8]], flags: Flags) -> Ingested {
+    use aterm_core::terminal::kitty_graphics::take_kitty_payload_decodes_for_test;
+
+    FETCHED.with(|fetched| *fetched.borrow_mut() = Fetched::default());
+    let mut terminal = Terminal::new(4, 8);
+    terminal.set_cell_pixel_size(10, 20);
+    terminal.set_kitty_file_resolver(take_kitty_medium);
+    let mut media = Vec::new();
+    take_kitty_payload_decodes_for_test();
+    for part in parts {
+        let mut at = 0;
+        while at < part.len() {
+            let fetched = Burst::begin_with(
+                &part[at..],
+                flags,
+                String::new,
+                |kind, name| {
+                    media.push((kind, name.to_string()));
+                    Some(vec![17, 34, 51, 255])
+                },
+                |_, _, _| {},
+            );
+            let end = at + fetched.covered();
+            assert!(end > at, "ingestion must advance");
+            terminal.process(&part[at..end]);
+            drop(fetched);
+            at = end;
+        }
+    }
+    Ingested {
+        decodes: take_kitty_payload_decodes_for_test(),
+        media,
+        response: String::from_utf8(terminal.take_response().unwrap_or_default()).unwrap(),
+        commands: terminal.kitty_graphics_commands(),
+        host_reads: terminal.host_io_ordinal(),
+        displayed: !terminal.cell_frame(4, 8).images[0].is_empty(),
+    }
+}
+
+/// Exercise the production flags and `reads`/`held` path for inline graphics, which requires
+/// no host file access even when the real medium resolver is installed.
+fn ingest_inline_as_reader(parts: &[&[u8]], enabled: bool) -> Ingested {
+    use aterm_core::terminal::kitty_graphics::take_kitty_payload_decodes_for_test;
+
+    FETCHED.with(|fetched| *fetched.borrow_mut() = Fetched::default());
+    let term = std::sync::Mutex::new(Terminal::new(4, 8));
+    {
+        let mut terminal = crate::term_lock(&term);
+        terminal.set_cell_pixel_size(10, 20);
+        if enabled {
+            terminal.set_kitty_file_resolver(take_kitty_medium);
+        }
+        assert_eq!(terminal.kitty_file_resolver_installed(), enabled);
+    }
+    take_kitty_payload_decodes_for_test();
+    for part in parts {
+        feed_as_reader(&term, part);
+    }
+    let mut terminal = crate::term_lock(&term);
+    Ingested {
+        decodes: take_kitty_payload_decodes_for_test(),
+        media: Vec::new(),
+        response: String::from_utf8(terminal.take_response().unwrap_or_default()).unwrap(),
+        commands: terminal.kitty_graphics_commands(),
+        host_reads: terminal.host_io_ordinal(),
+        displayed: !terminal.cell_frame(4, 8).images[0].is_empty(),
+    }
+}
+
+#[test]
+fn inline_images_decode_once_through_enabled_prefetch_and_terminal_ingestion() {
+    // The small APC fits the prefetch carry; its old eager parse decoded the same payload twice.
+    let pixels = [17, 34, 51, 255].repeat(32 * 16);
+    let encoded = aterm_codec::base64::encode(&pixels).unwrap();
+    let apc = [
+        b"\x1b_Ga=T,f=32,s=32,v=16,i=7;".as_slice(),
+        encoded.as_bytes(),
+        b"\x1b\\",
+    ]
+    .concat();
+    assert!(apc.len() <= 4096);
+    for enabled in [true, false] {
+        for cut in [0, 2, 41, apc.len() - 1] {
+            let result = ingest_inline_as_reader(&[&apc[..cut], &apc[cut..]], enabled);
+            assert_eq!(
+                result.decodes,
+                (1, encoded.len()),
+                "enabled={enabled}, cut at {cut}"
+            );
+            assert_eq!(result.commands, 1);
+            assert_eq!(result.host_reads, 0);
+            assert!(result.displayed && result.response.contains(";OK\x1b\\"));
+        }
+    }
+
+    let mut st8 = apc[..apc.len() - 2].to_vec();
+    st8.push(ST8);
+    let ended = ingest_inline_as_reader(&[&st8], true);
+    assert_eq!(ended.decodes, (1, encoded.len()));
+    assert!(ended.displayed);
+    for cancel in [CAN, SUB] {
+        let mut canceled = apc[..apc.len() - 2].to_vec();
+        canceled.push(cancel);
+        let ended = ingest_inline_as_reader(&[&canceled], true);
+        assert_eq!(ended.decodes, (0, 0));
+        assert!(!ended.displayed && ended.media.is_empty());
+    }
+}
+
+#[test]
+fn large_inline_ingestion_preserves_the_dropped_carry_control() {
+    let pixels = [17, 34, 51, 255].repeat(64 * 64);
+    let encoded = aterm_codec::base64::encode(&pixels).unwrap();
+    let apc = [
+        b"\x1b_Ga=T,f=32,s=64,v=64,i=8;".as_slice(),
+        encoded.as_bytes(),
+        b"\x1b\\",
+    ]
+    .concat();
+    assert!(apc.len() > CARRY_MAX);
+    // The whole sequence exercises deferred decoding. The split is a control: prefetch already
+    // discarded an unfinished APC this large, while the terminal retained and completed it.
+    for cut in [0, CARRY_MAX + 1] {
+        let result = ingest_inline_as_reader(&[&apc[..cut], &apc[cut..]], true);
+        assert_eq!(result.decodes, (1, encoded.len()), "cut at {cut}");
+        assert_eq!(result.commands, 1);
+        assert!(result.media.is_empty());
+        assert_eq!(result.host_reads, 0);
+        assert!(result.displayed && result.response.contains(";OK\x1b\\"));
+    }
+}
+
+#[test]
+fn external_media_keep_their_reads_after_shared_control_parsing() {
+    use aterm_core::terminal::kitty_graphics::KittyMedium::{File, SharedMemory, TempFile};
+    for (control, kind) in [
+        ("a=T,t=f", File),
+        ("a=T,t=t", TempFile),
+        ("a=T,t=s", SharedMemory),
+        ("t=f", File),
+        ("a=T,a=bad,t=f", File),
+        ("a=p,a=T,t=f", File),
+        ("a=T,t=d,t=f", File),
+        ("a=T,t=f,m=1,m=bad", File),
+    ] {
+        let apc = file(&format!("{control},f=32,s=1,v=1,i=9"), "/fixture");
+        for cut in [0, 5, apc.len() - 1] {
+            let result = ingest(&[&apc[..cut], &apc[cut..]], ALL);
+            assert_eq!(result.decodes, (2, 2 * 12), "{control}, cut {cut}");
+            assert_eq!(result.media, [(kind, "/fixture".to_string())], "{control}");
+            assert_eq!(result.host_reads, 1, "{control}");
+            assert!(result.response.contains(";OK\x1b\\"), "{}", result.response);
+        }
+    }
+}
+
+#[test]
+fn ignored_and_invalid_graphics_preserve_engine_results_without_host_reads() {
+    let pixels = [17, 34, 51, 255];
+    let encoded = aterm_codec::base64::encode(&pixels).unwrap();
+    for control in [
+        "a=T,t=f,t=d",
+        "a=T,t=s,t=bad",
+        "a=T,t=f,t=",
+        "a=q,a=bad,t=f",
+        "a=p,t=f",
+        "a=d,t=f",
+        "a=T,t=f,m=0,m=1",
+        "a=T,s=1,s=bad",
+    ] {
+        let apc = [
+            format!("\x1b_Gf=32,s=1,v=1,i=10,{control};").as_bytes(),
+            encoded.as_bytes(),
+            b"\x1b\\",
+        ]
+        .concat();
+        let result = ingest(&[&apc], ALL);
+        assert_eq!(result.decodes, (1, encoded.len()), "{control}");
+        assert!(result.media.is_empty(), "{control}");
+        assert_eq!(result.commands, 1);
+        assert_eq!(result.host_reads, 0);
+        if control.ends_with("s=bad") {
+            assert!(result.response.contains("EINVAL"), "{}", result.response);
+        }
+    }
+    for (apc, attempts) in [
+        (b"\x1b_Ga=\xff,t=f,i=11;AAAA\x1b\\".as_slice(), 0),
+        (b"\x1b_Ga=T,f=32,s=1,v=1,i=11;\xff\x1b\\".as_slice(), 0),
+        (b"\x1b_Ga=T,f=32,s=1,v=1,i=11;!!!\x1b\\".as_slice(), 1),
+        (b"\x1b_Ga=T,t=f,f=32,s=1,v=1,i=11;!!!\x1b\\".as_slice(), 2),
+        (b"\x1b_Ga=T,t=f,f=32,s=1,v=1,i=11;/w==\x1b\\".as_slice(), 2),
+    ] {
+        let result = ingest(&[apc], ALL);
+        assert_eq!(result.decodes.0, attempts, "{apc:?}");
+        assert!(result.media.is_empty());
+        assert_eq!(result.commands, 1);
+        assert_eq!(result.host_reads, 0);
+        if attempts > 0 {
+            assert!(result.response.contains("EINVAL"), "{}", result.response);
+        }
+    }
+}

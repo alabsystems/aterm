@@ -14,6 +14,15 @@
 //! long enough to have heard it, and only [`SILENT`] after it was last heard or first seen on the
 //! roster. The local writer's version comes from this running build, without counting it as
 //! a peer contact or report.
+//!
+//! The same reports keep a second gate, the registry's ([`in_place`], tracker LT-04B): no
+//! registry secret goes into the vault until every current member reports, within [`RECENT`], a
+//! release that writes no vault entry to a file ([`NO_SECRET_FILE`]), since a build that still
+//! writes them would put the value in plain text under `~/.secrets`. That gate counts only what
+//! it heard: a member unheard for [`RECENT`] holds it however long this device watched, for a
+//! Mac that comes back on an older build would write the file; only a member gone from the
+//! roster stops counting, and the vault's own list of readers still counts it
+//! (`crate::client::fleet_in_place`).
 
 use super::{
     binding::Binding,
@@ -41,6 +50,13 @@ pub const GAP: u64 = 6 * 60 * 60 * 1000;
 pub const DEFER: u64 = 15 * 60 * 1000;
 /// The first release that verifies nodes past the 0.145 caps.
 pub const LIFTED: Version = Version(0, 146, 0);
+/// The first release that writes no vault entry to a file under `~/.secrets` and reads each in
+/// place instead (tracker LT-04A). The release named here must be one every build of which
+/// writes no file: a dev build stamped with the release before it reports that release
+/// ([`Version::own`]), so the first release cut after the last file write is gone is the least
+/// that qualifies. The workspace stood at 0.202.0 when the apply stopped writing files, so a
+/// 0.202.0 build may still write them, and 0.203.0 is the first whose every build writes none.
+pub const NO_SECRET_FILE: Option<Version> = Some(Version(0, 203, 0));
 /// Exact wire size of a signed [`report`].
 pub const REPORT_LEN: usize = 4 + 12 + 64;
 const REPORT_DOMAIN: &[u8] = b"aterm/commons/version-report/1\0";
@@ -156,7 +172,55 @@ pub enum Hold {
     Older(Option<Version>),
     /// Not heard within [`RECENT`], and not watched that long either.
     Unwatched,
+    /// Not heard within [`RECENT`], under a floor that counts only a member it heard
+    /// ([`Floor::unheard_passes`] false), however long this device watched.
+    Unheard,
 }
+
+/// What a gate holds a member to: the release it must report, and whether a member this device
+/// has not heard within [`RECENT`] through a watch at least that long passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Floor {
+    /// The least release a member must report within [`RECENT`]; `None` where no release
+    /// passes, so every member holds the gate.
+    pub version: Option<Version>,
+    /// Whether a member unheard for [`RECENT`] through a watch that long passes: so for the 0.145
+    /// caps ([`CAPS`]), since such a member stopped where its build stopped and a node it cannot
+    /// read changes nothing for it; never for the registry ([`in_place`]), where a Mac that
+    /// returns on an older build would write what it reads to a file.
+    pub unheard_passes: bool,
+}
+
+impl Floor {
+    /// Whether a member reporting `version` (`None`: no report that still counts) is below this
+    /// floor.
+    fn below(self, version: Option<Version>) -> bool {
+        self.version
+            .is_none_or(|floor| version.is_none_or(|version| version < floor))
+    }
+}
+
+/// The gate a roster past the 0.145 caps waits on (C26).
+pub const CAPS: Floor = Floor {
+    version: Some(LIFTED),
+    unheard_passes: true,
+};
+
+/// The gate a registry secret's put into the vault waits on (tracker LT-04B): every current
+/// member heard within [`RECENT`] reporting `release` or later, where `release` is the first
+/// that writes no vault entry to a file ([`NO_SECRET_FILE`] outside a test); with none named,
+/// every member holds it.
+#[must_use]
+pub const fn in_place(release: Option<Version>) -> Floor {
+    Floor {
+        version: release,
+        unheard_passes: false,
+    }
+}
+
+/// The gate one Mac passes once it writes no vault entry to a file ([`NO_SECRET_FILE`],
+/// [`Ledger::writes_no_secret_file`]).
+pub const NO_FILE: Floor = in_place(NO_SECRET_FILE);
 
 /// This device's record of Commons contacts for one trust context (`<commons>/heard`).
 #[derive(Clone, Debug)]
@@ -437,11 +501,39 @@ impl Ledger {
             && !self.heard_within(actor, now_ms, SILENT)
     }
 
-    /// The gate: each of `members` that holds a roster past the 0.145 caps back, and why.
+    /// The gate: each of `members` that holds a roster past the 0.145 caps back, and why
+    /// ([`CAPS`]).
     pub fn holding<'a>(
         &self,
         members: impl IntoIterator<Item = &'a Binding>,
         now_ms: u64,
+    ) -> Vec<(Actor, Hold)> {
+        self.holding_below(members, now_ms, CAPS)
+    }
+
+    /// Whether `member`, one device, writes no vault entry to a file under `~/.secrets`: within
+    /// [`RECENT`] of `now_ms` it reported, signed by its Commons writer key, [`NO_SECRET_FILE`]
+    /// or later; for this device's own writer, this running build is that release or later
+    /// ([`Version::own`]). It fails closed: a device unheard within [`RECENT`] however long this
+    /// one watched, one whose last round reported nothing, one whose report is older than
+    /// [`RECENT`] and one on an older release each write files as far as this device can tell.
+    /// The per-device predicate of [`NO_FILE`], which a registry value's put (tracker LT-04B)
+    /// asks of every Mac that reads the vault.
+    #[must_use]
+    pub fn writes_no_secret_file(&self, member: &Binding, now_ms: u64) -> bool {
+        self.holding_below([member], now_ms, NO_FILE).is_empty()
+    }
+
+    /// Each of `members` that holds back what waits on `floor`, and why: the local writer where
+    /// this running build is below it ([`Version::own`]); a member heard within [`RECENT`] whose
+    /// report from that time is below it or missing; and a member not heard within [`RECENT`],
+    /// unless the floor lets one pass ([`Floor::unheard_passes`]) and this device watched that
+    /// long.
+    pub fn holding_below<'a>(
+        &self,
+        members: impl IntoIterator<Item = &'a Binding>,
+        now_ms: u64,
+        floor: Floor,
     ) -> Vec<(Actor, Hold)> {
         let watched = self
             .watched_since(now_ms)
@@ -452,14 +544,20 @@ impl Ledger {
                 let actor = member.actor();
                 if self.local == Some(actor) {
                     let version = Version::own();
-                    return (version < LIFTED).then_some((actor, Hold::Older(Some(version))));
+                    return floor
+                        .below(Some(version))
+                        .then_some((actor, Hold::Older(Some(version))));
                 }
                 if self.heard_within(&actor, now_ms, RECENT) {
                     let entry = self.heard[&actor];
                     let version = entry
                         .version
                         .filter(|_| entry.said_ms.saturating_add(RECENT) > now_ms);
-                    (version < Some(LIFTED)).then_some((actor, Hold::Older(version)))
+                    floor
+                        .below(version)
+                        .then_some((actor, Hold::Older(version)))
+                } else if !floor.unheard_passes {
+                    Some((actor, Hold::Unheard))
                 } else {
                     (!watched).then_some((actor, Hold::Unwatched))
                 }

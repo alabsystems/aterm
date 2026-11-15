@@ -22,6 +22,19 @@ use crate::{
     Session, TabIndex, WindowId, WindowState, pane, seed_cell_px,
 };
 
+/// Reveal a restored macOS window without lending it the keyboard before focus is settled.
+pub(crate) fn reveal_os_window(window: &Window, passive: bool) {
+    #[cfg(target_os = "macos")]
+    if passive {
+        use aterm_window::platform::macos::WindowExtMacOS as _;
+        window.order_front();
+        return;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = passive;
+    window.set_visible(true);
+}
+
 /// A screen's usable placement rectangle in logical points (top-left origin, y-down).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WorkAreaPts {
@@ -534,6 +547,7 @@ impl App {
         rows: u16,
         cols: u16,
         cwd_override: Option<&str>,
+        kept: Option<aterm_session::SessionId>,
         adopt: Option<crate::spawn::Adopted>,
         lineage_parent: Option<aterm_session::SessionId>,
         observe: Option<&aterm_session::SessionId>,
@@ -557,6 +571,7 @@ impl App {
             cwd.as_deref(),
             observe,
             None,  // no worker's task
+            kept,  // COLD RESTORE: the first leaf's tab ID, kept
             adopt, // SEAMLESS: `Some` re-adopts this window's handed-off first-leaf shell
         ) {
             Ok(s) => s,
@@ -693,6 +708,7 @@ impl App {
         &mut self,
         el: &ActiveEventLoop,
         cwd_override: Option<&str>,
+        kept: Option<aterm_session::SessionId>,
         adopt: Option<crate::spawn::Adopted>,
         lineage_parent: Option<aterm_session::SessionId>,
         observe: Option<&aterm_session::SessionId>,
@@ -700,8 +716,17 @@ impl App {
         placement: ((Option<i32>, Option<i32>), Option<bool>),
     ) -> Option<WindowId> {
         let ((rows, cols), carried_inner_px) = self.new_window_frame(carried);
-        let wid =
-            self.create_window_logical(rows, cols, cwd_override, adopt, lineage_parent, observe)?;
+        let previous_front = self.frontmost_window;
+        let wid = self.create_window_logical(
+            rows,
+            cols,
+            cwd_override,
+            kept,
+            adopt,
+            lineage_parent,
+            observe,
+        )?;
+        self.frontmost_window = previous_front;
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.take_carried_frame(carried_inner_px);
         }
@@ -709,7 +734,7 @@ impl App {
         self.stage_restore_placement(wid, placement.0, placement.1);
         #[cfg(not(any(windows, target_os = "linux")))]
         let _ = placement;
-        if !self.headless && !self.attach_os_window(el, wid) {
+        if !self.headless && !self.attach_restored_os_window(el, wid) {
             self.close_window_logical(wid);
             return None;
         }
@@ -981,6 +1006,28 @@ impl App {
         head
     }
 
+    /// Attach an explicitly opened foreground window, superseding an older saved focus.
+    pub(crate) fn attach_foreground_os_window(
+        &mut self,
+        el: &ActiveEventLoop,
+        wid: WindowId,
+    ) -> bool {
+        self.note_restore_focus_intent(wid);
+        self.attach_os_window(el, wid)
+    }
+
+    /// Attach a restored window without giving it the keyboard while its saved state is pending.
+    pub(crate) fn attach_restored_os_window(
+        &mut self,
+        el: &ActiveEventLoop,
+        wid: WindowId,
+    ) -> bool {
+        if let Some(window) = self.windows.get_mut(&wid) {
+            window.passive_reveal = true;
+        }
+        self.attach_os_window(el, wid)
+    }
+
     /// Create the OS window and present surface for logical window `wid` and attach them.
     #[must_use]
     pub(crate) fn attach_os_window(&mut self, el: &ActiveEventLoop, wid: WindowId) -> bool {
@@ -1045,6 +1092,13 @@ impl App {
             }
         };
         let defer_reveal = self.handoff_ready.is_some();
+        if defer_reveal && let Some(window) = self.windows.get_mut(&wid) {
+            window.passive_reveal = true;
+        }
+        let passive_reveal = self
+            .windows
+            .get(&wid)
+            .is_some_and(|window| window.passive_reveal);
         #[cfg(target_os = "linux")]
         let placed_before_reveal =
             !aterm_window::platform::wayland::ActiveEventLoopExtWayland::is_wayland(el)
@@ -1055,7 +1109,7 @@ impl App {
         #[cfg(not(target_os = "linux"))]
         let placed_before_reveal = false;
         let reveal_after_chrome = pending_join || cfg!(windows) || placed_before_reveal;
-        let attrs = if reveal_after_chrome || defer_reveal {
+        let attrs = if reveal_after_chrome || defer_reveal || passive_reveal {
             attrs.with_visible(false)
         } else {
             attrs
@@ -1238,7 +1292,7 @@ impl App {
                 self.apprt.window_set_background_color(&window, backdrop);
                 self.apprt
                     .window_set_appearance(&window, self.window_theme_for_chrome());
-                window.set_visible(true);
+                reveal_os_window(&window, passive_reveal);
                 crate::metrics::mark_first_window_visible();
                 self.apprt.window_flush_backdrop(&window);
                 early_reveal_size = Some(exact);
@@ -1400,11 +1454,11 @@ impl App {
                 window.set_maximized(true);
             }
         }
-        if reveal_after_chrome {
+        if reveal_after_chrome || passive_reveal {
             // Handoff boots stay hidden here: the first successful present reveals them,
             // or the 1.5 s `pending_reveal` deadline when none has landed by then.
             if !defer_reveal && early_reveal_size.is_none() {
-                window.set_visible(true);
+                reveal_os_window(&window, passive_reveal);
                 crate::metrics::mark_first_window_visible();
                 #[cfg(windows)]
                 self.apprt.window_flush_backdrop(&window);
@@ -1814,6 +1868,7 @@ impl App {
         if self.config.restore_session_or_default() && exits_app {
             self.quit_capture = Some(self.capture_restore_manifest());
         }
+        self.cancel_restore_window(wid, exits_app);
         // aterm quits with this window: a Mac Setup tab in it goes with the process, its ask never
         // declined, but one whose program the quit carries stays in the pool to the run's end,
         // which leaves it to the keeper (`App::carry_developer_tools_install_at_exit`).
@@ -1854,6 +1909,7 @@ impl App {
             }
         }
         self.windows.remove(&wid);
+        self.retire_window_document_admissions(wid);
         // A document close still armed for `wid` (a failed save left it, then a
         // tab move emptied the window) must not outlive it: its documents may be
         // open in another window now.
@@ -2394,6 +2450,9 @@ impl App {
     }
 
     fn raise_close_question(&mut self, wid: WindowId, focus: bool) {
+        if focus {
+            self.note_restore_focus_intent(wid);
+        }
         let Some((w, focused)) = self
             .windows
             .get(&wid)
@@ -2960,6 +3019,11 @@ impl App {
         if user_titled {
         } else if !live_title.is_empty() {
             slot.push_str(live_title);
+        } else if let Some(line) = crate::app_take_over::task_line_of(&session.ctx) {
+            // A title that says nothing leaves the strip's rungs: the task's first line comes
+            // before the folder there ([`crate::app_tabs::resolved_terminal_title_rung`]), and a
+            // busy terminal's arm below reads what the strip resolved, so both arms name it.
+            slot.push_str(&line);
         } else {
             let filled = match session.term.try_lock() {
                 Ok(term) => {
@@ -3071,6 +3135,9 @@ impl App {
                 let _ = self.resize_window_to_px(wid, asked);
             }
             return;
+        }
+        if matches!(op, W::RaiseWindow) {
+            self.note_restore_focus_intent(wid);
         }
         let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) else {
             return; // headless / not yet attached: nothing to manipulate

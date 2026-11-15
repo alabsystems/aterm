@@ -546,8 +546,7 @@ pub struct TreeWatch {
 }
 
 impl TreeWatch {
-    /// Read the tree once more, now: booked as the meter's own reads are. (Not `read`: the
-    /// lock-order census names a lock by such a method's name.)
+    /// Read the tree once more, now: booked as the meter's own reads are.
     pub fn look(&self) {
         read_into(self.root, &self.tally);
     }

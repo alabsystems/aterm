@@ -231,9 +231,16 @@ fn trace(phase: &str) {
     let _ = phase;
 }
 
-/// Why `need` can never be admitted on the machine `reading` reads: all the memory that can ever be available there or more, its margin included ([`Reading::reachable`]: physical memory less what is wired, which what is available never reaches), unless it asks to be admitted alone ([`Need::alone`]), which takes all the machine has; or more disk than its volume holds above the floor. `None` when it can.
+/// Why `need` can never be admitted on the machine `reading` reads: all the memory that can ever be available there or more, its margin included ([`Reading::reachable`]: physical memory less what is wired, which what is available never reaches), unless it asks to be admitted alone ([`Need::alone`]), which takes all the machine has; or more disk than its volume holds above the floor; or the judgment turn ([`crate::Heavy`]) at a rank other than Ordinary. `None` when it can.
 #[must_use]
 pub fn never(need: &Need, reading: &Reading) -> Option<String> {
+    if need.heavy.is_some() && need.rank != crate::Rank::Ordinary {
+        return Some(format!(
+            "{}: the judgment turn is Ordinary work's; a Release or Background claim never asks \
+             for it",
+            need.what
+        ));
+    }
     if need.mem > 0
         && !need.alone
         && let (Some(physical), Some(reach)) = (reading.physical, reading.reachable())
@@ -299,7 +306,8 @@ pub enum Short {
         available: u64,
         /// What the claims ahead still reserve against it: the held claims, the waiters ahead
         /// that can start, and each waiter ahead that keeps its place, its whole need. Never the
-        /// need of a waiter ahead that no claim's end can start (`stuck_ahead`).
+        /// need of a waiter ahead that no end of a claim it can wait for can start
+        /// (`stuck_ahead`).
         reserved: u64,
         /// Where a waiter ahead cannot start yet and keeps its place ([`Spared::Within`]), the
         /// most it may take now and go first past it (CAP3's passing rule, [`spared`]): the room
@@ -307,14 +315,16 @@ pub enum Short {
         /// waiter spares. `None` where no waiter ahead keeps its place so: then it fits the room
         /// those reservations leave, or waits.
         passes: Option<u64>,
-        /// What the waiters ahead that no claim's end can start ask for (STUCK,
-        /// [`Spared::Stuck`]): they reserve none of it against this need, so none of it is in
+        /// What the waiters ahead that no end of a claim they can wait for can start ask for
+        /// (STUCK, [`Spared::Stuck`]): they reserve none of it against this need, so none of it is in
         /// `reserved`, and it goes first past them once it fits the room. `0` where none is.
         stuck_ahead: u64,
         /// Whether this need is itself STUCK by this look's reckoning ([`Spared::Stuck`]): no
         /// end of a claim this look counts can start it, each giving back the most it may, so
-        /// what it lacks is memory no claim holds, whatever claims hold memory beside it
-        /// ([`memory_turn`]). What a release's slice budget and a compile unit escape a wait on.
+        /// what it lacks is memory no claim holds but the work it runs under (its kin,
+        /// [`kin_of`], which the look of a need its holder's tree keeps leaves out), whatever
+        /// claims hold memory beside it ([`memory_turn`]). What a release's slice budget and a
+        /// compile unit escape a wait on.
         stuck: bool,
     },
     /// Disk on the volume mounted at `mount`.
@@ -394,6 +404,20 @@ pub enum Short {
         /// Claims holding or reserving memory ahead of it.
         holders: usize,
     },
+    /// THE JUDGMENT TURN ([`crate::Heavy`]): another process holds it, or another heavy waiter
+    /// comes first by its key (shortest predicted first, aged).
+    Heavy {
+        /// The pid of the holder, or of the waiter ahead.
+        pid: u32,
+        /// What it is.
+        what: String,
+        /// Whether it holds the turn (else it waits ahead for it).
+        held: bool,
+        /// What its work is predicted to take of this machine.
+        predicted: Duration,
+        /// How long ago its work was first queued.
+        queued: Duration,
+    },
     /// Another waiter held the admissions' lock at this look.
     Turn {
         /// Its pid, where it wrote one.
@@ -416,6 +440,7 @@ impl Short {
                 | Short::Reserved { .. }
                 | Short::Alone { .. }
                 | Short::WantsAlone { .. }
+                | Short::Heavy { .. }
         )
     }
 
@@ -429,9 +454,9 @@ impl Short {
     }
 
     /// Whether a [`Relief`] may free some of this: what claims hold, but no reservation, which
-    /// only time ends.
+    /// only time ends, and not the judgment turn, which only its holder's end frees.
     const fn relievable(&self) -> bool {
-        self.held_by_claims() && !matches!(self, Short::Reserved { .. })
+        self.held_by_claims() && !matches!(self, Short::Reserved { .. } | Short::Heavy { .. })
     }
 
     /// Whether this is a disk need beyond the room (UNSERVABLE): more than its volume holds
@@ -494,15 +519,16 @@ impl fmt::Display for Short {
                 if *stuck_ahead > 0 {
                     write!(
                         f,
-                        "; no claim's end can start the claims ahead that ask {} more (they wait \
-                         for memory no claim holds), so they reserve none of it",
+                        "; no end of a claim they can wait for can start the claims ahead that \
+                         ask {} more (they wait for memory no claim holds but the work they run \
+                         under), so they reserve none of it",
                         gib(*stuck_ahead)
                     )?;
                 }
                 if *stuck {
                     f.write_str(
                         "; no end of a claim it can wait for brings what it lacks (it waits for \
-                         memory no claim holds)",
+                         memory no claim holds but the work it runs under)",
                     )?;
                 }
                 Ok(())
@@ -567,6 +593,24 @@ impl fmt::Display for Short {
                 f,
                 "waits to run alone beside {holders} {}",
                 if *holders == 1 { "holder" } else { "holders" }
+            ),
+            Short::Heavy {
+                pid,
+                what,
+                held,
+                predicted,
+                queued,
+            } => write!(
+                f,
+                "the judgment turn: pid {pid} (\"{what}\") {}, predicted {} of this machine, \
+                 queued {} ago (shortest predicted first, aged by its wait)",
+                if *held {
+                    "holds it"
+                } else {
+                    "comes first for it"
+                },
+                span(*predicted),
+                span(*queued)
             ),
             Short::Turn { holder: Some(pid) } => write!(f, "pid {pid} holds the ledger's lock"),
             Short::Turn { holder: None } => f.write_str("another waiter holds the ledger's lock"),
@@ -753,6 +797,39 @@ impl fmt::Display for Shortfall {
     }
 }
 
+/// A claim's place in the ledger ([`Record::order`]).
+pub(crate) type Order = (u64, u32, u64);
+
+/// INSIDE ([`own_counts`]): each inside waiter of a ledger, by order, with the waiters its own
+/// look counts ([`Other::inside`]).
+pub(crate) type Insides = HashMap<Order, Vec<Order>>;
+
+/// Each lead's fit once the independent holders end, by order, an ordinary lead's or a retained
+/// one's ([`lead_fits_after_independent_holders`], [`sure_leads`]), kept across the waiters
+/// [`own_counts`] reads: the same in each of their own looks, since that fit reads the asking
+/// waiter only through every waiting process's line, the asker's among them, which is the same set
+/// whichever asks, and a retained lead's REMAINS from what every look reckons
+/// ([`Reckoned::remains`]).
+type LeadFits = HashMap<Order, bool>;
+
+/// What every look of one ledger reckons of a claim's memory ([`Ledgerwide::reckoned`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Reckoned {
+    /// What it reserves against the claims behind it ([`reservations`] over every claim the look
+    /// read).
+    pub(crate) reserve: u64,
+    /// For a waiter of memory, how it stands by its own look ([`memory_turn`]'s OWN LOOK);
+    /// `None` for a held claim, a waiter that starts now and one of no memory.
+    pub(crate) standing: Option<Spared>,
+    /// The trees of the processes it is credited with ([`Other::credited`]), each counted toward
+    /// the first claim among every claim the look read that names it ([`others`]).
+    pub(crate) credited: TreeUse,
+    /// For a waiting critical lead that retains its sponsors' memory, REMAINS ([`remains`]): what
+    /// its ended sponsors' own processes still hold, which comes back as they exit and its fit
+    /// counts as room ([`lead_fits_after_independent_holders`]); `0` for every other claim.
+    pub(crate) remains: u64,
+}
+
 /// A claim in the ledger and what its holder's process tree, and the processes it is credited with, use now.
 #[derive(Clone)]
 pub(crate) struct Other<'a> {
@@ -766,6 +843,41 @@ pub(crate) struct Other<'a> {
     /// process it is credited with. Where it does not, the claim reserves all it claims and its
     /// end may give back as much again besides, which the look cannot see ([`memory_turn`]).
     pub(crate) seen: bool,
+    /// Whether its holder holds no other claim among those the look read ([`claims_by_holder`]),
+    /// held or waiting, ahead of the asker or behind it, the asker's own and those its look leaves
+    /// out ([`counted`]) among them, so that every look of one ledger finds the same. Where it
+    /// holds another, the holder lives on past this claim's end, which gives back what it claims
+    /// and what its credited processes use, never the rest of its holder's tree ([`released`]).
+    pub(crate) sole: bool,
+    /// For a waiter, its holder's ancestors from the process sweep ([`crate::Procs::ancestors`];
+    /// empty for a held claim and in a look with no sweep): the processes whose held claims end
+    /// only once it has run, its KIN ([`kin_of`]), which its standing in every look leaves out
+    /// where its holder's tree keeps it ([`Self::kin`], [`memory_turn`]'s OWN LOOK), as its own
+    /// look does.
+    pub(crate) line: Vec<u32>,
+    /// INSIDE: for a waiter its own look holds to the held claims and some waiters alone
+    /// ([`counted`]), those waiters by order ([`own_counts`]: its sure leads, none where its own
+    /// process holds the quiet machine; [`own_look_counts`] leaves out its kin's and its own
+    /// process's among them). `None` for a
+    /// held claim, a cohort-owned waiter and a waiter whose own look counts every claim but its
+    /// kin's and its own process's other waiters ([`own_look_counts`]).
+    pub(crate) inside: Option<Vec<Order>>,
+    /// What every look of the ledger reckons of its memory ([`Ledgerwide::reckoned`]): what it
+    /// reserves and how it stands by its own look, which this look's turn takes it at
+    /// ([`memory_turn`]'s OWN LOOK). `None` where the look reckoned none ([`reserved`],
+    /// [`crate::overruns`], a claim built by hand): a turn then reckons it over its own claims.
+    pub(crate) reckoned: Option<Reckoned>,
+}
+
+impl Other<'_> {
+    /// The process and ancestors ([`Self::line`]) whose kin ([`kin_of`]) this waiter's own look
+    /// leaves out ([`counted`]), and so does its standing in every look: a waiter its holder's
+    /// tree keeps. `None` for a held claim and for a cohort-owned waiter, whose own look counts
+    /// every claim, its kin's too.
+    fn kin(&self) -> Option<(u32, &[u32])> {
+        (self.record.held.is_none() && self.record.accounting == crate::Accounting::Holder)
+            .then_some((self.record.pid, self.line.as_slice()))
+    }
 }
 
 /// What one claim still reserves against the claims that asked after it, as their looks reckon
@@ -787,9 +899,9 @@ pub struct Reserve {
 }
 
 /// What each of `records` (a ledger's claims, [`crate::Ledger::list`]) still reserves against a
-/// claim that asked after them all, in `records`' order, with `trees` the use of their holders'
-/// and credited processes' trees ([`crate::Procs::trees`]; `None`, a look with no process
-/// sweep): the figures such a waiter's look holds its need to, by the same reckoning, each
+/// claim that asked after them all, in `records`' order, with `trees` the use of the process trees
+/// rooted at [`tree_roots`] ([`crate::Procs::trees`]; `None`, a look with no process sweep), as
+/// every look roots them (other roots give figures the looks do not hold): the figures such a waiter's look holds its need to, by the same reckoning, each
 /// credited process counted once, toward the first claim that names it. Each claim is reckoned
 /// on the volume its disk is on, read now among `volumes`, as the look of a claim behind it on
 /// that volume reckons it; a claim whose volume is not among them reserves no disk there
@@ -803,7 +915,18 @@ pub fn reserved(
     let records: Vec<&Record> = records.iter().collect();
     let taken = records.iter().map(|r| r.pid).collect();
     let none = HashMap::new();
-    let others = others(&records, taken, trees.unwrap_or(&none));
+    // No turn is reckoned here: what each claim reserves is reckoned below.
+    let wide = Ledgerwide {
+        holders: claims_by_holder(records.iter().copied()),
+        ..Ledgerwide::default()
+    };
+    let others = others(
+        &records,
+        taken,
+        trees.unwrap_or(&none),
+        &HashMap::new(),
+        &wide,
+    );
     let ahead: Vec<&Other<'_>> = others.iter().collect();
     let mut out = reservations(&ahead, None);
     for v in volumes {
@@ -826,8 +949,9 @@ pub enum Spared {
     /// take this many bytes at most and go first without delaying its turn by any of them (`0`:
     /// none may).
     Within(u64),
-    /// STUCK: no end of a claim ahead can start it, by the ledger's own reckoning, each giving
-    /// back the most it may: it lacks memory no claim holds, and its own look never admits it
+    /// STUCK: no end of a claim ahead it can wait for can start it, by the ledger's own
+    /// reckoning, each giving back the most it may: it lacks memory no claim holds but its kin
+    /// ([`kin_of`], whose claims end only once it has run), and its own look never admits it
     /// ALONE (it asks a margin, or its need is at or above what can ever be available). While it
     /// is so it reserves no memory against the claims behind it, and each that fits the room
     /// goes first (background work aside, which yields to every release claim).
@@ -835,84 +959,355 @@ pub enum Spared {
 }
 
 /// How each of `records` (a ledger's claims) stands as a waiter of memory that cannot start now,
-/// as the look of a claim that asked after them all reckons it with `available` bytes read now,
-/// `reachable` the most that can ever be available ([`Reading::reachable`]) and `trees` as
-/// [`reserved`] takes them (CAP3's passing rule, [`memory_turn`]): the most memory a claim behind
-/// it may take and go first without delaying its turn by any claim's end
-/// ([`Spared::Within`], `0` where none may), or that no claim's end can start it, so the claims
-/// behind it that fit go first ([`Spared::Stuck`]); `None` for a held claim, a waiter that can
-/// start now, and one of no memory. What `aterm pkg capacity` lists beside each waiter that
-/// cannot start.
+/// as the look of a claim that asked after them all reckons it with `reading` (what is
+/// available now, or physical memory where that was not read, and the most that can ever be,
+/// [`Reading::reachable`]), `trees` as [`reserved`] takes them (rooted at [`tree_roots`]) and
+/// `procs` the same sweep (`None` with none): each waiter stands as its own look stands it, as every look stands it
+/// ([`ledgerwide`], [`memory_turn`]'s OWN LOOK; its ancestors there hold claims that end only
+/// once it has run), and beside a claim held ALONE that its own look counts it lets none go
+/// first (CAP3's passing rule, [`memory_turn`]): the most memory a claim behind it may take and go
+/// first without delaying its turn by any claim's end ([`Spared::Within`], `0` where none may),
+/// or that no claim's end can start it, so the claims behind it that fit go first
+/// ([`Spared::Stuck`]); `None` for a held claim, a waiter that can start now, one of no memory,
+/// and every claim where no memory was read. What `aterm pkg capacity` lists beside each waiter
+/// that cannot start.
 #[must_use]
 pub fn spared(
     records: &[Record],
     trees: Option<&HashMap<u32, TreeUse>>,
-    available: u64,
-    reachable: Option<u64>,
+    procs: Option<&Procs>,
+    reading: &Reading,
 ) -> Vec<Option<Spared>> {
-    let records: Vec<&Record> = records.iter().collect();
-    let taken = records.iter().map(|r| r.pid).collect();
-    let none = HashMap::new();
-    let others = others(&records, taken, trees.unwrap_or(&none));
-    let ahead: Vec<&Other<'_>> = others.iter().collect();
-    let reserves = reservations(&ahead, None);
-    let counted: Vec<(&Other<'_>, u64)> = ahead
-        .iter()
-        .zip(&reserves)
-        .map(|(o, r)| (*o, r.mem))
-        .collect();
-    let mut spared = memory_turn(&counted, available, reachable).spared;
-    // While a claim holds memory alone, no memory claim is admitted beside it: no waiter lets
-    // one go first, one no claim's end can start included.
-    if records.iter().any(|r| r.held.is_some_and(|h| h.alone)) {
-        for (s, r) in spared.iter_mut().zip(&records) {
-            if r.held.is_none() && r.need.mem > 0 {
-                *s = Some(Spared::Within(0));
-            }
-        }
+    if reading.available.or(reading.physical).is_none() {
+        return vec![None; records.len()];
     }
-    spared
+    let records: Vec<&Record> = records.iter().collect();
+    let none = HashMap::new();
+    let wide = ledgerwide(&records, trees.unwrap_or(&none), procs, reading);
+    let lines = procs
+        .map(|procs| waiter_lines(records.iter().copied(), procs))
+        .unwrap_or_default();
+    let alone: Vec<&Record> = records
+        .iter()
+        .copied()
+        .filter(|r| r.held.is_some_and(|h| h.alone))
+        .collect();
+    records
+        .iter()
+        .map(|r| {
+            // While a claim holds memory alone, no memory claim is admitted beside it in a look
+            // that counts it ([`Short::Alone`]): such a waiter lets none go first, one no claim's
+            // end can start included. A waiter its holder's tree keeps leaves its kin's out.
+            let beside_alone = r.held.is_none()
+                && r.need.mem > 0
+                && alone.iter().any(|a| {
+                    r.accounting != crate::Accounting::Holder
+                        || !kin_of(a, r.pid, lines.get(&r.pid).map_or(&[], Vec::as_slice))
+                });
+            if beside_alone {
+                Some(Spared::Within(0))
+            } else {
+                wide.reckoned
+                    .get(&r.order())
+                    .and_then(|known| known.standing)
+            }
+        })
+        .collect()
 }
 
 /// Process-tree attribution shared by ordinary admission and rejection-only batch probes.
-struct ProcessUse {
+pub(crate) struct ProcessUse {
     claimants: HashSet<u32>,
-    trees: HashMap<u32, TreeUse>,
+    /// The trees rooted at every claimant, every process a claim is credited with and every
+    /// lingering sponsor holder ([`roots_of`]).
+    pub(crate) trees: HashMap<u32, TreeUse>,
+    /// Each waiting claimant's ancestors from the sweep ([`Other::line`]).
+    lines: HashMap<u32, Vec<u32>>,
 }
 
-fn process_use(records: &[&Record], pid: u32, procs: Option<&Procs>) -> ProcessUse {
+pub(crate) fn process_use(records: &[&Record], pid: u32, procs: Option<&Procs>) -> ProcessUse {
     let mut claimants = HashSet::with_capacity(records.len() + 1);
     claimants.extend(records.iter().map(|record| record.pid));
     claimants.insert(pid);
     let trees = procs
         .filter(|_| !records.is_empty())
         .map(|procs| {
-            let mut roots = Vec::with_capacity(
-                claimants.len()
-                    + records
-                        .iter()
-                        .map(|record| record.credit.len())
-                        .sum::<usize>(),
-            );
-            roots.extend(claimants.iter().copied());
-            roots.extend(
-                records
-                    .iter()
-                    .flat_map(|record| record.credit.iter().copied()),
-            );
+            let mut roots = roots_of(records, procs);
+            roots.push(pid);
             procs.trees(&roots)
         })
         .unwrap_or_default();
-    ProcessUse { claimants, trees }
+    let lines = procs
+        .map(|procs| waiter_lines(records.iter().copied(), procs))
+        .unwrap_or_default();
+    ProcessUse {
+        claimants,
+        trees,
+        lines,
+    }
+}
+
+/// The roots every look of `records` reckons process trees at ([`process_use`]): each claim's
+/// holder, each process a claim is credited with, and each LINGERING sponsor holder ([`lingers`]:
+/// a sponsor of a waiting critical lead's proof whose claim has ended while its process lives on),
+/// so no ancestor's claim takes that holder's tree when its record goes, as none did while it was
+/// held, and every look keeps one reckoning (OWN LOOK).
+fn roots_of(records: &[&Record], procs: &Procs) -> Vec<u32> {
+    let mut roots: Vec<u32> = records
+        .iter()
+        .flat_map(|record| std::iter::once(record.pid).chain(record.credit.iter().copied()))
+        .collect();
+    roots.extend(
+        retained_sponsors(records)
+            .filter(|sponsor| lingers(sponsor, records, procs))
+            .map(|sponsor| sponsor.order.1),
+    );
+    roots.sort_unstable();
+    roots.dedup();
+    roots
+}
+
+/// The roots every look of `records` reckons process trees at, as [`process_use`] roots them:
+/// what a reader beside the ledger (`aterm pkg capacity`) passes to [`Procs::trees`] for
+/// [`spared`], so it reckons the claims as their looks do.
+#[must_use]
+pub fn tree_roots(records: &[Record], procs: &Procs) -> Vec<u32> {
+    roots_of(&records.iter().collect::<Vec<_>>(), procs)
+}
+
+/// The sponsors named by the proofs of the waiting critical leads among `records`
+/// ([`Need::lead_reservation`]).
+fn retained_sponsors<'r>(records: &'r [&Record]) -> impl Iterator<Item = &'r crate::LeadSponsor> {
+    records
+        .iter()
+        .filter(|record| record.held.is_none() && record.need.critical)
+        .filter_map(|record| record.need.lead_reservation.as_ref())
+        .flat_map(|proof| proof.sponsors.iter())
+}
+
+/// Whether `sponsor`'s claim has ended while its holder lives on: no claim among `records` is at
+/// its order, and `procs` holds one row of its holder's pid with the start the proof recorded
+/// ([`crate::LeadSponsor::start`], [`Procs::start_of`]); a start of 0, unread, names no process.
+fn lingers(sponsor: &crate::LeadSponsor, records: &[&Record], procs: &Procs) -> bool {
+    sponsor.start != 0
+        && !records.iter().any(|record| record.order() == sponsor.order)
+        && procs.start_of(sponsor.order.1) == Some(sponsor.start)
+}
+
+/// REMAINS of `lead` among `read`, every claim a look read, over that look's `trees`
+/// ([`process_use`]) and `procs`: for each of its proof's sponsors whose claim has ended while its
+/// holder lives on ([`lingers`]), what that holder's tree still holds, capped at the sponsor's
+/// pledge, where no CLAIMANT (a claim's holder, a process a claim is credited with) is that holder
+/// or a process under it. A claimant there may hold the holder up: its claim may wait for a
+/// waiter, or credit one, and the holder for it, while the waiter counts the lead. The claimant
+/// test covers a sponsor still held, whose holder is its own claim's. Its tree is rooted in every
+/// look ([`roots_of`]), so no ancestor's claim takes it: a sole, uncredited sponsor's end leaves
+/// the fit's room where it was, `claims - reserve = min(mem, tree)` while held becoming that same
+/// tree, capped at `mem`, and after it the room moves only as those processes free pages, which
+/// then show up as available. `0` for any other claim, and where `procs` was not read.
+fn remains(
+    lead: &Record,
+    read: &[&Record],
+    trees: &HashMap<u32, TreeUse>,
+    procs: Option<&Procs>,
+) -> u64 {
+    let (Some(proof), Some(procs)) = (
+        (lead.held.is_none() && lead.need.critical)
+            .then_some(lead.need.lead_reservation.as_ref())
+            .flatten(),
+        procs,
+    ) else {
+        return 0;
+    };
+    let lingering: Vec<&crate::LeadSponsor> = proof
+        .sponsors
+        .iter()
+        .filter(|sponsor| lingers(sponsor, read, procs))
+        .collect();
+    if lingering.is_empty() {
+        return 0;
+    }
+    let claimants: HashSet<u32> = read
+        .iter()
+        .flat_map(|record| {
+            std::iter::once(record.pid).chain(record.credit.iter().copied().filter(|pid| *pid > 1))
+        })
+        .collect();
+    let lines: Vec<(u32, Vec<u32>)> = claimants
+        .iter()
+        .map(|pid| (*pid, procs.ancestors(*pid)))
+        .collect();
+    lingering
+        .into_iter()
+        .filter(|sponsor| {
+            let holder = sponsor.order.1;
+            !lines
+                .iter()
+                .any(|(pid, line)| *pid == holder || line.contains(&holder))
+        })
+        .map(|sponsor| {
+            trees
+                .get(&sponsor.order.1)
+                .map_or(0, |tree| tree.charged)
+                .min(sponsor.bytes)
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Each waiter among `records` by its process, with that process's ancestors in `procs`
+/// ([`crate::Procs::ancestors`]): the processes whose held claims end only once it has run
+/// ([`Other::line`]). What a look and [`spared`] leave out of that waiter's turn.
+pub(crate) fn waiter_lines<'r>(
+    records: impl IntoIterator<Item = &'r Record>,
+    procs: &Procs,
+) -> HashMap<u32, Vec<u32>> {
+    records
+        .into_iter()
+        .filter(|record| record.held.is_none())
+        .map(|record| (record.pid, procs.ancestors(record.pid)))
+        .collect()
+}
+
+/// How many claims each holder holds among `read`, every claim a look read, held or waiting
+/// ([`Other::sole`]).
+pub(crate) fn claims_by_holder<'r>(
+    read: impl IntoIterator<Item = &'r Record>,
+) -> HashMap<u32, usize> {
+    let mut holders = HashMap::new();
+    for record in read {
+        *holders.entry(record.pid).or_insert(0) += 1;
+    }
+    holders
+}
+
+/// What a look reads of every claim it read, held or waiting, its own among them, before
+/// [`counted`] leaves any out ([`ledgerwide`]), so that every look of one ledger finds the same.
+#[derive(Debug, Default)]
+pub(crate) struct Ledgerwide {
+    /// How many claims each holder holds ([`claims_by_holder`], [`Other::sole`]).
+    pub(crate) holders: HashMap<u32, usize>,
+    /// What each inside waiter's own look counts ([`own_counts`], [`Other::inside`]).
+    pub(crate) insides: Insides,
+    /// Each claim's memory, by order, as every look reckons it ([`Reckoned`], [`Other::reckoned`]):
+    /// none where the look reckons no turn ([`reserved`], [`crate::overruns`]).
+    pub(crate) reckoned: HashMap<Order, Reckoned>,
+}
+
+/// [`Ledgerwide`] of `read`, every claim a look read, its own among them, with `trees` the use of
+/// the process trees rooted at every one of their holders, every process they are credited with
+/// and every lingering sponsor holder ([`process_use`], [`roots_of`]), as that look reads `procs` and `reading`: each claim reckoned among all of
+/// `read`, what it reserves ([`reservations`]), what it is credited with ([`others`]) and, for a
+/// waiter, how it stands by its own look ([`memory_turn`]'s OWN LOOK), on what is available or,
+/// where that was not read, physical memory.
+pub(crate) fn ledgerwide(
+    read: &[&Record],
+    trees: &HashMap<u32, TreeUse>,
+    procs: Option<&Procs>,
+    reading: &Reading,
+) -> Ledgerwide {
+    let mut wide = Ledgerwide {
+        holders: claims_by_holder(read.iter().copied()),
+        ..Ledgerwide::default()
+    };
+    let lines = procs
+        .map(|procs| waiter_lines(read.iter().copied(), procs))
+        .unwrap_or_default();
+    let mut every = others(
+        read,
+        read.iter().map(|r| r.pid).collect(),
+        trees,
+        &lines,
+        &wide,
+    );
+    let reserves = reservations(&every.iter().collect::<Vec<_>>(), None);
+    wide.reckoned = every
+        .iter()
+        .zip(&reserves)
+        .map(|(o, reserve)| {
+            (
+                o.record.order(),
+                Reckoned {
+                    reserve: reserve.mem,
+                    standing: None,
+                    credited: o.credited,
+                    remains: remains(o.record, read, trees, procs),
+                },
+            )
+        })
+        .collect();
+    // Each sure lead's fit reads what every claim reserves ([`sure_leads`]).
+    wide.insides = own_counts(read, procs, &wide.reckoned, reading);
+    for o in every.iter_mut().filter(|o| o.record.held.is_none()) {
+        o.inside = wide.insides.get(&o.record.order()).cloned();
+    }
+    let ahead: Vec<(&Other<'_>, u64)> = every.iter().zip(reserves.iter().map(|r| r.mem)).collect();
+    let available = reading.available.or(reading.physical).unwrap_or(0);
+    let sweep = Sweep {
+        procs,
+        reading,
+        reckoned: &wide.reckoned,
+    };
+    let turn = memory_turn(&ahead, available, reading.reachable(), Some(sweep));
+    for (o, standing) in every.iter().zip(turn.spared) {
+        if let Some(known) = wide.reckoned.get_mut(&o.record.order()) {
+            known.standing = standing;
+        }
+    }
+    wide
+}
+
+/// What a look reads of `read`, every claim it read, `own` (its waiter's claim) among them, as it
+/// reads `procs` and `reading`: the claims it is held to ([`counted`]; every other claim for a
+/// cohort-owned waiter), the trees rooted at every claim's holder, every process a claim is
+/// credited with, every lingering sponsor holder and its own process ([`process_use`],
+/// [`roots_of`]), and what every look of the ledger reads alike ([`ledgerwide`]).
+pub(crate) struct LookRead<'r> {
+    pub(crate) counted: Vec<&'r Record>,
+    pub(crate) used: ProcessUse,
+    pub(crate) wide: Ledgerwide,
+}
+
+/// [`LookRead`] of `read` for the waiter `own`: one definition for a waiter's look, a resource
+/// probe and the tests that stand in for them.
+pub(crate) fn look_read<'r>(
+    read: &[&'r Record],
+    own: &Record,
+    procs: Option<&Procs>,
+    reading: &Reading,
+) -> LookRead<'r> {
+    let used = process_use(read, own.pid, procs);
+    let wide = ledgerwide(read, &used.trees, procs, reading);
+    let rest: Vec<&Record> = read
+        .iter()
+        .copied()
+        .filter(|r| r.order() != own.order())
+        .collect();
+    let counted = if own.accounting == crate::Accounting::CohortOwned {
+        rest
+    } else {
+        counted(rest, own.pid, procs, &wide.reckoned, reading)
+    };
+    LookRead {
+        counted,
+        used,
+        wide,
+    }
 }
 
 /// Each of `records` with its holder's tree use and the use of the processes it is credited
 /// with, from `trees`: a credited process is counted toward the first claim that names it, and
-/// never where `taken` (the claimants' own pids) holds it already.
+/// never where `taken` (the claimants' own pids) holds it already, among every claim the look
+/// read where `wide` reckoned the claim ([`Reckoned::credited`]). A waiter takes its holder's
+/// ancestors from `lines` ([`Other::line`]), and from `wide`, what the look read of every claim
+/// before [`counted`] left any out ([`Ledgerwide`]), whether its holder holds another claim
+/// ([`Other::sole`]) and, for a waiter its own look holds to some claims alone, what that look
+/// counts ([`Other::inside`]).
 pub(crate) fn others<'r>(
     records: &[&'r Record],
     mut taken: HashSet<u32>,
     trees: &HashMap<u32, TreeUse>,
+    lines: &HashMap<u32, Vec<u32>>,
+    wide: &Ledgerwide,
 ) -> Vec<Other<'r>> {
     records
         .iter()
@@ -939,13 +1334,27 @@ pub(crate) fn others<'r>(
                 credited: if r.accounting != crate::Accounting::Holder {
                     TreeUse::default()
                 } else {
-                    credited
+                    wide.reckoned
+                        .get(&r.order())
+                        .map_or(credited, |known| known.credited)
                 },
                 seen: r.accounting == crate::Accounting::Holder
                     && trees.contains_key(&r.pid)
                     && r.credit
                         .iter()
                         .all(|pid| *pid <= 1 || trees.contains_key(pid)),
+                line: if r.held.is_none() {
+                    lines.get(&r.pid).cloned().unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+                sole: wide.holders.get(&r.pid).is_none_or(|n| *n <= 1),
+                inside: if r.held.is_none() {
+                    wide.insides.get(&r.order()).cloned()
+                } else {
+                    None
+                },
+                reckoned: wide.reckoned.get(&r.order()).copied(),
             }
         })
         .collect()
@@ -967,7 +1376,18 @@ pub(crate) fn others<'r>(
 /// behind it to all, to what it spares, or to none where no claim's end can start it. Once its
 /// need fits the room again it reserves its disk again, in its turn. A held claim always
 /// reserves.
-fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<Reserve> {
+pub(crate) fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<Reserve> {
+    reservations_as(ahead, volume, |i| ahead[i].record.held.is_some())
+}
+
+/// [`reservations`] of `ahead` with the claims at each index `holds` names held, as a later look
+/// reckons them once those waiters have started ([`once_started`]): a held claim takes its
+/// holder's tree credit before any waiting claim of that holder.
+fn reservations_as(
+    ahead: &[&Other<'_>],
+    volume: Option<&Volume>,
+    holds: impl Fn(usize) -> bool,
+) -> Vec<Reserve> {
     let mut credit: HashMap<u32, TreeUse> = HashMap::with_capacity(ahead.len());
     for o in ahead {
         if o.record.accounting == crate::Accounting::Holder {
@@ -977,7 +1397,7 @@ fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<Reserve> {
     let mut order: Vec<usize> = (0..ahead.len()).collect();
     order.sort_unstable_by_key(|&i| {
         (
-            ahead[i].record.held.is_none(),
+            !holds(i),
             !ahead[i].record.need.leads,
             ahead[i].record.need.rank,
             ahead[i].record.order(),
@@ -1045,8 +1465,8 @@ fn split(gives: u64, total: u64) -> [u64; 2] {
 /// What a held claim's ends give back to the room every look reckons ([`memory_turn`]): it
 /// reserves what it claims now ([`Need::mem_now`]) less what its tree holds, and its tree's
 /// memory comes back with its end, so what it claims now, or all its tree holds where that is
-/// more (an overrun) and the tree is its alone (its holder holds no other claim ahead), split as
-/// its planned step down comes ([`split`]).
+/// more (an overrun) and the tree is its alone (its holder holds no other claim the look read,
+/// [`Other::sole`]), split as its planned step down comes ([`split`]).
 fn released(o: &Other<'_>, alone_in_tree: bool) -> [u64; 2] {
     let claims = o.record.need.mem_now();
     let total = if o.record.accounting == crate::Accounting::Holder {
@@ -1073,8 +1493,9 @@ fn released(o: &Other<'_>, alone_in_tree: bool) -> [u64; 2] {
 /// what they come to, each claim's rounded down, and the least read one step lower than it can
 /// be for each claim a step does not divide, so what this answers is never more than what is
 /// spared, and exact where every figure is a whole number of steps. `None` where all of
-/// `releases` sum to less than `short`: no set of ends brings what the waiter lacks, the rest of
-/// which is memory no claim holds ([`memory_turn`] says how such a waiter stands).
+/// `releases` sum to less than `short`: no set of these ends brings what the waiter lacks, the
+/// rest of which is memory none of their claims holds ([`memory_turn`] says how such a waiter
+/// stands).
 fn spare(releases: &[[u64; 2]], short: u64) -> Option<u64> {
     let ends: Vec<[u64; 2]> = releases
         .iter()
@@ -1152,6 +1573,13 @@ fn alone_once_clear(need: &Need, reach: Option<u64>) -> bool {
             && reach.is_none_or(|reach| need.mem.saturating_add(need.margin) < reach))
 }
 
+/// What a waiter of `need` asks of the room to start: its peak, its margin and its holdback.
+fn protected_wanted(need: &Need) -> u64 {
+    need.mem
+        .saturating_add(need.margin)
+        .saturating_add(holdback(need))
+}
+
 /// What a critical waiter's retained lead keeps back besides its need and margin
 /// ([`Need::lead_reservation`]): the claims its asker's ancestry may have hidden from the look
 /// that made its proof. `0` for every other need.
@@ -1163,21 +1591,23 @@ fn holdback(need: &Need) -> u64 {
 }
 
 /// THE MEMORY TURN OF A NEED BEHIND `ahead` ([`memory_turn`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct MemoryTurn {
     /// What the claims ahead reserve against the need: the held claims, the waiters ahead that
     /// can start, and each waiter ahead that keeps its place ([`Spared::Within`]), its whole
     /// need. The figure a look names in its shortfall ([`Short::Memory`]'s `reserved`). What a
-    /// waiter no claim's end can start asks is in [`Self::stuck`] instead.
+    /// waiter no end of a claim it can wait for can start asks is in [`Self::stuck`] instead.
     pub(crate) whole: u64,
-    /// What the room holds beside the held claims and the waiters ahead that can start now.
+    /// What the room holds beside the held claims and the waiters ahead that can start now: what
+    /// is available less what they take, at least `0`.
     pub(crate) room: u64,
     /// The most a need may take and go first past the waiters ahead that cannot start and keep
     /// their place, without delaying any of their turns ([`spare`]); `None` where no waiter
     /// ahead keeps its place so.
     pub(crate) passes: Option<u64>,
-    /// What the waiters ahead that no claim's end can start ask for ([`Spared::Stuck`]): none of
-    /// it is reserved against the need ([`Short::Memory`]'s `stuck_ahead`).
+    /// What the waiters ahead that no end of a claim they can wait for can start ask for
+    /// ([`Spared::Stuck`]): none of it is reserved against the need ([`Short::Memory`]'s
+    /// `stuck_ahead`).
     pub(crate) stuck: u64,
     /// For each of `ahead`, in its order, how it stands as a waiter that cannot start now
     /// ([`Spared`]); `None` for a held claim, a waiter that can start, and one of no memory.
@@ -1185,19 +1615,62 @@ pub(crate) struct MemoryTurn {
     /// The needs of the waiters ahead that cannot start and keep their place: what a later
     /// waiter's turn waits for besides its own need.
     blocked: u64,
-    /// What each claim ahead that can end before a later waiter starts gives back ([`spare`]):
-    /// the held claims, and every waiter ahead but those no claim's end can start.
-    releases: Vec<[u64; 2]>,
-    /// The most the ends in `releases` may give back beyond what they reckon, each tree within
-    /// its claim: what a held claim the look does not see ([`Other::seen`]) claims, which its
-    /// processes may use already, and what a waiter's process uses already, which its end gives
-    /// back besides its reservation (all it claims, where the look does not see it).
-    unseen: u64,
+    /// The end of each claim ahead that may come before a later waiter starts ([`End`]): the
+    /// held claims, and every waiter ahead but those no claim's end can start. A waiter stands
+    /// on the ends its own look counts ([`memory_turn`]'s OWN LOOK).
+    releases: Vec<End>,
     /// The most memory that can ever be available ([`Reading::reachable`]).
     reach: Option<u64>,
 }
 
+/// One end a later waiter's turn may wait for ([`MemoryTurn::standing`]).
+#[derive(Clone, Copy, Debug)]
+struct End {
+    /// What it gives back ([`released`], [`split`]): its planned step down, then the rest.
+    gives: [u64; 2],
+    /// The most it may give back beyond that, its tree within its claim: what a held claim the
+    /// look does not see ([`Other::seen`]) claims, which its processes may use already, and what
+    /// a waiter's process uses already, which its end gives back besides its reservation (all it
+    /// claims, where the look does not see it).
+    unseen: u64,
+}
+
 impl MemoryTurn {
+    /// A turn of `claims` claims on `available` bytes, `reach` the most that can ever be
+    /// ([`Reading::reachable`]), none of them taken yet.
+    fn new(claims: usize, available: u64, reach: Option<u64>) -> Self {
+        Self {
+            whole: 0,
+            room: available,
+            passes: None,
+            stuck: 0,
+            spared: vec![None; claims],
+            blocked: 0,
+            releases: Vec::with_capacity(claims),
+            reach,
+        }
+    }
+
+    /// A held claim of this turn, `o` reserving `reserve`: its reservation comes off the room
+    /// first, and its end is one a later waiter's turn may wait for.
+    fn hold(&mut self, o: &Other<'_>, reserve: u64) {
+        self.whole = self.whole.saturating_add(reserve);
+        self.room = self.room.saturating_sub(reserve);
+        self.releases.push(End {
+            gives: released(o, o.sole),
+            unseen: if o.seen { 0 } else { o.record.need.mem_now() },
+        });
+    }
+
+    /// What a waiter of `need` that starts in this turn ([`Self::standing`] `None`) leaves the
+    /// claims behind it: the room, within what each waiter ahead spares, past its need with its
+    /// margin and holdback ([`protected_wanted`]).
+    fn leaves(&self, need: &Need) -> u64 {
+        self.may()
+            .unwrap_or(self.room)
+            .saturating_sub(protected_wanted(need))
+    }
+
     /// Whether a need of `wanted` bytes (its peak and its margin) is admitted in this turn.
     pub(crate) fn admits(&self, wanted: u64) -> bool {
         self.may().unwrap_or(self.room) >= wanted
@@ -1211,15 +1684,19 @@ impl MemoryTurn {
         self.passes.map(|most| most.min(self.room))
     }
 
-    /// HOW A WAITER OF `need` THAT RESERVES `reserve` STANDS BEHIND THE CLAIMS THIS TURN HAS
-    /// TAKEN ([`memory_turn`] has the rule): `None` where it starts now, else what it leaves
-    /// the claims behind it. The one reckoning each waiter ahead is walked by and a look names
-    /// its own wait by ([`Short::Memory`]'s `stuck`).
-    pub(crate) fn standing(&self, need: &Need, reserve: u64) -> Option<Spared> {
+    /// HOW A WAITER OF `need` STANDS BEHIND THE CLAIMS THIS TURN HAS TAKEN ([`memory_turn`] has
+    /// the rule): `None` where it starts now, else what it leaves the claims behind it. The one
+    /// reckoning each waiter is stood by, over what its own look counts (OWN LOOK), and a look
+    /// names its own wait by ([`Short::Memory`]'s `stuck`). It is reckoned on its whole
+    /// need, as its own look asks it ([`decide`]'s `wanted`): what its holder's tree holds
+    /// already lowers what it reserves against the claims behind it ([`reservations`]), which is
+    /// what it takes from the room once it starts, never what it asks of the room to start.
+    pub(crate) fn standing(&self, need: &Need) -> Option<Spared> {
         let holdback = holdback(need);
-        let protected_wanted = reserve.saturating_add(need.margin).saturating_add(holdback);
+        let protected_wanted = protected_wanted(need);
+        let room = self.room;
         if !need.alone
-            && self.room >= protected_wanted
+            && room >= protected_wanted
             && self.passes.is_none_or(|most| protected_wanted <= most)
         {
             return None;
@@ -1236,26 +1713,25 @@ impl MemoryTurn {
         let short = self
             .blocked
             .saturating_add(protected_wanted)
-            .saturating_sub(self.room);
+            .saturating_sub(room);
         if short == 0 {
             // It fits beside the reservations ahead, its margin too, and waits only for one
             // ahead that cannot start: a claim that leaves it that fit never delays it. What
-            // first in, first out leaves beside it is the room past its reservation and every
-            // earlier one's that keeps its place.
-            let beside = self
-                .room
-                .saturating_sub(self.blocked)
-                .saturating_sub(reserve);
+            // first in, first out leaves beside it is the room past its need and every earlier
+            // waiter's reservation that keeps its place.
+            let beside = room.saturating_sub(self.blocked).saturating_sub(need.mem);
             return Some(Spared::Within(
                 beside.saturating_sub(need.margin).saturating_sub(holdback),
             ));
         }
-        Some(match spare(&self.releases, short) {
+        let gives: Vec<[u64; 2]> = self.releases.iter().map(|end| end.gives).collect();
+        Some(match spare(&gives, short) {
             Some(most) => Spared::Within(most),
-            // A retained critical wait owns each byte its terminal sponsors deliver. After one
-            // disappears, the kernel's available reading may lag its end; no later unit may
-            // refill that gap. A known release may still leave a bounded overshoot, which is
-            // safe backfill by the same subset-sum proof as CAP3.
+            // A retained critical wait owns each byte its terminal sponsors pledged; a sponsor's
+            // processes may still hold those bytes after its record has gone (the fit's REMAINS,
+            // `sure_leads`), and no later claim may refill that room. A known release may still
+            // leave a bounded overshoot, which is safe backfill by the same subset-sum proof as
+            // CAP3.
             None if need.critical && need.lead_reservation.is_some() => Spared::Within(0),
             // No set of ends brings what it lacks, yet the ends of the claims ahead do start
             // it: its own look admits it ALONE once none of them holds memory or waits for it,
@@ -1266,18 +1742,65 @@ impl MemoryTurn {
             // No set of ends brings it by what the look sees, but the ends may give back memory
             // their processes use that it does not see: until those claims end it is not known
             // to be stuck, so it keeps its place and spares nothing.
-            None if self.may_bring(short) => Spared::Within(0),
+            None if may_bring(&self.releases, short) => Spared::Within(0),
             None => Spared::Stuck,
         })
     }
 
-    /// Whether the ends of the claims ahead may bring `short`, each giving back the most it may
-    /// ([`Self::unseen`]): what a STUCK waiter is not.
-    fn may_bring(&self, short: u64) -> bool {
-        self.releases.iter().fold(self.unseen, |sum, [step, rest]| {
-            sum.saturating_add(*step).saturating_add(*rest)
-        }) >= short
+    /// What a waiter of this turn, `o` reserving `reserve`, takes of it, standing so
+    /// ([`Self::standing`], by its own look: OWN LOOK): what each later waiter's turn is held to
+    /// ([`memory_turn`]).
+    fn take(&mut self, (o, reserve): (&Other<'_>, u64), standing: Option<Spared>) {
+        let need = &o.record.need;
+        match standing {
+            None => {
+                // What it takes comes off the room and off what each waiter it goes first past
+                // spares: a later claim's turn is held to the room both leave. A critical waiter
+                // also protects its admission margin until it has actually won the turn; otherwise
+                // a later small claim can consume that margin first and make the real admission
+                // stop fitting. Once held, its live ancestors occupy the spare and ordinary
+                // held-claim accounting applies. One its own look starts (OWN LOOK) may take more
+                // than this room holds, all of it then: what that look leaves out still holds its
+                // reservation against the claims behind it.
+                let protected = reserve
+                    .saturating_add(if need.critical { need.margin } else { 0 })
+                    .saturating_add(holdback(need));
+                self.whole = self.whole.saturating_add(reserve);
+                self.room = self.room.saturating_sub(protected);
+                self.passes = self.passes.map(|most| most.saturating_sub(protected));
+            }
+            Some(Spared::Within(own)) => {
+                self.whole = self.whole.saturating_add(reserve);
+                self.blocked = self.blocked.saturating_add(reserve);
+                self.passes = Some(self.passes.map_or(own, |most| most.min(own)));
+            }
+            Some(Spared::Stuck) => {
+                // It reserves nothing against the claims behind it, and its own end is no end
+                // a later waiter's turn can wait for.
+                self.stuck = self.stuck.saturating_add(reserve);
+                return;
+            }
+        }
+        let claims = need.mem_now();
+        self.releases.push(End {
+            gives: split(need.step_gives(), reserve),
+            unseen: if o.seen {
+                claims.saturating_sub(reserve)
+            } else {
+                claims
+            },
+        });
     }
+}
+
+/// Whether `ends` may bring `short`, each giving back the most it may ([`End::unseen`]): what a
+/// STUCK waiter's are not.
+fn may_bring(ends: &[End], short: u64) -> bool {
+    ends.iter().fold(0u64, |sum, end| {
+        sum.saturating_add(end.gives[0])
+            .saturating_add(end.gives[1])
+            .saturating_add(end.unseen)
+    }) >= short
 }
 
 /// WHERE A MEMORY NEED STANDS BEHIND `ahead`: the held claims and the waiters ahead of it, each
@@ -1285,11 +1808,12 @@ impl MemoryTurn {
 /// ever be available ([`Reading::reachable`]) (CAP3's passing rule). The held claims'
 /// reservations come off `available` first. Then each waiter, in its turn (the order [`decide`]
 /// and [`reservations`] keep: the waiters that lead first, [`Need::leads`], then by rank and
-/// [`Record::order`]), either can start now (its need and margin fit what is left, within what
-/// every earlier waiter that keeps its place spares), and its need comes off the room, or it
-/// cannot ([`MemoryTurn::standing`]), and what it lacks is its need and margin with every
-/// earlier waiter's need that keeps its place, less the room: what the ends of claims ahead of
-/// it must give back first ([`spare`]). Where some set of those ends brings it, the waiter
+/// [`Record::order`]), either can start now (its whole need and margin, as its own look asks
+/// them, fit what is left, within what every earlier waiter that keeps its place spares), and
+/// its reservation comes off the room, or it cannot ([`MemoryTurn::standing`]), and what it lacks
+/// is its need and margin with every earlier waiter's reservation that keeps its place, less the
+/// room: what the ends of claims ahead of it must give back first ([`spare`]). Where some set of
+/// those ends brings it, the waiter
 /// KEEPS ITS PLACE ([`Spared::Within`]): a need behind it is admitted only where it fits the
 /// room left and within what the waiter spares, and then goes first without delaying its turn.
 /// With no waiter ahead that cannot start, that is the first-in, first-out rule: a need fits
@@ -1299,7 +1823,8 @@ impl MemoryTurn {
 /// one's reservation, its margin too, and waits only for one ahead that keeps its place, spares
 /// what that fit leaves.
 ///
-/// STUCK. A waiter whose shortfall no set of ends brings lacks memory no claim holds, where the
+/// STUCK. A waiter whose shortfall no set of the ends its turn waits for brings (none of its
+/// kin's, KIN below) lacks memory no claim it can wait for holds, where the
 /// look sees what each claim ahead gives back. Where it may not, the waiter is not known to be
 /// stuck: a held claim the look does not see ([`Other::seen`]: one its holder's tree does not
 /// account for, or one in a look with no reading of that tree) reserves all it claims, while
@@ -1312,8 +1837,9 @@ impl MemoryTurn {
 /// once the claims ahead of it end (`alone_once_clear`, the test [`decide`] applies: it asks no
 /// margin and its need is below `reach`): those ends do start it, and a stream of claims that
 /// went first would keep it from ever being alone. The other is a critical waiter's retained
-/// lead ([`Need::lead_reservation`]): it owns each byte its sponsors pledged, the kernel's
-/// available reading may lag a sponsor's end, and no later claim may refill that gap. Every
+/// lead ([`Need::lead_reservation`]): it owns each byte its sponsors pledged; a sponsor's
+/// processes may still hold those bytes after its record has gone (the fit's REMAINS,
+/// [`sure_leads`]), and no later claim may refill that room. Every
 /// other such waiter is STUCK ([`Spared::Stuck`]): one that asks a margin (a release's slice
 /// budget, a VM's boot), which is never admitted alone, and one at or above `reach`. A stuck
 /// waiter reserves no memory against the claims behind it, as a waiter whose disk need is
@@ -1349,21 +1875,73 @@ impl MemoryTurn {
 /// again before those claims end, a waiter only such a fall can start starts later than first
 /// in, first out would have started it. No rule that lets a claim go first can rule that out;
 /// this one never lets a claim's end or step come later for a waiter whose shortfall the claims
-/// ahead may bring. Nor does it ask whether a held claim can end before the waiter runs: one
-/// held by the waiter's own process or an ancestor of it counts as an end like any other, so in
-/// the look of a claim behind it a waiter only such claims fund keeps its place
-/// (ATERM-KI-1113-21), though its own look, which leaves out its ancestors' claims, names it
-/// stuck.
+/// ahead may bring.
+///
+/// KIN. A held claim of the kin of a waiter its holder's tree keeps ([`kin_of`]: its ancestors'
+/// from the process sweep, [`Other::line`], or one that credits it or an ancestor) ends only once
+/// that waiter has run, so it is no end that waiter's turn can wait for. It still reserves what it
+/// holds against the claims behind that waiter, but it is in none of that waiter's standing in any
+/// look, neither its reservation nor its end, as its own look leaves it out ([`counted`], OWN LOOK
+/// below): the waiter is INSIDE. One that asks a margin, or at or above `reach`, that only its kin
+/// could fund is STUCK, while one its own look admits ALONE once the others end
+/// (`alone_once_clear`) keeps its place sparing nothing. A cohort-owned waiter's own look counts
+/// every claim, its kin's too, and so does its standing ([`Other::kin`]). Before this rule such a
+/// waiter kept its place in the looks behind it, holding each claim there to what it spared until
+/// memory no claim holds fell, while its own look named it stuck (ATERM-KI-1113-21). Without a
+/// sweep no ancestor is known, and only a claim crediting the waiter's own process is its kin's.
+///
+/// OWN LOOK. Every look stands each waiter as its own look stands it: beside the held claims and
+/// the waiters ahead of it that its own look counts ([`own_look_counts`]), each such waiter taken
+/// at its own standing so reckoned ([`MemoryTurn::take`]). Its own look leaves out its kin's claims
+/// (KIN, [`counted`]) and its own process's other waiters ([`decide`]'s siblings), and one whose
+/// kin hold a claim, or whose own process holds the quiet machine, is INSIDE: its look counts the
+/// held claims and its sure leads alone ([`counted`]'s LEADS-FIRST and QUIET-FIRST,
+/// [`Other::inside`]). A look reckons every claim it read so, its own and those it leaves out among
+/// them, each with what it reserves among them all, before it leaves any out ([`ledgerwide`],
+/// [`Other::reckoned`]), and its own turn takes each claim it counts at that reckoning: every look
+/// of one ledger gives each waiter one standing and each claim one reservation, and what a look
+/// leaves out changes only what that look is itself held to. Only what a waiter that keeps its
+/// place spares is not its own look's alone: once waiters ahead that start now have started, its
+/// look counts each that is none of its kin's as a held claim, may find it INSIDE or its sure leads
+/// changed, and takes the others ahead as they stand then, so what it spares in every look is no
+/// more than it spares in each such look ([`once_started`]); where its own look starts it, or names
+/// it STUCK, so does every look. The rest its own look leaves out bind it to nothing, as they bind
+/// that look: one only its kin's end would fund ends after it has run, a sibling is ordered by its
+/// holder, and an inside waiter, held work going on, goes first past every waiter but its sure
+/// leads, one that other held claims' ends fund among them, beyond what that one spares (INSIDE,
+/// [`counted`]). A claim built with no reckoning ([`Other::reckoned`] `None`) is reckoned by the
+/// same rule over the claims of this turn. Before this rule a look stood each waiter in that look's
+/// own turn, beside every waiter that look counted. On 35 GiB, under a held 20 GiB claim of its
+/// ancestor's and behind a cohort-owned 40 GiB budget, a 42 GiB budget of a byte's margin was STUCK
+/// in its own look, while the look of a 2 GiB claim behind it found that the cohort budget's end,
+/// with what that look cannot see of it, might bring what it lacked, kept it in its place sparing
+/// nothing and held the 2 GiB claim back (ATERM-KI-1113-342); a look that left out its own
+/// process's waiting lead stood a waiter that counts that lead without it and went first past what
+/// that waiter spared; and an inside waiter's own look stood its sure leads without its kin's
+/// claims, which each lead's own look counts (ATERM-KI-1113-343). Looks still differ where one does
+/// not read a lead or a sponsor another reads ([`funded_lead_reservation`]), and where their sweeps
+/// of the process table differ.
+///
+/// A held claim of the waiter's OWN process is an end like any other: one process may hold a
+/// claim and wait for another side by side (verify's test binaries, each admitted beside the
+/// others from its one process; its lima boot beside a Windows boot), and the held one ends when
+/// its work does, whatever the wait does. The process holding it is no proof that its end
+/// waits for the waiter's; only a mark naming the claim a wait runs under would be, and the
+/// ledger keeps none. Leaving such an end out would name a waiter stuck that it can fund,
+/// reserving nothing for it while each later claim that fits goes first.
 pub(crate) fn memory_turn(
     ahead: &[(&Other<'_>, u64)],
     available: u64,
     reach: Option<u64>,
+    sweep: Option<Sweep<'_>>,
 ) -> MemoryTurn {
-    let mut held: Vec<&(&Other<'_>, u64)> = Vec::new();
-    let mut waiting: Vec<(usize, &(&Other<'_>, u64))> = Vec::new();
-    for (i, a) in ahead.iter().enumerate() {
+    let mut held: Vec<(&Other<'_>, u64)> = Vec::new();
+    let mut held_at: Vec<usize> = Vec::new();
+    let mut waiting: Vec<(usize, (&Other<'_>, u64))> = Vec::new();
+    for (i, a) in ahead.iter().copied().enumerate() {
         if a.0.record.held.is_some() {
             held.push(a);
+            held_at.push(i);
         } else if a.0.record.need.mem > 0 {
             waiting.push((i, a));
         }
@@ -1371,66 +1949,300 @@ pub(crate) fn memory_turn(
     waiting.sort_unstable_by_key(|(_, (o, _))| {
         (!o.record.need.leads, o.record.need.rank, o.record.order())
     });
-    let one_claim = |pid: u32| ahead.iter().filter(|(o, _)| o.record.pid == pid).count() == 1;
-    let mut turn = MemoryTurn {
-        whole: 0,
-        room: available,
-        passes: None,
-        stuck: 0,
-        spared: vec![None; ahead.len()],
-        blocked: 0,
-        releases: Vec::with_capacity(ahead.len()),
-        unseen: 0,
-        reach,
-    };
+    let mut turn = MemoryTurn::new(ahead.len(), available, reach);
     for (o, reserve) in &held {
-        turn.whole = turn.whole.saturating_add(*reserve);
-        turn.room = turn.room.saturating_sub(*reserve);
-        turn.releases.push(released(o, one_claim(o.record.pid)));
-        if !o.seen {
-            turn.unseen = turn.unseen.saturating_add(o.record.need.mem_now());
-        }
+        turn.hold(o, *reserve);
     }
+    let mut walked: Vec<Walked<'_, '_>> = Vec::with_capacity(waiting.len());
+    let mut walked_at: Vec<usize> = Vec::with_capacity(waiting.len());
     for (i, (o, reserve)) in waiting {
         let need = &o.record.need;
-        let standing = turn.standing(need, *reserve);
-        turn.spared[i] = standing;
-        match standing {
+        // OWN LOOK: as every look reckons it, else by its own look over this turn's claims.
+        let standing = match o.reckoned {
+            Some(known) => known.standing,
             None => {
-                // What it takes comes off the room and off what each waiter it goes first past
-                // spares: a later claim's turn is held to the room both leave. A critical waiter
-                // also protects its admission margin until it has actually won the turn; otherwise
-                // a later small claim can consume that margin first and make the real admission
-                // stop fitting. Once held, its live ancestors occupy the spare and ordinary
-                // held-claim accounting applies.
-                let protected = reserve
-                    .saturating_add(if need.critical { need.margin } else { 0 })
-                    .saturating_add(holdback(need));
-                turn.whole = turn.whole.saturating_add(*reserve);
-                turn.room -= protected;
-                turn.passes = turn.passes.map(|most| most.saturating_sub(protected));
+                let own = if held.iter().all(|(h, _)| own_look_counts(o, h))
+                    && walked.iter().all(|(w, _, _)| own_look_counts(o, w))
+                {
+                    turn.standing(need)
+                } else {
+                    own_standing(o, &held, &walked, available, reach)
+                };
+                match own {
+                    Some(Spared::Within(spares)) => Some(Spared::Within(once_started(
+                        o,
+                        spares,
+                        ahead,
+                        (&held, &held_at),
+                        (&walked, &walked_at),
+                        (available, reach),
+                        sweep,
+                    ))),
+                    standing => standing,
+                }
             }
-            Some(Spared::Within(own)) => {
-                turn.whole = turn.whole.saturating_add(*reserve);
-                turn.blocked = turn.blocked.saturating_add(*reserve);
-                turn.passes = Some(turn.passes.map_or(own, |most| most.min(own)));
-            }
-            Some(Spared::Stuck) => {
-                // It reserves nothing against the claims behind it, and its own end is no end
-                // a later waiter's turn can wait for.
-                turn.stuck = turn.stuck.saturating_add(*reserve);
-                continue;
-            }
-        }
-        turn.releases.push(split(need.step_gives(), *reserve));
-        let claims = need.mem_now();
-        turn.unseen = turn.unseen.saturating_add(if o.seen {
-            claims.saturating_sub(*reserve)
-        } else {
-            claims
-        });
+        };
+        walked.push((o, reserve, standing));
+        walked_at.push(i);
+        turn.spared[i] = standing;
+        turn.take((o, reserve), standing);
     }
     turn
+}
+
+/// A waiter of [`memory_turn`]'s walk: the waiter, what it reserves, and how it stands.
+type Walked<'w, 'r> = (&'w Other<'r>, u64, Option<Spared>);
+
+/// OWN LOOK: whether the own look of `w`, a waiter, counts `c`, a claim ahead of it: every claim
+/// but its kin's ([`kin_of`], [`counted`]) and its own process's other waiters ([`decide`]'s
+/// siblings), and of the waiters, where it is inside, only those it counts ([`Other::inside`]).
+/// A cohort-owned waiter's look counts its kin's too ([`Other::kin`]).
+fn own_look_counts(w: &Other<'_>, c: &Other<'_>) -> bool {
+    counts_within(w, w.inside.as_deref(), c.record)
+}
+
+/// [`own_look_counts`] of `c` for `w` where `w`'s look counts `inside` of the waiters
+/// ([`Other::inside`]), as a later look reads it ([`once_started`]).
+fn counts_within(w: &Other<'_>, inside: Option<&[Order]>, c: &Record) -> bool {
+    let waiting = c.held.is_none();
+    if waiting && c.accounting != crate::Accounting::CohortOwned && c.pid == w.record.pid {
+        return false;
+    }
+    w.kin().is_none_or(|(pid, line)| {
+        !kin_of(c, pid, line)
+            && (!waiting || inside.is_none_or(|counts| counts.contains(&c.order())))
+    })
+}
+
+/// What a look read beside its claims, its process sweep and its reading: what [`once_started`]
+/// reads each waiter's INSIDE again from once a set of starters holds ([`own_counts`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Sweep<'s> {
+    pub(crate) procs: Option<&'s Procs>,
+    pub(crate) reading: &'s Reading,
+    /// What every look of the ledger reckons of each claim ([`Ledgerwide::reckoned`]): where a
+    /// set of starters holds, each lead's REMAINS stays its figure, since a starter was a claimant
+    /// already ([`remains`]).
+    pub(crate) reckoned: &'s HashMap<Order, Reckoned>,
+}
+
+/// OWN LOOK: how `o`, a waiter, stands in its own look beside `held`, the held claims of a turn,
+/// and `walked`, the waiters ahead of it with how each stands: in a turn of the claims its own
+/// look counts ([`own_look_counts`]), each waiter at its standing.
+fn own_standing(
+    o: &Other<'_>,
+    held: &[(&Other<'_>, u64)],
+    walked: &[Walked<'_, '_>],
+    available: u64,
+    reach: Option<u64>,
+) -> Option<Spared> {
+    let mut own = MemoryTurn::new(0, available, reach);
+    for (h, r) in held.iter().filter(|(h, _)| own_look_counts(o, h)) {
+        own.hold(h, *r);
+    }
+    for (w, r, s) in walked.iter().filter(|(w, _, _)| own_look_counts(o, w)) {
+        own.take((w, *r), *s);
+    }
+    own.standing(&o.record.need)
+}
+
+/// The most waiters that start now ahead of a waiter whose sets [`once_started`] reckons it beside:
+/// beyond them it spares nothing, as each starter holds its claim at its next look.
+const STARTERS_MAX: usize = 4;
+
+/// OWN LOOK: what `o`, a waiter its own look keeps in its place sparing `spares`, spares in every
+/// look: no more than it spares, or leaves where it would start, in a turn of its own look's claims
+/// once any set of the waiters among `walked` that start now have started: a sibling, one an inside
+/// look drops, one it counts as a waiter, and one of its kin's, which its look counts at none of
+/// those looks but whose hold may leave it INSIDE, counting a lead that waits ahead of it as that
+/// lead stands beside the kin's held claim. Each such turn is its look once those have started and
+/// the rest have not: each holds what it reserves once held, its holder's tree credit coming to it
+/// before its holder's waiting claims ([`reservations_as`]), and its end gives back what a held
+/// claim's does ([`MemoryTurn::hold`], [`released`]); each waiter's INSIDE is read again
+/// ([`own_counts`] beside them held, as `sweep`, the look's process sweep and reading, reads them:
+/// one whose kin's claim starts is inside, a lead that starts no longer ends the sure leads behind
+/// it, and each starter moves what a lead's fit owes and gives back; where an INSIDE those looks
+/// read turns on the cores a starter is granted, which this look cannot know, `o` spares nothing);
+/// and each other waiter ahead stands again as its own look stands it there, beside the held claims
+/// and the set's starters that look counts (none of its kin's) and the waiters ahead of it that it
+/// counts, each at how it stands there, so what a waiter ahead spares once a starter that went
+/// first past it holds is what `o` passes it by. A claim behind that goes first within what this
+/// answers delays `o` at none of those looks. A waiter ahead is stood so once, not bounded again by
+/// the sets ahead of it (ATERM-KI-1114-992). A set in which `o` is STUCK bounds nothing, as no
+/// claim waits on a waiter that is stuck. `ahead` is the turn's every claim with what each
+/// reserves, `held` and `walked` (each waiter with how it stands) the held claims and the waiters
+/// ahead of `o` with their indices in it, and `room` what is available and the most the turn may
+/// reach. A turn given no sweep, of claims built by hand ([`decide`]), keeps each waiter's INSIDE
+/// as built. Beyond [`STARTERS_MAX`] starters it spares nothing.
+fn once_started(
+    o: &Other<'_>,
+    spares: u64,
+    ahead: &[(&Other<'_>, u64)],
+    held: (&[(&Other<'_>, u64)], &[usize]),
+    walked: (&[Walked<'_, '_>], &[usize]),
+    room: (u64, Option<u64>),
+    sweep: Option<Sweep<'_>>,
+) -> u64 {
+    let ((held, held_at), (walked, walked_at), (available, reach)) = (held, walked, room);
+    let started: Vec<usize> = walked
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, s))| s.is_none())
+        .map(|(k, _)| k)
+        .collect();
+    if started.is_empty() {
+        return spares;
+    }
+    if started.len() > STARTERS_MAX {
+        return 0;
+    }
+    let every: Vec<&Other<'_>> = ahead.iter().map(|(c, _)| *c).collect();
+    let now = reservations_as(&every, None, |i| every[i].record.held.is_some());
+    let mut least = spares;
+    for set in 1u32..(1 << started.len()) {
+        let starts = |k: usize| {
+            started
+                .iter()
+                .enumerate()
+                .any(|(bit, at)| set & (1 << bit) != 0 && *at == k)
+        };
+        let starter = |i: usize| walked_at.iter().position(|at| *at == i).is_some_and(starts);
+        let then = reservations_as(&every, None, |i| {
+            every[i].record.held.is_some() || starter(i)
+        });
+        // What each claim reserves once those have started: the turn's own figure, moved as
+        // their holders' tree credit moves.
+        let reserve = |i: usize| {
+            let moved = i128::from(then[i].mem) - i128::from(now[i].mem);
+            u64::try_from((i128::from(ahead[i].1) + moved).max(0)).unwrap_or(u64::MAX)
+        };
+        // Each claim as that look reads it: each starter held as its grant line will say, on the
+        // cores `cores` gives it, and not ALONE, as a waiter that asks to be never starts in a
+        // turn ([`MemoryTurn::standing`]).
+        let held_as = |cores: &dyn Fn(usize) -> u32| -> Vec<std::borrow::Cow<'_, Record>> {
+            every
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if starter(i) {
+                        let mut r = c.record.clone();
+                        r.held = Some(Held {
+                            admitted_ms: r.start_ms,
+                            cores: cores(i),
+                            alone: false,
+                        });
+                        std::borrow::Cow::Owned(r)
+                    } else {
+                        std::borrow::Cow::Borrowed(c.record)
+                    }
+                })
+                .collect()
+        };
+        // Each waiter's INSIDE there ([`own_counts`]). A starter is granted at least a core and at
+        // most what it asks within the cores the held claims its own look counts leave it
+        // ([`ranked_grant`], [`counted`]), which share this look cannot know, and a lead's fit is
+        // the surer the fewer cores its parents hold ([`lead_fits_after_independent_holders`]):
+        // where an INSIDE a look reads there is not the same at both ends, `o` spares nothing.
+        let (read, insides) = match sweep {
+            None => (held_as(&|i| every[i].record.need.cores), None),
+            Some(sweep) => {
+                let most_cores = |i: usize| {
+                    let x = every[i];
+                    let held = every
+                        .iter()
+                        .filter(|c| !kin_of(c.record, x.record.pid, &x.line))
+                        .filter_map(|c| c.record.held.map(|h| h.cores))
+                        .fold(0u32, u32::saturating_add);
+                    x.record
+                        .need
+                        .cores
+                        .min(sweep.reading.cores.saturating_sub(held))
+                };
+                let reckoned: HashMap<Order, Reckoned> = every
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let reckoned = Reckoned {
+                            reserve: reserve(i),
+                            standing: None,
+                            credited: c.credited,
+                            remains: sweep
+                                .reckoned
+                                .get(&c.record.order())
+                                .map_or(0, |known| known.remains),
+                        };
+                        (c.record.order(), reckoned)
+                    })
+                    .collect();
+                let insides_of = |read: &[std::borrow::Cow<'_, Record>]| {
+                    let records: Vec<&Record> = read.iter().map(AsRef::as_ref).collect();
+                    own_counts(&records, sweep.procs, &reckoned, sweep.reading)
+                };
+                let read = held_as(&most_cores);
+                let most = insides_of(&read);
+                let shares = walked
+                    .iter()
+                    .zip(walked_at)
+                    .enumerate()
+                    .any(|(k, (_, at))| starts(k) && most_cores(*at) > 1);
+                if shares {
+                    let fewest = insides_of(&held_as(&|i| most_cores(i).min(1)));
+                    let mut looks = walked
+                        .iter()
+                        .enumerate()
+                        .filter(|(k, _)| !starts(*k))
+                        .map(|(_, (w, _, _))| w.record.order())
+                        .chain(std::iter::once(o.record.order()));
+                    if looks.any(|at| fewest.get(&at) != most.get(&at)) {
+                        return 0;
+                    }
+                }
+                (read, Some(most))
+            }
+        };
+        // A turn of the claims the look of `w`, a waiter ahead, counts once the set has started:
+        // the held claims and the set's starters, then the first `before` waiters ahead that are
+        // not in the set, each at how it stands there (`stood`).
+        let look = |w: &Other<'_>, before: usize, stood: &[Option<Spared>]| {
+            let within = match &insides {
+                Some(insides) => insides.get(&w.record.order()).map(Vec::as_slice),
+                None => w.inside.as_deref(),
+            };
+            let mut turn = MemoryTurn::new(0, available, reach);
+            for ((h, _), at) in held.iter().zip(held_at) {
+                if counts_within(w, within, h.record) {
+                    turn.hold(h, reserve(*at));
+                }
+            }
+            for (k, ((x, _, _), at)) in walked.iter().zip(walked_at).enumerate() {
+                if starts(k) && counts_within(w, within, &read[*at]) {
+                    turn.hold(x, reserve(*at));
+                }
+            }
+            for (k, ((x, _, _), at)) in walked[..before].iter().zip(walked_at).enumerate() {
+                if !starts(k) && counts_within(w, within, x.record) {
+                    turn.take((x, reserve(*at)), stood[k]);
+                }
+            }
+            turn
+        };
+        let mut stood: Vec<Option<Spared>> = Vec::with_capacity(walked.len());
+        for (k, (w, _, _)) in walked.iter().enumerate() {
+            let standing = if starts(k) {
+                None
+            } else {
+                look(w, k, &stood).standing(&w.record.need)
+            };
+            stood.push(standing);
+        }
+        let turn = look(o, walked.len(), &stood);
+        least = least.min(match turn.standing(&o.record.need) {
+            Some(Spared::Within(then)) => then,
+            Some(Spared::Stuck) => continue,
+            None => turn.leaves(&o.record.need),
+        });
+    }
+    least
 }
 
 #[cfg(test)]
@@ -1443,8 +2255,8 @@ mod stuck_tests;
 
 /// Whether `other` is a scratch claim ([`Need::scratch`]) held on `volume` by a process other
 /// than `pid` (the waiter's): one whose end may give back what it wrote there, which a disk need
-/// beyond the room can wait for ([`Short::Disk`]). The waiter's own process lets its claims go
-/// only once its wait is over, so a wait for them would never end.
+/// beyond the room can wait for ([`Short::Disk`]). The waiter's own process may keep its scratch
+/// until its wait is over, so a wait for that end might never end.
 fn scratch_on(other: &Other<'_>, pid: u32, volume: &Volume) -> bool {
     let r = other.record;
     r.held.is_some()
@@ -1636,25 +2448,34 @@ pub fn covering_disk(
     Ok((mount.is_some() && by.need.path == mount).then_some(by))
 }
 
-/// The claims a waiter of the process `pid` is held to: every other claim but those its
-/// ancestors hold or wait for, and the held ones that credit it or an ancestor ([`credits`]). A waiter whose ancestor holds a claim is that admitted work going
-/// on (verify's run starting the lab's VM boot, which claims the VM's disk for itself), so it is
-/// held only to the other HELD claims: never to its ancestors', which end only once it has run,
-/// nor to any waiter, which waits for that work in turn. Held to either, it would wait for what
-/// waits for it, with no end. Its need is then checked beside the other held claims alone: what
-/// its ancestors have yet to write may overrun the room by up to their reservation, into the
-/// floor, which is what the floor is kept for. Without a process sweep no ancestor is known,
-/// and every claim counts.
+/// The claims a waiter of the process `pid` is held to, as its look reads `procs`, what each claim
+/// reserves (`reckoned`, [`ledgerwide`]) and `reading`: every other claim but those its ancestors
+/// hold or wait for, and the held ones that credit it or an ancestor ([`credits`]). A waiter whose
+/// ancestor holds a claim is that admitted work going on (verify's run starting the lab's VM boot,
+/// which claims the VM's disk for itself), so it is held only to the other HELD claims: never to
+/// its ancestors', which end only once it has run, nor to any waiter but its sure leads
+/// (LEADS-FIRST below): a waiter of that work waits for it in turn, and the work goes on before
+/// every other, one that other held claims' ends fund among them. Held to either, it would wait for
+/// what waits for it, with no end. Its need is then checked beside the other held claims alone:
+/// what its ancestors have yet to write may overrun the room by up to their reservation, into the
+/// floor, which is what the floor is kept for. Without a process sweep no ancestor is known, and
+/// every claim counts.
 ///
 /// LEADS-FIRST: a waiter inside held work still counts each SURE lead that is none of its kin
 /// ([`Need::leads`]: a release slice's compiler beside the release's tree, [`sure_leads`]), which
-/// [`decide`] puts ahead of it. A sure lead fits once every held claim but the PARENTS has ended,
-/// a parent being a held claim that may end only once a waiter under it has run (its holder is
-/// that waiter's process or an ancestor of it, or it credits one). So counting it closes no
-/// cycle: the lead waits only for held claims and for the sure leads ahead of it, and neither
-/// waits for the waiters that count it. What is available is read as it is, memory no claim
-/// holds left out of it, so that memory makes a lead unsure rather than holding the waiters that
-/// count it.
+/// [`decide`] puts ahead of it; every other look counts the same for it ([`inside_of`],
+/// [`own_counts`], [`memory_turn`]'s OWN LOOK). A sure lead fits once every held claim but the
+/// PARENTS has ended, a parent being a held claim that may end only once a waiter under it has run
+/// (its holder is that waiter's process or an ancestor of it, or it credits one), and asks for
+/// nothing else a parent may hold: no disk, no quiet machine, not the machine alone, and cores only
+/// where the parents' leave it one; and no lead is of background rank, which would yield to a
+/// release parent ([`Need::leads`]). So counting it closes no cycle: the lead waits only for held
+/// claims, for the sure leads ahead of it and, a retained lead, for the processes of its ended
+/// sponsors under which no claimant is ([`remains`]), and none of them waits for the waiters that
+/// count it, but for one: a held claim that is no parent, whose holder may wait for a descendant's
+/// claim that credits such a waiter, closes one (ATERM-KI-1114-999). What is available is read as
+/// it is, memory no claim holds left out of it, so that memory makes a lead unsure rather than
+/// holding the waiters that count it.
 ///
 /// QUIET-FIRST: a waiter whose own process holds the quiet machine (verify's timed stage, which
 /// claims its memory once it holds the run's quiet claim) is held to the held claims alone, its
@@ -1665,26 +2486,91 @@ pub(crate) fn counted<'r>(
     records: Vec<&'r Record>,
     pid: u32,
     procs: Option<&crate::Procs>,
-    available: Option<u64>,
+    reckoned: &HashMap<Order, Reckoned>,
+    reading: &Reading,
 ) -> Vec<&'r Record> {
     let ancestors = procs.map(|p| p.ancestors(pid)).unwrap_or_default();
-    let kin = |r: &Record| kin_of(r, pid, &ancestors);
-    let measuring = records.iter().any(|r| {
+    let within = inside_of(
+        &records,
+        (pid, &ancestors),
+        procs,
+        reckoned,
+        reading,
+        &mut LeadFits::new(),
+    );
+    records
+        .into_iter()
+        .filter(|r| {
+            !kin_of(r, pid, &ancestors)
+                && within
+                    .as_ref()
+                    .is_none_or(|sure| r.held.is_some() || sure.contains(&r.order()))
+        })
+        .collect()
+}
+
+/// INSIDE: where the look of a waiter of the process `asker.0`, its ancestors `asker.1`, among
+/// `records` (its own claim left out) holds it to the held claims and some waiters alone, those
+/// waiters: none where its own process holds the quiet machine (QUIET-FIRST), its SURE leads
+/// where its kin hold a claim (LEADS-FIRST, [`sure_leads`]). `None` where it is not inside: its
+/// look counts every claim but its kin's. The one test [`counted`] and [`own_counts`] share.
+fn inside_of(
+    records: &[&Record],
+    asker: (u32, &[u32]),
+    procs: Option<&crate::Procs>,
+    reckoned: &HashMap<Order, Reckoned>,
+    reading: &Reading,
+    fits: &mut LeadFits,
+) -> Option<Vec<Order>> {
+    let (pid, ancestors) = asker;
+    if records.iter().any(|r| {
         r.accounting == crate::Accounting::Holder
             && r.pid == pid
             && r.held.is_some()
             && r.need.quiet.is_some()
-    });
-    let inside = measuring || records.iter().any(|r| r.held.is_some() && kin(r));
-    let sure = if inside && !measuring {
-        sure_leads(&records, (pid, &ancestors), procs, available)
-    } else {
-        Vec::new()
-    };
+    }) {
+        return Some(Vec::new());
+    }
     records
-        .into_iter()
-        .filter(|r| !kin(r) && (!inside || r.held.is_some() || sure.contains(&r.order())))
-        .collect()
+        .iter()
+        .any(|r| r.held.is_some() && kin_of(r, pid, ancestors))
+        .then(|| sure_leads(records, asker, procs, reckoned, reading, fits))
+}
+
+/// Each inside waiter of memory among `records`, every claim a look read, its own among them, by
+/// order, with the waiters its own look counts ([`inside_of`]: its sure leads, of which
+/// [`own_look_counts`] leaves out its kin's and its own process's), as that look would read
+/// `procs`, what each claim reserves (`reckoned`, [`ledgerwide`]) and `reading`. A look reads it
+/// before [`counted`] leaves out the look's own kin, which may be that waiter's too. Only a waiter
+/// its holder's tree keeps is inside: a cohort-owned one's look counts every claim
+/// ([`Other::kin`]).
+pub(crate) fn own_counts(
+    records: &[&Record],
+    procs: Option<&crate::Procs>,
+    reckoned: &HashMap<Order, Reckoned>,
+    reading: &Reading,
+) -> Insides {
+    let mut out = Insides::new();
+    if !records.iter().any(|r| r.held.is_some()) {
+        return out;
+    }
+    let mut fits = LeadFits::new();
+    for w in records
+        .iter()
+        .copied()
+        .filter(|r| r.held.is_none() && r.need.mem > 0 && r.accounting == crate::Accounting::Holder)
+    {
+        let line = procs.map(|p| p.ancestors(w.pid)).unwrap_or_default();
+        let rest: Vec<&Record> = records
+            .iter()
+            .copied()
+            .filter(|r| r.order() != w.order())
+            .collect();
+        if let Some(sure) = inside_of(&rest, (w.pid, &line), procs, reckoned, reading, &mut fits) {
+            out.insert(w.order(), sure);
+        }
+    }
+    out
 }
 
 /// Whether `r` is a claim of the process `pid`'s kin: one its ancestors (`ancestors`) hold, or a
@@ -1694,26 +2580,44 @@ fn kin_of(r: &Record, pid: u32, ancestors: &[u32]) -> bool {
         && (ancestors.contains(&r.pid) || credits(r, pid, ancestors))
 }
 
-/// The SURE leads among `records` ([`counted`]), by their order: the waiters that lead, in rank
-/// and arrival order, while each fits, its need with its margin, in the room it would have once
-/// every held claim none of its kin but the PARENTS has ended. A parent is a held claim whose
-/// holder is a waiting process (the asking waiter, `asker`, with its ancestors, among them) or one
-/// of its ancestors in `procs`, or one that credits a waiting process or an ancestor
-/// ([`credits`]), each its kin: it may end only once that waiter has run. That room is what is
-/// `available` now, less what each parent's holder has yet to use of its claims, plus what each
-/// other holder's tree uses now, at most its claims, which its end gives back; a claim no tree
-/// measures gives back only its reservation. A parent held ALONE leaves no lead room
-/// ([`Short::Alone`]). A retained lead is not sure for a waiter descended from one of its
-/// sponsors: that waiter may be work the sponsor must join before ending, so letting it pass is
+/// The SURE leads among `records` ([`counted`]), by their order: the waiters that lead, in rank and
+/// arrival order, while each fits, its need with its margin, in the room it would have once every
+/// held claim its own look counts but the PARENTS has ended: every one, a cohort-owned lead's, and
+/// none of its kin's for one its holder's tree keeps ([`Other::kin`]). A parent is a held claim
+/// whose holder is a waiting process (the asking waiter, `asker`, with its ancestors, among them)
+/// or one of its ancestors in `procs`, or one that credits a waiting process or an ancestor
+/// ([`credits`]), each its kin: it may end only once that waiter has run. That room is what
+/// `reading` has available now, less what each parent reserves, plus what each other held claim's
+/// trees use of what it claims (what it claims less what it reserves), which its end gives back:
+/// each reservation as every look of the ledger reckons it (`reckoned`, [`Reckoned::reserve`]: over
+/// trees rooted at every claimant, every process a claim is credited with and every lingering
+/// sponsor holder, [`process_use`], [`roots_of`]), so
+/// a parent owes in a lead's fit what it reserves in that lead's own look, a credited process's use
+/// and none of a waiting descendant's taken off it, and no lead whose own look waits for a parent's
+/// end is sure for a waiter under that parent. A claim the reckoning lacks owes all it claims and
+/// gives back nothing. A parent held ALONE leaves no lead room ([`Short::Alone`]). Nor is a lead
+/// sure that asks for disk, the quiet machine or the machine alone, or for cores where the parents'
+/// held cores are all `reading`'s ([`ranked_grant`]): each a wait a parent's end may be the only
+/// end of. On 35 GiB and 18 cores, a parent holding 4 GiB and every core, five 2 GiB leads of a
+/// core each and a 22 GiB lead were sure by memory: an inside waiter under that parent was held to
+/// the 22 GiB, which spared nothing beside the five starting, which waited for the parent's cores,
+/// which waited for that waiter. A retained lead (its `lead_reservation`) is judged by that same
+/// fit, each sponsor still held a held claim whose end gives back what its trees use, or a parent
+/// where a waiting process is under it, and each sponsor whose claim has ended counting what its
+/// own processes still hold, which comes back as they exit (REMAINS, [`remains`]), so the room its
+/// end has yet to show is no gap. No retained lead is sure for a waiter descended from a sponsor
+/// still held: that waiter may be work the sponsor must join before ending, so letting it pass is
 /// the ABBA escape. The first lead that is not sure ends them, since each later lead waits for it.
-/// With no process sweep none is sure; without a current memory reading only a retained lead can
-/// be sure.
+/// With no process sweep or no memory reading, none is sure. A fit is kept in `fits`
+/// ([`LeadFits`]).
 fn sure_leads(
     records: &[&Record],
     asker: (u32, &[u32]),
     procs: Option<&crate::Procs>,
-    available: Option<u64>,
-) -> Vec<(u64, u32, u64)> {
+    reckoned: &HashMap<Order, Reckoned>,
+    reading: &Reading,
+    fits: &mut LeadFits,
+) -> Vec<Order> {
     let mut leads: Vec<&Record> = records
         .iter()
         .copied()
@@ -1725,36 +2629,36 @@ fn sure_leads(
     leads.sort_unstable_by_key(|r| (r.need.rank, r.order()));
     let mut sure = Vec::with_capacity(leads.len());
     for lead in leads {
+        // A still-held sponsor may have spawned capacity-aware work after the proof was written.
+        // That descendant must pass the lead so the sponsor can join it and deliver the pledge.
+        // Once the exact sponsor claim ends, it has delivered its memory: its old PID (or a reused
+        // one) grants no exemption.
         if let Some(proof) = lead
             .need
             .critical
             .then_some(lead.need.lead_reservation.as_ref())
             .flatten()
-        {
-            // A still-held sponsor may have spawned capacity-aware work after the proof was
-            // written. That descendant must pass the lead so the sponsor can join it and deliver
-            // the pledge. Once the exact sponsor claim ends, it has delivered its memory: its
-            // old PID (or a reused one) grants no exemption.
-            let sponsor_parent = proof.sponsors.iter().any(|sponsor| {
+            && proof.sponsors.iter().any(|sponsor| {
                 (sponsor.order.1 == asker.0 || asker.1.contains(&sponsor.order.1))
-                    && records.iter().any(|record| {
-                        record.order() == sponsor.order
-                            && record.held.is_some()
-                            && record.accounting == crate::Accounting::Holder
-                            && record.need.critical
-                            && record.need.mem == sponsor.bytes
-                    })
-            });
-            if procs.is_none() || sponsor_parent {
-                break;
-            }
-            sure.push(lead.order());
-            continue;
+                    && sponsor_held(records, sponsor)
+            })
+        {
+            break;
         }
-        let (Some(procs), Some(available)) = (procs, available) else {
+        let (Some(procs), Some(available)) = (procs, reading.available) else {
             break;
         };
-        if !lead_fits_after_independent_holders(lead, records, asker, procs, available) {
+        let fit = *fits.entry(lead.order()).or_insert_with(|| {
+            lead_fits_after_independent_holders(
+                lead,
+                records,
+                asker,
+                procs,
+                reckoned,
+                (available, reading.cores),
+            )
+        });
+        if !fit {
             break;
         }
         sure.push(lead.order());
@@ -1762,17 +2666,38 @@ fn sure_leads(
     sure
 }
 
-/// The snapshot proof used by an ordinary lead, and by a critical lead before it retains
-/// terminal funding: it fits once every independent held claim has ended, beside every parent
-/// that may need the asking waiter to run. A retained proof is stronger because it survives its
-/// sponsor record's disappearance and a lagging available-memory reading.
+/// Whether `sponsor`'s exact claim is still held among `records`: a held, holder-accounted,
+/// critical claim at its order of the bytes it pledged.
+fn sponsor_held(records: &[&Record], sponsor: &crate::LeadSponsor) -> bool {
+    records.iter().any(|record| {
+        record.order() == sponsor.order
+            && record.held.is_some()
+            && record.accounting == crate::Accounting::Holder
+            && record.need.critical
+            && record.need.mem == sponsor.bytes
+    })
+}
+
+/// The snapshot proof used by an ordinary lead, and by a critical lead before it retains terminal
+/// funding: it fits once every independent held claim its own look counts has ended (its kin's are
+/// none of them unless it is cohort-owned), beside every parent that may need the asking waiter to
+/// run, each claim at what it reserves in `reckoned` ([`sure_leads`]), and with no wait a parent
+/// may hold it in besides: no disk, quiet or ALONE, and a core the parents leave it where it asks
+/// cores, of the machine's `cores`. A retained lead is judged by it always, its room counting
+/// what its ended sponsors' own processes still hold (REMAINS, [`Reckoned::remains`]): the room
+/// those processes have yet to free is the lead's, and it shows up as available as they free it.
 fn lead_fits_after_independent_holders(
     lead: &Record,
     records: &[&Record],
     asker: (u32, &[u32]),
     procs: &Procs,
-    available: u64,
+    reckoned: &HashMap<Order, Reckoned>,
+    (available, cores): (u64, u32),
 ) -> bool {
+    // A wait for disk, the quiet machine or the machine alone may be a wait for a parent's end.
+    if lead.need.disk > 0 || lead.need.quiet.is_some() || lead.need.alone {
+        return false;
+    }
     let mut lines: HashMap<u32, Vec<u32>> = HashMap::from([(asker.0, asker.1.to_vec())]);
     for r in records.iter().filter(|r| r.held.is_none()) {
         lines.entry(r.pid).or_insert_with(|| procs.ancestors(r.pid));
@@ -1789,19 +2714,15 @@ fn lead_fits_after_independent_holders(
         .filter(|r| r.held.is_some())
         .map(|r| (r, is_parent(r)))
         .collect();
-    let mut roots: Vec<u32> = held
-        .iter()
-        .filter(|(r, _)| r.accounting == crate::Accounting::Holder)
-        .map(|(r, _)| r.pid)
-        .collect();
-    roots.sort_unstable();
-    roots.dedup();
-    let trees = procs.trees(&roots);
+    // The held claims its own look counts: every one but its kin's, and its kin's too for a
+    // cohort-owned lead ([`look_read`]).
     let line = lines.get(&lead.pid).map_or(&[][..], Vec::as_slice);
     let theirs: Vec<(&Record, bool)> = held
         .iter()
         .copied()
-        .filter(|(r, _)| !kin_of(r, lead.pid, line))
+        .filter(|(r, _)| {
+            lead.accounting == crate::Accounting::CohortOwned || !kin_of(r, lead.pid, line)
+        })
         .collect();
     if theirs
         .iter()
@@ -1809,43 +2730,63 @@ fn lead_fits_after_independent_holders(
     {
         return false;
     }
-    // Each holder's claims none of the lead's kin, and whether one of them is a parent.
-    let mut holders: HashMap<u32, (u64, bool)> = HashMap::new();
-    for (r, parent) in theirs
+    // Its cores ([`ranked_grant`]): once every other held claim has ended, the parents' leave it
+    // one, or it waits for a parent's end.
+    let parents_cores = theirs
         .iter()
-        .filter(|(r, _)| r.accounting == crate::Accounting::Holder)
-    {
-        let slot = holders.entry(r.pid).or_default();
-        slot.0 = slot.0.saturating_add(r.need.mem_now());
-        slot.1 |= *parent;
+        .filter(|(_, parent)| *parent)
+        .filter_map(|(r, _)| r.held.map(|held| held.cores))
+        .fold(0u32, u32::saturating_add);
+    if lead.need.cores > 0 && parents_cores >= cores {
+        return false;
     }
     let (mut back, mut owed) = (0u64, 0u64);
-    for (pid, (claimed, parent)) in holders {
-        let used = trees.get(&pid).map_or(0, |tree| tree.charged).min(claimed);
+    for (r, parent) in theirs {
+        let claims = r.need.mem_now();
+        let reserve = reckoned
+            .get(&r.order())
+            .map_or(claims, |known| known.reserve.min(claims));
         if parent {
-            owed = owed.saturating_add(claimed.saturating_sub(used));
+            owed = owed.saturating_add(reserve);
         } else {
-            back = back.saturating_add(used);
+            back = back.saturating_add(claims - reserve);
         }
     }
-    let room = available.saturating_add(back).saturating_sub(owed);
+    // REMAINS: what an ended sponsor's processes still hold comes back as they exit, as every
+    // look reckons it ([`remains`]).
+    let remains = reckoned.get(&lead.order()).map_or(0, |known| known.remains);
+    let room = available
+        .saturating_add(back)
+        .saturating_add(remains)
+        .saturating_sub(owed);
     room >= lead.need.mem.saturating_add(lead.need.margin)
 }
 
 /// Retained funding for a terminal critical Release waiter.
 ///
-/// `available` excludes pages in use. Every other held claim is budgeted at its immutable peak:
-/// its unused peak is unavailable to the lead even if a phased claim later steps back up. Ending
-/// one terminal sponsor returns its used pages and removes its unused reservation, exactly its
-/// whole peak. An irredundant set whose peaks cover the resulting shortage therefore funds the
-/// lead. Only already-held, memory-only, non-phased terminal critical claims from the same
-/// release checkout may sponsor. A later waiter unrelated to those sponsors counts the retained
-/// lead immediately. [`sure_leads`] lets a sponsor's own descendant pass as an explicit ABBA
-/// escape, because the sponsor may have to join that work before it can deliver its pledge.
+/// `available` excludes pages in use. Every other held claim owes its immutable peak less what the
+/// lead's look credits it (below): its unused peak is unavailable to the lead even if a phased
+/// claim later steps back up. Ending one terminal sponsor returns its used pages and removes its
+/// unused reservation, exactly its whole peak. An irredundant set whose peaks cover the resulting
+/// shortage therefore funds the lead. Only already-held, memory-only, non-phased terminal critical
+/// claims from the same release checkout may sponsor. The proof records each sponsor's holder's
+/// kernel start (`procs`, [`Procs::start_of`]), and a later waiter unrelated to those sponsors
+/// judges the lead by its fit, which counts, for a sponsor whose claim has ended, what that same
+/// process's tree still holds (REMAINS, [`sure_leads`], [`remains`]). [`sure_leads`] lets a
+/// sponsor's own descendant pass as an explicit ABBA escape, because the sponsor may have to join
+/// that work before it can deliver its pledge. Each held claim owes its peak less what the lead's
+/// look credits it among every claim that look read (`wide`, [`Reckoned::reserve`]: its holder's
+/// tree share and the processes it is credited with, over trees rooted as every look roots them,
+/// [`process_use`], [`roots_of`]), so a waiting descendant's use is never a held claim's and a holder's tree is
+/// the claim's that the reckoning gives it, its kin's claim's included; and a sponsor's holder
+/// holds no other claim the look read ([`Ledgerwide::holders`]), whose end would keep its tree.
+/// Owed less than it reserves in the lead's own look, a parent's end is what the lead waits for
+/// once its sponsors end, and the parent waits for the waiter under it that counts the lead.
 pub(crate) fn funded_lead_reservation(
     lead: &Record,
     records: &[&Record],
     procs: &Procs,
+    wide: &Ledgerwide,
     available: Option<u64>,
 ) -> Option<crate::LeadReservation> {
     let available = available?;
@@ -1892,29 +2833,10 @@ pub(crate) fn funded_lead_reservation(
         return None;
     }
 
-    // A holder's process tree is credited once across all of that holder's claims. Whole and
-    // cohort accounting have no numeric tree credit, so their whole immutable peaks stay owed.
-    let mut claims: HashMap<u32, (u64, usize)> = HashMap::new();
-    let mut roots = Vec::new();
-    let mut fixed_owed = 0u128;
-    for record in &relevant {
-        if record.accounting == crate::Accounting::Holder {
-            let entry = claims.entry(record.pid).or_default();
-            entry.0 = entry.0.saturating_add(record.need.mem);
-            entry.1 = entry.1.saturating_add(1);
-            roots.push(record.pid);
-        } else {
-            fixed_owed = fixed_owed.saturating_add(u128::from(record.need.mem));
-        }
-    }
-    roots.sort_unstable();
-    roots.dedup();
-    let trees = procs.trees(&roots);
-    let mut unused = fixed_owed;
-    for (pid, (peak, _)) in &claims {
-        let used = trees.get(pid).map_or(0, |tree| tree.charged).min(*peak);
-        unused = unused.saturating_add(u128::from(peak.saturating_sub(used)));
-    }
+    let unused = relevant
+        .iter()
+        .map(|record| u128::from(owed_by(record, &wide.reckoned)))
+        .fold(0u128, u128::saturating_add);
     let wanted = u128::from(lead.need.mem.saturating_add(lead.need.margin));
     let needed = wanted
         .saturating_add(unused)
@@ -1930,9 +2852,7 @@ pub(crate) fn funded_lead_reservation(
             terminal(record)
                 && record.pid != lead.pid
                 && record.checkout == lead.checkout
-                && claims
-                    .get(&record.pid)
-                    .is_some_and(|(_, count)| *count == 1)
+                && wide.holders.get(&record.pid) == Some(&1)
         })
         .collect();
     eligible.sort_unstable_by_key(|record| (std::cmp::Reverse(record.need.mem), record.order()));
@@ -1980,9 +2900,26 @@ pub(crate) fn funded_lead_reservation(
             .map(|record| crate::LeadSponsor {
                 order: record.order(),
                 bytes: record.need.mem,
+                start: procs.start_of(record.pid).unwrap_or(0),
             })
             .collect(),
     })
+}
+
+/// What a held claim owes a lead's funding ([`funded_lead_reservation`]): its
+/// immutable peak less what `reckoned` credits it, which its holder's tree or its credited
+/// processes already use ([`Reckoned::reserve`]). Whole and cohort accounting have no numeric tree
+/// credit, so their whole immutable peaks stay owed.
+fn owed_by(record: &Record, reckoned: &HashMap<Order, Reckoned>) -> u64 {
+    let credited = if record.accounting == crate::Accounting::Holder {
+        let now = record.need.mem_now();
+        reckoned
+            .get(&record.order())
+            .map_or(0, |known| now - known.reserve.min(now))
+    } else {
+        0
+    };
+    record.need.mem.saturating_sub(credited)
 }
 
 /// The quiet claim whose reservation holds `mine` back at `now` (unix ms), among `records` (the
@@ -2129,9 +3066,11 @@ pub(crate) fn decide(
                 .iter()
                 .zip(&ahead)
                 .filter(|(_, o)| !sibling(o))
-                .map(|(r, o)| (*o, r.mem))
+                .map(|(r, o)| (*o, o.reckoned.map_or(r.mem, |known| known.reserve)))
                 .collect();
-            let turn = memory_turn(&counted, available, reading.reachable());
+            // Each claim is reckoned ([`ledgerwide`]): no waiter stands in this turn but one
+            // built by hand, which keeps the INSIDE it was built with ([`once_started`]).
+            let turn = memory_turn(&counted, available, reading.reachable(), None);
             let reserved = turn.whole;
             let fits = !need.alone && turn.admits(wanted);
             // The claims ahead that hold memory or wait for it: a stuck waiter ahead
@@ -2164,7 +3103,7 @@ pub(crate) fn decide(
                         reserved,
                         passes: turn.may(),
                         stuck_ahead: turn.stuck,
-                        stuck: turn.standing(need, need.mem) == Some(Spared::Stuck),
+                        stuck: turn.standing(need) == Some(Spared::Stuck),
                     }
                 });
             }
@@ -2215,13 +3154,26 @@ pub(crate) fn decide(
             shorts.push(Short::Load { load1, max });
         }
     }
+    let heavy_ahead = need
+        .heavy
+        .and_then(|heavy| heavy_ahead(heavy, mine, others.iter().map(|o| o.record)));
+    if let Some(r) = heavy_ahead {
+        let theirs = r.need.heavy.unwrap_or_default();
+        shorts.push(Short::Heavy {
+            pid: r.pid,
+            what: r.need.what.clone(),
+            held: r.held.is_some(),
+            predicted: Duration::from_millis(theirs.predicted_ms),
+            queued: Duration::from_millis(now.saturating_sub(theirs.since_ms)),
+        });
+    }
     let cores = ranked_grant(need, mine, reading, others, now);
     if need.cores > 0 && cores == 0 {
         shorts.push(Short::Cores);
     }
     if !shorts.is_empty() {
         let overruns = overruns_of(others);
-        let holders = ahead
+        let mut holders: Vec<Holder> = ahead
             .iter()
             .zip(&reserves)
             .filter(|(o, r)| {
@@ -2238,7 +3190,7 @@ pub(crate) fn decide(
                 checkout: o.record.checkout.clone(),
                 held: o.record.held.is_some(),
                 age: Duration::from_millis(now.saturating_sub(o.record.start_ms)),
-                mem: r.mem,
+                mem: o.reckoned.map_or(r.mem, |known| known.reserve),
                 claimed: o.record.need.mem_now(),
                 alone: o.record.held.is_some_and(|h| h.alone),
                 disk: r.disk.unwrap_or(0),
@@ -2256,9 +3208,71 @@ pub(crate) fn decide(
                     .copied(),
             })
             .collect();
+        // The judgment turn is decided over every claim, not only those ahead: a heavy waiter
+        // whose key is smaller comes first whenever it arrived.
+        if let Some(r) = heavy_ahead
+            && !holders.iter().any(|h| h.order == r.order())
+        {
+            holders.push(Holder {
+                pid: r.pid,
+                what: r.need.what.clone(),
+                checkout: r.checkout.clone(),
+                held: r.held.is_some(),
+                age: Duration::from_millis(now.saturating_sub(r.start_ms)),
+                mem: 0,
+                claimed: 0,
+                alone: false,
+                disk: 0,
+                quiet: false,
+                order: r.order(),
+                stalled: None,
+                credit: r.credit.clone(),
+                overrun: None,
+            });
+        }
         return Err(Shortfall { shorts, holders });
     }
     Ok(Grant { cores, alone })
+}
+
+/// The claim a need of the judgment turn ([`crate::Heavy`]) with `mine`'s key waits for among
+/// `records`, read whole (not only the claims ahead of `mine` in arrival order): one another
+/// process holds, else the heavy waiter with the smallest key, then the earliest
+/// ([`Record::order`]), where that comes before `mine`'s. `None`: it may take the turn now. A
+/// claim of `mine`'s own process orders itself; a holder that is `mine`'s ancestor never reaches
+/// here, since its turn covers `mine` (`Waiter::look`).
+fn heavy_ahead<'r>(
+    heavy: crate::Heavy,
+    mine: (u64, u32, u64),
+    records: impl Iterator<Item = &'r Record>,
+) -> Option<&'r Record> {
+    let theirs = |r: &&'r Record| r.need.heavy.map(|h| (h.key(), r.order()));
+    let records: Vec<&Record> = records
+        .filter(|r| r.pid != mine.1 && r.need.heavy.is_some())
+        .collect();
+    if let Some(held) = records.iter().find(|r| r.held.is_some()) {
+        return Some(held);
+    }
+    records
+        .into_iter()
+        .filter(|r| theirs(r) < Some((heavy.key(), mine)))
+        .min_by_key(|r| theirs(r))
+}
+
+/// The judgment turn's queue among `records` ([`crate::Heavy`]): each claim that holds it, then
+/// each that waits for it in the order it takes it (smallest key, then earliest). What
+/// `aterm pkg capacity` lists.
+#[must_use]
+pub fn heavy_queue(records: &[Record]) -> Vec<&Record> {
+    let mut queue: Vec<&Record> = records.iter().filter(|r| r.need.heavy.is_some()).collect();
+    queue.sort_by_key(|r| {
+        (
+            r.held.is_none(),
+            r.need.heavy.map_or(u64::MAX, crate::Heavy::key),
+            r.order(),
+        )
+    });
+    queue
 }
 
 /// Bound every new grant by physical room. Earlier waiters in rank/arrival order that need
@@ -2271,6 +3285,13 @@ pub(crate) fn decide(
 /// cores two `targo test` waiters reserved while they queued for memory behind a 106 GiB compile
 /// that waited for that verify's 3.2 GiB. Such a waiter still counts as a party to the fair share
 /// ([`grant_iter`]), and its memory waits keep their first in, first out order.
+///
+/// CORES-GRANT. A claim of the process that holds the judgment turn ([`crate::Heavy`]) is granted
+/// all the room, as a Release's is, not the fair share: the turn runs one heavy judgment at a
+/// time so that it ends at full width (`docs/DESIGN-landing-economy.md` §1.1: the fair share's
+/// divisor counted every concurrent judgment's compiles, which claim no cores, as unclaimed load,
+/// and held each judgment's tests to a quarter of the machine). Only the holder's own claims are
+/// granted so; its descendants' are inside its turn and keep the fair share.
 fn ranked_grant(
     need: &Need,
     mine: (u64, u32, u64),
@@ -2292,7 +3313,7 @@ fn ranked_grant(
         .map(|o| o.record.need.cores)
         .fold(0u32, u32::saturating_add);
     let room = reading.cores.saturating_sub(held).saturating_sub(reserved);
-    if need.rank == crate::Rank::Release {
+    if need.rank == crate::Rank::Release || holds_turn(mine.1, others.iter().map(|o| o.record)) {
         return need.cores.min(room);
     }
     grant_iter(
@@ -2306,6 +3327,17 @@ fn ranked_grant(
     .min(room)
 }
 
+/// Whether the process `pid` holds the judgment turn ([`crate::Heavy`]) among `records`: an
+/// ordinary held claim of its own that asked for it.
+pub(crate) fn holds_turn<'r>(pid: u32, mut records: impl Iterator<Item = &'r Record>) -> bool {
+    records.any(|r| {
+        r.pid == pid
+            && r.accounting == crate::Accounting::Holder
+            && r.held.is_some()
+            && r.need.heavy.is_some()
+    })
+}
+
 /// Whether a waiter with `need` reserves its cores ahead of later claims (CORES-NO-CYCLE,
 /// [`ranked_grant`]): only one that waits for nothing but cores.
 const fn reserves_cores(need: &Need) -> bool {
@@ -2315,6 +3347,10 @@ const fn reserves_cores(need: &Need) -> bool {
 #[cfg(test)]
 #[path = "admit_cores_cycle_tests.rs"]
 mod cores_cycle_tests;
+
+#[cfg(test)]
+#[path = "admit_turn_tests.rs"]
+mod turn_tests;
 
 /// The fair share before `ranked_grant` applies reservations and the physical core bound.
 /// - The room is the cores less what every held claim was granted. Past about half
@@ -2437,6 +3473,9 @@ pub struct Claim {
     /// A loaded claim of its process or an ancestor spent its patience ([`loaded_cover`]): a
     /// stated entry decides on its first window, as for a loaded admission.
     spent: bool,
+    /// What its admission's looks said in the admission log ([`crate::admission_log`]): none for
+    /// an adopted claim, which records no admission's details.
+    pub(crate) looks: crate::admission_log::Looks,
 }
 
 impl Claim {
@@ -2655,6 +3694,158 @@ impl Claim {
             .map(|entry| entry.window)
     }
 
+    /// Take a new strict CPU/load/GPU observation under this original claim. Unlike
+    /// admission provenance, this samples the actual machine at the call, including at
+    /// completion. It never waits for a bad final reading to become quiet, or renews a hold.
+    /// # Errors
+    /// Lost original custody, expired protection, stale/reset/missing counters, busy or
+    /// unknown load/GPU, interruption, or unknown memory accounting.
+    #[cfg(unix)]
+    pub fn comparison_observation(
+        &mut self,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<crate::ComparisonObservation, crate::TimingIssue> {
+        let watch = aterm_toolchain::interrupt::Watch::enter();
+        self.comparison_observed_on(
+            &crate::Live,
+            Pace::default(),
+            &mut |d| watch.nap(d, &|| false),
+            say,
+        )
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn comparison_observation_on(
+        &mut self,
+        machine: &dyn Machine,
+        pace: Pace,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+    ) -> Result<crate::ComparisonObservation, crate::TimingIssue> {
+        self.comparison_observed_on(machine, pace, sleep, &mut |_| {})
+    }
+
+    #[cfg(unix)]
+    fn comparison_observed_on(
+        &mut self,
+        machine: &dyn Machine,
+        pace: Pace,
+        sleep: &mut dyn FnMut(Duration) -> bool,
+        say: &mut dyn FnMut(&str),
+    ) -> Result<crate::ComparisonObservation, crate::TimingIssue> {
+        use crate::TimingIssue;
+        self.comparison_custody()?;
+        let began_ms = now_ms();
+        let began = Instant::now();
+        let first = machine.cpu_point();
+        say(&format!("cpu_first={first:?}"));
+        let first = first.ok_or(TimingIssue::Unavailable)?;
+        if first.at < began
+            || first.at > Instant::now()
+            || first.unix_ms < began_ms
+            || first.unix_ms > now_ms()
+        {
+            return Err(TimingIssue::Unavailable);
+        }
+        if sleep(pace.poll) {
+            return Err(TimingIssue::Interrupted);
+        }
+        let gpu_busy = machine.gpu_busy(&|| false);
+        say(&format!("gpu_busy={gpu_busy:?}"));
+        let gpu_busy = gpu_busy.ok_or(TimingIssue::Unavailable)?;
+        if gpu_busy > crate::QUIET_GPU_BUSY {
+            return Err(TimingIssue::Busy);
+        }
+        let second = machine.cpu_point();
+        say(&format!("cpu_second={second:?}"));
+        let second = second.ok_or(TimingIssue::Unavailable)?;
+        if second.at < first.at
+            || second.at > Instant::now()
+            || second.unix_ms < first.unix_ms
+            || second.unix_ms > now_ms()
+        {
+            return Err(TimingIssue::Unavailable);
+        }
+        let window =
+            crate::CpuWindow::between(&first, &second).ok_or(TimingIssue::CounterChanged)?;
+        let reading = machine.read(None);
+        say(&format!(
+            "window={window:?} load1={:?} available={:?} physical={:?}",
+            reading.load1, reading.available, reading.physical
+        ));
+        let load1 = reading
+            .load1
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .ok_or(TimingIssue::LoadUnknown)?;
+        let (_, _, bound) = self.timing_hold()?;
+        if !window.ready() || load1 > bound {
+            return Err(TimingIssue::Busy);
+        }
+        if !matches!((reading.available, reading.physical), (Some(a), Some(p)) if p > 0 && a <= p) {
+            return Err(TimingIssue::Unavailable);
+        }
+        let footprint = self.comparison_memory_on(machine);
+        say(&format!("live_component_footprint_bytes={footprint:?}"));
+        let footprint_bytes = footprint?;
+        self.comparison_custody()?;
+        Ok(crate::ComparisonObservation {
+            window,
+            load1,
+            gpu_busy,
+            footprint_bytes,
+        })
+    }
+
+    /// Refuse an unknown or already insufficient declared peak before launching an arm.
+    /// All credited roots are the controller's currently validated actual arm processes.
+    /// # Errors
+    /// Missing process footprints, an overrun or lost original timing custody.
+    #[cfg(unix)]
+    pub fn comparison_memory(&self) -> Result<u64, crate::TimingIssue> {
+        self.comparison_memory_on(&crate::Live)
+    }
+
+    #[cfg(unix)]
+    fn comparison_memory_on(&self, machine: &dyn Machine) -> Result<u64, crate::TimingIssue> {
+        use crate::TimingIssue;
+        self.comparison_custody()?;
+        let procs = machine.procs().ok_or(TimingIssue::Unavailable)?;
+        let mut roots = self.record.credit.clone();
+        roots.push(self.record.pid);
+        roots.sort_unstable();
+        roots.dedup();
+        if roots.iter().any(|pid| !procs.observes_tree_resources(*pid)) {
+            return Err(TimingIssue::Unavailable);
+        }
+        let footprint = procs
+            .trees(&roots)
+            .values()
+            .try_fold(0u64, |total, tree| total.checked_add(tree.footprint))
+            .ok_or(TimingIssue::Unavailable)?;
+        if footprint >= self.record.need.mem {
+            return Err(TimingIssue::Memory);
+        }
+        Ok(footprint)
+    }
+
+    /// Check the original, still named claim without taking or renewing admission.
+    /// # Errors
+    /// Non-original, expired, replaced or non-budgeted strict timing custody.
+    #[cfg(unix)]
+    pub fn comparison_custody(&self) -> Result<(), crate::TimingIssue> {
+        self.timing_admission()?;
+        if self.record.pid != std::process::id()
+            || self.record.need.mem == 0
+            || self.record.need.margin == 0
+            || self.record.need.alone
+            || self.alone.is_some()
+        {
+            return Err(crate::TimingIssue::UnknownAdmission);
+        }
+        self.laid
+            .check_named_memory()
+            .map_err(|_| crate::TimingIssue::UnknownAdmission)
+    }
+
     /// [`Self::measurement_entry`] for work that runs on a busy machine and states it
     /// ([`crate::AtBound::RunLoaded`]): a loaded admission enters on one fresh window, and a quiet
     /// one whose entry stays busy through its entry's patience enters then; each says why in
@@ -2839,6 +4030,13 @@ impl Claim {
         self.asked_ms
     }
 
+    /// Whether a forced look (`--admit now`, [`Waiter::force`]) admitted it, whatever it lacked;
+    /// `false` for an adopted claim, which records no admission's details.
+    #[must_use]
+    pub const fn forced(&self) -> bool {
+        self.looks.forced()
+    }
+
     /// TEST: the wall clock ran `by_ms` ahead of this process's monotonic one while it waited (a
     /// Mac that slept through the wait): its ask and its record's laying read that much earlier,
     /// its [`Self::waited`] as this process's clock read it.
@@ -3011,6 +4209,7 @@ impl Claim {
             short: None,
             entry_custody: false,
             spent: false,
+            looks: crate::admission_log::Looks::default(),
         })
     }
 
@@ -3069,6 +4268,7 @@ impl Claim {
             short: None,
             entry_custody: false,
             spent: false,
+            looks: crate::admission_log::Looks::default(),
         })
     }
 
@@ -3337,7 +4537,7 @@ pub enum Polled {
 /// ends its wait on the second such look in a row. Nobody signals the holder.
 #[derive(Debug)]
 pub struct Waiter {
-    ledger: Ledger,
+    pub(crate) ledger: Ledger,
     record: Record,
     laid: Laid,
     /// The path whose volume the reading is taken for.
@@ -3358,6 +4558,8 @@ pub struct Waiter {
     stuck: Option<aterm_toolchain::waits::Stuck>,
     /// Timing-only observation storage; ordinary resource waiters carry no counter payload.
     cpu_point: Option<Box<crate::CpuPoint>>,
+    /// What its looks have said in the admission log ([`crate::admission_log`]).
+    pub(crate) looks: crate::admission_log::Looks,
 }
 
 /// WHAT THIS PROCESS'S WAITERS HAVE READ OF THE HOLDERS THEY WAIT BEHIND, by ledger and holder
@@ -3449,6 +4651,7 @@ impl Waiter {
             stuck_looks: 0,
             stuck: None,
             cpu_point: None,
+            looks: crate::admission_log::Looks::default(),
         })
     }
 
@@ -3519,14 +4722,12 @@ impl Waiter {
             .and_then(|_| machine.gpu_busy(stopped));
         let turn = match self.ledger.try_turn() {
             Ok(Ok(turn)) => turn,
-            Ok(Err(holder)) => {
-                return Polled::Waiting(self, Shortfall::only(Short::Turn { holder }));
-            }
-            Err(e) => return Polled::Waiting(self, Shortfall::only(Short::Ledger(e.to_string()))),
+            Ok(Err(holder)) => return self.unread(Short::Turn { holder }),
+            Err(e) => return self.unread(Short::Ledger(e.to_string())),
         };
         let found = match self.look(machine, gpu) {
             Ok(found) => found,
-            Err(e) => return Polled::Waiting(self, Shortfall::only(Short::Ledger(e.to_string()))),
+            Err(e) => return self.unread(Short::Ledger(e.to_string())),
         };
         if let Err(short) = &found.decided
             && let Some(issue) = short.shorts.iter().find_map(|s| match s {
@@ -3543,7 +4744,8 @@ impl Waiter {
             waiter.record.next_ms = Some(found.now);
         }
         let timed = found.timed();
-        let polled = match found.decided {
+        let before = crate::admission_log::Before::of(&waiter);
+        let mut polled = match found.decided {
             Ok((granted, quiet)) => waiter.grant(granted, quiet, timed, forced_now),
             Err(mut short) => {
                 let stuck = waiter.read_holders(&mut short, found.procs.as_ref(), &found.waits);
@@ -3561,6 +4763,8 @@ impl Waiter {
             }
         };
         drop(turn);
+        // Its admission-log row, written with the ledger's lock let go.
+        crate::admission_log::looked(before, &mut polled, &found.seen);
         polled
     }
 
@@ -3640,11 +4844,11 @@ impl Waiter {
         };
         trace("look.read.end");
         trace("look.scan.begin");
-        let records = self.ledger.scan(true)?;
+        let scanned = self.ledger.scan(true)?;
         trace("look.scan.end");
         let mine = self.record.order();
-        let records: Vec<&Record> = records.iter().filter(|r| r.order() != mine).collect();
-        let procs = (!records.is_empty())
+        let theirs: Vec<&Record> = scanned.iter().filter(|r| r.order() != mine).collect();
+        let procs = (!theirs.is_empty())
             .then(|| {
                 trace("look.procs.begin");
                 let procs = machine.procs();
@@ -3657,9 +4861,6 @@ impl Waiter {
         } else {
             Vec::new()
         };
-        let funded = procs.as_ref().and_then(|procs| {
-            funded_lead_reservation(&self.record, &records, procs, reading.available)
-        });
         // Coverage reads the claims before `counted` leaves out the ancestors': an ancestor's held
         // quiet claim is what covers this one.
         let mut need = std::borrow::Cow::Borrowed(&self.record.need);
@@ -3667,7 +4868,7 @@ impl Waiter {
         // CPU window here: this waiter samples its own admission and later its own entry.
         if self.record.accounting == crate::Accounting::Holder
             && need.quiet.is_some()
-            && covered(self.record.pid, &records, procs.as_ref())
+            && covered(self.record.pid, &theirs, procs.as_ref())
         {
             need.to_mut().quiet = None;
         }
@@ -3690,16 +4891,59 @@ impl Waiter {
         let spent = self.record.accounting == crate::Accounting::Holder
             && measured
             && self.record.need.at_bound == crate::AtBound::RunLoaded
-            && loaded_cover(self.record.pid, &records, procs.as_ref());
+            && loaded_cover(self.record.pid, &theirs, procs.as_ref());
         let past = past || spent;
         if past && need.quiet.is_some() {
             need.to_mut().quiet = Some(f64::INFINITY);
         }
-        let records = if self.record.accounting == crate::Accounting::CohortOwned {
-            records
+        // THE JUDGMENT TURN ([`crate::Heavy`]): a claim of a process whose ancestor holds the turn
+        // is inside that turn, as a quiet claim inside a held one is, and takes it with no wait.
+        // Every other heavy waiter is weighed whatever `counted` leaves out of a waiter inside
+        // held work: the turn's order is shortest predicted first over all of them, and a heavy
+        // record holds nothing else that could hold this one back.
+        let line = if need.heavy.is_some() && self.record.accounting == crate::Accounting::Holder {
+            procs
+                .as_ref()
+                .map(|p| p.ancestors(self.record.pid))
+                .unwrap_or_default()
         } else {
-            counted(records, self.record.pid, procs.as_ref(), reading.available)
+            Vec::new()
         };
+        if need.heavy.is_some()
+            && theirs.iter().any(|r| {
+                r.held.is_some() && r.need.heavy.is_some() && kin_of(r, self.record.pid, &line)
+            })
+        {
+            need.to_mut().heavy = None;
+        }
+        // Before `counted` leaves any out, over every claim this look read, its own among them, as
+        // every other look reads them: a holder that holds a claim this look leaves out lives on
+        // past the end of each other claim it holds, each tree is rooted at every claim's holder,
+        // and each waiter stands as its own look stands it (`memory_turn`'s OWN LOOK).
+        let LookRead {
+            counted: mut records,
+            used,
+            wide,
+        } = look_read(
+            &scanned.iter().collect::<Vec<_>>(),
+            &self.record,
+            procs.as_ref(),
+            &reading,
+        );
+        if need.heavy.is_some() && self.record.accounting != crate::Accounting::CohortOwned {
+            for r in theirs
+                .iter()
+                .copied()
+                .filter(|r| r.need.heavy.is_some() && !kin_of(r, self.record.pid, &line))
+            {
+                if !records.iter().any(|k| k.order() == r.order()) {
+                    records.push(r);
+                }
+            }
+        }
+        let funded = procs.as_ref().and_then(|procs| {
+            funded_lead_reservation(&self.record, &theirs, procs, &wide, reading.available)
+        });
         // A cold release slice holds memory ALONE while it learns its unit peaks. `Now` may
         // oversubscribe ordinary work, but letting unrelated work through this exclusion both
         // breaks the memory bound and can deadlock when that work next asks for the release's
@@ -3729,8 +4973,7 @@ impl Waiter {
                     && (!record.need.leads, record.need.rank, record.order())
                         < (!need.leads, need.rank, mine)
             });
-        let used = process_use(&records, self.record.pid, procs.as_ref());
-        let others = others(&records, used.claimants, &used.trees);
+        let others = others(&records, used.claimants, &used.trees, &used.lines, &wide);
         let mut decided = decide(&need, mine, &reading, &others, now);
         let mut loaded = None;
         if measured {
@@ -3882,6 +5125,8 @@ impl Waiter {
         {
             self.record.need.lead_reservation = Some(reservation);
         }
+        let seen =
+            crate::admission_log::Seen::of(reading.available, &others, decided.as_ref().err());
         Ok(Found {
             cores,
             decided,
@@ -3893,6 +5138,7 @@ impl Waiter {
             spent,
             next,
             now,
+            seen,
             procs,
             waits,
         })
@@ -3926,6 +5172,7 @@ impl Waiter {
             stuck_looks,
             stuck,
             cpu_point,
+            looks,
         } = self;
         let actual_admitted_ms = aterm_time::unix_millis();
         let held = Held {
@@ -3969,6 +5216,7 @@ impl Waiter {
                     short: None,
                     entry_custody: true,
                     spent,
+                    looks: looks.admitted(forced_now),
                 };
                 let checked = match claim.record.need.at_bound {
                     crate::AtBound::RunLoaded => claim.timing_protection().map(drop),
@@ -3996,6 +5244,7 @@ impl Waiter {
                     stuck_looks,
                     stuck,
                     cpu_point,
+                    looks,
                 },
                 Shortfall::only(Short::Ledger(e.to_string())),
             ),
@@ -4043,11 +5292,21 @@ impl Waiter {
         }
         let turn = match self.ledger.try_turn().map_err(Error::Ledger)? {
             Ok(turn) => turn,
-            Err(holder) => {
-                return Ok(Forced::Turn(self, Shortfall::only(Short::Turn { holder })));
-            }
+            Err(holder) => return Ok(self.unread_forced(Short::Turn { holder })),
         };
-        let found = self.look(machine, None).map_err(Error::Ledger)?;
+        let mut found = self.look(machine, None).map_err(Error::Ledger)?;
+        let before = crate::admission_log::Before::of(&self);
+        let seen = std::mem::take(&mut found.seen);
+        let mut forced = self.forced_by(found);
+        drop(turn);
+        // Its admission-log rows, written with the ledger's lock let go, as a look's are.
+        crate::admission_log::forced(before, &mut forced, &seen);
+        forced
+    }
+
+    /// What a forced look on a ledger that is not cohort-aware decides from what it `found`, in
+    /// its turn ([`Self::force`]).
+    fn forced_by(self, found: Found) -> Result<Forced, Error> {
         if found
             .protected_release_alone
             .as_ref()
@@ -4108,9 +5367,7 @@ impl Waiter {
             Ok((granted, _)) => (granted, None),
             Err(short) => (asked, Some(short)),
         };
-        let polled = self.grant(granted, None, timed, true);
-        drop(turn);
-        match polled {
+        match self.grant(granted, None, timed, true) {
             Polled::Admitted(claim) => Ok(Forced::Admitted(claim, would)),
             Polled::Waiting(_, short) => Err(Error::short_at_once(short)),
             Polled::Gone(e) => Err(Error::Ledger(e)),
@@ -4236,6 +5493,8 @@ struct Found {
     next: bool,
     /// When it looked, unix ms.
     now: u64,
+    /// What its admission-log row says beside its shortfall ([`crate::admission_log::Seen`]).
+    seen: crate::admission_log::Seen,
     /// The processes it read: `None` where it read none (no claim ahead, or no sweep).
     procs: Option<Procs>,
     /// The waits it read in this user's waits, with the processes ([`Machine::waits`]).
@@ -5054,3 +6313,7 @@ mod timing_completion_tests;
 #[cfg(all(test, unix))]
 #[path = "cohort_budget_tests.rs"]
 mod cohort_budget_tests;
+
+#[cfg(all(test, unix))]
+#[path = "admit_comparison_tests.rs"]
+mod comparison_tests;

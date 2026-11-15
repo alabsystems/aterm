@@ -5233,25 +5233,21 @@ impl App {
         }
     }
 
-    /// Open a resolved citation in `wid`.
+    /// Open a resolved citation in `wid`, its caret on the cited line; why it did not open shows
+    /// in `wid` ([`Self::open_path_for_person`]).
     pub(crate) fn open_citation(&mut self, wid: WindowId, target: &crate::path_link::PathTarget) {
-        let opened = crate::native_document_host::path_to_file_uri(&target.path)
-            .map_err(|error| error.to_string())
-            .and_then(|uri| {
-                self.open_document_tab_at(
-                    wid,
-                    crate::native_app::AppKind::Editor,
-                    &uri,
-                    target.line,
-                    target.col,
-                )
-            });
-        if let Err(error) = opened {
-            crate::logging::stderr_line!(
-                "aterm-gui: could not open {} in the editor: {error}",
-                target.shown
-            );
-        }
+        let reveal = target.line.map(|line| {
+            crate::app_documents::DocumentReveal::Line(crate::app_documents::LineReveal {
+                line,
+                col: target.col,
+            })
+        });
+        let _ = self.open_path_for_person(
+            wid,
+            crate::native_app::AppKind::Editor,
+            &target.path,
+            reveal,
+        );
     }
 
     /// `MouseInput` -> when no app is tracking the mouse.

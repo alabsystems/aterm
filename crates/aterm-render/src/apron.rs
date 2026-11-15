@@ -38,6 +38,7 @@ struct ApronKey {
     cursor_style: aterm_core::terminal::CursorStyle,
     cursor_effect_style_override: Option<aterm_core::terminal::CursorStyle>,
     cursor_fill_override: Option<u32>,
+    cursor_keyline_tint: Option<u32>,
     font_epoch: u64,
     cursor_blink_phase: bool,
     renderer_cursor_style_override: Option<aterm_core::terminal::CursorStyle>,
@@ -110,6 +111,7 @@ impl Renderer {
             cursor_style: input.cursor_style,
             cursor_effect_style_override: input.cursor_effect_style_override,
             cursor_fill_override: input.cursor_fill_override,
+            cursor_keyline_tint: input.cursor_keyline_tint,
             font_epoch: self.font_epoch,
             cursor_blink_phase: ap.cursor_col.is_some() && self.cursor_blink_phase,
             renderer_cursor_style_override: ap.cursor_col.and(self.cursor_style_override),
@@ -160,6 +162,7 @@ impl Renderer {
         mi.cursor_style = input.cursor_style;
         mi.cursor_effect_style_override = input.cursor_effect_style_override;
         mi.cursor_fill_override = input.cursor_fill_override;
+        mi.cursor_keyline_tint = input.cursor_keyline_tint;
         mi.cursor_row = 0;
         mi.cursor_col = ap.cursor_col.unwrap_or(0);
         mi.cursor_visible = ap.cursor_col.is_some();

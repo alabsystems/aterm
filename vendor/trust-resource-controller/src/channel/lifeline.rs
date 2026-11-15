@@ -28,7 +28,7 @@ impl Channel {
     pub fn send_read_lifeline(&mut self, fd: BorrowedFd<'_>, deadline: Instant) -> io::Result<()> {
         check_read_pipe(fd)?;
         self.begin()?;
-        let mut byte = [b'R'];
+        let mut byte = *b"R";
         // SAFETY: CMSG_SPACE computes native storage for one descriptor.
         let space = unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as _) as usize };
         let mut control = vec![0usize; space.div_ceil(size_of::<usize>())];
@@ -123,7 +123,7 @@ impl Channel {
                         && (*header).cmsg_type == libc::SCM_RIGHTS
                     {
                         let bytes = length - base;
-                        unexpected |= bytes % size_of::<libc::c_int>() != 0;
+                        unexpected |= !bytes.is_multiple_of(size_of::<libc::c_int>());
                         for index in 0..bytes / size_of::<libc::c_int>() {
                             let raw = libc::CMSG_DATA(header)
                                 .cast::<libc::c_int>()
@@ -138,7 +138,7 @@ impl Channel {
                 }
             }
             if count != 1
-                || byte != [b'R']
+                || byte != *b"R"
                 || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
                 || unexpected
                 || rights.len() != 1

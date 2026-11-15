@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Identity verbs: `auth status`, `auth add`, `auth remove` and `auth import`.
+//! Identity verbs: `auth status`, `auth add` and `auth remove`.
 
 use std::path::Path;
 
@@ -16,8 +16,7 @@ use super::{Answer, Ctx, Outcome, Receipt};
 use crate::client::Meter;
 use crate::config::{ConfigFault, Dirs};
 use crate::error::{Error, Kind, Result};
-use crate::identity::import::{ImportRequest, import_from_gh_metered};
-use crate::identity::provision::{self, AddFrom, AddOptions, AddRequest, Added};
+use crate::identity::provision::{self, AddOptions, AddRequest, Added};
 use crate::identity::vault::Found;
 use crate::identity::{self, tilde};
 use crate::policy::{ChainStep, Presence, Tier};
@@ -37,13 +36,8 @@ fn check_name(name: &str) -> Result<()> {
     }
 }
 
+/// `auth add`'s request.
 fn add_request(inv: &Invocation) -> Result<AddRequest> {
-    request_of(inv, None)
-}
-
-/// `auth add`'s request, or, with `from` given, `auth import`'s, whose token comes from gh
-/// and never from `--file` or `--stdin`.
-fn request_of(inv: &Invocation, from: Option<AddFrom>) -> Result<AddRequest> {
     let usage = |why: &str| inv.usage(why);
     let name = inv.require(0, "NAME")?;
     check_name(name)?;
@@ -57,10 +51,7 @@ fn request_of(inv: &Invocation, from: Option<AddFrom>) -> Result<AddRequest> {
         .flag("--tier")
         .and_then(Tier::parse)
         .ok_or_else(|| usage("--tier wants dev, release or external"))?;
-    let from = match from {
-        Some(from) => from,
-        None => token_source(inv)?,
-    };
+    let file = token_file(inv)?;
     let owners: Vec<String> = inv
         .flag_all("--owner")
         .into_iter()
@@ -79,7 +70,7 @@ fn request_of(inv: &Invocation, from: Option<AddFrom>) -> Result<AddRequest> {
     }
     Ok(AddRequest {
         name: name.to_string(),
-        from,
+        file,
         tier,
         owners,
         write,
@@ -87,70 +78,42 @@ fn request_of(inv: &Invocation, from: Option<AddFrom>) -> Result<AddRequest> {
     })
 }
 
-/// `auth add`'s `--file PATH` (made absolute against the current directory) or `--stdin`.
+/// `auth add`'s `--file PATH`, made absolute against the current directory.
 ///
 /// # Errors
 ///
-/// Usage for both or neither; could_not_run when the current directory cannot be read.
-fn token_source(inv: &Invocation) -> Result<AddFrom> {
-    match (inv.flag("--file"), inv.has("--stdin")) {
-        (Some(_), true) => Err(inv.usage("--file and --stdin contradict each other")),
-        (None, false) => Err(inv.usage("name the token: --file PATH or --stdin")),
-        (None, true) => Ok(AddFrom::Stdin),
-        (Some(path), false) => {
-            let path = Path::new(path);
-            if path.is_absolute() {
-                Ok(AddFrom::File(path.to_path_buf()))
-            } else {
-                let cwd = std::env::current_dir()
-                    .map_err(|e| Error::could_not_run(format!("the current directory: {e}")))?;
-                Ok(AddFrom::File(cwd.join(path)))
-            }
-        }
+/// Usage without it; could_not_run when the current directory cannot be read.
+fn token_file(inv: &Invocation) -> Result<std::path::PathBuf> {
+    let Some(path) = inv.flag("--file") else {
+        return Err(inv.usage(
+            "name the token: --file ~/.secrets/NAME names the vault entry NAME in this Mac's \
+             store, or --file PATH a token file of your own",
+        ));
+    };
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
     }
+    let cwd = std::env::current_dir()
+        .map_err(|e| Error::could_not_run(format!("the current directory: {e}")))?;
+    Ok(cwd.join(path))
 }
 
-fn stdin_next(req: &AddRequest) -> String {
-    let mut next = format!(
-        "agh auth add {} --stdin --tier {}",
-        req.name,
-        req.tier.slug()
-    );
-    for owner in &req.owners {
-        next.push_str(" --owner ");
-        next.push_str(owner);
-    }
-    if req.write {
-        next.push_str(" --write");
-    }
-    if req.drafts {
-        next.push_str(" --drafts");
-    }
-    next.push_str(" < FILE");
-    next
-}
-
-/// `agh auth add NAME (--file PATH | --stdin) --tier T [--owner O]… [--write [--drafts]]
-/// [--legacy-loose]`: an agent provisions as a person does, with or without a terminal.
+/// `agh auth add NAME --file PATH --tier T [--owner O]… [--write [--drafts]]
+/// [--legacy-loose]`: routes the vault entry `~/.secrets/ENTRY` names (read in place from the
+/// store), or a token file of the person's own at PATH, as profile NAME.
 ///
 /// # Errors
 ///
-/// Usage for its arguments, and for `--stdin` from a terminal, which would show the token as it
-/// is typed; `provision::add_with`'s errors.
+/// Usage for its arguments; `provision::add_with`'s errors.
 pub(crate) fn auth_add(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let req = add_request(inv)?;
-    if cfg!(unix) && req.from == AddFrom::Stdin && ctx.stdin_is_terminal {
-        return Err(Error::usage(
-            "--stdin reads the token from a pipe or a file, never from a terminal, which would show it as it is typed",
-        )
-        .with_next(stdin_next(&req)));
-    }
     let options = AddOptions::default().legacy_loose(inv.has("--legacy-loose"));
     let dirs = provisioning_dirs(ctx)?;
     // Provisioning never adopts: a vault token adoption refuses or leaves out never stops an
     // agent from writing the agh.toml that routes past it.
     let gh = ctx.provisioning_client();
-    let (added, meter) = provision::add_with_metered(&gh, &dirs, &req, options, &mut *ctx.stdin)?;
+    let (added, meter) = provision::add_with_metered(&gh, &dirs, &req, options)?;
     let mut outcome = added_outcome(ctx, inv, &dirs, &req, &added, &meter);
     if options.legacy_loose {
         strict_presence(ctx, &dirs, &req, &added, &mut outcome);
@@ -163,12 +126,8 @@ pub(crate) fn auth_add(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 /// file strictly. A loose file is `unusable` there, with its why and remedy, and the add's
 /// answer says so rather than `present`.
 fn strict_presence(ctx: &Ctx, dirs: &Dirs, req: &AddRequest, added: &Added, outcome: &mut Outcome) {
-    let profile = identity::Profile::new(
-        added.profile.as_str(),
-        identity::Source::File(added.token_file.clone()),
-        req.tier,
-    );
-    let row = profile_row(&profile, &*ctx.env, &dirs.home, &ctx.redactor, FROM_CONFIG);
+    let profile = identity::Profile::new(added.profile.as_str(), added.source.clone(), req.tier);
+    let row = profile_row(&profile, &dirs.home, &ctx.redactor, FROM_CONFIG);
     if let Answer::Object { value, .. } = &mut outcome.answer
         && let Some(fields) = value.as_object_mut()
     {
@@ -189,7 +148,7 @@ fn provisioning_dirs(ctx: &Ctx) -> Result<Dirs> {
         .ok_or_else(|| Error::could_not_run("no config directory: agh cannot provision here"))
 }
 
-/// `auth add`'s and `auth import`'s answer: the new profile as an Identity object, with the
+/// `auth add`'s answer: the new profile as an Identity object, with the
 /// receipt of the `GET /user` that bound it.
 fn added_outcome(
     ctx: &Ctx,
@@ -209,7 +168,7 @@ fn added_outcome(
         "presence": "present",
         "profile": added.profile.as_str(),
         "remedy": null,
-        "source": text(&format!("file:{}", tilde(&added.token_file, &dirs.home))),
+        "source": text(&identity::source_text(&added.source, &dirs.home)),
         "tier": req.tier.slug(),
         "why": null,
     });
@@ -237,7 +196,6 @@ pub(crate) fn auth_remove(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         "joins_vault": removed.joins_vault,
         "owners_edited": removed.owners_edited,
         "profile": removed.profile.as_str(),
-        "token_file_deleted": removed.token_file_deleted,
     });
     Ok(Outcome {
         answer: Answer::Object {
@@ -301,15 +259,9 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             let mut named: Vec<_> = validated.profiles().values().collect();
             named.sort_unstable_by(|a, b| a.name.cmp(&b.name));
             for profile in named {
-                profiles.push(profile_row(
-                    profile,
-                    &*ctx.env,
-                    &home,
-                    &ctx.redactor,
-                    FROM_CONFIG,
-                ));
+                profiles.push(profile_row(profile, &home, &ctx.redactor, FROM_CONFIG));
             }
-            unusable = referenced_unusable(&validated, &*ctx.env, &home);
+            unusable = referenced_unusable(&validated, &home);
             validated.joins_vault()
         }
     };
@@ -318,7 +270,7 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     }
     let adoption = joins_vault.then_some(ctx.adoption.as_ref()).flatten();
     if let Some(adoption) = adoption {
-        profiles.extend(vault_rows(adoption, &*ctx.env, &home, &ctx.redactor));
+        profiles.extend(vault_rows(adoption, &home, &ctx.redactor));
         profiles.sort_unstable_by(|a, b| {
             a.get("profile")
                 .and_then(Value::as_str)
@@ -392,7 +344,6 @@ pub(crate) fn auth_status(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
 
 fn referenced_unusable(
     validated: &crate::config::Validated,
-    env: &dyn identity::EnvSource,
     home: &Path,
 ) -> Option<(String, &'static str, Option<String>)> {
     let mut referenced: Vec<&str> = Vec::new();
@@ -416,50 +367,10 @@ fn referenced_unusable(
     referenced.dedup();
     referenced.into_iter().find_map(|name| {
         let profile = validated.profiles().get(name)?;
-        let error = identity::load(profile, env).err()?;
+        let error = identity::load(profile).err()?;
         match error.presence() {
             Presence::Unusable(slug) => Some((name.to_string(), slug, error.remedy(profile, home))),
             Presence::Present | Presence::Absent => None,
         }
     })
-}
-
-/// Whether `login` is a GitHub login as `--user` takes one: 1-39 ASCII letters, digits and
-/// hyphens.
-fn is_login(login: &str) -> bool {
-    (1..=39).contains(&login.len())
-        && login
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-
-/// `agh auth import NAME --from-gh [--user LOGIN] --tier T [--owner O]… [--write [--drafts]]`:
-/// a profile from gh's stored login, provisioned as `auth add --stdin` provisions one, with
-/// or without a terminal. It reads no stdin, so `--stdin`'s
-/// terminal check does not apply. Its answer is `auth add`'s. Its row declares neither
-/// `--file` nor `--stdin`, so the parser refuses either as an unknown flag before this runs.
-///
-/// # Errors
-///
-/// Usage for its arguments; `identity::import::import_from_gh`'s errors.
-pub(crate) fn auth_import(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
-    if !inv.has("--from-gh") {
-        return Err(inv.usage("auth import takes its token from gh: add --from-gh"));
-    }
-    let user = match inv.flag("--user") {
-        Some(login) if is_login(login) => Some(login.to_string()),
-        Some(_) => {
-            return Err(inv.usage("--user wants a GitHub login: 1-39 letters, digits or hyphens"));
-        }
-        None => None,
-    };
-    let req = ImportRequest {
-        user,
-        add: request_of(inv, Some(AddFrom::Stdin))?,
-    };
-    let dirs = provisioning_dirs(ctx)?;
-    let gh = ctx.provisioning_client();
-    let (added, meter) =
-        import_from_gh_metered(&gh, &dirs, &*ctx.env, &req, AddOptions::default())?;
-    Ok(added_outcome(ctx, inv, &dirs, &req.add, &added, &meter))
 }

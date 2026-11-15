@@ -1678,6 +1678,79 @@ fn disabled_native_command_is_visible_but_inert() {
     );
 }
 
+/// Over Settings ▸ This Mac the palette holds Settings' Undo Last Change (the undo of a settings
+/// edit, Cmd-Z) and the page's Undo Last Rename as two rows, each once, with distinct labels and
+/// actions, and only Settings' carries a key. The page's row, activated by the person, reaches
+/// the host as the rename's undo (answered, with no writer in this process, on the page's
+/// notice).
+/// NEGATIVE CONTROL: the words of the page's row filter Settings' row out, so the row activated
+/// is the page's.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_palette_tells_this_macs_undo_from_settings_undo() {
+    use crate::machine_title::page::fixture::{Names, found, named, rename};
+    use aterm_types::machine_name::Class;
+    const SETTINGS_UNDO: &str = "settings/undo";
+    const RENAME_UNDO: &str = "name/press/undo";
+    let scratch = named(Class::Chosen, 7, "Heron");
+    rename(&scratch, Class::Chosen, 8, "Puffin");
+    let names = Names::authorized(Ok(true));
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Machine));
+    let seq = app.machine_page.reads;
+    app.machine_page_read(seq, found(&scratch, &[], &names));
+    // The label of `action`'s one row, and whether it carries a key.
+    let row = |app: &App, action: &str| {
+        let lines = app.windows[&wid].palette().unwrap().controls_lines();
+        let named = format!(" action={action} ");
+        let rows: Vec<&String> = lines.iter().filter(|line| line.contains(&named)).collect();
+        let [row] = rows.as_slice() else {
+            return None;
+        };
+        let (_, rest) = row.split_once(" label=")?;
+        let (label, _) = rest.split_once(" target=")?;
+        Some((label.to_owned(), !row.contains(" accel=\"\" ")))
+    };
+
+    app.palette_enter();
+    filter(&mut app, "Undo Last");
+    let settings = row(&app, SETTINGS_UNDO).expect("Settings' undo is one row");
+    let renames = row(&app, RENAME_UNDO).expect("the rename's undo is one row");
+    assert_ne!(settings.0, renames.0);
+    assert!(settings.1, "Settings' undo carries its key");
+    assert!(!renames.1, "the rename's undo carries none");
+
+    // Its own label, as the palette quotes it, without the quotes.
+    let words = renames.0.trim_matches('"').to_owned();
+    app.palette_exit();
+    app.palette_enter();
+    filter(&mut app, &words);
+    assert_eq!(
+        row(&app, SETTINGS_UNDO),
+        None,
+        "control: the page's words name no Settings undo"
+    );
+    assert_eq!(row(&app, RENAME_UNDO), Some(renames));
+    let Some(crate::palette::PaletteTarget::Native(target)) = app.windows[&wid]
+        .palette()
+        .and_then(crate::palette::PaletteState::selected_target)
+    else {
+        panic!("the rename's undo is available and selected");
+    };
+    assert_eq!(target.action.as_str(), RENAME_UNDO);
+    assert_eq!(app.machine_page.state.notice, None);
+    app.palette_activate();
+    assert_eq!(
+        app.machine_page.state.notice,
+        Some(format!(
+            "Last attempt: {}",
+            crate::machine_title::page::NO_WRITER
+        )),
+        "the rename's undo reached the host"
+    );
+}
+
 #[test]
 fn copy_enablement_uses_native_selection_and_never_the_hidden_terminal() {
     use crate::menu::{menu_live, set_menu_live};

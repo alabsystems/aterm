@@ -211,6 +211,9 @@ pub enum Verb {
     Members,
     /// `aterm db` — embedded replicated application databases, offline and LAN.
     Db,
+    /// `aterm file` — the lab's shared files: tables every member reads from a local snapshot
+    /// (docs/DESIGN-shared-files-2026-11-11.md §3).
+    File,
     /// `aterm email` — read configured mail accounts without opening a window.
     Email,
     /// `aterm harness` — Claude Code harness read views, accounts roster, and live upgrade.
@@ -257,6 +260,7 @@ impl Verb {
         Verb::Secrets,
         Verb::Members,
         Verb::Db,
+        Verb::File,
         Verb::Email,
         Verb::Harness,
         Verb::Keeper,
@@ -294,6 +298,7 @@ impl Verb {
             Verb::Secrets => "secrets",
             Verb::Members => "members",
             Verb::Db => "db",
+            Verb::File => "file",
             Verb::Email => "email",
             Verb::Harness => "harness",
             Verb::Keeper => "keeper",
@@ -335,6 +340,7 @@ impl Verb {
             | Verb::Secrets
             | Verb::Members
             | Verb::Db
+            | Verb::File
             | Verb::Email
             | Verb::Harness
             | Verb::Keeper
@@ -355,7 +361,7 @@ impl Verb {
             Verb::Agh => "aterm agh <args>",
             Verb::Fleet => "aterm fleet <args>",
             Verb::Name => {
-                "aterm name [sync | set <mN> [--nick <word>] | nick <word>|--random] [--dry-run] [--json]"
+                "aterm name [sync | set <mN> [--nick <word>] | nick <word>|--random | undo | history] [--dry-run] [--json]"
             }
             Verb::Node => "aterm node [<cmd>]",
             Verb::Drive => "aterm drive <args>",
@@ -374,6 +380,7 @@ impl Verb {
             Verb::Secrets => "aterm secrets [<cmd>]",
             Verb::Members => "aterm members <cmd>",
             Verb::Db => "aterm db <cmd> --dir <database>",
+            Verb::File => "aterm file <cmd> [<name>] [--json]",
             Verb::Email => "aterm email <cmd>",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
@@ -427,9 +434,10 @@ impl Verb {
             Verb::Name => &[
                 "This machine's numeric ID and display name, made",
                 "by the first read; `set` chooses its ID and name,",
-                "`nick` changes its name; `sync` aligns macOS",
-                "with the saved name without choosing another.",
-                "`--json` gives one object. Unix only.",
+                "`nick` changes its name; `undo` takes back the",
+                "last change and `history` lists the changes;",
+                "`sync` aligns macOS with the saved name without",
+                "choosing another. `--json` prints JSON. Unix only.",
             ],
             Verb::Node => &[
                 "The windowless fleet and Commons job: answers",
@@ -496,6 +504,13 @@ impl Verb {
                 "fleet, tools, repositories and agents, each with",
                 "its next step and who takes it (aterm, an agent",
                 "or a person). Reads only; Unix only.",
+            ],
+            Verb::File => &[
+                "The lab's shared files (ai/accounts, ai/links,",
+                "lab/machines): tables read from this machine's",
+                "snapshot, each answer with its state (ls | cat |",
+                "path | status | get | rows | watch | history |",
+                "refresh). Unix only.",
             ],
             Verb::Email => &[
                 "Read mail without a window (accounts | folders |",

@@ -105,14 +105,14 @@ pub(crate) fn fronts_claimant(program: Option<&str>) -> bool {
 /// Return `Some("self")` when a proven self-claim answers `wall` by itself under `policy`.
 #[must_use]
 pub(crate) fn wall_answer(
-    kind: aterm_phase::WallKind,
+    kind: alab_policy::vocab::WallKind,
     has_reset: bool,
     policy: &aterm_agent::supervise::SupervisorConfig,
     effective: bool,
 ) -> aterm_messages::presence::WallAnswer {
+    use alab_policy::vocab::WallKind;
     use aterm_agent::supervise::policy::outlook::{Answer, answer};
     use aterm_messages::presence::WallAnswer;
-    use aterm_phase::WallKind;
     if !effective
         || !policy.resume_limits
         || !matches!(kind, WallKind::UsageSession | WallKind::UsageWeekly)

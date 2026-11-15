@@ -353,7 +353,7 @@ impl Row {
                 _ => row.extra.push((key.to_owned(), encode(&decode(value)))),
             }
         }
-        row.sid = sid.filter(|sid| is_sid(sid)).ok_or("no sid= of s-<hex>")?;
+        row.sid = sid.filter(|sid| is_sid(sid)).ok_or("no sid= of a tab id")?;
         row.state = state
             .filter(|state| valid_word(state))
             .ok_or("no state= word")?;
@@ -2130,13 +2130,12 @@ fn seen_sid(row: &str) -> Option<&str> {
         .filter(|sid| is_sid(sid))
 }
 
-/// Whether `word` is a global session id: `s-` and 1-62 hex digits.
+/// Whether `word` is a global session id, as the wire reads one
+/// ([`aterm_types::control_request::Sid::parse`]): a tab ID (`tqn5r6e0148`), or `s-` and hex
+/// digits, the form a tab opened before the `t` form keeps until it closes; 64 bytes at most.
 #[must_use]
 pub fn is_sid(word: &str) -> bool {
-    word.len() <= 64
-        && word
-            .strip_prefix("s-")
-            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    word.len() <= 64 && aterm_types::control_request::Sid::parse(word).is_some()
 }
 
 /// This Mac's host name, as a board names its own Mac.

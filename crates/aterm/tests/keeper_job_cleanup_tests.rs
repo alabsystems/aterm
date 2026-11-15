@@ -36,6 +36,20 @@ impl Job {
         aterm_uds::deadline::prints(&mut job.child, "keeper cleanup ready", HANG);
         job
     }
+
+    fn finish_failed_helper(
+        &mut self,
+        remove: impl FnOnce(&str) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        aterm_uds::deadline::kill_within(&mut self.child, HANG);
+        if self.child.try_wait()?.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "cleanup helper did not exit; direct removal was not attempted",
+            ));
+        }
+        remove(&self.label)
+    }
 }
 
 impl Drop for Job {
@@ -43,8 +57,7 @@ impl Drop for Job {
         drop(self.child.stdin.take());
         let ended = aterm_spec::wait::within(HANG, GAP, || self.child.try_wait().ok().flatten());
         if !ended.is_some_and(|status| status.success()) {
-            let removed = remove_job(&self.label);
-            aterm_uds::deadline::kill_within(&mut self.child, HANG);
+            let removed = self.finish_failed_helper(remove_job);
             eprintln!("keeper cleanup helper failed; direct removal: {removed:?}");
         }
     }
@@ -103,7 +116,7 @@ struct Owner {
 impl Drop for Owner {
     fn drop(&mut self) {
         aterm_uds::deadline::kill_within(&mut self.child, HANG);
-        let _ = aterm_keeper::job::remove(&self.label);
+        let _ = remove_job(&self.label);
     }
 }
 
@@ -198,6 +211,40 @@ fn a_failed_cleanup_helper_still_removes_the_job_on_normal_drop() {
     aterm_spec::wait::within(HANG, GAP, || job.child.try_wait().unwrap())
         .expect("the killed cleanup helper must exit");
     drop(job);
+    assert_eq!(
+        aterm_keeper::job::state(&label).unwrap(),
+        aterm_keeper::job::JobState::Absent
+    );
+}
+
+#[test]
+fn a_live_cleanup_helper_is_reaped_before_direct_removal() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let label = job_label("live-helper-fallback");
+    let mut job = Job::new(&label);
+    aterm_keeper::job::submit(
+        &label,
+        "/bin/sleep",
+        &["600"],
+        &world.path().join("job.log"),
+    )
+    .unwrap();
+    let pid = i32::try_from(job.child.id()).unwrap();
+    assert_eq!(
+        aterm_uds::process::process_presence(pid),
+        aterm_uds::process::ProcessPresence::Present
+    );
+    // Enter the timeout fallback with a ready helper still held at its input pipe.
+    // Observe the real process at the first direct removal, without waiting a minute.
+    job.finish_failed_helper(|label| {
+        assert_eq!(
+            aterm_uds::process::process_presence(pid),
+            aterm_uds::process::ProcessPresence::Absent,
+            "the failed helper must be reaped before direct cleanup can start"
+        );
+        remove_job(label)
+    })
+    .unwrap();
     assert_eq!(
         aterm_keeper::job::state(&label).unwrap(),
         aterm_keeper::job::JobState::Absent

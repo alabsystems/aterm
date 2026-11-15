@@ -5,7 +5,7 @@ use super::*;
 
 pub(super) fn caller() -> Caller {
     Caller {
-        sid: "s-slot-fixture".into(),
+        sid: "t10tfjxtvre".into(),
         pid: 42,
         birth: 123,
     }
@@ -43,7 +43,7 @@ pub(super) fn fixture(key: bool) -> (aterm_tempfile::TempDir, Env) {
         codex_login: None,
         agy_conversation: None,
         now: 1_790_000_000,
-        sid: "s-slot-fixture".into(),
+        sid: "t10tfjxtvre".into(),
         sock: None,
         config: None,
         claude_tmp: None,
@@ -122,7 +122,7 @@ fn slot_keys_bind_full_process_lineage_and_are_bounded_utf8_keys() {
     assert!(key.len() <= 256 && key.len().is_multiple_of(2) && hex(&key, key.len()));
     for alternate in [
         Caller {
-            sid: "s-other".into(),
+            sid: "t000000ther".into(),
             ..base.clone()
         },
         Caller {

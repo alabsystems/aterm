@@ -19,10 +19,6 @@ fn scripted(token: &[u8]) -> (agh::Github, Arc<ScriptedTransport>) {
 
 #[test]
 fn agh_identity_is_private_and_the_authenticated_read_keeps_pagination_headers() {
-    let source = AdmittedToken(Secret::new(TOKEN).unwrap());
-    assert!(source.var_os("GH_TOKEN").is_none());
-    assert!(source.var_os("GITHUB_TOKEN").is_none());
-    assert!(source.var_os("HTTPS_PROXY").is_none());
     let (client, transport) = scripted(TOKEN);
     transport.answer(
         200,
@@ -68,9 +64,9 @@ fn malformed_or_refresh_credentials_fail_before_any_network_or_anonymous_fallbac
         b"ghr_123456789012345678901234567890", // gitleaks:allow
         b"fixture development token only",
     ] {
-        let (client, transport) = scripted(token);
-        assert!(read_with(&client, "/user").is_err());
-        assert!(transport.requests().is_empty());
+        let secret = Secret::new(token).unwrap();
+        assert!(client(&secret).is_err(), "no client carries it");
+        assert!(read(&secret, "/user").is_err(), "so no read is sent");
     }
 }
 

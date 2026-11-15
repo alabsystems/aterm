@@ -568,7 +568,7 @@ fn a_successor_settles_its_predecessors_left_line_at_its_first_look() {
 /// goes on to weigh the carry, which only the composer's own guard keeps off the line.
 #[test]
 fn a_wakes_line_is_the_breaks_one_line_and_cruise_carries_nothing_over_it() {
-    use crate::supervise::policy::cruise_carry::{BACKGROUND_CARRY, RULE_BACKGROUND};
+    use alab_policy::cruise_carry::{BACKGROUND_CARRY, RULE_BACKGROUND};
     let line = job_line(1, T0 + MIN, None);
     let run_at = |tag: &str, wake: bool, left: bool, at_s: &[i64]| {
         let host = if wake {
@@ -584,8 +584,11 @@ fn a_wakes_line_is_the_breaks_one_line_and_cruise_carries_nothing_over_it() {
         };
         Script {
             policy: SupervisorConfig {
-                autopilot: Autopilot::Cruise,
                 continue_policy: true,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Cruise,
+                    ..policy(Occupancy::Prompt).turn_end.clone()
+                },
                 ..policy(Occupancy::Prompt)
             },
             host,

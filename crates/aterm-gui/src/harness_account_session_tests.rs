@@ -9,6 +9,7 @@ fn write_session(state: &aterm_spec::interp::State) -> [i64; 4] {
     let look = AccountLook {
         screen_wall: None,
         profile_env: Vec::new(),
+        token_served: ServedToken::Unnamed(None),
         who: accounts::ProcessLogin::of_env([]),
         label: Some("work-2".into()),
         snap: observed.clone(),

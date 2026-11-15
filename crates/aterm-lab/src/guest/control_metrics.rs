@@ -56,10 +56,7 @@ fn collect(
         let mut fields = line.split_whitespace();
         fields.next()?.parse::<u64>().ok()?;
         let sid = fields.next()?;
-        (sid.starts_with("s-")
-            && (1..=62).contains(&sid[2..].len())
-            && sid[2..].bytes().all(|b| b.is_ascii_hexdigit()))
-        .then_some(sid)
+        aterm_types::tab_id::is_tab_id(sid).then_some(sid)
     });
     let sid = sid.ok_or("no session belonging to the connected GUI")?;
     let metrics = client

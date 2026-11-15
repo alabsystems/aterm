@@ -34,12 +34,18 @@ pub const RELEASE_ROSTER_REL: &str = ".aterm/release-ring/roster/aterm-machines.
 /// Anchor file path relative to the workspace root.
 pub const PINS_REL: &str = "crates/aterm-update-core/src/pins.rs";
 
+/// How a `setup` that stored its phrase but armed nothing starts over: the vault's phrase goes
+/// first, since `setup` never replaces one.
+pub const SETUP_START_OVER: &str = "`aterm secrets unset release-paper-master` on the vault's \
+     admin Mac, fix the problem above, and run `atpkg-keys setup` again; it generates a \
+     different master.";
+
 /// Provisioning verb being executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
     /// First machine: generate the master and arm the anchor.
     Setup,
-    /// Later machine (or re-run): verify the typed master and add or rotate this machine.
+    /// Later machine (or re-run): verify the vault's master and add or rotate this machine.
     Join,
 }
 
@@ -221,11 +227,11 @@ pub fn load_roster(
             concat(&[
                 "the existing roster at ",
                 path,
-                " does not verify under the master you typed (",
+                " does not verify under the vault's master (",
                 &reject_name(&e),
-                "). Either a character of the phrase is wrong — check the fingerprint \
-                 above against your paper — or that roster was signed by a different \
-                 master. Nothing has been written.",
+                "). Either the vault's release-paper-master is another master's phrase \
+                 — check the fingerprint above against the pinned one — or that roster \
+                 was signed by a different master. Nothing has been written.",
             ])
         })?;
     let roster = Roster::parse(&verified).map_err(|e| {
@@ -839,18 +845,18 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
 
     match verb {
         Verb::Setup => {
-            // A second master is not an additional authority but a replacement for one
-            // that exists only on paper.
+            // A second master is not an additional authority but a replacement for the one
+            // the vault holds.
             if !master.members.is_empty() {
                 return Err(concat(&[
                     "a paper master is ALREADY committed in ",
                     &paths.pins,
                     " (pins::PAPER_MASTER_PUBKEYS names ",
                     &master.members.len().to_string(),
-                    " key(s)). `setup` would generate a SECOND master and strand the first \
-                     — whose secret half is on paper and exists nowhere else. Use \
-                     `atpkg-keys join --id <id>` instead: it proves the phrase you already \
-                     wrote down and mints this machine under the master you already have.",
+                    " key(s)). `setup` would generate a SECOND master and strand the first, \
+                     whose phrase the vault holds as release-paper-master. Use \
+                     `atpkg-keys join --id <id>` instead: it proves the vault's phrase and \
+                     mints this machine under the master you already have.",
                 ]));
             }
             if !paths.pins_explicit && !aterm_update_core::pins::PAPER_MASTER_PUBKEYS.is_empty() {
@@ -879,7 +885,7 @@ pub fn preflight(verb: Verb, id: &str, paths: &Paths) -> Result<Preflight, Strin
                     "no paper master is committed in ",
                     &paths.pins,
                     " (pins::PAPER_MASTER_PUBKEYS is empty), so there is nothing for \
-                     `join` to prove your phrase against. Run `atpkg-keys setup --id <id>` \
+                     `join` to prove the vault's phrase against. Run `atpkg-keys setup --id <id>` \
                      on the first machine, commit the anchor it writes, and join from \
                      there.",
                 ]));
@@ -937,13 +943,11 @@ pub fn verify_master(pre: &Preflight, seed: &MasterSeed) -> Result<(), String> {
         return Ok(());
     }
     Err(concat(&[
-        "the phrase you typed derives the master ",
+        "the vault's release-paper-master derives the master ",
         &derived,
         ", which is NOT the master committed in ",
         &pre.paths.pins,
-        ". Either a character of the phrase is wrong — compare the fingerprint printed \
-         above against the one on your paper — or this is a different master entirely. \
-         Nothing has been written.",
+        ". Nothing has been written.",
     ]))
 }
 
@@ -1030,10 +1034,10 @@ pub fn plan(pre: Preflight, seed: &MasterSeed, now: u64) -> Result<Planned, Stri
     if pre.verb == Verb::Setup {
         let date = today(now);
         let comment = [
-            "The PAPER MASTER — the offline root of the machine roster, armed by",
+            "The PAPER MASTER — the root of the machine roster, armed by",
             concat(&["`atpkg-keys setup --id ", &pre.id, "` on ", &date, "."]).as_str(),
-            "Its secret half is 52 base32 characters ON PAPER and exists on no",
-            "computer. It signs aterm-machines.toml and nothing else.",
+            "Its secret half is a 52-character base32 phrase, the vault entry",
+            "release-paper-master. It signs aterm-machines.toml and nothing else.",
         ]
         .map(str::to_string);
         let refs: Vec<&str> = comment.iter().map(String::as_str).collect();
@@ -1231,12 +1235,7 @@ impl std::fmt::Debug for Report {
 pub fn write_rest(mut planned: Planned) -> Result<Report, String> {
     let armed = planned.pins_text.is_some();
     let pins = &planned.paths.pins;
-    let start_over = concat(&[
-        "`git checkout -- ",
-        pins,
-        "`, destroy the paper you just wrote, fix the problem above, and run `atpkg-keys \
-         setup` again.",
-    ]);
+    let start_over = concat(&["`git checkout -- ", pins, "`, ", SETUP_START_OVER]);
     let when_armed = |text: &[&str]| if armed { concat(text) } else { String::new() };
     let armed_only = when_armed(&[
         " The anchor is armed but nothing else was written: ",

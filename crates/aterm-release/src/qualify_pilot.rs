@@ -11,6 +11,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "qualify_pilot_resume.rs"]
+mod resume;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Options {
     verify: PathBuf,
@@ -26,6 +29,8 @@ pub(crate) struct Options {
     build_return: BuildReturn,
     queued_tree_share: QueuedTreeShare,
     cores: Option<u32>,
+    resume: Option<PathBuf>,
+    seed_from: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,6 +43,7 @@ enum QueuedTreeShare {
     LendingMatched,
     Compare,
     LendingCompare,
+    HistoricalLendingMatched,
 }
 
 impl QueuedTreeShare {
@@ -50,6 +56,7 @@ impl QueuedTreeShare {
             Self::LendingMatched => "lend-matched",
             Self::Compare => "compare",
             Self::LendingCompare => "lend-compare",
+            Self::HistoricalLendingMatched => "historical-lend",
         }
     }
 
@@ -66,6 +73,12 @@ impl QueuedTreeShare {
                 "current" => Self::Resume,
                 "lent" => Self::Lend,
                 _ => unreachable!("lending comparison requires a named policy take"),
+            }
+        } else if self == Self::HistoricalLendingMatched {
+            match take {
+                "before" | "warmup" => Self::Retained,
+                "after" => Self::Lend,
+                _ => unreachable!("historical lending requires a named policy take"),
             }
         } else if self == Self::LendingMatched {
             match take {
@@ -295,6 +308,8 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
     let mut build_return = None;
     let mut queued_tree_share = None;
     let mut cores = None;
+    let mut resume = None;
+    let mut seed_from = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
@@ -309,6 +324,7 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
                             | "lend-matched"
                             | "compare"
                             | "lend-compare"
+                            | "historical-lend"
                     ) =>
             {
                 queued_tree_share = Some(match value.as_str() {
@@ -318,6 +334,7 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
                     "matched" => QueuedTreeShare::Matched,
                     "lend-matched" => QueuedTreeShare::LendingMatched,
                     "lend-compare" => QueuedTreeShare::LendingCompare,
+                    "historical-lend" => QueuedTreeShare::HistoricalLendingMatched,
                     _ => QueuedTreeShare::Compare,
                 });
             }
@@ -352,6 +369,8 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
             }
             "--verify" if verify.is_none() => verify = Some(PathBuf::from(value)),
             "--before-verify" if before.is_none() => before = Some(PathBuf::from(value)),
+            "--resume" if resume.is_none() => resume = Some(PathBuf::from(value)),
+            "--seed-from" if seed_from.is_none() => seed_from = Some(PathBuf::from(value)),
             "--tree-work"
                 if tree_work.is_none() && matches!(value.as_str(), "compile-lint" | "release") =>
             {
@@ -401,6 +420,8 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
         build_return: build_return.unwrap_or_default(),
         queued_tree_share: queued_tree_share.unwrap_or_default(),
         cores,
+        resume,
+        seed_from,
     };
     if matches!(options.mode.as_str(), "series" | "matched") != options.before.is_some() {
         return Err("series and matched require --before-verify PATH".into());
@@ -417,7 +438,9 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
     }
     if matches!(
         options.queued_tree_share,
-        QueuedTreeShare::Compare | QueuedTreeShare::LendingCompare
+        QueuedTreeShare::Compare
+            | QueuedTreeShare::LendingCompare
+            | QueuedTreeShare::HistoricalLendingMatched
     ) && (options.mode != "matched" || options.build_return != BuildReturn::Early)
     {
         return Err("queued-tree comparison requires matched mode and early build return".into());
@@ -454,6 +477,14 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
     }
     if options.cold_tree && (!options.real_export || options.mode == "export") {
         return Err("a cold native tree requires the full real local workload".into());
+    }
+    if (options.resume.is_some() || options.seed_from.is_some())
+        && (!options.real_export || options.mode != "matched")
+    {
+        return Err("resume and seed-from require a matched full real gate".into());
+    }
+    if options.resume.is_some() && options.seed_from.is_some() {
+        return Err("resume already binds its frozen history seed".into());
     }
     Ok(options)
 }
@@ -506,6 +537,8 @@ impl Options {
             build_return: self.build_return.for_take(mode),
             queued_tree_share: self.queued_tree_share.for_take(mode),
             cores: self.cores,
+            resume: None,
+            seed_from: None,
         })
     }
 
@@ -1158,6 +1191,7 @@ fn tree<'a>(
                 }
                 std::thread::sleep(Duration::from_millis(25));
             };
+            shares.reaped(&cmd, child.id(), Some(usage.status));
             let expected_red = opts.planted_red && usage.status.code() == Some(1)
                 && planted_red_only(root, &root.join(format!("tree-{check}.events")));
             let row = aterm_json::json!({"check":check,"wall_s":started.elapsed().as_secs_f64(),"cpu_s":usage.cpu.as_secs_f64(),"success":usage.status.success(),"expected_red":expected_red});
@@ -1376,13 +1410,28 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         })
         .unwrap_or_default()
         .encode();
-    crate::durable::write_fresh(&root.join("test-history-seed.json"), &history)
-        .map_err(|error| error.to_string())?;
-    for (index, mode) in modes.iter().enumerate() {
+    let continuation = if opts.real_export && opts.mode == "matched" {
+        Some(resume::Plan::prepare(
+            &root,
+            resume::spec(repo, commit.trim(), opts, claim.cores(), &modes)?,
+            opts.resume.as_deref(),
+            opts.seed_from.as_deref(),
+            history.clone(),
+        )?)
+    } else {
+        crate::durable::write_fresh(&root.join("test-history-seed.json"), &history)
+            .map_err(|error| error.to_string())?;
+        None
+    };
+    let history = continuation
+        .as_ref()
+        .map_or(history.as_str(), |plan| plan.history.as_str());
+    let first = continuation.as_ref().map_or(0, |plan| plan.next);
+    for (index, mode) in modes.iter().enumerate().skip(first) {
         crate::release_tools::clean_at(repo, commit.trim())?;
         let at = root.join(format!("take{}-{mode}", index + 1));
         std::fs::create_dir(&at).map_err(|e| e.to_string())?;
-        crate::durable::write_fresh(&at.join("test-history.json"), &history)
+        crate::durable::write_fresh(&at.join("test-history.json"), history)
             .map_err(|error| error.to_string())?;
         let options = opts.take(mode)?;
         let take = aterm_json::json!({
@@ -1459,6 +1508,9 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
             result?;
         }
         crate::release_tools::clean_at(repo, commit.trim())?;
+        if let Some(plan) = &continuation {
+            plan.complete(index, &at)?;
+        }
     }
     Ok(())
 }
@@ -1648,6 +1700,12 @@ fn frozen_arguments(opts: &Options, verify: &Path) -> Vec<OsString> {
     }
     if let Some(cores) = opts.cores {
         args.extend(["--cores".into(), cores.to_string().into()]);
+    }
+    if let Some(root) = &opts.resume {
+        args.extend(["--resume".into(), root.as_os_str().to_owned()]);
+    }
+    if let Some(root) = &opts.seed_from {
+        args.extend(["--seed-from".into(), root.as_os_str().to_owned()]);
     }
     args
 }
@@ -2411,6 +2469,7 @@ fn one(
         let build_usage = child
             .wait_with_rusage()
             .map_err(|error| format!("wait for qualify pilot slice child: {error}"))?;
+        shares.reaped(&command, child_pid, Some(build_usage.status));
         if opts.real_export {
             require_unsigned_build(&ended, commit)?;
         }

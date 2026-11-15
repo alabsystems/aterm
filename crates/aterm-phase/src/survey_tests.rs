@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::phase::{Phase, busy_signal, last_said_row, survey_open, transcript_end, worker_phase};
+use crate::phase::{busy_signal, last_said_row, survey_open, transcript_end, worker_phase};
+use alab_policy::vocab::Phase;
 
 const RULE: &str =
     "──────────────────────────────────────────────────────────────────────────────────";

@@ -281,6 +281,30 @@ pub(crate) fn live_holder_in(dir: &Path, sid: &SessionId) -> Option<u32> {
     (pid != std::process::id() && crate::control_auth::pid_alive(pid)).then_some(pid)
 }
 
+/// [`claim_for_adoption`] on the rendezvous directory, for a tab ID a cold restore keeps
+/// ([`crate::tab_ids::keep`]): whether this process now holds `sid`'s claim (no live instance
+/// serves it, and none is taking it over). The epoch an earlier holder recorded for its log is
+/// noted before the kept ID's log starts, as an adopted ID's is. With no rendezvous directory
+/// there is nobody else to ask, and the claim is this process's.
+pub(crate) fn claim_kept(sid: &SessionId) -> bool {
+    let Some(dir) = rendezvous_dir() else {
+        return true;
+    };
+    if !claim_for_adoption(&dir, sid) {
+        return false;
+    }
+    if let Some(ep) = recorded_epoch_in(&dir, sid) {
+        crate::session_log::Epochs::process().note(ep);
+    }
+    true
+}
+
+/// Whether a session on this Mac ever claimed tab ID `id` (its claim file persists after the
+/// claim is let go), in any instance: the minter's local half of "known".
+pub(crate) fn ever_claimed(id: &aterm_types::tab_id::TabId) -> bool {
+    rendezvous_dir().is_some_and(|dir| dir.join(CLAIMS_DIR).join(id.as_str()).exists())
+}
+
 fn rendezvous_dir() -> Option<PathBuf> {
     #[cfg(test)]
     {

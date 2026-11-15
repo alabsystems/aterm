@@ -94,7 +94,7 @@ pub(crate) fn fresh_snapshot(
         );
     }
     if check_peers {
-        // Each peer is aged against the lease its observer measured for it
+        // Each peer is aged against the lease its observer gave it
         // (`PeerObservation::reachable_for_ms`), the window the observer itself reads it by.
         for peer in &mut expired.network.peers {
             peer.reachability = peer.reachability_at(now_ms);

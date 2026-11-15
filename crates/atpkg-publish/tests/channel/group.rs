@@ -672,7 +672,7 @@ fn a_staging_repo_this_identity_cannot_see_is_refused_when_the_compiler_moved() 
             "{e}"
         );
     }
-    assert!(e.contains("~/.secrets/gh_access_token"), "{e}");
+    assert!(e.contains("the vault entry gh_access_token"), "{e}");
     let level = [
         ("trust-ir", 4),
         ("trust-cg", 4),
@@ -802,18 +802,23 @@ fn staging_needs_its_writer_and_key_but_never_a_public_writer() {
     let gh = |label| {
         let mut c = cut(label, &FLOOR, &[]);
         c.rig.ctx = c.rig.ctx.clone().with_host_choice(HostChoice::Gh);
-        std::fs::create_dir_all(c.rig.ctx.tokens.staging.parent().expect("secrets dir"))
-            .expect("mkdir secrets");
         c
     };
     let c = gh("group-identity");
     let e = refused(&c, &request(&c, Mode::StageUpload));
     assert!(
-        e.contains("--stage-upload needs the staging owner's token at ~/.secrets/gh_access_token"),
+        e.contains(
+            "--stage-upload needs the staging owner's token, the vault entry gh_access_token"
+        ),
         "{e}"
     );
     let control = gh("group-identity-ok");
-    std::fs::write(&control.rig.ctx.tokens.staging, "staging-token\n").expect("token");
+    control
+        .rig
+        .ctx
+        .tokens
+        .staging
+        .put_for_tests(Some(b"staging-token\n"));
     let (o, log) = ok(&control, &request(&control, Mode::StageUpload));
     assert_eq!(o.index_build, None);
     assert!(control.packs.indexes.borrow().is_empty());
@@ -823,8 +828,15 @@ fn staging_needs_its_writer_and_key_but_never_a_public_writer() {
     );
     assert!(!log.text().contains("  3. index "));
 
-    assert!(!c.rig.ctx.tokens.channel.exists(), "no public writer");
-    std::fs::write(&c.rig.ctx.tokens.staging, "staging-token\n").expect("token");
+    assert!(
+        c.rig.ctx.tokens.channel.read().is_ok_and(|t| t.is_none()),
+        "no public writer"
+    );
+    c.rig
+        .ctx
+        .tokens
+        .staging
+        .put_for_tests(Some(b"staging-token\n"));
     ok(&c, &request(&c, Mode::StageUpload));
     c.packs.packs.borrow_mut().clear();
     std::fs::remove_file(&c.rig.ctx.identity.key).expect("rm key");

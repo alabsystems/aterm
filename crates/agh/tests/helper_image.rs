@@ -118,7 +118,13 @@ mod native {
             let helper = helper.unwrap();
             assert_eq!(helper.args, prefix);
             if std::env::var(MODE).as_deref() == Ok("non-utf8") {
-                assert!(aterm_uds::tether::prepared_executable().unwrap().is_some());
+                assert!(
+                    aterm_uds::tether::prepared_executable_within(
+                        aterm_uds::deadline::FIRST_EXEC_HANG,
+                    )
+                    .unwrap()
+                    .is_some()
+                );
                 assert!(helper.exe.to_str().is_none());
                 assert!(helper.config_value().is_err());
                 write(&world, "done", "unrepresentable configuration refused");

@@ -93,6 +93,15 @@ pub struct PackageFiles {
     pub tree_root: String,
 }
 
+/// The public index that pins a campaign's package, read back anonymously.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    /// The index whose four public files equal the campaign's signed candidate.
+    pub index_build: u64,
+    /// Whether this run published it; `false` when an earlier run already had.
+    pub published_now: bool,
+}
+
 /// An observation made by native gates or actual readback. In particular,
 /// preparing an index does not mean that its publication failed or succeeded.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -125,6 +134,18 @@ pub enum Observation {
         build: u64,
         /// Digests in the native QUAD_FILES order.
         quad: [String; 4],
+    },
+    /// The public channel can never serve the retained candidate: another index
+    /// holds its number, the head moved past it, the channel replaced the
+    /// predecessor it was signed over, or its signed horizon lapsed. The next
+    /// attempt plans afresh over the channel head.
+    IndexRetired {
+        /// The retired index number.
+        build: u64,
+        /// The retired candidate's digests in QUAD_FILES order.
+        quad: [String; 4],
+        /// The public head observed when the controller retired it.
+        head_build: u64,
     },
     /// The client installed and ran the intended package entrypoint.
     Installed {
@@ -159,6 +180,11 @@ impl Observation {
             Self::IndexPublished { build, quad } => {
                 *build != 0 && quad.iter().all(|digest| hex(digest, 64))
             }
+            Self::IndexRetired {
+                build,
+                quad,
+                head_build,
+            } => *build != 0 && *head_build != 0 && quad.iter().all(|digest| hex(digest, 64)),
             Self::Installed {
                 tree_root,
                 entrypoint,

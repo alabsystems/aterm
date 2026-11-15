@@ -8,14 +8,19 @@ use crate::supervise::policy::approval::{
     PriorityWord, RULE_ANSWER_LAND, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_PLAN,
     RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
 };
-use crate::supervise::policy::credential_need::RULE_CREDENTIAL;
-use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
 use crate::supervise::policy::question::{RULE_ANSWER_RECOMMENDED, is_question_rule};
 use crate::supervise::policy::turn_end::{
-    RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE,
-    RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK, RULE_LAND_NUDGE,
-    RULE_LIMIT_RESUME, RULE_LOGIN_BACK, RULE_OPEN_ITEMS, RULE_OUTAGE_RESUME, RULE_SUGGESTION,
-    RULE_UNCOMMITTED,
+    RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_HOST_TURN,
+    RULE_LIMIT_RESUME, RULE_LOGIN_BACK, RULE_OUTAGE_RESUME, RULE_SUGGESTION,
+};
+use alab_policy::credential_need::RULE_CREDENTIAL;
+use alab_policy::go_ahead::RULE_GO_AHEAD;
+use alab_policy::{
+    land_check::RULE_LAND_CHECK,
+    words::{
+        RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE,
+        RULE_OPEN_ITEMS, RULE_UNCOMMITTED,
+    },
 };
 
 /// One act of the harness's, as the Autopilot chip names it for a moment.
@@ -185,7 +190,7 @@ fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
             | RULE_DONE_CHECK
             | RULE_OPEN_ITEMS
             | RULE_UNCOMMITTED
-            | crate::supervise::policy::cruise_carry::RULE_BACKGROUND
+            | alab_policy::cruise_carry::RULE_BACKGROUND
     ) {
         Some((Act::Continued, Counter::Continued))
     } else if is_prose_answer(rule) {
@@ -204,6 +209,7 @@ fn typed_act(rule: &str, command: &str) -> Option<(Act, Counter)> {
             | RULE_API_CUTOFF
             | RULE_OUTAGE_RESUME
             | RULE_LOGIN_BACK
+            | crate::supervise::policy::goal_restore::RULE_GOAL_RESTORE
     ) || (rule == RULE_COMPACT && !command.starts_with('/'))
     {
         Some((Act::Resumed, Counter::Resumed))
@@ -618,7 +624,7 @@ pub fn left_words(left: u16) -> String {
 pub enum HeldBy {
     /// The newest reply came again with no work (or a read wall's tries are spent at it).
     SameReply,
-    /// [`crate::supervise::policy::turn_end::NO_WORK_ACTS`] no-work answers in a row, whatever
+    /// [`alab_policy::words::NO_WORK_ACTS`] no-work answers in a row, whatever
     /// their wording.
     NoWork,
 }
@@ -649,7 +655,7 @@ impl HeldBy {
             HeldBy::SameReply => "the same reply twice, no work".to_owned(),
             HeldBy::NoWork => format!(
                 "{} replies in a row, no work",
-                crate::supervise::policy::turn_end::NO_WORK_ACTS
+                alab_policy::words::NO_WORK_ACTS
             ),
         }
     }
@@ -661,7 +667,7 @@ impl HeldBy {
             HeldBy::SameReply => "the same reply twice, with no work".to_owned(),
             HeldBy::NoWork => format!(
                 "{} replies in a row, with no work",
-                crate::supervise::policy::turn_end::NO_WORK_ACTS
+                alab_policy::words::NO_WORK_ACTS
             ),
         }
     }
@@ -674,7 +680,7 @@ impl HeldBy {
             HeldBy::SameReply => "twice with the same reply and no work".to_owned(),
             HeldBy::NoWork => format!(
                 "{} times in a row with no work",
-                crate::supervise::policy::turn_end::NO_WORK_ACTS
+                alab_policy::words::NO_WORK_ACTS
             ),
         }
     }
@@ -771,13 +777,13 @@ impl OpenWord {
     /// The index of `word`, a spelling the strict reading names.
     #[must_use]
     pub fn of(word: &str) -> Option<Self> {
-        crate::supervise::policy::turn_end::open_word_index(word).map(Self)
+        alab_policy::open_work::open_word_index(word).map(Self)
     }
 
     /// The word, as the strict reading spelled it.
     #[must_use]
     pub fn word(self) -> &'static str {
-        crate::supervise::policy::turn_end::open_word_at(self.0).unwrap_or("open work")
+        alab_policy::open_work::open_word_at(self.0).unwrap_or("open work")
     }
 }
 

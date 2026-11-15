@@ -160,7 +160,7 @@ impl Kind {
             Kind::Pending => "wait longer or look",
             Kind::Conflict => "read sub=; never retry blindly",
             Kind::Invalid => "fix the input",
-            Kind::RateLimited => "wait until reset= or retry_after=",
+            Kind::RateLimited => "wait for the reported rate-limit reset or retry delay",
             Kind::Server => "retry later",
             Kind::OutcomeUnknown => {
                 "re-run the same command: it discovers first; never re-POST by hand"
@@ -501,7 +501,7 @@ pub enum Sub {
     /// A git child exited non-zero (design §6.9).
     Git {
         /// Its exit code; `None` when a signal ended it. A run killed at its bound is could_not_run
-        /// `Sub::Local` instead (`fx::child::run`).
+        /// `Sub::Local` instead (`fx::child::run_unless`).
         exit: Option<i32>,
     },
     /// A clone's local config is outside the transport security policy (design §6.9).
@@ -992,6 +992,43 @@ impl Error {
         self.kind.retriable()
     }
 
+    fn quota_reset(&self) -> Option<u64> {
+        self.reset.or_else(|| {
+            (self.kind == Kind::RateLimited)
+                .then(|| self.rate.as_ref().map(|rate| rate.reset))
+                .flatten()
+        })
+    }
+
+    fn rendered_next(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+        if self.kind != Kind::RateLimited || self.next != self.kind.next_action() {
+            return Cow::Borrowed(&self.next);
+        }
+        let reset = self.quota_reset().map(|reset| {
+            // RFC3339's four-digit calendar stops at 9999. Keep an exact
+            // numeric timestamp outside that range instead of fabricating a date.
+            if reset <= 253_402_300_799 {
+                format!(
+                    "{} (reset={reset})",
+                    aterm_types::rfc3339::format_rfc3339(reset)
+                )
+            } else {
+                format!("reset={reset} (Unix seconds)")
+            }
+        });
+        Cow::Owned(match (reset, self.retry_after) {
+            (Some(reset), Some(delay)) => format!(
+                "wait until {reset} and at least {delay} seconds (retry_after={delay}) before retrying"
+            ),
+            (Some(reset), None) => format!("wait until {reset} before retrying"),
+            (None, Some(delay)) => {
+                format!("wait at least {delay} seconds (retry_after={delay}) before retrying")
+            }
+            (None, None) => return Cow::Borrowed(&self.next),
+        })
+    }
+
     /// Formats the redacted first stderr diagnostic line.
     #[must_use]
     pub fn line(&self, verb: &str, redactor: &Redactor) -> String {
@@ -1038,7 +1075,7 @@ impl Error {
         if let Some(sub) = self.sub.slug_cow() {
             let _ = write!(out, " sub={}", redactor.apply_cow(&sub));
         }
-        if let Some(reset) = self.reset {
+        if let Some(reset) = self.quota_reset() {
             let _ = write!(out, " reset={reset}");
         }
         if let Some(secs) = self.retry_after {
@@ -1062,7 +1099,7 @@ impl Error {
         out.push_str(" why=");
         push_quoted(&mut out, &self.why);
         out.push_str(" next=");
-        push_quoted(&mut out, &self.next);
+        push_quoted(&mut out, &self.rendered_next());
         out
     }
 
@@ -1125,7 +1162,7 @@ impl Error {
             "message".into(),
             opt_text(github.and_then(|g| g.message.as_deref())),
         );
-        object.insert("next".into(), text(&self.next));
+        object.insert("next".into(), text(&self.rendered_next()));
         object.insert(
             "rate".into(),
             self.rate.as_ref().map_or(Value::Null, |rate| {
@@ -1146,7 +1183,10 @@ impl Error {
             "retry_after".into(),
             self.retry_after.map_or(Value::Null, Value::from),
         );
-        object.insert("reset".into(), self.reset.map_or(Value::Null, Value::from));
+        object.insert(
+            "reset".into(),
+            self.quota_reset().map_or(Value::Null, Value::from),
+        );
         object.insert("side_effect".into(), Value::from(self.side_effect.slug()));
         object.insert(
             "intent".into(),

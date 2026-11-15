@@ -232,7 +232,7 @@ impl TransparentCommand {
             &image,
             &Placement {
                 inherit_all: true,
-                #[cfg(target_vendor = "apple")]
+                #[cfg(any(target_vendor = "apple", target_os = "linux"))]
                 inherit_signal_mask: true,
                 long_entry_ends: cfg!(target_vendor = "apple"),
                 ..Placement::default()

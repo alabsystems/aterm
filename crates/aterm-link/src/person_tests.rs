@@ -48,7 +48,15 @@ fn a_person_ring_stamped_with_an_expiry_reads_its_expiry() {
 fn a_person_is_h_or_a_dash_and_a_principal() {
     assert!(is_person_id("h-andrew"));
     assert!(is_person_id("a-review"));
-    for bad in ["n-0123", "s-0123", "h-", "h-UPPER", "h-a b", "andrew", ""] {
+    for bad in [
+        "n-0123",
+        "t0000000123",
+        "h-",
+        "h-UPPER",
+        "h-a b",
+        "andrew",
+        "",
+    ] {
         assert!(!is_person_id(bad), "{bad}");
     }
 }
@@ -112,14 +120,14 @@ fn each_verb_parses_its_words_and_refuses_the_rest() {
 
     let post = parse(
         "post",
-        &words("--cap-file c to=@s-a@n-b kind=answer re=@12 -- yes, ship it"),
+        &words("--cap-file c to=@ta000000000@n-b kind=answer re=@12 -- yes, ship it"),
     )
     .unwrap()
     .unwrap();
     assert_eq!(
         post.act,
         Act::Post {
-            sid: "s-a".to_string(),
+            sid: "ta000000000".to_string(),
             node: "n-b".to_string(),
             kind: "answer".to_string(),
             re: Some(12),
@@ -129,7 +137,7 @@ fn each_verb_parses_its_words_and_refuses_the_rest() {
     for re in ["5", "@5"] {
         let post = parse(
             "post",
-            &words(&format!("--cap-file c to=@s-a@n-b re={re} hi")),
+            &words(&format!("--cap-file c to=@ta000000000@n-b re={re} hi")),
         )
         .unwrap()
         .unwrap();
@@ -142,7 +150,7 @@ fn each_verb_parses_its_words_and_refuses_the_rest() {
     for re in ["+5", "@", "", "@-1"] {
         let refused = parse(
             "post",
-            &words(&format!("--cap-file c to=@s-a@n-b re={re} hi")),
+            &words(&format!("--cap-file c to=@ta000000000@n-b re={re} hi")),
         );
         assert!(
             refused
@@ -152,12 +160,12 @@ fn each_verb_parses_its_words_and_refuses_the_rest() {
         );
     }
     for bad in [
-        "--cap-file c to=@s-a kind=note hi",
-        "--cap-file c to=s-a@n-b kind=note hi",
-        "--cap-file c to=@s-a@n-b kind=ack hi",
-        "--cap-file c to=@s-a@n-b kind=note",
+        "--cap-file c to=@ta000000000 kind=note hi",
+        "--cap-file c to=ta000000000@n-b kind=note hi",
+        "--cap-file c to=@ta000000000@n-b kind=ack hi",
+        "--cap-file c to=@ta000000000@n-b kind=note",
         "--cap-file c kind=note hi",
-        "--cap-file c to=@s-a@n-b re=x note hi",
+        "--cap-file c to=@ta000000000@n-b re=x note hi",
     ] {
         assert!(parse("post", &words(bad)).is_err(), "{bad}");
     }
@@ -179,14 +187,14 @@ fn a_post_delimiter_makes_key_shaped_words_literal_message_text() {
     ] {
         let parsed = parse(
             "post",
-            &words(&format!("--cap-file c to=@s-a@n-b -- {text}")),
+            &words(&format!("--cap-file c to=@ta000000000@n-b -- {text}")),
         )
         .unwrap()
         .unwrap();
         assert_eq!(
             parsed.act,
             Act::Post {
-                sid: "s-a".to_string(),
+                sid: "ta000000000".to_string(),
                 node: "n-b".to_string(),
                 kind: "note".to_string(),
                 re: None,
@@ -806,7 +814,7 @@ fn an_agents_ring_reads_and_sends_mail_but_cannot_write_a_halt() {
     conn.publish(
         producer,
         2,
-        "/f/f/in/n-target/s-target/a-review/note",
+        "/f/f/in/n-target/ttarget0000/a-review/note",
         b"v=1 text=reply",
     )
     .unwrap();
@@ -835,7 +843,10 @@ fn only_a_humans_ring_can_publish_a_halt() {
     assert!(can("h-andrew", "/f/f1/fleet/h-andrew/halt"));
     assert!(!can("a-svc", "/f/f1/fleet/a-svc/halt"));
     for p in ["h-andrew", "a-svc"] {
-        assert!(can(p, &format!("/f/f1/in/n-a/s-b/{p}/answer")), "{p} posts");
+        assert!(
+            can(p, &format!("/f/f1/in/n-a/tb000000000/{p}/answer")),
+            "{p} posts"
+        );
     }
 }
 
@@ -871,7 +882,7 @@ fn with_the_mesh_on_a_persons_post_to_another_mac_is_sealed_or_refused_before_an
     reader.attach(&cap.filter, &cap.tag).unwrap();
     let mut held = || reader.fetch(0, "/f/f/in/>", 64).unwrap().0;
     let to = |node: &str| Act::Post {
-        sid: "s-a".to_string(),
+        sid: "ta000000000".to_string(),
         node: node.to_string(),
         kind: "note".to_string(),
         re: None,
@@ -914,13 +925,13 @@ fn with_the_mesh_on_a_persons_post_to_another_mac_is_sealed_or_refused_before_an
         assert_eq!(posted(&cfg, to(node)), ExitCode::SUCCESS, "to {node}");
     }
     let rows = held();
-    let lane = format!("/f/f/in/{there}/s-a/h-andrew/note");
+    let lane = format!("/f/f/in/{there}/ta000000000/h-andrew/note");
     assert_eq!(rows.len(), 2);
     for (_, subject, raw) in &rows {
         assert_eq!(subject, &lane, "on the person's lane to the member");
         let (body, _) = Body::decode(raw);
         assert_eq!(body.text, "hi");
-        let address = person_key::post_address("f", "s-a", "h-andrew", "note");
+        let address = person_key::post_address("f", "ta000000000", "h-andrew", "note");
         assert_eq!(
             person_key::verify(
                 person_key::Signer::Key(&node_key),
@@ -1017,15 +1028,15 @@ fn a_persons_answer_to_another_mac_names_the_post_it_answers_as_that_mac_numbers
             .0
     };
     let by = |seq: u64, node: &str| Some(wire_stamp(seq, astream_cap::producer_id_of(node)));
-    let from_a = format!("s-a@{there}");
+    let from_a = format!("ta000000000@{there}");
     let current = handed(&here, &from_a, by(7, &there));
-    let via_retired = handed(&here, &format!("s-a@{retired}"), by(9, retired));
-    let pushed_after_rotation = handed(&here, &format!("s-a@{retired}"), by(10, &there));
+    let via_retired = handed(&here, &format!("ta000000000@{retired}"), by(9, retired));
+    let pushed_after_rotation = handed(&here, &format!("ta000000000@{retired}"), by(10, &there));
     let before_rotation = handed(old_here, &from_a, by(11, &there));
-    let another_session = handed(&here, &format!("s-other@{there}"), by(13, &there));
-    let same_sid_here = handed(&here, &format!("s-a@{here}"), by(17, &there));
-    let same_sid_stranger = handed(&here, &format!("s-a@{stranger}"), by(19, &there));
-    let same_sid_old_here = handed(&here, &format!("s-a@{old_here}"), by(21, &there));
+    let another_session = handed(&here, &format!("t0ther00000@{there}"), by(13, &there));
+    let same_sid_here = handed(&here, &format!("ta000000000@{here}"), by(17, &there));
+    let same_sid_stranger = handed(&here, &format!("ta000000000@{stranger}"), by(19, &there));
+    let same_sid_old_here = handed(&here, &format!("ta000000000@{old_here}"), by(21, &there));
     let unstamped = handed(&here, &from_a, None);
     let out_of_range = handed(&here, &from_a, by(astream_broker::ACK_SEQ_BASE, &there));
     let bare_seq = handed(&here, &from_a, Some("23".to_owned()));
@@ -1033,20 +1044,20 @@ fn a_persons_answer_to_another_mac_names_the_post_it_answers_as_that_mac_numbers
     let another_lane = handed(stranger, &from_a, by(15, &there));
     // A session of this Mac asked before its key rotated: the bridge wrote it unstamped, from
     // the bare session, on the person's lane of the node it was then.
-    let local_before_rotation = handed(old_here, "s-a", None);
+    let local_before_rotation = handed(old_here, "ta000000000", None);
 
     let mut reader = astream_broker::Client::connect(&socket).unwrap();
     let cap = astream_cap::mint(&[0x51; 32], "ro:/f/f/in/>").unwrap();
     reader.attach(&cap.filter, &cap.tag).unwrap();
     let mut answers = |node: &str| -> Vec<Option<u64>> {
-        let lane = format!("/f/f/in/{node}/s-a/h-andrew/answer");
+        let lane = format!("/f/f/in/{node}/ta000000000/h-andrew/answer");
         let (rows, _) = reader.fetch(0, &lane, 64).unwrap();
         rows.iter()
             .map(|(_, _, raw)| Body::decode(raw).0.re)
             .collect()
     };
     let answer = |node: &str, re: u64| Act::Post {
-        sid: "s-a".to_string(),
+        sid: "ta000000000".to_string(),
         node: node.to_string(),
         kind: "answer".to_string(),
         re: Some(re),
@@ -1070,7 +1081,7 @@ fn a_persons_answer_to_another_mac_names_the_post_it_answers_as_that_mac_numbers
         assert_eq!(
             posted(&cfg, answer(node, re)),
             ExitCode::SUCCESS,
-            "re={re} to s-a@{node}"
+            "re={re} to ta000000000@{node}"
         );
     }
     assert_eq!(

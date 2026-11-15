@@ -1847,6 +1847,9 @@ impl WaitClass {
 
 pub(super) fn wait_class(wait: &str) -> WaitClass {
     let wait = wait.strip_prefix("release:").unwrap_or(wait);
+    if let Some(kind) = crate::harness::accounts_pool::RefusalKind::of_word(wait) {
+        return account_refusal_class(kind);
+    }
     let head = wait.split_once(':').map_or(wait, |(head, _)| head);
     match (head, wait) {
         ("limited", _) => WaitClass::Limit,
@@ -1889,7 +1892,9 @@ pub(super) fn wait_class(wait: &str) -> WaitClass {
             | "home-unreadable",
             _,
         ) => WaitClass::TabUnread,
-        ("in-flight" | "confirming" | upgrade::PRESSED, _) => WaitClass::UnderWay,
+        // The relaunch's own admission after its agent ended (`relaunch::WAIT_ACCOUNT`), retried
+        // at once as the plan's agreed.
+        ("in-flight" | "confirming" | "account" | upgrade::PRESSED, _) => WaitClass::UnderWay,
         (_, "left-typed:screen-unreadable") => WaitClass::TabUnread,
         ("left-typed", _) => WaitClass::Person,
         ("announce-refused", _) => WaitClass::Notice,
@@ -1910,6 +1915,44 @@ pub(super) fn wait_class(wait: &str) -> WaitClass {
         (upgrade::NEXT_POINT, _) => WaitClass::NextPoint,
         ("", "") => WaitClass::Unrecorded,
         _ => WaitClass::Unclassified,
+    }
+}
+
+/// What holds a move whose relaunch an account admission refused for `kind`
+/// ([`crate::harness::accounts_pool::RefusalKind::word`]): a lock or a change is under way and the
+/// next look plans again; an unread or unattributed route or record is a tab aterm cannot read
+/// yet; integrity, a vault token out of use here and selection policy are the person's (a sign-in,
+/// a new token, a pin, custody) but for a usage limit, which is its reset's.
+const fn account_refusal_class(kind: crate::harness::accounts_pool::RefusalKind) -> WaitClass {
+    use crate::harness::accounts_pool::RefusalKind;
+    match kind {
+        RefusalKind::Lock | RefusalKind::Changing => WaitClass::UnderWay,
+        RefusalKind::Unattributed | RefusalKind::Unread => WaitClass::TabUnread,
+        RefusalKind::Integrity
+        | RefusalKind::Token
+        | RefusalKind::SignedOut
+        | RefusalKind::Pin
+        | RefusalKind::Lease
+        | RefusalKind::Held => WaitClass::Person,
+        RefusalKind::Limited => WaitClass::Limit,
+    }
+}
+
+/// [`account_refusal_class`]'s refusal in a person's words, each under 64 characters.
+const fn account_refusal_words(kind: crate::harness::accounts_pool::RefusalKind) -> &'static str {
+    use crate::harness::accounts_pool::RefusalKind;
+    match kind {
+        RefusalKind::Lock => "its accounts are being changed; it moves once that is done",
+        RefusalKind::Changing => "its account changed as aterm checked it; it looks again",
+        RefusalKind::Unattributed => "aterm cannot tell which login it runs on",
+        RefusalKind::Unread => "aterm cannot read its account records yet",
+        RefusalKind::Integrity => "its login does not match the account it is filed under",
+        RefusalKind::Token => "its vault token is not in use on this Mac",
+        RefusalKind::SignedOut => "its account is signed out here",
+        RefusalKind::Limited => "its account is at a usage limit",
+        RefusalKind::Pin => "its account is not the one the pin names",
+        RefusalKind::Lease => "another Mac holds its account's lease",
+        RefusalKind::Held => "its account is assigned to another Mac",
     }
 }
 
@@ -3343,6 +3386,7 @@ fn claude_wait_words(wait: &str) -> Option<&'static str> {
         "login" => "it is not logged in",
         "in-flight" => "a step is under way",
         "confirming" => "its last restart is still being checked",
+        "account" => "its relaunch waits for its account's check",
         upgrade::PRESSED => "the owner pressed its update arrow: that press moves it",
         crate::harness::upgrade_drive::BUILD_FAILS => "its new build fails to start",
         crate::harness::upgrade_drive::UNREAD_VERSION => {
@@ -3365,7 +3409,10 @@ fn claude_wait_words(wait: &str) -> Option<&'static str> {
         w if w.starts_with("release:") => "it is owed the line telling it to carry on",
         w if w.starts_with("status-stale") => "its status lags",
         w if w.starts_with("not-idle") => "it has not gone idle",
-        w => return relaunch_line_words(w),
+        w => match crate::harness::accounts_pool::RefusalKind::of_word(w) {
+            Some(kind) => account_refusal_words(kind),
+            None => return relaunch_line_words(w),
+        },
     })
 }
 
@@ -3475,6 +3522,10 @@ fn stop_words(agent: upgrade::Agent, why: &str) -> String {
             format!("the new {who} never picked the conversation back up")
         }
         "stale-exit" => format!("{who} ended and was never started again on the new build"),
+        crate::harness::relaunch::ACCOUNT_MOVED => format!(
+            "{who} ended for the move, and its login was filed under another account before it \
+             started again, so it was not started on it"
+        ),
         "shell-gone" => {
             "the shell it ran in is gone, so there is no prompt to start it at".to_string()
         }
@@ -4639,7 +4690,7 @@ impl View {
             .ok()
             .and_then(|mut c| super::host_roster(&mut c))
         else {
-            let pause = crate::supervise::ladder::Ladder(&UNREAD_RETRY)
+            let pause = alab_policy::ladder::Ladder(&UNREAD_RETRY)
                 .step(usize::try_from(self.unread).unwrap_or(usize::MAX));
             self.unread = self.unread.saturating_add(1);
             self.watch.clear();

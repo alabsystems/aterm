@@ -155,9 +155,10 @@ pub const REACH_WAIT: Duration = aterm_secrets::client::REACH_WAIT;
 const UNCONFIGURED: &str =
     "no vault configured; run aterm init in a terminal, or aterm secrets join <url>";
 
-const SUBSCRIBED: &str = "subscriber running (aterm secrets watch keeps ~/.secrets in sync)";
+const SUBSCRIBED: &str =
+    "subscriber running (aterm secrets watch keeps this Mac's vault copy current)";
 
-const WRITTEN: &str = "every vault file written (aterm secrets sync)";
+const WRITTEN: &str = "this Mac's vault copy verified (aterm secrets sync)";
 
 /// The vault, as `aterm init` sees it.
 pub trait SecretsOps: Send + Sync {
@@ -2162,16 +2163,8 @@ fn judge(
         .map_or("(unnamed)", |config| config.name.as_str());
     let approve = status.approve_command();
     let alab = alab_words(status.config.as_ref(), source);
-    let inside = status.names.iter().filter(|n| !n.starts_with("~/")).count();
-    let elsewhere = status.names.len() - inside;
-    let held = if elsewhere == 0 {
-        format!("{} in ~/.secrets", secrets(inside))
-    } else {
-        format!(
-            "{} in ~/.secrets and {elsewhere} elsewhere in ~",
-            secrets(inside)
-        )
-    };
+    // A `~/` name is a store key, never a place: every entry is read in place from the store.
+    let held = format!("{} in the vault here", secrets(status.names.len()));
     let unwatched = |now: String| Probe::Change {
         from: format!("{now}, {}", unsynced.unwrap_or_default()),
         to: SUBSCRIBED.into(),
@@ -2179,7 +2172,7 @@ fn judge(
     let watched = unsynced.is_none();
     let kept = "kept in sync by the subscriber";
     let unwritten = |now: String| Probe::Change {
-        from: format!("{now}, but a file it wrote failed, is missing or was changed"),
+        from: format!("{now}, but its local vault copy is incomplete or does not verify"),
         to: WRITTEN.into(),
     };
     match &status.membership {
@@ -2256,7 +2249,7 @@ impl Item for Vault {
 
     fn title(&self) -> String {
         format!(
-            "Secrets vault {} synced into ~/.secrets (aterm help secrets)",
+            "Secrets vault {} kept current on this Mac (aterm help secrets)",
             shown(&self.source)
         )
     }
@@ -2342,7 +2335,9 @@ impl Item for Vault {
                 Ok(synced) => synced,
                 Err(why) => {
                     return Probe::Unusable {
-                        why: format!("cannot read whether the vault files are written: {why}"),
+                        why: format!(
+                            "cannot read whether this Mac's vault copy is verified: {why}"
+                        ),
                     };
                 }
             },
@@ -2484,18 +2479,6 @@ impl Item for Vault {
         let mut steps = Vec::new();
         if planned.subscribe {
             steps.push("aterm secrets agent off (stops and removes the subscriber)".to_owned());
-        }
-        if planned.join {
-            steps.push(
-                "rm each file aterm secrets ls names (in ~/.secrets, or in ~ for a ~/ name)"
-                    .to_owned(),
-            );
-        }
-        if planned.join || planned.files {
-            steps.push(
-                "a file the vault's took the place of is in ~/.secrets/.replaced, to move back"
-                    .to_owned(),
-            );
         }
         if planned.join {
             steps.push(match planned.kept {

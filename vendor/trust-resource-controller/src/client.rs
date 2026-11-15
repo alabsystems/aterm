@@ -14,9 +14,10 @@ use crate::{Channel, ContextQuery, ContextReply, ContextResponse};
 
 mod coordinator;
 pub use coordinator::{
-    AuthenticatedCoordinator, CompilerScope, CompilerScopeError, CoordinatorBroker,
-    CoordinatorBrokerEndpoint, CoordinatorBrokerServer, CoordinatorCompilerCapture,
-    CoordinatorOriginals, GraphAcknowledgement, PublicationAcknowledgement,
+    AuthenticatedCoordinator, CompilerScope, CompilerScopeError, CompilerScopeInputs,
+    CoordinatorBroker, CoordinatorBrokerEndpoint, CoordinatorBrokerServer,
+    CoordinatorCompilerCapture, CoordinatorOriginals, GraphAcknowledgement,
+    PublicationAcknowledgement,
 };
 
 /// Delivery facts, never a claim that the original root did not launch or that
@@ -241,7 +242,7 @@ impl Client {
             Ok(response)
         })();
         match exchange {
-            Ok(ContextResponse::Ready(reply)) => Ok(reply),
+            Ok(ContextResponse::Ready(reply)) => Ok(*reply),
             Ok(ContextResponse::Unavailable(value)) => Err(CallError {
                 delivery: Delivery::ContextUnavailable,
                 error: io::Error::new(io::ErrorKind::PermissionDenied, value.reason),
@@ -259,10 +260,10 @@ pub use member::{
 
 mod metadata;
 pub use metadata::{
-    CompletedProducedOperation, ContainedProducedError, ContainedProducedMember, LinkerError,
-    LinkerMember, LinkerOutcome, LinkerResult, MetadataError, MetadataIo, MetadataMember,
-    MetadataOutputStream, MetadataResult, ProducedError, ProducedFailureObservation,
-    ProducedMember, ProducedResult, SuccessfulProducedCompletion,
+    CompletedProducedOperation, ContainedProducedError, ContainedProducedMember,
+    CoordinatorDescriptors, LinkerError, LinkerMember, LinkerOutcome, LinkerResult, MetadataError,
+    MetadataIo, MetadataMember, MetadataOutputStream, MetadataResult, ProducedError,
+    ProducedFailureObservation, ProducedMember, ProducedResult, SuccessfulProducedCompletion,
 };
 
 mod telemetry;

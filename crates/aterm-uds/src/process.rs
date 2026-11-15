@@ -1199,22 +1199,64 @@ pub fn translation() -> Translation {
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn translator() -> Option<String> {
-    let kernel =
-        crate::atomic_file::read_regular_text(std::path::Path::new("/proc/sys/kernel/arch"), 1024)
-            .ok()?;
-    let (kernel, code) = (kernel.trim(), std::env::consts::ARCH);
+    translator_probe(
+        crate::spawnfd::stdio_reservation::Admission::enter,
+        || {
+            crate::atomic_file::read_regular_text(
+                std::path::Path::new("/proc/sys/kernel/arch"),
+                1024,
+            )
+        },
+        || {
+            // A translated cpuinfo open can retain a separate runtime-owned descriptor before
+            // returning its File. Admit that owner above stdio; moving its cached number later
+            // would not update its ownership. Keep the reservation through read and naming.
+            crate::atomic_file::read_regular_text(
+                std::path::Path::new("/proc/cpuinfo"),
+                1024 * 1024,
+            )
+            .is_ok_and(|info| info.contains("VirtualApple"))
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn translator_probe(
+    enter: impl FnOnce() -> crate::spawnfd::stdio_reservation::Admission,
+    kernel: impl FnOnce() -> std::io::Result<String>,
+    rosetta: impl FnOnce() -> bool,
+) -> Option<String> {
+    // Serialize before even the temporary kernel-arch File: a second probe must not
+    // borrow that file's stdio number and let it close during its opaque CPUinfo action.
+    let mut admission = enter();
+    let kernel = kernel().ok()?;
+    translator_named(&kernel, std::env::consts::ARCH, || {
+        admission.while_reserved(rosetta)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn translator_named(
+    kernel: &str,
+    code: &str,
+    rosetta: impl FnOnce() -> std::io::Result<bool>,
+) -> Option<String> {
+    let kernel = kernel.trim();
     if kernel.is_empty() || kernel == code {
         return None;
     }
-    let rosetta =
-        crate::atomic_file::read_regular_text(std::path::Path::new("/proc/cpuinfo"), 1024 * 1024)
-            .is_ok_and(|info| info.contains("VirtualApple"));
-    Some(if rosetta {
+    // Once architecture differs, a probe/refusal remains translated. It cannot grant the
+    // native shared-memory clone path merely because the brand could not be named.
+    Some(if rosetta().unwrap_or(false) {
         "Rosetta".to_string()
     } else {
         format!("a translator ({code} code on an {kernel} kernel)")
     })
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "process_translator_tests.rs"]
+mod translator_tests;
 
 /// See the Linux twin.
 #[cfg(not(target_os = "linux"))]
@@ -2299,7 +2341,7 @@ const PROCESS_ARGV_WORDS: usize = 65_536;
 
 #[cfg(target_os = "macos")]
 fn read_process_argv_inner(pid: i32) -> Option<Vec<std::ffi::OsString>> {
-    argv_from_procargs2(&crate::procargs::read(u32::try_from(pid).ok()?)?)
+    argv_from_procargs2(&crate::procargs::read(u32::try_from(pid).ok()?).ok()?)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2973,6 +3015,124 @@ pub fn release_free_memory() {
         let _ = unsafe { malloc_trim(0) };
     }
 }
+
+/// What [`relieve_heap_if_due`]'s last release left (the footprint before it where the read after
+/// it failed), 0 before the first: the mark growth is measured from.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+static FOOTPRINT_AFTER_RELEASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// This process's footprint at the previous [`heap_relief_owed`] or [`relieve_heap_if_due`]
+/// release, 0 before the first.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+static FOOTPRINT_LAST_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When [`relieve_heap_if_due`]'s last release returned on [`relief_clock`], 0 before the first.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+static RELEASED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds since this process first read this clock, plus one, so that 0 means never.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn relief_clock() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
+
+/// This process's anonymous memory, in memory and swapped (`RssAnon + VmSwap`): what a release
+/// can give back, unlike the file-backed pages it maps.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn heap_footprint() -> Option<u64> {
+    aterm_sysprobe::procs::footprint(std::process::id()).ok()
+}
+
+/// When [`relieve_heap_if_due`] owes a release. glibc shrinks a thread arena's heap only from its
+/// top, and a survivor allocated above a burst's frees pins them, so the short-lived threads of a
+/// long-lived process leave their frees resident (ATERM-KI-1114-33) until a release returns them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReliefRule {
+    /// Growth past what the last relief release left that owes one, bytes: a burst that strands a
+    /// floor's worth is given back once it stops growing, by under an eighth of the floor between
+    /// asks (a burst still growing holds its memory live, and a release then would return little).
+    pub floor: u64,
+    /// The least time between relief releases: a load that frees and faults back a floor's worth
+    /// between asks is trimmed at most this often, not at every other ask.
+    pub spacing: std::time::Duration,
+    /// The most time between them, once the process stopped growing: what a burst strands after a
+    /// release made while its memory was live, or as the process shrinks, shows in no growth.
+    pub sweep: std::time::Duration,
+}
+
+/// This process's footprint where it owes [`release_free_memory`] a call under `rule`. A relief
+/// release counts as the latest ask, so growth just after one is still growing; a
+/// [`release_free_memory`] made elsewhere moves none of this, since one made mid-burst, with the
+/// burst's memory live, would hide what the burst then strands.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn heap_relief_owed(rule: ReliefRule) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let millis = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let now = heap_footprint()?;
+    let before = FOOTPRINT_LAST_ASKED.swap(now, Relaxed);
+    let since = relief_clock().saturating_sub(RELEASED_AT.load(Relaxed));
+    let settled = now < before.saturating_add(rule.floor / 8);
+    let grown = now
+        >= FOOTPRINT_AFTER_RELEASE
+            .load(Relaxed)
+            .saturating_add(rule.floor);
+    (settled && since >= millis(rule.spacing) && (grown || since >= millis(rule.sweep)))
+        .then_some(now)
+}
+
+/// What a release [`relieve_heap_if_due`] made gave back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapRelief {
+    /// This process's anonymous memory, in memory and swapped, when the release was owed: bytes.
+    pub before: u64,
+    /// The same once the release returned (`before` where it could not be read).
+    pub after: u64,
+    /// How long the release took, every arena locked in its turn.
+    pub took: std::time::Duration,
+}
+
+/// Gives the allocator's free pages back where this process owes a release under `rule`, and says
+/// what that gave back; `None` where none was owed. One is owed once the process stopped growing
+/// (by under an eighth of the floor since the previous ask or release), no release of this
+/// function's came within the spacing, and either it grew by the floor since that release's or
+/// the sweep has passed since it; a [`release_free_memory`] made elsewhere counts for none of this.
+/// The settling is judged between asks, so it wants one caller asking at a steady interval. Linux
+/// glibc only; `None` elsewhere, where the process allocator's relief has its own triggers.
+#[must_use]
+pub fn relieve_heap_if_due(rule: ReliefRule) -> Option<HeapRelief> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = heap_relief_owed(rule)?;
+        let started = std::time::Instant::now();
+        release_free_memory();
+        let took = started.elapsed();
+        let after = heap_footprint().unwrap_or(before);
+        // What the release left is both the mark and the latest look at the footprint: the next
+        // ask measures growth and settling from here, not from before the trim.
+        FOOTPRINT_AFTER_RELEASE.store(after, Relaxed);
+        FOOTPRINT_LAST_ASKED.store(after, Relaxed);
+        RELEASED_AT.store(relief_clock(), Relaxed);
+        Some(HeapRelief {
+            before,
+            after,
+            took,
+        })
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        let _ = rule;
+        None
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+#[path = "process_heap_relief_tests.rs"]
+mod heap_relief_tests;
 
 #[cfg(test)]
 #[path = "process_start_tests.rs"]

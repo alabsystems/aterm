@@ -2509,7 +2509,8 @@ fn a_relaunch_under_land_is_carried_on_as_under_cruise() {
 #[test]
 fn a_relaunch_into_a_done_claim_asks_the_done_check() {
     use crate::harness::relaunch::{CAUSE_EXIT, CAUSE_HOST, CAUSE_STALL};
-    use crate::supervise::policy::turn_end::{DONE_CHECK, DONE_CHECK_REVERSIBLE, HostTurn};
+    use crate::supervise::policy::turn_end::HostTurn;
+    use alab_policy::words::{DONE_CHECK, DONE_CHECK_REVERSIBLE};
     let done = "All tasks are complete and verified.\nNothing left: the parser and its tests are on origin/main.";
     let forced = "All tasks are complete and verified. Should I force-push the rewritten history to \
                   origin main?\nNothing left: the parser and its tests are on origin/main.";

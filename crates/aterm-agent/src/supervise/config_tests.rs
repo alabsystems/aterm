@@ -161,7 +161,9 @@ fn a_value_it_cannot_read_keeps_its_default_and_only_an_off_limits() {
         assert_eq!(read(text).enabled, on, "{text:?}");
     }
     assert_eq!(
-        read("[harness]\ncontinue_text = \"yes\"\n").continue_text,
+        read("[harness]\ncontinue_text = \"yes\"\n")
+            .turn_end
+            .continue_text,
         "yes"
     );
     assert_eq!(read("[harness]\nanswer_text = \"1\"\n").answer_text, "1");
@@ -368,7 +370,7 @@ fn accounts_reads_its_three_words_and_only_limits() {
 #[test]
 fn autopilot_reads_its_three_words_and_only_limits() {
     let full = SupervisorConfig::default();
-    assert_eq!(full.autopilot, Autopilot::Cruise);
+    assert_eq!(full.turn_end.autopilot, Autopilot::Cruise);
     assert_eq!(Autopilot::default(), Autopilot::Cruise);
     assert_eq!(
         SupervisorConfig::default_shown("autopilot").as_deref(),
@@ -381,29 +383,6 @@ fn autopilot_reads_its_three_words_and_only_limits() {
         "after which sessions and beside the time a timed Cruise is offered to land at, \
          before what a box gets"
     );
-    for mode in Autopilot::ALL {
-        assert_eq!(Autopilot::parse(mode.word()), Some(mode), "{mode:?}");
-    }
-    for (word, want) in [
-        ("cruise", Some(Autopilot::Cruise)),
-        ("  CRUISE ", Some(Autopilot::Cruise)),
-        ("forever", Some(Autopilot::Cruise)),
-        ("Infinity", Some(Autopilot::Cruise)),
-        ("land", Some(Autopilot::Land)),
-        ("wrap-up", Some(Autopilot::Land)),
-        ("WrapUp", Some(Autopilot::Land)),
-        ("wrap", Some(Autopilot::Land)),
-        ("off", Some(Autopilot::Off)),
-        ("Off", Some(Autopilot::Off)),
-        ("on", None),
-        ("true", None),
-        ("false", None),
-        ("none", None),
-        ("wrap it up", None),
-        ("", None),
-    ] {
-        assert_eq!(Autopilot::parse(word), want, "{word:?}");
-    }
     for (text, want, said) in [
         ("\"cruise\"", Autopilot::Cruise, None),
         ("\"land\"", Autopilot::Land, None),
@@ -428,10 +407,13 @@ fn autopilot_reads_its_three_words_and_only_limits() {
     ] {
         let (c, notes) =
             SupervisorConfig::from_aterm_toml(&format!("[harness]\nautopilot = {text}\n"));
-        assert_eq!(c.autopilot, want, "{text}: {notes:?}");
+        assert_eq!(c.turn_end.autopilot, want, "{text}: {notes:?}");
         assert_eq!(
             SupervisorConfig {
-                autopilot: Autopilot::Cruise,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Cruise,
+                    ..c.turn_end.clone()
+                },
                 ..c
             },
             full,
@@ -463,26 +445,36 @@ fn autopilot_reads_its_three_words_and_only_limits() {
     assert_eq!(off.against_default().limits, ["autopilot: off"]);
     assert!(full.texts().contains(&("autopilot", "cruise".to_string())));
     assert_eq!(
-        read("[theme]\nharness.autopilot = \"land\"\n").autopilot,
+        read("[theme]\nharness.autopilot = \"land\"\n")
+            .turn_end
+            .autopilot,
         Autopilot::Land
     );
     assert_eq!(
         read("[harness]\nautopilot = \"land\"\n[theme]\nharness.autopilot = \"cruise\"\n")
+            .turn_end
             .autopilot,
         Autopilot::Land,
         "a misplaced key cannot undo the root table's limit"
     );
     assert_eq!(
-        read("[harness]\nautopilot = \"land\"\n[theme]\nharness.autopilot = \"off\"\n").autopilot,
+        read("[harness]\nautopilot = \"land\"\n[theme]\nharness.autopilot = \"off\"\n")
+            .turn_end
+            .autopilot,
         Autopilot::Off
     );
     assert_eq!(
-        read("font_px = \n[harness]\nautopilot = \"wrap-up\"\n").autopilot,
+        read("font_px = \n[harness]\nautopilot = \"wrap-up\"\n")
+            .turn_end
+            .autopilot,
         Autopilot::Land
     );
     for table in Autopilot::ALL {
         let cfg = SupervisorConfig {
-            autopilot: table,
+            turn_end: alab_policy::config::PolicyConfig {
+                autopilot: table,
+                ..full.clone().turn_end.clone()
+            },
             ..full.clone()
         };
         assert_eq!(cfg.autopilot_for(None), table, "{table:?}");
@@ -602,7 +594,7 @@ fn limit_reset_ships_off_and_only_the_root_table_turns_it_on() {
 
 #[test]
 fn limit_reset_kinds_is_the_owners_order_and_moves_only_with_the_step_off() {
-    use aterm_phase::ResetKind::{Full, Session, Weekly};
+    use alab_policy::vocab::ResetKind::{Full, Session, Weekly};
     let full = SupervisorConfig::default();
     assert!(
         full.limit_reset_kinds.is_empty(),
@@ -655,7 +647,7 @@ fn limit_reset_kinds_is_the_owners_order_and_moves_only_with_the_step_off() {
         assert_eq!(notes.len(), 1, "{text}: {notes:?}");
         assert!(notes[0].contains("limit_reset_kinds"), "{text}: {notes:?}");
     }
-    let listed = |on: bool, kinds: Vec<aterm_phase::ResetKind>| SupervisorConfig {
+    let listed = |on: bool, kinds: Vec<alab_policy::vocab::ResetKind>| SupervisorConfig {
         limit_reset: on,
         limit_reset_kinds: kinds,
         ..full.clone()

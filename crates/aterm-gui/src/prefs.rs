@@ -367,7 +367,7 @@ pub(crate) const EDIT_HARNESS_AUTOPILOT: &str = "harness.autopilot";
 pub(crate) const EDIT_HARNESS_LAND_AT: &str = "harness.land_at";
 /// [`EDIT_HARNESS_AUTOPILOT`]'s options.
 pub(crate) const HARNESS_AUTOPILOT_WORDS: [&str; 3] = {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let [a, b, c] = Autopilot::ALL;
     [a.word(), b.word(), c.word()]
 };
@@ -454,8 +454,6 @@ pub(crate) const EDIT_AI_PREFERRED: &str = "ai.preferred";
 pub(crate) const EDIT_AI_REVIEWS: &str = "ai.reviews";
 /// `[ai] review_permissions`.
 pub(crate) const EDIT_AI_REVIEW_PERMISSIONS: &str = "ai.review_permissions";
-/// `[ai] machine`.
-pub(crate) const EDIT_AI_MACHINE: &str = "ai.machine";
 /// `[ai] fleet`.
 pub(crate) const EDIT_AI_FLEET: &str = "ai.fleet";
 /// `[ai] fleet_key`.
@@ -723,11 +721,6 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         kind: EditKind::Enum {
             options: &aterm_agent::ai::permission::CHOICE_WORDS,
         },
-    },
-    NestedLeaf {
-        key: EDIT_AI_MACHINE,
-        label: "This machine's name in the fleet",
-        kind: EditKind::Text,
     },
     NestedLeaf {
         key: EDIT_AI_FLEET,
@@ -1074,6 +1067,7 @@ pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &spellings::TRAIL_STYLE_NAMES;
 pub(crate) const TRAIL_SOUND_STYLES: &[&str] = &[
     SoundVoice::Style.name(),
     SoundVoice::RainbowKittyV2.name(),
+    SoundVoice::MusicBoxII.name(),
     SoundVoice::Of(GlowStyle::Lumen).name(),
     SoundVoice::Of(GlowStyle::Sparkle).name(),
     SoundVoice::Of(GlowStyle::Comet).name(),
@@ -2784,10 +2778,9 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         EDIT_REROUTE_ANNOUNCE => boolean(cfg.reroute.as_ref().and_then(|r| r.announce), true),
         EDIT_HARNESS_ENABLED => boolean(Some(cfg.harness.policy.enabled), true),
         EDIT_HARNESS_AUTOPILOT => {
-            let mode = cfg.harness.policy.autopilot;
+            let mode = cfg.harness.policy.turn_end.autopilot;
             (
-                (mode != aterm_agent::supervise::Autopilot::Cruise)
-                    .then(|| mode.word().to_string()),
+                (mode != alab_policy::config::Autopilot::Cruise).then(|| mode.word().to_string()),
                 "cruise (default)".to_string(),
             )
         }
@@ -2839,7 +2832,6 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
                 "inherit (default)".to_string(),
             )
         }
-        EDIT_AI_MACHINE => txt(cfg.ai.local.machine.as_deref(), "none"),
         EDIT_AI_FLEET => {
             let shown = cfg
                 .ai
@@ -3119,7 +3111,7 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         return ("Permissions", 0);
     }
     if key == EDIT_MACHINE_UNIVERSAL_CONTROL {
-        return ("This Mac", 1);
+        return ("Machine settings", 1);
     }
     if key.starts_with("update.") {
         return ("Automatic updates", 3);
@@ -3393,7 +3385,6 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
         EDIT_AI_ENABLED => AI_ENABLED_NOTE,
         EDIT_AI_REVIEWS => AI_REVIEWS_NOTE,
         EDIT_AI_REVIEW_PERMISSIONS => AI_REVIEW_PERMISSIONS_NOTE,
-        EDIT_AI_MACHINE => AI_MACHINE_NOTE,
         EDIT_AI_FLEET => AI_FLEET_NOTE,
         EDIT_AI_FLEET_KEY => AI_FLEET_KEY_NOTE,
         k if ai_use_switch(k).is_some() => AI_USE_NOTE,
@@ -3413,9 +3404,6 @@ pub(crate) const AI_REVIEWS_NOTE: &str = "On, an AI agent here can ask every oth
 /// What the reviewers' permission level is.
 pub(crate) const AI_REVIEW_PERMISSIONS_NOTE: &str = "Inherit runs each reviewer with the \
      asking agent's own permissions, yolo when you ask; the others pin one level.";
-/// What this machine's fleet name is.
-pub(crate) const AI_MACHINE_NOTE: &str = "The [machine.<name>] row of the fleet document \
-     that applies to this machine.";
 /// What the fleet document is.
 pub(crate) const AI_FLEET_NOTE: &str = "One document for every machine: a file, or an \
      https:// URL fetched every six hours and checked against the signer's key.";
@@ -4406,7 +4394,6 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_AI_REVIEW_PERMISSIONS => {
             &["ai", "review", "permissions", "yolo", "inherit", "sandbox"]
         }
-        EDIT_AI_MACHINE => &["ai", "fleet", "machine", "name", "host"],
         EDIT_AI_FLEET => &["ai", "fleet", "document", "url", "path", "central"],
         EDIT_AI_FLEET_KEY => &["ai", "fleet", "key", "signer", "signature"],
         k if ai_use_switch(k).is_some() => &["ai", "cli", "use", "login", "review", "off"],

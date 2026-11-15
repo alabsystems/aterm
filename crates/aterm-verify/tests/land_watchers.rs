@@ -78,7 +78,8 @@ fn main() {
         .unwrap();
         wait_for(&dir.join("go"));
         if std::env::var_os("LAND_WATCHERS_INTERRUPT").is_some() {
-            aterm_verify::land::interrupt_judgment_awaiting(&mut child, MUST_HAPPEN);
+            let left = aterm_verify::land::interrupt_judgment_awaiting(&mut child, MUST_HAPPEN);
+            assert!(left.is_empty(), "the interrupt left {left:?} running");
         } else {
             publish(&dir.join("finish"), "finish");
             let status = until_within(MUST_HAPPEN, "the judgment's owning reap", || {

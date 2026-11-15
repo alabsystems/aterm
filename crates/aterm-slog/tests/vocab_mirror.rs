@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Vocabulary mirror tests between `aterm-slog` and `aterm-phase`. The mail kinds, the inbox
-//! verdicts and the story verbs need none: `vocab` spells them from astream-wire's `WakeClass`
-//! and `ReceiptVerdict` and aterm-messages' `StoryVerb`.
+//! Vocabulary mirror tests between `aterm-slog` and the screen reader's words: `aterm-phase`'s
+//! box kinds and alab-policy's wall kinds. The mail kinds, the inbox verdicts and the story verbs
+//! need none: `vocab` spells them from astream-wire's `WakeClass` and `ReceiptVerdict` and
+//! aterm-messages' `StoryVerb`.
 
-use aterm_phase::{ApiCause, PromptKind, WallKind as PhaseWall};
+use alab_policy::vocab::{ApiCause, WallKind as PhaseWall};
+use aterm_phase::PromptKind;
 use aterm_slog::vocab::{BOX_WORDS, WALL_WORDS};
 use aterm_slog::{BoxWord, Verdict, WallKind};
 

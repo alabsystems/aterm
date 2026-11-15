@@ -11,7 +11,11 @@ fn first_memory_signal_rechecks_human_and_budget_after_the_last_kernel_read() {
     for case in 0..3 {
         let (handle, mut reader) = testing::owned_handle(8130 + case);
         let ctx = Arc::clone(&handle.ctx);
-        let mut world = World::new(ctx.self_id.as_str()).unwrap();
+        let mut world = World::new(
+            aterm_types::tab_id::TabId::parse(ctx.self_id.as_str())
+                .expect("the owned handle has a minted tab ID"),
+        )
+        .unwrap();
         crate::harness_host::publish_snapshot_for_test(
             ctx.self_id.as_str(),
             Some(world.snapshot()),

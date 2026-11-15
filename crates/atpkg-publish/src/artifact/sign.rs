@@ -9,7 +9,7 @@ use std::sync::{Arc, PoisonError};
 use super::lineage_switch::{self, Switch};
 use super::pkgdoc;
 use crate::channel::Log;
-use crate::channel::index::newest_roster;
+use crate::channel::index::{RosterCandidate, newest_roster};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::HostError;
@@ -82,9 +82,12 @@ pub fn authority(ctx: &Ctx) -> Result<Authority> {
         .prefix("atpkg-publish-roster-")
         .tempdir()
         .map_err(|e| Error::io("create a scratch dir for the channel head's roster", &e))?;
-    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    let mut candidates: Vec<(String, RosterCandidate)> = Vec::new();
     match head_roster(ctx, scratch.path()) {
-        Ok(Some(path)) => candidates.push((format!("the head of {}", ctx.index_slug()), path)),
+        Ok(Some(path)) => candidates.push((
+            format!("the head of {}", ctx.index_slug()),
+            RosterCandidate::File(path),
+        )),
         Ok(None) => eprintln!(
             "atpkg-publish: {} serves no index yet — the rosters on this machine decide who \
              may sign",
@@ -100,13 +103,15 @@ pub fn authority(ctx: &Ctx) -> Result<Authority> {
     elect(ctx, &candidates)
 }
 
-fn local_candidates(ctx: &Ctx) -> Vec<(String, PathBuf)> {
-    [
+fn local_candidates(ctx: &Ctx) -> Vec<(String, RosterCandidate)> {
+    std::iter::once(RosterCandidate::File(
         ctx.repo_root.join("dist").join(QUAD_FILES[2]),
+    ))
+    .chain(std::iter::once(RosterCandidate::Store(ctx.home.clone())))
+    .chain(std::iter::once(RosterCandidate::File(
         ctx.identity.roster.clone(),
-    ]
-    .into_iter()
-    .map(|path| (ctx.shown(&path), path))
+    )))
+    .map(|candidate| (candidate.shown(ctx), candidate))
     .collect()
 }
 
@@ -118,7 +123,7 @@ pub fn elect_from_head(ctx: &Ctx, head: &crate::quad::VerifiedQuad) {
     }
     let mut candidates = vec![(
         format!("the head of {}", ctx.index_slug()),
-        head.file(QUAD_FILES[2]),
+        RosterCandidate::File(head.file(QUAD_FILES[2])),
     )];
     candidates.extend(local_candidates(ctx));
     if let Ok(authority) = elect(ctx, &candidates) {
@@ -140,13 +145,13 @@ pub fn elected(ctx: &Ctx) -> Result<Arc<Authority>> {
     Ok(fresh)
 }
 
-fn elect(ctx: &Ctx, candidates: &[(String, PathBuf)]) -> Result<Authority> {
-    let paths: Vec<PathBuf> = candidates.iter().map(|(_, p)| p.clone()).collect();
-    let pair = newest_roster(ctx, &paths, &mut Log::echo("atpkg-publish"))?;
+fn elect(ctx: &Ctx, candidates: &[(String, RosterCandidate)]) -> Result<Authority> {
+    let sources: Vec<RosterCandidate> = candidates.iter().map(|(_, c)| c.clone()).collect();
+    let pair = newest_roster(ctx, &sources, &mut Log::echo("atpkg-publish"))?;
     let label = candidates
         .iter()
-        .find(|(_, p)| *p == pair.path)
-        .map_or_else(|| ctx.shown(&pair.path), |(l, _)| l.clone());
+        .find(|(_, c)| *c == pair.source)
+        .map_or_else(|| pair.source.shown(ctx), |(l, _)| l.clone());
     let anchor = atpkg::Anchor::of(ctx.anchor.clone(), 0);
     let roster =
         atpkg::admit_roster(&anchor, pair.bytes, &pair.sig, ctx.now_unix).map_err(|why| {
@@ -289,7 +294,7 @@ pub fn sign_all(ctx: &Ctx, pkgs: &[PathBuf]) -> Result<Vec<PathBuf>> {
         let reference = super::bottle::reference::qualification::require(pkg, &bytes)?;
         prepared.push((pkg, bytes, reference));
     }
-    let key = MachineKey::load(ctx, &ctx.identity.key)?;
+    let key = MachineKey::this_machine(ctx)?;
     let authority = authority(ctx)?;
     let mut sigs = Vec::new();
     for (pkg, bytes, reference) in prepared {

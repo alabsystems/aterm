@@ -253,8 +253,9 @@ fn a_late_passive_read_cannot_publish_for_a_replacement_worker() {
     hooks.acts.snapshot = Arc::new(move |sid| {
         observed.fetch_add(1, Ordering::SeqCst);
         let captured = read(sid);
-        if captured.is_some() && hold_once.swap(false, Ordering::SeqCst) {
-            gate(sid);
+        if captured.is_ok() && hold_once.swap(false, Ordering::SeqCst) {
+            // Only the hold is the gate's: the read's answer is the captured one.
+            let _ = gate(sid);
         }
         captured
     });

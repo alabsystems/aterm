@@ -34,6 +34,15 @@ use crate::{
 };
 use aterm_effects::pipeline::TornBand;
 
+/// One geometry-plan leaf; its session is resolved only when the resize is applied.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlannedPaneResize {
+    pub(crate) tab: crate::tab_model::TabId,
+    pub(crate) view: crate::tab_model::ViewId,
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+}
+
 #[cfg(clean_islands)]
 macro_rules! trust_island {
     ($($item:item)*) => {
@@ -221,6 +230,7 @@ fn retire_torn_cursor_fx_host(window: &mut WindowState) {
     window.fx.companions_mut().cursor_cat.rebase_placement();
     window.composed_cursor_effect_valid = false;
     window.composed_cursor_fill = None;
+    window.composed_cursor_keyline_tint = None;
     window.composed_cursor_style_override = None;
     window.block_fill = None;
     suppress_torn_cursor_projection(&mut window.input_scratch);
@@ -238,6 +248,7 @@ fn suppress_torn_cursor_projection(input: &mut aterm_core::render::RenderInput) 
     input.cursor_trail.clear();
     input.cursor_effect_style_override = None;
     input.cursor_fill_override = None;
+    input.cursor_keyline_tint = None;
     // The kitty cursor, the pet and the word cats: the companions' sprite
     // layers (the rain's rows are no projection of the cursor and stay).
     input
@@ -392,6 +403,20 @@ fn window_cursor_fill(
         Some(INACTIVE_CURSOR_FILL)
     } else {
         active_fill
+    }
+}
+
+/// The keyline tint a window's caret draws ([`RenderInput::cursor_keyline_tint`]): none on an
+/// unfocused window's hollow block, which is no effect's body.
+#[inline]
+const fn window_cursor_keyline_tint(
+    cursor_override: Option<CursorStyle>,
+    keyline: Option<u32>,
+) -> Option<u32> {
+    if matches!(cursor_override, Some(CursorStyle::HollowBlock)) {
+        None
+    } else {
+        keyline
     }
 }
 
@@ -941,6 +966,8 @@ pub(crate) struct CompanionStep {
 pub(crate) struct PetKept {
     pub(crate) walks: bool,
     pub(crate) flies: bool,
+    /// The animal the flier is: the body the cat flies in ([`crate::kitty_cursor::CursorCat::set_body`]).
+    pub(crate) flier: Option<aterm_effects::kitty_pet::PetSpecies>,
 }
 
 impl PetKept {
@@ -948,7 +975,8 @@ impl PetKept {
     pub(crate) const fn of(presentation: &crate::app_config::ResolvedTrailPresentation) -> Self {
         Self {
             walks: presentation.pet_species.is_some(),
-            flies: presentation.pet_flies,
+            flies: presentation.pet_flier.is_some(),
+            flier: presentation.pet_flier,
         }
     }
 }
@@ -1012,6 +1040,9 @@ pub(crate) fn step_cursor_companions(
         ws.fx.companions_mut().sing_riff_bar = None;
     }
     let c = ws.fx.companions_mut();
+    // The body follows the pet setting, latched for the next appearance: a flier glides in
+    // whatever summoned it, a song included; a walker's singing head stays a head.
+    c.cursor_cat.set_body(pet.flier);
     c.cursor_cat.set_singing(
         now,
         crate::kitty_cursor::SingSync {
@@ -1497,6 +1528,7 @@ fn prepare_routed_head(
         geom,
         cursor: cell,
         look: cat_frame.render_look(),
+        body: cat_frame.body,
         bob: cat_frame.bob,
         lift: seat.lift,
     };
@@ -1637,6 +1669,7 @@ pub(crate) fn emit_routed_cursor_companion(
             geom,
             cursor: cell,
             look: cat_frame.render_look(),
+            body: cat_frame.body,
             bob: cat_frame.bob,
             lift: seat_lift,
         };
@@ -1672,6 +1705,7 @@ pub(crate) fn emit_routed_cursor_companion(
                     geom,
                     cursor: cell,
                     look: layout.look,
+                    body: layout.body,
                     colors,
                     bob: cat_frame.bob,
                     lift: seat_lift,
@@ -3317,6 +3351,18 @@ pub(crate) fn verdict_voice(failed: bool, dur_ms: Option<u64>) -> Option<(bool, 
     (dur >= VERDICT_MIN_MS).then_some((false, dur >= VERDICT_ICE_MS))
 }
 
+/// The result the sound hears: [`verdict_voice`]'s, and for the new music box every keyed command's, since a quick pass is what brings its phrase home.
+pub(crate) fn verdict_sound(
+    voice: aterm_effects::trail_sound::SoundVoice,
+    failed: bool,
+    dur_ms: Option<u64>,
+) -> Option<(bool, bool)> {
+    verdict_voice(failed, dur_ms).or_else(|| {
+        matches!(voice, aterm_effects::trail_sound::SoundVoice::MusicBoxII)
+            .then_some((false, false))
+    })
+}
+
 /// The resident pet's frame grid in the host contract's terms.
 pub(crate) fn pet_frame_geom(
     cell: (usize, usize),
@@ -4274,6 +4320,7 @@ fn fill_divider_grid_cells<T>(
     dst.cursor_style = CursorStyle::default();
     dst.cursor_effect_style_override = None;
     dst.cursor_fill_override = None;
+    dst.cursor_keyline_tint = None;
     dst.cursor_trail_color = 0;
     dst.display_offset = 0;
     dst.base_y = 0;
@@ -4417,6 +4464,8 @@ struct FocusedComposedCursorEffects<'a> {
     trail: &'a [aterm_core::render::TrailCell],
     trail_color: u32,
     active_cursor_fill: Option<u32>,
+    /// The block caret's keyline tint ([`RenderInput::cursor_keyline_tint`]).
+    active_cursor_keyline_tint: Option<u32>,
     fx_layers: &'a [aterm_core::render::FxLayer],
     /// Whether the focused pane's text holds the GPU's bloom, or the post
     /// passes spare its letters ([`RenderInput::bloom_gate`]).
@@ -4478,6 +4527,7 @@ fn project_focused_composed_cursor_effects(
     let Some(clip) = clip else {
         withdraw_fx_layers(&mut dst.fx_layers, effects.fx_layers);
         dst.cursor_fill_override = None;
+        dst.cursor_keyline_tint = None;
         dst.cursor_trail_color = effects.trail_color;
         return;
     };
@@ -4497,6 +4547,8 @@ fn project_focused_composed_cursor_effects(
     dst.cursor_trail_color = effects.trail_color;
     dst.cursor_fill_override =
         window_cursor_fill(focus_cursor_override, effects.active_cursor_fill);
+    dst.cursor_keyline_tint =
+        window_cursor_keyline_tint(focus_cursor_override, effects.active_cursor_keyline_tint);
     dst.cursor_effect_style_override = body_style_override;
 
     let clip_quad = |x: u16, y: u16, w: u16, h: u16| {
@@ -5453,6 +5505,8 @@ pub(crate) struct CursorFxTick {
     /// The caret body's colour this tick (`CursorFxFrame::caret_fill`): a bar or underline
     /// caret's lifted colour over the block's.
     pub caret_fill: Option<u32>,
+    /// The block caret's keyline tint this tick (`CursorFxFrame::keyline_tint`).
+    pub caret_keyline_tint: Option<u32>,
     pub bolt_cursor: bool,
     pub twinkle_cursor: bool,
     pub momentum_steady: Option<CursorStyle>,
@@ -6025,6 +6079,27 @@ impl App {
         active_plan: Option<&crate::tab_model::VisibleLeafPlan>,
         site: crate::resize_ledger::Site,
     ) {
+        self.resize_panes_scoped_selected(wid, active_only, active_plan, site, None);
+    }
+
+    /// Apply one validated target of the cold restore's final re-grid without replanning a tree.
+    pub(crate) fn resize_restored_target(&mut self, wid: WindowId, target: PlannedPaneResize) {
+        let _scope = crate::resize_ledger::SiteScope::enter(crate::resize_ledger::Cause::Restore);
+        let site = crate::resize_ledger::Site::caller(
+            crate::resize_ledger::Cause::Restore,
+            std::panic::Location::caller(),
+        );
+        self.resize_panes_scoped_selected(wid, false, None, site, Some(target));
+    }
+
+    fn resize_panes_scoped_selected(
+        &mut self,
+        wid: WindowId,
+        active_only: bool,
+        active_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+        site: crate::resize_ledger::Site,
+        selected: Option<PlannedPaneResize>,
+    ) {
         let Some(ws) = self.windows.get(&wid) else {
             return;
         };
@@ -6038,47 +6113,63 @@ impl App {
         let ntabs = ws.tab_set.len();
         let pane_cell_px = self.spawn_cell_px(wid);
         let mut targets: Vec<(usize, u64, u16, u16)> = Vec::new();
-        for (ti, tab) in ws.tab_set.tabs().iter().enumerate() {
-            // Under `active_only`, skip laying out background tabs the second loop
-            // would discard anyway (`visible_plan` allocates per leaf and divider,
-            // and `redraw_window` makes this call every frame of a live drag). The
-            // predicate is the second loop's (`pool.views(id) > 1`): a background
-            // tab is laid out iff some leaf holds a shared session. The per-pane
-            // `continue` below stays, since such a tab can also hold non-shared
-            // siblings.
-            if active_only
-                && ti != active
-                && !tab.root.any_leaf(&mut |view| {
-                    self.view_store
-                        .get(*view)
+        if let Some(target) = selected {
+            if let Some(session) = self
+                .view_store
+                .get(target.view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+            {
+                let index = if ws.tab_set.active_id() == Some(target.tab) {
+                    active
+                } else {
+                    usize::MAX
+                };
+                targets.push((index, session, target.rows, target.cols));
+            }
+        } else {
+            for (ti, tab) in ws.tab_set.tabs().iter().enumerate() {
+                // Under `active_only`, skip laying out background tabs the second loop
+                // would discard anyway (`visible_plan` allocates per leaf and divider,
+                // and `redraw_window` makes this call every frame of a live drag). The
+                // predicate is the second loop's (`pool.views(id) > 1`): a background
+                // tab is laid out iff some leaf holds a shared session. The per-pane
+                // `continue` below stays, since such a tab can also hold non-shared
+                // siblings.
+                if active_only
+                    && ti != active
+                    && !tab.root.any_leaf(&mut |view| {
+                        self.view_store
+                            .get(*view)
+                            .copied()
+                            .and_then(crate::tab_model::View::terminal_session)
+                            .and_then(|session| self.pool.views(session))
+                            .is_some_and(|views| views > 1)
+                    })
+                {
+                    continue;
+                }
+                let owned_plan;
+                let plan = if ti == active
+                    && let Some(plan) = active_plan
+                {
+                    plan
+                } else {
+                    owned_plan = self.plan_tab(tab, rows.max(1), cols.max(1));
+                    &owned_plan
+                };
+                for leaf in &plan.leaves {
+                    let Some(session) = self
+                        .view_store
+                        .get(leaf.view)
                         .copied()
                         .and_then(crate::tab_model::View::terminal_session)
-                        .and_then(|session| self.pool.views(session))
-                        .is_some_and(|views| views > 1)
-                })
-            {
-                continue;
-            }
-            let owned_plan;
-            let plan = if ti == active
-                && let Some(plan) = active_plan
-            {
-                plan
-            } else {
-                owned_plan = self.plan_tab(tab, rows.max(1), cols.max(1));
-                &owned_plan
-            };
-            for leaf in &plan.leaves {
-                let Some(session) = self
-                    .view_store
-                    .get(leaf.view)
-                    .copied()
-                    .and_then(crate::tab_model::View::terminal_session)
-                else {
-                    continue;
-                };
-                let (sub_rows, sub_cols) = Self::leaf_grid_cells(&leaf.rect);
-                targets.push((ti, session, sub_rows, sub_cols));
+                    else {
+                        continue;
+                    };
+                    let (sub_rows, sub_cols) = Self::leaf_grid_cells(&leaf.rect);
+                    targets.push((ti, session, sub_rows, sub_cols));
+                }
             }
         }
         let reflow_wake_proxy = self.proxy.clone();
@@ -7013,6 +7104,27 @@ impl App {
         }
     }
 
+    /// `trail warm`: build the cursor trail's pipeline states off the frame path, as a window's
+    /// mint does (a headless instance warms nothing by itself, `app_window.rs`), and read the
+    /// warm's standing: `owed=` builds it has not handed over yet and `frame_builds=` states the
+    /// frames built on the frame thread because no warm had. Idempotent: a state held or owed is
+    /// not asked for again.
+    pub(crate) fn trail_warm(&mut self) -> Result<String, String> {
+        // A headless instance builds its device at the first pixel demand; the warm is one.
+        self.ensure_pixel_backend();
+        let Backend::Gpu(g) = self.backend.ready_mut() else {
+            return Err("no GPU renderer: nothing to warm".to_string());
+        };
+        if !g.warm_effect_pipelines_now() {
+            return Err("this renderer has no Metal arm: its frames build every state".to_string());
+        }
+        let standing = g.pipeline_warm_standing();
+        Ok(format!(
+            "trail-warm owed={} frame_builds={}",
+            standing.owed, standing.frame_builds
+        ))
+    }
+
     /// `trail light`: the front window's light latch as its last frame left it, and its light
     /// read now ([`Self::window_light`]); `trail status` is unchanged.
     pub(crate) fn trail_light(&self) -> Result<String, String> {
@@ -7165,9 +7277,10 @@ impl App {
             icons.push_str("none");
         }
         Ok(format!(
-            "{line} word_icons={icons} {} resting={}",
+            "{line} word_icons={icons} {} resting={} sight={}",
             self.trail_target_fields()?,
-            ws.rest.resting()
+            ws.rest.resting(),
+            ws.sight().name()
         ))
     }
 
@@ -7366,6 +7479,9 @@ impl App {
         let editable =
             editable && vim_frame.is_some_and(|frame| self.vim_frame_is_current(id, frame));
         self.aos_settle_hold(id, frame_started);
+        let focused_session = self.focused_session_id(id);
+        let sound_session =
+            aterm_effects::trail_sound::EventMeta::session_of(focused_session.unwrap_or(0));
         let ws = self.windows.get_mut(&id)?;
         ws.fx.cursor_mut().glow.note_composer_entry(vim_entry);
         ws.fx.cursor_mut().glow.note_composer_insert_frame(editable);
@@ -7455,7 +7571,7 @@ impl App {
         forward_kitty_cursor_motion(
             glow_cfg.enabled,
             pet_mode,
-            trail_presentation.pet_flies,
+            trail_presentation.pet_flier.is_some(),
             glow_cfg.style,
             step.motion_pulse,
             &mut ws.fx.companions_mut().cursor_cat,
@@ -7482,6 +7598,9 @@ impl App {
                 .effective(self.config.tone_melody_or_default());
             let mut last_at_ms = 0u32;
             let flow_heat = ws.fx.cursor_mut().glow.flow_status().heat;
+            // The Enter that ran a command at this session's prompt, until its sound is sent.
+            let mut prompt_enter = ws.prompt_enter.is_some() && ws.prompt_enter == focused_session;
+            let asked = prompt_enter;
             drain_trail_sound_cues(
                 &mut ws.fx.cursor_mut().glow,
                 glow_cfg.style,
@@ -7495,6 +7614,12 @@ impl App {
                 |event| {
                     let at_ms = input_clock_ms().max(last_at_ms.wrapping_add(1));
                     last_at_ms = at_ms;
+                    let prompt = matches!(
+                        event.kind,
+                        aterm_effects::trail_sound::SoundGesture::Trail(
+                            aterm_effects::trail_sound::SoundKind::Enter { .. }
+                        )
+                    ) && std::mem::take(&mut prompt_enter);
                     self.trail_audio.push_meta(
                         event,
                         aterm_effects::trail_sound::EventMeta {
@@ -7504,10 +7629,15 @@ impl App {
                             pan_from: 0.0,
                             block_lead_s: 0.0,
                             flow: flow_heat,
+                            session: sound_session,
+                            prompt,
                         },
                     );
                 },
             );
+            if asked && !prompt_enter {
+                ws.prompt_enter = None;
+            }
         }
         if let Some(ws) = self.windows.get(&id) {
             let fx = ws.fx.cursor();
@@ -7533,6 +7663,7 @@ impl App {
             trail_fp: frame.trail_fp,
             block_fill: frame.block_fill,
             caret_fill: frame.caret_fill(),
+            caret_keyline_tint: frame.keyline_tint,
             bolt_cursor: frame.bolt_cursor,
             twinkle_cursor: frame.twinkle_cursor,
             momentum_steady: frame.momentum_steady,
@@ -7634,6 +7765,7 @@ impl App {
         };
         let valid = window.composed_cursor_effect_valid;
         let active_cursor_fill = window.composed_cursor_fill;
+        let active_cursor_keyline_tint = window.composed_cursor_keyline_tint;
         let body_style_override = valid
             .then_some(window.composed_cursor_style_override)
             .flatten();
@@ -7665,6 +7797,7 @@ impl App {
                     trail: trail_scratch,
                     trail_color,
                     active_cursor_fill,
+                    active_cursor_keyline_tint,
                     fx_layers: &[],
                     bloom_gate,
                 },
@@ -7687,6 +7820,7 @@ impl App {
                     trail: &[],
                     trail_color: 0,
                     active_cursor_fill: None,
+                    active_cursor_keyline_tint: None,
                     fx_layers: &[],
                     bloom_gate,
                 },
@@ -8136,6 +8270,7 @@ impl App {
         };
         let block_fill = fx.block_fill;
         let active_fill = presented_caret_fill(fx.caret_fill, block_fill);
+        let active_keyline_tint = fx.caret_keyline_tint;
         let body_style_override =
             compose_caret_style_override(fx.bolt_cursor, fx.twinkle_cursor, fx.momentum_steady);
         let Some(window) = self.windows.get_mut(&wid) else {
@@ -8144,6 +8279,7 @@ impl App {
         window.composed_cursor_effect_valid = true;
         window.composed_cursor_effect_session = Some(terminal_view.session);
         window.composed_cursor_fill = active_fill;
+        window.composed_cursor_keyline_tint = active_keyline_tint;
         window.composed_cursor_style_override = body_style_override;
         window.composed_cursor_trail_color = fx.trail_color;
         let projected = self.project_retained_composed_cursor_effects(wid, clip, cursor_override);
@@ -8221,8 +8357,13 @@ impl App {
         crate::settings_preview::PreviewAnimation,
     )> {
         let window = self.windows.get(&wid)?;
+        // A hidden window's preview ticks no frame it would park (`docs/ATERM_DESIGN.md` §7.4).
         if !crate::native_preview_may_tick(
-            window.os_window.is_some(),
+            crate::idle_draw::clocks_have_glass(
+                window.os_window.is_some(),
+                window.occluded,
+                recorded,
+            ),
             window.focused,
             recorded,
             window.overlay.is_some(),
@@ -9890,7 +10031,7 @@ impl App {
             && state.pending_reveal.take().is_some()
             && let Some(window) = state.os_window.clone()
         {
-            window.set_visible(true);
+            crate::app_window::reveal_os_window(&window, state.passive_reveal);
             crate::metrics::mark_first_window_visible();
             self.maybe_signal_handoff_ready();
         } else if self.handoff_ready.is_some() {
@@ -10635,6 +10776,44 @@ impl App {
         self.redraw_window_with_layout(id, Some((plan, route)), None);
     }
 
+    /// What a parked frame of a hidden window still does besides drawing
+    /// (`docs/ATERM_DESIGN.md` §7.4), all of it CPU work: it pays the re-grid its panes are owed (a
+    /// restore's, or a `panes_stale` one a cross-session resize leaves), so the programs in them
+    /// see their panes' sizes, and it carries the front terminal's title to the window (its Window
+    /// menu, Dock and Mission Control name) and to the store. An assistive client's tree needs a
+    /// drawn frame, so a window one reads never parks (`WindowState::frontend_awaits_present`).
+    fn settle_parked_frame(&mut self, id: WindowId, now: Instant) {
+        let Some((plan, route)) = self.active_visible_frame_layout(id) else {
+            return;
+        };
+        self.pay_restore_regrid_if_due(id, now);
+        if self.windows.get(&id).is_some_and(|ws| ws.panes_stale) {
+            let site = crate::resize_ledger::Site::caller(
+                crate::resize_ledger::Cause::Redraw,
+                std::panic::Location::caller(),
+            );
+            self.resize_panes_scoped_with_active_plan(id, true, Some(&plan), site);
+        }
+        if !matches!(route, crate::VisibleContentRoute::Terminal { .. }) {
+            return;
+        }
+        let Some(front_terminal) = self.shown_front(id) else {
+            return;
+        };
+        let title = crate::term_lock_ui(
+            &front_terminal.term,
+            &front_terminal.ui_waiting,
+            crate::metrics::TermWaitSite::Redraw,
+        )
+        .title_arc();
+        match self.windows.get(&id).and_then(|ws| ws.os_window.clone()) {
+            Some(window) => self.apply_title(id, &window, &title),
+            None => {
+                let _ = self.publish_active_terminal_title(id, &title);
+            }
+        }
+    }
+
     fn redraw_window_with_layout(
         &mut self,
         id: WindowId,
@@ -10651,12 +10830,27 @@ impl App {
                 metrics::note_redraw_retry_gated();
                 #[cfg(a11y_tree)]
                 if ws.present_retry.parked {
-                    self.publish_in_a_parked_window(id, Instant::now());
+                    self.publish_in_a_parked_window(id, frame_clock.unwrap_or_else(Instant::now));
                 }
                 return;
             }
             None => return,
             Some(_) => {}
+        }
+        // A window nobody can see composes and presents nothing, or a covered one at most a
+        // frame every 5 s: the present stays owed, paid at the period's end or once the window
+        // is visible again (`docs/ATERM_DESIGN.md` §7.4). The frame's work that is not drawing
+        // is still done.
+        let recording = self.video_rec.as_ref().is_some_and(|rec| rec.window == id);
+        let parked_at = frame_clock.unwrap_or_else(Instant::now);
+        if self
+            .windows
+            .get_mut(&id)
+            .is_some_and(|ws| ws.park_hidden_frame(recording, parked_at))
+        {
+            metrics::note_redraw_hidden_parked();
+            self.settle_parked_frame(id, parked_at);
+            return;
         }
         #[cfg(windows)]
         if let Some(w) = self.windows.get(&id).and_then(|ws| ws.os_window.as_ref()) {
@@ -11130,6 +11324,7 @@ impl App {
                 trail_fp,
                 block_fill,
                 caret_fill,
+                caret_keyline_tint,
                 bolt_cursor,
                 twinkle_cursor,
                 momentum_steady,
@@ -11311,7 +11506,7 @@ impl App {
                 .with_caret_path(caret_path),
             );
             mark_end_cheered(&mut self.harness_glass, pet_tick.landed_seen);
-            let mut verdict_cue: Option<(bool, bool)> = None;
+            let mut verdict_heard: Option<(bool, bool)> = None;
             if let Some((code, dur_ms)) = pet_tick.completion
                 && keyed_celebration_completion(
                     &mut ws.fx.companions_mut().kitty_sing,
@@ -11322,7 +11517,8 @@ impl App {
                     code,
                 )
             {
-                verdict_cue = verdict_voice(code != 0, dur_ms);
+                let verdict_cue = verdict_voice(code != 0, dur_ms);
+                verdict_heard = verdict_sound(self.config.trail_sound_voice(), code != 0, dur_ms);
                 if let Some((false, true)) = verdict_cue {
                     ws.fx.cursor_mut().glow.note_command_verdict(frame_started);
                 }
@@ -11605,7 +11801,7 @@ impl App {
                     !std::mem::replace(&mut ws.verdict_hush, false)
                 }
             });
-            if let Some((failed, ice)) = verdict_cue
+            if let Some((failed, ice)) = verdict_heard
                 && let Some(gain) = voice_gain(
                     Voice::Verdict,
                     &VoiceTerms {
@@ -11617,8 +11813,10 @@ impl App {
                     },
                 )
             {
-                self.trail_audio
-                    .push(aterm_effects::trail_sound::SoundEvent {
+                // Stamped on the keys' clock and with the session, so the new music box can tell
+                // which Enter this answers and how long it took.
+                self.trail_audio.push_meta(
+                    aterm_effects::trail_sound::SoundEvent {
                         style: glow_cfg.style,
                         voice: self.config.trail_sound_voice(),
                         kind: aterm_effects::trail_sound::SoundGesture::Output(
@@ -11631,7 +11829,15 @@ impl App {
                         shifted: false,
                         tone: aterm_effects::tone::Tone::Technical,
                         bed: false,
-                    });
+                    },
+                    aterm_effects::trail_sound::EventMeta {
+                        at_ms: input_clock_ms(),
+                        session: aterm_effects::trail_sound::EventMeta::session_of(
+                            front_terminal.session,
+                        ),
+                        ..aterm_effects::trail_sound::EventMeta::EMPTY
+                    },
+                );
             }
             if let Some(cue) = streak_cue
                 && let Some(gain) = voice_gain(
@@ -11901,6 +12107,8 @@ impl App {
                 cursor_override,
                 presented_caret_fill(caret_fill, block_fill),
             );
+            ws.input_scratch.cursor_keyline_tint =
+                window_cursor_keyline_tint(cursor_override, caret_keyline_tint);
             ws.input_scratch.input_hot = ws.input_hot;
             ws.input_scratch.cursor_trail_color = trail_color;
             ws.block_fill = presented_block_fill(
@@ -14409,6 +14617,7 @@ impl App {
             geom,
             cursor: cell,
             look: cat_frame.render_look(),
+            body: cat_frame.body,
             bob: cat_frame.bob,
             lift: seat_lift,
         };
@@ -14446,6 +14655,7 @@ impl App {
                 geom,
                 cursor: cell,
                 look: layout.look,
+                body: layout.body,
                 colors,
                 bob: cat_frame.bob,
                 lift: seat_lift,
@@ -15139,6 +15349,7 @@ impl App {
         let trail_fp = fx.trail_fp;
         let block_fill = fx.block_fill;
         let active_cursor_fill = presented_caret_fill(fx.caret_fill, block_fill);
+        let active_cursor_keyline_tint = fx.caret_keyline_tint;
         let body_style_override =
             compose_caret_style_override(fx.bolt_cursor, fx.twinkle_cursor, fx.momentum_steady);
         let focused = fx.win_focused;
@@ -15805,6 +16016,7 @@ impl App {
                 trail: &cursor_fx.trail_scratch,
                 trail_color,
                 active_cursor_fill,
+                active_cursor_keyline_tint,
                 fx_layers: &[],
                 bloom_gate: cursor_fx.bloom_gate(),
             },
@@ -15820,6 +16032,7 @@ impl App {
         ws.composed_cursor_effect_valid = true;
         ws.composed_cursor_effect_session = Some(focus);
         ws.composed_cursor_fill = active_cursor_fill;
+        ws.composed_cursor_keyline_tint = active_cursor_keyline_tint;
         ws.composed_cursor_style_override = body_style_override;
         ws.composed_cursor_trail_color = trail_color;
         ws.fx.publish_rain(&mut ws.input_scratch);
@@ -17698,6 +17911,7 @@ impl App {
                     !self.restore_size_unlanded(wid)
                 }
             })
+            && !self.resume_drain_regrid()
         {
             self.settle_restore_regrid(wid);
         }

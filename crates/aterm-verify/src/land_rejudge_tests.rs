@@ -84,8 +84,12 @@ fn replay(scenario: &str) {
         for package in packages {
             cmd.args(["-p", package]);
         }
-        aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
-            .expect("fixture tests finish")
+        aterm_uds::deadline::output_while_process_progressing(
+            &mut cmd,
+            aterm_spec::wait::MUST_HAPPEN,
+            "the fixture's own tests under Targo",
+        )
+        .expect("fixture tests finish")
     };
     // Warm every package in the same stable path before moving main or judging either cone.
     assert!(run_tests(&world.work, &[]).status.success());
@@ -210,8 +214,7 @@ fn replay(scenario: &str) {
                     )
                 })
             },
-            branch: &mut |_, _| crates(if narrow { &["a", "fan0"] } else { &["a"] }),
-            lane: &mut |_, _| Lane::Pass,
+            records: super::quiet(),
             reach: &live_reach,
             recheck: &mut |root, _, base, delta| {
                 assert!(
@@ -225,9 +228,12 @@ fn replay(scenario: &str) {
                     &tools,
                     &path_env,
                     base,
-                    &delta.judged,
-                    delta.shared.clone(),
-                    delta.mechanical,
+                    &crate::changed::Round {
+                        judged: delta.judged.clone(),
+                        shared: delta.shared.clone(),
+                        readers: delta.readers.clone(),
+                        mechanical: delta.mechanical,
+                    },
                 );
                 let crate::changed::Selection::Narrowed { crates, .. } = selection else {
                     panic!("fixture cone widened: {selection:?}");
@@ -254,6 +260,7 @@ fn replay(scenario: &str) {
                     ran(exit::FAILED, rows, began.elapsed().as_secs())
                 }
             },
+            autofix: &mut |_: &Path, _: &[String]| Ok(()),
             hand_over: &mut |_, _, _| panic!("no handoff was expected"),
             say: &mut |line| said.push(line.to_owned()),
             remote: &crate::remote::run,

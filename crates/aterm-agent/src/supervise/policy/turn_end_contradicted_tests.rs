@@ -8,7 +8,7 @@
 // note names the mutant each test was seen failing under.
 
 use crate::harness::repo_work::{RepoRead, RepoWork};
-use crate::supervise::policy::land_check;
+use alab_policy::land_check;
 
 /// A false defense: clean words over work git still finds.
 const DEFENSE: &str = "Nothing left: the parser is committed and pushed to origin/main.";

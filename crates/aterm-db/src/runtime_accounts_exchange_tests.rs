@@ -182,7 +182,7 @@ fn authenticated_application_failure_is_published_separately_from_peer_contact()
         &bootstrap,
         &std::cell::OnceCell::new(),
         &mut history,
-        vec![(actor, at)],
+        vec![(actor, at, crate::network_state::RELAYED_LEASE)],
         std::slice::from_ref(&failed),
         &place::Publisher::default(),
         || (2000, at + Duration::from_secs(1)),
@@ -273,7 +273,12 @@ fn a_writer_successor_owner_takes_up_its_earlier_seats_network_history() {
     history
         .local(machine_identity(&earlier), trust, Vec::new)
         .unwrap();
-    history.contact(machine_identity(&stranger), 1000, Instant::now());
+    history.contact(
+        machine_identity(&stranger),
+        1000,
+        Instant::now(),
+        crate::network_state::RELAYED_LEASE,
+    );
     drop(history);
     let deadline = crate::admission::deadline;
     assert!(
@@ -326,7 +331,12 @@ fn a_writer_successor_owner_takes_up_its_earlier_seats_network_history() {
         })
         .unwrap();
     let at = Instant::now();
-    history.contact(machine_identity(&stranger), 2000, at);
+    history.contact(
+        machine_identity(&stranger),
+        2000,
+        at,
+        crate::network_state::RELAYED_LEASE,
+    );
     history.observe(Visibility::Active, 0, "observing", 2000, at);
     let snapshot = handle.snapshot();
     assert_eq!(snapshot.history, HistoryState::Ready);

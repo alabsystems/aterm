@@ -11,6 +11,11 @@ use std::time::Instant;
 const WAITING: &str = "OK codex-rotation state=waiting\n";
 const RETRY_MS: u64 = 5_000;
 const OBSERVATION_MS: u64 = 60_000;
+/// How long before its observation lapses a selection is no longer published. The session
+/// commits a receipt in the step after it reads it, and [`commit_pool`] refuses a selection whose
+/// observation is [`OBSERVATION_MS`] old: one published with less than this left could lapse
+/// before that commit.
+const COMMIT_MARGIN_MS: u64 = 10_000;
 
 #[derive(Debug)]
 pub(in crate::native_act) struct Preparation {
@@ -36,6 +41,9 @@ struct Selection {
     proposal: pool::Proposal,
     observed: Instant,
     receipt: Option<Receipt>,
+    /// When a publication that failed may be tried again; `None` where none has failed since
+    /// the selection was made or last published.
+    publish_at: Option<Instant>,
 }
 
 impl Preparation {
@@ -80,13 +88,21 @@ impl Preparation {
 }
 
 fn index(job: &Preparation) -> Option<renewal::IndexKey> {
-    renewal::IndexKey::quota(&job.intent, job.process.pid, job.process.birth, &job.start).ok()
+    renewal::IndexKey::moved(&job.intent, job.process.pid, job.process.birth, &job.start).ok()
+}
+
+/// The live reader against the isolated HTTPS usage server a Rust fixture pins the roots of.
+#[cfg(debug_assertions)]
+pub(super) struct FixtureUsage<'a> {
+    live: pool::LiveUsage<'a>,
+    roots: Vec<Vec<u8>>,
 }
 
 #[cfg(debug_assertions)]
-struct FixtureUsage<'a> {
-    live: pool::LiveUsage<'a>,
-    roots: Vec<Vec<u8>>,
+impl<'a> FixtureUsage<'a> {
+    pub(super) const fn new(live: pool::LiveUsage<'a>, roots: Vec<Vec<u8>>) -> Self {
+        Self { live, roots }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -109,7 +125,6 @@ impl pool::UsageReader for FixtureUsage<'_> {
             self.roots.clone(),
             use_token,
         )
-        .into()
     }
 }
 
@@ -209,6 +224,7 @@ fn progress_after_observation(
             proposal,
             observed: now,
             receipt: None,
+            publish_at: None,
         })),
         Err(why) if current && pool::prepare_refusal_stands(why).is_some() => {
             if let Some(end) = pool::prepare_refusal_stands(why) {
@@ -314,35 +330,78 @@ pub(super) fn prepare(
         Err(_) | Ok(None) => return WAITING.into(),
         Ok(Some(None)) => {}
     }
-    let mut progress = job.progress.lock().unwrap_or_else(|p| p.into_inner());
-    match &mut *progress {
-        Progress::Reading => WAITING.into(),
-        Progress::Retry(at) if Instant::now() < *at => WAITING.into(),
+    ask(
+        &job.progress,
+        Instant::now(),
+        |selected| publish(ctx, env, proof, resume, &job, selected, &index),
+        || start(ctx, env, resume, &job),
+    )
+}
+
+/// What an ask at `now` is answered from its job's progress, and whether it starts a read of the
+/// accounts' usage, which [`ask`] does once the progress is unlocked. A selection is published
+/// by `publish`. One whose publication fails is kept, and the first ask [`RETRY_MS`] later
+/// publishes it again: a busy receipt writer, a taken sign-in turn or a changed claim is nothing
+/// a new read of the provider answers, so a failed publication starts none, and an ask before
+/// then publishes nothing. A selection within [`COMMIT_MARGIN_MS`] of its observation's end is
+/// not published: it is dropped, and the next ask reads again. A selection the records refute
+/// fails its publication like any other, and so waits until then for its next read.
+fn answer(
+    progress: &mut Progress,
+    now: Instant,
+    publish: impl FnOnce(&Selection) -> Result<Receipt, &'static str>,
+) -> (String, bool) {
+    match progress {
+        Progress::Reading => (WAITING.into(), false),
+        Progress::Retry(at) if now < *at => (WAITING.into(), false),
         Progress::Retry(_) => {
             *progress = Progress::Reading;
-            drop(progress);
-            start(ctx, env, resume, &job);
-            WAITING.into()
+            (WAITING.into(), true)
         }
-        Progress::NotNeeded => "OK codex-rotation state=not-needed\n".into(),
+        Progress::NotNeeded => ("OK codex-rotation state=not-needed\n".into(), false),
         Progress::Selected(selected) => {
-            if selected.observed.elapsed() >= Duration::from_millis(OBSERVATION_MS) {
-                *progress = Progress::Retry(Instant::now());
-                return WAITING.into();
+            if now.saturating_duration_since(selected.observed)
+                >= Duration::from_millis(OBSERVATION_MS - COMMIT_MARGIN_MS)
+            {
+                *progress = Progress::Retry(now);
+                return (WAITING.into(), false);
             }
-            let result = publish(ctx, env, proof, resume, &job, selected, &index);
-            match result {
+            if selected.publish_at.is_some_and(|at| now < at) {
+                return (WAITING.into(), false);
+            }
+            match publish(selected) {
                 Ok(receipt) => {
+                    selected.publish_at = None;
                     selected.receipt = Some(receipt.clone());
-                    receipt.reply()
+                    (receipt.reply(), false)
                 }
                 Err(_) => {
-                    *progress = Progress::Retry(Instant::now() + Duration::from_millis(RETRY_MS));
-                    WAITING.into()
+                    selected.publish_at = Some(now + Duration::from_millis(RETRY_MS));
+                    (WAITING.into(), false)
                 }
             }
         }
     }
+}
+
+/// Answer an ask at `now` from its job's progress and, where that answer starts a read of the
+/// accounts' usage, run `read`, once and with the progress unlocked: a read that cannot start
+/// writes the progress itself.
+fn ask(
+    progress: &Mutex<Progress>,
+    now: Instant,
+    publish: impl FnOnce(&Selection) -> Result<Receipt, &'static str>,
+    read: impl FnOnce(),
+) -> String {
+    let (reply, starts) = answer(
+        &mut progress.lock().unwrap_or_else(|p| p.into_inner()),
+        now,
+        publish,
+    );
+    if starts {
+        read();
+    }
+    reply
 }
 
 fn publish(
@@ -474,7 +533,7 @@ pub(super) fn retire_ready(
     current: &aterm_json::Value,
     receipt: &Receipt,
 ) -> Result<Option<Receipt>, &'static str> {
-    if receipt.intent.purpose != renewal::Purpose::WeeklyQuota
+    if !receipt.intent.purpose.moves_account()
         || receipt.phase != Phase::Ready
         || !receipt.has_no_execution_evidence()
         || receipt.sid != ctx.self_id.as_str()

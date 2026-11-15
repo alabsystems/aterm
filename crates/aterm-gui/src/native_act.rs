@@ -76,6 +76,7 @@ pub(crate) use observe_control::serve as serve_observation;
 #[path = "codex_renewal_control.rs"]
 mod renewal;
 pub(crate) use renewal::serve as serve_codex_renewal;
+pub(crate) use renewal::serve_login_rotation as serve_codex_login_rotation;
 pub(crate) use renewal::serve_rotation as serve_codex_rotation;
 #[path = "codex_accounts_control.rs"]
 mod accounts_control;
@@ -327,6 +328,9 @@ pub(crate) struct Operations {
     renewal_seals: BTreeMap<String, renewal::Seal>,
     renewal_services: BTreeMap<String, Arc<renewal::Service>>,
     rotation_prepare: Option<Arc<renewal::RotationPreparation>>,
+    login_rotation_prepare: Option<Arc<renewal::LoginRotationPreparation>>,
+    /// What a lost login's decision read and selected, for each wall turn of the claimed process.
+    login_rotation_reads: renewal::LoginRotationLedgers,
     by_id: BTreeMap<String, Arc<Mutex<Operation>>>,
     completed: std::collections::VecDeque<String>,
     coordinated_connections: std::collections::BTreeSet<u64>,

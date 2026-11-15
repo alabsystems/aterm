@@ -207,7 +207,7 @@ fn a_torn_tail_recovers_to_the_last_whole_record() {
         let recovered = recover_journal_for(key, &typed[..cut]).unwrap();
         assert_eq!(recovered.text, "disk+", "cut at {cut} of {}", typed.len());
     }
-    drop(journals);
+    journals.end_for_test();
     let torn = typed[..whole.len() + 5].to_vec();
     fs::write(&path, &torn).unwrap();
 
@@ -269,7 +269,7 @@ fn a_flipped_byte_in_the_base_snapshot_recovers_nothing_and_keeps_the_file() {
     damaged[base] ^= 0x10;
     fs::write(&path, &damaged).unwrap();
     assert!(recover_journal_for(key, &damaged).is_err());
-    drop(journals);
+    journals.end_for_test();
 
     let host = DraftJournalHost::new(root.clone()).unwrap();
     let decision = host.inspect_open("file:///tmp/draft.md", b"disk").unwrap();
@@ -309,7 +309,7 @@ fn a_flipped_byte_past_a_draft_record_recovers_the_draft_before_it() {
     damaged[more + 1] ^= 0x10;
     fs::write(&path, &damaged).unwrap();
     assert!(recover_journal_for(key, &damaged).is_err());
-    drop(journals);
+    journals.end_for_test();
 
     let host = DraftJournalHost::new(root.clone()).unwrap();
     let decision = host.inspect_open("file:///tmp/draft.md", b"disk").unwrap();
@@ -357,7 +357,7 @@ fn a_cut_past_a_frame_nested_in_the_text_recovers_the_whole_records_before_it() 
             .position(|bytes| bytes == [0xc2, 0xa5, b'q', 1])
             .expect("the appended frame holds the nested one");
     let cut = typed[..nested + 12].to_vec();
-    drop(journals);
+    journals.end_for_test();
     fs::write(&path, &cut).unwrap();
 
     let host = DraftJournalHost::new(root.clone()).unwrap();

@@ -591,12 +591,12 @@ pub fn notice_window(message: &str) -> Option<&'static str> {
     let head = message.replace('\u{2019}', "'").to_ascii_lowercase();
     let names = |phrases: &[&str]| phrases.iter().any(|p| head.contains(p));
     match aterm_phase::classify_wall(message) {
-        Some(aterm_phase::WallKind::UsageSession)
+        Some(alab_policy::vocab::WallKind::UsageSession)
             if names(&["session limit", "5-hour limit", "five-hour limit"]) =>
         {
             Some("five_hour")
         }
-        Some(aterm_phase::WallKind::UsageWeekly)
+        Some(alab_policy::vocab::WallKind::UsageWeekly)
             if names(&["weekly", "7-day limit", "seven-day limit"]) =>
         {
             Some("seven_day")

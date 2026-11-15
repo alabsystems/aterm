@@ -1148,7 +1148,7 @@ fn a_change_before_the_signal_or_its_refusal_takes_the_claim_back() {
 /// A fault or a wall on an idle screen holds the restart ([`live::screen_idle`]).
 #[test]
 fn a_fault_or_a_wall_on_an_idle_screen_holds_the_restart() {
-    use aterm_phase::Phase;
+    use alab_policy::vocab::Phase;
     use aterm_phase::muse::fixtures as fx;
     let read = |text: &str| {
         let rows = fixture_rows(text);

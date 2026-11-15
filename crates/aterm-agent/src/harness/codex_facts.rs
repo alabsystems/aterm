@@ -17,7 +17,7 @@ use super::excerpt::{
     prompt_key, tool_name,
 };
 use super::result::{codex_context, codex_media_label};
-use crate::supervise::policy::turn_end::without_finished_lines;
+use alab_policy::words::without_finished_lines;
 
 /// Tokens codex counts as always in the context (its instructions, tools and room to compact):
 /// its own context-left figure takes them out of the window and the use alike
@@ -75,6 +75,11 @@ pub struct CodexFacts {
     pub usage_7d_pct: Option<u8>,
     /// The newest turn's working directory.
     pub cwd: Option<PathBuf>,
+    /// Input tokens of the whole rollout so far, as the newest `token_count` that names its
+    /// running total says (`info.total_token_usage.input_tokens`); `None` where none said it.
+    pub tok_in: Option<u64>,
+    /// Output tokens of the whole rollout so far (`info.total_token_usage.output_tokens`).
+    pub tok_out: Option<u64>,
 }
 
 /// A forward fold of a rollout's rows into [`CodexFacts`].
@@ -95,6 +100,8 @@ pub struct CodexFactsFold {
     usage_5h_pct: Option<u8>,
     usage_7d_pct: Option<u8>,
     cwd: Option<PathBuf>,
+    tok_in: Option<u64>,
+    tok_out: Option<u64>,
 }
 
 impl CodexFactsFold {
@@ -134,6 +141,8 @@ impl CodexFactsFold {
             usage_5h_pct: self.usage_5h_pct,
             usage_7d_pct: self.usage_7d_pct,
             cwd: self.cwd.clone(),
+            tok_in: self.tok_in,
+            tok_out: self.tok_out,
         }
     }
 
@@ -170,6 +179,9 @@ impl CodexFactsFold {
             (Some("event_msg"), Some("token_count")) => {
                 if let Some(pct) = payload.get("info").and_then(ctx_left_pct) {
                     self.ctx_left_pct = Some(pct);
+                }
+                if let Some((tok_in, tok_out)) = super::codex_rollout::whole_tokens_of(payload) {
+                    (self.tok_in, self.tok_out) = (tok_in, tok_out);
                 }
                 if let Some(windows) = payload
                     .get("rate_limits")

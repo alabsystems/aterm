@@ -11,6 +11,26 @@ use super::{
     NativeInput, classify, current_event_origin, note_posted, parse_hwkey, run_burst,
 };
 
+#[test]
+fn a_posted_native_timestamp_requires_a_representable_observed_clock() {
+    assert_eq!(
+        super::native_timestamp_ns(1.25).map(|n| n.get()),
+        Some(1_250_000_000)
+    );
+    for seconds in [
+        0.0,
+        -1.0,
+        1e-12,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        u64::MAX as f64 / 1_000_000_000.0,
+        1e300,
+    ] {
+        assert!(super::native_timestamp_ns(seconds).is_none(), "{seconds:?}");
+    }
+}
+
 /// A FULL LEDGER REFUSES KEYS RATHER THAN FORGET ONE: every posted key must be found when
 /// AppKit dispatches it, however many wait ahead of it, or it runs as the person's (its ⌘V
 /// pastes the clipboard). So once the ledger waits for all it can hold, a burst's next press

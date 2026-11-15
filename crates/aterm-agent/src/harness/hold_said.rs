@@ -14,13 +14,13 @@
 //! the hold's legs and counts stay equal. Nothing the loop decides reads it back. Its words stay
 //! in-process (limit 5): the window's glass, through the presentation sanitizer at store.
 
-use crate::supervise::policy::land_check;
+use alab_policy::land_check;
 
 /// The most items of the agent's list a hold quotes ([`HoldSaid::open`]).
 pub const QUOTED_ITEMS: usize = 4;
 
 /// The most bytes one quoted item keeps: an item past it is cut at a word's edge, with `…`.
-pub const ITEM_BYTES: usize = crate::supervise::policy::turn_end::SAID_CAP;
+pub const ITEM_BYTES: usize = alab_policy::open_work::SAID_CAP;
 
 /// The most characters of the first item the chip's title, the hover and a worker's tip quote:
 /// past it the item is cut at a word's edge, with `…`, and the rest counted (`(+3 more)`).

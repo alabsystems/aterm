@@ -7,6 +7,11 @@ use aterm_uds::spawnfd::{BirthAttempt, SpawnFailure, Spawned, Stdio};
 use std::io;
 use std::path::Path;
 
+struct Input {
+    stdio: Stdio,
+    required_tether: bool,
+}
+
 /// A failed native start, retaining the actual attempt outcome and any child.
 /// The caller must settle an Unbound cohort; this value is not a cancellation
 /// receipt unless its outcome contains the actual NotSpawned receipt.
@@ -40,12 +45,18 @@ impl OwnedLaunchReservation {
     pub fn spawn(
         self,
         admitted: worker::Admitted,
-        cli: &worker::WorkerCli,
-        home: Option<&Path>,
         cwd: &Path,
         attempt: BirthAttempt,
     ) -> Result<OwnedWorker, OwnedSpawnFailure> {
-        self.spawn_with_input(admitted, cli, home, cwd, attempt, Stdio::piped())
+        self.spawn_with_input(
+            admitted,
+            cwd,
+            attempt,
+            Input {
+                stdio: Stdio::piped(),
+                required_tether: false,
+            },
+        )
     }
 
     /// Start with a private bidirectional socket at the actual child's stdin.
@@ -61,10 +72,34 @@ impl OwnedLaunchReservation {
     pub fn spawn_with_control(
         self,
         admitted: worker::Admitted,
-        cli: &worker::WorkerCli,
-        home: Option<&Path>,
         cwd: &Path,
         attempt: BirthAttempt,
+    ) -> Result<(OwnedWorker, aterm_uds::CtlStream), OwnedSpawnFailure> {
+        self.spawn_control(admitted, cwd, attempt, false)
+    }
+
+    /// Backend startup requires a real routed parent-death watcher in addition
+    /// to child/socket custody. Unavailable routing refuses before birth; no
+    /// untethered fallback or claim about separate tool groups is supplied.
+    ///
+    /// # Errors
+    /// Required parent-death routing is unavailable, or the admitted native
+    /// birth/control setup fails. Every failure retains its actual outcome.
+    pub fn spawn_with_required_control(
+        self,
+        admitted: worker::Admitted,
+        cwd: &Path,
+        attempt: BirthAttempt,
+    ) -> Result<(OwnedWorker, aterm_uds::CtlStream), OwnedSpawnFailure> {
+        self.spawn_control(admitted, cwd, attempt, true)
+    }
+
+    fn spawn_control(
+        self,
+        admitted: worker::Admitted,
+        cwd: &Path,
+        attempt: BirthAttempt,
+        required_tether: bool,
     ) -> Result<(OwnedWorker, aterm_uds::CtlStream), OwnedSpawnFailure> {
         let (native, child) = match aterm_uds::kept_out(aterm_uds::CtlStream::pair) {
             Ok(pair) => pair,
@@ -83,23 +118,25 @@ impl OwnedLaunchReservation {
             _ => return Err(before_birth(Error::Stale, attempt)),
         }
         let child: std::os::fd::OwnedFd = child.into();
-        self.spawn_with_input(admitted, cli, home, cwd, attempt, child.into())
-            .map(|worker| (worker, native))
+        self.spawn_with_input(
+            admitted,
+            cwd,
+            attempt,
+            Input {
+                stdio: child.into(),
+                required_tether,
+            },
+        )
+        .map(|worker| (worker, native))
     }
 
     fn spawn_with_input(
         self,
         admitted: worker::Admitted,
-        cli: &worker::WorkerCli,
-        home: Option<&Path>,
         cwd: &Path,
         attempt: BirthAttempt,
-        input: Stdio,
+        input: Input,
     ) -> Result<OwnedWorker, OwnedSpawnFailure> {
-        let admitted = match admitted.prepare(cli, home, |starter| Ok((starter, ()))) {
-            Ok((admitted, ())) => admitted,
-            Err(_) => return Err(before_birth(Error::Denied, attempt)),
-        };
         let sid = match self.spawn_session() {
             Ok(sid) => sid,
             Err(error) => return Err(before_birth(error, attempt)),
@@ -107,46 +144,46 @@ impl OwnedLaunchReservation {
         if let Err(error) = self.check_for_spawn(&admitted) {
             return Err(before_birth(error, attempt));
         }
-        let starter = admitted.starter();
-        let args = match &starter.args {
-            Ok(args) => args,
-            Err(_) => return Err(before_birth(Error::Unsupported, attempt)),
+        let command = match self.environment.command(
+            admitted.starter(),
+            &sid,
+            cwd,
+            input.stdio,
+            input.required_tether,
+        ) {
+            Ok(command) => command,
+            Err(error) => return Err(before_birth(error, attempt)),
         };
-        let mut command = aterm_uds::spawnfd::command(&starter.exe);
-        if let Err(error) = self.environment.install(&mut command, starter) {
-            return Err(before_birth(error, attempt));
-        }
-        command
-            .args(args)
-            .current_dir(cwd)
-            .stdin(input)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for name in &starter.unset {
-            command.env_remove(name);
-        }
-        // Both native peer observation and the SDK locator must name the actual
-        // owning terminal, rather than the GUI process's unrelated environment.
-        command
-            .env("ATERM_SESSION_ID", &sid)
-            .env("ATERM_PARENT_SESSION_ID", &sid);
-        self.finish_spawn(command.spawn_cohort(attempt))
+        self.finish_spawn(command.spawn(attempt))
     }
 
     pub(super) fn finish_spawn(
         self,
-        outcome: Result<Spawned, SpawnFailure>,
+        outcome: Result<owned_environment::InstalledSpawn, SpawnFailure>,
     ) -> Result<OwnedWorker, OwnedSpawnFailure> {
-        let mut spawned = outcome.map_err(|outcome| OwnedSpawnFailure {
-            reason: Error::Unavailable,
-            outcome,
-        })?;
-        if let Err(reason) = self.bind(spawned.child_mut()) {
+        let mut spawned = outcome
+            .map_err(|outcome| OwnedSpawnFailure {
+                reason: Error::Unavailable,
+                outcome,
+            })?
+            .into_spawned();
+        if !spawned.is_original_child() || !spawned.key().is_current() {
+            return Err(OwnedSpawnFailure {
+                reason: Error::Stale,
+                outcome: SpawnFailure::Unbound {
+                    spawned: Box::new(spawned),
+                    error: io::Error::other("sealed command lost original native spawn custody"),
+                },
+            });
+        }
+        if let Err((reason, stage)) = self.bind_checked(spawned.child_mut()) {
             return Err(OwnedSpawnFailure {
                 reason,
                 outcome: SpawnFailure::Unbound {
                     spawned: Box::new(spawned),
-                    error: io::Error::other("native constructor child bind refused"),
+                    error: io::Error::other(format!(
+                        "native constructor child bind refused: {stage}"
+                    )),
                 },
             });
         }
@@ -157,7 +194,7 @@ impl OwnedLaunchReservation {
     }
 }
 
-fn before_birth(reason: Error, attempt: BirthAttempt) -> OwnedSpawnFailure {
+pub(super) fn before_birth(reason: Error, attempt: BirthAttempt) -> OwnedSpawnFailure {
     let outcome = match attempt.cancel() {
         Ok(proof) => SpawnFailure::NotSpawned(Box::new(proof)),
         Err(error) => SpawnFailure::Refused(error),
@@ -166,6 +203,46 @@ fn before_birth(reason: Error, attempt: BirthAttempt) -> OwnedSpawnFailure {
 }
 
 impl OwnedWorker {
+    /// Transfer this actual child into a native retained service owner. The
+    /// control channel comes from its original constructor binding; no caller
+    /// supplied stream can substitute for that endpoint. SDK readiness is still
+    /// independently required before any frontend delivery.
+    ///
+    /// # Errors
+    /// Missing/stale constructor or control custody. Failure retains the actual
+    /// child in `OwnedServiceFailure`, rather than asserting no child exists.
+    pub fn into_service(mut self) -> Result<OwnedService, OwnedServiceFailure> {
+        let binding = (|| {
+            let process = self.process()?;
+            self._constructor.binding.entry()?;
+            let control = lock(&self._constructor.binding.1)?
+                .clone()
+                .ok_or(Error::Unsupported)?;
+            let state = self
+                ._constructor
+                .inner
+                .state
+                .upgrade()
+                .ok_or(Error::Stale)?;
+            let sid = {
+                let state = lock(&state)?;
+                let launch = state
+                    .launches
+                    .get(&self._constructor.inner.token)
+                    .ok_or(Error::Stale)?;
+                check(launch, &process, &self._constructor.binding)?;
+                launch.sid.clone()
+            };
+            Ok((control, Arc::downgrade(&state), sid))
+        })();
+        match binding {
+            Ok((control, state, sid)) => Ok(service::OwnedService::new(self, control, state, sid)),
+            Err(reason) => Err(OwnedServiceFailure {
+                reason,
+                worker: Box::new(self),
+            }),
+        }
+    }
     /// Borrow the child's startup output. Reading readiness text supplies no SDK grant.
     pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
         self.spawned.as_mut()?.child_mut().stderr.take()
@@ -245,43 +322,62 @@ impl OwnedWorker {
         let Some(spawned) = self.spawned.as_mut() else {
             return Ok(());
         };
-        if !spawned.key().is_current() || !spawned.is_original_child() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "original native child custody is unavailable",
-            ));
-        }
-        let group = spawned.child_mut().id();
-        if !spawned.child_mut().is_reaped() {
-            if !spawned.child_mut().owns_unreaped() {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "original native child wait custody is unavailable",
-                ));
-            }
-            let group = i32::try_from(group).map_err(io::Error::other)?;
-            aterm_uds::process::kill_group_until_empty(group)?;
-            if !spawned.group_members_ended()? {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "native cohort members have not ended",
-                ));
-            }
-            spawned.child_mut().wait()?;
-        }
-        // An owning wait only reaps the leader. Retain this actual receipt
-        // until the same scope's kernel reports absence of the entire group.
-        // After reap, never signal its numeric ID: another birth may reuse it.
-        if aterm_uds::process::group_presence(group) != aterm_uds::process::ProcessPresence::Absent
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "native cohort kernel absence remains unresolved",
-            ));
-        }
+        stop_spawned(spawned)?;
         self.spawned.take();
         Ok(())
     }
+}
+
+impl OwnedSpawnFailure {
+    /// Settle an actual post-birth original cohort without replacing its failure
+    /// with a no-child claim. Pending cleanup retains the same owned receipt.
+    /// Pre-birth failure has no returned child to stop and remains unchanged.
+    ///
+    /// # Errors
+    /// As `OwnedWorker::stop`; unavailable or pending custody is never closure.
+    pub fn stop(&mut self) -> io::Result<()> {
+        if let SpawnFailure::Unbound { spawned, .. } = &mut self.outcome {
+            stop_spawned(spawned)?;
+        }
+        Ok(())
+    }
+}
+
+fn stop_spawned(spawned: &mut Spawned) -> io::Result<()> {
+    if !spawned.key().is_current() || !spawned.is_original_child() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "original native child custody is unavailable",
+        ));
+    }
+    let group = spawned.child_mut().id();
+    if !spawned.child_mut().is_reaped() {
+        if !spawned.child_mut().owns_unreaped() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "original native child wait custody is unavailable",
+            ));
+        }
+        let group = i32::try_from(group).map_err(io::Error::other)?;
+        aterm_uds::process::kill_group_until_empty(group)?;
+        if !spawned.group_members_ended()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native cohort members have not ended",
+            ));
+        }
+        spawned.child_mut().wait()?;
+    }
+    // An owning wait only reaps the leader. Retain this actual receipt
+    // until the same scope's kernel reports absence of the entire group.
+    // After reap, never signal its numeric ID: another birth may reuse it.
+    if aterm_uds::process::group_presence(group) != aterm_uds::process::ProcessPresence::Absent {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "native cohort kernel absence remains unresolved",
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for OwnedWorker {

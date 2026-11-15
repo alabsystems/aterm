@@ -1094,7 +1094,11 @@ fn clt_landing_install_opens_the_tab_on_a_press() {
         // permission child must not change.
         let wanted_step = step(&mut app);
         let before = tabs(&app);
-        let id = test_support::book_unasked(&mut app, wid, name_rule_tab_then(7, origin));
+        let id = test_support::book_unasked(
+            &mut app,
+            wid,
+            name_rule_tab_then(crate::machine_title::Origin::Panel, 7, origin),
+        );
         if changed_origin {
             app.switch_tab_in(wid, 0);
         }
@@ -1136,7 +1140,11 @@ fn clt_landing_install_opens_the_tab_on_a_press() {
                 .unwrap();
             assert!(matches!(
                 terminal.purpose,
-                TerminalPurpose::NameRule { generation: 7, .. }
+                TerminalPurpose::NameRule {
+                    by: crate::machine_title::Origin::Panel,
+                    generation: 7,
+                    ..
+                }
             ));
             let session = terminal.session;
             if closed_origin {

@@ -1183,14 +1183,14 @@ fn every_journal_word_has_its_own_mark() {
         events.push(want);
     }
     for phase in [
-        aterm_phase::Phase::Busy,
-        aterm_phase::Phase::Prompt,
-        aterm_phase::Phase::Limited {
+        alab_policy::vocab::Phase::Busy,
+        alab_policy::vocab::Phase::Prompt,
+        alab_policy::vocab::Phase::Limited {
             message: String::new(),
             reset: None,
         },
-        aterm_phase::Phase::Idle,
-        aterm_phase::Phase::Question,
+        alab_policy::vocab::Phase::Idle,
+        alab_policy::vocab::Phase::Question,
     ] {
         let m = mark(&format!("EVENT {} seq=1 x", phase.name()));
         assert!(events.contains(&m), "EVENT {} reads {m:?}", phase.name());

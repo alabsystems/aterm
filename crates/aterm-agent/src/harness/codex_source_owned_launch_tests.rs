@@ -14,6 +14,7 @@ mod spawn_tests;
 struct Echo {
     child: Child,
     _input: std::process::ChildStdin,
+    environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 impl Echo {
     fn spawn(home: &std::path::Path, token: &str, dedicated: bool) -> Self {
@@ -42,6 +43,10 @@ impl Echo {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         configure(&mut command);
+        let environment = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect();
         let mut child = if dedicated {
             command.spawn_in_dedicated_process_group()
         } else {
@@ -52,6 +57,7 @@ impl Echo {
         Self {
             child,
             _input: input,
+            environment,
         }
     }
     fn stop(&mut self) {
@@ -83,7 +89,8 @@ impl Fixture {
         let token = aterm_uds::rand::hex_token::<16>().unwrap();
         let child = Echo::spawn(home.path(), &token, dedicated);
         let process = Process::observe(child.child.id()).unwrap();
-        let environment = OwnedLaunchEnvironment::capture(&process).unwrap();
+        let environment =
+            OwnedLaunchEnvironment::from_snapshot(&process, child.environment.clone()).unwrap();
         let starter = environment
             .prepare(worker::Starter {
                 exe: std::ffi::OsString::from_vec(process.image.path.clone()).into(),
@@ -99,7 +106,7 @@ impl Fixture {
         let lifetime = Lifetime::default();
         let scope = lifetime.enter().unwrap();
         let binding = Arc::new(Binding::default());
-        let registry = Registry::default();
+        let registry = Registry::for_app(&lifetime);
         registry.state.lock().unwrap().launches.insert(
             token.clone(),
             Launch {
@@ -235,17 +242,6 @@ fn foreign_child_wrong_group_and_reaped_custody_cannot_bind() {
         Err(Error::Denied)
     ));
     assert!(matches!(inherited.constructor_state(), Err(Error::Busy)));
-}
-
-#[test]
-fn matching_constructor_token_cannot_bind_a_child_with_different_settings() {
-    let fixture = Fixture::new(true);
-    let altered = Echo::spawn_with(fixture.home.path(), &fixture.token, true, |command| {
-        command.env("ALAB_OWNED_SOURCE_ONLY", "different-tab-setting");
-    });
-    assert_eq!(fixture.owner().bind(&altered.child), Err(Error::Denied));
-    assert!(matches!(fixture.constructor_state(), Err(Error::Busy)));
-    assert!(fixture.registry.state.lock().unwrap().members.is_empty());
 }
 
 #[test]

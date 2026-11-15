@@ -11,7 +11,9 @@
 //! push live waits past their one-minute hang detectors (`ATERM-KI-1103-3`).
 //!
 //! When `aterm-verify` runs a test stage, it creates a scratch pool directory sized to
-//! the stage's granted CPU budget and passes its path in [`SUBPROCESS_SLOTS_ENV`].
+//! the cores the stage asked and passes its path in [`SUBPROCESS_SLOTS_ENV`]. A stage whose
+//! share of those cores is read again as its binaries start holds the slots that share does
+//! not cover itself, by the lock a test takes, so a test finds them busy.
 //! Every test thread across all concurrent test binaries takes one [`SubprocessLease`]
 //! from that shared directory (via [`aterm_uds::file_lock::LockFile`], which keeps the
 //! descriptor out of spawned children and unlocks with `LOCK_UN` before closing) and

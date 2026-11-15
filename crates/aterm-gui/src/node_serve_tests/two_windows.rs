@@ -51,12 +51,14 @@ impl Drop for StandIn {
 }
 
 /// The sessions a test window holds: those it hosts, the retired workers whose rows it keeps,
-/// and which of its sessions have task news.
+/// and which of its sessions have task news; and whether its survey says its own look at the
+/// machine, as a window of an aterm that has the look does.
 #[derive(Clone, Default)]
 struct Holds {
     live: BTreeSet<String>,
     retired: BTreeSet<String>,
     news: BTreeSet<String>,
+    looks: bool,
 }
 
 impl Holds {
@@ -77,10 +79,18 @@ impl Holds {
         self
     }
 
+    fn with_look(mut self) -> Self {
+        self.looks = true;
+        self
+    }
+
     fn holds(&self, sid: &str) -> bool {
         self.live.contains(sid) || self.retired.contains(sid)
     }
 }
+
+/// The look a test window that has one says of the machine ([`Holds::with_look`]).
+const WINDOW_LOOK: &str = " m_at_ms=77 cores=2";
 
 /// A window this test serves at `wf-<pid>.sock`: it takes a drive by the relay's own rule over
 /// its `holds` (or, as `every_drive`, takes each drive whatever it names, as every window did
@@ -188,7 +198,8 @@ fn serve_drive(pid: u32, mut stream: CtlStream, holds: &Holds, served: &Mutex<Ve
 
 /// The survey a window answers of its own sessions: its `instance` line (it counts two
 /// instances here), a row per hosted session (`s-busy…` ones mid-turn), and this Mac's one
-/// account line.
+/// account line. Its header says no look at the machine and no access, as an older window's,
+/// unless it [`Holds::with_look`].
 fn window_survey(pid: u32, holds: &Holds) -> String {
     let rows: Vec<String> = holds
         .live
@@ -207,10 +218,11 @@ fn window_survey(pid: u32, holds: &Holds) -> String {
         .collect();
     let mut out = format!(
         "OK {}\ninstance pid={pid} host=m111 version=0.150.0 sessions={} level=content cut=0 \
-         at_ms=1 node={} instances=2 accounts=1\n",
+         at_ms=1 node={} instances=2 accounts=1{}\n",
         rows.len() + 2,
         rows.len(),
         "11".repeat(16),
+        if holds.looks { WINDOW_LOOK } else { "" },
     );
     for row in rows {
         out.push_str(&row);
@@ -697,6 +709,37 @@ fn a_drive_lines_sessions_are_its_selectors_holds_and_wait_targets() {
     assert!(!relay_names("x-a"));
 }
 
+/// A drive names a `t` tab as it names an `s-` one, by its selector, a hold or a wait target,
+/// and a relay line carries either; a malformed `t` ID names nothing and rides no relay line.
+#[test]
+fn a_drive_line_names_a_t_tab_and_a_relay_carries_either_form() {
+    let named = |line: &str| -> Vec<String> {
+        crate::control::drive_line_sessions(line)
+            .into_iter()
+            .map(|sid| sid.as_str().to_owned())
+            .collect()
+    };
+    assert_eq!(named("@tqn5r6e0148 status"), ["tqn5r6e0148"]);
+    assert_eq!(named("hold t0000000001 on reason=x"), ["t0000000001"]);
+    assert_eq!(
+        named("await task @tqn5r6e0148:3,@s-a,@tqn5r6e0148:4 any timeout=5"),
+        ["tqn5r6e0148", "s-a"]
+    );
+    for malformed in ["T0000000000", "t000000000", "tqn5r6e014u", "tQN5R6E0148"] {
+        assert!(
+            named(&format!("@{malformed} status")).is_empty(),
+            "{malformed}"
+        );
+        assert!(
+            named(&format!("hold {malformed} on")).is_empty(),
+            "{malformed}"
+        );
+        assert!(!relay_names(malformed), "{malformed}");
+    }
+    assert!(relay_names("tqn5r6e0148") && relay_names("s-1a2b3c4d5e6f70819203"));
+    assert!(!relay_names("tqn5r6e0148,t0000000001"));
+}
+
 /// THE LIVE LAUNCHER KNOWS ITS OWN APP'S WINDOW: a window's process whose image is this service's
 /// own executable runs its app; a process of another build's executable does not.
 #[test]
@@ -735,7 +778,8 @@ fn survey_read_by(
         drive: true,
         peer: None,
     };
-    spawn_node_survey(near, windows, header, open, (state, reader)).expect("the survey starts");
+    spawn_node_survey(near, windows, header, open, None, (state, reader))
+        .expect("the survey starts");
     lines
         .iter()
         .map(|line| {
@@ -783,7 +827,9 @@ fn a_survey_lists_the_sessions_of_every_window() {
         "{merged}"
     );
     assert!(lines[1].contains(" sessions=2 "), "{merged}");
-    assert!(lines[1].ends_with(" instances_read=2"), "{merged}");
+    // The merge ends the line with it; the node job's own look follows, these windows
+    // sending none (`the_node_job_adds_its_look_under_a_window_that_sends_none_…`).
+    assert!(lines[1].contains(" instances_read=2 os="), "{merged}");
     assert!(lines[2].contains(" sid=s-0d "), "{merged}");
     assert!(lines[3].contains(" sid=s-ae "), "{merged}");
     assert_eq!(lines[4], format!("account pool=claude id=a{older}"));
@@ -807,6 +853,300 @@ fn a_survey_lists_the_sessions_of_every_window() {
         .expect("instance");
     assert_eq!(head, "OK 3\n");
     assert!(instance.contains(" sessions=1 ") && !instance.contains("instances_read"));
+}
+
+/// THE NODE JOB ADDS ITS LOOK UNDER A WINDOW THAT SENDS NONE, AND NOT OVER ONE THAT DOES: a
+/// window of an aterm older than the look answers a header with no `m_at_ms=`; the node job
+/// that relays it adds its own look's tokens, once, before the header's `access=` (so the
+/// header ends as the window wrote it), to one window's answer as to several merged, and the
+/// strict parser then reads the machine's resources. The header's free space is the look's
+/// (the volume's size and `disk_lim=` were judged against it), and its `at_ms=` is the look's
+/// time where the look is later, so a reader's age of the look is 0 and never unread. The rows,
+/// the other lines and the count are the window's. A window that sends its own look is relayed
+/// as it came, and the node job reads no look for it. An answer at the reply bound loses a row
+/// to the look, the least kept first; only where no row is left to cut does it go without.
+/// NEGATIVE CONTROL (2026-11-12): with the `m_at_ms=` test dropped, a header carries two looks;
+/// with the tokens appended to the line, it no longer ends in `access=`; with the look added
+/// to merged answers alone, one window's answer goes out with none.
+#[test]
+fn the_node_job_adds_its_look_under_a_window_that_sends_none_and_not_over_one_that_does() {
+    use aterm_agent::survey_facts::{MachineFacts, SwarmSurveyFacts};
+    use aterm_capacity::machine_look::MachineLook;
+
+    const LOOKED: u64 = 1_793_160_000_123;
+    let own = || MachineFacts {
+        look: MachineLook {
+            at_unix_ms: Some(LOOKED),
+            cores: Some(8),
+            mem_total_mb: Some(16_384),
+            disk_free_mb: Some(850),
+            ..MachineLook::UNREAD
+        },
+        up_since_ms: Some(1_793_100_000_000),
+        os: Some("macos"),
+        target: Some("aarch64-apple-darwin".to_owned()),
+    };
+    let never = || -> MachineFacts { panic!("its window sends a look: the node job reads none") };
+    let tokens = own().header_tokens();
+    assert!(
+        tokens.starts_with(" os=macos ") && tokens.contains(" m_at_ms=1793160000123 cores=8 "),
+        "{tokens}"
+    );
+    let looks = |answer: &str| {
+        answer
+            .lines()
+            .nth(1)
+            .map_or(0, |head| head.matches(" m_at_ms=").count())
+    };
+    // A window's answer as an aterm before the look writes it, ending `tail`.
+    let old = |pid: u32, tail: &str| {
+        format!(
+            "OK 3\ninstance pid={pid} host=m111 version=0.198.0 sessions=1 level=facts cut=0 \
+             at_ms=1 node=n instances=2 label=m7 window=1 window_last=5 ssh_host_key=- \
+             home_free_mb=900 accounts=1 accounts_unread=- moves_7d=- move_tries_7d=- \
+             last_move=- roster_unread=0{tail}\nsession sid=s-{pid} program_kind=agent \
+             agent=idle attention=- needs=-\naccount pool=claude id=a{pid} condition=usable \
+             enrolled=1 pct5=- pct7=- week_reset=- walled_until=- last_used=-\n"
+        )
+    };
+    // Each line after the header; under a header the look raised from the window's `at_ms=1`,
+    // each `session` row ends with that time, when its window read it.
+    let rows_read_at_1 = |answer: &str| {
+        answer
+            .lines()
+            .skip(2)
+            .map(|line| {
+                if line.starts_with("session ") {
+                    format!("{line} at_ms=1")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let after_head = |answer: &str| {
+        answer
+            .lines()
+            .skip(2)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    // The header the window wrote, with the node job's edits: the look's free space and time.
+    let edited = |head: &str| {
+        head.replacen(" at_ms=1 ", &format!(" at_ms={LOOKED} "), 1)
+            .replacen(" home_free_mb=900 ", " home_free_mb=850 ", 1)
+    };
+
+    // One window's answer, returned by the merge as it came where no look is asked.
+    let single = old(7, " access=full drive=1");
+    assert_eq!(
+        merge_window_surveys(std::slice::from_ref(&single), usize::MAX, None),
+        single
+    );
+    let with = merge_window_surveys(std::slice::from_ref(&single), usize::MAX, Some(&own));
+    let head = with.lines().nth(1).expect("the instance line");
+    assert!(with.starts_with("OK 3\ninstance pid=7 "), "{with}");
+    assert_eq!(
+        head,
+        format!(
+            "{}{tokens} access=full drive=1",
+            edited(single.lines().nth(1).expect("its line"))
+                .strip_suffix(" access=full drive=1")
+                .expect("its access")
+        ),
+    );
+    assert_eq!(looks(&with), 1, "{head}");
+    assert_eq!(after_head(&with), rows_read_at_1(&single));
+    let parsed = SwarmSurveyFacts::from_survey_reply(&with).expect("the strict parser reads it");
+    assert_eq!(
+        parsed.machine,
+        Some(own()),
+        "the node job's look, with the free space it read"
+    );
+    assert_eq!(parsed.home_free_mb, Some(850));
+    assert_eq!(
+        SwarmSurveyFacts::from_survey_reply(&single)
+            .expect("an older window's")
+            .machine,
+        None,
+        "CONTROL: as it came, the machine is unread"
+    );
+    assert_eq!(
+        merge_window_surveys(std::slice::from_ref(&with), usize::MAX, Some(&never)),
+        with,
+        "an answer that says a look takes no other"
+    );
+    // Through the fleet read's own reader: the look's age is read, and it is 0.
+    let json = format!(
+        "[{{\"label\":\"pid 7\",\"instance\":{{{}}},\"sessions\":[]}}]",
+        head.split(' ')
+            .skip(1)
+            .filter_map(|token| token.split_once('='))
+            .map(|(key, value)| format!("\"{key}\":\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let read = crate::fleet_glance::sightings(&json, LOOKED + 5).expect("a fleet read");
+    let aterm_db::fleet::read::Answer::Answered(answered) = &read.machines[0].answer else {
+        panic!("this Mac answered: {read:?}");
+    };
+    assert_eq!(answered.look.age_ms, Some(0), "{:?}", answered.look);
+    assert_eq!(answered.home_free_mb, Some(850));
+
+    // A window that stamped its answer after the look keeps its time.
+    let later = old(7, "").replacen(" at_ms=1 ", " at_ms=1793160000999 ", 1);
+    let with = merge_window_surveys(std::slice::from_ref(&later), usize::MAX, Some(&own));
+    assert!(with.contains(" at_ms=1793160000999 "), "{with}");
+    assert_eq!(
+        after_head(&with),
+        after_head(&later),
+        "its header still times its rows"
+    );
+    // A look that read no volume leaves the window's free space.
+    let volumeless = || MachineFacts {
+        look: MachineLook {
+            disk_free_mb: None,
+            ..own().look
+        },
+        ..own()
+    };
+    let with = merge_window_surveys(std::slice::from_ref(&later), usize::MAX, Some(&volumeless));
+    assert!(with.contains(" home_free_mb=900 "), "{with}");
+
+    // A window before `access=` too: the tokens end its line.
+    let before_access = old(7, "");
+    let with = merge_window_surveys(std::slice::from_ref(&before_access), usize::MAX, Some(&own));
+    assert!(
+        with.lines()
+            .nth(1)
+            .is_some_and(|head| head.ends_with(&format!(" roster_unread=0{tokens}"))),
+        "{with}"
+    );
+    assert_eq!(after_head(&with), rows_read_at_1(&before_access));
+
+    // Two windows' answers merged.
+    let pair = [old(7, " access=read"), old(9, " access=read")];
+    let merged = merge_window_surveys(&pair, usize::MAX, None);
+    assert_eq!(looks(&merged), 0, "{merged}");
+    let with = merge_window_surveys(&pair, usize::MAX, Some(&own));
+    let head = with.lines().nth(1).expect("the instance line");
+    assert!(with.starts_with("OK 4\ninstance pid=7 "), "{with}");
+    assert!(
+        head.ends_with(&format!(
+            " roster_unread=0{tokens} access=read instances_read=2"
+        )),
+        "{head}"
+    );
+    assert!(head.contains(&format!(" at_ms={LOOKED} ")), "{head}");
+    assert_eq!(looks(&with), 1, "{head}");
+    assert_eq!(after_head(&with), rows_read_at_1(&merged));
+
+    // A window that sends its own look, alone and first of two.
+    let new = old(7, " m_at_ms=42 cores=2 access=read");
+    assert_eq!(
+        merge_window_surveys(std::slice::from_ref(&new), usize::MAX, Some(&never)),
+        new
+    );
+    let merged = merge_window_surveys(&[new, old(9, " access=read")], usize::MAX, Some(&never));
+    assert_eq!(looks(&merged), 1, "{merged}");
+
+    // At the reply bound: rows go before the look does, the least kept first (the idle
+    // shells, the latest first), and `sessions=` still counts them.
+    let mut full = old(7, " access=full").replacen("OK 3\n", "OK 13\n", 1);
+    let at = full.find("\naccount ").expect("the account line") + 1;
+    let shells: String = (0..10)
+        .map(|n| format!("session sid=s-shell{n} program_kind=shell agent=- attention=- needs=-\n"))
+        .collect();
+    full.insert_str(at, &shells);
+    let full = full.replacen(" sessions=1 ", " sessions=11 ", 1);
+    let bound = full.len();
+    let fitted = merge_window_surveys(std::slice::from_ref(&full), bound, Some(&own));
+    assert!(fitted.len() <= bound, "{fitted}");
+    assert_eq!(looks(&fitted), 1, "{fitted}");
+    assert!(
+        fitted.contains(" sid=s-7 "),
+        "the agent's row stays: {fitted}"
+    );
+    assert!(
+        fitted.contains(" sid=s-shell0 "),
+        "the earliest shell stays: {fitted}"
+    );
+    assert!(
+        !fitted.contains(" sid=s-shell9 "),
+        "the latest shell went: {fitted}"
+    );
+    assert!(fitted.contains(" sessions=11 "), "{fitted}");
+    assert!(
+        fitted.ends_with("last_used=-\n"),
+        "the Mac's own lines stay: {fitted}"
+    );
+    assert!(
+        SwarmSurveyFacts::from_survey_reply(&fitted).is_ok(),
+        "a counted answer: {fitted}"
+    );
+    // With no row left to cut, the answer goes as it came, without the look.
+    let rowless = "OK 1\ninstance pid=7 at_ms=1 home_free_mb=900 access=full\n".to_owned();
+    assert_eq!(
+        merge_window_surveys(std::slice::from_ref(&rowless), rowless.len(), Some(&own)),
+        rowless
+    );
+
+    // Through the node job's survey: one older window, then two, then one that sends a look.
+    let stand_in = StandIn::start();
+    let (older, newer) = two_pids(&stand_in);
+    let relay = crate::test_scratch::short_dir("look-old");
+    let _old = TestWindow::open(relay.path(), older, Holds::live(&["s-0d"]), false);
+    let one = &survey(relay.path(), Some(older), &["survey"])[0];
+    assert!(
+        one.starts_with(&format!("OK 3\ninstance pid={older} ")),
+        "{one}"
+    );
+    assert_eq!(
+        looks(one),
+        1,
+        "one window's answer carries the node job's look: {one}"
+    );
+    let head = fields_of(one.lines().nth(1).expect("the instance line"));
+    assert_eq!(head("os"), Some(std::env::consts::OS), "{one}");
+    assert!(
+        head("m_at_ms").is_some_and(|at| at.parse::<u64>().is_ok_and(|at| at > 77)),
+        "this machine's own look, taken now: {one}"
+    );
+    assert!(
+        head("cores").is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n > 0)),
+        "{one}"
+    );
+    let _new = TestWindow::open(relay.path(), newer, Holds::live(&["s-ae"]), false);
+    let two = &survey(relay.path(), Some(older), &["survey"])[0];
+    assert!(
+        two.starts_with(&format!("OK 4\ninstance pid={older} ")),
+        "{two}"
+    );
+    assert_eq!(looks(two), 1, "{two}");
+    // These test windows say no `access=` either: the look ends the merged line.
+    assert!(
+        two.lines()
+            .nth(1)
+            .is_some_and(|head| head.contains(" instances_read=2 os=")),
+        "{two}"
+    );
+
+    let relay = crate::test_scratch::short_dir("look-new");
+    let holds = Holds::live(&["s-0d"]).with_look();
+    let _looking = TestWindow::open(relay.path(), older, holds.clone(), false);
+    assert_eq!(
+        survey(relay.path(), Some(older), &["survey"])[0],
+        window_survey(older, &holds),
+        "a window that sends its look is relayed as it came"
+    );
+}
+
+/// The value an `instance` line says under a key.
+fn fields_of<'a>(line: &'a str) -> impl Fn(&str) -> Option<&'a str> {
+    move |key: &str| {
+        line.split(' ')
+            .find_map(|token| token.strip_prefix(key)?.strip_prefix('='))
+    }
 }
 
 /// A SURVEY A SESSION ASKED FOR IS ONE READ IN THE NODE JOB'S RECORD, AND EVERY WINDOW HEARS IT
@@ -839,7 +1179,16 @@ fn a_sessions_survey_reaches_each_window_plain_and_is_one_read_in_the_record() {
         ],
         (state.path().to_path_buf(), Some(reader.clone())),
     );
-    assert_eq!(answers[1], answers[0], "the same survey");
+    assert_eq!(
+        without_live_readings(&answers[1]),
+        without_live_readings(&answers[0]),
+        "the same survey"
+    );
+    let kept = without_live_readings(&answers[0]);
+    assert!(
+        kept.contains(" sid=s-0d ") && kept.contains(" sid=s-ae ") && kept.contains(" sessions="),
+        "the comparison keeps the survey: {kept}"
+    );
     let heard = ["survey", "survey", "survey facts", "survey"];
     assert_eq!(old.served(), heard);
     assert_eq!(new.served(), heard);
@@ -866,6 +1215,39 @@ fn a_sessions_survey_reaches_each_window_plain_and_is_one_read_in_the_record() {
     assert_eq!(reads, 2, "the two surveys the session asked for: {rows:?}");
 }
 
+/// `answer` without what the machine reads afresh for each answer: the node job adds its own
+/// look under these windows, which send none, so its clock and its figures (`at_ms=` and the
+/// machine keys, [`aterm_agent::survey_facts::MachineFacts::header_tokens`]) differ between two
+/// answers of one survey. Every other byte is the survey's.
+fn without_live_readings(answer: &str) -> String {
+    let unread = aterm_agent::survey_facts::MachineFacts {
+        look: aterm_capacity::machine_look::MachineLook::UNREAD,
+        up_since_ms: None,
+        os: None,
+        target: None,
+    }
+    .header_tokens();
+    let live: BTreeSet<&str> = unread
+        .split_whitespace()
+        .filter_map(|token| token.split_once('=').map(|(key, _)| key))
+        .chain(["at_ms"])
+        .collect();
+    answer
+        .lines()
+        .map(|line| {
+            line.split(' ')
+                .filter(|token| {
+                    token
+                        .split_once('=')
+                        .is_none_or(|(key, _)| !live.contains(key))
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A MERGED SURVEY KEEPS ITS BOUND AS A WINDOW DOES: past the reply bound, the rows a window
 /// itself would cut first go (the least kept, the last window's latest first), the busy agent's
 /// row stays, the Mac's own lines are the first window's once, and `sessions=` still counts every
@@ -876,10 +1258,10 @@ fn a_merged_survey_cuts_the_least_kept_rows_to_its_bound() {
     let first = window_survey(7, &Holds::live(&["s-busy1", "s-idle1"]));
     let second = window_survey(9, &Holds::live(&["s-idle2", "s-idle3"]));
     assert_eq!(
-        merge_window_surveys(std::slice::from_ref(&first), 64),
+        merge_window_surveys(std::slice::from_ref(&first), 64, None),
         first
     );
-    let whole = merge_window_surveys(&[first.clone(), second.clone()], usize::MAX);
+    let whole = merge_window_surveys(&[first.clone(), second.clone()], usize::MAX, None);
     assert_eq!(whole.lines().count(), 7, "{whole}");
     assert!(whole.starts_with("OK 6\ninstance pid=7 "), "{whole}");
     assert!(whole.ends_with("account pool=claude id=a7\n"), "{whole}");
@@ -892,7 +1274,7 @@ fn a_merged_survey_cuts_the_least_kept_rows_to_its_bound() {
     };
     // Room for all but two rows: the latest idle ones go, the busy one stays.
     let bound = whole.len() - row("s-idle3") - row("s-idle2");
-    let cut = merge_window_surveys(&[first, second], bound);
+    let cut = merge_window_surveys(&[first, second], bound, None);
     assert!(cut.len() <= bound, "{cut}");
     assert!(cut.starts_with("OK 4\n"), "{cut}");
     assert!(cut.contains(" sessions=4 "), "{cut}");
@@ -919,7 +1301,7 @@ fn a_merged_survey_counts_the_cut_rows_it_sends() {
     let second = "OK 2\ninstance pid=9 host=m111 sessions=1 level=content cut=0 at_ms=1 node=n \
                   instances=2\nsession sid=s-c program_kind=agent agent=idle said=ok\n"
         .to_owned();
-    let whole = merge_window_surveys(&[first.clone(), second.clone()], usize::MAX);
+    let whole = merge_window_surveys(&[first.clone(), second.clone()], usize::MAX, None);
     assert!(
         whole.starts_with("OK 5\ninstance pid=7 host=m111 sessions=3 level=content cut=1 "),
         "{whole}"
@@ -928,7 +1310,7 @@ fn a_merged_survey_counts_the_cut_rows_it_sends() {
         .lines()
         .find(|line| line.contains(" sid=s-b "))
         .map_or(0, |line| line.len() + 1);
-    let fitted = merge_window_surveys(&[first, second], whole.len() - row);
+    let fitted = merge_window_surveys(&[first, second], whole.len() - row, None);
     assert!(!fitted.contains(" sid=s-b "), "{fitted}");
     assert!(
         fitted.starts_with("OK 4\ninstance pid=7 host=m111 sessions=3 level=content cut=0 "),
@@ -955,7 +1337,7 @@ fn a_merged_survey_keeps_the_first_windows_updater_beside_its_version() {
                   update_to=0.199.0 update_why=crash-loop update_checks=on access=read\n\
                   session sid=s-b program_kind=shell\n"
         .to_owned();
-    let merged = merge_window_surveys(&[first, second], usize::MAX);
+    let merged = merge_window_surveys(&[first, second], usize::MAX, None);
     let lines: Vec<String> = merged.lines().skip(1).map(str::to_owned).collect();
     assert_eq!(
         aterm_net::fleet_member::Answerer::of(&lines),
@@ -1045,4 +1427,121 @@ fn the_node_counts_the_agents_of_every_window() {
     stop.store(true, Ordering::Release);
     let _ = aterm_uds::connect::until(&socket, Instant::now() + Duration::from_millis(100));
     let _ = relay_thread.join();
+}
+
+/// `answer`, one Mac's merged survey answer, as `aterm ctl survey --json` hands a fleet peer's to
+/// the fleet read: its `instance` line and each `session` row an object of their `key=value`
+/// words (no value here needs decoding).
+fn peer_json(label: &str, answer: &str) -> String {
+    let object = |line: &str| {
+        let members: Vec<String> = line
+            .split(' ')
+            .skip(1)
+            .filter_map(|token| token.split_once('='))
+            .map(|(key, value)| format!("\"{key}\":\"{value}\""))
+            .collect();
+        format!("{{{}}}", members.join(","))
+    };
+    let instance = answer
+        .lines()
+        .find(|line| line.starts_with("instance "))
+        .map_or_else(|| "null".to_owned(), object);
+    let sessions: Vec<String> = answer
+        .lines()
+        .filter(|line| line.starts_with("session "))
+        .map(object)
+        .collect();
+    format!(
+        "[{{\"label\":\"{label}\",\"fleet\":true,\"instance\":{instance},\"sessions\":[{}]}}]",
+        sessions.join(",")
+    )
+}
+
+/// A PEER'S AGENTS ARE TIMED BY THEIR OWN WINDOW'S ANSWER: a Mac's node service merges its
+/// windows' answers into one, under the first window's `instance` line, its `at_ms=` raised to
+/// the node job's look where that is later. Each window read its agents' counters at its own
+/// time, so a row the merge sends under a header of another time carries its window's own
+/// `at_ms=` (`-` where that window's clock was unread), and the fleet read times each agent by
+/// it: two windows, the look later than both, one window under a raised header, and a window
+/// with no clock. CONTROLS: the merge sending each row as it came (every agent timed by the
+/// header), the one-window path alone doing so, and the fleet read ignoring a row's own time
+/// are each caught.
+#[test]
+fn a_peers_agents_are_timed_by_their_own_windows_answer_through_the_merge() {
+    use aterm_agent::survey_facts::MachineFacts;
+    use aterm_capacity::machine_look::MachineLook;
+
+    const FIRST: u64 = 1_793_160_000_000;
+    const SECOND: u64 = FIRST + 1_800;
+    const LOOKED: u64 = FIRST + 2_500;
+    let own = || MachineFacts {
+        look: MachineLook {
+            at_unix_ms: Some(LOOKED),
+            ..MachineLook::UNREAD
+        },
+        up_since_ms: None,
+        os: None,
+        target: None,
+    };
+    let window = |pid: u32, at_ms: u64, sid: &str| {
+        format!(
+            "OK 2\ninstance pid={pid} host=m111 version=0.200.0 sessions=1 level=facts cut=0 \
+             at_ms={at_ms} node=n instances=2 access=read\nsession sid={sid} state=running \
+             program=claude program_kind=agent agent=busy attention=- needs=- turn=1\n"
+        )
+    };
+    let header_at = |answer: &str| {
+        answer
+            .lines()
+            .nth(1)
+            .and_then(|head| head.split(' ').find_map(|t| t.strip_prefix("at_ms=")))
+            .map(str::to_owned)
+    };
+    let times = |answer: &str| -> Vec<(String, Option<u64>)> {
+        let read = crate::fleet_glance::sightings(&peer_json("m111", answer), LOOKED + 9)
+            .expect("a fleet read");
+        let aterm_db::fleet::read::Answer::Answered(answered) = &read.machines[0].answer else {
+            panic!("the peer answered: {read:?}");
+        };
+        answered
+            .agents
+            .iter()
+            .map(|agent| (agent.sid.clone(), agent.answer_at_ms))
+            .collect()
+    };
+    let both = |second: Option<u64>| {
+        vec![
+            ("s-p1".to_owned(), Some(FIRST)),
+            ("s-p2".to_owned(), second),
+        ]
+    };
+
+    let pair = [window(7, FIRST, "s-p1"), window(9, SECOND, "s-p2")];
+    let merged = merge_window_surveys(&pair, usize::MAX, None);
+    assert_eq!(header_at(&merged), Some(FIRST.to_string()), "{merged}");
+    assert_eq!(times(&merged), both(Some(SECOND)), "two windows: {merged}");
+
+    let looked = merge_window_surveys(&pair, usize::MAX, Some(&own));
+    assert_eq!(header_at(&looked), Some(LOOKED.to_string()), "{looked}");
+    assert_eq!(
+        times(&looked),
+        both(Some(SECOND)),
+        "under the look: {looked}"
+    );
+
+    let one = merge_window_surveys(std::slice::from_ref(&pair[0]), usize::MAX, Some(&own));
+    assert_eq!(header_at(&one), Some(LOOKED.to_string()), "{one}");
+    assert_eq!(
+        times(&one),
+        [("s-p1".to_owned(), Some(FIRST))],
+        "one window under a raised header: {one}"
+    );
+
+    let clockless = [window(7, FIRST, "s-p1"), window(9, 0, "s-p2")];
+    let merged = merge_window_surveys(&clockless, usize::MAX, None);
+    assert_eq!(
+        times(&merged),
+        both(None),
+        "a window with no clock: {merged}"
+    );
 }

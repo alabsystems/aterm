@@ -257,11 +257,13 @@ pub(in crate::native_act) fn cleanup_terminal_pool(
     let Some(unattached) = ended_unattached(env, root) else {
         return false;
     };
-    if root.intent.purpose != renewal::Purpose::WeeklyQuota {
-        // A login renewal whose successor never attached hands its session back on the login it
-        // left, where the same wall asks for the same successor again: its end holds that
-        // successor off first ([`renewal::ReceiptWriter::note_unattached_login`]), so the session
-        // is handed back only once a new root onto it would be refused.
+    if root.intent.purpose.auth_wall() {
+        // A login renewal, or a lost login's move, whose successor never attached hands its
+        // session back on the login it left, where the same wall asks for the same successor
+        // again: its end holds that successor off first
+        // ([`renewal::ReceiptWriter::note_unattached_login`]), keyed by the source's identity,
+        // so the session is handed back only once a new root onto it would be refused. A move
+        // holds no pool record to retire.
         if unattached {
             return renewal::with_receipt_writer(env, |writer| writer.note_unattached_login(root))
                 .is_ok_and(|noted| noted.is_some());

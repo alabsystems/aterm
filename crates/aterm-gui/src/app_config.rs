@@ -1530,9 +1530,9 @@ pub(crate) struct ResolvedTrailPresentation {
     /// The animal the `cursor_pet` setting keeps walking beside the cursor, whatever the style
     /// is; `None` for `off` and for a flier.
     pub(crate) pet_species: Option<aterm_effects::kitty_pet::PetSpecies>,
-    /// The `cursor_pet` setting names a flier (`flying cat`): no walker, and the rainbow's
-    /// momentum flies the head in.
-    pub(crate) pet_flies: bool,
+    /// The animal a flier (`flying cat`) flies in at the cursor: no walker, and the rainbow's
+    /// momentum flies it in, in its glide. `None` for a walker and for `off`.
+    pub(crate) pet_flier: Option<aterm_effects::kitty_pet::PetSpecies>,
     pub(crate) comet: bool,
 }
 
@@ -1551,7 +1551,7 @@ impl Default for ResolvedTrailPresentation {
             ribbon_flat: false,
             classic_mono: false,
             pet_species: aterm_effects::cursor_pet::species(crate::prefs::DEFAULT_CURSOR_PET),
-            pet_flies: aterm_effects::cursor_pet::flies(crate::prefs::DEFAULT_CURSOR_PET),
+            pet_flier: aterm_effects::cursor_pet::flies(crate::prefs::DEFAULT_CURSOR_PET),
             comet: false,
         }
     }
@@ -6057,8 +6057,8 @@ pub(crate) fn resolve_trail_style(raw: &str) -> ResolvedTrailStyle {
 pub(crate) struct ResolvedCursorPet {
     pub(crate) canonical: &'static str,
     pub(crate) species: Option<aterm_effects::kitty_pet::PetSpecies>,
-    /// The row is a flier: its head flies in, and nothing walks.
-    pub(crate) flies: bool,
+    /// The animal the row flies in, and nothing walks; `None` for a walker and for `off`.
+    pub(crate) flies: Option<aterm_effects::kitty_pet::PetSpecies>,
     pub(crate) unknown: bool,
 }
 
@@ -6071,7 +6071,7 @@ pub(crate) fn resolve_cursor_pet(raw: &str) -> ResolvedCursorPet {
     ResolvedCursorPet {
         canonical: row.map_or("off", |row| row.name),
         species: row.and_then(|row| row.species),
-        flies: row.is_some_and(|row| row.flies),
+        flies: row.and_then(|row| row.flies),
         unknown,
     }
 }
@@ -6101,7 +6101,7 @@ pub(crate) fn resolve_trail_presentation_from_style(
         classic_mono: style.style == Some(GlowStyle::Classic)
             && GlowStyle::style_names_classic_mono(raw.trim()),
         pet_species: pet.species,
-        pet_flies: pet.flies,
+        pet_flier: pet.flies,
         comet: style.style == Some(GlowStyle::Comet),
     }
 }

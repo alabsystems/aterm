@@ -69,6 +69,10 @@ pub(crate) struct SessionRecord {
     pub autopilot: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub land_at: Option<i64>,
+    /// The session's pin ([`crate::session_timeline::SessionMeta::pinned`]); a record from a
+    /// build before the pin has none, and that session was never pinned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -790,6 +794,7 @@ impl CarriedClaims {
                 questions: record.questions.clone(),
                 autopilot: record.autopilot.clone(),
                 land_at: record.land_at,
+                pinned: record.pinned,
                 ..Default::default()
             },
             topics: record.topics.clone(),
@@ -944,6 +949,7 @@ impl SessionHandoff {
                         questions: meta.questions.clone(),
                         autopilot: meta.autopilot.clone(),
                         land_at: meta.land_at,
+                        pinned: meta.pinned,
                         control: None,
                         frozen_path: store.has_frozen_path(h.local_id),
                         topics,
@@ -1830,8 +1836,11 @@ fn record_state_change(
 }
 
 thread_local! {
-    static CLOSE_ATTRIBUTION: std::cell::RefCell<Option<(ExitReason, ExitActor)>> =
-        const { std::cell::RefCell::new(None) };
+    // Boxed: inline it was 72 bytes of every thread's thread-local template
+    // (`tests/thread_local_template.rs`). The box is made the first time a thread opens or reads
+    // an attribution.
+    static CLOSE_ATTRIBUTION: Box<std::cell::RefCell<Option<(ExitReason, ExitActor)>>> =
+        Box::new(std::cell::RefCell::new(None));
 }
 
 /// RAII guard attributing all session deregistrations on the current thread to `(reason, actor)`.

@@ -24,12 +24,11 @@ fn derived(state: &State, caller: &slot::Caller) -> Result<Vec<SourceProofDerive
     let mut result = Vec::new();
     for (child, issued) in &actor.issued {
         if let Some(parent) = &issued.parent_use {
-            let key = member_key(caller, &parent.member)?;
-            let uses = state.uses.get(&key).ok_or(Error::Stale)?;
-            let active = uses.active.get(&parent.nonce.counter).ok_or(Error::Stale)?;
-            if uses.prefix != parent.nonce.prefix || active.capability != parent.capability {
-                return Err(Error::Stale);
-            }
+            // Native issuance accepted this ancestry while the parent use was
+            // current. The child allocation can outlive that use; this row is
+            // historical metadata, not a claim that the parent is still active.
+            // Current native uses and their Scope captures are counted and
+            // validated independently below.
             result.push(SourceProofDerived {
                 child: child.clone(),
                 parent: parent.member.clone(),

@@ -835,3 +835,28 @@ fn a_shown_report_is_the_ls_rows_program_state_and_never_agent() {
         );
     }
 }
+
+/// A Claude report is a claim by Claude alone. The other agents and runtimes are
+/// negative controls; a cleared report cannot leave a standing status behind.
+#[test]
+fn claude_reports_are_shown_only_for_claude_and_clear_with_the_root() {
+    let mut term = Terminal::new(24, 80);
+    let mut gate = ProgramStateGate::default();
+    let now = Instant::now();
+    term.process(b"\x1b]7501;state=working:app=claude-code\x1b\\");
+    let report = term.program_state();
+    let app = report.state.map(|state| state.app);
+    assert!(honoured_for(Some("claude"), app));
+    for other in ["codex", "grok", "node", "bun", "zsh", "muse", "agy", "kimi"] {
+        assert!(!honoured_for(Some(other), app), "{other}");
+    }
+    assert!(!honoured_for(None, app));
+    assert!(gate.observe(report, honoured_for(Some("claude"), app), false, now));
+    let state = gate.shown().expect("standing Claude report").0;
+    assert_eq!(wire(gate.shown()), "working");
+    assert_eq!(row_word(state), "claude working");
+    assert_eq!(survey_word(state), "busy");
+    term.process(b"\x1b]7501;state=clear:app=claude-code\x1b\\");
+    assert!(gate.observe(term.program_state(), true, false, now));
+    assert!(gate.shown().is_none());
+}

@@ -33,6 +33,9 @@ mod main_lane;
 #[path = "../../src/accepted_measure.rs"]
 #[allow(dead_code)]
 mod accepted_measure;
+#[path = "../../src/allowance.rs"]
+#[allow(dead_code)]
+mod allowance;
 #[path = "../../src/apple.rs"]
 #[allow(dead_code)]
 mod apple;
@@ -162,6 +165,9 @@ mod release_disk;
 #[path = "../../src/release_keychain.rs"]
 #[allow(dead_code)]
 mod release_keychain;
+#[path = "../../src/release_leftovers.rs"]
+#[allow(dead_code)]
+mod release_leftovers;
 #[path = "../../src/release_pump.rs"]
 #[allow(dead_code)]
 mod release_pump;
@@ -214,6 +220,10 @@ mod stage_local;
 #[path = "../../src/tap.rs"]
 #[allow(dead_code)]
 mod tap;
+#[cfg(unix)]
+#[path = "../../src/test_vault_tests.rs"]
+#[allow(dead_code)]
+mod test_vault;
 #[path = "../../src/transforms.rs"]
 #[allow(dead_code)]
 mod transforms;
@@ -305,4 +315,19 @@ pub(crate) fn test_scratch_dir(tag: &str) -> aterm_tempfile::TempDir {
     #[cfg(not(unix))]
     let made = builder.tempdir();
     made.expect("test scratch dir")
+}
+
+/// The store's release ring under `home` as its three entries (key, record, profile), all for one
+/// fresh key, or the record naming `record_key` where a test wants the three apart: the profile's
+/// base64 PKCS#8 and the public key. Only these tests seed a ring without a key of their own, so
+/// it lives here: in the shared module the binary's unit tests would compile it unused.
+#[cfg(unix)]
+fn seed_ring(home: &std::path::Path, record_key: Option<&str>) -> (String, String) {
+    use ring::signature::KeyPair as _;
+    let pkcs8 =
+        ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let pubkey = aterm_codec::base64::encode(pair.public_key().as_ref()).unwrap();
+    test_vault::seed_ring_as(home, "m22", pkcs8.as_ref(), record_key.unwrap_or(&pubkey));
+    (aterm_codec::base64::encode(pkcs8.as_ref()).unwrap(), pubkey)
 }

@@ -1247,6 +1247,13 @@ pub struct RenderInput {
     pub fire_patch_damage: EffectStreamDamage,
     /// Host-resolved cursor fill override (`0x00RRGGBB`), or `None` for the theme/OSC-12 colour.
     pub cursor_fill_override: Option<u32>,
+    /// The tint (`0x00RRGGBB`, premultiplied, additive) of a keyline the renderer draws one pixel
+    /// inside an opaque block caret's edge, over its fill and its letter, or `None`: the rainbow
+    /// caret's innermost rim, laid on the caret where it would otherwise be the page's pixel
+    /// beside it. The renderer works the line's colour from this, the fill it draws (after its
+    /// minimum-contrast floor) and the ground under the caret (`aterm_render`'s
+    /// `block_keyline_colour`).
+    pub cursor_keyline_tint: Option<u32>,
     /// Whether the page's text can take the GPU's bloom ([`BloomGate`]).
     pub bloom_gate: BloomGate,
     /// Sparkle-word decorations: small sprites over cells of matched words.
@@ -1623,6 +1630,7 @@ impl PartialEq for RenderInput {
             && self.glow_under_ramps == other.glow_under_ramps
             && self.fire_patch == other.fire_patch
             && self.cursor_fill_override == other.cursor_fill_override
+            && self.cursor_keyline_tint == other.cursor_keyline_tint
             && self.bloom_gate == other.bloom_gate
             && self.word_decorations == other.word_decorations
             && self.ink == other.ink
@@ -1812,6 +1820,7 @@ impl RenderInput {
         self.cursor_trail.clone_from(&source.cursor_trail);
         self.cursor_trail_color = source.cursor_trail_color;
         self.cursor_fill_override = source.cursor_fill_override;
+        self.cursor_keyline_tint = source.cursor_keyline_tint;
         self.bloom_gate = source.bloom_gate;
 
         macro_rules! copy_effect_stream {
@@ -1935,6 +1944,7 @@ impl RenderInput {
             glow_under_damage: EffectStreamDamage::default(),
             fire_patch_damage: EffectStreamDamage::default(),
             cursor_fill_override: None,
+            cursor_keyline_tint: None,
             bloom_gate: BloomGate::Open,
             word_decorations: Vec::new(),
             ink: Vec::new(),
@@ -2408,6 +2418,7 @@ impl RenderInput {
         self.glow_under_damage = EffectStreamDamage::default();
         self.fire_patch_damage = EffectStreamDamage::default();
         self.cursor_fill_override = None;
+        self.cursor_keyline_tint = None;
         self.bloom_gate = BloomGate::Open;
         self.word_decorations.clear();
         self.ink.clear();

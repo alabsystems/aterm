@@ -30,16 +30,18 @@ fn proof_of(endpoint: &Endpoint) -> NodeProof {
 }
 
 /// The bytes `endpoint` writes before any evidence under `wire`: its metadata, then under
-/// `atdb/5` what it holds.
+/// `atdb/5` and `atdb/6` what it holds.
 fn stated(endpoint: &Endpoint, wire: Wire) -> usize {
     let metadata = 4 + HELLO_FIXED + 6;
     match wire {
         Wire::Whole => metadata,
-        Wire::Delta => metadata + 4 + 13 + 32 * View::of(endpoint).unwrap().have().len(),
+        Wire::Delta | Wire::Duplex => {
+            metadata + 4 + 13 + 32 * View::of(endpoint).unwrap().have().len()
+        }
     }
 }
 
-/// Metadata of `request` under `bound`, then under `atdb/5` a statement that it holds nothing:
+/// Metadata of `request` under `bound`, then under delta-frontier protocols a statement that it holds nothing:
 /// what a peer sends before its evidence.
 fn opening(trust: Trust, request: &Request, bound: RecordsBound, wire: Wire) -> Vec<u8> {
     let mut input = Vec::new();
@@ -49,7 +51,7 @@ fn opening(trust: Trust, request: &Request, bound: RecordsBound, wire: Wire) -> 
         flags: 0,
     };
     send_frame(&mut input, &metadata.encode(trust)).unwrap();
-    if wire == Wire::Delta {
+    if wire != Wire::Whole {
         send_frame(&mut input, &encode_frontier(bound, &[])).unwrap();
     }
     input
@@ -171,17 +173,20 @@ fn frontier_refuses_missing_reflected_and_incompatible_identity_before_evidence(
         node: endpoint.identity.node().into(),
         key: endpoint.identity.key(),
     };
-    for (wire, proof, bound) in [Wire::Whole, Wire::Delta].into_iter().flat_map(|wire| {
-        [
-            (wire, None, RecordsBound::here(false)),
-            (wire, Some(&reflected), RecordsBound::here(false)),
-            (
-                wire,
-                Some(&valid_proof),
-                RecordsBound::of(u32::MAX as usize, true),
-            ),
-        ]
-    }) {
+    for (wire, proof, bound) in [Wire::Whole, Wire::Delta, Wire::Duplex]
+        .into_iter()
+        .flat_map(|wire| {
+            [
+                (wire, None, RecordsBound::here(false)),
+                (wire, Some(&reflected), RecordsBound::here(false)),
+                (
+                    wire,
+                    Some(&valid_proof),
+                    RecordsBound::of(u32::MAX as usize, true),
+                ),
+            ]
+        })
+    {
         let peer = Metadata {
             request: lab.requests[1].clone(),
             bound,
@@ -738,7 +743,7 @@ fn frontier_keeps_selected_evidence_after_the_seat_record() {
     };
     // Under `atdb/4`, and to a peer that holds nothing, the whole selected evidence, the later
     // proof among it.
-    for wire in [Wire::Whole, Wire::Delta] {
+    for wire in [Wire::Whole, Wire::Delta, Wire::Duplex] {
         let received = log_witness_from_records(lab.trust, pushed(wire, &[])).unwrap();
         assert_eq!(received.held_count(), log.held_count());
         assert!(received.get(&wrapped_id).is_some());
@@ -808,7 +813,7 @@ fn frontier_native_tls_resumes_after_a_durable_receipt_is_lost() {
             .into_parts();
             tcp.set_read_timeout(Some(EXCHANGE)).unwrap();
             tcp.set_write_timeout(Some(EXCHANGE)).unwrap();
-            let mut channel = fleet::server_handshake_database_as(
+            let mut channel = fleet::test_server_handshake_database_v5_as(
                 tcp,
                 &FleetSecret::new(&[51; 32]).unwrap(),
                 Some(&fixture.endpoints[1].identity),
@@ -841,7 +846,7 @@ fn frontier_native_tls_resumes_after_a_durable_receipt_is_lost() {
             .into_parts();
         tcp.set_read_timeout(Some(EXCHANGE)).unwrap();
         tcp.set_write_timeout(Some(EXCHANGE)).unwrap();
-        let mut channel = fleet::client_handshake_database_as(
+        let mut channel = fleet::test_client_handshake_database_v5_as(
             tcp,
             &FleetSecret::new(&[51; 32]).unwrap(),
             Some(&fixture.endpoints[0].identity),
@@ -909,7 +914,7 @@ fn frontier_sender_respects_the_receivers_smaller_held_bound() {
         assert!(count > aterm_secrets::membership_log::LEGACY_RECORDS);
         let endpoint = fixture.lab.endpoint(0);
         let evidence = crate::control::frontier::Evidence::Log(Arc::new(log));
-        for (wire, held, fits) in [Wire::Whole, Wire::Delta]
+        for (wire, held, fits) in [Wire::Whole, Wire::Delta, Wire::Duplex]
             .into_iter()
             .flat_map(|wire| [(wire, count, true), (wire, count - 1, false)])
         {
@@ -1027,10 +1032,10 @@ fn frontier_rejects_a_different_real_genesis_even_when_root_metadata_matches() {
         flags: 1,
     };
     let held = client::load_records(&fixture.paths[1]).unwrap().inventory();
-    for wire in [Wire::Whole, Wire::Delta] {
+    for wire in [Wire::Whole, Wire::Delta, Wire::Duplex] {
         let mut input = Vec::new();
         send_frame(&mut input, &metadata.encode(fixture.lab.trust)).unwrap();
-        if wire == Wire::Delta {
+        if wire != Wire::Whole {
             send_frame(&mut input, &encode_frontier(bound, &[])).unwrap();
         }
         send_frame(
@@ -1093,7 +1098,7 @@ fn frontier_rechecks_capacity_after_waiting_for_peer_admission() {
         };
         let mut input = Vec::new();
         send_frame(&mut input, &metadata.encode(lab.trust)).unwrap();
-        if wire == Wire::Delta {
+        if wire != Wire::Whole {
             send_frame(&mut input, &encode_frontier(remote.records_bound, &[])).unwrap();
         }
         let evidence = evidence_frames(
@@ -1887,7 +1892,7 @@ fn released_session(
             let handshake = if released == Some(1) {
                 fleet::test_server_handshake_database_v4_as
             } else {
-                fleet::server_handshake_database_as
+                fleet::test_server_handshake_database_v5_as
             };
             let mut channel =
                 handshake(tcp, &secret, Some(&fixture.endpoints[1].identity), EXCHANGE).unwrap();
@@ -1916,7 +1921,7 @@ fn released_session(
         let handshake = if released == Some(0) {
             fleet::test_client_handshake_database_v4_as
         } else {
-            fleet::client_handshake_database_as
+            fleet::test_client_handshake_database_v5_as
         };
         let mut channel =
             handshake(tcp, &secret, Some(&fixture.endpoints[0].identity), EXCHANGE).unwrap();
@@ -1944,7 +1949,7 @@ fn released_session(
 /// whole witness, and the membership rounds move both forks of the log, more records than one
 /// 0.153 batch holds, until both hold the same records.
 ///
-/// NEGATIVE CONTROL (in the test): two Macs of this build negotiate `atdb/5`, so the sessions
+/// NEGATIVE CONTROL (in the test): two delta-frontier peers negotiate `atdb/5`, so the sessions
 /// above ran the released wire, not this build's.
 #[test]
 fn a_released_atdb4_mac_and_this_build_complete_a_session() {
@@ -2189,7 +2194,7 @@ fn founded_then_removed(lab: &Lab) -> (Log, Log) {
 ///
 /// NEGATIVE CONTROL (in the test): with a failed read passing the peer
 /// ([`mutants::Mutant::UnreadCustodyAdmits`], as both checks did before X1), the removed Mac is
-/// authenticated and the responder's session completes, under both wires.
+/// authenticated and the responder's session completes, under all three wires.
 #[test]
 fn a_removed_mac_is_refused_while_its_responders_records_do_not_read() {
     let lab = Lab::new();
@@ -2199,7 +2204,7 @@ fn a_removed_mac_is_refused_while_its_responders_records_do_not_read() {
     let actor = lab.requests[1].binding().actor();
     let kept = custodied(&lab, 0, "kept", founded.clone(), &founded);
     let responder = custodied(&lab, 0, "responder", founded, &removed);
-    for wire in [Wire::Delta, Wire::Whole] {
+    for wire in [Wire::Delta, Wire::Whole, Wire::Duplex] {
         let (result, repair) = answered(&mac2, &kept, wire, false, None);
         assert!(
             result.is_ok(),
@@ -2280,7 +2285,7 @@ fn a_remove_not_yet_acknowledged_refuses_its_mac_at_the_handshake() {
         Some(founded.heads()),
         "the log the check judges by is the acknowledged one"
     );
-    for wire in [Wire::Delta, Wire::Whole] {
+    for wire in [Wire::Delta, Wire::Whole, Wire::Duplex] {
         let (result, repair) = answered(&mac2, &responder, wire, false, None);
         assert!(result.is_err(), "{wire:?}: the durable Remove refuses it");
         assert_eq!(repair.authenticated_actor(), None, "{wire:?}");
@@ -2440,7 +2445,7 @@ fn every_grant_of_a_real_session_spends_one_fresh_pass() {
     let mac2 = witnessed(&lab, 1, founded.clone());
     let kept = custodied(&lab, 0, "kept", founded.clone(), &founded);
     let responder = custodied(&lab, 0, "responder", founded, &removed);
-    for wire in [Wire::Delta, Wire::Whole] {
+    for wire in [Wire::Delta, Wire::Whole, Wire::Duplex] {
         let (result, _, tape) = taped(&mac2, &kept, wire);
         assert!(result.is_ok(), "{wire:?}: {result:?}");
         let grants = replay(&tape);
@@ -2656,6 +2661,7 @@ const fn alpn(protocol: Protocol) -> &'static str {
         Protocol::Credentials => "atdb/3",
         Protocol::Frontier(Wire::Whole) => "atdb/4",
         Protocol::Frontier(Wire::Delta) => "atdb/5",
+        Protocol::Frontier(Wire::Duplex) => "atdb/6",
     }
 }
 
@@ -2716,7 +2722,7 @@ fn session(
 /// its log; Mac 1 then makes a `Remove` of Mac 2 durable without acknowledging it (as a writer cut
 /// short between writing the records file and acknowledging it leaves the file, the records
 /// written here as X1's test writes them), and the same pending device dials it again under
-/// `atdb/5`, `atdb/4` and the legacy `ACE1` exchange (the one an `atdb/2` or `atdb/3` channel and
+/// `atdb/6`, `atdb/5`, `atdb/4` and the legacy `ACE1` exchange (the one an `atdb/2` or `atdb/3` channel and
 /// a channel with no ALPN carry for a pending device). Under each, Mac 1 refuses it: its session
 /// fails, it never authenticates Mac 2, and it authors no record.
 ///
@@ -2734,7 +2740,8 @@ fn session(
 #[test]
 fn a_pending_enrollment_is_judged_on_every_record_held() {
     use crate::control::enrollment::tests::Lab as Vault;
-    const ENROLLING: [Protocol; 3] = [
+    const ENROLLING: [Protocol; 4] = [
+        Protocol::Frontier(Wire::Duplex),
         Protocol::Frontier(Wire::Delta),
         Protocol::Frontier(Wire::Whole),
         Protocol::Legacy,
@@ -2927,7 +2934,7 @@ impl Later {
 /// [`PeerCacheStage::Acquired`] fires in its thread), its own `Remove` of Mac 2 becomes durable,
 /// ahead of its acknowledgement or acknowledged. Its session must fail with no grant after: it
 /// trades Mac 2 no membership records and sends it none of its control history (one node its
-/// journal holds that Mac 2's lacks). `atdb/5` and `atdb/4`, which re-check before each grant,
+/// journal holds that Mac 2's lacks). `atdb/6`, `atdb/5` and `atdb/4`, which re-check before each grant,
 /// stop at the same moment.
 ///
 /// The defect it pins: `connected_until`'s legacy branch calls `verify_peer_against_local_log`
@@ -3018,6 +3025,7 @@ fn a_remove_after_the_check_stops_every_later_grant_on_atdb_2_3() {
         Protocol::Legacy,
         Protocol::Repair,
         Protocol::Credentials,
+        Protocol::Frontier(Wire::Duplex),
         Protocol::Frontier(Wire::Delta),
         Protocol::Frontier(Wire::Whole),
     ] {

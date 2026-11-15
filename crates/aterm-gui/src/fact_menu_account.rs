@@ -31,7 +31,7 @@ use aterm_agent::harness::account_progress::{AccountProgress, OwnClaimBlocker, P
 use aterm_agent::harness::accounts::{AuthRoute, Cli};
 use aterm_agent::harness::ai_pool::SlotWhy;
 use aterm_agent::harness::outlook::{self, Figure, Offsets, Read, Window};
-use aterm_agent::harness::token_state::TokenState;
+use aterm_agent::harness::token_state::{TokenState, Unverified};
 
 use super::{AccountMenuRow, FactAct, FactMenuFacts, PIN_GLYPH, band_glyphs, band_level};
 use crate::autopilot_menu::{
@@ -573,18 +573,84 @@ fn token_section(ctx: &Ctx<'_>) -> (Verdict, Vec<MenuRow>) {
                     Some(at) => vault(Words::of("ended").then(ctx.date(at))),
                     None => vault(Words::of("ended")),
                 },
-                TokenState::Rejected => vault(Words::of("Claude Code refused it")),
+                TokenState::Rejected { .. } => vault(Words::of("Claude Code refused it")),
+                // This Mac's comparison found its windows different: this Mac starts no session
+                // on it, a session running on it here moves back where this Mac holds the stored
+                // login, and only a replacement is ever verified, so the card of the Mac that
+                // made it says to replace it; another Mac's says only that it is not used here.
+                TokenState::Unverified {
+                    minted_here: true,
+                    why: Unverified::WindowsDiffer,
+                    ..
+                } => vault(Words::of(
+                    "replace it: not used, its usage windows are not this login's",
+                )),
+                TokenState::Unverified {
+                    why: Unverified::WindowsDiffer,
+                    ..
+                } => vault(Words::of(
+                    "not used here: its usage windows are not this login's",
+                )),
+                // Another account here shows the same windows, so the comparison could not tell
+                // the two apart and never verifies it: one made at a person's terminal (or whose
+                // meta names no route) then serves only this Mac, so its card says to replace it.
+                TokenState::Unverified {
+                    minted_here: true,
+                    why: Unverified::WindowsShared,
+                    minted_by,
+                    ..
+                } if !minted_by
+                    .is_some_and(aterm_secrets::entry_class::MintedBy::proves_account) =>
+                {
+                    vault(Words::of(
+                        "replace it: its usage windows could not be told from another account's",
+                    ))
+                }
+                // Made on another Mac at a person's terminal, or by a meta that names no route:
+                // only that Mac uses it until it is verified.
+                TokenState::Unverified { minted_on, .. } if !token.kind.in_use() => {
+                    Verdict::value(place().and(Words::of(format!(
+                        "not used here until {} verifies it",
+                        if minted_on.is_empty() {
+                            "the Mac that made it"
+                        } else {
+                            minted_on.as_str()
+                        }
+                    ))))
+                }
+                // No session on the stored login here has reported its windows since it was
+                // made: a launch whose stored login works here stays on it until one does.
+                TokenState::Unverified {
+                    minted_here: true,
+                    why: Unverified::AwaitingBasis,
+                    ..
+                } if token.not_yet => {
+                    Verdict::value(place().and(Words::of("awaiting a stored-login reading")))
+                }
+                TokenState::Unverified {
+                    minted_here: true,
+                    why: Unverified::AwaitingBasis,
+                    ..
+                } => Verdict::value(
+                    Words::of("made here").and(Words::of("awaiting a stored-login reading")),
+                ),
+                TokenState::Unverified {
+                    why: Unverified::AwaitingBasis,
+                    ..
+                } => Verdict::value(place().and(Words::of("awaiting a stored-login reading"))),
                 TokenState::Unverified {
                     minted_here: true, ..
                 } if token.not_yet => Verdict::value(place().and(Words::of("not verified yet"))),
                 TokenState::Unverified {
                     minted_here: true, ..
                 } => Verdict::value(Words::of("made here").and(Words::of("not verified yet"))),
+                // Made on another Mac in aterm's window or headless route: in use here from its
+                // mint, verified or not.
                 TokenState::Unverified { minted_on, .. } => {
                     Verdict::value(place().and(Words::of(format!(
-                        "works only on {} until verified",
+                        "made on {}, not verified yet",
                         if minted_on.is_empty() {
-                            "the Mac that made it"
+                            "another Mac"
                         } else {
                             minted_on.as_str()
                         }
@@ -596,6 +662,12 @@ fn token_section(ctx: &Ctx<'_>) -> (Verdict, Vec<MenuRow>) {
     };
     let stored = facts.route == Some(AuthRoute::Stored);
     let login = match (&facts.route, ctx.card()) {
+        // An account with no login here whose sign-in runs on this Mac says so first, whatever
+        // the tab runs on, by the rule line E and the card's items read (`Figure::login`, which
+        // the card's build applied: `AccountCard::signing_in`).
+        (_, Some(card)) if card.signing_in => {
+            Some((Words::of(outlook::SIGNING_IN), NoteTone::Label))
+        }
         (Some(AuthRoute::VaultToken { .. }), _) => Some((
             Words::of("not needed: this tab runs on the vault token"),
             NoteTone::Value,
@@ -655,12 +727,13 @@ fn token_section(ctx: &Ctx<'_>) -> (Verdict, Vec<MenuRow>) {
     (verdict, rows)
 }
 
-/// The account's stored login on this Mac as `card` and the token read know it: an outside
-/// login is signed in (the tab runs on it) and is given no end; a pool row's is its record's,
-/// or not needed where a vault token stands in for it; a row no login was ever made for says
-/// so. A tab that runs on the stored login itself is told the login's own record first: the
-/// row then ends `this tab runs on it`, which after `not needed: the vault token …` would
-/// read as the tab running on the token.
+/// The account's stored login on this Mac as `card` and the token read know it, with no
+/// sign-in of it running where it has none here (that says `signing in` before this is asked):
+/// an outside login is signed in (the tab runs on it) and is given no end; a pool row's is its
+/// record's, or not needed where a vault token stands in for it; a row no login was ever made
+/// for says so. A tab that runs on the stored login itself is told the login's own record
+/// first: the row then ends `this tab runs on it`, which after `not needed: the vault token …`
+/// would read as the tab running on the token.
 fn login_words(ctx: &Ctx<'_>, card: &AccountCard) -> Option<(Words, NoteTone)> {
     match &card.who {
         Who::Outside { .. } => Some((Words::of("signed in on this Mac"), NoteTone::Value)),
@@ -708,10 +781,11 @@ fn login_half_words(ctx: &Ctx<'_>, half: LoginHalf) -> (Words, NoteTone) {
             (Words::of("ended").then(ctx.date(at)), NoteTone::Warn)
         }
         LoginHalf::Ended { at: None } => (Words::of("ended"), NoteTone::Warn),
-        LoginHalf::SignedOut { at: Some(at) } => {
-            (Words::of("signed out").then(ctx.date(at)), NoteTone::Warn)
-        }
-        LoginHalf::SignedOut { at: None } => (Words::of("signed out"), NoteTone::Warn),
+        LoginHalf::SignedOut { at: Some(at) } => (
+            Words::of(outlook::SIGNED_OUT).then(ctx.date(at)),
+            NoteTone::Warn,
+        ),
+        LoginHalf::SignedOut { at: None } => (Words::of(outlook::SIGNED_OUT), NoteTone::Warn),
     }
 }
 
@@ -726,7 +800,7 @@ fn budget_section(ctx: &Ctx<'_>) -> (Verdict, Vec<MenuRow>) {
     let facts = ctx.facts;
     let stand = week_stand(ctx);
     let verdict = match &stand {
-        _ if facts.signed_out => Verdict::label("not known: not signed in"),
+        _ if facts.signed_out => Verdict::label(format!("not known: {}", outlook::SIGNED_OUT)),
         Some(stand) => {
             let (words, tone) = standing(ctx, stand.figure, stand.reset);
             Verdict { words, tone }
@@ -1705,7 +1779,7 @@ fn head_rows(ctx: &Ctx<'_>, out: &mut Vec<MenuRow>) {
         _ => None,
     });
     let name = if facts.signed_out {
-        Some("not signed in")
+        Some(outlook::SIGNED_OUT)
     } else {
         facts
             .email
@@ -1940,9 +2014,10 @@ pub(crate) fn account_rows(facts: &FactMenuFacts) -> Vec<MenuRow> {
 }
 
 /// Everything the card holds of the account, for the clipboard: each of its facts unwrapped,
-/// then what the card leaves out (the token's dates and its vault standing, every Mac the
-/// account is assigned to and every live claim, the last use and the starts by Mac, why the
-/// footer has no week figure, and today's recovery record). Every time is said on the local
+/// then what the card leaves out (the token's dates, its vault standing and a token step a check
+/// stopped that its record holds, every Mac the account is assigned to and every live claim,
+/// the last use and the starts by Mac, why the footer has no week figure, and today's recovery
+/// record). Every time is said on the local
 /// clock with its RFC 3339 instant after it. For an account that is a row here, the last line
 /// names the command that prints its older days.
 #[must_use]
@@ -2007,6 +2082,9 @@ pub(crate) fn details_report(facts: &FactMenuFacts) -> String {
         }
         if let Some(vault) = &token.vault_words {
             lines.push(format!("Vault: {vault}"));
+        }
+        if let Some(step) = &token.step {
+            lines.push(format!("Token step: {step}"));
         }
         match secs(token.peers_read_at) {
             Some(at) => lines.push(format!(

@@ -11,11 +11,39 @@ use super::tests::{
 };
 use super::*;
 use std::io::{Read, Write};
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 use std::os::fd::AsFd as _;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Unit-test images do not serve the tether entrypoint. A required watcher must
+/// therefore refuse before executing the requested program, with the genuine
+/// no-birth receipt; calling the optional builder afterward cannot weaken it.
+#[test]
+fn a_required_tether_without_a_helper_refuses_before_birth() {
+    assert!(crate::tether::executable().is_none());
+    let scratch = Scratch::new("required-tether");
+    let marker = scratch.join("executed");
+    let mut child = command("/bin/sh");
+    child
+        .args(["-c", "printf executed > \"$1\"", "required-tether"])
+        .arg(&marker)
+        .require_tether()
+        .tether();
+    let attempt = BirthAttempt::new().expect("actual attempt");
+    let key = attempt.key().clone();
+    let failure = child.spawn_cohort(attempt).expect_err("no helper route");
+    match failure {
+        SpawnFailure::NotSpawned(receipt) => {
+            assert_eq!(receipt.key(), &key);
+            assert_eq!(receipt.error().kind(), io::ErrorKind::Unsupported);
+        }
+        SpawnFailure::Unbound { .. } => panic!("a missing route started a child"),
+        SpawnFailure::Refused(_) => panic!("the actual current birth attempt was refused"),
+    }
+    assert!(!marker.exists(), "the requested program must not execute");
+}
 
 /// Darwin may report a start-suspended child's CLD_STOPPED even with WEXITED.
 /// Neither that notification nor its pid means the actual owned child exited.
@@ -254,7 +282,7 @@ fn a_descriptor_at_any_number_reaches_its_slot() {
 }
 
 /// The staged half of [`an_inherited_stdio_reaches_the_child_and_a_closed_one_is_null`].
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn staged_inherit() {
     unsafe extern "C" {
         fn close(fd: RawFd) -> i32;
@@ -284,7 +312,7 @@ fn staged_inherit() {
 /// child whose stdout is inherited writes into this process's stdout; one
 /// whose inherited stderr this process has CLOSED gets `/dev/null` there, so
 /// its writes succeed and its first `open` does not land on 2.
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 #[test]
 fn an_inherited_stdio_reaches_the_child_and_a_closed_one_is_null() {
     const NAME: &str =
@@ -298,8 +326,26 @@ fn an_inherited_stdio_reaches_the_child_and_a_closed_one_is_null() {
     assert!(out.contains("STAGED inherit ok"), "{out}");
 }
 
-/// The staged half of [`a_pipe_end_this_process_keeps_never_passes_for_its_closed_stdio`].
+/// The child of [`staged_closed_stdio`]: its stdout must be `/dev/null` (a character device),
+/// and its stdin must end once this process wrote it and closed its end.
 #[cfg(target_vendor = "apple")]
+const STDOUT_NULL_STDIN_ENDS: &str = "{ t=$(/usr/bin/stat -f %HT <&9); } 9>&1; \
+     [ \"$t\" = 'Character Device' ] || { echo stdout=not-null >&2; exit 3; }; \
+     cat >/dev/null; echo stdin-ended >&2";
+#[cfg(target_os = "linux")]
+const STDOUT_NULL_STDIN_ENDS: &str = "{ t=$(stat -L -c %F /dev/stdin <&9); } 9>&1; \
+     [ \"$t\" = 'character special file' ] || { echo stdout=not-null >&2; exit 3; }; \
+     cat >/dev/null; echo stdin-ended >&2";
+/// A child that says whether its inherited stdin is `/dev/null`.
+#[cfg(target_vendor = "apple")]
+const SAYS_STDIN_IS_NULL: &str = "[ \"$(/usr/bin/stat -f %HT)\" = 'Character Device' ] \
+     && echo stdin=null || echo stdin=not-null";
+#[cfg(target_os = "linux")]
+const SAYS_STDIN_IS_NULL: &str = "[ \"$(stat -L -c %F /dev/stdin)\" = 'character special file' ] \
+     && echo stdin=null || echo stdin=not-null";
+
+/// The staged half of [`a_pipe_end_this_process_keeps_never_passes_for_its_closed_stdio`].
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn staged_closed_stdio() {
     unsafe extern "C" {
         fn close(fd: RawFd) -> i32;
@@ -316,12 +362,7 @@ fn staged_closed_stdio() {
     assert_eq!(unsafe { close(1) }, 0, "close stdout");
 
     let mut child = command("/bin/sh")
-        .args([
-            "-c",
-            "{ t=$(/usr/bin/stat -f %HT <&9); } 9>&1; [ \"$t\" = 'Character Device' ] \
-             || { echo stdout=not-null >&2; exit 3; }; \
-             cat >/dev/null; echo stdin-ended >&2",
-        ])
+        .args(["-c", STDOUT_NULL_STDIN_ENDS])
         .stdin(Stdio::piped())
         .stderr(err.try_clone().expect("dup err"))
         .spawn()
@@ -346,10 +387,7 @@ fn staged_closed_stdio() {
     };
 
     let out = command("/bin/sh")
-        .args([
-            "-c",
-            "[ \"$(/usr/bin/stat -f %HT)\" = 'Character Device' ] && echo stdin=null || echo stdin=not-null",
-        ])
+        .args(["-c", SAYS_STDIN_IS_NULL])
         .stdin(Stdio::inherit())
         .output()
         .expect("output");
@@ -376,7 +414,7 @@ fn staged_closed_stdio() {
 /// there, reads to the spawn as this process's own stdio, which an inherited
 /// slot hands the child (a child given the write end of its own stdin as its
 /// stdout waits for its stdin's end forever).
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 #[test]
 fn a_pipe_end_this_process_keeps_never_passes_for_its_closed_stdio() {
     const NAME: &str =
@@ -519,6 +557,19 @@ fn a_native_image_spawn_refuses_what_it_could_not_start_as_its_image() {
     }
     let mut started = tethered.native_image(false).spawn().expect("starts");
     assert!(started.wait().expect("its exit").success());
+}
+
+/// `std`'s command for `program`, forked into `execvp` by a hook that does nothing, in place of
+/// its `posix_spawn` (glibc's, which runs no file the kernel will not run as a script).
+#[cfg(target_os = "linux")]
+fn std_execvp(program: &str) -> std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+    let mut command = std::process::Command::new(program);
+    // SAFETY: the hook does nothing, so nothing runs between the fork and the exec.
+    unsafe {
+        command.pre_exec(|| Ok(()));
+    }
+    command
 }
 
 #[test]
@@ -693,6 +744,13 @@ fn programs_arguments_environments_and_directories_match_std() {
             mute.push(row.what);
         } else if !std_answers_two_ways(row.what) {
             assert_eq!(ours, theirs, "{}: ours, then std's", row.what);
+        }
+        // Linux's spawn walks glibc's `execvp` search in its child: std's forked child runs
+        // that `execvp` itself, so every row, the script with no `#!` included, answers alike.
+        #[cfg(target_os = "linux")]
+        if translator.is_none() {
+            let execvp = outcome(configured!(std_execvp, row).output());
+            assert_eq!(ours, execvp, "{}: ours, then std's execvp", row.what);
         }
         kinds.push((row.what, ours));
     }

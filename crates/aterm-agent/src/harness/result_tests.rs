@@ -5,9 +5,10 @@
 
 use super::*;
 use crate::supervise::ScratchDir;
-use crate::supervise::policy::turn_end::{
+use crate::supervise::policy::turn_end::done_check_text;
+use alab_policy::words::{
     DONE_CHECK, DONE_CHECK_MARKER_BEFORE, LAND, LAND_ANSWER, LAND_NUDGE, RETIRED_LAND_NUDGES,
-    RETIRED_LANDS, done_check_text, done_check_words,
+    RETIRED_LANDS, done_check_words,
 };
 
 const SESSION: &str = "0b2299fa-2e8d-447e-a9b8-082171298ccd";
@@ -572,7 +573,7 @@ fn the_result_is_the_report_before_the_land_acts_then_the_defense() {
 /// anything else ends nothing. Negative control: the `LANDED` answer kept in the report.
 #[test]
 fn the_receipt_quotes_the_audited_defense() {
-    use crate::supervise::policy::land_check::{LAND_CHECK, LANDED};
+    use alab_policy::land_check::{LAND_CHECK, LANDED};
     let defense = "Nothing left: merged to origin/main at 4f2a9c1, worktree removed.";
     let checked = |answer: &str| {
         let mut rows = landing(LAND_NUDGE, &[says("a-defense", "msg_3", defense)]);
@@ -1515,7 +1516,7 @@ fn past_the_bound_the_snapshot_is_read_as_it_stands() {
 /// report. NEGATIVE CONTROL: a snapshot taken by [`DoneBy::Turn`] over the same rows reads nothing.
 #[test]
 fn a_failed_result_that_missed_its_snapshot_is_read_again_by_its_own_rule() {
-    use crate::supervise::policy::land_check::LAND_CHECK;
+    use alab_policy::land_check::LAND_CHECK;
     const SAID: &str = "Could not finish: the grammar is gone.";
     let root = ScratchDir::new("result", "reread-failed");
     let tasks = root.join("tasks");

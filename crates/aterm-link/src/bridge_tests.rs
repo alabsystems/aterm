@@ -9,7 +9,7 @@ fn receipt_and_expired_bodies_are_what_astream_reads() {
     const T: u64 = 1_700_000_000_999;
     for verdict in ReceiptVerdict::ALL {
         let word = verdict.as_str();
-        let wire = receipt_body(T, "s-host", 41, word).encode();
+        let wire = receipt_body(T, "th0st000000", 41, word).encode();
         let line = String::from_utf8_lossy(&wire).into_owned();
         assert_eq!(
             V1Receipt::decode("ack", &wire),
@@ -23,14 +23,14 @@ fn receipt_and_expired_bodies_are_what_astream_reads() {
         let (ours, _) = Body::decode(&wire);
         assert_eq!(
             (ours.re, ours.verdict.as_deref(), ours.from.as_deref()),
-            (Some(41), Some(word), Some("s-host")),
+            (Some(41), Some(word), Some("th0st000000")),
             "{line}"
         );
     }
     let posted = |dl: Option<u64>, via: Option<&str>| QueuedPost {
-        sid: "s-b".into(),
+        sid: "tb000000000".into(),
         id: 1,
-        to: "s-a".into(),
+        to: "ta000000000".into(),
         kind: "ack".into(),
         re: Some(41),
         dl,
@@ -77,7 +77,7 @@ fn receipt_and_expired_bodies_are_what_astream_reads() {
             "{line}"
         );
     }
-    let mut receipt = receipt_body(T, "s-host", 41, "handled");
+    let mut receipt = receipt_body(T, "th0st000000", 41, "handled");
     receipt.re = None;
     let mut post = posted(None, None);
     post.re = None;
@@ -99,12 +99,16 @@ fn replay_scheduler_refines_shared_budget_and_rotation() {
     let mut state = model.init_state();
     let now = Instant::now();
     let mut replay = SayReplay::new(now);
-    let owed = BTreeSet::from(["s-a".to_string(), "s-b".to_string()]);
+    let owed = BTreeSet::from(["ta000000000".to_string(), "tb000000000".to_string()]);
 
     assert!(model.fire("Control", &mut state));
     for _ in 0..SAY_REPLAY_PAGES {
         let sid = replay.take(&owed).expect("one shared page remains");
-        let action = if sid == "s-a" { "FetchA" } else { "FetchB" };
+        let action = if sid == "ta000000000" {
+            "FetchA"
+        } else {
+            "FetchB"
+        };
         assert!(model.action_enabled(action, &state), "{action}: {state:?}");
         assert!(model.fire(action, &mut state));
     }
@@ -123,7 +127,11 @@ fn replay_scheduler_refines_shared_budget_and_rotation() {
     assert!(model.fire("Refill", &mut state));
     for _ in 0..SAY_REPLAY_PAGES {
         let sid = replay.take(&owed).expect("the next interval has pages");
-        let action = if sid == "s-a" { "FetchA" } else { "FetchB" };
+        let action = if sid == "ta000000000" {
+            "FetchA"
+        } else {
+            "FetchB"
+        };
         assert!(model.action_enabled(action, &state), "{action}: {state:?}");
         assert!(model.fire(action, &mut state));
     }
@@ -200,7 +208,7 @@ fn replay_scheduler_refines_shared_budget_and_rotation() {
 fn many_backlogged_sessions_get_one_turn_before_any_get_a_second() {
     let now = Instant::now();
     let mut replay = SayReplay::new(now);
-    let owed: BTreeSet<String> = (0..12).map(|n| format!("s-{n:02}")).collect();
+    let owed: BTreeSet<String> = (0..12).map(|n| format!("t{n:010}")).collect();
     let mut served = Vec::new();
     for round in 0..3 {
         replay.refill(now + roster_refresh() * round);
@@ -215,9 +223,9 @@ fn many_backlogged_sessions_get_one_turn_before_any_get_a_second() {
     assert_eq!(served.into_iter().collect::<BTreeSet<_>>(), owed);
 
     let mut reduced = owed;
-    reduced.remove("s-11");
+    reduced.remove("t0000000011");
     replay.refill(now + roster_refresh() * 3);
-    assert_eq!(replay.take(&reduced).as_deref(), Some("s-00"));
+    assert_eq!(replay.take(&reduced).as_deref(), Some("t0000000000"));
 }
 
 #[test]
@@ -225,29 +233,35 @@ fn bridge_roster_accepts_only_complete_unique_identity_rows() {
     let a = "0123456789abcdef0123456789abcdef";
     let b = "fedcba9876543210fedcba9876543210";
     let rows = [
-        format!("9 s-nine nonce={a}"),
-        format!("2 s-two nonce={b} role=worker"),
+        format!("9 tn1ne000000 nonce={a}"),
+        format!("2 ttw00000000 nonce={b} role=worker"),
     ];
     let (locals, epochs) = parse_bridge_roster(rows.iter().map(String::as_str)).unwrap();
-    assert_eq!(locals.get(&2).map(String::as_str), Some("s-two"));
-    assert_eq!(locals.get(&9).map(String::as_str), Some("s-nine"));
-    assert_eq!(epochs.get("s-two").map(String::as_str), Some(b));
-    assert_eq!(epochs.get("s-nine").map(String::as_str), Some(a));
+    assert_eq!(locals.get(&2).map(String::as_str), Some("ttw00000000"));
+    assert_eq!(locals.get(&9).map(String::as_str), Some("tn1ne000000"));
+    assert_eq!(epochs.get("ttw00000000").map(String::as_str), Some(b));
+    assert_eq!(epochs.get("tn1ne000000").map(String::as_str), Some(a));
 
     for bad in [
-        "2 s-two",
-        "2 s-two nonce=-",
-        "2 s-two nonce=FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        "2 s-two nonce=0123456789abcdef0123456789abcdef my title",
-        "2 s-two nonce=0123456789abcdef0123456789abcdef =1",
-        "2 title s-two nonce=0123456789abcdef0123456789abcdef",
-        "not-a-local s-two nonce=0123456789abcdef0123456789abcdef",
+        "2 ttw00000000",
+        "2 ttw00000000 nonce=-",
+        "2 ttw00000000 nonce=FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+        "2 ttw00000000 nonce=0123456789abcdef0123456789abcdef my title",
+        "2 ttw00000000 nonce=0123456789abcdef0123456789abcdef =1",
+        "2 title ttw00000000 nonce=0123456789abcdef0123456789abcdef",
+        "not-a-local ttw00000000 nonce=0123456789abcdef0123456789abcdef",
     ] {
         assert!(parse_bridge_roster(std::iter::once(bad)).is_err(), "{bad}");
     }
     for duplicate in [
-        [format!("2 s-two nonce={a}"), format!("2 s-new nonce={b}")],
-        [format!("2 s-two nonce={a}"), format!("3 s-two nonce={b}")],
+        [
+            format!("2 ttw00000000 nonce={a}"),
+            format!("2 tnew0000000 nonce={b}"),
+        ],
+        [
+            format!("2 ttw00000000 nonce={a}"),
+            format!("3 ttw00000000 nonce={b}"),
+        ],
     ] {
         assert!(
             parse_bridge_roster(duplicate.iter().map(String::as_str)).is_err(),
@@ -259,20 +273,20 @@ fn bridge_roster_accepts_only_complete_unique_identity_rows() {
 #[test]
 fn status_batch_keeps_each_session_and_incarnation_separate() {
     let locals = BTreeMap::from([
-        (1, "s-one".to_string()),
-        (2, "s-two".to_string()),
-        (3, "s-three".to_string()),
+        (1, "t0ne0000000".to_string()),
+        (2, "ttw00000000".to_string()),
+        (3, "tthree00000".to_string()),
     ]);
     let epochs = BTreeMap::from([
-        ("s-one".to_string(), "a1".to_string()),
-        ("s-two".to_string(), "b2".to_string()),
-        ("s-three".to_string(), "c3".to_string()),
+        ("t0ne0000000".to_string(), "a1".to_string()),
+        ("ttw00000000".to_string(), "b2".to_string()),
+        ("tthree00000".to_string(), "c3".to_string()),
     ]);
     let rows = [
-        "1 s-one a1 sid=1 revision=7 hold=1 hold_origin=local detail=Claude%20Code \
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 hold_origin=local detail=Claude%20Code \
          agent=prompt role=worker attention=stuck user_title=%2D gen=3.41",
-        "2 s-two b2 sid=2 revision=4 hold=0 hold_origin=- detail=- agent=- gen=-",
-        "3 s-three NEW sid=3 revision=99 hold=0 detail=new",
+        "2 ttw00000000 b2 sid=2 revision=4 hold=0 hold_origin=- detail=- agent=- gen=-",
+        "3 tthree00000 NEW sid=3 revision=99 hold=0 detail=new",
     ];
     let parsed = parse_batch_rows(rows.into_iter(), &locals, &epochs);
     assert!(matches!(
@@ -303,16 +317,17 @@ fn status_batch_keeps_each_session_and_incarnation_separate() {
     );
     assert!(matches!(parsed.get(&3), Some(BatchSample::Stale)));
 
-    let wrong_sid = ["2 s-other b2 sid=2 revision=88 hold=1 detail=other"];
+    let wrong_sid = ["2 t0ther00000 b2 sid=2 revision=88 hold=1 detail=other"];
     let parsed = parse_batch_rows(wrong_sid.into_iter(), &locals, &epochs);
     assert!(matches!(parsed.get(&2), Some(BatchSample::Stale)));
 }
 
 #[test]
 fn batch_agent_deferral_keeps_the_verdict_and_malformed_rows_retry_singly() {
-    let locals = BTreeMap::from([(1, "s-one".to_string())]);
-    let epochs = BTreeMap::from([("s-one".to_string(), "a1".to_string())]);
-    let row = "1 s-one a1 sid=1 revision=7 hold=1 detail=Claude%20Code agent_deferred=1 gen=1.9";
+    let locals = BTreeMap::from([(1, "t0ne0000000".to_string())]);
+    let epochs = BTreeMap::from([("t0ne0000000".to_string(), "a1".to_string())]);
+    let row =
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=Claude%20Code agent_deferred=1 gen=1.9";
     let mut parsed = parse_batch_rows(std::iter::once(row), &locals, &epochs);
     let Some(BatchSample::Ready(sample)) = parsed.remove(&1) else {
         panic!("a deferred agent is a usable hold/detail sample");
@@ -341,7 +356,7 @@ fn batch_agent_deferral_keeps_the_verdict_and_malformed_rows_retry_singly() {
         !slot.sampled,
         "a sample that carried no meaning fields samples none"
     );
-    let row = "1 s-one a1 sid=1 revision=7 hold=0 detail=- agent=idle role=worker \
+    let row = "1 t0ne0000000 a1 sid=1 revision=7 hold=0 detail=- agent=idle role=worker \
                attention=stuck user_title=lead gen=1.9";
     let Some(BatchSample::Ready(sample)) =
         parse_batch_rows(std::iter::once(row), &locals, &epochs).remove(&1)
@@ -366,22 +381,22 @@ fn batch_agent_deferral_keeps_the_verdict_and_malformed_rows_retry_singly() {
     );
 
     for malformed in [
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent=idle gen=-",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent_deferred=1 gen=-",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=0 gen=-",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=Claude Code agent=prompt gen=-",
-        "1 s-one a1 sid=1 revision=4 hold=0 agent=idle gen=-",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- gen=-",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=- gen=1.2",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=1",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=1.2:ab",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle role=- gen=-",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle role=- attention=- gen=-",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle role=- attention=- \
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent=idle gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent_deferred=1 gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent_deferred=0 gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=Claude Code agent=prompt gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=4 hold=0 agent=idle gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=idle",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=- gen=1.2",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=1",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=1.2:ab",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=idle gen=",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=idle role=- gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=idle role=- attention=- gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=idle role=- attention=- \
          user_title=- role=lead gen=-",
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=idle role=- attention=- \
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=idle role=- attention=- \
          user_title=- title=x gen=-",
     ] {
         assert!(
@@ -393,10 +408,10 @@ fn batch_agent_deferral_keeps_the_verdict_and_malformed_rows_retry_singly() {
 
 #[test]
 fn a_batch_row_says_whose_hold_stands() {
-    let locals = BTreeMap::from([(1, "s-one".to_string())]);
-    let epochs = BTreeMap::from([("s-one".to_string(), "a1".to_string())]);
+    let locals = BTreeMap::from([(1, "t0ne0000000".to_string())]);
+    let epochs = BTreeMap::from([("t0ne0000000".to_string(), "a1".to_string())]);
     let parse = |fields: &str| {
-        let row = format!("1 s-one a1 sid=1 revision=7 {fields} detail=- agent=- gen=-");
+        let row = format!("1 t0ne0000000 a1 sid=1 revision=7 {fields} detail=- agent=- gen=-");
         match parse_batch_rows(std::iter::once(row.as_str()), &locals, &epochs).remove(&1) {
             Some(BatchSample::Ready(sample)) => Some(sample.hold),
             Some(BatchSample::Stale) => panic!("{row}: not a reused id"),
@@ -457,8 +472,8 @@ fn a_batch_row_says_whose_hold_stands() {
         assert_eq!(parse(malformed), None, "{malformed}");
     }
     let duplicate = [
-        "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent=prompt gen=-",
-        "1 s-one a1 sid=1 revision=8 hold=0 detail=- agent=idle gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=7 hold=1 detail=- agent=prompt gen=-",
+        "1 t0ne0000000 a1 sid=1 revision=8 hold=0 detail=- agent=idle gen=-",
     ];
     let parsed = parse_batch_rows(duplicate.into_iter(), &locals, &epochs);
     assert!(
@@ -506,7 +521,7 @@ fn a_refused_status_batch_never_fans_out() {
                 requests.push(line.trim_end().to_string());
                 if line == "sessions status\n" {
                     stream.write_all(batch_reply.as_bytes()).unwrap();
-                } else if line == "@s-four meta\n" {
+                } else if line == "@tf0vr000000 meta\n" {
                     stream
                         .write_all(format!("{REFUSED_BATCH_META}\n").as_bytes())
                         .unwrap();
@@ -532,7 +547,7 @@ fn a_refused_status_batch_never_fans_out() {
         })
         .unwrap();
         bridge.attachment = Attachment::Inherited;
-        for (local, sid) in [(1, "s-one"), (2, "s-two"), (3, "s-three")] {
+        for (local, sid) in [(1, "t0ne0000000"), (2, "ttw00000000"), (3, "tthree00000")] {
             bridge.locals.insert(local, sid.to_string());
             bridge
                 .per_sid
@@ -548,9 +563,9 @@ fn a_refused_status_batch_never_fans_out() {
             fields.set_detail(Some("old"));
             fields.set_agent(Some("prompt"));
         }
-        // Two sessions the round publishes for, their rows already on the bus: s-four's
-        // meaning fields unsampled since (a GAP cleared them), s-five's sampled.
-        for (local, sid, sampled) in [(4, "s-four", false), (5, "s-five", true)] {
+        // Two sessions the round publishes for, their rows already on the bus: tf0vr000000's
+        // meaning fields unsampled since (a GAP cleared them), tf1ve000000's sampled.
+        for (local, sid, sampled) in [(4, "tf0vr000000", false), (5, "tf1ve000000", true)] {
             bridge.locals.insert(local, sid.to_string());
             bridge
                 .per_sid
@@ -564,17 +579,23 @@ fn a_refused_status_batch_never_fans_out() {
             slot.sampled = sampled;
         }
         bridge.sample_local_control();
-        for sid in ["s-one", "s-two", "s-three", "s-four", "s-five"] {
+        for sid in [
+            "t0ne0000000",
+            "ttw00000000",
+            "tthree00000",
+            "tf0vr000000",
+            "tf1ve000000",
+        ] {
             let fields = &bridge.per_sid.presence[sid].fields;
             assert_eq!(fields.detail, "old", "{batch_reply:?}");
             assert_eq!(fields.phase, "prompt", "{batch_reply:?}");
         }
-        assert!(bridge.per_sid.presence["s-four"].sampled);
+        assert!(bridge.per_sid.presence["tf0vr000000"].sampled);
         drop(bridge);
         let requests = responder.join().unwrap();
         assert_eq!(
             requests,
-            ["sessions status", "@s-four meta"],
+            ["sessions status", "@tf0vr000000 meta"],
             "{batch_reply:?}: no session's status, and the meta of only a session the round \
              publishes for whose slot no row sampled"
         );
@@ -733,7 +754,7 @@ fn bridge_deadlines_restore_then_move_the_shipping_arm_from_far_to_near() {
         .unwrap()
         .set_deadlines_as_an_older_build(&[Deadline {
             off: 1,
-            sid: "s-one".into(),
+            sid: "t0ne0000000".into(),
             at: 0,
             dl: 1_000,
             to: None,
@@ -752,9 +773,9 @@ fn bridge_deadlines_restore_then_move_the_shipping_arm_from_far_to_near() {
     );
 
     bridge.deadlines.clear();
-    bridge.note_deadline("s-one", 2, 3_600_000, None);
+    bridge.note_deadline("t0ne0000000", 2, 3_600_000, None);
     let far = bridge.deadline_due;
-    bridge.note_deadline("s-one", 3, 0, None);
+    bridge.note_deadline("t0ne0000000", 3, 0, None);
     assert!(
         bridge.deadline_due < far,
         "a nearer ask replaces the far arm"
@@ -766,7 +787,7 @@ fn moving_irrelevant_cursors_get_one_checkpoint_per_256_broadcasts() {
     let mut topics = (0..64)
         .map(|i| {
             (
-                format!("s-{i:03}"),
+                format!("t{i:010}"),
                 BTreeMap::from([("quiet".to_string(), TopicCursor { next: 10 })]),
             )
         })
@@ -845,8 +866,8 @@ fn a_bus_incarnation_past_the_will_space_is_not_adopted() {
 
 #[test]
 fn every_per_sid_map_is_pruned_to_the_roster() {
-    const LIVE: &str = "s-live";
-    const GONE: &str = "s-gone";
+    const LIVE: &str = "t11ve000000";
+    const GONE: &str = "tgpne000000";
     let mut maps = PerSession::default();
     {
         let PerSession {
@@ -939,15 +960,15 @@ fn the_node_row_carries_a_real_host_name() {
 
 #[test]
 fn a_drain_frame_carries_receipts_and_fetches_after_the_posts() {
-    let frame = b"post sid=s-a id=1 to=%40s-b kind=ask re=7 len=8\nline\none\
-                  receipt sid=s-a rid=3 off=40 verdict=handled kind=ask from=s-z@n-q\n\
-                  receipt sid=bad rid=4 off=40 verdict=handled kind=ask from=s-z@n-q\n\
-                  receipt sid=s-a rid=0 off=40 verdict=handled kind=ask from=s-z@n-q\n\
-                  receipt sid=s-a rid=5 off=40 kind=ask from=s-z@n-q\n\
-                  receipt sid=s-a rid=6 off=12 verdict=deferred kind=task from=h-x \
+    let frame = b"post sid=ta000000000 id=1 to=%40s-b kind=ask re=7 len=8\nline\none\
+                  receipt sid=ta000000000 rid=3 off=40 verdict=handled kind=ask from=tz000000000@n-q\n\
+                  receipt sid=bad rid=4 off=40 verdict=handled kind=ask from=tz000000000@n-q\n\
+                  receipt sid=ta000000000 rid=0 off=40 verdict=handled kind=ask from=tz000000000@n-q\n\
+                  receipt sid=ta000000000 rid=5 off=40 kind=ask from=tz000000000@n-q\n\
+                  receipt sid=ta000000000 rid=6 off=12 verdict=deferred kind=task from=h-x \
                   log=earlier\n\
-                  receipt sid=s-a rid=7 off=12 verdict=deferred kind=task from=h-x log=a.0\n\
-                  fetch sid=s-a off=41\nfetch sid=s-b off=7\nfetch sid=bad off=9\n\
+                  receipt sid=ta000000000 rid=7 off=12 verdict=deferred kind=task from=h-x log=a.0\n\
+                  fetch sid=ta000000000 off=41\nfetch sid=tb000000000 off=7\nfetch sid=bad off=9\n\
                   more\n";
     let drain = parse_drain(frame);
     assert_eq!(drain.posts.len(), 1);
@@ -957,16 +978,18 @@ fn a_drain_frame_carries_receipts_and_fetches_after_the_posts() {
         "a body may hold newlines"
     );
     assert_eq!(drain.posts[0].re, Some(7));
-    assert!(parse_drain(b"post sid=s-a id=1 to=x kind=note len=99\nhi")
-        .posts
-        .is_empty());
+    assert!(
+        parse_drain(b"post sid=ta000000000 id=1 to=x kind=note len=99\nhi")
+            .posts
+            .is_empty()
+    );
     let owed = OwedReceipt {
-        sid: "s-a".to_string(),
+        sid: "ta000000000".to_string(),
         rid: 3,
         off: 40,
         verdict: "handled".to_string(),
         kind: "ask".to_string(),
-        from: "s-z@n-q".to_string(),
+        from: "tz000000000@n-q".to_string(),
         earlier_log: false,
     };
     let earlier = OwedReceipt {
@@ -991,10 +1014,14 @@ fn a_drain_frame_carries_receipts_and_fetches_after_the_posts() {
     );
     assert_eq!(
         drain.fetches,
-        vec![("s-a".to_string(), 41), ("s-b".to_string(), 7)],
+        vec![
+            ("ta000000000".to_string(), 41),
+            ("tb000000000".to_string(), 7)
+        ],
         "a sid that is not a principal is dropped, never spliced into a filter"
     );
-    let ahead = b"fetch sid=s-a off=41\npost sid=s-a id=1 to=%40s-b kind=note len=0\n";
+    let ahead =
+        b"fetch sid=ta000000000 off=41\npost sid=ta000000000 id=1 to=%40s-b kind=note len=0\n";
     let drain = parse_drain(ahead);
     assert_eq!((drain.posts.len(), drain.fetches.len()), (1, 1));
     assert!(!drain.more, "no `more` line, a whole listing");
@@ -1010,7 +1037,7 @@ fn lanes_whole_from_the_base(first: bool) -> astream_broker::Retention {
     use astream_broker::{Retention, Rule};
     let mut classes = vec![Rule::prefix(EV_FILTER).unwrap()];
     if first {
-        classes.push(Rule::hold("/f/*/in/*/s-z/>").unwrap().last_only());
+        classes.push(Rule::hold("/f/*/in/*/tz000000000/>").unwrap().last_only());
     }
     classes.push(Rule::hold(MAIL_FILTER).unwrap());
     Retention::new(classes, Rule::default_keeping_all()).unwrap()
@@ -1040,7 +1067,7 @@ fn topics_whole_from_the_base(first: bool) -> astream_broker::Retention {
 #[cfg(unix)]
 #[test]
 fn a_fetch_of_a_record_held_below_its_lanes_oldest_answers_the_record() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for control in [false, true] {
         let (lane, mut bridge, _server, broker) =
             rig_retained_by(&[(1, SID)], Some(lanes_whole_from_the_base(true)));
@@ -1050,10 +1077,10 @@ fn a_fetch_of_a_record_held_below_its_lanes_oldest_answers_the_record() {
         let node = bridge.node.clone();
         let subject = format!("/f/f/in/{node}/{SID}/{node}/note");
         let held = bridge
-            .publish_own_off(&subject, b"v=1 t=1 from=s-held text=held")
+            .publish_own_off(&subject, b"v=1 t=1 from=the1d000000 text=held")
             .unwrap();
         let after = bridge
-            .publish_own_off(&subject, b"v=1 t=1 from=s-held text=after")
+            .publish_own_off(&subject, b"v=1 t=1 from=the1d000000 text=after")
             .unwrap();
         broker.retain_before_carrying_state(after + 1).unwrap();
         broker
@@ -1097,17 +1124,17 @@ fn a_fetch_of_a_record_held_below_its_lanes_oldest_answers_the_record() {
 #[cfg(unix)]
 #[test]
 fn a_fetch_whose_told_read_cannot_be_dialled_answers_unreadable_and_keeps_the_link() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for capped in [true, false] {
         let (lane, mut bridge, _server, broker) =
             rig_retained_by(&[(1, SID)], Some(lanes_whole_from_the_base(true)));
         let node = bridge.node.clone();
         let subject = format!("/f/f/in/{node}/{SID}/{node}/note");
         let held = bridge
-            .publish_own_off(&subject, b"v=1 t=1 from=s-held text=held")
+            .publish_own_off(&subject, b"v=1 t=1 from=the1d000000 text=held")
             .unwrap();
         let after = bridge
-            .publish_own_off(&subject, b"v=1 t=1 from=s-held text=after")
+            .publish_own_off(&subject, b"v=1 t=1 from=the1d000000 text=after")
             .unwrap();
         broker.retain_before_carrying_state(after + 1).unwrap();
         broker
@@ -1142,15 +1169,15 @@ fn a_fetch_whose_told_read_cannot_be_dialled_answers_unreadable_and_keeps_the_li
 
 #[test]
 fn a_fetch_below_the_lanes_retained_floor_names_the_floor() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let (lane, mut bridge, _server, broker) = rig_with_kept_broker(&[(1, SID)], false);
     let node = bridge.node.clone();
     let subject = format!("/f/f/in/{node}/{SID}/{node}/note");
     let gone = bridge
-        .publish_own_off(&subject, b"v=1 t=1 from=s-gone text=first")
+        .publish_own_off(&subject, b"v=1 t=1 from=tgpne000000 text=first")
         .unwrap();
     let kept = bridge
-        .publish_own_off(&subject, b"v=1 t=1 from=s-gone text=second")
+        .publish_own_off(&subject, b"v=1 t=1 from=tgpne000000 text=second")
         .unwrap();
     assert!(
         broker.retain_before_carrying_state(kept).unwrap() > 0,
@@ -1185,7 +1212,7 @@ fn a_fetch_below_the_lanes_retained_floor_names_the_floor() {
 
 #[test]
 fn fetched_lines_carry_a_body_whole_in_chunks_and_cut_one_over_the_bound() {
-    let fields = "from=s-a@n-b kind=note trust=agent";
+    let fields = "from=ta000000000@n-b kind=note trust=agent";
     let decode = |lines: &[String]| -> String {
         let mut body = String::new();
         for (i, line) in lines.iter().enumerate() {
@@ -1205,14 +1232,14 @@ fn fetched_lines_carry_a_body_whole_in_chunks_and_cut_one_over_the_bound() {
         }
         body
     };
-    let small = fetched_lines("s-x", 7, fields, "hello world").expect("small");
+    let small = fetched_lines("tx000000000", 7, fields, "hello world").expect("small");
     assert_eq!(
         small,
-        vec!["deliver s-x fetched=7 from=s-a@n-b kind=note trust=agent text=hello%20world"]
+        vec!["deliver tx000000000 fetched=7 from=ta000000000@n-b kind=note trust=agent text=hello%20world"]
     );
     let mut text = "x ".repeat(19_999);
     text.push('x');
-    let lines = fetched_lines("s-x", 4, fields, &text).expect("chunked");
+    let lines = fetched_lines("tx000000000", 4, fields, &text).expect("chunked");
     assert!(lines.len() > 1, "{} line(s)", lines.len());
     assert!(
         !lines.iter().any(|l| l.contains(" len=")),
@@ -1220,11 +1247,11 @@ fn fetched_lines_carry_a_body_whole_in_chunks_and_cut_one_over_the_bound() {
     );
     assert_eq!(decode(&lines), text, "whole, byte for byte");
     let wide = "é🙂".repeat(20_000);
-    let lines = fetched_lines("s-x", 5, fields, &wide).expect("wide");
+    let lines = fetched_lines("tx000000000", 5, fields, &wide).expect("wide");
     assert!(lines.len() > 1);
     assert_eq!(decode(&lines), wide);
     let big = format!("{}é", "z".repeat(FETCH_BODY_MAX - 1));
-    let lines = fetched_lines("s-x", 6, fields, &big).expect("big");
+    let lines = fetched_lines("tx000000000", 6, fields, &big).expect("big");
     let got = decode(&lines);
     assert_eq!(
         got.len(),
@@ -1235,7 +1262,10 @@ fn fetched_lines_carry_a_body_whole_in_chunks_and_cut_one_over_the_bound() {
         .iter()
         .all(|l| l.contains(&format!(" len={} ", big.len()))));
     let huge = "x".repeat(REQUEST_LINE_MAX);
-    assert_eq!(fetched_lines("s-x", 8, &huge, "hi"), Err("oversize"));
+    assert_eq!(
+        fetched_lines("tx000000000", 8, &huge, "hi"),
+        Err("oversize")
+    );
 }
 
 #[test]
@@ -1471,6 +1501,7 @@ fn a_window_loads_at_the_floor_its_file_names_and_an_older_builds_at_its_oldest_
     let log = |offsets: &[u64], floor: Option<u64>| crate::state::AckedLog {
         offsets: offsets.iter().copied().collect(),
         floor,
+        log: None,
         entries: offsets.len(),
         appendable: true,
     };
@@ -1725,6 +1756,42 @@ fn a_link_reason_is_one_token_per_failure_and_an_ack_never_reads_zero() {
             "commit failed: injected fsync fault"
         )),
         "a write rolled back is the broker working"
+    );
+    let unknown = words(
+        p::ERR_REFUSED,
+        "durability flush failed: injected; the outcome is unknown, and the log refuses every \
+         write until it is reopened: resend then",
+    );
+    assert!(
+        outcome_unknown(&unknown) && !refusal_is_ack(&unknown),
+        "an op whose own full flush failed was not answered: its record may be on the bus"
+    );
+    assert!(!outcome_unknown(&words(
+        p::ERR_REFUSED,
+        "commit failed: injected fsync fault"
+    )));
+    // A first Commit: a rolled-back batch's refusal keeps the link for the retry; an outcome
+    // unknown takes it, as a poisoned log's refusal does, and the next link commits afresh.
+    let (_lane, bridge) = FakeVerbLane::bridge(&[]);
+    let first = Then::Commit {
+        upto: 1,
+        retry: false,
+    };
+    assert!(bridge.commit_refusal_is_an_answer(
+        &first,
+        &Err(words(p::ERR_REFUSED, "commit failed: injected fsync fault"))
+    ));
+    assert!(!bridge.commit_refusal_is_an_answer(&first, &Err(words(p::ERR_REFUSED, &poisoned))));
+    assert!(
+        !bridge.commit_refusal_is_an_answer(
+            &first,
+            &Err(words(
+                p::ERR_REFUSED,
+                "durability flush failed: injected; the outcome is unknown, and the log \
+                 refuses every write until it is reopened: resend then",
+            ))
+        ),
+        "a Commit answered outcome unknown takes the link"
     );
     assert!(refusal_is_ack(&refusal(p::ERR_UNAUTHORIZED)));
     assert!(!refusal_is_ack(&lapsed(p::ERR_UNAUTHORIZED)));
@@ -2670,13 +2737,13 @@ fn refused_publish(poisoned: bool) {
         decode_request, encode_response, read_frame, write_frame, Request, Response, ERR_REFUSED,
         LOG_POISONED_PREFIX,
     };
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "th0st000000")]);
     let face = format!("/f/f/in/p/h-a/{}/note", bridge.node);
     let mut body = Body::new(1);
-    body.from = Some("s-host".into());
+    body.from = Some("th0st000000".into());
     body.text = "retry".into();
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-host id=1 to=h-a kind=note len=5\nretry".into());
+        Some("post sid=th0st000000 id=1 to=h-a kind=note len=5\nretry".into());
     let pin = PublishPin {
         seq: bridge.next_seq().unwrap(),
         via_key: false,
@@ -2686,7 +2753,7 @@ fn refused_publish(poisoned: bool) {
         owner: None,
         at: None,
     };
-    bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
+    bridge.state.set_post_pin("th0st000000", 1, &pin).unwrap();
     bridge.unsent = None;
     let socket = lane.dir.path().join("poisoned.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -2734,7 +2801,7 @@ fn refused_publish(poisoned: bool) {
     bridge.conn = Some(bridge.connect().unwrap().0.into());
     bridge.note_ack(Duration::from_millis(1));
     bridge.drain_outbox();
-    let retained = bridge.state.post_pin("s-host", 1).unwrap().is_some();
+    let retained = bridge.state.post_pin("th0st000000", 1).unwrap().is_some();
     let retired = !lane.sent.lock().unwrap().is_empty();
     assert_eq!(
         (retained, retired),
@@ -2778,14 +2845,14 @@ fn denied_publication_read(receipt: bool, verification: bool, lapsed: bool) {
         !(lapsed && verification),
         "a lapsed cap refuses the Publish"
     );
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "th0st000000")]);
     let kind = if receipt { "ack" } else { "note" };
     let face = format!("/f/f/in/p/h-a/{}/{kind}", bridge.node);
     let mut body = Body::new(1);
-    body.from = Some("s-host".into());
+    body.from = Some("th0st000000".into());
     body.text = "retry".into();
     let owed = OwedReceipt {
-        sid: "s-host".into(),
+        sid: "th0st000000".into(),
         rid: 1,
         off: 4,
         verdict: "handled".into(),
@@ -2794,10 +2861,10 @@ fn denied_publication_read(receipt: bool, verification: bool, lapsed: bool) {
         earlier_log: false,
     };
     if receipt {
-        body = receipt_body(1, "s-host", owed.off, &owed.verdict);
+        body = receipt_body(1, "th0st000000", owed.off, &owed.verdict);
     } else {
         *lane.outbox.lock().unwrap() =
-            Some("post sid=s-host id=1 to=h-a kind=note len=5\nretry".into());
+            Some("post sid=th0st000000 id=1 to=h-a kind=note len=5\nretry".into());
     }
     let pin = PublishPin {
         seq: bridge.next_seq().unwrap(),
@@ -2811,10 +2878,10 @@ fn denied_publication_read(receipt: bool, verification: bool, lapsed: bool) {
     if receipt {
         bridge
             .state
-            .set_receipt_pin("s-host", 1, &pin, None)
+            .set_receipt_pin("th0st000000", 1, &pin, None)
             .unwrap();
     } else {
-        bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
+        bridge.state.set_post_pin("th0st000000", 1, &pin).unwrap();
     }
     bridge.unsent = None;
     let socket = lane.dir.path().join("denied.sock");
@@ -2886,9 +2953,13 @@ fn denied_publication_read(receipt: bool, verification: bool, lapsed: bool) {
     };
     broker.join().unwrap();
     let retained = if receipt {
-        bridge.state.receipt_pin("s-host", 1).unwrap().is_some()
+        bridge
+            .state
+            .receipt_pin("th0st000000", 1)
+            .unwrap()
+            .is_some()
     } else {
-        bridge.state.post_pin("s-host", 1).unwrap().is_some()
+        bridge.state.post_pin("th0st000000", 1).unwrap().is_some()
     };
     let retired = if receipt {
         lane.transcript().iter().any(|line| line == "deliver -")
@@ -2934,9 +3005,9 @@ fn one_older_builds_damaged_reservation_leaves_the_node_attaching() {
     bridge.conn = Some(bridge.connect().unwrap().0.into());
     let root = bridge.state.root().to_path_buf();
     std::fs::create_dir_all(root.join("sent")).unwrap();
-    std::fs::write(root.join("sent/s-z.9"), b"7 key identity\n").unwrap();
+    std::fs::write(root.join("sent/tz000000000.9"), b"7 key identity\n").unwrap();
     bridge.state = StateDir::open(&root).unwrap();
-    assert_eq!(bridge.state.post_pin("s-a", 1).unwrap(), None);
+    assert_eq!(bridge.state.post_pin("ta000000000", 1).unwrap(), None);
     assert!(
         bridge.settle_in_flight(),
         "the attach's in-flight settle goes on"
@@ -2946,9 +3017,9 @@ fn one_older_builds_damaged_reservation_leaves_the_node_attaching() {
         .owed_publications()
         .unwrap()
         .sids
-        .contains("s-z"));
-    let held = bridge.state.post_pin("s-z", 9).unwrap_err();
-    assert!(held.to_string().contains("sent/s-z.9"), "{held}");
+        .contains("tz000000000"));
+    let held = bridge.state.post_pin("tz000000000", 9).unwrap_err();
+    assert!(held.to_string().contains("sent/tz000000000.9"), "{held}");
 }
 
 /// A DROP THE DISK REFUSES IS NOT PUBLISHED AT THE NEXT ATTACH (B19 review): a record the
@@ -2962,7 +3033,7 @@ fn a_record_dropped_while_the_disk_is_full_is_not_published_at_the_next_attach()
     bridge.cfg.broker = socket;
     bridge.conn = Some(bridge.connect().unwrap().0.into());
     let face = format!(
-        "/f/{}/in/{}/s-b/{}/note",
+        "/f/{}/in/{}/tb000000000/{}/note",
         bridge.cfg.fleet, bridge.node, bridge.node
     );
     let seq = bridge.state.reserve_next_sequence(bridge.inc).unwrap();
@@ -3004,10 +3075,10 @@ fn assert_uncertain_in_flight_waits(kind: UncertainJournal) {
     bridge.cfg.broker = socket;
     bridge.conn = Some(bridge.connect().unwrap().0.into());
     // The floor the attach this skips takes from the empty log's head.
-    bridge.floor_at_the_head(0);
+    bridge.floor_at_the_head(0, None).expect("the floor");
     assert!(bridge.settle_in_flight(), "no journal is no pending work");
     let face = format!(
-        "/f/{}/in/{}/s-b/{}/note",
+        "/f/{}/in/{}/tb000000000/{}/note",
         bridge.cfg.fleet, bridge.node, bridge.node
     );
     let seq = bridge.state.reserve_next_sequence(bridge.inc).unwrap();
@@ -3126,7 +3197,7 @@ fn leave_journaled_publications(
 #[cfg(unix)]
 #[test]
 fn referenced_journal_rows_do_not_cross_a_log_identity() {
-    const SID: &str = "s-local";
+    const SID: &str = "t10ca100000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     lane.answer_hello_with(&format!("OK lane={LINK_LOG_LANE} build=test\n"));
     bridge.introduce();
@@ -3201,7 +3272,7 @@ fn referenced_journal_rows_recover_on_the_same_identified_log() {
     let (socket, _broker, _server) = serve_log(&lane, "journal-same");
     bridge.cfg.broker = socket;
     assert!(bridge.attach_broker());
-    let subject = format!("/f/f/in/{}/s-local/{}/ack", bridge.node, bridge.node);
+    let subject = format!("/f/f/in/{}/t10ca100000/{}/ack", bridge.node, bridge.node);
     let body = b"v=1 t=1 re=0 verdict=handled text=same".to_vec();
     let published = leave_journaled_publications(&mut bridge, &[(subject.clone(), body)]);
     bridge.close_subscriptions();
@@ -3224,7 +3295,7 @@ fn referenced_journal_rows_without_a_log_witness_remain_uncertain() {
     let (socket, _broker, _server) = serve_log(&lane, "journal-legacy");
     bridge.cfg.broker = socket;
     assert!(bridge.attach_broker());
-    let subject = format!("/f/f/in/{}/s-local/{}/ack", bridge.node, bridge.node);
+    let subject = format!("/f/f/in/{}/t10ca100000/{}/ack", bridge.node, bridge.node);
     let published = leave_journaled_publications(
         &mut bridge,
         &[(
@@ -3279,7 +3350,7 @@ fn referenced_journal_rows_need_the_current_connection_log_identity() {
     let (socket, broker, _server) = serve_log(&lane, "journal-unconfirmed");
     bridge.cfg.broker = socket;
     assert!(bridge.attach_broker());
-    let subject = format!("/f/f/in/{}/s-local/{}/ack", bridge.node, bridge.node);
+    let subject = format!("/f/f/in/{}/t10ca100000/{}/ack", bridge.node, bridge.node);
     leave_journaled_publications(
         &mut bridge,
         &[(
@@ -3326,7 +3397,7 @@ fn a_publish_with_no_connection_journals_nothing_and_the_attach_goes_on() {
     let (socket, broker, _server) = serve_log(&lane, "journal-offline");
     bridge.cfg.broker = socket;
     assert!(bridge.attach_broker());
-    let subject = format!("/f/f/in/{}/s-local/{}/ack", bridge.node, bridge.node);
+    let subject = format!("/f/f/in/{}/t10ca100000/{}/ack", bridge.node, bridge.node);
     let body = b"v=1 t=1 re=0 verdict=handled text=offline".to_vec();
     bridge.close_subscriptions();
     bridge.conn = None;
@@ -3340,9 +3411,9 @@ fn a_publish_with_no_connection_journals_nothing_and_the_attach_goes_on() {
         "an entry that names no log was journaled for a publish that could not be sent"
     );
     let post = QueuedPost {
-        sid: "s-local".to_string(),
+        sid: "t10ca100000".to_string(),
         id: 1,
-        to: "s-local".to_string(),
+        to: "t10ca100000".to_string(),
         kind: "note".to_string(),
         re: Some(0),
         dl: None,
@@ -3392,10 +3463,10 @@ fn the_attach_relearns_its_own_in_flight_records_and_no_one_elses() {
     bridge.cfg.broker = socket.to_string_lossy().into_owned();
     bridge.conn = Some(bridge.connect().unwrap().0.into());
     // The floor the attach this skips takes from the empty log's head.
-    bridge.floor_at_the_head(0);
+    bridge.floor_at_the_head(0, None).expect("the floor");
     let (mut other, _) = bridge.connect().unwrap();
     let face = format!(
-        "/f/{}/in/{}/s-b/{}/note",
+        "/f/{}/in/{}/tb000000000/{}/note",
         bridge.cfg.fleet, bridge.node, bridge.node
     );
     let in_flight = |bridge: &Bridge, body: &[u8]| {
@@ -3464,7 +3535,7 @@ fn a_reply_entry_cut_before_its_witness_is_set_aside_and_the_next_boot_attaches(
         bridge.begin_run();
         assert!(bridge.attach_broker(), "boot 1");
         let face = format!(
-            "/f/{}/in/{}/s-b/{}/ack",
+            "/f/{}/in/{}/tb000000000/{}/ack",
             bridge.cfg.fleet, bridge.node, bridge.node
         );
         let body = b"v=1 t=1 re=1 verdict=handled".to_vec();
@@ -3622,10 +3693,10 @@ fn a_quit_whose_hand_off_the_disk_refuses_leaves_the_run_open() {
         let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
         bridge.simulate_boot(crate::durability::test_boot(1), 0);
         bridge.begin_run();
-        let pin = plain_pin(7, "/f/f/in/n-1/s-b/n-1/note", b"v=1 t=1");
-        bridge.state.set_post_pin("s-a", 1, &pin).unwrap();
+        let pin = plain_pin(7, "/f/f/in/n-1/tb000000000/n-1/note", b"v=1 t=1");
+        bridge.state.set_post_pin("ta000000000", 1, &pin).unwrap();
         if refused {
-            bridge.state.refuse_writes_of(Some("sent/s-a.1"));
+            bridge.state.refuse_writes_of(Some("sent/ta000000000.1"));
         }
         bridge.bye = Some(Bye::Quit);
         bridge.end_run();
@@ -3634,7 +3705,7 @@ fn a_quit_whose_hand_off_the_disk_refuses_leaves_the_run_open() {
         assert_eq!(run.clean, !refused, "refused={refused}");
         let next = StateDir::open(bridge.state.root()).unwrap();
         assert_eq!(
-            next.post_pin("s-a", 1).unwrap(),
+            next.post_pin("ta000000000", 1).unwrap(),
             Some(pin),
             "refused={refused}"
         );
@@ -3651,8 +3722,8 @@ fn a_handoff_leaves_the_run_to_its_successor_and_a_quit_stops_it_cleanly() {
         let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
         bridge.simulate_boot(crate::durability::test_boot(1), 0);
         bridge.begin_run();
-        let pin = plain_pin(7, "/f/f/in/n-1/s-b/n-1/note", b"v=1 t=1");
-        bridge.state.set_post_pin("s-a", 1, &pin).unwrap();
+        let pin = plain_pin(7, "/f/f/in/n-1/tb000000000/n-1/note", b"v=1 t=1");
+        bridge.state.set_post_pin("ta000000000", 1, &pin).unwrap();
         bridge.bye = Some(bye);
         bridge.end_run();
         let run = bridge.state.last_run().unwrap().expect("a run record");
@@ -3728,10 +3799,10 @@ fn an_in_flight_entry_of_an_earlier_boot_is_retired_and_its_attach_publishes_not
         bridge.begin_run();
         assert!(bridge.attach_broker(), "boot 1");
         let face = format!(
-            "/f/{}/in/{}/s-b/{}/note",
+            "/f/{}/in/{}/tb000000000/{}/note",
             bridge.cfg.fleet, bridge.node, bridge.node
         );
-        let body = b"v=1 t=1 from=s-a text=landed%20then%20lost".to_vec();
+        let body = b"v=1 t=1 from=ta000000000 text=landed%20then%20lost".to_vec();
         let pin = plain_pin(bridge.next_seq().unwrap(), &face, &body);
         bridge
             .state
@@ -3872,7 +3943,7 @@ fn no_attach_runs_while_run_names_an_earlier_boot_so_a_relaunch_retires_nothing_
             );
         }
         let subject = format!(
-            "/f/{}/in/{}/s-local/{}/note",
+            "/f/{}/in/{}/t10ca100000/{}/note",
             bridge.cfg.fleet, bridge.node, bridge.node
         );
         let published =
@@ -3957,7 +4028,7 @@ fn no_attach_runs_under_a_clean_stops_record_so_the_next_boot_sweeps_what_it_wro
             assert_eq!(run, clean_one, "{case}: CONTROL: attached under it");
         }
         let face = format!(
-            "/f/{}/in/{}/s-b/{}/note",
+            "/f/{}/in/{}/tb000000000/{}/note",
             bridge.cfg.fleet, bridge.node, bridge.node
         );
         let body = b"v=1 t=1 text=live".to_vec();
@@ -4018,24 +4089,24 @@ fn a_post_routes_on_a_tofu_pin_only_once_it_is_on_the_media() {
             io::ErrorKind::Other,
         )));
         assert!(
-            bridge.state.pin("s-x", "n-far").is_err(),
+            bridge.state.pin("tx000000000", "n-far").is_err(),
             "the first sight's flush failed"
         );
         bridge.state.refuse_directory_flush(None);
         assert_eq!(
-            bridge.state.pins().get("s-x").map(String::as_str),
+            bridge.state.pins().get("tx000000000").map(String::as_str),
             Some("n-far"),
             "and it reads"
         );
         assert!(!bridge.state.on_the_media("pins"));
-        let _ = bridge.pinned_node_for("s-x");
+        let _ = bridge.pinned_node_for("tx000000000");
         assert_eq!(
             bridge.state.on_the_media("pins"),
             settle,
             "settle={settle}: the table written again before the route"
         );
         assert_eq!(
-            bridge.state.pins().get("s-x").map(String::as_str),
+            bridge.state.pins().get("tx000000000").map(String::as_str),
             Some("n-far")
         );
     }
@@ -4140,7 +4211,7 @@ fn a_face_at_its_bound_pauses_and_resumes_with_every_record_once_in_order() {
     let inc = bridge.inc;
     let links = lane.links.lock().unwrap().len();
     let (mut publisher, _) = bridge.connect().unwrap();
-    let lane_subject = format!("/f/f/in/{}/s-a/n-x/note", bridge.node);
+    let lane_subject = format!("/f/f/in/{}/ta000000000/n-x/note", bridge.node);
     let total = QUEUE_ROWS_MAX + QUEUE_ROWS_MAX / 2 + 7;
     let published: Vec<u64> = publisher
         .publish_pipelined(77, &lane_subject, &vec![b"v=1".as_slice(); total], 64)
@@ -4196,7 +4267,7 @@ fn a_face_at_its_bound_pauses_and_resumes_with_every_record_once_in_order() {
 fn a_duty_resumes_a_paused_fleet_face_before_the_next_halt() {
     use crate::mailbox::QUEUE_ROWS_MAX;
 
-    const SID: &str = "s-busy";
+    const SID: &str = "tbvsy000000";
     let (lane, mut bridge, _server) = rig_with_broker(&[(1, SID)]);
     bridge.refresh_sessions().unwrap();
     let inc = bridge.inc;
@@ -4275,18 +4346,18 @@ fn a_cut_subscription_is_named_by_its_face_and_a_dead_broker_is_closed() {
 
 #[test]
 fn the_broadcast_face_is_held_only_while_a_session_has_a_topic() {
-    let (lane, mut bridge, _server) = rig_with_broker(&[(1, "s-a")]);
+    let (lane, mut bridge, _server) = rig_with_broker(&[(1, "ta000000000")]);
     bridge.refresh_sessions().unwrap();
     let (mut publisher, _) = bridge.connect().unwrap();
     let body = Body::new(0).encode();
     let mut shout = |seq: u64| {
         publisher
-            .publish(77, seq, "/f/f/pub/n-src/s-src/say/t", &body)
+            .publish(77, seq, "/f/f/pub/n-src/tsrc0000000/say/t", &body)
             .unwrap()
             .0
     };
     let topic = |bridge: &mut Bridge, words: &str| {
-        bridge.topic_change("s-a", &mut words.split_whitespace());
+        bridge.topic_change("ta000000000", &mut words.split_whitespace());
         assert!(bridge.sync_say_face());
     };
     let take_say = |bridge: &mut Bridge| match bridge
@@ -4340,7 +4411,7 @@ fn the_broadcast_face_is_held_only_while_a_session_has_a_topic() {
 
 #[test]
 fn a_new_head_topic_after_a_shorter_log_hears_its_first_new_broadcast() {
-    const SID: &str = "s-a";
+    const SID: &str = "ta000000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     bridge.refresh_sessions().unwrap();
     let (a, _broker_a, _server_a) = serve_log(&lane, "a");
@@ -4355,7 +4426,7 @@ fn a_new_head_topic_after_a_shorter_log_hears_its_first_new_broadcast() {
     assert!(bridge.sync_say_face());
     let body = Body::new(0).encode();
     let (off, _) = writer_a
-        .publish(77, 65, "/f/f/pub/n-src/s-src/say/t", &body)
+        .publish(77, 65, "/f/f/pub/n-src/tsrc0000000/say/t", &body)
         .unwrap();
     match bridge
         .mailbox
@@ -4389,7 +4460,7 @@ fn a_new_head_topic_after_a_shorter_log_hears_its_first_new_broadcast() {
     assert!(bridge.sync_say_face());
     let before = lane.delivery_offsets().len();
     let (off, _) = writer_b
-        .publish(78, 1, "/f/f/pub/n-src/s-src/say/t", &body)
+        .publish(78, 1, "/f/f/pub/n-src/tsrc0000000/say/t", &body)
         .unwrap();
     assert_eq!(off, head);
     match bridge
@@ -4422,7 +4493,7 @@ fn fan_in_next_say(bridge: &mut Bridge) -> u64 {
 #[cfg(unix)]
 #[test]
 fn a_broadcast_cursor_waits_for_its_refill_floor_to_be_persisted() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let state = bridge.state.root().to_path_buf();
     let (bus, _broker, _server) = serve_log(&lane, "bus");
@@ -4433,7 +4504,12 @@ fn a_broadcast_cursor_waits_for_its_refill_floor_to_be_persisted() {
     let before = bridge.per_sid.topics[SID]["t"].next;
     let (mut writer, _) = bridge.connect().unwrap();
     let (off, _) = writer
-        .publish(77, 1, "/f/f/pub/n-src/s-src/say/t", &Body::new(0).encode())
+        .publish(
+            77,
+            1,
+            "/f/f/pub/n-src/tsrc0000000/say/t",
+            &Body::new(0).encode(),
+        )
         .unwrap();
     std::fs::write(state.join("unhandled"), b"owned write obstruction").unwrap();
     assert_eq!(fan_in_next_say(&mut bridge), off);
@@ -4480,7 +4556,7 @@ fn a_broadcast_cursor_waits_for_its_refill_floor_to_be_persisted() {
 #[cfg(unix)]
 #[test]
 fn an_uncertain_broadcast_refill_floor_refuses_attach_until_repaired() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for damage in ["directory", "dangling", "utf8", "malformed"] {
         let (lane, mut first) = FakeVerbLane::bridge(&[(1, SID)]);
         let state = first.state.root().to_path_buf();
@@ -4491,7 +4567,12 @@ fn an_uncertain_broadcast_refill_floor_refuses_attach_until_repaired() {
         assert!(first.sync_say_face());
         let (mut writer, _) = first.connect().unwrap();
         let (off, _) = writer
-            .publish(77, 1, "/f/f/pub/n-src/s-src/say/t", &Body::new(0).encode())
+            .publish(
+                77,
+                1,
+                "/f/f/pub/n-src/tsrc0000000/say/t",
+                &Body::new(0).encode(),
+            )
             .unwrap();
         assert_eq!(fan_in_next_say(&mut first), off);
         first.close_subscriptions();
@@ -4541,7 +4622,7 @@ fn an_uncertain_broadcast_refill_floor_refuses_attach_until_repaired() {
 #[cfg(unix)]
 #[test]
 fn a_broadcast_refill_floor_without_a_cursor_is_replayed() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let (lane, mut first) = FakeVerbLane::bridge(&[(1, SID)]);
     let state = first.state.root().to_path_buf();
     let (bus, _broker, _server) = serve_log(&lane, "bus");
@@ -4551,7 +4632,12 @@ fn a_broadcast_refill_floor_without_a_cursor_is_replayed() {
     assert!(first.sync_say_face());
     let (mut writer, _) = first.connect().unwrap();
     let (off, _) = writer
-        .publish(77, 1, "/f/f/pub/n-src/s-src/say/t", &Body::new(0).encode())
+        .publish(
+            77,
+            1,
+            "/f/f/pub/n-src/tsrc0000000/say/t",
+            &Body::new(0).encode(),
+        )
         .unwrap();
     assert_eq!(fan_in_next_say(&mut first), off);
     first.close_subscriptions();
@@ -4574,7 +4660,7 @@ fn a_broadcast_refill_floor_without_a_cursor_is_replayed() {
 #[cfg(unix)]
 #[test]
 fn an_update_offers_the_successor_every_broadcast_its_session_had_not_handled() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let (old_lane, mut old) = FakeVerbLane::bridge(&[(1, SID)]);
     let state = old.state.root().to_path_buf();
     let (bus, _broker, _server) = serve_log(&old_lane, "bus");
@@ -4585,7 +4671,7 @@ fn an_update_offers_the_successor_every_broadcast_its_session_had_not_handled() 
     let (mut god, _) = old.connect().unwrap();
     let body = Body::new(0).encode();
     let mut shout = |seq: u64| {
-        god.publish(77, seq, "/f/f/pub/n-src/s-src/say/t", &body)
+        god.publish(77, seq, "/f/f/pub/n-src/tsrc0000000/say/t", &body)
             .unwrap()
             .0
     };
@@ -4646,7 +4732,7 @@ fn an_update_offers_the_successor_every_broadcast_its_session_had_not_handled() 
 #[cfg(unix)]
 #[test]
 fn a_restarted_bridge_learns_what_its_session_handled_while_it_was_away() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for reported in [false, true] {
         let (lane, mut first) = FakeVerbLane::bridge(&[(1, SID)]);
         let state = first.state.root().to_path_buf();
@@ -4659,7 +4745,7 @@ fn a_restarted_bridge_learns_what_its_session_handled_while_it_was_away() {
         let body = Body::new(0).encode();
         let b: Vec<u64> = (1..=3)
             .map(|seq| {
-                god.publish(77, seq, "/f/f/pub/n-src/s-src/say/t", &body)
+                god.publish(77, seq, "/f/f/pub/n-src/tsrc0000000/say/t", &body)
                     .unwrap()
                     .0
             })
@@ -4701,7 +4787,7 @@ fn a_restarted_bridge_learns_what_its_session_handled_while_it_was_away() {
 
 #[test]
 fn the_unhandled_set_is_released_by_the_watermark_and_bounded_oldest_first() {
-    const SID: &str = "s-a";
+    const SID: &str = "ta000000000";
     let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let on_disk = |bridge: &Bridge| bridge.state.topic_floors(SID).unwrap();
     let floors = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
@@ -4768,12 +4854,12 @@ fn receipt_collision_with_unclearable_pin(restart: bool) {
     bridge.cfg.broker = socket.to_string_lossy().into_owned();
     bridge.conn = Some(bridge.connect().unwrap().0.into());
     let r = OwedReceipt {
-        sid: "s-host".to_string(),
+        sid: "th0st000000".to_string(),
         rid: 1,
         off: 7,
         verdict: "handled".to_string(),
         kind: "task".to_string(),
-        from: format!("s-sender@{}", bridge.node),
+        from: format!("tsender0000@{}", bridge.node),
         earlier_log: false,
     };
     let seq = bridge.next_seq().unwrap();
@@ -4836,7 +4922,7 @@ fn a_pinned_lost_ack_retries_its_original_face_after_restart() {
     let original = format!("/f/f/in/p/h-a/{}/note", bridge.node);
     let moved = format!("/f/f/in/p/h-b/{}/note", bridge.node);
     let mut body = Body::new(1);
-    body.from = Some("s-host".into());
+    body.from = Some("th0st000000".into());
     body.text = "lost ack".into();
     let pin = PublishPin {
         seq: bridge.next_seq().unwrap(),
@@ -4847,7 +4933,7 @@ fn a_pinned_lost_ack_retries_its_original_face_after_restart() {
         owner: None,
         at: None,
     };
-    bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
+    bridge.state.set_post_pin("th0st000000", 1, &pin).unwrap();
     let (off, deduped, _) = bridge
         .publish_reserved(&pin, &original, &body.encode(), false)
         .unwrap();
@@ -4857,7 +4943,7 @@ fn a_pinned_lost_ack_retries_its_original_face_after_restart() {
     bridge.cfg.broker = socket.to_string_lossy().into_owned();
     bridge.conn = Some(bridge.connect().unwrap().0.into());
     body.t = 99;
-    let pin = bridge.state.post_pin("s-host", 1).unwrap().unwrap();
+    let pin = bridge.state.post_pin("th0st000000", 1).unwrap().unwrap();
     let (again, deduped, actual) = bridge
         .publish_reserved(&pin, &moved, &body.encode(), false)
         .unwrap();
@@ -4894,7 +4980,7 @@ fn a_pinned_dedup_after_restart_requires_its_payload_and_legacy_ambiguity_stays_
         bridge.conn = Some(bridge.connect().unwrap().0.into());
         let face = format!("/f/f/in/p/h-a/{}/note", bridge.node);
         let mut intended = Body::new(1);
-        intended.from = Some("s-host".into());
+        intended.from = Some("th0st000000".into());
         intended.text = "the requested payload".into();
         let pin = PublishPin {
             seq: bridge.next_seq().unwrap(),
@@ -4905,7 +4991,7 @@ fn a_pinned_dedup_after_restart_requires_its_payload_and_legacy_ambiguity_stays_
             owner: None,
             at: None,
         };
-        bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
+        bridge.state.set_post_pin("th0st000000", 1, &pin).unwrap();
         let mut other_body = intended.clone();
         other_body.text = "a different original payload".into();
         let (mut other, _) = bridge.connect().unwrap();
@@ -4916,7 +5002,7 @@ fn a_pinned_dedup_after_restart_requires_its_payload_and_legacy_ambiguity_stays_
         let (_second, mut bridge) = FakeVerbLane::bridge_with_state(&[], Some(&state));
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         bridge.conn = Some(bridge.connect().unwrap().0.into());
-        let pin = bridge.state.post_pin("s-host", 1).unwrap().unwrap();
+        let pin = bridge.state.post_pin("th0st000000", 1).unwrap().unwrap();
         let error = bridge
             .publish_reserved(&pin, &face, &intended.encode(), false)
             .unwrap_err();
@@ -4931,7 +5017,7 @@ fn a_pinned_dedup_after_restart_requires_its_payload_and_legacy_ambiguity_stays_
                 "an older keyed body is not proof of a collision"
             );
             assert!(
-                bridge.state.post_pin("s-host", 1).unwrap().is_some(),
+                bridge.state.post_pin("th0st000000", 1).unwrap().is_some(),
                 "an unverifiable reservation is not reseeded"
             );
         }
@@ -4940,7 +5026,7 @@ fn a_pinned_dedup_after_restart_requires_its_payload_and_legacy_ambiguity_stays_
 
 #[test]
 fn a_legacy_keys_fresh_append_recovers_ownership_after_reconciliation_and_restart() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "th0st000000")]);
     let state = bridge.state.root().to_path_buf();
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
@@ -4949,11 +5035,14 @@ fn a_legacy_keys_fresh_append_recovers_ownership_after_reconciliation_and_restar
     bridge.conn = Some(bridge.connect().unwrap().0.into());
     let face = format!("/f/f/in/p/h-a/{}/ask", bridge.node);
     let mut body = Body::new(1);
-    body.from = Some("s-host".into());
+    body.from = Some("th0st000000".into());
     body.dl = Some(30_000);
     body.text = "new legacy attempt".into();
     let seq = bridge.next_seq().unwrap();
-    bridge.state.set_key_seq("s-host", "k-legacy", seq).unwrap();
+    bridge
+        .state
+        .set_key_seq("th0st000000", "k-legacy", seq)
+        .unwrap();
     let pin = PublishPin {
         seq,
         via_key: true,
@@ -4963,7 +5052,7 @@ fn a_legacy_keys_fresh_append_recovers_ownership_after_reconciliation_and_restar
         owner: None,
         at: None,
     };
-    bridge.state.set_post_pin("s-host", 1, &pin).unwrap();
+    bridge.state.set_post_pin("th0st000000", 1, &pin).unwrap();
     let (off, deduped, actual) = bridge
         .publish_reserved(&pin, &face, &body.encode(), false)
         .unwrap();
@@ -4971,7 +5060,7 @@ fn a_legacy_keys_fresh_append_recovers_ownership_after_reconciliation_and_restar
     bridge
         .state
         .reconcile_key(
-            "s-host",
+            "th0st000000",
             "k-legacy",
             seq,
             actual.as_ref().unwrap(),
@@ -4980,11 +5069,11 @@ fn a_legacy_keys_fresh_append_recovers_ownership_after_reconciliation_and_restar
         )
         .unwrap();
     drop(bridge);
-    let (second, mut bridge) = FakeVerbLane::bridge_with_state(&[(1, "s-host")], Some(&state));
+    let (second, mut bridge) = FakeVerbLane::bridge_with_state(&[(1, "th0st000000")], Some(&state));
     bridge.cfg.broker = socket.to_string_lossy().into_owned();
     bridge.conn = Some(bridge.connect().unwrap().0.into());
     *second.outbox.lock().unwrap() = Some(format!(
-        "post sid=s-host id=1 to=h-a kind=ask key=k-legacy dl=30000 len={}\n{}",
+        "post sid=th0st000000 id=1 to=h-a kind=ask key=k-legacy dl=30000 len={}\n{}",
         body.text.len(),
         body.text
     ));
@@ -5027,13 +5116,13 @@ fn offer_live_record(bridge: &mut Bridge, off: u64) -> bool {
     }
 }
 
-/// The offsets `lane` delivered to `s-b` a note of `text` at.
+/// The offsets `lane` delivered to `tb000000000` a note of `text` at.
 #[cfg(unix)]
 fn notes_delivered(lane: &FakeVerbLane, text: &str) -> BTreeSet<String> {
     let tail = format!("text={text}");
     lane.deliveries()
         .iter()
-        .filter(|l| l.starts_with("deliver s-b ") && l.ends_with(&tail))
+        .filter(|l| l.starts_with("deliver tb000000000 ") && l.ends_with(&tail))
         .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("off=")))
         .map(str::to_string)
         .collect()
@@ -5046,8 +5135,8 @@ fn notes_delivered(lane: &FakeVerbLane, text: &str) -> BTreeSet<String> {
 /// an ask whose deadline the disk refuses, so the bridge holds it for its retry and sends
 /// no `outbox sent`. Its in-flight entry stands and the live tail holds its record back.
 /// The log moves before the drain's retry, which finds no copy on the new log and
-/// publishes there: s-b is handed that copy alone. NEGATIVE CONTROL: the entry ended at any
-/// answer and at a hold, as E07's first cut ended it, lets the tail hand s-b the first copy
+/// publishes there: tb000000000 is handed that copy alone. NEGATIVE CONTROL: the entry ended at any
+/// answer and at a hold, as E07's first cut ended it, lets the tail hand tb000000000 the first copy
 /// too.
 #[cfg(unix)]
 #[test]
@@ -5059,7 +5148,7 @@ fn a_post_aterm_keeps_queued_is_held_until_its_retry_so_a_move_delivers_it_once(
         ("held", true),
     ] {
         let case = format!("{arm} control={control}");
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
         if control {
             bridge.fx =
                 crate::fx::Fx::os_without(crate::sim::world::Mutant::LandedWhileThePostStaysQueued);
@@ -5069,17 +5158,17 @@ fn a_post_aterm_keeps_queued_is_held_until_its_retry_so_a_move_delivers_it_once(
         assert!(bridge.attach_broker(), "{case}: the attach on A");
         let post = if arm == "busy" {
             lane.refuse_retirements(true);
-            "post sid=s-a id=1 to=@s-b kind=note len=4\nonce"
+            "post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nonce"
         } else {
             bridge.state.refuse_writes_of(Some("deadlines"));
-            "post sid=s-a id=1 to=@s-b kind=ask dl=60000 len=4\nonce"
+            "post sid=ta000000000 id=1 to=@tb000000000 kind=ask dl=60000 len=4\nonce"
         };
         *lane.outbox.lock().unwrap() = Some(post.to_string());
         bridge.drain_outbox();
         bridge.state.refuse_writes_of(None);
         let pin = bridge
             .state
-            .post_pin("s-a", 1)
+            .post_pin("ta000000000", 1)
             .unwrap()
             .expect("the post's pin stays while aterm keeps it queued");
         let face = pin.identity.as_ref().unwrap().subject.clone();
@@ -5097,7 +5186,7 @@ fn a_post_aterm_keeps_queued_is_held_until_its_retry_so_a_move_delivers_it_once(
         assert_eq!(
             lane.delivery_offsets().contains(&on_a),
             control,
-            "{case}: the note on A handed to s-b while its post stood queued"
+            "{case}: the note on A handed to tb000000000 while its post stood queued"
         );
         bridge.close_subscriptions();
         bridge.conn = None;
@@ -5115,7 +5204,7 @@ fn a_post_aterm_keeps_queued_is_held_until_its_retry_so_a_move_delivers_it_once(
         bridge.drain_outbox();
         let (mut writer, _) = bridge.connect().unwrap();
         let sentinel_face = format!(
-            "/f/{}/in/{}/s-b/h-writer/note",
+            "/f/{}/in/{}/tb000000000/h-writer/note",
             bridge.cfg.fleet, bridge.node
         );
         let (sentinel, _) = writer
@@ -5144,6 +5233,292 @@ fn a_post_aterm_keeps_queued_is_held_until_its_retry_so_a_move_delivers_it_once(
         );
         bridge.close_subscriptions();
     }
+}
+
+/// Publish a note from another node onto `sid`'s lane of this bridge's node, at `seq`: its
+/// offset.
+#[cfg(unix)]
+fn publish_note_to(bridge: &Bridge, sid: &str, seq: u64, text: &str) -> u64 {
+    let (mut writer, _) = bridge.connect().unwrap();
+    let face = format!(
+        "/f/{}/in/{}/{sid}/h-writer/note",
+        bridge.cfg.fleet, bridge.node
+    );
+    writer
+        .publish(81, seq, &face, format!("v=1 t=1 text={text}").as_bytes())
+        .unwrap()
+        .0
+}
+
+/// An attached bridge whose post from `ta000000000` to `tb000000000` landed on its own lane while aterm
+/// answered its `outbox sent` with `ERR busy` (aterm-gui-fabric's `retire_post` while a seamless
+/// update's commit fences retirements): the post stays queued at its pin and its in-flight
+/// entry stands for the drain's retry ([`Bridge::awaiting_drain`]). Answers the note's offset.
+#[cfg(unix)]
+fn an_own_note_aterm_keeps_queued(lane: &FakeVerbLane, bridge: &mut Bridge) -> u64 {
+    lane.refuse_retirements(true);
+    *lane.outbox.lock().unwrap() =
+        Some("post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nonce".to_string());
+    bridge.drain_outbox();
+    let pin = bridge
+        .state
+        .post_pin("ta000000000", 1)
+        .unwrap()
+        .expect("the post's pin stays while aterm keeps it queued");
+    let face = pin.identity.as_ref().unwrap().subject.clone();
+    let (rows, _) = bridge.conn_now().unwrap().fetch(0, &face, 1).unwrap();
+    let on_bus = rows.first().expect("the note on the bus").0;
+    assert!(
+        bridge.held_for_the_drain(on_bus),
+        "the note's entry stands for the drain"
+    );
+    on_bus
+}
+
+/// **AN OWN RECORD HELD FOR ATERM'S DRAIN HOLDS ITS OWN LANE, NOT THE LINK** (ATERM-KI-1111-3).
+/// The live tail meets an own-lane note whose in-flight entry stands for the drain's retry
+/// (aterm answered `outbox sent` with `ERR busy`): the bridge keeps its broker link, says no
+/// `link down`, and holds the note in hand, with the later mail of its session queued behind
+/// it; another session's later mail on the node's one inbox subscription is delivered at once,
+/// and the inbox commit stays below the held note. Once aterm retires the post at the drain's
+/// retry, the entry ends and the held note, then the mail behind it, is delivered, each once,
+/// in order. Every build before this one dropped the link at the note (`link down
+/// reason=error`), and the next record of the node's inbox, whoever it was for, waited for an
+/// attach. NEGATIVE CONTROLS: `Mutant::DropTheLinkAtAHeldOwnRecord`, today's drop;
+/// `Mutant::CommitPastAHeldOwnRecord`, a commit that passes the held note once the mail behind
+/// it is accounted, which the sim's model refuses (its
+/// `an_own_record_held_for_aterms_drain_drops_no_link_and_stalls_no_other_lane`, killed worlds
+/// included).
+#[cfg(unix)]
+#[test]
+fn an_own_record_held_for_the_drain_keeps_the_link_and_the_other_lanes() {
+    use crate::sim::world::Mutant;
+    for control in [
+        None,
+        Some(Mutant::DropTheLinkAtAHeldOwnRecord),
+        Some(Mutant::CommitPastAHeldOwnRecord),
+    ] {
+        let case = format!("control={control:?}");
+        let (lane, mut bridge) =
+            FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tc000000000")]);
+        if let Some(m) = control {
+            bridge.fx = crate::fx::Fx::os_without(m);
+        }
+        let drops = control == Some(Mutant::DropTheLinkAtAHeldOwnRecord);
+        let passes = control == Some(Mutant::CommitPastAHeldOwnRecord);
+        let (a, _broker, _server) = serve_log(&lane, &format!("held-own-{control:?}"));
+        bridge.cfg.broker = a;
+        assert!(bridge.attach_broker(), "{case}: the attach");
+        let note = an_own_note_aterm_keeps_queued(&lane, &mut bridge);
+        let links = lane.links().len();
+        assert!(
+            offer_live_record(&mut bridge, note),
+            "{case}: the live tail reached the note"
+        );
+        let said_down = lane.links()[links..]
+            .iter()
+            .any(|l| l.starts_with("link down"));
+        let kept = bridge.conn.is_some();
+        assert!(
+            !lane.delivery_offsets().contains(&note),
+            "{case}: the note is not delivered while its entry stands"
+        );
+        let other = publish_note_to(&bridge, "tc000000000", 1, "other");
+        assert!(
+            offer_live_record(&mut bridge, other),
+            "{case}: the live tail reached tc000000000's note"
+        );
+        assert_eq!(
+            (kept, said_down, lane.delivery_offsets().contains(&other)),
+            (!drops, drops, !drops),
+            "{case}: (the link stands, `link down` said, another session's later mail \
+             delivered while the note is held)"
+        );
+        if drops {
+            bridge.close_subscriptions();
+            continue;
+        }
+        let behind = publish_note_to(&bridge, "tb000000000", 2, "behind");
+        assert!(
+            offer_live_record(&mut bridge, behind),
+            "{case}: the live tail reached tb000000000's later note"
+        );
+        assert!(
+            !lane.delivery_offsets().contains(&behind),
+            "{case}: tb000000000's later mail waits behind its held note"
+        );
+        assert_eq!(
+            bridge.commit_target(behind).is_none_or(|t| t < note),
+            !passes,
+            "{case}: the inbox commit stays below the held note"
+        );
+        if passes {
+            bridge.close_subscriptions();
+            continue;
+        }
+        lane.refuse_retirements(false);
+        bridge.drain_outbox();
+        assert!(
+            bridge.state.in_flight().unwrap().is_empty(),
+            "{case}: the drain's retry ended the entry"
+        );
+        let to_b: Vec<u64> = lane
+            .deliveries()
+            .iter()
+            .filter(|l| l.starts_with("deliver tb000000000 "))
+            .filter_map(|l| {
+                l.split_whitespace()
+                    .find_map(|w| w.strip_prefix("off="))
+                    .and_then(|o| o.parse().ok())
+            })
+            .collect();
+        assert_eq!(
+            to_b,
+            [note, behind],
+            "{case}: the held note, then the mail behind it, each once"
+        );
+        assert!(bridge.conn.is_some(), "{case}: the link stood throughout");
+        bridge.close_subscriptions();
+    }
+}
+
+/// **WHAT THE BRIDGE HOLDS IN HAND IS BOUNDED, AND PAST IT THE LINK DROPS** (ATERM-KI-1111-3):
+/// a held own note and its session's later mail behind it fill [`HELD_OWN_RECORDS_MAX`]; the
+/// next record of that lane is not held, and the link is said down and dropped, as every
+/// held own record dropped it before. The commit never passed the held note, so the attach
+/// offers it again.
+#[cfg(unix)]
+#[test]
+fn records_past_what_the_bridge_holds_in_hand_drop_the_link() {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
+    let (a, _broker, _server) = serve_log(&lane, "held-bound");
+    bridge.cfg.broker = a;
+    assert!(bridge.attach_broker(), "the attach");
+    let note = an_own_note_aterm_keeps_queued(&lane, &mut bridge);
+    assert!(
+        offer_live_record(&mut bridge, note),
+        "the tail reached the note"
+    );
+    let mut last = note;
+    for seq in 1..u64::try_from(HELD_OWN_RECORDS_MAX).unwrap() {
+        last = publish_note_to(&bridge, "tb000000000", seq, "behind");
+    }
+    assert!(
+        offer_live_record(&mut bridge, last),
+        "the tail reached the last one held"
+    );
+    assert_eq!(
+        bridge.held_own.values().map(BTreeMap::len).sum::<usize>(),
+        HELD_OWN_RECORDS_MAX,
+        "the note and the mail behind it fill what the bridge holds"
+    );
+    assert!(bridge.conn.is_some(), "the link stands up to the bound");
+    let links = lane.links().len();
+    let past = publish_note_to(&bridge, "tb000000000", HELD_OWN_RECORDS_MAX as u64, "past");
+    assert!(
+        offer_live_record(&mut bridge, past),
+        "the tail reached the record past it"
+    );
+    assert!(
+        bridge.conn.is_none(),
+        "a record past the bound drops the link"
+    );
+    assert!(
+        lane.links()[links..]
+            .iter()
+            .any(|l| l == "link down reason=error"),
+        "and says it down: {:?}",
+        lane.links()
+    );
+    assert!(
+        !lane.delivery_offsets().contains(&note) && !lane.delivery_offsets().contains(&past),
+        "nothing of the held lane was delivered"
+    );
+    assert!(
+        bridge.commit_target(past).is_none_or(|t| t < note),
+        "the commit stays below the held note"
+    );
+    bridge.close_subscriptions();
+}
+
+/// **WHAT THE BRIDGE HOLDS IN HAND IS BOUNDED IN BYTES TOO** (ATERM-KI-1111-3): a held own note
+/// and large mail of its session behind it fill [`HELD_OWN_BYTES_MAX`] to the byte, far below
+/// [`HELD_OWN_RECORDS_MAX`] records; one more byte of that lane's next record is not held, and
+/// the link is said down and dropped. The commit never passed the held note.
+#[cfg(unix)]
+#[test]
+fn bytes_past_what_the_bridge_holds_in_hand_drop_the_link() {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
+    let (a, _broker, _server) = serve_log(&lane, "held-bytes");
+    bridge.cfg.broker = a;
+    assert!(bridge.attach_broker(), "the attach");
+    let note = an_own_note_aterm_keeps_queued(&lane, &mut bridge);
+    assert!(
+        offer_live_record(&mut bridge, note),
+        "the tail reached the note"
+    );
+    let held_bytes = |bridge: &Bridge| {
+        bridge
+            .held_own
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(|r| r.subject.len() + r.raw.len())
+            .sum::<usize>()
+    };
+    // What one note of `publish_note_to` to tb000000000 carrying `text` costs in hand.
+    let face = format!(
+        "/f/{}/in/{}/tb000000000/h-writer/note",
+        bridge.cfg.fleet, bridge.node
+    );
+    let cost = |text: usize| face.len() + "v=1 t=1 text=".len() + text;
+    let quarter = HELD_OWN_BYTES_MAX / 4;
+    let mut last = note;
+    for seq in 1..=2 {
+        last = publish_note_to(&bridge, "tb000000000", seq, &"q".repeat(quarter));
+    }
+    assert!(
+        offer_live_record(&mut bridge, last),
+        "the tail reached the large mail"
+    );
+    let before = held_bytes(&bridge);
+    let room = HELD_OWN_BYTES_MAX - before;
+    let fill = publish_note_to(&bridge, "tb000000000", 3, &"f".repeat(room - cost(0)));
+    assert!(
+        offer_live_record(&mut bridge, fill),
+        "the tail reached the mail that fills the bound"
+    );
+    assert_eq!(
+        (held_bytes(&bridge), bridge.held_in_hand()),
+        (HELD_OWN_BYTES_MAX, 4),
+        "the note and the mail behind it fill the byte bound exactly, in four records"
+    );
+    assert!(bridge.conn.is_some(), "the link stands up to the bound");
+    let links = lane.links().len();
+    let past = publish_note_to(&bridge, "tb000000000", 4, "");
+    assert!(
+        offer_live_record(&mut bridge, past),
+        "the tail reached the record past it"
+    );
+    assert!(
+        bridge.conn.is_none(),
+        "a record past the byte bound drops the link"
+    );
+    assert!(
+        lane.links()[links..]
+            .iter()
+            .any(|l| l == "link down reason=error"),
+        "and says it down: {:?}",
+        lane.links()
+    );
+    assert!(
+        !lane.delivery_offsets().contains(&note) && !lane.delivery_offsets().contains(&past),
+        "nothing of the held lane was delivered"
+    );
+    assert!(
+        bridge.commit_target(past).is_none_or(|t| t < note),
+        "the commit stays below the held note"
+    );
+    bridge.close_subscriptions();
 }
 
 /// The offsets `lane` handed `sid` a receipt's answer at (`kind=ack`).
@@ -5178,7 +5553,7 @@ fn answers_delivered(lane: &FakeVerbLane, sid: &str) -> BTreeSet<String> {
 fn a_receipt_aterm_still_owes_is_held_until_its_retry_and_answered_once() {
     for control in [false, true] {
         let case = format!("control={control}");
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
         if control {
             bridge.fx = crate::fx::Fx::os_without(crate::sim::world::Mutant::ReceiptRetiredAtAck);
         }
@@ -5186,12 +5561,14 @@ fn a_receipt_aterm_still_owes_is_held_until_its_retry_and_answered_once() {
         bridge.cfg.broker = a;
         assert!(bridge.attach_broker(), "{case}: the first attach");
         lane.refuse_retirements(true);
-        *lane.outbox.lock().unwrap() =
-            Some("receipt sid=s-b rid=1 off=3 verdict=handled kind=ask from=s-a\n".to_string());
+        *lane.outbox.lock().unwrap() = Some(
+            "receipt sid=tb000000000 rid=1 off=3 verdict=handled kind=ask from=ta000000000\n"
+                .to_string(),
+        );
         bridge.drain_outbox();
         let pin = bridge
             .state
-            .receipt_pin("s-b", 1)
+            .receipt_pin("tb000000000", 1)
             .unwrap()
             .expect("the receipt's pin stays while aterm still owes it");
         let face = pin.identity.as_ref().unwrap().subject.clone();
@@ -5216,9 +5593,9 @@ fn a_receipt_aterm_still_owes_is_held_until_its_retry_and_answered_once() {
             "{case}: the live tail reached the answer"
         );
         assert_eq!(
-            answers_delivered(&lane, "s-a").contains(&format!("off={on_bus}")),
+            answers_delivered(&lane, "ta000000000").contains(&format!("off={on_bus}")),
             control,
-            "{case}: the answer handed to s-a while aterm still owed the receipt"
+            "{case}: the answer handed to ta000000000 while aterm still owed the receipt"
         );
         bridge.close_subscriptions();
         bridge.conn = None;
@@ -5232,7 +5609,7 @@ fn a_receipt_aterm_still_owes_is_held_until_its_retry_and_answered_once() {
         bridge.drain_outbox();
         let (mut writer, _) = bridge.connect().unwrap();
         let sentinel_face = format!(
-            "/f/{}/in/{}/s-a/h-writer/note",
+            "/f/{}/in/{}/ta000000000/h-writer/note",
             bridge.cfg.fleet, bridge.node
         );
         let (sentinel, _) = writer
@@ -5247,7 +5624,11 @@ fn a_receipt_aterm_still_owes_is_held_until_its_retry_and_answered_once() {
             "{case}: aterm's OK ended the entry"
         );
         assert!(
-            bridge.state.receipt_pin("s-b", 1).unwrap().is_none(),
+            bridge
+                .state
+                .receipt_pin("tb000000000", 1)
+                .unwrap()
+                .is_none(),
             "{case}: the reservation went with the receipt"
         );
         let (answers, _) = bridge.conn_now().unwrap().fetch(0, &face, 8).unwrap();
@@ -5257,9 +5638,9 @@ fn a_receipt_aterm_still_owes_is_held_until_its_retry_and_answered_once() {
             "{case}: the answer on the bus once"
         );
         assert_eq!(
-            answers_delivered(&lane, "s-a"),
+            answers_delivered(&lane, "ta000000000"),
             [format!("off={on_bus}")].into(),
-            "{case}: s-a handed the answer at its one offset: {:?}",
+            "{case}: ta000000000 handed the answer at its one offset: {:?}",
             lane.deliveries()
         );
         bridge.close_subscriptions();
@@ -5276,13 +5657,13 @@ fn a_receipt_aterm_still_owes_is_held_until_its_retry_and_answered_once() {
 #[cfg(unix)]
 #[test]
 fn a_successor_attaches_once_after_aterm_went_away_during_a_landed_posts_retirement() {
-    let sessions = [(1, "s-a"), (2, "s-b")];
+    let sessions = [(1, "ta000000000"), (2, "tb000000000")];
     let (lane, mut first) = FakeVerbLane::bridge(&sessions);
     let state = first.state.root().to_path_buf();
     let (a, _broker_a, _server_a) = serve_log(&lane, "gone-a");
     first.cfg.broker = a.clone();
     assert!(first.attach_broker(), "the first bridge's attach");
-    let post = "post sid=s-a id=1 to=@s-b kind=note len=4\nonce".to_string();
+    let post = "post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nonce".to_string();
     *lane.outbox.lock().unwrap() = Some(post.clone());
     lane.hang_up_at("outbox sent ");
     first.drain_outbox();
@@ -5328,15 +5709,16 @@ fn a_successor_attaches_once_after_aterm_went_away_during_a_landed_posts_retirem
 #[cfg(unix)]
 #[test]
 fn a_successor_attaches_once_after_aterm_went_away_during_a_landed_receipts_retirement() {
-    let sessions = [(1, "s-a"), (2, "s-b")];
+    let sessions = [(1, "ta000000000"), (2, "tb000000000")];
     let (lane, mut first) = FakeVerbLane::bridge(&sessions);
     let state = first.state.root().to_path_buf();
     let (a, _broker_a, _server_a) = serve_log(&lane, "gone-receipt");
     first.cfg.broker = a.clone();
     assert!(first.attach_broker(), "the first bridge's attach");
-    let receipt = "receipt sid=s-b rid=1 off=3 verdict=handled kind=ask from=s-a\n".to_string();
+    let receipt = "receipt sid=tb000000000 rid=1 off=3 verdict=handled kind=ask from=ta000000000\n"
+        .to_string();
     *lane.outbox.lock().unwrap() = Some(receipt.clone());
-    lane.hang_up_at("deliver s-b receipt=");
+    lane.hang_up_at("deliver tb000000000 receipt=");
     first.drain_outbox();
     assert!(first.aterm_gone(), "the retirement met aterm gone");
     assert_eq!(
@@ -5367,11 +5749,11 @@ fn a_successor_attaches_once_after_aterm_went_away_during_a_landed_receipts_reti
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.starts_with("deliver s-b receipt=1 off=") && !l.ends_with("off=-")),
+            .any(|l| l.starts_with("deliver tb000000000 receipt=1 off=") && !l.ends_with("off=-")),
         "the successor retired the receipt at its offset"
     );
     assert_eq!(
-        answers_delivered(&second, "s-a").len(),
+        answers_delivered(&second, "ta000000000").len(),
         1,
         "the successor's attach handed the answer over once: {:?}",
         second.deliveries()
@@ -5387,13 +5769,14 @@ fn a_successor_attaches_once_after_aterm_went_away_during_a_landed_receipts_reti
 #[cfg(unix)]
 #[test]
 fn a_receipt_onto_a_persons_lane_lands_without_an_acked_write() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     let (a, _broker, _server) = serve_log(&lane, "person-receipt");
     bridge.cfg.broker = a;
     assert!(bridge.attach_broker(), "the attach");
     lane.retire_from_outbox();
-    *lane.outbox.lock().unwrap() =
-        Some("receipt sid=s-a rid=1 off=3 verdict=handled kind=task from=h-x\n".to_string());
+    *lane.outbox.lock().unwrap() = Some(
+        "receipt sid=ta000000000 rid=1 off=3 verdict=handled kind=task from=h-x\n".to_string(),
+    );
     let acked_before = bridge.self_acked.clone();
     bridge.drain_outbox();
     let face = format!("{}/ack", subject::person_lane("f", "h-x", &bridge.node));
@@ -5405,11 +5788,15 @@ fn a_receipt_onto_a_persons_lane_lands_without_an_acked_write() {
         lane.requests
             .lock()
             .unwrap()
-            .contains(&format!("deliver s-a receipt=1 off={off}")),
+            .contains(&format!("deliver ta000000000 receipt=1 off={off}")),
         "aterm told the receipt's offset"
     );
     assert!(
-        bridge.state.receipt_pin("s-a", 1).unwrap().is_none(),
+        bridge
+            .state
+            .receipt_pin("ta000000000", 1)
+            .unwrap()
+            .is_none(),
         "the reservation went with the receipt"
     );
     assert!(
@@ -5440,7 +5827,7 @@ fn a_receipt_onto_a_persons_lane_lands_without_an_acked_write() {
 fn a_post_onto_a_persons_lane_or_another_nodes_takes_no_slot_of_the_self_lane_window() {
     for wide in [false, true] {
         let case = format!("wide={wide}");
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tr000000000")]);
         if wide {
             bridge.fx = Fx::os_without(crate::sim::world::Mutant::WideAckedSet);
         }
@@ -5448,7 +5835,7 @@ fn a_post_onto_a_persons_lane_or_another_nodes_takes_no_slot_of_the_self_lane_wi
         let (a, _broker, _server) = serve_log(&lane, &format!("wide-acked-{wide}"));
         bridge.cfg.broker = a;
         assert!(bridge.attach_broker(), "{case}: the attach");
-        let own_lane = subject::post_lane("f", &bridge.node, "s-r", &bridge.node, "note");
+        let own_lane = subject::post_lane("f", &bridge.node, "tr000000000", &bridge.node, "note");
         let forged_body = b"v=1 t=1 text=forged".to_vec();
         let (mut forger, _) = bridge.connect().unwrap();
         let (forged, _) = forger
@@ -5476,7 +5863,7 @@ fn a_post_onto_a_persons_lane_or_another_nodes_takes_no_slot_of_the_self_lane_wi
             "{case}: PRECONDITION: the full window accuses @{forged}"
         );
 
-        *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 1, "h-x", "to a person"));
+        *lane.outbox.lock().unwrap() = Some(queued_note("ta000000000", 1, "h-x", "to a person"));
         bridge.drain_outbox();
         bridge.settle_acks();
         let person = format!("{}/>", subject::person_lane("f", "h-x", &bridge.node));
@@ -5486,12 +5873,18 @@ fn a_post_onto_a_persons_lane_or_another_nodes_takes_no_slot_of_the_self_lane_wi
         };
         assert!(
             *to_person > forged
-                && retirements(&lane).contains(&("s-a".to_string(), 1, Some(*to_person))),
+                && retirements(&lane).contains(&("ta000000000".to_string(), 1, Some(*to_person))),
             "{case}: the person's note landed above @{forged} and was retired: {:?}",
             retirements(&lane)
         );
-        let other_lane = subject::post_lane("f", "n-9ee7000000000002", "s-x", &bridge.node, "note");
-        let post = parse_drain(b"post sid=s-a id=2 to=@s-x kind=note len=5\nthere")
+        let other_lane = subject::post_lane(
+            "f",
+            "n-9ee7000000000002",
+            "tx000000000",
+            &bridge.node,
+            "note",
+        );
+        let post = parse_drain(b"post sid=ta000000000 id=2 to=@tx000000000 kind=note len=5\nthere")
             .posts
             .remove(0);
         let identity = publication_identity(&other_lane, b"there");
@@ -5550,12 +5943,17 @@ fn a_post_onto_a_persons_lane_or_another_nodes_takes_no_slot_of_the_self_lane_wi
             bridge.self_floor
         );
 
-        *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 3, "@s-r", "to a session"));
+        *lane.outbox.lock().unwrap() = Some(queued_note(
+            "ta000000000",
+            3,
+            "@tr000000000",
+            "to a session",
+        ));
         bridge.drain_outbox();
         bridge.settle_acks();
         let (rows, _) = forger.fetch(forged + 1, &own_lane, 8).unwrap();
         let [(own, _, _)] = rows.as_slice() else {
-            panic!("{case}: the note on s-r's lane once: {rows:?}");
+            panic!("{case}: the note on tr000000000's lane once: {rows:?}");
         };
         assert!(
             bridge.self_acked.contains(own) && bridge.state.self_acked().contains(own),
@@ -5605,7 +6003,7 @@ fn a_fresh_windows_first_own_record_moves_no_floor() {
     .enumerate()
     {
         let case = format!("{mutant:?}");
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tr000000000")]);
         if let Some(mutant) = mutant {
             bridge.fx = Fx::os_without(mutant);
         }
@@ -5621,7 +6019,7 @@ fn a_fresh_windows_first_own_record_moves_no_floor() {
         );
         let (mut forger, _) = bridge.connect().unwrap();
 
-        *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 1, "h-x", "to a person"));
+        *lane.outbox.lock().unwrap() = Some(queued_note("ta000000000", 1, "h-x", "to a person"));
         bridge.drain_outbox();
         bridge.settle_acks();
         let person = format!("{}/>", subject::person_lane("f", "h-x", &bridge.node));
@@ -5629,17 +6027,22 @@ fn a_fresh_windows_first_own_record_moves_no_floor() {
         let [(to_person, _, _)] = rows.as_slice() else {
             panic!("{case}: the note on the person's lane once: {rows:?}");
         };
-        let own_lane = subject::post_lane("f", &bridge.node, "s-r", &bridge.node, "note");
+        let own_lane = subject::post_lane("f", &bridge.node, "tr000000000", &bridge.node, "note");
         let forged_body = b"v=1 t=1 text=forged".to_vec();
         let (forged, _) = forger
             .publish(bridge.producer_id ^ 1, 1, &own_lane, &forged_body)
             .unwrap();
-        *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 2, "@s-r", "to a session"));
+        *lane.outbox.lock().unwrap() = Some(queued_note(
+            "ta000000000",
+            2,
+            "@tr000000000",
+            "to a session",
+        ));
         bridge.drain_outbox();
         bridge.settle_acks();
         let (rows, _) = forger.fetch(forged + 1, &own_lane, 8).unwrap();
         let [(own, _, _)] = rows.as_slice() else {
-            panic!("{case}: the note on s-r's lane once: {rows:?}");
+            panic!("{case}: the note on tr000000000's lane once: {rows:?}");
         };
         assert!(
             *to_person < forged && forged < *own,
@@ -5705,21 +6108,21 @@ fn a_lost_or_unreadable_acked_file_accuses_nothing_it_cannot_judge() {
     .enumerate()
     {
         let case = format!("unreadable={unreadable} {mutant:?}");
-        let sessions = [(1, "s-a"), (2, "s-r")];
+        let sessions = [(1, "ta000000000"), (2, "tr000000000")];
         let (lane, mut bridge) = FakeVerbLane::bridge(&sessions);
         let state = bridge.state.root().to_path_buf();
         assert!(bridge.refresh_sessions().is_ok());
         let (socket, _broker, _server) = serve_log(&lane, &format!("lost-acked-{i}"));
         bridge.cfg.broker = socket.clone();
         assert!(bridge.attach_broker(), "{case}: the first run's attach");
-        *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 1, "@s-r", "mine"));
+        *lane.outbox.lock().unwrap() = Some(queued_note("ta000000000", 1, "@tr000000000", "mine"));
         bridge.drain_outbox();
         bridge.settle_acks();
-        let own_lane = subject::post_lane("f", &bridge.node, "s-r", &bridge.node, "note");
+        let own_lane = subject::post_lane("f", &bridge.node, "tr000000000", &bridge.node, "note");
         let (mut reader, _) = bridge.connect().unwrap();
         let (rows, _) = reader.fetch(0, &own_lane, 8).unwrap();
         let [(own, _, own_body)] = rows.as_slice() else {
-            panic!("{case}: the note on s-r's lane once: {rows:?}");
+            panic!("{case}: the note on tr000000000's lane once: {rows:?}");
         };
         let (own, own_body) = (*own, own_body.clone());
         assert!(
@@ -5789,6 +6192,217 @@ fn a_lost_or_unreadable_acked_file_accuses_nothing_it_cannot_judge() {
     }
 }
 
+/// **A WINDOW KEPT ON ANOTHER LOG IS DROPPED** (`Bridge::drop_a_window_of_another_log`, the
+/// lossy-log world's seed 3483 and its review): a node's first run attaches on a log that
+/// already holds forty records, so its window is floored above them and bound to that log in
+/// its `acked` file, and lands a note to a session of its own. Between two runs a power cut
+/// loses what the state dir says of the log: the `bus-log` witness removed or torn, or a
+/// witness of the next log brought back beside the old log's `acked` (the review's second
+/// case). The relaunch attaches on another log, fresh, whose offsets start again at 0. With
+/// the witness lost the load takes the log `acked` names, and the attach judges a move; with
+/// the next log's witness it judges none, and drops the window as another log's. Either way
+/// the window is this log's, floored at its head, and a record a co-holder of the node cap
+/// writes onto the node's own lane there is accused as `forged-self`, as an own record whose
+/// ack is still unread is, until its ack is read. A floor write the disk refuses there refuses
+/// the attach, so no witness of the new log is saved over the old window (the review's first
+/// case), and the next attach floors it. On the log the window was kept on nothing is dropped:
+/// a lost witness alone keeps the window and its floor, and the first run's own record is
+/// offered again unaccused. NEGATIVE CONTROL (`Mutant::UnboundWindow`): the old log's window
+/// stays in force on the new one, its floor above the forged record, which is delivered as the
+/// node's own.
+#[cfg(unix)]
+#[test]
+fn a_window_kept_on_another_log_is_dropped() {
+    use crate::sim::world::Mutant;
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Lost {
+        Removed,
+        Torn,
+        NextLogs,
+    }
+    for (i, (lost, another_log, refused, mutant)) in [
+        (Lost::Removed, true, false, None),
+        (Lost::Torn, true, false, None),
+        (Lost::NextLogs, true, false, None),
+        (Lost::NextLogs, true, true, None),
+        (Lost::Removed, false, false, None),
+        (Lost::Torn, false, false, None),
+        (Lost::Removed, true, false, Some(Mutant::UnboundWindow)),
+        (Lost::Torn, true, false, Some(Mutant::UnboundWindow)),
+        (Lost::NextLogs, true, false, Some(Mutant::UnboundWindow)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case = format!("{lost:?} another_log={another_log} refused={refused} {mutant:?}");
+        let sessions = [(1, "ta000000000"), (2, "tr000000000")];
+        let (lane, mut bridge) = FakeVerbLane::bridge(&sessions);
+        let state = bridge.state.root().to_path_buf();
+        assert!(bridge.refresh_sessions().is_ok());
+        let (socket, first_broker, _server) = serve_log(&lane, &format!("bound-{i}"));
+        let first_log = first_broker.log_identity();
+        bridge.cfg.broker = socket.clone();
+        let (mut filler, _) = bridge.connect().unwrap();
+        for seq in 1..=40 {
+            filler
+                .publish(
+                    bridge.producer_id ^ 2,
+                    seq,
+                    "/f/f/pub/n-filler/tx000000000/ev",
+                    b"x",
+                )
+                .unwrap();
+        }
+        assert!(bridge.attach_broker(), "{case}: the first run's attach");
+        let old_floor = bridge.self_floor;
+        assert!(
+            old_floor.is_some_and(|floor| floor >= 40),
+            "{case}: PRECONDITION: the first window floored above the filler: {old_floor:?}"
+        );
+        assert_eq!(
+            bridge.state.self_acked_log().log,
+            Some(first_log),
+            "{case}: the first window's file names its log"
+        );
+        *lane.outbox.lock().unwrap() = Some(queued_note("ta000000000", 1, "@tr000000000", "mine"));
+        bridge.drain_outbox();
+        bridge.settle_acks();
+        let own_lane = subject::post_lane("f", &bridge.node, "tr000000000", &bridge.node, "note");
+        let (mut reader, _) = bridge.connect().unwrap();
+        let (rows, _) = reader.fetch(0, &own_lane, 8).unwrap();
+        let [(own, _, own_body)] = rows.as_slice() else {
+            panic!("{case}: the note on tr000000000's lane once: {rows:?}");
+        };
+        let (own, own_body) = (*own, own_body.clone());
+        assert!(
+            bridge.state.self_acked().contains(&own),
+            "{case}: PRECONDITION: the first run remembered @{own}"
+        );
+        bridge.close_subscriptions();
+        drop(bridge);
+        let second = another_log.then(|| serve_log(&lane, &format!("bound-{i}-another")));
+        let second_log = second.as_ref().map(|(_, broker, _)| broker.log_identity());
+        let witness = state.join("bus-log");
+        assert!(
+            witness.exists(),
+            "{case}: PRECONDITION: the first run wrote its witness"
+        );
+        let next_witness = second_log.map(|id| {
+            LogWitness {
+                high: 0,
+                id: Some(id),
+            }
+            .render()
+        });
+        match lost {
+            Lost::Removed => std::fs::remove_file(&witness).unwrap(),
+            Lost::Torn => std::fs::write(&witness, b"id=5a5a").unwrap(),
+            Lost::NextLogs => {
+                let next = next_witness.as_deref().expect("another log's witness");
+                std::fs::write(&witness, next).unwrap();
+            }
+        }
+
+        let (lane, mut bridge) = FakeVerbLane::bridge_with_state(&sessions, Some(&state));
+        assert_eq!(
+            bridge.bus_log,
+            if lost == Lost::NextLogs {
+                second_log
+            } else {
+                Some(first_log)
+            },
+            "{case}: the load takes the log its witness names, or with none the one its window does"
+        );
+        if let Some(mutant) = mutant {
+            bridge.fx = Fx::os_without(mutant);
+            // The load under the mutant, which reads the witness alone (`Bridge::new`).
+            bridge.bus_log = bridge.log_witness.id;
+        }
+        assert_eq!(
+            bridge.self_floor, old_floor,
+            "{case}: PRECONDITION: the relaunch loads the first run's window"
+        );
+        assert!(bridge.refresh_sessions().is_ok());
+        bridge.cfg.broker = second
+            .as_ref()
+            .map_or(socket, |(another, _, _)| another.clone());
+        if refused {
+            bridge.state.refuse_writes_of(Some("acked"));
+            assert!(
+                !bridge.attach_broker(),
+                "{case}: a dropped window's floor the disk refuses refuses the attach"
+            );
+            assert_eq!(
+                (
+                    bridge.state.self_acked_log().log,
+                    std::fs::read_to_string(&witness).ok()
+                ),
+                (Some(first_log), next_witness.clone()),
+                "{case}: the old window stays bound to its log, and no witness is saved over it"
+            );
+            bridge.state.refuse_writes_of(None);
+        }
+        assert!(bridge.attach_broker(), "{case}: the relaunch's attach");
+        let control = mutant.is_some();
+        let floor = bridge.self_floor;
+        let on_disk = bridge.state.self_acked_log();
+        assert_eq!(
+            on_disk.floor, floor,
+            "{case}: the file names the window's floor"
+        );
+        let (mut reader, _) = bridge.connect().unwrap();
+        if another_log {
+            if !control {
+                assert_eq!(
+                    on_disk.log, second_log,
+                    "{case}: the window is bound to the log it is kept on"
+                );
+                let moved = node_evs(&bridge)
+                    .iter()
+                    .any(|e| e.contains("ev=log-replaced head="));
+                assert_eq!(
+                    moved,
+                    lost != Lost::NextLogs,
+                    "{case}: a lost witness's attach judges the move from the log `acked` names"
+                );
+            }
+            let (forged, _) = reader
+                .publish(bridge.producer_id ^ 1, 1, &own_lane, b"v=1 t=1 text=forged")
+                .unwrap();
+            assert!(
+                forged < 40,
+                "{case}: PRECONDITION: another log's record @{forged} lies below the old floor"
+            );
+            bridge.on_inbox_record(
+                &(forged, own_lane.clone(), b"v=1 t=1 text=forged".to_vec()),
+                None,
+            );
+            bridge.settle_acks();
+            let (accused, delivered) = forged_verdict(&lane, &mut reader, forged);
+            assert_eq!(
+                (accused, delivered),
+                (!control, control),
+                "{case}: the record forged on another log @{forged}: accused {accused}, \
+                 delivered {delivered}; floor {floor:?} (the old log's {old_floor:?})"
+            );
+        } else {
+            assert_eq!(
+                (floor, on_disk.log),
+                (old_floor, Some(first_log)),
+                "{case}: on the same log a lost witness alone keeps the window"
+            );
+            bridge.on_inbox_record(&(own, own_lane.clone(), own_body), None);
+            bridge.settle_acks();
+            let (accused, _) = forged_verdict(&lane, &mut reader, own);
+            assert!(
+                !accused,
+                "{case}: the node's own earlier record @{own} is not accused"
+            );
+        }
+        bridge.close_subscriptions();
+    }
+}
+
 /// **AN ANSWER READ AFTER A LANDED POST IS TIMED TO ITS READ** (E07 review): a pass reads a
 /// post's ack, which waits for its group, then another answer, whose conclusion settles the
 /// group first (`Bridge::settled`). That settle's `outbox sent` takes thirty seconds on a
@@ -5797,11 +6411,11 @@ fn a_lost_or_unreadable_acked_file_accuses_nothing_it_cannot_judge() {
 #[cfg(unix)]
 #[test]
 fn an_answer_read_after_a_landed_post_is_timed_to_its_read_not_past_the_posts_settle() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     bridge.fx = Fx::os().on_a_held_clock();
     let clock = bridge.fx.clone();
     lane.on_first_retire(move || clock.advance(Duration::from_secs(30)));
-    let post = parse_drain(b"post sid=s-a id=1 to=@s-b kind=note len=4\nonce")
+    let post = parse_drain(b"post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nonce")
         .posts
         .remove(0);
     let pin = PublishPin {
@@ -5813,7 +6427,7 @@ fn an_answer_read_after_a_landed_post_is_timed_to_its_read_not_past_the_posts_se
         owner: Some(1),
         at: None,
     };
-    let subject = format!("/f/f/in/{0}/s-b/{0}/note", bridge.node);
+    let subject = format!("/f/f/in/{0}/tb000000000/{0}/note", bridge.node);
     bridge.landings.push(Landing {
         of: Outboxed::Post(post),
         subject,
@@ -5841,7 +6455,7 @@ fn an_answer_read_after_a_landed_post_is_timed_to_its_read_not_past_the_posts_se
     bridge.grouping = false;
     assert_eq!(
         lane.sent.lock().unwrap().as_slice(),
-        ["outbox sent s-a 1 off=4"],
+        ["outbox sent ta000000000 1 off=4"],
         "the landed post settled ahead of the answer's conclusion"
     );
     assert_eq!(
@@ -5877,19 +6491,19 @@ fn a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once()
         (false, Some(0)),
     ] {
         let case = format!("hold={hold} at={at:?}");
-        let sessions = [(1, "s-a"), (2, "s-b")];
+        let sessions = [(1, "ta000000000"), (2, "tb000000000")];
         let (lane, mut first) = FakeVerbLane::bridge(&sessions);
         let state = first.state.root().to_path_buf();
         let (a, _broker_a, _server_a) = serve_log(&lane, "replay-a");
         first.cfg.broker = a.clone();
         assert!(first.attach_broker(), "{case}: boot's first attach");
         lane.refuse_retirements(true);
-        let post = "post sid=s-a id=1 to=@s-b kind=note len=4\nonce".to_string();
+        let post = "post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nonce".to_string();
         *lane.outbox.lock().unwrap() = Some(post.clone());
         first.drain_outbox();
         let pin = first
             .state
-            .post_pin("s-a", 1)
+            .post_pin("ta000000000", 1)
             .unwrap()
             .expect("the post's pin stays with its retirement refused");
         let face = pin.identity.as_ref().unwrap().subject.clone();
@@ -5924,9 +6538,9 @@ fn a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once()
         let requests = second.requests.lock().unwrap().clone();
         let retired = requests
             .iter()
-            .position(|l| l.starts_with("outbox sent s-a 1 "));
+            .position(|l| l.starts_with("outbox sent ta000000000 1 "));
         let delivered = requests.iter().position(|l| {
-            l.starts_with("deliver s-b ")
+            l.starts_with("deliver tb000000000 ")
                 && l.split_whitespace().any(|w| w == format!("off={on_a}"))
         });
         assert_eq!(
@@ -5950,7 +6564,7 @@ fn a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once()
         bridge.drain_outbox();
         let (mut writer, _) = bridge.connect().unwrap();
         let sentinel_face = format!(
-            "/f/{}/in/{}/s-b/h-writer/note",
+            "/f/{}/in/{}/tb000000000/h-writer/note",
             bridge.cfg.fleet, bridge.node
         );
         let (sentinel, _) = writer
@@ -6012,7 +6626,7 @@ fn a_replayed_record_waits_for_its_posts_retirement_so_a_move_delivers_it_once()
 fn a_record_held_below_its_subjects_oldest_is_read_back_and_not_published_again() {
     use crate::broker_rules::{EV_FILTER, MAIL_FILTER};
     use astream_broker::{Retention, Rule};
-    let sessions = [(1, "s-a"), (2, "s-b")];
+    let sessions = [(1, "ta000000000"), (2, "tb000000000")];
     let (lane, mut first) = FakeVerbLane::bridge(&sessions);
     let state = first.state.root().to_path_buf();
     let (a, broker, _server) = serve_log(&lane, "held-oldest");
@@ -6023,7 +6637,7 @@ fn a_record_held_below_its_subjects_oldest_is_read_back_and_not_published_again(
     let rules = |first: bool| {
         let mut classes = vec![Rule::prefix(EV_FILTER).unwrap()];
         if first {
-            classes.push(Rule::hold("/f/*/in/*/s-z/>").unwrap().last_only());
+            classes.push(Rule::hold("/f/*/in/*/tz000000000/>").unwrap().last_only());
         }
         classes.push(Rule::hold(MAIL_FILTER).unwrap());
         Retention::new(classes, Rule::default_keeping_all()).unwrap()
@@ -6032,12 +6646,12 @@ fn a_record_held_below_its_subjects_oldest_is_read_back_and_not_published_again(
     first.cfg.broker = a.clone();
     assert!(first.attach_broker(), "the first attach");
     lane.refuse_retirements(true);
-    let post = "post sid=s-a id=1 to=@s-b kind=note len=4\nonce".to_string();
+    let post = "post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nonce".to_string();
     *lane.outbox.lock().unwrap() = Some(post.clone());
     first.drain_outbox();
     let pin = first
         .state
-        .post_pin("s-a", 1)
+        .post_pin("ta000000000", 1)
         .unwrap()
         .expect("the post's pin stays with its retirement refused");
     let face = pin.identity.as_ref().unwrap().subject.clone();
@@ -6129,7 +6743,7 @@ fn a_dedup_whose_record_a_cut_carried_below_its_oldest_since_the_answer_is_not_s
     let rules = lanes_whole_from_the_base;
     for arm in ["told", "control", "capped"] {
         let (control, capped) = (arm == "control", arm == "capped");
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
         let (a, broker, _server) = serve_log(&lane, "dedup-cut");
         let broker = Arc::new(broker);
         broker.set_retention_interval(Duration::from_secs(3600));
@@ -6140,9 +6754,9 @@ fn a_dedup_whose_record_a_cut_carried_below_its_oldest_since_the_answer_is_not_s
             bridge.fx = crate::fx::Fx::os_without(crate::sim::world::Mutant::ReadAtWithoutTheHeld);
         }
         let node = bridge.node.clone();
-        let face = format!("/f/f/in/{node}/s-b/{node}/note");
+        let face = format!("/f/f/in/{node}/tb000000000/{node}/note");
         let mut body = Body::new(1);
-        body.from = Some("s-a".into());
+        body.from = Some("ta000000000".into());
         body.text = "once".into();
         let encoded = body.encode();
         let identity = publication_identity(&face, &encoded);
@@ -6234,20 +6848,20 @@ fn a_dedup_whose_record_a_cut_carried_below_its_oldest_since_the_answer_is_not_s
 }
 
 /// **A SENDER'S EARLIER POST OF THE SAME WORDS, PUBLISHED AGAIN BY THE REPLAY ABOVE ITS NEXT
-/// POST'S HEAD, IS NEVER TAKEN FOR THAT POST** (aterm-link B05 review). `s-a` posts `ok` to
-/// `s-b` twice. Post 1 lands and is retired, but its record in flight stands (a clear the
+/// POST'S HEAD, IS NEVER TAKEN FOR THAT POST** (aterm-link B05 review). `ta000000000` posts `ok` to
+/// `tb000000000` twice. Post 1 lands and is retired, but its record in flight stands (a clear the
 /// disk refused); post 2 is reserved and journaled at the head past post 1, and the bridge
 /// stops before it publishes. Retention gives up post 1's unread copy. The next attach's
 /// replay finds nothing of post 1 and publishes it again, above post 2's head, and claims
 /// it ([`Bridge::claims`]); post 2's read back skips that copy, finds none of its own, and
-/// publishes post 2, and the drain's retry settles post 2 where it landed: `s-b` is handed
+/// publishes post 2, and the drain's retry settles post 2 where it landed: `tb000000000` is handed
 /// `ok` twice, once a post. CONTROL (`read_back_past_claims`): the read back takes post 1's
 /// copy for post 2, which never reaches the bus.
 #[cfg(unix)]
 #[test]
 fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_the_same_words() {
     for control in [false, true] {
-        let sessions = [(1, "s-a"), (2, "s-b")];
+        let sessions = [(1, "ta000000000"), (2, "tb000000000")];
         let (lane, mut first) = FakeVerbLane::bridge(&sessions);
         let state = first.state.root().to_path_buf();
         let (a, broker, _server) = serve_log(&lane, "same-words");
@@ -6256,12 +6870,13 @@ fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_th
         assert!(first.attach_broker(), "the first attach");
         lane.refuse_retirements(true);
         lane.retire_from_outbox();
-        let post = |id: u64| format!("post sid=s-a id={id} to=@s-b kind=note len=2\nok");
+        let post =
+            |id: u64| format!("post sid=ta000000000 id={id} to=@tb000000000 kind=note len=2\nok");
         *lane.outbox.lock().unwrap() = Some(post(1));
         first.drain_outbox();
         let pin = first
             .state
-            .post_pin("s-a", 1)
+            .post_pin("ta000000000", 1)
             .unwrap()
             .expect("post 1's pin stays with its retirement refused");
         let face = pin.identity.as_ref().unwrap().subject.clone();
@@ -6286,7 +6901,7 @@ fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_th
         first.drain_outbox();
         first.state.refuse_writes_of(None);
         assert_eq!(
-            first.state.post_pin("s-a", 1).unwrap(),
+            first.state.post_pin("ta000000000", 1).unwrap(),
             None,
             "post 1 retired"
         );
@@ -6301,7 +6916,7 @@ fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_th
             at: Some(on_bus + 1),
             ..pin.clone()
         };
-        first.state.set_post_pin("s-a", 2, &next).unwrap();
+        first.state.set_post_pin("ta000000000", 2, &next).unwrap();
         first
             .state
             .set_in_flight(&entry(&next, on_bus + 1))
@@ -6342,7 +6957,7 @@ fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_th
             .lock()
             .unwrap()
             .iter()
-            .filter(|l| l.starts_with("outbox sent s-a 2 "))
+            .filter(|l| l.starts_with("outbox sent ta000000000 2 "))
             .cloned()
             .collect();
         assert_eq!(
@@ -6375,7 +6990,7 @@ fn a_senders_earlier_post_published_again_is_never_taken_for_its_next_post_of_th
 
 #[test]
 fn a_key_winner_republished_on_another_log_does_not_become_a_later_ask() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     const KEY: &str = "k-log";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let (a, _broker_a, _server_a) = serve_log(&lane, "key-a");
@@ -6481,7 +7096,7 @@ fn a_key_winner_republished_on_another_log_does_not_become_a_later_ask() {
 fn keyed_reposts_keep_the_winner_and_reconcile_a_retained_away_winner_before_retirement() {
     use std::os::unix::fs::PermissionsExt as _;
     for same in [false, true] {
-        let (initial_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
+        let (initial_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "th0st000000")]);
         let state = bridge.state.root().to_path_buf();
         let socket = initial_lane.dir.path().join("broker.sock");
         let broker = crate::test_broker(initial_lane.dir.path().join("broker.log")).unwrap();
@@ -6491,7 +7106,7 @@ fn keyed_reposts_keep_the_winner_and_reconcile_a_retained_away_winner_before_ret
         let recovered;
         let lane = if same {
             let mut original = Body::new(0);
-            original.from = Some("s-host".into());
+            original.from = Some("th0st000000".into());
             original.dl = Some(30_000);
             original.text = "original".into();
             let face = format!("/f/f/in/p/h-a/{}/ask", bridge.node);
@@ -6504,9 +7119,13 @@ fn keyed_reposts_keep_the_winner_and_reconcile_a_retained_away_winner_before_ret
                 owner: Some(1),
                 at: None,
             };
-            bridge.state.set_key_pin("s-host", "k-first", &key).unwrap();
+            bridge
+                .state
+                .set_key_pin("th0st000000", "k-first", &key)
+                .unwrap();
             drop(bridge);
-            (recovered, bridge) = FakeVerbLane::bridge_with_state(&[(1, "s-host")], Some(&state));
+            (recovered, bridge) =
+                FakeVerbLane::bridge_with_state(&[(1, "th0st000000")], Some(&state));
             bridge.cfg.broker = socket.to_string_lossy().into_owned();
             bridge.conn = Some(bridge.connect().unwrap().0.into());
             &recovered
@@ -6515,7 +7134,7 @@ fn keyed_reposts_keep_the_winner_and_reconcile_a_retained_away_winner_before_ret
         };
         let queue = |lane: &FakeVerbLane, id: u64, to: &str, kind: &str, text: &str| {
             *lane.outbox.lock().unwrap() = Some(format!(
-                "post sid=s-host id={id} to={to} kind={kind} key=k-first dl=30000 len={}\n{text}",
+                "post sid=th0st000000 id={id} to={to} kind={kind} key=k-first dl=30000 len={}\n{text}",
                 text.len()
             ));
         };
@@ -6528,7 +7147,11 @@ fn keyed_reposts_keep_the_winner_and_reconcile_a_retained_away_winner_before_ret
         );
         bridge.drain_outbox();
         assert_eq!(lane.sent.lock().unwrap().len(), 1);
-        let first = bridge.state.key_pin("s-host", "k-first").unwrap().unwrap();
+        let first = bridge
+            .state
+            .key_pin("th0st000000", "k-first")
+            .unwrap()
+            .unwrap();
         let first_off = lane.sent.lock().unwrap()[0]
             .split_whitespace()
             .find_map(|word| word.strip_prefix("off="))
@@ -6548,7 +7171,7 @@ fn keyed_reposts_keep_the_winner_and_reconcile_a_retained_away_winner_before_ret
         assert_eq!(
             bridge
                 .state
-                .key_pin("s-host", "k-first")
+                .key_pin("th0st000000", "k-first")
                 .unwrap()
                 .unwrap()
                 .identity,
@@ -6572,12 +7195,13 @@ fn keyed_reposts_keep_the_winner_and_reconcile_a_retained_away_winner_before_ret
             2,
             "no retirement before durable reconciliation"
         );
-        let pending = bridge.state.post_pin("s-host", 3).unwrap().unwrap();
+        let pending = bridge.state.post_pin("th0st000000", 3).unwrap().unwrap();
         assert_eq!(pending.identity == pending.original, same);
         assert_eq!(pending.original_off, Some(first_off));
         drop(bridge);
 
-        let (second, mut bridge) = FakeVerbLane::bridge_with_state(&[(1, "s-host")], Some(&state));
+        let (second, mut bridge) =
+            FakeVerbLane::bridge_with_state(&[(1, "th0st000000")], Some(&state));
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         bridge.conn = Some(bridge.connect().unwrap().0.into());
         queue(&second, 3, target, "ask", text);
@@ -6602,7 +7226,7 @@ fn keyed_reposts_keep_the_winner_and_reconcile_a_retained_away_winner_before_ret
         assert_eq!(
             bridge
                 .state
-                .key_pin("s-host", "k-first")
+                .key_pin("th0st000000", "k-first")
                 .unwrap()
                 .unwrap()
                 .identity,
@@ -6635,7 +7259,7 @@ fn keyed_reposts_keep_the_winner_and_reconcile_a_retained_away_winner_before_ret
 #[test]
 fn a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner() {
     for (rule, replay) in [(true, false), (false, false), (true, true), (false, true)] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "th0st000000")]);
         if !rule {
             bridge.fx =
                 crate::fx::Fx::os_without(crate::sim::world::Mutant::KeyedRepostWithoutReadingBack);
@@ -6649,7 +7273,7 @@ fn a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner() 
         bridge.conn = Some(bridge.connect().unwrap().0.into());
         let queue = |id: u64, text: &str| {
             *lane.outbox.lock().unwrap() = Some(format!(
-                "post sid=s-host id={id} to=h-a kind=note key=k len={}\n{text}",
+                "post sid=th0st000000 id={id} to=h-a kind=note key=k len={}\n{text}",
                 text.len()
             ));
         };
@@ -6665,7 +7289,7 @@ fn a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner() 
         broker.retain_before_carrying_state(winner + 1).unwrap();
         let face = bridge
             .state
-            .key_pin("s-host", "k")
+            .key_pin("th0st000000", "k")
             .unwrap()
             .unwrap()
             .identity
@@ -6686,9 +7310,9 @@ fn a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner() 
         if replay {
             // The re-post's pin as its drain makes it, and its entry, journaled before a
             // publish whose answer a kill lost.
-            let keyed = bridge.state.key_pin("s-host", "k").unwrap().unwrap();
+            let keyed = bridge.state.key_pin("th0st000000", "k").unwrap().unwrap();
             let mut body = Body::new(1);
-            body.from = Some("s-host".to_string());
+            body.from = Some("th0st000000".to_string());
             body.text = "again".to_string();
             let encoded = body.encode();
             let pin = PublishPin {
@@ -6705,7 +7329,7 @@ fn a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner() 
                 Some(winner),
                 "PRECONDITION: the winner's offset"
             );
-            bridge.state.set_post_pin("s-host", 2, &pin).unwrap();
+            bridge.state.set_post_pin("th0st000000", 2, &pin).unwrap();
             bridge
                 .state
                 .set_in_flight(&InFlight {
@@ -6759,7 +7383,7 @@ fn a_keyed_repost_past_a_cut_that_carried_its_winner_is_retired_at_the_winner() 
 #[test]
 fn a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy() {
     for kind in ["note", "ask"] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "th0st000000")]);
         let socket = lane.dir.path().join("broker.sock");
         let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
         broker.set_retention_interval(Duration::from_secs(3600));
@@ -6770,7 +7394,7 @@ fn a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy() 
         let queue = |id: u64, kind: &str, text: &str| {
             let dl = if kind == "ask" { " dl=30000" } else { "" };
             *lane.outbox.lock().unwrap() = Some(format!(
-                "post sid=s-host id={id} to=h-a kind={kind}{dl} key=k len={}\n{text}",
+                "post sid=th0st000000 id={id} to=h-a kind={kind}{dl} key=k len={}\n{text}",
                 text.len()
             ));
         };
@@ -6784,7 +7408,7 @@ fn a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy() 
         bridge.drain_outbox();
         let winner = off_of(&lane.sent.lock().unwrap()[0]);
         broker.retain_before_carrying_state(winner + 1).unwrap();
-        let keyed = bridge.state.key_pin("s-host", "k").unwrap().unwrap();
+        let keyed = bridge.state.key_pin("th0st000000", "k").unwrap().unwrap();
         let winner_face = keyed.identity.clone().unwrap().subject;
         let face = format!(
             "{}/{kind}",
@@ -6792,7 +7416,7 @@ fn a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy() 
         );
         // The older build's re-post: pinned at its key's sequence, journaled, published.
         let mut body = Body::new(1);
-        body.from = Some("s-host".to_string());
+        body.from = Some("th0st000000".to_string());
         body.dl = (kind == "ask").then_some(30_000);
         body.text = "again".to_string();
         let encoded = body.encode();
@@ -6810,7 +7434,7 @@ fn a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy() 
             Some(winner),
             "PRECONDITION: the winner's offset"
         );
-        bridge.state.set_post_pin("s-host", 2, &pin).unwrap();
+        bridge.state.set_post_pin("th0st000000", 2, &pin).unwrap();
         // The entry names its log and head, as every build since read backs journals them.
         let log = bridge.read_log_identity().unwrap();
         assert_eq!(log, Some(broker.log_identity()), "PRECONDITION: its log");
@@ -6838,7 +7462,7 @@ fn a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy() 
             "{kind}: the re-post is retired at its own copy @{own}, not at its key's winner \
              @{winner}: {retired}"
         );
-        let moved = bridge.state.key_pin("s-host", "k").unwrap().unwrap();
+        let moved = bridge.state.key_pin("th0st000000", "k").unwrap().unwrap();
         assert_eq!(
             (moved.original_off, moved.owner),
             (Some(own), Some(2)),
@@ -6856,8 +7480,8 @@ fn a_keyed_repost_whose_own_copy_the_replay_read_back_is_retired_at_that_copy() 
 
 #[test]
 fn a_broadcast_with_no_topics_advances_the_head_without_decoding_its_body() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
-    let subject = "/f/f/pub/n-src/s-src/say/quiet".to_string();
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
+    let subject = "/f/f/pub/n-src/tsrc0000000/say/quiet".to_string();
     bridge.say_drained_to = 5;
     bridge.say_bus_head = 5;
     let decoded = crate::body::decode_calls();
@@ -6869,21 +7493,21 @@ fn a_broadcast_with_no_topics_advances_the_head_without_decoding_its_body() {
     assert!(lane.delivery_offsets().is_empty());
 
     bridge.per_sid.topics.insert(
-        "s-a".to_string(),
+        "ta000000000".to_string(),
         BTreeMap::from([("quiet".to_string(), TopicCursor { next: 6 })]),
     );
     bridge.on_say_record(&(6, subject, Body::new(0).encode()));
     assert_eq!(crate::body::decode_calls(), decoded + 1);
     assert_eq!(lane.delivery_offsets(), [6]);
-    assert_eq!(bridge.per_sid.topics["s-a"]["quiet"].next, 7);
+    assert_eq!(bridge.per_sid.topics["ta000000000"]["quiet"].next, 7);
 }
 
 #[test]
 fn a_refused_broadcast_is_read_past_by_every_cursor_at_the_frontier() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     bridge.say_drained_to = 5;
     bridge.say_bus_head = 5;
-    for sid in ["s-a", "s-b"] {
+    for sid in ["ta000000000", "tb000000000"] {
         bridge.per_sid.topics.insert(
             sid.to_string(),
             BTreeMap::from([("news".to_string(), TopicCursor { next: 5 })]),
@@ -6892,13 +7516,13 @@ fn a_refused_broadcast_is_read_past_by_every_cursor_at_the_frontier() {
     let mut relayed = Body::new(0);
     relayed.via = Some("notaprincipal".to_string());
     let refused = [
-        (5, "/f/f/pub/n-x/s-1/say/news/x", Body::new(0)),
-        (6, "/f/f/pub/n-x/s-1/say/NEWS", Body::new(0)),
-        (7, "/f/f/pub/n-x/s-1/say/news", relayed),
+        (5, "/f/f/pub/n-x/t0000000001/say/news/x", Body::new(0)),
+        (6, "/f/f/pub/n-x/t0000000001/say/NEWS", Body::new(0)),
+        (7, "/f/f/pub/n-x/t0000000001/say/news", relayed),
     ];
     for (off, subject, body) in refused {
         bridge.on_say_record(&(off, subject.to_string(), body.encode()));
-        for sid in ["s-a", "s-b"] {
+        for sid in ["ta000000000", "tb000000000"] {
             assert_eq!(
                 bridge.per_sid.topics[sid]["news"].next,
                 off + 1,
@@ -6908,10 +7532,10 @@ fn a_refused_broadcast_is_read_past_by_every_cursor_at_the_frontier() {
     }
     assert!(lane.delivery_offsets().is_empty());
 
-    let live = "/f/f/pub/n-x/s-1/say/news".to_string();
+    let live = "/f/f/pub/n-x/t0000000001/say/news".to_string();
     bridge.on_say_record(&(8, live, Body::new(0).encode()));
     assert_eq!(lane.transcript(), ["deliver 8", "deliver 8"]);
-    for sid in ["s-a", "s-b"] {
+    for sid in ["ta000000000", "tb000000000"] {
         assert_eq!(bridge.per_sid.topics[sid]["news"].next, 9);
     }
 }
@@ -6919,7 +7543,7 @@ fn a_refused_broadcast_is_read_past_by_every_cursor_at_the_frontier() {
 #[cfg(unix)]
 #[test]
 fn a_catch_up_page_walks_one_topic_past_every_other_topics_traffic() {
-    const SID: &str = "s-late";
+    const SID: &str = "t1ate000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
@@ -6931,7 +7555,7 @@ fn a_catch_up_page_walks_one_topic_past_every_other_topics_traffic() {
     let (mut god, _) = bridge.connect().unwrap();
     let note = Body::new(0).encode();
     let mut publish = |producer: u64, topic: &str, n: usize| -> Vec<u64> {
-        let subject = format!("/f/f/pub/n-x/s-p{producer}/say/{topic}");
+        let subject = format!("/f/f/pub/n-x/tp{producer:09}/say/{topic}");
         let bodies = vec![note.as_slice(); n];
         god.publish_pipelined(producer, &subject, &bodies, 64)
             .unwrap()
@@ -6980,7 +7604,7 @@ fn a_catch_up_page_walks_one_topic_past_every_other_topics_traffic() {
 #[cfg(unix)]
 #[test]
 fn a_live_record_does_not_cancel_a_backlog_still_owed() {
-    const SID: &str = "s-late";
+    const SID: &str = "t1ate000000";
     const PAGE: usize = 8;
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     bridge.say_replay.page = u32::try_from(PAGE).expect("a small page");
@@ -6993,7 +7617,7 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
 
     let (mut god, _) = bridge.connect().unwrap();
     let note = Body::new(0).encode();
-    let old = "/f/f/pub/n-x/s-old/say/deep";
+    let old = "/f/f/pub/n-x/tpmd0000000/say/deep";
     let bodies = vec![note.as_slice(); SAY_REPLAY_PAGES * PAGE + 1];
     let backlog: Vec<u64> = god
         .publish_pipelined(1, old, &bodies, 64)
@@ -7011,7 +7635,7 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
         SID.to_string(),
         BTreeMap::from([("deep".to_string(), TopicCursor { next: backlog[0] })]),
     );
-    let shout = "/f/f/pub/n-y/s-live/say/deep";
+    let shout = "/f/f/pub/n-y/t11ve000000/say/deep";
     let delivered =
         |offs: &[u64]| -> Vec<String> { offs.iter().map(|off| format!("deliver {off}")).collect() };
     let round = |bridge: &mut Bridge| {
@@ -7063,37 +7687,37 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
 
 #[test]
 fn a_remote_node_cannot_speak_for_a_local_session() {
-    let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-mgr")]);
+    let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tmgr0000000")]);
     bridge
         .per_sid
         .epochs
-        .insert("s-w".to_string(), "e".to_string());
+        .insert("tw000000000".to_string(), "e".to_string());
     let local = bridge.node.clone();
     let addr = |src: &str, kind: WakeClass| subject::InAddr {
         node: local.clone(),
-        sid: "s-mgr".to_string(),
+        sid: "tmgr0000000".to_string(),
         src: src.to_string(),
         kind,
     };
     let mut body = Body::new(0);
-    body.from = Some("s-w".to_string());
+    body.from = Some("tw000000000".to_string());
     assert_eq!(
         bridge.render_from(&addr(&local, WakeClass::Report), &body),
-        format!("s-w@{local}")
+        format!("tw000000000@{local}")
     );
     assert_eq!(
         bridge.render_from(&addr("n-evil", WakeClass::Report), &body),
         "n-evil"
     );
-    body.from = Some("s-far".to_string());
+    body.from = Some("tfar0000000".to_string());
     assert_eq!(
         bridge.render_from(&addr("n-far", WakeClass::Report), &body),
-        "s-far@n-far"
+        "tfar0000000@n-far"
     );
-    bridge.state.pin("s-far", "n-far").expect("pin");
+    bridge.state.pin("tfar0000000", "n-far").expect("pin");
     assert_eq!(
         bridge.render_from(&addr("n-far", WakeClass::Report), &body),
-        "s-far@n-far"
+        "tfar0000000@n-far"
     );
     assert_eq!(
         bridge.render_from(&addr("n-evil", WakeClass::Report), &body),
@@ -7129,13 +7753,13 @@ fn delivered_in_every_cell(bridge: &mut Bridge) -> Vec<(DemotionCell, Delivered)
             };
             let addr = subject::InAddr {
                 node: node.clone(),
-                sid: "s-mgr".to_string(),
+                sid: "tmgr0000000".to_string(),
                 src,
                 kind: claimed,
             };
             let mut body = Body::new(0);
             body.re = Some(91);
-            body.via = relayed.then(|| "s-inner".to_string());
+            body.via = relayed.then(|| "t1nner00000".to_string());
             let delivered = bridge.classify_delivery(&addr, &body);
             cells.push(((claimed, accepted, relayed, stray), delivered));
         }
@@ -7191,7 +7815,7 @@ fn relayed_cells_not_a_note(cells: &[(DemotionCell, Delivered)]) -> Vec<Demotion
 /// relayed `control`, delivered as a control.
 #[test]
 fn classify_delivery_is_astreams_sender_demotion_in_every_cell() {
-    let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-mgr")]);
+    let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tmgr0000000")]);
     let cells = delivered_in_every_cell(&mut bridge);
     assert_eq!(cells.len(), WakeClass::ALL.len() * 8);
     assert_eq!(cells_off_astreams_demotion(&cells), []);
@@ -7274,18 +7898,24 @@ fn seeded_broker(
 #[cfg(unix)]
 #[test]
 fn a_new_lane_past_the_subject_budget_is_retired_and_the_queue_behind_it_lands() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
-    let task_lane = format!("/f/f/in/{0}/s-b/{0}/task", bridge.node);
-    let ask_lane = format!("/f/f/in/{0}/s-b/{0}/ask", bridge.node);
+    let task_lane = format!("/f/f/in/{0}/tb000000000/{0}/task", bridge.node);
+    let ask_lane = format!("/f/f/in/{0}/tb000000000/{0}/ask", bridge.node);
     let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
-    let (_broker, _server) = seeded_broker(&lane, &mut bridge, &["s-a", "s-b"], &[task_lane], max);
+    let (_broker, _server) = seeded_broker(
+        &lane,
+        &mut bridge,
+        &["ta000000000", "tb000000000"],
+        &[task_lane],
+        max,
+    );
     bridge.indexed_subjects.insert(ask_lane.clone());
     *lane.outbox.lock().unwrap() = Some(
-        "post sid=s-a id=1 to=@s-b kind=note len=5\nfirst\
-         post sid=s-a id=2 to=@s-b kind=ask len=5\nstale\
-         post sid=s-a id=3 to=@s-b kind=task len=6\nsecond\
-         receipt sid=s-b rid=1 off=3 verdict=handled kind=ask from=s-a\n"
+        "post sid=ta000000000 id=1 to=@tb000000000 kind=note len=5\nfirst\
+         post sid=ta000000000 id=2 to=@tb000000000 kind=ask len=5\nstale\
+         post sid=ta000000000 id=3 to=@tb000000000 kind=task len=6\nsecond\
+         receipt sid=tb000000000 rid=1 off=3 verdict=handled kind=ask from=ta000000000\n"
             .to_string(),
     );
     bridge.drain_outbox();
@@ -7293,7 +7923,7 @@ fn a_new_lane_past_the_subject_budget_is_retired_and_the_queue_behind_it_lands()
     for refused in [1, 2] {
         assert!(
             sent.contains(&format!(
-                "outbox sent s-a {refused} off=- reason=subject-budget"
+                "outbox sent ta000000000 {refused} off=- reason=subject-budget"
             )),
             "post {refused}: {sent:#?}"
         );
@@ -7304,7 +7934,7 @@ fn a_new_lane_past_the_subject_budget_is_retired_and_the_queue_behind_it_lands()
     );
     assert!(
         sent.iter()
-            .any(|l| l.starts_with("outbox sent s-a 3 off=") && !l.contains("off=-")),
+            .any(|l| l.starts_with("outbox sent ta000000000 3 off=") && !l.contains("off=-")),
         "the task behind the refused posts did not land: {sent:#?}"
     );
     let (mut reader, _) = bridge.connect().unwrap();
@@ -7318,10 +7948,13 @@ fn a_new_lane_past_the_subject_budget_is_retired_and_the_queue_behind_it_lands()
     assert!(
         node_ev
             .iter()
-            .any(|e| e.contains("ev=undeliverable to=@s-b reason=subject-budget")),
+            .any(|e| e.contains("ev=undeliverable to=@tb000000000 reason=subject-budget")),
         "{node_ev:#?}"
     );
-    let b_ev = ev_of(&mut reader, format!("/f/f/pub/{}/s-b/ev", bridge.node));
+    let b_ev = ev_of(
+        &mut reader,
+        format!("/f/f/pub/{}/tb000000000/ev", bridge.node),
+    );
     assert!(
         b_ev.iter()
             .any(|e| e.contains("unacked re=3 verdict=handled reason=subject-budget")),
@@ -7332,31 +7965,34 @@ fn a_new_lane_past_the_subject_budget_is_retired_and_the_queue_behind_it_lands()
 #[cfg(unix)]
 #[test]
 fn a_broadcast_opens_a_subject_only_above_the_reserve() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
-    let known = format!("/f/f/pub/{}/s-a/say/known", bridge.node);
+    let known = format!("/f/f/pub/{}/ta000000000/say/known", bridge.node);
     let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
     let held = max - max / SAY_RESERVE_DIVISOR;
     let (_broker, _server) = seeded_broker(
         &lane,
         &mut bridge,
-        &["s-a", "s-b"],
+        &["ta000000000", "tb000000000"],
         std::slice::from_ref(&known),
         held,
     );
     *lane.outbox.lock().unwrap() = Some(
-        "post sid=s-a id=1 to=say:fresh kind=note len=3\nnew\
-         post sid=s-a id=2 to=say:known kind=note len=3\nold\
-         post sid=s-b id=1 to=@s-a kind=note len=4\nmail"
+        "post sid=ta000000000 id=1 to=say:fresh kind=note len=3\nnew\
+         post sid=ta000000000 id=2 to=say:known kind=note len=3\nold\
+         post sid=tb000000000 id=1 to=@ta000000000 kind=note len=4\nmail"
             .to_string(),
     );
     bridge.drain_outbox();
     let sent = lane.sent.lock().unwrap().clone();
     assert!(
-        sent.contains(&"outbox sent s-a 1 off=- reason=subject-budget".to_string()),
+        sent.contains(&"outbox sent ta000000000 1 off=- reason=subject-budget".to_string()),
         "{sent:#?}"
     );
-    for landed in ["outbox sent s-a 2 off=", "outbox sent s-b 1 off="] {
+    for landed in [
+        "outbox sent ta000000000 2 off=",
+        "outbox sent tb000000000 1 off=",
+    ] {
         assert!(
             sent.iter()
                 .any(|l| l.starts_with(landed) && !l.contains("off=-")),
@@ -7364,7 +8000,7 @@ fn a_broadcast_opens_a_subject_only_above_the_reserve() {
         );
     }
     let (mut reader, _) = bridge.connect().unwrap();
-    let fresh = format!("/f/f/pub/{}/s-a/say/fresh", bridge.node);
+    let fresh = format!("/f/f/pub/{}/ta000000000/say/fresh", bridge.node);
     assert!(
         reader.fetch(0, &fresh, 8).unwrap().0.is_empty(),
         "nothing spent"
@@ -7376,7 +8012,7 @@ fn a_broadcast_opens_a_subject_only_above_the_reserve() {
     assert_eq!(budget.subjects, held + 1, "only the directed lane opened");
 }
 
-/// A drain of `s-a`'s notes to each of `to` on `lane`, their post ids from `first` on: what
+/// A drain of `ta000000000`'s notes to each of `to` on `lane`, their post ids from `first` on: what
 /// came of each, in order (`true` landed, `false` retired at the subject budget's door),
 /// and the `subject_budget` requests the drain made.
 #[cfg(unix)]
@@ -7390,14 +8026,14 @@ fn budget_drain(
     let listing: String = to
         .iter()
         .zip(first..)
-        .map(|(sid, id)| format!("post sid=s-a id={id} to=@{sid} kind=note len=1\nn"))
+        .map(|(sid, id)| format!("post sid=ta000000000 id={id} to=@{sid} kind=note len=1\nn"))
         .collect();
     *lane.outbox.lock().unwrap() = Some(listing);
     bridge.drain_outbox();
     let sent = lane.sent.lock().unwrap()[sent_before..].to_vec();
     let landed = (first..first + to.len() as u64)
         .map(|id| {
-            let head = format!("outbox sent s-a {id} off=");
+            let head = format!("outbox sent ta000000000 {id} off=");
             let line = sent
                 .iter()
                 .find(|l| l.starts_with(&head))
@@ -7424,9 +8060,20 @@ fn budget_world(
     astream_broker::Broker,
     astream_broker::BrokerHandle,
 ) {
-    const SIDS: [&str; 5] = ["s-a", "s-b", "s-c", "s-d", "s-e"];
-    let (lane, mut bridge) =
-        FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-c"), (4, "s-d"), (5, "s-e")]);
+    const SIDS: [&str; 5] = [
+        "ta000000000",
+        "tb000000000",
+        "tc000000000",
+        "td000000000",
+        "te000000000",
+    ];
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[
+        (1, "ta000000000"),
+        (2, "tb000000000"),
+        (3, "tc000000000"),
+        (4, "td000000000"),
+        (5, "te000000000"),
+    ]);
     bridge.fx = crate::fx::Fx::os_without_each(off);
     assert!(bridge.refresh_sessions().is_ok());
     let (broker, server) = seeded_broker(&lane, &mut bridge, &SIDS, &[], held);
@@ -7453,7 +8100,7 @@ fn held_leaving(room: u64) -> u64 {
 fn a_drain_reads_the_subject_budget_once_for_every_fresh_lane_it_opens() {
     use crate::sim::world::Mutant;
     use crate::wait_tally::{Row, Tally, FILE};
-    let lanes = ["s-b", "s-c", "s-d", "s-e"];
+    let lanes = ["tb000000000", "tc000000000", "td000000000", "te000000000"];
     for (off, reads) in [
         (&[][..], 1),
         (&[Mutant::BudgetReadPerSubject][..], lanes.len() as u64),
@@ -7486,7 +8133,7 @@ fn a_drain_reads_the_subject_budget_once_for_every_fresh_lane_it_opens() {
 #[test]
 fn the_count_since_the_reading_refuses_where_the_per_subject_read_would() {
     use crate::sim::world::Mutant;
-    let lanes = ["s-b", "s-c", "s-d"];
+    let lanes = ["tb000000000", "tc000000000", "td000000000"];
     let drain = |off: &[Mutant]| {
         let (lane, mut bridge, _broker, _server) = budget_world(off, held_leaving(2));
         budget_drain(&lane, &mut bridge, &lanes, 1)
@@ -7526,14 +8173,14 @@ fn each_drain_reads_the_budget_afresh_what_another_writer_spent_or_a_retirement_
     for off in [&[][..], &[Mutant::BudgetReadOutlivesItsScope][..]] {
         let reused = !off.is_empty();
         let (lane, mut bridge, _broker, _server) = budget_world(off, held_leaving(2));
-        let (landed, asked) = budget_drain(&lane, &mut bridge, &["s-b"], 1);
+        let (landed, asked) = budget_drain(&lane, &mut bridge, &["tb000000000"], 1);
         assert_eq!((landed, asked), (vec![true], 1), "{off:?}: the first drain");
         let (mut other, _) = bridge.connect().unwrap();
         let spent = format!("/f/f/pub/{}/node/another-writer", bridge.node);
         other
             .publish(bridge.producer_id, 100_000, &spent, b"v=1")
             .expect("another writer under this producer opens a subject");
-        let (landed, _) = budget_drain(&lane, &mut bridge, &["s-c"], 2);
+        let (landed, _) = budget_drain(&lane, &mut bridge, &["tc000000000"], 2);
         if reused {
             assert_eq!(
                 landed,
@@ -7550,7 +8197,7 @@ fn each_drain_reads_the_budget_afresh_what_another_writer_spent_or_a_retirement_
         other
             .retire_subject(bridge.producer_id, &spent)
             .expect("the other writer's subject retired");
-        let (landed, asked) = budget_drain(&lane, &mut bridge, &["s-c"], 3);
+        let (landed, asked) = budget_drain(&lane, &mut bridge, &["tc000000000"], 3);
         assert_eq!(
             (landed, asked),
             (vec![true], 1),
@@ -7583,7 +8230,7 @@ fn a_budget_freed_inside_a_drain_is_read_where_the_count_says_short() {
                 .retire_subject(producer, &filler)
                 .expect("a filler retired as the first post is concluded");
         });
-        budget_drain(&lane, &mut bridge, &["s-b", "s-c"], 1)
+        budget_drain(&lane, &mut bridge, &["tb000000000", "tc000000000"], 1)
     };
     let (per_subject, _) = drain(&[Mutant::BudgetReadPerSubject]);
     assert_eq!(
@@ -7606,43 +8253,52 @@ fn a_budget_freed_inside_a_drain_is_read_where_the_count_says_short() {
 #[cfg(unix)]
 #[test]
 fn a_new_post_id_under_a_winning_key_dedups_before_the_subject_budget_door() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     bridge.refresh_sessions().unwrap();
-    let note = format!("/f/f/in/{0}/s-b/{0}/note", bridge.node);
-    let ask = format!("/f/f/in/{0}/s-b/{0}/ask", bridge.node);
+    let note = format!("/f/f/in/{0}/tb000000000/{0}/note", bridge.node);
+    let ask = format!("/f/f/in/{0}/tb000000000/{0}/ask", bridge.node);
     let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
     let (_broker, _server) = seeded_broker(
         &lane,
         &mut bridge,
-        &["s-a", "s-b"],
+        &["ta000000000", "tb000000000"],
         std::slice::from_ref(&note),
         max,
     );
-    *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=@s-b kind=note key=k-first len=8\noriginal".into());
+    *lane.outbox.lock().unwrap() = Some(
+        "post sid=ta000000000 id=1 to=@tb000000000 kind=note key=k-first len=8\noriginal".into(),
+    );
     bridge.drain_outbox();
-    let winner = bridge.state.key_pin("s-a", "k-first").unwrap().unwrap();
+    let winner = bridge
+        .state
+        .key_pin("ta000000000", "k-first")
+        .unwrap()
+        .unwrap();
     let off = winner.original_off.unwrap();
     assert!(lane
         .sent
         .lock()
         .unwrap()
-        .contains(&format!("outbox sent s-a 1 off={off}")));
+        .contains(&format!("outbox sent ta000000000 1 off={off}")));
 
     *lane.outbox.lock().unwrap() = Some(
-        "post sid=s-a id=2 to=@s-b kind=ask key=k-first dl=30000 len=5\nlater\
-         post sid=s-a id=3 to=@s-b kind=ask len=5\nfresh"
+        "post sid=ta000000000 id=2 to=@tb000000000 kind=ask key=k-first dl=30000 len=5\nlater\
+         post sid=ta000000000 id=3 to=@tb000000000 kind=ask len=5\nfresh"
             .into(),
     );
     bridge.drain_outbox();
     let sent = lane.sent.lock().unwrap().clone();
     assert!(
-        sent.contains(&format!("outbox sent s-a 2 off={off} dup=1")),
+        sent.contains(&format!("outbox sent ta000000000 2 off={off} dup=1")),
         "the winning key was judged as a new subject: {sent:#?}"
     );
-    assert!(sent.contains(&"outbox sent s-a 3 off=- reason=subject-budget".into()));
+    assert!(sent.contains(&"outbox sent ta000000000 3 off=- reason=subject-budget".into()));
     assert!(bridge.asked.is_empty() && bridge.deadlines.is_empty());
-    let kept = bridge.state.key_pin("s-a", "k-first").unwrap().unwrap();
+    let kept = bridge
+        .state
+        .key_pin("ta000000000", "k-first")
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (kept.seq, kept.owner, kept.original_off),
         (winner.seq, Some(1), Some(off))
@@ -7671,14 +8327,20 @@ fn a_new_post_id_under_a_winning_key_dedups_before_the_subject_budget_door() {
 fn unknown_post_or_key_reservation_state_cannot_retire_at_the_budget_door() {
     for (blocked, dangling) in [
         (crate::state::journal::FILE, false),
-        ("keys/s-a", false),
+        ("keys/ta000000000", false),
         (crate::state::journal::FILE, true),
-        ("keys/s-a", true),
+        ("keys/ta000000000", true),
     ] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
         bridge.refresh_sessions().unwrap();
         let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
-        let (_broker, _server) = seeded_broker(&lane, &mut bridge, &["s-a", "s-b"], &[], max);
+        let (_broker, _server) = seeded_broker(
+            &lane,
+            &mut bridge,
+            &["ta000000000", "tb000000000"],
+            &[],
+            max,
+        );
         let root = bridge.state.root().to_path_buf();
         let path = root.join(blocked);
         std::fs::create_dir_all(path.parent().expect("reservation parent")).unwrap();
@@ -7690,15 +8352,16 @@ fn unknown_post_or_key_reservation_state_cannot_retire_at_the_budget_door() {
             std::fs::create_dir(&path).expect("make the required reservation read fail");
         }
         bridge.state = StateDir::open(&root).unwrap();
-        *lane.outbox.lock().unwrap() =
-            Some("post sid=s-a id=1 to=@s-b kind=ask key=k-first len=5\nfresh".into());
+        *lane.outbox.lock().unwrap() = Some(
+            "post sid=ta000000000 id=1 to=@tb000000000 kind=ask key=k-first len=5\nfresh".into(),
+        );
         bridge.drain_outbox();
         let retired = || {
             lane.sent
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|s| s.starts_with("outbox sent s-a 1 "))
+                .any(|s| s.starts_with("outbox sent ta000000000 1 "))
         };
         assert!(
             !retired(),
@@ -7717,9 +8380,9 @@ fn unknown_post_or_key_reservation_state_cannot_retire_at_the_budget_door() {
             .sent
             .lock()
             .unwrap()
-            .contains(&"outbox sent s-a 1 off=- reason=subject-budget".into()));
+            .contains(&"outbox sent ta000000000 1 off=- reason=subject-budget".into()));
         let (mut reader, _) = bridge.connect().unwrap();
-        let ask = format!("/f/f/in/{0}/s-b/{0}/ask", bridge.node);
+        let ask = format!("/f/f/in/{0}/tb000000000/{0}/ask", bridge.node);
         assert!(reader.fetch(0, &ask, 8).unwrap().0.is_empty());
     }
 }
@@ -7727,17 +8390,18 @@ fn unknown_post_or_key_reservation_state_cannot_retire_at_the_budget_door() {
 #[cfg(unix)]
 #[test]
 fn directed_mail_opens_a_lane_only_to_a_node_the_fleet_has_shown_and_above_its_reserve() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let node = bridge.node.clone();
     let far = subject::node_face("f", "n-far", "presence");
-    let known = format!("/f/f/in/n-far/s-x/{node}/note");
+    let known = format!("/f/f/in/n-far/tx000000000/{node}/note");
     let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
     let held = max - max / LANE_RESERVE_DIVISOR - 1;
-    let (_broker, _server) = seeded_broker(&lane, &mut bridge, &["s-a"], &[far, known], held);
+    let (_broker, _server) =
+        seeded_broker(&lane, &mut bridge, &["ta000000000"], &[far, known], held);
     // n-far advertises the sessions mailed there; its rows are its producer's, not this node's.
     let (mut far_node, _) = bridge.connect().unwrap();
-    for (seq, sid) in (1..).zip(["s-x", "s-y", "s-z"]) {
+    for (seq, sid) in (1..).zip(["tx000000000", "ty000000000", "tz000000000"]) {
         far_node
             .publish(
                 9_000,
@@ -7748,26 +8412,27 @@ fn directed_mail_opens_a_lane_only_to_a_node_the_fleet_has_shown_and_above_its_r
             .unwrap();
     }
     *lane.outbox.lock().unwrap() = Some(
-        "post sid=s-a id=1 to=@s-x@n-nowhere kind=note len=1\n1\
-         post sid=s-a id=2 to=@s-y@n-far kind=note len=1\n2\
-         post sid=s-a id=3 to=@s-z@n-far kind=note len=1\n3\
-         post sid=s-a id=4 to=h-made-up kind=note len=1\n4\
-         post sid=s-a id=5 to=@s-x@n-far kind=note len=1\n5"
+        "post sid=ta000000000 id=1 to=@tx000000000@n-nowhere kind=note len=1\n1\
+         post sid=ta000000000 id=2 to=@ty000000000@n-far kind=note len=1\n2\
+         post sid=ta000000000 id=3 to=@tz000000000@n-far kind=note len=1\n3\
+         post sid=ta000000000 id=4 to=h-made-up kind=note len=1\n4\
+         post sid=ta000000000 id=5 to=@tx000000000@n-far kind=note len=1\n5"
             .to_string(),
     );
     bridge.drain_outbox();
     let sent = lane.sent.lock().unwrap().clone();
     let retired = |id: u64, why: &str| {
         assert!(
-            sent.contains(&format!("outbox sent s-a {id} off=- reason={why}")),
+            sent.contains(&format!("outbox sent ta000000000 {id} off=- reason={why}")),
             "post {id} is retired {why}: {sent:#?}"
         );
     };
     let landed = |id: u64| {
         assert!(
-            sent.iter()
-                .any(|l| l.starts_with(&format!("outbox sent s-a {id} off="))
-                    && !l.contains("off=-")),
+            sent.iter().any(
+                |l| l.starts_with(&format!("outbox sent ta000000000 {id} off="))
+                    && !l.contains("off=-")
+            ),
             "post {id} landed: {sent:#?}"
         );
     };
@@ -7778,8 +8443,8 @@ fn directed_mail_opens_a_lane_only_to_a_node_the_fleet_has_shown_and_above_its_r
     landed(5);
     let (mut reader, _) = bridge.connect().unwrap();
     for unminted in [
-        format!("/f/f/in/n-nowhere/s-x/{node}/note"),
-        format!("/f/f/in/n-far/s-z/{node}/note"),
+        format!("/f/f/in/n-nowhere/tx000000000/{node}/note"),
+        format!("/f/f/in/n-far/tz000000000/{node}/note"),
         format!("/f/f/in/p/h-made-up/{node}/note"),
     ] {
         assert!(
@@ -7797,14 +8462,18 @@ fn directed_mail_opens_a_lane_only_to_a_node_the_fleet_has_shown_and_above_its_r
     assert!(
         node_ev
             .iter()
-            .any(|e| e.contains("ev=undeliverable to=@s-x@n-nowhere reason=unroutable")),
+            .any(|e| e.contains("ev=undeliverable to=@tx000000000@n-nowhere reason=unroutable")),
         "the refusal is said where the node's operator reads: {node_ev:#?}"
     );
     let budget = reader
         .subject_budget(bridge.producer_id)
         .unwrap()
         .expect("a broker that reads budgets");
-    assert_eq!(budget.subjects, held + 1, "only @s-y@n-far's lane opened");
+    assert_eq!(
+        budget.subjects,
+        held + 1,
+        "only @ty000000000@n-far's lane opened"
+    );
     assert_eq!(
         budget.remaining(),
         max / LANE_RESERVE_DIVISOR,
@@ -7815,7 +8484,7 @@ fn directed_mail_opens_a_lane_only_to_a_node_the_fleet_has_shown_and_above_its_r
 #[cfg(unix)]
 #[test]
 fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
@@ -7826,12 +8495,12 @@ fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
     assert!(bridge.refresh_sessions().is_ok());
     let node = bridge.node.clone();
 
-    for (off, ghost) in [(10, "s-ghost1"), (11, "s-ghost2")] {
+    for (off, ghost) in [(10, "tgh0st10000"), (11, "tgh0st20000")] {
         let subject = format!("/f/f/in/{node}/{ghost}/n-evil/note");
         let outcome = bridge.deliver_record(off, &subject, b"v=1 t=1 text=x", None);
         assert_eq!(outcome, Delivery::Accounted);
     }
-    let known = format!("/f/f/in/n-evil/s-known/{node}");
+    let known = format!("/f/f/in/n-evil/tkn0wn00000/{node}");
     bridge
         .publish(&format!("{known}/note"), b"v=1 t=1 text=hi")
         .unwrap();
@@ -7841,14 +8510,18 @@ fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
         let outcome = bridge.deliver_record(off, &subject, raw.as_bytes(), None);
         assert_eq!(outcome, Delivery::Accounted);
     };
-    refuse(&mut bridge, 20, "s-first");
+    refuse(&mut bridge, 20, "tf1rst00000");
     for i in 1..NEW_LANES_PER_NODE {
-        let fill = format!("/f/f/in/n-evil/s-fill{i}/{node}");
+        let fill = format!("/f/f/in/n-evil/tf111{i:06}/{node}");
         assert!(bridge.may_answer_on("n-evil", &fill).unwrap(), "{fill}");
     }
-    refuse(&mut bridge, 21, "s-x");
-    refuse(&mut bridge, 22, "s-known");
-    for (rid, from) in [(1, "s-y@n-evil"), (2, "s-first@n-evil"), (3, "s-z@n-other")] {
+    refuse(&mut bridge, 21, "tx000000000");
+    refuse(&mut bridge, 22, "tkn0wn00000");
+    for (rid, from) in [
+        (1, "ty000000000@n-evil"),
+        (2, "tf1rst00000@n-evil"),
+        (3, "tz000000000@n-other"),
+    ] {
         let owed = OwedReceipt {
             sid: SID.to_string(),
             rid,
@@ -7861,7 +8534,7 @@ fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
         bridge.send_receipt(&owed).unwrap();
     }
     for i in 0..=NEW_LANES_PER_NODE {
-        let mine = format!("/f/f/in/{node}/s-local{i}/{node}");
+        let mine = format!("/f/f/in/{node}/t10ca1{i:05}/{node}");
         assert!(bridge.may_answer_on(&node, &mine).unwrap(), "{mine}");
     }
 
@@ -7869,7 +8542,7 @@ fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
     let (rows, _) = reader.last_all("/f/f/>").unwrap();
     let subjects: Vec<&str> = rows.iter().map(|(_, s, _)| s.as_str()).collect();
     assert!(
-        !subjects.iter().any(|s| s.contains("s-ghost")),
+        !subjects.iter().any(|s| s.contains("tghpst00000")),
         "a sid this node does not host became a subject: {subjects:#?}"
     );
     let lanes_on = |peer: &str| -> BTreeSet<&str> {
@@ -7880,7 +8553,7 @@ fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
             .filter(|s| s.starts_with(&prefix))
             .collect()
     };
-    let first = format!("/f/f/in/n-evil/s-first/{node}");
+    let first = format!("/f/f/in/n-evil/tf1rst00000/{node}");
     assert_eq!(
         lanes_on("n-evil"),
         BTreeSet::from([
@@ -7893,7 +8566,7 @@ fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
     );
     assert_eq!(
         lanes_on("n-other"),
-        BTreeSet::from([format!("/f/f/in/n-other/s-z/{node}/ack").as_str()]),
+        BTreeSet::from([format!("/f/f/in/n-other/tz000000000/{node}/ack").as_str()]),
         "another node's first contact draws on its own allowance"
     );
 
@@ -7908,7 +8581,7 @@ fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
             .collect()
     };
     let node_ev = ev_of(&subject::node_face("f", &node, "ev"), &mut reader);
-    for (off, ghost) in [(10, "s-ghost1"), (11, "s-ghost2")] {
+    for (off, ghost) in [(10, "tgh0st10000"), (11, "tgh0st20000")] {
         let want = format!("undeliverable off={off} reason=not-hosted sid={ghost}");
         assert!(node_ev.contains(&want), "{want} in {node_ev:#?}");
     }
@@ -7927,7 +8600,7 @@ fn a_strangers_mail_spends_a_bounded_share_of_this_nodes_budget() {
 #[cfg(unix)]
 #[test]
 fn a_failed_lane_read_keeps_the_receipt_owed_and_sends_no_verdict() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
@@ -7939,7 +8612,7 @@ fn a_failed_lane_read_keeps_the_receipt_owed_and_sends_no_verdict() {
         off: 31,
         verdict: "handled".to_string(),
         kind: "ask".to_string(),
-        from: "s-y@n-evil".to_string(),
+        from: "ty000000000@n-evil".to_string(),
         earlier_log: false,
     };
     let addr = subject::InAddr {
@@ -7949,7 +8622,7 @@ fn a_failed_lane_read_keeps_the_receipt_owed_and_sends_no_verdict() {
         kind: WakeClass::Note,
     };
     let mut body = Body::new(0);
-    body.from = Some("s-y".to_string());
+    body.from = Some("ty000000000".to_string());
 
     let (conn, closer) = bridge.connect().unwrap();
     bridge.conn = Some(conn.into());
@@ -7970,7 +8643,7 @@ fn a_failed_lane_read_keeps_the_receipt_owed_and_sends_no_verdict() {
 
     let far = OwedReceipt {
         rid: 2,
-        from: "s-far".to_string(),
+        from: "tfar0000000".to_string(),
         ..owed.clone()
     };
     let (conn, closer) = bridge.connect().unwrap();
@@ -7981,17 +8654,17 @@ fn a_failed_lane_read_keeps_the_receipt_owed_and_sends_no_verdict() {
         "a bare sender the roster could not place stays owed"
     );
     assert!(
-        bridge.resolve_to("@s-far", Some(SID)).is_err(),
+        bridge.resolve_to("@tfar0000000", Some(SID)).is_err(),
         "no connection at all is no answer either"
     );
-    assert!(!bridge.state.pins().contains_key("s-far"));
+    assert!(!bridge.state.pins().contains_key("tfar0000000"));
     let (conn, _) = bridge.connect().unwrap();
     bridge.conn = Some(conn.into());
     assert_eq!(
-        bridge.resolve_to("@s-far", Some(SID)).unwrap(),
+        bridge.resolve_to("@tfar0000000", Some(SID)).unwrap(),
         Route::Unroutable
     );
-    assert!(!bridge.state.pins().contains_key("s-far"));
+    assert!(!bridge.state.pins().contains_key("tfar0000000"));
 
     bridge.send_receipt(&owed).unwrap();
     assert_eq!(lane.delivery_offsets().len(), 1, "retired with its offset");
@@ -8008,7 +8681,7 @@ fn the_routing_read_folds_in_the_records_its_walk_omitted() {
             let mut s = theirs;
             let row = |offset: u64, node: &str, state: &str| Response::Delivery {
                 offset,
-                subject: format!("/f/f/pub/{node}/s-x/presence"),
+                subject: format!("/f/f/pub/{node}/tx000000000/presence"),
                 body: format!("v=1 t=1 state={state}").into_bytes(),
             };
             while let Ok(Some(frame)) = read_frame(&mut s) {
@@ -8042,7 +8715,7 @@ fn the_routing_read_folds_in_the_records_its_walk_omitted() {
     };
     let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
     bridge.conn = Some(scripted(13).into());
-    let live = bridge.advertisers("s-x").unwrap();
+    let live = bridge.advertisers("tx000000000").unwrap();
     assert_eq!(
         live,
         BTreeSet::from(["n-a".to_string(), "n-c".to_string()]),
@@ -8050,7 +8723,7 @@ fn the_routing_read_folds_in_the_records_its_walk_omitted() {
     );
     bridge.conn = Some(scripted(12).into());
     assert!(
-        bridge.advertisers("s-x").is_err(),
+        bridge.advertisers("tx000000000").is_err(),
         "a stretch read short of its head is unknown"
     );
 }
@@ -8060,7 +8733,7 @@ fn the_routing_read_folds_in_the_records_its_walk_omitted() {
 fn a_presence_walk_services_a_halt_between_pages_and_stops_on_disconnect() {
     use astream_broker::proto::{decode_request, encode_response, read_frame, write_frame};
     use astream_broker::{Request, Response};
-    const SID: &str = "s-local";
+    const SID: &str = "t10ca100000";
     for closed in [false, true] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         bridge.refresh_sessions().unwrap();
@@ -8079,7 +8752,7 @@ fn a_presence_walk_services_a_halt_between_pages_and_stops_on_disconnect() {
         let server = std::thread::spawn(move || {
             let row = |offset, node: &str, state| Response::Delivery {
                 offset,
-                subject: format!("/f/f/pub/{node}/s-x/presence"),
+                subject: format!("/f/f/pub/{node}/tx000000000/presence"),
                 body: format!("v=1 t=1 state={state}").into_bytes(),
             };
             while let Ok(Some(frame)) = read_frame(&mut peer) {
@@ -8157,7 +8830,7 @@ fn a_presence_walk_services_a_halt_between_pages_and_stops_on_disconnect() {
             }
         });
         bridge.conn = Some(Conn::from_stream(Box::new(ours)).into());
-        let answer = bridge.advertisers("s-x");
+        let answer = bridge.advertisers("tx000000000");
         if closed {
             assert!(
                 answer.is_err(),
@@ -8262,7 +8935,7 @@ impl std::io::Write for ReadTap {
 #[test]
 fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
     use crate::presence_view::Phase as ViewPhase;
-    const SID: &str = "s-near";
+    const SID: &str = "tnear000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
@@ -8304,40 +8977,43 @@ fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
     const EXITED: &str = "v=1 t=1 state=exited";
     let row = |far: &str, sid: &str| format!("/f/f/pub/{far}/{sid}/presence");
 
-    let off = publish(&row("n-far", "s-far"), LIVE);
+    let off = publish(&row("n-far", "tfar0000000"), LIVE);
     assert_eq!(view.phase(), ViewPhase::Closed);
-    let first = counted(&mut bridge, "@s-far");
-    assert_eq!(first.0, to("n-far", "s-far"));
+    let first = counted(&mut bridge, "@tfar0000000");
+    assert_eq!(first.0, to("n-far", "tfar0000000"));
     assert!(walked(&first), "a Last and its stretch's Fetch: {first:?}");
-    assert_eq!(bridge.state.pins()["s-far"], "n-far");
+    assert_eq!(bridge.state.pins()["tfar0000000"], "n-far");
     caught_up(off);
-    assert_eq!(counted(&mut bridge, "@s-far"), (to("n-far", "s-far"), 0, 1));
+    assert_eq!(
+        counted(&mut bridge, "@tfar0000000"),
+        (to("n-far", "tfar0000000"), 0, 1)
+    );
 
-    publish(&row("n-a", "s-moved"), LIVE);
-    publish(&row("n-a", "s-moved"), EXITED);
-    let moved = publish(&row("n-b", "s-moved"), LIVE);
+    publish(&row("n-a", "tm0ved00000"), LIVE);
+    publish(&row("n-a", "tm0ved00000"), EXITED);
+    let moved = publish(&row("n-b", "tm0ved00000"), LIVE);
     caught_up(moved);
     assert_eq!(
-        counted(&mut bridge, "@s-moved"),
-        (to("n-b", "s-moved"), 0, 1)
+        counted(&mut bridge, "@tm0ved00000"),
+        (to("n-b", "tm0ved00000"), 0, 1)
     );
     assert_eq!(
-        bridge.state.pins()["s-moved"],
+        bridge.state.pins()["tm0ved00000"],
         "n-b",
         "first sight, through the view"
     );
 
-    publish(&row("n-far", "s-far"), EXITED);
-    let off = publish(&row("n-c", "s-far"), LIVE);
+    publish(&row("n-far", "tfar0000000"), EXITED);
+    let off = publish(&row("n-c", "tfar0000000"), LIVE);
     caught_up(off);
-    let contested = counted(&mut bridge, "@s-far");
+    let contested = counted(&mut bridge, "@tfar0000000");
     assert_eq!(contested.0, Route::Ambiguous);
     assert!(
         walked(&contested),
         "the verdict that retires is the walk's: {contested:?}"
     );
 
-    let miss = counted(&mut bridge, "@s-nobody");
+    let miss = counted(&mut bridge, "@tn0b0dy0000");
     assert_eq!(miss.0, Route::Unroutable);
     assert!(
         walked(&miss),
@@ -8351,8 +9027,8 @@ fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
         "a cut subscription is a dead view"
     );
     bridge.presence_view_retry_at = Some(Instant::now() + aterm_spec::wait::MUST_HAPPEN);
-    let dead = counted(&mut bridge, "@s-moved");
-    assert_eq!(dead.0, to("n-b", "s-moved"));
+    let dead = counted(&mut bridge, "@tm0ved00000");
+    assert_eq!(dead.0, to("n-b", "tm0ved00000"));
     assert!(walked(&dead), "a dead view is a walk: {dead:?}");
     assert_eq!(
         view.phase(),
@@ -8360,11 +9036,11 @@ fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
         "not redialled inside the bound"
     );
     bridge.presence_view_retry_at = None;
-    assert!(walked(&counted(&mut bridge, "@s-moved")));
+    assert!(walked(&counted(&mut bridge, "@tm0ved00000")));
     caught_up(off);
     assert_eq!(
-        counted(&mut bridge, "@s-moved"),
-        (to("n-b", "s-moved"), 0, 1)
+        counted(&mut bridge, "@tm0ved00000"),
+        (to("n-b", "tm0ved00000"), 0, 1)
     );
 
     bridge.presence_view.close();
@@ -8373,26 +9049,26 @@ fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
         g,
         "f",
         moved,
-        "/f/f/pub/n-b/s-moved/presence",
+        "/f/f/pub/n-b/tm0ved00000/presence",
         b"v=1 t=1 state=live"
     ));
     assert!(view.mark(g, off + 1, off + 1));
-    let exact = || view.snapshot("s-moved").expect("live").exact_to;
+    let exact = || view.snapshot("tm0ved00000").expect("live").exact_to;
 
     for i in 0..20 {
-        publish(&format!("/f/f/term/n-z/s-z/{i}"), "busy");
+        publish(&format!("/f/f/term/n-z/tz000000000/{i}"), "busy");
     }
     let head = reader.fetch(0, "/f/f/>", 0).unwrap().1 .1;
     assert!(exact() < head, "the view is behind the traffic");
     assert_eq!(
-        counted(&mut bridge, "@s-moved"),
-        (to("n-b", "s-moved"), 0, 1)
+        counted(&mut bridge, "@tm0ved00000"),
+        (to("n-b", "tm0ved00000"), 0, 1)
     );
     assert_eq!(reads.last_fetched_from(), Some(off + 1));
     assert_eq!(exact(), head, "the confirmation moved the view to the head");
     assert_eq!(
-        counted(&mut bridge, "@s-moved"),
-        (to("n-b", "s-moved"), 0, 1)
+        counted(&mut bridge, "@tm0ved00000"),
+        (to("n-b", "tm0ved00000"), 0, 1)
     );
     assert_eq!(
         reads.last_fetched_from(),
@@ -8400,13 +9076,13 @@ fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
         "the next confirmation scans nothing the last one did"
     );
 
-    let rival_off = publish(&row("n-d", "s-moved"), LIVE);
+    let rival_off = publish(&row("n-d", "tm0ved00000"), LIVE);
     assert_eq!(
-        view.snapshot("s-moved").map(|s| s.nodes),
+        view.snapshot("tm0ved00000").map(|s| s.nodes),
         Some(std::collections::BTreeSet::from(["n-b".to_string()])),
         "NEGATIVE CONTROL: unconfirmed, the view routes it to the pinned node"
     );
-    let rival = counted(&mut bridge, "@s-moved");
+    let rival = counted(&mut bridge, "@tm0ved00000");
     assert_eq!(
         rival.0,
         Route::Ambiguous,
@@ -8427,12 +9103,12 @@ fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
         g,
         "f",
         moved,
-        "/f/f/pub/n-b/s-moved/presence",
+        "/f/f/pub/n-b/tm0ved00000/presence",
         b"v=1 t=1 state=live"
     ));
     assert!(view.mark(g, rival_off, rival_off));
     assert!(view.mark(g, rival_off, rival_off + CONFIRM_SCAN_MAX + 1));
-    let long = counted(&mut bridge, "@s-moved");
+    let long = counted(&mut bridge, "@tm0ved00000");
     assert_eq!(long.0, Route::Ambiguous);
     assert_eq!((long.1, long.2), (1, 1), "the walk alone: {long:?}");
     let g = view.open();
@@ -8440,24 +9116,30 @@ fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
         g,
         "f",
         moved,
-        "/f/f/pub/n-b/s-moved/presence",
+        "/f/f/pub/n-b/tm0ved00000/presence",
         b"v=1 t=1 state=live"
     ));
     assert!(view.mark(g, rival_off, rival_off));
     let bus_high = std::mem::replace(&mut bridge.bus_high, rival_off + CONFIRM_SCAN_MAX + 1);
-    let long = counted(&mut bridge, "@s-moved");
+    let long = counted(&mut bridge, "@tm0ved00000");
     assert_eq!((long.1, long.2), (1, 1), "the walk alone: {long:?}");
     bridge.bus_high = bus_high;
 
-    let cut_a = publish(&row("n-cut-a", "s-cut"), LIVE);
-    let solo = publish(&row("n-solo", "s-solo"), LIVE);
+    let cut_a = publish(&row("n-cut-a", "tcvt0000000"), LIVE);
+    let solo = publish(&row("n-solo", "ts010000000"), LIVE);
     let g = view.open();
-    assert!(view.apply(g, "f", cut_a, &row("n-cut-a", "s-cut"), LIVE.as_bytes()));
-    assert!(view.apply(g, "f", solo, &row("n-solo", "s-solo"), LIVE.as_bytes()));
+    assert!(view.apply(
+        g,
+        "f",
+        cut_a,
+        &row("n-cut-a", "tcvt0000000"),
+        LIVE.as_bytes()
+    ));
+    assert!(view.apply(g, "f", solo, &row("n-solo", "ts010000000"), LIVE.as_bytes()));
     let before_cut = solo + 1;
     assert!(view.mark(g, before_cut, before_cut));
-    let rival = publish(&row("n-cut-b", "s-cut"), LIVE);
-    let floor = publish("/f/f/term/n-z/s-z/after-cut", "busy");
+    let rival = publish(&row("n-cut-b", "tcvt0000000"), LIVE);
+    let floor = publish("/f/f/term/n-z/tz000000000/after-cut", "busy");
     assert!(before_cut <= rival && rival < floor);
     broker.retain_before_carrying_state(floor).expect("the cut");
     let filter = crate::presence_view::presence_filter("f");
@@ -8474,27 +9156,27 @@ fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
     for far in ["n-cut-a", "n-cut-b"] {
         assert!(
             last.iter()
-                .any(|(_, subject, _)| subject == &row(far, "s-cut")),
+                .any(|(_, subject, _)| subject == &row(far, "tcvt0000000")),
             "Last preserves the actual claim of {far}"
         );
     }
     assert_eq!(
-        view.snapshot("s-cut").unwrap().nodes,
+        view.snapshot("tcvt0000000").unwrap().nodes,
         BTreeSet::from(["n-cut-a".to_string()]),
         "NEGATIVE CONTROL: the stale view alone would route to n-cut-a"
     );
-    let cut = counted(&mut bridge, "@s-cut");
+    let cut = counted(&mut bridge, "@tcvt0000000");
     assert_eq!(
         cut.0,
         Route::Ambiguous,
         "the retained rival is still a rival"
     );
     assert!(walked(&cut), "the cut requires Last: {cut:?}");
-    assert_eq!(view.snapshot("s-cut").unwrap().exact_to, before_cut);
-    let solo = counted(&mut bridge, "@s-solo");
-    assert_eq!(solo.0, to("n-solo", "s-solo"));
+    assert_eq!(view.snapshot("tcvt0000000").unwrap().exact_to, before_cut);
+    let solo = counted(&mut bridge, "@ts010000000");
+    assert_eq!(solo.0, to("n-solo", "ts010000000"));
     assert!(walked(&solo), "a unique route survives the cut: {solo:?}");
-    assert_eq!(view.snapshot("s-solo").unwrap().exact_to, before_cut);
+    assert_eq!(view.snapshot("ts010000000").unwrap().exact_to, before_cut);
 
     bridge.close_subscriptions();
     assert_eq!(view.phase(), ViewPhase::Closed);
@@ -8506,7 +9188,7 @@ fn a_bare_post_to_a_remote_peer_walks_once_while_the_presence_view_is_live() {
 fn the_presence_view_is_dialled_off_the_bridges_loop() {
     use crate::presence_view::Phase as ViewPhase;
     use std::io::Read as _;
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-near")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tnear000000")]);
     let socket = lane.dir.path().join("mute.sock");
     let mute = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     bridge.cfg.broker = socket.to_string_lossy().into_owned();
@@ -8559,7 +9241,7 @@ fn presence_view_under_the_guard(
     use crate::presence_view::Phase as ViewPhase;
     const FAR: &str = "n-00000000000000fa";
     let secret = vec![0x5a_u8; 32];
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-near")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tnear000000")]);
     let broker =
         astream_broker::Broker::open_guarded(lane.dir.path().join("guarded.log"), secret.clone())
             .unwrap();
@@ -8582,7 +9264,7 @@ fn presence_view_under_the_guard(
     bridge.conn = Some(bridge.connect().expect("the publisher attaches").0.into());
     let (mut far, _) = transport::connect(&endpoint, ACK_DEADLINE).unwrap();
     transport::attach_ring(&mut far, &ring(FAR, &|_| true)).unwrap();
-    let subject = format!("/f/f/pub/{FAR}/s-far/presence");
+    let subject = format!("/f/f/pub/{FAR}/tfar0000000/presence");
     let off = far
         .publish(
             astream_cap::producer_id_of(FAR),
@@ -8592,9 +9274,14 @@ fn presence_view_under_the_guard(
         )
         .unwrap()
         .0;
-    let to = Route::To(format!("/f/f/in/{FAR}/s-far/{}", bridge.node));
+    let to = Route::To(format!("/f/f/in/{FAR}/tfar0000000/{}", bridge.node));
 
-    assert_eq!(bridge.resolve_to("@s-far", Some("s-near")).unwrap(), to);
+    assert_eq!(
+        bridge
+            .resolve_to("@tfar0000000", Some("tnear000000"))
+            .unwrap(),
+        to
+    );
     let view = Arc::clone(&bridge.presence_view);
     assert!(
         view.wait_for(aterm_spec::wait::MUST_HAPPEN, |phase, reached| {
@@ -8609,10 +9296,15 @@ fn presence_view_under_the_guard(
         "the ring covers the view's seed, its subscription and its idle marks"
     );
     let head = far.fetch(0, "/f/f/pub/>", 0).unwrap().1 .1;
-    assert_eq!(bridge.resolve_to("@s-far", Some("s-near")).unwrap(), to);
+    assert_eq!(
+        bridge
+            .resolve_to("@tfar0000000", Some("tnear000000"))
+            .unwrap(),
+        to
+    );
     assert!(bridge.conn.is_some());
     assert_eq!(
-        view.snapshot("s-far").map(|s| s.exact_to),
+        view.snapshot("tfar0000000").map(|s| s.exact_to),
         Some(head),
         "the confirmation answered, through to the head"
     );
@@ -8668,14 +9360,19 @@ fn dropping_a_bridge_closes_its_live_presence_reader() {
         }
     }
 
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-near")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tnear000000")]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
     let _server = broker.serve(&socket).unwrap();
     bridge.cfg.broker = socket.to_string_lossy().into_owned();
     let (mut publisher, _) = bridge.connect().unwrap();
     let off = publisher
-        .publish(7, 1, "/f/f/pub/n-far/s-far/presence", b"v=1 t=1 state=live")
+        .publish(
+            7,
+            1,
+            "/f/f/pub/n-far/tfar0000000/presence",
+            b"v=1 t=1 state=live",
+        )
         .unwrap()
         .0;
     bridge.conn = Some(publisher.into());
@@ -8701,7 +9398,7 @@ fn dropping_a_bridge_closes_its_live_presence_reader() {
         })
     );
     assert_eq!(
-        view.snapshot("s-far").map(|snapshot| snapshot.nodes),
+        view.snapshot("tfar0000000").map(|snapshot| snapshot.nodes),
         Some(BTreeSet::from(["n-far".to_string()]))
     );
     assert!(matches!(
@@ -8727,7 +9424,7 @@ fn dropping_a_bridge_closes_its_live_presence_reader() {
 #[cfg(unix)]
 #[test]
 fn a_record_refused_twice_answers_its_sender_once() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
@@ -8738,7 +9435,7 @@ fn a_record_refused_twice_answers_its_sender_once() {
     assert!(bridge.refresh_sessions().is_ok());
     let node = bridge.node.clone();
     let local = format!("/f/f/in/{node}/{SID}/{node}/note");
-    let raw = b"v=1 t=1 from=s-gone via=NOT-A-PRINCIPAL text=x";
+    let raw = b"v=1 t=1 from=tgpne000000 via=NOT-A-PRINCIPAL text=x";
     let off = bridge.publish_own_off(&local, raw).unwrap();
     for _ in 0..2 {
         assert_eq!(
@@ -8747,7 +9444,7 @@ fn a_record_refused_twice_answers_its_sender_once() {
         );
     }
     let (mut reader, _) = bridge.connect().unwrap();
-    let notices = format!("/f/f/in/{node}/s-gone/{node}/undeliverable");
+    let notices = format!("/f/f/in/{node}/tgpne000000/{node}/undeliverable");
     let (rows, _) = reader.fetch(0, &notices, 16).unwrap();
     let answers: Vec<Option<u64>> = rows.iter().map(|(_, _, b)| Body::decode(b).0.re).collect();
     assert_eq!(answers, [Some(off)], "one notice for one refused record");
@@ -8763,7 +9460,7 @@ const SHIPPED_DELIVER_USAGE: &str = "ERR usage: deliver <sid> off=<n> from=<p> k
 #[cfg(unix)]
 #[test]
 fn a_broadcast_opt_out_race_leaves_the_sessions_other_mail_deliverable() {
-    const SID: &str = "s-optout";
+    const SID: &str = "t0pt0vt0000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
@@ -8786,7 +9483,7 @@ fn a_broadcast_opt_out_race_leaves_the_sessions_other_mail_deliverable() {
     lane.answer_deliveries_to(SID, "ERR not-subscribed\n");
     bridge.on_say_record(&(
         20,
-        "/f/f/pub/n-peer/s-peer/say/declined".to_string(),
+        "/f/f/pub/n-peer/tpeer000000/say/declined".to_string(),
         b"v=1 t=1 text=declined".to_vec(),
     ));
     let read_past = bridge.per_sid.topics[SID]["declined"].next;
@@ -8795,14 +9492,14 @@ fn a_broadcast_opt_out_race_leaves_the_sessions_other_mail_deliverable() {
     bridge.topic_change(SID, &mut "drop declined".split_whitespace());
     bridge.on_say_record(&(
         21,
-        "/f/f/pub/n-peer/s-peer/say/wanted".to_string(),
+        "/f/f/pub/n-peer/tpeer000000/say/wanted".to_string(),
         b"v=1 t=2 text=wanted".to_vec(),
     ));
     bridge.on_inbox_record(
         &(
             22,
             format!("/f/f/in/{}/{SID}/n-peer/note", bridge.node),
-            b"v=1 t=3 from=s-peer text=addressed".to_vec(),
+            b"v=1 t=3 from=tpeer000000 text=addressed".to_vec(),
         ),
         None,
     );
@@ -8822,8 +9519,8 @@ fn a_broadcast_opt_out_race_leaves_the_sessions_other_mail_deliverable() {
 #[cfg(unix)]
 #[test]
 fn an_answer_that_is_no_verdict_keeps_the_record_owed_and_holds_back_only_its_session() {
-    const HELD: &str = "s-held";
-    const OTHER: &str = "s-other";
+    const HELD: &str = "the1d000000";
+    const OTHER: &str = "t0ther00000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, HELD), (2, OTHER)]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
@@ -8838,7 +9535,7 @@ fn an_answer_that_is_no_verdict_keeps_the_record_owed_and_holds_back_only_its_se
         (
             off,
             format!("/f/f/in/{node}/{sid}/n-peer/note"),
-            b"v=1 t=1 from=s-peer text=hi".to_vec(),
+            b"v=1 t=1 from=tpeer000000 text=hi".to_vec(),
         )
     };
 
@@ -8870,7 +9567,7 @@ fn an_answer_that_is_no_verdict_keeps_the_record_owed_and_holds_back_only_its_se
     );
 
     let (mut reader, _) = bridge.connect().unwrap();
-    let notices = format!("/f/f/in/n-peer/s-peer/{node}/undeliverable");
+    let notices = format!("/f/f/in/n-peer/tpeer000000/{node}/undeliverable");
     let (rows, _) = reader.fetch(0, &notices, 16).unwrap();
     let told: Vec<(Option<u64>, String)> = rows
         .iter()
@@ -8915,9 +9612,9 @@ fn an_answer_that_is_no_verdict_keeps_the_record_owed_and_holds_back_only_its_se
 #[cfg(unix)]
 #[test]
 fn inbox_commit_debt_follows_live_sessions_and_survives_reconnects() {
-    const FIRST: &str = "s-first";
-    const SECOND: &str = "s-second";
-    const HEALTHY: &str = "s-healthy";
+    const FIRST: &str = "tf1rst00000";
+    const SECOND: &str = "tsec0nd0000";
+    const HEALTHY: &str = "thea1thy000";
     for unattributed in [None, Some(10)] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, FIRST), (2, SECOND), (3, HEALTHY)]);
         let socket = lane.dir.path().join("broker.sock");
@@ -8933,7 +9630,7 @@ fn inbox_commit_debt_follows_live_sessions_and_survives_reconnects() {
             (
                 off,
                 format!("/f/f/in/{node}/{sid}/n-peer/note"),
-                b"v=1 t=1 from=s-peer text=mail".to_vec(),
+                b"v=1 t=1 from=tpeer000000 text=mail".to_vec(),
             )
         };
         lane.answer_deliveries_to(FIRST, SHIPPED_DELIVER_USAGE);
@@ -8987,8 +9684,8 @@ fn inbox_commit_debt_follows_live_sessions_and_survives_reconnects() {
 #[cfg(unix)]
 #[test]
 fn a_log_of_another_identity_owes_nothing_the_old_one_owed() {
-    const FAULTED: &str = "s-faulted";
-    const HEALTHY: &str = "s-healthy";
+    const FAULTED: &str = "tfav1ted000";
+    const HEALTHY: &str = "thea1thy000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, FAULTED), (2, HEALTHY)]);
     assert!(bridge.refresh_sessions().is_ok());
     let (a, _broker_a, _server_a) = serve_log(&lane, "a");
@@ -8999,7 +9696,7 @@ fn a_log_of_another_identity_owes_nothing_the_old_one_owed() {
         (
             off,
             format!("/f/f/in/{node}/{sid}/n-peer/note"),
-            b"v=1 t=1 from=s-peer text=mail".to_vec(),
+            b"v=1 t=1 from=tpeer000000 text=mail".to_vec(),
         )
     };
     lane.answer_deliveries_to(FAULTED, SHIPPED_DELIVER_USAGE);
@@ -9039,15 +9736,15 @@ fn a_log_of_another_identity_owes_nothing_the_old_one_owed() {
 
 #[test]
 fn a_broadcast_on_a_dropped_topic_is_the_sessions_verdict_and_holds_nothing_back() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     bridge.say_drained_to = 5;
     bridge.say_bus_head = 5;
     bridge.per_sid.topics.insert(
-        "s-a".to_string(),
+        "ta000000000".to_string(),
         BTreeMap::from([("news".to_string(), TopicCursor { next: 5 })]),
     );
-    lane.answer_deliveries_to("s-a", "ERR not-subscribed\n");
-    let live = "/f/f/pub/n-x/s-1/say/news".to_string();
+    lane.answer_deliveries_to("ta000000000", "ERR not-subscribed\n");
+    let live = "/f/f/pub/n-x/t0000000001/say/news".to_string();
     bridge.on_say_record(&(5, live, Body::new(0).encode()));
     assert_eq!(lane.transcript(), ["deliver 5"]);
     assert!(
@@ -9056,7 +9753,7 @@ fn a_broadcast_on_a_dropped_topic_is_the_sessions_verdict_and_holds_nothing_back
         bridge.per_sid.lane_owed
     );
     assert_eq!(
-        bridge.per_sid.topics["s-a"]["news"].next, 6,
+        bridge.per_sid.topics["ta000000000"]["news"].next, 6,
         "its cursor moves past the record it declined"
     );
 }
@@ -9066,7 +9763,7 @@ fn a_broadcast_on_a_dropped_topic_is_the_sessions_verdict_and_holds_nothing_back
 fn the_hello_reads_each_endpoints_lane_and_build_and_refuses_none() {
     let own = aterm_stamp::build_id();
     let lane_now = aterm_types::control_verbs::BRIDGE_LANE;
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     bridge.introduce();
     assert_eq!(
         lane.hellos(),
@@ -9097,13 +9794,13 @@ fn the_hello_reads_each_endpoints_lane_and_build_and_refuses_none() {
 #[cfg(unix)]
 #[test]
 fn an_endpoint_without_the_bridge_roster_is_named_and_never_attached() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     lane.answer_roster_with("ERR usage: sessions\n");
     assert!(!bridge.first_roster(), "a grammar the bridge cannot read");
     assert_eq!(lane.links(), ["link down reason=endpoint-grammar"]);
     assert!(bridge.locals.is_empty() && bridge.per_sid.epochs.is_empty());
 
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     lane.refuse_roster(true);
     assert!(
         bridge.first_roster(),
@@ -9112,13 +9809,16 @@ fn an_endpoint_without_the_bridge_roster_is_named_and_never_attached() {
     assert!(lane.links().is_empty(), "and nothing is reported for it");
     lane.refuse_roster(false);
     assert!(bridge.first_roster());
-    assert_eq!(bridge.locals.get(&1).map(String::as_str), Some("s-a"));
+    assert_eq!(
+        bridge.locals.get(&1).map(String::as_str),
+        Some("ta000000000")
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn an_older_halt_record_on_the_tail_does_not_lift_a_newer_standing_halt() {
-    let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     let halt = |off: u64, state: &str| -> BrokerRecord {
         let body = format!("v=1 t=1 state={state} reason=stop");
         (off, "/f/f/fleet/h-b/halt".to_string(), body.into_bytes())
@@ -9143,12 +9843,12 @@ fn local_pair_world(
     String,
     (astream_broker::Broker, astream_broker::BrokerHandle),
 ) {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     let (socket, broker, server) = serve_log(&lane, name);
     bridge.cfg.broker = socket.clone();
     assert!(bridge.attach_broker());
     let face = format!(
-        "/f/{}/in/{}/s-b/{}/note",
+        "/f/{}/in/{}/tb000000000/{}/note",
         bridge.cfg.fleet, bridge.node, bridge.node
     );
     (lane, bridge, socket, face, (broker, server))
@@ -9171,8 +9871,8 @@ fn retired_off(lane: &FakeVerbLane, id: u64) -> u64 {
 
 #[cfg(unix)]
 fn own_lane_post_costs(per_drain: u64, drains: u64) -> crate::state::FileOps {
-    const A: &str = "s-a";
-    const B: &str = "s-b";
+    const A: &str = "ta000000000";
+    const B: &str = "tb000000000";
     let (lane, mut bridge, _socket, _face, _broker) = local_pair_world("costs");
     let frame = |ids: std::ops::Range<u64>| -> String {
         ids.map(|id| format!("post sid={A} id={id} to=@{B} kind=note len=4\nping"))
@@ -9247,8 +9947,8 @@ fn a_local_post_costs_the_state_dir_a_counted_set_of_operations() {
 #[test]
 fn the_tallys_state_dir_rows_count_what_the_dir_did_and_an_off_tally_counts_none() {
     use crate::wait_tally::{Row, Tally, FILE};
-    const A: &str = "s-a";
-    const B: &str = "s-b";
+    const A: &str = "ta000000000";
+    const B: &str = "tb000000000";
     for on in [true, false] {
         let (lane, mut bridge, _socket, _face, _broker) = local_pair_world("tally-dir");
         let path = bridge.state.root().join(FILE);
@@ -9321,7 +10021,7 @@ fn the_tallys_state_dir_rows_count_what_the_dir_did_and_an_off_tally_counts_none
 #[test]
 fn a_post_events_path_is_timed_to_each_publish_and_its_event_counted_as_a_wake_or_queued() {
     use crate::wait_tally::{Row, Tally, FILE};
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let (socket, _broker, _server) = serve_log(&lane, "tally-path");
     bridge.cfg.broker = socket;
@@ -9329,13 +10029,13 @@ fn a_post_events_path_is_timed_to_each_publish_and_its_event_counted_as_a_wake_o
     let node = bridge.node.clone();
     bridge
         .indexed_subjects
-        .insert(subject::post_lane("f", &node, "s-b", &node, "note"));
+        .insert(subject::post_lane("f", &node, "tb000000000", &node, "note"));
     lane.retire_from_outbox();
     let path = bridge.state.root().join(FILE);
     bridge.tally_to(&path);
     let outbox = |ids: std::ops::Range<u64>| {
         *lane.outbox.lock().unwrap() = Some(
-            ids.map(|id| queued_note("s-a", id, "@s-b", "ping"))
+            ids.map(|id| queued_note("ta000000000", id, "@tb000000000", "ping"))
                 .collect(),
         );
     };
@@ -9408,7 +10108,7 @@ fn acked_is_replaced_whole_after_a_failed_write_and_at_twice_its_keep() {
     // many replaces the drain made.
     let post = |lane: &FakeVerbLane, bridge: &mut Bridge, id: u64| {
         *lane.outbox.lock().unwrap() = Some(format!(
-            "post sid=s-a id={id} to=@s-b kind=note len=4\nping"
+            "post sid=ta000000000 id={id} to=@tb000000000 kind=note len=4\nping"
         ));
         let text = || std::fs::read_to_string(&acked).unwrap_or_default();
         let (before, was) = (bridge.state.ops(), text());
@@ -9458,7 +10158,7 @@ fn acked_is_replaced_whole_after_a_failed_write_and_at_twice_its_keep() {
     }
     std::fs::write(&acked, log).unwrap();
     let (_second_lane, bridge) =
-        FakeVerbLane::bridge_with_state(&[(1, "s-a"), (2, "s-b")], Some(&state));
+        FakeVerbLane::bridge_with_state(&[(1, "ta000000000"), (2, "tb000000000")], Some(&state));
     assert_eq!(
         (bridge.self_acked.clone(), bridge.self_floor),
         (
@@ -9472,7 +10172,7 @@ fn acked_is_replaced_whole_after_a_failed_write_and_at_twice_its_keep() {
 
     std::fs::write(&acked, "7,9,").unwrap();
     let (_third_lane, mut bridge) =
-        FakeVerbLane::bridge_with_state(&[(1, "s-a"), (2, "s-b")], Some(&state));
+        FakeVerbLane::bridge_with_state(&[(1, "ta000000000"), (2, "tb000000000")], Some(&state));
     let before = bridge.state.ops();
     assert!(bridge.remember_self_ack(11).is_ok());
     assert_eq!(
@@ -9491,7 +10191,7 @@ fn a_local_post_that_landed_is_not_published_again_on_the_next_log() {
     let (lane, mut bridge, _socket, face, _log_a) = local_pair_world("landed-a");
     let state = bridge.state.root().to_path_buf();
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=@s-b kind=note len=4\nping".to_string());
+        Some("post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nping".to_string());
     bridge.drain_outbox();
     let off = retired_off(&lane, 1);
     assert!(
@@ -9501,7 +10201,7 @@ fn a_local_post_that_landed_is_not_published_again_on_the_next_log() {
     drop(bridge);
 
     let (_second, mut bridge) =
-        FakeVerbLane::bridge_with_state(&[(1, "s-a"), (2, "s-b")], Some(&state));
+        FakeVerbLane::bridge_with_state(&[(1, "ta000000000"), (2, "tb000000000")], Some(&state));
     let (b, _broker_b, _server_b) = serve_log(&lane, "landed-b");
     bridge.cfg.broker = b;
     assert!(bridge.attach_broker());
@@ -9518,10 +10218,10 @@ fn an_own_lane_posts_reservation_stays_readable_by_an_older_bridge() {
     let (lane, mut bridge, _socket, _face, _log) = local_pair_world("older-reader");
     lane.refuse_retirements(true);
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=@s-b kind=note len=4\nping".to_string());
+        Some("post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nping".to_string());
     bridge.drain_outbox();
     assert!(lane.sent.lock().unwrap().is_empty(), "left listed");
-    let pin = bridge.state.post_pin("s-a", 1).unwrap();
+    let pin = bridge.state.post_pin("ta000000000", 1).unwrap();
     assert!(pin.is_some(), "the journal holds the reservation");
     bridge.end_run();
     let sent = bridge.state.root().join("sent");
@@ -9538,7 +10238,7 @@ fn an_own_lane_posts_reservation_stays_readable_by_an_older_bridge() {
         }
         names.push(name);
     }
-    assert_eq!(names, ["s-a.1"], "the reservation is kept");
+    assert_eq!(names, ["ta000000000.1"], "the reservation is kept");
     let inflight = bridge.state.root().join("inflight");
     if let Ok(entries) = std::fs::read_dir(&inflight) {
         for entry in entries.map(Result::unwrap) {
@@ -9560,8 +10260,12 @@ fn an_own_lane_posts_reservation_stays_readable_by_an_older_bridge() {
         "the stop unlinked the journal, so a later bridge of this build reads the files"
     );
     let next = StateDir::open(bridge.state.root()).unwrap();
-    assert_eq!(next.post_pin("s-a", 1).unwrap(), pin, "and takes it back");
-    assert!(!sent.join("s-a.1").exists());
+    assert_eq!(
+        next.post_pin("ta000000000", 1).unwrap(),
+        pin,
+        "and takes it back"
+    );
+    assert!(!sent.join("ta000000000.1").exists());
 }
 
 #[cfg(unix)]
@@ -9614,7 +10318,7 @@ fn next_delivery<S: std::io::Read + std::io::Write>(
 #[cfg(unix)]
 #[test]
 fn a_halt_published_during_the_attach_refill_is_applied_before_it_ends() {
-    const SID: &str = "s-busy";
+    const SID: &str = "tbvsy000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let (socket, _broker, _server) = serve_log(&lane, "broker");
     bridge.cfg.broker = socket;
@@ -9677,7 +10381,7 @@ fn a_halt_published_during_the_attach_refill_is_applied_before_it_ends() {
 fn unread_mail_the_broker_gave_up_is_told_to_aterm_as_a_link_gap() {
     use crate::broker_rules::{EV_FILTER, MAIL_FILTER, MAIL_READER};
     use astream_broker::{Retention, Rule};
-    const SID: &str = "s-gap";
+    const SID: &str = "tgap0000000";
     const BODY: u64 = 4096;
     let run = |endpoint_lane: u32| -> (Vec<u64>, Vec<u64>, Vec<String>) {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
@@ -9693,7 +10397,7 @@ fn unread_mail_the_broker_gave_up_is_told_to_aterm_as_a_link_gap() {
         let filler = vec![b'e'; BODY as usize];
         for seq in 1..=3 {
             writer
-                .publish(82, seq, "/f/f/pub/n-fill/s-fill/ev", &filler)
+                .publish(82, seq, "/f/f/pub/n-fill/tf111000000/ev", &filler)
                 .unwrap();
         }
         broker.set_retention_interval(Duration::from_secs(3600));
@@ -9760,7 +10464,7 @@ fn unread_mail_the_broker_gave_up_is_told_to_aterm_as_a_link_gap() {
 #[cfg(unix)]
 #[test]
 fn a_replaced_log_keeps_the_halts_it_lost_until_their_human_writes_a_row() {
-    const SID: &str = "s-held";
+    const SID: &str = "the1d000000";
     let held = format!("hold {SID} on reason=stop origin=fleet");
     let lifted = format!("hold {SID} off origin=fleet");
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
@@ -9830,7 +10534,7 @@ fn a_replaced_log_keeps_the_halts_it_lost_until_their_human_writes_a_row() {
 #[cfg(unix)]
 #[test]
 fn a_log_with_another_identity_has_every_old_offset_forgotten_however_long_it_is() {
-    const SID: &str = "s-moved";
+    const SID: &str = "tm0ved00000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     assert!(bridge.refresh_sessions().is_ok());
     bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
@@ -9972,7 +10676,7 @@ fn a_log_with_another_identity_has_every_old_offset_forgotten_however_long_it_is
 #[cfg(unix)]
 #[test]
 fn a_known_log_identity_that_rewinds_is_refused_before_any_clock_mutation() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     lane.answer_hello_with(&format!("OK lane={LINK_LOG_LANE} build=test\n"));
     bridge.begin_run();
@@ -10131,7 +10835,7 @@ fn a_known_log_identity_that_rewinds_is_refused_before_any_clock_mutation() {
 #[test]
 fn a_power_loss_under_a_relaxed_broker_continues_the_log_at_the_next_boot() {
     use crate::durability::{self, Durability};
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let cases = [
         (true, false, true),
         (true, true, true),
@@ -10196,7 +10900,7 @@ fn a_power_loss_under_a_relaxed_broker_continues_the_log_at_the_next_boot() {
         let body = Body::new(0).encode();
         let (mut other, _) = bridge.connect().unwrap();
         let (at_fork, _) = other
-            .publish(82, 1, "/f/f/pub/n-src/s-src/say/t", &body)
+            .publish(82, 1, "/f/f/pub/n-src/tsrc0000000/say/t", &body)
             .unwrap();
         assert_eq!(
             at_fork, 4,
@@ -10225,7 +10929,7 @@ fn a_power_loss_under_a_relaxed_broker_continues_the_log_at_the_next_boot() {
             assert_eq!(bridge.state.rewound_log().unwrap(), None, "{case}");
             assert!(bridge.sync_say_face(), "{case}");
             let (sentinel, _) = other
-                .publish(82, seq, "/f/f/pub/n-src/s-src/say/t", &body)
+                .publish(82, seq, "/f/f/pub/n-src/tsrc0000000/say/t", &body)
                 .unwrap();
             let first = fan_in_next_say(&mut bridge);
             if lineage {
@@ -10268,7 +10972,7 @@ fn a_power_loss_under_a_relaxed_broker_continues_the_log_at_the_next_boot() {
 #[test]
 fn a_moved_generation_of_a_log_refused_as_rewound_continues_nothing() {
     use crate::durability::{self, Durability};
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     lane.answer_hello_with(&format!("OK lane={LINK_LOG_LANE} build=test\n"));
     bridge.introduce();
@@ -10399,7 +11103,7 @@ fn a_moved_generation_of_a_log_refused_as_rewound_continues_nothing() {
 #[test]
 fn an_in_flight_reply_below_the_fork_is_published_on_the_moved_generation() {
     use crate::durability::{self, Durability};
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for lineage in [true, false] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         lane.answer_hello_with(&format!("OK lane={LINK_LOG_LANE} build=test\n"));
@@ -10514,7 +11218,7 @@ fn an_in_flight_reply_below_the_fork_is_published_on_the_moved_generation() {
 #[test]
 fn an_entry_a_replay_published_on_a_moved_generation_is_read_back_from_the_fork() {
     use crate::durability::{self, Durability};
-    let sessions = [(1, "s-a"), (2, "s-b")];
+    let sessions = [(1, "ta000000000"), (2, "tb000000000")];
     for control in [false, true] {
         let case = format!("control={control}");
         let (lane, mut first) = FakeVerbLane::bridge(&sessions);
@@ -10526,9 +11230,9 @@ fn an_entry_a_replay_published_on_a_moved_generation_is_read_back_from_the_fork(
         let log = lane.dir.path().join("moved.log");
         let socket = lane.dir.path().join("moved.sock");
         first.cfg.broker = socket.to_string_lossy().into_owned();
-        let subject = format!("/f/f/in/{0}/s-b/{0}/note", first.node);
+        let subject = format!("/f/f/in/{0}/tb000000000/{0}/note", first.node);
         let mut note = Body::new(1);
-        note.from = Some("s-a".into());
+        note.from = Some("ta000000000".into());
         note.text = "once".into();
         let body = note.encode();
         let (cut, old) = {
@@ -10647,7 +11351,7 @@ fn an_entry_a_replay_published_on_a_moved_generation_is_read_back_from_the_fork(
 #[test]
 fn a_moved_generation_is_told_to_a_lane_3_endpoint_with_its_fork() {
     use crate::durability::{self, Durability};
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for (endpoint_lane, lineage, refuse) in [
         (LINK_CONTINUES_LANE, true, false),
         (LINK_LOG_LANE, true, false),
@@ -10760,7 +11464,7 @@ fn a_moved_generation_is_told_to_a_lane_3_endpoint_with_its_fork() {
 #[test]
 fn a_clamp_clears_halt_acked_and_the_halt_is_answered_again() {
     use crate::durability::{self, Durability};
-    const SID: &str = "s-held";
+    const SID: &str = "the1d000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     assert!(bridge.refresh_sessions().is_ok());
     let log = lane.dir.path().join("relaxed.log");
@@ -10847,8 +11551,8 @@ fn a_clamp_clears_halt_acked_and_the_halt_is_answered_again() {
 #[cfg(unix)]
 #[test]
 fn a_log_switch_drops_old_commit_floors_but_keeps_the_session_fence() {
-    const HELD: &str = "s-held";
-    const HEALTHY: &str = "s-healthy";
+    const HELD: &str = "the1d000000";
+    const HEALTHY: &str = "thea1thy000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, HELD), (2, HEALTHY)]);
     assert!(bridge.refresh_sessions().is_ok());
     let (a, _broker_a, _server_a) = serve_log(&lane, "debt-a");
@@ -10856,7 +11560,7 @@ fn a_log_switch_drops_old_commit_floors_but_keeps_the_session_fence() {
     assert!(bridge.attach_broker());
     let node = bridge.node.clone();
     let face = |sid: &str| format!("/f/f/in/{node}/{sid}/n-peer/note");
-    let body = b"v=1 t=1 from=s-peer text=mail";
+    let body = b"v=1 t=1 from=tpeer000000 text=mail";
     let (mut writer, _) = bridge.connect().unwrap();
     let (old, _) = writer.publish(81, 1, &face(HELD), body).unwrap();
     lane.answer_deliveries_to(HELD, SHIPPED_DELIVER_USAGE);
@@ -10954,7 +11658,7 @@ fn burst_rig(
     assert!(bridge.refresh_sessions().is_ok());
     bridge.per_sid.pending_admit.clear();
     let face = format!("/f/f/in/{}/{sid}/n-peer/note", bridge.node);
-    let body = b"v=1 t=1 from=s-peer text=burst".to_vec();
+    let body = b"v=1 t=1 from=tpeer000000 text=burst".to_vec();
     let (mut writer, _) = bridge.connect().unwrap();
     let records = (1..=n)
         .map(|seq| {
@@ -10968,7 +11672,7 @@ fn burst_rig(
 #[cfg(unix)]
 #[test]
 fn a_refill_below_the_retained_floor_reads_on_from_it() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let (records, mut reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, SID, 3);
     let offs: Vec<u64> = records.iter().map(|r| r.0).collect();
@@ -11015,7 +11719,7 @@ fn told_gaps(lane: &FakeVerbLane) -> Vec<String> {
 #[cfg(unix)]
 #[test]
 fn a_refill_from_seen_below_the_retained_floor_tells_that_session_what_went() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let run = |seen: bool, endpoint_lane: u32| {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         bridge.endpoint_lane = endpoint_lane;
@@ -11117,8 +11821,8 @@ fn together_rig_with(
         "PRECONDITION: every session is owed its refill"
     );
     let (mut writer, _) = bridge.connect().unwrap();
-    let body = b"v=1 t=1 from=s-peer text=mail".to_vec();
-    let elsewhere = subject::session_face("f", &bridge.node, "s-else", "ev");
+    let body = b"v=1 t=1 from=tpeer000000 text=mail".to_vec();
+    let elsewhere = subject::session_face("f", &bridge.node, "te1se000000", "ev");
     let mut mails: BTreeMap<&'static str, Vec<u64>> = BTreeMap::new();
     for (seq, to) in (1..).zip(order) {
         match to {
@@ -11167,7 +11871,7 @@ fn together_rig_cut(
     rig
 }
 
-const TOGETHER: [&str; 3] = ["s-ta", "s-tb", "s-tc"];
+const TOGETHER: [&str; 3] = ["tta00000000", "ttb00000000", "ttc00000000"];
 
 /// The lane's `deliver <off>` lines, in the order aterm was asked.
 fn offered(lane: &FakeVerbLane) -> Vec<u64> {
@@ -11694,7 +12398,7 @@ fn carry_below_the_lanes_oldest(broker: &astream_broker::Broker, lane: &str, bef
 #[cfg(unix)]
 #[test]
 fn a_refill_offers_the_mail_retention_holds_below_its_lanes_oldest() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for control in [false, true] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
@@ -11707,7 +12411,7 @@ fn a_refill_offers_the_mail_retention_holds_below_its_lanes_oldest() {
         }
         let node = bridge.node.clone();
         let face = format!("/f/f/in/{node}/{SID}/n-peer/note");
-        let note = |n: u64| format!("v=1 t=1 from=s-peer text=note-{n}").into_bytes();
+        let note = |n: u64| format!("v=1 t=1 from=tpeer000000 text=note-{n}").into_bytes();
         let (mut writer, _) = bridge.connect().unwrap();
         let (seen, _) = writer.publish(91, 1, "/f/f/x/padding", b"v=1").unwrap();
         let (first, _) = writer.publish(92, 1, &face, &note(1)).unwrap();
@@ -11747,7 +12451,7 @@ fn a_refill_offers_the_mail_retention_holds_below_its_lanes_oldest() {
 #[cfg(unix)]
 #[test]
 fn an_inbox_burst_costs_one_commit_record_and_one_record_at_a_time_costs_one_each() {
-    const SID: &str = "s-burst";
+    const SID: &str = "tbvrst00000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let (records, mut reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, SID, 32);
     let (burst, singles) = records.split_at(16);
@@ -11783,8 +12487,9 @@ fn an_inbox_burst_costs_one_commit_record_and_one_record_at_a_time_costs_one_eac
 #[cfg(unix)]
 #[test]
 fn the_round_takes_its_next_item_while_its_commit_is_in_the_flush_and_reads_it_after() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
-    let (records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 1);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
+    let (records, _reader, _socket, broker, _server) =
+        burst_rig(&lane, &mut bridge, "tb000000000", 1);
     let before = bridge.committed;
     bridge.in_round = true;
     bridge.on_inbox_record(&records[0], None);
@@ -11799,7 +12504,7 @@ fn the_round_takes_its_next_item_while_its_commit_is_in_the_flush_and_reads_it_a
     let node = bridge.node.clone();
     bridge
         .indexed_subjects
-        .insert(subject::post_lane("f", &node, "s-b", &node, "note"));
+        .insert(subject::post_lane("f", &node, "tb000000000", &node, "note"));
     let held = broker.pause_next_acks();
     let (go, gate) = std::sync::mpsc::channel::<()>();
     let watchdog = std::thread::spawn(move || {
@@ -11809,7 +12514,7 @@ fn the_round_takes_its_next_item_while_its_commit_is_in_the_flush_and_reads_it_a
         reached
     });
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=@s-b kind=note len=4\npong".to_string());
+        Some("post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\npong".to_string());
     bridge.mailbox.push_event("EVENT 1 post 1".to_string());
     assert!(bridge.round(aterm_spec::wait::MUST_HAPPEN));
     let owed: Vec<&str> = bridge
@@ -11846,7 +12551,7 @@ fn the_round_takes_its_next_item_while_its_commit_is_in_the_flush_and_reads_it_a
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.starts_with("outbox sent s-a 1 off=")),
+            .any(|l| l.starts_with("outbox sent ta000000000 1 off=")),
         "the post retired: {:?}",
         lane.sent.lock().unwrap()
     );
@@ -11863,9 +12568,10 @@ fn the_round_takes_its_next_item_while_its_commit_is_in_the_flush_and_reads_it_a
 #[cfg(unix)]
 #[test]
 fn an_idle_rounds_inbox_commit_rides_the_reply_in_one_write_and_one_batch() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     bridge.fx = crate::fx::Fx::os().on_a_held_clock();
-    let (records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 1);
+    let (records, _reader, _socket, broker, _server) =
+        burst_rig(&lane, &mut bridge, "tb000000000", 1);
     bridge.in_round = true;
     bridge.on_inbox_record(&records[0], None);
     bridge.in_round = false;
@@ -11890,9 +12596,9 @@ fn an_idle_rounds_inbox_commit_rides_the_reply_in_one_write_and_one_batch() {
     let node = bridge.node.clone();
     bridge
         .indexed_subjects
-        .insert(subject::post_lane("f", &node, "s-b", &node, "note"));
+        .insert(subject::post_lane("f", &node, "tb000000000", &node, "note"));
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=@s-b kind=note len=4\npong".to_string());
+        Some("post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\npong".to_string());
     bridge.mailbox.push_event("EVENT 1 post 1".to_string());
     let batches = broker.stats().writer_batches;
     assert!(bridge.park_and_take(aterm_spec::wait::MUST_HAPPEN));
@@ -11931,7 +12637,7 @@ fn an_idle_rounds_inbox_commit_rides_the_reply_in_one_write_and_one_batch() {
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.starts_with("outbox sent s-a 1 off=")),
+            .any(|l| l.starts_with("outbox sent ta000000000 1 off=")),
         "the post retired: {:?}",
         lane.sent.lock().unwrap()
     );
@@ -11966,9 +12672,10 @@ fn a_held_commit_rides_clamped_below_a_record_still_owed() {
 /// what the held commit that rode the reply named, and the three records.
 #[cfg(unix)]
 fn ride_with_a_record_owed(fx: crate::fx::Fx) -> (Vec<u64>, Vec<BrokerRecord>) {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     bridge.fx = fx.on_a_held_clock();
-    let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 3);
+    let (records, _reader, _socket, _broker, _server) =
+        burst_rig(&lane, &mut bridge, "tb000000000", 3);
     bridge.in_round = true;
     for rec in &records {
         bridge.on_inbox_record(rec, None);
@@ -11978,16 +12685,16 @@ fn ride_with_a_record_owed(fx: crate::fx::Fx) -> (Vec<u64>, Vec<BrokerRecord>) {
     bridge
         .per_sid
         .lane_owed
-        .insert("s-b".to_string(), Some(records[2].0));
+        .insert("tb000000000".to_string(), Some(records[2].0));
     bridge.settle_owed();
     assert!(bridge.commit_held.is_some(), "PRECONDITION: held");
 
     let node = bridge.node.clone();
     bridge
         .indexed_subjects
-        .insert(subject::post_lane("f", &node, "s-b", &node, "note"));
+        .insert(subject::post_lane("f", &node, "tb000000000", &node, "note"));
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=@s-b kind=note len=4\npong".to_string());
+        Some("post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\npong".to_string());
     bridge.mailbox.push_event("EVENT 1 post 1".to_string());
     assert!(bridge.park_and_take(aterm_spec::wait::MUST_HAPPEN));
     let rode: Vec<u64> = bridge
@@ -12151,9 +12858,10 @@ fn a_take_nothing_carries_goes_alone_once_its_grace_is_out() {
             false,
         ),
     ] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
         bridge.fx = fx.on_a_held_clock();
-        let (_records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-a", 0);
+        let (_records, _reader, _socket, broker, _server) =
+            burst_rig(&lane, &mut bridge, "ta000000000", 0);
         bridge.mirror = Some(mirror_run::MirrorRun::acked_for_tests(
             &bridge.state,
             aterm_slog::TAKE_MAX,
@@ -12168,7 +12876,7 @@ fn a_take_nothing_carries_goes_alone_once_its_grace_is_out() {
             .lock()
             .unwrap()
             .logs
-            .insert("s-a".to_string(), an_opened_session_log());
+            .insert("ta000000000".to_string(), an_opened_session_log());
         bridge.mirror_wake();
         let batches = broker.stats().writer_batches;
         let writes = tap_shapes(&mut bridge);
@@ -12327,7 +13035,7 @@ fn a_take_inside_the_rate_hold_goes_after_the_commits_write() {
 
 /// **A TAKE ANOTHER SESSION'S HOLD DOES NOT COVER STILL RIDES THE COMMIT** (critic item
 /// E04c's review): the endpoint's rate hold is per session. A take before a paced note came
-/// back empty with a third session's snapshot held back (`held=s-c`), so the bridge keeps a
+/// back empty with a third session's snapshot held back (`held=tc000000000`), so the bridge keeps a
 /// rate hold that lasts past the test, but the note's sessions owe their snapshots at once.
 /// The note's wakes are theirs, which that hold does not cover
 /// ([`Bridge::mirror_woken_by`]), so the take goes as E04's rule has it: the sender's
@@ -12489,13 +13197,13 @@ fn first_rounds_after_an_attach(
 #[cfg(unix)]
 #[derive(Clone, Copy)]
 enum Drain {
-    /// That many posts to `s-b`, a session this node hosts, counted as its drain counts
+    /// That many posts to `tb000000000`, a session this node hosts, counted as its drain counts
     /// each ([`Bridge::mirror_drained_post`]), their records left for
     /// [`FirstStep::Arrive`].
     Counted(u64),
     /// A real drain of this outbox listing ([`Bridge::drain_outbox`]), its posts' records
-    /// left on the broker, never on the inbox face: the rig reads none. `s-w` is `n-far`'s
-    /// session, pinned there and advertised live, so a post `to=@s-w@n-far` routes to its
+    /// left on the broker, never on the inbox face: the rig reads none. `tw000000000` is `n-far`'s
+    /// session, pinned there and advertised live, so a post `to=@tw000000000@n-far` routes to its
     /// lane.
     Listed(&'static str),
 }
@@ -12511,7 +13219,7 @@ fn first_rounds_after_a_drain(
     steps: &[FirstStep],
 ) -> FirstRun {
     use crate::wait_tally::{Row, Tally, FILE};
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     let mut off = off.to_vec();
     if link != FirstLink::Unnamed {
         off.push(crate::sim::world::Mutant::WaitForEveryAck);
@@ -12521,7 +13229,7 @@ fn first_rounds_after_a_drain(
     let (records, _writer, _socket, broker, _server) = burst_rig(
         &lane,
         &mut bridge,
-        "s-b",
+        "tb000000000",
         queued + u64::try_from(arrivals).unwrap(),
     );
     if link != FirstLink::Unnamed {
@@ -12574,17 +13282,17 @@ fn first_rounds_after_a_drain(
         .lock()
         .unwrap()
         .logs
-        .insert("s-b".to_string(), log);
+        .insert("tb000000000".to_string(), log);
     bridge.mirror_attached();
     match drained {
         Drain::Counted(n) => {
-            let hosted = format!("/f/f/in/{0}/s-b/{0}/note", bridge.node);
+            let hosted = format!("/f/f/in/{0}/tb000000000/{0}/note", bridge.node);
             for _ in 0..n {
                 bridge.mirror_drained_post(&hosted);
             }
         }
         Drain::Listed(listing) => {
-            bridge.state.pin("s-w", "n-far").expect("pin");
+            bridge.state.pin("tw000000000", "n-far").expect("pin");
             bridge
                 .connect()
                 .unwrap()
@@ -12592,10 +13300,10 @@ fn first_rounds_after_a_drain(
                 .publish(
                     9_000,
                     1,
-                    &subject::session_face("f", "n-far", "s-w", "presence"),
+                    &subject::session_face("f", "n-far", "tw000000000", "presence"),
                     b"v=1 t=1 inc=1 state=live",
                 )
-                .expect("n-far advertises s-w");
+                .expect("n-far advertises tw000000000");
             *lane.outbox.lock().unwrap() = Some(listing.to_string());
             bridge.drain_outbox();
             let posts = listing.matches("post sid=").count();
@@ -12826,8 +13534,8 @@ fn a_post_to_another_nodes_session_does_not_hold_the_first_pass() {
         asked: asked.to_vec(),
         fenced,
     };
-    const REMOTE: &str = "post sid=s-a id=1 to=@s-w@n-far kind=note len=4\nmail";
-    const HOSTED: &str = "post sid=s-a id=1 to=@s-b kind=note len=4\nmail";
+    const REMOTE: &str = "post sid=ta000000000 id=1 to=@tw000000000@n-far kind=note len=4\nmail";
+    const HOSTED: &str = "post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nmail";
     let pass = |off: &[Mutant], listing| {
         first_rounds_after_a_drain(Unnamed, off, 0, long, Drain::Listed(listing), &[Pass]).rounds
     };
@@ -13166,9 +13874,10 @@ struct MirrorRide {
 /// its acks are read, a commit still owed goes alone, as the backstop sends it.
 #[cfg(unix)]
 fn mirror_after_a_delivery(fx: crate::fx::Fx, pass: MirrorPass, fenced: bool) -> MirrorRide {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     bridge.fx = fx.on_a_held_clock();
-    let (records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 1);
+    let (records, _reader, _socket, broker, _server) =
+        burst_rig(&lane, &mut bridge, "tb000000000", 1);
     bridge.mirror = Some(mirror_run::MirrorRun::acked_for_tests(
         &bridge.state,
         aterm_slog::TAKE_MAX,
@@ -13196,7 +13905,7 @@ fn mirror_after_a_delivery(fx: crate::fx::Fx, pass: MirrorPass, fenced: bool) ->
         .lock()
         .unwrap()
         .logs
-        .insert("s-b".to_string(), log);
+        .insert("tb000000000".to_string(), log);
 
     bridge.in_round = true;
     bridge.on_inbox_record(&records[0], None);
@@ -13230,7 +13939,7 @@ fn mirror_after_a_delivery(fx: crate::fx::Fx, pass: MirrorPass, fenced: bool) ->
             let node = bridge.node.clone();
             bridge
                 .indexed_subjects
-                .insert(subject::session_face("f", &node, "s-b", "ev"));
+                .insert(subject::session_face("f", &node, "tb000000000", "ev"));
             bridge.in_round = true;
             for i in 0..PIPELINE_WINDOW - 1 {
                 bridge.publish_ev(&format!("ahead {i}"));
@@ -13332,8 +14041,8 @@ fn pass_past_its_hold(bridge: &mut Bridge) {
 }
 
 /// One write's frames named as the fabric bench names a paced note's records in its shapes:
-/// `note` a post, `commit` the inbox commit, `evA` and `evB` a mirror slot of `s-a`'s log
-/// and of `s-b`'s, `ev` any other publish; a run of one name is one, and the names are
+/// `note` a post, `commit` the inbox commit, `evA` and `evB` a mirror slot of `ta000000000`'s log
+/// and of `tb000000000`'s, `ev` any other publish; a run of one name is one, and the names are
 /// joined by `+`.
 #[cfg(unix)]
 fn shape_step(frames: &[(&Then, Option<&str>)]) -> String {
@@ -13342,8 +14051,8 @@ fn shape_step(frames: &[(&Then, Option<&str>)]) -> String {
         let name = match (then, subject) {
             (Then::Commit { .. }, _) => "commit",
             (Then::Post(_), _) => "note",
-            (Then::Mirror { .. }, Some(s)) if s.ends_with("/s-a/ev") => "evA",
-            (Then::Mirror { .. }, Some(s)) if s.ends_with("/s-b/ev") => "evB",
+            (Then::Mirror { .. }, Some(s)) if s.ends_with("/ta000000000/ev") => "evA",
+            (Then::Mirror { .. }, Some(s)) if s.ends_with("/tb000000000/ev") => "evB",
             _ => "ev",
         };
         if names.last() != Some(&name) {
@@ -13426,7 +14135,7 @@ enum Snapshots {
     /// wakes are ones the hold covers.
     InsideTheRateHold,
     /// A take before the note came back empty with a third session's snapshot held back to
-    /// the endpoint's rate past the test's span (`held=s-c`), and every take after it holds
+    /// the endpoint's rate past the test's span (`held=tc000000000`), and every take after it holds
     /// the snapshots the two sessions' logs owe, as with [`Snapshots::Taken`]: the hold is
     /// per session, so the note's wakes are ones it does not cover (critic item E04c's
     /// review).
@@ -13434,7 +14143,7 @@ enum Snapshots {
 }
 
 /// A PACED NOTE BETWEEN TWO SESSIONS OF ONE NODE, as the fabric bench's paced phase sends one
-/// (critic item E04), in an open that holds the pin's fence: `s-a` posts to `s-b`. The post
+/// (critic item E04), in an open that holds the pin's fence: `ta000000000` posts to `tb000000000`. The post
 /// moved A's mail count, so A's log at the lane owes its snapshot, and the endpoint's line
 /// for the post wakes the mirror as it lists the post. The note's ack is read before the
 /// next pass, so the note's write is a writer batch before anything the pass sends. The
@@ -13453,10 +14162,11 @@ enum Snapshots {
 /// loaded machine ran the rig's steps slowly.
 #[cfg(unix)]
 fn a_paced_note_on_one_node(fx: crate::fx::Fx, snapshots: Snapshots) -> PacedNote {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000")]);
     bridge.fx = fx.on_a_held_clock();
     lane.mirror.lock().unwrap().clock = bridge.fx.held_clock();
-    let (_records, mut reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 0);
+    let (_records, mut reader, _socket, broker, _server) =
+        burst_rig(&lane, &mut bridge, "tb000000000", 0);
     bridge.mirror = Some(mirror_run::MirrorRun::acked_for_tests(
         &bridge.state,
         aterm_slog::TAKE_MAX,
@@ -13478,18 +14188,18 @@ fn a_paced_note_on_one_node(fx: crate::fx::Fx, snapshots: Snapshots) -> PacedNot
         }
         Snapshots::InsideTheRateHold => {
             lane.mirror.lock().unwrap().refuse_take =
-                Some("OK 0 slots=0 due=120000 held=s-a,s-b\n".to_string());
+                Some("OK 0 slots=0 due=120000 held=ta000000000,tb000000000\n".to_string());
         }
         Snapshots::OtherSessionHeld => {
             lane.mirror.lock().unwrap().refuse_take =
-                Some("OK 0 slots=0 due=120000 held=s-c\n".to_string());
+                Some("OK 0 slots=0 due=120000 held=tc000000000\n".to_string());
         }
     }
     lane.mirror
         .lock()
         .unwrap()
         .logs
-        .insert("s-a".to_string(), an_opened_session_log());
+        .insert("ta000000000".to_string(), an_opened_session_log());
     if matches!(
         snapshots,
         Snapshots::InsideTheRateHold | Snapshots::OtherSessionHeld
@@ -13518,13 +14228,13 @@ fn a_paced_note_on_one_node(fx: crate::fx::Fx, snapshots: Snapshots) -> PacedNot
             .lock()
             .unwrap()
             .logs
-            .insert("s-b".to_string(), b_log);
+            .insert("tb000000000".to_string(), b_log);
     });
     let node = bridge.node.clone();
-    let lane_face = subject::post_lane("f", &node, "s-b", &node, "note");
+    let lane_face = subject::post_lane("f", &node, "tb000000000", &node, "note");
     bridge.indexed_subjects.insert(lane_face.clone());
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=@s-b kind=note len=4\nnote".to_string());
+        Some("post sid=ta000000000 id=1 to=@tb000000000 kind=note len=4\nnote".to_string());
     bridge.mailbox.push_event("EVENT 1 post 1".to_string());
     let batches = broker.stats().writer_batches;
     let takes_before = lane.mirror.lock().unwrap().takes;
@@ -13547,7 +14257,7 @@ fn a_paced_note_on_one_node(fx: crate::fx::Fx, snapshots: Snapshots) -> PacedNot
         .lock()
         .unwrap()
         .iter()
-        .find_map(|l| l.strip_prefix("outbox sent s-a 1 off="))
+        .find_map(|l| l.strip_prefix("outbox sent ta000000000 1 off="))
         .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
         .expect("PRECONDITION: the note landed");
     let (rows, _) = reader
@@ -13591,7 +14301,9 @@ fn a_paced_note_on_one_node(fx: crate::fx::Fx, snapshots: Snapshots) -> PacedNot
             .any(|l| l.split_whitespace().step_by(2).any(|word| word == sid))
     };
     let done = |bridge: &Bridge| match snapshots {
-        Snapshots::Taken | Snapshots::OtherSessionHeld => landed("s-a") && landed("s-b"),
+        Snapshots::Taken | Snapshots::OtherSessionHeld => {
+            landed("ta000000000") && landed("tb000000000")
+        }
         Snapshots::HeldBack => true,
         Snapshots::InsideTheRateHold => bridge.mirror.as_deref().is_some_and(|m| !m.owed()),
     };
@@ -13646,9 +14358,10 @@ fn the_wind_down_lands_a_held_inbox_commit() {
             false,
         ),
     ] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tb000000000")]);
         bridge.fx = fx.on_a_held_clock();
-        let (records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 1);
+        let (records, _reader, _socket, broker, _server) =
+            burst_rig(&lane, &mut bridge, "tb000000000", 1);
         let group = subject::inbox_group(&bridge.cfg.fleet, &bridge.node);
         assert_eq!(
             broker.group_start(&group),
@@ -13696,9 +14409,10 @@ fn the_wind_down_lands_a_held_inbox_commit() {
 #[cfg(unix)]
 #[test]
 fn a_held_inbox_commit_goes_alone_once_its_grace_is_out() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tb000000000")]);
     bridge.fx = crate::fx::Fx::os().on_a_held_clock();
-    let (records, _reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 2);
+    let (records, _reader, _socket, broker, _server) =
+        burst_rig(&lane, &mut bridge, "tb000000000", 2);
     let group = subject::inbox_group(&bridge.cfg.fleet, &bridge.node);
 
     bridge.in_round = true;
@@ -13777,7 +14491,7 @@ fn a_held_inbox_commit_goes_alone_once_its_grace_is_out() {
 #[cfg(unix)]
 #[test]
 fn record_zero_commits_below_a_record_owed_just_past_it() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tb000000000")]);
     let (records, _reader, _socket, broker, _server) =
         owe_the_record_past_record_zero(&lane, &mut bridge);
     let group = subject::inbox_group(&bridge.cfg.fleet, &bridge.node);
@@ -13820,7 +14534,7 @@ fn record_zero_commits_below_a_record_owed_just_past_it() {
 #[cfg(unix)]
 #[test]
 fn record_zero_is_left_for_the_next_bridge_below_a_record_owed_just_past_it() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tb000000000")]);
     let (records, _writer, _socket, _broker, _server) =
         owe_the_record_past_record_zero(&lane, &mut bridge);
     bridge.conn = None;
@@ -13832,7 +14546,7 @@ fn record_zero_is_left_for_the_next_bridge_below_a_record_owed_just_past_it() {
     );
 }
 
-/// A fresh log's first two records delivered to `s-b`, the second still owed to it.
+/// A fresh log's first two records delivered to `tb000000000`, the second still owed to it.
 #[cfg(unix)]
 fn owe_the_record_past_record_zero(
     lane: &FakeVerbLane,
@@ -13844,7 +14558,7 @@ fn owe_the_record_past_record_zero(
     astream_broker::Broker,
     astream_broker::BrokerHandle,
 ) {
-    let rig = burst_rig(lane, bridge, "s-b", 2);
+    let rig = burst_rig(lane, bridge, "tb000000000", 2);
     let records = &rig.0;
     assert_eq!(records[0].0, 0, "PRECONDITION: a fresh log's first record");
     bridge.in_round = true;
@@ -13855,7 +14569,7 @@ fn owe_the_record_past_record_zero(
     bridge
         .per_sid
         .lane_owed
-        .insert("s-b".to_string(), Some(records[1].0));
+        .insert("tb000000000".to_string(), Some(records[1].0));
     assert_eq!(bridge.inbox_pending, Some(records[1].0), "PRECONDITION");
     rig
 }
@@ -13868,8 +14582,9 @@ fn owe_the_record_past_record_zero(
 #[cfg(unix)]
 #[test]
 fn a_commit_that_a_record_owed_to_a_session_stops_is_not_held() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
-    let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 3);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tb000000000")]);
+    let (records, _reader, _socket, _broker, _server) =
+        burst_rig(&lane, &mut bridge, "tb000000000", 3);
     bridge.in_round = true;
     bridge.on_inbox_record(&records[0], None);
     bridge.in_round = false;
@@ -13890,7 +14605,7 @@ fn a_commit_that_a_record_owed_to_a_session_stops_is_not_held() {
     bridge
         .per_sid
         .lane_owed
-        .insert("s-b".to_string(), Some(owed_off));
+        .insert("tb000000000".to_string(), Some(owed_off));
     assert_eq!(bridge.inbox_pending, Some(records[2].0), "PRECONDITION");
     assert_eq!(
         bridge.commit_target(records[2].0),
@@ -13922,9 +14637,10 @@ fn a_commit_that_a_record_owed_to_a_session_stops_is_not_held() {
 #[cfg(unix)]
 #[test]
 fn an_item_off_the_bus_sends_a_held_commit_before_it_is_handled() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-b")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tb000000000")]);
     bridge.fx = crate::fx::Fx::os().on_a_held_clock();
-    let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, "s-b", 2);
+    let (records, _reader, _socket, _broker, _server) =
+        burst_rig(&lane, &mut bridge, "tb000000000", 2);
     bridge.in_round = true;
     bridge.on_inbox_record(&records[0], None);
     bridge.in_round = false;
@@ -13966,13 +14682,13 @@ fn an_item_off_the_bus_sends_a_held_commit_before_it_is_handled() {
 #[cfg(unix)]
 #[test]
 fn a_commit_refused_by_a_rolled_back_batch_keeps_the_link_and_its_retry_lands_it() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     let socket = lane.dir.path().join("commit-refused.sock");
     let broker = astream_broker::Broker::open(lane.dir.path().join("commit-refused.log")).unwrap();
     let _server = broker.serve(&socket).unwrap();
     bridge.cfg.broker = socket.to_string_lossy().into_owned();
     bridge.conn = Some(bridge.connect().unwrap().0.into());
-    let face = format!("/f/f/in/{}/s-a/n-peer/note", bridge.node);
+    let face = format!("/f/f/in/{}/ta000000000/n-peer/note", bridge.node);
     let (mut writer, _) = bridge.connect().unwrap();
     let (r0, _) = writer.publish(91, 1, &face, b"v=1 t=1 text=a").unwrap();
     let (r1, _) = writer.publish(91, 2, &face, b"v=1 t=1 text=b").unwrap();
@@ -14035,7 +14751,7 @@ fn a_commit_refused_by_a_rolled_back_batch_keeps_the_link_and_its_retry_lands_it
 #[test]
 fn the_wait_tally_counts_the_commit_and_the_ack_the_loop_waited_on_and_an_off_one_counts_nothing() {
     use crate::wait_tally::{Row, Tally, FILE};
-    const SID: &str = "s-tally";
+    const SID: &str = "tta11y00000";
     for on in [true, false] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, SID, 4);
@@ -14105,7 +14821,7 @@ fn the_wait_tally_counts_the_commit_and_the_ack_the_loop_waited_on_and_an_off_on
 #[cfg(unix)]
 #[test]
 fn a_crash_before_the_bursts_commit_redelivers_the_burst_and_the_endpoint_keeps_one_of_each() {
-    const SID: &str = "s-crash";
+    const SID: &str = "tcrash00000";
     const N: usize = 8;
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let (burst, mut reader, socket, _broker, _server) =
@@ -14148,7 +14864,7 @@ fn a_crash_before_the_bursts_commit_redelivers_the_burst_and_the_endpoint_keeps_
     assert_eq!(log_head(&mut reader) - before, 1, "and committed once");
     let (mut writer, _) = bridge.connect().unwrap();
     let (sentinel, _) = writer
-        .publish(92, 1, &burst[0].1, b"v=1 t=2 from=s-peer text=after")
+        .publish(92, 1, &burst[0].1, b"v=1 t=2 from=tpeer000000 text=after")
         .unwrap();
     assert_eq!(
         group_offers("the cursor after the commit", 1),
@@ -14160,8 +14876,8 @@ fn a_crash_before_the_bursts_commit_redelivers_the_burst_and_the_endpoint_keeps_
 #[cfg(unix)]
 #[test]
 fn a_reconnect_does_not_commit_a_local_refusal_whose_verdict_never_landed() {
-    const HOSTED: &str = "s-hosted";
-    const ABSENT: &str = "s-not-hosted";
+    const HOSTED: &str = "th0sted0000";
+    const ABSENT: &str = "tn0txh0sted";
     let (lane, bridge) = FakeVerbLane::bridge(&[(1, HOSTED)]);
     let (socket, _broker, _server) = serve_log(&lane, "unproved");
     struct CloseBridge(Bridge);
@@ -14257,8 +14973,8 @@ fn a_reconnect_does_not_commit_a_local_refusal_whose_verdict_never_landed() {
 #[cfg(unix)]
 #[test]
 fn no_burst_commit_passes_an_owed_record() {
-    const HELD: &str = "s-held";
-    const OK: &str = "s-ok";
+    const HELD: &str = "the1d000000";
+    const OK: &str = "t0k00000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, HELD), (2, OK)]);
     let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, OK, 6);
     let node = bridge.node.clone();
@@ -14269,7 +14985,7 @@ fn no_burst_commit_passes_an_owed_record() {
             body.to_vec(),
         )
     };
-    let plain = b"v=1 t=1 from=s-peer text=hi";
+    let plain = b"v=1 t=1 from=tpeer000000 text=hi";
     lane.answer_deliveries_to(HELD, SHIPPED_DELIVER_USAGE);
     queue_inbox(
         &bridge,
@@ -14310,7 +15026,7 @@ fn no_burst_commit_passes_an_owed_record() {
 #[cfg(unix)]
 #[test]
 fn no_exit_commit_passes_an_unaccounted_record() {
-    const OK: &str = "s-ok";
+    const OK: &str = "t0k00000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, OK)]);
     let (records, _reader, _socket, _broker, _server) = burst_rig(&lane, &mut bridge, OK, 4);
     bridge.on_inbox_record(&records[0], None);
@@ -14326,7 +15042,7 @@ fn no_exit_commit_passes_an_unaccounted_record() {
         &(
             *off,
             subject.clone(),
-            b"v=1 t=1 from=s-peer via=NOT-A-PRINCIPAL text=x".to_vec(),
+            b"v=1 t=1 from=tpeer000000 via=NOT-A-PRINCIPAL text=x".to_vec(),
         ),
         None,
     );
@@ -14369,14 +15085,14 @@ fn no_exit_commit_passes_an_unaccounted_record() {
 #[test]
 fn a_local_refusal_sends_the_rows_its_run_queued_ahead_of_it_first() {
     use crate::sim::world::Mutant;
-    const OK: &str = "s-ok";
+    const OK: &str = "t0k00000000";
     let run =
         |fx: crate::fx::Fx, aterm_leaves: bool| -> (Vec<u64>, Option<u64>, Vec<usize>, Vec<u64>) {
             let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, OK)]);
             bridge.fx = fx;
             let (mut records, _reader, _socket, _broker, _server) =
                 burst_rig(&lane, &mut bridge, OK, 4);
-            records[2].2 = b"v=1 t=1 from=s-peer via=NOT-A-PRINCIPAL text=x".to_vec();
+            records[2].2 = b"v=1 t=1 from=tpeer000000 via=NOT-A-PRINCIPAL text=x".to_vec();
             bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
             bridge.endpoint_build = Some(aterm_stamp::build_id());
             // No `link up` report falls due while the run is handled: it is a lane request,
@@ -14441,8 +15157,8 @@ fn first_offered(socket: &str, node: &str, what: &str) -> u64 {
 #[cfg(unix)]
 #[test]
 fn a_records_commit_waits_for_its_own_verdicts_answer_and_dies_with_its_connection() {
-    const SID: &str = "s-host";
-    const ABSENT: &str = "s-not-hosted";
+    const SID: &str = "th0st000000";
+    const ABSENT: &str = "tn0txh0sted";
     for dropped in [false, true] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let (records, mut writer, socket, _broker, _server) = burst_rig(&lane, &mut bridge, SID, 1);
@@ -14507,14 +15223,14 @@ fn a_records_commit_waits_for_its_own_verdicts_answer_and_dies_with_its_connecti
 #[cfg(unix)]
 #[test]
 fn a_notice_a_dead_publisher_never_carried_is_not_committed_past() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let (records, mut reader, socket, _broker, _server) = burst_rig(&lane, &mut bridge, SID, 1);
     let node = bridge.node.clone();
     let face = format!("/f/f/in/{node}/{SID}/n-peer/note");
     bridge.on_inbox_record(&records[0], None);
     assert_eq!(bridge.committed, Some(records[0].0));
-    let refused = b"v=1 t=1 from=s-peer via=NOT-A-PRINCIPAL text=x";
+    let refused = b"v=1 t=1 from=tpeer000000 via=NOT-A-PRINCIPAL text=x";
     let (mut writer, _) = bridge.connect().unwrap();
     let off = writer.publish(93, 1, &face, refused).unwrap().0;
     let (conn, closer) = bridge.connect().unwrap();
@@ -14533,14 +15249,14 @@ fn a_notice_a_dead_publisher_never_carried_is_not_committed_past() {
         "nothing past the refusal"
     );
     let (sentinel, _) = writer
-        .publish(94, 1, &face, b"v=1 t=2 from=s-peer text=s")
+        .publish(94, 1, &face, b"v=1 t=2 from=tpeer000000 text=s")
         .unwrap();
     assert_eq!(
         first_offered(&socket, &node, "the durable cursor"),
         off,
         "offered again, not committed past for sentinel {sentinel}"
     );
-    let notices = format!("/f/f/in/n-peer/s-peer/{node}/undeliverable");
+    let notices = format!("/f/f/in/n-peer/tpeer000000/{node}/undeliverable");
     let (rows, _) = reader.fetch(0, &notices, 64).unwrap();
     assert!(rows.is_empty(), "no notice landed: {rows:?}");
     bridge.close_subscriptions();
@@ -14549,7 +15265,7 @@ fn a_notice_a_dead_publisher_never_carried_is_not_committed_past() {
 #[cfg(unix)]
 #[test]
 fn an_exit_with_no_connection_hands_the_bursts_commit_to_the_next_bridge() {
-    const SID: &str = "s-burst";
+    const SID: &str = "tbvrst00000";
     for handed in [true, false] {
         let (lane, mut old) = FakeVerbLane::bridge(&[(1, SID)]);
         let state = old.state.root().to_path_buf();
@@ -14615,7 +15331,7 @@ fn old_bridge_forgets_the_hand_over(state: &std::path::Path) {
 #[cfg(unix)]
 #[test]
 fn a_commit_another_nodes_bridge_handed_over_is_not_made_on_this_nodes_group() {
-    const SID: &str = "s-burst";
+    const SID: &str = "tbvrst00000";
     const NOW: &str = "n-rotated";
     let (lane, mut old) = FakeVerbLane::bridge(&[(1, SID)]);
     let state = old.state.root().to_path_buf();
@@ -14666,7 +15382,7 @@ fn a_commit_another_nodes_bridge_handed_over_is_not_made_on_this_nodes_group() {
 #[test]
 fn a_handed_over_inbox_commit_above_the_fork_dies_with_a_relaxed_generation() {
     use crate::durability::{self, Durability};
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for reboot in [true, false] {
         let case = format!("reboot={reboot}");
         let (lane, mut old) = FakeVerbLane::bridge(&[(1, SID)]);
@@ -14679,7 +15395,7 @@ fn a_handed_over_inbox_commit_above_the_fork_dies_with_a_relaxed_generation() {
         old.cfg.broker = socket.to_string_lossy().into_owned();
         let node = old.node.clone();
         let face = format!("/f/f/in/{node}/{SID}/n-peer/note");
-        let body = b"v=1 t=1 from=s-peer text=burst".to_vec();
+        let body = b"v=1 t=1 from=tpeer000000 text=burst".to_vec();
         let (high, cut, burst) = {
             let opened = durability::open(
                 &log,
@@ -14738,7 +15454,7 @@ fn a_handed_over_inbox_commit_above_the_fork_dies_with_a_relaxed_generation() {
         let mut seq = 1;
         while reopened.broker.head() <= high {
             let (off, _) = other
-                .publish(92, seq, &face, b"v=1 t=1 from=s-peer text=new")
+                .publish(92, seq, &face, b"v=1 t=1 from=tpeer000000 text=new")
                 .unwrap();
             new_mail.push(off);
             seq += 1;
@@ -14781,15 +15497,15 @@ fn a_handed_over_inbox_commit_above_the_fork_dies_with_a_relaxed_generation() {
 #[cfg(unix)]
 #[test]
 fn a_refused_live_records_notice_and_its_commit_are_one_record() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let (records, mut reader, socket, _broker, _server) = burst_rig(&lane, &mut bridge, SID, 1);
     let node = bridge.node.clone();
     let face = format!("/f/f/in/{node}/{SID}/n-peer/note");
-    let refused = b"v=1 t=1 from=s-peer via=NOT-A-PRINCIPAL text=x";
+    let refused = b"v=1 t=1 from=tpeer000000 via=NOT-A-PRINCIPAL text=x";
     let (mut writer, _) = bridge.connect().unwrap();
     let mut refused_at = |seq: u64| writer.publish(93, seq, &face, refused).unwrap().0;
-    let notices = format!("/f/f/in/n-peer/s-peer/{node}/undeliverable");
+    let notices = format!("/f/f/in/n-peer/tpeer000000/{node}/undeliverable");
     let answered = |reader: &mut Conn| -> Vec<Option<u64>> {
         let (rows, _) = reader.fetch(0, &notices, 64).unwrap();
         rows.iter().map(|(_, _, b)| Body::decode(b).0.re).collect()
@@ -14810,7 +15526,7 @@ fn a_refused_live_records_notice_and_its_commit_are_one_record() {
     let filter = subject::inbox_filter("f", &node);
     let (mut w, _) = bridge.connect().unwrap();
     let (sentinel, _) = w
-        .publish(94, 1, &face, b"v=1 t=2 from=s-peer text=s")
+        .publish(94, 1, &face, b"v=1 t=2 from=tpeer000000 text=s")
         .unwrap();
     let (client, _) = transport::connect(&socket, aterm_spec::wait::MUST_HAPPEN).unwrap();
     let mut sub = client.subscribe_group(&group, &filter).unwrap();
@@ -14824,7 +15540,7 @@ fn a_refused_live_records_notice_and_its_commit_are_one_record() {
         &(
             sentinel,
             face.clone(),
-            b"v=1 t=2 from=s-peer text=s".to_vec(),
+            b"v=1 t=2 from=tpeer000000 text=s".to_vec(),
         ),
         None,
     );
@@ -14880,7 +15596,7 @@ fn a_refused_live_records_notice_and_its_commit_are_one_record() {
 #[test]
 fn an_attach_sends_every_sessions_presence_row_before_reading_one_ack() {
     const N: u64 = 24;
-    let sids: Vec<String> = (1..=N).map(|i| format!("s-p{i:02}")).collect();
+    let sids: Vec<String> = (1..=N).map(|i| format!("tp{i:09}")).collect();
     let roster: Vec<(u64, &str)> = sids
         .iter()
         .enumerate()
@@ -14988,21 +15704,25 @@ fn notes_on(reader: &mut Conn, subject: &str) -> Vec<(u64, String)> {
 #[cfg(unix)]
 #[test]
 fn a_burst_from_many_senders_is_on_the_wire_at_once_and_each_lands_in_its_order() {
-    const SENDERS: [&str; 3] = ["s-a", "s-b", "s-c"];
-    let (lane, mut bridge) =
-        FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-c"), (4, "s-r")]);
+    const SENDERS: [&str; 3] = ["ta000000000", "tb000000000", "tc000000000"];
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[
+        (1, "ta000000000"),
+        (2, "tb000000000"),
+        (3, "tc000000000"),
+        (4, "tr000000000"),
+    ]);
     assert!(bridge.refresh_sessions().is_ok());
     let (socket, _broker, _server) = serve_log(&lane, "burst");
     bridge.cfg.broker = socket;
     bridge.conn = Some(bridge.connect().unwrap().0.into());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     let burst = |key: bool| -> String {
         let mut frame = String::new();
         for n in 1..=3u64 {
             for sid in SENDERS {
                 let text = format!("{sid}-{n}");
-                let line = queued_note(sid, n, "@s-r", &text);
+                let line = queued_note(sid, n, "@tr000000000", &text);
                 frame.push_str(&if key {
                     line.replacen(" kind=", &format!(" key={text} kind="), 1)
                 } else {
@@ -15069,7 +15789,7 @@ fn a_burst_from_many_senders_is_on_the_wire_at_once_and_each_lands_in_its_order(
     );
 }
 
-/// `s-a`'s post 1 under a pin from a build before publication identities (no identity), and
+/// `ta000000000`'s post 1 under a pin from a build before publication identities (no identity), and
 /// another writer's record at its sequence on `face`: astream's dedup answers the retry
 /// there, and the read back cannot tell that record from the post's first copy, so the
 /// answer is unverifiable ([`Bridge::unverified_publication`]'s case 2). The record's
@@ -15086,14 +15806,14 @@ fn a_legacy_pin_another_writer_answers(bridge: &mut Bridge, face: &str) -> u64 {
         at: None,
     };
     bridge.unsent = None;
-    bridge.state.set_post_pin("s-a", 1, &pin).unwrap();
+    bridge.state.set_post_pin("ta000000000", 1, &pin).unwrap();
     let (mut other, _) = bridge.connect().unwrap();
     let (foreign, deduped) = other
         .publish(
             bridge.producer_id,
             pin.seq,
             face,
-            b"v=1 t=1 from=s-x text=another%20writer",
+            b"v=1 t=1 from=tx000000000 text=another%20writer",
         )
         .unwrap();
     assert!(!deduped);
@@ -15118,7 +15838,7 @@ fn retired_at(retired: &Retired, sid: &str, id: u64) -> Option<u64> {
 
 /// RETENTION CUTS every record below the head, and their dedup keys with them, and the loop
 /// runs as [`Bridge::pass`] does, parked no later than a hold's end and draining at it
-/// ([`Bridge::after_holds`]), until aterm was told both of `s-a`'s posts landed.
+/// ([`Bridge::after_holds`]), until aterm was told both of `ta000000000`'s posts landed.
 #[cfg(unix)]
 fn cut_and_run_out_the_holds(
     lane: &FakeVerbLane,
@@ -15131,12 +15851,13 @@ fn cut_and_run_out_the_holds(
     let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let done = |lane: &FakeVerbLane| {
         let retired = retirements(lane);
-        retired_at(&retired, "s-a", 1).is_some() && retired_at(&retired, "s-a", 2).is_some()
+        retired_at(&retired, "ta000000000", 1).is_some()
+            && retired_at(&retired, "ta000000000", 2).is_some()
     };
     while !done(lane) {
         assert!(
             Instant::now() < deadline,
-            "HANG: s-a's posts were not retired in a minute: {:#?}",
+            "HANG: ta000000000's posts were not retired in a minute: {:#?}",
             retirements(lane)
         );
         let now = bridge.fx.now();
@@ -15162,39 +15883,45 @@ struct HeldWorld {
     /// What the first drain retired, and whether it kept the link.
     first: Retired,
     kept: bool,
-    /// Whether that drain held `s-a` and made no pin for its post 2.
+    /// Whether that drain held `ta000000000` and made no pin for its post 2.
     held: bool,
     /// Every retirement once retention cut the record the answer named and the holds ran
     /// out: empty where the first drain lost the link.
     last: Retired,
-    /// The record another writer put at `s-a`'s pinned sequence.
+    /// The record another writer put at `ta000000000`'s pinned sequence.
     foreign: u64,
 }
 
 #[cfg(unix)]
 fn unverifiable_reservation_world(fx: crate::fx::Fx) -> HeldWorld {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     bridge.fx = fx;
     assert!(bridge.refresh_sessions().is_ok());
     lane.retire_from_outbox();
     let (broker, _server) = on_a_broker(&lane, &mut bridge, true);
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     let foreign = a_legacy_pin_another_writer_answers(&mut bridge, &lane_of);
     *lane.outbox.lock().unwrap() = Some(
-        [("s-a", 1), ("s-b", 1), ("s-a", 2), ("s-b", 2)]
-            .iter()
-            .map(|&(sid, id)| queued_note(sid, id, "@s-r", &format!("{}{id}", &sid[2..])))
-            .collect(),
+        [
+            ("ta000000000", 1),
+            ("tb000000000", 1),
+            ("ta000000000", 2),
+            ("tb000000000", 2),
+        ]
+        .iter()
+        .map(|&(sid, id)| queued_note(sid, id, "@tr000000000", &format!("{}{id}", &sid[1..2])))
+        .collect(),
     );
     bridge.drain_outbox();
     let first = retirements(&lane);
     let kept = bridge.conn.is_some();
     let held = bridge.unverified.holds(
-        "s-a",
+        "ta000000000",
         crate::unverified_hold::Domain::Posts,
         bridge.fx.now(),
-    ) && bridge.state.post_pin("s-a", 2).unwrap().is_none();
+    ) && bridge.state.post_pin("ta000000000", 2).unwrap().is_none();
     let last = if kept {
         cut_and_run_out_the_holds(&lane, &mut bridge, &broker)
     } else {
@@ -15209,18 +15936,18 @@ fn unverifiable_reservation_world(fx: crate::fx::Fx) -> HeldWorld {
     }
 }
 
-/// **AN UNVERIFIABLE RESERVATION HOLDS ONLY ITS OWN SENDER** (critic item F21). `s-a`'s post
+/// **AN UNVERIFIABLE RESERVATION HOLDS ONLY ITS OWN SENDER** (critic item F21). `ta000000000`'s post
 /// 1 is retried at a pin from a build before publication identities, and astream's dedup
 /// answers it with another writer's record, which its read back cannot tell from the post's
 /// first copy ([`Bridge::unverified_publication`]): never taken for its delivery, it stays
-/// queued at its pin. aterm lists `s-a`'s two posts and `s-b`'s two, interleaved, `s-a`'s
-/// first. The drain holds `s-a` (no pin is made for its post 2) and lands both of `s-b`'s on
+/// queued at its pin. aterm lists `ta000000000`'s two posts and `tb000000000`'s two, interleaved, `ta000000000`'s
+/// first. The drain holds `ta000000000` (no pin is made for its post 2) and lands both of `tb000000000`'s on
 /// the link it keeps. Once retention cuts the record the answer named, and its key with it,
-/// the loop parks to the hold's end, and the drain's retry at the pin appends anew: `s-a`'s
+/// the loop parks to the hold's end, and the drain's retry at the pin appends anew: `ta000000000`'s
 /// posts land, in its order, above that record. NEGATIVE CONTROLS:
 /// `Mutant::UnverifiableDropsTheLink`, the whole-link stop of every build before F21: the
-/// drain ends at `s-a`'s post 1 and `s-b`'s posts wait with it; and
-/// `Mutant::UnverifiableHoldsNothing`: the drain goes past the reservation to `s-a`'s post
+/// drain ends at `ta000000000`'s post 1 and `tb000000000`'s posts wait with it; and
+/// `Mutant::UnverifiableHoldsNothing`: the drain goes past the reservation to `ta000000000`'s post
 /// 2, which lands ahead of post 1's retry.
 #[cfg(unix)]
 #[test]
@@ -15230,25 +15957,25 @@ fn an_unverifiable_reservation_holds_only_its_own_sender() {
         world.kept,
         "a verdict is no transport fault: the link is kept"
     );
-    assert!(world.held, "s-a is held, its post 2 unpinned");
-    let b1 = retired_at(&world.first, "s-b", 1);
-    let b2 = retired_at(&world.first, "s-b", 2);
+    assert!(world.held, "ta000000000 is held, its post 2 unpinned");
+    let b1 = retired_at(&world.first, "tb000000000", 1);
+    let b2 = retired_at(&world.first, "tb000000000", 2);
     assert!(
         b1.zip(b2).is_some_and(|(b1, b2)| b1 < b2),
-        "s-b's posts land, in its order, while s-a is held: {:#?}",
+        "tb000000000's posts land, in its order, while ta000000000 is held: {:#?}",
         world.first
     );
     assert!(
-        world.first.iter().all(|(sid, _, _)| sid != "s-a"),
-        "nothing of s-a's is retired while it is held: {:#?}",
+        world.first.iter().all(|(sid, _, _)| sid != "ta000000000"),
+        "nothing of ta000000000's is retired while it is held: {:#?}",
         world.first
     );
-    let a1 = retired_at(&world.last, "s-a", 1);
-    let a2 = retired_at(&world.last, "s-a", 2);
+    let a1 = retired_at(&world.last, "ta000000000", 1);
+    let a2 = retired_at(&world.last, "ta000000000", 2);
     assert!(
         a1.zip(a2)
             .is_some_and(|(a1, a2)| world.foreign < a1 && a1 < a2),
-        "past the cut s-a's posts land in its order, above the record the answer named \
+        "past the cut ta000000000's posts land in its order, above the record the answer named \
          (@{}): {:#?}",
         world.foreign,
         world.last
@@ -15259,7 +15986,7 @@ fn an_unverifiable_reservation_holds_only_its_own_sender() {
     ));
     assert!(
         !stop.kept && stop.first.is_empty(),
-        "CONTROL: the link dropped at s-a's reservation, and s-b's posts waited with it: \
+        "CONTROL: the link dropped at ta000000000's reservation, and tb000000000's posts waited with it: \
          {:#?}",
         stop.first
     );
@@ -15268,12 +15995,13 @@ fn an_unverifiable_reservation_holds_only_its_own_sender() {
         crate::sim::world::Mutant::UnverifiableHoldsNothing,
     ));
     let (a1, a2) = (
-        retired_at(&unheld.last, "s-a", 1),
-        retired_at(&unheld.last, "s-a", 2),
+        retired_at(&unheld.last, "ta000000000", 1),
+        retired_at(&unheld.last, "ta000000000", 2),
     );
     assert!(
-        retired_at(&unheld.first, "s-a", 2).is_some() && a1.zip(a2).is_some_and(|(a1, a2)| a2 < a1),
-        "CONTROL: s-a's post 2 lands ahead of post 1's retry: first {:#?}, last {:#?}",
+        retired_at(&unheld.first, "ta000000000", 2).is_some()
+            && a1.zip(a2).is_some_and(|(a1, a2)| a2 < a1),
+        "CONTROL: ta000000000's post 2 lands ahead of post 1's retry: first {:#?}, last {:#?}",
         unheld.first,
         unheld.last
     );
@@ -15286,9 +16014,9 @@ struct ReplayWorld {
     replayed: bool,
     /// What the attach's drain retired.
     first: Retired,
-    /// Where `s-a`'s post 2 was on the bus before the attach, if it was.
+    /// Where `ta000000000`'s post 2 was on the bus before the attach, if it was.
     landed: Option<u64>,
-    /// Whether `s-a`'s post 2's record still waited for the drain after it.
+    /// Whether `ta000000000`'s post 2's record still waited for the drain after it.
     waits: bool,
     /// Every retirement once retention cut the record the answer named and the holds ran
     /// out, for a post 2 that had not landed.
@@ -15297,12 +16025,13 @@ struct ReplayWorld {
 
 #[cfg(unix)]
 fn replay_behind_an_unverifiable_entry(fx: crate::fx::Fx, landed: bool) -> ReplayWorld {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     bridge.fx = fx;
     assert!(bridge.refresh_sessions().is_ok());
     lane.retire_from_outbox();
     let (broker, _server) = on_a_broker(&lane, &mut bridge, true);
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
     assert!(log.is_some(), "PRECONDITION: the link read its log");
@@ -15320,12 +16049,12 @@ fn replay_behind_an_unverifiable_entry(fx: crate::fx::Fx, landed: bool) -> Repla
         log,
         at: Some(head),
     };
-    // s-a's post 1, in flight under a pin another writer's record answers.
+    // ta000000000's post 1, in flight under a pin another writer's record answers.
     a_legacy_pin_another_writer_answers(&mut bridge, &lane_of);
-    let pin1 = bridge.state.post_pin("s-a", 1).unwrap().unwrap();
+    let pin1 = bridge.state.post_pin("ta000000000", 1).unwrap().unwrap();
     bridge
         .state
-        .set_in_flight(&entry(&pin1, words("s-a", "a1")))
+        .set_in_flight(&entry(&pin1, words("ta000000000", "a1")))
         .unwrap();
     let pinned = |bridge: &mut Bridge, sid: &str, id: u64, body: &[u8]| {
         let pin = PublishPin {
@@ -15345,10 +16074,10 @@ fn replay_behind_an_unverifiable_entry(fx: crate::fx::Fx, landed: bool) -> Repla
             .unwrap();
         pin
     };
-    // s-a's post 2 behind it, and s-b's post 1 behind both, each in flight.
-    let a2 = words("s-a", "a2");
-    let pin2 = pinned(&mut bridge, "s-a", 2, &a2);
-    pinned(&mut bridge, "s-b", 1, &words("s-b", "b1"));
+    // ta000000000's post 2 behind it, and tb000000000's post 1 behind both, each in flight.
+    let a2 = words("ta000000000", "a2");
+    let pin2 = pinned(&mut bridge, "ta000000000", 2, &a2);
+    pinned(&mut bridge, "tb000000000", 1, &words("tb000000000", "b1"));
     let landed = landed.then(|| {
         let (mut other, _) = bridge.connect().unwrap();
         let (off, deduped) = other
@@ -15358,9 +16087,9 @@ fn replay_behind_an_unverifiable_entry(fx: crate::fx::Fx, landed: bool) -> Repla
         off
     });
     *lane.outbox.lock().unwrap() = Some(
-        [("s-a", 1), ("s-b", 1), ("s-a", 2)]
+        [("ta000000000", 1), ("tb000000000", 1), ("ta000000000", 2)]
             .iter()
-            .map(|&(sid, id)| queued_note(sid, id, "@s-r", &format!("{}{id}", &sid[2..])))
+            .map(|&(sid, id)| queued_note(sid, id, "@tr000000000", &format!("{}{id}", &sid[1..2])))
             .collect(),
     );
     let replayed = bridge.settle_in_flight();
@@ -15382,15 +16111,15 @@ fn replay_behind_an_unverifiable_entry(fx: crate::fx::Fx, landed: bool) -> Repla
 }
 
 /// **THE ATTACH'S REPLAY HOLDS AN UNVERIFIABLE ENTRY'S SENDER, AND ONLY IT** (critic item
-/// F21, [`Bridge::replay_in_flight`]'s point 5). `s-a`'s post 1, its post 2 and `s-b`'s post
+/// F21, [`Bridge::replay_in_flight`]'s point 5). `ta000000000`'s post 1, its post 2 and `tb000000000`'s post
 /// 1 are in flight, by sequence, and the replay's answer to post 1 is unverifiable (a pin
 /// from a build before publication identities, another writer's record at its sequence): its
 /// entry is dropped and the post kept queued at its pin, and no fence follows a verdict.
-/// Where `s-a`'s post 2 had not landed, the replay reads it back, finds none and does not
-/// publish it, its post kept queued at its pin; `s-b`'s goes on, and the attach's drain
-/// retires it while `s-a` is held. Past the cut `s-a`'s posts land in its order. Where post
+/// Where `ta000000000`'s post 2 had not landed, the replay reads it back, finds none and does not
+/// publish it, its post kept queued at its pin; `tb000000000`'s goes on, and the attach's drain
+/// retires it while `ta000000000` is held. Past the cut `ta000000000`'s posts land in its order. Where post
 /// 2 had landed, the replay settles it where it is, held for the drain, which retires it
-/// though `s-a` is held: nothing is sent, and its record does not wait out the hold,
+/// though `ta000000000` is held: nothing is sent, and its record does not wait out the hold,
 /// dropping the link at each delivery that meets it. NEGATIVE CONTROLS:
 /// `Mutant::ReplayPastAnUnverifiableEntry`: the replay publishes post 2, which lands ahead of
 /// post 1's retry; `Mutant::HeldRecordWaitsForTheHold`: the landed post 2 waits for the hold,
@@ -15401,18 +16130,18 @@ fn the_attachs_replay_holds_an_unverifiable_entrys_sender() {
     let world = replay_behind_an_unverifiable_entry(crate::fx::Fx::os(), false);
     assert!(world.replayed, "the replay settles the journal");
     assert!(
-        retired_at(&world.first, "s-b", 1).is_some()
-            && world.first.iter().all(|(sid, _, _)| sid != "s-a"),
-        "s-b's post lands while s-a is held: {:#?}",
+        retired_at(&world.first, "tb000000000", 1).is_some()
+            && world.first.iter().all(|(sid, _, _)| sid != "ta000000000"),
+        "tb000000000's post lands while ta000000000 is held: {:#?}",
         world.first
     );
     let (a1, a2) = (
-        retired_at(&world.last, "s-a", 1),
-        retired_at(&world.last, "s-a", 2),
+        retired_at(&world.last, "ta000000000", 1),
+        retired_at(&world.last, "ta000000000", 2),
     );
     assert!(
         a1.zip(a2).is_some_and(|(a1, a2)| a1 < a2),
-        "past the cut s-a's posts land in its order: {:#?}",
+        "past the cut ta000000000's posts land in its order: {:#?}",
         world.last
     );
     let past = replay_behind_an_unverifiable_entry(
@@ -15420,22 +16149,22 @@ fn the_attachs_replay_holds_an_unverifiable_entrys_sender() {
         false,
     );
     let (a1, a2) = (
-        retired_at(&past.last, "s-a", 1),
-        retired_at(&past.last, "s-a", 2),
+        retired_at(&past.last, "ta000000000", 1),
+        retired_at(&past.last, "ta000000000", 2),
     );
     assert!(
         a1.zip(a2).is_some_and(|(a1, a2)| a2 < a1),
-        "CONTROL: the replay published s-a's post 2 ahead of post 1's retry: {:#?}",
+        "CONTROL: the replay published ta000000000's post 2 ahead of post 1's retry: {:#?}",
         past.last
     );
 
     let landed = replay_behind_an_unverifiable_entry(crate::fx::Fx::os(), true);
     assert!(
         landed.landed.is_some()
-            && retired_at(&landed.first, "s-a", 2) == landed.landed
-            && retired_at(&landed.first, "s-a", 1).is_none()
+            && retired_at(&landed.first, "ta000000000", 2) == landed.landed
+            && retired_at(&landed.first, "ta000000000", 1).is_none()
             && !landed.waits,
-        "a landed post 2 is retired where it landed while s-a is held: {:#?}",
+        "a landed post 2 is retired where it landed while ta000000000 is held: {:#?}",
         landed.first
     );
     let waiting = replay_behind_an_unverifiable_entry(
@@ -15443,7 +16172,7 @@ fn the_attachs_replay_holds_an_unverifiable_entrys_sender() {
         true,
     );
     assert!(
-        retired_at(&waiting.first, "s-a", 2).is_none() && waiting.waits,
+        retired_at(&waiting.first, "ta000000000", 2).is_none() && waiting.waits,
         "CONTROL: the landed post 2 waits for the hold, its record held from delivery: \
          {:#?}",
         waiting.first
@@ -15500,7 +16229,7 @@ fn landed_earlier(bridge: &Bridge, seq: u64, subject: &str, body: &[u8]) -> u64 
 #[cfg(unix)]
 struct LeftWorld {
     replayed: bool,
-    /// The copies of `s-a`'s post 2 on the bus after the attach and its drain.
+    /// The copies of `ta000000000`'s post 2 on the bus after the attach and its drain.
     copies: usize,
     /// Whether post 2's entry still stood.
     stands: bool,
@@ -15508,31 +16237,31 @@ struct LeftWorld {
 
 #[cfg(unix)]
 fn left_the_outbox_behind_an_unverifiable_entry(fx: crate::fx::Fx) -> LeftWorld {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (3, "s-r")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (3, "tr000000000")]);
     bridge.fx = fx;
     assert!(bridge.refresh_sessions().is_ok());
     lane.retire_from_outbox();
     let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     let head = head_of(&bridge);
     let words = |text: &str| {
         let mut body = Body::new(1);
-        body.from = Some("s-a".to_string());
+        body.from = Some("ta000000000".to_string());
         body.text = text.to_string();
         body.encode()
     };
-    // s-a's post 1, in flight under a pin another writer's record answers, still queued.
+    // ta000000000's post 1, in flight under a pin another writer's record answers, still queued.
     a_legacy_pin_another_writer_answers(&mut bridge, &lane_of);
-    let pin1 = bridge.state.post_pin("s-a", 1).unwrap().unwrap();
+    let pin1 = bridge.state.post_pin("ta000000000", 1).unwrap().unwrap();
     journal_entry(&bridge, &pin1, &lane_of, &words("a1"), head);
-    // s-a's post 2 behind it: aterm was told it landed, so it left the outbox, and its
+    // ta000000000's post 2 behind it: aterm was told it landed, so it left the outbox, and its
     // entry stands (a kill before the journal's write); retention gave up its record, which
     // no reader was handed, so it is not on the bus.
     let a2 = words("a2");
     let pin2 = fresh_pin(&mut bridge, &lane_of, &a2, head);
     journal_entry(&bridge, &pin2, &lane_of, &a2, head);
-    *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 1, "@s-r", "a1"));
+    *lane.outbox.lock().unwrap() = Some(queued_note("ta000000000", 1, "@tr000000000", "a1"));
     let replayed = bridge.settle_in_flight();
     bridge.drain_outbox();
     let (mut reader, _) = bridge.connect().unwrap();
@@ -15554,7 +16283,7 @@ fn left_the_outbox_behind_an_unverifiable_entry(fx: crate::fx::Fx) -> LeftWorld 
 }
 
 /// **AN ENTRY WHOSE POST LEFT THE OUTBOX IS PUBLISHED BEHIND AN UNVERIFIABLE ONE** (critic
-/// item F21's review, [`Bridge::replay_in_flight`]'s point 5). `s-a`'s post 1 is in flight
+/// item F21's review, [`Bridge::replay_in_flight`]'s point 5). `ta000000000`'s post 1 is in flight
 /// under a pin another writer's record answers, and still queued; its post 2's entry stands
 /// though aterm no longer lists it, its record not on the bus. The replay holds only the
 /// lanes aterm lists an entry in, so post 2's entry, all that remembers it, is published at
@@ -15603,25 +16332,26 @@ struct HeldReadBack {
 /// the attach's replay reads back behind an unverifiable reservation of its lane's.
 #[cfg(unix)]
 fn held_lane_read_back(fx: crate::fx::Fx, keyed: bool) -> HeldReadBack {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     bridge.fx = fx;
     assert!(bridge.refresh_sessions().is_ok());
     lane.retire_from_outbox();
     let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
     let head = head_of(&bridge);
     let (sid, domain, second) = if keyed {
-        let face = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+        let face = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
         bridge.indexed_subjects.insert(face.clone());
         let words = |text: &str| {
             let mut body = Body::new(1);
-            body.from = Some("s-a".to_string());
+            body.from = Some("ta000000000".to_string());
             body.text = text.to_string();
             body.encode()
         };
-        // s-a's post 1 under a pin another writer's record answers; its post 2 a re-post
+        // ta000000000's post 1 under a pin another writer's record answers; its post 2 a re-post
         // of a key post 9 holds, at the key's sequence.
         a_legacy_pin_another_writer_answers(&mut bridge, &face);
-        let pin1 = bridge.state.post_pin("s-a", 1).unwrap().unwrap();
+        let pin1 = bridge.state.post_pin("ta000000000", 1).unwrap().unwrap();
         journal_entry(&bridge, &pin1, &face, &words("a1"), head);
         let a2 = words("a2");
         let fresh = fresh_pin(&mut bridge, &face, &a2, head);
@@ -15631,7 +16361,10 @@ fn held_lane_read_back(fx: crate::fx::Fx, keyed: bool) -> HeldReadBack {
             owner: Some(9),
             ..fresh.clone()
         };
-        bridge.state.set_key_pin("s-a", "k", &holder).unwrap();
+        bridge
+            .state
+            .set_key_pin("ta000000000", "k", &holder)
+            .unwrap();
         let pin2 = PublishPin {
             via_key: true,
             original: Some(original),
@@ -15639,23 +16372,27 @@ fn held_lane_read_back(fx: crate::fx::Fx, keyed: bool) -> HeldReadBack {
             owner: Some(9),
             ..fresh
         };
-        bridge.state.set_post_pin("s-a", 2, &pin2).unwrap();
+        bridge.state.set_post_pin("ta000000000", 2, &pin2).unwrap();
         journal_entry(&bridge, &pin2, &face, &a2, head);
         let landed = landed_earlier(&bridge, pin2.seq, &face, &a2);
         *lane.outbox.lock().unwrap() = Some(format!(
             "{}{}",
-            queued_note("s-a", 1, "@s-r", "a1"),
-            queued_note("s-a", 2, "@s-r", "a2").replacen(" kind=", " key=k kind=", 1)
+            queued_note("ta000000000", 1, "@tr000000000", "a1"),
+            queued_note("ta000000000", 2, "@tr000000000", "a2").replacen(
+                " kind=",
+                " key=k kind=",
+                1
+            )
         ));
-        ("s-a", crate::unverified_hold::Domain::Posts, landed)
+        ("ta000000000", crate::unverified_hold::Domain::Posts, landed)
     } else {
-        let prefix = bridge.receipt_lane("s-a").unwrap().unwrap();
+        let prefix = bridge.receipt_lane("ta000000000").unwrap().unwrap();
         let face = format!("{prefix}/ack");
         let receipt = |bridge: &mut Bridge, off: u64| {
             let re = bridge.wire_re(&prefix, off).unwrap();
-            receipt_body(1, "s-b", re, "handled").encode()
+            receipt_body(1, "tb000000000", re, "handled").encode()
         };
-        // s-b's receipt 1 under a pin from a build before publication identities, another
+        // tb000000000's receipt 1 under a pin from a build before publication identities, another
         // writer's record at its sequence; its receipt 2 landed, its entry standing.
         let legacy = PublishPin {
             seq: bridge.next_seq().unwrap(),
@@ -15669,36 +16406,43 @@ fn held_lane_read_back(fx: crate::fx::Fx, keyed: bool) -> HeldReadBack {
         bridge.unsent = None;
         bridge
             .state
-            .set_receipt_pin("s-b", 1, &legacy, None)
+            .set_receipt_pin("tb000000000", 1, &legacy, None)
             .unwrap();
         landed_earlier(
             &bridge,
             legacy.seq,
             &face,
-            b"v=1 t=1 from=s-x text=another%20writer",
+            b"v=1 t=1 from=tx000000000 text=another%20writer",
         );
         let r1 = receipt(&mut bridge, 3);
         journal_entry(&bridge, &legacy, &face, &r1, head);
         let r2 = receipt(&mut bridge, 4);
         let pin2 = fresh_pin(&mut bridge, &face, &r2, head);
-        bridge.state.set_receipt_pin("s-b", 2, &pin2, None).unwrap();
+        bridge
+            .state
+            .set_receipt_pin("tb000000000", 2, &pin2, None)
+            .unwrap();
         journal_entry(&bridge, &pin2, &face, &r2, head);
         let landed = landed_earlier(&bridge, pin2.seq, &face, &r2);
         *lane.outbox.lock().unwrap() = Some(
-            "receipt sid=s-b rid=1 off=3 verdict=handled kind=ask from=s-a\n\
-             receipt sid=s-b rid=2 off=4 verdict=handled kind=ask from=s-a\n"
+            "receipt sid=tb000000000 rid=1 off=3 verdict=handled kind=ask from=ta000000000\n\
+             receipt sid=tb000000000 rid=2 off=4 verdict=handled kind=ask from=ta000000000\n"
                 .to_string(),
         );
-        ("s-b", crate::unverified_hold::Domain::Receipts, landed)
+        (
+            "tb000000000",
+            crate::unverified_hold::Domain::Receipts,
+            landed,
+        )
     };
     let replayed = bridge.settle_in_flight();
     bridge.drain_outbox();
     let held = bridge.unverified.holds(sid, domain, bridge.fx.now());
     let retired = if keyed {
-        retired_at(&retirements(&lane), "s-a", 2)
+        retired_at(&retirements(&lane), "ta000000000", 2)
     } else {
         lane.requests.lock().unwrap().iter().find_map(|line| {
-            line.strip_prefix("deliver s-b receipt=2 off=")
+            line.strip_prefix("deliver tb000000000 receipt=2 off=")
                 .and_then(|off| off.parse().ok())
         })
     };
@@ -15723,7 +16467,7 @@ fn held_lane_read_back(fx: crate::fx::Fx, keyed: bool) -> HeldReadBack {
 /// answers, the second landed, its entry standing. The replay reads the second back and
 /// holds its record for the drain; the drain's retry of the first is unverifiable and holds
 /// the lane, and the second is retired at its offset all the same, nothing sent, so a
-/// delivery of its record keeps the link. Both for `s-b`'s owed receipts and for `s-a`'s
+/// delivery of its record keeps the link. Both for `tb000000000`'s owed receipts and for `ta000000000`'s
 /// posts, the second a keyed re-post. NEGATIVE CONTROL (`Mutant::HeldRecordWaitsForTheHold`):
 /// the second waits for the hold, and each delivery of its record drops the link.
 #[cfg(unix)]
@@ -15762,7 +16506,8 @@ fn a_held_lanes_receipt_or_keyed_post_the_replay_read_back_is_retired_where_it_l
 #[cfg(unix)]
 #[test]
 fn a_senders_post_refused_mid_burst_holds_its_later_posts_and_no_one_elses() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let socket = lane.dir.path().join("refused.sock");
     let broker = astream_broker::Broker::open(lane.dir.path().join("refused.log")).unwrap();
@@ -15771,15 +16516,15 @@ fn a_senders_post_refused_mid_burst_holds_its_later_posts_and_no_one_elses() {
     let broker = Arc::new(broker);
     bridge.cfg.broker = socket;
     bridge.conn = Some(bridge.connect().unwrap().0.into());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     *lane.outbox.lock().unwrap() = Some(
         [
-            queued_note("s-a", 1, "@s-r", "a1"),
-            queued_note("s-a", 2, "@s-r", "a2"),
-            queued_note("s-b", 1, "@s-r", "b1"),
-            queued_note("s-a", 3, "@s-r", "a3"),
-            queued_note("s-b", 2, "@s-r", "b2"),
+            queued_note("ta000000000", 1, "@tr000000000", "a1"),
+            queued_note("ta000000000", 2, "@tr000000000", "a2"),
+            queued_note("tb000000000", 1, "@tr000000000", "b1"),
+            queued_note("ta000000000", 3, "@tr000000000", "a3"),
+            queued_note("tb000000000", 2, "@tr000000000", "b2"),
         ]
         .concat(),
     );
@@ -15813,25 +16558,25 @@ fn a_senders_post_refused_mid_burst_holds_its_later_posts_and_no_one_elses() {
     let (mut reader, _) = bridge.connect().unwrap();
     let notes = notes_on(&mut reader, &lane_of);
     let texts: Vec<&str> = notes.iter().map(|(_, text)| text.as_str()).collect();
-    assert_eq!(texts, ["b1", "b2"], "only s-b's notes landed");
+    assert_eq!(texts, ["b1", "b2"], "only tb000000000's notes landed");
     for (n, text) in [(1, "b1"), (2, "b2")] {
         let at = notes.iter().find(|(_, t)| t == text).map(|(off, _)| *off);
         assert!(
-            retired.contains(&("s-b".to_string(), n, at)),
+            retired.contains(&("tb000000000".to_string(), n, at)),
             "{retired:#?}"
         );
     }
     assert!(
-        retired.iter().all(|(sid, _, _)| sid == "s-b"),
-        "nothing of s-a's retired: {retired:#?}"
+        retired.iter().all(|(sid, _, _)| sid == "tb000000000"),
+        "nothing of ta000000000's retired: {retired:#?}"
     );
     assert!(
-        bridge.state.post_pin("s-a", 1).unwrap().is_some(),
+        bridge.state.post_pin("ta000000000", 1).unwrap().is_some(),
         "a1 keeps its sequence for the retry"
     );
     for n in [2, 3] {
         assert_eq!(
-            bridge.state.post_pin("s-a", n).unwrap(),
+            bridge.state.post_pin("ta000000000", n).unwrap(),
             None,
             "a{n} was never reserved, let alone sent"
         );
@@ -15841,9 +16586,9 @@ fn a_senders_post_refused_mid_burst_holds_its_later_posts_and_no_one_elses() {
     lane.sent.lock().unwrap().clear();
     *lane.outbox.lock().unwrap() = Some(
         [
-            queued_note("s-a", 1, "@s-r", "a1"),
-            queued_note("s-a", 2, "@s-r", "a2"),
-            queued_note("s-a", 3, "@s-r", "a3"),
+            queued_note("ta000000000", 1, "@tr000000000", "a1"),
+            queued_note("ta000000000", 2, "@tr000000000", "a2"),
+            queued_note("ta000000000", 3, "@tr000000000", "a3"),
         ]
         .concat(),
     );
@@ -15854,12 +16599,12 @@ fn a_senders_post_refused_mid_burst_holds_its_later_posts_and_no_one_elses() {
     assert_eq!(
         texts,
         ["b1", "b2", "a1", "a2", "a3"],
-        "s-a's notes once each, in its order"
+        "ta000000000's notes once each, in its order"
     );
     for (n, text) in [(1, "a1"), (2, "a2"), (3, "a3")] {
         let at = notes.iter().find(|(_, t)| t == text).map(|(off, _)| *off);
         assert!(
-            retired.contains(&("s-a".to_string(), n, at)),
+            retired.contains(&("ta000000000".to_string(), n, at)),
             "{retired:#?}"
         );
     }
@@ -15875,17 +16620,18 @@ fn a_senders_post_refused_mid_burst_holds_its_later_posts_and_no_one_elses() {
 #[cfg(unix)]
 #[test]
 fn behind_a_gap_fence_a_refused_post_holds_back_what_went_after_it_and_each_lands_once() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let (broker, _server) = on_a_broker(&lane, &mut bridge, true);
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     let posts = [
-        queued_note("s-a", 1, "@s-r", "a1"),
-        queued_note("s-a", 2, "@s-r", "a2"),
-        queued_note("s-b", 1, "@s-r", "b1"),
-        queued_note("s-a", 3, "@s-r", "a3"),
-        queued_note("s-b", 2, "@s-r", "b2"),
+        queued_note("ta000000000", 1, "@tr000000000", "a1"),
+        queued_note("ta000000000", 2, "@tr000000000", "a2"),
+        queued_note("tb000000000", 1, "@tr000000000", "b1"),
+        queued_note("ta000000000", 3, "@tr000000000", "a3"),
+        queued_note("tb000000000", 2, "@tr000000000", "b2"),
     ]
     .concat();
     *lane.outbox.lock().unwrap() = Some(posts.clone());
@@ -15917,13 +16663,19 @@ fn behind_a_gap_fence_a_refused_post_holds_back_what_went_after_it_and_each_land
     assert_eq!(
         link.peak(),
         5,
-        "the burst went out before any answer was read, three of s-a's at once"
+        "the burst went out before any answer was read, three of ta000000000's at once"
     );
     assert!(link.fenced(), "the refusals left the fence up");
     assert!(retirements(&lane).is_empty(), "nothing landed behind a1");
     let (mut reader, _) = bridge.connect().unwrap();
     assert!(notes_on(&mut reader, &lane_of).is_empty());
-    for (sid, n) in [("s-a", 1), ("s-a", 2), ("s-b", 1), ("s-a", 3), ("s-b", 2)] {
+    for (sid, n) in [
+        ("ta000000000", 1),
+        ("ta000000000", 2),
+        ("tb000000000", 1),
+        ("ta000000000", 3),
+        ("tb000000000", 2),
+    ] {
         assert!(
             bridge.state.post_pin(sid, n).unwrap().is_some(),
             "{sid} {n} keeps its sequence for the retry"
@@ -15956,11 +16708,11 @@ fn behind_a_gap_fence_a_refused_post_holds_back_what_went_after_it_and_each_land
     }
     assert_eq!(texts.len(), 5, "each note exactly once: {texts:?}");
     for (sid, n, text) in [
-        ("s-a", 1, "a1"),
-        ("s-a", 2, "a2"),
-        ("s-a", 3, "a3"),
-        ("s-b", 1, "b1"),
-        ("s-b", 2, "b2"),
+        ("ta000000000", 1, "a1"),
+        ("ta000000000", 2, "a2"),
+        ("ta000000000", 3, "a3"),
+        ("tb000000000", 1, "b1"),
+        ("tb000000000", 2, "b2"),
     ] {
         let at = notes.iter().find(|(_, t)| t == text).map(|(off, _)| *off);
         assert!(retired.contains(&(sid.to_string(), n, at)), "{retired:#?}");
@@ -16009,7 +16761,7 @@ fn on_a_broker(
 /// gone. Each seam that reads one is driven. Behind a gap fence, where a sender's posts go
 /// out without waiting for their answers: a new lane's subject-budget read (a drain reads
 /// the budget at the first lane it opens, critic item G04, so the drain's first post goes
-/// to a lane already open and its second opens `s-q`'s), the full window before a send,
+/// to a lane already open and its second opens `tq000000000`'s), the full window before a send,
 /// and the settle before a keyed post. On a broker that does not gap-fence, where a
 /// sender's post waits only for the answer to its own last: the budget read that takes
 /// another sender's answer. And a retry at a pin an older build made, which names no
@@ -16024,15 +16776,15 @@ fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
         name: &'static str,
         fenced: bool,
         indexed: bool,
-        /// `s-a`'s post 1 waits at a pin an older build made (no head to read back from).
+        /// `ta000000000`'s post 1 waits at a pin an older build made (no head to read back from).
         pinned: bool,
         posts: Vec<(String, String)>,
         /// How many of `posts`, in order, went before the loss.
         sent: usize,
     }
     let note = |sid: &str, id: u64, key: Option<&str>| {
-        let text = format!("{}{id}", &sid[2..]);
-        let line = queued_note(sid, id, "@s-r", &text);
+        let text = format!("{}{id}", &sid[1..2]);
+        let line = queued_note(sid, id, "@tr000000000", &text);
         let line = match key {
             Some(key) => line.replacen(" kind=", &format!(" key={key} kind="), 1),
             None => line,
@@ -16040,8 +16792,8 @@ fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
         (line, text)
     };
     let fresh = |sid: &str, id: u64| {
-        let text = format!("{}{id}", &sid[2..]);
-        (queued_note(sid, id, "@s-q", &text), text)
+        let text = format!("{}{id}", &sid[1..2]);
+        (queued_note(sid, id, "@tq000000000", &text), text)
     };
     let window = u64::try_from(PIPELINE_WINDOW).unwrap();
     let seams = [
@@ -16050,7 +16802,7 @@ fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
             fenced: true,
             indexed: true,
             pinned: false,
-            posts: vec![note("s-a", 1, None), fresh("s-a", 2)],
+            posts: vec![note("ta000000000", 1, None), fresh("ta000000000", 2)],
             sent: 1,
         },
         Seam {
@@ -16058,7 +16810,9 @@ fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
             fenced: true,
             indexed: true,
             pinned: false,
-            posts: (1..=window + 1).map(|id| note("s-a", id, None)).collect(),
+            posts: (1..=window + 1)
+                .map(|id| note("ta000000000", id, None))
+                .collect(),
             sent: PIPELINE_WINDOW,
         },
         Seam {
@@ -16066,7 +16820,10 @@ fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
             fenced: true,
             indexed: true,
             pinned: false,
-            posts: vec![note("s-b", 1, None), note("s-a", 1, Some("k"))],
+            posts: vec![
+                note("tb000000000", 1, None),
+                note("ta000000000", 1, Some("k")),
+            ],
             sent: 1,
         },
         Seam {
@@ -16074,7 +16831,7 @@ fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
             fenced: false,
             indexed: true,
             pinned: false,
-            posts: vec![note("s-b", 1, None), fresh("s-a", 1)],
+            posts: vec![note("tb000000000", 1, None), fresh("ta000000000", 1)],
             sent: 1,
         },
         Seam {
@@ -16082,18 +16839,22 @@ fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
             fenced: true,
             indexed: true,
             pinned: true,
-            posts: vec![note("s-b", 1, None), note("s-a", 1, None)],
+            posts: vec![note("tb000000000", 1, None), note("ta000000000", 1, None)],
             sent: 1,
         },
     ];
     let mut wrong = Vec::new();
     for seam in seams {
         let name = seam.name;
-        let (lane, mut bridge) =
-            FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r"), (4, "s-q")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[
+            (1, "ta000000000"),
+            (2, "tb000000000"),
+            (3, "tr000000000"),
+            (4, "tq000000000"),
+        ]);
         assert!(bridge.refresh_sessions().is_ok());
         let (_broker, _server) = on_a_broker(&lane, &mut bridge, seam.fenced);
-        let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+        let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
         let inbox = format!("/f/f/in/{}/>", bridge.node);
         if seam.indexed {
             bridge.indexed_subjects.insert(lane_of.clone());
@@ -16108,7 +16869,7 @@ fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
                 owner: Some(1),
                 at: None,
             };
-            bridge.state.set_post_pin("s-a", 1, &pin).unwrap();
+            bridge.state.set_post_pin("ta000000000", 1, &pin).unwrap();
         }
         *lane.outbox.lock().unwrap() =
             Some(seam.posts.iter().map(|(line, _)| line.as_str()).collect());
@@ -16163,24 +16924,25 @@ fn a_drain_that_finds_its_aterm_gone_sends_no_post_it_had_not_sent() {
 }
 
 /// **A POST ITS SEND CONCLUDES UNSENT HAS NO IN-FLIGHT ENTRY, WHATEVER BECAME OF THE LINK**
-/// (the orphan of `fabric_world`'s `an_orphaned_bridge_mid_drain_…`, its review): `s-b`'s 64
-/// posts fill the window behind the gap fence, their answers unread, and `s-a`'s post's send
+/// (the orphan of `fabric_world`'s `an_orphaned_bridge_mid_drain_…`, its review): `tb000000000`'s 64
+/// posts fill the window behind the gap fence, their answers unread, and `ta000000000`'s post's send
 /// waits for one. The broker link is cut meanwhile, so the wait reads the cut, concludes
 /// `b1` with its fate unknown and drops the link; and aterm goes in the same moment, as its
 /// push lane can say at any time, or stays. `a1` is not sent: with aterm gone the send's look
 /// at aterm stops it ([`Bridge::unsendable`]) and the bridge exits, and the next attach on
 /// its state dir is its successor's; with aterm there the lost link stops it, and that attach
-/// is this bridge's own. The attach's replay ([`Bridge::settle_in_flight`]) finds `s-b`'s 64
+/// is this bridge's own. The attach's replay ([`Bridge::settle_in_flight`]) finds `tb000000000`'s 64
 /// on the bus and publishes no copy, and finds no entry for `a1`, which no connection carried
 /// ([`Unsent`]): the successor never sends it, and the live bridge's drain sends it once at
 /// its pin.
 #[cfg(unix)]
 #[test]
 fn a_post_its_send_concludes_unsent_has_no_in_flight_entry_whatever_became_of_the_link() {
-    let sessions = [(1, "s-a"), (2, "s-b"), (3, "s-r")];
+    let sessions = [(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")];
     let window = u64::try_from(PIPELINE_WINDOW).unwrap();
-    let note = |sid: &str, id: u64| queued_note(sid, id, "@s-r", &format!("{}{id}", &sid[2..]));
-    let window_full: String = (1..=window).map(|id| note("s-b", id)).collect();
+    let note =
+        |sid: &str, id: u64| queued_note(sid, id, "@tr000000000", &format!("{}{id}", &sid[1..2]));
+    let window_full: String = (1..=window).map(|id| note("tb000000000", id)).collect();
     let sent: Vec<String> = (1..=window).map(|id| format!("b{id}")).collect();
     // A link as the attach opens one, the fence asked for; its closer cuts it.
     let link = |bridge: &mut Bridge| {
@@ -16202,7 +16964,7 @@ fn a_post_its_send_concludes_unsent_has_no_in_flight_entry_whatever_became_of_th
         assert!(bridge.refresh_sessions().is_ok());
         let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
         let cut = link(&mut bridge);
-        let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+        let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
         bridge.indexed_subjects.insert(lane_of.clone());
         *lane.outbox.lock().unwrap() = Some(window_full.clone());
         // As the loop runs it: an answer is read when the loop reads it, not after the drain.
@@ -16217,7 +16979,9 @@ fn a_post_its_send_concludes_unsent_has_no_in_flight_entry_whatever_became_of_th
         if aterm_goes {
             bridge.mailbox.push_aterm_closed();
         }
-        let a1 = parse_drain(note("s-a", 1).as_bytes()).posts.remove(0);
+        let a1 = parse_drain(note("ta000000000", 1).as_bytes())
+            .posts
+            .remove(0);
         bridge.drain_post(a1);
         assert!(
             bridge.conn.is_none(),
@@ -16266,7 +17030,7 @@ fn a_post_its_send_concludes_unsent_has_no_in_flight_entry_whatever_became_of_th
             "aterm_goes={aterm_goes}: the attach replays no copy and nothing unsent"
         );
         if !aterm_goes {
-            *lane.outbox.lock().unwrap() = Some(format!("{window_full}{}", note("s-a", 1)));
+            *lane.outbox.lock().unwrap() = Some(format!("{window_full}{}", note("ta000000000", 1)));
             next.drain_outbox();
             next.settle_acks();
             let mut once = sent.clone();
@@ -16282,15 +17046,15 @@ fn a_post_its_send_concludes_unsent_has_no_in_flight_entry_whatever_became_of_th
 }
 
 /// **A LATER POST WHOSE ANSWER WAS NEVER READ WAITS FOR ITS SENDER'S REFUSED ONE** (C12s1's
-/// review): `a1` and `a2` of `s-a` go out together behind the gap fence and their batch fails
+/// review): `a1` and `a2` of `ta000000000` go out together behind the gap fence and their batch fails
 /// its fsync. The bridge reads `a1`'s refusal, which drops `a2`'s entry with `a1`'s, and the
-/// link is lost before `a2`'s answer is read. The attach's replay then has nothing of `s-a`'s
+/// link is lost before `a2`'s answer is read. The attach's replay then has nothing of `ta000000000`'s
 /// to publish, and the drain sends `a1`, then `a2`, each once. Before the fix `a2`'s entry
 /// outlived `a1`'s refusal and the replay landed `a2` first.
 #[cfg(unix)]
 #[test]
 fn a_later_post_whose_answer_was_never_read_waits_for_its_senders_refused_one() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let socket = lane.dir.path().join("unread.sock");
     let broker = astream_broker::Broker::open_opts(
@@ -16316,12 +17080,12 @@ fn a_later_post_whose_answer_was_never_read_waits_for_its_senders_refused_one() 
     };
     attach(&mut bridge);
     assert!(bridge.pipelines_posts());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     let posts = format!(
         "{}{}",
-        queued_note("s-a", 1, "@s-r", "a1"),
-        queued_note("s-a", 2, "@s-r", "a2")
+        queued_note("ta000000000", 1, "@tr000000000", "a1"),
+        queued_note("ta000000000", 2, "@tr000000000", "a2")
     );
     *lane.outbox.lock().unwrap() = Some(posts.clone());
     broker.inject_faults(astream_broker::InjectedFaults {
@@ -16338,7 +17102,7 @@ fn a_later_post_whose_answer_was_never_read_waits_for_its_senders_refused_one() 
         "a1 and a2 are in flight together"
     );
     assert!(bridge.settle_one(bridge.fx.now()), "a1's refusal is read");
-    assert!(bridge.held_senders.contains("s-a"));
+    assert!(bridge.held_senders.contains("ta000000000"));
     assert!(
         bridge.state.in_flight().unwrap().is_empty(),
         "a2's entry left the journal with a1's"
@@ -16359,7 +17123,11 @@ fn a_later_post_whose_answer_was_never_read_waits_for_its_senders_refused_one() 
         .into_iter()
         .map(|(_, text)| text)
         .collect();
-    assert_eq!(texts, ["a1", "a2"], "s-a's notes once each, in its order");
+    assert_eq!(
+        texts,
+        ["a1", "a2"],
+        "ta000000000's notes once each, in its order"
+    );
 }
 
 /// **AN `ev` A GAP FENCE REFUSED IS SENT AGAIN** (C12s1's review): `first`'s batch fails its
@@ -16422,8 +17190,8 @@ fn an_ev_a_gap_fence_refused_is_sent_again_once_the_fence_is_lifted() {
 }
 
 /// **A SENDER'S SECOND POST IN THE SAME WORDS LANDS THOUGH THE FIRST LANDED JUST AHEAD OF
-/// IT** (C12s1's review, `Bridge::settle_same_words`): `s-a` posts `ok` twice behind the gap
-/// fence, and between them goes `s-b`'s post, which the broker refuses for its bytes (past
+/// IT** (C12s1's review, `Bridge::settle_same_words`): `ta000000000` posts `ok` twice behind the gap
+/// fence, and between them goes `tb000000000`'s post, which the broker refuses for its bytes (past
 /// the byte rate's whole burst, so at every try), so the second `ok` is refused behind it
 /// and retried at its pin. A retry reads back from its pin's head first, and takes the first record in its words above that head for its own: had the
 /// second pin been made while the first `ok` was still owed, its head would lie below the
@@ -16443,8 +17211,8 @@ fn a_senders_second_post_in_the_same_words_lands_after_the_first() {
     for (n, (at, _)) in notes.iter().enumerate() {
         let id = u64::try_from(n).unwrap() + 1;
         assert!(
-            retired.contains(&("s-a".to_string(), id, Some(*at))),
-            "s-a {id} retired at @{at}: {retired:#?}"
+            retired.contains(&("ta000000000".to_string(), id, Some(*at))),
+            "ta000000000 {id} retired at @{at}: {retired:#?}"
         );
     }
 
@@ -16457,8 +17225,8 @@ fn a_senders_second_post_in_the_same_words_lands_after_the_first() {
     assert_eq!(text, "ok");
     for id in [1, 2] {
         assert!(
-            retired.contains(&("s-a".to_string(), id, Some(*first))),
-            "NEGATIVE CONTROL: s-a {id} retired at the first's @{first}: {retired:#?}"
+            retired.contains(&("ta000000000".to_string(), id, Some(*first))),
+            "NEGATIVE CONTROL: ta000000000 {id} retired at the first's @{first}: {retired:#?}"
         );
     }
 }
@@ -16470,10 +17238,11 @@ struct SameWordsOutcome {
 }
 
 /// The scenario of [`a_senders_second_post_in_the_same_words_lands_after_the_first`] under
-/// `fx`: the notes on `s-r`'s lane, by offset, and every retirement aterm was told.
+/// `fx`: the notes on `tr000000000`'s lane, by offset, and every retirement aterm was told.
 #[cfg(unix)]
 fn two_posts_in_the_same_words_behind_a_refusal(fx: crate::fx::Fx) -> SameWordsOutcome {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     bridge.fx = fx;
     assert!(bridge.refresh_sessions().is_ok());
     let socket = lane.dir.path().join("words.sock");
@@ -16501,22 +17270,22 @@ fn two_posts_in_the_same_words_behind_a_refusal(fx: crate::fx::Fx) -> SameWordsO
         .hello()
         .unwrap();
     assert!(bridge.ask_gap_fences());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
-    let other = format!("/f/f/in/{0}/s-r/{0}/other", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
+    let other = format!("/f/f/in/{0}/tr000000000/{0}/other", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     bridge.indexed_subjects.insert(other);
     let big = "z".repeat(16 * 1024);
-    let second = queued_note("s-a", 2, "@s-r", "ok");
+    let second = queued_note("ta000000000", 2, "@tr000000000", "ok");
     *lane.outbox.lock().unwrap() = Some(format!(
-        "{}post sid=s-b id=1 to=@s-r kind=other len={}\n{big}{second}",
-        queued_note("s-a", 1, "@s-r", "ok"),
+        "{}post sid=tb000000000 id=1 to=@tr000000000 kind=other len={}\n{big}{second}",
+        queued_note("ta000000000", 1, "@tr000000000", "ok"),
         big.len(),
     ));
     bridge.drain_outbox();
     bridge.settle_acks();
     assert!(
-        bridge.state.post_pin("s-a", 2).unwrap().is_some(),
-        "PRECONDITION: the second `ok` was refused behind s-b's and keeps its pin"
+        bridge.state.post_pin("ta000000000", 2).unwrap().is_some(),
+        "PRECONDITION: the second `ok` was refused behind tb000000000's and keeps its pin"
     );
 
     broker.set_rate_limit(None).unwrap();
@@ -16534,14 +17303,14 @@ fn two_posts_in_the_same_words_behind_a_refusal(fx: crate::fx::Fx) -> SameWordsO
 }
 
 /// **THE ATTACH'S REPLAY HOLDS THE FENCES A REFUSED ENTRY SET** (C12s1's review,
-/// `Bridge::fences_held`): `s-a`'s `a1` and `a2` go out together behind the gap fence, and
+/// `Bridge::fences_held`): `ta000000000`'s `a1` and `a2` go out together behind the gap fence, and
 /// the link is lost before either answer is read, so both entries stand. The broker refuses
 /// `a1` for its bytes (past the byte rate's whole burst, so at every try: a wait no hold
 /// covers), at its first attempt and again at the attach's replay, which drops its entry and
 /// keeps the post at its pin; the fence that refusal set is held through the replay, so
 /// `a2`'s entry, sent once the replay has waited out the hold the refusal set
 /// ([`Bridge::rate`]), is refused behind it and dropped too. Once the byte rate is lifted the
-/// drain sends `a1`, then `a2`, each at its pin: the log holds them in `s-a`'s order.
+/// drain sends `a1`, then `a2`, each at its pin: the log holds them in `ta000000000`'s order.
 ///
 /// NEGATIVE CONTROL: with the fences lifted mid-replay
 /// ([`crate::sim::world::Mutant::LiftFencesDuringReplay`]), and the refusal's wait not held
@@ -16553,18 +17322,24 @@ fn two_posts_in_the_same_words_behind_a_refusal(fx: crate::fx::Fx) -> SameWordsO
 #[cfg(unix)]
 #[test]
 fn the_attachs_replay_holds_the_fences_a_refused_entry_set() {
-    let (replayed, drained) = replay_of_a_refused_entry_and_the_next(crate::fx::Fx::os());
+    let (replayed, drained) = replay_of_a_refused_entry_and_the_next(crate::fx::Fx::os(), false);
     assert!(
         replayed.is_empty(),
-        "nothing of s-a's landed at the replay: {replayed:?}"
+        "nothing of ta000000000's landed at the replay: {replayed:?}"
     );
-    assert_eq!(drained, ["a1", "a2"], "s-a's posts once each, in its order");
+    assert_eq!(
+        drained,
+        ["a1", "a2"],
+        "ta000000000's posts once each, in its order"
+    );
 
-    let (replayed, drained) =
-        replay_of_a_refused_entry_and_the_next(crate::fx::Fx::os_without_each(&[
+    let (replayed, drained) = replay_of_a_refused_entry_and_the_next(
+        crate::fx::Fx::os_without_each(&[
             crate::sim::world::Mutant::LiftFencesDuringReplay,
             crate::sim::world::Mutant::RetryRateLimitedAtOnce,
-        ]));
+        ]),
+        false,
+    );
     assert_eq!(
         replayed,
         ["a2"],
@@ -16578,11 +17353,14 @@ fn the_attachs_replay_holds_the_fences_a_refused_entry_set() {
 }
 
 /// The scenario of [`the_attachs_replay_holds_the_fences_a_refused_entry_set`] under `fx`:
-/// the posts of `s-a`'s on `s-r`'s lane, by offset, after the attach's replay, and after
+/// the posts of `ta000000000`'s on `tr000000000`'s lane, by offset, after the attach's replay, and after
 /// the drain that follows it.
 #[cfg(unix)]
-fn replay_of_a_refused_entry_and_the_next(fx: crate::fx::Fx) -> (Vec<String>, Vec<String>) {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+fn replay_of_a_refused_entry_and_the_next(
+    fx: crate::fx::Fx,
+    lower_second: bool,
+) -> (Vec<String>, Vec<String>) {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tr000000000")]);
     bridge.fx = fx;
     assert!(bridge.refresh_sessions().is_ok());
     let socket = lane.dir.path().join("replay.sock");
@@ -16614,13 +17392,13 @@ fn replay_of_a_refused_entry_and_the_next(fx: crate::fx::Fx) -> (Vec<String>, Ve
     };
     attach(&mut bridge);
     assert!(bridge.pipelines_posts());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     let a1 = format!("a1{}", "z".repeat(16 * 1024));
     let posts = format!(
         "{}{}",
-        queued_note("s-a", 1, "@s-r", &a1),
-        queued_note("s-a", 2, "@s-r", "a2")
+        queued_note("ta000000000", 1, "@tr000000000", &a1),
+        queued_note("ta000000000", 2, "@tr000000000", "a2")
     );
     *lane.outbox.lock().unwrap() = Some(posts.clone());
     // As the loop runs it: an answer is read when the loop reads it, not after the drain.
@@ -16631,6 +17409,20 @@ fn replay_of_a_refused_entry_and_the_next(fx: crate::fx::Fx) -> (Vec<String>, Ve
         2,
         "PRECONDITION: a1 and a2 are in flight together"
     );
+
+    if lower_second {
+        // A keyed re-post can follow a1 at an older sequence. Both first attempts were
+        // refused, so give a2 that sequence before replaying the outstanding entries.
+        let entries = bridge.state.in_flight().unwrap();
+        let mut second = entries[1].1.clone();
+        bridge.state.clear_in_flight(second.pin.seq).unwrap();
+        second.pin.seq = entries[0].0 - 1;
+        bridge
+            .state
+            .set_post_pin("ta000000000", 2, &second.pin)
+            .unwrap();
+        bridge.state.set_in_flight(&second).unwrap();
+    }
 
     // The link lost, as a kill loses it, with both answers unread: both entries stand.
     bridge.conn = None;
@@ -16657,10 +17449,10 @@ fn replay_of_a_refused_entry_and_the_next(fx: crate::fx::Fx) -> (Vec<String>, Ve
 }
 
 /// **A POST WITH AN ENTRY WAITS FOR THE ANSWER TO ITS SENDER'S POST WITH NONE**
-/// (`Bridge::settle_in_flight`'s 4): `s-a`'s `a1`, to a person's lane (never journaled), and
-/// `a2`, to `s-r` on this node (journaled), come in one listing. The broker refuses `a1` for
+/// (`Bridge::settle_in_flight`'s 4): `ta000000000`'s `a1`, to a person's lane (never journaled), and
+/// `a2`, to `tr000000000` on this node (journaled), come in one listing. The broker refuses `a1` for
 /// its bytes, and `a2` is not sent: no entry stands, so the attach after a lost link
-/// publishes nothing, and the drain sends `a1`, then `a2`, in `s-a`'s order.
+/// publishes nothing, and the drain sends `a1`, then `a2`, in `ta000000000`'s order.
 ///
 /// NEGATIVE CONTROL ([`crate::sim::world::Mutant::EntryAheadOfAPostWithNone`]): `a2` goes out
 /// behind `a1` and is fenced, its answer lost with the link, so its entry stands; the replay
@@ -16671,7 +17463,11 @@ fn a_post_with_an_entry_waits_for_the_answer_to_its_senders_post_with_none() {
     let (entries, replayed, drained) = behind_a_post_with_no_entry(crate::fx::Fx::os());
     assert_eq!(entries, 0, "a2 was not sent behind a1's refusal");
     assert!(replayed.is_empty(), "nothing to replay: {replayed:?}");
-    assert_eq!(drained, ["a1", "a2"], "s-a's posts once each, in its order");
+    assert_eq!(
+        drained,
+        ["a1", "a2"],
+        "ta000000000's posts once each, in its order"
+    );
 
     let (entries, replayed, drained) = behind_a_post_with_no_entry(crate::fx::Fx::os_without(
         crate::sim::world::Mutant::EntryAheadOfAPostWithNone,
@@ -16686,11 +17482,11 @@ fn a_post_with_an_entry_waits_for_the_answer_to_its_senders_post_with_none() {
 }
 
 /// What [`a_post_with_an_entry_waits_for_the_answer_to_its_senders_post_with_none`] reads
-/// under `fx`: the in-flight entries the link's loss leaves, then `s-a`'s posts by offset
+/// under `fx`: the in-flight entries the link's loss leaves, then `ta000000000`'s posts by offset
 /// over both lanes, after the attach's replay and after the drain that follows it.
 #[cfg(unix)]
 fn behind_a_post_with_no_entry(fx: crate::fx::Fx) -> (usize, Vec<String>, Vec<String>) {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tr000000000")]);
     bridge.fx = fx;
     assert!(bridge.refresh_sessions().is_ok());
     let socket = lane.dir.path().join("replay.sock");
@@ -16722,15 +17518,15 @@ fn behind_a_post_with_no_entry(fx: crate::fx::Fx) -> (usize, Vec<String>, Vec<St
     };
     attach(&mut bridge);
     assert!(bridge.pipelines_posts());
-    let own = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let own = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     let person = format!("/f/f/in/p/h-alice/{}/note", bridge.node);
     bridge.indexed_subjects.insert(own.clone());
     bridge.indexed_subjects.insert(person.clone());
     let a1 = format!("a1{}", "z".repeat(16 * 1024));
     let posts = format!(
         "{}{}",
-        queued_note("s-a", 1, "h-alice", &a1),
-        queued_note("s-a", 2, "@s-r", "a2")
+        queued_note("ta000000000", 1, "h-alice", &a1),
+        queued_note("ta000000000", 2, "@tr000000000", "a2")
     );
     *lane.outbox.lock().unwrap() = Some(posts.clone());
     // As the loop runs it: an answer is read when the loop reads it, not after the drain.
@@ -16766,13 +17562,14 @@ fn behind_a_post_with_no_entry(fx: crate::fx::Fx) -> (usize, Vec<String>, Vec<St
 }
 
 /// **ONLY THE POST WITH AN ENTRY BEHIND ONE WITH NONE WAITS** (`Bridge::settle_unjournaled_ahead`):
-/// of `s-a`'s `a1` to a person, `a2` and `a3` to `s-r` on this node, and `a4` to the person
+/// of `ta000000000`'s `a1` to a person, `a2` and `a3` to `tr000000000` on this node, and `a4` to the person
 /// again, one listing reads `a1`'s answer before `a2` goes and nothing more: `a2`, `a3` and
 /// `a4` go on in flight together, and so does another sender's `b1`, listed behind `a1`.
 #[cfg(unix)]
 #[test]
 fn only_the_post_with_an_entry_behind_one_with_none_waits() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let socket = lane.dir.path().join("one-wait.sock");
     let broker = astream_broker::Broker::open_opts(
@@ -16797,17 +17594,17 @@ fn only_the_post_with_an_entry_behind_one_with_none_waits() {
     assert!(bridge.pipelines_posts());
     bridge
         .indexed_subjects
-        .insert(format!("/f/f/in/{0}/s-r/{0}/note", bridge.node));
+        .insert(format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node));
     bridge
         .indexed_subjects
         .insert(format!("/f/f/in/p/h-alice/{}/note", bridge.node));
     *lane.outbox.lock().unwrap() = Some(format!(
         "{}{}{}{}{}",
-        queued_note("s-a", 1, "h-alice", "a1"),
-        queued_note("s-b", 1, "@s-r", "b1"),
-        queued_note("s-a", 2, "@s-r", "a2"),
-        queued_note("s-a", 3, "@s-r", "a3"),
-        queued_note("s-a", 4, "h-alice", "a4"),
+        queued_note("ta000000000", 1, "h-alice", "a1"),
+        queued_note("tb000000000", 1, "@tr000000000", "b1"),
+        queued_note("ta000000000", 2, "@tr000000000", "a2"),
+        queued_note("ta000000000", 3, "@tr000000000", "a3"),
+        queued_note("ta000000000", 4, "h-alice", "a4"),
     ));
     bridge.in_round = true;
     bridge.drain_outbox();
@@ -16823,17 +17620,17 @@ fn only_the_post_with_an_entry_behind_one_with_none_waits() {
     assert_eq!(
         owed,
         [
-            ("s-a".to_string(), 2),
-            ("s-a".to_string(), 3),
-            ("s-a".to_string(), 4),
-            ("s-b".to_string(), 1),
+            ("ta000000000".to_string(), 2),
+            ("ta000000000".to_string(), 3),
+            ("ta000000000".to_string(), 4),
+            ("tb000000000".to_string(), 1),
         ],
         "a1's answer alone was read"
     );
 }
 
 /// **A BURST THE BROKER'S RATE LIMIT REFUSES MID-WINDOW IS WAITED OUT, AND LANDS WHOLE, ONCE
-/// AND IN ORDER** (critic item E06, `Bridge::rate`): `s-a` and `s-b` post three notes each in
+/// AND IN ORDER** (critic item E06, `Bridge::rate`): `ta000000000` and `tb000000000` post three notes each in
 /// one drain, pipelined behind the gap fence, onto a broker whose bucket takes two records and
 /// one more a second. The limit refuses the third post mid-window, and the fence (or the empty
 /// bucket) every post sent after it. The bridge holds every publish of its producer for the
@@ -16943,7 +17740,7 @@ fn a_burst_the_rate_limit_refuses_mid_window_lands_whole_once_and_in_order() {
 }
 
 #[cfg(unix)]
-const RATE_SENDERS: [&str; 2] = ["s-a", "s-b"];
+const RATE_SENDERS: [&str; 2] = ["ta000000000", "tb000000000"];
 
 #[cfg(unix)]
 const RATE_POSTS: u64 = 6;
@@ -16952,7 +17749,7 @@ const RATE_POSTS: u64 = 6;
 #[cfg(unix)]
 #[derive(Debug)]
 struct RateLimitedRun {
-    /// The notes on `s-r`'s lane, by offset.
+    /// The notes on `tr000000000`'s lane, by offset.
     notes: Vec<(u64, String)>,
     retired: Retired,
     /// The broker refused part of the first drain's burst for the rate.
@@ -16981,7 +17778,8 @@ struct RateLimitedRun {
 /// end would wait for a wake nothing sends, and the run says so.
 #[cfg(unix)]
 fn rate_limited_burst(fx: crate::fx::Fx) -> RateLimitedRun {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     bridge.fx = fx.on_a_held_clock();
     // The roster's refresh, the loop's one other duty here, falls past the run.
     bridge.roster_due = bridge.fx.now() + Duration::from_secs(3600);
@@ -17009,12 +17807,12 @@ fn rate_limited_burst(fx: crate::fx::Fx) -> RateLimitedRun {
         .unwrap();
     assert!(bridge.ask_gap_fences());
     assert!(bridge.pipelines_posts());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     let mut frame = String::new();
     for n in 1..=3u64 {
         for sid in RATE_SENDERS {
-            frame.push_str(&queued_note(sid, n, "@s-r", &format!("{sid}-{n}")));
+            frame.push_str(&queued_note(sid, n, "@tr000000000", &format!("{sid}-{n}")));
         }
     }
     *lane.outbox.lock().unwrap() = Some(frame);
@@ -17130,7 +17928,7 @@ fn spend_the_bucket(bridge: &Bridge, records: u64, bytes: usize) {
             .publish(
                 bridge.producer_id,
                 (1u64 << 40) + seq,
-                "/f/f/pub/n-x/s-x/ev",
+                "/f/f/pub/n-x/tx000000000/ev",
                 &body,
             )
             .unwrap();
@@ -17140,7 +17938,7 @@ fn spend_the_bucket(bridge: &Bridge, records: u64, bytes: usize) {
 /// **AN `undeliverable` NOTICE THE RATE LIMIT HELD BACK IS SENT ONCE THE HOLD IS OVER, AND
 /// THE INBOX COMMIT WAITS FOR IT** (critic item E06's review, `Bridge::notices_held`): another
 /// write of the bridge's producer has spent its bucket (two records, one more a second), and
-/// an inbound note @23 for `s-other` is answered `ERR quota`. The bridge's `undeliverable` ev
+/// an inbound note @23 for `t0ther00000` is answered `ERR quota`. The bridge's `undeliverable` ev
 /// for it is refused for the rate, which holds every publish of the producer, so the notice
 /// to the remote sender is held back unsent. It is kept, the inbox commit stays below @23
 /// while it is, and once the hold is over the round's settle sends it at its own sequence:
@@ -17175,7 +17973,7 @@ fn an_undeliverable_notice_the_rate_limit_held_is_sent_once_the_hold_is_over() {
 /// ([`Bridge::settle_owed`]). The `re=` of each notice on the sender's lane.
 #[cfg(unix)]
 fn notice_under_a_rate_hold(fx: crate::fx::Fx) -> Vec<Option<u64>> {
-    const OTHER: &str = "s-other";
+    const OTHER: &str = "t0ther00000";
     const AT: u64 = 23;
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(2, OTHER)]);
     bridge.fx = fx;
@@ -17192,7 +17990,7 @@ fn notice_under_a_rate_hold(fx: crate::fx::Fx) -> Vec<Option<u64>> {
     let rec: BrokerRecord = (
         AT,
         format!("/f/f/in/{node}/{OTHER}/n-peer/note"),
-        b"v=1 t=1 from=s-peer text=hi".to_vec(),
+        b"v=1 t=1 from=tpeer000000 text=hi".to_vec(),
     );
     lane.answer_deliveries_to(OTHER, "ERR quota\n");
     // aterm answers `outbox` (an empty listing): the bridge stays an inheriting one.
@@ -17236,7 +18034,7 @@ fn notice_under_a_rate_hold(fx: crate::fx::Fx) -> Vec<Option<u64>> {
         );
     }
     let (mut reader, _) = bridge.connect().unwrap();
-    let notices = format!("/f/f/in/n-peer/s-peer/{node}/undeliverable");
+    let notices = format!("/f/f/in/n-peer/tpeer000000/{node}/undeliverable");
     let (rows, _) = reader.fetch(0, &notices, 16).unwrap();
     rows.iter()
         .filter(|(_, s, _)| *s == notices)
@@ -17246,16 +18044,16 @@ fn notice_under_a_rate_hold(fx: crate::fx::Fx) -> Vec<Option<u64>> {
 
 /// **A POST THE BYTE RATE REFUSED WAITS THE WHOLE WAIT THE BROKER NAMED, WHILE ITS
 /// PRODUCER'S OTHER POSTS GO ON** (critic item E06's review, `RateHold::hold_sender`): the
-/// bridge's byte bucket (16 KiB, 1 KiB a second) is spent, and `s-a` posts a note of 15 KiB,
-/// then `s-b` one of a few bytes, in one drain. The broker refuses `s-a`'s for its bytes,
-/// naming a wait of about fifteen seconds, and `s-b`'s behind the fence. The producer is held
+/// bridge's byte bucket (16 KiB, 1 KiB a second) is spent, and `ta000000000` posts a note of 15 KiB,
+/// then `tb000000000` one of a few bytes, in one drain. The broker refuses `ta000000000`'s for its bytes,
+/// naming a wait of about fifteen seconds, and `tb000000000`'s behind the fence. The producer is held
 /// a second at most ([`crate::rate_hold::PRODUCER_HOLD_MAX`]); at that hold's end the drain
-/// sends `s-b`'s, which the bucket has refilled for, and nothing of `s-a`'s, which is still
-/// held: no second refusal, and the loop's next wake is `s-a`'s own hold's end.
+/// sends `tb000000000`'s, which the bucket has refilled for, and nothing of `ta000000000`'s, which is still
+/// held: no second refusal, and the loop's next wake is `ta000000000`'s own hold's end.
 ///
 /// NEGATIVE CONTROL: with the sender held only by the producer's hold
 /// ([`crate::sim::world::Mutant::SenderWaitsOnlyTheProducerHold`]), the drain at its end sends
-/// `s-a`'s post again, into a bucket that holds a second's bytes: refused again, and so after
+/// `ta000000000`'s post again, into a bucket that holds a second's bytes: refused again, and so after
 /// every producer hold, a one-a-second loop of refusals.
 #[cfg(unix)]
 #[test]
@@ -17263,12 +18061,12 @@ fn a_post_the_byte_rate_refused_waits_its_whole_wait_while_the_others_go_on() {
     let run = byte_refused_post_and_another(crate::fx::Fx::os());
     assert_eq!(
         run.refusals_after_the_hold, 0,
-        "s-a's post waits its own wait: {run:#?}"
+        "ta000000000's post waits its own wait: {run:#?}"
     );
-    assert_eq!(run.landed, ["small"], "s-b's post landed: {run:#?}");
+    assert_eq!(run.landed, ["small"], "tb000000000's post landed: {run:#?}");
     assert!(
         run.next_wake > crate::rate_hold::PRODUCER_HOLD_MAX,
-        "the next wake is s-a's own hold's end: {run:#?}"
+        "the next wake is ta000000000's own hold's end: {run:#?}"
     );
 
     let run = byte_refused_post_and_another(crate::fx::Fx::os_without(
@@ -17276,7 +18074,7 @@ fn a_post_the_byte_rate_refused_waits_its_whole_wait_while_the_others_go_on() {
     ));
     assert!(
         run.refusals_after_the_hold > 0,
-        "NEGATIVE CONTROL: s-a's post is refused again at the producer hold's end: {run:#?}"
+        "NEGATIVE CONTROL: ta000000000's post is refused again at the producer hold's end: {run:#?}"
     );
 }
 
@@ -17286,7 +18084,7 @@ fn a_post_the_byte_rate_refused_waits_its_whole_wait_while_the_others_go_on() {
 struct ByteRefusedRun {
     /// The broker's refusals for the rate in the drain at the producer hold's end.
     refusals_after_the_hold: u64,
-    /// The texts on `s-r`'s lane but the big one's.
+    /// The texts on `tr000000000`'s lane but the big one's.
     landed: Vec<String>,
     /// How long after that drain the next hold ends.
     next_wake: Duration,
@@ -17297,7 +18095,8 @@ struct ByteRefusedRun {
 #[cfg(unix)]
 fn byte_refused_post_and_another(fx: crate::fx::Fx) -> ByteRefusedRun {
     const KIB: u64 = 1024;
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     bridge.fx = fx;
     bridge.roster_due = Instant::now() + Duration::from_secs(3600);
     lane.retire_from_outbox();
@@ -17311,21 +18110,21 @@ fn byte_refused_post_and_another(fx: crate::fx::Fx) -> ByteRefusedRun {
             .unwrap(),
     );
     assert!(bridge.pipelines_posts());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     spend_the_bucket(&bridge, 1, usize::try_from(16 * KIB).unwrap() - 64);
     let big = "z".repeat(usize::try_from(15 * KIB).unwrap());
     *lane.outbox.lock().unwrap() = Some(format!(
         "{}{}",
-        queued_note("s-a", 1, "@s-r", &big),
-        queued_note("s-b", 1, "@s-r", "small"),
+        queued_note("ta000000000", 1, "@tr000000000", &big),
+        queued_note("tb000000000", 1, "@tr000000000", "small"),
     ));
     bridge.drain_outbox();
     bridge.settle_acks();
     let refused = broker.stats().rate_limited;
     assert!(
         refused > 0 && bridge.rate_held().is_some(),
-        "PRECONDITION: s-a's post was refused for its bytes"
+        "PRECONDITION: ta000000000's post was refused for its bytes"
     );
 
     let left = bridge.rate_held().unwrap_or_default();
@@ -17351,14 +18150,14 @@ fn byte_refused_post_and_another(fx: crate::fx::Fx) -> ByteRefusedRun {
 #[cfg(unix)]
 #[test]
 fn an_own_lane_record_is_judged_only_once_its_pipelined_post_is_answered() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let (socket, _broker, _server) = serve_log(&lane, "self-lane");
     bridge.cfg.broker = socket;
     assert!(bridge.attach_broker());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
-    *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 1, "@s-r", "mine"));
+    *lane.outbox.lock().unwrap() = Some(queued_note("ta000000000", 1, "@tr000000000", "mine"));
     bridge.in_round = true;
     bridge.drain_outbox();
     assert_eq!(
@@ -17393,7 +18192,7 @@ fn an_own_lane_record_is_judged_only_once_its_pipelined_post_is_answered() {
         "delivered: {:#?}",
         lane.transcript()
     );
-    assert!(retirements(&lane).contains(&("s-a".to_string(), 1, Some(off))));
+    assert!(retirements(&lane).contains(&("ta000000000".to_string(), 1, Some(off))));
     bridge.settle_acks();
     let (rows, _) = reader.fetch(0, "/f/f/pub/>", 4096).unwrap();
     let evs: Vec<String> = rows
@@ -17407,17 +18206,18 @@ fn an_own_lane_record_is_judged_only_once_its_pipelined_post_is_answered() {
 #[cfg(unix)]
 #[test]
 fn a_halt_queued_at_a_drain_of_fresh_posts_is_applied_inside_the_drain() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let (socket, _broker, _server) = serve_log(&lane, "halt");
     bridge.cfg.broker = socket;
     bridge.conn = Some(bridge.connect().unwrap().0.into());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     let mut frame = String::new();
     for n in 1..=4u64 {
-        for sid in ["s-a", "s-b"] {
-            frame.push_str(&queued_note(sid, n, "@s-r", &format!("{sid}-{n}")));
+        for sid in ["ta000000000", "tb000000000"] {
+            frame.push_str(&queued_note(sid, n, "@tr000000000", &format!("{sid}-{n}")));
         }
     }
     *lane.outbox.lock().unwrap() = Some(frame);
@@ -17443,7 +18243,7 @@ fn a_halt_queued_at_a_drain_of_fresh_posts_is_applied_inside_the_drain() {
         .into_iter()
         .filter(|line| line.starts_with("hold "))
         .collect();
-    for sid in ["s-a", "s-b", "s-r"] {
+    for sid in ["ta000000000", "tb000000000", "tr000000000"] {
         assert!(
             holds
                 .iter()
@@ -17465,12 +18265,12 @@ fn a_halt_queued_at_a_drain_of_fresh_posts_is_applied_inside_the_drain() {
 #[test]
 fn a_fresh_posts_unwritable_in_flight_entry_ends_the_drain_as_a_blocking_one_does() {
     for key in [false, true] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (3, "s-r")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (3, "tr000000000")]);
         assert!(bridge.refresh_sessions().is_ok());
         let (socket, _broker, _server) = serve_log(&lane, "inflight");
         bridge.cfg.broker = socket;
         bridge.conn = Some(bridge.connect().unwrap().0.into());
-        let own = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+        let own = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
         let other = format!("/f/f/in/p/h-human/{}/note", bridge.node);
         bridge.indexed_subjects.insert(own.clone());
         bridge.indexed_subjects.insert(other.clone());
@@ -17486,8 +18286,8 @@ fn a_fresh_posts_unwritable_in_flight_entry_ends_the_drain_as_a_blocking_one_doe
         };
         *lane.outbox.lock().unwrap() = Some(
             [
-                keyed(queued_note("s-a", 1, "@s-r", "a1"), "a1"),
-                keyed(queued_note("s-a", 2, "h-human", "a2"), "a2"),
+                keyed(queued_note("ta000000000", 1, "@tr000000000", "a1"), "a1"),
+                keyed(queued_note("ta000000000", 2, "h-human", "a2"), "a2"),
             ]
             .concat(),
         );
@@ -17508,7 +18308,7 @@ fn a_fresh_posts_unwritable_in_flight_entry_ends_the_drain_as_a_blocking_one_doe
         assert_eq!(
             retirements(&lane),
             [],
-            "key={key}: nothing of s-a's retired"
+            "key={key}: nothing of ta000000000's retired"
         );
     }
 }
@@ -17516,12 +18316,12 @@ fn a_fresh_posts_unwritable_in_flight_entry_ends_the_drain_as_a_blocking_one_doe
 #[cfg(unix)]
 #[test]
 fn a_reply_naming_a_pipelined_ask_is_judged_once_the_asks_answer_is_read() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let (socket, _broker, _server) = serve_log(&lane, "stray");
     bridge.cfg.broker = socket;
     assert!(bridge.attach_broker());
-    bridge.state.pin("s-w", "n-far").expect("pin");
+    bridge.state.pin("tw000000000", "n-far").expect("pin");
     bridge
         .connect()
         .unwrap()
@@ -17529,14 +18329,14 @@ fn a_reply_naming_a_pipelined_ask_is_judged_once_the_asks_answer_is_read() {
         .publish(
             9_000,
             1,
-            &subject::session_face("f", "n-far", "s-w", "presence"),
+            &subject::session_face("f", "n-far", "tw000000000", "presence"),
             b"v=1 t=1 inc=1 state=live",
         )
-        .expect("n-far advertises s-w");
-    let face = format!("/f/f/in/n-far/s-w/{}/ask", bridge.node);
+        .expect("n-far advertises tw000000000");
+    let face = format!("/f/f/in/n-far/tw000000000/{}/ask", bridge.node);
     bridge.indexed_subjects.insert(face.clone());
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=@s-w@n-far kind=ask len=1\nq".to_string());
+        Some("post sid=ta000000000 id=1 to=@tw000000000@n-far kind=ask len=1\nq".to_string());
     bridge.in_round = true;
     bridge.drain_outbox();
     assert_eq!(
@@ -17556,7 +18356,7 @@ fn a_reply_naming_a_pipelined_ask_is_judged_once_the_asks_answer_is_read() {
         None,
         "the control: with the ask's ack unread, nothing says where it went"
     );
-    let stray = format!("/f/f/in/{}/s-a/n-evil/answer", bridge.node);
+    let stray = format!("/f/f/in/{}/ta000000000/n-evil/answer", bridge.node);
     let mut body = Body::new(0);
     body.re = Some(asked);
     body.text = "forged".to_string();
@@ -17579,21 +18379,21 @@ fn a_reply_naming_a_pipelined_ask_is_judged_once_the_asks_answer_is_read() {
         delivered[0].contains(" kind=note ") && delivered[0].contains(" demoted=answer"),
         "the stray delivered as what it is: {delivered:#?}"
     );
-    assert!(retirements(&lane).contains(&("s-a".to_string(), 1, Some(asked))));
+    assert!(retirements(&lane).contains(&("ta000000000".to_string(), 1, Some(asked))));
 }
 
 #[cfg(unix)]
 #[test]
 fn a_post_still_in_flight_at_the_next_drains_peek_lands_once() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-r")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let (socket, _broker, _server) = serve_log(&lane, "peek");
     bridge.cfg.broker = socket;
     bridge.conn = Some(bridge.connect().unwrap().0.into());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     lane.retire_from_outbox();
-    *lane.outbox.lock().unwrap() = Some(queued_note("s-a", 1, "@s-r", "once"));
+    *lane.outbox.lock().unwrap() = Some(queued_note("ta000000000", 1, "@tr000000000", "once"));
     bridge.in_round = true;
     bridge.drain_outbox();
     assert_eq!(
@@ -17606,7 +18406,7 @@ fn a_post_still_in_flight_at_the_next_drains_peek_lands_once() {
             .lock()
             .unwrap()
             .as_deref()
-            .is_some_and(|frame| frame.contains("sid=s-a id=1 ")),
+            .is_some_and(|frame| frame.contains("sid=ta000000000 id=1 ")),
         "the control: the endpoint still lists the note in flight"
     );
 
@@ -17620,7 +18420,7 @@ fn a_post_still_in_flight_at_the_next_drains_peek_lands_once() {
     assert_eq!(texts, ["once"], "one record: {notes:#?}");
     assert_eq!(
         retirements(&lane),
-        [("s-a".to_string(), 1, Some(notes[0].0))],
+        [("ta000000000".to_string(), 1, Some(notes[0].0))],
         "retired once, at its own offset"
     );
 }
@@ -17628,18 +18428,19 @@ fn a_post_still_in_flight_at_the_next_drains_peek_lands_once() {
 #[cfg(unix)]
 #[test]
 fn a_whole_drain_answers_the_drain_events_queued_before_its_peek_and_a_short_one_none() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (2, "s-b"), (3, "s-r")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tb000000000"), (3, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let (socket, _broker, _server) = serve_log(&lane, "forget");
     bridge.cfg.broker = socket;
     bridge.conn = Some(bridge.connect().unwrap().0.into());
-    let lane_of = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(lane_of.clone());
     lane.retire_from_outbox();
     let queue = |bridge: &Bridge| {
         for line in [
             "EVENT 1 post 2",
-            "EVENT 2 inbox 7 from=s-a kind=note off=40",
+            "EVENT 2 inbox 7 from=ta000000000 kind=note off=40",
             "EVENT 2 post 1",
             "GAP 2 events-dropped=1",
             "EVENT 1 fetch off=9",
@@ -17655,14 +18456,17 @@ fn a_whole_drain_answers_the_drain_events_queued_before_its_peek_and_a_short_one
         left
     };
     queue(&bridge);
-    bridge.on_event("EVENT 2 inbox 6 from=s-a kind=note off=39");
+    bridge.on_event("EVENT 2 inbox 6 from=ta000000000 kind=note off=39");
     assert_eq!(
         left(&bridge).len(),
         5,
         "the control: an inbox event forgets nothing"
     );
 
-    *lane.outbox.lock().unwrap() = Some(format!("{}more\n", queued_note("s-a", 1, "@s-r", "a1")));
+    *lane.outbox.lock().unwrap() = Some(format!(
+        "{}more\n",
+        queued_note("ta000000000", 1, "@tr000000000", "a1")
+    ));
     queue(&bridge);
     bridge.on_event("EVENT 1 post 1");
     assert_eq!(
@@ -17677,13 +18481,17 @@ fn a_whole_drain_answers_the_drain_events_queued_before_its_peek_and_a_short_one
         "a cut listing leaves every drain event for the next drain"
     );
 
-    std::fs::write(bridge.state.root().join("fail-post-publish"), "s-b\n").unwrap();
+    std::fs::write(
+        bridge.state.root().join("fail-post-publish"),
+        "tb000000000\n",
+    )
+    .unwrap();
     bridge.fault = Fault::FailPostPublishWhileMarked;
-    *lane.outbox.lock().unwrap() = Some(queued_note("s-b", 1, "@s-r", "b1"));
+    *lane.outbox.lock().unwrap() = Some(queued_note("tb000000000", 1, "@tr000000000", "b1"));
     queue(&bridge);
     bridge.on_event("EVENT 2 post 1");
     assert!(
-        bridge.held_senders.contains("s-b"),
+        bridge.held_senders.contains("tb000000000"),
         "the refusal holds its sender"
     );
     assert_eq!(
@@ -17698,7 +18506,7 @@ fn a_whole_drain_answers_the_drain_events_queued_before_its_peek_and_a_short_one
     assert_eq!(
         retirements(&lane)
             .iter()
-            .filter(|(sid, _, off)| sid == "s-b" && off.is_some())
+            .filter(|(sid, _, off)| sid == "tb000000000" && off.is_some())
             .count(),
         1,
         "b1 landed: {:?}",
@@ -17707,7 +18515,7 @@ fn a_whole_drain_answers_the_drain_events_queued_before_its_peek_and_a_short_one
     assert_eq!(
         left(&bridge),
         [
-            "EVENT 2 inbox 7 from=s-a kind=note off=40",
+            "EVENT 2 inbox 7 from=ta000000000 kind=note off=40",
             "GAP 2 events-dropped=1"
         ]
     );
@@ -17716,30 +18524,30 @@ fn a_whole_drain_answers_the_drain_events_queued_before_its_peek_and_a_short_one
 #[cfg(unix)]
 #[test]
 fn a_refused_pipelined_publish_is_its_own_records_answer() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
-    let (_broker, _server) = seeded_broker(&lane, &mut bridge, &["s-a"], &[], max);
+    let (_broker, _server) = seeded_broker(&lane, &mut bridge, &["ta000000000"], &[], max);
     bridge
         .per_sid
         .presence
-        .entry("s-new".to_string())
+        .entry("tnew0000000".to_string())
         .or_default()
         .sampled = true;
     bridge.batched(|bridge| {
-        bridge.publish_ev_for(Some("s-a"), "one");
-        bridge.publish_session_presence("s-new", "live");
-        bridge.publish_ev_for(Some("s-a"), "two");
+        bridge.publish_ev_for(Some("ta000000000"), "one");
+        bridge.publish_session_presence("tnew0000000", "live");
+        bridge.publish_ev_for(Some("ta000000000"), "two");
         assert_eq!(bridge.conn.as_ref().unwrap().unacked(), 3, "all in flight");
     });
     assert!(bridge.conn.is_some(), "a refusal leaves the link up");
     assert_eq!(
-        bridge.per_sid.presence["s-new"].due(bridge.cfg.presence, Instant::now()),
+        bridge.per_sid.presence["tnew0000000"].due(bridge.cfg.presence, Instant::now()),
         crate::presence::Due::First,
         "the refused row is not on the bus"
     );
     let (mut reader, _) = bridge.connect().unwrap();
-    let face = subject::session_face("f", &bridge.node, "s-a", "ev");
+    let face = subject::session_face("f", &bridge.node, "ta000000000", "ev");
     let (rows, _) = reader.fetch(0, &face, 64).unwrap();
     let evs: Vec<String> = rows
         .iter()
@@ -17815,15 +18623,15 @@ fn sequences_are_reserved_a_block_at_a_time_and_a_restart_never_reuses_one() {
 #[cfg(unix)]
 #[test]
 fn a_log_switch_rechecks_a_cached_broadcast_against_the_new_subject_budget() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     let (a, _broker_a, _server_a) = serve_log(&lane, "say-a");
     bridge.cfg.broker = a;
     assert!(bridge.attach_broker());
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=say:known kind=note len=3\nold".to_string());
+        Some("post sid=ta000000000 id=1 to=say:known kind=note len=3\nold".to_string());
     bridge.drain_outbox();
-    let subject = format!("/f/f/pub/{}/s-a/say/known", bridge.node);
+    let subject = format!("/f/f/pub/{}/ta000000000/say/known", bridge.node);
     assert!(bridge.indexed_subjects.contains(&subject));
     bridge.conn = None;
     assert!(bridge.attach_broker());
@@ -17836,16 +18644,16 @@ fn a_log_switch_rechecks_a_cached_broadcast_against_the_new_subject_budget() {
     bridge.conn = None;
     let max = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER as u64;
     let held = max - max / SAY_RESERVE_DIVISOR;
-    let (_broker_b, _server_b) = seeded_broker(&lane, &mut bridge, &["s-a"], &[], held);
+    let (_broker_b, _server_b) = seeded_broker(&lane, &mut bridge, &["ta000000000"], &[], held);
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=2 to=say:known kind=note len=3\nnew".to_string());
+        Some("post sid=ta000000000 id=2 to=say:known kind=note len=3\nnew".to_string());
     bridge.drain_outbox();
     assert!(
         lane.sent
             .lock()
             .unwrap()
             .iter()
-            .any(|line| line == "outbox sent s-a 2 off=- reason=subject-budget"),
+            .any(|line| line == "outbox sent ta000000000 2 off=- reason=subject-budget"),
         "A's cache spent B's reserve: {:?}",
         lane.sent.lock().unwrap()
     );
@@ -17864,7 +18672,7 @@ fn a_log_switch_rechecks_a_cached_broadcast_against_the_new_subject_budget() {
 #[cfg(unix)]
 #[test]
 fn a_log_switch_waits_until_every_old_offset_directory_can_be_read() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for blocked in ["seen", "topics"] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         assert!(bridge.refresh_sessions().is_ok());
@@ -17912,7 +18720,7 @@ fn a_log_switch_waits_until_every_old_offset_directory_can_be_read() {
 #[cfg(unix)]
 #[test]
 fn a_log_switch_waits_until_every_listed_topic_file_can_be_read() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     assert!(bridge.refresh_sessions().is_ok());
     let (a, broker_a, _server_a) = serve_log(&lane, "entry-a");
@@ -17963,7 +18771,7 @@ fn a_log_switch_waits_until_every_listed_topic_file_can_be_read() {
 #[cfg(unix)]
 #[test]
 fn a_log_transition_requires_the_endpoints_ack_before_refill() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for (index, reply) in [
         "ERR busy\n",
         "ERR usage link\n",
@@ -18018,7 +18826,7 @@ fn a_log_transition_requires_the_endpoints_ack_before_refill() {
 #[cfg(unix)]
 #[test]
 fn a_log_transition_with_a_lost_endpoint_publishes_nothing() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-kept")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tkept000000")]);
     lane.answer_hello_with(&format!("OK lane={LINK_LOG_LANE} build=test\n"));
     bridge.introduce();
     assert!(bridge.refresh_sessions().is_ok());
@@ -18040,7 +18848,7 @@ fn a_log_transition_with_a_lost_endpoint_publishes_nothing() {
 #[cfg(unix)]
 #[test]
 fn a_log_transition_is_not_sent_to_an_endpoint_below_lane_two() {
-    const SID: &str = "s-kept";
+    const SID: &str = "tkept000000";
     for endpoint_lane in [0, LINK_LOG_LANE - 1] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         lane.answer_hello_with(&format!("OK lane={endpoint_lane} build=old\n"));
@@ -18066,7 +18874,7 @@ fn a_log_transition_is_not_sent_to_an_endpoint_below_lane_two() {
 #[cfg(unix)]
 #[test]
 fn a_record_decided_on_one_log_is_never_published_on_another() {
-    const SID: &str = "s-decider";
+    const SID: &str = "tdec1der000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     assert!(bridge.refresh_sessions().is_ok());
     let node = bridge.node.clone();
@@ -18094,7 +18902,7 @@ fn a_record_decided_on_one_log_is_never_published_on_another() {
         off: 5,
         verdict: "handled".to_string(),
         kind: "ask".to_string(),
-        from: format!("s-asker@{node}"),
+        from: format!("tasker00000@{node}"),
         earlier_log: false,
     };
     cut(&mut bridge);
@@ -18181,7 +18989,7 @@ fn a_record_decided_on_one_log_is_never_published_on_another() {
 #[cfg(unix)]
 #[test]
 fn a_log_restored_under_its_own_identity_replays_no_record_decided_before_it() {
-    const SID: &str = "s-decider";
+    const SID: &str = "tdec1der000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     assert!(bridge.refresh_sessions().is_ok());
     let node = bridge.node.clone();
@@ -18226,7 +19034,7 @@ fn a_log_restored_under_its_own_identity_replays_no_record_decided_before_it() {
 #[test]
 fn an_observer_answers_no_halt() {
     for (attachment, answers) in [(Attachment::Inherited, true), (Attachment::Observer, false)] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-s")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ts000000000")]);
         let (socket, _broker, _server) = serve_log(&lane, "broker");
         bridge.cfg.broker = socket;
         bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -18252,7 +19060,7 @@ fn an_observer_answers_no_halt() {
 #[cfg(unix)]
 #[test]
 fn a_halt_the_verb_lane_died_under_is_answered_by_the_bridge_that_applies_it() {
-    const SID: &str = "s-held";
+    const SID: &str = "the1d000000";
     const HALT: &str = "/f/f/fleet/h-x/halt";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let (socket, _broker, _server) = serve_log(&lane, "broker");
@@ -18338,8 +19146,8 @@ fn halt_answers(bridge: &Bridge) -> Vec<Body> {
 #[cfg(unix)]
 #[test]
 fn a_busy_hold_is_answered_only_after_a_later_roster_round_reaches_it() {
-    const FIRST: &str = "s-first";
-    const LATER: &str = "s-later";
+    const FIRST: &str = "tf1rst00000";
+    const LATER: &str = "t1ater00000";
     const HALT: &str = "/f/f/fleet/h-x/halt";
     for on in [true, false] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, FIRST), (2, LATER)]);
@@ -18416,18 +19224,18 @@ fn a_busy_hold_is_answered_only_after_a_later_roster_round_reaches_it() {
 #[test]
 fn only_an_absent_session_satisfies_a_halt_without_an_ok_hold() {
     for (reply, reached) in [("ERR no such session", true), ("ERR denied", false)] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-first"), (2, "s-later")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tf1rst00000"), (2, "t1ater00000")]);
         let (socket, _broker, _server) = serve_log(&lane, "broker");
         bridge.cfg.broker = socket;
         bridge.conn = Some(bridge.connect().unwrap().0.into());
-        lane.refuse_hold("s-first", Some(reply));
+        lane.refuse_hold("tf1rst00000", Some(reply));
         let (mut human, _) = bridge.connect().unwrap();
         let body = b"v=1 t=1 state=on reason=stop";
         let subject = "/f/f/fleet/h-x/halt";
         let (barrier, _) = human.publish(91, 1, subject, body).unwrap();
         bridge.on_fleet_record(&(barrier, subject.into(), body.to_vec()));
         assert!(
-            lane.holds("s-later"),
+            lane.holds("t1ater00000"),
             "later sessions were skipped after {reply}"
         );
         assert_eq!(
@@ -18447,7 +19255,7 @@ fn only_an_absent_session_satisfies_a_halt_without_an_ok_hold() {
 #[cfg(unix)]
 #[test]
 fn an_unread_roster_leaves_its_halt_owed_until_a_successful_round() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-first"), (2, "s-later")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tf1rst00000"), (2, "t1ater00000")]);
     let (socket, _broker, _server) = serve_log(&lane, "broker");
     bridge.cfg.broker = socket;
     bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -18459,11 +19267,11 @@ fn an_unread_roster_leaves_its_halt_owed_until_a_successful_round() {
     let subject = "/f/f/fleet/h-x/halt";
     let (barrier, _) = human.publish(91, 1, subject, body).unwrap();
     bridge.on_fleet_record(&(barrier, subject.into(), body.to_vec()));
-    assert!(lane.holds("s-first") && lane.holds("s-later"));
+    assert!(lane.holds("tf1rst00000") && lane.holds("t1ater00000"));
     assert_eq!(bridge.state.halt_acked(), None);
-    bridge.converge_hold("s-later", EndpointHold::Fleet);
+    bridge.converge_hold("t1ater00000", EndpointHold::Fleet);
     assert!(
-        lane.holds("s-later"),
+        lane.holds("t1ater00000"),
         "unread roster rolled back a standing halt"
     );
     bridge.roster_backstop();
@@ -18479,7 +19287,7 @@ fn an_unread_roster_leaves_its_halt_owed_until_a_successful_round() {
 #[cfg(unix)]
 #[test]
 fn convergence_never_lifts_the_owners_local_hold() {
-    const SID: &str = "s-held";
+    const SID: &str = "the1d000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let (socket, _broker, _server) = serve_log(&lane, "broker");
     bridge.cfg.broker = socket;
@@ -18555,7 +19363,7 @@ fn convergence_never_lifts_the_owners_local_hold() {
 #[cfg(unix)]
 fn ready_status_row(local: u64, seq: u64) -> String {
     format!(
-        "{local} s-{local} {local:032x} sid={local} revision=1 hold=0 hold_origin=- \
+        "{local} t{local:010} {local:032x} sid={local} revision=1 hold=0 hold_origin=- \
          detail=- agent=idle {META_WORDS_SAID} gen=1.{seq}"
     )
 }
@@ -18648,7 +19456,7 @@ fn an_attach_of_ready_sessions_reads_one_status_batch_and_no_meta_or_screen() {
         Some(Mutant::ReadTheScreenEveryRow),
         Some(Mutant::ReadMetaPerSession),
     ] {
-        let sessions: Vec<(u64, String)> = (1..=N).map(|l| (l, format!("s-{l}"))).collect();
+        let sessions: Vec<(u64, String)> = (1..=N).map(|l| (l, format!("t{l:010}"))).collect();
         let named: Vec<(u64, &str)> = sessions.iter().map(|(l, s)| (*l, s.as_str())).collect();
         let (lane, mut bridge) = FakeVerbLane::bridge(&named);
         if let Some(mutant) = control {
@@ -18719,20 +19527,24 @@ fn an_attach_of_ready_sessions_reads_one_status_batch_and_no_meta_or_screen() {
 /// E05 and its review). aterm reads an ack's meaning fields in one meta hold with its watch's
 /// start, and the bridge cannot order that start against the read that sampled the slot, so
 /// an ack that agrees with the slot reads nothing and one that differs reads the session's
-/// own `@<sid> meta`, which is later than the watch's start, whichever came first. s-1's
+/// own `@<sid> meta`, which is later than the watch's start, whichever came first. t0000000001's
 /// batch said `role=worker` and its role became `lead` before its watch began, so no `EVENT
-/// meta` will tell it and the ack says `lead`. s-2's watch began first (as `start()`
+/// meta` will tell it and the ack says `lead`. t0000000002's watch began first (as `start()`
 /// subscribes before the first attach), its ack saying `worker`, and its role became `lead`
 /// before the batch read it, so the ack is the older. Both slots, and their newest rows, say
-/// `lead`, and no row of s-2 says the ack's `worker`. s-3's ack says only some of the three
-/// and reads the session's own meta too; s-4's agrees and reads nothing.
+/// `lead`, and no row of t0000000002 says the ack's `worker`. t0000000003's ack says only some of the three
+/// and reads the session's own meta too; t0000000004's agrees and reads nothing.
 #[cfg(unix)]
 #[test]
 fn a_watch_ack_never_rolls_a_slot_back_and_a_change_it_says_reaches_presence() {
     let lead_words = META_WORDS_SAID.replace("role=worker", "role=lead");
     let lead_header = META_HEADER.replace("role=worker", "role=lead");
-    let (lane, mut bridge) =
-        FakeVerbLane::bridge(&[(1, "s-1"), (2, "s-2"), (3, "s-3"), (4, "s-4")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[
+        (1, "t0000000001"),
+        (2, "t0000000002"),
+        (3, "t0000000003"),
+        (4, "t0000000004"),
+    ]);
     let (socket, _broker, _server) = serve_log(&lane, "ack-meta");
     bridge.cfg.broker = socket;
     lane.answer_meta_with(META_HEADER);
@@ -18749,14 +19561,14 @@ fn a_watch_ack_never_rolls_a_slot_back_and_a_change_it_says_reaches_presence() {
         0,
         "the attach reads no meta"
     );
-    // The sessions' meta as `@<sid> meta` reads it from here on: s-1's and s-2's role is
+    // The sessions' meta as `@<sid> meta` reads it from here on: t0000000001's and t0000000002's role is
     // `lead`, the change each ack races.
     lane.answer_meta_with(&lead_header);
 
     for ack in [
-        format!("sub 1 s-1 {lead_words}"),
-        format!("sub 2 s-2 {META_WORDS_SAID}"),
-        "sub 3 s-3 role=boss attention=-".to_string(),
+        format!("sub 1 t0000000001 {lead_words}"),
+        format!("sub 2 t0000000002 {META_WORDS_SAID}"),
+        "sub 3 t0000000003 role=boss attention=-".to_string(),
     ] {
         bridge.on_event(&ack);
         assert_eq!(
@@ -18765,17 +19577,17 @@ fn a_watch_ack_never_rolls_a_slot_back_and_a_change_it_says_reaches_presence() {
             "an ack that differs from its slot reads the session's own meta: {ack}"
         );
     }
-    bridge.on_event(&format!("sub 4 s-4 {META_WORDS_SAID}"));
+    bridge.on_event(&format!("sub 4 t0000000004 {META_WORDS_SAID}"));
     assert_eq!(
         presence_reads(&lane.take_requests()),
         [0, 0, 0, 0],
         "an ack that agrees with its slot reads nothing"
     );
     for (sid, role) in [
-        ("s-1", "lead"),
-        ("s-2", "lead"),
-        ("s-3", "lead"),
-        ("s-4", "worker"),
+        ("t0000000001", "lead"),
+        ("t0000000002", "lead"),
+        ("t0000000003", "lead"),
+        ("t0000000004", "worker"),
     ] {
         let slot = &bridge.per_sid.presence[sid];
         assert!(slot.sampled, "{sid}");
@@ -18783,25 +19595,25 @@ fn a_watch_ack_never_rolls_a_slot_back_and_a_change_it_says_reaches_presence() {
     }
 
     let (mut reader, _) = bridge.connect().unwrap();
-    for sid in ["s-1", "s-2"] {
+    for sid in ["t0000000001", "t0000000002"] {
         assert!(bridge.batched(|b| b.publish_session_presence(sid, "live")));
     }
-    let said = presence_said(&bridge, &mut reader, "s-1", "role");
+    let said = presence_said(&bridge, &mut reader, "t0000000001", "role");
     assert_eq!(
         (
             said.first().map(String::as_str),
             said.last().map(String::as_str)
         ),
         (Some("worker"), Some("lead")),
-        "s-1's attach row said the batch's role, and its newest says the change"
+        "t0000000001's attach row said the batch's role, and its newest says the change"
     );
     assert_eq!(
-        presence_said(&bridge, &mut reader, "s-2", "role")
+        presence_said(&bridge, &mut reader, "t0000000002", "role")
             .iter()
             .filter(|role| *role != "lead")
             .count(),
         0,
-        "no row of s-2 says its older ack's role"
+        "no row of t0000000002 says its older ack's role"
     );
 }
 
@@ -18816,14 +19628,15 @@ fn a_watch_ack_never_rolls_a_slot_back_and_a_change_it_says_reaches_presence() {
 #[cfg(unix)]
 #[test]
 fn an_attach_reads_its_own_status_for_a_row_that_deferred_its_verdict_or_named_no_screen() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-1"), (2, "s-2"), (3, "s-3")]);
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, "t0000000001"), (2, "t0000000002"), (3, "t0000000003")]);
     let (socket, _broker, _server) = serve_log(&lane, "attach-short");
     bridge.cfg.broker = socket;
     lane.answer_meta_with(META_HEADER);
     lane.answer_single_status_with("OK hold=0 detail=- agent=busy gen=1.99");
     let short = |local: u64, tail: &str| {
         format!(
-            "{local} s-{local} {local:032x} sid={local} revision=1 hold=0 hold_origin=- \
+            "{local} t{local:010} {local:032x} sid={local} revision=1 hold=0 hold_origin=- \
              detail=- {tail}"
         )
     };
@@ -18845,12 +19658,12 @@ fn an_attach_reads_its_own_status_for_a_row_that_deferred_its_verdict_or_named_n
     };
     assert_eq!(
         single(crate::wait_tally::Row::LaneStatus),
-        ["@s-2 status", "@s-3 status"],
+        ["@t0000000002 status", "@t0000000003 status"],
         "the two short rows' sessions, and only they, read their own status"
     );
     assert_eq!(
         single(crate::wait_tally::Row::LaneMeta),
-        ["@s-2 meta"],
+        ["@t0000000002 meta"],
         "the row that left its meaning fields out, and only it, reads its own meta"
     );
     assert_eq!(
@@ -18861,16 +19674,16 @@ fn an_attach_reads_its_own_status_for_a_row_that_deferred_its_verdict_or_named_n
     let (mut reader, _) = bridge.connect().unwrap();
     let token = |seq| crate::presence::gen_token(ScreenGen { epoch: 1, seq });
     assert_eq!(
-        presence_phases_and_gens(&bridge, &mut reader, "s-1"),
+        presence_phases_and_gens(&bridge, &mut reader, "t0000000001"),
         [("idle".to_string(), token(11))],
     );
     assert_eq!(
-        presence_phases_and_gens(&bridge, &mut reader, "s-2"),
+        presence_phases_and_gens(&bridge, &mut reader, "t0000000002"),
         [("busy".to_string(), token(99))],
         "a deferred verdict's first row says the verdict its own read gave"
     );
     assert_eq!(
-        presence_phases_and_gens(&bridge, &mut reader, "s-3"),
+        presence_phases_and_gens(&bridge, &mut reader, "t0000000003"),
         [("busy".to_string(), token(99))],
         "a busy terminal's first row says the generation its own read named"
     );
@@ -18887,7 +19700,7 @@ fn an_attach_reads_its_own_status_for_a_row_that_deferred_its_verdict_or_named_n
 fn an_observers_every_row_reads_its_sessions_status() {
     let token = |seq| crate::presence::gen_token(ScreenGen { epoch: 1, seq });
     for attachment in [Attachment::Observer, Attachment::Inherited] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-1")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "t0000000001")]);
         bridge.attachment = attachment;
         let (socket, _broker, _server) = serve_log(&lane, "observer-rows");
         bridge.cfg.broker = socket;
@@ -18899,10 +19712,10 @@ fn an_observers_every_row_reads_its_sessions_status() {
         assert!(bridge.attach_broker(), "{attachment:?}: the attach");
         let attach = presence_reads(&lane.take_requests());
         lane.answer_single_status_with("OK hold=0 detail=- agent=busy gen=1.900");
-        assert!(bridge.batched(|b| b.publish_session_presence("s-1", "live")));
+        assert!(bridge.batched(|b| b.publish_session_presence("t0000000001", "live")));
         let later = presence_reads(&lane.take_requests());
         let (mut reader, _) = bridge.connect().unwrap();
-        let rows = presence_phases_and_gens(&bridge, &mut reader, "s-1");
+        let rows = presence_phases_and_gens(&bridge, &mut reader, "t0000000001");
         let row = |phase: &str, seq| (phase.to_string(), token(seq));
         if attachment == Attachment::Inherited {
             assert_eq!(
@@ -18936,7 +19749,7 @@ fn an_observers_every_row_reads_its_sessions_status() {
 #[test]
 fn an_agent_or_meta_events_row_reads_no_screen() {
     for control in [false, true] {
-        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-1"), (2, "s-2")]);
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "t0000000001"), (2, "t0000000002")]);
         if control {
             bridge.fx = crate::fx::Fx::os_without(crate::sim::world::Mutant::ReadTheScreenEveryRow);
         }
@@ -18947,7 +19760,7 @@ fn an_agent_or_meta_events_row_reads_no_screen() {
         bridge.per_sid.pending_admit.clear();
         lane.answer_meta_with(META_HEADER);
         lane.answer_status_with(&[ready_status_row(1, 5), ready_status_row(2, 6)]);
-        bridge.sample_meta("s-1");
+        bridge.sample_meta("t0000000001");
         bridge.presence_from_status_batch();
         lane.take_requests();
 
@@ -18971,12 +19784,12 @@ fn an_agent_or_meta_events_row_reads_no_screen() {
         );
         let (mut reader, _) = bridge.connect().unwrap();
         assert_eq!(
-            presence_gens(&bridge, &mut reader, "s-1"),
+            presence_gens(&bridge, &mut reader, "t0000000001"),
             [crate::presence::gen_token(ScreenGen { epoch: 1, seq: 77 })],
             "the verdict's row says the screen it was judged on"
         );
         assert_eq!(
-            presence_gens(&bridge, &mut reader, "s-2"),
+            presence_gens(&bridge, &mut reader, "t0000000002"),
             [crate::presence::gen_token(ScreenGen { epoch: 1, seq: 6 })],
         );
     }
@@ -18985,7 +19798,7 @@ fn an_agent_or_meta_events_row_reads_no_screen() {
 #[cfg(unix)]
 #[test]
 fn an_observer_leaves_the_nodes_inbox_group_where_it_found_it() {
-    const SID: &str = "s-watched";
+    const SID: &str = "twatched000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     bridge.attachment = Attachment::Observer;
     let (socket, _broker, _server) = serve_log(&lane, "broker");
@@ -19036,7 +19849,7 @@ fn an_observer_leaves_the_nodes_inbox_group_where_it_found_it() {
 #[cfg(unix)]
 #[test]
 fn an_observer_on_a_copy_of_a_live_nodes_state_dir_is_refused() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-copy")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "tc0py000000")]);
     bridge.attachment = Attachment::Observer;
     let (socket, _broker, _server) = serve_log(&lane, "broker");
     bridge.cfg.broker = socket;
@@ -19109,7 +19922,7 @@ fn the_ghost_sweep_never_retires_a_row_superseded_past_its_walk() {
             let mut s = theirs;
             let row = |offset: u64, inc: u64| Response::Delivery {
                 offset,
-                subject: format!("/f/f/pub/{node}/s-x/presence"),
+                subject: format!("/f/f/pub/{node}/tx000000000/presence"),
                 body: format!("v=1 t=1 inc={inc} state=live").into_bytes(),
             };
             while let Ok(Some(frame)) = read_frame(&mut s) {
@@ -19162,16 +19975,16 @@ fn a_refused_exited_row_is_owed_to_the_sweep_until_it_lands() {
     let ours = |row: &str| format!("{row} {}={mark}", crate::state::PRESENCE_MARK);
     let live = ours(&format!("v=1 t=1 inc={} state=live", bridge.inc));
     writer
-        .publish(91, 1, &face("s-gone"), live.as_bytes())
+        .publish(91, 1, &face("tgpne000000"), live.as_bytes())
         .unwrap();
     writer
-        .publish(91, 2, &face("s-done"), live.as_bytes())
+        .publish(91, 2, &face("td0ne000000"), live.as_bytes())
         .unwrap();
     let done = ours(&format!("v=1 t=2 inc={} state=exited", bridge.inc));
     writer
-        .publish(91, 3, &face("s-done"), done.as_bytes())
+        .publish(91, 3, &face("td0ne000000"), done.as_bytes())
         .unwrap();
-    for sid in ["s-gone", "s-done"] {
+    for sid in ["tgpne000000", "td0ne000000"] {
         bridge.conclude(
             Then::Presence {
                 sid: sid.to_string(),
@@ -19183,7 +19996,10 @@ fn a_refused_exited_row_is_owed_to_the_sweep_until_it_lands() {
     }
     assert_eq!(
         bridge.exits_owed,
-        ["s-done", "s-gone"].map(String::from).into_iter().collect(),
+        ["td0ne000000", "tgpne000000"]
+            .map(String::from)
+            .into_iter()
+            .collect(),
         "each refused `exited` row is owed"
     );
     assert!(bridge.sweep_owed(), "the sweep's arm has work");
@@ -19194,11 +20010,11 @@ fn a_refused_exited_row_is_owed_to_the_sweep_until_it_lands() {
         String::from_utf8_lossy(&rows.last().expect("a row").2).into_owned()
     };
     assert!(
-        newest(&bridge, "s-gone").contains("state=exited"),
+        newest(&bridge, "tgpne000000").contains("state=exited"),
         "the owed row was written"
     );
     assert_eq!(
-        newest(&bridge, "s-done"),
+        newest(&bridge, "td0ne000000"),
         done,
         "nothing written over a row that already says exited"
     );
@@ -19215,7 +20031,7 @@ fn a_refused_exited_row_is_owed_to_the_sweep_until_it_lands() {
 #[cfg(unix)]
 #[test]
 fn failed_live_admission_keeps_new_group_mail_behind_old_refill() {
-    const SID: &str = "s-live-refill";
+    const SID: &str = "t11vexref11";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
@@ -19332,7 +20148,7 @@ impl FakePushLane {
 
     fn park_through(&mut self, bridge: &mut Bridge, lines: &[&str]) {
         self.barriers += 1;
-        let sid = format!("s-park-barrier-{}", self.barriers);
+        let sid = format!("tpark{:06}", self.barriers);
         let barrier = format!("sub {} {sid}", 1_000_000 + self.barriers);
         let mut all = lines.to_vec();
         all.push(&barrier);
@@ -19389,10 +20205,10 @@ fn holds(bridge: &Bridge, sid: &str, topic: &str) -> bool {
 
 #[test]
 fn a_kept_sid_listed_after_the_attach_resumes_from_its_cursor_on_disk() {
-    const S: &str = "s-s";
-    const T: &str = "s-t";
-    const U: &str = "s-u";
-    const V: &str = "s-v";
+    const S: &str = "ts000000000";
+    const T: &str = "tt000000000";
+    const U: &str = "tv000000000";
+    const V: &str = "tv000000001";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(2, S), (3, T), (4, U), (5, V)]);
     let kept = BTreeMap::from([("builds".to_string(), TopicCursor { next: 91234 })]);
     for sid in [S, U, V] {
@@ -19410,7 +20226,10 @@ fn a_kept_sid_listed_after_the_attach_resumes_from_its_cursor_on_disk() {
     lane.refuse_reads(U, 1);
     lane.opt_in(U, &["topic builds since=@5", "topic other since=@7"]);
     let mut push = FakePushLane::attach(&bridge);
-    push.deliver(&mut bridge, &["EVENT * session-created s-s watch=deferred"]);
+    push.deliver(
+        &mut bridge,
+        &["EVENT * session-created ts000000000 watch=deferred"],
+    );
     assert_eq!(lane.reads_of(S), 1, "REACH: the announcement read S");
     assert_eq!(
         (
@@ -19449,7 +20268,7 @@ fn a_kept_sid_listed_after_the_attach_resumes_from_its_cursor_on_disk() {
 
 #[test]
 fn inbox_seen_persists_the_endpoints_addressed_floor() {
-    const T: &str = "s-t";
+    const T: &str = "tt000000000";
     let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, T)]);
     bridge.locals.insert(1, T.to_string());
     let mut push = FakePushLane::attach(&bridge);
@@ -19492,7 +20311,7 @@ fn inbox_seen_persists_the_endpoints_addressed_floor() {
 
 #[test]
 fn an_observer_reads_each_session_once_and_does_not_poll() {
-    const S: &str = "s-s";
+    const S: &str = "ts000000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(2, S)]);
     bridge.attachment = Attachment::Observer;
     bridge.roster_backstop();
@@ -19518,8 +20337,8 @@ struct BridgeWorld {
 
 impl BridgeWorld {
     const LOCAL: u64 = 2;
-    const S: &'static str = "s-s";
-    const ACK: &'static str = "sub 2 s-s";
+    const S: &'static str = "ts000000000";
+    const ACK: &'static str = "sub 2 ts000000000";
     const PUSH: &'static str = "EVENT 2 topic add probe since=@5";
 
     fn new() -> Self {
@@ -19899,9 +20718,9 @@ fn node_ev_words(bridge: &Bridge, reader: &mut Conn) -> Vec<String> {
 #[cfg(unix)]
 #[test]
 fn a_quit_withdraws_every_session_once_and_a_handoff_withdraws_none() {
-    const A: &str = "s-a";
-    const B: &str = "s-b";
-    const C: &str = "s-c";
+    const A: &str = "ta000000000";
+    const B: &str = "tb000000000";
+    const C: &str = "tc000000000";
     let (lane, mut bridge, mut push, mut reader, _server) = advertising(&[(1, A), (2, B)]);
     for sid in [A, B] {
         assert_eq!(presence_states(&bridge, &mut reader, sid), ["live"]);
@@ -19978,7 +20797,7 @@ fn a_quit_withdraws_every_session_once_and_a_handoff_withdraws_none() {
 }
 
 /// **A QUIT UNDER A HOLD BEHIND THE RATE LIMIT WITHDRAWS ITS SESSIONS** (critic item E06's
-/// review, `Bridge::publish_withdrawal`): `s-a` and `s-b` are advertised `live`; the broker
+/// review, `Bridge::publish_withdrawal`): `ta000000000` and `tb000000000` are advertised `live`; the broker
 /// is then limited to a record a second, another write of the bridge's producer spends the
 /// bucket, and the bridge reads the refusal of its next write, so every publish of its
 /// producer is held. aterm quits (`EVENT * bye quit`, then the lanes close): each
@@ -20007,11 +20826,11 @@ fn a_quit_under_a_rate_hold_withdraws_its_sessions() {
 }
 
 /// The scenario of [`a_quit_under_a_rate_hold_withdraws_its_sessions`] under `fx`: each
-/// session's presence states, `s-a`'s then `s-b`'s.
+/// session's presence states, `ta000000000`'s then `tb000000000`'s.
 #[cfg(unix)]
 fn quit_under_a_rate_hold(fx: crate::fx::Fx) -> [Vec<String>; 2] {
-    const A: &str = "s-a";
-    const B: &str = "s-b";
+    const A: &str = "ta000000000";
+    const B: &str = "tb000000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, A), (2, B)]);
     bridge.fx = fx;
     let socket = lane.dir.path().join("broker.sock");
@@ -20045,9 +20864,9 @@ fn quit_under_a_rate_hold(fx: crate::fx::Fx) -> [Vec<String>; 2] {
 #[cfg(unix)]
 #[test]
 fn a_refused_withdrawal_row_stops_only_itself() {
-    const A: &str = "s-a";
-    const B: &str = "s-b";
-    const C: &str = "s-c";
+    const A: &str = "ta000000000";
+    const B: &str = "tb000000000";
+    const C: &str = "tc000000000";
     let secret = [7u8; 32];
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, A), (2, B), (3, C)]);
     let socket = lane.dir.path().join("broker.sock");
@@ -20105,7 +20924,7 @@ fn a_refused_withdrawal_row_stops_only_itself() {
 #[cfg(unix)]
 #[test]
 fn a_quit_the_loop_never_took_is_withdrawn_when_the_lanes_close() {
-    const A: &str = "s-a";
+    const A: &str = "ta000000000";
     let (_lane, mut bridge, mut push, mut reader, _server) = advertising(&[(1, A)]);
     bridge.on_aterm_closed();
     assert_eq!(presence_states(&bridge, &mut reader, A), ["live"]);
@@ -20145,36 +20964,52 @@ fn only_a_withdrawn_address_is_refused_and_an_away_one_routes() {
         peer.publish(9_000, seq, subject, body.as_bytes()).unwrap();
     };
     row("/f/f/pub/n-far/node/presence", "v=1 t=1 state=away inc=3");
-    row("/f/f/pub/n-far/s-away/presence", "v=1 t=1 inc=3 state=live");
-    row("/f/f/pub/n-far/s-quit/presence", "v=1 t=1 inc=3 state=live");
-    for sid in ["s-away", "s-quit"] {
+    row(
+        "/f/f/pub/n-far/taway000000/presence",
+        "v=1 t=1 inc=3 state=live",
+    );
+    row(
+        "/f/f/pub/n-far/tqv1t000000/presence",
+        "v=1 t=1 inc=3 state=live",
+    );
+    for sid in ["taway000000", "tqv1t000000"] {
         assert_eq!(
-            bridge.resolve_to(&format!("@{sid}"), Some("s-me")).unwrap(),
+            bridge
+                .resolve_to(&format!("@{sid}"), Some("tme00000000"))
+                .unwrap(),
             Route::To(format!("/f/f/in/n-far/{sid}/{}", bridge.node))
         );
     }
     row(
-        "/f/f/pub/n-far/s-quit/presence",
+        "/f/f/pub/n-far/tqv1t000000/presence",
         "v=1 t=2 inc=3 state=exited",
     );
     assert_eq!(
-        bridge.resolve_to("@s-away", Some("s-me")).unwrap(),
-        Route::To(format!("/f/f/in/n-far/s-away/{}", bridge.node)),
+        bridge
+            .resolve_to("@taway000000", Some("tme00000000"))
+            .unwrap(),
+        Route::To(format!("/f/f/in/n-far/taway000000/{}", bridge.node)),
         "an away node's session still routes: its mail queues for the node"
     );
     assert_eq!(
-        bridge.resolve_to("@s-quit", Some("s-me")).unwrap(),
+        bridge
+            .resolve_to("@tqv1t000000", Some("tme00000000"))
+            .unwrap(),
         Route::Unroutable,
         "a pinned sid its node withdrew routed to a lane nobody fetches"
     );
     assert_eq!(
-        bridge.resolve_to("@s-quit@n-far", Some("s-me")).unwrap(),
+        bridge
+            .resolve_to("@tqv1t000000@n-far", Some("tme00000000"))
+            .unwrap(),
         Route::Unroutable,
         "an address naming the node that withdrew it routed all the same"
     );
     assert_eq!(
-        bridge.resolve_to("@s-away@n-far", Some("s-me")).unwrap(),
-        Route::To(format!("/f/f/in/n-far/s-away/{}", bridge.node))
+        bridge
+            .resolve_to("@taway000000@n-far", Some("tme00000000"))
+            .unwrap(),
+        Route::To(format!("/f/f/in/n-far/taway000000/{}", bridge.node))
     );
 }
 
@@ -20235,7 +21070,7 @@ fn the_node_is_the_state_dirs_and_a_cap_for_another_node_is_refused() {
 #[cfg(unix)]
 #[test]
 fn the_deadline_sweep_counts_a_receipt_only_from_the_node_the_ask_went_to() {
-    const SID: &str = "s-asker";
+    const SID: &str = "tasker00000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
     let socket = lane.dir.path().join("broker.sock");
     let broker = astream_broker::Broker::open(lane.dir.path().join("broker.log")).unwrap();
@@ -20252,7 +21087,7 @@ fn the_deadline_sweep_counts_a_receipt_only_from_the_node_the_ask_went_to() {
 
     let mut asks = Vec::new();
     for seq in 1..=3 {
-        let lane = format!("/f/f/in/n-far/s-far/{node}/task");
+        let lane = format!("/f/f/in/n-far/tfar0000000/{node}/task");
         let (off, _) = peer.publish(9_100, seq, &lane, b"v=1 t=1 text=q").unwrap();
         bridge.note_deadline(SID, off, 1_000, Some("n-far".to_string()));
         asks.push(off);
@@ -20296,7 +21131,7 @@ fn the_deadline_sweep_counts_a_receipt_only_from_the_node_the_ask_went_to() {
 #[cfg(unix)]
 #[test]
 fn the_deadline_sweep_tells_the_asker_what_retention_gave_up_under_its_verdict() {
-    const SID: &str = "s-asker";
+    const SID: &str = "tasker00000";
     let run = |seen_past_the_answer: bool| {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
@@ -20312,7 +21147,7 @@ fn the_deadline_sweep_tells_the_asker_what_retention_gave_up_under_its_verdict()
             .insert(SID.to_string(), "e".to_string());
         let node = bridge.node.clone();
         let (mut peer, _) = bridge.connect().unwrap();
-        let ask_lane = format!("/f/f/in/n-far/s-far/{node}/ask");
+        let ask_lane = format!("/f/f/in/n-far/tfar0000000/{node}/ask");
         let (ask, _) = peer
             .publish(9_100, 1, &ask_lane, b"v=1 t=1 text=q")
             .unwrap();
@@ -20369,7 +21204,7 @@ fn the_deadline_sweep_tells_the_asker_what_retention_gave_up_under_its_verdict()
 #[cfg(unix)]
 #[test]
 fn the_deadline_sweep_finds_an_answer_held_below_the_askers_oldest() {
-    const SID: &str = "s-asker";
+    const SID: &str = "tasker00000";
     for control in [false, true] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
         bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
@@ -20384,7 +21219,7 @@ fn the_deadline_sweep_finds_an_answer_held_below_the_askers_oldest() {
         }
         let node = bridge.node.clone();
         let (mut peer, _) = bridge.connect().unwrap();
-        let ask_lane = format!("/f/f/in/n-far/s-far/{node}/ask");
+        let ask_lane = format!("/f/f/in/n-far/tfar0000000/{node}/ask");
         let (ask, _) = peer
             .publish(9_100, 1, &ask_lane, b"v=1 t=1 text=q")
             .unwrap();
@@ -20439,7 +21274,7 @@ fn the_deadline_sweep_finds_an_answer_held_below_the_askers_oldest() {
 #[cfg(unix)]
 #[test]
 fn a_held_asks_retry_arms_no_deadline_the_hold_saw_settled() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     for answered in [true, false] {
         let case = if answered { "answered" } else { "expired" };
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
@@ -20450,7 +21285,7 @@ fn a_held_asks_retry_arms_no_deadline_the_hold_saw_settled() {
         lane.retire_from_outbox();
         bridge.state.refuse_writes_of(Some("deadlines"));
         *lane.outbox.lock().unwrap() =
-            Some("post sid=s-host id=1 to=h-a kind=ask dl=60000 len=1\nq".to_string());
+            Some("post sid=th0st000000 id=1 to=h-a kind=ask dl=60000 len=1\nq".to_string());
         bridge.drain_outbox();
         assert!(
             lane.sent.lock().unwrap().is_empty(),
@@ -20517,8 +21352,8 @@ fn a_held_asks_retry_arms_no_deadline_the_hold_saw_settled() {
 #[cfg(unix)]
 #[test]
 fn a_held_asks_retry_after_a_kill_arms_no_deadline_the_hold_saw_settled() {
-    const SID: &str = "s-host";
-    const POST: &str = "post sid=s-host id=1 to=h-a kind=ask dl=60000 len=1\nq";
+    const SID: &str = "th0st000000";
+    const POST: &str = "post sid=th0st000000 id=1 to=h-a kind=ask dl=60000 len=1\nq";
     for control in [false, true] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let state = bridge.state.root().to_path_buf();
@@ -20603,8 +21438,8 @@ fn a_held_asks_retry_after_a_kill_arms_no_deadline_the_hold_saw_settled() {
 #[cfg(unix)]
 #[test]
 fn an_answer_the_next_bridge_delivers_ahead_of_the_retry_arms_no_deadline() {
-    const SID: &str = "s-host";
-    const POST: &str = "post sid=s-host id=1 to=h-a kind=ask dl=60000 len=1\nq";
+    const SID: &str = "th0st000000";
+    const POST: &str = "post sid=th0st000000 id=1 to=h-a kind=ask dl=60000 len=1\nq";
     for control in [false, true] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let state = bridge.state.root().to_path_buf();
@@ -20701,7 +21536,7 @@ fn cost_of_post(bridge: &mut Bridge, lane: &FakeVerbLane, post: String) -> crate
 #[cfg(unix)]
 #[test]
 fn a_landed_ask_is_one_append_its_deadline_riding_with_its_recipient() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let state = bridge.state.root().to_path_buf();
     let (socket, _broker, _server) = serve_log(&lane, "ask-cost");
@@ -20737,7 +21572,7 @@ fn a_landed_ask_is_one_append_its_deadline_riding_with_its_recipient() {
 #[cfg(unix)]
 #[test]
 fn the_sweep_and_the_orphan_prune_write_their_settles() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     let state = bridge.state.root().to_path_buf();
     let (socket, _broker, _server) = serve_log(&lane, "settle-written");
@@ -20746,7 +21581,7 @@ fn the_sweep_and_the_orphan_prune_write_their_settles() {
     assert!(bridge.refresh_sessions().is_ok());
     let node = bridge.node.clone();
     let (mut peer, _) = bridge.connect().unwrap();
-    let ask_lane = format!("/f/f/in/n-far/s-far/{node}/ask");
+    let ask_lane = format!("/f/f/in/n-far/tfar0000000/{node}/ask");
     let (ask, _) = peer
         .publish(9_100, 1, &ask_lane, b"v=1 t=1 text=q")
         .unwrap();
@@ -20761,7 +21596,7 @@ fn the_sweep_and_the_orphan_prune_write_their_settles() {
         "a kill here leaves no deadline to expire twice"
     );
 
-    bridge.note_deadline("s-gone", ask + 100, 1_000, None);
+    bridge.note_deadline("tgpne000000", ask + 100, 1_000, None);
     assert_eq!(StateDir::peek(&state).deadlines().len(), 1, "armed");
     assert!(bridge.refresh_sessions().is_ok());
     assert!(bridge.deadlines.is_empty(), "pruned");
@@ -20780,7 +21615,7 @@ fn the_sweep_and_the_orphan_prune_write_their_settles() {
 #[cfg(unix)]
 #[test]
 fn a_sweep_reads_back_an_expired_a_killed_bridge_published() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     for control in [false, true] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let (socket, _broker, _server) = serve_log(&lane, "own-expired");
@@ -20793,7 +21628,7 @@ fn a_sweep_reads_back_an_expired_a_killed_bridge_published() {
         }
         let node = bridge.node.clone();
         let (mut peer, _) = bridge.connect().unwrap();
-        let ask_lane = format!("/f/f/in/n-far/s-far/{node}/ask");
+        let ask_lane = format!("/f/f/in/n-far/tfar0000000/{node}/ask");
         let (ask, _) = peer
             .publish(9_100, 1, &ask_lane, b"v=1 t=1 text=q")
             .unwrap();
@@ -20819,7 +21654,7 @@ fn a_sweep_reads_back_an_expired_a_killed_bridge_published() {
 #[cfg(unix)]
 #[test]
 fn a_stop_hands_the_asks_journal_back_as_the_tables_an_older_build_reads() {
-    const SID: &str = "s-host";
+    const SID: &str = "th0st000000";
     for bye in [None, Some(Bye::Handoff)] {
         let (_lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         let state = bridge.state.root().to_path_buf();
@@ -20861,7 +21696,7 @@ fn a_stop_hands_the_asks_journal_back_as_the_tables_an_older_build_reads() {
 #[cfg(unix)]
 #[test]
 fn an_unwritten_deadline_table_withholds_only_the_answer_whose_deadline_it_holds() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-host"), (2, "s-other")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "th0st000000"), (2, "t0ther00000")]);
     let (socket, _broker, _server) = serve_log(&lane, "unwritten");
     bridge.cfg.broker = socket;
     bridge.conn = Some(bridge.connect().unwrap().0.into());
@@ -20869,7 +21704,7 @@ fn an_unwritten_deadline_table_withholds_only_the_answer_whose_deadline_it_holds
     let node = bridge.node.clone();
     bridge.state.refuse_writes_of(Some("deadlines"));
     assert!(
-        !bridge.note_deadline("s-other", 5, 60_000, None),
+        !bridge.note_deadline("t0ther00000", 5, 60_000, None),
         "the table's write is refused"
     );
     let answer = |sid: &str, re: u64| {
@@ -20879,7 +21714,7 @@ fn an_unwritten_deadline_table_withholds_only_the_answer_whose_deadline_it_holds
         (format!("/f/f/in/{node}/{sid}/h-a/answer"), body.encode())
     };
 
-    let (subject, raw) = answer("s-host", 3);
+    let (subject, raw) = answer("th0st000000", 3);
     bridge.deliver_record(40, &subject, &raw, None);
     assert!(
         lane.delivery_offsets().contains(&40),
@@ -20887,7 +21722,7 @@ fn an_unwritten_deadline_table_withholds_only_the_answer_whose_deadline_it_holds
     );
     assert!(bridge.conn.is_some(), "and the link stays up");
 
-    let (subject, raw) = answer("s-other", 5);
+    let (subject, raw) = answer("t0ther00000", 5);
     bridge.deliver_record(41, &subject, &raw, None);
     assert!(
         !lane.delivery_offsets().contains(&41),
@@ -20913,7 +21748,7 @@ fn an_unwritten_deadline_table_withholds_only_the_answer_whose_deadline_it_holds
 #[cfg(unix)]
 #[test]
 fn a_topic_replay_below_the_retained_floor_tells_the_session_the_topics_range() {
-    const SID: &str = "s-late";
+    const SID: &str = "t1ate000000";
     let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
     bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
     let socket = lane.dir.path().join("broker.sock");
@@ -20924,7 +21759,7 @@ fn a_topic_replay_below_the_retained_floor_tells_the_session_the_topics_range() 
     bridge.conn = Some(conn.into());
     let (mut god, _) = bridge.connect().unwrap();
     let note = Body::new(0).encode();
-    let subject = "/f/f/pub/n-x/s-p/say/alpha";
+    let subject = "/f/f/pub/n-x/tp000000000/say/alpha";
     let alpha: Vec<u64> = (1..=3)
         .map(|seq| god.publish(7, seq, subject, &note).unwrap().0)
         .collect();
@@ -20977,7 +21812,7 @@ fn a_topic_replay_below_the_retained_floor_tells_the_session_the_topics_range() 
 #[cfg(unix)]
 #[test]
 fn a_topic_replay_offers_the_broadcasts_retention_holds_below_the_topics_oldest() {
-    const SID: &str = "s-late";
+    const SID: &str = "t1ate000000";
     for control in [false, true] {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
         bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
@@ -20994,7 +21829,7 @@ fn a_topic_replay_offers_the_broadcasts_retention_holds_below_the_topics_oldest(
         }
         let (mut god, _) = bridge.connect().unwrap();
         let note = Body::new(0).encode();
-        let subject = "/f/f/pub/n-x/s-p/say/alpha";
+        let subject = "/f/f/pub/n-x/tp000000000/say/alpha";
         let (first, _) = god.publish(7, 1, subject, &note).unwrap();
         let (second, _) = god.publish(7, 2, subject, &note).unwrap();
         broker.retain_before_carrying_state(second + 1).unwrap();
@@ -21355,6 +22190,94 @@ mod mesh {
     }
 }
 
+/// **FABRIC MAIL BETWEEN THE TWO TAB-ID FORMS IS DELIVERED.** A tab opened before the tab-ID
+/// update keeps its `s-` ID until it closes, and the fleet updates over hours: a lane to an
+/// `s-` tab, written for an `s-` sender, reaches it, and so does mail between an `s-` and a
+/// `t` tab either way, its sender named as the lane's node speaks for it. NEGATIVE CONTROLS: a
+/// lane whose recipient is a malformed ID of either form (upper-case hex, a letter outside
+/// Crockford's base32) is delivered to no one, though the roster hosts a session of that name (so
+/// only the grammar refuses it), and a body whose `from=` is one is not named as a session (the
+/// sender reads as the node).
+#[cfg(unix)]
+#[test]
+fn mail_between_the_earlier_and_the_tab_id_forms_is_delivered() {
+    const EARLIER: &str = "s-0123456789abcdef0123";
+    const EARLIER_SENDER: &str = "s-fedcba98765432100123";
+    const TAB: &str = "t000000tab1";
+    const TAB_SENDER: &str = "t000000tab2";
+    const MALFORMED: &str = "s-0123456789ABCDEF0123";
+    const MALFORMED_TAB: &str = "tqn5r6e014i";
+    let (lane, mut bridge) =
+        FakeVerbLane::bridge(&[(1, EARLIER), (2, TAB), (3, MALFORMED), (4, MALFORMED_TAB)]);
+    let socket = lane.dir.path().join("broker.sock");
+    let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
+    let _server = broker.serve(&socket).unwrap();
+    bridge.cfg.broker = socket.to_string_lossy().into_owned();
+    let (conn, _) = bridge.connect().unwrap();
+    bridge.conn = Some(conn.into());
+    assert!(bridge.refresh_sessions().is_ok());
+    let node = bridge.node.clone();
+    let delivered = |lane: &FakeVerbLane, to: &str, off: u64| -> Vec<String> {
+        let head = format!("deliver {to} off={off} ");
+        lane.deliveries()
+            .into_iter()
+            .filter(|line| line.starts_with(&head))
+            .collect()
+    };
+
+    for (off, to, from) in [
+        (10, EARLIER, EARLIER_SENDER),
+        (11, TAB, EARLIER_SENDER),
+        (12, EARLIER, TAB_SENDER),
+    ] {
+        let subject = format!("/f/f/in/{node}/{to}/n-far/note");
+        let raw = format!("v=1 t=1 from={from} text=hi");
+        assert_eq!(
+            bridge.deliver_record(off, &subject, raw.as_bytes(), None),
+            Delivery::Accounted
+        );
+        let lines = delivered(&lane, to, off);
+        assert_eq!(lines.len(), 1, "{to} from {from}: {:?}", lane.deliveries());
+        assert!(
+            lines[0].contains(&format!(" from={from}@n-far kind=note ")),
+            "{to} from {from}: {}",
+            lines[0]
+        );
+    }
+
+    for (off, malformed) in [(20, MALFORMED), (21, MALFORMED_TAB)] {
+        let subject = format!("/f/f/in/{node}/{malformed}/n-far/note");
+        let raw = format!("v=1 t=1 from={EARLIER_SENDER} text=hi");
+        assert_eq!(
+            bridge.deliver_record(off, &subject, raw.as_bytes(), None),
+            Delivery::Accounted
+        );
+        assert!(
+            lane.deliveries()
+                .iter()
+                .all(|line| !line.contains(&format!(" off={off} "))),
+            "a malformed recipient is delivered to no one: {:?}",
+            lane.deliveries()
+        );
+    }
+
+    for (off, malformed) in [(22, MALFORMED), (23, MALFORMED_TAB)] {
+        let subject = format!("/f/f/in/{node}/{EARLIER}/n-far/note");
+        let raw = format!("v=1 t=1 from={malformed} text=hi");
+        assert_eq!(
+            bridge.deliver_record(off, &subject, raw.as_bytes(), None),
+            Delivery::Accounted
+        );
+        let lines = delivered(&lane, EARLIER, off);
+        assert_eq!(lines.len(), 1, "{:?}", lane.deliveries());
+        assert!(
+            lines[0].contains(" from=n-far kind=note "),
+            "a malformed from= names no session: {}",
+            lines[0]
+        );
+    }
+}
+
 /// What [`a_reworded_receipt`] left: the records on the receipt's face, by offset and words, the
 /// offsets aterm was told it landed at, and the send's answer.
 struct RewordedReceipt {
@@ -21374,12 +22297,12 @@ fn a_reworded_receipt(fx: crate::fx::Fx, landed: bool) -> RewordedReceipt {
     bridge.fx = fx;
     let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
     let r = OwedReceipt {
-        sid: "s-host".to_string(),
+        sid: "th0st000000".to_string(),
         rid: 1,
         off: 7,
         verdict: "handled".to_string(),
         kind: "task".to_string(),
-        from: format!("s-sender@{}", bridge.node),
+        from: format!("tsender0000@{}", bridge.node),
         earlier_log: false,
     };
     let Ok(prefix) = bridge.receipt_lane(&r.from).unwrap() else {
@@ -21474,12 +22397,12 @@ fn a_reworded_retry_is_deduped_against_a_first_attempt_that_commits_late() {
     let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
     let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
     let r = OwedReceipt {
-        sid: "s-host".to_string(),
+        sid: "th0st000000".to_string(),
         rid: 1,
         off: 7,
         verdict: "handled".to_string(),
         kind: "task".to_string(),
-        from: format!("s-sender@{}", bridge.node),
+        from: format!("tsender0000@{}", bridge.node),
         earlier_log: false,
     };
     let Ok(prefix) = bridge.receipt_lane(&r.from).unwrap() else {
@@ -21522,7 +22445,7 @@ fn a_reworded_retry_is_deduped_against_a_first_attempt_that_commits_late() {
     assert_eq!(lane.delivery_offsets(), vec![rows[0].0]);
 }
 
-/// **A REWORDED KEYED POST'S KEY NEVER LOSES ITS PIN** (ATERM-KI-1111-7's review): `s-a`'s
+/// **A REWORDED KEYED POST'S KEY NEVER LOSES ITS PIN** (ATERM-KI-1111-7's review): `ta000000000`'s
 /// post 1 owns its key `k`, pinned in words aterm no longer lists and not on the bus, and the
 /// disk refuses its pin's rewrite at the retry. The retry keeps the pin's sequence, so the
 /// key's pin is never rewritten before the post lands, and is reconciled to its record once it
@@ -21534,40 +22457,40 @@ fn a_reworded_retry_is_deduped_against_a_first_attempt_that_commits_late() {
 #[cfg(unix)]
 #[test]
 fn a_reworded_keyed_posts_key_keeps_its_pin_through_a_refused_write() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (3, "s-r")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (3, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     lane.retire_from_outbox();
     let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
-    let face = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let face = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(face.clone());
     let head = head_of(&bridge);
     let mut stale = Body::new(1);
-    stale.from = Some("s-a".to_string());
+    stale.from = Some("ta000000000".to_string());
     stale.text = "a0".to_string();
     let pin = PublishPin {
         owner: Some(1),
         ..fresh_pin(&mut bridge, &face, &stale.encode(), head)
     };
-    bridge.state.set_key_pin("s-a", "k", &pin).unwrap();
-    bridge.state.set_post_pin("s-a", 1, &pin).unwrap();
+    bridge.state.set_key_pin("ta000000000", "k", &pin).unwrap();
+    bridge.state.set_post_pin("ta000000000", 1, &pin).unwrap();
     let keyed = |id: u64, text: &str| {
-        queued_note("s-a", id, "@s-r", text).replacen(" kind=", " key=k kind=", 1)
+        queued_note("ta000000000", id, "@tr000000000", text).replacen(" kind=", " key=k kind=", 1)
     };
     *lane.outbox.lock().unwrap() = Some(keyed(1, "a1"));
-    let _ = bridge.state.refuse_writes_of(Some("sent/s-a.1"));
+    let _ = bridge.state.refuse_writes_of(Some("sent/ta000000000.1"));
     bridge.drain_outbox();
     let _ = bridge.state.refuse_writes_of(None);
     bridge.held_senders.clear();
-    if retired_at(&retirements(&lane), "s-a", 1).is_none() {
+    if retired_at(&retirements(&lane), "ta000000000", 1).is_none() {
         bridge.drain_outbox();
     }
-    let first = retired_at(&retirements(&lane), "s-a", 1);
+    let first = retired_at(&retirements(&lane), "ta000000000", 1);
     assert!(first.is_some(), "post 1 landed: {:?}", retirements(&lane));
     *lane.outbox.lock().unwrap() = Some(keyed(2, "a2"));
     bridge.held_senders.clear();
     bridge.drain_outbox();
     assert_eq!(
-        retired_at(&retirements(&lane), "s-a", 2),
+        retired_at(&retirements(&lane), "ta000000000", 2),
         first,
         "post 2 retires at its key's record: {:?}",
         retirements(&lane)
@@ -21584,7 +22507,7 @@ fn a_reworded_keyed_posts_key_keeps_its_pin_through_a_refused_write() {
 }
 
 /// **A KEY'S OWN POST REBUILT FROM ITS KEY'S PIN IS PINNED IN THE WORDS IT SENDS** (the
-/// review of seed 590's fix): `s-a`'s post 1 owns its key `k`, whose pin a drain wrote in words
+/// review of seed 590's fix): `ta000000000`'s post 1 owns its key `k`, whose pin a drain wrote in words
 /// it then sent nothing in (its own post pin refused), and aterm now lists the post in other
 /// words. The rebuilt pin names the words this drain publishes, so its retry reads its attempt
 /// back by them ([`Bridge::landed_at_its_pin`]), not as a reworded attempt
@@ -21595,15 +22518,15 @@ fn a_reworded_keyed_posts_key_keeps_its_pin_through_a_refused_write() {
 #[cfg(unix)]
 #[test]
 fn a_keys_own_post_rebuilt_from_its_keys_pin_is_pinned_in_the_words_it_sends() {
-    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a"), (3, "s-r")]);
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (3, "tr000000000")]);
     assert!(bridge.refresh_sessions().is_ok());
     lane.retire_from_outbox();
     let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
-    let face = format!("/f/f/in/{0}/s-r/{0}/note", bridge.node);
+    let face = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
     bridge.indexed_subjects.insert(face.clone());
     let words = |t: u64, text: &str| {
         let mut body = Body::new(t);
-        body.from = Some("s-a".to_string());
+        body.from = Some("ta000000000".to_string());
         body.text = text.to_string();
         body.encode()
     };
@@ -21618,14 +22541,15 @@ fn a_keys_own_post_rebuilt_from_its_keys_pin_is_pinned_in_the_words_it_sends() {
         at: None,
         ..fresh_pin(&mut bridge, &face, &words(1, "a0"), head)
     };
-    bridge.state.set_key_pin("s-a", "k", &key).unwrap();
+    bridge.state.set_key_pin("ta000000000", "k", &key).unwrap();
     bridge.after_a_reworded_read = Some(Box::new(|| {
         panic!("the rebuilt pin read its attempt back as a reworded one")
     }));
-    *lane.outbox.lock().unwrap() =
-        Some(queued_note("s-a", 1, "@s-r", "a1").replacen(" kind=", " key=k kind=", 1));
+    *lane.outbox.lock().unwrap() = Some(
+        queued_note("ta000000000", 1, "@tr000000000", "a1").replacen(" kind=", " key=k kind=", 1),
+    );
     bridge.drain_outbox();
-    let landed = retired_at(&retirements(&lane), "s-a", 1);
+    let landed = retired_at(&retirements(&lane), "ta000000000", 1);
     assert!(landed.is_some(), "post 1 landed: {:?}", retirements(&lane));
     let (mut reader, _) = bridge.connect().unwrap();
     assert_eq!(
@@ -21636,7 +22560,11 @@ fn a_keys_own_post_rebuilt_from_its_keys_pin_is_pinned_in_the_words_it_sends() {
         vec!["a1"],
         "one record of the key"
     );
-    let reconciled = bridge.state.key_pin("s-a", "k").unwrap().expect("k's pin");
+    let reconciled = bridge
+        .state
+        .key_pin("ta000000000", "k")
+        .unwrap()
+        .expect("k's pin");
     assert_eq!(
         (reconciled.seq, reconciled.identity, reconciled.original_off),
         (
@@ -21673,11 +22601,11 @@ fn a_receipts_head_is_read_only_for_its_own_pin() {
     let log = bridge.conn.as_ref().and_then(|c| c.seen_log_identity());
     bridge
         .state
-        .set_receipt_pin("s-host", 1, &headed, log)
+        .set_receipt_pin("th0st000000", 1, &headed, log)
         .unwrap();
     assert_eq!(
         bridge
-            .receipt_pin_now("s-host", 1)
+            .receipt_pin_now("th0st000000", 1)
             .unwrap()
             .map(|pin| pin.at),
         Some(Some(40)),
@@ -21690,10 +22618,10 @@ fn a_receipts_head_is_read_only_for_its_own_pin() {
     assert_ne!(log, Some(another), "PRECONDITION: another log");
     bridge
         .state
-        .set_receipt_pin("s-host", 1, &headed, Some(another))
+        .set_receipt_pin("th0st000000", 1, &headed, Some(another))
         .unwrap();
     let elsewhere = bridge
-        .receipt_pin_now("s-host", 1)
+        .receipt_pin_now("th0st000000", 1)
         .unwrap()
         .map(|pin| pin.at);
     assert!(
@@ -21701,11 +22629,11 @@ fn a_receipts_head_is_read_only_for_its_own_pin() {
         "a head of another log is not an offset of this one: {elsewhere:?}"
     );
     std::fs::write(
-        std::path::Path::new(&bridge.cfg.state_dir).join("acks/s-host.1"),
+        std::path::Path::new(&bridge.cfg.state_dir).join("acks/th0st000000.1"),
         "9",
     )
     .unwrap();
-    let repinned = bridge.receipt_pin_now("s-host", 1).unwrap();
+    let repinned = bridge.receipt_pin_now("th0st000000", 1).unwrap();
     assert_eq!(repinned.as_ref().map(|pin| pin.seq), Some(9));
     assert_eq!(
         repinned.map(|pin| pin.at),
@@ -21732,12 +22660,12 @@ fn reworded_past_a_cut(fx: crate::fx::Fx) -> PastACut {
     bridge.fx = fx;
     let (broker, _server) = on_a_broker(&lane, &mut bridge, true);
     let r = OwedReceipt {
-        sid: "s-host".to_string(),
+        sid: "th0st000000".to_string(),
         rid: 1,
         off: 7,
         verdict: "handled".to_string(),
         kind: "task".to_string(),
-        from: format!("s-sender@{}", bridge.node),
+        from: format!("tsender0000@{}", bridge.node),
         earlier_log: false,
     };
     let Ok(prefix) = bridge.receipt_lane(&r.from).unwrap() else {
@@ -21815,4 +22743,76 @@ fn a_reworded_retry_past_a_cut_reads_its_landed_attempt_back() {
         2,
         "CONTROL: a second record beside the first"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn replay_holds_an_older_sequence_behind_a_refused_publication() {
+    let (replayed, drained) = replay_of_a_refused_entry_and_the_next(crate::fx::Fx::os(), true);
+    assert!(
+        replayed.is_empty(),
+        "the older sequence passed the refusal: {replayed:?}"
+    );
+    assert_eq!(drained, ["a1", "a2"]);
+    let (replayed, drained) = replay_of_a_refused_entry_and_the_next(
+        crate::fx::Fx::os_without_each(&[
+            crate::sim::world::Mutant::LiftFencesDuringReplay,
+            crate::sim::world::Mutant::RetryRateLimitedAtOnce,
+        ]),
+        true,
+    );
+    assert_eq!(
+        replayed,
+        ["a2"],
+        "CONTROL: the older sequence lifts the fence"
+    );
+    assert_eq!(drained, ["a2", "a1"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_same_words_keyed_repost_does_not_own_its_originals_replay() {
+    const SID: &str = "th0st000000";
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+    let (socket, _broker, _server) = serve_log(&lane, "same-words-key");
+    bridge.cfg.broker = socket;
+    assert!(bridge.attach_broker());
+    *lane.outbox.lock().unwrap() = Some(format!(
+        "post sid={SID} id=1 to=@{SID} kind=ask key=k dl=30000 len=4\nsame"
+    ));
+    bridge.drain_outbox();
+    let winner = bridge.state.key_pin(SID, "k").unwrap().unwrap();
+    let off = winner.original_off.unwrap();
+    let identity = winner.identity.as_ref().unwrap();
+    let (rows, _) = bridge
+        .conn_now()
+        .unwrap()
+        .fetch(off, &identity.subject, 1)
+        .unwrap();
+    let (_, subject, body) = rows.into_iter().next().unwrap();
+    bridge
+        .state
+        .set_in_flight(&InFlight {
+            pin: winner.clone(),
+            subject,
+            body,
+            log: None,
+            at: None,
+        })
+        .unwrap();
+    bridge.claim(off, winner.seq);
+    bridge.awaiting_drain.insert(winner.seq, (off, true));
+    for at in [Some(off + 1), None] {
+        let repost = PublishPin {
+            via_key: true,
+            at,
+            original: winner.identity.clone(),
+            ..winner.clone()
+        };
+        assert_eq!(
+            bridge.keyed_repost_landed(&repost, false, true).unwrap(),
+            Some((off, true)),
+            "the replay belongs to the original, even with identical words and head {at:?}"
+        );
+    }
 }

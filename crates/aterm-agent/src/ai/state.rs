@@ -30,6 +30,10 @@ pub enum State {
     Refused,
     /// No login exists, or its login has ended.
     SignedOut,
+    /// Its stored login is signed out here, and its sessions run on its vault year token until
+    /// this time (accounts v2's `on-token`), which a one-shot review (`claude -p`) is never
+    /// served: no review runs on it, and no sign-in is its fix, since renewal is off for it.
+    OnToken(i64),
     /// Wanted and served here, and not installed.
     NotInstalled,
     /// Not to be used here.
@@ -49,6 +53,7 @@ impl State {
             State::Unproven => "unproven",
             State::Refused => "refused",
             State::SignedOut => "signed-out",
+            State::OnToken(_) => crate::harness::accounts::LoginHere::ON_TOKEN,
             State::NotInstalled => "not-installed",
             State::Off => "off",
         }
@@ -758,6 +763,25 @@ fn rate_login(f: &Facts, mut row: Row, unmeasured: &str, now: i64) -> Row {
             unread_fix(Some(label))
         ));
         row.actor = Some(Actor::Person);
+        return row;
+    }
+    // The serving row runs on its vault year token while its stored login is signed out
+    // (accounts v2's `on-token`, as the report says it): its sessions run, but a review's one-shot
+    // `claude -p` is never served the token, and renewal is off for it, so no sign-in is offered.
+    if let Some(until) = f
+        .accounts
+        .as_ref()
+        .filter(|a| a.state == Some(crate::harness::accounts::LoginHere::ON_TOKEN))
+        .and_then(|a| a.on_token_until)
+    {
+        row.state = State::OnToken(until);
+        row.mark = Mark::Note;
+        row.fact = format!(
+            "`{}` runs on its vault year token here until {}; its stored login is signed out, and \
+             a one-shot review (`claude -p`) is never served the token, so no review runs on it{unmeasured}",
+            f.accounts.as_ref().map_or("", |a| a.label.as_str()),
+            when(until)
+        );
         return row;
     }
     if claude_expired || pool_expired {

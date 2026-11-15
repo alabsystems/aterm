@@ -111,7 +111,7 @@ impl<C: Ctl> Session<'_, C> {
             && !ended_under(
                 aterm_phase::since_limit(rows).as_ref(),
                 memory.wall.kind,
-                limit::ResetClock::of(memory.wall.reset.as_deref()),
+                limit::reset_clock(memory.wall.reset.as_deref()),
             ))
         .then(|| memory.wall.clone())
     }
@@ -159,9 +159,9 @@ impl<C: Ctl> Session<'_, C> {
             }
             Some(_) => self.forget_wall(seq),
             None => match reading.phase {
-                aterm_phase::Phase::Busy => {
+                alab_policy::vocab::Phase::Busy => {
                     if let Some(w) = self.remembered_wall(reader, rows) {
-                        reading.phase = aterm_phase::Phase::Limited {
+                        reading.phase = alab_policy::vocab::Phase::Limited {
                             message: w.message.clone(),
                             reset: w.reset.clone(),
                         };
@@ -170,19 +170,19 @@ impl<C: Ctl> Session<'_, C> {
                         self.end_memory_on_live_turn(reader, rows, seq);
                     }
                 }
-                aterm_phase::Phase::Idle if reader.end_hidden(rows) => {
+                alab_policy::vocab::Phase::Idle if reader.end_hidden(rows) => {
                     if let Some(w) = self.remembered_wall(reader, rows) {
-                        reading.phase = aterm_phase::Phase::Limited {
+                        reading.phase = alab_policy::vocab::Phase::Limited {
                             message: w.message.clone(),
                             reset: w.reset.clone(),
                         };
                         reading.wall = Some(w);
                     }
                 }
-                aterm_phase::Phase::Idle
-                | aterm_phase::Phase::Question
-                | aterm_phase::Phase::Prompt
-                | aterm_phase::Phase::Limited { .. } => {}
+                alab_policy::vocab::Phase::Idle
+                | alab_policy::vocab::Phase::Question
+                | alab_policy::vocab::Phase::Prompt
+                | alab_policy::vocab::Phase::Limited { .. } => {}
             },
         }
     }
@@ -471,7 +471,7 @@ impl<C: Ctl> Session<'_, C> {
     fn apply_open_wall(
         &mut self,
         open: approvals::OpenWall,
-        kind: aterm_phase::WallKind,
+        kind: alab_policy::vocab::WallKind,
         now: i64,
         waited: Option<i64>,
     ) {
@@ -493,7 +493,7 @@ impl<C: Ctl> Session<'_, C> {
                 self.instant_of(unix),
                 jitter,
                 limit::resumes_by_itself(&open.message),
-                limit::ResetClock::of(open.reset.as_deref()),
+                limit::reset_clock(open.reset.as_deref()),
                 self.fx
                     .mono()
                     .checked_sub(ago)

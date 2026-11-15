@@ -29,7 +29,7 @@ pub(in crate::harness) fn token() -> String {
 }
 
 /// Another one.
-fn other_token() -> String {
+pub(in crate::harness) fn other_token() -> String {
     format!(
         "{}{}",
         "sk-ant-oa", "t01-OTHER_tok-9876543210zyxwvutsrqponmlkjihgfedcbaZYXWVUTS"
@@ -572,7 +572,7 @@ fn stand_in() {
     match mode.as_str() {
         "success" => {
             say(&waiting_frame(&good_url()));
-            // The person signs in once told to: the capture said the browser opened.
+            // The sign-in goes on once told to: the capture said its page opened.
             while !home.join("told").exists() && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -588,6 +588,140 @@ fn stand_in() {
             say(&erase(5));
             say(&success_frame(&token(), "less than a day"));
             std::thread::sleep(Duration::from_millis(500));
+        }
+        "renew-window-token"
+        | "renew-window-closed"
+        | "window-human-check"
+        | "window-browser-start" => {
+            use super::super::open_url::{CODE_ENV, EMAIL_ENV, OUTCOME_ENV, WINDOW_ENV};
+            // Each run in the window says it ran, so a test counts the captures that reached
+            // the page.
+            let mut runs = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(home.join("runs"))
+                .expect("the runs file");
+            runs.write_all(b"ran\n").expect("a run, said");
+            drop(runs);
+            assert_eq!(
+                std::env::var_os(WINDOW_ENV).as_deref(),
+                Some(std::ffi::OsStr::new("1"))
+            );
+            assert_eq!(
+                std::env::var_os(EMAIL_ENV).as_deref(),
+                Some(std::ffi::OsStr::new(EMAIL))
+            );
+            let code = PathBuf::from(std::env::var_os(CODE_ENV).expect("private code path"));
+            let outcome =
+                PathBuf::from(std::env::var_os(OUTCOME_ENV).expect("private outcome path"));
+            assert_eq!(code.parent(), outcome.parent());
+            say(&waiting_frame(&good_url()));
+            let met = match mode.as_str() {
+                "renew-window-closed" => Some("window-closed"),
+                // The consent page's human check, on its host: what the opener met, which no
+                // step record may keep.
+                "window-human-check" => Some("window-human-check claude.ai"),
+                // A stop that holds no step: another try alone may pass it.
+                "window-browser-start" => Some("browser-start"),
+                _ => None,
+            };
+            if let Some(met) = met {
+                put(
+                    &outcome,
+                    &format!("opener-outcome=1\nphase=failed\nmet={met}\n"),
+                );
+                wait_for_ever();
+            }
+            put(&code, "test-code#test-state");
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .expect("the window's code");
+            assert_eq!(line.trim_end(), "test-code#test-state");
+            put(&home.join("pasted"), line.trim_end());
+            say(&success_frame(&token(), "1 year"));
+        }
+        "headless-token" | "headless-bot-check" | "headless-unnamed" | "headless-turnstile"
+        | "headless-callback" => {
+            use super::super::headless_oauth::token_consent::tests::{
+                Shows, serve_on_fixture, token_callback, token_url,
+            };
+            use super::super::open_url::{
+                EMAIL_ENV, OUTCOME_ENV, TOKEN_ENV, WINDOW_ENV, account_label_of,
+                finish_token_consent, store_dir_of,
+            };
+            // Its terminal is closed to it: a token it shows came back on its loopback alone.
+            // SAFETY: closes this process's own standard input, which nothing here reads.
+            unsafe {
+                libc::close(0);
+            }
+            let mut runs = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(home.join("runs"))
+                .expect("the runs file");
+            runs.write_all(b"ran\n").expect("a run, said");
+            drop(runs);
+            let var = |name: &str| std::env::var_os(name);
+            assert_eq!(var(TOKEN_ENV).as_deref(), Some(std::ffi::OsStr::new("1")));
+            assert_eq!(var(WINDOW_ENV), None);
+            assert_eq!(var(EMAIL_ENV).as_deref(), Some(std::ffi::OsStr::new(EMAIL)));
+            let outcome = PathBuf::from(var(OUTCOME_ENV).expect("private outcome path"));
+            let opener = PathBuf::from(var("BROWSER").expect("aterm's opener"));
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("the loopback listener");
+            let port = listener.local_addr().expect("its port").port();
+            let url = token_url(port);
+            say(&waiting_frame(&url));
+            // Claude Code's listener: takes one callback and sends the browser on.
+            let took = std::thread::spawn(move || {
+                let (mut stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .ok()?;
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).ok()? == 1 {
+                    request.push(byte[0]);
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: https://platform.claude.com/oauth/code/\
+                          success?app=claude-code\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .ok()?;
+                String::from_utf8(request)
+                    .ok()?
+                    .lines()
+                    .next()
+                    .map(str::to_owned)
+            });
+            let shows = match mode.as_str() {
+                "headless-token" => Shows::Account,
+                "headless-bot-check" => Shows::BotCheck,
+                "headless-turnstile" => Shows::Turnstile,
+                // A grant the profile already holds: the page goes to its callback unasked.
+                "headless-callback" => Shows::Callback,
+                _ => Shows::Nobody,
+            };
+            let store = store_dir_of(&var, Some(opener.as_path()));
+            let label = account_label_of(&var);
+            let email = var(EMAIL_ENV).and_then(|email| email.into_string().ok());
+            let (served, log) = serve_on_fixture(
+                &url,
+                (store.as_deref(), label.as_deref(), email.as_deref()),
+                shows,
+                &token_callback(port),
+            );
+            put(&home.join("browser-log"), &log.join("\n"));
+            if finish_token_consent(served, Some(&outcome)) != 0 {
+                wait_for_ever();
+            }
+            let line = took.join().expect("the listener").expect("its callback");
+            put(&home.join("callback"), &line);
+            say(&success_frame(&token(), "1 year"));
         }
         "paste" => {
             say(&waiting_frame(&good_url()));
@@ -672,6 +806,16 @@ impl World {
         self.home.path()
     }
 
+    /// Makes the stand-in's next run play `mode`.
+    pub(in crate::harness) fn play(&self, mode: &str) {
+        std::fs::write(self.home().join(MODE_FILE), format!("{mode}\n")).expect("the mode file");
+    }
+
+    /// How many runs in aterm's window reached the stand-in's page.
+    pub(in crate::harness) fn runs(&self) -> usize {
+        std::fs::read_to_string(self.home().join("runs")).map_or(0, |runs| runs.lines().count())
+    }
+
     /// The stand-in, as the program a capture runs: this test binary at [`stand_in`].
     pub(in crate::harness) fn program() -> Program {
         Program {
@@ -719,38 +863,37 @@ impl World {
             .unwrap_or_default()
     }
 
-    /// Runs a capture of the stand-in with `person`, under `deadline`.
-    fn capture(&self, person: &Stub<'_>, deadline: WakeDeadline) -> Result<Minted, Error> {
+    /// Runs a capture of the stand-in with `stub` as its sign-in, under `deadline`.
+    fn capture(&self, stub: &Stub<'_>, deadline: WakeDeadline) -> Result<Minted, Error> {
         let program = Self::program();
         let env = self.env(&[]);
+        let route = window_route(self);
         capture(
             &Capture {
                 program: &program,
                 store: &self.store,
                 sign_in_as: EMAIL,
                 env: &env,
-                window: None,
+                opener: &route,
                 deadline,
             },
-            person,
+            stub,
         )
     }
 }
 
-/// The person, stood in for: says `go` to the stand-in once it proved the stand-in (and its
+/// The sign-in, stood in for: says `go` to the stand-in once it proved the stand-in (and its
 /// group's `sleep`) by birth, and records what the capture said.
 struct Stub<'a> {
     world: &'a World,
     group: bool,
     proven: Mutex<Vec<Born>>,
     said: Mutex<Vec<String>>,
-    /// The code to paste the first time it is asked.
-    code: Mutex<Option<Zeroizing<Vec<u8>>>>,
-    /// Stops (Ctrl-C) once the capture said the browser opened.
+    /// Stops (Ctrl-C) once the capture said the window opened.
     stops: bool,
     /// Says, once it proved the stand-in, that the host slept this long.
     sleeps: Option<(crate::harness::wake_deadline::Sleeper, Duration)>,
-    pasted_asks: AtomicBool,
+    code_awaited: AtomicBool,
 }
 
 impl<'a> Stub<'a> {
@@ -760,10 +903,9 @@ impl<'a> Stub<'a> {
             group,
             proven: Mutex::new(Vec::new()),
             said: Mutex::new(Vec::new()),
-            code: Mutex::new(None),
             stops: false,
             sleeps: None,
-            pasted_asks: AtomicBool::new(false),
+            code_awaited: AtomicBool::new(false),
         }
     }
 
@@ -808,27 +950,22 @@ impl<'a> Stub<'a> {
     }
 }
 
-impl Person for Stub<'_> {
+impl SignIn for Stub<'_> {
     fn say(&self, line: &str) {
-        if line.contains("browser window opened") {
+        if line.contains("sign-in window opened") {
             std::fs::write(self.world.home().join("told"), "").expect("told");
         }
         self.said.lock().unwrap().push(line.to_owned());
     }
 
-    fn paste(
-        &self,
-        prompt: &str,
-        cancelled: &AtomicBool,
-    ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
-        assert_eq!(prompt, PASTE_PROMPT);
-        self.pasted_asks.store(true, Ordering::SeqCst);
-        if let Some(code) = self.code.lock().unwrap().take() {
-            return Ok(Some(code));
-        }
+    fn code(&self, cancelled: &AtomicBool) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+        self.code_awaited.store(true, Ordering::SeqCst);
         let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while !cancelled.load(Ordering::SeqCst) {
-            assert!(Instant::now() < until, "the paste was never cancelled");
+            assert!(
+                Instant::now() < until,
+                "the wait for a code was never cancelled"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         Ok(None)
@@ -842,7 +979,11 @@ impl Person for Stub<'_> {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|line| line.contains("browser window opened"))
+                .any(|line| line.contains("sign-in window opened"))
+    }
+
+    fn failed(&self) -> Option<super::super::open_url::MetWord> {
+        None
     }
 }
 
@@ -877,9 +1018,10 @@ fn no_url_said(stub: &Stub<'_>) {
     }
 }
 
-/// A STAND-IN THAT MAKES A TOKEN: the capture takes it, says the browser opened on claude.com
-/// with the account to sign in as and never a byte of the URL, the child holds no route,
-/// credential, browser or aterm variable, and the scratch folder is gone.
+/// A STAND-IN THAT MAKES A TOKEN: the capture takes it, says aterm's sign-in window opened on
+/// claude.com and never a byte of the URL, the child holds no route, credential or aterm
+/// variable of the verb's (its `BROWSER` and aterm variables are the window's own), and the
+/// scratch folder is gone.
 #[test]
 fn a_stand_in_that_makes_a_token_gives_it() {
     let world = World::new("success", false);
@@ -897,13 +1039,15 @@ fn a_stand_in_that_makes_a_token_gives_it() {
     assert!(
         stub.said()
             .iter()
-            .any(|l| l.contains("claude.com") && l.contains(EMAIL)),
+            .any(|l| l.contains("claude.com") && l.contains("aterm's sign-in window")),
         "{:?}",
         stub.said()
     );
+    let route = window_route(&world);
+    let window: Vec<(&str, OsString)> = opener_env(&route, EMAIL, &|_| None);
     let env = std::fs::read_to_string(world.home().join("env")).expect("the child's env");
     for kv in env.lines() {
-        let name = kv.split_once('=').map_or(kv, |(k, _)| k);
+        let (name, value) = kv.split_once('=').unwrap_or((kv, ""));
         assert!(
             !super::super::netwatch::ROUTE_KEYS.contains(&name),
             "{name}"
@@ -912,8 +1056,19 @@ fn a_stand_in_that_makes_a_token_gives_it() {
             !super::super::accounts::CREDENTIAL_KEYS.contains(&name),
             "{name}"
         );
-        assert!(name != "BROWSER" && !name.starts_with("ATERM"), "{name}");
+        if name == "BROWSER" || name.starts_with("ATERM") {
+            let held = window.iter().find(|(key, _)| *key == name);
+            assert!(
+                held.is_some_and(|(_, held)| held.to_str() == Some(value)),
+                "{name}={value} is not the window's"
+            );
+        }
     }
+    assert!(
+        env.lines()
+            .any(|kv| kv == "BROWSER=/nonexistent/aterm-open-url"),
+        "{env}"
+    );
     assert!(env.lines().any(|kv| kv == "TERM=dumb"), "{env}");
     let config = env
         .lines()
@@ -922,34 +1077,16 @@ fn a_stand_in_that_makes_a_token_gives_it() {
     assert!(Path::new(config).starts_with(&world.store), "{config}");
 }
 
-/// THE PASTED CODE REACHES THE STAND-IN'S TERMINAL: the person's code, handed over in a buffer
-/// that wipes itself, is what the stand-in read at its paste prompt, and the token follows.
-#[test]
-fn the_pasted_code_reaches_the_stand_in() {
-    let world = World::new("paste", false);
-    let stub = Stub::new(&world, false);
-    *stub.code.lock().unwrap() = Some(Zeroizing::new(b"the-code#the-state".to_vec()));
-    let minted = world
-        .capture(&stub, WakeDeadline::after(super::super::login_drive::HANG))
-        .expect("a token");
-    assert_eq!(minted.token.as_slice(), token().as_bytes());
-    assert_eq!(
-        std::fs::read_to_string(world.home().join("pasted")).expect("what it read"),
-        "the-code#the-state"
-    );
-    ended_and_swept(&world, &stub);
-}
-
-/// A capture whose page opens in aterm's sign-in window: the stub proves the stand-in and keeps
-/// what was said, and the window's waiter answers the paste and says whether the opener failed.
+/// A capture with aterm's own waiter on its window: the stub proves the stand-in and keeps what
+/// was said, and the window's waiter hands over the code and says whether the opener failed.
 struct Windowed<'a> {
     stub: &'a Stub<'a>,
-    waiter: WindowWaiter<'a>,
+    waiter: OpenerWaiter<'a>,
     /// Written to the route's outcome file once the capture says the window opened.
     fails_with: Option<(&'a Path, &'a str)>,
 }
 
-impl Person for Windowed<'_> {
+impl SignIn for Windowed<'_> {
     fn say(&self, line: &str) {
         if line.contains("sign-in window opened")
             && let Some((outcome, record)) = self.fails_with
@@ -958,24 +1095,21 @@ impl Person for Windowed<'_> {
         }
         self.stub.say(line);
     }
-    fn paste(
-        &self,
-        prompt: &str,
-        cancelled: &AtomicBool,
-    ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
-        self.waiter.paste(prompt, cancelled)
+    fn code(&self, cancelled: &AtomicBool) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+        self.waiter.code(cancelled)
     }
     fn stopped(&self) -> bool {
         self.stub.stopped()
     }
-    fn failed(&self) -> Option<String> {
+    fn failed(&self) -> Option<super::super::open_url::MetWord> {
         self.waiter.failed()
     }
 }
 
-fn window_route(world: &World) -> WindowRoute {
-    WindowRoute {
+fn window_route(world: &World) -> OpenerRoute {
+    OpenerRoute {
         opener: PathBuf::from("/nonexistent/aterm-open-url"),
+        page: OpenerPage::Window,
         outcome: world.home().join("outcome"),
         code: world.home().join("outcome.code"),
     }
@@ -984,7 +1118,7 @@ fn window_route(world: &World) -> WindowRoute {
 /// IN THE SIGN-IN WINDOW NOBODY IS ASKED FOR THE CODE: a hosted flow's code, which the window's
 /// opener hands over in the capture's own file, is taken once and typed at the stand-in's
 /// paste prompt, and the token follows. The child is told its page opens through aterm's
-/// opener with the window's grant and the account to sign in as; a capture with no window
+/// opener with the window's grant and the account to sign in as; the verb's own environment
 /// hands it none of that.
 #[test]
 fn a_window_capture_types_the_code_its_opener_handed_over() {
@@ -994,7 +1128,7 @@ fn a_window_capture_types_the_code_its_opener_handed_over() {
     std::fs::write(&route.code, "the-code#the-state").expect("the opener's code");
     let person = Windowed {
         stub: &stub,
-        waiter: WindowWaiter::new(&route),
+        waiter: OpenerWaiter::new(&route),
         fails_with: None,
     };
     let program = World::program();
@@ -1005,7 +1139,7 @@ fn a_window_capture_types_the_code_its_opener_handed_over() {
             store: &world.store,
             sign_in_as: EMAIL,
             env: &env,
-            window: Some(&route),
+            opener: &route,
             deadline: WakeDeadline::after(super::super::login_drive::HANG),
         },
         &person,
@@ -1027,7 +1161,7 @@ fn a_window_capture_types_the_code_its_opener_handed_over() {
     ended_and_swept(&world, &stub);
 
     let trace = |name: &str| (name == "ATERM_SIGN_IN_TRACE").then(|| OsString::from("/t/trace"));
-    let held: Vec<(&str, OsString)> = window_env(&route, EMAIL, &trace);
+    let held: Vec<(&str, OsString)> = opener_env(&route, EMAIL, &trace);
     let value = |name: &str| {
         held.iter()
             .find(|(key, _)| *key == name)
@@ -1055,7 +1189,36 @@ fn a_window_capture_types_the_code_its_opener_handed_over() {
     );
     #[cfg(target_os = "macos")]
     assert_eq!(value("ATERM_SIGN_IN_TRACE").as_deref(), Some("/t/trace"));
-    // CONTROL: the child of a capture with no window is handed no opener and no grant.
+    assert_eq!(value(super::super::open_url::TOKEN_ENV), None);
+    // The account's headless profile (FL-137): the token's grant and the row's label, never the
+    // window's grant or its trace.
+    let headless = OpenerRoute {
+        page: OpenerPage::Headless {
+            label: Some("work".to_owned()),
+        },
+        ..window_route(&world)
+    };
+    let held: Vec<(&str, OsString)> = opener_env(&headless, EMAIL, &trace);
+    let value = |name: &str| {
+        held.iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+    };
+    assert_eq!(
+        value(super::super::open_url::TOKEN_ENV).as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        value(super::super::open_url::ACCOUNT_LABEL_ENV).as_deref(),
+        Some("work")
+    );
+    assert_eq!(
+        value(super::super::open_url::EMAIL_ENV).as_deref(),
+        Some(EMAIL)
+    );
+    assert_eq!(value(super::super::open_url::WINDOW_ENV), None);
+    assert_eq!(value("ATERM_SIGN_IN_TRACE"), None);
+    // CONTROL: the verb's own environment hands the child no opener and no grant.
     let plain = child_env(&|_| None, Path::new("/scratch"));
     assert!(
         !plain
@@ -1065,8 +1228,9 @@ fn a_window_capture_types_the_code_its_opener_handed_over() {
 }
 
 /// A SIGN-IN THE WINDOW'S OPENER ENDED WITHOUT AUTHORIZING ENDS THE CAPTURE WITH WHAT IT MET:
-/// the stand-in, which would wait for ever, is ended, and the error is the opener's own closed
-/// words, never a byte the child wrote.
+/// the stand-in, which would wait for ever, is ended, and the error is the opener's closed
+/// word alone (no host, no reason), never a byte the child wrote; an opener that recorded
+/// nothing it met is `not-authorized`.
 #[test]
 fn a_window_capture_ends_with_what_its_opener_met() {
     let world = World::new("wait", true);
@@ -1074,7 +1238,7 @@ fn a_window_capture_ends_with_what_its_opener_met() {
     let route = window_route(&world);
     let person = Windowed {
         stub: &stub,
-        waiter: WindowWaiter::new(&route),
+        waiter: OpenerWaiter::new(&route),
         fails_with: Some((
             &route.outcome,
             "opener-outcome=1\nphase=failed\nmet=window-bot-check claude.ai\n",
@@ -1088,20 +1252,30 @@ fn a_window_capture_ends_with_what_its_opener_met() {
             store: &world.store,
             sign_in_as: EMAIL,
             env: &env,
-            window: Some(&route),
+            opener: &route,
             deadline: WakeDeadline::after(super::super::login_drive::HANG),
         },
         &person,
     )
     .expect_err("no token");
-    let Error::Window(why) = &error else {
-        panic!("{error:?}");
-    };
-    assert!(why.contains("Cloudflare's check on claude.ai"), "{why}");
-    assert!(error.to_string().contains("nothing was made"));
+    assert_eq!(
+        error,
+        Error::Opener(super::super::open_url::MetWord::WindowBotCheck)
+    );
+    let words = error.to_string();
+    assert!(
+        words.contains("Cloudflare's check did not clear"),
+        "{words}"
+    );
+    assert!(!words.contains("claude.ai"), "{words}");
+    assert!(words.contains("nothing was made"));
     ended_and_swept(&world, &stub);
-    // A person's browser says no such thing.
-    assert_eq!(stub.failed(), None);
+    // A record that met nothing is the opener's refusal, closed too.
+    std::fs::write(&route.outcome, "opener-outcome=1\nphase=failed\nmet=\n").unwrap();
+    assert_eq!(
+        OpenerWaiter::new(&route).failed(),
+        Some(super::super::open_url::MetWord::NotAuthorized)
+    );
 }
 
 /// A FAILURE ENDS THE GROUP AND HOLDS NO CHILD BYTE: the stand-in's exchange failure (with a
@@ -1121,7 +1295,7 @@ fn a_failure_ends_the_group_and_says_nothing_of_the_child() {
 }
 
 /// THE AUTHORIZE URL ENDS THE GROUP: a stand-in that opens another host, or asks a wider scope,
-/// is ended (with its group) and nothing was asked of the person.
+/// is ended (with its group) and no code is waited on.
 #[test]
 fn a_request_for_anything_else_ends_the_group() {
     for mode in ["bad-host", "wide-scope"] {
@@ -1134,8 +1308,8 @@ fn a_request_for_anything_else_ends_the_group() {
         ended_and_swept(&world, &stub);
         no_url_said(&stub);
         assert!(
-            !stub.pasted_asks.load(Ordering::SeqCst),
-            "{mode}: the person was asked"
+            !stub.code_awaited.load(Ordering::SeqCst),
+            "{mode}: a code was waited on"
         );
     }
 }
@@ -1159,8 +1333,8 @@ fn a_long_silence_meets_the_hang_detector() {
     ended_and_swept(&world, &stub);
 }
 
-/// CTRL-C ENDS IT: once the browser opened and the paste prompt is up, the person's stop ends
-/// the stand-in and its group, cancels the prompt, and leaves no scratch folder.
+/// CTRL-C ENDS IT: once the window opened and the paste prompt is up, a stop ends the stand-in
+/// and its group, cancels the wait for the window's code, and leaves no scratch folder.
 #[test]
 fn ctrl_c_ends_the_group() {
     let world = World::new("wait", true);
@@ -1201,13 +1375,14 @@ fn a_route_is_refused_before_any_spawn() {
         let program = World::program();
         let env = world.env(&[(key, value)]);
         let stub = Stub::new(&world, false);
+        let route = window_route(&world);
         let error = capture(
             &Capture {
                 program: &program,
                 store: &world.store,
                 sign_in_as: EMAIL,
                 env: &env,
-                window: None,
+                opener: &route,
                 deadline: WakeDeadline::after(super::super::login_drive::HANG),
             },
             &stub,
@@ -1232,13 +1407,9 @@ fn verb_stand_in() {
         return;
     };
     struct Waits;
-    impl Person for Waits {
+    impl SignIn for Waits {
         fn say(&self, _line: &str) {}
-        fn paste(
-            &self,
-            _prompt: &str,
-            cancelled: &AtomicBool,
-        ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+        fn code(&self, cancelled: &AtomicBool) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
             while !cancelled.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -1247,19 +1418,28 @@ fn verb_stand_in() {
         fn stopped(&self) -> bool {
             false
         }
+        fn failed(&self) -> Option<super::super::open_url::MetWord> {
+            None
+        }
     }
     let program = World::program();
     let mut env: Vec<(OsString, OsString)> = vec![("HOME".into(), home.clone().into_os_string())];
     if let Some(tmp) = std::env::var_os("TMPDIR") {
         env.push(("TMPDIR".into(), tmp));
     }
+    let route = OpenerRoute {
+        opener: PathBuf::from("/nonexistent/aterm-open-url"),
+        page: OpenerPage::Window,
+        outcome: home.join("outcome"),
+        code: home.join("outcome.code"),
+    };
     let _ = capture(
         &Capture {
             program: &program,
             store: &home.join("store"),
             sign_in_as: EMAIL,
             env: &env,
-            window: None,
+            opener: &route,
             deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN),
         },
         &Waits,
@@ -1323,109 +1503,4 @@ fn a_killed_verbs_child_ends_and_its_folder_is_swept_next_run() {
         Error::Failed(Failure::Exchange)
     );
     ended_and_swept(&world, &next);
-}
-
-/// Set when this test binary reads a code unshown at its terminal ([`unshown_reader`]): where
-/// it writes what it read.
-const UNSHOWN_AT: &str = "ATERM_SETUP_TOKEN_TEST_UNSHOWN";
-
-/// THE ZEROIZING UNSHOWN READ, in a child whose controlling terminal is a pty (a no-op in a
-/// plain test run): a read already cancelled gives nothing, then the typed line is read.
-#[test]
-fn unshown_reader() {
-    let Some(at) = std::env::var_os(UNSHOWN_AT).map(PathBuf::from) else {
-        return;
-    };
-    let cancelled = AtomicBool::new(true);
-    let none = crate::fleet_member::read_unshown_secret("first: ", &cancelled).expect("a read");
-    assert!(none.is_none(), "a cancelled read gave a line");
-    let open = AtomicBool::new(false);
-    let line = crate::fleet_member::read_unshown_secret("code: ", &open)
-        .expect("a read")
-        .expect("a line");
-    let line: &Zeroizing<Vec<u8>> = &line;
-    std::fs::write(&at, &line[..]).expect("what it read");
-}
-
-/// THE PASTED CODE IS READ UNSHOWN INTO A BUFFER THAT WIPES ITSELF: a child reading at its own
-/// terminal (`/dev/tty`, a pty here) gets the code typed there, without its newline, and the
-/// terminal never echoes it.
-#[test]
-fn the_code_is_read_unshown_from_the_terminal() {
-    use std::os::fd::AsRawFd as _;
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("aterm-setup-token-unshown-")
-        .suffix(".noindex")
-        .tempdir()
-        .expect("a folder");
-    let at = dir.path().join("got");
-    let (master, slave, mut child) =
-        aterm_pty::spawn_session_leader_on_pty_sized(25, 512, |slave| {
-            let tty = || slave.try_clone().map(std::process::Stdio::from);
-            #[allow(
-                clippy::disallowed_types,
-                reason = "the pty spawn seam takes StdCommand"
-            )]
-            let mut cmd = std::process::Command::new(std::env::current_exe()?);
-            cmd.args([
-                "--exact",
-                "harness::setup_token::tests::unshown_reader",
-                "--nocapture",
-                "--test-threads=1",
-                "--quiet",
-            ])
-            .env(UNSHOWN_AT, &at)
-            .stdout(tty()?)
-            .stderr(tty()?);
-            Ok(cmd)
-        })
-        .expect("the reader starts");
-    let mut master = std::fs::File::from(master);
-    aterm_pty::set_nonblocking(master.as_raw_fd(), true).expect("nonblocking");
-    let mut seen = Vec::new();
-    let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    let read_some = |seen: &mut Vec<u8>, master: &mut std::fs::File| {
-        let mut buf = [0u8; 1024];
-        match std::io::Read::read(master, &mut buf) {
-            Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
-            _ => std::thread::sleep(Duration::from_millis(10)),
-        }
-    };
-    while find(&seen, b"code: ").is_none() {
-        assert!(
-            Instant::now() < until,
-            "no prompt: {:?}",
-            String::from_utf8_lossy(&seen)
-        );
-        read_some(&mut seen, &mut master);
-    }
-    std::io::Write::write_all(&mut master, b"the-code#the-state\r").expect("typed");
-    while !at.exists() {
-        assert!(
-            Instant::now() < until,
-            "nothing read: {:?}",
-            String::from_utf8_lossy(&seen)
-        );
-        read_some(&mut seen, &mut master);
-    }
-    // Read on while it exits: on Apple a session leader's exit waits for its terminal's output
-    // to drain.
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("the reader's state") {
-            break status;
-        }
-        assert!(Instant::now() < until, "the reader never ended");
-        read_some(&mut seen, &mut master);
-    };
-    drop(slave);
-    assert!(status.success(), "{status}");
-    assert_eq!(
-        std::fs::read(&at).expect("what it read"),
-        b"the-code#the-state"
-    );
-    assert!(
-        find(&seen, b"the-code").is_none(),
-        "echoed: {:?}",
-        String::from_utf8_lossy(&seen)
-    );
 }

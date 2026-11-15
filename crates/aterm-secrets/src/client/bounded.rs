@@ -70,7 +70,6 @@ pub(super) fn sync_reader_with_candidates_until(
         Err(error) if error.kind() == crate::ErrorKind::MembershipHistoryUnavailable => {}
         Err(error) => return Err(error),
         Ok(SyncOutcome::Unchanged { .. }) => {}
-        Ok(SyncOutcome::Applied { ref report, .. }) if apply_failed(report) => {}
         Ok(complete) => return Ok(complete),
     }
     let config = configured(paths)?;

@@ -3,10 +3,12 @@
 
 //! Content-agnostic tab, view, and split-tree identities and logical-pixel split geometry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// Define a process-stable, non-index identity.
 macro_rules! stable_id {
@@ -157,6 +159,57 @@ impl View {
 pub struct ViewStore {
     ids: IdAllocator<ViewId>,
     views: HashMap<ViewId, View>,
+    terminal_views: HashMap<u64, Vec<ViewId>>,
+    revision: MutationRevision,
+}
+
+#[derive(Debug)]
+struct MutationRevision(Arc<AtomicUsize>);
+
+impl Default for MutationRevision {
+    fn default() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+}
+
+impl MutationRevision {
+    fn changed(&mut self) {
+        if let Some(next) = self.0.load(Ordering::Relaxed).checked_add(1) {
+            self.0.store(next, Ordering::Relaxed);
+        } else {
+            self.0 = Arc::new(AtomicUsize::new(0));
+        }
+    }
+    fn snapshot(&self) -> MutationToken {
+        MutationToken {
+            revision: Arc::clone(&self.0),
+            observed: self.0.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MutationToken {
+    revision: Arc<AtomicUsize>,
+    observed: usize,
+}
+
+impl MutationToken {
+    fn is_current(&self, revision: &MutationRevision) -> bool {
+        Arc::ptr_eq(&self.revision, &revision.0)
+            && self.observed == revision.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A view-map snapshot, including replacement of the entire store.
+#[derive(Clone, Debug)]
+pub struct ViewStoreRevision(MutationToken);
+
+impl ViewStoreRevision {
+    #[must_use]
+    pub fn is_current(&self, views: &ViewStore) -> bool {
+        self.0.is_current(&views.revision)
+    }
 }
 
 impl ViewStore {
@@ -174,8 +227,12 @@ impl ViewStore {
 
     fn insert(&mut self, view: View) -> Result<ViewId, IdExhausted> {
         let id = self.ids.allocate()?;
+        self.revision.changed();
         let previous = self.views.insert(id, view);
         debug_assert!(previous.is_none(), "monotonic ViewId collided");
+        if let Some(session) = view.terminal_session() {
+            self.terminal_views.entry(session).or_default().push(id);
+        }
         Ok(id)
     }
 
@@ -194,7 +251,31 @@ impl ViewStore {
     /// Remove a view.
     #[inline]
     pub fn remove(&mut self, id: ViewId) -> Option<View> {
-        self.views.remove(&id)
+        let view = self.views.remove(&id)?;
+        self.revision.changed();
+        if let Some(session) = view.terminal_session()
+            && let Some(ids) = self.terminal_views.get_mut(&session)
+        {
+            ids.retain(|view| *view != id);
+            if ids.is_empty() {
+                self.terminal_views.remove(&session);
+            }
+        }
+        Some(view)
+    }
+
+    /// Every current view of a terminal session, including distinct views of the same session.
+    #[inline]
+    pub fn terminal_views(&self, session: u64) -> impl Iterator<Item = ViewId> + '_ {
+        self.terminal_views
+            .get(&session)
+            .into_iter()
+            .flat_map(|ids| ids.iter().copied())
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> ViewStoreRevision {
+        ViewStoreRevision(self.revision.snapshot())
     }
 
     #[inline]
@@ -1787,13 +1868,77 @@ impl Tab {
 ///
 /// `tabs[..shown_len()]` is what the strip draws and `tabs[shown_len()..]` are the parked tabs, so
 /// a canonical index is a strip index for every visible tab. Any tab may be active, parked or not.
-#[derive(Clone, PartialEq, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct TabSet {
-    active: Option<TabId>,
+    active: Option<ActiveTab>,
     tabs: Vec<Tab>,
     /// The shown tab that stands for the parked ones: the strip selects it while a parked tab is
     /// active, and closing that parked tab lands on it.
     home: Option<TabId>,
+    revision: MutationRevision,
+    focused_views: OnceLock<HashSet<ViewId>>,
+    #[cfg(any(test, debug_assertions))]
+    focused_view_visits: AtomicUsize,
+}
+
+/// An opaque topology snapshot: presentation-only updates leave it current.
+#[derive(Clone, Debug)]
+pub struct TabSetRevision(MutationToken);
+
+impl TabSetRevision {
+    #[must_use]
+    pub fn is_current(&self, tabs: &TabSet) -> bool {
+        self.0.is_current(&tabs.revision)
+    }
+}
+
+impl Clone for TabSet {
+    fn clone(&self) -> Self {
+        Self {
+            active: self.active.clone(),
+            tabs: self.tabs.clone(),
+            home: self.home,
+            revision: MutationRevision::default(),
+            focused_views: self.focused_views.clone(),
+            #[cfg(any(test, debug_assertions))]
+            focused_view_visits: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl PartialEq for TabSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.active == other.active && self.tabs == other.tabs && self.home == other.home
+    }
+}
+
+/// The selected identity and a position hint. Mutable tab access can move the identity, so reads
+/// validate the hint and repair it by identity. Atomic storage preserves shared-reader access.
+#[derive(Debug)]
+struct ActiveTab {
+    id: TabId,
+    index: AtomicUsize,
+}
+
+impl ActiveTab {
+    fn at(id: TabId, index: usize) -> Self {
+        Self {
+            id,
+            index: AtomicUsize::new(index),
+        }
+    }
+}
+
+impl Clone for ActiveTab {
+    fn clone(&self) -> Self {
+        Self::at(self.id, self.index.load(Ordering::Relaxed))
+    }
+}
+
+impl PartialEq for ActiveTab {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
 }
 
 impl TabSet {
@@ -1801,9 +1946,13 @@ impl TabSet {
     #[inline]
     pub fn new(first: Tab) -> Self {
         Self {
-            active: Some(first.id),
+            active: Some(ActiveTab::at(first.id, 0)),
             tabs: vec![first],
             home: None,
+            revision: MutationRevision::default(),
+            focused_views: OnceLock::new(),
+            #[cfg(any(test, debug_assertions))]
+            focused_view_visits: AtomicUsize::new(0),
         }
     }
 
@@ -1822,14 +1971,23 @@ impl TabSet {
     #[must_use]
     #[inline]
     pub const fn active_id(&self) -> Option<TabId> {
-        self.active
+        match self.active.as_ref() {
+            Some(active) => Some(active.id),
+            None => None,
+        }
     }
 
     #[must_use]
     #[inline]
     pub fn active_index(&self) -> Option<usize> {
-        let active = self.active?;
-        self.tabs.iter().position(|tab| tab.id == active)
+        let active = self.active.as_ref()?;
+        let hint = active.index.load(Ordering::Relaxed);
+        if self.tabs.get(hint).is_some_and(|tab| tab.id == active.id) {
+            return Some(hint);
+        }
+        let index = self.tabs.iter().position(|tab| tab.id == active.id)?;
+        active.index.store(index, Ordering::Relaxed);
+        Some(index)
     }
 
     #[must_use]
@@ -1841,6 +1999,7 @@ impl TabSet {
     #[inline]
     pub fn active_mut(&mut self) -> Option<&mut Tab> {
         let index = self.active_index()?;
+        self.membership_changed();
         self.tabs.get_mut(index)
     }
 
@@ -1858,7 +2017,50 @@ impl TabSet {
 
     #[inline]
     pub fn tab_at_mut(&mut self, index: usize) -> Option<&mut Tab> {
+        self.membership_changed();
         self.tabs.get_mut(index)
+    }
+
+    /// Narrow presentation changes do not alter split geometry or view membership.
+    pub fn presentation_at_mut(&mut self, index: usize) -> Option<&mut TabPresentation> {
+        self.tabs.get_mut(index).map(|tab| &mut tab.presentation)
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> TabSetRevision {
+        TabSetRevision(self.revision.snapshot())
+    }
+
+    fn changed(&mut self) {
+        self.revision.changed();
+    }
+
+    fn membership_changed(&mut self) {
+        self.changed();
+        self.focused_views.take();
+    }
+
+    /// Whether any tab focuses `view`, regardless of which tab is active or parked.
+    pub fn contains_focused_view(&self, view: ViewId) -> bool {
+        self.focused_views
+            .get_or_init(|| {
+                self.tabs
+                    .iter()
+                    .map(|tab| {
+                        #[cfg(any(test, debug_assertions))]
+                        self.focused_view_visits.fetch_add(1, Ordering::Relaxed);
+                        tab.focus
+                    })
+                    .collect()
+            })
+            .contains(&view)
+    }
+
+    /// The number of tabs visited to build focused-view membership since the previous read.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn take_focused_view_visits_for_test(&self) -> usize {
+        self.focused_view_visits.swap(0, Ordering::Relaxed)
     }
 
     #[must_use]
@@ -1942,6 +2144,7 @@ impl TabSet {
         if self.get(tab.id).is_some() {
             return Err(DuplicateTabId);
         }
+        self.membership_changed();
         let id = tab.id;
         let at = if tab.parked {
             self.tabs.len()
@@ -1949,7 +2152,7 @@ impl TabSet {
             self.shown_len()
         };
         self.tabs.insert(at, tab);
-        self.active = Some(id);
+        self.active = Some(ActiveTab::at(id, at));
         Ok(at)
     }
 
@@ -1961,25 +2164,26 @@ impl TabSet {
             .tabs
             .iter()
             .position(|tab| tab.id == id && (tab.parked || tab.ephemeral))?;
+        self.changed();
         if !self.tabs[from].parked {
             self.tabs[from].ephemeral = false;
             self.tabs[from].fleet = false;
             return Some(from);
         }
-        let mut tab = self.tabs.remove(from);
+        let to = self.shown_len();
+        self.move_tab(from, to);
+        let tab = &mut self.tabs[to];
         tab.parked = false;
         tab.ephemeral = false;
         tab.fleet = false;
-        let to = self.shown_len();
-        self.tabs.insert(to, tab);
         Some(to)
     }
 
     pub fn switch_to(&mut self, id: TabId) -> bool {
-        if self.get(id).is_none() {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return false;
-        }
-        self.active = Some(id);
+        };
+        self.active = Some(ActiveTab::at(id, index));
         true
     }
 
@@ -1987,7 +2191,7 @@ impl TabSet {
         let Some(id) = self.tabs.get(index).map(|tab| tab.id) else {
             return false;
         };
-        self.active = Some(id);
+        self.active = Some(ActiveTab::at(id, index));
         true
     }
 
@@ -2006,7 +2210,7 @@ impl TabSet {
             (current + count - 1) % count
         };
         let id = self.tabs[next].id;
-        self.active = Some(id);
+        self.active = Some(ActiveTab::at(id, next));
         Some(id)
     }
 
@@ -2027,7 +2231,7 @@ impl TabSet {
             (current + count - 1) % count
         };
         let id = self.tabs[next].id;
-        self.active = Some(id);
+        self.active = Some(ActiveTab::at(id, next));
         Some(id)
     }
 
@@ -2036,7 +2240,8 @@ impl TabSet {
     /// shown tab, and a shown one on the shown tab in its place, else the one before it.
     pub fn remove(&mut self, id: TabId) -> Option<Tab> {
         let index = self.tabs.iter().position(|tab| tab.id == id)?;
-        let was_active = self.active == Some(id);
+        self.membership_changed();
+        let was_active = self.active_id() == Some(id);
         let removed = self.tabs.remove(index);
         if self.home == Some(id) {
             self.home = None;
@@ -2052,7 +2257,11 @@ impl TabSet {
             } else {
                 index.min(shown - 1)
             };
-            self.active = Some(self.tabs[landing].id);
+            self.active = Some(ActiveTab::at(self.tabs[landing].id, landing));
+        } else if let Some(active) = &mut self.active
+            && *active.index.get_mut() > index
+        {
+            *active.index.get_mut() -= 1;
         }
         Some(removed)
     }
@@ -2070,9 +2279,25 @@ impl TabSet {
         if (from < shown) != (to < shown) {
             return false;
         }
+        self.move_tab(from, to);
+        true
+    }
+
+    /// Move one tab and carry the selected tab's position through the intervening shift.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        self.changed();
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
-        true
+        if let Some(active) = &mut self.active {
+            let hint = active.index.get_mut();
+            if *hint == from {
+                *hint = to;
+            } else if from < *hint && *hint <= to {
+                *hint -= 1;
+            } else if to <= *hint && *hint < from {
+                *hint += 1;
+            }
+        }
     }
 
     /// Move a tab as near canonical index `to` as its own side of the boundary allows, keeping
@@ -2095,10 +2320,10 @@ impl TabSet {
         if self.tabs.is_empty() {
             return self.active.is_none();
         }
-        let Some(active) = self.active else {
+        let Some(active) = self.active.as_ref() else {
             return false;
         };
-        self.tabs.iter().filter(|tab| tab.id == active).count() == 1
+        self.tabs.iter().filter(|tab| tab.id == active.id).count() == 1
             && self.parked_is_suffix()
             && self
                 .home

@@ -195,6 +195,21 @@ pub(crate) fn not_run(why: impl std::fmt::Display) -> Fail {
     Fail::exit(NOT_RUN, format!("NOT RUN: {why}"))
 }
 
+/// Both complete output streams, each bounded by the existing 16 MiB complete-output limit.
+/// Unlike a diagnostic tail, an oversized or incomplete stream supplies no usable output.
+fn capture_output(
+    command: &mut aterm_uds::spawnfd::Command,
+    limit: Duration,
+) -> Result<std::process::Output, String> {
+    aterm_uds::deadline::output_with_input_until(
+        command,
+        aterm_uds::secret::Secret::new(&[]),
+        Instant::now() + limit,
+        aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+    )
+    .map_err(|error| format!("complete guest output: {error}"))
+}
+
 /// Where the `tart` to run comes from.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TartSource {
@@ -761,6 +776,19 @@ impl Vm {
             aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
         )
         .map_err(|e| format!("tart exec complete: {e}"))
+    }
+
+    /// Complete stdout and stderr, each at most 16 MiB; never a diagnostic tail.
+    pub(crate) fn exec_output(
+        &self,
+        script: &str,
+        limit: Duration,
+    ) -> Result<std::process::Output, String> {
+        capture_output(
+            aterm_uds::spawnfd::command(&self.tart)
+                .args(["exec", &self.name, "/bin/sh", "-c", script]),
+            limit,
+        )
     }
 
     pub(crate) fn sh(&self, script: &str, limit: Duration) -> Result<String, Fail> {
@@ -1514,3 +1542,7 @@ fn tail(text: &str) -> String {
 #[cfg(test)]
 #[path = "mac_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mac_capture_tests.rs"]
+mod capture_tests;

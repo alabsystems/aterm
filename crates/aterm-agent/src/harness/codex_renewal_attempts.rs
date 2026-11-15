@@ -23,6 +23,7 @@ pub use index::IndexKey;
 
 #[path = "codex_renewal_unattached.rs"]
 mod unattached;
+pub use unattached::unattached_held_until;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -152,9 +153,10 @@ impl<'a> ReceiptWriter<'a> {
         if read_cancellation(self.env, initial)?.is_some() {
             return Err("receipt-revoked");
         }
-        // A login renewal's successor that never attached is held off: the session handed back
-        // on the login it left asks for it again, and would be moved onto it at once.
-        if initial.intent.purpose == Purpose::Login
+        // A successor at an authentication wall that never attached is held off (a login
+        // renewal's, or a lost login's move): the session handed back on the login it left asks
+        // for it again, and would be moved onto it at once.
+        if initial.intent.purpose.auth_wall()
             && self
                 .unattached_login_until(
                     &initial.intent.identity,
@@ -310,7 +312,7 @@ impl<'a> ReceiptWriter<'a> {
         receipt: &Receipt,
         target: &str,
     ) -> Result<(), &'static str> {
-        if receipt.intent.purpose != super::Purpose::WeeklyQuota
+        if !receipt.intent.purpose.pool_scoped()
             || receipt.phase != Phase::Consumed
             || receipt.accepted_turn.as_deref() != Some(receipt.intent.wall.as_str())
             || super::read_receipt(self.env, &receipt.id).as_ref() != Some(receipt)
@@ -402,7 +404,7 @@ impl<'a> ReceiptWriter<'a> {
         expected: &Receipt,
         proof: &impl NativeUnattachedProof,
     ) -> Result<bool, &'static str> {
-        if expected.intent.purpose != super::Purpose::WeeklyQuota {
+        if !expected.intent.purpose.pool_scoped() {
             return Ok(false);
         }
         if expected.phase != Phase::Retired
@@ -471,7 +473,7 @@ impl<'a> ReceiptWriter<'a> {
         expected: &Receipt,
         opts: &super::super::upgrade_drive::Opts,
     ) -> Result<bool, &'static str> {
-        if expected.intent.purpose != super::Purpose::WeeklyQuota {
+        if !expected.intent.purpose.pool_scoped() {
             return Ok(false);
         }
         if opts.state != self.env.state || self.env.home.as_ref() != Some(&opts.home) {
@@ -509,7 +511,7 @@ impl<'a> ReceiptWriter<'a> {
         expected: &Receipt,
         terminal: bool,
     ) -> Result<bool, &'static str> {
-        if expected.intent.purpose != super::Purpose::WeeklyQuota {
+        if !expected.intent.purpose.pool_scoped() {
             return Ok(false);
         }
         if !terminal || super::read_receipt(self.env, &expected.id).as_ref() != Some(expected) {

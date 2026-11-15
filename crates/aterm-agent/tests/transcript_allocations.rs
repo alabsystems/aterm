@@ -226,7 +226,7 @@ fn codex_step_rows_materialize_no_text() {
     }
     assert!(!fold.broken());
     let batch = fold.take();
-    assert_eq!((batch.lost, batch.overflow), (0, 0));
+    assert_eq!((batch.lost(), batch.overflow), (0, 0));
     assert_eq!(batch.steps.len(), 8, "{:?}", batch.steps);
     assert!(!format!("{:?}", batch.steps).contains("SENTINEL"));
     let gated = [
@@ -260,7 +260,7 @@ fn codex_step_rows_materialize_no_text() {
     }
     assert!(!fold.broken());
     let batch = fold.take();
-    assert_eq!((batch.lost, batch.overflow), (0, 0));
+    assert_eq!((batch.lost(), batch.overflow), (0, 0));
     let said = format!("{:?}", batch.steps);
     assert!(!said.contains("SENTINEL"), "{said}");
     let harness = batch

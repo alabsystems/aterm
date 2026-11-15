@@ -139,7 +139,7 @@ fn two_stores_on_one_journal_mint_distinct_ids() {
         old.owner(TAB_A),
         Some((first.clone(), NODE.to_owned(), BY.to_owned()))
     );
-    assert!(old.join(&second, NODE, BY).is_ok());
+    assert!(old.join(&second, NODE, BY, Via::FleetShell).is_ok());
     // The next minute counts from one again.
     let third = old
         .open_request(AT + 60_000, fleet_shell(BY, "three"))
@@ -213,23 +213,51 @@ fn req_joins_only_an_open_request_of_the_same_requester() {
     );
     let refusal = |result: Result<(), Refusal>| result.map_err(|refusal| refusal.to_string());
     assert_eq!(
-        refusal(store.join("r-20261109-1411-87be5228-99", NODE, BY)),
+        refusal(store.join("r-20261109-1411-87be5228-99", NODE, BY, Via::FleetShell)),
         Err("no request of that id on this Mac".to_owned())
     );
     assert_eq!(
-        refusal(store.join(&theirs, NODE, BY)),
+        refusal(store.join(&theirs, NODE, BY, Via::FleetShell)),
         Err("another requester's request".to_owned())
     );
     // NEGATIVE CONTROL: the requester's token from another Mac with the same node head.
     assert_eq!(
-        refusal(store.join(&mine, TWIN, BY)),
+        refusal(store.join(&mine, TWIN, BY, Via::FleetShell)),
         Err("another requester's request".to_owned())
     );
     assert_eq!(
-        refusal(store.join(&done, NODE, BY)),
+        refusal(store.join(&done, NODE, BY, Via::FleetShell)),
         Err("the request has concluded".to_owned())
     );
-    assert_eq!(refusal(store.join(&mine, NODE, BY)), Ok(()));
+    assert_eq!(
+        refusal(store.join(&mine, NODE, BY, Via::FleetShell)),
+        Ok(())
+    );
+    // A plain fleet shell joins only a plain fleet shell's request, which a lease ends: joined
+    // to a worker's request it would be leased by none. Nor does a worker join a shell's.
+    let worker = store
+        .open_request(
+            AT,
+            Intake {
+                via: Via::FleetWorker,
+                form: Form::Agent("claude".to_owned()),
+                ..fleet_shell(BY, "a worker")
+            },
+        )
+        .unwrap();
+    let shell_into_worker = refusal(store.join(&worker, NODE, BY, Via::FleetShell));
+    assert!(
+        shell_into_worker.as_ref().is_err_and(|why| why
+            .starts_with("the request came in as fleet-worker and this spawn as fleet-shell")
+            && why.contains("spawn it without req= to open its own")),
+        "{shell_into_worker:?}"
+    );
+    assert!(refusal(store.join(&mine, NODE, BY, Via::FleetWorker)).is_err());
+    assert_eq!(
+        refusal(store.join(&worker, NODE, BY, Via::FleetWorker)),
+        Ok(())
+    );
+    store.refused(AT, &worker, true).unwrap();
     // A joined request's refused spawn leaves it as it was; a concluded one takes no tab.
     store.tab(AT, &mine, TAB_A, BY, false, None).unwrap();
     store.refused(AT, &mine, true).unwrap();
@@ -244,7 +272,7 @@ fn a_pending_join_keeps_its_request_open_while_its_last_tab_leaves() {
     let id = store.open_request(AT, fleet_shell(BY, "keep")).unwrap();
     store.tab(AT, &id, TAB_A, BY, false, None).unwrap();
     // The requester's `req=` passes while its only tab is closing; the tab leaves first.
-    store.join(&id, NODE, BY).unwrap();
+    store.join(&id, NODE, BY, Via::FleetShell).unwrap();
     let shell_exit = closed_by("-", "shell-exit", Some(0));
     assert_eq!(store.left(AT + 1, TAB_A, &shell_exit).unwrap(), None);
     assert_eq!(store.get(&id).unwrap().state(), State::Running);
@@ -257,7 +285,7 @@ fn a_pending_join_keeps_its_request_open_while_its_last_tab_leaves() {
     // A join whose spawn is refused concludes a request whose tabs all left meanwhile.
     let other = store.open_request(AT, fleet_shell(BY, "refused")).unwrap();
     store.tab(AT, &other, TAB_C, BY, false, None).unwrap();
-    store.join(&other, NODE, BY).unwrap();
+    store.join(&other, NODE, BY, Via::FleetShell).unwrap();
     let failed = closed_by("-", "shell-exit", Some(1));
     assert_eq!(store.left(AT + 1, TAB_C, &failed).unwrap(), None);
     store.refused(AT + 2, &other, true).unwrap();
@@ -281,7 +309,7 @@ fn a_pending_join_keeps_its_request_open_while_its_last_tab_leaves() {
     );
     let waits = store.open_request(AT, fleet_shell(BY, "waits")).unwrap();
     store.tab(AT, &waits, TAB_E, BY, false, None).unwrap();
-    store.join(&waits, NODE, BY).unwrap();
+    store.join(&waits, NODE, BY, Via::FleetShell).unwrap();
     store.left(AT + 1, TAB_E, &failed).unwrap();
     assert_eq!(store.get(&waits).unwrap().end, None);
 }
@@ -428,6 +456,110 @@ fn a_journal_of_live_records_is_not_rewritten_for_its_size() {
     );
 }
 
+/// Append `lines` to the journal as another build writes them, byte for byte.
+fn append_raw(dir: &Path, lines: &[Vec<u8>]) {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join(crate::JOURNAL))
+        .unwrap();
+    for line in lines {
+        file.write_all(line).unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+}
+
+/// Two builds share a state home (a seamless update's overlap, an update reverted): an older
+/// build's compaction keeps every line it cannot read, byte for byte and in its place, so a
+/// newer build's records (a kind, a word or a key the older one lacks, a value that is no
+/// UTF-8, an `attach` of a later shape) survive it. NEGATIVE CONTROL: the superseded `attach`es
+/// it reads still go, the last with the count.
+#[test]
+fn compaction_keeps_every_row_a_newer_build_wrote_as_written() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    store.compact_at = u64::MAX;
+    let id = store.open_request(AT, fleet_shell(BY, "shared")).unwrap();
+    store.tab(AT, &id, TAB_A, BY, false, None).unwrap();
+    let newer: Vec<Vec<u8>> = vec![
+        format!("t={} op=verdict req={id} by=human note=-", AT + 1).into_bytes(),
+        format!("t={} op=end req={id} out=released why=superseded", AT + 2).into_bytes(),
+        format!("t={} op=keep req={id} tab={TAB_A} by=human seat=1", AT + 3).into_bytes(),
+        [
+            format!("t={} op=review req={id} note=", AT + 4).as_bytes(),
+            b"\xff\xfe by=human",
+        ]
+        .concat(),
+        format!(
+            "t={} op=attach req={id} tab={TAB_A} verb=turn n=1 by={BY} seat=1",
+            AT + 5
+        )
+        .into_bytes(),
+    ];
+    for (n, line) in (0..).zip(&newer) {
+        for k in 0..10 {
+            store
+                .attach(AT + 10 + n * 10 + k, TAB_A, Verb::Turn, NODE, BY)
+                .unwrap();
+        }
+        append_raw(dir.path(), std::slice::from_ref(line));
+    }
+    let before = journal(dir.path());
+    let is_attach = |line: &[u8]| {
+        std::str::from_utf8(line)
+            .ok()
+            .and_then(Rec::parse)
+            .is_some_and(|rec| matches!(rec.body, Body::Attach { .. }))
+    };
+    let inode = |path: &Path| {
+        let id = line_log::identity_of(&std::fs::metadata(path).unwrap());
+        (id.dev, id.ino)
+    };
+    let old = inode(&dir.path().join(crate::JOURNAL));
+    // The next append passes the bound: the older build (this one) compacts.
+    store.compact_at = 1;
+    assert!(store.attach(AT + 99, TAB_A, Verb::Turn, NODE, BY).unwrap());
+    assert_ne!(
+        inode(&dir.path().join(crate::JOURNAL)),
+        old,
+        "never compacted"
+    );
+    let after = journal(dir.path());
+    let last = format!(
+        "t={} op=attach req={id} tab={TAB_A} verb=turn n=51 by={BY}\n",
+        AT + 99
+    );
+    let mut want: Vec<u8> = before
+        .split_inclusive(|b| *b == b'\n')
+        .filter(|line| !is_attach(line.strip_suffix(b"\n").unwrap_or(line)))
+        .flatten()
+        .copied()
+        .collect();
+    want.extend_from_slice(last.as_bytes());
+    assert_eq!(
+        String::from_utf8_lossy(&after),
+        String::from_utf8_lossy(&want)
+    );
+    assert_eq!(after, want, "byte for byte");
+    for line in &newer {
+        assert_eq!(
+            after
+                .split(|b| *b == b'\n')
+                .filter(|kept| kept == line)
+                .count(),
+            1,
+            "{}",
+            String::from_utf8_lossy(line)
+        );
+    }
+    // Every store reads it as before: the count kept, the newer rows skipped, never applied.
+    let fresh = Store::open(dir.path()).unwrap();
+    let request = fresh.get(&id).unwrap();
+    assert_eq!(request.tabs[0].verbs.get(&Verb::Turn), Some(&51));
+    assert_eq!(request.state(), State::Running);
+    assert_eq!(fresh.skipped(), 5);
+}
+
 #[test]
 fn a_tab_comes_out_by_its_task_or_its_exit() {
     let worker = |task| Left {
@@ -539,7 +671,7 @@ fn an_idle_leased_shell_concludes_abandoned_once_its_quiet_window_passes() {
         []
     );
     // NEGATIVE CONTROL: a pending join holds it.
-    store.join(&id, NODE, BY).unwrap();
+    store.join(&id, NODE, BY, Via::FleetShell).unwrap();
     assert_eq!(store.lease(driven + LEASE_IDLE_MS, &idle).unwrap(), []);
     store.refused(driven, &id, true).unwrap();
     assert_eq!(journal(dir.path()), before, "nothing written");
@@ -763,7 +895,7 @@ fn the_relaunch_sweep_concludes_only_requests_whose_tabs_are_gone() {
     let young = store.open_request(born, fleet_shell(BY, "young")).unwrap();
     let joining = store.open_request(AT, fleet_shell(BY, "joining")).unwrap();
     store.tab(AT, &joining, TAB_C, BY, false, None).unwrap();
-    store.join(&joining, NODE, BY).unwrap();
+    store.join(&joining, NODE, BY, Via::FleetShell).unwrap();
     let hosted: BTreeSet<String> = [TAB_A.to_owned()].into();
     let ended = store.sweep(born + 1, born, &hosted).unwrap();
     let ids: Vec<(&str, Out, EndWhy)> = ended
@@ -1627,6 +1759,186 @@ fn left_folds_reason_code_and_task() {
     assert_eq!(store.get(&open).unwrap().tabs[0].gone, None);
 }
 
+/// A local agent's spawn whose why is `why` (else its goal's), its tab's goal and asked lines
+/// `goal` and `asked`.
+fn local_agent(why: Option<&str>, goal: Option<&str>, asked: Option<&str>) -> Intake {
+    Intake {
+        via: Via::CtlSpawn,
+        form: Form::Agent("claude".to_owned()),
+        from: From {
+            node: String::new(),
+            host: "m72".to_owned(),
+            by: ASKER.to_owned(),
+            program: None,
+            model: None,
+            account: None,
+        },
+        why: why_of(Via::CtlSpawn, why, None, goal, asked),
+        brief: None,
+        goal: goal.map(str::to_owned),
+        asked: asked.map(str::to_owned),
+    }
+}
+
+/// The content rows a spawn wrote at `t_ms` under `id` before its `open` was lost (a crash, a
+/// failed append between the two writes): its goal's why, its goal and its asked line.
+fn lost_intake(dir: &Path, t_ms: u64, id: &str) {
+    use std::io::Write as _;
+    let rows = [
+        SaidBody::Why {
+            text: "migrate the billing DB".to_owned(),
+            src: WhySrc::Goal,
+        },
+        SaidBody::Goal {
+            text: "migrate the billing DB".to_owned(),
+        },
+        SaidBody::Asked {
+            text: "drop the old table?".to_owned(),
+        },
+    ];
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(crate::SAID))
+        .unwrap();
+    for body in rows {
+        let line = Said {
+            t_ms,
+            id: id.to_owned(),
+            body,
+        }
+        .line();
+        writeln!(file, "{line}").unwrap();
+    }
+}
+
+/// A spawn's content rows whose `open` never reached the journal are no later request's: the
+/// next request of that minute and head is minted past their id, and says only what it said.
+/// NEGATIVE CONTROL: a request whose `open` was written reads its own rows.
+#[test]
+fn content_rows_whose_open_was_lost_lend_nothing_to_a_later_request() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let lost = "r-20261109-1411-local-01";
+    lost_intake(dir.path(), AT, lost);
+    // A spawn of the same minute gives its why, and its tab has no goal or asked line yet.
+    let id = store
+        .open_request(AT + 35_000, local_agent(Some("run the tests"), None, None))
+        .unwrap();
+    assert_eq!(id, "r-20261109-1411-local-02", "minted past the lost id");
+    assert_eq!(store.said(&id), None);
+    assert_eq!(Store::open(dir.path()).unwrap().said(&id), None);
+    assert_eq!(store.said(lost), None, "no request's");
+    let own = store
+        .open_request(
+            AT + 36_000,
+            local_agent(None, Some("its own goal"), Some("its own ask")),
+        )
+        .unwrap();
+    assert_eq!(own, "r-20261109-1411-local-03");
+    let said = Store::open(dir.path()).unwrap().said(&own).unwrap();
+    assert_eq!(said.goal.as_deref(), Some("its own goal"));
+    assert_eq!(said.asked.as_deref(), Some("its own ask"));
+}
+
+/// Where a build that mints from the journal alone opened a lost spawn's id again, the lost
+/// content rows are still not its: a request's own are those written with its `open`.
+/// NEGATIVE CONTROL: its own row, at its `open`'s time, is read.
+#[test]
+fn a_reopened_id_reads_only_the_rows_written_with_its_open() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let lost = "r-20261109-1411-local-01";
+    lost_intake(dir.path(), AT, lost);
+    let opened = AT + 35_000;
+    let intake = local_agent(Some("run the tests"), None, None);
+    let rows = [
+        Body::Open(Open {
+            via: intake.via,
+            form: intake.form,
+            node: String::new(),
+            host: intake.from.host,
+            by: intake.from.by,
+            program: None,
+            model: None,
+            account: None,
+            why_src: WhySrc::Given,
+        }),
+        Body::Why {
+            text: "run the tests".to_owned(),
+        },
+    ]
+    .map(|body| {
+        Rec {
+            t_ms: opened,
+            id: lost.to_owned(),
+            body,
+        }
+        .line()
+        .into_bytes()
+    });
+    std::fs::write(dir.path().join(crate::JOURNAL), b"").unwrap();
+    append_raw(dir.path(), &rows);
+    let mut store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store.get(lost).map(|request| request.opened_ms),
+        Some(opened)
+    );
+    assert_eq!(store.said(lost), None);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join(crate::SAID))
+        .unwrap();
+    let asked = Said {
+        t_ms: opened,
+        id: lost.to_owned(),
+        body: SaidBody::Asked {
+            text: "its own ask".to_owned(),
+        },
+    }
+    .line();
+    std::io::Write::write_all(&mut file, format!("{asked}\n").as_bytes()).unwrap();
+    let said = store.said(lost).unwrap();
+    assert_eq!(said.asked.as_deref(), Some("its own ask"));
+    assert_eq!((said.why, said.goal), (None, None));
+}
+
+/// A spawn's content row cut short under its id (a short write on a full disk, a power loss,
+/// before its `open`) keeps that id from being minted again: the read made to mint finishes the
+/// row, as the next append would, so no later request's rows are written under its id.
+/// NEGATIVE CONTROL: the finished row is still no request's, and the new request reads its own.
+#[test]
+fn a_content_row_cut_short_keeps_its_id_from_being_minted_again() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let lost = "r-20261109-1411-local-01";
+    let row = Said {
+        t_ms: AT,
+        id: lost.to_owned(),
+        body: SaidBody::Asked {
+            text: "drop the old table".to_owned(),
+        },
+    }
+    .line();
+    // Cut inside its text, where what was written still reads as a row.
+    let cut = &row[..row.len() - 3];
+    std::fs::write(dir.path().join(crate::SAID), cut).unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let id = store
+        .open_request(AT + 35_000, local_agent(None, Some("its own goal"), None))
+        .unwrap();
+    assert_eq!(
+        id, "r-20261109-1411-local-02",
+        "minted past the cut row's id"
+    );
+    let said = std::fs::read_to_string(dir.path().join(crate::SAID)).unwrap();
+    assert!(
+        said.starts_with(&format!("{cut}\n")) && !said[cut.len() + 1..].contains(lost),
+        "the cut row is finished where it was, and nothing more is written under its id: {said}"
+    );
+    assert_eq!(store.said(lost), None, "no request's");
+    let own = Store::open(dir.path()).unwrap().said(&id).unwrap();
+    assert_eq!(own.goal.as_deref(), Some("its own goal"));
+}
+
 #[test]
 fn said_fold_reads_fallback_why_goal_asked_and_reply() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -1779,4 +2091,323 @@ fn inspection_refuses_a_broken_journal_where_the_cache_would_answer() {
         [id]
     );
     assert!(store.inspect().is_err());
+}
+
+fn every_tab(_: &str) -> bool {
+    true
+}
+
+fn plan_of(start: CleanStart) -> CleanPlan {
+    match start {
+        CleanStart::Plan(plan) => *plan,
+        CleanStart::Already => panic!("a plan"),
+    }
+}
+
+#[test]
+fn begin_clean_refuses_running_without_stop_kept_and_cleaned_and_writes_an_implicit_review() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let running = shell_request(&mut store, false);
+    let before = journal(dir.path());
+    // A running request is no cleanup's without stop=1, and nothing is written.
+    assert!(matches!(
+        store.begin_clean(AT + 10, &running, "human", false, &every_tab),
+        Err(ActRefusal::Live)
+    ));
+    // A standing tab another aterm hosts is that aterm's to close.
+    assert!(matches!(
+        store.begin_clean(AT + 10, &running, "human", true, &|_| false),
+        Err(ActRefusal::Elsewhere(sid)) if sid == TAB_A
+    ));
+    assert!(matches!(
+        store.begin_clean(
+            AT + 10,
+            "r-20261109-1411-87be5228-09",
+            "human",
+            true,
+            &every_tab
+        ),
+        Err(ActRefusal::Unknown)
+    ));
+    assert_eq!(journal(dir.path()), before);
+    // NEGATIVE: with stop=1 it begins, and the person's clean is their review.
+    let plan = plan_of(
+        store
+            .begin_clean(AT + 11, &running, "human", true, &every_tab)
+            .unwrap(),
+    );
+    assert!(!plan.resumed);
+    assert_eq!(plan.at_ms, AT + 11);
+    assert_eq!(plan.request.stage(), Stage::Cleaning);
+    let review = plan.request.review.clone().unwrap();
+    assert_eq!((review.by.as_str(), review.at_ms), ("human", AT + 11));
+    assert_eq!(
+        plan.request.clean,
+        Some(CleanBegan {
+            by: "human".to_owned(),
+            at_ms: AT + 11,
+            stop: true
+        })
+    );
+    // A concluded, reviewed request writes no second review.
+    let concluded = {
+        let id = store
+            .open_request(AT + 20, fleet_shell(BY, "second"))
+            .unwrap();
+        store.tab(AT + 21, &id, TAB_B, BY, false, None).unwrap();
+        store
+            .left(AT + 22, TAB_B, &closed_by(BY, "shell-exit", Some(0)))
+            .unwrap();
+        store.review(AT + 23, &id, "ctl", Some("fine")).unwrap();
+        id
+    };
+    let plan = plan_of(
+        store
+            .begin_clean(AT + 24, &concluded, "human", false, &every_tab)
+            .unwrap(),
+    );
+    assert_eq!(plan.request.review.as_ref().unwrap().by, "ctl");
+    let text = String::from_utf8(journal(dir.path())).unwrap();
+    assert_eq!(
+        text.matches(&format!("op=review req={concluded}")).count(),
+        1
+    );
+    store
+        .end_clean(
+            AT + 25,
+            &concluded,
+            CleanEnd::Cleaned {
+                tabs: 0,
+                deleted: 0,
+                kept: 0,
+                failed: 0,
+                by: "human".to_owned(),
+            },
+        )
+        .unwrap();
+    assert_eq!(store.get(&concluded).unwrap().stage(), Stage::Cleaned);
+    let before = journal(dir.path());
+    assert_eq!(
+        store
+            .begin_clean(AT + 26, &concluded, "human", false, &every_tab)
+            .unwrap(),
+        CleanStart::Already
+    );
+    assert!(matches!(
+        store.keep_request(AT + 27, &concluded, "human"),
+        Err(ActRefusal::Cleaned)
+    ));
+    assert_eq!(journal(dir.path()), before, "neither wrote");
+    // A kept request is never cleaned.
+    let kept = {
+        let id = store
+            .open_request(AT + 30, fleet_shell(BY, "third"))
+            .unwrap();
+        store.tab(AT + 31, &id, TAB_C, BY, false, None).unwrap();
+        store
+            .left(AT + 32, TAB_C, &closed_by(BY, "shell-exit", Some(0)))
+            .unwrap();
+        store.keep_request(AT + 33, &id, "human").unwrap();
+        id
+    };
+    assert!(matches!(
+        store.begin_clean(AT + 34, &kept, "human", true, &every_tab),
+        Err(ActRefusal::Kept)
+    ));
+}
+
+// Its claims are Unix paths.
+#[cfg(unix)]
+#[test]
+fn gone_and_cleaned_fold_and_a_cut_clean_reads_cleaning_and_resumes_skipping_gone_paths() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let id = shell_request(&mut store, true);
+    store
+        .born(
+            AT + 3,
+            &[
+                born(&id, "/Users//a/x", Some(true)),
+                born(&id, "/Users//a/y", Some(true)),
+            ],
+        )
+        .unwrap();
+    // NEGATIVE: no cleanup began, so no cleanup row is taken.
+    let gone_x = GoneClaim {
+        at_ms: AT + 12,
+        path: "/Users//a/x".to_owned(),
+        bytes: Some(10),
+        why: None,
+        did: Did::Deleted,
+    };
+    assert_eq!(
+        store.gone(&id, &gone_x).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    plan_of(
+        store
+            .begin_clean(AT + 10, &id, "human", false, &every_tab)
+            .unwrap(),
+    );
+    let archive = Archive {
+        at_ms: AT + 11,
+        dir: id.clone(),
+        bytes: 100,
+        files: 3,
+        listed: 2,
+        whole: true,
+    };
+    store.archived(&id, &archive).unwrap();
+    store.gone(&id, &gone_x).unwrap();
+    // NEGATIVE: a folder the request does not claim takes no row.
+    let stray = GoneClaim {
+        path: "/Users//a/z".to_owned(),
+        ..gone_x.clone()
+    };
+    assert_eq!(
+        store.gone(&id, &stray).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    // A cut: the process ends here. A cold reader reads it cleaning, with what it did.
+    drop(store);
+    let mut store = Store::open(dir.path()).unwrap();
+    let request = store.get(&id).unwrap().clone();
+    assert_eq!(request.stage(), Stage::Cleaning);
+    assert_eq!(request.archives, vec![archive.clone()]);
+    assert_eq!(request.gone, vec![gone_x.clone()]);
+    // Cleaning it again resumes it: the folder deleted stays deleted.
+    let plan = plan_of(
+        store
+            .begin_clean(AT + 20, &id, "ctl", false, &every_tab)
+            .unwrap(),
+    );
+    assert!(plan.resumed);
+    assert_eq!(
+        plan.request.gone_of("/Users//a/x").map(|g| g.did),
+        Some(Did::Deleted)
+    );
+    assert_eq!(plan.request.gone_of("/Users//a/y"), None);
+    let kept_y = GoneClaim {
+        at_ms: AT + 21,
+        path: "/Users//a/y".to_owned(),
+        bytes: None,
+        why: Some(Keep::Unpushed),
+        did: Did::Kept,
+    };
+    store.gone(&id, &kept_y).unwrap();
+    // The resumed cleanup's own archive is recorded beside the first, which still holds what the
+    // cut cleanup listed of the folder it deleted.
+    let again = Archive {
+        at_ms: AT + 21,
+        dir: format!("{id}-2"),
+        bytes: 10,
+        files: 0,
+        listed: 1,
+        whole: true,
+    };
+    store.archived(&id, &again).unwrap();
+    store
+        .end_clean(
+            AT + 22,
+            &id,
+            CleanEnd::Cleaned {
+                tabs: 0,
+                deleted: 1,
+                kept: 1,
+                failed: 0,
+                by: "ctl".to_owned(),
+            },
+        )
+        .unwrap();
+    // NEGATIVE: a finished cleanup takes no more rows.
+    assert_eq!(
+        store
+            .end_clean(AT + 23, &id, CleanEnd::Uncleaned(Unclean::Store))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let fresh = Store::open(dir.path()).unwrap();
+    let request = fresh.get(&id).unwrap();
+    assert_eq!(request.stage(), Stage::Cleaned);
+    assert_eq!(request.archives, vec![archive, again]);
+    assert_eq!(request.gone, vec![gone_x, kept_y]);
+    assert_eq!(
+        request
+            .cleaned
+            .as_ref()
+            .map(|c| (c.deleted, c.kept, c.by.as_str())),
+        Some((1, 1, "ctl"))
+    );
+    assert_eq!(fresh.skipped(), 0);
+    // The record rows of the request are read back whole, its said rows apart.
+    let (rows, said) = lines_of(dir.path(), &id).unwrap();
+    assert!(rows.iter().all(|row| row.contains(&format!(" req={id} "))));
+    assert!(rows.iter().any(|row| row.contains(" op=cleaned ")));
+    assert!(said.is_empty());
+    assert_eq!(
+        rows.len(),
+        String::from_utf8(journal(dir.path()))
+            .unwrap()
+            .lines()
+            .count()
+    );
+    // NEGATIVE: another request's rows are not its.
+    assert!(
+        lines_of(dir.path(), "r-20261109-1411-87be5228-09")
+            .unwrap()
+            .0
+            .is_empty()
+    );
+}
+
+#[test]
+fn uncleaned_returns_the_stage_to_reviewed() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let id = shell_request(&mut store, true);
+    assert_eq!(store.get(&id).unwrap().stage(), Stage::Concluded);
+    plan_of(
+        store
+            .begin_clean(AT + 10, &id, "human", false, &every_tab)
+            .unwrap(),
+    );
+    assert_eq!(store.get(&id).unwrap().stage(), Stage::Cleaning);
+    store
+        .end_clean(AT + 11, &id, CleanEnd::Uncleaned(Unclean::Busy))
+        .unwrap();
+    let request = Store::open(dir.path()).unwrap().get(&id).unwrap().clone();
+    assert_eq!(request.stage(), Stage::Reviewed);
+    assert_eq!(request.uncleaned, Some((Unclean::Busy, AT + 11)));
+    // A later cleanup begins afresh, not resumed.
+    let plan = plan_of(
+        store
+            .begin_clean(AT + 12, &id, "human", false, &every_tab)
+            .unwrap(),
+    );
+    assert!(!plan.resumed);
+    assert_eq!(plan.request.stage(), Stage::Cleaning);
+}
+
+#[test]
+fn a_request_kept_while_its_cleanup_was_cut_leaves_cleaning() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let id = shell_request(&mut store, true);
+    plan_of(
+        store
+            .begin_clean(AT + 10, &id, "human", false, &every_tab)
+            .unwrap(),
+    );
+    // A quit cuts the cleanup here.
+    assert_eq!(store.get(&id).unwrap().stage(), Stage::Cleaning);
+    store.keep_request(AT + 11, &id, "human").unwrap();
+    let request = Store::open(dir.path()).unwrap().get(&id).unwrap().clone();
+    assert_eq!(request.stage(), Stage::Reviewed, "the person's now");
+    // NEGATIVE: no cleanup resumes it.
+    assert!(matches!(
+        store.begin_clean(AT + 12, &id, "human", false, &every_tab),
+        Err(ActRefusal::Kept)
+    ));
 }

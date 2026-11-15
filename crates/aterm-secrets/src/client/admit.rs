@@ -14,8 +14,8 @@
 //!   ([`members::bundle::Handed::Log`]). The caller posts the records to every server it reaches
 //!   ([`post_records_to_servers`]).
 //! - [`write_from_log_bundle`] is the new Mac's side: it checks the path from the genesis its pin
-//!   trusts to the effective `Admit` that names its own key, opens its files from the log, and
-//!   writes `~/.secrets`.
+//!   trusts to the effective `Admit` that names its own key, and records the entries it reads in
+//!   place from the log.
 //!
 //! Everywhere else (a vault with no log, ALab until F12b; a member with no seat; a new Mac that
 //! does not read the log bundle) [`hand_over`] falls back to F10's interim: the member's
@@ -1233,15 +1233,16 @@ pub(super) fn post_records_to_servers_by(paths: &Paths, by: Instant) -> crate::R
     Ok(posted)
 }
 
-/// Write this Mac's vault configuration, records and `~/.secrets` from a member's log bundle
+/// Write this Mac's vault configuration and records from a member's log bundle, recording the
+/// entries it reads in place from them
 /// ([`Handed::Log`]), once the path to the genesis holds: the records verify into a store for
 /// the bundle's vault, its genesis is one the bundle's pin trusts (for ALab, only what this build
 /// compiles: the digest or, until F12b, the vault keys it names, never a key the bundle alone
 /// names), the log lets this Mac's own key in by the bundle's `Admit`,
 /// and the log hands this Mac at least one epoch key. Whichever member signed that `Admit`, the
 /// log's own rules made it effective; the member this Mac ran the phrase with may hand an `Admit`
-/// another member signed for this Mac on an earlier run. This Mac is then in: it reads its files
-/// from the log, with no admin. It keeps the bundle's `Allowed` and its subscriber posts it to its
+/// another member signed for this Mac on an earlier run. This Mac is then in: it reads its entries
+/// in place from the log, with no admin. It keeps the bundle's `Allowed` and its subscriber posts it to its
 /// source each hour (`ask_again_if_due`) until an admin's approver names it in `[machines]` and
 /// its locker arrives: that approver still names it in `aterm-swarm-roster` and the envelope
 /// 0.145 Macs read (the fleet admits it by the log since F17), and a member's one post of it can
@@ -1362,13 +1363,12 @@ fn write_log_bundle(
             // history's checks read the cached envelope as `checked_log_bundle` read it.
             crate::fsx::wipe_and_remove(&paths.cache_file())?;
         }
-        let report = apply_entries(paths, &mut state, &entries)?;
+        let report = record_applied(&mut state, &entries);
         state.membership = Stored::In;
-        state.failed = apply_failed(&report);
         state.records_digest = Some(digest);
         state.proof = None;
         state.refused = None;
-        state.source_identity = (!state.failed).then(|| source_identity(&config));
+        state.source_identity = Some(source_identity(&config));
         // The first subscriber pass posts the `Allowed` at once.
         state.requested = 0;
         save_state(paths, &state)?;

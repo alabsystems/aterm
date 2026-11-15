@@ -145,6 +145,7 @@ fn card_outlook(env: &Env) -> outlook::Outlook {
         enrolled: &enrolled,
         series: &series,
         renewals: &outlook::renewals_of(&roster, &logins),
+        lab: &BTreeMap::new(),
         mode: outlook::replay_mode(&policy),
         credits: policy.usage_credits,
         now: env.now,
@@ -373,4 +374,124 @@ fn stats_and_the_accounts_report_give_one_since() {
         assert_eq!(since_in(&account["windows"], id), Value::Null, "{id}");
         assert_eq!(since_in(&row["windows"], id), Value::Null, "{id}");
     }
+}
+
+/// T9's report half: THE REPORT WRITES NOTHING WITH THE JOURNAL ON OR OFF. Over the seeded store,
+/// with `pool1` (never read here) given an address the journal knows, the report run with no
+/// journal and the report run with one in which a peer read `pool1`'s week leave every file
+/// byte-identical; only the one with the journal says the peer's bound (`lab.pool1` in the JSON,
+/// `others may use it` in the text), and the rows' own figures are this Mac's either way.
+/// NEGATIVE CONTROL: with `write_accounts_report_snapshot` giving the outlook no bounds (its
+/// `lab` read removed), `the journal's bound is shown` fails.
+#[test]
+fn the_report_writes_nothing_with_the_journal_on_or_off() {
+    use crate::harness::alab_seen::{self, AccountSeen, Figure, Seen, WindowSeen};
+    const KEY: &str = "ac-00000000000000b1";
+    const PEER: &str = "13000000000000000000000000000013";
+    const OWN: &str = "02000000000000000000000000000002";
+    let tmp = tmp_dir("accounts-outlook-journal");
+    let env = env_at(&tmp);
+    seeded(&tmp, &env);
+    let dir = |label: &str| {
+        let dir = tmp.path().join("logins").join(label);
+        Some(dir.to_str().expect("utf-8").to_owned())
+    };
+    let roster = accounts::append_rows_for(
+        Cli::Claude,
+        "",
+        &[
+            accounts::Row {
+                label: "me".into(),
+                class: Class::Preferred,
+                dir: dir("me"),
+                ..Default::default()
+            },
+            accounts::Row {
+                label: "alt1".into(),
+                class: Class::Preferred,
+                dir: dir("alt1"),
+                ..Default::default()
+            },
+            accounts::Row {
+                label: "pool1".into(),
+                class: Class::Pool,
+                dir: dir("pool1"),
+                email: Some("pool1@example.test".into()),
+                ..Default::default()
+            },
+        ],
+    )
+    .expect("the rows admit");
+    std::fs::write(env.accounts_roster().expect("a config dir"), roster).expect("write");
+    let seen = Seen {
+        me: [OWN.to_owned()].into(),
+        at: env.now,
+        accounts: [(
+            KEY.to_owned(),
+            AccountSeen {
+                windows: vec![WindowSeen {
+                    window: alab_seen::WEEK.into(),
+                    sub: None,
+                    figure: Some(Figure::Used {
+                        pct_x10: 400,
+                        reset: Some(env.now + 5 * D),
+                    }),
+                    read: Some((env.now - 3 * H, "m13".into(), "statusline".into())),
+                    reader: Some(PEER.into()),
+                    wall_until: None,
+                    wall_by: None,
+                }],
+                ..AccountSeen::default()
+            },
+        )]
+        .into(),
+    };
+    let report = |json: bool| {
+        crate::harness::journal::with_keyer(
+            |realm, email| (realm == "claude" && email == "pool1@example.test").then(|| KEY.into()),
+            || acc_quiet(AccountsCmd::Report { json }, &env).1,
+        )
+    };
+    let before = every_file(tmp.path());
+    let (off_json, off_text) = (report(true), report(false));
+    let (on_json, on_text) = alab_seen::with_seen(seen, || (report(true), report(false)));
+    assert_eq!(before, every_file(tmp.path()), "the reports wrote nothing");
+    let off_json: Value = aterm_json::from_str(off_json.trim()).expect("the report is JSON");
+    let on_json: Value = aterm_json::from_str(on_json.trim()).expect("the report is JSON");
+    assert!(
+        off_json["outlook"]["lab"]
+            .as_object()
+            .is_some_and(|lab| lab.is_empty()),
+        "CONTROL: no journal, no bound: {}",
+        off_json["outlook"]
+    );
+    assert!(
+        !off_text.contains("others may use it"),
+        "CONTROL: {off_text}"
+    );
+    assert_eq!(
+        on_json["outlook"]["lab"]["pool1"]["seven_day"]["used_x10"].as_u64(),
+        Some(400),
+        "the journal's bound is shown: {}",
+        on_json["outlook"]
+    );
+    assert!(on_text.contains("others may use it"), "{on_text}");
+    let figures = |doc: &Value| {
+        doc["accounts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|row| row["windows"].as_array().into_iter().flatten())
+            .map(figures_of)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !figures(&off_json).is_empty(),
+        "CONTROL: the rows have figures"
+    );
+    assert_eq!(
+        figures(&on_json),
+        figures(&off_json),
+        "the rows' own figures"
+    );
 }

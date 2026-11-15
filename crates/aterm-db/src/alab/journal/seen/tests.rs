@@ -47,7 +47,7 @@ fn a_lower_reading_frees_nothing() {
         read,
         by,
         ..
-    }) = usage(Window::FiveHour, &readings, now)
+    }) = usage(Window::FiveHour, &readings, None, now)
     else {
         panic!("current");
     };
@@ -73,7 +73,7 @@ fn an_ended_window_inside_its_tolerance_does_not_outrank_the_new_one() {
     ];
     let Some(Usage::Current {
         pct_x10, reset, by, ..
-    }) = usage(Window::FiveHour, &readings, now)
+    }) = usage(Window::FiveHour, &readings, None, now)
     else {
         panic!("current");
     };
@@ -102,7 +102,7 @@ fn a_reading_without_a_reset_made_since_is_a_read_since() {
     ];
     let Some(Usage::Current {
         pct_x10, reset, by, ..
-    }) = usage(Window::FiveHour, &readings, now)
+    }) = usage(Window::FiveHour, &readings, None, now)
     else {
         panic!("current");
     };
@@ -119,7 +119,8 @@ fn resets_that_disagree_beyond_their_resolution_are_unknown() {
         reading("aa", 9_000, 100, Some(20_000), Res::Exact),
         reading("bb", 9_100, 200, Some(27_200), Res::Minute),
     ];
-    let Some(Usage::Current { reset, pct_x10, .. }) = usage(Window::FiveHour, &readings, 10_000)
+    let Some(Usage::Current { reset, pct_x10, .. }) =
+        usage(Window::FiveHour, &readings, None, 10_000)
     else {
         panic!("current");
     };
@@ -135,7 +136,8 @@ fn resets_that_disagree_beyond_their_resolution_are_unknown() {
 #[test]
 fn a_passed_reset_is_not_read_as_zero() {
     let readings = [reading("aa", 9_000, 420, Some(9_500), Res::Exact)];
-    let Some(Usage::ResetUnread { reset, read, .. }) = usage(Window::FiveHour, &readings, 10_000)
+    let Some(Usage::ResetUnread { reset, read, .. }) =
+        usage(Window::FiveHour, &readings, None, 10_000)
     else {
         panic!("reset unread");
     };
@@ -146,7 +148,7 @@ fn a_passed_reset_is_not_read_as_zero() {
         ..reading("aa", 9_000, 50, None, Res::Exact)
     }];
     assert!(matches!(
-        usage(Window::FiveHour, &none, 10_000),
+        usage(Window::FiveHour, &none, None, 10_000),
         Some(Usage::Current {
             reset: None,
             pct_x10: 50,
@@ -157,6 +159,309 @@ fn a_passed_reset_is_not_read_as_zero() {
 
 fn account(email: &str) -> Pk {
     Pk::new(&keys::account_pk("claude", email).unwrap()).unwrap()
+}
+
+/// A week's reading of `account` at `t`, `pct` tenths used, its reset `reset`.
+fn week_read(t: u64, account: Pk, pct: u16, reset: u64) -> Event {
+    Event {
+        window: Some(Window::Week),
+        pct_x10: Some(pct),
+        reset: Some(reset),
+        res: Some(Res::Exact),
+        src: Source::Statusline,
+        ..ev(t, Kind::Quota, account)
+    }
+}
+
+/// The week `seen` folds of `account`: its figure and the Mac credited with it.
+fn week_of(seen: &Seen, account: Pk) -> Option<(u16, String)> {
+    seen.quota(account.as_str())
+        .into_iter()
+        .find(|q| q.pk == account.as_str() && q.window == Window::Week)
+        .and_then(|q| match q.usage? {
+            Usage::Current { pct_x10, by, .. } => Some((pct_x10, by)),
+            Usage::ResetUnread { .. } => None,
+        })
+}
+
+/// A `reset-used` that refilled `window` of `account` at `t`.
+fn refill(t: u64, account: Pk, window: Window) -> Event {
+    Event {
+        window: Some(window),
+        ..ev(t, Kind::ResetUsed, account)
+    }
+}
+
+/// A wall of `account`'s week seen at `t`, standing until `until`.
+fn week_wall(t: u64, account: Pk, until: u64) -> Event {
+    Event {
+        window: Some(Window::Week),
+        until: Some(until),
+        ..ev(t, Kind::Wall, account)
+    }
+}
+
+/// Whether `seen` holds a standing wall of `account`'s `window`.
+fn walled(seen: &Seen, account: Pk, window: Window) -> bool {
+    seen.quota(account.as_str())
+        .iter()
+        .any(|q| q.window == window && q.wall.is_some())
+}
+
+/// A REFILL CUTS THE WINDOW'S OLDER READINGS: 90% read at t100, a `reset-used` of the week at t200
+/// and 10% at t300 under the same reset is 10%, though a lower reading frees nothing within one
+/// window; a reading made in the refill's second stands.
+/// NEGATIVE CONTROL: without the `reset-used` the 90% stands (readings are snapshots), and with
+/// `usage` given no cut (`None` for `cut`), the refilled window reads 90%: `left: Some(900)
+/// right: Some(100)`.
+#[test]
+fn a_reset_used_cuts_the_readings_before_it() {
+    const MAC: &str = "000000000000000000000000000000aa";
+    let ann = account("ann@example.test");
+    let reset = 7 * 86_400;
+    let read = |events: &[Event]| {
+        let events: Vec<(String, Event)> = events.iter().map(|e| (MAC.to_owned(), *e)).collect();
+        week_of(&Seen::of_events(&events, 400), ann).map(|(pct, _)| pct)
+    };
+    let before = week_read(100, ann, 900, reset);
+    let after = week_read(300, ann, 100, reset);
+    assert_eq!(
+        read(&[before, after]),
+        Some(900),
+        "CONTROL: a lower reading frees nothing"
+    );
+    let refill = refill(200, ann, Window::Week);
+    assert_eq!(read(&[before, refill, after]), Some(100));
+    assert_eq!(
+        read(&[before, after, refill]),
+        Some(100),
+        "the batch's order is not the cut's"
+    );
+    let same_second = week_read(200, ann, 50, reset);
+    assert_eq!(read(&[before, refill, same_second]), Some(50));
+    assert_eq!(
+        read(&[before, refill]),
+        None,
+        "nothing read since the refill"
+    );
+}
+
+/// ONE MAC'S REFILL CUTS EVERY MAC'S OLDER READINGS OF THE WINDOW: a `reset-used` of the week m3
+/// logged cuts m17's week reading made before it, and m17's reading made after it stands; a wall
+/// of the week m17 saw before the refill no longer stands; another account's readings and wall
+/// are left.
+/// NEGATIVE CONTROL: with the cut keyed by (account, Mac), m17's 95% stands: `left: Some((950,
+/// "…bb")) right: Some((200, "…bb"))`; with `quota` not cutting walls, ann's wall stands.
+#[test]
+fn one_macs_reset_used_cuts_another_macs_older_readings() {
+    let (m3, m17) = ("a".repeat(32), "b".repeat(32));
+    let (ann, bob) = (account("ann@example.test"), account("bob@example.test"));
+    let reset = 7 * 86_400;
+    let seen = Seen::of_events(
+        &[
+            (m17.clone(), week_read(100, ann, 950, reset)),
+            (m17.clone(), week_wall(150, ann, reset)),
+            (m17.clone(), week_read(100, bob, 700, reset)),
+            (m17.clone(), week_wall(150, bob, reset)),
+            (m3.clone(), refill(200, ann, Window::Week)),
+            (m17.clone(), week_read(300, ann, 200, reset)),
+        ],
+        400,
+    );
+    assert_eq!(week_of(&seen, ann), Some((200, m17.clone())));
+    assert_eq!(
+        week_of(&seen, bob),
+        Some((700, m17)),
+        "another account's week"
+    );
+    assert!(
+        !walled(&seen, ann, Window::Week),
+        "a wall seen before the refill no longer stands"
+    );
+    assert!(
+        walled(&seen, bob, Window::Week),
+        "another account's wall stands"
+    );
+}
+
+/// A RESET SPENT WITH THE LIMIT STILL STANDING CUTS NOTHING: m13 walls ann's week at t100 and
+/// logs a `reset-used` naming no window at t200 (the harness writes one for a reset the vendor
+/// says was spent while the walled limit still stands, and for no other); the wall and m13's 95%
+/// read before it still stand.
+/// NEGATIVE CONTROL: with a `reset-used` of no window read as cutting every window of its key (as
+/// it once was), the wall and the reading are gone: `wall still stands` fails.
+#[test]
+fn a_reset_spent_with_the_limit_still_standing_cuts_nothing() {
+    let m13 = "d".repeat(32);
+    let ann = account("ann@example.test");
+    let reset = 7 * 86_400;
+    let seen = Seen::of_events(
+        &[
+            (m13.clone(), week_read(90, ann, 950, reset)),
+            (m13.clone(), week_wall(100, ann, reset)),
+            (m13.clone(), ev(200, Kind::ResetUsed, ann)),
+        ],
+        400,
+    );
+    assert!(walled(&seen, ann, Window::Week), "the wall still stands");
+    assert_eq!(week_of(&seen, ann), Some((950, m13)), "the reading stands");
+}
+
+/// A FIVE-HOUR REFILL LEAVES THE WEEK: m3's `reset-used` of the five-hour window cuts a peer's
+/// five-hour reading made before it; m13's 95% week reading and its week wall, both before it,
+/// stand.
+/// NEGATIVE CONTROL: with the cut keyed by account alone (every window of the key), the week's
+/// reading is gone: `left: None right: Some((950, …))`.
+#[test]
+fn a_five_hour_refill_leaves_the_week() {
+    let (m3, m13) = ("a".repeat(32), "d".repeat(32));
+    let ann = account("ann@example.test");
+    let reset = 7 * 86_400;
+    let five = Event {
+        window: Some(Window::FiveHour),
+        reset: Some(18_000),
+        ..week_read(100, ann, 800, reset)
+    };
+    let seen = Seen::of_events(
+        &[
+            (m13.clone(), week_read(100, ann, 950, reset)),
+            (m13.clone(), week_wall(150, ann, reset)),
+            (m13.clone(), five),
+            (m3.clone(), refill(200, ann, Window::FiveHour)),
+        ],
+        400,
+    );
+    assert_eq!(week_of(&seen, ann), Some((950, m13)), "the week's reading");
+    assert!(walled(&seen, ann, Window::Week), "the week's wall");
+    assert!(
+        !seen
+            .quota(ann.as_str())
+            .iter()
+            .any(|q| q.window == Window::FiveHour && q.usage.is_some()),
+        "the five-hour reading made before the refill is cut"
+    );
+}
+
+/// A REFILL DATED BY A CLOCK AHEAD CUTS NO MORE THAN NOW ALLOWS: a `reset-used` m17 dated two
+/// hours past the read is not believed (m3's 95% read before the read stands); one dated ten
+/// minutes past it holds from the read's now (the 95% made before now is cut, a reading made at
+/// now stands).
+/// NEGATIVE CONTROL: with the cut stored as the event's raw time, the reading at now is cut too:
+/// `left: None right: Some(30)`; with no bound ahead, the two-hour refill cuts the 95%.
+#[test]
+fn a_refill_dated_ahead_of_the_read_cuts_no_more_than_now() {
+    let (m3, m17) = ("a".repeat(32), "b".repeat(32));
+    let ann = account("ann@example.test");
+    let (now, reset) = (10_000, 7 * 86_400);
+    let read = |refill_at: u64, events: &[(String, Event)]| {
+        let mut events = events.to_vec();
+        events.push((m17.clone(), refill(refill_at, ann, Window::Week)));
+        week_of(&Seen::of_events(&events, now), ann).map(|(pct, _)| pct)
+    };
+    let before = (m3.clone(), week_read(now - 100, ann, 950, reset));
+    assert_eq!(
+        read(now + 2 * 3_600, std::slice::from_ref(&before)),
+        Some(950),
+        "a refill two hours ahead is not believed"
+    );
+    assert_eq!(
+        read(now + 600, std::slice::from_ref(&before)),
+        None,
+        "a refill ten minutes ahead holds from now"
+    );
+    assert_eq!(
+        read(
+            now + 600,
+            &[before.clone(), (m3.clone(), week_read(now, ann, 30, reset))]
+        ),
+        Some(30),
+        "a reading made at now stands"
+    );
+}
+
+/// A PEER'S READING DATED JUST AFTER A REFILL COUNTS ONLY UNTIL A LATER SURE ONE: m17's clock
+/// runs ten minutes ahead, and its 95% read before m3's refill is dated five minutes after it.
+/// With nothing read since it counts (it may be of the refilled window); m3's own 3% read before
+/// it does not outrank it; m3's 4% dated after it (the refilling Mac's clock, so surely after the
+/// refill) shows the window: the 95% is from before the refill. A peer's reading a skew bound
+/// past the refill is sure too and counts as most used as any.
+/// NEGATIVE CONTROL: with every reading at or after the cut counted alike, m17's 95% stands over
+/// m3's 4%: `left: Some((950, "…bb")) right: Some((40, "…aa"))`.
+#[test]
+fn a_peers_reading_just_after_a_refill_counts_until_a_later_sure_one() {
+    let (m3, m17) = ("a".repeat(32), "b".repeat(32));
+    let ann = account("ann@example.test");
+    let (cut, reset) = (12 * 3_600, 7 * 86_400);
+    let read = |events: &[(String, Event)]| {
+        let mut events = events.to_vec();
+        events.push((m3.clone(), refill(cut, ann, Window::Week)));
+        week_of(&Seen::of_events(&events, cut + 3 * 3_600), ann)
+    };
+    let stale = (m17.clone(), week_read(cut + 300, ann, 950, reset));
+    assert_eq!(
+        read(std::slice::from_ref(&stale)),
+        Some((950, m17.clone())),
+        "with nothing sure read since, it counts"
+    );
+    let early = (m3.clone(), week_read(cut + 60, ann, 30, reset));
+    assert_eq!(
+        read(&[stale.clone(), early.clone()]),
+        Some((950, m17.clone())),
+        "a sure reading made before it does not outrank it"
+    );
+    let later = (m3.clone(), week_read(cut + 360, ann, 40, reset));
+    assert_eq!(
+        read(&[stale.clone(), early.clone(), later.clone()]),
+        Some((40, m3.clone())),
+        "a later sure reading shows the window"
+    );
+    let past_skew = (m17.clone(), week_read(cut + 900, ann, 60, reset));
+    assert_eq!(
+        read(&[stale, early, later, past_skew]),
+        Some((60, m17)),
+        "a peer's reading a skew bound past the refill is sure"
+    );
+}
+
+/// A WORKSPACE'S REFILL CUTS ITS SUB-ACCOUNT'S WINDOW: a `reset-used` noted with the workspace's
+/// `sub`, as its readings and walls are, cuts the sub-account's week reading and wall made before
+/// it; one noted of the account alone leaves the workspace's.
+/// NEGATIVE CONTROL: with the fold keying a `reset-used` by its account whatever its `sub`, the
+/// workspace's 95% stands: `left: Some(950) right: None`.
+#[test]
+fn a_workspaces_refill_cuts_its_sub_accounts_window() {
+    let m13 = "d".repeat(32);
+    let ann = account("ann@example.test");
+    let sub = Some(Word::new("0123456789ab").unwrap());
+    let sa = keys::subaccount_pk(ann.as_str(), "0123456789ab").unwrap();
+    let reset = 7 * 86_400;
+    let workspace = |event: Event| (m13.clone(), Event { sub, ..event });
+    let held = |events: &[(String, Event)]| {
+        let seen = Seen::of_events(events, 400);
+        let week = seen
+            .quota(ann.as_str())
+            .into_iter()
+            .find(|q| q.pk == sa && q.window == Window::Week);
+        let pct = week.as_ref().and_then(|q| match q.usage.as_ref()? {
+            Usage::Current { pct_x10, .. } => Some(*pct_x10),
+            Usage::ResetUnread { .. } => None,
+        });
+        (pct, week.is_some_and(|q| q.wall.is_some()))
+    };
+    let before = [
+        workspace(week_read(100, ann, 950, reset)),
+        workspace(week_wall(150, ann, reset)),
+    ];
+    let mut cut = before.to_vec();
+    cut.push(workspace(refill(200, ann, Window::Week)));
+    assert_eq!(held(&cut), (None, false), "the workspace's window is cut");
+    let mut account_only = before.to_vec();
+    account_only.push((m13.clone(), refill(200, ann, Window::Week)));
+    assert_eq!(
+        held(&account_only),
+        (Some(950), true),
+        "the account's refill is not the workspace's"
+    );
 }
 
 fn ev(t: u64, kind: Kind, account: Pk) -> Event {
@@ -233,6 +538,11 @@ fn the_window_says_who_used_an_account_where_it_is_signed_in_and_its_quota() {
         .unwrap();
     let (uuid, t) = seen.last_use.get(ann.as_str()).expect("a last use").clone();
     assert_eq!(t, t0);
+    assert_eq!(
+        seen.me,
+        [uuid.clone()].into(),
+        "the Mac that wrote the batch reads it as its own"
+    );
     let signed = seen
         .signins
         .get(ann.as_str())

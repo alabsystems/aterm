@@ -174,9 +174,7 @@ impl App {
         else {
             return;
         };
-        if self.pool.theme(sid).is_some() {
-            self.set_session_theme(sid, None);
-        }
+        self.commit_session_theme(sid, None);
     }
 
     fn sync_tab_theme_trial(&mut self, trial_open: bool, change: Option<Option<String>>) {
@@ -290,14 +288,16 @@ impl App {
             if self.pool.get(trial.session).is_none() {
                 return;
             }
-            let theme = match self.session_theme_unavailable(id) {
-                None => Some(crate::session_theme::SessionTheme {
-                    selector: id.to_string(),
-                    origin: crate::session_theme::SessionThemeOrigin::Ctl,
-                }),
-                Some(_) => trial.prior,
-            };
-            self.set_session_theme(trial.session, theme);
+            match self.session_theme_unavailable(id) {
+                None => self.commit_session_theme(
+                    trial.session,
+                    Some(crate::session_theme::SessionTheme {
+                        selector: id.to_string(),
+                        origin: crate::session_theme::SessionThemeOrigin::Ctl,
+                    }),
+                ),
+                Some(_) => self.set_session_theme(trial.session, trial.prior),
+            }
             return;
         }
         if id.eq_ignore_ascii_case(&self.configured_side_name()) {

@@ -1,5 +1,30 @@
 # Native resource member controller
 
+The closed local-archive request/startup/external-delivery overlay follows
+canonical Trust `3229e452ecf013a6107567c3d856842aa3bf3569`. Request v2 binds the
+original host/boot and fixed source/contents observations; startup and delivery
+compare the complete request, and ACKs bind the exact terminal. Output basenames
+are fixed leaves for exclusive creation beneath the actual original contents
+descriptor. These are DATA codecs, with no child, SDK, GNU return or seed grant.
+Existing consumer refinements, omitted examples and fixture deadlines remain.
+
+The preparation/configuration overlay is from Trust commit
+`9d377bd751` and ordered-set follow-up `f90b2e8a09`, preserving the existing
+protocols and consumer overlays below.
+The representation-only lint repair follows canonical `3ef6dc8fda`; its wire
+encoders and ownership checks are unchanged. Existing native import refinements
+and the vendor's omitted example population remain intact.
+This identifies source DATA, not complete SDK or resident-operation qualification.
+Preparation ACKv2 follows canonical `277e3e0ec8`: its actual resident contents
+descriptor identity is retained only as restrictive DATA through output binding.
+It neither opens/adopts a directory nor grants producer/seed availability.
+
+Aterm's prepared-profile output handler seals the actual accepted source/config
+population and same fresh workspace into one private retained bundle. The Root
+and a later operation share that same owner; its bookended original-directory
+FD adds no admission, returned producer or seed authority. Callback failure and
+unwind quarantine the original while retaining the cache and input guards.
+
 The Bootstrap graph codec/client is an engineering overlay from Trust commit
 `14b8b87ef8fcb6b6f246ac080ce8f054e89bec75`, based on published commit
 `5d40370f4cf13387956ae26456ea9e2eec514ecb`. It adds bounded support,
@@ -233,3 +258,19 @@ which a container image may lack (the `rust` image does). There, every
 `client::metadata` test whose fixture calls `host_boot().unwrap()` panics with
 `NotFound`, under any feature set that enables `client`. Mount the host's file
 read-only (`-v /etc/machine-id:/etc/machine-id:ro`).
+
+The native Bootstrap graph has an explicit preparation exchange before the
+configuration issuer's first read. It retains a fresh private producer/cache in
+the same resident Job and preserves that Root's original GNU and control SDK
+Keeper. A subsequent configuration exchange transfers the actual readonly
+original descriptor into that slot before validating its bytes. Every input
+endpoint only shortens the same original bound; binding hashes are DATA.
+
+These APIs require the actual source/config issuers to remain held and checked
+by the caller. They do not reconstruct Trust owners over IPC. The ordered
+configuration set admits at most64 files and4MiB aggregate captured bytes.
+Every include/profile needs its own retained issuer; the genuine getter applies
+the remaining file/byte limits to that issuer BEFORE allocation or capture. It provides no returning archive
+operation, authenticated reconnect, private-seed constructor, or full/default
+Bootstrap admission. Raw Darwin preparation stays refused until those connected
+operations and original-input/owner-loss controls are qualified.

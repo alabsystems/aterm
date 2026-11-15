@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bootstrap compatibility is decided by the installed pair, never candidate atpkg code.
+//! Bootstrap compatibility is decided by a pair, a `targo` shim's text and the helper it names,
+//! run in a disposable home. Two pairs are judged, each by its own check.
+//!
+//! `released-shim` runs the installed public release's pair, never candidate atpkg code.
 //! Relocation changes only the shim's baked store path. The helper stays the installed image.
+//!
+//! `candidate-shim` runs this tree's pair: the text this tree's atpkg lays for the store's
+//! `targo`, naming the `atpkg` this tree built, once under each placement the shim can select
+//! (`mac::Placement`). A pair no home can build with is red there, before it is a release: the
+//! installed pair shows a defect only once it is installed.
+//!
 //! All leases, ownership records, Cargo state and artifacts go to scratch; SBPL enforces that
 //! the real toolchain, registry and build caches cannot be written, even by build scripts.
-//! The installed helper retains its normal account-wide capacity-ledger bookkeeping.
+//! The helper retains its normal account-wide capacity-ledger bookkeeping.
 
 use crate::{Ctx, Scope, ladder::Report};
 
@@ -38,8 +47,10 @@ fn bootstrap_input(path: &str, confined: &[String]) -> bool {
 
 /// The line of a refused build that says why.
 #[cfg(target_os = "macos")]
-fn refusal(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr)
+fn refusal(output: &crate::exec::MachineRun) -> String {
+    output
+        .run
+        .output
         .lines()
         .find(|line| line.contains("refused") || line.starts_with("error:"))
         .unwrap_or("see child output")
@@ -76,39 +87,76 @@ pub struct Judged {
 /// THE RELEASED-SHIM JUDGMENT of the checkout at `root`: the installed public release's shim
 /// and helper build its tracked files' `aterm-time` offline in a disposable home. `inputs`
 /// names what makes it owed, for its row. The check's stage ([`run`]) and a release's early ask
-/// of its own tree (`ship release`, step 1) both make it here, so both say the same words.
+/// of its own tree (`ship release`, step 1) share the supervised judgment and its words.
 /// What it finds depends on which release is public and installed as well as on the tree: it
 /// can turn red with no change to the tree.
 #[must_use]
 pub fn judge(root: &std::path::Path, env: &crate::EnvSnapshot, inputs: &[String]) -> Judged {
+    judge_with_exec(
+        root,
+        env,
+        inputs,
+        crate::exec::ExecEnv {
+            events: None,
+            cwd: root,
+            path: &env.path,
+            scratch: root,
+            child_ceiling: None,
+            remove_env: &[],
+            add_env: &[],
+            stage_groups: None,
+            host: &crate::exec::LIVE_HOST,
+            hang_samples: None,
+        },
+    )
+}
+
+fn judge_with_exec(
+    root: &std::path::Path,
+    env: &crate::EnvSnapshot,
+    inputs: &[String],
+    execution: crate::exec::ExecEnv<'_>,
+) -> Judged {
     #[cfg(target_os = "macos")]
     {
-        match mac::judge(root, env) {
-            Ok((judging, output)) if output.status.success() => Judged {
+        match mac::judge(root, env, execution) {
+            Ok((judging, output)) if output.run.ok => Judged {
                 verdict: Verdict::Accepted,
                 row: format!(
                     "released-shim: {} built aterm-time; inputs: {}",
                     judging.who(),
                     inputs.join(", ")
                 ),
-                output: String::from_utf8_lossy(&output.stderr).into_owned(),
+                output: output.run.output,
             },
-            Ok((judging, output)) => Judged {
-                verdict: Verdict::Refused,
-                row: format!(
-                    "released-shim: {} refuses candidate ({}); incompatible bootstrap inputs: \
-                     {}; {}; land shim support first, release it, then adopt the configuration",
-                    judging.who(),
-                    output.status,
-                    inputs.join(", "),
-                    refusal(&output)
-                ),
-                output: format!(
+            Ok((judging, output)) => {
+                let diagnostic = format!(
                     "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            },
+                    output.stdout.as_deref().unwrap_or(""),
+                    output.run.output
+                );
+                let Some(code) = output.run.code else {
+                    return Judged {
+                        verdict: Verdict::Undecided,
+                        row: format!(
+                            "released-shim: {} bootstrap did not complete; see child output",
+                            judging.who()
+                        ),
+                        output: diagnostic,
+                    };
+                };
+                Judged {
+                    verdict: Verdict::Refused,
+                    row: format!(
+                        "released-shim: {} refuses candidate (exit status: {code}); incompatible bootstrap inputs: \
+                         {}; {}; land shim support first, release it, then adopt the configuration",
+                        judging.who(),
+                        inputs.join(", "),
+                        refusal(&output)
+                    ),
+                    output: diagnostic,
+                }
+            }
             Err(why) => Judged {
                 verdict: Verdict::Undecided,
                 row: format!("released-shim: {why}"),
@@ -118,7 +166,7 @@ pub fn judge(root: &std::path::Path, env: &crate::EnvSnapshot, inputs: &[String]
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (root, env, inputs);
+        let _ = (root, env, inputs, execution);
         Judged {
             verdict: Verdict::NotThisHost,
             row: "released-shim: macOS installed-app bootstrap lane (run on a Mac)".into(),
@@ -147,7 +195,7 @@ pub(crate) fn run(ctx: &Ctx, report: &mut Report) {
         report.pass("released-shim: no executable bootstrap inputs changed; no child build");
         return;
     }
-    let judged = judge(&ctx.root, &ctx.env, &inputs);
+    let judged = judge_with_exec(&ctx.root, &ctx.env, &inputs, ctx.exec_env());
     report.raw(judged.output);
     match judged.verdict {
         Verdict::Accepted => report.pass(judged.row),
@@ -157,14 +205,54 @@ pub(crate) fn run(ctx: &Ctx, report: &mut Report) {
     }
 }
 
+/// The name of the helper `candidate-shim` builds from this tree: atpkg's own `[[bin]]`, whose
+/// `__build_admit` front is the one the app's `atpkg` runs.
+pub(crate) const CANDIDATE_HELPER_BIN: &str = "atpkg";
+
+/// Why `candidate-shim` builds and judges nothing on this OS, where it does not: the pair it
+/// judges is macOS's.
+pub(crate) const CANDIDATE_ELSEWHERE: Option<&str> = if cfg!(target_os = "macos") {
+    None
+} else {
+    Some("candidate-shim: macOS bootstrap lane (run on a Mac)")
+};
+
+/// This tree's pair, `helper` being the `atpkg` it built, judged under each placement: one row
+/// each, and a red under one does not keep the others from being judged.
+pub(crate) fn run_candidate(ctx: &Ctx, report: &mut Report, helper: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    mac::candidate(&ctx.root, &ctx.env, helper, ctx.exec_env(), report);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (ctx, helper);
+        report.skip(CANDIDATE_ELSEWHERE.unwrap_or_default());
+    }
+}
+
 #[cfg(test)]
 #[path = "released_shim_tests.rs"]
 mod tests;
 
+/// The fetched public release tags the check picks its judging release from
+/// ([`mac::public_releases`]): what the land seal names as the check's release tags
+/// ([`crate::land_seal::RELEASE_TAGS`]).
+///
+/// # Errors
+/// The tags could not be listed, or the workspace version is no release version.
+#[cfg(target_os = "macos")]
+pub(crate) fn public_releases(
+    root: &std::path::Path,
+    env: &crate::EnvSnapshot,
+    head: &str,
+    current: &str,
+) -> Result<Vec<String>, String> {
+    mac::public_releases(root, env, head, current)
+}
+
 #[cfg(target_os = "macos")]
 mod mac {
-    use crate::EnvSnapshot;
-    use std::os::unix::fs::DirBuilderExt as _;
+    use crate::{EnvSnapshot, exec};
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -173,6 +261,63 @@ mod mac {
 
     fn io<T, E: std::fmt::Display>(value: Result<T, E>) -> Result<T, String> {
         value.map_err(|e| e.to_string())
+    }
+
+    /// `MAJOR.MINOR.0` of a public release's version or `v`-tag; `None` for anything else.
+    fn release_version(text: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = text.strip_prefix('v').unwrap_or(text).split('.');
+        let version = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        );
+        (parts.next().is_none() && version.2 == 0).then_some(version)
+    }
+
+    /// Every fetched public release tag (`vMAJOR.MINOR.0`) no newer than the workspace version
+    /// `current` and reachable from `head`, by version, oldest first.
+    pub(super) fn public_releases(
+        root: &Path,
+        env: &EnvSnapshot,
+        head: &str,
+        current: &str,
+    ) -> Result<Vec<String>, String> {
+        let current = release_version(current)
+            .ok_or_else(|| format!("workspace version {current:?} is not MAJOR.MINOR.0"))?;
+        let mut cmd = crate::git_provider::command();
+        for name in crate::changed::GIT_REDIRECTS {
+            cmd.env_remove(name);
+        }
+        cmd.current_dir(root).env("PATH", &env.path).args([
+            "for-each-ref",
+            &format!("--merged={head}"),
+            "--format=%(refname:strip=2)",
+            "refs/tags/v*",
+        ]);
+        // A hang detector, as for the listing below.
+        let out = io(aterm_uds::deadline::output_while_process_progressing(
+            &mut cmd,
+            Duration::from_secs(60),
+            "the candidate's release tags",
+        ))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git for-each-ref exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let listed = String::from_utf8(out.stdout)
+            .map_err(|_| "git for-each-ref returned non-UTF-8 text".to_string())?;
+        let mut releases: Vec<_> = listed
+            .lines()
+            .filter_map(|tag| {
+                let version = release_version(tag)?;
+                (version <= current).then(|| (version, tag.trim_start_matches('v').to_owned()))
+            })
+            .collect();
+        releases.sort_unstable();
+        Ok(releases.into_iter().map(|(_, name)| name).collect())
     }
 
     fn git_files(root: &Path, env: &EnvSnapshot) -> Result<Vec<PathBuf>, String> {
@@ -272,7 +417,7 @@ mod mac {
     /// WHICH INSTALLED APP MAY JUDGE: a public release that is the newest fetched public tag in
     /// the candidate's ancestry, or the one immediately before it. `installed` is the first line
     /// of the app's `--version`, `releases` those tags' versions, oldest first
-    /// ([`crate::harness_debt::public_releases`]). In the hours after a release is published a
+    /// ([`public_releases`]). In the hours after a release is published a
     /// Mac that has fetched its tag and not yet updated still judges, and its row says with
     /// which release; a development build, a release two or more behind and one no fetched tag
     /// names decide nothing.
@@ -319,6 +464,77 @@ mod mac {
                  bootstrap compatibility"
             ),
         })
+    }
+
+    /// A home and a call the shim places a build's intermediates by, named for the placement
+    /// this tree's shim selects there. The shim selects and the helper must admit what it
+    /// selected: aterm 0.199.0's shim took its in-tree fallback in [`Self::NewHome`] and its
+    /// helper refused it, and a shim that walks to the first folder that stands refuses under
+    /// [`Self::NoCache`] with a helper that owes that build a record it cannot lay.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Placement {
+        /// The shared cache, in a home whose `Library/Caches` may be written: an account's.
+        SharedCache,
+        /// A home with no `Library` at all, as a new account's or a container's: the shared
+        /// cache, made through the folders that home lacks.
+        NewHome,
+        /// The in-tree fallback, in a home whose `Library/Caches` stands and cannot be written.
+        NoCache,
+        /// Under a target directory the caller chose (`--target-dir`), in an account's home.
+        ChosenTarget,
+    }
+
+    impl Placement {
+        /// Every placement, in the order their rows are written.
+        pub(super) const ALL: [Self; 4] = [
+            Self::SharedCache,
+            Self::NewHome,
+            Self::NoCache,
+            Self::ChosenTarget,
+        ];
+
+        /// What a row calls it.
+        pub(super) const fn name(self) -> &'static str {
+            match self {
+                Self::SharedCache => "the shared cache (a home with a writable Library/Caches)",
+                Self::NewHome => "a new home (no Library folder: the shared cache is made there)",
+                Self::NoCache => {
+                    "the no-cache fallback (a home whose Library/Caches cannot be written)"
+                }
+                Self::ChosenTarget => "a caller's --target-dir",
+            }
+        }
+
+        /// The home's `Library/Caches` as this placement has it: its mode, or `None` where the
+        /// home has no `Library`.
+        const fn caches_mode(self) -> Option<u32> {
+            match self {
+                Self::SharedCache | Self::ChosenTarget => Some(0o700),
+                Self::NewHome => None,
+                Self::NoCache => Some(0o500),
+            }
+        }
+    }
+
+    /// Whose shim text and helper a rig runs.
+    #[derive(Clone, Copy)]
+    pub(super) enum Pair<'a> {
+        /// The installed public release's: its store's shim with only the store path rebased,
+        /// naming the helper in the installed `aterm.app`.
+        Installed,
+        /// This tree's: the shim this tree's atpkg lays for the store's `targo`
+        /// (`atpkg::platform::canonical_build_hop_shim`), naming `helper`.
+        Candidate { helper: &'a Path },
+    }
+
+    impl Pair<'_> {
+        /// The check that judges this pair, for the line that names a rig it kept.
+        const fn check(self) -> &'static str {
+            match self {
+                Self::Installed => "released-shim",
+                Self::Candidate { .. } => "candidate-shim",
+            }
+        }
     }
 
     /// This machine's package store: its prefix, and the text of its `targo` shim.
@@ -372,6 +588,31 @@ mod mac {
             }
             Ok(line.to_owned())
         }
+
+        /// The shim `pair` runs, for this store rebased to `local`.
+        fn shim(&self, pair: Pair<'_>, local: &Path) -> Result<String, String> {
+            match pair {
+                Pair::Installed => relocate(&self.text, &self.prefix, local),
+                Pair::Candidate { helper } => {
+                    let installed = self.prefix.join("bin/targo");
+                    let target = atpkg::platform::resolve_shim(&installed)
+                        .ok_or("the store's targo shim names no program")?;
+                    let target =
+                        local.join(target.strip_prefix(&self.prefix).map_err(
+                            |_| "the store's targo shim runs a program outside the store",
+                        )?);
+                    // The exports are the toolchain package's, not an aterm version's.
+                    let exports = atpkg::platform::shim_env_of(&installed);
+                    let laid = io(atpkg::platform::canonical_build_hop_shim(
+                        &local.join("bin/targo"),
+                        &target,
+                        &exports,
+                        helper,
+                    ))?;
+                    String::from_utf8(laid.body).map_err(|e| e.to_string())
+                }
+            }
+        }
     }
 
     pub(super) struct Rig {
@@ -381,24 +622,39 @@ mod mac {
         shim: PathBuf,
         cargo: PathBuf,
         rustup: PathBuf,
-        /// Who judges, for a row: the installed app's `--version` line.
+        placement: Placement,
+        /// The check whose pair this rig runs ([`Pair::check`]).
+        check: &'static str,
+        /// Who judges, for a row: the installed app's `--version` line, or this tree's pair.
         pub(super) label: String,
     }
 
     impl Rig {
-        pub(super) fn new(env: &EnvSnapshot, store: &Store, label: String) -> Result<Self, String> {
+        pub(super) fn new(
+            env: &EnvSnapshot,
+            store: &Store,
+            pair: Pair<'_>,
+            label: String,
+            placement: Placement,
+        ) -> Result<Self, String> {
             let scratch = io(aterm_tempfile::tempdir())?;
             let home = io(scratch.path().canonicalize())?;
-            // Model the standard account cache parent without any managed cache or marker: a
-            // macOS HOME has ~/Library/Caches. Without it the installed 0.199.0 shim refuses
-            // its first build there (ATERM-KI-1112-154), which no real HOME ever meets.
-            // This lane judges the installed shim's configuration support, independently of
-            // whether an older helper can bootstrap missing account directories. The judgment
-            // is one build, the first in its home, and its custody stays entirely in scratch.
-            io(fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(home.join("Library/Caches")))?;
+            // Model the account cache parent the placement names, without any managed cache
+            // or marker: the shim places a build by the first of the cache's folders that
+            // stands and whether it may be written, and the helper makes the rest. A judgment
+            // is one build, the first in its home, so it is of the placement named, and its
+            // custody stays entirely in scratch.
+            if let Some(mode) = placement.caches_mode() {
+                let caches = home.join("Library/Caches");
+                io(fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&caches))?;
+                io(fs::set_permissions(
+                    &caches,
+                    fs::Permissions::from_mode(mode),
+                ))?;
+            }
             let prefix = &store.prefix;
             let local = home.join("pkg");
             let trust = local.join("store/trust");
@@ -420,10 +676,7 @@ mod mac {
                 }
             }
             let shim = home.join("targo");
-            io(fs::write(
-                &shim,
-                relocate(&store.text, &store.prefix, &local)?,
-            ))?;
+            io(fs::write(&shim, store.shim(pair, &local)?))?;
             let cargo = home.join(".cargo");
             io(fs::create_dir_all(&cargo))?;
             let installed_home = env.tool_home.as_deref().unwrap_or(&env.home);
@@ -468,6 +721,8 @@ mod mac {
                 shim,
                 cargo,
                 rustup,
+                placement,
+                check: pair.check(),
                 label,
             })
         }
@@ -486,7 +741,36 @@ mod mac {
             Ok(cmd)
         }
 
-        pub(super) fn build(&self) -> Result<std::process::Output, String> {
+        fn run_build(
+            &self,
+            command: &aterm_uds::spawnfd::Command,
+            env: exec::ExecEnv<'_>,
+        ) -> exec::MachineRun {
+            let argv: Vec<_> = std::iter::once(command.get_program().to_owned())
+                .chain(command.get_args().map(std::ffi::OsStr::to_owned))
+                .collect();
+            let envs = command
+                .get_envs()
+                .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
+                .collect();
+            let mut command = exec::Cmd::replayed(&argv, &self.tree, envs);
+            command.hang_after = Some(Duration::from_secs(60));
+            // The installed helper marks genuine admission waits. Keep both those marks and
+            // captured diagnostics inside the sandbox's existing writable scratch root, and
+            // suspend the inactivity detector during those waits. A progressing build has
+            // no elapsed-work limit; one minute without output or CPU/I/O proves a hang.
+            let env = exec::ExecEnv {
+                scratch: &self.home,
+                child_ceiling: None,
+                ..env
+            };
+            exec::run_machine(&command, env, Some(self.check))
+        }
+
+        pub(super) fn build(
+            &self,
+            execution: exec::ExecEnv<'_>,
+        ) -> Result<exec::MachineRun, String> {
             let mut cmd = self.sandbox()?;
             cmd.arg("/bin/sh").arg(&self.shim).args([
                 "--unverified",
@@ -498,14 +782,10 @@ mod mac {
                 "--lib",
                 "--message-format=json",
             ]);
-            // A hang detector, not a latency budget: the build may take as long as a loaded
-            // Mac makes it, and is ended only once its output and its descendants' CPU and
-            // I/O stay still for a minute.
-            io(aterm_uds::deadline::output_while_process_progressing(
-                &mut cmd,
-                Duration::from_secs(60),
-                "the installed shim's offline aterm-time build",
-            ))
+            if self.placement == Placement::ChosenTarget {
+                cmd.arg("--target-dir").arg(self.home.join("chosen-target"));
+            }
+            Ok(self.run_build(&cmd, execution))
         }
 
         /// The candidate's tracked files, snapshotted into the rig, and the rig's one build of
@@ -514,7 +794,8 @@ mod mac {
             self,
             root: &Path,
             env: &EnvSnapshot,
-        ) -> Result<std::process::Output, String> {
+            execution: exec::ExecEnv<'_>,
+        ) -> Result<exec::MachineRun, String> {
             let result = (|| {
                 for path in git_files(root, env)? {
                     let from = root.join(&path);
@@ -523,8 +804,10 @@ mod mac {
                         copy_file(&from, &self.tree.join(path))?;
                     }
                 }
-                let output = self.build()?;
-                if output.status.success() && !built_artifact(&output.stdout, &self.home) {
+                let output = self.build(execution)?;
+                if output.run.ok
+                    && !built_artifact(output.stdout.as_deref()?.as_bytes(), &self.home)
+                {
                     return Err(format!(
                         "{} exited successfully without an aterm-time library artifact",
                         self.label
@@ -532,24 +815,22 @@ mod mac {
                 }
                 Ok(output)
             })();
+            let check = self.check;
             match result {
                 Err(why) => {
                     let retained = self._scratch.keep();
                     Err(format!(
-                        "{why}; released-shim failure inputs retained at {}",
+                        "{why}; {check} failure inputs retained at {}",
                         retained.display()
                     ))
                 }
                 Ok(mut output) => {
-                    if !output.status.success() {
+                    if !output.run.ok {
                         let retained = self._scratch.keep();
-                        output.stderr.extend_from_slice(
-                            format!(
-                                "\nreleased-shim failure inputs retained at {}\n",
-                                retained.display()
-                            )
-                            .as_bytes(),
-                        );
+                        output.run.output.push_str(&format!(
+                            "\n{check} failure inputs retained at {}\n",
+                            retained.display()
+                        ));
                     }
                     Ok(output)
                 }
@@ -560,7 +841,8 @@ mod mac {
     pub(super) fn judge(
         root: &Path,
         env: &EnvSnapshot,
-    ) -> Result<(Judging, std::process::Output), String> {
+        execution: exec::ExecEnv<'_>,
+    ) -> Result<(Judging, exec::MachineRun), String> {
         let manifest = io(fs::read_to_string(root.join("Cargo.toml")))?;
         let manifest: aterm_toml::Value =
             aterm_toml::from_str(&manifest).map_err(|e| e.to_string())?;
@@ -571,17 +853,82 @@ mod mac {
             .and_then(aterm_toml::Value::as_str)
             .ok_or("workspace has no version")?;
         let head = crate::head_commit(root, &env.path).ok_or("candidate has no HEAD")?;
-        let releases: Vec<String> =
-            crate::harness_debt::public_releases(root, &env.path, &head, current)?
-                .into_iter()
-                .map(|(version, _)| version)
-                .collect();
+        let releases = public_releases(root, env, &head, current)?;
         let store = Store::read(env)?;
         let installed = store.release()?;
         let judging = judging_release(&installed, &releases)?;
-        let rig = Rig::new(env, &store, installed)?;
-        let output = rig.first_build(root, env)?;
+        let rig = Rig::new(
+            env,
+            &store,
+            Pair::Installed,
+            installed,
+            Placement::SharedCache,
+        )?;
+        let output = rig.first_build(root, env, execution)?;
         Ok((judging, output))
+    }
+
+    /// What a row calls this tree's pair.
+    const CANDIDATE: &str = "this tree's shim and atpkg";
+
+    /// This tree's pair under `placement`: a fresh home, one build.
+    pub(super) fn judge_candidate(
+        root: &Path,
+        env: &EnvSnapshot,
+        helper: &Path,
+        placement: Placement,
+        execution: exec::ExecEnv<'_>,
+    ) -> Result<exec::MachineRun, String> {
+        let store = Store::read(env)?;
+        let rig = Rig::new(
+            env,
+            &store,
+            Pair::Candidate { helper },
+            CANDIDATE.to_owned(),
+            placement,
+        )?;
+        rig.first_build(root, env, execution)
+    }
+
+    /// `candidate-shim`'s rows: [`judge_candidate`] under each of [`Placement::ALL`].
+    pub(super) fn candidate(
+        root: &Path,
+        env: &EnvSnapshot,
+        helper: &Path,
+        execution: exec::ExecEnv<'_>,
+        report: &mut crate::ladder::Report,
+    ) {
+        for placement in Placement::ALL {
+            let under = placement.name();
+            match judge_candidate(root, env, helper, placement, execution) {
+                Ok(output) if output.run.ok => {
+                    report.raw(output.run.output);
+                    report.pass(format!(
+                        "candidate-shim: {CANDIDATE} built aterm-time under {under}"
+                    ));
+                }
+                Ok(output) => {
+                    report.raw(output.stdout.as_deref().unwrap_or("").to_owned());
+                    report.raw(output.run.output.clone());
+                    // A build ended with no exit code (a hang, a signal) decided nothing.
+                    let Some(code) = output.run.code else {
+                        report.cannot_run(format!(
+                            "candidate-shim: {CANDIDATE} did not complete a first build under \
+                             {under}; see child output"
+                        ));
+                        continue;
+                    };
+                    report.fail(format!(
+                        "candidate-shim: {CANDIDATE} refuse a first build under {under} (exit \
+                         status: {code}); {}; a release cut from this tree would refuse that \
+                         build on every Mac it is installed on: fix the shim or the helper \
+                         before it is released",
+                        super::refusal(&output)
+                    ));
+                }
+                Err(why) => report.cannot_run(format!("candidate-shim: under {under}: {why}")),
+            }
+        }
     }
 
     fn built_artifact(output: &[u8], home: &Path) -> bool {

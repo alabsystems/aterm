@@ -393,7 +393,7 @@ fn the_lift_is_read_off_the_held_tabs_record() {
 
 #[test]
 fn the_land_drills_stub_answer_is_a_clean_defense() {
-    use aterm_agent::supervise::policy::turn_end::clean_defense;
+    use alab_policy::open_work::clean_defense;
     assert!(clean_defense(Some(LANDED_TEXT)), "{LANDED_TEXT}");
     assert!(!clean_defense(Some(
         "Committed and pushed the lab's work; nothing is left to do.\nATERM-TASK-DONE"
@@ -402,7 +402,7 @@ fn the_land_drills_stub_answer_is_a_clean_defense() {
 
 #[test]
 fn the_land_drills_stub_answers_the_land_check_with_the_word_that_lands() {
-    use aterm_agent::supervise::policy::land_check::LAND_CHECK;
+    use alab_policy::land_check::LAND_CHECK;
     let mode = landed_mode();
     let reply = |last: &str| {
         crate::stub::scripted_reply(&mode, &["the task".to_string(), last.to_string()])

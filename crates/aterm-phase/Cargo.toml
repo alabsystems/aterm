@@ -16,11 +16,13 @@ description = "aterm — the worker-phase reader: busy | prompt | limited | idle
 [lints]
 workspace = true
 
-# One dependency, by design: the reader is pure functions over `&[String]` rows, linked by
-# `aterm-agent` (`aterm drive`) and `aterm-gui` (the server's agent verdict, relayed by the
-# fabric as `phase=`). It names a program's agent by aterm-agent-names, the one name table,
-# which a crate deny.toml keeps from the reader reads directly.
+# Two dependencies, both std only, by design: the reader is pure functions over `&[String]` rows,
+# linked by `aterm-agent` (`aterm drive`) and `aterm-gui` (the server's agent verdict, relayed by
+# the fabric as `phase=`). It names a program's agent by aterm-agent-names, the one name table,
+# which a crate deny.toml keeps from the reader reads directly, and joins a turn's messages by
+# alab-policy's one join (`alab_policy::text::join_messages`), which the turn-end readers split by.
 [dependencies]
+alab-policy = { workspace = true }
 aterm-agent-names = { workspace = true }
 
 [dev-dependencies]

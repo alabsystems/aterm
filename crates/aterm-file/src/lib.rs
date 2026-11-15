@@ -39,6 +39,8 @@ pub use layout::Root;
 pub use name::{Name, NotAName};
 #[cfg(any(unix, windows))]
 pub use outbox::Claim;
+#[cfg(any(test, debug_assertions))]
+pub use outbox::owner_act_for_test;
 pub use outbox::{
     Accepted, Done, Draft, Dropped, Edit, Held, Intent, Mark, Outbox, OwnerAct, Refused,
 };

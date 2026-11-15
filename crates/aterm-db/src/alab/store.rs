@@ -252,8 +252,6 @@ fn quiet(outcome: Outcome) -> Registered {
 /// can resume the existing idempotent importer; after completion even owner edits stay put.
 fn roster_migration(
     session: &Session<'_>,
-    scope: Scope,
-    table: &typed::Table,
     view: &View,
     now_ms: u64,
 ) -> Result<Vec<Vec<crate::database::Change>>> {
@@ -285,14 +283,43 @@ fn roster_migration(
             import::Mark::Absent
         }
     }
+    // Labels carry no secret: a store that holds nothing and takes nothing.
+    struct NoSecrets;
+    impl typed::secret::Store for NoSecrets {
+        fn vault(&self) -> Result<String> {
+            Err(Error::new("the roster's labels name no secret"))
+        }
+        fn admit(&self) -> Result<()> {
+            Err(Error::new("the roster's labels name no secret"))
+        }
+        fn put(&self, _: &str, _: &typed::secret::Secret) -> Result<()> {
+            Err(Error::new("the roster's labels name no secret"))
+        }
+        fn get(&self, _: &str) -> Result<Option<typed::secret::Secret>> {
+            Ok(None)
+        }
+        fn remove(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn owe(&self, _: &[String]) -> Result<()> {
+            Err(Error::new("the roster's labels name no secret"))
+        }
+        fn orphaned(&self) -> Result<std::collections::BTreeSet<String>> {
+            Ok(std::collections::BTreeSet::new())
+        }
+        fn cleared(&self, _: &std::collections::BTreeSet<String>) -> Result<()> {
+            Ok(())
+        }
+        fn paid(&self, _: &std::collections::BTreeSet<String>) -> Result<()> {
+            Ok(())
+        }
+    }
     let macs = super::command::known_macs_from_roster(&roster);
-    let name = format!("{}/{}", table.application, table.role);
-    let sealer = crate::att::sealer(&name, session, scope)?;
     let input = import::Input {
         sheets: &[],
         macs: &macs,
         vendors: &LabelsOnly,
-        sealer: &sealer,
+        store: &NoSecrets,
         now_ms,
         births: import::Births::Listed,
         unread: &[],
@@ -354,8 +381,8 @@ fn planned(
     now_ms: u64,
 ) -> Result<register::Plan> {
     // An enrollment with a facts row is bound, and its lineage decides nothing more, except
-    // whether a row it birthed and has not folded is a successor's birth rule 0 would have
-    // prevented (`register::fold`). Only a pass that could fold it reads the lineage
+    // whether the row it binds, a birth of a writer of its chain it has not folded, is one rule 0
+    // would have prevented (`register::fold`). Only a pass that could fold it reads the lineage
     // (`register::may_fold`), so a bound Mac with nothing to fold pays nothing for it, and a
     // refresh cannot fail on it: where it cannot be verified now, that row is refreshed as it
     // stands and a later pass folds it.
@@ -452,6 +479,87 @@ impl Registry {
         })
     }
 
+    /// Start this Mac's registry at the newest generation this build compiles, as a lab whose
+    /// Macs all run this build: declare and enroll it, and write this Mac's cover row restating
+    /// an empty earlier generation, which makes a later generation whole
+    /// ([`crate::att::View::complete`]).
+    ///
+    /// # Errors
+    /// As [`Self::open`], or the cover row cannot be written.
+    #[cfg(any(test, debug_assertions))]
+    pub fn open_newest(&self, now_ms: u64) -> Result<Scope> {
+        let newest = crate::att::REGISTRY
+            .chain()
+            .last()
+            .copied()
+            .ok_or_else(|| Error::new("the registry has no generation"))?;
+        application::with_store(
+            &self.paths,
+            true,
+            descriptor(newest),
+            |session, store, scope| {
+                session.writer()?;
+                let uuid = session
+                    .members()?
+                    .iter()
+                    .find(|binding| binding.actor() == session.actor())
+                    .map(|binding| crate::typed::keys::uuid32(binding.machine()))
+                    .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
+                let changes = super::roll::cover_row(
+                    &crate::typed::cell::Projection::default(),
+                    newest.generation - 1,
+                    &uuid,
+                    &std::collections::BTreeMap::new(),
+                    0,
+                    now_ms,
+                )?;
+                let command = Command::Write {
+                    request: crate::crypto::random()?,
+                    changes,
+                };
+                application::append(session, store, &command.encode()?)?;
+                Ok(scope)
+            },
+        )
+    }
+
+    /// Seal `text` into `collection.column` of row `pk`, as a build up to 0.200.0 sealed whatever
+    /// its `set … --stdin` or its grid was given. This build seals only a phone's number and
+    /// writes no secret into a generation that holds one sealed, so a test of what such a cell
+    /// shows writes it here.
+    ///
+    /// # Errors
+    /// The generation here has no such column, or the write is refused.
+    #[cfg(any(test, debug_assertions))]
+    pub fn seal_as_older(
+        &self,
+        collection: &str,
+        pk: &str,
+        column: &str,
+        text: &str,
+    ) -> Result<()> {
+        use typed::cell::{CellKey, CellValue, change};
+        let handle = crate::att::Handle::at(self.paths.clone(), &crate::att::REGISTRY);
+        let collection = handle.compiled().collection(collection)?;
+        handle
+            .commit_owner_sealed(|_, sealer| {
+                let token = sealer.seal(
+                    collection.name,
+                    pk,
+                    column,
+                    &typed::secret::Secret::new(text.to_owned()),
+                )?;
+                let key = CellKey {
+                    pk,
+                    col: column,
+                    elem: None,
+                };
+                let value = CellValue::owner(collection.version, aterm_json::Value::String(token));
+                Ok(((), vec![vec![change(collection, key, &value)?]]))
+            })
+            .map(|_| ())
+    }
+
     /// Read the registry this Mac holds, without enrolling it.
     ///
     /// # Errors
@@ -509,7 +617,8 @@ impl Registry {
                 }
                 let packed = pack(seeds::rows_for(&view.cells)?)?;
                 let packed_len = packed.len();
-                for (index, changes) in packed.into_iter().enumerate() {
+                for (index, mut changes) in packed.into_iter().enumerate() {
+                    crate::att::conform(compiled.table, &mut changes)?;
                     let request = typed::request_id(APPLICATION, compiled.table.role, &changes)?;
                     let command = Command::Write { request, changes };
                     if log.retry(session.actor(), &command)?.is_some() {
@@ -643,8 +752,9 @@ impl Registry {
                 }
                 let mut migrated = 0;
                 if heard {
-                    let rows = roster_migration(session, scope, compiled.table, &view, now_ms)?;
-                    for changes in pack(rows)? {
+                    let rows = roster_migration(session, &view, now_ms)?;
+                    for mut changes in pack(rows)? {
+                        crate::att::conform(compiled.table, &mut changes)?;
                         if !quota_room(session, &log, &view, 0) {
                             return Ok(Registered {
                                 outcome: Outcome::QuotaSpent,
@@ -664,7 +774,8 @@ impl Registry {
                     }
                 }
                 let lineage = || former(&origin, session);
-                let plan = planned(session, trust, &view, probe, lineage, heard, now_ms)?;
+                let mut plan = planned(session, trust, &view, probe, lineage, heard, now_ms)?;
+                crate::att::conform(compiled.table, &mut plan.changes)?;
                 if plan.changes.is_empty() {
                     return Ok(Registered {
                         outcome: plan.outcome,
@@ -761,6 +872,8 @@ impl Registry {
                     findings,
                     changes,
                 } = discover::plan(&input, &view.cells, obs)?;
+                let mut changes = changes;
+                crate::att::conform(compiled.table, &mut changes)?;
                 if changes.is_empty() {
                     return Ok(Discovered {
                         outcome,
@@ -860,6 +973,8 @@ impl Registry {
                     marked,
                     rested: _,
                 } = observe::plan(&input, &view.cells, obs)?;
+                let mut changes = changes;
+                crate::att::conform(compiled.table, &mut changes)?;
                 let done = |records| Observed {
                     quiet: None,
                     born,
@@ -1020,8 +1135,9 @@ impl Registry {
         crate::att::Handle::at(self.paths.clone(), &crate::att::REGISTRY).publish_schema()
     }
 
-    /// Append `records` as this Mac, one record each (tests drive owner edits, births and
-    /// owned rows with it).
+    /// Append `records` as this Mac, one record each, as they are: unchecked, as any build or a
+    /// writer that skipped a check could append them (tests drive owner edits, births, owned rows
+    /// and stray candidates with it).
     #[cfg(any(test, debug_assertions))]
     pub fn write(&self, records: Vec<Vec<crate::database::Change>>) -> Result<()> {
         let compiled = self.generation();

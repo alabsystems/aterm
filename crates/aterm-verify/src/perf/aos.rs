@@ -90,11 +90,9 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
     for build in [Build::Release, Build::OptTest] {
         let args = build.args();
         eprintln!("  $ {}", driver.display_workspace("build", &args));
-        let out = driver
-            .workspace_command("build")?
-            .args(&args)
-            .current_dir(workspace_root())
-            .output()
+        let mut build_command = driver.workspace_command("build")?;
+        build_command.args(&args).current_dir(workspace_root());
+        let out = super::driver::compiler_output(&mut build_command)
             .map_err(|e| format!("could not run targo build: {e}"))?;
         if !out.status.success() {
             return Err(Halt::Fail(format!(

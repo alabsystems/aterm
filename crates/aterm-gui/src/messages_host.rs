@@ -672,7 +672,9 @@ impl App {
 
     /// Resolves live row `id` as `Answered` with `label` and syncs the center ([`Self::sync_messages`]).
     pub(crate) fn answer_message(&mut self, id: MessageId, label: &str) -> bool {
-        let answered = self.messages.answer(id, label, Instant::now());
+        let answered = self
+            .messages
+            .answer(id, label, self.messages_wall.now(), Instant::now());
         if answered {
             self.sync_messages();
         }
@@ -861,6 +863,7 @@ impl App {
     /// Executes a plain-data [`Intent`] triggered from row `id` in window `wid`.
     pub(crate) fn perform_intent(&mut self, wid: WindowId, id: MessageId, intent: Intent) -> bool {
         let now = Instant::now();
+        let wall = self.messages_wall.now();
         let navigation = matches!(
             intent,
             Intent::OpenSettings { .. }
@@ -870,7 +873,7 @@ impl App {
                 | Intent::ReviewVaultSync
         );
         let performed = self.perform_intent_inner(wid, id, intent, now);
-        if navigation && performed && self.messages.mark_seen(id, now) {
+        if navigation && performed && self.messages.mark_seen(id, wall, now) {
             self.sync_messages();
         }
         performed
@@ -885,7 +888,7 @@ impl App {
     ) -> bool {
         match intent {
             Intent::Details => {
-                if self.messages.mark_seen(id, now) {
+                if self.messages.mark_seen(id, self.messages_wall.now(), now) {
                     self.sync_messages();
                 }
                 if self.consent_card_message == Some(id) {
@@ -1130,7 +1133,12 @@ impl App {
             };
         }
         let intent = if self.messages.live(id).is_some() {
-            let intent = self.messages.act(id, ActionIndex(action), Instant::now());
+            let intent = self.messages.act(
+                id,
+                ActionIndex(action),
+                self.messages_wall.now(),
+                Instant::now(),
+            );
             self.sync_messages();
             intent
         } else if self.messages.digest_entry(id).is_some() {

@@ -2,7 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! [`Command`], [`Stdio`] and [`Child`]: explicit stdio and guard inheritance, started on
-//! Darwin by one `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, with no parent fork.
+//! Darwin by one `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`, and on Linux by one clone that
+//! shares this process's memory until its exec (`super::clone_spawn`; below Linux 5.16 the same
+//! child runs in a copy, as a fork's would): no copy of this process on Darwin, nor from 5.16 on
+//! Linux.
 
 use super::{DISCLAIM_SPI, F_GETFL, F_SETFL, fcntl};
 use std::collections::BTreeMap;
@@ -199,7 +202,11 @@ pub struct Command {
     footprint: Option<trust_exec_policy::FootprintLimit>,
     /// End the child when this process dies ([`super::Tether`]).
     tether: bool,
-    /// Fork a tethered child on the calling thread ([`Self::tie_to_this_thread`]).
+    /// Refuse before birth unless the actual watcher route can be installed.
+    require_tether: bool,
+    /// A private helper endpoint for one prepared cohort, never a public guard.
+    entry_barrier: Option<OwnedFd>,
+    /// Start a tethered child on the calling thread ([`Self::tie_to_this_thread`]).
     #[cfg(all(test, target_os = "linux"))]
     this_thread: bool,
 }
@@ -266,6 +273,8 @@ impl Command {
             #[cfg(target_os = "macos")]
             footprint: None,
             tether: false,
+            require_tether: false,
+            entry_barrier: None,
             #[cfg(all(test, target_os = "linux"))]
             this_thread: false,
         }
@@ -698,7 +707,7 @@ impl Command {
         self
     }
 
-    /// TEST SEAM: fork a tethered child on the calling thread, not on one of the tether's
+    /// TEST SEAM: start a tethered child on the calling thread, not on one of the tether's
     /// spawners, so Linux's parent-death signal follows that thread and the child dies when the
     /// thread exits: the per-thread tie the spawners replace, kept as their control.
     #[cfg(all(test, target_os = "linux"))]
@@ -786,6 +795,39 @@ impl Command {
         })
     }
 
+    /// Own the actual dedicated cohort while its tether holds the requested
+    /// program before exec. A broker can retain this value before releasing
+    /// execution. Requires a real watcher route; no untethered fallback runs.
+    /// Create, release and drop this blocking owner off the GUI thread.
+    ///
+    /// # Errors
+    /// Actual pre-birth failures retain the attempt's no-child receipt. A
+    /// post-birth handshake failure retains the original spawned resource.
+    pub fn prepare_cohort(
+        &mut self,
+        attempt: super::BirthAttempt,
+    ) -> Result<PreparedCohort, super::SpawnFailure> {
+        self.require_tether();
+        self.with_dedicated_process_group(|command| {
+            super::birth::prepare_cohort(attempt, || {
+                let (barrier, endpoint) = super::entry_barrier::Parent::new()?;
+                struct Restore<'a> {
+                    command: &'a mut Command,
+                    previous: Option<OwnedFd>,
+                }
+                impl Drop for Restore<'_> {
+                    fn drop(&mut self) {
+                        self.command.entry_barrier = self.previous.take();
+                    }
+                }
+                let previous = command.entry_barrier.replace(endpoint);
+                let restore = Restore { command, previous };
+                let pending = restore.command.start_pending(Fallback::Inherit, true)?;
+                Ok((pending, barrier))
+            })
+        })
+    }
+
     /// Start the child in a new, self-led process group for this one spawn only: the
     /// command's configured process group is restored when this call returns or unwinds,
     /// so a borrowed command's later births keep the group their caller configured.
@@ -839,6 +881,46 @@ impl Command {
         self.start(Fallback::Piped, false)?.wait_with_output()
     }
 
+    /// Run `f` with [`Self::output`]'s defaults: unset stdin is null, and unset stdout and
+    /// stderr are piped. Explicit stdio and every other command setting stay as configured.
+    /// The temporary defaults are removed on return or unwind, so a supervisor can own the
+    /// ordinary spawn and reap without changing a later use of this command.
+    pub fn with_output_defaults<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        struct Restore<'a> {
+            command: &'a mut Command,
+            unset: [bool; 3],
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                for (slot, unset) in [
+                    &mut self.command.stdin,
+                    &mut self.command.stdout,
+                    &mut self.command.stderr,
+                ]
+                .into_iter()
+                .zip(self.unset)
+                {
+                    if unset {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        let unset = [
+            self.stdin.is_none(),
+            self.stdout.is_none(),
+            self.stderr.is_none(),
+        ];
+        self.stdin.get_or_insert_with(Stdio::null);
+        self.stdout.get_or_insert_with(Stdio::piped);
+        self.stderr.get_or_insert_with(Stdio::piped);
+        let restore = Restore {
+            command: self,
+            unset,
+        };
+        f(&mut *restore.command)
+    }
+
     /// Run the child to its end with unset stdio inherited.
     /// # Errors
     /// As [`Self::spawn`]'s, and waiting.
@@ -855,6 +937,29 @@ impl super::Tether for Command {
     fn tether(&mut self) -> &mut Self {
         self.tether = true;
         self
+    }
+}
+
+impl Command {
+    /// Require the routed parent-death watcher, refusing before spawn rather
+    /// than falling back to an untethered child or a parent-death signal alone.
+    /// On Linux the child must lead a new group or session. The helper still
+    /// has to arm its real watcher before executing the requested program.
+    /// This is no receipt that the child or any separate process group ended.
+    pub fn require_tether(&mut self) -> &mut Self {
+        self.tether = true;
+        self.require_tether = true;
+        self
+    }
+
+    fn check_required_tether(&self, routed: bool) -> io::Result<()> {
+        if self.require_tether && !routed {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the required parent-death watcher route is unavailable",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1111,6 +1216,18 @@ impl Child {
         self.observe_wait_result(result)
     }
 
+    /// Observe the terminal status without releasing this actual child's reservation.
+    /// # Errors
+    /// Custody was lost, the owning wait failed, or its terminal record was invalid.
+    pub(crate) fn exit_status_unreaped(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.handle.require_custody()?;
+        if let Some(status) = self.handle.status {
+            return Ok(Some(status));
+        }
+        let result = rusage::exit_status_unreaped(self.id());
+        self.observe_wait_result(result)
+    }
+
     /// The child's pid.
     #[must_use]
     pub fn id(&self) -> u32 {
@@ -1287,7 +1404,7 @@ fn set_nonblocking(fd: RawFd, on: bool) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 type Handle = super::LaneChild;
 
 #[cfg(target_vendor = "apple")]
@@ -1401,11 +1518,19 @@ impl Command {
         } else {
             None
         };
+        self.check_required_tether(routed.is_some())?;
         // The tether runs the program only after this spawn started it, so it reports its exec's
         // error back here ([`ExecStatus`]), and the spawn fails with it as a spawn of the program
         // itself would.
         let status = routed.is_some().then(ExecStatus::new).transpose()?;
         let mut env = self.env.capture();
+        env.retain(|(key, _)| key != super::entry_barrier::VAR);
+        if let Some(endpoint) = &self.entry_barrier {
+            env.push((
+                super::entry_barrier::VAR.into(),
+                endpoint.as_raw_fd().to_string().into(),
+            ));
+        }
         if let Some(status) = &status {
             use crate::tether::{OWN_PATH_VAR, STATUS_VAR};
             env.retain(|(key, _)| key != STATUS_VAR && key != OWN_PATH_VAR);
@@ -1534,6 +1659,10 @@ impl Command {
             let end = status.write.as_raw_fd();
             guards.push((end, end));
         }
+        if let Some(endpoint) = &self.entry_barrier {
+            let end = endpoint.as_raw_fd();
+            guards.push((end, end));
+        }
         let pid = super::platform::spawn(
             &image,
             &Placement {
@@ -1564,7 +1693,7 @@ impl Command {
 
 /// A `std` child: on drop collected if it has exited, else handed to
 /// [`crate::reaper`].
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 #[derive(Debug)]
 struct Handle {
     child: std::process::Child,
@@ -1572,7 +1701,7 @@ struct Handle {
     custody: super::WaitCustody,
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 impl Handle {
     fn require_custody(&self) -> io::Result<()> {
         self.custody.require()
@@ -1656,7 +1785,7 @@ impl Handle {
     }
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 impl Drop for Handle {
     fn drop(&mut self) {
         if matches!(self.try_wait(), Ok(None))
@@ -1707,35 +1836,45 @@ type ExecStatus = std::convert::Infallible;
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 impl ExecStatus {
-    /// A fresh pipe, both ends close-on-exec in this process, the write end above stdio: the
-    /// spawn hands that number on as it is, and the child's stdio, placed over 0 to 2, would
-    /// replace a write end there, or the program would inherit it as stdio when stdio is
-    /// inherited. Neither end is kept out of other children ([`crate::kept_out`]): close-on-exec
-    /// already keeps both out of every other spawn's program, and a mark would make the spawn
+    /// A fresh pipe, both ends close-on-exec in this process and above stdio: the spawn hands the
+    /// write end's number on as it is, and the child's stdio, placed over 0 to 2, would replace
+    /// a write end there; and an end on a number this process had closed would stand in for
+    /// that closed stdio, which an inherited slot passes on as `/dev/null`, so the program would
+    /// read or write the pipe there. Neither end is kept out of other children
+    /// ([`crate::kept_out`]): close-on-exec already keeps both out of every other spawn's
+    /// program, and a mark would make the spawn
     /// that hands the write end hold the spawn lock exclusively ([`crate::spawn_lock::handing`]),
     /// as its creation would, so each tethered spawn would wait for every spawn in flight and
     /// stall every later one behind it. A fork that does not exec (only tests fork here) holds a
     /// copy until it ends, which delays the status's end, as it does on Linux.
     fn new() -> io::Result<Self> {
-        use std::os::fd::FromRawFd as _;
         #[expect(
             clippy::disallowed_methods,
             reason = "the exec status is not kept out (above): a mark would make each tethered \
                       spawn hold the spawn lock exclusively to hand the tether its write end"
         )]
         let (read, write) = std::io::pipe()?;
-        let mut write = OwnedFd::from(write);
-        if write.as_raw_fd() < 3 {
-            // SAFETY: `fcntl` duplicates a descriptor this process owns onto the lowest free
-            // number from 3; the result is a fresh descriptor nothing else owns, or -1.
-            let above = unsafe { super::fcntl(write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-            if above < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: as above, the descriptor the call just made.
-            write = unsafe { OwnedFd::from_raw_fd(above) };
+        Ok(Self {
+            read: Self::above_stdio(OwnedFd::from(read))?.into(),
+            write: Self::above_stdio(OwnedFd::from(write))?,
+        })
+    }
+
+    /// `fd`, or where it sits on 0 to 2, a close-on-exec copy on the lowest free number from 3
+    /// (`fd` itself closed).
+    fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
+        use std::os::fd::FromRawFd as _;
+        if fd.as_raw_fd() > 2 {
+            return Ok(fd);
         }
-        Ok(Self { read, write })
+        // SAFETY: `fcntl` duplicates a descriptor this process owns onto the lowest free number
+        // from 3; the result is a fresh descriptor nothing else owns, or -1.
+        let above = unsafe { super::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if above < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above, the descriptor the call just made.
+        Ok(unsafe { OwnedFd::from_raw_fd(above) })
     }
 
     /// Once the tether was started: this process's write end closed, the read end read to its end.
@@ -1790,16 +1929,15 @@ impl Command {
             );
         }
         match self.forked() {
-            Ok((mut command, _)) => command.exec(),
+            Ok(mut command) => command.exec(),
             Err(error) => error,
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn start_pending(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<PendingChild> {
         super::note_spawn();
-        let (mut command, status) = self.forked()?;
-        #[cfg(target_os = "linux")]
-        let routed = status.is_some();
+        let mut command = self.forked()?;
         if self.stdin.is_none() && !needs_stdin {
             command.stdin(std::process::Stdio::null());
         }
@@ -1811,39 +1949,9 @@ impl Command {
                 command.stderr(std::process::Stdio::piped());
             }
         }
-        // Each try is one fork; the pause between tries runs here, on the calling thread, so a
-        // fork that runs on a spawner holds it for that fork alone.
-        #[cfg(target_os = "linux")]
-        let on_a_spawner = self.forks_on_the_spawner();
-        let command = std::sync::Arc::new(std::sync::Mutex::new(command));
-        let mut child = super::past_text_busy(
-            super::TEXT_BUSY_FOR,
-            || {
-                let command = std::sync::Arc::clone(&command);
-                let fork = move || {
-                    let mut command = command
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // The tether's watcher watches the thread that forks it, as the parent-death
-                    // signal follows it (`crate::tether::THREAD_VAR`).
-                    #[cfg(target_os = "linux")]
-                    if routed {
-                        // SAFETY: `gettid` takes nothing and cannot fail.
-                        let thread = unsafe { libc::syscall(libc::SYS_gettid) };
-                        command.env(crate::tether::THREAD_VAR, thread.to_string());
-                    }
-                    command.spawn()
-                };
-                #[cfg(target_os = "linux")]
-                if on_a_spawner {
-                    return crate::tether::spawned(fork);
-                }
-                fork()
-            },
-            super::text_busy_pause,
-        )?;
+        let mut child = super::spawn_past_text_busy(|| command.spawn())?;
         Ok(PendingChild {
-            status,
+            status: None,
             child: Child {
                 stdin: child.stdin.take(),
                 stdout: child.stdout.take(),
@@ -1860,23 +1968,10 @@ impl Command {
         })
     }
 
-    /// Whether the fork runs on one of the tether's spawners (`crate::tether::spawned`), threads
-    /// that live as long as this process, so the parent-death signal `bind` sets comes at this
-    /// process's death, not at the calling thread's: a tethered spawn's does, but one a test ties
-    /// to its own thread (`tie_to_this_thread`).
-    #[cfg(target_os = "linux")]
-    fn forks_on_the_spawner(&self) -> bool {
-        #[cfg(test)]
-        let this_thread = self.this_thread;
-        #[cfg(not(test))]
-        let this_thread = false;
-        self.tether && !this_thread
-    }
-
     /// The `std` command this one configures: its explicit descriptor policy first, then
-    /// the empty mask and session in one more hook; and, for one that runs through its tether
-    /// ([`Self::route`]), the exec status it hands that tether ([`ExecStatus`]).
-    fn forked(&self) -> io::Result<(super::StdCommand, Option<ExecStatus>)> {
+    /// the empty mask and session in one more hook. Linux's in-place exec, and every spawn where
+    /// neither Darwin's `posix_spawn` nor Linux's clone starts the child.
+    fn forked(&self) -> io::Result<super::StdCommand> {
         use super::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
         if self
@@ -1907,19 +2002,13 @@ impl Command {
                 "tethered commands do not forward explicit guards",
             ));
         }
-        #[cfg(target_os = "linux")]
-        let routed = self.route();
-        #[cfg(not(target_os = "linux"))]
-        let routed: Option<(std::path::PathBuf, Vec<OsString>)> = None;
+        // No command here runs through a tether: Linux's tethered spawn is its clone's.
+        self.check_required_tether(false)?;
         #[expect(
             clippy::disallowed_types,
             reason = "spawnfd's own Command, with its explicit descriptor policy installed before the native process hook"
         )]
-        let mut command = std::process::Command::new(
-            routed
-                .as_ref()
-                .map_or(self.program.as_os_str(), |(exe, _)| exe.as_os_str()),
-        );
+        let mut command = std::process::Command::new(&self.program);
         if self.inherit_all {
             // Trust's std strips every descriptor above stdio from a child unless told not to;
             // upstream's std hands on the whole non-close-on-exec table by itself.
@@ -1928,16 +2017,9 @@ impl Command {
         } else {
             command.inherit_nothing();
         }
-        match &routed {
-            Some((_, args)) => {
-                command.args(args).arg0(crate::tether::NAME);
-            }
-            None => {
-                command.args(&self.args);
-                if let Some(arg0) = &self.arg0 {
-                    command.arg0(arg0);
-                }
-            }
+        command.args(&self.args);
+        if let Some(arg0) = &self.arg0 {
+            command.arg0(arg0);
         }
         if self.env.clear {
             command.env_clear();
@@ -1948,19 +2030,10 @@ impl Command {
                 None => command.env_remove(key),
             };
         }
-        #[cfg(target_os = "linux")]
-        let status = routed.is_some().then(ExecStatus::new).transpose()?;
-        #[cfg(target_os = "linux")]
-        if let Some(status) = &status {
-            command.env(
-                crate::tether::STATUS_VAR,
-                status.write.as_raw_fd().to_string(),
-            );
+        command.env_remove(super::entry_barrier::VAR);
+        if let Some(endpoint) = &self.entry_barrier {
+            command.env(super::entry_barrier::VAR, endpoint.as_raw_fd().to_string());
         }
-        #[cfg(target_os = "linux")]
-        let status_end = status.as_ref().map(|status| status.write.as_raw_fd());
-        #[cfg(not(target_os = "linux"))]
-        let status: Option<ExecStatus> = None;
         if let Some(dir) = &self.cwd {
             command.current_dir(dir);
         }
@@ -1978,18 +2051,14 @@ impl Command {
         }
         let setsid = self.setsid;
         let default_signals = self.default_signals;
-        let guards: Vec<_> = self.guard_targets().collect();
-        #[cfg(target_os = "linux")]
-        let tether = self
-            .tether
-            .then(|| i32::try_from(std::process::id()))
-            .transpose()
-            .map_err(io::Error::other)?;
-        // SAFETY: the hook runs between fork and exec and calls only signal/session operations,
-        // the tether's prctl/getppid, and fcntl over pre-captured descriptors. Command owns
-        // those occupied guard numbers throughout this private forked command's spawn/exec, and
-        // the caller the exec status's write end until the fork returned; no allocation, lock or
-        // descriptor replacement occurs in the child hook.
+        let mut guards: Vec<_> = self.guard_targets().collect();
+        if let Some(endpoint) = &self.entry_barrier {
+            guards.push(endpoint.as_raw_fd());
+        }
+        // SAFETY: the hook runs between fork and exec and calls only signal/session operations
+        // and fcntl over pre-captured descriptors. Command owns those occupied guard numbers,
+        // and the entry barrier's endpoint, throughout this private forked command's spawn/exec;
+        // no allocation, lock or descriptor replacement occurs in the child hook.
         unsafe {
             command.pre_exec(move || {
                 if default_signals {
@@ -2017,11 +2086,7 @@ impl Command {
                 if setsid && new_session() < 0 {
                     return Err(io::Error::last_os_error());
                 }
-                #[cfg(target_os = "linux")]
-                let handed = guards.iter().copied().chain(status_end);
-                #[cfg(not(target_os = "linux"))]
-                let handed = guards.iter().copied();
-                for guard in handed {
+                for &guard in &guards {
                     let flags = super::fcntl(guard, super::F_GETFD);
                     if flags < 0
                         || super::fcntl(guard, super::F_SETFD, flags & !super::FD_CLOEXEC) < 0
@@ -2029,37 +2094,19 @@ impl Command {
                         return Err(io::Error::last_os_error());
                     }
                 }
-                #[cfg(target_os = "linux")]
-                if let Some(parent) = tether {
-                    crate::tether::bind(parent)?;
-                }
                 Ok(())
             });
         }
         if self.native_image {
             self.native_hook(&mut command)?;
         }
-        Ok((command, status))
+        Ok(command)
     }
 
-    /// The tether a Linux tethered spawn runs through ([`crate::tether::route`]): one whose child
-    /// leads its own process group (`process_group(0)`, or a session), whose tether leaves a
-    /// watcher that ends that group, while this process records an image to run through
-    /// (`crate::tether::route` says when it does not). `None` for any other spawn, whose child is
-    /// tied by its parent-death signal alone. The tether runs the program only after it forked
-    /// that watcher, so it reports its exec's error on an [`ExecStatus`], and the spawn fails
-    /// with it as a spawn of the program itself would.
-    #[cfg(target_os = "linux")]
-    fn route(&self) -> Option<(std::path::PathBuf, Vec<OsString>)> {
-        if !self.tether || !(self.setsid || self.group() == Some(0)) {
-            return None;
-        }
-        crate::tether::route(&self.program, self.arg0.as_deref(), &self.args)
-    }
-
-    /// The last hook of a native-image spawn ([`super::NativeImage`]): the child `execve`s the
-    /// image prepared here, and a failed exec fails the spawn with its error, before `std`'s
-    /// `execvp` could hand the file to the system shell.
+    /// The last hook of a native-image exec in this process's place ([`super::NativeImage`]; a
+    /// spawn's child walks its own, `super::clone_spawn`): it `execve`s the image prepared here,
+    /// and a failed exec returns its error, before `std`'s `execvp` could hand the file to the
+    /// system shell.
     #[cfg(target_os = "linux")]
     fn native_hook(&self, command: &mut super::StdCommand) -> io::Result<()> {
         use std::os::unix::ffi::OsStrExt as _;
@@ -2070,8 +2117,8 @@ impl Command {
                 "a tethered command is not started as a native image",
             ));
         }
-        // The search runs here, before the fork, against this process's directory, where the
-        // child's `execvp` would search against the one it moved to.
+        // The search runs here, against this process's directory, where `std`'s `execvp` would
+        // search against the one its hooks moved to.
         if self.cwd.is_some() && !self.program.as_bytes().contains(&b'/') {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2084,7 +2131,7 @@ impl Command {
             &self.args,
             &self.env.capture(),
         )?;
-        // SAFETY: added after every other hook, it runs last between fork and exec, once stdio,
+        // SAFETY: added after every other hook, it runs last before the exec, once stdio,
         // the working directory, the strip, the mask, the session and the guards are in place,
         // and calls only `NativeExec::exec` (an `execve` over what `native` owns, then errno).
         unsafe {
@@ -2100,6 +2147,224 @@ impl Command {
             io::ErrorKind::Unsupported,
             "a native-image spawn is macOS's and Linux's",
         ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Command {
+    /// The spawn ([`super::clone_spawn`]): this process's ends of the child's pipes, and for one
+    /// that runs through its tether ([`Self::route`]) the exec status it hands that tether.
+    fn start_pending(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<PendingChild> {
+        use super::clone_spawn::{Plan, Spec};
+        use super::{Image, Source, c_string, placeable, placeable_copy};
+        use std::os::unix::ffi::OsStrExt as _;
+        super::note_spawn();
+        if self
+            .guards
+            .iter()
+            .any(|guard| guard.source.as_raw_fd() != guard.target)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "mapped guards need native spawn actions",
+            ));
+        }
+        if self.disclaim.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "disclaiming responsibility is Darwin's: no child is started without it",
+            ));
+        }
+        if self.suspended {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "starting a child stopped at its exec is Darwin's: no child is started",
+            ));
+        }
+        if self.tether && !self.guards.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "tethered commands do not forward explicit guards",
+            ));
+        }
+        if self.native_image && self.tether {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a tethered command is not started as a native image",
+            ));
+        }
+        if self.native_image && self.cwd.is_some() && !self.program.as_bytes().contains(&b'/') {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a native image started in another directory is named by its path",
+            ));
+        }
+        let routed = self.route();
+        self.check_required_tether(routed.is_some())?;
+        // The tether runs the program only after this spawn started it, so it reports its exec's
+        // error back here ([`ExecStatus`]), and the spawn fails with it as a spawn of the program
+        // itself would.
+        let status = routed.is_some().then(ExecStatus::new).transpose()?;
+        let mut env = self.env.capture();
+        env.retain(|(key, _)| key != super::entry_barrier::VAR);
+        if let Some(endpoint) = &self.entry_barrier {
+            env.push((
+                super::entry_barrier::VAR.into(),
+                endpoint.as_raw_fd().to_string().into(),
+            ));
+        }
+        if let Some(status) = &status {
+            use crate::tether::{STATUS_VAR, THREAD_VAR};
+            env.retain(|(key, _)| key != STATUS_VAR && key != THREAD_VAR);
+            env.push((
+                STATUS_VAR.into(),
+                status.write.as_raw_fd().to_string().into(),
+            ));
+        }
+        let mut image = match &routed {
+            Some((exe, args)) => Image::build(exe.as_os_str(), args, &env)?,
+            None => Image::build(&self.program, &self.args, &env)?,
+        };
+        match (&routed, &self.arg0) {
+            (Some(_), _) => image.argv[0] = c_string(crate::tether::NAME.as_bytes())?,
+            (None, Some(arg0)) => image.argv[0] = c_string(arg0.as_bytes())?,
+            (None, None) => {}
+        }
+        let mut kept: Vec<OwnedFd> = Vec::new();
+        let mut ours: [Option<OwnedFd>; 3] = [None, None, None];
+        let mut slots = Vec::with_capacity(3);
+        for (target, slot) in [&self.stdin, &self.stdout, &self.stderr]
+            .into_iter()
+            .enumerate()
+        {
+            let kind = match slot {
+                Some(Stdio(kind)) => kind,
+                None if target == 0 && !needs_stdin => &Kind::Null,
+                None => match fallback {
+                    Fallback::Inherit => &Kind::Inherit,
+                    Fallback::Piped => &Kind::Piped,
+                },
+            };
+            slots.push(match kind {
+                Kind::Inherit => Source::Inherit,
+                Kind::Null => Source::Null,
+                Kind::Piped => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "spawnfd's own piped stdio, close-on-exec, which keeps both ends \
+                                  out of other spawns' programs, as Darwin's are"
+                    )]
+                    let (read, write) = io::pipe()?;
+                    let (mine, theirs) = if target == 0 {
+                        (OwnedFd::from(write), OwnedFd::from(read))
+                    } else {
+                        (OwnedFd::from(read), OwnedFd::from(write))
+                    };
+                    let theirs = super::off_the_targets(theirs)?;
+                    let source = Source::Fd(theirs.as_raw_fd());
+                    kept.push(theirs);
+                    ours[target] = Some(super::off_stdio(mine)?);
+                    source
+                }
+                Kind::Fd(fd) if placeable(fd.as_raw_fd()) => Source::Fd(fd.as_raw_fd()),
+                Kind::Fd(fd) => {
+                    let copy = placeable_copy(fd.as_raw_fd())?;
+                    let source = Source::Fd(copy.as_raw_fd());
+                    kept.push(copy);
+                    source
+                }
+            });
+        }
+        let mut handed: Vec<RawFd> = self.guard_targets().collect();
+        handed.extend(status.as_ref().map(|status| status.write.as_raw_fd()));
+        handed.extend(self.entry_barrier.as_ref().map(AsRawFd::as_raw_fd));
+        let tie = self
+            .tether
+            .then(|| i32::try_from(std::process::id()))
+            .transpose()
+            .map_err(io::Error::other)?;
+        let plan = Arc::new(Plan::new(
+            &image,
+            Spec {
+                slots,
+                handed,
+                kept,
+                cwd: self
+                    .cwd
+                    .as_ref()
+                    .map(|dir| c_string(dir.as_os_str().as_bytes()))
+                    .transpose()?,
+                inherit_all: self.inherit_all,
+                default_signals: self.default_signals,
+                keep_mask: false,
+                pgroup: self.group(),
+                setsid: self.setsid,
+                native: self.native_image,
+                tie,
+                // The tether's watcher watches the thread that starts it, as the parent-death
+                // signal follows that thread (`crate::tether::THREAD_VAR`).
+                thread_var: routed.is_some(),
+                ..Spec::default()
+            },
+        )?);
+        // Each try is one clone; the pause between tries runs here, on the calling thread, so a
+        // clone that runs on a spawner holds it for that clone alone.
+        let on_a_spawner = self.starts_on_a_spawner();
+        let pid = super::past_text_busy(
+            super::TEXT_BUSY_FOR,
+            || {
+                if on_a_spawner {
+                    let plan = Arc::clone(&plan);
+                    return crate::tether::spawned(move || plan.start());
+                }
+                plan.start()
+            },
+            super::text_busy_pause,
+        )?;
+        drop(plan);
+        let [stdin, stdout, stderr] = ours;
+        Ok(PendingChild {
+            status,
+            child: Child {
+                stdin: stdin.map(ChildStdin::from),
+                stdout: stdout.map(ChildStdout::from),
+                stderr: stderr.map(ChildStderr::from),
+                foreground: None,
+                handle: super::LaneChild {
+                    pid,
+                    status: None,
+                    custody: super::WaitCustody::default(),
+                },
+                usage: None,
+                custody: Arc::new(()),
+            },
+        })
+    }
+
+    /// Whether the clone runs on one of the tether's spawners (`crate::tether::spawned`), threads
+    /// that live as long as this process, so the parent-death signal the child sets comes at this
+    /// process's death, not at the calling thread's: a tethered spawn's does, but one a test ties
+    /// to its own thread (`tie_to_this_thread`).
+    fn starts_on_a_spawner(&self) -> bool {
+        #[cfg(test)]
+        let this_thread = self.this_thread;
+        #[cfg(not(test))]
+        let this_thread = false;
+        self.tether && !this_thread
+    }
+
+    /// The tether a Linux tethered spawn runs through ([`crate::tether::route`]): one whose child
+    /// leads its own process group (`process_group(0)`, or a session), whose tether leaves a
+    /// watcher that ends that group, while this process records an image to run through
+    /// (`crate::tether::route` says when it does not). `None` for any other spawn, whose child is
+    /// tied by its parent-death signal alone. The tether runs the program only after it forked
+    /// that watcher, so it reports its exec's error on an [`ExecStatus`], and the spawn fails
+    /// with it as a spawn of the program itself would.
+    fn route(&self) -> Option<(std::path::PathBuf, Vec<OsString>)> {
+        if !self.tether || !(self.setsid || self.group() == Some(0)) {
+            return None;
+        }
+        crate::tether::route(&self.program, self.arg0.as_deref(), &self.args)
     }
 }
 
@@ -2121,7 +2386,179 @@ pub(super) struct PendingChild {
     status: Option<ExecStatus>,
 }
 
+/// Actual native cohort custody while the requested program is held before
+/// exec. Observation keys cannot construct this owner. Drop withdraws entry,
+/// kills and reaps the helper; use on a worker thread, never the GUI thread.
+#[must_use = "retain the prepared child until release or actual cancellation"]
+pub struct PreparedCohort {
+    spawned: Option<super::Spawned>,
+    status: Option<ExecStatus>,
+    barrier: Option<super::entry_barrier::Parent>,
+}
+
+impl std::fmt::Debug for PreparedCohort {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("PreparedNativeCohort(<owned>)")
+    }
+}
+
+/// One physical release endpoint bound to its original unreaped native child.
+/// Dropping it withdraws entry while the caller retains actual child custody.
+#[must_use = "retain the entry permit until release or withdrawal"]
+pub struct EntryPermit {
+    key: super::BirthKey,
+    custody: Arc<()>,
+    status: Option<ExecStatus>,
+    barrier: super::entry_barrier::Parent,
+}
+
+/// Exec-status observation carries no child control or completion authority.
+/// The broker can keep controlling its actual Spawned while another thread
+/// waits on this pipe; stopping the root never needs to wait for its borrow.
+#[must_use = "observe exec status or explicitly discard the observation"]
+pub struct ExecObservation(Option<ExecStatus>);
+
+impl std::fmt::Debug for EntryPermit {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("NativeEntryPermit(<private>)")
+    }
+}
+
+impl std::fmt::Debug for ExecObservation {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str("NativeExecObservation(<private>)")
+    }
+}
+
+impl EntryPermit {
+    /// Release the requested program only against this same original current
+    /// unreaped child. Keep the actual child in the broker before this call.
+    /// # Errors
+    /// Original custody or scope changed, or release I/O failed. The caller
+    /// still owns its actual post-birth resource; no no-child claim is made.
+    pub fn commit(self, spawned: &super::Spawned) -> io::Result<ExecObservation> {
+        if !spawned.admits_entry(&self.key, &self.custody) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "entry permit does not own this current cohort",
+            ));
+        }
+        self.barrier.release()?;
+        Ok(ExecObservation(self.status))
+    }
+}
+
+impl ExecObservation {
+    /// Read the retained native exec-status pipe without borrowing the child.
+    /// This is not evidence that the requested program ran or has ended.
+    /// # Errors
+    /// Target exec or status I/O failed after the actual helper birth.
+    pub fn observe(self) -> io::Result<()> {
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        if let Some(status) = self.0 {
+            return status.after_fork();
+        }
+        Ok(())
+    }
+}
+
+impl PreparedCohort {
+    /// The actual attempt observation, never permission reconstructed from it.
+    #[must_use]
+    pub fn key(&self) -> &super::BirthKey {
+        self.spawned
+            .as_ref()
+            .expect("prepared cohort owns its child")
+            .key()
+    }
+
+    /// The original owned helper's pid, not a signalling capability.
+    #[must_use]
+    pub fn id(&mut self) -> u32 {
+        self.spawned
+            .as_mut()
+            .expect("prepared cohort owns its child")
+            .child_mut()
+            .id()
+    }
+
+    /// Transfer actual child custody to the broker before execution, retaining
+    /// its separate physical release permit. Neither part is reconstructed from
+    /// an observation key or a caller-supplied pid.
+    pub fn into_held(mut self) -> (super::Spawned, EntryPermit) {
+        let spawned = self.spawned.take().expect("prepared cohort owns its child");
+        let permit = EntryPermit {
+            key: spawned.key().clone(),
+            custody: spawned.entry_custody(),
+            status: self.status.take(),
+            barrier: self
+                .barrier
+                .take()
+                .expect("prepared cohort owns its barrier"),
+        };
+        (spawned, permit)
+    }
+
+    /// Release only this original current cohort, then observe its exec status.
+    /// This permits execution; it is not proof that the tool ran or finished.
+    /// # Errors
+    /// Scope or custody changed, release failed, or target exec failed. Every
+    /// refusal retains the actual post-birth resource for settlement.
+    pub fn release(self) -> Result<super::Spawned, super::SpawnFailure> {
+        let (spawned, permit) = self.into_held();
+        let observed = permit.commit(&spawned).and_then(ExecObservation::observe);
+        match observed {
+            Ok(()) => Ok(spawned),
+            Err(error) => Err(super::SpawnFailure::Unbound {
+                spawned: Box::new(spawned),
+                error,
+            }),
+        }
+    }
+
+    /// Withdraw entry and transfer the genuine spawned helper for settlement.
+    /// No requested program is released and no no-child receipt is invented.
+    #[must_use]
+    pub fn cancel(mut self) -> super::Spawned {
+        self.barrier.take();
+        self.status.take();
+        self.spawned.take().expect("prepared cohort owns its child")
+    }
+}
+
+impl Drop for PreparedCohort {
+    fn drop(&mut self) {
+        self.barrier.take();
+        if let Some(mut spawned) = self.spawned.take()
+            && spawned.is_original_child()
+        {
+            let _killed = spawned.child_mut().kill();
+            let _waited = spawned.child_mut().wait();
+        }
+    }
+}
+
 impl PendingChild {
+    pub(super) fn prepare(
+        self,
+        seal: impl FnOnce(Child) -> super::Spawned,
+        mut barrier: super::entry_barrier::Parent,
+    ) -> Result<PreparedCohort, super::SpawnFailure> {
+        let Self { child, status } = self;
+        let spawned = seal(child);
+        if let Err(error) = barrier.ready() {
+            return Err(super::SpawnFailure::Unbound {
+                spawned: Box::new(spawned),
+                error,
+            });
+        }
+        Ok(PreparedCohort {
+            spawned: Some(spawned),
+            status,
+            barrier: Some(barrier),
+        })
+    }
+
     pub(super) fn observe<R>(self, seal: impl FnOnce(Child) -> R) -> Result<R, (R, io::Error)> {
         let Self { child, status } = self;
         let owned = seal(child);

@@ -21,6 +21,7 @@ use aterm_agent::harness::disk::maintenance as cache_maintenance;
 pub(crate) mod progress;
 #[path = "harness_task_exit.rs"]
 pub(crate) mod task_exit;
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::accounts_pool;
 use aterm_agent::harness::accounts_sync::UpkeepStep;
 use aterm_agent::harness::agent_image;
@@ -34,11 +35,13 @@ use aterm_agent::harness::profile;
 use aterm_agent::harness::provider_read;
 use aterm_agent::harness::relaunch::{
     self, ExitLook, ExitRecord, Foreground, OnExit, Outcome, Relaunches, Restart, Say, Snapshot,
+    SnapshotRefusal,
 };
 use aterm_agent::harness::restart_stamp;
 use aterm_agent::harness::resume;
 use aterm_agent::harness::self_claimed;
 use aterm_agent::harness::tap;
+use aterm_agent::harness::token_route;
 use aterm_agent::harness::upgrade;
 use aterm_agent::harness::upgrade_drive::{self, After, Behind, Due};
 use aterm_agent::harness::upgrade_wake::{ActivationWake, WakeTrigger};
@@ -54,7 +57,7 @@ use aterm_agent::supervise::policy::{
 use aterm_agent::supervise::tap_clock::{TapWindow, UsageWindow};
 use aterm_agent::supervise::tape::store as tape;
 use aterm_agent::supervise::{
-    AgentResumed, Autopilot, BuiltinAuthority, Ctl, CtlReply, Endpoint, Guard, HostStep, IdleHost,
+    AgentResumed, BuiltinAuthority, Ctl, CtlReply, Endpoint, Guard, HostAgent, HostStep, IdleHost,
     IdlePoint, Interrupter, LineHeld, ProbeMiss, RelayCtl, Session, StallSeen, SuperviseOpts,
     SupervisorConfig, UsageSeen,
 };
@@ -100,6 +103,21 @@ const TAP_NOT_OWN: &str = "reading not this machine's own login's";
 /// A tap reading of an account no roster row lists: the journal takes it, no row's record does
 /// (`docs/DESIGN-account-discovery-2026-11-09.md`, decision 7).
 const TAP_UNLISTED: &str = "reading of an account no roster row lists";
+/// [`WorkerIdle::tap_step`]'s word for a reading of a session on another token of its row's
+/// entry than the vault's: one a `--replace` has since replaced, one an earlier wrapper served
+/// that may be older than the vault's, or one whose variable names nothing
+/// ([`ServedToken::on`](aterm_agent::harness::token_route::ServedToken::on)); or of a session on
+/// its row's token where the vault now holds none.
+const TAP_OTHER_TOKEN: &str = "reading of a session on another token than the vault's";
+/// [`WorkerIdle::tap_step`]'s word for a reading of a token not known to be its row's account's:
+/// one whose windows this Mac's comparison found different, or one not in use here before
+/// verification (minted on another Mac at a person's terminal, or by a meta that names no route)
+/// and not verified. It is folded into no row.
+const TAP_APART: &str = "reading of a token not known to be its row's account's";
+/// [`WorkerIdle::tap_step`]'s word for a reading of a session on its row's token while this
+/// Mac's vault could not be read: whose token it is is not known, so nothing of it is recorded,
+/// and the next step reads it again.
+const TAP_TOKEN_UNREAD: &str = "reading dropped: vault-busy";
 
 static AGENTS_OFF: Mutex<Vec<Program>> = Mutex::new(Vec::new());
 
@@ -401,7 +419,7 @@ impl Switches {
         self.usage_notes
             .store(accounts_on && cfg.usage_notes, Ordering::SeqCst);
         self.autopilot
-            .store(autopilot_rank(cfg.autopilot), Ordering::SeqCst);
+            .store(autopilot_rank(cfg.turn_end.autopilot), Ordering::SeqCst);
         self.claim_credits
             .store(accounts_on && cfg.claim_credits, Ordering::SeqCst);
     }
@@ -1489,6 +1507,10 @@ pub(crate) struct Kept {
     release_hold: Option<Instant>,
     /// The relaunch snapshot read still out ([`start_point_read`]).
     point_read: Option<Arc<PointRead>>,
+    /// The last relaunch snapshot read that ended for its own snapshot was refused unread (the
+    /// refusal's code, [`SnapshotRefusal::Unread`]); none since a snapshot landed or a read was
+    /// answered. Read by [`WorkerIdle::agent_resumed`]: a failed read is not "no agent".
+    snapshot_unread: Option<&'static str>,
     /// The upgrade read off the idle point ([`due_at_point`]).
     due: DueKept,
     /// The session's work record reads ([`WorkKept`]).
@@ -1652,6 +1674,9 @@ struct AccountKept {
     /// Why the last account advice could not be judged ([`WorkerIdle::account_unjudged`]),
     /// logged once per change; `None` once one was.
     unjudged: Option<&'static str>,
+    /// What the last login observation that recorded nothing said, and why
+    /// ([`WorkerIdle::login_unrecorded`]), logged once per change; `None` once one recorded.
+    login_said: Option<String>,
     moved: Option<Moved>,
     lost: Option<LostSeen>,
     came_back: Option<Option<String>>,
@@ -1826,12 +1851,12 @@ fn reset_qualifies(until: i64, day_start: Option<i64>, now: i64) -> Option<bool>
 enum ResetRead {
     /// The vendor's own line said a reset of `kind` was spent and the limits reset, with the count of that kind it named.
     Used {
-        kind: aterm_phase::ResetKind,
+        kind: alab_policy::vocab::ResetKind,
         left: Option<u32>,
     },
     /// The vendor's own line said a reset of `kind` was spent and the walled limit still stands.
     Walled {
-        kind: aterm_phase::ResetKind,
+        kind: alab_policy::vocab::ResetKind,
         left: u32,
     },
     /// It said the limit had lifted by itself.
@@ -2754,7 +2779,8 @@ type DiskFreeFn =
     dyn Fn(&str, &crate::disk_board::AskOwed, AskWord, AskWord) -> String + Send + Sync;
 /// A word [`DiskFreeFn`] is handed: why a session may not be asked, or what holds its line.
 type AskWord = Option<&'static str>;
-type SnapshotFn = dyn Fn(&str) -> Option<Snapshot> + Send + Sync;
+/// A relaunch snapshot read ([`Acts::snapshot`]): the snapshot, or what its refusal says of the tab.
+type SnapshotFn = dyn Fn(&str) -> Result<Snapshot, SnapshotRefusal> + Send + Sync;
 type ScopedFn = dyn Fn(&str) -> Option<crate::harness_claim::Scoped> + Send + Sync;
 type ScopedAccountFn = dyn Fn(&str, &str, &accounts_pool::LoginEnv) -> bool + Send + Sync;
 type ObserveSnapshotFn = dyn Fn(&Snapshot) + Send + Sync;
@@ -2966,6 +2992,10 @@ type TaskedFn = dyn Fn(&str, &Snapshot, &mut upgrade_drive::Tasked) -> Option<bo
 /// Whether the conversation a tab's agent holds says its task is finished ([`upgrade_drive::Finished::of_snapshot`], the tab's supervisor's own turns none).
 type FinishedFn =
     dyn Fn(&str, &Snapshot, &mut upgrade_drive::Finished) -> Option<bool> + Send + Sync;
+/// The `/goal` the conversation a tab's agent holds reads ([`upgrade_drive::GoalOf::of_snapshot`]).
+type GoalFn = dyn Fn(&str, &Snapshot, &mut upgrade_drive::GoalOf) -> aterm_agent::harness::goal::GoalRead
+    + Send
+    + Sync;
 /// The reset named by the standing usage limit of the conversation a snapshot names.
 type LimitResetFn = dyn Fn(&Snapshot) -> Option<u64> + Send + Sync;
 /// The tail of the transcript the Claude Code a snapshot names writes now ([`upgrade_drive::snapshot_transcript_tail`]; [`Acts::transcript_tail`]).
@@ -2975,9 +3005,8 @@ type RepoWorkFn = dyn Fn(&Snapshot) -> aterm_agent::harness::repo_work::RepoRead
 /// Tab `sid`'s agent's left rows, each re-proved now ([`Acts::leftover`]).
 type LeftoverFn = dyn Fn(&str) -> aterm_agent::harness::leftover::LeftRead + Send + Sync;
 /// How credential wants resolve on this Mac ([`Acts::credentials`]).
-type CredentialsFn = dyn Fn(&[String]) -> aterm_agent::supervise::policy::credential_need::CredentialRead
-    + Send
-    + Sync;
+type CredentialsFn =
+    dyn Fn(&[String]) -> alab_policy::credential_need::CredentialRead + Send + Sync;
 /// Where tab `sid`'s agent works, read with git ([`Acts::work_read`]): its kept snapshot, where
 /// one is kept, names its start folder and transcript, and no git starts while the hold given
 /// says new starts are held back.
@@ -3886,6 +3915,8 @@ pub(crate) struct Acts {
     pub(crate) tasked: Arc<TaskedFn>,
     /// Whether the conversation the session's agent holds says its task is finished.
     pub(crate) finished: Arc<FinishedFn>,
+    /// The `/goal` the conversation the session's agent holds reads ([`WorkerIdle::goal`]).
+    pub(crate) goal: Arc<GoalFn>,
     /// The usage limit's reset the conversation's transcript names, past or to come ([`WorkerIdle::limit_until`]).
     pub(crate) limit_reset: Arc<LimitResetFn>,
     /// The transcript that confirms a wall ([`WorkerIdle::transcript_tail`]).
@@ -4157,7 +4188,7 @@ fn restart_backoff(n: usize) -> Duration {
         Duration::from_secs(30 * 60),
         Duration::from_secs(60 * 60),
     ];
-    aterm_agent::supervise::ladder::Ladder(&STEPS).step(n.saturating_sub(1))
+    alab_policy::ladder::Ladder(&STEPS).step(n.saturating_sub(1))
 }
 
 /// Drop the entries of a session's fault history older than [`RESTART_WINDOW`].
@@ -5063,7 +5094,7 @@ impl UpgradeRun {
 
     /// A look whose read failed: the pause before the next one ([`UNREAD_LOOK`]), the step's own counts untouched.
     fn unread(&mut self) -> Duration {
-        let pause = aterm_agent::supervise::ladder::Ladder(&UNREAD_LOOK)
+        let pause = alab_policy::ladder::Ladder(&UNREAD_LOOK)
             .step(usize::try_from(self.unread).unwrap_or(usize::MAX));
         self.unread = self.unread.saturating_add(1);
         pause
@@ -5203,6 +5234,8 @@ pub(crate) struct WorkerIdle {
     tasked: Mutex<upgrade_drive::Tasked>,
     /// Whether its task is finished, as far as its record has been read ([`WorkerIdle::finished`]).
     finished: Mutex<upgrade_drive::Finished>,
+    /// Its `/goal`, as far as its record has been read ([`WorkerIdle::goal`]).
+    goal: Mutex<upgrade_drive::GoalOf>,
     /// The session's note behind still to be taken ([`Owed`]).
     note: Note,
     /// The unix second the loop last knew the session at its limit.
@@ -5233,9 +5266,8 @@ pub(crate) struct WorkerIdle {
     /// The read of the agent's left rows, on its own thread ([`IdleHost::leftover`]).
     left_probe: aterm_agent::harness::repo_work::Probing<aterm_agent::harness::leftover::LeftRead>,
     /// The resolution of credential wants, on its own thread ([`IdleHost::credentials`]).
-    credential_probe: aterm_agent::harness::repo_work::Probing<
-        aterm_agent::supervise::policy::credential_need::CredentialRead,
-    >,
+    credential_probe:
+        aterm_agent::harness::repo_work::Probing<alab_policy::credential_need::CredentialRead>,
     /// The group of the session's agent, as its job's ([`WorkerJob::group`]): the one a work
     /// record read is put for ([`Acts::work_put`]).
     group: Arc<AtomicI32>,
@@ -5464,7 +5496,7 @@ impl WorkerIdle {
         let at = match point {
             AccountPoint::TurnEnd => accounts::Point::TurnEnd,
             AccountPoint::Wall {
-                kind: aterm_phase::WallKind::Auth,
+                kind: alab_policy::vocab::WallKind::Auth,
             } => accounts::Point::LostLogin { seen: seat.now },
             AccountPoint::LoginEnded => accounts::Point::LoginEnded,
             AccountPoint::Wall { .. } => accounts::Point::Wall {
@@ -6486,18 +6518,29 @@ impl IdleHost for WorkerIdle {
 
     /// Whether the foreground agent in the tab resumes a conversation, aterm's relaunch or its own
     /// arguments ([`IdleHost::agent_resumed`]). Refreshes the snapshot when a new foreground process
-    /// has not been captured yet.
-    fn agent_resumed(&self) -> Option<AgentResumed> {
-        let snap = self.kept_in_tab().or_else(|| {
-            refresh_snapshot_at_point(
-                &self.sid,
-                &self.kept,
-                &self.hooks,
-                self.hooks.acts.point_read,
-            );
-            self.kept_in_tab()
-        })?;
-        Some(AgentResumed {
+    /// has not been captured yet. A refresh still out past [`Acts::point_read`], or one that failed
+    /// before the host answered ([`SnapshotRefusal::Unread`]), is [`HostAgent::Unread`]: the loop
+    /// decides nothing by it, where reading it as no agent let a loaded host's fresh program pass
+    /// for a resume's banner.
+    fn agent_resumed(&self) -> HostAgent {
+        let snap = match self.kept_in_tab() {
+            Some(snap) => snap,
+            None => {
+                let hooks = &self.hooks;
+                if reread(&self.sid, &self.kept, hooks, None, hooks.acts.point_read) == Reread::Out
+                {
+                    return HostAgent::Unread;
+                }
+                let Some(snap) = self.kept_in_tab() else {
+                    return match with_kept_of(&self.kept, |k| k.snapshot_unread) {
+                        Some(_) => HostAgent::Unread,
+                        None => HostAgent::Absent,
+                    };
+                };
+                snap
+            }
+        };
+        HostAgent::Read(AgentResumed {
             pid: snap.pid,
             started: process_started(&snap.start),
             resumed: (self.hooks.acts.agent_resumed)(&self.sid, &snap),
@@ -6759,6 +6802,19 @@ impl IdleHost for WorkerIdle {
         (self.hooks.acts.finished)(&self.sid, &snap, &mut memo)
     }
 
+    /// The session's `/goal` as its conversation's record reads it ([`IdleHost::goal`]): Claude
+    /// Code's, read on from where the last ask stopped.
+    fn goal(&self) -> aterm_agent::harness::goal::GoalRead {
+        if !reads_transcript(self.agent) {
+            return aterm_agent::harness::goal::GoalRead::Unread;
+        }
+        let Some(snap) = self.followed_kept().filter(|s| s.session.is_some()) else {
+            return aterm_agent::harness::goal::GoalRead::Unread;
+        };
+        let mut memo = self.goal.lock().unwrap_or_else(PoisonError::into_inner);
+        (self.hooks.acts.goal)(&self.sid, &snap, &mut memo)
+    }
+
     /// What the session's repository holds that no remote has ([`IdleHost::repo_work`]): read on
     /// the probe's own thread, each ask waiting [`aterm_agent::harness::repo_work::PROBE_ASK`] at
     /// most, or until the worker is stopped.
@@ -6794,7 +6850,7 @@ impl IdleHost for WorkerIdle {
     fn credentials(
         &self,
         wants: Vec<String>,
-    ) -> Option<aterm_agent::supervise::policy::credential_need::CredentialRead> {
+    ) -> Option<alab_policy::credential_need::CredentialRead> {
         self.credential_probe.ask(
             || {
                 let resolve = Arc::clone(&self.hooks.acts.credentials);
@@ -6817,26 +6873,34 @@ impl IdleHost for WorkerIdle {
     }
 
     /// The usage limit's reset the conversation's transcript or quota reading names ([`IdleHost::limit_until`]).
+    /// `None` is no reset read here, never "no limit": the loop then dates the wall by the screen's
+    /// own words. A relaunch read still out past [`Acts::point_read`] reads nothing (LS-15): a
+    /// snapshot no read has landed is not taken for the agent's.
     fn limit_until(&self) -> Option<u64> {
         if !reads_limit_until(self.agent) {
             return None;
         }
         let quota_lane = limit_read_without_session(self.agent);
-        let snap = self
-            .followed_kept()
-            .or_else(|| {
-                if !quota_lane {
+        let snap = match self.followed_kept() {
+            Some(snap) => snap,
+            None if !quota_lane => return None,
+            None => {
+                let hooks = &self.hooks;
+                if reread(&self.sid, &self.kept, hooks, None, hooks.acts.point_read) == Reread::Out
+                {
+                    aterm_log::info!(
+                        "harness @{}: no usage-limit reset read: the relaunch read is still out, \
+                         and the loop dates the wall by the screen",
+                        self.sid
+                    );
                     return None;
                 }
-                refresh_snapshot_at_point(
-                    &self.sid,
-                    &self.kept,
-                    &self.hooks,
-                    self.hooks.acts.point_read,
-                );
-                self.followed_kept()
-            })
-            .filter(|s| quota_lane || s.session.is_some())?;
+                self.followed_kept()?
+            }
+        };
+        if !quota_lane && snap.session.is_none() {
+            return None;
+        }
         (self.hooks.acts.limit_reset)(&snap)
     }
 
@@ -6950,7 +7014,7 @@ impl IdleHost for WorkerIdle {
         if records_its_wall
             && hold
                 == Some(Lasting::Wall {
-                    wire: aterm_phase::WallKind::Auth.wire(),
+                    wire: alab_policy::vocab::WallKind::Auth.wire(),
                 })
         {
             self.note_muse_wall();
@@ -7123,7 +7187,7 @@ impl IdleHost for WorkerIdle {
         let seat = (self.hooks.acts.account_seat)()?;
         let roster = roster_read(&seat).ok()?;
         let look = self.account_look(&seat, &roster)?;
-        let to = route_offered(&seat, &roster, &look.who)?;
+        let to = route_offered(&seat, &roster, &look)?;
         aterm_log::info!(
             "harness @{}: route move offered: onto its {}",
             self.sid,
@@ -7318,9 +7382,18 @@ impl IdleHost for WorkerIdle {
     /// What the session's own point shows of its login ([`IdleHost::login_seen`]).
     fn login_seen(&self, seen: LoginSeen) {
         match accounts::Cli::of(self.agent) {
-            Some(accounts::Cli::Claude) => self.claude_login_seen(seen),
+            Some(accounts::Cli::Claude) => self.claude_login_seen(seen, None),
             Some(cli) => self.pool_login_seen(cli, seen),
             None => {}
+        }
+    }
+
+    /// The session's own Claude Code login served a turn that worked to a break of its own
+    /// background work, its reply written at `at` ([`IdleHost::login_served_at`]): recorded as a
+    /// served point is, dated by that reply.
+    fn login_served_at(&self, at: i64) {
+        if accounts::Cli::of(self.agent) == Some(accounts::Cli::Claude) {
+            self.claude_login_seen(LoginSeen::Served, Some(at));
         }
     }
 
@@ -7434,7 +7507,7 @@ impl IdleHost for WorkerIdle {
         let limit = AccountPoint::Wall {
             kind: look
                 .screen_wall
-                .map_or(aterm_phase::WallKind::UsageWeekly, |wall| wall.kind),
+                .map_or(alab_policy::vocab::WallKind::UsageWeekly, |wall| wall.kind),
         };
         let (at, _, _) = account_point_read(&seat, &look, limit, seat.now);
         Some(roster_word_of(
@@ -7696,7 +7769,7 @@ fn account_answered(this: &WorkerIdle, bad: AccountBad) {
     };
     if matches!(bad, AccountBad::SignedOut) {
         let lost = AccountPoint::Wall {
-            kind: aterm_phase::WallKind::Auth,
+            kind: alab_policy::vocab::WallKind::Auth,
         };
         let _ = look.with_current(&this.kept, |k| {
             k.account.came_back = None;
@@ -7862,33 +7935,49 @@ impl WorkerIdle {
     /// on. The renewal lifecycle keeps its own asks ([`Self::login_ended`],
     /// [`Self::login_served`]); this starts none. A session the token wrapper served marks
     /// its token refused instead ([`token_refused_at`]), and a process on a login a renewal
-    /// replaced says nothing of the renewed one.
-    fn claude_login_seen(&self, seen: LoginSeen) {
+    /// replaced says nothing of the renewed one. Whatever it leaves as it stood is one line of
+    /// aterm's log, once per change ([`Self::login_unrecorded`]). A served turn is evidence of
+    /// the time it served: `served_at`, the model's reply that ended a break's turn
+    /// ([`IdleHost::login_served_at`]; no later than now), else now, a point's own time.
+    fn claude_login_seen(&self, seen: LoginSeen, served_at: Option<i64>) {
+        let what = format!("{} login {}", self.agent.name(), login_seen_word(seen));
         let Some(seat) = (self.hooks.acts.account_seat)() else {
-            return;
+            return self.login_unrecorded(&what, "this host has no accounts seat");
         };
         let Some(roster) = account_roster(&seat) else {
-            return;
+            return self.login_unrecorded(&what, "no account roster admits");
         };
         let Some(look) = self.account_look(&seat, &roster) else {
-            return;
+            return self.login_unrecorded(&what, "its process's login could not be read");
         };
-        if seen == LoginSeen::Lost && token_refused_at(&seat, &roster, &look.who).is_some() {
-            return;
+        if seen == LoginSeen::Lost && token_refused_at(&seat, &roster, &look).is_some() {
+            return self.login_unrecorded(
+                &what,
+                "it runs on its vault token, whose refusal is judged instead",
+            );
         }
         let me = look.me(&roster);
         let Some(label) = me
             .account
             .filter(|_| me.default_home && me.route.is_stored())
         else {
-            return;
+            return self.login_unrecorded(
+                &what,
+                &format!("not a roster row's stored login: {}", not_own_stored(&me)),
+            );
         };
         // One unlocked read first: a turn end that changes nothing takes no writer.
         let Some(row) = roster.row(label) else {
-            return;
+            return self.login_unrecorded(&what, &format!("account {label}: its row is gone"));
         };
-        let Ok((state, _)) = seat.bounded_claude_store().load(seat.now) else {
-            return;
+        let state = match seat.bounded_claude_store().load(seat.now) {
+            Ok((state, _)) => state,
+            Err(why) => {
+                return self.login_unrecorded(
+                    &what,
+                    &format!("account {label}: the accounts state could not be read: {why}"),
+                );
+            }
         };
         let account = state.account(label);
         let word = account.current_auth(row);
@@ -7897,13 +7986,20 @@ impl WorkerIdle {
                 if account.auth == accounts::Auth::SignedOut
                     || (account.auth != accounts::Auth::Unseen && word == accounts::Auth::Unseen)
                 {
-                    self.signed_back(&seat, &roster, &look, label);
+                    let at = served_at.map_or(seat.now, |at| at.min(seat.now));
+                    self.served_back(&seat, &roster, &look, label, at, &what);
+                } else {
+                    self.login_unrecorded(
+                        &what,
+                        &format!("account {label}: its login is not signed out; nothing to lift"),
+                    );
                 }
             }
             LoginSeen::Lost => {
                 let told = word == accounts::Auth::SignedOut;
                 if told {
-                    return;
+                    return self
+                        .login_unrecorded(&what, &format!("account {label}: already signed out"));
                 }
                 let done = login_transact_of(
                     &self.sid,
@@ -7916,16 +8012,36 @@ impl WorkerIdle {
                 );
                 match done {
                     Ok(events) if !events.is_empty() => {
+                        self.login_recorded();
                         aterm_log::info!("harness @{}: account {label}: its login ended", self.sid);
                     }
-                    Ok(_) => {}
-                    Err(why) => aterm_log::info!(
-                        "harness @{}: account {label}: its login's end not recorded: {why}",
-                        self.sid
+                    Ok(_) => self.login_unrecorded(
+                        &what,
+                        &format!("account {label}: its login's end was already on record"),
+                    ),
+                    Err(why) => self.login_unrecorded(
+                        &what,
+                        &format!("account {label}: its login's end not recorded: {why}"),
                     ),
                 }
             }
         }
+    }
+
+    /// A login observation (`what`) that recorded nothing, and `why`: one line of aterm's log
+    /// once per change, never an alert, a banner or a need, so a day of served turns that lifted
+    /// nothing reads in the log.
+    fn login_unrecorded(&self, what: &str, why: &str) {
+        let line = format!("{what}: {why}");
+        let said = with_kept_of(&self.kept, |k| k.account.login_said.replace(line.clone()));
+        if said.as_deref() != Some(line.as_str()) {
+            aterm_log::info!("harness @{}: {line}", self.sid);
+        }
+    }
+
+    /// A login observation that recorded: the next one that records nothing is told again.
+    fn login_recorded(&self) {
+        with_kept_of(&self.kept, |k| k.account.login_said = None);
     }
 
     /// The scoped Kimi session's renewable row and whether its bound credential home changed.
@@ -8093,7 +8209,40 @@ impl WorkerIdle {
         let row = captured.row(&label).expect("tap row was attributed");
         // A session on its vault token: the row's own token, whose standing is read value-free
         // before the fold (served facts, verification by windows; design §5.6, §5.7).
-        let token = token_standing(&seat, row, &look.who);
+        let token = match token_standing(&seat, row, &look.who) {
+            TokenLook::Stored => None,
+            // Whose token the session runs on is not known: nothing of the reading is recorded,
+            // and the next step reads it again.
+            TokenLook::Unread => {
+                self.tap_untake(before);
+                return Some(TAP_TOKEN_UNREAD);
+            }
+            // The vault holds no token of the row now: the one the session runs on is no token
+            // this Mac knows to be the row's account's.
+            TokenLook::Absent => return Some(TAP_OTHER_TOKEN),
+            TokenLook::Found(standing) => Some(*standing),
+        };
+        // A reading counts for the token the session runs on: the one its wrapper named beside
+        // the marker, or, for a session an earlier wrapper served, a token made before it began;
+        // of any other (one a `--replace` has since replaced, or none it can be), nothing is the
+        // vault's token's or known to be the row's. The reading stays taken, so the next step
+        // does not read the vault for it again.
+        let named = match token
+            .as_ref()
+            .map(|standing| token_on(standing, look.token_served))
+        {
+            None => false,
+            Some(TokenOn::Other) => return Some(TAP_OTHER_TOKEN),
+            Some(TokenOn::Named) => true,
+            Some(TokenOn::Unnamed) => false,
+        };
+        // A session on the row's stored login: where the row's token, in use here, waits for a
+        // verdict, this reading is its basis once the fold credits it to the row (§5.6).
+        let basis = if token.is_none() && look.who.route.is_stored() {
+            basis_standing(&seat, row, &look.who)
+        } else {
+            None
+        };
         let key = match row.expected_identity_email() {
             // A profile read: a token session's profile may be stale, so it keys nothing.
             _ if !look.who.route.is_stored() => None,
@@ -8147,7 +8296,13 @@ impl WorkerIdle {
         );
         let mut held_back = false;
         let mut low_or_limited = false;
-        let mut verify = None;
+        let mut write = None;
+        let mut apart = false;
+        // The other accounts' current windows here, for a basis this reading gives to compare a
+        // token reading its row kept with.
+        let mut others = Vec::new();
+        // The row's word is signed out: this reading may be news against it ([`Self::tap_lifts`]).
+        let mut struck = false;
         // The record's figures once the reading was folded in, and its lab key then.
         let folded: std::cell::Cell<Option<TapFolded>> = std::cell::Cell::new(None);
         let noted = self.usage_observed(
@@ -8155,15 +8310,29 @@ impl WorkerIdle {
             &captured,
             (&look.who, &look.seen),
             |state, now| {
-                // Under `accounts.lock`, before this reading is folded into the row: so the basis
-                // a token's verification compares with is the stored login's, never the token's
-                // own.
+                // Under `accounts.lock`, before this reading is folded into the row: its served
+                // facts, and its comparison with the basis a stored-login reading recorded, never
+                // a token's reading. A token whose windows were found different here, or one not
+                // in use here unverified (another Mac's terminal token), may be another account's:
+                // nothing of its reading is the row's. Served facts that could not be
+                // written fold nothing either: a token whose windows differ would be the row's.
                 if let Some(standing) = token.as_ref() {
-                    verify = token_served(&seat, standing, &label, state, &read, now);
+                    match token_served(&seat, standing, (&label, named), state, &read, now)? {
+                        TokenReading::Continue(due) => write = due,
+                        TokenReading::Break(due) => {
+                            write = due;
+                            apart = true;
+                            return Ok(Vec::new());
+                        }
+                    }
+                }
+                if basis.is_some() {
+                    others = token_others(state, &label, now);
                 }
                 let (events, held) = accounts::note_reading_held(state, &label, &read, now, owner);
                 held_back = held;
                 let record = state.accounts.get(&label);
+                struck = record.is_some_and(|a| a.current_auth(row) == accounts::Auth::SignedOut);
                 low_or_limited = !events.is_empty()
                     && record.is_some_and(|a| a.low(now) || a.limited_until(now).is_some());
                 let window = |w: &str| record.and_then(|a| a.windows.get(w)).cloned();
@@ -8201,9 +8370,26 @@ impl WorkerIdle {
             },
         );
         match noted {
+            // The reading stays taken: it is not read again, and nothing of it was recorded.
+            Ok(_) if apart => {
+                if let Some(write) = write {
+                    token_write(&seat, write);
+                }
+                Some(TAP_APART)
+            }
             Ok((events, take)) => {
-                if let Some(verify) = verify {
-                    token_verify(&seat, verify);
+                if let Some(standing) = basis.as_ref() {
+                    // The fold credited the reading to the row as it credits every reading: not
+                    // another account's, and not held back while a login is adopted.
+                    if !held_back
+                        && owner != accounts::ReadingOwner::Another
+                        && let Some(write) = token_basis(&seat, standing, &label, &read, &others)
+                    {
+                        token_write(&seat, write);
+                    }
+                }
+                if let Some(write) = write {
+                    token_write(&seat, write);
                 }
                 if low_or_limited {
                     (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
@@ -8249,6 +8435,9 @@ impl WorkerIdle {
                         seat.now,
                     );
                 }
+                if struck {
+                    self.tap_lifts(&seat, &captured, &look, &label, &read, beside, held_back);
+                }
                 Some(if events.is_empty() {
                     "reading: nothing new"
                 } else {
@@ -8262,6 +8451,54 @@ impl WorkerIdle {
                 } else {
                     "reading dropped: not recorded"
                 })
+            }
+        }
+    }
+
+    /// A tap reading recorded on a row whose word is signed out ([`Self::tap_step`]): served
+    /// evidence of that row's own stored login, which lifts the word ([`Self::served_back`])
+    /// where its process's API time grew since its last reading here ([`tap::Beside::served`]),
+    /// the reading was not held back while a login is adopted, the process runs on its stored
+    /// login (a token route's reading is its token's) and the row names the address its profile
+    /// proves.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the tap step's seat, roster, look and row beside the reading and what its fold said"
+    )]
+    fn tap_lifts(
+        &self,
+        seat: &AccountSeat,
+        captured: &accounts::UsageRoster,
+        look: &AccountLook,
+        label: &str,
+        read: &accounts::TapRead,
+        beside: tap::Beside,
+        held_back: bool,
+    ) {
+        const WHAT: &str = "usage tap reading";
+        let named = !captured.implicit()
+            && captured
+                .roster()
+                .row(label)
+                .is_some_and(|row| row.expected_identity_email().is_some());
+        let why = if !named {
+            Some("its row names no address its login is proved by")
+        } else if !look.who.route.is_stored() {
+            Some("a token route's reading is no news of its stored login")
+        } else if held_back {
+            Some("the reading was held back while a login is adopted")
+        } else if !beside.seen {
+            Some("its process has no earlier reading here, so nothing shows it served since")
+        } else if !beside.served {
+            Some("its process made no calls since its last reading here")
+        } else {
+            None
+        };
+        match why {
+            Some(why) => self.login_unrecorded(WHAT, &format!("account {label}: {why}")),
+            None => {
+                let at = read.at.min(seat.now);
+                let _ = self.served_back(seat, captured.roster(), look, label, at, WHAT);
             }
         }
     }
@@ -8556,8 +8793,18 @@ impl WorkerIdle {
             return None;
         }
         let hooks = &self.hooks;
-        if relaunched {
-            refresh_snapshot_at_point(&self.sid, &self.kept, hooks, hooks.acts.point_read);
+        // The relaunch record read again for this point's readers. A read still out past its
+        // bound (LS-15) holds no step: the carry-on, the upgrade's step and the look's close read
+        // the relaunch records themselves, not the kept snapshot. What it leaves unread is the
+        // loop's read of the agent in the tab, which answers unread until the read lands
+        // ([`IdleHost::agent_resumed`]), never as no agent.
+        if relaunched
+            && reread(&self.sid, &self.kept, hooks, None, hooks.acts.point_read) == Reread::Out
+        {
+            aterm_log::debug!(
+                "harness @{}: idle point goes on with the agent unread; its steps read their own records",
+                self.sid
+            );
         }
         laps::lap("snapshot");
         self.hold_clock();
@@ -9608,14 +9855,64 @@ impl WorkerIdle {
         look: &AccountLook,
         label: &str,
     ) {
+        self.signed_back_after(seat, roster, look, label, None, "sign-in");
+    }
+
+    /// Evidence that `label`'s own stored login served (`what`, at `served_at`) after a strike
+    /// signed it out: its word lifts through the one writer ([`Self::signed_back_after`]) where
+    /// the login file names no other account ([`accounts::ReadingOwner::Another`]), the
+    /// evidence postdates the strike and the profile proves whose login it is. A turn's own
+    /// wall or a check that finds no login strikes it again, so a stale word is what this lifts.
+    fn served_back(
+        &self,
+        seat: &AccountSeat,
+        roster: &accounts::Roster,
+        look: &AccountLook,
+        label: &str,
+        served_at: i64,
+        what: &str,
+    ) -> bool {
+        let reconciled = accounts::reconcile(roster, &look.who, &look.seen);
+        if accounts::ReadingOwner::of(&reconciled, label) == accounts::ReadingOwner::Another {
+            self.login_unrecorded(
+                what,
+                &format!("account {label}: its login file names another account; nothing lifted"),
+            );
+            return false;
+        }
+        self.signed_back_after(seat, roster, look, label, Some(served_at), what)
+    }
+
+    /// [`Self::signed_back`] on evidence `what`; where `served` is given, a turn or a reading
+    /// served then, which says nothing of a login struck at or after it (the strike's
+    /// `auth_at`, read under the writer's lock), and lifts the strike alone, stamping no
+    /// renewal ([`accounts::note_served_back`]). Whether the word lifted; every other outcome
+    /// is one line of the log ([`Self::login_unrecorded`]).
+    fn signed_back_after(
+        &self,
+        seat: &AccountSeat,
+        roster: &accounts::Roster,
+        look: &AccountLook,
+        label: &str,
+        served: Option<i64>,
+        what: &str,
+    ) -> bool {
         // The believed row, on purpose: whose login this is is read at the writer, under its
         // lock ([`Self::login_identity_permits`]), so a profile the look read stale never decides
         // (`AccountServedIdentity`); a profile that names another account is refused there.
         let me = look.who.me(roster);
         // A sign-in is a stored login's service.
         if !me.default_home || !me.route.is_stored() || me.account != Some(label) {
-            return;
+            self.login_unrecorded(
+                what,
+                &format!(
+                    "account {label}: not this row's own stored login: {}",
+                    not_own_stored(&me)
+                ),
+            );
+            return false;
         }
+        let mut kept = None;
         let done = login_transact_of(
             &self.sid,
             &self.hooks,
@@ -9630,29 +9927,60 @@ impl WorkerIdle {
                         .row(label)
                         .is_some_and(|row| account.current_auth(row) == accounts::Auth::Unseen);
                 if account.auth != accounts::Auth::SignedOut && !historical {
+                    kept = Some("its login is not signed out".to_owned());
+                    return Ok(Vec::new());
+                }
+                if let Some(at) = served
+                    && let Some(struck) = account.auth_at.filter(|struck| at <= *struck)
+                {
+                    kept = Some(format!("served at {at}, not after its strike at {struck}"));
                     return Ok(Vec::new());
                 }
                 if !self.login_identity_permits(seat, roster, look, label, true) {
                     return Err("sign-in identity is not confirmed; nothing recorded".into());
                 }
-                Ok(accounts::note_signed_back(state, logins, label, now))
+                // Served evidence lifts the strike and changes no credential: the login's
+                // renewal, notice and lifetime stand ([`accounts::note_served_back`]). A login
+                // signed back in at the tab is a new one ([`accounts::note_signed_back`]).
+                let events = if served.is_some() {
+                    accounts::note_served_back(state, logins, label, now)
+                } else {
+                    accounts::note_signed_back(state, logins, label, now)
+                };
+                if events.is_empty() {
+                    kept = Some("its record holds a later word".to_owned());
+                }
+                Ok(events)
             },
         );
         match done {
             Ok(events) if !events.is_empty() => {
-                aterm_log::info!("harness @{}: account {label}: signed in again", self.sid);
-            }
-            Ok(_) => {}
-            Err(_) => {
+                self.login_recorded();
                 aterm_log::info!(
-                    "harness @{}: account {label}: signed in again, not recorded",
+                    "harness @{}: account {label}: signed in again ({what})",
                     self.sid
                 );
+                true
+            }
+            Ok(_) => {
+                let why = kept.unwrap_or_else(|| "nothing to record".to_owned());
+                self.login_unrecorded(what, &format!("account {label}: {why}"));
+                false
+            }
+            Err(why) => {
+                self.login_unrecorded(
+                    what,
+                    &format!("account {label}: signed in again, not recorded: {why}"),
+                );
+                false
             }
         }
     }
 
-    /// A turn end under a renewable login.
+    /// A turn end under a renewable login: its service is recorded. It never lifts a strike:
+    /// the TurnEnd point is asked at any idle point (a screen decided again on account news, the
+    /// first point after a launch), with no turn worked to it, so a struck login lifts only on a
+    /// served point ([`Self::claude_login_seen`]) or a tap reading ([`Self::tap_lifts`]).
     fn login_served(&self, seat: &AccountSeat, roster: &accounts::Roster, look: &AccountLook) {
         let Some(label) = renewable_own(roster, look) else {
             return;
@@ -9745,6 +10073,10 @@ impl WorkerIdle {
             who
         };
         let profile_env = profile_environment(&env);
+        let token_served = ServedToken::of(
+            env.iter().filter_map(|kv| kv.split_once('=')),
+            (self.hooks.acts.tap_born)(snap.pid).and_then(|born| u64::try_from(born).ok()),
+        );
         // Read afresh on every look, in the home of the seat the caller read: a `/login` in
         // another tab rewrites the file while this process runs.
         let seen = login_seen(&env, &seat.home, who.route, roster);
@@ -9759,6 +10091,7 @@ impl WorkerIdle {
             snap,
             generation,
             profile_env,
+            token_served,
             seen,
         })
     }
@@ -9819,6 +10152,7 @@ impl WorkerIdle {
                 snap,
                 generation,
                 profile_env: Vec::new(),
+                token_served: ServedToken::Unnamed(None),
                 seen,
             },
             env,
@@ -9900,9 +10234,9 @@ impl WorkerIdle {
         if matches!(
             point,
             AccountPoint::Wall {
-                kind: aterm_phase::WallKind::Auth
+                kind: alab_policy::vocab::WallKind::Auth
             } | AccountPoint::LoginEnded
-        ) && let Some(first) = token_refused_at(&seat, &roster, &look.who)
+        ) && let Some(first) = token_refused_at(&seat, &roster, &look)
         {
             if first {
                 aterm_log::info!(
@@ -9970,14 +10304,26 @@ impl WorkerIdle {
             self.login_served(&seat, &roster, &look);
         }
         let me = asked_at(look.me(&roster), point, self.switches.logins());
-        let advice =
-            checked_account_advice(&roster, &state, &mut judged.identities, seat.now, |state| {
-                accounts::advise(&roster, state, &enrolled, &me, &at, mode, seat.now)
-            });
+        let mut serves = |row: &accounts::Row| {
+            token_route::row_token_serves_at(&seat.home, &store, &roster, row, seat.now)
+        };
+        let advice = checked_account_advice(
+            (&roster, &state, &enrolled),
+            &mut judged.identities,
+            &mut serves,
+            seat.now,
+            |state| accounts::advise(&roster, state, &enrolled, &me, &at, mode, seat.now),
+        );
         let past = matches!(advice, accounts::Advice::Probe).then(|| {
-            checked_account_advice(&roster, &state, &mut judged.identities, seat.now, |state| {
-                accounts::advise_past_probe(&roster, state, &enrolled, &me, &at, mode, seat.now)
-            })
+            checked_account_advice(
+                (&roster, &state, &enrolled),
+                &mut judged.identities,
+                &mut serves,
+                seat.now,
+                |state| {
+                    accounts::advise_past_probe(&roster, state, &enrolled, &me, &at, mode, seat.now)
+                },
+            )
         });
         self.account_note(&seat, &roster, &look, &state);
         let at_wall = point.at_wall();
@@ -11100,18 +11446,28 @@ impl WorkerIdle {
         let advise = |state: &accounts::State, now: i64| {
             let me = asked_at(look.me(&roster), advised.point, controls.logins);
             let mut identities = AccountIdentities::new(&seat, &look.profile_env);
+            let store = seat.claude_store();
+            let mut serves = |row: &accounts::Row| {
+                token_route::row_token_serves_at(&seat.home, &store, &roster, row, now)
+            };
             // The writer calls this again after validating the complete bound roster.
-            checked_account_advice(&roster, state, &mut identities, now, |state| {
-                accounts::advise_past_probe(
-                    &roster,
-                    state,
-                    &enrolled,
-                    &me,
-                    &point,
-                    controls.mode,
-                    now,
-                )
-            })
+            checked_account_advice(
+                (&roster, state, &enrolled),
+                &mut identities,
+                &mut serves,
+                now,
+                |state| {
+                    accounts::advise_past_probe(
+                        &roster,
+                        state,
+                        &enrolled,
+                        &me,
+                        &point,
+                        controls.mode,
+                        now,
+                    )
+                },
+            )
         };
         let accounts::Advice::Move { to: first, .. } = advise(&state, seat.now) else {
             return RestartAnswer::unread(CHANGED);
@@ -11405,6 +11761,13 @@ impl WorkerIdle {
     }
 }
 
+/// A test act's answer of no agent in the tab ([`SnapshotRefusal::Answered`]).
+#[cfg(any(test, feature = "bench-support"))]
+pub(crate) const NO_AGENT: SnapshotRefusal = SnapshotRefusal::Answered("no-foreground");
+
+/// The refusal of a relaunch snapshot read the host could make no options for: no answer read.
+const SNAPSHOT_NO_OPTS: &str = "no-opts";
+
 /// The word each tab's last relaunch snapshot read was refused by, said when it changes.
 fn snapshot_refused(sid: &str, why: Option<&'static str>) {
     static SAID: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
@@ -11491,8 +11854,16 @@ impl SnapshotRead {
             return false;
         }
         match (hooks.acts.snapshot)(sid) {
-            Some(snap) => land_snapshot(sid, kept, hooks, snap, stale),
-            None => {
+            Ok(snap) => land_snapshot(sid, kept, hooks, snap, stale),
+            Err(refused) => {
+                with_kept_of(kept, |k| {
+                    if !stale(k) {
+                        k.snapshot_unread = match refused {
+                            SnapshotRefusal::Unread(why) => Some(why),
+                            SnapshotRefusal::Answered(_) => None,
+                        };
+                    }
+                });
                 self.follow(sid, kept, hooks, revoked);
                 false
             }
@@ -11517,6 +11888,7 @@ fn land_snapshot(
         let moved = publish_snapshot(sid, Some(&snap));
         let said = asked_runs(sid, &mut kept, &snap);
         kept.snapshot = Some(snap);
+        kept.snapshot_unread = None;
         (moved, said)
     };
     observe_published_snapshot(sid, hooks);
@@ -11710,16 +12082,6 @@ fn start_off_point<B: Clone + Send + 'static>(
         PointRead::over(kept, &out);
     }
     out
-}
-
-/// Read the relaunch record again at an idle point on a thread of its own, one per session, waiting `bound` at most: whether it ended.
-fn refresh_snapshot_at_point(
-    sid: &str,
-    kept: &Arc<Mutex<Kept>>,
-    hooks: &Hooks,
-    bound: Duration,
-) -> bool {
-    reread(sid, kept, hooks, None, bound) != Reread::Out
 }
 
 /// Read the relaunch record again on the session's one read off the worker's thread
@@ -11951,7 +12313,7 @@ fn land_passive_read(
     if !owner.current(hooks) {
         return false;
     }
-    let Some(snap) = (hooks.acts.snapshot)(sid) else {
+    let Ok(snap) = (hooks.acts.snapshot)(sid) else {
         return false;
     };
     let mut snap = with_self_claimed_line(sid, snap, false);
@@ -13406,6 +13768,7 @@ fn relaunch_until_with(
         } else {
             pause
         };
+        aterm_log::debug!("harness @{sid}: relaunch worker waiting {wait:?}");
         if wait_for(Instant::now() + (hooks.pause)(wait), || {
             !job.left.is(Word::Left)
         }) {
@@ -13437,7 +13800,9 @@ fn relaunch_until_with(
             at_keys = false;
             continue;
         }
+        aterm_log::debug!("harness @{sid}: relaunch worker reading the exit decision");
         let decision = decide();
+        aterm_log::debug!("harness @{sid}: relaunch worker exit decision {decision:?}");
         if !job.admitted() {
             settled(job);
             return false;
@@ -13467,7 +13832,9 @@ fn relaunch_until_with(
         if claims {
             (hooks.acts.claim)(sid, true);
         }
+        aterm_log::debug!("harness @{sid}: relaunch worker entering the executor");
         let step = attempt();
+        aterm_log::debug!("harness @{sid}: relaunch worker executor returned {step}");
         if !job.admitted() {
             give_back();
             settled(job);
@@ -15279,14 +15646,14 @@ impl HostHandle {
     pub(crate) fn wall_answer(
         &self,
         agent: Program,
-        kind: aterm_phase::WallKind,
+        kind: alab_policy::vocab::WallKind,
         has_reset: bool,
     ) -> aterm_messages::presence::WallAnswer {
         use aterm_agent::supervise::policy::outlook::{Answer, answer};
         use aterm_messages::presence::WallAnswer;
         if !self.admits(agent)
             || !agent.supervisable()
-            || (kind == aterm_phase::WallKind::Auth
+            || (kind == alab_policy::vocab::WallKind::Auth
                 && !aterm_agent::supervise::policy::login::carried(agent))
         {
             return WallAnswer::Nobody;
@@ -17222,7 +17589,7 @@ fn host_pass(
     };
     let rostered = wanted.clone();
     let off = if active {
-        OffSessions::read(hooks, cfg.autopilot)
+        OffSessions::read(hooks, cfg.turn_end.autopilot)
     } else {
         OffSessions::default()
     };
@@ -20118,6 +20485,7 @@ fn start_worker(
         background_at: Mutex::default(),
         tasked: Mutex::default(),
         finished: Mutex::default(),
+        goal: Mutex::default(),
         note: Arc::clone(&note),
         clock_hold: Mutex::default(),
         net: Arc::clone(&shared.net),
@@ -20513,7 +20881,7 @@ pub(crate) fn note_codex_report(
     use aterm_core::terminal::program_state::ProgramApp;
     let codex = match shown {
         Some(ProgramApp::Codex) => true,
-        Some(ProgramApp::GrokBuild) | None => false,
+        Some(ProgramApp::ClaudeCode | ProgramApp::GrokBuild) | None => false,
     };
     let mut reports = CODEX_REPORTS.lock().unwrap_or_else(PoisonError::into_inner);
     if codex {
@@ -21145,6 +21513,7 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
     let opts = Arc::new(opts);
     let standing_opts = Arc::clone(&opts);
     let o_finished = Arc::clone(&opts);
+    let o_goal = Arc::clone(&opts);
     let o_earlier = Arc::clone(&opts);
     let o_adopted = Arc::clone(&opts);
     let o_in_flight = Arc::clone(&opts);
@@ -21306,14 +21675,14 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
                     took.total().as_millis()
                 );
             }
-            match read? {
+            match read.ok_or(SnapshotRefusal::Unread(SNAPSHOT_NO_OPTS))? {
                 Ok(snap) => {
                     snapshot_refused(sid, None);
-                    Some(snap)
+                    Ok(snap)
                 }
                 Err(why) => {
                     snapshot_refused(sid, Some(why));
-                    None
+                    Err(SnapshotRefusal::of(why))
                 }
             }
         }),
@@ -21552,6 +21921,9 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
             let o = o10(sid, 0)?;
             memo.of_snapshot(&o.home, snap, &conversation_typed(&o, sid, snap)?)
         }),
+        goal: Arc::new(move |sid, snap, memo| {
+            o_goal(sid, 0).map_or_else(Default::default, |o| memo.of_snapshot(&o.home, snap))
+        }),
         finished: Arc::new(move |sid, snap, memo| {
             let o = o_finished(sid, 0)?;
             let finished = memo.of_snapshot(&o.home, snap, &conversation_typed(&o, sid, snap)?);
@@ -21575,14 +21947,9 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
         }),
         transcript_tail: Arc::new(upgrade_drive::snapshot_transcript_tail),
         repo_work: Arc::new(move |snap| {
-            use aterm_agent::harness::{repo_work, unix_time};
-            let tail = upgrade_drive::snapshot_transcript_tail(snap);
-            let used =
-                repo_work::Used::of_session(unix_time::parse_lstart(&snap.start), tail.as_deref());
-            repo_work::session_dir(&snap.cwd, tail.as_deref())
-                .map_or_else(Default::default, |dir| {
-                    session_repo_work(&dir, repo_home.as_deref(), &used)
-                })
+            snapshot_subject(snap).map_or_else(Default::default, |(dir, used)| {
+                session_repo_work(&dir, repo_home.as_deref(), &used)
+            })
         }),
         leftover: Arc::new(move |sid| {
             crate::control::control_end::agents_left_now(&left_store, sid)
@@ -21946,6 +22313,21 @@ fn account_wall_of(
     (word, label)
 }
 
+/// WHERE THE PROBE OF THE AGENT `snap` NAMES READS ([`Acts::repo_work`], and `harness probe repo`
+/// where the snapshot names the claimant, [`crate::harness_probe_verb::live_subject`]): the folder
+/// it works in, the last `cwd` its transcript wrote, else the one the snapshot names
+/// ([`aterm_agent::harness::repo_work::session_dir`]), and what it used beyond that folder's
+/// `HEAD` since it began ([`aterm_agent::harness::repo_work::Used::of_session`]); `None` where
+/// neither names an absolute folder.
+pub(crate) fn snapshot_subject(
+    snap: &Snapshot,
+) -> Option<(PathBuf, aterm_agent::harness::repo_work::Used)> {
+    use aterm_agent::harness::{repo_work, unix_time};
+    let tail = upgrade_drive::snapshot_transcript_tail(snap);
+    let used = repo_work::Used::of_session(unix_time::parse_lstart(&snap.start), tail.as_deref());
+    repo_work::session_dir(&snap.cwd, tail.as_deref()).map(|dir| (dir, used))
+}
+
 /// What a session working in `dir`, having used `used`, holds that no remote main has (`IdleHost::repo_work`, [`aterm_agent::harness::repo_work::probe_session`]).
 pub(crate) fn session_repo_work(
     dir: &std::path::Path,
@@ -22195,7 +22577,7 @@ fn startups_on(
                         .get(crate::task_record::SELF_CLAIM_ATTENTION_OWNER)
                         .map(str::to_string),
                     meta.supervisor_proven(crate::metrics::now_us()),
-                    meta.autopilot_word() == Some(aterm_agent::supervise::Autopilot::Off),
+                    meta.autopilot_word() == Some(alab_policy::config::Autopilot::Off),
                 )
             };
             let hold_observation = h.ctx.fabric.hold_observation();
@@ -23577,35 +23959,74 @@ type TokenStanding = aterm_secrets::claude_token::Standing;
 #[cfg(not(unix))]
 type TokenStanding = std::convert::Infallible;
 
-/// What a token session's reading leaves to write once its fold is ([`token_verify`]): the
-/// token's key and the evidence of its windows.
+/// An account's current windows as a token's verification compares them
+/// ([`token_others`], [`token_basis`]).
 #[cfg(unix)]
-type TokenVerify = (
-    aterm_secrets::claude_token::Key,
-    aterm_secrets::claude_token::Verified,
-);
+type TokenWindows = aterm_agent::harness::accounts_tokens::Windows;
 #[cfg(not(unix))]
-type TokenVerify = std::convert::Infallible;
+type TokenWindows = std::convert::Infallible;
+
+/// What a token session's reading leaves to write to the vault once its fold is
+/// ([`token_write`]), for the token's key.
+#[cfg(unix)]
+enum TokenWrite {
+    /// `verified`, for the token compared, with the evidence of its windows.
+    Verify(
+        aterm_secrets::claude_token::Key,
+        aterm_agent::harness::accounts_tokens::Verify,
+    ),
+}
+#[cfg(not(unix))]
+type TokenWrite = std::convert::Infallible;
+
+/// What [`token_standing`] found of a session's vault token.
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "off unix no session runs on a vault token")
+)]
+enum TokenLook {
+    /// The session runs on no vault token of its row: its stored login, or off its credentials.
+    Stored,
+    /// It runs on its row's token, and this Mac's vault could not be read just now.
+    Unread,
+    /// It runs on its row's token, and the vault holds none of the row's account now.
+    Absent,
+    /// It runs on its row's token, the vault's standing of it (boxed: it is far the largest).
+    Found(Box<TokenStanding>),
+}
+
+/// What a session's reading is to its row's vault token ([`token_on`]).
+type TokenOn = aterm_agent::harness::token_route::OnToken;
+
+/// Which token of the entry a session runs on, as its environment and birth say
+/// ([`AccountLook::token_served`]).
+type ServedToken = aterm_agent::harness::token_route::ServedToken;
 
 /// The standing of `row`'s vault token, where the session whose process login is `who` runs on
 /// it (`AuthRoute::VaultToken` naming the row's own entry): read value-free from this Mac's vault,
-/// never waiting past `claude_token::standing`'s brief wait.
+/// never waiting past `claude_token::standing`'s brief wait. A vault that could not be read is
+/// said so, never taken for one on the stored login.
 #[cfg(unix)]
 fn token_standing(
     seat: &AccountSeat,
     row: &accounts::Row,
     who: &accounts::ProcessLogin,
-) -> Option<TokenStanding> {
+) -> TokenLook {
     use aterm_secrets::claude_token::{self, Key, Lookup};
-    let entry = accounts::TokenEntry::of_row(row)?;
+    let Some(entry) = accounts::TokenEntry::of_row(row) else {
+        return TokenLook::Stored;
+    };
     match who.route.for_account(Some(entry)) {
         accounts::AuthRoute::VaultToken { .. } => {}
-        accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => return None,
+        accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => return TokenLook::Stored,
     }
-    let key = Key::parse(entry.key().as_str())?;
+    let Some(key) = Key::parse(entry.key().as_str()) else {
+        return TokenLook::Absent;
+    };
     match claude_token::standing(&aterm_secrets::client::Paths::for_home(&seat.home), &key) {
-        Ok(Lookup::Found(standing)) => Some(standing),
-        Ok(Lookup::Absent | Lookup::Unknown) | Err(_) => None,
+        Ok(Lookup::Found(standing)) => TokenLook::Found(Box::new(standing)),
+        Ok(Lookup::Absent) => TokenLook::Absent,
+        Ok(Lookup::Unknown) | Err(_) => TokenLook::Unread,
     }
 }
 
@@ -23614,51 +24035,173 @@ fn token_standing(
     _seat: &AccountSeat,
     _row: &accounts::Row,
     _who: &accounts::ProcessLogin,
+) -> TokenLook {
+    TokenLook::Stored
+}
+
+/// The standing of `row`'s vault token where the session whose process login is `who` runs on
+/// the row's stored login (`AuthRoute::Stored`) and this Mac's token table holds a row of the
+/// account a stored-login reading gives a basis
+/// ([`aterm_agent::harness::accounts_tokens::basis_wanted`], a table read with no vault read):
+/// then read value-free from this Mac's vault, never waiting past `claude_token::standing`'s
+/// brief wait. What the reading records of it is judged by its standing ([`token_basis`]: a
+/// token in use here and not verified, wherever it was minted).
+#[cfg(unix)]
+fn basis_standing(
+    seat: &AccountSeat,
+    row: &accounts::Row,
+    who: &accounts::ProcessLogin,
+) -> Option<TokenStanding> {
+    use aterm_secrets::claude_token::{self, Key, Lookup};
+    let entry = accounts::TokenEntry::of_row(row)?;
+    if !who.route.for_account(Some(entry)).is_stored() {
+        return None;
+    }
+    let key = Key::parse(entry.key().as_str())?;
+    if !aterm_agent::harness::accounts_tokens::basis_wanted(&seat.claude_store(), &key) {
+        return None;
+    }
+    match claude_token::standing(&aterm_secrets::client::Paths::for_home(&seat.home), &key) {
+        Ok(Lookup::Found(standing)) => Some(standing),
+        Ok(Lookup::Absent | Lookup::Unknown) | Err(_) => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn basis_standing(
+    _seat: &AccountSeat,
+    _row: &accounts::Row,
+    _who: &accounts::ProcessLogin,
 ) -> Option<TokenStanding> {
     None
 }
 
+/// Records the windows of `read`, a reading of a session on the row `label`'s stored login that
+/// the fold credited to the row, as the basis of the row's token `standing`
+/// ([`aterm_agent::harness::accounts_tokens::note_basis`]): after the fold, outside
+/// `accounts.lock`, under `tokens.lock`. A token reading the row kept with no basis is compared
+/// with it at once, `others` being the other accounts' current windows here ([`token_others`]):
+/// where the windows are equal, what [`token_write`] writes. One not recorded (a table that does
+/// not write) is recorded by the next reading.
+#[cfg(unix)]
+fn token_basis(
+    seat: &AccountSeat,
+    standing: &TokenStanding,
+    label: &str,
+    read: &accounts::TapRead,
+    others: &[TokenWindows],
+) -> Option<TokenWrite> {
+    use aterm_agent::harness::accounts_tokens::{self, Based, Windows};
+    match accounts_tokens::note_basis(
+        &seat.claude_store(),
+        standing,
+        label,
+        &Windows::of_reading(read),
+        others,
+        u64::try_from(seat.now).unwrap_or(0),
+    ) {
+        Ok(Based::Verify(verify)) => Some(TokenWrite::Verify(standing.key.clone(), verify)),
+        Ok(Based::Not | Based::Recorded) | Err(_) => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn token_basis(
+    _seat: &AccountSeat,
+    standing: &TokenStanding,
+    _label: &str,
+    _read: &accounts::TapRead,
+    _others: &[TokenWindows],
+) -> Option<TokenWrite> {
+    match *standing {}
+}
+
+/// The other accounts' current windows on this Mac, as their samples in `state` hold them at
+/// `now` (`accounts_tokens::Windows::current`), every account but the row `label`'s, each naming
+/// a week: what a comparison of the row's token's windows reads for `shared`.
+#[cfg(unix)]
+fn token_others(state: &accounts::State, label: &str, now: i64) -> Vec<TokenWindows> {
+    use aterm_agent::harness::accounts_tokens::Windows;
+    state
+        .accounts
+        .iter()
+        .filter(|(other, _)| other.as_str() != label)
+        .filter_map(|(_, account)| {
+            account
+                .sample
+                .as_ref()
+                .map(|sample| Windows::current(sample, now))
+        })
+        .filter(|windows| windows.week_reset.is_some())
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn token_others(_state: &accounts::State, _label: &str, _now: i64) -> Vec<TokenWindows> {
+    Vec::new()
+}
+
+/// What a session the wrapper served as `served` ([`AccountLook::token_served`]) is to the vault's
+/// token `standing` ([`ServedToken::on`](aterm_agent::harness::token_route::ServedToken::on)):
+/// the marker names the entry alone, so after a `--replace` a session still on the earlier token
+/// reads as one on the entry. Only a reading of that very token is its served reading, folded
+/// into the row, and only one whose wrapper named the token is compared for its verification
+/// ([`token_served`]).
+#[cfg(unix)]
+fn token_on(standing: &TokenStanding, served: ServedToken) -> TokenOn {
+    standing
+        .meta
+        .as_ref()
+        .map_or(TokenOn::Other, |meta| served.on(meta.minted_at))
+}
+
+#[cfg(not(unix))]
+fn token_on(standing: &TokenStanding, _served: ServedToken) -> TokenOn {
+    match *standing {}
+}
+
+/// What a token session's reading is to its row ([`token_served`]): `Continue` where it is the
+/// row's, folded into it; `Break` where the token's windows were found different, so nothing of
+/// the reading is folded. `Continue` carries what [`token_write`] writes once the fold is, where
+/// the windows were found equal on the Mac that minted the token.
+type TokenReading = std::ops::ControlFlow<Option<TokenWrite>, Option<TokenWrite>>;
+
 /// A token session's served reading `read` of the row `label`, recorded in this Mac's token table
 /// before the fold ([`aterm_agent::harness::accounts_tokens::note_served`]): its served facts,
-/// and on the minting Mac the basis (the row's stored-login windows `state` holds now) and the
-/// comparison, with the other accounts' current windows here. Where the windows are equal, what
-/// [`token_verify`] writes once the fold is.
+/// and, where the token is in use here unverified, its comparison with the basis a stored-login
+/// reading recorded ([`token_basis`]), with the other accounts' current windows here as their
+/// samples in `state` hold them. Where the windows are equal on the Mac that minted the token and
+/// its wrapper named the token (`named`), what [`token_write`] writes once the fold is; where
+/// they differ, or the token is not in use here unverified (minted on another Mac at a person's
+/// terminal, or by a meta that names no route) and not verified, that the reading is apart from
+/// the row. A table that could not be written is an error, which folds nothing: the token's
+/// verdict was not read, and a token whose windows differ would be folded into the row.
 #[cfg(unix)]
 fn token_served(
     seat: &AccountSeat,
     standing: &TokenStanding,
-    label: &str,
+    (label, named): (&str, bool),
     state: &accounts::State,
     read: &accounts::TapRead,
     now: i64,
-) -> Option<TokenVerify> {
+) -> Result<TokenReading, String> {
     use aterm_agent::harness::accounts_tokens::{self, Due, Served, Windows};
-    let windows = |account: &accounts::Account| {
-        account
-            .sample
-            .as_ref()
-            .map(|sample| Windows::current(sample, now))
-    };
     let served = Served {
         label: label.to_owned(),
-        basis: state
-            .accounts
-            .get(label)
-            .and_then(windows)
-            .unwrap_or_default(),
         reading: Windows::of_reading(read),
-        others: state
-            .accounts
-            .iter()
-            .filter(|(other, _)| other.as_str() != label)
-            .filter_map(|(_, account)| windows(account))
-            .filter(|windows| windows.week_reset.is_some())
-            .collect(),
+        others: token_others(state, label, now),
+        named,
     };
     let at = u64::try_from(now).unwrap_or(0);
+    let key = || standing.key.clone();
     match accounts_tokens::note_served(&seat.claude_store(), standing, &served, at) {
-        Ok(Due::Verify(evidence)) => Some((standing.key.clone(), evidence)),
-        Ok(Due::Nothing) | Err(_) => None,
+        Ok(Due::Verify(verify)) => Ok(TokenReading::Continue(Some(TokenWrite::Verify(
+            key(),
+            verify,
+        )))),
+        Ok(Due::Apart) => Ok(TokenReading::Break(None)),
+        Ok(Due::Nothing) => Ok(TokenReading::Continue(None)),
+        Err(why) => Err(format!("the token table: {why}")),
     }
 }
 
@@ -23666,49 +24209,53 @@ fn token_served(
 fn token_served(
     _seat: &AccountSeat,
     standing: &TokenStanding,
-    _label: &str,
+    _label: (&str, bool),
     _state: &accounts::State,
     _read: &accounts::TapRead,
     _now: i64,
-) -> Option<TokenVerify> {
+) -> Result<TokenReading, String> {
     match *standing {}
 }
 
-/// Writes `verified` for the token [`token_served`] found equal windows for
-/// ([`aterm_agent::harness::accounts_tokens::verify_served`]), after the fold and outside every
-/// store's lock: a vault write. One the vault holds is tried again at the next reading.
+/// Writes what [`token_served`] or [`token_basis`] left for the vault: `verified` for the token
+/// found equal windows for ([`aterm_agent::harness::accounts_tokens::verify_served`]). After the
+/// fold and outside every store's lock: a vault write, refused where the vault no longer holds the
+/// token compared. One the vault holds off is tried again at the token's next reading.
 #[cfg(unix)]
-fn token_verify(seat: &AccountSeat, (key, evidence): TokenVerify) {
-    let _ = aterm_agent::harness::accounts_tokens::verify_served(
-        &seat.claude_store(),
-        &aterm_agent::harness::accounts_tokens::Vault(aterm_secrets::client::Paths::for_home(
-            &seat.home,
-        )),
-        &key,
-        evidence,
-        u64::try_from(seat.now).unwrap_or(0),
-    );
+fn token_write(seat: &AccountSeat, write: TokenWrite) {
+    use aterm_agent::harness::accounts_tokens::{self, Vault};
+    let vault = Vault(aterm_secrets::client::Paths::for_home(&seat.home));
+    let _ = match write {
+        TokenWrite::Verify(key, verify) => accounts_tokens::verify_served(
+            &seat.claude_store(),
+            &vault,
+            &key,
+            verify,
+            u64::try_from(seat.now).unwrap_or(0),
+        ),
+    };
 }
 
 #[cfg(not(unix))]
-fn token_verify(_seat: &AccountSeat, verify: TokenVerify) {
-    match verify {}
+fn token_write(_seat: &AccountSeat, write: TokenWrite) {
+    match write {}
 }
 
-/// The route move [`IdleHost::route_move`] offers the session whose process login is `who`
-/// ([`aterm_agent::harness::token_route::offered_move`]).
+/// The route move [`IdleHost::route_move`] offers the session `look` reads, by its process login
+/// and the token its wrapper served it ([`AccountLook::token_served`],
+/// [`aterm_agent::harness::token_route::offered_move`]).
 #[cfg(unix)]
 fn route_offered(
     seat: &AccountSeat,
     roster: &accounts::Roster,
-    who: &accounts::ProcessLogin,
+    look: &AccountLook,
 ) -> Option<RouteTo> {
     aterm_agent::harness::token_route::offered_move(
         &seat.home,
         &aterm_secrets::client::Paths::for_home(&seat.home),
         &seat.claude_store(),
         Some(roster),
-        who,
+        (&look.who, look.token_served),
         u64::try_from(seat.now).unwrap_or(0),
     )
 }
@@ -23717,26 +24264,30 @@ fn route_offered(
 fn route_offered(
     _seat: &AccountSeat,
     _roster: &accounts::Roster,
-    _who: &accounts::ProcessLogin,
+    _look: &AccountLook,
 ) -> Option<RouteTo> {
     None
 }
 
-/// Whether a lost login on the session whose process login is `who` is its vault token's
-/// refusal, recorded ([`aterm_agent::harness::token_route::token_refused`]): `Some(first)` for a
-/// session the wrapper served, `None` for one on its stored login.
+/// Whether a lost login on the session `look` reads is its vault token's refusal, recorded
+/// ([`aterm_agent::harness::token_route::token_refused`]) where the session runs on the vault's
+/// token ([`AccountLook::token_served`]) and its newest API error answered `401`
+/// ([`upgrade_drive::named_api_error_status`]; a `403` is Cloudflare's block page):
+/// `Some(first)` for a session the wrapper served (`Some(false)` where nothing was recorded),
+/// `None` for one on its stored login.
 #[cfg(unix)]
 fn token_refused_at(
     seat: &AccountSeat,
     roster: &accounts::Roster,
-    who: &accounts::ProcessLogin,
+    look: &AccountLook,
 ) -> Option<bool> {
     aterm_agent::harness::token_route::token_refused(
         &seat.home,
         &aterm_secrets::client::Paths::for_home(&seat.home),
         &seat.claude_store(),
         Some(roster),
-        who,
+        (&look.who, look.token_served),
+        upgrade_drive::named_api_error_status(&seat.home, &look.snap),
         u64::try_from(seat.now).unwrap_or(0),
     )
 }
@@ -23745,7 +24296,7 @@ fn token_refused_at(
 fn token_refused_at(
     _seat: &AccountSeat,
     _roster: &accounts::Roster,
-    _who: &accounts::ProcessLogin,
+    _look: &AccountLook,
 ) -> Option<bool> {
     None
 }
@@ -25099,6 +25650,11 @@ struct AccountLook {
     generation: Arc<Mutex<()>>,
     /// Only the profile selectors from the same process environment as `who`.
     profile_env: Vec<String>,
+    /// From the same process environment as `who`, and the process's birth, which token of the
+    /// entry its marker names it runs on
+    /// ([`ServedToken::of`](aterm_agent::harness::token_route::ServedToken::of)): the `minted_at`
+    /// aterm's wrapper named serving it, or, for a process an earlier wrapper served, none.
+    token_served: ServedToken,
     /// What the process's login file says it runs on, read when `who` was
     /// ([`observe::claude`], [`observe::pooled`]).
     seen: Observation,
@@ -25205,7 +25761,7 @@ fn lost_seen_of(k: &mut Kept, snap: &Snapshot, point: AccountPoint, now: i64) ->
     if !matches!(
         point,
         AccountPoint::Wall {
-            kind: aterm_phase::WallKind::Auth
+            kind: alab_policy::vocab::WallKind::Auth
         }
     ) {
         return now;
@@ -25373,6 +25929,16 @@ fn renewable_listed(roster: &accounts::Roster) -> bool {
     roster.rows.iter().any(|row| row.email.is_some())
 }
 
+/// What `me` runs on, for a log line that says why it is not a row's own stored login.
+fn not_own_stored(me: &accounts::Me<'_>) -> String {
+    match me.account {
+        None => "no roster row is its login's".to_owned(),
+        Some(_) if !me.default_home => "its process names a Claude home of its own".to_owned(),
+        Some(_) if !me.route.is_stored() => format!("it runs on its {} route", me.route.word()),
+        Some(label) => format!("its login is {label}'s"),
+    }
+}
+
 /// The renewable row whose own login the process holds.
 fn renewable_own(roster: &accounts::Roster, look: &AccountLook) -> Option<String> {
     let me = look.me(roster);
@@ -25399,7 +25965,7 @@ struct OwnWall {
 /// An explicit usage wall read from the current Claude process's settled screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScreenAccountWall {
-    kind: aterm_phase::WallKind,
+    kind: alab_policy::vocab::WallKind,
     at: u64,
 }
 
@@ -25411,7 +25977,7 @@ impl ScreenAccountWall {
             // UsageSession includes a generic usage-limit banner, which names no window.
             window: Some(
                 match self.kind {
-                    aterm_phase::WallKind::UsageWeekly => "seven_day",
+                    alab_policy::vocab::WallKind::UsageWeekly => "seven_day",
                     _ => accounts::UNNAMED_WINDOW,
                 }
                 .to_string(),
@@ -25455,8 +26021,8 @@ fn screen_account_wall_of(
         return None;
     }
     let kind = match published.word {
-        "wall:usage-session" => aterm_phase::WallKind::UsageSession,
-        "wall:usage-weekly" => aterm_phase::WallKind::UsageWeekly,
+        "wall:usage-session" => alab_policy::vocab::WallKind::UsageSession,
+        "wall:usage-weekly" => alab_policy::vocab::WallKind::UsageWeekly,
         _ => return None,
     };
     let started = u64::try_from(process_started(&snap.start)?).ok()?;
@@ -25511,7 +26077,7 @@ fn standing_wall(seat: &AccountSeat, snap: &Snapshot) -> Standing {
 
 /// A usage limit as the loop's screen reads it: any wall but a lost login.
 fn usage_limit(point: AccountPoint) -> bool {
-    matches!(point, AccountPoint::Wall { kind } if kind != aterm_phase::WallKind::Auth)
+    matches!(point, AccountPoint::Wall { kind } if kind != alab_policy::vocab::WallKind::Auth)
 }
 
 /// The session as the roster is asked about it at `point`.
@@ -25553,7 +26119,7 @@ fn account_point_read(
     match point {
         AccountPoint::TurnEnd => (accounts::Point::TurnEnd, None, false),
         AccountPoint::Wall {
-            kind: aterm_phase::WallKind::Auth,
+            kind: alab_policy::vocab::WallKind::Auth,
         } => (accounts::Point::LostLogin { seen }, None, false),
         AccountPoint::LoginEnded => (accounts::Point::LoginEnded, None, false),
         AccountPoint::Wall { kind } => match standing_wall(seat, &look.snap) {
@@ -25604,7 +26170,7 @@ fn pool_point(
     match point {
         AccountPoint::TurnEnd => accounts::Point::TurnEnd,
         AccountPoint::Wall {
-            kind: aterm_phase::WallKind::Auth,
+            kind: alab_policy::vocab::WallKind::Auth,
         } => accounts::Point::LostLogin { seen },
         AccountPoint::LoginEnded => accounts::Point::LoginEnded,
         AccountPoint::Wall { .. } => match standing_wall(seat, &look.snap) {
@@ -25910,23 +26476,38 @@ fn account_identity_matches(
 
 /// Exclude known identity contradictions only from this selection. Recompute with
 /// the whole roster, pin and canary intact; the persisted authentication state is unchanged.
+/// A target that runs here only on its vault token ([`accounts::LoginHere::OnToken`], `enrolled`
+/// holding the rows whose login is made here) and whose token `serves` says the move's line would
+/// not start on is refused as signed out ([`accounts::token_guarded`]'s rule), so a stale reading
+/// of the vault never moves a session onto a lapsed stored login.
 fn checked_account_advice(
-    roster: &accounts::Roster,
-    state: &accounts::State,
+    (roster, state, enrolled): (&accounts::Roster, &accounts::State, &BTreeSet<String>),
     identities: &mut AccountIdentities,
+    serves: &mut dyn FnMut(&accounts::Row) -> bool,
     now: i64,
     advise: impl Fn(&accounts::State) -> accounts::Advice,
 ) -> accounts::Advice {
-    let mut candidates = None;
+    let mut candidates: Option<accounts::State> = None;
     let mut excluded = BTreeSet::new();
+    let mut refused = BTreeSet::new();
     loop {
-        let advice = advise(candidates.as_ref().unwrap_or(state));
+        let current = candidates.as_ref().unwrap_or(state);
+        let advice = advise(current);
         let accounts::Advice::Move { to, .. } = &advice else {
             return advice;
         };
         let Some(row) = roster.row(to) else {
             return accounts::Advice::Stay(accounts::StayWhy::NoCandidate);
         };
+        if accounts::token_pick_refused(row, current, enrolled.contains(to), now, serves) {
+            if !refused.insert(to.clone()) {
+                return accounts::Advice::Stay(accounts::StayWhy::NoCandidate);
+            }
+            candidates
+                .get_or_insert_with(|| state.clone())
+                .refuse_token(to);
+            continue;
+        }
         if identities.matches(row) {
             return advice;
         }
@@ -27205,6 +27786,11 @@ fn disk_look_pass(
                             went.len()
                         );
                     }
+                    // While space is ample, measure who holds the disk, so the row a later
+                    // crossing writes names holders from its first tick.
+                    let _ = atpkg::build_cache::holders::measure_home(
+                        aterm_agent::harness::disk::HOLDERS_DAILY_BUDGET,
+                    );
                 },
             );
             if let Err(error) = result {
@@ -29755,16 +30341,11 @@ fn activation_wake(host: &HostHandle) -> ActivationWake {
                 }
             }),
         );
+    // The store's own files move when a vault version carrying the mailbox entry lands (its
+    // saved state and its verified envelope); the person's own mailbox config is a file.
     for secret_mark in [
         aterm_types::dirs::aterm_config_dir().map(|d| d.join("secrets/state.toml")),
-        home.as_ref().map(|h| {
-            h.join(".secrets")
-                .join(aterm_agent::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE)
-        }),
-        home.as_ref().map(|h| {
-            h.join(".secrets")
-                .join(aterm_agent::harness::headless_oauth::MAILBOX_TOML_FILE)
-        }),
+        aterm_types::dirs::aterm_config_dir().map(|d| d.join("secrets/vault")),
         aterm_types::dirs::aterm_config_dir()
             .map(|d| d.join(aterm_agent::harness::headless_oauth::MAILBOX_TOML_FILE)),
     ] {
@@ -30211,7 +30792,7 @@ impl Acts {
             }),
             wake_release: Arc::new(|_, _, _, _| {}),
             wakes_left: Arc::new(|_| {}),
-            snapshot: Arc::new(|_| None),
+            snapshot: Arc::new(|_| Err(NO_AGENT)),
             observe_snapshot: Arc::new(|_| {}),
             point_read: INERT_POINT_READ,
             follow: Arc::new(|_, _| Foreground::Shell),
@@ -30243,13 +30824,12 @@ impl Acts {
             restart: Arc::new(|_, _, _, _, _| RestartSaid::step("refused:inert")),
             tasked: Arc::new(|_, _, _| None),
             finished: Arc::new(|_, _, _| None),
+            goal: Arc::new(|_, _, _| aterm_agent::harness::goal::GoalRead::Unread),
             limit_reset: Arc::new(|_| None),
             transcript_tail: Arc::new(|_| None),
             repo_work: Arc::new(|_| Default::default()),
             leftover: Arc::new(|_| aterm_agent::harness::leftover::LeftRead::NotAsked),
-            credentials: Arc::new(|_| {
-                aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked
-            }),
+            credentials: Arc::new(|_| alab_policy::credential_need::CredentialRead::NotAsked),
             work_read: Arc::new(|_, _, _, _| aterm_agent::harness::work_record::WorkRead::None),
             work_put: Arc::new(|_, _, _| {}),
             work_overlap: Arc::new(|_| None),
@@ -30434,6 +31014,7 @@ impl HostHandle {
                     home: None,
                     claude_dir: None,
                 })
+                .ok_or(NO_AGENT)
         });
         acts.exited = Arc::new(|snap, within| {
             if snap.pid == SUCCESSOR_TEST_LANDED {

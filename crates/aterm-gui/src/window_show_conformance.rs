@@ -89,6 +89,7 @@ impl Rig {
             (w1, shown(0, true, true)),
             (w2, shown(2, false, false)),
         ];
+        self.app.restore_focus.begin();
         self.app.carried_window_show = Some(CarriedShow::new(lane, plan(&windows, lane), Some(w0)));
     }
 
@@ -152,6 +153,7 @@ impl Rig {
             "Type" => {
                 performed.push(action);
                 self.typed.push(self.holder);
+                self.app.note_restore_focus_intent(self.holder);
                 let winit_id = *self
                     .app
                     .winit_to_window
@@ -174,7 +176,14 @@ impl Rig {
                     .app
                     .carried_window_show
                     .as_ref()
-                    .map(|carried| carried.plan.stacking_ops())
+                    .map(|carried| {
+                        carried
+                            .plan
+                            .stacking_ops()
+                            .into_iter()
+                            .filter(|op| carried.committed || !matches!(op, ShowOp::MakeKey(_)))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 assert!(
                     self.app.handoff_ready.is_none(),
@@ -198,6 +207,16 @@ impl Rig {
                 assert_eq!(typed, self.typed, "the queue holds what was typed, where");
                 self.app.commit_carried_window_show(&typed)
             }
+            "ChooseSaved" => {
+                performed.push(action);
+                self.typed.clear();
+                self.app.handoff_deferred_input.clear();
+                self.app.raise_window(self.key);
+                self.front = true;
+                let mut ops = self.key_to(self.key);
+                ops.extend(self.app.settle_carried_window_show());
+                ops
+            }
             "Stack" | "EnterFullScreen" => self.app.settle_carried_window_show(),
             other => panic!("no such action {other}"),
         };
@@ -205,7 +224,7 @@ impl Rig {
         while index < ops.len() {
             let op = ops[index];
             match op {
-                ShowOp::Raise(window) => {
+                ShowOp::MakeKey(window) => {
                     let more = self.key_to(window);
                     ops.extend(more);
                 }
@@ -215,7 +234,7 @@ impl Rig {
                         self.fsfront = self.front;
                     }
                 }
-                ShowOp::Minimize(_) => {}
+                ShowOp::Minimize(_) | ShowOp::OrderFront(_) => {}
             }
             index += 1;
         }
@@ -271,10 +290,24 @@ const SCHEDULES: &[&[&str]] = &[
     &["Launch", "Reveal", "Prove", "Activate", "Commit"],
     &["Launch", "Reveal", "Prove", "Commit", "Activate"],
     &[
-        "Launch", "Reveal", "Prove", "Steal", "Type", "Commit", "Activate",
+        "Launch",
+        "Reveal",
+        "Prove",
+        "Steal",
+        "Type",
+        "Commit",
+        "Activate",
+        "ChooseSaved",
     ],
     &[
-        "Launch", "Reveal", "Prove", "Activate", "Steal", "Type", "Commit",
+        "Launch",
+        "Reveal",
+        "Prove",
+        "Activate",
+        "Steal",
+        "Type",
+        "Commit",
+        "ChooseSaved",
     ],
     &["Launch", "Reveal", "Prove", "Steal", "Commit", "Activate"],
     &[
@@ -287,8 +320,24 @@ const SCHEDULES: &[&[&str]] = &[
         "Activate",
     ],
     &["Launch", "Reveal", "Activate", "Prove", "Commit"],
-    &["Launch", "Reveal", "Type", "Prove", "Commit", "Activate"],
-    &["Launch", "Reveal", "Activate", "Type", "Prove", "Commit"],
+    &[
+        "Launch",
+        "Reveal",
+        "Type",
+        "Prove",
+        "Commit",
+        "Activate",
+        "ChooseSaved",
+    ],
+    &[
+        "Launch",
+        "Reveal",
+        "Activate",
+        "Type",
+        "Prove",
+        "Commit",
+        "ChooseSaved",
+    ],
     &["ColdLaunch", "Activate", "Reveal"],
     &["ColdLaunch", "Reveal", "Activate", "Deactivate"],
 ];

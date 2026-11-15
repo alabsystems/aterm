@@ -3,6 +3,63 @@
 
 use super::*;
 
+#[test]
+fn topology_tokens_survive_presentation_updates_and_detect_every_mutable_owner() {
+    let (mut tabs, mut views, ids) = parked_set(2, 1);
+    let token = tabs.revision();
+    tabs.presentation_at_mut(0).unwrap().title = "new label".into();
+    tabs.switch_to(ids[1]);
+    assert!(token.is_current(&tabs));
+    let equal = tabs.clone();
+    assert_eq!(tabs, equal, "cache identity is not content equality");
+    assert!(
+        !token.is_current(&equal),
+        "a whole replacement has its own owner"
+    );
+    let token = tabs.revision();
+    let _ = tabs.active_mut();
+    assert!(!token.is_current(&tabs));
+    let token = tabs.revision();
+    let _ = tabs.tab_at_mut(0);
+    assert!(!token.is_current(&tabs));
+    let token = tabs.revision();
+    tabs.reorder(ids[0], 1);
+    assert!(!token.is_current(&tabs));
+    let token = tabs.revision();
+    tabs.keep(ids[2]);
+    assert!(!token.is_current(&tabs));
+    let token = tabs.revision();
+    tabs.remove(ids[1]);
+    assert!(!token.is_current(&tabs));
+    let token = tabs.revision();
+    tabs.push(equal.get(ids[1]).unwrap().clone()).unwrap();
+    assert!(!token.is_current(&tabs));
+
+    let token = views.revision();
+    let id = views.insert_terminal(99).unwrap();
+    assert!(!token.is_current(&views));
+    let token = views.revision();
+    views.remove(id);
+    assert!(!token.is_current(&views));
+    let token = views.revision();
+    views = ViewStore::default();
+    assert!(!token.is_current(&views));
+}
+
+#[test]
+fn revision_overflow_changes_owner_instead_of_revalidating_an_old_token() {
+    let (mut tabs, _, _) = parked_set(1, 0);
+    tabs.revision.0.store(usize::MAX, Ordering::Relaxed);
+    let token = tabs.revision();
+    let _ = tabs.active_mut();
+    assert!(!token.is_current(&tabs));
+    let mut views = ViewStore::default();
+    views.revision.0.store(usize::MAX, Ordering::Relaxed);
+    let token = views.revision();
+    views.insert_terminal(1).unwrap();
+    assert!(!token.is_current(&views));
+}
+
 fn view_store_with(count: usize) -> (ViewStore, Vec<ViewId>) {
     let mut store = ViewStore::default();
     let ids = (0..count)
@@ -29,6 +86,321 @@ fn parked_set(shown: usize, parked: usize) -> (TabSet, ViewStore, Vec<TabId>) {
         tabs.push(id);
     }
     (set, store, tabs)
+}
+
+fn focused_membership_agrees(set: &TabSet, views: &[ViewId]) -> bool {
+    views.iter().all(|view| {
+        set.contains_focused_view(*view) == set.tabs().iter().any(|tab| tab.focus == *view)
+    })
+}
+
+#[test]
+fn focused_membership_survives_tab_mutations_and_replacement() {
+    fn shared<T: Send + Sync>() {}
+    shared::<TabSet>();
+    shared::<ViewStore>();
+    let (mut set, mut store, tabs) = parked_set(2, 2);
+    let mut views: Vec<_> = store.iter().map(|(id, _)| id).collect();
+    views.sort_unstable();
+    let original = set.tab_at(0).unwrap().focus;
+    let alias = store.insert_terminal(0).unwrap();
+    views.push(alias);
+    let cold = set.clone();
+    assert!(focused_membership_agrees(&set, &views));
+    assert_eq!(set, cold, "warming membership does not change identity");
+    assert_eq!(set.take_focused_view_visits_for_test(), 4);
+
+    set.presentation_at_mut(0).unwrap().title = "renamed".into();
+    assert!(set.reorder(tabs[0], 1));
+    assert!(set.place(tabs[3], 0).is_some());
+    assert!(set.keep(tabs[2]).is_some());
+    assert!(set.switch_to(tabs[0]));
+    set.cycle(true);
+    set.cycle_shown(false);
+    assert!(focused_membership_agrees(&set, &views));
+    assert_eq!(set.take_focused_view_visits_for_test(), 0);
+
+    assert!(set.switch_to(tabs[0]));
+    assert!(
+        set.active_mut()
+            .unwrap()
+            .split_focused(SplitAxis::Horizontal, alias)
+    );
+    assert!(focused_membership_agrees(&set, &views));
+    assert!(!set.contains_focused_view(original));
+    assert!(set.contains_focused_view(alias));
+
+    let copy = set.active().unwrap().clone();
+    let duplicate = Tab::new(
+        TabId::from_stored(100),
+        alias,
+        TabPresentation::terminal("alias"),
+    );
+    set.push(duplicate.clone()).unwrap();
+    assert!(focused_membership_agrees(&set, &views));
+    set.remove(copy.id).unwrap();
+    assert!(focused_membership_agrees(&set, &views));
+    assert!(
+        set.contains_focused_view(alias),
+        "the duplicate still labels this view"
+    );
+
+    let first = set.tab_at(0).unwrap().clone();
+    let last_index = set.shown_len() - 1;
+    let last = set.tab_at(last_index).unwrap().clone();
+    *set.tab_at_mut(0).unwrap() = last;
+    *set.tab_at_mut(last_index).unwrap() = first;
+    assert!(focused_membership_agrees(&set, &views));
+    set.tab_at_mut(last_index).unwrap().id = TabId::from_stored(101);
+    assert!(focused_membership_agrees(&set, &views));
+    assert!(set.invariant_holds(&store));
+
+    set = TabSet::new(copy);
+    assert!(focused_membership_agrees(&set, &views));
+    set = TabSet::default();
+    assert!(focused_membership_agrees(&set, &views));
+
+    let mut set = TabSet::new(duplicate);
+    assert!(focused_membership_agrees(&set, &views));
+    let stale = set.focused_views.get().unwrap().clone();
+    *set.tab_at_mut(0).unwrap() = Tab::new(
+        TabId::from_stored(102),
+        original,
+        TabPresentation::terminal("replacement"),
+    );
+    // Negative control: restore the cache the broad mutable loan correctly invalidated.
+    set.focused_views.set(stale).unwrap();
+    assert!(!focused_membership_agrees(&set, &views));
+    set.focused_views.take();
+    assert!(focused_membership_agrees(&set, &views));
+}
+
+#[test]
+fn terminal_view_index_matches_the_forward_store() {
+    fn check(store: &ViewStore) {
+        for session in [0, 1, 2, 3, 99] {
+            let mut expected: Vec<_> = store
+                .iter()
+                .filter_map(|(id, view)| (view.terminal_session() == Some(session)).then_some(id))
+                .collect();
+            let mut indexed: Vec<_> = store.terminal_views(session).collect();
+            expected.sort_unstable();
+            indexed.sort_unstable();
+            assert_eq!(indexed, expected);
+        }
+    }
+    let (mut store, ids) = view_store_with(4);
+    check(&store);
+    let alias = store.insert_terminal(1).unwrap();
+    let native = store.insert_native(AppInstanceId::from_stored(1)).unwrap();
+    check(&store);
+    store.remove(ids[1]).unwrap();
+    check(&store);
+    assert_eq!(store.terminal_views(1).collect::<Vec<_>>(), [alias]);
+    store.remove(alias).unwrap();
+    check(&store);
+    assert!(store.remove(alias).is_none());
+    store.remove(native).unwrap();
+    check(&store);
+    store = ViewStore::default();
+    store.insert_terminal(99).unwrap();
+    check(&store);
+}
+
+/// Check the selected position against an independent identity search after edits that move
+/// the selected tab or its neighbors, including moves across the parked boundary by `keep`.
+#[test]
+fn active_position_tracks_identity_through_every_tab_edit() {
+    fn check(set: &mut TabSet, views: &ViewStore, expected: Option<TabId>) {
+        let searched = set.tabs().iter().position(|tab| Some(tab.id) == expected);
+        assert_eq!(set.active_id(), expected);
+        assert_eq!(set.active_index(), searched);
+        assert_eq!(set.active().map(|tab| tab.id), expected);
+        assert_eq!(set.active_mut().map(|tab| tab.id), expected);
+        assert!(set.invariant_holds(views));
+    }
+
+    let (views, view_ids) = view_store_with(6);
+    let mut ids = IdAllocator::<TabId>::default();
+    let mut pushed = TabSet::default();
+    check(&mut pushed, &views, None);
+    for (index, view) in view_ids.into_iter().enumerate() {
+        let id = ids.allocate().expect("finite test id space");
+        let mut tab = Tab::new(id, view, TabPresentation::terminal("tab"));
+        tab.parked = index % 2 == 0;
+        pushed.push(tab.clone()).expect("new identity");
+        check(&mut pushed, &views, Some(id));
+        assert_eq!(pushed.push(tab), Err(DuplicateTabId));
+        check(&mut pushed, &views, Some(id));
+    }
+    let stale = ids.allocate().expect("absent identity");
+    let expected = pushed.active_id();
+    assert!(!pushed.switch_to(stale));
+    assert!(!pushed.switch_to_index(pushed.len()));
+    assert!(pushed.remove(stale).is_none());
+    assert!(!pushed.reorder(stale, 0));
+    assert!(pushed.place(stale, 0).is_none());
+    assert!(pushed.keep(stale).is_none());
+    check(&mut pushed, &views, expected);
+
+    let (base, views, tabs) = parked_set(3, 3);
+    for home in [None, Some(tabs[1])] {
+        for &selected in &tabs {
+            let mut base = base.clone();
+            assert!(base.set_home(home));
+            assert!(base.switch_to(selected));
+            check(&mut base, &views, Some(selected));
+            for (from, &moved) in tabs.iter().enumerate() {
+                for to in 0..=tabs.len() {
+                    let mut reordered = base.clone();
+                    let _ = reordered.reorder(moved, to);
+                    check(&mut reordered, &views, Some(selected));
+                    let mut placed = base.clone();
+                    let _ = placed.place(moved, to);
+                    check(&mut placed, &views, Some(selected));
+                }
+
+                let mut kept = base.clone();
+                kept.tab_at_mut(from).expect("present tab").ephemeral = true;
+                assert!(kept.keep(moved).is_some());
+                check(&mut kept, &views, Some(selected));
+
+                let mut removed = base.clone();
+                let removed_tab = removed.remove(moved).expect("present tab");
+                let expected = if moved != selected {
+                    selected
+                } else {
+                    let shown: Vec<_> = removed.tabs().iter().filter(|tab| !tab.parked).collect();
+                    if removed_tab.parked {
+                        home.unwrap_or_else(|| shown.last().expect("shown tab").id)
+                    } else {
+                        shown[from.min(shown.len() - 1)].id
+                    }
+                };
+                check(&mut removed, &views, Some(expected));
+            }
+
+            for forward in [false, true] {
+                let mut cycled = base.clone();
+                let mut expected = selected;
+                for _ in 0..=tabs.len() {
+                    let order: Vec<_> = cycled.tabs().iter().map(|tab| tab.id).collect();
+                    let at = order.iter().position(|id| *id == expected).unwrap();
+                    expected = order[if forward {
+                        (at + 1) % order.len()
+                    } else {
+                        (at + order.len() - 1) % order.len()
+                    }];
+                    assert_eq!(cycled.cycle(forward), Some(expected));
+                    check(&mut cycled, &views, Some(expected));
+                }
+
+                let mut cycled = base.clone();
+                let shown: Vec<_> = cycled.shown().iter().map(|tab| tab.id).collect();
+                let mut expected = selected;
+                for _ in 0..=shown.len() {
+                    let at = shown
+                        .iter()
+                        .position(|id| *id == expected)
+                        .unwrap_or_else(|| {
+                            home.and_then(|id| shown.iter().position(|shown| *shown == id))
+                                .unwrap_or(shown.len() - 1)
+                        });
+                    expected = shown[if forward {
+                        (at + 1) % shown.len()
+                    } else {
+                        (at + shown.len() - 1) % shown.len()
+                    }];
+                    assert_eq!(cycled.cycle_shown(forward), Some(expected));
+                    check(&mut cycled, &views, Some(expected));
+                }
+            }
+        }
+    }
+
+    let mut drained = base;
+    for &id in &tabs {
+        assert!(drained.switch_to(id));
+        check(&mut drained, &views, Some(id));
+        drained.remove(id).expect("present tab");
+        let expected = drained.tabs().first().map(|tab| tab.id);
+        check(&mut drained, &views, expected);
+    }
+    assert_eq!(drained.cycle(true), None);
+    assert_eq!(drained.cycle_shown(false), None);
+    check(&mut drained, &views, None);
+
+    let mut one = TabSet::new(Tab::new(
+        tabs[0],
+        views.iter().next().expect("a view").0,
+        TabPresentation::terminal("one"),
+    ));
+    check(&mut one, &views, Some(tabs[0]));
+    assert_eq!(one.cycle(false), Some(tabs[0]));
+    assert_eq!(one.cycle_shown(true), Some(tabs[0]));
+    check(&mut one, &views, Some(tabs[0]));
+    one.active_mut().expect("selected tab").id = stale;
+    assert_eq!(one.active_id(), Some(tabs[0]));
+    assert_eq!(
+        one.active_index(),
+        None,
+        "a replaced ID is not the selection"
+    );
+    assert!(one.active().is_none());
+    assert!(one.active_mut().is_none());
+    assert!(!one.invariant_holds(&views));
+    one.tab_at_mut(0).expect("remaining tab").id = tabs[0];
+    check(&mut one, &views, Some(tabs[0]));
+}
+
+/// Mutable tab access can relocate the selected identity without using a TabSet move. Every
+/// later operation must treat its remembered position as a hint, never as the selection.
+#[test]
+fn relocated_active_identity_survives_a_stale_position_hint() {
+    fn relocated() -> (TabSet, ViewStore, Vec<TabId>) {
+        let (mut set, views, ids) = parked_set(3, 0);
+        assert!(set.switch_to(ids[0]));
+        let last = set.tab_at(2).expect("last tab").clone();
+        let first = std::mem::replace(set.active_mut().expect("first tab"), last);
+        *set.tab_at_mut(2).expect("last slot") = first;
+        // This check must not repair a position hint to accept the valid identity move.
+        assert!(set.invariant_holds(&views));
+        assert_eq!(set.active_id(), Some(ids[0]));
+        (set, views, ids)
+    }
+
+    fn check(set: &TabSet, views: &ViewStore, selected: TabId) {
+        let cold = set.clone();
+        let searched = set.tabs().iter().position(|tab| tab.id == selected);
+        assert_eq!(set.active_id(), Some(selected));
+        assert_eq!(set.active_index(), searched);
+        assert_eq!(set.active().map(|tab| tab.id), Some(selected));
+        assert_eq!(*set, cold, "repairing the hint does not change the tab set");
+        assert!(set.invariant_holds(views));
+    }
+
+    let (set, views, ids) = relocated();
+    check(&set, &views, ids[0]);
+
+    let (mut set, views, ids) = relocated();
+    assert!(set.reorder(ids[0], 1));
+    check(&set, &views, ids[0]);
+
+    let (mut set, views, ids) = relocated();
+    set.remove(ids[1]).expect("unselected tab");
+    check(&set, &views, ids[0]);
+
+    let (mut set, views, ids) = relocated();
+    set.remove(ids[0]).expect("selected tab");
+    check(&set, &views, ids[1]);
+
+    let (mut set, views, ids) = relocated();
+    assert_eq!(set.cycle(true), Some(ids[2]));
+    check(&set, &views, ids[2]);
+
+    let (mut set, views, ids) = relocated();
+    assert_eq!(set.cycle_shown(false), Some(ids[1]));
+    check(&set, &views, ids[1]);
 }
 
 #[test]

@@ -4,7 +4,6 @@
 
 //! Identity token kinds, sources, profiles, credentials, and ambient-token inspection.
 
-pub mod import;
 pub mod provision;
 pub mod vault;
 
@@ -80,12 +79,67 @@ impl TokenKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Source {
-    /// A private token file.
+    /// A private token file of the person's own, outside the vault's folder, read in place.
     File(std::path::PathBuf),
-    /// An environment variable.
-    Env(String),
+    /// A vault entry, read in place from this Mac's verified secret store. agh.toml spells it
+    /// `token_file = "~/.secrets/NAME"`, the spelling every build reads; no file there is read.
+    Entry(VaultEntry),
     /// A token a library caller holds in memory (design §6.1). agh.toml cannot spell it.
     Inline(InlineToken),
+}
+
+/// One vault entry a profile's token is: its name, and the home whose secret store holds it
+/// (`aterm_secrets::client::Paths::locate_for_home`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultEntry {
+    name: String,
+    home: std::path::PathBuf,
+}
+
+impl VaultEntry {
+    /// Entry `name` of the store under `home`.
+    #[must_use]
+    pub fn new(name: impl Into<String>, home: &Path) -> VaultEntry {
+        VaultEntry {
+            name: name.into(),
+            home: home.to_path_buf(),
+        }
+    }
+
+    /// The entry's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// How agh.toml spells it: `~/.secrets/NAME`, which older builds read as a file and this one
+    /// reads as the entry.
+    #[must_use]
+    pub fn spelling(&self) -> String {
+        aterm_types::vault_entry::plain_entry_pointer(&self.name)
+    }
+}
+
+/// The value of vault entry `name` from the verified store under `home`, read in place
+/// (`aterm_secrets::client::read_in_place`): `Ok(None)` when this Mac has no vault or the vault
+/// holds no such entry. Off unix there is no store, so there is no entry.
+///
+/// # Errors
+/// The store cannot be read (the entry name is invalid, or local state cannot be parsed); the
+/// text names no value.
+pub fn vault_value(home: &Path, name: &str) -> Result<Option<Secret>, String> {
+    #[cfg(unix)]
+    {
+        let paths = aterm_secrets::client::Paths::locate_for_home(home);
+        aterm_secrets::client::read_in_place(&paths, name)
+            .map(|value| value.map(|bytes| Secret::new(bytes.as_slice())))
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (home, name);
+        Ok(None)
+    }
 }
 
 /// An in-memory token (design §6.1): an `Arc` of [`aterm_uds::secret::Secret`], scrubbed when
@@ -267,7 +321,15 @@ impl Credential {
         &self.fingerprint
     }
 
-    /// The token file's `(dev, ino)` as opened; `None` for an env source.
+    /// Full commitment for one Git operation, distinct from the short audit label.
+    pub(crate) fn git_grant_binding(&self) -> [u8; 32] {
+        let mut digest = aterm_digest::Sha256::new();
+        digest.update(b"agh/git-operation-credential/v2\0");
+        digest.update(self.expose());
+        digest.finalize()
+    }
+
+    /// The token file's `(dev, ino)` as opened; `None` for a vault entry or an inline source.
     #[must_use]
     pub const fn file_id(&self) -> Option<(u64, u64)> {
         self.file_id
@@ -275,7 +337,7 @@ impl Credential {
 
     /// Whether the token file was read loose: a `legacy_loose` profile (design §6.6) whose
     /// file or directory had a group or other read bit, which the host's lane logs as a
-    /// warning. False for a strict, env or inline load, and off unix.
+    /// warning. False for a strict or inline load, and off unix.
     #[must_use]
     pub const fn loose_file(&self) -> bool {
         self.loose
@@ -416,13 +478,12 @@ impl LoadError {
             LoadError::Loose(_) => loose_remedy(profile, home),
             LoadError::Symlink => Some(match &profile.source {
                 Source::File(file) => token_link_remedy(file, home),
-                Source::Env(_) | Source::Inline(_) => FILE_LINK.to_string(),
+                Source::Entry(_) | Source::Inline(_) => FILE_LINK.to_string(),
             }),
-            LoadError::Malformed(why) => Some(malformed_remedy(why, &profile.source)),
-            LoadError::Unsupported(_) => Some(
-                "provision a personal access token: a refresh token cannot authenticate API calls"
-                    .to_string(),
-            ),
+            LoadError::Malformed(why) => {
+                vault::token_step(profile).or_else(|| Some(malformed_remedy(why, &profile.source)))
+            }
+            LoadError::Unsupported(_) => vault::token_step(profile),
             LoadError::Missing | LoadError::Io(_) | LoadError::Unavailable(_) => None,
         }
     }
@@ -586,7 +647,7 @@ const TOO_LONG: &str = "longer than such a file can be";
 /// size, and a regular file for a path that names none.
 fn malformed_remedy(why: &str, source: &Source) -> String {
     match source {
-        Source::Env(_) | Source::Inline(_) => format!("the variable holds {ONE_TOKEN}"),
+        Source::Inline(_) | Source::Entry(_) => format!("the token is {ONE_TOKEN}"),
         Source::File(_) if why == SHAPE || why == TOO_LONG => {
             format!("the token file holds {ONE_TOKEN}")
         }
@@ -594,6 +655,17 @@ fn malformed_remedy(why: &str, source: &Source) -> String {
             "token_file must name a regular file in a directory, by a UTF-8 name".to_string()
         }
         Source::File(_) => TOKEN_NOT_A_FILE.to_string(),
+    }
+}
+
+/// A profile's token source as a row shows it: `vault:NAME` for a vault entry, `file:{path, ~
+/// for home}` for a token file of the person's own, `inline` for a library caller's token.
+#[must_use]
+pub fn source_text(source: &Source, home: &Path) -> String {
+    match source {
+        Source::File(path) => format!("file:{}", tilde(path, home)),
+        Source::Entry(entry) => format!("vault:{}", entry.name()),
+        Source::Inline(_) => "inline".to_string(),
     }
 }
 
@@ -625,28 +697,18 @@ fn shell_word(text: String) -> String {
     format!("{head}'{}'", rest.replace('\'', "'\\''"))
 }
 
-/// The Loose remedy: the chmods that make the token file and its directory private, their
-/// inverse, and the way that touches no folder of the person's.
+/// The Loose remedy: the chmods that make the token file and its directory private, with their
+/// inverse; where no chmod of this user's does, the vault's rewrite of its file
+/// (`vault::token_step`).
 #[cfg(unix)]
 fn loose_remedy(profile: &Profile, home: &Path) -> Option<String> {
     let Source::File(file) = &profile.source else {
         return None;
     };
-    let dir = file.parent()?;
-    let file_text = shell_word(tilde(file, home));
-    let provision = format!(
-        "agh auth add {} --tier {} --stdin < {file_text}",
-        profile.name,
-        profile.tier.slug()
-    );
-    match private_fix(dir, file, home, Held::Token) {
-        PrivateFix::Fix(chmods) => Some(format!(
-            "{chmods}; or, touching no folder of yours: {provision}"
-        )),
+    match private_fix(file.parent()?, file, home, Held::Token) {
+        PrivateFix::Fix(chmods) => Some(chmods),
         PrivateFix::NotAFile => Some(TOKEN_NOT_A_FILE.to_string()),
-        PrivateFix::NoChmod | PrivateFix::Unseen => {
-            Some(format!("touching no folder of yours: {provision}"))
-        }
+        PrivateFix::NoChmod | PrivateFix::Unseen => vault::token_step(profile),
     }
 }
 
@@ -777,7 +839,7 @@ fn loose_remedy(profile: &Profile, home: &Path) -> Option<String> {
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoadError::Missing => f.write_str("there is no such file or variable"),
+            LoadError::Missing => f.write_str("there is no such file or vault entry"),
             LoadError::Loose(why) => f.write_str(why),
             LoadError::Malformed(why)
             | LoadError::Unsupported(why)
@@ -795,12 +857,36 @@ impl std::fmt::Display for LoadError {
 ///
 /// # Errors
 /// Returns why the profile gave no credential.
-pub(crate) fn load(profile: &Profile, env: &dyn EnvSource) -> Result<Credential, LoadError> {
+pub(crate) fn load(profile: &Profile) -> Result<Credential, LoadError> {
     match &profile.source {
         Source::File(path) if profile.legacy_loose() => load_loose_file(profile, path),
         Source::File(path) => load_file(profile, path),
-        Source::Env(var) => load_env(profile, env, var),
+        Source::Entry(entry) => load_entry(profile, entry),
         Source::Inline(token) => credential_from(profile, token.0.expose(), None),
+    }
+}
+
+/// A vault entry source: the value [`vault_value`] reads in place, judged by the token rules as
+/// a file's bytes are. No file is opened, so there is no `file_id` and no mode to judge; a store
+/// that cannot be read is `Io`, and a store with no such entry `Missing`.
+fn load_entry(profile: &Profile, entry: &VaultEntry) -> Result<Credential, LoadError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (profile, entry);
+        Err(LoadError::Unavailable(
+            "vault entries need this Mac's secret store, which is unix only",
+        ))
+    }
+    #[cfg(unix)]
+    {
+        match vault_value(&entry.home, &entry.name) {
+            Ok(Some(value)) => credential_from(profile, value.expose(), None),
+            Ok(None) => Err(LoadError::Missing),
+            Err(why) => Err(LoadError::Io(format!(
+                "the vault entry {}: {why}",
+                entry.name
+            ))),
+        }
     }
 }
 
@@ -880,29 +966,6 @@ fn load_file(profile: &Profile, path: &Path) -> Result<Credential, LoadError> {
     ))
 }
 
-/// An env source: unset or empty is Missing; the value is checked as a file's bytes are, and
-/// the copy read from the environment is scrubbed.
-fn load_env(profile: &Profile, env: &dyn EnvSource, var: &str) -> Result<Credential, LoadError> {
-    let Some(value) = env.var_os(var) else {
-        return Err(LoadError::Missing);
-    };
-    if value.is_empty() {
-        return Err(LoadError::Missing);
-    }
-    let value = match value.into_string() {
-        Ok(value) => value,
-        Err(raw) => {
-            let mut bytes = raw.into_encoded_bytes();
-            aterm_uds::secret::scrub(&mut bytes);
-            return Err(LoadError::Malformed("the variable is not UTF-8"));
-        }
-    };
-    let mut bytes = value.into_bytes();
-    let loaded = credential_from(profile, &bytes, None);
-    aterm_uds::secret::scrub(&mut bytes);
-    loaded
-}
-
 /// Strips at most one trailing `\r\n` or `\n` from `raw`.
 pub(crate) fn trim_newline(raw: &[u8]) -> &[u8] {
     raw.strip_suffix(b"\r\n")
@@ -947,14 +1010,14 @@ fn credential_from(
 /// # Errors
 /// Returns why the profile gave no credential.
 #[cfg(any(test, debug_assertions))]
-pub fn load_for_tests(profile: &Profile, env: &dyn EnvSource) -> Result<Credential, LoadError> {
-    load(profile, env)
+pub fn load_for_tests(profile: &Profile) -> Result<Credential, LoadError> {
+    load(profile)
 }
 
 /// Evaluates [`load`] and returns only its [`Presence`].
 #[must_use]
-pub fn presence(profile: &Profile, env: &dyn EnvSource) -> Presence {
-    match load(profile, env) {
+pub fn presence(profile: &Profile) -> Presence {
+    match load(profile) {
         Ok(_) => Presence::Present,
         Err(e) => e.presence(),
     }
@@ -968,8 +1031,8 @@ pub fn presence(profile: &Profile, env: &dyn EnvSource) -> Presence {
 /// # Errors
 ///
 /// `load`'s `LoadError`.
-pub fn lists_drafts(profile: &Profile, env: &dyn EnvSource) -> Result<bool, LoadError> {
-    let cred = load(profile, env)?;
+pub fn lists_drafts(profile: &Profile) -> Result<bool, LoadError> {
+    let cred = load(profile)?;
     Ok(profile.drafts_vouched(&cred))
 }
 

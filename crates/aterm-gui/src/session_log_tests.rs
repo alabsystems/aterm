@@ -5001,7 +5001,7 @@ pub(super) fn hand_over(
     (successor, next, hand)
 }
 
-fn producer() -> (crate::session_store::SessionHandle, SessionStore, Hand) {
+pub(super) fn producer() -> (crate::session_store::SessionHandle, SessionStore, Hand) {
     let h = test_handle(1);
     let hand = hand_clock(&h.ctx.timeline);
     let mut store = SessionStore::default();
@@ -5020,7 +5020,7 @@ fn publish(g: &mut SessionTimeline, word: &'static str, seq: u64) {
     );
 }
 
-fn successors_first_sweep(g: &mut SessionTimeline, program: &str) {
+pub(super) fn successors_first_sweep(g: &mut SessionTimeline, program: &str) {
     let _ = g.sweep_slog(&BlockRead::default(), false, 100, 300);
     g.set_program(300, Some(program.into()));
     swept(g);

@@ -2646,7 +2646,7 @@ fn a_controller_reads_the_slider_and_its_stops() {
     let read = |app: &App| {
         let lines = app.fact_menu_controls();
         assert!(
-            lines[0].starts_with("fact-menu open=true session=s-")
+            lines[0].starts_with("fact-menu open=true session=t")
                 && lines[0].contains(" fact=effort "),
             "{lines:?}"
         );

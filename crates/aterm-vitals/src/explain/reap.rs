@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Reap credit (SA §7.5): a tab's CPU in the processes that finished between two readings.
+//! Reap credit (SA §7.5): attributed CPU charges and independently observed actual own CPU.
+//!
+//! The charge reconciles inherited kernel counters and is diagnostic, not an actual-work
+//! lower bound: an unobserved auto-reaping process can pass up doubled child time. The own-CPU
+//! floor is tracked independently by process incarnation; ambiguous charge epochs make that
+//! floor the primary actual-work evidence.
 //!
 //! A sweep reads only the processes alive when it runs, and a build's processes mostly start
 //! and finish between two sweeps. The kernel keeps their work: at each reap it adds the child's
@@ -9,7 +14,7 @@
 //! waits for it (measured on macOS 27: the parent's growth equals the zombie's final figures to
 //! the nanosecond) and twice where the kernel reaps it for the parent, one that ignores `SIGCHLD`
 //! or set `SA_NOCLDWAIT` (`P_NOCLDWAIT`; measured: 400.4–401.6 ms for a 200 ms child). So a tab's
-//! work is its members' own CPU growth plus the growth of their reaped-children time, where the
+//! attributed charge combines its members' own CPU growth and reaped-children time, where the
 //! members are this ledger's, not one reading's parent chain: a process takes the tab each
 //! reading puts it in (a pane shared into two tabs counts where the host lists it); first seen in
 //! none, its parent's row's scope, else aterm's own where the reading puts it in aterm, else, for
@@ -78,10 +83,9 @@
 //! it); aterm's coalition holds what its counters kept of them, as the split's unattributed work,
 //! and the rest is unaccounted (a probe's launchd job kept 958 of 1,200 ms of its orphans' work
 //! on macOS 27; over a live loop of 6 ms orphans, 819 mc, the split's windows read 824–1,035 mc
-//! unaccounted), so a tab's figure over such a window can read exact and be short. A tab's
-//! counter only grows, and over any window it grows at least as much as the own CPU of the
-//! members it read at both ends that no job held between and that stayed in it (the live-only
-//! figure), since what is absorbed comes out of reaped growth alone.
+//! unaccounted). Missing coverage and ambiguous inherited charges stay separate: the own-CPU
+//! floor records actual observed own growth even when conservative reconciliation withholds a
+//! retained child's charge to avoid a nonsimultaneous parent read counting it again.
 //! `aterm_models_misc::reap_credit_model` is the model; `tests/conformance_reap_credit.rs` binds
 //! it.
 
@@ -115,6 +119,15 @@ struct Row {
     cpu: u64,
     /// Its reaped children's CPU at its last reading, ns.
     child: u64,
+    /// Final owning-wait aggregate when the terminal own/child split was unread. Kept as an
+    /// aggregate rather than inventing either lifetime counter.
+    aggregate_final: Option<u64>,
+    /// Lifetime already set against a possible early reap by this exact ancestor. Restoring
+    /// an older still-listed child must neither credit that lifetime again nor make that same
+    /// ancestor absorb it twice when disappearance is finally observed.
+    prepaid: Option<(crate::delegated::ProcessKey, u64)>,
+    /// A nonsimultaneous child reading made this parent's reaped growth ambiguous.
+    overlapping: bool,
     /// Its own CPU as far as its counter here took it, ns: its last reading's while its work
     /// counts here, held from the reading before a delegated job took it over; `None` for one a
     /// job held from its first reading ([`ReapLedger::credited`]).
@@ -210,6 +223,8 @@ struct Counter {
     ns: u64,
     /// The last step that knowingly missed some of its work; 0 for none.
     missed: u64,
+    floor_ns: u64,
+    ambiguous: u64,
 }
 
 /// One open tab's counter at one reading.
@@ -223,6 +238,10 @@ pub struct TabTotal {
     pub ns: u64,
     /// The last step that knowingly missed some of its work ([module docs](self)); 0 for none.
     pub missed: u64,
+    /// Independently observed own CPU only, never an inherited child charge.
+    pub floor_ns: u64,
+    /// Last step whose attributed raw charge could contain unobserved inherited child time.
+    pub ambiguous: u64,
 }
 
 /// The ledger's counters at one reading: where a window starts or ends.
@@ -233,11 +252,75 @@ pub struct ReapTotals {
     /// Every scope's counter summed, ns: a closed tab's folds into aterm's own, so this sum keeps
     /// every tab's work, closed or open.
     pub all: u64,
+    /// Last step that knowingly missed work in any scope, including aterm's own/shared work.
+    pub missed: u64,
+    /// Every scope's independently observed own CPU, including closed tabs, nanoseconds.
+    pub all_floor: u64,
+    /// Last ambiguous inherited charge in any scope.
+    pub ambiguous: u64,
+    /// Last ambiguous inherited charge in aterm's own scope.
+    pub own_ambiguous: u64,
+    /// Independent nondelegated own CPU grouped by its observed resource coalition.
+    pub coalition_floors: IdMap<u64, u64>,
+    /// Own CPU in each current pane, separate from a logical tab's pooled counter.
+    pub pane_floors: IdMap<u64, u64>,
+    /// Independent own CPU whose coalition could not be established for that counter delta.
+    pub unmapped_floor: u64,
     /// Each open tab's counter, by key.
     pub tabs: Vec<TabTotal>,
 }
 
 impl ReapTotals {
+    /// Independent own CPU observed in this pane since `base`.
+    #[must_use]
+    pub fn pane_floor_since(&self, base: &Self, pane: u64) -> u64 {
+        self.pane_floors
+            .get(&pane)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(base.pane_floors.get(&pane).copied().unwrap_or(0))
+    }
+    /// Own CPU observed in `coalition` since `base`, without inherited child charges.
+    #[must_use]
+    pub fn coalition_floor_since(&self, base: &Self, coalition: u64) -> u64 {
+        self.coalition_floors
+            .get(&coalition)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(base.coalition_floors.get(&coalition).copied().unwrap_or(0))
+    }
+    /// Independent own CPU of this tab since `base`, and whether inherited charges in that
+    /// interval were ambiguous. Identity is the stable tab id, including a pane-key change.
+    #[must_use]
+    pub fn floor_since(&self, base: &Self, key: u64) -> (u64, bool) {
+        let Some(tab) = self.tabs.iter().find(|t| t.key == key) else {
+            return (0, false);
+        };
+        let before = base
+            .tabs
+            .iter()
+            .find(|t| t.id == tab.id)
+            .map_or(0, |t| t.floor_ns);
+        (
+            tab.floor_ns.saturating_sub(before),
+            tab.ambiguous > base.step,
+        )
+    }
+
+    /// Own-scope floor over the interval, excluding open tabs. Closed historical counters do
+    /// not become fresh work: only the aggregate's growth since `base` participates.
+    #[must_use]
+    pub fn own_floor_since(&self, base: &Self) -> (u64, bool) {
+        let tabs = self.tabs.iter().fold(0_u64, |sum, t| {
+            sum.saturating_add(self.floor_since(base, t.key).0)
+        });
+        (
+            self.all_floor
+                .saturating_sub(base.all_floor)
+                .saturating_sub(tabs),
+            self.own_ambiguous > base.step,
+        )
+    }
     /// Tab `key`'s counter, ns; 0 for a tab it holds none of.
     #[must_use]
     pub fn tab(&self, key: u64) -> u64 {
@@ -266,6 +349,8 @@ pub struct StepIn<'a> {
     /// whose start ([`ProcSample::birth_ms`]) is at or after the last step's was not in its
     /// sweep, so was born since.
     pub at_unix_ms: i64,
+    /// Native clocks at the whole frontend sweep's end. They do not use `at_ns`'s epoch.
+    pub cpu_cut: crate::model::NativeCpuCut,
     /// The sweep.
     pub procs: &'a [ProcSample],
     /// Each process's scopes by this reading's parent chains, in [`Self::procs`]' order.
@@ -325,6 +410,25 @@ struct Held {
 /// The tabs' and aterm's cumulative CPU, live and reaped ([module docs](self)).
 #[derive(Debug, Default)]
 pub struct ReapLedger {
+    /// Only real whole sweeps advance the timing boundary, never synthetic terminal passes.
+    whole_at_ns: Option<u64>,
+    whole_wall_ms: Option<i64>,
+    whole_cpu_cut: crate::model::NativeCpuCut,
+    floor_rows: IdMap<crate::delegated::ProcessKey, OwnFloor>,
+    coalition_floors: IdMap<u64, u64>,
+    pane_floors: IdMap<u64, u64>,
+    unmapped_floor: u64,
+    own_floor: u64,
+    ambiguity: u64,
+    own_ambiguity: u64,
+    terminal_totals: IdMap<crate::delegated::ProcessKey, Option<u64>>,
+    terminal_overlap: IdMap<crate::delegated::ProcessKey, u64>,
+    baseline_only: IdSet<crate::delegated::ProcessKey>,
+    /// Last consumed original-wait journal cursor, separately for every daemon incarnation.
+    native_sequences: IdMap<crate::delegated::ProcessKey, u64>,
+    /// Accepted transport events remain ours until a whole process sweep can consume them.
+    pending_terminals: IdMap<(crate::delegated::ProcessKey, u64), crate::model::NativeTerminal>,
+    pending_native_incomplete: bool,
     /// Every member alive at the last step, by pid.
     rows: IdMap<u32, Row>,
     /// Each open tab's counter, by its id.
@@ -343,6 +447,8 @@ pub struct ReapLedger {
     next_id: u64,
     /// aterm's own counter (and closed tabs'), ns.
     own: u64,
+    /// Last step that knowingly missed work, whether in a tab or aterm's own scope.
+    missed: u64,
     /// The steps taken.
     step: u64,
     /// The stamp of the reading it last stepped on.
@@ -362,7 +468,534 @@ pub struct ReapLedger {
     pub(crate) fault: Option<ReapFault>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct OwnFloor {
+    cpu: u64,
+    /// Whole frontend observation that read this counter, including terminal passes at its cut.
+    at_ns: u64,
+    scope: Scope,
+    delegated: bool,
+    coalition: Option<u64>,
+    version: Option<i32>,
+    pane: Option<u64>,
+}
+
 impl ReapLedger {
+    fn born_in_window(&self, p: &ProcSample, i: &StepIn) -> bool {
+        if let (Some(before), Some(now), Some(start)) =
+            (self.whole_cpu_cut.boot, i.cpu_cut.boot, p.start)
+        {
+            return before < start && start <= now;
+        }
+        p.birth_ms
+            .zip(self.whole_wall_ms)
+            .is_some_and(|(birth, before)| before < birth && birth <= i.at_unix_ms)
+    }
+
+    fn floor_is_consecutive(&self, before: &OwnFloor, now: u64) -> bool {
+        Some(before.at_ns) == self.whole_at_ns || before.at_ns == now
+    }
+
+    fn terminal_in_window(&self, record: &crate::model::NativeTerminal, i: &StepIn) -> bool {
+        let (Some(before), Some(now), Some(exited)) = (
+            self.whole_cpu_cut.continuous_ns,
+            i.cpu_cut.continuous_ns,
+            record.timing.exited_ns,
+        ) else {
+            return false;
+        };
+        if !(before < exited && exited <= now) {
+            return false;
+        }
+        // An exit in this interval does not place its whole lifetime here. An existing
+        // consecutive own-counter baseline bounds its delta; otherwise its birth must be
+        // proved inside this actual model interval, including deferred whole-sweep adoption.
+        let consecutive = record.process.start.is_some_and(|start| {
+            self.floor_rows
+                .get(&crate::delegated::ProcessKey {
+                    pid: record.process.pid,
+                    start,
+                })
+                .is_some_and(|row| self.floor_is_consecutive(row, i.at_ns))
+        });
+        consecutive || self.born_in_window(&record.process, i)
+    }
+
+    fn observe_own_floor(&mut self, i: &StepIn) {
+        self.name_tabs(i.tabs);
+        for ((p, member), delegated) in i.procs.iter().zip(i.members).zip(i.delegated) {
+            let (Some(start), Some(cpu)) = (p.start, p.cpu_ns) else {
+                continue;
+            };
+            let key = crate::delegated::ProcessKey { pid: p.pid, start };
+            let previous = self.floor_rows.get(&key).copied();
+            if previous.is_some_and(|p| p.delegated) && !*delegated && !member.aterm {
+                self.floor_rows.remove(&key);
+                continue;
+            }
+            if p.uid != Some(i.self_uid) && !member.aterm && previous.is_none() {
+                continue;
+            }
+            let scope = member
+                .tab
+                .and_then(|index| i.tabs.get(index))
+                .and_then(|tab| {
+                    self.keys
+                        .iter()
+                        .find(|(key, _)| *key == tab.tab)
+                        .map(|(_, id)| Scope::Tab(*id))
+                })
+                .or_else(|| {
+                    previous.map(|p| match p.scope {
+                        Scope::Tab(id) if !self.keys.iter().any(|(_, open)| *open == id) => {
+                            Scope::Own
+                        }
+                        scope => scope,
+                    })
+                })
+                .or_else(|| member.aterm.then_some(Scope::Own));
+            let Some(scope) = scope else { continue };
+            let pane = member
+                .tab
+                .and_then(|index| i.tabs.get(index))
+                .map(|tab| tab.key)
+                .or_else(|| {
+                    previous
+                        .and_then(|before| before.pane)
+                        .filter(|key| i.tabs.iter().any(|tab| tab.key == *key))
+                });
+            let born = self.born_in_window(p, i);
+            let regressed = previous.is_some_and(|before| cpu < before.cpu);
+            let consecutive = !regressed
+                && previous.is_some_and(|before| self.floor_is_consecutive(&before, i.at_ns));
+            let delta = if consecutive {
+                cpu.saturating_sub(previous.map_or(0, |before| before.cpu))
+            } else if previous.is_none() && born {
+                cpu
+            } else {
+                0
+            };
+            if !*delegated
+                && self.whole_at_ns.is_some()
+                && !consecutive
+                && (previous.is_some() || !born)
+                && (cpu > 0 || regressed)
+            {
+                // A readable counter after a gap bounds a lifetime, not this interval.
+                // Rebaseline it; the raw reconciled charge remains separately visible.
+                // A rollback keeps its prior maximum and read stamp until a later recovery.
+                miss(&mut self.tabs, &mut self.missed, scope, self.step + 1);
+                ambiguous(
+                    &mut self.tabs,
+                    &mut self.ambiguity,
+                    &mut self.own_ambiguity,
+                    scope,
+                    self.step + 1,
+                );
+            }
+            let coalition = p.coalition.or_else(|| {
+                previous
+                    .filter(|before| p.version.is_some() && p.version == before.version)
+                    .and_then(|before| before.coalition)
+            });
+            self.floor_rows.insert(
+                key,
+                OwnFloor {
+                    cpu: previous
+                        .filter(|_| regressed)
+                        .map_or(cpu, |before| before.cpu),
+                    at_ns: previous
+                        .filter(|_| regressed)
+                        .map_or(i.at_ns, |before| before.at_ns),
+                    scope,
+                    delegated: *delegated,
+                    coalition,
+                    version: p
+                        .version
+                        .or_else(|| previous.and_then(|before| before.version)),
+                    pane,
+                },
+            );
+            if !*delegated {
+                if let Some(pane) = pane {
+                    let total = self.pane_floors.entry(pane).or_default();
+                    *total = total.saturating_add(delta);
+                }
+                if let Some(coalition) = coalition {
+                    let total = self.coalition_floors.entry(coalition).or_default();
+                    *total = total.saturating_add(delta);
+                } else {
+                    self.unmapped_floor = self.unmapped_floor.saturating_add(delta);
+                }
+                match scope {
+                    Scope::Own => self.own_floor = self.own_floor.saturating_add(delta),
+                    Scope::Tab(id) => {
+                        let counter = self.tabs.entry(id).or_default();
+                        counter.floor_ns = counter.floor_ns.saturating_add(delta);
+                    }
+                }
+            }
+        }
+    }
+    /// Delivered native evidence still waiting for a complete process/ownership reading.
+    pub(crate) fn has_pending_native(&self) -> bool {
+        !self.pending_terminals.is_empty() || self.pending_native_incomplete
+    }
+
+    /// Bound accounting metadata to coalitions still listed or still held by an observed
+    /// process. An inactive coalition's prior snapshots keep their own immutable counters.
+    pub(crate) fn retain_coalitions(&mut self, read: &super::CoalSample) {
+        let mut present: IdSet<_> = read.rows.iter().map(|row| row.id).collect();
+        present.extend(self.floor_rows.values().filter_map(|row| row.coalition));
+        self.coalition_floors.retain(|id, _| present.contains(id));
+    }
+    /// Accept transport custody before checking whether a process sweep can run. A source
+    /// cursor may advance on a truncated or machine-only observation; those observations must
+    /// not discard final counters already delivered to the model.
+    pub(crate) fn ingest_terminals(
+        &mut self,
+        terminals: &[crate::model::NativeTerminal],
+        incomplete: bool,
+    ) {
+        self.pending_native_incomplete |= incomplete;
+        for record in terminals {
+            if record.seq
+                <= self
+                    .native_sequences
+                    .get(&record.host)
+                    .copied()
+                    .unwrap_or(0)
+            {
+                continue;
+            }
+            self.pending_terminals
+                .entry((record.host, record.seq))
+                .or_insert_with(|| record.clone());
+        }
+        while self.pending_terminals.len() > 65_536 {
+            let oldest = self
+                .pending_terminals
+                .iter()
+                .min_by_key(|(_, r)| (r.process.start, r.seq))
+                .map(|(key, _)| *key);
+            if let Some(key) = oldest {
+                self.pending_terminals.remove(&key);
+            }
+            self.pending_native_incomplete = true;
+        }
+    }
+
+    /// Credit exact native terminal generations before their disappearance reaches the normal
+    /// sweep. Parent child counters are held at their prior values until every terminal has
+    /// become pending: otherwise one child's final sample could first charge a sibling's
+    /// unseen completion to the daemon. Final generations remain separate from a live process
+    /// that already reused their PID.
+    pub(crate) fn step_with_terminals(
+        &mut self,
+        i: &StepIn,
+        terminals: &[crate::model::NativeTerminal],
+        incomplete: bool,
+    ) {
+        self.ingest_terminals(terminals, incomplete);
+        if i.truncated {
+            return;
+        }
+        let terminals: Vec<_> = std::mem::take(&mut self.pending_terminals)
+            .into_values()
+            .collect();
+        let incomplete = std::mem::take(&mut self.pending_native_incomplete);
+        let mut records: Vec<_> = terminals
+            .iter()
+            .filter(|r| r.seq > self.native_sequences.get(&r.host).copied().unwrap_or(0))
+            .collect();
+        records.sort_by_key(|r| (r.host.pid, r.host.start, r.seq));
+        let mut invalid = Vec::new();
+        let baseline = (self.at_unix_ms, self.newest);
+        let records: Vec<_> = records
+            .into_iter()
+            .filter(|record| {
+                self.native_sequences.insert(record.host, record.seq);
+                if self.terminal_in_window(record, i) {
+                    true
+                } else {
+                    // Preserve the receipt in Snapshot, consume its cursor once, and withhold
+                    // both synthetic raw charge and own floor. The real reaper counter remains
+                    // free to grow once in whichever ordinary sweep actually reads it.
+                    invalid.push(record.tab);
+                    false
+                }
+            })
+            .collect();
+        let mut final_children = IdMap::<_, u64>::default();
+        for record in &records {
+            if let Some(cpu) = record
+                .process
+                .cpu_ns
+                .zip(record.process.child_cpu_ns)
+                .map(|(cpu, child)| cpu.saturating_add(child))
+                .or(record.wait_cpu_ns)
+            {
+                let sum = final_children.entry(record.host).or_default();
+                *sum = sum.saturating_add(cpu);
+            }
+        }
+        let mut parent_children = IdMap::default();
+        for (host, final_children) in final_children {
+            let old = self
+                .rows
+                .get(&host.pid)
+                .filter(|r| r.start == host.start)
+                .map(|r| r.child);
+            let raw = i
+                .procs
+                .iter()
+                .find(|p| p.pid == host.pid && p.start == Some(host.start))
+                .and_then(|p| p.child_cpu_ns);
+            let held = old.or_else(|| raw.map(|raw| raw.saturating_sub(final_children)));
+            parent_children.insert(host, held);
+        }
+        let mut remaining = Vec::new();
+        for record in records {
+            let process = &record.process;
+            if process.start.is_none()
+                || (process.cpu_ns.zip(process.child_cpu_ns).is_none()
+                    && record.wait_cpu_ns.is_none())
+                || process.pid == record.host.pid
+                || process.ppid != record.host.pid
+            {
+                invalid.push(record.tab);
+                continue;
+            }
+            remaining.push(record);
+        }
+        // Different PIDs share one synthetic sweep. A PID reused several times needs one
+        // pass per generation, oldest first; native root generations never coexist in a row.
+        remaining.sort_by_key(|r| (r.process.start, r.seq));
+        while !remaining.is_empty() {
+            let mut seen = IdSet::default();
+            let (batch, later): (Vec<_>, Vec<_>) = remaining
+                .into_iter()
+                .partition(|r| seen.insert(r.process.pid));
+            remaining = later;
+            let mut procs = i.procs.to_vec();
+            let mut members = i.members.to_vec();
+            let mut delegated = i.delegated.to_vec();
+            for record in &batch {
+                let mut final_process = record.process.clone();
+                final_process.state = ProcState::Zombie;
+                if procs
+                    .iter()
+                    .any(|p| p.pid == record.host.pid && p.start != Some(record.host.start))
+                {
+                    // This is another generation of the custodian's PID, so it reaped none of
+                    // this old custodian's children.
+                    final_process.ppid = 1;
+                }
+                let member = Membership {
+                    aterm: true,
+                    shared: false,
+                    tab: record
+                        .tab
+                        .and_then(|key| i.tabs.iter().position(|t| t.key == key || t.tab == key)),
+                };
+                match procs.iter().position(|p| p.pid == record.process.pid) {
+                    Some(k) => {
+                        procs[k] = final_process;
+                        members[k] = member;
+                        delegated[k] = false;
+                    }
+                    None => {
+                        procs.push(final_process);
+                        members.push(member);
+                        delegated.push(false);
+                    }
+                }
+            }
+            for p in &mut procs {
+                if let Some(start) = p.start
+                    && let Some(&child) =
+                        parent_children.get(&crate::delegated::ProcessKey { pid: p.pid, start })
+                {
+                    p.child_cpu_ns = child;
+                }
+            }
+            self.terminal_totals = batch
+                .iter()
+                .filter_map(|record| {
+                    Some((
+                        crate::delegated::ProcessKey {
+                            pid: record.process.pid,
+                            start: record.process.start?,
+                        },
+                        record.wait_cpu_ns,
+                    ))
+                })
+                .collect();
+            self.step_observed(
+                &StepIn {
+                    procs: &procs,
+                    members: &members,
+                    delegated: &delegated,
+                    ..*i
+                },
+                false,
+            );
+            for record in batch
+                .iter()
+                .filter(|r| r.process.cpu_ns.zip(r.process.child_cpu_ns).is_none())
+            {
+                let Some(total) = record.wait_cpu_ns else {
+                    continue;
+                };
+                if total > record.process.cpu_ns.unwrap_or(0) {
+                    let scope = record
+                        .tab
+                        .and_then(|key| {
+                            self.keys
+                                .iter()
+                                .find(|(k, _)| *k == key)
+                                .map(|(_, id)| Scope::Tab(*id))
+                        })
+                        .unwrap_or(Scope::Own);
+                    ambiguous(
+                        &mut self.tabs,
+                        &mut self.ambiguity,
+                        &mut self.own_ambiguity,
+                        scope,
+                        self.step,
+                    );
+                }
+                let overlap = record
+                    .process
+                    .start
+                    .and_then(|start| {
+                        self.terminal_overlap.get(&crate::delegated::ProcessKey {
+                            pid: record.process.pid,
+                            start,
+                        })
+                    })
+                    .copied()
+                    .unwrap_or(0);
+                let scope = record
+                    .tab
+                    .and_then(|key| {
+                        self.keys
+                            .iter()
+                            .find(|(k, _)| *k == key)
+                            .map(|(_, id)| Scope::Tab(*id))
+                    })
+                    .unwrap_or(Scope::Own);
+                let parent = self
+                    .rows
+                    .get(&record.host.pid)
+                    .filter(|p| p.start == record.host.start)
+                    .map(|p| (record.host.pid, p.start));
+                if let Some(row) = self
+                    .rows
+                    .get_mut(&record.process.pid)
+                    .filter(|p| Some(p.start) == record.process.start)
+                {
+                    let doubtful = row.soon.saturating_add(row.late);
+                    let known = row
+                        .cpu
+                        .saturating_add(row.child)
+                        .saturating_add(row.pending.saturating_add(doubtful).max(overlap));
+                    let untrusted_children = row.unwaited
+                        || row.under_unwaited
+                        || record.process.reaps_unwaited != Some(false);
+                    if !untrusted_children {
+                        credit(
+                            &mut self.tabs,
+                            &mut self.own,
+                            scope,
+                            total.saturating_sub(known),
+                        );
+                    }
+                    if doubtful > 0 || overlap > 0 || total < known || untrusted_children {
+                        miss(&mut self.tabs, &mut self.missed, scope, self.step);
+                    }
+                    if untrusted_children {
+                        row.distrust = row.distrust.max(self.step + 1);
+                    }
+                    row.scope = scope;
+                    row.aggregate_final = Some(total);
+                    row.pending = 0;
+                    row.soon = 0;
+                    row.late = 0;
+                    row.zombie = true;
+                    row.parent = parent;
+                    row.ppid = parent.map_or(1, |(pid, _)| pid);
+                } else {
+                    let born = self.born_in_window(&record.process, i);
+                    if born && record.process.reaps_unwaited == Some(false) {
+                        credit(
+                            &mut self.tabs,
+                            &mut self.own,
+                            scope,
+                            total.saturating_sub(overlap),
+                        );
+                        if overlap > 0 {
+                            miss(&mut self.tabs, &mut self.missed, scope, self.step);
+                        }
+                    } else {
+                        // The combined wait is known, but no reading bounds how much preceded
+                        // this window. Retain that aggregate in the snapshot and mark timing
+                        // coverage unknown rather than assign its whole lifetime to this tick.
+                        miss(&mut self.tabs, &mut self.missed, scope, self.step);
+                    }
+                    if let Some((pid, _)) = parent
+                        && let Some(p) = self.rows.get_mut(&pid)
+                    {
+                        p.pending = p.pending.saturating_add(total);
+                    }
+                }
+            }
+            self.terminal_totals.clear();
+            // A synthetic terminal pass is no new birth boundary for this whole sweep.
+            // In particular a live incarnation that reused a terminal's PID may be new since
+            // the prior whole sweep despite being older than another current process.
+            (self.at_unix_ms, self.newest) = baseline;
+        }
+        self.step(i);
+        let present: IdSet<_> = i
+            .procs
+            .iter()
+            .filter_map(|p| {
+                Some(crate::delegated::ProcessKey {
+                    pid: p.pid,
+                    start: p.start?,
+                })
+            })
+            .collect();
+        self.floor_rows.retain(|key, _| present.contains(key));
+        self.pane_floors
+            .retain(|key, _| i.tabs.iter().any(|tab| tab.key == *key));
+        if incomplete {
+            self.missed = self.step;
+            for counter in self.tabs.values_mut() {
+                counter.missed = self.step;
+            }
+        }
+        for tab in invalid {
+            let scope = tab
+                .and_then(|key| {
+                    self.keys
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, id)| Scope::Tab(*id))
+                })
+                .unwrap_or(Scope::Own);
+            miss(&mut self.tabs, &mut self.missed, scope, self.step);
+            ambiguous(
+                &mut self.tabs,
+                &mut self.ambiguity,
+                &mut self.own_ambiguity,
+                scope,
+                self.step,
+            );
+        }
+    }
+
     /// Whether the last step read the reading stamped `at_ns`.
     #[must_use]
     pub fn stepped_at(&self, at_ns: u64) -> bool {
@@ -382,12 +1015,24 @@ impl ReapLedger {
                     id,
                     ns: c.ns,
                     missed: c.missed,
+                    floor_ns: c.floor_ns,
+                    ambiguous: c.ambiguous,
                 }
             })
             .collect();
         tabs.sort_unstable_by_key(|t| t.key);
         ReapTotals {
             step: self.step,
+            missed: self.missed,
+            all_floor: self
+                .tabs
+                .values()
+                .fold(self.own_floor, |sum, c| sum.saturating_add(c.floor_ns)),
+            ambiguous: self.ambiguity,
+            own_ambiguous: self.own_ambiguity,
+            coalition_floors: self.coalition_floors.clone(),
+            pane_floors: self.pane_floors.clone(),
+            unmapped_floor: self.unmapped_floor,
             all: self
                 .tabs
                 .values()
@@ -500,8 +1145,179 @@ impl ReapLedger {
         }
     }
 
-    /// Reads one whole sweep. A cut one is skipped: a member it missed may be alive.
+    /// Reads one whole sweep. Counter reads within a sweep need not be simultaneous: a child
+    /// sampled first can already have been reaped by a parent sampled later. Let that child's
+    /// known lifetime become pending before the later parent counter is credited, then restore
+    /// the retained child reading as a baseline. That overlap is ambiguous, never an exact
+    /// claim that the child died; a known escaped parent chain or a later child counter stays
+    /// independent.
     pub fn step(&mut self, i: &StepIn) {
+        self.step_observed(i, true);
+    }
+
+    fn step_observed(&mut self, i: &StepIn, whole: bool) {
+        if i.truncated {
+            return;
+        }
+        self.observe_own_floor(i);
+        self.terminal_overlap.clear();
+        let by_pid: IdMap<_, _> = i.procs.iter().map(|p| (p.pid, p)).collect();
+        let mut overlaps = IdMap::default();
+        for parent in i.procs {
+            let Some(start) = parent.start else { continue };
+            let key = crate::delegated::ProcessKey {
+                pid: parent.pid,
+                start,
+            };
+            let previous = self.rows.get(&parent.pid).filter(|p| p.start == start);
+            let grew = parent
+                .child_cpu_ns
+                .is_some_and(|cpu| cpu > previous.map_or(0, |p| p.child));
+            let terminal = self.terminal_totals.get(&key);
+            let aggregate_grew = terminal
+                .copied()
+                .flatten()
+                .is_some_and(|cpu| cpu > previous.map_or(0, |p| p.cpu.saturating_add(p.child)));
+            if !grew && !aggregate_grew {
+                continue;
+            }
+            for child in i.procs {
+                let Some(child_start) = child.start else {
+                    continue;
+                };
+                if child.pid == parent.pid
+                    || child
+                        .cpu_ns
+                        .unwrap_or(0)
+                        .saturating_add(child.child_cpu_ns.unwrap_or(0))
+                        == 0
+                {
+                    continue;
+                }
+                let earlier = match (child.at_ns, parent.at_ns) {
+                    (Some(child), Some(parent)) => child < parent,
+                    _ => terminal.is_some(),
+                };
+                if !earlier {
+                    continue;
+                }
+                let mut up = child.ppid;
+                let mut distance = 0;
+                while up > 1 && distance < MAX_HOPS {
+                    distance += 1;
+                    if up == parent.pid {
+                        break;
+                    }
+                    let next = by_pid.get(&up).map(|p| p.ppid);
+                    let Some(next) = next.filter(|next| *next != up) else {
+                        break;
+                    };
+                    up = next;
+                }
+                if up != parent.pid {
+                    continue;
+                }
+                let child_key = crate::delegated::ProcessKey {
+                    pid: child.pid,
+                    start: child_start,
+                };
+                let known = self
+                    .rows
+                    .get(&child.pid)
+                    .filter(|p| p.start == child_start)
+                    .map_or(0, |p| {
+                        p.cpu.saturating_add(p.child).saturating_sub(
+                            p.prepaid
+                                .filter(|(to, _)| *to == key)
+                                .map_or(0, |(_, cpu)| cpu),
+                        )
+                    });
+                let entry = overlaps.entry(child_key).or_insert((key, known, distance));
+                if distance < entry.2 {
+                    *entry = (key, known, distance);
+                }
+            }
+        }
+        if overlaps.is_empty() {
+            self.step_inner(i);
+            if whole {
+                self.accept_whole_cut(i);
+            }
+            return;
+        }
+        for (parent, known, _) in overlaps.values() {
+            let cpu = self.terminal_overlap.entry(*parent).or_insert(0_u64);
+            *cpu = cpu.saturating_add(*known);
+        }
+        let baseline = (self.at_unix_ms, self.newest);
+        let mut procs = Vec::with_capacity(i.procs.len());
+        let mut members = Vec::with_capacity(i.members.len());
+        let mut delegated = Vec::with_capacity(i.delegated.len());
+        for ((p, member), job) in i.procs.iter().zip(i.members).zip(i.delegated) {
+            if p.start.is_some_and(|start| {
+                overlaps.contains_key(&crate::delegated::ProcessKey { pid: p.pid, start })
+            }) {
+                continue;
+            }
+            procs.push(p.clone());
+            members.push(*member);
+            delegated.push(*job);
+        }
+        self.step_inner(&StepIn {
+            procs: &procs,
+            members: &members,
+            delegated: &delegated,
+            ..*i
+        });
+        (self.at_unix_ms, self.newest) = baseline;
+        self.baseline_only.extend(overlaps.keys().copied());
+        self.step_inner(i);
+        self.baseline_only.clear();
+        for (child, (parent, _, _)) in overlaps {
+            if let Some(row) = self
+                .rows
+                .get_mut(&child.pid)
+                .filter(|p| p.start == child.start)
+            {
+                row.prepaid = Some((parent, row.cpu.saturating_add(row.child)));
+                miss(&mut self.tabs, &mut self.missed, row.scope, self.step);
+                ambiguous(
+                    &mut self.tabs,
+                    &mut self.ambiguity,
+                    &mut self.own_ambiguity,
+                    row.scope,
+                    self.step,
+                );
+            }
+            if let Some(row) = self
+                .rows
+                .get_mut(&parent.pid)
+                .filter(|p| p.start == parent.start)
+            {
+                row.overlapping = true;
+                miss(&mut self.tabs, &mut self.missed, row.scope, self.step);
+                ambiguous(
+                    &mut self.tabs,
+                    &mut self.ambiguity,
+                    &mut self.own_ambiguity,
+                    row.scope,
+                    self.step,
+                );
+            }
+        }
+        if whole {
+            self.accept_whole_cut(i);
+        }
+    }
+
+    fn accept_whole_cut(&mut self, i: &StepIn) {
+        self.whole_at_ns = Some(i.at_ns);
+        self.whole_wall_ms = Some(i.at_unix_ms);
+        self.whole_cpu_cut = i.cpu_cut;
+    }
+
+    /// The pending-credit step over one consistent set of present generations.
+    fn step_inner(&mut self, i: &StepIn) {
         if i.truncated {
             return;
         }
@@ -522,11 +1338,17 @@ impl ReapLedger {
             tabs,
             keys,
             own,
+            missed,
             step,
             here,
             memo,
             tab_ids,
             held,
+            baseline_only,
+            terminal_overlap,
+            own_floor,
+            ambiguity,
+            own_ambiguity,
             ..
         } = self;
         let step = *step;
@@ -538,6 +1360,8 @@ impl ReapLedger {
             let keep = open.contains(id);
             if !keep {
                 *own = own.saturating_add(c.ns);
+                *own_floor = own_floor.saturating_add(c.floor_ns);
+                *own_ambiguity = (*own_ambiguity).max(c.ambiguous);
             }
             keep
         });
@@ -567,7 +1391,9 @@ impl ReapLedger {
         };
         let countable = |k: usize| {
             let p = &i.procs[k];
-            p.start.is_some() && p.uid == Some(i.self_uid) && p.cpu_ns.is_some()
+            p.start.is_some()
+                && (p.uid == Some(i.self_uid) || i.members.get(k).is_some_and(|m| m.aterm))
+                && p.cpu_ns.is_some()
         };
 
         // Processes with no row gone since the last step that held members' work: each passes it
@@ -606,7 +1432,7 @@ impl ReapLedger {
                     q.distrust = q.distrust.max(step + 1);
                 }
                 if h.doubt > 0 && !q.delegated {
-                    miss(tabs, q.scope, step);
+                    miss(tabs, missed, q.scope, step);
                 }
                 continue;
             }
@@ -634,10 +1460,10 @@ impl ReapLedger {
                         q.distrust = q.distrust.max(step + 1);
                     }
                     if h.doubt > 0 && !q.delegated {
-                        miss(tabs, q.scope, step);
+                        miss(tabs, missed, q.scope, step);
                     }
                 }
-                None => miss(tabs, h.scope, step),
+                None => miss(tabs, missed, h.scope, step),
             }
         }
 
@@ -659,7 +1485,19 @@ impl ReapLedger {
             .collect();
         for &pid in &gone {
             let r = rows[&pid];
-            let certain = r.cpu.saturating_add(r.child).saturating_add(r.pending);
+            let prepaid = r
+                .prepaid
+                .filter(|(to, _)| {
+                    reaper(rows, r.parent, gone_now)
+                        .and_then(|pid| rows.get(&pid).map(|row| (pid, row.start)))
+                        .is_some_and(|(pid, start)| pid == to.pid && start == to.start)
+                })
+                .map_or(0, |(_, cpu)| cpu);
+            let certain = r
+                .aggregate_final
+                .unwrap_or_else(|| r.cpu.saturating_add(r.child))
+                .saturating_sub(prepaid)
+                .saturating_add(r.pending);
             let direct = r.parent.is_some_and(|(p, _)| p == r.ppid);
             let stayed = r.ppid > 1
                 && match r.parent {
@@ -673,7 +1511,7 @@ impl ReapLedger {
             // A job's member gone: the job's figure, live members' alone, read none of its work
             // since the window began.
             if r.job {
-                miss(tabs, r.scope, step);
+                miss(tabs, missed, r.scope, step);
             }
             let hold =
                 fault_is(fault, Fault::HoldEveryPending) || fault_is(fault, Fault::KeepFirstParent);
@@ -694,7 +1532,7 @@ impl ReapLedger {
                 // Its tail since its last reading is in the holder's reaped time, in no figure
                 // until the holder goes; a zombie's last reading was final.
                 if !r.delegated && !r.zombie {
-                    miss(tabs, r.scope, step);
+                    miss(tabs, missed, r.scope, step);
                 }
                 continue;
             }
@@ -721,12 +1559,12 @@ impl ReapLedger {
                         // Work a reading already found its reaper's reaped time short of: what
                         // is taken out against it here may be the reaper's other children's.
                         if r.doubt() > 0 && !p.delegated {
-                            miss(tabs, p.scope, step);
+                            miss(tabs, missed, p.scope, step);
                         }
                     }
                 }
                 None if !r.delegated && (!r.zombie || r.doubt() > 0) => {
-                    miss(tabs, r.scope, step);
+                    miss(tabs, missed, r.scope, step);
                 }
                 None => {}
             }
@@ -772,6 +1610,9 @@ impl ReapLedger {
             // launchd may have, so what a reading takes out against it may be its other
             // children's: this one where any is left, and the next, which drops the rest.
             let suspect = row.late > 0;
+            if row.soon > 0 || row.late > 0 {
+                ambiguous(tabs, ambiguity, own_ambiguity, row.scope, step);
+            }
             let grew = child.saturating_sub(row.child);
             let mut left = grew;
             if !fault_is(fault, Fault::AbsorbNothing) {
@@ -794,6 +1635,9 @@ impl ReapLedger {
             // since), that growth may hold some of their work twice, so none of it counts, and the
             // step missed what it held once.
             let unseen = left > 0;
+            if unseen && !row.delegated {
+                ambiguous(tabs, ambiguity, own_ambiguity, row.scope, step);
+            }
             let unwaited = p.reaps_unwaited == Some(true);
             let doubled = unwaited || row.unwaited || row.distrust >= step;
             if doubled {
@@ -833,10 +1677,10 @@ impl ReapLedger {
             let short = if row.delegated {
                 held && unseen
             } else {
-                doubt || (doubled && unseen)
+                doubt || (doubled && unseen) || row.overlapping
             };
             if short || back {
-                miss(tabs, row.scope, step);
+                miss(tabs, missed, row.scope, step);
             }
         }
 
@@ -945,8 +1789,9 @@ impl ReapLedger {
                 let (Some(scope), Some(start), true) = (scope, p.start, countable(k)) else {
                     continue;
                 };
-                let born = p.birth_ms.zip(since_ms).is_some_and(|(b, t)| b >= t)
-                    || since_start.is_some_and(|s| start > s);
+                let born = (p.birth_ms.zip(since_ms).is_some_and(|(b, t)| b >= t)
+                    || since_start.is_some_and(|s| start > s))
+                    && !baseline_only.contains(&crate::delegated::ProcessKey { pid: p.pid, start });
                 let (cpu, child) = (p.cpu_ns.unwrap_or(0), p.child_cpu_ns.unwrap_or(0));
                 let delegated = i.delegated.get(k).copied().unwrap_or(false);
                 let unwaited = p.reaps_unwaited == Some(true);
@@ -958,6 +1803,9 @@ impl ReapLedger {
                         scope,
                         cpu,
                         child,
+                        aggregate_final: None,
+                        prepaid: None,
+                        overlapping: false,
                         credited: (!delegated).then_some(cpu),
                         parent: None,
                         ppid: p.ppid,
@@ -983,7 +1831,7 @@ impl ReapLedger {
                     // The job's figure reads a member from a window's start: one first read since
                     // is in none of its figures over that window.
                     if since_ms.is_some() {
-                        miss(tabs, scope, step);
+                        miss(tabs, missed, scope, step);
                     }
                     continue;
                 }
@@ -991,12 +1839,27 @@ impl ReapLedger {
                     // Its reaped time may hold its children's work twice: its own counts alone.
                     credit(tabs, own, scope, cpu);
                     if child > 0 {
-                        miss(tabs, scope, step);
+                        miss(tabs, missed, scope, step);
                     }
                 } else if born {
-                    credit(tabs, own, scope, cpu.saturating_add(child));
+                    let overlap = terminal_overlap
+                        .get(&crate::delegated::ProcessKey { pid: p.pid, start })
+                        .copied()
+                        .unwrap_or(0);
+                    credit(
+                        tabs,
+                        own,
+                        scope,
+                        cpu.saturating_add(child.saturating_sub(overlap)),
+                    );
+                    if overlap > 0 {
+                        miss(tabs, missed, scope, step);
+                    }
                 } else if since_ms.is_some() {
-                    miss(tabs, scope, step);
+                    miss(tabs, missed, scope, step);
+                }
+                if born && child > 0 && !delegated {
+                    ambiguous(tabs, ambiguity, own_ambiguity, scope, step);
                 }
             }
         }
@@ -1048,10 +1911,25 @@ fn credit(tabs: &mut IdMap<u64, Counter>, own: &mut u64, scope: Scope, ns: u64) 
     }
 }
 
-/// Marks step `step` as one that missed some of `scope`'s work, where `scope` is a tab.
-fn miss(tabs: &mut IdMap<u64, Counter>, scope: Scope, step: u64) {
+/// Marks step `step` as one that missed work globally and in the tab where there is one.
+fn miss(tabs: &mut IdMap<u64, Counter>, missed: &mut u64, scope: Scope, step: u64) {
+    *missed = step;
     if let Scope::Tab(id) = scope {
         tabs.entry(id).or_default().missed = step;
+    }
+}
+
+fn ambiguous(
+    tabs: &mut IdMap<u64, Counter>,
+    all: &mut u64,
+    own: &mut u64,
+    scope: Scope,
+    step: u64,
+) {
+    *all = step;
+    match scope {
+        Scope::Tab(id) => tabs.entry(id).or_default().ambiguous = step,
+        Scope::Own => *own = step,
     }
 }
 

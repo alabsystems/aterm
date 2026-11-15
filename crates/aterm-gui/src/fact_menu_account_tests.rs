@@ -52,6 +52,7 @@ fn card(who: Who) -> AccountCard {
         pool_size: 3,
         this_mac: Some("m20".into()),
         login: None,
+        signing_in: false,
         budget: Budget::default(),
         history: Arc::new(History::none(HistoryFrom::Nothing)),
         machine: Machine {
@@ -157,8 +158,8 @@ fn series_days(days: i64) -> Vec<DayPoint> {
 fn pool_a() -> Vec<AccountMenuRow> {
     vec![
         acct("alpha", "alpha.m20.1@proton.me", "\u{2264}88% left", false),
-        acct("beta", "beta.m21.1@proton.me", "not signed in", false),
-        acct("gamma", "gamma.m22.1@proton.me", "not signed in", false),
+        acct("beta", "beta.m21.1@proton.me", "signed out", false),
+        acct("gamma", "gamma.m22.1@proton.me", "signed out", false),
     ]
 }
 
@@ -619,8 +620,8 @@ fn state_a_a_login_outside_this_macs_pool() {
             "Usual    m15 \u{b7} 41 of 46 starts since 28 Oct",
             "Switch this Mac to \u{2500}\u{2500}",
             "\u{2386}  alpha.m20.1@proton.me  [\u{2264}88% left]",
-            "\u{2386}  beta.m21.1@proton.me  [not signed in]",
-            "\u{2386}  gamma.m22.1@proton.me  [not signed in]",
+            "\u{2386}  beta.m21.1@proton.me  [signed out]",
+            "\u{2386}  gamma.m22.1@proton.me  [signed out]",
             "Automatic switching \u{2500}\u{2500}",
             "Off for this tab: its login is not one of this Mac's 3",
             "accounts.",
@@ -660,8 +661,8 @@ fn state_a_on_a_debug_build_says_what_it_does_not_know() {
             "This Mac in use: this tab only",
             "Switch this Mac to \u{2500}\u{2500}",
             "\u{2386}  alpha.m20.1@proton.me  [\u{2264}88% left]",
-            "\u{2386}  beta.m21.1@proton.me  [not signed in]",
-            "\u{2386}  gamma.m22.1@proton.me  [not signed in]",
+            "\u{2386}  beta.m21.1@proton.me  [signed out]",
+            "\u{2386}  gamma.m22.1@proton.me  [signed out]",
             "Automatic switching \u{2500}\u{2500}",
             "Off for this tab: its login is not one of",
             "this Mac's 3 accounts.",
@@ -966,10 +967,10 @@ fn state_f_a_program_that_is_not_claude_code() {
         shown(&agy),
         [
             "Account \u{b7} tab 5",
-            "\u{2386}  not signed in",
+            "\u{2386}  signed out",
             "Token    not used: Antigravity keeps its own",
             "         login",
-            "Budget   not known: not signed in",
+            "Budget   not known: signed out",
             "Machine  in use here",
             "         other Macs not tracked",
             "Budget \u{2500}\u{2500}",
@@ -1185,10 +1186,33 @@ fn every_token_state_has_one_verdict() {
         token.not_yet = not_yet;
         verdict(Some(TokensRead::Read), Some(token))
     };
-    let unverified = |minted_here: bool, minted_on: &str| TokenState::Unverified {
+    use aterm_secrets::entry_class::MintedBy;
+    let unverified = |minted_here: bool, by: MintedBy, minted_on: &str| TokenState::Unverified {
         minted_here,
+        minted_by: Some(by),
         why: Unverified::NoReadingYet,
         minted_on: minted_on.into(),
+        exposed: Vec::new(),
+    };
+    let differ = |minted_here: bool| TokenState::Unverified {
+        minted_here,
+        minted_by: Some(MintedBy::Window),
+        why: Unverified::WindowsDiffer,
+        minted_on: "m20".into(),
+        exposed: Vec::new(),
+    };
+    let awaiting = |minted_here: bool| TokenState::Unverified {
+        minted_here,
+        minted_by: Some(MintedBy::Window),
+        why: Unverified::AwaitingBasis,
+        minted_on: "m20".into(),
+        exposed: Vec::new(),
+    };
+    let shared = |by: MintedBy| TokenState::Unverified {
+        minted_here: true,
+        minted_by: Some(by),
+        why: Unverified::WindowsShared,
+        minted_on: "m20".into(),
         exposed: Vec::new(),
     };
     let cases: Vec<((String, NoteTone), &str, NoteTone)> = vec![
@@ -1237,18 +1261,49 @@ fn every_token_state_has_one_verdict() {
             NoteTone::Warn,
         ),
         (
-            of(TokenState::Rejected, None, false),
+            of(TokenState::Rejected { elsewhere: true }, None, false),
             "in the vault \u{b7} Claude Code refused it",
             NoteTone::Warn,
         ),
         (
-            of(unverified(true, "m20"), None, false),
+            of(unverified(true, MintedBy::Terminal, "m20"), None, false),
             "made here \u{b7} not verified yet",
             NoteTone::Value,
         ),
         (
-            of(unverified(false, "m15"), None, false),
-            "in the vault \u{b7} works only on m15 until verified",
+            of(differ(true), None, false),
+            "in the vault \u{b7} replace it: not used, its usage windows are not this login's",
+            NoteTone::Warn,
+        ),
+        (
+            of(differ(false), None, false),
+            "in the vault \u{b7} not used here: its usage windows are not this login's",
+            NoteTone::Warn,
+        ),
+        (
+            of(awaiting(true), None, false),
+            "made here \u{b7} awaiting a stored-login reading",
+            NoteTone::Value,
+        ),
+        (
+            of(awaiting(false), None, false),
+            "in the vault \u{b7} awaiting a stored-login reading",
+            NoteTone::Value,
+        ),
+        (
+            of(shared(MintedBy::Terminal), None, false),
+            "in the vault \u{b7} replace it: its usage windows could not be told from another \
+             account's",
+            NoteTone::Warn,
+        ),
+        (
+            of(unverified(false, MintedBy::Window, "m15"), None, false),
+            "in the vault \u{b7} made on m15, not verified yet",
+            NoteTone::Value,
+        ),
+        (
+            of(unverified(false, MintedBy::Terminal, "m15"), None, false),
+            "in the vault \u{b7} not used here until m15 verifies it",
             NoteTone::Value,
         ),
         (
@@ -1274,6 +1329,13 @@ fn every_token_state_has_one_verdict() {
         assert_eq!(tone, want_tone, "{want}");
         assert!(seen.insert(value), "{want}: said by two states");
     }
+    // Shared windows never verify a token, but aterm's window proved the account at its mint and
+    // the token is in use on every Mac: its card asks for no replacement, as a terminal token's
+    // does.
+    assert_eq!(
+        of(shared(MintedBy::Window), None, false),
+        of(unverified(true, MintedBy::Window, "m20"), None, false),
+    );
     // A token signed only into this Mac's log so far is not said to be in the vault, whatever
     // state it is in: each state keeps its clause and its tone.
     let made = "made here \u{b7} not in the vault yet";
@@ -1308,18 +1370,28 @@ fn every_token_state_has_one_verdict() {
             NoteTone::Warn,
         ),
         (
-            of(TokenState::Rejected, None, true),
+            of(TokenState::Rejected { elsewhere: false }, None, true),
             format!("{made} \u{b7} Claude Code refused it"),
             NoteTone::Warn,
         ),
         (
-            of(unverified(true, "m20"), None, true),
+            of(unverified(true, MintedBy::Terminal, "m20"), None, true),
             format!("{made} \u{b7} not verified yet"),
             NoteTone::Value,
         ),
         (
-            of(unverified(false, "m15"), None, true),
-            format!("{made} \u{b7} works only on m15 until verified"),
+            of(differ(true), None, true),
+            format!("{made} \u{b7} replace it: not used, its usage windows are not this login's"),
+            NoteTone::Warn,
+        ),
+        (
+            of(awaiting(true), None, true),
+            format!("{made} \u{b7} awaiting a stored-login reading"),
+            NoteTone::Value,
+        ),
+        (
+            of(unverified(false, MintedBy::Terminal, "m15"), None, true),
+            format!("{made} \u{b7} not used here until m15 verifies it"),
             NoteTone::Value,
         ),
         (
@@ -1398,7 +1470,21 @@ fn an_outside_login_is_never_given_an_end() {
         fact_value(&rows, "Login").as_deref(),
         Some("signed in on this Mac \u{b7} this tab runs on it")
     );
-    for text in words_of(&rows) {
+    // The pool's items say each pool account's own state (`signed out`), not this login's.
+    let own: Vec<MenuRow> = rows
+        .iter()
+        .filter(|row| {
+            !matches!(
+                row,
+                MenuRow::Item {
+                    act: MenuAct::Fact(_, FactAct::UseAccount(_)),
+                    ..
+                }
+            )
+        })
+        .cloned()
+        .collect();
+    for text in words_of(&own) {
         assert!(
             !text.contains("ends 30 Nov") && !text.contains("signed out"),
             "{text}"
@@ -1476,6 +1562,35 @@ fn the_login_row_says_the_login_and_what_the_tab_runs_on() {
     assert!(rows.contains(&"Login    never signed in on this Mac".into()));
     let rows = login(None, AuthRoute::Outside, true);
     assert!(rows.contains(&"Login    not read yet".into()));
+    // While the card says its account's sign-in runs with no login here
+    // (`AccountCard::signing_in`, which the card's build reads by `Figure::login`, the rule line E
+    // and the card's items read), the Login line says `signing in` whatever the tab runs on and
+    // whatever stands in for the login: a key from outside, a vault token in use, this tab on the
+    // vault token. NEGATIVE CONTROL: the words above are the same card's with it false.
+    let vault_route = state_b(120).route;
+    assert!(
+        matches!(vault_route, Some(AuthRoute::VaultToken { .. })),
+        "{vault_route:?}"
+    );
+    for (route, in_use) in [
+        (Some(AuthRoute::Outside), false),
+        (Some(AuthRoute::Outside), true),
+        (vault_route, false),
+    ] {
+        let mut facts = state_b(120);
+        facts.route = route;
+        if in_use {
+            facts.token.as_mut().expect("a token").login = LoginHere::Half(LoginHalf::InUse);
+        }
+        let card = facts.card.as_mut().expect("a card");
+        card.login = Some(LoginHalf::SignedOut { at: Some(NOV_9) });
+        card.signing_in = true;
+        let rows = lines(&super::build(&facts, 120, false));
+        assert!(
+            rows.contains(&"Login    signing in".to_owned()),
+            "{route:?}, token in use {in_use}: {rows:?}"
+        );
+    }
 }
 
 /// THE BUDGET VERDICT'S FIGURE IS THE FIRST SOURCE THAT HOLDS ONE, and a week never says a
@@ -2090,7 +2205,7 @@ fn a_pool_item_keeps_its_trail_or_moves_it_under() {
     let long = acct(
         "long",
         "a.rather.long.account.name@example.proton.me",
-        "not signed in",
+        "signed out",
         false,
     );
     let item = |room: usize| {
@@ -2103,13 +2218,13 @@ fn a_pool_item_keeps_its_trail_or_moves_it_under() {
     };
     assert_eq!(
         item(64),
-        ["\u{2386}  a.rather.long.account.name@example.proton.me  [not signed in]"]
+        ["\u{2386}  a.rather.long.account.name@example.proton.me  [signed out]"]
     );
     assert_eq!(
         item(60),
         [
             "\u{2386}  a.rather.long.account.name@example.proton.me",
-            "   not signed in"
+            "   signed out"
         ]
     );
     assert_eq!(
@@ -2117,7 +2232,7 @@ fn a_pool_item_keeps_its_trail_or_moves_it_under() {
         [
             "\u{2386}  a.rather.long.account.name",
             "   @example.proton.me",
-            "   not signed in"
+            "   signed out"
         ]
     );
     assert_eq!(
@@ -2125,7 +2240,7 @@ fn a_pool_item_keeps_its_trail_or_moves_it_under() {
         [
             "\u{2386}  a.rather.long.account.nam",
             "   e@example.proton.me",
-            "   not signed in"
+            "   signed out"
         ],
         "a name part wider than the room breaks at the cell, nothing dropped"
     );
@@ -2162,6 +2277,7 @@ fn copy_details_holds_every_fact_emails_and_both_clocks() {
     token.vault_words = Some("in the vault, shared with 2 Macs".into());
     token.peers = vec!["m15".into(), "m22".into()];
     token.peers_read_at = u64::try_from(TODAY_13_05).ok();
+    token.step = Some("stopped 11 Nov: the consent page carried a human check".into());
     let progress = facts.account_progress.as_mut().expect("progress");
     progress.details = vec!["sol.m20.2@proton.me: no usable sign-in route".into(); 3];
     progress.next_at = Some(TODAY_20_10);
@@ -2184,6 +2300,7 @@ fn copy_details_holds_every_fact_emails_and_both_clocks() {
         "Token ends: Mon 1 Feb 12:00 (2027-02-01T12:00:00Z)",
         "Token made on: m20",
         "Vault: in the vault, shared with 2 Macs",
+        "Token step: stopped 11 Nov: the consent page carried a human check",
         "Other Macs on the token: m15, m22, read 13:05 (2026-11-11T13:05:00Z)",
         "Assigned to: m22, this Mac (m20)",
         "Claim: m22, since 09:40 (2026-11-11T09:40:00Z), until 21:40 (2026-11-11T21:40:00Z)",

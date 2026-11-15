@@ -245,8 +245,9 @@ pub(crate) struct CursorPreviewSpec {
     pub(crate) cursor_color_pinned: bool,
     /// The animal the `cursor_pet` setting names, beside whatever style is selected.
     pub(crate) pet: Option<aterm_effects::kitty_pet::PetSpecies>,
-    /// The `cursor_pet` setting names the flier: no walker, and a head the rainbow flies in.
-    pub(crate) pet_flies: bool,
+    /// The animal the `cursor_pet` setting flies in (the flier, in its glide): no walker, and
+    /// the rainbow flies it in. `None` for a walker and for `off`.
+    pub(crate) pet_flier: Option<aterm_effects::kitty_pet::PetSpecies>,
 }
 
 impl Default for CursorPreviewSpec {
@@ -267,7 +268,7 @@ impl Default for CursorPreviewSpec {
             momentum_glow: true,
             cursor_color_pinned: false,
             pet: aterm_effects::cursor_pet::species(crate::prefs::DEFAULT_CURSOR_PET),
-            pet_flies: aterm_effects::cursor_pet::flies(crate::prefs::DEFAULT_CURSOR_PET),
+            pet_flier: aterm_effects::cursor_pet::flies(crate::prefs::DEFAULT_CURSOR_PET),
         }
     }
 }
@@ -296,7 +297,7 @@ impl CursorPreviewSpec {
             momentum_glow: self.momentum_glow,
             cursor_color_pinned: self.cursor_color_pinned,
             pet: self.pet,
-            pet_flies: self.pet_flies,
+            pet_flier: self.pet_flier,
         }
     }
 
@@ -345,7 +346,7 @@ impl CursorPreviewSpec {
             "off",
         );
         presentation.pet_species = self.pet;
-        presentation.pet_flies = self.pet_flies;
+        presentation.pet_flier = self.pet_flier;
         presentation
     }
 
@@ -354,7 +355,7 @@ impl CursorPreviewSpec {
     pub(crate) fn trail_companion(&self) -> PreviewTrailCompanion {
         match self.pet {
             Some(species) => PreviewTrailCompanion::Pet(species),
-            None if self.pet_flies
+            None if self.pet_flier.is_some()
                 && self.resolved_trail_presentation().style.style
                     == Some(GlowStyle::RainbowKitty) =>
             {
@@ -2059,7 +2060,7 @@ impl SettingsPreviewSpec {
         self.cursor.momentum_glow.hash(&mut hash);
         self.cursor.cursor_color_pinned.hash(&mut hash);
         self.cursor.pet.hash(&mut hash);
-        self.cursor.pet_flies.hash(&mut hash);
+        self.cursor.pet_flier.hash(&mut hash);
         self.reduced_motion.hash(&mut hash);
         self.pause.hash(&mut hash);
         self.holds_pause().hash(&mut hash);
@@ -4690,9 +4691,15 @@ struct ScenePlayer {
 }
 
 impl ScenePlayer {
-    fn new(key: u64, look: aterm_effects::kitty_registry::KittyLook) -> Self {
+    fn new(
+        key: u64,
+        look: aterm_effects::kitty_registry::KittyLook,
+        body: Option<aterm_effects::kitty_pet::PetSpecies>,
+    ) -> Self {
         let mut cat = aterm_effects::kitty_cursor::CursorCat::default();
         cat.set_look(look);
+        // The flier glides in as the pet setting's animal ([`aterm_effects::kitty_cursor::CursorCat::set_body`]).
+        cat.set_body(body);
         Self {
             key,
             origin: Instant::now(),
@@ -4991,8 +4998,11 @@ impl CursorScene {
                     player
                 }
                 _ => {
-                    let player =
-                        slot.insert(Box::new(ScenePlayer::new(key, self.post_fx.companion_look)));
+                    let player = slot.insert(Box::new(ScenePlayer::new(
+                        key,
+                        self.post_fx.companion_look,
+                        self.cursor.pet_flier,
+                    )));
                     player.fx.glow.observe_glyph_ink(stage.ink.cloned());
                     player
                 }
@@ -5020,6 +5030,7 @@ impl CursorScene {
         if let Some(frame) = step.frame {
             input.cursor_trail_color = frame.trail_color;
             input.cursor_fill_override = frame.caret_fill();
+            input.cursor_keyline_tint = frame.keyline_tint;
             #[cfg(test)]
             if !self.controls.thin_caret_fill {
                 input.cursor_fill_override = frame.block_fill.map(|owned| owned.fill);
@@ -5551,16 +5562,30 @@ impl CursorScene {
                 );
             }
             SceneCompanion::FlyingKitty => {
-                let (look, alpha, bob, mut pose, sing) = match flight {
+                let (look, body, alpha, bob, mut pose, sing) = match flight {
                     Some(frame) => (
                         frame.render_look(),
+                        frame.body,
                         frame.alpha,
-                        frame.bob,
+                        // The glide breathes in whole device pixels, as the terminal's route
+                        // quantizes it.
+                        match frame.body {
+                            aterm_effects::kitty_cursor::CursorBody::Glide(_) => {
+                                aterm_effects::kitty_cursor::glide_bob_cells(frame.bob, cell_h)
+                            }
+                            aterm_effects::kitty_cursor::CursorBody::Head => frame.bob,
+                        },
                         frame.pose,
                         frame.sing,
                     ),
                     None => (
                         self.post_fx.companion_look,
+                        match self.cursor.pet_flier {
+                            Some(species) => aterm_effects::kitty_cursor::CursorBody::Glide(
+                                aterm_effects::kitty_pet::glide_faces(species).fly,
+                            ),
+                            None => aterm_effects::kitty_cursor::CursorBody::Head,
+                        },
                         255,
                         0.0,
                         aterm_effects::kitty_cursor::CatPose::STILL,
@@ -5572,22 +5597,25 @@ impl CursorScene {
                 // caret where the caret's row is blank there, else behind the
                 // caret or a row up, off the letters (`rainbow_kitty::companion::
                 // placement`). The scene's cat faces the way it types.
+                let ink = |row: u16, col: u16| {
+                    (row < geom.rows && col < geom.cols)
+                        .then(|| pet.letters.lettered(usize::from(row), usize::from(col)))
+                };
                 let mut lift = 0.0;
-                if let Some(rest) = decorations.kitty_cursor_footprint(
+                let base_pose = pose;
+                let rest = decorations.kitty_cursor_footprint(
                     aterm_effects::word_decorations::KittyCursorLayout {
                         geom,
                         cursor: caret,
                         look,
+                        body,
                         bob,
                         lift: 0.0,
                     },
-                ) {
+                );
+                if let Some(rest) = rest {
                     use aterm_effects::rainbow_kitty::companion::{SeatQuery, placement};
 
-                    let ink = |row: u16, col: u16| {
-                        (row < geom.rows && col < geom.cols)
-                            .then(|| pet.letters.lettered(usize::from(row), usize::from(col)))
-                    };
                     let seat = placement(
                         caret,
                         &SeatQuery {
@@ -5613,25 +5641,100 @@ impl CursorScene {
                         pose.lead += seat.x.saturating_sub(rest.x) as f32 / f32::from(cell_w);
                     }
                 }
-                let _ = decorations.kitty_cursor(
-                    KittyCursorFrame {
-                        geom,
-                        cursor: caret,
-                        look,
-                        colors,
-                        bob,
-                        lift,
-                        alpha,
-                        pose: aterm_effects::kitty_cursor::CatPose {
-                            scale_x: pose.scale_x * fit,
-                            scale_y: pose.scale_y * fit,
-                            ..pose
-                        },
-                        sing,
-                        notes: [None; aterm_effects::kitty_sing::MAX_NOTES],
+                let whole = KittyCursorFrame {
+                    geom,
+                    cursor: caret,
+                    look,
+                    body,
+                    colors,
+                    bob,
+                    lift,
+                    alpha,
+                    pose: aterm_effects::kitty_cursor::CatPose {
+                        scale_x: pose.scale_x * fit,
+                        scale_y: pose.scale_y * fit,
+                        ..pose
                     },
-                    sprites,
-                );
+                    sing,
+                    notes: [None; aterm_effects::kitty_sing::MAX_NOTES],
+                };
+                // Judged on the posed body, as the terminal's head is: a stretch grows it about
+                // its centre, back toward the caret.
+                let mut drawn = decorations
+                    .kitty_cursor_kept_off(&whole, ink, false)
+                    .map(|placement| (whole, placement));
+                // No whole seat clears: fitted to the caret's row as the terminal fits it
+                // (`EffectsPipeline::route_flying_head`, `companion::HeadFit`).
+                let (cw, ch) = (i32::from(cell_w), i32::from(cell_h));
+                let gap = (aterm_effects::word_decorations::WordDecorations::kitty_cursor_lead_px(
+                    cell_w,
+                ) / aterm_effects::word_decorations::HEAD_CARET_GAP_DEN)
+                    .max(1);
+                let blocked = drawn
+                    .and_then(|(_, placement)| placement.drawn_footprint())
+                    .is_some_and(|r| {
+                        !aterm_effects::rainbow_kitty::companion::box_clear(
+                            (r.x, r.y, i32::from(r.w), i32::from(r.h)),
+                            caret,
+                            (cw, ch, geom.rows, geom.cols),
+                            0,
+                            &ink,
+                        )
+                    });
+                if blocked
+                    && let Some(rest) = rest
+                    && let Some((goal, _)) = aterm_effects::rainbow_kitty::companion::head_fit_seat(
+                        caret,
+                        rest,
+                        (cw, ch, geom.cols),
+                        (
+                            gap,
+                            decorations.kitty_cursor_fit_floor(
+                                aterm_effects::word_decorations::KittyCursorLayout {
+                                    geom,
+                                    cursor: caret,
+                                    look,
+                                    body,
+                                    bob,
+                                    lift: 0.0,
+                                },
+                                rest,
+                            ),
+                        ),
+                        &ink,
+                    )
+                {
+                    // The terminal's own fitted geometry (`companion::fitted_head`), at the
+                    // goal: the preview has no ease.
+                    let aterm_effects::rainbow_kitty::companion::FittedHead {
+                        lift, lead_px, ..
+                    } = aterm_effects::rainbow_kitty::companion::fitted_head(
+                        caret,
+                        rest,
+                        goal,
+                        (cw, ch, geom.cols),
+                        gap,
+                        (bob * f32::from(cell_h)).round() as i32,
+                    );
+                    let fitted = KittyCursorFrame {
+                        // No hover: a box with a pixel to spare in its row would bob out of it.
+                        bob: 0.0,
+                        lift,
+                        pose: aterm_effects::kitty_cursor::CatPose {
+                            scale_x: base_pose.scale_x * goal * fit,
+                            scale_y: base_pose.scale_y * goal * fit,
+                            lead: base_pose.lead + lead_px as f32 / f32::from(cell_w.max(1)),
+                            ..base_pose
+                        },
+                        ..whole
+                    };
+                    if let Some(placement) = decorations.kitty_cursor_kept_off(&fitted, ink, true) {
+                        drawn = Some((fitted, placement));
+                    }
+                }
+                if let Some((frame, placement)) = drawn {
+                    let _ = decorations.kitty_cursor_at_placement(frame, placement, sprites);
+                }
             }
             SceneCompanion::None => {}
         }

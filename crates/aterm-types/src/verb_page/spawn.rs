@@ -10,13 +10,18 @@ use super::{Page, Section, para, row};
 /// The `spawn` entry.
 pub(crate) const PAGE: Page = Page {
     usage: &[
+        para(
+            "Use native subagents for same-machine tasks; run commands/scripts in your shell. \
+             Without native agents, work directly. New sessions need an explicit request or a \
+             strong need native tools cannot meet. State why before spawning (`aterm help workers`).",
+        ),
         row(
             "spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] \
              [why=<one line>] [req=<id>]",
             "a new tab (or, with split=, a pane of the focused one), addressable at once",
         ),
         row(
-            "spawn … agent=<claude|codex|agy|muse> [model=<m>] [autopilot=<land|cruise>] \
+            "spawn … agent=<claude|codex|agy|muse> [model=<m>] [effort=<level>] [autopilot=<land|cruise>] \
              [from=<sid>] len=<n>",
             "a worker on a task (owner): replies `GO <n>`, reads <n> task bytes, launches the \
              agent under Autopilot (`aterm ctl spawn agent=<word> … -` reads the task from stdin)",
@@ -61,17 +66,18 @@ pub(crate) const PAGE: Page = Page {
         ),
         row(
             "req=<id>",
-            "join the request an earlier spawn's reply named (`req=r-<yyyymmdd>-<hhmm>-<head>-<n>`): \
-             one of the same requester's that has not concluded, so its tabs are one request \
-             (`ERR spawn req=<id>: <why>` otherwise, `<why>` `this caller makes no request` from \
-             a caller that makes none: a person's shell, a client in no tab); not on the \
-             connected form",
+            "join the request an earlier spawn's reply named, so its tabs are one request \
+             (`req=r-<yyyymmdd>-<hhmm>-<head>-<n>`): the same requester's, not concluded, of this \
+             spawn's kind (over a fleet drive a plain shell joins only a plain shell's, a worker \
+             only a worker's); else `ERR spawn req=<id>: <why>`, `this caller makes no request` \
+             from a person's shell or a client in no tab; not on the connected form",
         ),
-        row(
-            "agent=<word>",
-            "the worker's agent; `grok` is refused for now (`help spawn worker`)",
-        ),
+        row("agent=<word>", "the worker's agent (`help spawn worker`)"),
         row("model=<m>", "the agent's model"),
+        row(
+            "effort=<level>",
+            "Codex only; a native effort such as ultra",
+        ),
         row(
             "autopilot=<land|cruise>",
             "the worker's Autopilot (default land); `meta set autopilot` switches later",
@@ -119,11 +125,6 @@ pub(crate) const PAGE: Page = Page {
             "a new tab in that folder, brought to front",
         ),
         row(
-            "echo 'fix the failing test' | aterm ctl spawn agent=claude cwd=/Users//me/repo -",
-            "a Claude Code worker on that task; then `aterm ctl await task @<sid> since=0` in the \
-             background",
-        ),
-        row(
             "aterm ctl --host mini spawn agent=codex 'cwd=~/repo' - < task.md",
             "a codex-alab worker on another Mac, in a folder of that Mac's home",
         ),
@@ -134,9 +135,8 @@ pub(crate) const PAGE: Page = Page {
             about: "where a worker lands, how it launches and installs, and each stall",
             rows: &[
                 para(
-                    "Worker form (Owner-only): `spawn … agent=<claude|codex|agy|muse|grok>` \
-                     (`grok` is refused, below) `\
-                     [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>` lands its tab \
+                    "Worker form (Owner-only): `spawn … agent=<claude|codex|agy|muse> \
+                     [model=<m>] [effort=<level>] [autopilot=<land|cruise>] [from=<sid>] len=<n>` lands its tab \
                      under the window's Workers tab, behind what the window shows whatever \
                      `raise=` says, not on the strip (`raise <sid>` or the row opens it, and the \
                      row's Move to Tab puts it among the person's tabs; `inspect app/v1 tabs` says \
@@ -158,8 +158,8 @@ pub(crate) const PAGE: Page = Page {
                 ),
                 para(
                     "It sets `task` to `working` (`from=<sid|ctl>`) and `autopilot` to `land` (or \
-                     `autopilot=cruise`; `meta set autopilot land` switches later, on this Mac \
-                     alone: a fleet drive names it at spawn and serves no `meta`).",
+                     `autopilot=cruise`). `meta set autopilot land|cruise|off` switches it later, \
+                     locally or over a fleet drive.",
                 ),
                 para("A launch that does not come up marks the task `stalled` with a `why=`:"),
                 row(
@@ -192,20 +192,11 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "It refuses with `ERR unsupervised: <switch>` when the window harness cannot \
                      supervise (`[harness] enabled = false`, `headless = false`, or `autopilot = \
-                     \"off\"`), and with `ERR spawn agent=<word>: <why>` for an agent whose turn \
-                     end no reader sees yet (`grok`, until aterm reads Grok Build's turn end), \
-                     before any check of this Mac.",
-                ),
-                para(
-                    "Not reached while that refusal stands: once aterm reads Grok Build's turn \
-                     end, a Grok Build worker with no usable sign-in file (a pooled \
-                     `GROK_AUTH_PATH`, else `<GROK_HOME or ~/.grok>/auth.json`, missing, empty or \
-                     one grok refused) is `stalled why=signin` before anything is installed, and \
-                     only a person signs in.",
+                     \"off\"`).",
                 ),
                 para(
                     "An agent whose program atpkg's store holds no build of yet (every agent is in \
-                     atpkg's default set; a fresh Mac before its update pass lands it) is then \
+                     atpkg's default set; a fresh Mac before its update pass lands it) is \
                      installed by atpkg's verified install, and a failed install is `stalled \
                      why=install`, atpkg's last line of the failure in `attention=` \
                      (`why=signin` and `why=install` name the member and the cause there too); \
@@ -262,7 +253,7 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "A `program=` empty, starting `-` or `~`, or holding a control character, an \
                      `arg=` holding one, an `arg=` with no `program=`, and a `program=` beside \
-                     `agent=`, `model=` or `autopilot=` are the usage line; a program whose file \
+                     `agent=`, `model=`, `effort=` or `autopilot=` are the usage line; a program whose file \
                      name is a CLI whose harness concludes its worker \
                      (`agent=claude|codex|agy|muse`) is `ERR spawn program=<p>: <CLI> has a \
                      harness here; spawn it as `agent=<word>``. It needs the window harness \
@@ -289,7 +280,7 @@ pub(crate) const PAGE: Page = Page {
             rows: &[
                 para(
                     "Over an authenticated fleet drive, a worker's spawn takes `agent=`, \
-                     `model=`, `autopilot=`, an absolute `cwd=` or `'cwd=~/<path>'` (a folder in \
+                     `model=`, `effort=`, `autopilot=`, an absolute `cwd=` or `'cwd=~/<path>'` (a folder in \
                      the driven Mac's home, resolved there and refused where it leaves the home, \
                      lies in a folder macOS guards, or is not there; quoted, since bash turns an \
                      unquoted `cwd=~/…` into this Mac's own home before aterm sees it), `from=`, \

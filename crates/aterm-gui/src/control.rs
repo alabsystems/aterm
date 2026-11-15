@@ -286,6 +286,9 @@ fn board_reply(rest: &str) -> String {
     )
 }
 
+/// A fleet `survey` at the level `scope` proved, its facts from the listener cache and, for a
+/// peer's answer, the machine's look; for this Mac's own read (`SERVING_FLEET_TAKING`, which
+/// [`attach_fleet_connection`] sets from what the node job relayed) none.
 fn fleet_survey(verb: &str, rest: &str, scope: Scope, store: &Store) -> Option<String> {
     #[cfg(any(unix, test))]
     if let Scope::Fleet { content, drive } = scope
@@ -303,7 +306,7 @@ fn fleet_survey(verb: &str, rest: &str, scope: Scope, store: &Store) -> Option<S
             aterm_net::fleet::REPLY_MAX,
             &crate::survey::Here {
                 drive,
-                ..crate::survey::Here::cached_for_listener()
+                ..crate::survey::Here::cached(SERVING_FLEET_TAKING.with(std::cell::Cell::get))
             },
         );
         // A survey connection this window's own listener admitted, answered for the session its
@@ -713,6 +716,9 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
             ) => Some(Need::OwnerOnly),
             _ => None,
         },
+        // A log the session kept before aterm last started it is the journal's, read for the
+        // Owner only, since no read grant survives its process.
+        "log" | "brief" if crate::session_log::take_prev(rest) != Ok(None) => Some(Need::OwnerOnly),
         "brief" if !crate::session_log::BriefQuery::parse(rest).is_ok_and(|q| !q.all) => {
             Some(Need::OwnerOnly)
         }
@@ -736,7 +742,9 @@ pub(crate) enum FrontControlSurface {
     None,
     Overlay(crate::overlay::OverlayKind),
     NativeSettings,
-    HarnessSettings,
+    /// A Settings page only the owner drives while it is open: Harness and Lab, which navigate
+    /// sessions, and This Mac, which shows this machine's identity.
+    OwnerSettings,
     /// A private document's view ([`crate::App::view_is_private`]) is the front tab's focused
     /// content: no controller reads or drives it, whatever its authority.
     PrivateDocument,
@@ -1063,7 +1071,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         }
         _ => return "ERR usage: update [status|check|apply|retry|holds]\n".to_string(),
     };
-    let Some(mut st) = st else {
+    let Some(st) = st else {
         return update_status_unreadable_line();
     };
     let apply_snapshot = crate::control::control_media::call_main_within(
@@ -1076,6 +1084,34 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         .is_none()
         .then(crate::update_control::published_activation)
         .flatten();
+    update_status_reply(st, apply_snapshot, published)
+}
+
+/// Durable updater reads for an admitted drive whose node has no open window. There is no
+/// main-thread snapshot here: the shared formatter reports live policy as unknown.
+#[cfg(unix)]
+pub(crate) fn windowless_update_reply(rest: &str) -> Option<String> {
+    match rest.trim() {
+        "status" => {
+            let build = crate::build_info::build_number()
+                .parse::<u64>()
+                .unwrap_or(0);
+            Some(
+                aterm_update::status(build).map_or_else(update_status_unreadable_line, |st| {
+                    update_status_reply(st, None, None)
+                }),
+            )
+        }
+        "holds" => Some(update_holds_reply()),
+        _ => None,
+    }
+}
+
+fn update_status_reply(
+    mut st: aterm_update::UpdateStatus,
+    apply_snapshot: Option<crate::update_control::Snapshot>,
+    published: Option<crate::native_updater_service::StagedUpdate>,
+) -> String {
     // The durable ledger may predate configuration changes, or not exist yet.
     // The running application's policy governs this control response.
     if let Some(live) = &apply_snapshot {
@@ -1121,10 +1157,15 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         };
         format!("{}:{kind}", st.failing_checks)
     };
-    let last_check = apply_snapshot.as_ref().and_then(|live| {
-        let source = aterm_update::Source::resolve(live.owner.as_deref(), live.repo.as_deref());
-        aterm_update::last_check_at(st.current_build, &source)
-    });
+    let last_check = match apply_snapshot.as_ref() {
+        Some(live) => {
+            let source = aterm_update::Source::resolve(live.owner.as_deref(), live.repo.as_deref());
+            aterm_update::last_check_at(st.current_build, &source)
+        }
+        // Without live configuration this is the durable receipt, not a claim about the
+        // current channel's checking policy, whose fields above remain unknown.
+        None => (!st.updated_at.is_empty()).then(|| st.updated_at.clone()),
+    };
     let stale_check =
         apply_snapshot
             .as_ref()
@@ -2987,7 +3028,7 @@ impl ControlWorkerContext {
     fn serve_fleet(
         &self,
         mut stream: CtlStream,
-        peer: Option<std::net::SocketAddr>,
+        (peer, taking): (Option<std::net::SocketAddr>, crate::survey::Taking),
         caller: FleetCaller,
     ) {
         let (content, drive, driver, driver_key, service_context, reader) = match caller {
@@ -3030,26 +3071,42 @@ impl ControlWorkerContext {
         };
         let drive = drive || requested.is_some();
         let content = content || requested.is_some();
-        SERVING_FLEET_PEER.with(|serving| serving.set(peer));
         SERVING_FLEET_KEY.with(|serving| serving.set(driver_key));
         SERVING_SERVICE_REPAIR.with(|serving| serving.set(service_context));
         SERVING_FLEET_READER.with(|serving| *serving.borrow_mut() = reader);
-        let _ = serve_preresolved(
-            &stream,
-            Scope::Fleet { content, drive },
-            &self.account_services,
-            &self.active,
-            &self.store,
-            &self.proxy,
-            &self.sock_dir,
-            &self.recovery_count_admission,
-        );
-        SERVING_FLEET_PEER.with(|serving| serving.set(None));
+        serving_fleet_as((peer, taking), || {
+            let _ = serve_preresolved(
+                &stream,
+                Scope::Fleet { content, drive },
+                &self.account_services,
+                &self.active,
+                &self.store,
+                &self.proxy,
+                &self.sock_dir,
+                &self.recovery_count_admission,
+            );
+        });
         SERVING_FLEET_KEY.with(|serving| serving.set(None));
         SERVING_SERVICE_REPAIR.with(|serving| serving.set(false));
         SERVING_FLEET_READER.with(|serving| *serving.borrow_mut() = None);
         aterm_uds::hangup::hang_up(&stream);
     }
+}
+
+/// Runs `serve` as a fleet connection from `peer` whose surveys take `taking`
+/// ([`attach_fleet_connection`]), then forgets both: the next connection this thread serves
+/// starts with no peer and takes the look.
+#[cfg(unix)]
+pub(crate) fn serving_fleet_as<R>(
+    (peer, taking): (Option<std::net::SocketAddr>, crate::survey::Taking),
+    serve: impl FnOnce() -> R,
+) -> R {
+    SERVING_FLEET_PEER.with(|serving| serving.set(peer));
+    SERVING_FLEET_TAKING.with(|serving| serving.set(taking));
+    let served = serve();
+    SERVING_FLEET_PEER.with(|serving| serving.set(None));
+    SERVING_FLEET_TAKING.with(|serving| serving.set(crate::survey::Taking::Look));
+    served
 }
 
 /// Who a fleet connection serves (`ControlWorkerContext::serve_fleet`).
@@ -3154,14 +3211,15 @@ pub(crate) fn fabric_bridge_retired(generation: crate::fabric::BridgeGeneration)
 }
 
 /// Serve one fleet connection the fleet listener admitted ([`crate::fleet_listen`]), or the
-/// node job relayed. `reader` is the member it proved itself as where this window's listener
-/// admitted it, for the fleet activity record; a relayed one names none, as the node job that
-/// admitted it notes its surveys.
+/// node job relayed, its surveys taking the machine's look as `taking` says (a peer's do; the
+/// node job's own reads take none, `node_serve::relayed_survey`). `reader` is the member it
+/// proved itself as where this window's listener admitted it, for the fleet activity record; a
+/// relayed one names none, as the node job that admitted it notes its surveys.
 #[cfg(unix)]
 pub(crate) fn attach_fleet_connection(
     stream: CtlStream,
     (content, drive): (bool, bool),
-    peer: Option<std::net::SocketAddr>,
+    (peer, taking): (Option<std::net::SocketAddr>, crate::survey::Taking),
     reader: Option<crate::fleet_activity::Reader>,
 ) -> bool {
     let Some(context) = BRIDGE_CONTEXT.get().cloned() else {
@@ -3173,7 +3231,7 @@ pub(crate) fn attach_fleet_connection(
         move || {
             context.serve_fleet(
                 stream,
-                peer,
+                (peer, taking),
                 FleetCaller::Reader {
                     content,
                     drive,
@@ -3228,7 +3286,7 @@ pub(crate) fn attach_fleet_drive(
         move || {
             context.serve_fleet(
                 stream,
-                peer,
+                (peer, crate::survey::Taking::Look),
                 FleetCaller::Driver {
                     driver,
                     requester,
@@ -4271,12 +4329,18 @@ fn dispatch_fabric_verb(
     cmd_fabric(rest, store)
 }
 
+/// Whether `sid` names a tab a drive or a retire can name: a session ID this Mac's tabs hold
+/// ([`aterm_session::is_minted_sid`]), a legacy tab's included.
+fn names_tab(sid: &str) -> bool {
+    aterm_session::is_minted_sid(sid)
+}
+
 fn cmd_fabric_retire(words: &[&str], store: &Store) -> String {
     if words.is_empty() {
         return FABRIC_USAGE.to_string();
     }
     for sid in words {
-        if !sid.starts_with("s-") || !crate::fabric::valid_principal(sid) {
+        if !names_tab(sid) || !crate::fabric::valid_principal(sid) {
             return FABRIC_USAGE.to_string();
         }
     }
@@ -4414,7 +4478,7 @@ fn serve_meta(
     ctx: &SessionCtx,
     store: &Store,
     scope: Scope,
-    on_change: impl FnOnce(),
+    on_change: impl FnOnce(bool),
 ) -> String {
     serve_meta_with_barrier(
         MetaRequest {
@@ -4434,7 +4498,7 @@ fn serve_meta(
 fn serve_meta_with_barrier(
     request: MetaRequest<'_>,
     before_act: impl FnOnce(&SessionCtx) -> crate::act_barrier::Passage,
-    on_change: impl FnOnce(),
+    on_change: impl FnOnce(bool),
 ) -> String {
     let MetaRequest {
         rest,
@@ -4475,6 +4539,8 @@ fn serve_meta_with_barrier(
     if reads_counts && caller_hung_up() {
         return HUNG_UP_REPLY.to_owned();
     }
+    // An admitted `harness_needs` line can move the `owner=needs` entry itself, a meta change.
+    let mut entry_moved = false;
     let (resp, changed) =
         control_session::cmd_meta_supervisor(ctx, scope, serving_connection(), prove, rest)
             .or_else(|| {
@@ -4498,7 +4564,14 @@ fn serve_meta_with_barrier(
                 control_session::cmd_meta_harness_land(ctx, serving_connection(), prove, rest)
             })
             .or_else(|| {
-                control_session::cmd_meta_harness_needs(ctx, serving_connection(), prove, rest)
+                let (resp, moved) = control_session::cmd_meta_harness_needs(
+                    ctx,
+                    serving_connection(),
+                    prove,
+                    rest,
+                )?;
+                entry_moved = moved.entry;
+                Some((resp, moved.any()))
             })
             .or_else(|| control_session::meta_questions_denied(scope, rest))
             .unwrap_or_else(|| {
@@ -4507,7 +4580,7 @@ fn serve_meta_with_barrier(
             });
     if changed {
         crate::self_claim::meta_changed(ctx);
-        on_change();
+        on_change(entry_moved);
     }
     if meta_moves_autopilot(rest) {
         word_journaled(store, resp)
@@ -4527,9 +4600,18 @@ fn serve_meta_wired(
     scope: Scope,
     post: &mut dyn FnMut(Wake),
 ) -> String {
-    serve_meta(rest, term, prove, session, ctx, store, scope, || {
-        post_meta_change(session, ctx, rest, post);
-    })
+    serve_meta(
+        rest,
+        term,
+        prove,
+        session,
+        ctx,
+        store,
+        scope,
+        |entry_moved| {
+            post_meta_change(session, ctx, rest, entry_moved, post);
+        },
+    )
 }
 
 #[cfg(test)]
@@ -4539,25 +4621,36 @@ fn serve_meta_wired_with_barrier(
     post: &mut dyn FnMut(Wake),
 ) -> String {
     let (session, ctx, rest) = (request.session, request.ctx, request.rest);
-    serve_meta_with_barrier(request, before_act, || {
-        post_meta_change(session, ctx, rest, post);
+    serve_meta_with_barrier(request, before_act, |entry_moved| {
+        post_meta_change(session, ctx, rest, entry_moved, post);
     })
 }
 
-fn post_meta_change(session: u64, ctx: &SessionCtx, rest: &str, post: &mut dyn FnMut(Wake)) {
-    for wake in meta_change_wakes(session, ctx.self_id.as_str(), rest) {
+fn post_meta_change(
+    session: u64,
+    ctx: &SessionCtx,
+    rest: &str,
+    entry_moved: bool,
+    post: &mut dyn FnMut(Wake),
+) {
+    for wake in meta_change_wakes(session, ctx.self_id.as_str(), rest, entry_moved) {
         post(wake);
     }
 }
 
-fn meta_change_wakes(session: u64, sid: &str, rest: &str) -> Vec<Wake> {
+fn meta_change_wakes(session: u64, sid: &str, rest: &str, entry_moved: bool) -> Vec<Wake> {
     // A self-claim's NEEDS YOU set is a needs fact, as aterm's own loop's tell is: the need
-    // published again, and the hover stamped where the need's words did not move.
+    // published again, and the hover stamped where the need's words did not move. Where aterm
+    // stood another `owner=needs` entry for the person's needs (`entry_moved`), the meta moved too.
     if control_session::is_harness_needs(rest) {
-        return vec![Wake::HarnessFact {
+        let mut wakes = vec![Wake::HarnessFact {
             sid: sid.to_string(),
             fact: crate::HarnessFact::Needs,
         }];
+        if entry_moved {
+            wakes.push(Wake::MetaChanged { session });
+        }
+        return wakes;
     }
     let mut wakes = vec![Wake::MetaChanged { session }];
     if let Some(face) = control_session::harness_act_face(rest) {
@@ -5633,9 +5726,58 @@ fn closed_session_reply_with(
         );
         return "ERR denied\n".to_string();
     }
+    match crate::session_log::take_prev(rest) {
+        Ok(None) => {}
+        Ok(Some((back, rest))) => {
+            return earlier_log_reply(reader, &sid, verb, &rest, back, Some(log.base_ep()), store);
+        }
+        Err(()) => return prev_usage(verb).to_string(),
+    }
     match verb {
         "log" => control_session::cmd_log_closed(&log, rest),
         _ => control_session::cmd_brief_closed(&log, &sid, store, rest),
+    }
+}
+
+/// Reply when the journal keeps no earlier log of a session that a `log prev` or a `brief prev`
+/// names.
+const NO_EARLIER_LOG: &str = "ERR the journal keeps no earlier log of this session\n";
+
+/// The usage line of `verb` (`log` or `brief`) for a `prev` word that names no earlier log.
+fn prev_usage(verb: &str) -> &'static str {
+    match verb {
+        "log" => crate::session_log::LOG_USAGE,
+        _ => crate::session_log::BRIEF_USAGE,
+    }
+}
+
+/// `log prev[=<k>]` and `brief prev[=<k>]` ([`crate::session_log::take_prev`]) for an Owner-class
+/// caller, which the caller has checked: the `back`-th log of `sid` before the one a plain `log`
+/// answers (the log whose base is `below`; `None`: the journal's newest), read from the journal
+/// ([`aterm_slog::journal::Pick::Before`]), with `rest`, the request without its `prev` word,
+/// paging and filtering it as a closed session's log. A tab keeps its ID across a cold restore
+/// (LT-01) and the restore starts it a new log, so the log it kept before aterm last started it
+/// answers here.
+fn earlier_log_reply(
+    reader: Option<&crate::session_log_journal::read::Reader>,
+    sid: &str,
+    verb: &str,
+    rest: &str,
+    back: u32,
+    below: Option<u32>,
+    store: &Store,
+) -> String {
+    use crate::session_log_journal::read::{JOURNAL_CUT, JournalRead};
+    if verb == "brief" && crate::session_log::BriefQuery::parse(rest).is_ok_and(|q| q.all) {
+        return crate::session_log::BRIEF_USAGE.to_string();
+    }
+    let (Some(reader), Some(short)) = (reader, aterm_slog::ShortId::new(sid)) else {
+        return NO_EARLIER_LOG.to_string();
+    };
+    match reader.view_picked(&short, aterm_slog::journal::Pick::Before { below, back }) {
+        JournalRead::View(view) => journal_view_reply(&view, sid, verb, rest, store),
+        JournalRead::Absent => NO_EARLIER_LOG.to_string(),
+        JournalRead::Cut => JOURNAL_CUT.to_string(),
     }
 }
 
@@ -5712,23 +5854,48 @@ fn journal_session_reply_with(
         JournalRead::Absent => return None,
         JournalRead::Cut => return Some(journal_read::JOURNAL_CUT.to_string()),
     };
-    Some(match verb {
-        "log" => journal_read::cmd_log_journal(&view, rest),
+    Some(match crate::session_log::take_prev(rest) {
+        Ok(None) => journal_view_reply(&view, sid.as_str(), verb, rest, store),
+        Ok(Some((back, rest))) => earlier_log_reply(
+            Some(reader),
+            sid.as_str(),
+            verb,
+            &rest,
+            back,
+            Some(view.log.base_ep()),
+            store,
+        ),
+        Err(()) => prev_usage(verb).to_string(),
+    })
+}
+
+/// `log` (any other verb: `brief`) over a journal read's `view` of session `sid`, its cursor
+/// placed in the journal's own numbering.
+fn journal_view_reply(
+    view: &aterm_slog::journal::View,
+    sid: &str,
+    verb: &str,
+    rest: &str,
+    store: &Store,
+) -> String {
+    use crate::session_log_journal::read as journal_read;
+    match verb {
+        "log" => journal_read::cmd_log_journal(view, rest),
         _ => {
             let mut query = match crate::session_log::BriefQuery::parse(rest) {
                 Ok(q) => q,
-                Err(usage) => return Some(usage.to_string()),
+                Err(usage) => return usage.to_string(),
             };
-            query.cursor = query.cursor.map(|c| journal_read::journal_cursor(&view, c));
+            query.cursor = query.cursor.map(|c| journal_read::journal_cursor(view, c));
             control_session::cmd_brief_closed_query(
                 &view.log,
-                sid.as_str(),
+                sid,
                 store,
                 &query,
                 Some(view.reply_cursor()),
             )
         }
-    })
+    }
 }
 
 enum ServeDisposition {
@@ -6073,6 +6240,11 @@ thread_local! {
     #[cfg(any(unix, test))]
     static SERVING_FLEET_PEER: std::cell::Cell<Option<std::net::SocketAddr>> =
         const { std::cell::Cell::new(None) };
+    /// Whether this fleet connection's surveys take the machine's look: a peer's do; the node
+    /// job's own reads, relayed with no peer, take none ([`attach_fleet_connection`]).
+    #[cfg(any(unix, test))]
+    static SERVING_FLEET_TAKING: std::cell::Cell<crate::survey::Taking> =
+        const { std::cell::Cell::new(crate::survey::Taking::Look) };
     /// The member a survey connection this thread serves proved itself as, where this window's
     /// own listener admitted it: who its surveys are noted for in the fleet activity record.
     #[cfg(unix)]
@@ -7284,8 +7456,8 @@ fn drive_kind(head: &Head) -> Result<DriveKind, String> {
             "request" if !matches!(rest.split_whitespace().next(), Some("claim" | "show")) => {
                 return Err(drive_refused(
                     "a drive's request verbs are request claim path=<absolute|~/…> [req=<id>], \
-                     request show <id> and requests; review, keep and reply are this Mac's \
-                     person's",
+                     request show <id> and requests; review, keep, reply and clean are this \
+                     Mac's person's",
                     format!("request {}", rest.trim()).trim_end(),
                 ));
             }
@@ -7320,11 +7492,11 @@ fn drive_kind(head: &Head) -> Result<DriveKind, String> {
         drive_refused(
             if selector.is_some() {
                 "a drive serves @<sid> \
-                 status|text|screen|result|inbox|post|turn|key|send|close"
+                 status|text|screen|result|inbox|post|turn|key|send|close|meta(autopilot)|agent(set)"
             } else {
                 "a drive serves survey, version, board, requests, update status|holds, vault status|approve, hold, \
                  spawn cwd=<absolute>|agent=<word>, request claim|show and await task, and \
-                 @<sid> status|text|screen|result|inbox|post|turn|key|send|close"
+                 @<sid> status|text|screen|result|inbox|post|turn|key|send|close|meta(autopilot)|agent(set)"
             },
             verb,
         )
@@ -7384,13 +7556,13 @@ fn drive_gate(
     let selected = line.split_whitespace().next().unwrap_or_default();
     let hosted = |sid: &str| {
         let sid = SessionId::new(sid);
-        (sid.as_str().starts_with("s-") && hosts(&sid)).then_some(sid)
+        (names_tab(sid.as_str()) && hosts(&sid)).then_some(sid)
     };
     // A worker the reaper closed keeps a row ([`crate::retired_workers`]) its manager's reads
     // answer from, a manager on another Mac's too.
     let kept = |sid: &str| {
         let sid = SessionId::new(sid);
-        sid.as_str().starts_with("s-") && retired(&sid)
+        names_tab(sid.as_str()) && retired(&sid)
     };
     // The hosted session the line's selector names, or why it names none.
     let session = || match selector {
@@ -7456,9 +7628,11 @@ fn drive_gate(
             Ok(act(Some(sid)))
         }
         DriveKind::Vault | DriveKind::ServiceRepair | DriveKind::AccountsRenew => Ok(act(None)),
-        DriveKind::Post | DriveKind::MailSeen | DriveKind::Key | DriveKind::Send => {
-            session().map(|sid| act(Some(sid)))
-        }
+        DriveKind::Post
+        | DriveKind::MailSeen
+        | DriveKind::Key
+        | DriveKind::Send
+        | DriveKind::Configure => session().map(|sid| act(Some(sid))),
         DriveKind::Turn => {
             let sid = session()?;
             drive_turn(rest)?;
@@ -7547,7 +7721,7 @@ fn drive_gate(
 }
 
 /// The sessions a drive's `line` names, in its order, once each: its `@<sid>` selector, a
-/// `hold <sid>`'s sid, or each target of `await task @a,@b,…`. Only `s-` ids, the only ones
+/// `hold <sid>`'s sid, or each target of `await task @a,@b,…`. Only tab IDs ([`names_tab`]), the only ones
 /// [`drive_gate`] serves; a `spawn`'s `from=` is the driver's own session, on its own Mac, and
 /// names none here. Node serve hands the line to the window that hosts or keeps every one
 /// (`node_serve::route_drive`).
@@ -7579,7 +7753,7 @@ pub(crate) fn drive_line_sessions(line: &str) -> Vec<SessionId> {
     let mut sids: Vec<SessionId> = Vec::new();
     for sid in named {
         let sid = SessionId::new(sid);
-        if sid.as_str().starts_with("s-") && !sids.contains(&sid) {
+        if names_tab(sid.as_str()) && !sids.contains(&sid) {
             sids.push(sid);
         }
     }
@@ -7799,7 +7973,7 @@ fn drive_spawn(
                          no task, command or other options";
     let usage = || {
         format!(
-            "a drive's worker form is spawn agent=<{}> [model=<m>] [autopilot=<land|cruise>] \
+            "a drive's worker form is spawn agent=<{}> [model=<m>] [effort=<level>] [autopilot=<land|cruise>] \
              [cwd=<absolute>|~/<path>] [from=<sid>] [why=<one line>] [req=<id>] [raise=false] \
              - < task",
             aterm_agent::harness::worker::started_words()
@@ -7891,8 +8065,8 @@ fn drive_spawn(
                     .any(|w| w.word == value) => {}
             "len" => framed = true,
             "model" => {}
-            // The worker's Autopilot, as on one Mac: the drive names it here alone, serving no
-            // `meta`, whose writes no hold stops.
+            "effort" if aterm_types::agent_settings::valid_effort(value) => {}
+            // A new worker may start with its Autopilot set, as on one Mac.
             "autopilot" if matches!(value, "land" | "cruise") => {}
             "cwd" if std::path::Path::new(value).is_absolute() => {}
             "cwd" => {
@@ -8224,6 +8398,14 @@ fn drive_record(act: &DriveAct, reply: &str, holds_now: bool) -> Option<&'static
         (DriveKind::Turn | DriveKind::Key | DriveKind::Send, _) if typed_into(reply) => {
             Some(act.kind.word())
         }
+        (DriveKind::Configure, _)
+            if typed_into(reply)
+                && reply.lines().next().is_some_and(|line| {
+                    line.split_whitespace().any(|word| word == "submitted=1")
+                }) =>
+        {
+            Some("submitted settings in")
+        }
         (DriveKind::Hold, Some(HoldAsk { on: true, held })) if ok && !held && holds_now => {
             Some("took (hold on)")
         }
@@ -8245,6 +8427,7 @@ fn drive_record(act: &DriveAct, reply: &str, holds_now: bool) -> Option<&'static
             | DriveKind::Post
             | DriveKind::MailSeen
             | DriveKind::Turn
+            | DriveKind::Configure
             | DriveKind::Key
             | DriveKind::Send
             | DriveKind::Hold
@@ -8274,7 +8457,7 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
             let worker = reply
                 .split_whitespace()
                 .nth(1)
-                .filter(|sid| sid.starts_with("s-"))
+                .filter(|sid| names_tab(sid))
                 .map(SessionId::new);
             if let Some(worker) = &worker
                 && !act.shell
@@ -8304,6 +8487,7 @@ fn note_drive_act(act: &DriveAct, reply: &str, store: &Store) {
         | DriveKind::Post
         | DriveKind::MailSeen
         | DriveKind::Turn
+        | DriveKind::Configure
         | DriveKind::Key
         | DriveKind::Send
         | DriveKind::Hold
@@ -10017,7 +10201,7 @@ fn front_drive_escalation(
         return None;
     }
     match surface {
-        FrontControlSurface::Overlay(_) | FrontControlSurface::HarnessSettings => {
+        FrontControlSurface::Overlay(_) | FrontControlSurface::OwnerSettings => {
             Some(Need::OwnerOnly)
         }
         FrontControlSurface::NativeSettings => Some(Need::Op(Op::ConfigWrite)),
@@ -10045,8 +10229,8 @@ fn front_drive_denial(surface: FrontControlSurface) -> String {
         FrontControlSurface::NativeSettings => {
             "ERR native settings open (config-write authority required)\n".to_string()
         }
-        FrontControlSurface::HarnessSettings => {
-            "ERR native settings harness open (owner-only while open)\n".to_string()
+        FrontControlSurface::OwnerSettings => {
+            "ERR native settings owner-only page open (owner-only while open)\n".to_string()
         }
         FrontControlSurface::PrivateDocument => private_view_refusal(),
         FrontControlSurface::None | FrontControlSurface::OtherNative => "ERR denied\n".to_string(),
@@ -10835,13 +11019,69 @@ fn serve_session_verb(
             |_| front_drive_denial(front_surface),
         );
     }
+    // A log this tab kept before aterm last started it (its ID kept across the cold restore,
+    // LT-01), from the journal: `prev` counts back from the live log, which a plain `log` reads.
+    // Only an Owner-class caller gets here with the word ([`argument_escalation`]).
+    if matches!(verb, "log" | "brief") {
+        match crate::session_log::take_prev(rest) {
+            Ok(None) => {}
+            Ok(Some((back, rest))) => {
+                let live = ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .slog()
+                    .log()
+                    .base_ep();
+                return earlier_log_reply(
+                    crate::session_log_journal::read::reader(),
+                    ctx.self_id.as_str(),
+                    verb,
+                    &rest,
+                    back,
+                    Some(live),
+                    store,
+                );
+            }
+            Err(()) => return prev_usage(verb).to_string(),
+        }
+    }
     let host = GuiHost::with_fleet(session, term, Some(proxy), store, ctx);
+
+    if verb == "agent" {
+        let turn = match control_session::agent_settings_turn(term, ctx, rest) {
+            Ok(turn) => turn,
+            Err(refusal) => return refusal,
+        };
+        let Some(turn_form) = aterm_types::control_verbs::spec_for("turn", &turn) else {
+            return "ERR agent settings: native submission unavailable\n".into();
+        };
+        let request = Head {
+            selector,
+            verb: "turn",
+            rest: &turn,
+        };
+        let reply = serve_session_verb(
+            &request,
+            &turn_form,
+            target,
+            front_active_session,
+            cx,
+            reply_retention,
+        );
+        // Enter is a submission acknowledgement, not evidence that the native
+        // catalog accepted the model or that an in-flight inference changed.
+        return control_session::agent_settings_reply(reply);
+    }
 
     if verb == "codex-renewal" {
         return crate::native_act::serve_codex_renewal(self_ctx, master, rest);
     }
     if verb == "codex-rotation" {
         return crate::native_act::serve_codex_rotation(self_ctx, master, rest);
+    }
+    if verb == "codex-login-rotation" {
+        return crate::native_act::serve_codex_login_rotation(self_ctx, master, rest);
     }
     if verb == "codex-auth" {
         // Source members retain their authenticated connection past replies;
@@ -11472,6 +11712,18 @@ fn serve_session_verb(
             crate::occupancy_host::cmd_occupancy(sid.as_deref(), rest)
         }
         "mark" => dispatch_mark(ctx, scope, rest),
+        "pin" | "unpin" => {
+            let (reply, moved) = crate::session_pin::cmd(
+                ctx,
+                verb == "pin",
+                rest,
+                control_session::log_actor(scope, ctx),
+            );
+            if moved {
+                let _ = proxy.send_event(Wake::MetaChanged { session });
+            }
+            reply
+        }
         "resizes" => crate::resize_ledger::cmd_resizes(ctx, term, rest),
         "status" => control_media::cmd_session_status(proxy, session, rest),
         "resources" => {
@@ -11481,17 +11733,17 @@ fn serve_session_verb(
             }
             reply
         }
-        "harness" if rest.split_whitespace().next() == Some("recovery") => {
-            crate::harness_recovery_verb::cmd(rest, scope.is_owner_class(), || {
-                let timeline = ctx
-                    .timeline
-                    .try_lock()
-                    .map_err(|_| "recovery observation busy".to_string())?;
-                Ok(crate::harness_recovery_verb::snapshot(&timeline))
-            })
-        }
-        "harness" if rest.split_whitespace().next() == Some("fact") => {
-            crate::harness_fact_verb::cmd(
+        "harness" => match HarnessVerb::of(rest) {
+            HarnessVerb::Recovery => {
+                crate::harness_recovery_verb::cmd(rest, scope.is_owner_class(), || {
+                    let timeline = ctx
+                        .timeline
+                        .try_lock()
+                        .map_err(|_| "recovery observation busy".to_string())?;
+                    Ok(crate::harness_recovery_verb::snapshot(&timeline))
+                })
+            }
+            HarnessVerb::Fact => crate::harness_fact_verb::cmd(
                 ctx,
                 rest,
                 scope.is_owner_class(),
@@ -11523,24 +11775,65 @@ fn serve_session_verb(
                     .map_err(|e| e.to_string())
                     .and_then(|facts| facts)
                 },
-            )
-        }
-        "harness" => crate::harness_policy_verb::cmd(rest, scope.is_owner_class(), || {
-            if let Some(config) = ctx.native_policy.config() {
-                // Installed only by the explicit display-free private-host Rust factory.
-                return Ok(crate::harness_policy_verb::configured_facts(
-                    ctx, config, 1, true, true, false,
-                ));
+            ),
+            HarnessVerb::Probe => crate::harness_probe_verb::cmd(
+                ctx,
+                rest,
+                scope.is_owner_class(),
+                serving_connection(),
+                &|holder: &str| prove_self_claim_for(ctx, holder, master),
+                &crate::harness_probe_verb::Reads::live(),
+            ),
+            HarnessVerb::Policy => {
+                crate::harness_policy_verb::cmd(rest, scope.is_owner_class(), || {
+                    if let Some(config) = ctx.native_policy.config() {
+                        // Installed only by the explicit display-free private-host Rust factory.
+                        return Ok(crate::harness_policy_verb::configured_facts(
+                            ctx, config, 1, true, true, false,
+                        ));
+                    }
+                    control_media::call_main(proxy, |tx| Wake::ReadHarnessPolicy {
+                        session,
+                        reply: tx,
+                    })
+                    .map_err(|e| e.to_string())
+                    .and_then(|facts| facts)
+                })
             }
-            control_media::call_main(proxy, |tx| Wake::ReadHarnessPolicy { session, reply: tx })
-                .map_err(|e| e.to_string())
-                .and_then(|facts| facts)
-        }),
+        },
         "subscribe" => SUBSCRIBE_USAGE.to_string(),
         _ => no_handler(verb),
     });
     control_session::ledger_typed_input(term, ctx, scope, verb, rest, &resp);
     crate::input_stall::with_warning(stamp_input_seq(class, resp, term), warning.as_deref())
+}
+
+/// The verb a session's `harness <rest>` line goes to ([`serve_session_verb`]'s `harness` arm,
+/// which answers each with its own handler): the one its first word names (`recovery`, `fact`,
+/// `probe`), else the policy verb, which answers every other `harness` line (its usage line
+/// included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HarnessVerb {
+    /// `harness recovery` ([`crate::harness_recovery_verb`]).
+    Recovery,
+    /// `harness fact …` ([`crate::harness_fact_verb`]).
+    Fact,
+    /// `harness probe …` ([`crate::harness_probe_verb`]).
+    Probe,
+    /// Any other `harness` line ([`crate::harness_policy_verb`]).
+    Policy,
+}
+
+impl HarnessVerb {
+    /// The verb `harness <rest>` goes to.
+    fn of(rest: &str) -> Self {
+        match rest.split_whitespace().next() {
+            Some("recovery") => Self::Recovery,
+            Some("fact") => Self::Fact,
+            Some("probe") => Self::Probe,
+            _ => Self::Policy,
+        }
+    }
 }
 
 fn stamp_input_seq(class: Input, resp: String, term: &Arc<Mutex<Terminal>>) -> String {
@@ -11726,7 +12019,7 @@ pub(crate) fn meta_line_for_test(
         ctx,
         store,
         Scope::Owner,
-        || {},
+        |_| {},
     )
 }
 

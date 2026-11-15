@@ -532,7 +532,7 @@ THE ROW (schema=1; one line, space-separated key=value, a checksum last)
           saw one live (builtins alone, or programs that ran between passes); for a
           spawn, the agent; for an admission, a build or a test, the first word of the
           description its claimant wrote (`targo`, `lab`)
-  sid     the session's public id (`s-…`, as `aterm ctl @<sid>` and the survey name it),
+  sid     the session's tab ID (`s-…` or `t…`, as `aterm ctl @<sid>` and the survey name it),
           `-` for an admission, a build or a test, or before the sweep has read the
           session; a spawn's and a task's are the worker's
   on      the fleet node id of the Mac the action ran on, written only where that is
@@ -671,9 +671,7 @@ GOTCHAS
     },
     Topic {
         name: "workers",
-        tagline: Some(
-            "coding-agent workers in other tabs: start, wait, read the result; the survey",
-        ),
+        tagline: Some("separate coding-agent sessions when requested or justified; the survey"),
         body: Some(WORKERS_PAGE),
     },
     Topic {
@@ -727,7 +725,8 @@ WHAT IT IS
   default) does both. Connections are revocable, audited and owner-only, and end
   when either session closes or aterm restarts cold. `aterm conn` manages them; the
   reads and keys are `aterm ctl`'s (`text`, `turn`, `await`; `aterm help
-  introspection`). To hand a coding agent a task, spawn a worker instead (`aterm
+  introspection`). For same-machine delegation, use your harness's native subagents.
+  Where a separate session is requested or justified, start your own worker (`aterm
   help workers`).
 
 KEY USAGE (`aterm conn help` has every flag)
@@ -833,7 +832,9 @@ WHAT IT DOES
   with its lid closed; macOS honours that only on AC power, and on battery a
   closed lid still sleeps it. A click toggles the mug; a right-click or
   Control-click opens the menu: its one-line about (version, what it does, who
-  made it), then Activate for 1 Hour, 8 Hours, 24 Hours or Forever (the checked
+  made it), then Open aterm (it starts the aterm app the mug was started from, or
+  brings it forward; a mug started from a bare build has no such row), then
+  Activate for 1 Hour, 8 Hours, 24 Hours or Forever (the checked
   span's row says what is left of it), Keep Awake with Lid Closed, Enable at
   Startup and Quit aCaffeine. Timed spans count time asleep,
   and a change of the date or time neither lengthens nor shortens one; at its end the
@@ -944,7 +945,11 @@ FOR AN AGENT (a tool shell has no tty)
   window refused the file (one under a cloud-storage folder is refused) or could
   not be reached, and amacs fell back to the terminal, which a tool shell does
   not have; inside tmux or screen it always edits in the terminal. Then give the
-  person the path.
+  person the path. Exit 1 with `did not open it (ERR busy drafts …)`: another
+  aterm process is writing the file's draft (the window tried for about five
+  seconds), so nothing opened anywhere (a terminal editor would split that
+  draft); run amacs again. `ERR timeout` is no answer within 30 s, whatever the
+  cause.
   While the tab is open, `aterm ctl @self doc ls uri=file:///abs/path` says
   whether it holds unsaved typing (`dirty=1`) and where their caret is
   (`cursor=`), and `aterm ctl @self doc read file:///abs/path` reads the buffer,
@@ -958,8 +963,9 @@ FOR AN AGENT (a tool shell has no tty)
   `open-in-amacs` skill (`aterm help agents`).
 
 EXIT STATUS
-  0 closed normally; 1 refused/unopenable/aborted (`C-c C-k`); 2 usage or no tty;
-  75 window gone with no successor; 130 interrupted (`C-c`, tab stays open).
+  0 closed normally; 1 refused, unopenable, a busy draft or aborted (`C-c C-k`);
+  2 usage or no tty; 75 window gone with no successor; 130 interrupted (`C-c`,
+  tab stays open).
 
 ON THE WIRE
   aterm ctl @self edit <file-uri> [line=L[:C]] [create=1] [wait=0]
@@ -1037,8 +1043,11 @@ ON THE WIRE (`aterm ctl help rewind`)
   owner.
 
 LIMITS
-  Images and the child process are not rewound. Nothing before the oldest kept
-  keyframe, or across a stretch the recorder lost, is shown."#,
+  The child process is not rewound. Inline (OSC 1337), Sixel and Kitty images
+  are rewound on screen and in up to 2000 newest scrollback lines. A keyframe
+  keeps up to 2048 scrollback lines of text. No cursor or screen effect is drawn
+  over a rewound pane. Nothing before the oldest kept keyframe, or across a
+  stretch the recorder lost, is shown."#,
         ),
     },
     Topic {
@@ -1136,7 +1145,7 @@ CONFIGURATION — `[ai]` in `aterm.toml`
 
     aterm email session ACCOUNT [--folder ID] [--limit 1..100] [--timeout 1..3600]
     aterm email accounts
-    aterm email connect-gmail ACCOUNT [--client-file FILE] [--timeout 1..300]
+    aterm email connect-gmail ACCOUNT [--timeout 1..300]
     aterm email folders ACCOUNT
     aterm email list ACCOUNT [--folder ID] [--limit 1..100]
     aterm email read ACCOUNT MESSAGE_ID [--folder ID]
@@ -1150,8 +1159,9 @@ or deleted. --timeout bounds connection and mail operations (60 seconds by defau
 Errors include a retryable field; a false value ends automatic retries.
 
 connect-gmail explicitly runs one bounded headless OAuth enrollment. It uses
-aterm's own Google desktop client JSON at ~/.config/aterm/mail/google-client.json
-or --client-file, with private file permissions. It verifies a read-only Gmail
+aterm's own Google desktop client JSON, the vault entry google-mail-client.json;
+where this Mac's vault holds none it files entry:google-mail-client.json (as
+`aterm secrets need` does) and stops. It verifies a read-only Gmail
 connection before saving the encrypted offline grant. No token is printed.
 Reading mail never launches enrollment automatically.
 
@@ -1183,8 +1193,8 @@ configured mailbox routes and encrypted grants, never command-line passwords.
         name: "secrets",
         tagline: None,
         body: Some(
-            r#"secrets — one encrypted, signed credentials file for every machine, written to
-`~/.secrets/<name>` (macOS and Linux; `aterm secrets --help` has every verb and flag).
+            r#"secrets — one encrypted, signed credentials store for every machine, read in place
+and written to no file (macOS and Linux; `aterm secrets --help` has every verb and flag).
 
   aterm members join                           a new Mac: Allow on any member, type its phrase
   aterm secrets approve <age1…> --name <host>  an admin lets in one a path vault holds
@@ -1192,8 +1202,8 @@ configured mailbox routes and encrypted grants, never command-line passwords.
   aterm secrets ls --describe                   names, purposes and registered file pointers
   aterm secrets ls --json                       the same metadata as JSON, without values
 
-  Use its registered paths: entries may land outside ~/.secrets. One this Mac lacks is
-  `aterm secrets need <want>`, never a person's. `agh whoami --verify` asks GitHub whose
+  Read a value with `aterm secrets get <name>` (git: `aterm secrets git-credential`), never
+  from a file. One this Mac lacks is `aterm secrets need <want>`, never a person's. `agh whoami --verify` asks GitHub whose
   each token is (`aterm help agh`).
 
 DETAILS
@@ -1212,20 +1222,22 @@ HOW IT WORKS
   An admin machine encrypts the vault (age X25519, one locker per audience), signs
   the envelope with the vault's Ed25519 key, and publishes it to a server URL (default
   `http://alab-secrets.local:7484/v1/alab` over mDNS) or a file path. Subscribed
-  machines check the pinned signer and a rising version, decrypt their lockers, and
-  write `~/.secrets/<name>` (mode 0600). Where the vault holds a membership log, as
-  ALab's does, any member seated there writes a shared name with no admin key:
-  `pbpaste | aterm secrets set <name>` signs it into the log for every member (release
-  material, fleet configuration, git's config and control records stay an admin's).
+  machines check the pinned signer and a rising version and keep the verified copy;
+  each read decrypts the one entry it names from it. Nothing is written under the
+  home, and the files an earlier aterm wrote to `~/.secrets` are left as they are.
+  Where the vault holds a membership log, as ALab's does, any member seated there
+  writes a shared name with no admin key: `pbpaste | aterm secrets set <name>` signs
+  it into the log for every member (release material, fleet configuration, git's
+  config and control records stay an admin's).
   With no server answering it is signed here, and while a removal's new key is due it
   waits; either way it is not yet in vault until this Mac's vault pass posts or signs
   it. `aterm secrets status` says who writes (`vault writes:`) and what still needs
   the admin key here (`admin key:`). Claude Code, Codex, Grok Build, Kimi Code and
-  Muse Code login files are refused as entries and never written (their refresh tokens
-  are single-use; use `aterm ai login`). Of home paths a Mac writes only gh's hosts.yml,
-  git's config and credentials and the release material aterm names; any other `~/`
-  path, and another spelling of a name aterm holds (`GH_ACCESS_TOKEN_ALABSYSTEMS`), is
-  never written, and two names that differ only in case write neither.
+  Muse Code login files are refused as entries (their refresh tokens are single-use;
+  use `aterm ai login`). Of home-path names a Mac reads only gh's hosts.yml, git's
+  config and credentials and the release material aterm names; any other `~/` path,
+  and another spelling of a name aterm holds (`GH_ACCESS_TOKEN_ALABSYSTEMS`), is never
+  read, and of two names that differ only in case neither is.
 
 VAULT FORMAT (`aterm secrets edit`)
   [machines]          `<host> = age1…` (delete to revoke)
@@ -1234,12 +1246,12 @@ VAULT FORMAT (`aterm secrets edit`)
   [m3 m22]            entries only those hosts get, overriding `[everyone]`
   [join]              `password = …`, or `open = yes` (aterm writes it as a note
                       older aterms read past), plus `code-only = age1…`
-  name=value          single-line secret (`name` -> `~/.secrets/<name>`, or a `~/<path>`
-                      aterm names)
+  name=value          single-line secret (`name` a file name, or a `~/<path>` aterm
+                      names; either is a key in the store, never a file)
   name<<END [base64] [if-absent[=<other>]]
-                      multi-line or base64 entry; `if-absent` writes only when absent
-                      or still holding what the vault wrote; `if-absent=<other>`
-                      anchors a set of files together (e.g. Git/GH config or release keys)
+                      multi-line or base64 entry; `if-absent` puts it only where the
+                      store holds no entry of that name; `if-absent=<other>` makes a
+                      set read together from one version (e.g. the release keys)
 
 VERBS
   every machine   status (the default), join, sync, watch, ls, get <name>, agent
@@ -1257,7 +1269,7 @@ VERBS
   vault has no join queue: approve each key.
 
 FILES
-  `~/.config/aterm/secrets/{source.toml,identity,state.toml,vault}` and `~/.secrets/<name>`."#,
+  `~/.config/aterm/secrets/{source.toml,identity,state.toml,vault}`; no other file."#,
         ),
     },
     Topic {
@@ -1307,8 +1319,9 @@ HOW A MAC JOINS
   4. The phrase runs CPace with that member. The member hands over a signed `Allowed`
      and, where the vault holds a membership log the member has a seat in, its signed
      `Admit` of the new Mac and the log's records; elsewhere, its own decrypted
-     `[everyone]` files. Either way the new Mac writes `~/.secrets` at once (GitHub,
-     publishing and AI-account credentials).
+     `[everyone]` entries, of which the new Mac keeps none. On the log path the new Mac
+     reads its credentials (GitHub, publishing and AI accounts) at once; elsewhere once
+     an admin lets it in.
   5. The new Mac asks the vault's server with the `Allowed`. On the log path the `Admit`
      already lets it read the vault; elsewhere an admin's approver lets it in once one
      is reachable. From then it follows every vault change.
@@ -1399,6 +1412,80 @@ not vendor billing.
 
 Account records are proposals, never permission to dispatch credentials. Raw secrets
 belong in `aterm secrets`; database records carry references to them.
+"#,
+        ),
+    },
+    Topic {
+        name: "file",
+        tagline: None,
+        body: Some(
+            r#"file — the lab's shared files (`aterm file`, Unix only).
+
+A shared file is a table every member of the lab reads: `ai/accounts` (the accounts at AI
+providers), `ai/links` (which machine prefers which account, in what order) and
+`lab/machines` (the lab's Macs). Each is kept on this machine as a snapshot and a TSV under
+`~/.aterm/files`, so a read is a read of a local file: it answers whatever the replicated
+store behind it is doing, and it never opens that store.
+
+  aterm file ls                          every shared file here, with its state
+  aterm file cat <name> [--published]    the table as TSV, this machine's queued writes over
+                                         it (--published: the snapshot alone); state on stderr
+  aterm file path <name>                 where the TSV is
+  aterm file status [<name>]             state, why, revision, rows, inert, face
+  aterm file get <name> <row> [<column>] one row or one cell
+  aterm file rows <name> [--where col=val]... [--join <ref column>]
+  aterm file watch <name> [--timeout <seconds>] [--changes <n>]
+  aterm file history <name> [--limit <n>]
+  aterm file refresh [<name>]            project the store to the snapshot now
+  aterm file set <name> <row> <column> [<value> | --stdin]
+                                         write one cell (no value clears it)
+  aterm file add <name> <column>=<value>...
+  aterm file rm <name> <row>             retire the row (its history stays)
+  aterm file revert <name> <operation>
+  aterm file resolve <name> <id> mine|theirs
+  aterm file outbox [<name>] | outbox drop <id>
+
+Every verb takes `--json`.
+
+WRITES
+  A write is queued on this machine first and published by its writer: it answers
+  `published <operation>`, `queued <id>: <why>` (published later, whatever the store is doing
+  now) or `held <id>: <why>` (exit 4: the cell changed since this machine read it). A held write
+  is shown `⚠ mine ‖ theirs` and never applied; `resolve` keeps one side.
+  The three files are owner files: each change is an explicit `aterm file` write. A program's
+  statement of its own machine's row is held in `outbox` with "an owner file takes no Mac
+  statement", and `resolve <name> <id> theirs` drops it.
+
+STATE
+  live    the snapshot is what this machine's store holds
+  held    the last rows this machine read; the store refuses for now
+  never   this machine has not read the file yet
+  off     `[commons]` in aterm.toml turns the file off here; the last rows stay readable
+A state is never an error. With `held`, `never` and `off` comes why: succession, membership,
+busy, policy, keys, catalog or custody. `ls` and `status` add `· N inert` where the store
+holds records of a file's table that the file does not show (an automatic record past its
+writer's quota, or a machine's row at another machine's key); they stay in `history`.
+
+ROWS
+  A row is named by its key, or by a name the file gives it: an account by its slug
+  (`claude-fb-alpha`), by `<provider> <address>` (`claude ada.fb@alpha.example`) or by its
+  address where one account has it; a machine by its label. A name that fits no row, or more
+  than one, exits 2 and lists the rows it could mean; nothing is matched by prefix.
+  `rows --join <column>` adds the row a reference column names, as `<column>.<their column>`.
+
+WHO WRITES THE SNAPSHOT
+  The window (or `aterm node serve`) projects each file shortly after its store takes a
+  record, and once a minute besides, whether or not the store lets it in. `aterm file
+  refresh` does one pass by hand. A pass that the store refuses records the state and leaves
+  the rows as they were.
+  `aterm db ai-accounts` and `aterm db computers` read the same snapshots; with `--registry`
+  they read the store itself, which adds where each account was last seen running and the
+  seats no machine row names, and refuses where the store does.
+
+Addresses are shown in full here, as they are in the files under `~/.aterm/files`, which only
+this user can read. No password, token or other secret is ever in a shared file.
+
+Exit 0 ok, 2 usage, 3 problems (nothing queued or recorded), 4 conflict.
 "#,
         ),
     },
@@ -1631,9 +1718,11 @@ AUTOPILOT — how far the harness carries a session's work
   (`meta set harness_needs entry=<pct text> need=<pct need> …`, at most 32;
   `meta unset harness_needs`) has its needs shown the same way while that claim
   stands, any past the 32 still counted; one that does not is shown by its
-  entry's first need and count. An agent's own reversible work (build, test,
-  commit, push or merge its own branch to main) needs no one's go-ahead: Cruise
-  and Land answer a reply that holds it for one with the
+  entry's first need and count. A credential is never shown as a need: aterm
+  takes it off its own loop's set and a codex-alab's alike and resolves it
+  from the vault, else files `aterm secrets need`. An agent's own reversible
+  work (build, test, commit, push or merge its own branch to main) needs no
+  one's go-ahead: Cruise and Land answer a reply that holds it for one with the
   owner's standing go-ahead (`go-ahead@v1`), which covers that work only, grants
   nothing outward, destructive or another's and lifts no hold the person gave, and
   tell the agent to drop that line now. A line aterm answers with the standing
@@ -1769,11 +1858,11 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
              `idle_build_dirs`, `idle_build_days`, `cap_used_gib`)
   ledger     the approval ledger of a session, or the `disk`, `upgrade` or `accounts` one
   accounts   the Claude Code account pool (`accounts.toml`), sign-ins and renewals, and
-             fleet account sync from a source this machine names or keeps in `~/.secrets`
+             fleet account sync from a source this machine names or its vault holds
              (`aterm harness accounts --help`); `--cli codex|grok|kimi` is that CLI's pool
              (`accounts-<cli>.toml`), synced by default from the lab registry where the lab
              names this Mac (no vault file is read); on any other Mac from
-             `~/.secrets/ai-pool.toml`, else `ai-accounts-<cli>.toml`, else its column of
+             the vault's `ai-pool.toml`, else `ai-accounts-<cli>.toml`, else its column of
              `ai-accounts.csv`, even where this machine keeps no roster yet (the sync writes it;
              `[harness] accounts = "off"` stops that sync); Claude Code's report ends with
              the outlook the footer and the Account card's forecast show (`--json`: `outlook`, and `fresh`
@@ -1784,11 +1873,12 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
 VAULT TOKENS (Claude Code's pool, macOS)
   The token route: a Claude Code account can keep a year-long token (`claude setup-token`) in
   the vault, and a session on that account starts on it instead of its stored login, which
-  then needs no renewal. `aterm harness accounts token <label|email>` makes one: a person at
-  this Mac's terminal signs in as the account, and aterm stores the token in the vault and
-  records it, value-free, in the accounts store's `tokens.json`; `--replace` makes a new one
-  while the old is still in use, `--remove` deletes it. A busy vault never loses it: it waits
-  in this Mac's vault writes ("not yet in vault") for the next vault pass.
+  then needs no renewal. `aterm harness accounts token <label|email>` makes one in aterm's
+  own sign-in window at this Mac's desk, which signs in and authorizes by itself, stores the
+  token in the vault and records it, value-free, in the accounts store's `tokens.json` (its
+  check in `tokens-check.json`); `--replace` makes a new one while the old is still in use,
+  `--remove` deletes it. A busy vault never loses it: it waits in this Mac's vault writes
+  ("not yet in vault") for the next vault pass.
   The wrapper (`accounts token-run`) hands the token to a session-starting launch of a store
   Claude Code build over an inherited descriptor, only where today's judgment puts the launch
   on the row's stored login, and otherwise runs the program exactly as typed, journaling its
@@ -1796,25 +1886,44 @@ VAULT TOKENS (Claude Code's pool, macOS)
   subcommand, a one-word prompt, or a line's own `--settings` or `--bare`), `program` (not a
   store build), `outside` (a route, credential or settings `env` of the person's or a
   repository's own, named, never its value), `claimed` or `held` (`--auto`: another Mac's
-  claim), and the token's own: `absent`, `busy`, `unverified`, `ended`, `rejected`,
-  `mismatched`, `unreadable`.
-  Verification: a new token serves only the Mac that made it until the first session on it
-  there reads the same 7-day (and 5-hour) windows as the account's stored login, and no other
-  account here shares them; it is then marked verified in the vault and every Mac serves it
-  (else `unverified (windows differ | windows shared | no reading yet | no roster row)`). A
-  sign-in wall on a token session is a rejection: the session moves back to its stored login
-  and the token reads `rejected`.
+  claim), and the token's own: `absent`, `busy`, `unverified`, `awaiting-basis`, `differ`,
+  `ended`, `rejected`, `mismatched`, `unreadable`. Beside the marker the wrapper names the
+  token it served (`ATERM_CLAUDE_TOKEN_MINTED`, its mint time): a session counts only for that
+  token, so one still on a token since replaced verifies, refuses and adds usage to nothing,
+  and moves at its next turn end onto the account's current token where that is in use, else
+  onto its stored login; one an earlier aterm's wrapper started counts for a token made before
+  it began, never verifying it; where its start cannot be read it is never restarted onto the
+  current token, and moves back to its stored login as one on the current token would. While a
+  replacement is on its way to the vault the token the vault holds is judged as before.
+  Verification: a token made in aterm's window signed in as the account and was refused for
+  any other, so it serves every Mac from the moment it is made; one made at a person's terminal
+  serves only the Mac that made it until it is verified. On each Mac it serves, a launch whose
+  stored login works there stays on that login until a session on it has reported its 7-day
+  (and 5-hour) windows (`awaiting-basis`; one with no working stored login starts on the token).
+  A session on the token that then reads the same windows, which no other account there shares,
+  verifies it: the Mac that made it marks it verified in the vault, and every Mac serves it
+  (else `unverified (awaiting a stored-login reading | no reading yet | windows differ |
+  windows shared | windows equal | no roster row)`). Windows that differ may be another
+  account's: that Mac starts no session on the token, a session running on it there moves back
+  to the account's stored login, its readings are left out of the row, and on the Mac that made
+  it the surfaces offer `--replace`. Windows another account there shows too could not tell the
+  two apart and never verify the token: one made at a terminal then serves only the Mac that
+  made it, whose surfaces offer `--replace`. A sign-in wall on a token session is a rejection:
+  the session moves back to its stored login, and the token reads `rejected` on that Mac.
   Off for token rows: renewal (`accounts renew <label>` says the row runs on its vault token
   and that renewal is off for it), `signin.lock`, and typing `/login` into a token session.
   Where to see it: `aterm harness accounts` (and `--json` under `tokens`), `ctl @self status`
   (`auth=`, `token=`), `ctl survey` (`auth=`, `token=` on session rows; `token=` on account
   lines), `aterm doctor`'s accounts row, `aterm secrets ls --describe`, the Account
   card's `Token` row, the Lab page and Settings ▸ Harness's state line. Where an account a session here is on has no
-  token in use, or one ending within 30 days or handed to a removed Mac, each says one quiet
-  offer once per change of the token's and the login's state, never as a dialog, a banner or a
-  notification; its one step opens a tab beside yours that runs the verb (with `--replace` for
-  one still in use). Off macOS the surfaces say a token's state and offer nothing, since the
-  verb makes a token only on macOS. No surface shows a token's value.
+  token, or one that ended, was refused, failed its check or cannot be opened here, or one
+  ending within 30 days, handed to a removed Mac, whose windows differ or, made at a terminal,
+  are shared, each says one quiet offer once per change of the token's and the login's state,
+  never as a dialog, a banner or a notification; its one step opens a tab beside yours that
+  runs the verb (with `--replace` for one still in use or one whose windows differ or are
+  shared). Off macOS
+  the surfaces say a token's state and offer nothing, since the verb makes a token only on
+  macOS. No surface shows a token's value.
 
 THE FOOTER
   A supervised tab's footer bar carries an Autopilot chip (`∞` cruise, `⤓` land,
@@ -1929,11 +2038,23 @@ THE FOOTER
     key, and no email leaves the Mac. An email takes up to 32 cells; a longer one shows
     its local part, the words before `@`, cut with `…` past 32 cells, and once the row
     narrows past its widest rungs every name shows its local part cut with `…` past 12
-    cells. Every account figure aterm shows is what is left, like a battery, and says
-    so: `37% left` read within 15 minutes (of 63% used), `≤30% left` for an older
-    reading (use only rises within a week, so no more can be left), `out` at a wall and
-    `?` unread; `0% left` only for a reading of 100. The files, the journal and
-    `--json` keep the use.
+    cells. Names on one row are cut apart, never alike in what the glass shows: two
+    that would cut alike keep the end that tells them apart (`tidepool…1.2`,
+    `tidepool…1.5`), equal local parts take their domain (`owner@acme`), then their
+    roster label (`owner (alt2)`), and names still alike a number (`owner…#2`).
+    Every account figure aterm shows is what is left, like a battery, and says so:
+    `37% left` read within 15 minutes (of 63% used), `≤30% left` for an older reading
+    (use only rises within a week, so no more can be left), `out` at a wall; a week with
+    no figure says why in words, never as a mark: `not read yet`,
+    `not read since reset` or `time unconfirmed`, and beside a narrow name `not read`,
+    as the Account card's items say it; an account with no login on this Mac, none made
+    or one ended, says `signed out` in its figure's place at every width, and `signing in`
+    while aterm signs it in here, the words the Account card's items and its Login line
+    say too (`aterm harness accounts` says `login: signed-out` and `signing-in`), both in
+    the dim ink, with no figure another Mac read beside them. Accounts with
+    one reason share it (`alt1, alt2 not read`). This tab's own account always shows its
+    week. `0% left` only for a reading of 100. The files, the journal and `--json` keep
+    the use.
   * one chart over [now − 1 d, now + 7 d) at 3 to 12 cells a day, which drains as the
     week is used: what was left of this tab's week as read on this Mac in solid steps
     (blank before its first reading), `▕` now, then what is projected to be left of
@@ -1941,14 +2062,18 @@ THE FOOTER
     reset, `→` a hand-off (the next account's name after it where it fits, else its
     local part, else that cut to 12 cells), `╳` a stop
     (every account out, or the wall the work waits at now), `$` usage credits and `┄`
-    not projected (after an unread account the work would reach, or the whole week with
-    no pace yet, a paused recovery or a tab the rotation cannot move). Ticks at the foot
-    of its level cells mark local midnights.
+    not projected (after an account the work would reach whose week aterm holds no
+    exact figure of, or the whole week with no pace yet, a paused recovery or a tab the
+    rotation cannot move). Ticks at the foot of its level cells mark local midnights.
   * at most two phrases: `~1% left at ↺ Sat 10:00` (or `↺ Sat 10:00`), then the verdict:
     `╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00` (a stop, to the vendor reset that resumes
     the work, or `–~<when>`; `╳ from ~Wed 16:00` where nothing ends it in reach),
-    `⧗ until Sat 10:00` (the work waits at a wall now), `? alt2 unread from ~Sat 06:00`,
-    `$ ~Sat 06:00` (credits) or `no pace yet`.
+    `⧗ until Sat 10:00` (the work waits at a wall now),
+    `alt2 not read from ~Sat 06:00` (the work moves onto an account whose week aterm
+    holds no exact figure of, said why in the narrow words above, or `read earlier` for
+    one read before another Mac may have spent it; narrower, `alt2 not read ~Sat 06:00`,
+    the account named as the row's lead names it), `$ ~Sat 06:00` (credits) or
+    `no pace yet`.
   A narrower row steps down: a coarser chart, shorter phrases, the other accounts
   folded, then no chart; this tab's name and figure, and a stop's or a wait's words,
   stay. Times are said on the local clock as it will read then, a forecast to 10 minutes
@@ -2817,11 +2942,14 @@ const fn verb_line(v: crate::Verb) -> &'static str {
             "this machine at a glance, each item with its next step and who takes it"
         }
         crate::Verb::Secrets => {
-            "one credentials file for every machine: the vault, its server, ~/.secrets"
+            "one credentials store for every machine: the vault, its server, its reads"
         }
         crate::Verb::Members => "Macs joining ALab, and the members that let them in (Unix)",
         crate::Verb::Db => {
             "encrypted embedded application databases, replicated directly on the LAN"
+        }
+        crate::Verb::File => {
+            "the lab's shared files: tables read from this machine's snapshot (Unix)"
         }
         crate::Verb::Email => "read mail without a window, as JSON Lines",
         crate::Verb::Harness => {
@@ -3010,8 +3138,9 @@ PROVISION — make this machine able to publish
       files `aterm secrets need notary`); it asks no one for a credential.
       `--mint-developer-id`, on the release machine only, spends one of the five
       Developer ID slots when the vault holds no pair. Once the independent
-      prerequisites pass, it can mint the machine's key, asking for the paper
-      master phrase. Keys are never copied between machines. The final
+      prerequisites pass, it can mint the machine's key under the vault's master
+      phrase (else it files `aterm secrets need paper-master`). Keys are never
+      copied between machines. The final
       source-signing audit runs after the identity and its signed roster are in
       place. An existing identity is reused.
 
@@ -3224,7 +3353,19 @@ CLOSING A TAB
 
 /// `aterm help workers`: the manager's pattern (`spawn agent=`, `await task`, `result`, `task`, `survey`).
 const WORKERS_PAGE: &str = concat!(
-    r#"workers — coding agents in other tabs on tasks you give them, and the survey
+    r#"workers — separate coding-agent sessions when requested or justified, and the survey
+
+CHOOSE THE PROCESS
+  Use your harness's native subagent tools for same-machine delegation: research,
+  reviews and one-off tasks. Run commands and scripts with your own shell/background
+  tools. If native subagents are unavailable, do routine work directly.
+
+  A new aterm tab starts a separate terminal, agent context, login and supervision
+  lifecycle. Use it only when the person explicitly asks for a new tab/session or a
+  strong concrete reason justifies that overhead: work needing another host's hardware,
+  or a persistent interactive terminal native tools cannot provide. State the reason
+  before spawning. Parallelism, a short task or a missing native subagent tool alone
+  does not justify another session.
 
 WHAT IT IS
   A WORKER is another aterm tab running a coding agent (`claude`, `codex`, `agy` or
@@ -3259,6 +3400,9 @@ KEY USAGE (`aterm ctl help <verb>` has every flag)
                              own report), then wait on `await task @<sid>:<n>`
   aterm ctl @<sid> signal term
                              stop the worker; `aterm ctl @<sid> close` closes its pane
+  aterm ctl @<sid> pin       list a session first among its Mac's agents in the fleet
+                             band; `unpin` lifts it, and a worker it spawns starts
+                             unpinned (`status` and the survey say `pinned=0|1`)
 
 THE BOARD (this Mac's record of every worker it started, here or on another Mac)
   aterm ctl board [--json] [from=<sid>] [label=<word>|<prefix>*]
@@ -3287,15 +3431,11 @@ AGENTS
   transcript), `agent=agy` (Antigravity CLI, on the model its quota rotation picks:
   `aterm harness agy pick`), `agent=muse` (Muse Code). `agent=codex` is codex-alab,
   which carries itself: it trusts its folder by its own rule (`harness policy`'s
-  approve level and trust roots), and `result` reads its rollout. `agent=grok` (Grok
-  Build) is refused (`ERR spawn agent=grok: …`) until aterm reads its turn end. Then
-  a Grok Build worker with no usable sign-in file (missing, empty or refused) is
-  `stalled why=signin` before anything is installed (only a person signs in: signed
-  out, it opens xAI's sign-in page by itself). Any agent whose program atpkg's store
-  does not hold yet (a fresh Mac before the update pass lands it) is then installed
-  by atpkg's verified install (a failed install is `stalled why=install`, and one
-  that makes no progress for 45 minutes `stalled why=startup`, naming the install;
-  each names the member and the cause in `attention=`);
+  approve level and trust roots), and `result` reads its rollout. Any agent whose
+  program atpkg's store does not hold yet (a fresh Mac before the update pass lands
+  it) is installed by atpkg's verified install (a failed install is `stalled
+  why=install`, and one that makes no progress for 45 minutes `stalled why=startup`,
+  naming the install; each names the member and the cause in `attention=`);
   where `[packages] exclude`, a person's removal or a no to unattended installs (Keep
   ALab tools up to date or Install ALab tools off in Settings ▸ Packages, or the
   toolset removed by `aterm pkg uninstall --all`) keeps it off, nothing is installed,
@@ -3303,6 +3443,8 @@ AGENTS
   its `stalled why=startup` says why).
 
 ANY OTHER PROGRAM
+  Run routine commands and scripts in your own shell/background tools. This form is
+  for a separate terminal explicitly requested or justified under CHOOSE THE PROCESS.
   aterm ctl @self spawn program=<path|word> [arg=<word>]... - < task
                              a worker running a program no harness reads (a script,
                              or Kimi Code CLI: `program=sh arg=-c
@@ -3334,17 +3476,18 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
   `m<N>` in it (`m27` of `MacbookAir-m27-…`, never a chip's `M5`). A short name two Macs
   answer to is refused, naming both; a word no peer answers to is refused, except by
   `survey --host`, which looks it up as a host.
-  aterm ctl --host <h> spawn agent=<word> [model=<m>] [autopilot=land|cruise]
+  aterm ctl --host <h> spawn agent=<word> [model=<m>] [effort=<level>] [autopilot=land|cruise]
                        [cwd=<abs-path>|'cwd=~/<path>'] - < task
-                             the worker's Autopilot is named here alone: a drive serves
-                             no `meta`, so `meta set autopilot` runs on that Mac; each
-                             refusal names the word it refused. `'cwd=~/<path>'` is a
+                             a running session's Autopilot is set with `@<sid> meta set autopilot`;
+                             native model/effort with `@<sid> agent set model=<id> effort=<level>`. A drive serves
+                             only Autopilot metadata writes; supervisor and other metadata
+                             stay local. Each refusal names the word it refused. `'cwd=~/<path>'` is a
                              folder in that Mac's home, resolved there: refused where the
                              path leaves the home (a `..`, a link out, `~user`), lies in a
                              folder macOS guards, or is not there. Quote it: bash turns an
                              unquoted `cwd=~/…` into this Mac's own home before aterm sees
                              it, and that Mac gets this Mac's path
-  aterm ctl --host any spawn agent=<claude|codex> [model=<m>] [autopilot=land|cruise]
+  aterm ctl --host any spawn agent=<claude|codex> [model=<m>] [effort=<level>] [autopilot=land|cruise]
                          [need=repo:<name>[,free:<n>g]] [cwd=<abs-path>|'cwd=~/<path>']
                          - < task
                              one survey of every member picks the Mac: of those that let
@@ -3380,7 +3523,7 @@ ON ANOTHER MAC (`aterm fleet allow drive --from <this Mac>`, or `--all`, on `<h>
   aterm ctl --host <h> await task @<w>,… since=0 [all] [timeout=<ms>]
   aterm ctl --host <h> await task @<w>:<rev>,… [all] [timeout=<ms>]
   aterm ctl --host <h> @<w> result | status | text | screen
-  aterm ctl --host <h> update status | holds   read the open window's updater; Read Only access
+  aterm ctl --host <h> update status | holds   read updater records with or without a window; Read Only access
   aterm ctl --host <h> @<w> turn [settle=submitted] '<line>' | key <k> | send <text>
   aterm ctl --host <h> hold <w> on|off   (<w> bare: no @)
   aterm ctl --host <h> @<w> close   (or `close <w>`): its own worker, even after that Mac's
@@ -3412,11 +3555,17 @@ THE SURVEY & CHANNELS
                              behind origin/main, fetched 2h ago, dirty`), read with git
                              beside the survey at most every 10 min, offline (a survey never
                              fetches, so `behind` is as of its last fetch of origin's main);
-                             a Mac says these at content (a grant of facts alone reads none);
+                             a Mac says its home and its checkouts at content (a grant of
+                             facts alone reads the free space and neither location);
                              `--json` carries `home=`, `home_free_mb=`, `repos=`, `repos_at=`
                              and `repos_cut=` on the instance and `"repos":[…]` (`null` from
                              an aterm before them, at facts, before its first read, or where
-                             its rows did not all come: unknown, never none)
+                             its rows did not all come: unknown, never none), and at facts
+                             as at content the machine's own look at its CPU, memory, disk,
+                             GPU and network, with whether each is at its limit and its
+                             system-load score (`os=` to `load=` on the instance,
+                             `aterm ctl help survey instance`:
+                             each `-` where unread, all absent from an aterm before them)
   Topic channels (with `aterm fabric on`, this machine only): `aterm ctl @self topic add
   <t>`, wait in the background with `aterm ctl @self await inbox since=<id> topic=<t>`,
   and broadcast with `aterm ctl @self post to=say:<t> kind=note -- '<text>'`. A worker's
@@ -3432,8 +3581,8 @@ THE SURVEY & CHANNELS
   `await task` and `@<sid> result`, which carry the same facts.
 
 GOTCHAS
-  * Hand over a task with `spawn agent=… -`, never by typing a `turn` into someone
-    else's session.
+  * When a separate session is justified, hand over its task with `spawn agent=… -`,
+    never by typing a `turn` into someone else's session.
   * `conclusion=` on `await task` and `task` says how a worker ended: `finished`, or
     `failed` with `why=` (`could-not-finish`, a reply whose first line starts `Could not
     finish: <why>`; `exit`, before it finished; `off`, a person; `off-ctl`, a manager or a
@@ -3860,20 +4009,23 @@ MEMBERSHIP
 
   Default fleet joining chooses this machine's LAN address and reserves a free
   listener port automatically. Its stable temporary name is node-<node-id>.
-  `aterm fleet name` shows the name and alias; `aterm fleet name set studio`
-  assigns a primary name while retaining the temporary alias. An `m<N>` name is
-  the swarm roster's label: where the roster gives this Mac another label, the
-  name follows it. Names travel in signed membership entries. Conflicting
-  primary names refuse ambiguous lookups; the permanent node aliases continue
-  to work.
+  `aterm fleet name` shows the name and alias; `aterm name set <mN|N>` chooses
+  this machine's number and publishes it as the fleet name, retaining the
+  temporary alias, and `aterm name nick <word>` sets its nickname (`aterm help
+  name`). While no number is chosen, an `m<N>` name is the swarm roster's
+  label: where the roster gives this Mac another label, the name follows it.
+  Once a number is chosen, the fleet name follows that number, not the roster.
+  Names travel in signed membership entries. Conflicting primary names refuse
+  ambiguous lookups; the permanent node aliases continue to work.
 
   For a separate, manually configured fleet, `aterm fleet init` on the first
   machine mints the secret, writes the join code (the secret alone) to a 0600
   file and prints that file's path (never the code), and sets
   `[fleet]` (port 7100). `aterm fleet join` on each other machine reads the code from
-  stdin, `--code-file F` or a hidden prompt, never an argument, and joins through the
-  member `--at <host[:port]>` names, the place a vault's code names, a member its book
-  holds, or one advertising `_alab._tcp` on the LAN. `init --rotate` mints
+  `--code-file F` or redirected stdin, never an argument (given neither, it is `aterm fleet
+  sync --on`, the default ALab fleet's join from the vault, or files `fleet-code` and fails),
+  and joins through the member `--at <host[:port]>` names, the place a vault's code names, a
+  member its book holds, or one advertising `_alab._tcp` on the LAN. `init --rotate` mints
   a new secret, which every member joins again with and which keeps no drive grant on
   either side and no fleet access above Read Only; `peers` checks every known peer (3 s) and `peers add|rm` edits the
   book of peers (`add` refuses an address past the LAN, an IPv6 one but ::1, and
@@ -4032,6 +4184,8 @@ const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `unn
   aterm name [--json]
   aterm name set <mN> [--nick <word>] [--dry-run] [--json]
   aterm name nick <word> | --random  [--dry-run] [--json]
+  aterm name undo [--dry-run] [--json]
+  aterm name history [--json]
   aterm name sync [--json]
 
   Unix only for now: elsewhere it exits 2, keeping no name.
@@ -4039,40 +4193,67 @@ const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `unn
 WHAT IT SAYS
   One line, `m8 Heron  class=seeded fleet=in node=<node id>`: the NAME and nickname this
   machine goes by, how the NAME was claimed (`auto`, aterm picked it; `chosen`, a person
-  did; `seeded`, from the bound registry row or an older build's names), whether it is in a fleet (`fleet=in`: a
-  member of its vault, or it holds a fleet key that reads and its vault did not take it
-  out; `fleet=joining`: let in, asking, or waiting for a seat; `fleet=out`; `fleet=unread`:
-  the vault's state cannot be read, as `aterm members status` would say), a migration from an older build's names not
-  finished yet (`migration=pending` or `migration=waiting`), and this machine's fleet node
-  once it has one. An unreadable identity is journaled; an existing valid name is still
-  reported, with no node in text and `node: null` in JSON. `--json` prints one object:
-  `name`, `number` (null while `unnumbered`), `nick`,
-  `title`, `class`, `nick_class`, `since`, `rev`, `migration`, `fleet`, `node`, and `made`,
+  did; `seeded`, from the bound registry row or an older build's names), whether it is in
+  a fleet (`fleet=in`: a member of its vault, or it holds a fleet key that reads, its vault
+  did not take it out, and the key's custody admits traffic; `fleet=joining`: let in,
+  asking, or waiting for a seat; `fleet=out`; `fleet=paused`: it holds a fleet key whose
+  custody refuses traffic (no take recorded, a take under another vault, or a record that
+  cannot be read), until an explicit take restores it; `fleet=unread`: the vault's state
+  cannot be read, as `aterm members status` would say), a migration from an older build's
+  names not finished yet (`migration=pending` or `migration=waiting`), and this machine's
+  fleet node once it has one. An unreadable identity is journaled; an existing valid name
+  is still reported, with no node in text and `node: null` in JSON. `--json` prints one
+  object: `name`, `number` (null while `unnumbered`), `nick`, `title`, `class`,
+  `nick_class`, `since`, `rev`, `migration`, `fleet`, `node`, and `made`,
   where a name this run wrote came from (`kept` when it was there already). On macOS the
   menu bar shows the same title right of the version, its nickname clipped to 16 letters.
 
 CHANGING THE NAME
   On macOS, click the machine name beside the version and choose Rename This Mac….
-  Type a number (`m86` or `86`), a nickname, or both into their two fields; a field you
-  leave alone or empty keeps what this Mac has, so a nickname alone keeps the number.
-  The line under the fields says, as you type, whether the number is free, this Mac's
-  own, or held, and by what: another machine's signed name, or a label or seat its vault
-  gives another Mac. Rename is unavailable while it is held; a number the line
-  could not check stays available, and Rename checks it. A number
-  this Mac shows but has not claimed yet leaves the Number field empty: type it to claim
-  it. Change Nickname… changes only the nickname, and can draw a random noun.
+  Type a number (`m86` or `86`) into Numeric ID, a nickname into Name, or both, and press
+  Save; a field you leave alone or empty keeps what this Mac has, so a nickname alone
+  keeps the number. The line under the fields says, as you type, whether the number is
+  free, this Mac's own, or held, and by what: another machine's signed name, or a label
+  or seat its vault gives another Mac. Where another Mac holds it, the line also names the
+  next three free numbers above it. Save is unavailable while it is held; a number the
+  line could not check stays available, and Save checks it. A number this Mac shows but
+  has not claimed yet leaves the Numeric ID field empty: type it to claim it. While this
+  Mac's chosen number is not yet published everywhere and both fields are untouched, Save
+  reads Retry Sync, or Authorize & Sync where the naming rule is missing.
+
+  Settings ▸ This Mac (`aterm ctl open app settings /machine`, or `/name`) keeps the same
+  two fields open beside what the name is: the NAME and nickname, how the NAME was
+  claimed, the node, whether this Mac is in a fleet, and its earlier numbers. Its line
+  judges the fields as the panel's does. Its primary button is Save, or Retry Sync while
+  aterm.toml or the fleet name still owe this Mac's chosen number; it reads only aterm's
+  own files, so macOS's names and the naming permission (their Retry Sync, Authorize &
+  Sync and Authorize Naming) stay with Rename This Mac…, which the page's notice names
+  when a save leaves them pending. An aterm that is not your account's own (an isolated
+  instance, root, or another HOME) sets no macOS names from either, so there the notice
+  only says why. New Random Name draws another noun, and Refresh reads again. LAST CHANGE
+  says what Undo Last Rename gives back, or why it cannot: it takes back the last change
+  as `aterm name undo` does, and only the change the page showed. It is no Settings undo:
+  Settings' own Undo Last Change (Cmd-Z) undoes a settings edit and never a rename.
+  HISTORY lists the changes `aterm name history` lists, in its lines. Only your own click
+  or key presses Save, Retry Sync, New Random Name and Undo Last Rename: `act`, a control
+  client and an accessibility client are refused, so with VoiceOver use Rename This Mac…
+  in the menu bar. A failed save is said on the page until its next one, and does not lead
+  the next Rename This Mac…. On Linux the page names `aterm name`; on Windows it says this
+  platform keeps no machine name yet; off macOS it offers no field or write.
 
   From a shell, `aterm name set m86 --nick Marigold` chooses that number and nickname.
   Leave out `--nick` to keep the name. The numeric ID ranges from 0 to 999999;
-  `unnumbered` means no ID has been assigned. A number another known machine holds is refused, and so
-  is one its vault gives another Mac, with what holds it. `--dry-run` reports the
-  proposed name without changing it. A real change also updates the naming policy and
-  checked fleet name. On macOS it uses the existing setup authorization to update
-  ComputerName, LocalHostName and HostName; the command never opens a password prompt.
-  Missing authorization or a failed step leaves publication pending. `aterm name sync`
-  retries the three OS names from the freshly read saved identity, without choosing a
-  number or nickname or changing policy or the fleet name. To authorize naming, open
-  Rename This Mac… from the Name menu and choose Authorize Naming.
+  `unnumbered` means no ID has been assigned. A number another known machine holds is
+  refused, and so is one its vault gives another Mac, with what holds it and the next
+  three free numbers above it. `--dry-run` reports the proposed name without changing it.
+  A real change also updates the naming policy and checked fleet name. On macOS it uses
+  the existing setup authorization to update ComputerName, LocalHostName and HostName; the
+  command never opens a password prompt. Missing authorization or a failed step leaves
+  publication pending. `aterm name sync` retries the three OS names from the freshly read
+  saved identity, without choosing a number or nickname or changing policy or the fleet
+  name. To authorize naming, open Rename This Mac… and press Authorize & Sync; where the
+  panel could not read whether the rule is in place, it offers Authorize Naming… beside
+  Retry Sync.
 
 THE NICKNAME
   `aterm name nick Heron` sets the nickname (one argument: quote `"Blue Heron"`), and
@@ -4087,6 +4268,29 @@ THE NICKNAME
   name, as any read does). Who asked is kept beside it: an agent when the command runs in
   an aterm session whose `status` names an agent program or an agent's state, a person
   otherwise, or when that session does not answer within 2 seconds. A nickname must be non-empty.
+
+UNDO AND HISTORY
+  `aterm name history` lists the newest 16 changes to the name, newest first: when (UTC),
+  why (`first`, the name the first run made; `named`, a number chosen; `nickname`, a word
+  set; `drawn`, a noun drawn again; `undone`, an undo; `registry`, a change that follows this
+  Mac's registry row, which the file takes but no aterm records yet), the name before and
+  after, who made it (person, agent or automatic, and the node), and `(undone)` once an undo
+  took it back. `--json` prints one array of those objects (`at`, `at_ms`, `why`, `from`,
+  `to`, `nick_from`, `nick_to`, `by`, `undone`).
+
+  `aterm name undo` takes back the newest change. A change of number goes back to the number
+  it replaced, checked as `set` checks one, so it is refused while another machine holds that
+  number, by any claim, or its vault gives it to another Mac; the number returns as a new
+  `chosen` claim, never the rank it had. The nickname the change replaced returns with it, and
+  a nickname change goes back alone, leaving the number as it is. An undo is not undone, a
+  change is undone once, the first name is not undone, a change that kept both the number and
+  the nickname (a `set` that claims the number this machine already showed, keeping its
+  nickname) has nothing to take back, and no undo leaves this machine `unnumbered`; a name
+  changed since its newest recorded change (by an older aterm, which keeps no history) has
+  nothing to undo. `--dry-run` reports the name it would give, and a real undo publishes as
+  `set` does. An undo takes back only the change it read: if the name changed after it read
+  it, it refuses and changes nothing. On macOS, Settings ▸ This Mac shows the same History
+  and offers the same undo as Undo Last Rename.
 
 THE FIRST RUN
   The first reader to find no `machine-name.toml` makes it, under its lock, so every other
@@ -5421,8 +5625,8 @@ THE FIVE VERBS YOU NEED
                                             unless `kinds=note,...`; re-arms up to
                                             `timeout=<ms>`, default 1h, then `OK timeout`
                                             exit 124)
-  To delegate work to a coding agent in another tab, spawn a WORKER instead (`aterm ctl
-  @self spawn agent=claude -`, `aterm help workers`).
+  Use native subagents for same-machine delegation. If a new tab/session is explicitly
+  requested or justified, give its WORKER the task at launch (`aterm help workers`).
 
 BROADCAST, IDEMPOTENCY, DEADLINES & RECEIPTS
   * Broadcasts: `aterm ctl @self post to=say:<topic> kind=note '<text>'` publishes one

@@ -176,10 +176,18 @@ impl RolloutTap {
         &self.thread
     }
 
-    /// Arm the tap with the run's floor, watermark, and running build.
-    pub fn arm(&mut self, floor_ms: u64, given: Option<StepMark>, running: Option<&str>) {
+    /// Arm the tap with the run's floor, its adoption (0: none; [`CodexStepFold::set_adopted`]),
+    /// its watermark, and the running build.
+    pub fn arm(
+        &mut self,
+        floor_ms: u64,
+        adopted_ms: u64,
+        given: Option<StepMark>,
+        running: Option<&str>,
+    ) {
         self.floor_ms = self.floor_ms.max(floor_ms);
         self.fold.raise_floor(self.floor_ms);
+        self.fold.set_adopted(adopted_ms);
         self.given = given;
         self.running = running.map(str::to_string);
     }

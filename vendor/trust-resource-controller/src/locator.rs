@@ -16,7 +16,7 @@ fn hex<const N: usize>(text: &str) -> io::Result<[u8; N]> {
         _ => Err(invalid()),
     };
     let mut result = [0; N];
-    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in text.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         result[index] = (digit(pair[0])? << 4) | digit(pair[1])?;
     }
     Ok(result)

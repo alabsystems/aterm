@@ -7,7 +7,7 @@
 //! <package> <target flag>` and the run's features: [`crate::testrun::Binary::spec`]), which
 //! names the same binary in every checkout and every build, where its executable's hash does not.
 //! It keeps the last [`SAMPLES_KEPT`] samples of each, newest last, the grant each settled at
-//! ([`Row::settled`]), which outlives those samples while its executable is unchanged, and at most [`ROWS_KEPT`] rows: past that,
+//! ([`Row::settled`]), which outlives those samples, and at most [`ROWS_KEPT`] rows: past that,
 //! the row whose newest sample is oldest goes, never the one just added.
 //!
 //! The file sits beside the stages' memory records in this user's aterm state directory
@@ -58,7 +58,7 @@ pub struct Sample {
     pub at_ms: u64,
     /// `ok`, `FAIL` or `NOT RUN`, as its event says.
     pub outcome: String,
-    /// Its own wall, ms.
+    /// Its own wall, ms, rounded up; 0 only for a run that was stopped, which has none.
     pub wall_ms: u64,
     /// The CPU its tree was read using, ms ([`crate::exec::TreeUsage::cpu`]); `None` where unread.
     pub cpu_ms: Option<u64>,
@@ -75,18 +75,13 @@ pub struct Sample {
     pub tests: Option<u64>,
     /// A case or module filter balancing observed time, where a successful long run measured one.
     pub partition: Option<String>,
-    /// The SHA-256 of the executable that ran (`test_content::Evidence::exe_sha256`); `None`
-    /// where it was not read (a libtest JSON probe's run, a sample kept before it was).
-    pub exe_sha256: Option<String>,
 }
 
-/// The grant a binary settled at ([`Row::settled`]) and the executable it settled as.
+/// The grant a binary settled at ([`Row::settled`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settled {
     /// The largest grant a timed run of it was not held at.
     pub cores: u32,
-    /// The executable that showed it ([`Sample::exe_sha256`]); `None` where none was read.
-    pub exe_sha256: Option<String>,
 }
 
 /// One binary's samples, newest last, and the grant it settled at.
@@ -96,15 +91,10 @@ pub struct Row {
     pub test: String,
     pub samples: Vec<Sample>,
     /// The largest grant a timed run of it was not held at ([`Sample::held`]) when no kept run
-    /// had been held at a larger one ([`Row::settle`]), with the executable that showed it;
-    /// `None` until one was, and again once a timed run is held at this grant or above or a
-    /// run of another executable is kept. It outlives the samples that showed it, so an
-    /// unchanged binary held run after run at a smaller grant (a single-threaded test at one
-    /// core) is not re-probed at twice that grant each time the unheld run ages out of the kept
-    /// samples, which would also change its `ATERM_TEST_CORES` and so its content key. A
-    /// changed binary's need is unknown again: one that now uses every core of the smaller
-    /// grant for more work than before looks, at that grant, as it did, so only a probe above
-    /// it can tell, once its kept samples no longer settle it.
+    /// had been held at a larger one ([`Row::settle`]); `None` until one was, and again once a
+    /// timed run is held at this grant or above. It outlives the samples that showed it, so a
+    /// binary held run after run at a smaller grant (a single-threaded test at one core) is not
+    /// re-probed at twice that grant each time the unheld run ages out of the kept samples.
     pub settled: Option<Settled>,
 }
 
@@ -114,26 +104,15 @@ impl Row {
         self.samples.iter().map(|s| s.at_ms).max().unwrap_or(0)
     }
 
-    /// Fold its newest sample, just pushed, into [`Row::settled`]. A run of an executable other
-    /// than the one the binary settled as (both read) clears it: the binary changed. Then a timed
-    /// run with a CPU reading and a grant `g`: held, it clears a settled grant at most `g` (the
-    /// binary now uses that grant, so what it needs above it is unknown again); not held, with no
-    /// kept timed run held at a grant above `g`, it makes the settled grant at least `g`, settled
-    /// as its executable. Any other run changes nothing more: one no grant bounded says nothing
-    /// of a grant.
+    /// Fold its newest sample, just pushed, into [`Row::settled`]: a timed run with a CPU reading
+    /// and a grant `g`. Held, it clears a settled grant at most `g` (the binary now uses that
+    /// grant, so what it needs above it is unknown again); not held, with no kept timed run held
+    /// at a grant above `g`, it makes the settled grant at least `g`. Any other run changes
+    /// nothing: one no grant bounded says nothing of a grant.
     fn settle(&mut self) {
         let Some(newest) = self.samples.last() else {
             return;
         };
-        let changed = |s: &Settled| {
-            s.exe_sha256
-                .as_deref()
-                .zip(newest.exe_sha256.as_deref())
-                .is_some_and(|(was, now)| was != now)
-        };
-        if self.settled.as_ref().is_some_and(changed) {
-            self.settled = None;
-        }
         if !newest.timed() {
             return;
         }
@@ -157,7 +136,6 @@ impl Row {
             let was = self.settled.take();
             self.settled = Some(Settled {
                 cores: was.as_ref().map_or(g, |k| k.cores.max(g)),
-                exe_sha256: newest.exe_sha256.clone().or(was.and_then(|k| k.exe_sha256)),
             });
         }
     }
@@ -330,10 +308,6 @@ impl History {
                             "partition".to_owned(),
                             s.partition.as_deref().map_or(Value::Null, Value::from),
                         );
-                        o.insert(
-                            "exe_sha256".to_owned(),
-                            s.exe_sha256.as_deref().map_or(Value::Null, Value::from),
-                        );
                         Value::Object(o)
                     })
                     .collect();
@@ -345,10 +319,6 @@ impl History {
                     r.settled.as_ref().map_or(Value::Null, |s| {
                         let mut o = Map::new();
                         o.insert("cores".to_owned(), Value::from(s.cores));
-                        o.insert(
-                            "exe_sha256".to_owned(),
-                            s.exe_sha256.as_deref().map_or(Value::Null, Value::from),
-                        );
                         Value::Object(o)
                     }),
                 );
@@ -403,7 +373,6 @@ impl History {
                                     None | Some(Value::Null) => None,
                                     Some(value) => Some(value.as_str()?.to_owned()),
                                 },
-                                exe_sha256: text_or_null(s, "exe_sha256")?,
                             })
                         })
                         .collect::<Option<Vec<_>>>()?;
@@ -414,7 +383,6 @@ impl History {
                             None | Some(Value::Null) => None,
                             Some(value) => Some(Settled {
                                 cores: u32::try_from(value.get("cores")?.as_u64()?).ok()?,
-                                exe_sha256: text_or_null(value, "exe_sha256")?,
                             }),
                         },
                     })
@@ -423,14 +391,6 @@ impl History {
             Some(History { rows })
         };
         decoded().unwrap_or_default()
-    }
-}
-
-/// The text at `key` of `o`: `Some(None)` where it is absent or null, `None` where it is not text.
-fn text_or_null(o: &Value, key: &str) -> Option<Option<String>> {
-    match o.get(key) {
-        None | Some(Value::Null) => Some(None),
-        Some(value) => Some(Some(value.as_str()?.to_owned())),
     }
 }
 

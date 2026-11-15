@@ -11,10 +11,12 @@ use super::*;
 use crate::harness::account_progress::{AccountProgress, ProgressPhase};
 use crate::harness::accounts::{self, Class};
 use crate::harness::footer::FooterFacts;
-use crate::harness::outlook::tests::{SAT8, scenario_b, scenario_c, scenario_d, worst_case};
-use crate::harness::outlook::{Refusal, round_down};
+use crate::harness::outlook::tests::{
+    SAT8, scenario_a_idle, scenario_b, scenario_c, scenario_d, worst_case,
+};
+use crate::harness::outlook::{Fresh, Refusal, round_down};
 use crate::harness::quota_scenes::{
-    D, Fx, H, MIN, NOW, SAT7, SAT14, T5, case_a, case_b, case_c, case_d,
+    D, Fx, H, MIN, NOW, SAT7, SAT14, T5, case_a, case_b, case_c, case_d, case_e,
 };
 
 /// Both accounts walled now at 97%: the work waits until main's reset.
@@ -165,7 +167,7 @@ fn long_label() -> Fx {
     fx
 }
 
-/// Every scenario, named, with its outlook and its tab: the design's four cases, a gap, a lean,
+/// Every scenario, named, with its outlook and its tab: the design's five cases, a gap, a lean,
 /// a 5-hour stop, a lean whose worst case stops, one whose both branches stop (in the week pass
 /// and in the working pass), credits, a wall on either tab, a wall the work moves off, a 5-hour
 /// wall (with no working pass, with one, and under a refused pace), a refused pace on either
@@ -176,6 +178,7 @@ fn outlooks() -> Vec<(&'static str, Outlook, &'static str)> {
         ("b", case_b(), "main"),
         ("c", case_c(), "main"),
         ("d", case_d(), "main"),
+        ("e", case_e(), "main"),
         ("gap", scenario_b(), "me"),
         ("lean", scenario_c(), "me"),
         ("lean-stop", lean_stops(), "me"),
@@ -220,9 +223,10 @@ fn emailed_scenarios() -> Vec<(&'static str, QuotaView)> {
         .collect()
 }
 
-/// `n`'s name as a rung lays it: whole, or its local part.
-fn name_forms(n: &Named) -> [String; 2] {
-    [cut(&n.name), short(&n.name)]
+/// `n`'s name as a rung of `view` lays it: whole, or its local part, each apart from every
+/// other account's.
+fn name_forms(view: &QuotaView, n: &Named) -> [String; 2] {
+    [Names::Whole, Names::Local].map(|form| view.name(n, form))
 }
 
 /// The view laid at `room`, where a rung fits.
@@ -441,12 +445,13 @@ fn beside_main(login: fn(&mut Fx), signing_in: bool) -> Outlook {
 
 /// AN ACCOUNT WITH NO LOGIN ON THIS MAC SAYS SO WHERE ITS FIGURE WOULD BE (the owner: "aterm
 /// and claude code harness should make this obvious"). A row with no login made here and one
-/// whose login ended both say `signed out` after their name at every rung that lays the email
-/// whole, `no login` at the rungs that lay its local part, and `signing in` at both while their
-/// sign-in runs on this Mac; `?` is a signed-in row whose figure has not been read. The words
-/// are laid in the quiet ink, never bold and never the warning ink: a fact in the row. The
-/// hover title and the spoken row say the same. Each of the lab's three widths lays the row. Negative control: the same row signed in and unread says `?` at every
-/// rung and never a login.
+/// whose login ended both say `signed out` after their name at every rung, the one word for
+/// that state whether the rung lays the email whole or its local part, and `signing in` while
+/// their sign-in runs on this Mac; a signed-in row whose figure has not been read says why
+/// (`not read yet`, `not read` beside the local part). No rung says `?`. Both are laid in the
+/// quiet ink, never bold and never the warning ink: a fact in the row. The hover title and the
+/// spoken row say the same. Each of the lab's three widths lays the row. Negative control:
+/// the same row signed in and unread says it unread at every rung and never a login.
 #[test]
 fn a_row_with_no_login_here_says_so_where_its_figure_would_be() {
     const WHOLE: &str = "other.person@example.test";
@@ -465,7 +470,7 @@ fn a_row_with_no_login_here_says_so_where_its_figure_would_be() {
             false,
             Figure::SignedOut,
             "signed out",
-            "no login",
+            "signed out",
             "signed out on this Mac",
         ),
         (
@@ -474,7 +479,7 @@ fn a_row_with_no_login_here_says_so_where_its_figure_would_be() {
             false,
             Figure::SignedOut,
             "signed out",
-            "no login",
+            "signed out",
             "signed out on this Mac",
         ),
         (
@@ -500,9 +505,9 @@ fn a_row_with_no_login_here_says_so_where_its_figure_would_be() {
             unread,
             false,
             Figure::Unread,
-            "?",
-            "?",
-            "",
+            "not read yet",
+            "not read",
+            "aterm has not read its week yet",
         ),
     ] {
         let out = beside_main(login, signing_in);
@@ -533,7 +538,7 @@ fn a_row_with_no_login_here_says_so_where_its_figure_would_be() {
                 (LOCAL, narrow)
             } else {
                 // A rung that folds the other accounts into `+1` names no login.
-                for word in ["signed out", "no login", "signing in"] {
+                for word in ["signed out", "signing in"] {
                     assert!(!text.contains(word), "{what} at {room}: {text}");
                 }
                 continue;
@@ -543,23 +548,15 @@ fn a_row_with_no_login_here_says_so_where_its_figure_would_be() {
                 lead[at..].starts_with(&format!(" {said}")),
                 "{what} at {room}: {lead}"
             );
-            assert_eq!(
-                lead.contains('?'),
-                !of_login,
-                "{what} at {room}: `?` is a signed-in row not yet read: {lead}"
-            );
+            assert!(!text.contains('?'), "{what} at {room}: no `?`: {text}");
             // The words' cells, after the name and its blank.
             let from = line.lead.start + lead[..at].chars().count() + 1;
             for (c, ink, bold) in &line.cells[from..from + said.chars().count()] {
-                if of_login {
-                    assert_eq!(
-                        (*ink, *bold),
-                        (Role::Quiet, false),
-                        "{what} at {room}: {c:?} of {lead}"
-                    );
-                } else {
-                    assert_ne!(*ink, Role::Warn, "{what} at {room}");
-                }
+                assert_eq!(
+                    (*ink, *bold),
+                    (Role::Quiet, false),
+                    "{what} at {room}: {c:?} of {lead}"
+                );
             }
         }
         assert!(
@@ -573,19 +570,30 @@ fn a_row_with_no_login_here_says_so_where_its_figure_would_be() {
             widest.contains(&format!("{WHOLE} {wide}")),
             "{what}: {widest}"
         );
-        assert!(
-            view.title.contains(&format!("{WHOLE} {wide}")),
-            "{what}: {}",
-            view.title
-        );
         if of_login {
+            assert!(
+                view.title.contains(&format!("{WHOLE} {wide}")),
+                "{what}: {}",
+                view.title
+            );
             assert!(
                 view.spoken.contains(&format!("{WHOLE} {heard}.")),
                 "{what}: {}",
                 view.spoken
             );
         } else {
-            for word in ["signed out", "signing in", "no login"] {
+            // The title and the reader say why after the whole name, as a sentence.
+            assert!(
+                view.title.contains(&format!("{WHOLE}: {heard}")),
+                "{what}: {}",
+                view.title
+            );
+            assert!(
+                view.spoken.contains(&format!("{WHOLE}: {heard}.")),
+                "{what}: {}",
+                view.spoken
+            );
+            for word in ["signed out", "signing in"] {
                 assert!(
                     !words_now(&view).iter().any(|said| said.contains(word)),
                     "NEGATIVE CONTROL: {what}: a signed-in row says no login"
@@ -819,7 +827,8 @@ fn a_hand_off_is_always_drawn() {
 /// A NAME IS DRAWN ONLY WHERE ITS RUN HOLDS IT: at 12 cells a day, `→alt1` at now has five plain
 /// cells before the next mark, its name and one more, so it reads `→alt1`; `→alt2` six hours on
 /// has four, just its name, so it stands alone; `→main` ten hours on has the rest of the week.
-/// A lean's `→pool1?` needs its `?` too. Negative control: a name drawn where the run holds just
+/// A lean's `→pool1` is laid the same, `┄` after it and no mark (the tail says why in words).
+/// Negative control: a name drawn where the run holds just
 /// the name (`room >= len`) draws `→alt2` flush against `→main`.
 #[test]
 fn a_name_is_drawn_only_where_its_run_holds_it() {
@@ -858,10 +867,10 @@ fn a_name_is_drawn_only_where_its_run_holds_it() {
     let want = format!("\u{2192}alt1{l}\u{2192}{l}{l}{l}{l}\u{2192}main{l}");
     assert!(text(&chart).starts_with(&want), "{}", text(&chart));
     chart.runs.truncate(1);
-    chart.marks = vec![(T5 + 2 * H, Mark::Lean("pool1".into()))];
+    chart.marks = vec![(T5 + 2 * H, Mark::Lean("pool1".into(), Why::NeverRead))];
     chart.unknown_from = Some(T5 + 2 * H);
     let lean: String = text(&chart).chars().take(10).collect();
-    assert_eq!(lean, format!("{l}\u{2192}pool1?\u{2504}\u{2504}"));
+    assert_eq!(lean, format!("{l}\u{2192}pool1\u{2504}\u{2504}\u{2504}"));
 }
 
 /// AN EMAIL TOO WIDE FOR ITS RUN GIVES WAY TO ITS LOCAL PART: `alt1@example-domain.test` with
@@ -1252,7 +1261,7 @@ fn every_glass_percentage_says_which_way_it_runs() {
 /// NO INFERRED ZERO LEFT: a wall says `out` and no figure, though its reading said 97% used, and
 /// the footer's own figure of 97% (a reading, never `out`) does not override a wall standing
 /// now; a curve that reaches 99.5% used or more by the reset, short of a fill, says `~1% left`;
-/// an unread account the worst case assumes full is `?`, and no word of any scenario says `0%
+/// an unread account the worst case assumes full has no figure, and no word of any scenario says `0%
 /// left`, a chart column's title included. Negative controls: the tail rounded half up without
 /// the cap (`(x10 + 5) / 10`) says `~0% left` for case (b) under a lead of 64%; `own` taken over
 /// the row's figure whatever it is says `main 3% left` on a walled tab; a hand-off's title
@@ -1290,6 +1299,7 @@ fn no_inferred_zero_left() {
     let worst = worst_case().outlook().quota("me", None, true);
     let pool = worst.named.iter().find(|n| n.label == "pool1").unwrap();
     assert_eq!(pool.figure, Figure::Unread);
+    assert!(pool.unread.is_some(), "an unread account says why");
     for (name, view) in scenarios()
         .into_iter()
         .chain([("high", high), ("wall", wall)])
@@ -1803,9 +1813,9 @@ fn parts(view: &QuotaView, line: &QuotaLine) -> Parts {
         .named
         .iter()
         .filter(|n| {
-            name_forms(n)
+            name_forms(view, n)
                 .iter()
-                .any(|form| lead.split(' ').any(|w| w == form))
+                .any(|form| lead.split([' ', ',']).any(|w| w == form))
         })
         .map(|n| n.label.clone())
         .collect();
@@ -1820,10 +1830,11 @@ fn parts(view: &QuotaView, line: &QuotaLine) -> Parts {
         phrases.push(("own", full || own.by_reset.is_none()));
     }
     if let Some(v) = &view.tail.verdict {
-        if tail.contains(&v.full) && v.full != v.short {
+        let shorts = [&v.short, &v.short_whole];
+        if tail.contains(&v.full) && !shorts.contains(&&v.full) {
             phrases.push(("verdict", true));
-        } else if tail.contains(&v.short) {
-            phrases.push(("verdict", v.full == v.short));
+        } else if let Some(short) = shorts.into_iter().find(|s| tail.contains(s.as_str())) {
+            phrases.push(("verdict", v.full == *short));
         }
     }
     (names, line.per_day, phrases)
@@ -1864,7 +1875,10 @@ fn the_quota_ladder_keeps_its_invariants() {
             let text = line.text();
             // (1) and (3).
             if view.waiting() {
-                assert!(name_forms(tab).contains(&lead), "{name} at {room}: {lead}");
+                assert!(
+                    name_forms(&view, tab).contains(&lead),
+                    "{name} at {room}: {lead}"
+                );
             } else {
                 let mut body = lead.as_str();
                 if let Some((head, n)) = body.rsplit_once(" +")
@@ -1873,15 +1887,39 @@ fn the_quota_ladder_keeps_its_invariants() {
                     body = head;
                 }
                 let shown: Vec<&str> = body.split(SEP).collect();
-                let laid_as =
-                    |n: &Named| name_forms(n).map(|form| format!("{form} {}", n.figure.words()));
+                // An account's part: its name and its figure, or, with no figure, the words
+                // that say why or its login, which accounts of one reason share (`alt1, alt2 not
+                // read`).
+                let laid_as = |n: &Named| {
+                    [Names::Whole, Names::Local]
+                        .map(|form| format!("{} {}", view.name(n, form), QuotaView::said(n, form)))
+                };
+                let grouped = |part: &str| {
+                    [Names::Whole, Names::Local].iter().any(|&form| {
+                        let of: Vec<&Named> = view
+                            .named
+                            .iter()
+                            .filter(|n| {
+                                !n.has_figure()
+                                    && part.ends_with(&format!(" {}", QuotaView::said(n, form)))
+                                    && part.split([' ', ',']).any(|w| w == view.name(n, form))
+                            })
+                            .collect();
+                        let names: Vec<String> = of.iter().map(|n| view.name(n, form)).collect();
+                        of.first().is_some_and(|n| {
+                            part == format!("{} {}", names.join(", "), QuotaView::said(n, form))
+                        })
+                    })
+                };
                 for part in &shown {
                     assert!(
                         view.named
                             .iter()
-                            .any(|n| laid_as(n).iter().any(|form| part == form)),
+                            .any(|n| laid_as(n).iter().any(|form| part == form))
+                            || grouped(part),
                         "{name} at {room}: `{part}` in `{lead}`"
                     );
+                    assert!(!part.contains('?'), "{name} at {room}: `{part}`");
                 }
                 assert!(
                     laid_as(tab).iter().any(|own| shown.contains(&own.as_str())),
@@ -1890,7 +1928,9 @@ fn the_quota_ladder_keeps_its_invariants() {
                 // (2).
                 if let Some(v) = view.tail.verdict.as_ref().filter(|v| v.kept) {
                     assert!(
-                        text.contains(&v.short) || text.contains(&v.full),
+                        [&v.short, &v.short_whole, &v.full]
+                            .iter()
+                            .any(|said| text.contains(said.as_str())),
                         "{name} at {room}: {text}"
                     );
                 }
@@ -1920,6 +1960,111 @@ fn the_quota_ladder_keeps_its_invariants() {
             wider = Some(now);
         }
     }
+}
+
+/// Where `needle` stands in `cells` as a run of its own: at the start or after a blank.
+fn runs_of(cells: &[(char, Role, bool)], needle: &str) -> Vec<usize> {
+    let want: Vec<char> = needle.chars().collect();
+    if want.len() > cells.len() {
+        return Vec::new();
+    }
+    (0..=cells.len() - want.len())
+        .filter(|&i| {
+            (i == 0 || cells[i - 1].0 == ' ')
+                && cells[i..i + want.len()]
+                    .iter()
+                    .map(|cell| cell.0)
+                    .eq(want.iter().copied())
+        })
+        .collect()
+}
+
+/// LINE E READS ITS FIGURES AND SAYS `left` QUIETLY (§1.3's ink table: this tab's name and figure
+/// lit and bold; `left`, `·`, `+2` and `at` quiet; the tail's `~1%` and times value). In every
+/// scenario, its accounts named by label and by email, at every room that lays a row: each
+/// account's figure in the lead is in its account's ink (this tab's lit and bold, another's value
+/// and regular), a bound's `≤` with it, and ` left` after it quiet and regular, while `out` is a
+/// figure alone; the tail's phrase 1 lays `~N%` in the value ink and ` left at ` quiet. Control:
+/// the walk meets this tab's figures and others', a bound, an `out` and a phrase 1, so no kind
+/// passes for being absent.
+#[test]
+fn line_e_reads_its_figures_and_says_left_quietly() {
+    let word = crate::harness::left::WORD;
+    let mut views = scenarios();
+    views.extend(emailed_scenarios());
+    views.push(("idle", scenario_a_idle().outlook().quota("me", None, true)));
+    let (mut tabs, mut others, mut bounds, mut outs, mut tails) = (0, 0, 0, 0, 0);
+    for (name, view) in &views {
+        for room in 0..=200 {
+            let Some(line) = laid(view, room) else {
+                continue;
+            };
+            let lead = &line.cells[line.lead.clone()];
+            for n in view.named.iter().filter(|n| n.has_figure()) {
+                let said = n.figure.words();
+                let figure = said
+                    .strip_suffix(word)
+                    .and_then(|rest| rest.strip_suffix(' '))
+                    .unwrap_or(&said);
+                let ink = if n.this_tab {
+                    (Role::Lit, true)
+                } else {
+                    (Role::Value, false)
+                };
+                let forms: BTreeSet<String> = name_forms(view, n).into_iter().collect();
+                for form in forms {
+                    for at in runs_of(lead, &format!("{form} {said}")) {
+                        let from = at + form.chars().count() + 1;
+                        let to = from + figure.chars().count();
+                        for (c, role, bold) in &lead[from..to] {
+                            assert_eq!((*role, *bold), ink, "{name} at {room}: {c:?} of {said}");
+                        }
+                        for (c, role, bold) in &lead[to..from + said.chars().count()] {
+                            assert_eq!(
+                                (*role, *bold),
+                                (Role::Quiet, false),
+                                "{name} at {room}: {c:?} of {said}"
+                            );
+                        }
+                        if n.this_tab {
+                            tabs += 1;
+                        } else {
+                            others += 1;
+                        }
+                        bounds += usize::from(figure.starts_with('\u{2264}'));
+                        outs += usize::from(figure == said);
+                    }
+                }
+            }
+            let tail = &line.cells[line.tail.clone()];
+            let phrase = format!(" {word} at ");
+            for at in runs_of(tail, &phrase[1..]).into_iter().filter(|&at| at > 0) {
+                let from = tail[..at]
+                    .iter()
+                    .rposition(|cell| cell.0 == '~')
+                    .expect("phrase 1's figure starts at `~`");
+                for (c, role, bold) in &tail[from..at - 1] {
+                    assert_eq!(
+                        (*role, *bold),
+                        (Role::Value, false),
+                        "{name} at {room}: {c:?}"
+                    );
+                }
+                for (c, role, bold) in &tail[at - 1..at - 1 + phrase.chars().count()] {
+                    assert_eq!(
+                        (*role, *bold),
+                        (Role::Quiet, false),
+                        "{name} at {room}: {c:?}"
+                    );
+                }
+                tails += 1;
+            }
+        }
+    }
+    assert!(
+        tabs > 0 && others > 0 && bounds > 0 && outs > 0 && tails > 0,
+        "tab figures {tabs}, others {others}, bounds {bounds}, outs {outs}, phrase 1s {tails}"
+    );
 }
 
 /// CASE (C) LAYS R2, R5 AND R7 (§1.3 (c), §2.4) at 166, 96 and 66 cells: R2's 45 lead cells
@@ -2505,6 +2650,7 @@ fn a_scenes_tap_words_are_the_taps_own_for_its_case() {
             ("b", "week 37% left \u{b7} resets Sat 10:00".to_owned()),
             ("c", "week 25% left \u{b7} resets Sat 10:00".to_owned()),
             ("d", NO_WEEK.to_owned()),
+            ("e", "week 14% left \u{b7} resets Sat 10:00".to_owned()),
         ]
     );
     for (name, words) in &said {
@@ -2518,4 +2664,575 @@ fn a_scenes_tap_words_are_the_taps_own_for_its_case() {
     moved.read("main", None, Some((640, SAT7)), T5);
     let view = moved.outlook().quota("main", None, true);
     assert_eq!(tap_words(&view), "week 36% left \u{b7} resets Sat 10:00");
+}
+
+/// What the glass shows of `name`: every character but a Default_Ignorable_Code_Point, which it
+/// draws as nothing.
+fn seen(name: &str) -> String {
+    name.chars()
+        .filter(|&c| !crate::supervise::occupancy::git_url::default_ignorable(c))
+        .collect()
+}
+
+/// NAMES ON ONE ROW NEVER COLLIDE (§2.5): [`distinct`] lays every set of accounts, at every
+/// width from 8 cells to [`NAME_CELLS`] and in both forms, with no two alike in what the glass
+/// shows ([`seen`]) and none wider than its cells: addresses that differ only late in their
+/// local part (`tidepool.m1.2@…`, `tidepool.m1.5@…`, re-cut as head, ellipsis and tail), one
+/// address under two roster labels, one local part at two domains and at one domain label
+/// twice, names that differ only in their middle, accented, wide and joined-emoji names, a
+/// joiner after a letter (whose wide character the grid folds into the letter's cell), names
+/// that differ elsewhere but end in a character drawn as nothing, a local part of 300
+/// characters, and a name that is already another's cut. A name with no neighbour to tell it
+/// from is cut as it was (`tidepool.m1…`). Negative control: the plain cut to twelve cells is
+/// one name for two.
+#[test]
+fn distinct_names_never_collide() {
+    let long = "x".repeat(300);
+    let sets: Vec<Vec<(String, &str)>> = vec![
+        vec![
+            ("tidepool.m1.2@example.com".into(), "pool1"),
+            ("tidepool.m1.5@example.com".into(), "pool2"),
+            ("ledgerbooks@example.com".into(), "main"),
+        ],
+        // One address under two labels, and one local part at two domains.
+        vec![
+            ("ledgerbooks@example.com".into(), "main"),
+            ("ledgerbooks@example.com".into(), "alt"),
+            ("ledgerbooks@example.org".into(), "alt2"),
+            ("ledgerbooks@other.example".into(), "alt3"),
+        ],
+        // No `@`: roster labels that share a head, and ones that differ only in the middle.
+        vec![
+            ("a-long-account-label-0123456789".into(), "long"),
+            ("a-long-account-label-0123456780".into(), "long2"),
+            (format!("{long}A{long}"), "mid1"),
+            (format!("{long}B{long}"), "mid2"),
+            (format!("{long}C{long}"), "mid3"),
+        ],
+        // Unicode: an accent stays on its letter, a wide cell and a joined emoji go whole.
+        vec![
+            ("re\u{301}sume\u{301}-accounts-one@example.com".into(), "u1"),
+            ("re\u{301}sume\u{301}-accounts-two@example.com".into(), "u2"),
+            (
+                "\u{6771}\u{4eac}\u{90fd}\u{5343}\u{4ee3}\u{7530}\u{533a}\u{4e00}@example.com"
+                    .into(),
+                "w1",
+            ),
+            (
+                "\u{6771}\u{4eac}\u{90fd}\u{5343}\u{4ee3}\u{7530}\u{533a}\u{4e8c}@example.com"
+                    .into(),
+                "w2",
+            ),
+            (
+                "team-\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}-family-one@example.com".into(),
+                "e1",
+            ),
+            (
+                "team-\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}-family-two@example.com".into(),
+                "e2",
+            ),
+        ],
+        // Very long local parts that differ only in their last character, and a name that is
+        // already another's plain cut or its ordinal.
+        vec![
+            (format!("{long}1@example.com"), "l1"),
+            (format!("{long}2@example.com"), "l2"),
+            (format!("{long}3@example.com"), "l3"),
+            ("xxxxxxxxxxx\u{2026}".into(), "cut"),
+            ("xxxxxxxxx\u{2026}#2".into(), "ordinal"),
+            (String::new(), "empty"),
+            (String::new(), "empty2"),
+        ],
+        // A joiner after a letter: the grid folds the wide character after it into the
+        // letter's cell, a cluster laid in less than its own width.
+        vec![
+            (
+                format!("x\u{200d}\u{1f600}{}1@example.com", "a".repeat(16)),
+                "z1",
+            ),
+            (
+                format!("x\u{200d}\u{1f600}{}2@example.com", "a".repeat(16)),
+                "z2",
+            ),
+            (
+                format!("a\u{200d}\u{6771}{}1@example.com", "b".repeat(36)),
+                "z3",
+            ),
+            (
+                format!("a\u{200d}\u{6771}{}2@example.com", "b".repeat(36)),
+                "z4",
+            ),
+        ],
+        // Names that differ early, one ending in a character the glass draws as nothing, and
+        // names that differ in nothing else.
+        vec![
+            ("tidepool.team.Q.abc@example.com".into(), "h1"),
+            ("tidepool.team.R.abc\u{200b}@example.com".into(), "h2"),
+            ("tidepool.team.S.abc\u{fe0f}@example.com".into(), "h3"),
+            ("tidepool.team.T.abc\u{2060}@example.com".into(), "h4"),
+            ("tidepool.team.Q.abc\u{ad}@example.com".into(), "h5"),
+            ("owner".into(), "h6"),
+            ("owner\u{200b}".into(), "h7"),
+        ],
+    ];
+    for set in &sets {
+        let names: Vec<(&str, &str)> = set.iter().map(|(n, l)| (n.as_str(), *l)).collect();
+        for whole in [false, true] {
+            for max in 8..=NAME_CELLS {
+                let laid = apart(&names, whole, max);
+                assert_eq!(laid.len(), names.len());
+                for (i, a) in laid.iter().enumerate() {
+                    assert!(
+                        aterm_grapheme::str_grid_columns(a) <= max,
+                        "{max} cells: `{a}` of {:?}",
+                        names[i]
+                    );
+                    assert!(!a.is_empty() || names[i].0.is_empty(), "{:?}", names[i]);
+                    for (j, b) in laid.iter().enumerate().skip(i + 1) {
+                        assert_ne!(
+                            seen(a),
+                            seen(b),
+                            "{max} cells: {:?} and {:?}",
+                            names[i],
+                            names[j]
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // The forms a person reads: the tail that tells two addresses apart, in the same cells.
+    let pool = [
+        ("ledgerbooks@example.com", "main"),
+        ("tidepool.m1.2@example.com", "pool1"),
+        ("tidepool.m1.5@example.com", "pool2"),
+    ];
+    assert_eq!(
+        distinct(&pool, Names::Local),
+        ["ledgerbooks", "tidepool\u{2026}1.2", "tidepool\u{2026}1.5"]
+    );
+    assert_eq!(
+        distinct(&pool, Names::Whole),
+        pool.map(|(name, _)| name),
+        "an email that fits is laid whole"
+    );
+    // Equal local parts take their domain's first label, then their roster label.
+    assert_eq!(
+        distinct(
+            &[("owner@acme.example", "a"), ("owner@beta.example", "b")],
+            Names::Local
+        ),
+        ["owner@acme", "owner@beta"]
+    );
+    assert_eq!(
+        distinct(
+            &[("owner@acme.example", "a"), ("owner@acme.test", "b")],
+            Names::Local
+        ),
+        ["owner@ac\u{2026}(a)", "owner@ac\u{2026}(b)"]
+    );
+    assert_eq!(
+        distinct(&[("owner", "alt1"), ("owner", "alt2")], Names::Local),
+        ["owner (alt1)", "owner (alt2)"]
+    );
+    // One account said twice reads alike, and a name alone is cut as it always was.
+    assert_eq!(
+        distinct(
+            &[("owner@acme.example", "a"), ("owner@acme.example", "a")],
+            Names::Local
+        ),
+        ["owner", "owner"]
+    );
+    assert_eq!(short("tidepool.m1.2@example.com"), "tidepool.m1\u{2026}");
+    assert_eq!(distinct(&pool[1..2], Names::Local), ["tidepool.m1\u{2026}"]);
+    // The control: one plain cut for each is one name for two.
+    assert_eq!(short(pool[1].0), short(pool[2].0));
+}
+
+/// A CLUSTER THE GRID FOLDS IS CUT WITH ITS CELL (§2.5): a joiner after a letter ends that
+/// letter's grapheme cluster (`x\u{200d}`), and the grid folds the wide character after it
+/// into the letter's cell, so that cluster (`😀`, `東`) is laid in no column of its own. Two
+/// addresses that begin so and whose plain cuts are equal are cut apart, narrow and whole,
+/// each within its cells, the tail after `…` being the address's own last characters
+/// (`x\u{200d}😀aaaaaaa…aa1`). Negative control: placing each cluster at its end column less
+/// its own width subtracts past zero at the folded cluster, a panic in a debug build and, in a
+/// release one, that cluster copied into the tail (`x\u{200d}😀aaaaa…😀aa1`).
+#[test]
+fn a_cluster_the_grid_folds_is_cut_with_its_cell() {
+    let address = |head: &str, body: &str, last: char| format!("{head}{body}{last}@example.com");
+    let narrow = ['1', '2'].map(|d| address("x\u{200d}\u{1f600}", &"a".repeat(16), d));
+    let whole = ['1', '2'].map(|d| address("a\u{200d}\u{6771}", &"b".repeat(36), d));
+    for (pair, form) in [(&narrow, Names::Local), (&whole, Names::Whole)] {
+        let names = [(pair[0].as_str(), "one"), (pair[1].as_str(), "two")];
+        let laid = distinct(&names, form);
+        assert_ne!(seen(&laid[0]), seen(&laid[1]), "{laid:?}");
+        for ((name, _), cut) in names.iter().zip(&laid) {
+            assert!(
+                aterm_grapheme::str_grid_columns(cut) <= form.cells(),
+                "`{cut}` in {} cells",
+                form.cells()
+            );
+            let (_, tail) = cut.split_once('\u{2026}').expect("cut apart");
+            assert!(local(name).ends_with(tail), "`{cut}` of `{name}`");
+        }
+    }
+    assert_eq!(
+        distinct(&[(&narrow[0], "one"), (&narrow[1], "two")], Names::Local),
+        [
+            "x\u{200d}\u{1f600}aaaaaaa\u{2026}aa1",
+            "x\u{200d}\u{1f600}aaaaaaa\u{2026}aa2"
+        ]
+    );
+}
+
+/// NAMES APART DIFFER IN WHAT THE GLASS SHOWS (§2.5): two addresses that differ early
+/// (`…team.Q.abc@…`, `…team.R.abc@…`), one of them ending in a character the glass draws as
+/// nothing (a zero-width space, a variation selector, a word joiner, a soft hyphen), are told
+/// apart on the row by a character a person reads (`tidepo…Q.abc`, `tidepo…R.abc`), at every
+/// width from 8 cells and in both forms. Negative control: telling cuts apart by their bytes
+/// takes the first tail, `tidepool…abc` and `tidepool…abc` with a zero-width space after it,
+/// two accounts that read as one.
+#[test]
+fn names_apart_differ_in_what_the_glass_shows() {
+    for hidden in ['\u{200b}', '\u{fe0f}', '\u{2060}', '\u{ad}'] {
+        let other = format!("tidepool.team.R.abc{hidden}@example.com");
+        let names = [
+            ("tidepool.team.Q.abc@example.com", "pool1"),
+            (other.as_str(), "pool2"),
+        ];
+        for whole in [false, true] {
+            for max in 8..=NAME_CELLS {
+                let laid = apart(&names, whole, max);
+                assert_ne!(
+                    seen(&laid[0]),
+                    seen(&laid[1]),
+                    "{hidden:?} in {max}: {laid:?}"
+                );
+            }
+        }
+    }
+    let other = "tidepool.team.R.abc\u{200b}@example.com";
+    let laid = distinct(
+        &[
+            ("tidepool.team.Q.abc@example.com", "pool1"),
+            (other, "pool2"),
+        ],
+        Names::Local,
+    );
+    assert_eq!(
+        laid.iter().map(|cut| seen(cut)).collect::<Vec<_>>(),
+        ["tidepo\u{2026}Q.abc", "tidepo\u{2026}R.abc"]
+    );
+}
+
+/// A LEAN ON A BOUND SAYS IT WAS READ (§2.3): `alt1`, read three hours ago and idle here since,
+/// is a bound (`≤69% left`), and the work leans on it from ~Wed 06:00 (`Fresh::IdleHere`). The
+/// lean's phrase says what is true of it, `alt1 read earlier ~Wed 06:00` (full `… from ~Wed
+/// 06:00`); the title, a column's title and the spoken chain say `whose week was read
+/// earlier`; the CLI's text and its spoken verdict the same. No rung, no form of line D's unit,
+/// no title and no line of the CLI says `alt1` is not read, unread or one aterm cannot read
+/// (`alt2`, whose week reset unread, still says so).
+/// Negative control: the words of 2026-11-12 said `alt1 not read ~Wed 06:00` on the very row
+/// that leads with `alt1 ≤69% left`, and `alt1 unread from ~Wed 06:00` in its title.
+#[test]
+fn a_lean_on_a_bound_says_it_was_read() {
+    let out = scenario_a_idle().outlook();
+    assert!(
+        matches!(&out.verdict, Verdict::Lean { row, why: Fresh::IdleHere, .. } if row == "alt1"),
+        "{:?}",
+        out.verdict
+    );
+    let view = out.quota("me", None, true);
+    let phrase = view.tail.verdict.clone().expect("the lean's phrase");
+    assert_eq!(
+        (phrase.full.as_str(), phrase.short.as_str()),
+        (
+            "alt1 read earlier from ~Wed 06:00",
+            "alt1 read earlier ~Wed 06:00"
+        )
+    );
+    assert!(
+        view.title
+            .contains("from ~Wed 06:00 the work moves to alt1, whose week was read earlier"),
+        "{}",
+        view.title
+    );
+    assert!(
+        view.spoken
+            .contains("then alt1, whose week was read earlier, from about Wednesday 06:00"),
+        "{}",
+        view.spoken
+    );
+    assert!(
+        out.verdict_spoken()
+            .contains("the rotation moves to alt1, whose week was read earlier."),
+        "{}",
+        out.verdict_spoken()
+    );
+    assert!(
+        out.text().contains("alt1 read earlier from ~Wed 06:00"),
+        "{}",
+        out.text()
+    );
+    let leads_bound = (0..=260)
+        .filter_map(|room| laid(&view, room))
+        .any(|line| line.text_of(&line.lead).contains("alt1 \u{2264}69% left"));
+    assert!(leads_bound, "a rung leads with alt1's bound");
+    let mut said = every_word(&view);
+    said.extend([out.text(), out.verdict_spoken()]);
+    for text in &said {
+        for false_words in [
+            "alt1 not read",
+            "alt1 unread",
+            "alt1, which aterm",
+            "alt1: aterm",
+        ] {
+            assert!(!text.contains(false_words), "`{false_words}` in {text}");
+        }
+    }
+}
+
+/// Every reason a signed-in account's week has no figure ([`Why::unread`]).
+const UNREAD: [Why; 3] = [Why::NeverRead, Why::ResetUnread, Why::ClockInvalid];
+
+/// Every state of an account with no figure to say, as its [`Named`] holds it: a signed-in
+/// week unread for each reason, and each login the row says in the figure's place.
+const NO_FIGURE_STATES: [(Figure, Option<Why>); 5] = [
+    (Figure::Unread, Some(Why::NeverRead)),
+    (Figure::Unread, Some(Why::ResetUnread)),
+    (Figure::Unread, Some(Why::ClockInvalid)),
+    (Figure::SignedOut, None),
+    (Figure::SigningIn, None),
+];
+
+/// `aterm help harness` SAYS THE ROW'S OWN WORDS (§2.1, §2.3, §2.5): the manual's harness topic
+/// names every reason a week has no figure in the row's words, whole ([`Why::words`]) and
+/// narrow ([`Why::brief`]), an account with no login here in the one word the row says of it at
+/// every width (`signed out`, `signing in`: [`Figure::words`]), the lean in the grammar its
+/// phrase is built in (`alt2 not read from ~Sat 06:00`, `read earlier` for a bound), the names
+/// [`distinct`] cuts apart (`tidepool…1.2`, `tidepool…1.5`), and no `?` for a week with no
+/// figure, nor a second word for no login (`no login`, `not signed in`). Negative control: the
+/// manual of 2026-11-12 said "`?` unread" and "`? alt2 unread from ~Sat 06:00`".
+#[test]
+fn the_manual_says_the_rows_own_words() {
+    const MANUAL: &str = include_str!("../../../aterm-cli/src/manual.rs");
+    let at = MANUAL.find("name: \"harness\"").expect("the harness topic");
+    let topic = &MANUAL[at..];
+    let end = topic[1..]
+        .find("Topic {")
+        .map_or(topic.len(), |end| end + 1);
+    let manual = topic[..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let named = |words: &str| manual.contains(&format!("`{words}`"));
+    for why in UNREAD {
+        assert!(named(why.words()), "{why:?}: `{}`", why.words());
+        assert!(manual.contains(why.brief()), "{why:?}: {}", why.brief());
+    }
+    for login in [Figure::SignedOut, Figure::SigningIn] {
+        assert!(named(&login.words()), "{login:?}: `{}`", login.words());
+    }
+    for other in ["no login", "not signed in"] {
+        assert!(!named(other), "a second word for no login: `{other}`");
+    }
+    assert!(manual.contains(&format!("`{}`", Why::Earlier.brief())));
+    let lean = |name: &str, why: Why| format!("`{name} {} from ~Sat 06:00`", why.brief());
+    assert!(
+        manual.contains(&lean("alt2", Why::NeverRead)),
+        "the lean's grammar"
+    );
+    let pool = [
+        ("tidepool.m1.2@example.com", "pool1"),
+        ("tidepool.m1.5@example.com", "pool2"),
+    ];
+    for cut in distinct(&pool, Names::Local) {
+        assert!(named(&cut), "`{cut}`");
+    }
+    assert!(
+        !manual.contains("`?`") && !manual.contains("`? "),
+        "a `?` for an unread week"
+    );
+}
+
+/// NO CLASS SAYS A QUESTION MARK (§2.1): an account whose week has no figure says why in
+/// words ([`Why::words`]; [`Why::brief`] beside a narrow name), and one with no login here
+/// says its login ([`Figure::words`]), on the row at every room, in its title, aloud and in
+/// line D's unit: never `?` and never a figure nothing reported. Every scenario holds it, case
+/// (e) and the leans included (a lean's phrase says `pool1 not read ~Wed 15:00` and its chart
+/// `→pool1┄`), and so does case (e) with each of its two unread accounts set to each state with
+/// no figure in turn; the title and the spoken words say the whole sentence ([`Why::sentence`])
+/// after the account's whole name. Negative control: the figure's own word for an unread week
+/// was `?` (`Figure::words`), which this test's first assertion refuses.
+#[test]
+fn no_class_says_a_question_mark() {
+    assert_eq!(Figure::Unread.words(), "not read");
+    for why in Why::ALL {
+        for words in [why.words(), why.brief(), why.sentence(), why.which()] {
+            assert!(!words.is_empty() && !words.contains('?'), "{why:?}");
+            assert!(!words.contains(|c: char| c.is_ascii_digit()), "{why:?}");
+        }
+        assert!(why.brief().len() <= why.words().len(), "{why:?}");
+    }
+    let mut views: Vec<(String, QuotaView)> = scenarios()
+        .into_iter()
+        .chain(emailed_scenarios())
+        .map(|(name, view)| (name.to_owned(), view))
+        .collect();
+    let base = case_e().outlook().quota("main", None, true);
+    for first in NO_FIGURE_STATES {
+        for second in NO_FIGURE_STATES {
+            let mut view = base.clone();
+            (view.named[1].figure, view.named[1].unread) = first;
+            (view.named[2].figure, view.named[2].unread) = second;
+            views.push((format!("e {first:?} {second:?}"), view));
+        }
+    }
+    for (name, view) in &views {
+        for text in every_word(view) {
+            assert!(!text.contains('?'), "{name}: {text}");
+        }
+        // The ladder still fits: a laid row within its room, every wider room laid too.
+        let mut fits = false;
+        for room in (20..=240).rev() {
+            match laid(view, room) {
+                Some(line) => {
+                    assert!(line.cells.len() <= room, "{name} at {room}");
+                    assert!(room == 240 || fits, "{name}: laid at {room}, not wider");
+                    fits = true;
+                    let lead = line.text_of(&line.lead);
+                    for n in view.named.iter().filter(|n| !n.has_figure() && !n.this_tab) {
+                        let forms = [Names::Whole, Names::Local];
+                        let named = forms.iter().any(|f| lead.contains(&view.name(n, *f)));
+                        let why = forms.iter().any(|f| {
+                            lead.contains(&view.name(n, *f))
+                                && lead.contains(&QuotaView::said(n, *f))
+                        });
+                        assert!(
+                            why || !named,
+                            "{name} at {room}: `{lead}` names an account with no figure bare"
+                        );
+                    }
+                }
+                None => fits = false,
+            }
+        }
+        assert!(laid(view, 240).is_some(), "{name} lays at 240 cells");
+    }
+    assert!(
+        base.title
+            .contains("tidepool.m1.2@example.com: aterm has not read its week yet")
+    );
+    assert!(
+        base.title
+            .contains("tidepool.m1.5@example.com: its week reset and aterm has not read it since")
+    );
+    assert!(
+        base.spoken.contains(
+            " tidepool.m1.5@example.com: its week reset and aterm has not read it since."
+        ),
+        "{}",
+        base.spoken
+    );
+}
+
+/// CASE (E) NAMES ITS TWO UNREAD ACCOUNTS APART AND SAYS WHY (§1.3 (e), §2.1, §2.5), at the
+/// mocks' 166, 96 and 66 cells: the lead whole lays from 234 cells (R4, 6 cells a day; 233
+/// lays the local parts), so at 166 the rung of local parts lays `ledgerbooks 14% left ·
+/// tidepool…1.2, tidepool…1.5 not read` (the two unread accounts under their one reason, each
+/// by the tail that tells it from the other) at 6 cells a day; at 96 the lead folds to `+2` at
+/// 4 cells a day, the lean said in the tail; at 66 this tab's figure and the lean. At every
+/// room the tail names the account the work leans on as the rung's lead names it, whole beside
+/// a whole lead (`tidepool.m1.2@example.com not read ~Fri 20:00`) and narrow beside a narrow
+/// one. Negative controls: each name cut alone reads `tidepool.m1…` twice; a tail that names
+/// the lean's account narrow on every rung says `tidepool…1.2` beside a lead that says
+/// `tidepool.m1.2@example.com`, from 221 cells.
+#[test]
+fn case_e_names_its_unread_accounts_apart() {
+    let view = case_e().outlook().quota("main", None, true);
+    assert_eq!(
+        view.named.iter().map(|n| n.unread).collect::<Vec<_>>(),
+        [None, Some(Why::NeverRead), Some(Why::ResetUnread)]
+    );
+    let lean = "tidepool\u{2026}1.2 not read ~Fri 20:00";
+    let whole_lean = "tidepool.m1.2@example.com not read ~Fri 20:00";
+    let whole_lead = "ledgerbooks@example.com 14% left \u{b7} tidepool.m1.2@example.com not read \
+                      yet \u{b7} tidepool.m1.5@example.com not read since reset";
+    let local_lead =
+        "ledgerbooks 14% left \u{b7} tidepool\u{2026}1.2, tidepool\u{2026}1.5 not read";
+    let row = |room: usize| {
+        let line = laid(&view, room).unwrap();
+        (
+            line.text_of(&line.lead),
+            line.per_day,
+            line.text_of(&line.tail),
+        )
+    };
+    assert_eq!(
+        row(240),
+        (
+            whole_lead.to_owned(),
+            6,
+            format!("\u{21ba} Sat 10:00 \u{b7} {whole_lean}")
+        )
+    );
+    assert_eq!(row(234).0, whole_lead, "the whole lead lays from 234 cells");
+    assert_eq!(row(233).0, local_lead, "233 cells lay the local parts");
+    // The lead and the tail of one rung name the lean's account one way.
+    for room in 0..=260 {
+        let Some(line) = laid(&view, room) else {
+            continue;
+        };
+        let (lead, tail) = (line.text_of(&line.lead), line.text_of(&line.tail));
+        for (form, other) in [
+            ("tidepool.m1.2@", "tidepool\u{2026}1.2"),
+            ("tidepool\u{2026}1.2", "tidepool.m1.2@"),
+        ] {
+            assert!(
+                !(lead.contains(form) && tail.contains(other)),
+                "at {room}: `{lead}` and `{tail}`"
+            );
+        }
+    }
+    assert_eq!(
+        row(166),
+        (
+            "ledgerbooks 14% left \u{b7} tidepool\u{2026}1.2, tidepool\u{2026}1.5 not read"
+                .to_owned(),
+            6,
+            format!("\u{21ba} Sat 10:00 \u{b7} {lean}")
+        )
+    );
+    assert_eq!(
+        row(96),
+        ("ledgerbooks 14% left +2".to_owned(), 4, lean.to_owned())
+    );
+    assert_eq!(
+        row(66),
+        ("ledgerbooks 14% left".to_owned(), 0, lean.to_owned())
+    );
+    // The chart names the account the work leans on whole where its run holds that, else by
+    // the narrow name the lead tells it apart with; `┄` follows, and no mark.
+    for (room, name) in [
+        (166, "\u{2192}tidepool.m1.2@example.com\u{2504}"),
+        (96, "\u{2192}tidepool\u{2026}1.2\u{2504}"),
+    ] {
+        let line = laid(&view, room).unwrap();
+        assert!(line.text_of(&line.chart).contains(name), "{}", line.text());
+    }
+    // Line D's unit names this tab as the row does.
+    let forms: Vec<String> = view
+        .fallback()
+        .iter()
+        .map(|form| form.iter().map(|p| p.text.as_str()).collect())
+        .collect();
+    assert_eq!(forms.last().unwrap(), "ledgerbooks");
+    assert_eq!(
+        forms[0],
+        format!("ledgerbooks@example.com 14% left \u{b7} \u{21ba} Sat 10:00 \u{b7} {lean}")
+    );
+    assert_eq!(
+        short("tidepool.m1.2@example.com"),
+        short("tidepool.m1.5@example.com")
+    );
 }

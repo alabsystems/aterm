@@ -6,18 +6,124 @@
 //! move; no store is a refusal naming the product's fix first; the lease is taken once on the
 //! physical build; the client's own checker admits the compiler before anything is built.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atpkg_publish::artifact::lineage_switch::Switch;
+use atpkg_publish::artifact::relocate::Report;
+use atpkg_publish::artifact::tarwrite::Compressor;
 use atpkg_publish::artifact::toolchain::{self, Held, Source};
+use atpkg_publish::artifact::tools::{self, Ran, Run, RunError, Tools};
 use atpkg_publish::ctx::Ctx;
 use atpkg_publish::error::Error;
 use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::testkit::Keys;
 use atpkg_publish::triple::Triple;
 
-use super::fixture::{FakeTools, put, put_exe, scratch, toolchain as fixture_toolchain};
+use super::fixture::{
+    COMMIT, FakeTools, put, put_exe, scratch, toolchain as fixture_toolchain, version_text,
+};
+
+/// The ordinary collector keeps a tail; complete collection preserves the fake's full report.
+struct TailCapture(FakeTools);
+
+impl Tools for TailCapture {
+    fn run(&self, run: &Run) -> Result<Ran, RunError> {
+        let mut result = self.0.run(run)?;
+        let discarded = result
+            .stdout
+            .len()
+            .saturating_sub(aterm_uds::deadline::OUTPUT_KEEP);
+        result.stdout.drain(..discarded);
+        Ok(result)
+    }
+
+    fn run_complete(&self, run: &Run, limit: usize) -> Result<Ran, RunError> {
+        self.0.run_complete(run, limit)
+    }
+
+    fn strip(&self, file: &Path, locals_and_debug: bool) -> Result<(), String> {
+        self.0.strip(file, locals_and_debug)
+    }
+
+    fn resign(&self, file: &Path) -> Result<(), String> {
+        self.0.resign(file)
+    }
+
+    fn same_unsigned(&self, a: &Path, b: &Path) -> Result<bool, String> {
+        self.0.same_unsigned(a, b)
+    }
+
+    fn thin(&self, file: &Path, arch: &str, out: &Path) -> Result<(), String> {
+        self.0.thin(file, arch, out)
+    }
+
+    fn relocate(&self, stage: &Path, donors: &[PathBuf]) -> Result<Report, String> {
+        self.0.relocate(stage, donors)
+    }
+
+    fn compressor(&self) -> &dyn Compressor {
+        self.0.compressor()
+    }
+}
+
+#[test]
+fn compiler_identity_cannot_replace_an_invalid_first_line_with_a_valid_tail() {
+    let compiler = Path::new("fixture-compiler");
+    let report = version_text(COMMIT, "aarch64-apple-darwin");
+    let runner = TailCapture(FakeTools::new("aarch64-apple-darwin"));
+    runner.0.version(compiler, &report);
+    let observed = tools::version(&runner, compiler).expect("ordinary complete report");
+    assert!(atpkg::lineage::parse_version_verbose(&observed).is_ok());
+
+    let tail = format!(
+        "{report}{}",
+        "\n".repeat(aterm_uds::deadline::OUTPUT_KEEP - report.len())
+    );
+    let whole = format!("not a Trust compiler report\n{tail}");
+    runner.0.version(compiler, &whole);
+
+    let truncated = runner
+        .run(&Run::new(compiler, ["-vV"]).bounded())
+        .expect("negative control: ordinary tail capture");
+    assert!(
+        atpkg::lineage::parse_version_verbose(
+            std::str::from_utf8(&truncated.stdout).expect("ASCII report")
+        )
+        .is_ok(),
+        "discarding the real first line changes identity admission"
+    );
+    let observed = tools::version(&runner, compiler).expect("complete report within the bound");
+    assert!(
+        atpkg::lineage::parse_version_verbose(&observed).is_err(),
+        "the compiler's actual first line must be judged"
+    );
+    assert!(observed == whole, "the report must remain complete");
+}
+
+#[test]
+fn compiler_identity_capture_has_an_inclusive_output_bound() {
+    let compiler = Path::new("fixture-compiler");
+    let runner = FakeTools::new("aarch64-apple-darwin");
+    for extra in [0, 1] {
+        let report = "x".repeat(aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES + extra);
+        runner.version(compiler, &report);
+        assert_eq!(tools::version(&runner, compiler).is_ok(), extra == 0);
+    }
+}
+
+#[test]
+fn compiler_identity_refuses_invalid_utf8_in_stdout() {
+    let compiler = Path::new("fixture-compiler");
+    let runner = FakeTools::new("aarch64-apple-darwin");
+    let report = version_text(COMMIT, "aarch64-apple-darwin");
+    let index = report.find("trust: ").expect("identity field") + "trust: ".len();
+    let mut bytes = report.into_bytes();
+    bytes[index] = 0xff;
+    assert!(atpkg::lineage::parse_version_verbose(&String::from_utf8_lossy(&bytes)).is_ok());
+    runner.version_bytes(compiler, &bytes);
+    assert!(tools::version(&runner, compiler).is_err());
+}
 
 fn ctx(home: &Path, xdg: Option<&Path>) -> Ctx {
     let mut c = Keys::mint("m3", &[]).ctx(home, Arc::new(FakeHost::new()));

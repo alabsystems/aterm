@@ -73,7 +73,7 @@ fn debug_seam(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             continue;
         }
         let lexed = file.lexed();
-        let compiled = crate::lock_order::unmasked_lines(&lexed.code, &release_never_compiles);
+        let compiled = crate::items::unmasked_lines(&lexed.code, &release_never_compiles);
         for (line, seam) in mentions(&file.rel, lexed, &bound) {
             seen[seam] = true;
             if compiled.get(line).copied().unwrap_or(true) {

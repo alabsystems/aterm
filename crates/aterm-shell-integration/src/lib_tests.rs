@@ -5,6 +5,7 @@
 include!("tests.rs");
 include!("tests_loader.rs");
 include!("tests_tty.rs");
+include!("tests_bash_forks.rs");
 include!("tests_spare.rs");
 include!("tests_pwsh_keys.rs");
 include!("tests_windows_marks.rs");

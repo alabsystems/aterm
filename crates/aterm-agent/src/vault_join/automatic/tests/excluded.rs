@@ -243,8 +243,8 @@ fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_with_no_window() {
         client::Membership::In { .. }
     ));
     assert_eq!(
-        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
-        b"everyone"
+        crate::vault_entry::read_text(&fresh.home, "shared", 1 << 20).text(),
+        Some("everyone")
     );
     let actor = device
         .request(trust.network, trust.authority)

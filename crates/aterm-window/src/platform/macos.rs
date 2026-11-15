@@ -138,6 +138,17 @@ pub fn window_event_origin() -> Option<InputOrigin> {
     crate::platform_impl::window_event_origin()
 }
 
+/// The original native input event retained for this window-event callback.
+///
+/// Returns `None` outside callback delivery and for a callback generated without a native
+/// input event. Its timestamp belongs to that event even when delivery was deferred or nested;
+/// it never borrows the event AppKit happens to be dispatching later. This is scalar identity
+/// and clock evidence only, not input authority.
+#[inline]
+pub fn window_event_native_input() -> Option<NativeInputEvent> {
+    crate::platform_impl::window_event_native_input()
+}
+
 /// Printable ASCII character produced only via an Option chord on `key` under the active keyboard layout.
 ///
 /// LOCAL PATCH (aterm): added; reads the layout with `UCKeyTranslate`, on the main thread.
@@ -180,6 +191,17 @@ pub fn frame_clock_links(window: &Window) -> Vec<aterm_objc::WeakObj> {
 /// `EventLoopBuilderExtMacOS::with_default_menu` (the default menu is always built) and
 /// `MonitorHandleExtMacOS::ns_screen`.
 pub trait WindowExtMacOS {
+    /// Show and order this window in front without making it key or activating the application.
+    ///
+    /// A minimized window stays minimized. Call [`Self::make_key`] separately when this
+    /// window should receive keyboard input.
+    fn order_front(&self);
+
+    /// Make this already-visible window key without ordering it or activating the application.
+    ///
+    /// A hidden or minimized window is left unchanged.
+    fn make_key(&self);
+
     /// Modifier state last derived from an event for this window.
     ///
     /// LOCAL PATCH (aterm): winit's own cache, written before the matching `ModifiersChanged` is
@@ -194,6 +216,16 @@ pub trait WindowExtMacOS {
 }
 
 impl WindowExtMacOS for Window {
+    #[inline]
+    fn order_front(&self) {
+        self.window.maybe_queue_on_main(|w| w.order_front())
+    }
+
+    #[inline]
+    fn make_key(&self) {
+        self.window.maybe_queue_on_main(|w| w.make_key())
+    }
+
     #[inline]
     fn cached_modifiers(&self) -> ModifiersState {
         self.window.maybe_wait_on_main(|w| w.cached_modifiers())

@@ -2588,8 +2588,9 @@ impl crate::App {
                 entry.pinned = pinned;
             }
         }
+        let pool = &self.pool;
         let sweep = &mut self.session_status.slog_memory;
-        sweep.known.retain(|id, _| ids.contains(id));
+        sweep.known.retain(|id, _| pool.get(*id).is_some());
         let total: usize = sweep.known.values().map(|c| c.footprint).sum();
         if total <= cap && !sweep.known.values().any(|c| c.lowered) {
             return;
@@ -2828,13 +2829,45 @@ fn log_instant(ms: u64) -> std::time::Instant {
 }
 
 /// The `log` verb's usage line.
-pub(crate) const LOG_USAGE: &str = "ERR usage: log [<node>] [lvl=session|run|turn|step] [since=<seq> ep=<epoch> [base=<log_base>]] [n=<count>] [kinds=<k>[,...]] [class=turn] [tier=content] [--json]\n";
+pub(crate) const LOG_USAGE: &str = "ERR usage: log [<node>] [prev[=<k>]] [lvl=session|run|turn|step] [since=<seq> ep=<epoch> [base=<log_base>]] [n=<count>] [kinds=<k>[,...]] [class=turn] [tier=content] [--json]\n";
 /// `log n`'s usage line (the instance's node log).
 pub(crate) const NODE_LOG_USAGE: &str =
     "ERR usage: log n [since=<seq> ep=<epoch>] [n=<count>] [kinds=<k>[,...]] [--json]\n";
 /// The `brief` verb's usage line.
-pub(crate) const BRIEF_USAGE: &str =
-    "ERR usage: brief [<node>|all] [budget=<tokens>] [since=<seq> ep=<epoch> [base=<log_base>]]\n";
+pub(crate) const BRIEF_USAGE: &str = "ERR usage: brief [<node>|all] [prev[=<k>]] [budget=<tokens>] [since=<seq> ep=<epoch> [base=<log_base>]]\n";
+
+/// THE EARLIER LOG A `log` OR `brief` NAMES: `prev` (the log just before) or `prev=<k>` (`k` logs
+/// back, `k >= 1`) among `rest`'s words. A tab keeps its ID across a cold restore (LT-01) and each
+/// launch that restores it starts it a new log, so the logs it kept before are read from the
+/// journal this way. `Ok(None)` where no word names one; `Ok(Some((k, rest)))` with the word taken
+/// out of `rest`; `Err(())` for a second such word or a `k` that is not a count of one or more.
+pub(crate) fn take_prev(rest: &str) -> Result<Option<(u32, String)>, ()> {
+    let mut back = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for word in rest.split_whitespace() {
+        let k = match word.strip_prefix("prev") {
+            Some("") => 1,
+            Some(v) => match v.strip_prefix('=') {
+                Some(k) if !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()) => {
+                    k.parse::<u32>().ok().filter(|k| *k > 0).ok_or(())?
+                }
+                Some(_) => return Err(()),
+                None => {
+                    kept.push(word);
+                    continue;
+                }
+            },
+            None => {
+                kept.push(word);
+                continue;
+            }
+        };
+        if back.replace(k).is_some() {
+            return Err(());
+        }
+    }
+    Ok(back.map(|k| (k, kept.join(" "))))
+}
 
 /// A parsed `log` request.
 #[derive(Clone, Debug, PartialEq, Eq)]

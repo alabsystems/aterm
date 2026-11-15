@@ -209,6 +209,31 @@ fn wait_status(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
+fn wait_git_start(root: &Path, child: &mut Child, marker: &Path) {
+    let preparation = if cfg!(target_os = "macos") {
+        aterm_uds::deadline::FIRST_EXEC_HANG
+    } else {
+        HANG
+    };
+    let by = Instant::now() + preparation;
+    loop {
+        if std::fs::read_to_string(marker)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .is_some_and(|pid| pid != 0)
+        {
+            return;
+        }
+        let status = child.try_wait().expect("own CLI preparation wait");
+        assert!(
+            status.is_none() && Instant::now() < by,
+            "CLI preparation did not start its owned Git: {status:?}: {}",
+            std::fs::read_to_string(root.join("cli.stderr")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn retired(token: Identity) -> bool {
     process::read_identity(token.pid)
         .is_some_and(|current| current.pid != token.pid || current.birth != token.birth)
@@ -257,6 +282,7 @@ fn cli(root: &Path, url: &str) -> (Owned, PathBuf, PathBuf) {
     let bin = root.join("bin");
     let repo = root.join("destination.git");
     std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(root.join("tmp")).unwrap();
     host_git(
         root,
         &[
@@ -286,6 +312,9 @@ fn cli(root: &Path, url: &str) -> (Owned, PathBuf, PathBuf) {
         .env("HOME", root)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_STATE_HOME", root.join("state"))
+        // A CLI killed by SIGKILL never removes its own scratch: it is made here,
+        // where the world's removal takes it, not in the host's /tmp.
+        .env("TMPDIR", root.join("tmp"))
         .env(
             "PATH",
             std::env::join_paths([
@@ -315,7 +344,8 @@ fn real_git_pack_completes_through_the_unchanged_cli_collector() {
     let (oid, pack) = source_pack(root.path());
     let server = PackServer::new(oid.clone(), pack);
     server.release(true);
-    let (mut cli, _, repo) = cli(root.path(), &server.url);
+    let (mut cli, marker, repo) = cli(root.path(), &server.url);
+    wait_git_start(root.path(), &mut cli.0, &marker);
     let status = wait_status(&mut cli.0);
     assert!(
         status.success(),
@@ -339,6 +369,9 @@ fn a_fresh_home_retains_its_helper_and_unavailable_custody_starts_no_git() {
         let server = PackServer::new(oid.clone(), pack);
         server.release(true);
         let (mut cli, marker, repo) = cli(root.path(), &server.url);
+        if !blocked {
+            wait_git_start(root.path(), &mut cli.0, &marker);
+        }
         let status = wait_status(&mut cli.0);
         assert_eq!(
             status.success(),
@@ -369,6 +402,7 @@ fn abrupt_cli_death_retires_real_git_and_index_pack_without_signalling_a_bystand
     let (oid, pack) = source_pack(root.path());
     let server = PackServer::new(oid, pack);
     let (mut cli, marker, _) = cli(root.path(), &server.url);
+    wait_git_start(root.path(), &mut cli.0, &marker);
     let mut bystander = Owned(spawnfd::command("/bin/sleep").arg("600").spawn().unwrap());
     let by = Instant::now() + HANG;
     let mut last_observed = String::new();
@@ -447,6 +481,14 @@ fn abrupt_cli_death_retires_real_git_and_index_pack_without_signalling_a_bystand
     let status = wait_status(&mut cli.0);
     use std::os::unix::process::ExitStatusExt as _;
     assert_eq!(status.signal(), Some(9));
+    let scratch = std::fs::read_dir(root.path().join("tmp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        scratch.iter().any(|name| name.starts_with("agh-git-")),
+        "the killed CLI's scratch is the world's to remove: {scratch:?}"
+    );
     let by = Instant::now() + HANG;
     while !tokens.iter().copied().all(retired) && Instant::now() < by {
         std::thread::sleep(Duration::from_millis(10));

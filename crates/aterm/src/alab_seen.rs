@@ -26,6 +26,7 @@ use aterm_db::alab::{
     view::LabView,
 };
 use aterm_secrets::client::Paths;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -36,8 +37,57 @@ const READ_EVERY: Duration = Duration::from_secs(300);
 /// How far back the history reaches into the heard archive, in seconds: the ring's two weeks.
 const HEARD_BACK_S: u64 = 14 * 86_400;
 
-/// How a journal record's Mac is shown: its machine label where its facts row binds a live
-/// machine with one, else `uuid:<first 8 hex>`.
+/// What names the journal's Macs ([`Names::mac`]): the registry's view, this Mac's own Commons
+/// uuids and the label this Mac goes by.
+pub(crate) struct Names<'a> {
+    view: &'a LabView,
+    me: BTreeSet<String>,
+    label: String,
+}
+
+impl<'a> Names<'a> {
+    /// The names `view` gives `seen`'s Macs: this Mac's own uuids are the ones its read says
+    /// ([`seen::Seen::me`]: its seat and the seats it succeeded) and each the registry binds to
+    /// this machine; it goes by its registry label, else `label` (its configured one), else
+    /// "this Mac".
+    pub(crate) fn of(
+        view: &'a LabView,
+        seen: &seen::Seen,
+        label: impl FnOnce() -> Option<String>,
+    ) -> Self {
+        let me = seen
+            .me
+            .iter()
+            .cloned()
+            .chain(
+                view.bound
+                    .iter()
+                    .filter(|(_, pk)| view.me.as_ref() == Some(*pk))
+                    .map(|(uuid, _)| uuid.clone()),
+            )
+            .collect();
+        let label = view
+            .me
+            .as_deref()
+            .and_then(|pk| view.machine_label(pk))
+            .map(str::to_owned)
+            .or_else(label)
+            .unwrap_or_else(|| "this Mac".to_owned());
+        Self { view, me, label }
+    }
+
+    /// How a journal record's Mac is shown: this Mac's own label for one of its own uuids,
+    /// whatever the registry binds it to; else as the registry names it ([`mac`]).
+    fn mac(&self, uuid: &str) -> String {
+        if self.me.contains(uuid) {
+            return self.label.clone();
+        }
+        mac(self.view, uuid)
+    }
+}
+
+/// How a journal record's Mac is shown by the registry: its machine label where its facts row
+/// binds a live machine with one, else `uuid:<first 8 hex>`.
 pub(crate) fn mac(view: &LabView, uuid: &str) -> String {
     view.bound
         .get(uuid)
@@ -52,9 +102,11 @@ fn secs(t: u64) -> i64 {
     i64::try_from(t).unwrap_or(i64::MAX)
 }
 
-/// The closed words one event carries beyond its kind: its window and figure, its reason, the
-/// other account of a switch by its lab label. Never free text: every word is the journal's.
+/// The closed words one event carries beyond its kind: its window and figure, the reset a
+/// reading or a wall names (`r=<RFC 3339>`), its reason, the other account of a switch by its
+/// lab label. Never free text: every word is the journal's.
 fn detail(view: &LabView, event: &aterm_db::alab::journal::Event) -> String {
+    use aterm_db::alab::journal::event::Kind;
     use std::fmt::Write as _;
     let mut out = String::new();
     let sep = |out: &mut String| {
@@ -68,6 +120,17 @@ fn detail(view: &LabView, event: &aterm_db::alab::journal::Event) -> String {
     if let Some(p) = event.pct_x10 {
         sep(&mut out);
         let _ = write!(out, "{}.{}%", p / 10, p % 10);
+    }
+    // A reading names its window's reset; a wall names it as the end it stands until.
+    let reset = match event.kind {
+        Kind::Quota => event.reset,
+        Kind::Wall => event.until.or(event.reset),
+        _ => None,
+    };
+    if let Some(reset) = reset {
+        sep(&mut out);
+        out.push_str("r=");
+        out.push_str(&aterm_agent::harness::usage::rfc3339_utc(secs(reset)));
     }
     if let Some(why) = &event.why {
         sep(&mut out);
@@ -88,8 +151,9 @@ fn detail(view: &LabView, event: &aterm_db::alab::journal::Event) -> String {
 }
 
 /// What the journal says, as the harness reads it: each account `seen` knows, its Macs named
-/// through `view`.
-pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen {
+/// by `names` ([`mac`]).
+pub(crate) fn harness_seen(names: &Names<'_>, seen: &seen::Seen) -> alab_seen::Seen {
+    let view = names.view;
     let mut history_by_pk: std::collections::BTreeMap<&str, Vec<&seen::Logged>> =
         std::collections::BTreeMap::new();
     for logged in seen.events.iter().rev() {
@@ -110,7 +174,7 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
     let mut accounts = std::collections::BTreeMap::new();
     for pk in seen.accounts() {
         let last_use = seen.last_use.get(&pk).map(|(uuid, t)| LastUse {
-            by: mac(view, uuid),
+            by: names.mac(uuid),
             t: secs(*t),
         });
         let mut signed_in: Vec<SignedIn> = seen
@@ -119,7 +183,7 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
             .into_iter()
             .flatten()
             .map(|(uuid, s)| SignedIn {
-                on: mac(view, uuid),
+                on: names.mac(uuid),
                 state: s.state.to_owned(),
                 t: secs(s.t),
             })
@@ -129,8 +193,8 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
             .quota(&pk)
             .into_iter()
             .map(|q| {
-                let (figure, read) = match q.usage {
-                    None => (None, None),
+                let (figure, read, reader) = match q.usage {
+                    None => (None, None, None),
                     Some(Usage::Current {
                         pct_x10,
                         reset,
@@ -142,11 +206,13 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
                             pct_x10,
                             reset: reset.map(secs),
                         }),
-                        Some((secs(read), mac(view, &by), src)),
+                        Some((secs(read), names.mac(&by), src)),
+                        Some(by),
                     ),
                     Some(Usage::ResetUnread { reset, read, by }) => (
                         Some(Figure::ResetUnread { reset: secs(reset) }),
-                        Some((secs(read), mac(view, &by), "reading".to_owned())),
+                        Some((secs(read), names.mac(&by), "reading".to_owned())),
+                        Some(by),
                     ),
                 };
                 WindowSeen {
@@ -154,7 +220,9 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
                     sub: (q.pk != pk).then_some(q.pk),
                     figure,
                     read,
-                    wall_until: q.wall.map(|w| w.until.map(secs)),
+                    reader,
+                    wall_until: q.wall.as_ref().map(|w| w.until.map(secs)),
+                    wall_by: q.wall.map(|w| (secs(w.t), names.mac(&w.uuid), w.uuid)),
                 }
             })
             .collect();
@@ -165,7 +233,7 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
             .rev()
             .map(|logged| Line {
                 t: secs(logged.event.t),
-                by: mac(view, &logged.uuid),
+                by: names.mac(&logged.uuid),
                 kind: logged.event.kind.word().to_owned(),
                 cli: logged.event.cli.as_str().to_owned(),
                 detail: detail(view, &logged.event),
@@ -189,6 +257,7 @@ pub(crate) fn harness_seen(view: &LabView, seen: &seen::Seen) -> alab_seen::Seen
     alab_seen::Seen {
         accounts,
         at: secs(seen.now),
+        me: names.me.clone(),
     }
 }
 
@@ -246,6 +315,9 @@ struct Cache {
     /// The last view of the registry projected here, and the inventory it was projected from.
     lab: Mutex<Option<(Arc<LabView>, Inventory)>>,
     reader: OnceLock<()>,
+    /// The label this Mac is configured to go by, where the registry names it none
+    /// ([`Names::of`]).
+    label: fn() -> Option<String>,
 }
 
 impl Cache {
@@ -262,8 +334,33 @@ impl Cache {
     /// partial history holds the registry ([`lab_offer`]), and a lab turned off, or none, drops
     /// it.
     fn read_into(&self, fleet: &aterm_db::fleet::Folder) {
+        self.read_with(
+            fleet,
+            aterm_time::unix_millis().unwrap_or(0),
+            |held| Registry::at(self.paths.clone()).lab(&self.config, held),
+            |now| {
+                let heard = self
+                    .spool
+                    .as_ref()
+                    .map(|spool| (spool, now.saturating_sub(HEARD_BACK_S)));
+                seen::read(&self.paths, heard, now)
+            },
+        );
+    }
+
+    /// [`Self::read_into`] at `now_ms` (Unix milliseconds), the registry read by `registry`
+    /// (given the inventory held) and the journal window by `journal` (given now, in seconds).
+    /// The journal is read whatever the registry read gave: a registry that cannot be read is
+    /// held for the fleet tables, and the journal's Macs are named by the projection held, by
+    /// uuid where none is, this Mac by its own uuids ([`Names`]).
+    fn read_with(
+        &self,
+        fleet: &aterm_db::fleet::Folder,
+        now_ms: u64,
+        registry: impl FnOnce(Option<Inventory>) -> aterm_db::Result<Option<LabRead>>,
+        journal: impl FnOnce(u64) -> aterm_db::Result<Option<seen::Seen>>,
+    ) {
         use aterm_db::fleet::{HELD_POLICY, HELD_UNREADABLE, Reading};
-        let now_ms = aterm_time::unix_millis().unwrap_or(0);
         match crate::alab_view::roster_policy(&self.config) {
             crate::alab_view::LocalRosterPolicy::Enabled => {}
             crate::alab_view::LocalRosterPolicy::Unavailable => {
@@ -293,27 +390,21 @@ impl Cache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let held = last.as_ref().map(|(_, inventory)| *inventory);
-        let read = match Registry::at(self.paths.clone()).lab(&self.config, held) {
-            Ok(read) => read,
+        let (view, lab) = match registry(held) {
+            Ok(read) => lab_offer(read, &mut last),
             Err(why) => {
                 aterm_log::debug!("journal view: {why}");
-                fleet.offer_lab(
-                    Reading::Held(HELD_UNREADABLE),
-                    Reading::Held(HELD_UNREADABLE),
-                    now_ms,
-                );
-                return;
+                let view = last
+                    .as_ref()
+                    .map_or_else(Arc::default, |(view, _)| Arc::clone(view));
+                (view, Reading::Held(HELD_UNREADABLE))
             }
         };
-        let (view, lab) = lab_offer(read, &mut last);
         drop(last);
-        let heard = self
-            .spool
-            .as_ref()
-            .map(|spool| (spool, now.saturating_sub(HEARD_BACK_S)));
-        let journal = match seen::read(&self.paths, heard, now) {
+        let journal = match journal(now) {
             Ok(Some(seen)) => {
-                let fresh = Arc::new(harness_seen(&view, &seen));
+                let names = Names::of(&view, &seen, self.label);
+                let fresh = Arc::new(harness_seen(&names, &seen));
                 *self
                     .held
                     .lock()
@@ -392,6 +483,7 @@ pub(crate) fn install() {
         held: Mutex::new(None),
         lab: Mutex::new(None),
         reader: OnceLock::new(),
+        label: aterm_agent::survey_facts::machine_label,
     });
     let _ = alab_seen::install(Box::new(cache));
     // The fleet tables read the registry and the journal through this cache's reads: its

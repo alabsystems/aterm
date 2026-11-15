@@ -1221,8 +1221,7 @@ mod live {
         for (key, value) in env {
             cmd.env(key, value);
         }
-        let out = cmd
-            .output()
+        let out = crate::perf::driver::compiler_output(&mut cmd)
             .map_err(|e| format!("could not run targo: {e}"))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -1417,11 +1416,9 @@ mod live {
             }
             eprintln!("  debug fixture plan: {}", plan.summary());
             eprintln!("  $ {}", targo.display("build", &args));
-            let out = targo
-                .command("build")?
-                .args(args)
-                .stderr(Stdio::inherit())
-                .output()
+            let mut build_command = targo.command("build")?;
+            build_command.args(args).stderr(Stdio::inherit());
+            let out = crate::perf::driver::compiler_output(&mut build_command)
                 .map_err(|e| format!("could not build debug fixture: {e}"))?;
             if !out.status.success() {
                 return Err(format!("debug fixture build exited {}", out.status));

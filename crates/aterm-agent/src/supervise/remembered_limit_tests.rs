@@ -3,9 +3,8 @@
 
 use super::*;
 use crate::supervise::approvals::{Outcome, RULE_WALL_WAIT, RULE_WALL_WAIT_END, Row};
-use crate::supervise::policy::turn_end::{
-    Conversation, RULE_CONTINUE, RULE_LIMIT_RESUME, decide_turn_end,
-};
+use crate::supervise::policy::turn_end::{Conversation, RULE_LIMIT_RESUME, decide_turn_end};
+use alab_policy::words::RULE_CONTINUE;
 
 fn with_shell(mut rows: Vec<String>) -> Vec<String> {
     let done = rows
@@ -97,7 +96,7 @@ fn a_remembered_bucket_obeys_the_newest_model_choice_under_background_work() {
         let armed = screen(WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
         let (initial, action) = fold(&mut s, armed.clone(), &opts);
         assert!(
-            initial.wall == Some(aterm_phase::WallKind::ModelBucket { consent: false })
+            initial.wall == Some(alab_policy::vocab::WallKind::ModelBucket { consent: false })
                 && initial.reset_at.is_some()
                 && s.turn_end.waits_on_named_reset(),
             "{chosen}: the measured bucket must seed a named wait: {initial:#?}\n{action:?}"
@@ -1711,7 +1710,7 @@ fn try_then(
     then: &[String],
 ) -> Tried {
     let wall = armed_conversation_b();
-    let bucket = aterm_phase::WallKind::UsageSession;
+    let bucket = alab_policy::vocab::WallKind::UsageSession;
     let (dir, ledger) = ledger_at(tag);
     let mut m = Mock::new(vec![wall.clone()]);
     let mut s = session(&mut m, Some("@s-1".to_owned()));

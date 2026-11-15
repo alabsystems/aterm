@@ -12,6 +12,7 @@ use super::policy::turn_end::{
     Conversation, Kept, LandBooks, LimitTry, OffStood, Replies, WallPass,
 };
 use crate::harness::profile::AccountKey;
+use aterm_phase::ResetDrawn;
 
 /// How much of a command a row keeps.
 pub const COMMAND_BYTES: usize = 4096;
@@ -593,7 +594,7 @@ fn held_rows(rows: &mut dyn Iterator<Item = String>) -> Option<(Vec<String>, usi
             if LandWalk::reads(&row)
                 || SwitchWalk::reads(&row)
                 || row.contains(RULE_EARLIER_BOOKS)
-                || row.contains(super::policy::turn_end::RULE_GO_AHEAD_HOUR)
+                || row.contains(alab_policy::words::RULE_GO_AHEAD_HOUR)
             {
                 older_bytes = older_bytes.checked_add(row.len())?;
                 older.push(row);
@@ -1207,7 +1208,7 @@ pub fn typed_at_in(body: &str, sid: Option<&str>) -> Vec<i64> {
 }
 
 /// THE PERSON'S HOUR A LOOP BEFORE THIS ONE BOOKED for `sid`
-/// ([`super::policy::turn_end::RULE_GO_AHEAD_HOUR`]): the latest start (unix ms) its rows name.
+/// ([`alab_policy::words::RULE_GO_AHEAD_HOUR`]): the latest start (unix ms) its rows name.
 #[must_use]
 pub fn go_ahead_hour_in(body: &str, sid: Option<&str>) -> Option<i64> {
     let want = sid.map(|s| s.trim_start_matches('@'));
@@ -1220,7 +1221,7 @@ pub fn go_ahead_hour_in(body: &str, sid: Option<&str>) -> Option<i64> {
 /// A row's session and signed start, shared by recovery and cut retention so both choose the
 /// same hour. An invalid rule, JSON body or command contributes no start.
 fn go_ahead_hour_row(line: &str) -> Option<(Option<String>, i64)> {
-    use super::policy::turn_end::RULE_GO_AHEAD_HOUR;
+    use alab_policy::words::RULE_GO_AHEAD_HOUR;
     if !line.contains(RULE_GO_AHEAD_HOUR) {
         return None;
     }
@@ -1273,6 +1274,19 @@ pub const LEFT_AT_WALL_REASON: &str =
 /// the tab's books read before it ([`left_after_work_in`]), a program started fresh in a tab
 /// another ran included.
 pub const LEFT_OPENS: &str = " (the session's opening message)";
+
+/// What a `LEFT` row's reason says, before [`LEFT_OPENS`], where the exchange was judged to open
+/// the session only because the host's read of the agent had not answered (LS-15): a taskless
+/// screen within a resume's grace was undecided, and the exchange was left to the person rather
+/// than carried on as the resumed session's for want of a read.
+pub const LEFT_UNREAD: &str = " (the host's read of the agent had not answered)";
+
+/// What closes the `LEFT` row a loop writes again for an exchange it left with [`LEFT_UNREAD`]
+/// once a read that answered named the resumed session (LS-15): the exchange was that session's,
+/// not its opening message, so this row, the exchange's last, does not close with [`LEFT_OPENS`]
+/// and [`left_after_work_in`] reads it by the books before it.
+pub const LEFT_TAKEN_BACK: &str =
+    " (taken back: the host's read that answered named the resumed session)";
 
 /// A `LEFT` row's reason: `reason`, closed by [`LEFT_OPENS`] where the exchange `opens` the
 /// session.
@@ -1355,7 +1369,7 @@ pub fn words_lead(text: &str) -> u64 {
 
 #[must_use]
 pub fn open_left_in(body: &str, sid: Option<&str>) -> Option<String> {
-    use super::policy::turn_end::RULE_LEFT;
+    use alab_policy::words::RULE_LEFT;
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut open: Option<String> = None;
     for line in act_lines(body) {
@@ -1384,7 +1398,7 @@ pub fn open_left_in(body: &str, sid: Option<&str>) -> Option<String> {
 }
 
 /// Whether the last person's exchange left to them for `sid` (a `skipped` row under
-/// [`RULE_LEFT`](super::policy::turn_end::RULE_LEFT)) was left after the session worked. A row
+/// [`RULE_LEFT`](alab_policy::words::RULE_LEFT)) was left after the session worked. A row
 /// whose reason closes with [`LEFT_OPENS`] was left as the session's opening message, so never;
 /// any other, by the books before it: an act a loop typed (a fact line, an accounts probe, an
 /// account move or a sign-in's done is none, as [`typed_at_in`] reads them), or a point it
@@ -1394,7 +1408,8 @@ pub fn open_left_in(body: &str, sid: Option<&str>) -> Option<String> {
 #[must_use]
 pub fn left_after_work_in(body: &str, sid: Option<&str>) -> bool {
     use super::policy::login::RULE_LOGIN_DONE;
-    use super::policy::turn_end::{RULE_ACCOUNT, RULE_LEFT, RULE_USAGE_PROBE};
+    use super::policy::turn_end::{RULE_ACCOUNT, RULE_USAGE_PROBE};
+    use alab_policy::words::RULE_LEFT;
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let (mut typed, mut first_point, mut after_work) = (false, None::<u64>, false);
     for line in act_lines(body) {
@@ -1574,9 +1589,9 @@ pub fn reset_owed(body: &str, sid: Option<&str>) -> Option<ResetOpen> {
         ",\"rule_id\":{},",
         json_str(super::policy::approval::RULE_LIMIT_RESET)
     );
-    let yeses: Vec<String> = aterm_phase::ResetKind::ALL
+    let yeses: Vec<String> = alab_policy::vocab::ResetKind::ALL
         .into_iter()
-        .map(aterm_phase::ResetKind::yes)
+        .map(alab_policy::vocab::ResetKind::yes)
         .chain([RESET_YES_2_1_287.to_string()])
         .map(|yes| format!(",\"command\":{},", json_str(&yes)))
         .collect();
@@ -1770,7 +1785,7 @@ pub fn usage_attempt_taken_in(
                     if let Some(row) = text("reason").and_then(wall_wait_of).filter(|r| r.older) {
                         let kind = wall_kind(row.kind, row.message);
                         let bucket =
-                            matches!(kind, Some(aterm_phase::WallKind::ModelBucket { .. }));
+                            matches!(kind, Some(alab_policy::vocab::WallKind::ModelBucket { .. }));
                         standing = Some(LimitTry {
                             bucket,
                             in_place: false,
@@ -1911,10 +1926,8 @@ pub fn check_point_last_in(body: &str, sid: Option<&str>) -> Option<&'static str
 }
 
 fn walk_done_check(body: &str, sid: Option<&str>) -> (Option<CheckOwed>, u32) {
-    use super::policy::turn_end::{
-        RULE_COMPACT, RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED, RULE_USAGE_PROBE,
-        is_wall_retry,
-    };
+    use super::policy::turn_end::{RULE_COMPACT, RULE_USAGE_PROBE, is_wall_retry};
+    use alab_policy::words::{RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED};
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut owed: Option<CheckOwed> = None;
     let mut judged = 0_u32;
@@ -2061,7 +2074,8 @@ fn walk_done_check(body: &str, sid: Option<&str>) -> (Option<CheckOwed>, u32) {
 }
 
 fn delivers_check(command: Option<&str>) -> bool {
-    use super::policy::turn_end::{DONE_CHECK, RETIRED_DONE_CHECKS, is_challenge_text};
+    use super::policy::turn_end::is_challenge_text;
+    use alab_policy::words::{DONE_CHECK, RETIRED_DONE_CHECKS};
     command.is_some_and(|c| {
         std::iter::once(DONE_CHECK)
             .chain(RETIRED_DONE_CHECKS)
@@ -2071,9 +2085,12 @@ fn delivers_check(command: Option<&str>) -> bool {
 }
 
 pub(crate) fn delivers_land(command: Option<&str>) -> bool {
-    use super::policy::turn_end::{
-        LAND, LAND_ANSWER, LAND_CHECK_HEAD, LAND_CONTRADICTED_HEAD, LAND_NUDGE,
-        RETIRED_LAND_ANSWERS, RETIRED_LAND_NUDGES, RETIRED_LANDS, past_switch_why,
+    use alab_policy::{
+        land_check::LAND_CHECK_HEAD,
+        words::{
+            LAND, LAND_ANSWER, LAND_CONTRADICTED_HEAD, LAND_NUDGE, RETIRED_LAND_ANSWERS,
+            RETIRED_LAND_NUDGES, RETIRED_LANDS, past_switch_why,
+        },
     };
     command.is_some_and(|c| {
         let c = past_switch_why(c);
@@ -2095,7 +2112,7 @@ pub(crate) fn delivers_land(command: Option<&str>) -> bool {
 
 /// Whether `command` opens on Land's instruction, now's or a retired build's (no nudge, no answer).
 fn gives_land(command: Option<&str>) -> bool {
-    use super::policy::turn_end::{LAND, RETIRED_LANDS, past_switch_why};
+    use alab_policy::words::{LAND, RETIRED_LANDS, past_switch_why};
     command.is_some_and(|c| {
         let c = past_switch_why(c);
         let c = c.as_ref();
@@ -2178,7 +2195,10 @@ pub fn land_episode_in(body: &str, sid: Option<&str>) -> Option<LandSeed> {
 }
 
 fn land_rule(rule: &str) -> Option<&'static str> {
-    use super::policy::turn_end::{RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK, RULE_LAND_NUDGE};
+    use alab_policy::{
+        land_check::RULE_LAND_CHECK,
+        words::{RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE},
+    };
     [
         RULE_LAND,
         RULE_LAND_NUDGE,
@@ -2209,9 +2229,10 @@ impl LandWalk {
 
     fn read(&mut self, v: &aterm_json::Value) {
         use super::policy::turn_end::{
-            HoldStart, RULE_COMPACT, RULE_LAND, RULE_LAND_NUDGE, RULE_USAGE_PROBE, is_cleared_line,
-            is_continue_rule, is_land_rule, is_wall_retry,
+            HoldStart, RULE_COMPACT, RULE_USAGE_PROBE, is_cleared_line, is_continue_rule,
+            is_wall_retry,
         };
+        use alab_policy::words::{RULE_LAND, RULE_LAND_NUDGE, is_land_rule};
         let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
         let rule = text("rule_id").unwrap_or("");
         match text("decision") {
@@ -2285,7 +2306,7 @@ impl LandWalk {
                     && let Some(e) = self.ep.as_mut()
                 {
                     e.checked = land_rule(rule).map_or(was_checked, |r| {
-                        r == super::policy::turn_end::RULE_LAND_CHECK
+                        r == alab_policy::land_check::RULE_LAND_CHECK
                     });
                     e.owed = if let Some(rule) = land_rule(rule) {
                         Some(rule)
@@ -2359,8 +2380,8 @@ pub fn land_episode(path: &Path, sid: Option<&str>) -> Option<LandSeed> {
     )
 }
 
-const fn of_try(kind: Option<aterm_phase::WallKind>, limit: LimitTry) -> bool {
-    use aterm_phase::WallKind;
+const fn of_try(kind: Option<alab_policy::vocab::WallKind>, limit: LimitTry) -> bool {
+    use alab_policy::vocab::WallKind;
     match kind {
         Some(WallKind::ModelBucket { .. }) => limit.bucket,
         Some(WallKind::UsageSession | WallKind::UsageWeekly | WallKind::Spend) => !limit.bucket,
@@ -2546,7 +2567,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
         let checks = text("reason").and_then(checks_note_of).unwrap_or(0);
         let land = text("reason").and_then(land_books_of).unwrap_or_default();
         let switch_spent =
-            if !point && text("command").is_some_and(super::policy::turn_end::is_switch_ask) {
+            if !point && text("command").is_some_and(alab_policy::words::is_switch_ask) {
                 said.last().map(|k| k.mark)
             } else {
                 last.as_ref().and_then(|l| l.switch_spent)
@@ -2596,19 +2617,19 @@ pub fn short_streak_of(reason: &str) -> Option<u32> {
 /// work was typed (unix ms, oldest first) and the streak its row names
 /// ([`background_carry_reason`]), since its books last started again on a row, so a loop after
 /// the ones that typed them replays their ladder
-/// ([`super::policy::cruise_carry::BackgroundCarries::replayed`]). A carry is any act typed whose
+/// ([`alab_policy::cruise_carry::BackgroundCarries::replayed`]). A carry is any act typed whose
 /// row names its streak (the go-ahead or the continuation owed typed in the carry's place at a
-/// break goes on its ladder), or a [`RULE_BACKGROUND`](super::policy::cruise_carry::RULE_BACKGROUND) row written before rows
+/// break goes on its ladder), or a [`RULE_BACKGROUND`](alab_policy::cruise_carry::RULE_BACKGROUND) row written before rows
 /// named it (no streak). The run ends, newest first, at an act of another rule typed, a point
 /// judged, the books started again in memory
-/// ([`RULE_BACKGROUND_RESET`](super::policy::cruise_carry::RULE_BACKGROUND_RESET)), a person's own
+/// ([`RULE_BACKGROUND_RESET`](alab_policy::cruise_carry::RULE_BACKGROUND_RESET)), a person's own
 /// exchange left to them, the session lifted off Off, or a carry that names no time. A turn read
 /// running after a point ([`RULE_TURN_RAN`]) starts no books: the point's own row ends the run,
 /// and a loop's first live read writes one with no point before it. Empty with none since.
 #[must_use]
 pub fn background_carries_in(body: &str, sid: Option<&str>) -> Vec<(i64, Option<u32>)> {
-    use super::policy::cruise_carry::{RULE_BACKGROUND, RULE_BACKGROUND_RESET};
-    use super::policy::turn_end::RULE_LEFT;
+    use alab_policy::cruise_carry::{RULE_BACKGROUND, RULE_BACKGROUND_RESET};
+    use alab_policy::words::RULE_LEFT;
     let want = sid.map(|s| s.trim_start_matches('@'));
     let mut run = Vec::new();
     for line in act_lines(body).rev() {
@@ -2639,6 +2660,35 @@ pub fn background_carries_in(body: &str, sid: Option<&str>) -> Vec<(i64, Option<
     run
 }
 
+/// THE GOAL RESTORE THE BOOKS HOLD LAST: when `sid`'s newest
+/// [`RULE_GOAL_RESTORE`](super::policy::goal_restore::RULE_GOAL_RESTORE) row typed was written
+/// (unix ms), the clear it answered and its rung, as its reason names them
+/// ([`super::policy::goal_restore::typed_reason`]); `None` with none, or with none that names them.
+#[must_use]
+pub fn goal_restore_in(body: &str, sid: Option<&str>) -> Option<(i64, String, u32)> {
+    use super::policy::goal_restore::{RULE_GOAL_RESTORE, restore_of};
+    let want = sid.map(|s| s.trim_start_matches('@'));
+    act_lines(body).rev().find_map(|line| {
+        if !line.contains(RULE_GOAL_RESTORE) {
+            return None;
+        }
+        let v = aterm_json::from_str::<aterm_json::Value>(line).ok()?;
+        let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+        if text("sid") != want
+            || text("rule_id") != Some(RULE_GOAL_RESTORE)
+            || text("decision") != Some(Outcome::Typed.word())
+        {
+            return None;
+        }
+        let (clear, rung) = restore_of(text("reason")?)?;
+        Some((
+            v.get("ts").and_then(aterm_json::Value::as_i64)?,
+            clear,
+            rung,
+        ))
+    })
+}
+
 /// The note a carry's row names its streak in ([`background_carry_reason`]).
 const CARRY_STREAK: &str = "carries in a row";
 
@@ -2660,7 +2710,8 @@ fn carry_streak_of(reason: &str) -> Option<u32> {
 
 #[must_use]
 pub fn carry_ended_in(body: &str, sid: Option<&str>) -> bool {
-    use super::policy::turn_end::{RULE_ACCOUNT, RULE_LEFT, RULE_USAGE_PROBE};
+    use super::policy::turn_end::{RULE_ACCOUNT, RULE_USAGE_PROBE};
+    use alab_policy::words::RULE_LEFT;
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let esc = format!("({PERSONS_ESC})");
     let (mut ended, mut judged) = (false, false);
@@ -2999,7 +3050,7 @@ fn replies_note_of(reason: &str) -> Option<(Replies, Option<i64>)> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryMark {
-    pub kind: aterm_phase::WallKind,
+    pub kind: alab_policy::vocab::WallKind,
     pub attempts: usize,
     pub ups: usize,
     pub since_ms: i64,
@@ -3015,17 +3066,17 @@ pub struct RetryMark {
 
 const RETRY_LADDER: &str = "the wall's retries";
 
-const API_CAUSES: [(aterm_phase::ApiCause, &str); 6] = [
-    (aterm_phase::ApiCause::Server, "server"),
-    (aterm_phase::ApiCause::Unreachable, "unreachable"),
-    (aterm_phase::ApiCause::CutOff, "cut-off"),
-    (aterm_phase::ApiCause::Config, "config"),
-    (aterm_phase::ApiCause::Request, "request"),
-    (aterm_phase::ApiCause::Overlong, "overlong"),
+const API_CAUSES: [(alab_policy::vocab::ApiCause, &str); 6] = [
+    (alab_policy::vocab::ApiCause::Server, "server"),
+    (alab_policy::vocab::ApiCause::Unreachable, "unreachable"),
+    (alab_policy::vocab::ApiCause::CutOff, "cut-off"),
+    (alab_policy::vocab::ApiCause::Config, "config"),
+    (alab_policy::vocab::ApiCause::Request, "request"),
+    (alab_policy::vocab::ApiCause::Overlong, "overlong"),
 ];
 
 fn retry_mark(retry: Option<RetryMark>) -> String {
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let Some(r) = retry else {
         return String::new();
     };
@@ -3058,7 +3109,7 @@ fn retry_mark(retry: Option<RetryMark>) -> String {
 }
 
 fn retry_mark_of(reason: &str) -> Option<RetryMark> {
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let (_, rest) = reason.split_once(&format!("({RETRY_LADDER}: "))?;
     let fields = rest.split(')').next()?;
     let field = |name: &str| {
@@ -3509,7 +3560,7 @@ fn tap_reset_of(reason: &str) -> Option<(i64, i64)> {
 /// notice printed (`-` for none), as the usage tap keys a wall and a [`RULE_WALL_WAIT`] row
 /// names it.
 #[must_use]
-pub fn wall_reset_key(kind: aterm_phase::WallKind, reset: Option<&str>) -> String {
+pub fn wall_reset_key(kind: alab_policy::vocab::WallKind, reset: Option<&str>) -> String {
     format!("{}|{}", kind.name(), reset.unwrap_or("-"))
 }
 
@@ -3673,7 +3724,7 @@ pub const WALL_LEFT_NO_TASK: &str =
 pub fn wall_wait_reason(
     reset_unix: Option<i64>,
     reset: Option<&str>,
-    kind: aterm_phase::WallKind,
+    kind: alab_policy::vocab::WallKind,
     message: &str,
 ) -> String {
     wall_wait_reason_tapped(reset_unix, None, reset, kind, message)
@@ -3691,7 +3742,7 @@ pub fn wall_wait_reason_tapped(
     reset_unix: Option<i64>,
     tap_unix: Option<i64>,
     reset: Option<&str>,
-    kind: aterm_phase::WallKind,
+    kind: alab_policy::vocab::WallKind,
     message: &str,
 ) -> String {
     wall_wait_reason_of(reset_unix, tap_unix, None, reset, kind, message)
@@ -3708,7 +3759,7 @@ pub fn wall_wait_reason_of(
     tap_unix: Option<i64>,
     login: Option<AccountKey>,
     reset: Option<&str>,
-    kind: aterm_phase::WallKind,
+    kind: alab_policy::vocab::WallKind,
     message: &str,
 ) -> String {
     format!(
@@ -3737,8 +3788,8 @@ pub fn login_moved_reason(from: AccountKey, to: AccountKey) -> String {
     )
 }
 
-fn kind_named(name: &str) -> Option<aterm_phase::WallKind> {
-    use aterm_phase::WallKind;
+fn kind_named(name: &str) -> Option<alab_policy::vocab::WallKind> {
+    use alab_policy::vocab::WallKind;
     [
         WallKind::UsageSession,
         WallKind::UsageWeekly,
@@ -3751,9 +3802,9 @@ fn kind_named(name: &str) -> Option<aterm_phase::WallKind> {
 
 #[must_use]
 pub fn wall_kind(
-    named: Option<aterm_phase::WallKind>,
+    named: Option<alab_policy::vocab::WallKind>,
     message: &str,
-) -> Option<aterm_phase::WallKind> {
+) -> Option<alab_policy::vocab::WallKind> {
     let words = super::run::words_kind(message);
     match named {
         Some(kind) => Some(
@@ -3777,7 +3828,7 @@ pub struct OpenWall {
     pub tap_unix: Option<i64>,
     /// The account the limit was read under ([`wall_wait_reason_of`]); `None` where it was not read, and in an older build's row.
     pub login: Option<AccountKey>,
-    pub kind: Option<aterm_phase::WallKind>,
+    pub kind: Option<alab_policy::vocab::WallKind>,
     pub judged_ms: Option<i64>,
     pub retry_ms: Option<i64>,
 }
@@ -3890,7 +3941,7 @@ struct WallRow<'a> {
     tap_unix: Option<i64>,
     login: Option<AccountKey>,
     reset: Option<String>,
-    kind: Option<aterm_phase::WallKind>,
+    kind: Option<alab_policy::vocab::WallKind>,
     older: bool,
     message: &'a str,
 }

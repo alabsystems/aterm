@@ -779,11 +779,312 @@ fn a_refused_refresh_rejects_its_grant_and_leaves_the_catalogue_current() {
     }
 }
 
+/// What is on record of why `label`'s login was refused: the reason in its row's record, the
+/// row's refusal read with that record, and the same read with no record given.
+#[cfg(unix)]
+fn recorded_refusal(
+    env: &Env,
+    label: &str,
+) -> (
+    Option<codex_app_login::RefusalReason>,
+    codex_app_login::RefusalStanding,
+    codex_app_login::RefusalStanding,
+) {
+    let store = env
+        .accounts_store_for(crate::harness::accounts::Cli::Codex)
+        .unwrap();
+    let roster = env
+        .accounts_roster_for(crate::harness::accounts::Cli::Codex)
+        .unwrap();
+    let records = store.read_account_records(Some(&roster), env.now).unwrap();
+    let row = records.roster.row(label).unwrap();
+    let default = store.default_login_home();
+    (
+        records.state.account(label).auth_refusal,
+        codex_app_login::row_refusal(
+            row,
+            store.custody_record(&records.state, row),
+            default.as_deref(),
+            env.now,
+        ),
+        codex_app_login::row_refusal(row, None, default.as_deref(), env.now),
+    )
+}
+
+/// NATIVE CUSTODY KEEPS WHY ITS SETTLED REFUSAL WAS REFUSED, ON THE ROW: once a refused refresh
+/// of a custody grant outlives the rotation-publication window, the settlement that signs the
+/// row out records the answer's closed code word beside that sign-out, and the row's refusal
+/// reads settled for that reason under the digest of the refresh token the grant's login file
+/// holds. Only an expired token ends ordinarily. CONTROLS: before the window nothing is on
+/// record and the row stands unknown; read with no row record it stands unknown; `state.json`
+/// holds the code word and none of the answer's text; a second settlement changes nothing; a
+/// sign-in clears the reason; and a login file replaced after the settlement stands unknown
+/// under the reason still on record.
+#[cfg(unix)]
+#[test]
+fn a_settled_native_refusal_keeps_its_reason_on_the_row() {
+    use codex_app_login::{RefusalReason, RefusalStanding};
+    let cases: [(&str, &[u8], RefusalReason, bool); 3] = [
+        (
+            "expired",
+            br#"{"error":{"code":"refresh_token_expired","message":"private-answer-text"}}"#,
+            RefusalReason::Expired,
+            false,
+        ),
+        (
+            "invalidated",
+            br#"{"error":{"code":"refresh_token_invalidated","message":"private-answer-text"}}"#,
+            RefusalReason::Invalidated,
+            true,
+        ),
+        (
+            "reused",
+            br#"{"error":{"code":"refresh_token_reused","message":"private-answer-text"}}"#,
+            RefusalReason::Reused,
+            false,
+        ),
+    ];
+    for (name, body, want, replace_after) in cases {
+        let fixture =
+            crate::harness::codex_enrollment::NativeRowRecoveryFixture::new(&"b".repeat(64));
+        fixture.retire_originals().unwrap();
+        let applied_a = fixture.publish_first().unwrap();
+        let env = fixture.env();
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let (work, _) = crate::harness::codex_enrollment::owned_work(
+            fixture.requests()[1].clone(),
+            scope.clone(),
+        );
+        fixture.run_recovery(work).unwrap();
+        let store = env
+            .accounts_store_for(crate::harness::accounts::Cli::Codex)
+            .unwrap();
+        let (logins, warning) = store.load_logins(env.now).unwrap();
+        assert!(warning.is_none());
+        let a = logins
+            .enrollment
+            .published_grant(&fixture.requests()[0].label, applied_a.generation.unwrap())
+            .unwrap();
+        let label = a.request.label.clone();
+        let auth_directory = logins
+            .enrollment
+            .catalogue_staging(&a.request)
+            .unwrap()
+            .directory;
+        assert!(
+            !codex_app_login::legacy_file_reader_allowed(&auth_directory.join("auth.json")),
+            "CONTROL {name}: the grant's login is in aterm's own custody"
+        );
+        let digest = codex_app_login::owned_refresh_token_digest(
+            &std::fs::read(auth_directory.join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        inject_lineage_answer(
+            env,
+            &a,
+            &scope,
+            Some(aterm_uds::rand::hex_token::<16>().unwrap()),
+            (401, body),
+        );
+        assert!(
+            reconcile_retained(env, &a, &scope).is_err(),
+            "CONTROL {name}: the refusal is not settled yet"
+        );
+        assert_eq!(
+            recorded_refusal(env, &label),
+            (None, RefusalStanding::Unknown, RefusalStanding::Unknown),
+            "CONTROL {name}: nothing is on record before the publication window ends"
+        );
+
+        let mut later = env.clone();
+        later.now = later
+            .now
+            .saturating_add(i64::try_from(codex_app_login::ROTATION_HANG.as_secs()).unwrap());
+        let settled = RefusalStanding::Settled {
+            reason: want,
+            digest: digest.clone(),
+        };
+        for pass in ["the settlement", "a second settlement"] {
+            reconcile_retained(&later, &a, &scope)
+                .unwrap_or_else(|why| panic!("{name}: {pass}: {why:?}"));
+            assert_eq!(
+                recorded_auth(&later, &label),
+                crate::harness::accounts::Auth::SignedOut,
+                "{name}: {pass}"
+            );
+            assert_eq!(
+                recorded_refusal(&later, &label),
+                (Some(want), settled.clone(), RefusalStanding::Unknown),
+                "{name}: {pass}"
+            );
+        }
+        assert_eq!(
+            want.ends_ordinarily(),
+            want == RefusalReason::Expired,
+            "{name}: only an expired token ends ordinarily"
+        );
+        let state = std::fs::read_to_string(store.state_file()).unwrap();
+        assert!(
+            state.contains(&format!(r#""auth_refusal":"{}""#, want.code())),
+            "{name}: the code word is what state.json keeps"
+        );
+        assert!(
+            !state.contains("private-answer-text"),
+            "{name}: none of the answer is kept"
+        );
+
+        if replace_after {
+            replace_canonical_refresh(&auth_directory, "replacement-refresh-token");
+            assert_eq!(
+                recorded_refusal(&later, &label),
+                (
+                    Some(want),
+                    RefusalStanding::Unknown,
+                    RefusalStanding::Unknown
+                ),
+                "{name}: the record is of the login it was made in, not the one there now"
+            );
+        } else {
+            later.now += 1;
+            record_contextual_auth(
+                &later,
+                &label,
+                crate::harness::accounts::Auth::Ok,
+                later.now,
+            );
+            assert_eq!(
+                recorded_refusal(&later, &label),
+                (None, RefusalStanding::Unknown, RefusalStanding::Unknown),
+                "{name}: a sign-in clears the reason"
+            );
+        }
+    }
+}
+
+/// A SETTLED REFUSAL IS RECORDED ONLY FOR THE TOKEN THAT WAS REFUSED: the settlement signs out,
+/// with its reason, the login whose refresh token is the one the grant's witness names as
+/// refused. A program that takes none of aterm's locks can replace the login file after the
+/// grant's admission compared it; the settlement then writes nothing, so no reason ever stands
+/// for a token nobody refused. CONTROL: with the file left as admitted, the same call records
+/// the sign-out and the reason under the refused token's digest.
+#[cfg(unix)]
+#[test]
+fn a_settled_refusal_is_recorded_only_for_the_token_that_was_refused() {
+    use codex_app_login::{RefusalReason, RefusalStanding};
+    for replaced in [false, true] {
+        let fixture =
+            crate::harness::codex_enrollment::NativeRowRecoveryFixture::new(&"b".repeat(64));
+        fixture.retire_originals().unwrap();
+        let applied_a = fixture.publish_first().unwrap();
+        let env = fixture.env();
+        let lifetime = crate::harness::account_work::Lifetime::default();
+        let scope = lifetime.enter().unwrap();
+        let (work, _) = crate::harness::codex_enrollment::owned_work(
+            fixture.requests()[1].clone(),
+            scope.clone(),
+        );
+        fixture.run_recovery(work).unwrap();
+        let store = env
+            .accounts_store_for(crate::harness::accounts::Cli::Codex)
+            .unwrap();
+        let (logins, warning) = store.load_logins(env.now).unwrap();
+        assert!(warning.is_none());
+        let a = logins
+            .enrollment
+            .published_grant(&fixture.requests()[0].label, applied_a.generation.unwrap())
+            .unwrap();
+        let label = a.request.label.clone();
+        let auth_directory = logins
+            .enrollment
+            .catalogue_staging(&a.request)
+            .unwrap()
+            .directory;
+        let refused = codex_app_login::owned_refresh_token_digest(
+            &std::fs::read(auth_directory.join("auth.json")).unwrap(),
+        )
+        .unwrap();
+        inject_lineage_answer(
+            env,
+            &a,
+            &scope,
+            Some(aterm_uds::rand::hex_token::<16>().unwrap()),
+            (401, br#"{"error":{"code":"refresh_token_expired"}}"#),
+        );
+        assert!(
+            reconcile_retained(env, &a, &scope).is_err(),
+            "CONTROL replaced={replaced}: the refusal is rejected and not settled yet"
+        );
+
+        let mut later = env.clone();
+        later.now = later
+            .now
+            .saturating_add(i64::try_from(codex_app_login::ROTATION_HANG.as_secs()).unwrap());
+        let settled_at = later.now;
+        let mut outcome = None;
+        // What the admission answers afterwards is its own to say of the replaced file.
+        let _ = super::super::super::with_maintenance_owner(&later, &a, &scope, |mut grant| {
+            let witness = grant.anchor().read()?.ok_or("fixture witness missing")?;
+            assert_eq!(
+                witness
+                    .pending
+                    .as_ref()
+                    .map(|attempt| attempt.token_digest.as_str()),
+                Some(refused.as_str()),
+                "CONTROL replaced={replaced}: the witness names the refused token"
+            );
+            if replaced {
+                // The admission has compared the file by now; only the settlement is left to see
+                // that it changed.
+                replace_canonical_refresh(&auth_directory, "replacement-refresh-token");
+            }
+            outcome = Some(
+                grant
+                    .anchor()
+                    .record_settled_refusal(&witness, settled_at, RefusalReason::Expired)
+                    .map(|_| ()),
+            );
+            Ok(())
+        });
+        let outcome = outcome.expect("the admission reached the settlement");
+        if replaced {
+            assert!(
+                outcome.is_err(),
+                "a login replaced after admission is not the one that was refused"
+            );
+            assert_ne!(
+                recorded_auth(&later, &label),
+                crate::harness::accounts::Auth::SignedOut,
+                "the replacing login is not signed out for another token's refusal"
+            );
+            assert_eq!(
+                recorded_refusal(&later, &label),
+                (None, RefusalStanding::Unknown, RefusalStanding::Unknown),
+                "no reason stands for a token nobody refused"
+            );
+        } else {
+            outcome.unwrap_or_else(|why| panic!("CONTROL: the admitted login settles: {why}"));
+            assert_eq!(
+                recorded_refusal(&later, &label),
+                (
+                    Some(RefusalReason::Expired),
+                    RefusalStanding::Settled {
+                        reason: RefusalReason::Expired,
+                        digest: refused.clone(),
+                    },
+                    RefusalStanding::Unknown
+                ),
+                "CONTROL: the admitted login's refusal is recorded under the refused token"
+            );
+        }
+    }
+}
+
 fn operation() -> Operation {
     Operation {
         id: "a".repeat(32),
         caller: slot::Caller {
-            sid: "s-fixture".into(),
+            sid: "t000fjxtvre".into(),
             pid: 123,
             birth: 456,
         },
@@ -950,7 +1251,7 @@ fn immutable_delivery_digest_binds_every_caller_assignment_and_request_field() {
         let mut changed = original.clone();
         match field {
             0 => changed.id = "e".repeat(32),
-            1 => changed.caller.sid = "s-other".into(),
+            1 => changed.caller.sid = "t000000ther".into(),
             2 => changed.caller.pid += 1,
             3 => changed.caller.birth += 1,
             4 => changed.slot = "e".repeat(64),

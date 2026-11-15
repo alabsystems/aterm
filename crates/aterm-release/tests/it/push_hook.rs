@@ -70,6 +70,14 @@ impl<F: FnMut(u32)> GitRunner for HookRunner<F> {
         self.before(args);
         self.inner.git_input(args, input)
     }
+
+    fn git_read(&self, args: &[&str]) -> Result<RunOut> {
+        self.inner.git_read(args)
+    }
+
+    fn git_read_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
+        self.inner.git_read_input(args, input)
+    }
 }
 
 // The race is injected at the typed mutation boundary, never by decoding Git

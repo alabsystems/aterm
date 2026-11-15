@@ -37,7 +37,7 @@ fn known_macs_waits_for_the_roster_writer_instead_of_reporting_no_macs() {
 use crate::{
     alab::{
         Registry,
-        import::tests::{LOGINS_HEADER, Stand, VAULT_HEADER},
+        import::tests::{LOGINS_HEADER, Stand, VAULT_HEADER, store},
         registry::{ACCOUNT, ADDRESS, MACHINE, MAILBOX, PREFERENCE},
     },
     table::tests::Lab,
@@ -50,6 +50,27 @@ use aterm_secrets::commons::roster::Role;
 use std::os::unix::fs::PermissionsExt as _;
 
 pub(super) const NOW: u64 = 1_800_000_000_000;
+
+/// [`super::run`] with this test's in-memory secret store ([`store`]) in place of this Mac's
+/// vault, no grid opener, no stdin and no heard archive.
+pub(super) fn run(
+    paths: &Paths,
+    words: &[String],
+    vendors: Option<&dyn Vendors>,
+    review: Review<'_>,
+    now_ms: u64,
+) -> Result<Value> {
+    let mut open = |_: &Path, _| -> Result<()> { panic!("no grid opens here") };
+    let mut stdin = || -> Result<String> { panic!("no stdin is read here") };
+    let mut io = Io {
+        review,
+        open: &mut open,
+        stdin: &mut stdin,
+        heard: None,
+        store: store(),
+    };
+    run_io(paths, words, vendors, &mut io, now_ms)
+}
 
 /// Write the two fixture sheets into `dir`.
 fn sheets(dir: &Path) -> (PathBuf, PathBuf) {
@@ -172,7 +193,7 @@ fn an_import_seeds_the_providers_its_accounts_name() {
     assert!(dry["seeds"].as_u64().unwrap() >= 1, "{dry}");
     let first = import(paths, &["--apply"], &vault, &logins, &mut opened);
     let view = Registry::at(paths.clone()).view().unwrap();
-    let (_, generic) = checks::lab(&view.cells);
+    let (_, generic) = checks::lab(&crate::alab::registry::REGISTRY_3, &view.cells);
     let dangling: Vec<_> = generic
         .iter()
         .filter(|f| matches!(f, crate::typed::check::Finding::Dangling { .. }))
@@ -302,7 +323,7 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
     let recent = NOW - 60_000;
     let stale = NOW - 60 * 60_000;
     let waits =
-        |repair: RepairObservation| empty_view_wait(Some(table), None, [Some(&repair)], NOW);
+        |repair: RepairObservation| empty_view_wait(Some(table), None, [Some(&repair)], None, NOW);
     let exchanged =
         |at, on, received| round(at, RepairOutcome::Exchanged, None, on, received, None);
     // A fresh round that brought or deferred registry records, a failed one's count included.
@@ -342,7 +363,13 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
     assert!(waits(failed.clone()).is_some());
     let drained = exchanged(recent, table, Some(0));
     assert_eq!(
-        empty_view_wait(Some(table), None, [Some(&failed), Some(&drained)], NOW),
+        empty_view_wait(
+            Some(table),
+            None,
+            [Some(&failed), Some(&drained)],
+            None,
+            NOW
+        ),
         None
     );
     // No round that speaks: stale, over another table, failed before exchanging, or none.
@@ -359,22 +386,23 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
         ))
         .is_some()
     );
-    assert!(empty_view_wait(Some(table), None, [None], NOW).is_some());
+    assert!(empty_view_wait(Some(table), None, [None], None, NOW).is_some());
     // A fresh round that exchanged and brought nothing, beside one that says nothing.
     assert_eq!(waits(exchanged(recent, table, Some(0))), None);
     let drained = exchanged(recent, table, Some(0));
     assert_eq!(
-        empty_view_wait(Some(table), None, [None, Some(&drained)], NOW),
+        empty_view_wait(Some(table), None, [None, Some(&drained)], None, NOW),
         None
     );
     // The lab's first import: no peer is known.
-    assert_eq!(empty_view_wait(Some(table), None, [], NOW), None);
+    assert_eq!(empty_view_wait(Some(table), None, [], None, NOW), None);
     // Where this Mac cannot name the registry's table, any table's round speaks.
     assert!(
         empty_view_wait(
             None,
             None,
             [Some(&exchanged(recent, [4; 32], Some(1)))],
+            None,
             NOW
         )
         .is_some()
@@ -384,6 +412,7 @@ fn an_empty_view_waits_only_while_a_peer_holds_the_registry() {
             None,
             None,
             [Some(&exchanged(recent, [4; 32], Some(0)))],
+            None,
             NOW
         ),
         None
@@ -419,7 +448,7 @@ fn the_latest_rounds_are_the_live_observers_before_they_reach_its_history() {
     observer.local(identity(1), trust, Vec::new).unwrap();
     let at = std::time::Instant::now();
     let wall = aterm_time::unix_millis().unwrap();
-    observer.contact(identity(2), wall, at);
+    observer.contact(identity(2), wall, at, crate::network_state::RELAYED_LEASE);
     observer.observe(Visibility::Active, 0, "observing", wall, at);
     // A round that brought registry records ends just after that checkpoint.
     let round = RepairObservation {
@@ -438,15 +467,7 @@ fn the_latest_rounds_are_the_live_observers_before_they_reach_its_history() {
     let live = latest_rounds(&config).unwrap();
     assert_eq!(live.via_local_process, Some(std::process::id()));
     assert_eq!(live.peers[0].last_repair, Some(round.clone()));
-    assert!(
-        empty_view_wait(
-            Some([3; 32]),
-            None,
-            live.peers.iter().map(|peer| peer.last_repair.as_ref()),
-            wall
-        )
-        .is_some()
-    );
+    assert!(rounds_wait(&live, Some([3; 32]), None, wall).is_some());
     // The observer stops: its pending round is written, and the history answers.
     drop(observer);
     let retained = latest_rounds(&config).unwrap();
@@ -490,7 +511,7 @@ fn a_writer_successors_import_waits_for_a_round_it_made() {
     // The earlier seat (machine 1) heard machine 2 and drained a round with it, then stopped.
     let mut earlier = Observer::open(&config, ObservationHandle::default()).unwrap();
     earlier.local(identity(1), trust, Vec::new).unwrap();
-    earlier.contact(identity(2), wall, at);
+    earlier.contact(identity(2), wall, at, crate::network_state::RELAYED_LEASE);
     let drained = RepairObservation {
         completed_at_ms: wall,
         outbound: true,
@@ -518,6 +539,7 @@ fn a_writer_successors_import_waits_for_a_round_it_made() {
             Some([3; 32]),
             None,
             live.peers.iter().map(|peer| peer.last_repair.as_ref()),
+            live.last_catalog_repair.as_ref(),
             wall
         )
         .is_some(),
@@ -560,12 +582,7 @@ fn an_open_history_does_not_speak_for_the_latest_rounds() {
     // What the retained history alone says of an import into the registry `[3; 32]`.
     let history_waits = |config: &Path, now_ms| {
         let history = read_history(config).unwrap();
-        empty_view_wait(
-            Some([3; 32]),
-            None,
-            history.peers.iter().map(|peer| peer.last_repair.as_ref()),
-            now_ms,
-        )
+        rounds_wait(&history, Some([3; 32]), None, now_ms)
     };
     // The observer's socket needs a short path.
     let root = aterm_tempfile::Builder::new()
@@ -578,7 +595,7 @@ fn an_open_history_does_not_speak_for_the_latest_rounds() {
     observer.local(identity(1), trust, Vec::new).unwrap();
     let at = std::time::Instant::now();
     let wall = aterm_time::unix_millis().unwrap();
-    observer.contact(identity(2), wall, at);
+    observer.contact(identity(2), wall, at, crate::network_state::RELAYED_LEASE);
     observer.repair(&identity(2), round(RepairOutcome::Exchanged, wall), at);
     observer.observe(Visibility::Active, 0, "observing", wall, at);
     // The checkpoint has a round that exchanged and brought nothing: by it the import may go.
@@ -657,15 +674,7 @@ fn an_open_history_does_not_speak_for_the_latest_rounds() {
     let live = latest_rounds(&config).unwrap();
     assert_eq!(live.via_local_process, Some(std::process::id()));
     assert_eq!(live.peers.len(), 1);
-    assert!(
-        empty_view_wait(
-            Some([3; 32]),
-            None,
-            live.peers.iter().map(|peer| peer.last_repair.as_ref()),
-            wall
-        )
-        .is_some()
-    );
+    assert!(rounds_wait(&live, Some([3; 32]), None, wall).is_some());
 }
 
 /// Before the lab's first import no Mac holds the registry, so no repair round ever covers it,
@@ -705,19 +714,28 @@ fn the_labs_first_import_goes_on_a_drained_catalog_round() {
             Some(table),
             Some(catalog),
             [Some(&drained), Some(&quiet)],
+            None,
             NOW
         ),
         None
     );
     assert_eq!(
-        empty_view_wait(Some(table), Some(catalog), [None, Some(&drained)], NOW),
+        empty_view_wait(
+            Some(table),
+            Some(catalog),
+            [None, Some(&drained)],
+            None,
+            NOW
+        ),
         None
     );
     // Without the catalog's word (another Mac's declaration is here, or no catalog was read) the
     // same rounds say nothing and the import waits.
-    assert!(empty_view_wait(Some(table), None, [Some(&drained), Some(&quiet)], NOW).is_some());
+    assert!(
+        empty_view_wait(Some(table), None, [Some(&drained), Some(&quiet)], None, NOW).is_some()
+    );
     let waits = |repair: RepairObservation| {
-        empty_view_wait(Some(table), Some(catalog), [Some(&repair)], NOW)
+        empty_view_wait(Some(table), Some(catalog), [Some(&repair)], None, NOW)
     };
     assert!(
         waits(round(
@@ -745,6 +763,7 @@ fn the_labs_first_import_goes_on_a_drained_catalog_round() {
             Some(table),
             Some(catalog),
             [Some(&failed), Some(&drained)],
+            None,
             NOW
         ),
         None
@@ -758,9 +777,219 @@ fn the_labs_first_import_goes_on_a_drained_catalog_round() {
             Some(table),
             Some(catalog),
             [Some(&drained), Some(&exchanged(recent, table, Some(3)))],
+            None,
             NOW
         )
         .is_some()
+    );
+}
+
+/// A peer's latest round is over the catalog one time in as many as the two Macs share tables.
+/// The lab's latest round over the catalog, kept through the rounds that followed it, still
+/// gives the catalog's word: the first import goes on a peer whose latest round took another
+/// table. The kept round gives that word and no other. One that is stale, deferred or brought
+/// records, failed, or is over another table says nothing; none speaks where the guard was
+/// handed no catalog or cannot name the registry's table; and none holds an import back that
+/// a peer's latest round lets go, while a hold by a peer's latest round stands whatever is
+/// kept.
+///
+/// NEGATIVE CONTROLS (2026-11-12, each by an inverse edit then undone): with `empty_view_wait`
+/// reading nothing kept, the first import waits (`the kept catalog round speaks`); with a
+/// fresh kept round counted whatever it came to, with a stale one counted, and with one over
+/// any table counted, the rounds below let it go (`says nothing`); with a kept round's
+/// deferral holding the import back, a peer's drained latest round no longer lets it go
+/// (`holds nothing back`); with the kept round read where the registry's table has no name,
+/// it speaks there (`the registry's table is unnamed`).
+#[test]
+fn the_kept_catalog_round_gives_the_catalogs_word_and_holds_nothing_back() {
+    use aterm_types::network_state::{RepairCause, RepairObservation, RepairOutcome, RepairStage};
+    let (table, catalog, journal) = ([3u8; 32], [5u8; 32], [6u8; 32]);
+    let round = |at: u64, outcome, on: [u8; 32], received, deferred| RepairObservation {
+        completed_at_ms: at,
+        outbound: true,
+        stage: Some(RepairStage::Application),
+        outcome,
+        table: Some(on),
+        sent: Some(0),
+        received: Some(received),
+        deferred: Some(deferred),
+    };
+    let recent = NOW - 10 * 60_000;
+    let stale = NOW - 16 * 60_000;
+    let exchanged = |at, on, received| round(at, RepairOutcome::Exchanged, on, received, 0);
+    // The peer's latest round took another table a moment ago; its catalog round is ten
+    // minutes old.
+    let latest = exchanged(NOW - 1000, journal, 0);
+    let drained = exchanged(recent, catalog, 0);
+    assert!(
+        empty_view_wait(Some(table), Some(catalog), [Some(&latest)], None, NOW).is_some(),
+        "its latest round alone says nothing of the catalog"
+    );
+    assert_eq!(
+        empty_view_wait(
+            Some(table),
+            Some(catalog),
+            [Some(&latest)],
+            Some(&drained),
+            NOW
+        ),
+        None,
+        "the kept catalog round speaks"
+    );
+    // What a kept round does not say, alone and beside another peer whose latest round over
+    // the catalog drained it.
+    let silent = [
+        ("stale", exchanged(stale, catalog, 0)),
+        ("over another table", exchanged(recent, journal, 0)),
+        ("brought records", exchanged(recent, catalog, 2)),
+        (
+            "deferred",
+            round(recent, RepairOutcome::Deferred(None), catalog, 0, 1),
+        ),
+        (
+            "exchanged with records deferred",
+            round(recent, RepairOutcome::Exchanged, catalog, 0, 1),
+        ),
+        (
+            "failed",
+            round(
+                recent,
+                RepairOutcome::Failed(RepairCause::Io),
+                catalog,
+                0,
+                0,
+            ),
+        ),
+        (
+            "stopped",
+            round(recent, RepairOutcome::Cancelled, catalog, 0, 0),
+        ),
+    ];
+    for (what, kept) in &silent {
+        assert!(
+            empty_view_wait(Some(table), Some(catalog), [Some(&latest)], Some(kept), NOW).is_some(),
+            "{what}: says nothing"
+        );
+        assert_eq!(
+            empty_view_wait(
+                Some(table),
+                Some(catalog),
+                [Some(&latest), Some(&drained)],
+                Some(kept),
+                NOW
+            ),
+            None,
+            "{what}: holds nothing back"
+        );
+    }
+    // No catalog's word was asked for (another Mac's declaration is here), or this Mac cannot
+    // name the registry's table apart from the catalog's.
+    assert!(
+        empty_view_wait(Some(table), None, [Some(&latest)], Some(&drained), NOW).is_some(),
+        "no catalog handed"
+    );
+    let failed = round(
+        recent,
+        RepairOutcome::Failed(RepairCause::Io),
+        journal,
+        0,
+        0,
+    );
+    assert!(
+        empty_view_wait(None, Some(catalog), [Some(&failed)], Some(&drained), NOW).is_some(),
+        "the registry's table is unnamed"
+    );
+    // A peer's latest round that brought registry records holds the import back as before.
+    let brought = exchanged(NOW - 1000, table, 3);
+    assert!(
+        empty_view_wait(
+            Some(table),
+            Some(catalog),
+            [Some(&brought)],
+            Some(&drained),
+            NOW
+        )
+        .is_some()
+    );
+}
+
+/// The guard reads the kept catalog round where it reads each peer's latest: from the live
+/// observer, and from the history that observer closes as it stops. A peer whose catalog round
+/// drained and whose later round took another table lets the first import go by either.
+/// MUTANT (`KEPT_UNREAD`): the guard reads each peer's latest round alone, and waits.
+#[test]
+fn the_guard_reads_the_kept_catalog_round_live_and_from_a_closed_history() {
+    use crate::network_state::{ObservationHandle, Observer};
+    use aterm_types::network_state::{
+        MachineIdentity, RepairObservation, RepairOutcome, Visibility,
+    };
+    let identity = |n: u8| MachineIdentity {
+        machine_id: [n; 16],
+        incarnation: [n; 16],
+        label: None,
+    };
+    let trust = aterm_secrets::commons::journal::Trust {
+        network: [1; 16],
+        authority: [2; 32],
+        genesis: [3; 32],
+    };
+    let (registry, other) = ([3u8; 32], [6u8; 32]);
+    let catalog = crate::catalog::scope(trust).digest();
+    // The observer's socket needs a short path.
+    let root = aterm_tempfile::Builder::new()
+        .prefix("rounds-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let config = root.path().join("aterm.toml");
+    let mut observer = Observer::open(&config, ObservationHandle::default()).unwrap();
+    observer.local(identity(1), trust, Vec::new).unwrap();
+    let at = std::time::Instant::now();
+    let wall = aterm_time::unix_millis().unwrap();
+    observer.contact(identity(2), wall, at, crate::network_state::RELAYED_LEASE);
+    let round = |table| RepairObservation {
+        completed_at_ms: wall,
+        outbound: true,
+        stage: None,
+        outcome: RepairOutcome::Exchanged,
+        table: Some(table),
+        sent: Some(0),
+        received: Some(0),
+        deferred: Some(0),
+    };
+    observer.repair(&identity(2), round(catalog), at);
+    observer.repair(
+        &identity(2),
+        round(other),
+        at + std::time::Duration::from_secs(1),
+    );
+    observer.observe(Visibility::Active, 0, "observing", wall, at);
+    let waits = |network: &aterm_types::network_state::NetworkObservation, mutant: bool| {
+        KEPT_UNREAD.with(|flag| flag.set(mutant));
+        let waits = rounds_wait(network, Some(registry), Some(catalog), wall);
+        KEPT_UNREAD.with(|flag| flag.set(false));
+        waits
+    };
+    let live = latest_rounds(&config).unwrap();
+    assert_eq!(live.via_local_process, Some(std::process::id()));
+    assert_eq!(live.peers[0].last_repair, Some(round(other)));
+    assert_eq!(live.last_catalog_repair, Some(round(catalog)));
+    assert_eq!(waits(&live, false), None);
+    assert!(
+        waits(&live, true).is_some(),
+        "MUTANT: the latest round alone"
+    );
+    assert!(
+        rounds_wait(&live, Some(registry), None, wall).is_some(),
+        "no catalog's word was asked for"
+    );
+    // The observer stops: the history it closes answers the same.
+    drop(observer);
+    let retained = latest_rounds(&config).unwrap();
+    assert_eq!(retained.via_local_process, None);
+    assert_eq!(waits(&retained, false), None);
+    assert!(
+        waits(&retained, true).is_some(),
+        "MUTANT: the latest round alone"
     );
 }
 
@@ -819,11 +1048,11 @@ fn another_macs_declaration_of_the_registry_holds_an_empty_import_back() {
 }
 
 /// No report shows an address: the dry run's summary and its finding list carry counts, kinds,
-/// keys and coordinates only; the review (`--review`) masks addresses unless `--show-addresses`,
-/// and it is the one place a note's text appears. A Mac that does not hold the registry yet plans
-/// against an empty one.
-/// NEGATIVE CONTROL: with `review_text` ignoring `reveal` (always the flat text), the masked
-/// review shows the address: `` assertion failed: !findings.contains("ann@example.invalid") ``.
+/// keys and coordinates only; the review (`--review`) is the one place a cell's or a note's text
+/// appears, an address as it is (ordinary data), and `--show-addresses` is no flag. A Mac that
+/// does not hold the registry yet plans against an empty one.
+/// NEGATIVE CONTROL: with `review_text` withholding a cell that holds `@`, the review hides the
+/// address: `` assertion failed: findings.contains("ann@example.invalid") ``.
 #[test]
 fn no_import_report_shows_an_address() {
     let lab = Lab::new(&[Role::Writer]);
@@ -851,23 +1080,29 @@ fn no_import_report_shows_an_address() {
     assert_eq!(names, ["findings.tsv", "planned.tsv"]);
     assert!(opened.iter().all(|(_, _, mode)| *mode == 0o700));
     let findings = &opened[0].1;
-    let planned = &opened[1].1;
-    assert!(!findings.contains("ann@example.invalid"));
-    assert!(!planned.contains("ann@example.invalid"));
-    assert!(findings.contains("an…@…"));
+    assert!(findings.contains("ann@example.invalid"));
+    assert!(!findings.contains("an…@…"), "nothing is masked");
     assert!(
         findings.contains("kimi banned"),
         "the local review shows the note"
     );
-    opened.clear();
-    import(
+    let list = [
+        "import",
+        "--vault-sheet",
+        vault.to_str().unwrap(),
+        "--review",
+        "--show-addresses",
+    ];
+    let why = run(
         paths,
-        &["--review", "--show-addresses"],
-        &vault,
-        &logins,
-        &mut opened,
-    );
-    assert!(opened[0].1.contains("ann@example.invalid"));
+        &words(&list),
+        Some(&Stand),
+        &mut |_: &Path| Ok(()),
+        NOW,
+    )
+    .unwrap_err()
+    .0;
+    assert!(why.contains("unknown option"), "{why}");
 }
 
 /// The review never shows a secret, not even locally: a credential-shaped cell and a note that
@@ -932,7 +1167,7 @@ fn check_reports_an_address_whose_birth_key_another_row_holds() {
     }
     let mut book = Book::new();
     book.write(1, &[], changes);
-    let (lab, _) = checks::lab(&book.cells());
+    let (lab, _) = checks::lab(&crate::alab::registry::REGISTRY_3, &book.cells());
     let elsewhere: Vec<&checks::Finding> = lab
         .iter()
         .filter(|f| f.kind == "address-key-elsewhere")
@@ -1042,7 +1277,7 @@ fn check_reports_the_lab_rules() {
     changes.push(put(&PREFERENCE, &retired, "row", json!("live")));
     let mut book = Book::new();
     book.write(1, &[], changes);
-    let (lab, _) = checks::lab(&book.cells());
+    let (lab, _) = checks::lab(&crate::alab::registry::REGISTRY_3, &book.cells());
     let kinds: Vec<&str> = lab.iter().map(|f| f.kind).collect();
     for kind in [
         "preference-on-retired-machine",
@@ -1129,28 +1364,47 @@ fn prefer_and_unprefer_write_one_mapping() {
     assert!(!text.contains('@'), "{text}");
 }
 
-/// The harness's files are read through `Vendors::stated`: named ones refuse when unreadable,
-/// ones found beside the vault sheet are reported in `unread` and retract nothing, and the warm
+/// The harness's sources are read through `Vendors::stated`: named files refuse when unreadable,
+/// entries this Mac's store holds are reported in `unread` and retract nothing, and the warm
 /// list becomes one preference per machine. A Mac holding no `[everyone]` key reads none of them,
 /// since a secrets file's source is keyed by it (`Sheet::stated`), and refuses one named.
-/// NEGATIVE CONTROL: with `harness_sheets` skipping the files it found (`.filter(|_| false)`), the
-/// scratch home's files are not read and there is nothing to import: `` Error("no sheet to import:
+/// NEGATIVE CONTROL: with `harness_sheets` skipping the entries it found (`.filter(|_| false)`),
+/// the store's entries are not read and there is nothing to import: `` Error("no sheet to import:
 /// give --vault-sheet or --logins, or put the sheets in their places") ``.
 #[test]
 fn harness_files_are_read_and_a_bad_one_is_reported() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
-    let secrets = paths.home.join(".secrets");
-    std::fs::create_dir_all(&secrets).unwrap();
+    // The harness's sources as this Mac's store holds them, published and synced.
+    let deliver = |entries: &[(&str, &str)]| {
+        let admin = aterm_secrets::client::admin_open(paths).unwrap();
+        let mut doc = admin.doc.clone();
+        for (name, text) in entries {
+            doc.set_entry(
+                &aterm_secrets::text::Audience::Everyone,
+                name,
+                text.as_bytes(),
+            )
+            .unwrap();
+        }
+        aterm_secrets::client::admin_publish(paths, &admin, &doc).unwrap();
+        aterm_secrets::client::sync(paths, None).unwrap();
+    };
+    deliver(&[
+        ("ai-pool.toml", "claude,ann@example.invalid,,m8 m9\n"),
+        ("fleet-accounts.toml", "not rows\n"),
+    ]);
+    // The files a person names, outside the store.
+    let named = aterm_tempfile::tempdir().unwrap();
     std::fs::write(
-        secrets.join("ai-pool.toml"),
+        named.path().join("ai-pool.toml"),
         "claude,ann@example.invalid,,m8 m9\n",
     )
     .unwrap();
-    std::fs::write(secrets.join("fleet-accounts.toml"), "not rows\n").unwrap();
+    std::fs::write(named.path().join("fleet-accounts.toml"), "not rows\n").unwrap();
     let mut open = |_: &Path| Ok(());
     let list = words(&["import", "--apply"]);
-    let pool = secrets.join("ai-pool.toml");
+    let pool = named.path().join("ai-pool.toml");
     let named_pool = words(&["import", "--ai-pool", pool.to_str().unwrap()]);
     let keyless = run(paths, &named_pool, Some(&Stand), &mut open, NOW).unwrap_err();
     assert!(keyless.to_string().contains("[everyone]"), "{keyless}");
@@ -1165,11 +1419,7 @@ fn harness_files_are_read_and_a_bad_one_is_reported() {
     let view = Registry::at(paths.clone()).view().unwrap();
     assert_eq!(view.project(&PREFERENCE).rows.len(), 2);
     // The pool drops m9 while the fleet file still fails: what the failed file may state stands.
-    std::fs::write(
-        secrets.join("ai-pool.toml"),
-        "claude,ann@example.invalid,,m8\n",
-    )
-    .unwrap();
+    deliver(&[("ai-pool.toml", "claude,ann@example.invalid,,m8\n")]);
     let again = words(&["import", "--apply"]);
     run(paths, &again, Some(&Stand), &mut open, NOW).unwrap();
     let view = Registry::at(paths.clone()).view().unwrap();
@@ -1183,42 +1433,12 @@ fn harness_files_are_read_and_a_bad_one_is_reported() {
     let named = words(&[
         "import",
         "--fleet-accounts",
-        secrets.join("fleet-accounts.toml").to_str().unwrap(),
+        named.path().join("fleet-accounts.toml").to_str().unwrap(),
     ]);
     let refused = run(paths, &named, Some(&Stand), &mut open, NOW).unwrap_err();
     assert!(!refused.to_string().contains("not rows"), "{refused}");
 }
 
-/// A harness file found beside the vault sheet that is a symlink (a dotfiles checkout's link into
-/// `~/.secrets`) is read through its link like a named one: a good one becomes a sheet, a bad one
-/// is reported in `unread`, and a dangling one is absent.
-/// NEGATIVE CONTROL: with `harness_sheets` keeping only paths whose `symlink_metadata` is a
-/// regular file, both links are dropped and the dry run refuses with `no sheet to import`.
-#[cfg(unix)]
-#[test]
-fn harness_files_found_through_a_symlink_are_read() {
-    let lab = Lab::new(&[Role::Writer]);
-    let paths = &lab.paths[0];
-    let secrets = paths.home.join(".secrets");
-    std::fs::create_dir_all(&secrets).unwrap();
-    let elsewhere = aterm_tempfile::tempdir().unwrap();
-    let pool = elsewhere.path().join("ai-pool.toml");
-    std::fs::write(&pool, "claude,ann@example.invalid,,m8 m9\n").unwrap();
-    let fleet = elsewhere.path().join("fleet-accounts.toml");
-    std::fs::write(&fleet, "not rows\n").unwrap();
-    std::os::unix::fs::symlink(&pool, secrets.join("ai-pool.toml")).unwrap();
-    std::os::unix::fs::symlink(&fleet, secrets.join("fleet-accounts.toml")).unwrap();
-    std::os::unix::fs::symlink(
-        elsewhere.path().join("gone.toml"),
-        secrets.join("ai-accounts-codex.toml"),
-    )
-    .unwrap();
-    EVERYONE.with(|held| held.set(Some(([0xab; 32], [0x11; 32]))));
-    let mut open = |_: &Path| Ok(());
-    let report = run(paths, &words(&["import"]), Some(&Stand), &mut open, NOW).unwrap();
-    assert_eq!(report["dry_run"], json!(true), "{report}");
-    assert_eq!(report["unread"], json!(["fleet-accounts.toml"]), "{report}");
-}
 /// `prefer` refuses a retired machine or account even when named by its primary key, while
 /// `unprefer` ends a lingering preference on a retired machine or account by label or key.
 /// NEGATIVE CONTROL: with `named_row` accepting any present `pk` without checking `require_live`
@@ -1482,15 +1702,33 @@ fn the_export_publishes_once_and_check_reports_its_drift() {
         "compare before write: {second}"
     );
     aterm_secrets::client::sync(paths, None).unwrap();
-    let held = std::fs::read_to_string(paths.home.join(".secrets/fleet-accounts.toml")).unwrap();
+    let held_entry = |name: &str| {
+        aterm_secrets::client::read_in_place(paths, name)
+            .unwrap()
+            .map(|value| value.as_str().unwrap().to_owned())
+    };
+    let held = held_entry("fleet-accounts.toml").unwrap();
     assert!(
         held.starts_with("# @generated by aterm db alab export --apply (seal "),
         "{held}"
     );
     assert!(
-        !paths.home.join(".secrets/ai-pool.toml").exists(),
-        "a file the vault did not hold is never created"
+        held_entry("ai-pool.toml").is_none(),
+        "an entry the vault did not hold is never created"
     );
+    // A hand edit of the vault's entry, published and synced as an admin's edit would be.
+    let republish = |text: &str| {
+        let admin = aterm_secrets::client::admin_open(paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            "fleet-accounts.toml",
+            text.as_bytes(),
+        )
+        .unwrap();
+        aterm_secrets::client::admin_publish(paths, &admin, &doc).unwrap();
+        aterm_secrets::client::sync(paths, None).unwrap();
+    };
     let check = || {
         run(
             paths,
@@ -1510,12 +1748,10 @@ fn the_export_publishes_once_and_check_reports_its_drift() {
             .collect()
     };
     assert_eq!(states(&check()), ["same", "missing"]);
-    let file = paths.home.join(".secrets/fleet-accounts.toml");
-    let text = std::fs::read_to_string(&file).unwrap();
-    std::fs::write(&file, text.replace("# places", "# hand edit, places")).unwrap();
+    republish(&held.replace("# places", "# hand edit, places"));
     assert_eq!(states(&check()), ["edited", "missing"]);
-    // A current file the harness cannot parse refuses the export and is reported, not hidden.
-    std::fs::write(&file, "unparseable").unwrap();
+    // A current entry the harness cannot parse refuses the export and is reported, not hidden.
+    republish("unparseable");
     assert!(check()["exports"]["error"].as_str().is_some());
 }
 
@@ -1530,12 +1766,13 @@ fn verb_io<'a>(paths: &Paths, list: &[&str], open: att::Opener<'a>, stdin: &str)
         open,
         stdin: &mut read,
         heard: None,
+        store: store(),
     };
     run_io(paths, &words(list), None, &mut io, NOW)
 }
 
 fn verb(paths: &Paths, list: &[&str]) -> Result<Value> {
-    verb_io(paths, list, &mut |_: &Path, _, _: &[String]| Ok(()), "")
+    verb_io(paths, list, &mut |_: &Path, _| Ok(()), "")
 }
 
 /// The readers print the registry by key and label: `accounts` gives each account's label and
@@ -1706,7 +1943,7 @@ fn an_account_is_added_from_stdin_and_its_address_never_printed() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let (vault, logins) = sheets(scratch.path());
     import(paths, &["--apply"], &vault, &logins, &mut Vec::new());
-    let mut open = |_: &Path, _, _: &[String]| Ok(());
+    let mut open = |_: &Path, _| Ok(());
     let added = verb_io(
         paths,
         &["add", "account", "claude"],
@@ -1787,7 +2024,7 @@ fn an_account_signs_in_with_the_row_its_address_names_now() {
             put(&ADDRESS, &gone, "row", json!("retired")),
         ]])
         .unwrap();
-    let mut open = |_: &Path, _, _: &[String]| Ok(());
+    let mut open = |_: &Path, _| Ok(());
     let added = verb_io(
         paths,
         &["add", "account", "claude"],
@@ -1841,7 +2078,7 @@ fn an_account_signs_in_with_the_row_its_address_names_now() {
 }
 
 /// `edit machines` opens the machine grid in the scripted editor and saves the owner's cell
-/// through the grid's three-way save; `edit mail` opens the address grid, its addresses masked.
+/// through the grid's three-way save; `edit mail` opens the address grid, its addresses as they are.
 /// NEGATIVE CONTROL: with `edited` opening the account collection for `machines`, the opened
 /// file is `account.tsv` and `record` finds no machine row there: `` called `Option::unwrap()`
 /// on a `None` value ``.
@@ -1855,14 +2092,17 @@ fn edit_saves_the_owners_cell_through_the_grid() {
     import(paths, &["--apply"], &vault, &logins, &mut Vec::new());
     let m3 = keys::machine_pk("m3");
     let mut opened = Vec::new();
-    let mut open = |path: &Path, _: usize, _: &[String]| -> Result<()> {
+    let mut open = |path: &Path, _: usize| -> Result<()> {
         opened.push(path.file_name().unwrap().to_string_lossy().into_owned());
         let held = std::fs::read_to_string(path).unwrap();
         if opened.len() == 1 {
             let row = record(&held, &m3);
             std::fs::write(path, type_in(&held, row, "role", "desk")).unwrap();
         } else {
-            assert!(!held.contains("@example"), "masked: {held}");
+            assert!(
+                held.contains("@example"),
+                "addresses show as they are: {held}"
+            );
         }
         Ok(())
     };
@@ -2256,6 +2496,7 @@ pub(super) fn replica_fixture(paths: &Paths, n: usize, status: &str) -> PathBuf 
 #[test]
 fn a_refused_cell_keeps_a_replica_uncovered_until_it_is_settled() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 1, "active");
     let put = |chip: &str| {
@@ -2294,6 +2535,7 @@ fn a_refused_cell_keeps_a_replica_uncovered_until_it_is_settled() {
 #[test]
 fn a_replica_beside_its_sheets_reads_as_covered() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 0, "active");
     let number = "415-555-0101";
@@ -2305,11 +2547,17 @@ fn a_replica_beside_its_sheets_reads_as_covered() {
         crate::fleet_db::put_row(&mut db, "phones", number, row).unwrap();
     };
     put("Acme");
-    let secrets = paths.home.join(".secrets");
-    std::fs::create_dir_all(&secrets).unwrap();
-    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
     let sheet = format!("phone,carrier\n{number},Acme\n");
-    aterm_uds::private_file::write_private(&secrets, "alab-phones.csv", sheet.as_bytes()).unwrap();
+    let admin = aterm_secrets::client::admin_open(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &aterm_secrets::text::Audience::Everyone,
+        "alab-phones.csv",
+        sheet.as_bytes(),
+    )
+    .unwrap();
+    aterm_secrets::client::admin_publish(paths, &admin, &doc).unwrap();
+    aterm_secrets::client::sync(paths, None).unwrap();
     let mut never = |_: &Path| -> Result<()> { panic!("no review") };
     let mut go = |list: &[&str]| run(paths, &words(list), Some(&Stand), &mut never, NOW);
     let import = ["import", "--fleet-db", "--fill-only", "--apply"];
@@ -2328,16 +2576,17 @@ fn a_replica_beside_its_sheets_reads_as_covered() {
 
 /// `import --fleet-db` on a real lab reads this Mac's replica in place: its mode must be named, a
 /// Mac with no replica is refused and none is made, and an authoritative import of 39 passwords
-/// lands as 39 `Secret` cells sealed by this Mac's registry key, which open there to each row's
-/// password and show masked in every report. After `--apply` the import records beside the
+/// puts each into its own secret-store entry, which its cell names, no report showing a value; a
+/// dry run puts nothing. After `--apply` the import records beside the
 /// replica that the registry covers it; a re-run writes nothing; an owner's later edit to the
 /// replica, read fill-only, differs by key and column only and leaves the replica uncovered, its
 /// cells listed; and `check` says "not imported" until the first import.
 /// NEGATIVE CONTROL: with `covered::judge` skipping the plan's findings, the edited replica is
 /// recorded covered: `` assertion failed: `(left == right)` left: Bool(true) right: Bool(false) ``.
 #[test]
-fn a_fleet_db_replica_imports_sealed_and_records_its_coverage() {
+fn a_fleet_db_replica_imports_into_the_store_and_records_its_coverage() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let check = verb(paths, &["check"]).unwrap();
     assert_eq!(check["registry"], json!("not imported"), "{check}");
@@ -2359,6 +2608,9 @@ fn a_fleet_db_replica_imports_sealed_and_records_its_coverage() {
         import::covered::read(&dir).unwrap().is_none(),
         "a dry run records nothing"
     );
+    let dry = go(&["import", "--fleet-db", "--authoritative"]).unwrap();
+    assert_eq!(dry["store_puts"], json!(39), "{dry}");
+    assert!(store().every().is_empty(), "a dry run puts nothing");
     let first = go(&["import", "--fleet-db", "--authoritative", "--apply"]).unwrap();
     assert!(first["written"].as_u64().unwrap() > 0, "{first}");
     assert_eq!(first["replica"]["covered"], json!(true), "{first}");
@@ -2370,26 +2622,21 @@ fn a_fleet_db_replica_imports_sealed_and_records_its_coverage() {
     );
     let record = import::covered::read(&dir).unwrap().unwrap();
     assert!(record.covered && record.uncovered == 0, "{record:?}");
-    let handle = Handle::at(paths.clone(), &att::REGISTRY);
-    handle
-        .view_sealed(|view, sealer| {
-            let addresses = view.project(&registry::ADDRESS);
-            for n in 1..=39 {
-                let pk = keys::address_pk(&format!("box{n:02}@proton.example")).unwrap();
-                let token = addresses.rows[&pk]
-                    .get("password")
-                    .unwrap()
-                    .as_str()
-                    .unwrap();
-                assert!(crate::typed::secret::is_sealed(token));
-                let want = Secret::new(format!("synthetic-pass-{n:02}"));
-                assert!(sealer.holds(registry::ADDRESS.name, &pk, "password", token, &want));
-            }
-            Ok(())
-        })
-        .unwrap();
+    assert_eq!(first["store_puts"], json!(39), "{first}");
+    let view = Handle::at(paths.clone(), &att::REGISTRY).view().unwrap();
+    let addresses = view.project(&registry::ADDRESS);
+    for n in 1..=39 {
+        let pk = keys::address_pk(&format!("box{n:02}@proton.example")).unwrap();
+        let cell = addresses.rows[&pk].get("password").unwrap();
+        let entry = crate::typed::secret::entry_of(cell).unwrap();
+        assert_eq!(
+            store().held(entry).as_deref(),
+            Some(format!("synthetic-pass-{n:02}").as_str())
+        );
+    }
     let again = go(&["import", "--fleet-db", "--authoritative", "--apply"]).unwrap();
     assert_eq!(again["records"].as_u64(), Some(0), "{again}");
+    assert_eq!(again["store_puts"], json!(0), "{again}");
     assert_eq!(again["replica"]["covered"], json!(true), "{again}");
     let same = go(&["import", "--fleet-db", "--fill-only"]).unwrap();
     assert_eq!(same["matches_registry"], json!(true), "{same}");
@@ -2435,6 +2682,7 @@ fn a_fleet_db_replica_imports_sealed_and_records_its_coverage() {
 #[test]
 fn a_replicas_machines_judge_covered_after_a_clean_import() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 1, "active");
     {
@@ -2630,6 +2878,7 @@ fn a_flag_shaped_password_is_covered_only_when_its_word_agrees() {
 #[test]
 fn a_stored_redaction_mark_is_uncovered_until_the_registry_holds_a_password() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 1, "active");
     let (email, mut row) = email_row(2, "active");
@@ -2684,6 +2933,7 @@ fn a_password_beside_a_concurrent_protected_mark_is_uncovered() {
         .unwrap();
     };
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 1, "active");
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -2756,6 +3006,7 @@ fn a_spelling_is_not_reported_beside_a_column_that_really_disagrees() {
         .unwrap();
     };
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 1, "active");
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -2816,6 +3067,7 @@ fn a_spelling_is_not_reported_beside_a_column_that_really_disagrees() {
 #[test]
 fn an_import_does_not_cover_a_record_the_dump_withholds() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 1, "active");
     let secret = crate::fleet_db::resolve_fleet_secret(&dir).unwrap();
@@ -2881,6 +3133,7 @@ fn an_import_does_not_cover_a_record_the_dump_withholds() {
 fn fleet_db_writes_refuse_once_the_replica_is_covered_and_work_before() {
     use crate::alab::import::covered;
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 2, "active");
     let fleet = |list: &[&str]| {
@@ -2996,7 +3249,7 @@ fn a_replica_digest_is_stable_and_names_its_epoch() {
 }
 
 /// `import --compare-sheet` reports what the sheet would do and how its password flags meet the
-/// registry's sealed passwords, by count, key and column, and writes nothing: no address, no
+/// registry's password cells, by count, key and column, and writes nothing: no address, no
 /// cell value and no flag's text is in the report.
 /// NEGATIVE CONTROL: with `differs_json` adding each finding's `at` coordinates' cell text
 /// (`sheets[0].text(..)`), the report holds the sheet's provider word: `` assertion failed:
@@ -3004,6 +3257,7 @@ fn a_replica_digest_is_stable_and_names_its_epoch() {
 #[test]
 fn compare_sheet_prints_no_values() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let scratch = aterm_tempfile::tempdir().unwrap();
     replica_fixture(paths, 3, "active");
@@ -3029,8 +3283,8 @@ fn compare_sheet_prints_no_values() {
     assert_eq!(report["matches_registry"], json!(false));
     assert_eq!(
         report["password_flags"],
-        json!({"set": 3, "sealed_in_registry": 2, "missing_in_registry": 1, "no_address": 0,
-            "sealed_unflagged": 1})
+        json!({"set": 3, "stored_in_registry": 2, "missing_in_registry": 1, "no_address": 0,
+            "stored_unflagged": 1})
     );
     let box01 = keys::address_pk("box01@proton.example").unwrap();
     assert!(
@@ -3059,7 +3313,7 @@ fn compare_sheet_prints_no_values() {
 
 /// A dry run on a Mac that does not hold the registry plans its replica's passwords against an empty
 /// registry, each sealed to a token no key opens, rather than refusing: the report says "not held
-/// here" and shows no value.
+/// here", plans the three mailboxes, names no store entry, shows no value and puts nothing.
 /// NEGATIVE CONTROL: with `Unheld::seal` returning the mask, the planned Secret cell fails
 /// validation: `` called `Result::unwrap()` on an `Err` value: … authenticated opaque token ``.
 #[test]
@@ -3077,6 +3331,9 @@ fn a_dry_run_without_the_registry_plans_a_replicas_passwords() {
     )
     .unwrap();
     assert_eq!(report["registry"], json!("not held here"), "{report}");
+    assert_eq!(report["counts"]["mailbox"]["new"], json!(3), "{report}");
+    assert_eq!(report["store_puts"], json!(0), "{report}");
+    assert!(store().every().is_empty());
     let text = aterm_json::to_string(&report).unwrap();
     assert!(
         !text.contains("synthetic-pass") && !text.contains('@'),
@@ -3084,17 +3341,23 @@ fn a_dry_run_without_the_registry_plans_a_replicas_passwords() {
     );
 }
 
-/// The local review never shows a phone number: a number is a `Secret` cell's value.
-/// NEGATIVE CONTROL: with `review_text` skipping `guard::phone_shaped`, the number shows: ``
-/// left: "+1 (202) 555-0149" right: "(withheld: shaped like a secret)" ``.
+/// The local review shows a phone number and an address as the ordinary data they are, on one
+/// line, and withholds only what is shaped like a credential.
+/// NEGATIVE CONTROL: with `review_text` withholding `guard::phone_shaped` text again, the number
+/// is withheld: `` left: "(withheld: shaped like a secret)" right: "+1 (202) 555-0149" ``.
 #[test]
-fn a_review_never_shows_a_phone_number() {
-    assert_eq!(review_text("+1 (202) 555-0149", true), WITHHELD);
-    assert_eq!(review_text("desk line", true), "desk line");
+fn a_review_shows_a_phone_number_and_withholds_a_credential() {
+    assert_eq!(review_text("+1 (202) 555-0149"), "+1 (202) 555-0149");
+    assert_eq!(review_text("ann@example.invalid"), "ann@example.invalid");
+    assert_eq!(
+        review_text(concat!("ghp", "_bbbbbbbbbbbbbbbbbbbbbbbb")),
+        WITHHELD
+    );
 }
 
 /// `import --mailbox-toml <file> --apply` on a real lab lands the harness's mailbox file and says
-/// whether it is covered: every field of a synthetic file lands (`covered`, sealed, no value or
+/// whether it is covered: every field of a synthetic file lands (`covered`, its secrets in store
+/// entries, no value or
 /// address in the report), and once the file holds a field with no column the report names that
 /// field by its name alone and the file is not covered. `--mailbox-toml` goes with no
 /// `--digest` or `--compare-sheet`.
@@ -3103,6 +3366,7 @@ fn a_review_never_shows_a_phone_number() {
 #[test]
 fn a_mailbox_file_imports_and_reports_its_coverage() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let scratch = aterm_tempfile::tempdir().unwrap();
     let file = scratch.path().join("ai-mailbox.toml");
@@ -3199,6 +3463,7 @@ fn a_sheet_path_names_a_workbook_tab() {
 #[test]
 fn an_edited_replica_reports_what_it_no_longer_says() {
     let lab = Lab::new(&[Role::Writer]);
+    crate::alab::tests::newest(&lab.paths[0], 1_800_000_000_000);
     let paths = &lab.paths[0];
     let dir = replica_fixture(paths, 0, "active");
     let put = |table: &str, key: &str, row: Value| {
@@ -3261,16 +3526,14 @@ fn an_edited_replica_reports_what_it_no_longer_says() {
     let login = keys::address_pk(aliased).unwrap();
     let cell = |collection: &crate::typed::Collection, pk: &str, column: &str| {
         handle
-            .view_sealed(|view, _| {
-                Ok(view
-                    .project(collection)
-                    .rows
-                    .get(pk)
-                    .and_then(|row| row.get(column))
-                    .cloned()
-                    .unwrap_or(Value::Null))
-            })
+            .view()
             .unwrap()
+            .project(collection)
+            .rows
+            .get(pk)
+            .and_then(|row| row.get(column))
+            .cloned()
+            .unwrap_or(Value::Null)
     };
     assert_ne!(
         cell(&registry::ADDRESS, &login, "alias_of"),
@@ -3320,15 +3583,13 @@ fn an_edited_replica_reports_what_it_no_longer_says() {
     assert_eq!(cell(&ACCOUNT, &account_pk, "note"), json!("seat note"));
     let member = |collection: &crate::typed::Collection, pk: &str, column: &str, element: &str| {
         handle
-            .view_sealed(|view, _| {
-                Ok(view
-                    .project(collection)
-                    .rows
-                    .get(pk)
-                    .and_then(|row| row.fields.get(column))
-                    .is_some_and(|field| field.has_member(element)))
-            })
+            .view()
             .unwrap()
+            .project(collection)
+            .rows
+            .get(pk)
+            .and_then(|row| row.fields.get(column))
+            .is_some_and(|field| field.has_member(element))
     };
     assert!(member(&ACCOUNT, &account_pk, "services", "chatgpt"));
     assert!(member(&ACCOUNT, &account_pk, "services", "codex"));
@@ -3340,4 +3601,29 @@ fn an_edited_replica_reports_what_it_no_longer_says() {
     let third = go(&import).unwrap();
     assert_eq!(third["written"], json!(0), "{third}");
     assert_eq!(third["replica"]["covered"], json!(false), "{third}");
+}
+
+/// `check`'s duplicate numbers compare the phone rows' plain numbers: two live rows saying one
+/// number are one group by key, a retired row and a row with another number are none.
+/// NEGATIVE CONTROL: with `duplicate_numbers` keeping retired rows, the retired row joins the
+/// group: `` left: [["ph-a", "ph-b", "ph-c"]] right: [["ph-a", "ph-b"]] ``.
+#[test]
+fn duplicate_numbers_compare_plain_numbers() {
+    let mut changes = Vec::new();
+    for (pk, number, row) in [
+        ("ph-a", "4155550101", "live"),
+        ("ph-b", "4155550101", "live"),
+        ("ph-c", "4155550101", "retired"),
+        ("ph-d", "4155550102", "live"),
+    ] {
+        changes.push(put(&PHONE, pk, "number", json!(number)));
+        changes.push(put(&PHONE, pk, "row", json!(row)));
+    }
+    let mut book = Book::new();
+    book.write(1, &[], changes);
+    let phones = cell::project(&PHONE, &book.cells());
+    assert_eq!(
+        duplicate_numbers(&phones, &grid::Opened::new()),
+        [vec!["ph-a".to_owned(), "ph-b".to_owned()]]
+    );
 }

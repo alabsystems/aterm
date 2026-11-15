@@ -36,7 +36,10 @@
 //! shell's job, claims, hands its claim to a holder that keeps it for the build's life ([`hold`]),
 //! and becomes the build in its own pid with its granted job width (its signal state put back as
 //! it was started with it: `build_admit_exec.rs`), so every reader of that pid, its parent, its
-//! job and its signals finds the build itself. A build started under a cargo that holds its
+//! job and its signals finds the build itself. On macOS the front becomes the build only with
+//! its exec gate closed (`aterm_sysprobe::exec_gate`); where one of its own process-table reads
+//! is still in the kernel the build runs as its child, under its claim where it holds one
+//! ([`front_exec`]). A build started under a cargo that holds its
 //! build lock (a build script's) runs under its verified covering claim; without one, an
 //! ambiguous active lock bounds a wait to one admission look ([`possible_build_lock`]). Where
 //! no holder arms, it runs as [`supervise`] runs it.
@@ -62,6 +65,12 @@ use aterm_capacity::tree_meter::TreeMeter;
 use aterm_capacity::{Admit, Claim, Error, Ledger, Machine, Need, Pace, Record};
 
 use crate::build_cache::Tool;
+
+#[cfg(unix)]
+#[path = "build_admit_output.rs"]
+mod output;
+#[cfg(unix)]
+pub use output::{output, output_at};
 
 /// The hidden verb that runs a build under its claim, `atpkg __build_admit [--shim <tool>
 /// <placed>] <target> [args…]` ([`run_hidden`]): what a `targo` shim's hop execs.
@@ -125,7 +134,7 @@ fn limited_jobs(args: &[String], cores: u32) -> Vec<String> {
 }
 
 #[cfg(unix)]
-fn limit_command(command: &mut aterm_uds::spawnfd::Command, cores: u32) {
+fn limit_command(command: &mut aterm_uds::spawnfd::Command, cores: u32, compiler: Option<&Build>) {
     let Some(args) = command
         .get_args()
         .map(|a| a.to_str().map(str::to_owned))
@@ -133,7 +142,9 @@ fn limit_command(command: &mut aterm_uds::spawnfd::Command, cores: u32) {
     else {
         return;
     };
-    if classify(&args, tool_of(Path::new(command.get_program()))).is_some() {
+    // Captured compilation was classified with its explicit tool before admission. Ordinary
+    // arbitrary-command supervision retains its existing program-name inference.
+    if compiler.is_some() || classify(&args, tool_of(Path::new(command.get_program()))).is_some() {
         command.set_args(limited_jobs(&args, cores));
     }
 }
@@ -1174,13 +1185,18 @@ fn look_in_turn(
 /// peak kept as [`Held::end`] keeps one: never below its root's own resident peak, which the
 /// reap that consumes the root's exit reads from its accounting (`wait4`: the root's and those of
 /// the descendants it reaped), as a host job's does, so a child this process reaped before, which
-/// is no part of this build, is no floor of it. Its status.
+/// is no part of this build, is no floor of it. On Linux that peak also holds what the fork that
+/// launched the root copied of this process's resident memory: an exec folds the memory it
+/// replaces into the new program's peak. That overcounts by this process's resident size at the
+/// launch at most, on the side of admission that reserves more. Its status.
 /// Build pass-through commands with [`aterm_uds::spawnfd::TransparentCommand::into_command`]
 /// to preserve inherited handles such as compiler jobserver pipes. The native owned-child
 /// boundary uses ordinary spawn for ordinary admission. [`admit_cohort`] instead requires
 /// native ARM/birth/BIND. A live or unread cohort remains fully reserved after root exit;
 /// that incomplete run cannot supply a successful whole-build memory sample. This does
 /// not transfer the ordinary shim's terminal policy or enable account-wide cohort admission.
+/// An ordinary owning-wait error retains the original child and claim until an actual owning
+/// reap completes. A permanently lost wait leaves this operation unresolved and budgeted.
 ///
 /// # Errors
 /// Admission's native launch, durable binding or wait failed. A child whose BIND failed
@@ -1443,6 +1459,7 @@ fn supervise_job_using(
             live,
             cancelled: false,
         }),
+        None,
     )
 }
 
@@ -1463,6 +1480,7 @@ fn supervise_with(
         arm,
         |owned, meter| before_wait(owned.child_mut(), meter),
         None,
+        None,
     )
     .map(JobOutcome::root_status)
 }
@@ -1475,6 +1493,7 @@ fn supervise_launch(
     arm: impl FnOnce() -> Option<front::Front>,
     before_wait: impl FnOnce(&mut SupervisedChild, Option<&TreeMeter>),
     mut terminal: Option<JobRun<'_>>,
+    compiler: Option<&Build>,
 ) -> std::io::Result<JobOutcome> {
     if terminal.is_some() && held.as_ref().is_none_or(|held| !held.cohort) {
         return Err(std::io::Error::new(
@@ -1489,7 +1508,7 @@ fn supervise_launch(
         );
     }
     let front = arm();
-    let (mut owned, mut launch_error) = match launch_held(held.as_mut(), command) {
+    let (mut owned, mut launch_error) = match launch_held(held.as_mut(), command, compiler) {
         Ok(child) => child,
         Err(e) => {
             if let Some(front) = &front {
@@ -1556,8 +1575,14 @@ fn supervise_launch(
             None,
         ),
     };
-    if let (Some(meter), Ok(status)) = (&meter, &status) {
-        end_tree(meter, passed, *status, say);
+    // A supervision error and an owning retirement receipt are independent. Recovery
+    // may positively reap the original child while preserving the first error for callers.
+    let retired = {
+        let child = owned.child_mut();
+        child.is_reaped().then(|| child.wait().ok()).flatten()
+    };
+    if let (Some(meter), Some(retired)) = (&meter, retired) {
+        end_tree(meter, passed, retired, say);
     }
     // A root's exit is no group-drain receipt. Drop retains a live/unknown cohort's
     // entire budget; do not record an incomplete sample as a successful whole build.
@@ -1694,6 +1719,35 @@ fn wait_supervised(
             say(&format!(
                 "{SAYS}: failed supervision could not reap its owned root ({error})"
             ));
+        }
+    }
+    if let Err(error) = &result
+        && matches!(owned, SupervisedChild::Ordinary(_))
+        && !owned.child_mut().is_reaped()
+    {
+        if let Some(front) = front {
+            // An unavailable owning wait cannot keep numeric forwarding authority.
+            front.reaped();
+        }
+        say(&format!(
+            "{SAYS}: ordinary owning wait unresolved ({error}); supervision remains active"
+        ));
+        loop {
+            // Keep the actual owner and every original resource here. A PID read,
+            // disappearance or another process's wait is never our retirement receipt.
+            // ECHILD forfeits the handle's numeric custody and cannot be repaired here;
+            // such an operation stays unresolved instead of releasing its reservation.
+            let child = owned.child_mut();
+            if !child.is_reaped() && !child.owns_unreaped() {
+                // Lost custody is permanent for this handle. No timer can restore it;
+                // spurious unparks recheck the same state without granting authority.
+                std::thread::park();
+                continue;
+            }
+            if reap_accounted(child).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
     result
@@ -1972,10 +2026,11 @@ impl SupervisedChild {
 fn launch_held(
     held: Option<&mut Held>,
     command: &mut aterm_uds::spawnfd::Command,
+    compiler: Option<&Build>,
 ) -> std::io::Result<(SupervisedChild, Option<std::io::Error>)> {
     use aterm_capacity::cohort::launch::LaunchError;
     if let Some(held) = held.as_ref() {
-        limit_command(command, held.claim.cores());
+        limit_command(command, held.claim.cores(), compiler);
     }
     let Some(held) = held.filter(|held| held.cohort) else {
         return match command.spawn_observed(aterm_uds::spawnfd::BirthAttempt::new()?) {
@@ -2134,20 +2189,35 @@ fn end_tree(
 }
 
 /// Replace this process with `target` run on `args`, unchanged: what a call that claims nothing
-/// runs. Returns only when the exec failed: 127, said.
+/// runs. Returns when the exec failed (127, said) or, on macOS, with the build's own end where
+/// it ran as this process's child ([`exec_marked`]).
 fn exec<A: AsRef<std::ffi::OsStr>>(target: &Path, args: &[A]) -> std::process::ExitCode {
     exec_marked(target, args, None)
 }
 
-/// [`exec`], with [`aterm_capacity::COVER_ENV`] set to `marker` where one is given. On Unix the
-/// build starts with the signal state this process was started with ([`becoming`]).
+/// [`exec`], with [`aterm_capacity::COVER_ENV`] set to `marker` where one is given. On Unix a
+/// build this process becomes starts with the signal state this process was started with
+/// ([`becoming`]). Where a thread of this process is still in a process-table read (macOS) the
+/// build is not exec'ed but run as this process's child (`run_as_child`): the build's end is
+/// then returned.
 fn exec_marked<A: AsRef<std::ffi::OsStr>>(
     target: &Path,
     args: &[A],
     marker: Option<&str>,
 ) -> std::process::ExitCode {
     #[cfg(unix)]
-    let err = becoming::become_build(target, args, marker);
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            clippy::infallible_destructuring_match,
+            reason = "`Reading` is the macOS-only arm"
+        )
+    )]
+    let err = match becoming::become_build(target, args, marker) {
+        becoming::Stayed::Failed(err) => err,
+        #[cfg(target_os = "macos")]
+        becoming::Stayed::Reading(still) => return run_as_child(target, args, marker, still),
+    };
     #[cfg(not(unix))]
     let err = {
         #[expect(
@@ -2164,6 +2234,44 @@ fn exec_marked<A: AsRef<std::ffi::OsStr>>(
     };
     eprintln!("atpkg {VERB}: failed to exec {}: {err}", target.display());
     std::process::ExitCode::from(127)
+}
+
+/// RUN THE BUILD AS THIS FRONT'S CHILD, where the front may not become it
+/// (`becoming::Stayed::Reading`: an exec would wait, for as long as another process's exec
+/// takes and with no way to end the wait, on this front's own thread in the process table):
+/// `target` on `args` with this process's descriptors and environment, [`aterm_capacity::COVER_ENV`]
+/// set to `marker` where one is given, supervised as a build that claims nothing ([`supervise`]:
+/// every signal that reaches this front for it passed on). Unlike the exec, the child starts
+/// with `SIGPIPE` at its default and no signal blocked, whatever this front was started with.
+/// A front that claimed never gets here: it closes its gate before its claim leaves it and
+/// keeps it closed until it execs (`front_exec_bounded`), so this runs the calls that claim
+/// nothing and the ones another claim covers. This front's end is the build's ([`end_like`]);
+/// 127, said, where the build did not start.
+#[cfg(target_os = "macos")]
+fn run_as_child<A: AsRef<std::ffi::OsStr>>(
+    target: &Path,
+    args: &[A],
+    marker: Option<&str>,
+    still: aterm_sysprobe::exec_gate::StillReading,
+) -> std::process::ExitCode {
+    let mut say = |line: &str| eprintln!("{line}");
+    say(&format!(
+        "{SAYS}: {still}; an exec would wait on it, so the build runs as this front's child"
+    ));
+    let mut command = aterm_uds::spawnfd::transparent(target).into_command();
+    command.args(args.iter().map(AsRef::as_ref));
+    if let Some(marker) = marker {
+        command.env(aterm_capacity::COVER_ENV, marker);
+    }
+    match supervise(None, &mut command, &mut say) {
+        Ok(status) => end_like(status),
+        Err(e) => {
+            say(&format!(
+                "{SAYS}: running the build as this front's child failed ({e})"
+            ));
+            std::process::ExitCode::from(127)
+        }
+    }
 }
 
 /// The tool `target` is, by its name: the lint's own binary, else `targo`.
@@ -2456,6 +2564,15 @@ fn usage() -> std::process::ExitCode {
 /// no holder arms, the build runs under the claim here as [`supervise`] runs it, and only where
 /// that cannot start does it run unclaimed, said. An interrupt that ended the wait ends this
 /// process as it would have ended the build ([`stopped_by`]).
+///
+/// On macOS this process becomes `target` only with its exec gate closed
+/// (`aterm_sysprobe::exec_gate`): an exec made while a thread of this process is in a
+/// process-table read waits on that thread for as long as another process's exec takes, and no
+/// signal ends the wait. A claimed front closes the gate before its claim leaves it and keeps it
+/// closed until it execs; where a read is still in the kernel it keeps the claim and runs the
+/// build under it here, said, as where no holder arms. A call that claims nothing runs its build
+/// as this process's child there (`run_as_child`), so in both cases the build's pid is then not
+/// this one.
 #[cfg(unix)]
 pub fn front_exec(
     target: &Path,
@@ -2493,6 +2610,22 @@ fn front_exec_bounded(
     };
     let args = limited_jobs(args, held.claim.cores());
     let args = args.as_slice();
+    // The gate is closed before the claim leaves this front: a holder judges the end of the pid
+    // it watches, which must then be the build's own, and a front that found out only at its
+    // exec would run the build as a child the holder cannot tell from it.
+    #[cfg(target_os = "macos")]
+    let closed = {
+        if aterm_types::dev_seam!(READ_HELD_ENV).is_some() {
+            std::mem::forget(aterm_sysprobe::exec_gate::reading());
+        }
+        match aterm_sysprobe::exec_gate::close(aterm_sysprobe::exec_gate::SETTLES_WITHIN) {
+            Ok(closed) => closed,
+            Err(still) => {
+                let why = format!("{still}; an exec would wait on it");
+                return under_this_front(held, target, args, &why, &mut say);
+            }
+        }
+    };
     match hand_over(&held) {
         Ok(()) => {
             let marker = std::env::var_os(aterm_capacity::COVER_ENV)
@@ -2501,23 +2634,45 @@ fn front_exec_bounded(
             exec_marked(target, args, marker.as_deref())
         }
         Err(why) => {
-            say(&format!(
-                "{SAYS}: its claim's holder did not arm ({why}); the build runs under this front"
-            ));
-            let mut command = aterm_uds::spawnfd::transparent(target).into_command();
-            command.args(args);
-            match supervise(Some(held), &mut command, &mut say) {
-                Ok(status) => end_like(status),
-                Err(e) => {
-                    say(&format!(
-                        "{SAYS}: running the build under its claim failed ({e}); no unclaimed retry"
-                    ));
-                    std::process::ExitCode::from(127)
-                }
-            }
+            // The build's meter reads the process table: it reads again from here.
+            #[cfg(target_os = "macos")]
+            drop(closed);
+            let why = format!("its claim's holder did not arm ({why})");
+            under_this_front(held, target, args, &why, &mut say)
         }
     }
 }
+
+/// Run the claimed build as this front's child under its claim ([`supervise`]), saying `why` it
+/// did not become it. This front's end is the build's ([`end_like`]); 127, said, where the build
+/// did not start: it is not retried unclaimed.
+#[cfg(unix)]
+fn under_this_front(
+    held: Held,
+    target: &Path,
+    args: &[String],
+    why: &str,
+    say: &mut dyn FnMut(&str),
+) -> std::process::ExitCode {
+    say(&format!("{SAYS}: {why}; the build runs under this front"));
+    let mut command = aterm_uds::spawnfd::transparent(target).into_command();
+    command.args(args);
+    match supervise(Some(held), &mut command, say) {
+        Ok(status) => end_like(status),
+        Err(e) => {
+            say(&format!(
+                "{SAYS}: running the build under its claim failed ({e}); no unclaimed retry"
+            ));
+            std::process::ExitCode::from(127)
+        }
+    }
+}
+
+/// TEST SEAM ([`aterm_types::dev_seam!`]): set, a claimed front counts one process-table read of
+/// its own as in the kernel for good before it closes its exec gate, as its table reader's
+/// thread (`lane-kproc_table`) behind another process's exec is.
+#[cfg(target_os = "macos")]
+pub const READ_HELD_ENV: &str = "ATERM_BUILD_FRONT_READ_HELD";
 
 /// The longest a front waits for its holder to arm ([`hand_over`]): a production hang bound, past
 /// which the build runs under the front instead.

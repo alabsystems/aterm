@@ -28,7 +28,7 @@ pub(super) fn composition(value: Composition) -> aterm_land::Composition {
             aterm_land::Composition::Rechecks { tree, shared }
         }
         Composition::Held(why) => aterm_land::Composition::Held(why),
-        Composition::Doomed(why) => aterm_land::Composition::Doomed(why),
+        Composition::Doomed(doom) => aterm_land::Composition::Doomed(doom.why),
     }
 }
 impl Qualified {
@@ -64,6 +64,16 @@ struct Adapter<'a, 'g, 's> {
     moved: Option<String>,
     /// What a later run must settle before it pushes again ([`Wire::unsettled`]).
     unsettled: Option<String>,
+    /// The last tip the push tested ([`Host::composition`]): the revision it tested it for and
+    /// what it found, which the compose or abort its event says is recorded from.
+    seen: std::cell::RefCell<Option<Seen>>,
+}
+
+/// A tip the push tested against a revision, and what it found ([`Adapter::seen`]).
+struct Seen {
+    tip: String,
+    revision: Revision,
+    found: Composition,
 }
 
 fn limits() -> aterm_land::Limits {
@@ -76,7 +86,11 @@ fn limits() -> aterm_land::Limits {
 
 /// Land `revision` (the checkout's HEAD over the main commit it merged), as `own`, from its
 /// first qualification: a judgment, or `resumed`, the one an earlier run kept for it, with
-/// main's tip where it `moved` since.
+/// main's tip where it `moved` since. What the verdict reads goes to `tally` ([`conclude`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the landing's state as its first step finds it"
+)]
 pub(super) fn drive(
     git: &Git<'_>,
     seams: &mut Seams<'_>,
@@ -85,6 +99,7 @@ pub(super) fn drive(
     revision: Revision,
     resumed: Option<Kept>,
     moved: Option<String>,
+    tally: &mut Tally,
 ) -> Result<i32, String> {
     let mut adapter = Adapter {
         git,
@@ -92,12 +107,12 @@ pub(super) fn drive(
         subject,
         words: own.words,
         held: Held {
-            branch: None,
             cone: revision.base.clone(),
             stated: Stated::default(),
             reach: std::cell::RefCell::new(None),
             own: own.image,
             hop: 0,
+            tally: Tally::default(),
         },
         next: None,
         resumed,
@@ -106,9 +121,10 @@ pub(super) fn drive(
         rounded: false,
         moved,
         unsettled: None,
+        seen: std::cell::RefCell::new(None),
     };
     let ran = aterm_land::run(&mut adapter, revision, limits());
-    conclude(adapter, ran)
+    conclude(adapter, ran, tally)
 }
 
 /// Land `revision`, the checkout's HEAD, a merge of the main commit `revision.base` into the
@@ -117,11 +133,15 @@ pub(super) fn drive(
 /// new push session and no compositions spent), with the kept receipt and main's tip where it
 /// `moved` past the merged commit. The kept judgment stands for the merge's first parent and
 /// never for the merge, so nothing is resumed at the push: the round runs, or, where no round
-/// answers for the merge, a full judgment over the cone since the merged commit, which is also
-/// the cone the branch's crates are read over. So are the tool's own merge after a round of it
-/// that was killed or went red, and a merge a person made of a main that did not conflict. The
+/// answers for the merge, a full judgment over the cone since the merged commit. So are the
+/// tool's own merge after a round of it that was killed or went red, and a merge a person made
+/// of a main that did not conflict. The
 /// tool's own merge after a full judgment of it began is not: that judgment dropped the record
-/// ([`Host::qualify`]).
+/// ([`Host::qualify`]). What the verdict reads goes to `tally` ([`conclude`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the landing's state as its first step finds it"
+)]
 pub(super) fn resume_merged(
     git: &Git<'_>,
     seams: &mut Seams<'_>,
@@ -130,6 +150,7 @@ pub(super) fn resume_merged(
     revision: Revision,
     kept: Kept,
     moved: Option<String>,
+    tally: &mut Tally,
 ) -> Result<i32, String> {
     let mut adapter = Adapter {
         git,
@@ -137,12 +158,12 @@ pub(super) fn resume_merged(
         subject,
         words: own.words,
         held: Held {
-            branch: None,
             cone: revision.base.clone(),
             stated: kept.stated,
             reach: std::cell::RefCell::new(None),
             own: own.image,
             hop: 0,
+            tally: Tally::default(),
         },
         next: None,
         resumed: None,
@@ -151,18 +172,21 @@ pub(super) fn resume_merged(
         rounded: false,
         moved,
         unsettled: None,
+        seen: std::cell::RefCell::new(None),
     };
+    // The round of this merge is the run's first step: a person's merge into a kept judgment.
+    adapter.seams.records.tally.next = Some(land_run::Cause::new("kept-merge", &revision.base, ""));
     let checkpoint = Checkpoint {
         step: aterm_land::Step::Recheck,
         revision,
         composes: 0,
     };
     let ran = aterm_land::resume(&mut adapter, checkpoint, Some(()), limits());
-    conclude(adapter, ran)
+    conclude(adapter, ran, tally)
 }
 
 /// Resume the step `handoff` stopped before, as `own`, with the compositions it spent, the
-/// branch's crates or the cone they are read over, and its receipt; that step hands
+/// cone it carries and its receipt; that step hands
 /// on while it has taken fewer than [`HOPS`] handoffs ([`built`]). A checkpoint past this
 /// build's bounds ([`aterm_land::admit`]) could not run, naming the rerun. A round resumes in
 /// its judgment's push, whose session holds nothing ([`Wire`]): no deadline crosses the hop.
@@ -172,13 +196,17 @@ pub(super) fn resume_merged(
 /// checkout still stands at that commit, the step is not run again: it is that judgment, with
 /// its receipt, as the next run would resume it ([`drive`]). Any other record leaves the step
 /// to run (it judges another revision), and a checkout that left the commit is refused by the
-/// step's own check of it.
+/// step's own check of it. A step that runs, on a checkout that stands at its commit, runs on
+/// that commit's open-issues file held to the rule ([`super::hold_to_rule`]), the merge an
+/// image without the rule handed on amended. What the verdict reads goes to `tally`
+/// ([`conclude`]).
 pub(super) fn resume(
     git: &Git<'_>,
     seams: &mut Seams<'_>,
     own: &Own<'_>,
     subject: &str,
     handoff: Handoff,
+    tally: &mut Tally,
 ) -> Result<i32, String> {
     let Handoff {
         step,
@@ -187,7 +215,6 @@ pub(super) fn resume(
         base,
         composes,
         cone,
-        branch,
         stated,
         ..
     } = handoff;
@@ -212,18 +239,35 @@ pub(super) fn resume(
         }
         Ok(_) | Err(_) => None,
     };
+    // An image without the open-issues rule made the merge it handed on as Git merges the file:
+    // the step runs on that merge held to the rule, as this image's own merge holds it.
+    let held = if resumed.is_none() && standing() {
+        super::hold_to_rule(git, seams, at, base)?
+    } else {
+        None
+    };
+    let checkpoint = match held {
+        Some(head) => Checkpoint {
+            revision: Revision {
+                at: head,
+                base: checkpoint.revision.base.clone(),
+            },
+            ..checkpoint
+        },
+        None => checkpoint,
+    };
     let mut adapter = Adapter {
         git,
         seams,
         subject,
         words: own.words,
         held: Held {
-            branch,
             cone,
             stated,
             reach: std::cell::RefCell::new(None),
             own: own.image,
             hop,
+            tally: Tally::default(),
         },
         next: None,
         resumed,
@@ -232,9 +276,10 @@ pub(super) fn resume(
         rounded: false,
         moved: None,
         unsettled: None,
+        seen: std::cell::RefCell::new(None),
     };
     let ran = aterm_land::resume(&mut adapter, checkpoint, session, limits());
-    conclude(adapter, ran)
+    conclude(adapter, ran, tally)
 }
 
 /// How the landing that ran as `adapter` ends: where a step yielded to another image, its
@@ -244,15 +289,21 @@ pub(super) fn resume(
 /// person commits is judged for what it changed for the branch. Where a round ended it, red or
 /// not run, and the judgment that round extends is still kept for the merge's first parent
 /// ([`Git::kept_parent`]), it says which fix keeps it: the merge amended, never a commit on top.
+/// What the landing's verdict reads goes to `tally`. A hand-over that worked replaced this
+/// process, whose receiver says its own; one that returned failed, and this one's verdict says
+/// what ran here.
 fn conclude(
     mut adapter: Adapter<'_, '_, '_>,
     ran: Result<Outcome<()>, String>,
+    tally: &mut Tally,
 ) -> Result<i32, String> {
+    *tally = std::mem::take(&mut adapter.held.tally);
     let ran = match ran {
         Ok(Outcome::Elsewhere { checkpoint, .. }) => return finish(adapter, checkpoint),
         Ok(Outcome::Exit(code)) => Ok(code),
         Err(why) => Err(why),
     };
+    adapter.seams.records.tally.kept = adapter.kept.is_some();
     let unsettled = adapter.unsettled.take();
     let conflicted = adapter.conflicted;
     let resume = |tree: &String| match &unsettled {
@@ -294,9 +345,8 @@ fn conclude(
 }
 
 /// The handoff of the step `checkpoint` stopped before to the image it yielded to: the
-/// checkpoint, the step's next hop, the receipt, the branch's crates or their cone and the
-/// person's words, written in the checkout's git directory and handed over
-/// ([`Seams::hand_over`]). The file is removed once that returns. A step yields only before it
+/// checkpoint, the step's next hop, the receipt, the cone and the person's words, written in
+/// the checkout's git directory and handed over ([`Seams::hand_over`]). The file is removed once that returns. A step yields only before it
 /// runs, where the engine has merged a new main (a re-judge, a recheck) or the landing is at
 /// its first judgment: no judgment is kept for that HEAD, and a write whose outcome is unknown
 /// ended the landing before it, so the handoff leaves nothing to say.
@@ -310,6 +360,11 @@ fn finish(adapter: Adapter<'_, '_, '_>, checkpoint: Checkpoint) -> Result<i32, S
         ..
     } = adapter;
     let image = next.ok_or("the landing yielded with no image to hand to")?;
+    // An interrupt the landing took ends it here, before a handoff is written: no image runs
+    // after it.
+    if super::stopped(seams) {
+        return Ok(exit::COULD_NOT_RUN);
+    }
     let handoff = Handoff {
         root: git.root.to_owned(),
         image: image.digest.clone(),
@@ -320,8 +375,14 @@ fn finish(adapter: Adapter<'_, '_, '_>, checkpoint: Checkpoint) -> Result<i32, S
         base: checkpoint.revision.base,
         composes: checkpoint.composes,
         cone: held.cone,
-        branch: held.branch,
+        branch: None,
         stated: held.stated,
+        run: Some(handoff::Carried {
+            id: seams.records.run.id.clone(),
+            started: seams.records.run.started,
+            seq: seams.records.tally.seq,
+            cause: seams.records.tally.next.clone(),
+        }),
     };
     let file = git.handoff_file()?;
     handoff::write(&file, &handoff)?;
@@ -339,10 +400,80 @@ fn finish(adapter: Adapter<'_, '_, '_>, checkpoint: Checkpoint) -> Result<i32, S
     let code = (seams.hand_over)(&image, &file, git.root);
     // The receiver took it, or the hand-over failed and nothing will.
     let _ = std::fs::remove_file(&file);
+    // A hand-over an interrupt refused ([`handoff::hand_over`]) is said as one.
+    super::stopped(seams);
     Ok(code)
 }
 
 impl Adapter<'_, '_, '_> {
+    /// The run record `event` makes, and the cause it leaves the next judgment or round
+    /// ([`records::Tally::next`]): a composition is recorded as a compose, a tip that does not
+    /// compose as an abort (`doomed`) of the judgment that passed, each from what the push found
+    /// when it tested that tip ([`Self::seen`]).
+    fn record(&mut self, event: &Event<'_>) {
+        let seen = self.seen.borrow_mut().take();
+        let seen = |tip: &str| seen.filter(|seen| seen.tip == tip);
+        let records = &mut self.seams.records;
+        let now = (records.now)();
+        let at =
+            |seen: &Option<Seen>, kind: land_run::Kind, result: &str, cause: land_run::Cause| {
+                let revision = seen.as_ref().map(|seen| &seen.revision);
+                let tree = match seen.as_ref().map(|seen| &seen.found) {
+                    Some(Composition::Composes { tree, .. }) => tree.clone(),
+                    _ => String::new(),
+                };
+                (
+                    kind,
+                    land_run::Record {
+                        started: now,
+                        head: revision.map(|r| r.at.clone()).unwrap_or_default(),
+                        base: revision.map(|r| r.base.clone()).unwrap_or_default(),
+                        tree,
+                        result: result.to_owned(),
+                        cause: Some(cause),
+                        ..land_run::Record::default()
+                    },
+                )
+            };
+        let made = match event {
+            Event::Composing { tip, why } => Some(at(
+                &seen(tip),
+                land_run::Kind::Compose,
+                "composed",
+                land_run::Cause::new("disjoint", tip, why),
+            )),
+            Event::DoesNotCompose { tip, why } => {
+                let seen = seen(tip);
+                let cause = match seen.as_ref().map(|seen| &seen.found) {
+                    Some(Composition::Doomed(doom)) => records::doomed("doomed", tip, doom),
+                    _ => land_run::Cause::new("doomed", tip, why),
+                };
+                records.tally.next = Some(land_run::Cause::new("doomed", tip, why));
+                Some(at(&seen, land_run::Kind::Abort, "doomed", cause))
+            }
+            Event::RecheckNeeded { tip, shared } => {
+                records.tally.next = Some(land_run::Cause::new("shared", tip, "").sharing(shared));
+                None
+            }
+            Event::MergeDiffers {
+                tip,
+                made,
+                expected,
+            } => {
+                records.tally.next = Some(land_run::Cause::new(
+                    "merge-differs",
+                    tip,
+                    &format!("merging it made {made}, not {expected}"),
+                ));
+                None
+            }
+            _ => None,
+        };
+        if let Some((kind, record)) = made {
+            records.run_record(kind, record, &mut *self.seams.say);
+        }
+    }
+
     /// Keep the judgment of `revision` that just passed ([`Git::keep`]), before anything is
     /// pushed: no ending of the push loses it.
     fn keep(&mut self, revision: &Revision) {
@@ -373,9 +504,24 @@ impl Adapter<'_, '_, '_> {
             && self.git.tree(&revision.at)? == kept.tree
             && revision.base == kept.merged
         {
+            // A kept round names its landing by what it judged, as the run that judged it
+            // would have: Markdown alone where its shared paths are no-reach Markdown, read
+            // again from the commit and the receipt before it (`round_delta`). A read that
+            // fails names it `rechecked`; nothing of the landing reads the name.
+            self.seams.records.tally.markdown = match kept.stated.rechecked.last() {
+                Some(round) if round.after == kept.stated.checked.len() => {
+                    let mut before = kept.stated.clone();
+                    before.rechecked.pop();
+                    super::round_delta(self.git, &revision.at, &round.onto, &before).is_ok_and(
+                        |rounded| matches!(rounded, super::Rounded::Round { markdown: true, .. }),
+                    )
+                }
+                _ => false,
+            };
             self.held.stated = kept.stated;
             self.held.hop = 0;
             self.kept = Some(kept.tree);
+            self.seams.records.tally.resumed = true;
             return Ok(Some(Judgment::Passed(Qualified::new(revision))));
         }
         Err("the kept judgment is not of the revision the landing began with".into())
@@ -388,6 +534,11 @@ impl Host for Adapter<'_, '_, '_> {
     /// handoff either.
     type PushSession = ();
     fn qualify(&mut self, revision: &Revision) -> Result<Judgment<Qualified>, String> {
+        // An interrupt the landing took stops it before the step changes anything: the kept
+        // judgment stays kept, and nothing of the step runs.
+        if super::stopped(self.seams) {
+            return Ok(Judgment::Exit(exit::COULD_NOT_RUN));
+        }
         if let Some(kept) = self.take_resumed(revision)? {
             return Ok(kept);
         }
@@ -425,6 +576,9 @@ impl Host for Adapter<'_, '_, '_> {
         )
     }
     fn recheck(&mut self, revision: &Revision) -> Result<Judgment<Qualified>, String> {
+        if super::stopped(self.seams) {
+            return Ok(Judgment::Exit(exit::COULD_NOT_RUN));
+        }
         if let Some(kept) = self.take_resumed(revision)? {
             return Ok(kept);
         }
@@ -456,15 +610,22 @@ impl Host for Adapter<'_, '_, '_> {
         self.git.moved_from(at)
     }
     fn merge(&mut self, tip: &str) -> Result<aterm_land::Merge, String> {
+        // An interrupt the landing took (during the push before, say) stops it before the
+        // checkout moves: HEAD stays the judged commit, and its judgment stays kept.
+        if super::stopped(self.seams) {
+            return Ok(aterm_land::Merge::Exit(exit::COULD_NOT_RUN));
+        }
         let merged = self.git.merge(tip, self.subject);
         Ok(match merged {
             // HEAD moved past the judged commit (a clean merge, or one the rules resolved): the
-            // kept judgment no longer resumes this checkout at the push.
+            // kept judgment no longer resumes this checkout at the push. The landing's fixes are
+            // committed into the merge, as into the first one.
             Ok(Merge::Clean { resolved }) => {
                 self.kept = None;
                 for line in resolved {
                     (self.seams.say)(&format!("verify land: resolved by rule: {line}"));
                 }
+                super::autofix(self.git, self.seams, tip, true)?;
                 aterm_land::Merge::Clean
             }
             // HEAD is still the judged commit, its merge left for the person: the judgment
@@ -492,14 +653,20 @@ impl Host for Adapter<'_, '_, '_> {
         revision: &Revision,
         tip: &str,
     ) -> Result<aterm_land::Composition, String> {
-        Ok(composition(super::composition(
+        let found = super::composition(
             self.git,
             self.seams.reach,
             &self.held.reach,
             &revision.base,
             tip,
             &revision.at,
-        )?))
+        )?;
+        *self.seen.borrow_mut() = Some(Seen {
+            tip: tip.to_owned(),
+            revision: revision.clone(),
+            found: found.clone(),
+        });
+        Ok(composition(found))
     }
     fn begin_push(&mut self) -> Result<(), String> {
         Ok(())
@@ -515,6 +682,10 @@ impl Host for Adapter<'_, '_, '_> {
         } = request;
         if qualified.at != revision.at || qualified.base != revision.base {
             return Err("landing replaced its actual qualified revision".into());
+        }
+        // An interrupt the landing took stops it before it writes anything.
+        if super::stopped(self.seams) {
+            return Ok(Publication::Done(exit::COULD_NOT_RUN));
         }
         // A resumed landing already read main's new tip: it is composed onto before any write,
         // which onto the kept judgment's own main would be refused.
@@ -570,7 +741,13 @@ impl Host for Adapter<'_, '_, '_> {
             let say = |line: &str| (self.seams.say)(line);
             let say = std::cell::RefCell::new(say);
             let say = |line: &str| (say.borrow_mut())(line);
-            let wire = Wire::new(self.git, self.seams.remote, self.seams.pause, &say);
+            let wire = Wire::new(
+                self.git,
+                self.seams.remote,
+                self.seams.pause,
+                &say,
+                &*self.seams.records.interrupt,
+            );
             let pushed = wire.push(&landing, onto, budget);
             let unsettled = wire.unsettled.take();
             drop(wire);
@@ -589,8 +766,27 @@ impl Host for Adapter<'_, '_, '_> {
                 }
                 let _ = self.git.forget();
                 self.kept = None;
+                let stated = &self.held.stated;
+                let tally = &mut self.seams.records.tally;
+                let rounded = stated
+                    .rechecked
+                    .last()
+                    .is_some_and(|round| round.after == stated.checked.len());
+                let kind = match (rounded, tally.markdown) {
+                    (true, true) => "markdown",
+                    (true, false) => "rechecked",
+                    (false, _) if onto != revision.base => "composed",
+                    (false, _) => "exact",
+                };
+                tally.landing = Some(land_run::Landing {
+                    commit: landing.clone(),
+                    onto: onto.to_owned(),
+                    kind: kind.to_owned(),
+                    resumed: tally.resumed,
+                });
                 let adopted = self.git.adopt(&landing, &revision.at);
                 (self.seams.say)(&landed_line(&landing, &self.held.stated));
+                self.held.tally.landed = Some(landing);
                 if let Err(why) = adopted {
                     (self.seams.say)(&format!(
                         "verify land: the landing is on {REMOTE}/{MAIN}, but {why}"
@@ -601,6 +797,7 @@ impl Host for Adapter<'_, '_, '_> {
         }
     }
     fn event(&mut self, event: Event<'_>) {
+        self.record(&event);
         let line = match event {
             // Only a resumed step reads the checkout while it holds a hop: before it runs.
             Event::CheckoutMoved(why) if self.held.hop > 0 => {

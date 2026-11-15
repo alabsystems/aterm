@@ -709,6 +709,22 @@ impl Grid {
     }
 
     /// Set the retained scrollback line limit (`None` = unlimited).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ScrollbackHandoff",
+            action = "Raise",
+            project = "grid::scrollback_offload::tests::handoff_environment_actions_match_grid_and_reject_wrong_rows"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ScrollbackHandoff",
+            action = "Lower",
+            project = "grid::scrollback_offload::tests::handoff_environment_actions_match_grid_and_reject_wrong_rows"
+        )
+    )]
     pub fn set_scrollback_line_limit(&mut self, limit: Option<usize>) {
         // The worker owns the store during an off-thread reflow. Keep the
         // newest request in the detach snapshot so the getter is truthful and

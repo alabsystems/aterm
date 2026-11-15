@@ -187,7 +187,7 @@ fn transition_with(before: &ModelState, action: &str, kind: i64, fault: Fault) -
     if kind == 22 {
         state.membership = Stored::Revoked;
         state.failed = true;
-        state.pending.insert("unapplied".into(), "00".into());
+        state.failed = true;
     }
     let (reply, legacy) = transport_result(kind, &f);
     if (3..=11).contains(&kind) {

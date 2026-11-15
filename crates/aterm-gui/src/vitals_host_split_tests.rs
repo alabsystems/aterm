@@ -16,6 +16,8 @@ use super::*;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Reads {
     coalitions: usize,
+    /// All frontend process sweeps, whether or not they ask for coalition identities.
+    sweeps: usize,
     /// Sweeps that read each process's coalition.
     swept: usize,
     /// Sweeps that read the pid version of each process whose start they
@@ -42,6 +44,7 @@ thread_local! {
     static READS: Cell<Reads> = const {
         Cell::new(Reads {
             coalitions: 0,
+            sweeps: 0,
             swept: 0,
             versioned: 0,
             births: 0,
@@ -65,6 +68,7 @@ fn count(read: impl FnOnce(&mut Reads)) {
 const STAND_IN: CoalProbe = CoalProbe {
     self_check: |_| Ok(1),
     sweep: |opts, ids| {
+        count(|r| r.sweeps += 1);
         if opts.coalitions {
             count(|r| r.swept += 1);
         }
@@ -256,11 +260,38 @@ fn split_ticks_ride_the_bars_and_an_armed_pull_only() {
 }
 
 /// The coalitions are read at every reading while the lane is on, whatever asked for it: they
-/// are the start counter's read (record §8.2), and a split tick's split takes that same read.
-/// Only a split tick sweeps each process's coalition and moves the split's clock.
+/// are the start counter's read (record §8.2). Every whole reading materializes the same
+/// counter table and cached process coalition ids, while signature details keep their cadence.
 #[test]
-fn the_coalitions_are_read_every_reading_and_split_on_split_ticks_only() {
+fn whole_readings_materialize_existing_coalitions_without_repeating_signature_details() {
     let (mut reader, armed) = stand_in_reader();
+    reader.split.probe.sweep = |opts, ids| {
+        count(|r| {
+            r.sweeps += 1;
+            r.swept += usize::from(opts.coalitions);
+        });
+        let pid = std::process::id();
+        ids.begin_sweep();
+        let coalition = opts
+            .coalitions
+            .then(|| ids.of(pid, Some(1), || Some(1)))
+            .flatten();
+        ids.end_sweep();
+        Some(aterm_sysprobe::Sweep {
+            procs: vec![aterm_sysprobe::ProcessReading {
+                pid,
+                start: Some(1),
+                version: Some(1),
+                coalition,
+                name: "aterm".into(),
+                birth_ms: Some(1),
+                cpu_ns: Some(0),
+                child_cpu_ns: Some(0),
+                ..aterm_sysprobe::ProcessReading::default()
+            }],
+            truncated: false,
+        })
+    };
     let reads = || {
         let r = READS.get();
         (r.coalitions, r.swept)
@@ -276,29 +307,27 @@ fn the_coalitions_are_read_every_reading_and_split_on_split_ticks_only() {
         jobs_now: true,
         ..bars()
     });
-    assert_eq!(reads(), (2, 0), "the jobs engine's reading");
+    assert_eq!(reads(), (2, 1), "the jobs engine's reading");
     reader.read(&Request {
         deck: false,
         ..bars()
     });
-    assert_eq!(reads(), (3, 0), "the Fleet Monitor tab's");
+    assert_eq!(reads(), (3, 2), "the Fleet Monitor tab's");
     let _ = pull(&mut reader, &mut bars(), Some(Instant::now()), false);
-    assert_eq!(reads(), (4, 0), "an unarmed pull");
+    assert_eq!(reads(), (4, 3), "an unarmed pull");
     assert!(reader.split.last.is_none(), "no split tick yet");
     reader.read(&bars());
-    assert_eq!(reads(), (5, 1), "the bars' first reading");
+    assert_eq!(reads(), (5, 4), "the bars' first reading");
     assert!(reader.split.last.is_some(), "a split tick");
     let kept = reader.split.coalition_ids.len();
-    assert_eq!(
-        kept > 0,
-        cfg!(target_os = "macos"),
-        "its coalitions kept: {kept}"
-    );
+    assert_eq!(kept, 1, "the stand-in process's coalition is kept");
     just_read(&mut reader);
     let tick = reader.split.last;
+    let identities = READS.get().identities;
     reader.read(&bars());
-    assert_eq!(reads(), (6, 1), "the bars' next, at once");
+    assert_eq!(reads(), (6, 5), "the bars' next, at once");
     assert_eq!(reader.split.last, tick, "no split tick");
+    assert_eq!(READS.get().identities, identities, "no signature reread");
     assert_eq!(
         reader.split.coalition_ids.len(),
         kept,
@@ -309,7 +338,7 @@ fn the_coalitions_are_read_every_reading_and_split_on_split_ticks_only() {
         assert!(!reader.split_cold(), "the last split tick is fresh");
         let _ = pull(&mut reader, &mut bars(), Some(Instant::now()), false);
     }
-    assert_eq!(reads(), (7, 2), "a warm pull while armed");
+    assert_eq!(reads(), (7, 6), "a warm pull while armed");
 }
 
 thread_local! {
@@ -371,14 +400,23 @@ fn the_start_counter_rides_every_reading() {
             reader.read_machine(&hidden)
         };
         let r = READS.take();
+        assert_eq!(
+            r.sweeps,
+            usize::from(whole),
+            "exactly one sweep per whole reading"
+        );
+        assert_eq!(
+            r.identities, 0,
+            "counter reads do not add a signature detail read"
+        );
         (next.facts.flow, (r.coalitions, r.swept))
     };
     for whole in [false, true] {
         let (flow, reads) = flows(GROWING, whole);
         assert_eq!(
             reads,
-            (2, 0),
-            "whole: {whole}: one read a reading, no split"
+            (2, usize::from(whole)),
+            "whole: {whole}: one counter read per reading, coalition identities on the whole sweep"
         );
         let flow = flow.expect("a flow");
         assert!(flow.starts_ps > 0.0, "{flow:?}");
@@ -472,6 +510,7 @@ fn an_armed_pull_with_no_fresh_split_tick_reads_a_pair_and_has_a_window() {
     let stale = || Instant::now().checked_sub(gap);
     reader.epoch = reader.epoch.checked_sub(gap).expect("a minute since boot");
     reader.split.last = stale();
+    reader.split.last_accounting = stale();
     assert!(reader.split_cold(), "a base too old for a window");
     let snap = pull(&mut reader, &mut bars(), Some(Instant::now()), false);
     assert_eq!(READS.take().coalitions, 2, "cold for the split alone");
@@ -484,8 +523,8 @@ fn an_armed_pull_with_no_fresh_split_tick_reads_a_pair_and_has_a_window() {
     let r = READS.take();
     assert_eq!(
         (r.coalitions, r.swept),
-        (1, 0),
-        "the start counter's read, and no split"
+        (1, 1),
+        "the start counter's table also reaches the whole accounting sample"
     );
 }
 
@@ -534,6 +573,7 @@ fn a_pull_is_cold_for_the_split_a_margin_inside_the_longest_window() {
     let mut split = SplitReader::new(STAND_IN, armed);
     let t0 = Instant::now();
     split.last = Some(t0);
+    split.last_accounting = Some(t0);
     let hair = t0 + SPLIT_WINDOW_MAX - Duration::from_millis(100);
     let inside = t0 + SPLIT_WINDOW_MAX - SPLIT_COLD_MARGIN - Duration::from_millis(100);
     assert!(!split.cold(hair), "unarmed");
@@ -955,7 +995,16 @@ fn tick(split: &mut SplitReader, procs: Vec<ProcSample>) -> Sample {
 
 /// One split tick over `procs`, each process's pid version read as the
 /// sweep reads it.
-fn tick_at(split: &mut SplitReader, mut procs: Vec<ProcSample>, now: Instant) -> Sample {
+fn tick_at(split: &mut SplitReader, procs: Vec<ProcSample>, now: Instant) -> Sample {
+    tick_details_at(split, procs, now, true)
+}
+
+fn tick_details_at(
+    split: &mut SplitReader,
+    mut procs: Vec<ProcSample>,
+    now: Instant,
+    details: bool,
+) -> Sample {
     for p in &mut procs {
         p.version = (split.probe.version)(p.pid);
     }
@@ -964,8 +1013,80 @@ fn tick_at(split: &mut SplitReader, mut procs: Vec<ProcSample>, now: Instant) ->
         ..Sample::default()
     };
     let read = (split.probe.coalitions)().expect("the stand-in's list");
-    split.fill(&mut sample, read, now);
+    split.fill(&mut sample, read, now, details);
     sample
+}
+
+#[test]
+fn every_whole_counter_read_reuses_only_current_versioned_identity_without_os_signature_reads() {
+    kernel(&[(1, "launchd", 1_000, true)]);
+    let armed = gauge();
+    let _armed = armed.arm();
+    let mut split = SplitReader::new(STAND_IN, armed);
+    let now = Instant::now();
+    let process = || vec![swept(1, 1, "launchd", 1)];
+    READS.take();
+    assert_eq!(
+        sent(&tick_details_at(&mut split, process(), now, true))[0].3,
+        Voucher::Apple
+    );
+    assert_eq!(READS.take().identities, 1);
+    let next = now + Duration::from_secs(1);
+    assert_eq!(
+        sent(&tick_details_at(&mut split, process(), next, false))[0].3,
+        Voucher::Apple
+    );
+    assert_eq!(
+        READS.take().identities,
+        0,
+        "whole accounting reuses the signature under its observed pid version"
+    );
+    assert_eq!(
+        split.last,
+        Some(now),
+        "signature detail cadence stays independent of whole counters"
+    );
+    assert_eq!(split.last_accounting, Some(next));
+
+    EXECS.set(EXECS.get() + 1);
+    let changed = tick_details_at(&mut split, process(), next + Duration::from_secs(1), false);
+    assert_eq!(
+        sent(&changed)[0].3,
+        Voucher::Unknown,
+        "an exec never inherits the old image's signature"
+    );
+    assert_eq!(
+        READS.take().identities,
+        0,
+        "a nondetail read does no signature syscall even after exec"
+    );
+    assert_eq!(
+        sent(&tick_details_at(
+            &mut split,
+            process(),
+            next + Duration::from_secs(2),
+            true
+        ))[0]
+            .3,
+        Voucher::Apple
+    );
+    assert_eq!(READS.take().identities, 1);
+
+    UNVERSIONED.set(Some(1));
+    let unread = tick_details_at(&mut split, process(), next + Duration::from_secs(3), false);
+    UNVERSIONED.set(None);
+    assert_eq!(
+        sent(&unread)[0].3,
+        Voucher::Unknown,
+        "a missing version cannot vouch for a cached signature"
+    );
+    assert_eq!(READS.take().identities, 0);
+    let fresh = now + SPLIT_WINDOW_MAX;
+    tick_details_at(&mut split, process(), fresh, false);
+    assert!(
+        !split.cold(fresh),
+        "fresh whole counters do not need a second cold baseline when signature details are old"
+    );
 }
 
 fn sent(s: &Sample) -> Vec<(u32, i64, &str, Voucher)> {
@@ -1180,6 +1301,7 @@ thread_local! {
 const FOREIGN: CoalProbe = CoalProbe {
     sweep: |opts, _| {
         count(|r| {
+            r.sweeps += 1;
             r.swept += usize::from(opts.coalitions);
             r.versioned += usize::from(opts.versions);
         });
@@ -1259,6 +1381,7 @@ fn another_users_births_are_read_once_across_plain_readings_and_split_ticks() {
     let r = READS.take();
     assert_eq!((r.tables, r.births), (1, 0), "the table, once");
     assert_eq!(r.swept, 1, "the first, a split tick");
+    assert_eq!(r.sweeps, 1, "one frontend sweep");
     assert!(all_born(&reader), "{:?}", reader.split.births);
 
     for k in 1..=8 {
@@ -1273,9 +1396,13 @@ fn another_users_births_are_read_once_across_plain_readings_and_split_ticks() {
     let r = READS.take();
     assert_eq!((r.tables, r.births), (0, 0), "every birth kept");
     assert_eq!(
-        (r.swept, r.versioned),
-        (2, 8),
-        "6 plain readings and 2 split ticks, each sweep reading versions"
+        (r.sweeps, r.swept, r.versioned),
+        (8, 8, 8),
+        "each whole reading maps coalitions and versions in its one frontend sweep"
+    );
+    assert_eq!(
+        r.identities, 0,
+        "the two detail ticks reuse unchanged versioned signatures"
     );
 
     rows(Some(99_000));
@@ -1283,7 +1410,15 @@ fn another_users_births_are_read_once_across_plain_readings_and_split_ticks() {
     just_read(&mut reader);
     let _ = reader.read(&bars());
     let r = READS.take();
-    assert_eq!((r.swept, r.tables, r.births), (0, 0, 1), "NEGATIVE CONTROL");
+    assert_eq!(
+        (r.sweeps, r.swept, r.tables, r.births),
+        (1, 1, 0, 1),
+        "NEGATIVE CONTROL"
+    );
+    assert_eq!(
+        r.identities, 0,
+        "a nondetail reading does not inspect the new image's signature"
+    );
     assert_eq!(
         born(&reader, again),
         Some(99_000),
@@ -1294,6 +1429,7 @@ fn another_users_births_are_read_once_across_plain_readings_and_split_ticks() {
     assert_eq!(born(&reader, again), Some(99_000));
     let r = READS.take();
     assert_eq!((r.tables, r.births), (0, 0), "kept under its new version");
+    assert_eq!((r.sweeps, r.swept, r.identities), (1, 1, 0));
 }
 
 #[test]
@@ -1568,6 +1704,7 @@ fn births_ride_every_whole_reading() {
     let (mut reader, _) = stand_in_reader();
     kernel(&[(std::process::id(), &own_swept_name(), BORN, false)]);
     no_split_falls_due(&mut reader);
+    let details_at = reader.split.last;
     READS.take();
     let _ = reader.read_machine(&Request {
         machine_only: true,
@@ -1575,8 +1712,8 @@ fn births_ride_every_whole_reading() {
     });
     let r = READS.take();
     assert_eq!(
-        (r.births, r.tables, r.swept),
-        (0, 0, 0),
+        (r.births, r.tables, r.sweeps, r.swept, r.identities),
+        (0, 0, 0, 0, 0),
         "NEGATIVE CONTROL: a machine-only reading"
     );
     let unseen = Request {
@@ -1604,7 +1741,16 @@ fn births_ride_every_whole_reading() {
     ] {
         let snap = reader.read(&req);
         let r = READS.take();
-        assert_eq!(r.swept, 0, "{why}: not a split tick");
+        assert_eq!(
+            (r.sweeps, r.swept, r.coalitions),
+            (1, 1, 1),
+            "{why}: one whole reading refreshes the existing accounting counters"
+        );
+        assert_eq!(r.identities, 0, "{why}: no signature detail tick");
+        assert_eq!(
+            reader.split.last, details_at,
+            "{why}: detail cadence stays unchanged"
+        );
         assert_eq!(own_birth(&snap), (Some(BORN), Some(BORN)), "{why}");
     }
 }
@@ -1716,11 +1862,44 @@ fn births_do_not_need_the_coalitions_lane() {
 #[test]
 fn the_kernels_birth_reaches_a_reading_between_split_ticks() {
     let mut reader = Reader::new(Arc::default());
-    reader.split = SplitReader::new(CoalProbe::KERNEL, gauge());
+    reader.split = SplitReader::new(
+        CoalProbe {
+            sweep: |opts, ids| {
+                count(|r| {
+                    r.sweeps += 1;
+                    r.swept += usize::from(opts.coalitions);
+                });
+                (CoalProbe::KERNEL.sweep)(opts, ids)
+            },
+            coalitions: || {
+                count(|r| r.coalitions += 1);
+                (CoalProbe::KERNEL.coalitions)()
+            },
+            identity: |pid| {
+                count(|r| r.identities += 1);
+                (CoalProbe::KERNEL.identity)(pid)
+            },
+            ..CoalProbe::KERNEL
+        },
+        gauge(),
+    );
     no_split_falls_due(&mut reader);
+    let details_at = reader.split.last;
+    READS.take();
     let _ = reader.read(&bars());
     let snap = reader.read(&bars());
-    assert!(reader.split.coalition_ids.is_empty(), "no split tick");
+    let r = READS.take();
+    let mapped = 2 * usize::from(reader.split.lane.on());
+    assert_eq!(
+        (r.sweeps, r.swept, r.coalitions, r.identities),
+        (2, mapped, mapped, 0),
+        "each whole reading reuses one frontend sweep and refreshes counters without signature details"
+    );
+    assert_eq!(reader.split.last, details_at, "no signature detail tick");
+    assert!(
+        !reader.split.lane.on() || !reader.split.coalition_ids.is_empty(),
+        "the live accounting lane keeps versioned coalition identities between detail ticks"
+    );
     let bsd =
         aterm_uds::process::read_process_birth(i32::try_from(std::process::id()).expect("a pid"))
             .expect("its BSD info");

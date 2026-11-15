@@ -1500,17 +1500,16 @@ fn refresh_refuses_missing_main_symbolic_tracking_and_concurrent_ref_changes() {
     git(&source, &["push", "-q", bare.to_str().unwrap(), "main"]);
     remote.fetch_exact(&old).unwrap();
     remote.fetch_exact(&new).unwrap();
-    remote.record_main(None, &old).unwrap();
+    assert!(remote.record_main(None, &old).unwrap());
     let expected = remote.tracking_main().unwrap();
     git(&target, &["update-ref", ORIGIN_MAIN, &head]);
-    assert!(
-        remote
-            .record_main(expected.as_deref(), &new)
-            .unwrap_err()
-            .contains("changed")
-    );
+    // Another refresh moved the ref: nothing is recorded over it, and the caller reads again.
+    assert!(!remote.record_main(expected.as_deref(), &new).unwrap());
     assert_eq!(git(&target, &["rev-parse", ORIGIN_MAIN]), head);
-    assert!(remote.record_main(None, &new).is_err());
+    assert!(!remote.record_main(None, &new).unwrap());
+    assert_eq!(git(&target, &["rev-parse", ORIGIN_MAIN]), head);
+    // One that recorded this same reading left nothing to write.
+    assert!(remote.record_main(expected.as_deref(), &head).unwrap());
 
     git(&target, &["update-ref", ORIGIN_MAIN, &old]);
     git(
@@ -1890,3 +1889,54 @@ fn malformed_or_unsafe_configuration_does_not_adopt_another_identity() {
     assert!(configured(&dirs).is_err());
     assert!(!dirs.state.exists());
 }
+
+/// A rate-limited refusal of this tool's own client names its reset as agh's command does, so
+/// the run waits for it ([`crate::allowance`]). NEGATIVE CONTROLS: a rate-limited refusal with
+/// no reset, and another kind that carries one, say only their reason.
+#[test]
+fn a_rate_limited_refusal_names_its_reset_and_no_other_refusal_does() {
+    let client = GithubBuilder::new(Router::empty()).build();
+    let limited = agh::Error::new(agh::error::Kind::RateLimited, "core is spent");
+    let said = words(&client, &limited.clone().with_reset(1_794_594_793));
+    assert_eq!(
+        said,
+        "core is spent (agh: rate_limited exit=11 reset=1794594793)"
+    );
+    assert_eq!(
+        crate::allowance::reset_in([said.as_str()]),
+        Some(1_794_594_793)
+    );
+    for other in [
+        limited,
+        agh::Error::new(agh::error::Kind::Forbidden, "core is spent").with_reset(1_794_594_793),
+    ] {
+        let said = words(&client, &other);
+        assert_eq!(said, "core is spent");
+        assert_eq!(crate::allowance::reset_in([said.as_str()]), None);
+    }
+}
+
+/// The reset is read from the line agh itself prints for a refused call, whatever else that
+/// line carries: the parser is held to agh's writer, not to a copy of its words.
+#[test]
+fn the_reset_reads_from_the_line_agh_prints() {
+    let refused = agh::Error::new(
+        agh::error::Kind::RateLimited,
+        "background core read leaves 1000 requests for the release cutter until 1794594793",
+    )
+    .with_sub(agh::Sub::PreRefused)
+    .with_reset(1_794_594_793);
+    let line = refused.line("api", &agh::redact::Redactor::new());
+    assert_eq!(
+        crate::allowance::reset_in([line.as_str()]),
+        Some(1_794_594_793),
+        "{line}"
+    );
+    // Negative control: agh's line for another kind, with the same reset on it.
+    let other = agh::Error::new(agh::error::Kind::Forbidden, "no").with_reset(1_794_594_793);
+    let line = other.line("api", &agh::redact::Redactor::new());
+    assert_eq!(crate::allowance::reset_in([line.as_str()]), None, "{line}");
+}
+
+#[path = "intent_wait_tests.rs"]
+mod intent_wait;

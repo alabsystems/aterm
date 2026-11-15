@@ -21,7 +21,7 @@ fn program_words_match_without_case_from_a_path_and_a_login_dash() {
         ("Agy", Some(Agent::Agy)),
         ("MUSE x", Some(Agent::Muse)),
         (
-            "/Users//x/.local/bin/muse-bin-1.4.10-R6427.1",
+            "/Users/_user0/.local/bin/muse-bin-1.4.10-R6427.1",
             Some(Agent::Muse),
         ),
         ("muse-alab", Some(Agent::Muse)),

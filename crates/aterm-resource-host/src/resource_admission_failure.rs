@@ -67,7 +67,7 @@ impl Owner {
                 // This child was created stopped at exec and was never resumed.
                 // Only its original owned handle is used, never a saved PID.
                 let _ = spawned.child_mut().kill();
-                let _ = spawned.child_mut().try_wait();
+                let _ = crate::resource_accounting::try_reap(spawned.child_mut(), false);
             }
             let finished = match failed.custody.as_mut() {
                 Some(Custody::Fixed(custody)) => custody.try_finish(&self.fence),

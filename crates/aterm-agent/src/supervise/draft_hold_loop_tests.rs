@@ -19,7 +19,8 @@
 //! cell no more for that.
 
 use super::*;
-use crate::supervise::policy::turn_end::{OWN_WORDS_STAND, PERSON_TYPING, SEARCH_DIVERTS};
+use crate::supervise::policy::turn_end::{OWN_WORDS_STAND, SEARCH_DIVERTS};
+use alab_policy::words::PERSON_TYPING;
 
 const SAID: &str = "Stage 1 is in.";
 const HINT: &str = "keep going, then merge when ready";

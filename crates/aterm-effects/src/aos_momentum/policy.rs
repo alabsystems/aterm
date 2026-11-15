@@ -1487,7 +1487,7 @@ const UNMEASURED: Baseline = Baseline {
 #[inline]
 fn measure_lane(s: &Scenario, origin: Instant) -> (Baseline, bool) {
     let mut h = MomentumHost::default();
-    h.attach_sched(
+    h.attach_code(
         origin,
         Sched::Prebuilt(MomentumCode::Shipped),
         BASELINE_BUILD,

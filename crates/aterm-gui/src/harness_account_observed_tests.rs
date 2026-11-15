@@ -15,6 +15,7 @@ fn look(seen: Observation) -> AccountLook {
     AccountLook {
         screen_wall: None,
         profile_env: Vec::new(),
+        token_served: ServedToken::Unnamed(None),
         who: accounts::ProcessLogin {
             login: None,
             default_home: true,

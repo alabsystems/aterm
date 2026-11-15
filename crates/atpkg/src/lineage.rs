@@ -261,12 +261,16 @@ fn find_driver(root: &Path, refusals: &mut Vec<String>) -> Option<PathBuf> {
 
 /// Admit `trustc -vV`'s output: `binary: trustc`, a `trust:` line, a 40-hex `commit-hash`, `release:` and `host:`, and a first line that is a Trust self-report whose short hash is the commit's prefix.
 /// # Errors
-/// One line per missing or inconsistent field.
+/// One line per missing, duplicate or inconsistent identity field.
 pub fn parse_version_verbose(text: &str) -> Result<VersionInfo, Vec<String>> {
-    let field = |key: &str| {
-        text.lines()
-            .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
-            .unwrap_or_default()
+    let mut refusals = Vec::new();
+    let mut field = |key: &str| {
+        let mut values = text.lines().filter_map(|line| line.strip_prefix(key));
+        let value = values.next().unwrap_or_default().trim().to_string();
+        if values.next().is_some() {
+            refusals.push(format!("-vV carries duplicate `{key}` identity fields"));
+        }
+        value
     };
     let first = text.lines().next().unwrap_or_default().trim();
     let (binary, trust, commit, release, host) = (
@@ -276,7 +280,6 @@ pub fn parse_version_verbose(text: &str) -> Result<VersionInfo, Vec<String>> {
         field("release:"),
         field("host:"),
     );
-    let mut refusals = Vec::new();
     if binary != "trustc" {
         refusals.push(format!("-vV says `binary: {binary}`, not `binary: trustc`"));
     }
@@ -322,27 +325,41 @@ pub fn parse_version_verbose(text: &str) -> Result<VersionInfo, Vec<String>> {
     }
 }
 
-/// Run `<trustc> -vV` (bounded) and return its stdout.
-fn probe_version(trustc: &Path) -> Result<String, String> {
-    let mut cmd = aterm_uds::spawnfd::command(trustc);
-    cmd.arg("-vV");
-    let out =
-        crate::doctor::output_bounded_capturing(&mut cmd, VERSION_PROBE).ok_or_else(|| {
-            format!(
-                "{} -vV did not run to completion within {}s",
-                trustc.display(),
-                VERSION_PROBE.as_secs()
-            )
-        })?;
+/// Decode complete compiler-version stdout without replacing malformed bytes.
+/// # Errors
+/// The report is not UTF-8. The error names the invalid offset without echoing its bytes.
+pub fn decode_version_stdout(stdout: Vec<u8>) -> Result<String, String> {
+    String::from_utf8(stdout)
+        .map_err(|error| format!("stdout is not UTF-8: {}", error.utf8_error()))
+}
+
+fn version_output(cmd: &mut aterm_uds::spawnfd::Command) -> Result<String, String> {
+    let out = aterm_uds::deadline::output_until_complete_stdout_with_limit(
+        cmd,
+        std::time::Instant::now() + VERSION_PROBE,
+        aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+    )
+    .map_err(|error| {
+        format!(
+            "could not collect complete stdout ({}s deadline): {error}",
+            VERSION_PROBE.as_secs()
+        )
+    })?;
     if !out.status.success() {
         return Err(format!(
-            "{} -vV exited {}: {}",
-            trustc.display(),
+            "exited {}: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    decode_version_stdout(out.stdout)
+}
+
+/// Run `<trustc> -vV`, requiring complete, size-bounded UTF-8 stdout.
+fn probe_version(trustc: &Path) -> Result<String, String> {
+    let mut cmd = aterm_uds::spawnfd::command(trustc);
+    cmd.arg("-vV");
+    version_output(&mut cmd).map_err(|why| format!("{} -vV {why}", trustc.display()))
 }
 
 /// The content half of [`check_compiler`]: location, head, identity and a clean scan of the compiler's own bytes.

@@ -162,6 +162,7 @@ fn legacy_encoding_cannot_drop_a_new_route_or_settled_image() {
                         "aterm-claude-token-ac-0123456789abcdef",
                     )
                     .unwrap(),
+                    purpose: crate::harness::accounts_pool::Purpose::Select,
                 },
             ));
         }

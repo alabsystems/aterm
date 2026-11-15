@@ -5,11 +5,13 @@
 //! The challenge travels only on the native-owned socket; its acknowledgement
 //! arrives on that member's authenticated SDK connection. Neither is SDK readiness.
 use super::*;
-use std::io::Write;
+use std::io::{Read, Write};
 
 pub(super) struct Control {
     stream: aterm_uds::CtlStream,
     state: Mutex<State>,
+    delivery: Mutex<()>,
+    receipt_failed: std::sync::atomic::AtomicBool,
 }
 enum State {
     Fresh,
@@ -31,12 +33,21 @@ impl Proof {
 impl Control {
     pub(super) fn new(stream: aterm_uds::CtlStream) -> std::io::Result<Self> {
         stream.set_write_timeout(Some(std::time::Duration::from_secs(60)))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
         Ok(Self {
             stream,
             state: Mutex::new(State::Fresh),
+            delivery: Mutex::new(()),
+            receipt_failed: std::sync::atomic::AtomicBool::new(false),
         })
     }
     pub(super) fn bound(&self) -> Result<(Connection, String), Error> {
+        if self
+            .receipt_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Stale);
+        }
         match &*lock(&self.state)? {
             State::Bound(proof) | State::Pending(proof) if !proof.connection.is_live() => {
                 Err(Error::Stale)
@@ -46,7 +57,59 @@ impl Control {
             _ => Err(Error::Stale),
         }
     }
+    pub(super) fn send_attachment(&self, stream: &aterm_uds::CtlStream) -> Result<(), Error> {
+        use std::os::fd::AsFd;
+        let _delivery = lock(&self.delivery)?;
+        self.bound()?;
+        let nonce = aterm_uds::rand::hex_token::<16>().map_err(|_| Error::Unavailable)?;
+        let header = format!("A{nonce}");
+        let result = (|| {
+            let sent = loop {
+                match aterm_uds::fdpass::send_with_fds(
+                    &self.stream,
+                    header.as_bytes(),
+                    &[stream.as_fd()],
+                ) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => break result.map_err(|_| Error::Unavailable)?,
+                }
+            };
+            if sent == 0 || sent > header.len() {
+                return Err(Error::Unavailable);
+            }
+            let mut socket = &self.stream;
+            socket
+                .write_all(&header.as_bytes()[sent..])
+                .map_err(|_| Error::Unavailable)?;
+            // Retain the sender's actual endpoint through physical reception.
+            // A queued SCM_RIGHTS write alone is not a completed handoff.
+            let mut receipt = [0; 32];
+            socket
+                .read_exact(&mut receipt)
+                .map_err(|_| Error::Unavailable)?;
+            if !aterm_digest::ct_eq(&receipt, nonce.as_bytes()) {
+                return Err(Error::Denied);
+            }
+            // The matching physical receipt completes transfer custody. A
+            // concurrent metadata reader must not turn that completed transfer
+            // into an uncertain send. OwnedService separately rechecks the
+            // original constructor, SDK and foreground before exposing a right.
+            Ok(())
+        })();
+        if result.is_err() {
+            // An uncertain receipt cannot be consumed by a different delivery.
+            self.receipt_failed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
     fn begin(&self, connection: &Connection, member: &str, operation: &str) -> Result<(), Error> {
+        if self
+            .receipt_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Stale);
+        }
         let mut state = lock(&self.state)?;
         match &*state {
             State::Pending(proof) | State::Bound(proof) => {
@@ -82,6 +145,12 @@ impl Control {
         operation: &str,
         nonce: &str,
     ) -> Result<(), Error> {
+        if self
+            .receipt_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Stale);
+        }
         let mut state = lock(&self.state)?;
         let matches = match &*state {
             State::Pending(proof) | State::Bound(proof) => {
@@ -111,10 +180,14 @@ impl Registry {
         peer: &Peer,
         connection: &Connection,
         member: &str,
+        controller_operation: &str,
     ) -> Result<Arc<Control>, Error> {
         if !peer.current() || !connection.is_live() {
             return Err(Error::Stale);
         }
+        // This role is issued independently of credential members. Its opaque
+        // id cannot preload credentials or assert SDK readiness.
+        self.frontend_controller(peer, connection, member, controller_operation)?;
         let state = lock(&self.state)?;
         let launch = state
             .launches
@@ -130,16 +203,8 @@ impl Registry {
         {
             return Err(Error::Denied);
         }
-        let actor = state
-            .actors
-            .get(&actor_key(&peer.caller))
-            .ok_or(Error::Stale)?;
-        let issued = actor.issued.get(member).ok_or(Error::Stale)?;
-        if actor.process != peer.process
-            || issued.target.is_some()
-            || issued.parent_use.is_some()
-            || !issued.connection.same(connection)
-        {
+        let issued = state.controllers.get(member).ok_or(Error::Stale)?;
+        if !issued.bound_to(&peer.caller, &peer.process, connection) {
             return Err(Error::Denied);
         }
         let control = lock(&binding.1)?.clone();
@@ -149,27 +214,31 @@ impl Registry {
     /// No nonce is returned on the SDK connection. Exact retries write nothing.
     ///
     /// # Errors
-    /// The child, constructor member or connection is stale, foreign, unbound,
+    /// The child, independent controller or connection is stale, foreign, unbound,
     /// or has no owned socket; another operation owns the proof; socket IO fails.
     pub fn begin_owned_control(
         &self,
         peer: &Peer,
         connection: &Connection,
         member: &str,
+        controller_operation: &str,
         operation: &str,
     ) -> Result<(), Error> {
         if !hex(operation, 32) {
             return Err(Error::Denied);
         }
-        let control = self.owned_control(peer, connection, member)?;
+        let control = self.owned_control(peer, connection, member, controller_operation)?;
         control.begin(connection, member, operation)?;
-        if !Arc::ptr_eq(&control, &self.owned_control(peer, connection, member)?) {
+        if !Arc::ptr_eq(
+            &control,
+            &self.owned_control(peer, connection, member, controller_operation)?,
+        ) {
             return Err(Error::Stale);
         }
         Ok(())
     }
     /// Acknowledge the challenge received on the original owned socket through
-    /// the same admitted constructor member and SDK connection. This grants no
+    /// the same independently issued controller and SDK connection. This grants no
     /// source use, frontend attachment, or SDK readiness.
     ///
     /// # Errors
@@ -179,15 +248,19 @@ impl Registry {
         peer: &Peer,
         connection: &Connection,
         member: &str,
+        controller_operation: &str,
         operation: &str,
         nonce: &str,
     ) -> Result<(), Error> {
         if !hex(operation, 32) || !hex(nonce, 32) {
             return Err(Error::Denied);
         }
-        let control = self.owned_control(peer, connection, member)?;
+        let control = self.owned_control(peer, connection, member, controller_operation)?;
         control.acknowledge(connection, member, operation, nonce)?;
-        if !Arc::ptr_eq(&control, &self.owned_control(peer, connection, member)?) {
+        if !Arc::ptr_eq(
+            &control,
+            &self.owned_control(peer, connection, member, controller_operation)?,
+        ) {
             return Err(Error::Stale);
         }
         Ok(())

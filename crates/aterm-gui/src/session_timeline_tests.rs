@@ -279,7 +279,9 @@ fn supervisor_authority_captures_partial_full_and_expired_ownership() {
 /// the crash relaunch and its passive continuity; under `relaunch,upgrade` it keeps neither
 /// lane, and the change of relaunch ownership breaks that continuity. Under both, turn ends,
 /// approvals, questions and walls stay the built-in engine's, typed by its own holder alone, and
-/// the claim speaks for no box or wall.
+/// the claim speaks for no box or wall. Under every duty, the scope its row allows since HX-07
+/// passed, the typing duties are the harness's, typed by its own connection alone, and the claim
+/// speaks for the boxes and walls.
 #[test]
 fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_nothing_else() {
     use aterm_agent::harness::contract::{Scope, Words, read};
@@ -291,6 +293,10 @@ fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_no
     for (words, taken) in [
         ("scope=upgrade", &[Scope::Upgrade][..]),
         ("scope=relaunch,upgrade", &[Scope::Relaunch, Scope::Upgrade]),
+        (
+            "scope=relaunch,upgrade,turn-end,approvals,questions,walls",
+            &Scope::ALL,
+        ),
     ] {
         let Words::Scoped(claim) = read(holder, &["contract=3", words, "vendor=2.1.310"]) else {
             panic!("the roster admits claude-code-alab's {words}");
@@ -319,7 +325,11 @@ fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_no
             "{words}: never codex-alab's self-claim"
         );
         let live = meta.live_claim(now).expect("the live claim");
-        assert!(!live.speaks_for_boxes_and_walls(), "{words}");
+        assert_eq!(
+            live.speaks_for_boxes_and_walls(),
+            taken.contains(&Scope::Walls),
+            "{words}"
+        );
         let authority = meta.supervisor_authority(now);
         assert_eq!(authority.holder(), Some(holder));
         assert_eq!(authority.contract(), Some(3));
@@ -344,7 +354,8 @@ fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_no
             "{words}: the built-in relaunch lane's continuity follows the relaunch duty"
         );
         drop(meta);
-        // The typing duties stay the built-in holder's; the harness's own connection types none.
+        // A typing duty the claim does not take stays the built-in holder's, and the harness's own
+        // connection types none for it; one it takes is the harness's alone.
         for duty in [
             Scope::TurnEnd,
             Scope::Approvals,
@@ -356,7 +367,7 @@ fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_no
                 revision: authority.revision(),
                 duty,
             };
-            assert!(
+            assert_eq!(
                 SupervisorInputFence::authorize(
                     ctx,
                     request(&host),
@@ -369,9 +380,10 @@ fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_no
                     now,
                 )
                 .is_ok(),
+                !taken.contains(&duty),
                 "{words}: the built-in engine keeps {duty:?}"
             );
-            assert!(
+            assert_eq!(
                 SupervisorInputFence::authorize(
                     ctx,
                     request(holder),
@@ -383,8 +395,9 @@ fn claude_code_alabs_claim_takes_its_scope_from_the_built_in_claude_lanes_and_no
                     },
                     now,
                 )
-                .is_err(),
-                "{words}: claude-code-alab types nothing for {duty:?}"
+                .is_ok(),
+                taken.contains(&duty),
+                "{words}: claude-code-alab types {duty:?} where it takes it"
             );
         }
         before = authority;

@@ -17,6 +17,33 @@ fn time(deadline: Instant) -> io::Result<()> {
         Ok(())
     }
 }
+fn remaining(deadline: Instant) -> io::Result<u64> {
+    let duration = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|value| !value.is_zero())
+        .ok_or(io::ErrorKind::TimedOut)?;
+    duration.as_nanos().try_into().map_err(|_| refused())
+}
+
+/// Original bundle was already delivered and retained by this SAME Root.
+/// Native polling, not the RPC worker or its success reply, owns retirement.
+pub(crate) fn archive(
+    stream: &CtlStream,
+    peer: Peer,
+    hello: &aterm_json::Value,
+    deadline: Instant,
+) -> io::Result<()> {
+    let started = Instant::now();
+    let mut channel = Channel::new(stream.try_clone()?)?;
+    let request = wire::archive::Request::decode(&channel.receive(deadline)?)?;
+    let expected: aterm_json::Value =
+        aterm_json::from_slice(&request.hello()?).map_err(|_| refused())?;
+    if *hello != expected || transport::local_peer(stream)? != peer {
+        return Err(refused());
+    }
+    time(deadline)?;
+    crate::actor::submit_bootstrap_archive(peer, request, stream.try_clone()?, started, deadline)
+}
 struct Receiving {
     // Actual channel closes before preparation can leave settlement's barrier,
     // including actor timeout, dropped reply and partially delivered rights.
@@ -141,7 +168,7 @@ pub(crate) fn serve(
 
     // Costly real Steps/lock acquisition may happen before output exists. The
     // original Job deadline includes queue/preparation and is never an RPC reset.
-    let deadline = receiving.preparing.deadline();
+    let mut deadline = receiving.preparing.deadline();
     let source = wire::SourceAttachment::decode(&receiving.channel.receive(deadline)?)?;
     let token = crate::actor::bootstrap_graph_source_begin(
         receiving.preparing.source_transfer(source.clone())?,
@@ -169,7 +196,71 @@ pub(crate) fn serve(
         .encode()?,
         deadline,
     )?;
-    let output = wire::OutputAttachment::decode(&receiving.channel.receive(deadline)?)?;
+    let mut next = receiving.channel.receive(deadline)?;
+    if let Ok(preparation) = wire::MaterializationPreparation::decode(&next) {
+        let token = crate::actor::bootstrap_graph_materialization_begin(
+            receiving
+                .preparing
+                .materialization_transfer(preparation.clone())?,
+        )?;
+        deadline = deadline.min(token.deadline());
+        let digest = aterm_digest::Sha256::digest(&preparation.binding_preimage()?);
+        let remaining_input_ns = remaining(deadline)?;
+        revalidate()?;
+        receiving.channel.send(
+            &wire::MaterializationReply::Prepared {
+                key: preparation.key,
+                preparation_sha256: digest,
+                remaining_input_ns,
+                contents_directory: token.contents_directory()?,
+                context: Box::new(token.context().clone()),
+            }
+            .encode()?,
+            deadline,
+        )?;
+        next = receiving.channel.receive(deadline)?;
+    }
+    while let Ok(configuration) = wire::ConfigurationAttachment::decode(&next) {
+        let token = crate::actor::bootstrap_graph_configuration_begin(
+            receiving
+                .preparing
+                .configuration_transfer(configuration.clone())?,
+        )?;
+        let configuration_deadline = token.deadline().min(deadline);
+        deadline = configuration_deadline;
+        let digest = aterm_digest::Sha256::digest(&configuration.binding_preimage()?);
+        receiving.channel.send(
+            &wire::ConfigurationReply::Prepared {
+                key: configuration.key.clone(),
+                attachment_sha256: digest,
+                remaining_input_ns: remaining(configuration_deadline)?,
+                context: token.context().clone(),
+            }
+            .encode()?,
+            configuration_deadline,
+        )?;
+        // Install the actual received file in the original native Job before
+        // hashing or other configuration-content checks. A lost reply cannot
+        // drop that original out of native settlement.
+        let description = wire::transport::receive_configuration_description(
+            &mut receiving.channel,
+            configuration_deadline,
+        )?;
+        let current = crate::actor::bootstrap_graph_configuration_retain(token, description)?;
+        revalidate()?;
+        receiving.channel.send(
+            &wire::ConfigurationReply::Attached {
+                key: configuration.key,
+                attachment_sha256: digest,
+                remaining_input_ns: remaining(configuration_deadline)?,
+                context: current,
+            }
+            .encode()?,
+            configuration_deadline,
+        )?;
+        next = receiving.channel.receive(deadline)?;
+    }
+    let output = wire::OutputAttachment::decode(&next)?;
     let token = crate::actor::bootstrap_graph_output_begin(
         receiving.preparing.output_transfer(output.clone())?,
     )?;

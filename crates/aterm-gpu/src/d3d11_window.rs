@@ -343,10 +343,10 @@ impl GpuRenderer {
         source_crop: Option<PresentCrop>,
         effects_transport_shift_y: i32,
     ) -> Result<(), SurfacePresentFailure> {
-        // A minimized window cannot be seen, and DXGI presents to it all the
-        // same: refuse before any compose, unless a
-        // capture or a recording waits on the present.
-        if win.parks_while_minimized() {
+        // A hidden window cannot be seen, and DXGI presents to it all the
+        // same: refuse before any compose, unless a capture, a recording or
+        // the frontend waits on the present (`WindowGpu::parks_while_hidden`).
+        if win.parks_while_hidden() {
             return Err(SurfacePresentFailure::Occluded);
         }
         let source_crop = self

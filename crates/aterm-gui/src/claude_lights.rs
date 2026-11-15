@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::acts::{Act, TaskFace};
 use aterm_agent::harness::footer::{FactKind, FactMask};
 use aterm_agent::harness::lights::{self, Light, Mode, Reading, Screen};
-use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
 use aterm_effects::glass_inks::{GlassInks, HoverPart, field};
 use aterm_window::event::KeyEvent;
@@ -3114,7 +3114,7 @@ impl ChipFace {
         today: Option<i64>,
     ) -> Option<std::borrow::Cow<'static, str>> {
         use crate::autopilot::mode_words;
-        use aterm_agent::supervise::Autopilot;
+        use alab_policy::config::Autopilot;
         if let Some(stopped) = words.stop_under(self) {
             let stop = crate::harness_glass::stop_words(
                 stopped,

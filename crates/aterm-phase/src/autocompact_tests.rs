@@ -4,12 +4,12 @@
 //! Autocompact offer reader tests (`crate::prompt::fixtures::AUTOCOMPACT_*`).
 
 use super::*;
-use crate::phase::Phase;
 use crate::prompt::fixtures::{
     AUTOCOMPACT_80COL_500K, AUTOCOMPACT_FULLSCREEN, AUTOCOMPACT_KEEP_FIRST,
     AUTOCOMPACT_LOWER_FIRST, AUTOCOMPACT_PRESS_AGAIN, AUTOCOMPACT_SAVED, screen,
 };
 use crate::prompt::parse_prompt_v2;
+use alab_policy::vocab::Phase;
 
 fn offer(rows: &[String]) -> Option<Offer> {
     parse_prompt_v2(rows).and_then(|p| p.autocompact_offer())

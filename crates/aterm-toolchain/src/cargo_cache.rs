@@ -30,6 +30,23 @@ impl SourceCacheGuard {
         imp::acquire(cargo_home).map(Self)
     }
 
+    /// Add an exact original-directory restriction before creating the lock.
+    /// The actual lock is opened relative to a retained copy of `original`, not
+    /// a later pathname lookup. This descriptor only narrows ordinary cache
+    /// acquisition; it grants no freshness, source, SDK or producer authority.
+    /// The final component must name the same directory without a symlink.
+    ///
+    /// # Errors
+    /// As [`Self::try_acquire`], or the readonly original directory and selected
+    /// Cargo home differ. Refusal occurs before creating a lock in another home.
+    #[cfg(unix)]
+    pub fn try_acquire_original_directory(
+        cargo_home: &Path,
+        original: std::os::fd::BorrowedFd<'_>,
+    ) -> io::Result<Self> {
+        imp::acquire_original(cargo_home, original).map(Self)
+    }
+
     /// Check that the original Cargo-home spelling and lock still name the held objects.
     /// This is an observation, not protection against arbitrary rename/unlink or manual edits.
     /// An error leaves this guard and its actual shared lock owned by the caller.
@@ -48,7 +65,7 @@ mod imp {
         fs::{File, Metadata, OpenOptions, TryLockError},
         io,
         os::{
-            fd::{AsRawFd as _, FromRawFd as _},
+            fd::{AsRawFd as _, BorrowedFd, FromRawFd as _},
             unix::fs::{MetadataExt as _, OpenOptionsExt as _},
         },
         path::{Path, PathBuf},
@@ -152,21 +169,44 @@ mod imp {
     }
 
     pub(super) fn acquire(cargo_home: &Path) -> io::Result<Held> {
-        acquire_with(cargo_home, supported_filesystem, |file| {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the strict owned Cargo shared source-cache guard's actual kernel acquisition, released by `Held`'s Drop (`LOCK_UN`); no best-effort fallback"
-            )]
-            let result = file.try_lock_shared();
-            result.map_err(|error| match error {
-                TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
-                TryLockError::Error(error) => error,
-            })
+        acquire_with(cargo_home, supported_filesystem, shared_lock)
+    }
+
+    pub(super) fn acquire_original(
+        cargo_home: &Path,
+        original: BorrowedFd<'_>,
+    ) -> io::Result<Held> {
+        acquire_with_original(
+            cargo_home,
+            Some(original),
+            supported_filesystem,
+            shared_lock,
+        )
+    }
+
+    fn shared_lock(file: &File) -> io::Result<()> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the strict owned Cargo shared source-cache guard's actual kernel acquisition, released by `Held`'s Drop (`LOCK_UN`); no best-effort fallback"
+        )]
+        let result = file.try_lock_shared();
+        result.map_err(|error| match error {
+            TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
+            TryLockError::Error(error) => error,
         })
     }
 
     pub(super) fn acquire_with(
         cargo_home: &Path,
+        filesystem: impl FnMut(&File) -> io::Result<()>,
+        lock: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<Held> {
+        acquire_with_original(cargo_home, None, filesystem, lock)
+    }
+
+    pub(super) fn acquire_with_original(
+        cargo_home: &Path,
+        original: Option<BorrowedFd<'_>>,
         mut filesystem: impl FnMut(&File) -> io::Result<()>,
         lock: impl FnOnce(&File) -> io::Result<()>,
     ) -> io::Result<Held> {
@@ -177,10 +217,37 @@ mod imp {
             ));
         }
         let resolved = std::fs::canonicalize(cargo_home)?;
-        let directory = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&resolved)?;
+        let directory = if let Some(original) = original {
+            // Retain the actual supplied description BEFORE any lock creation.
+            // SAFETY: flags observation of the live borrowed descriptor only.
+            let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if flags & libc::O_ACCMODE != libc::O_RDONLY {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "original Cargo directory is not readonly",
+                ));
+            }
+            let directory = File::from(original.try_clone_to_owned()?);
+            let held = directory.metadata()?;
+            let named = std::fs::symlink_metadata(cargo_home)?;
+            if !held.is_dir() || !named.is_dir() || identity(&held) != identity(&named) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Cargo home is not the original directory",
+                ));
+            }
+            directory
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+                .open(&resolved)?
+        };
         filesystem(&directory)?;
         // Open relative to the actual retained directory, never a raced ancestor.
         // SAFETY: the directory descriptor and static NUL-terminated lock name are live;
@@ -227,6 +294,14 @@ mod imp {
     pub(super) struct Held(Infallible);
 
     pub(super) fn acquire(_: &Path) -> io::Result<Held> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict Cargo source-cache guard is unavailable on this platform",
+        ))
+    }
+
+    #[cfg(unix)]
+    pub(super) fn acquire_original(_: &Path, _: std::os::fd::BorrowedFd<'_>) -> io::Result<Held> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "strict Cargo source-cache guard is unavailable on this platform",

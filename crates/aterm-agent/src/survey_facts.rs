@@ -3,11 +3,16 @@
 
 //! Swarm survey facts (C16): host label, version, window liveness (`window` / `window_last`),
 //! session count, per-row account health/enrollment/usage/last-use across pooled CLIs, pure-Rust
-//! SSH host-key `SHA256:…` fingerprint, and vault-server subscriber last-heard records.
+//! SSH host-key `SHA256:…` fingerprint, vault-server subscriber last-heard records, and the
+//! machine's look at its own resources ([`MachineFacts`]).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use aterm_capacity::machine_look::{Limits, LoadScore, MachineLook};
+use aterm_sysprobe::MemoryLevel;
+use aterm_types::look_words;
 
 use crate::ai::connector::Cli;
 use crate::harness::accounts;
@@ -110,8 +115,20 @@ pub struct SwarmSurveyFacts {
     /// The home this aterm runs under, absolute (`home=`): where a fleet spawn's `cwd=~/…`
     /// resolves. `None` from an aterm that says nothing of it, which a reader takes as unknown.
     pub home: Option<String>,
-    /// Free space on the home's volume, in MiB (`home_free_mb=`), read with these facts.
+    /// The home these facts were collected for, absolute, as the path it is: the volume a look
+    /// reads ([`Self::take_latest_look`]). Not on the wire, and read from a path [`Self::home`]
+    /// cannot spell (one that is not UTF-8) as from any other.
+    pub home_dir: Option<PathBuf>,
+    /// Free space on the home's volume, in MiB (`home_free_mb=`): read with the facts, and with
+    /// a look ([`Self::machine`]) the look's own figure ([`MachineLook::disk_free_mb`]), so the
+    /// volume's size and its limit verdict travel beside the free space they were read with.
     pub home_free_mb: Option<u64>,
+    /// This machine's look at its own resources, with its OS, its target and since when it has
+    /// been up (the header's `os=` to `gpu_lim=`, [`MachineFacts::header_tokens`]). An answer
+    /// takes it ([`Self::take_latest_look`]); collected facts carry none, so the 3-minute facts
+    /// push, which no reader of a look reads, takes none. `None` there and from an aterm whose
+    /// facts predate the look (no `m_at_ms=`): every figure is then unknown, never zero.
+    pub machine: Option<MachineFacts>,
     /// The checkouts aterm's setup clones into the home, as its last read found them
     /// ([`repo_home::read_home`]: `repos=`, `repos_at=`, `repos_cut=` and one `repo` line
     /// each); `None` before a read finished, which a reader takes as unknown, never as none.
@@ -121,6 +138,196 @@ pub struct SwarmSurveyFacts {
     /// collector read no updater ([`Self::collect`] reads none; the window and the node job fill
     /// it) and from an aterm older than the words, which a reader takes as unknown.
     pub update: Option<UpdateFact>,
+}
+
+/// What one machine says of itself in a survey header beside its sessions and accounts: its
+/// look at its own resources ([`MachineLook`]: integers in fixed units, capacity beside use, the
+/// four limit verdicts), its OS, the target its packages are built for, and since when it has
+/// been up. Every figure is `None` where it was not read or not sent; none is a zero that stands
+/// for unread, and there is no default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineFacts {
+    /// The look, kept [`aterm_capacity::machine_look::LOOK_KEEP`] per process.
+    pub look: MachineLook,
+    /// Since when the machine has been up, Unix ms on its own clock (`up_since_ms=`): the later
+    /// of its boot and its last wake ([`crate::harness::upgrade_drive::system_awake_since`]),
+    /// so a Mac back from sleep says a new one. Never the start of the answering process, which
+    /// every update replaces. `None` where the OS says neither.
+    pub up_since_ms: Option<u64>,
+    /// `macos`, `linux` or `windows` (`os=`); `None` for any other word.
+    pub os: Option<&'static str>,
+    /// The target triple atpkg selects this machine's builds by (`target=`, one of
+    /// `atpkg::TARGETS`); `None` on a machine atpkg has no target for.
+    pub target: Option<String>,
+}
+
+impl MachineFacts {
+    /// This machine now: the process's kept look with the volume holding `home`
+    /// ([`aterm_capacity::machine_look::latest`]; `None` reads no volume), and what the OS says
+    /// of itself. It reads in process and starts nothing.
+    #[must_use]
+    pub fn now(home: Option<&Path>) -> Self {
+        Self {
+            look: aterm_capacity::machine_look::latest(home),
+            up_since_ms: up_since_ms(crate::harness::upgrade_drive::system_awake_since()),
+            os: look_words::os_of(std::env::consts::OS),
+            target: Some(atpkg::cli::current_triple())
+                .filter(|triple| atpkg::TARGETS.contains(triple))
+                .map(str::to_owned),
+        }
+    }
+
+    /// Space-prefixed `key=value` tokens for the `instance` header, `os=` to `load=`: each
+    /// figure a whole number in the unit its key names, `-` where it is unread. The home
+    /// volume's free space is not among them: it is the header's `home_free_mb=`, which older
+    /// readers know. `load=<level>:<over>` is the deck dial's system-load score in hundredths
+    /// ([`LoadScore`]), `load=-` where its level is unread and `load=<level>:-` where its
+    /// over is.
+    #[must_use]
+    pub fn header_tokens(&self) -> String {
+        let look = &self.look;
+        let load = |at: usize| opt_u32_token(look.load_x100.map(|load| load[at]));
+        let limit = |at: Option<bool>| at.map_or("-", |at| if at { "1" } else { "0" });
+        format!(
+            " os={} target={} m_at_ms={} cores={} load1_x100={} load5_x100={} load15_x100={} \
+             cpu_busy_x100={} rate_win_ms={} mem_total_mb={} mem_used_mb={} mem_avail_mb={} \
+             mem_pressure={} mem_psi60_x100={} swap_used_mb={} swap_total_mb={} \
+             home_total_mb={} gpu_cores={} gpu_busy_pct={} net_link_kbps={} net_rx_kbps={} \
+             net_tx_kbps={} net_other_kbps={} up_since_ms={} cpu_lim={} mem_lim={} disk_lim={} \
+             gpu_lim={} load={}",
+            self.os.unwrap_or("-"),
+            word_token(self.target.as_deref()),
+            opt_u64_token(look.at_unix_ms),
+            opt_u32_token(look.cores),
+            load(0),
+            load(1),
+            load(2),
+            opt_u64_token(look.cpu_busy_x100),
+            opt_u64_token(look.rate_win_ms),
+            opt_u64_token(look.mem_total_mb),
+            opt_u64_token(look.mem_used_mb),
+            opt_u64_token(look.mem_avail_mb),
+            look.mem_pressure.map_or("-", MemoryLevel::as_str),
+            opt_u32_token(look.mem_psi60_x100),
+            opt_u64_token(look.swap_used_mb),
+            opt_u64_token(look.swap_total_mb),
+            opt_u64_token(look.disk_total_mb),
+            opt_u32_token(look.gpu_cores),
+            opt_u32_token(look.gpu_busy_pct.map(u32::from)),
+            opt_u64_token(look.net_link_kbps),
+            opt_u64_token(look.net_rx_kbps),
+            opt_u64_token(look.net_tx_kbps),
+            opt_u64_token(look.net_other_kbps),
+            opt_u64_token(self.up_since_ms),
+            limit(look.limits.cpu),
+            limit(look.limits.mem),
+            limit(look.limits.disk),
+            limit(look.limits.gpu),
+            load_token(look.load),
+        )
+    }
+
+    /// What an `instance` header says of its machine, with the free space its `home_free_mb=`
+    /// said: `None` where it has no `m_at_ms=` (an aterm whose facts predate the look). Each key
+    /// is read by itself and leniently: one that is absent, `-`, not a whole number in its
+    /// range or not a word of its closed set is `None`, and the rest still read. A size or a
+    /// core count of 0 is no capacity and reads `None`; the three loads read together or not at
+    /// all, and so do the load score's two parts ([`load_of`]).
+    fn of_header(header: &[(String, String)], home_free_mb: Option<u64>) -> Option<Self> {
+        field_raw(header, "m_at_ms")?;
+        let n = |key: &str| lenient_u64(header, key);
+        let n32 = |key: &str| n(key).and_then(|n| u32::try_from(n).ok());
+        let limit = |key: &str| match field_raw(header, key)? {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        };
+        Some(Self {
+            look: MachineLook {
+                at_unix_ms: n("m_at_ms"),
+                cores: n32("cores").filter(|cores| *cores > 0),
+                load_x100: n32("load1_x100")
+                    .zip(n32("load5_x100"))
+                    .zip(n32("load15_x100"))
+                    .map(|((one, five), fifteen)| [one, five, fifteen]),
+                cpu_busy_x100: n("cpu_busy_x100"),
+                rate_win_ms: n("rate_win_ms"),
+                mem_total_mb: n("mem_total_mb").filter(|total| *total > 0),
+                mem_used_mb: n("mem_used_mb"),
+                mem_avail_mb: n("mem_avail_mb"),
+                mem_pressure: field_raw(header, "mem_pressure").and_then(memory_level),
+                mem_psi60_x100: n32("mem_psi60_x100"),
+                swap_used_mb: n("swap_used_mb"),
+                swap_total_mb: n("swap_total_mb"),
+                disk_total_mb: n("home_total_mb").filter(|total| *total > 0),
+                disk_free_mb: home_free_mb,
+                gpu_cores: n32("gpu_cores").filter(|cores| *cores > 0),
+                gpu_busy_pct: n("gpu_busy_pct")
+                    .and_then(|pct| u8::try_from(pct).ok())
+                    .filter(|pct| *pct <= 100),
+                net_link_kbps: n("net_link_kbps").filter(|rate| *rate > 0),
+                net_rx_kbps: n("net_rx_kbps"),
+                net_tx_kbps: n("net_tx_kbps"),
+                net_other_kbps: n("net_other_kbps"),
+                limits: Limits {
+                    cpu: limit("cpu_lim"),
+                    mem: limit("mem_lim"),
+                    disk: limit("disk_lim"),
+                    gpu: limit("gpu_lim"),
+                },
+                load: field_raw(header, "load").and_then(load_of),
+            },
+            up_since_ms: n("up_since_ms").filter(|ms| *ms > 0),
+            os: field_raw(header, "os").and_then(look_words::os_of),
+            target: field_raw(header, "target").and_then(look_words::target_of),
+        })
+    }
+}
+
+/// The header's `load=` value: `<level_x100>:<over_x100>`, the over `-` where it is unread;
+/// `-` where the level is unread.
+fn load_token(load: Option<LoadScore>) -> String {
+    load.map_or_else(
+        || "-".to_owned(),
+        |load| {
+            format!(
+                "{}:{}",
+                load.level_x100,
+                opt_u32_token(load.over_x100.map(u32::from))
+            )
+        },
+    )
+}
+
+/// The score a `load=` value names: a whole number `0..=100`, one `:`, then another or `-` (its
+/// over unread); `-`, one number alone, a third part or anything out of range is unread.
+fn load_of(raw: &str) -> Option<LoadScore> {
+    let (level, over) = raw.split_once(':')?;
+    let hundredths = |raw: &str| crate::parse_uint::<u8>(raw).filter(|n| *n <= 100);
+    Some(LoadScore {
+        level_x100: hundredths(level)?,
+        over_x100: match over {
+            "-" => None,
+            over => Some(hundredths(over)?),
+        },
+    })
+}
+
+/// `since_s`, the awake clock in Unix seconds, as the header's Unix ms: `None` where the OS says
+/// none (0), never an epoch that reads as up since 1970.
+fn up_since_ms(since_s: u64) -> Option<u64> {
+    since_s.checked_mul(1000).filter(|ms| *ms > 0)
+}
+
+/// The memory pressure level `raw` names ([`MemoryLevel::as_str`]).
+fn memory_level(raw: &str) -> Option<MemoryLevel> {
+    [
+        MemoryLevel::Normal,
+        MemoryLevel::Warn,
+        MemoryLevel::Critical,
+    ]
+    .into_iter()
+    .find(|level| level.as_str() == raw)
 }
 
 /// What a Mac's ledgers keep of rotations, across its pools: whether rotation has ever happened
@@ -194,7 +401,9 @@ impl SwarmSurveyFacts {
                 moves: None,
                 server_heard: Vec::new(),
                 home: None,
+                home_dir: None,
                 home_free_mb: None,
+                machine: None,
                 repos: None,
                 update: None,
             },
@@ -213,32 +422,7 @@ impl SwarmSurveyFacts {
         node: Option<String>,
         now_secs: i64,
     ) -> Self {
-        let env = Env {
-            state: aterm_state
-                .join("harness")
-                .join(crate::harness::cli::HARNESS),
-            aterm_state: Some(aterm_state.to_path_buf()),
-            cwd: aterm_state.to_path_buf(),
-            home: home.map(Path::to_path_buf),
-            claude_dir: home.map(|h| h.join(".claude")),
-            claude_config_unusable: None,
-            claude_profile: home.map(|h| h.join(".claude.json")),
-            claude_custom_oauth: false,
-            claude_session: None,
-            claude_pid: None,
-            codex_thread: None,
-            codex_home: None,
-            xdg_config_home: None,
-            codex_login: None,
-            agy_conversation: None,
-            now: now_secs,
-            sid: String::new(),
-            sock: None,
-            config: config.map(Path::to_path_buf),
-            claude_tmp: None,
-            claude_running: None,
-            tz_s: 0,
-        };
+        let env = env_at(aterm_state, home, config, now_secs);
         Self::collect_in(&env, sessions, window, node, cached_system_ssh_host_key())
     }
 
@@ -282,7 +466,9 @@ impl SwarmSurveyFacts {
             moves: moved.map(|moves| MoveFacts::of(&moves, env.now)),
             server_heard,
             home: home.and_then(Path::to_str).map(str::to_owned),
+            home_dir: home.map(Path::to_path_buf),
             home_free_mb: home.and_then(free_mb),
+            machine: None,
             repos: home.and_then(repo_home::latest),
             update: None,
         }
@@ -291,11 +477,11 @@ impl SwarmSurveyFacts {
     /// Space-prefixed `key=value` tokens appended onto `survey`'s `instance …` header line: with
     /// `accounts=` counting the `account` lines that follow, and `accounts_unread=` naming the
     /// pools none of whose rows they list because their records could not be read (`-` for none).
-    /// Volume free space (`home_free_mb=`) is a resource fact, and so is where the updater stands
-    /// (the `update*=` words after `roster_unread=`, where [`Self::update`] says it). A reply at
-    /// `content` also adds the home location and its checkouts' count and read (`home=`,
-    /// `repos=`, `repos_at=`, `repos_cut=`): work locations remain content, as a session's folder
-    /// is.
+    /// Volume free space (`home_free_mb=`) is a resource fact, and so are the machine's look
+    /// after it ([`Self::machine_tokens`]) and where the updater stands (the `update*=` words
+    /// after `roster_unread=`, where [`Self::update`] says it). A reply at `content` also adds the
+    /// home location and its checkouts' count and read (`home=`, `repos=`, `repos_at=`,
+    /// `repos_cut=`): work locations remain content, as a session's folder is.
     #[must_use]
     pub fn header_tokens(&self, content: bool) -> String {
         let home = if content {
@@ -311,13 +497,15 @@ impl SwarmSurveyFacts {
             String::new()
         };
         format!(
-            " label={} window={} window_last={} ssh_host_key={} home_free_mb={}{home} accounts={} \
-             accounts_unread={} moves_7d={} move_tries_7d={} last_move={} roster_unread={}{}",
+            " label={} window={} window_last={} ssh_host_key={} home_free_mb={}{}{home} \
+             accounts={} accounts_unread={} moves_7d={} move_tries_7d={} last_move={} \
+             roster_unread={}{}",
             word_token(self.label.as_deref()),
             u8::from(self.window),
             opt_u64_token(self.window_last),
             word_token(self.ssh_host_key.as_deref()),
             opt_u64_token(self.home_free_mb),
+            self.machine_tokens(),
             self.accounts.len(),
             word_token(Some(&self.accounts_unread.join(","))),
             opt_u64_token(self.moves.and_then(|m| u64::try_from(m.proven_7d).ok())),
@@ -336,6 +524,26 @@ impl SwarmSurveyFacts {
         if let Some(home) = self.home.as_deref() {
             self.repos = repo_home::latest(Path::new(home));
         }
+    }
+
+    /// The machine's own header tokens ([`MachineFacts::header_tokens`]), or nothing where
+    /// these facts carry no look: a header then says none of the keys, as an older aterm's.
+    #[must_use]
+    pub fn machine_tokens(&self) -> String {
+        self.machine
+            .as_ref()
+            .map_or_else(String::new, MachineFacts::header_tokens)
+    }
+
+    /// Take this machine's look as it is now ([`MachineFacts::now`], kept
+    /// [`aterm_capacity::machine_look::LOOK_KEEP`]), its volume the one holding
+    /// [`Self::home_dir`], with the free space it read: what an answer does, so facts a listener
+    /// keeps a minute say a look of the reply they go out in, never one a minute behind its
+    /// `at_ms`. Only an answer calls it: a look is taken only inside one.
+    pub fn take_latest_look(&mut self) {
+        let machine = MachineFacts::now(self.home_dir.as_deref());
+        self.home_free_mb = machine.look.disk_free_mb;
+        self.machine = Some(machine);
     }
 
     /// Additional `account …`, `repo …` and `server_heard …` lines emitted in a `survey` reply,
@@ -532,6 +740,8 @@ impl SwarmSurveyFacts {
             })
             .transpose()?;
 
+        let home_free_mb = field_raw(&header, "home_free_mb")
+            .map_or(Ok(None), |raw| parse_opt_u64(raw, "home_free_mb"))?;
         Ok(Self {
             operation_lines,
             node,
@@ -549,8 +759,9 @@ impl SwarmSurveyFacts {
             moves,
             server_heard,
             home: field_raw(&header, "home").and_then(optional_word),
-            home_free_mb: field_raw(&header, "home_free_mb")
-                .map_or(Ok(None), |raw| parse_opt_u64(raw, "home_free_mb"))?,
+            home_dir: None,
+            home_free_mb,
+            machine: MachineFacts::of_header(&header, home_free_mb),
             repos,
             // Lenient: a word outside its grammar reads as unknown and never fails the facts.
             update: UpdateFact::of_fields(&header),
@@ -608,7 +819,7 @@ fn parse_repo_line(fields: &[(String, String)]) -> Result<HomeRepo, String> {
     })
 }
 
-/// The free space on `home`'s volume, in MiB.
+/// The free space on `home`'s volume, in MiB: the one volume read collected facts make.
 fn free_mb(home: &Path) -> Option<u64> {
     aterm_sysprobe::volumes::read_path(home, &aterm_sysprobe::volumes::table())
         .ok()
@@ -640,6 +851,13 @@ fn required_nonempty(fields: &[(String, String)], key: &str) -> Result<String, S
         return Err(format!("empty `{key}` field"));
     }
     Ok(raw.to_owned())
+}
+
+/// A header key's whole number, read leniently: `None` where the key is absent, `-` or anything
+/// but digits in range, and the reply it came in still parses. A figure nothing here acts on
+/// must not cost a machine its whole reply.
+fn lenient_u64(fields: &[(String, String)], key: &str) -> Option<u64> {
+    field_raw(fields, key).and_then(crate::parse_uint::<u64>)
 }
 
 fn optional_word(raw: &str) -> Option<String> {
@@ -747,18 +965,109 @@ pub fn record_window_last(state_dir: &Path, now: u64) -> std::io::Result<()> {
     )
 }
 
+/// The [`Env`] a survey of `aterm_state`, `home` and `config` at `now_secs` reads.
+fn env_at(aterm_state: &Path, home: Option<&Path>, config: Option<&Path>, now_secs: i64) -> Env {
+    Env {
+        state: aterm_state
+            .join("harness")
+            .join(crate::harness::cli::HARNESS),
+        aterm_state: Some(aterm_state.to_path_buf()),
+        cwd: aterm_state.to_path_buf(),
+        home: home.map(Path::to_path_buf),
+        claude_dir: home.map(|h| h.join(".claude")),
+        claude_config_unusable: None,
+        claude_profile: home.map(|h| h.join(".claude.json")),
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        codex_home: None,
+        xdg_config_home: None,
+        codex_login: None,
+        agy_conversation: None,
+        now: now_secs,
+        sid: String::new(),
+        sock: None,
+        config: config.map(Path::to_path_buf),
+        claude_tmp: None,
+        claude_running: None,
+        tz_s: 0,
+    }
+}
+
+/// How long a survey waits for a vault writer before it reports the roster unread.
+const SURVEY_ROSTER_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long a release lease waits for a vault writer before it says this Mac's roster could
+/// not be read. On 2026-11-13 a survey's 250 ms ran out under load 30–50 on 36 cores and ended
+/// a release; a vault apply that outlasts this is a fault worth stopping on.
+pub const RELEASE_ROSTER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why this Mac has no canonical label it may publish ([`machine_label_within`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoLabel {
+    /// The swarm roster denies this Mac's vault recipient.
+    Denied,
+    /// Neither `aterm.toml` nor this Mac's vault names a label the roster allows.
+    Unnamed,
+    /// The roster, the recipient's standing in it, or this Mac's vault identity could not be
+    /// read within `waited` (a vault writer held the state lock throughout, or a read failed).
+    Unread {
+        why: String,
+        waited: std::time::Duration,
+    },
+}
+
+impl std::fmt::Display for NoLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no canonical fleet host label: ")?;
+        match self {
+            Self::Denied => f.write_str("the swarm roster denies this Mac's vault recipient"),
+            Self::Unnamed => f.write_str(
+                "neither aterm.toml ([swarm] label, or [ai], [fleet] or [harness] machine) nor \
+                 this Mac's vault names one the swarm roster allows",
+            ),
+            Self::Unread { why, waited } => write!(
+                f,
+                "this Mac's swarm roster could not be read within {} ms: {why}",
+                waited.as_millis()
+            ),
+        }
+    }
+}
+
+/// The roster's deny labels, whether it denies this Mac's recipient, and the label it (or, with
+/// no roster, the vault's configured host) gives this Mac. A vault writer holding the state lock
+/// is waited out until `wait` has passed, for the roster and for the recipient's standing alike:
+/// a writer met between the two reads is not a denial.
 #[cfg(unix)]
-fn local_roster_denial(home: Option<&Path>) -> Result<(Vec<String>, bool, Option<String>), String> {
+fn local_roster_denial(
+    home: Option<&Path>,
+    wait: std::time::Duration,
+) -> Result<(Vec<String>, bool, Option<String>), String> {
     let Some(home) = home else {
         return Ok((Vec::new(), false, None));
     };
+    let deadline = std::time::Instant::now() + wait;
     let paths = aterm_secrets::client::Paths::for_home(home);
-    let roster = aterm_secrets::client::swarm_roster_until(
-        &paths,
-        std::time::Instant::now() + std::time::Duration::from_millis(250),
-    )
-    .map_err(|why| why.to_string())?;
-    let recipient_denied = aterm_secrets::client::local_recipient_denied_in_roster(&paths);
+    let roster = aterm_secrets::client::swarm_roster_until(&paths, deadline)
+        .map_err(|why| why.to_string())?;
+    let recipient_denied = loop {
+        match aterm_secrets::client::local_recipient_denial_observed(&paths) {
+            Ok(denied) => break denied,
+            Err(why)
+                if why.kind() == aterm_secrets::ErrorKind::VaultBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(std::time::Duration::from_millis(20)),
+                );
+            }
+            Err(why) => return Err(why.to_string()),
+        }
+    };
     let label = if let Some(roster) = &roster {
         aterm_secrets::client::read_machine_identity(&paths)
             .map_err(|why| why.to_string())?
@@ -784,6 +1093,7 @@ fn local_roster_denial(home: Option<&Path>) -> Result<(Vec<String>, bool, Option
 #[cfg(not(unix))]
 fn local_roster_denial(
     _home: Option<&Path>,
+    _wait: std::time::Duration,
 ) -> Result<(Vec<String>, bool, Option<String>), String> {
     Ok((Vec::new(), false, None))
 }
@@ -794,14 +1104,38 @@ pub fn machine_label() -> Option<String> {
     resolve_machine_label(&Env::from_process().ok()?)
 }
 
+/// This machine's canonical label for a record that names its holder (a release lease), or why
+/// it has none, waiting up to [`RELEASE_ROSTER_WAIT`] for a vault writer.
+/// # Errors
+/// [`NoLabel`]'s words, or why this process's environment could not be read.
+pub fn release_machine_label() -> Result<String, String> {
+    let env = Env::from_process().map_err(|why| format!("no canonical fleet host label: {why}"))?;
+    machine_label_within(&env, RELEASE_ROSTER_WAIT).map_err(|no| no.to_string())
+}
+
 fn resolve_machine_label(env: &Env) -> Option<String> {
     resolve_machine_label_checked(env).ok().flatten()
 }
 
+/// The survey's form: a denied or unnamed Mac publishes no label, an unread roster says so.
 fn resolve_machine_label_checked(env: &Env) -> Result<Option<String>, String> {
-    let (deny_labels, recipient_denied, vault_label) = local_roster_denial(env.home.as_deref())?;
+    match machine_label_within(env, SURVEY_ROSTER_WAIT) {
+        Ok(label) => Ok(Some(label)),
+        Err(NoLabel::Unread { why, .. }) => Err(why),
+        Err(NoLabel::Denied | NoLabel::Unnamed) => Ok(None),
+    }
+}
+
+/// `env`'s canonical label, waiting up to `wait` for a vault writer; a roster that denies this
+/// Mac or names nothing answers at once.
+/// # Errors
+/// [`NoLabel`]: why there is none.
+pub fn machine_label_within(env: &Env, wait: std::time::Duration) -> Result<String, NoLabel> {
+    let (deny_labels, recipient_denied, vault_label) =
+        local_roster_denial(env.home.as_deref(), wait)
+            .map_err(|why| NoLabel::Unread { why, waited: wait })?;
     if recipient_denied {
-        return Ok(None);
+        return Err(NoLabel::Denied);
     }
     let is_denied_label = |candidate: &str| {
         #[cfg(unix)]
@@ -817,9 +1151,11 @@ fn resolve_machine_label_checked(env: &Env) -> Result<Option<String>, String> {
         .as_deref()
         .and_then(|config| config_label(config, &is_denied_label))
     {
-        return Ok(Some(label));
+        return Ok(label);
     }
-    Ok(vault_label.filter(|h| !is_denied_label(h)))
+    vault_label
+        .filter(|h| !is_denied_label(h))
+        .ok_or(NoLabel::Unnamed)
 }
 
 /// The first of `[swarm] label`, `[ai] machine`, `[fleet] machine` and `[harness] machine` the

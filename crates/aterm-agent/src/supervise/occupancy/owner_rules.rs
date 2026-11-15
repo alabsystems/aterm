@@ -28,7 +28,7 @@ use super::git_url::{RemoteUrl, hidden};
 use super::wake_atoms::PATH_MAX;
 use super::wakes::{SysWait, WakeUsage};
 use crate::harness::harness_mark;
-use crate::supervise::config::Autopilot;
+use alab_policy::config::Autopilot;
 
 /// The root `[harness]` key of the source tables.
 pub const SOURCE_TABLE: &str = "occupancy_source";

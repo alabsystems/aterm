@@ -7,15 +7,15 @@ use super::*;
 fn authentication_and_context_failures_do_not_become_quota_exhaustion() {
     assert!(
         wall_name(AccountPoint::Wall {
-            kind: aterm_phase::WallKind::UsageWeekly
+            kind: alab_policy::vocab::WallKind::UsageWeekly
         })
         .is_some()
     );
     for kind in [
-        aterm_phase::WallKind::Auth,
-        aterm_phase::WallKind::Context,
-        aterm_phase::WallKind::Memory,
-        aterm_phase::WallKind::Overloaded,
+        alab_policy::vocab::WallKind::Auth,
+        alab_policy::vocab::WallKind::Context,
+        alab_policy::vocab::WallKind::Memory,
+        alab_policy::vocab::WallKind::Overloaded,
     ] {
         let point = AccountPoint::Wall { kind };
         assert_eq!(wall_name(point), None);

@@ -103,7 +103,18 @@ name = "tether_image"
 path = "tests/tether_image.rs"
 harness = false
 
-# What a spawn costs a process shaped like the window: a benchmark run by hand
+[[test]]
+name = "tether_closed_stdio"
+path = "tests/tether_closed_stdio.rs"
+harness = false
+
+[[test]]
+name = "prepared_cohort"
+path = "tests/prepared_cohort.rs"
+harness = false
+
+# What a spawn costs a process shaped like the window (macOS's region walk, Linux's fork and
+# clone at three resident sizes): a benchmark run by hand
 # (`targo --unverified bench -p aterm-uds --bench spawn_cost`), never a gate.
 [[bench]]
 name = "spawn_cost"

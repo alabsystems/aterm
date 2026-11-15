@@ -474,6 +474,7 @@ fn a_claude_row_whose_sign_in_starts_nothing_offers_no_sign_in() {
         made: false,
         state: None,
         renew_by: None,
+        on_token_until: None,
         limited_until: None,
         served_at: None,
         renewed_at: None,

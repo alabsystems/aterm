@@ -1208,12 +1208,12 @@ fn the_seam_spares_the_banner_and_a_codex_and_reads_a_refused_limit_on_its_frame
     let mut reading = read(&banner);
     assert_eq!(
         reading.wall.as_ref().map(|w| w.kind),
-        Some(aterm_phase::WallKind::Memory)
+        Some(alab_policy::vocab::WallKind::Memory)
     );
     s.confirm_wall(&mut reading, &at(&banner, 1), &opts, Check::Decide);
     assert_eq!(
         reading.wall.as_ref().map(|w| w.kind),
-        Some(aterm_phase::WallKind::Memory),
+        Some(alab_policy::vocab::WallKind::Memory),
         "the banner stands"
     );
     assert_eq!(host.asks(), 0, "the banner is never asked");
@@ -1300,10 +1300,10 @@ fn a_closed_notice_the_screen_cannot_name_is_the_decisions_wall() {
     let read = |rows: &[String]| aterm_phase::reader::read(Some("claude"), rows, Some(2));
     assert_eq!(read(&shown).wall, None, "the screen alone names none");
     assert_eq!(read(&shown).phase, Phase::Idle);
-    let refused = aterm_phase::WallKind::ApiError {
+    let refused = alab_policy::vocab::WallKind::ApiError {
         code: None,
         retryable: false,
-        cause: aterm_phase::ApiCause::Request,
+        cause: alab_policy::vocab::ApiCause::Request,
     };
     let host = TranscriptHost::of(&[Some(&notice_turn(MODEL, "model_not_found", true))]);
     let opts = hosted_by(&host);
@@ -1408,15 +1408,15 @@ fn a_confirmed_unnamed_api_error_is_named_by_its_notice_at_the_decision() {
     const DLP: &str = "API Error: Request blocked by your organization's policy.";
     const FALLBACK: &str =
         "API Error (claude-opus-9): model: claude-opus-9. Try /model to switch to Opus 5.5.";
-    let server = aterm_phase::WallKind::ApiError {
+    let server = alab_policy::vocab::WallKind::ApiError {
         code: None,
         retryable: true,
-        cause: aterm_phase::ApiCause::Server,
+        cause: alab_policy::vocab::ApiCause::Server,
     };
-    let refused = aterm_phase::WallKind::ApiError {
+    let refused = alab_policy::vocab::WallKind::ApiError {
         code: None,
         retryable: false,
-        cause: aterm_phase::ApiCause::Request,
+        cause: alab_policy::vocab::ApiCause::Request,
     };
     let read = |rows: &[String]| aterm_phase::reader::read(Some("claude"), rows, Some(2));
     let shown = |text: &str| ended_on(&["❯ carry on with the task", "", &format!("⏺ {text}")]);
@@ -1493,17 +1493,17 @@ fn a_confirmed_unnamed_api_error_is_named_by_its_notice_at_the_decision() {
     const FORBIDDEN: &str = "API Error: 403 Forbidden";
     const BLOCKED: &str =
         "API Error: 403 Request blocked by your organization's data loss prevention policy.";
-    let forbidden = aterm_phase::WallKind::ApiError {
+    let forbidden = alab_policy::vocab::WallKind::ApiError {
         code: Some(403),
         retryable: false,
-        cause: aterm_phase::ApiCause::Request,
+        cause: alab_policy::vocab::ApiCause::Request,
     };
     for (seq, text, error, want) in [
         (
             13,
             FORBIDDEN,
             "authentication_failed",
-            aterm_phase::WallKind::Auth,
+            alab_policy::vocab::WallKind::Auth,
         ),
         (14, FORBIDDEN, "unknown", forbidden),
         (15, BLOCKED, "authentication_failed", forbidden),
@@ -1540,10 +1540,10 @@ fn a_notice_the_screen_shows_is_read_until_its_turn_closes() {
         .take_while(|r| !r.contains("\"isApiErrorMessage\""))
         .collect::<Vec<_>>()
         .join("\n");
-    let refused = Some(aterm_phase::WallKind::ApiError {
+    let refused = Some(alab_policy::vocab::WallKind::ApiError {
         code: None,
         retryable: false,
-        cause: aterm_phase::ApiCause::Request,
+        cause: alab_policy::vocab::ApiCause::Request,
     });
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = virtual_session(&mut m, None);
@@ -1637,10 +1637,10 @@ fn a_notice_drawn_like_prose_the_transcript_has_not_written_is_read_again_once()
     s.confirm_wall(&mut reading, &at(&shown, 1), &opts, Check::Decide);
     assert_eq!(
         reading.wall.map(|w| w.kind),
-        Some(aterm_phase::WallKind::ApiError {
+        Some(alab_policy::vocab::WallKind::ApiError {
             code: None,
             retryable: false,
-            cause: aterm_phase::ApiCause::Request,
+            cause: alab_policy::vocab::ApiCause::Request,
         }),
         "found on the second read"
     );
@@ -1688,10 +1688,10 @@ fn a_prose_notice_after_a_prompt_command_behind_an_older_notice_is_read_again_on
             .collect::<Vec<_>>()
             .join("\n")
     );
-    let refused = Some(aterm_phase::WallKind::ApiError {
+    let refused = Some(alab_policy::vocab::WallKind::ApiError {
         code: None,
         retryable: false,
-        cause: aterm_phase::ApiCause::Request,
+        cause: alab_policy::vocab::ApiCause::Request,
     });
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = virtual_session(&mut m, None);
@@ -1956,7 +1956,10 @@ fn a_wall_whose_call_scrolled_off_is_judged_with_the_history_above() {
 
 #[test]
 fn a_stop_reason_taller_than_the_tail_is_read_with_the_rows_above() {
-    let session_limit = Some((aterm_phase::WallKind::UsageSession, Some("3pm".to_string())));
+    let session_limit = Some((
+        alab_policy::vocab::WallKind::UsageSession,
+        Some("3pm".to_string()),
+    ));
     let phrase = "  Usage limit reached · resets 3pm";
     let pane = |capture: &str| {
         let mut rows = fx::screen(capture);
@@ -2412,7 +2415,7 @@ fn the_transcript_names_the_limit_a_generic_footer_does_not() {
     );
     assert_eq!(
         wall,
-        Some(aterm_phase::WallKind::ModelBucket { consent: false })
+        Some(alab_policy::vocab::WallKind::ModelBucket { consent: false })
     );
     assert_eq!(
         message,
@@ -2435,7 +2438,7 @@ fn the_transcript_names_the_limit_a_generic_footer_does_not() {
     );
     assert_eq!(
         wall,
-        Some(aterm_phase::WallKind::ModelBucket { consent: false })
+        Some(alab_policy::vocab::WallKind::ModelBucket { consent: false })
     );
     assert!(message.ends_with("seven_day_sonnet"), "{message}");
     let (action, wall, message, _) = decide(written(
@@ -2448,7 +2451,7 @@ fn the_transcript_names_the_limit_a_generic_footer_does_not() {
     );
     assert_eq!(
         wall,
-        Some(aterm_phase::WallKind::ModelBucket { consent: false })
+        Some(alab_policy::vocab::WallKind::ModelBucket { consent: false })
     );
     assert!(message.ends_with("seven_day_opus"), "{message}");
     let (action, wall, message, phase) = decide(written(
@@ -2459,7 +2462,7 @@ fn the_transcript_names_the_limit_a_generic_footer_does_not() {
         matches!(&action, TurnEndAction::WaitUntil { .. }),
         "{action:?}"
     );
-    assert_eq!(wall, Some(aterm_phase::WallKind::UsageSession));
+    assert_eq!(wall, Some(alab_policy::vocab::WallKind::UsageSession));
     assert!(message.contains("Usage limit reached"), "{message}");
     assert!(
         matches!(&phase, Phase::Limited { message, .. } if message.contains("Usage limit reached")),
@@ -2654,7 +2657,7 @@ fn a_cancelled_limit_answers_the_act_only_by_a_notice_written_since_it() {
         s.turn_end.acted(
             &TurnEndAction::Type {
                 text: "keep going".to_string(),
-                rule_id: crate::supervise::policy::turn_end::RULE_CONTINUE,
+                rule_id: alab_policy::words::RULE_CONTINUE,
             },
             &at_act,
             Instant::now(),
@@ -3349,9 +3352,8 @@ fn replied_under_a_shell(reply: &str, fired_row: bool) -> Vec<String> {
 
 #[test]
 fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report() {
-    use crate::supervise::policy::turn_end::{
-        DONE_CHECK_REVERSIBLE, RULE_DONE_CHECK, RULE_LIMIT_RESUME, done_check_words,
-    };
+    use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
+    use alab_policy::words::{DONE_CHECK_REVERSIBLE, RULE_DONE_CHECK, done_check_words};
     const RESET: i64 = 1_791_999_480;
     let done =
         "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
@@ -3517,7 +3519,7 @@ fn a_bucket_only_its_rate_limit_type_named_is_that_bucket_for_a_loop_that_follow
     use crate::supervise::approvals::{Ledger, open_wall, usage_attempt};
     use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
     const RESET: i64 = 1_792_279_200;
-    let bucket = aterm_phase::WallKind::ModelBucket { consent: false };
+    let bucket = alab_policy::vocab::WallKind::ModelBucket { consent: false };
     let reset = "Oct 17 at 4:20pm (America/Los_Angeles)";
     let armed = |words: &str| -> Vec<String> {
         fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300)
@@ -3680,7 +3682,7 @@ fn virtual_clock<C: Ctl>(s: &mut Session<'_, C>, now: i64, offset: i64) {
 }
 #[test]
 fn a_buckets_cancel_on_a_short_pane_is_the_bucket_the_transcript_names() {
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let short: Vec<String> = {
         let rows = fx::screen(fx::WALL_SONNET_BUCKET_CANCELLED_UNDER_24H_2_1_302);
         rows[rows.len() - 12..].to_vec()
@@ -3747,7 +3749,7 @@ fn a_buckets_cancel_on_a_short_pane_is_the_bucket_the_transcript_names() {
         s.turn_end.acted(
             &TurnEndAction::Type {
                 text: "keep going".to_string(),
-                rule_id: crate::supervise::policy::turn_end::RULE_CONTINUE,
+                rule_id: alab_policy::words::RULE_CONTINUE,
             },
             &at_act,
             Instant::now(),
@@ -3777,7 +3779,7 @@ fn a_buckets_cancel_on_a_short_pane_is_the_bucket_the_transcript_names() {
 
 #[test]
 fn a_buckets_cancel_under_the_limit_dialog_answers_the_act_and_nothing_is_typed_into_it() {
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let screen: Vec<String> = fx::screen(fx::WALL_SONNET_BUCKET_CANCELLED_OVER_24H_2_1_302)
         .into_iter()
         .map(|r| r.replace("❯ carry on with the task", "❯ keep going"))
@@ -3828,7 +3830,7 @@ fn a_buckets_cancel_under_the_limit_dialog_answers_the_act_and_nothing_is_typed_
     s.turn_end.acted(
         &TurnEndAction::Type {
             text: "keep going".to_string(),
-            rule_id: crate::supervise::policy::turn_end::RULE_CONTINUE,
+            rule_id: alab_policy::words::RULE_CONTINUE,
         },
         &at_act,
         typed_at,
@@ -4007,7 +4009,7 @@ fn a_limits_continuation_is_typed_into_no_other_conversation() {
     let reason = approvals::wall_wait_reason(
         Some(BEFORE_B_RESETS + 1),
         Some("9:19am"),
-        aterm_phase::WallKind::UsageSession,
+        alab_policy::vocab::WallKind::UsageSession,
         "session limit",
     );
     let row = Row {
@@ -4030,7 +4032,7 @@ fn a_limits_continuation_is_typed_into_no_other_conversation() {
         );
         let open = approvals::open_wall_in(&body, Some("@s-1")).expect("legacy-compatible row");
         assert_eq!(open.conversation, conversation);
-        assert_eq!(open.kind, Some(aterm_phase::WallKind::UsageSession));
+        assert_eq!(open.kind, Some(alab_policy::vocab::WallKind::UsageSession));
     }
     let tried = Row {
         rule_id: crate::supervise::policy::turn_end::RULE_LIMIT_RESUME,
@@ -4314,7 +4316,7 @@ fn a_model_chosen_off_a_bucket_moves_a_loop_that_took_its_wait_over() {
 #[test]
 fn a_standing_weekly_limit_over_a_refused_generic_banner_and_transcript_only_row_marks_the_point_limited()
  {
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let weekly = transcript("weekly-limit");
     let queue_only = r#"{"parentUuid":"00000000-0000-4000-8000-000000000001","isSidechain":false,"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>wf1</task-id>\n<status>failed</status>\n<summary>Orphaned on session resume</summary>\n</task-notification>"},"uuid":"00000000-0000-4000-8000-000000000099","timestamp":"2026-10-08T16:36:00.000Z","queueTranscriptOnly":true}"#;
     let tail = format!("{weekly}\n{queue_only}");

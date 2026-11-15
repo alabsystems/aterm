@@ -162,3 +162,64 @@ fn private_dirs_are_distinct_and_private() {
         }
     }
 }
+
+/// This Mac's store under `home`: an unrelated entry always, and the deployer key's entry
+/// holding `key` where one is given, none where it is not.
+#[cfg(unix)]
+pub(crate) fn registry_under(home: &Path, key: Option<&str>) {
+    let entry = aterm_secrets::entry_class::SITE_DEPLOYER_KEY;
+    crate::test_vault::seed(home, &[("gh_access_token", b"unrelated-token")]);
+    match key {
+        Some(key) => {
+            crate::test_vault::seed(home, &[(entry, key.as_bytes())]);
+        }
+        None => crate::test_vault::drop_entries(home, &[entry]),
+    }
+}
+
+/// THE DEPLOYER'S KEY HAS ONE SOURCE: this Mac's store entry, read in place.
+/// NEGATIVE CONTROLS: no vault and a store without the entry are each no key, and a file at
+/// the path older builds wrote the entry to is never read.
+#[cfg(unix)]
+#[test]
+fn the_deployer_key_is_the_stores_entry_and_nothing_else() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let home = home.path();
+    let why = deployer_key(Some(home)).unwrap_err();
+    assert!(why.contains("holds no site-deployer-key entry"), "{why}");
+    let stray = home
+        .join(".secrets")
+        .join(aterm_secrets::entry_class::SITE_DEPLOYER_KEY);
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, "stray-file-value").unwrap();
+    registry_under(home, None);
+    let why = deployer_key(Some(home)).unwrap_err();
+    assert!(why.contains("holds no site-deployer-key entry"), "{why}");
+    registry_under(home, Some("{}"));
+    assert_eq!(deployer_key(Some(home)).unwrap().expose(), b"{}");
+    assert_eq!(std::fs::read(&stray).unwrap(), b"stray-file-value");
+    assert_eq!(deployer_key(None).err(), Some("HOME is not set".to_owned()));
+}
+
+/// A key this Mac lacks is filed with the lab under the deployer's purpose, once: a second
+/// filing adds no request.
+#[cfg(unix)]
+#[test]
+fn a_missing_deployer_key_is_filed_with_the_lab() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let line = file_deployer_key(Some(home.path()));
+    assert!(
+        line.starts_with("filed `aterm secrets need site-deployer-key` with the lab: "),
+        "{line}"
+    );
+    file_deployer_key(Some(home.path()));
+    let paths = aterm_secrets::client::Paths::locate_for_home(home.path());
+    let needs = aterm_secrets::need::peek(&paths).unwrap();
+    assert_eq!(needs.len(), 1, "{needs:?}");
+    assert_eq!(needs[0].want, aterm_secrets::need::Want::SiteDeployerKey);
+    assert_eq!(
+        needs[0].purpose,
+        aterm_secrets::need::Purpose::ReleaseSiteKey
+    );
+    assert!(file_deployer_key(None).contains("could not be filed: HOME is not set"));
+}

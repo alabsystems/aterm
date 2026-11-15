@@ -759,7 +759,7 @@ fn lane(inst: &Instance, world: &World, holder: &mut Running) -> Result<Option<V
     let sid = ls
         .stdout
         .split_whitespace()
-        .find(|w| w.starts_with("s-"))
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .map(str::to_owned)
         .ok_or_else(|| format!("no session in `ls`: {}", ls.stdout))?;
     let at = format!("@{sid}");

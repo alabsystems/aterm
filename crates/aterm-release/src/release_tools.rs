@@ -480,6 +480,13 @@ pub fn stage(
     }
     prove_exec(&tools.cutter.path, CUTTER_VERSION)?;
     prove_exec(&tools.verify.path, VERIFY_VERSION)?;
+    // Each cutter build freezes one set: remove those no record of this clone names any more.
+    let _ = crate::release_leftovers::sweep_tools(
+        release,
+        &final_dir,
+        std::time::SystemTime::now(),
+        &crate::artifact::remove_unused_dir,
+    );
     Ok(tools)
 }
 

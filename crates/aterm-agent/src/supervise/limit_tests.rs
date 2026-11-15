@@ -264,7 +264,7 @@ fn a_clock_folded_across_a_change_keeps_its_clock() {
 /// date, midnight and noon on the twelve.
 #[test]
 fn a_reset_clock_reads_as_its_notice_said_it() {
-    let words = |text: &str| ResetClock::of(Some(text)).map(|c| c.words());
+    let words = |text: &str| reset_clock(Some(text)).map(|c| c.words());
     for (text, said) in [
         ("Oct 23 at 9am (America/Los_Angeles)", "on Oct 23 at 9am"),
         ("Sep 30 at 12:30pm (UTC)", "on Sep 30 at 12:30pm"),

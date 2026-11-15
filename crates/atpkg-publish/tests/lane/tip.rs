@@ -15,10 +15,11 @@ use atpkg_publish::api::{
 };
 use atpkg_publish::artifact::qualify::Runner;
 use atpkg_publish::artifact::tools::{Ran, Run, RunError};
-use atpkg_publish::ctx::Ctx;
+use atpkg_publish::ctx::{Ctx, HostChoice};
 use atpkg_publish::error::{Error, Result};
 use atpkg_publish::host::Replace;
-use atpkg_publish::host::fake::FakeHost;
+use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp};
+use atpkg_publish::host::rest::TokenSource;
 use atpkg_publish::lane::install::InstallFlags;
 use atpkg_publish::lane::lifecycle::{Registry, Standing};
 use atpkg_publish::lane::ready::{self, Record};
@@ -238,6 +239,12 @@ impl Packer for Recording<'_> {
             "build bound {:?}",
             request.build_within.map(|within| within.as_secs())
         ));
+        // The build's bound leaves out what it waits to be admitted in the lane's checkout.
+        assert_eq!(
+            request.build_queue.as_ref().map(|q| q.checkout.as_path()),
+            Some(request.checkout.as_path()),
+            "the build carries the queue of the checkout it builds in"
+        );
         // What the build would read besides the commit's own files.
         let stray = git(
             &request.checkout,
@@ -893,7 +900,8 @@ fn a_pass_freezes_main_qualifies_packs_stages_and_enqueues_and_publishes_nothing
     assert_eq!(record.steps[3].target.as_deref(), Some(ARM.as_str()));
 
     // Its qualification receipt and raw step output stay on disk.
-    let receipt = std::fs::read_to_string(w.state().dir.join("receipts/ay-5.json")).expect("kept");
+    let receipt = std::fs::read_to_string(w.state().dir.join("logs/ay-5/attempt-1/receipt.json"))
+        .expect("kept");
     let receipt: aterm_json::Value = aterm_json::from_str(&receipt).expect("JSON");
     assert_eq!(receipt["outcome"].as_str(), Some("enqueued"));
     assert_eq!(receipt["source"].as_str(), Some(frozen.as_str()));
@@ -1066,7 +1074,8 @@ fn a_run_that_matched_zero_tests_fails_the_candidate_before_anything_is_built() 
     assert!(w.queued().is_empty());
     let state = w.state();
     assert!(state.dir.join("logs/ay-5/attempt-1/unit.stdout").is_file());
-    let receipt = std::fs::read_to_string(state.dir.join("receipts/ay-5.json")).expect("kept");
+    let receipt =
+        std::fs::read_to_string(state.dir.join("logs/ay-5/attempt-1/receipt.json")).expect("kept");
     let receipt: aterm_json::Value = aterm_json::from_str(&receipt).expect("JSON");
     assert_eq!(receipt["outcome"].as_str(), Some("failed"));
     assert_eq!(receipt["steps"][1]["passed"].as_bool(), Some(false));
@@ -1152,12 +1161,94 @@ fn a_host_that_does_not_answer_defers_the_candidate_and_counts_nothing_against_i
         assert!(!state.blocked_file("ay", 5).exists());
         assert!(w.queued().is_empty());
     }
-    let receipt = std::fs::read_to_string(state.dir.join("receipts/ay-5.json")).expect("kept");
+    let receipt =
+        std::fs::read_to_string(state.dir.join("logs/ay-5/attempt-1/receipt.json")).expect("kept");
     let receipt: aterm_json::Value = aterm_json::from_str(&receipt).expect("JSON");
     assert_eq!(receipt["outcome"].as_str(), Some("deferred"));
     // The owner answers again: the same build is staged and queued.
     w.backend.staging_down.store(false, Ordering::SeqCst);
     assert_eq!(w.pass().0.enqueued, ["ay=5"]);
+}
+
+#[test]
+fn every_qualification_attempt_keeps_its_own_logs() {
+    let w = World::new("tip-attempt-logs");
+    let state = w.state();
+    let logs = state.dir.join("logs/ay-5");
+    let fmt = |n: u32| std::fs::read_to_string(logs.join(format!("attempt-{n}/fmt.stdout"))).ok();
+    // An attempt that ran every step and was deferred: nothing is counted against the build.
+    w.backend.on("fmt --check", exit(0, "attempt one\n"));
+    w.backend.staging_down.store(true, Ordering::SeqCst);
+    let (outcome, tx) = w.pass();
+    assert!(
+        matches!(row(&outcome, "ay").fate, Some(Fate::Deferred(_))),
+        "{}",
+        tx.text()
+    );
+    // The next qualifies, stages and queues the build.
+    w.backend.staging_down.store(false, Ordering::SeqCst);
+    w.backend.on("fmt --check", exit(0, "attempt two\n"));
+    assert_eq!(w.pass().0.enqueued, ["ay=5"]);
+    // Its record is set aside (the staged bytes changed), and the build is qualified anew.
+    w.fx.stage_text(
+        "ay",
+        5,
+        &format!(
+            "{}\n# restaged by hand\n",
+            fixture::manifest("ay", 5, &[ARM])
+        ),
+    );
+    w.dispatch();
+    w.backend.on("fmt --check", exit(0, "attempt three\n"));
+    assert_eq!(w.pass().0.enqueued, ["ay=5"]);
+    // Each attempt's raw output is where it left it.
+    assert_eq!(
+        [fmt(1), fmt(2), fmt(3), fmt(4)],
+        [
+            Some("attempt one\n".to_string()),
+            Some("attempt two\n".to_string()),
+            Some("attempt three\n".to_string()),
+            None
+        ]
+    );
+    // So is each attempt's receipt, beside its logs: the deferred one's is not replaced by
+    // the attempts after it.
+    let receipt = |n: u32| -> (Option<u64>, Option<String>, Option<String>) {
+        let text = std::fs::read_to_string(logs.join(format!("attempt-{n}/receipt.json")))
+            .unwrap_or_else(|e| panic!("attempt {n}'s receipt: {e}"));
+        let v: aterm_json::Value = aterm_json::from_str(&text).expect("JSON");
+        (
+            v["attempt"].as_u64(),
+            v["outcome"].as_str().map(str::to_string),
+            v["why"].as_str().map(str::to_string),
+        )
+    };
+    let (n, outcome, why) = receipt(1);
+    assert_eq!((n, outcome.as_deref()), (Some(1), Some("deferred")));
+    assert!(
+        why.as_deref()
+            .is_some_and(|w| w.starts_with("staging refused it")),
+        "{why:?}"
+    );
+    for n in [2, 3] {
+        assert_eq!(
+            receipt(n),
+            (Some(u64::from(n)), Some("enqueued".to_string()), None)
+        );
+    }
+    // And the record set aside still finds the output it binds.
+    let text = std::fs::read_to_string(state.dir.join("retired/ay-5.ready.toml.restaged"))
+        .expect("the set-aside record");
+    let retired: Record = aterm_toml::from_str(&text).expect("a record that parses");
+    let step = retired
+        .steps
+        .iter()
+        .find(|s| s.name == "fmt")
+        .expect("its fmt step");
+    assert_eq!(
+        step.stdout_sha256,
+        atpkg::tree::sha256_bytes(fmt(2).expect("attempt two's output").as_bytes())
+    );
 }
 
 #[test]
@@ -1202,11 +1293,18 @@ fn a_repository_with_no_qualification_list_ships_nothing_and_is_not_a_failure() 
         !w.state().attempts_file("ay", 5).exists(),
         "a missing list is the repository's standing, not a failed attempt"
     );
-    // A malformed list is a defect of that commit: it fails, by what is wrong with it.
+    let logs = w.state().dir.join("logs/ay-5");
+    assert!(!logs.exists(), "no attempt was made, and none is kept");
+    // A malformed list is a defect of that commit: it fails, by what is wrong with it. The
+    // attempt ran no step, and still keeps its receipt in a directory of its own.
     w.backend.recipe("ay", recipe("ay", Some(&[FMT, BUILD])));
     let (r, _) = w.pass_with(false, None);
     let e = r.expect_err("a malformed list");
     assert!(e.to_string().contains(r#"carries no "packed" step"#), "{e}");
+    let receipt = std::fs::read_to_string(logs.join("attempt-1/receipt.json")).expect("kept");
+    let receipt: aterm_json::Value = aterm_json::from_str(&receipt).expect("JSON");
+    assert_eq!(receipt["outcome"].as_str(), Some("failed"));
+    assert_eq!(receipt["attempt"].as_u64(), Some(1));
 
     // A commit none of whose manifests spells a list has not joined the lane: the pass learns
     // that from the commit's objects, and neither checks it out nor asks for its recipe.
@@ -1248,7 +1346,8 @@ fn a_pack_that_fails_or_source_a_step_changed_is_refused() {
     );
     assert!(w.queued().is_empty());
     assert_eq!(w.fx.staging_asset("ay", 5, "pkg-ay-5.toml"), None);
-    let receipt = std::fs::read_to_string(w.state().dir.join("receipts/ay-5.json")).expect("kept");
+    let receipt = std::fs::read_to_string(w.state().dir.join("logs/ay-5/attempt-1/receipt.json"))
+        .expect("kept");
     let receipt: aterm_json::Value = aterm_json::from_str(&receipt).expect("JSON");
     assert_eq!(receipt["steps"][2]["stage"].as_str(), Some("build"));
     assert_eq!(receipt["steps"][2]["passed"].as_bool(), Some(false));
@@ -1443,6 +1542,24 @@ fn a_record_whose_staged_bytes_changed_is_set_aside_and_its_build_is_qualified_a
         latch.contains("is not the manifest that was qualified"),
         "{latch}"
     );
+    // Each record set aside is kept as its own receipt: a later one never replaces it.
+    let mut kept: Vec<String> = std::fs::read_dir(state.dir.join("retired"))
+        .expect("retired records")
+        .map(|e| {
+            e.expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    kept.sort();
+    let expected: Vec<String> = (1..=ready::SET_ASIDE_AFTER)
+        .map(|nth| match nth {
+            1 => "ay-5.ready.toml.restaged".to_string(),
+            nth => format!("ay-5.ready.toml.restaged.{nth}"),
+        })
+        .collect();
+    assert_eq!(kept, expected);
     let packs = w.fx.packer.legs().len();
     let (outcome, _) = w.pass();
     assert_eq!(row(&outcome, "ay").decision, Decision::Blocked);
@@ -1584,6 +1701,178 @@ fn a_publish_that_could_not_run_counts_nothing_against_its_records() {
     assert_eq!(outcome.published, Some(6), "{}", tx.text());
     assert_eq!(outcome.ready, ["ay=5", "nn=4"]);
     assert_eq!(w.indexer.count(), 1);
+}
+
+/// The channel's own publisher, counted. Its preflight refuses a channel this Mac cannot write,
+/// and calls that a refusal, not a could-not-run. `revoke` takes the release credential away as
+/// a publish starts.
+struct Channel {
+    calls: AtomicUsize,
+    revoke: Option<TokenSource>,
+}
+
+impl Indexer for Channel {
+    fn publish(&self, ctx: &Ctx, request: &IndexRequest) -> Result<Published> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(token) = &self.revoke {
+            // Take the release credential away.
+            token.put_for_tests(None);
+        }
+        atpkg_publish::channel::index::Index.publish(ctx, request)
+    }
+}
+
+#[test]
+fn a_channel_this_mac_cannot_write_counts_nothing_against_its_records() {
+    let mut w = World::new("ready-channel");
+    w.pass();
+    w.queue(&w.record("ay", 5).expect("ay's record"), "nn", 4, 3);
+    let state = w.state();
+    let untouched = |w: &World, what: &str| {
+        assert_eq!(w.queued(), ["ay-5.ready.toml", "nn-4.ready.toml"], "{what}");
+        for (program, build) in [("ay", 5), ("nn", 4)] {
+            assert_eq!(state.publish_attempts(program, build), 0, "{what}");
+            assert!(!state.blocked_file(program, build).exists(), "{what}");
+        }
+        assert!(!state.dir.join("retired").exists(), "{what}");
+    };
+    let refused = |w: &World, publisher: &dyn Indexer, words: &[&str], what: &str| {
+        let (r, tx) = w.dispatch_with(publisher, false, true);
+        let e = r.expect_err("nothing can be published");
+        assert!(
+            matches!(e, Error::CannotRun(_)),
+            "{what}: {e:?}\n{}",
+            tx.text()
+        );
+        let said = e.to_string();
+        assert!(
+            words.iter().all(|word| said.contains(word))
+                && said.contains("not a fault of any queued build"),
+            "{what}: {said}"
+        );
+        untouched(w, what);
+    };
+    let publisher = Channel {
+        calls: AtomicUsize::new(0),
+        revoke: None,
+    };
+    // On the gh arm, this Mac holds no release credential. More passes than a refused record
+    // gets: none counts, and no publish is even tried.
+    w.fx.use_gh();
+    let token = w.fx.ctx.tokens.channel.clone();
+    token.put_for_tests(None);
+    // The refusal names the act that clears it: the lab's credential path, never a person.
+    let lab = "`aterm secrets need gh:release` asks the lab's Macs for it";
+    for pass in 0..=ready::SET_ASIDE_AFTER {
+        refused(
+            &w,
+            &publisher,
+            &["this Mac holds no release credential", lab],
+            &format!("no credential, pass {pass}"),
+        );
+    }
+    // Under agh, the public owner does not answer the release writer's check, or refuses it.
+    token.put_for_tests(Some(b"ghp_channel_stub\n"));
+    w.fx.ctx = w.fx.ctx.clone().with_host_choice(HostChoice::Agh);
+    for (pass, (fail, words)) in [
+        (
+            FakeFail::Unanswered,
+            &[
+                "did not answer the release writer's check",
+                "the next pass asks again",
+            ][..],
+        ),
+        (
+            FakeFail::Refuse,
+            &[
+                "release writer agh routes cannot write",
+                "hosts check --host agh",
+                lab,
+            ][..],
+        ),
+        (
+            FakeFail::Unanswered,
+            &[
+                "did not answer the release writer's check",
+                "the next pass asks again",
+            ][..],
+        ),
+        (
+            FakeFail::Refuse,
+            &[
+                "release writer agh routes cannot write",
+                "hosts check --host agh",
+                lab,
+            ][..],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        w.fx.host.fail_next(FakeOp::Preflight, fail);
+        refused(&w, &publisher, words, &format!("agh, pass {pass}"));
+    }
+    assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
+    // The credential goes while a publish is under way: the publisher refuses, and the channel,
+    // asked again, says the refusal is its own.
+    w.fx.ctx = w.fx.ctx.clone().with_host_choice(HostChoice::Gh);
+    let revoking = Channel {
+        calls: AtomicUsize::new(0),
+        revoke: Some(token.clone()),
+    };
+    for pass in 0..=ready::SET_ASIDE_AFTER {
+        token.put_for_tests(Some(b"ghp_channel_stub\n"));
+        refused(
+            &w,
+            &revoking,
+            &["this Mac holds no release credential", lab],
+            &format!("revoked mid-publish, pass {pass}"),
+        );
+    }
+    assert_eq!(
+        revoking.calls.load(Ordering::SeqCst),
+        usize::try_from(ready::SET_ASIDE_AFTER + 1).expect("small")
+    );
+    // The channel can be written again: both are pinned by one index.
+    token.put_for_tests(Some(b"ghp_channel_stub\n"));
+    let (outcome, tx) = w.dispatch();
+    assert_eq!(outcome.published, Some(6), "{}", tx.text());
+    assert_eq!(outcome.ready, ["ay=5", "nn=4"]);
+
+    // One record, the credential gone while its publish runs: no record is left to publish
+    // alone after it, so only the channel, asked again after the refusal, keeps it uncounted.
+    let mut one = World::new("ready-channel-one");
+    one.pass();
+    one.fx.use_gh();
+    let token = one.fx.ctx.tokens.channel.clone();
+    let revoking = Channel {
+        calls: AtomicUsize::new(0),
+        revoke: Some(token.clone()),
+    };
+    for pass in 0..=ready::SET_ASIDE_AFTER {
+        token.put_for_tests(Some(b"ghp_channel_stub\n"));
+        let (r, tx) = one.dispatch_with(&revoking, false, true);
+        let e = r.expect_err("nothing can be published");
+        assert!(
+            matches!(e, Error::CannotRun(_)),
+            "pass {pass}: {e:?}\n{}",
+            tx.text()
+        );
+        assert!(
+            e.to_string()
+                .contains("this Mac holds no release credential"),
+            "pass {pass}: {e}"
+        );
+    }
+    let state = one.state();
+    assert_eq!(one.queued(), ["ay-5.ready.toml"]);
+    assert_eq!(state.publish_attempts("ay", 5), 0);
+    assert!(!state.blocked_file("ay", 5).exists());
+    assert!(!state.dir.join("retired").exists());
+    assert_eq!(
+        revoking.calls.load(Ordering::SeqCst),
+        usize::try_from(ready::SET_ASIDE_AFTER + 1).expect("small")
+    );
 }
 
 #[test]

@@ -16,13 +16,17 @@
 //! - **`emails-set <aterm> <world> <seed> <row> <column> <value-or-tag>`** writes one cell of row
 //!   `<row>` (1 to [`ROWS`]) through the shipped `aterm db emails set`: a `password` from
 //!   standard input, a value derived from the seed and `<tag>` (never on a command line); any other
-//!   column the value given. It reports when the write returned and the table's keyed digest
-//!   after it.
-//! - **`emails-wait <aterm> <world> <digest>|!<digest> <seconds>`** reads `aterm db emails
-//!   --digest` until it equals `<digest>` (or, after `!`, until it no longer does), and reports
-//!   when it did and the digest it read: how long an edit took to reach this Mac.
+//!   column the value given. It reports when the write returned and the table's digest after it.
+//!   A password shows as the mask before and after, so its edit moves the digest only where the
+//!   cell held none.
+//! - **`emails-wait <aterm> <world> <digest>|!<digest> <seconds>`** reads the table's digest
+//!   until it equals `<digest>` (or, after `!`, until it no longer does), and reports when it did
+//!   and the digest it read: how long an edit took to reach this Mac.
 //!
-//! Reports name counts, row numbers, times and keyed digests, never an address or a value.
+//! The table's digest is computed here from what `aterm db emails` shows
+//! ([`crate::util::listing_digest`]): an address as it is, a password as the mask or as the name
+//! of its secret-store entry, never a value. Reports name counts, row numbers, times and
+//! digests, never an address or a value.
 
 use super::{db_output, fail, write_new};
 use crate::instance::World;
@@ -161,24 +165,54 @@ pub(super) fn fixture(world: &World, seed: &str) -> Result<Value, Fail> {
     }))
 }
 
-/// `aterm db emails --digest` in `world`: its JSON, or why not.
+/// The digest of what `aterm db emails` shows in `world` ([`listing`]), or why not.
 fn digest(aterm: &Path, world: &World) -> Result<Value, Fail> {
     let output = db_output(
         aterm,
         world,
-        &["emails".into(), "--digest".into()],
+        &["emails".into()],
         aterm_uds::spawnfd::Stdio::null(),
     )?;
     if !output.status.success() {
         return Err(Fail::die(format!(
-            "emails --digest failed: {}",
+            "emails failed: {}",
             String::from_utf8_lossy(&output.stderr)
                 .lines()
                 .next()
                 .unwrap_or_default()
         )));
     }
-    aterm_json::from_slice(&output.stdout).map_err(fail)
+    let listed: Value = aterm_json::from_slice(&output.stdout).map_err(fail)?;
+    listing(&listed).map_err(Fail::die)
+}
+
+/// What an `aterm db emails` view says of its table, value-free: `digest` (of its rows as
+/// shown), `rows`, `with_password` (rows whose password cell shows anything) and `complete`.
+///
+/// # Errors
+/// The view lists no rows, or its registry read refused (`state` `never`: no rows and the
+/// reason, which is no table to compare): what it said instead.
+fn listing(listed: &Value) -> Result<Value, String> {
+    let said = |what: &str| {
+        let text: String = aterm_json::to_string(listed).unwrap_or_default();
+        format!(
+            "the emails view {what}: {}",
+            crate::util::one_line(&text, 160)
+        )
+    };
+    let rows = listed
+        .get("emails")
+        .and_then(Value::as_array)
+        .ok_or_else(|| said("lists no rows"))?;
+    if listed.get("state").and_then(Value::as_str) == Some("never") {
+        return Err(said("did not read the registry"));
+    }
+    Ok(json!({
+        "digest": crate::util::listing_digest(rows),
+        "rows": rows.len(),
+        "with_password": rows.iter().filter(|row| !row["password"].is_null()).count(),
+        "complete": listed.get("complete").and_then(Value::as_bool).unwrap_or(false),
+    }))
 }
 
 /// `emails-set`: one cell of row `row`, through the shipped `aterm db emails set`.
@@ -325,111 +359,6 @@ pub(super) fn wait(
         }
         stop::sleep(POLL)?;
     }
-}
-
-/// Every value the fixture of `seed` and its edits `tags` (`emails-set … password <tag>`) can
-/// have put in the table: what a reveal's Editor file holds and nothing else may.
-#[cfg(debug_assertions)]
-fn needles(seed: &str, tags: &[String]) -> Vec<String> {
-    let mut needles: Vec<String> = rows(seed)
-        .into_iter()
-        .filter_map(|row| row.password)
-        .collect();
-    for tag in tags {
-        needles.extend((1..=ROWS).map(|index| password(seed, &format!("edit:{tag}"), index)));
-    }
-    needles
-}
-
-/// The addresses the reveal's grid shows when it opens, at its top: what its accessibility tree
-/// must still carry once the passwords are concealed (A17b).
-#[cfg(debug_assertions)]
-fn first_screen(seed: &str) -> Vec<String> {
-    rows(seed)
-        .into_iter()
-        .take(3)
-        .map(|row| row.email)
-        .collect()
-}
-
-/// `emails-reveal <aterm> <world> <seed> [<tag>...]`: one-mesh A17 on a lab Mac's own emails
-/// table, its passwords sealed by the lab's import and edits. A windowed instance in the world's
-/// environment, whose boot tab's zsh accepts `aterm db emails --show-passwords` once (nobody
-/// typing over the control socket), then [`crate::reveal_tab::observe`]: the protected Editor tab opens
-/// and holds the values, `text`, `screen`, `image`, `window`, `video`, `key`, `pointer`,
-/// `invoke` and `doc read` of it refuse, and the caller's tab text, blocks and session log hold
-/// none of them, before and after the Editor tab closes; the window's accessibility tree carries
-/// the grid and its first addresses and no password (a named skip without an Accessibility
-/// grant). The caller stops the world's node first: the instance is the world's one aterm while
-/// it runs. The report names checks only.
-///
-/// # Errors
-/// The world is no prepared profile, its home already holds a `.zshrc`, or the instance or its
-/// Editor tab did not come up.
-#[cfg(debug_assertions)]
-pub(super) fn reveal(
-    aterm: &Path,
-    world: &World,
-    seed: &str,
-    tags: &[String],
-) -> Result<(Value, i32), Fail> {
-    let aterm = std::fs::canonicalize(aterm).map_err(fail)?;
-    let command = aterm.to_string_lossy();
-    if command.contains('\'') {
-        return Err(Fail::die("the aterm path holds a single quote"));
-    }
-    let rc = world.home.join(".zshrc");
-    crate::util::write_fresh(
-        &rc,
-        crate::reveal_tab::zshrc(&format!("{command} db emails --show-passwords")),
-    )
-    .map_err(fail)?;
-    let mut env = crate::reveal_tab::zsh_env(world);
-    env.retain(|(key, _)| key != "ATERM_STATE_HOME" && key != "CI");
-    let started = crate::instance::Instance::start(
-        world,
-        crate::instance::Launch {
-            aterm: aterm.clone(),
-            headless: false,
-            args: Vec::new(),
-            env,
-            cwd: world.home.clone(),
-            sandbox: None,
-            reroute: false,
-        },
-    )
-    .map_err(fail);
-    let mut evidence = crate::reveal_tab::Evidence::default();
-    let observed = started.and_then(|mut inst| {
-        let observed = crate::reveal_tab::observe(
-            &mut inst,
-            world,
-            &needles(seed, tags),
-            &first_screen(seed),
-            &mut evidence,
-        );
-        crate::instance::after_stop(observed, inst.stop())
-    });
-    let removed = std::fs::remove_file(&rc);
-    observed?;
-    removed.map_err(fail)?;
-    let checks = crate::reveal_tab::judge_tab(&evidence);
-    let pass = checks.iter().all(|(_, held)| *held);
-    let refusals: Vec<Value> = evidence
-        .refusals
-        .iter()
-        .map(|(verb, first)| json!({"verb": verb, "first": first.chars().take(120).collect::<String>()}))
-        .collect();
-    Ok((
-        json!({
-            "pass": pass,
-            "checks": checks.iter().map(|(name, held)| json!({"check": name, "pass": held})).collect::<Vec<_>>(),
-            "refusals": refusals,
-            "doc_read": evidence.doc_read.chars().take(120).collect::<String>(),
-            "skipped": crate::reveal_tab::skipped(&evidence).into_iter().map(|why| json!(why)).collect::<Vec<_>>(),
-        }),
-        i32::from(!pass),
-    ))
 }
 
 #[cfg(test)]

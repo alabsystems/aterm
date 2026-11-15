@@ -918,8 +918,9 @@ pub fn admission_cause(refusals: &[String]) -> String {
 
 impl Measured {
     /// Parses a crate's `targo trust check` log and `.rc` exit-code file into [`Measured`] facts.
-    #[must_use]
-    pub fn of_log(log: impl BufRead, rc: &str) -> Measured {
+    /// # Errors
+    /// A log read failed; even a complete-looking prefix cannot establish its final facts.
+    pub fn of_log(log: impl BufRead, rc: &str) -> std::io::Result<Measured> {
         const ADMISSION: &str = "memory admission failed";
         const BUDGET: &str = "exceeded the per-function verification budget";
         let mut m = Measured {
@@ -936,13 +937,7 @@ impl Measured {
         let mut refused_paths: BTreeSet<PathRefusal> = BTreeSet::new();
         let mut buf = Vec::new();
         let mut log = log;
-        loop {
-            use std::io::Read as _;
-            buf.clear();
-            match (&mut log).take(1024 * 1024).read_until(b'\n', &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
+        while read_log_line(&mut log, &mut buf)? {
             let line = String::from_utf8_lossy(&buf);
             let line = line.trim_end_matches(['\n', '\r']);
             if line.contains("verification did not run") || line.contains("transport:missing-json")
@@ -1083,7 +1078,7 @@ impl Measured {
         }
         m.ended = one_line(&ended.join("; "));
         m.path_refused = refused_paths.into_iter().collect();
-        m
+        Ok(m)
     }
 
     fn to_fields(&self) -> String {
@@ -1218,6 +1213,55 @@ impl Measured {
         };
         Some((m, backstops))
     }
+}
+
+/// Read one bounded logical line, discarding an overlong diagnostic through its real newline.
+/// A continuation chunk can never become an independent Summary or Coverage line.
+fn read_log_line(log: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    const MAX_LINE: u64 = 1024 * 1024;
+    loop {
+        buf.clear();
+        if (&mut *log).take(MAX_LINE + 1).read_until(b'\n', buf)? == 0 {
+            return Ok(false);
+        }
+        if buf.len() as u64 <= MAX_LINE {
+            return Ok(true);
+        }
+        if buf.last() != Some(&b'\n') {
+            log.skip_until(b'\n')?;
+        }
+    }
+}
+
+/// Read an optional execution mark. A present but unreadable mark is unavailable input.
+fn optional_receipt(path: &Path) -> std::io::Result<Option<String>> {
+    match crate::durable::read_text(path) {
+        Ok(text) => Ok(Some(text.trim().to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        )),
+    }
+}
+
+/// The required status uses the same canonical signed decimal as `trust_lane::Ended::code`.
+fn execution_status(path: &Path) -> std::io::Result<String> {
+    let text = crate::durable::read_text(path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    let status = text.trim();
+    if status
+        .parse::<i32>()
+        .ok()
+        .is_none_or(|n| n.to_string() != status)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{}: no canonical compiler exit status", path.display()),
+        ));
+    }
+    Ok(status.to_string())
 }
 
 const GIB: f64 = 1_073_741_824.0;
@@ -4238,39 +4282,43 @@ impl Plan {
     }
 
     /// Reads each gated crate's log and its `.rc`, `.trustd`, `.trustd-lost`, `.budget`, `.pace`
-    /// and obligation record ([`crate::trust_oblig::RECORD_SUFFIX`]) beside it into `self.crates`.
-    pub fn measure(&mut self) {
-        let read = |p: PathBuf| {
-            crate::durable::read_text(&p)
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default()
-        };
-        self.facts.grants = read(self.logdir.join(".trustd-grants"));
-        self.facts.trustd_seen = read(self.logdir.join(".trustd-seen"));
-        for c in &mut self.facts.crates {
+    /// and obligation record ([`crate::trust_oblig::RECORD_SUFFIX`]) beside it into `self.facts`.
+    /// # Errors
+    /// A gated log or required status is unavailable, the status is malformed, or a present
+    /// optional receipt could not be read or an obligation record is malformed. No partial
+    /// measurement is kept.
+    pub fn measure(&mut self) -> std::io::Result<()> {
+        self.measure_with(|path, rc| {
+            Measured::of_log(BufReader::new(crate::durable::open_regular_file(path)?), rc)
+        })
+    }
+
+    fn measure_with(
+        &mut self,
+        mut measure: impl FnMut(&Path, &str) -> std::io::Result<Measured>,
+    ) -> std::io::Result<()> {
+        let read = |p: PathBuf| optional_receipt(&p).map(Option::unwrap_or_default);
+        let mut facts = self.facts.clone();
+        facts.grants = read(self.logdir.join(".trustd-grants"))?;
+        facts.trustd_seen = read(self.logdir.join(".trustd-seen"))?;
+        for c in &mut facts.crates {
             if let Decision::Gate(m) = &mut c.decision {
                 let spec = self
                     .specs
                     .get(&c.name)
                     .map_or(c.name.as_str(), String::as_str);
                 let log = self.logdir.join(format!("{spec}.log"));
-                let rc = crate::durable::read_text(&self.logdir.join(format!("{spec}.log.rc")))
-                    .map_or_else(|_| "?".to_string(), |s| s.trim().to_string());
-                *m = match crate::durable::open_regular_file(&log) {
-                    Ok(f) => Measured::of_log(BufReader::new(f), &rc),
-                    Err(_) => Measured {
-                        rc,
-                        ..Measured::default()
-                    },
-                };
+                let rc = execution_status(&self.logdir.join(format!("{spec}.log.rc")))?;
+                *m = measure(&log, &rc).map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("{}: {e}", log.display()))
+                })?;
+                let probe = read(self.logdir.join(format!("{spec}.log.trustd")))?;
                 if !m.launch.is_empty() {
-                    let probe = read(self.logdir.join(format!("{spec}.log.trustd")));
                     let (held, what) = probe.split_once('\t').unwrap_or((probe.as_str(), ""));
                     (m.held, m.held_what) = (one_line(held), one_line(what));
                 }
                 let mark = self.logdir.join(format!("{spec}.log.budget"));
-                if mark.exists() {
-                    let said = read(mark);
+                if let Some(said) = optional_receipt(&mark)? {
                     let said = said.lines().next().unwrap_or("");
                     m.wall_budget = if !said.is_empty() && said.bytes().all(|b| b.is_ascii_digit())
                     {
@@ -4279,19 +4327,27 @@ impl Plan {
                         "?".into()
                     };
                 }
-                m.pace = Pace::parse(&read(self.logdir.join(format!("{spec}.log.pace"))));
+                m.pace = Pace::parse(&read(self.logdir.join(format!("{spec}.log.pace")))?);
                 m.trustd_lost =
-                    one_line(&read(self.logdir.join(format!("{spec}.log.trustd-lost"))));
-                m.backstops = crate::durable::read_text(
-                    &self
-                        .logdir
-                        .join(format!("{spec}.log{}", crate::trust_oblig::RECORD_SUFFIX)),
-                )
-                .ok()
-                .and_then(|t| crate::trust_oblig::Record::parse(&t).ok())
-                .map(|r| Backstop::of_record(&r));
+                    one_line(&read(self.logdir.join(format!("{spec}.log.trustd-lost")))?);
+                let record = self
+                    .logdir
+                    .join(format!("{spec}.log{}", crate::trust_oblig::RECORD_SUFFIX));
+                m.backstops = optional_receipt(&record)?
+                    .map(|t| {
+                        crate::trust_oblig::Record::parse(&t).map_err(|why| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("{}: {why}", record.display()),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .map(|r| Backstop::of_record(&r));
             }
         }
+        self.facts = facts;
+        Ok(())
     }
 }
 
@@ -4697,7 +4753,11 @@ pub fn conclude(
     plan: &mut Plan,
     update: Update<'_>,
 ) -> Result<Concluded> {
-    plan.measure();
+    plan.measure().map_err(|e| {
+        Error::new(format!(
+            "compiler execution receipts could not be measured: {e}"
+        ))
+    })?;
     let filed = plan.file.as_ref().map(|file| filing(git, repo, plan, file));
     let mut facts = plan.facts.clone();
     let mut why_not: Option<String> = None;
@@ -5091,6 +5151,7 @@ fn short_name(name: &str) -> String {
 #[derive(Debug, PartialEq, Eq)]
 pub enum TrustCmd {
     Run(crate::trust_lane::Config),
+    Reduce(crate::trust_oblig::ReduceArgs),
     Judge {
         commit: String,
         prover: Option<PathBuf>,
@@ -5109,9 +5170,12 @@ pub fn parse_cmd<'a>(
 ) -> std::result::Result<TrustCmd, String> {
     let verb = it
         .next()
-        .ok_or("trust needs a verb: run, judge or credit")?;
+        .ok_or("trust needs a verb: run, reduce, judge or credit")?;
     if verb == "run" {
         return crate::trust_lane::parse(it).map(TrustCmd::Run);
+    }
+    if verb == "reduce" {
+        return crate::trust_oblig::parse_reduce(it).map(TrustCmd::Reduce);
     }
     if verb == "credit" {
         let records: Vec<PathBuf> = it.map(PathBuf::from).collect();
@@ -5199,10 +5263,59 @@ pub fn pending_for(
     Ok(Ok(verdict.unverified))
 }
 
+/// Reduce retained evidence, returning `2` for refusal or a failed output writer.
+/// A failed initial diagnostic leaves the output unpublished. A later stdout
+/// failure leaves the completed record in place; it never replaces an output.
+pub(crate) fn reduce_with_io(
+    args: &crate::trust_oblig::ReduceArgs,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> i32 {
+    if writeln!(
+        err,
+        "aterm-release trust reduce: parsing retained evidence; no proof claim; source root {}",
+        one_line(&args.repo.display().to_string()),
+    )
+    .and_then(|()| err.flush())
+    .is_err()
+    {
+        return 2;
+    }
+    match crate::trust_oblig::write_new_record(args) {
+        Ok(record) => {
+            if let Err(why) = writeln!(
+                out,
+                "{}: {} functions, {} obligations, {} proved; {}",
+                record.package,
+                record.functions,
+                record.total(),
+                record.proved(),
+                args.out.display()
+            )
+            .and_then(|()| out.flush())
+            {
+                let _ = writeln!(err, "aterm-release trust reduce: stdout: {why}")
+                    .and_then(|()| err.flush());
+                return 2;
+            }
+            0
+        }
+        Err(why) => {
+            let _ = writeln!(err, "aterm-release trust reduce: {why}").and_then(|()| err.flush());
+            2
+        }
+    }
+}
+
 /// Executes `cmd` against `repo` and returns its process exit code (`0`, `1`, or `2`).
 pub fn run_cmd(repo: &Path, cmd: TrustCmd) -> i32 {
     let git = crate::ledger::GitCli::new(repo);
     match cmd {
+        TrustCmd::Reduce(args) => reduce_with_io(
+            &args,
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+        ),
         TrustCmd::Credit(records) => crate::trust_credit::run_cmd(repo, &records),
         TrustCmd::Run(mut cfg) => {
             cfg.repo = repo.to_path_buf();

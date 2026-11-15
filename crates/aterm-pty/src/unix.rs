@@ -808,6 +808,7 @@ fn spawn_termios() -> Option<libc::termios> {
 
 const EXEC_START_HANG: std::time::Duration = crate::START_HANG;
 
+#[cfg(not(target_os = "linux"))]
 const EXEC_STATUS_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1030,7 +1031,7 @@ fn open_exec_status_channel() -> io::Result<(libc::c_int, libc::c_int, ExecStatu
         Ok(chan) => chan,
         Err(why) => {
             // Close-on-exec and kept out of children: the spawn that uses it hands its child the
-            // write end (`aterm_uds::spawn_lock::handing`).
+            // write end (`aterm_uds::spawn_lock::spawn_std`).
             let (rd, wr) = aterm_uds::pipe()?;
             note_racy_exec_status_carrier(&why);
             (
@@ -1057,8 +1058,18 @@ fn open_exec_status_channel() -> io::Result<(libc::c_int, libc::c_int, ExecStatu
 enum ExecStatus {
     Execed,
     FailedBeforeExec(u8),
+    #[cfg(not(target_os = "linux"))]
     NoVerdict,
-    ChannelBroke(io::Error),
+    ChannelBroke(
+        #[cfg_attr(
+            target_os = "linux",
+            expect(
+                dead_code,
+                reason = "only the fork's verdict names why its channel broke"
+            )
+        )]
+        io::Error,
+    ),
 }
 
 fn read_exec_status_now(rd: libc::c_int) -> Option<ExecStatus> {
@@ -1081,6 +1092,7 @@ fn read_exec_status_now(rd: libc::c_int) -> Option<ExecStatus> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn wait_readable_briefly(fd: libc::c_int, slice: std::time::Duration) {
     if fd >= 0 && (fd as usize) < libc::FD_SETSIZE {
         // SAFETY: `fd` is in `0..FD_SETSIZE`, and `set` and `tv` are valid initialized locals.
@@ -1114,7 +1126,8 @@ fn wait_readable_briefly(fd: libc::c_int, slice: std::time::Duration) {
 pub(crate) mod pre_exec_stall;
 
 /// The wait a spawn on this thread last gave its exec verdict (tests): what
-/// the spawn passed [`wait_for_exec_status`], whatever its constant says.
+/// the spawn passed `wait_for_exec_status`, or a Linux terminal start, whatever
+/// its constant says.
 #[cfg(test)]
 #[path = "unix_exec_wait_seen_tests.rs"]
 pub(crate) mod exec_wait_seen;
@@ -1126,6 +1139,7 @@ pub(crate) mod exec_wait_seen;
 #[path = "unix_exec_carrier_seen_tests.rs"]
 mod exec_carrier_seen;
 
+#[cfg(not(target_os = "linux"))]
 fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecStatus {
     #[cfg(test)]
     exec_wait_seen::note(budget);
@@ -1472,11 +1486,10 @@ fn spawn_session_leader_on_fresh_pty(
                 Ok(())
             });
         }
-        // The exec status's write end, which `pre_exec` writes, is unmarked for this spawn alone
-        // where it is a kept-out pipe (the fallback carrier).
-        let spawning = aterm_uds::spawn_lock::handing(&[status_wr]);
-        let spawned = cmd.spawn();
-        drop(spawning);
+        // The exec status's write end, which `pre_exec` writes, is unmarked for this fork alone
+        // where it is a kept-out pipe (the fallback carrier). The spawn lock is held across the
+        // fork alone, not the child's exec, which std's spawn waits for.
+        let spawned = aterm_uds::spawn_lock::spawn_std(&mut cmd, &[status_wr]);
         drop(cmd);
         match spawned {
             Ok(child) => {
@@ -1871,11 +1884,12 @@ pub fn spawn_shell_with_pid(
 }
 
 /// [`spawn_shell_with_pid`], filling the winsize pixel fields from the host's cell metrics, and
-/// handing the child `pass` ([`PassedFd`]) when there is one. A pass the child cannot put in
-/// place fails the spawn closed: the child exits before its exec and the call is an `Err`. No
-/// shell starts on a pty found dead up to the child's last check before its exec
-/// (ATERM-KI-1028-4): one the parent finds dead before the fork (`dead_pty`), a pooled one
-/// included, one the child cannot make its controlling terminal, or one dead in the child right
+/// handing the child `pass` ([`PassedFd`]) when there is one. The child is a fork, or on Linux a
+/// clone that runs in this process's memory until its exec (`start_on_pty`). A pass the child
+/// cannot put in place fails the spawn closed: the child exits before its exec and the call is an
+/// `Err`. No shell starts on a pty found dead up to the child's last check before its exec
+/// (ATERM-KI-1028-4): one the parent finds dead before it starts the child (`dead_pty`), a pooled
+/// one included, one the child cannot make its controlling terminal, or one dead in the child right
 /// after it did, is replaced by a fresh pty once, and a dead replacement is an `Err` naming the
 /// cause. A pty that dies after that check (during the exec, or under the running shell) still
 /// ends the shell: nothing in user space sees that coming.
@@ -1960,6 +1974,7 @@ pub fn spawn_shell_with_pid_cell_px(
 ) -> io::Result<SpawnedShell> {
     aterm_cap::require(cap, aterm_cap::Tier::Trusted)
         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
+    #[cfg(not(target_os = "linux"))]
     let handed = pass.map(|p| std::os::fd::AsRawFd::as_raw_fd(&p.fd));
     let pass = pass
         .map(|p| aterm_uds::spawnfd::PassAt::new(p.fd, p.at))
@@ -1993,8 +2008,12 @@ pub fn spawn_shell_with_pid_cell_px(
             CString::new(kv.as_bytes()).ok()
         })
         .collect();
-    let mut envp: Vec<*const libc::c_char> = env_store.iter().map(|c| c.as_ptr()).collect();
-    envp.push(ptr::null());
+    #[cfg(not(target_os = "linux"))]
+    let envp: Vec<*const libc::c_char> = env_store
+        .iter()
+        .map(|c| c.as_ptr())
+        .chain([ptr::null()])
+        .collect();
 
     let runs_program = exec_command.is_some_and(|c| !c.is_empty());
     let (exec_target, argv_store): (CString, Vec<CString>) =
@@ -2031,8 +2050,12 @@ pub fn spawn_shell_with_pid_cell_px(
         (exec_target, argv_store)
     };
 
-    let mut argv: Vec<*const libc::c_char> = argv_store.iter().map(|c| c.as_ptr()).collect();
-    argv.push(ptr::null());
+    #[cfg(not(target_os = "linux"))]
+    let argv: Vec<*const libc::c_char> = argv_store
+        .iter()
+        .map(|c| c.as_ptr())
+        .chain([ptr::null()])
+        .collect();
 
     let chdir_c: Option<CString> = match cwd {
         Some(dir) => Some(CString::new(dir.as_bytes()).map_err(|_| {
@@ -2043,6 +2066,25 @@ pub fn spawn_shell_with_pid_cell_px(
         })?),
         None => default_start_folder().and_then(|h| CString::new(h.as_bytes()).ok()),
     };
+
+    // Linux: the limits the child sets on itself, decided here, where the capability's check may
+    // allocate; a refusal starts nothing.
+    #[cfg(target_os = "linux")]
+    let planned: Vec<aterm_uds::spawnfd::terminal::Limit> = limits
+        .plan(sandbox_cap)
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("sandbox confinement failed (fail-closed: shell not started): {e}"),
+            )
+        })?
+        .into_iter()
+        .map(|limit| aterm_uds::spawnfd::terminal::Limit {
+            resource: limit.resource,
+            soft: limit.soft,
+            hard: limit.hard,
+        })
+        .collect();
 
     let (ws_xpixel, ws_ypixel) = winsize_pixels(rows, cols, cell_px);
     let ws = libc::winsize {
@@ -2056,6 +2098,10 @@ pub fn spawn_shell_with_pid_cell_px(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
+    #[cfg_attr(
+        target_os = "linux",
+        allow(unused_mut, reason = "only the fork's loop swaps it")
+    )]
     let mut kit = match pooled {
         Some(kit) => {
             kit.size(&ws);
@@ -2063,10 +2109,63 @@ pub fn spawn_shell_with_pid_cell_px(
         }
         None => fresh_kit(&ws)?,
     };
+    #[cfg(target_os = "linux")]
+    return start_on_pty(
+        kit,
+        &ws,
+        &aterm_uds::spawnfd::terminal::Start {
+            program: &exec_target,
+            argv: &argv_store,
+            envp: &env_store,
+            cwd: chdir_c.as_deref(),
+            limits: &planned,
+            pass,
+        },
+        |step, error| match step {
+            aterm_uds::spawnfd::terminal::Step::Folder => (
+                io::ErrorKind::Other,
+                format!(
+                    "the child's working directory could not be entered ({error}); no program \
+                     was executed"
+                ),
+            ),
+            aterm_uds::spawnfd::terminal::Step::Limits => (
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "sandbox confinement failed in child ({error}; fail-closed: shell not \
+                     exec'd)"
+                ),
+            ),
+            aterm_uds::spawnfd::terminal::Step::Pass => (
+                io::ErrorKind::Other,
+                format!(
+                    "the child could not hold its passed descriptor at {} ({error}; \
+                     fail-closed: `{}` not exec'd)",
+                    pass.map_or(-1, aterm_uds::spawnfd::PassAt::at),
+                    exec_target.to_string_lossy()
+                ),
+            ),
+            _ => (
+                io::ErrorKind::Other,
+                exec_failure(
+                    &exec_target,
+                    if runs_program || sandbox_wrap.is_some() {
+                        ""
+                    } else {
+                        shell_from
+                    },
+                    runs_program,
+                    chdir_c.as_deref(),
+                ),
+            ),
+        },
+    );
     // What each dead pty this spawn met died of: it forks onto no pty its parent finds dead, and
     // replaces a dead one, found here or by its child, with a fresh one, once
     // ([`replace_dead_pty`]; ATERM-KI-1028-4).
+    #[cfg(not(target_os = "linux"))]
     let mut deaths: Vec<String> = Vec::new();
+    #[cfg(not(target_os = "linux"))]
     let (master, pid, status) = loop {
         if let Some(died_of) = dead_pty(kit.master, kit.slave) {
             // The dead kit closes only once its replacement is open.
@@ -2255,6 +2354,7 @@ pub fn spawn_shell_with_pid_cell_px(
         reap(pid);
         kit = fresh?;
     };
+    #[cfg(not(target_os = "linux"))]
     let failure: Option<(io::ErrorKind, String)> = match status {
         ExecStatus::Execed => None,
         ExecStatus::FailedBeforeExec(b'C') => Some((
@@ -2305,6 +2405,7 @@ pub fn spawn_shell_with_pid_cell_px(
             ),
         )),
     };
+    #[cfg(not(target_os = "linux"))]
     if let Some((kind, what)) = failure {
         // SAFETY: `pid` is this call's child and `master` is the parent's owned pty master fd.
         unsafe {
@@ -2314,7 +2415,92 @@ pub fn spawn_shell_with_pid_cell_px(
         reap(pid);
         return Err(io::Error::new(kind, what));
     }
+    #[cfg(not(target_os = "linux"))]
     Ok(SpawnedShell { master, pid })
+}
+
+/// Linux: start `start`'s program as the leader of a session on `kit`'s pty, by the clone every
+/// Linux spawn makes ([`aterm_uds::spawnfd::terminal`]), so a new tab copies nothing of this
+/// process (ATERM-KI-1113-811). A pty found dead before the start, or by its child (it could not
+/// take the pty as its controlling terminal, or the pty died once it had), is replaced as the
+/// fork's is ([`replace_dead_pty`]); `failure` says what any other step the child stopped at
+/// means. The start reaps a child that stopped or hung, so nothing here kills or reaps.
+#[cfg(target_os = "linux")]
+fn start_on_pty(
+    mut kit: SpawnKit,
+    ws: &libc::winsize,
+    start: &aterm_uds::spawnfd::terminal::Start<'_>,
+    failure: impl Fn(aterm_uds::spawnfd::terminal::Step, &io::Error) -> (io::ErrorKind, String),
+) -> io::Result<SpawnedShell> {
+    use aterm_uds::spawnfd::terminal::{self, Started, Step};
+    let mut deaths: Vec<String> = Vec::new();
+    loop {
+        if let Some(died_of) = dead_pty(kit.master, kit.slave) {
+            // The dead kit closes only once its replacement is open.
+            let dead = std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, ws)?);
+            drop(dead);
+            continue;
+        }
+        let (master, slave, status_rd, status_wr) = kit.into_raw();
+        // The child's verdict comes by the start's own report, so the kit's exec-status pair is
+        // spent unused.
+        // SAFETY: the kit's write end, owned by this spawn alone.
+        unsafe {
+            libc::close(status_wr);
+        }
+        retire_spent(status_rd);
+        #[cfg(test)]
+        spawn_trace::forking_onto(master);
+        let within = EXEC_START_HANG;
+        #[cfg(test)]
+        exec_wait_seen::note(within);
+        // SAFETY: `slave` is the kit's slave, open and owned here until its close below.
+        let on = unsafe { std::os::fd::BorrowedFd::borrow_raw(slave) };
+        let started = terminal::start(start, on, within);
+        // SAFETY: the parent's copy of the slave, owned here.
+        unsafe {
+            libc::close(slave);
+        }
+        let died = match started {
+            Ok(Started::Running(pid)) => return Ok(SpawnedShell { master, pid }),
+            // The child could not take its pty, or lost it: the pty is dead, not the program.
+            Ok(Started::Stopped {
+                step: Step::Terminal,
+                error,
+            }) => Ok(format!(
+                "the shell could not make it its controlling terminal ({error})"
+            )),
+            Ok(Started::Stopped {
+                step: Step::Live,
+                error,
+            }) => Ok(format!(
+                "it died once the shell had made it its controlling terminal (fstat or \
+                 tcgetattr on it failed in the child: {error})"
+            )),
+            Ok(Started::Stopped { step, error }) => {
+                let (kind, what) = failure(step, &error);
+                Err(io::Error::new(kind, what))
+            }
+            Ok(Started::Hung) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "`{}` did not start within {} s",
+                    start.program.to_string_lossy(),
+                    within.as_secs()
+                ),
+            )),
+            Err(err) => Err(err),
+        };
+        // A fresh pty opens while this master still holds the dead one's number.
+        let fresh = died.and_then(|how| {
+            replace_dead_pty(&mut deaths, format!("{}: {how}", pty_label(master)), ws)
+        });
+        // SAFETY: the parent's owned master of this try's pty, which no shell holds.
+        unsafe {
+            libc::close(master);
+        }
+        kit = fresh?;
+    }
 }
 
 /// In the forked child, after the master's close: put `pass` at its number. The exec-status
@@ -2326,6 +2512,7 @@ pub fn spawn_shell_with_pid_cell_px(
 /// # Safety
 /// Only in the forked child before its exec, after the descriptor strip, with `status_wr` its
 /// exec-status write end and nothing else it still needs at `pass.at()`.
+#[cfg(not(target_os = "linux"))]
 unsafe fn place_passed(
     pass: aterm_uds::spawnfd::PassAt,
     status_wr: libc::c_int,

@@ -3241,6 +3241,23 @@ impl LiveFixture {
         self.home.join(".aterm").join("shell.d")
     }
 
+    /// A session's re-key path in a private folder, as the host hands every session it starts
+    /// one (`<control dir>/rekey/<sid>`, [`REKEY_PATH_VAR`]): the bash hooks read a command's
+    /// output through the file beside it ([`OUTPUT_SUFFIX`]) instead of a `$(…)`.
+    fn rekey_path(&self) -> String {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir = self.base.join("rekey");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .expect("re-key dir");
+        dir.join("s-0123456789abcdef0123")
+            .to_str()
+            .expect("UTF-8")
+            .to_owned()
+    }
+
     fn hook_body(&self, golden: &str) -> String {
         golden
             .replace(

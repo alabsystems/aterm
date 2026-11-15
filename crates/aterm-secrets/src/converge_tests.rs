@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::materialize::Report;
+use crate::client::Report;
 use std::net::Ipv4Addr;
 
 const HOME: Routes = [Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))), None, None];
@@ -828,4 +828,174 @@ fn starting_a_runner_never_waits_for_it_and_gives_it_its_own_session() {
             "exit {code} is consumed once"
         );
     }
+}
+
+/// The causes of the start `due` last chose.
+fn caused(due: &Due) -> Causes {
+    due.note().causes
+}
+
+fn causes<const N: usize>(set: [Causes; N]) -> Causes {
+    set.into_iter().fold(Causes::default(), Causes::with)
+}
+
+/// EACH SUBSCRIBER START NOTES EXACTLY WHAT CAUSED IT: every cause is noted where its work is
+/// requested and leaves with the start it caused, so each set below is the whole set of that
+/// start. The first start has no refresh boundary yet, so it is `start` and `recheck`; a
+/// retry names what set its time; identity's own retry is named beside the runner's.
+/// NEGATIVE CONTROL: causes left in place at a start make the second start's set
+/// `{start, recheck, applied}`.
+#[test]
+fn each_subscriber_start_notes_exactly_its_causes() {
+    let mut due = Due::default();
+    assert!(due.at_start(0, HOME, Last::None));
+    assert_eq!(caused(&due), causes([Causes::START, Causes::RECHECK]));
+    assert!(due.after_pass(&applied(), MINUTE, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::APPLIED);
+    due.failed();
+    assert!(due.after_pass(&unchanged(), 2 * MINUTE, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::RECOVERED);
+    assert!(due.after_unreachable_pass(&applied(), 3 * MINUTE, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::APPLIED);
+    assert!(due.after_local_progress(RepositoryWork::Repair, 4 * MINUTE, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::LOCAL);
+    due.paused();
+    assert!(due.poll(5 * MINUTE, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::ACTIVATION);
+    // The projection notes an observer's request beside the request itself.
+    due.because(Causes::INPUT_REPAIR);
+    due.request(RepositoryRequest::Repair);
+    assert!(due.poll(6 * MINUTE, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::INPUT_REPAIR);
+    due.because(Causes::INPUT_REFRESH);
+    due.request(RepositoryRequest::Refresh(RefreshRequest::after(
+        None,
+        RefreshVersion::default(),
+    )));
+    assert!(due.poll(7 * MINUTE, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::INPUT_REFRESH);
+    due.identity_changed();
+    assert!(due.poll(8 * MINUTE, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::IDENTITY);
+    assert!(due.poll(9 * MINUTE, AWAY, Last::Ended));
+    assert_eq!(caused(&due), Causes::ROUTES);
+    assert!(due.poll(MINUTE, AWAY, Last::Ended));
+    assert_eq!(caused(&due), Causes::CLOCK);
+    assert!(!due.poll(MINUTE + RECHECK_MS - 1, AWAY, Last::Ended));
+    assert!(due.poll(MINUTE + RECHECK_MS, AWAY, Last::Ended));
+    assert_eq!(caused(&due), Causes::RECHECK);
+
+    let failed = 40 * MINUTE;
+    assert!(!due.poll(failed, AWAY, Last::Failed));
+    assert!(!due.poll(failed + FIRST_RETRY_MS - 1, AWAY, Last::None));
+    assert!(due.poll(failed + FIRST_RETRY_MS, AWAY, Last::None));
+    assert_eq!(caused(&due), Causes::RETRY_FAILED);
+    let unfinished = 41 * MINUTE;
+    assert!(!due.poll(unfinished, AWAY, Last::Unfinished));
+    assert!(due.poll(unfinished + 2 * FIRST_RETRY_MS, AWAY, Last::None));
+    assert_eq!(caused(&due), Causes::RETRY_UNFINISHED);
+    assert_eq!(due.note().held, 0);
+
+    // Identity's own retry and the runner's come due together after a failed pass that
+    // carried identity debt.
+    let mut due = Due::default();
+    assert!(due.at_start(0, HOME, Last::None));
+    due.identity_changed();
+    assert!(due.poll(1000, HOME, Last::Ended));
+    assert_eq!(caused(&due), Causes::IDENTITY);
+    assert!(!due.poll(2000, HOME, Last::Failed));
+    assert!(due.poll(2000 + FIRST_RETRY_MS, HOME, Last::None));
+    assert_eq!(
+        caused(&due),
+        causes([Causes::RETRY_FAILED, Causes::RETRY_IDENTITY])
+    );
+
+    // The shared wave's retry: the request waits for it, and the start it makes names it
+    // beside the boundary that was owed with it.
+    let refresh = RefreshRequest::inputs(RefreshScope::new([1; 32]), RefreshVersion::default());
+    let waiting = RefreshObservation {
+        pending: Some(refresh),
+        retry_ms: Some(5_000),
+        ..RefreshObservation::default()
+    };
+    let mut due = Due::default();
+    due.observe(waiting);
+    assert!(!due.after_request(RepositoryRequest::Refresh(refresh), 0, HOME, Last::None));
+    due.observe(RefreshObservation {
+        retry_ms: Some(0),
+        ..waiting
+    });
+    assert!(due.poll(5_000, HOME, Last::None));
+    assert_eq!(caused(&due), causes([Causes::RECHECK, Causes::RETRY_WAVE]));
+}
+
+/// A START THAT FOUND THE LOCK HELD IS COUNTED ON THE PASS THAT FOLLOWS IT, WHICH NAMES WHAT
+/// IT WAS FIRST OWED FOR: after the first start (`start`, `recheck`, the mark moved by the
+/// index in one look), a held runner, a config move and the 5 s retry give `{start, recheck,
+/// retry-held}` with `held == 1`, the CPU its reap measured, the 5 s waited and both classes
+/// in two looks; a second held runner gives `held == 2`, both runners' CPU and the time since
+/// the first, and keeps both classes; a runner that ran zeroes all of it. No start's pacing
+/// moves: the starts are at the times the retry gave before.
+/// NEGATIVE CONTROLS: a held reap that sets no retry cause gives `{start, recheck}` without
+/// `retry-held`; a held reap that does not put the held start's causes back gives
+/// `{retry-held}` alone; one that does not put its classes back gives `config` in one look.
+#[test]
+fn a_held_start_is_counted_and_keeps_its_causes_for_the_pass_that_follows() {
+    use std::time::Duration;
+    let owed = causes([Causes::START, Causes::RECHECK, Causes::RETRY_HELD]);
+    let both = MarkMoved::INDEX.with(MarkMoved::CONFIG);
+    let mut due = Due::default();
+    due.because_moved(MarkMoved::INDEX, 1);
+    assert!(due.at_start(0, HOME, Last::None));
+    assert_eq!(
+        due.note(),
+        StartNote {
+            causes: causes([Causes::START, Causes::RECHECK]),
+            moved: MarkMoved::INDEX,
+            moves: 1,
+            ..StartNote::default()
+        }
+    );
+    due.held_spent(Duration::from_millis(30));
+    assert!(!due.poll(1000, HOME, Last::Held));
+    due.because_moved(MarkMoved::CONFIG, 1);
+    assert!(!due.poll(1000 + FIRST_RETRY_MS - 1, HOME, Last::None));
+    assert!(due.poll(1000 + FIRST_RETRY_MS, HOME, Last::None));
+    assert_eq!(
+        due.note(),
+        StartNote {
+            causes: owed,
+            held: 1,
+            held_cpu_ms: 30,
+            waited_ms: FIRST_RETRY_MS,
+            moved: both,
+            moves: 2,
+        }
+    );
+    due.held_spent(Duration::from_millis(12));
+    assert!(!due.poll(7000, HOME, Last::Held));
+    assert!(due.poll(7000 + FIRST_RETRY_MS, HOME, Last::None));
+    assert_eq!(
+        due.note(),
+        StartNote {
+            causes: owed,
+            held: 2,
+            held_cpu_ms: 42,
+            waited_ms: 11_000,
+            moved: both,
+            moves: 2,
+        }
+    );
+    assert_eq!(
+        due.note().word(),
+        "c=start+recheck+retry-held,h=2,hc=42,w=11000,m=config+index,n=2"
+    );
+    assert!(due.after_pass(&applied(), 20_000, HOME, Last::Ended));
+    assert_eq!(
+        due.note(),
+        StartNote {
+            causes: Causes::APPLIED,
+            ..StartNote::default()
+        }
+    );
 }

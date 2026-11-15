@@ -42,7 +42,7 @@ pub(crate) fn prepared(request: &Request) -> Prepared {
 }
 fn terminal(request: &Request, exit: i32) -> Terminal {
     Terminal::Completed {
-        completion: MetadataCompletion {
+        completion: Box::new(MetadataCompletion {
             finished: StatusFrame {
                 root_attempt: request.key.graph.query.binding.root_attempt,
                 member_attempt: request.key.operation,
@@ -53,7 +53,7 @@ fn terminal(request: &Request, exit: i32) -> Terminal {
                 },
             },
             inputs_unchanged: Ok(()),
-        },
+        }),
         observation: crate::accounting::Observation::uncollected(),
         artifact: if exit == 0 {
             Some(MetadataFile {

@@ -86,6 +86,20 @@ impl CargoDriver {
     }
 }
 
+/// Capture a prepared compiler call under ordinary build admission where that boundary is
+/// available. The command keeps its environment, handles and configured stdio. Runtime
+/// measurements use their own entry policy after this compiler's owning wait has ended.
+pub(super) fn compiler_output(command: &mut Command) -> std::io::Result<std::process::Output> {
+    #[cfg(unix)]
+    {
+        atpkg::build_admit::output(command, atpkg::build_cache::Tool::Targo)
+    }
+    #[cfg(not(unix))]
+    {
+        command.output()
+    }
+}
+
 /// Resolves the `--config` build-dir argument for performance builds in this workspace.
 pub(crate) fn workspace_build_dir() -> Option<&'static str> {
     workspace_layout().selected.as_deref()

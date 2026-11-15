@@ -266,6 +266,212 @@ mod files {
         assert_eq!(transport.requests().len(), 2, "the cutter can still read");
     }
 
+    /// A registry whose one record names `pid`, started at `start` in boot `boot`, as a
+    /// release line's holder: what a cutter writes when it takes its fleet line.
+    fn line_record(registry: &std::path::Path, pid: u32, boot: &str, start: u64) {
+        std::fs::create_dir_all(registry).unwrap();
+        let identity = aterm_ctl::release_holder::Identity {
+            pid,
+            boot: boot.to_owned(),
+            start,
+        };
+        let record = aterm_json::json!({"holder": {"pid": pid, "boot": boot, "start": start}});
+        std::fs::write(
+            registry.join(identity.record_name("0.200.0")),
+            record.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// This test process, as the kernel names it: its pid, boot and start.
+    fn this_process() -> (u32, String, u64) {
+        let pid = std::process::id();
+        let start = aterm_uds::process::read_process_start(i32::try_from(pid).unwrap())
+            .expect("this process's start reads")
+            .boot
+            .0;
+        let boot = aterm_uds::process::boot_id().expect("this host names its boot");
+        (pid, boot, start)
+    }
+
+    const AT_THE_RESERVE: [(&str, &str); 3] = [
+        ("x-ratelimit-limit", "5000"),
+        ("x-ratelimit-remaining", "995"),
+        ("x-ratelimit-reset", "1760003600"),
+    ];
+
+    /// R32: a cut's own process tree is the cutter for a client that never said so. The
+    /// client is the default one (reserve 1000), as the `agh` command builds it.
+    /// NEGATIVE CONTROLS: with no record, with a record of this pid under another start (a pid
+    /// that changed hands), and with one of another boot, the same read is refused at the
+    /// reserve and nothing is sent.
+    #[test]
+    fn a_read_in_a_cuts_own_tree_spends_the_reserve_and_a_stale_or_forged_record_does_not() {
+        let (pid, boot, start) = this_process();
+        let other_boot = if boot.starts_with('0') { "1" } else { "0" };
+        let read = |record: Option<(&str, u64)>| {
+            let root = common::scratch("rate-cut-tree");
+            let fake = agh_fake::FakeGithub::start();
+            common::canonical_tokens(root.path(), &fake, true, false);
+            let registry = root.path().join("release-lines");
+            if let Some((boot, start)) = record {
+                line_record(&registry, pid, boot, start);
+            }
+            let transport = Arc::new(ScriptedTransport::new());
+            transport.answer(200, &AT_THE_RESERVE, b"{}");
+            transport.answer(200, &AT_THE_RESERVE, b"{}");
+            let client = GithubBuilder::new(common::router(
+                &common::canonical_config(root.path()),
+                root.path(),
+            ))
+            .transport(transport.clone())
+            .endpoints(Endpoints::loopback(47_201, 47_202, 47_203, 47_204))
+            .env(Arc::new(common::env()))
+            .fx(Arc::new(Fx::simulated(NOW)))
+            .caller("quota-test")
+            .rate_book(RateBook::at(Dirs::under(root.path()).rate()))
+            .cut_registry(Some(registry))
+            .retry(RetryPolicy::NONE)
+            .build();
+            client.call(&repo_get()).unwrap();
+            let second = client
+                .call(&repo_get())
+                .map(|_| ())
+                .map_err(|e| e.sub.clone());
+            (second, transport.requests().len())
+        };
+        assert_eq!(
+            read(Some((&boot, start))),
+            (Ok(()), 2),
+            "the cut's own tree"
+        );
+        assert_eq!(read(None), (Err(Sub::PreRefused), 1), "no record");
+        assert_eq!(
+            read(Some((&boot, start.wrapping_add(1)))),
+            (Err(Sub::PreRefused), 1),
+            "another holder of this pid"
+        );
+        assert_eq!(
+            read(Some((other_boot, start))),
+            (Err(Sub::PreRefused), 1),
+            "another boot's record"
+        );
+    }
+
+    /// What the reserve never governed is unchanged by a cut's record: a spent allowance
+    /// refuses the cut's tree as it refuses everyone (the wait for the reset is the release's),
+    /// and an anonymous read at the reserve is sent with the record and without it.
+    #[test]
+    fn a_cuts_record_changes_neither_a_spent_allowance_nor_an_anonymous_read() {
+        let (pid, boot, start) = this_process();
+        for recorded in [true, false] {
+            let root = common::scratch("rate-cut-unchanged");
+            let fake = agh_fake::FakeGithub::start();
+            common::canonical_tokens(root.path(), &fake, true, false);
+            let registry = root.path().join("release-lines");
+            if recorded {
+                line_record(&registry, pid, &boot, start);
+            }
+            let book = RateBook::at(Dirs::under(root.path()).rate());
+            let transport = Arc::new(ScriptedTransport::new());
+            let spent = [
+                ("x-ratelimit-limit", "5000"),
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", "1760003600"),
+            ];
+            transport.answer(200, &spent, b"{}");
+            let own = GithubBuilder::new(common::router(
+                &common::canonical_config(root.path()),
+                root.path(),
+            ))
+            .transport(transport.clone())
+            .endpoints(Endpoints::loopback(47_201, 47_202, 47_203, 47_204))
+            .env(Arc::new(common::env()))
+            .fx(Arc::new(Fx::simulated(NOW)))
+            .caller("quota-test")
+            .rate_book(book.clone())
+            .cut_registry(Some(registry.clone()))
+            .retry(RetryPolicy::NONE)
+            .build();
+            own.call(&repo_get()).unwrap();
+            let refused = own.call(&repo_get()).unwrap_err();
+            assert_eq!(
+                (refused.kind, refused.sub.clone(), refused.reset),
+                (Kind::RateLimited, Sub::PreRefused, Some(1_760_003_600)),
+                "recorded={recorded}: a spent allowance refuses the cut too"
+            );
+            assert_eq!(transport.requests().len(), 1);
+
+            let anonymous = Arc::new(ScriptedTransport::new());
+            anonymous.answer(200, &AT_THE_RESERVE, b"{}");
+            anonymous.answer(200, &AT_THE_RESERVE, b"{}");
+            let nobody = GithubBuilder::new(Router::empty())
+                .transport(anonymous.clone())
+                .endpoints(Endpoints::loopback(47_201, 47_202, 47_203, 47_204))
+                .env(Arc::new(common::env()))
+                .fx(Arc::new(Fx::simulated(NOW)))
+                .caller("test")
+                .retry(RetryPolicy::NONE)
+                .rate_book(book)
+                .cut_registry(Some(registry))
+                .build();
+            nobody.call(&repo_get()).unwrap();
+            nobody.call(&repo_get()).unwrap();
+            assert_eq!(
+                anonymous.requests().len(),
+                2,
+                "recorded={recorded}: no reserve is kept from an anonymous read"
+            );
+        }
+    }
+
+    /// R32 at the command line, which is how a cut's publication engine reads: `agh api` at the
+    /// reserve exits 11 `rate_limited`, and exits 0 once a release-line record names this
+    /// process as its holder. NEGATIVE CONTROL: the same command with a record of another start.
+    #[test]
+    fn the_agh_command_in_a_cuts_tree_reads_past_the_reserve() {
+        let (pid, boot, start) = this_process();
+        let run = |start: Option<u64>| {
+            let root = common::scratch("rate-cut-cli");
+            let fake = agh_fake::FakeGithub::start();
+            common::canonical_tokens(root.path(), &fake, true, false);
+            let dirs = Dirs::under(root.path());
+            common::write_config(&dirs, &common::canonical_config(root.path()));
+            if let Some(start) = start {
+                line_record(
+                    &root
+                        .path()
+                        .join("state/harness/claude-harness/release-lines"),
+                    pid,
+                    &boot,
+                    start,
+                );
+            }
+            let transport = Arc::new(ScriptedTransport::new());
+            transport.answer(200, &AT_THE_RESERVE, b"{}");
+            transport.answer(200, &AT_THE_RESERVE, b"{}");
+            let codes: Vec<u8> = (0..2)
+                .map(|_| {
+                    let (mut ctx, _captured) = agh::cli::Ctx::for_tests(
+                        root.path(),
+                        transport.clone(),
+                        Endpoints::loopback(47_201, 47_202, 47_203, 47_204),
+                        common::env(),
+                    );
+                    common::run_cli(&mut ctx, &["api", "/repos/fixture-dev/repo"])
+                })
+                .collect();
+            (codes, transport.requests().len())
+        };
+        assert_eq!(run(Some(start)), (vec![0, 0], 2), "in the cut's tree");
+        assert_eq!(run(None), (vec![0, 11], 1), "no record: the reserve holds");
+        assert_eq!(
+            run(Some(start.wrapping_add(1))),
+            (vec![0, 11], 1),
+            "a record of another start"
+        );
+    }
+
     #[test]
     fn a_concurrent_background_burst_leaves_the_reserve_instead_of_spending_old_snapshots() {
         for (reserve, expected) in [(1000, 1), (0, 32)] {

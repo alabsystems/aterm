@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::cat_baker::EyesFrame;
-use crate::kitty_cursor::CatFrame;
+use crate::kitty_cursor::{CatFrame, CursorBody};
 use crate::kitty_registry::KittyLook;
+use crate::pet_glyphs_gen::PetGlyphId;
 use crate::rainbow_kitty::CompanionImpulse;
 use crate::word_decorations::KittyCursorLayout;
 use std::time::Duration;
@@ -73,6 +74,7 @@ const fn layout(cursor: (u16, u16), frame: &CatFrame) -> KittyCursorLayout {
         geom: GEOM,
         cursor,
         look: frame.render_look(),
+        body: frame.body,
         bob: frame.bob,
         lift: 0.0,
     }
@@ -93,6 +95,7 @@ fn head_walk(
     path: &[(u16, u16)],
     key_ms: u64,
     frames: u64,
+    body: CursorBody,
 ) -> Vec<HeadFrame> {
     let t0 = Instant::now();
     let mut fx = EffectsPipeline::default();
@@ -102,13 +105,42 @@ fn head_walk(
         .glow
         .tick(Some(path[0]), t0, &cfg, glow_geom(), &mut sprites);
     let cat = &mut fx.companions_mut().cursor_cat;
-    cat.on_collect(t0, KittyLook::for_app("claude"));
-    cat.set_collection_presentable(t0, true);
+    // The head is a collection hello, on glass at once. The glide is the pet setting's flier,
+    // summoned by a run of keys and kept by the walk's own keys, so its pose is the glide's
+    // (`CursorCat::glides`), not a hello's.
+    let flier = match body {
+        CursorBody::Glide(face) => crate::kitty_pet::glide_species(face),
+        CursorBody::Head => None,
+    };
+    let t0 = match flier {
+        Some(species) => {
+            cat.set_body(Some(species));
+            let mut at = t0;
+            while !cat.is_active() {
+                cat.on_key(at, true);
+                at += Duration::from_millis(25);
+                assert!(
+                    at < t0 + Duration::from_secs(10),
+                    "a 25 ms run summons the flier"
+                );
+            }
+            at
+        }
+        None => {
+            cat.on_collect(t0, KittyLook::for_app("claude"));
+            cat.set_collection_presentable(t0, true);
+            t0
+        }
+    };
     let mut out = Vec::new();
     let mut at = 0usize;
     let mut fold = None;
     for f in 0..frames {
         let now = t0 + Duration::from_millis(16 * f);
+        // The flier's keys go on at the walk's pace past its end, holding it on glass.
+        if flier.is_some() && (f * 16) % key_ms < 16 {
+            fx.companions_mut().cursor_cat.on_key(now, true);
+        }
         if f * 16 >= (at as u64 + 1) * key_ms && at + 1 < path.len() {
             let (r, c) = path[at];
             cells[usize::from(r)][usize::from(c)].ch = 'x';
@@ -119,6 +151,7 @@ fn head_walk(
         }
         let cell = path[at];
         let mut frame = fx.companions_mut().cursor_cat.frame(now);
+        frame.body = body;
         let seat = fx.route_flying_head(
             CompanionDuty::FlyingHead { cell },
             &cells,
@@ -158,6 +191,7 @@ fn head_walk(
                     geom: GEOM,
                     cursor: cell,
                     look: frame.render_look(),
+                    body: frame.body,
                     colors: crate::cat_baker::CatColorKey::default(),
                     bob: frame.bob,
                     lift: seat.lift,
@@ -182,6 +216,7 @@ fn last_row_walk(
     to: u16,
     key_ms: u64,
     frames: u64,
+    body: CursorBody,
 ) -> Vec<(u16, u16, i32, i32, i32, i32, f32)> {
     let mut cells = blank();
     for row in (0..=22).step_by(2) {
@@ -193,7 +228,7 @@ fn last_row_walk(
         c.ch = 'x';
     }
     let path: Vec<(u16, u16)> = (from..=to).map(|col| (23, col)).collect();
-    head_walk(cells, &path, key_ms, frames)
+    head_walk(cells, &path, key_ms, frames, body)
         .into_iter()
         .map(|((row, col), drawn, fit)| {
             let (x0, x1, y0, y1) = drawn.expect("the head is drawn in every frame");
@@ -220,7 +255,7 @@ fn a_head_crossing_a_wrap_is_not_fitted_for_its_way_across() {
     }
     let mut path: Vec<(u16, u16)> = (112..120).map(|col| (9, col)).collect();
     path.extend((0..8).map(|col| (10, col)));
-    let walk = head_walk(cells, &path, 60, 300);
+    let walk = head_walk(cells, &path, 60, 300, CursorBody::Head);
     assert!(
         walk.iter().any(|f| f.0.0 == 10),
         "fixture: the caret reached the row the wrap brings it to"
@@ -239,52 +274,71 @@ fn a_head_crossing_a_wrap_is_not_fitted_for_its_way_across() {
 /// whole seat runs out at the margin, the head is drawn in every frame, and from its ease's
 /// end its box lies inside the caret's row and off the caret's cell and every letter, to the
 /// last column it has room past the caret. Its fit only falls with the room, so it does not
-/// pulse. Negative control: without the fit the head lies on the row above.
+/// pulse. The flier's glide is held to the same law to the same column: wider for its height, it
+/// is fitted down to the head's floor width (`kitty_cursor_fit_floor`), no narrower than the
+/// head stood. Negative control: without the fit the head lies on the row above.
 #[test]
 fn the_head_fits_its_row_where_no_seat_holds_it_whole() {
-    const LAST_ROOM: u16 = 116;
-    let ch = i32::from(GEOM.cell_h);
-    let cw = i32::from(GEOM.cell_w);
-    let walk = last_row_walk(60, LAST_ROOM, 50, 1_200);
-    let settled = (0.3 * 1000.0 / 16.0) as usize;
-    let mut least = 1.0f32;
-    for &(row, col, x0, x1, y0, y1, fit) in &walk[settled..] {
+    // Held for the head and for the flier's glide, each to the last column with room for it.
+    let mut head_least_w = None;
+    for (body, last_room) in [
+        (CursorBody::Head, 116_u16),
+        (CursorBody::Glide(PetGlyphId::PetFly), 116),
+    ] {
+        let ch = i32::from(GEOM.cell_h);
+        let cw = i32::from(GEOM.cell_w);
+        let walk = last_row_walk(60, last_room, 50, 1_200, body);
+        let settled = (0.3 * 1000.0 / 16.0) as usize;
+        let mut least = 1.0f32;
+        let mut least_w = i32::MAX;
+        for &(row, col, x0, x1, y0, y1, fit) in &walk[settled..] {
+            least_w = least_w.min(x1 - x0);
+            assert!(
+                y0 >= i32::from(row) * ch && y1 <= (i32::from(row) + 1) * ch,
+                "{body:?}: caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} leaves its row"
+            );
+            assert!(
+                x0 >= (i32::from(col) + 1) * cw,
+                "{body:?}: caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} meets the caret or \
+                 the letters behind it"
+            );
+            assert!(
+                fit <= least,
+                "{body:?}: caret ({row}, {col}): the head's fit grew back from {least} to {fit}"
+            );
+            least = fit;
+        }
+        match head_least_w {
+            None => {
+                assert!(
+                    least >= crate::rainbow_kitty::companion::HEAD_FIT_FLOOR,
+                    "the head stayed big enough to read: fit {least}"
+                );
+                head_least_w = Some(least_w);
+            }
+            Some(head_w) => assert!(
+                least_w >= head_w - 1,
+                "{body:?}: fitted to {least_w} px wide, under the head's {head_w}"
+            ),
+        }
+        crate::rainbow_kitty::companion::set_head_fit_unread(true);
+        let whole = last_row_walk(60, last_room, 50, 1_200, body);
+        crate::rainbow_kitty::companion::set_head_fit_unread(false);
+        let &(row, _, _, _, y0, ..) = whole.last().expect("frames");
+        assert!(
+            y0 < i32::from(row) * ch,
+            "{body:?}: negative control: without the fit the head still kept off the row above"
+        );
+        // To the last column, where no room is left past the caret: still fitted to its row, at
+        // the grid's end, and not back over the row above.
+        let to_the_end = last_row_walk(60, 119, 50, 1_400, body);
+        let &(row, col, x0, x1, y0, y1, _) = to_the_end.last().expect("frames");
+        assert_eq!(col, 119, "the caret reached the last column");
         assert!(
             y0 >= i32::from(row) * ch && y1 <= (i32::from(row) + 1) * ch,
-            "caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} leaves its row"
+            "{body:?}: at the last column the head's box {x0}..{x1} x {y0}..{y1} left its row"
         );
-        assert!(
-            x0 >= (i32::from(col) + 1) * cw,
-            "caret ({row}, {col}): the head's box {x0}..{x1} x {y0}..{y1} meets the caret or \
-             the letters behind it"
-        );
-        assert!(
-            fit <= least,
-            "caret ({row}, {col}): the head's fit grew back from {least} to {fit}"
-        );
-        least = fit;
     }
-    assert!(
-        least >= crate::rainbow_kitty::companion::HEAD_FIT_FLOOR,
-        "the head stayed big enough to read: fit {least}"
-    );
-    crate::rainbow_kitty::companion::set_head_fit_unread(true);
-    let whole = last_row_walk(60, LAST_ROOM, 50, 1_200);
-    crate::rainbow_kitty::companion::set_head_fit_unread(false);
-    let &(row, _, _, _, y0, ..) = whole.last().expect("frames");
-    assert!(
-        y0 < i32::from(row) * ch,
-        "negative control: without the fit the head still kept off the row above"
-    );
-    // To the last column, where no room is left past the caret: still fitted to its row, at
-    // the grid's end, and not back over the row above.
-    let to_the_end = last_row_walk(60, 119, 50, 1_400);
-    let &(row, col, x0, x1, y0, y1, _) = to_the_end.last().expect("frames");
-    assert_eq!(col, 119, "the caret reached the last column");
-    assert!(
-        y0 >= i32::from(row) * ch && y1 <= (i32::from(row) + 1) * ch,
-        "at the last column the head's box {x0}..{x1} x {y0}..{y1} left its row"
-    );
 }
 
 /// §7.2(a): a head not yet drawn anywhere (nothing to fly from,
@@ -527,8 +581,10 @@ fn head_frame(
     fx: &mut EffectsPipeline,
     cell: (u16, u16),
     now: Instant,
+    body: CursorBody,
 ) -> crate::word_decorations::CatFootprint {
     let mut frame = fx.companions_mut().cursor_cat.frame(now);
+    frame.body = body;
     let duty = CompanionDuty::FlyingHead { cell };
     let seat = fx.route_flying_head(duty, &blank(), now, GEOM, &mut frame, true);
     let layout = KittyCursorLayout {
@@ -545,6 +601,7 @@ fn head_frame(
             geom: GEOM,
             cursor: cell,
             look: layout.look,
+            body: layout.body,
             colors: crate::cat_baker::CatColorKey::default(),
             bob: frame.bob,
             lift: layout.lift,
@@ -566,6 +623,7 @@ fn fly_far(
     from: (u16, u16),
     to: (u16, u16),
     licensed: bool,
+    body: CursorBody,
 ) -> (
     Vec<crate::word_decorations::CatFootprint>,
     Instant,
@@ -583,13 +641,13 @@ fn fly_far(
     cat.on_collect(t0, KittyLook::for_app("claude"));
     cat.set_collection_presentable(t0, true);
     let mut at = t0;
-    let mut drawn = head_frame(&mut fx, from, at);
+    let mut drawn = head_frame(&mut fx, from, at, body);
     for _ in 0..30 {
         at += frame;
         fx.cursor_mut()
             .glow
             .tick(Some(from), at, &cfg, glow_geom(), &mut out);
-        drawn = head_frame(&mut fx, from, at);
+        drawn = head_frame(&mut fx, from, at, body);
     }
     let jump = at + frame;
     if licensed {
@@ -602,7 +660,7 @@ fn fly_far(
         fx.cursor_mut()
             .glow
             .tick(Some(to), t, &cfg, glow_geom(), &mut out);
-        path.push(head_frame(&mut fx, to, t));
+        path.push(head_frame(&mut fx, to, t, body));
         if t == jump {
             booked = fx.companions().cursor_cat.land_at();
         }
@@ -629,13 +687,19 @@ fn a_far_caret_is_flown_to_from_where_the_head_was_drawn() {
                 b: &crate::word_decorations::CatFootprint| {
         (((a.x - b.x).pow(2) + (a.y - b.y).pow(2)) as f32).sqrt()
     };
-    for (what, from, to, licensed) in [
+    for (what, from, to, licensed, body) in [
         ("Enter", (3u16, 100u16), (5u16, 10u16), true),
         ("Ctrl+U", (3, 110), (3, 6), true),
         ("a screen cleared", (20, 30), (1, 4), false),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|(what, from, to, licensed)| {
+        // Held for the head and for the flier's glide.
+        [CursorBody::Head, CursorBody::Glide(PetGlyphId::PetFly)]
+            .map(|body| (what, from, to, licensed, body))
+    }) {
         crate::word_decorations::HEAD_FLIGHT_OFF.with(|c| c.set(true));
-        let (old, _, _) = fly_far(from, to, licensed);
+        let (old, _, _) = fly_far(from, to, licensed, body);
         crate::word_decorations::HEAD_FLIGHT_OFF.with(|c| c.set(false));
         let old_whole = dist(&old[0], old.last().expect("frames"));
         let old_worst = old
@@ -644,27 +708,27 @@ fn a_far_caret_is_flown_to_from_where_the_head_was_drawn() {
             .fold(0.0f32, f32::max);
         assert!(
             old_worst > 0.8 * old_whole,
-            "{what}: negative control: the head placed at the landing moved {old_worst:.0} of \
+            "{what} {body:?}: negative control: the head placed at the landing moved {old_worst:.0} of \
              {old_whole:.0} px in a frame"
         );
 
-        let (path, jump, booked) = fly_far(from, to, licensed);
+        let (path, jump, booked) = fly_far(from, to, licensed, body);
         let (drawn, rest) = (path[0], *path.last().expect("frames"));
         let whole = dist(&drawn, &rest);
         assert!(
             whole > 300.0,
-            "{what}: precondition: a far jump ({whole} px)"
+            "{what} {body:?}: precondition: a far jump ({whole} px)"
         );
         let steps: Vec<f32> = path.windows(2).map(|w| dist(&w[0], &w[1])).collect();
         assert!(
             steps[0] <= 0.25 * whole,
-            "{what}: on the jump's frame the head moved {:.0} of {whole:.0} px: {path:?}",
+            "{what} {body:?}: on the jump's frame the head moved {:.0} of {whole:.0} px: {path:?}",
             steps[0]
         );
         let worst = steps.iter().copied().fold(0.0f32, f32::max);
         assert!(
             worst <= 0.2 * whole,
-            "{what}: a frame moved the head {worst:.0} of {whole:.0} px: {steps:?}"
+            "{what} {body:?}: a frame moved the head {worst:.0} of {whole:.0} px: {steps:?}"
         );
         // Down where it rests within the flight's time: the landing's squash and the whip's
         // spring settle it a few pixels more after.
@@ -677,12 +741,76 @@ fn a_far_caret_is_flown_to_from_where_the_head_was_drawn() {
         assert!(
             jump + Duration::from_millis(frame_ms * landed_at as u64)
                 <= landed + Duration::from_millis(frame_ms),
-            "{what}: still flying {landed_at} frames after the jump: {path:?}"
+            "{what} {body:?}: still flying {landed_at} frames after the jump: {path:?}"
         );
         if let Some(booked) = booked.filter(|_| licensed) {
             minted += 1;
-            assert_eq!(booked, landed, "{what}: the squash lands with the head");
+            assert_eq!(
+                booked, landed,
+                "{what} {body:?}: the squash lands with the head"
+            );
         }
     }
     assert!(minted > 0, "a licensed jump mints a meteor");
+}
+
+/// THE HOST DRAWS THE GLIDE'S BREATH IN WHOLE PIXELS. The flier's breath (`glide_lift`) is a
+/// fraction of the cell; [`EffectsPipeline::route_flying_head`], which every host path calls,
+/// rounds it to 0 or +1 device pixel (`glide_bob_cells`) before any seat or draw reads it, so no
+/// pixel under the glide's outline shimmers through a sub-pixel breath. Control: the cat's own
+/// frames, before routing, hold breaths that are not whole pixels, so a route that passed them
+/// on would fail.
+#[test]
+fn the_host_draws_the_glides_breath_in_whole_pixels() {
+    let t0 = Instant::now();
+    let mut fx = EffectsPipeline::default();
+    let cfg = rainbow_kitty();
+    let mut sprites = Vec::new();
+    let cell = (3, 10);
+    fx.cursor_mut()
+        .glow
+        .tick(Some(cell), t0, &cfg, glow_geom(), &mut sprites);
+    let cat = &mut fx.companions_mut().cursor_cat;
+    cat.set_body(Some(crate::kitty_pet::PetSpecies::Cat));
+    let mut at = t0;
+    while !cat.is_active() {
+        cat.on_key(at, true);
+        at += Duration::from_millis(25);
+        assert!(at < t0 + Duration::from_secs(10), "a run summons the flier");
+    }
+    let ch = f32::from(GEOM.cell_h);
+    let (mut raw_fractional, mut levels) = (0, std::collections::BTreeSet::new());
+    for f in 0..150_u64 {
+        let now = at + Duration::from_millis(16 * f);
+        let mut frame = fx.companions_mut().cursor_cat.frame(now);
+        assert!(
+            matches!(frame.body, CursorBody::Glide(_)),
+            "frame {f} flies the glide"
+        );
+        let raw = frame.bob * ch;
+        raw_fractional += usize::from((raw - raw.round()).abs() > 1e-3);
+        fx.route_flying_head(
+            CompanionDuty::FlyingHead { cell },
+            &blank(),
+            now,
+            GEOM,
+            &mut frame,
+            true,
+        );
+        let px = frame.bob * ch;
+        assert!(
+            (px - px.round()).abs() < 1e-3,
+            "frame {f}: the routed breath is {px} px, not a whole pixel"
+        );
+        levels.insert(px.round() as i32);
+    }
+    assert_eq!(
+        levels.into_iter().collect::<Vec<_>>(),
+        vec![0, 1],
+        "the glide rests and rises a pixel"
+    );
+    assert!(
+        raw_fractional > 10,
+        "control: the cat's own breath is a fraction of a pixel in {raw_fractional} frames"
+    );
 }

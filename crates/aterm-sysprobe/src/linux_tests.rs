@@ -275,6 +275,7 @@ fn psi_gives_its_averages_and_the_pressure_level() {
     let level = |some: f32, full: f32| {
         linux::psi_level(&linux::Psi {
             some_avg10: some,
+            some_avg60: 0.0,
             full_avg10: full,
         })
     };
@@ -294,6 +295,73 @@ fn psi_gives_its_averages_and_the_pressure_level() {
     assert_eq!(Root::new(empty.path()).psi(), Err(Why::NotEnabled("psi")));
 }
 
+/// The one-minute `some` average is read from the line the ten-second one is on, each from its
+/// own key. NEGATIVE CONTROLS: the two differ in the file, so a reader that returned one for the
+/// other fails; a `some` line with no `avg60`, or one that is not a plain number, reads no PSI
+/// at all rather than a zero.
+#[test]
+fn psi_reads_avg60_beside_avg10() {
+    let p = linux::psi(
+        "some avg10=1.25 avg60=11.50 avg300=3.00 total=9\nfull avg10=0.50 avg60=7.75 avg300=1.00 total=4\n",
+    )
+    .expect("a PSI file");
+    assert_eq!(
+        (p.some_avg10, p.some_avg60, p.full_avg10),
+        (1.25, 11.5, 0.5)
+    );
+    let quiet = linux::psi(PSI_QUIET).expect("a PSI file");
+    assert_eq!((quiet.some_avg10, quiet.some_avg60), (0.0, 0.12));
+    assert_eq!(
+        linux::psi("some avg10=1.25 avg300=3.00 total=9\nfull avg10=0.50 avg60=7.75 total=4\n"),
+        None,
+        "the full line's avg60 is not the some line's"
+    );
+    assert_eq!(
+        linux::psi("some avg10=1.25 avg60=+2.00 total=9\nfull avg10=0.50 total=4\n"),
+        None
+    );
+    assert_eq!(
+        linux::psi("some avg10=1.25 avg60=nan total=9\nfull avg10=0.50 total=4\n"),
+        None
+    );
+}
+
+/// Memory is at its limit when some task stalled on it for a tenth of the last minute and the
+/// machine is short: `some avg60` at 10 or more, and not while a tenth of memory is available
+/// (the room the level is held to, for the same cgroup-reclaim reason). NEGATIVE CONTROLS: a
+/// ten-second burst (`avg10` high, `avg60` under 10) is not the minute at its limit, and a
+/// quiet ten seconds after a stalled minute still is; one unit under a tenth available is short
+/// again; unread room leaves PSI alone deciding.
+#[test]
+fn linux_memory_is_at_its_limit_at_some_avg60_ten_and_not_while_a_tenth_is_available() {
+    let psi = |some_avg10: f32, some_avg60: f32| linux::Psi {
+        some_avg10,
+        some_avg60,
+        full_avg10: 0.0,
+    };
+    let short = Some((10_000_000, 999_999));
+    assert!(linux::memory_at_limit(&psi(0.0, 10.0), short));
+    assert!(!linux::memory_at_limit(&psi(0.0, 9.99), short));
+    assert!(
+        !linux::memory_at_limit(&psi(80.0, 9.99), short),
+        "a ten-second burst is not the minute"
+    );
+    assert!(
+        linux::memory_at_limit(&psi(0.0, 40.0), short),
+        "a quiet ten seconds after a stalled minute"
+    );
+    assert!(
+        !linux::memory_at_limit(&psi(74.01, 40.0), Some((10_000_000, 1_000_000))),
+        "exactly a tenth available is room"
+    );
+    assert!(
+        !linux::memory_at_limit(&psi(74.01, 40.0), Some((16_341_464, 8_626_676))),
+        "the live guest: one cgroup's reclaim on a machine with room"
+    );
+    assert!(linux::memory_at_limit(&psi(74.01, 40.0), None));
+    assert!(linux::memory_at_limit(&psi(74.01, 40.0), Some((0, 0))));
+}
+
 /// The machine's level asks for both PSI's stall and the machine's shortage, held to the live
 /// reading that found the gap: one 64 MiB `MemoryHigh` scope on a 16 GiB guest read
 /// `some avg10=74.01`, `full avg10=73.81` with `MemAvailable` at 8,626,676 KiB of 16,341,464 KiB,
@@ -304,6 +372,7 @@ fn psi_gives_its_averages_and_the_pressure_level() {
 fn the_machines_level_asks_for_both_the_stall_and_the_shortage() {
     let stalled = linux::Psi {
         some_avg10: 74.01,
+        some_avg60: 40.0,
         full_avg10: 73.81,
     };
     assert_eq!(linux::psi_level(&stalled), MemoryLevel::Critical);
@@ -323,6 +392,7 @@ fn the_machines_level_asks_for_both_the_stall_and_the_shortage() {
     );
     let warn = linux::Psi {
         some_avg10: 12.5,
+        some_avg60: 4.0,
         full_avg10: 2.0,
     };
     assert_eq!(

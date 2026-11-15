@@ -293,9 +293,7 @@ fn a_vault_holds_its_rosters_labels_and_an_unwhole_copy_refuses() {
     let mut failed = state.clone();
     failed.failed = true;
     let mut unapplied = state.clone();
-    unapplied
-        .pending
-        .insert("other".to_owned(), "00".repeat(32));
+    unapplied.failed = true;
     let mut joining = state.clone();
     joining.membership = Stored::Pending;
     let mut never = state.clone();

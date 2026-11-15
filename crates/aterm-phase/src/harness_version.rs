@@ -334,7 +334,6 @@ impl CliHarness {
             CliHarness::Grok => &[
                 "crates/aterm-phase/src/grok.rs",
                 "crates/aterm-agent/src/harness/grok_signin.rs",
-                "crates/aterm-agent/src/harness/worker_grok.rs",
             ],
             CliHarness::Kimi => &[
                 "crates/aterm-phase/src/kimi.rs",

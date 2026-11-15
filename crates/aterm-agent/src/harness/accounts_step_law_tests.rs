@@ -980,14 +980,28 @@ mod every_step_a_surface_names_can_be_taken {
 #[cfg(unix)]
 fn claude_token_worlds(seen: &mut BTreeSet<String>, wrong: &mut Vec<String>) {
     use crate::harness::accounts_tokens::tests as token;
-    use crate::harness::accounts_tokens::{
-        InVault, SessionLogin, TokenRow, UsedOn, Verification, update_table,
-    };
-    use aterm_secrets::claude_token::Check;
+    use crate::harness::accounts_tokens::{SessionLogin, update_table};
+    use aterm_secrets::claude_token::{Check, Standing};
     let soon = || token::standing(Check::Readable, token::NOW + 86_400, true, false, &[]);
-    let worlds: [(&str, token::Answer, bool); 4] = [
-        ("none", token::Answer::Absent, false),
-        ("soon", soon(), false),
+    let in_use = || {
+        token::standing(
+            Check::Readable,
+            token::NOW + token::A_YEAR,
+            true,
+            false,
+            &[],
+        )
+    };
+    let rejected = match in_use() {
+        token::Answer::Found(standing) => token::Answer::Found(Box::new(Standing {
+            refused_at: Some(token::NOW - 60),
+            ..*standing
+        })),
+        token::Answer::Absent | token::Answer::Unknown => unreachable!(),
+    };
+    let worlds: [(&str, token::Answer); 4] = [
+        ("none", token::Answer::Absent),
+        ("soon", soon()),
         (
             "exposed",
             token::standing(
@@ -997,50 +1011,16 @@ fn claude_token_worlds(seen: &mut BTreeSet<String>, wrong: &mut Vec<String>) {
                 false,
                 &["m9"],
             ),
-            false,
         ),
-        (
-            "rejected",
-            token::standing(
-                Check::Readable,
-                token::NOW + token::A_YEAR,
-                true,
-                false,
-                &[],
-            ),
-            true,
-        ),
+        ("rejected", rejected),
     ];
-    for (name, found, rejected) in worlds {
+    for (name, found) in worlds {
         let scratch = token::Scratch::new(&format!("law-{name}"));
         let lay = || {
             let store = scratch.store();
             update_table(&store, |table| {
                 table.rows.clear();
                 table.offers.clear();
-                if rejected {
-                    table.rows.insert(
-                        token::KEY.to_owned(),
-                        TokenRow {
-                            key: token::KEY.to_owned(),
-                            email: token::EMAIL.to_owned(),
-                            account_id: None,
-                            label: Some("work".to_owned()),
-                            entry: token::key().entry(),
-                            minted_at: Some(token::NOW - 86_400),
-                            expires_at: Some(token::NOW + token::A_YEAR),
-                            expiry_from: Some("printed".to_owned()),
-                            minted_on: Some("m7".to_owned()),
-                            signer: Some("m7".to_owned()),
-                            used_on: UsedOn::default(),
-                            vault: InVault::InVault,
-                            verified: Some(token::NOW - 3_600),
-                            verification: Verification::default(),
-                            rejected_at: Some(token::NOW - 60),
-                            removed_at: None,
-                        },
-                    );
-                }
             })
             .expect("the table");
         };

@@ -188,7 +188,7 @@ impl std::fmt::Display for Starvation {
                         f,
                         "; this process family runs at QoS {} (a submitted job's tier, which the \
                          subject inherits): run from an interactive shell or a LaunchAgent with \
-                         ProcessType=Interactive",
+                         ProcessType=App",
                         q.name()
                     ),
                     _ => f.write_str("; re-take on an unloaded machine"),

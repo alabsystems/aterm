@@ -2,12 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::port::{Fake, Stat};
+use crate::port::{Fake, MachineReading, Stat};
 
 const GIB: u64 = 1 << 30;
 
-/// One look at a 48 GiB, 14-core Mac: every reading present, each class distinct from every
-/// other so a figure read from the wrong one shows.
+/// One look at a 14-core Mac with a home volume: what a fake system answers for its machine.
+/// The mapping of each reading to its figure is aterm-capacity's (`HostVitals::of`, tested
+/// there); these figures only have to show which look, home and uptime `gather_vitals` used.
 fn full_reading() -> MachineReading {
     MachineReading {
         cores: Some(14),
@@ -15,29 +16,9 @@ fn full_reading() -> MachineReading {
         memory: Some(aterm_sysprobe::MemoryDetail {
             total: 48 * GIB,
             available: 7 * GIB,
-            free: GIB,
-            speculative: Some(GIB / 4),
-            active: Some(20 * GIB),
-            inactive: Some(10 * GIB),
-            wired: 4 * GIB,
-            compressed: Some(3 * GIB),
-            stored: Some(9 * GIB),
-            purgeable: Some(GIB / 2),
-            file_backed: 5 * GIB,
-            app: 18 * GIB,
-            shared: Some(GIB),
-            swap_used: GIB / 2,
-            swap_total: 2 * GIB,
-            pressure: Some(aterm_sysprobe::MemoryLevel::Warn),
-            exact: true,
             ..aterm_sysprobe::MemoryDetail::default()
         }),
-        gpu: Some(aterm_sysprobe::GpuReading {
-            device_pct: Some(37),
-            cores: Some(40),
-            name: Some(" Apple M5 Max ".into()),
-            ..aterm_sysprobe::GpuReading::default()
-        }),
+        gpu: None,
         volume: Some(aterm_sysprobe::volumes::Reading {
             mount: "/System/Volumes/Data".into(),
             key: aterm_sysprobe::volumes::VolumeKey::Container("disk3".into()),
@@ -61,8 +42,11 @@ fn owner() -> crate::model::User {
     }
 }
 
+/// `hello`'s vitals are the system's one look at the machine, asked for the logged-in
+/// account's home, mapped by capacity's `HostVitals::of` with the uptime since boot, and no
+/// child process runs for them.
 #[test]
-fn gather_vitals_maps_every_reading_to_the_figure_it_owns() {
+fn gather_vitals_maps_the_systems_look_with_the_uptime_since_boot() {
     let mut sys = Fake::root();
     sys.machine = Some(full_reading());
     sys.logged_in(&owner());
@@ -73,26 +57,12 @@ fn gather_vitals_maps_every_reading_to_the_figure_it_owns() {
     let v = gather_vitals(&sys, &facts).expect("a machine read");
     assert_eq!(
         v,
-        HostVitals {
-            cpu_cores: Some(14),
-            load_avg_100: Some([250, 300, 400]),
-            gpu_name: Some("Apple M5 Max".into()),
-            gpu_cores: Some(40),
-            gpu_busy_pct: Some(37),
-            mem_total_bytes: Some(48 * GIB),
-            mem_available_bytes: Some(7 * GIB),
-            mem_used_bytes: Some(26 * GIB),
-            mem_wired_bytes: Some(4 * GIB),
-            mem_compressed_bytes: Some(3 * GIB),
-            swap_used_bytes: Some(GIB / 2),
-            mem_pressure: Some("warn".into()),
-            disk_total_bytes: Some(1000 * GIB),
-            disk_free_bytes: Some(200 * GIB),
-            uptime_secs: Some(4 * 86_400 + 11 * 3_600),
-            rtt_us: None,
-        }
+        HostVitals::of(&full_reading(), Some(4 * 86_400 + 11 * 3_600))
     );
-    assert_eq!(v.disk_used(), Some(800 * GIB));
+    assert_eq!(
+        (v.cpu_cores, v.disk_total_bytes, v.uptime_secs),
+        (Some(14), Some(1000 * GIB), Some(4 * 86_400 + 11 * 3_600))
+    );
     assert_eq!(
         sys.machine_homes(),
         [Some(PathBuf::from("/Users//owner"))],
@@ -103,8 +73,6 @@ fn gather_vitals_maps_every_reading_to_the_figure_it_owns() {
         "no child process: {:?}",
         sys.calls()
     );
-    let wire = aterm_json::to_string(&v).unwrap();
-    assert_eq!(aterm_json::from_str::<HostVitals>(&wire).unwrap(), v);
 }
 
 /// With no account home, or one that is not an absolute path, the machine is read for no
@@ -133,27 +101,7 @@ fn without_an_absolute_home_no_volume_is_read() {
 }
 
 #[test]
-fn a_reading_that_is_absent_leaves_its_figures_absent() {
-    let bare = MachineReading {
-        cores: Some(14),
-        ..MachineReading::default()
-    };
-    assert_eq!(
-        vitals_of(&bare, None),
-        HostVitals {
-            cpu_cores: Some(14),
-            ..HostVitals::default()
-        }
-    );
-    let unread_cores = MachineReading {
-        cores: Some(0),
-        ..full_reading()
-    };
-    assert_eq!(
-        vitals_of(&unread_cores, None).cpu_cores,
-        None,
-        "a layout that reads no core says nothing, not one core"
-    );
+fn a_system_that_reads_no_machine_has_no_vitals_and_an_unbooted_one_no_uptime() {
     assert_eq!(
         gather_vitals(&Fake::root(), &HostFacts::default()),
         None,
@@ -167,39 +115,6 @@ fn a_reading_that_is_absent_leaves_its_figures_absent() {
             .uptime_secs,
         None
     );
-}
-
-/// LAW: available memory is the memory classes' own figure (`MemoryDetail::available`, which
-/// `sys mem` and admission read), never the free, inactive and purgeable pages' sum; memory
-/// used is `MemoryDetail::used`, app (shared included), wired and compressed, at most the
-/// total, never the active queue. CONTROL: on this reading each rejected formula gives
-/// another figure, so a mapping that used it fails.
-#[test]
-fn available_and_used_memory_each_have_one_definition() {
-    let r = full_reading();
-    let v = vitals_of(&r, None);
-    let m = r.memory.unwrap();
-    let overstated = m.free + m.inactive.unwrap() + m.purgeable.unwrap();
-    assert_eq!(v.mem_available_bytes, Some(m.available));
-    assert_ne!(
-        v.mem_available_bytes,
-        Some(overstated),
-        "CONTROL: free + inactive + purgeable overstates"
-    );
-    assert_eq!(
-        v.mem_used_bytes,
-        Some(m.app + m.shared.unwrap() + m.wired + 3 * GIB)
-    );
-    assert_ne!(
-        v.mem_used_bytes,
-        Some(m.active.unwrap() + m.wired + 3 * GIB),
-        "CONTROL: the active queue is not memory used"
-    );
-    let mut over = r.clone();
-    if let Some(memory) = over.memory.as_mut() {
-        memory.total = 20 * GIB;
-    }
-    assert_eq!(vitals_of(&over, None).mem_used_bytes, Some(20 * GIB));
 }
 
 const VM_HIDUTIL: &str = "Services:\n\

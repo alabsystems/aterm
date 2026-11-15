@@ -121,6 +121,39 @@ fn name_keys_fold_case_and_whitespace_but_keep_display_spelling() {
 }
 
 #[test]
+fn nickname_limits_apply_after_whitespace_collapse() {
+    let padded = format!(
+        "{}Blue{}Heron{}",
+        "\u{2003}".repeat(4096),
+        "\t".repeat(4096),
+        " ".repeat(4096)
+    );
+    assert_eq!(Nickname::parse(&padded).unwrap().as_str(), "Blue Heron");
+    assert_eq!(
+        Nickname::parse(&"A ".repeat(12)).unwrap().as_str(),
+        "A ".repeat(12).trim()
+    );
+    assert_eq!(Nickname::parse(&"A ".repeat(13)), Err(Refusal::TooLong));
+    assert!(Nickname::parse(&"界".repeat(21)).is_ok());
+    assert!(Nickname::parse(&format!("{}A", "界".repeat(21))).is_ok());
+    assert_eq!(
+        Nickname::parse(&format!("{}AA", "界".repeat(21))),
+        Err(Refusal::TooLong)
+    );
+    assert_eq!(Nickname::parse(&"界".repeat(22)), Err(Refusal::TooLong));
+}
+
+#[test]
+fn refusing_an_oversized_nickname_keeps_temporary_storage_bounded() {
+    let _ = aterm_heap_count::bytes_freed_in(|| ());
+    for word in ["A ".repeat(65_536), "A".repeat(65_536)] {
+        let (result, bytes) = aterm_heap_count::bytes_freed_in(|| Nickname::parse(&word));
+        assert_eq!(result, Err(Refusal::TooLong));
+        assert!(bytes <= 128, "refusal used {bytes} temporary bytes");
+    }
+}
+
+#[test]
 fn a_lowercase_nickname_shows_capitalised_and_any_other_as_typed() {
     let shown = |word: &str| Nickname::parse(word).unwrap().display();
     assert_eq!(shown("heron"), "Heron");

@@ -1232,7 +1232,7 @@ fn a_reset_used_clears_its_walls_hundred_percent() {
         WEEK_END,
         "s-1",
         &accounts::ResetDone::Used {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             left: Some(0),
         },
         NOW - 20 * MIN,
@@ -1970,7 +1970,7 @@ const NOV_12: i64 = NOW + 28 * DAY;
 /// The record of `main` after one limit-reset offer was noted of it on machine `by`
 /// ([`accounts::note_offer`], the record's one writer), seen at `at`.
 fn offered(
-    kind: Option<aterm_phase::ResetKind>,
+    kind: Option<alab_policy::vocab::ResetKind>,
     left: u32,
     use_by: Option<i64>,
     at: i64,
@@ -2001,7 +2001,7 @@ fn resets_doc(l: &Look<'_>) -> Value {
 /// read, so it is null in every case.
 #[test]
 fn the_resets_object_is_the_offer_as_last_seen_and_never_invented() {
-    use aterm_phase::ResetKind;
+    use alab_policy::vocab::ResetKind;
     let p = profile(None);
     let seen = NOW - 3 * DAY;
     let current = offered(Some(ResetKind::Weekly), 1, Some(NOV_12), seen, MACHINE);
@@ -2145,7 +2145,7 @@ fn an_unread_state_gives_the_resets_figure_the_windows_word() {
 /// comes after the dollars and before `used`.
 #[test]
 fn the_resets_row_says_the_offer_as_last_seen() {
-    use aterm_phase::ResetKind;
+    use alab_policy::vocab::ResetKind;
     let p = profile(None);
     let seen = NOW - 3 * DAY;
     let row = |account: Option<&accounts::Account>| -> String {
@@ -2216,7 +2216,7 @@ fn the_resets_row_says_the_offer_as_last_seen() {
 /// the deadline, not the one it shows now.
 #[test]
 fn the_resets_rows_use_by_is_on_the_clock_at_that_instant() {
-    use aterm_phase::ResetKind;
+    use alab_policy::vocab::ResetKind;
     let p = profile(None);
     let by = NOV_12 + 14 * HOUR + 50 * MIN;
     let offer = offered(Some(ResetKind::Weekly), 1, Some(by), NOW - DAY, MACHINE);

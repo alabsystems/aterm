@@ -2221,7 +2221,7 @@ fn wall_and_grant_seen_rows_read_back_whole() {
         by: MACHINE.to_string(),
     });
     let grant = EventSaid::grant_seen(&accounts::Offer {
-        kind: Some(aterm_phase::ResetKind::Weekly),
+        kind: Some(alab_policy::vocab::ResetKind::Weekly),
         left: 2,
         use_by: Some(7_000),
         at: 95,

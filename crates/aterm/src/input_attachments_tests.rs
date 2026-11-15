@@ -1037,10 +1037,8 @@ fn failed_or_held_attachments_retry_without_a_hot_loop_and_new_devices_wake_now(
                 verified(ids)
             },
         );
-        sampled
-            .send((false, first, reads, applied.clone()))
-            .unwrap();
-        let hinted = watch.wait_until(&worker_stop, Instant::now() + Duration::from_secs(60));
+        sampled.send((None, first, reads, applied.clone())).unwrap();
+        let hinted = watch.wait(&worker_stop, Instant::now() + Duration::from_secs(60));
         let second = keeper.round(
             1,
             Some(7),
@@ -1053,7 +1051,9 @@ fn failed_or_held_attachments_retry_without_a_hot_loop_and_new_devices_wake_now(
                 verified(ids)
             },
         );
-        sampled.send((hinted, second, reads, applied)).unwrap();
+        sampled
+            .send((Some(hinted), second, reads, applied))
+            .unwrap();
     });
     let first = samples.recv_timeout(Duration::from_secs(60));
     let entered = waiting.recv_timeout(Duration::from_secs(60));
@@ -1070,10 +1070,15 @@ fn failed_or_held_attachments_retry_without_a_hot_loop_and_new_devices_wake_now(
     assert!(ended.is_ok(), "{ended:?}");
     assert!(entered.is_ok(), "{entered:?}");
     assert!(released.is_ok(), "{released:?}");
-    assert_eq!(first.unwrap(), (false, Ok(true), 1, vec![vec![1]]));
+    assert_eq!(first.unwrap(), (None, Ok(true), 1, vec![vec![1]]));
     assert_eq!(
         second.unwrap(),
-        (true, Ok(true), 2, vec![vec![1], vec![2]]),
+        (
+            Some(watch::Woke::Hint(watch::Causes::WAKE)),
+            Ok(true),
+            2,
+            vec![vec![1], vec![2]]
+        ),
         "native wake, then fresh complete census; the unchanged fallback is not a hint"
     );
 
@@ -1088,8 +1093,11 @@ fn failed_or_held_attachments_retry_without_a_hot_loop_and_new_devices_wake_now(
         let mut watch = watch::Watch::private(native, &stopped, || {
             panic!("a queued hint needs no blocking wait")
         });
-        assert!(watch.wait_until(&stopped, Instant::now() + Duration::from_secs(60)));
-        assert!(!watch.wait_until(&stopped, Instant::now()));
+        assert_eq!(
+            watch.wait(&stopped, Instant::now() + Duration::from_secs(60)),
+            watch::Woke::Hint(watch::Causes::WAKE)
+        );
+        assert_eq!(watch.wait(&stopped, Instant::now()), watch::Woke::Deadline);
     });
     assert!(before_setup.join().is_ok());
     // A late wake after teardown only latches state, never reaches freed CF handles.
@@ -1100,9 +1108,1004 @@ fn failed_or_held_attachments_retry_without_a_hot_loop_and_new_devices_wake_now(
         let mut watch = watch::Watch::private(native, &stopped, || {
             panic!("prelatched stop needs no blocking wait")
         });
-        assert!(!watch.wait_until(&stopped, Instant::now() + Duration::from_secs(60)));
+        assert_eq!(
+            watch.wait(&stopped, Instant::now() + Duration::from_secs(60)),
+            watch::Woke::Stopped
+        );
     });
     assert!(before_setup.join().is_ok());
+}
+
+/// What a worker on a private watch tells its test: that it is about to block with nothing
+/// pending, or how a wait returned.
+#[derive(Debug, PartialEq, Eq)]
+enum Waited {
+    Blocked,
+    Returned(watch::Woke),
+}
+
+/// K1, on the wait a settled keeper blocks in, one with a deadline far off (here the
+/// backstop's): three hints end three waits, a wait with nothing to tell blocks, and the fourth
+/// blocks until stop.
+/// NEGATIVE CONTROL: with a deadline still ahead read as passed, the first wait returns
+/// `Deadline` before the worker blocks, and the worker ends there.
+#[test]
+fn a_wait_returns_once_for_each_hint_and_for_nothing_else_before_its_deadline() {
+    use std::sync::mpsc;
+
+    let control = Arc::<watch::Control>::default();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (tell, told) = mpsc::channel();
+    let worker_control = Arc::clone(&control);
+    let worker_stop = Arc::clone(&stopped);
+    let worker = std::thread::spawn(move || {
+        let blocked = tell.clone();
+        let mut watch = watch::Watch::private(worker_control, &worker_stop, move || {
+            let _ = blocked.send(Waited::Blocked);
+        });
+        let far = Instant::now() + BACKSTOP;
+        loop {
+            let woke = watch.wait(&worker_stop, far);
+            let _ = tell.send(Waited::Returned(woke));
+            if !matches!(woke, watch::Woke::Hint(_)) {
+                return;
+            }
+        }
+    });
+    let next = || told.recv_timeout(Duration::from_secs(60));
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        // The worker says it blocks before each hint: a wait with nothing to tell returns nothing.
+        seen.push(next());
+        control.hint(watch::Causes::RECORDS);
+        seen.push(next());
+    }
+    seen.push(next());
+    stopped.store(true, Ordering::Release);
+    control.wake();
+    seen.push(next());
+    let ended = worker.join();
+    // Release and join the only worker before any verdict.
+    assert!(ended.is_ok(), "{ended:?}");
+    let hinted = || Ok(Waited::Returned(watch::Woke::Hint(watch::Causes::RECORDS)));
+    assert_eq!(
+        seen,
+        [
+            Ok(Waited::Blocked),
+            hinted(),
+            Ok(Waited::Blocked),
+            hinted(),
+            Ok(Waited::Blocked),
+            hinted(),
+            Ok(Waited::Blocked),
+            Ok(Waited::Returned(watch::Woke::Stopped)),
+        ],
+        "three hints end three waits, and the fourth wait blocks until stop"
+    );
+    assert!(
+        told.try_recv().is_err(),
+        "nothing blocked or returned after the stop"
+    );
+}
+
+/// A scripted clock for [`keeper_loop`]: each hint arrives at its instant, a wait ends at the
+/// first of a hint, its deadline and the script's end, and the clock moves only in a wait.
+struct ScriptedWaits {
+    start: Instant,
+    now: std::rc::Rc<std::cell::Cell<Duration>>,
+    hints: std::collections::VecDeque<(Duration, watch::Causes)>,
+    until: Duration,
+    armed: usize,
+}
+
+impl ScriptedWaits {
+    fn new(hints: &[(u64, watch::Causes)], until_ms: u64) -> Self {
+        Self {
+            start: Instant::now(),
+            now: std::rc::Rc::default(),
+            hints: hints
+                .iter()
+                .map(|&(at, cause)| (Duration::from_millis(at), cause))
+                .collect(),
+            until: Duration::from_millis(until_ms),
+            armed: 0,
+        }
+    }
+}
+
+impl Waits for ScriptedWaits {
+    fn now(&self) -> Instant {
+        self.start + self.now.get()
+    }
+
+    fn armed(&self) -> watch::Armed {
+        watch::Armed {
+            devices: true,
+            console: true,
+        }
+    }
+
+    fn wait(&mut self, stopped: &AtomicBool, deadline: Instant) -> watch::Woke {
+        self.armed += 1;
+        let now = self.now.get();
+        let deadline = deadline.saturating_duration_since(self.start);
+        // As the real watch tells them: a passed deadline before a hint that is also there.
+        if now >= deadline {
+            return watch::Woke::Deadline;
+        }
+        let hint = self.hints.front().copied();
+        let next = hint.map_or(deadline, |(at, _)| at.min(deadline));
+        if next.max(now) > self.until {
+            self.now.set(self.until);
+            stopped.store(true, Ordering::Release);
+            return watch::Woke::Stopped;
+        }
+        match hint {
+            Some((at, cause)) if at < deadline => {
+                self.hints.pop_front();
+                self.now.set(now.max(at));
+                watch::Woke::Hint(cause)
+            }
+            _ => {
+                self.now.set(deadline);
+                watch::Woke::Deadline
+            }
+        }
+    }
+}
+
+/// What a round that owes nothing finds, after a wait that heard `causes`.
+fn settled(causes: watch::Causes) -> RoundFacts {
+    RoundFacts {
+        causes,
+        moved: false,
+        pending_scope: false,
+        attempted: false,
+        console_return: false,
+        follow_up: crate::withheld_preferences::Owed::Idle,
+        caps_stand: true,
+        dispatch: None,
+        undelivered: false,
+    }
+}
+
+/// Every hint source armed.
+const WHOLE: Coverage = Coverage {
+    devices: true,
+    console: true,
+    records: true,
+};
+
+/// The instant each round of [`keeper_loop`] started on a scripted clock, in milliseconds, and
+/// the causes it was handed; then the waits the loop armed. `found` is what the round of that
+/// index finds; every hint source is armed.
+fn scripted_rounds(
+    hints: &[(u64, watch::Causes)],
+    until_ms: u64,
+    found: impl Fn(usize, watch::Causes) -> RoundFacts,
+) -> (Vec<(u128, watch::Causes)>, usize) {
+    let mut waits = ScriptedWaits::new(hints, until_ms);
+    let clock = std::rc::Rc::clone(&waits.now);
+    let mut rounds = Vec::new();
+    keeper_loop(
+        |causes| {
+            rounds.push((clock.get().as_millis(), causes));
+            found(rounds.len() - 1, causes)
+        },
+        |_, _, _| {},
+        &mut waits,
+        &AtomicBool::new(false),
+        true,
+        PACE,
+    );
+    (rounds, waits.armed)
+}
+
+/// A keeper's first round finds a new sample, and every round after it nothing owed.
+fn fresh_then_settled(round: usize, causes: watch::Causes) -> RoundFacts {
+    RoundFacts {
+        moved: round == 0,
+        ..settled(causes)
+    }
+}
+
+/// While a round owes another (here an unfinished attachment), the timer and the pacing are
+/// what they were: a round every two seconds, at once for a device notice or a wake, and every
+/// other hint handed to the round the pace starts.
+/// NEGATIVE CONTROL: with a records hint ending the wait as a device notice does, a round
+/// starts at 500 ms carrying `records` alone.
+#[test]
+fn only_a_device_notice_or_a_wake_starts_a_round_before_the_pace() {
+    use watch::Causes;
+    let none = Causes::default();
+    let owed = |_, causes| RoundFacts {
+        attempted: true,
+        ..settled(causes)
+    };
+    let (rounds, armed) = scripted_rounds(
+        &[
+            (500, Causes::RECORDS),
+            (1_000, Causes::FOCUS),
+            (1_500, Causes::REQUEST),
+            (3_000, Causes::CONSOLE),
+            (4_700, Causes::DEVICE),
+            (9_000, Causes::WAKE),
+        ],
+        12_000,
+        owed,
+    );
+    assert_eq!(
+        rounds,
+        [
+            (0, none),
+            (
+                2_000,
+                Causes::RECORDS.union(Causes::FOCUS).union(Causes::REQUEST)
+            ),
+            (4_000, Causes::CONSOLE),
+            (4_700, Causes::DEVICE),
+            (6_700, none),
+            (8_700, none),
+            (9_000, Causes::WAKE),
+            (11_000, none),
+        ],
+        "a round every two seconds, and at once for the device notice and the wake"
+    );
+    // One wait a round, one more for each hint that did not end its wait, and the last, which
+    // the script's end stopped.
+    assert_eq!(armed, 8 + 4);
+
+    // No hint in the hour that ends just before its last pace would: a round at each pace
+    // and nothing else.
+    let (rounds, armed) = scripted_rounds(&[], 3_599_999, owed);
+    assert_eq!(rounds.len(), 1_800);
+    assert_eq!(armed, 1_800);
+    assert!(rounds.iter().all(|(_, causes)| causes.is_empty()));
+}
+
+/// K3, the wait a round's facts choose: the backstop for a settled round with every hint source
+/// armed, and the two-second timer for each thing a round can owe.
+/// NEGATIVE CONTROL: without the `attempted` test, the unfinished attachment's row waits 300 s.
+#[test]
+fn a_settled_round_waits_for_the_backstop_and_an_owed_round_keeps_the_timer() {
+    use crate::withheld_preferences::Owed;
+    use watch::Causes;
+    let none = Causes::default();
+    let secs = Duration::from_secs;
+    assert_eq!(BACKSTOP, secs(300));
+    let waits = |facts: RoundFacts| next_wait(&facts, WHOLE, PACE);
+    let rows = [
+        ("settled", settled(none), secs(300)),
+        ("a records hint", settled(Causes::RECORDS), secs(300)),
+        ("a focus hint", settled(Causes::FOCUS), secs(300)),
+        ("a request hint", settled(Causes::REQUEST), secs(300)),
+        ("a wake", settled(Causes::WAKE), secs(300)),
+        ("a device notice", settled(Causes::DEVICE), PACE),
+        ("a console notice", settled(Causes::CONSOLE), PACE),
+        (
+            "a device notice among others",
+            settled(Causes::DEVICE.union(Causes::FOCUS)),
+            PACE,
+        ),
+        (
+            "moved",
+            RoundFacts {
+                moved: true,
+                ..settled(none)
+            },
+            PACE,
+        ),
+        (
+            "a pending scope",
+            RoundFacts {
+                pending_scope: true,
+                ..settled(none)
+            },
+            PACE,
+        ),
+        (
+            "an unfinished attachment",
+            RoundFacts {
+                attempted: true,
+                ..settled(none)
+            },
+            PACE,
+        ),
+        (
+            "a kept console return",
+            RoundFacts {
+                console_return: true,
+                ..settled(none)
+            },
+            PACE,
+        ),
+        (
+            "a follow-up attempt running",
+            RoundFacts {
+                follow_up: Owed::Running,
+                ..settled(none)
+            },
+            PACE,
+        ),
+        (
+            "a Caps Lock live reading that does not stand",
+            RoundFacts {
+                caps_stand: false,
+                ..settled(none)
+            },
+            PACE,
+        ),
+        (
+            "readings the window's loop has not taken",
+            RoundFacts {
+                undelivered: true,
+                ..settled(none)
+            },
+            PACE,
+        ),
+        (
+            "a follow-up put off 40 s",
+            RoundFacts {
+                follow_up: Owed::In(secs(40)),
+                ..settled(none)
+            },
+            secs(40),
+        ),
+        (
+            "a follow-up a round has not seen",
+            RoundFacts {
+                follow_up: Owed::In(Duration::ZERO),
+                ..settled(none)
+            },
+            PACE,
+        ),
+        (
+            "a follow-up put off past the backstop",
+            RoundFacts {
+                follow_up: Owed::In(secs(600)),
+                ..settled(none)
+            },
+            secs(300),
+        ),
+        (
+            "a reader held 1 s",
+            RoundFacts {
+                dispatch: Some(secs(1)),
+                ..settled(none)
+            },
+            PACE,
+        ),
+        (
+            "a reader held 30 s",
+            RoundFacts {
+                dispatch: Some(secs(30)),
+                follow_up: Owed::In(secs(40)),
+                ..settled(none)
+            },
+            secs(30),
+        ),
+    ];
+    for (name, facts, wait) in rows {
+        assert_eq!(waits(facts), wait, "{name}");
+    }
+    for (name, coverage) in [
+        (
+            "no device notices",
+            Coverage {
+                devices: false,
+                ..WHOLE
+            },
+        ),
+        (
+            "no console key",
+            Coverage {
+                console: false,
+                ..WHOLE
+            },
+        ),
+        (
+            "no records watch",
+            Coverage {
+                records: false,
+                ..WHOLE
+            },
+        ),
+    ] {
+        assert_eq!(next_wait(&settled(none), coverage, PACE), PACE, "{name}");
+    }
+}
+
+/// K3, round counts on a scripted clock: a settled keeper with every source armed runs a round
+/// for each hint, one more after a keyboard or console notice, one at each backstop, and none
+/// else.
+/// NEGATIVE CONTROL: with the wait after every round the pace, the hour with no hint runs 1800
+/// rounds.
+#[test]
+fn a_settled_keeper_runs_a_round_for_a_hint_or_the_backstop_and_none_else() {
+    use watch::Causes;
+    let none = Causes::default();
+
+    // An hour with no hint: the first round, the one its new sample owes, and the backstop's.
+    let (rounds, armed) = scripted_rounds(&[], 3_599_999, fresh_then_settled);
+    let backstops = (1..=11).map(|nth| (2_000 + nth * 300_000, none));
+    assert_eq!(
+        rounds,
+        [(0, none), (2_000, none)]
+            .into_iter()
+            .chain(backstops)
+            .collect::<Vec<_>>(),
+        "thirteen rounds in an hour: two, then one every five minutes"
+    );
+    assert_eq!(armed, 13, "one wait a round");
+
+    // Five hints of each kind, ten seconds apart, in a hundred seconds: no backstop falls in
+    // them.
+    let count = |cause| {
+        let hints: Vec<_> = (1..=5).map(|nth| (nth * 10_000, cause)).collect();
+        scripted_rounds(&hints, 100_000, fresh_then_settled).0.len()
+    };
+    assert_eq!(scripted_rounds(&[], 100_000, fresh_then_settled).0.len(), 2);
+    assert_eq!(
+        count(Causes::DEVICE),
+        2 + 2 * 5,
+        "a round and its confirming round"
+    );
+    assert_eq!(
+        count(Causes::CONSOLE),
+        2 + 2 * 5,
+        "a round and its confirming round"
+    );
+    assert_eq!(count(Causes::RECORDS), 2 + 5);
+    assert_eq!(count(Causes::FOCUS), 2 + 5);
+    assert_eq!(count(Causes::REQUEST), 2 + 5);
+    assert_eq!(count(Causes::WAKE), 2 + 5);
+
+    // When each round starts: at the hint, but no sooner than the pace after the round before,
+    // a keyboard notice and a wake apart.
+    let (rounds, _) = scripted_rounds(
+        &[
+            (10_000, Causes::DEVICE),
+            (20_000, Causes::RECORDS),
+            (20_500, Causes::FOCUS),
+            (21_000, Causes::REQUEST),
+            (21_500, Causes::RECORDS),
+            (30_000, Causes::CONSOLE),
+            (40_000, Causes::WAKE),
+            (40_100, Causes::DEVICE),
+        ],
+        60_000,
+        fresh_then_settled,
+    );
+    assert_eq!(
+        rounds,
+        [
+            (0, none),
+            (2_000, none),
+            (10_000, Causes::DEVICE),
+            (12_000, none),
+            (20_000, Causes::RECORDS),
+            (
+                22_000,
+                Causes::FOCUS.union(Causes::REQUEST).union(Causes::RECORDS)
+            ),
+            (30_000, Causes::CONSOLE),
+            (32_000, none),
+            (40_000, Causes::WAKE),
+            (40_100, Causes::DEVICE),
+            (42_100, none),
+        ]
+    );
+}
+
+/// What a keeper's worker tells its test: each round's causes and the wait chosen after it, and
+/// how each wait returned.
+#[derive(Debug, PartialEq, Eq)]
+enum Kept {
+    Round(watch::Causes, Duration),
+    Waited(watch::Woke),
+}
+
+/// The real watch, telling each wait's return. Where the test asked for it since the wait before
+/// returned, the console's callout is called on the worker's thread as this wait returns, so
+/// the next wait tells it.
+struct TappedWatch {
+    watch: watch::Watch,
+    tell: std::sync::mpsc::Sender<Kept>,
+    console: Arc<AtomicBool>,
+    /// Stand for a Mac whose keyboard notices and console key armed, which a private watch
+    /// registers none of.
+    covered: bool,
+}
+
+impl Waits for TappedWatch {
+    fn now(&self) -> Instant {
+        self.watch.now()
+    }
+
+    fn armed(&self) -> watch::Armed {
+        if self.covered {
+            watch::Armed {
+                devices: true,
+                console: true,
+            }
+        } else {
+            self.watch.armed()
+        }
+    }
+
+    fn wait(&mut self, stopped: &AtomicBool, deadline: Instant) -> watch::Woke {
+        let woke = Waits::wait(&mut self.watch, stopped, deadline);
+        if self.console.swap(false, Ordering::AcqRel) {
+            self.watch.console_notice();
+        }
+        let _ = self.tell.send(Kept::Waited(woke));
+        woke
+    }
+}
+
+/// A background keeper's worker on a private watch with `records` as its records folder: the
+/// function the keeper's thread runs, over a system that reads no hardware, off the console
+/// unless [`KeptWorker::start_as`] is handed another. It tells each round and each wait's return.
+struct KeptWorker {
+    control: Arc<watch::Control>,
+    stopped: Arc<AtomicBool>,
+    console: Arc<AtomicBool>,
+    told: std::sync::mpsc::Receiver<Kept>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KeptWorker {
+    fn start(records: Option<std::path::PathBuf>, pace: Duration, covered: bool) -> Self {
+        Self::start_as(records, pace, covered, || {
+            (
+                aterm_machines::port::Fake::root(),
+                InputSetupScope::Inactive,
+            )
+        })
+    }
+
+    /// [`Self::start`] over the system and under the setup scope `world` makes on the worker's
+    /// thread.
+    fn start_as(
+        records: Option<std::path::PathBuf>,
+        pace: Duration,
+        covered: bool,
+        world: fn() -> (aterm_machines::port::Fake, InputSetupScope),
+    ) -> Self {
+        let control = Arc::<watch::Control>::default();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let console = Arc::new(AtomicBool::new(false));
+        let (tell, told) = std::sync::mpsc::channel();
+        let worker_control = Arc::clone(&control);
+        let worker_stop = Arc::clone(&stopped);
+        let worker_console = Arc::clone(&console);
+        let worker = std::thread::spawn(move || {
+            let (sys, scope) = world();
+            let rounds = tell.clone();
+            let mut watch = TappedWatch {
+                watch: watch::Watch::private(Arc::clone(&worker_control), &worker_stop, || {}),
+                tell,
+                console: worker_console,
+                covered,
+            };
+            keeper_worker(
+                &Mutex::default(),
+                &worker_stop,
+                Instant::now(),
+                &Notifications {
+                    changed: || {},
+                    invalidated: || {},
+                    console_return: None,
+                    pending: None,
+                    ended: None,
+                },
+                &worker_control,
+                &mut watch,
+                &Ports {
+                    sys: &sys,
+                    scope: &|| Ok(scope),
+                    activate: &|_, _, _| panic!("a keeper with no applied scope activates nothing"),
+                    records,
+                    chose: &|facts, _, wait| {
+                        let _ = rounds.send(Kept::Round(facts.causes, wait));
+                    },
+                    pace,
+                },
+            );
+        });
+        Self {
+            control,
+            stopped,
+            console,
+            told,
+            worker: Some(worker),
+        }
+    }
+
+    /// What the worker tells next: a wait for something that must happen.
+    fn next(&self) -> Result<Kept, std::sync::mpsc::RecvTimeoutError> {
+        self.told.recv_timeout(Duration::from_secs(60))
+    }
+
+    /// Stop and join the worker, and hand back everything it told after the last `next`.
+    fn end(mut self) -> Vec<Kept> {
+        self.stopped.store(true, Ordering::Release);
+        self.control.wake();
+        let ended = self.worker.take().expect("one worker").join();
+        assert!(ended.is_ok(), "{ended:?}");
+        self.told.try_iter().collect()
+    }
+}
+
+/// On the function the keeper's thread runs: each hint source reaches the worker's wait, a
+/// records, focus, request or console hint starts no round while the pace runs, and the round a
+/// device notice starts is handed all of them. The records hints come from the worker's own
+/// watch of its records folder: its first look, then a record renamed into the folder.
+/// NEGATIVE CONTROL: a worker that starts no records watch tells no `Hint(records)`; the wait
+/// for it runs into the one-minute hang detector.
+#[test]
+fn a_worker_hears_each_hint_and_runs_no_round_for_it_before_the_pace() {
+    use watch::{Causes, Woke};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let folder = dir.path().join("doctor");
+    std::fs::create_dir(&folder).unwrap();
+    let staged = dir.path().join("first-run.json.new");
+    std::fs::write(&staged, b"{}").unwrap();
+    // An hour's pace: no round but the first starts unless a device notice starts it.
+    let hour = Duration::from_secs(3_600);
+    let worker = KeptWorker::start(Some(folder.clone()), hour, true);
+    let mut told = Vec::new();
+    // The first round, then the records watch's first look.
+    told.push(worker.next());
+    told.push(worker.next());
+    // The console's callout runs on the worker's thread as the focus hint's wait returns.
+    worker.console.store(true, Ordering::Release);
+    worker.control.hint(Causes::FOCUS);
+    told.push(worker.next());
+    told.push(worker.next());
+    worker.control.hint(Causes::REQUEST);
+    told.push(worker.next());
+    std::fs::rename(&staged, folder.join("first-run.json")).unwrap();
+    told.push(worker.next());
+    worker.control.hint(Causes::DEVICE);
+    told.push(worker.next());
+    told.push(worker.next());
+    let after = worker.end();
+    let heard = |cause| Ok(Kept::Waited(Woke::Hint(cause)));
+    assert_eq!(
+        told,
+        [
+            Ok(Kept::Round(Causes::default(), hour)),
+            heard(Causes::RECORDS),
+            heard(Causes::FOCUS),
+            heard(Causes::CONSOLE),
+            heard(Causes::REQUEST),
+            heard(Causes::RECORDS),
+            heard(Causes::DEVICE),
+            Ok(Kept::Round(
+                Causes::RECORDS
+                    .union(Causes::FOCUS)
+                    .union(Causes::CONSOLE)
+                    .union(Causes::REQUEST)
+                    .union(Causes::DEVICE),
+                hour
+            )),
+        ],
+        "six hints, one round, and that round the device notice's"
+    );
+    assert_eq!(after, [Kept::Waited(Woke::Stopped)], "nothing but the stop");
+}
+
+/// K3, on the function the keeper's thread runs, with no pace so that only a settled wait
+/// blocks: a fresh worker runs its first round, the one its new sample owes, and one for its
+/// records watch's first look, then blocks. Each hint then runs one round, and a keyboard or
+/// console notice one more, and nothing else runs: 25 rounds, 3 of them the fresh worker's, 10
+/// for five keyboard notices, 9 for three focus, three request and three records hints, and 3
+/// for a focus hint and a console notice.
+/// NEGATIVE CONTROL: with the wait after every round the pace, the second round's wait returns
+/// `Deadline` where the settled wait blocks for `Hint(records)`, and rounds follow with no
+/// hint.
+#[test]
+fn a_settled_worker_blocks_until_a_hint_and_runs_one_round_for_it() {
+    use watch::{Causes, Woke};
+    let none = Causes::default();
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let folder = dir.path().join("doctor");
+    std::fs::create_dir(&folder).unwrap();
+    let worker = KeptWorker::start(Some(folder.clone()), Duration::ZERO, true);
+    let mut told = Vec::new();
+    let mut expected = Vec::new();
+    let now = Duration::ZERO;
+    let mut expect = |told: &mut Vec<_>, events: &[Kept]| {
+        for event in events {
+            told.push(worker.next());
+            expected.push(Ok(match event {
+                Kept::Round(causes, wait) => Kept::Round(*causes, *wait),
+                Kept::Waited(woke) => Kept::Waited(*woke),
+            }));
+        }
+    };
+    // One round for a hint that needs no confirming: the hint ends the settled wait, the pace
+    // (none here) has passed, and the round settles again.
+    let one_round = |cause| {
+        [
+            Kept::Waited(Woke::Hint(cause)),
+            Kept::Waited(Woke::Deadline),
+            Kept::Round(cause, BACKSTOP),
+        ]
+    };
+    expect(
+        &mut told,
+        &[
+            Kept::Round(none, now),
+            Kept::Waited(Woke::Deadline),
+            Kept::Round(none, BACKSTOP),
+        ],
+    );
+    // The records watch's first look.
+    expect(&mut told, &one_round(Causes::RECORDS));
+    for _ in 0..5 {
+        worker.control.hint(Causes::DEVICE);
+        expect(
+            &mut told,
+            &[
+                Kept::Waited(Woke::Hint(Causes::DEVICE)),
+                Kept::Round(Causes::DEVICE, now),
+                Kept::Waited(Woke::Deadline),
+                Kept::Round(none, BACKSTOP),
+            ],
+        );
+    }
+    for nth in 0..3 {
+        worker.control.hint(Causes::FOCUS);
+        expect(&mut told, &one_round(Causes::FOCUS));
+        worker.control.hint(Causes::REQUEST);
+        expect(&mut told, &one_round(Causes::REQUEST));
+        let staged = dir.path().join("record.new");
+        std::fs::write(&staged, b"{}").unwrap();
+        std::fs::rename(&staged, folder.join(format!("record-{nth}.json"))).unwrap();
+        expect(&mut told, &one_round(Causes::RECORDS));
+    }
+    // The console's callout runs on the worker's thread as the focus hint's wait returns.
+    worker.console.store(true, Ordering::Release);
+    worker.control.hint(Causes::FOCUS);
+    expect(&mut told, &one_round(Causes::FOCUS));
+    expect(
+        &mut told,
+        &[
+            Kept::Waited(Woke::Hint(Causes::CONSOLE)),
+            Kept::Waited(Woke::Deadline),
+            Kept::Round(Causes::CONSOLE, now),
+            Kept::Waited(Woke::Deadline),
+            Kept::Round(none, BACKSTOP),
+        ],
+    );
+    let after = worker.end();
+    assert_eq!(told, expected);
+    let rounds = told
+        .iter()
+        .filter(|event| matches!(event, Ok(Kept::Round(..))))
+        .count();
+    assert_eq!(rounds, 3 + 2 * 5 + 3 * 3 + 1 + 2);
+    assert_eq!(after, [Kept::Waited(Woke::Stopped)], "nothing but the stop");
+}
+
+/// K3, on the function the keeper's thread runs: a worker whose keyboard notices and console
+/// key did not arm (a private watch registers neither, and says so) keeps its timer after
+/// every round, its records watch armed or not.
+/// NEGATIVE CONTROL: with `Watch::armed` saying both armed, the second round settles and the
+/// worker blocks: the third round is the records watch's first look, after `Hint(records)`.
+#[test]
+fn a_worker_whose_hint_sources_did_not_arm_keeps_its_timer() {
+    use watch::{Causes, Woke};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let worker = KeptWorker::start(Some(dir.path().to_owned()), Duration::ZERO, false);
+    let told: Vec<_> = (0..8).map(|_| worker.next()).collect();
+    let _ = worker.end();
+    let round = || Ok(Kept::Round(Causes::default(), Duration::ZERO));
+    let paced = || Ok(Kept::Waited(Woke::Deadline));
+    assert_eq!(
+        told,
+        [
+            round(),
+            paced(),
+            round(),
+            paced(),
+            round(),
+            paced(),
+            round(),
+            paced()
+        ],
+        "round after round at the pace"
+    );
+}
+
+/// K3, on what the keeper's thread runs ([`live_worker`]: the live watch, the records watch
+/// and the two-second pace), over a system that reads no hardware: every round finds all
+/// three hint sources armed, the first round's wait is the pace, and a round after it settles
+/// on the backstop. A wake starts each later round, so the law waits out no pace; a keyboard
+/// this Mac attaches meanwhile only adds a paced round.
+/// NEGATIVE CONTROLS: with the console registration deleted from the live watch's setup the
+/// first round's coverage says `console: false`; with `live_worker` handing its worker no
+/// records folder it says `records: false`.
+#[test]
+fn the_keepers_thread_arms_every_hint_source_and_settles_on_the_backstop() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let folder = dir.path().to_owned();
+    let control = Arc::<watch::Control>::default();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (tell, told) = std::sync::mpsc::channel();
+    let worker_control = Arc::clone(&control);
+    let worker_stop = Arc::clone(&stopped);
+    let worker = std::thread::spawn(move || {
+        let sys = aterm_machines::port::Fake::root();
+        live_worker(
+            &Mutex::default(),
+            &worker_stop,
+            Instant::now(),
+            &Notifications {
+                changed: || {},
+                invalidated: || {},
+                console_return: None,
+                pending: None,
+                ended: None,
+            },
+            &worker_control,
+            &Outside {
+                sys: &sys,
+                scope: &|| Ok(InputSetupScope::Inactive),
+                activate: &|_, _, _| panic!("a keeper off the console activates nothing"),
+                records: Some(folder),
+                chose: &|_, coverage, wait| {
+                    let _ = tell.send((coverage, wait));
+                },
+            },
+        );
+    });
+    let whole = Coverage {
+        devices: true,
+        console: true,
+        records: true,
+    };
+    // Each round's coverage and wait, to the first that settled or found a source unarmed, and
+    // no more than eight: each is a wait for something that must happen.
+    let mut rounds = Vec::new();
+    for _ in 0..8 {
+        let Ok(round) = told.recv_timeout(Duration::from_secs(60)) else {
+            break;
+        };
+        rounds.push(round);
+        if round.0 != whole || round.1 == BACKSTOP {
+            break;
+        }
+        control.wake();
+    }
+    stopped.store(true, Ordering::Release);
+    control.wake();
+    let ended = worker.join();
+    assert!(ended.is_ok(), "{ended:?}");
+    assert_eq!(
+        rounds.first(),
+        Some(&(whole, PACE)),
+        "the first round: every source armed, and its new sample owes a round at the pace"
+    );
+    assert_eq!(
+        rounds.last(),
+        Some(&(whole, BACKSTOP)),
+        "a later round settled"
+    );
+    assert!(
+        rounds
+            .iter()
+            .all(|round| round.0 == whole && (round.1 == PACE || round.1 == BACKSTOP)),
+        "{rounds:?}"
+    );
+}
+
+/// K3, on the function the keeper's thread runs, with no pace: a background keeper at the
+/// console under a pending scope settles as one off the console does, since nothing reads its
+/// pending sample, and a record published into its folder starts one round.
+/// NEGATIVE CONTROL: with a background keeper's pending sample counted as owed, every round's
+/// wait is the pace and no wait blocks for the records hint.
+#[test]
+fn a_background_keeper_under_a_pending_scope_settles_and_a_record_starts_its_round() {
+    use watch::{Causes, Woke};
+    let none = Causes::default();
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let folder = dir.path().join("doctor");
+    std::fs::create_dir(&folder).unwrap();
+    let worker = KeptWorker::start_as(Some(folder.clone()), Duration::ZERO, true, || {
+        let who = aterm_machines::model::User {
+            name: "alice".into(),
+            uid: 501,
+            gid: 20,
+            home: "/Users//alice".into(),
+            shell: "/bin/zsh".into(),
+            admin: true,
+        };
+        let mut sys = aterm_machines::port::Fake::root();
+        sys.euid = who.uid;
+        sys.logged_in(&who);
+        sys.keyboard_services = Some(Ok(vec![41]));
+        sys.stat_of(
+            "/dev/console",
+            aterm_machines::port::Stat {
+                uid: who.uid,
+                gid: who.gid,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        (sys, InputSetupScope::Pending(7))
+    });
+    let one_round = |cause| {
+        [
+            Ok(Kept::Waited(Woke::Hint(cause))),
+            Ok(Kept::Waited(Woke::Deadline)),
+            Ok(Kept::Round(cause, BACKSTOP)),
+        ]
+    };
+    // The fresh worker's two rounds, then the round for the records watch's first look.
+    let mut told: Vec<_> = (0..6).map(|_| worker.next()).collect();
+    let staged = dir.path().join("record.new");
+    std::fs::write(&staged, b"{}").unwrap();
+    std::fs::rename(&staged, folder.join("record.json")).unwrap();
+    told.extend((0..3).map(|_| worker.next()));
+    let after = worker.end();
+    let mut expected = vec![
+        Ok(Kept::Round(none, Duration::ZERO)),
+        Ok(Kept::Waited(Woke::Deadline)),
+        Ok(Kept::Round(none, BACKSTOP)),
+    ];
+    expected.extend(one_round(Causes::RECORDS));
+    expected.extend(one_round(Causes::RECORDS));
+    assert_eq!(told, expected);
+    assert_eq!(after, [Kept::Waited(Woke::Stopped)], "nothing but the stop");
+}
+
+/// K2: the watch the keeper's thread makes ([`watch::Watch::new`]) arms every keyboard
+/// lifecycle notice and the console user's key on this Mac, and the key's callout, called as
+/// the store's run-loop source calls it, is the next wait's `console` cause, once.
+/// NEGATIVE CONTROLS: with the console registration deleted from the live watch's setup, the
+/// watch says `console: false`; with the callout setting nothing, the first wait finds nothing
+/// to tell and would block: the worker panics there, and the two returns are `None`.
+#[test]
+fn the_console_users_key_arms_and_its_callout_is_the_waits_console_cause() {
+    use watch::{Causes, Woke};
+    let armed = std::thread::spawn(|| {
+        let stopped = AtomicBool::new(false);
+        watch::Watch::new(Arc::default(), &stopped).armed()
+    })
+    .join();
+    assert_eq!(
+        armed.ok(),
+        Some(watch::Armed {
+            devices: true,
+            console: true
+        }),
+        "the live watch's keyboard notices and its dynamic store source armed"
+    );
+    let told = std::thread::spawn(|| {
+        let stopped = AtomicBool::new(false);
+        let mut watch = watch::Watch::private(Arc::default(), &stopped, || {
+            panic!("a told notice needs no blocking wait")
+        });
+        let hour = Instant::now() + Duration::from_secs(3_600);
+        watch.console_notice();
+        watch.console_notice();
+        [
+            watch.wait(&stopped, hour),
+            watch.wait(&stopped, Instant::now()),
+        ]
+    })
+    .join();
+    assert_eq!(
+        told.ok(),
+        Some([Woke::Hint(Causes::CONSOLE), Woke::Deadline]),
+        "two notices before a wait are one cause, and a taken cause is not told again"
+    );
 }
 
 #[test]

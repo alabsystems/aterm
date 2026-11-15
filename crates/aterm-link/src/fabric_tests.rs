@@ -160,31 +160,31 @@ fn ghost_rows_are_live_unhosted_and_ours() {
         ..SessionRow::default()
     };
     let sessions = vec![
-        row("s-ghost", None, "n-ours", "live"),
-        row("s-hosted", Some(42), "n-ours", "live"),
-        row("s-gone", None, "n-ours", "exited"),
-        row("s-elsewhere", None, "n-theirs", "live"),
+        row("tghpst00000", None, "n-ours", "live"),
+        row("th0sted0000", Some(42), "n-ours", "live"),
+        row("tgpne000000", None, "n-ours", "exited"),
+        row("te1sewhere0", None, "n-theirs", "live"),
     ];
     let local = local_nodes(&[], Some("n-ours"));
     let got: Vec<&str> = ghost_rows(&sessions, &local)
         .iter()
         .map(|s| s.sid.as_str())
         .collect();
-    assert_eq!(got, ["s-ghost"]);
+    assert_eq!(got, ["tghpst00000"]);
 }
 
 #[test]
 fn incomplete_instance_discovery_never_admits_a_retirement_candidate() {
     let mut report = healthy();
     report.sessions = vec![SessionRow {
-        sid: "s-ghost".into(),
+        sid: "tghpst00000".into(),
         node: "n-a".into(),
         bus: "live".into(),
         ..SessionRow::default()
     }];
     assert_eq!(
         retirement_candidates(&report).unwrap(),
-        [("s-ghost".into(), "n-a".into())]
+        [("tghpst00000".into(), "n-a".into())]
     );
     report.instances[0].error = Some("native reply unavailable".into());
     assert!(retirement_candidates(&report).is_err());
@@ -418,12 +418,12 @@ fn tail_json_prints_one_object_per_record_and_a_body_only_under_bodies() {
         transport::connect(&sock.to_string_lossy(), aterm_spec::wait::MUST_HAPPEN).expect("dial");
     let records = [
         (
-            "/f/f1/in/n-a/s-x/h-jsmith/note",
+            "/f/f1/in/n-a/tx000000000/h-jsmith/note",
             "v=1 t=1700000000000 text=QZP8NOTE",
         ),
         ("/f/f1/pub/n-a/node/presence", "v=1 t=1700000000001 inc=3"),
         (
-            "/f/f1/pub/n-a/s-x/presence",
+            "/f/f1/pub/n-a/tx000000000/presence",
             "v=1 t=1700000000002 state=live",
         ),
     ];
@@ -479,7 +479,7 @@ fn tail_json_prints_one_object_per_record_and_a_body_only_under_bodies() {
             );
             assert_eq!(field("subject"), Some(subject));
             assert_eq!(field("node"), Some("n-a"));
-            assert_eq!(field("sid"), [Some("s-x"), None][i], "{line}");
+            assert_eq!(field("sid"), [Some("tx000000000"), None][i], "{line}");
             assert_eq!(field("kind"), Some(["note", "presence"][i]));
             let t = traffic_of("f1", offs[i], subject, body.as_bytes(), 0);
             let table = tail_line(&t, 0, 0, true);
@@ -770,11 +770,11 @@ fn tail_json_under_a_node_cap_prints_offsets_in_order_so_a_resume_misses_none() 
         .collect();
     crate::bridge::write_owner_only(&cap, lines);
     let subjects = [
-        ("/f/f1/pub/n-b/s-x/presence", true),
-        ("/f/f1/in/n-a/s-y/n-b/note", true),
-        ("/f/f1/pub/n-a/s-y/presence", true),
+        ("/f/f1/pub/n-b/tx000000000/presence", true),
+        ("/f/f1/in/n-a/ty000000000/n-b/note", true),
+        ("/f/f1/pub/n-a/ty000000000/presence", true),
         ("/f/f1/fleet/h-andrew/halt", true),
-        ("/f/f1/in/n-b/s-z/n-c/note", false),
+        ("/f/f1/in/n-b/tz000000000/n-c/note", false),
     ];
     let mut seq = 0u64;
     let mut publish = |i: usize| {
@@ -904,7 +904,10 @@ impl TwoFaces {
     /// The two faces, in the order [`readable_faces`] reads them.
     const FACES: [&'static str; 2] = ["/f/f1/in/n-a/>", "/f/f1/pub/>"];
     /// A subject on each face.
-    const SUBJECTS: [&'static str; 2] = ["/f/f1/in/n-a/s-y/n-b/note", "/f/f1/pub/n-b/s-x/presence"];
+    const SUBJECTS: [&'static str; 2] = [
+        "/f/f1/in/n-a/ty000000000/n-b/note",
+        "/f/f1/pub/n-b/tx000000000/presence",
+    ];
 
     fn new(dir: &std::path::Path) -> Self {
         let secret = vec![0x5a_u8; 32];
@@ -1225,11 +1228,11 @@ fn a_tail_filter_passes_astreams_grammar_then_aterms_narrower_one() {
         "/f/lab/pub/*/*/say/>",
         "/f/lab/pub/*/*/presence",
         "/f/lab/pub/n-00000000000000aa/*/presence",
-        "/f/lab/pub/*/s-1/presence",
+        "/f/lab/pub/*/t0000000001/presence",
         "/f/lab/pub/*/*/ev",
         "/f/lab/pub/n-a/>",
         "/f/lab/in/n-a/>",
-        "/f/lab/in/n-a/s-1/>",
+        "/f/lab/in/n-a/t0000000001/>",
         "/f/lab/in/*/*/n-a/*",
         "/f/lab/in/p/h-x/>",
         "/f/lab/in/p/h-x/*/ask",
@@ -1375,7 +1378,7 @@ fn sessions_show_the_broadcast_topics_and_a_dash_for_none() {
     let mut r = healthy();
     r.sessions.clear();
     let mut listening = r.instances[0].sessions[0].clone();
-    listening.sid = "s-ears".to_string();
+    listening.sid = "tears000000".to_string();
     listening.topics = vec!["build.failed".to_string(), "sat-comp".to_string()];
     r.instances[0].sessions.push(listening);
     join_sessions(&mut r, None);
@@ -1386,7 +1389,7 @@ fn sessions_show_the_broadcast_topics_and_a_dash_for_none() {
     );
     assert!(json.contains("\"topics\":[]"), "{json}");
     r.sessions.push(SessionRow {
-        sid: "s-gone".to_string(),
+        sid: "tgpne000000".to_string(),
         pid: None,
         node: "n-a".to_string(),
         bus: "gone".to_string(),
@@ -1400,7 +1403,7 @@ fn sessions_show_the_broadcast_topics_and_a_dash_for_none() {
     });
     let json = render_json(&r);
     let gone = json
-        .split("\"sid\":\"s-gone\"")
+        .split("\"sid\":\"tgpne000000\"")
         .nth(1)
         .expect("the gone row");
     assert!(gone.contains("\"topics\":null"), "{gone}");
@@ -1415,13 +1418,15 @@ fn sessions_show_the_presence_rows_meaning_fields() {
         detail=claude phase=busy context=12%25 title=bus%20title",
     );
     let local_row =
-        crate::glance::Row::parse("lab", 5, "/f/lab/pub/n-a/s-one/presence", body).expect("a row");
-    let remote_row = crate::glance::Row::parse("lab", 6, "/f/lab/pub/n-far/s-far/presence", body)
-        .expect("a row");
+        crate::glance::Row::parse("lab", 5, "/f/lab/pub/n-a/t0ne0000000/presence", body)
+            .expect("a row");
+    let remote_row =
+        crate::glance::Row::parse("lab", 6, "/f/lab/pub/n-far/tfar0000000/presence", body)
+            .expect("a row");
     let old_row = crate::glance::Row::parse(
         "lab",
         7,
-        "/f/lab/pub/n-far/s-old/presence",
+        "/f/lab/pub/n-far/tpmd0000000/presence",
         b"v=1 t=1 inc=1 state=live hold=0 holder=- attention=-",
     )
     .expect("a row");
@@ -1595,16 +1600,16 @@ fn unread_is_listed_minus_handled_and_posts_are_the_unlanded_rows() {
     let mut s = LocalSession::default();
     let header0 = "OK 2 hold=1 holder=h-andrew seen=3 bus_head=40 dropped=2 pending=1";
     let posts = vec![
-        "post 7 to=@s-a kind=task off=- len=5".to_string(),
-        "post 8 to=@s-b kind=note off=- len=9".to_string(),
+        "post 7 to=@ta000000000 kind=task off=- len=5".to_string(),
+        "post 8 to=@tb000000000 kind=note off=- len=9".to_string(),
     ];
     let full = vec![
         "msg 2 off=10 t=5 from=h-andrew kind=task trust=human len=3".to_string(),
-        "msg 3 off=11 t=6 from=s-x@n-y kind=note trust=agent len=3".to_string(),
-        "msg 4 off=12 t=7 from=s-x@n-y kind=ask trust=agent len=3".to_string(),
+        "msg 3 off=11 t=6 from=tx000000000@n-y kind=note trust=agent len=3".to_string(),
+        "msg 4 off=12 t=7 from=tx000000000@n-y kind=ask trust=agent len=3".to_string(),
         "msg 5 off=13 t=8 from=h-andrew kind=task trust=human len=3".to_string(),
-        "msg 6 off=14 t=9 from=s-x@n-y kind=note trust=agent re=3 len=3".to_string(),
-        "post 7 to=@s-a kind=task off=- len=5".to_string(),
+        "msg 6 off=14 t=9 from=tx000000000@n-y kind=note trust=agent re=3 len=3".to_string(),
+        "post 7 to=@ta000000000 kind=task off=- len=5".to_string(),
     ];
     fill_inbox(&mut s, header0, &posts, &full);
     assert_eq!(s.hold, Some(1));
@@ -1677,12 +1682,15 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
     let t = traffic_of(
         "lab",
         4,
-        "/f/lab/in/n-a/s-w/n-a/task",
-        b"v=1 t=1757000000000 from=s-me text=secret%20plan",
+        "/f/lab/in/n-a/tw000000000/n-a/task",
+        b"v=1 t=1757000000000 from=tme00000000 text=secret%20plan",
         0,
     );
-    assert_eq!(t.from, "s-me@n-a", "the node attests which session spoke");
-    assert_eq!(t.to, "s-w@n-a");
+    assert_eq!(
+        t.from, "tme00000000@n-a",
+        "the node attests which session spoke"
+    );
+    assert_eq!(t.to, "tw000000000@n-a");
     assert_eq!(t.kind, "task");
     assert_eq!(t.trust, "agent");
     assert_eq!(t.len, "secret plan".len());
@@ -1693,22 +1701,28 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
     assert!(tail_line(&t, t.t_ms, 0, true).ends_with("text=secret plan"));
 
     let mirrored = b"v=2 t=1757000000001 ep=1 seq=4 ms=3 op=close node=r2 k=cmd out=fail code=1 src=shell conf=exact";
-    let t = traffic_of("lab", 9, "/f/lab/pub/n-a/s-w/ev", mirrored, 0);
+    let t = traffic_of("lab", 9, "/f/lab/pub/n-a/tw000000000/ev", mirrored, 0);
     assert_eq!((t.kind.as_str(), t.trust), ("ev", "shell"));
     assert_eq!(t.len, mirrored.len());
     assert_eq!(t.t_ms, 1_757_000_000_001);
     let line = tail_line(&t, t.t_ms, 0, true);
     assert!(line.contains(" op=close node=r2 k=cmd out=fail "), "{line}");
     assert!(!tail_line(&t, t.t_ms, 0, false).contains("op=close"));
-    let other = traffic_of("lab", 9, "/f/lab/pub/n-a/s-w/presence", mirrored, 0);
+    let other = traffic_of("lab", 9, "/f/lab/pub/n-a/tw000000000/presence", mirrored, 0);
     assert_eq!(other.kind, "presence");
 
-    let h = traffic_of("lab", 5, "/f/lab/in/n-a/s-w/h-andrew/ask", b"v=1 t=1", 0);
+    let h = traffic_of(
+        "lab",
+        5,
+        "/f/lab/in/n-a/tw000000000/h-andrew/ask",
+        b"v=1 t=1",
+        0,
+    );
     assert_eq!((h.from.as_str(), h.trust), ("h-andrew", "human"));
     let r = traffic_of(
         "lab",
         6,
-        "/f/lab/in/n-a/s-w/h-andrew/ask",
+        "/f/lab/in/n-a/tw000000000/h-andrew/ask",
         b"v=1 t=1 via=n-b",
         0,
     );
@@ -1716,24 +1730,24 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
     let forged = traffic_of(
         "lab",
         7,
-        "/f/lab/in/n-a/s-w/s-evil/note",
+        "/f/lab/in/n-a/tw000000000/tev11000000/note",
         b"v=1 from=h-andrew",
         0,
     );
-    assert_eq!(forged.from, "s-evil");
+    assert_eq!(forged.from, "tev11000000");
 
     // A record whose meaning is in its fields, not a `text=` (fix unit E5, E2E-10): its
     // body is its whole first line and `len` that line's bytes, shown under `--bodies`
     // alone. NEGATIVE CONTROL (scratch): today's decoded-text rule gives `len` 0 and an
     // empty body.
     let row: &[u8] = b"v=1 t=2 state=live attention=QZP7WORD1";
-    let p = traffic_of("lab", 1, "/f/lab/pub/n-a/s-w/presence", row, 0);
+    let p = traffic_of("lab", 1, "/f/lab/pub/n-a/tw000000000/presence", row, 0);
     assert_eq!(
         (p.from.as_str(), p.to.as_str(), p.kind.as_str(), p.len),
-        ("s-w@n-a", "-", "presence", row.len())
+        ("tw000000000@n-a", "-", "presence", row.len())
     );
     assert_eq!(p.text.as_bytes(), row);
-    let subject = "/f/lab/pub/n-a/s-w/presence";
+    let subject = "/f/lab/pub/n-a/tw000000000/presence";
     assert!(!traffic_cells(&p, 0, 0).join(" ").contains("QZP7WORD1"));
     assert!(!tail_line(&p, 0, 0, false).contains("QZP7WORD1"));
     assert!(!tail_json("lab", subject, &p, false).contains("QZP7WORD1"));
@@ -1743,11 +1757,17 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
     // the face's cut may hold) is keystrokes.
     // NEGATIVE CONTROL (scratch): taking the whole raw body prints them.
     let keys: &[u8] = b"v=1 t=1 gen=1:ab len=9\nQZP7KEYS1";
-    let k = traffic_of("lab", 13, "/f/lab/term/n-a/s-w/in/h-andrew", keys, 0);
+    let k = traffic_of(
+        "lab",
+        13,
+        "/f/lab/term/n-a/tw000000000/in/h-andrew",
+        keys,
+        0,
+    );
     assert_eq!((k.text.as_str(), k.len), ("v=1 t=1 gen=1:ab len=9", 22));
     for shown in [
         tail_line(&k, 0, 0, true),
-        tail_json("lab", "/f/lab/term/n-a/s-w/in/h-andrew", &k, true),
+        tail_json("lab", "/f/lab/term/n-a/tw000000000/in/h-andrew", &k, true),
     ] {
         assert!(!shown.contains("QZP7KEYS1"), "{shown}");
     }
@@ -1756,22 +1776,28 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
     let s = traffic_of(
         "lab",
         150,
-        "/f/lab/pub/n-a1b2/s-c3d4/say/build.failed",
-        b"v=1 t=1 kind=task from=s-c3d4 text=x",
+        "/f/lab/pub/n-a1b2/tc3d4000000/say/build.failed",
+        b"v=1 t=1 kind=task from=tc3d4000000 text=x",
         0,
     );
     assert_eq!(
         (s.from.as_str(), s.to.as_str(), s.kind.as_str(), s.trust),
-        ("s-c3d4@n-a1b2", "say:build.failed", "task", "agent")
+        ("tc3d4000000@n-a1b2", "say:build.failed", "task", "agent")
     );
-    let bare = traffic_of("lab", 151, "/f/lab/pub/n-a/s-w/say/say", b"v=1 t=1", 0);
+    let bare = traffic_of(
+        "lab",
+        151,
+        "/f/lab/pub/n-a/tw000000000/say/say",
+        b"v=1 t=1",
+        0,
+    );
     assert_eq!((bare.to.as_str(), bare.kind.as_str()), ("say:say", "note"));
     assert_eq!(
         (bare.text.as_str(), bare.len),
         ("v=1 t=1", 7),
         "a bare body's own line"
     );
-    let ev = traffic_of("lab", 3, "/f/lab/pub/n-a/s-w/ev", b"v=1 t=2", 0);
+    let ev = traffic_of("lab", 3, "/f/lab/pub/n-a/tw000000000/ev", b"v=1 t=2", 0);
     assert_eq!(ev.trust, SCREEN);
     let halt = traffic_of(
         "lab",
@@ -1792,7 +1818,13 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
     let odd = traffic_of("lab", 9, "/f/lab/pub/h-andrew/say/note", b"v=1 t=2", 0);
     assert_eq!((odd.to.as_str(), odd.kind.as_str()), ("-", "note"));
     // The drive face is cut: its record reads as any face nothing serves, by its subject.
-    let key = traffic_of("lab", 10, "/f/lab/term/n-a/s-w/in/h-andrew", b"v=1", 0);
+    let key = traffic_of(
+        "lab",
+        10,
+        "/f/lab/term/n-a/tw000000000/in/h-andrew",
+        b"v=1",
+        0,
+    );
     assert_eq!(
         (
             key.from.as_str(),
@@ -1800,14 +1832,25 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
             key.kind.as_str(),
             key.trust
         ),
-        ("-", "/f/lab/term/n-a/s-w/in/h-andrew", "term", SCREEN)
+        (
+            "-",
+            "/f/lab/term/n-a/tw000000000/in/h-andrew",
+            "term",
+            SCREEN
+        )
     );
     let odd = traffic_of("lab", 11, "/f/lab/zzz/q", b"", 0);
     assert_eq!((odd.kind.as_str(), odd.trust), ("zzz", SCREEN));
-    let alien = traffic_of("lab", 11, "/f/other/in/n-a/s-w/n-a/note", b"", 0);
+    let alien = traffic_of("lab", 11, "/f/other/in/n-a/tw000000000/n-a/note", b"", 0);
     assert_eq!((alien.kind.as_str(), alien.trust), ("unknown", SCREEN));
 
-    let hostile = traffic_of("lab", 12, "/f/lab/in/n-a/s-w/n-\u{1b}[2J/note", b"v=1", 0);
+    let hostile = traffic_of(
+        "lab",
+        12,
+        "/f/lab/in/n-a/tw000000000/n-\u{1b}[2J/note",
+        b"v=1",
+        0,
+    );
     let line = tail_line(&hostile, 0, 0, true);
     assert!(!line.contains('\u{1b}'), "{line:?}");
 }
@@ -1815,7 +1858,7 @@ fn traffic_rows_classify_every_face_and_carry_no_text_in_their_columns() {
 /// When the carried-post tests' certificate was signed, and the post: a reader's clock.
 const CARRIED_AT: u64 = 1_800_000_000_000;
 
-/// A post of h-andrew's to session `s-q`, of `kind`, sealed on the Mac whose node seed is
+/// A post of h-andrew's to session `tq000000000`, of `kind`, sealed on the Mac whose node seed is
 /// `[51; 32]` and carried by that Mac's mesh (§11 C3c, `federate::Routes::carry_one`): the
 /// Mac's node, and the body its lane holds, `by=h-andrew` beside the seal.
 fn carried_post(kind: &str) -> (String, Body) {
@@ -1831,7 +1874,7 @@ fn carried_post(kind: &str) -> (String, Body) {
     body.text = "QZP9PLAN".to_owned();
     key.seal(
         &cert,
-        &post_address("lab", "s-q", "h-andrew", kind),
+        &post_address("lab", "tq000000000", "h-andrew", kind),
         &mut body,
     );
     body.unknown
@@ -1841,7 +1884,7 @@ fn carried_post(kind: &str) -> (String, Body) {
 }
 
 /// **A CARRIED PERSON'S POST READS AS THE PERSON ONLY WHILE ITS SEAL VERIFIES** (§11 C3d): a
-/// post of h-andrew's that the Mac P carried onto its own lane to session s-q on Q,
+/// post of h-andrew's that the Mac P carried onto its own lane to session tq000000000 on Q,
 /// `by=h-andrew` beside the seal, is the person's in every observer view (`traffic_of`, the
 /// TRAFFIC cells, `tail`, `tail --json`, the deadline scan), `from=h-andrew@<P>
 /// trust=human`, once its seal verifies, at the reader's clock, under the certificate of the
@@ -1849,8 +1892,8 @@ fn carried_post(kind: &str) -> (String, Body) {
 /// NEGATIVE CONTROLS, each the same record less one premise, each refused for its reason and
 /// shown as the lane's writer and `agent`, never under the name it claims: the same bytes on
 /// another Mac's lane (not vouched), `by=` naming another person and its text changed (each
-/// a bad seal), its seal taken off (unsealed), a body `from=s-x` beside a failed claim (the
-/// Mac still, not `s-x@<P>`), `by=` naming no person (malformed), and a reader whose clock
+/// a bad seal), its seal taken off (unsealed), a body `from=tx000000000` beside a failed claim (the
+/// Mac still, not `tx000000000@<P>`), `by=` naming no person (malformed), and a reader whose clock
 /// is past the certificate's life (lapsed, though nothing in the post changed); one relayed
 /// (`via=`) reads `relayed`.
 #[test]
@@ -1859,7 +1902,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     let (p, post) = carried_post("ask");
     let q = crate::federate::node_of(&[52; 32]);
     let other = crate::federate::node_of(&[53; 32]);
-    let lane = |writer: &str| format!("/f/lab/in/{q}/s-q/{writer}/ask");
+    let lane = |writer: &str| format!("/f/lab/in/{q}/tq000000000/{writer}/ask");
     // Every view of the record: its classification, its TRAFFIC cells' trust and sender,
     // its `tail` line's words and its `tail --json` object.
     let views = |subject: &str, body: &Body, now: u64| {
@@ -1872,7 +1915,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     let shows = |what: &str, subject: &str, body: &Body, now: u64, (from, trust): (&str, &str)| {
         let (t, cells, line, json) = views(subject, body, now);
         assert_eq!((t.from.as_str(), t.trust), (from, trust), "{what}");
-        assert_eq!(t.to, format!("s-q@{q}"), "{what}");
+        assert_eq!(t.to, format!("tq000000000@{q}"), "{what}");
         assert_eq!(cells, (trust.to_owned(), from.to_owned()), "{what}");
         let words: Vec<&str> = line.split_whitespace().collect();
         assert!(
@@ -1893,7 +1936,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     let person = format!("h-andrew@{p}");
     shows("verified", &lane(&p), &post, CARRIED_AT, (&person, "human"));
     assert_eq!(
-        carried_by("lab", "s-q", &p, "ask", &post, CARRIED_AT),
+        carried_by("lab", "tq000000000", &p, "ask", &post, CARRIED_AT),
         Ok(Some(person.clone()))
     );
     let late = CARRIED_AT + 60_001;
@@ -1945,10 +1988,10 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
             Refusal::Unsealed,
         ),
         (
-            "from=s-x beside a failed claim",
+            "from=tx000000000 beside a failed claim",
             &p,
             with(&|b| {
-                b.from = Some("s-x".to_owned());
+                b.from = Some("tx000000000".to_owned());
                 b.text.push('!');
             }),
             CARRIED_AT,
@@ -1958,7 +2001,8 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
             "by= no person",
             &p,
             with(&|b| {
-                b.unknown.insert(BY_TOKEN.to_owned(), "s-evil".to_owned());
+                b.unknown
+                    .insert(BY_TOKEN.to_owned(), "tev11000000".to_owned());
             }),
             CARRIED_AT,
             Refusal::Malformed,
@@ -1973,7 +2017,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     ];
     for (what, writer, body, now, refusal) in &controls {
         assert_eq!(
-            carried_by("lab", "s-q", writer, "ask", body, *now),
+            carried_by("lab", "tq000000000", writer, "ask", body, *now),
             Err(*refusal),
             "{what}"
         );
@@ -1987,7 +2031,7 @@ fn a_carried_persons_post_reads_as_the_person_only_while_its_seal_verifies() {
     );
     let relayed = with(&|b| b.via = Some(other.clone()));
     assert_eq!(
-        carried_by("lab", "s-q", &p, "ask", &relayed, CARRIED_AT),
+        carried_by("lab", "tq000000000", &p, "ask", &relayed, CARRIED_AT),
         Err(Refusal::Relayed)
     );
     shows("relayed", &lane(&p), &relayed, CARRIED_AT, (&p, "relayed"));
@@ -2007,7 +2051,7 @@ fn a_person_lane_names_a_session_on_another_mac_as_its_bridge_wrote_it() {
         crate::federate::node_of(&[51; 32]),
         crate::federate::node_of(&[52; 32]),
     );
-    let named = format!("s-q@{q}");
+    let named = format!("tq000000000@{q}");
     let raw = |from: &str| format!("v=1 t=1757000000000 from={from} re=3 text=done");
     let on_person_lane = format!("/f/lab/in/p/h-andrew/{p}/answer");
     let t = traffic_of("lab", 41, &on_person_lane, raw(&named).as_bytes(), 0);
@@ -2027,14 +2071,14 @@ fn a_person_lane_names_a_session_on_another_mac_as_its_bridge_wrote_it() {
         inbox.contains(&format!("  answer  from={named} trust=agent re=3")),
         "{inbox}"
     );
-    let bare = traffic_of("lab", 42, &on_person_lane, raw("s-x").as_bytes(), 0);
+    let bare = traffic_of("lab", 42, &on_person_lane, raw("tx000000000").as_bytes(), 0);
     assert_eq!(
         bare.from,
-        format!("s-x@{p}"),
+        format!("tx000000000@{p}"),
         "a bare session is still the writer's"
     );
 
-    let on_session_lane = format!("/f/lab/in/{p}/s-x/{q}/note");
+    let on_session_lane = format!("/f/lab/in/{p}/tx000000000/{q}/note");
     let t = traffic_of("lab", 43, &on_session_lane, raw(&named).as_bytes(), 0);
     assert_eq!((t.from.as_str(), t.trust), (q.as_str(), "agent"));
     let by_person = "/f/lab/in/p/h-andrew/h-bob/answer";
@@ -2042,10 +2086,10 @@ fn a_person_lane_names_a_session_on_another_mac_as_its_bridge_wrote_it() {
     assert_eq!((t.from.as_str(), t.trust), ("h-bob", "human"));
     for odd in [
         format!("h-x@{q}"),
-        "s-q@h-x".to_owned(),
-        format!("s-q@{q}@{q}"),
+        "tq000000000@h-x".to_owned(),
+        format!("tq000000000@{q}@{q}"),
         format!("s-Q@{q}"),
-        "s-q@".to_owned(),
+        "tq000000000@".to_owned(),
     ] {
         let t = traffic_of("lab", 45, &on_person_lane, raw(&odd).as_bytes(), 0);
         assert_eq!(t.from, p, "{odd}");
@@ -2056,7 +2100,7 @@ const CMD: &str = "aterm link serve --fleet lab --broker /tmp/b.sock --state /s"
 
 fn healthy() -> Report {
     let session = LocalSession {
-        sid: "s-one".to_string(),
+        sid: "t0ne0000000".to_string(),
         title: "work".to_string(),
         role: "-".to_string(),
         hold: Some(0),
@@ -3389,9 +3433,9 @@ fn nodes_lists_every_node_and_marks_this_one() {
                 b"v=1 t=1 inc=1 state=live fabric=connected host=m100",
             )
             .expect("row"),
-            crate::glance::Row::parse("lab", 3, "/f/lab/pub/n-z/s-far/presence", body)
+            crate::glance::Row::parse("lab", 3, "/f/lab/pub/n-z/tfar0000000/presence", body)
                 .expect("row"),
-            crate::glance::Row::parse("lab", 4, "/f/lab/pub/n-a/s-one/presence", body)
+            crate::glance::Row::parse("lab", 4, "/f/lab/pub/n-a/t0ne0000000/presence", body)
                 .expect("row"),
         ],
         truncated: false,
@@ -3631,14 +3675,14 @@ fn every_condition_that_makes_connected_a_lie_or_loses_mail_is_a_warning() {
 
     let mut r = healthy();
     r.instances[0].sessions[0].dropped = Some(2);
-    one(&r, "@s-one (instance 100)");
+    one(&r, "@t0ne0000000 (instance 100)");
 
     let mut r = healthy();
     r.instances[0].sessions[0].hold = Some(1);
     r.instances[0].sessions[0].hold_why = Some(("fabric-lost".to_string(), "fleet".to_string()));
     one(&r, "reason=fabric-lost origin=fleet");
     r.instances[0].sessions[0].hold_why = None;
-    one(&r, "@s-one");
+    one(&r, "@t0ne0000000");
 
     let mut r = healthy();
     r.instances[0].sessions[0].unhandled = vec![
@@ -3651,16 +3695,16 @@ fn every_condition_that_makes_connected_a_lie_or_loses_mail_is_a_warning() {
         MsgMeta {
             id: 5,
             off: 41,
-            from: "s-x@n-b".to_string(),
+            from: "tx000000000@n-b".to_string(),
             kind: "note".to_string(),
         },
     ];
     let mut ages = BTreeMap::new();
-    ages.insert(("s-one".to_string(), 40), r.now_ms - 11 * 60 * 1000);
-    ages.insert(("s-one".to_string(), 41), r.now_ms - 60 * 60 * 1000);
+    ages.insert(("t0ne0000000".to_string(), 40), r.now_ms - 11 * 60 * 1000);
+    ages.insert(("t0ne0000000".to_string(), 41), r.now_ms - 60 * 60 * 1000);
     let w = warnings(&r, &ages, &[]);
     assert!(w.len() == 1 && w[0].contains("h-andrew"), "{w:#?}");
-    ages.insert(("s-one".to_string(), 40), r.now_ms - 9 * 60 * 1000);
+    ages.insert(("t0ne0000000".to_string(), 40), r.now_ms - 9 * 60 * 1000);
     assert!(warnings(&r, &ages, &[]).is_empty(), "a note is not work");
 }
 
@@ -3746,7 +3790,7 @@ fn records_the_brokers_retention_gave_up_are_listed_once_where_they_were_told() 
 
     let mut r = healthy();
     let mut two = r.instances[0].sessions[0].clone();
-    two.sid = "s-two".to_string();
+    two.sid = "ttw00000000".to_string();
     r.instances[0].sessions.push(two);
     for s in &mut r.instances[0].sessions {
         s.given_up = Some(range(10, 42, Some(3)));
@@ -3775,7 +3819,7 @@ fn records_the_brokers_retention_gave_up_are_listed_once_where_they_were_told() 
     );
     for (i, from) in [130, 140, 150, 160].into_iter().enumerate() {
         let mut s = r.instances[0].sessions[0].clone();
-        s.sid = format!("s-more{i}");
+        s.sid = format!("tm0re{i:06}");
         s.given_up = Some(range(from, from + 5, None));
         r.instances[0].sessions.push(s);
     }
@@ -3795,11 +3839,14 @@ fn records_the_brokers_retention_gave_up_are_listed_once_where_they_were_told() 
         ("news".to_string(), range(81, 90, Some(4))),
     ];
     let w = warned_items(&r);
-    let own: Vec<&Warning> = w.iter().filter(|l| l.text.starts_with("@s-one ")).collect();
+    let own: Vec<&Warning> = w
+        .iter()
+        .filter(|l| l.text.starts_with("@t0ne0000000 "))
+        .collect();
     assert_eq!(
         own.iter().map(|l| &l.text).collect::<Vec<_>>(),
         [
-            "@s-one (instance 100): the broker's retention gave up records of its own before it \
+            "@t0ne0000000 (instance 100): the broker's retention gave up records of its own before it \
           handled them: its mail lane @50..@60 (`inbox` lane_given_up=); topic deploy \
           @70..@80, topic news @81..@90 (4 records) (`topic ls` given_up=)"
         ],
@@ -3810,7 +3857,7 @@ fn records_the_brokers_retention_gave_up_are_listed_once_where_they_were_told() 
     r.instances[0].sessions[0].lane_given_up = None;
     one(
         &r,
-        "@s-one (instance 100): the broker's retention gave up records of its own before it handled them: topic deploy",
+        "@t0ne0000000 (instance 100): the broker's retention gave up records of its own before it handled them: topic deploy",
     );
     r.instances[0].sessions[0].topic_given_up.clear();
     assert_eq!(warned(&r).len(), 1, "only the node's: {:#?}", warned(&r));
@@ -3860,7 +3907,7 @@ fn overlapping_ranges_of_the_nodes_given_up_mail_are_listed_as_one() {
 
     let mut r = healthy();
     let mut two = r.instances[0].sessions[0].clone();
-    two.sid = "s-two".to_string();
+    two.sid = "ttw00000000".to_string();
     r.instances[0].sessions.push(two);
     r.instances[0].sessions[0].given_up = Some(range(10, 42, Some(3)));
     r.instances[0].sessions[1].given_up = Some(range(30, 50, Some(2)));
@@ -3870,11 +3917,11 @@ fn overlapping_ranges_of_the_nodes_given_up_mail_are_listed_as_one() {
         "the sessions' alone, after an update"
     );
     let mut three = r.instances[0].sessions[0].clone();
-    three.sid = "s-three".to_string();
+    three.sid = "tthree00000".to_string();
     three.given_up = Some(range(50, 60, Some(1)));
     r.instances[0].sessions.push(three);
     let mut four = r.instances[0].sessions[0].clone();
-    four.sid = "s-four".to_string();
+    four.sid = "tf0vr000000".to_string();
     four.given_up = Some(range(60, 60, None));
     r.instances[0].sessions.push(four);
     assert_eq!(
@@ -3919,10 +3966,10 @@ impl HeldAsk {
 }
 
 /// RETENTION HOLDS OVERDUE ASKS BELOW THE `in` LANES' OLDEST (audit finding BUS-1, on one
-/// node): `s-one@n-a` asks the person `h-jsmith` three times with a deadline of 10 min, 20
+/// node): `t0ne0000000@n-a` asks the person `h-jsmith` three times with a deadline of 10 min, 20
 /// min before `now`; the person lanes' reader group (`/f/lab/cur/p/node/inbox`) is one
-/// nothing commits, so retention holds the asks. On `s-one`'s own lane, the person answers
-/// the first (`answered`) and `s-one`'s bridge records the second expired (`lapsed`); the
+/// nothing commits, so retention holds the asks. On `t0ne0000000`'s own lane, the person answers
+/// the first (`answered`) and `t0ne0000000`'s bridge records the second expired (`lapsed`); the
 /// third (`ask`) gets neither. Last, a mail between two of the node's sessions. The node's
 /// inbox group reads all three, and the bulk stream's cut (aterm's rules, its bytes
 /// scaled) gives them up past the asks, which raises their subjects' floors, and so the
@@ -3962,25 +4009,25 @@ fn held_ask_bus(tag: &str) -> HeldAsk {
         "{}/ask",
         crate::subject::person_lane("lab", "h-jsmith", "n-a")
     );
-    let asked = format!("v=1 t={t} from=s-one dl=600000 text=which");
+    let asked = format!("v=1 t={t} from=t0ne0000000 dl=600000 text=which");
     let answered = publish(&to_person, &asked);
     publish(
-        &crate::subject::post_lane("lab", "n-a", "s-one", "h-jsmith", "answer"),
+        &crate::subject::post_lane("lab", "n-a", "t0ne0000000", "h-jsmith", "answer"),
         &format!("v=1 t=1 re={answered} text=yes"),
     );
     let lapsed = publish(&to_person, &asked);
     publish(
-        &crate::subject::post_lane("lab", "n-a", "s-one", "n-a", "expired"),
+        &crate::subject::post_lane("lab", "n-a", "t0ne0000000", "n-a", "expired"),
         &format!("v=1 t=1 re={lapsed} dl=600000 text=expired"),
     );
     let ask = publish(&to_person, &asked);
     let read = publish(
-        &crate::subject::post_lane("lab", "n-a", "s-two", "n-a", "note"),
-        "v=1 t=1 from=s-one text=fyi",
+        &crate::subject::post_lane("lab", "n-a", "ttw00000000", "n-a", "note"),
+        "v=1 t=1 from=t0ne0000000 text=fyi",
     );
     let filler = "e".repeat(BODY as usize);
     for _ in 0..3 {
-        publish("/f/lab/pub/n-a/s-one/ev", &filler);
+        publish("/f/lab/pub/n-a/t0ne0000000/ev", &filler);
     }
     writer
         .commit(&crate::subject::inbox_group("lab", "n-a"), read)
@@ -4063,11 +4110,11 @@ fn an_ask_held_below_the_in_lanes_oldest_is_listed_overdue() {
     }
 }
 
-/// AN ASK STATUS CANNOT JUDGE IS COUNTED, NEVER LISTED (audit finding BUS2-3): `s-one@n-a`
+/// AN ASK STATUS CANNOT JUDGE IS COUNTED, NEVER LISTED (audit finding BUS2-3): `t0ne0000000@n-a`
 /// asks the person `h-jsmith` with a deadline that has passed (`ask`), then again with one
-/// that has not (`later`), and the person answers `later` on `s-one`'s lane. The node's
+/// that has not (`later`), and the person answers `later` on `t0ne0000000`'s lane. The node's
 /// inbox group reads the answer and a mail, and the bulk stream's cut (aterm's rules, its
-/// bytes scaled) gives them up, which raises the floor of `s-one`'s answers above `ask`: the
+/// bytes scaled) gives them up, which raises the floor of `t0ne0000000`'s answers above `ask`: the
 /// bus no longer says whether `ask` had one. Over the whole fleet's `in` lanes and over the
 /// node cap's faces, the deadline scan lists nothing and counts `ask` unjudged, and status
 /// says so in one warning (exit 1), which `doctor` gives its own fix, and as
@@ -4117,23 +4164,23 @@ fn an_ask_whose_askers_later_answer_was_given_up_is_counted_unjudged() {
     );
     let ask = publish(
         &to_person,
-        &format!("v=1 t={t} from=s-one dl=600000 text=which"),
+        &format!("v=1 t={t} from=t0ne0000000 dl=600000 text=which"),
     );
     let later = publish(
         &to_person,
-        &format!("v=1 t={now} from=s-one dl=600000 text=which"),
+        &format!("v=1 t={now} from=t0ne0000000 dl=600000 text=which"),
     );
     publish(
-        &crate::subject::post_lane("lab", "n-a", "s-one", "h-jsmith", "answer"),
+        &crate::subject::post_lane("lab", "n-a", "t0ne0000000", "h-jsmith", "answer"),
         &format!("v=1 t=1 re={later} text=yes"),
     );
     let read = publish(
-        &crate::subject::post_lane("lab", "n-a", "s-two", "n-a", "note"),
-        "v=1 t=1 from=s-one text=fyi",
+        &crate::subject::post_lane("lab", "n-a", "ttw00000000", "n-a", "note"),
+        "v=1 t=1 from=t0ne0000000 text=fyi",
     );
     let filler = "e".repeat(BODY as usize);
     for _ in 0..3 {
-        publish("/f/lab/pub/n-a/s-one/ev", &filler);
+        publish("/f/lab/pub/n-a/t0ne0000000/ev", &filler);
     }
     writer
         .commit(&crate::subject::inbox_group("lab", "n-a"), read)
@@ -4142,7 +4189,7 @@ fn an_ask_whose_askers_later_answer_was_given_up_is_counted_unjudged() {
         .retention_tick_at(broker.now_ms())
         .expect("the retention tick");
     let (_, (_, head)) = writer.fetch(0, "/f/lab/>", 0).expect("the head");
-    let lane = verdict_lane("lab", &to_person, Some("s-one"));
+    let lane = verdict_lane("lab", &to_person, Some("t0ne0000000"));
     let (floor, _) = writer
         .oldest(&format!("{lane}/answer"))
         .expect("the answers' oldest");
@@ -4193,36 +4240,39 @@ fn an_ask_whose_askers_later_answer_was_given_up_is_counted_unjudged() {
 fn an_asks_verdicts_are_read_on_its_askers_lane() {
     let lane = |subject: &str, from: Option<&str>| verdict_lane("lab", subject, from);
     assert_eq!(
-        lane("/f/lab/in/p/h-jsmith/n-a/ask", Some("s-one")),
-        "/f/lab/in/n-a/s-one/*"
+        lane("/f/lab/in/p/h-jsmith/n-a/ask", Some("t0ne0000000")),
+        "/f/lab/in/n-a/t0ne0000000/*"
     );
     assert_eq!(
-        lane("/f/lab/in/n-b/s-two/n-a/ask", Some("s-one")),
-        "/f/lab/in/n-a/s-one/*"
+        lane("/f/lab/in/n-b/ttw00000000/n-a/ask", Some("t0ne0000000")),
+        "/f/lab/in/n-a/t0ne0000000/*"
     );
     assert_eq!(
-        lane("/f/lab/in/n-a/s-one/h-jsmith/ask", None),
+        lane("/f/lab/in/n-a/t0ne0000000/h-jsmith/ask", None),
         "/f/lab/in/p/h-jsmith/*"
     );
     for (subject, from) in [
-        ("/f/lab/in/n-b/s-two/n-a/ask", None),
-        ("/f/lab/in/n-b/s-two/n-a/ask", Some("s-Bad")),
-        ("/f/lab/in/n-b/s-two/s-one/ask", Some("s-one")),
+        ("/f/lab/in/n-b/ttw00000000/n-a/ask", None),
+        ("/f/lab/in/n-b/ttw00000000/n-a/ask", Some("s-Bad")),
+        (
+            "/f/lab/in/n-b/ttw00000000/t0ne0000000/ask",
+            Some("t0ne0000000"),
+        ),
     ] {
         assert_eq!(lane(subject, from), "/f/lab/in/*/*/*", "{subject} {from:?}");
     }
-    let verdicts = "/f/lab/in/n-b/s-two/*/answer";
+    let verdicts = "/f/lab/in/n-b/ttw00000000/*/answer";
     assert_eq!(
         filter_meet(verdicts, "/f/lab/in/>").as_deref(),
         Some(verdicts)
     );
     assert_eq!(
         filter_meet(verdicts, "/f/lab/in/*/*/n-a/*").as_deref(),
-        Some("/f/lab/in/n-b/s-two/n-a/answer")
+        Some("/f/lab/in/n-b/ttw00000000/n-a/answer")
     );
     assert_eq!(
         filter_meet("/f/lab/in/*/*/n-a/*", verdicts).as_deref(),
-        Some("/f/lab/in/n-b/s-two/n-a/answer")
+        Some("/f/lab/in/n-b/ttw00000000/n-a/answer")
     );
     assert_eq!(filter_meet(verdicts, "/f/lab/in/n-a/>"), None);
     assert_eq!(filter_meet(verdicts, "/f/lab/in/*/*/*"), None);
@@ -4308,7 +4358,7 @@ fn the_status_reports_only_a_halt_a_bridge_applies() {
 #[test]
 fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
     let now = 100 * 60 * 1000u64;
-    let lane = |src: &str, kind: &str| format!("/f/lab/in/n-a/s-one/{src}/{kind}");
+    let lane = |src: &str, kind: &str| format!("/f/lab/in/n-a/t0ne0000000/{src}/{kind}");
     let rec = |off: u64, subject: String, body: &str| (off, subject, body.as_bytes().to_vec());
     let records = vec![
         rec(
@@ -4324,13 +4374,16 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
         rec(
             45,
             lane("n-b", "answer"),
-            &format!("v=1 t={} from=s-two re=41 text=done", now - 5 * 60 * 1000),
+            &format!(
+                "v=1 t={} from=ttw00000000 re=41 text=done",
+                now - 5 * 60 * 1000
+            ),
         ),
         rec(
             42,
             lane("n-b", "ask"),
             &format!(
-                "v=1 t={} from=s-two dl=600000 text=why",
+                "v=1 t={} from=ttw00000000 dl=600000 text=why",
                 now - 20 * 60 * 1000
             ),
         ),
@@ -4380,8 +4433,8 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
     );
     assert_eq!(overdue[0].late_ms, 10 * 60 * 1000);
     assert_eq!(overdue[0].from, "h-andrew");
-    assert_eq!(overdue[0].to, "s-one@n-a");
-    assert_eq!(overdue[1].from, "s-two@n-b");
+    assert_eq!(overdue[0].to, "t0ne0000000@n-a");
+    assert_eq!(overdue[1].from, "ttw00000000@n-b");
 
     let mut r = healthy();
     r.overdue = overdue;
@@ -4404,7 +4457,7 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
     one(&r, "fabric=disconnected");
 
     r.instances[0].sessions[0].posts = Some(3);
-    one(&r, "@s-one");
+    one(&r, "@t0ne0000000");
 
     let mut r = healthy();
     r.instances[0].command = Some(words(
@@ -4510,16 +4563,16 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
             b"v=1 t=1 state=live fabric=connected",
         ),
         (
-            "/f/lab/pub/n-a/s-one/presence",
+            "/f/lab/pub/n-a/t0ne0000000/presence",
             b"v=1 t=1 state=live hold=0",
         ),
         (
-            "/f/lab/pub/n-a/s-ghost/presence",
+            "/f/lab/pub/n-a/tghpst00000/presence",
             b"v=1 t=1 state=live hold=0",
         ),
-        ("/f/lab/pub/n-a/s-gone/presence", fresh_gone.as_bytes()),
+        ("/f/lab/pub/n-a/tgpne000000/presence", fresh_gone.as_bytes()),
         (
-            "/f/lab/pub/n-far/s-far/presence",
+            "/f/lab/pub/n-far/tfar0000000/presence",
             b"v=1 t=1 state=live hold=0",
         ),
     ];
@@ -4541,23 +4594,23 @@ fn an_ask_past_its_deadline_with_no_reply_is_a_warning() {
     assert_eq!(
         joined,
         vec![
-            ("s-one", Some(100), "live"),
-            ("s-far", None, "live"),
-            ("s-ghost", None, "live"),
-            ("s-gone", None, "gone"),
+            ("t0ne0000000", Some(100), "live"),
+            ("tfar0000000", None, "live"),
+            ("tghpst00000", None, "live"),
+            ("tgpne000000", None, "gone"),
         ],
         "local rows first, then the bus-only ones by sid; a recently retired \
          local row is LISTED as `gone` rather than counted"
     );
     assert_eq!(r.exited, 0, "nothing here is old enough to be a bare count");
     let w = warned(&r);
-    assert!(w.iter().any(|l| l.contains("@s-ghost")), "{w:#?}");
+    assert!(w.iter().any(|l| l.contains("@tghpst00000")), "{w:#?}");
     assert!(
-        !w.iter().any(|l| l.contains("@s-gone")),
+        !w.iter().any(|l| l.contains("@tgpne000000")),
         "a retired row is not advertised live and must not be warned about: {w:#?}"
     );
     assert!(
-        !w.iter().any(|l| l.contains("@s-far")),
+        !w.iter().any(|l| l.contains("@tfar0000000")),
         "a REMOTE node's session is not this machine's to host: {w:#?}"
     );
 }
@@ -4572,7 +4625,7 @@ fn a_will_reads_away_and_so_do_the_rows_it_left_live() {
             b"v=1 t=1 state=live fabric=connected",
         ),
         (
-            "/f/lab/pub/n-a/s-one/presence",
+            "/f/lab/pub/n-a/t0ne0000000/presence",
             b"v=1 t=1 state=live hold=0",
         ),
         (
@@ -4584,14 +4637,17 @@ fn a_will_reads_away_and_so_do_the_rows_it_left_live() {
             b"v=1 t=1 state=gone inc=2 fabric=disconnected",
         ),
         (
-            "/f/lab/pub/n-far/s-far/presence",
+            "/f/lab/pub/n-far/tfar0000000/presence",
             b"v=1 t=1 state=live hold=0",
         ),
         (
-            "/f/lab/pub/n-old/s-old/presence",
+            "/f/lab/pub/n-old/tpmd0000000/presence",
             b"v=1 t=1 state=live hold=0",
         ),
-        ("/f/lab/pub/n-a/s-ended/presence", fresh_exited.as_bytes()),
+        (
+            "/f/lab/pub/n-a/tended00000/presence",
+            fresh_exited.as_bytes(),
+        ),
     ];
     let glance = crate::glance::Glance {
         fleet: "lab".to_string(),
@@ -4611,10 +4667,10 @@ fn a_will_reads_away_and_so_do_the_rows_it_left_live() {
     assert_eq!(
         joined,
         vec![
-            ("s-one", "live"),
-            ("s-ended", "gone"),
-            ("s-far", "away"),
-            ("s-old", "away"),
+            ("t0ne0000000", "live"),
+            ("tended00000", "gone"),
+            ("tfar0000000", "away"),
+            ("tpmd0000000", "away"),
         ]
     );
     assert_eq!(
@@ -4708,13 +4764,13 @@ fn the_subject_count_is_read_off_a_guarded_broker_through_the_nodes_ring() {
         &[
             "/f/lab/pub/n-a/node/presence",
             "/f/lab/pub/n-a/node/ev",
-            "/f/lab/pub/n-a/s-1/presence",
-            "/f/lab/pub/n-a/s-1/ev",
-            "/f/lab/pub/n-a/s-2/presence",
-            "/f/lab/pub/n-a/s-1/say/lab",
-            "/f/lab/in/n-b/s-9/n-a/ask",
-            "/f/lab/in/n-b/s-9/n-a/ask",
-            "/f/lab/in/n-b/s-8/n-a/note",
+            "/f/lab/pub/n-a/t0000000001/presence",
+            "/f/lab/pub/n-a/t0000000001/ev",
+            "/f/lab/pub/n-a/t0000000002/presence",
+            "/f/lab/pub/n-a/t0000000001/say/lab",
+            "/f/lab/in/n-b/t0000000009/n-a/ask",
+            "/f/lab/in/n-b/t0000000009/n-a/ask",
+            "/f/lab/in/n-b/t0000000008/n-a/note",
             "/f/lab/pub/n-a/node/presence",
         ],
     );
@@ -4724,8 +4780,8 @@ fn the_subject_count_is_read_off_a_guarded_broker_through_the_nodes_ring() {
         "n-b",
         &[
             "/f/lab/pub/n-b/node/presence",
-            "/f/lab/pub/n-b/s-9/presence",
-            "/f/lab/in/n-a/s-1/n-b/ask",
+            "/f/lab/pub/n-b/t0000000009/presence",
+            "/f/lab/in/n-a/t0000000001/n-b/ask",
         ],
     );
     assert_eq!(subjects_of(&mut a, "lab", "n-a").expect("counted"), 8);
@@ -4738,7 +4794,7 @@ fn the_report_prints_no_body() {
     r.traffic = vec![traffic_of(
         "lab",
         7,
-        "/f/lab/in/n-a/s-one/h-andrew/task",
+        "/f/lab/in/n-a/t0ne0000000/h-andrew/task",
         b"v=1 t=6000000 text=the%20secret%20plan",
         0,
     )];
@@ -4757,15 +4813,18 @@ fn the_report_prints_no_body() {
 fn a_retire_refusal_event_names_its_sid() {
     for (ev, sid) in [
         (
-            "presence-retire-refused sid=s-x reason=hosted pid=42",
-            Some("s-x"),
+            "presence-retire-refused sid=tx000000000 reason=hosted pid=42",
+            Some("tx000000000"),
         ),
         (
-            "presence-retire-refused sid=s-y reason=unaskable",
-            Some("s-y"),
+            "presence-retire-refused sid=ty000000000 reason=unaskable",
+            Some("ty000000000"),
         ),
-        ("presence-retire-refused sid=s-z reason=new", Some("s-z")),
-        ("presence-retired sid=s-x reason=operator", None),
+        (
+            "presence-retire-refused sid=tz000000000 reason=new",
+            Some("tz000000000"),
+        ),
+        ("presence-retired sid=tx000000000 reason=operator", None),
         ("presence-retire-refused reason=hosted", None),
     ] {
         assert_eq!(
@@ -4819,14 +4878,14 @@ fn reports_tails_and_inboxes_label_offsets_across_daylight_saving() {
         traffic_of(
             "f",
             1,
-            "/f/f/in/n-1/s-1/h-a/note",
+            "/f/f/in/n-1/t0000000001/h-a/note",
             format!("v=1 t={pre_ms} text=pre").as_bytes(),
             now_ms,
         ),
         traffic_of(
             "f",
             2,
-            "/f/f/in/n-1/s-1/h-a/note",
+            "/f/f/in/n-1/t0000000001/h-a/note",
             format!("v=1 t={post_ms} text=post").as_bytes(),
             now_ms,
         ),
@@ -4847,7 +4906,7 @@ fn reports_tails_and_inboxes_label_offsets_across_daylight_saving() {
     let tail_pre = tail.record_at(
         "f",
         1,
-        "/f/f/in/n-1/s-1/h-a/note",
+        "/f/f/in/n-1/t0000000001/h-a/note",
         format!("v=1 t={pre_ms} text=pre").as_bytes(),
         now_ms,
         &la_at,
@@ -4855,7 +4914,7 @@ fn reports_tails_and_inboxes_label_offsets_across_daylight_saving() {
     let tail_post = tail.record_at(
         "f",
         2,
-        "/f/f/in/n-1/s-1/h-a/note",
+        "/f/f/in/n-1/t0000000001/h-a/note",
         format!("v=1 t={post_ms} text=post").as_bytes(),
         now_ms,
         &la_at,

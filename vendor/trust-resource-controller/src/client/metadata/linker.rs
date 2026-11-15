@@ -15,7 +15,7 @@ pub struct LinkerResult {
 }
 #[derive(Debug)]
 pub enum LinkerOutcome {
-    Completed(LinkerResult),
+    Completed(Box<LinkerResult>),
     /// Same host positively refused before execution and closed its streams.
     Refused(String),
 }
@@ -127,14 +127,14 @@ impl LinkerMember {
                     }
                     self.inner.poisoned = true;
                     self.inner.result_delivered = true;
-                    Ok(Some(LinkerOutcome::Completed(LinkerResult {
+                    Ok(Some(LinkerOutcome::Completed(Box::new(LinkerResult {
                         prepared,
                         started,
                         completion,
                         stdout: std::mem::take(&mut self.inner.streams.output.bytes[0]),
                         stderr: std::mem::take(&mut self.inner.streams.output.bytes[1]),
                         output_limit_exceeded: self.inner.streams.output.exceeded,
-                    })))
+                    }))))
                 }
             })();
         if result.is_err() {

@@ -501,6 +501,8 @@ fn shape_of(ev: &StepEvent) -> Option<String> {
         StepEvent::Compact => Some("compact".to_string()),
         StepEvent::Model { .. } => Some("model".to_string()),
         StepEvent::Off { .. } => Some("off".to_string()),
+        // Counted apart ([`reduce::Readings::lost`]), never a step of the readings.
+        StepEvent::Lost { .. } => None,
     }
 }
 

@@ -11,13 +11,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use aterm_digest::Sha256;
 use serde::Deserialize;
 
 use crate::trust_facts::{hex, one_line, one_line_owned};
+
+#[path = "trust_oblig_snapshot.rs"]
+mod snapshot;
 
 /// The record's first line.
 pub const RECORD_MAGIC: &str = "# aterm trust obligations 2";
@@ -569,45 +571,108 @@ fn package_of(unit: &str) -> Option<&str> {
 }
 
 /// The sources a check's spans point into, read once each.
-struct Sources<'a> {
-    repo: &'a Path,
+struct Sources {
+    repo: PathBuf,
     /// The repository as the file system names it (cargo may print either).
-    repo_real: Option<PathBuf>,
+    repo_real: PathBuf,
+    /// Every source read walks below this pinned directory, never a replaced path.
+    directory: fs::File,
     /// Repo-relative directories a relative path may be relative to.
     bases: Vec<String>,
     resolved: BTreeMap<String, (String, bool)>,
     lines: BTreeMap<String, Vec<String>>,
 }
 
-impl<'a> Sources<'a> {
-    fn new(repo: &'a Path, manifest: Option<&str>) -> std::result::Result<Sources<'a>, String> {
+impl Sources {
+    fn new(repo: &Path, manifest: Option<&str>) -> std::result::Result<Sources, String> {
+        let absolute = if repo.is_absolute() {
+            repo.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| format!("the current directory: {e}"))?
+                .join(repo)
+        };
+        let repo = lexical_path(&absolute)?;
+        let repo_real = fs::canonicalize(&absolute)
+            .map_err(|e| format!("the checkout {}: {e}", absolute.display()))?;
+        if fs::canonicalize(&repo).map_err(|e| format!("the checkout {}: {e}", repo.display()))?
+            != repo_real
+        {
+            return Err(format!(
+                "the checkout {} changes meaning when parent components are folded",
+                absolute.display()
+            ));
+        }
+        #[cfg(unix)]
+        let directory = aterm_dirfd::openat(
+            aterm_dirfd::CWD,
+            &repo_real,
+            aterm_dirfd::OFlags::RDONLY
+                | aterm_dirfd::OFlags::DIRECTORY
+                | aterm_dirfd::OFlags::NOFOLLOW
+                | aterm_dirfd::OFlags::CLOEXEC,
+            aterm_dirfd::Mode::empty(),
+        )
+        .map(fs::File::from);
+        #[cfg(windows)]
+        let directory = aterm_dirfd::pin(&repo_real).map(fs::File::from);
+        #[cfg(not(any(unix, windows)))]
+        let directory: std::io::Result<fs::File> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "confined source reads are unavailable on this platform",
+        ));
+        let directory =
+            directory.map_err(|e| format!("pin the checkout {}: {e}", repo_real.display()))?;
         let mut bases = Vec::new();
         if let Some(m) = manifest {
-            let rel = if Path::new(m).is_absolute() {
-                Path::new(m)
-                    .strip_prefix(repo)
+            let manifest = lexical_path(Path::new(m))?;
+            let relative = if manifest.is_absolute() {
+                manifest
+                    .strip_prefix(&repo)
+                    .or_else(|_| manifest.strip_prefix(&repo_real))
                     .map_err(|_| {
                         format!("the manifest {m} is not in the checkout {}", repo.display())
                     })?
-                    .to_string_lossy()
-                    .into_owned()
             } else {
-                m.to_string()
+                manifest.as_path()
             };
+            let rel = source_name(relative)?;
+            // The manifest's parent determines every lookup base. Refuse a physical escape
+            // here even when the manifest itself has not been written yet.
+            let original = if Path::new(m).is_absolute() {
+                PathBuf::from(m)
+            } else {
+                repo_real.join(m)
+            };
+            let normalized = repo_real.join(&rel);
+            let parent = normalized
+                .parent()
+                .ok_or_else(|| format!("the manifest {m} has no parent"))?;
+            let original_parent = original
+                .parent()
+                .ok_or_else(|| format!("the manifest {m} has no parent"))?;
+            physical_source(original_parent, parent, &repo_real)
+                .map_err(|e| format!("the manifest {m}: {e}"))?;
+            match physical_source(&original, &normalized, &repo_real) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(format!("the manifest {m}: {e}"));
+                }
+                _ => {}
+            }
             let mut dir = Path::new(&rel).parent().map(Path::to_path_buf);
             while let Some(d) = dir {
-                let s = d.to_string_lossy().into_owned();
-                if s.is_empty() {
+                if d.as_os_str().is_empty() {
                     break;
                 }
-                bases.push(s);
+                bases.push(source_name(&d)?);
                 dir = d.parent().map(Path::to_path_buf);
             }
         }
         bases.push(String::new());
         Ok(Sources {
             repo,
-            repo_real: fs::canonicalize(repo).ok(),
+            repo_real,
+            directory,
             bases,
             resolved: BTreeMap::new(),
             lines: BTreeMap::new(),
@@ -628,15 +693,18 @@ impl<'a> Sources<'a> {
         if raw.is_empty() || raw.chars().any(char::is_control) {
             return Err(format!("a location in no file (`{}`)", one_line(raw)));
         }
-        if raw.starts_with('/') {
-            for root in std::iter::once(self.repo).chain(self.repo_real.as_deref()) {
-                if let Ok(rest) = Path::new(raw).strip_prefix(root) {
-                    let rel = rest.to_string_lossy().into_owned();
-                    valid_file(&rel)?;
-                    if self.repo.join(&rel).is_file() {
-                        return Ok((rel, true));
-                    }
-                    return Err(format!("{raw} names no file in the checkout"));
+        #[cfg(windows)]
+        let normalized = raw.replace('\\', "/");
+        #[cfg(windows)]
+        let raw = normalized.as_str();
+        if raw.starts_with('/') || Path::new(raw).is_absolute() {
+            let path = lexical_path(Path::new(raw))?;
+            for root in [&self.repo, &self.repo_real] {
+                if let Ok(rest) = path.strip_prefix(root) {
+                    let rel = source_name(rest)?;
+                    self.open_source_spelled(Path::new(raw), &rel)
+                        .map_err(|e| format!("{raw}: {e}"))?;
+                    return Ok((rel, true));
                 }
             }
             if let Some(rest) = sysroot_tail(raw) {
@@ -658,6 +726,8 @@ impl<'a> Sources<'a> {
         }
         let folded = fold_parents(raw)
             .ok_or_else(|| format!("{raw} is a relative path of no form this gate knows"))?;
+        source_name(Path::new(&folded))?;
+        let original = raw;
         let raw = folded.as_str();
         for base in &self.bases {
             let rel = if base.is_empty() {
@@ -665,8 +735,11 @@ impl<'a> Sources<'a> {
             } else {
                 format!("{base}/{raw}")
             };
-            if self.repo.join(&rel).is_file() {
-                return Ok((rel, true));
+            valid_file(&rel)?;
+            match self.open_source_spelled(&self.repo_real.join(base).join(original), &rel) {
+                Ok(_) => return Ok((rel, true)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{rel}: {e}")),
             }
         }
         // A toolchain library's file, as one prover names it (`core/src/…`) or another, from its
@@ -689,11 +762,70 @@ impl<'a> Sources<'a> {
         ))
     }
 
+    /// Resolve links using metadata alone, then open every physical component below the
+    /// pinned checkout with no-follow handles. A directory replaced by a link cannot redirect
+    /// the read between the containment check and the open.
+    fn open_source(&self, rel: &str) -> std::io::Result<fs::File> {
+        self.open_source_spelled(&self.repo_real.join(rel), rel)
+    }
+
+    fn open_source_spelled(&self, original: &Path, rel: &str) -> std::io::Result<fs::File> {
+        use std::io::{Error, ErrorKind};
+        let rel =
+            source_name(Path::new(rel)).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+        let physical = physical_source(original, &self.repo_real.join(rel), &self.repo_real)?;
+        let relative = physical
+            .strip_prefix(&self.repo_real)
+            .map_err(|_| Error::other("validated source lost its checkout prefix"))?;
+        let name = source_name(relative).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+        #[cfg(any(unix, windows))]
+        {
+            let mut file = self.directory.try_clone()?;
+            let mut parts = name.split('/').peekable();
+            while let Some(part) = parts.next() {
+                let mut flags = aterm_dirfd::OFlags::RDONLY
+                    | aterm_dirfd::OFlags::NOFOLLOW
+                    | aterm_dirfd::OFlags::CLOEXEC
+                    | aterm_dirfd::OFlags::NONBLOCK;
+                if parts.peek().is_some() {
+                    flags |= aterm_dirfd::OFlags::DIRECTORY;
+                }
+                file = aterm_dirfd::openat(&file, part, flags, aterm_dirfd::Mode::empty())?.into();
+            }
+            if !file.metadata()?.is_file() {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "source is not a regular file",
+                ));
+            }
+            Ok(file)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = name;
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "confined source reads are unavailable",
+            ))
+        }
+    }
+
     /// An in-tree file's lines, read once.
     fn lines(&mut self, rel: &str) -> std::result::Result<&[String], String> {
         if !self.lines.contains_key(rel) {
-            let text = crate::durable::read_text(&self.repo.join(rel))
+            use std::io::Read as _;
+            let file = self.open_source(rel).map_err(|e| format!("{rel}: {e}"))?;
+            let max = crate::durable::MAX_RELEASE_FILE_BYTES;
+            if file.metadata().map_err(|e| format!("{rel}: {e}"))?.len() > max {
+                return Err(format!("{rel}: source exceeds the release file bound"));
+            }
+            let mut text = String::new();
+            file.take(max + 1)
+                .read_to_string(&mut text)
                 .map_err(|e| format!("{rel}: {e}"))?;
+            if u64::try_from(text.len()).unwrap_or(u64::MAX) > max {
+                return Err(format!("{rel}: source exceeds the release file bound"));
+            }
             let lines = text
                 .split('\n')
                 .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
@@ -702,6 +834,68 @@ impl<'a> Sources<'a> {
         }
         Ok(self.lines.get(rel).map_or(&[], Vec::as_slice))
     }
+}
+
+/// Native `link/..` resolution must stay inside the checkout and name the same target as
+/// lexical folding. Only metadata is followed until this comparison succeeds.
+fn physical_source(original: &Path, folded: &Path, root: &Path) -> std::io::Result<PathBuf> {
+    let physical = fs::canonicalize(original)?;
+    if !physical.starts_with(root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "source is outside the physical checkout",
+        ));
+    }
+    let normalized = fs::canonicalize(folded)?;
+    if !normalized.starts_with(root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "source is outside the physical checkout",
+        ));
+    }
+    if physical != normalized {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source changes meaning when parent components are folded",
+        ));
+    }
+    Ok(physical)
+}
+
+/// Fold a path before any prefix comparison; `..` may never walk above its root.
+fn lexical_path(path: &Path) -> std::result::Result<PathBuf, String> {
+    use std::path::Component;
+    let mut clean = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if clean.file_name().is_none() || !clean.pop() {
+                    return Err(format!("{} escapes its path root", path.display()));
+                }
+            }
+            _ => clean.push(part.as_os_str()),
+        }
+    }
+    Ok(clean)
+}
+
+/// A record name made from relative native path components, never a root or drive prefix.
+fn source_name(path: &Path) -> std::result::Result<String, String> {
+    let parts = path
+        .components()
+        .map(|part| match part {
+            std::path::Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| format!("{} is not a relative source name", path.display()))?;
+    let name = parts.join("/");
+    if name.starts_with('@') {
+        return Err(format!("{name} is not a checkout source name"));
+    }
+    valid_file(&name)?;
+    Ok(name)
 }
 
 /// `…/library/<sysroot crate>/<rest>` -> `<sysroot crate>/<rest>`.
@@ -873,9 +1067,8 @@ pub fn reduce(
     let file = crate::durable::open_regular_file(report)
         .map_err(|e| format!("{}: {e}", report.display()))?;
     let mut src = Sources::new(repo, manifest)?;
-    let mut reader = BufReader::new(file);
-    let mut buf = Vec::new();
-    let mut n = 0usize;
+    let snapshot =
+        snapshot::Snapshot::read(file).map_err(|e| format!("{}: {e}", report.display()))?;
     let mut unit: Option<String> = None;
     let mut footer = false;
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -883,23 +1076,15 @@ pub fn reduce(
         package: package.to_string(),
         ..Record::default()
     };
-    const MAX_REPORT_LINE_BYTES: usize = 16 * 1024 * 1024;
-    loop {
-        use std::io::Read as _;
-        buf.clear();
-        let got = (&mut reader)
-            .take((MAX_REPORT_LINE_BYTES + 1) as u64)
-            .read_until(b'\n', &mut buf)
-            .map_err(|e| format!("{}: {e}", report.display()))?;
-        if got == 0 {
-            break;
-        }
-        n += 1;
-        if buf.len() > MAX_REPORT_LINE_BYTES {
-            return Err(format!("line {n} exceeds {MAX_REPORT_LINE_BYTES} bytes"));
-        }
+    const RETAINED_RECORD_BUDGET: usize = 16 * 1024 * 1024;
+    for (i, mut buf) in snapshot
+        .bytes()
+        .split_inclusive(|b| *b == b'\n')
+        .enumerate()
+    {
+        let n = i + 1;
         while matches!(buf.last(), Some(b'\n' | b'\r')) {
-            buf.pop();
+            buf = &buf[..buf.len() - 1];
         }
         if footer {
             return Err(format!("line {n} follows the footer"));
@@ -907,7 +1092,7 @@ pub fn reduce(
         if buf.is_empty() {
             return Err(format!("line {n} is empty"));
         }
-        let raw: RawRecord = aterm_json::from_slice(&buf)
+        let raw: RawRecord = aterm_json::from_slice_with_budget(buf, RETAINED_RECORD_BUDGET)
             .map_err(|e| format!("line {n} is not a report record: {e}"))?;
         let schema_ok = |what: &str| match raw.schema.as_deref() {
             Some(REPORT_SCHEMA) => Ok(()),
@@ -1041,7 +1226,7 @@ fn kept_desc(d: &str) -> String {
 fn obligation(
     function: &str,
     o: RawObligation,
-    src: &mut Sources<'_>,
+    src: &mut Sources,
 ) -> std::result::Result<Obligation, String> {
     valid_kind(&o.kind)?;
     let outcome = RawOutcome::of(o.outcome)?;
@@ -1100,6 +1285,62 @@ pub struct ReduceArgs {
     pub out: PathBuf,
 }
 
+/// Parse the standalone reducer, which reads an existing report and changes
+/// neither stored proof facts nor ratchets.
+///
+/// # Errors
+/// An unknown or repeated flag, a missing value, or a missing required flag.
+pub fn parse_reduce<'a>(
+    it: &mut impl Iterator<Item = &'a str>,
+) -> std::result::Result<ReduceArgs, String> {
+    let mut flags = BTreeMap::new();
+    while let Some(flag) = it.next() {
+        if !matches!(
+            flag,
+            "--report" | "--package" | "--repo" | "--out" | "--manifest-path"
+        ) {
+            return Err(format!("trust reduce: unknown flag {flag:?}"));
+        }
+        let value = it
+            .next()
+            .filter(|v| !v.is_empty() && !v.starts_with('-'))
+            .ok_or_else(|| format!("trust reduce: {flag} needs a value"))?;
+        if flags.insert(flag, value).is_some() {
+            return Err(format!("trust reduce: {flag} given twice"));
+        }
+    }
+    let required = |flag| {
+        flags
+            .get(flag)
+            .copied()
+            .ok_or_else(|| format!("trust reduce needs {flag}"))
+    };
+    Ok(ReduceArgs {
+        report: PathBuf::from(required("--report")?),
+        package: required("--package")?.into(),
+        repo: PathBuf::from(required("--repo")?),
+        out: PathBuf::from(required("--out")?),
+        manifest: flags.get("--manifest-path").map(|v| (*v).into()),
+    })
+}
+
+/// Reduce an existing report to a new output path. Publishing uses an atomic
+/// hard link to a completed staging file, so even an output created during the
+/// reduction is refused rather than replaced.
+///
+/// # Errors
+/// An invalid report, an occupied output path, or a failed file operation.
+pub fn write_new_record(args: &ReduceArgs) -> std::result::Result<Record, String> {
+    let rec = reduce(
+        &args.report,
+        &args.package,
+        &args.repo,
+        args.manifest.as_deref(),
+    )?;
+    publish_record(args, &rec, false)?;
+    Ok(rec)
+}
+
 /// Reduce one check's report and write its record (whole, or nothing).
 ///
 /// # Errors
@@ -1113,24 +1354,35 @@ pub fn write_record(args: &ReduceArgs) -> std::result::Result<Record, String> {
         args.manifest.as_deref(),
     )
     .and_then(|rec| {
-        let dir = args.out.parent().unwrap_or_else(|| Path::new("."));
-        let write = || -> std::io::Result<()> {
-            fs::create_dir_all(dir)?;
-            let stage = aterm_tempfile::Builder::new()
-                .prefix(".oblig-")
-                .suffix(".noindex")
-                .tempdir_in(dir)?;
-            let staged = stage.path().join("record.tsv");
-            crate::durable::open_create_new(&staged).and_then(|mut f| {
-                use std::io::Write as _;
-                f.write_all(rec.to_text().as_bytes())
-            })?;
-            fs::rename(&staged, &args.out)
-        };
-        write()
-            .map_err(|e| format!("{}: {e}", args.out.display()))
-            .map(|()| rec)
+        publish_record(args, &rec, true)?;
+        Ok(rec)
     })
+}
+
+fn publish_record(
+    args: &ReduceArgs,
+    rec: &Record,
+    replace: bool,
+) -> std::result::Result<(), String> {
+    let dir = args.out.parent().unwrap_or_else(|| Path::new("."));
+    let write = || -> std::io::Result<()> {
+        fs::create_dir_all(dir)?;
+        let stage = aterm_tempfile::Builder::new()
+            .prefix(".oblig-")
+            .suffix(".noindex")
+            .tempdir_in(dir)?;
+        let staged = stage.path().join("record.tsv");
+        crate::durable::open_create_new(&staged).and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(rec.to_text().as_bytes())
+        })?;
+        if replace {
+            fs::rename(&staged, &args.out)
+        } else {
+            fs::hard_link(&staged, &args.out)
+        }
+    };
+    write().map_err(|e| format!("{}: {e}", args.out.display()))
 }
 #[cfg(test)]
 #[path = "trust_oblig_tests.rs"]

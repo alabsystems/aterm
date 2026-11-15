@@ -210,11 +210,27 @@ fn a_retained_helper_cannot_acquire_a_verb_from_a_newer_producer() {
     });
 }
 
+#[track_caller]
 fn run(shim: &Path, words: &[&str]) -> std::process::Output {
+    let call = std::panic::Location::caller();
     let mut command = aterm_uds::spawnfd::command(shim);
     command.args(words).env_clear().env("TERM_PROGRAM", "aterm");
-    let output =
-        aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN).unwrap();
+    #[cfg(target_vendor = "apple")]
+    let output = {
+        let held = aterm_uds::deadline::Held::start(&mut command)
+            .unwrap_or_else(|error| panic!("shim preparation at {call}: {command:?}: {error}"));
+        let pid = held.id();
+        held.output_until(
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap_or_else(|error| {
+            panic!("shim execution at {call} (pid {pid}): {command:?}: {error}")
+        })
+    };
+    #[cfg(not(target_vendor = "apple"))]
+    let output = aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+        .unwrap_or_else(|error| panic!("shim launch at {call}: {command:?}: {error}"));
     assert!(output.status.success(), "{output:?}");
     output
 }

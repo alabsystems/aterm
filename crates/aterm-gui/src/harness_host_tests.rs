@@ -793,6 +793,7 @@ fn idle_host(sid: &str, agent: Program, switches: Arc<Switches>, hooks: Hooks) -
         background_at: Mutex::default(),
         tasked: Mutex::default(),
         finished: Mutex::default(),
+        goal: Mutex::default(),
         note: Arc::default(),
         clock_hold: Mutex::default(),
         net: NetProbe::new(),
@@ -929,7 +930,7 @@ fn a_hung_landing_look_holds_the_restored_queue_one_bound_at_most() {
                     )
                     .unwrap();
             }
-            Some(restored(sid, "in its tab").snap)
+            Ok(restored(sid, "in its tab").snap)
         });
         if hangs {
             h.acts.point_read = POINT_READ_BOUND;
@@ -1042,7 +1043,7 @@ fn a_landing_whose_look_did_not_come_back_is_not_relaunched_again() {
                 )
                 .unwrap();
         }
-        None
+        Err(NO_AGENT)
     });
     h.acts.adopted_gone = Arc::new(|_, _| None);
     h.acts.point_read = POINT_READ_BOUND;
@@ -1563,7 +1564,7 @@ fn a_landings_look_asks_the_record_where_no_read_reaches_it() {
         (None, LandingLook::Gone),
     ] {
         let mut h = hooks(&world, parking_body(&world));
-        h.acts.snapshot = Arc::new(|_| None);
+        h.acts.snapshot = Arc::new(|_| Err(NO_AGENT));
         h.still_wanted = Arc::new(|_, _| false);
         h.acts.adopted_gone = Arc::new(move |_, _| said);
         let host = HostHandle::start(on(), false, false, h.clone());
@@ -4048,7 +4049,7 @@ fn a_restored_landing_after_the_attach_asks_for_the_next_idle_point() {
     use aterm_agent::harness::relaunch::{AgentRun, AgyRun, MuseRun};
     let world = Arc::new(World::default());
     let mut h = hooks(&world, parking_body(&world));
-    h.acts.snapshot = Arc::new(|_| None);
+    h.acts.snapshot = Arc::new(|_| Err(NO_AGENT));
     h.acts.open = Arc::new(|sid| matches!(sid, "s-m" | "s-y" | "s-c" | "s-x"));
     let host = HostHandle::start(on(), false, false, h.clone());
     let a = Arc::new(Acting::default());
@@ -4733,7 +4734,7 @@ fn every_supervisor_key_reaches_the_engine_and_only_those_restart_it() {
     assert_eq!(opts.policy.trust_roots, ["~/x*", "/y"]);
     assert!(!opts.policy.continue_policy && !opts.policy.retry_api_errors);
     assert_eq!(opts.policy.continue_per_hour, 1);
-    assert_eq!(opts.policy.continue_text, "go");
+    assert_eq!(opts.policy.turn_end.continue_text, "go");
     assert_eq!(
         opts.policy.rules_file.as_deref(),
         Some(std::path::Path::new("/r"))
@@ -8234,12 +8235,12 @@ impl Acting {
                     )
                 }),
                 snapshot: Arc::new(move |sid| {
-                    let (pid, program) = a6.agent_in(sid)?;
+                    let (pid, program) = a6.agent_in(sid).ok_or(NO_AGENT)?;
                     if a6.gone.load(Ordering::SeqCst) || a6.unreadable.load(Ordering::SeqCst) {
-                        return None;
+                        return Err(NO_AGENT);
                     }
                     a6.read.lock().unwrap().push((sid.to_string(), pid));
-                    Some(Snapshot {
+                    Ok(Snapshot {
                         pid,
                         start: a6.start_of(sid, pid),
                         run: if program == Program::Codex {
@@ -8539,6 +8540,7 @@ impl Acting {
                     }
                     *a14f.finished.lock().unwrap()
                 }),
+                goal: Acts::inert().goal,
                 limit_reset: Arc::new(|_| None),
                 transcript_tail: Arc::new(|_| None),
                 repo_work: Arc::new(|_| Default::default()),
@@ -8965,6 +8967,7 @@ fn a_point_resting_only_for_the_carry_on_steps_nothing_else() {
         background_at: Mutex::default(),
         tasked: Mutex::default(),
         finished: Mutex::default(),
+        goal: Mutex::default(),
         note: Arc::default(),
         clock_hold: Mutex::default(),
         net: NetProbe::new(),
@@ -9159,6 +9162,7 @@ fn a_task_done_under_land_is_carried_on_with_nothing_typed() {
         background_at: Mutex::default(),
         tasked: Mutex::default(),
         finished: Mutex::default(),
+        goal: Mutex::default(),
         note: Arc::default(),
         clock_hold: Mutex::default(),
         net: NetProbe::new(),
@@ -9235,6 +9239,7 @@ fn a_relaunchs_owed_carry_on_is_settled_where_its_loop_takes_a_point() {
         background_at: Mutex::default(),
         tasked: Mutex::default(),
         finished: Mutex::default(),
+        goal: Mutex::default(),
         note: Arc::default(),
         clock_hold: Mutex::default(),
         net: NetProbe::new(),
@@ -9651,6 +9656,7 @@ fn the_workers_own_readers_follow_the_agents_record_first() {
             background_at: Mutex::default(),
             tasked: Mutex::default(),
             finished: Mutex::default(),
+            goal: Mutex::default(),
             note: Arc::default(),
             clock_hold: Mutex::default(),
             net: NetProbe::new(),
@@ -9779,7 +9785,14 @@ fn the_transcript_that_confirms_a_wall_is_the_agent_in_the_tab_now() {
     };
     let mut hooks = hooks(&world, parking_body(&world));
     hooks.acts = Acts {
-        snapshot: Arc::new(move |_| r1.lock().unwrap().pop_front().flatten().map(of)),
+        snapshot: Arc::new(move |_| {
+            r1.lock()
+                .unwrap()
+                .pop_front()
+                .flatten()
+                .map(of)
+                .ok_or(NO_AGENT)
+        }),
         transcript_tail: Arc::new(move |snap| {
             a1.lock().unwrap().push(snap.pid.to_string());
             Some(format!("the tail of {}", snap.pid))
@@ -9853,7 +9866,12 @@ fn a_landed_agent_missed_is_read_again_a_production_pause_later() {
     hooks.acts = Acts {
         snapshot: Arc::new(move |_| {
             a1.lock().unwrap().push(Instant::now());
-            r1.lock().unwrap().pop_front().flatten().map(snap)
+            r1.lock()
+                .unwrap()
+                .pop_front()
+                .flatten()
+                .map(snap)
+                .ok_or(NO_AGENT)
         }),
         ..Acts::inert()
     };
@@ -10677,6 +10695,9 @@ mod account_landing_snapshot;
 #[path = "harness_account_served_identity_tests.rs"]
 mod account_served_identity;
 
+#[path = "harness_account_served_back_tests.rs"]
+mod account_served_back;
+
 #[path = "harness_account_immediate_tests.rs"]
 mod account_immediate;
 
@@ -11119,7 +11140,9 @@ impl Accts {
                 };
                 account_wall_of(&a.store(), &a.roster(), sid, &read, a.clock())
             }),
-            snapshot: Arc::new(move |sid| a3.tabs.lock().unwrap().get(sid).cloned()),
+            snapshot: Arc::new(move |sid| {
+                a3.tabs.lock().unwrap().get(sid).cloned().ok_or(NO_AGENT)
+            }),
             account_restart: Arc::new(move |_, _| {
                 let to = a4.asked_to.lock().unwrap().clone();
                 to.filter(|_| a4.ended.load(Ordering::SeqCst))
@@ -11191,7 +11214,7 @@ impl Accts {
 
 fn usage_wall() -> AccountPoint {
     AccountPoint::Wall {
-        kind: aterm_phase::WallKind::UsageSession,
+        kind: alab_policy::vocab::WallKind::UsageSession,
     }
 }
 
@@ -13097,7 +13120,7 @@ fn struck_out(a: &Accts, label: &str, by: &str, at: i64) {
 
 fn login_wall() -> AccountPoint {
     AccountPoint::Wall {
-        kind: aterm_phase::WallKind::Auth,
+        kind: alab_policy::vocab::WallKind::Auth,
     }
 }
 
@@ -13700,7 +13723,7 @@ fn resetting() -> SupervisorConfig {
 
 fn reset_ask(day_start: Option<i64>) -> ResetAsk {
     ResetAsk {
-        kind: aterm_phase::ResetKind::Session,
+        kind: alab_policy::vocab::ResetKind::Session,
         left: 2,
         day: "Oct 5".to_string(),
         day_start,
@@ -13712,7 +13735,7 @@ fn reset_go(until_in: i64, long: bool) -> ResetGo {
         until: ACCT_NOW + until_in,
         long,
         limits: vec!["5-hour".to_string(), "session".to_string()],
-        kind: aterm_phase::ResetKind::Session,
+        kind: alab_policy::vocab::ResetKind::Session,
         left: 2,
         day: "Oct 5".to_string(),
     }
@@ -14215,9 +14238,9 @@ fn a_limit_reset_is_claimed_only_at_the_process_own_wall_with_a_reset_a_grant_cl
     );
 
     for kind in [
-        aterm_phase::ResetKind::Session,
-        aterm_phase::ResetKind::Weekly,
-        aterm_phase::ResetKind::Full,
+        alab_policy::vocab::ResetKind::Session,
+        alab_policy::vocab::ResetKind::Weekly,
+        alab_policy::vocab::ResetKind::Full,
     ] {
         let a = Accts::new();
         walled(&a, sid, ACCT_TALK_A, LONG_WALL);
@@ -14347,7 +14370,7 @@ fn a_limit_reset_qualifies_at_twelve_hours_or_by_a_grant_that_ends_within_a_day(
 
 #[test]
 fn every_takeable_kinds_spent_line_is_a_reset_used() {
-    use aterm_phase::ResetKind;
+    use alab_policy::vocab::ResetKind;
     let sid = "s-reset-kinds";
     const TOLD: i64 = ACCT_NOW + 20;
     let entered = ResetEnd {
@@ -14528,7 +14551,7 @@ fn series_events(a: &Accts, label: &str) -> Vec<account_series::EventSaid> {
 /// holds appends none.
 #[test]
 fn a_reset_offer_first_seen_or_changed_is_one_grant_seen_row() {
-    use aterm_phase::ResetKind;
+    use alab_policy::vocab::ResetKind;
     let sid = "s-reset-series";
     const TOLD: i64 = ACCT_NOW + 20;
     let entered = ResetEnd {
@@ -14730,7 +14753,7 @@ fn a_limit_resets_outcome_is_the_transcripts_line_since_the_claim() {
     let deadline = Some(ACCT_NOW + 2 * 86_400);
     let entered = ResetEnd {
         offer: Some(ResetOffer {
-            kind: aterm_phase::ResetKind::Session,
+            kind: alab_policy::vocab::ResetKind::Session,
             left: 2,
             use_by: deadline,
         }),
@@ -14759,7 +14782,7 @@ fn a_limit_resets_outcome_is_the_transcripts_line_since_the_claim() {
         assert_eq!(
             idle.reset_told(&entered),
             ResetOutcome::Spent {
-                kind: aterm_phase::ResetKind::Session,
+                kind: alab_policy::vocab::ResetKind::Session,
                 asks: asked,
                 left: Some(1),
                 cleared_at: TOLD,
@@ -14991,7 +15014,7 @@ fn a_limit_resets_outcome_is_the_transcripts_line_since_the_claim() {
         assert_eq!(
             idle.reset_told(&entered),
             ResetOutcome::Spent {
-                kind: aterm_phase::ResetKind::Session,
+                kind: alab_policy::vocab::ResetKind::Session,
                 asks: false,
                 left: Some(1),
                 cleared_at: TOLD,
@@ -15200,7 +15223,7 @@ fn a_juniors_yield_holds_its_turn_end_under_a_limit_reset_in_flight() {
     let t = Instant::now();
     let decided = |account| {
         let end = TurnEndReading {
-            phase: aterm_agent::supervise::phase::Phase::Idle,
+            phase: alab_policy::vocab::Phase::Idle,
             authoritative: true,
             composer: Composer::Empty,
             said_tail: Some("Stage 1 is in.".to_string()),
@@ -15305,7 +15328,7 @@ fn a_juniors_yield_at_a_wall_under_a_limit_reset_in_flight_is_asked_again_shortl
         a.worker("s-yield-2", &resetting()),
     );
     let weekly = AccountPoint::Wall {
-        kind: aterm_phase::WallKind::UsageWeekly,
+        kind: alab_policy::vocab::WallKind::UsageWeekly,
     };
     let yielding = junior.account(weekly);
     assert!(
@@ -15317,7 +15340,19 @@ fn a_juniors_yield_at_a_wall_under_a_limit_reset_in_flight_is_asked_again_shortl
         ResetWord::Take(_)
     ));
     let asked = junior.account(weekly);
-    let t = Instant::now();
+    let Some(AccountAdvice::Again {
+        until,
+        why: AskAgain::Reset,
+    }) = &asked
+    else {
+        panic!("the reset asks again: {asked:?}");
+    };
+    assert!(*until <= Instant::now() + RESET_AGAIN_AFTER, "{asked:?}");
+    // Decide at the ask's logical origin. Descheduling this test after the host
+    // answered must not turn its unexpired-advice case into an expired one.
+    let t = until
+        .checked_sub(RESET_AGAIN_AFTER)
+        .expect("the reset ask's logical origin");
     let wall = TurnEndReading {
         composer: Composer::Empty,
         autopilot: Autopilot::Cruise,
@@ -15332,12 +15367,7 @@ fn a_juniors_yield_at_a_wall_under_a_limit_reset_in_flight_is_asked_again_shortl
         matches!(act, TurnEndAction::WaitUntil { until, .. } if until <= t + Duration::from_secs(120)),
         "{asked:?}: {act:?}"
     );
-    assert!(
-        matches!(asked, Some(AccountAdvice::Again { until, why: AskAgain::Reset })
-            if until <= Instant::now() + RESET_AGAIN_AFTER),
-        "{asked:?}"
-    );
-    let again = Instant::now() + RESET_AGAIN_AFTER;
+    let again = t + RESET_AGAIN_AFTER;
     let yields = Some(AccountAdvice::Move {
         to: "work-2".to_string(),
         yields: Some(again - Duration::from_secs(5)),
@@ -15353,7 +15383,7 @@ fn a_juniors_yield_at_a_wall_under_a_limit_reset_in_flight_is_asked_again_shortl
 
 #[test]
 fn the_offer_on_record_is_only_what_was_read_as_one() {
-    use aterm_phase::ResetKind::{Fable, Full, Weekly};
+    use alab_policy::vocab::ResetKind::{Fable, Full, Weekly};
     let end = |offer| ResetEnd {
         offer,
         ..reset_end()
@@ -16200,7 +16230,7 @@ fn a_renewable_login_the_way_back_brought_up_is_moved_back_under_it() {
         (advised, a.state().account("main").auth)
     };
     let lost = AccountPoint::Wall {
-        kind: aterm_phase::WallKind::Auth,
+        kind: alab_policy::vocab::WallKind::Auth,
     };
     assert_eq!(
         came_back(lost),
@@ -19481,7 +19511,7 @@ fn a_relaunch_claim_is_given_back_when_its_landing_read_loses_admission() {
                     Change::Off => switches.agents.store(0, Ordering::SeqCst),
                     Change::ForGood => {
                         left.stop();
-                        return None;
+                        return Err(NO_AGENT);
                     }
                 }
             }
@@ -25002,7 +25032,7 @@ fn shutdown_follows_the_record_after_an_in_flight_worker_read_finishes() {
                 .unwrap()
                 .recv_timeout(Duration::from_secs(60))
                 .expect("worker stopped");
-            Some(before.clone())
+            Ok(before.clone())
         });
         let kept = Arc::clone(&worker.kept);
         let done = Arc::clone(&worker.done);
@@ -25071,7 +25101,7 @@ fn closing_a_restored_queue_during_its_read_preserves_the_snapshot_and_debt() {
                     .recv_timeout(Duration::from_secs(60))
                     .expect("snapshot read released");
             }
-            snapshot.then(|| stale.clone())
+            snapshot.then(|| stale.clone()).ok_or(NO_AGENT)
         });
         let follows = Arc::new(AtomicUsize::new(0));
         let followed = Arc::clone(&follows);
@@ -25455,12 +25485,9 @@ fn pty_job(end: JobEnd) -> (i32, std::process::Child, i32) {
             Ok(())
         });
     }
-    // std's spawn forks and waits for the child's exec without the spawn lock: held across it, the
-    // child copies no neighbour's descriptor between its creation and its close-on-fork mark
-    // (`aterm_uds::kept_out`).
-    let spawning = aterm_uds::spawn_lock::spawning();
-    let leader = cmd.spawn().expect("spawn the session leader");
-    drop(spawning);
+    // The spawn lock is held across std's fork alone, so the child copies no neighbour's
+    // descriptor between its creation and its close-on-fork mark (`aterm_uds::kept_out`).
+    let leader = aterm_uds::spawn_lock::spawn_std(&mut cmd, &[]).expect("spawn the session leader");
     drop(slave);
     let shell = libc::pid_t::try_from(leader.id()).expect("pid");
     let agent = std::cell::Cell::new(0);
@@ -31038,7 +31065,7 @@ impl LookWorld {
                 UpgradeStep::unknown("announced:1")
             }
         });
-        acts.snapshot = Arc::new(|sid| Some(snap(sid)));
+        acts.snapshot = Arc::new(|sid| Ok(snap(sid)));
         let hooks = Hooks {
             roster: Arc::new(Vec::new),
             autopilot: Arc::new(HashMap::new),
@@ -34802,9 +34829,9 @@ fn weekly_limit_reading(t: Instant) -> aterm_agent::supervise::policy::turn_end:
     let rows = aterm_phase::prompt::fixtures::rows(&["⏺ Carrying on.", ""]);
     let wall = "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)";
     TurnEndReading {
-        phase: aterm_agent::supervise::phase::Phase::Idle,
+        phase: alab_policy::vocab::Phase::Idle,
         authoritative: true,
-        wall: Some(aterm_phase::WallKind::UsageWeekly),
+        wall: Some(alab_policy::vocab::WallKind::UsageWeekly),
         wall_message: wall.to_string(),
         said_tail: Some(wall.to_string()),
         reset_at: Some(t + Duration::from_secs(6 * 24 * 3600)),
@@ -35448,7 +35475,7 @@ fn a_superseded_logins_end_strikes_nothing_and_follows_under_a_wall() {
     );
     assert_eq!(a.ledger(), ledger, "nothing recorded");
     let lost = AccountPoint::Wall {
-        kind: aterm_phase::WallKind::Auth,
+        kind: alab_policy::vocab::WallKind::Auth,
     };
     assert_eq!(
         idle.account(lost),
@@ -35905,7 +35932,7 @@ struct TapWorld {
 }
 
 #[cfg(unix)]
-const TAP_SID: &str = "s-7a9";
+const TAP_SID: &str = "t00000007a9";
 #[cfg(unix)]
 const TAP_PID: u32 = 4242;
 
@@ -42824,7 +42851,7 @@ fn an_unnamed_conversation_is_read_again_at_a_look_not_at_once() {
         let read = session.clone();
         hooks.acts = Acts {
             snapshot: Arc::new(move |sid| {
-                Some(Snapshot {
+                Ok(Snapshot {
                     session: read.clone(),
                     ..snap(sid)
                 })
@@ -42860,6 +42887,7 @@ fn an_unnamed_conversation_is_read_again_at_a_look_not_at_once() {
             background_at: Mutex::default(),
             tasked: Mutex::default(),
             finished: Mutex::default(),
+            goal: Mutex::default(),
             note: Arc::default(),
             clock_hold: Mutex::default(),
             net: NetProbe::new(),
@@ -43156,6 +43184,7 @@ fn idle_of(hooks: Hooks, agent: Program, session: Option<String>) -> WorkerIdle 
         background_at: Mutex::default(),
         tasked: Mutex::default(),
         finished: Mutex::default(),
+        goal: Mutex::default(),
         note: Arc::default(),
         clock_hold: Mutex::default(),
         net: NetProbe::new(),
@@ -43202,7 +43231,7 @@ impl GatedRead {
         let held = Arc::clone(self);
         Arc::new(move |sid| {
             held.pass();
-            Some(Snapshot {
+            Ok(Snapshot {
                 session: Some(session.to_string()),
                 ..snap(sid)
             })
@@ -43679,7 +43708,7 @@ fn an_unnamed_conversations_upgrade_wait_climbs_its_ladder() {
         let read = session.clone();
         hooks.acts = Acts {
             snapshot: Arc::new(move |sid| {
-                Some(Snapshot {
+                Ok(Snapshot {
                     session: read.clone(),
                     ..snap(sid)
                 })
@@ -44104,7 +44133,7 @@ fn a_restored_relaunch_that_typed_then_panicked_is_stepped_again_and_said_as_its
             assert!(answer.is_some(), "the step's read fails (a test's)");
             answer.unwrap_or_default().to_string()
         });
-        h.acts.snapshot = Arc::new(|sid| Some(snap(sid)));
+        h.acts.snapshot = Arc::new(|sid| Ok(snap(sid)));
         h.acts.adopted_gone = Arc::new(|_, _| None);
         let host = HostHandle::start(on(), false, false, h);
         host.relaunch_restored(vec![restored_in("s-p1", 5)]);
@@ -44156,7 +44185,7 @@ fn a_landings_look_that_panicked_is_looked_at_again_and_counted() {
         h.acts.snapshot = Arc::new(move |sid| {
             let n = l.fetch_add(1, Ordering::SeqCst) + 1;
             assert!(n > faults, "the landing's read fails (a test's)");
-            Some(snap(sid))
+            Ok(snap(sid))
         });
         h.acts.adopted_gone = Arc::new(|_, _| Some(false));
         let host = HostHandle::start(on(), false, false, h);
@@ -45016,6 +45045,7 @@ fn a_full_disk_withholds_continuations_and_space_back_types_the_resume_once() {
         background_at: Mutex::default(),
         tasked: Mutex::default(),
         finished: Mutex::default(),
+        goal: Mutex::default(),
         note: Arc::default(),
         clock_hold: Mutex::default(),
         net: NetProbe::new(),
@@ -47272,7 +47302,7 @@ fn the_windows_sweeps_present_the_in_memory_token_on_its_own_socket() {
             Default::default(),
         )
     });
-    assert!((acts.snapshot)("s-a").is_none(), "no roster, no snapshot");
+    assert!((acts.snapshot)("s-a").is_err(), "no roster, no snapshot");
     drop(acts);
     let mut view = upgrade_drive::View::default();
     let _ = view.refresh(
@@ -48129,6 +48159,7 @@ fn a_codex_is_told_no_resume_line_and_claude_codes_is_unchanged() {
             background_at: Mutex::default(),
             tasked: Mutex::default(),
             finished: Mutex::default(),
+            goal: Mutex::default(),
             note: Arc::default(),
             clock_hold: Mutex::default(),
             net: NetProbe::new(),
@@ -48920,7 +48951,7 @@ fn worker_idle_agent_resumed_refreshes_an_uncaptured_foreground_snapshot() {
         };
         let mut h = hooks(&world, parking_body(&world));
         h.acts = Acts {
-            snapshot: Arc::new(move |_| present.then(|| snap.clone())),
+            snapshot: Arc::new(move |_| present.then(|| snap.clone()).ok_or(NO_AGENT)),
             follow: Arc::new(move |_, seen| {
                 if seen.pid == 8888 {
                     Foreground::Agent
@@ -48947,7 +48978,7 @@ fn worker_idle_agent_resumed_refreshes_an_uncaptured_foreground_snapshot() {
     };
     assert_eq!(
         check(true, true, Foreground::Agent),
-        Some(AgentResumed {
+        HostAgent::Read(AgentResumed {
             pid: 8888,
             started: Some(expected_started),
             resumed: true,
@@ -48955,7 +48986,7 @@ fn worker_idle_agent_resumed_refreshes_an_uncaptured_foreground_snapshot() {
     );
     assert_eq!(
         check(true, true, Foreground::Other),
-        Some(AgentResumed {
+        HostAgent::Read(AgentResumed {
             pid: 8888,
             started: Some(expected_started),
             resumed: true,
@@ -48964,12 +48995,12 @@ fn worker_idle_agent_resumed_refreshes_an_uncaptured_foreground_snapshot() {
     );
     assert_eq!(
         check(true, false, Foreground::Shell),
-        None,
+        HostAgent::Absent,
         "control: dead kept snapshot at shell prompt reports no foreground agent"
     );
     assert_eq!(
         check(false, true, Foreground::Agent),
-        Some(AgentResumed {
+        HostAgent::Read(AgentResumed {
             pid: 8888,
             started: Some(expected_started),
             resumed: false,
@@ -48978,11 +49009,12 @@ fn worker_idle_agent_resumed_refreshes_an_uncaptured_foreground_snapshot() {
     );
     assert_eq!(
         check(true, false, Foreground::Agent),
-        None,
+        HostAgent::Absent,
         "control: no foreground agent"
     );
 }
 
+#[cfg(unix)] // seeds its pool entry through `vault_entry::put`, a unix-only seam
 #[test]
 fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere() {
     use aterm_agent::harness::claims::{self, Claim, Kind, LeaseKey, Row, Table, Tabled};
@@ -49006,6 +49038,7 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
                 clock: None,
                 skewed: Vec::new(),
                 held: Vec::new(),
+                homes: None,
             })
         }
 
@@ -49021,9 +49054,7 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
 
     let setup = || {
         let a = Accts::new();
-        let secrets = a.tmp.path().join("home/.secrets");
-        std::fs::create_dir_all(&secrets).unwrap();
-        std::fs::write(secrets.join("ai-pool.toml"), "version = 1\n").unwrap();
+        aterm_agent::vault_entry::put(&a.tmp.path().join("home"), "ai-pool.toml", "version = 1\n");
         let dir = |label: &str| a.login_dir(label);
         std::fs::write(
             a.roster_path(),
@@ -49092,6 +49123,7 @@ fn account_move_claims_target_before_restarting_and_refuses_when_held_elsewhere(
                 kind: Kind::Lease,
                 since: ACCT_NOW - 60,
             }],
+            ranks_homes: false,
         },
     );
     let table = Arc::new(TestClaimsTable {
@@ -49798,7 +49830,7 @@ fn agy_limit_until_reads_quota_without_a_session() {
     let due = Arc::new(Mutex::new(Due::No));
     let due_for_act = Arc::clone(&due);
     h.acts.snapshot = Arc::new(|sid| {
-        Some(Snapshot {
+        Ok(Snapshot {
             session: None,
             ..snap(sid)
         })

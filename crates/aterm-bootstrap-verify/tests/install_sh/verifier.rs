@@ -32,7 +32,25 @@ pub fn under_test() -> PathBuf {
 impl Built {
     /// The verifier under test ([`under_test`]).
     pub fn new() -> Self {
-        Self::at(under_test())
+        let built = Self::at(under_test());
+        built.qualify(1);
+        built
+    }
+
+    /// Qualify the private executable before corpus batches, using a harmless invalid invocation.
+    fn qualify(&self, status: i32) {
+        let mut command = aterm_uds::spawnfd::command(&self.exe);
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        let output =
+            aterm_uds::deadline::output_within(&mut command, aterm_uds::deadline::FIRST_EXEC_HANG)
+                .expect("the verifier fixture answers before its measured corpus calls");
+        assert_eq!(output.status.code(), Some(status), "{output:?}");
+        assert!(
+            !output.stdout.is_empty() || !output.stderr.is_empty(),
+            "the verifier fixture's body must show it ran: {output:?}"
+        );
     }
 
     /// The executable at `exe`, held to its own SHA-256.
@@ -217,6 +235,7 @@ fn the_differential_catches_a_verifier_that_drops_the_durable_policy() {
         ("STUB_VERIFIER".into(), s(&under_test()).into()),
         ("STUB_EMPTY_STORE".into(), s(&empty).into()),
     ];
+    forgetful.qualify(1);
     let wrong = chain::differential(&scratch, &forgetful).wrong;
     assert!(
         wrong
@@ -233,7 +252,9 @@ fn the_differential_catches_a_verifier_that_admits_everything() {
         "lenient/aterm-bootstrap-verify",
         "#!/bin/sh\nprintf 'aterm-0.100.0-linux-x86_64\\t%064d\\t80\\t1\\t1\\n' 0\n",
     );
-    let tally = chain::differential(&scratch, &Built::at(stand_in));
+    let lenient = Built::at(stand_in);
+    lenient.qualify(0);
+    let tally = chain::differential(&scratch, &lenient);
     assert!(tally.wrong.len() >= 50, "{} caught", tally.wrong.len());
     assert!(
         tally.wrong.iter().any(|w| w.contains("updater Err")),

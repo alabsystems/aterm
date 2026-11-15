@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use super::probe::{OnDisk, PolicyProbe};
-use crate::supervise::classify::{GLOB_CHARS, TEST_BINARY, TEST_UNARY, glob_match, numeric_format};
+use alab_policy::classify::{GLOB_CHARS, TEST_BINARY, TEST_UNARY, glob_match, numeric_format};
 
 const MKTEMP_NAME: &str = "\u{1}mktemp";
 

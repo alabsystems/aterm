@@ -8,9 +8,14 @@ use aterm_spec::derive::Model;
 /// A want one Mac raises ends fulfilled or retired with a checkable reason; no value reaches a
 /// Mac the policy does not give it to; no request is ever handed to a person. `st`: 0 none,
 /// 1 local (the need ledger), 2 open, 3 offered, 4 published, 5 fulfilled, 6 retired. `why`:
-/// 1 never-stored, 2 never-copied, 3 not-authorized, 4 not-needed, 5 not-held, 7 requester-gone,
-/// 8 lapsed (6, declined, is an earlier build's that nothing writes now). `kind`: 0 copyable,
-/// 1 nowhere, 2 per Mac, 3 vault-only. `wait`, the one party that moves a non-final state:
+/// 2 never-copied, 3 not-authorized, 4 not-needed, 5 not-held, 7 requester-gone, 8 lapsed (1,
+/// never-stored, and 6, declined, are an earlier build's that nothing writes now). `kind`:
+/// 0 copyable, 2 per Mac, 3 vault-only (1, nowhere, was the paper master's before the vault held
+/// it), 4 vault-only with a producer (`claude-token:*`: no Mac
+/// holds a copy to offer, no member sweeps it, no custodian copies it, and its requester ends it
+/// once the vault's log gives it a value in use there, `inuse`, which a refusal there or the
+/// value's end takes out of use again until a person makes a new one). `wait`, the one party that
+/// moves a non-final state:
 /// 1 holders, 2 the custodian, 4 the requester, 5 the founding. `pa` and `okr` record, at the
 /// step that publishes or raises again, whether the law's condition held then, so a mutant of
 /// an honest guard breaks the law, not only a named mutant.
@@ -24,43 +29,48 @@ pub fn credential_request_model() -> Model {
             var commons = 0;
             var auth = 1; var gen = 0; var atgen = 0;
             var inv = 0; var held = 0; var swept = 0; var lost = 0; var need = 1;
-            var wait = 0; var quiet = 0;
+            var wait = 0; var quiet = 0; var inuse = 0;
             var posted = 0; var got = 0; var raises = 0;
             var pa = 0; var okr = 0; var stray = 0; var rogue = 0;
 
             action Raise when (st == 0 && raises == 0) {
                 st = 1; raises = 1; wait = if commons == 1 { 4 } else { 5 };
             }
-            action RaiseNowhere when (st == 0 && raises == 0) { st = 1; kind = 1; raises = 1; wait = 4; }
             action RaisePerMachine when (st == 0 && raises == 0) { st = 1; kind = 2; raises = 1; wait = 4; }
             action RaiseVaultOnly when (st == 0 && raises == 0) {
                 st = 1; kind = 3; raises = 1; wait = if commons == 1 { 4 } else { 5 };
             }
+            action RaiseProducer when (st == 0 && raises == 0) {
+                st = 1; kind = 4; raises = 1; wait = if commons == 1 { 4 } else { 5 };
+            }
             action CommonsReady when (commons == 0) {
                 commons = 1; wait = if st == 1 && wait == 5 { 4 } else { wait };
             }
-            action Catalog when (st == 1 && (kind == 1 || kind == 2)) {
-                st = 6; why = if kind == 1 { 1 } else { 2 }; wait = 0;
+            action Catalog when (st == 1 && kind == 2) { st = 6; why = 2; wait = 0; }
+            action Flush when (st == 1 && commons == 1 && (kind == 0 || kind == 3 || kind == 4) && auth == 1) {
+                st = 2; posted = 1; swept = 0; wait = if kind == 4 { 4 } else { 1 };
             }
-            action Flush when (st == 1 && commons == 1 && (kind == 0 || kind == 3) && auth == 1) {
-                st = 2; posted = 1; swept = 0; wait = 1;
-            }
-            action Unauthorized when ((st == 1 || st == 2) && (kind == 0 || kind == 3) && auth == 0) {
+            action Unauthorized when ((st == 1 || st == 2) && (kind == 0 || kind == 3 || kind == 4) && auth == 0) {
                 st = 6; why = 3; atgen = gen; wait = 0;
             }
             action Stored when (inv == 0 && st > 0 && 4 > st) { inv = 1; }
-            action Widen when (st == 2 && auth == 1 && inv == 1) { st = 4; got = 1; pa = auth; wait = 4; }
+            action Widen when (st == 2 && auth == 1 && inv == 1 && 4 > kind) { st = 4; got = 1; pa = auth; wait = 4; }
             action Arrive when (held == 0 && st > 0 && (kind == 0 || kind == 3)) { held = 1; }
             action Offer when (st == 2 && auth == 1 && inv == 0 && held == 1) { st = 3; wait = 2; }
             action OfferLost when (st == 3 && lost == 0) { st = 2; held = 0; lost = 1; swept = 0; wait = 1; }
             action Publish when (st == 3 && auth == 1) { st = 4; got = 1; inv = 1; pa = auth; wait = 4; }
             action Revoked when (st == 3 && auth == 0) { st = 6; why = 3; atgen = gen; wait = 0; }
             action Apply when (st == 4) { st = 5; wait = 0; }
-            action Sweep when (st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 0) { swept = 1; wait = 2; }
-            action NotHeld when (st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 1) {
+            action Sweep when (st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 0 && 4 > kind) { swept = 1; wait = 2; }
+            action NotHeld when (st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 1 && 4 > kind) {
                 st = 6; why = 5; wait = 0;
             }
             action Unneeded when (need == 1 && st > 0 && 5 > st) {
+                need = 0; st = 6; why = 4; wait = 0;
+            }
+            action InUse when (kind == 4 && inuse == 0 && st > 0) { inuse = 1; }
+            action OutOfUse when (kind == 4 && inuse == 1) { inuse = 0; }
+            action Arrived when (kind == 4 && inuse == 1 && need == 1 && st > 0 && 5 > st) {
                 need = 0; st = 6; why = 4; wait = 0;
             }
             action Gone when (posted == 1 && st > 1 && 5 > st) { st = 6; why = 7; wait = 0; }
@@ -72,11 +82,11 @@ pub fn credential_request_model() -> Model {
                 && (why == 4 || why == 8 || (why == 3 && (gen > atgen || atgen > gen)) || (why == 5 && held == 1))) {
                 st = 1; why = 0; swept = 0; got = 0; pa = 0; posted = 0; raises = 2; quiet = 0;
                 okr = if why == 4 || why == 8 || (why == 3 && (gen > atgen || atgen > gen)) || (why == 5 && held == 1) { 1 } else { 0 };
-                wait = if commons == 1 || kind == 1 || kind == 2 { 4 } else { 5 };
+                wait = if commons == 1 || kind == 2 { 4 } else { 5 };
             }
 
             action BuggyPublishUnauthorized when (Buggy == 1 && st == 3 && auth == 0) { st = 4; got = 1; pa = auth; wait = 4; }
-            action BuggyFlushCatalog when (Buggy == 2 && st == 1 && kind == 1 && commons == 1) { st = 2; posted = 1; wait = 1; }
+            action BuggyFlushCatalog when (Buggy == 2 && st == 1 && kind == 2 && commons == 1) { st = 2; posted = 1; wait = 1; }
             action BuggyNotHeldUnswept when (Buggy == 3 && st == 2 && held == 0 && swept == 0 && inv == 0) { st = 6; why = 5; wait = 0; }
             action BuggyRetireSilently when (Buggy == 4 && st == 2) { st = 6; wait = 0; }
             action BuggyStrandOffer when (Buggy == 5 && st == 3) { wait = 0; }
@@ -93,9 +103,15 @@ pub fn credential_request_model() -> Model {
             action BuggyParkSweep when (Buggy == 1 && st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 0) {
                 swept = 2;
             }
+            action BuggyCopyProducer when (Buggy == 14 && st == 2 && kind == 4 && auth == 1 && inv == 1) {
+                st = 4; got = 1; pa = auth; wait = 4;
+            }
+            action BuggyFlushProducerToHolders when (Buggy == 15 && st == 1 && kind == 4 && commons == 1 && auth == 1) {
+                st = 2; posted = 1; swept = 0; wait = 1;
+            }
 
             invariant NoUnauthorizedValue: got == 0 || pa == 1;
-            invariant CatalogNeverLeaves: kind == 0 || kind == 3 || posted == 0;
+            invariant CatalogNeverLeaves: kind == 0 || kind == 3 || kind == 4 || posted == 0;
             invariant NotHeldNeedsSweep: 5 > why || why > 5 || swept == 1;
             invariant RetiredHasReason: 6 > st || st > 6 || why > 0;
             invariant WaiterNamed: ((st == 0 || st == 5 || st == 6) && wait == 0)
@@ -106,6 +122,8 @@ pub fn credential_request_model() -> Model {
             invariant OnlyCustodianPublishes: rogue == 0;
             invariant LapseOnlyQuiet: 8 > why || why > 8 || quiet == 1;
             invariant SweepDecides: swept <= 1;
+            invariant NoProducerCopy: 4 > kind || got == 0;
+            invariant ProducerWaitsOnRequester: 4 > kind || 2 > st || st > 2 || wait == 4;
             bound StRange: st <= 6; bound WhyRange: why <= 8; bound WaitRange: wait <= 5;
             bound SweptRange: swept <= 2; bound GenRange: gen <= 2; bound RaisesRange: raises <= 2;
         }
@@ -114,7 +132,14 @@ pub fn credential_request_model() -> Model {
 
 /// A REQUEST ENDS: every raised want is, infinitely often, fulfilled or retired with its reason,
 /// assuming each party's step is taken once it stays possible, the founding
-/// included (`CommonsReady`: the vault admin's window runs a release that founds Commons).
+/// included (`CommonsReady`: the vault admin's window runs a release that founds Commons), and,
+/// for a want with a producer, that while no value is in use on the requester a person runs its
+/// producer and a new one comes into use there (`InUse`). A value can leave use again before the
+/// requester reads it (`OutOfUse`: Claude Code refused it on that Mac, or its end passed), and
+/// then only a new production brings one back, so the requester's end of the request is strongly
+/// fair (`Arrived`): a requester whose need finds a value in use time and again reads one while
+/// it still is. A request for a key no account has is never made, so it waits until withdrawn by
+/// hand.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(credential_request_model)]
@@ -138,8 +163,9 @@ pub fn credential_request_liveness() -> aterm_spec::derive::Liveness {
             "Apply",
             "Sweep",
             "NotHeld",
+            "InUse",
         ],
-        strong: vec![],
+        strong: vec!["Arrived"],
         mutants: vec!["BuggyParkSweep"],
     }
 }

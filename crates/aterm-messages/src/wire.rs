@@ -1622,7 +1622,7 @@ fn apply_dismiss(
             Hold::Default | Hold::For(_) | Hold::Standing(_) | Hold::LogOnly => {}
         }
     }
-    center.dismiss(id, now);
+    center.dismiss(id, stamp, now);
     shown(center, gate, now, format!("OK dismissed={id}"))
 }
 

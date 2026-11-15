@@ -203,7 +203,7 @@ impl Mac {
             mailbox: &|_, _, _| (super::super::sign_in_ladder::Mailbox::Ready, None),
             log: Arc::new(|_: &str| {}),
             run_attempt: None,
-            save_oauth: |_, _| Ok("inert".into()),
+            tokens_here: |_, _, _, _| None,
             shared: shared_renewal::Effects::default(),
         };
         let mut started = Vec::new();

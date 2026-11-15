@@ -8,8 +8,8 @@ use super::*;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::footer::FooterFacts;
-use aterm_agent::supervise::Autopilot;
 use aterm_core::render::{FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace, PxRect};
 use aterm_core::terminal::{CutKind, HolderCut};
 use aterm_effects::harness_card::{EPISODE_MS, FLOW_SLACK_MS, KITTY_W};

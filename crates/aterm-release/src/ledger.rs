@@ -66,6 +66,9 @@ impl From<String> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[path = "ledger_lazy_fetch.rs"]
+mod lazy_fetch;
+
 /// Resolve once and hold that exact installed build until every local Git child
 /// has finished. A broken managed installation is not permission to use another Git.
 struct SelectedGit {
@@ -75,19 +78,39 @@ struct SelectedGit {
 }
 
 impl SelectedGit {
+    fn new(
+        program: PathBuf,
+        env: atpkg::shim_env::ShimEnv,
+        lease: Option<atpkg::lease::Lease>,
+    ) -> Self {
+        Self {
+            program,
+            env,
+            _lease: lease,
+        }
+    }
+
     fn command(&self) -> Command {
         let mut cmd = command(&self.program);
         cmd.envs(self.env.entries().iter().map(|(key, value)| (key, value)));
         cmd
     }
 
-    fn object_command(&self, repo: &Path) -> Command {
+    /// [`SelectedGit::command`] for a read that must stay local: `--no-lazy-fetch` where this git
+    /// takes it and `GIT_NO_LAZY_FETCH=1` on every one, on a git seen to keep a read local
+    /// ([`lazy_fetch::guard`]), whose refusal this returns otherwise.
+    fn local_read(&self) -> Result<Command> {
+        let guard = lazy_fetch::guard(&self.program, self.env.entries())?;
+        let mut cmd = self.command();
+        cmd.args(guard.option()).env("GIT_NO_LAZY_FETCH", "1");
+        Ok(cmd)
+    }
+
+    /// [`object_git`]'s command.
+    fn object_command(&self, repo: &Path) -> Result<Command> {
+        let guard = lazy_fetch::guard(&self.program, self.env.entries())?;
         let mut cmd = command(&self.program);
-        for (key, _) in std::env::vars_os() {
-            if key.as_encoded_bytes().starts_with(b"GIT_") {
-                cmd.env_remove(&key);
-            }
-        }
+        atpkg::git_lazy_fetch::without_git_environment(&mut cmd);
         // Reapply only the selected package's declared environment after removing
         // ambient Git overrides (notably its own GIT_EXEC_PATH, when declared).
         cmd.envs(self.env.entries().iter().map(|(key, value)| (key, value)))
@@ -96,11 +119,12 @@ impl SelectedGit {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(guard.option())
             .arg("-C")
             .arg(repo)
             .stdin(aterm_uds::spawnfd::Stdio::null());
         crate::credential_wait::ask_no_one(&mut cmd);
-        cmd
+        Ok(cmd)
     }
 }
 
@@ -116,11 +140,11 @@ fn managed_git(layout: &atpkg::Layout) -> std::result::Result<SelectedGit, Strin
     let tool = atpkg::store::ToolName::new("git").ok_or("invalid Git tool name")?;
     let shim = layout.shim(&tool);
     if !present(&shim)? && !present(&layout.program_current("git"))? {
-        return Ok(SelectedGit {
-            program: PathBuf::from(aterm_uds::os_path!("git")),
-            env: atpkg::shim_env::ShimEnv::NONE,
-            _lease: None,
-        });
+        return Ok(SelectedGit::new(
+            PathBuf::from(aterm_uds::os_path!("git")),
+            atpkg::shim_env::ShimEnv::NONE,
+            None,
+        ));
     }
     let selected = atpkg::ops::managed(layout, "git").ok_or(
         "managed Git is present but its executable cannot be resolved; run `aterm pkg repair`",
@@ -158,11 +182,7 @@ fn managed_git(layout: &atpkg::Layout) -> std::result::Result<SelectedGit, Strin
             "managed Git selection changed while it was being verified; retry the release".into(),
         );
     }
-    Ok(SelectedGit {
-        program,
-        env: selected.env,
-        _lease: Some(lease),
-    })
+    Ok(SelectedGit::new(program, selected.env, Some(lease)))
 }
 
 fn selected_git() -> Result<&'static SelectedGit> {
@@ -195,6 +215,11 @@ pub(crate) fn git_command() -> Result<Command> {
     Ok(selected_git()?.command())
 }
 
+/// [`git_command`] for a read that must stay local ([`SelectedGit::local_read`]).
+fn local_read_command() -> Result<Command> {
+    selected_git()?.local_read()
+}
+
 /// Captured output of one runner invocation.
 pub struct RunOut {
     pub status: i32,
@@ -221,10 +246,31 @@ impl RunOut {
 pub trait GitRunner {
     fn git(&self, args: &[&str]) -> Result<RunOut>;
 
-    /// A complete local history listing, bounded in the production runner. Test runners
-    /// supply the same command seam; a failed or incomplete read supplies no semantic data.
+    /// A complete local history listing, bounded in the production runner, which fetches
+    /// nothing a partial clone lacks (`--no-lazy-fetch` where git takes it and
+    /// `GIT_NO_LAZY_FETCH=1`, on a git seen to keep a read local, and a refusal on one that does
+    /// not). A failed or incomplete read supplies no semantic data.
+    ///
+    /// A runner that does not say how its reads stay local refuses them: the only default a read
+    /// could take is [`GitRunner::git`], which may fetch, so a runner that forwards only `git`
+    /// (a wrapper over a guarded runner, say) would read unguarded. A wrapper forwards this to
+    /// its inner runner's; a runner that answers from a table and starts no git answers it from
+    /// that table.
     fn git_read(&self, args: &[&str]) -> Result<RunOut> {
-        self.git(args)
+        Err(Error::new(format!(
+            "git {}: this runner keeps no read local",
+            args.join(" ")
+        )))
+    }
+
+    /// `git <args>` reading `input` on its stdin (`cat-file --batch`), local as
+    /// [`GitRunner::git_read`] is, and refused, as it is, by a runner that does not say how.
+    fn git_read_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
+        let _ = input;
+        Err(Error::new(format!(
+            "git {}: this runner keeps no read with input local",
+            args.join(" ")
+        )))
     }
 
     /// `git <args>` with `input` on its stdin, for the objects-only writes ([`commit_with`]: `hash-object --stdin`, `mktree -z`).
@@ -428,12 +474,11 @@ impl GitRunner for GitCli {
     }
 
     fn git_read(&self, args: &[&str]) -> Result<RunOut> {
-        let mut cmd = git_command()?;
+        let mut cmd = local_read_command()?;
         crate::credential_wait::ask_no_one(&mut cmd)
             .arg("-C")
             .arg(&self.repo)
-            .args(args)
-            .env("GIT_NO_LAZY_FETCH", "1");
+            .args(args);
         let out = aterm_uds::deadline::output_until_complete_stdout_with_limit(
             &mut cmd,
             std::time::Instant::now() + std::time::Duration::from_secs(60),
@@ -479,6 +524,14 @@ impl GitRunner for GitCli {
             .arg(&self.repo);
         run_with_input(cmd, args, input)
     }
+
+    fn git_read_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
+        let mut cmd = local_read_command()?;
+        crate::credential_wait::ask_no_one(&mut cmd)
+            .arg("-C")
+            .arg(&self.repo);
+        run_with_input(cmd, args, input)
+    }
 }
 
 /// The `-c` pairs on every git that writes a tree (a checkout, an archive; a clone's config keeps them), so it writes the commit's bytes whatever the releaser's `core.autocrlf`, `core.eol` or global attributes file says.
@@ -491,9 +544,9 @@ pub(crate) const BYTE_EXACT: [&str; 6] = [
     "core.attributesFile=/dev/null",
 ];
 
-/// `git -C <repo>` that answers for that repository's objects as recorded and nothing else: every inherited `GIT_*` variable is removed (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_GRAFT_FILE` … would answer for another repository or rewrite this one), no system or global config is read, replace refs are ignored, nothing is fetched lazily or prompts, no optional lock is taken, and stdin is empty.
+/// `git -C <repo>` that answers for that repository's objects as recorded and nothing else: every inherited `GIT_*` variable is removed (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_GRAFT_FILE` … would answer for another repository or rewrite this one), no system or global config is read, replace refs are ignored, nothing is fetched lazily (`--no-lazy-fetch` where the git takes it and `GIT_NO_LAZY_FETCH=1`, on a git seen to keep a read local, [`lazy_fetch::guard`], whose refusal this returns otherwise) or prompts, no optional lock is taken, and stdin is empty.
 pub fn object_git(repo: &Path) -> Result<Command> {
-    Ok(selected_git()?.object_command(repo))
+    selected_git()?.object_command(repo)
 }
 
 /// Run a git command and require success; the error carries the argv and git's trimmed stderr.
@@ -1109,7 +1162,6 @@ fn announced_base(
     let commit = git_read_ok(
         git,
         &[
-            "--no-lazy-fetch",
             "--no-replace-objects",
             "rev-parse",
             "--verify",

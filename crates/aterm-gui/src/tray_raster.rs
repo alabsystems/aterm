@@ -2328,7 +2328,10 @@ type SemanticForkMemo = (
 );
 
 thread_local! {
-    static SEMANTIC_FORK_MEMO: std::cell::RefCell<Option<SemanticForkMemo>> =
+    /// Boxed: every thread's copy of the thread-local template holds this slot, and the memo
+    /// inline (a candidate, an epoch and a renderer) is 256 bytes of the template's 8 KiB
+    /// (`tests/thread_local_template.rs`); the box is one pointer.
+    static SEMANTIC_FORK_MEMO: std::cell::RefCell<Option<Box<SemanticForkMemo>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -2341,7 +2344,7 @@ pub(crate) fn prepare_semantic_font(
         let snapshot = semantic_font_snapshot_locked(fonts, candidate);
         let memoized = SEMANTIC_FORK_MEMO.with(|slot| {
             slot.borrow()
-                .as_ref()
+                .as_deref()
                 .and_then(|(memo_candidate, memo_epoch, renderer)| {
                     (memo_candidate == candidate && *memo_epoch == snapshot.ready_epoch)
                         .then(|| renderer.clone())
@@ -2361,7 +2364,7 @@ pub(crate) fn prepare_semantic_font(
     if remember {
         let memo = renderer.clone();
         SEMANTIC_FORK_MEMO.with(|slot| {
-            *slot.borrow_mut() = Some((candidate.clone(), snapshot.ready_epoch, memo));
+            *slot.borrow_mut() = Some(Box::new((candidate.clone(), snapshot.ready_epoch, memo)));
         });
     }
     PreparedSemanticFont {

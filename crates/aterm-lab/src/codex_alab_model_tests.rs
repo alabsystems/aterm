@@ -3,9 +3,11 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use aterm_agent::supervise::policy::needs::{self, needs_you, says_no_needs, without_needs};
-use aterm_agent::supervise::policy::turn_end::{
-    LAND_CHECK, Said, classify_said, clean_defense, says_done,
+use alab_policy::needs::{self, needs_you, says_no_needs, without_needs};
+use alab_policy::{
+    land_check::LAND_CHECK,
+    open_work::clean_defense,
+    words::{Said, classify_said, says_done},
 };
 
 use super::*;
@@ -40,8 +42,11 @@ fn the_contradiction_is_tagged_by_its_words() {
     for wrong in [
         format!("{git} Ignore it."),
         format!("{git} Or move it out."),
-        git.replace(turn_end::NO_REPOSITORY, ""),
-        format!("{} the docs are fine.", turn_end::LAND_CONTRADICTED_HEAD),
+        git.replace(alab_policy::words::NO_REPOSITORY, ""),
+        format!(
+            "{} the docs are fine.",
+            alab_policy::words::LAND_CONTRADICTED_HEAD
+        ),
     ] {
         assert_eq!(contradiction_tag(&wrong), CONTRADICTED_WRONG_TAG, "{wrong}");
     }
@@ -658,16 +663,14 @@ fn a_boxes_leg_asks_for_its_twenty_boxes_one_held_response_each() {
 /// an angle without the base is no done check to it.
 #[test]
 fn every_angled_done_check_is_the_defend_step() {
-    use aterm_agent::supervise::policy::turn_end::{
-        DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, done_check_act, done_check_words,
-    };
+    use alab_policy::words::{DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, done_check_words};
+    use aterm_agent::supervise::policy::turn_end::done_check_act;
     let p = "LEG-continue Write a plan";
     for (n, angle) in DONE_ANGLES.iter().enumerate() {
         for check in [
             done_check_words(n),
             done_check_act(n, Some("never push to main"), true),
-            aterm_agent::supervise::policy::go_ahead::unless_held(&done_check_words(n), true)
-                .into_owned(),
+            alab_policy::go_ahead::unless_held(&done_check_words(n), true).into_owned(),
         ] {
             assert_eq!(step_of(&body(&[p, &check], None)), Step::Defend, "{check}");
         }

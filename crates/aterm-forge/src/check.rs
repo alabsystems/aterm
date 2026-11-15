@@ -139,9 +139,8 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
     let _ = writeln!(
         log,
         "  [OB-11] REVIEW REGISTRATION — every VENDORED `[patch.crates-io]` path fork has a \
-         `[[fork]]` block in {FORK_LEDGER} with its census class (first-party and absorbed \
-         targets under crates/ are named, not reviewed — they are workspace members, not \
-         forks under review):"
+         `[[fork]]` block in {FORK_LEDGER} (first-party and absorbed targets under crates/ \
+         are named, not reviewed — they are workspace members, not forks under review):"
     );
     let reviewed = match reviewed_forks(root) {
         Ok(reviewed) => reviewed,
@@ -210,9 +209,8 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
                     log,
                     "  ✗ FAIL [OB-11] `{}` is patched to `{}` but has NO `[[fork]]` block in \
                      {FORK_LEDGER} — a fork nobody reviewed links into the process. Fix: review \
-                     the fork, then add its block (`name = \"{}\"`, `path = \"{}\"`, \
-                     `census.mode = \"scanned\"`, its `census.namespace`) with the review note \
-                     in the comment above it.",
+                     the fork, then add its block (`name = \"{}\"`, `path = \"{}\"`, its \
+                     `version` and `license`) with the review note in the comment above it.",
                     e.name, e.path, e.name, e.path
                 );
             }
@@ -227,12 +225,8 @@ fn report_over(cargo: &Cargo, root: &Path, cells: &[Cell]) -> Verdict {
                     e.name, r.path, e.path
                 );
             }
-            Some(r) => {
-                let _ = writeln!(
-                    log,
-                    "    ✓ {} → {} (reviewed, scanned in-process as `{}::`)",
-                    e.name, e.path, r.namespace
-                );
+            Some(_) => {
+                let _ = writeln!(log, "    ✓ {} → {} (reviewed)", e.name, e.path);
             }
         }
         if !root.join(&e.path).join("Cargo.toml").is_file() {
@@ -767,17 +761,16 @@ fn green_verdict(c: &GreenCounts) -> String {
 /// `[OB-17]`: one line per way the fork ledger disagrees with the tree.
 fn ledger_findings(root: &Path) -> Vec<String> {
     let measured = resolve::default_cells();
-    let mut out: Vec<String> =
-        resolve::unmeasured_wasm_roots(&measured, aterm_census::WASM_ROOT_CRATES)
-            .into_iter()
-            .map(|root| {
-                format!(
-                    "shipped browser root `{root}` has no wasm measurement cell. Fix: add its \
+    let mut out: Vec<String> = resolve::unmeasured_wasm_roots(&measured, resolve::WASM_ROOT_CRATES)
+        .into_iter()
+        .map(|root| {
+            format!(
+                "shipped browser root `{root}` has no wasm measurement cell. Fix: add its \
                      own cell to resolve::default_cells and measure its budget; sibling browser \
                      modules can select different dependencies."
-                )
-            })
-            .collect();
+            )
+        })
+        .collect();
     if !root.join(POLICY_FILE).is_file() {
         out.push(format!(
             "{POLICY_FILE} is missing — it is the authoritative fork and carve ledger, even when \

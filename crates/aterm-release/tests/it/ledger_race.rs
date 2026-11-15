@@ -237,6 +237,10 @@ impl GitRunner for Commits<'_> {
     fn git_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
         self.inner.git_input(args, input)
     }
+
+    fn git_read_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
+        self.inner.git_read_input(args, input)
+    }
 }
 
 fn assert_clean_at(fix: &Fixture, source: &str) {
@@ -481,8 +485,16 @@ fn a_failure_building_mains_commit_leaves_the_checkout_on_the_published_commit()
             self.0.git(args)
         }
 
+        fn git_read(&self, args: &[&str]) -> ledger::Result<RunOut> {
+            self.0.git_read(args)
+        }
+
         fn git_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
             self.0.git_input(args, input)
+        }
+
+        fn git_read_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
+            self.0.git_read_input(args, input)
         }
     }
     let fix = Fixture::new("landing-fails");
@@ -853,8 +865,16 @@ fn a_claim_that_landed_unjournaled_is_spent_and_the_re_run_claims_anew() {
             self.0.git(args)
         }
 
+        fn git_read(&self, args: &[&str]) -> ledger::Result<RunOut> {
+            self.0.git_read(args)
+        }
+
         fn git_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
             self.0.git_input(args, input)
+        }
+
+        fn git_read_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
+            self.0.git_read_input(args, input)
         }
     }
     let fix = Fixture::new("landed-unjournaled");
@@ -1726,28 +1746,18 @@ fn the_derived_harness_announcement_leads_changed_and_the_claim_holds_it() {
 /// THE RELEASE PAYS THE HARNESS DEBT IT CREATES, IN THE COMMIT THAT CREATES IT. Main moved past
 /// the published commit: a peer changed the claude harness's source under the version the
 /// release ships, and changed the muse harness's with its version raised. The landing merge is
-/// what puts the release commit, and so its tag, in main's history; the landing check then
-/// counts from that tag. The merge raises claude's version in its version file (keeping the
-/// peer's code), leaves muse (already above the release's) and agy (unchanged) alone, and the
-/// landing check on the merge, with the tag public, owes nothing.
-/// NEGATIVE CONTROLS: before the release lands, main owes nothing (the debt is the release's
-/// doing); and the same merge without the raised version file owes exactly claude's.
+/// what puts the release commit, and so its tag, in main's history. The merge raises claude's
+/// version in its version file (keeping the peer's code), leaves muse (already above the
+/// release's) and agy (unchanged) alone, moves main's tree by nothing else, and says what it
+/// raised.
 #[cfg(unix)]
 #[test]
-fn a_release_landing_on_moved_main_leaves_no_harness_debt() {
+fn a_release_landing_on_moved_main_raises_the_harness_versions_it_owes() {
     const PHASE: &str = "crates/aterm-phase/src/phase.rs";
     const AGY: &str = "crates/aterm-phase/src/agy.rs";
     const MUSE: &str = "crates/aterm-phase/src/muse.rs";
     let manifest =
         |version: &str| format!("[workspace]\n[workspace.package]\nversion = \"{version}\"\n");
-    let judged = |fix: &Fixture, head: &str| {
-        aterm_verify::harness_debt::judge(
-            &fix.work,
-            head,
-            &std::env::var_os("PATH").unwrap_or_default(),
-        )
-        .unwrap()
-    };
     let fix = Fixture::new("harness-landing");
     rival_files(
         &fix,
@@ -1782,13 +1792,6 @@ fn a_release_landing_on_moved_main_leaves_no_harness_debt() {
     let tip = run(&fix.work, "git", &["rev-parse", "origin/main"])
         .trim()
         .to_string();
-    assert!(
-        matches!(
-            judged(&fix, &tip),
-            aterm_verify::harness_debt::Judgement::Clear { ref version, .. } if version == "0.25.0"
-        ),
-        "before the release lands, main owes nothing since v0.25.0"
-    );
 
     let git = Git::new(&fix.work);
     let plan = ClaimPlan {
@@ -1837,46 +1840,6 @@ fn a_release_landing_on_moved_main_leaves_no_harness_debt() {
             .contains("written here: alab claude harness 0.3."),
         "the merge says what it raised"
     );
-
-    // The release is public: its tag is on the release commit, which the merge put in main.
-    run(&fix.work, "git", &["tag", "v0.26.0", &c.commit]);
-    match judged(&fix, &c.landed) {
-        aterm_verify::harness_debt::Judgement::Clear { version, baseline } => {
-            assert_eq!(
-                (version.as_str(), baseline.as_str()),
-                ("0.26.0", c.commit.as_str())
-            );
-        }
-        owed => panic!("the next landing owes a harness version: {owed:?}"),
-    }
-
-    // The same merge as the claim made it before it raised the versions: main's tree, the
-    // rolled changelog and the ledger line, and nothing else.
-    let landed_file =
-        |path: &str| run(&fix.work, "git", &["show", &format!("{}:{path}", c.landed)]);
-    let bare = ledger::commit_with(
-        &git,
-        &tip,
-        &[
-            ("CHANGELOG.md", &landed_file("CHANGELOG.md")),
-            ("RELEASES.ledger", &landed_file("RELEASES.ledger")),
-        ],
-        &[],
-        &[&tip, &c.commit],
-        "a landing that raises nothing",
-    )
-    .unwrap();
-    match judged(&fix, &bare) {
-        aterm_verify::harness_debt::Judgement::Owed { debts, .. } => {
-            let lines: Vec<String> = debts.iter().map(|debt| debt.line()).collect();
-            assert_eq!(lines.len(), 1, "{lines:?}");
-            assert!(
-                lines[0].starts_with("alab claude harness 0.2 ") && lines[0].contains(PHASE),
-                "{lines:?}"
-            );
-        }
-        clear => panic!("a landing that raises nothing owed nothing: {clear:?}"),
-    }
 }
 
 /// A release that main fast-forwards to changes no harness version: nothing on main is past

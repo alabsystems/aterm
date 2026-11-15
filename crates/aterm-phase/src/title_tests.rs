@@ -14,7 +14,8 @@ use crate::prompt::fixtures::{
     MEMORY_BANNER_IDLE, STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
     STATUSLINE_REPLY_DONE_2_1_311, screen,
 };
-use crate::{ClaudeReader, MuseReader, Phase, Program, Reading, ScreenReader, read_at, read_seen};
+use crate::{ClaudeReader, MuseReader, Program, Reading, ScreenReader, read_at, read_seen};
+use alab_policy::vocab::Phase;
 
 const WATCHDOG_STATUSLINE: &str =
     include_str!("fixtures/claude-2.1.300-wall-watchdog-session-statusline.txt");
@@ -422,7 +423,11 @@ fn the_memory_banner_beside_a_reply_under_a_status_line_is_no_end_of_it() {
         let mut shown = rows.clone();
         shown.insert(top, banner.clone());
         let wall = crate::wall(&shown).expect("the banner reads");
-        assert_eq!(wall.kind, crate::WallKind::Memory, "the control frame");
+        assert_eq!(
+            wall.kind,
+            alab_policy::vocab::WallKind::Memory,
+            "the control frame"
+        );
         assert!(crate::wall::turn_wall(&shown).is_none());
         for title in RUNNING {
             assert!(title_live(&shown, Some(true)), "{title}");
@@ -432,12 +437,15 @@ fn the_memory_banner_beside_a_reply_under_a_status_line_is_no_end_of_it() {
                 (Phase::Busy, true),
                 "{title}: {r:?}"
             );
-            assert_eq!(r.wall.map(|w| w.kind), Some(crate::WallKind::Memory));
+            assert_eq!(
+                r.wall.map(|w| w.kind),
+                Some(alab_policy::vocab::WallKind::Memory)
+            );
         }
         let alone = read_at(Some("claude"), &shown, caret(&shown), None);
         assert_eq!(
             (alone.phase.clone(), alone.wall.as_ref().map(|w| w.kind)),
-            (Phase::Idle, Some(crate::WallKind::Memory)),
+            (Phase::Idle, Some(alab_policy::vocab::WallKind::Memory)),
             "the screen alone: the misread a memory restart would act on"
         );
         for title in NOT_RUNNING {

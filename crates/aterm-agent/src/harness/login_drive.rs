@@ -531,7 +531,9 @@ pub struct Handoff<'a> {
     pub email: Option<&'a str>,
     /// Whether the CLI already said it is done, or closed its output.
     pub finished: &'a dyn Fn() -> bool,
-    /// The original sign-in budget, including time the host slept.
+    /// The original sign-in budget, including time the host slept. It has passed too once the
+    /// sign-in's account work is cancelled ([`Deadline::cancelled_by`]), so a mail poll or a page
+    /// the approver waits on ends at its next look.
     pub deadline: Deadline<'a>,
 }
 
@@ -1014,6 +1016,10 @@ fn drive_until_with_readers(
     let mut status = None;
     let mut exited_at: Option<Instant> = None;
     let grace = OUTPUT_DRAIN_HANG;
+    let work_cancelled = || {
+        work.as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+    };
     loop {
         if work
             .as_ref()
@@ -1067,9 +1073,18 @@ fn drive_until_with_readers(
                 hosts: spec.hosts,
                 email: spec.email,
                 finished: &finished,
-                deadline,
+                deadline: deadline.cancelled_by(&work_cancelled),
             };
-            match approver.approve(&handoff) {
+            let approval = approver.approve(&handoff);
+            if work_cancelled() {
+                // Whatever the approver made of a page it left for the cancellation, it is
+                // no outcome of this account's sign-in.
+                return Drove {
+                    outcome: Outcome::Unverified("automatic account work is cancelled".into()),
+                    host,
+                };
+            }
+            match approval {
                 Approval::Approved { page: shown } => {
                     page = shown;
                     if status.is_some() {
@@ -1427,6 +1442,12 @@ const SANDBOX_PROBE_WAIT: Duration = Duration::from_secs(60);
 /// macOS does not let it nest.
 #[must_use]
 pub fn sandbox_refusal(sandbox: &Path) -> Option<String> {
+    sandbox_refusal_unless(sandbox, &|| false)
+}
+
+/// [`sandbox_refusal`] for an automatic sign-in: its try is ended, its group killed, at the first
+/// look after `cancelled` says its account work was cancelled.
+fn sandbox_refusal_unless(sandbox: &Path, cancelled: &dyn Fn() -> bool) -> Option<String> {
     let started = Instant::now();
     use aterm_uds::spawnfd::Stdio;
     let mut cmd = aterm_uds::spawnfd::command(sandbox);
@@ -1434,7 +1455,7 @@ pub fn sandbox_refusal(sandbox: &Path) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    sandbox_refusal_command(sandbox, &mut cmd, started)
+    sandbox_refusal_command(sandbox, &mut cmd, started, cancelled)
 }
 
 /// Run the prepared preflight under its original start. Explicitly expired work never starts.
@@ -1442,6 +1463,7 @@ fn sandbox_refusal_command(
     sandbox: &Path,
     cmd: &mut aterm_uds::spawnfd::Command,
     started: Instant,
+    cancelled: &dyn Fn() -> bool,
 ) -> Option<String> {
     let remaining = SANDBOX_PROBE_WAIT.saturating_sub(started.elapsed());
     if remaining.is_zero() {
@@ -1457,6 +1479,13 @@ fn sandbox_refusal_command(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
+            Ok(None) if cancelled() => {
+                end(&mut child);
+                return Some(format!(
+                    "{} was ended on a try: automatic account work is cancelled",
+                    sandbox.display()
+                ));
+            }
             Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
                 end(&mut child);
@@ -1695,7 +1724,14 @@ fn sign_in_until_custody<C: super::codex_app_login::CodeGrantCapture>(
                     no_desk.unwrap_or(Path::new(SANDBOX_EXEC)).display()
                 ));
             };
-            if let Some(why) = sandbox_refusal(sandbox) {
+            let cancelled = || {
+                work.as_ref()
+                    .is_some_and(super::account_work::Scope::cancelled)
+            };
+            if let Some(why) = sandbox_refusal_unless(sandbox, &cancelled) {
+                if cancelled() {
+                    return not_run("automatic account work is cancelled".into());
+                }
                 return not_run(format!(
                     "{} opens this machine's default browser through the OS, and the sandbox that \
                  stops it cannot run here: {why}; run it from a terminal that is not sandboxed; \

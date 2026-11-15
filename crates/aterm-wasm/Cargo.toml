@@ -44,11 +44,8 @@ aterm-stamp = { workspace = true }
 # root, which sets this crate's opt-level = "z".
 
 [dev-dependencies]
-# Test-only: `pct_encode_is_the_control_wires` holds `messages_api::pct_encode`
-# equal to the control socket's encoder, which the shipped module cannot link
-# (aterm-control takes the engine's disk tier, whose mmap store cannot target
-# wasm32). Dev-dependencies never enter the wasm32 graph.
-aterm-control = { workspace = true }
+# Compare the local browser encoder with the canonical wire codec directly.
+aterm-codec = { workspace = true }
 # TEST-ONLY: `aterm_spec::host::could_not_run`, so a test the host cannot run
 # (no system font, no GPU) ends COULD NOT RUN, never a silent pass.
 aterm-spec = { workspace = true }

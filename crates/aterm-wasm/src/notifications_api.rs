@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use aterm_core::terminal::Terminal;
 use aterm_types::osc::{Notification, NotificationUrgency};
 
-use crate::json_string;
+use crate::write_json_string;
 
 /// Drain handle shared with the engine callbacks, which must be `Send + 'static` (hence `Arc<Mutex<..>>` on single-threaded wasm).
 pub(crate) type NotificationQueue = Arc<Mutex<VecDeque<Notification>>>;
@@ -51,19 +51,34 @@ pub(crate) fn drain_notifications_json(queue: &NotificationQueue) -> Option<Stri
     if q.is_empty() {
         return None;
     }
-    let objects: Vec<String> = q.drain(..).map(|n| notification_json(&n)).collect();
-    Some(format!("[{}]", objects.join(",")))
+    let mut out = String::from("[");
+    for (i, notification) in q.drain(..).enumerate() {
+        if i != 0 {
+            out.push(',');
+        }
+        write_notification_json(&mut out, &notification);
+    }
+    out.push(']');
+    Some(out)
 }
 
-fn notification_json(n: &Notification) -> String {
-    let field = |v: &Option<String>| v.as_deref().map_or_else(|| "null".to_string(), json_string);
-    format!(
-        r#"{{"id":{},"title":{},"body":{},"urgency":"{}"}}"#,
-        field(&n.id),
-        field(&n.title),
-        field(&n.body),
-        urgency_label(n.urgency),
-    )
+fn write_nullable_json(out: &mut String, field: Option<&str>) {
+    match field {
+        Some(text) => write_json_string(out, text),
+        None => out.push_str("null"),
+    }
+}
+
+fn write_notification_json(out: &mut String, n: &Notification) {
+    out.push_str(r#"{"id":"#);
+    write_nullable_json(out, n.id.as_deref());
+    out.push_str(r#","title":"#);
+    write_nullable_json(out, n.title.as_deref());
+    out.push_str(r#","body":"#);
+    write_nullable_json(out, n.body.as_deref());
+    out.push_str(r#","urgency":""#);
+    out.push_str(urgency_label(n.urgency));
+    out.push_str(r#""}"#);
 }
 
 #[inline]

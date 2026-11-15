@@ -6,11 +6,9 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 // Trust's std hands a spawned child its stdio and nothing else; a pass-through command
-// (`spawnfd::transparent`) asks for upstream's inheritance back where std spawns it (`build.rs`).
-#![cfg_attr(
-    all(trust_std, unix, not(target_vendor = "apple")),
-    feature(trust_process_inherit_fds)
-)]
+// (`spawnfd::transparent` off Apple, `spawnfd::InheritEverything` everywhere) asks for upstream's
+// inheritance back where std spawns it (`build.rs`).
+#![cfg_attr(all(trust_std, unix), feature(trust_process_inherit_fds))]
 #![cfg_attr(
     test,
     allow(
@@ -28,6 +26,9 @@ pub type CtlListener = std::os::unix::net::UnixListener;
 /// its creation ([`kept_out`]) with no spawn held back for the connect.
 #[cfg(unix)]
 pub mod connect;
+/// CPU time for counters: the calling thread's, the process's, and a meter that adds a thread's
+/// spending to a total once.
+pub mod cpu;
 
 /// Connect to `addr` within `timeout`, as `TcpStream::connect_timeout` does: every TCP dial of
 /// aterm's, refused before any socket is made where a debug build's partition cut lists `addr`
@@ -542,10 +543,10 @@ pub mod shared_write;
 pub mod shm;
 /// Which Windows console a child process gets: a windowless one when this process has none (the window), so no console flashes on screen, and nothing changed when it has one or off Windows.
 pub mod spawn;
-/// Child spawns that inherit only what they are handed: [`spawnfd::command`], the `Command` every child is built with (on Darwin one `posix_spawn`, no fork); the fabric bridge's spawn with two descriptors at fixed numbers; the inheritance strip for a spawn that must fork (the PTY child's), and the one descriptor such a spawn may pass at a fixed number ([`spawnfd::PassAt`]); and [`spawnfd::transparent`], the pass-throughs' spawn, whose child inherits this process's whole table.
+/// Child spawns that inherit only what they are handed: [`spawnfd::command`], the `Command` every child is built with (on Darwin one `posix_spawn`, on Linux one `clone` that shares this process's memory until the child's exec, from Linux 5.16 (below, the same child runs in a copy): no copy of this process on Darwin, nor from 5.16 on Linux); the fabric bridge's spawn with two descriptors at fixed numbers; the inheritance strip for a spawn that must fork (the PTY child's), and the one descriptor such a spawn may pass at a fixed number ([`spawnfd::PassAt`]); and [`spawnfd::transparent`], the pass-throughs' spawn, whose child inherits this process's whole table.
 #[cfg(unix)]
 pub mod spawnfd;
-/// Off Unix, [`spawnfd::command`] (there: the Windows console rule of [`spawn`]), [`spawnfd::transparent`], [`spawnfd::InheritNothing`] and std's `Command`, `Stdio` and `Child` under spawnfd's names, so a shared spawn site reads the same on every platform.
+/// Off Unix, [`spawnfd::command`] (there: the Windows console rule of [`spawn`]), [`spawnfd::transparent`], [`spawnfd::InheritNothing`], std's `Stdio` and `Child` under spawnfd's names, and [`spawnfd::Command`], std's builder whose starts run with the starting thread's system error boxes off, so a file that is no program is the start's error and a shared spawn site reads the same on every platform.
 #[cfg(not(unix))]
 #[path = "spawnfd_nonunix.rs"]
 pub mod spawnfd;
@@ -578,6 +579,8 @@ pub mod stdout;
 pub mod stop;
 /// The kernel facts a `sudo` askpass relay stands on, and a scrubbed secret for the password in flight (`docs/DESIGN-sudo-askpass-2026-10-15.md`).
 pub mod sudo;
+/// When a long-lived loop reports the counts it keeps of its own work (the 1st, 2nd, 4th ... 256th event, then each 256th).
+pub mod tally;
 /// A Cargo test binary's own per-user root, under which [`control_socket_dir`] and `aterm_types::dirs` answer in a test, so no test reaches the person's live socket, state, logs or config.
 pub mod test_binary;
 /// A child that ends with the process that started it, killed outright included: Linux's parent-death signal, and this executable's [`tether::VERB`] (every tethered spawn on Darwin, a group leader's on Linux), which leaves a watcher behind as it execs the child ([`spawnfd::Tether`]).

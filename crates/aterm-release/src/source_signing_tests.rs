@@ -285,6 +285,32 @@ fn authority_requires_the_publishers_canonical_roster_pair() {
     assert!(Tools::ring_authority(f.home.path(), 100, &[&f.master]).is_ok());
 }
 
+/// ONE RELEASE HAS ONE SIGNER. The engine signs the source with the ring files; where the
+/// store holds a ring too, the cut signs with that one, so the two must be one key. Negative
+/// control: a store ring of another key refuses the authority by name.
+#[cfg(unix)]
+#[test]
+fn a_store_ring_of_another_key_refuses_source_signing() {
+    let f = Fixture::new();
+    crate::test_vault::seed_ring_as(f.home.path(), "test", &f.key, &f.public);
+    Tools::ring_authority(f.home.path(), 100, &[&f.master]).expect("one key in both");
+
+    let other = Fixture::new();
+    crate::test_vault::seed_ring_as(f.home.path(), "test", &other.key, &other.public);
+    // A sync of this build still copies the store's ring over the files; put this Mac's minted
+    // ring back, so the files and the store disagree.
+    let ring = |rel: &str| f.home.path().join(rel);
+    std::fs::write(ring(atpkg_keys::provision::MACHINE_KEY_REL), &f.key).unwrap();
+    std::fs::write(
+        ring(atpkg_keys::provision::MACHINE_PUB_REL),
+        format!("id = \"test\"\npubkey = \"{}\"\n", f.public),
+    )
+    .unwrap();
+    Tools::ring_authority(other.home.path(), 100, &[&other.master]).expect("the other ring alone");
+    let refused = Tools::ring_authority(f.home.path(), 100, &[&f.master]).unwrap_err();
+    assert!(refused.contains("are not one key"), "{refused}");
+}
+
 /// The fixture's grant is roster generation 1: a retained floor at 1 admits it and one at
 /// 2 refuses it. Each floor is written as the vault writes it (0600 in a 0700 directory),
 /// so the verdict turns on its generation, never on a file mode its reader refuses.

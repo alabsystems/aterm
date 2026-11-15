@@ -2934,8 +2934,35 @@ fn the_arrow_offers_a_later_build_until_its_move_lands() {
         ("attended", "once you stop typing"),
         ("draft", "once your draft is sent or cleared"),
         ("screen-unreadable", ""),
+        ("account", "once its account can be checked"),
+        ("account-lock", "once its account can be checked"),
+        ("account-changing", "once its account can be checked"),
+        ("account-unread", "once its account can be checked"),
+        ("account-policy-signed-out", "after login"),
+        ("account-policy-limited", "after the usage limit"),
+        ("account-unattributed", ""),
+        ("account-integrity", ""),
+        ("account-token", ""),
+        ("account-policy-pin", ""),
+        ("account-policy-lease", ""),
+        ("account-policy-held", ""),
     ] {
         assert_eq!(up_wait(wait), words, "{wait:?}");
+    }
+    // Every account refusal a relaunch waits on has its when-words above, and none that waits on a
+    // person's act promises "once its account can be checked".
+    for kind in aterm_agent::harness::accounts_pool::RefusalKind::ALL {
+        let words = up_wait(kind.word());
+        assert_eq!(
+            words == "once its account can be checked",
+            matches!(
+                kind,
+                aterm_agent::harness::accounts_pool::RefusalKind::Lock
+                    | aterm_agent::harness::accounts_pool::RefusalKind::Changing
+                    | aterm_agent::harness::accounts_pool::RefusalKind::Unread
+            ),
+            "{kind:?}: {words:?}"
+        );
     }
 }
 

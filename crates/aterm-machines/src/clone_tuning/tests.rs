@@ -225,19 +225,26 @@ impl World {
                 )
             })
             .collect();
-        let dir = self.home.path().join(".secrets");
-        std::fs::create_dir_all(&dir).unwrap();
-        set_mode(&dir, 0o700);
-        let file = dir.join("github-repositories.json");
-        std::fs::write(
-            &file,
+        // The store's entry, in a file vault beside the fixture home, read in place.
+        use aterm_secrets::{client, text::Audience};
+        let paths = client::Paths::for_home(self.home.path());
+        if client::config(&paths).unwrap().is_none() {
+            let vault = self.sources.path().join("fixture.vault");
+            client::create(&paths, vault.to_str().unwrap(), None, Some("fixture")).unwrap();
+        }
+        let admin = client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &Audience::Everyone,
+            aterm_secrets::entry_class::GITHUB_REPOSITORIES,
             format!(
                 r#"{{"schema":2,"account":"fixture","repositories":[{}]}}"#,
                 repositories.join(",")
-            ),
+            )
+            .as_bytes(),
         )
         .unwrap();
-        set_mode(&file, 0o600);
+        client::admin_publish(&paths, &admin, &doc).unwrap();
     }
 
     /// `~/.config/aterm/init.toml`.

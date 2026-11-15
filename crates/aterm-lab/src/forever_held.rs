@@ -8,7 +8,6 @@
 use std::borrow::Cow;
 
 use aterm_agent::harness::acts::{ATERM_DRIVES, FACT_SEPARATOR, HeldBy, StopForm, stop_words};
-use aterm_agent::supervise::policy::turn_end;
 
 use super::super::switch::SWITCH_SETTLE_MS;
 use super::super::{
@@ -284,7 +283,7 @@ pub fn stall_fault(chain: Chain, seen: &Seen, t0: i64) -> Option<String> {
 /// whose first act is no land@v1 fails here.
 #[must_use]
 pub fn judge_hold(seen: &Seen, t0: i64) -> Verdict {
-    let first_rule = turn_end::RULE_LAND;
+    let first_rule = alab_policy::words::RULE_LAND;
     let acts = seen.all_acts();
     let Some(first) = acts.first() else {
         return Verdict::Fail(format!("no act typed within {}", at(t0, seen.end_ms)));

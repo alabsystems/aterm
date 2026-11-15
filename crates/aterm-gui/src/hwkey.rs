@@ -723,6 +723,8 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
     }
 
     // The pacing, the count and the gate before every key are `run_burst`'s.
+    #[cfg(any(test, debug_assertions))]
+    let mut measurement = crate::restore_measurement::KeyBurst::begin(spec.count);
     run_burst(
         spec.count,
         spec.interval_ms,
@@ -743,6 +745,9 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                     }
                     appkit::send_f64(info, sel!(systemUptime))
                 };
+                let timestamp_ns = native_timestamp_ns(ts).ok_or_else(|| {
+                    "ERR hwkey: system uptime cannot provide a native event timestamp\n".to_string()
+                })?;
                 // SAFETY: the AppKit event factory with a non-nil characters pair (winit
                 // dereferences both unconditionally) and a nil graphics context, exactly as
                 // upstream winit's `replace_event` builds a synthetic key event.
@@ -781,7 +786,12 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                 };
                 let key_event = |kind: usize| {
                     if spec.press {
-                        press_event(spec.keycode, kind == NS_EVENT_TYPE_KEY_DOWN, spec.flags)
+                        press_event(
+                            spec.keycode,
+                            kind == NS_EVENT_TYPE_KEY_DOWN,
+                            spec.flags,
+                            timestamp_ns,
+                        )
                     } else {
                         built(kind)
                     }
@@ -819,6 +829,8 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                 // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the shared
                 // application with a live event; AppKit documents it as safe from any thread, and
                 // this runs on the control thread.
+                #[cfg(any(test, debug_assertions))]
+                let posted_begin = measurement.start_post();
                 unsafe {
                     let post: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) =
                         aterm_objc::checked_msg();
@@ -826,19 +838,37 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
                         post(app, sel!(postEvent:atStart:), event, Bool::NO);
                     }
                 }
+                #[cfg(any(test, debug_assertions))]
+                measurement.posted(posted_begin);
                 Ok(())
             })
         },
     )
 }
 
+/// Convert the observed system uptime to CoreGraphics nanoseconds. An unknown, zero or
+/// unrepresentable clock cannot become a posted event's timestamp.
+#[cfg(any(target_os = "macos", test))]
+fn native_timestamp_ns(seconds: f64) -> Option<std::num::NonZeroU64> {
+    let nanos = seconds * 1_000_000_000.0;
+    if !nanos.is_finite() || nanos < 1.0 || nanos >= u64::MAX as f64 {
+        return None;
+    }
+    std::num::NonZeroU64::new(nanos as u64)
+}
+
 /// A key-down (`down`) or key-up `NSEvent` built as a key press is: a CoreGraphics
 /// keyboard event for `keycode` with `flags` (`CGEventFlags` share the bit positions of
 /// `NSEventModifierFlags`), wrapped by `+[NSEvent eventWithCGEvent:]`, so its
-/// `characters` are the current layout's for that key and modifiers and its timestamp is
-/// the CoreGraphics event's own (the same seconds-since-boot clock).
+/// `characters` are the current layout's for that key and modifiers. Set its timestamp
+/// from the observed system uptime before wrapping: a new CoreGraphics event can carry zero.
 #[cfg(target_os = "macos")]
-fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
+fn press_event(
+    keycode: u16,
+    down: bool,
+    flags: u64,
+    timestamp_ns: std::num::NonZeroU64,
+) -> aterm_objc::Id {
     use std::ffi::c_void;
 
     use aterm_objc::{Id, Sel, class, sel};
@@ -851,6 +881,7 @@ fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
             keydown: bool,
         ) -> *mut c_void;
         fn CGEventSetFlags(event: *mut c_void, flags: u64);
+        fn CGEventSetTimestamp(event: *mut c_void, timestamp: u64);
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
@@ -866,6 +897,7 @@ fn press_event(keycode: u16, down: bool, flags: u64) -> aterm_objc::Id {
             return Id::NIL;
         }
         CGEventSetFlags(cg, flags);
+        CGEventSetTimestamp(cg, timestamp_ns.get());
         let wrap: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> Id =
             aterm_objc::checked_msg();
         let event = wrap(class(c"NSEvent").as_id(), sel!(eventWithCGEvent:), cg);

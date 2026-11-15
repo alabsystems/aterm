@@ -51,6 +51,8 @@ pub mod secret;
 pub mod seeds;
 #[cfg(unix)]
 pub(super) mod store;
+#[cfg(unix)]
+pub mod vault;
 pub mod view;
 pub use crate::typed::View;
 #[cfg(unix)]

@@ -260,6 +260,14 @@ pub fn accounts(home: &Path) -> Vec<String> {
 
 pub type Shared = std::sync::Arc<std::sync::Mutex<Session>>;
 
+/// The file under `home` that holds `account`'s saved grant, whether or not one is saved there:
+/// what a reader that dates a grant's saving by its file reads, opening nothing. `None` for an
+/// address that names no Google mail account.
+#[must_use]
+pub fn grant_file(home: &Path, account: &str) -> Option<PathBuf> {
+    email(account).ok().map(|account| location(home, &account))
+}
+
 /// Reuse one renewing session inside this process.
 pub fn shared(home: &Path, account: &str) -> Result<Option<Shared>, String> {
     type Sessions = std::collections::BTreeMap<PathBuf, std::sync::Weak<std::sync::Mutex<Session>>>;

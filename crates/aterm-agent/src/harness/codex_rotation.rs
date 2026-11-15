@@ -142,7 +142,7 @@ impl<T: Clone> Proposal<T> {
     /// generation, selection or receipt checks.
     pub fn commit(&self, receipt: &Receipt, now: i64) -> Result<(), &'static str> {
         let next = self.successor().ok_or("selection-missing")?;
-        if receipt.intent.purpose != renewal::Purpose::WeeklyQuota
+        if !receipt.intent.purpose.pool_scoped()
             || receipt.intent.identity != self.source_identity
             || !receipt.matches_successor(&next)
         {
@@ -160,9 +160,7 @@ impl<T: Clone> Proposal<T> {
 
 /// Immutable handoff metadata only; no credential bytes enter this digest.
 pub fn receipt_binding(receipt: &Receipt) -> Result<String, &'static str> {
-    if receipt.intent.purpose != renewal::Purpose::WeeklyQuota
-        || receipt.target_identity().is_none()
-    {
+    if !receipt.intent.purpose.pool_scoped() || receipt.target_identity().is_none() {
         return Err("not-quota-receipt");
     }
     let fields = aterm_json::to_string(&(
@@ -193,7 +191,30 @@ pub fn with_selected_writer<T>(
     receipt: &Receipt,
     use_selected: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
 ) -> Result<Option<T>, &'static str> {
-    with_selection_writer(env, receipt, SelectionPhase::Forward, use_selected)
+    with_selection_writer(
+        env,
+        receipt,
+        SelectionScope::Pool,
+        SelectionPhase::Forward,
+        use_selected,
+    )
+}
+
+/// [`with_selected_writer`] for a lost login's move ([`renewal::Purpose::LoginRotation`]):
+/// the session's own selection, judged of the records alone, with no pool record behind it
+/// ([`SelectionScope::Session`]). No network call may run inside the callback.
+pub fn with_session_selected_writer<T>(
+    env: &Env,
+    receipt: &Receipt,
+    use_selected: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
+) -> Result<Option<T>, &'static str> {
+    with_selection_writer(
+        env,
+        receipt,
+        SelectionScope::Session,
+        SelectionPhase::Forward,
+        use_selected,
+    )
 }
 
 /// Publish an exec attempt only after the selected account's writer admits it.
@@ -236,9 +257,7 @@ pub(super) fn publish_selected_committing_using(
     receipt: &mut Receipt,
     write: impl FnOnce(&Env, &Receipt) -> Result<(), &'static str>,
 ) -> Result<Option<()>, &'static str> {
-    if receipt.intent.purpose != renewal::Purpose::WeeklyQuota
-        || receipt.target_identity().is_none()
-    {
+    if !receipt.intent.purpose.pool_scoped() || receipt.target_identity().is_none() {
         return Err("not-quota-receipt");
     }
     if receipt.revoked {
@@ -277,7 +296,8 @@ pub fn with_prepared_writer<T>(
     {
         return Err("not-ready");
     }
-    with_selection_writer(env, receipt, SelectionPhase::Prepared, use_prepared)
+    let scope = SelectionScope::of(receipt.intent.purpose)?;
+    with_selection_writer(env, receipt, scope, SelectionPhase::Prepared, use_prepared)
 }
 
 /// Validate a consumed receipt after its pool deduplication record was retired.
@@ -294,7 +314,13 @@ pub fn with_completed_writer<T>(
     {
         return Err("not-consumed");
     }
-    with_selection_writer(env, receipt, SelectionPhase::Completed, use_completed)
+    with_selection_writer(
+        env,
+        receipt,
+        SelectionScope::Pool,
+        SelectionPhase::Completed,
+        use_completed,
+    )
 }
 
 /// Revalidate a consumed tree's own account for another authenticated member.
@@ -311,7 +337,13 @@ pub fn with_consumed_member_writer<T>(
     {
         return Err("not-consumed");
     }
-    with_selection_writer(env, receipt, SelectionPhase::Member, use_member)
+    with_selection_writer(
+        env,
+        receipt,
+        SelectionScope::Pool,
+        SelectionPhase::Member,
+        use_member,
+    )
 }
 
 /// Validate compensation to the original login, without requiring the failed
@@ -329,9 +361,14 @@ pub fn with_rollback_writer<T>(
     {
         return Err("not-rollback");
     }
-    with_selection_writer(env, receipt, SelectionPhase::Rollback, |_, writer| {
-        restore_source(writer)
-    })
+    let scope = SelectionScope::of(receipt.intent.purpose)?;
+    with_selection_writer(
+        env,
+        receipt,
+        scope,
+        SelectionPhase::Rollback,
+        |_, writer| restore_source(writer),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -343,14 +380,50 @@ enum SelectionPhase {
     Member,
 }
 
+/// Whose selection a move's writer judges: the pool's, or the session's alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionScope {
+    /// A usage-limit handoff's ([`renewal::Purpose::WeeklyQuota`]): the pool moved its
+    /// selection to the destination, so its deduplication record (`native_rotations`) binds the
+    /// receipt and, from its commit on, the destination is the pool's `active` row.
+    Pool,
+    /// A lost login's move ([`renewal::Purpose::LoginRotation`]): only this session moves, so
+    /// no pool record binds it and the pool's `active` row is not the destination's to be. In
+    /// its place, until the session is moved, the records must still show what moves it: the
+    /// source signed out, the refusal of the token its login file holds settled as an ordinary
+    /// end ([`codex_app_login::RefusalReason::ends_ordinarily`]), and the destination one this
+    /// Mac may use ([`accounts::State::lease_verdict`]), as a pool move's `begin_rotation` holds
+    /// it to.
+    Session,
+}
+
+impl SelectionScope {
+    /// The scope of a receipt of `purpose`; a login renewal moves no account and has none.
+    fn of(purpose: renewal::Purpose) -> Result<Self, &'static str> {
+        match purpose {
+            renewal::Purpose::WeeklyQuota => Ok(Self::Pool),
+            renewal::Purpose::LoginRotation => Ok(Self::Session),
+            renewal::Purpose::Login => Err("not-moving-receipt"),
+        }
+    }
+}
+
 fn with_selection_writer<T>(
     env: &Env,
     receipt: &Receipt,
+    scope: SelectionScope,
     phase: SelectionPhase,
     use_selected: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
 ) -> Result<Option<T>, &'static str> {
+    if SelectionScope::of(receipt.intent.purpose)? != scope {
+        return Err("receipt-scope");
+    }
     let expected = receipt.target_identity().ok_or("receipt-identity")?;
-    let binding = receipt_binding(receipt)?;
+    // Only a pool move has a pool record to bind; a session's move has none to check.
+    let binding = match scope {
+        SelectionScope::Pool => Some(receipt_binding(receipt)?),
+        SelectionScope::Session => None,
+    };
     let home = env.home.as_deref().ok_or("home-unavailable")?;
     let config = env.config.as_deref().ok_or("config-unavailable")?;
     let store = env
@@ -379,16 +452,18 @@ fn with_selection_writer<T>(
         let (logins, _) = store
             .load_logins(env.now)
             .map_err(|_| "bindings-unreadable")?;
-        match logins.native_rotations.get(&receipt.id) {
-            Some(recorded) if recorded != &binding => return Err("pool-commit-changed"),
-            None if !matches!(
-                phase,
-                SelectionPhase::Prepared | SelectionPhase::Completed | SelectionPhase::Member
-            ) =>
-            {
-                return Err("pool-commit-missing");
+        if let Some(binding) = &binding {
+            match logins.native_rotations.get(&receipt.id) {
+                Some(recorded) if recorded != binding => return Err("pool-commit-changed"),
+                None if !matches!(
+                    phase,
+                    SelectionPhase::Prepared | SelectionPhase::Completed | SelectionPhase::Member
+                ) =>
+                {
+                    return Err("pool-commit-missing");
+                }
+                _ => {}
             }
-            _ => {}
         }
         let roster = accounts::bound(&raw, &logins);
         let default = home.join(Cli::Codex.accounts().default_home);
@@ -424,13 +499,34 @@ fn with_selection_writer<T>(
         }
         let mut state = store.load(env.now).map_err(|_| "state-unreadable")?.0;
         store.hydrate_auth_contexts(&mut state, &roster);
-        if (!matches!(phase, SelectionPhase::Prepared | SelectionPhase::Member)
+        // A pin stops every move, in every phase: a pool move's and a session's alone. The lost
+        // login's own pin ended when its sign-out was staged, so one standing now is a person's.
+        if (scope == SelectionScope::Pool
+            && !matches!(phase, SelectionPhase::Prepared | SelectionPhase::Member)
             && state.active.as_deref() != Some(target.label.as_str()))
             || state.pinned
             || (phase != SelectionPhase::Rollback
                 && !super::accounts_pool::native_target_admitted(target, &state, env.now))
         {
             return Err("target-unavailable");
+        }
+        if scope == SelectionScope::Session
+            && matches!(phase, SelectionPhase::Prepared | SelectionPhase::Forward)
+        {
+            if accounts::condition(source, &state, true, env.now) != accounts::Condition::SignedOut
+            {
+                return Err("source-not-signed-out");
+            }
+            // As the decision read it: without a custody record, so a custody login never moves.
+            if !codex_app_login::row_refusal(source, None, Some(&default), env.now)
+                .settled()
+                .is_some_and(codex_app_login::RefusalReason::ends_ordinarily)
+            {
+                return Err("source-not-ended");
+            }
+            if state.lease_verdict(&target.label, env.now).is_err() {
+                return Err("target-unavailable");
+            }
         }
         let custody = super::codex_account_custody::lock(
             env,
@@ -463,7 +559,7 @@ fn with_selection_writer<T>(
     })
 }
 
-fn row_auth(seat: &Seat<'_>, row: &Row) -> PathBuf {
+pub(super) fn row_auth(seat: &Seat<'_>, row: &Row) -> PathBuf {
     row.dir
         .as_ref()
         .map(PathBuf::from)
@@ -514,7 +610,7 @@ fn walled_window(usage: &IdentifiedUsage, now: i64) -> Option<&'static str> {
 
 /// Whether a fresh read lets a session move to its row, by the rule its writer holds a sample on
 /// record to ([`accounts::Sample::low`]), so a read it just made selects no row it would refuse.
-fn usable(usage: &IdentifiedUsage, now: i64) -> bool {
+pub(super) fn usable(usage: &IdentifiedUsage, now: i64) -> bool {
     usage.usage.sample.week_pct.is_some_and(|used| used < 100)
         && usage.usage.sample.session_pct.is_none_or(|used| used < 100)
         && usage.usage.walls.is_empty()

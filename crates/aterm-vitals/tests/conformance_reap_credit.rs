@@ -217,6 +217,7 @@ fn run(fault: Option<ReapFault>) -> Vec<S> {
         l.step(&StepIn {
             at_ns: (t + 1) * 1_000 * MS,
             at_unix_ms: T0_MS + i64::try_from(t * 1000).unwrap_or(0),
+            cpu_cut: Default::default(),
             procs: &procs,
             members: &members,
             delegated: &vec![false; procs.len()],

@@ -49,10 +49,6 @@ fn plan_shape() -> Vec<StageSpec> {
     vec![
         spec(StageId::TestCompile, "compile", Lane::MainTarget, false),
         spec(StageId::Test, "test", Lane::MainTarget, false),
-        StageSpec {
-            after_stages: vec![StageId::TestCompile],
-            ..spec(StageId::Doctests, "doctests", Lane::AfterCompile, false)
-        },
         spec(StageId::Tippy, "tippy", Lane::TippyTarget, false),
         spec(StageId::Formatting, "fmt", Lane::Pure, false),
         spec(StageId::Census, "l0", Lane::Pure, false),
@@ -81,7 +77,7 @@ fn plan_shape() -> Vec<StageSpec> {
             Lane::MainTarget,
             false,
         ),
-        spec(StageId::LinuxLane, "linux", Lane::MainTarget, true),
+        spec(StageId::LinuxLane, "linux", Lane::Pure, true),
     ]
 }
 
@@ -285,7 +281,6 @@ fn ordinary_preflight_halts_without_shortening_test_failure_evidence() {
         let halt = Halt::after_preflight(|_| {});
         assert!(!halt.armed(), "tests still run their complete sweep");
         assert!(!halt.red("test"));
-        assert!(!halt.red("doc"));
         assert!(halt.words().is_none());
         assert!(halt.red(check));
         assert_eq!(
@@ -513,7 +508,9 @@ fn managed_plans_spend_their_share_on_one_stage_without_losing_checks() {
 fn pooled_tree_checks_overlap_without_losing_the_compile_dependency() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 4).unwrap();
-    let mut c = ctx(&crate::checks::RELEASE_TREE, crate::Scope::workspace()).with_pool(Some(pool));
+    let mut c = ctx(&crate::checks::RELEASE_TREE, crate::Scope::workspace())
+        .with_release(true)
+        .with_pool(Some(pool));
     c.env.build_slot_held = Some("1".into());
     c.env.cargo_build_jobs = Some("4".into());
     let specs = crate::plan::plan(&c);
@@ -521,10 +518,7 @@ fn pooled_tree_checks_overlap_without_losing_the_compile_dependency() {
     assert!(specs.iter().all(|s| !s.exclusive));
     let at = |id| specs.iter().position(|s| s.id == id).unwrap();
     let title = |id| specs[at(id)].title.as_str();
-    let pairs = [
-        (title(StageId::Test), title(StageId::Doctests)),
-        (title(StageId::Test), title(StageId::SpecCheck)),
-    ];
+    let pairs = [(title(StageId::Test), title(StageId::SpecCheck))];
     let spans = met_run(&specs, &pairs);
     let span = |id| {
         let (_, start, end) = spans.iter().find(|(i, _, _)| *i == at(id)).unwrap();
@@ -536,10 +530,9 @@ fn pooled_tree_checks_overlap_without_losing_the_compile_dependency() {
         assert!(overlaps(span(a), span(b)));
     }
     assert!(span(StageId::Tippy).1 <= span(StageId::TestCompile).0);
-    for id in [StageId::Test, StageId::Doctests, StageId::SpecCheck] {
+    for id in [StageId::Test, StageId::SpecCheck] {
         assert!(span(StageId::TestCompile).1 <= span(id).0);
     }
-    assert!(span(StageId::Doctests).1 <= span(StageId::SpecCheck).0);
     let mut expected = crate::checks::stages_of(&crate::checks::RELEASE_TREE);
     let mut actual: Vec<_> = specs.iter().map(|s| s.id).collect();
     expected.sort_by_key(|id| *id as u8);
@@ -758,7 +751,7 @@ fn a_stage_above_the_budget_runs_with_no_other_that_claims_memory() {
 /// Declared order holds for memory: with a 10 GiB stage running, a 15 GiB one declared next
 /// waits for room, and a 5 GiB one declared after it, which would fit, waits behind it rather
 /// than overtake it; once the 10 GiB stage ends, the 15 GiB one starts, and then the 5 GiB
-/// one beside it. A stage held by something other than memory (the doctests, after the
+/// one beside it. A stage held by something other than memory (the spec checkers, after the
 /// compile) holds nothing back. NEGATIVE CONTROL: the 5 GiB stage alone after the 10 GiB one
 /// starts beside it.
 #[test]
@@ -801,14 +794,14 @@ fn a_stage_that_fits_never_overtakes_an_earlier_one_waiting_for_room() {
         claiming(StageId::TestCompile, "compile", Lane::MainTarget, 5 * GIB),
         StageSpec {
             after_stages: vec![StageId::TestCompile],
-            ..claiming(StageId::Doctests, "doc", Lane::AfterCompile, 15 * GIB)
+            ..claiming(StageId::SpecCheck, "spec", Lane::AfterCompile, 15 * GIB)
         },
         claiming(StageId::Tippy, "tippy", Lane::TippyTarget, 5 * GIB),
     ];
     assert_eq!(
         ready_now(&after, &[true, true, false, false], &[false; 4], BUDGET),
         ["tippy"],
-        "the doctests wait for the compile, not for room, and hold the lint back from nothing"
+        "the spec checkers wait for the compile, not for room, and hold the lint back from nothing"
     );
 }
 

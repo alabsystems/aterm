@@ -9,8 +9,13 @@
 //! here, beside those readings, so both of its readers share one definition and one rendering
 //! ([`HostVitals::summary`]): aterm-machines fills and prints it, and the window shows it without
 //! depending on aterm-machines.
+//!
+//! ONE LOOK AT THIS MACHINE ([`Look`]) is the reading those figures are mapped from
+//! ([`HostVitals::of`]): [`Look::now`] takes it in this process with no child process, so any
+//! program that links this crate reads its machine as `hello` does.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// One host's machine as `hello` reports it and `aterm machines monitor` samples it. Every
 /// figure is `None` where it was not read, and is then left off the wire; a hello an older agent
@@ -74,7 +79,108 @@ pub struct HostVitals {
     pub rtt_us: Option<u64>,
 }
 
+/// One look at this machine, read in this process with no child process: what a host's vitals
+/// are mapped from ([`HostVitals::of`]). Each OS reading is taken once, so every figure mapped
+/// from one of them comes from the same moment. A reading that was not taken is `None`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Look {
+    /// The logical cores ([`aterm_sysprobe::cpu_layout`]); `None` where the layout reads none.
+    pub cores: Option<u32>,
+    /// The 1-, 5- and 15-minute load averages ([`aterm_sysprobe::load_average`]).
+    pub load: Option<[f64; 3]>,
+    /// The memory classes ([`aterm_sysprobe::memory_detail`]): total, available, used, wired,
+    /// compressed, swap and pressure.
+    pub memory: Option<aterm_sysprobe::MemoryDetail>,
+    /// The GPU ([`aterm_sysprobe::gpu`]): its device utilization, name and core count.
+    pub gpu: Option<aterm_sysprobe::GpuReading>,
+    /// The volume holding the account's home, placed as admission places it
+    /// ([`crate::reading::volume_of`]); `None` where no home was given or it is unread.
+    pub volume: Option<aterm_sysprobe::volumes::Reading>,
+}
+
+impl Look {
+    /// This machine now, its volume the one holding `home` (`None`: no volume is read). Each
+    /// reading is one in-process call into aterm-sysprobe; none starts a child process. The GPU
+    /// is read on every OS, and a process's first GPU read on Windows opens a counter query
+    /// for about a quarter of a second ([`aterm_sysprobe::gpu`]).
+    #[must_use]
+    pub fn now(home: Option<&Path>) -> Look {
+        Look {
+            gpu: aterm_sysprobe::gpu(),
+            ..Look::without_gpu(home)
+        }
+    }
+
+    /// [`Self::now`] with the GPU left unread: the look of a reader that must not pay for a
+    /// process's first GPU read on Windows (the kept look, [`crate::machine_look`]).
+    #[must_use]
+    pub fn without_gpu(home: Option<&Path>) -> Look {
+        Look {
+            cores: u32::try_from(aterm_sysprobe::cpu_layout().logical_cores())
+                .ok()
+                .filter(|n| *n > 0),
+            load: aterm_sysprobe::load_average(),
+            memory: aterm_sysprobe::memory_detail(),
+            gpu: None,
+            volume: home.and_then(|home| {
+                crate::reading::volume_of(home, &aterm_sysprobe::volumes::table()).ok()
+            }),
+        }
+    }
+}
+
+/// A load average in hundredths (`1.42` reads 142), rounded; a negative or non-finite one
+/// (which [`aterm_sysprobe::load_average`] never gives) reads 0.
+pub(crate) fn hundredths(load: f64) -> u32 {
+    let scaled = (load * 100.0).round();
+    if scaled.is_finite() && scaled > 0.0 {
+        scaled.min(f64::from(u32::MAX)) as u32
+    } else {
+        0
+    }
+}
+
 impl HostVitals {
+    /// The vitals one look at the machine `r` gives, `uptime_secs` beside them: each figure
+    /// from the one reading that owns it, `None` where that reading is absent.
+    /// - The CPU layout's: the logical cores.
+    /// - The load averages': the 1-, 5- and 15-minute load.
+    /// - The memory classes': total, available ([`aterm_sysprobe::MemoryDetail::available`],
+    ///   what admission counts too), used ([`aterm_sysprobe::MemoryDetail::used`]), wired,
+    ///   compressed, swap used and the pressure word.
+    /// - The GPU's: how busy it is, its name and core count.
+    /// - The home volume's: its size and free bytes (`f_bavail`).
+    #[must_use]
+    pub fn of(r: &Look, uptime_secs: Option<u64>) -> HostVitals {
+        let memory = r.memory.as_ref();
+        let gpu = r.gpu.as_ref();
+        let volume = r.volume.as_ref();
+        HostVitals {
+            cpu_cores: r.cores.filter(|n| *n > 0),
+            load_avg_100: r.load.map(|l| l.map(hundredths)),
+            gpu_name: gpu
+                .and_then(|g| g.name.as_deref())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+            gpu_cores: gpu.and_then(|g| g.cores).filter(|n| *n > 0).map(u32::from),
+            gpu_busy_pct: gpu.and_then(|g| g.device_pct).map(|p| p.min(100)),
+            mem_total_bytes: memory.map(|m| m.total).filter(|t| *t > 0),
+            mem_available_bytes: memory.map(|m| m.available),
+            mem_used_bytes: memory.map(aterm_sysprobe::MemoryDetail::used),
+            mem_wired_bytes: memory.map(|m| m.wired),
+            mem_compressed_bytes: memory.and_then(|m| m.compressed),
+            swap_used_bytes: memory.map(|m| m.swap_used),
+            mem_pressure: memory
+                .and_then(|m| m.pressure)
+                .map(|p| p.as_str().to_owned()),
+            disk_total_bytes: volume.map(|v| v.total),
+            disk_free_bytes: volume.map(|v| v.free),
+            uptime_secs,
+            rtt_us: None,
+        }
+    }
+
     /// Bytes used on the account home's volume: its size less what is free
     /// ([`Self::disk_free_bytes`]), so blocks the volume reserves from this account count as
     /// used, as `sys disk` counts a volume's used bytes

@@ -29,6 +29,8 @@ pub enum Error {
     Verification,
     Rejected,
     Mail(&'static str),
+    /// Its automatic account work was cancelled (a quit, an update).
+    Cancelled,
 }
 
 impl std::fmt::Display for Error {
@@ -46,6 +48,7 @@ impl std::fmt::Display for Error {
                 "Google sign-in requires an unsupported or unconfigured verification step"
             }
             Self::Rejected => "Google rejected the submitted credential or verification code",
+            Self::Cancelled => "Google approval stopped for shutdown or update",
         })
     }
 }
@@ -57,6 +60,13 @@ pub(super) struct Context<'a> {
     pub state: &'a Path,
     pub mailbox: Option<&'a MailboxConfig>,
     pub current: &'a dyn Fn() -> bool,
+}
+
+/// Whether this approval's account work was cancelled (a quit, an update).
+fn cancelled(ctx: &Context<'_>) -> bool {
+    ctx.work
+        .as_ref()
+        .is_some_and(super::account_work::Scope::cancelled)
 }
 
 pub(super) fn approve(
@@ -89,6 +99,9 @@ pub(super) fn approve(
     let mut seen = BTreeSet::new();
     let started = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok());
     loop {
+        if cancelled(ctx) {
+            return Err(Error::Cancelled);
+        }
         if deadline.passed() {
             return Err(Error::Deadline);
         }
@@ -186,10 +199,18 @@ pub(super) fn approve(
                     Some(ctx.home),
                     ctx.mailbox,
                     started,
-                    super::login_drive::Deadline::waking(deadline, &std::time::Instant::now),
+                    super::login_drive::Deadline::waking(deadline, &std::time::Instant::now)
+                        .cancelled_by(&|| cancelled(ctx)),
                     &mut seen,
                 )
-                .map_err(Error::Mail)?;
+                // A poll the cancellation ended says its deadline passed; it was a quit.
+                .map_err(|why| {
+                    if cancelled(ctx) {
+                        Error::Cancelled
+                    } else {
+                        Error::Mail(why)
+                    }
+                })?;
                 mail_code = Some(SecretBytes::from(code));
             }
             Some("mailcode") => {

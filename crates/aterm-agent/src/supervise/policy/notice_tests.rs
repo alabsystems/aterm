@@ -43,7 +43,7 @@ fn filled(n: &NoticeText) -> Filled {
 }
 
 fn longest_reset() -> String {
-    crate::supervise::limit::ResetClock::of(Some("Sep 30 at 12:30pm"))
+    crate::supervise::limit::reset_clock(Some("Sep 30 at 12:30pm"))
         .expect("a clock")
         .words()
 }

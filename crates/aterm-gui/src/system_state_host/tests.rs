@@ -5449,6 +5449,36 @@ fn an_occluded_focused_window_is_not_in_front_for_on_screen_steps() {
     );
 }
 
+/// A window that becomes key while macOS reports it occluded (the key window closed behind a
+/// lock screen, so another window takes the focus) gets no occlusion change, so the focus alone
+/// does not put System State in front: its next frame draws at once, but the window stays
+/// occluded for the on-screen steps until macOS says it is visible.
+#[test]
+fn a_window_focused_while_occluded_is_not_in_front_for_on_screen_steps() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.windows.get_mut(&wid).unwrap().os_window_for_test = true;
+    let (_, _instance, _view) = page(&mut app);
+    assert!(app.commit_glassless_native_frame(wid));
+    fresh(&mut app, running());
+    app.window_focus_event(wid, false);
+    app.on_occlusion_changed(wid, true);
+    app.window_focus_event(wid, true);
+    assert!(
+        app.windows[&wid].focused,
+        "precondition: the window took the focus"
+    );
+    assert!(
+        !app.system_state_frontmost(),
+        "a key window behind a lock screen puts macOS prompts on a screen nobody sees"
+    );
+    app.on_occlusion_changed(wid, false);
+    assert!(
+        app.system_state_frontmost(),
+        "once macOS says it is visible, it is in front"
+    );
+}
+
 /// A person stage starts only with HID input in the last 60 s and an unlocked screen
 /// (init-on-by-default design §6.1, §6.4): the worker's `page_front` port is what
 /// [`App::publish_system_state_front`] publishes, so a focused, visible page with nobody at the

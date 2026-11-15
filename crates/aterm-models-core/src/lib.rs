@@ -18,6 +18,7 @@ mod models_lan;
 mod models_resize_row_reuse;
 mod models_run_loop_waker;
 mod models_sandbox;
+mod models_scrollback_handoff;
 
 pub use models_lan::{lan_boundary_model, lan_prepared_listen_model};
 mod models_screen_generation;
@@ -40,6 +41,7 @@ pub use models_resize_row_reuse::resize_row_reuse_model;
 pub use models_run_loop_waker::run_loop_waker_model;
 pub use models_sandbox::sandbox_model;
 pub use models_screen_generation::observation_screen_generation_model;
+pub use models_scrollback_handoff::scrollback_handoff_model;
 pub use models_text_selection_lifecycle::text_selection_lifecycle_model;
 
 /// Encodes core model state counts into 16 little-endian bytes.

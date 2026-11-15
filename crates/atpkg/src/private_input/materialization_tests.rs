@@ -2,7 +2,73 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::private_input::Producer;
 use std::{fs, time::Duration};
+
+#[test]
+fn attempt_still_requires_one_to_eight_actual_input_uses_before_workspace_creation() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let source = Producer::create(world.path(), "source")
+        .unwrap()
+        .finish()
+        .unwrap();
+    for count in [0, 9] {
+        let inputs = (0..count).map(|_| source.lend().unwrap()).collect();
+        let refused = MaterializationAttempt::create(
+            world.path(),
+            "attempt",
+            inputs,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(refused.error().kind(), io::ErrorKind::InvalidInput);
+        let (_, original) = refused.into_parts();
+        assert_eq!(original.len(), count);
+        for input in original {
+            input.check_current().unwrap();
+        }
+        assert!(!world.path().join("attempt").exists());
+    }
+    let inputs = (0..8).map(|_| source.lend().unwrap()).collect();
+    let attempt = MaterializationAttempt::create(
+        world.path(),
+        "attempt",
+        inputs,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    attempt.check_current().unwrap();
+}
+
+#[test]
+fn failed_fresh_workspace_creation_returns_the_same_original_input_use() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let source = Producer::create(world.path(), "source")
+        .unwrap()
+        .finish()
+        .unwrap();
+    fs::create_dir(world.path().join("attempt")).unwrap();
+    let input = source.lend().unwrap();
+    let original_identity = std::sync::Arc::as_ptr(&input.inner);
+    let refused = MaterializationAttempt::create(
+        world.path(),
+        "attempt",
+        vec![input],
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(refused.error().kind(), io::ErrorKind::AlreadyExists);
+    let (_, original) = refused.into_parts();
+    assert_eq!(original.len(), 1);
+    assert_eq!(
+        std::sync::Arc::as_ptr(&original[0].inner),
+        original_identity
+    );
+    original[0].check_current().unwrap();
+    assert!(!world.path().join("attempt/.input-owner").exists());
+}
 
 #[test]
 fn failed_preflight_returns_original_inputs_before_creating_a_namespace() {

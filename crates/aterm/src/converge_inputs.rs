@@ -14,7 +14,7 @@ use aterm_machines::init_github::{
 };
 use aterm_machines::port::{Live, System};
 use aterm_secrets::client::Paths;
-use aterm_secrets::converge::RepositoryWork;
+use aterm_secrets::converge::{MarkMoved, RepositoryWork};
 use aterm_uds::file_watch::FileWatch;
 use aterm_uds::ready::Doorbell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -140,6 +140,11 @@ struct Inputs {
     /// read owes what a watch may not hear ([`settled_look`]). A declaration missing or refused
     /// is no such read: what replaces it is heard.
     unsettled: Option<Instant>,
+    /// What moved the mark in the looks that called for work since [`Self::take_moved`] last
+    /// took it, as classes and never a path, and how many such looks there were: for the note
+    /// of the start they cause, and nothing else.
+    moved: MarkMoved,
+    moves: u32,
 }
 
 impl Inputs {
@@ -152,6 +157,8 @@ impl Inputs {
             control: RepositoryInputPathCache::default(),
             checkouts_read: None,
             unsettled: None,
+            moved: MarkMoved::default(),
+            moves: 0,
         };
         if allowed {
             let _ = inputs.changed(sys, true, now);
@@ -230,15 +237,17 @@ impl Inputs {
             self.unsettled = Some(now);
             return Err(());
         };
+        let admission = self
+            .metadata
+            .as_ref()
+            .is_some_and(|prev| prev.admission != metadata.admission);
         let work = if self.held
             || self
                 .seen
                 .as_ref()
                 .is_none_or(|before| !before.same_source(&mark))
-            || self
-                .metadata
-                .as_ref()
-                .is_none_or(|prev| prev.admission != metadata.admission)
+            || self.metadata.is_none()
+            || admission
         {
             Some(RepositoryWork::Refresh)
         } else if self.seen.as_ref() != Some(&mark) {
@@ -246,6 +255,23 @@ impl Inputs {
         } else {
             None
         };
+        if work.is_some() {
+            // Why this look calls for work, as classes: the mark's own move, or `first` with no
+            // mark before it; a hold let go; a folder above a control path whose admission
+            // moved.
+            let mut moved = self
+                .seen
+                .as_ref()
+                .map_or(MarkMoved::FIRST, |before| mark.moved(before));
+            if self.held {
+                moved = moved.with(MarkMoved::RESUMED);
+            }
+            if admission {
+                moved = moved.with(MarkMoved::ADMISSION);
+            }
+            self.moved = self.moved.with(moved);
+            self.moves = self.moves.saturating_add(1);
+        }
         // Retain the state captured with the semantic scope. Resampling after capture could
         // cache a later repair next to an earlier mark and swallow that repair on the next tick.
         metadata.checkouts = Some(mark.captured_checkout_metadata());
@@ -254,6 +280,15 @@ impl Inputs {
         self.seen = Some(mark);
         self.held = false;
         Ok(work)
+    }
+
+    /// What moved the mark in the looks that called for work since this was last asked, and
+    /// how many such looks there were ([`Self::moved`]); it starts again from none.
+    fn take_moved(&mut self) -> (MarkMoved, u32) {
+        (
+            std::mem::take(&mut self.moved),
+            std::mem::take(&mut self.moves),
+        )
     }
 
     fn request(
@@ -430,6 +465,13 @@ impl Readiness {
     fn watched(&self) -> impl Iterator<Item = Watch> + '_ {
         self.ready.iter().flat_map(|(inputs, _)| inputs.watched())
     }
+
+    /// The inputs' [`Inputs::take_moved`]: nothing before they are admitted.
+    fn take_moved(&mut self) -> (MarkMoved, u32) {
+        self.ready
+            .as_mut()
+            .map_or_else(Default::default, |(inputs, _)| inputs.take_moved())
+    }
 }
 
 /// An input a look reads that a file watch can hear: a file, or a folder of records whose entries
@@ -595,6 +637,7 @@ fn observing(
     observed.arm();
     let observed = Arc::new(Mutex::new(observed));
     let looked = Arc::clone(&observed);
+    let moved = Arc::clone(&observed);
     let repository_sys = Arc::clone(&sys);
     let naming_sys = Arc::clone(&sys);
     aterm_secrets::client::ConvergenceInputs::new(Box::new(move |refresh| {
@@ -610,6 +653,13 @@ fn observing(
     }))
     .with_identity(Box::new(move || {
         naming.request(naming_sys.as_ref(), || sharing())
+    }))
+    .with_moved(Box::new(move || {
+        moved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .readiness
+            .take_moved()
     }))
     .with_refresh(Box::new(move || {
         state

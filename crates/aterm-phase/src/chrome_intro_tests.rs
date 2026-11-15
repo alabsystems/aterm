@@ -9,12 +9,12 @@
 //! extension is found, and taller than its pane.
 
 use super::*;
-use crate::phase::Phase;
 use crate::prompt::fixtures::{
     CHROME_INTRO, CHROME_INTRO_EXTENSION_FOUND, CHROME_INTRO_FULLSCREEN, CHROME_INTRO_HEAD_OFF,
     CHROME_INTRO_INLINE, ink_wrap, screen,
 };
 use crate::prompt::parse_prompt_v2;
+use alab_policy::vocab::Phase;
 
 const TITLE: &str = "Claude in Chrome";
 const FOOTER: &str = "Enter to confirm · Esc to cancel";

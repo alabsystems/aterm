@@ -29,9 +29,6 @@ use super::fixture::{
 use super::install::{Box_, install, machine};
 use crate::shared::{toml_path, write_config};
 
-/// The runbook every provisioning text names.
-const RUNBOOK: &str = "docs/RUNBOOK-atpkg-republish.md";
-
 /// The staging owner every judging test uses, which `dev_config` writes.
 const STAGING: &str = "fixture-dev";
 
@@ -505,28 +502,6 @@ fn hosts_check_reports_each_check() {
     assert!(
         !named(&checks, "grants").detail.contains("alabsystems/"),
         "{checks:?}"
-    );
-
-    // 9. A writer whose token is a variable: no lane unit carries one, and git's helper reads
-    // only token files, so it fails before any variable is read.
-    write_config(
-        &dirs,
-        "[profiles.dev]\nenv = \"AGH_FIXTURE_NEVER_SET\"\ntier = \"dev\"\n\
-         login = \"fixture-dev-bot\"\n\n\
-         [[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = [\"dev\"]\nwrite = \"dev\"\n",
-    );
-    let checks = check(HostChoice::AghStaging, false);
-    let staging = named(&checks, "staging_writer");
-    assert!(!staging.ok, "{staging:?}");
-    assert!(
-        staging
-            .detail
-            .starts_with("dev writes fixture-dev, and its token is not in a token file"),
-        "{staging:?}"
-    );
-    assert!(
-        staging.detail.contains("aterm secrets need gh:dev") && staging.detail.contains(RUNBOOK),
-        "{staging:?}"
     );
 }
 

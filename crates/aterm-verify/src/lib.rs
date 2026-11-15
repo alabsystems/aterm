@@ -39,13 +39,12 @@ pub const FROZEN_TOOL_VERSION: &str = "aterm-verify tool 1";
 #[cfg(all(test, unix, debug_assertions))]
 mod benchmark_fixture_tests;
 
+mod admission_rows;
 pub mod appkit_content;
 pub mod browser;
 pub mod cells;
 mod census_fix;
 pub mod changed;
-pub mod changelog_fragments;
-pub mod changelog_guard;
 pub mod checks;
 pub mod cli;
 pub mod compile_account;
@@ -55,8 +54,6 @@ mod compiler_observation;
 /// The disk a run will write, claimed before it builds (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT).
 #[cfg(unix)]
 pub mod disk;
-pub mod docdriver;
-pub mod docscan;
 pub mod engine;
 pub mod event_log;
 pub mod exec;
@@ -65,7 +62,6 @@ pub mod findings;
 pub mod fmt;
 pub mod git_paths;
 pub mod git_provider;
-pub mod harness_debt;
 pub mod input_content;
 pub mod ladder;
 pub mod launch_agent;
@@ -87,6 +83,8 @@ mod resource_waits;
 mod run_log;
 /// Nothing outlives its run: the run record, the stage-end survivor check and the next run's start ending a dead run's proven members (`docs/DESIGN-leftover-processes-2026-10-16.md` §3.3, §5.4, §8.1).
 pub mod runs;
+#[cfg(unix)]
+pub mod runtime_capture;
 pub mod rustup;
 pub mod sched;
 pub mod scope;
@@ -97,8 +95,8 @@ pub mod smoke;
 pub mod smoke_stages;
 pub mod soak;
 pub mod stages;
+pub mod stale_artifact;
 pub mod status;
-pub mod test_content;
 mod test_env;
 pub mod test_history;
 pub mod test_index;
@@ -108,7 +106,9 @@ mod test_shards;
 mod test_share;
 mod test_workers;
 pub mod testrun;
+mod turn;
 pub mod unitgraph;
+pub mod vendor_out;
 /// THE toolchain resolution, shared with atpkg (`aterm help rust`), the libc oracle's gate and the release cutter.
 pub use aterm_toolchain::discovery as toolchain;
 #[cfg(unix)]
@@ -116,13 +116,30 @@ pub mod judged;
 /// `verify land`: merge main, judge the cone since it, push, compose or re-judge (design B10).
 #[cfg(unix)]
 pub mod land;
+/// `verify land --census`: what a window of run records says about landing, read from the
+/// journal and the clone's spool, deciding nothing.
+#[cfg(unix)]
+pub mod land_census;
+/// `verify land`'s verdict records: one signed record per check of a judged tree, filed in the
+/// journal's `land/`.
+#[cfg(unix)]
+pub mod land_record;
+/// `verify land`'s run records: one per judgment, round, compose and abort of a landing run,
+/// and one at its end whatever its exit (but a run killed outright, or held past the
+/// interrupt's report grace), filed in the journal's `land/runs/`.
+#[cfg(unix)]
+pub mod land_run;
+/// What each check of a run reads beyond its tree, as `verify land`'s records key it.
+pub mod land_seal;
+/// The verdict and run records a clone has still to append to the journal.
+#[cfg(unix)]
+pub mod land_spool;
 #[cfg(unix)]
 mod remote;
 pub mod remote_cli;
 pub mod remote_host;
 pub mod wasm_glue;
 mod wasm_page;
-pub mod wasm_smoke;
 #[cfg(unix)]
 pub mod watch;
 pub mod window_list;
@@ -1126,15 +1143,15 @@ pub struct Ctx {
     pub test_cores: Option<u32>,
     /// Explicit libtest shuffle seed; none preserves its ordinary case order.
     pub test_seed: Option<u64>,
-    /// The program cargo runs in place of test binaries ([`testrun::RECORD_FLAG`]) and rustdoc ([`docdriver`]).
+    /// The program cargo runs in place of test binaries ([`testrun::RECORD_FLAG`]).
     pub test_recorder: Option<PathBuf>,
     /// How the timing stages ([`plan::TIMED`]), and the browser lane where Safari's window takes
     /// the desk (`browser::takes_the_desk`), take the quiet machine: the run waits in the
     /// per-user capacity ledger for measured admission before its first (`Some(Wait)`), and
     /// retains bounded protection through its stages. `Some(Now)` cannot qualify Timing: a
-    /// measurement stage starts no callback, while the AppKit correctness drivers make one
-    /// non-overriding attempt to own the per-user window admission, then run and report their
-    /// live load without claiming measurement qualification. `None` is the caller's explicit
+    /// measurement stage starts no callback, while the AppKit correctness drivers wait, bounded
+    /// ([`WINDOW_WAIT`]) and never overriding, for another run's per-user window admission to end,
+    /// then run and report their live load without claiming measurement qualification. `None` is the caller's explicit
     /// untimed/outer-owned contract; it supplies no CPU observation or measurement qualification.
     pub quiet: Option<aterm_capacity::Admit>,
     /// A repeatable watch sample whose stage admissions rank behind overlapping Ordinary work.
@@ -1148,22 +1165,24 @@ pub struct Ctx {
     /// by ([`test_plan`]): planning data, never a verdict. `None` keeps nothing and plans every
     /// binary as unseen, as every run a test makes does.
     pub test_history: Option<PathBuf>,
-    /// The complete test proofs a run may carry ([`testrun::carry`], `--passed-binaries`).
-    pub passed_binaries: Option<testrun::Passed>,
     /// Per-package lint successes a release resume may carry by complete content key.
     pub passed_lint_packages: Option<lint_content::Passed>,
     /// Prior successful AppKit groups whose current executable bytes must be re-keyed before
     /// their WindowServer work can be carried.
     pub passed_appkit_groups: Option<appkit_content::Passed>,
+    /// The owner-private directory holding each AppKit group's empty working directory and the
+    /// `windowed.lock` that serializes them; `None` is the stable per-user one every real run
+    /// shares, so a carried group's proof names the same cwd at every hop. A test context names
+    /// its own ([`Ctx::with_appkit_runtime`]): a test never clears, fills or inspects a real run's
+    /// directory, nor another test's after its lock is released. A build with debug assertions
+    /// off has no such seam and always uses the per-user one.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) appkit_runtime: Option<PathBuf>,
     /// Source-reader candidates from the immediately preceding preflight attempt.
     pub input_items: Vec<input_content::Proof>,
-    /// The release cutter's frozen verifier, seal and toolchain context, salted into each test
-    /// binary and lint-package content key (`--carry-context`).
+    /// The release cutter's frozen verifier, seal and toolchain context, salted into each
+    /// lint-package, source-reader and AppKit content key (`--carry-context`).
     pub carry_context: Option<String>,
-    /// A development test run brackets each test binary's executable and declared runtime
-    /// inputs, as a release's does (`--input-drift`, [`testrun::evidence_context`]): a successful
-    /// binary whose inputs changed while it ran makes the test check NOT RUN. It carries nothing.
-    pub input_drift: bool,
     /// Where a run writes each `check-finished`, `test-binary-finished` and
     /// `lint-package-finished` line whole, apart from its output, and its check-terminal
     /// `run-finished` line (`--events`; later accounting may follow): a release's cutter keeps its
@@ -1176,6 +1195,13 @@ pub struct Ctx {
     /// run's own compile, are COULD NOT RUN behind it and start no cargo, since a recompile of
     /// what failed would run under a claim learned when it passed, or none.
     pub test_compile_failed: std::sync::atomic::AtomicBool,
+    /// Each run's id and CPU for its admission-log rows, begun afresh by each run of its checks
+    /// ([`run_with`], [`admission_rows::Tally`]).
+    pub(crate) admission: admission_rows::Tally,
+    /// The CPU the run's test binaries' trees were read using, ms, over every test stage
+    /// (`testrun`'s `test-cpu-accounted`; a lower bound where a tree was unread): what the
+    /// judgment turn's prediction predicts, which its `judgment-cpu` sets beside it ([`turn`]).
+    pub(crate) tests_cpu_ms: std::sync::atomic::AtomicU64,
     /// What the run's first proven red ends ([`halt_of`]): the tree half finishes its sweep
     /// unless explicitly fail-fast; other releases halt, and ordinary runs halt at preflight.
     pub halt: sched::Halt,
@@ -1191,6 +1217,8 @@ pub struct Ctx {
     /// ([`shape::fresh_check`]), and what every compile call reported of its build directory
     /// ([`disk::note_call`]).
     pub shape_run: Mutex<shape::Run>,
+    /// The lab executable whose build succeeded in this run, before the VM phase starts.
+    pub(crate) linux_lab_built: Mutex<Option<PathBuf>>,
     /// When the run began (its context was made), which the run's record of what it used names
     /// ([`disk::keep_used`]): a unit of one of its build directories written since is one some
     /// compile of the run built.
@@ -1203,6 +1231,12 @@ pub struct Ctx {
     /// ([`testrun::dispatch_pooled`]); `None` without an adopted pool. Shared ownership keeps
     /// bounded workers' tokens alive until their actual completion.
     pub pool: Option<std::sync::Arc<aterm_capacity::Jobserver>>,
+    /// The run's one read of the publication engine, at its first ask ([`Ctx::engine`]).
+    pub(crate) engine: std::sync::OnceLock<Result<engine::Files, String>>,
+    /// The run's land plan and what reseals it (`run-planned`, `run-resealed`,
+    /// [`land_seal::Run`]): [`run_cli`] makes it for a run that keeps an events file; `None` for
+    /// one that keeps none.
+    pub land: Option<land_seal::Run>,
 }
 
 /// A `CARGO_BUILD_JOBS` value as a job count.
@@ -1361,22 +1395,27 @@ impl Ctx {
             runs: None,
             memory: None,
             test_history: None,
-            passed_binaries: None,
             passed_lint_packages: None,
             passed_appkit_groups: None,
+            #[cfg(any(test, debug_assertions))]
+            appkit_runtime: None,
             input_items: Vec::new(),
             carry_context: None,
-            input_drift: false,
             events: None,
             hang_samples: None,
             test_compile_failed: std::sync::atomic::AtomicBool::new(false),
+            admission: admission_rows::Tally::default(),
+            tests_cpu_ms: std::sync::atomic::AtomicU64::new(0),
             halt: sched::Halt::off(),
             unit_graph: stages::unit_graph,
             workspace_members: |ctx| changed::read_members(&ctx.root, &ctx.tools, &ctx.path_env),
             shape_run: Mutex::new(shape::Run::default()),
+            linux_lab_built: Mutex::new(None),
             began: std::time::SystemTime::now(),
             unit_reader: memory::read_unit,
             pool: None,
+            engine: std::sync::OnceLock::new(),
+            land: None,
         };
         ctx.refresh_test_threads();
         ctx
@@ -1645,14 +1684,6 @@ impl Ctx {
         self
     }
 
-    /// Carry the complete test proofs `passed` names when their current executable and runtime
-    /// inputs still match ([`Ctx::passed_binaries`]).
-    #[must_use]
-    pub fn with_passed_binaries(mut self, passed: Option<testrun::Passed>) -> Self {
-        self.passed_binaries = passed;
-        self
-    }
-
     /// Carry prior per-package lint successes into a release lint run.
     #[must_use]
     pub fn with_passed_lint_packages(mut self, passed: Option<lint_content::Passed>) -> Self {
@@ -1667,18 +1698,21 @@ impl Ctx {
         self
     }
 
-    /// Salt test evidence with its frozen caller context, or release lint with its frozen
-    /// verifier, seal and toolchain context.
+    /// Keep this context's AppKit runtime in `parent` instead of the stable per-user one: a test
+    /// seam, for this crate's unit tests and its integration tests. `parent` must lie outside the
+    /// candidate root.
+    #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn with_carry_context(mut self, context: Option<String>) -> Self {
-        self.carry_context = context;
+    pub fn with_appkit_runtime(mut self, parent: PathBuf) -> Self {
+        self.appkit_runtime = Some(parent);
         self
     }
 
-    /// Bracket each development test binary's inputs ([`Ctx::input_drift`]).
+    /// Salt release lint, source-reader and AppKit evidence with its frozen verifier, seal and
+    /// toolchain context.
     #[must_use]
-    pub fn with_input_drift(mut self, input_drift: bool) -> Self {
-        self.input_drift = input_drift;
+    pub fn with_carry_context(mut self, context: Option<String>) -> Self {
+        self.carry_context = context;
         self
     }
 
@@ -1688,6 +1722,21 @@ impl Ctx {
     pub fn with_events(mut self, events: Option<event_log::EventLog>) -> Self {
         self.events = events;
         self
+    }
+
+    /// The run's one read of the publication engine ([`engine::Files::read`]), at its first
+    /// ask: the commit export-scan and census judge by, and the files the run's land seal names
+    /// ([`land_seal::ENGINE_BASELINE`], [`land_seal::ENGINE_REGISTRY`]), so what the plan keyed
+    /// is what each check read.
+    pub fn engine(&self) -> &Result<engine::Files, String> {
+        self.engine.get_or_init(|| {
+            engine::Files::read(
+                &self.root,
+                &|name| self.env.engine_var(name),
+                &engine::bounded,
+                &engine::native,
+            )
+        })
     }
 
     /// Write `line`, a `verify-event: ` line, to the run's events file, when it has one.
@@ -1749,11 +1798,10 @@ impl Ctx {
     }
 
     /// The command that reruns `check` over this run's selection, as this run ran it: a release's
-    /// `test` and `doc` rows name `--as-release`, without which they carry no
-    /// `ATERM_SPEC_CHECKERS=1` and `test` owes no [`checks::GOLDEN`] test, so would pass what
-    /// failed. A cone's `lint` row names the cone's base: `-p` over its crates would lint every
-    /// target of each and the crates it left out ([`stages::tippy_passes`]). So does a cone's
-    /// `export-scan` row: under `-p` it scans the whole export, not the changed files. A lint rerun pulls
+    /// `test` row names `--as-release`, without which it carries no `ATERM_SPEC_CHECKERS=1` and
+    /// owes no [`checks::GOLDEN`] test, so would pass what failed. A cone's `lint` row names the
+    /// cone's base, which selects the same cone again. So does a cone's `export-scan` row: under
+    /// `-p` it scans the whole export, not the changed files. A lint rerun pulls
     /// `cells` as any dev lint does ([`checks::pulls_cells`]).
     #[must_use]
     pub fn rerun(&self, check: Check) -> String {
@@ -1780,7 +1828,7 @@ impl Ctx {
         if self.compile_only && matches!(check, Check::Test | Check::Checkers | Check::Measure) {
             cmd.push_str(" --compile-only");
         }
-        if self.checkers_in_tests && matches!(check, Check::Test | Check::Doc) {
+        if self.checkers_in_tests && check == Check::Test {
             cmd.push_str(" --as-release");
         }
         if self.no_windows && check.spec().stages.iter().any(|id| id.opens_windows()) {
@@ -1853,6 +1901,33 @@ pub(crate) fn admit_live(
         need,
         mode,
         &mut |line| eprintln!("{line}"),
+    )
+}
+
+/// Admit `need` in this user's ledger on the live machine ([`admit_in`]), saying through `say`
+/// what it waits for: the judgment turn's admission ([`turn::take`]), which reports its first
+/// wait as an event.
+///
+/// # Errors
+/// As [`admit_live`].
+fn admit_with_say(
+    need: aterm_capacity::Need,
+    mode: aterm_capacity::Admit,
+    say: &mut dyn FnMut(&str),
+) -> Result<aterm_capacity::Claim, aterm_capacity::Error> {
+    let ledger = aterm_capacity::Ledger::user().ok_or_else(|| {
+        aterm_capacity::Error::Ledger(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory to keep the ledger under",
+        ))
+    })?;
+    admit_in(
+        &ledger,
+        &aterm_capacity::Live,
+        aterm_capacity::Pace::default(),
+        need,
+        mode,
+        say,
     )
 }
 
@@ -2340,23 +2415,120 @@ fn takes_quiet(ctx: &Ctx, id: plan::StageId) -> bool {
     (id.timed() || desk) && !plan::named_skip(ctx, id)
 }
 
-const APPKIT_NOW: &str = "ran immediately under --admit now without quiet qualification; live \
+const APPKIT_NOW: &str = "ran under --admit now without quiet qualification; live \
 load is reported, not a refusal";
 
-/// Make one non-overriding attempt to own the per-user window admission on the live machine.
+/// Make one non-overriding look at the per-user window admission on the live machine, keeping
+/// what it was short of and who held it when it was not admitted.
 ///
 /// # Errors
 /// The capacity ledger is unavailable.
 fn try_window_live(
     need: aterm_capacity::Need,
-) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error> {
+) -> Result<aterm_capacity::admit::AdmissionAttempt, aterm_capacity::Error> {
     let ledger = aterm_capacity::Ledger::user().ok_or_else(|| {
         aterm_capacity::Error::Ledger(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no home directory to keep the ledger under",
         ))
     })?;
-    aterm_capacity::admit::try_admit_with(&ledger, &aterm_capacity::Live, need)
+    aterm_capacity::admit::try_admit_observed_with(&ledger, &aterm_capacity::Live, need)
+}
+
+/// How long an AppKit driver under `--admit now` waits for the per-user window admission while
+/// another run's claim holds it, before it is COULD NOT RUN. Another landing's or release's
+/// whole `appkit` check holds that claim through both its windowed stages: the longest measured
+/// on m86 held it 986 s (0.200.0 hand1: the two stages' `execution_s`), most under five minutes.
+/// Thirty minutes outlasts one such holder with room to spare and still ends behind a holder that
+/// never lets go.
+pub(crate) const WINDOW_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// How often that wait looks again.
+const WINDOW_LOOK: Duration = Duration::from_secs(2);
+
+/// How often that wait says who holds the admission.
+const WINDOW_SAY: Duration = Duration::from_secs(60);
+
+/// An AppKit driver's wait for the per-user window admission under `--admit now`: how long it may
+/// wait behind another holder ([`WINDOW_WAIT`]) and how often it looks ([`WINDOW_LOOK`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WindowWait {
+    pub bound: Duration,
+    pub look: Duration,
+}
+
+impl WindowWait {
+    const LIVE: WindowWait = WindowWait {
+        bound: WINDOW_WAIT,
+        look: WINDOW_LOOK,
+    };
+}
+
+/// Own the per-user window admission for stage `title`: look with `look`, and while another
+/// claim holds it wait (saying once a minute who holds it) up to `wait.bound`. Nothing is forced:
+/// each look is non-overriding.
+///
+/// # Errors
+/// Words for a stage that started nothing: the run is ending ([`ended`]); the admission can never
+/// be had here (an unreachable need, or no ledger to keep it in), at once; or it stayed held past
+/// the bound, naming who held it at the last look.
+fn window_claim(
+    ctx: &Ctx,
+    title: &str,
+    need: &aterm_capacity::Need,
+    wait: WindowWait,
+    look: &mut impl FnMut(
+        aterm_capacity::Need,
+    ) -> Result<aterm_capacity::admit::AdmissionAttempt, aterm_capacity::Error>,
+) -> Result<aterm_capacity::Claim, String> {
+    use aterm_capacity::admit::AdmissionAttempt;
+    let started = Instant::now();
+    let mut said: Option<Instant> = None;
+    loop {
+        if let Some(why) = ended(ctx) {
+            return Err(why);
+        }
+        let short = match look(need.clone()) {
+            Ok(AdmissionAttempt::Admitted(claim)) => {
+                if said.is_some() {
+                    eprintln!(
+                        "verify: {title}: the per-user window admission was had after {}",
+                        aterm_capacity::span(started.elapsed())
+                    );
+                }
+                return Ok(claim);
+            }
+            Ok(AdmissionAttempt::Unreachable(why)) => {
+                return Err(format!(
+                    "{title}: the per-user window admission can never be had here: {why}; \
+                     started nothing"
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "{title}: the per-user window admission is unavailable: {error}; started \
+                     nothing"
+                ));
+            }
+            Ok(AdmissionAttempt::Waiting(short)) => short,
+        };
+        let waited = started.elapsed();
+        if waited >= wait.bound {
+            return Err(format!(
+                "{title}: the per-user window admission was still held after {} (its bound): \
+                 {short}; started nothing",
+                aterm_capacity::span(waited)
+            ));
+        }
+        if said.is_none_or(|at| at.elapsed() >= WINDOW_SAY) {
+            eprintln!(
+                "verify: {title}: waiting up to {} more for the per-user window admission: {short}",
+                aterm_capacity::span(wait.bound - waited)
+            );
+            said = Some(Instant::now());
+        }
+        std::thread::sleep(wait.look.min(wait.bound - waited));
+    }
 }
 
 /// Run `f` under the timing rule for `id`. AppKit's live correctness drivers have no timing
@@ -2370,7 +2542,7 @@ fn run_timed<T>(
     title: &str,
     f: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, Option<String>), String> {
-    run_timed_with(ctx, quiet, id, title, try_window_live, f)
+    run_timed_with(ctx, quiet, id, title, WindowWait::LIVE, try_window_live, f)
 }
 
 fn run_timed_with<T>(
@@ -2378,9 +2550,11 @@ fn run_timed_with<T>(
     quiet: &Mutex<Quiet>,
     id: plan::StageId,
     title: &str,
+    wait: WindowWait,
     mut try_window: impl FnMut(
         aterm_capacity::Need,
-    ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error>,
+    )
+        -> Result<aterm_capacity::admit::AdmissionAttempt, aterm_capacity::Error>,
     f: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, Option<String>), String> {
     if !takes_quiet(ctx, id) {
@@ -2401,24 +2575,15 @@ fn run_timed_with<T>(
             let need = aterm_capacity::Need::new(format!("verify {title}"))
                 // Infinity ignores load while retaining the ledger's cross-process exclusion:
                 // another quiet/window claim is still a shortfall. No patience means no GPU or
-                // timing wait, and `try_admit_with` makes exactly one non-overriding look.
+                // timing wait; each look is non-overriding and the wait for another window
+                // holder is bounded ([`WINDOW_WAIT`]).
                 .quiet(f64::INFINITY)
                 .checkout(ctx.root.to_string_lossy());
-            match try_window(need) {
-                Ok(Some(claim)) => q.claim = Some(Arc::new(claim)),
-                Ok(None) => {
+            match window_claim(ctx, title, &need, wait, &mut try_window) {
+                Ok(claim) => q.claim = Some(Arc::new(claim)),
+                Err(why) => {
                     q.passed();
-                    return Err(format!(
-                        "{title}: the per-user window admission was unavailable at its immediate \
-                         look; started nothing"
-                    ));
-                }
-                Err(error) => {
-                    q.passed();
-                    return Err(format!(
-                        "{title}: the per-user window admission is unavailable: {error}; started \
-                         nothing"
-                    ));
+                    return Err(why);
                 }
             }
         }
@@ -2446,7 +2611,7 @@ fn measured(
     meter: Option<&memory::Meter>,
     compile_jobs: Option<u32>,
     units: Option<&compile_width::Units>,
-) -> Option<String> {
+) -> Option<(String, &'static str)> {
     let book = ctx.memory.as_ref()?;
     if !memory::metered(spec) {
         return None;
@@ -2468,10 +2633,15 @@ fn measured(
         None
     };
     if let Some(why) = not_kept {
-        return Some(format!("memory: peaked {size}, not kept: {why}"));
+        return Some((
+            format!("memory: peaked {size}, not kept: {why}"),
+            "not-kept",
+        ));
     }
     let key = compile_width::record_key(memory::Key::of_stage(spec, ctx), compile_jobs);
-    let mut said = match book.keep(spec, &key, peak) {
+    let keeping = book.keep(spec, &key, peak);
+    let kept = admission_rows::kept_word(&keeping);
+    let mut said = match keeping {
         Ok(memory::Kept::Kept | memory::Kept::Nowhere) => format!("memory: peaked {size}"),
         Ok(memory::Kept::Light) => format!(
             "memory: peaked {size}, not kept: light beside the heaviest peak its record kept in \
@@ -2503,7 +2673,7 @@ fn measured(
             Err(error) => said.push_str(&format!("; compiler footprint peaks not kept: {error}")),
         }
     }
-    Some(said)
+    Some((said, kept))
 }
 
 /// What the run's memory budget of `budget` bytes held stage `i` of `stages` back for
@@ -2543,9 +2713,17 @@ pub(crate) struct ResourceClaim {
     pub(crate) said: String,
     /// Unit admission configured by the early claim, installed only on the stage's own thread.
     pub(crate) units: Option<compile_width::Units>,
+    /// What sized its memory, for its stage's admission-log row ([`admission_rows::basis`]).
+    pub(crate) basis: admission_rows::Basis,
 }
 
 impl ResourceClaim {
+    /// This claim, its memory sized by `basis` ([`admission_rows::basis`]).
+    pub(crate) const fn sized_by(mut self, basis: admission_rows::Basis) -> Self {
+        self.basis = basis;
+        self
+    }
+
     /// The cover marker its stage's children are handed ([`memory::cover`]).
     pub(crate) fn cover(&self) -> Option<std::sync::Arc<str>> {
         (self.claim.record().need.mem > 0)
@@ -2696,9 +2874,9 @@ fn claim_memory(
             cores,
             admit,
         )
-        .map(Some);
+        .map(|claim| Some(claim.sized_by(admission_rows::Basis::word("none"))));
     }
-    let need = book.need(
+    let (need, keyed_jobs) = book.need_keyed(
         spec,
         &memory::Key::of_stage(spec, ctx),
         compile_width::jobs_for(ctx, spec.id),
@@ -2708,6 +2886,7 @@ fn claim_memory(
         None if need.bytes == spec.mem => need.to_string(),
         None => aterm_capacity::size(spec.mem),
     };
+    let basis = admission_rows::basis(spec, &need, keyed_jobs);
     claim_bytes(
         ctx,
         &spec.title,
@@ -2717,7 +2896,7 @@ fn claim_memory(
         cores,
         admit,
     )
-    .map(Some)
+    .map(|claim| Some(claim.sized_by(basis)))
 }
 
 /// Claim `bytes` for a test run's binaries (`what` says which: the most its plan's hold at once,
@@ -2800,6 +2979,7 @@ fn claim_bytes(
                     if cores > 0 { "resources" } else { resource }
                 ),
                 units: None,
+                basis: admission_rows::Basis::word("planned"),
             })
         }
         Err(aterm_capacity::Error::Stopped { .. }) if ctx.halted().is_some() => {
@@ -2898,6 +3078,13 @@ fn staged(
                 (report, begun, aterm_capacity::between(&from, &to))
             })
             .map_err(|e| format!("CPU tokens could not be acquired: {e}"))?;
+        // Its compilers, the pool's GNU clients, have all ended: for the record of the pool's
+        // next count that is not whole, which this reap point makes where nothing of the run
+        // is left running.
+        if let (Some(pool), Some(_)) = (ctx.pool.as_deref(), jobs) {
+            pool.note_reaped(format!("stage={}", spec.title));
+            testrun::count_at_reap(pool, &exec::no_child_runs);
+        }
         Ok((report, begun, machine, claim, jobs))
     };
     let ran = run_timed(ctx, quiet, spec.id, &spec.title, run);
@@ -2911,7 +3098,9 @@ fn staged(
         machine.push_str(&said);
     }
     let units = claim.as_ref().and_then(|claim| claim.units.as_ref());
-    if let Some(said) = measured(ctx, spec, &report, meter.as_deref(), jobs, units) {
+    let measured = measured(ctx, spec, &report, meter.as_deref(), jobs, units);
+    let kept = measured.as_ref().map(|(_, kept)| *kept);
+    if let Some((said, _)) = measured {
         machine.push_str("; ");
         machine.push_str(&said);
     }
@@ -2932,7 +3121,18 @@ fn staged(
         machine.push_str("; ");
         machine.push_str(&said);
     }
+    // Built while the claim is held, written once it is let go: no claim waits on the write.
+    let row = admission_rows::stage_row(
+        ctx,
+        spec,
+        claim.as_ref(),
+        jobs,
+        meter.as_deref(),
+        kept,
+        begun,
+    );
     drop(claim);
+    admission_rows::stage(ctx, &row);
     let cpu = meter.as_ref().and_then(|meter| meter.observed_cpu());
     (report, begun, machine, cpu)
 }
@@ -2947,9 +3147,6 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
         .filter(|c| !(ctx.cells_pulled && *c == Check::Cells))
         .collect();
     let names: Vec<&str> = own.iter().map(|c| c.name()).collect();
-    let holds = |p: &str| ctx.scope.includes_crate(p);
-    let pulled = checks::pulled(&checks::DEV, holds);
-    let pulled_without_forge = checks::with_pulled(&checks::DEV, false, holds);
     let appkit = (!ctx.release && own.contains(&Check::Appkit))
         .then(|| {
             checks::appkit_pull(&checks::DEV, false, cfg!(target_os = "macos"), |p| {
@@ -2957,7 +3154,7 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
             })
         })
         .flatten();
-    let mut pulled_set = pulled_without_forge;
+    let mut pulled_set = checks::DEV.to_vec();
     if appkit.is_some() {
         pulled_set = checks::with(&pulled_set, Check::Appkit);
     }
@@ -2987,9 +3184,8 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
         }
     } else if own == checks::DEV {
         "dev".to_string()
-    } else if (!pulled.is_empty() || forge.is_some() || appkit.is_some()) && own == pulled_set {
-        let (mut added, mut by): (Vec<&str>, Vec<&str>) =
-            pulled.iter().map(|(c, p)| (c.name(), *p)).unzip();
+    } else if (forge.is_some() || appkit.is_some()) && own == pulled_set {
+        let (mut added, mut by): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
         if let Some(reason) = forge.as_deref() {
             added.push(Check::Forge.name());
             by.push(reason);
@@ -3060,8 +3256,26 @@ pub fn run(
     run_with(ctx, out, log, show, LIVE)
 }
 
-/// [`run`], its stages run, and its quiet machine and its stages' memory admitted, by `seams`.
+/// [`run`], its stages run, and its quiet machine and its stages' memory admitted, by `seams`:
+/// one run of `ctx`'s checks, which begins its admission-log tally afresh and ends with its `run`
+/// row however it ends ([`admission_rows::run`]; a failed write of its result says could not
+/// run).
 fn run_with(
+    ctx: &Ctx,
+    out: &mut (dyn Write + Send),
+    log: &mut (dyn Write + Send),
+    show: &Show<'_>,
+    seams: Seams,
+) -> std::io::Result<i32> {
+    let started_ms = ctx.admission.begin();
+    let code = run_seamed(ctx, out, log, show, seams);
+    let ended = code.as_ref().map_or(exit::COULD_NOT_RUN, |code| *code);
+    admission_rows::run(ctx, started_ms, ended);
+    code
+}
+
+/// [`run_with`]'s run.
+fn run_seamed(
     ctx: &Ctx,
     out: &mut (dyn Write + Send),
     log: &mut (dyn Write + Send),
@@ -3106,6 +3320,11 @@ fn run_with(
     let _ = write!(log, "{}", toolchain_lines(ctx));
 
     let stages = plan::plan(ctx);
+    // The run's plan, pulls and keys decided (by `run_cli`), said before the first stage
+    // starts: `verify land` keys its records by it.
+    if let Some(land) = &ctx.land {
+        ctx.record_event(&report::run_planned(&land.plan));
+    }
     // Qualify's build branch has not started a compiler yet: reserve lint now, while its known
     // claim still fits around the build's already-admitted slice envelope. `staged` consumes the
     // same claim later, after the source preflight, and drops it when lint ends.
@@ -3264,9 +3483,7 @@ fn run_with(
                         _ => 0.0,
                     };
                     let mine: Vec<&Report> = p.reports.iter().flatten().collect();
-                    let scope = if check == Check::Lint {
-                        ctx.scope.lint_label()
-                    } else if check.reads(&ctx.scope) {
+                    let scope = if check.reads(&ctx.scope) {
                         ctx.scope.label()
                     } else {
                         String::new()
@@ -3283,7 +3500,8 @@ fn run_with(
                     // its rendered line, so the two are never split by another output writer.
                     // Persist first: no output mutex is held during external file contention.
                     // Concurrent sinks may order different checks differently, but keep identical records.
-                    let event = report::check_event(&result, &mine);
+                    let keyed = ctx.land.as_ref().and_then(|land| land.keyed(ctx, check));
+                    let event = report::keyed_check_event(&result, &mine, keyed.as_ref());
                     let text = report::render(&result, width);
                     let event = ctx.record_event(&event);
                     if let Ok(mut o) = out.lock() {
@@ -3324,10 +3542,7 @@ fn run_with(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     results.sort_by_key(|r| r.check);
     if let Some(runs) = &ctx.runs {
-        for line in runs.end_of_run(&runs::LiveKernel) {
-            let _ = writeln!(log, "verify: {line}");
-            writeln!(out, "verify: {line}")?;
-        }
+        write_survivor_report(ctx, runs.end_of_run(&runs::LiveKernel), out, log)?;
     }
     let seconds = started.elapsed().as_secs_f64();
     let (line, code) = report::moved_checkout(
@@ -3338,6 +3553,11 @@ fn run_with(
     #[cfg(unix)]
     for evidence in aterm_uds::signal_origin::records() {
         let _ = writeln!(log, "{evidence}");
+    }
+    // What each sealed field reads now, so a record says whether its run's inputs stood
+    // through it (`run-resealed`).
+    if let Some(land) = &ctx.land {
+        ctx.record_event(&report::run_resealed(&land.reseal(ctx)));
     }
     ctx.record_event(&report::run_event(&results, code));
     let _ = writeln!(log, "\n{line}");
@@ -3350,6 +3570,27 @@ fn run_with(
         eprintln!("verify: the log could not be written: {e}");
     }
     Ok(code)
+}
+
+/// Retain cleanup observations before the concise summaries. These records describe a sweep;
+/// they grant neither signal authority nor a check verdict.
+fn write_survivor_report(
+    ctx: &Ctx,
+    report: runs::RunEndReport,
+    out: &mut dyn std::io::Write,
+    log: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    for survivor in report.survivors {
+        let event =
+            event_log::event_value(event_log::EventKind::ProcessSurvivor, survivor.payload());
+        let event = ctx.record_event(&format!("verify-event: {event}\n"));
+        let _ = log.write_all(event.as_bytes());
+    }
+    for line in report.lines {
+        let _ = writeln!(log, "verify: {line}");
+        writeln!(out, "verify: {line}")?;
+    }
+    Ok(())
 }
 
 fn toolchain_lines(ctx: &Ctx) -> String {
@@ -3580,43 +3821,53 @@ pub fn head_commit(root: &Path, path_env: &OsStr) -> Option<String> {
     (out.status.success() && !head.is_empty()).then_some(head)
 }
 
-/// A round of `verify land` as `parsed` names it ([`cli::JUDGED`], [`cli::SHARED`]): the judged
-/// commit and the shared paths, read from the file beside `cwd` that holds each ended by a NUL.
-/// `None` for any other run.
+/// A round of `verify land` as `parsed` names it ([`cli::JUDGED`], [`cli::SHARED`],
+/// [`cli::READERS`], [`cli::BY_HAND`]): the judged commit, the shared paths and the files that
+/// may read shared Markdown, each list read from the file beside `cwd` that holds each path
+/// ended by a NUL, and whether Git made the merge. `None` for any other run.
 ///
 /// # Errors
-/// The file could not be read; the usage line to stop with.
-fn round_of(parsed: &cli::Args, cwd: &Path) -> Result<Option<(String, Vec<String>)>, String> {
-    let (Some(judged), Some(path)) = (parsed.judged.as_deref(), parsed.shared.as_deref()) else {
+/// A file could not be read; the usage line to stop with.
+fn round_of(parsed: &cli::Args, cwd: &Path) -> Result<Option<changed::Round>, String> {
+    let (Some(judged), Some(shared)) = (parsed.judged.as_deref(), parsed.shared.as_deref()) else {
         return Ok(None);
     };
-    let text = aterm_uds::atomic_file::read_regular_text(&cwd.join(path), 16 * 1024 * 1024)
-        .map_err(|why| format!("verify: {} {}: {why}", cli::SHARED, path.display()))?;
-    Ok(Some((
-        judged.to_owned(),
-        text.split('\0')
+    let listed = |word: &str, path: &Path| -> Result<Vec<String>, String> {
+        let text = aterm_uds::atomic_file::read_regular_text(&cwd.join(path), 16 * 1024 * 1024)
+            .map_err(|why| format!("verify: {word} {}: {why}", path.display()))?;
+        Ok(text
+            .split('\0')
             .filter(|path| !path.is_empty())
             .map(str::to_owned)
-            .collect(),
-    )))
+            .collect())
+    };
+    Ok(Some(changed::Round {
+        judged: judged.to_owned(),
+        shared: listed(cli::SHARED, shared)?,
+        readers: match parsed.readers.as_deref() {
+            Some(readers) => listed(cli::READERS, readers)?,
+            None => Vec::new(),
+        },
+        mechanical: !parsed.by_hand,
+    }))
 }
 
 /// The crates a run that narrows with no `-p` judges: the change cone since `base`, or, for a
 /// round ([`round_of`]), what is left of that cone to judge beside the judgment kept for the
-/// round's judged commit ([`changed::resolve_round`]), no shared path's owner judged alone
-/// where the merge was made by hand ([`cli::BY_HAND`]). The scope keeps `base` either way, so
-/// each check that reads the change (fmt, census, export-scan, released-shim) reads all of it.
+/// round's judged commit ([`changed::resolve_round`]): shared Markdown standing for the files
+/// that may read it, and no shared path's owner judged alone where the merge was made by hand
+/// ([`cli::BY_HAND`]). The scope keeps `base` either way, so each check that reads the change
+/// (fmt, census, export-scan, released-shim) reads all of it.
 fn cone_selection(
-    parsed: &cli::Args,
-    round: Option<(String, Vec<String>)>,
+    round: Option<changed::Round>,
     root: &Path,
     tools: &Toolchain,
     path_env: &OsStr,
     base: &str,
 ) -> changed::Selection {
     match round {
-        Some((judged, paths)) if tools.have_targo() => {
-            changed::resolve_round(root, tools, path_env, base, &judged, paths, !parsed.by_hand)
+        Some(round) if tools.have_targo() => {
+            changed::resolve_round(root, tools, path_env, base, &round)
         }
         Some(_) | None => changed::resolve(root, tools, path_env, base),
     }
@@ -3631,7 +3882,7 @@ fn planned_checks_for_host(
     root: &Path,
     macos: bool,
 ) -> (Vec<Check>, bool) {
-    let mut wanted = parsed.wanted(|package| scope.includes_crate(package));
+    let mut wanted = parsed.checks.clone();
     if checks::forge_pull(
         &parsed.checks,
         parsed.release || parsed.as_release,
@@ -3663,6 +3914,50 @@ fn planned_checks(parsed: &cli::Args, scope: &Scope, root: &Path) -> (Vec<Check>
     planned_checks_for_host(parsed, scope, root, cfg!(target_os = "macos"))
 }
 
+/// `ctx` with what the command line says of how its checks run: every flag [`run_cli`] hands the
+/// run but the files and handles it opens. The one map from flags to the run, which the land
+/// plan's tests hold to ([`checks::part`] reads what it sets).
+fn with_parsed(ctx: Ctx, parsed: &cli::Args) -> Ctx {
+    let mut ctx = ctx
+        .with_release(parsed.release)
+        .with_checkers_in_tests(parsed.release || parsed.as_release)
+        .with_fix(parsed.fix)
+        .with_cells(parsed.cells.clone())
+        .with_no_windows(parsed.no_windows)
+        .with_halt(halt_of(parsed))
+        .with_cursor_pacing(parsed.cursor_pacing)
+        .with_compile_only(parsed.compile_only)
+        .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
+        .with_test_threads(parsed.test_threads)
+        .with_test_cores(parsed.test_cores)
+        .with_carry_context(parsed.carry_context.clone())
+        .with_quiet(Some(if parsed.background {
+            aterm_capacity::Admit::Preemptible
+        } else {
+            parsed.admit
+        }));
+    ctx.background = parsed.background;
+    ctx.test_seed = parsed.test_seed;
+    ctx
+}
+
+/// Keep the run's land plan ([`Ctx::land`]) when the run keeps an events file and is no release
+/// or fix: its checks (the full plan's, pulls included) keyed over `tree`, their fields read by
+/// `machine`, which reseals them at the run's end, and its tree read by `tree`.
+fn plan_land(
+    parsed: &cli::Args,
+    ctx: &mut Ctx,
+    mut machine: Box<dyn land_seal::Machine>,
+    tree: impl FnOnce(&Ctx) -> Result<land_seal::Tree, String>,
+) {
+    if parsed.events.is_none() || ctx.release || ctx.fix {
+        return;
+    }
+    let tree = tree(ctx);
+    let plan = land_seal::Plan::make(ctx, machine.as_mut(), tree);
+    ctx.land = Some(land_seal::Run::new(plan, machine));
+}
+
 /// The whole CLI, in-process.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
@@ -3680,7 +3975,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     if args.first().is_some_and(|a| a == "land") {
         return land::run(&args[1..], cwd);
     }
-    // `perf`, `soak`, `glue`, `provision` and the browser lane's verbs
+    // `perf`, `soak`, `glue`, `vendor-out`, `provision` and the browser lane's verbs
     // (`browser-site`, `browser-drive`) parse their own arguments, and none
     // needs targo to start: a host without Trust drives the browser lane, and
     // `provision` names what provides targo where a row needs it.
@@ -3692,6 +3987,9 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     }
     if args.first().is_some_and(|a| a == "glue") {
         return wasm_glue::run(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "vendor-out") {
+        return vendor_out::run(&args[1..], cwd);
     }
     #[cfg(unix)]
     if args.first().is_some_and(|a| a == "provision") {
@@ -3726,6 +4024,9 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         print!("{}", checks::list_table());
         return exit::PASS;
     }
+    if parsed.events_file_only {
+        event_log::keep_off_console();
+    }
     let could_not_run = |why: String| {
         stop(
             exit::COULD_NOT_RUN,
@@ -3740,16 +4041,6 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     {
         Ok(a) => a,
         Err(why) => return stop(exit::USAGE, format!("verify: {why}")),
-    };
-    let passed_binaries = match parsed.passed_binaries.as_deref().map(|path| {
-        aterm_uds::atomic_file::read_regular_text(&cwd.join(path), 16 * 1024 * 1024)
-            .map_err(|e| e.to_string())
-            .and_then(|text| testrun::read_passed(&text))
-            .map_err(|why| format!("verify: --passed-binaries {}: {why}", path.display()))
-    }) {
-        Some(Err(why)) => return stop(exit::USAGE, why),
-        Some(Ok(passed)) => Some(passed),
-        None => None,
     };
     let passed_lint_packages = match parsed.passed_lint_packages.as_deref().map(|path| {
         aterm_uds::atomic_file::read_regular_text(&cwd.join(path), 16 * 1024 * 1024)
@@ -3890,53 +4181,41 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             .base
             .clone()
             .unwrap_or_else(|| changed::default_base(&root, &path_env));
-        let sel = cone_selection(&parsed, round, &root, &tools, &path_env, &base);
+        let sel = cone_selection(round, &root, &tools, &path_env, &base);
         let (scope, said) = changed::cone(&base, &sel);
         (scope, Some(said))
     };
     let (wanted, cells_pulled) = planned_checks(&parsed, &scope, &root);
-    let mut ctx = Ctx::new_with_tools(root, scope, env, scratch.clone(), tools)
-        .with_checks(&wanted)
-        .with_release(parsed.release)
-        .with_checkers_in_tests(parsed.release || parsed.as_release)
-        .with_fix(parsed.fix)
-        .with_cells(parsed.cells.clone())
-        .with_cells_pulled(cells_pulled)
-        .with_no_windows(parsed.no_windows)
-        .with_halt(halt_of(&parsed))
-        .with_cursor_pacing(parsed.cursor_pacing)
-        .with_compile_only(parsed.compile_only)
-        .with_measure_artifact(measure_artifact)
-        .with_child_ceiling(parsed.timeout.unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)))
-        .with_pool(pool)
-        .with_test_threads(parsed.test_threads)
-        .with_test_cores(parsed.test_cores)
-        .with_passed_binaries(passed_binaries)
-        .with_passed_lint_packages(passed_lint_packages)
-        .with_passed_appkit_groups(passed_appkit_groups)
-        .with_carry_context(parsed.carry_context.clone())
-        .with_input_drift(parsed.input_drift)
-        .with_events(events)
-        .with_quiet(Some(if parsed.background {
-            aterm_capacity::Admit::Preemptible
-        } else {
-            parsed.admit
-        }))
-        .with_memory(memory::Book::live())
-        .with_test_history(test_history::planning_path(
-            parsed.test_history.clone(),
-            aterm_types::dirs::account_state_dir(),
-        ))
-        .with_toolchain_lease(lease_said)
-        .with_lock_notes(lock_said)
-        .with_quiet_tmpdir(&std::env::temp_dir())
-        .with_head_at_start(head_at_start);
-    ctx.background = parsed.background;
+    let mut ctx = with_parsed(
+        Ctx::new_with_tools(root, scope, env, scratch.clone(), tools)
+            .with_checks(&wanted)
+            .with_cells_pulled(cells_pulled),
+        &parsed,
+    )
+    .with_measure_artifact(measure_artifact)
+    .with_pool(pool)
+    .with_passed_lint_packages(passed_lint_packages)
+    .with_passed_appkit_groups(passed_appkit_groups)
+    .with_events(events)
+    .with_memory(memory::Book::live())
+    .with_test_history(test_history::planning_path(
+        parsed.test_history.clone(),
+        aterm_types::dirs::account_state_dir(),
+    ))
+    .with_toolchain_lease(lease_said)
+    .with_lock_notes(lock_said)
+    .with_quiet_tmpdir(&std::env::temp_dir())
+    .with_head_at_start(head_at_start);
     #[cfg(target_os = "macos")]
     {
         ctx.screen_locked = smoke::screen_locked;
     }
-    ctx.test_seed = parsed.test_seed;
+    plan_land(
+        &parsed,
+        &mut ctx,
+        Box::new(land_seal::Live::new()),
+        land_seal::Tree::read,
+    );
     if let Err(error) = prepare_main_build_dir(&ctx) {
         end_run(&ctx, &scratch);
         return could_not_run(format!("cannot prepare the captured build plan: {error}"));
@@ -3953,6 +4232,28 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     for line in plan::retire_old_lanes(&ctx) {
         eprintln!("verify: {line}");
     }
+    if parsed.queued_since.is_some() {
+        ctx.admission.judged_by_land();
+    }
+    // A heavy run takes the judgment turn before it claims its disk, so a run that waits for the
+    // turn holds nothing another run could use (`docs/DESIGN-landing-economy.md` §2.3).
+    let turn = match turn::take(
+        &mut ctx,
+        parsed.queued_since,
+        run_admit_mode(parsed.background, parsed.admit),
+    ) {
+        Ok(turn) => turn,
+        Err(why) => {
+            if let Some(record) = &ctx.runs {
+                record.finish(&runs::LiveKernel);
+            }
+            std::fs::remove_dir_all(&scratch).ok();
+            let code = could_not_run(why);
+            #[cfg(unix)]
+            exec::group::end_interrupted();
+            return code;
+        }
+    };
     #[cfg(unix)]
     let disk = match disk::admit(&ctx, run_admit_mode(parsed.background, parsed.admit)) {
         Ok(held) => held,
@@ -3980,18 +4281,30 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         Some(f) => f,
         None => &mut sink,
     };
-    let mut out = std::io::stdout();
+    // A run whose reader takes its events from its events file alone keeps them off its output
+    // (`cli::EVENTS_FILE_ONLY`): the rest of what it says passes as it is.
+    let mut out: Box<dyn Write + Send> = if parsed.events_file_only {
+        Box::new(event_log::WithoutEvents::new(std::io::stdout()))
+    } else {
+        Box::new(std::io::stdout())
+    };
     let show = Show {
         cone: cone.as_deref(),
         log: log_shown.as_deref(),
     };
-    let code = match run(&ctx, &mut out, log_writer, &show) {
+    let code = match run(&ctx, &mut *out, log_writer, &show) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("verify: cannot write the result: {e}");
             exit::COULD_NOT_RUN
         }
     };
+    if let Some(turn) = turn {
+        turn.end(
+            ctx.events.as_ref(),
+            ctx.tests_cpu_ms.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
     #[cfg(unix)]
     {
         // A run an interrupt or its first proven red ended stopped short of its compile calls:
@@ -4044,27 +4357,38 @@ fn open_run_log(ctx: &mut Ctx, chosen: Option<&Path>, cwd: &Path) -> Option<run_
         &run_log::default_dir(&ctx.state_dir()),
         invocation.as_deref(),
     );
+    let mut kept_events = None;
     if let Some(retained) = log.as_mut().and_then(run_log::Log::take_events) {
         if let Some(events) = &mut ctx.events {
             events.retain(retained);
         }
         if let Some(log) = &log {
-            eprintln!(
-                "verify: events: {}",
-                run_log::events_path(&log.path).display()
-            );
+            let path = run_log::events_path(&log.path);
+            eprintln!("verify: events: {}", path.display());
+            kept_events = Some(path);
         }
     }
+    // Where the run keeps its log and the events beside it, so a reader of its events file
+    // alone (`verify land`) can name them (`event_log::Kept`).
+    let kept = match &log {
+        Some(log) => aterm_json::json!({
+            "log": log.path.display().to_string(),
+            "events": kept_events.map(|path| path.display().to_string()),
+        }),
+        None => aterm_json::json!({}),
+    };
     event_log::emit(
         ctx.events.as_ref(),
         &format!(
             "verify-event: {}",
-            event_log::event_value(
-                event_log::EventKind::InvocationStarted,
-                aterm_json::json!({})
-            )
+            event_log::event_value(event_log::EventKind::InvocationStarted, kept)
         ),
     );
+    // What the run said before its log opened, the judgment turn's wait among it, joins the
+    // kept events after their first record.
+    if let Some(events) = &ctx.events {
+        events.retain_early();
+    }
     log
 }
 

@@ -83,12 +83,15 @@ pub const KERN_ARGMAX: libc::c_int = 8;
 
 /// `pid`'s `KERN_PROCARGS2` answer, whole: read once into the largest buffer the kernel takes,
 /// `kern.argmax` bytes past the argc (one byte more is `EINVAL`).
-#[must_use]
-pub fn read(pid: u32) -> Option<Vec<u8>> {
+///
+/// # Errors
+/// The kernel read fails, the PID is invalid, the record is truncated, or this platform
+/// does not provide `KERN_PROCARGS2`. Kernel failures retain their original OS error.
+pub fn read(pid: u32) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; imp::most()?];
     let len = read_into(pid, &mut buf)?;
     buf.truncate(len);
-    Some(buf)
+    Ok(buf)
 }
 
 /// `pid`'s `KERN_PROCARGS2` answer read into `buf`, its length, when the whole record fits: a
@@ -97,51 +100,70 @@ pub fn read(pid: u32) -> Option<Vec<u8>> {
 /// buffer the record's TAIL (the end of its environment), never its head, so a full buffer is
 /// refused, never parsed. The kernel copies the whole record in either way, so a long one costs
 /// it as much as a whole read.
-#[must_use]
-pub fn read_into(pid: u32, buf: &mut [u8]) -> Option<usize> {
+///
+/// # Errors
+/// The kernel read fails, the PID is invalid, the record fills the buffer, or this platform
+/// does not provide `KERN_PROCARGS2`. Kernel failures retain their original OS error.
+pub fn read_into(pid: u32, buf: &mut [u8]) -> std::io::Result<usize> {
     imp::read_into(pid, buf)
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{KERN_ARGMAX, KERN_PROCARGS2};
+    use std::io::{Error, ErrorKind, Result};
     use std::sync::OnceLock;
 
-    /// `kern.argmax`, read once: a constant of the running kernel.
+    /// `kern.argmax`, cached after a successful read: a constant of the running kernel.
     #[cfg_attr(trust_verify, trust::skip)]
-    fn argmax() -> Option<usize> {
-        static ARGMAX: OnceLock<Option<usize>> = OnceLock::new();
-        *ARGMAX.get_or_init(|| {
-            let mut argmax: libc::c_int = 0;
-            let mut len = std::mem::size_of::<libc::c_int>();
-            let mut mib = [libc::CTL_KERN, KERN_ARGMAX];
-            // SAFETY: `mib` names a two-integer key; `argmax` and `len` are ours and outlive the
-            // call; nothing is written (`newp` null).
-            let rc = unsafe {
-                libc::sysctl(
-                    mib.as_mut_ptr(),
-                    2,
-                    (&raw mut argmax).cast::<libc::c_void>(),
-                    &raw mut len,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            };
-            usize::try_from(argmax)
-                .ok()
-                .filter(|n| rc == 0 && len == std::mem::size_of::<libc::c_int>() && *n > 4)
-        })
+    fn argmax() -> Result<usize> {
+        static ARGMAX: OnceLock<usize> = OnceLock::new();
+        if let Some(value) = ARGMAX.get() {
+            return Ok(*value);
+        }
+        let mut argmax: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, KERN_ARGMAX];
+        // SAFETY: `mib` names a two-integer key; `argmax` and `len` are ours and outlive the
+        // call; nothing is written (`newp` null).
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&raw mut argmax).cast::<libc::c_void>(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::last_os_error());
+        }
+        let value = usize::try_from(argmax)
+            .ok()
+            .filter(|n| len == std::mem::size_of::<libc::c_int>() && *n > 4)
+            .ok_or_else(|| Error::from(ErrorKind::InvalidData))?;
+        let _ = ARGMAX.set(value);
+        Ok(value)
     }
 
     /// The largest buffer the kernel takes: `kern.argmax` bytes past the argc.
-    pub(super) fn most() -> Option<usize> {
-        argmax()?.checked_add(super::ARGC_BYTES)
+    pub(super) fn most() -> Result<usize> {
+        argmax()?
+            .checked_add(super::ARGC_BYTES)
+            .ok_or_else(|| Error::from(ErrorKind::InvalidData))
     }
 
     #[cfg_attr(trust_verify, trust::skip)]
-    pub(super) fn read_into(pid: u32, buf: &mut [u8]) -> Option<usize> {
-        let pid = libc::c_int::try_from(pid).ok().filter(|p| *p > 0)?;
+    pub(super) fn read_into(pid: u32, buf: &mut [u8]) -> Result<usize> {
+        let pid = libc::c_int::try_from(pid)
+            .ok()
+            .filter(|p| *p > 0)
+            .ok_or_else(|| Error::from(ErrorKind::InvalidInput))?;
         let cap = buf.len().min(most()?);
+        if cap == 0 {
+            return Err(Error::from(ErrorKind::InvalidInput));
+        }
         let mut len = cap;
         let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
         // SAFETY: `buf` is at least `cap` writable bytes and `len` says `cap`; the kernel writes
@@ -157,18 +179,24 @@ mod imp {
                 0,
             )
         };
-        (rc == 0 && len < cap).then_some(len)
+        if rc != 0 {
+            return Err(Error::last_os_error());
+        }
+        if len >= cap {
+            return Err(Error::from(ErrorKind::InvalidData));
+        }
+        Ok(len)
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    pub(super) const fn most() -> Option<usize> {
-        None
+    pub(super) fn most() -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 
-    pub(super) const fn read_into(_pid: u32, _buf: &mut [u8]) -> Option<usize> {
-        None
+    pub(super) fn read_into(_pid: u32, _buf: &mut [u8]) -> std::io::Result<usize> {
+        most()
     }
 }
 

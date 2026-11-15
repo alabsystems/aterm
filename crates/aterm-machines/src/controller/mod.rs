@@ -5,6 +5,7 @@
 
 pub mod artifacts;
 pub mod commands;
+mod credential;
 pub mod discover;
 pub mod enroll;
 pub mod github;

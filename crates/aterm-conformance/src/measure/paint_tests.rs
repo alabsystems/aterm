@@ -18,6 +18,9 @@ fn row(expect: Expect, capture: Capture, style: Style) -> PaintRow {
         companion: None,
         split: None,
         reach: None,
+        recording: true,
+        rewound: false,
+        hosted: false,
     }
 }
 
@@ -97,6 +100,7 @@ fn rainbow_rows(frames: usize, extra: &str) -> Ledger {
         rows: Some(vec![status("rainbow", extra); frames]),
         final_row: None,
         fx_under_frames: 40,
+        hosted: None,
     }
 }
 
@@ -175,6 +179,7 @@ fn recorded_continuity_tolerates_one_dark_frame_and_refuses_two() {
         rows: None,
         final_row: Some(status("rainbow", "")),
         fx_under_frames: 40,
+        hosted: None,
     };
     for (dark_us, want) in [
         (NOMINAL, ShapeVerdict::Pass),
@@ -237,6 +242,7 @@ fn trail_dark_reads_the_engine_ledger_and_refuses_without_one() {
         rows: None,
         final_row: None,
         fx_under_frames: 0,
+        hosted: None,
     };
     assert_eq!(verdict(&cold, &blind, &scan), ShapeVerdict::Fail);
 }
@@ -259,6 +265,7 @@ fn effect_off_needs_typed_pixels_a_quiet_ledger_and_no_witness() {
         ]),
         final_row: None,
         fx_under_frames: 0,
+        hosted: None,
     };
     assert_eq!(verdict(&off, &rows(QUIET), &scan), ShapeVerdict::Pass);
     let ribbon = ScanReport {
@@ -290,6 +297,7 @@ fn a_recorded_effect_off_window_must_read_dead() {
             "trail style=\"off\" effective=false {QUIET}"
         ))),
         fx_under_frames: 0,
+        hosted: None,
     };
     let mut scan = ScanReport {
         rainbow_frames: 0,
@@ -313,6 +321,7 @@ fn a_spelling_that_resolved_elsewhere_is_red() {
         ]),
         final_row: None,
         fx_under_frames: 40,
+        hosted: None,
     };
     assert_eq!(
         verdict(&tall, &resolved("rainbow-kitty"), &lit_burst()),
@@ -346,6 +355,7 @@ fn companion_obligations_ride_on_top_of_ink() {
         rows: Some(vec![status("rainbow", ""); 36]),
         final_row: None,
         fx_under_frames: 40,
+        hosted: None,
     };
     let healthy = ScanReport {
         frames: 36,
@@ -461,6 +471,7 @@ fn a_missing_pet_is_named_by_its_frame_and_claimed_pose() {
         ]),
         final_row: None,
         fx_under_frames: 40,
+        hosted: None,
     };
     assert_eq!(pet_missing_at(&ledger, &scan), "1:pet_hop,3:-");
     let found = ScanReport {
@@ -624,6 +635,235 @@ fn a_reach_row_that_cannot_measure_its_body_is_refused() {
     }
 }
 
+/// A rewound row's take: the prompt, typed under an open view, every frame read.
+fn past_row() -> PaintRow {
+    PaintRow {
+        scene: Scene::Prompt,
+        rewound: true,
+        ..row(Expect::Past, Capture::UnpinnedFocused, Style::Default)
+    }
+}
+
+/// A burst over a rewound pane: the shipped pet claimed (owned off glass) and never found, no
+/// ink and no ribbon.
+fn past_burst() -> ScanReport {
+    ScanReport {
+        total_ink: 0,
+        best_ink: 0,
+        union_hues: 0,
+        rainbow_frames: 0,
+        rainbow_run: 0,
+        ribbon_claimed: 0,
+        ribbon_bound: 0,
+        pet_claimed: 67,
+        pet_missing: 67,
+        companion_frames: 0,
+        ..lit_burst()
+    }
+}
+
+/// A rewound pane's take passes only with no effect ink, no companion drawn and no ribbon claimed
+/// on any frame; the shipped pet's claim off glass is no finding. The red a build that keeps
+/// effects over a rewound pane makes (its pet drawn, its trail lit) fails it.
+#[test]
+fn a_rewound_take_passes_only_while_nothing_is_drawn_over_the_past() {
+    let row = past_row();
+    assert_eq!(row.validate(), Ok(()));
+    let ledger = Ledger {
+        rows: Some(vec![status("rainbow", "pet_active=true"); 67]),
+        final_row: None,
+        fx_under_frames: 0,
+        hosted: None,
+    };
+    assert_eq!(verdict(&row, &ledger, &past_burst()), ShapeVerdict::Pass);
+    for (why, scan) in [
+        (
+            "the pet drawn over the past",
+            ScanReport {
+                companion_frames: 3,
+                pet_missing: 64,
+                ..past_burst()
+            },
+        ),
+        (
+            "effect ink over the past",
+            ScanReport {
+                total_ink: 1,
+                best_ink: 1,
+                ..past_burst()
+            },
+        ),
+        (
+            "a ribbon claimed over the past",
+            ScanReport {
+                ribbon_claimed: 2,
+                ..past_burst()
+            },
+        ),
+    ] {
+        assert_eq!(verdict(&row, &ledger, &scan), ShapeVerdict::Fail, "{why}");
+    }
+    assert_eq!(
+        verdict(&row, &ledger, &lit_burst()),
+        ShapeVerdict::Fail,
+        "a live pane's ink is red over the past"
+    );
+}
+
+#[test]
+fn a_rewound_row_that_could_not_show_the_past_is_refused() {
+    for (why, bad) in [
+        (
+            "no recording, so no view",
+            PaintRow {
+                recording: false,
+                ..past_row()
+            },
+        ),
+        (
+            "a video take binds no frame to its claims",
+            PaintRow {
+                capture: Capture::PinnedVideo,
+                ..past_row()
+            },
+        ),
+        (
+            "the past's darkness only on a rewound pane",
+            PaintRow {
+                rewound: false,
+                ..past_row()
+            },
+        ),
+        (
+            "a rewound row expects the past",
+            PaintRow {
+                expect: Expect::Ink,
+                ..past_row()
+            },
+        ),
+        (
+            "an unsplit prompt",
+            PaintRow {
+                split: Some(Split::V),
+                ..past_row()
+            },
+        ),
+        (
+            "the prompt scene",
+            PaintRow {
+                scene: Scene::FakeClaude,
+                ..past_row()
+            },
+        ),
+        (
+            "no companion obligation over the past",
+            PaintRow {
+                companion: Some(Companion::Pet),
+                ..past_row()
+            },
+        ),
+    ] {
+        assert!(bad.validate().is_err(), "{why}");
+    }
+}
+
+/// A hosted row is the matrix's ink row with the glow attached: it passes only where the glow
+/// stayed hosted, its log held and its task took every typed key, on top of every ink
+/// obligation. The red, a hosted task that takes no key, fails it.
+#[test]
+fn a_hosted_glow_row_needs_its_task_to_take_every_typed_key() {
+    let row = PaintRow {
+        scene: Scene::Plane,
+        hosted: true,
+        ..row(Expect::Ink, Capture::UnpinnedFocused, Style::Rainbow)
+    };
+    assert_eq!(row.validate(), Ok(()));
+    for scene in [Scene::FakeClaude, Scene::Prompt] {
+        assert!(
+            matches!(
+                PaintRow { scene, ..row }.validate(),
+                Err(CouldNotRun::Refused(_))
+            ),
+            "a hosted row off the plane ({scene:?}) is refused, not judged"
+        );
+    }
+    let held = Hosted {
+        attached: true,
+        keys: 3,
+        broken: false,
+    };
+    let ledger = |hosted| Ledger {
+        hosted,
+        ..rainbow_rows(67, "")
+    };
+    assert_eq!(
+        verdict(&row, &ledger(Some(held)), &lit_burst()),
+        ShapeVerdict::Pass
+    );
+    for (why, hosted) in [
+        ("a task that took no key", Some(Hosted { keys: 0, ..held })),
+        ("one key short", Some(Hosted { keys: 2, ..held })),
+        (
+            "detached mid-take",
+            Some(Hosted {
+                attached: false,
+                ..held
+            }),
+        ),
+        (
+            "a broken log",
+            Some(Hosted {
+                broken: true,
+                ..held
+            }),
+        ),
+        ("no account", None),
+    ] {
+        assert_eq!(
+            verdict(&row, &ledger(hosted), &lit_burst()),
+            ShapeVerdict::Fail,
+            "{why}"
+        );
+    }
+    assert_eq!(
+        verdict(&row, &ledger(Some(held)), &past_burst()),
+        ShapeVerdict::Fail,
+        "a hosted glow is still held to its ink"
+    );
+    for (why, bad) in [
+        (
+            "a hosted row paints",
+            PaintRow {
+                style: Style::Off,
+                ..row
+            },
+        ),
+        (
+            "a hosted row expects ink",
+            PaintRow {
+                expect: Expect::Quiet,
+                ..row
+            },
+        ),
+    ] {
+        assert!(bad.validate().is_err(), "{why}");
+    }
+    let read = Hosted::read(
+        "OK window=0 attached=true code=shipped hot=true active=true settling=false",
+        "OK window=0 log=40 log_epoch=0 first=0 end=40 broken=false bytes=120+900 sealed=true \
+         keys=29 resets=1 ticks=9 queries=0 unseen=0",
+    );
+    assert_eq!(
+        read,
+        Some(Hosted {
+            attached: true,
+            keys: 29,
+            broken: false
+        })
+    );
+    assert_eq!(Hosted::read("OK attached=true", "OK keys=29"), None);
+}
+
 #[test]
 fn a_companion_row_is_red_for_a_companion_too_short_or_too_tall() {
     let cell_h = lit_burst().cell.h;
@@ -646,6 +886,7 @@ fn a_companion_row_is_red_for_a_companion_too_short_or_too_tall() {
             rows: Some(vec![status("rainbow", ""); 36]),
             final_row: None,
             fx_under_frames: 40,
+            hosted: None,
         };
         let (lo, hi) = companion.height_bounds();
         let lo_px = (lo * cell_h).div_ceil(100);

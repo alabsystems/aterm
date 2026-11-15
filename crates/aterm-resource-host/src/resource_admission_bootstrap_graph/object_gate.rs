@@ -87,17 +87,19 @@ impl Owner {
             .bootstrap_graph
             .as_mut()
             .ok_or_else(|| refused("original Bootstrap object Root unavailable"))?;
+        let root_deadline = root.deadline();
         let state = &mut root.queries;
         state.check_key(&request.key.graph)?;
         state.directory_current()?;
         let deadline = started
             .checked_add(Duration::from_nanos(request.timeout_ns))
             .ok_or_else(|| refused("object original clock overflow"))?
-            .min(root.deadline);
+            .min(root_deadline);
         time(deadline)?;
         let enrollment = root.inputs.enrolled(&request.key.graph)?;
         if state.active.is_some()
             || state.object_active.is_some()
+            || state.archive_active.is_some()
             || request.key.sequence != state.next
             || state.next > MAX_QUERIES
             || state.operations.contains(&request.key.operation)

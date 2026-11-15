@@ -200,10 +200,7 @@ fn target(element: &str) -> io::Result<Target> {
 }
 
 fn global_sid(selector: &str) -> Option<&str> {
-    selector
-        .strip_prefix("s-")
-        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then_some(selector)
+    Some(selector).filter(|sid| crate::board::is_sid(sid))
 }
 
 /// The targets of one instance, where it answers, and each target's caller-chosen index.

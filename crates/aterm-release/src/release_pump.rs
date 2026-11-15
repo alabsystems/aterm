@@ -113,11 +113,34 @@ impl Host {
         }
     }
 
+    /// This clone's journal: candidate.toml's pending one, else release.toml's. A proposal
+    /// candidate.toml kept of a line this clone never held ([`Journal::never_claimed`]: the
+    /// fleet's line of that version starts elsewhere) is no journal of a line; the next run
+    /// drops it.
+    /// The Linux declaration `verb`'s run is handed ([`pump::declaration`]): this clone's
+    /// unfinished journal says whether it holds one of its own.
+    fn handed_linux(&self, verb: &Verb) -> Result<Vec<String>, String> {
+        let declares = self
+            .journal_file()
+            .ok()
+            .flatten()
+            .is_some_and(|journal| !journal.finished() && journal.linux.declared());
+        pump::declaration(verb, declares, self.linux())
+    }
+
     fn journal_file(&self) -> Result<Option<Journal>, String> {
-        match Journal::load(&self.release.join(SELECTION_FILE))? {
-            Some(pending) => Ok(Some(pending)),
-            None => Journal::load(&self.release.join(JOURNAL_FILE)),
+        let judged = Journal::load(&self.release.join(JOURNAL_FILE))?;
+        let Some(pending) = Journal::load(&self.release.join(SELECTION_FILE))? else {
+            return Ok(judged);
+        };
+        if pending.proposal_only(judged.as_ref())
+            && let Some(fleet) = crate::line_claim::existing(&self.repo, &pending.version)?
+            && crate::line::supersession(&self.git(), &pending.version)?.is_none()
+            && pending.never_claimed(judged.as_ref(), &fleet)
+        {
+            return Ok(judged);
         }
+        Ok(Some(pending))
     }
 
     /// Whether this clone holds the cut claim of `version`: its cut journal
@@ -293,13 +316,17 @@ impl pump::World for Host {
             && crate::fixtures::on_commit(&self.git(), &tip, &version)
                 .map_err(|e| e.to_string())?
                 .is_some();
-        let (line, holder) = if published {
-            (None, None)
+        let (line, holder, held) = if published {
+            (None, None, None)
         } else {
-            let claim = crate::line_claim::existing_with_holder(&self.repo, &version)?;
+            let (claim, held) = crate::line_claim::standing(&self.repo, &version, true)?;
             (
                 claim.line.map(|line| line.head().to_owned()),
                 claim.holder.map(|(_, holder)| holder),
+                held.map(|held| pump::Held {
+                    until: held.until,
+                    refusal: held.refusal,
+                }),
             )
         };
         let opened = (!published).then(|| self.opened(&version, &tip)).flatten();
@@ -324,6 +351,7 @@ impl pump::World for Host {
             fixtures,
             line,
             holder,
+            held,
         })
     }
 
@@ -410,13 +438,9 @@ impl pump::World for Host {
             code: 2,
             last: format!("pump: {why}"),
         };
-        let linux = if matches!(verb, Verb::Start(_) | Verb::Adopt) {
-            match self.linux() {
-                Ok(linux) => linux,
-                Err(why) => return unstarted(why),
-            }
-        } else {
-            Vec::new()
+        let linux = match self.handed_linux(verb) {
+            Ok(linux) => linux,
+            Err(why) => return unstarted(why),
         };
         // The line the verb runs is of this clone's unfinished journal, else of main's version.
         let version = self
@@ -587,13 +611,18 @@ pub fn run(repo: &Path, opts: &ReleaseOptions) -> i32 {
         let line = match pump::observe(&mut host) {
             Ok(seen) => match pump::decide(&seen, &memory) {
                 pump::Decision::Run { verb, why, .. } => {
-                    let linux = host.linux().unwrap_or_default();
+                    let linux = host.handed_linux(&verb).unwrap_or_default();
                     format!(
                         "pump: DRY RUN — {why}; would run {RELEASE_COMMAND} {}",
                         verb.argv(&linux, &host.handed)[1..].join(" ")
                     )
                 }
-                pump::Decision::Wait { why, .. } => format!("pump: DRY RUN — would wait: {why}"),
+                pump::Decision::Wait { why, note, .. } if note.is_empty() => {
+                    format!("pump: DRY RUN — would wait: {why}")
+                }
+                pump::Decision::Wait { why, note, .. } => {
+                    format!("pump: DRY RUN — would wait: {why} ({note})")
+                }
             },
             Err(why) => format!("pump: DRY RUN — cannot read the world: {why}"),
         };
@@ -762,6 +791,15 @@ pub fn service(repo: &Path, opts: &ReleaseOptions) -> Result<String, String> {
         &service_args(&opts),
     );
     let target = aterm_verify::launch_agent::replace(home, LABEL, &text, UNLOAD_WAIT)?;
+    // Each install leaves one copy: remove the earlier ones no agent names and no process runs.
+    if let Some(controllers) = deployment.parent() {
+        let _ = crate::release_leftovers::sweep_controllers(
+            controllers,
+            &deployment,
+            std::time::SystemTime::now(),
+            &crate::artifact::remove_unused_dir,
+        );
+    }
     Ok(format!(
         "release pump installed: {target}\nclone={}\nlog={}\nstop it: {RELEASE_COMMAND} --pump --uninstall",
         repo.display(),

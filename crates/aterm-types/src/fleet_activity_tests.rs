@@ -33,6 +33,7 @@ fn every_drive_kind_has_its_plain_type_or_is_a_service() {
         (K::Turn, Some(Plain::Typed)),
         (K::Key, Some(Plain::Typed)),
         (K::Send, Some(Plain::Typed)),
+        (K::Configure, Some(Plain::Configure)),
         (K::Hold, Some(Plain::Hold)),
         (K::Close, Some(Plain::Close)),
         (K::Claim, Some(Plain::Hold)),

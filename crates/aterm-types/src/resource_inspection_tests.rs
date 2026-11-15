@@ -9,7 +9,7 @@ fn cooperative_ceiling_never_serializes_as_a_fixed_cpu_grant() {
         inode: 2,
     };
     let mut observed = Inspection {
-        session: "s-a".into(),
+        session: "s-0000000000000000000a".into(),
         attempt: [3; 16],
         host: "darwin:test".into(),
         boot: "ab".repeat(16),
@@ -60,6 +60,18 @@ fn cooperative_ceiling_never_serializes_as_a_fixed_cpu_grant() {
     observed.subject = Subject::Root { pid: 17, birth: 18 };
     assert!(observed.json().is_err());
     observed.subject = Subject::Root { pid: 7, birth: 8 };
+    // The session is a tab ID in either form, the rule the admission wire and the host's lookup
+    // share. NEGATIVE CONTROL: a malformed ID of each form, and an `s-` ID of other than 20 hex
+    // digits (which the earlier rule admitted), is refused.
+    for session in ["tqn5r6e0148", "s-0000000000000000000a"] {
+        observed.session = session.into();
+        assert!(observed.json().is_ok(), "{session}");
+    }
+    for session in ["s-a", "s-0000000000000000000A", "tqn5r6e014", "tqn5r6e014u"] {
+        observed.session = session.into();
+        assert!(observed.json().is_err(), "CONTROL: {session}");
+    }
+    observed.session = "s-0000000000000000000a".into();
     observed.memory.epoch.clear();
     assert!(observed.json().is_err());
 }

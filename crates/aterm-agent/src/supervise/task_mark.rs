@@ -298,9 +298,7 @@ impl<C: Ctl> Session<'_, C> {
                     let said = match &self.land_defense_said {
                         Some((by, defense))
                             if *by == program
-                                && crate::supervise::policy::land_check::landed_reply(Some(
-                                    &said,
-                                )) =>
+                                && alab_policy::land_check::landed_reply(Some(&said)) =>
                         {
                             defense.clone()
                         }

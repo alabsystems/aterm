@@ -86,9 +86,7 @@ fn empty_pool_checks_the_captured_source_before_publishing() {
                 .collect::<Vec<_>>()
         };
         let before = images();
-        let source = bed
-            .secrets()
-            .join(super::super::super::ai_pool::AI_POOL_FILE);
+        let source = super::super::super::ai_pool::AI_POOL_FILE;
         let called = std::cell::Cell::new(false);
         let result = sync_accounts_for_init_with(
             &bed.home,
@@ -98,7 +96,7 @@ fn empty_pool_checks_the_captured_source_before_publishing() {
             || {
                 called.set(true);
                 if changed {
-                    fs::write(&source, format!("{original}# changed after capture\n")).unwrap();
+                    bed.secret(source, &format!("{original}# changed after capture\n"));
                 }
             },
             &|_, _| panic!("the captured local pool must not fetch"),
@@ -106,19 +104,15 @@ fn empty_pool_checks_the_captured_source_before_publishing() {
         assert!(called.get());
         if changed {
             let error = result.unwrap_err();
-            assert_eq!(error.retry_reason(), Some(Retry::Changed));
-            assert!(
-                error.to_string().contains("changed after init discovery"),
-                "{error}"
-            );
+            assert_eq!(error.retry_reason(), Some(Retry::Changed), "{error}");
             assert_eq!(
                 images(),
                 before,
                 "a stale empty pool cannot publish authority"
             );
             assert_eq!(
-                fs::read_to_string(source).unwrap(),
-                format!("{original}# changed after capture\n")
+                crate::vault_entry::read_text(&bed.home, source, 1 << 20).text(),
+                Some(format!("{original}# changed after capture\n").as_str())
             );
         } else {
             assert!(
@@ -366,8 +360,8 @@ fn pending_registry_does_not_promote_an_automatic_file_into_an_explicit_source()
         assert!(!roster.exists(), "a pending source created account rows");
         assert!(!bed.config.join(FLEET_ROSTER_FILE).exists());
         assert_eq!(
-            fs::read_to_string(bed.secrets().join(FLEET_ROSTER_FILE)).unwrap(),
-            fleet
+            crate::vault_entry::read_text(&bed.home, FLEET_ROSTER_FILE, 1 << 20).text(),
+            Some(fleet)
         );
     });
 }

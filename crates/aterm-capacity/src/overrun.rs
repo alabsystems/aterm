@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::admit::{Other, gib, others};
+use crate::admit::{Ledgerwide, Other, claims_by_holder, gib, others};
 use crate::floor::GIB;
 use crate::ledger::{Accounting, Record};
 use crate::reading::TreeUse;
@@ -138,7 +138,12 @@ pub fn overruns(
     };
     let records: Vec<&Record> = records.iter().collect();
     let taken: HashSet<u32> = records.iter().map(|r| r.pid).collect();
-    overruns_of(&others(&records, taken, trees))
+    // No turn is reckoned here.
+    let wide = Ledgerwide {
+        holders: claims_by_holder(records.iter().copied()),
+        ..Ledgerwide::default()
+    };
+    overruns_of(&others(&records, taken, trees, &HashMap::new(), &wide))
 }
 
 #[cfg(test)]

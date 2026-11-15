@@ -20,7 +20,7 @@ mod measuring {
 
     use aterm_conformance::measure::Rig;
     use aterm_conformance::measure::instance::CouldNotRun;
-    use aterm_conformance::measure::rewind::{RewindRow, RewindScene, measure};
+    use aterm_conformance::measure::rewind::{RewindRow, RewindScene, Verdict, measure};
     use aterm_conformance::measure::rewind_cost::{self, CostRow};
     use aterm_conformance::measure::starvation::Disposition;
 
@@ -61,7 +61,7 @@ mod measuring {
             "recording_keeps_parse_throughput_at_or_above_0_97x",
             Row::Cost(rewind_cost::THROUGHPUT),
         ),
-        // One idle pane: recording adds at most `rewind_budget_mb`'s default (8 MiB, one pane's history cap) of resident size, the arms' medians over ABBA pairs of fresh instances. ATERM_DESIGN.md §7.2's 25 MB idle target is the whole app's, which misses it with recording off too, so the row judges it only on a bundle that records by default (the R4 flip it gates) and reports it on every other.
+        // One idle pane: recording adds at most `rewind_budget_mb`'s default (8 MiB, one pane's history cap) of resident size, the arms' medians over ABBA pairs of fresh instances. ATERM_DESIGN.md §7.2's 25 MB idle target is the whole app's, by phys_footprint (resident size off macOS, which has none to read): the row holds a bundle that records by default to it on the recording arm's median, and reports that median unjudged on a bundle that records only when asked.
         (
             "an_idle_recording_pane_adds_at_most_one_panes_budget_rss",
             Row::Cost(CostRow::IdleRss {
@@ -127,6 +127,12 @@ mod measuring {
                 "REWIND CONFORMANCE FAILED: a step took past its bound to be shown, or an idle \
                  view woke the app.\n  {report}"
             )),
+            Disposition::Unproved if report.verdict == Verdict::Unproved => {
+                Outcome::Undecided(format!(
+                    "REWIND UNPROVED: the percentile interval straddles its bound, so the recorded \
+                 metric resolution does not decide whether it was met.\n  {report}"
+                ))
+            }
             Disposition::Unproved => Outcome::Undecided(format!(
                 "REWIND UNPROVED: a step took past its bound to be shown while the driver was \
                  held off its core as long as the bound, so the take is not evidence about the \

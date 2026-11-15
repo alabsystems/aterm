@@ -5,7 +5,7 @@
 //! the shape `aterm db dump <file> --show-passwords` writes (every address `example.invalid` or
 //! `proton.example`, every password `synthetic-pass-<n>`, every number in `555-01xx`).
 
-use super::super::tests::{SEALER, Stand};
+use super::super::tests::{Stand, put_all, store};
 use super::*;
 use crate::{
     alab::{
@@ -15,7 +15,7 @@ use crate::{
     typed::{
         cell::{self, Cells},
         grid::tests::{Book, put},
-        secret::{self, Sealer as _},
+        secret,
     },
 };
 
@@ -31,7 +31,7 @@ fn planned(sheets: &[Sheet], cells: &Cells) -> Plan {
             sheets,
             macs: &[],
             vendors: &Stand,
-            sealer: &SEALER,
+            store: store(),
             now_ms: NOW,
             births: crate::alab::import::Births::Named,
             unread: &[],
@@ -41,8 +41,9 @@ fn planned(sheets: &[Sheet], cells: &Cells) -> Plan {
     .unwrap()
 }
 
-/// The registry after `plan`'s rows, written in order by writer 1 on `book`.
+/// The registry after `plan`'s puts and rows, the rows written in order by writer 1 on `book`.
 fn apply(book: &mut Book, plan: &Plan) -> Cells {
+    put_all(plan);
     for changes in &plan.rows {
         book.write(1, &[], changes.clone());
     }
@@ -203,8 +204,9 @@ fn every_column() -> Value {
 }
 
 /// The fixture holds every column [`DUMP_TABLES`] names for each table, and each is carried:
-/// to its registry cell (the root's provider, kind, status, phone, note and sealed password; the
-/// alias's `alias_of`; the phone's sealed number, label, carrier, line type, device and note;
+/// to its registry cell (the root's provider, kind, status, phone, note and the store entry its
+/// password went to; the alias's `alias_of`; the phone's plain number, label, carrier, line type,
+/// device and note;
 /// the account's provider, service, login and note, its tier read the harness's way; the
 /// machine's make, arch, OS, chip, memory, disk, aliases, nickname and its aliases, location,
 /// status, node, host and note), or as a relation (preferences, the alias's mailbox), or
@@ -271,9 +273,24 @@ fn every_fleet_db_column_is_carried() {
         value(&plan, "mailbox", &mailbox, "webmail"),
         Some(&json!("https://mail.proton.me/u/1/inbox"))
     );
+    let entry = value(&plan, "address", &root, "password")
+        .and_then(secret::entry_of)
+        .unwrap()
+        .to_owned();
+    assert!(
+        secret::bound("address", "password", &root, &entry),
+        "{entry}"
+    );
     assert_eq!(
         value(&plan, "address", &root, "password"),
-        Some(&json!(secret::MASK))
+        Some(&secret::reference(secret::Memory::VAULT, &entry))
+    );
+    assert_eq!(
+        plan.puts
+            .iter()
+            .map(|(entry, _)| entry.as_str())
+            .collect::<Vec<_>>(),
+        [entry.as_str()]
     );
     // The phone: found by its number, its cells carried.
     let phone = value(&plan, "address", &root, "phone")
@@ -287,7 +304,7 @@ fn every_fleet_db_column_is_carried() {
         ("line_type", json!("eSIM")),
         ("device", json!("desk phone")),
         ("last4", json!("0101")),
-        ("number", json!(secret::MASK)),
+        ("number", json!("4155550101")),
         ("note", json!("primary test line")),
     ] {
         assert_eq!(value(&plan, "phone", &phone, column), Some(&x), "{column}");
@@ -343,9 +360,10 @@ fn every_fleet_db_column_is_carried() {
         "{:?}",
         kinds(&plan)
     );
-    // `ip` is carried nowhere, and the unknown column only by its name.
+    // `ip` is carried nowhere, the unknown column only by its name, and the password only into
+    // its store entry.
     let text = written(&plan);
-    for absent in ["192.0.2.3", "teal", "synthetic-pass-root", "555-0101"] {
+    for absent in ["192.0.2.3", "teal", "synthetic-pass-root"] {
         assert!(!text.contains(absent), "{absent}");
     }
     assert!(
@@ -370,52 +388,101 @@ fn every_fleet_db_column_is_carried() {
     assert!(sources.iter().all(|s| s.contains("fleet-db-m104.json#")));
 }
 
-/// The 39 passwords of a dump of the replica's shape land as 39 sealed `Secret` cells: each
-/// token opens, under its own row and column, to that row's password and to no other row's, no
-/// plaintext is in any written value, and a re-import of the same dump writes nothing.
-/// NEGATIVE CONTROL: with `finish` sealing every secret under one row's coordinates (`pk` in
-/// `sealer.seal(name, "ad-0000000000000000", column, ..)`), no token opens under its own row:
-/// `` assertion failed: SEALER.holds(..) ``.
+/// The 39 passwords of a dump of the replica's shape land in 39 store entries, one per row, each
+/// cell naming its own row's entry and holding no value; no plaintext is in any written value,
+/// and a re-import of the same dump writes and puts nothing.
+/// NEGATIVE CONTROL: with `finish` naming every secret's entry by one row's key
+/// (`secret::entry_name(name, column, "ad-0000000000000000")`), the rows' cells name one entry:
+/// `` assertion failed: names.insert(entry.to_owned()) ``.
 #[test]
-fn thirty_nine_passwords_land_as_sealed_secret_cells_and_a_rerun_writes_nothing() {
+fn thirty_nine_passwords_land_in_named_store_entries_and_a_rerun_writes_nothing() {
     let dump = thirty_nine();
     let sheets = sheets(&dump, Mode::Authoritative);
     let plan = planned(&sheets, &Cells::new());
     let text = written(&plan);
     assert!(!text.contains("synthetic-pass"), "no plaintext is written");
+    assert!(
+        !format!("{:?}", plan.planned).contains("synthetic-pass"),
+        "no plaintext is planned"
+    );
+    assert_eq!(plan.puts.len(), 39);
     let mut book = Book::new();
     let cells = apply(&mut book, &plan);
     let addresses = cell::project(&ADDRESS, &cells);
-    let mut sealed = 0;
+    let mut names = BTreeSet::new();
     for n in 1..=39 {
         let pk = keys::address_pk(&format!("box{n:02}@proton.example")).unwrap();
-        let token = addresses.rows[&pk]
-            .get("password")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(secret::is_sealed(&token));
-        let want = Secret::new(format!("synthetic-pass-{n:02}"));
-        assert!(SEALER.holds(ADDRESS.name, &pk, "password", &token, &want));
-        let other = keys::address_pk(&format!("box{:02}@proton.example", n % 39 + 1)).unwrap();
-        assert!(!SEALER.holds(ADDRESS.name, &other, "password", &token, &want));
-        sealed += 1;
+        let cell = addresses.rows[&pk].get("password").unwrap();
+        let entry = secret::entry_of(cell).unwrap();
+        assert!(
+            secret::bound(ADDRESS.name, "password", &pk, entry),
+            "{entry}"
+        );
+        assert!(names.insert(entry.to_owned()));
+        assert_eq!(
+            store().held(entry).as_deref(),
+            Some(format!("synthetic-pass-{n:02}").as_str())
+        );
     }
-    assert_eq!(sealed, 39);
     assert_eq!(cell::project(&MAILBOX, &cells).rows.len(), 39);
     let again = planned(&sheets, &cells);
     assert!(again.rows.is_empty(), "{:?}", kinds(&again));
+    assert!(again.puts.is_empty());
     // The same dump read fill-only, as another replica's, matches the registry.
     let replica = planned(&self::sheets(&dump, Mode::FillOnly), &cells);
     assert!(replica.rows.is_empty(), "{:?}", kinds(&replica));
     assert!(!replica.findings.iter().any(|f| f.kind == Kind::Differs));
 }
 
+/// A store entry that holds another value than the dump states is a password the dump changed:
+/// the authoritative dump puts the new value into the cell's next entry, never over the one the
+/// held candidate names, rewrites the cell to name it, and removes the replaced entry once the
+/// rows commit (`plan.removes`).
+/// NEGATIVE CONTROL: with `store_holds` answering `true` for any entry it finds, the changed
+/// password is taken for the held one and nothing is put: `` left: 0 right: 1 ``.
+#[test]
+fn a_changed_password_goes_into_its_entry() {
+    let mut book = Book::new();
+    let cells = apply(
+        &mut book,
+        &planned(
+            &sheets(&emails(vec![email_row(1)]), Mode::Authoritative),
+            &Cells::new(),
+        ),
+    );
+    let changed = emails(vec![with(
+        email_row(1),
+        &[("password", json!("synthetic-pass-new"))],
+    )]);
+    let plan = planned(&sheets(&changed, Mode::Authoritative), &cells);
+    assert_eq!(plan.puts.len(), 1);
+    assert!(!written(&plan).contains("synthetic-pass"));
+    let pk = keys::address_pk("box01@proton.example").unwrap();
+    let named = |cells: &Cells| {
+        secret::entry_of(
+            cell::project(&ADDRESS, cells).rows[&pk]
+                .get("password")
+                .unwrap(),
+        )
+        .unwrap()
+        .to_owned()
+    };
+    let entry = named(&cells);
+    let next = named(&apply(&mut book, &plan));
+    assert!(
+        secret::bound(ADDRESS.name, "password", &pk, &next),
+        "{next}"
+    );
+    assert_ne!(next, entry, "the new value takes a fresh entry");
+    assert_eq!(store().held(&next).as_deref(), Some("synthetic-pass-new"));
+    assert_eq!(store().held(&entry).as_deref(), Some("synthetic-pass-01"));
+    assert_eq!(plan.removes, [entry]);
+}
+
 /// A password that reads as a flag (`1`, `yes`, anything under six characters) or the dump's
-/// redaction mark is refused with a finding by key and column, and no `Secret` cell is planned.
-/// NEGATIVE CONTROL: with `want_secret` skipping `flag_like`, the `1` is sealed as a password:
-/// `` left: Some(String("••••••")) right: None ``.
+/// redaction mark is refused with a finding by key and column, and no secret cell is planned.
+/// NEGATIVE CONTROL: with `want_secret` skipping `flag_like`, the `yes` is put as a password:
+/// `` left: Some(Object {"entry": …, "vault": …}) right: None ``.
 #[test]
 fn a_flag_or_a_redaction_never_becomes_a_password() {
     let dump = emails(vec![
@@ -432,6 +499,7 @@ fn a_flag_or_a_redaction_never_becomes_a_password() {
         let pk = keys::address_pk(&format!("box{n:02}@proton.example")).unwrap();
         assert_eq!(value(&plan, "address", &pk, "password"), None, "{n}");
     }
+    assert!(plan.puts.is_empty(), "no flag reaches the store");
     let found = kinds(&plan);
     assert_eq!(
         found.iter().filter(|k| **k == "secret-flag-like").count(),
@@ -570,13 +638,8 @@ fn fill_only_never_overwrites_and_a_difference_is_recorded_without_its_value() {
     let cells = apply(&mut book, &plan);
     let held = cell::project(&ADDRESS, &cells);
     assert_eq!(held.rows[&pk].get("status"), Some(&json!("active")));
-    assert!(SEALER.holds(
-        ADDRESS.name,
-        &pk,
-        "password",
-        held.rows[&pk].get("password").unwrap().as_str().unwrap(),
-        &Secret::new("synthetic-pass-01".into()),
-    ));
+    let entry = secret::entry_of(held.rows[&pk].get("password").unwrap()).unwrap();
+    assert_eq!(store().held(entry).as_deref(), Some("synthetic-pass-01"));
     let again = planned(&replica, &cells);
     assert!(again.rows.is_empty(), "{:?}", kinds(&again));
     // A sheet (fill-only) stating another provider differs too; the authoritative dump then
@@ -635,7 +698,7 @@ fn a_protected_row_refuses_a_password() {
         )],
     );
     let cells = book.cells();
-    let (_, found) = crate::alab::checks::lab(&cells);
+    let (_, found) = crate::alab::checks::lab(&crate::alab::registry::REGISTRY_3, &cells);
     assert!(found.iter().any(|f| matches!(f,
         crate::typed::check::Finding::Protected { pk, column, .. } if *pk == two && column == "password")),
         "{found:?}");
@@ -670,12 +733,12 @@ fn a_replica_conflict_is_a_finding_not_a_write() {
     );
 }
 
-/// Two replicas naming one number name one phone row: the second finds the row by opening its
-/// sealed `number`, so no second row is minted and nothing more is written.
-/// NEGATIVE CONTROL: with `phone` skipping the opened-number lookup, the second replica mints a
+/// Two replicas naming one number, spelled two ways, name one phone row: the second finds the row
+/// by its plain `number`, so no second row is minted, and the number is stored as its digits.
+/// NEGATIVE CONTROL: with `phone` skipping the plain-number lookup, the second replica mints a
 /// row of its own: `` left: 2 right: 1 ``.
 #[test]
-fn a_phone_is_found_by_its_sealed_number() {
+fn a_phone_is_found_by_its_plain_number() {
     let phone = |number: &str| {
         json!({"phones": [{"phone": number, "label": "phone-1", "owner_carrier": "Tello",
             "line_type": "eSIM", "device": null, "status": "active", "linked_emails": [],
@@ -687,7 +750,14 @@ fn a_phone_is_found_by_its_sealed_number() {
         &mut book,
         &planned(&sheets(&dump, Mode::Authoritative), &Cells::new()),
     );
-    assert_eq!(cell::project(&PHONE, &cells).rows.len(), 1);
+    let phones = cell::project(&PHONE, &cells);
+    assert_eq!(phones.rows.len(), 1);
+    assert!(
+        phones
+            .rows
+            .values()
+            .all(|row| row.get("number") == Some(&json!("4155550102")))
+    );
     let other = phone("(415) 555-0102");
     let replica = dump_sheets(
         "fleet-db-m22.json",
@@ -2741,16 +2811,8 @@ fn a_cell_an_edit_clears_is_reported() {
         let first = sheets(full, Mode::Authoritative);
         let mut book = Book::new();
         if let Some(pk) = phone {
-            let number = SEALER
-                .seal(
-                    PHONE.name,
-                    pk,
-                    "number",
-                    &secret::Secret::new("4155550101".into()),
-                )
-                .unwrap();
             let changes = [
-                ("number", json!(number)),
+                ("number", json!("4155550101")),
                 ("last4", json!("0101")),
                 ("label", json!("phone-1")),
                 ("row", json!("live")),
@@ -2776,17 +2838,7 @@ fn a_cell_an_edit_clears_is_reported() {
         if let Some(pk) = phone {
             let phones = cell::project(&PHONE, &cells);
             assert_eq!(phones.rows.len(), 1);
-            let number = phones.rows[pk]
-                .get("number")
-                .and_then(Value::as_str)
-                .unwrap();
-            assert!(SEALER.holds(
-                PHONE.name,
-                pk,
-                "number",
-                number,
-                &secret::Secret::new("4155550101".into())
-            ));
+            assert_eq!(phones.rows[pk].get("number"), Some(&json!("4155550101")));
         }
         let mut read = sheets(bare, Mode::Authoritative);
         let earlier: BTreeSet<String> = first.iter().map(|sheet| sheet.source.clone()).collect();
@@ -3011,7 +3063,8 @@ fn a_row_protected_later_gives_back_its_mailbox_and_hint() {
         plan.findings
     );
     apply(&mut book, &plan);
-    let (lab, generic) = crate::alab::checks::lab(&book.cells());
+    let (lab, generic) =
+        crate::alab::checks::lab(&crate::alab::registry::REGISTRY_3, &book.cells());
     assert!(lab.is_empty(), "{lab:?}");
     assert!(generic.is_empty(), "{generic:?}");
 
@@ -3433,7 +3486,7 @@ fn what_a_row_says_beyond_its_cells_is_reported() {
                 sheets: &read,
                 macs: &[],
                 vendors: &AnyMember,
-                sealer: &SEALER,
+                store: store(),
                 now_ms: NOW,
                 births: crate::alab::import::Births::Named,
                 unread: &[],

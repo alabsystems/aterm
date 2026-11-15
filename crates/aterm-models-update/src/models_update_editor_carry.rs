@@ -40,9 +40,26 @@ pub fn native_update_editor_carry_model() -> Model {
                 late = if phase == 2 { 1 } else { late };
                 target = 0;
             }
+            action Defer when (inflight == 1) {
+                inflight = 0;
+                target = 0;
+            }
             action Refuse when (inflight == 1 && owner == 1) {
                 inflight = 0;
                 target = 0;
+                reseat = 1;
+            }
+            action FailOwned when (inflight == 1 && owner == 0) {
+                inflight = 0;
+                target = 0;
+                reseat = 1;
+            }
+            action FailPublished when (inflight == 1 && owner == 0) {
+                journal = target;
+                owner = 1;
+                inflight = 0;
+                target = 0;
+                reseat = 1;
             }
             action Start when (
                 phase == 0
@@ -90,8 +107,15 @@ pub fn native_update_editor_carry_model() -> Model {
                 late = 0;
                 reseat = if Buggy == 1 { reseat } else { 1 };
             }
+            action ReseatUnchanged when (
+                reseat == 1 && inflight == 0 && owner == 0 && head > mem
+                    && (phase == 0 || (Buggy == 2 && phase <= 2))
+            ) {
+                reseat = 0;
+            }
             action Reseat when (
-                reseat == 1 && inflight == 0 && (phase == 0 || (Buggy == 2 && phase <= 2))
+                reseat == 1 && inflight == 0 && (owner == 1 || mem == head)
+                    && (phase == 0 || (Buggy == 2 && phase <= 2))
             ) {
                 reseat = 0;
                 owner = 0;

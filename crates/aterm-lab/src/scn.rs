@@ -242,7 +242,7 @@ impl Ctx {
             let ls = self.ctl(&["ls"]).stdout;
             if let Some(sid) = ls
                 .split_whitespace()
-                .find(|w| w.len() == 22 && w.starts_with("s-"))
+                .find(|w| aterm_types::tab_id::is_tab_id(w))
             {
                 self.sid = sid.to_string();
                 break;

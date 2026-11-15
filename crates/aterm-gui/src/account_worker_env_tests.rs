@@ -40,8 +40,7 @@ fn worker_command_replaces_the_shells_previous_login() {
         )
         .unwrap();
         let cli = worker::worker_cli(Program::Codex).unwrap();
-        let admitted =
-            worker::admit(cli, onto, Some(root.path()), |_| true, |_| None, |_| Ok(())).unwrap();
+        let admitted = worker::admit(cli, onto, |_| true, |_| None, |_| Ok(())).unwrap();
         let line = worker::line(cli, Dialect::Bash, &admitted, &Fresh::default()).unwrap();
         let mut shell = aterm_uds::spawnfd::command("/bin/sh");
         shell

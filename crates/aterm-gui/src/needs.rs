@@ -163,8 +163,9 @@ impl NeedFacts {
 }
 
 /// THE NEEDS YOU SETS EVERY READER READS FOR `ctx`'s SESSION (the facts' [`NeedFacts::told`],
-/// so the hover's lines and [`HarnessAsk::others`], and `status needs_told=`), told by whoever drives it: under a proven self-claim, the sets that claim told
-/// of its own entry while it stands (`meta set harness_needs`,
+/// so the hover's lines and [`HarnessAsk::others`], and `status needs_told=`), told by whoever drives it: under a claim with an act proof
+/// ([`crate::session_timeline::SupervisorClaim::act_proof`]), the sets that claim told of its own
+/// entry while it stands (`meta set harness_needs`,
 /// [`crate::session_timeline::SessionMeta::self_needs`]), else the sets aterm's own loop told the
 /// window's host ([`crate::session_timeline::SessionTimeline::harness_needs`]). Each leaf lock is
 /// taken alone, the meta's first.
@@ -310,6 +311,173 @@ impl HarnessNeeds {
                     == self.entry);
         same.then_some(self.needs.as_slice())
     }
+
+    /// THE SET A PERSON IS SHOWN: a credential is never a person's need
+    /// ([`alab_policy::credential_need`], the reader aterm's own loop applies
+    /// through `persons_needs`), so a self-claim's set loses its credential lines at ingest
+    /// (`meta set harness_needs`) and aterm resolves them on the secrets path instead. Where a line
+    /// went, the set is told beside the entry aterm puts up in place of the claimant's: the
+    /// claimant's frame (its program and tail, read as every reader reads the entry, [`entry_need`])
+    /// rebuilt for the needs left (`needs_attention_text`), the needs the entry counted past the
+    /// set's own still counted; no set where none is left.
+    #[must_use]
+    pub(crate) fn for_person(&self) -> PersonsSet {
+        use alab_policy::credential_need::is_credential;
+        let (credentials, persons): (Vec<String>, Vec<String>) = self
+            .needs
+            .iter()
+            .cloned()
+            .partition(|need| is_credential(need));
+        if credentials.is_empty() {
+            return PersonsSet {
+                told: Some(self.clone()),
+                credentials,
+            };
+        }
+        let Some(first) = persons.first() else {
+            return PersonsSet {
+                told: None,
+                credentials,
+            };
+        };
+        let said = entry_need(&self.entry);
+        let head = said.map_or(aterm_phase::Program::Codex.product(), |said| said.head);
+        let untold = said.map_or(0, |said| {
+            usize::from(said.words.more).saturating_sub(self.needs.len() - 1)
+        });
+        let tail = said.map_or_else(NeedTail::default, |said| said.words.tail);
+        let entry = aterm_agent::supervise::needs_attention_text(
+            head,
+            first,
+            persons.len() - 1 + untold,
+            tail,
+        );
+        PersonsSet {
+            told: Self::told(&persons, &entry),
+            credentials,
+        }
+    }
+}
+
+/// A self-claim's set as aterm stores and shows it ([`HarnessNeeds::for_person`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PersonsSet {
+    /// The person's needs beside the entry aterm stands for them, `None` where none is left.
+    pub(crate) told: Option<HarnessNeeds>,
+    /// The credential lines taken off, in the claimant's order.
+    pub(crate) credentials: Vec<String>,
+}
+
+/// WHAT A PROVEN SELF-CLAIM SAID OF ITS OWN NEEDS YOU, AND WHAT A PERSON IS SHOWN OF IT: the
+/// claimant's `owner=needs` text as it last wrote it and its last `harness_needs` set, whole, kept
+/// apart from the entry aterm stands for them ([`entry_for`]) and the person's sets told beside
+/// that entry ([`Self::told`]). The claimant never sees aterm's entry: it keeps telling sets with
+/// its own text and writes a new entry only where its own words move, so each of its writes is
+/// read against what it said, never against the entry standing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClaimNeeds {
+    /// The person's sets as the readers read them ([`ToldNeeds::tell`] of [`PersonsSet::told`]).
+    pub(crate) told: ToldNeeds,
+    /// The claimant's own `owner=needs` text, `None` where it took the entry down or wrote none.
+    said: Option<String>,
+    /// The claimant's last set, credential lines included.
+    set: Option<HarnessNeeds>,
+}
+
+impl ClaimNeeds {
+    /// The claimant wrote `said` as its `owner=needs` entry (`None`: took it down): the entry
+    /// aterm stands in its place ([`entry_for`]).
+    pub(crate) fn say(&mut self, said: Option<String>) -> Option<String> {
+        self.said = said;
+        entry_for(self.said.as_deref(), self.set.as_ref())
+    }
+
+    /// The claimant told `set` (`None`: took it down) beside `standing`, the `owner=needs` entry
+    /// as stored now ([`ToldNeeds::tell`] of the person's set): whether what a reader reads
+    /// beside it moved, the credential lines it took off, and, where the set was told with what
+    /// the claimant said, the entry aterm stands for them ([`entry_for`]) if that differs from
+    /// `standing` (`Some(None)`: take it down). A set told with another text waits for the
+    /// claimant's entry to say it ([`Self::say`]). Where the claimant wrote no entry under this
+    /// claim, the standing one is its own if the set was told with it.
+    pub(crate) fn tell(
+        &mut self,
+        set: Option<HarnessNeeds>,
+        standing: Option<&str>,
+    ) -> (bool, Vec<String>, Option<Option<String>>) {
+        let persons = set.as_ref().map(HarnessNeeds::for_person);
+        let credentials = persons
+            .as_ref()
+            .map(|persons| persons.credentials.clone())
+            .unwrap_or_default();
+        let told = persons
+            .and_then(|persons| persons.told)
+            .map(std::sync::Arc::new);
+        let moved = self.told.tell(told, standing);
+        let describes = |said: &str| {
+            set.as_ref()
+                .is_some_and(|set| set.words_for(Some(said)).is_some())
+        };
+        if self.said.is_none() {
+            self.said = standing.filter(|s| describes(s)).map(str::to_string);
+        }
+        let shown = self
+            .said
+            .as_deref()
+            .filter(|said| describes(said))
+            .map(|said| entry_for(Some(said), set.as_ref()))
+            .filter(|shown| shown.as_deref() != standing.map(str::trim));
+        self.set = set;
+        (moved, credentials, shown)
+    }
+}
+
+/// THE `owner=needs` ENTRY A PERSON IS SHOWN FOR A WRITER'S `said` TEXT, beside the set its
+/// claimant told last (`set`, `None` for a writer that tells none): where the set was told with
+/// that text, the entry [`HarnessNeeds::for_person`] stands for the person's needs (the claimant's
+/// text where it took no line off; none where no person's need is left); else the text itself
+/// unless the need it leads with, read as every reader reads it ([`entry_need`]), is a credential,
+/// which no person is shown: that entry waits for its set to say what else it counts.
+#[must_use]
+pub(crate) fn entry_for(said: Option<&str>, set: Option<&HarnessNeeds>) -> Option<String> {
+    let said = said?;
+    if let Some(set) = set.filter(|set| set.words_for(Some(said)).is_some()) {
+        return set.for_person().told.map(|told| told.entry);
+    }
+    let lead = entry_need(said).map_or_else(|| entry_words(said), |need| need.words.first);
+    (!alab_policy::credential_need::is_credential(lead)).then(|| said.to_string())
+}
+
+/// A needs entry read as every reader reads it ([`harness_ask`]): its program's words as written
+/// and its first need, the count and tail where [`need_words`] reads them, else the whole rest
+/// past the program, without its tail, as the one need; `None` where it names no program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EntryNeed<'a> {
+    /// The program as the entry writes it (`Codex`).
+    pub(crate) head: &'a str,
+    /// The need it leads with, the count and the tail.
+    pub(crate) words: NeedWords<'a>,
+}
+
+/// [`EntryNeed`] of `text` (an entry's `kind=` word skipped).
+#[must_use]
+pub(crate) fn entry_need(text: &str) -> Option<EntryNeed<'_>> {
+    let text = entry_words(text);
+    let (head, rest) = text.split_once(NEEDS_YOU)?;
+    let head = head.trim();
+    let program = aterm_phase::Program::ALL
+        .into_iter()
+        .find(|program| program.name().eq_ignore_ascii_case(head))?;
+    let words = need_words(text).or_else(|| {
+        let (first, tail) = without_tail(rest);
+        let first = first.trim();
+        (!first.is_empty()).then(|| NeedWords {
+            first,
+            more: 0,
+            program,
+            tail: tail.unwrap_or_default(),
+        })
+    })?;
+    Some(EntryNeed { head, words })
 }
 
 /// What a session needs of its owner now.
@@ -619,7 +787,7 @@ pub(crate) const ROW_WHAT_MAX: usize = 72;
 /// Byte budget for a harness's need in its own words ([`HarnessAsk::first`]).
 pub(crate) const NEED_WHAT_MAX: usize = 240;
 /// Byte budget for each need a harness's loop told the window whole ([`HarnessAsk::told`]).
-pub(crate) const NEED_TOLD_MAX: usize = aterm_agent::supervise::policy::needs::NEED_CHARS * 4;
+pub(crate) const NEED_TOLD_MAX: usize = alab_policy::needs::NEED_CHARS * 4;
 /// Byte budget for the words that carry a remedy.
 pub(crate) const REMEDY_TEXT_MAX: usize = crate::session_timeline::META_ATTENTION_KEYED_MAX;
 
@@ -948,29 +1116,13 @@ fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool)
 }
 
 fn harness_ask(text: &str, told: Option<&[String]>) -> Option<HarnessAsk> {
-    let text = entry_words(text);
-    let (head, rest) = text.split_once(NEEDS_YOU)?;
-    let program = aterm_phase::Program::ALL
-        .into_iter()
-        .find(|program| program.name().eq_ignore_ascii_case(head.trim()))?;
-    let parsed = need_words(text);
-    let counted = parsed.map_or(0, |words| words.more);
-    let tail = without_tail(rest).1.unwrap_or_default();
-    let alone = parsed.map(HarnessAsk::of).or_else(|| {
-        let (first, tail) = without_tail(rest);
-        let first = first.trim();
-        (!first.is_empty()).then(|| {
-            HarnessAsk::of(NeedWords {
-                first,
-                more: 0,
-                program,
-                tail: tail.unwrap_or_default(),
-            })
+    let words = entry_need(text)?.words;
+    told.and_then(|needs| HarnessAsk::told_counted(needs, words.program, words.more))
+        .map(|ask| HarnessAsk {
+            tail: words.tail,
+            ..ask
         })
-    });
-    told.and_then(|needs| HarnessAsk::told_counted(needs, program, counted))
-        .map(|ask| HarnessAsk { tail, ..ask })
-        .or(alone)
+        .or_else(|| Some(HarnessAsk::of(words)))
 }
 
 fn entry_words(text: &str) -> &str {
@@ -1098,7 +1250,7 @@ pub(crate) fn memory_remedy(resume: Option<&str>) -> String {
         .unwrap_or_else(|| HEAD.to_string())
 }
 
-/// A wall kind (`aterm_phase::WallKind::name`) in a person's words.
+/// A wall kind (`alab_policy::vocab::WallKind::name`) in a person's words.
 pub(crate) fn wall_words(kind: &str) -> &str {
     match kind {
         "usage-session" => "session usage limit",

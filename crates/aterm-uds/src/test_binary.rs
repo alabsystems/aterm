@@ -109,43 +109,7 @@ pub fn short_root() -> Option<&'static Path> {
     }
 }
 
-/// Whether `exe` is a Cargo test binary: an executable with the name Cargo gives one,
-/// `<name>-<16 hex digits>`, in any folder, so that a copy kept aside to compare two builds stays
-/// out of the person's folders as the original does. Under any other name it cannot be told from a
-/// development program, and it runs on the person's real state, sockets and fleet port. Cargo names
-/// an example and a build script the same way, and each of those is a program.
-///
-/// Linux names a running image that a later build unlinked `<path> (deleted)` (its
-/// `/proc/self/exe`, which `current_exe` reads), and that image is still the test binary it was.
-#[must_use]
-pub fn is_test_binary(exe: &Path) -> bool {
-    #[cfg(unix)]
-    let exe = {
-        use std::os::unix::ffi::OsStrExt as _;
-        exe.as_os_str()
-            .as_bytes()
-            .strip_suffix(b" (deleted)")
-            .map_or(exe, |path| Path::new(OsStr::from_bytes(path)))
-    };
-    let executable = exe.extension().is_none_or(|ext| ext == "exe");
-    let named = exe
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .and_then(|stem| stem.rsplit_once('-'))
-        .is_some_and(|(name, hash)| {
-            !name.is_empty()
-                && !name.starts_with("build_script_")
-                && hash.len() == 16
-                && hash
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        });
-    let example = exe
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|dir| dir == "examples");
-    executable && named && !example
-}
+pub use aterm_sysprobe::test_binary::is_test_binary;
 
 /// Whether `dir` is the login session's runtime directory (`/run/user/<uid>`).
 #[must_use]

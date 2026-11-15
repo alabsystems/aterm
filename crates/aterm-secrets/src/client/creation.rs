@@ -915,10 +915,9 @@ fn finish(paths: &Paths, context: [u8; 32], pending: Pending) -> crate::Result<C
             if state.seq == 0
                 || state.membership != Stored::In
                 || state.failed
-                || !state.pending.is_empty()
                 || !source_bound(&current, &state)
                 || !cache_intact(paths, &state)
-                || !files_intact(paths, &state)
+                || !applied_intact(paths, &state)
             {
                 return Err(Error::new(
                     "creation is published; local installation remains incomplete",
@@ -940,7 +939,7 @@ fn finish(paths: &Paths, context: [u8; 32], pending: Pending) -> crate::Result<C
             super::config(paths)?.ok_or_else(|| Error::new("creation lost its configuration"))?;
         compatible(&current, &pending.config()?)?;
         let state = load_state(paths)?;
-        if state.failed || !state.pending.is_empty() || !source_bound(&current, &state) {
+        if state.failed || !source_bound(&current, &state) {
             return Err(Error::new("creation changed before completion"));
         }
         let digest = aterm_digest::Sha256::digest(&pending.packet);

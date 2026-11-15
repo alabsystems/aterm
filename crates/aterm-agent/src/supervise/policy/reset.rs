@@ -7,7 +7,8 @@
 use std::fmt;
 use std::time::Duration;
 
-use aterm_phase::{ConfirmRead, ResetKind};
+use alab_policy::vocab::ResetKind;
+use aterm_phase::ConfirmRead;
 
 use crate::harness::accounts::OFFER_EXPIRING_S;
 

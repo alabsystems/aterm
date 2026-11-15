@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! AghGitGrant's conformance: the helper's decision (`answer`) and the grant files, bound to
-//! the model step by step.
+//! AghGitGrant's conformance: the helper's final credential admission (`admitted`) and
+//! grant files, bound to the model step by step.
 
 #![cfg(unix)]
 
@@ -15,17 +15,40 @@ use aterm_spec::interp::{self, State};
 use aterm_spec::xref::{self, StepEvidence};
 
 use super::GRANT_MAX;
-use super::credential::{Asked, CredentialAnswer, CredentialRequest, answer, project_answer};
+use super::credential::{Asked, CredentialAnswer, CredentialRequest, admitted};
 use super::grant::{self, Grant, MapGrants, project_grant_file};
 use crate::config::{self, Dirs};
-use crate::identity::{self, MapEnv};
-use crate::policy::{Presence, Router};
+use crate::identity;
+use crate::policy::{Router, Tier};
 use crate::slug::Slug;
 use crate::test_fixtures::{canonical_text, setup_file, write_config};
 
+/// The model's view of an answer (`AghGitGrant`'s `(phase, used)`):
+/// - a credential whose profile is release tier (`CredentialAnswer::Credential`'s `tier`) →
+///   (1, 2);
+/// - any other credential → (1, 1);
+/// - `Quit` → (2, 0).
+///
+/// It reads the tier of the profile that answered, never the slug's. So a release credential
+/// answered for a dev slug projects (1, 2), which breaks `ReleaseStaysHome`.
+#[must_use]
+fn project_admitted(admission: &super::credential::CredentialAdmission) -> (i64, i64) {
+    if admission.credential.is_none() {
+        return (2, 0);
+    }
+    match &admission.answer {
+        CredentialAnswer::Credential {
+            tier: Tier::Release,
+            ..
+        } => (1, 2),
+        CredentialAnswer::Credential { .. } => (1, 1),
+        CredentialAnswer::Quit { .. } => (2, 0),
+    }
+}
+
 const MACHINE: &str = "AghGitGrant";
 
-const LAWS: [&str; 9] = [
+const LAWS: [&str; 11] = [
     "PathlessGetsNothing",
     "GithubOnly",
     "NoTerminalDoor",
@@ -35,9 +58,11 @@ const LAWS: [&str; 9] = [
     "GrantLive",
     "GrantPidBound",
     "GrantSlugBound",
+    "SuppliedGrantBound",
+    "GrantCredentialBound",
 ];
 
-const MUTANTS: [(&str, &str); 9] = [
+const MUTANTS: [(&str, &str); 11] = [
     ("BuggyPathless", "PathlessGetsNothing"),
     ("BuggyForeignHost", "GithubOnly"),
     ("BuggyTtyAnswers", "NoTerminalDoor"),
@@ -47,10 +72,14 @@ const MUTANTS: [(&str, &str); 9] = [
     ("BuggyOtherPid", "GrantPidBound"),
     ("BuggyWrongSlug", "GrantSlugBound"),
     ("BuggyReleaseForDev", "ReleaseStaysHome"),
+    ("BuggySuppliedFallback", "SuppliedGrantBound"),
+    ("BuggyMismatchedCredential", "GrantCredentialBound"),
 ];
 
-const WORLD: [&str; 10] = [
+const WORLD: [&str; 12] = [
     "NextTier",
+    "ToggleSupplied",
+    "ToggleBinding",
     "TogglePath",
     "ToggleHost",
     "ToggleTty",
@@ -144,7 +173,7 @@ fn request(state: &State) -> CredentialRequest {
 }
 
 /// The model's grant as a `MapGrants` (plan §11, the conformance's step 3).
-fn grants(state: &State) -> MapGrants {
+fn grants(state: &State, credentials: &[std::sync::Arc<identity::Credential>]) -> MapGrants {
     let model = var(state, "grant");
     if model == 0 {
         return MapGrants::new();
@@ -156,10 +185,24 @@ fn grants(state: &State) -> MapGrants {
     };
     let live = model == 1;
     let in_tree = live && var(state, "child") == 1 && var(state, "asker") == 0;
+    let profile = if var(state, "tier") == 0 {
+        "dev"
+    } else {
+        "release"
+    };
+    let mut credential_binding = credentials
+        .iter()
+        .find(|cred| cred.profile() == profile)
+        .unwrap()
+        .git_grant_binding();
+    if var(state, "bindingm") == 0 {
+        credential_binding[31] ^= 1;
+    }
     let grant = Grant {
         nonce: nonce(),
         slug,
-        profile: "release".to_string(),
+        profile: profile.to_string(),
+        credential_binding,
         pid: std::process::id(),
         start: 1,
         expires_at: if live { NOW + 600 } else { NOW - 1 },
@@ -194,13 +237,9 @@ fn the_helper_and_the_grant_files_conform_to_the_git_grant_model() {
     let buggy = interp::with_buggy(&model, 1);
     let states = interp::reachable_states(&model);
     let world = world();
-    let env = MapEnv::new();
-    let presence = |name: &str| {
-        world
-            .router
-            .profile(name)
-            .map_or(Presence::Absent, |row| identity::presence(row, &env))
-    };
+    let credentials = ["dev", "release"].map(|name| {
+        std::sync::Arc::new(identity::load(world.router.profile(name).unwrap()).unwrap())
+    });
     let mut ev = StepEvidence::new(MACHINE);
     let mut real: BTreeMap<State, (i64, i64)> = BTreeMap::new();
 
@@ -210,25 +249,26 @@ fn the_helper_and_the_grant_files_conform_to_the_git_grant_model() {
         let nonce = nonce();
         let asked = Asked {
             stdin_is_terminal: var(state, "tty") == 1,
-            nonce: (var(state, "grant") > 0).then_some(nonce.as_str()),
+            nonce: (var(state, "supplied") > 0).then_some(nonce.as_str()),
             loopback: None,
             now: NOW,
         };
-        let grants = grants(state);
+        let grants = grants(state, &credentials);
         let answered = ev.step("Answer", || {
-            answer(&req, &asked, &world.router, &grants, &presence)
+            admitted(&req, &asked, &world.router, &grants, &credentials)
         });
-        let projection = project_answer(&answered);
+        let projection = project_admitted(&answered);
         assert_eq!(
             (expected["phase"], expected["used"]),
             projection,
-            "{state:?}: {answered:?}"
+            "{state:?}: {:?}",
+            answered.answer
         );
-        if let CredentialAnswer::Credential { profile, tier } = &answered {
+        if let CredentialAnswer::Credential { profile, tier } = &answered.answer {
             let row = world.router.profile(profile).expect("a profile it holds");
-            assert_eq!(*tier, row.tier, "{state:?}: {answered:?}");
+            assert_eq!(*tier, row.tier, "{state:?}: {:?}", answered.answer);
             if var(state, "tier") == 0 {
-                assert_eq!(profile, "dev", "{state:?}: {answered:?}");
+                assert_eq!(profile, "dev", "{state:?}: {:?}", answered.answer);
             }
         }
         real.insert(state.clone(), projection);
@@ -277,7 +317,7 @@ fn the_helper_and_the_grant_files_conform_to_the_git_grant_model() {
                 "Spawn" => {
                     let made = ev
                         .step("Spawn", || {
-                            grant::write(&dirs, &repo, "release", NOW, GRANT_MAX)
+                            grant::write(&dirs, &repo, "release", [0; 32], NOW, GRANT_MAX)
                         })
                         .expect("a grant is written");
                     assert_eq!(
@@ -287,7 +327,7 @@ fn the_helper_and_the_grant_files_conform_to_the_git_grant_model() {
                     );
                 }
                 "Consume" => {
-                    let made = grant::write(&dirs, &repo, "release", NOW, GRANT_MAX)
+                    let made = grant::write(&dirs, &repo, "release", [0; 32], NOW, GRANT_MAX)
                         .expect("a grant is written");
                     assert_eq!(project_grant_file(&dirs, &made.nonce, NOW), 1);
                     ev.step("Consume", || grant::remove(&dirs, &made));
@@ -298,7 +338,7 @@ fn the_helper_and_the_grant_files_conform_to_the_git_grant_model() {
                     );
                 }
                 _ => {
-                    let made = grant::write(&dirs, &repo, "release", NOW, GRANT_MAX)
+                    let made = grant::write(&dirs, &repo, "release", [0; 32], NOW, GRANT_MAX)
                         .expect("a grant is written");
                     // NEGATIVE CONTROL: a sweep at the walk's clock leaves the live grant alone.
                     grant::sweep(&dirs, NOW);
@@ -324,7 +364,7 @@ fn the_helper_and_the_grant_files_conform_to_the_git_grant_model() {
         "Spawn, Consume and Expire on both tiers: {seen:?}"
     );
 
-    assert_eq!((LAWS.len(), MUTANTS.len(), WORLD.len()), (9, 9, 10));
+    assert_eq!((LAWS.len(), MUTANTS.len(), WORLD.len()), (11, 11, 12));
     let audit = ev.audit();
     assert!(audit.is_complete(), "{audit:?}");
     let anchored: BTreeSet<&str> = ["Answer", "Consume", "Expire", "Spawn"].into();
@@ -343,7 +383,7 @@ fn the_helper_and_the_grant_files_conform_to_the_git_grant_model() {
         .chain(MUTANTS.iter().map(|(mutant, _)| *mutant))
         .collect();
     assert_eq!(waived, expected);
-    assert_eq!(waived.len(), 19);
+    assert_eq!(waived.len(), 23);
     let every: BTreeSet<&str> = model.actions.iter().map(|a| a.name).collect();
     assert_eq!(
         bound.union(&waived).copied().collect::<BTreeSet<_>>(),
@@ -365,8 +405,15 @@ fn a_grant_is_written_into_a_fresh_state_directory() {
     let (_root, dirs) = fresh_dirs();
     assert!(!dirs.state.exists());
     assert!(dirs.state.parent().is_some_and(|p| !p.exists()));
-    let made = grant::write(&dirs, &slug("alabsystems/aterm"), "release", NOW, GRANT_MAX)
-        .expect("a grant on a fresh state directory");
+    let made = grant::write(
+        &dirs,
+        &slug("alabsystems/aterm"),
+        "release",
+        [0; 32],
+        NOW,
+        GRANT_MAX,
+    )
+    .expect("a grant on a fresh state directory");
     let mode = |path: &std::path::Path| {
         std::fs::metadata(path)
             .expect("it exists")
@@ -383,15 +430,22 @@ fn a_grant_is_written_into_a_fresh_state_directory() {
 }
 
 /// A grant is published whole under its name: no staging file is left, and the file has one
-/// link. A staging file a concurrent writer has not yet linked (`.{nonce}.tmp`, empty here, as
-/// it is between its `create_new` and its write) is no grant to `sweep`, which keeps it while
-/// it is young and removes it once its mtime is more than `GRANT_MAX` old.
+/// link. A staging file a concurrent writer has not yet linked (`.{nonce}.tmp`, empty here,
+/// between its `create_new` and its write) has no established expiry. The sweep preserves
+/// its bytes even after more than `GRANT_MAX` has passed since its mtime.
 #[test]
-fn a_grant_is_published_whole_and_a_stale_staging_file_is_swept() {
+fn a_grant_is_published_whole_and_an_unknown_staging_file_is_kept() {
     use std::os::unix::fs::MetadataExt as _;
     let (_root, dirs) = fresh_dirs();
-    let made = grant::write(&dirs, &slug("alabsystems/aterm"), "release", NOW, GRANT_MAX)
-        .expect("a grant");
+    let made = grant::write(
+        &dirs,
+        &slug("alabsystems/aterm"),
+        "release",
+        [0; 32],
+        NOW,
+        GRANT_MAX,
+    )
+    .expect("a grant");
     let names = || -> BTreeSet<String> {
         std::fs::read_dir(dirs.grants())
             .expect("the grants directory")
@@ -405,7 +459,7 @@ fn a_grant_is_published_whole_and_a_stale_staging_file_is_swept() {
     assert_eq!(std::fs::metadata(&file).expect("the grant").nlink(), 1);
     let other = aterm_uds::rand::hex_token::<16>().expect("a nonce");
     let staging = format!(".{other}.tmp");
-    std::fs::File::create(dirs.grants().join(&staging)).expect("a staging file");
+    setup_file(&dirs.grants().join(&staging), b"");
     let staged_at = std::fs::metadata(dirs.grants().join(&staging))
         .and_then(|meta| meta.modified())
         .ok()
@@ -415,5 +469,8 @@ fn a_grant_is_published_whole_and_a_stale_staging_file_is_swept() {
     grant::sweep(&dirs, staged_at);
     assert!(names().contains(&staging), "a young staging file was swept");
     grant::sweep(&dirs, staged_at + GRANT_MAX.as_secs() + 1);
-    assert!(!names().contains(&staging), "a stale staging file was kept");
+    assert!(
+        names().contains(&staging),
+        "an undated staging file was swept by age alone"
+    );
 }

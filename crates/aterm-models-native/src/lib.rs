@@ -7,8 +7,10 @@
 
 //! aterm's models of the native chrome (tabs, panes, settings, documents).
 
+mod models_closed_reopen;
 mod models_engine_corpus;
 mod models_native;
+pub use models_closed_reopen::*;
 
 pub use models_engine_corpus::*;
 pub use models_native::*;

@@ -623,11 +623,11 @@ impl PaletteState {
                 MenuAction::NextNeed => row.enabled = live.agents.needs_local,
                 MenuAction::Overview => row.enabled = live.agents.any_window,
                 MenuAction::ReadFleet | MenuAction::FleetMachines => {
-                    row.enabled = live.agents.in_fleet;
+                    row.enabled = live.agents.in_fleet == Some(true);
                 }
                 MenuAction::SummarizeFleet => {
                     row.label = Cow::Borrowed(crate::menu::summarize_title(live.agents.in_fleet));
-                    row.enabled = live.agents.summarize_block.is_none();
+                    row.enabled = live.agents.summarize_ready();
                 }
                 MenuAction::SetRole => {
                     row.enabled = live.terminal_front && live.can_rename;

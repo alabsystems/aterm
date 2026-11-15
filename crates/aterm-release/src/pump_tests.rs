@@ -623,15 +623,24 @@ fn the_last_runs_exit_decides_whether_and_when_it_runs_again() {
         "and is capped"
     );
 
-    // Exit 4, another live holder: wait; adoption is tried again later, never a second line.
+    // Exit 4, beside another holder of this clone's line: nothing is run again while the line's
+    // record still keeps a contender off, however long; once it does not, it is tried again.
     let mut lab = Lab::opened();
-    lab.adopt = true;
-    lab.main.line = Some(OPENED.into());
+    lab.line(OPENED);
     let memory = attempt(&mut lab, 4, 0);
-    lab.now += HOLDER_SECS - 1;
-    assert!(waits(&decide(&lab.seen(), &memory)).contains("no second line is started"));
+    lab.main.held = Some(held(lab.now + 1800));
+    lab.now += 100 * HOLDER_SECS;
+    let waiting = decide(&lab.seen(), &memory);
+    assert!(waits(&waiting).contains("still holds it"), "{waiting:?}");
+    lab.main.held = None;
+    assert_eq!(runs(&decide(&lab.seen(), &memory)), Some(&Verb::Prepare));
+    // The run and the record disagreed (exit 4 from a line its record calls free): the tries
+    // back off, never a tight loop.
+    let memory = attempt(&mut lab, 4, 2);
+    lab.now += 4 * POLL_SECS - 1;
+    assert!(waits(&decide(&lab.seen(), &memory)).contains("no longer keeps a contender off"));
     lab.now += 1;
-    assert_eq!(runs(&decide(&lab.seen(), &memory)), Some(&Verb::Adopt));
+    assert_eq!(runs(&decide(&lab.seen(), &memory)), Some(&Verb::Prepare));
 
     // Exit 1 with no repair worker, an operational refusal: nothing starts until the journal or
     // main has changed, however long it waits.
@@ -674,6 +683,181 @@ fn the_last_runs_exit_decides_whether_and_when_it_runs_again() {
         runs(&decide(&lab.seen(), &memory)),
         Some(&Verb::Start(OPENED.into()))
     );
+}
+
+/// A LINE THE PUMP RESUMES HAS A LINUX DECLARATION (0.200.0, 2026-11-12: a resume adopted the
+/// fleet's line into a journal with none, and `release --prepare` was refused "the cut must
+/// declare Linux" at step 1). A resume whose journal holds no declaration is handed the pump's
+/// own, as a start and an adoption always are; `--open-next` takes none.
+/// NEGATIVE CONTROLS: a journal that holds a declaration keeps its own, so the resume is handed
+/// nothing; a pump with no declaration starts no run that prepares such a line, and names what
+/// is missing.
+#[test]
+fn a_resumed_line_with_no_linux_declaration_is_handed_the_pumps() {
+    let mac = || Ok(vec!["--mac-only".to_string()]);
+    let none = || Err::<Vec<String>, String>("the pump has no declaration".into());
+    let resumes = [Verb::Prepare, Verb::Fix(FIX.into()), Verb::Finish];
+    for verb in &resumes {
+        let handed = declaration(verb, false, mac()).unwrap();
+        assert_eq!(handed, ["--mac-only"], "{verb:?}");
+        assert_eq!(verb.args(&handed).last().unwrap(), "--mac-only", "{verb:?}");
+        assert!(
+            declaration(verb, true, mac()).unwrap().is_empty(),
+            "{verb:?}"
+        );
+        assert!(
+            declaration(verb, true, none()).unwrap().is_empty(),
+            "{verb:?}"
+        );
+    }
+    for verb in [Verb::Start(OPENED.into()), Verb::Adopt] {
+        for declares in [false, true] {
+            assert_eq!(declaration(&verb, declares, mac()).unwrap(), ["--mac-only"]);
+            assert!(declaration(&verb, declares, none()).is_err(), "{verb:?}");
+        }
+    }
+    assert!(declaration(&Verb::Prepare, false, none()).is_err());
+    assert!(declaration(&Verb::Fix(FIX.into()), false, none()).is_err());
+    // The bare run of a journal with none is the release's to refuse or finish.
+    assert!(
+        declaration(&Verb::Finish, false, none())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        declaration(&Verb::OpenNext, false, mac())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        Verb::OpenNext.args(&mac().unwrap()),
+        ["release", "--open-next"]
+    );
+}
+
+/// A refused resume that moved this clone's journal (it adopted the fleet's line, so the head
+/// its key names changed) is the last run of the journal it left: the same verb on that journal
+/// is not run again as if untried, and waits for the journal or main to change.
+/// NEGATIVE CONTROL: with the journal changed since that run, the verb runs.
+#[test]
+fn a_refusal_that_moved_the_journal_is_not_run_again_at_once() {
+    let mut lab = Lab::opened();
+    lab.line(OPENED);
+    let mut memory = attempt(&mut lab, 1, 0);
+    // The run adopted the line at MOVED and was refused there.
+    lab.line(MOVED);
+    memory.last.as_mut().unwrap().journal = lab.journal.clone();
+    let again = decide(&lab.seen(), &memory);
+    assert!(waits(&again).contains("stopped"), "{again:?}");
+    lab.now += 10 * REFUSED_CAP_SECS;
+    assert!(runs(&decide(&lab.seen(), &memory)).is_none());
+    lab.main.tip = TIP.into();
+    assert_eq!(runs(&decide(&lab.seen(), &memory)), Some(&Verb::Prepare));
+    let mut changed = Lab::opened();
+    changed.line(OPENED);
+    let memory = attempt(&mut changed, 1, 0);
+    changed.line(MOVED);
+    assert_eq!(
+        runs(&decide(&changed.seen(), &memory)),
+        Some(&Verb::Prepare)
+    );
+    // Only a refusal is carried across the move: a run that ended 0 or could not run is of its
+    // own key, and the journal it left is run at once.
+    for code in [0, 3] {
+        let mut lab = Lab::opened();
+        lab.line(OPENED);
+        let mut memory = attempt(&mut lab, code, 0);
+        lab.line(MOVED);
+        memory.last.as_mut().unwrap().journal = lab.journal.clone();
+        assert_eq!(
+            runs(&decide(&lab.seen(), &memory)),
+            Some(&Verb::Prepare),
+            "exit {code}"
+        );
+    }
+}
+
+/// A holder whose lease runs until `until`, as the line's record gives it to a contender.
+fn held(until: u64) -> Held {
+    Held {
+        until,
+        refusal: "CUTTING ELSEWHERE: v0.6.0 by m73 at qualify".into(),
+    }
+}
+
+/// THE PUMP RUNS NOTHING IT CANNOT HOLD (0.200.0, 2026-11-12: m73 held the line, and the pump
+/// ran step 1 again and again to be told so). With `--adopt`, a fleet line whose record keeps a
+/// contender off is waited on from that record alone: no verb runs, and the wait is said once,
+/// with the lease's end, however often the holder renews. Once the record frees the line, the
+/// release's selection adopts it.
+/// NEGATIVE CONTROL: the same line with a record that keeps nobody off is adopted at the first
+/// look.
+#[test]
+fn a_held_line_is_waited_on_from_its_record_and_said_once() {
+    let beside = |held_until: Option<u64>| {
+        let mut lab = Lab::opened();
+        lab.adopt = true;
+        lab.main.line = Some(OPENED.into());
+        lab.main.holder = Some("m73 (node n, session s, pid 1, boot b, start 1)".into());
+        lab.main.held = held_until.map(held);
+        lab
+    };
+    let mut lab = beside(Some(2_800));
+    let (mut memory, mut said) = (Memory::default(), String::new());
+    for _ in 0..90 {
+        let secs = cycle(&mut lab, &mut memory, &mut said);
+        assert_eq!(secs, POLL_SECS);
+        lab.now += secs;
+        // The holder completes a row: its lease is renewed.
+        lab.main.held.as_mut().unwrap().until += 300;
+    }
+    assert!(lab.ran.is_empty(), "{:?}", lab.ran);
+    assert_eq!(lab.said.len(), 1, "{:?}", lab.said);
+    assert!(
+        lab.said[0].contains("held by m73")
+            && lab.said[0].contains("its lease runs until 2800")
+            && lab.said[0].contains("CUTTING ELSEWHERE: v0.6.0 by m73"),
+        "{:?}",
+        lab.said
+    );
+    lab.main.held = None;
+    assert_eq!(cycle(&mut lab, &mut memory, &mut said), 0);
+    assert_eq!(lab.ran, [Verb::Adopt]);
+
+    let mut free = beside(None);
+    cycle(&mut free, &mut Memory::default(), &mut String::new());
+    assert_eq!(free.ran, [Verb::Adopt]);
+}
+
+/// A run that still ends beside the holder (exit 4: the line was taken between the look and
+/// the claim, or this clone's own line was taken over) is run once: while the record keeps a
+/// contender off the pump waits, saying so once, and it resumes when the record frees the line.
+/// NEGATIVE CONTROL: without the record's word the exit-4 line would be tried again each
+/// backoff; here ninety looks beside a live holder run nothing.
+#[test]
+fn a_run_that_ended_beside_a_holder_is_not_run_again_while_the_line_is_held() {
+    let mut lab = Lab::opened();
+    lab.line(OPENED);
+    lab.exits = vec![4];
+    let (mut memory, mut said) = (Memory::default(), String::new());
+    assert_eq!(cycle(&mut lab, &mut memory, &mut said), 0);
+    assert_eq!(lab.ran, [Verb::Prepare]);
+    lab.main.held = Some(held(lab.now + 1_800));
+    let before = lab.said.len();
+    for _ in 0..90 {
+        lab.now += cycle(&mut lab, &mut memory, &mut said);
+        lab.main.held.as_mut().unwrap().until += 300;
+    }
+    assert_eq!(lab.ran, [Verb::Prepare], "nothing ran beside the holder");
+    assert_eq!(lab.said.len(), before + 1, "{:?}", lab.said);
+    assert!(
+        lab.said[before].contains("still holds it"),
+        "{:?}",
+        lab.said
+    );
+    lab.main.held = None;
+    cycle(&mut lab, &mut memory, &mut said);
+    assert_eq!(lab.ran, [Verb::Prepare, Verb::Prepare]);
 }
 
 /// A RED IS NEVER RUN AGAIN. A line that refused with a repair worker on it is not resumed when
@@ -788,12 +972,15 @@ fn the_verbs_spell_only_the_existing_release_flags() {
         format!("release --prepare --commit {OPENED} --mac-only")
     );
     assert_eq!(spelled(Verb::Adopt), "release --prepare --mac-only");
-    assert_eq!(spelled(Verb::Prepare), "release --prepare");
-    assert_eq!(spelled(Verb::Finish), "release");
+    assert_eq!(spelled(Verb::Prepare), "release --prepare --mac-only");
+    assert_eq!(spelled(Verb::Finish), "release --mac-only");
     assert_eq!(
         spelled(Verb::Fix(FIX.into())),
-        format!("release --prepare --fix {FIX}")
+        format!("release --prepare --fix {FIX} --mac-only")
     );
+    // Handed no declaration (the journal holds its own), a resume spells none.
+    assert_eq!(Verb::Prepare.args(&[]).join(" "), "release --prepare");
+    assert_eq!(Verb::Finish.args(&[]).join(" "), "release");
     for verb in [
         Verb::OpenNext,
         Verb::Start(OPENED.into()),

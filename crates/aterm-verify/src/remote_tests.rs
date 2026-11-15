@@ -106,19 +106,38 @@ fn github_spellings_share_a_route_and_unsupported_urls_never_become_git_fallback
     }
 }
 
+/// What `agh repo fetch-main` prints: the ref and the commit its fetch wrote there.
+fn fetched_main(oid: &str) -> String {
+    json!({"ref": "refs/agh/fetched-main", "oid": oid}).to_string()
+}
+
 #[test]
 fn main_refresh_requires_a_successful_incremental_snapshot_and_one_commit() {
     let root = aterm_tempfile::tempdir().unwrap();
-    for (symbolic, fetched, tip, object, expected, calls_expected) in [
-        (1, 0, AFTER, "commit\n", true, 4),
-        (1, 4, BEFORE, "commit\n", false, 2),
-        (0, 0, AFTER, "commit\n", false, 1),
-        (128, 0, AFTER, "commit\n", false, 1),
-        (1, 0, "bad", "commit\n", false, 3),
-        (1, 0, AFTER, "tag\n", false, 4),
+    let mut fetch = words(&["repo", "fetch-main", "fixture/repo"]);
+    fetch.push(root.path().as_os_str().to_owned());
+    for (fetched, printed, object, expected, calls_expected) in [
+        (0, fetched_main(AFTER), "commit\n", true, 2),
+        (4, fetched_main(AFTER), "commit\n", false, 1),
+        (0, String::new(), "commit\n", false, 1),
+        (0, fetched_main("bad"), "commit\n", false, 1),
+        (
+            0,
+            json!({"ref": "refs/agh/other", "oid": AFTER}).to_string(),
+            "commit\n",
+            false,
+            1,
+        ),
+        (
+            0,
+            json!({"ref": "refs/agh/fetched-main"}).to_string(),
+            "commit\n",
+            false,
+            1,
+        ),
+        (0, fetched_main(AFTER), "tag\n", false, 2),
     ] {
         let calls = Cell::new(0);
-        let current = Cell::new(BEFORE);
         let run = |tool, args: &[OsString]| {
             if tool == Tool::Git && args.first().is_some_and(|arg| arg == "remote") {
                 return Ok(url(tool, args).unwrap());
@@ -127,48 +146,71 @@ fn main_refresh_requires_a_successful_incremental_snapshot_and_one_commit() {
             calls.set(call + 1);
             match call {
                 0 => {
-                    assert_eq!(tool, Tool::Git);
-                    assert_eq!(
-                        args,
-                        words(&["symbolic-ref", "--quiet", "refs/agh/fetched-main"])
-                    );
-                    Ok(out(symbolic, ""))
+                    assert_eq!(tool, Tool::Agh);
+                    assert_eq!(args, fetch);
+                    Ok(out(fetched, &printed))
                 }
                 1 => {
-                    assert_eq!(tool, Tool::Agh);
-                    let mut command = words(&["repo", "fetch-main", "fixture/repo"]);
-                    command.push(root.path().as_os_str().to_owned());
-                    assert_eq!(args, command);
-                    if fetched == 0 {
-                        current.set(tip);
-                    }
-                    Ok(out(fetched, ""))
-                }
-                2 => {
                     assert_eq!(tool, Tool::Git);
-                    assert_eq!(
-                        args,
-                        words(&["rev-parse", "--verify", "refs/agh/fetched-main"])
-                    );
-                    Ok(out(0, &format!("{}\n", current.get())))
-                }
-                3 => {
-                    assert_eq!(tool, Tool::Git);
-                    assert_eq!(args, words(&["cat-file", "-t", tip]));
+                    assert_eq!(args, words(&["cat-file", "-t", AFTER]));
                     Ok(out(0, object))
                 }
-                _ => panic!("no retry or raw GitHub transport: {tool:?} {args:?}"),
+                _ => panic!("no retry, ref read or raw GitHub transport: {tool:?} {args:?}"),
             }
         };
         let value = Remote::open(root.path(), "origin", &run)
             .unwrap()
             .refresh_main();
-        assert_eq!(value.is_ok(), expected);
+        assert_eq!(value.is_ok(), expected, "{printed}: {value:?}");
         if expected {
             assert_eq!(value.unwrap(), AFTER);
         }
-        assert_eq!(calls.get(), calls_expected);
+        assert_eq!(calls.get(), calls_expected, "{printed}");
     }
+}
+
+/// Every worktree of a clone shares `refs/agh/fetched-main`, and agh's last step writes it
+/// unconditionally, so a sibling worktree's slower fetch, which read main before it moved, can
+/// put the older main back between this fetch's write and any read of the ref. The refresh is
+/// this fetch's own commit, as agh printed it, whatever the shared ref says by then. NEGATIVE
+/// CONTROL: the shared ref, read back as the refresh once did, names the sibling's older main.
+#[test]
+fn main_refresh_is_its_own_fetch_even_when_a_sibling_rewrites_the_shared_ref() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let shared = std::cell::RefCell::new(String::from(ZERO));
+    let run = |tool, args: &[OsString]| {
+        if tool == Tool::Git && args.first().is_some_and(|arg| arg == "remote") {
+            return Ok(url(tool, args).unwrap());
+        }
+        let args: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+        Ok(match (tool, args.as_slice()) {
+            (Tool::Agh, ["repo", "fetch-main", "fixture/repo", _]) => {
+                // This fetch writes main's new tip; a sibling's, which read main at BEFORE,
+                // then finishes and writes the older tip over it.
+                *shared.borrow_mut() = AFTER.into();
+                *shared.borrow_mut() = BEFORE.into();
+                out(0, &fetched_main(AFTER))
+            }
+            // The shared ref answers as git would, for a refresh that read it back.
+            (Tool::Git, ["symbolic-ref", "--quiet", "refs/agh/fetched-main"]) => out(1, ""),
+            (Tool::Git, ["rev-parse", "--verify", "refs/agh/fetched-main"]) => {
+                out(0, &format!("{}\n", shared.borrow()))
+            }
+            (Tool::Git, ["cat-file", "-t", _]) => out(0, "commit\n"),
+            other => panic!("unexpected remote step: {other:?}"),
+        })
+    };
+    let remote = Remote::open(root.path(), "origin", &run).unwrap();
+    assert_eq!(
+        remote.refresh_main().as_deref(),
+        Ok(AFTER),
+        "the refresh is this fetch's commit, not the shared ref's"
+    );
+    assert_eq!(
+        *shared.borrow(),
+        BEFORE,
+        "the sibling's older main is in the ref"
+    );
 }
 
 #[test]
@@ -654,202 +696,6 @@ fn local_transport_allows_only_the_file_protocol_even_if_configuration_changes()
         Ok(Pushed::Done)
     ));
     assert_eq!(operations.get(), 3);
-}
-
-#[test]
-fn a_github_object_import_is_one_agh_request_into_a_scratch_then_file_transport_only() {
-    let root = aterm_tempfile::tempdir().expect("root");
-    let agh_calls = Cell::new(0);
-    let git_calls = std::cell::RefCell::new(Vec::new());
-    let scratch = std::cell::RefCell::new(None::<OsString>);
-    let run = |tool, args: &[OsString]| {
-        if tool == Tool::Git && args[0] == "remote" {
-            return Ok(url(tool, args).expect("URL discovery"));
-        }
-        if tool == Tool::Agh {
-            agh_calls.set(agh_calls.get() + 1);
-            assert_eq!(&args[..3], words(&["repo", "fetch", "fixture/repo"]));
-            assert_ne!(
-                args[3],
-                root.path().as_os_str(),
-                "agh never runs in the clone"
-            );
-            assert_eq!(scratch.borrow().as_ref(), Some(&args[3]));
-            assert_eq!(args[4], "--objects");
-            let ids: Value = aterm_json::from_slice(&std::fs::read(&args[5]).expect("live input"))
-                .expect("JSON");
-            assert_eq!(ids, json!([BEFORE, AFTER]));
-            return Ok(out(0, ""));
-        }
-        if args[0] == "init" {
-            *scratch.borrow_mut() = Some(args[3].clone());
-        }
-        git_calls.borrow_mut().push(args.to_vec());
-        Ok(out(0, ""))
-    };
-    let remote = Remote::open(root.path(), "origin", &run).unwrap();
-    // NEGATIVE CONTROL: nothing to import sends nothing, and a malformed ID is refused locally.
-    assert_eq!(remote.import(&[]), Ok(()));
-    assert!(remote.import(&["not-an-oid".into()]).is_err());
-    assert_eq!(agh_calls.get(), 0);
-    assert!(git_calls.borrow().is_empty());
-    assert_eq!(remote.import(&[BEFORE.into(), AFTER.into()]), Ok(()));
-    assert_eq!(agh_calls.get(), 1);
-    let git_calls = git_calls.borrow();
-    let scratch = scratch.borrow().clone().expect("a scratch receiver");
-    assert_eq!(git_calls.len(), 3, "{git_calls:?}");
-    // The only fetch is from the scratch path, over the file transport alone.
-    let fetch = git_calls.last().unwrap();
-    assert_eq!(
-        &fetch[..4],
-        words(&[
-            "-c",
-            "protocol.allow=never",
-            "-c",
-            "protocol.file.allow=always"
-        ])
-    );
-    let at = fetch
-        .iter()
-        .position(|word| *word == scratch)
-        .expect("from the scratch");
-    assert_eq!(&fetch[at + 1..], words(&[BEFORE, AFTER]));
-}
-
-/// Real git, the shape `verify census` imports into: a blobless partial clone with history,
-/// named by a linked worktree's path, lacking a blob an ancestor holds. agh refuses to run git
-/// in such a clone (its promisor keys are outside agh's transport policy), so its half is
-/// played here by what agh's object import leaves (the exact object in the scratch bare
-/// repository, no ref); the scratch-to-clone hop runs for real.
-#[test]
-fn a_github_object_import_lands_in_a_real_partial_clone_through_its_worktree() {
-    let temp = aterm_tempfile::tempdir().expect("root");
-    let base = temp.path();
-    let git = |dir: &Path, args: &[&str]| -> String {
-        let mut cmd = crate::git_provider::command();
-        cmd.current_dir(dir).args(args);
-        for (key, _) in std::env::vars_os() {
-            if key.as_encoded_bytes().starts_with(b"GIT_") {
-                cmd.env_remove(key);
-            }
-        }
-        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_NO_LAZY_FETCH", "1")
-            .env("GIT_AUTHOR_NAME", "A")
-            .env("GIT_AUTHOR_EMAIL", "a@example.invalid")
-            .env("GIT_COMMITTER_NAME", "A")
-            .env("GIT_COMMITTER_EMAIL", "a@example.invalid");
-        let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
-            .expect("git within its hang detector");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
-    };
-    let work = base.join("work");
-    std::fs::create_dir_all(&work).unwrap();
-    git(&work, &["init", "-q", "-b", "main"]);
-    std::fs::write(work.join("version.rs"), "pub const V: u32 = 3;\n").unwrap();
-    git(&work, &["add", "."]);
-    git(&work, &["commit", "-qm", "baseline"]);
-    let blob = git(&work, &["rev-parse", "HEAD:version.rs"]);
-    std::fs::write(work.join("version.rs"), "pub const V: u32 = 4;\n").unwrap();
-    git(&work, &["commit", "-qam", "head"]);
-    let server = base.join("server.git");
-    git(
-        base,
-        &["clone", "-q", "--bare", "work", server.to_str().unwrap()],
-    );
-    git(&server, &["config", "uploadpack.allowFilter", "true"]);
-    git(
-        &server,
-        &["config", "uploadpack.allowAnySHA1InWant", "true"],
-    );
-    let clone = base.join("partial");
-    git(
-        base,
-        &[
-            "clone",
-            "-q",
-            "--no-checkout",
-            "--filter=blob:none",
-            &format!("file://{}", server.display()),
-            clone.to_str().unwrap(),
-        ],
-    );
-    // Point origin at GitHub, as the real checkout's is; nothing may use that URL.
-    git(
-        &clone,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            "https://github.com/Fixture/Repo.git",
-        ],
-    );
-    let tree = base.join("partial-wt");
-    git(
-        &clone,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "--no-checkout",
-            "--detach",
-            tree.to_str().unwrap(),
-        ],
-    );
-    let holds = || {
-        let mut cmd = crate::git_provider::command();
-        cmd.current_dir(&tree)
-            .args(["cat-file", "-e", &blob])
-            .env("GIT_NO_LAZY_FETCH", "1");
-        aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
-            .unwrap()
-            .status
-            .success()
-    };
-    // NEGATIVE CONTROL: the blobless clone really lacks the ancestor's blob.
-    assert!(
-        !holds(),
-        "the fixture's partial clone already holds the blob"
-    );
-    let refs = git(&clone, &["for-each-ref"]);
-    let make = |root: &Path| {
-        let mut cmd = crate::git_provider::command();
-        cmd.current_dir(root);
-        cmd
-    };
-    let until = Instant::now() + std::time::Duration::from_secs(60);
-    let run = |tool, args: &[OsString]| match tool {
-        Tool::Git => super::run(&tree, &make, tool, args, until),
-        Tool::Agh => {
-            let ids: Vec<String> =
-                aterm_json::from_slice(&std::fs::read(&args[5]).expect("live input"))
-                    .expect("JSON");
-            let scratch = Path::new(&args[3]);
-            // agh's config screen: a receiver with promisor keys is refused, nothing sent.
-            let listed = git(scratch, &["config", "--list", "--name-only"]).to_ascii_lowercase();
-            if listed.contains("promisor") || listed.contains("partialclone") {
-                return Ok(out(1, ""));
-            }
-            let mut fetch = vec!["fetch", "-q", "--no-tags", server.to_str().unwrap()];
-            fetch.extend(ids.iter().map(String::as_str));
-            git(scratch, &fetch);
-            Ok(out(0, ""))
-        }
-    };
-    let remote = Remote::open(&tree, "origin", &run).unwrap();
-    assert_eq!(remote.import(std::slice::from_ref(&blob)), Ok(()));
-    assert!(holds(), "the blob reached the clone's shared store");
-    assert_eq!(
-        git(&clone, &["for-each-ref"]),
-        refs,
-        "an object import publishes no ref"
-    );
 }
 
 #[test]

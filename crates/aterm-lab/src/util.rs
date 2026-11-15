@@ -8,6 +8,20 @@ use std::io;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The SHA-256, as lower-case hex, of the rows an `aterm db <table>` view printed, each as its
+/// compact JSON on a line of its own: what two Macs compare to tell that they read one table.
+/// It is computed here, from what the view shows, and the view shows no secret (a password reads
+/// as the mask or as its secret-store entry's name), so the digest says nothing of one.
+pub fn listing_digest<'a>(rows: impl IntoIterator<Item = &'a aterm_json::Value>) -> String {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-lab/listing/1\0");
+    for row in rows {
+        hash.update(aterm_json::to_string(row).unwrap_or_default().as_bytes());
+        hash.update(b"\n");
+    }
+    aterm_codec::hex::encode_lower(&hash.finalize())
+}
+
 /// Seconds since the epoch, with the fraction.
 #[must_use]
 pub fn now() -> f64 {
@@ -934,3 +948,32 @@ pub fn b64url_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 #[path = "util_tests.rs"]
 mod tests;
+
+/// Publish `value` as vault entry `name` of the scratch `home`'s store, read in place by an
+/// instance (or a stand-in) run under that home: a home with no vault is made the admin of a file
+/// vault beside it first. Never a person's own home.
+///
+/// # Errors
+/// The scratch vault cannot be made, opened or published.
+pub fn publish_scratch_entry(
+    home: &std::path::Path,
+    name: &str,
+    value: &[u8],
+) -> Result<(), String> {
+    use aterm_secrets::client;
+    let said = |e: &dyn std::fmt::Display| format!("the scratch vault entry {name}: {e}");
+    let paths = client::Paths::locate_for_home(home);
+    if client::config(&paths).map_err(|e| said(&e))?.is_none() {
+        let source = home.join("lab.vault");
+        let source = source
+            .to_str()
+            .ok_or_else(|| said(&"the scratch home is not UTF-8"))?;
+        client::create(&paths, source, None, Some("lab-mac")).map_err(|e| said(&e))?;
+    }
+    let admin = client::admin_open(&paths).map_err(|e| said(&e))?;
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&aterm_secrets::text::Audience::Everyone, name, value)
+        .map_err(|e| said(&e))?;
+    client::admin_publish(&paths, &admin, &doc).map_err(|e| said(&e))?;
+    Ok(())
+}

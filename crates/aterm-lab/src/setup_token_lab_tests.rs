@@ -280,22 +280,20 @@ fn the_mcp_probe_answers_what_claude_code_asks() {
     assert_eq!(mcp_reply("not json"), None);
 }
 
-/// Lane A passes only where the capture stopped at the paste prompt it was asked at, having told
-/// the person where the sign-in opened; a token taken, a refused URL, a hang, or a stop with no
-/// ask fails.
+/// Lane A passes only where the capture stopped at the paste prompt, waiting for the window's
+/// code, having said where the sign-in window opened; a token taken, a refused URL, a hang, or a
+/// stop with no wait fails.
 #[test]
 fn lane_a_passes_only_a_stop_at_the_prompt() {
-    let told = vec!["a browser window opened on claude.com: sign in as x there".to_string()];
+    let told = vec![
+        "aterm's sign-in window opened on claude.com and authorizes the account by itself"
+            .to_string(),
+    ];
     let stopped = Err(setup_token::Error::Stopped);
-    assert_eq!(judge_frames(&stopped, true, true, &told).0, Verdict::Ok);
-    assert_eq!(judge_frames(&stopped, false, false, &told).0, Verdict::Fail);
+    assert_eq!(judge_frames(&stopped, true, &told).0, Verdict::Ok);
+    assert_eq!(judge_frames(&stopped, false, &told).0, Verdict::Fail);
     assert_eq!(
-        judge_frames(&stopped, true, false, &told).0,
-        Verdict::Fail,
-        "another prompt"
-    );
-    assert_eq!(
-        judge_frames(&stopped, true, true, &[]).0,
+        judge_frames(&stopped, true, &[]).0,
         Verdict::Fail,
         "never told"
     );
@@ -304,7 +302,7 @@ fn lane_a_passes_only_a_stop_at_the_prompt() {
         setup_token::Error::Hang,
         setup_token::Error::NoToken,
     ] {
-        assert_eq!(judge_frames(&Err(e), true, true, &told).0, Verdict::Fail);
+        assert_eq!(judge_frames(&Err(e), true, &told).0, Verdict::Fail);
     }
 }
 

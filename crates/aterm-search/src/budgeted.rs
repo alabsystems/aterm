@@ -166,6 +166,14 @@ impl BudgetedSearch {
         self.rows_fed
     }
 
+    /// Consume at most `count` rows before the retained depth window without
+    /// reading their text. These rows contribute neither matches nor truncation
+    /// metadata, exactly as feeding them would. Stops at the first retained row.
+    #[inline]
+    pub fn skip_unretained_rows(&mut self, count: usize) {
+        self.rows_fed += count.min(self.verify_from.saturating_sub(self.rows_fed));
+    }
+
     /// Total rows in the search window.
     #[inline]
     #[must_use]

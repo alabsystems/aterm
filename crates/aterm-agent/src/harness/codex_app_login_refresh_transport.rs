@@ -198,6 +198,20 @@ pub(in crate::harness) fn owned_refresh_refusal_settled_at(
     (owned_refresh_refused(status, body) && now >= settled_at).then_some(settled_at)
 }
 
+/// Why an explicitly refused owned refresh ([`owned_refresh_refused`]) was refused: the one
+/// closed word its retained answer's code names ([`RefusalReason::of_answer`]), with none of the
+/// answer kept. An answer that is no explicit refusal names no reason
+/// ([`RefusalReason::UNKNOWN`]). The status narrows the reason exactly as it narrows the
+/// refusal: a refresh-token code is one under any status but `200`, `invalid_grant` under `400`
+/// and `401` alone.
+pub(in crate::harness) fn owned_refresh_refusal_reason(status: u16, body: &[u8]) -> RefusalReason {
+    if owned_refresh_refused(status, body) {
+        RefusalReason::of_answer(body)
+    } else {
+        RefusalReason::UNKNOWN
+    }
+}
+
 /// Interpret only a response already retained by the caller's encrypted journal.
 /// This pure merge grants no publication or refresh authority.
 pub(in crate::harness) fn merge_owned_refresh(

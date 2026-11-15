@@ -125,7 +125,7 @@ fn percentiles(
         "OK n_input=30 input_p50_ms=9.11 input_p95_ms=12.30 input_p99_ms={input} \
          n_present=31 present_p50_ms=8.20 present_p95_ms=10.10 present_p99_ms=11.40 \
          n_key_write={n_key_write} key_write_p50_ms=1.10 key_write_p95_ms=2.30 \
-         key_queue_unavailable=0 key_write_unavailable=0 \
+         n_key_queue=30 key_queue_unavailable=0 key_write_unavailable=0 \
          key_write_p99_ms={key_write} n_pre_present=31 pre_present_p50_ms=0.90 \
          n_acquire=31 acquire_p50_ms=0.02 acquire_p95_ms=1.10 acquire_p99_ms={acquire} \
          last_acquire_wait_ms=0.02 max_acquire_wait_ms=4.80 \
@@ -403,6 +403,15 @@ fn a_breach_on_a_loaded_burst_is_undecided_and_on_a_quiet_one_fails() {
         unread.percentiles = unread.percentiles.replace("key_queue_unavailable=0 ", "");
         let rows = run(unread, vec![loaded]);
         assert_eq!(rows[1].0, failed, "unreported clocks fail under any load");
+        let mut incomplete = breaching();
+        incomplete.percentiles = incomplete
+            .percentiles
+            .replace("n_key_queue=30", "n_key_queue=29");
+        let rows = run(incomplete, vec![loaded]);
+        assert_eq!(
+            rows[1].0, failed,
+            "missing queue samples fail under any load"
+        );
     }
     for quiet in [Vec::new(), vec![aterm_capacity::Unqualified::Lapsed]] {
         let rows = run(breaching(), quiet);
@@ -669,6 +678,25 @@ fn native_clock_quality_requires_every_observed_press_and_write() {
             let unsupported = measured.replace(&format!("{field}=0 "), &replacement);
             assert!(hv(&unsupported).is_err(), "{unsupported}");
         }
+    }
+}
+
+#[test]
+fn native_queue_samples_must_cover_exactly_the_posted_burst() {
+    let measured = percentiles(30, "6.00", "0.10", "1.00", "10.00");
+    hv(&measured).expect("all posted keys have a native queue sample");
+    for replacement in [
+        "",
+        "n_key_queue=unknown ",
+        "n_key_queue=0 ",
+        "n_key_queue=29 ",
+        "n_key_queue=31 ",
+    ] {
+        let incomplete = measured.replace("n_key_queue=30 ", replacement);
+        assert!(
+            matches!(hv(&incomplete), Err(Miss::Fail(_))),
+            "native queue evidence {replacement:?} cannot prove a 30-key burst"
+        );
     }
 }
 

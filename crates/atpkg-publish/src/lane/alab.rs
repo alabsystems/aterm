@@ -152,9 +152,56 @@ pub struct Facts {
     pub staging: Staging,
     /// Whether its build is latched BLOCKED.
     pub latched: bool,
-    /// The Apple targets an overlay already pins at the release's build: that build is
-    /// public there, and its signed manifest cannot gain the rows the other targets need.
-    pub public_on: BTreeSet<Triple>,
+    /// Whether the release's build was ever published.
+    pub public: Public,
+}
+
+/// Whether a release above the pin was ever published: a published pack is immutable (the
+/// upload refuses any other manifest under its tag), so it never gains the rows it lacks,
+/// whichever builds the overlays have moved on to since.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Public {
+    /// Not looked up: the release is not above the pin.
+    NotLooked,
+    /// Published with these rows: those of its pack the public owner serves, and every Apple
+    /// target the head pins at that build. Empty: never published.
+    Rows(BTreeSet<Triple>),
+    /// Nothing is known (the public owner unreachable, or its pack does not verify) — never
+    /// read as unpublished: a re-pack of a published build is refused, and counted.
+    Unknown(String),
+}
+
+impl Public {
+    /// The rows of `required` a published build lacks, and can never gain: empty when the
+    /// build was never published, or is published with every one of them.
+    #[must_use]
+    pub fn lacks<'a>(&self, required: impl IntoIterator<Item = &'a Triple>) -> Vec<Triple> {
+        match self {
+            Self::Rows(rows) if !rows.is_empty() => required
+                .into_iter()
+                .filter(|t| !rows.contains(t))
+                .copied()
+                .collect(),
+            Self::Rows(_) | Self::NotLooked | Self::Unknown(_) => Vec::new(),
+        }
+    }
+
+    /// Whether the build was published: the public owner serves its pack, or an Apple target
+    /// pins it.
+    #[must_use]
+    pub fn published(&self) -> bool {
+        matches!(self, Self::Rows(rows) if !rows.is_empty())
+    }
+}
+
+/// Where a build the index can pin already is, with every row it must carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// The staging owner: the index mirrors its pack to the public owner.
+    Staging,
+    /// The public owner, which already serves it: a published pack is never packed again,
+    /// whatever the staging owner holds.
+    Public,
 }
 
 /// One program's decision.
@@ -170,8 +217,9 @@ pub enum Decision {
     Ok,
     /// The pin is ahead of it: a pack cut past the last promote (not a rollback).
     Ahead,
-    /// Staging already holds the build with every required row: the index remains.
-    Index,
+    /// The build is already held with every required row (by the staging owner, or published
+    /// by the public owner): the index remains.
+    Index(Holder),
     /// A sysroot bundle: its pack command is printed, never run.
     BundleLane {
         /// The rows its pack must carry.
@@ -197,7 +245,7 @@ impl Decision {
     pub const fn ready(&self) -> bool {
         matches!(
             self,
-            Self::Ok | Self::Ahead | Self::Index | Self::Pack { .. }
+            Self::Ok | Self::Ahead | Self::Index(_) | Self::Pack { .. }
         )
     }
 
@@ -209,7 +257,7 @@ impl Decision {
             Self::Unverified(_) => "UNVERIFIED",
             Self::Unresolved(_) => "UNRESOLVED",
             Self::Ok | Self::Ahead => "OK",
-            Self::Index => "INDEX",
+            Self::Index(_) => "INDEX",
             Self::BundleLane { .. } => "BUNDLE-LANE",
             Self::Blocked { .. } => "BLOCKED",
             Self::Pack { .. } => "PACK",
@@ -240,24 +288,36 @@ pub fn decide(f: &Facts) -> Decision {
     if r.build < pin {
         return Decision::Ahead;
     }
-    if !f.public_on.is_empty() {
-        return Decision::Skip(format!(
-            "build {} is already public on {} through an overlay, and a published pack never \
-             gains rows — the other Apple target moves with the next signed release",
-            r.build,
-            super::state::names(&f.public_on.iter().copied().collect::<Vec<_>>())
-        ));
+    if let Public::Unknown(why) = &f.public {
+        return Decision::Skip(why.clone());
     }
     let (required, staged) = match &f.staging {
         Staging::Known { required, staged } => (required.clone(), staged.clone()),
         _ => (f.program.darwin_triples().iter().copied().collect(), None),
     };
+    // A published pack gains no rows: once the build is public it is pinned as it is, or it
+    // waits for the next signed release, and it is never packed again.
+    if let Public::Rows(rows) = &f.public
+        && f.public.published()
+    {
+        let lacks = f.public.lacks(&required);
+        if lacks.is_empty() {
+            return Decision::Index(Holder::Public);
+        }
+        return Decision::Skip(format!(
+            "build {} is already public on {}, and a published pack never gains rows — {} \
+             moves with the next signed release",
+            r.build,
+            super::state::names(&rows.iter().copied().collect::<Vec<_>>()),
+            super::state::names(&lacks)
+        ));
+    }
     let missing: BTreeSet<Triple> = staged
         .as_ref()
         .map(|s| required.difference(s).copied().collect())
         .unwrap_or_default();
     if staged.is_some() && missing.is_empty() {
-        return Decision::Index;
+        return Decision::Index(Holder::Staging);
     }
     if matches!(f.program.shape, Shape::Bundle(_)) {
         return Decision::BundleLane { required, missing };
@@ -326,9 +386,14 @@ impl Row {
                  cut past the last promote{note}",
                 self.pin.unwrap_or(0)
             ),
-            Decision::Index => format!(
+            Decision::Index(Holder::Staging) => format!(
                 "INDEX: {tag} (build {build}) is already on {staging} as {} — publishing the \
                  index is what remains",
+                upload::tag(self.program.name, build)
+            ),
+            Decision::Index(Holder::Public) => format!(
+                "INDEX: {tag} (build {build}) is already public as {} with every Apple row it \
+                 must carry — publishing the index is what remains, never a pack",
                 upload::tag(self.program.name, build)
             ),
             Decision::BundleLane { missing, .. } => format!(
@@ -606,7 +671,7 @@ fn locked(
         .collect();
     let mut pending: Vec<&str> = rows
         .iter()
-        .filter(|r| r.decision == Decision::Index)
+        .filter(|r| matches!(r.decision, Decision::Index(_)))
         .map(|r| r.program.name)
         .collect();
     let mut outcome = Outcome {
@@ -860,18 +925,22 @@ pub fn move_pin(channel: &atpkg::Channel, delta: &mut Delta, program: &str, buil
 }
 
 fn preflight(ctx: &Ctx, deps: &Deps<'_>) -> Result<()> {
-    if !ctx.identity.key.is_file() {
-        return Err(Error::cannot_run(format!(
-            "no machine key at {} — this lane SIGNS; provision this Mac (`atpkg-keys join --id \
-             <id>`) or run it on a rostered one",
-            ctx.shown(&ctx.identity.key)
-        )));
-    }
-    if !ctx.identity.record.is_file() {
-        return Err(Error::cannot_run(format!(
-            "no machine record at {} (written by `atpkg-keys setup`/`join`)",
-            ctx.shown(&ctx.identity.record)
-        )));
+    match crate::identity::missing(ctx)? {
+        None => {}
+        Some("machine key") => {
+            return Err(Error::cannot_run(format!(
+                "no machine key: the store holds no release ring and there is none at {} — this \
+                 lane SIGNS; provision this Mac (`atpkg-keys join --id <id>`) or run it on a \
+                 rostered one",
+                ctx.shown(&ctx.identity.key)
+            )));
+        }
+        Some(_) => {
+            return Err(Error::cannot_run(format!(
+                "no machine record at {} (written by `atpkg-keys setup`/`join`)",
+                ctx.shown(&ctx.identity.record)
+            )));
+        }
     }
     for (what, path, role) in [
         ("channel", &ctx.tokens.channel, HostRole::Channel),
@@ -908,16 +977,16 @@ fn preflight(ctx: &Ctx, deps: &Deps<'_>) -> Result<()> {
             Ok(true) => {}
             Ok(false) => {
                 return Err(Error::cannot_run(format!(
-                    "{what} token file missing/empty: {} — the unattended lane speaks only as its \
+                    "{what} token missing/empty: {} — the unattended lane speaks only as its \
                      owners' tokens",
-                    ctx.shown(path)
+                    ctx.shown_token(path)
                 )));
             }
             Err(why) => {
                 return Err(Error::cannot_run(format!(
-                    "{what} token file invalid/unreadable: {} ({why}) — the unattended lane speaks \
+                    "{what} token invalid/unreadable: {} ({why}) — the unattended lane speaks \
                      only as its owners' tokens",
-                    ctx.shown(path)
+                    ctx.shown_token(path)
                 )));
             }
         }
@@ -1089,7 +1158,7 @@ fn gather(
         release: Err(ReleaseGap::NoTag(String::new())),
         staging: Staging::NotLooked,
         latched: false,
-        public_on: BTreeSet::new(),
+        public: Public::NotLooked,
     };
     let Some(pin) = pin else {
         return facts;
@@ -1113,13 +1182,23 @@ fn gather(
     if rel.build <= pin {
         return facts;
     }
-    facts.public_on = cells
+    let pinned_at: BTreeSet<Triple> = cells
         .into_iter()
         .flatten()
         .filter(|(_, b)| **b == rel.build)
         .map(|(t, _)| *t)
         .collect();
-    if !facts.public_on.is_empty() {
+    facts.public = public_of(ctx, head, work, def, rel.build, pinned_at);
+    if let Public::Unknown(why) = &facts.public {
+        tx.warn(format!(
+            "{}: {why}; skipped this run (nothing packed, nothing pinned)",
+            def.name
+        ));
+        return facts;
+    }
+    // Every row the program packs is required: a published build lacking one is skipped
+    // without asking the staging owner anything.
+    if !facts.public.lacks(def.darwin_triples()).is_empty() {
         return facts;
     }
     facts.staging = staging_of(ctx, head, work, def, pin, rel.build);
@@ -1367,6 +1446,49 @@ fn resolve_dev(
     })
 }
 
+/// Whether `build` of `def` was ever published, and with which rows: `pinned_at` (the Apple
+/// targets the head pins at it now), with the rows of `atpkg-<program>-<build>` as the public
+/// owner serves it. The public owner is asked where it is not the staging owner, exactly where
+/// the upload refuses a manifest other than the public one; where they are one owner the
+/// upload converges the staged pack, and only the head says what is published.
+fn public_of(
+    ctx: &Ctx,
+    head: &VerifiedQuad,
+    work: &Path,
+    def: &ProgramDef,
+    build: Build,
+    pinned_at: BTreeSet<Triple>,
+) -> Public {
+    let slug = ctx.public_slug(def.repo);
+    if slug == ctx.staging_slug(def.repo) {
+        return Public::Rows(pinned_at);
+    }
+    let tag = upload::tag(def.name, build);
+    match rows::fetch_published(
+        &ctx.hosts.channel,
+        &slug,
+        def.name,
+        build,
+        &work.join("public"),
+        head,
+    ) {
+        Fetched::Present { manifest, .. } => {
+            let mut rows = pinned_at;
+            rows.extend(rows::targets(&manifest));
+            Public::Rows(rows)
+        }
+        Fetched::Absent(_) => Public::Rows(pinned_at),
+        Fetched::Unreachable(why) => Public::Unknown(format!(
+            "{} unreachable — whether {tag} is published could not be read ({why})",
+            ctx.accounts.public
+        )),
+        Fetched::Invalid(why) => Public::Unknown(format!(
+            "{tag} on {} does not verify ({why}) — never re-packed over",
+            ctx.accounts.public
+        )),
+    }
+}
+
 fn staging_of(
     ctx: &Ctx,
     head: &VerifiedQuad,
@@ -1520,6 +1642,7 @@ fn pack(
                     upload: true,
                     env: Vec::new(),
                     build_within: None,
+                    build_queue: None,
                 },
             )
             .map_err(|e| format!("the pack failed for {triple}: {e}"))?;

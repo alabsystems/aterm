@@ -14,7 +14,8 @@
 //! so a request outlives the process that made it. What a spawn made of its request (its tab,
 //! or its refusal) and a tab's leaving both start on the main thread, in the order the tab lived,
 //! and are written in that order by this module's one writer thread, `requests-journal`, which a
-//! quit or an update's exec flushes within its budget ([`flush_within`]).
+//! quit or an update's exec flushes within its budget ([`flush_within`]); a leaving the journal
+//! refused is tried again until it is written (`Unrecorded`).
 
 use crate::session_store::{ExitActor, Store};
 use aterm_requests::{Brief, EndWhy, Form, From, Intake, Out, Stage, Verb, Via, Why, WhySrc};
@@ -501,12 +502,13 @@ pub(crate) fn own_host() -> String {
 pub(crate) enum Prepared {
     /// Open a request.
     Open { dir: PathBuf, intake: Box<Intake> },
-    /// Join request `id` (`req=`).
+    /// Join request `id` (`req=`), coming in as `via`.
     Join {
         dir: PathBuf,
         id: String,
         node: String,
         by: String,
+        via: Via,
     },
 }
 
@@ -525,7 +527,8 @@ pub(crate) enum Made {
 
 /// The request of a spawn `asker` asks for: none where no one a request is made for asks
 /// ([`asker`]) or this Mac keeps none (a test that set no folder); a join where the line named
-/// `req=<id>`; else a new request, its why `why` or the documented fallback
+/// `req=<id>`, coming in as the spawn would open one ([`aterm_requests::Store::join`]); else a
+/// new request, its why `why` or the documented fallback
 /// ([`aterm_requests::why_of`]) and its brief `brief` (a worker's task). Pure: nothing is written
 /// until [`begin`].
 /// # Errors
@@ -548,19 +551,20 @@ pub(crate) fn prepare(
     let Some(dir) = dir().map_err(|why| format!("ERR request store: {why}\n"))? else {
         return Ok(None);
     };
+    let via = match (asker.fleet, made) {
+        (true, Made::Shell) => Via::FleetShell,
+        (true, _) => Via::FleetWorker,
+        (false, _) => Via::CtlSpawn,
+    };
     if let Some(id) = req {
         return Ok(Some(Prepared::Join {
             dir,
             id: id.to_owned(),
             node: asker.from.node.clone(),
             by: asker.from.by.clone(),
+            via,
         }));
     }
-    let via = match (asker.fleet, made) {
-        (true, Made::Shell) => Via::FleetShell,
-        (true, _) => Via::FleetWorker,
-        (false, _) => Via::CtlSpawn,
-    };
     let form = match made {
         Made::Shell => Form::Shell,
         Made::Agent(agent) => Form::Agent(agent.to_owned()),
@@ -599,7 +603,8 @@ pub(crate) struct Begun {
 
 /// Write what `prepared` decided: the request's `open` (before the spawn reaches the main
 /// thread, so nothing runs on another's behalf without one), or the check that `req=` names an
-/// open request of the same requester, which holds it open until the spawn settles.
+/// open request of the same requester that came in as this spawn does, which holds it open until
+/// the spawn settles.
 /// # Errors
 /// The spawn's refusal: the store could not record the request, or the join is refused.
 pub(crate) fn begin(prepared: Option<Prepared>) -> Result<Option<Begun>, String> {
@@ -616,8 +621,14 @@ pub(crate) fn begin(prepared: Option<Prepared>) -> Result<Option<Begun>, String>
                 joined: false,
             }))
         }
-        Some(Prepared::Join { dir, id, node, by }) => {
-            let joined = with_store(&dir, |store| Ok(store.join(&id, &node, &by)))
+        Some(Prepared::Join {
+            dir,
+            id,
+            node,
+            by,
+            via,
+        }) => {
+            let joined = with_store(&dir, |store| Ok(store.join(&id, &node, &by, via)))
                 .map_err(|error| format!("ERR request store: {error}\n"))?;
             joined.map_err(|why| format!("ERR spawn req={id}: {why}\n"))?;
             Ok(Some(Begun {
@@ -900,30 +911,7 @@ fn post(item: Item) {
     let (tx, rx) = mpsc::channel::<Item>();
     let started = std::thread::Builder::new()
         .name("requests-journal".to_owned())
-        .spawn(move || {
-            for item in rx {
-                match item {
-                    Item::Settle { at, settle, sid } => write_settle(at, settle, sid.as_deref()),
-                    Item::Left { dir, at, left } => write_left(&dir, at, &left),
-                    Item::Load { dir } => write_load(&dir),
-                    Item::Look { dir, at, look } => write_look(&dir, at, &look),
-                    Item::Keep { dir, at, sids, by } => write_keep(&dir, at, &sids, &by),
-                    Item::Sweep { dir, sweep } => write_sweep(&dir, &sweep),
-                    Item::Spans { dir, hand } => write_spans(&dir, &hand),
-                    Item::Relist { dir } => {
-                        if let Err(error) = with_store(&dir, |store| {
-                            relist(&dir, store);
-                            Ok(())
-                        }) {
-                            aterm_log::warn!("requests: not listed: {error}");
-                        }
-                    }
-                    Item::Flush(done) => {
-                        let _ = done.send(());
-                    }
-                }
-            }
-        });
+        .spawn(move || write_items(&rx, LEFT_RETRY));
     match started {
         Ok(_) => {
             let _ = tx.send(item);
@@ -933,9 +921,77 @@ fn post(item: Item) {
     }
 }
 
-fn write_left(dir: &Path, at: u64, left: &TabLeft) {
+/// How long the writer waits, with nothing else to write, before it tries again a tab's leaving
+/// the journal refused ([`Unrecorded`]).
+const LEFT_RETRY: Duration = Duration::from_secs(15);
+
+/// The writer thread: write each item `rx` hands it, in order, until every sender is gone; a
+/// leaving the journal refused ([`Unrecorded`]) is tried again before each later item and, with
+/// nothing else to write, every `retry`.
+fn write_items(rx: &mpsc::Receiver<Item>, retry: Duration) {
+    let mut unrecorded = Vec::new();
+    loop {
+        let item = if unrecorded.is_empty() {
+            match rx.recv() {
+                Ok(item) => item,
+                Err(mpsc::RecvError) => break,
+            }
+        } else {
+            match rx.recv_timeout(retry) {
+                Ok(item) => item,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    retry_left(&mut unrecorded);
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+        // A leaving the journal refused goes first, in the order its tab left.
+        retry_left(&mut unrecorded);
+        match item {
+            Item::Settle { at, settle, sid } => write_settle(at, settle, sid.as_deref()),
+            Item::Left { dir, at, left } => {
+                if let Some(left) = write_left(&dir, at, &left) {
+                    unrecorded.push(left);
+                }
+            }
+            Item::Load { dir } => write_load(&dir),
+            Item::Look { dir, at, look } => write_look(&dir, at, &look),
+            Item::Keep { dir, at, sids, by } => write_keep(&dir, at, &sids, &by),
+            Item::Sweep { dir, sweep } => write_sweep(&dir, &sweep),
+            Item::Spans { dir, hand } => write_spans(&dir, &hand),
+            Item::Relist { dir } => {
+                if let Err(error) = with_store(&dir, |store| {
+                    relist(&dir, store);
+                    Ok(())
+                }) {
+                    aterm_log::warn!("requests: not listed: {error}");
+                }
+            }
+            Item::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+/// A tab's leaving the journal refused (another process held its lock past the wait, a write
+/// failed): nothing else in this process concludes the request its last tab left (a lease looks
+/// only at tabs it hosts, and the relaunch sweep runs once, over requests an earlier process
+/// opened), so the writer tries it again before each later item and every [`LEFT_RETRY`] until
+/// it is written, or until its store's journal is gone.
+struct Unrecorded {
+    dir: PathBuf,
+    at: u64,
+    sid: String,
+    record: aterm_requests::Left,
+}
+
+/// Record tab `left`'s leaving at `at` in the store of `dir`: `Some` where the journal refused
+/// it, which the writer then tries again ([`Unrecorded`]).
+fn write_left(dir: &Path, at: u64, left: &TabLeft) -> Option<Unrecorded> {
     if !dir.join(aterm_requests::JOURNAL).exists() {
-        return;
+        return None;
     }
     let sid = left.sid.as_str();
     // The close's read, or what the samples saw while it ran where that is more: a process that
@@ -954,15 +1010,46 @@ fn write_left(dir: &Path, at: u64, left: &TabLeft) {
         node: Some(node_of(&left.by)),
         spent,
     };
-    if let Err(error) = with_store(dir, |store| {
-        store.left(at, sid, &record)?;
+    let error = record_left(dir, at, sid, &record).err()?;
+    aterm_log::warn!("requests: {sid} left, not recorded yet: {error}");
+    Some(Unrecorded {
+        dir: dir.to_path_buf(),
+        at,
+        sid: sid.to_owned(),
+        record,
+    })
+}
+
+/// Tab `sid`'s leaving at `at`, as `record` says, in the store of `dir`, and its request
+/// indexed again.
+fn record_left(
+    dir: &Path,
+    at: u64,
+    sid: &str,
+    record: &aterm_requests::Left,
+) -> std::io::Result<()> {
+    with_store(dir, |store| {
+        store.left(at, sid, record)?;
         if let Some((id, ..)) = store.owner(sid) {
             republish(dir, store, [id.as_str()]);
         }
         Ok(())
-    }) {
-        aterm_log::warn!("requests: {sid} left, not recorded: {error}");
-    }
+    })
+}
+
+/// Try again each leaving the journal refused ([`Unrecorded`]), in the order its tab left:
+/// kept until it is written, or until its store's journal is gone.
+fn retry_left(unrecorded: &mut Vec<Unrecorded>) {
+    unrecorded.retain(|left| {
+        if !left.dir.join(aterm_requests::JOURNAL).exists() {
+            return false;
+        }
+        let refused = record_left(&left.dir, left.at, &left.sid, &left.record).is_err();
+        if !refused {
+            aterm_log::info!("requests: {} left, recorded on a later try", left.sid);
+        }
+        refused
+    });
 }
 
 fn write_load(dir: &Path) {
@@ -1213,8 +1300,9 @@ pub(crate) fn left(left: TabLeft) {
 /// takes one ordered flush, and only the tabs closed just before are queued.
 pub(crate) const FLUSH_WAIT: Duration = Duration::from_secs(1);
 
-/// Wait at most `budget` for every record handed to the writer thread to be written: a quit's or
-/// an update's exec. `false` where the budget ran out first.
+/// Wait at most `budget` for every record handed to the writer thread to be written, a leaving
+/// the journal refused tried once more (`Unrecorded`): a quit's or an update's exec. `false`
+/// where the budget ran out first.
 pub(crate) fn flush_within(budget: Duration) -> bool {
     if WRITER.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
         return true;

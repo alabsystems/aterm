@@ -1411,7 +1411,7 @@ impl Evaluator {
             Ok(s) => s,
             Err(e) => return unreadable(row, e.to_string()),
         };
-        let code = PrebuiltMomentum::of(sched, &self.build);
+        let code = PrebuiltMomentum::compiled(sched, &self.build);
         let first = read.log.header().first_cursor;
         if let Err(r) = code.entry(&read.schema, &start) {
             row.run = RowVerdict::fail(r.law, first);
@@ -1507,7 +1507,7 @@ impl Evaluator {
         let HostMode::Hosted(hd) = &h.mode else {
             return not_logged(row);
         };
-        row.firings = Some(hd.guard.firings);
+        row.firings = Some(hd.guard_firings());
         let b = &hd.boundary;
         let (Some(checkpoint), Some(log)) = (b.checkpoint(), b.log()) else {
             return not_logged(row);

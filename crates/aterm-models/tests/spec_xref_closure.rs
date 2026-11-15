@@ -176,6 +176,7 @@ fn spec_xref_closure() {
         aterm_agent::harness::accounts_pool::account_pool_preparation_environment as fn(),
     );
     std::hint::black_box(aterm_agent::harness::claims::account_claim_clock_environment as fn());
+    std::hint::black_box(aterm_agent::harness::claims::account_claim_rank_environment as fn());
     // aterm-vz's `VzLifecycle` anchors: one named item in each module that holds them.
     #[cfg(unix)]
     std::hint::black_box((

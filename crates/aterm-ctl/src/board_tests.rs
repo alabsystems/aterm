@@ -69,6 +69,30 @@ fn a_row_keeps_a_later_aterms_key_and_state_and_refuses_a_bad_row() {
     }
 }
 
+/// A worker's row names its tab by its ID in either form: a tab opened before the tab-ID update
+/// keeps its `s-` ID until it closes. NEGATIVE CONTROLS: a malformed ID of either form is no
+/// row, and names no `from=` filter.
+#[test]
+fn a_row_names_its_tab_by_its_id_in_either_form() {
+    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        let row = Row::parse(&format!("sid={sid} state=working")).expect(sid);
+        assert_eq!(row.sid, sid);
+        assert!(is_sid(sid), "{sid}");
+    }
+    for bad in [
+        "tqn5r6e014",
+        "tqn5r6e014i",
+        "Tqn5r6e0148",
+        "s-0123456789abcdeg0123",
+    ] {
+        assert!(!is_sid(bad), "{bad}");
+        assert!(
+            Row::parse(&format!("sid={bad} state=working")).is_err(),
+            "{bad} is refused"
+        );
+    }
+}
+
 #[test]
 fn a_live_answer_moves_a_row_forward_never_back() {
     let mut row = worker("s-0a1", "L", 1);

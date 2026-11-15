@@ -123,8 +123,13 @@ fn a_long_subject_and_reason_are_clipped_and_the_whole_fits_256_bytes() {
 #[test]
 fn the_needs_entry_keeps_its_frame_for_a_long_need_in_any_script() {
     for letter in ["\u{915}", "\u{e01}", "\u{9a8}", "\u{25b8}"] {
-        let needs = vec![letter.repeat(80), "sign 0.48.0".to_string()];
-        let t = needs_attention_text("Muse Code", &needs, NeedTail::CarryingOn);
+        let needs = [letter.repeat(80), "sign 0.48.0".to_string()];
+        let t = needs_attention_text(
+            "Muse Code",
+            &needs[0],
+            needs.len() - 1,
+            NeedTail::CarryingOn,
+        );
         assert!(t.len() <= ATTENTION_BYTES, "{letter}: {}", t.len());
         assert!(
             t.starts_with(&format!("Muse Code needs you: {letter}"))
@@ -134,11 +139,11 @@ fn the_needs_entry_keeps_its_frame_for_a_long_need_in_any_script() {
     }
     let need = "grant Screen Recording to com.aterm.aterm".to_string();
     assert_eq!(
-        needs_attention_text("claude", std::slice::from_ref(&need), NeedTail::CarryingOn),
+        needs_attention_text("claude", &need, 0, NeedTail::CarryingOn),
         "claude needs you: grant Screen Recording to com.aterm.aterm \u{2014} carrying on"
     );
     assert_eq!(
-        needs_attention_text("agy", &[need], NeedTail::WaitsOnYou),
+        needs_attention_text("agy", &need, 0, NeedTail::WaitsOnYou),
         "agy needs you: grant Screen Recording to com.aterm.aterm \u{2014} waits on you"
     );
 }

@@ -216,6 +216,8 @@ struct Sim {
     rotated_row: String,
     /// A sample of a rendered survey, for the record (it is synthetic).
     sample: String,
+    /// Failed fleet JSON and the following member-local reads, before later phases alter them.
+    json_failures: Vec<aterm_json::Value>,
     /// The sim's start, for the record's timing note.
     started: Instant,
 }
@@ -292,6 +294,7 @@ impl Sim {
             biggest,
             rotated_row: String::new(),
             sample: String::new(),
+            json_failures: Vec::new(),
             started,
         })
     }
@@ -310,7 +313,29 @@ impl Sim {
                     let ranks = judge::ranks(&json);
                     let mut run_checks =
                         judge::judge_text(&text, &self.want, BUDGET, &self.host, every_top, &ranks);
-                    run_checks.extend(judge::judge_json(&json, &self.want));
+                    let json_checks = judge::judge_json(&json, &self.want);
+                    if json_checks.iter().any(|check| !check.ok) {
+                        let mut members = Vec::new();
+                        for inst in &self.world.insts {
+                            if stop::check().is_err() {
+                                break;
+                            }
+                            let out = self.world.ctl(inst, &["survey", "--json"]);
+                            members.push(aterm_json::json!({
+                                "machine": inst.i,
+                                "pid": inst.pid,
+                                "exit": out.code,
+                                "stdout": out.stdout,
+                                "stderr": out.stderr,
+                            }));
+                        }
+                        self.json_failures.push(aterm_json::json!({
+                            "run": r + 1,
+                            "fleet_json": json.clone(),
+                            "member_reads": members,
+                        }));
+                    }
+                    run_checks.extend(json_checks);
                     run_checks.push(escaping_check(
                         &text,
                         &json,
@@ -841,7 +866,7 @@ impl Sim {
             .stdout
             .split_whitespace()
             .nth(1)
-            .filter(|sid| spawn.code == 0 && sid.starts_with("s-"))
+            .filter(|sid| spawn.code == 0 && aterm_types::tab_id::is_tab_id(sid))
             .map(|sid| format!("@{sid}"));
         let line = worker
             .as_deref()
@@ -1321,6 +1346,21 @@ impl Sim {
             let _ = writeln!(s, "{}", hide(l));
         }
         s.push_str("…\n```\n");
+        if !self.json_failures.is_empty() {
+            s.push_str(
+                "\n## Failed JSON reads and subsequent member-local surveys (synthetic)\n\n",
+            );
+            s.push_str(
+                "Each member was read once after the failed fleet read, before the fault and \
+                 security phases. These are later observations, not an atomic snapshot of what \
+                 each member served during the fleet read. Exit status and stderr retain failed \
+                 local reads; collecting evidence does not change the original verdict. These \
+                 private captures retain replies verbatim, without hostname substitution.\n\n",
+            );
+            for failed in &self.json_failures {
+                let _ = writeln!(s, "```json\n{failed}\n```\n");
+            }
+        }
         s
     }
 }
@@ -1620,7 +1660,7 @@ fn give_sessions(world: &mut World) -> Result<(), Fail> {
                 let inst = &world.insts[idx];
                 let body = world.ctl_ok(inst, &["spawn"]).map_err(Fail::die)?;
                 body.split_whitespace()
-                    .find(|w| w.starts_with("s-"))
+                    .find(|w| aterm_types::tab_id::is_tab_id(w))
                     .ok_or_else(|| Fail::die(format!("m{idx:02}: spawn: {body}")))?
                     .to_owned()
             };

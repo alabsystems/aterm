@@ -13,7 +13,10 @@
 use super::super::supervisor_attention::{HostDoor, behind_the_door};
 use super::*;
 use crate::harness::contract::Scope;
-use crate::supervise::policy::turn_end::{LAND, LAND_CHECK, RULE_LAND, RULE_LAND_CHECK};
+use alab_policy::{
+    land_check::{LAND_CHECK, RULE_LAND_CHECK},
+    words::{LAND, RULE_LAND},
+};
 
 /// A due probe on a point, behind the window harness's door: the point decided (`seed` first
 /// sets up the session under the run's options; `continues`, the policy's `continue`, lets a done

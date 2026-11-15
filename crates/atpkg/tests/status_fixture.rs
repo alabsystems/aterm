@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Inert development-only native tether entry for ordinary supervision controls.
+//! Development-only process controls.
+
+#[path = "capture_fixture.rs"]
+mod capture;
+#[cfg(unix)]
+#[path = "warm_fixture.rs"]
+mod warm;
 
 fn main() -> std::process::ExitCode {
-    aterm_uds::tether::entry().unwrap_or(std::process::ExitCode::from(2))
+    let ended = aterm_uds::tether::entry().or_else(capture::entry);
+    #[cfg(unix)]
+    let ended = ended.or_else(warm::entry);
+    ended.unwrap_or(std::process::ExitCode::from(2))
 }

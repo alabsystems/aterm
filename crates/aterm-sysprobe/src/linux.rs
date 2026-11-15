@@ -890,11 +890,14 @@ pub fn loadavg_counts(text: &str) -> Option<(u64, u64)> {
     (total > 0).then_some((running, total))
 }
 
-/// One PSI file's ten-second averages (`/proc/pressure/memory`): the share of wall time some task, and every task, stalled on memory.
+/// One PSI file's averages (`/proc/pressure/memory`): the share of wall time some task, and every task, stalled on memory over the last ten seconds, and some task over the last minute.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Psi {
     /// `some avg10`, percent.
     pub some_avg10: f32,
+    /// `some avg60`, percent: the last minute, which a reader that looks once a minute judges
+    /// ([`memory_at_limit`]); `avg10` covers a sixth of it.
+    pub some_avg60: f32,
     /// `full avg10`, percent.
     pub full_avg10: f32,
 }
@@ -905,24 +908,27 @@ pub const PSI_WARN_SOME_AVG10: f32 = 7.0;
 /// `full avg10` at or past this is [`MemoryLevel::Critical`].
 pub const PSI_CRITICAL_FULL_AVG10: f32 = 60.0;
 
-/// A PSI file's `some` and `full` ten-second averages (`some avg10=1.25 avg60=… total=…`).
+/// A PSI file's `some` and `full` ten-second averages and its `some` one-minute average
+/// (`some avg10=1.25 avg60=… total=…`); `None` where any of the three is missing or not a
+/// plain non-negative number.
 #[must_use]
 pub fn psi(text: &str) -> Option<Psi> {
-    let avg10 = |kind: &str| {
+    let average = |kind: &str, key: &str| {
         whole_lines(text).find_map(|l| {
             let mut it = l.split_whitespace();
             if it.next()? != kind {
                 return None;
             }
-            let raw = it.find_map(|f| f.strip_prefix("avg10="))?;
+            let raw = it.find_map(|f| f.strip_prefix(key))?;
             raw.parse::<f32>()
                 .ok()
                 .filter(|v| !raw.starts_with('+') && v.is_finite() && *v >= 0.0)
         })
     };
     Some(Psi {
-        some_avg10: avg10("some")?,
-        full_avg10: avg10("full")?,
+        some_avg10: average("some", "avg10=")?,
+        some_avg60: average("some", "avg60=")?,
+        full_avg10: average("full", "avg10=")?,
     })
 }
 
@@ -954,14 +960,34 @@ pub const PSI_ROOM_PERMILLE: u64 = 100;
 /// free. Without `/proc/meminfo` (`room_kib` `None`, or a zero total) PSI alone decides.
 #[must_use]
 pub fn machine_pressure(p: &Psi, room_kib: Option<(u64, u64)>) -> MemoryLevel {
-    let room = room_kib.is_some_and(|(total, avail)| {
-        total > 0 && u128::from(avail) * 1000 >= u128::from(total) * u128::from(PSI_ROOM_PERMILLE)
-    });
-    if room {
+    if has_room(room_kib) {
         MemoryLevel::Normal
     } else {
         psi_level(p)
     }
+}
+
+/// Whether `MemAvailable` holds [`PSI_ROOM_PERMILLE`] of `MemTotal` (`room_kib` is `(total,
+/// available)`, both in one unit): `false` where it is unread or the total is zero.
+fn has_room(room_kib: Option<(u64, u64)>) -> bool {
+    room_kib.is_some_and(|(total, avail)| {
+        total > 0 && u128::from(avail) * 1000 >= u128::from(total) * u128::from(PSI_ROOM_PERMILLE)
+    })
+}
+
+/// `some avg60` at or past this is memory at its limit ([`memory_at_limit`]): some task stalled
+/// on memory for a tenth of the last minute.
+pub const PSI_LIMIT_SOME_AVG60: f32 = 10.0;
+
+/// Whether the machine's memory is at its limit over the last minute: `some avg60` at
+/// [`PSI_LIMIT_SOME_AVG60`] or more, and not while `MemAvailable` holds [`PSI_ROOM_PERMILLE`] of
+/// `MemTotal`, the room [`machine_pressure`] holds its level to for the same reason (`room_kib`
+/// as there; unread or a zero total, PSI alone decides). The level's `avg10` is a ten-second
+/// average, so a reader that looks once a minute sees a sixth of each minute in it; `avg60` is
+/// the minute.
+#[must_use]
+pub fn memory_at_limit(p: &Psi, room_kib: Option<(u64, u64)>) -> bool {
+    p.some_avg60 >= PSI_LIMIT_SOME_AVG60 && !has_room(room_kib)
 }
 
 /// Core layout from present/online cores, hybrid PMU core lists, and per-core `cpu_capacity`, fastest first.

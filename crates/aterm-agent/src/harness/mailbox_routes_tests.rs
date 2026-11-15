@@ -1222,15 +1222,13 @@ fn a_lower_files_entry_for_the_same_login_keeps_its_addresses() {
 fn an_environment_mailbox_login_overrides_the_entries() {
     use crate::harness::headless_oauth::{IMAP_USER_ENV, discover_mailbox_config_with_env};
     let home = aterm_tempfile::tempdir().expect("home");
-    let secrets = home.path().join(".secrets");
-    std::fs::create_dir_all(&secrets).expect("secrets");
-    std::fs::write(
-        secrets.join("ai-mailbox.toml"),
+    crate::vault_entry::put(
+        home.path(),
+        "ai-mailbox.toml",
         "imap_url = \"imaps://imap.example.test/INBOX\"\npassword = \"top\"\n\
          [[mailboxes]]\nlogin = \"entry@example.test\"\npassword = \"entry-pw\"\n\
          receives = [\"ai@pm.example.test\"]\n",
-    )
-    .expect("toml");
+    );
     let target = Some("ai@pm.example.test");
     let files = discover_mailbox_config_with_env(Some(home.path()), None, |_| None).expect("files");
     assert_eq!(

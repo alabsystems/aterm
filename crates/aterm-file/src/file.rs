@@ -339,6 +339,9 @@ pub struct Opened {
     pub projection: u32,
     /// Cells left out for a credential-shaped value.
     pub withheld: u64,
+    /// Records of the file's collection the replica holds inert: refused when the snapshot was
+    /// built, kept in history with their authors.
+    pub inert: u64,
     /// The projection, or `None` where the pass saw the frontier was the snapshot's and
     /// projected nothing again.
     pub projected: Option<Projected>,
@@ -501,6 +504,7 @@ mod write {
                         frontier,
                         projection,
                         withheld,
+                        inert,
                         projected,
                     } = *opened;
                     // A snapshot whose frontier is not here to compare (removed, damaged,
@@ -554,6 +558,7 @@ mod write {
                             state.kind.clone_from(&snapshot.kind);
                             state.ext.clone_from(&snapshot.ext);
                             state.withheld = withheld;
+                            state.inert = Some(inert);
                             state.projection = projection;
                             self.write_face(&mut state, &snapshot, held.as_ref())?;
                             replaced = Some(snapshot);

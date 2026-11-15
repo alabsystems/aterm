@@ -9,7 +9,7 @@ use crate::prompt::fixtures::{cursor, rows, screen};
 use crate::reader::{
     AgyReader, ClaudeReader, CodexReader, MuseReader, Program, ScreenReader, identify, read,
 };
-use crate::wall::WallKind;
+use alab_policy::vocab::WallKind;
 
 fn muse(text: &str) -> crate::reader::Reading {
     read(Some("muse"), &screen(text), None)

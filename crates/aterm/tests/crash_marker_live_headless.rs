@@ -139,7 +139,7 @@ fn first_sid(sock: &Path) -> String {
     let mut row = String::new();
     reader.read_line(&mut row).unwrap();
     row.split_whitespace()
-        .find(|t| t.starts_with("s-"))
+        .find(|t| aterm_types::tab_id::is_tab_id(t))
         .unwrap_or_else(|| panic!("no sid in `{status}` / `{row}`"))
         .to_string()
 }

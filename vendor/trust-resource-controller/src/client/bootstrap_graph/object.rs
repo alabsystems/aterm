@@ -187,7 +187,7 @@ fn receive_operation(
                 return match object::Terminal::decode(&bytes, request, digest)? {
                     object::Terminal::Completed { completion, observation, artifact } => {
                         transcript.complete()?;
-                        Ok((completion, observation, artifact))
+                        Ok((*completion, observation, artifact))
                     }
                     object::Terminal::Refused { reason } => {
                         Err(io::Error::new(io::ErrorKind::PermissionDenied, reason))

@@ -248,6 +248,7 @@ fn accounts(state: Option<&'static str>) -> ClaudeAccounts {
         made: false,
         state,
         renew_by: None,
+        on_token_until: None,
         limited_until: None,
         served_at: None,
         renewed_at: None,

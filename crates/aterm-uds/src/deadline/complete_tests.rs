@@ -689,6 +689,72 @@ fn the_progress_bound_listing_keeps_sixteen_mebibytes_of_records() {
     );
 }
 
+/// THE PROGRESS-BOUND READER TAKES AN EXPLICIT LIMIT: a child printing 2 MiB with no last
+/// newline, as `git cat-file blob` may, comes back whole through the progress-bound reader held
+/// to [`MAX_COMPLETE_STDOUT_BYTES`]; its window is a one-minute hang detector. NEGATIVE
+/// CONTROLS: a limit one byte short refuses the same output and names that limit, and a limit
+/// past the hard maximum is refused before anything starts.
+#[cfg(unix)]
+#[test]
+fn the_progress_bound_reader_keeps_whole_stdout_up_to_its_explicit_limit() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let path = world.path().join("blob");
+    let blob = vec![b'x'; 2 << 20];
+    std::fs::write(&path, &blob).unwrap();
+    let cat = crate::deadline::stand_in(std::path::Path::new("/bin/cat"));
+    let command = || {
+        let mut command = crate::spawnfd::command(&cat);
+        command.arg(&path);
+        command
+    };
+    let output = output_while_process_progressing_complete_stdout_with_limit(
+        &mut command(),
+        HANG,
+        "the blob fixture",
+        MAX_COMPLETE_STDOUT_BYTES,
+    )
+    .expect("2 MiB is within the explicit limit");
+    assert!(output.status.success(), "{}", output.status);
+    assert!(
+        output.stdout == blob,
+        "{} of the blob's {} bytes came back",
+        output.stdout.len(),
+        blob.len()
+    );
+    let short = blob.len() - 1;
+    let refused = output_while_process_progressing_complete_stdout_with_limit(
+        &mut command(),
+        HANG,
+        "the blob fixture",
+        short,
+    );
+    assert!(
+        matches!(
+            &refused,
+            Err(CompleteProgressError::Complete(CompleteOutputError::StdoutTooLarge { limit }))
+                if *limit == short
+        ),
+        "{:?}",
+        refused.map(|output| output.stdout.len())
+    );
+    let mut missing = crate::spawnfd::command(world.path().join("absent"));
+    let excessive = output_while_process_progressing_complete_stdout_with_limit(
+        &mut missing,
+        HANG,
+        "the blob fixture",
+        MAX_COMPLETE_STDOUT_BYTES + 1,
+    );
+    assert!(
+        matches!(
+            &excessive,
+            Err(CompleteProgressError::Complete(CompleteOutputError::Run(RunError::Spawn(error))))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ),
+        "{:?}",
+        excessive.map(|output| output.stdout.len())
+    );
+}
+
 /// A LISTING IS READ WHOLE PAST THE SHARED HARD MAXIMUM, UP TO ITS OWN: one byte past
 /// [`MAX_COMPLETE_STDOUT_BYTES`] comes back whole. NEGATIVE CONTROLS: the shared entry point
 /// refuses that limit before dispatch, and the listing's refuses one past its own maximum.

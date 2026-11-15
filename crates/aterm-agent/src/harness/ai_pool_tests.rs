@@ -23,23 +23,8 @@ pub(in crate::harness) fn seed_local_swarm_roster_denying(
     aliases: &[&str],
     deny_labels: &[&str],
 ) {
-    let srv_dir = aterm_tempfile::tempdir().expect("server dir");
-    let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let running = aterm_secrets::server::start(
-        socket,
-        &aterm_secrets::server::Options {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            store: srv_dir.path().to_path_buf(),
-            advertise: None,
-            pins: Vec::new(),
-            hold: Duration::from_millis(50),
-            keep_awake: false,
-        },
-    )
-    .expect("start server");
-    let url = format!("http://{}/v1/test", running.addr);
-    let paths = aterm_secrets::client::Paths::for_home(home);
-    aterm_secrets::client::create(&paths, &url, None, Some(label)).expect("create vault");
+    // The file vault the home's other fixtures publish to ([`crate::vault_entry::seed`]).
+    let paths = crate::vault_entry::ensure_vault(home, label);
     let recipient = aterm_secrets::client::machine_identity(&paths)
         .expect("identity")
         .recipient()
@@ -478,10 +463,8 @@ fn sync_from_ai_pool_outranks_sheet_tracks_aliases_and_marks_held_by() {
     let home = tmp.path().join("home");
     let state_dir = tmp.path().join("state");
     let config_dir = home.join(".config/aterm");
-    let secrets_dir = home.join(".secrets");
     fs::create_dir_all(&config_dir).unwrap();
     seed_local_swarm_roster(&home, "m100", &["m32"]);
-    aterm_types::fs_restricted::ensure_private_dir(&secrets_dir).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
     aterm_uds::atomic_file::write(&config_dir.join("aterm.toml"), b"", 0o600).unwrap();
 
@@ -489,11 +472,11 @@ fn sync_from_ai_pool_outranks_sheet_tracks_aliases_and_marks_held_by() {
     let codex_roster_path = config_dir.join("accounts-codex.toml");
 
     // Negative control before `ai-pool.toml` exists: 0.144 `ai-accounts.csv` still syncs.
-    fs::write(
-        secrets_dir.join(accounts_sync::ACCOUNTS_CSV_FILE),
+    crate::vault_entry::put(
+        &home,
+        accounts_sync::ACCOUNTS_CSV_FILE,
         "email,computer,claude,codex\ncsv-only@example.test,m100,1,1\n",
-    )
-    .unwrap();
+    );
     crate::test_config::write(
         config_dir.join("aterm.toml"),
         "[fleet]\nmachine = \"m100\"\n",
@@ -510,7 +493,7 @@ fn sync_from_ai_pool_outranks_sheet_tracks_aliases_and_marks_held_by() {
         Some("csv-only@example.test")
     );
 
-    // Now deliver `~/.secrets/ai-pool.toml`: it outranks `ai-accounts.csv`, resolves `m100`
+    // Now deliver the vault's `ai-pool.toml`: it outranks `ai-accounts.csv`, resolves `m100`
     // + alias `m32` from `swarm-roster.toml`, warms both `a01` (home `m100`) and `a02` (via
     // alias `m32`, home `m9`), retains `csv-only` as `held_by = "pool"`, and syncs Codex too.
     crate::test_config::write(config_dir.join("aterm.toml"), "").unwrap();
@@ -545,7 +528,7 @@ provider = "codex"
 email = "c02@example.test"
 warm = ["m9"]
 "#;
-    fs::write(secrets_dir.join(AI_POOL_FILE), pool_v1).unwrap();
+    crate::vault_entry::put(&home, AI_POOL_FILE, pool_v1);
     assert!(accounts_sync::needs_init_accounts_sync(
         &home,
         &state_dir,
@@ -644,7 +627,7 @@ provider = "codex"
 email = "c01@example.test"
 warm = ["m9"]
 "#;
-    fs::write(secrets_dir.join(AI_POOL_FILE), pool_v2).unwrap();
+    crate::vault_entry::put(&home, AI_POOL_FILE, pool_v2);
     assert!(accounts_sync::needs_init_accounts_sync(
         &home,
         &state_dir,
@@ -696,4 +679,16 @@ fn read_bounded_text_and_small_text_enforce_size_and_file_type() {
         std::os::unix::fs::symlink(&file, &link).unwrap();
         assert_eq!(super::super::disk::discover::small_text(&link), None);
     }
+}
+
+/// The vault's pool entry, named as a source (`vault:ai-pool.toml`), is a pool by its name, even
+/// empty. NEGATIVE CONTROL: another entry holding the same empty list is not.
+#[test]
+fn the_vault_pool_entry_is_a_pool_by_its_name() {
+    let empty = "version=1\naccount=[]\n";
+    assert!(Pool::looks_like_pool(
+        &crate::vault_entry::source_name(AI_POOL_FILE),
+        empty
+    ));
+    assert!(!Pool::looks_like_pool("vault:fleet-accounts.toml", empty));
 }

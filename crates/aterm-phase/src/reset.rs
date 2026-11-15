@@ -6,6 +6,7 @@
 use crate::anchors::anchor;
 use crate::phase::{has_composer_frame, is_rule, leading_spaces};
 use crate::prompt::{PromptKind, PromptV2, is_panel_rule};
+use alab_policy::vocab::ResetKind;
 
 const SEP: &str = " · ";
 
@@ -29,49 +30,36 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// A kind of reset (2.1.304's `CLe`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ResetKind {
-    /// `session`: the five-hour limit's (`5-hour reset`).
-    Session,
-    /// `weekly`: a weekly limit's (`weekly reset`).
-    Weekly,
-    /// `fable`: gives back what Fable used of the weekly limit (`Fable reset`).
-    Fable,
-    /// `full`: both limits' (`full reset`).
-    Full,
-}
-
-impl ResetKind {
-    /// Every kind, in the vendor's own order (`CLe`).
-    pub const ALL: [ResetKind; 4] = [
-        ResetKind::Session,
-        ResetKind::Weekly,
-        ResetKind::Fable,
-        ResetKind::Full,
-    ];
-
-    /// The vendor's id of the kind (`CLe`; the dialog row's value is `cedar-ember-<id>`).
-    #[inline]
-    #[must_use]
-    pub const fn word(self) -> &'static str {
-        match self {
-            ResetKind::Session => "session",
-            ResetKind::Weekly => "weekly",
-            ResetKind::Fable => "fable",
-            ResetKind::Full => "full",
-        }
-    }
-
-    /// [`Self::word`] read back.
-    #[must_use]
-    pub fn of_word(word: &str) -> Option<ResetKind> {
-        ResetKind::ALL.into_iter().find(|kind| kind.word() == word)
-    }
-
+/// How the program draws a kind of reset ([`ResetKind`]) in its usage-limit dialog, its
+/// confirmation and its outcome lines.
+pub trait ResetDrawn: Copy {
     /// `{kind}`, as the vendor draws it (`X()`).
     #[must_use]
-    pub fn name(self) -> &'static str {
+    fn name(self) -> &'static str;
+
+    /// `{Kind}`: [`Self::name`] with its first letter upper-cased.
+    #[must_use]
+    fn capital(self) -> String;
+
+    /// `{done}`, the head of the line that says a reset of this kind was spent (`Mt()`).
+    #[must_use]
+    fn done(self) -> &'static str;
+
+    /// The confirmation's title.
+    #[must_use]
+    fn title(self) -> String;
+
+    /// The confirmation's yes.
+    #[must_use]
+    fn yes(self) -> String;
+
+    /// `{kindResets}`, as `ce()` counts `n` of this kind.
+    #[must_use]
+    fn resets(self, n: u32) -> String;
+}
+
+impl ResetDrawn for ResetKind {
+    fn name(self) -> &'static str {
         anchor(match self {
             ResetKind::Session => "reset.kind.session",
             ResetKind::Weekly => "reset.kind.weekly",
@@ -80,9 +68,7 @@ impl ResetKind {
         })
     }
 
-    /// `{Kind}`: [`Self::name`] with its first letter upper-cased.
-    #[must_use]
-    pub fn capital(self) -> String {
+    fn capital(self) -> String {
         let name = self.name();
         let mut chars = name.chars();
         chars.next().map_or_else(String::new, |first| {
@@ -90,16 +76,7 @@ impl ResetKind {
         })
     }
 
-    fn noun(self) -> &'static str {
-        match self {
-            ResetKind::Session => crate::anchor!("reset.kind.session_count"),
-            _ => self.name(),
-        }
-    }
-
-    /// `{done}`, the head of the line that says a reset of this kind was spent (`Mt()`).
-    #[must_use]
-    pub fn done(self) -> &'static str {
+    fn done(self) -> &'static str {
         anchor(match self {
             ResetKind::Session => "reset.done.session",
             ResetKind::Weekly => "reset.done.weekly",
@@ -108,71 +85,69 @@ impl ResetKind {
         })
     }
 
-    /// [`Self::done`] and the head the builds before 2.1.312 drew for this kind
-    /// ([`SESSION_DONE_BEFORE_2_1_312`]).
-    fn done_heads(self) -> impl Iterator<Item = &'static str> {
-        std::iter::once(self.done())
-            .chain((self == ResetKind::Session).then_some(SESSION_DONE_BEFORE_2_1_312))
+    fn title(self) -> String {
+        format!("{}?", row_head(self))
     }
 
-    /// Whether the step may take a reset of this kind (the spec's R2).
-    #[inline]
-    #[must_use]
-    pub const fn takeable(self) -> bool {
-        !matches!(self, ResetKind::Fable)
-    }
-
-    /// The confirmation's title.
-    #[must_use]
-    pub fn title(self) -> String {
-        format!("{}?", self.row_head())
-    }
-
-    /// The confirmation's yes.
-    #[must_use]
-    pub fn yes(self) -> String {
+    fn yes(self) -> String {
         format!("{} {}", crate::anchor!("reset.yes"), self.name())
     }
 
-    fn row_head(self) -> String {
-        format!("{} {}", crate::anchor!("reset.row"), self.name())
-    }
-
-    fn early(self) -> String {
-        format!(
-            "{} {} {}",
-            crate::anchor!("reset.early"),
-            self.name(),
-            crate::anchor!("reset.early.anyway")
-        )
-    }
-
-    /// `{kindResets}`, as `ce()` counts `n` of this kind.
-    #[must_use]
-    pub fn resets(self, n: u32) -> String {
-        let noun = self.noun();
+    fn resets(self, n: u32) -> String {
+        let noun = noun(self);
         match n {
             0 => format!("no {noun}s"),
             1 => format!("1 {noun}"),
             n => format!("{n} {noun}s"),
         }
     }
+}
 
-    fn resets_of(self, text: &str) -> Option<u32> {
-        let noun = self.noun();
-        let plural = |rest: &str| rest.strip_suffix('s') == Some(noun);
-        if text.strip_prefix("no ").is_some_and(plural) {
-            return Some(0);
-        }
-        if text.strip_prefix("1 ") == Some(noun) {
-            return Some(1);
-        }
-        let (n, rest) = text.split_once(' ')?;
-        plural(rest)
-            .then(|| number(n))
-            .flatten()
-            .filter(|&n| n >= 2)
+/// What `{kindResets}` counts of `kind`: the five-hour kind's own noun
+/// (`reset.kind.session_count`), every other kind's [`ResetDrawn::name`].
+fn noun(kind: ResetKind) -> &'static str {
+    match kind {
+        ResetKind::Session => crate::anchor!("reset.kind.session_count"),
+        _ => kind.name(),
     }
+}
+
+/// [`ResetDrawn::done`] and the head the builds before 2.1.312 drew for `kind`
+/// ([`SESSION_DONE_BEFORE_2_1_312`]).
+fn done_heads(kind: ResetKind) -> impl Iterator<Item = &'static str> {
+    std::iter::once(kind.done())
+        .chain((kind == ResetKind::Session).then_some(SESSION_DONE_BEFORE_2_1_312))
+}
+
+fn row_head(kind: ResetKind) -> String {
+    format!("{} {}", crate::anchor!("reset.row"), kind.name())
+}
+
+fn early(kind: ResetKind) -> String {
+    format!(
+        "{} {} {}",
+        crate::anchor!("reset.early"),
+        kind.name(),
+        crate::anchor!("reset.early.anyway")
+    )
+}
+
+/// The count `text` spells of `kind`'s resets (`no …s`, `1 …`, `<n> …s`), [`ResetDrawn::resets`]
+/// read back.
+fn resets_of(kind: ResetKind, text: &str) -> Option<u32> {
+    let noun = noun(kind);
+    let plural = |rest: &str| rest.strip_suffix('s') == Some(noun);
+    if text.strip_prefix("no ").is_some_and(plural) {
+        return Some(0);
+    }
+    if text.strip_prefix("1 ") == Some(noun) {
+        return Some(1);
+    }
+    let (n, rest) = text.split_once(' ')?;
+    plural(rest)
+        .then(|| number(n))
+        .flatten()
+        .filter(|&n| n >= 2)
 }
 
 /// The kind whose confirmation title `text` is (`Use a {kind}?`, the whole of it once trimmed).
@@ -255,7 +230,7 @@ pub fn spends_reset(label: &str) -> bool {
         || opens(label, WEEKLY_ROW_BEFORE_2_1_312)
         || ResetKind::ALL
             .into_iter()
-            .any(|kind| opens(label, &kind.row_head()) || opens(label, &kind.yes()))
+            .any(|kind| opens(label, &row_head(kind)) || opens(label, &kind.yes()))
 }
 
 /// Whether `label`, past a leading `yes, `.
@@ -296,8 +271,8 @@ fn opens(label: &str, words: &str) -> bool {
 
 fn grant_kind(label: &str) -> Option<ResetKind> {
     let label = label.trim_start();
-    ResetKind::ALL.into_iter().find(|kind| {
-        let head = kind.row_head();
+    ResetKind::ALL.into_iter().find(|&kind| {
+        let head = row_head(kind);
         opens(label, &head) && {
             let rest = &label[head.len()..];
             rest.is_empty() || rest.starts_with(" (") || rest.starts_with(" · ")
@@ -307,7 +282,7 @@ fn grant_kind(label: &str) -> Option<ResetKind> {
 
 fn grant_of(label: &str, kind: ResetKind) -> Option<(u32, &str)> {
     let inner = label
-        .strip_prefix(kind.row_head().as_str())?
+        .strip_prefix(row_head(kind).as_str())?
         .strip_prefix(" (")?
         .strip_suffix(')')?;
     let (left, day) = inner.split_once(&format!(" {} ", crate::anchor!("reset.row.until")))?;
@@ -554,7 +529,7 @@ fn keeps_a_reset(prompt: &PromptV2, rows: &[String]) -> bool {
     }
     let stays = crate::anchor!("reset.confirm.stays");
     let stays = stays.split(SEP).last().unwrap_or(stays);
-    let early: Vec<String> = ResetKind::ALL.into_iter().map(ResetKind::early).collect();
+    let early: Vec<String> = ResetKind::ALL.into_iter().map(early).collect();
     rows.get(prompt.span.0..first.row.min(rows.len()))
         .unwrap_or_default()
         .iter()
@@ -574,7 +549,7 @@ fn confirm_text(
 ) -> Result<(Vec<String>, &str, u32, &str), &'static str> {
     if ResetKind::ALL
         .into_iter()
-        .any(|any| text.contains(any.early().as_str()))
+        .any(|any| text.contains(early(any).as_str()))
     {
         return Err("early");
     }
@@ -601,7 +576,7 @@ fn confirm_text(
         .strip_prefix(' ')
         .and_then(|rest| rest.split_once(&format!(" {left}")))
         .ok_or("count")?;
-    let count = kind.resets_of(count).filter(|&n| n >= 1).ok_or("count")?;
+    let count = resets_of(kind, count).filter(|&n| n >= 1).ok_or("count")?;
     let (deadline, rest) = rest
         .strip_prefix(&use_by[left.len()..])
         .and_then(|rest| rest.strip_prefix(' '))
@@ -725,16 +700,14 @@ pub fn reset_line(text: &str) -> ResetLine {
 fn left_of(segment: &str, kind: ResetKind) -> Option<u32> {
     let use_by = crate::anchor!("reset.confirm.use_by");
     let left = use_by.split(SEP).next().unwrap_or(use_by);
-    kind.resets_of(segment.strip_suffix(&format!(" {left}"))?)
+    resets_of(kind, segment.strip_suffix(&format!(" {left}"))?)
 }
 
 fn spent_line(text: &str) -> Option<(ResetKind, Option<u32>)> {
     let stays = crate::anchor!("reset.confirm.stays");
     let stays = stays.split(SEP).last().unwrap_or(stays);
     ResetKind::ALL.into_iter().find_map(|kind| {
-        let rest = kind
-            .done_heads()
-            .find_map(|done| text.strip_prefix(done)?.strip_prefix(SEP))?;
+        let rest = done_heads(kind).find_map(|done| text.strip_prefix(done)?.strip_prefix(SEP))?;
         let left = rest.split(SEP).find_map(|segment| left_of(segment, kind));
         let own = kind != ResetKind::Session
             || left.is_some()

@@ -209,8 +209,8 @@ fn an_existing_seat_recovers_by_proof_on_a_headless_members_port_off_home() {
     assert_eq!(bundle.allowed.binding(), request.binding());
     client::write_from_log_bundle(&f.paths, &bundle).unwrap();
     assert_eq!(
-        std::fs::read(f.paths.home.join(".secrets/recovery-token")).unwrap(),
-        b"fixture-value"
+        crate::vault_entry::read_text(&f.paths.home, "recovery-token", 1 << 20).text(),
+        Some("fixture-value")
     );
     assert!(matches!(
         client::status(&f.paths).unwrap().membership,

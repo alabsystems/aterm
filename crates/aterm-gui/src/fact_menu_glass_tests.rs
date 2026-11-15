@@ -689,6 +689,7 @@ fn a_cards_marks_are_drawn_while_it_is_open_and_gone_once_it_closes() {
             &roster,
             &State::default(),
             &enrolled,
+            None,
             true,
             Some("main"),
             None,

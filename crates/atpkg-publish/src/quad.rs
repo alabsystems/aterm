@@ -215,6 +215,16 @@ pub fn head_build(ctx: &Ctx, slug: &Slug) -> std::result::Result<Option<u64>, Ho
     }
 }
 
+/// The most bytes a client fetches for the quad file `name`.
+#[must_use]
+pub fn wire_cap(name: &str) -> u64 {
+    match name {
+        "index.toml" => atpkg::net::MANIFEST_CAP,
+        n if n.ends_with(".sig") => atpkg::net::SIG_CAP,
+        _ => atpkg::net::ROSTER_CAP,
+    }
+}
+
 /// Download `names` (of [`QUAD_FILES`]) of index release `tag` into `dir`.
 /// # Errors
 ///
@@ -231,12 +241,7 @@ pub fn download_quad_files(
         return host.download(slug, tag, names, dir);
     }
     for name in names {
-        let cap = match *name {
-            "index.toml" => atpkg::net::MANIFEST_CAP,
-            n if n.ends_with(".sig") => atpkg::net::SIG_CAP,
-            _ => atpkg::net::ROSTER_CAP,
-        };
-        match host.fetch_public(slug, tag, name, &dir.join(name), cap) {
+        match host.fetch_public(slug, tag, name, &dir.join(name), wire_cap(name)) {
             Probe::Present => {}
             Probe::Absent => return Err(HostError::NotFound),
             Probe::Unknown(why) => return Err(HostError::Unreachable(why)),

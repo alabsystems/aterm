@@ -3,7 +3,7 @@
 
 //! Ownership and hang-bound tests for `install.sh` app destination and `aterm` bin entry checks.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use aterm_spec::wait::{MUST_HAPPEN, PARKED_SECS, until_within};
 
@@ -198,37 +198,41 @@ if [ "$1" = pkg ]; then
 fi
 echo 'aterm 0.99.0'
 "#);
-    scratch.program(
+    let pre_store = scratch.program(
         "lane/pre-store/bin/aterm",
         "#!/bin/sh\necho \"aterm 0.4.0\"\n",
     );
+    let mut qualification = aterm_uds::spawnfd::command(&pre_store);
+    qualification.arg("--version");
+    let output = aterm_uds::deadline::output_within(
+        &mut qualification,
+        aterm_uds::deadline::FIRST_EXEC_HANG,
+    )
+    .expect("the private pre-store image qualifies before replacement checks");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"aterm 0.4.0\n");
     let elsewhere = Path::new("/usr/local/Cellar/other/bin/aterm");
     symlink(elsewhere, &scratch.mkdir("lane/foreign/bin").join("aterm"));
-    let mut lib = Lib::new();
-    let lanes: Vec<(&str, usize, PathBuf, PathBuf)> = ["pre-store", "foreign", "record-refused"]
-        .into_iter()
-        .map(|name| {
-            let store = scratch.mkdir(&format!("lane/{name}/store"));
-            let bin = scratch.mkdir(&format!("lane/{name}/bin"));
-            let at = lib.call(
-                format!(
-                    "(export DECLARED={} RECORD_STATUS={}; {})",
-                    q(s(&scratch.join(&format!("lane/{name}/declared")))),
-                    if name == "record-refused" { 37 } else { 0 },
-                    source_lane(
-                        &q(s(&scratch.mkdir(&format!("lane/{name}/source")))),
-                        &q(s(&store)),
-                        &q(s(&bin)),
-                        &q(s(&built)),
-                    )
-                ),
-                &[],
-            );
-            (name, at, store, bin)
-        })
-        .collect();
-    let recs = lib.run(&scratch);
-    for (name, at, store, bin) in lanes {
+    for name in ["pre-store", "foreign", "record-refused"] {
+        let mut lib = Lib::new();
+        let store = scratch.mkdir(&format!("lane/{name}/store"));
+        let bin = scratch.mkdir(&format!("lane/{name}/bin"));
+        let declared = scratch.join(&format!("lane/{name}/declared"));
+        let at = lib.call(
+            format!(
+                "(export DECLARED={} RECORD_STATUS={}; {})",
+                q(s(&declared)),
+                if name == "record-refused" { 37 } else { 0 },
+                source_lane(
+                    &q(s(&scratch.mkdir(&format!("lane/{name}/source")))),
+                    &q(s(&store)),
+                    &q(s(&bin)),
+                    &q(s(&built)),
+                )
+            ),
+            &[],
+        );
+        let recs = lib.run_qualifying(&scratch, Some((at, &declared)));
         let rec = &recs[at];
         let line = |start: &str| rec.out.lines().any(|line| line.starts_with(start));
         assert_eq!(rec.rc, 0, "{name}: {}", rec.err);
@@ -770,7 +774,7 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
 /// A stand-in that parks without a line, as a first exec held at macOS's check does.
 fn silent_staller() -> String {
     format!(
-        "#!/bin/sh\nsleep {PARKED_SECS} &\necho \"$$ $! $PPID\" >\"${{STALL_PARKED:?}}\"\nwait\n"
+        "#!/bin/sh\nif [ \"${{1:-}}\" = --qualify-staller ]; then echo staller-body-ran; exit 0; fi\nsleep {PARKED_SECS} &\necho \"$$ $! $PPID\" >\"${{STALL_PARKED:?}}\"\nwait\n"
     )
 }
 
@@ -872,7 +876,7 @@ fn left_where_it_is(scratch: &Scratch, held: Option<&Path>) {
     let siblings = toolset.join("Contents/MacOS");
     scratch.program("proof/toolset/aterm.app/Contents/MacOS/aterm", ATERM);
     scratch.program("proof/toolset/aterm.app/Contents/MacOS/aterm-cli", ATERM);
-    scratch.program("proof/toolset/aterm.app/Contents/MacOS/atpkg", &silent);
+    let toolset_atpkg = scratch.program("proof/toolset/aterm.app/Contents/MacOS/atpkg", &silent);
     let whole = scratch.mkdir("proof/whole/aterm.app");
     scratch.program("proof/whole/aterm.app/Contents/MacOS/aterm", ATERM);
     symlink(&stalls, &whole.join("Contents/MacOS/atpkg"));
@@ -881,6 +885,15 @@ fn left_where_it_is(scratch: &Scratch, held: Option<&Path>) {
     let staged = scratch.mkdir("proof/dest/aterm.app.installing.x");
     scratch.mkdir("proof/store");
     let placed = scratch.program("proof/store/aterm", &silent);
+    for program in [&toolset_atpkg, &dest_aterm, &placed] {
+        let mut command = aterm_uds::spawnfd::command(program);
+        command.arg("--qualify-staller");
+        let output =
+            aterm_uds::deadline::output_within(&mut command, aterm_uds::deadline::FIRST_EXEC_HANG)
+                .expect("the private staller qualifies before its bounded silent run");
+        assert!(output.status.success(), "{program:?}: {output:?}");
+        assert_eq!(output.stdout, b"staller-body-ran\n", "{program:?}");
+    }
     let link = scratch.join("proof/store/aterm-ctl");
     symlink(&stalls, &link);
     let parked = |name: &str| scratch.join(&format!("proof/{name}.parked"));
@@ -1258,12 +1271,15 @@ fn logged_staller(tag: &str) -> String {
     )
 }
 
-/// A stand-in that logs each run (`$0`) to STALL_LOG and parks with no line on its first run
-/// only, by whatever path, as a first exec macOS's check holds past one detector does, then
-/// answers as aterm; `tag` makes it a file of its own and names its mark beside STALL_PARKED.
+/// A stand-in that logs queries (`$0`) to STALL_LOG and parks on the first query only,
+/// by whatever path, then answers as aterm. The installed-command action writes its own
+/// receipt without consuming that query's hold; `tag` names both marks beside STALL_PARKED.
 fn held_once(tag: &str) -> String {
     format!(
-        "#!/bin/sh\n# {tag}\necho \"$0\" >>\"${{STALL_LOG:?}}\"\nheld=\"${{STALL_PARKED:?}}.{tag}.held\"\n\
+        "#!/bin/sh\n# {tag}\n\
+         if [ \"$*\" = \"pkg shell-setup --installed-command $0\" ]; then\n\
+         echo \"$0\" >>\"${{STALL_PARKED:?}}.{tag}.declared\"\nexit 0\nfi\n\
+         echo \"$0\" >>\"${{STALL_LOG:?}}\"\nheld=\"${{STALL_PARKED:?}}.{tag}.held\"\n\
          if [ ! -e \"$held\" ]; then\n: >\"$held\"\nsleep {PARKED_SECS} &\n\
          echo \"$$ $! $PPID\" >\"$STALL_PARKED\"\nwait\nfi\necho \"aterm 0.99.0\"\n"
     )
@@ -1490,6 +1506,11 @@ fn a_binary_held_past_one_detector_is_asked_again_at_once() {
     );
     let linked = bin.join("aterm");
     assert_eq!(recs[setup].out, s(&linked), "{}", recs[setup].err);
+    assert_eq!(
+        read(&scratch.join("held/parked.store.declared")),
+        format!("{}\n", s(&store.join("aterm"))),
+        "the placed runtime's declaration is an action, separate from retried queries"
+    );
     assert_eq!(
         read(&log),
         format!(

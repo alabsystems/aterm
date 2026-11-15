@@ -128,8 +128,7 @@ enum OnDisk {
     /// issued it: provision installs that.
     Unchained,
     /// Only ones the keychain holds with their issuer and still does not trust (revoked), the
-    /// first of them at this path: only a new certificate from Apple changes that, and
-    /// provision passes over these while it waits for one.
+    /// first of them at this path: provision passes over these, as over no certificate.
     Refused(PathBuf),
     /// The folders or the request key could not be read (why), which stops a real run too.
     Unlooked(String),
@@ -139,9 +138,10 @@ enum OnDisk {
 /// request key, the folder the operator named (`cert_dir`), and what the watched folders hold
 /// for that key. A certificate for the key that provision can make an identity, by importing
 /// it or its issuer, is a step for whoever runs provision; one the keychain holds with its
-/// issuer and still refuses is the owner's errand at Apple. A folder or key it could not read
-/// stops it as it stops a real run. `leave` says whether the test signature of a held
-/// identity may re-assert the release keychain's partition list first.
+/// issuer and still refuses counts as none, which provision resolves from the vault registry
+/// or files with the lab. A folder or key it could not read stops it as it stops a real run.
+/// `leave` says whether the test signature of a held identity may re-assert the release
+/// keychain's partition list first.
 fn read_only(
     kc: &Keychains<'_>,
     id: &str,
@@ -181,14 +181,7 @@ fn read_only(
                     "'{id}''s Developer ID certificate {} is in the keychain with its issuer, and macOS still does not trust it (revoked?)",
                     cert.display()
                 ),
-                next: format!(
-                    "a new certificate from Apple: {}; where the secrets vault holds the old \
-                     one, replace that entry with the new certificate (aterm secrets set \
-                     <its name> --file <the new .cer> --if-absent) so the Macs it fills get it",
-                    provision(
-                        "writes the request to upload and passes over the old certificate while it waits for the new one"
-                    )
-                ),
+                next: unheld_next(id),
             },
             OnDisk::Unlooked(why) => unlooked(why, key),
             OnDisk::Nothing => Outcome::Todo {
@@ -201,12 +194,18 @@ fn read_only(
                 "no Developer ID Application identity for team {}",
                 pins::APPLE_TEAM_ID
             ),
-            next: format!(
-                "provision imports the vault's Developer ID pair, else files `aterm secrets \
-                 need developer-id:{id}`"
-            ),
+            next: unheld_next(id),
         },
     }
+}
+
+/// What a real provision does for a Mac with no usable Developer ID identity: the one path a
+/// credential takes.
+fn unheld_next(id: &str) -> String {
+    format!(
+        "provision imports the vault's Developer ID pair, else files `aterm secrets need \
+         developer-id:{id}`"
+    )
 }
 
 /// The flag that lets provision mint a Developer ID request, spending one of the team's five
@@ -223,6 +222,7 @@ fn mint_command(id: &str) -> String {
 
 /// What this Mac's vault registry gives the Apple step when the keychains hold no identity
 /// ([`registry_pair`]).
+#[derive(Debug, Clone)]
 pub(crate) enum Vault {
     /// The registry holds a Developer ID pair and it was imported and proved (the line).
     Imported(String),
@@ -234,11 +234,12 @@ pub(crate) enum Vault {
     Unread(String),
 }
 
-/// THE ONE SOURCE OF A DEVELOPER ID PAIR: this Mac's vault registry
-/// ([`aterm_secrets::registry::read`]). A `~/.aterm/apple/devid-<stem>.cer` entry there is
-/// imported into the release keychain and proved ([`aterm_secrets::client::release::sync_signing`]).
+/// THE ONE SOURCE OF A DEVELOPER ID PAIR: this Mac's store, whose value-free names
+/// ([`aterm_secrets::registry::read`]) say whether it holds one. A `~/.aterm/apple/devid-<stem>.cer`
+/// entry there is read in place, imported into the release keychain and proved
+/// ([`aterm_secrets::client::release::sync_signing`]).
 fn registry_pair() -> Vault {
-    let paths = match aterm_secrets::client::Paths::live() {
+    let paths = match aterm_secrets::client::Paths::locate() {
         Ok(paths) => paths,
         Err(error) => return Vault::Unread(error.to_string()),
     };
@@ -462,7 +463,9 @@ fn acquire_in(
 
 /// No identity: a pair the vault filled for this id imports from disk, else the registry's
 /// pair is imported, else a request this Mac minted waits on Apple for the release machine's
-/// [`MINT_FLAG`] run, else the want is unheld. Nothing waits on a person.
+/// [`MINT_FLAG`] run, else the want is unheld. A certificate the keychain refuses (revoked)
+/// counts as none, so a vault pair that is that certificate leaves the want unheld too.
+/// Nothing waits on a person.
 fn resolve(
     kc: &Keychains<'_>,
     id: &str,
@@ -470,6 +473,7 @@ fn resolve(
     watch: &Watch,
     vault: &dyn Fn() -> Vault,
 ) -> Outcome {
+    let mut refused = None;
     if let Some(key) = &seen.key {
         match look(key, watch, &seen.invalid, 0, &|leaf| {
             issuer_in_keychain(kc, leaf)
@@ -478,29 +482,59 @@ fn resolve(
                 cert: Some(cer), ..
             }) => return install(kc, &cer, key, id),
             Err(why) => return unlooked(why, key),
+            Ok(Look {
+                judged: OnDisk::Refused(path),
+                ..
+            }) => refused = Some(path),
             Ok(_) => {}
         }
     }
-    match vault() {
-        Vault::Imported(line) => {
-            step(APPLE_LABEL, &line);
-            let ids = Observed::look(kc, id).identities;
-            if ids.is_empty() {
-                Outcome::Blocked {
-                    what: "the vault's Developer ID pair imported and the keychains list no \
-                           identity for it"
-                        .into(),
-                    fix: "re-run once `security find-identity` lists it".into(),
-                }
-            } else {
-                verdict(kc, id, ids, Leave::Write)
-            }
+    let answer = vault();
+    if let Vault::Imported(line) = &answer {
+        step(APPLE_LABEL, line);
+    }
+    if matches!(answer, Vault::Imported(_) | Vault::Pending(_)) {
+        let now = Observed::look(kc, id);
+        if !now.identities.is_empty() {
+            return verdict(kc, id, now.identities, Leave::Write);
         }
+        if refused.is_none() {
+            refused = refused_pair(kc, &now.invalid);
+        }
+    }
+    settle(
+        id,
+        answer,
+        refused.as_deref(),
+        seen.key.is_some() && seen.csr.is_some(),
+    )
+}
+
+/// What [`resolve`] reports once the keychains list no identity after the vault's `answer`:
+/// `refused` is a certificate for the want the keychain holds with its issuer and refuses, and
+/// `requested` says this Mac holds a request key and its request.
+fn settle(id: &str, answer: Vault, refused: Option<&Path>, requested: bool) -> Outcome {
+    if let Some(cert) = refused
+        && !matches!(answer, Vault::Unread(_))
+    {
+        return Outcome::Unheld(format!(
+            "'{id}''s Developer ID certificate {} is in the keychain with its issuer and macOS \
+             does not trust it (revoked?), and the vault registry gives no other",
+            cert.display()
+        ));
+    }
+    match answer {
+        Vault::Imported(_) => Outcome::Blocked {
+            what: "the vault's Developer ID pair imported and the keychains list no identity \
+                   for it"
+                .into(),
+            fix: "re-run once `security find-identity` lists it".into(),
+        },
         Vault::Pending(why) => Outcome::Blocked {
             what: format!("the vault's Developer ID pair is not imported here: {why}"),
             fix: "provision imports it once the vault authorizes this Mac's release ring".into(),
         },
-        Vault::Absent if seen.key.is_some() && seen.csr.is_some() => Outcome::Waiting {
+        Vault::Absent if requested => Outcome::Waiting {
             what: format!("'{id}' holds a request key and no installed certificate"),
             next: format!("`{}` resumes the request out at Apple", mint_command(id)),
         },
@@ -515,6 +549,43 @@ fn resolve(
                 .into(),
         },
     }
+}
+
+/// The first Developer ID certificate this Mac's store holds (a `~/.aterm/apple/devid-*.cer`
+/// entry, read in place) that the keychain holds with its issuer and refuses, given the
+/// identities it does not trust (`invalid`): its entry name. No file under the home is read;
+/// a public certificate is staged in a private run directory only so `openssl` can parse it.
+fn refused_pair(kc: &Keychains<'_>, invalid: &[String]) -> Option<PathBuf> {
+    if invalid.is_empty() {
+        return None;
+    }
+    let paths = aterm_secrets::client::Paths::locate_for_home(kc.home());
+    let mut names: Vec<String> = aterm_secrets::registry::read(&paths)
+        .ok()?
+        .into_iter()
+        .map(|entry| entry.name)
+        .filter(|name| {
+            name.starts_with(aterm_secrets::entry_class::APPLE_PREFIX)
+                && name.ends_with(".cer")
+                && aterm_secrets::entry_class::signing_material(name)
+        })
+        .collect();
+    names.sort();
+    let run = temp_run_dir("refused").ok()?;
+    names.into_iter().find_map(|name| {
+        let value = aterm_secrets::client::read_in_place(&paths, &name).ok()??;
+        let path = run.path().join(name.rsplit('/').next()?);
+        std::fs::write(&path, value.as_slice()).ok()?;
+        let form = ["DER", "PEM"]
+            .into_iter()
+            .find(|form| cert_subject(&path, form).is_some())?;
+        match judged(&MatchedCert { path, form }, invalid, 0, &|leaf| {
+            issuer_in_keychain(kc, leaf)
+        }) {
+            OnDisk::Refused(_) => Some(PathBuf::from(&name)),
+            _ => None,
+        }
+    })
 }
 
 /// What a run says when it could not look for the certificate (`why`, from
@@ -967,7 +1038,7 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
             next: "re-run without --check to set it from the vault".into(),
         };
     }
-    match aterm_secrets::client::Paths::live()
+    match aterm_secrets::client::Paths::locate()
         .and_then(|paths| aterm_secrets::client::release::sync_notary(&paths))
     {
         Ok(Some(note)) => Outcome::Ready {

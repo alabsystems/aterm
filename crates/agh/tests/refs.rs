@@ -318,6 +318,73 @@ fn ref_get_reads_one_ref() {
 }
 
 #[test]
+fn ref_guard_rejects_grafted_and_invalid_targets_before_delete() {
+    for (reference, sha, kind) in [
+        ("refs/heads/other", common::MAIN_SHA, "commit"),
+        (
+            "refs/heads/main",
+            "0000000000000000000000000000000000000000",
+            "commit",
+        ),
+        ("refs/heads/main", "not-an-object-id", "commit"),
+        ("refs/heads/main", common::MAIN_SHA, "tag"),
+        ("refs/heads/main", common::MAIN_SHA, ""),
+    ] {
+        let world = world("refs-invalid-guard");
+        world.fake.fault(
+            Match::api("/repos/fixture-dev/app/git/ref/heads/main").method("GET"),
+            Fault::Status {
+                status: 200,
+                body: format!(
+                    r#"{{"ref":"{reference}","object":{{"sha":"{sha}","type":"{kind}"}}}}"#
+                ),
+                headers: Vec::new(),
+            },
+        );
+        let error = world
+            .refs()
+            .delete_expect(&world.permit(), "refs/heads/main", common::MAIN_SHA)
+            .expect_err("an invalid guard cannot authorize deletion");
+        assert_eq!(error.kind, Kind::CouldNotRun, "{error:?}");
+        assert_eq!(error.sub, agh::Sub::Protocol, "{error:?}");
+        assert!(world.gh.fx().children_run().is_empty());
+        assert_eq!(world.git_requests(), 0);
+        assert!(world.records().is_empty());
+        assert!(
+            world
+                .fake
+                .seen()
+                .iter()
+                .all(|request| request.method == "GET")
+        );
+    }
+}
+
+#[test]
+fn ref_get_preserves_valid_tag_object_families() {
+    for kind in ["commit", "tag", "tree", "blob"] {
+        let world = world("refs-tag-family");
+        world.fake.fault(
+            Match::api("/repos/fixture-dev/app/git/ref/tags/v1").method("GET"),
+            Fault::Status {
+                status: 200,
+                body: format!(
+                    r#"{{"ref":"refs/tags/v1","object":{{"sha":"{}","type":"{kind}"}}}}"#,
+                    common::MAIN_SHA
+                ),
+                headers: Vec::new(),
+            },
+        );
+        let found = world
+            .refs()
+            .get("refs/tags/v1")
+            .expect("a valid tag target");
+        assert_eq!(found.object.kind, kind);
+        assert_eq!(found.object.sha, common::MAIN_SHA);
+    }
+}
+
+#[test]
 fn delete_expect_of_a_missing_ref_is_gone() {
     let world = world("refs-gone");
     let gone = world

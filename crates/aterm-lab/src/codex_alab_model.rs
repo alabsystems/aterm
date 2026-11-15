@@ -7,12 +7,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use aterm_agent::supervise::config::CONTINUE_TEXT;
-use aterm_agent::supervise::policy::land_check::LANDED as LANDED_ANSWER;
-use aterm_agent::supervise::policy::needs::NEEDS_ACK;
-use aterm_agent::supervise::policy::turn_end::{
-    self, DONE_CHECK, FINISHED, LAND, LAND_ANSWER, LAND_CHECK_HEAD, LAND_NUDGE,
+use alab_policy::config::CONTINUE_TEXT;
+use alab_policy::land_check::LANDED as LANDED_ANSWER;
+use alab_policy::needs::NEEDS_ACK;
+use alab_policy::{
+    land_check::LAND_CHECK_HEAD,
+    words::{DONE_CHECK, FINISHED, LAND, LAND_ANSWER, LAND_NUDGE},
 };
+use aterm_agent::supervise::policy::turn_end;
 
 use crate::codex_rig::{Answered, ResponseGate, call_item, message_item, request_view};
 use crate::pyjson::J;
@@ -54,15 +56,15 @@ pub const CONTRADICTED_WRONG_TAG: &str = "+contradicted-wrong";
 #[must_use]
 pub fn contradiction_fault(user: &str) -> Option<String> {
     let after = user
-        .split_once(turn_end::LAND_CONTRADICTED_HEAD)
+        .split_once(alab_policy::words::LAND_CONTRADICTED_HEAD)
         .map(|(_, r)| r.trim_start())?;
     let mut bad = Vec::new();
-    if !after.starts_with(turn_end::CONTRADICTED_GIT)
-        && !after.starts_with(turn_end::CONTRADICTED_LISTED)
+    if !after.starts_with(alab_policy::words::CONTRADICTED_GIT)
+        && !after.starts_with(alab_policy::words::CONTRADICTED_LISTED)
     {
         bad.push("no measured fact or list after the head".to_string());
     }
-    for whole in [turn_end::NO_REPOSITORY, "never delete work"] {
+    for whole in [alab_policy::words::NO_REPOSITORY, "never delete work"] {
         if !user.contains(whole) {
             bad.push(format!("does not say {whole:?}"));
         }
@@ -82,7 +84,7 @@ pub fn contradiction_fault(user: &str) -> Option<String> {
 /// it carries no contradiction.
 #[must_use]
 pub fn contradiction_tag(user: &str) -> &'static str {
-    if !user.contains(turn_end::LAND_CONTRADICTED_HEAD) {
+    if !user.contains(alab_policy::words::LAND_CONTRADICTED_HEAD) {
         return "";
     }
     if contradiction_fault(user).is_some() {

@@ -739,20 +739,35 @@ fn actual_direct_socket_cleanup_reaches_retained_identity_without_foreground_or_
 }
 
 #[test]
-fn owned_control_wire_requires_a_member_and_exact_challenge_fields() {
+fn owned_control_wire_requires_an_independent_controller_and_exact_challenge_fields() {
     let base = format!(
         "schema=1 request=0123456789abcdef0000000000000001 operation={} member={}",
         "a".repeat(32),
         "b".repeat(32)
     );
-    let begin = format!("member-control-begin {base}");
+    let begin = format!(
+        "controller-control-begin {base} controller_operation={}",
+        "d".repeat(32)
+    );
+    assert!(
+        handles(&begin),
+        "the native dispatcher must reach the control parser"
+    );
     assert!(matches!(
         Request::parse(&begin).unwrap().action,
-        Action::ControlBegin
+        Action::ControlBegin { .. }
     ));
     assert!(Request::parse(&format!("{begin} nonce={}", "c".repeat(32))).is_none());
     assert!(Request::parse(&begin.replace(&format!(" member={}", "b".repeat(32)), "")).is_none());
-    let ack = format!("member-control-ack {base} nonce={}", "c".repeat(32));
+    let ack = format!(
+        "controller-control-ack {base} controller_operation={} nonce={}",
+        "d".repeat(32),
+        "c".repeat(32)
+    );
+    assert!(
+        handles(&ack),
+        "the native dispatcher must reach the control parser"
+    );
     assert!(matches!(
         Request::parse(&ack).unwrap().action,
         Action::ControlAck { .. }
@@ -764,4 +779,61 @@ fn owned_control_wire_requires_a_member_and_exact_challenge_fields() {
     ] {
         assert!(Request::parse(&bad).is_none());
     }
+}
+
+#[test]
+fn retained_service_start_wire_is_bounded_typed_data_not_constructor_authority() {
+    let base = format!(
+        "controller-service-start schema=1 request=0123456789abcdef0000000000000001 operation={} member={} controller_operation=dddddddddddddddddddddddddddddddd",
+        "a".repeat(32),
+        "b".repeat(32),
+    );
+    let encode = |value: &str| {
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let request = Request::parse(&format!(
+        "{base} settings={}",
+        encode("/private/startup socket")
+    ))
+    .unwrap();
+    assert_eq!(request.name(), "controller-service-start");
+    assert!(
+        matches!(request.action, Action::ServiceStart { settings, .. } if settings == std::path::Path::new("/private/startup socket"))
+    );
+    for value in ["f", "XX", "72656c6174697665", "2f6100"] {
+        assert!(Request::parse(&format!("{base} settings={value}")).is_none());
+    }
+    assert!(Request::parse(&base).is_none());
+    assert!(Request::parse(&format!("{base} settings=2f61 extra=1")).is_none());
+    assert!(Request::parse(&format!("{base} settings={}", "0".repeat(MAX_FRAME))).is_none());
+}
+
+#[test]
+fn retained_service_attachment_wire_refuses_ambiguous_callback_data() {
+    use std::os::unix::ffi::OsStrExt;
+    let base = format!(
+        "controller-service-attach schema=1 request=0123456789abcdef0000000000000001 operation={} member={} service={} controller_operation=dddddddddddddddddddddddddddddddd",
+        "a".repeat(32),
+        "b".repeat(32),
+        "c".repeat(32),
+    );
+    // Raw Unix paths need not be UTF-8. Neither the path nor service ID supplies
+    // the actual frontend member/connection or backend construction authority.
+    let request = Request::parse(&format!("{base} callback=2f746d702fff")).unwrap();
+    assert_eq!(request.name(), "controller-service-attach");
+    assert!(
+        matches!(request.action, Action::ServiceAttach { service, callback, .. }
+        if service == "c".repeat(32) && callback.as_os_str().as_bytes() == b"/tmp/\xff")
+    );
+    for callback in ["f", "XX", "", "72656c6174697665", "2f746d7000"] {
+        assert!(Request::parse(&format!("{base} callback={callback}")).is_none());
+    }
+    assert!(Request::parse(&base).is_none());
+    assert!(Request::parse(&format!("{base} callback=2f extra=1")).is_none());
+    assert!(Request::parse(&format!("{base} callback=2f callback=2f")).is_none());
+    assert!(Request::parse(&format!("{base} callback={}", "2f".repeat(MAX_FRAME))).is_none());
 }

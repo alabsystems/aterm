@@ -72,6 +72,9 @@ aterm-spec-anchor = { workspace = true }
 aterm-dirfd = { workspace = true }
 # No-follow, close-on-exec opens for the private complete-source inventory.
 libc = { workspace = true }
+# The vault's entries (gh_access_token, gh_access_token_alabsystems, any `~/.secrets/NAME`
+# token_file), read in place from this Mac's verified store: no file under ~/.secrets is read.
+aterm-secrets = { workspace = true }
 
 [dev-dependencies]
 aterm-sysprobe = { workspace = true }

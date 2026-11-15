@@ -1,5 +1,11 @@
 # trust-resource-provenance
 
+The distinct local-archive image predicate follows canonical Trust
+`3229e452ecf013a6107567c3d856842aa3bf3569`: the same retained image is bookended
+around its readonly `__TEXT,__trust_barch` marker check. This adds no late image
+capture, SDK compatibility, execution or settlement authority. The consumer's
+existing original-deadline fixtures and native reader controls are preserved.
+
 `program::HeldProgram` retains original executable/runtime files and selected
 directory observations for the new bounded metadata purpose. Its supported
 profile reads thin arm64 Mach-O load commands directly, including weak,

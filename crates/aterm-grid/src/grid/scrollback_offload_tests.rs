@@ -279,36 +279,64 @@ fn detached_settings_apply_to_replacement_store_race() {
 
 #[test]
 fn clean_detach_snapshot_adopts_replacement_store_settings() {
-    let (rows, cols) = (10u16, 40u16);
-    let mut g = tiered_grid(rows, cols, 8);
-    for i in 0..100 {
-        logical_line(&mut g, &format!("B{i}"));
+    for ring in [8, 64] {
+        for clear in [false, true] {
+            let mut g = tiered_grid(10, 40, ring);
+            for i in 0..100 {
+                logical_line(&mut g, &format!("B{i}"));
+            }
+            let owned_ring: Vec<_> = history_seq(&g)
+                .into_iter()
+                .rev()
+                .take(g.ring_buffer_scrollback())
+                .map(|(text, _)| text)
+                .collect();
+            let job = g
+                .resize_offloading_scrollback(10, 20)
+                .expect("tiered store detaches");
+            if clear {
+                g.erase_scrollback();
+            }
+            let mut replacement: ScrollbackStorage = Scrollback::new(64, 512, 2_500_000).into();
+            replacement.set_line_limit(Some(12));
+            replacement
+                .push_line(Line::from("NEW_BASELINE"))
+                .expect("seed replacement");
+            g.attach_scrollback(replacement);
+            assert_eq!(
+                g.scrollback_line_limit(),
+                Some(12 + ring),
+                "clean snapshot follows replacement raw share plus ring capacity"
+            );
+            assert_eq!(g.scrollback_memory_budget(), Some(2_500_000));
+            g.reattach_reflowed_scrollback(job.reflow());
+            let history = history_seq(&g);
+            assert!(
+                history.iter().all(
+                    |(text, _)| !text.starts_with('B') || (!clear && owned_ring.contains(text))
+                ),
+                "ring {ring}, clear {clear}: replacement must not adopt old store history"
+            );
+            assert!(
+                history.iter().any(|(text, _)| text == "NEW_BASELINE"),
+                "replacement contents remain authoritative"
+            );
+            if !clear {
+                for text in &owned_ring {
+                    assert!(
+                        history.iter().any(|(row, _)| row == text),
+                        "ring {ring}: grid-owned ring row {text} must return"
+                    );
+                }
+            }
+            let store = g.scrollback().expect("replacement remains authoritative");
+            assert_eq!(g.scrollback_line_limit(), Some(12 + ring));
+            assert_eq!(store.line_limit(), Some(12));
+            assert_eq!(store.memory_budget(), 2_500_000);
+            assert!(g.storage.pending_scrollback_settings.is_none());
+            g.assert_invariants();
+        }
     }
-    let job = g
-        .resize_offloading_scrollback(rows, 20)
-        .expect("tiered store detaches");
-    g.erase_scrollback();
-
-    let mut replacement: ScrollbackStorage = Scrollback::new(64, 512, 2_500_000).into();
-    replacement.set_line_limit(Some(12));
-    replacement
-        .push_line(Line::from("NEW_BASELINE"))
-        .expect("seed replacement");
-    g.attach_scrollback(replacement);
-    assert_eq!(
-        g.scrollback_line_limit(),
-        Some(20),
-        "clean snapshot follows replacement raw 12 + ring 8"
-    );
-    assert_eq!(g.scrollback_memory_budget(), Some(2_500_000));
-
-    g.reattach_reflowed_scrollback(job.reflow());
-    let store = g.scrollback().expect("replacement remains authoritative");
-    assert_eq!(g.scrollback_line_limit(), Some(20));
-    assert_eq!(store.line_limit(), Some(12));
-    assert_eq!(store.memory_budget(), 2_500_000);
-    assert!(g.storage.pending_scrollback_settings.is_none());
-    g.assert_invariants();
 }
 
 #[test]
@@ -1335,8 +1363,12 @@ fn window_debt_follows_what_the_program_does() {
     }
 }
 
-fn reference_materialize_all(job: PendingScrollbackReflow) -> ScrollbackStorage {
+fn reference_materialize_all(job: PendingScrollbackReflow) -> ReflowedScrollback {
     let mut store = job.store;
+    let limits = LiftedStoreLimits {
+        line_limit: store.line_limit(),
+        memory_budget: store.memory_budget(),
+    };
     let mut input: Vec<Line> = Vec::with_capacity(store.line_count() + job.lazy_lines.len());
     for i in 0..store.line_count() {
         input.push(match store.get_line(i) {
@@ -1347,16 +1379,74 @@ fn reference_materialize_all(job: PendingScrollbackReflow) -> ScrollbackStorage 
     input.extend(job.lazy_lines);
     let mut staged = job.lazy_staged;
     input.extend(staged.drain_all());
-    if job.ring_lines.first().is_some_and(Line::is_wrapped) {
+    let mut ring_input = if job.ring_lines.first().is_some_and(Line::is_wrapped) {
         let head = input.iter().rposition(|line| !line.is_wrapped());
-        input.truncate(head.unwrap_or(0));
-    }
+        input.split_off(head.unwrap_or(0))
+    } else {
+        Vec::new()
+    };
+    ring_input.extend(job.ring_lines);
     let out = super::super::scrollback_reflow::reflow_scrollback_lines(&input, job.new_cols);
     store.clear().expect("reference clear");
     for line in out {
         store.push_line(line).expect("reference push");
     }
+    ReflowedScrollback {
+        store,
+        limits,
+        store_tail_len: 0,
+        ring_out: super::super::scrollback_reflow::reflow_scrollback_lines(
+            &ring_input,
+            job.new_cols,
+        ),
+        new_cols: job.new_cols,
+        prev_offset: job.prev_offset,
+        detach_live_bottom_gen: job.detach_live_bottom_gen,
+        clear_gen: job.clear_gen,
+    }
+}
+
+// Independent all-at-once oracle: join the entire input before rewrapping,
+// including a logical line crossing the store/ring seam.
+fn reference_reflow_all(job: PendingScrollbackReflow) -> ReflowedScrollback {
+    let mut store = job.store;
+    let limits = LiftedStoreLimits {
+        line_limit: store.line_limit(),
+        memory_budget: store.memory_budget(),
+    };
+    let mut input: Vec<Line> = (0..store.line_count())
+        .map(|i| {
+            store
+                .get_line(i)
+                .expect("decode")
+                .expect("present")
+                .into_owned()
+        })
+        .collect();
+    input.extend(job.lazy_lines);
+    let mut staged = job.lazy_staged;
+    input.extend(staged.drain_all());
+    input.extend(job.ring_lines);
+    let mut out = super::super::scrollback_reflow::reflow_scrollback_lines(&input, job.new_cols);
+    let ring_out = out.split_off(out.len().saturating_sub(job.ring_capacity));
+    store.clear().expect("clear");
+    store.set_line_limit(None);
     store
+        .set_memory_budget(usize::MAX)
+        .expect("lift reference budget");
+    for line in out {
+        store.push_line(line).expect("reference push");
+    }
+    ReflowedScrollback {
+        store,
+        limits,
+        store_tail_len: 0,
+        ring_out,
+        new_cols: job.new_cols,
+        prev_offset: job.prev_offset,
+        detach_live_bottom_gen: job.detach_live_bottom_gen,
+        clear_gen: job.clear_gen,
+    }
 }
 
 fn parity_grid(seed: u64, limit: Option<usize>, budget_bytes: usize) -> Grid {
@@ -1379,7 +1469,7 @@ fn streaming_matches_materialize_all_reference() {
             let mut streamed_grid = parity_grid(seed, limit, budget_bytes);
             let mut chunked_grid = parity_grid(seed, limit, budget_bytes);
 
-            let reference_store = reference_materialize_all(
+            let reference = reference_reflow_all(
                 reference_grid
                     .resize_offloading_scrollback(rows, new_cols)
                     .expect("reference job"),
@@ -1396,35 +1486,46 @@ fn streaming_matches_materialize_all_reference() {
 
             assert!(steps > 4, "reach: the schedule actually chunked");
             assert_eq!(
-                store_fingerprint(&one_shot.store),
-                store_fingerprint(&reference_store),
+                reflowed_fingerprint(&one_shot),
+                reflowed_fingerprint(&reference),
                 "limit {limit:?} budget {budget_bytes} seed {seed}: streaming \
                  one-shot != materialize-all reference"
             );
             assert_eq!(
-                store_fingerprint(&chunked.store),
-                store_fingerprint(&reference_store),
+                reflowed_fingerprint(&chunked),
+                reflowed_fingerprint(&reference),
                 "limit {limit:?} budget {budget_bytes} seed {seed}: streaming \
                  chunked != materialize-all reference"
             );
-            assert_eq!(one_shot.store.line_limit(), limit);
-            assert_eq!(one_shot.store.memory_budget(), budget_bytes);
+            assert_eq!(one_shot.limits.line_limit, limit);
+            assert_eq!(one_shot.limits.memory_budget, budget_bytes);
+            reference_grid.reattach_reflowed_scrollback(reference);
+            streamed_grid.reattach_reflowed_scrollback(one_shot);
+            chunked_grid.reattach_reflowed_scrollback(chunked);
+            assert_eq!(history_seq(&streamed_grid), history_seq(&reference_grid));
+            assert_eq!(history_seq(&chunked_grid), history_seq(&reference_grid));
+            for grid in [&reference_grid, &streamed_grid, &chunked_grid] {
+                let store = grid.scrollback().expect("store returned");
+                assert_eq!(store.line_limit(), limit);
+                assert_eq!(store.memory_budget(), budget_bytes);
+                assert!(store.total_memory_used() <= budget_bytes);
+            }
         }
     }
 }
 
 #[test]
-fn streaming_under_byte_budget_pressure_keeps_a_longer_suffix() {
+fn streaming_under_byte_budget_pressure_preserves_the_newest_suffix() {
     const BUDGET_BYTES: usize = 10_000;
     let (rows, new_cols) = (10u16, 23u16);
-    let mut deeper_anywhere = false;
+    let mut pressure_observed = false;
 
     for seed in [5u64, 21] {
         let mut reference_grid = parity_grid(seed, None, BUDGET_BYTES);
         let mut streamed_grid = parity_grid(seed, None, BUDGET_BYTES);
         let mut chunked_grid = parity_grid(seed, None, BUDGET_BYTES);
 
-        let reference_store = reference_materialize_all(
+        let reference_reflowed = reference_materialize_all(
             reference_grid
                 .resize_offloading_scrollback(rows, new_cols)
                 .expect("reference job"),
@@ -1440,17 +1541,33 @@ fn streaming_under_byte_budget_pressure_keeps_a_longer_suffix() {
         let (chunked, steps) = step_with_schedule(chunked_job, &mut rng, 41);
         assert!(steps > 4, "reach: the schedule actually chunked");
 
-        let reference = store_fingerprint(&reference_store);
+        let unbudgeted_rows = one_shot.store.line_count();
+        // The boundary owns the latest limits; check their actual enforcement
+        // after adopting the worker output, including its reserved newest tail.
+        reference_grid.reattach_reflowed_scrollback(reference_reflowed);
+        streamed_grid.reattach_reflowed_scrollback(one_shot);
+        chunked_grid.reattach_reflowed_scrollback(chunked);
+        let one_shot_store = streamed_grid.scrollback().expect("one-shot store");
+        let chunked_store = chunked_grid.scrollback().expect("chunked store");
+        let reference_store = reference_grid.scrollback().expect("reference store");
+        let reference = store_fingerprint(reference_store);
         assert!(
-            reference_store.total_memory_used() <= BUDGET_BYTES,
+            reference_store.budgeted_memory_used() <= BUDGET_BYTES,
             "seed {seed}: the reference must end under the byte budget"
         );
+        // The store budget counts reclaimable tier storage, not read cache and
+        // structural overhead exposed by total_memory_used after reattachment.
         assert!(
-            one_shot.store.total_memory_used() <= BUDGET_BYTES,
-            "seed {seed}: the streamed store must end under the byte budget"
+            one_shot_store.budgeted_memory_used() <= BUDGET_BYTES,
+            "seed {seed}: streamed total={} budgeted={} limit={}",
+            one_shot_store.total_memory_used(),
+            one_shot_store.budgeted_memory_used(),
+            one_shot_store.memory_budget()
         );
 
-        for (name, store) in [("one-shot", &one_shot.store), ("chunked", &chunked.store)] {
+        for (name, store) in [("one-shot", one_shot_store), ("chunked", chunked_store)] {
+            assert!(store.budgeted_memory_used() <= BUDGET_BYTES);
+            assert_eq!(store.memory_budget(), BUDGET_BYTES);
             let streamed = store_fingerprint(store);
             assert!(
                 streamed.len() >= reference.len(),
@@ -1466,17 +1583,21 @@ fn streaming_under_byte_budget_pressure_keeps_a_longer_suffix() {
                  the byte-identical NEWEST SUFFIX of the streamed history — only the \
                  eviction depth may differ"
             );
-            deeper_anywhere |= streamed.len() > reference.len();
+            pressure_observed |= store.line_count() < unbudgeted_rows;
         }
 
-        assert_eq!(one_shot.store.line_limit(), None);
-        assert_eq!(one_shot.store.memory_budget(), BUDGET_BYTES);
+        assert_eq!(
+            store_fingerprint(one_shot_store),
+            store_fingerprint(chunked_store),
+            "the step schedule must not change retained history under byte pressure"
+        );
+        assert_eq!(one_shot_store.line_limit(), None);
+        assert_eq!(one_shot_store.memory_budget(), BUDGET_BYTES);
     }
 
     assert!(
-        deeper_anywhere,
-        "reach: the byte-budget corpus must actually evict to DIFFERENT depths — \
-         that divergence is the boundary this test exists to pin"
+        pressure_observed,
+        "reach: the byte-budget corpus must actually evict rows at reattachment"
     );
 }
 
@@ -1736,4 +1857,299 @@ fn a_setting_changed_inside_the_offload_window_keeps_history_in_order() {
             }
         }
     }
+}
+
+#[test]
+fn a_converging_drag_keeps_the_same_total_as_a_ring_only_twin() {
+    let (rows, start, first, settled) = (3, 8, 7, 6);
+    let total = 32;
+    let mut tiered = tiered_grid(rows, start, 20);
+    tiered.set_scrollback_line_limit(Some(total));
+    let mut twin = Grid::with_scrollback(rows, start, total);
+    for i in 0..60 {
+        for grid in [&mut tiered, &mut twin] {
+            logical_line(grid, &format!("H{i}"));
+        }
+    }
+    tiered.drain_lazy_buffer();
+    assert_eq!(tiered.scrollback_lines(), total);
+    assert_eq!(history_seq(&tiered), history_seq(&twin));
+
+    let job = tiered
+        .resize_offloading_scrollback(rows, first)
+        .expect("tiered store detaches");
+    assert!(
+        !job.ring_lines.is_empty(),
+        "fixture must carry ring history beyond the four-screen hold-back"
+    );
+    twin.resize(rows, first);
+    assert!(tiered.resize_offloading_scrollback(rows, settled).is_none());
+    twin.resize(rows, settled);
+    let follow = tiered
+        .reattach_reflowed_scrollback_or_redetach(job.reflow())
+        .expect("superseded width requires convergence");
+    assert!(
+        tiered
+            .reattach_reflowed_scrollback_or_redetach(follow.reflow())
+            .is_none()
+    );
+    tiered.assert_invariants();
+    twin.assert_invariants();
+    assert_eq!(
+        tiered.scrollback_lines(),
+        total,
+        "convergence must retain the total"
+    );
+    assert_eq!(history_seq(&tiered), history_seq(&twin));
+    assert_eq!(screen_rows(&tiered), screen_rows(&twin));
+}
+
+#[test]
+fn converging_streams_apply_latest_limits_at_every_handoff() {
+    for (limit, rows) in [(32, 3), (48, 3), (24, 3), (32, 5)] {
+        let mut grid = tiered_grid(3, 8, 20);
+        grid.set_scrollback_line_limit(Some(32));
+        let mut twin = Grid::with_scrollback(3, 8, 32);
+        for i in 0..60 {
+            for grid in [&mut grid, &mut twin] {
+                logical_line(grid, &format!("H{i}"));
+            }
+        }
+        grid.drain_lazy_buffer();
+        let mut job = grid
+            .resize_offloading_scrollback(3, 7)
+            .expect("initial job");
+        twin.resize(3, 7);
+        for (pass, cols) in [6, 8, 5].into_iter().enumerate() {
+            // Give the eager twin the same effective policy for this window's
+            // output; it cannot recover rows evicted before a later raise.
+            grid.set_scrollback_line_limit(Some(limit));
+            twin.set_scrollback_line_limit(Some(limit));
+            grid.set_scrollback_memory_budget(4_000_000)
+                .expect("pending budget");
+            for i in 0..3 {
+                for grid in [&mut grid, &mut twin] {
+                    logical_line(grid, &format!("W{pass}{i}"));
+                }
+            }
+            assert!(grid.resize_offloading_scrollback(rows, cols).is_none());
+            twin.resize(rows, cols);
+            job = grid
+                .reattach_reflowed_scrollback_or_redetach(job.reflow())
+                .expect("another width requires convergence");
+            assert!(
+                job.line_count() + grid.scrollback_lines() <= limit,
+                "limit {limit}, rows {rows}, pass {pass}: every handoff is bounded"
+            );
+            assert_eq!(job.store.memory_budget(), 4_000_000);
+            assert!(job.store.budgeted_memory_used() <= 4_000_000);
+        }
+        assert!(
+            grid.reattach_reflowed_scrollback_or_redetach(job.reflow())
+                .is_none()
+        );
+        grid.assert_invariants();
+        twin.assert_invariants();
+        assert_eq!(
+            history_seq(&grid),
+            history_seq(&twin),
+            "limit {limit}, rows {rows}"
+        );
+        assert_eq!(
+            screen_rows(&grid),
+            screen_rows(&twin),
+            "limit {limit}, rows {rows}"
+        );
+        assert!(grid.scrollback_lines() <= limit);
+    }
+}
+
+#[test]
+fn finite_handoff_matches_model_and_rejects_lost_or_unbounded_rows() {
+    use aterm_models_core::scrollback_handoff_model;
+    use aterm_spec::{interp, verify};
+
+    let model = scrollback_handoff_model();
+    assert!(
+        interp::bmc(&model).is_ok(),
+        "default handoff model must hold"
+    );
+    for fault in [1, 2] {
+        assert!(
+            interp::bmc(&interp::with_buggy(&model, fault)).is_err(),
+            "fault {fault} must have a reachable counterexample"
+        );
+    }
+    let mut grid = tiered_grid(3, 8, 20);
+    grid.set_scrollback_line_limit(Some(32));
+    for i in 0..60 {
+        logical_line(&mut grid, &format!("H{i}"));
+    }
+    grid.drain_lazy_buffer();
+    let job = grid.resize_offloading_scrollback(3, 7).expect("job");
+    let mut prev = model.init_state();
+    assert_eq!(job.line_count() as i64, prev["carried"]);
+    assert_eq!(grid.ring_buffer_scrollback() as i64, prev["held"]);
+    for i in 0..5 {
+        logical_line(&mut grid, &format!("W{i}"));
+        assert!(model.fire("FillRoom", &mut prev));
+    }
+    grid.resize(3, 6);
+    assert_eq!(grid.ring_buffer_scrollback() as i64, prev["held"]);
+    assert_eq!(
+        grid.storage.lazy_buffer.len(),
+        0,
+        "all new output stays in the ring"
+    );
+    let follow = grid
+        .reattach_reflowed_scrollback_or_redetach(job.reflow())
+        .expect("superseded width converges");
+    let mut next = prev.clone();
+    assert!(model.fire("Handoff", &mut next));
+    next.insert("carried", follow.line_count() as i64);
+    next.insert("held", grid.ring_buffer_scrollback() as i64);
+    let validate = |next: &std::collections::BTreeMap<&'static str, i64>| {
+        verify::validate_transition_tiered(
+            &model,
+            &[("Buggy", 0)],
+            &prev,
+            next,
+            Some("Handoff"),
+            "finite scrollback handoff Tier-1",
+        )
+    };
+    let (accepted, diagnostic) = validate(&next);
+    assert!(accepted, "real handoff rejected: {diagnostic}");
+    for fault in [1, 2] {
+        let mutant = interp::with_buggy(&model, fault);
+        let wrong = mutant
+            .successors("Handoff", &prev)
+            .pop()
+            .expect("mutant successor");
+        assert!(
+            !validate(&wrong).0,
+            "fault {fault} must be rejected by the real contract"
+        );
+    }
+    assert!(
+        grid.reattach_reflowed_scrollback_or_redetach(follow.reflow())
+            .is_none()
+    );
+    grid.assert_invariants();
+}
+
+#[test]
+fn a_budget_raise_during_reflow_preserves_the_detached_input() {
+    for seed in [5, 21] {
+        let mut grid = parity_grid(seed, None, 10_000);
+        let mut twin = parity_grid(seed, None, 10_000);
+        let store = grid.scrollback().expect("initial store");
+        let lost_before = store.pressure_evicted_lines();
+        assert!(
+            lost_before > 0,
+            "fixture must have experienced real byte pressure"
+        );
+        let policy = (store.hot_limit(), store.warm_limit());
+        let job = grid.resize_offloading_scrollback(10, 23).expect("job");
+        grid.set_scrollback_memory_budget(8_000_000)
+            .expect("deferred raise");
+        twin.set_scrollback_memory_budget(8_000_000)
+            .expect("eager raise");
+        twin.resize(10, 23);
+        grid.reattach_reflowed_scrollback(job.reflow());
+        assert_eq!(
+            history_seq(&grid),
+            history_seq(&twin),
+            "seed {seed}: raised budget keeps input"
+        );
+        assert_eq!(screen_rows(&grid), screen_rows(&twin));
+        let store = grid.scrollback().expect("returned store");
+        assert_eq!((store.hot_limit(), store.warm_limit()), policy);
+        assert_eq!(store.memory_budget(), 8_000_000);
+        assert!(store.budgeted_memory_used() <= 8_000_000);
+        assert_eq!(
+            store.pressure_evicted_lines(),
+            lost_before,
+            "replacement storage must preserve loss history without inventing new loss"
+        );
+        grid.assert_invariants();
+    }
+}
+
+#[test]
+fn handoff_environment_actions_match_grid_and_reject_wrong_rows() {
+    use aterm_models_core::scrollback_handoff_model;
+    use aterm_spec::verify;
+    use std::collections::BTreeMap;
+
+    let model = scrollback_handoff_model();
+    let mut state = model.init_state();
+    let mut grid = tiered_grid(3, 8, 20);
+    grid.set_scrollback_line_limit(Some(32));
+    for i in 0..60 {
+        logical_line(&mut grid, &format!("H{i}"));
+    }
+    grid.drain_lazy_buffer();
+    let job = grid.resize_offloading_scrollback(3, 7).expect("job");
+    let check = |action: &str,
+                 state: &mut BTreeMap<&'static str, i64>,
+                 grid: &Grid,
+                 job: &PendingScrollbackReflow| {
+        let mut next = state.clone();
+        assert!(model.fire(action, &mut next), "{action} must be enabled");
+        next.insert("held", grid.ring_buffer_scrollback() as i64);
+        next.insert(
+            "total",
+            grid.scrollback_line_limit().expect("finite") as i64,
+        );
+        let carried = (job.line_count() + grid.storage.lazy_buffer.len()) as i64;
+        next.insert("carried", carried);
+        next.insert("wanted", carried);
+        let validate = |candidate: &BTreeMap<&'static str, i64>| {
+            verify::validate_transition_tiered(
+                &model,
+                &[("Buggy", 0)],
+                state,
+                candidate,
+                Some(action),
+                "finite handoff environment Tier-1",
+            )
+        };
+        let (accepted, diagnostic) = validate(&next);
+        assert!(accepted, "{action}: {diagnostic}");
+        let mut wrong = next.clone();
+        *wrong.get_mut("held").expect("held") += 1;
+        assert!(!validate(&wrong).0, "{action}: wrong ring custody accepted");
+        *state = next;
+    };
+    assert_eq!(grid.ring_buffer_scrollback() as i64, state["held"]);
+    assert_eq!(job.line_count() as i64, state["carried"]);
+
+    grid.set_scrollback_line_limit(Some(36));
+    check("Raise", &mut state, &grid, &job);
+    grid.set_scrollback_line_limit(Some(32));
+    check("Lower", &mut state, &grid, &job);
+    grid.resize_with_policy(4, 7, ResizePolicy::Native);
+    check("OpenRoom", &mut state, &grid, &job);
+    while state["held"] < 20 {
+        logical_line(&mut grid, "F");
+        check("FillRoom", &mut state, &grid, &job);
+    }
+    logical_line(&mut grid, "X");
+    check("Output", &mut state, &grid, &job);
+    grid.resize(4, 6);
+    let follow = grid
+        .reattach_reflowed_scrollback_or_redetach(job.reflow())
+        .expect("stale width redetaches");
+    // One converging call implements both model steps: the trim's boundary
+    // followed by custody in the fresh job. `boundary` marks that abstract cut;
+    // it is not a claim that the UI exposes the intermediate store attachment.
+    check("Handoff", &mut state, &grid, &follow);
+    assert!(grid.reflow_offload_in_flight());
+    check("Redetach", &mut state, &grid, &follow);
+    assert!(
+        grid.reattach_reflowed_scrollback_or_redetach(follow.reflow())
+            .is_none()
+    );
+    grid.assert_invariants();
 }

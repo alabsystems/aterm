@@ -1946,9 +1946,9 @@ pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result
                 "the public channel {slug} is not readable with the available credential, so \
                  this cut cannot confirm it carries v{version} (GitHub's 404 means missing \
                  or unauthorized).\n\
-                 fix:  the release-org token at {} reads it (`aterm secrets need gh:release` \
-                 asks the lab's Macs for one), or cut with --dry-run",
-                crate::publish::channel_token_pointer()
+                 fix:  the release-org token (vault entry {}) reads it (`aterm secrets need \
+                 gh:release` asks the lab's Macs for one), or cut with --dry-run",
+                crate::publish::CHANNEL_TOKEN
             )));
         }
         return Ok(None);
@@ -3108,8 +3108,8 @@ pub fn github_identity_gate(offline: bool) -> Result<Option<String>> {
     }
     let user = crate::github::get("user").map_err(|e| {
         Error::new(format!(
-            "GitHub did not take the release token in {}: {e}; nothing was claimed",
-            crate::publish::channel_token_pointer()
+            "GitHub did not take the release token (vault entry {}): {e}; nothing was claimed",
+            crate::publish::CHANNEL_TOKEN
         ))
     })?;
     Ok(user["login"].as_str().map(str::to_string))

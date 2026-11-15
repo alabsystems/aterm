@@ -218,7 +218,7 @@ fn the_pointer_is_a_hand_exactly_where_a_press_acts() {
             let (x, y) = band_px(&t, 0, col);
             let acts = t.band_press_acts(x, y);
             let (mut twin, t0) = fresh(details);
-            let pressed = twin.band_press_at(x, y, t0 + ms(1));
+            let pressed = twin.band_press_at(x, y, t0 + ms(1), stamp());
             assert_eq!(acts, pressed != "OK none", "col {col}: {pressed}");
             hands += usize::from(acts);
         }
@@ -449,7 +449,7 @@ fn the_pointer_lights_only_the_chip_and_a_press_is_notice_act() {
         !t.band_hover_at(x, y, t0),
         "withheld links: nothing to light"
     );
-    assert_eq!(t.band_press_at(x, y, t0), "OK none");
+    assert_eq!(t.band_press_at(x, y, t0, stamp()), "OK none");
     assert_eq!(t.band_rows(), 1, "and nothing happened");
     t.set_details_view_at(true, t0);
     assert!(t.needs_frame(), "the links are a new frame");
@@ -497,7 +497,7 @@ fn the_pointer_lights_only_the_chip_and_a_press_is_notice_act() {
         native,
         format!("OK acted={} performed=1", pct_encode("Details \u{203a}"))
     );
-    let pressed = t.band_press_at(x, y, t0 + ms(4));
+    let pressed = t.band_press_at(x, y, t0 + ms(4), stamp());
     assert_eq!(pressed, format!("{native} id=1"));
     assert_eq!(
         t.messages_read_at("", 9),
@@ -510,8 +510,8 @@ fn the_pointer_lights_only_the_chip_and_a_press_is_notice_act() {
         "{}",
         t.messages_read_at("", 9)
     );
-    assert_eq!(t.band_press_at(x, 0.0, t0 + ms(5)), "OK none");
-    assert_eq!(t.band_press_at(x, 400.0, t0 + ms(5)), "OK none");
+    assert_eq!(t.band_press_at(x, 0.0, t0 + ms(5), stamp()), "OK none");
+    assert_eq!(t.band_press_at(x, 400.0, t0 + ms(5), stamp()), "OK none");
 }
 
 #[test]
@@ -549,9 +549,9 @@ fn the_overflow_row_opens_the_details_view_only_with_one() {
         "three rows on a two-row band: the last is the overflow"
     );
     let (x, y) = band_px(&t, last, 3);
-    assert_eq!(t.band_press_at(x, y, t0 + ms(11)), "OK none");
+    assert_eq!(t.band_press_at(x, y, t0 + ms(11), stamp()), "OK none");
     t.set_details_view_at(true, t0 + ms(12));
-    assert_eq!(t.band_press_at(x, y, t0 + ms(13)), "OK messages");
+    assert_eq!(t.band_press_at(x, y, t0 + ms(13), stamp()), "OK messages");
 }
 
 #[test]
@@ -936,11 +936,7 @@ fn messages_entry_is_the_records_row() {
 fn pct_encode_is_the_control_wires() {
     for b in 0u8..=0x7f {
         let s = char::from(b).to_string();
-        assert_eq!(
-            pct_encode(&s),
-            aterm_control::wire::pct_encode(&s),
-            "{b:#x}"
-        );
+        assert_eq!(pct_encode(&s), aterm_codec::pct::encode(&s), "{b:#x}");
     }
     let two_byte = (0x80u32..0x800).filter_map(char::from_u32);
     let wider = (0x800u32..=0x10_ffff)
@@ -948,7 +944,7 @@ fn pct_encode_is_the_control_wires() {
         .filter_map(char::from_u32);
     for c in two_byte.chain(wider) {
         let s = c.to_string();
-        assert_eq!(pct_encode(&s), aterm_control::wire::pct_encode(&s), "{c:?}");
+        assert_eq!(pct_encode(&s), aterm_codec::pct::encode(&s), "{c:?}");
     }
     for s in [
         "",
@@ -959,7 +955,7 @@ fn pct_encode_is_the_control_wires() {
         "\t\n\r\u{7f}",
         "~/src/aterm",
     ] {
-        assert_eq!(pct_encode(s), aterm_control::wire::pct_encode(s), "{s:?}");
+        assert_eq!(pct_encode(s), aterm_codec::pct::encode(s), "{s:?}");
     }
 }
 

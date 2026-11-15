@@ -1501,23 +1501,36 @@ impl FooterCache {
             .wall_basis
             .as_ref()
             .and_then(|(rows, served)| wall_of(rows, *served, now, offset_at));
-        let (models, busy_ms) = if refresh.caught_up {
+        let (models, busy_ms, served_at) = if refresh.caught_up {
             (
                 model_tokens(usage.total_fold().per_model()),
                 usage.busy_ms(),
+                usage.served_at(),
             )
         } else {
-            ((Vec::new(), super::session_usage::More::default()), 0)
+            ((Vec::new(), super::session_usage::More::default()), 0, None)
         };
-        UsageFacts::of(models, wall, Some(&refresh)).map(|facts| facts.with_runtime(busy_ms))
+        UsageFacts::of(models, wall, Some(&refresh)).map(|facts| UsageFacts {
+            served_at,
+            ..facts.with_runtime(busy_ms)
+        })
     }
 
-    /// ARM the step tap: rows of the main transcript older than `floor_ms` (wall ms: the process's start, `floor_of` × 1000) or at or below the log's watermark `given` for their file are history, folded into the end and never queued.
-    pub fn set_floor(&mut self, floor_ms: u64, given: Option<super::steps::StepMark>) {
+    /// ARM the step tap: rows of the main transcript older than `floor_ms` (wall ms: the process's start, `floor_of` × 1000) or at or below the log's watermark `given` for their file are history, folded into the end and never queued; one of the run's own dated below `adopted_ms` (a seamless update's adoption, 0 for none) is lost ([`super::steps::StepFold::set_adopted`]).
+    pub fn set_floor(
+        &mut self,
+        floor_ms: u64,
+        adopted_ms: u64,
+        given: Option<super::steps::StepMark>,
+    ) {
         match self.steps.as_mut() {
-            Some(tap) => tap.set_floor(floor_ms, given),
+            Some(tap) => {
+                tap.set_floor(floor_ms, given);
+                tap.set_adopted(adopted_ms);
+            }
             None => {
                 let mut tap = super::steps::StepFold::new(floor_ms, given);
+                tap.set_adopted(adopted_ms);
                 if let Some(usage) = self.usage.as_ref() {
                     usage.bind_tap(&mut tap);
                 }
@@ -3894,11 +3907,12 @@ fn unit_figure(facts: &FooterFacts) -> Option<&str> {
 /// its roster label; [`super::quota_view::THIS_LOGIN`] only for a login with a figure that
 /// neither an address nor a row names; `None` with none of these. A login the account state says
 /// is signed out ([`super::profile::SubscriptionDisplay::signed_out`]) is named by none of them:
-/// the glass says [`super::quota_view::NOT_SIGNED_IN`].
+/// the glass says [`super::outlook::SIGNED_OUT`], the one word every surface says of an account
+/// with no login to run on, warned since this tab cannot run.
 #[must_use]
 pub fn unit_name(facts: &FooterFacts) -> Option<&str> {
     if signed_out(facts) {
-        return Some(super::quota_view::NOT_SIGNED_IN);
+        return Some(super::outlook::SIGNED_OUT);
     }
     let email = facts
         .subscription
@@ -3949,21 +3963,18 @@ pub fn account_unit(facts: &FooterFacts) -> Vec<Vec<Segment>> {
             // A signed-out login's unit is the one warning, whole at every width, with no
             // figure: none is true of it.
             if signed_out(facts) {
-                return [[piece(
-                    super::quota_view::NOT_SIGNED_IN.to_owned(),
-                    Role::Warn,
-                )]]
-                .iter()
-                .map(|form| {
-                    form.iter()
-                        .map(|piece| Segment {
-                            tone: Tone::of(piece.role),
-                            bold: piece.bold,
-                            ..Segment::plain(ACCOUNT_MARK, piece.text.as_str())
-                        })
-                        .collect()
-                })
-                .collect();
+                return [[piece(super::outlook::SIGNED_OUT.to_owned(), Role::Warn)]]
+                    .iter()
+                    .map(|form| {
+                        form.iter()
+                            .map(|piece| Segment {
+                                tone: Tone::of(piece.role),
+                                bold: piece.bold,
+                                ..Segment::plain(ACCOUNT_MARK, piece.text.as_str())
+                            })
+                            .collect()
+                    })
+                    .collect();
             }
             name.map(|name| {
                 let local = piece(super::quota_view::short(name), Role::Lit);

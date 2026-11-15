@@ -722,7 +722,7 @@ impl Bed {
             mailbox: &|_, _, _| (super::super::sign_in_ladder::Mailbox::Ready, None),
             log: Arc::new(|_| {}),
             run_attempt: None,
-            save_oauth: |_, _| Ok("inert".into()),
+            tokens_here: |_, _, _, _| None,
             shared: shared_renewal::Effects {
                 authority: None,
                 checkpoint_authority: None,
@@ -863,7 +863,7 @@ impl Bed {
             },
             log,
             run_attempt: Some(Arc::new(|_, _| panic!("no unguarded fallback"))),
-            save_oauth: |_, _| Ok("inert".into()),
+            tokens_here: |_, _, _, _| None,
             shared: shared_renewal::Effects {
                 authority: factory,
                 checkpoint_authority: factory,

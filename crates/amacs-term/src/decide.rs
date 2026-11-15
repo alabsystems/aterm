@@ -57,6 +57,11 @@ pub const NO_TERMINAL: &str =
 pub const NO_ANSWER: &str = "amacs: the aterm window may have taken the request but no answer came; \
                              nothing else was opened, look for its Editor tab";
 
+/// What a handoff the window refused because another aterm process is writing the file's draft
+/// says: nothing opened here, so the draft is not split between two editors.
+pub const BUSY: &str = "amacs: another aterm process is writing this file's draft; nothing was \
+                        opened here, so the draft is not split; run amacs again";
+
 /// The rows before the handoff, in the design's order ([`native_face`], [`no_terminal_exit`]).
 #[must_use]
 pub fn decide(inputs: &Inputs) -> Face {
@@ -205,6 +210,8 @@ pub enum Handoff {
     Opened,
     /// `ERR …`: the window refused it.
     Refused,
+    /// `ERR busy drafts (…)`: another aterm process is writing the file's draft.
+    Busy,
     /// No window could be asked.
     Unreachable,
     /// The window took the request and did not answer in time.
@@ -219,6 +226,7 @@ pub fn after_handoff(handoff: Handoff) -> Face {
         Handoff::Opened => Face::Native,
         Handoff::Refused | Handoff::Unreachable => Face::Terminal,
         Handoff::TimedOut => Face::Exit(1, NO_ANSWER.to_string()),
+        Handoff::Busy => Face::Exit(1, BUSY.to_string()),
     }
 }
 

@@ -23,7 +23,8 @@ pub use chord::*;
 pub use command::*;
 pub use grid::*;
 pub use history::{
-    AMALGAM_CHARS, Origin, RECOVERED_FLOOR, Request, UNDO_BYTE_LIMIT, UNDO_FRAME_LIMIT,
+    AMALGAM_CHARS, Origin, PreparedRecovery, RECOVERED_FLOOR, Request, UNDO_BYTE_LIMIT,
+    UNDO_FRAME_LIMIT,
 };
 pub use keymap::*;
 pub use minibuffer::*;

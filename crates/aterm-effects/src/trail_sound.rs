@@ -3,8 +3,11 @@
 
 //! Trail sound: the aural half of the cursor effects.
 
+mod music_box_body;
+mod music_box_ii;
 mod rainbow_kitty_v2;
 
+pub use music_box_ii::MelodyII;
 pub use rainbow_kitty_v2::{MelodyV2, RainbowKittyV2Palette, TimbreStops};
 
 use rainbow_kitty_v2::{
@@ -154,6 +157,8 @@ pub enum SoundVoice {
     Felt,
     /// The music box: the rainbow kitty instrument (`docs/design/RAINBOW-KITTY-V2.md` §9-§13), the only voice whose events bypass the v1 admission chain ([`TrailSynth::push_v2`]).
     RainbowKittyV2,
+    /// The music box that plays phrases ([`MelodyII`]): a word is a figure, a phrase has one high point, the harmony holds and Enter resets nothing. Chosen by name only; the rainbow kitty look still brings [`SoundVoice::RainbowKittyV2`].
+    MusicBoxII,
 }
 
 impl SoundVoice {
@@ -161,6 +166,7 @@ impl SoundVoice {
     pub const ALL: &[SoundVoice] = &[
         SoundVoice::Style,
         SoundVoice::RainbowKittyV2,
+        SoundVoice::MusicBoxII,
         SoundVoice::Of(GlowStyle::Lumen),
         SoundVoice::Of(GlowStyle::Sparkle),
         SoundVoice::Of(GlowStyle::Comet),
@@ -180,6 +186,9 @@ impl SoundVoice {
         ("style", SoundVoice::Style),
         ("follow", SoundVoice::Style),
         ("default", SoundVoice::Style),
+        ("music box 2", SoundVoice::MusicBoxII),
+        ("music box two", SoundVoice::MusicBoxII),
+        ("phrases", SoundVoice::MusicBoxII),
         ("glass bell", SoundVoice::RainbowKittyV2),
         ("bell", SoundVoice::RainbowKittyV2),
         ("bells", SoundVoice::RainbowKittyV2),
@@ -227,6 +236,7 @@ impl SoundVoice {
         match self {
             SoundVoice::Style => "auto",
             SoundVoice::Of(GlowStyle::RainbowKitty) | SoundVoice::RainbowKittyV2 => "music box",
+            SoundVoice::MusicBoxII => "music box ii",
             SoundVoice::Of(GlowStyle::Lumen) => "warm pluck",
             SoundVoice::Of(GlowStyle::Sparkle) => "glitter",
             SoundVoice::Of(GlowStyle::Comet) => "ice chime",
@@ -328,6 +338,10 @@ pub struct EventMeta {
     pub block_lead_s: f32,
     /// Flow heat, 0..1: how far into flow state the typist is, from the glow engine's flow counter (fast keys with no delete; a delete, a Kill or a slow key resets it).
     pub flow: f32,
+    /// Which session was typed in, so each keeps its own part in [`SoundVoice::MusicBoxII`]; any number the host holds stable for a session, `0` where it has none.
+    pub session: u32,
+    /// This Enter was pressed at a shell prompt, on a line with something on it: the shell will report the command's result, which [`SoundVoice::MusicBoxII`] waits for ([`OutputGesture::Verdict`]).
+    pub prompt: bool,
 }
 
 impl Default for EventMeta {
@@ -346,7 +360,16 @@ impl EventMeta {
         pan_from: 0.0,
         block_lead_s: 0.0,
         flow: 0.0,
+        session: 0,
+        prompt: false,
     };
+
+    /// [`EventMeta::session`] for the host's 64-bit session id.
+    #[inline]
+    #[must_use]
+    pub const fn session_of(id: u64) -> u32 {
+        (id ^ (id >> 32)) as u32
+    }
 }
 
 const BLOCK_LEAD_MAX_S: f32 = 0.050;
@@ -1161,6 +1184,8 @@ struct Voice {
     lane: u8,
     born: u32,
     arm_ttl: f32,
+    /// The voice sounds through the music box's body ([`music_box_body::Body`]).
+    body: bool,
 }
 
 impl Voice {
@@ -1216,6 +1241,7 @@ impl Voice {
         lane: 0,
         born: 0,
         arm_ttl: 0.0,
+        body: false,
     };
 
     #[inline]
@@ -1318,6 +1344,9 @@ const fn bed_kick(kind: SoundKind) -> f32 {
 pub struct TrailSynth {
     #[cfg(test)]
     pub(crate) ting_unducked: bool,
+    /// Test seam: the body passes its bus through unchanged.
+    #[cfg(test)]
+    pub(crate) body_bypass: bool,
     inv_sr: f32,
     rng: u32,
     voices: [Voice; MAX_VOICES],
@@ -1358,6 +1387,8 @@ pub struct TrailSynth {
     #[cfg(test)]
     lane_births: [u32; 16],
     v2: MelodyV2,
+    ii: MelodyII,
+    body: music_box_body::Body,
     born_seq: u32,
     clock_s: f64,
     v2_latched: bool,
@@ -1400,7 +1431,7 @@ const fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
         SoundVoice::Typewriter => 0.5116,
         SoundVoice::Marimba => 0.9326,
         SoundVoice::Felt => 0.7385,
-        SoundVoice::RainbowKittyV2 => 1.0,
+        SoundVoice::RainbowKittyV2 | SoundVoice::MusicBoxII => 1.0,
         SoundVoice::Style => match style {
             GlowStyle::Lumen => 0.95,
             GlowStyle::Phaser | GlowStyle::Classic => 0.94,
@@ -1418,7 +1449,7 @@ const fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
 #[inline]
 const fn kill_swoosh_band(voice: SoundVoice, style: GlowStyle) -> (f32, f32) {
     match voice {
-        SoundVoice::RainbowKittyV2 => (1600.0, 350.0),
+        SoundVoice::RainbowKittyV2 | SoundVoice::MusicBoxII => (1600.0, 350.0),
         SoundVoice::Mech => (1000.0, 220.0),
         SoundVoice::Typewriter => (2200.0, 500.0),
         SoundVoice::Marimba => (1300.0, 300.0),
@@ -1441,6 +1472,8 @@ impl TrailSynth {
         Self {
             #[cfg(test)]
             ting_unducked: false,
+            #[cfg(test)]
+            body_bypass: false,
             inv_sr: 1.0 / sample_rate.max(8_000.0),
             rng: seed | 1,
             voices: [Voice::DEFAULT; MAX_VOICES],
@@ -1481,6 +1514,8 @@ impl TrailSynth {
             #[cfg(test)]
             lane_births: [0; 16],
             v2: MelodyV2::new(),
+            ii: MelodyII::new(seed),
+            body: music_box_body::Body::new(sample_rate.max(8_000.0)),
             born_seq: 0,
             clock_s: 0.0,
             v2_latched: false,
@@ -1516,7 +1551,8 @@ impl TrailSynth {
             && self.dc_x_l == 0.0
             && self.dc_x_r == 0.0
             && self.dc_y_l == 0.0
-            && self.dc_y_r == 0.0)
+            && self.dc_y_r == 0.0
+            && self.body.idle())
         {
             return false;
         }
@@ -1640,6 +1676,14 @@ impl TrailSynth {
         };
         if ev.gain <= 0.0 {
             return;
+        }
+        if matches!(ev.voice, SoundVoice::MusicBoxII)
+            && matches!(
+                ev.kind,
+                SoundGesture::Trail(_) | SoundGesture::Output(OutputGesture::Verdict { .. })
+            )
+        {
+            return self.push_ii(ev, meta);
         }
         if self.v2_engaged(&ev) {
             // Rain glints are muted while the riff owns the room (`sing > 0`,
@@ -2893,6 +2937,8 @@ impl TrailSynth {
         self.since_erase += dt_block;
         self.since_space_step += dt_block;
         self.since_shift += dt_block;
+        // The new music box ends a phrase by the audio's own clock, before the quiet check: a rest's answer starts in this block.
+        self.ii_elapse(dt_block);
         if self.rate > 0.0 {
             const INV_RATE_TAU: f32 = -1.0 / 0.6;
             self.rate *= crate::color_math::exp_f32(dt_block * INV_RATE_TAU);
@@ -2970,18 +3016,27 @@ impl TrailSynth {
         let dc_g = 0.5 * (1.0 + dc_r);
         let mut active_voices = [0u8; MAX_VOICES];
         let mut active_len = 0usize;
+        // The body runs while it rings or a voice of this block sounds through it; a voice starts only between blocks.
+        let mut body_on = !self.body.idle();
         let mut i = 0;
         while i < self.voices.len() {
             if self.voices[i].on {
                 active_voices[active_len] = i as u8;
                 active_len += 1;
+                body_on |= self.voices[i].body;
             }
             i += 1;
+        }
+        #[cfg(test)]
+        let body_on = body_on && !self.body_bypass;
+        if body_on {
+            self.body.begin_block(self.rate);
         }
         let mut f = 0;
         while f < frames {
             let (mut l, mut r) = (0.0f32, 0.0f32);
             let (mut xl, mut xr) = (0.0f32, 0.0f32);
+            let (mut bl, mut br) = (0.0f32, 0.0f32);
 
             let mut read_idx = 0;
             let mut write_idx = 0;
@@ -3141,7 +3196,10 @@ impl TrailSynth {
                 } else {
                     (v.gl, v.gr)
                 };
-                if v.duck_exempt {
+                if v.body {
+                    bl += y * gl;
+                    br += y * gr;
+                } else if v.duck_exempt {
                     xl += y * gl;
                     xr += y * gr;
                 } else {
@@ -3150,6 +3208,14 @@ impl TrailSynth {
                 }
             }
             active_len = write_idx;
+            if body_on {
+                let (wl, wr) = self.body.tick(bl, br);
+                l += wl;
+                r += wr;
+            } else {
+                l += bl;
+                r += br;
+            }
 
             if let Some(palette) = bed_palette {
                 self.bed.out_lvl += (bed_target - self.bed.out_lvl) * bed_slew;
@@ -3183,6 +3249,9 @@ impl TrailSynth {
             out[base] = soft_clip(yl);
             out[base + 1] = soft_clip(yr);
             f += 1;
+        }
+        if body_on {
+            self.body.end_block(frames);
         }
         if bed_target == 0.0 && self.bed.out_lvl < 1e-5 {
             self.bed.out_lvl = 0.0;
@@ -3397,7 +3466,7 @@ const fn palette_for(voice: SoundVoice, style: GlowStyle) -> PaletteKind {
         SoundVoice::Typewriter => PaletteKind::Typewriter,
         SoundVoice::Marimba => PaletteKind::Marimba,
         SoundVoice::Felt => PaletteKind::Felt,
-        SoundVoice::RainbowKittyV2 => PaletteKind::RainbowKittyV2,
+        SoundVoice::RainbowKittyV2 | SoundVoice::MusicBoxII => PaletteKind::RainbowKittyV2,
         SoundVoice::Of(s) => palette_for(SoundVoice::Style, s),
         SoundVoice::Style => match style {
             GlowStyle::Lumen => PaletteKind::Lumen,

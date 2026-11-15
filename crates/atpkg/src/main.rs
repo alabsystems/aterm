@@ -23,5 +23,28 @@ fn main() -> ExitCode {
     if let Some(code) = aterm_uds::tether::entry() {
         return code;
     }
-    atpkg::cli::main_entry(std::env::args_os().skip(1).collect())
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // This binary is a development tool. Qualify its real retained image before tests
+    // start a separately bounded admission/consumer phase; no producer override exists.
+    if args
+        .first()
+        .is_some_and(|arg| arg == "__qualify_retained_helper")
+    {
+        if args.len() != 1 {
+            return ExitCode::from(2);
+        }
+        return match aterm_uds::tether::prepared_executable_within(
+            aterm_uds::deadline::FIRST_EXEC_HANG,
+        ) {
+            Ok(Some(_)) => {
+                println!("retained helper prepared");
+                ExitCode::SUCCESS
+            }
+            result => {
+                eprintln!("retained helper qualification failed: {result:?}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    atpkg::cli::main_entry(args)
 }

@@ -289,6 +289,7 @@ pub fn bundle_json(b: &Bundle) -> Jv {
                                                     super::view::cpu_accounting_json(
                                                         &worker.cpu_accounting,
                                                         "macOS",
+                                                        None,
                                                     ),
                                                 ),
                                             ])
@@ -365,7 +366,11 @@ pub fn current_report_json(s: &Snapshot) -> Jv {
                             ),
                             (
                                 "cpu_accounting",
-                                super::view::cpu_accounting_json(&p.cpu_accounting, "macOS"),
+                                super::view::cpu_accounting_json(
+                                    &p.cpu_accounting,
+                                    "macOS",
+                                    super::view::stalled_lane(s, "reaping"),
+                                ),
                             ),
                         ])
                     })
@@ -379,7 +384,10 @@ pub fn current_report_json(s: &Snapshot) -> Jv {
         ),
         (
             "process_window_ns",
-            Jv::known_or(s.procs_window_ns, "not_sampled"),
+            s.procs_window_ns.map_or_else(
+                || super::view::unknown_json(s, "procs", "not_sampled"),
+                Jv::u,
+            ),
         ),
         (
             "kernel_counters",

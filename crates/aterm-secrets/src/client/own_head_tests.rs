@@ -295,11 +295,11 @@ fn an_approval_lost_at_the_heal_comes_back_after_the_other_side_mirrored_it_away
     let _ = sync_with_candidates(&mx, None, &urls);
     assert_eq!(load_state(&mx).unwrap().membership, Stored::In);
     assert_eq!(
-        std::fs::read(mx.home.join(".secrets/other-key")).unwrap(),
+        crate::client::stored(&mx, "other-key").unwrap(),
         b"v3-from-higher-seq"
     );
     assert_eq!(
-        std::fs::read(mx.home.join(".secrets/after-heal")).unwrap(),
+        crate::client::stored(&mx, "after-heal").unwrap(),
         b"from-st2"
     );
 

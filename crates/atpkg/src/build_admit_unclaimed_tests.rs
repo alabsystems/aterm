@@ -33,7 +33,11 @@ fn unclaimed_observation_actor_if_requested() {
     let world = PathBuf::from(world);
     aterm_uds::tether::image_cache_for_tests(world.join("helper-images")).unwrap();
     aterm_uds::tether::through(aterm_tempfile::bin_exe("atpkg-status-fixture"));
-    assert!(aterm_uds::tether::prepared_executable().unwrap().is_some());
+    assert!(
+        aterm_uds::tether::prepared_executable_within(aterm_uds::deadline::FIRST_EXEC_HANG)
+            .unwrap()
+            .is_some()
+    );
 
     for case in ["healthy", "prebirth", "postbirth"] {
         let root = world.join(case);

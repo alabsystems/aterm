@@ -279,7 +279,17 @@ fn states_and_origins_are_closed_words() {
     assert!(TaskState::Stalled.is_terminal());
 
     assert!(valid_from("ctl") && valid_from(SID) && valid_from("s-ab"));
+    assert!(
+        valid_from("tqn5r6e0148") && valid_from("t0000000000"),
+        "a t tab"
+    );
     for bad in [
+        "t",
+        "t000000000",
+        "t00000000000",
+        "T0000000000",
+        "tqn5r6e014u",
+        "@tqn5r6e0148",
         "",
         "s-",
         "s-xyz",
@@ -572,6 +582,7 @@ fn a_carried_record_keeps_only_the_time_it_was_awake() {
         fact: None,
         program_block: None,
         fact_rev: 0,
+        line: None,
     };
     let row = record.carry_row(t0 + Duration::from_secs(66));
     assert!(row.contains(" age_ms=60000 ran_ms=66000"), "{row}");
@@ -639,6 +650,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         fact: None,
         program_block: None,
         fact_rev: 0,
+        line: None,
     };
     let carried = t0 + Duration::from_secs(5);
     let row = record.carry_row(carried);
@@ -810,6 +822,7 @@ fn the_reply_event_and_status_spellings() {
         fact: None,
         program_block: None,
         fact_rev: 0,
+        line: None,
     };
     let fields = record.wire_fields();
     assert!(
@@ -2020,6 +2033,7 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         fact: hold_room(2),
         program_block: None,
         fact_rev: 3,
+        line: None,
     };
     let row = record.carry_row(t0);
     assert_eq!(
@@ -2804,7 +2818,7 @@ fn the_wire_says_how_a_task_ended() {
 /// types nothing more. NEGATIVE CONTROL: a word no ending names is refused.
 #[test]
 fn every_ending_the_supervisor_marks_is_a_word_the_record_takes() {
-    use aterm_agent::supervise::policy::turn_end::GaveUp;
+    use alab_policy::words::GaveUp;
     for ending in GaveUp::ALL {
         let word = ending.word();
         assert!(TASK_WHY.contains(&word), "{word}");
@@ -2984,7 +2998,7 @@ fn a_worker_with_its_own_report_is_told_by_its_folder() {
 fn autopilot_off_fails_a_working_task_and_the_switch_back_opens_it() {
     use crate::session_timeline::AutopilotSetBy;
     const LATER: u64 = 60_000;
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let t0 = Instant::now();
     let by = |actor, since_ms| AutopilotSetBy {
         actor,
@@ -3108,7 +3122,7 @@ fn autopilot_off_fails_a_working_task_and_the_switch_back_opens_it() {
 #[test]
 fn an_off_fails_a_task_only_once_it_has_stood() {
     use crate::session_timeline::AutopilotSetBy;
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let set = AutopilotSetBy {
         actor: aterm_slog::Actor::Human,
         surface: None,
@@ -3147,7 +3161,7 @@ fn an_off_fails_a_task_only_once_it_has_stood() {
 /// the window owes the Off finds nothing to fail once the word moved on.
 #[test]
 fn a_click_through_off_leaves_a_working_task_working() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let mut app = crate::App::headless_for_test();
     let local = app
         .focused_session_id(crate::WindowId(0))
@@ -3235,6 +3249,10 @@ fn a_failed_task_reads_its_result_and_a_turn_opens_it() {
 #[test]
 fn a_record_never_names_a_result_file_that_is_gone() {
     let tasks = tasks_dir().expect("the test binary's state root");
+    // The folder stands before any road is asked: tests in this binary share it, and one that
+    // makes it between `result_stands`'s open and its look at the path reads "could not be
+    // checked", which rightly keeps the name.
+    std::fs::create_dir_all(&tasks).expect("the tasks folder");
     let row = |path: &Path| {
         format!(
             "rev=4 state=done from=ctl since=1789000000000 result_bytes=605 attention=0 \
@@ -3423,4 +3441,140 @@ fn a_result_that_could_not_be_checked_stays_named() {
         "CONTROL: a result that is gone"
     );
     std::fs::remove_file(&sidecar).expect("removed");
+}
+
+/// A TASK'S FIRST LINE RIDES EVERY ROW AND AN OLDER ROW READS NONE (tracker ST-02): the record's
+/// `line=` crosses a seamless update's carry row and a layout's (its face), so a restored tab is
+/// named by it once its task file is gone. A row from an older writer has none and the record
+/// stands. A line a hand wrote reads as the one bounded line it would have been, and never
+/// refuses the record; a second `line=` refuses the row, as any repeated key does. The line is the
+/// first of the task's that draws something, kept literal, with a credential redacted.
+#[test]
+fn a_task_line_rides_every_row_and_an_older_row_reads_none() {
+    use crate::session_timeline::SessionTimeline;
+    let now = Instant::now();
+    let mut timeline = SessionTimeline::default();
+    timeline.mark_task(&TaskMark::new(TaskState::Working), &Asks::default(), now, 1);
+    timeline.set_task_worker(aterm_phase::Program::Claude, None);
+    timeline.set_task_line(task_line(
+        b"\n  Fix the flaky title test\nthen run verify\n",
+    ));
+    let record = timeline.task().expect("a record").clone();
+    assert_eq!(record.line.as_deref(), Some("Fix the flaky title test"));
+    let row = record.carry_row(now);
+    assert!(
+        row.contains(" line=Fix%20the%20flaky%20title%20test"),
+        "{row}"
+    );
+    let back = |row: &str| TaskRecord::from_carry_row(row, None, now, 1).expect("reads");
+    assert_eq!(back(&row).line, record.line, "a seamless update's row");
+    assert_eq!(
+        back(&TaskRecord::carry_face(&row)).line,
+        record.line,
+        "a layout's row"
+    );
+
+    let older = row
+        .split_whitespace()
+        .filter(|word| !word.starts_with("line="))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        back(&older),
+        TaskRecord {
+            line: None,
+            ..back(&row)
+        },
+        "an older writer's row: the record stands, with no line"
+    );
+
+    assert_eq!(
+        back(&format!("{older} line=%0A%0Aa%0Ab")).line.as_deref(),
+        Some("a"),
+        "a line of several reads as its first"
+    );
+    assert_eq!(back(&format!("{older} line=%20%0A%09")).line, None);
+    let long = back(&format!("{older} line={}", "x".repeat(10_000)))
+        .line
+        .expect("a line");
+    assert_eq!(long, "x".repeat(TASK_LINE_MAX), "cut to the bound");
+    let wide = back(&format!(
+        "{older} line={}",
+        crate::control::pct_encode(&"\u{e9}".repeat(1_000))
+    ))
+    .line
+    .expect("a line");
+    assert!(
+        aterm_codec::pct::encoded_len(&wide) <= TASK_LINE_MAX
+            && wide.chars().count() == TASK_LINE_MAX / 6,
+        "the bound is on the encoded bytes, and a cut keeps whole characters: {wide}"
+    );
+    assert_eq!(
+        TaskRecord::from_carry_row(&format!("{row} line=b"), None, now, 1),
+        None,
+        "a repeated key refuses the row"
+    );
+
+    assert_eq!(
+        task_line("\u{200b}\n# Kept as written\n".as_bytes()).as_deref(),
+        Some("# Kept as written"),
+        "a line that draws nothing is passed over, and the line is literal"
+    );
+    assert_eq!(task_line(b" \n\t\n"), None);
+    assert_eq!(task_line(b""), None);
+    let token = "ab12".repeat(16);
+    assert_eq!(
+        task_line(format!("push with {token}").as_bytes()).as_deref(),
+        Some("push with [redacted]")
+    );
+}
+
+/// A TASK LINE IS REDACTED AS ITS TITLE SHOWS IT (tracker ST-02): a character no title shows
+/// (a soft hyphen or a zero-width space a paste brought, a tab) is dropped before the redactor
+/// judges the line, so it cannot split a credential the title would show joined. Only what the
+/// title can show is judged for a sensitive phrase, so a long paragraph that names a password
+/// past the bound keeps its first words as the title, and a line the redactor replaces whole
+/// gives no line rather than its placeholder. A line cut inside a word reads back as itself.
+#[test]
+fn a_task_line_is_redacted_as_its_title_shows_it() {
+    let token = format!("ghp_{}", "Ab3d".repeat(9));
+    for hidden in ['\u{00ad}', '\u{200b}', '\u{2060}', '\t'] {
+        let (head, tail) = token.split_at(14);
+        let line = task_line(format!("push with {head}{hidden}{tail}").as_bytes()).expect("a line");
+        assert!(!line.contains(&token), "{hidden:?}: {line}");
+        assert!(
+            hidden.is_whitespace() || line == "push with [redacted]",
+            "{hidden:?}: {line}"
+        );
+    }
+    assert_eq!(
+        task_line(b"Fix\tthe title").as_deref(),
+        Some("Fix the title"),
+        "a blank hidden character reads as a space"
+    );
+
+    let paragraph = format!(
+        "Fix the flaky title test {} then rotate the password",
+        "and check it again ".repeat(20)
+    );
+    let line = task_line(paragraph.as_bytes()).expect("a line");
+    assert!(
+        line.starts_with("Fix the flaky title test and check"),
+        "a phrase past what the title shows does not replace it: {line}"
+    );
+    assert_eq!(
+        task_line(b"rotate the password: hunter2 now"),
+        None,
+        "a line the redactor replaces whole gives no line"
+    );
+
+    // 216 encoded bytes (a space encodes as three), then a 40-character word the `.rs` after it
+    // keeps whole for the redactor: the cut at the bound drops `.rs` and leaves the bare word.
+    let word = format!("{}q9", "a1".repeat(19));
+    let cut = task_line(format!("abc {}{word}.rs", "word ".repeat(30)).as_bytes()).expect("a line");
+    assert_eq!(
+        task_line(cut.as_bytes()).as_deref(),
+        Some(cut.as_str()),
+        "a line cut inside a word reads back as itself"
+    );
 }

@@ -14,7 +14,6 @@ struct Waiting(Child);
 
 impl Waiting {
     fn start() -> Self {
-        use std::os::windows::process::CommandExt as _;
         let mut cmd = aterm_uds::spawnfd::command("cmd.exe");
         cmd.args(["/D", "/C"])
             .raw_arg("set /p held=")
@@ -173,6 +172,21 @@ fn a_held_child_is_described_from_the_kernel() {
 fn no_process_has_a_group_or_a_terminal() {
     let me = std::process::id();
     assert_eq!(ids(me), None, "Windows has no process group");
-    assert_eq!(super::live_terminal(me), None);
+    assert_eq!(
+        super::live_terminal_read(me),
+        super::TerminalRead::Read(None),
+        "the observed current process has no controlling terminal"
+    );
     assert_eq!(super::opener(me, parent_of(me).unwrap_or(0)), None);
+}
+
+#[test]
+fn unobserved_process_terminal_remains_unread() {
+    for pid in [0, u32::MAX] {
+        assert_eq!(
+            super::live_terminal_read(pid),
+            super::TerminalRead::Unread,
+            "an unobservable process must not be classified as an observed terminal owner"
+        );
+    }
 }

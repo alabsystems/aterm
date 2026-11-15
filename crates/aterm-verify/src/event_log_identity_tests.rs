@@ -282,7 +282,7 @@ fn a_bounded_descriptor_and_oversized_diagnostic_remain_an_unknown_observation()
         crate::EnvSnapshot::default(),
         std::path::PathBuf::from("/fixture/scratch"),
     )
-    .with_checks(&vec![crate::Check::Doc; 1000]);
+    .with_checks(&vec![crate::Check::Test; 1000]);
     let mut log = EventLog::unrecorded();
     log.bind(Context::captured(&ctx));
     let prepared = log.prepare(&row(&"\0\\\"界".repeat(20_000)));

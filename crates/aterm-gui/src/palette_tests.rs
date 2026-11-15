@@ -267,7 +267,6 @@ fn the_agents_rows_resolve_from_their_live_bits() {
     }
     for a in [
         MenuAction::ReadThisMac,
-        MenuAction::SummarizeFleet,
         MenuAction::FabricStatus,
         MenuAction::FabricOn,
         MenuAction::FabricOff,
@@ -276,14 +275,15 @@ fn the_agents_rows_resolve_from_their_live_bits() {
     }
     assert_eq!(
         row(&s, MenuAction::SummarizeFleet).label,
-        crate::menu::summarize_title(false)
+        crate::menu::summarize_title(None)
     );
+    assert!(!row(&s, MenuAction::SummarizeFleet).enabled);
     s.resolve(&PaletteLive {
         terminal_front: true,
         can_rename: true,
         agents: crate::menu::AgentsLive {
             needs_local: true,
-            in_fleet: true,
+            in_fleet: Some(true),
             any_window: true,
             summarize_block: Some("(claude not found)".to_string()),
         },
@@ -306,7 +306,7 @@ fn the_agents_rows_resolve_from_their_live_bits() {
     );
     assert_eq!(
         row(&s, MenuAction::SummarizeFleet).label,
-        crate::menu::summarize_title(true)
+        crate::menu::summarize_title(Some(true))
     );
 }
 

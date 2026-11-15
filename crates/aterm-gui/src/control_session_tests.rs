@@ -515,8 +515,8 @@ fn await_agent_words_take_walls_and_refuse_typos() {
             AgentWord::Verdict("unknown"),
         ]
     );
-    let overloaded = aterm_phase::WallKind::Overloaded.wire();
-    let session = aterm_phase::WallKind::UsageSession.wire();
+    let overloaded = alab_policy::vocab::WallKind::Overloaded.wire();
+    let session = alab_policy::vocab::WallKind::UsageSession.wire();
     assert!(words[1].matches(overloaded));
     assert!(words[2].matches(session));
     assert!(!words[2].matches(overloaded));
@@ -1258,7 +1258,7 @@ fn a_second_ask_under_a_standing_one_wakes_await_task() {
             .and_then(|row| row.rsplit_once(" task_news="))
             .map(|(_, bit)| bit.to_string())
     };
-    let first = "set attention owner=needs kind=ask claude needs you: a release credential";
+    let first = "set attention owner=needs kind=ask claude needs you: a release approval";
     let again = "set attention owner=needs kind=ask claude needs you: the org admin role";
     let the_box = "set attention owner=supervisor box: Allow this command?";
     assert_eq!(meta(first), "OK\n");
@@ -1711,7 +1711,7 @@ fn await_task_latches_news_that_comes_and_goes() {
 /// holder's claim unproven prints `-`, as nothing admits it yet.
 #[test]
 fn a_proven_self_claim_prints_its_sessions_word_before_the_sweep_names_it() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let me = std::process::id();
     let line = |h: &SessionHandle| {
         sessions_lines(
@@ -1944,7 +1944,7 @@ fn the_roster_carries_the_published_program_and_agent_verdict() {
         .unwrap();
     assert!(human.parse::<u64>().is_ok(), "{line}");
     assert_roster_fields(line, &unclaimed_fields);
-    let cruise = crate::autopilot::HarnessPosture::On(aterm_agent::supervise::Autopilot::Cruise);
+    let cruise = crate::autopilot::HarnessPosture::On(alab_policy::config::Autopilot::Cruise);
     let autopilot = |posture| {
         let out = sessions_lines(std::slice::from_ref(&h), Ok(&[]), posture, |_| false);
         out.lines()
@@ -3085,4 +3085,21 @@ fn cast_drift_slots_cap_the_concurrent_folds() {
     assert!(SLOTS.acquire(short).is_none(), "every slot is taken");
     drop(held);
     assert!(SLOTS.acquire(short).is_some(), "released slots are free");
+}
+
+#[test]
+fn agent_settings_preserve_native_submission_refusals_and_skips() {
+    for reply in [
+        "ERR busy lease=other\n",
+        "ERR halted reason=taken-over\n",
+        "OK 0 turn skipped reason=changed submitted=0\n",
+    ] {
+        assert_eq!(agent_settings_reply(reply.into()), reply);
+    }
+    let reply = agent_settings_reply("OK turn submitted=1 status=submitted\nscreen\n".into());
+    assert_eq!(
+        reply,
+        "OK turn submitted=1 status=submitted settings_scope=subsequent-turns confirmation=pending\nscreen\n"
+    );
+    assert!(!reply.contains("applied"));
 }

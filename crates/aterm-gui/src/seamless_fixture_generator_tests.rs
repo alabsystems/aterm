@@ -442,6 +442,7 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         questions: None,
         autopilot: None,
         land_at: None,
+        pinned: false,
         control: None,
         frozen_path: false,
         topics: Vec::new(),
@@ -514,6 +515,7 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         autopilot: None,
         land_at: None,
         autopilot_by: None,
+        pinned: false,
         agent: None,
         supervised: None,
         lost: None,
@@ -571,6 +573,7 @@ fn fx_capture_leaves(desk: &mut FxDesk) {
         leaf.questions = record.questions;
         leaf.autopilot = record.autopilot;
         leaf.land_at = record.land_at;
+        leaf.pinned = record.pinned;
     };
     for window in &mut desk.layout.windows {
         for tab in &mut window.restored_tabs {
@@ -2675,6 +2678,7 @@ fn fx_twelve_pane_desk() -> FxDesk {
     sessions[3].record.user_title = Some("build".to_string());
     sessions[3].record.role = Some("worker".to_string());
     sessions[7].record.description = Some("release notes".to_string());
+    sessions[5].record.pinned = true;
     let v = SplitKind::Vertical;
     let h = SplitKind::Horizontal;
     let leaf = |id: u64, title: &str| fx_leaf(id, title, Some("/home/dev/src/aterm"));
@@ -3481,7 +3485,7 @@ fn fx_mailbox() -> FxMailbox {
         let ctx = h.ctx.clone();
         store.write().unwrap().register(h);
         let forever = format!(
-            "to=@s-peer kind=note dl={} the release notes are in docs/RELEASE.md",
+            "to=@tpeer000000 kind=note dl={} the release notes are in docs/RELEASE.md",
             u64::MAX
         );
         assert_eq!(cmd_post(&ctx, &forever, None), "OK 1\n");
@@ -3507,7 +3511,7 @@ fn fx_mailbox() -> FxMailbox {
         let ask = |off: u64, text: &str| {
             cmd_deliver(
                 &store,
-                &format!("{sid} off={off} from=s-peer@n-lab kind=ask trust=agent text={text}"),
+                &format!("{sid} off={off} from=tpeer000000@n-lab kind=ask trust=agent text={text}"),
             )
         };
         assert!(link("aa".repeat(16)).starts_with("OK"));
@@ -3534,7 +3538,7 @@ fn fx_mailbox() -> FxMailbox {
         assert_eq!(
             cmd_post(
                 &ctx,
-                "to=@s-peer kind=answer re=10 dl=600000 via=h-andrew key=build-42 tagged \
+                "to=@tpeer000000 kind=answer re=10 dl=600000 via=h-andrew key=build-42 tagged \
                  v0.108.0",
                 None,
             ),
@@ -3550,7 +3554,7 @@ fn fx_mailbox() -> FxMailbox {
             let reply = cmd_deliver(
                 &store,
                 &format!(
-                    "{sid} off={} from=s-ci@n-runner{n} kind=note trust=agent topic=builds \
+                    "{sid} off={} from=tc100000000@n-runner{n} kind=note trust=agent topic=builds \
                      text=passed",
                     20 + n
                 ),
@@ -4960,6 +4964,25 @@ fn generate_handoff_fixtures() {
     if !fx_generator_in_child("ATERM_HANDOFF_FIXTURE_OUT") {
         return;
     }
+    // The desks hold whole terminals by value, a score in `fx_engine_state_desk` alone, and a
+    // build that inlines their helpers into one frame overflows libtest's 2 MiB thread: verify's
+    // non-incremental build gave that function a 1.09 MB frame (29 KB in an incremental one).
+    // The thread takes the test's name, which `test_alone::in_child` reads as the child's.
+    std::thread::Builder::new()
+        .name(
+            std::thread::current()
+                .name()
+                .expect("libtest names the test's thread")
+                .to_owned(),
+        )
+        .stack_size(16 << 20)
+        .spawn(write_handoff_fixtures)
+        .expect("the generator's thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn write_handoff_fixtures() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _restore = restore_env();
     fx_install_release_stamp();

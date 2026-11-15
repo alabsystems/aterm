@@ -662,7 +662,10 @@ fn a_fact_that_would_not_fit_leaves_the_prompt_alone_and_stays_untold() {
     let ran = Run::new(
         "facts-unfit",
         SupervisorConfig {
-            continue_text: long.clone(),
+            turn_end: alab_policy::config::PolicyConfig {
+                continue_text: long.clone(),
+                ..keyed(Occupancy::Off, true).turn_end.clone()
+            },
             ..keyed(Occupancy::Off, true)
         },
         &[(0, Step::End), (60, Step::Break)],
@@ -1252,7 +1255,7 @@ fn an_overlap_rides_a_continuation_and_never_a_break_line() {
         "CONTROL: an answer asks none"
     );
     let carry = TurnEndAction::Type {
-        text: opts.policy.continue_text.clone(),
+        text: opts.policy.turn_end.continue_text.clone(),
         rule_id: RULE_CONTINUE,
     };
     assert_eq!(

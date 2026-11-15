@@ -39,6 +39,7 @@ fn line() -> Procs {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        start: 0,
         charged: 0,
         footprint: 0,
         written: 0,
@@ -97,7 +98,7 @@ fn retained_custody_never_covers_or_skips_a_reused_holders_line() {
     assert!(!covered_memory(300, &[&retained], Some(&procs)));
     assert!(!covered_memory(100, &[&retained], Some(&procs)));
     assert_eq!(
-        crate::admit::counted(vec![&retained], 300, Some(&procs), None).len(),
+        crate::tests::counted_by(vec![&retained], 300, Some(&procs), None).len(),
         1
     );
 }
@@ -113,6 +114,7 @@ fn a_held_claim_covers_and_frees_what_it_credits() {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        start: 0,
         charged: 0,
         footprint: 0,
         written: 0,
@@ -139,7 +141,7 @@ fn a_held_claim_covers_and_frees_what_it_credits() {
     let mut vm = record(200, Need::new("lab vm boot").mem(8 * GIB), true);
     vm.credit = vec![500];
     assert!(!covered(&vm, 510), "a VM's claim covers nothing");
-    let held_to = |r: &Record| crate::admit::counted(vec![r], 510, Some(&procs), None).len();
+    let held_to = |r: &Record| crate::tests::counted_by(vec![r], 510, Some(&procs), None).len();
     assert_eq!(held_to(&kept), 0, "a waiter under a credited process");
     assert_eq!(held_to(&uncredited), 1, "uncredited, it waits on the claim");
     let mut waiting = kept.clone();
@@ -206,6 +208,7 @@ fn the_cover_marker_reads_its_holders_claims_and_the_ledger_answers_without_it()
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        start: 0,
         charged: 0,
         footprint: 0,
         written: 0,
@@ -261,6 +264,7 @@ fn the_cover_marker_reads_its_holders_claims_alone() {
         Proc {
             pid: build,
             ppid: me,
+            start: 0,
             charged: 0,
             footprint: 0,
             written: 0,
@@ -270,6 +274,7 @@ fn the_cover_marker_reads_its_holders_claims_alone() {
         Proc {
             pid: me,
             ppid: 1,
+            start: 0,
             charged: 0,
             footprint: 0,
             written: 0,
@@ -317,6 +322,7 @@ fn a_marker_names_one_claim_of_its_holder() {
         Proc {
             pid: build,
             ppid: me,
+            start: 0,
             charged: 0,
             footprint: 0,
             written: 0,
@@ -326,6 +332,7 @@ fn a_marker_names_one_claim_of_its_holder() {
         Proc {
             pid: me,
             ppid: 1,
+            start: 0,
             charged: 0,
             footprint: 0,
             written: 0,
@@ -408,6 +415,7 @@ fn a_disk_claim_covers_only_the_run_its_marker_names() {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        start: 0,
         charged: 0,
         footprint: 0,
         written: 0,

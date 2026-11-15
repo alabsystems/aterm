@@ -235,7 +235,7 @@ fn classify_is_aterm_phases_verdict_or_its_background_rest() {
         );
         let want = if verdict.phase_authoritative {
             aterm_phase::background_rest(screen)
-                .filter(|_| verdict.phase == aterm_phase::Phase::Busy)
+                .filter(|_| verdict.phase == alab_policy::vocab::Phase::Busy)
                 .unwrap_or(verdict.phase)
                 .name()
         } else {
@@ -293,7 +293,7 @@ fn a_turn_over_under_its_own_background_work_publishes_its_rest() {
     assert!(caret.is_some(), "the composer's row");
     assert_eq!(
         aterm_phase::read(Some("claude"), &workflows, None).phase,
-        aterm_phase::Phase::Busy,
+        alab_policy::vocab::Phase::Busy,
         "the reader's phase stays busy for the supervisor's break"
     );
     assert_eq!(word(&workflows, caret), "idle", "captured 2.1.310 screen");
@@ -364,11 +364,11 @@ fn a_rest_is_published_only_where_the_reader_would_vouch_for_it() {
     let panel = screen(AGENTS_PANEL_AGENT_SELECTED_2_1_304);
     assert_eq!(
         aterm_phase::read(Some("claude"), &panel, None).phase,
-        aterm_phase::Phase::Busy
+        alab_policy::vocab::Phase::Busy
     );
     assert_eq!(
         aterm_phase::background_rest(&panel),
-        Some(aterm_phase::Phase::Idle),
+        Some(alab_policy::vocab::Phase::Idle),
         "its turn is over under a background agent"
     );
     let selected = panel
@@ -467,7 +467,7 @@ fn the_live_2_1_316_sessions_rest_publishes_idle_and_its_live_turn_busy() {
     let rest = screen(WAITING_AGENTS_WORKFLOWS_2_1_316);
     assert_eq!(
         aterm_phase::read(Some("claude"), &rest, Some(2)).phase,
-        aterm_phase::Phase::Busy,
+        alab_policy::vocab::Phase::Busy,
         "the reader's phase stays busy for the supervisor's break"
     );
     assert_eq!(word(&rest, Some(47)), "idle", "the captured cursor");
@@ -548,7 +548,7 @@ fn a_shell_pill_under_a_running_title_publishes_no_rest() {
     *footer = footer.replace("(shift+tab to cycle)", "(shift+tab to cycle) · 2 shells");
     assert_eq!(
         aterm_phase::ClaudeReader.background_rest(&shells),
-        Some(aterm_phase::Phase::Idle),
+        Some(alab_policy::vocab::Phase::Idle),
         "the screen alone: a turn over under a shell"
     );
     let caret = shells.iter().rposition(|r| r.starts_with('❯'));
@@ -972,7 +972,7 @@ fn the_memory_banner_publishes_wall_memory_under_a_busy_spinner() {
     );
     assert_eq!(v.word(), "wall:memory");
     assert_eq!(v.detail(), None);
-    assert!(!aterm_phase::WallKind::Memory.reads_limited());
+    assert!(!alab_policy::vocab::WallKind::Memory.reads_limited());
     let quoted = screen("", &banner);
     assert_eq!(
         agent_verdict(
@@ -1053,10 +1053,10 @@ fn the_prompt_subject_comes_from_the_reading() {
 
 #[test]
 fn an_api_wall_says_its_cause() {
+    use alab_policy::vocab::{ApiCause, WallKind};
     use aterm_phase::prompt::fixtures::{
         API_ERROR_529, API_ERROR_ENOTFOUND, API_ERROR_SLEEP, screen,
     };
-    use aterm_phase::{ApiCause, WallKind};
     let wall = |cause| AgentPhase::Wall {
         kind: WallKind::ApiError {
             code: None,
@@ -1129,7 +1129,7 @@ fn retry_plan_clock_handles_the_entire_timestamp_range() {
 fn retry_plan_ordering_survives_extreme_timestamp_differences() {
     let agent = AgentReading {
         phase: AgentPhase::Wall {
-            kind: aterm_phase::WallKind::Overloaded,
+            kind: alab_policy::vocab::WallKind::Overloaded,
             reset: None,
             until: None,
         },
@@ -1154,7 +1154,7 @@ fn retry_plan_ordering_survives_extreme_timestamp_differences() {
 
 #[test]
 fn a_retry_plan_is_laid_on_an_api_wall_and_nothing_else() {
-    use aterm_phase::{ApiCause, WallKind};
+    use alab_policy::vocab::{ApiCause, WallKind};
     const NOW_UNIX: i64 = 1_789_660_500;
     const PDT: i64 = -7 * 3600;
     let now = t0();
@@ -1507,7 +1507,7 @@ fn detail_of(rows: &[String]) -> Option<String> {
 
 #[test]
 fn a_bash_verdict_is_read_only_only_when_every_reading_is() {
-    use aterm_agent::supervise::classify::classify_command;
+    use alab_policy::classify::classify_command;
     let all_read_only = |rows: &[String]| {
         let p = aterm_phase::parse_prompt_v2(rows).expect("a box");
         let readings = p.readings();
@@ -1549,7 +1549,7 @@ fn a_bash_verdict_is_read_only_only_when_every_reading_is() {
 
 #[test]
 fn a_bash_verdict_is_the_read_only_rules_on_the_command_as_drawn() {
-    use aterm_agent::supervise::classify::classify_command;
+    use alab_policy::classify::classify_command;
     use aterm_agent::supervise::policy::approval::readings_read_only;
     use aterm_phase::prompt::fixtures::{
         BOX_BASH_AWK_MULTI_LINE_2_1_308, BOX_BASH_FIND_CONTINUED_2_1_308, screen,
@@ -1595,7 +1595,7 @@ fn a_bash_verdict_reads_the_default_python_allowlist() {
 
 #[test]
 fn a_bash_verdict_refuses_a_secret_and_a_proof_gap() {
-    use aterm_agent::supervise::classify::classify_command;
+    use alab_policy::classify::classify_command;
     for line in ["cat ~/.ssh/id_rsa", "FOO=1 cat README.md"] {
         assert!(classify_command(line).read_only, "{line}");
         assert_eq!(
@@ -1625,8 +1625,9 @@ fn a_bash_verdict_refuses_a_secret_and_a_proof_gap() {
 /// CONTROL: a shell showing those frames runs no agent.
 #[test]
 fn grok_and_kimi_tabs_publish_the_phase_and_walls_their_screens_decide() {
+    use alab_policy::vocab::WallKind;
     use aterm_phase::prompt::fixtures::screen;
-    use aterm_phase::{WallKind, grok, kimi};
+    use aterm_phase::{grok, kimi};
     let verdict = |program: &str, text: &str| {
         agent_verdict(
             Some(program),

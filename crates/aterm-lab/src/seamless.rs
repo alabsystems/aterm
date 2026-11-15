@@ -1516,7 +1516,7 @@ fn bridge_holds(state: &Path, sid: &str, topic: &str) -> bool {
         .any(|l| l.split(' ').next() == Some(topic))
 }
 
-/// THE GAP, AS THE RING SAID IT (T22): two slow readers of the successor, the lab's own `subscribe @<a> events` client and the bridge, each stopped (`SIGSTOP`, by its pid) while `a`'s log rolls past where they read, then let go (`SIGCONT`): each must be told `GAP <local> events-dropped=<n>`. The bridge says so on the bus (`ev gap …`, found in the broker's log) and reads the session's topics again: one added while it was stopped reaches the inbox after.
+/// THE GAP, AS THE RING SAID IT (T22): two slow readers of the successor, the lab's own `subscribe @<a> events` client and the bridge, each stopped (`SIGSTOP`, by its pid) while `a`'s log rolls past where they read, then let go (`SIGCONT`): each must be told `GAP <local> events-dropped=<n>`. The bridge says so on the bus (`ev gap <local> …`, read through the broker after the leg began, [`crate::bus::Fabric::ev_reader`]: its log is sealed at rest) and reads the session's topics again: one added while it was stopped reaches the inbox after.
 #[allow(clippy::too_many_lines)]
 fn slow_readers(
     desk: &Desk,
@@ -1529,14 +1529,11 @@ fn slow_readers(
     let at_a = format!("@{a}");
     let watch_pid = i32::try_from(events.child.id()).unwrap_or(0);
     let bridge = bridge_pid(&fabric.state).filter(|p| crate::sys::alive(*p));
-    let broker_log = fabric.state.parent().map(|d| d.join("b.log"));
-    let said_gaps = || {
-        broker_log
-            .as_ref()
-            .and_then(|p| crate::util::read_regular_file(p).ok())
-            .map_or(0, |bytes| count_of(&bytes, b"events-dropped="))
-    };
-    let gaps_before = said_gaps();
+    // The bus is read on one connection: what it holds before the leg is read here and passed
+    // over, so only a gap record the bridge publishes after this counts.
+    let mut bus = fabric
+        .ev_reader()
+        .and_then(|mut reader| reader.read().map(|_| reader));
     if events.ended().is_some() || watch_pid <= 1 {
         return Ok((
             Verdict::Fail(format!(
@@ -1637,15 +1634,28 @@ fn slow_readers(
         GAP_TOPIC,
         "the bridge, let go, read the topic added while it was stopped",
     )?;
-    let gaps_after = said_gaps();
+    // The bridge publishes its `ev gap …` as it reads the GAP, before it reads the session's
+    // topics again; the wait for it on the bus is a hang detector, and a bus that cannot be read
+    // ends it at once.
+    let on_bus = until(HANG, || {
+        let read = match bus.as_mut() {
+            Ok(reader) => reader.read(),
+            Err(why) => Err(why.clone()),
+        };
+        gap_step(read, local_a)
+    })?
+    .unwrap_or(Ok(0));
+    let told = matches!(&on_bus, Ok(n) if *n > 0);
+    let counts = gaps_text(&on_bus);
+    let local = local_a.unwrap_or("?");
     let same = bridge_pid(&fabric.state) == Some(bridge) && crate::sys::alive(bridge);
-    let gap_topics = match (held, delivered, gaps_after > gaps_before, same) {
+    let gap_topics = match (held, delivered, told, same) {
         (Some(()), Verdict::Pass(said), true, true) => Verdict::Pass(format!(
-            "bridge {bridge} said events-dropped= on the bus ({gaps_before} -> {gaps_after} in the broker's log); {said} (topic add: {})",
+            "bridge {bridge} said gap {local} events-dropped= on the bus (its gap records for local {local} read through the broker since the leg began: {counts}); {said} (topic add: {})",
             added.first()
         )),
         (held, delivered, told, same) => Verdict::Fail(format!(
-            "bridge {bridge}: topic held {}, the bus told of a gap {told} ({gaps_before} -> {gaps_after}), the same bridge runs {same}; {} (topic add: {})",
+            "bridge {bridge}: topic held {}, the bus told of a gap for local {local} {told} ({counts} since the leg began), the same bridge runs {same}; {} (topic add: {})",
             held.is_some(),
             delivered.said(),
             added.first()
@@ -1654,11 +1664,47 @@ fn slow_readers(
     Ok((gap, gap_topics))
 }
 
-fn count_of(hay: &[u8], needle: &[u8]) -> usize {
-    if needle.is_empty() {
-        return 0;
+/// How many gaps the bridge told the bus of for the session at `local`: its `ev` records
+/// `gap <local> events-dropped=<n>`, the endpoint's `GAP <local> events-dropped=<n>` as the
+/// bridge publishes it. Another session's gap, a record of another kind, a gap that names no
+/// dropped events (a log gap's `log-lost=`) and a record that only mentions a gap further in
+/// are not counted.
+fn bus_gaps(evs: &[String], local: &str) -> usize {
+    evs.iter()
+        .filter(|ev| {
+            let mut words = ev.split_whitespace();
+            words.next() == Some("gap")
+                && words.next() == Some(local)
+                && words.any(|w| w.starts_with("events-dropped="))
+        })
+        .count()
+}
+
+/// One read of the bus while the gaptopic leg waits for the bridge's gap record (`read`: the
+/// `ev` records published since the last read, or why the bus could not be read), as the wait
+/// takes it: its answer once the read holds a gap record for the shell tab's `local` (their
+/// count, [`bus_gaps`]) or failed (why, which ends the wait at once), else `None`, to read
+/// again. With no local known, no record is the shell tab's.
+fn gap_step(
+    read: Result<Vec<String>, String>,
+    local: Option<&str>,
+) -> Option<Result<usize, String>> {
+    match read {
+        Err(why) => Some(Err(why)),
+        Ok(evs) => {
+            let n = local.map_or(0, |local| bus_gaps(&evs, local));
+            (n > 0).then_some(Ok(n))
+        }
     }
-    hay.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+/// What the wait for the bridge's gap record read, as a verdict says it: the count, or why the
+/// bus could not be read.
+fn gaps_text(read: &Result<usize, String>) -> String {
+    match read {
+        Ok(n) => n.to_string(),
+        Err(why) => format!("unread: {why}"),
+    }
 }
 
 /// Successor-local native input, after every handoff reader has finished. A fresh terminal

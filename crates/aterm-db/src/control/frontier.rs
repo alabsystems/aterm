@@ -4,8 +4,8 @@
 //! Fixed metadata, separately framed authority evidence and causal membership repair.
 //! Membership evidence never grants table or credential permissions by itself.
 //!
-//! Two wires share these frames ([`Wire`]). Under `atdb/5`, once metadata names each side's
-//! request, each states what it holds of the membership log ([`View`]). A peer then pushes only
+//! Three wires share these frames ([`Wire`]). Under `atdb/5` and `atdb/6`, once metadata names
+//! each side's request, each states what it holds of the membership log ([`View`]). A peer then pushes only
 //! the records of its seat evidence outside the past of what the other stated, at most
 //! [`MAX_EVIDENCE`] bytes, and the other judges that push in a copy of its own records, writing
 //! nothing before the peer is authenticated. Bulk repair follows in membership rounds bounded by
@@ -62,6 +62,9 @@ pub(super) enum Wire {
     /// move at most [`BATCH_RECORDS`] records or [`BATCH_BYTES`] bytes, and records left for a
     /// later session hold up no table repair.
     Delta,
+    /// `atdb/6` ([`fleet::ALPN_DATABASE_DUPLEX`]): the delta-frontier frames, then
+    /// credential handoffs in both directions so the custodian may also be the listener.
+    Duplex,
 }
 
 impl Wire {
@@ -69,7 +72,7 @@ impl Wire {
     pub(super) const fn batch_records(self) -> usize {
         match self {
             Self::Whole => WHOLE_BATCH_RECORDS,
-            Self::Delta => BATCH_RECORDS,
+            Self::Delta | Self::Duplex => BATCH_RECORDS,
         }
     }
 
@@ -77,7 +80,7 @@ impl Wire {
     pub(super) const fn batch_bytes(self) -> usize {
         match self {
             Self::Whole => WHOLE_BATCH_BYTES,
-            Self::Delta => BATCH_BYTES,
+            Self::Delta | Self::Duplex => BATCH_BYTES,
         }
     }
 
@@ -85,7 +88,7 @@ impl Wire {
     pub(super) const fn evidence_bytes(self) -> usize {
         match self {
             Self::Whole => MAX_RECORDS_STREAM,
-            Self::Delta => MAX_EVIDENCE,
+            Self::Delta | Self::Duplex => MAX_EVIDENCE,
         }
     }
 
@@ -98,7 +101,7 @@ impl Wire {
     pub(super) const fn round_cap(self, capacity: usize) -> usize {
         match self {
             Self::Whole => capacity / (WHOLE_BATCH_BYTES / MAX_RECORD) + 2,
-            Self::Delta => {
+            Self::Delta | Self::Duplex => {
                 2 * (capacity.div_ceil(BATCH_RECORDS) + MAX_RECORDS_STREAM.div_ceil(BATCH_BYTES))
                     + 2
             }
@@ -428,10 +431,12 @@ pub(super) fn send_evidence(
             admit_by_log_witness(log, target.binding())?;
             match wire {
                 Wire::Whole => log.records().map(Record::bytes).collect(),
-                Wire::Delta => lacked(endpoint, Some(log), log.records(), session.have)
-                    .into_iter()
-                    .map(Record::bytes)
-                    .collect(),
+                Wire::Delta | Wire::Duplex => {
+                    lacked(endpoint, Some(log), log.records(), session.have)
+                        .into_iter()
+                        .map(Record::bytes)
+                        .collect()
+                }
             }
         }
         Evidence::Node(node) => vec![node],
@@ -465,7 +470,7 @@ fn send_evidence_wires(
         .try_fold(0usize, |n, frame| n.checked_add(frame.len()))
         .ok_or_else(|| Error::new("Commons evidence length overflow"))?;
     let counted = if log {
-        wire == Wire::Delta || !wires.is_empty()
+        wire != Wire::Whole || !wires.is_empty()
     } else {
         wires.len() == 1
     };
@@ -578,7 +583,7 @@ fn receive_evidence(
             admit_by_log_witness(&log, target.binding())?;
             Ok(Received::Witness(Box::new(log)))
         }
-        Wire::Delta => {
+        Wire::Delta | Wire::Duplex => {
             let (overlay, pushed) = overlay(endpoint, session.view, records)?;
             admit_by_log_witness(&overlay, target.binding())?;
             Ok(Received::Push {
@@ -710,10 +715,10 @@ pub(super) fn connected(
     let mut peer = Metadata::decode(endpoint.trust, &remote)?;
     let actor = authenticate_identity(endpoint.actor, proof, &peer.request)?;
     compatible(endpoint, peer.bound)?;
-    // Only `atdb/5` states what each side holds; an `atdb/4` peer sends its evidence next.
+    // Delta-frontier peers state what each side holds; an `atdb/4` peer sends its evidence next.
     let (view, have) = match wire {
         Wire::Whole => (View::NONE, Vec::new()),
-        Wire::Delta => {
+        Wire::Delta | Wire::Duplex => {
             let view = View::of(endpoint)?;
             let have = trade_haves(endpoint, stream, side, repair, &mut peer, &view)?;
             (view, have)
@@ -817,7 +822,7 @@ pub(super) fn connected(
                 // nothing spends none, and names no more specific category.
                 let stop = match ending {
                     Ending::Complete => None,
-                    Ending::Deferred | Ending::Exhausted if wire == Wire::Delta => None,
+                    Ending::Deferred | Ending::Exhausted if wire != Wire::Whole => None,
                     Ending::Deferred => Some((
                         aterm_types::network_state::RepairCause::Other,
                         "Commons membership repair moved nothing and has more records",
@@ -860,7 +865,8 @@ pub(super) fn connected(
                 compatible(endpoint, peer.bound)?;
                 let pass = verify_evidence(endpoint, &peer, &theirs)?;
                 lease.phase = Phase::Credentials;
-                lease.handoff = endpoint.hand_off_credentials(pass, actor, side, stream);
+                lease.handoff =
+                    endpoint.hand_off_credentials(pass, actor, side, wire == Wire::Duplex, stream);
             }
             lease.phase = Phase::Complete;
         }
@@ -891,6 +897,7 @@ fn lease_after_evidence<'a>(
     lease.prepare(endpoint.trust, actor);
     lease.authenticated = Some(authenticated);
     lease.clear_application();
+    lease.heed();
     Ok(lease)
 }
 
@@ -1368,7 +1375,7 @@ fn enroll(
             .map_err(failure)?;
             let wires: Vec<_> = match session.wire {
                 Wire::Whole => chain.iter().map(Record::bytes).collect(),
-                Wire::Delta => lacked(endpoint, None, &chain, session.have)
+                Wire::Delta | Wire::Duplex => lacked(endpoint, None, &chain, session.have)
                     .into_iter()
                     .map(Record::bytes)
                     .collect(),

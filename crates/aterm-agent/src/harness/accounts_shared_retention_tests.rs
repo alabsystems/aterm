@@ -50,7 +50,6 @@ fn a_non_home_warm_grant_wakes_a_sync_to_release_prepared_execution() {
         let config_dir = root.path().join("config");
         let state_dir = root.path().join("state");
         fs::create_dir_all(&home).unwrap();
-        aterm_types::fs_restricted::ensure_private_dir(&home.join(".secrets")).unwrap();
         fs::create_dir_all(&config_dir).unwrap();
         let config = config_dir.join("aterm.toml");
         crate::test_config::write(&config, "[fleet]\nmachine='m16'\n").unwrap();
@@ -59,12 +58,10 @@ fn a_non_home_warm_grant_wakes_a_sync_to_release_prepared_execution() {
              warm=['m1','m16']\nsince=['2026-10-30T00:00:00Z','2026-10-30T00:00:00Z']\n\
              why=['pin','pin']\nused=['2026-10-30','2026-10-30']\n"
         );
-        fs::write(
-            home.join(".secrets")
-                .join(super::super::ai_pool::AI_POOL_FILE),
-            &source,
-        )
-        .unwrap();
+        crate::vault_entry::seed(
+            &home,
+            &[(super::super::ai_pool::AI_POOL_FILE, source.as_bytes())],
+        );
         let pool = super::super::ai_pool::Pool::from_toml(&source, "fixture").unwrap();
         let identity =
             super::super::ai_pool::resolve_local_pool_identity(Some(&home), Some(&config), None)

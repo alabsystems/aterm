@@ -9,7 +9,7 @@
 use crate::harness::acts::HoldLeg;
 use crate::harness::hold_said::HoldSaid;
 use crate::harness::repo_work::{RepoRead, RepoWork};
-use crate::supervise::policy::land_check;
+use alab_policy::land_check;
 
 /// L2's defense: clean words, a leftover beside them (the forever lab's `open_defense`).
 const OPEN_DEFENSE: &str = "Nothing left: the parser is committed and pushed to origin/main.\n\

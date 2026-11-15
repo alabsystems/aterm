@@ -26,20 +26,22 @@ pub struct CoalBase {
     pub coalitions: IdMap<u64, CoalUsage>,
     /// The highest id the kernel listed, answered or not, where the list was whole.
     pub newest: Option<u64>,
-    /// Each process of the user's, by pid: its kernel start and CPU time.
+    /// Each readable process, by pid: its kernel start and CPU time.
     pub procs: IdMap<u32, (Option<u64>, u64)>,
-    /// Whether the list or the sweep stopped short.
+    /// Whether a listed coalition was unread, or the list or the sweep stopped short.
     pub truncated: bool,
     /// Whether the list stopped short.
     pub list_truncated: bool,
     /// The reap credit's counters at this reading, where its ledger read the sweep.
     pub reap: Option<ReapTotals>,
+    /// Coalitions whose complete live census proved exclusive app ownership at this endpoint.
+    pub exclusive: super::IdSet<u64>,
 }
 
 impl CoalBase {
-    /// Samples `s`'s counters, coalitions `read`, and CPU time of `uid`'s processes in `procs`.
+    /// Samples `s`'s counters, coalitions `read`, and each readable process's own CPU.
     #[must_use]
-    pub fn of(s: &Sample, read: &CoalSample, procs: &[ProcSample], uid: u32) -> Option<Self> {
+    pub fn of(s: &Sample, read: &CoalSample, procs: &[ProcSample]) -> Option<Self> {
         let cores = s.cores.as_deref().filter(|c| !c.is_empty())?;
         Some(Self {
             at_ns: s.at_ns,
@@ -50,12 +52,14 @@ impl CoalBase {
             newest: read.newest.filter(|_| !read.truncated),
             procs: procs
                 .iter()
-                .filter(|p| p.uid == Some(uid))
                 .filter_map(|p| Some((p.pid, (p.start, p.cpu_ns?))))
                 .collect(),
-            truncated: read.truncated || s.procs_truncated,
+            truncated: read.truncated
+                || s.procs_truncated
+                || read.rows.len() < read.listed as usize,
             list_truncated: read.truncated,
             reap: None,
+            exclusive: super::IdSet::default(),
         })
     }
 
@@ -102,15 +106,31 @@ pub struct SplitIn<'a> {
 pub fn split(i: &SplitIn) -> CoalSplit {
     let window = i.now.at_ns.saturating_sub(i.base.at_ns).max(1);
     let mc = |ns: u64| per_window(ns, window);
+    let floor_mc =
+        |ns: u64| i64::try_from(u128::from(ns) * 1000 / u128::from(window)).unwrap_or(i64::MAX);
     let global_mc = rounded(
         u128::from(i.now.busy.saturating_sub(i.base.busy)) * i.now.cores as u128 * 1000,
         u128::from(i.now.total.saturating_sub(i.base.total)),
     );
-    let part_of = |c: u64| i.names.get(&c).map_or(Part::Services, |n| n.part);
+    let part_of = |c: u64| {
+        i.names.get(&c).map_or(Part::Services, |n| {
+            if n.part == Part::Aterm
+                && !(i.base.exclusive.contains(&c) && i.now.exclusive.contains(&c))
+            {
+                n.outside
+            } else {
+                n.part
+            }
+        })
+    };
     let add = |sum: &mut u64, ns: u64| *sum = sum.saturating_add(ns);
 
     let mut tabs = vec![0u64; i.tabs.len()];
+    let mut tab_floors = vec![0u64; i.tabs.len()];
+    let mut ambiguous_tabs = Vec::new();
     let mut own_ns = 0u64;
+    let mut own_floor_ns = 0u64;
+    let mut own_ambiguous = false;
     let mut short_tabs = Vec::new();
     // The reap credit, where its ledger read both ends: it counts every
     // member but a delegated job's, whose live work the loop below reads.
@@ -125,6 +145,11 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             if i.tabs[..k].iter().all(|o| o.tab != t.tab) {
                 let (ns, missed) = now.since(base, t.tab);
                 *sum = ns;
+                let (floor, ambiguous) = now.floor_since(base, t.tab);
+                tab_floors[k] = floor;
+                if ambiguous {
+                    ambiguous_tabs.push(t.tab);
+                }
                 in_tabs = in_tabs.saturating_add(ns);
                 if missed {
                     short_tabs.push(t.tab);
@@ -132,13 +157,44 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             }
         }
         own_ns = now.all.saturating_sub(base.all).saturating_sub(in_tabs);
+        (own_floor_ns, own_ambiguous) = now.own_floor_since(base);
     }
     // Whether every member of aterm's coalitions swept now is in a figure
     // that read it at both ends of the window ([`CoalSplit::skew_mc`]).
     let mut all_live = true;
     let mut moved: IdMap<u64, u64> = IdMap::default();
+    if let Some((_, base, now)) = reap {
+        for &coalition in now.coalition_floors.keys() {
+            if part_of(coalition) != Part::Aterm {
+                add(
+                    moved.entry(coalition).or_default(),
+                    now.coalition_floor_since(base, coalition),
+                );
+            }
+        }
+    }
+    let mut foreign_floors: IdMap<u64, u64> = IdMap::default();
     for ((p, m), delegated) in i.procs.iter().zip(i.members).zip(i.delegated) {
         let ours = p.coalition.is_some_and(|c| part_of(c) == Part::Aterm);
+        if !m.aterm
+            && !*delegated
+            && p.uid.is_some_and(|uid| {
+                p.coalition
+                    .is_some_and(|coalition| match part_of(coalition) {
+                        Part::Others => uid == i.self_uid,
+                        Part::Services => uid != i.self_uid,
+                        Part::Aterm => false,
+                    })
+            })
+            && let (Some(coalition), Some(cpu), Some((Some(start), before))) =
+                (p.coalition, p.cpu_ns, i.base.procs.get(&p.pid))
+            && p.start == Some(*start)
+        {
+            add(
+                foreign_floors.entry(coalition).or_default(),
+                cpu.saturating_sub(*before),
+            );
+        }
         if let Some((ledger, base, _)) = reap.filter(|_| !*delegated) {
             all_live &= !ours || ledger.counted(p.pid, p.start, base.step);
             continue;
@@ -147,7 +203,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             all_live &= !ours;
             continue;
         };
-        if start.is_none() || start != p.start || p.uid != Some(i.self_uid) {
+        if start.is_none() || start != p.start {
             all_live &= !ours;
             continue;
         }
@@ -157,20 +213,79 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             .and_then(|(ledger, _, _)| ledger.credited(p.pid, p.start))
             .map_or(before, |c| c.max(before));
         let work = ns.saturating_sub(before);
-        match m.tab.and_then(|t| tabs.get_mut(t)) {
-            Some(tab) => add(tab, work),
-            None if m.aterm => add(&mut own_ns, work),
+        match m.tab.filter(|t| *t < tabs.len()) {
+            Some(t) => {
+                add(&mut tabs[t], work);
+                add(&mut tab_floors[t], work);
+            }
+            None if m.aterm => {
+                add(&mut own_ns, work);
+                add(&mut own_floor_ns, work);
+            }
             None => all_live &= !ours,
         }
         if let Some(c) = p
             .coalition
-            .filter(|c| *delegated && part_of(*c) != Part::Aterm)
+            .filter(|c| (*delegated || m.aterm) && part_of(*c) != Part::Aterm)
         {
             add(moved.entry(c).or_default(), work);
         }
     }
 
+    // Reconciliation can omit charge that an independent own counter proves. This is also
+    // ambiguity, never a reason to clamp the proved actual-work floor down to that charge.
+    own_ambiguous |= own_floor_ns > own_ns;
+    for (k, t) in i.tabs.iter().enumerate() {
+        if tab_floors[k] > tabs[k] && !ambiguous_tabs.contains(&t.tab) {
+            ambiguous_tabs.push(t.tab);
+        }
+    }
+
     let mut homes: IdMap<u64, Option<Vec<u64>>> = IdMap::default();
+    let mut owned_memory: IdMap<u64, crate::model::MemoryCharge> = IdMap::default();
+    let mut owned_live: IdMap<u64, u32> = IdMap::default();
+    let mut foreign_memory_parts: IdMap<u64, Option<Part>> = IdMap::default();
+    let mut unknown_memory_owner = super::IdSet::default();
+    for ((p, delegated), member) in i.procs.iter().zip(i.delegated).zip(i.members) {
+        if !*delegated
+            && !member.aterm
+            && let Some(coalition) = p.coalition
+        {
+            let part = p.uid.map(|uid| {
+                if uid == i.self_uid {
+                    Part::Others
+                } else {
+                    Part::Services
+                }
+            });
+            foreign_memory_parts
+                .entry(coalition)
+                .and_modify(|current| {
+                    if *current != part {
+                        *current = None;
+                    }
+                })
+                .or_insert(part);
+        }
+        if (*delegated || member.aterm)
+            && let Some(coalition) = p.coalition
+        {
+            *owned_live.entry(coalition).or_default() += 1;
+        }
+        if !*delegated
+            && !member.aterm
+            && p.uid.is_none()
+            && let Some(coalition) = p.coalition
+        {
+            unknown_memory_owner.insert(coalition);
+        }
+        if let Some(coalition) = p
+            .coalition
+            .filter(|c| (*delegated || member.aterm) && part_of(*c) != Part::Aterm)
+        {
+            owned_memory.entry(coalition).or_default().add(p.footprint);
+        }
+    }
     for (p, m) in i.procs.iter().zip(i.members) {
         let Some(c) = p.coalition else { continue };
         let key = m.tab.and_then(|t| i.tabs.get(t)).map(|t| t.tab);
@@ -183,6 +298,22 @@ pub fn split(i: &SplitIn) -> CoalSplit {
     }
 
     let (mut aterm_ns, mut delegated_ns, mut others_ns, mut services_ns) = (0, 0, 0, 0);
+    let unmapped_owned = reap.is_some_and(|(_, base, now)| {
+        let mapped = now
+            .coalition_floors
+            .keys()
+            .filter(|id| i.now.coalitions.contains_key(id))
+            .fold(0_u64, |sum, &id| {
+                sum.saturating_add(now.coalition_floor_since(base, id))
+            });
+        now.all_floor.saturating_sub(base.all_floor) > mapped
+    });
+    let missing_app_coalition = i.names.iter().any(|(id, name)| {
+        let before = i.base.coalitions.contains_key(id);
+        let now = i.now.coalitions.contains_key(id);
+        name.has_app && (before != now || !now && i.live.get(id).is_some_and(|live| *live > 0))
+    });
+    let mut ownership_incomplete = unmapped_owned || missing_app_coalition;
     // Whether none of aterm's coalitions made or reaped a member between the
     // window's two reads, each read at both ends with the same task
     // counters, and the sweep found each one's every live member
@@ -205,7 +336,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
                 .fold(0, |sum: u64, ns| sum.saturating_add(*ns))
         };
         let named = i.names.get(&u.id);
-        let part = named.map_or(Part::Services, |n| n.part);
+        let part = part_of(u.id);
         if part == Part::Aterm {
             let swept = u64::from(i.live.get(&u.id).copied().unwrap_or(0));
             kept_members &= measured
@@ -213,11 +344,20 @@ pub fn split(i: &SplitIn) -> CoalSplit {
                 && u.tasks_started.checked_sub(u.tasks_exited) == Some(swept);
         }
         let cpu_ns = u.cpu_ns - before.cpu_ns;
-        let delegated = moved.get(&u.id).map_or(0, |d| (*d).min(cpu_ns));
+        let delegated = moved.get(&u.id).copied().unwrap_or(0);
+        let ownership_mixed = part != Part::Aterm
+            && (unmapped_owned || named.is_some_and(|n| n.has_app || n.unknown_owner));
+        ownership_incomplete |= ownership_mixed;
+        let outside_floor = foreign_floors.get(&u.id).copied().unwrap_or(0);
+        let outside = if ownership_mixed {
+            outside_floor
+        } else {
+            cpu_ns.saturating_sub(delegated)
+        };
         match part {
             Part::Aterm => add(&mut aterm_ns, cpu_ns),
-            Part::Others => add(&mut others_ns, cpu_ns - delegated),
-            Part::Services => add(&mut services_ns, cpu_ns - delegated),
+            Part::Others => add(&mut others_ns, outside),
+            Part::Services => add(&mut services_ns, outside),
         }
         add(&mut delegated_ns, delegated);
         rows_ns.push(cpu_ns);
@@ -227,6 +367,8 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             cpu_mc: mc(cpu_ns),
             measured,
             delegated_mc: mc(delegated),
+            ownership_mixed,
+            outside_floor_mc: floor_mc(outside_floor),
             deferred_mc: mc(deferred(u).saturating_sub(deferred(&before))),
             qos_mc: mc(qos(u).saturating_sub(qos(&before))),
             read_bps: u64::try_from(
@@ -235,16 +377,56 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             )
             .unwrap_or(u64::MAX),
             footprint: u.footprint,
-            live: i.live.get(&u.id).copied().unwrap_or(0),
-            tabs: homes.get(&u.id).cloned().flatten().map(|mut keys| {
-                keys.sort_unstable();
-                keys
+            footprint_aterm: owned_live.get(&u.id).is_some_and(|owned| {
+                *owned > 0
+                    && Some(u64::from(*owned)) == u.tasks_started.checked_sub(u.tasks_exited)
+                    && Some(owned) == i.live.get(&u.id)
             }),
+            footprint_outside: foreign_memory_parts
+                .get(&u.id)
+                .copied()
+                .flatten()
+                .filter(|_| {
+                    u.tasks_started.checked_sub(u.tasks_exited)
+                        == Some(u64::from(i.live.get(&u.id).copied().unwrap_or(0)))
+                }),
+            owned_footprint: owned_memory.get(&u.id).copied().unwrap_or_default(),
+            footprint_ownership_incomplete: unknown_memory_owner.contains(&u.id)
+                || u.tasks_started.checked_sub(u.tasks_exited)
+                    != Some(u64::from(i.live.get(&u.id).copied().unwrap_or(0))),
+            live: i.live.get(&u.id).copied().unwrap_or(0),
+            tabs: homes
+                .get(&u.id)
+                .cloned()
+                .flatten()
+                .filter(|_| {
+                    u.tasks_started.checked_sub(u.tasks_exited)
+                        == Some(u64::from(i.live.get(&u.id).copied().unwrap_or(0)))
+                })
+                .map(|mut keys| {
+                    keys.sort_unstable();
+                    keys
+                }),
             finished: u.tasks_exited > 0,
             lead: named.and_then(|n| n.lead.clone()),
         });
     }
-    let live_ns = tabs.iter().fold(own_ns, |sum, ns| sum.saturating_add(*ns));
+    let actual_own_ns = if own_ambiguous { own_floor_ns } else { own_ns };
+    let live_ns = tabs.iter().zip(&tab_floors).zip(i.tabs).fold(
+        actual_own_ns,
+        |sum, ((charge, floor), root)| {
+            sum.saturating_add(if ambiguous_tabs.contains(&root.tab) {
+                *floor
+            } else {
+                *charge
+            })
+        },
+    );
+    // A terminal's independently proved own CPU may have no readable coalition. The app
+    // floor survives, while unread ownership stays in the signed residual.
+    if ownership_incomplete {
+        delegated_ns = delegated_ns.max(live_ns.saturating_sub(aterm_ns));
+    }
     let past_ns = aterm_ns
         .saturating_add(delegated_ns)
         .saturating_sub(live_ns);
@@ -252,19 +434,37 @@ pub fn split(i: &SplitIn) -> CoalSplit {
     // that read it at both ends, aterm's counters held only the figures'
     // work: what they ran past the figures is the counters' skew against
     // their members' times, never finished work (RD §3.5).
-    let (unattributed_ns, skew_ns) = if kept_members && all_live {
-        (0, past_ns)
-    } else {
-        (past_ns, 0)
-    };
+    let (unattributed_ns, skew_ns) =
+        if kept_members && all_live && ambiguous_tabs.is_empty() && !own_ambiguous {
+            (0, past_ns)
+        } else {
+            (past_ns, 0)
+        };
     let unattributed_mc = mc(unattributed_ns);
-    let (aterm_mc, delegated_mc, others_mc) = (mc(aterm_ns), mc(delegated_ns), mc(others_ns));
-    let services_mc = mc(services_ns);
+    let (aterm_mc, delegated_mc, others_mc, services_mc) = if ownership_incomplete {
+        let app = floor_mc(aterm_ns.saturating_add(delegated_ns));
+        let coalition = floor_mc(aterm_ns);
+        (
+            coalition,
+            app.saturating_sub(coalition),
+            floor_mc(others_ns),
+            floor_mc(services_ns),
+        )
+    } else {
+        (
+            mc(aterm_ns),
+            mc(delegated_ns),
+            mc(others_ns),
+            mc(services_ns),
+        )
+    };
     as_a_set(
         &mut rows,
         &rows_ns,
         window,
-        aterm_mc + delegated_mc + others_mc + services_mc,
+        mc(rows_ns
+            .iter()
+            .fold(0_u64, |sum, ns| sum.saturating_add(*ns))),
     );
     // Ids are unique, so the order is total and an unstable sort is the
     // stable one's: it moves the ~650 rows (each a few hundred bytes) far less.
@@ -272,7 +472,12 @@ pub fn split(i: &SplitIn) -> CoalSplit {
     let unaccounted_mc = global_mc - (aterm_mc + delegated_mc + others_mc + services_mc);
     CoalSplit {
         via: Via::Coalitions,
-        exact: !(i.now.truncated || i.base.truncated) && rows.iter().all(|r| r.measured),
+        exact: !(i.now.truncated || i.base.truncated)
+            && rows.iter().all(|r| r.measured)
+            && ambiguous_tabs.is_empty()
+            && !own_ambiguous
+            && !ownership_incomplete,
+        ownership_incomplete,
         list_truncated: i.now.list_truncated || i.base.list_truncated,
         listed: i.listed,
         global_mc,
@@ -286,6 +491,13 @@ pub fn split(i: &SplitIn) -> CoalSplit {
             .map(|(k, ns)| (k, mc(ns)))
             .collect(),
         own_mc: mc(own_ns),
+        own_floor_mc: floor_mc(own_floor_ns),
+        own_ambiguous,
+        tab_floors: by_tab(i.tabs.iter().map(|t| t.tab).zip(tab_floors))
+            .into_iter()
+            .map(|(key, ns)| (key, floor_mc(ns)))
+            .collect(),
+        ambiguous_tabs,
         unattributed_mc,
         skew_mc: mc(skew_ns),
         short_tabs,
@@ -330,9 +542,6 @@ fn as_a_set(rows: &mut [CoalRow], ns: &[u64], window: u64, target: i64) {
     for &(_, _, k) in &up[..extra] {
         rows[k].cpu_mc += 1;
     }
-    for row in rows {
-        row.delegated_mc = row.delegated_mc.min(row.cpu_mc);
-    }
 }
 
 fn by_tab<T: std::ops::AddAssign>(panes: impl IntoIterator<Item = (u64, T)>) -> Vec<(u64, T)> {
@@ -356,8 +565,8 @@ fn rounded(num: u128, den: u128) -> i64 {
 }
 
 impl CoalSplit {
-    /// The split from the built [`crate::Split`] (by subtraction), with each tab's live figure from
-    /// the same sweep.
+    /// Process evidence from the built [`crate::Split`], with each tab's live figure from the
+    /// same sweep. The current common-window reap account can replace these live figures.
     #[must_use]
     pub fn by_subtraction(built: &Split, tabs: &[TabView], roots: &[TabRoot]) -> Self {
         let mc = |cores: f32| super::millicores(cores);
@@ -365,15 +574,17 @@ impl CoalSplit {
             mc(built.global),
             mc(built.aterm),
             mc(built.others),
-            mc(built.services),
+            (f64::from(built.services) * 1000.0).floor() as i64,
         );
         let tab_of = |key: u64| roots.iter().find(|r| r.key == key).map_or(key, |r| r.tab);
         let tabs = by_tab(tabs.iter().map(|t| (tab_of(t.key), mc(t.scope.cores.raw))));
         let in_tabs: i64 = tabs.iter().map(|(_, mc)| mc).sum();
         let own_mc = (aterm_mc - in_tabs).max(0);
+        let tab_floors = tabs.clone();
         Self {
             via: Via::Subtraction,
             exact: false,
+            ownership_incomplete: true,
             list_truncated: false,
             listed: 0,
             global_mc,
@@ -384,6 +595,10 @@ impl CoalSplit {
             unaccounted_mc: global_mc - aterm_mc - others_mc - services_mc,
             tabs,
             own_mc,
+            own_floor_mc: own_mc,
+            own_ambiguous: false,
+            tab_floors,
+            ambiguous_tabs: Vec::new(),
             unattributed_mc: (aterm_mc - own_mc - in_tabs).max(0),
             skew_mc: 0,
             short_tabs: Vec::new(),

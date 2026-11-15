@@ -100,8 +100,8 @@ struct File {
 const ADMISSION: &str = "cannot safely read ~/.config/aterm/init.toml (requires an owned \
                          regular file, no links or group/other writes, at most 64 KiB)";
 const INVALID: &str = "invalid ~/.config/aterm/init.toml: it must be TOML holding at most a \
-                       [github] table (account, owner, token_file, token_key) and a [develop] \
-                       table (checkouts = [\"~/<path>\", …])";
+                       [github] table (enabled, account, owner; the GitHub token is the \
+                       vault's gh:dev) and a [develop] table (checkouts = [\"~/<path>\", …])";
 
 struct Profile {
     path: PathBuf,
@@ -1294,8 +1294,8 @@ pub struct Inputs<'a> {
 ///
 /// # Errors
 /// `ctx` names no one user, the profile or a manifest cannot be read safely or is invalid,
-/// or `--develop` runs in a linked worktree, cannot list the checkouts the GitHub item
-/// verifies, or finds no checkout to record and none is recorded.
+/// or `--develop` runs in a linked worktree, or finds no checkout to record and none is
+/// recorded.
 pub fn compose(sys: &dyn System, ctx: &Ctx, inputs: &Inputs<'_>) -> Result<Vec<Placed>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init --develop requires exactly one local user".into());
@@ -1327,7 +1327,7 @@ pub fn compose(sys: &dyn System, ctx: &Ctx, inputs: &Inputs<'_>) -> Result<Vec<P
                     }
                     vec![root]
                 }
-                _ => crate::init_github::aterm_checkouts(sys, ctx)?,
+                _ => Vec::new(),
             };
             let mut want = recorded.unwrap_or_default();
             for path in found {

@@ -3,7 +3,8 @@
 // Author: Andrew Yates
 
 //! The account's durable record of setup's administrator-password attempt (setup's one early
-//! elevation: the Command Line Tools, developer mode, the Mac's name rule and the LAN broker).
+//! elevation: the Command Line Tools, developer mode, the Mac's name rule, the LAN broker and
+//! Spotlight's scope).
 //! Window and terminal askers share one record and one lock, and the record says how the last
 //! attempt ended, so the next automatic ask follows from that end alone, whatever build, launch,
 //! update or reboot reads it:

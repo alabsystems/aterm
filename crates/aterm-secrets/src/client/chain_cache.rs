@@ -24,13 +24,19 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-const MAX_ENTRIES: usize = 16;
+pub(super) const MAX_ENTRIES: usize = 16;
 const MAX_CACHED_BYTES: usize = 2 * envelope::MAX_ENVELOPE;
 /// The most files an entry is known by ([`Entry::stamps`]): two vault folders that hold the same
 /// bytes in one process (two Macs of a test's lab) each keep theirs.
 const STAMPS: usize = 4;
 
 static CACHE: Cache = Cache::new();
+
+#[cfg(test)]
+thread_local! {
+    /// The cache this thread's [`held`] reads use while an [`OwnCache`] guard lives.
+    static OWN: std::cell::RefCell<Option<Arc<Cache>>> = const { std::cell::RefCell::new(None) };
+}
 
 /// The vault file at `path` (the held vault, [`Paths::cache_file`](super::Paths::cache_file)),
 /// admitted and bounded as [`fsx::read_private`] reads it at [`envelope::MAX_ENVELOPE`], parsed:
@@ -41,7 +47,34 @@ static CACHE: Cache = Cache::new();
 /// # Errors
 /// As [`fsx::read_private`].
 pub(super) fn held(path: &Path) -> Result<Option<Arc<Parsed>>> {
+    #[cfg(test)]
+    if let Some(own) = OWN.with(|own| own.borrow().clone()) {
+        return own.held(path);
+    }
     CACHE.held(path)
+}
+
+/// While it lives, this thread's [`held`] reads use a cache of their own, which no other thread
+/// fills. Every test thread of a binary shares the process's cache, so another test's vaults
+/// can push an entry out of it ([`MAX_ENTRIES`], [`MAX_CACHED_BYTES`]) between two reads of a
+/// test that holds which entries stay.
+#[cfg(test)]
+#[must_use = "this thread's reads use their own cache only while the guard lives"]
+pub(super) struct OwnCache(Option<Arc<Cache>>);
+
+#[cfg(test)]
+impl OwnCache {
+    pub(super) fn new() -> Self {
+        Self(OWN.with(|own| own.borrow_mut().replace(Arc::new(Cache::new()))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for OwnCache {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        OWN.with(|own| *own.borrow_mut() = before);
+    }
 }
 
 /// What one exact input to [`envelope::parse`] gave. It holds no authority:
@@ -127,6 +160,7 @@ impl Parsed {
         followed: &[[u8; 32]],
         held: Option<&Floor>,
     ) -> Result<(&Envelope, Pin, Verdict)> {
+        crate::pass_counts::add(crate::pass_counts::Count::EntryVerifies);
         let envelope = self.envelope()?;
         let (pin, verdict) = envelope::judge_for_reader(
             envelope,
@@ -157,6 +191,58 @@ impl Parsed {
             _ => Vec::new(),
         }
     }
+}
+
+/// What a reader verifies an envelope against: [`envelope::verify_for_reader`]'s arguments
+/// after the bytes.
+#[derive(Clone, Copy)]
+pub(super) struct Reader<'a> {
+    pub(super) name: &'a str,
+    pub(super) pin: &'a [u8; 32],
+    pub(super) followed: &'a [[u8; 32]],
+    pub(super) floor: Option<&'a Floor>,
+}
+
+/// [`envelope::verify_for_reader`] of `bytes` for `reader`, and what `found` makes of the
+/// envelope and the pin it verified to. Where `bytes` are exactly the bytes `held` was parsed
+/// from (the held vault's entry, [`held`]), the entry answers ([`Parsed::verify_for_reader`]),
+/// counted as `sites.0`; any other bytes, and every byte where there is no entry, are parsed
+/// and verified whole, counted as `sites.1`.
+///
+/// The entry's answer for its own bytes is the answer a verification of those bytes gives: what
+/// they parse to and whether their signature verifies are functions of the bytes alone, which
+/// the entry keeps, and the name, the pin, the followed keys, the floor and the retired keys are
+/// judged at each call, as for any bytes. Bytes of another length or with one other byte are not
+/// the entry's. This only looks the entry up: it adds nothing to the cache, keeps nothing of
+/// `bytes`, and changes no entry.
+pub(super) fn verify_as_held<T>(
+    held: Option<&Parsed>,
+    bytes: &[u8],
+    reader: Reader<'_>,
+    sites: (crate::pass_counts::Count, crate::pass_counts::Count),
+    found: impl FnOnce(&Envelope, Pin) -> T,
+) -> Result<T> {
+    let Reader {
+        name,
+        pin,
+        followed,
+        floor,
+    } = reader;
+    if let Some(held) = held.filter(|held| held.bytes() == bytes) {
+        crate::pass_counts::add(sites.0);
+        let (envelope, pin, _) = held.verify_for_reader(name, pin, followed, floor)?;
+        return Ok(found(envelope, pin));
+    }
+    crate::pass_counts::add(sites.1);
+    let (envelope, pin, _) = envelope::verify_for_reader(bytes, name, pin, followed, floor)?;
+    Ok(found(&envelope, pin))
+}
+
+/// Whether the process's cache keeps an entry of exactly `bytes`.
+#[cfg(test)]
+pub(super) fn keeps(bytes: &[u8]) -> bool {
+    let mut entries = CACHE.entries.lock().expect("the cache");
+    same_bytes(&mut entries, bytes).is_some()
 }
 
 struct Cache {

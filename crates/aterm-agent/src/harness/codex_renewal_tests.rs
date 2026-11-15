@@ -157,6 +157,135 @@ fn quota_requests_and_markers_cannot_be_used_as_same_account_renewals() {
     assert!(!intent().matches_record(&record, None));
 }
 
+/// A LOST LOGIN'S MOVE SPEAKS THE ROTATION'S FOUR KEYS UNDER ITS OWN PURPOSE: `turn`,
+/// `source_account` and `source_user` beside `thread`, exactly four. A fifth field (a `wall=` on
+/// top, or any other) is refused, and so are the renewal's own key names, which name a
+/// same-account renewal. The same line read as a usage-limit handoff's is that purpose's intent,
+/// never this one's, and the renewal's grammar refuses it.
+#[test]
+fn login_rotation_requests_take_exactly_the_rotations_four_keys() {
+    let mut moved = intent();
+    moved.purpose = Purpose::LoginRotation;
+    let request = format!(
+        "prepare thread={THREAD} turn={WALL} source_account={} source_user={}",
+        moved.identity.account, moved.identity.user,
+    );
+    assert_eq!(
+        Request::parse_login_rotation(&request),
+        Some(Request::Prepare(moved.clone()))
+    );
+    let mut quota = moved.clone();
+    quota.purpose = Purpose::WeeklyQuota;
+    assert_eq!(
+        Request::parse_rotation(&request),
+        Some(Request::Prepare(quota))
+    );
+    assert!(Request::parse(&request).is_none());
+    for extra in [
+        format!(" wall={WALL}"),
+        " target=/arbitrary/login".to_owned(),
+    ] {
+        assert!(Request::parse_login_rotation(&(request.clone() + &extra)).is_none());
+    }
+    let renewal_keys = format!(
+        "prepare thread={THREAD} wall={WALL} account={} user={}",
+        moved.identity.account, moved.identity.user,
+    );
+    assert!(Request::parse_login_rotation(&renewal_keys).is_none());
+    assert_eq!(
+        Request::parse_login_rotation(&format!("status id={}", "ab".repeat(16))),
+        Some(Request::Status("ab".repeat(16)))
+    );
+}
+
+/// Each purpose's predicates say what its receipt is: only a usage-limit handoff's is the
+/// pool's, both moves name another account, and both a renewal and a lost login's move stand at
+/// an authentication wall. A lost login's move shares the rotation's record field (`rotation`)
+/// under its own rule, and its intent keeps its purpose on disk while a renewal's writes none.
+#[test]
+fn a_lost_logins_move_is_an_account_move_at_an_auth_wall_outside_the_pool() {
+    for (purpose, moves, pool, auth, marker, rule) in [
+        (
+            Purpose::Login,
+            false,
+            false,
+            true,
+            "renewal",
+            "login-back@v1",
+        ),
+        (
+            Purpose::WeeklyQuota,
+            true,
+            true,
+            false,
+            "rotation",
+            "usage-rotate@v1",
+        ),
+        (
+            Purpose::LoginRotation,
+            true,
+            false,
+            true,
+            "rotation",
+            "login-rotate@v1",
+        ),
+    ] {
+        assert_eq!(purpose.moves_account(), moves, "{purpose:?}");
+        assert_eq!(purpose.pool_scoped(), pool, "{purpose:?}");
+        assert_eq!(purpose.auth_wall(), auth, "{purpose:?}");
+        assert_eq!(purpose.marker(), marker, "{purpose:?}");
+        assert_eq!(purpose.rule(), rule, "{purpose:?}");
+    }
+    let mut moved = intent();
+    moved.purpose = Purpose::LoginRotation;
+    let value = aterm_json::to_value(&moved).unwrap();
+    assert_eq!(value["purpose"].as_str(), Some("login_rotation"));
+    assert_eq!(aterm_json::from_value::<Intent>(value).unwrap(), moved);
+    assert!(
+        aterm_json::to_value(intent())
+            .unwrap()
+            .get("purpose")
+            .is_none()
+    );
+}
+
+/// A LOST LOGIN'S MOVE IS PREPARED ONLY AT AN AUTHENTICATION WALL ON ITS OWN RULE: its history is
+/// a completed turn that ended unauthorized, never a usage limit, and its record is the
+/// `rotation` field under `login-rotate@v1`. A usage-limit handoff's record (`usage-rotate@v1`)
+/// does not match it, nor does its record match the handoff.
+#[test]
+fn a_lost_logins_move_matches_only_an_auth_wall_and_its_own_rule() {
+    let mut moved = intent();
+    moved.purpose = Purpose::LoginRotation;
+    let start = event(aterm_json::json!({"type":"task_started","turn_id":WALL}));
+    let done = event(aterm_json::json!({"type":"task_complete","turn_id":WALL}));
+    let unauthorized = event(aterm_json::json!({"type":"error","codex_error_info":"unauthorized"}));
+    let limited =
+        event(aterm_json::json!({"type":"error", "codex_error_info":"usage_limit_exceeded"}));
+    let auth = history_lines(format!("{start}{unauthorized}{done}").as_bytes(), &moved).unwrap();
+    assert!(moved.matches_history(&auth));
+    let usage = history_lines(format!("{start}{limited}{done}").as_bytes(), &moved).unwrap();
+    assert!(!moved.matches_history(&usage));
+
+    let record = |rule: &str| {
+        aterm_json::json!({
+            "sessionId": THREAD, "status": "waiting", "draftEmpty": true,
+            "autopilot": "active", "owed": {
+                "thread": THREAD, "mode": "cruise", "rule": rule,
+                "nativeOrigin": {"turnId": WALL, "phase": "complete"},
+                "rotation": {"openaiScope": true, "account": moved.identity.account,
+                    "user": moved.identity.user, "receipt": null}
+            }
+        })
+    };
+    assert!(moved.matches_record(&record("login-rotate@v1"), None));
+    assert!(!moved.matches_record(&record("usage-rotate@v1"), None));
+    let mut quota = moved.clone();
+    quota.purpose = Purpose::WeeklyQuota;
+    assert!(!quota.matches_record(&record("login-rotate@v1"), None));
+    assert!(!intent().matches_record(&record("login-rotate@v1"), None));
+}
+
 #[test]
 fn quota_history_is_typed_and_separate_from_authentication_failure() {
     let mut quota = intent();
@@ -401,7 +530,7 @@ fn receipt() -> Receipt {
         destination: None,
         id: "ab".repeat(16),
         intent: intent(),
-        sid: "s-fixture".into(),
+        sid: "t000fjxtvre".into(),
         old_pid: 10,
         old_birth: 20,
         claim_revision: 3,
@@ -451,6 +580,70 @@ fn receipt_requires_an_explicit_distinct_quota_destination() {
     let mut renewal = original;
     renewal.destination = Some(target);
     assert!(renewal.target_identity().is_none());
+}
+
+/// A LOST LOGIN'S MOVE NAMES ANOTHER ACCOUNT AND SAYS SO UNDER ITS OWN VERB: its target is its
+/// destination only where that is a different account (none, or the source's own, is no target),
+/// and its reply is the rotation's eight fields after `OK codex-login-rotation`, while a
+/// usage-limit handoff's keeps `OK codex-rotation`. No reply names a login path.
+#[test]
+fn a_login_rotation_receipt_names_another_account_under_its_own_verb() {
+    let mut moved = receipt();
+    moved.intent.purpose = Purpose::LoginRotation;
+    assert!(moved.target_identity().is_none(), "no destination");
+    assert_eq!(
+        moved.reply(),
+        "ERR account recovery invalid identity transition\n"
+    );
+    moved.destination = Some(moved.intent.identity.clone());
+    assert!(
+        moved.target_identity().is_none(),
+        "the source's own account"
+    );
+    let target = Identity::from_native("next-workspace", "next-user");
+    moved.destination = Some(target.clone());
+    assert_eq!(moved.target_identity(), Some(&target));
+    for (phase, state) in [
+        (Phase::Ready, "ready"),
+        (Phase::Committing, "waiting"),
+        (Phase::Committed, "committed"),
+        (Phase::Consumed, "consumed"),
+        (Phase::Retired, "retired"),
+    ] {
+        let mut receipt = moved.clone();
+        receipt.phase = phase;
+        let reply = receipt.reply();
+        assert!(
+            reply.starts_with(&format!("OK codex-login-rotation state={state} ")),
+            "{reply}"
+        );
+        let fields: Vec<_> = reply.split_whitespace().skip(2).collect();
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.split_once('=').unwrap().0)
+                .collect::<Vec<_>>(),
+            [
+                "state",
+                "id",
+                "thread",
+                "turn",
+                "source_account",
+                "source_user",
+                "target_account",
+                "target_user"
+            ]
+        );
+        assert!(reply.contains(&format!("target_account={}", target.account)));
+        assert!(!reply.contains("/old/") && !reply.contains("/new/"));
+    }
+    let value = aterm_json::to_value(&moved).unwrap();
+    assert_eq!(value["intent"]["purpose"].as_str(), Some("login_rotation"));
+    assert_eq!(aterm_json::from_value::<Receipt>(value).unwrap(), moved);
+    let mut quota = moved.clone();
+    quota.intent.purpose = Purpose::WeeklyQuota;
+    assert!(quota.reply().starts_with("OK codex-rotation state=ready "));
+    assert!(!quota.same_intent(&moved));
 }
 
 #[test]

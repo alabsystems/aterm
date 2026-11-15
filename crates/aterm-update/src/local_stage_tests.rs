@@ -158,7 +158,9 @@ fn final_publication_rechecks_installed_floor_and_existing_stage_without_losing_
 }
 #[test]
 fn host_binding_uses_the_actual_loaded_image_and_rejects_same_path_replacement() {
-    use aterm_uds::deadline::{KeptUntilRan, ad_hoc_copy, cat_echoes};
+    use std::io::Write as _;
+
+    use aterm_uds::deadline::{FIRST_EXEC_HANG, KeptUntilRan, ad_hoc_copy, prints};
     use aterm_uds::spawnfd::Stdio;
 
     let mut dir = KeptUntilRan::new(crate::paths::scratch_dir("host-binding").keep());
@@ -174,7 +176,9 @@ fn host_binding_uses_the_actual_loaded_image_and_rejects_same_path_replacement()
         .unwrap();
     // Keep the child alive after its echo proves this copy finished its first exec.
     // Without that proof its directory must survive a failed program assessment.
-    let _input = cat_echoes(&mut child);
+    let mut input = child.stdin.take().expect("the native fixture's input");
+    input.write_all(b"ran\n").expect("ask the body for proof");
+    prints(&mut child, "ran", FIRST_EXEC_HANG);
     dir.ran();
     let observed = (|| -> Result<(), String> {
         let pid = i32::try_from(child.id()).map_err(|e| e.to_string())?;

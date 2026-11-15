@@ -2,6 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+
+/// The bound these tests give the journal operations they set a scene with: a hang guard of
+/// minutes, not the journal's own 60 s wait for a remote ([`judged::deadline`]), which a loaded
+/// Mac's fixture can outlive with nothing wrong in the code (2026-11-13, `judged`'s own tests).
+fn journal_bound() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(10 * 60)
+}
+
 #[test]
 fn bootstrap_stop_cause_keeps_named_environment_before_build_output() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -463,76 +471,104 @@ fn stopping_a_sample_first_allows_its_signal_handler_to_clean_up() {
         "direct SIGKILL would prevent the worker from retiring its nested groups"
     );
 }
+/// A CLAIM IS RENEWED AT EACH STAGE END AND AT LEAST EVERY TEN MINUTES, and a renewal the
+/// journal did not take is tried again a minute on: sooner than the next ten minutes, and not at
+/// every look. Another attempt's hold is asked after at the usual pace. What failed stays for
+/// the attempt's last record, whatever succeeds later.
 #[test]
-fn failed_renewals_preserve_only_confirmed_time_and_ownership_loss_stops() {
+fn a_claim_is_renewed_at_each_stage_end_and_every_ten_minutes_and_a_failure_is_tried_again_sooner()
+{
     let start = Instant::now();
     let at = |seconds| start + Duration::from_secs(seconds);
-    let mut lease = Renewal::new(at(120), 1120, start);
+    let mut renewal = Renewal::new(start);
     assert!(
-        lease
-            .finish(
-                Err(PublishError::Unavailable("network".into())),
-                at(30),
-                1150,
-                at(31),
-                1031
-            )
-            .is_ok()
+        renewal.due(start, 0),
+        "the first renewal carries the sampled inputs"
     );
-    assert_eq!(lease.last_failure.as_deref(), Some("network"));
-    assert_eq!(lease.expires, at(120));
-    assert_eq!(lease.epoch_until, 1120);
-    assert_eq!(lease.next, at(36));
-    assert_eq!(lease.deadline(at(87), 1087), at(90));
+    renewal.renewed(start, 0);
+    assert!(!renewal.due(at(judged::RENEW_EVERY - 1), 0));
+    assert!(renewal.due(at(judged::RENEW_EVERY), 0));
+    assert!(renewal.due(at(1), 1), "a stage ended");
+    renewal.renewed(at(1), 1);
+    assert!(!renewal.due(at(judged::RENEW_EVERY), 1));
+    assert_eq!(renewal.evidence(), None);
+
+    renewal.failed(at(700), 1, &PublishError::Unavailable("network".into()));
+    assert!(!renewal.due(at(700 + RENEW_RETRY - 1), 1));
+    assert!(renewal.due(at(700 + RENEW_RETRY), 1));
     assert!(
-        !lease.valid(at(31), 1121),
-        "sleep or a forward wall-clock jump cannot prolong ownership"
+        renewal.due(at(701), 2),
+        "a stage end is a renewal's time while renewals fail, too"
     );
+    renewal.failed(
+        at(701),
+        2,
+        &PublishError::Displaced("judging by two".into()),
+    );
+    assert!(!renewal.due(at(701 + RENEW_RETRY), 2));
+    assert!(renewal.due(at(701 + judged::RENEW_EVERY), 2));
+    renewal.renewed(at(701 + judged::RENEW_EVERY), 2);
+    let evidence = renewal.evidence().expect("what failed");
     assert!(
-        !lease.valid(at(121), 900),
-        "a backward wall-clock jump cannot prolong ownership"
+        evidence.contains("failed: 2") && evidence.contains("judging by two"),
+        "{evidence}"
     );
-    assert!(lease.finish(Ok(()), at(60), 1180, at(61), 1061).is_ok());
-    assert_eq!(
-        lease.last_failure.as_deref(),
-        Some("network"),
-        "a later success retains the last failed transaction for diagnostics"
-    );
-    assert_eq!(lease.expires, at(180));
-    assert_eq!(lease.cutoff(), at(150));
-    assert!(
-        lease
-            .finish(Err(PublishError::Lost), at(80), 1200, at(81), 1081)
-            .is_err()
-    );
-    assert!(
-        lease
-            .finish(
-                Err(PublishError::Unavailable("network".into())),
-                at(145),
-                1265,
-                at(150),
-                1150
-            )
-            .is_err()
-    );
-    assert_eq!(lease.expires, at(180));
 }
 
+/// A STAGE END IS A STAGE LOG WRITTEN SINCE THE SAMPLE BEGAN. An earlier sample's log, the
+/// sample's own output and the service's log are none.
 #[test]
-fn renewal_uses_the_owned_lease_budget_instead_of_an_unrelated_timeout() {
-    let start = Instant::now();
-    let at = |seconds| start + Duration::from_secs(seconds);
-    let mut lease = Renewal::new(at(120), 1120, start);
-    // A six-second fetch/append/push fits the owned lease. The old five-second cap
-    // rejected it even though sixty seconds remained before cleanup had to begin.
-    assert_eq!(lease.deadline(at(30), 1030), at(90));
-    assert!(at(36) < lease.deadline(at(30), 1030));
-    lease.finish(Ok(()), at(30), 1150, at(36), 1036).unwrap();
-    assert_eq!(lease.expires, at(150));
-    assert_eq!(lease.epoch_until, 1150);
-    assert_eq!(lease.deadline(at(87), 1140), at(87));
-    assert_eq!(lease.deadline(at(119), 1000), at(120));
+fn a_stage_end_is_a_stage_log_written_since_the_sample_began() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let git_dir = dir.path().join(".git");
+    fs::create_dir(&git_dir).unwrap();
+    let began = std::time::SystemTime::now();
+    let write = |name: &str, written: std::time::SystemTime| {
+        let file = File::create(git_dir.join(name)).unwrap();
+        file.set_modified(written).unwrap();
+    };
+    let earlier = began - Duration::from_secs(3_600);
+    let later = began + Duration::from_secs(1);
+    assert_eq!(stage_ends(dir.path(), began), 0);
+    write("watch-inputs.log", earlier);
+    write("watch-sample.log", later);
+    write("watch-service.log", later);
+    write("watch-result.toml", later);
+    assert_eq!(stage_ends(dir.path(), began), 0);
+    write("watch-candidate.log", later);
+    assert_eq!(stage_ends(dir.path(), began), 1);
+    write("watch-inputs.log", later);
+    write("watch-tree.log", later);
+    assert_eq!(stage_ends(dir.path(), began), 3);
+}
+
+/// A DECLINED START IS LOGGED ONCE PER REASON, a failure each time, and a sample that ran
+/// leaves no line here (its record is the journal's).
+#[test]
+fn a_declined_start_is_logged_once_per_reason() {
+    let declined = |why: &str| Ok(Start::Declined(why.into()));
+    let mut last = None;
+    assert_eq!(
+        log_line(&mut last, &declined("busy")).as_deref(),
+        Some("verify watch: no sample started: busy")
+    );
+    assert_eq!(log_line(&mut last, &declined("busy")), None);
+    assert_eq!(
+        log_line(&mut last, &declined("c0ffee is red by m1")).as_deref(),
+        Some("verify watch: no sample started: c0ffee is red by m1")
+    );
+    assert_eq!(log_line(&mut last, &Ok(Start::Judged)), None);
+    assert_eq!(
+        log_line(&mut last, &declined("c0ffee is red by m1")).as_deref(),
+        Some("verify watch: no sample started: c0ffee is red by m1"),
+        "a sample ran in between, so the reason is news again"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            log_line(&mut last, &Err("journal away".into())).as_deref(),
+            Some("verify watch: sample could not run: journal away")
+        );
+    }
 }
 
 #[test]
@@ -628,13 +664,13 @@ fn attribution_names_non_merge_suspects_and_only_an_unambiguous_fix() {
             "origin",
             None,
             &record(&base, "pass", 30),
-            judged::deadline()
+            journal_bound()
         )
         .unwrap()
     );
     git(&root, &["checkout", "-b", "unrelated", &base]).unwrap();
     let unrelated = commit("unrelated pass", "side");
-    let head = judged::head(&root, "origin", judged::deadline())
+    let head = judged::head(&root, "origin", journal_bound())
         .unwrap()
         .unwrap();
     assert!(
@@ -643,13 +679,13 @@ fn attribution_names_non_merge_suspects_and_only_an_unambiguous_fix() {
             "origin",
             Some(&head),
             &record(&unrelated, "pass", 100),
-            judged::deadline()
+            journal_bound()
         )
         .unwrap()
     );
     git(&root, &["checkout", "main"]).unwrap();
     let nearest_green = commit("newer green", "still good");
-    let head = judged::head(&root, "origin", judged::deadline())
+    let head = judged::head(&root, "origin", journal_bound())
         .unwrap()
         .unwrap();
     assert!(
@@ -658,7 +694,7 @@ fn attribution_names_non_merge_suspects_and_only_an_unambiguous_fix() {
             "origin",
             Some(&head),
             &record(&nearest_green, "pass", 20),
-            judged::deadline()
+            journal_bound()
         )
         .unwrap()
     );
@@ -679,19 +715,10 @@ fn attribution_names_non_merge_suspects_and_only_an_unambiguous_fix() {
         std::slice::from_ref(&red),
         "publication time and an unrelated pass cannot move the range before the nearest green"
     );
-    let head = judged::head(&root, "origin", judged::deadline())
+    let head = judged::head(&root, "origin", journal_bound())
         .unwrap()
         .unwrap();
-    assert!(
-        judged::append(
-            &root,
-            "origin",
-            Some(&head),
-            &red_record,
-            judged::deadline()
-        )
-        .unwrap()
-    );
+    assert!(judged::append(&root, "origin", Some(&head), &red_record, journal_bound()).unwrap());
     let fix = commit("fix", "good again");
     let fixed_tree = git(&root, &["rev-parse", "HEAD^{tree}"]).unwrap();
     let merge = git(
@@ -731,7 +758,7 @@ fn attribution_names_non_merge_suspects_and_only_an_unambiguous_fix() {
 
     git(&root, &["checkout", "-b", "attribution-left", &base]).unwrap();
     let left = commit("left green", "left good");
-    let head = judged::head(&root, "origin", judged::deadline())
+    let head = judged::head(&root, "origin", journal_bound())
         .unwrap()
         .unwrap();
     assert!(
@@ -740,13 +767,13 @@ fn attribution_names_non_merge_suspects_and_only_an_unambiguous_fix() {
             "origin",
             Some(&head),
             &record(&left, "pass", 70),
-            judged::deadline()
+            journal_bound()
         )
         .unwrap()
     );
     git(&root, &["checkout", "-b", "attribution-right", &base]).unwrap();
     let right = commit("right green", "right good");
-    let head = judged::head(&root, "origin", judged::deadline())
+    let head = judged::head(&root, "origin", journal_bound())
         .unwrap()
         .unwrap();
     assert!(
@@ -755,7 +782,7 @@ fn attribution_names_non_merge_suspects_and_only_an_unambiguous_fix() {
             "origin",
             Some(&head),
             &record(&right, "pass", 80),
-            judged::deadline()
+            journal_bound()
         )
         .unwrap()
     );
@@ -1278,6 +1305,116 @@ fn suspects_include_transitive_workspace_dependencies_but_not_unrelated_crates()
 }
 
 #[test]
+fn a_closure_holds_what_the_lock_links_through_a_patch() {
+    // As `targo metadata --no-deps` words a workspace: its members and their path dependencies.
+    // No manifest names by path what the root manifest patches in, all of it outside the
+    // workspace; only the lock says which member links which.
+    let registry = "registry+https://example.invalid/index";
+    let mirror = "registry+https://example.invalid/mirror";
+    let described = Described {
+        metadata: aterm_json::json!({"packages": [
+            {"name": "a", "manifest_path": "/repo/crates/a/Cargo.toml", "dependencies": [
+                {"name": "b", "path": "/repo/crates/b"},
+                {"name": "reg", "path": null},
+                {"name": "shim", "path": null}
+            ]},
+            {"name": "b", "manifest_path": "/repo/crates/b/Cargo.toml", "dependencies": []},
+            {"name": "c", "manifest_path": "/repo/crates/c/Cargo.toml", "dependencies": []},
+            {"name": "ghost", "manifest_path": "/repo/crates/ghost/Cargo.toml", "dependencies": []}
+        ]}),
+        manifest: aterm_toml::from_str(
+            "[patch.crates-io]\n\
+             shim = { path = \"./vendor/shim-1\" }\n\
+             shim-2 = { package = \"shim\", path = \"vendor/shim-2\" }\n\
+             deep = { path = \"vendor/deep\" }\n\
+             unused = { path = \"vendor/unused\" }\n\
+             elsewhere = { git = \"https://example.invalid/elsewhere\" }\n\
+             [patch.\"https://example.invalid/forked\"]\n\
+             forked = { path = \"vendor/forked\" }\n",
+        )
+        .unwrap(),
+        lock: aterm_toml::from_str(&format!(
+            "version = 4\n\
+             [[package]]\nname = \"a\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"b\", \"reg\", \"shim 1.0.0\"]\n\
+             [[package]]\nname = \"b\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"forked\", \"twin 1.0.0 ({mirror})\"]\n\
+             [[package]]\nname = \"c\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"shim 1.0.0\", \"unused\"]\n\
+             [[package]]\nname = \"deep\"\nversion = \"0.1.0\"\n\
+             [[package]]\nname = \"forked\"\nversion = \"0.3.0\"\n\
+             [[package]]\nname = \"reg\"\nversion = \"1.2.0\"\nsource = \"{registry}\"\n\
+             checksum = \"of-reg\"\ndependencies = [\"shim 2.0.0\"]\n\
+             [[package]]\nname = \"shim\"\nversion = \"1.0.0\"\n\
+             [[package]]\nname = \"shim\"\nversion = \"2.0.0\"\ndependencies = [\"deep\"]\n\
+             [[package]]\nname = \"twin\"\nversion = \"1.0.0\"\nsource = \"{registry}\"\n\
+             checksum = \"of-twin\"\n\
+             [[package]]\nname = \"twin\"\nversion = \"1.0.0\"\nsource = \"{mirror}\"\n\
+             checksum = \"of-mirrored-twin\"\n\
+             [[package]]\nname = \"unused\"\nversion = \"1.0.0\"\n"
+        ))
+        .unwrap(),
+    };
+    let closure = |crate_dir: &str, dependencies| {
+        item_closure(
+            Path::new("/repo"),
+            &BTreeSet::from([crate_dir.to_owned()]),
+            dependencies,
+            "",
+            &|| Ok(&described),
+        )
+    };
+    let set = |members: &[&str]| -> BTreeSet<String> {
+        members.iter().map(|member| (*member).to_owned()).collect()
+    };
+    assert_eq!(
+        closure("crates/a", true).unwrap(),
+        Closure {
+            paths: set(&[
+                "crates/a",
+                "crates/b",
+                "vendor/deep",
+                "vendor/forked",
+                "vendor/shim-1",
+                "vendor/shim-2",
+            ]),
+            registry: set(&[
+                &format!("reg 1.2.0 {registry} of-reg"),
+                &format!("twin 1.0.0 {mirror} of-mirrored-twin"),
+            ]),
+        },
+        "a patched crate a member names by version, one a registry package between them names, \
+         and one a path dependency names; of two registry packages of one name and version, \
+         the one the lock's dependency names"
+    );
+    assert_eq!(
+        closure("crates/c", true).unwrap(),
+        Closure {
+            paths: set(&[
+                "crates/c",
+                "vendor/shim-1",
+                "vendor/shim-2",
+                "vendor/unused"
+            ]),
+            registry: BTreeSet::new(),
+        },
+        "both directories of the name `shim` are its, and only version 2.0.0 links `deep`"
+    );
+    assert_eq!(
+        closure("crates/a", false).unwrap(),
+        Closure {
+            paths: set(&["crates/a"]),
+            registry: BTreeSet::new(),
+        }
+    );
+    assert_eq!(
+        closure("crates/ghost", true).unwrap_err(),
+        "Cargo.lock holds no package at crates/ghost",
+        "a crate the lock does not hold has no closure to compare"
+    );
+}
+
+#[test]
 fn signal_provenance_survives_watch_messages_and_the_tail_limit() {
     let mut output = (0..32)
         .map(|n| format!("watch stage={n} done\n"))
@@ -1301,4 +1438,355 @@ fn signal_provenance_survives_watch_messages_and_the_tail_limit() {
     }
     let control = row("tree", Some(0), "completed");
     assert!(!control.log.contains("sender_pid"));
+}
+
+/// A lane journal on a scratch bare remote, and one checkout per named host with it as `origin`.
+fn lane(hosts: &[&str]) -> (aterm_tempfile::TempDir, Vec<PathBuf>) {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--quiet", "--bare", "journal"]).unwrap();
+    let journal = dir.path().join("journal");
+    let roots = hosts
+        .iter()
+        .map(|host| {
+            git(dir.path(), &["init", "--quiet", "-b", "main", host]).unwrap();
+            let root = dir.path().join(host);
+            git(&root, &["config", "user.name", "Andrew Yates"]).unwrap();
+            git(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+            git(
+                &root,
+                &["remote", "add", "origin", journal.to_str().unwrap()],
+            )
+            .unwrap();
+            root
+        })
+        .collect();
+    (dir, roots)
+}
+
+/// `host`'s claim of `tree`, made at `at`.
+fn claim(host: &str, tree: &str, token: &str, at: u64) -> Record {
+    Record {
+        commit: format!("commit-of-{tree}"),
+        tree: tree.into(),
+        host: host.into(),
+        verifier: String::new(),
+        controller: String::new(),
+        inputs: String::new(),
+        token: token.into(),
+        state: "judging".into(),
+        cause: String::new(),
+        started: at,
+        updated: at,
+        lease_until: at + judged::LEASE,
+        rows: Vec::new(),
+    }
+}
+
+/// A sample that is looked at `looks` more times, thirty seconds apart by its own clock, and then
+/// exits clean. Nothing signals its controller, and no real time passes.
+struct Scripted {
+    at: Instant,
+    epoch: u64,
+    looks: u64,
+    stopped: bool,
+}
+
+impl Attended for Scripted {
+    fn exited(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        use std::os::unix::process::ExitStatusExt as _;
+        if self.looks == 0 {
+            return Ok(Some(std::process::ExitStatus::from_raw(0)));
+        }
+        self.looks -= 1;
+        Ok(None)
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        self.stopped = true;
+        Ok(())
+    }
+
+    fn signal(&self) -> Option<i32> {
+        None
+    }
+
+    fn now(&self) -> (Instant, u64) {
+        (self.at, self.epoch)
+    }
+
+    fn stages(&mut self) -> usize {
+        0
+    }
+
+    fn pause(&mut self) {
+        self.at += Duration::from_secs(30);
+        self.epoch += 30;
+    }
+}
+
+/// A JUDGMENT IS WORTH MORE THAN ITS LEASE, AND ITS LAST RECORD REACHES THE JOURNAL ONCE. Over a
+/// journal on a scratch remote and a scripted clock: (1) with the journal away for two leases'
+/// time, every renewal fails and the sample is neither stopped nor failed; (2) its terminal
+/// record, which cannot be published either, is kept in the checkout, and the next loop appends
+/// it at its tree's slot, lapsed lease and all, and forgets the copy; (3) a loop after that, and
+/// a copy that outlived its own publication, append nothing; (4) where another host claimed the
+/// tree after the lapse and its red or its live claim holds the slot, the late record is filed
+/// beside that host's, whichever finishes first, and a red in the slot is not replaced by the
+/// late pass; (5) a claim whose controller ended while judging is closed as could-not-run by the
+/// next loop. NEGATIVE CONTROLS: stop the sample when a renewal fails, as the 120 s lease did,
+/// and (1) fails; let nothing read the kept record, and (2) fails; append a kept record without
+/// asking the journal for it, and (3) fails; file a late record at the slot, and (4) loses the
+/// other host's.
+#[test]
+fn a_judgment_outlives_failed_renewals_and_its_terminal_record_is_published_later() {
+    let (dir, roots) = lane(&["one", "two"]);
+    let [one, two] = roots.as_slice() else {
+        unreachable!("two hosts were asked for");
+    };
+    let journal = dir.path().join("journal");
+    let away = dir.path().join("away");
+    let reach = |root: &Path, there: bool| {
+        let url = if there { &journal } else { &away };
+        git(
+            root,
+            &["remote", "set-url", "origin", url.to_str().unwrap()],
+        )
+        .unwrap();
+    };
+    let head = |root: &Path| judged::head(root, "origin", judged::deadline()).unwrap();
+    let slot = |root: &Path, tree: &str| {
+        judged::record(root, head(root).as_deref(), tree, judged::deadline()).unwrap()
+    };
+    let all =
+        |root: &Path| judged::records(root, head(root).as_deref(), judged::deadline()).unwrap();
+    let append = |root: &Path, record: &Record| {
+        assert!(
+            judged::append(
+                root,
+                "origin",
+                head(root).as_deref(),
+                record,
+                judged::deadline()
+            )
+            .unwrap()
+        );
+    };
+    let kept = |root: &Path| -> Record {
+        aterm_toml::from_str(&fs::read_to_string(saved(root)).expect("the kept record")).unwrap()
+    };
+    let red = |record: &mut Record| {
+        record.state = "red".into();
+        record.rows = vec![row("tree", Some(1), "FAIL the item")];
+    };
+    let began = 1_800_000_000;
+
+    // (1) Host one claims a tree and keeps the claim, as an attempt does. Then the journal is
+    // away for the whole judgment.
+    let mut first = claim("one", "t1", "first", began);
+    append(one, &first);
+    save(one, &first).unwrap();
+    let claimed = head(one);
+    reach(one, false);
+    let mut sample = Scripted {
+        at: Instant::now(),
+        epoch: began,
+        looks: 2 * judged::LEASE / 30 + 1,
+        stopped: false,
+    };
+    let ended = attend(one, &mut first, &mut sample);
+    assert!(
+        !sample.stopped,
+        "a renewal that failed ended the judgment: {ended:?}"
+    );
+    assert!(
+        matches!(&ended, Ok((Ended::Exited(status), Some(_))) if status.success()),
+        "the sample runs to its own end, and the failed renewals are named: {ended:?}"
+    );
+    let ended_at = sample.epoch;
+    assert!(
+        ended_at > began + 2 * judged::LEASE,
+        "control: the lease lapsed while the sample ran"
+    );
+
+    // (2) The verdict cannot be published while the journal is away: it is kept.
+    red(&mut first);
+    assert!(
+        conclude(one, &mut first, ended_at).is_err(),
+        "control: the journal is away"
+    );
+    assert_eq!(kept(one), first);
+    assert_eq!((first.state.as_str(), first.lease_until), ("red", 0));
+    reach(one, true);
+    assert_eq!(head(one), claimed, "nothing reached the journal meanwhile");
+    assert!(
+        slot(one, "t1").is_some_and(|held| held.state == "judging" && !held.occupied(ended_at)),
+        "control: the journal holds the claim, and its lease has lapsed"
+    );
+    // The next loop publishes it and forgets the copy.
+    settle(one, ended_at + 60).unwrap();
+    assert!(!saved(one).exists());
+    assert_eq!(slot(one, "t1"), Some(first.clone()));
+    let published = head(one);
+    assert_ne!(published, claimed);
+
+    // (3) Never twice: the loop after has nothing to publish, and a copy that outlived its own
+    // publication (the controller ended between the push and the removal) is only forgotten.
+    settle(one, ended_at + 120).unwrap();
+    assert_eq!(head(one), published);
+    save(one, &first).unwrap();
+    settle(one, ended_at + 180).unwrap();
+    assert_eq!(head(one), published, "the journal already held it");
+    assert!(!saved(one).exists());
+
+    // (4a) Two hosts judge one tree after a lapse; the other host's red is in the slot first.
+    let at = ended_at + 1_000;
+    let mut late = claim("one", "t2", "late", at);
+    append(one, &late);
+    save(one, &late).unwrap();
+    reach(one, false);
+    let lapsed = at + judged::LEASE + 1;
+    assert!(
+        slot(two, "t2").is_some_and(|held| !held.occupied(lapsed)),
+        "control: host one's lease lapsed, so host two may claim the tree"
+    );
+    let mut other = claim("two", "t2", "other", lapsed);
+    append(two, &other);
+    red(&mut other);
+    conclude(two, &mut other, lapsed + 600).unwrap();
+    assert_eq!(slot(two, "t2"), Some(other.clone()));
+    late.state = "pass".into();
+    assert!(conclude(one, &mut late, lapsed + 700).is_err());
+    reach(one, true);
+    settle(one, lapsed + 760).unwrap();
+    assert!(!saved(one).exists());
+    assert_eq!(
+        slot(one, "t2"),
+        Some(other.clone()),
+        "a red is never replaced by a later pass"
+    );
+    let records = all(one);
+    assert!(
+        records.contains(&late) && records.contains(&other),
+        "two hosts that judged one tree leave two records: {records:?}"
+    );
+    let published = head(one);
+    save(one, &late).unwrap();
+    settle(one, lapsed + 820).unwrap();
+    assert_eq!(
+        head(one),
+        published,
+        "a record beside the slot is not filed twice"
+    );
+
+    // (4b) The same, with the other host still judging under a live claim when the late record
+    // arrives: its claim is left alone, and its own verdict then takes the slot.
+    let at = lapsed + 2_000;
+    let mut late = claim("one", "t3", "late3", at);
+    append(one, &late);
+    let lapsed = at + judged::LEASE + 1;
+    let mut other = claim("two", "t3", "other3", lapsed);
+    append(two, &other);
+    red(&mut late);
+    conclude(one, &mut late, lapsed + 60).unwrap();
+    assert_eq!(
+        slot(one, "t3"),
+        Some(other.clone()),
+        "a live claim of another host is not replaced"
+    );
+    other.state = "pass".into();
+    conclude(two, &mut other, lapsed + 120).unwrap();
+    assert_eq!(slot(two, "t3"), Some(other.clone()));
+    let records = all(two);
+    assert!(
+        records.contains(&late) && records.contains(&other),
+        "{records:?}"
+    );
+
+    // (5) A controller that ended while judging left its claim in the checkout and the
+    // journal: the next loop closes it.
+    let at = lapsed + 2_000;
+    let orphan = claim("one", "t4", "orphan", at);
+    append(one, &orphan);
+    save(one, &orphan).unwrap();
+    settle(one, at + 90).unwrap();
+    assert!(!saved(one).exists());
+    let closed = slot(one, "t4").expect("the closed claim");
+    assert_eq!(
+        (
+            closed.token.as_str(),
+            closed.state.as_str(),
+            closed.lease_until
+        ),
+        ("orphan", "could-not-run", 0)
+    );
+    assert_eq!(closed.updated, at + 90);
+}
+
+/// A TREE WITH A VERDICT IS NOT CLAIMED AGAIN, WHEREVER THE VERDICT IS FILED. Host one's red is
+/// filed beside the live claim host two made after one's lease lapsed; host two's attempt then
+/// ends cancelled, which leaves the slot to any new claim. The red beside it still keeps a new
+/// claim out. CONTROLS: the same tree before the red is held by nothing once the claim on it
+/// lapses, and after it by the live claim alone until that claim ends. NEGATIVE CONTROL: ask
+/// the slot alone, as a claim did, and the tree is judged again after its red.
+#[test]
+fn a_tree_judged_beside_its_slot_is_not_claimed_again() {
+    let (_dir, roots) = lane(&["one", "two"]);
+    let [one, two] = roots.as_slice() else {
+        unreachable!("two hosts were asked for");
+    };
+    let head = |root: &Path| judged::head(root, "origin", judged::deadline()).unwrap();
+    let append = |root: &Path, record: &Record| {
+        assert!(
+            judged::append(
+                root,
+                "origin",
+                head(root).as_deref(),
+                record,
+                judged::deadline()
+            )
+            .unwrap()
+        );
+    };
+    let held_at = |root: &Path, epoch: u64| {
+        holder(root, head(root).as_deref(), "t", epoch, judged::deadline())
+            .unwrap()
+            .map(|held| (held.token, held.state))
+    };
+    let began = 1_800_000_000;
+    let mut late = claim("one", "t", "late", began);
+    append(one, &late);
+    let lapsed = began + judged::LEASE + 1;
+    assert_eq!(
+        held_at(two, began + 1),
+        Some(("late".into(), "judging".into()))
+    );
+    assert_eq!(
+        held_at(two, lapsed),
+        None,
+        "control: a lapsed claim holds nothing"
+    );
+    let mut other = claim("two", "t", "other", lapsed);
+    append(two, &other);
+    late.state = "red".into();
+    late.rows = vec![row("tree", Some(1), "FAIL the item")];
+    conclude(one, &mut late, lapsed + 60).unwrap();
+    assert_eq!(
+        held_at(one, lapsed + 61),
+        Some(("other".into(), "judging".into())),
+        "control: the live claim holds the slot, and the red is beside it"
+    );
+    other.state = "cancelled".into();
+    conclude(two, &mut other, lapsed + 120).unwrap();
+    assert_eq!(
+        judged::record(two, head(two).as_deref(), "t", judged::deadline())
+            .unwrap()
+            .map(|held| held.occupied(lapsed + 121)),
+        Some(false),
+        "control: the slot itself is open to a new claim"
+    );
+    assert_eq!(
+        held_at(two, lapsed + 121),
+        Some(("late".into(), "red".into())),
+        "a red beside the slot keeps the tree from being judged again"
+    );
 }

@@ -1120,6 +1120,14 @@ pub(crate) struct AckedLog {
     /// a floor nor an offset is floored at the head its next attach reads, and written so
     /// (critic item F20, `Bridge::floor_at_the_head`).
     pub floor: Option<u64>,
+    /// The identity of the bus log the window was kept on, the file's `log=<id>` entry: every
+    /// replace this build makes names the log the node reads then, ahead of the floor, so the
+    /// window is bound to its log by construction and a window of another log is never read as
+    /// this one's (`Bridge::drop_a_window_of_another_log`), whatever a power cut brought back of
+    /// the other files. `None` for no file, one that cannot be read, one written while the
+    /// broker answered no identity, or one an older build wrote. Its comma ends it, so a cut
+    /// inside it leaves no entry, never a shorter identity.
+    pub log: Option<astream_broker::LogIdentity>,
     /// How many offset entries the file holds, repeats included.
     pub entries: usize,
     /// Whether the file ends at a terminator (or is absent), so an append may go on after its last byte.
@@ -1129,6 +1137,9 @@ pub(crate) struct AckedLog {
 /// The prefix of the `acked` log's floor entry ([`AckedLog::floor`]): no offset, so a build
 /// before it reads past it, as it reads past every piece that is not one.
 const ACKED_FLOOR: &str = "floor=";
+
+/// The prefix of the `acked` log's log entry ([`AckedLog::log`]), which no offset reads as.
+const ACKED_LOG: &str = "log=";
 
 impl AckedLog {
     fn parse(text: &str) -> Self {
@@ -1145,6 +1156,10 @@ impl AckedLog {
                 }
                 continue;
             }
+            if let Some(id) = piece.trim().strip_prefix(ACKED_LOG) {
+                log.log = astream_broker::LogIdentity::parse(id);
+                continue;
+            }
             log.entries += 1;
             if let Some(off) = crate::parse_uint(piece.trim()) {
                 log.offsets.insert(off);
@@ -1159,9 +1174,19 @@ impl AckedLog {
         log
     }
 
-    /// `offsets`, each ended by its comma, after the floor entry where `floor` names one.
-    fn render(floor: Option<u64>, offsets: impl Iterator<Item = u64>) -> String {
+    /// `offsets`, each ended by its comma, after the floor entry where `floor` names one, after
+    /// the log entry where `log` names one.
+    fn render(
+        log: Option<astream_broker::LogIdentity>,
+        floor: Option<u64>,
+        offsets: impl Iterator<Item = u64>,
+    ) -> String {
         let mut text = String::new();
+        if let Some(log) = log {
+            text.push_str(ACKED_LOG);
+            text.push_str(&log.to_string());
+            text.push(',');
+        }
         if let Some(floor) = floor {
             text.push_str(ACKED_FLOOR);
             text.push_str(&floor.to_string());
@@ -2075,6 +2100,14 @@ impl StateDir {
         let mut known = self.logpin_fence.lock().unwrap_or_else(|e| e.into_inner());
         let durable = !self.logpin_fence_known(&mut known);
         self.replace_logpin(text, &mut known, durable)
+    }
+
+    /// [`StateDir::set_logpin`] ON THE MEDIA before it returns, whatever fence this open holds:
+    /// the drop of a pin that names a log this node no longer reads (`Bridge::mirror_forget_log`),
+    /// which must not come back under a power cut once the node's witness names the new log.
+    pub(crate) fn set_logpin_durable(&self, text: &str) -> io::Result<()> {
+        let mut known = self.logpin_fence.lock().unwrap_or_else(|e| e.into_inner());
+        self.replace_logpin(text, &mut known, true)
     }
 
     /// Establish the current pin's v=2 fence before a copy, take or send, by two full flushes of
@@ -3039,6 +3072,7 @@ impl StateDir {
             }
             taken.push(rel);
         }
+        let in_flight_start = frames.len();
         for (name, rel) in &in_flight {
             let entry = match self.read_reservation(rel) {
                 Ok(None) => continue,
@@ -3058,6 +3092,22 @@ impl StateDir {
                 frames.push(journal::Frame::InFlight(posts.handed_entry(entry)));
             }
             taken.push(rel);
+        }
+        // Files have no publication order. Matching entries in the current hand-off
+        // retain its journal order, including when a keyed post reuses an old sequence.
+        if let Some(handed) = posts.handed.as_ref() {
+            let order: std::collections::BTreeMap<_, _> = handed
+                .in_publication_order()
+                .enumerate()
+                .map(|(position, (seq, entry))| (seq, (position, entry)))
+                .collect();
+            frames[in_flight_start..].sort_by_key(|frame| match frame {
+                journal::Frame::InFlight(entry) => order
+                    .get(&entry.pin.seq)
+                    .filter(|(_, held)| *held == entry)
+                    .map_or(usize::MAX, |(position, _)| *position),
+                _ => usize::MAX,
+            });
         }
         // THE HAND-OFF'S ATTACH, NAMED WITH THE RECORDS IT KEPT HEADS FOR (item F4): a journal an
         // adoption starts names no attach until this open's own takes its incarnation, and a
@@ -4189,14 +4239,16 @@ impl StateDir {
     }
 
     /// Replace the acked self-lane set with the newest `keep` of `set`, under the window floor
-    /// `floor` ([`AckedLog::floor`]), raised to the oldest kept where `keep` drops any. The
-    /// descriptor the appends held goes first, under its lock, so no append lands in the file
-    /// the rename unlinks: the next one opens the file this puts at the name.
+    /// `floor` ([`AckedLog::floor`]), raised to the oldest kept where `keep` drops any, the
+    /// window bound to `log`, the log it is kept on ([`AckedLog::log`]). The descriptor the
+    /// appends held goes first, under its lock, so no append lands in the file the rename
+    /// unlinks: the next one opens the file this puts at the name.
     pub fn set_self_acked(
         &self,
         set: &std::collections::BTreeSet<u64>,
         floor: u64,
         keep: usize,
+        log: Option<astream_broker::LogIdentity>,
     ) -> io::Result<()> {
         let mut held = self.acked.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(test)]
@@ -4216,7 +4268,7 @@ impl StateDir {
         };
         self.replace_bytes(
             "acked",
-            AckedLog::render(Some(floor), kept).as_bytes(),
+            AckedLog::render(log, Some(floor), kept).as_bytes(),
             false,
             STATE_FILE_MODE,
         )
@@ -4234,7 +4286,7 @@ impl StateDir {
         let _call = self.timed(crate::wait_tally::Row::AppendSelfAcked);
         self.count(|ops| ops.appends += 1);
         let path = self.path("acked");
-        let line = AckedLog::render(floor, offs.iter().copied());
+        let line = AckedLog::render(None, floor, offs.iter().copied());
         let w = crate::fx::Write::Append {
             path: &path,
             bytes: line.as_bytes(),
@@ -4271,6 +4323,37 @@ impl StateDir {
             .in_flight
             .iter()
             .map(|(seq, entry)| (*seq, entry.clone()))
+            .collect())
+    }
+
+    /// Read a projection of the outstanding entry at `seq`, if present, without
+    /// first cloning the entry. The projection runs under the post-journal cache lock
+    /// and must not reenter this state directory.
+    ///
+    /// # Errors
+    /// The same damaged or unreadable journal and held legacy entry as [`Self::in_flight`].
+    pub(crate) fn in_flight_at<T>(
+        &self,
+        seq: u64,
+        project: impl FnOnce(&InFlight) -> T,
+    ) -> io::Result<Option<T>> {
+        let mut posts = self.posts()?;
+        self.refuse_a_held_in_flight(&mut posts)?;
+        Ok(posts.index().in_flight.get(&seq).map(project))
+    }
+
+    /// Every current publication in journal order, for the bridge's replay. A key can reuse
+    /// an older sequence, so sequence order is not publication order.
+    ///
+    /// # Errors
+    /// The same damaged or unreadable journal and held legacy entry as [`Self::in_flight`].
+    pub(crate) fn replay_entries(&self) -> io::Result<Vec<(u64, InFlight)>> {
+        let mut posts = self.posts()?;
+        self.refuse_a_held_in_flight(&mut posts)?;
+        Ok(posts
+            .index()
+            .in_publication_order()
+            .map(|(seq, entry)| (seq, entry.clone()))
             .collect())
     }
 
@@ -5715,8 +5798,8 @@ impl StateDir {
         }
         // The forged-self window starts again at this log's head: empty, its floor the head, so
         // no record below the head is accused, and none above it is vouched for until it lands
-        // (`Bridge::remember_self_acks`).
-        self.set_self_acked(&std::collections::BTreeSet::new(), head, 1)?;
+        // (`Bridge::remember_self_acks`), bound to this log ([`AckedLog::log`]).
+        self.set_self_acked(&std::collections::BTreeSet::new(), head, 1, log)?;
         self.clear_halt_acked()?;
         let still: Vec<(String, u64)> =
             owed.iter().filter(|(_, off)| kept(*off)).cloned().collect();

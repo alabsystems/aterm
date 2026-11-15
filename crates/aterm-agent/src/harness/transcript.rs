@@ -528,17 +528,25 @@ struct Conversation(Value);
 struct Exchange(Value);
 struct Goal(Value);
 
-/// A row's `/goal` status ([`super::goal::ClaudeGoal`]): its discriminants and the attachment's
-/// verdict and condition, never another attachment's payload.
+/// A row's `/goal` status ([`super::goal::ClaudeGoal`]): its discriminants and ids, the
+/// attachment's verdict and condition, a system row's words (the notice that names the error a
+/// goal was cleared after, a command typed while a turn ran) and a message's plain-string content
+/// (a command row's), never another attachment's payload or a message's parts.
 const GOAL: Shape = Shape::Object(&[
     ("type", Shape::Scalar),
+    ("subtype", Shape::Scalar),
     ("isSidechain", Shape::Scalar),
+    ("uuid", Shape::Scalar),
+    ("parentUuid", Shape::Scalar),
+    ("content", Shape::Scalar),
+    ("message", Shape::Object(&[("content", Shape::Scalar)])),
     (
         "attachment",
         Shape::Object(&[
             ("type", Shape::Scalar),
             ("met", Shape::Scalar),
             ("failed", Shape::Scalar),
+            ("sentinel", Shape::Scalar),
             ("condition", Shape::Scalar),
         ]),
     ),
@@ -642,7 +650,7 @@ pub(crate) fn flight(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Flight>(line).map(|v| v.0)
 }
 
-/// The goal fold's read of a row ([`super::goal::ClaudeGoal`]): the attachment's type, verdict and condition, never another attachment's payload.
+/// The goal fold's read of a row ([`super::goal::ClaudeGoal`]): the attachment's type, verdict and condition, a system row's words and a command row's plain-string content, never another attachment's payload or a message's parts.
 pub(crate) fn goal(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Goal>(line).map(|v| v.0)
 }

@@ -889,6 +889,7 @@ pub fn pack_package_with_signed_root(
     let mut ctx = ctx.clone();
     if let Some(key) = &request.key {
         ctx.identity.key.clone_from(key);
+        ctx.identity.store = None;
     }
     let ctx = &ctx;
     let signer = pack::Signer::load(ctx)?;

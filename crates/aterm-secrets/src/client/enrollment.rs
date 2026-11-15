@@ -416,7 +416,6 @@ fn admin_cached_observed(paths: &Paths, lock: Option<&StateLock>) -> crate::Resu
     let state = load_state(paths)?;
     if state.membership != Stored::In
         || state.failed
-        || !state.pending.is_empty()
         || !source_bound(&config, &state)
         || !pin_admitted(&config, None)
     {

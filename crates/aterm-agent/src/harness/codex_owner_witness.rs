@@ -124,19 +124,31 @@ impl<'a> OwnerAnchorWriter<'a> {
     }
 
     /// Record a settled refresh refusal against the same effective row and credential context
-    /// that canonical owner admission authenticated. The owner witness check and contextual auth
-    /// word share the retained account writer, so a changed grant, roster or login writes none.
+    /// that canonical owner admission authenticated, with `reason`, the closed word its answer
+    /// named, kept beside the sign-out in that context. The owner witness check and contextual
+    /// auth word share the retained account writer, so a changed grant, roster or login writes
+    /// none. A newer sign-out already on record satisfies the settlement and keeps no reason.
+    ///
+    /// The context is captured only from a login file that still holds the refused refresh
+    /// token, the one `expected`'s pending attempt names by digest, in the same read. The
+    /// admission's earlier comparison of that file excludes aterm's writers alone: a login
+    /// another program put there since is not the one refused, and writes none.
     pub(in crate::harness) fn record_settled_refusal(
         &mut self,
         expected: &OwnerWitness,
         at: i64,
+        reason: super::super::codex_app_login::RefusalReason,
     ) -> Result<SettledRefusal, String> {
         if at <= 0 || at > self.now {
             return Err("settled refusal time unavailable".into());
         }
+        let refused = expected
+            .pending
+            .as_ref()
+            .ok_or("rejected owner attempt unavailable")?;
         let context = self
             .store
-            .capture_auth_context(self.policy.row)
+            .capture_refused_auth_context(self.policy.row, &refused.token_digest)
             .ok_or("rejected owner credential context unavailable")?;
         let raw = self
             .policy
@@ -153,14 +165,7 @@ impl<'a> OwnerAnchorWriter<'a> {
                 if logins.enrollment.owner_witness(self.binding)?.as_ref() != Some(expected) {
                     return Err("rejected owner witness changed".into());
                 }
-                super::accounts::stage_auth(
-                    state,
-                    raw,
-                    logins,
-                    context,
-                    super::accounts::Auth::SignedOut,
-                    at,
-                );
+                super::accounts::stage_settled_refusal(state, raw, logins, context, reason, at);
                 Ok(Vec::new())
             },
         )?;

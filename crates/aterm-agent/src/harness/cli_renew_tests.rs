@@ -412,9 +412,6 @@ impl AccountsHost for RenewHost {
             crate::harness::headless_oauth::WEBMAIL_URL_ENV if self.env_webmail => {
                 return Some("https://mail.example.com/".into());
             }
-            crate::harness::headless_oauth::WEBMAIL_PASS_ENV if self.env_webmail => {
-                return Some("a mailbox password".into());
-            }
             _ => None,
         }
         .map(|path| path.clone().into_os_string())
@@ -2135,6 +2132,296 @@ fn only_a_sign_in_in_aterms_own_window_makes_its_rows_token_in_the_same_run() {
     }
 }
 
+/// The fixture of [`a_window_renewal_writes_no_login_credential_to_the_vault`]: a Mac at its
+/// desk renewing a row in aterm's own window, and the scratch vault it writes.
+#[cfg(unix)]
+mod login_vault {
+    use super::*;
+    use crate::harness::accounts_tokens::tests::{EMAIL, NOW};
+    use crate::harness::accounts_tokens::{TokenVault, Vault};
+    use crate::harness::setup_token::Program;
+    use crate::harness::setup_token::tests::World;
+    use aterm_secrets::SecretBytes;
+    use aterm_secrets::claude_token::{Key, Lookup, Meta, Standing, Verified};
+    use aterm_secrets::client::{MemberUnset, MemberWritten, OnBusy, Paths, WriteRoute};
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    /// The stored login's two OAuth values, stood in for by words no output or account record
+    /// may repeat.
+    pub(super) const STORED_LOGIN: [&str; 2] = [
+        "stored-login-first-stand-in",
+        "stored-login-second-stand-in",
+    ];
+
+    /// The scratch seated vault, standing in for this Mac's: each entry a write, removal or
+    /// restamp asked of it is recorded by name.
+    struct Recorded {
+        real: Vault,
+        names: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Recorded {
+        /// A write or removal of `key`'s pair.
+        fn pair(&self, key: &Key) {
+            self.names
+                .borrow_mut()
+                .extend([key.entry(), key.meta_entry()]);
+        }
+
+        /// A restamp of `key`'s meta alone.
+        fn meta(&self, key: &Key) {
+            self.names.borrow_mut().push(key.meta_entry());
+        }
+    }
+
+    impl TokenVault for Recorded {
+        fn route(&self, by: Instant) -> Result<WriteRoute, String> {
+            self.real.route(by)
+        }
+        fn standing(&self, key: &Key, by: Instant) -> Result<Lookup<Standing>, String> {
+            self.real.standing(key, by)
+        }
+        fn listed(&self) -> Result<Lookup<Vec<Standing>>, String> {
+            self.real.listed()
+        }
+        fn waiting_here(&self, key: &Key) -> Result<bool, String> {
+            self.real.waiting_here(key)
+        }
+        fn seat_here(&self) -> Result<Option<String>, String> {
+            self.real.seat_here()
+        }
+        fn write(
+            &self,
+            key: &Key,
+            token: &SecretBytes,
+            meta: &Meta,
+            on_busy: OnBusy,
+        ) -> Result<MemberWritten, String> {
+            self.pair(key);
+            self.real.write(key, token, meta, on_busy)
+        }
+        fn remove(&self, key: &Key, by: Instant) -> Result<MemberUnset, String> {
+            self.pair(key);
+            self.real.remove(key, by)
+        }
+        fn verify(
+            &self,
+            key: &Key,
+            minted_at: u64,
+            evidence: Verified,
+            on_busy: OnBusy,
+        ) -> Result<MemberWritten, String> {
+            self.meta(key);
+            self.real.verify(key, minted_at, evidence, on_busy)
+        }
+        fn post(&self) -> Result<bool, String> {
+            self.real.post()
+        }
+    }
+
+    /// The host: the sign-in leaves Claude Code's profile and its stored login, both OAuth
+    /// values in it, in the staging home, and the token step runs the setup-token stand-in of
+    /// `world` against `vault`, recording each entry it writes in `names`.
+    pub(super) struct WindowRenewal<'a> {
+        pub(super) world: &'a World,
+        pub(super) vault: &'a Paths,
+        pub(super) names: Rc<RefCell<Vec<String>>>,
+        pub(super) signed_in: RefCell<Vec<PathBuf>>,
+    }
+
+    impl AccountsHost for WindowRenewal<'_> {
+        fn stdin_is_terminal(&self) -> bool {
+            true
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn on_macos(&self) -> bool {
+            true
+        }
+        fn now(&self) -> i64 {
+            i64::try_from(NOW).unwrap()
+        }
+        fn current_exe(&self) -> Option<PathBuf> {
+            std::env::current_exe().ok()
+        }
+        fn opens_sign_in_window(&self) -> bool {
+            true
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            panic!("a renewal checks its staging home, not an ambient login")
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            panic!("a renewal runs its own sign-in")
+        }
+        fn renew_flow(
+            &self,
+            home: &str,
+            email: &str,
+            browser: &RenewBrowser,
+        ) -> Result<i32, String> {
+            assert!(
+                matches!(browser, RenewBrowser::Window { .. }),
+                "{browser:?}"
+            );
+            let home = Path::new(home);
+            std::fs::write(
+                home.join(".claude.json"),
+                format!(r#"{{"oauthAccount":{{"emailAddress":"{email}"}}}}"#),
+            )
+            .unwrap();
+            let [access, refresh] = STORED_LOGIN;
+            std::fs::write(
+                home.join(".credentials.json"),
+                format!(
+                    r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":4102444800000,"scopes":["user:inference"]}}}}"#
+                ),
+            )
+            .unwrap();
+            self.signed_in.borrow_mut().push(home.to_owned());
+            Ok(0)
+        }
+        fn status_in_home(&self, _home: &str) -> Result<Captured, String> {
+            Ok(Captured {
+                stdout: format!(r#"{{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"{EMAIL}","orgId":"o-1","subscriptionType":"max"}}"#).into_bytes(),
+                code: Some(0),
+            })
+        }
+        fn verb_env(&self) -> Vec<(OsString, OsString)> {
+            self.world.env(&[])
+        }
+        fn token_vault(&self) -> Option<Box<dyn TokenVault>> {
+            Some(Box::new(Recorded {
+                real: Vault(self.vault.clone()),
+                names: self.names.clone(),
+            }))
+        }
+        fn setup_token_program(&self) -> Option<(Program, String)> {
+            Some((World::program(), "2.1.318".to_owned()))
+        }
+        fn token_hang(&self) -> Duration {
+            aterm_spec::wait::MUST_HAPPEN
+        }
+    }
+}
+
+/// A WINDOW RENEWAL WRITES NO LOGIN CREDENTIAL TO THE VAULT. The sign-in leaves Claude Code's
+/// stored login, its refresh token included, in the row's new login directory; a login is made
+/// fresh on each Mac and never copied (aterm-secrets' need/catalog.rs, PerMac), since a copy
+/// refreshed on one Mac signs the other out. The account's fleet-wide credential is its
+/// long-term token, so the run's only vault writes are that pair, `aterm-claude-token-<ac key>`
+/// and its `-meta`: the vault text gains no other entry, and no output or account record
+/// repeats the stored login. CONTROL: the pair was written and the vault reads it, so the
+/// recording vault saw the run's mint.
+#[cfg(unix)]
+#[test]
+fn a_window_renewal_writes_no_login_credential_to_the_vault() {
+    use crate::harness::accounts_tokens::TABLE_FILE;
+    use crate::harness::accounts_tokens::tests::{Lab, Scratch, key, keyer};
+    use crate::harness::setup_token::tests::World;
+    use aterm_secrets::claude_token::Lookup;
+    use aterm_secrets::entry_class::CLAUDE_TOKEN_PREFIX;
+    use login_vault::{STORED_LOGIN, WindowRenewal};
+    let scratch = Scratch::new("renew-no-login-credential");
+    let lab = Lab::new();
+    let world = World::new("renew-window-token", false);
+    std::fs::write(world.home().join("go"), b"go").unwrap();
+    let names = || -> std::collections::BTreeSet<String> {
+        aterm_secrets::client::admin_open(&lab.paths)
+            .expect("the vault text")
+            .doc
+            .entries_ref()
+            .map(|entry| entry.name.clone())
+            .collect()
+    };
+    let before = names();
+    let host = WindowRenewal {
+        world: &world,
+        vault: &lab.paths,
+        names: std::rc::Rc::default(),
+        signed_in: RefCell::default(),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = crate::harness::journal::with_keyer(keyer, || {
+        run_accounts(
+            &renew(&["work"], false, None),
+            &scratch.env(),
+            &host,
+            &mut out,
+            &mut err,
+        )
+    });
+    let (out, err) = (
+        String::from_utf8_lossy(&out).into_owned(),
+        String::from_utf8_lossy(&err).into_owned(),
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
+    let signed_in = host.signed_in.borrow().clone();
+    let [login] = signed_in.as_slice() else {
+        panic!("one sign-in: {signed_in:?} {out}{err}");
+    };
+    let store = scratch.store();
+    let logins = store.load_logins(host.now()).expect("the logins").0;
+    assert_eq!(
+        logins.get("work").and_then(|row| row.dir.as_deref()),
+        login.to_str(),
+        "the renewal bound its new login directory"
+    );
+    assert!(
+        crate::ai::connector::stored_login_file(Cli::Claude.connector(), login).is_some(),
+        "PRECONDITION: the stored login is there to copy"
+    );
+    let key = key();
+    assert_eq!(
+        *host.names.borrow(),
+        [key.entry(), key.meta_entry()],
+        "the run writes the account's token pair, once"
+    );
+    assert!(
+        host.names
+            .borrow()
+            .iter()
+            .all(|name| name.starts_with(CLAUDE_TOKEN_PREFIX)),
+        "{:?}",
+        host.names.borrow()
+    );
+    let added: Vec<String> = names().difference(&before).cloned().collect();
+    assert!(
+        added
+            .iter()
+            .all(|name| name.starts_with(CLAUDE_TOKEN_PREFIX)),
+        "the vault text gains no other entry: {added:?}"
+    );
+    let Ok(Lookup::Found(tokens)) = aterm_secrets::claude_token::listed(&lab.paths) else {
+        panic!("the vault reads");
+    };
+    assert_eq!(
+        tokens
+            .iter()
+            .map(|standing| &standing.key)
+            .collect::<Vec<_>>(),
+        [&key],
+        "CONTROL: the vault holds the pair the run wrote"
+    );
+    for bytes in [
+        out.into_bytes(),
+        err.into_bytes(),
+        std::fs::read(store.shared_dir().join(TABLE_FILE)).unwrap_or_default(),
+        std::fs::read(store.logins_file()).unwrap_or_default(),
+        std::fs::read(store.state_file()).unwrap_or_default(),
+    ] {
+        for word in STORED_LOGIN {
+            assert!(
+                !bytes
+                    .windows(word.len())
+                    .any(|part| part == word.as_bytes()),
+                "an output or account record repeats the stored login"
+            );
+        }
+    }
+}
+
 /// An agent's terminal opens no browser on this Mac: a row with no headless route is left to a
 /// person, and a headless run that failed gets no second, interactive one. CONTROL: a person at
 /// the same terminal gets both.
@@ -2768,7 +3055,7 @@ fn a_terminal_opener_failure_ends_the_owned_capture_before_its_budget() {
             .open(&gate)
             .unwrap();
         let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
-        cmd.arg("-c").arg(format!("printf 'opener-outcome=1\\nphase=failed\\nmet={met}\\n' > \"$ATERM_OPEN_URL_OUTCOME\"; read answer < \"$GATE\"; exit 7"));
+        cmd.arg("-c").arg(format!("printf 'opener-outcome=1\\nphase=failed\\nmet={met}\\n' > \"$ATERM_OPEN_URL_OUTCOME.part\"; mv \"$ATERM_OPEN_URL_OUTCOME.part\" \"$ATERM_OPEN_URL_OUTCOME\"; read answer < \"$GATE\"; exit 7"));
         cmd.env("GATE", &gate);
         let (done, result) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -2821,7 +3108,7 @@ fn a_failed_renewal_by_hand_is_the_rows_last_sign_in_and_one_ledger_row() {
         assert_eq!(attempt.outcome, accounts::AttemptOutcome::Failed);
         assert_eq!(
             attempt.routes,
-            "by hand: claude auth login exited 1 with no login made"
+            "by hand: the sign-in exited 1 with no login made"
         );
         let ledger = store.tail(10).expect("ledger");
         assert_eq!(
@@ -2832,7 +3119,7 @@ fn a_failed_renewal_by_hand_is_the_rows_last_sign_in_and_one_ledger_row() {
         assert_eq!(ledger[0].kind, accounts::Kind::SignIn);
         assert_eq!(
             ledger[0].why,
-            "hand failed: by hand: claude auth login exited 1 with no login made"
+            "hand failed: by hand: the sign-in exited 1 with no login made"
         );
         assert_eq!(
             accounts::AttemptOutcome::of_sign_in(&ledger[0].why),
@@ -2847,6 +3134,7 @@ fn a_failed_renewal_by_hand_is_the_rows_last_sign_in_and_one_ledger_row() {
 #[test]
 fn a_terminal_opener_failure_releases_the_machine_signin_lock() {
     use std::io::Write as _;
+    const OPENER_REASON: &str = "fixture-opener-control-failure";
     let (tmp, env) = renew_env("renew-terminal-opener");
     let store = env.accounts_store();
     std::fs::create_dir_all(
@@ -2866,7 +3154,10 @@ fn a_terminal_opener_failure_releases_the_machine_signin_lock() {
         .write(true)
         .open(&gate)
         .unwrap();
-    aterm_tempfile::stand_in(&program, "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=failed\\nmet=browser-control\\nwhy=the DevTools socket closed\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nread answer < \"${0%/*}/gate\"\nexit 7\n").unwrap();
+    aterm_tempfile::stand_in(
+        &program,
+        &format!("#!/bin/sh\nprintf 'opener-outcome=1\\nphase=failed\\nmet=browser-control\\nwhy={OPENER_REASON}\\n' > \"$ATERM_OPEN_URL_OUTCOME.part\"\nmv \"$ATERM_OPEN_URL_OUTCOME.part\" \"$ATERM_OPEN_URL_OUTCOME\"\nread answer < \"${{0%/*}}/gate\"\nexit 7\n"),
+    ).unwrap();
     let before = logins_of(&env).get("work-2").cloned();
     let worker_env = env.clone();
     let host = NativeRenewal {
@@ -2893,46 +3184,32 @@ fn a_terminal_opener_failure_releases_the_machine_signin_lock() {
         None,
         "the row is no longer signing in"
     );
-    // WHY IT ENDED IS KEPT: the opener's reason is printed, is the row's last sign-in and is
-    // one `sign-in` ledger row; nothing else of the row moved.
-    const WHY: &str = "the sign-in did not finish; it could not communicate with its headless \
-                       browser: the DevTools socket closed";
-    assert!(
-        answer.2.contains("the DevTools socket closed"),
-        "the renewal prints the opener's reason: {}",
-        answer.2
-    );
+    // The complete published diagnostic reaches the result and the stored attempt.
+    assert!(answer.2.contains(OPENER_REASON), "{}", answer.2);
     let after = logins_of(&env).get("work-2").cloned().expect("its record");
     let attempt = after
         .sign_in_attempt
         .clone()
         .expect("the row's last sign-in");
     assert_eq!(attempt.outcome, accounts::AttemptOutcome::Failed);
-    assert_eq!(attempt.routes, format!("by hand: {WHY}"));
+    assert!(attempt.routes.contains(OPENER_REASON), "{attempt:?}");
     assert_eq!(
         after.dir,
         before.and_then(|binding| binding.dir),
         "no login was bound"
     );
     let ledger = store.tail(10).expect("ledger");
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(ledger[0].kind, accounts::Kind::SignIn);
     assert_eq!(
-        ledger
-            .iter()
-            .map(|event| (event.kind, event.why.as_str()))
-            .collect::<Vec<_>>(),
-        [(
-            accounts::Kind::SignIn,
-            format!("hand failed: by hand: {WHY}").as_str()
-        )]
+        accounts::AttemptOutcome::of_sign_in(&ledger[0].why),
+        Some(accounts::AttemptOutcome::Failed)
     );
+    assert!(ledger[0].why.ends_with(&attempt.routes), "{ledger:?}");
     // The report says it of a row that still needs its sign-in.
     on_record(&env, &[("work-2", Auth::SignedOut)]);
     let (_, report, _) = acc(AccountsCmd::Report { json: false }, &env, &RenewHost::new());
-    assert!(
-        report.contains("sign-in: error failed since ")
-            && report.contains(&format!(": tried by hand: {WHY}")),
-        "{report}"
-    );
+    assert!(report.contains(&attempt.routes), "{report}");
 }
 
 #[cfg(unix)]
@@ -3054,7 +3331,7 @@ fn an_unattended_browser_challenge_records_a_task_but_cancellation_does_not() {
         aterm_tempfile::stand_in(
             &program,
             &format!(
-                "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=continuing\\nmet={met}\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit {code}\n"
+                "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=continuing\\nmet={met}\\n' > \"$ATERM_OPEN_URL_OUTCOME.part\"\nmv \"$ATERM_OPEN_URL_OUTCOME.part\" \"$ATERM_OPEN_URL_OUTCOME\"\nexit {code}\n"
             ),
         )
         .unwrap();
@@ -3217,7 +3494,7 @@ fn an_unattended_provider_exit_keeps_its_browser_outcome() {
     let program = tmp.path().join("provider");
     aterm_tempfile::stand_in(
         &program,
-        "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=continuing\\nmet=block-page claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME\"\nexit 1\n",
+        "#!/bin/sh\nprintf 'opener-outcome=1\\nphase=continuing\\nmet=block-page claude.ai\\n' > \"$ATERM_OPEN_URL_OUTCOME.part\"\nmv \"$ATERM_OPEN_URL_OUTCOME.part\" \"$ATERM_OPEN_URL_OUTCOME\"\nexit 1\n",
     )
     .unwrap();
     let cmd = aterm_uds::spawnfd::Command::new(&program);

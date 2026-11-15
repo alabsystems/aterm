@@ -103,7 +103,10 @@ fn closing_the_boot_session_closes_its_pty_master() {
         .unwrap_or_else(|| panic!("no local 0 in sessions: {sessions}"))
         .to_string();
     let spawned = ctl_ok(&inst, &["spawn"]);
-    assert!(spawned.starts_with("OK s-"), "spawn: {spawned}");
+    assert!(
+        aterm_agent::spawned_tab_id(&spawned).is_some(),
+        "spawn: {spawned}"
+    );
 
     let witnessed = open_masters(pid).is_some();
     assert!(

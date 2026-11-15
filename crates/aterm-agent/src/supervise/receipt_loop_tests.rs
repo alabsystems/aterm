@@ -376,10 +376,7 @@ fn a_wake_kept_landing_tells_no_new_receipt() {
     else {
         panic!("the landing and its receipt, the wake's and its: {ends:#?}");
     };
-    assert!(
-        kept.contains(crate::supervise::policy::turn_end::WAKE_KEPT),
-        "{ends:#?}"
-    );
+    assert!(kept.contains(alab_policy::words::WAKE_KEPT), "{ends:#?}");
     assert_eq!(*landed_first, None, "a fresh note: {ends:#?}");
     assert_eq!(
         *kept_first,

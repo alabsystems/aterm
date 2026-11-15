@@ -302,11 +302,13 @@ pub fn unattended_args(cwd: &Path) -> Vec<String> {
 /// `aterm ctl`'s answer for a sid no session of the aterm has.
 const GONE: &str = "no such session";
 
-/// One `aterm ctl` read of the worker `sid` (`task`, `result`), bounded like the spawn.
-fn ctl_read(sid: &str, verb: &str) -> Result<String, String> {
+/// One `aterm ctl` read of the worker `sid` (`task`, `result`, `result full`), bounded like
+/// the spawn.
+fn ctl_read(sid: &str, verb: &[&str]) -> Result<String, String> {
     let out = aterm_uds::spawnfd::command("aterm")
         .args(["ctl", "--timeout", SPAWN_TIMEOUT_SECS])
-        .args([format!("@{sid}").as_str(), verb])
+        .arg(format!("@{sid}"))
+        .args(verb)
         .output()
         .map_err(|e| format!("cannot run aterm ctl: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -320,7 +322,8 @@ fn ctl_read(sid: &str, verb: &str) -> Result<String, String> {
         .unwrap_or("no answer")
         .to_string();
     Err(format!(
-        "aterm ctl @{sid} {verb} exited {}: {said}",
+        "aterm ctl @{sid} {} exited {}: {said}",
+        verb.join(" "),
         out.status
     ))
 }
@@ -328,19 +331,37 @@ fn ctl_read(sid: &str, verb: &str) -> Result<String, String> {
 /// What the worker `sid` reports now, read from the aterm that runs it.
 #[must_use]
 pub fn report(sid: &str) -> crate::pump::Report {
-    report_from(ctl_read(sid, "task"), || ctl_read(sid, "result"))
+    report_from(ctl_read(sid, &["task"]), |full| {
+        ctl_read(
+            sid,
+            if full {
+                &["result", "full"]
+            } else {
+                &["result"]
+            },
+        )
+    })
 }
 
-/// A worker's report from its task record (`state=<word> …`) and, once it ended, its final
-/// report. Its state is one of `aterm ctl`'s `working|done|exited|stalled|failed|-`: `working`
-/// (and a word this does not know) is still working; `done`, `exited`, `stalled` and `failed`
-/// have ended, with the report's [`verdict`] and, without one, no fix; `-` is a session that
-/// runs no task, which ended without a fix. A session the aterm no longer has (`no such
-/// session`: its tab was closed, or the aterm restarted) ended without a fix too. Any other
-/// record or report that cannot be read is unread, never an ended worker.
+/// A worker's report from its task record (`state=<word> …`) and, once it ended, its report:
+/// `result(false)` is its last reply (`aterm ctl result`), `result(true)` its whole exchange
+/// since the task prompt (`result full`). Its state is one of `aterm ctl`'s
+/// `working|done|exited|stalled|failed|-`: `working` (and a word this does not know) is still
+/// working; `done`, `exited`, `stalled` and `failed` have ended, with a [`verdict`] and, without
+/// one, no fix; `-` is a session that runs no task, which ended without a fix. A session the
+/// aterm no longer has (`no such session`: its tab was closed, or the aterm restarted) ended
+/// without a fix too. Any other record or last reply that cannot be read is unread, never an
+/// ended worker.
+///
+/// The verdict is the last reply's, else the newest verdict line in the whole exchange: under
+/// Autopilot Land a worker's last reply answers the harness's land check (`LANDED`), after the
+/// reply that named its fix (0.202.0, 2026-11-14 15:58: `FIX 73c05e2c0d8…` then `LANDED`, read
+/// as no fix). The task prompt itself names no verdict line (`FIX` needs 40 hex digits, and its
+/// `NO-FIX` sits inside a sentence), so only a worker's own line is found. An exchange that
+/// cannot be read leaves the last reply's answer: no fix.
 pub fn report_from(
     task: Result<String, String>,
-    result: impl FnOnce() -> Result<String, String>,
+    mut result: impl FnMut(bool) -> Result<String, String>,
 ) -> crate::pump::Report {
     use crate::pump::Report;
     let task = match task {
@@ -365,14 +386,29 @@ pub fn report_from(
     if !matches!(state, "done" | "exited" | "stalled" | "failed") {
         return Report::Working;
     }
-    match result().map(|report| verdict(&report)) {
-        Err(why) if why.contains(GONE) => Report::NoFix(format!("its session is gone ({why})")),
-        Err(why) => Report::Unread(why),
-        Ok(Some(Ok(commit))) => Report::Fix(commit),
-        Ok(Some(Err(why))) => Report::NoFix(why),
-        Ok(None) => Report::NoFix(format!(
-            "its task is {state} and its report ends with neither `FIX <commit>` nor `NO-FIX \
-             <why>`"
+    let last = match result(false) {
+        Err(why) if why.contains(GONE) => {
+            return Report::NoFix(format!("its session is gone ({why})"));
+        }
+        Err(why) => return Report::Unread(why),
+        Ok(report) => verdict(&report),
+    };
+    let (found, unread) = match last {
+        Some(found) => (Some(found), None),
+        None => match result(true) {
+            Ok(exchange) => (verdict(&exchange), None),
+            Err(why) => (None, Some(why)),
+        },
+    };
+    match found {
+        Some(Ok(commit)) => Report::Fix(commit),
+        Some(Err(why)) => Report::NoFix(why),
+        None => Report::NoFix(format!(
+            "its task is {state} and none of its replies holds `FIX <commit>` or `NO-FIX \
+             <why>`{}",
+            unread.map_or_else(String::new, |why| format!(
+                " (its whole exchange could not be read: {why}; its last reply holds neither)"
+            ))
         )),
     }
 }

@@ -298,7 +298,7 @@ fn rejected_direct_refresh_reaches_native_auth_without_changing_live_credentials
                 staging.profile,
                 Some(claim),
                 None,
-                deadline,
+                (deadline, &|| false),
                 |_, _| {
                     observed.set(true);
                     Err(Error::Callback)

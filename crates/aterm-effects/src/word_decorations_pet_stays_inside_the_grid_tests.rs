@@ -241,6 +241,7 @@ fn both_companions_on_the_top_rows_land_whole_in_a_top_pane_and_a_lower_pane() {
                     geom: GEOM,
                     cursor: (row, 30),
                     look: KittyLook::default(),
+                    body: crate::kitty_cursor::CursorBody::Head,
                     colors: CatColorKey::default(),
                     bob: 0.0,
                     lift,

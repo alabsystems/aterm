@@ -53,7 +53,7 @@ impl Drop for Reset {
 }
 
 /// The capture this thread records into, for a thread it starts to record into too
-/// ([`crate::memo::threads`]).
+/// ([`crate::workers::threads`]).
 pub(crate) struct Carried(Option<Arc<Capture>>);
 
 /// This thread's capture, if one is active.
@@ -70,7 +70,7 @@ impl Carried {
 }
 
 /// Run one census against a content snapshot and recheck every input before returning
-/// evidence. The census's own threads, which it starts through [`crate::memo::threads`], record
+/// evidence. The census's own threads, which it starts through [`crate::workers::threads`], record
 /// into the same capture; no other thread does. An out-of-root read or failed snapshot leaves the
 /// result usable only for this run, never for reuse.
 pub fn capture<T>(root: &Path, run: impl FnOnce() -> T) -> (T, Option<Vec<Input>>) {
@@ -287,7 +287,7 @@ fn tree(hash: &mut aterm_digest::Sha256, root: &Path, path: &Path, budget: &mut 
 
 fn read(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read as _;
-    let (file, size) = crate::tree::open_regular_unrecorded(path).ok()?;
+    let (file, size) = crate::tree::open_regular(path).ok()?;
     let mut bytes = Vec::with_capacity(size.saturating_add(1));
     file.take(crate::tree::MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)

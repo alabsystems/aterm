@@ -114,11 +114,15 @@ trust_island! {
 #[must_use = "a detached scrollback store must be reflowed and re-attached, or history is lost"]
 pub struct PendingScrollbackReflow {
     store: ScrollbackStorage,
+    /// Separate output blocks while the unread input is released from `store`.
+    output_store: Option<Box<ScrollbackStorage>>,
     lazy_lines: Vec<Line>,
     /// The rows staged for the store at (re)detach, still raw ([`LazyBuffer::take_staged`]).
     lazy_staged: Box<LazyBuffer>,
     /// The ring's scrollback rows, materialized at detach ([`ReflowedScrollback::ring_out`]).
     ring_lines: Vec<Line>,
+    /// Bound on the newest output transferred to the ring at completion.
+    ring_capacity: usize,
     new_cols: u16,
     /// The reader's scroll position at detach, restored on re-attach.
     prev_offset: usize,
@@ -128,7 +132,7 @@ pub struct PendingScrollbackReflow {
     clear_gen: u64,
     /// Rewrap progress ([`reflow`](Self::reflow)).
     phase: ReflowPhase,
-    /// `Some` from the first step until the store stream finishes.
+    /// Limits held from the first step until the UI resolves the latest settings.
     lifted_limits: Option<LiftedStoreLimits>,
     /// The history lines this job detached ([`Self::lines_done`]).
     lines_total: usize,
@@ -188,6 +192,9 @@ pub enum ReflowStep {
 #[must_use = "a reflowed scrollback store must be re-attached, or history is lost"]
 pub struct ReflowedScrollback {
     store: ScrollbackStorage,
+    limits: LiftedStoreLimits,
+    /// Prefix of `ring_out` borrowed from the worker's store, not grid-owned ring rows.
+    store_tail_len: usize,
     /// The ring history rewrapped to `new_cols` ([`Grid::reattach_ring_history`]).
     ring_out: Vec<Line>,
     new_cols: u16,
@@ -235,6 +242,10 @@ impl PendingScrollbackReflow {
             + self.lazy_lines.len()
             + self.lazy_staged.len()
             + self.ring_lines.len()
+            + self
+                .output_store
+                .as_ref()
+                .map_or(0, |store| store.line_count())
     }
 
     /// The whole rewrap in one call.
@@ -258,10 +269,12 @@ impl PendingScrollbackReflow {
                 line_limit: self.store.line_limit(),
                 memory_budget: self.store.memory_budget(),
             };
-            self.store.set_line_limit(None);
-            if let Err(error) = self.store.set_memory_budget(usize::MAX) {
+            let mut output = self.store.empty_replacement();
+            output.set_line_limit(None);
+            if let Err(error) = output.set_memory_budget(usize::MAX) {
                 aterm_log::warn!("offload reflow: lifting the memory budget failed: {error}");
             }
+            self.output_store = Some(Box::new(output));
             self.lifted_limits = Some(lifted);
         }
         match &mut self.phase {
@@ -315,21 +328,11 @@ impl PendingScrollbackReflow {
                     carry.clear();
                     carry.shrink_to_fit();
                     self.lazy_lines = Vec::new();
-                    for line in out {
-                        if let Err(error) = self.store.push_line(line) {
-                            aterm_log::warn!(
-                                "offload reflow: scrollback push_line failed: {error}"
-                            );
-                        }
-                    }
-                    if let Some(limits) = self.lifted_limits.take() {
-                        self.store.set_line_limit(limits.line_limit);
-                        if let Err(error) = self.store.set_memory_budget(limits.memory_budget) {
-                            aterm_log::warn!(
-                                "offload reflow: restoring the memory budget failed: {error}"
-                            );
-                        }
-                    }
+                    push_reflow_output(
+                        self.output_store.as_mut().expect("stream output storage"),
+                        out,
+                    );
+                    self.store = *self.output_store.take().expect("completed stream output");
                     self.phase = ReflowPhase::RingRewrap {
                         next_input: 0,
                         carry: straddling,
@@ -347,16 +350,13 @@ impl PendingScrollbackReflow {
                         if boundary > 0 {
                             let tail = carry.split_off(boundary);
                             let head = std::mem::replace(carry, tail);
-                            for line in super::scrollback_reflow::reflow_scrollback_lines(
-                                &head,
-                                self.new_cols,
-                            ) {
-                                if let Err(error) = self.store.push_line(line) {
-                                    aterm_log::warn!(
-                                        "offload reflow: scrollback push_line failed: {error}"
-                                    );
-                                }
-                            }
+                            push_reflow_output(
+                                self.output_store.as_mut().expect("stream output storage"),
+                                super::scrollback_reflow::reflow_scrollback_lines(
+                                    &head,
+                                    self.new_cols,
+                                ),
+                            );
                         }
                     }
                 }
@@ -382,9 +382,17 @@ impl PendingScrollbackReflow {
                         carry,
                         self.new_cols,
                     ));
-                    let ring_out = std::mem::take(out);
+                    let carried_ring = std::mem::take(out);
+                    let mut ring_out = take_reflow_tail(
+                        &mut self.store,
+                        self.ring_capacity.saturating_sub(carried_ring.len()),
+                    );
+                    let store_tail_len = ring_out.len();
+                    ring_out.extend(carried_ring);
                     ReflowStep::Done(ReflowedScrollback {
                         store: self.store,
+                        limits: self.lifted_limits.take().expect("stream lifted limits"),
+                        store_tail_len,
                         ring_out,
                         new_cols: self.new_cols,
                         prev_offset: self.prev_offset,
@@ -398,6 +406,36 @@ impl PendingScrollbackReflow {
             }
         }
     }
+}
+
+/// Append output without changing its compression layout at every step.
+fn push_reflow_output(store: &mut ScrollbackStorage, lines: impl IntoIterator<Item = Line>) {
+    for line in lines {
+        if let Err(error) = store.push_line(line) {
+            aterm_log::warn!("offload reflow: scrollback push_line failed: {error}");
+        }
+    }
+}
+
+/// Transfer only the ring-sized newest suffix, on the worker, after streaming.
+fn take_reflow_tail(store: &mut ScrollbackStorage, capacity: usize) -> Vec<Line> {
+    let count = capacity.min(store.line_count());
+    let first = store.line_count() - count;
+    let mut tail = Vec::with_capacity(count);
+    for index in first..store.line_count() {
+        match store.get_line(index) {
+            Ok(Some(line)) => tail.push(line.into_owned()),
+            result => {
+                aterm_log::warn!("offload reflow: cannot read ring tail: {result:?}");
+                return Vec::new();
+            }
+        }
+    }
+    if let Err(error) = store.remove_newest(count) {
+        aterm_log::warn!("offload reflow: cannot transfer ring tail: {error}");
+        return Vec::new();
+    }
+    tail
 }
 
 /// Rewrap the completed runs of `carry` into `out`, keeping the trailing run carried.
@@ -537,6 +575,8 @@ impl Grid {
             clear_gen,
             phase,
             lifted_limits: None,
+            output_store: None,
+            ring_capacity: self.storage.max_scrollback,
         })
     }
 
@@ -549,11 +589,18 @@ impl Grid {
 
         if self.storage.scrollback.is_some() {
             self.drop_fill_debt();
-            self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
+            if reflowed.clear_gen == self.storage.scrollback_clear_gen {
+                // The replacement owns store history. Only the rows detached
+                // from this grid's ring can still return from the old job.
+                let mut ring_out = reflowed.ring_out;
+                let carried_ring = ring_out.split_off(reflowed.store_tail_len);
+                self.reattach_ring_history(carried_ring, reflowed.new_cols);
+            }
             self.reconcile_pending_scrollback_settings();
             return;
         }
 
+        self.retain_reflow_settings(reflowed.limits);
         if reflowed.clear_gen != self.storage.scrollback_clear_gen {
             let mut store = reflowed.store;
             let _ = store.clear();
@@ -574,8 +621,18 @@ impl Grid {
         // output), and only then do the settings changed meanwhile replay: each setter settles
         // whatever is staged into the store, which ahead of the seat put the window's output
         // before the older ring history for good.
-        self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
-        self.drain_lazy_buffer();
+        if reflowed.new_cols == self.storage.cols {
+            let mut returned = reflowed.ring_out;
+            // A whole detach window includes its oldest flood marker. The
+            // synchronous helper's drain_back takes only new visible overflow
+            // and deliberately leaves that marker behind.
+            returned.extend(self.storage.lazy_buffer.drain_all());
+            self.storage.lazy_buffer.release_spine_slack();
+            self.restore_reflowed_scrollback(returned, reflowed.new_cols, 0);
+        } else {
+            self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
+            self.drain_lazy_buffer();
+        }
         self.reconcile_pending_scrollback_settings();
         if reflowed.new_cols == self.storage.cols {
             let pulled = self.pay_fill_debt();
@@ -601,6 +658,22 @@ impl Grid {
 
     /// Re-attach, then converge.
     #[must_use = "a returned job is a re-detached store: drive it and re-attach it (or abort), or history is lost"]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ScrollbackHandoff",
+            action = "Handoff",
+            project = "grid::scrollback_offload::tests::finite_handoff_matches_model_and_rejects_lost_or_unbounded_rows"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ScrollbackHandoff",
+            action = "Redetach",
+            project = "grid::scrollback_offload::tests::handoff_environment_actions_match_grid_and_reject_wrong_rows"
+        )
+    )]
     pub fn reattach_reflowed_scrollback_or_redetach(
         &mut self,
         reflowed: ReflowedScrollback,
@@ -609,7 +682,7 @@ impl Grid {
         let had_replacement = self.storage.scrollback.is_some();
         let stale_cols = reflowed.new_cols;
         let staged_stale = self.storage.staged_width_stale
-            && (reflowed.store.line_limit() != Some(0)
+            && (reflowed.limits.line_limit != Some(0)
                 || self
                     .storage
                     .pending_scrollback_settings
@@ -626,6 +699,7 @@ impl Grid {
         let reader_aim = self.storage.detached_reader_aim.take();
         let counter_at_reattach = self.storage.absolute_row_counter;
 
+        self.retain_reflow_settings(reflowed.limits);
         self.storage.scrollback = Some(reflowed.store);
         // The window's staged output leaves with the job's ring history before the settings
         // replay, so no setter settles it into the store ahead of those older lines; the run
@@ -635,9 +709,14 @@ impl Grid {
 
         let (lazy_lines, lazy_staged) = if self.storage.store_retains_lines() {
             let mut ring_out = reflowed.ring_out;
+            let room = self
+                .storage
+                .max_scrollback
+                .saturating_sub(self.storage.ring_buffer_scrollback());
             if let Some(store) = self.storage.scrollback.as_mut()
-                && let Some(max) = store.line_limit()
+                && let Some(share) = store.line_limit()
             {
+                let max = share.saturating_add(room);
                 let total = store
                     .line_count()
                     .saturating_add(ring_out.len() + staged.len());
@@ -730,6 +809,8 @@ impl Grid {
             clear_gen,
             phase,
             lifted_limits: None,
+            output_store: None,
+            ring_capacity: self.storage.max_scrollback,
         })
     }
 
@@ -785,6 +866,24 @@ impl Grid {
         if !lines.is_empty() {
             self.prepend_ring_scrollback_lines(lines, cols);
         }
+    }
+
+    /// A worker returns without irreversible eviction under its detach snapshot.
+    /// Reapply even unchanged settings once all returned and staged rows are seated.
+    fn retain_reflow_settings(&mut self, limits: LiftedStoreLimits) {
+        let settings =
+            self.storage
+                .pending_scrollback_settings
+                .get_or_insert(PendingScrollbackSettings {
+                    line_limit: limits
+                        .line_limit
+                        .map(|share| share.saturating_add(self.storage.max_scrollback)),
+                    memory_budget: limits.memory_budget,
+                    line_limit_changed: false,
+                    memory_budget_changed: false,
+                });
+        settings.line_limit_changed = true;
+        settings.memory_budget_changed = true;
     }
 
     /// Replay scrollback settings changed while the tiered store was detached. Each setter

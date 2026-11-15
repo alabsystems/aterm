@@ -28,7 +28,9 @@ fn lookup_at(root: &Path, session: &str) -> io::Result<Value> {
 }
 
 fn lookup_started(root: &Path, session: &str, started: Instant) -> io::Result<Value> {
-    canonical_session(session)?;
+    if !aterm_types::control_verbs::is_minted_sid(session) {
+        return Err(invalid());
+    }
     let deadline = crate::runtime::control_deadline(started);
     let host = ProvenanceStore::open_at(root)?.connect_ancestor(deadline)?;
     query(&host, session, deadline)
@@ -82,13 +84,6 @@ fn read_reply(mut stream: &aterm_uds::CtlStream, deadline: Instant) -> io::Resul
     let mut bytes = vec![0; size];
     exact(&mut bytes)?;
     Ok(bytes)
-}
-fn canonical_session(session: &str) -> io::Result<()> {
-    let sid = session.strip_prefix("s-").ok_or_else(invalid)?;
-    if sid.is_empty() || sid.len() > 62 || !aterm_codec::hex::is_lower(sid, sid.len()) {
-        return Err(invalid());
-    }
-    Ok(())
 }
 fn object(value: &Value, fields: &[&str]) -> io::Result<()> {
     let map = value.as_object().ok_or_else(invalid)?;

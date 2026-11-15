@@ -63,6 +63,12 @@ pub const SOCKET_DIR: &str = "/var/run/systems.alab.aterm-lan";
 /// The socket's name under [`SOCKET_DIR`] (mode 0666; clients are admitted by code signature).
 pub const SOCKET_NAME: &str = "broker.sock";
 
+/// The broker's counts file under [`SOCKET_DIR`]: what it counts of its connections, its full
+/// checks of their code and their CPU time, written by rename as the previous and the current
+/// snapshot (`cat /var/run/systems.alab.aterm-lan/broker.counts`; two snapshots give a rate). It
+/// holds counts and requesters' pids, nothing a request carried.
+pub const COUNTS_NAME: &str = "broker.counts";
+
 /// The broker protocol's version: a client and a broker of different versions refuse each other
 /// ([`Unavailable::Outdated`]).
 pub const PROTOCOL: u32 = 1;

@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::stats::HarnessStats;
-use aterm_agent::supervise::{Autopilot, SupervisorConfig};
+use aterm_agent::supervise::SupervisorConfig;
 use aterm_capacity::host_vitals::HostVitals;
 
 use crate::App;
@@ -2362,7 +2363,7 @@ impl App {
     /// [`Self::harness_ab_arm`], and whether the session's MODE is Land — its own word, else the table's default, whatever the posture or the claim (`AbBook::follow_mode`, §11.6.3 item 4) — from the same one read of its metadata.
     #[must_use]
     pub(crate) fn harness_ab_reading(&self, local_id: u64) -> (AbArm, bool) {
-        let default = self.harness_policy.get().policy.autopilot;
+        let default = self.harness_policy.get().policy.turn_end.autopilot;
         let Some(session) = self.pool.get(local_id) else {
             return (
                 AbArm::of(
@@ -2852,18 +2853,37 @@ impl App {
             return Some(person);
         }
         let session = self.pool.get(local_id)?;
-        let rung = |t: &aterm_core::terminal::Terminal| {
+        let snapshot = |t: &aterm_core::terminal::Terminal| {
             use crate::cwd_native::ReportedCwd as _;
-            let cwd = t.native_working_directory();
-            crate::app_tabs::resolved_terminal_title_rung(None, t.title(), cwd.as_deref())
+            (
+                t.title().to_owned(),
+                t.native_working_directory()
+                    .map(std::borrow::Cow::into_owned),
+                crate::app_take_over::untitled_by_its_program(t),
+            )
         };
-        match session.term.try_lock() {
-            Ok(t) => rung(&t),
-            Err(std::sync::TryLockError::Poisoned(p)) => rung(&p.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                crate::app_tabs::resolved_terminal_title_rung(None, stored, None)
-            }
-        }
+        let (title, cwd, untitled) = match session.term.try_lock() {
+            Ok(t) => snapshot(&t),
+            Err(std::sync::TryLockError::Poisoned(p)) => snapshot(&p.into_inner()),
+            // A busy terminal's rungs as they were last read
+            // ([`App::captured_title_of_session`]), else the store's copy.
+            Err(std::sync::TryLockError::WouldBlock) => self
+                .captured_title_of_session(local_id)
+                .map_or((stored.to_owned(), None, false), |cached| {
+                    (cached.title.clone(), None, cached.untitled)
+                }),
+        };
+        // The guard is gone: the task's line is read under the timeline's lock alone.
+        let line = untitled
+            .then(|| crate::app_take_over::task_line_of(&session.ctx))
+            .flatten();
+        crate::app_tabs::resolved_terminal_title_rung(
+            None,
+            &title,
+            untitled,
+            line.as_deref(),
+            cwd.as_deref(),
+        )
         .map(|title| crate::chrome_label::without_spinner_frame(&title).to_owned())
     }
 

@@ -126,7 +126,7 @@ fn pasted(token: &str) -> [String; 10] {
         format!("[[owners]]\nname = \"{token}\"\ntier = \"external\"\nread = [\"ghost\"]\n"),
         format!("[default]\nread = [\"{token}\"]\n"),
         format!("[targets]\nt = \"{token}\"\n"),
-        format!("[profiles.{token}]\ntier = \"dev\"\nenv = \"X_TOKEN\"\n"),
+        format!("[profiles.{token}]\ntier = \"dev\"\ntoken_file = \"/x.token\"\n"),
     ]
 }
 
@@ -156,23 +156,20 @@ fn l1_never_quotes_a_pasted_token() {
 }
 
 #[test]
-fn l1_env_must_name_a_variable() {
-    let legacy = agh_fake::token("env")[4..].to_string();
-    let long = "A".repeat(65);
-    for value in [legacy.as_str(), "GH TOKEN", "", "1X", long.as_str()] {
-        let extra = format!("[profiles.x]\ntier = \"dev\"\nenv = \"{value}\"\n");
-        let found = faults(&extra);
-        assert_eq!(rules(&found), ["L1"], "{value:?}: {found:?}");
-        assert!(found[0].what.contains("profile x"), "{found:?}");
-        assert!(found[0].what.contains("env"), "{found:?}");
-        if !value.is_empty() {
-            assert!(!found[0].what.contains(value), "{found:?}");
-        }
+fn l1_env_is_no_token_source() {
+    let found = faults("[profiles.x]\ntier = \"dev\"\nenv = \"GH_TOKEN\"\n");
+    assert_eq!(rules(&found), ["L1"], "{found:?}");
+    for step in [
+        "token_file = \"~/.secrets/x\"",
+        "aterm secrets need entry:x",
+    ] {
+        assert!(found[0].what.contains(step), "{found:?}");
     }
-    for value in ["GH_TOKEN", "_X", "x_token_2"] {
-        let extra = format!("[profiles.x]\ntier = \"dev\"\nenv = \"{value}\"\n");
-        assert_eq!(faults(&extra), Vec::new(), "{value:?}");
-    }
+    assert!(!found[0].what.contains("GH_TOKEN"), "{found:?}");
+    let both =
+        faults("[profiles.x]\ntier = \"dev\"\ntoken_file = \"/x.token\"\nenv = \"GH_TOKEN\"\n");
+    assert_eq!(rules(&both), ["L1"], "{both:?}");
+    assert!(both[0].what.ends_with("delete env"), "{both:?}");
 }
 
 #[test]
@@ -203,14 +200,9 @@ fn l1_references_and_values() {
         &["owner fixture-ext", "prod"],
     );
     assert_one(
-        "[profiles.x]\ntoken_file = \"{root}/x.token\"\nenv = \"X_TOKEN\"\ntier = \"dev\"\n",
-        "L1",
-        &["profile x", "token_file", "env"],
-    );
-    assert_one(
         "[profiles.x]\ntier = \"dev\"\n",
         "L1",
-        &["profile x", "token_file", "env"],
+        &["profile x", "token_file"],
     );
     assert_one(
         "[profiles.x]\ntoken_file = \"tokens/x.token\"\ntier = \"dev\"\n",
@@ -283,7 +275,7 @@ fn a_long_name_is_carried_whole() {
     );
     let profile = "fixtureprofilewithalongname";
     assert_one(
-        &format!("[profiles.{profile}]\nenv = \"X_TOKEN\"\ntier = \"prod\"\n"),
+        &format!("[profiles.{profile}]\ntoken_file = \"/x.token\"\ntier = \"prod\"\n"),
         "L1",
         &[profile],
     );
@@ -306,15 +298,6 @@ fn l4_one_writer() {
         "[default]\nread = [\"anonymous\"]\nwrite = \"dev\"\n",
         "L4",
         &["[default]"],
-    );
-}
-
-#[test]
-fn l5_release_reads_a_file() {
-    assert_one(
-        "[profiles.x]\nenv = \"X_TOKEN\"\ntier = \"release\"\nlogin = \"fixture-reader\"\n",
-        "L5",
-        &["profile x"],
     );
 }
 
@@ -526,7 +509,7 @@ fn dirs_resolve_follows_a_lane_s_environment() {
     #[cfg(target_os = "linux")]
     assert_eq!(dirs.state, st.join("aterm").join("agh"));
     assert_eq!(dirs.journal(), dirs.state.join("journal"));
-    assert_eq!(dirs.grants(), dirs.state.join("grants"));
+    assert_eq!(dirs.grants(), dirs.state.join("grants-v2"));
     assert_eq!(dirs.needs(), dirs.state.join("needs"));
     let plain = config::Dirs::resolve(home, None, None).expect("the home's defaults");
     assert_eq!(plain.config, home.join(".config").join("aterm").join("agh"));
@@ -706,7 +689,7 @@ mod files {
         let root = common::scratch("check-bad");
         let dirs = Dirs::under(root.path());
         let text = format!(
-            "{}\n[profiles.Zed]\nenv = \"Z\"\ntier = \"dev\"\n",
+            "{}\n[profiles.Zed]\ntoken_file = \"/z.token\"\ntier = \"dev\"\n",
             common::canonical_config(root.path())
                 .replace("channel = \"alabsystems/aterm\"", "channel = \"nope\"")
         );
@@ -999,7 +982,7 @@ mod files {
         std::fs::create_dir_all(&dirs.home).expect("home");
         aterm_uds::private_file::create_private_dir(&dir).expect("a private directory");
         let text = format!(
-            "{}\n[profiles.Zed]\nenv = \"Z\"\ntier = \"dev\"\n",
+            "{}\n[profiles.Zed]\ntoken_file = \"/z.token\"\ntier = \"dev\"\n",
             common::canonical_config(root.path())
         );
         aterm_uds::private_file::write_private(&dir, "agh.toml", text.as_bytes())

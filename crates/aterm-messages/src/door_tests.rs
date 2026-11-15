@@ -266,7 +266,7 @@ fn a_decision_row_keeps_its_ten_minutes_and_an_unclassified_one_is_cut() {
         Hold::asking(Duration::from_secs(600)),
         "a question is a decision row"
     );
-    assert!(c.mark_seen(id, now));
+    assert!(c.mark_seen(id, stamp(), now));
     assert!(
         c.live(id).is_some(),
         "reading a question does not answer it: only Not now, a supersede or its ten minutes do"

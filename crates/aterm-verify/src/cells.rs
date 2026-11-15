@@ -37,14 +37,6 @@ use crate::stages::lane_jobs;
 /// The build-script shims a cell may apply.
 pub const POLICY: &str = "tools/cross-cell-gate.tsv";
 
-/// The triples some machine in this fleet runs natively: their OSes' cells are red on any
-/// rustc warning ([`judges_warnings`]).
-pub const FLEET_HOST_TRIPLES: [&str; 3] = [
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-unknown-linux-gnu",
-];
-
 /// The clippy config the browser cells lint with: std's clock panics on
 /// wasm32-unknown-unknown, which no host lint can see.
 const WASM_CLIPPY_CONF: &str = "crates/aterm-time/wasm32";
@@ -603,7 +595,7 @@ pub(crate) fn run_prepared(ctx: &Ctx, r: &mut Report, prepared: Option<PreparedR
 
 /// The checkout's stock pin as the `rustup` row (looked up on the run's `PATH`) holds it: the one
 /// toolchain every cell and both windows-sys oracles compile with.
-fn stock_of(ctx: &Ctx) -> Result<rustup::Stock, rustup::Unready> {
+pub(crate) fn stock_of(ctx: &Ctx) -> Result<rustup::Stock, rustup::Unready> {
     let (root, path) = (ctx.root.clone(), ctx.env.path.clone());
     exec::bounded(ctx.child_ceiling, move || stock_using(&root, &path)).unwrap_or_else(|why| {
         Err(rustup::Unready {
@@ -1319,13 +1311,17 @@ fn check_cell(
     } else {
         lint_packages(cell, &extra)
     };
+    // The cell compiles into its own target directory: a stale artifact there is removed from
+    // it alone ([`crate::stale_artifact::retried`]).
+    let built = [aterm_uds::runs::canonical(&target_dir)];
     let lint = noted(calls, LINT_CALL, || {
-        exec::run(&cargo.lint(&packages), ctx.exec_env())
+        crate::stale_artifact::retried(
+            &built,
+            || exec::run(&cargo.lint(&packages), ctx.exec_env()),
+            |run| run,
+        )
     });
-    let mut red = Red {
-        leaves_test_warnings: leaves_test_warnings(ctx.cells_pulled, &cell.triple),
-        ..Red::default()
-    };
+    let mut red = Red::default();
     let read = match read_cargo_run_with_discovery(
         &lint,
         &cell.triple,
@@ -1412,7 +1408,7 @@ fn check_cell(
             test_cargo.all_targets(&tests.excluded)
         };
         let run = noted(calls, ALL_TARGETS_CALL, || {
-            exec::run(&check, ctx.exec_env())
+            crate::stale_artifact::retried(&built, || exec::run(&check, ctx.exec_env()), |run| run)
         });
         let read = match read_cargo_run_with_discovery(
             &run,
@@ -1473,15 +1469,6 @@ fn check_cell(
         summary.push_str(&format!(
             "; non-selected Git manifest diagnostics: {}",
             red.discovery.join("; ")
-        ));
-    }
-    if !red.unjudged.is_empty() {
-        summary.push_str(&format!(
-            "; {} test-target warning(s) this pulled run does not judge (`targo --unverified verify \
-             cells --cell {}` does): {}",
-            red.unjudged.len(),
-            cell.name,
-            red.unjudged.join("; ")
         ));
     }
     match red.status {
@@ -1562,10 +1549,6 @@ struct Red {
     status: Option<String>,
     detail: Vec<String>,
     discovery: Vec<String>,
-    /// The all-targets pass's rustc warnings are named in `unjudged` rather than found
-    /// ([`leaves_test_warnings`]).
-    leaves_test_warnings: bool,
-    unjudged: Vec<String>,
 }
 
 impl Red {
@@ -1706,35 +1689,6 @@ fn read_cargo_run_with_discovery(
             format!("in `{pkg}`:\n{}", rendered.trim_end()),
         );
     }
-    let warnings: &[(String, String)] = if judges_warnings(triple) {
-        &read.warnings
-    } else {
-        &[]
-    };
-    let warnings = if tests && red.leaves_test_warnings {
-        red.unjudged
-            .extend(warnings.iter().take(20).map(|(pkg, rendered)| {
-                let first = rendered.lines().next().unwrap_or_default();
-                format!("in `{pkg}`: {first}")
-            }));
-        &[]
-    } else {
-        warnings
-    };
-    let n = warnings.len();
-    for (pkg, rendered) in warnings.iter().take(20) {
-        red.note(
-            format!(
-                "{}({n})",
-                if tests {
-                    "TEST-TARGET-WARNING"
-                } else {
-                    "WARNING"
-                }
-            ),
-            format!("in `{pkg}`:\n{}", rendered.trim_end()),
-        );
-    }
     let lines: Vec<_> = run.output.lines().collect();
     let completed = run.ok && cargo_finished_successfully(&run.output);
     for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
@@ -1829,10 +1783,10 @@ impl CellCargo<'_> {
     }
 
     /// The lint of `packages` (`-p` arguments): of clippy, only the `clippy.toml` bans (every other
-    /// clippy lint is the host's), the browser cells with their own clock-only config; rustc's own
-    /// warnings are read from the stream ([`is_cell_warning`]). Under `--release`, so debug
-    /// assertions are off as a shipped build has them: a seam gated on them that shipped code calls
-    /// is a compile error here, and code only they keep alive a dead-code warning. No dev check
+    /// clippy lint is the host's), the browser cells with their own clock-only config; a cell
+    /// judges errors, never rustc's warnings. Under `--release`, so debug assertions are off as a
+    /// shipped build has them: a seam gated on them that shipped code calls is a compile error
+    /// here. No dev check
     /// compiles aterm's library that way otherwise; the all-targets pass stays debug-on, because
     /// test targets call those seams. `tippy -p aterm --release` stays in the release set for what
     /// only Trust compiles (`cfg(trust_verify)`, `cfg(clean_islands)`).
@@ -2163,43 +2117,6 @@ pub fn renamed_package(spec: &str) -> Option<&str> {
 pub struct CargoRead {
     pub checked: BTreeSet<String>,
     pub errors: Vec<(String, String)>,
-    pub warnings: Vec<(String, String)>,
-}
-
-/// Whether a run's all-targets pass of `triple` names its rustc warnings without finding them: a
-/// Windows cell's in a run the selection pulled. They are mostly `cfg(windows)` test helpers gone
-/// dead, and a warning stops no guest `cargo test` (`lab windows exec`), so they would restart this
-/// run's slow checks for code it does not run. The pass stays: a TEST-TARGET-ERROR does stop that
-/// lane, whose whole-crate run costs 8 GiB and one holder at a time. A run naming `cells` judges
-/// these warnings, and the lint pass judges them on shipped code, so a Windows test helper can sit
-/// dead until someone runs `verify cells`.
-#[must_use]
-pub fn leaves_test_warnings(pulled: bool, triple: &str) -> bool {
-    pulled && triple.ends_with("-pc-windows-msvc")
-}
-
-/// Whether a cell's rustc warnings ([`is_cell_warning`]) are findings.
-#[must_use]
-pub fn judges_warnings(triple: &str) -> bool {
-    let Some(own) = os_of(triple) else {
-        return false;
-    };
-    WARNINGS_JUDGED_OFF_FLEET.contains(&own)
-        || FLEET_HOST_TRIPLES
-            .iter()
-            .any(|host| os_of(host) == Some(own))
-}
-
-/// The OSes (a triple past its architecture) no fleet machine runs whose cells still judge
-/// warnings ([`judges_warnings`]).
-pub const WARNINGS_JUDGED_OFF_FLEET: [&str; 1] = ["pc-windows-msvc"];
-
-/// Whether a warning's lint code makes a cell red: any lint rustc itself raises.
-#[must_use]
-pub fn is_cell_warning(code: Option<&str>) -> bool {
-    code.is_some_and(|c| {
-        !c.starts_with("clippy::") && !matches!(c, "unknown_lints" | "renamed_and_removed_lints")
-    })
 }
 
 /// Read the JSON lines of `output` (cargo's other lines are skipped).
@@ -2248,22 +2165,12 @@ pub fn read_cargo_json(
                         .unwrap_or_default()
                         .to_string()
                 };
-                match msg
+                if msg
                     .and_then(|m| m.get("level"))
                     .and_then(aterm_json::Value::as_str)
+                    == Some("error")
                 {
-                    Some("error") => read.errors.push((pkg, rendered())),
-                    Some("warning") => {
-                        let code = msg
-                            .and_then(|m| m.get("code"))
-                            .and_then(|c| c.get("code"))
-                            .and_then(aterm_json::Value::as_str);
-                        let warning = (pkg, rendered());
-                        if is_cell_warning(code) && !read.warnings.contains(&warning) {
-                            read.warnings.push(warning);
-                        }
-                    }
-                    _ => {}
+                    read.errors.push((pkg, rendered()));
                 }
             }
             _ => {}

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TOML 1.0 date-times across the spec's four shapes, serialized through serde under a
+//! TOML 1.1 date-times across the spec's four shapes, serialized through serde under a
 //! private struct name compatible with `toml`.
 
 use core::fmt;
@@ -133,7 +133,7 @@ impl FromStr for Datetime {
             .filter(|(_, consumed)| *consumed == s.len())
             .map(|(dt, _)| dt)
             .ok_or(DatetimeParseError {
-                reason: "not an RFC 3339 date, time, or date-time",
+                reason: "not a TOML date, time, or date-time",
             })
     }
 }
@@ -170,7 +170,7 @@ const fn days_in_month(year: u16, month: u8) -> u8 {
 
 /// Parses a date-time prefix of `b` and returns `(datetime, consumed_bytes)`.
 pub(crate) fn parse_datetime(b: &[u8]) -> Option<(Datetime, usize)> {
-    // Local time: hh:mm:ss[.frac]
+    // Local time: hh:mm[:ss[.frac]].
     if b.len() >= 3 && b[2] == b':' {
         let (time, used) = parse_time(b, 0)?;
         return Some((
@@ -257,17 +257,19 @@ fn parse_time(b: &[u8], mut pos: usize) -> Option<(Time, usize)> {
         return None;
     }
     let minute = u8::try_from(digits(b, pos + 3, 2)?).ok()?;
-    if b.get(pos + 5) != Some(&b':') {
-        return None;
-    }
-    let second = u8::try_from(digits(b, pos + 6, 2)?).ok()?;
+    let seconds_present = b.get(pos + 5) == Some(&b':');
+    let second = if seconds_present {
+        u8::try_from(digits(b, pos + 6, 2)?).ok()?
+    } else {
+        0
+    };
     if hour > 23 || minute > 59 || second > 60 {
         return None;
     }
-    pos += 8;
+    pos += if seconds_present { 8 } else { 5 };
 
     let mut nanosecond = 0u32;
-    if b.get(pos) == Some(&b'.') {
+    if seconds_present && b.get(pos) == Some(&b'.') {
         let start = pos + 1;
         let mut end = start;
         while end < b.len() && b[end].is_ascii_digit() {

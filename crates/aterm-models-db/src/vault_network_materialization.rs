@@ -28,12 +28,12 @@ pub fn vault_network_materialization_admission_model() -> Model {
             action WrongSequence when (scenario == 0) { scenario = 13; recorded = if Buggy == 13 {1} else {0}; retained = 1; }
             action WrongEnvelopeDigest when (scenario == 0) { scenario = 14; recorded = if Buggy == 14 {1} else {0}; retained = 1; }
             action FailedApply when (scenario == 0) { scenario = 15; recorded = if Buggy == 15 {1} else {0}; retained = 1; }
-            action PendingApply when (scenario == 0) { scenario = 16; recorded = if Buggy == 16 {1} else {0}; retained = 1; }
+            action UnselectedApply when (scenario == 0) { scenario = 16; recorded = if Buggy == 16 {1} else {0}; retained = 1; }
             action NoOwnership when (scenario == 0) { scenario = 17; recorded = if Buggy == 17 {1} else {0}; retained = 1; }
             action Revoked when (scenario == 0) { scenario = 18; recorded = if Buggy == 18 {1} else {0}; retained = 1; }
             action CacheMissing when (scenario == 0) { scenario = 19; recorded = if Buggy == 19 {1} else {0}; retained = 1; }
-            action FileMissing when (scenario == 0) { scenario = 20; recorded = if Buggy == 20 {1} else {0}; retained = 1; }
-            action FileChanged when (scenario == 0) { scenario = 21; recorded = if Buggy == 21 {1} else {0}; retained = 1; }
+            action StaleSelection when (scenario == 0) { scenario = 20; recorded = if Buggy == 20 {1} else {0}; retained = 1; }
+            action CacheChanged when (scenario == 0) { scenario = 21; recorded = if Buggy == 21 {1} else {0}; retained = 1; }
             action MissingIdentity when (scenario == 0) { scenario = 22; recorded = if Buggy == 22 {1} else {0}; retained = 1; }
             action PlainSource when (scenario == 0) { scenario = 23; recorded = if Buggy == 23 {1} else {0}; retained = 1; }
             action UnknownMembership when (scenario == 0) { scenario = 24; recorded = if Buggy == 24 {1} else {0}; retained = 1; }

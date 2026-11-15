@@ -1530,7 +1530,7 @@ fn a_release_header_names_its_half() {
             EnvSnapshot::default(),
             PathBuf::from("/tmp"),
         )
-        .with_checks(&a.wanted(|_| true))
+        .with_checks(&a.checks)
         .with_release(a.release);
         header(&ctx, None)
     };
@@ -1552,22 +1552,20 @@ fn the_header_names_what_the_selection_pulled_and_why() {
             crates.iter().map(|c| c.to_string()).collect(),
             true,
         );
-        let holds = |p: &str| scope.includes_crate(p);
-        let checks = checks::with_pulled(&checks::DEV, false, holds);
         let ctx = Ctx::new(
             PathBuf::from("/repo"),
             scope.clone(),
             EnvSnapshot::default(),
             PathBuf::from("/tmp"),
         )
-        .with_checks(&checks);
+        .with_checks(&checks::DEV);
         header(&ctx, Some("the cone"))
     };
     assert_eq!(head(&["aterm-gui"]), "verify: dev — the cone");
-    assert_eq!(head(&["aterm-gpu"]), "verify: dev — the cone");
     assert_eq!(
         head(&["aterm-core", "aterm-gpu", "aterm-gpu-web", "aterm-wasm"]),
-        "verify: dev + wasm-smoke (the selection holds aterm-wasm) — the cone"
+        "verify: dev — the cone",
+        "a web module pulls no check"
     );
     let pulled = |crates: &[&str]| {
         let scope = Scope::changed(
@@ -1575,11 +1573,7 @@ fn the_header_names_what_the_selection_pulled_and_why() {
             crates.iter().map(|c| c.to_string()).collect(),
             true,
         );
-        let holds = |p: &str| scope.includes_crate(p);
-        let checks = checks::with(
-            &checks::with_pulled(&checks::DEV, false, holds),
-            Check::Cells,
-        );
+        let checks = checks::with(&checks::DEV, Check::Cells);
         let ctx = Ctx::new(
             PathBuf::from("/repo"),
             scope.clone(),
@@ -1593,10 +1587,6 @@ fn the_header_names_what_the_selection_pulled_and_why() {
     assert_eq!(
         pulled(&["aterm-gui"]),
         "verify: dev + cells (each other OS's cell and one of this OS's that builds a selected crate) — the cone"
-    );
-    assert_eq!(
-        pulled(&["aterm-wasm"]),
-        "verify: dev + wasm-smoke (the selection holds aterm-wasm) + cells (each other OS's cell and one of this OS's that builds a selected crate) — the cone"
     );
 
     if cfg!(target_os = "macos") {
@@ -1906,7 +1896,8 @@ fn structured_records_survive_the_external_temp_directory_and_keep_actual_produc
             code: finished.code,
             checks: rows,
             secs: 0,
-            finished: Some(finished)
+            finished: Some(finished),
+            ..event_log::Judged::default()
         }
         .whole()
     );
@@ -2388,4 +2379,226 @@ fn pinned_engine_snapshot_values_are_reader_inputs_not_test_child_environment() 
         assert!(ctx.exec_env().remove_env.contains(&name));
         assert!(ctx.exec_env().add_env.iter().all(|(key, _)| key != name));
     }
+}
+
+/// A run of `words` over `scope` as [`run_cli`] plans it on macOS (`planned_checks_for_host`, its
+/// flags by [`with_parsed`]), `home` its HOME and `root` its checkout, the engine and the public
+/// release pinned to fixtures, its land plan made over a fixture tree and machine.
+fn land_run(words: &[&str], scope: &Scope, root: &str, home: &str) -> Ctx {
+    let manifest_dir = aterm_tempfile::manifest_dir();
+    let checkout = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("aterm-verify is two directories below the workspace root");
+    let parsed = cli::parse(words.iter().copied()).expect("the invocation parses");
+    let (wanted, cells_pulled) = planned_checks_for_host(&parsed, scope, checkout, true);
+    let env = EnvSnapshot {
+        home: PathBuf::from(home),
+        ..EnvSnapshot::default()
+    };
+    let mut ctx = with_parsed(
+        Ctx::new(
+            PathBuf::from(root),
+            scope.clone(),
+            env,
+            PathBuf::from("/tmp"),
+        )
+        .with_checks(&wanted)
+        .with_cells_pulled(cells_pulled),
+        &parsed,
+    );
+    land_seal::tests::pin(&ctx, "# rows\n", "[repos]\n");
+    plan_land(
+        &parsed,
+        &mut ctx,
+        Box::new(land_seal::tests::Bench::every()),
+        |_| Ok(land_seal::tests::tree()),
+    );
+    ctx
+}
+
+/// A cone through aterm-gui and aterm-wasm: the dev set pulls appkit and cells.
+fn pulling_cone() -> Scope {
+    Scope::changed(
+        "origin/main",
+        vec!["aterm-gui".into(), "aterm-wasm".into()],
+        true,
+    )
+    .with_seeds(vec!["aterm-gui".into(), "aterm-wasm".into()])
+}
+
+/// Each planned check's key.
+fn planned_keys(ctx: &Ctx) -> Vec<(Check, String)> {
+    let land = ctx.land.as_ref().expect("the run keeps a land plan");
+    assert!(land.plan.unsealed.is_empty(), "{:?}", land.plan.unsealed);
+    land.plan
+        .required
+        .iter()
+        .map(|row| (row.check, row.key.clone()))
+        .collect()
+}
+
+const EVENTS: [&str; 2] = ["--events", "/tmp/e"];
+
+/// A DEV RUN KEYS ITS PULLS AND SAYS ITS PLAN FIRST: the dev set over a cone that pulls
+/// appkit and cells plans and keys each pull, and a run that keeps `--events` says
+/// `run-planned` (each planned check and its key) before its first stage, a `check-finished`
+/// carrying its planned key for each check it ran, and a `run-resealed` that holds it sealed
+/// through. NEGATIVE CONTROL: `--no-windows` changes appkit's key, the one check of the plan that
+/// opens windows, and no other.
+#[test]
+fn a_dev_run_keys_its_pulls_and_says_its_plan_first() {
+    let cone = pulling_cone();
+    let full = land_run(&EVENTS, &cone, "/repo", "/home");
+    let keys = planned_keys(&full);
+    for pulled in [Check::Appkit, Check::Cells] {
+        assert!(
+            full.checks.contains(&pulled),
+            "{pulled:?}: {:?}",
+            full.checks
+        );
+        assert!(
+            keys.iter().any(|(check, _)| *check == pulled),
+            "{pulled:?}: {keys:?}"
+        );
+    }
+
+    let windows = land_run(
+        &[&EVENTS[..], &["--no-windows"]].concat(),
+        &cone,
+        "/repo",
+        "/home",
+    );
+    let moved: Vec<Check> = planned_keys(&windows)
+        .iter()
+        .zip(&keys)
+        .filter(|(a, b)| a != b)
+        .map(|(a, _)| a.0)
+        .collect();
+    assert_eq!(moved, [Check::Appkit], "NEGATIVE CONTROL: --no-windows");
+
+    // A run over a plan whose stages the fixture passes: the events say the plan before any
+    // stage, and finish each check under its planned key.
+    let small = Scope::packages(&["aterm-types".to_owned()]);
+    let mut ctx = land_run(&["fmt", "--events", "/tmp/e"], &small, "/repo", "/home");
+    assert_eq!(ctx.checks, [Check::Fmt]);
+    let keys = planned_keys(&ctx);
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let at = dir.path().join("verify.events");
+    ctx = ctx.with_events(Some(event_log::EventLog::open(&at).unwrap()));
+    let code = run_with(
+        &ctx,
+        &mut std::io::sink(),
+        &mut std::io::sink(),
+        &Show::default(),
+        Seams {
+            stage: passing_stage,
+            prepare_cells: None,
+            prepare_build_dir: |_| Ok(()),
+            ..LIVE
+        },
+    )
+    .unwrap();
+    assert_eq!(code, exit::PASS);
+    let kept = std::fs::read_to_string(&at).unwrap();
+    let planned_at = kept
+        .lines()
+        .position(|l| event_log::Planned::of_event(l).is_some())
+        .expect("run-planned");
+    let first_stage = kept
+        .lines()
+        .position(|l| l.contains("\"event\":\"stage-started\""))
+        .expect("a stage started");
+    assert!(planned_at < first_stage, "{kept}");
+    let judged = event_log::Judged::from_events(&kept, code, 1);
+    let planned = judged.planned.as_ref().expect("run-planned");
+    assert_eq!(
+        planned
+            .required
+            .iter()
+            .map(|row| (row.check, row.key.clone()))
+            .collect::<Vec<_>>(),
+        keys,
+        "{kept}"
+    );
+    assert_eq!(
+        judged
+            .checks
+            .iter()
+            .map(|row| (row.check.as_str(), row.key.as_deref()))
+            .collect::<Vec<_>>(),
+        [("fmt", Some(planned.row(Check::Fmt).unwrap().key.as_str()))],
+        "{kept}"
+    );
+    assert!(judged.whole() && judged.sealed_through(), "{kept}");
+}
+
+/// PER-MAC SHAPING AND IDENTITY LEAVE EVERY KEY ALONE: `--test-cores` 4 or 12, `--timeout`,
+/// `--admit`, `--test-threads`, `--log`, `--test-seed` and the events file change no key, and
+/// another HOME or checkout path changes none either (they are the machine's local attributes:
+/// the local digest is the bench's, a test of its own reads the live ones). NEGATIVE CONTROLS:
+/// another base commit changes every key, released-shim's and census's included; a named `cells`
+/// keys apart from the pulled one.
+#[test]
+fn per_mac_shaping_and_identity_leave_every_key_alone() {
+    let cone = pulling_cone();
+    let keys = |words: &[&str], root: &str, home: &str| {
+        planned_keys(&land_run(&[&EVENTS[..], words].concat(), &cone, root, home))
+    };
+    let plain = keys(&[], "/repo", "/home");
+    for shaping in [
+        &["--test-cores", "4"][..],
+        &["--test-cores", "12"],
+        &["--timeout", "60"],
+        &["--timeout", "off"],
+        &["--admit", "now"],
+        &["--test-threads", "3"],
+        &["--log", "/tmp/l"],
+        &["--test-seed", "7"],
+    ] {
+        assert_eq!(keys(shaping, "/repo", "/home"), plain, "{shaping:?}");
+    }
+    assert_eq!(
+        keys(&[], "/elsewhere/repo", "/home"),
+        plain,
+        "another checkout"
+    );
+    assert_eq!(keys(&[], "/repo", "/Users//b"), plain, "another HOME");
+    let other_events = planned_keys(&land_run(&["--events", "/var/e2"], &cone, "/repo", "/home"));
+    assert_eq!(other_events, plain, "another events file");
+
+    let ctx = land_run(&EVENTS, &cone, "/repo", "/home");
+    let mut bench = land_seal::tests::Bench::every();
+    let other_base = land_seal::Plan::make(
+        &ctx,
+        &mut bench,
+        Ok(land_seal::Tree {
+            base: "a".repeat(40),
+            ..land_seal::tests::tree()
+        }),
+    );
+    for (row, (check, key)) in other_base.required.iter().zip(&plain) {
+        assert_ne!(
+            &row.key, key,
+            "NEGATIVE CONTROL: another base moves {check:?}"
+        );
+    }
+
+    let named = land_run(&["cells", "--events", "/tmp/e"], &cone, "/repo", "/home");
+    let pulled = land_run(&EVENTS, &cone, "/repo", "/home");
+    let cells = |ctx: &Ctx| {
+        ctx.land
+            .as_ref()
+            .unwrap()
+            .plan
+            .row(Check::Cells)
+            .unwrap()
+            .key
+            .clone()
+    };
+    assert_ne!(
+        cells(&named),
+        cells(&pulled),
+        "NEGATIVE CONTROL: named cells"
+    );
 }

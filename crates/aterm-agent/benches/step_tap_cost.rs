@@ -109,7 +109,7 @@ fn main() {
             lane.push(t.elapsed());
             assert!(r.caught_up);
             let batch = tap.take();
-            assert_eq!(batch.lost, 0, "every synthetic row is one the fold reads");
+            assert_eq!(batch.lost(), 0, "every synthetic row is one the fold reads");
             let n = batch.steps.len() as u64 + batch.overflow;
             if given.is_some() {
                 queued.1 = n;

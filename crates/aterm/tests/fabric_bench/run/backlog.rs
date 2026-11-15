@@ -126,6 +126,18 @@ pub fn fill_records<S: Read + Write>(
     subject: &str,
     n: usize,
 ) -> io::Result<()> {
+    fill_from(client, producer, 1, subject, n)
+}
+
+/// [`fill_records`] under producer sequences `first_seq..first_seq + n`, so one producer's fill
+/// can go in several parts.
+pub fn fill_from<S: Read + Write>(
+    client: &mut astream_broker::Client<S>,
+    producer: u64,
+    first_seq: u64,
+    subject: &str,
+    n: usize,
+) -> io::Result<()> {
     use astream_broker::{Pipelined, broker_refusal};
 
     if client.owed_acks() != 0 {
@@ -138,7 +150,7 @@ pub fn fill_records<S: Read + Write>(
     let mut progress = Instant::now();
     for start in (0..n).step_by(window) {
         let mut pending: Vec<u64> = (start..n.min(start.saturating_add(window)))
-            .map(|index| index as u64 + 1)
+            .map(|index| index as u64 + first_seq)
             .collect();
         while !pending.is_empty() {
             if progress.elapsed() >= DEADLINE {
@@ -194,6 +206,118 @@ pub fn fill_records<S: Read + Write>(
         }
     }
     Ok(())
+}
+
+/// [`fill`] with wanted mail among its oldest records (F11c, ATERM-KI-1111-9): `wanted` rounds,
+/// each [`crate::spec::WANTED_GAP`] filler records then a note from `mailer` to each of `sids`
+/// in turn (`wanted-<tag>-<round>-<i>`), then the rest of the `n` filler records. A note goes
+/// through aterm's outbox and the live bridge, which publish it some time after the post
+/// returns, so the fill waits (the hang detector) until its session lists it before the next
+/// filler record: each note's log offset is then past the filler before it and below the filler
+/// after it, and two notes lie more than [`crate::spec::WANTED_GAP`] records apart (asserted on
+/// the offsets the inbox reports), whatever the load. No session marks them seen, so every
+/// restart's refill reads them again, cold, from the watermarks [`seed_seen`] left, the pages
+/// that hold one record by record among the filler pages it passes whole. Returns how long the
+/// fill took, in ms, each session's notes' texts, and the newest note's log offset.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the world, its mail connection and clock, the population and the fill's sizes are \
+              each the fill's own"
+)]
+pub fn fill_with_wanted(
+    w: &World,
+    ctl: &mut Ctl,
+    clock: Clock,
+    mailer: &str,
+    sids: &[String],
+    tag: &str,
+    producer: u64,
+    n: usize,
+    wanted: usize,
+) -> (f64, HashMap<String, Vec<String>>, u64) {
+    use crate::spec::WANTED_GAP;
+
+    let subject = fill_subject(&w.node);
+    let mut god = w.god();
+    let mut seq = 1u64;
+    let mut filled = 0usize;
+    let mut notes: HashMap<String, Vec<String>> = HashMap::new();
+    let mut last_off: Option<u64> = None;
+    let t0 = Instant::now();
+    for round in 0..wanted {
+        for (i, sid) in sids.iter().enumerate() {
+            fill_from(&mut god, producer, seq, &subject, WANTED_GAP)
+                .unwrap_or_else(|e| panic!("fill {WANTED_GAP} records on {subject}: {e}"));
+            seq += WANTED_GAP as u64;
+            filled += WANTED_GAP;
+            let text = format!("wanted-{tag}-{round}-{i}");
+            let since = newest_id(ctl, sid);
+            post(ctl, clock, mailer, sid, &text);
+            let (id, _) = await_note(ctl, clock, sid, since)
+                .unwrap_or_else(|e| panic!("the wanted note `{text}` to {sid}: {e}"));
+            let row = list_since(ctl, sid, since)
+                .into_iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{sid} woke at row {id} and does not list it"));
+            assert_eq!(row.text, text, "{sid}'s row {id}");
+            if let Some(prev) = last_off {
+                assert!(
+                    row.off > prev + WANTED_GAP as u64,
+                    "the wanted note `{text}` landed at @{}, within {WANTED_GAP} records of the \
+                     one before it at @{prev}",
+                    row.off
+                );
+            }
+            last_off = Some(row.off);
+            notes.entry(sid.clone()).or_default().push(text);
+        }
+    }
+    let rest = n.saturating_sub(filled);
+    fill_from(&mut god, producer, seq, &subject, rest)
+        .unwrap_or_else(|e| panic!("fill {rest} records on {subject}: {e}"));
+    let newest = last_off.unwrap_or_else(|| panic!("a fill with wanted={wanted} posted no note"));
+    (t0.elapsed().as_secs_f64() * 1000.0, notes, newest)
+}
+
+/// A population's wanted mail ([`fill_with_wanted`]): each session's notes' texts, and its
+/// newest row id before them, from which [`wanted_listed`] lists them.
+pub struct Wanted {
+    pub notes: HashMap<String, Vec<String>>,
+    pub before: HashMap<String, u64>,
+}
+
+/// Every one of `notes`' sessions lists each of its notes exactly once among its rows newer
+/// than `since`'s for it, waiting (the hang detector) until the last of them is there: its
+/// newest row id among them, where its next wait starts.
+pub fn wanted_listed(
+    ctl: &mut Ctl,
+    notes: &HashMap<String, Vec<String>>,
+    since: &HashMap<String, u64>,
+) -> HashMap<String, u64> {
+    let mut newest = HashMap::new();
+    for (sid, texts) in notes {
+        let from = since.get(sid).copied().unwrap_or(0);
+        let rows = until(
+            &format!("{sid} to list its {} wanted note(s)", texts.len()),
+            || {
+                let rows = list_since(ctl, sid, from);
+                texts
+                    .iter()
+                    .all(|t| rows.iter().any(|r| &r.text == t))
+                    .then_some(rows)
+            },
+        );
+        for t in texts {
+            let n = rows.iter().filter(|r| &r.text == t).count();
+            assert_eq!(
+                n, 1,
+                "{sid} lists its wanted note `{t}` {n} times: {rows:?}"
+            );
+        }
+        let id = rows.iter().map(|r| r.id).max().unwrap_or(from);
+        newest.insert(sid.clone(), id);
+    }
+    newest
 }
 
 /// One paced publish: when it was sent, and when its ack came, on the run's clock.

@@ -28,6 +28,9 @@ pub(crate) use cohort_ledger::tests::Fixture as CohortFixture;
 #[path = "cohort_failure_tests.rs"]
 mod failure_tests;
 #[cfg(test)]
+#[path = "ledger_heavy_tests.rs"]
+mod heavy_tests;
+#[cfg(test)]
 #[path = "legacy_claim_tests.rs"]
 mod legacy_claim_tests;
 
@@ -281,6 +284,12 @@ impl Record {
         if let Some(run) = self.need.run_mem.filter(|run| *run < self.need.mem) {
             o.insert("run_mem".to_owned(), Value::from(run));
         }
+        if let Some(heavy) = self.need.heavy {
+            let mut h = Map::new();
+            h.insert("since_ms".to_owned(), Value::from(heavy.since_ms));
+            h.insert("predicted_ms".to_owned(), Value::from(heavy.predicted_ms));
+            o.insert("heavy".to_owned(), Value::Object(h));
+        }
         if let Some(p) = self.need.patience {
             let mut q = Map::new();
             q.insert("reserve_ms".to_owned(), Value::from(millis(p.reserve)));
@@ -316,8 +325,8 @@ impl Record {
     }
 
     /// The line a waiting critical lead appends once stable Release holders fund its memory
-    /// ([`crate::LeadReservation`]). The evidence is immutable: only the first complete line is
-    /// read.
+    /// ([`crate::LeadReservation`]), under the key `lead_retention`, each sponsor with its
+    /// holder's kernel start. The evidence is immutable: only the first complete line is read.
     pub(crate) fn lead_reservation_line(reservation: &crate::LeadReservation) -> String {
         let sponsors = reservation
             .sponsors
@@ -330,6 +339,7 @@ impl Record {
                     "order".into(),
                     Value::Array(vec![Value::from(start), Value::from(pid), Value::from(seq)]),
                 );
+                value.insert("start".into(), Value::from(sponsor.start));
                 Value::Object(value)
             })
             .collect();
@@ -338,7 +348,7 @@ impl Record {
         proof.insert("holdback".into(), Value::from(reservation.holdback));
         proof.insert("sponsors".into(), Value::Array(sponsors));
         let mut line = Map::new();
-        line.insert("lead_reservation".into(), Value::Object(proof));
+        line.insert("lead_retention".into(), Value::Object(proof));
         line_of(line)
     }
 
@@ -444,6 +454,16 @@ impl Record {
             None | Some(Value::Null) => None,
             Some(v) => Some(v.as_f64().filter(|q| q.is_finite() && *q >= 0.0)?),
         };
+        // The judgment turn ([`crate::Heavy`]): a record that names it in any shape but its own
+        // is no record, as a rank it does not know is none, so a malformed one never reads as a
+        // claim that asks nothing of the turn.
+        let heavy = match head.get("heavy") {
+            None => None,
+            Some(h) => Some(crate::Heavy {
+                since_ms: num(h, "since_ms")?,
+                predicted_ms: num(h, "predicted_ms")?,
+            }),
+        };
         let need = Need {
             rank: match head.get("rank") {
                 None => crate::Rank::Ordinary,
@@ -484,6 +504,7 @@ impl Record {
             stepped: None,
             stuck_ends: None,
             at_bound: crate::AtBound::Refuse,
+            heavy,
         };
         // The lines after the head, in the order they were added: a quiet waiter's `next_ms`,
         // the admission, then the measured writes' (written over in place) and each credit,
@@ -544,7 +565,7 @@ impl Record {
                 timing = Some(crate::TimingEvidence::read(t));
             }
             if lead_reservation.is_none()
-                && let Some(proof) = v.get("lead_reservation").and_then(read_lead_reservation)
+                && let Some(proof) = v.get("lead_retention").and_then(read_lead_reservation)
             {
                 lead_reservation = Some(proof);
             }
@@ -553,6 +574,7 @@ impl Record {
         // own: a waiter is never stepped, and one stepped below what it was admitted with is held
         // as any other, no longer alone: its reservation is counted beside the other claims'.
         let mut need = need;
+        need.leads &= need.rank != crate::Rank::Background;
         need.run_mem = num(&head, "run_mem").filter(|run| *run < need.mem);
         need.stepped = stepped.filter(|_| held);
         let valid_detached_need = match marker {
@@ -693,8 +715,14 @@ fn line_of(o: Map) -> String {
     line
 }
 
-/// A complete, bounded, irredundant lead-reservation proof. Unknown or malformed evidence is
-/// absent, so it can never make a later claimant wait.
+/// A complete, bounded, irredundant lead-reservation proof (a `lead_retention` line's value):
+/// `needed` above 0, its holdback, and 1 to [`crate::LEAD_SPONSORS_MAX`] sponsor rows, each of
+/// some bytes, a claim order of a pid above 0 that no row before names, and its holder's kernel
+/// start (0 where unread), whose bytes cover `needed`, none of them needlessly. Unknown keys are
+/// ignored. Unknown or malformed evidence is absent, so it can never make a later claimant wait; so
+/// is a row without its start, which no later look could tie to its process. Lines an earlier
+/// build wrote, under `lead_reservation`, are never read: such a lead loses its retained turn and
+/// nothing else, and no build reads evidence it cannot judge.
 fn read_lead_reservation(value: &Value) -> Option<crate::LeadReservation> {
     let needed = value.get("needed")?.as_u64().filter(|needed| *needed > 0)?;
     let holdback = value.get("holdback")?.as_u64()?;
@@ -702,10 +730,8 @@ fn read_lead_reservation(value: &Value) -> Option<crate::LeadReservation> {
     if rows.is_empty() || rows.len() > crate::LEAD_SPONSORS_MAX {
         return None;
     }
-    let mut seen = std::collections::HashSet::new();
-    let mut sponsors = Vec::with_capacity(rows.len());
-    for row in rows {
-        let bytes = row.get("bytes")?.as_u64().filter(|bytes| *bytes > 0)?;
+    let row = |row: &Value| {
+        let bytes = row.get("bytes")?.as_u64()?;
         let order = row.get("order")?.as_array()?;
         let [start, pid, seq] = order.as_slice() else {
             return None;
@@ -715,10 +741,20 @@ fn read_lead_reservation(value: &Value) -> Option<crate::LeadReservation> {
             u32::try_from(pid.as_u64()?).ok().filter(|pid| *pid > 0)?,
             seq.as_u64()?,
         );
-        if !seen.insert(order) {
+        let start = row.get("start")?.as_u64()?;
+        Some(crate::LeadSponsor {
+            order,
+            bytes,
+            start,
+        })
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut sponsors = Vec::with_capacity(rows.len());
+    for sponsor in rows.iter().map(row).collect::<Option<Vec<_>>>()? {
+        if sponsor.bytes == 0 || !seen.insert(sponsor.order) {
             return None;
         }
-        sponsors.push(crate::LeadSponsor { order, bytes });
+        sponsors.push(sponsor);
     }
     let total = sponsors
         .iter()
@@ -816,7 +852,7 @@ impl Laid {
 
 #[cfg(unix)]
 impl Laid {
-    fn check_named_memory(&self) -> io::Result<()> {
+    pub(crate) fn check_named_memory(&self) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt as _;
         let original = self.lock.metadata()?;
         let named = std::fs::symlink_metadata(&self.path)?;
@@ -1506,6 +1542,9 @@ impl Ledger {
             ));
         }
         let mut need = need.clone();
+        // A background need yields to every release claim ([`crate::Short::Release`]), so it
+        // never leads: a waiter that counted it would wait behind what a release holds.
+        need.leads &= need.rank != crate::Rank::Background;
         // Critical retention is a Release-only contract. A reservation is runtime evidence
         // written by this ledger's waiter, never authority a caller can carry into a new claim.
         need.critical &= need.leads && need.rank == crate::Rank::Release;

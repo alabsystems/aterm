@@ -3,14 +3,13 @@
 
 //! `@<sid> harness policy` control verb for one session's `[harness]` policy.
 
-use aterm_agent::supervise::policy::land_check::land_check_text;
-use aterm_agent::supervise::policy::needs::{NEEDS_ACK, NEEDS_HINT};
+use alab_policy::config::Autopilot;
+use alab_policy::land_check::land_check_text;
+use alab_policy::needs::{NEEDS_ACK, NEEDS_HINT};
+use alab_policy::words::{DONE_ANGLES, DONE_TAIL, land_answer_text, land_nudge_text, land_text};
+use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::question::LAND_TEXT;
-use aterm_agent::supervise::policy::turn_end::{
-    DONE_ANGLES, DONE_TAIL, continuation_text, done_check_text, land_answer_text, land_nudge_text,
-    land_text,
-};
-use aterm_agent::supervise::{Autopilot, SupervisorConfig};
+use aterm_agent::supervise::policy::turn_end::{continuation_text, done_check_text};
 use aterm_phase::Program;
 
 /// What the main thread knows of one session's policy: the facts the reply is made of, all but the rules file's text (read off the main thread).
@@ -25,6 +24,9 @@ pub(crate) struct PolicyFacts {
     /// The session's own `meta questions` word, when it has one.
     pub(crate) session_questions: Option<String>,
     pub(crate) codex_rotation: bool,
+    /// Whether the native policy moves a session whose login was lost
+    /// ([`crate::native_session_policy`]'s `login_rotation_enabled`).
+    pub(crate) codex_login_rotation: bool,
 }
 
 /// The inputs of `effective=`/`why=` for one session.
@@ -176,6 +178,11 @@ pub(crate) fn reply_serving(
             aterm_agent::harness::accounts::RESET_SOON_S
         ));
     }
+    if facts.codex_login_rotation {
+        // A codex-alab whose login was lost asks `codex-login-rotation prepare` only where this
+        // host moves such a session; elsewhere the lost login stays its stop for a person.
+        line.push_str(" codex_rotation_login=1");
+    }
     for (key, value) in facts.policy.texts() {
         let value = if key == "continue_text" {
             continuation_text(&facts.policy, rules)
@@ -244,6 +251,7 @@ pub(crate) fn configured_facts(
     PolicyFacts {
         generation,
         codex_rotation: ctx.native_policy.quota_rotation_enabled(),
+        codex_login_rotation: ctx.native_policy.login_rotation_enabled(),
         policy: policy.clone(),
         session_questions,
         effective: effective(

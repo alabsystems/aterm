@@ -651,3 +651,347 @@ fn inner_gated_and_macro_read_test_modules_say_so() {
         ]
     );
 }
+
+/// `text` with every item whose gate line is one of `gates` blanked.
+fn mask_gated_items(text: &str, gates: &[&str]) -> String {
+    mask_items_where(text, &|attr| gates.contains(&attr))
+}
+
+#[test]
+fn gated_items_end_at_their_own_shape_not_at_a_brace_count() {
+    fn src(lines: &[&str]) -> String {
+        let mut s = lines.join("\n");
+        s.push('\n');
+        s
+    }
+    let gates: &[&str] = &["#[cfg(test)]"];
+
+    let m = mask_gated_items(
+        &src(&[
+            "#[cfg(test)]",
+            "mod tests {",
+            "    fn t() {",
+            "        assert!(matches!(c, '{'), \"{}\", render());",
+            "    }",
+            "}",
+            "fn spawn_pkg_update_check() {",
+            "    let g = pkg.lock();",
+            "}",
+        ]),
+        gates,
+    );
+    assert!(
+        !m.contains("render()"),
+        "the test mod must be blanked:\n{m}"
+    );
+    assert!(
+        m.contains("fn spawn_pkg_update_check") && m.contains("pkg.lock()"),
+        "shipped code AFTER a gated mod must survive:\n{m}"
+    );
+    assert_eq!(
+        m.matches('{').count(),
+        m.matches('}').count(),
+        "the mask must leave the file brace-balanced:\n{m}"
+    );
+
+    let m = mask_gated_items(
+        &src(&[
+            "enum Ev {",
+            "    Shipped(u8),",
+            "    #[cfg(test)]",
+            "    TestOnly,",
+            "    AlsoShipped {",
+            "        payload: u8,",
+            "    },",
+            "}",
+        ]),
+        gates,
+    );
+    assert!(!m.contains("TestOnly"), "the gated variant must go:\n{m}");
+    assert!(
+        m.contains("AlsoShipped") && m.contains("payload"),
+        "the variants AFTER it must survive:\n{m}"
+    );
+
+    let m = mask_gated_items(
+        &src(&[
+            "fn settings(&self) -> Option<&S> {",
+            "    match &self.overlay {",
+            "        #[cfg(test)]",
+            "        Some(Overlay::Settings(s)) => Some(s),",
+            "        _ => None,",
+            "    }",
+            "}",
+        ]),
+        gates,
+    );
+    assert!(!m.contains("Overlay::Settings"), "arm must go:\n{m}");
+    assert!(m.contains("_ => None"), "the next arm must survive:\n{m}");
+
+    let m = mask_gated_items(
+        &src(&[
+            "#[cfg(test)]",
+            "fn helper(",
+            "    a: u32,",
+            ") -> u32 {",
+            "    alpha.lock();",
+            "}",
+            "fn shipped() {}",
+        ]),
+        gates,
+    );
+    assert!(!m.contains("alpha.lock()"), "gated body must go:\n{m}");
+    assert!(m.contains("fn shipped"), "the next item must survive:\n{m}");
+
+    let m = mask_gated_items(
+        &src(&[
+            "fn truncate(&mut self, n: usize) {",
+            "    #[cfg(test)]",
+            "    debug_assert!(",
+            "        n <= self.count,",
+            "        \"truncate({n}) exceeds count({})\",",
+            "        self.count",
+            "    );",
+            "    self.count -= n;",
+            "}",
+        ]),
+        gates,
+    );
+    assert!(!m.contains("debug_assert"), "the assert must go:\n{m}");
+    assert!(
+        m.contains("self.count -= n;"),
+        "the shipped statement after it must survive:\n{m}"
+    );
+    assert_eq!(
+        m.matches('{').count(),
+        m.matches('}').count(),
+        "the enclosing fn must still be brace-balanced:\n{m}"
+    );
+
+    let m = mask_gated_items(
+        &src(&[
+            "#[cfg(test)]",
+            "fn odd() {",
+            "    let g = alpha.lock();",
+            "  }",
+            "fn shipped() {}",
+        ]),
+        gates,
+    );
+    assert!(
+        m.contains("fn odd") && m.contains("alpha.lock()"),
+        "an unrecognised shape must be masked LESS, not more:\n{m}"
+    );
+    assert_eq!(
+        m.matches('{').count(),
+        m.matches('}').count(),
+        "the mask must never splice a brace off its partner:\n{m}"
+    );
+
+    let m = mask_gated_items(
+        &src(&[
+            "enum Ev {",
+            "    A,",
+            "    #[cfg(test)]",
+            "    B",
+            "}",
+            "fn shipped() {",
+            "    alpha.lock();",
+            "}",
+        ]),
+        gates,
+    );
+    assert!(!m.contains('B'), "the gated variant must go:\n{m}");
+    assert!(
+        m.contains("fn shipped") && m.contains("alpha.lock()"),
+        "the item after the enum must survive:\n{m}"
+    );
+    assert_eq!(
+        m.matches('{').count(),
+        m.matches('}').count(),
+        "the enum's close must survive:\n{m}"
+    );
+
+    let raw = src(&["#[cfg(test)]", "mod t {", "    fn a() {}", "}", "fn b() {}"]);
+    assert_eq!(
+        mask_gated_items(&raw, gates).lines().count(),
+        raw.lines().count()
+    );
+}
+
+#[test]
+fn gated_item_boundaries_ignore_multiline_literals_and_comments() {
+    let source = r####"
+const QUOTED: &str = r###"
+#[cfg(test)]
+mod quoted_gate {
+}
+"###;
+#[cfg(test)]
+mod tests {
+    const EXAMPLE: &str = r##"
+}
+fn dims(term: &Mutex<Terminal>) {
+    (term_lock(term).rows(), term_lock(term).cols())
+}
+"##;
+    /*
+}
+    */
+}
+fn shipped() {
+    let guard = real.lock();
+}
+"####;
+    let masked = crate::mask_unshipped_items(source);
+    assert!(masked.contains("mod quoted_gate"), "a quoted gate is data");
+    assert!(
+        !masked.contains("fn dims"),
+        "the whole actual test module is masked"
+    );
+    assert!(
+        masked.contains("fn shipped") && masked.contains("real.lock()"),
+        "real code after the test module survives"
+    );
+    assert_eq!(masked.lines().count(), source.lines().count());
+}
+
+/// A literal's later lines sit at any column: one at column 0 opens inside the literal, so it
+/// is no dedent, and its `;` still ends the gated statement. Read on raw indents, each tail
+/// below was kept as shipped code.
+#[test]
+fn a_literal_tail_at_column_0_ends_no_gated_item() {
+    let text = [
+        "fn shipped() {",
+        "    #[cfg(test)]",
+        "    let cooked = \"",
+        "term_lock(&t).resize(1, 2)\";",
+        "    #[cfg(test)]",
+        "    let raw = r#\"",
+        "gamma.lock()",
+        "\"#;",
+        "    #[cfg(test)]",
+        "    let listed = [\"a",
+        "\", delta.lock()];",
+        "    beta.lock();",
+        "}",
+        "",
+    ]
+    .join("\n");
+    let m = crate::mask_unshipped_items(&text);
+    for gone in ["term_lock", "gamma.lock()", "\"#;", "delta.lock()"] {
+        assert!(!m.contains(gone), "`{gone}` is test code:\n{m}");
+    }
+    assert!(
+        m.contains("fn shipped() {") && m.contains("beta.lock();"),
+        "the fn's shipped lines survive:\n{m}"
+    );
+    assert_eq!(m.lines().count(), text.lines().count());
+}
+
+#[test]
+fn gated_item_predicates_keep_quoted_values_and_ignore_trailing_comments() {
+    let raw = "#[cfg(target_os = \"macos\")] // target-only\nfn hidden() {\n    alpha_lock.lock();\n}\nfn shipped() {\n    beta_lock.lock();\n}\n";
+    let masked = mask_items_where(raw, &|attr| attr == "#[cfg(target_os = \"macos\")]");
+    assert!(
+        !masked.contains("hidden") && !masked.contains("alpha_lock"),
+        "target value was lost:\n{masked}"
+    );
+    assert!(
+        masked.contains("fn shipped") && masked.contains("beta_lock"),
+        "following production code was masked:\n{masked}"
+    );
+    assert_eq!(masked.lines().count(), raw.lines().count());
+}
+
+#[test]
+fn strict_test_cfg_masks_only_complete_provably_false_items() {
+    for attr in [
+        "#[cfg(all(test, unix))]",
+        "#[cfg(\n all(test,\n unix)\n)]",
+        "#[cfg(not(not(test)))]",
+    ] {
+        let source = format!(
+            "{attr}\nmod hidden {{\n    fn cycle() {{\n        let a = alpha.lock().unwrap();\n        alpha.lock();\n    }}\n}}\nfn visible() {{\n    beta.lock();\n}}\n"
+        );
+        let masked = crate::mask_unshipped_items(&source);
+        assert!(!masked.contains("fn cycle"), "{attr}: {masked}");
+        assert!(masked.contains("fn visible"));
+    }
+    for attr in [
+        "#[cfg(any(test, debug_assertions))]",
+        "#[cfg(any(test, feature = \"x\"))]",
+        "#[cfg(not(test))]",
+        "#[cfg(all(test, bogus(,)))]",
+        "#[cfg(all(test, unix)) trailing)]",
+    ] {
+        let source = format!("{attr}\nfn visible() {{\n    beta.lock();\n}}\n");
+        assert!(
+            crate::mask_unshipped_items(&source).contains("fn visible"),
+            "{attr}"
+        );
+    }
+    let array_then_module = "#[cfg(test)]\nconst KEY: [u8; 32] = [0; 32];\n#[cfg(test)]\nmod later {\n    fn hidden() { alpha.lock(); }\n}\nfn shipped() { beta.lock(); }\n";
+    let masked = crate::mask_unshipped_items(array_then_module);
+    assert!(!masked.contains("const KEY"), "{masked}");
+    assert!(!masked.contains("fn hidden"), "{masked}");
+    assert!(masked.contains("fn shipped"), "{masked}");
+    let closure_then_module = "fn first() {\n    #[cfg(test)]\n    WAITER.with(|waiter| {\n        take(waiter);\n    });\n}\n#[cfg(test)]\nmod later {\n    fn hidden() { alpha.lock(); }\n}\nfn shipped() { beta.lock(); }\n";
+    let masked = crate::mask_unshipped_items(closure_then_module);
+    assert!(!masked.contains("WAITER"), "{masked}");
+    assert!(!masked.contains("fn hidden"), "{masked}");
+    assert!(masked.contains("fn shipped"), "{masked}");
+    let multiline = "#[cfg(test)]\nfn hidden(\n    argument: usize,\n) {\n    alpha.lock();\n}\n#[cfg(test)]\nconst CALLED: usize = identity(\n    1,\n);\n#[cfg(test)]\nmod later {\n    fn hidden_too() { beta.lock(); }\n}\nfn shipped() { beta.lock(); }\n";
+    let masked = crate::mask_unshipped_items(multiline);
+    assert!(!masked.contains("fn hidden"), "{masked}");
+    assert!(!masked.contains("const CALLED"), "{masked}");
+    assert!(masked.contains("fn shipped"), "{masked}");
+    let mixed_const = crate::mask_unshipped_items(
+        "#[cfg(test)]\nconst HIDDEN: u8 = 0; fn shipped() { alpha.lock(); }\n#[cfg(test)]\nfn later() { beta.lock(); }\n",
+    );
+    assert!(mixed_const.contains("fn shipped"), "{mixed_const}");
+    assert!(!mixed_const.contains("fn later"), "{mixed_const}");
+    let mixed_then_module = "#[cfg(test)]\nfn hidden() {} fn shipped() { alpha.lock(); }\n#[cfg(test)]\nfn later() { beta.lock(); }\n";
+    let masked = crate::mask_unshipped_items(mixed_then_module);
+    assert!(masked.contains("fn shipped"), "{masked}");
+    assert!(!masked.contains("fn later"), "{masked}");
+    let prefixed = "// λ padded   \r\nconst NOTE: &str = \"λ\";   \r\n#[cfg(\r\n all(test, unix)\r\n)]\r\nfn hidden() {\r\n    alpha.lock();\r\n}\r\nfn visible() {\r\n    beta.lock();\r\n}\r\n";
+    let masked = crate::mask_unshipped_items(prefixed);
+    assert!(!masked.contains("fn hidden"), "{masked}");
+    assert!(masked.contains("fn visible"), "{masked}");
+    let same_line = crate::mask_unshipped_items(
+        "#[cfg(all(test, unix))] fn hidden() {}\nfn visible() {\n    beta.lock();\n}\n",
+    );
+    assert!(same_line.contains("fn hidden"));
+    assert!(same_line.contains("fn visible"));
+    let shared_line =
+        crate::mask_unshipped_items("#[cfg(test)] fn hidden() {} fn shipped() { alpha.lock(); }\n");
+    assert!(shared_line.contains("fn shipped"));
+    let literal = "const SOURCE: &str = r#\"\n#[cfg(all(test, unix))]\nfn fake() {}\n\"#;\nfn visible() {\n    beta.lock();\n}\n";
+    assert!(crate::mask_unshipped_items(literal).contains("fn visible"));
+}
+
+#[test]
+fn test_disabled_evaluation_requires_complete_syntax_and_settles_only_test() {
+    for predicate in [
+        "test",
+        "all(test, unix)",
+        "all(feature = \"a,b\", test)",
+        "not(not(test))",
+        "any(test, test)",
+    ] {
+        assert_eq!(when_test_disabled(predicate), Truth::False, "{predicate}");
+    }
+    for predicate in [
+        "any(test, debug_assertions)",
+        "any(test, feature = \"x\")",
+        "all(test, broken(,))",
+        "all(test, unix))",
+        "all(test,,unix)",
+        "all(test, feature = \"\\q\")",
+        "all(test, feature = \"unfinished)",
+    ] {
+        assert_eq!(when_test_disabled(predicate), Truth::Unknown, "{predicate}");
+    }
+    assert_eq!(when_test_disabled("not(test)"), Truth::True);
+}

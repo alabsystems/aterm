@@ -14,10 +14,10 @@
 //! characters, which another Mac could match, so `req=`, a later verb and a requester's close
 //! count as the requester's only where both are its own.
 
-use crate::claim::{Claim, ClaimSrc, HeldClaim, MAX_CLAIMS, MAX_ROOTS, TouchWhy};
+use crate::claim::{Claim, ClaimSrc, HeldClaim, Keep, MAX_CLAIMS, MAX_ROOTS, TouchWhy};
 use crate::record::{
-    Body, Brief, EndWhy, Form, HOST_BYTES, Open, Out, Rec, Said, SaidBody, Spent, TaskEnd, Verb,
-    Via, WhySrc, is_node_word, is_token,
+    Body, Brief, Did, EndWhy, Form, HOST_BYTES, Open, Out, Rec, Said, SaidBody, Spent, TaskEnd,
+    Unclean, Verb, Via, WhySrc, is_node_word, is_token,
 };
 use crate::why::Why;
 use aterm_types::control_verbs::{REQUEST_WHY_BYTES, REQUESTER_ACCOUNT_BYTES};
@@ -153,6 +153,11 @@ pub enum Stage {
     Concluded,
     /// Concluded and reviewed.
     Reviewed,
+    /// A person's cleanup began and has not finished: it runs, or a quit or a crash cut it, and
+    /// cleaning it again resumes it. A request kept since reads as its review left it.
+    Cleaning,
+    /// Cleaned up: its tabs closed, its claimed folders deleted or listed as kept.
+    Cleaned,
 }
 
 impl Stage {
@@ -164,6 +169,8 @@ impl Stage {
             Self::Running => "running",
             Self::Concluded => "concluded",
             Self::Reviewed => "reviewed",
+            Self::Cleaning => "cleaning",
+            Self::Cleaned => "cleaned",
         }
     }
 }
@@ -194,6 +201,69 @@ pub struct Reply {
 
 /// The most replies a request folds: its newest.
 pub const MAX_REPLIES: usize = 32;
+
+/// The most archives a request folds: its newest.
+pub const MAX_ARCHIVES: usize = 32;
+
+/// A person's cleanup of a request, as its newest `clean` record says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanBegan {
+    /// Who.
+    pub by: String,
+    /// When, Unix milliseconds.
+    pub at_ms: u64,
+    /// Its tabs are closed even where a command runs in one.
+    pub stop: bool,
+}
+
+/// A cleanup's archive, as its `archived` record says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Archive {
+    /// When it was written, Unix milliseconds.
+    pub at_ms: u64,
+    /// Its folder's name in the archive.
+    pub dir: String,
+    /// The bytes it holds.
+    pub bytes: u64,
+    /// The files its manifest lists.
+    pub files: u64,
+    /// The claims its manifest lists.
+    pub listed: u64,
+    /// Whether every claim's listing was whole.
+    pub whole: bool,
+}
+
+/// What a cleanup did with one claimed folder, as its `gone` record says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoneClaim {
+    /// When, Unix milliseconds.
+    pub at_ms: u64,
+    /// The claimed folder.
+    pub path: String,
+    /// The bytes it measured, where a measure read them.
+    pub bytes: Option<u64>,
+    /// Why it was kept.
+    pub why: Option<Keep>,
+    /// What was done.
+    pub did: Did,
+}
+
+/// How a cleanup finished, as its `cleaned` record says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanedAs {
+    /// When, Unix milliseconds.
+    pub at_ms: u64,
+    /// The tabs it closed.
+    pub tabs: u64,
+    /// The claimed folders it deleted.
+    pub deleted: u64,
+    /// The claimed folders it kept.
+    pub kept: u64,
+    /// The claimed folders it failed to delete.
+    pub failed: u64,
+    /// Who cleaned it.
+    pub by: String,
+}
 
 /// One request, folded from its records.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +298,17 @@ pub struct Request {
     pub kept: Option<(String, u64)>,
     /// The replies that went to its requester, oldest first: its newest [`MAX_REPLIES`].
     pub replies: Vec<Reply>,
+    /// The newest cleanup a person began.
+    pub clean: Option<CleanBegan>,
+    /// Its cleanups' archives, oldest first: its newest [`MAX_ARCHIVES`]. A cleanup a quit cut
+    /// after its archive was written, resumed, writes another beside it.
+    pub archives: Vec<Archive>,
+    /// What cleanups did with its claimed folders: one per folder, the newest.
+    pub gone: Vec<GoneClaim>,
+    /// Why the newest cleanup stopped before it deleted anything, and when.
+    pub uncleaned: Option<(Unclean, u64)>,
+    /// How its cleanup finished.
+    pub cleaned: Option<CleanedAs>,
 }
 
 impl Request {
@@ -244,6 +325,13 @@ impl Request {
     /// Where it stands for its review ([`Stage`]).
     #[must_use]
     pub fn stage(&self) -> Stage {
+        if self.cleaned.is_some() {
+            return Stage::Cleaned;
+        }
+        // A request kept since its cleanup was cut is the person's: no cleanup resumes it.
+        if self.clean.is_some() && self.uncleaned.is_none() && self.kept.is_none() {
+            return Stage::Cleaning;
+        }
         match self.state() {
             State::Open => Stage::Open,
             State::Running => Stage::Running,
@@ -260,6 +348,12 @@ impl Request {
     #[must_use]
     pub fn claim(&self, path: &str) -> Option<&HeldClaim> {
         self.claims.iter().find(|held| held.claim.path == path)
+    }
+
+    /// What a cleanup did with its claimed folder `path`, where one did.
+    #[must_use]
+    pub fn gone_of(&self, path: &str) -> Option<&GoneClaim> {
+        self.gone.iter().find(|gone| gone.path == path)
     }
 
     /// What its tabs spent, summed over the tabs that left (the largest resident set, the
@@ -333,6 +427,15 @@ pub enum Refusal {
     NotYours,
     /// It concluded.
     Concluded,
+    /// It came in as `request`, and the spawn comes in as `spawn`: a request's lease is its
+    /// intake's (a plain fleet shell's is leased, a worker's is not), so its tabs all come in one
+    /// way.
+    Via {
+        /// How the request came in.
+        request: Via,
+        /// How the joining spawn comes in.
+        spawn: Via,
+    },
     /// The store could not be read.
     Store(io::Error),
 }
@@ -343,6 +446,14 @@ impl std::fmt::Display for Refusal {
             Self::Unknown => f.write_str("no request of that id on this Mac"),
             Self::NotYours => f.write_str("another requester's request"),
             Self::Concluded => f.write_str("the request has concluded"),
+            Self::Via { request, spawn } => write!(
+                f,
+                "the request came in as {} and this spawn as {}: a request's tabs come in one \
+                 way, since a plain fleet shell's request is leased and a worker's is not (spawn \
+                 it without req= to open its own)",
+                request.word(),
+                spawn.word()
+            ),
             Self::Store(error) => write!(f, "the request store: {error}"),
         }
     }
@@ -358,6 +469,14 @@ pub enum ActRefusal {
     /// The line is not one a record keeps: a note or reply that is not one visible line
     /// ([`crate::why::line_of`]), or a key no `post` takes.
     Shape(&'static str),
+    /// It is kept: its tabs and folders are a person's, which no cleanup touches.
+    Kept,
+    /// It has not concluded, and the cleanup was not asked to stop it (`stop=1`).
+    Live,
+    /// Its tab `.0` stands in another aterm on this state home, which alone can close it.
+    Elsewhere(String),
+    /// It was cleaned up.
+    Cleaned,
     /// The store could not be read or written.
     Store(io::Error),
 }
@@ -369,6 +488,20 @@ impl std::fmt::Display for ActRefusal {
             Self::Running => {
                 f.write_str("the request has not concluded, and a review judges how it came out")
             }
+            Self::Kept => f.write_str(
+                "the request is kept: its tabs and folders are this Mac's person's, and no \
+                 cleanup touches them",
+            ),
+            Self::Live => f.write_str(
+                "the request has not concluded: clean it with stop=1 to close its tabs and end \
+                 what runs in them",
+            ),
+            Self::Elsewhere(sid) => write!(
+                f,
+                "its tab {sid} is open in another aterm on this state home, which alone can \
+                 close it"
+            ),
+            Self::Cleaned => f.write_str("the request was cleaned up"),
             Self::Shape(why) => f.write_str(why),
             Self::Store(error) => write!(f, "the request store: {error}"),
         }
@@ -395,6 +528,47 @@ pub struct KeptRequest {
     pub already: bool,
 }
 
+/// What a cleanup's start found ([`Store::begin_clean`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CleanStart {
+    /// It was cleaned up before: nothing was written.
+    Already,
+    /// The cleanup may go on: the request as its `clean` record left it.
+    Plan(Box<CleanPlan>),
+}
+
+/// A cleanup a person began ([`CleanStart::Plan`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanPlan {
+    /// The request, its `clean` (and any review the clean wrote) folded in.
+    pub request: Request,
+    /// When the cleanup began, Unix milliseconds.
+    pub at_ms: u64,
+    /// An earlier cleanup of it was cut short: this one resumes it, and skips each folder that
+    /// one deleted.
+    pub resumed: bool,
+}
+
+/// How a cleanup ended ([`Store::end_clean`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CleanEnd {
+    /// It finished: tabs closed and claimed folders deleted, kept and failed, by whom.
+    Cleaned {
+        /// The tabs it closed.
+        tabs: u64,
+        /// The claimed folders it deleted.
+        deleted: u64,
+        /// The claimed folders it kept.
+        kept: u64,
+        /// The claimed folders it failed to delete.
+        failed: u64,
+        /// Who cleaned it.
+        by: String,
+    },
+    /// It stopped before it deleted anything.
+    Uncleaned(Unclean),
+}
+
 /// What a request said in the content tier ([`Store::said`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SaidOf {
@@ -408,20 +582,58 @@ pub struct SaidOf {
     pub replies: Vec<(String, String)>,
 }
 
-/// The content tier as last read: where the read stopped, and each request's words.
+/// The content tier as last read: where the read stopped, and each id's rows.
 #[derive(Default)]
 struct SaidFold {
     seen: Option<Identity>,
-    of: HashMap<String, SaidOf>,
+    of: BTreeMap<String, SaidRows>,
+}
+
+/// What the content tier holds under one id, each intake row with the time it was written:
+/// a request's own intake rows carry its `open`'s time ([`Store::open_request`]).
+#[derive(Default)]
+struct SaidRows {
+    why: Option<(u64, String, WhySrc)>,
+    goal: Option<(u64, String)>,
+    asked: Option<(u64, String)>,
+    replies: Vec<(String, String)>,
+}
+
+impl SaidRows {
+    /// What a request opened at `opened_ms` said: only the intake rows written with its `open`.
+    /// Rows a spawn wrote under the id before its `open` was lost (a crash or a failed write
+    /// between the two) are no request's, even where a build that minted the id again opened it.
+    fn of(&self, opened_ms: u64) -> SaidOf {
+        let own = |t_ms: u64| t_ms == opened_ms;
+        SaidOf {
+            why: self
+                .why
+                .as_ref()
+                .filter(|(t_ms, ..)| own(*t_ms))
+                .map(|(_, text, src)| (text.clone(), *src)),
+            goal: self
+                .goal
+                .as_ref()
+                .filter(|(t_ms, _)| own(*t_ms))
+                .map(|(_, text)| text.clone()),
+            asked: self
+                .asked
+                .as_ref()
+                .filter(|(t_ms, _)| own(*t_ms))
+                .map(|(_, text)| text.clone()),
+            replies: self.replies.clone(),
+        }
+    }
 }
 
 impl SaidFold {
     fn apply(&mut self, said: Said) {
         let of = self.of.entry(said.id).or_default();
+        let t_ms = said.t_ms;
         match said.body {
-            SaidBody::Why { text, src } => of.why = Some((text, src)),
-            SaidBody::Goal { text } => of.goal = Some(text),
-            SaidBody::Asked { text } => of.asked = Some(text),
+            SaidBody::Why { text, src } => of.why = Some((t_ms, text, src)),
+            SaidBody::Goal { text } => of.goal = Some((t_ms, text)),
+            SaidBody::Asked { text } => of.asked = Some((t_ms, text)),
             SaidBody::Reply { text, key } => {
                 if of.replies.len() >= MAX_REPLIES {
                     of.replies.remove(0);
@@ -721,6 +933,11 @@ impl Fold {
                     review: None,
                     kept: None,
                     replies: Vec::new(),
+                    clean: None,
+                    archives: Vec::new(),
+                    gone: Vec::new(),
+                    uncleaned: None,
+                    cleaned: None,
                 },
             );
             return true;
@@ -850,6 +1067,85 @@ impl Fold {
                     sent,
                 });
             }
+            Body::Clean { by, stop } => {
+                if request.cleaned.is_some() {
+                    return false;
+                }
+                request.clean = Some(CleanBegan {
+                    by,
+                    at_ms: t_ms,
+                    stop,
+                });
+                request.uncleaned = None;
+            }
+            Body::Archived {
+                dir,
+                bytes,
+                files,
+                listed,
+                whole,
+            } => {
+                if request.clean.is_none() {
+                    return false;
+                }
+                request.archives.push(Archive {
+                    at_ms: t_ms,
+                    dir,
+                    bytes,
+                    files,
+                    listed,
+                    whole,
+                });
+                if request.archives.len() > MAX_ARCHIVES {
+                    request.archives.remove(0);
+                }
+            }
+            Body::Gone {
+                bytes,
+                why,
+                path,
+                did,
+            } => {
+                if request.clean.is_none() || request.claim(&path).is_none() {
+                    return false;
+                }
+                let gone = GoneClaim {
+                    at_ms: t_ms,
+                    path,
+                    bytes,
+                    why,
+                    did,
+                };
+                match request.gone.iter_mut().find(|had| had.path == gone.path) {
+                    Some(had) => *had = gone,
+                    None => request.gone.push(gone),
+                }
+            }
+            Body::Uncleaned { why } => {
+                if request.clean.is_none() || request.cleaned.is_some() {
+                    return false;
+                }
+                request.uncleaned = Some((why, t_ms));
+            }
+            Body::Cleaned {
+                tabs,
+                deleted,
+                kept,
+                failed,
+                by,
+            } => {
+                if request.clean.is_none() || request.cleaned.is_some() {
+                    return false;
+                }
+                request.cleaned = Some(CleanedAs {
+                    at_ms: t_ms,
+                    tabs,
+                    deleted,
+                    kept,
+                    failed,
+                    by,
+                });
+            }
         }
         true
     }
@@ -932,11 +1228,15 @@ impl Store {
 
     /// What request `id` said in the content tier ([`crate::SAID`]): its fallback why, the
     /// requesting tab's goal and asked lines, and its replies' text, after any row another
-    /// process appended. The content tier is read only here, so a reader that serves no content
-    /// never opens it. A read that fails answers from what this store last read.
+    /// process appended; `None` for an id this store holds no request of, or one that said
+    /// nothing. Only the intake rows written with its `open` are its own ([`Self::open_request`]).
+    /// The content tier is read only here and by [`Self::open_request`], so a reader that serves
+    /// no content never opens it. A read that fails answers from what this store last read.
     pub fn said(&mut self, id: &str) -> Option<SaidOf> {
         let _ = self.refresh_said();
-        self.said_fold.of.get(id).cloned()
+        let opened_ms = self.fold.requests.get(id)?.opened_ms;
+        let said = self.said_fold.of.get(id)?.of(opened_ms);
+        (said != SaidOf::default()).then_some(said)
     }
 
     /// A person (`by`, an actor token) reviewed request `id` at `at_ms`, with `note` where they
@@ -1004,6 +1304,9 @@ impl Store {
         let mut held = line_log::hold(&self.journal).map_err(ActRefusal::Store)?;
         self.refresh_held(&mut held).map_err(ActRefusal::Store)?;
         let request = self.fold.requests.get(id).ok_or(ActRefusal::Unknown)?;
+        if request.cleaned.is_some() {
+            return Err(ActRefusal::Cleaned);
+        }
         let tabs: Vec<String> = request
             .tabs
             .iter()
@@ -1089,6 +1392,159 @@ impl Store {
         .map_err(ActRefusal::Store)
     }
 
+    /// A person (`by`) begins cleaning request `id` up at `at_ms` (`request clean`, Clean Up):
+    /// where it may be, its `clean` (`stop` where its tabs are closed even with a command running
+    /// in one), after a `review` by the same person where none was written (a person's cleanup
+    /// counts as their review), in one append. `hosted` says whether this process hosts a tab: a
+    /// standing tab it does not is another aterm's, which alone can close it. A cleanup that a
+    /// quit or a crash cut short (its stage `cleaning`) is begun again, and resumes.
+    ///
+    /// # Errors
+    /// [`ActRefusal::Unknown`]; [`ActRefusal::Kept`]; [`ActRefusal::Live`] for a request not
+    /// concluded without `stop`; [`ActRefusal::Elsewhere`]; the journal's.
+    pub fn begin_clean(
+        &mut self,
+        at_ms: u64,
+        id: &str,
+        by: &str,
+        stop: bool,
+        hosted: &dyn Fn(&str) -> bool,
+    ) -> Result<CleanStart, ActRefusal> {
+        let mut held = line_log::hold(&self.journal).map_err(ActRefusal::Store)?;
+        self.refresh_held(&mut held).map_err(ActRefusal::Store)?;
+        let request = self.fold.requests.get(id).ok_or(ActRefusal::Unknown)?;
+        if request.cleaned.is_some() {
+            return Ok(CleanStart::Already);
+        }
+        if request.kept.is_some() {
+            return Err(ActRefusal::Kept);
+        }
+        if request.end.is_none() && !stop {
+            return Err(ActRefusal::Live);
+        }
+        if let Some(tab) = request
+            .tabs
+            .iter()
+            .find(|tab| tab.is_open() && !hosted(&tab.sid))
+        {
+            return Err(ActRefusal::Elsewhere(tab.sid.clone()));
+        }
+        let resumed = request.stage() == Stage::Cleaning;
+        let by = token_or_dash(by);
+        let rec = |body| Rec {
+            t_ms: at_ms,
+            id: id.to_owned(),
+            body,
+        };
+        let mut recs = Vec::new();
+        if request.review.is_none() {
+            recs.push(rec(Body::Review {
+                note: None,
+                by: by.clone(),
+            }));
+        }
+        recs.push(rec(Body::Clean { by, stop }));
+        self.write(&mut held, recs).map_err(ActRefusal::Store)?;
+        let request = self
+            .fold
+            .requests
+            .get(id)
+            .cloned()
+            .ok_or(ActRefusal::Unknown)?;
+        Ok(CleanStart::Plan(Box::new(CleanPlan {
+            request,
+            at_ms,
+            resumed,
+        })))
+    }
+
+    /// Request `id`'s cleanup wrote its archive, `archive` (its `at_ms` the record's time).
+    ///
+    /// # Errors
+    /// The journal's; `InvalidInput` where no cleanup of `id` began.
+    pub fn archived(&mut self, id: &str, archive: &Archive) -> io::Result<()> {
+        self.clean_rows(
+            archive.at_ms,
+            id,
+            vec![Body::Archived {
+                dir: archive.dir.clone(),
+                bytes: archive.bytes,
+                files: archive.files,
+                listed: archive.listed,
+                whole: archive.whole,
+            }],
+        )
+    }
+
+    /// What request `id`'s cleanup did with its claimed folder `gone.path` (its `at_ms` the
+    /// record's time), written as it is done so a cut cleanup's next run skips a folder deleted.
+    ///
+    /// # Errors
+    /// The journal's; `InvalidInput` where no cleanup of `id` began or it claims no such folder.
+    pub fn gone(&mut self, id: &str, gone: &GoneClaim) -> io::Result<()> {
+        self.clean_rows(
+            gone.at_ms,
+            id,
+            vec![Body::Gone {
+                bytes: gone.bytes,
+                why: gone.why,
+                path: gone.path.clone(),
+                did: gone.did,
+            }],
+        )
+    }
+
+    /// Request `id`'s cleanup ended at `at_ms` as `end` says.
+    ///
+    /// # Errors
+    /// The journal's; `InvalidInput` where no cleanup of `id` began or it finished already.
+    pub fn end_clean(&mut self, at_ms: u64, id: &str, end: CleanEnd) -> io::Result<()> {
+        let body = match end {
+            CleanEnd::Cleaned {
+                tabs,
+                deleted,
+                kept,
+                failed,
+                by,
+            } => Body::Cleaned {
+                tabs,
+                deleted,
+                kept,
+                failed,
+                by: token_or_dash(&by),
+            },
+            CleanEnd::Uncleaned(why) => Body::Uncleaned { why },
+        };
+        self.clean_rows(at_ms, id, vec![body])
+    }
+
+    /// Append `bodies` of request `id` at `at_ms` where a cleanup of it began and has not
+    /// finished, and each applies.
+    fn clean_rows(&mut self, at_ms: u64, id: &str, bodies: Vec<Body>) -> io::Result<()> {
+        let mut held = line_log::hold(&self.journal)?;
+        self.refresh_held(&mut held)?;
+        let open = self.fold.requests.get(id).is_some_and(|request| {
+            request.clean.is_some()
+                && request.cleaned.is_none()
+                && bodies.iter().all(|body| match body {
+                    Body::Gone { path, .. } => request.claim(path).is_some(),
+                    _ => true,
+                })
+        });
+        if !open {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let recs = bodies
+            .into_iter()
+            .map(|body| Rec {
+                t_ms: at_ms,
+                id: id.to_owned(),
+                body,
+            })
+            .collect();
+        self.write(&mut held, recs)
+    }
+
     /// Every request, including those with no tab, after any record another process appended,
     /// with the read's coverage: how many rows were skipped, and whether the fold holds the whole
     /// journal. It never opens the content tier ([`Self::said`]).
@@ -1109,23 +1565,25 @@ impl Store {
 
     /// Open a request for `intake` at `at_ms`, minting its id under the journal's lock: the
     /// content tier goes to [`crate::SAID`] first, then the journal's `open` (and its `why` and
-    /// `brief`), so a request is in the journal only with what it said beside it.
+    /// `brief`), so a request is in the journal only with what it said beside it, every row at
+    /// `at_ms`. A crash or a failed write between the two leaves content rows under an id the
+    /// journal never opened: the id is minted past every id either log holds, a row an
+    /// interrupted append cut short included, so none is minted twice, and those rows are no
+    /// request's ([`Self::said`]).
     ///
     /// # Errors
     /// The minute's id counter is exhausted, or either log's lock, read, write or flush fails.
     pub fn open_request(&mut self, at_ms: u64, intake: Intake) -> io::Result<String> {
         let mut held = line_log::hold(&self.journal)?;
         self.refresh_held(&mut held)?;
+        // Every content-tier row is written under the journal's lock (here and by a reply), and
+        // this read finishes a row a cut append left without its newline before it reads, so it
+        // holds each id one was written under, its `open` written or not.
+        self.refresh_said_held()?;
         let head = crate::id::head_of(&intake.from.node);
         let prefix = crate::id::prefix(at_ms, &head);
-        let n = self
-            .fold
-            .requests
-            .range(prefix.clone()..)
-            .take_while(|(id, _)| id.starts_with(&prefix))
-            .filter_map(|(id, _)| crate::id::count_of(id, &prefix))
-            .max()
-            .unwrap_or(0)
+        let n = top_count(&self.fold.requests, &prefix)
+            .max(top_count(&self.said_fold.of, &prefix))
             .checked_add(1)
             .ok_or_else(|| io::Error::other("request id counter exhausted for this minute"))?;
         let id = crate::id::nth(&prefix, n);
@@ -1203,14 +1661,16 @@ impl Store {
         Ok(id)
     }
 
-    /// Whether a spawn by node `node`'s `by` with `req=<id>` joins request `id`: it must be open
-    /// on this Mac, that requester's own, and not concluded. Nothing is written until its tab
-    /// lands ([`Self::tab`]) or its spawn is refused ([`Self::refused`]), each with `joined`;
-    /// until then the request does not conclude.
+    /// Whether a spawn by node `node`'s `by` with `req=<id>`, coming in as `via`, joins request
+    /// `id`: it must be open on this Mac, that requester's own, not concluded, and have come in
+    /// as `via` too, so a plain fleet shell joins only a plain fleet shell's request, which a
+    /// lease ends ([`Self::lease`]). Nothing is written until its tab lands ([`Self::tab`]) or its
+    /// spawn is refused ([`Self::refused`]), each with `joined`; until then the request does not
+    /// conclude.
     ///
     /// # Errors
     /// Why it cannot.
-    pub fn join(&mut self, id: &str, node: &str, by: &str) -> Result<(), Refusal> {
+    pub fn join(&mut self, id: &str, node: &str, by: &str, via: Via) -> Result<(), Refusal> {
         self.refresh().map_err(Refusal::Store)?;
         let request = self.fold.requests.get(id).ok_or(Refusal::Unknown)?;
         if !request.open.is_from(node, by) {
@@ -1218,6 +1678,12 @@ impl Store {
         }
         if request.end.is_some() {
             return Err(Refusal::Concluded);
+        }
+        if request.open.via != via {
+            return Err(Refusal::Via {
+                request: request.open.via,
+                spawn: via,
+            });
         }
         *self.joining.entry(id.to_owned()).or_default() += 1;
         Ok(())
@@ -1670,13 +2136,14 @@ impl Store {
     }
 
     /// A lease's look at `at_ms` ([`Look`]): each open request of a fleet drive's plain shell
-    /// (`via=fleet-shell`, no `req=` join pending) whose every open tab this look found idle
-    /// concludes abandoned, where its requester's Mac left the fleet ([`requester_left`],
-    /// `why=requester-left`) or its quiet (the latest of each open tab's last drive,
-    /// [`Tab::last_ms`], and its shell's last command's end) is `look.idle_after_ms` old
-    /// (`why=idle`). Only its `end` is written: its tabs stay, and their later leaving writes
-    /// nothing. A request with an open tab the look did not find (hosted elsewhere, or gone) is
-    /// the relaunch sweep's ([`Self::sweep`]). Returns what it concluded.
+    /// (`via=fleet-shell`, which only a plain fleet shell joins, [`Self::join`]; no `req=` join
+    /// pending) whose every open tab this look found idle concludes abandoned, where its
+    /// requester's Mac left the fleet ([`requester_left`], `why=requester-left`) or its quiet
+    /// (the latest of each open tab's last drive, [`Tab::last_ms`], and its shell's last
+    /// command's end) is `look.idle_after_ms` old (`why=idle`). Only its `end` is written: its
+    /// tabs stay, and their later leaving writes nothing. A request with an open tab the look did
+    /// not find (hosted elsewhere, or gone) is the relaunch sweep's ([`Self::sweep`]). Returns
+    /// what it concluded.
     ///
     /// # Errors
     /// The journal's: then nothing concluded.
@@ -1902,35 +2369,44 @@ impl Store {
         Ok(())
     }
 
-    /// Rewrite the journal of `len` bytes (under `held`, refreshed), all of it, keeping every
-    /// record but each tab's earlier `attach`es of a verb: the last carries the count. Another
-    /// store finds the file replaced and reads it again whole.
+    /// Rewrite the journal of `len` bytes (under `held`, refreshed), all of it: every line as it
+    /// was written and in its order, but each tab's earlier `attach`es of a verb (the last carries
+    /// the count). A line this build cannot read (a newer build's record on a state home two
+    /// builds share, a torn row) is kept byte for byte, so no build's compaction loses another's
+    /// records. Another store finds the file replaced and reads it again whole.
     fn compact(&mut self, held: &mut Held, len: u64) -> io::Result<()> {
         let bytes = held.read_from(0, len)?;
-        let text = String::from_utf8_lossy(&bytes);
-        let recs: Vec<Rec> = text.lines().filter_map(Rec::parse).collect();
-        let mut last: HashMap<(&str, &str, Verb), usize> = HashMap::new();
-        for (at, rec) in recs.iter().enumerate() {
-            if let Body::Attach { tab, verb, .. } = &rec.body {
-                last.insert((rec.id.as_str(), tab.as_str(), *verb), at);
+        // Each line with its newline, and the `attach` it is where this build reads it as one.
+        let lines: Vec<&[u8]> = bytes.split_inclusive(|b| *b == b'\n').collect();
+        let attaches: Vec<Option<(String, String, Verb)>> = lines
+            .iter()
+            .map(|&line| {
+                let line = line.strip_suffix(b"\n").unwrap_or(line);
+                let rec = std::str::from_utf8(line).ok().and_then(Rec::parse)?;
+                match rec.body {
+                    Body::Attach { tab, verb, .. } => Some((rec.id, tab, verb)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let mut last: HashMap<&(String, String, Verb), usize> = HashMap::new();
+        for (at, attach) in attaches.iter().enumerate() {
+            if let Some(attach) = attach {
+                last.insert(attach, at);
             }
         }
-        let mut out = String::new();
-        for (at, rec) in recs.iter().enumerate() {
-            let keep = match &rec.body {
-                Body::Attach { tab, verb, .. } => {
-                    last.get(&(rec.id.as_str(), tab.as_str(), *verb)) == Some(&at)
-                }
-                _ => true,
-            };
-            if keep {
-                out.push_str(&rec.line());
-                out.push('\n');
+        let mut out = Vec::with_capacity(bytes.len());
+        for (at, (line, attach)) in lines.iter().zip(&attaches).enumerate() {
+            if attach
+                .as_ref()
+                .is_none_or(|attach| last.get(attach) == Some(&at))
+            {
+                out.extend_from_slice(line);
             }
         }
         aterm_uds::atomic_file::write_flushed(
             &self.journal,
-            out.as_bytes(),
+            &out,
             0o600,
             Some(aterm_durable::Flush::Ordered),
         )?;
@@ -2011,6 +2487,31 @@ impl Store {
         Ok(())
     }
 
+    /// Read the content tier as [`Self::refresh_said`] does, first finishing under its lock a
+    /// final row an interrupted append left without its newline (a short write on a full disk,
+    /// a power loss), as [`Self::refresh_held`] finishes the journal's: a reader stops before
+    /// such a row, and the next append would finish it, so a read made to mint an id must hold
+    /// it already.
+    fn refresh_said_held(&mut self) -> io::Result<()> {
+        match std::fs::symlink_metadata(&self.said) {
+            // A store that read the tier up to its end read it to a newline ([`whole_lines`]).
+            Ok(meta)
+                if meta.len() > 0 && self.said_fold.seen != Some(line_log::identity_of(&meta)) =>
+            {
+                let mut held_said = line_log::hold(&self.said)?;
+                let len = held_said.identity()?.len;
+                if len > 0 && held_said.read_from(len - 1, 1)? != b"\n" {
+                    held_said.append(&[])?;
+                    aterm_durable::ordered(held_said.file())?;
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.refresh_said()
+    }
+
     /// Read what the content tier gained since this store last read it, without the lock, as
     /// [`Self::refresh`] reads the journal.
     fn refresh_said(&mut self) -> io::Result<()> {
@@ -2039,6 +2540,37 @@ impl Store {
         self.said_fold.seen = Some(tail.seen);
         Ok(())
     }
+}
+
+/// Request `id`'s rows of the store in folder `dir`, as they stand in its two logs (each of the
+/// newest [`READ_MAX`] bytes, whole lines only): its journal's, then its content tier's. Read
+/// without either log's lock, which a cleanup's archive needs no more than a reader does.
+///
+/// # Errors
+/// Either log could not be read (a missing one has no rows).
+pub fn lines_of(dir: &Path, id: &str) -> io::Result<(Vec<String>, Vec<String>)> {
+    let rows = |path: &Path, of: &dyn Fn(&str) -> Option<String>| -> io::Result<Vec<String>> {
+        let (file, meta) = match aterm_uds::regular_file::open(path) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let tail = whole_lines(None, line_log::identity_of(&meta), read_of(&file))?;
+        Ok(tail
+            .lines()
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .filter(|line| of(line).as_deref() == Some(id))
+            .map(str::to_owned)
+            .collect())
+    };
+    Ok((
+        rows(&dir.join(crate::JOURNAL), &|line| {
+            Rec::parse(line).map(|rec| rec.id)
+        })?,
+        rows(&dir.join(crate::SAID), &|line| {
+            Said::parse(line).map(|said| said.id)
+        })?,
+    ))
 }
 
 /// What a read of a log's whole lines took ([`whole_lines`]).
@@ -2123,6 +2655,16 @@ fn read_of(file: &std::fs::File) -> impl FnMut(u64, u64) -> io::Result<Vec<u8>> 
         file.take(max).read_to_end(&mut out)?;
         Ok(out)
     }
+}
+
+/// The highest count of an id minted with `prefix` among `ids`' keys ([`crate::id::count_of`]),
+/// 0 where none is.
+fn top_count<V>(ids: &BTreeMap<String, V>, prefix: &str) -> u32 {
+    ids.range(prefix.to_owned()..)
+        .take_while(|(id, _)| id.starts_with(prefix))
+        .filter_map(|(id, _)| crate::id::count_of(id, prefix))
+        .max()
+        .unwrap_or(0)
 }
 
 /// `value` cut to `cap` encoded bytes at a character boundary.

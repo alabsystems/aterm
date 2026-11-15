@@ -520,6 +520,10 @@ pub struct Opened {
     pub renewed: Option<Renewed>,
     /// Error message if removing a legacy mark failed after opening.
     pub mark_kept: Option<String>,
+    /// When astream's open, holding the log's lock, called its `prepare`, before its recovery
+    /// scan ([`aterm_uds::process::continuous_ns`]): what splits the open for
+    /// [`crate::start_stamps`].
+    pub locked_ns: Option<u64>,
 }
 
 /// Open the broker over `log` at `durability` in `boot`, folding any legacy mark into `astream`'s open verdict.
@@ -582,7 +586,9 @@ pub fn open_with(
 ) -> io::Result<Opened> {
     opts.boot = boot.map_or(astream_broker::Boot::Unknown, astream_broker::Boot::Known);
     let mut decided: Option<(Mark, Option<Renewed>)> = None;
+    let mut locked_ns = None;
     let prepare = || -> io::Result<astream_broker::Prepared> {
+        locked_ns = aterm_uds::process::continuous_ns();
         let mark = read_mark(log);
         let renewed = renewal(&mark, boot);
         let verdict = renewed
@@ -607,6 +613,7 @@ pub fn open_with(
         broker,
         renewed,
         mark_kept,
+        locked_ns,
     })
 }
 

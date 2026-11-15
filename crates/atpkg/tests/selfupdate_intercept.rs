@@ -6,7 +6,7 @@
 #![cfg(unix)]
 
 use std::ffi::OsString;
-use std::io::{BufRead as _, BufReader, Read as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 // Close non-stdio fds across spawn.
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct Fixture {
-    root: aterm_tempfile::TempDir,
+    root: Option<aterm_tempfile::TempDir>,
     home: PathBuf,
     config_home: PathBuf,
     registry: PathBuf,
@@ -41,7 +41,7 @@ impl Fixture {
             prefix.display()
         );
         let fx = Self {
-            root,
+            root: Some(root),
             home,
             config_home,
             registry,
@@ -50,7 +50,21 @@ impl Fixture {
         fx.layout()
             .ensure_dir(&fx.prefix)
             .expect("fixture: the 0700 prefix directory");
+        fx.phase("fixture-ready");
         fx
+    }
+
+    fn root(&self) -> &Path {
+        self.root.as_ref().unwrap().path()
+    }
+
+    fn phase(&self, phase: &str) {
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root().join("phases.log"))
+            .unwrap();
+        writeln!(log, "{phase}").unwrap();
     }
 
     fn layout(&self) -> atpkg::store::Layout {
@@ -140,6 +154,20 @@ impl Fixture {
     }
 }
 
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(root) = self.root.take()
+        {
+            eprintln!(
+                "selfupdate fixture phases: {}",
+                std::fs::read_to_string(root.path().join("phases.log")).unwrap_or_default()
+            );
+            eprintln!("KEPT selfupdate fixture: {}", root.keep().display());
+        }
+    }
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -156,11 +184,14 @@ fn describe(out: &Output) -> String {
 struct Streamed {
     child: Child,
     stdout: Arc<Mutex<Vec<String>>>,
-    stderr: std::thread::JoinHandle<String>,
-    stdout_reader: std::thread::JoinHandle<()>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
+    stdout_reader: Option<std::thread::JoinHandle<()>>,
     started: Instant,
+    called: &'static std::panic::Location<'static>,
 }
 
+#[track_caller]
 fn stream(mut cmd: Command) -> Streamed {
     let mut child = cmd.spawn().expect("spawn the dev atpkg");
     let out = child.stdout.take().expect("piped stdout");
@@ -172,22 +203,45 @@ fn stream(mut cmd: Command) -> Streamed {
             sink.lock().unwrap().push(line);
         }
     });
-    let stderr = std::thread::spawn(move || {
-        let mut text = String::new();
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let errors = Arc::clone(&stderr);
+    let stderr_reader = std::thread::spawn(move || {
         let mut err = err;
-        let _ = err.read_to_string(&mut text);
-        text
+        let mut bytes = [0; 8192];
+        loop {
+            match err.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(n) => errors.lock().unwrap().extend_from_slice(&bytes[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
     });
     Streamed {
         child,
         stdout,
         stderr,
-        stdout_reader,
+        stderr_reader: Some(stderr_reader),
+        stdout_reader: Some(stdout_reader),
         started: Instant::now(),
+        called: std::panic::Location::caller(),
+    }
+}
+
+impl Drop for Streamed {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
 impl Streamed {
+    fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.lock().unwrap()).into_owned()
+    }
+
     fn stdout_has(&self, needle: &str) -> bool {
         self.stdout
             .lock()
@@ -201,16 +255,18 @@ impl Streamed {
         while !self.stdout_has(needle) {
             if let Some(status) = self.child.try_wait().expect("poll") {
                 panic!(
-                    "the child exited ({status}) before printing {needle:?}; stdout: {:?}",
-                    self.stdout.lock().unwrap()
+                    "the child exited ({status}) before printing {needle:?}; stdout: {:?}; stderr: {}",
+                    self.stdout.lock().unwrap(),
+                    self.stderr_text()
                 );
             }
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
                 panic!(
-                    "no {needle:?} on stdout within {within:?}; stdout: {:?}",
-                    self.stdout.lock().unwrap()
+                    "no {needle:?} on stdout within {within:?}; stdout: {:?}; stderr: {}",
+                    self.stdout.lock().unwrap(),
+                    self.stderr_text()
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -227,21 +283,50 @@ impl Streamed {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
                 panic!(
-                    "the child did not exit within {within:?}; stdout: {:?}",
-                    self.stdout.lock().unwrap()
+                    "the child at {} (pid {}) did not exit within {within:?}; stdout: {:?}; stderr: {}",
+                    self.called,
+                    self.child.id(),
+                    self.stdout.lock().unwrap(),
+                    self.stderr_text()
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
         };
         let elapsed = self.started.elapsed();
-        self.stdout_reader.join().unwrap();
-        let stderr = self.stderr.join().unwrap();
+        self.stdout_reader.take().unwrap().join().unwrap();
+        self.stderr_reader.take().unwrap().join().unwrap();
+        let stderr = String::from_utf8_lossy(&self.stderr.lock().unwrap()).into_owned();
         let stdout = self.stdout.lock().unwrap().clone();
         (status, elapsed, stdout, stderr)
     }
 }
 
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
+
+#[test]
+fn unwinding_a_streamed_child_closes_its_input_before_returning() {
+    let mut command = Command::new(aterm_uds::deadline::stand_in(Path::new("/bin/cat")));
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = stream(command);
+    let mut input = child.child.stdin.take().expect("the held input pipe");
+    input.write_all(b"streamed-child-ready\n").unwrap();
+    child.wait_for_line("streamed-child-ready", ANNOUNCE_WITHIN);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _child = child;
+        panic!("an assertion unwinds while the child is still waiting for input");
+    }));
+    assert!(unwound.is_err());
+    let after = input.write_all(b"after-unwind\n");
+    // Close the negative control's input too: an unfixed wrapper must leave no waiting cat.
+    drop(input);
+    assert!(
+        after.is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe),
+        "unwinding must end the child before returning"
+    );
+}
 
 fn wait_markers(stdout: &[String]) -> Vec<&str> {
     stdout
@@ -264,7 +349,7 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     }
     let fx = Fixture::new("held-then-released");
     fx.install_claude(2026091601);
-    let missing = fx.root.path().join("no-such-registry");
+    let missing = fx.root().join("no-such-registry");
     let guard = atpkg::lock::try_lock_store(&fx.layout()).expect("the fixture holds the lock");
     let registry = format!("dir:{}", missing.display());
     let mut child = stream(fx.command(
@@ -333,6 +418,7 @@ fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
         "{shown}"
     );
     assert!(!fx.lock_held(), "help takes no lock");
+    fx.phase("direct-help-completed");
 
     fx.install_claude(2026091601);
     let layout = fx.layout();
@@ -342,16 +428,18 @@ fn help_forwards_to_the_vendor_after_one_note_and_takes_no_lock() {
     std::fs::write(
         layout.agent_shim(&claude),
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  update|upgrade|install)\n    __atpkg={atpkg}\n    \
-             if [ -x \"$__atpkg\" ]; then exec \"$__atpkg\" __selfupdate 'claude' {prefix} -- \
+            "#!/bin/sh\nprintf '%s\\n' 'managed-shim-entered' >> {trace}\ncase \"$1\" in\n  update|upgrade|install)\n    __atpkg={atpkg}\n    \
+             if [ -x \"$__atpkg\" ]; then printf '%s\\n' 'dispatch-atpkg' >> {trace}; exec \"$__atpkg\" __selfupdate 'claude' {prefix} -- \
              \"$@\"; fi\n    ;;\nesac\nexec {store} \"$@\"\n",
             atpkg = q(&aterm_tempfile::bin_exe("atpkg")),
             prefix = q(&fx.prefix),
             store = q(&store),
+            trace = q(&fx.root().join("phases.log")),
         ),
     )
     .unwrap();
     atpkg::activate::reconcile_agents(&layout);
+    fx.phase("managed-shim-prepared");
     let mut managed = Command::new(layout.shim(&claude));
     managed
         .args(["update", "--help"])
@@ -393,7 +481,7 @@ fn an_unrostered_program_forwards_silently() {
 fn a_prefix_the_environment_does_not_resolve_is_refused_with_both_named() {
     let fx = Fixture::new("prefix");
     fx.fake_shim("claude");
-    let elsewhere = fx.root.path().join("elsewhere");
+    let elsewhere = fx.root().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
     let mut cmd = Command::new(aterm_tempfile::bin_exe("atpkg"));
     cmd.arg(atpkg::selfupdate::HIDDEN_VERB)

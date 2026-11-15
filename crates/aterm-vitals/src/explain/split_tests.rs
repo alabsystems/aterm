@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use super::fixtures::{
-    Coal, Proc, Scene, build_start_1032, delegated_1032, delegated_in_aterm_1032, reaped_1032,
-    shared_launcher_1032, spotlight_1032, tab, tab_ahead_1032, two_coalitions_1421,
+    Coal, Proc, Scene, USERSPACE_MS, build_start_1032, delegated_1032, delegated_in_aterm_1032,
+    reaped_1032, shared_launcher_1032, spotlight_1032, tab, tab_ahead_1032, two_coalitions_1421,
 };
 use super::*;
 use crate::events::EventKind;
@@ -35,6 +35,106 @@ fn parts(tab: i64, aterm_rest: i64, others: i64, services: i64, unaccounted: i64
         others,
         services,
         unaccounted,
+    }
+}
+
+#[test]
+fn independently_proved_cpu_is_never_clamped_to_a_smaller_reconciled_charge() {
+    let split = CoalSplit {
+        tabs: vec![(1, 100)],
+        tab_floors: vec![(1, 300)],
+        own_mc: 20,
+        own_floor_mc: 40,
+        ..CoalSplit::default()
+    };
+    assert_eq!(split.tab_charge_of(&[1]), 100);
+    assert_eq!(split.tab_actual_of(&[1]), 300);
+    assert_eq!(split.own_actual(), 40);
+}
+
+#[test]
+fn an_app_cli_in_another_terminals_coalition_never_claims_its_foreign_work() {
+    for removed in [5001, 5002] {
+        let mut scene = spotlight_1032();
+        let birth = USERSPACE_MS + 1000;
+        scene.busy_mc += 850;
+        scene.coalitions.push(Coal {
+            started: 2,
+            ..Coal::new(5000, 850)
+        });
+        scene.procs.push(Proc::new(
+            5001,
+            1,
+            501,
+            5000,
+            birth + 1,
+            "other-terminal-worker",
+            800,
+        ));
+        scene
+            .procs
+            .push(Proc::new(5002, 1, 501, 5000, birth, "aterm", 50));
+        let shared = crate::model::SharedRoot {
+            pid: 5002,
+            start: Some(birth as u64),
+            version: None,
+        };
+        let reading = |offset, split| {
+            let mut sample = scene.reading(offset, split);
+            sample.shared_roots.push(shared);
+            sample
+        };
+        let mut vitals = Vitals::new();
+        vitals.absorb(&reading(0, true));
+        vitals.absorb(&reading(4000, false));
+        let snapshot = vitals.absorb(&reading(5000, true));
+        let facts = snapshot.why.unwrap();
+        let foreign = row(&facts, 5000);
+        assert_eq!(
+            (foreign.part, foreign.ownership_mixed, foreign.cpu_mc),
+            (Part::Others, true, 850)
+        );
+        assert_eq!((foreign.delegated_mc, foreign.outside_floor_mc), (50, 800));
+        assert_eq!(facts.split.aterm_mc + facts.split.delegated_mc, 450);
+        assert_eq!(facts.split.others_mc, 1530);
+        assert!(
+            !facts
+                .causes
+                .iter()
+                .any(|cause| cause.id == CauseId::AppWork(5000)),
+            "an owned coalition lead cannot name the foreign members' CPU"
+        );
+        for (offset, split) in [(9000, false), (10000, true)] {
+            let mut sample = reading(offset, split);
+            sample.procs.as_mut().unwrap().retain(|p| p.pid != removed);
+            if let Some(coalitions) = sample.coalitions.as_mut() {
+                coalitions
+                    .rows
+                    .iter_mut()
+                    .find(|c| c.id == 5000)
+                    .unwrap()
+                    .tasks_exited += 1;
+            }
+            let snapshot = vitals.absorb(&sample);
+            if split {
+                let facts = snapshot.why.unwrap();
+                assert_eq!(
+                    row(&facts, 5000).part,
+                    Part::Others,
+                    "exiting either member cannot convert the foreign coalition into an app coalition"
+                );
+                assert_eq!(
+                    row(&facts, 5000).footprint_aterm,
+                    removed == 5001,
+                    "instantaneous footprint follows the complete current census, independently of past CPU owners"
+                );
+                assert!(
+                    facts.split.aterm_mc + facts.split.delegated_mc <= 450,
+                    "{} millicores of unrelated coalition work must not become app CPU",
+                    row(&facts, 5000).cpu_mc
+                );
+            }
+        }
     }
 }
 
@@ -70,7 +170,11 @@ fn the_1032_window_splits_into_its_five_parts() {
         "logd's and mds's birth, never launchd's"
     );
     assert_eq!(f.lane, CoalLane::On);
-    assert_eq!((f.split.via, f.split.exact), (Via::Coalitions, true));
+    assert_eq!(
+        (f.split.via, f.split.exact),
+        (Via::Coalitions, false),
+        "the kernel refused one listed coalition"
+    );
     assert_eq!(f.split.global_mc, 3300);
     assert_eq!(f.split.parts(Some(1)), parts(200, 200, 730, 2170, 0));
     assert_eq!(f.split.own_mc, 200, "aterm itself and aterm-link");
@@ -124,6 +228,28 @@ fn the_1032_window_splits_into_its_five_parts() {
     assert_eq!(f.split.parts(None), parts(0, 400, 730, 2170, 0));
     let cut = facts_edited(&scene, |_, now| now.procs_truncated = true);
     assert_eq!(cut.userspace_ms, None);
+}
+
+#[test]
+fn an_unread_listed_coalition_prevents_an_exact_split() {
+    let whole = Scene {
+        unanswered: 0,
+        ..spotlight_1032()
+    };
+    let full = facts(&whole);
+    assert!(
+        full.split.exact,
+        "every listed coalition answered both reads"
+    );
+    let missing = facts(&Scene {
+        unanswered: 1,
+        ..whole
+    });
+    assert!(!missing.split.exact, "a refused usage row has unknown CPU");
+    assert_eq!(
+        missing.split.rows, full.split.rows,
+        "refusal cannot invent a zero owner"
+    );
 }
 
 #[test]
@@ -191,7 +317,7 @@ fn a_coalition_made_or_reaped_inside_the_window() {
     assert_eq!((made.cpu_mc, made.measured), (300, true));
     assert!(f.split.rows.iter().all(|r| r.id != 80_000));
     assert_eq!(f.split.parts(Some(1)), parts(200, 200, 1030, 2170, 250));
-    assert!(f.split.exact);
+    assert!(!f.split.exact, "the kernel refused one listed coalition");
 
     let mut behind = spotlight_1032();
     behind.busy_mc -= 50;
@@ -200,7 +326,7 @@ fn a_coalition_made_or_reaped_inside_the_window() {
 }
 
 #[test]
-fn a_delegated_member_counts_once_in_its_tab_capped_at_its_launcher() {
+fn a_delegated_members_proved_cpu_is_never_capped_at_a_short_coalition_read() {
     let job = |mc: u64, launcher_mc: u64| facts(&delegated_1032(mc, launcher_mc));
     let f = job(500, 100);
     let launcher = row(&f, 4000);
@@ -211,11 +337,11 @@ fn a_delegated_member_counts_once_in_its_tab_capped_at_its_launcher() {
     let f = job(700, 0);
     assert_eq!(
         row(&f, 4000).delegated_mc,
-        600,
-        "capped at the launcher's 600"
+        700,
+        "the owning process counter remains evidence when the coalition read is short"
     );
     let p = f.split.parts(Some(1));
-    assert_eq!(p, parts(900, 100, 730, 2170, 0));
+    assert_eq!(p, parts(900, 200, 730, 2170, -100));
     assert_eq!(
         p.tab + p.aterm_rest + p.others + p.services + p.unaccounted,
         3900
@@ -229,6 +355,85 @@ fn a_delegated_member_counts_once_in_its_tab_capped_at_its_launcher() {
         (f.split.aterm_mc, f.split.delegated_mc, f.split.own_mc),
         (400, 500, 700)
     );
+}
+
+#[test]
+fn delegated_memory_is_read_at_the_split_tick_independently_of_cpu_coverage() {
+    let f = facts_edited(&delegated_1032(500, 100), |_, now| {
+        let member = now
+            .procs
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p.pid == 4010)
+            .unwrap();
+        member.footprint = Some(12345);
+        member.cpu_ns = None;
+    });
+    assert_eq!(
+        row(&f, 4000).owned_footprint,
+        crate::model::MemoryCharge {
+            bytes: 12345,
+            members: 1,
+            unread: 0
+        }
+    );
+    let f = facts_edited(&delegated_1032(500, 100), |_, now| {
+        now.procs
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|p| p.pid == 4010)
+            .unwrap()
+            .footprint = None;
+    });
+    assert_eq!(
+        row(&f, 4000).owned_footprint,
+        crate::model::MemoryCharge {
+            bytes: 0,
+            members: 1,
+            unread: 1
+        }
+    );
+}
+
+#[test]
+fn coalition_memory_ownership_needs_the_current_full_census_and_readable_foreign_owners() {
+    let scene = delegated_1032(500, 100);
+    assert!(!row(&facts(&scene), 4000).footprint_ownership_incomplete);
+    assert_eq!(
+        row(&facts(&scene), 4000).footprint_outside,
+        Some(Part::Others)
+    );
+    let absent = facts_edited(&scene, |_, now| {
+        now.coalitions
+            .as_mut()
+            .unwrap()
+            .rows
+            .iter_mut()
+            .find(|coal| coal.id == 4000)
+            .unwrap()
+            .tasks_started += 1;
+    });
+    assert!(
+        row(&absent, 4000).footprint_ownership_incomplete,
+        "a missing active member can own any part of the remaining coalition charge"
+    );
+    assert_eq!(row(&absent, 4000).footprint_outside, None);
+    let unread = facts_edited(&scene, |_, now| {
+        now.procs
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|process| process.pid == 4001)
+            .unwrap()
+            .uid = None;
+    });
+    assert!(
+        row(&unread, 4000).footprint_ownership_incomplete,
+        "an unread foreign UID cannot prove a Services or Others allocation"
+    );
+    assert_eq!(row(&unread, 4000).footprint_outside, None);
 }
 
 #[test]
@@ -306,8 +511,8 @@ fn two_tabs_delegated_jobs_under_one_launcher_count_each_member_once_in_its_own_
     assert_eq!((launcher.cpu_mc, launcher.delegated_mc), (1100, 800));
     assert_eq!(
         f.split.parts(Some(2)),
-        parts(300, 900, 1030, 2170, 0),
-        "a member that exited inside the window stays in its launcher's part"
+        parts(300, 900, 830, 2170, 200),
+        "unobserved terminal work in a mixed coalition has no proved outside owner"
     );
 }
 
@@ -480,15 +685,18 @@ fn with_the_lane_off_the_split_is_the_built_one_by_subtraction() {
         let s = &f.split;
         assert_eq!((s.via, s.exact, s.listed), (Via::Subtraction, false, 0));
         assert_eq!(
-            (s.global_mc, s.aterm_mc, s.others_mc, s.services_mc),
-            (
-                mc(built.global),
-                mc(built.aterm),
-                mc(built.others),
-                mc(built.services)
-            )
+            (s.global_mc, s.aterm_mc, s.others_mc),
+            (mc(built.global), mc(built.aterm), mc(built.others),)
         );
-        assert!((s.unaccounted_mc - mc(built.unaccounted)).abs() <= 2);
+        assert_eq!(
+            s.services_mc,
+            (f64::from(built.services) * 1000.0).floor() as i64,
+            "only observed service CPU belongs to services"
+        );
+        assert_eq!(
+            s.unaccounted_mc,
+            s.global_mc - s.aterm_mc - s.others_mc - s.services_mc
+        );
         assert_eq!(s.tabs, [(1, 200)]);
         let p = s.parts(Some(1));
         assert_eq!(
@@ -633,7 +841,7 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
     );
     assert_eq!(
         drop_newest.split.parts(Some(1)),
-        parts(200, 0, 730, 2170, 200)
+        parts(200, 200, 730, 2170, 0)
     );
     assert!(!drop_newest.split.exact);
     let drop_all = facts_edited(&spotlight_1032(), |base, _| {
@@ -642,7 +850,7 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
         }
     });
     assert!(drop_all.split.rows.iter().all(|r| !r.measured));
-    assert_eq!(drop_all.split.parts(Some(1)), parts(200, 0, 0, 0, 3100));
+    assert_eq!(drop_all.split.parts(Some(1)), parts(200, 200, 0, 0, 2900));
     assert!(!drop_all.split.exact);
 
     let went_back = facts_edited(&spotlight_1032(), |base, now| {
@@ -755,6 +963,12 @@ fn a_tab_pid_reused_inside_the_window_counts_only_what_one_start_read() {
 fn a_coalition_takes_its_part_from_every_member_in_the_kernels_order() {
     let late = 1_792_517_560_000;
     let mut scene = spotlight_1032();
+    scene
+        .coalitions
+        .iter_mut()
+        .find(|c| c.id == 1342)
+        .unwrap()
+        .started += 1;
     scene
         .procs
         .push(Proc::new(2000, 1, 0, 1092, late, "helper", 0));

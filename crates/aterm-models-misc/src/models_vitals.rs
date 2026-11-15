@@ -200,8 +200,12 @@ pub fn stuck_verdict_liveness() -> Liveness {
 /// `a` is aterm's coalitions' counters, which hold the work of members that
 /// exited inside the window (`x`, SA's `Container`); `d` is the caller tab's
 /// live delegated members under a launcher outside aterm, `e` another tab's
-/// under the same launcher, and `l` that launcher's coalition, whose own work
-/// and exited members' (`LauncherWork`) stay in its part. Law
+/// under the same launcher. `l` is its raw coalition counter; independently
+/// observed foreign own CPU (`f`) stays outside aterm even when that raw
+/// counter trails the delegated or foreign floors. Scope totals retain those
+/// floors without capping them to `l`, and a signed residual shows the skew.
+/// Buggy 2 counts delegated work in both owner groups; Buggy 3 substitutes
+/// raw `l - d - e` for the independent foreign floor. Law
 /// `ExitedWorkStaysCounted` (Buggy 6, SA's `DropReapedChildTime`: aterm's
 /// part is its live members' work and the reaped members' time is charged to
 /// services, the reaper's).
@@ -221,6 +225,7 @@ pub fn scope_balance_model() -> Model {
             var e = 0;
             var x = 0;
             var l = 0;
+            var f = 0;
             var o = 0;
             var s = 0;
             var moved = 0;
@@ -267,6 +272,12 @@ pub fn scope_balance_model() -> Model {
                 n = n + 1;
                 g = g + 1;
                 l = l + 1;
+                f = f + 1;
+                fresh = 0;
+            }
+            action ForeignAhead when (n <= Work - 1) {
+                n = n + 1;
+                f = f + 1;
                 fresh = 0;
             }
             action DelegatedWork when (n <= Work - 1) {
@@ -312,11 +323,11 @@ pub fn scope_balance_model() -> Model {
             }
 
             action Move when (fresh == 0) {
-                moved = if (Buggy == 3 || d + e <= l) { d + e } else { l };
+                moved = d + e;
                 others = if (Buggy == 2) {
-                    o + l
+                    o + f + d + e
                 } else {
-                    if (Buggy == 3 || d + e <= l) { o + l - d - e } else { o }
+                    if (Buggy == 3) { o + l - d - e } else { o + f }
                 };
                 tab = if (Buggy == 5) { tf + d } else { t + d };
                 fresh = 1;
@@ -331,8 +342,8 @@ pub fn scope_balance_model() -> Model {
                 } else {
                     0
                 };
-                services = if (Buggy == 4 && g > a + l + o + s) {
-                    g - a - l - o
+                services = if (Buggy == 4 && g > a + moved + others + s) {
+                    g - a - moved - others
                 } else {
                     if (Buggy == 6 && tab <= a + moved) {
                         s + (if (x <= a + moved - tab) { x } else { a + moved - tab })
@@ -340,16 +351,16 @@ pub fn scope_balance_model() -> Model {
                         s
                     }
                 };
-                residual = if (Buggy == 4 && g > a + l + o + s) {
+                residual = if (Buggy == 4 && g > a + moved + others + s) {
                     if (a + moved <= tab) { a + moved - tab } else { 0 }
                 } else {
                     if (Buggy == 1
                         && g + (if (a + moved <= tab) { a + moved - tab } else { 0 })
-                            <= a + l + o + s)
+                            <= a + moved + others + s)
                     {
                         0
                     } else {
-                        g - a - l - o - s + (if (a + moved <= tab) { a + moved - tab } else { 0 })
+                        g - a - moved - others - s + (if (a + moved <= tab) { a + moved - tab } else { 0 })
                     }
                 };
                 fresh = 2;
@@ -362,9 +373,10 @@ pub fn scope_balance_model() -> Model {
             invariant ResidualIsShown:
                 fresh <= 1
                     || residual
-                        == g - a - l - o - s
+                        == g - a - moved - others - s
                             + (if (a + moved <= tab) { a + moved - tab } else { 0 });
-            invariant DelegatedCountedOnce: fresh == 0 || others + moved == o + l;
+            invariant DelegatedCountedOnce:
+                fresh == 0 || (moved == d + e && others == o + f);
             invariant MatchedWindowsOnly: fresh == 0 || tab == t + d;
             invariant ExitedWorkStaysCounted:
                 fresh <= 1
@@ -376,10 +388,12 @@ pub fn scope_balance_model() -> Model {
 }
 
 /// THE EXPLANATION'S HONESTY. `live` and `bound`: the caller tab's role
-/// at its live figure, and with the work no live process held added (none
-/// over a window in which aterm's coalitions made or reaped no member and
-/// the sweep found every member in a live figure: the counters' skew,
-/// RD §3.5);
+/// at its measured figure, and with unresolved app work and the global
+/// unaccounted residual added to its possible share. Unresolved global work
+/// may change that bound even when aterm's own member census is complete;
+/// `role` 5 abstracts an unavailable role when those endpoints differ, including
+/// missing work and ambiguous inherited counter charge, whose actual figure is
+/// its independently measured own-CPU floor;
 /// `lost`: the split's unaccounted residual
 /// (work no coalition held) is at least a core and over the floor;
 /// `settled`: pressure and the thermal state are read, neither holds, and no

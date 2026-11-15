@@ -39,6 +39,8 @@ use aterm_uds::{CtlListener, CtlStream};
 
 #[path = "node_serve/health.rs"]
 mod health;
+#[path = "node_serve/route_refresh.rs"]
+mod route_refresh;
 #[cfg(target_os = "linux")]
 #[path = "node_serve/window_start.rs"]
 mod window_start;
@@ -248,6 +250,8 @@ pub(crate) enum RelayHeader {
     Survey {
         content: bool,
         drive: bool,
+        /// The peer that asked; none for the node job's own reads (its facts push, its count of
+        /// agents), whose answer takes no look at the machine ([`relayed_survey`]).
         peer: Option<SocketAddr>,
     },
     Drive {
@@ -792,6 +796,38 @@ pub(crate) fn start_window_fleet_relay(sock_dir: &Path, applies: bool) {
     }
 }
 
+/// A relayed survey as a window's fleet connection serves it: its scope (content, drive), then
+/// its peer with what its answer takes ([`relayed_survey`]).
+pub(crate) type RelayedSurvey = ((bool, bool), (Option<SocketAddr>, crate::survey::Taking));
+
+/// What a window's answer to a relayed survey takes of the machine. One that names no peer is
+/// the node job's own read on its timer (its 3-minute facts push, [`query_window_survey_facts`],
+/// and its 60 s count of agents, [`activity_of_windows`]), which no reader of a look waits on: it
+/// takes none, so a look happens only inside a peer's answer. A peer's takes the look. A survey
+/// whose peer's address the node job could not read is relayed with none too, and its answer
+/// still carries a look: the node job's own, which it adds where the first window's answer says
+/// none ([`with_look`]). A window older than the look takes none either way, and the node job of
+/// an older build sends its own reads with no peer as this one does, so no version word is sent.
+///
+/// What a window's fleet connection is handed for a relayed survey `header`: its scope (content,
+/// drive) and its peer with what its answer takes. None for a header that is not a survey.
+pub(crate) fn relayed_survey(header: &RelayHeader) -> Option<RelayedSurvey> {
+    let RelayHeader::Survey {
+        content,
+        drive,
+        peer,
+    } = *header
+    else {
+        return None;
+    };
+    let taking = if peer.is_some() {
+        crate::survey::Taking::Look
+    } else {
+        crate::survey::Taking::NoLook
+    };
+    Some(((content, drive), (peer, taking)))
+}
+
 fn run_window_fleet_relay() {
     crate::qos::set_self(crate::qos::Role::Responsive);
     let applies = WINDOW_RELAY_APPLIES.load(Ordering::Acquire);
@@ -808,11 +844,12 @@ fn run_window_fleet_relay() {
     let pid = std::process::id();
     let attach = move |header: RelayHeader, stream: CtlStream| -> bool {
         match header {
-            RelayHeader::Survey {
-                content,
-                drive,
-                peer,
-            } => crate::control::attach_fleet_connection(stream, (content, drive), peer, None),
+            RelayHeader::Survey { .. } => match relayed_survey(&header) {
+                Some((scope, serving)) => {
+                    crate::control::attach_fleet_connection(stream, scope, serving, None)
+                }
+                None => false,
+            },
             RelayHeader::Drive {
                 driver,
                 key,
@@ -1438,16 +1475,10 @@ fn parse_sid_list(list: &str) -> Option<Vec<SessionId>> {
         .collect()
 }
 
-/// Whether `sid` is a session id a relay line carries: `s-` and then letters, digits, `-` or
-/// `_`, as this Mac mints them (`aterm_session::SessionId`), so no list separator or space can
-/// ride in one.
+/// Whether `sid` is a session id a relay line carries: a session ID this Mac's tabs hold
+/// ([`aterm_session::is_minted_sid`]), so no list separator or space can ride in one.
 fn relay_names(sid: &str) -> bool {
-    sid.strip_prefix("s-").is_some_and(|rest| {
-        !rest.is_empty()
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    })
+    aterm_session::is_minted_sid(sid)
 }
 
 /// Hand `wire` to the window whose relay is `path`, and read what it answered.
@@ -1564,8 +1595,14 @@ fn busy_line(why: &str) -> String {
     )
 }
 
-/// This Mac's windows' survey facts, read as one ([`survey_every_window`]): every window's
-/// sessions counted, the installed app's window's facts.
+/// This Mac's windows' survey facts for the 3-minute facts push, read as one
+/// ([`survey_every_window`]): every window's sessions counted and the installed app's window's
+/// facts, with no look at the machine. The survey names no peer, so no window takes a look for
+/// it ([`relayed_survey`]) and the node job takes none (a look is taken only inside a
+/// peer's answer). A look a window's answer carries anyway (one of a build that takes one for
+/// every survey) is dropped: no reader of the pushed facts reads one, and a look's time and rates
+/// move at every push, so the record its holder keeps would be rewritten whole every three
+/// minutes where its accounts never moved.
 pub(crate) fn query_window_survey_facts(
     windows: &WindowRelays,
 ) -> Option<aterm_agent::survey_facts::SwarmSurveyFacts> {
@@ -1574,10 +1611,92 @@ pub(crate) fn query_window_survey_facts(
         drive: false,
         peer: None,
     };
-    let WindowsSurveyed::Answered(wire) = survey_every_window(windows, &header, "survey\n") else {
+    let WindowsSurveyed::Answered(wire) = survey_every_window(windows, &header, "survey\n", None)
+    else {
         return None;
     };
-    aterm_agent::survey_facts::SwarmSurveyFacts::from_survey_reply(&wire).ok()
+    let mut facts = aterm_agent::survey_facts::SwarmSurveyFacts::from_survey_reply(&wire).ok()?;
+    facts.machine = None;
+    Some(facts)
+}
+
+/// The node job's own look at this machine, its volume the one holding `home`: the look every
+/// answer of this process shares for its keep (`aterm_capacity::machine_look::LOOK_KEEP`), read
+/// in process. `home` is read as the facts read it: an absolute one, or none.
+fn node_machine(home: Option<&Path>) -> aterm_agent::survey_facts::MachineFacts {
+    aterm_agent::survey_facts::MachineFacts::now(home.filter(|home| home.is_absolute()))
+}
+
+/// The node job's own look, for a survey whose first window says none, as the tokens and edits
+/// [`with_look`] makes of an `instance` line.
+type NodeLook<'a> = &'a dyn Fn() -> aterm_agent::survey_facts::MachineFacts;
+
+/// Whether `survey` (a window's counted answer) has an `instance` line that says no look at the
+/// machine (no `m_at_ms=`): a window of an aterm older than the look, under which the node job
+/// says its own.
+fn says_no_look(survey: &str) -> bool {
+    survey
+        .lines()
+        .nth(1)
+        .filter(|line| line.starts_with("instance "))
+        .is_some_and(|line| !line.split(' ').any(|token| token.starts_with("m_at_ms=")))
+}
+
+/// The time an `instance` line says it answered, its `at_ms=`: `None` where it says none, or 0,
+/// which its writer sends with its clock unread.
+fn at_ms_said(instance: &str) -> Option<u64> {
+    instance
+        .split(' ')
+        .find_map(|token| token.strip_prefix("at_ms="))
+        .and_then(|at| at.parse::<u64>().ok())
+        .filter(|at| *at > 0)
+}
+
+/// What a window's `session` rows end with when the merged answer's header says `sent_at` and
+/// the window answered at `window_at` ([`at_ms_said`] of each): its own `at_ms=` (`-` where its
+/// clock was unread), or nothing where the header says the window's time.
+fn row_stamp(window_at: Option<u64>, sent_at: Option<u64>) -> Option<String> {
+    (window_at != sent_at).then(|| match window_at {
+        Some(at) => format!(" at_ms={at}"),
+        None => " at_ms=-".to_owned(),
+    })
+}
+
+/// `instance`, an `instance` line that says no look at the machine, with `machine`'s: its header
+/// tokens (`MachineFacts::header_tokens`) before its `access=` token, so the line ends as the
+/// window wrote it, or at its end where it has no `access=`. Two of the window's own tokens are
+/// made to agree with the look, both on this machine's one clock:
+/// - `home_free_mb=` says the free space the look read, where it read one, so the volume's size
+///   and its `disk_lim=` verdict travel beside the free space they were judged against (an
+///   older window's figure comes from its own 60 s cache);
+/// - `at_ms=` is raised to the look's `m_at_ms=` where the look is later. The node job takes its
+///   look after the window stamped its answer, and the answer is complete only with the look,
+///   so it was answered then; a reader's age of the look (`at_ms` less `m_at_ms`) is then 0, never
+///   negative and unread. The window's rows were read at its own time, which each then says
+///   ([`row_stamp`]).
+fn with_look(instance: &str, machine: &aterm_agent::survey_facts::MachineFacts) -> String {
+    let look = &machine.look;
+    let edited: Vec<String> = instance
+        .split(' ')
+        .map(|token| match token.split_once('=') {
+            Some(("home_free_mb", _)) => look
+                .disk_free_mb
+                .map_or_else(|| token.to_owned(), |free| format!("home_free_mb={free}")),
+            Some(("at_ms", at)) => match (at.parse::<u64>().ok(), look.at_unix_ms) {
+                (Some(at), Some(looked)) if looked > at => format!("at_ms={looked}"),
+                _ => token.to_owned(),
+            },
+            _ => token.to_owned(),
+        })
+        .collect();
+    let line = edited.join(" ");
+    let tokens = machine.header_tokens();
+    let at = line.find(" access=").unwrap_or(line.len());
+    let mut out = String::with_capacity(line.len() + tokens.len());
+    out.push_str(&line[..at]);
+    out.push_str(&tokens);
+    out.push_str(&line[at..]);
+    out
 }
 
 /// What a survey of every window here found ([`survey_every_window`]).
@@ -1754,7 +1873,9 @@ fn ask_window_survey(path: &Path, wire: &str, request: &str, deadline: Instant) 
 /// Ask every window here `request` (a `survey [facts|content]` line) on a hand-over of `header`,
 /// all at once, and merge their answers in [`WindowRelays::in_order`]'s order, the installed
 /// app's window first: a survey of this Mac lists every window's sessions, not the one window
-/// that took it.
+/// that took it. A survey a peer asked passes `own`, the node job's look, which the merge adds
+/// where the first window's answer says none ([`merge_window_surveys`]); the node job's own
+/// reads pass none and take no look.
 ///
 /// Each window has [`SURVEY_ANSWER_WITHIN`] to answer; once one has, the rest have
 /// [`RELAY_CONNECT_TIMEOUT`] more, so a stopped window delays a survey of this Mac by no more
@@ -1763,6 +1884,7 @@ fn survey_every_window(
     windows: &WindowRelays,
     header: &RelayHeader,
     request: &str,
+    own: Option<NodeLook<'_>>,
 ) -> WindowsSurveyed {
     let wire = header.encode();
     let deadline = Instant::now() + SURVEY_ANSWER_WITHIN;
@@ -1812,6 +1934,7 @@ fn survey_every_window(
         return WindowsSurveyed::Answered(merge_window_surveys(
             &surveys,
             aterm_net::fleet::REPLY_MAX,
+            own,
         ));
     }
     if let Some(line) = refused {
@@ -1827,16 +1950,71 @@ fn survey_every_window(
 }
 
 /// The windows' survey answers (`OK <n>`, one `instance` line, `session` rows, then the Mac's
-/// own lines: accounts, checkouts, …) merged into one answer of this Mac, at most `max` bytes.
+/// own lines: accounts, checkouts, …) merged into one answer of this Mac, at most `max` bytes,
+/// with the node job's look (`own`, [`with_look`]) where the first window's answer says none
+/// ([`says_no_look`]); `own` is asked only then.
 /// The first answer (the installed app's window's) gives the `instance` line and the Mac's own
 /// lines; its `sessions=` counts every window's sessions, `cut=` the rows sent cut to facts,
 /// `instances=` at least every window read,
 /// and `instances_read=` how many were, so a reader says `k of n instances read` only where some
 /// went unread. Every window's `session` rows follow; past `max`, the rows a window itself would
 /// cut first go (the least kept, the latest first), and `sessions=` still counts them, so a reader
-/// reports them not sent. One answer is returned as it came.
-fn merge_window_surveys(surveys: &[String], max: usize) -> String {
+/// reports them not sent. The look's bytes are counted before any row is cut, so a row goes
+/// before the look does; only where no row is left to cut is the answer sent without it (a look
+/// unsent reads as unread, where a reply past its bound is refused whole). One answer that
+/// needs no look, or fits with it, is returned as it came, its `instance` line with the look and,
+/// where the look raised its time, each row with its own.
+///
+/// Each window read its rows' counters at its own time, its header's `at_ms=`, which the merged
+/// header need not say: it is the first window's, raised to the look's where that is later
+/// ([`with_look`]). So a row whose window's time differs from the header sent carries its
+/// window's own `at_ms=` (`-` where that window's clock was unread), a key only this merge adds
+/// ([`row_stamp`]), and a reader times the row by it.
+fn merge_window_surveys(surveys: &[String], max: usize, own: Option<NodeLook<'_>>) -> String {
+    let machine = own
+        .filter(|_| surveys.first().is_some_and(|first| says_no_look(first)))
+        .map(|own| own());
     if let [only] = surveys {
+        let Some(machine) = &machine else {
+            return only.clone();
+        };
+        // The `instance` line is the second, after the count ([`says_no_look`]).
+        let from = only.find('\n').map_or(only.len(), |at| at + 1);
+        let to = only[from..].find('\n').map_or(only.len(), |len| from + len);
+        let head = with_look(&only[from..to], machine);
+        // A header the look raised no longer times the window's rows: each says its own.
+        let stamp = row_stamp(at_ms_said(&only[from..to]), at_ms_said(&head));
+        let mut with = format!("{}{head}", &only[..from]);
+        for line in only[to..].split_inclusive('\n') {
+            let (row, end) = line
+                .strip_suffix('\n')
+                .map_or((line, ""), |row| (row, "\n"));
+            with.push_str(row);
+            if let Some(stamp) = stamp.as_deref().filter(|_| row.starts_with("session ")) {
+                with.push_str(stamp);
+            }
+            with.push_str(end);
+        }
+        if with.len() <= max {
+            return with;
+        }
+    }
+    let merged = merge_fitted(surveys, max, machine.as_ref());
+    if machine.is_some() && merged.len() > max {
+        return merge_fitted(surveys, max, None);
+    }
+    merged
+}
+
+/// [`merge_window_surveys`]'s merge, its `instance` line with `machine`'s look where given:
+/// past `max`, the least kept rows go first. A row whose window answered at another time than the
+/// header it goes under says its window's `at_ms=`, counted in its bytes before any row is cut.
+fn merge_fitted(
+    surveys: &[String],
+    max: usize,
+    machine: Option<&aterm_agent::survey_facts::MachineFacts>,
+) -> String {
+    if let ([only], None) = (surveys, machine) {
         return only.clone();
     }
     struct Read<'a> {
@@ -1899,26 +2077,38 @@ fn merge_window_surveys(surveys: &[String], max: usize) -> String {
             })
             .collect();
         instance.push(format!("instances_read={}", reads.len()));
-        instance.join(" ")
+        let line = instance.join(" ");
+        machine.map_or_else(|| line.clone(), |machine| with_look(&line, machine))
     };
     // Fitted with every window's cut rows counted, at least as long as the line it ends with.
     let instance = instance_line(cuts.iter().sum());
+    // Each window's rows under a header of another time say their window's own: the time their
+    // counters were read ([`merge_window_surveys`]).
+    let sent_at = at_ms_said(&instance);
+    let stamps: Vec<Option<String>> = reads
+        .iter()
+        .map(|read| row_stamp(read.instance.and_then(at_ms_said), sent_at))
+        .collect();
     // The rows in the order they are cut, as a window cuts its own: the least kept first, the
     // latest (the last window's last row) first among equals.
-    let mut rows: Vec<(usize, usize, &str)> = reads
+    let mut rows: Vec<(usize, usize, std::borrow::Cow<'_, str>)> = reads
         .iter()
         .enumerate()
         .flat_map(|(window, read)| {
-            read.rows
-                .iter()
-                .enumerate()
-                .map(move |(at, row)| (window, at, *row))
+            let stamp = stamps[window].as_deref();
+            read.rows.iter().enumerate().map(move |(at, row)| {
+                let text = match stamp {
+                    Some(stamp) => std::borrow::Cow::Owned(format!("{row}{stamp}")),
+                    None => std::borrow::Cow::Borrowed(*row),
+                };
+                (window, at, text)
+            })
         })
         .collect();
     let mut cut_order: Vec<usize> = (0..rows.len()).collect();
     cut_order.sort_by_key(|&at| {
-        let (window, row, text) = rows[at];
-        (row_kept(text), std::cmp::Reverse((window, row)))
+        let (window, row, text) = &rows[at];
+        (row_kept(text), std::cmp::Reverse((*window, *row)))
     });
     let own_bytes: usize = primary.own.iter().map(|line| line.len() + 1).sum();
     let head_bytes =
@@ -1954,7 +2144,7 @@ fn merge_window_surveys(surveys: &[String], max: usize) -> String {
         instance_line(cut)
     );
     for (_, _, row) in rows {
-        out.push_str(row);
+        out.push_str(&row);
         out.push('\n');
     }
     for line in &primary.own {
@@ -1994,7 +2184,7 @@ pub struct NodeServeConfig {
     pub state_dir: PathBuf,
     /// Socket directory holding `wf-<pid>.sock` window relays.
     pub relay_dir: PathBuf,
-    /// User home directory (`~/.secrets`, etc.), if known.
+    /// User home directory (the vault's store under it, etc.), if known.
     pub home_dir: Option<PathBuf>,
     /// Path to `aterm.toml`, if known.
     pub config_path: Option<PathBuf>,
@@ -3828,6 +4018,7 @@ fn serve_node_job(
         if let Some(maintain) = &maintenance {
             maintain();
         }
+        crate::heap_relief::relieve();
         if fleet_turned_off_or_swarm_disabled(&cfg) {
             advertiser.stop();
             port_lock = None;
@@ -4661,7 +4852,8 @@ fn installed_window_activity() -> WindowActivity {
 
 /// This Mac's agents at `at` (Unix seconds), counted from a facts survey of every window here
 /// ([`survey_every_window`], [`crate::fleet_glance::activity_of_survey`]), which every released
-/// window already answers, so no window needs a new stream for it: a zero count where no
+/// window already answers, so no window needs a new stream for it (the survey names no peer, so
+/// a window takes no look at the machine for it, [`relayed_survey`]): a zero count where no
 /// window runs (no agent runs here), and `None` where windows run and none answered a survey,
 /// or where the answer is partial (a window left unread, rows the reply cap cut), so nothing is
 /// published and the last whole count stands until it ages out at its readers.
@@ -4671,7 +4863,7 @@ pub(crate) fn activity_of_windows(windows: &WindowRelays, at: u64) -> Option<Act
         drive: false,
         peer: None,
     };
-    match survey_every_window(windows, &header, "survey\n") {
+    match survey_every_window(windows, &header, "survey\n", None) {
         WindowsSurveyed::Answered(wire) => crate::fleet_glance::activity_of_survey(&wire, at),
         WindowsSurveyed::Untaken(None) => Some(ActivityRow {
             at,
@@ -5321,6 +5513,7 @@ fn serve_one_node_generation(
                 let tick_every = tick_every.min(Duration::from_secs(86_400 * 365));
                 let mut next_tick = Instant::now() + tick_every;
                 let mut wait_failed = false;
+                let mut route_refresh = route_refresh::RouteRefresh::new(Arc::clone(&listener_stop));
 
                 while !listener_stop.is_set() {
                     let moved = match admission_network.wait_until(
@@ -5363,6 +5556,7 @@ fn serve_one_node_generation(
                     if let Some(maintain) = &maintenance {
                         maintain();
                     }
+                    crate::heap_relief::relieve();
                     if aterm_agent::node_service::left_the_fleet(&state_dir) {
                         listener_stop.set();
                         return;
@@ -5448,24 +5642,38 @@ fn serve_one_node_generation(
                         mail.pass();
                     }
 
-                    if let (Some(watch), Some(keys)) = (browse_watch.as_ref(), log.as_deref()) {
-                        let mut discovery =
-                            discovery.lock().unwrap_or_else(PoisonError::into_inner);
-                        discovery.refresh(
-                            Instant::now(),
-                            || watch.adverts(Duration::from_secs(3)),
-                            |hint| {
-                                aterm_agent::node_service::prove_discovery_address(
-                                    hint,
-                                    &secret_watch,
-                                    identity.as_ref(),
-                                    keys,
-                                )
-                            },
-                        );
-                        if let Err(error) = discovery.save(&state_dir) {
-                            aterm_log::warn!("node discovery: could not save addresses: {error}");
-                        }
+                    if let (Some(watch), Some(keys)) = (browse_watch.as_ref(), log.as_ref())
+                        && route_refresh.due(Instant::now())
+                    {
+                        let watch = Arc::clone(watch);
+                        let keys = Arc::clone(keys);
+                        let discovery = Arc::clone(&discovery);
+                        let state = state_dir.clone();
+                        let secret = secret_watch.clone();
+                        let me = identity.clone();
+                        let stopped = Arc::clone(&listener_stop);
+                        let traffic = traffic_watch.clone();
+                        route_refresh.start(Instant::now(), move || {
+                            let now = Instant::now();
+                            let deadline = now + route_refresh::WITHIN;
+                            let current = || !stopped.is_set() && traffic.current();
+                            let bindings = aterm_net::fleet_member::Keyring::read(&state);
+                            if !current() { return; }
+                            let mut routes = discovery.lock().unwrap_or_else(PoisonError::into_inner);
+                            routes.refresh(now,
+                                || watch.adverts(deadline.saturating_duration_since(Instant::now())),
+                                |hint| {
+                                    let left = deadline.saturating_duration_since(Instant::now());
+                                    if !current() || left.is_zero()
+                                        || (bindings.is_empty() && hint.mesh_node().is_none())
+                                    { return None; }
+                                    aterm_agent::node_service::prove_fleet_route(hint,
+                                        (&secret, me.as_ref()), (&keys, &bindings), left)
+                                });
+                            if current() && let Err(error) = routes.save(&state) {
+                                aterm_log::warn!("node discovery: could not save addresses: {error}");
+                            }
+                        });
                     }
                     if let Some(vp) = vault_paths.as_ref() {
                         adv_watch.tick(
@@ -5590,6 +5798,12 @@ fn serve_one_node_generation(
     if let Some(told) = &cfg.on_generation {
         told(&initial_wanted.listen);
     }
+    aterm_log::info!(
+        "node listener started at_ms={} pid={} version={} listen={addr}",
+        aterm_time::unix_millis().unwrap_or(0),
+        std::process::id(),
+        aterm_stamp::app_version(),
+    );
     aterm_net::fleet::serve_offering_with_ask_within(
         &listener,
         (
@@ -5833,6 +6047,7 @@ fn serve_one_node_generation(
                     windows.clone(),
                     header,
                     Arc::clone(&open),
+                    home_dir.clone(),
                     (state_dir.clone(), reader),
                 )?;
             } else {
@@ -5950,12 +6165,15 @@ const SURVEY_REQUESTS: usize = 4;
 /// answered by every window at once, merged ([`survey_every_window`]); any other line (`version`,
 /// `setup …`, or one a window refuses in its words) and the rest of the connection go to the
 /// installed app's window, as the one window served them all before. Where no window takes a
-/// survey, it is answered busy, as a window that took no hand-over was.
+/// survey, it is answered busy, as a window that took no hand-over was. An answer whose window
+/// says no look at the machine carries the node job's own, its volume the one holding
+/// `home_dir` ([`merge_window_surveys`], [`with_look`]).
 fn spawn_node_survey(
     mut near: CtlStream,
     windows: WindowRelays,
     header: RelayHeader,
     open: Arc<NodeOpened>,
+    home_dir: Option<PathBuf>,
     (state_dir, reader): (PathBuf, Option<crate::fleet_activity::Reader>),
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
@@ -6002,7 +6220,8 @@ fn spawn_node_survey(
                 let asker = aterm_types::fleet_activity::survey_asker(rest).map(str::to_owned);
                 let line = aterm_types::fleet_activity::survey_unmarked(line.trim_end())
                     .map_or(line, |plain| format!("{plain}\n"));
-                let answer = match survey_every_window(&windows, &header, &line) {
+                let own = || node_machine(home_dir.as_deref());
+                let answer = match survey_every_window(&windows, &header, &line, Some(&own)) {
                     WindowsSurveyed::Answered(answer) => answer,
                     WindowsSurveyed::Untaken(why) => {
                         let _ = near.write_all(
@@ -6128,6 +6347,8 @@ fn spawn_windowless_survey(
                             node,
                             now_s,
                         );
+                        // An answer: it takes the machine's look.
+                        facts.take_latest_look();
                         facts.update = Some(crate::survey::updater_fact());
                         let here = crate::survey::Here {
                             host: aterm_uds::process::lan_host_name(),
@@ -6371,11 +6592,34 @@ fn spawn_node_drive(
                 // A window is launched only for an admitted spawn: the same parse decided the
                 // lock above, so a locked Mac launches none for any line.
                 DriveRoute::NoWindow if kind == Ok(DriveKind::Spawn) => String::new(),
+                DriveRoute::NoWindow if verb == "update" && kind == Ok(DriveKind::Read) => {
+                    crate::control::windowless_update_reply(rest)
+                        .unwrap_or_else(|| "ERR no window open on this Mac\n".to_owned())
+                }
                 DriveRoute::NoWindow => "ERR no window open on this Mac\n".to_owned(),
             };
             if !answer.is_empty() {
                 let _ = near.write_all(answer.as_bytes());
                 let _ = near.flush();
+                if verb == "update"
+                    && answer.starts_with("OK")
+                    && let (
+                        Ok(kind),
+                        RelayHeader::Drive {
+                            driver, requester, ..
+                        },
+                    ) = (kind, &header)
+                {
+                    crate::fleet_activity::note_in(
+                        &state_dir,
+                        crate::fleet_activity::driven(
+                            driver,
+                            kind,
+                            requester.sid(),
+                            aterm_types::fleet_activity::Outcome::Admitted,
+                        ),
+                    );
+                }
                 aterm_uds::hangup::hang_up(&near);
                 return;
             }
@@ -7210,6 +7454,7 @@ impl LinkServe {
                 self.windows.clone(),
                 header,
                 Arc::clone(&open),
+                self.home_dir.clone(),
                 (self.state_dir.clone(), reader),
             )
         } else {

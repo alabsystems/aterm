@@ -23,6 +23,10 @@ dev-seams = []
 # a crate of its own, as `aterm-winit-keymap` does.
 
 [dependencies]
+# The one table of characters no surface prints (`alab_policy::text::is_hidden_char`), and
+# the grammar of a tab ID's text (`alab_policy::tab_id`: its alphabet, lengths and
+# `is_tab_id`), which `tab_id` re-exports and `TabId::parse` checks an ID by.
+alab-policy = { workspace = true }
 # The same dependency-free product-version policy used by build stamps.
 aterm-stamp = { workspace = true }
 # Pure resource-accounting DTO/codec only; native channels and clients stay in
@@ -63,6 +67,7 @@ aterm-uds = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
+aterm-heap-count = { path = "../aterm-heap-count" }
 # The machine-number models `machine_name::model_tests` holds `settle`, `choose` and `check` to.
 aterm-models-swarm = { workspace = true }
 # The `CltEpisode` model `clt_mark::model_tests` holds the record of setup's password ask to.

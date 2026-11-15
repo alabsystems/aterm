@@ -157,7 +157,7 @@ fn the_panel_is_placed_on_every_measured_screen_of_both_renderers() {
                 reading.phase_authoritative,
                 reading.composer.is_some()
             ),
-            (crate::Phase::Idle, false, false),
+            (alab_policy::vocab::Phase::Idle, false, false),
             "{what}"
         );
     }

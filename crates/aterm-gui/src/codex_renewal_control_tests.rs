@@ -437,14 +437,16 @@ fn ended_unattached_keeps_its_service(session: u64, attached: bool) {
 /// A root that ended with no successor hands its session back on the login it was on, and the
 /// agent that relaunch starts (a new pid, the same conversation, its record still bound to the
 /// receipt it inherited) asks about that receipt. It is told the receipt retired, so it unbinds
-/// and asks afresh, for a login renewal and a rotation alike; were it told it is the wrong
-/// process, it would keep the point and ask again until a person typed. A process on the other
-/// login, on another conversation, or whose record no longer names the receipt is still refused.
+/// and asks afresh, for a login renewal, a rotation and a lost login's move alike; were it told
+/// it is the wrong process, it would keep the point and ask again until a person typed. A process
+/// on the other login, on another conversation, or whose record no longer names the receipt is
+/// still refused.
 #[test]
 fn codex_renewal_ended_root_answers_the_agent_handed_back_on_its_login() {
     for (session, purpose) in [
         (8903, renewal::Purpose::Login),
         (8904, renewal::Purpose::WeeklyQuota),
+        (8937, renewal::Purpose::LoginRotation),
     ] {
         ended_root_answers_its_lineage(session, purpose);
     }
@@ -460,7 +462,7 @@ fn ended_root_answers_its_lineage(session: u64, purpose: renewal::Purpose) {
     seed.env.state = directory.path().join("state");
     seed.env.config = Some(directory.path().join("aterm.toml"));
     seed.receipt.intent.purpose = purpose;
-    if purpose == renewal::Purpose::WeeklyQuota {
+    if purpose.moves_account() {
         seed.receipt.destination = Some(renewal::Identity::from_native("target", "user"));
     }
     seed.receipt.phase = Phase::Committing;
@@ -512,7 +514,7 @@ fn ended_root_answers_its_lineage(session: u64, purpose: renewal::Purpose) {
     };
     let bound = |receipt: &str| match purpose {
         renewal::Purpose::Login => aterm_json::json!({"owed": {"renewal": {"receipt": receipt}}}),
-        renewal::Purpose::WeeklyQuota => {
+        renewal::Purpose::WeeklyQuota | renewal::Purpose::LoginRotation => {
             aterm_json::json!({"owed": {"rotation": {"receipt": receipt}}})
         }
     };
@@ -878,4 +880,76 @@ fn codex_renewal_respects_the_fixture_constructor_gate() {
     assert!(
         !System(&handle.ctx.native_policy, true).constructor_enabled(Constructor::PrivateRestart)
     );
+}
+
+/// A LOST LOGIN'S MOVE HOLDS `restart account=` OFF ONCE COMMITTED, AS A USAGE-LIMIT HANDOFF'S DOES:
+/// once its receipt is committed (Committing, then Committed) its service is pending, and the
+/// fence answers `account-recovery-pending` before the pool's word. CONTROL: with no move
+/// committed, before the first and after each service ended, the ask passes the fence. That a
+/// Ready receipt, which has no service yet, passes it too is shown where the job publishes one
+/// (`a_settled_expiry_is_answered_waiting_then_ready_with_the_exact_line`).
+#[test]
+fn a_committed_lost_login_move_holds_an_account_restart_off() {
+    let handle = crate::session_store::test_handle_on(8957, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    install(&ctx, 71, &[Scope::Relaunch]);
+    let sid = ctx.self_id.as_str().to_string();
+    let (pid, start) = (0x3fff_ff31_u32, "t");
+    let copy = self_claimed::Copy {
+        lifetime: None,
+        pid,
+        start: start.to_string(),
+        home: PathBuf::from("/u/.codex"),
+        seen: self_claimed::Seen::Removed,
+        resume: Ok(self_claimed::Resume {
+            argv: vec!["/opt/codex/bin/codex".to_string()],
+            session: "0badf00d-1111-2222-3333-444455556666".to_string(),
+            codex_home: None,
+            codex_auth_path: None,
+            cwd: None,
+        }),
+    };
+    let resume = copy.resume.clone().unwrap();
+    let snap = aterm_agent::harness::relaunch::snapshot_of_copy(&sid, &copy, &resume, 1, None);
+    crate::harness_host::publish_snapshot_for_test(&sid, Some(&snap));
+    let judged = crate::restart_act::Judged {
+        pid,
+        start: start.to_string(),
+        copied: true,
+        home: None,
+        refusal: Some(aterm_agent::harness::accounts_pool::MOVE_LIMITED),
+    };
+    let wanted = aterm_agent::harness::restart_stamp::Wanted::Row("work".into());
+    let fence =
+        || crate::restart_act::account_fence(&ctx, (pid, start), &wanted, Some(&judged), None);
+    let pool_word = Some(aterm_agent::harness::accounts_pool::MOVE_LIMITED);
+    assert_eq!(fence(), pool_word, "CONTROL: with no move committed");
+    for phase in [Phase::Committing, Phase::Committed] {
+        let mut seed = seal(&ctx);
+        seed.receipt.intent.purpose = renewal::Purpose::LoginRotation;
+        seed.receipt.destination = Some(renewal::Identity::from_native("target", "user"));
+        seed.receipt.phase = phase.clone();
+        seed.receipt.launch_attempted = true;
+        let id = seed.receipt.id.clone();
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .renewal_services
+            .insert(id.clone(), Arc::new(Service::new(seed)));
+        assert!(crate::native_act::renewal_pending(&ctx), "{phase:?}");
+        assert_eq!(
+            fence(),
+            Some(crate::restart_act::ACCOUNT_RECOVERY_PENDING),
+            "{phase:?}"
+        );
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .renewal_services
+            .remove(&id);
+    }
+    assert_eq!(fence(), pool_word, "CONTROL: with no move in flight");
+    crate::harness_host::publish_snapshot_for_test(&sid, None);
 }

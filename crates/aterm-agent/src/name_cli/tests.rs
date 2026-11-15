@@ -665,7 +665,11 @@ fn a_name_another_machine_in_view_carries_is_refused() {
         NOW,
     )
     .expect_err("another machine holds this name");
-    assert!(refused.contains("already used"), "{refused}");
+    assert_eq!(
+        crate::machine_name::Refused::of(&refused).map(|refused| &refused.cause),
+        Some(&crate::machine_name::Cause::Nickname),
+        "{refused}"
+    );
     let before = crate::machine_name::file::read(root.path())
         .unwrap()
         .unwrap();
@@ -682,9 +686,323 @@ fn a_name_another_machine_in_view_carries_is_refused() {
         false,
     )
     .expect_err("number and name must change atomically");
-    assert!(refused.to_string().contains("already used"));
+    assert_eq!(
+        crate::machine_name::Refused::of(&refused).map(|refused| &refused.cause),
+        Some(&crate::machine_name::Cause::Nickname),
+        "{refused}"
+    );
     assert_eq!(
         crate::machine_name::file::read(root.path()).unwrap(),
         Some(before)
+    );
+}
+
+#[test]
+fn undo_and_history_take_their_flags_and_refuse_every_other_word() {
+    assert_eq!(
+        parse(&args(&["undo"])),
+        Ok(Mode::Undo {
+            dry_run: false,
+            json: false
+        })
+    );
+    assert_eq!(
+        parse(&args(&["undo", "--json", "--dry-run"])),
+        Ok(Mode::Undo {
+            dry_run: true,
+            json: true
+        })
+    );
+    assert_eq!(parse(&args(&["undo", "--help"])), Ok(Mode::Help));
+    assert_eq!(
+        parse(&args(&["history"])),
+        Ok(Mode::History { json: false })
+    );
+    assert_eq!(
+        parse(&args(&["history", "--json"])),
+        Ok(Mode::History { json: true })
+    );
+    assert_eq!(parse(&args(&["history", "-h"])), Ok(Mode::Help));
+    for refused in [
+        &["undo", "m7"][..],
+        &["undo", "--dry-run", "--dry-run"],
+        &["undo", "--json", "--json"],
+        &["undo", "--random"],
+        &["history", "--dry-run"],
+        &["history", "m7"],
+        &["history", "--json", "--json"],
+        &["--json", "undo"],
+        &["--json", "history"],
+    ] {
+        assert!(parse(&args(refused)).is_err(), "{refused:?}");
+        assert_eq!(
+            main_entry(args(refused), || panic!(
+                "undo and history parsing call no sync"
+            )),
+            ExitCode::from(2),
+            "{refused:?}"
+        );
+    }
+}
+
+/// Every path under `root` with its bytes (`None` for a directory), so a test sees any write.
+fn tree(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("lists") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                dirs.push(path.clone());
+                found.insert(path, None);
+            } else {
+                let bytes = std::fs::read(&path).expect("reads");
+                found.insert(path, Some(bytes));
+            }
+        }
+    }
+    found
+}
+
+/// `aterm name undo --dry-run` reports the name the undo would give and changes nothing under
+/// the state directory, no file added or rewritten; the control, the same undo for real, writes
+/// that name. An undo asked over a change the command read before a later one is refused as
+/// unseen, writing nothing, so the command takes back only the change it read. A second undo is
+/// refused as an undo's, by kind. `aterm name history` prints each change's line
+/// ([`file::Change::line`]), byte for byte, and a change's line says whether it was undone. The
+/// changes come from `aterm name nick` on an unnumbered Mac, which publishes nothing.
+#[test]
+fn name_undo_dry_run_changes_nothing() {
+    use super::unix::{NickAsk, Note, UndoAsk, history, renick, undo};
+    use crate::machine_name::NickTo;
+    use aterm_net::fleet_member::name_record::ByKind;
+    let root = state(0o700);
+    let newest = || {
+        file::read(root.path())
+            .expect("reads")
+            .expect("a name")
+            .history
+            .first()
+            .cloned()
+    };
+    let mut stale = None;
+    for word in ["Test", "Other"] {
+        renick(
+            root.path(),
+            Some(&vault(root.path())),
+            &NickAsk {
+                to: &NickTo::Word(nickname(word)),
+                kind: ByKind::Person,
+                dry_run: false,
+            },
+            false,
+            no_roster,
+            NOW,
+        )
+        .expect("a nickname");
+        stale = stale.or_else(newest);
+    }
+    let before = tree(root.path());
+    let ask = |dry_run, seen| UndoAsk {
+        kind: ByKind::Person,
+        dry_run,
+        seen,
+    };
+    let refused = undo(
+        root.path(),
+        Some(&vault(root.path())),
+        &ask(false, stale.as_ref()),
+        false,
+        unread,
+        NOW + 1,
+    )
+    .expect_err("the change read is no longer the newest");
+    assert_eq!(
+        crate::machine_name::Refused::of(&refused).map(|refused| &refused.cause),
+        Some(&crate::machine_name::Cause::Unseen),
+        "{refused}"
+    );
+    assert_eq!(tree(root.path()), before, "an unseen undo writes nothing");
+    let seen = newest();
+    let (line, notes) = undo(
+        root.path(),
+        Some(&vault(root.path())),
+        &ask(true, seen.as_ref()),
+        false,
+        unread,
+        NOW + 1,
+    )
+    .expect("a dry run");
+    assert!(line.starts_with("unnumbered Test  class=auto"), "{line}");
+    assert_eq!(notes, [Note::NameDryRun]);
+    assert_eq!(tree(root.path()), before, "nothing written");
+    let (json, notes) = undo(
+        root.path(),
+        Some(&vault(root.path())),
+        &ask(false, seen.as_ref()),
+        true,
+        unread,
+        NOW + 1,
+    )
+    .expect("the control: the undo itself");
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_ne!(tree(root.path()), before, "the control: the undo writes");
+    let json: aterm_json::Value = aterm_json::from_str(&json).expect("JSON");
+    assert_eq!(json["title"].as_str(), Some("unnumbered Test"));
+    assert_eq!(
+        file::read(root.path())
+            .expect("reads")
+            .expect("a name")
+            .nick
+            .as_str(),
+        "Test"
+    );
+    let seen = newest();
+    let refused = undo(
+        root.path(),
+        Some(&vault(root.path())),
+        &ask(true, seen.as_ref()),
+        false,
+        unread,
+        NOW + 2,
+    )
+    .expect_err("an undo is not undone");
+    assert_eq!(
+        crate::machine_name::Refused::of(&refused).map(|refused| &refused.cause),
+        Some(&crate::machine_name::Cause::Undone),
+        "{refused}"
+    );
+
+    let (json, narrowed) = history(root.path(), true, unread, NOW + 2).expect("History");
+    assert_eq!(narrowed, None);
+    let json: aterm_json::Value = aterm_json::from_str(&json).expect("JSON");
+    let changes = json.as_array().expect("an array");
+    let column = |key: &str| {
+        changes
+            .iter()
+            .map(|change| change[key].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        column("why"),
+        ["undone", "nickname", "nickname", "first"].map(|why| Some(why.to_owned()))
+    );
+    assert_eq!(
+        column("nick_to")[..3],
+        ["Test", "Other", "Test"].map(|nick| Some(nick.to_owned()))
+    );
+    assert_eq!(
+        changes
+            .iter()
+            .map(|change| change["undone"].as_bool())
+            .collect::<Vec<_>>(),
+        [Some(false), Some(true), Some(false), Some(false)]
+    );
+    assert!(changes[3]["by"].is_null(), "the first name, by no one");
+    assert_eq!(changes[0]["by"]["kind"].as_str(), Some("person"));
+    let (text, _) = history(root.path(), false, unread, NOW + 2).expect("History");
+    assert_eq!(text.lines().count(), 4, "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .is_some_and(|line| line.ends_with("  (undone)")),
+        "{text}"
+    );
+    let kept = file::read(root.path())
+        .expect("reads")
+        .expect("a name")
+        .history;
+    assert_eq!(
+        text,
+        kept.iter()
+            .map(|change| change.line() + "\n")
+            .collect::<String>(),
+        "History's lines, byte for byte"
+    );
+    for change in &kept {
+        let mut flipped = change.clone();
+        flipped.undone = !change.undone;
+        assert_ne!(flipped.line(), change.line(), "{change:?}");
+    }
+}
+
+/// `aterm name set`'s refusal of a number older builds hold names the next free numbers above
+/// it ([`super::unix::next_free_note`]), in the words every surface shares, and each number it
+/// names the set takes. Controls: the first number named renames for real, and an error that
+/// carries no refusal names none.
+#[test]
+fn a_refused_set_names_the_free_numbers_the_set_takes() {
+    use super::unix::{NameAsk, next_free_note, rename};
+    use crate::machine_name::{NameTo, next_free_words};
+    use aterm_net::fleet::NodeIdentity;
+    use aterm_net::fleet_member::Peer;
+    use aterm_net::fleet_member::name_record::ByKind;
+    use aterm_types::machine_name::Number;
+    let num = |n| Number::new(n).expect("a number");
+    let root = state(0o700);
+    let home = vault(root.path());
+    let set = |n: u32, dry_run: bool| {
+        rename(
+            root.path(),
+            Some(&home),
+            &NameAsk {
+                to: &NameTo {
+                    num: num(n),
+                    nick: None,
+                },
+                kind: ByKind::Person,
+                dry_run,
+            },
+            false,
+            no_roster,
+            NOW,
+        )
+    };
+    set(5, false).expect("this Mac takes m5");
+    let older = |seed: u8, n: u32| {
+        let other = NodeIdentity::from_seed(&format!("{seed:02x}").repeat(16), &[seed; 32])
+            .expect("an identity");
+        let name = num(n).to_string();
+        Peer::own(&other, (&format!("{name}.local"), 7485, "0.160.0"), NOW)
+            .with_primary_name(&other, Some(&name))
+            .line()
+            + "\n"
+    };
+    write_private(
+        root.path(),
+        PEERS_FILE,
+        (older(0xb2, 7) + &older(0xc3, 8)).as_bytes(),
+    )
+    .expect("older builds hold m7 and m8");
+    let held = set(7, false).expect_err("an older build holds m7");
+    let named = file::read(root.path()).expect("reads");
+    let note = next_free_note(root.path(), Some(&home), num(7), &held, no_roster, NOW);
+    assert_eq!(note, next_free_words(&[num(9), num(10), num(11)]), "{held}");
+    assert_eq!(
+        file::read(root.path()).expect("reads"),
+        named,
+        "no name changed"
+    );
+    for free in [9, 10, 11] {
+        set(free, true).expect("the set takes each number named");
+    }
+    set(9, false).expect("the control: m9 renames");
+    assert_eq!(
+        file::read(root.path())
+            .expect("reads")
+            .and_then(|name| name.num),
+        Some(num(9))
+    );
+    assert_eq!(
+        next_free_note(
+            root.path(),
+            Some(&home),
+            num(7),
+            &io::Error::other("busy"),
+            no_roster,
+            NOW
+        ),
+        None,
+        "the control: no refusal, no numbers"
     );
 }

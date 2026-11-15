@@ -70,6 +70,8 @@ mod resource_recovery;
 pub use resource_recovery::resource_recovery_model;
 mod discovery;
 pub use discovery::discovery_replacement_model;
+mod dial_cadence;
+pub use dial_cadence::dial_cadence_model;
 mod enrollment_gate;
 pub use enrollment_gate::enrollment_gate_model;
 mod repair_policy;

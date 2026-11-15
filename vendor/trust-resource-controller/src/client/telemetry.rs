@@ -64,7 +64,7 @@ impl Client {
                     let lifeline = channel.receive_read_lifeline(deadline)?;
                     host.revalidate(deadline)?;
                     channel.send(&[2], deadline)?;
-                    Ok(Ok(ReceivedTelemetry { reply, received_at, lifeline }))
+                    Ok(Ok(ReceivedTelemetry { reply: *reply, received_at, lifeline }))
                 }
             }
         };

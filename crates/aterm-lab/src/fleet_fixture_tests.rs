@@ -180,7 +180,7 @@ fn a_run_hands_the_payload_and_shows_the_first_line() {
     assert_eq!(row, Some(format!("week {}", std::process::id())));
     assert_eq!(std::fs::read_to_string(&kept).expect("handed"), payload);
     let vars = tap::TapVars {
-        sid: Some("s-01".into()),
+        sid: Some("t0000000001".into()),
         pid: Some("7".into()),
         ..tap::TapVars::default()
     };

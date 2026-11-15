@@ -47,3 +47,26 @@ pub(crate) fn between() {
         step();
     }
 }
+
+/// An owner act for this crate's tests, as a person's verb makes one: aterm-db's one call of
+/// the test seam past its clippy.toml row (one owner act).
+pub(crate) fn owner() -> aterm_file::OwnerAct {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "aterm-db's one test helper for an owner act"
+    )]
+    let act = aterm_file::owner_act_for_test("person", None);
+    act.expect("an owner act")
+}
+
+/// What `aterm file set <name> <row> <column> [<value>]` would queue over `paths`, for a test
+/// outside `file`, which cannot name the private write verbs.
+pub(crate) fn draft_set(
+    paths: &aterm_secrets::client::Paths,
+    name: &str,
+    key: &str,
+    column: &str,
+    value: Option<&str>,
+) -> Option<aterm_file::Draft> {
+    super::write::draft_set(paths, name, key, column, value).expect("a draft")
+}

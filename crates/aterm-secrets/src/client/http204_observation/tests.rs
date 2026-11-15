@@ -238,7 +238,7 @@ fn actual_204_with_any_etag_is_retained_without_admission_and_reads_preserve_rec
         assert_eq!(state.heard, 0);
         assert_eq!(state.seq, 0);
         assert!(state.network_materialization.is_none());
-        assert!(state.manifest.files.is_empty());
+        assert!(state.held.is_none());
         assert!(matches!(
             observe_materialization(&f.paths, &f.config, || Ok(())).unwrap(),
             MaterializationObservation::Blocked(_)
@@ -256,7 +256,7 @@ fn actual_204_with_any_etag_is_retained_without_admission_and_reads_preserve_rec
         );
         state.membership = Stored::Revoked;
         state.failed = true;
-        state.pending.insert("synthetic".into(), "00".into());
+        state.failed = true;
         save_state(&f.paths, &state).unwrap();
         assert_eq!(
             observe_http204_response(&f.paths, &f.config).unwrap(),

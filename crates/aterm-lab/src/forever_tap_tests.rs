@@ -16,7 +16,12 @@ const RESET: i64 = 300_000;
 const SHARE: i64 = 17_000;
 
 fn grace_ms() -> i64 {
-    i64::try_from(turn_end::TurnEndTiming::default().reset_grace.as_millis()).unwrap()
+    i64::try_from(
+        alab_policy::config::TurnEndTiming::default()
+            .reset_grace
+            .as_millis(),
+    )
+    .unwrap()
 }
 
 /// The wait's due timed by the tap: its reset, the grace, the share; ms after [`T0`].
@@ -434,7 +439,7 @@ fn the_tap_times_the_wall_in_a_narrow_pane() {
     assert_eq!(w, "PASS", "{why}");
     assert!(why.contains("the tap's"), "{why}");
     let armed = i64::try_from(
-        turn_end::TurnEndTiming::default()
+        alab_policy::config::TurnEndTiming::default()
             .auto_resume_grace
             .as_millis(),
     )

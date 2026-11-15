@@ -36,11 +36,18 @@ fn allowed_in(sid: &str) -> Asked {
 #[test]
 fn the_session_decides_and_only_a_persons_tab_reveals() {
     assert_eq!(
-        decide(&at_terminal(allowed_in("s-0a1b"), None, true)).unwrap(),
-        Place::Tab("s-0a1b".to_owned())
+        decide(&at_terminal(allowed_in("t0000000a1b"), None, true)).unwrap(),
+        Place::Tab("t0000000a1b".to_owned())
     );
     // A marker in the environment does not overrule the session: aterm strips them anyway.
-    assert!(decide(&at_terminal(allowed_in("s-0a1b"), Some("CLAUDECODE"), true)).is_ok());
+    assert!(
+        decide(&at_terminal(
+            allowed_in("t0000000a1b"),
+            Some("CLAUDECODE"),
+            true
+        ))
+        .is_ok()
+    );
     assert!(decide(&at_terminal(answered(ALLOWED), None, true)).is_err());
     for word in [
         "spawned", "carried", "held", "driven", "agent", "remote", "indirect", "none",
@@ -53,7 +60,7 @@ fn the_session_decides_and_only_a_persons_tab_reveals() {
         let facts = Facts {
             stdin_tty,
             stdout_tty,
-            ..at_terminal(allowed_in("s-0a1b"), None, true)
+            ..at_terminal(allowed_in("t0000000a1b"), None, true)
         };
         assert!(decide(&facts).unwrap_err().to_string().contains("terminal"));
     }
@@ -116,12 +123,12 @@ fn every_instance_is_asked_and_one_that_withholds_decides() {
     assert_eq!(combine(Vec::new()), Asked::NoInstance);
     assert_eq!(combine(vec![answered("none")]), answered("none"));
     assert_eq!(
-        combine(vec![answered("none"), allowed_in("s-77")]),
-        allowed_in("s-77"),
+        combine(vec![answered("none"), allowed_in("t0000000077")]),
+        allowed_in("t0000000077"),
         "the instance whose tab holds the caller answers for it, naming its session"
     );
     assert_eq!(
-        combine(vec![allowed_in("s-77"), answered("agent")]),
+        combine(vec![allowed_in("t0000000077"), answered("agent")]),
         answered("agent"),
         "an instance nested in an agent's tab: the outer one sees the agent"
     );
@@ -130,22 +137,49 @@ fn every_instance_is_asked_and_one_that_withholds_decides() {
         answered("spawned"),
         "the first withholding word in WORDS' order"
     );
-    assert_eq!(combine(vec![allowed_in("s-77"), failed()]), failed());
+    assert_eq!(combine(vec![allowed_in("t0000000077"), failed()]), failed());
     assert_eq!(combine(vec![answered("none"), failed()]), failed());
 }
 
-/// The answer's grammar: one line, a known verdict.
+/// The answer's grammar: one line, a known verdict, and a session that is an ID aterm minted,
+/// in either form.
+/// NEGATIVE CONTROL: with `parse` asking `tab_id::is_tab_id` of the session, as it did after the
+/// `t` form became the only tab ID, a legacy tab's answer is out of grammar: `` left:
+/// Failed("an answer whose session is no session id") ``.
 #[test]
 fn a_reveal_answer_is_one_line_with_a_known_verdict() {
     let line = |s: &str| vec![s.to_owned()];
     assert_eq!(
-        parse(&line("verdict=allowed session=s-1")),
-        allowed_in("s-1")
+        parse(&line("verdict=allowed session=t0000000001")),
+        allowed_in("t0000000001")
     );
-    assert!(matches!(
-        parse(&line("verdict=allowed session=$(x)")),
-        Asked::Failed(_)
-    ));
+    // A tab opened before the tab-ID update keeps its `s-` ID until it closes.
+    assert_eq!(
+        parse(&line("verdict=allowed session=s-0123456789abcdef0123")),
+        allowed_in("s-0123456789abcdef0123")
+    );
+    for bad in [
+        "$(x)",
+        "T0000000001",
+        "t000000000i",
+        "t000000001",
+        // A loose `s-` word is no session: only `s-` and exactly 20 lower-case hex digits is.
+        "s-abc",
+        "s-peer",
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
+        "s-0123456789abcdefghij",
+        "s-0123456789ABCDEF0123",
+        "S-0123456789abcdef0123",
+    ] {
+        assert!(
+            matches!(
+                parse(&line(&format!("verdict=allowed session={bad}"))),
+                Asked::Failed(_)
+            ),
+            "{bad}"
+        );
+    }
     assert_eq!(
         parse(&line("verdict=spawned session=-")),
         answered("spawned")
@@ -159,4 +193,52 @@ fn a_reveal_answer_is_one_line_with_a_known_verdict() {
         parse(&["verdict=allowed".to_owned(), "verdict=allowed".to_owned()]),
         Asked::Failed(_)
     ));
+}
+
+/// A tab opened before the `t` form is read as the session it is, under either ID: a person's
+/// own reveals beside it, and one an update carried over is refused in the words of its own
+/// verdict, which say what to do, never as an instance that did not answer.
+#[test]
+fn a_legacy_tabs_answer_is_read_as_its_own_verdict() {
+    let line = |s: &str| vec![s.to_owned()];
+    for sid in ["t0000000001", "s-0123456789abcdef0123"] {
+        let allowed = parse(&line(&format!("verdict=allowed session={sid} fleet=no")));
+        assert_eq!(
+            decide(&at_terminal(allowed, None, true)).unwrap(),
+            Place::Tab(sid.to_owned()),
+            "{sid}"
+        );
+        let carried = parse(&line(&format!("verdict=carried session={sid} fleet=no")));
+        assert_eq!(
+            carried,
+            Asked::Answered {
+                word: "carried".to_owned(),
+                session: Some(sid.to_owned()),
+            },
+            "{sid}"
+        );
+        // Another instance's `none` does not hide it, and nothing reads it as a failure.
+        let refusal = decide(&at_terminal(
+            combine(vec![answered("none"), carried]),
+            None,
+            true,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refusal.contains("(carried)") && refusal.contains("open a new tab"),
+            "{sid}: {refusal}"
+        );
+        assert!(!refusal.contains("did not answer"), "{sid}: {refusal}");
+    }
+    // The control: a loose `s-` word is out of grammar under any verdict, and refuses as an
+    // instance that did not answer.
+    for word in ["allowed", "carried"] {
+        let loose = parse(&line(&format!("verdict={word} session=s-peer fleet=no")));
+        assert!(matches!(loose, Asked::Failed(_)), "{word}: {loose:?}");
+        let refusal = decide(&at_terminal(loose, None, true))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("did not answer"), "{word}: {refusal}");
+    }
 }

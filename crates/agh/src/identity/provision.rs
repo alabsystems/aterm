@@ -29,22 +29,15 @@ use crate::identity::{self, Credential, LoadError, Profile, Source, tilde};
 #[cfg(unix)]
 use crate::policy::Router;
 
-/// Where `auth add` takes the token from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AddFrom {
-    /// A private token file, read in place: agh.toml names it, and agh never copies it.
-    File(std::path::PathBuf),
-    /// Standard input, written to `<config>/tokens/NAME.token`.
-    Stdin,
-}
-
 /// What `auth add` was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddRequest {
     /// The profile's name.
     pub name: String,
-    /// Where the token comes from.
-    pub from: AddFrom,
+    /// `--file`: `~/.secrets/NAME`, which names the vault entry NAME (read in place from the
+    /// store; no file there is opened), or a private token file of the person's own, read in
+    /// place. agh.toml names it as given, and agh never copies it (`config::token_source`).
+    pub file: std::path::PathBuf,
     /// The profile's tier.
     pub tier: Tier,
     /// The owners it reads for (`--owner`).
@@ -62,8 +55,8 @@ pub struct Added {
     pub profile: String,
     /// The login `GET /user` bound it to.
     pub login: String,
-    /// Where its token file is.
-    pub token_file: std::path::PathBuf,
+    /// Where its token is: a vault entry, or a token file of the person's own.
+    pub source: crate::identity::Source,
     /// The token's fingerprint.
     pub fingerprint: String,
     /// The token's kind.
@@ -73,40 +66,22 @@ pub struct Added {
 }
 
 /// The refusal of provisioning off unix.
+#[cfg(not(unix))]
 const OFF_UNIX: &str =
     "provisioning needs unix permission checks; agh on Windows is anonymous only";
 
-/// Refused `OFF_UNIX` off unix, where every provisioning path ends in that refusal; nothing
-/// on unix. `auth import` asks it before it looks for gh, so its answer names the platform
-/// and not a verb that would refuse too.
-///
-/// # Errors
-///
-/// That Refused, off unix.
-pub(crate) fn refuse_off_unix() -> Result<()> {
-    if cfg!(unix) {
-        Ok(())
-    } else {
-        Err(Error::refused(OFF_UNIX))
-    }
-}
-
-/// Provision `req`. With no agh.toml and a vault token file there, the new agh.toml starts
-/// with `vault = true` (`vault::seed`), so the vault's rows keep joining as adoption derives
-/// them, rotations included (design §6.10); a profile named `dev` or `release`, or one whose
-/// `--file` is a vault file, starts a plain agh.toml that routes alone instead.
+/// Provision `req`. With no agh.toml and either vault GitHub entry in the store, the new agh.toml
+/// starts with `vault = true` (`vault::seed`), so the vault's rows keep joining as adoption
+/// derives them, rotations included (design §6.10); a profile named `dev` or `release`, or one
+/// whose `--file` names one of those two entries, starts a plain agh.toml that routes alone
+/// instead.
 /// # Errors
 /// Usage for a profile `dev` or `release` beside an agh.toml that says `vault = true`, before
 /// anything is sent; refused for a loose `--file` (with its remedy), a fault the edit would
 /// make, or a tier change; Unauthenticated when `GET /user` refuses the token; could_not_run on
 /// I/O.
-pub fn add(
-    gh: &Github,
-    dirs: &Dirs,
-    req: &AddRequest,
-    stdin: &mut dyn std::io::Read,
-) -> Result<Added> {
-    add_with(gh, dirs, req, AddOptions::default(), stdin)
+pub fn add(gh: &Github, dirs: &Dirs, req: &AddRequest) -> Result<Added> {
+    add_with(gh, dirs, req, AddOptions::default())
 }
 
 /// `auth add`'s options beyond M1's request.
@@ -129,25 +104,8 @@ impl AddOptions {
     }
 }
 
-/// The refusal of `--legacy-loose` with a token from stdin, which agh writes 0600 itself.
-const LOOSE_STDIN: &str =
-    "--legacy-loose takes a --file: a token from stdin is written 0600 by agh";
-
-/// Usage `LOOSE_STDIN` for `options.legacy_loose` with a token from stdin (`from`), which agh
-/// writes 0600 itself. `auth import` asks it before gh runs, as its token comes as stdin.
-///
-/// # Errors
-///
-/// That Usage, next `agh help auth add`.
-pub(crate) fn refuse_loose_stdin(options: AddOptions, from: &AddFrom) -> Result<()> {
-    if options.legacy_loose && *from == AddFrom::Stdin {
-        return Err(Error::usage(LOOSE_STDIN).with_next(ADD_HELP));
-    }
-    Ok(())
-}
-
-/// [`add`] with `options`. `add(gh, dirs, req, stdin)` becomes
-/// `add_with(gh, dirs, req, AddOptions::default(), stdin)`. With `options.legacy_loose`, a
+/// [`add`] with `options`. `add(gh, dirs, req)` is
+/// `add_with(gh, dirs, req, AddOptions::default())`. With `options.legacy_loose`, a
 /// `--file` with a group or other read bit (on the file or its directory) is read through
 /// `read_owned_into` for the login binding, and the profile's row says `legacy_loose = true`;
 /// a link, another owner's file, and a group or other write bit are refused as without it.
@@ -155,16 +113,9 @@ pub(crate) fn refuse_loose_stdin(options: AddOptions, from: &AddFrom) -> Result<
 ///
 /// # Errors
 ///
-/// As [`add`]; Usage for `options.legacy_loose` with a token from stdin, before anything is
-/// read or sent.
-pub fn add_with(
-    gh: &Github,
-    dirs: &Dirs,
-    req: &AddRequest,
-    options: AddOptions,
-    stdin: &mut dyn std::io::Read,
-) -> Result<Added> {
-    add_with_metered(gh, dirs, req, options, stdin).map(|(added, _)| added)
+/// As [`add`].
+pub fn add_with(gh: &Github, dirs: &Dirs, req: &AddRequest, options: AddOptions) -> Result<Added> {
+    add_with_metered(gh, dirs, req, options).map(|(added, _)| added)
 }
 
 /// `add_with`, with the meter of the one-profile client that sent `GET /user` as the new
@@ -178,16 +129,14 @@ pub(crate) fn add_with_metered(
     dirs: &Dirs,
     req: &AddRequest,
     options: AddOptions,
-    stdin: &mut dyn std::io::Read,
 ) -> Result<(Added, Meter)> {
-    refuse_loose_stdin(options, &req.from)?;
     #[cfg(unix)]
     {
-        add_unix(gh, dirs, req, options, stdin)
+        add_unix(gh, dirs, req, options)
     }
     #[cfg(not(unix))]
     {
-        let _ = (gh, dirs, req, stdin);
+        let _ = (gh, dirs, req, options);
         Err(Error::refused(OFF_UNIX))
     }
 }
@@ -197,8 +146,6 @@ pub(crate) fn add_with_metered(
 pub struct Removed {
     /// The profile's name.
     pub profile: String,
-    /// Whether its token file was deleted.
-    pub token_file_deleted: bool,
     /// The owners whose rows changed.
     pub owners_edited: Vec<String>,
     /// Whether the vault's tokens route after it, as agh adopts them, rotations included: there
@@ -209,10 +156,10 @@ pub struct Removed {
 
 /// Remove profile `name` and every reference to it. With no agh.toml, or one that says
 /// `vault = true`, `dev` or `release` forgets the login vault adoption recorded for that token
-/// (design §6.10), so the next call learns it again. When the removed profile names a vault
-/// token file, agh.toml names no other such profile and none named `dev` or `release`, and a
-/// vault token file is there, agh.toml is made to join the vault (`join_vault`), which is how a
-/// machine provisioned before adoption comes to it.
+/// (design §6.10), so the next call learns it again. When the removed profile names one of the
+/// vault's two GitHub entries, agh.toml names no other such profile and none named `dev` or
+/// `release`, and the store holds either entry, agh.toml is made to join the vault
+/// (`join_vault`), which is how a machine provisioned before adoption comes to it.
 /// # Errors
 /// Usage for an unknown profile; Refused when the result would fault; could_not_run on I/O.
 pub fn remove(dirs: &Dirs, name: &str) -> Result<Removed> {
@@ -275,7 +222,6 @@ pub(crate) fn edit_config_with(
             })?;
             set_value(row, "token_file", Value::from(token_file));
             set_value(row, "login", Value::from(login));
-            row.remove("env");
             row.remove("covers_all_repos");
             if req.drafts {
                 set_value(row, "drafts_fp", Value::from(fingerprint));
@@ -566,18 +512,8 @@ fn set_owner_tables(doc: &mut DocumentMut, tables: Vec<Table>) {
 }
 
 /// `auth add`'s help, the next of its usage errors.
+#[cfg(unix)]
 const ADD_HELP: &str = "agh help auth add";
-
-/// A stack buffer scrubbed on every way out of the scope that holds it.
-#[cfg(unix)]
-struct Scrubbed([u8; config::TOKEN_MAX + 1]);
-
-#[cfg(unix)]
-impl Drop for Scrubbed {
-    fn drop(&mut self) {
-        aterm_uds::secret::scrub(&mut self.0);
-    }
-}
 
 /// The current agh.toml's text: `None` when there is none.
 #[cfg(unix)]
@@ -690,21 +626,30 @@ fn config_dir(dirs: &Dirs) -> Result<()> {
     private_dir(&dirs.config, &dirs.home)
 }
 
-/// A token file's load, as `auth add` answers it.
+/// A token's load, as `auth add` answers it.
 #[cfg(unix)]
-fn load_refusal(error: &LoadError, profile: &Profile, home: &Path, path: &Path) -> Error {
-    match error {
-        LoadError::Missing => {
-            Error::usage(format!("no such token file: {}", tilde(path, home))).with_next(ADD_HELP)
+fn load_refusal(error: &LoadError, profile: &Profile, home: &Path) -> Error {
+    let shown = source_shown(&profile.source, home);
+    match (error, &profile.source) {
+        (LoadError::Missing, Source::Entry(entry)) => Error::usage(format!(
+            "the vault holds no entry {} on this Mac",
+            entry.name()
+        ))
+        .with_next(super::vault::token_step(profile).unwrap_or_else(|| ADD_HELP.to_string())),
+        (LoadError::Missing, _) => {
+            Error::usage(format!("no such token file: {shown}")).with_next(ADD_HELP)
         }
-        LoadError::Io(_) | LoadError::Unavailable(_) => {
-            Error::could_not_run(format!("{}: {error}", tilde(path, home)))
+        (LoadError::Io(_) | LoadError::Unavailable(_), _) => {
+            Error::could_not_run(format!("{shown}: {error}"))
         }
-        LoadError::Loose(_)
-        | LoadError::Symlink
-        | LoadError::Malformed(_)
-        | LoadError::Unsupported(_) => {
-            let refused = Error::refused(format!("{}: {error}", tilde(path, home)));
+        (
+            LoadError::Loose(_)
+            | LoadError::Symlink
+            | LoadError::Malformed(_)
+            | LoadError::Unsupported(_),
+            _,
+        ) => {
+            let refused = Error::refused(format!("{shown}: {error}"));
             match error.remedy(profile, home) {
                 Some(remedy) => refused.with_next(remedy),
                 None => refused,
@@ -712,31 +657,6 @@ fn load_refusal(error: &LoadError, profile: &Profile, home: &Path, path: &Path) 
         }
     }
 }
-
-/// Read stdin into `buf` until EOF or the buffer is full; the bytes read.
-#[cfg(unix)]
-fn read_stdin(stdin: &mut dyn std::io::Read, buf: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match stdin.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(Error::could_not_run(format!("stdin: {e}"))),
-        }
-    }
-    Ok(filled)
-}
-
-/// The `.agh-new` file a stdin token is written to before it is put in place.
-#[cfg(unix)]
-fn new_token_name(name: &str) -> String {
-    format!("{name}.token{STAGED_SUFFIX}")
-}
-
-/// The suffix of a staged token's name, `.token.agh-new` less its `.token`.
-#[cfg(unix)]
-const STAGED_SUFFIX: &str = ".agh-new";
 
 /// One cooperative auth edit (`auth add`, `auth remove`), or, under its own lock file, one
 /// write of vault adoption's record (design §6.10), so that an ordinary read that records a
@@ -844,152 +764,17 @@ pub fn hold_auth_edit_for_tests(dirs: &Dirs) -> Result<impl Sized> {
     AuthEdit::take(dirs)
 }
 
+/// How a refusal names `source`: a token file `~/`-relative, a vault entry by its name.
+#[cfg(unix)]
+fn source_shown(source: &Source, home: &Path) -> String {
+    match source {
+        Source::File(path) => tilde(path, home),
+        Source::Entry(entry) => format!("the vault entry {}", entry.name()),
+        Source::Inline(_) => "the inline token".to_string(),
+    }
+}
+
 /// A staging name this transaction created exclusively.
-#[cfg(unix)]
-struct StagedToken {
-    path: std::path::PathBuf,
-    file: std::fs::File,
-    placed: bool,
-}
-
-#[cfg(unix)]
-impl StagedToken {
-    fn still_named(&self) -> bool {
-        use std::os::unix::fs::MetadataExt as _;
-        match (std::fs::symlink_metadata(&self.path), self.file.metadata()) {
-            (Ok(named), Ok(open)) => {
-                named.file_type().is_file()
-                    && (named.dev(), named.ino()) == (open.dev(), open.ino())
-            }
-            _ => false,
-        }
-    }
-
-    fn place(mut self, dest: &Path) -> Result<()> {
-        if !self.still_named() {
-            return Err(Error::could_not_run(
-                "the staged token changed during agh auth add",
-            ));
-        }
-        std::fs::rename(&self.path, dest)
-            .map_err(|e| Error::could_not_run(format!("{}: {e}", dest.display())))?;
-        self.placed = true;
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-impl Drop for StagedToken {
-    fn drop(&mut self) {
-        if !self.placed && self.still_named() {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Whether `path` is (or resolves to) a staged token of agh's.
-#[cfg(unix)]
-fn is_staged(dirs: &Dirs, path: &Path) -> bool {
-    let Ok(tokens) = std::fs::canonicalize(dirs.tokens()) else {
-        return false;
-    };
-    let staged_in_tokens = |p: &Path| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_suffix(STAGED_SUFFIX))
-            .is_some_and(|rest| rest.ends_with(".token"))
-            && p.parent()
-                .and_then(|d| std::fs::canonicalize(d).ok())
-                .is_some_and(|d| d == tokens)
-    };
-    staged_in_tokens(path) || std::fs::canonicalize(path).is_ok_and(|c| staged_in_tokens(&c))
-}
-
-/// Whether a profile of `config` names the file `path`, both compared after `canonicalize`.
-#[cfg(unix)]
-fn names_file(config: &Validated, path: &Path) -> bool {
-    let Ok(target) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    config.profiles().values().any(|p| match &p.source {
-        Source::File(file) => std::fs::canonicalize(file).is_ok_and(|f| f == target),
-        Source::Env(_) | Source::Inline(_) => false,
-    })
-}
-
-/// Validate stdin before making any directory or taking the transaction lock.
-#[cfg(unix)]
-fn read_stdin_token(
-    dirs: &Dirs,
-    req: &AddRequest,
-    stdin: &mut dyn std::io::Read,
-) -> Result<(Scrubbed, usize)> {
-    let mut buf = Scrubbed([0u8; config::TOKEN_MAX + 1]);
-    let read = read_stdin(stdin, &mut buf.0)?;
-    if read > config::TOKEN_MAX {
-        return Err(
-            Error::usage(format!("a token is at most {} bytes", config::TOKEN_MAX))
-                .with_next(ADD_HELP),
-        );
-    }
-    let token = match identity::token_bytes(&buf.0[..read]) {
-        Ok(token) => token,
-        Err(LoadError::Malformed(why)) => return Err(Error::usage(why).with_next(ADD_HELP)),
-        Err(other) => return Err(Error::usage(other.to_string()).with_next(ADD_HELP)),
-    };
-    if let Err(error) = TokenKind::of(token) {
-        let profile = Profile::new(
-            req.name.clone(),
-            Source::File(dirs.tokens().join(format!("{}.token", req.name))),
-            req.tier,
-        );
-        let refused = Error::refused(error.to_string());
-        return Err(match error.remedy(&profile, &dirs.home) {
-            Some(remedy) => refused.with_next(remedy),
-            None => refused,
-        });
-    }
-    let n = token.len();
-    buf.0[n] = b'\n';
-    Ok((buf, n + 1))
-}
-
-/// Stage the validated token while its auth edit lock is held.
-#[cfg(unix)]
-fn stage_stdin(dirs: &Dirs, req: &AddRequest, token: &[u8]) -> Result<StagedToken> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    private_dir(&dirs.tokens(), &dirs.home)?;
-    let name = new_token_name(&req.name);
-    let path = dirs.tokens().join(name);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-        .open(&path)
-        .map_err(|e| {
-            let shown = tilde(&path, &dirs.home);
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Error::refused(format!("the staging path {shown} is occupied"))
-                    .with_next("recover or move that file before provisioning this profile again")
-            } else {
-                Error::could_not_run(format!("{shown}: {e}"))
-            }
-        })?;
-    let mut staged = StagedToken {
-        path,
-        file,
-        placed: false,
-    };
-    staged
-        .file
-        .write_all(token)
-        .and_then(|()| aterm_durable::durable(&staged.file))
-        .map_err(|e| Error::could_not_run(format!("the staged token: {e}")))?;
-    Ok(staged)
-}
-
 /// `add` on unix (plan §11.2).
 #[cfg(unix)]
 fn add_unix(
@@ -997,61 +782,38 @@ fn add_unix(
     dirs: &Dirs,
     req: &AddRequest,
     options: AddOptions,
-    stdin: &mut dyn std::io::Read,
 ) -> Result<(Added, Meter)> {
-    // The profile a `--file` is loaded as, here and in the login binding: with
-    // `--legacy-loose`, `identity::load` reads it through `read_owned_into`.
-    let file_profile = |path: &Path| {
-        let mut profile =
-            Profile::new(req.name.clone(), Source::File(path.to_path_buf()), req.tier);
-        profile.set_legacy_loose(options.legacy_loose);
-        profile
-    };
+    // The profile the token is loaded as, here and in the login binding: a `~/.secrets/NAME`
+    // `--file` is the vault entry NAME, read in place from the store; with `--legacy-loose`,
+    // `identity::load` reads a file of the person's own through `read_owned_into`.
+    let path = &req.file;
     if let Some(fault) = config::profile_name_fault(&req.name) {
         return Err(Error::usage(fault).with_next(ADD_HELP));
     }
-    let named = match &req.from {
-        AddFrom::File(path) => path.clone(),
-        AddFrom::Stdin => dirs.tokens().join(format!("{}.token", req.name)),
-    };
-    if named.to_str().is_none() {
+    let Some(text) = path.to_str() else {
         return Err(Error::usage(format!(
             "the token file {} is not a UTF-8 path, and agh.toml can name only a UTF-8 path",
-            tilde(&named, &dirs.home)
-        ))
-        .with_next(ADD_HELP));
-    }
-    if let AddFrom::File(path) = &req.from
-        && is_staged(dirs, path)
-    {
-        return Err(Error::usage(format!(
-            "{} is agh's staging file: move it to a name of its own first",
             tilde(path, &dirs.home)
         ))
         .with_next(ADD_HELP));
-    }
-    let stdin_token = match &req.from {
-        AddFrom::Stdin => Some(read_stdin_token(dirs, req, stdin)?),
-        AddFrom::File(path) => {
-            let profile = file_profile(path);
-            identity::load(&profile, gh.env())
-                .map_err(|e| load_refusal(&e, &profile, &dirs.home, path))?;
-            None
-        }
     };
+    let source = config::token_source(text, &dirs.home).ok_or_else(|| {
+        Error::usage(format!(
+            "{} is inside ~/.secrets, which holds only vault entries: name one as \
+             ~/.secrets/NAME",
+            tilde(path, &dirs.home)
+        ))
+        .with_next(ADD_HELP)
+    })?;
+    let mut profile = Profile::new(req.name.clone(), source.clone(), req.tier);
+    profile.set_legacy_loose(options.legacy_loose);
+    identity::load(&profile).map_err(|e| load_refusal(&e, &profile, &dirs.home))?;
     let _edit = AuthEdit::take(dirs)?;
     let existing = read_current(dirs)?;
     let existed = existing.is_some();
-    let text = existing.unwrap_or_else(|| {
-        let file = match &req.from {
-            AddFrom::File(path) => Some(path.as_path()),
-            AddFrom::Stdin => None,
-        };
-        super::vault::seed(dirs, &req.name, file).unwrap_or_default()
-    });
-    let current = if text.is_empty() {
-        None
-    } else {
+    let text = existing
+        .unwrap_or_else(|| super::vault::seed(dirs, &req.name, &source).unwrap_or_default());
+    if !text.is_empty() {
         let current = config::judge(&text, &dirs.home).verdict.map_err(|_| {
             Error::refused("agh.toml is invalid; agh auth add edits only a valid file")
                 .with_next(config::POLICY_CHECK)
@@ -1060,10 +822,10 @@ fn add_unix(
             && let Some(slot) = super::vault::Slot::named(&req.name)
         {
             return Err(Error::usage(format!(
-                "profile {} is the vault's {}, which agh adopts with nothing to run: agh.toml says \
-                 vault = true, so it names no profile dev or release",
+                "profile {} is the vault entry {}, which agh adopts with nothing to run: agh.toml \
+                 says vault = true, so it names no profile dev or release",
                 req.name,
-                slot.pointer()
+                slot.entry()
             ))
             .with_next("choose another NAME: the vault's token already joins agh.toml's rows"));
         }
@@ -1077,63 +839,17 @@ fn add_unix(
                 req.name
             )));
         }
-        Some(current)
-    };
-    edit_config_with(&text, req, "", "", "", options.legacy_loose)?;
-    match &req.from {
-        AddFrom::File(path) => {
-            let profile = file_profile(path);
-            let cred = identity::load(&profile, gh.env())
-                .map_err(|e| load_refusal(&e, &profile, &dirs.home, path))?;
-            let (added, new_text, meter) =
-                bind_and_edit(gh, dirs, req, &text, &profile, path, &cred)?;
-            judge_edit(&new_text, &dirs.home, existed)?;
-            write_config(dirs, &new_text, None)?;
-            Ok((added, meter))
-        }
-        AddFrom::Stdin => {
-            let staging = dirs.tokens().join(new_token_name(&req.name));
-            if current.as_ref().is_some_and(|c| names_file(c, &staging)) {
-                return Err(Error::refused(format!(
-                    "agh.toml names agh's staging file {} as a token_file",
-                    tilde(&staging, &dirs.home)
-                ))
-                .with_next("move that token to a name of its own and fix agh.toml first"));
-            }
-            let Some((buf, len)) = stdin_token.as_ref() else {
-                return Err(Error::could_not_run("the stdin token was not checked"));
-            };
-            let staged = stage_stdin(dirs, req, &buf.0[..*len])?;
-            let token_file = named;
-            let placed: Result<_> = (|| {
-                let profile = Profile::new(
-                    req.name.clone(),
-                    Source::File(staged.path.clone()),
-                    req.tier,
-                );
-                let cred = identity::load(&profile, gh.env())
-                    .map_err(|e| load_refusal(&e, &profile, &dirs.home, &staged.path))?;
-                let added = bind_and_edit(gh, dirs, req, &text, &profile, &token_file, &cred)?;
-                judge_edit(&added.1, &dirs.home, existed)?;
-                staged.place(&token_file)?;
-                Ok(added)
-            })();
-            let (added, new_text, meter) = placed?;
-            aterm_durable::durable_dir(&dirs.tokens()).map_err(|e| {
-                Error::could_not_run(format!(
-                    "{}: {e}; the new token is in place at {}, and agh.toml is as it was",
-                    tilde(&dirs.tokens(), &dirs.home),
-                    tilde(&token_file, &dirs.home)
-                ))
-            })?;
-            write_config(dirs, &new_text, Some(&token_file))?;
-            Ok((added, meter))
-        }
     }
+    edit_config_with(&text, req, "", "", "", options.legacy_loose)?;
+    let cred = identity::load(&profile).map_err(|e| load_refusal(&e, &profile, &dirs.home))?;
+    let (added, new_text, meter) = bind_and_edit(gh, dirs, req, &text, &profile, &cred)?;
+    judge_edit(&new_text, &dirs.home, existed)?;
+    write_config(dirs, &new_text)?;
+    Ok((added, meter))
 }
 
 /// Steps 5 and 6 of `add` (plan §11.2): the login bound as `loaded`, the profile `cred` was
-/// loaded as (its file source and its `legacy_loose`), then the edit made (`judge_edit` judges
+/// loaded as (its source and its `legacy_loose`), then the edit made (`judge_edit` judges
 /// it), its row saying `legacy_loose = true` exactly when `--legacy-loose` asked for it
 /// (`loaded.legacy_loose()`), whether or not the file was loose.
 #[cfg(unix)]
@@ -1143,13 +859,9 @@ fn bind_and_edit(
     req: &AddRequest,
     text: &str,
     loaded: &Profile,
-    token_file: &Path,
     cred: &Credential,
 ) -> Result<(Added, String, Meter)> {
-    let source = match &loaded.source {
-        Source::File(path) => path.as_path(),
-        Source::Env(_) | Source::Inline(_) => token_file,
-    };
+    let token_file = req.file.as_path();
     let validated = Validated {
         profiles: BTreeMap::from([(req.name.clone(), loaded.clone())]),
         owners: BTreeMap::new(),
@@ -1169,15 +881,19 @@ fn bind_and_edit(
     );
     if !sent_as_loaded {
         return Err(Error::could_not_run(format!(
-            "the token file {} changed during agh auth add",
-            tilde(source, &dirs.home)
+            "{} changed during agh auth add",
+            source_shown(&loaded.source, &dirs.home)
         ))
         .with_next("run agh auth add again"));
     }
+    let spelled = match &loaded.source {
+        Source::Entry(entry) => entry.spelling(),
+        _ => tilde(token_file, &dirs.home),
+    };
     let new_text = edit_config_with(
         text,
         req,
-        &tilde(token_file, &dirs.home),
+        &spelled,
         &login,
         cred.fingerprint(),
         loaded.legacy_loose(),
@@ -1185,7 +901,7 @@ fn bind_and_edit(
     let added = Added {
         profile: req.name.clone(),
         login,
-        token_file: token_file.to_path_buf(),
+        source: loaded.source.clone(),
         fingerprint: cred.fingerprint().to_string(),
         kind: cred.kind(),
         owners: req.owners.clone(),
@@ -1195,30 +911,17 @@ fn bind_and_edit(
 
 /// agh.toml written whole, 0600, in its private directory (`add`'s step 8, plan §11.2).
 #[cfg(unix)]
-fn write_config(dirs: &Dirs, text: &str, placed: Option<&Path>) -> Result<()> {
-    let written = config_dir(dirs).and_then(|()| {
-        aterm_uds::private_file::write_private(&dirs.config, CONFIG_FILE, text.as_bytes()).map_err(
-            |e| {
-                Error::could_not_run(format!(
-                    "{}: {}",
-                    tilde(&dirs.config_file(), &dirs.home),
-                    io_text(&e, &dirs.config, &dirs.home)
-                ))
-            },
-        )
-    });
-    match (written, placed) {
-        (Ok(()), _) => Ok(()),
-        (Err(error), None) => Err(error),
-        (Err(mut error), Some(token)) => {
-            error.why = format!(
-                "{}; the new token is in place at {}, and agh.toml is as it was",
-                error.why,
-                tilde(token, &dirs.home)
-            );
-            Err(error)
-        }
-    }
+fn write_config(dirs: &Dirs, text: &str) -> Result<()> {
+    config_dir(dirs)?;
+    aterm_uds::private_file::write_private(&dirs.config, CONFIG_FILE, text.as_bytes()).map_err(
+        |e| {
+            Error::could_not_run(format!(
+                "{}: {}",
+                tilde(&dirs.config_file(), &dirs.home),
+                io_text(&e, &dirs.config, &dirs.home)
+            ))
+        },
+    )
 }
 
 /// `remove` on unix (plan §11.2).
@@ -1231,7 +934,6 @@ fn remove_unix(dirs: &Dirs, name: &str) -> Result<Removed> {
         {
             return Ok(Removed {
                 profile: name.to_string(),
-                token_file_deleted: false,
                 owners_edited: Vec::new(),
                 joins_vault: true,
             });
@@ -1251,36 +953,24 @@ fn remove_unix(dirs: &Dirs, name: &str) -> Result<Removed> {
         {
             return Ok(Removed {
                 profile: name.to_string(),
-                token_file_deleted: false,
                 owners_edited: Vec::new(),
                 joins_vault: true,
             });
         }
         return Err(crate::config::no_profile(name, "agh auth status"));
     };
-    let own = dirs.tokens().join(format!("{name}.token"));
-    let canonical_own = std::fs::canonicalize(&own).ok();
-    let names_own = |source: &Source| match source {
-        Source::File(path) => {
-            canonical_own.is_some() && std::fs::canonicalize(path).ok() == canonical_own
-        }
-        Source::Env(_) | Source::Inline(_) => false,
-    };
     let (new_text, owners_edited) = remove_from_config(&text, name)?;
     let after = config::judge(&new_text, &dirs.home)
         .verdict
         .map_err(|faults| would_break(&faults, "remove", true))?;
-    let vaults = |p: &Profile| match &p.source {
-        Source::File(path) => super::vault::is_vault_file(dirs, path),
-        Source::Env(_) | Source::Inline(_) => false,
-    };
+    let vaults = |p: &Profile| super::vault::is_slot_entry(&p.source);
     let (new_text, joins_vault) = if vaults(profile)
         && !after.joins_vault()
         && !after
             .profiles()
             .values()
             .any(|p| vaults(p) || super::vault::Slot::named(&p.name).is_some())
-        && super::vault::any_file(dirs)
+        && super::vault::any_entry(dirs)
     {
         let joined = join_vault(&text, &new_text)?;
         match config::judge(&joined, &dirs.home).verdict {
@@ -1290,26 +980,9 @@ fn remove_unix(dirs: &Dirs, name: &str) -> Result<Removed> {
     } else {
         (new_text, after.joins_vault())
     };
-    let own_dir = aterm_uds::private_file::check_private_dir(&dirs.tokens()).is_ok();
-    let deletable = own_dir
-        && names_own(&profile.source)
-        && !after.profiles().values().any(|p| names_own(&p.source));
-    write_config(dirs, &new_text, None)?;
-    let token_file_deleted = if deletable {
-        aterm_uds::private_file::remove_private(&dirs.tokens(), &format!("{name}.token")).map_err(
-            |e| {
-                Error::could_not_run(format!(
-                    "{}: {e}; agh.toml no longer names profile {name}",
-                    tilde(&own, &dirs.home)
-                ))
-            },
-        )?
-    } else {
-        false
-    };
+    write_config(dirs, &new_text)?;
     Ok(Removed {
         profile: name.to_string(),
-        token_file_deleted,
         owners_edited,
         joins_vault,
     })

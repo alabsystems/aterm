@@ -198,6 +198,8 @@ listed! {
         Key,
         /// Text typed into a session.
         Send,
+        /// Changing an existing session's Autopilot or native agent settings.
+        Configure,
         /// Taking a session over, or handing it back.
         Hold,
         /// Closing a session.
@@ -227,6 +229,7 @@ impl DriveKind {
             | Self::Turn
             | Self::Key
             | Self::Send
+            | Self::Configure
             | Self::Hold
             | Self::Close
             | Self::Claim
@@ -249,6 +252,7 @@ impl DriveKind {
             Self::Turn => "turn",
             Self::Key => "key",
             Self::Send => "send",
+            Self::Configure => "configure",
             Self::Hold => "hold",
             Self::Close => "close",
             Self::Claim => "request claim",

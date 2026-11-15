@@ -2108,7 +2108,7 @@ fn a_deaf_watcher_rests_after_each_slow_look() {
 fn a_refused_edit_is_read_again_until_a_second_read_agrees() {
     let dir = watch_scratch("refused-edit");
     let config = dir.join("aterm.toml");
-    std::fs::write(&config, b"# caf\xe9\nfont_px = 14\n").unwrap();
+    crate::test_scratch::write_config(&config, b"# caf\xe9\nfont_px = 14\n");
     let says_off = b"# caf\xe9\n[update]\nauto_apply = false\n";
     let posts = Posts::default();
     let edited = config.clone();

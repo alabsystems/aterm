@@ -766,7 +766,7 @@ fn account_progress_gallery() {
                 .lock()
                 .unwrap()
                 .set_autopilot(
-                    Some(aterm_agent::supervise::Autopilot::Off.word().into()),
+                    Some(alab_policy::config::Autopilot::Off.word().into()),
                     None,
                 );
         }
@@ -843,6 +843,7 @@ fn account_progress_gallery() {
                 &roster,
                 &Default::default(),
                 &Default::default(),
+                None,
                 true,
                 Some("fixture-current"),
                 None,

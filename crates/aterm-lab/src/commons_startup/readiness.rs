@@ -80,6 +80,12 @@ fn read(paths: &Paths, until: Instant) -> Result<Observation, &'static str> {
     })
 }
 
+/// Whether `observed` shows both writers admitted alike and each reached by the other's live
+/// observer: each observation sampled and published within 15 s of `now` and `wall_ms`, and each
+/// peer Reachable on an authenticated contact and check made since `since_ms`, when this run
+/// started its hosts. A contact is held to the run, not to the last 15 s: once their first
+/// sweep is done the two endpoints rest until their audits, minutes apart, and a peer stays
+/// Reachable on the contact that verified it.
 fn ready(
     observed: &[Observation; 2],
     expected: &[Binding; 2],
@@ -87,11 +93,13 @@ fn ready(
     log_backed: bool,
     now: Instant,
     wall_ms: Option<u64>,
+    since_ms: u64,
 ) -> bool {
     let Some(wall) = wall_ms else {
         return false;
     };
     let recent = |stamp| stamp != 0 && wall.checked_sub(stamp).is_some_and(|age| age <= 15_000);
+    let this_run = |stamp: u64| stamp != 0 && stamp >= since_ms;
     if expected[0].machine() == expected[1].machine()
         || expected[0].actor() == expected[1].actor()
         || observed[0].trust != observed[1].trust
@@ -145,11 +153,11 @@ fn ready(
                 observed.identity.machine_id == *peer.machine()
                     && observed.identity.incarnation == *peer.incarnation()
                     && observed.reachability == Reachability::Reachable
-                    && recent(observed.last_seen_ms)
+                    && this_run(observed.last_seen_ms)
                     && observed.last_seen_ms <= network.observed_at_ms
                     && observed
                         .last_checked_ms
-                        .is_some_and(|at| recent(at) && at <= network.observed_at_ms)
+                        .is_some_and(|at| this_run(at) && at <= network.observed_at_ms)
             })
     })
 }
@@ -209,13 +217,15 @@ fn hosts_live(node: &mut Node, window: &mut Instance, pid: u32) -> Result<bool, 
         && window.aterm_pid() == Some(pid as i32))
 }
 
-/// Observe convergence of the two expected writers and their authenticated contacts.
+/// Observe convergence of the two expected writers and their authenticated contacts, each made
+/// since `since_ms`, when this run started its hosts ([`ready`]).
 /// This creates no custody/catalog and grants no lease for the subsequent single write.
 pub(super) fn wait(
     worlds: [&World; 2],
     node: &mut Node,
     window: &mut Instance,
     log_backed: bool,
+    since_ms: u64,
     out: &Path,
 ) -> Result<(), Fail> {
     let pids = [
@@ -265,6 +275,7 @@ pub(super) fn wait(
                     log_backed,
                     Instant::now(),
                     aterm_time::unix_millis(),
+                    since_ms,
                 ) && hosts_live(node, window, pids[1])?
                 {
                     save(

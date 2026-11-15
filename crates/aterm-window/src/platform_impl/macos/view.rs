@@ -979,7 +979,7 @@ impl WinitView {
     /// Last modifier state derived from an event.
     ///
     /// LOCAL PATCH (aterm): written before `ModifiersChanged` is queued; never a WindowServer probe
-    /// (the aterm-census guard `input-probe` bans the class-level flags query).
+    /// (the class-level flags query).
     pub(super) fn cached_modifiers(&self) -> ModifiersState {
         self.ivars().modifiers.get().state()
     }

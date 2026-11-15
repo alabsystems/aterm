@@ -1141,7 +1141,8 @@ pub struct SubscriptionDisplay {
     pub model_id: Option<String>,
     /// The account state says this login is signed out ([`super::agy_gate`]): the display then
     /// names no email, plan or week (none is known true of it any more), nothing on the screen
-    /// refills them, and the glass says it is not signed in. `agy`'s footer only.
+    /// refills them, and the glass says `signed out` ([`super::outlook::SIGNED_OUT`]). `agy`'s
+    /// footer only.
     pub signed_out: bool,
     /// How the selected profile's plan bills Fable ([`Profile::fable`]), which a session's
     /// model card says beside its Fable choice. `None` where no Claude profile was read.

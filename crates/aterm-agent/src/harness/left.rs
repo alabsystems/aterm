@@ -16,7 +16,8 @@
 //! | a lower bound of use | `≤38% left` | [`at_most`]: 100 − use rounded down, an upper bound |
 //! | a projected fill short of 100 | `~1% left` | [`ahead`]: never `~0% left` |
 //! | a standing wall, a projected fill | `out` | a word, never an inferred `0% left` |
-//! | unread | `?` | |
+//! | unread | `not read`, or its reason's words (`not read yet`) | [`super::outlook::Why::words`]: why no figure stands, never a mark alone |
+//! | no login here | `signed out`, `signing in` | [`super::outlook::Figure::login`]: the login, in the figure's place |
 //!
 //! `0% left` is printed only for a reading of 100, as `100% used` was. A wall keeps the word `out`
 //! because it is the vendor's refusal, not a reading: it can stand on a window last read at 97%,

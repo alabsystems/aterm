@@ -316,3 +316,81 @@ fn glow_style_matches_glow_config() {
         "the key-time click must name the frame drain's instrument"
     );
 }
+
+#[test]
+fn the_drain_marks_the_enter_that_ran_a_command_at_the_prompt_and_no_other() {
+    use aterm_effects::trail_sound::{SoundGesture, SoundKind};
+    use std::time::{Duration, Instant};
+
+    let mut app = crate::App::headless_for_test();
+    app.config.cursor_trail = Some(true);
+    app.config.trail_sounds = Some(true);
+    app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+    let wid = crate::WindowId(0);
+    app.windows.get_mut(&wid).expect("window").focused = true;
+    let session = app
+        .focused_session_id(wid)
+        .expect("the window shows a session");
+    let t0 = Instant::now();
+    app.cursor_frame(wid, super::CursorFxInputs::sample_for_test(t0))
+        .expect("the fixture window ticks");
+    let _ = app.trail_audio.take_captured_with_meta_for_test();
+
+    let frame = |app: &mut crate::App, at_ms: u64, kinds: &[SoundKind]| -> Vec<(bool, bool)> {
+        let glow = &mut app
+            .windows
+            .get_mut(&wid)
+            .expect("window")
+            .fx
+            .cursor_mut()
+            .glow;
+        for (i, kind) in kinds.iter().enumerate() {
+            assert!(
+                glow.cue_keystroke_kind(t0 + Duration::from_millis(at_ms + i as u64), *kind),
+                "the backlog takes cue {i}"
+            );
+        }
+        app.cursor_frame(
+            wid,
+            super::CursorFxInputs::sample_for_test(t0 + Duration::from_millis(at_ms + 16)),
+        )
+        .expect("the fixture window ticks");
+        app.trail_audio
+            .take_captured_with_meta_for_test()
+            .iter()
+            .filter(|(ev, _)| {
+                matches!(
+                    ev.kind,
+                    SoundGesture::Trail(SoundKind::Typed | SoundKind::Enter { .. })
+                )
+            })
+            .map(|(ev, meta)| {
+                (
+                    matches!(ev.kind, SoundGesture::Trail(SoundKind::Enter { .. })),
+                    meta.prompt,
+                )
+            })
+            .collect()
+    };
+    let enter = SoundKind::Enter { cells: 4 };
+
+    app.windows.get_mut(&wid).expect("window").prompt_enter = Some(session);
+    assert_eq!(
+        frame(&mut app, 1, &[SoundKind::Typed, enter, enter]),
+        [(false, false), (true, true), (true, false)],
+        "the one Enter that ran the command is marked, and neither a letter nor a second Enter"
+    );
+    assert_eq!(
+        app.windows.get(&wid).expect("window").prompt_enter,
+        None,
+        "the mark is spent with its Enter"
+    );
+    assert_eq!(
+        frame(&mut app, 40, &[enter]),
+        [(true, false)],
+        "an Enter with no prompt behind it asks nothing"
+    );
+    // A prompt Enter in a session this window no longer shows marks nothing here.
+    app.windows.get_mut(&wid).expect("window").prompt_enter = Some(session + 1);
+    assert_eq!(frame(&mut app, 80, &[enter]), [(true, false)]);
+}

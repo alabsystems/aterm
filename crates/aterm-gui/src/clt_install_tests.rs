@@ -615,17 +615,21 @@ fn a_mac_with_the_tools_still_gets_the_one_elevation_for_what_is_owed() {
     let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     use aterm_containment::consent::DebuggerMember::Admin;
     use aterm_containment::consent::DebuggerMode::{Disabled, Enabled, Unknown};
-    assert!(root_steps_owed_by(Disabled, Admin, Ok((0, 0o440, true)), false, false).any());
-    assert!(root_steps_owed_by(Enabled, Admin, gone(), false, false).any());
-    assert!(root_steps_owed_by(Enabled, Admin, Ok((501, 0o440, true)), false, false).any());
-    assert!(!root_steps_owed_by(Enabled, Admin, Ok((0, 0o440, true)), false, false).any());
+    assert!(root_steps_owed_by(Disabled, Admin, Ok((0, 0o440, true)), false, false, false).any());
+    assert!(root_steps_owed_by(Enabled, Admin, gone(), false, false, false).any());
+    assert!(root_steps_owed_by(Enabled, Admin, Ok((501, 0o440, true)), false, false, false).any());
+    assert!(!root_steps_owed_by(Enabled, Admin, Ok((0, 0o440, true)), false, false, false).any());
     assert!(
-        root_steps_owed_by(Enabled, Admin, Ok((0, 0o440, true)), false, true).any(),
+        root_steps_owed_by(Enabled, Admin, Ok((0, 0o440, true)), false, true, false).any(),
         "the broker alone owes the elevation"
     );
-    assert!(!root_steps_owed_by(Unknown, Admin, denied(), false, false).any());
     assert!(
-        !root_steps_owed_by(Enabled, Admin, gone(), true, false).any(),
+        root_steps_owed_by(Enabled, Admin, Ok((0, 0o440, true)), false, false, true).any(),
+        "Spotlight's scope alone owes the elevation"
+    );
+    assert!(!root_steps_owed_by(Unknown, Admin, denied(), false, false, false).any());
+    assert!(
+        !root_steps_owed_by(Enabled, Admin, gone(), true, false, false).any(),
         "refused stands"
     );
 }
@@ -646,7 +650,7 @@ fn enabled_mode_owes_only_a_definitely_unauthorized_console_account() {
         (DebuggerMode::Unknown, NotMember, false),
     ] {
         assert_eq!(
-            root_steps_owed_by(mode, member, Ok((0, 0o440, true)), false, false),
+            root_steps_owed_by(mode, member, Ok((0, 0o440, true)), false, false, false),
             RootSteps {
                 debugger: owed,
                 other: false
@@ -733,6 +737,7 @@ fn assert_debugger_setup_admission(
         debugger.mode,
         debugger.member,
         Ok((0, 0o440, true)),
+        false,
         false,
         false,
     ));

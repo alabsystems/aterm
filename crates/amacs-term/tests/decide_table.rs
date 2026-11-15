@@ -4,7 +4,7 @@
 //! Tests for the client face decision table.
 
 use amacs_term::decide::{
-    EXIT_USAGE, Face, Handoff, Inputs, NO_TERMINAL, OpenIn, after_handoff, decide,
+    BUSY, EXIT_USAGE, Face, Handoff, Inputs, NO_TERMINAL, OpenIn, after_handoff, decide,
 };
 
 fn in_a_tab() -> Inputs {
@@ -96,6 +96,11 @@ fn every_row_of_the_design_table() {
     assert_eq!(after_handoff(Handoff::Refused), Face::Terminal);
     assert_eq!(after_handoff(Handoff::Unreachable), Face::Terminal);
     assert!(matches!(after_handoff(Handoff::TimedOut), Face::Exit(1, _)));
+    assert_eq!(
+        after_handoff(Handoff::Busy),
+        Face::Exit(1, BUSY.to_string())
+    );
+    assert!(BUSY.starts_with("amacs: ") && BUSY.ends_with("; run amacs again"));
     assert_eq!(after_handoff(Handoff::Opened), Face::Native);
 
     for inputs in every_input() {

@@ -422,7 +422,6 @@ fn probe_prints_its_own_argv_and_environment_when_asked() {
 #[test]
 fn process_args_reads_a_live_process_as_its_own_runtime_split_it() {
     use std::io::BufRead as _;
-    use std::os::windows::process::CommandExt as _;
     if std::env::var_os(ARGS_PROBE_ENV).is_some() {
         return;
     }
@@ -489,7 +488,6 @@ fn process_args_reads_a_live_process_as_its_own_runtime_split_it() {
 #[cfg(windows)]
 #[test]
 fn a_wow64_process_is_read_through_its_32_bit_block() {
-    use std::os::windows::process::CommandExt as _;
     let root = std::env::var_os("SystemRoot").expect("SystemRoot");
     let cmd = std::path::Path::new(&root).join("SysWOW64").join("cmd.exe");
     assert!(cmd.is_file(), "no 32-bit cmd.exe at {}", cmd.display());

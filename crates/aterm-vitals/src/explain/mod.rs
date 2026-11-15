@@ -8,7 +8,7 @@
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
-use crate::model::{Membership, Sample, Snapshot, TabRoot};
+use crate::model::{Membership, Sample, Snapshot};
 
 pub mod account;
 pub mod detect;
@@ -92,13 +92,13 @@ impl Hasher for IdHasher {
 /// Whether the coalition lane reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CoalLane {
-    /// This OS has no coalitions (Linux, Windows): the split is by subtraction.
+    /// This OS has no coalition reader (Linux, Windows): use process and reaper evidence.
     #[default]
     Unsupported,
     /// macOS answered the launch self-check: the split is by coalition.
     On,
     /// macOS's self-check missed, or a read did not match the record layout the readers hold: the
-    /// split is by subtraction.
+    /// split uses process and reaper evidence.
     Off,
 }
 
@@ -304,7 +304,7 @@ impl Lead {
 /// Where a coalition's work counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Part {
-    /// aterm's: it holds this instance, or a tab's shell (`C(I)`).
+    /// Proved app ownership, including independent app subsets moved out of mixed coalitions.
     Aterm,
     /// The user's other work: it holds a live process of this user.
     Others,
@@ -331,6 +331,14 @@ impl Part {
 pub struct Named {
     /// Where its work counts.
     pub part: Part,
+    /// A foreign member was observed in this coalition. This proof persists after it exits.
+    pub mixed: bool,
+    /// At least one app-owned member has been observed; used to separate a mixed remainder.
+    pub has_app: bool,
+    /// A foreign member's user class was unread or disagreed with another member's class.
+    pub unknown_owner: bool,
+    /// Where the coalition's unowned remainder belongs when full app ownership is unproved.
+    pub outside: Part,
     /// Its lead; `None` when no live member's birth was read.
     pub lead: Option<Lead>,
 }
@@ -338,9 +346,9 @@ pub struct Named {
 /// How a split was made.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Via {
-    /// Per coalition: every part is its coalitions' counters.
+    /// Measured coalition counters with independently proved owner subsets for mixed groups.
     Coalitions,
-    /// By subtraction: services is the busy figure less aterm and others.
+    /// Process and reaper evidence; unproved work stays in the signed residual.
     #[default]
     Subtraction,
 }
@@ -370,9 +378,13 @@ pub struct CoalRow {
     /// `false` for one the base should have held and did not, or whose counter went back: its
     /// figures over the window read 0, and the residual holds its work.
     pub measured: bool,
-    /// Of that, a delegated job's members' work, counted in their tab instead, millicores (never
-    /// above [`Self::cpu_mc`]).
+    /// Independently attributed app members' own CPU moved out of an outside coalition,
+    /// millicores. Different kernel read cuts can put this past [`Self::cpu_mc`].
     pub delegated_mc: i64,
+    /// Whole-coalition ownership is mixed or incomplete; its raw total has no single owner.
+    pub ownership_mixed: bool,
+    /// Independently measured foreign members' own CPU when ownership is mixed.
+    pub outside_floor_mc: i64,
     /// Of [`Self::cpu_mc`], what ran at maintenance or background QoS (deferred work), millicores.
     pub deferred_mc: i64,
     /// Its seven QoS buckets' growth over the window, millicores: what [`Self::deferred_mc`] is a
@@ -382,6 +394,19 @@ pub struct CoalRow {
     pub read_bps: u64,
     /// Its live members' footprint now, bytes, where read.
     pub footprint: Option<u64>,
+    /// A complete current active census proves every live member is app-owned. Footprint
+    /// is instantaneous, so this proof is independent of the CPU window's earlier owners.
+    pub footprint_aterm: bool,
+    /// A complete current census proves the foreign members share this user class. This
+    /// instantaneous footprint proof is independent of historical CPU ownership uncertainty.
+    pub footprint_outside: Option<Part>,
+    /// This tick's readable memory charges of proved app members in a foreign coalition.
+    /// Kept separately so a complete subset can move to aterm without moving its launcher's
+    /// other work, and an unread subset leaves the coalition explicitly mixed.
+    pub owned_footprint: crate::model::MemoryCharge,
+    /// The current active census or foreign owner identities were incomplete, so the
+    /// coalition's footprint cannot be divided among owners from this sweep.
+    pub footprint_ownership_incomplete: bool,
     /// Its live members in this tick's sweep.
     pub live: u32,
     /// The tabs its live members are in, by key, sorted, when it has live members and all are in
@@ -395,11 +420,109 @@ pub struct CoalRow {
 }
 
 impl CoalRow {
+    /// Partition this instantaneous coalition charge using only its current ownership proof.
+    /// CPU's historical owner and window uncertainty cannot classify current memory.
+    pub(crate) fn footprint_account(&self) -> FootprintAccount {
+        let outside_part = self
+            .footprint_outside
+            .filter(|part| matches!(part, Part::Others | Part::Services));
+        let owner = if self.footprint_aterm {
+            FootprintOwner::Aterm
+        } else if self.owned_footprint.members > 0 {
+            FootprintOwner::Mixed
+        } else {
+            outside_part.map_or(FootprintOwner::Unknown, FootprintOwner::Outside)
+        };
+        let mut account = FootprintAccount {
+            owner,
+            total: self.footprint,
+            outside_part,
+            aterm: Default::default(),
+            outside: Default::default(),
+            unknown: Default::default(),
+            incomplete: false,
+        };
+        if self.footprint == Some(0) {
+            match owner {
+                FootprintOwner::Aterm => account.aterm.add(Some(0)),
+                FootprintOwner::Outside(_) => account.outside.add(Some(0)),
+                _ => account.unknown.add(Some(0)),
+            }
+        } else if self.footprint_ownership_incomplete {
+            account.owner = if self.owned_footprint.members > 0 {
+                FootprintOwner::Mixed
+            } else {
+                FootprintOwner::Unknown
+            };
+            account.unknown.add(self.footprint);
+            account.incomplete = true;
+        } else if self.footprint_aterm {
+            account.aterm.add(self.footprint);
+        } else if self.owned_footprint.members > 0 {
+            let owned = self.owned_footprint;
+            if let Some(total) = self.footprint
+                && owned.unread == 0
+                && owned.bytes <= total
+            {
+                account.aterm.add(Some(owned.bytes));
+                if owned.bytes == total {
+                    account.owner = FootprintOwner::Aterm;
+                } else if outside_part.is_some() && owned.members < self.live {
+                    account.outside.add(Some(total - owned.bytes));
+                } else {
+                    account.unknown.add(Some(total - owned.bytes));
+                    account.incomplete = true;
+                }
+            } else {
+                account.unknown.add(self.footprint);
+                account.incomplete = true;
+            }
+        } else if outside_part.is_some() {
+            account.outside.add(self.footprint);
+        } else {
+            account.unknown.add(self.footprint);
+            account.incomplete = true;
+        }
+        account
+    }
+
     /// Its deferred share, per mille of its QoS buckets ([`Self::qos_mc`]), never past 1000; `None`
     /// where the buckets did not grow.
     #[must_use]
     pub fn deferred_pm(&self) -> Option<u16> {
         deferred_pm(self.deferred_mc, self.qos_mc)
+    }
+}
+
+/// The proved owner of a current coalition footprint, independently of CPU history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FootprintOwner {
+    Aterm,
+    Outside(Part),
+    Mixed,
+    Unknown,
+}
+
+/// One coalition's conserved current charge account. Each known byte appears in one bucket.
+pub(crate) struct FootprintAccount {
+    pub owner: FootprintOwner,
+    pub total: Option<u64>,
+    pub outside_part: Option<Part>,
+    pub aterm: crate::model::MemoryCharge,
+    pub outside: crate::model::MemoryCharge,
+    pub unknown: crate::model::MemoryCharge,
+    pub incomplete: bool,
+}
+
+impl FootprintAccount {
+    pub(crate) fn outside_bytes(&self) -> Option<u64> {
+        if self.total == Some(0) || self.owner == FootprintOwner::Aterm {
+            return Some(0);
+        }
+        if self.incomplete {
+            return None;
+        }
+        self.outside.value()
     }
 }
 
@@ -420,12 +543,15 @@ pub struct CoalSplit {
     /// How it was made.
     pub via: Via,
     /// Whether every coalition was read and every process swept at both ends of the window, so
-    /// every row is measured (`exact`), or not (`heuristic`, as every split by subtraction is).
+    /// every row is measured and every scope's CPU charge is unambiguous (`exact`), or not
+    /// (`heuristic`, as every process-only account is).
     pub exact: bool,
+    /// App and outside scopes are lower bounds because a coalition has mixed or unread owners.
+    pub ownership_incomplete: bool,
     /// Whether the kernel's list of coalitions stopped short at either end of the window
     /// (`cannot what=coalition_list why=truncated`).
     pub list_truncated: bool,
-    /// Coalitions the kernel listed (0 by subtraction).
+    /// Coalitions the kernel listed (0 for a process-only account).
     pub listed: u32,
     /// The machine's busy figure (the cores' own ticks).
     pub global_mc: i64,
@@ -436,22 +562,30 @@ pub struct CoalSplit {
     pub delegated_mc: i64,
     /// The user's other coalitions, less the delegated work.
     pub others_mc: i64,
-    /// Every other coalition, less the delegated work; by subtraction, the busy figure less aterm
-    /// and others, never below 0.
+    /// Every other measured coalition, less the delegated work. By subtraction, only observed
+    /// other-user processes' own CPU; unknown services remain in [`Self::unaccounted_mc`].
     pub services_mc: i64,
     /// What no part holds, signed and never clamped.
     pub unaccounted_mc: i64,
-    /// Each tab's work over the window, by its key ([`TabRoot::tab`]; a tab split into panes is
+    /// Each tab's work over the window, by its key ([`crate::model::TabRoot::tab`]; a tab split into panes is
     /// one), in the host's order: where the reap credit's ledger read both ends of the window
     /// ([`reap`]), its members' own CPU and their reaped children's (finished work included),
     /// else its processes alive at both ends of it; delegated members' live work included.
     pub tabs: Vec<(u64, i64)>,
+    /// Independently observed own CPU for each tab, without any reaped-child charge.
+    pub tab_floors: Vec<(u64, i64)>,
+    /// Tabs whose reaped-counter charge may exceed actual CPU in this window.
+    pub ambiguous_tabs: Vec<u64>,
     /// The same over the window for aterm's processes in no tab (itself, its helpers, what
     /// closed tabs left, and a delegated job's members whose tab closed), so of
     /// [`Self::aterm_mc`] plus [`Self::delegated_mc`], not of aterm's coalitions alone.
     pub own_mc: i64,
-    /// [`Self::aterm_mc`] plus [`Self::delegated_mc`] less every figure
-    /// ([`Self::own_mc`] and [`Self::tabs`]), never below 0: work in no
+    /// Independently observed own CPU outside tabs, millicores.
+    pub own_floor_mc: i64,
+    /// Whether the charge outside tabs may exceed actual CPU.
+    pub own_ambiguous: bool,
+    /// [`Self::aterm_mc`] plus [`Self::delegated_mc`] less every supported actual-CPU figure
+    /// ([`Self::own_actual`] and [`Self::tab_actual_of`]), never below 0: work in no
     /// figure, so in no tab's: with the reap credit, a process that left for
     /// launchd before a sweep read it, a member's tail before launchd reaped
     /// it, the counters' skew; without it, every process not alive at both
@@ -469,7 +603,7 @@ pub struct CoalSplit {
     /// members' times, which the headless run read at 2.70–3.78 ms, each
     /// giving back what the counter fell behind in the windows before (RD
     /// §3.5, §7.3). Rounded once from ns, as [`Self::unattributed_mc`]
-    /// (which reads 0 then); 0 in any other window, and by subtraction.
+    /// (which reads 0 then); 0 in any other window and without coalition counters.
     pub skew_mc: i64,
     /// The tabs, by key, whose figure the reap credit's ledger knows is short of their work over
     /// the window, so only a lower bound however little is [`Self::unattributed_mc`] ([`reap`]'s
@@ -478,9 +612,9 @@ pub struct CoalSplit {
     /// back from a delegated job, a process first read since the last reading. None by
     /// subtraction, which reads no finished work.
     pub short_tabs: Vec<u64>,
-    /// Every listed coalition that answered, busiest first (none by subtraction), rounded as a set
-    /// so they add up to the parts' total (`global_mc - unaccounted_mc`); a part's rows may still
-    /// differ from the part, rounded once, by a millicore or two.
+    /// Every listed coalition that answered, busiest first (none in a process-only account), rounded as a
+    /// set to their measured total. A mixed row retains its raw coalition total, while only
+    /// independently attributed owner floors enter the scope totals.
     pub rows: Vec<CoalRow>,
 }
 
@@ -501,6 +635,52 @@ pub struct Parts {
 }
 
 impl CoalSplit {
+    /// Reconciled counter charge of these tabs, which can still repeat or miss inherited work.
+    #[must_use]
+    pub fn tab_charge_of(&self, panes: &[u64]) -> i64 {
+        self.tabs
+            .iter()
+            .filter(|(k, _)| panes.contains(k))
+            .map(|(_, mc)| *mc)
+            .sum()
+    }
+
+    /// The supported actual-CPU figure: exact charge where unambiguous, otherwise only the
+    /// independently measured own-CPU floor. Charges remain available separately.
+    #[must_use]
+    pub fn tab_actual_of(&self, panes: &[u64]) -> i64 {
+        self.tabs
+            .iter()
+            .filter(|(k, _)| panes.contains(k))
+            .map(|(k, charge)| {
+                let floor = self
+                    .tab_floors
+                    .iter()
+                    .find(|(key, _)| key == k)
+                    .map_or(0, |(_, mc)| *mc);
+                if self.ownership_incomplete
+                    || self.unaccounted_mc > 0
+                    || self.ambiguous_tabs.contains(k)
+                    || floor > *charge
+                {
+                    floor
+                } else {
+                    *charge
+                }
+            })
+            .sum()
+    }
+
+    /// Actual CPU outside tabs, or its independent floor when the charge is ambiguous.
+    #[must_use]
+    pub fn own_actual(&self) -> i64 {
+        if self.ownership_incomplete || self.own_ambiguous || self.own_floor_mc > self.own_mc {
+            self.own_floor_mc
+        } else {
+            self.own_mc
+        }
+    }
+
     /// The parts with tab `tab`'s work (the caller's) out of aterm's: none for no tab or one the
     /// split did not read.
     #[must_use]
@@ -511,12 +691,35 @@ impl CoalSplit {
     /// [`Self::parts`] for the tab whose split panes are the sessions `panes`.
     #[must_use]
     pub fn parts_of(&self, panes: &[u64]) -> Parts {
-        let tab: i64 = self
-            .tabs
-            .iter()
-            .filter(|(k, _)| panes.contains(k))
-            .map(|(_, mc)| *mc)
-            .sum();
+        self.parts_of_coverage(panes, false)
+    }
+
+    /// Owner parts with source coverage that may be incomplete independently of coalition reads.
+    #[must_use]
+    pub fn parts_of_coverage(&self, panes: &[u64], source_incomplete: bool) -> Parts {
+        let tab = self.tab_actual_of(panes);
+        if self.ownership_incomplete || source_incomplete {
+            let tab = self
+                .tab_floors
+                .iter()
+                .filter(|(key, _)| panes.contains(key))
+                .map(|(_, cpu)| *cpu)
+                .sum();
+            let aterm_rest = self.own_floor_mc
+                + self
+                    .tab_floors
+                    .iter()
+                    .filter(|(key, _)| !panes.contains(key))
+                    .map(|(_, cpu)| *cpu)
+                    .sum::<i64>();
+            return Parts {
+                tab,
+                aterm_rest,
+                others: self.others_mc,
+                services: self.services_mc,
+                unaccounted: self.global_mc - tab - aterm_rest - self.others_mc - self.services_mc,
+            };
+        }
         let rest = self.aterm_mc + self.delegated_mc - tab;
         Parts {
             tab,
@@ -543,6 +746,12 @@ pub struct WhyFacts {
     pub split: CoalSplit,
     /// Whether the split tick's sweep stopped at its cap, so a tab's figure may fall short.
     pub procs_truncated: bool,
+    /// Some app/session roots were unproved, or historical native CPU evidence was lost or
+    /// could not be timed. Carried facts retain this CPU gap after identity or source recovery.
+    pub provenance_incomplete: bool,
+    /// Current footprint ownership was unproved at this source reading. Historical CPU
+    /// source loss is separate and does not invalidate a complete later memory census.
+    pub memory_provenance_incomplete: bool,
     /// The machine's timeline, where read.
     pub timeline: Option<TimelineSample>,
     /// When userspace started, unix ms: the earliest birth among the live processes above pid 1
@@ -565,7 +774,7 @@ pub struct WhyFacts {
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fault {
-    /// With the lane on, services takes the positive residual, as the split by subtraction does.
+    /// Falsely charge the positive residual to services instead of preserving unknown work.
     SplitBySubtraction,
     /// The tab's figure is its last sweep's rate (a 1 s window) against the split's window.
     TabOverProcsWindow,
@@ -597,7 +806,7 @@ impl Fault {
     pub const TOLERANCE_MC: i64 = 5;
 
     /// `facts` with this defect in their split by coalition (`snap` the
-    /// snapshot they are of); facts by subtraction as they are.
+    /// snapshot they are of); current process-only facts as they are.
     fn inject(self, mut facts: WhyFacts, snap: &Snapshot) -> WhyFacts {
         let split = &mut facts.split;
         if split.via != Via::Coalitions {
@@ -614,6 +823,7 @@ impl Fault {
                     .iter()
                     .map(|t| (t.key, millicores(t.scope.cores.raw)))
                     .collect();
+                split.tab_floors.clone_from(&split.tabs);
             }
             Self::ChargeSharedLauncher => {
                 for r in &split.rows {
@@ -657,47 +867,95 @@ pub fn leads(members: &[(u32, u64, i64)]) -> Vec<(u64, u32)> {
 }
 
 /// Names `read`'s coalitions in `names` from this tick's sweep `procs` and returns each
-/// coalition's live member count. Each one with a live member takes its part (aterm's when it
-/// holds this instance, `self_pid`, or a tab's shell, so a tab adopted from a predecessor counts;
-/// others' when it holds a process of user `self_uid`; else services) and its lead, with the
-/// identity `identities` hold for that pid and birth.
+/// coalition's live member count. Whole-coalition app ownership requires every active member
+/// to be swept and proved app-owned. A foreign member permanently prevents that claim for this
+/// coalition, even after it exits. Mixed coalitions retain their outside part; the split moves
+/// only independently attributed app work. Lead identities come from `identities`.
 pub fn name(
     names: &mut IdMap<u64, Named>,
     read: &CoalSample,
     procs: &[crate::model::ProcSample],
-    self_pid: u32,
     self_uid: u32,
-    tabs: &[TabRoot],
+    membership: &[Membership],
+    delegated: &[Option<usize>],
     identities: &IdMap<(u32, i64), LeadIdentity>,
 ) -> IdMap<u64, u32> {
-    let roots: IdSet<u32> = std::iter::once(self_pid)
-        .chain(tabs.iter().map(|t| t.shell_pid).filter(|p| *p != 0))
-        .collect();
     let listed: IdSet<u64> = read.rows.iter().map(|r| r.id).collect();
+    let active: IdMap<u64, Option<u64>> = read
+        .rows
+        .iter()
+        .map(|r| (r.id, r.tasks_started.checked_sub(r.tasks_exited)))
+        .collect();
     let mut live: IdMap<u64, u32> = IdMap::default();
     let mut parts: IdMap<u64, Part> = IdMap::default();
+    let mut foreign_parts: IdMap<u64, Part> = IdMap::default();
+    let mut unknown_owners: IdSet<u64> = IdSet::default();
+    let mut foreign: IdSet<u64> = IdSet::default();
+    let mut owned: IdSet<u64> = IdSet::default();
+    let mut app: IdSet<u64> = IdSet::default();
     let mut members = Vec::new();
     let mut born: IdMap<u32, (i64, Option<u32>)> = IdMap::default();
-    for p in procs {
+    for ((p, member), owner) in procs.iter().zip(membership).zip(delegated) {
         let Some(c) = p.coalition else { continue };
         *live.entry(c).or_default() += 1;
-        let part = if roots.contains(&p.pid) {
-            Part::Aterm
-        } else if p.uid == Some(self_uid) {
+        let ours = member.aterm || owner.is_some();
+        if member.aterm || owner.is_some() {
+            app.insert(c);
+        }
+        if ours {
+            owned.insert(c);
+        } else {
+            foreign.insert(c);
+        }
+        let part = if p.uid == Some(self_uid) {
             Part::Others
         } else {
             Part::Services
         };
         let best = parts.entry(c).or_insert(part);
-        if part == Part::Aterm || (part == Part::Others && *best == Part::Services) {
+        if part == Part::Others && *best == Part::Services {
             *best = part;
+        }
+        if !ours {
+            if p.uid.is_none() {
+                unknown_owners.insert(c);
+            }
+            let outside = foreign_parts.entry(c).or_insert(part);
+            if *outside != part {
+                unknown_owners.insert(c);
+            }
+            if part == Part::Others {
+                *outside = part;
+            }
         }
         if let Some(birth) = p.birth_ms {
             members.push((p.pid, c, birth));
             born.insert(p.pid, (birth, p.uid));
         }
     }
-    names.retain(|id, _| listed.contains(id));
+    // An unread listed record cannot erase prior mixed ownership. Coalition IDs are never
+    // reused; forget a name only when a complete answer set proves that coalition gone.
+    if !read.truncated && read.rows.len() == read.listed as usize {
+        names.retain(|id, _| listed.contains(id));
+    }
+    for (c, part) in &mut parts {
+        let named = names.entry(*c).or_default();
+        let was_mixed = named.mixed;
+        named.mixed |= foreign.contains(c);
+        named.has_app |= app.contains(c);
+        named.unknown_owner |= unknown_owners.contains(c);
+        named.outside =
+            foreign_parts
+                .get(c)
+                .copied()
+                .unwrap_or(if was_mixed { named.outside } else { *part });
+        let census = active.get(c).copied().flatten() == Some(u64::from(live[c]));
+        *part = if owned.contains(c) && !named.mixed && census {
+            Part::Aterm
+        } else {
+            named.outside
+        };
+    }
     for (c, pid) in leads(&members) {
         let Some(part) = parts.remove(&c).filter(|_| listed.contains(&c)) else {
             continue;
@@ -717,7 +975,9 @@ pub fn name(
         }
     }
     for (c, part) in parts.into_iter().filter(|(c, _)| listed.contains(c)) {
-        names.insert(c, Named { part, lead: None });
+        let named = names.entry(c).or_default();
+        named.part = part;
+        named.lead = None;
     }
     live
 }
@@ -735,9 +995,10 @@ pub(crate) struct WhyState {
     facts: Option<Arc<WhyFacts>>,
     episodes: Episodes,
     clause: ClauseHold,
-    /// The tabs' and aterm's CPU, live and reaped, read at each whole
-    /// reading while splits are taken ([`reap`]).
+    /// The tabs' and aterm's CPU, live and reaped, read at each whole reading ([`reap`]).
     reap: ReapLedger,
+    /// The last whole reading used by the resource rows' scope histories.
+    scope_base: Option<(u64, ReapTotals, IdMap<crate::delegated::ProcessKey, u64>)>,
     /// Whether a read misread the record's layout ([`misread`]): the lane
     /// stays off for good, since the kernel's layout does not change under a
     /// running process.
@@ -747,7 +1008,258 @@ pub(crate) struct WhyState {
     pub(crate) fault: Option<Fault>,
 }
 
+/// One whole sweep's common-window CPU account, separate from process-live rates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScopeCpu {
+    /// Duration between the two whole readings, nanoseconds.
+    pub window_ns: u64,
+    /// App CPU supported by the matched coalition account, including proved mixed-owner floors.
+    pub app_measured: Option<f64>,
+    /// Whether the measured app total is only a lower bound of app ownership/coverage.
+    pub app_incomplete: bool,
+    /// Non-tab reconciled counter charge, in cores.
+    pub own_charge: f64,
+    /// Non-tab CPU proved by each observed process's own counter, in cores.
+    pub own_floor: f64,
+    /// Whether the non-tab reaped remainder cannot be equated with actual CPU.
+    pub own_ambiguous: bool,
+    /// Whether any contribution was unread or missed in this interval.
+    pub missed: bool,
+    /// Logical tabs, one row per tab key.
+    pub tabs: Vec<ScopeCpuTab>,
+    /// Independently confirmed CPU for each currently open pane. A logical tab can hold
+    /// additional work from a pane that has closed.
+    pub panes: Vec<ScopeCpuPane>,
+}
+
+/// A pane's independently observed own-counter CPU over the common window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScopeCpuPane {
+    /// Pane/session key.
+    pub key: u64,
+    /// Confirmed CPU in cores.
+    pub floor: f64,
+}
+
+/// A logical tab's contribution to the common-window CPU account.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScopeCpuTab {
+    /// Logical tab key.
+    pub key: u64,
+    /// Stable identity assigned by the reap ledger while the logical tab stays open.
+    pub id: u64,
+    /// Reconciled counter charge, in cores.
+    pub charge: f64,
+    /// Proved own-counter CPU, in cores.
+    pub floor: f64,
+    /// Whether inherited reaped-counter charge can include repeated accounting.
+    pub ambiguous: bool,
+    /// Whether the interval missed or could not read some tab work.
+    pub missed: bool,
+}
+
+impl ScopeCpu {
+    /// Actual non-tab CPU supported by this account; a lower bound when ambiguous.
+    #[must_use]
+    pub fn own_actual(&self) -> f64 {
+        if self.own_ambiguous {
+            self.own_floor
+        } else {
+            self.own_charge.max(self.own_floor)
+        }
+    }
+    /// Actual app CPU supported by this account, including every logical tab once.
+    #[must_use]
+    pub fn all_actual(&self) -> f64 {
+        let assigned = self.own_actual() + self.tabs.iter().map(ScopeCpuTab::actual).sum::<f64>();
+        self.app_measured.map_or(assigned, |app| app.max(assigned))
+    }
+    /// App kernel counter charge, which is separate from proved actual CPU.
+    #[must_use]
+    pub fn all_charge(&self) -> f64 {
+        self.own_charge + self.tabs.iter().map(|t| t.charge).sum::<f64>()
+    }
+}
+
+/// Fresh raw facts prepared before the resource rows, explained only after their snapshot is
+/// complete. The coalition baseline advances once for a whole reading.
+pub(crate) struct PreparedWhy {
+    lane: CoalLane,
+    facts: Option<WhyFacts>,
+}
+
+impl PreparedWhy {
+    pub(crate) fn memory_owners(&self) -> Option<crate::model::MemoryOwners> {
+        let facts = self.facts.as_ref().filter(|facts| facts.lane.on())?;
+        Some(crate::model::MemoryOwners::of_coalitions(
+            &facts.split,
+            facts.memory_provenance_incomplete,
+        ))
+    }
+    pub(crate) fn apply_app(&self, s: &Sample, cpu: &mut ScopeCpu) {
+        let Some(facts) = self
+            .facts
+            .as_ref()
+            .filter(|f| f.lane.on() && f.window_ns == cpu.window_ns)
+        else {
+            return;
+        };
+        cpu.app_measured =
+            Some((facts.split.aterm_mc + facts.split.delegated_mc).max(0) as f64 / 1000.0);
+        cpu.app_incomplete = facts.split.ownership_incomplete
+            || facts.split.list_truncated
+            || facts.split.rows.len() < facts.split.listed as usize
+            || facts
+                .split
+                .rows
+                .iter()
+                .any(|row| row.part == Part::Aterm && !row.measured)
+            || s.procs_truncated
+            || s.native_incomplete
+            || s.native_source_lost
+            || s.ownership_incomplete
+            || !s.unproved_tabs.is_empty();
+        let assigned = cpu.own_actual() + cpu.tabs.iter().map(ScopeCpuTab::actual).sum::<f64>();
+        cpu.app_incomplete |= cpu.app_measured.is_some_and(|app| app < assigned);
+    }
+}
+
+impl ScopeCpuTab {
+    /// Actual CPU supported by this account; a lower bound when ambiguous.
+    #[must_use]
+    pub fn actual(&self) -> f64 {
+        if self.ambiguous {
+            self.floor
+        } else {
+            self.charge.max(self.floor)
+        }
+    }
+}
+
 impl WhyState {
+    pub(crate) fn has_pending_native(&self) -> bool {
+        self.reap.has_pending_native()
+    }
+    /// Count finished children before the resource rows append this reading. The explanation
+    /// and the rows share this ledger, so short jobs have the same owner on both surfaces.
+    pub(crate) fn scope_cpu(
+        &mut self,
+        s: &Sample,
+        attribution: Option<(&[Membership], &[Option<usize>])>,
+    ) -> Option<ScopeCpu> {
+        self.step_reap(s, attribution);
+        if !self.reap.stepped_at(s.at_ns) {
+            return None;
+        }
+        if let Some(read) = &s.coalitions {
+            self.reap.retain_coalitions(read);
+        }
+        let now = self.reap.totals();
+        let procs = s.procs.as_deref()?;
+        let counters = procs
+            .iter()
+            .filter_map(|p| {
+                Some((
+                    crate::delegated::ProcessKey {
+                        pid: p.pid,
+                        start: p.start?,
+                    },
+                    p.cpu_ns?,
+                ))
+            })
+            .collect();
+        let (at, base, before) = self.scope_base.replace((s.at_ns, now.clone(), counters))?;
+        let window = s
+            .at_ns
+            .checked_sub(at)
+            .filter(|dt| *dt > 0 && *dt <= WINDOW_MAX_NS)?;
+        let mut extra_own = 0_u64;
+        let mut extra_tabs = IdMap::<u64, u64>::default();
+        let mut extra_panes = IdMap::<u64, u64>::default();
+        let mut extra_missing = IdSet::<Option<u64>>::default();
+        let (members, owners) = attribution?;
+        for ((p, member), owner) in procs.iter().zip(members).zip(owners) {
+            if owner.is_none() {
+                continue;
+            }
+            let tab = member
+                .tab
+                .and_then(|index| s.tabs.get(index))
+                .map(|t| t.tab);
+            let delta = p
+                .start
+                .and_then(|start| before.get(&crate::delegated::ProcessKey { pid: p.pid, start }))
+                .zip(p.cpu_ns)
+                .and_then(|(before, now)| now.checked_sub(*before));
+            if let Some(delta) = delta {
+                if let Some(tab) = tab {
+                    let sum = extra_tabs.entry(tab).or_default();
+                    *sum = sum.saturating_add(delta);
+                    if let Some(pane) = member
+                        .tab
+                        .and_then(|index| s.tabs.get(index))
+                        .map(|root| root.key)
+                    {
+                        let sum = extra_panes.entry(pane).or_default();
+                        *sum = sum.saturating_add(delta);
+                    }
+                } else {
+                    extra_own = extra_own.saturating_add(delta);
+                }
+            } else {
+                extra_missing.insert(tab);
+            }
+        }
+        let tabs: Vec<_> = now
+            .tabs
+            .iter()
+            .map(|tab| {
+                let (cpu, missed) = now.since(&base, tab.key);
+                let (floor, ambiguous) = now.floor_since(&base, tab.key);
+                let extra = extra_tabs.get(&tab.key).copied().unwrap_or(0);
+                ScopeCpuTab {
+                    key: tab.key,
+                    id: tab.id,
+                    charge: cpu.saturating_add(extra) as f64 / window as f64,
+                    floor: floor.saturating_add(extra) as f64 / window as f64,
+                    ambiguous: ambiguous || floor > cpu,
+                    missed: missed || extra_missing.contains(&Some(tab.key)),
+                }
+            })
+            .collect();
+        let panes = s
+            .tabs
+            .iter()
+            .map(|pane| ScopeCpuPane {
+                key: pane.key,
+                floor: now
+                    .pane_floor_since(&base, pane.key)
+                    .saturating_add(extra_panes.get(&pane.key).copied().unwrap_or(0))
+                    as f64
+                    / window as f64,
+            })
+            .collect();
+        let raw_tabs = now.tabs.iter().fold(0_u64, |sum, t| {
+            sum.saturating_add(now.since(&base, t.key).0)
+        });
+        let (own_floor, own_ambiguous) = now.own_floor_since(&base);
+        let own_charge = now.all.saturating_sub(base.all).saturating_sub(raw_tabs);
+        Some(ScopeCpu {
+            window_ns: window,
+            app_measured: None,
+            app_incomplete: true,
+            own_charge: own_charge.saturating_add(extra_own) as f64 / window as f64,
+            own_floor: own_floor.saturating_add(extra_own) as f64 / window as f64,
+            own_ambiguous: own_ambiguous || own_floor > own_charge,
+            missed: now.missed > base.step
+                || !extra_missing.is_empty()
+                || s.ownership_incomplete
+                || s.native_source_lost,
+            tabs,
+            panes,
+        })
+    }
+
     /// The lane sample `s` reads under: its host's word, or `Off` once a read misread the layout.
     pub(crate) fn lane(&self, s: &Sample) -> CoalLane {
         if s.coal_lane.on() && self.misread {
@@ -757,25 +1269,41 @@ impl WhyState {
         }
     }
 
-    /// The facts snapshot `snap` (of sample `s`) carries: new ones for a split tick with a window,
-    /// else the last ones.
-    pub(crate) fn absorb(
+    /// Capture counters before Rows without requiring a partly built Snapshot.
+    pub(crate) fn prepare(
         &mut self,
         s: &Sample,
-        snap: &Snapshot,
         attribution: Option<(&[Membership], &[Option<usize>])>,
-    ) -> Option<Arc<WhyFacts>> {
+    ) -> PreparedWhy {
         self.misread = self.misread || (s.coal_lane.on() && misread(s));
         let lane = self.lane(s);
         if !lane.on() {
             self.episodes = Episodes::default();
             self.clause = ClauseHold::default();
         }
-        self.step_reap(s, lane, attribution);
-        let fresh = match s.coal_lane {
-            CoalLane::On if self.misread => by_subtraction(s, snap, CoalLane::Off),
-            CoalLane::On => self.by_coalitions(s, attribution),
-            lane => by_subtraction(s, snap, lane),
+        if !self.reap.stepped_at(s.at_ns) {
+            self.step_reap(s, attribution);
+        }
+        let facts = lane
+            .on()
+            .then(|| self.by_coalitions(s, attribution))
+            .flatten();
+        PreparedWhy { lane, facts }
+    }
+
+    /// Finish causes and episodes using the complete snapshot, reusing this reading's already
+    /// prepared coalition facts rather than advancing their baseline a second time.
+    pub(crate) fn finish(
+        &mut self,
+        s: &Sample,
+        snap: &Snapshot,
+        prepared: PreparedWhy,
+    ) -> Option<Arc<WhyFacts>> {
+        let lane = prepared.lane;
+        let fresh = if lane.on() {
+            prepared.facts
+        } else {
+            by_subtraction(s, snap, lane)
         };
         match fresh {
             Some(facts) => {
@@ -805,40 +1333,31 @@ impl WhyState {
         self.facts.clone()
     }
 
-    /// Steps the reap credit's ledger on sample `s`'s sweep: on a split
-    /// tick, and on every whole reading between split ticks under 60 s
-    /// apart, so a member is seen as soon as a sweep can see it; never with
-    /// the lane off, where no split reads it.
-    fn step_reap(
-        &mut self,
-        s: &Sample,
-        lane: CoalLane,
-        attribution: Option<(&[Membership], &[Option<usize>])>,
-    ) {
+    /// Steps the shared CPU ledger on each whole sweep, independently of the coalition lane.
+    fn step_reap(&mut self, s: &Sample, attribution: Option<(&[Membership], &[Option<usize>])>) {
+        self.reap
+            .ingest_terminals(&s.native_terminals, s.native_incomplete);
         let (Some(procs), Some(uid), Some((members, owners))) =
             (s.procs.as_deref(), s.self_uid, attribution)
         else {
             return;
         };
-        let taking = s.coalitions.is_some()
-            || self
-                .base
-                .as_ref()
-                .is_some_and(|b| s.at_ns.saturating_sub(b.at_ns) <= WINDOW_MAX_NS);
-        if !lane.on() || !taking {
-            return;
-        }
         let delegated: Vec<bool> = owners.iter().map(Option::is_some).collect();
-        self.reap.step(&reap::StepIn {
-            at_ns: s.at_ns,
-            at_unix_ms: s.at_unix_ms,
-            procs,
-            members,
-            delegated: &delegated,
-            tabs: &s.tabs,
-            self_uid: uid,
-            truncated: s.procs_truncated,
-        });
+        self.reap.step_with_terminals(
+            &reap::StepIn {
+                at_ns: s.at_ns,
+                at_unix_ms: s.at_unix_ms,
+                cpu_cut: s.native_cpu_cut,
+                procs,
+                members,
+                delegated: &delegated,
+                tabs: &s.tabs,
+                self_uid: uid,
+                truncated: s.procs_truncated,
+            },
+            &s.native_terminals,
+            s.native_incomplete,
+        );
     }
 
     /// `facts` with the causes that hold over their window, the episodes
@@ -900,12 +1419,24 @@ impl WhyState {
             &mut self.names,
             read,
             procs,
-            s.self_pid,
             uid,
-            &s.tabs,
+            attribution?.0,
+            attribution?.1,
             &self.identities,
         );
-        let mut now = CoalBase::of(s, read, procs, uid)?;
+        let mut now = CoalBase::of(s, read, procs)?;
+        now.exclusive = read
+            .rows
+            .iter()
+            .filter(|row| {
+                self.names
+                    .get(&row.id)
+                    .is_some_and(|named| named.part == Part::Aterm)
+                    && row.tasks_started.checked_sub(row.tasks_exited)
+                        == Some(u64::from(live.get(&row.id).copied().unwrap_or(0)))
+            })
+            .map(|row| row.id)
+            .collect();
         now.reap = self.reap.stepped_at(s.at_ns).then(|| self.reap.totals());
         let base = self.base.replace(now)?;
         let now = self.base.as_ref()?;
@@ -932,6 +1463,13 @@ impl WhyState {
             lane: CoalLane::On,
             split,
             procs_truncated: s.procs_truncated,
+            provenance_incomplete: s.native_incomplete
+                || s.native_source_lost
+                || s.ownership_incomplete
+                || !s.unproved_tabs.is_empty(),
+            memory_provenance_incomplete: s.native_incomplete
+                || s.ownership_incomplete
+                || !s.unproved_tabs.is_empty(),
             timeline: s.timeline.clone(),
             userspace_ms: userspace_ms(s),
             self_uid: Some(uid),
@@ -960,17 +1498,60 @@ fn misread(s: &Sample) -> bool {
     mem.total > 0 && held > room.saturating_mul(MISREAD_X)
 }
 
-/// The facts of the snapshot's own split by subtraction, for snapshot `snap`
+/// The facts of the snapshot's own process account, for snapshot `snap`
 /// (of sample `s`) with the lane `lane`; `None` without a split.
 fn by_subtraction(s: &Sample, snap: &Snapshot, lane: CoalLane) -> Option<WhyFacts> {
     let built = snap.split?;
+    let mut split = CoalSplit::by_subtraction(&built, &snap.tabs, &s.tabs);
+    if let Some(cpu) = &snap.scoped_cpu {
+        split.aterm_mc = (cpu.all_actual() * 1000.0).floor() as i64;
+        split.own_mc = (cpu.own_charge * 1000.0).round() as i64;
+        split.own_floor_mc = (cpu.own_floor * 1000.0).floor() as i64;
+        split.own_ambiguous = cpu.own_ambiguous;
+        split.tabs = cpu
+            .tabs
+            .iter()
+            .map(|t| (t.key, (t.charge * 1000.0).round() as i64))
+            .collect();
+        split.tab_floors = cpu
+            .tabs
+            .iter()
+            .map(|t| (t.key, (t.floor * 1000.0).floor() as i64))
+            .collect();
+        split.ambiguous_tabs = cpu
+            .tabs
+            .iter()
+            .filter(|t| t.ambiguous)
+            .map(|t| t.key)
+            .collect();
+        split.short_tabs = cpu
+            .tabs
+            .iter()
+            .filter(|t| t.missed || cpu.missed)
+            .map(|t| t.key)
+            .collect();
+    }
+    // Unknown services and app work stay in the residual. Only independently observed
+    // other-user process CPU belongs to the services floor.
+    split.unaccounted_mc = split.global_mc - split.aterm_mc - split.others_mc - split.services_mc;
     Some(WhyFacts {
         at_ns: snap.at_ns,
         at_unix_ms: snap.at_unix_ms,
-        window_ns: snap.procs_window_ns?,
+        window_ns: snap
+            .scoped_cpu
+            .as_ref()
+            .map(|cpu| cpu.window_ns)
+            .or(snap.procs_window_ns)?,
         lane,
-        split: CoalSplit::by_subtraction(&built, &snap.tabs, &s.tabs),
+        split,
         procs_truncated: snap.procs_truncated,
+        provenance_incomplete: s.native_incomplete
+            || s.native_source_lost
+            || s.ownership_incomplete
+            || !s.unproved_tabs.is_empty(),
+        memory_provenance_incomplete: s.native_incomplete
+            || s.ownership_incomplete
+            || !s.unproved_tabs.is_empty(),
         timeline: s.timeline.clone(),
         userspace_ms: userspace_ms(s),
         self_uid: s.self_uid,

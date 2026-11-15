@@ -1080,8 +1080,7 @@ pub(crate) const fn containment_word(mode: aterm_containment::ContainmentMode) -
     }
 }
 
-/// The kqueue every product watch registers on (named apart: the lazy-init census merges cells by
-/// name).
+/// The kqueue every product watch registers on.
 #[cfg(unix)]
 static WAKE_WATCHER: std::sync::LazyLock<Option<aterm_uds::nofollow::Watcher>> =
     std::sync::LazyLock::new(|| aterm_uds::nofollow::Watcher::new().ok());

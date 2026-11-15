@@ -20,7 +20,6 @@ struct Rig {
 }
 
 impl Rig {
-    /// Named `rigged` rather than `new` so the lock-order census does not treat every `new` as acquiring `term`.
     fn rigged() -> Self {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);

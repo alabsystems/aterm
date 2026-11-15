@@ -22,6 +22,8 @@ aterm-durable = { workspace = true }
 
 # O_NOFOLLOW on the journal and its lock so a planted symlink is refused at open.
 [target.'cfg(unix)'.dependencies]
+# Bounded, atomic journal-history witnesses and their random incarnation.
+aterm-uds = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]

@@ -396,7 +396,7 @@ mod apple_test {
     #[test]
     fn every_spawn_waits_for_a_creation_in_flight() {
         type Spawn = fn() -> std::io::Result<()>;
-        let paths: [(&str, Spawn); 4] = [
+        let paths: [(&str, Spawn); 5] = [
             ("spawnfd::command", || {
                 crate::spawnfd::command("/usr/bin/true").status().map(drop)
             }),
@@ -411,6 +411,14 @@ mod apple_test {
                     .stdout(crate::spawnfd::ChildStdio::Null)
                     .stderr(crate::spawnfd::ChildStdio::Null);
                 crate::spawnfd::spawn(lane)?.wait().map(drop)
+            }),
+            ("spawn_lock::spawn_std", || {
+                use crate::spawnfd::InheritNothing as _;
+                let mut command = std::process::Command::new("/usr/bin/true");
+                command.inherit_nothing();
+                crate::spawn_lock::spawn_std(&mut command, &[])?
+                    .wait()
+                    .map(drop)
             }),
             ("pspawn::spawn_cloexec_default", || {
                 let pid = crate::pspawn::spawn_cloexec_default("/usr/bin/true", &[])?;
@@ -539,6 +547,93 @@ mod apple_test {
             0,
             "the unmarked one left as it was"
         );
+    }
+
+    /// A std spawn ([`crate::spawn_lock::spawn_std`]) holds the lock across its fork alone, not
+    /// across its child's `exec`, which std's parent waits for: while the child is held before
+    /// its `exec`, an `accept` on another thread (a creation, which holds the lock exclusively)
+    /// completes. Meanwhile the descriptors the spawn hands its child, kept out of every other
+    /// fork, reach it and have their marks back in this process. Held across the whole
+    /// `command.spawn()`, as every std spawn site did, the `accept` waits for the child's `exec`:
+    /// under load, seconds of every listener of this process answering nothing.
+    #[test]
+    fn an_accept_completes_while_a_std_spawns_child_waits_before_its_exec() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixListener;
+        use std::os::unix::process::CommandExt as _;
+        // The child says it has forked on `tell`, then waits for the test on `go` before its
+        // exec; both ends it uses are kept out of children and handed to this spawn alone.
+        let (mut told, tell) = crate::pipe().expect("a tell pipe");
+        let (go_end, mut go) = crate::pipe().expect("a go pipe");
+        let (tell_fd, go_fd) = (tell.as_raw_fd(), go_end.as_raw_fd());
+        let mut command = std::process::Command::new("/usr/bin/true");
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: the hook runs in the forked child before its exec and makes one `write` and
+        // one `read` of a stack byte on two descriptors open across the fork; it allocates
+        // nothing and takes no lock.
+        unsafe {
+            command.pre_exec(move || {
+                let mut byte = b'f';
+                if libc::write(tell_fd, std::ptr::addr_of!(byte).cast(), 1) != 1
+                    || libc::read(go_fd, std::ptr::addr_of_mut!(byte).cast(), 1) != 1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let spawner = std::thread::spawn(move || {
+            let spawned = crate::spawn_lock::spawn_std(&mut command, &[tell_fd, go_fd]);
+            drop((tell, go_end));
+            spawned
+        });
+        let mut forked = [0u8];
+        told.read_exact(&mut forked)
+            .expect("the child forked holding the descriptor handed to it");
+
+        let root = aterm_tempfile::tempdir().expect("a folder");
+        let path = root.path().join("accept.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let _client = UnixStream::connect(&path).expect("connect");
+        let (accepted_tx, accepted) = mpsc::channel();
+        let acceptor = std::thread::spawn(move || {
+            let answer = crate::accept(
+                &listener,
+                crate::AcceptWait::Forever,
+                crate::AcceptedMode::Blocking,
+            )
+            .map(drop);
+            accepted_tx.send(answer).expect("the test listens");
+        });
+        let answer = accepted.recv_timeout(HANG);
+        let marks = [tell_fd, go_fd].map(|fd| {
+            // SAFETY: `F_GETFD` reads one descriptor's flags; the spawner holds both open until
+            // its spawn returns, which waits for `go`.
+            unsafe { libc::fcntl(fd, libc::F_GETFD) & FD_CLOFORK }
+        });
+        go.write_all(b"g").expect("let the child exec");
+        let child = spawner.join().expect("the spawner");
+        acceptor.join().expect("the acceptor");
+        answer
+            .expect("the accept completes while the spawn's child waits before its exec")
+            .expect("a connection");
+        let expected = if super::clofork_supported() {
+            FD_CLOFORK
+        } else {
+            0
+        };
+        assert_eq!(
+            marks, [expected; 2],
+            "each handed descriptor has its supported mark back once the fork has returned"
+        );
+        let status = child
+            .expect("the child execs")
+            .wait()
+            .expect("reap the child");
+        assert!(status.success(), "{status}");
     }
 
     /// Wait until `spawner` waits in [`crate::spawn_lock::spawning`] while `holder` holds the lock

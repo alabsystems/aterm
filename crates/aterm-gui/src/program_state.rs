@@ -225,15 +225,17 @@ fn starts_a_turn(before: Option<ProgramState>, after: Option<ProgramState>) -> b
 
 /// Whether a report naming `app` is honoured under the program in front, its published name
 /// (`program=`): a `codex` report under a codex (or a script runtime one runs under, as an npm
-/// install does), a `grok-build` report under a Grok Build, and nothing else. A report is the
-/// claim of the program it names, so one never stands for another program in front.
+/// install does), a `grok-build` report under a Grok Build, and a `claude-code` report under
+/// Claude Code. A report is the claim of the program it names, so one never stands for
+/// another program in front.
 pub(crate) fn honoured_for(program: Option<&str>, app: Option<ProgramApp>) -> bool {
     use aterm_phase::Program;
     let (Some(name), Some(app)) = (program, app) else {
         return false;
     };
     match (aterm_phase::program_of(name), app) {
-        (Some(Program::Codex), ProgramApp::Codex)
+        (Some(Program::Claude), ProgramApp::ClaudeCode)
+        | (Some(Program::Codex), ProgramApp::Codex)
         | (Some(Program::Grok), ProgramApp::GrokBuild) => true,
         (None, ProgramApp::Codex) => aterm_phase::may_host_agent(name),
         (
@@ -247,7 +249,7 @@ pub(crate) fn honoured_for(program: Option<&str>, app: Option<ProgramApp>) -> bo
                 | Program::Muse,
             )
             | None,
-            ProgramApp::Codex | ProgramApp::GrokBuild,
+            ProgramApp::ClaudeCode | ProgramApp::Codex | ProgramApp::GrokBuild,
         ) => false,
     }
 }
@@ -280,6 +282,11 @@ pub(crate) fn column(shown: Option<crate::session_timeline::ShownProgram>) -> St
 pub(crate) const fn row_word(state: ProgramState) -> &'static str {
     use aterm_core::terminal::program_state::ProgramStateWord as W;
     match (state.app, state.state) {
+        (ProgramApp::ClaudeCode, W::Idle) => "claude idle",
+        (ProgramApp::ClaudeCode, W::Working) => "claude working",
+        (ProgramApp::ClaudeCode, W::Blocked) => "claude blocked",
+        (ProgramApp::ClaudeCode, W::Done) => "claude done",
+        (ProgramApp::ClaudeCode, W::Error) => "claude error",
         (ProgramApp::Codex, W::Idle) => "codex idle",
         (ProgramApp::Codex, W::Working) => "codex working",
         (ProgramApp::Codex, W::Blocked) => "codex blocked",

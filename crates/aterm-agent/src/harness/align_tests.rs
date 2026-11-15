@@ -260,7 +260,6 @@ fn shell(line: &str) -> Command {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt as _;
         let mut cmd = aterm_uds::spawnfd::command("cmd.exe");
         cmd.args(["/D", "/C"]).raw_arg(line);
         cmd

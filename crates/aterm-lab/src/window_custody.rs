@@ -103,13 +103,14 @@ struct Receipt {
     lane: (u64, u64),
     memory: crate::window_guards::MemoryObservation,
     route: Route,
+    generation: Option<crate::band::Generation>,
     job: Option<String>,
 }
 
 impl Receipt {
     fn text(&self) -> String {
         format!(
-            "aterm-lab-window-custody/3\nworld={}\nsocket={}\nowner={}\nkeeper={}\ngui={}\nlane-dev={}\nlane-ino={}\nmemory-claim={}\nmemory-dev={}\nmemory-ino={}\nmemory-bytes={}\nmemory-pid={}\nmemory-start={}\nmemory-sequence={}\nroute={}\njob={}\n",
+            "aterm-lab-window-custody/4\nworld={}\nsocket={}\nowner={}\nkeeper={}\ngui={}\nlane-dev={}\nlane-ino={}\nmemory-claim={}\nmemory-dev={}\nmemory-ino={}\nmemory-bytes={}\nmemory-pid={}\nmemory-start={}\nmemory-sequence={}\nroute={}\njob-generation={}\njob={}\n",
             self.world.display(),
             self.socket.display(),
             self.owner.token(),
@@ -125,13 +126,16 @@ impl Receipt {
             self.memory.start_ms,
             self.memory.sequence,
             self.route.name(),
+            self.generation
+                .as_ref()
+                .map_or("none", crate::band::Generation::word),
             self.job.as_deref().unwrap_or("none")
         )
     }
     fn parse(bytes: &[u8]) -> Result<Self, String> {
         let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
         let lines: Vec<_> = text.lines().collect();
-        if lines.len() != 17 || lines[0] != "aterm-lab-window-custody/3" {
+        if lines.len() != 18 || lines[0] != "aterm-lab-window-custody/4" {
             return Err("invalid custody receipt envelope".into());
         }
         let field = |index: usize, name: &str| {
@@ -172,7 +176,11 @@ impl Receipt {
                 sequence: number(14, "memory-sequence=")?,
             },
             route: Route::parse(field(15, "route=")?)?,
-            job: match field(16, "job=")? {
+            generation: match field(16, "job-generation=")? {
+                "none" => None,
+                generation => Some(crate::band::Generation::parse(generation)?),
+            },
+            job: match field(17, "job=")? {
                 "none" => None,
                 job => Some(job.to_owned()),
             },
@@ -198,11 +206,14 @@ impl Receipt {
                     self.memory.start_ms, self.memory.pid, self.memory.sequence
                 )
             || match self.route {
-                Route::Child => self.job.is_some(),
-                Route::AppBand => {
+                Route::Child => self.job.is_some() || self.generation.is_some(),
+                Route::AppBand => self.generation.as_ref().is_none_or(|generation| {
                     self.job.as_deref()
-                        != Some(crate::band::label_for(&self.world, self.memory.pid).as_str())
-                }
+                        != Some(
+                            crate::band::label_for(&self.world, self.memory.pid, generation)
+                                .as_str(),
+                        )
+                }),
             }
         {
             return Err(
@@ -426,12 +437,25 @@ struct OwnedHelper {
 struct OwnedJob {
     world: PathBuf,
     owner: u32,
+    generation: crate::band::Generation,
     label: String,
 }
 
 impl OwnedJob {
     fn remove(&self) -> Result<(), String> {
-        crate::band::remove_owned_for_qualification(&self.world, self.owner, &self.label)
+        crate::band::remove_owned_for_qualification(
+            &self.world,
+            self.owner,
+            &self.generation,
+            &self.label,
+        )
+    }
+
+    fn matches(&self, receipt: &Receipt) -> bool {
+        receipt.world == self.world
+            && u32::try_from(receipt.owner.pid).ok() == Some(self.owner)
+            && receipt.generation.as_ref() == Some(&self.generation)
+            && receipt.job.as_deref() == Some(self.label.as_str())
     }
 }
 
@@ -525,6 +549,7 @@ fn run_app_band(args: &Args, cut_keeper: bool) -> Result<(), String> {
         lane: file_identity(&lane_file()?)?,
         memory: instance.memory_for_qualification()?,
         route: Route::AppBand,
+        generation: instance.qualification_job_generation().cloned(),
         job: instance.qualification_job_label().map(str::to_owned),
     };
     receipt.validate()?;
@@ -583,21 +608,30 @@ fn qualify(args: &Args) -> Result<(), String> {
     // start a window, so a malformed/missing readiness record cannot lose cleanup.
     let mut world = prepare_world(&out)?;
     let log = crate::util::create_stdio_file(&out.join("owner.log")).map_err(|e| e.to_string())?;
-    let child = spawnfd::command(std::env::current_exe().map_err(|e| e.to_string())?)
+    let generation = (args.route == Route::AppBand)
+        .then(crate::band::Generation::fresh)
+        .transpose()?;
+    let mut command = spawnfd::command(std::env::current_exe().map_err(|e| e.to_string())?);
+    command
         .args(["window-custody-owner", "--aterm"])
         .arg(&args.aterm)
         .arg("--out")
         .arg(&out)
-        .args(["--band", args.route.name()])
+        .args(["--band", args.route.name()]);
+    if let Some(generation) = &generation {
+        command.args(["--job-generation", generation.word()]);
+    }
+    let child = command
         .stdin(Stdio::null())
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
         .stderr(log)
         .spawn()
         .map_err(|e| e.to_string())?;
-    let job = (args.route == Route::AppBand).then(|| OwnedJob {
+    let job = generation.map(|generation| OwnedJob {
         world: world.dir.clone(),
         owner: child.id(),
-        label: crate::band::label_for(&world.dir, child.id()),
+        label: crate::band::label_for(&world.dir, child.id(), &generation),
+        generation,
     });
     let mut helper = OwnedHelper {
         child,
@@ -620,6 +654,10 @@ fn qualify(args: &Args) -> Result<(), String> {
         || receipt.owner.pid != owner_pid
         || receipt.route != args.route
         || receipt.world != world.dir
+        || helper
+            .job
+            .as_ref()
+            .is_some_and(|job| !job.matches(&receipt))
     {
         return Err("receipt did not come from the original owned helper identity".into());
     }
@@ -656,7 +694,12 @@ fn qualify(args: &Args) -> Result<(), String> {
     if let Some(job) = &helper.job {
         // Observe the real one-use restart retiring its own job while the GUI must
         // remain alive. Explicit bootout here could hide the lifecycle under test.
-        crate::band::await_owned_absent_for_qualification(&job.world, job.owner, &job.label)?;
+        crate::band::await_owned_absent_for_qualification(
+            &job.world,
+            job.owner,
+            &job.generation,
+            &job.label,
+        )?;
         aterm_uds::private_file::write_private(
             &out,
             "job-automatically-absent",
@@ -750,11 +793,21 @@ fn qualify(args: &Args) -> Result<(), String> {
 /// # Errors
 /// A private fixture, admission, actual native identity, controlled crash or acknowledgement fails.
 pub fn owner(args: &[String]) -> Res {
-    let args = Args::parse(args, Route::Child)?;
-    run_owner(&args).map(|()| 0).map_err(Fail::die)
+    let mut args = args.to_vec();
+    let generation = instance::take_value(&mut args, "--job-generation")?
+        .map(|word| crate::band::Generation::parse(&word))
+        .transpose()
+        .map_err(Fail::usage)?;
+    let args = Args::parse(&args, Route::Child)?;
+    if (args.route == Route::AppBand) != generation.is_some() {
+        return Err(Fail::usage(
+            "owner route and its original job generation differ",
+        ));
+    }
+    run_owner(&args, generation).map(|()| 0).map_err(Fail::die)
 }
 
-fn run_owner(args: &Args) -> Result<(), String> {
+fn run_owner(args: &Args, generation: Option<crate::band::Generation>) -> Result<(), String> {
     aterm_uds::private_file::check_private_dir(&args.out).map_err(|e| e.to_string())?;
     let bytes = read_record(&args.out, "world.txt")?
         .ok_or("original controller did not prepare its world")?;
@@ -763,7 +816,7 @@ fn run_owner(args: &Args) -> Result<(), String> {
         .strip_suffix('\n')
         .ok_or("invalid original world locator")?;
     let world = World::open_at(Path::new(path))?;
-    let mut instance = Instance::start_retained_functional_in(
+    let mut instance = Instance::start_retained_functional_generation(
         &world,
         Launch {
             aterm: args.aterm.clone(),
@@ -781,6 +834,7 @@ fn run_owner(args: &Args) -> Result<(), String> {
         },
         MEMORY,
         args.route.band(),
+        generation,
     )?;
     instance
         .await_socket(HANG)
@@ -798,6 +852,7 @@ fn run_owner(args: &Args) -> Result<(), String> {
         lane: file_identity(&lane_file()?)?,
         memory: instance.memory_for_qualification()?,
         route: args.route,
+        generation: instance.qualification_job_generation().cloned(),
         job: instance.qualification_job_label().map(str::to_owned),
     };
     receipt.validate()?;

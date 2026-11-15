@@ -18,6 +18,7 @@ use crate::release::{
 };
 use crate::release_steps::Real;
 
+mod allowance;
 mod distribution;
 mod host_fit;
 mod open_next;
@@ -36,18 +37,11 @@ const FIX2: &str = "2222222222222222222222222222222222222222";
 const N2: &str = "3333333333333333333333333333333333333333";
 const N3: &str = "4444444444444444444444444444444444444444";
 
-fn passed_binary(spec: &str, executable: &str) -> Binary {
+fn binary_row(spec: &str, outcome: &str) -> Binary {
     Binary {
         spec: spec.into(),
-        sha256: executable.into(),
-        outcome: "ok".into(),
-        content_key: Some("cc".repeat(32)),
-        inputs_bounded: true,
-        input_reason: None,
-        json: Some(false),
+        outcome: outcome.into(),
         execution_s: 1.25,
-        key_parts: std::collections::BTreeMap::new(),
-        origin_run: None,
     }
 }
 
@@ -119,6 +113,10 @@ struct World {
     /// or a judgment this Mac could not make.
     shim_finding: Option<InputFinding>,
     fleet_refusal: Option<String>,
+    /// What the line's record says a claim would be told now, before anything is run, and how
+    /// often it was asked.
+    fleet_contender_refusal: Option<String>,
+    fleet_contender_asked: usize,
     fleet_panics: bool,
     supersede_preflight_refusal: Option<Refusal>,
     supersede_unknown_once: bool,
@@ -166,8 +164,6 @@ struct World {
     /// Each check's record, by R's commit (its tree here), the executable for the bundle's
     /// `measure` (`None` for a tree check), and the check: its outcome word.
     records: BTreeMap<(String, Option<String>, String), &'static str>,
-    /// The test binaries a test record that did not pass lists as passed.
-    resume: Vec<Binary>,
     /// What the fake `verify release` records for a check it is asked to run, over
     /// `verify_passes` (every asked check ok, else nothing).
     verify_outcomes: BTreeMap<&'static str, &'static str>,
@@ -283,6 +279,10 @@ struct World {
     after_appkit: Option<fn(&mut World)>,
     /// What the world does once a stage to the engine ends.
     after_stage: Option<fn(&mut World)>,
+    /// What the next stages that push answer before a stage behaves as usual, first first.
+    stage_answers: std::collections::VecDeque<Ran>,
+    /// What the next `publish_begin`s refuse with, first first.
+    publish_begin_refusals: std::collections::VecDeque<Refusal>,
     /// What the world does while the release next sleeps (an owner wait).
     after_sleep: Option<fn(&mut World)>,
     /// Tags in this clone only (a leftover).
@@ -458,6 +458,8 @@ impl World {
             sync_input_finding: None,
             shim_finding: None,
             fleet_refusal: None,
+            fleet_contender_refusal: None,
+            fleet_contender_asked: 0,
             fleet_panics: false,
             supersede_preflight_refusal: None,
             supersede_unknown_once: false,
@@ -506,7 +508,6 @@ impl World {
             cut: None,
             attested: None,
             records: BTreeMap::new(),
-            resume: Vec::new(),
             verify_outcomes: BTreeMap::new(),
             verify_runs: Vec::new(),
             tail: 1_791_500_000,
@@ -572,6 +573,8 @@ impl World {
             after_verify: None,
             after_appkit: None,
             after_stage: None,
+            stage_answers: std::collections::VecDeque::new(),
+            publish_begin_refusals: std::collections::VecDeque::new(),
             after_sleep: None,
             local_tags: BTreeSet::new(),
             real: None,
@@ -671,8 +674,7 @@ impl World {
         self.engine_awaits_draft = false;
         self.sign_ran = false;
         let _ = std::fs::remove_file(self.dir.path().join("publish-entered"));
-        let home = self.dir.path().to_path_buf();
-        let outcome = run_with(self, &args, &home);
+        let outcome = run_with(self, &args);
         (outcome.code, outcome.last)
     }
 
@@ -732,7 +734,6 @@ impl World {
                 let measure = check == aterm_verify::checks::Check::Measure;
                 if measure && executable.is_none() {
                     return State::Missing {
-                        resume: Vec::new(),
                         lint_resume: Vec::new(),
                         appkit_resume: Vec::new(),
                     };
@@ -741,7 +742,6 @@ impl World {
                     Some("ok") => State::Passed,
                     Some("FAIL") => State::Failed { log: log.clone() },
                     _ => State::Missing {
-                        resume: self.resume.clone(),
                         lint_resume: Vec::new(),
                         appkit_resume: Vec::new(),
                     },
@@ -1400,6 +1400,11 @@ impl World {
             .into(),
         );
         assert!(!self.stage_panics, "a bug in the release");
+        if target == StageTarget::Remote
+            && let Some(answer) = self.stage_answers.pop_front()
+        {
+            return Ok(answer);
+        }
         if self.stage_stages {
             if target == StageTarget::Local {
                 if let Some(then) = self.after_stage {
@@ -1628,6 +1633,14 @@ impl Backend for World {
             .filter(|line| line.version == version);
         Ok(line)
     }
+    fn fleet_contender_refusal(
+        &mut self,
+        _version: &str,
+        _continued: bool,
+    ) -> Result<Option<String>, String> {
+        self.fleet_contender_asked += 1;
+        Ok(self.fleet_contender_refusal.clone())
+    }
     fn fleet_holder(&mut self, _head: &str) -> Option<String> {
         Some("m3 (node fixture-m3, session cut-193, pid 193, boot fixture, start 123)".into())
     }
@@ -1657,6 +1670,14 @@ impl Backend for World {
     fn fleet_audit(&mut self) -> Result<(), String> {
         self.fleet_audits += 1;
         self.fleet_audited_after.push(self.calls.len());
+        if self.fleet_audit_refusal {
+            Err("fleet line was adopted".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn fleet_wait(&mut self, what: &str) -> Result<(), String> {
+        self.calls.push(format!("fleet-wait {what}"));
         if self.fleet_audit_refusal {
             Err("fleet line was adopted".into())
         } else {
@@ -1742,7 +1763,7 @@ impl Backend for World {
     fn cleared_env(&mut self) -> Vec<String> {
         Vec::new()
     }
-    fn machine(&mut self, _creds: &Path, _explicit: bool) -> (String, Vec<Refusal>) {
+    fn machine(&mut self, _creds: Option<&Path>) -> (String, Vec<Refusal>) {
         self.observations.push("machine");
         ("m3".into(), self.machine_refusals.clone())
     }
@@ -2232,7 +2253,7 @@ impl Backend for World {
     fn cut_gates(
         &mut self,
         _c: &Candidate,
-        _creds: &Path,
+        _creds: Option<&Path>,
         kind: crate::publish::CutKind,
     ) -> Vec<Refusal> {
         self.calls.push("cut-gates".into());
@@ -2360,6 +2381,9 @@ impl Backend for World {
         self.export(c, target)
     }
     fn publish_begin(&mut self, _p: &Prover) -> Result<(), Refusal> {
+        if let Some(refusal) = self.publish_begin_refusals.pop_front() {
+            return Err(refusal);
+        }
         self.source_runs = true;
         // A signal that came during step 7's checks, after the step's own entry.
         self.interrupt_at("publish-begin");
@@ -2427,7 +2451,12 @@ impl Backend for World {
         _candidate: &Candidate,
         _reserved: Option<&Reservation>,
     ) -> Ran {
-        self.calls.push(format!("cut {}", args[3..].join(" ")));
+        // `cut`, then `--release-credentials <file>` only where the operator named one.
+        let rest = match &args[1..] {
+            [flag, _, rest @ ..] if flag == "--release-credentials" => rest,
+            rest => rest,
+        };
+        self.calls.push(format!("cut {}", rest.join(" ")));
         let resuming = args.iter().any(|a| a == "--resume");
         let Some(reserved) = self.journal().and_then(|j| j.reserved) else {
             if resuming && let Some(cut) = self.cut.as_mut() {
@@ -2610,6 +2639,124 @@ fn fleet_line_excludes_a_second_cut_and_rechecks_before_publication() {
     let (code, last) = owner.run(bump());
     assert_eq!(code, 0, "{last}");
     assert!(owner.fleet_audits >= 2);
+}
+
+/// What a run that only proposed a line leaves in candidate.toml: nothing done on it.
+fn proposal(version: &str, commit: &str) -> Journal {
+    Journal {
+        version: version.into(),
+        commit: commit.into(),
+        started: 100,
+        line: Some(Line::start(version, commit, 100)),
+        ..Journal::default()
+    }
+}
+
+/// A release started beside another holder's live line is told so from the line's record: it
+/// ends CUTTING ELSEWHERE (exit 4) before the toolchain lease, a checkout move, a judgement or
+/// the claim, and
+/// leaves no candidate.toml that makes this clone look like the line's holder, whether this
+/// run or an earlier one wrote it.
+/// NEGATIVE CONTROLS: with the record naming no holder the same run takes its toolchain lease,
+/// claims the line and judges; a candidate.toml that holds more than a proposal is kept.
+#[test]
+fn a_line_held_elsewhere_stops_before_anything_is_judged_and_leaves_no_proposal() {
+    let told = "CUTTING ELSEWHERE: v0.6.0 by m73 at qualify head dddd; lease runs until 9";
+    let opened = || {
+        let mut world = World::new();
+        world.versions.insert(TIP.into(), "0.6.0".into());
+        world
+    };
+    let mut held = opened();
+    held.fleet_contender_refusal = Some(told.into());
+    let selection = held.release_dir().join(SELECTION_FILE);
+    proposal("0.6.0", TIP).save(&selection).unwrap();
+    let (code, last) = held.run(mac());
+    assert_eq!(code, 4, "{last}");
+    assert!(last.starts_with(told), "{last}");
+    assert!(last.contains("was dropped"), "{last}");
+    assert!(!selection.exists());
+    assert_eq!(held.fleet_contender_asked, 1);
+    for later in ["lease", "commit-gates-dry", "commit-gates", "fleet-select"] {
+        assert_eq!(held.count(later), 0, "{later}: {:?}", held.calls);
+    }
+    assert!(
+        !held.calls.iter().any(|call| call.starts_with("move ")),
+        "{:?}",
+        held.calls
+    );
+
+    // The holder took the line between that read and the claim: the proposal this run wrote
+    // goes with the stop.
+    let mut raced = opened();
+    raced.fleet_refusal = Some(told.into());
+    let (code, last) = raced.run(mac());
+    assert_eq!(code, 4, "{last}");
+    assert!(
+        last.starts_with(told) && last.contains("was dropped"),
+        "{last}"
+    );
+    assert!(!raced.release_dir().join(SELECTION_FILE).exists());
+
+    let mut free = opened();
+    let (_, last) = free.run(mac());
+    assert_eq!(free.fleet_contender_asked, 1, "{last}");
+    for later in ["lease", "commit-gates", "fleet-select"] {
+        assert!(free.count(later) > 0, "{later}: {:?}", free.calls);
+    }
+
+    let mut kept = opened();
+    kept.fleet_contender_refusal = Some(told.into());
+    let selection = kept.release_dir().join(SELECTION_FILE);
+    let mut worked = proposal("0.6.0", TIP);
+    worked.bumped = true;
+    worked.save(&selection).unwrap();
+    let (code, last) = kept.run(mac());
+    assert_eq!(code, 4, "{last}");
+    assert!(!last.contains("was dropped"), "{last}");
+    assert!(selection.exists());
+}
+
+/// A proposal candidate.toml kept of a version whose fleet line starts at another commit was
+/// never the fleet's line: the next run drops it before it selects, and says so.
+/// NEGATIVE CONTROLS: a proposal at the fleet line's own base, and one whose version main
+/// superseded, are this clone's to resume or to have refused, and stay.
+#[test]
+fn a_proposal_the_fleet_never_took_is_dropped_before_selection() {
+    let setup = |base: &str| {
+        let mut world = World::new();
+        world.versions.insert(TIP.into(), "0.6.0".into());
+        world.versions.insert(NEXT.into(), "0.6.0".into());
+        world.history.insert(1, NEXT.into());
+        world.existing_fleet_line = Some(Line::start("0.6.0", base, 100));
+        proposal("0.6.0", TIP)
+            .save(&world.release_dir().join(SELECTION_FILE))
+            .unwrap();
+        world
+    };
+    let dropped = |world: &World| world.out.iter().any(|line| line.contains("was dropped"));
+    let mut never = setup(NEXT);
+    never.run(mac());
+    assert!(dropped(&never), "{:?}", never.out);
+    assert!(
+        never
+            .out
+            .iter()
+            .any(|line| line.contains("the fleet's line of v0.6.0 starts at dddddddd")),
+        "{:?}",
+        never.out
+    );
+    let mut own = setup(TIP);
+    own.run(mac());
+    assert!(!dropped(&own), "{:?}", own.out);
+    let mut superseded = setup(NEXT);
+    superseded.supersession = Some(crate::line::Supersession {
+        previous: Line::start("0.6.0", TIP, 100),
+        replacement: Line::start("0.6.0", NEXT, 100),
+        reason: "replaced".into(),
+    });
+    superseded.run(mac());
+    assert!(!dropped(&superseded), "{:?}", superseded.out);
 }
 
 /// An owner wait before the publish renews nothing, so another cutter may take the line's
@@ -4531,7 +4678,7 @@ fn a_dry_run_forecasts_qualifys_fixed_slice_memory_reading() {
         "42 GiB parent is short too",
         "alone through both serial slices",
         "39.7 GiB available",
-        "no claim holds it: other work on this Mac",
+        "no claim holds it",
     ] {
         assert!(output.contains(words), "{words}:\n{output}");
     }
@@ -6834,6 +6981,100 @@ fn a_fix_after_a_red_carries_a_landed_commit_and_never_reselects_main() {
         "the base's tree, then the hop's tree and bundle: {:?}",
         w.calls
     );
+}
+
+/// A line started red under `--mac-only`, for the Linux-declaration tests (R37).
+fn red_mac_only_line(w: &mut World) {
+    w.verify_half = Some(Half::Tree);
+    w.verify_code = 1;
+    w.verify_passes = false;
+    let (code, last) = w.run(bump());
+    assert!(
+        code == 1 && last.starts_with("REFUSED at 4/10 qualify"),
+        "{last}"
+    );
+    assert!(
+        w.journal().unwrap().linux.mac_only,
+        "the line declares --mac-only"
+    );
+    w.history.push(FIX.into());
+    w.versions.insert(FIX.into(), "0.6.0".into());
+    w.verify_code = 0;
+    w.verify_passes = true;
+}
+
+/// R37: the Linux declaration belongs to the line. A line started `--mac-only` and hopped with
+/// `--fix` and no Linux words (the pump's `release --prepare --fix`, then a bare `--prepare`)
+/// keeps `--mac-only` in the hop's journal and passes step 1. Before, the hop's journal was
+/// written before step 1 resolved the declaration, so it held none and every later run refused
+/// "the cut must declare Linux". NEGATIVE CONTROL: a line that never declared still refuses.
+#[test]
+fn a_fix_hop_without_linux_words_keeps_the_lines_declaration() {
+    let mut w = World::new();
+    red_mac_only_line(&mut w);
+    let (code, last) = w.run(ReleaseOptions {
+        fix: vec![FIX.into()],
+        ..ReleaseOptions::default()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    let j = w.journal().unwrap();
+    assert_eq!(j.commit, hop_of(FIX), "the hop is the line's head");
+    assert_eq!(
+        j.linux,
+        crate::release::LinuxDecl {
+            mac_only: true,
+            ..crate::release::LinuxDecl::default()
+        },
+        "the hop's journal keeps the line's declaration"
+    );
+
+    // NEGATIVE CONTROL: the same hop of a line whose journal declares nothing refuses at step 1.
+    let mut w = World::new();
+    red_mac_only_line(&mut w);
+    let path = w.release_dir().join(JOURNAL_FILE);
+    let mut undeclared = w.journal().unwrap();
+    undeclared.linux = crate::release::LinuxDecl::default();
+    undeclared.save(&path).unwrap();
+    let (code, last) = w.run(ReleaseOptions {
+        fix: vec![FIX.into()],
+        ..ReleaseOptions::default()
+    });
+    assert!(
+        code != 0 && last.contains("the cut must declare Linux, and nothing here does"),
+        "{last}"
+    );
+}
+
+/// R37: a run whose Linux declaration differs from its line's is refused before anything is
+/// carried, naming both. NEGATIVE CONTROL: repeating the line's own declaration is no conflict.
+#[test]
+fn a_conflicting_linux_declaration_refuses_naming_both() {
+    let mut w = World::new();
+    red_mac_only_line(&mut w);
+    let before = w.journal();
+    let (code, last) = w.run(ReleaseOptions {
+        fix: vec![FIX.into()],
+        linux: crate::release::LinuxDecl {
+            artifacts: Some(PathBuf::from("/handoff")),
+            workers: vec!["m1".into()],
+            ..crate::release::LinuxDecl::default()
+        },
+        ..ReleaseOptions::default()
+    });
+    assert!(
+        code != 0
+            && last.contains(
+                "this run declares Linux as `--linux-artifacts /handoff --linux-worker m1`, \
+                 and the line v0.6.0 declares `--mac-only`"
+            ),
+        "{last}"
+    );
+    assert_eq!(w.count("carry"), 0, "nothing carried: {:?}", w.calls);
+    assert_eq!(w.journal(), before, "the line is kept as it was");
+
+    let (code, last) = w.run(fix(&[FIX]));
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(w.journal().unwrap().linux.mac_only);
 }
 
 /// `--fix` naming a commit a hop carries already carries nothing and resumes the line as it
@@ -12034,16 +12275,14 @@ fn a_staged_bundle_failure_can_supersede_onto_main_and_must_qualify_again() {
 }
 
 /// A run that could not run every check (exit 3) keeps the records of those that finished, and
-/// the resume runs exactly the missing checks of each half, carrying exactly the test binaries
-/// the test record lists as passed; once they pass the release goes on. Negative control: a
-/// resume that asks every check of a half again fails the asserted set.
+/// the resume runs exactly the missing checks of each half, every test binary again; once they
+/// pass the release goes on. Negative control: a resume that asks every check of a half again
+/// fails the asserted set.
 #[test]
-fn a_resume_runs_only_the_missing_checks_and_carries_the_binaries_that_passed() {
+fn a_resume_runs_only_the_missing_checks() {
     let mut w = World::new();
     w.verify_outcomes.insert("test", "NOT RUN");
     w.verify_code = 3;
-    let carried = vec![passed_binary("-p aterm-db --lib", &"aa".repeat(32))];
-    w.resume.clone_from(&carried);
     let (code, last) = w.run(bump());
     assert_eq!(code, 3, "{last}");
     assert!(last.starts_with("REFUSED at 4/10 qualify"), "{last}");
@@ -12061,8 +12300,8 @@ fn a_resume_runs_only_the_missing_checks_and_carries_the_binaries_that_passed() 
         "appkit runs first, then the first tree run asks every tree check"
     );
 
-    // The tree's resume passes, carrying the recorded binaries; AppKit is not repeated and the
-    // bundle half asks only the remaining bundle-dependent check.
+    // The tree's resume passes; AppKit is not repeated and the bundle half asks only the
+    // remaining bundle-dependent check.
     w.verify_outcomes.clear();
     w.verify_half = None;
     w.verify_code = 0;
@@ -12076,7 +12315,6 @@ fn a_resume_runs_only_the_missing_checks_and_carries_the_binaries_that_passed() 
         (tree.half, tree.checks.as_slice()),
         (Half::Tree, ["test".to_owned()].as_slice())
     );
-    assert_eq!(tree.passed_binaries, carried);
     assert_eq!(
         (bundle.half, bundle.checks.as_slice()),
         (Half::Bundle, ["measure".to_owned()].as_slice()),
@@ -12126,13 +12364,13 @@ fn a_killed_run_that_failed_a_test_is_refused_never_resumed() {
 /// clone. Early AppKit is `release --bundle --admit now --checks appkit` with no app and its
 /// step-4 log; a prior executable-group candidate is handed back only for a post-build re-key;
 /// measure is `release --bundle --checks measure --app <app>` with its step-5 log. A tree resume
-/// names its missing `--checks` and `--passed-binaries`, and only a run from a clone at R's tree and clean, before
+/// names its missing `--checks`, and only a run from a clone at R's tree and clean, before
 /// and after, under one seal, keeps one record per check its events file says finished, a FAIL
 /// included, never what its output says; a moved clone or a changed seal keeps nothing, its
 /// `began` record withdrawn, and could not run. Negative control: records read from the log
 /// take its decoy FAIL. A cut an interrupt ended cannot walk the seal again; where the seal it
-/// holds stands by status it records what its verifier finished, each row under the run that
-/// executed it. Negative control: a held seal that does not stand keeps nothing of that run.
+/// holds stands by status it records what its verifier finished. Negative control: a held seal
+/// that does not stand keeps nothing of that run.
 #[cfg(unix)]
 #[test]
 fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check() {
@@ -12323,21 +12561,32 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     );
     real.build_inputs = || Ok("fixture inputs".into());
 
-    // A resume names exactly its missing checks and the binaries that passed.
+    // A resume names exactly its missing checks and the lint packages that passed.
     let resume = VerifyRun {
         half: Half::Tree,
         checks: vec!["lint".into(), "test".into()],
-        passed_binaries: vec![passed_binary("-p a --lib", &"aa".repeat(32))],
         passed_lint_packages: vec![passed_lint_package("a@1.0.0")],
         passed_appkit_groups: Vec::new(),
     };
-    let binary = |spec: &str, sha: &str, outcome: &str| {
+    let binary = |spec: &str, outcome: &str| {
         format!(
             "verify-event: {}\n",
             aterm_json::json!({"schema":1,"event":"test-binary-finished","test":spec,
-                "outcome":outcome,"exe_sha256":sha,"content_key":"cc".repeat(32),
-                "inputs_bounded":true,"input_reason":null,"recorded_execution_s":1.25,
-                "json":false,"carried":false})
+                "outcome":outcome,"recorded_execution_s":1.25,"json":false})
+        )
+    };
+    // The rows of R's test record, as its last run kept them.
+    let test_rows = |r: &str| -> Vec<Binary> {
+        let root = crate::check_record::root(&git).unwrap();
+        let tree = crate::check_record::tree_of(&git, r).unwrap();
+        let at = crate::check_record::path(&root, &tree, "fixture inputs", "test", None);
+        std::fs::read_to_string(&at).map_or_else(
+            |_| Vec::new(),
+            |text| {
+                aterm_toml::from_str::<crate::check_record::CheckRecord>(&text)
+                    .unwrap()
+                    .binaries
+            },
         )
     };
     let lint_package = |spec: &str, key: &str, outcome: &str| {
@@ -12355,8 +12604,8 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
             "{}{}{}{}",
             finished(&[("lint", "ok")]),
             lint_package("a@1.0.0", &"dd".repeat(32), "ok"),
-            binary("-p a --lib", &"aa".repeat(32), "ok"),
-            binary("-p b --lib", &"bb".repeat(32), "NOT RUN")
+            binary("-p a --lib", "ok"),
+            binary("-p b --lib", "NOT RUN")
         ),
     );
     let ran = verify(&mut real, Step::Qualify, &resume).expect("it ran");
@@ -12370,9 +12619,8 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
             .unwrap_or_else(|| panic!("{flag} <path>: {said_now}"))
             .to_owned()
     };
-    let (context, passed, passed_lint, events_file) = (
+    let (context, passed_lint, events_file) = (
         after("--carry-context"),
-        after("--passed-binaries"),
         after("--passed-lint-packages"),
         after("--events"),
     );
@@ -12380,17 +12628,11 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         said_now.trim(),
         format!(
             "{} release --tree --carry-context {context} --checks lint,test \
-             --passed-binaries {passed} --passed-lint-packages {passed_lint} \
-             --events {events_file}",
+             --passed-lint-packages {passed_lint} --events {events_file}",
             repo_seen.display(),
         ),
         "no measure, so no --app"
     );
-    let proofs =
-        aterm_verify::testrun::read_passed(&std::fs::read_to_string(&passed).unwrap()).unwrap();
-    assert_eq!(proofs.len(), 1);
-    assert_eq!(proofs["-p a --lib"].exe_sha256, Some("aa".repeat(32)));
-    assert_eq!(proofs["-p a --lib"].content_key, Some("cc".repeat(32)));
     let lint_proofs =
         aterm_verify::lint_content::read_passed(&std::fs::read_to_string(&passed_lint).unwrap())
             .unwrap();
@@ -12402,20 +12644,14 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         "{}",
         judged.line()
     );
-    let killed_run = Path::new(&events_file)
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(std::ffi::OsStr::to_str)
-        .expect("the events file sits in its run's log directory")
-        .to_owned();
-    let passed_in_killed_run = Binary {
-        origin_run: Some(killed_run.clone()),
-        ..passed_binary("-p a --lib", &"aa".repeat(32))
-    };
+    let killed = [
+        binary_row("-p a --lib", "ok"),
+        binary_row("-p b --lib", "NOT RUN"),
+    ];
     assert_eq!(
-        judged.run(Half::Tree).passed_binaries,
-        std::slice::from_ref(&passed_in_killed_run),
-        "the test record of the killed run lists what passed, under the run that executed it"
+        test_rows(&r),
+        killed,
+        "the test record of the killed run lists every binary that ended"
     );
 
     // AN INTERRUPTED CUT. The interrupt that stops the verifier also ends the seal's own walk,
@@ -12431,20 +12667,17 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     let interrupted = INTERRUPTED.get_or_init(|| dir.path().join("interrupted"));
     real.build_inputs = interrupted_inputs;
     let interrupted_events = format!(
-        "verify-event: {}\n{}",
-        aterm_json::json!({"schema":1,"event":"test-binary-finished","test":"-p a --lib",
-            "outcome":"ok","exe_sha256":"aa".repeat(32),"content_key":"cc".repeat(32),
-            "inputs_bounded":true,"input_reason":null,"recorded_execution_s":1.25,
-            "json":false,"carried":true,"carried_from":"an-earlier-run"}),
-        binary("-p c --lib", &"ee".repeat(32), "ok")
+        "{}{}",
+        binary("-p a --lib", "ok"),
+        binary("-p c --lib", "ok")
     );
     real.inputs_held = |_| false;
     set("143", "interrupt", &interrupted_events);
     let refused = verify(&mut real, Step::Qualify, &resume).expect_err("the held seal moved");
     assert!(refused.could_not_run, "{refused:?}");
     assert_eq!(
-        judge(&r).run(Half::Tree).passed_binaries,
-        std::slice::from_ref(&passed_in_killed_run),
+        test_rows(&r),
+        killed,
         "a seal that does not stand keeps nothing of the interrupted run"
     );
     std::fs::remove_file(interrupted).unwrap();
@@ -12453,19 +12686,12 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     let ran = verify(&mut real, Step::Qualify, &resume).expect("the interrupted run is kept");
     assert_eq!(ran.code, 143);
     assert_eq!(
-        judge(&r).run(Half::Tree).passed_binaries,
+        test_rows(&r),
         [
-            Binary {
-                origin_run: Some("an-earlier-run".into()),
-                ..passed_binary("-p a --lib", &"aa".repeat(32))
-            },
-            Binary {
-                origin_run: Some(killed_run),
-                ..passed_binary("-p c --lib", &"ee".repeat(32))
-            },
+            binary_row("-p a --lib", "ok"),
+            binary_row("-p c --lib", "ok")
         ],
-        "the interrupted run's rows are recorded: the carried one under the run that executed \
-         it, the one it ran under this release run"
+        "the interrupted run's rows are recorded"
     );
     std::fs::remove_file(interrupted).unwrap();
     real.build_inputs = || Ok("fixture inputs".into());

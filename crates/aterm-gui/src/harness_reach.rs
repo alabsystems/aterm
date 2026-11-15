@@ -20,7 +20,7 @@ pub(crate) struct HarnessHosting {
     pub(crate) relaunching: std::collections::HashSet<String>,
     /// The table's default Autopilot (`[harness] autopilot`), for a session
     /// with no word of its own.
-    pub(crate) autopilot: aterm_agent::supervise::Autopilot,
+    pub(crate) autopilot: alab_policy::config::Autopilot,
 }
 
 impl HarnessHosting {
@@ -35,12 +35,12 @@ impl HarnessHosting {
     pub(crate) fn hosts(
         &self,
         sid: &str,
-        word: Option<aterm_agent::supervise::Autopilot>,
+        word: Option<alab_policy::config::Autopilot>,
         agent: aterm_phase::Program,
     ) -> bool {
         self.supervising
             && self.agents.admits(agent)
-            && word.unwrap_or(self.autopilot) != aterm_agent::supervise::Autopilot::Off
+            && word.unwrap_or(self.autopilot) != alab_policy::config::Autopilot::Off
             && !self.held_off.iter().any(|held| held == sid)
     }
 }
@@ -61,7 +61,7 @@ impl App {
                 agents: host.admission(),
                 held_off: host.held_off(),
                 relaunching: host.relaunching(),
-                autopilot: self.harness_policy.get().policy.autopilot,
+                autopilot: self.harness_policy.get().policy.turn_end.autopilot,
             },
             _ => HarnessHosting::default(),
         }

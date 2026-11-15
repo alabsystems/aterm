@@ -29,7 +29,7 @@ pub(super) fn book(record: &Record) -> Book {
     Book {
         schema: 2,
         caller: Caller {
-            sid: "s-fixture".into(),
+            sid: "t000fjxtvre".into(),
             pid: 42,
             birth: 7,
         },
@@ -190,7 +190,7 @@ fn persisted_target_cannot_substitute_scope_identity_or_manual_selection() {
 fn legacy_book_encoding_stays_exact_and_new_records_require_schema_three() {
     let record = record();
     let caller = Caller {
-        sid: "s-fixture".into(),
+        sid: "t000fjxtvre".into(),
         pid: 42,
         birth: 7,
     };

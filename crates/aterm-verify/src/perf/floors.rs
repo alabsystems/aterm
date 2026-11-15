@@ -673,11 +673,9 @@ fn measure_example_for(
         "--message-format=json-render-diagnostics",
     ]);
     eprintln!("  $ {}", driver.display_workspace("build", &args));
-    let built = driver
-        .workspace_command("build")?
-        .args(&args)
-        .current_dir(workspace_root())
-        .output()
+    let mut build_command = driver.workspace_command("build")?;
+    build_command.args(&args).current_dir(workspace_root());
+    let built = super::driver::compiler_output(&mut build_command)
         .map_err(|e| format!("could not build {example}: {e}"))?;
     if !built.status.success() {
         return Err(MeasureError::Failed(format!(

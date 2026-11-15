@@ -58,6 +58,8 @@ mod driver;
 mod fabric;
 #[cfg(unix)]
 mod fabric_counts;
+#[cfg(unix)]
+mod fabric_open_peak;
 mod floors;
 #[cfg(unix)]
 mod journal;
@@ -802,6 +804,15 @@ const OPTIONS: &[OptSpec] = &[
                sealed and plaintext logs in the bench's process",
     },
     OptSpec {
+        flag: "--attach-wanted",
+        value: Some("K"),
+        lanes: &[Lane::Fabric],
+        help: "with --attach-backlog in the bench's process: K notes to every attach session \
+               among the backlog's oldest records, 600 filler records apart, which every \
+               restart's refill reads again cold among the filler pages it passes whole; each \
+               session must still list each note once after every restart",
+    },
+    OptSpec {
         flag: "--durability",
         value: Some("TIER,..."),
         lanes: &[Lane::Fabric],
@@ -1325,8 +1336,9 @@ fn main(args: &[String]) -> ExitCode {
         {
             Ok(quiet) => quiet.flatten(),
             Err(why) => {
-                eprintln!("verify perf: COULD NOT RUN — {why}");
-                return ExitCode::from(3);
+                let (text, code) = admission_refused(&ran, *lane, why);
+                eprint!("{text}");
+                return code;
             }
         };
         let started = Instant::now();
@@ -1491,12 +1503,32 @@ fn main(args: &[String]) -> ExitCode {
     }
 }
 
+/// An admission refusal retains completed results and their failure precedence.
+fn admission_refused(ran: &[(Lane, LaneRun, f64)], lane: Lane, why: String) -> (String, ExitCode) {
+    let unrun = LaneRun::could_not_run(why, "run this lane when its machine is available");
+    let mut rows: Vec<_> = ran
+        .iter()
+        .map(|(lane, run, secs)| (lane.name(), run, *secs))
+        .collect();
+    rows.push((lane.name(), &unrun, 0.0));
+    let (text, code) = verdict(&rows);
+    (
+        text,
+        if code == crate::exit::FAILED {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::from(3)
+        },
+    )
+}
+
 /// Resource admission for one timing lane, alone among quiet claims once load and sampled CPU
 /// are ready. Its build runs under this reservation; collectors sample again after compilation.
 /// Immediate, forced, unknown and unavailable admission starts no acceptance callback.
 ///
 /// # Errors
-/// An interrupt ended the wait (WAIT-INTERRUPT): why, and the run ends COULD NOT RUN.
+/// Timing qualification could not be established, including an interrupted wait. The caller
+/// records this lane as unavailable and retains any earlier failure's precedence.
 fn quiet(lane: Lane, mode: aterm_capacity::Admit) -> Result<Option<aterm_capacity::Claim>, String> {
     let need = aterm_capacity::Need::timing(format!("verify perf {}", lane.name()));
     match aterm_capacity::admit(need, mode) {

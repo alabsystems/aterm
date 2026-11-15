@@ -535,11 +535,11 @@ pub enum FailureKind {
     /// as waiting; it failed only once no worker goes on with the run (it stopped, or aterm runs
     /// none). A failure nobody classified is one of these, never a person's.
     Transient,
-    /// Only a person's act ends it: a setting only they can fix, a vault password to retype, an
-    /// approval only an admin Mac gives, a switch only the person flips. A missing or refused
-    /// credential is never one: it waits on the need ledger. It needs
-    /// them at once, and no pass retries it. A reading says it as [`Standing::NeedsYou`], with
-    /// its remedy in the row's note, and the run's row for it parks the run.
+    /// Only a person's act ends it: a setting only they can fix, an approval only an admin Mac
+    /// gives, a switch only the person flips. A missing or refused credential is never one: it
+    /// waits on the need ledger. It needs them at once, and no pass retries it. A reading says it
+    /// as [`Standing::NeedsYou`], with its remedy in the row's note, and the run's row for it
+    /// parks the run.
     NeedsPerson,
 }
 
@@ -621,6 +621,8 @@ pub const ADMITTED_NAME_RULE: &str = "/private/etc/sudoers.d/aterm-admitted-name
 /// reads): while it stands the rule is not owed, so a sudo that cannot read it never makes each
 /// later launch ask for the password again.
 pub const ADMITTED_NAME_RULE_REFUSED: &str = "/private/etc/sudoers.d/.aterm-admitted-name.refused";
+
+pub mod spotlight_scope;
 
 /// The environment variable System State's Mac Setup tab runs `aterm init --only
 /// base.clt` under, as the tab's own program (design §3.3). That run does nothing until the

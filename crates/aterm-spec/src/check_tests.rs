@@ -4,6 +4,96 @@
 use super::*;
 
 #[test]
+fn mutant_agreement_requires_a_registered_law_refutation() {
+    let model = crate::ty_model! {
+        NamedRefutation {
+            const Buggy = 0;
+            var count = 0;
+            action Fill when (1 > count) { count = count + 1; }
+            invariant Fits: if Buggy == 1 { count == 1 } else { count <= 1 };
+        }
+    };
+    let mutant = interp::with_buggy(&model, 1);
+    let refutation = interp::bmc(&mutant);
+    assert_eq!(refutation.as_ref().unwrap_err().1, "Fits");
+    let initial_stderr = "--- ty stdout ---\nINVARIANTS: Fits\n\
+        --- ty stderr ---\n\
+        Error: Invariant Fits is violated by the initial state:\n\
+        /\\ count = 0\nStatistics:\nStates found: 0\nInitial states generated: 1\n";
+    for evidence in [
+        "--- ty stdout ---\nError: Invariant Fits is violated.\n--- ty stderr ---\n",
+        initial_stderr,
+    ] {
+        assert!(
+            model_verdict_finding(
+                &mutant,
+                "NamedRefutation",
+                1,
+                refutation.clone(),
+                false,
+                evidence
+            )
+            .is_none(),
+            "{evidence}"
+        );
+    }
+    let unknown = initial_stderr.replace("Invariant Fits ", "Invariant OtherLaw ");
+    assert_eq!(verify::ty_violated_law(&unknown), Some("OtherLaw"));
+    for evidence in [
+        unknown.as_str(),
+        "--- ty stdout ---\nINVARIANTS: Fits\n--- ty stderr ---\nParse error: unexpected token\n",
+        "--- ty stdout ---\nINVARIANTS: Fits\n--- ty stderr ---\nError: Successor state is not completely specified\n",
+        "--- ty stdout ---\nINVARIANTS: Fits\n--- ty stderr ---\nModel checking stopped: memory limit reached\n",
+    ] {
+        assert!(
+            model_verdict_finding(
+                &mutant,
+                "NamedRefutation",
+                1,
+                refutation.clone(),
+                false,
+                evidence
+            )
+            .is_some(),
+            "{evidence}"
+        );
+    }
+    assert!(
+        model_verdict_finding(
+            &mutant,
+            "NamedRefutation",
+            1,
+            refutation.clone(),
+            true,
+            initial_stderr
+        )
+        .is_some()
+    );
+    assert!(
+        model_verdict_finding(
+            &mutant,
+            "NamedRefutation",
+            0,
+            refutation,
+            false,
+            initial_stderr
+        )
+        .is_some()
+    );
+    let states = interp::bmc(&model).expect("the unmutated model must hold");
+    let complete = format!("States found: {states}\n");
+    assert!(
+        model_verdict_finding(&model, "NamedRefutation", 0, Ok(states), true, &complete).is_none()
+    );
+    for (held, evidence) in [(true, "States found: 0\n"), (false, initial_stderr)] {
+        assert!(
+            model_verdict_finding(&model, "NamedRefutation", 0, Ok(states), held, evidence)
+                .is_some()
+        );
+    }
+}
+
+#[test]
 fn an_interpreter_panic_fails_the_law_audit_before_running_ty() {
     let mut model = crate::test_models::ring_model();
     model.invariants[0].expr = crate::derive::Expr::Eq(

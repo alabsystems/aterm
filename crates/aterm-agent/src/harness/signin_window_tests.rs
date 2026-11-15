@@ -550,8 +550,12 @@ fn the_mailbox_is_read_again_until_its_email_arrives_and_an_unreadable_one_is_dr
             .collect();
         assert_eq!(dropped.len(), 1, "said once: {:?}", desk.log.said);
         assert!(dropped[0].contains(why), "{}", dropped[0]);
-        // An ordinary failure: another try may read the mailbox.
-        assert!(matches!(VisibleStop::from(stop), VisibleStop::Failed(_)));
+        // An ordinary failure, which names the dropped mailbox and holds no token step: another
+        // try may read it. Only a window that read no mailbox from the start holds one.
+        let VisibleStop::Failed(words) = VisibleStop::from(stop) else {
+            panic!("a dropped mailbox held the step");
+        };
+        assert!(words.contains(why), "{words}");
     }
 
     // One read that failed, then the code: the sign-in goes on.
@@ -631,7 +635,106 @@ fn a_sign_in_whose_mailbox_failed_is_finished_by_the_code_a_person_types() {
         );
         assert!(said.contains("a value aterm did not set"), "{said}");
         assert_eq!(desk.log.closed, 1);
+        assert_eq!(
+            desk.log.noted, 0,
+            "a run whose code a person typed records nothing of the store"
+        );
     }
+}
+
+/// A CODE A PERSON TYPED PROVES NOTHING OF WHOSE SESSION THE STORE HOLDS: aterm continues with
+/// the account's email, a person types a code and verifies it themselves, and the consent page
+/// names no address: that session may be any account's (the code may be another sign-in's), so
+/// nothing is authorized, the store is emptied and nothing records it as the account's; a page a
+/// human check holds ends the same way at once, with no person asked to complete it. NEGATIVE
+/// CONTROL: the same page after aterm verified the code it read from the account's mailbox, or
+/// in a store an earlier run recorded, is authorized.
+#[test]
+fn a_code_a_person_typed_never_vouches_for_a_consent_page_that_names_nobody() {
+    const UNNAMED: &str = "Claude Code would like to connect to your Claude account";
+    for held in [false, true] {
+        let page = move |log: &Log| {
+            Ok(if log.pressed.contains(&Button::Authorize) {
+                at(ANSWERED)
+            } else if !log.pressed.contains(&Button::ContinueWithEmail) {
+                login_page()
+            } else if log.reads < 8 {
+                code_page(log.reads >= 4)
+            } else if held {
+                held_consent_page(UNNAMED)
+            } else {
+                consent_page(UNNAMED)
+            })
+        };
+        let mut desk = Fake::new(page);
+        assert_eq!(
+            run(AUTHORIZE, &mut desk),
+            Err(Stop::UnknownSession),
+            "{held}"
+        );
+        assert_eq!(desk.log.pressed, [Button::ContinueWithEmail], "{held}");
+        assert_eq!(codes(&desk.log), 0, "{held}: aterm set no code");
+        assert_eq!(desk.log.noted, 0, "{held}");
+        assert_eq!(desk.log.forgot, 1, "{held}: the store is emptied");
+        assert_eq!(desk.log.closed, 1, "{held}");
+        assert!(
+            !desk
+                .log
+                .said
+                .iter()
+                .any(|line| line.contains("human check")),
+            "{held}: nobody is asked to complete a check for nothing: {:?}",
+            desk.log.said
+        );
+
+        let mut desk = Fake::new(page);
+        desk.store_is_the_accounts = true;
+        if held {
+            // A person completes the check: the page's Authorize is enabled from the tenth read.
+            desk.page = Box::new(move |log: &Log| {
+                Ok(
+                    if log.reads >= 10 && !log.pressed.contains(&Button::Authorize) {
+                        consent_page(UNNAMED)
+                    } else {
+                        page(log)?
+                    },
+                )
+            });
+        }
+        assert_eq!(
+            run(AUTHORIZE, &mut desk),
+            Ok(Done::Delivered),
+            "CONTROL: {held}"
+        );
+        assert_eq!(
+            desk.log.pressed.last(),
+            Some(&Button::Authorize),
+            "CONTROL: {held}"
+        );
+        assert_eq!(desk.log.forgot, 0, "CONTROL: {held}");
+    }
+
+    let proved = |log: &Log| {
+        Ok(if log.pressed.contains(&Button::Authorize) {
+            at(ANSWERED)
+        } else if log.pressed.contains(&Button::VerifyEmailAddress) {
+            consent_page(UNNAMED)
+        } else {
+            whole_flow(log)?
+        })
+    };
+    let mut desk = Fake::new(proved).with_mail(|_| Ok(MailboxCredential::Otp("123456".into())));
+    assert_eq!(run(AUTHORIZE, &mut desk), Ok(Done::Delivered), "CONTROL");
+    assert_eq!(
+        desk.log.pressed,
+        [
+            Button::ContinueWithEmail,
+            Button::VerifyEmailAddress,
+            Button::Authorize
+        ],
+        "CONTROL: aterm's own code vouches for the page"
+    );
+    assert_eq!(desk.log.noted, 1, "CONTROL: and records the store");
 }
 
 /// A CODE THE FIELD DID NOT KEEP IS SET AGAIN FROM THE ONE READ THAT GAVE IT: the mailbox gives
@@ -1033,8 +1136,8 @@ fn a_timeout_names_where_it_stood_and_no_button_is_pressed_twice() {
     assert_eq!(desk.log.closed, 1);
     assert_eq!(
         VisibleStop::from(stop),
-        VisibleStop::Failed(words),
-        "an ordinary failure carries its words"
+        VisibleStop::Deadline(Phase::Waiting.words().to_owned()),
+        "the deadline is its own word, and says where it stood"
     );
 
     let mut desk = Fake::new(|_: &Log| Ok(login_page()));

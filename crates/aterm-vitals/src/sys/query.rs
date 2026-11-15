@@ -32,7 +32,7 @@ pub enum View {
     Overview,
     /// The target's tab across every resource.
     Tab,
-    /// This aterm instance across every resource, with its parts.
+    /// aterm across every resource, including proved shared app work, with its parts.
     Aterm,
     /// The machine across every resource.
     Global,
@@ -127,7 +127,7 @@ pub enum ScopeArg {
     Window,
     /// Every tab of the request that owns the target's tab (ATERM-KI-1109-3).
     Request,
-    /// This aterm instance.
+    /// This aterm instance and proved shared app work.
     Aterm,
     /// The machine.
     Global,

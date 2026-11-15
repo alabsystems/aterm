@@ -14,7 +14,7 @@
 //! Mac's subscriber wakes for it. Nothing here runs on a timer: the exports change only when the
 //! owner runs the verb.
 //!
-//! Drift (`check`): each file as this Mac's `~/.secrets` holds it against what the lab renders
+//! Drift (`check`): each file as this Mac's verified store holds it against what the lab renders
 //! now: `same`; `stale` (the generator wrote it and the lab moved since); `edited` (its seal no
 //! longer holds: a hand edit); `unsealed` (no seal: never generated, or written by an older
 //! tool); `missing`.
@@ -102,20 +102,21 @@ pub fn rendered(
         .collect()
 }
 
-/// Each of `names` as `~/.secrets` under `home` holds it, where it is there and is UTF-8.
+/// Each of `names` as this Mac's verified store holds it, read in place, where it holds it and it
+/// is UTF-8. No file under `~/.secrets` is read.
 ///
 /// # Errors
-/// A file is there and cannot be read.
-pub fn materialized(home: &std::path::Path, names: &[String]) -> Result<BTreeMap<String, String>> {
-    let dir = home.join(".secrets");
+/// The store's local state cannot be read.
+pub fn stored(paths: &Paths, names: &[String]) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for name in names {
-        let path = dir.join(name);
-        let Some(bytes) = crate::import::read_bounded_if_file(&path)? else {
+        let Some(bytes) =
+            aterm_secrets::client::read_in_place(paths, name).map_err(crate::table::failure)?
+        else {
             continue;
         };
-        if let Ok(text) = String::from_utf8(bytes) {
-            out.insert(name.clone(), text);
+        if let Some(text) = bytes.as_str() {
+            out.insert(name.clone(), text.to_owned());
         }
     }
     Ok(out)
@@ -279,7 +280,7 @@ fn lab_now(paths: &Paths) -> Result<Option<(LabView, OwnedRead)>> {
     Ok(Some((lab, facts)))
 }
 
-/// `check`'s `exports`: each file's drift against `~/.secrets`, `null` where no harness renders
+/// `check`'s `exports`: each file's drift against this Mac's store, `null` where no harness renders
 /// or the registry is not held whole here, an `error` where the render is refused.
 pub(super) fn check(paths: &Paths, vendors: Option<&dyn Vendors>, now: u64) -> Value {
     let Some(vendors) = vendors else {
@@ -294,7 +295,7 @@ pub(super) fn check(paths: &Paths, vendors: Option<&dyn Vendors>, now: u64) -> V
         .unwrap_or_default();
     let names = vendors.export_names();
     let report = (|| {
-        let current = materialized(&paths.home, &names)?;
+        let current = stored(paths, &names)?;
         let rendered = rendered(vendors, &lab, &places, &current)?;
         Ok::<_, Error>(plan(&rendered, &current, None, &OwnedRead::default()).drift)
     })();
@@ -311,8 +312,8 @@ pub(super) fn check(paths: &Paths, vendors: Option<&dyn Vendors>, now: u64) -> V
 
 /// `aterm db alab export [--dry-run|--apply]` at `now` (Unix seconds): render the exports from the
 /// registry and the journal's place rows and, with `apply`, publish every changed file and roster
-/// hint in one admin publish of the vault. A dry run compares with `~/.secrets` and writes
-/// nothing. The report names files and labels, never a value.
+/// hint in one admin publish of the vault. A dry run compares with this Mac's verified store
+/// and writes nothing. The report names files and labels, never a value.
 ///
 /// # Errors
 /// No harness renders, the registry is not held whole here, a current file does not parse, or
@@ -351,7 +352,7 @@ pub(super) fn run(
                 .map_err(crate::table::failure)?,
         ),
         None => (
-            materialized(&paths.home, &names)?,
+            stored(paths, &names)?,
             aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
                 .map_err(crate::table::failure)?,
         ),

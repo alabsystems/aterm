@@ -6,7 +6,7 @@
 //! vault, registry or account is read.
 
 use super::{
-    Derived, Type,
+    Class, Computed, Type,
     materialize::{self, Outcome, Pass},
     publish::{self, Answer},
     seam, write,
@@ -14,9 +14,8 @@ use super::{
 use crate::{
     alab::{
         Registry,
-        command::views::{self, Noun, Opening, Place, ViewIo},
-        registry::{ACCOUNT, ADDRESS, MACHINE, PREFERENCE},
-        secret::Journal,
+        command::views::{self, Noun, ViewIo},
+        registry::{ACCOUNT, ACCOUNT_OBS, ADDRESS, MACHINE, PREFERENCE},
     },
     att, generation,
     table::tests::Lab,
@@ -184,21 +183,21 @@ fn verb(root: &Root, list: &[&str]) -> String {
 }
 
 /// One alias view (`aterm db ai-accounts`, `aterm db computers`) with nothing it may open: no
-/// session gate, no grid, no standard input.
+/// grid, no standard input, an empty secret store.
 #[track_caller]
 fn alias(paths: &Paths, noun: Noun, list: &[&str]) -> Value {
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let journal = Journal::at(scratch.path());
-    let gate = || -> crate::Result<Place> { panic!("an alias read asks no session") };
-    let mut open = |_: &Opening<'_>| -> crate::Result<()> { panic!("an alias read opens no grid") };
+    let store = crate::typed::secret::Memory::default();
+    let mut open = |_: &std::path::Path, _: usize| -> crate::Result<()> {
+        panic!("an alias read opens no grid")
+    };
     let mut read_stdin = || -> crate::Result<zeroize::Zeroizing<Vec<u8>>> {
         panic!("an alias read takes no standard input")
     };
     let mut io = ViewIo {
-        gate: &gate,
         open: &mut open,
         read_stdin: &mut read_stdin,
-        journal: &journal,
+        store: &store,
+        holding: &|| Ok(0),
         now_ms: NOW,
     };
     views::run(paths, noun, &words(list), &mut io).unwrap()
@@ -215,7 +214,7 @@ struct Seen {
     name: String,
     /// The rows of `rows ai/links --join account --json`.
     joined: Value,
-    /// The alias rows of `aterm db ai-accounts --show-addresses` and `aterm db computers`.
+    /// The alias rows of `aterm db ai-accounts` and `aterm db computers`.
     aliases: Vec<Value>,
 }
 
@@ -255,7 +254,7 @@ fn reads(stand: &Stand, word: Word, why: Option<Why>) -> Seen {
     ))
     .unwrap();
     let joined = joined["rows"].clone();
-    let accounts = alias(stand.paths(), Noun::AiAccounts, &["--show-addresses"]);
+    let accounts = alias(stand.paths(), Noun::AiAccounts, &[]);
     let computers = alias(stand.paths(), Noun::Computers, &[]);
     for (answer, table) in [(&accounts, "ai-accounts"), (&computers, "computers")] {
         assert_eq!(answer["state"].as_str(), Some(word.as_str()), "{answer}");
@@ -487,13 +486,13 @@ fn grid_of(text: &str) -> Vec<Vec<&str>> {
         .collect()
 }
 
-/// The face is the TSV `aterm db table export` writes for the collection, addresses shown, with
-/// the file's derived columns before the key and the revision in the key's header cell: every
+/// The face is the TSV `aterm db table export` writes for the collection, with the file's
+/// computed columns before the key and the revision in the key's header cell: every
 /// stored column's header and every stored cell, quoting included, is the grid's own.
 /// NEGATIVE CONTROL: with `push_cell` never quoting, the machine's row differs from the export's:
 /// `` right: ["m7", …, "the \"desk\" Mac", "", ""] ``.
 #[test]
-fn the_face_is_the_grid_export_with_derived_columns_and_the_revision() {
+fn the_face_is_the_grid_export_with_computed_columns_and_the_revision() {
     let stand = Stand::new();
     all(&stand, &stand.pass(false), Word::Live, None);
     let registry = Registry::at(stand.paths().clone());
@@ -501,30 +500,30 @@ fn the_face_is_the_grid_export_with_derived_columns_and_the_revision() {
     let view = registry.view().unwrap();
     for file in super::FILES {
         let collection = compiled.collection(file.collection.name).unwrap();
-        let export = grid::export(compiled.table, collection, &view.cells, &[], true).unwrap();
+        let export = grid::export(compiled.table, collection, &view.cells, &[]).unwrap();
         let face = std::fs::read_to_string(stand.root().face(&file.file(), "tsv")).unwrap();
         let (theirs, ours) = (grid_of(&export.text), grid_of(&face));
         assert_eq!(theirs.len(), ours.len(), "{}", file.name);
-        let derived = file.derived.columns();
-        // The grid's columns but its key, then the derived ones, then the key at its revision.
+        let computed = file.computed.columns();
+        // The grid's columns but its key, then the computed ones, then the key at its revision.
         let stored = theirs[0].len() - 1;
         assert_eq!(theirs[0][stored], "=pk");
-        assert_eq!(ours[0].len(), stored + derived.len() + 1, "{}", file.name);
-        assert_eq!(ours[0][stored + derived.len()], "=pk@1");
-        for (at, name) in derived.iter().enumerate() {
+        assert_eq!(ours[0].len(), stored + computed.len() + 1, "{}", file.name);
+        assert_eq!(ours[0][stored + computed.len()], "=pk@1");
+        for (at, name) in computed.iter().enumerate() {
             assert_eq!(ours[0][stored + at], format!("={name}"));
         }
         for (theirs, ours) in theirs.iter().zip(&ours) {
             assert_eq!(theirs[..stored], ours[..stored], "{}", file.name);
         }
         for (theirs, ours) in theirs.iter().zip(&ours).skip(1) {
-            assert_eq!(theirs[stored], ours[stored + derived.len()], "the key");
+            assert_eq!(theirs[stored], ours[stored + computed.len()], "the key");
         }
     }
     let machines =
         std::fs::read_to_string(stand.root().face(&super::MACHINES.file(), "tsv")).unwrap();
     assert!(machines.contains("\"the \"\"desk\"\" Mac\""), "{machines}");
-    // The derived cells: the account's name and slug, its address, and the machines linked.
+    // The computed cells: the account's name and slug, its address, and the machines linked.
     let accounts = stand.file(&super::ACCOUNTS).read();
     let row = accounts.named("claude-fb-alpha");
     assert_eq!(row.len(), 1);
@@ -563,9 +562,9 @@ fn the_face_is_the_grid_export_with_derived_columns_and_the_revision() {
     }
 }
 
-/// A shared file holds no `Secret` and no `Sealed` column: the registry's `address` collection,
-/// whose `password` is a `Secret`, cannot be one, and every file this build compiles passed the
-/// same check when it was compiled.
+/// A shared file holds no `Secret` and no `Sealed` column: the second generation's `address`
+/// collection ([`crate::alab::registry::SEALED_ADDRESS`]), whose `password` is a `Secret`, cannot
+/// be one, and every file this build compiles passed the same check when it was compiled.
 /// NEGATIVE CONTROL: with `holds_secret` answering `false` for a `Secret`, the address file
 /// checks: `` called `Result::unwrap_err()` on an `Ok` value: () ``.
 #[test]
@@ -574,8 +573,9 @@ fn a_file_with_a_secret_column_is_refused() {
         name: "lab/emails",
         about: "",
         family: &att::REGISTRY,
-        collection: &ADDRESS,
-        derived: Derived::None,
+        class: Class::Owner,
+        collection: &crate::alab::registry::SEALED_ADDRESS,
+        computed: Computed::None,
         handles: &["addr"],
     };
     let refused = emails.check().unwrap_err();
@@ -598,6 +598,167 @@ fn a_file_with_a_secret_column_is_refused() {
         ..super::ACCOUNTS
     };
     assert!(handle.check().unwrap_err().contains("handle"));
+}
+
+/// A file's class fits its collection: an owner file projects a cells collection the owner
+/// writes, a Mac file an owned collection keyed by its writer's uuid or a log, and no Mac file
+/// compiles until this build's materializer projects one; every file of this build is an owner
+/// file. The publisher holds what a file's class does not take: an owner file no Mac's
+/// statement, a Mac file no owner's write, a revert included.
+/// NEGATIVE CONTROL, observed: with `Type::check`'s owner arm refusing nothing, the owner file
+/// over an owned collection is refused for its kind alone, and the assertion prints that rule:
+/// `` this build projects only cells collections: no Mac file compiles until its materializer
+/// does ``; with `Class::refuses` answering `None` for a Mac file, the owner's write to one
+/// passes: `` left: None right: Some("a Mac file takes no owner write") ``.
+#[test]
+fn a_files_class_fits_its_collection_and_takes_only_its_writers_intents() {
+    // A Mac file over this build's registry: each Mac's account observations.
+    let seen = Type {
+        name: "ai/seen",
+        about: "",
+        family: &att::REGISTRY,
+        class: Class::Mac,
+        collection: &ACCOUNT_OBS,
+        computed: Computed::None,
+        handles: &[],
+    };
+    let owned = Type {
+        class: Class::Owner,
+        ..seen
+    }
+    .check()
+    .unwrap_err();
+    assert!(
+        owned.contains("an owner file projects a cells collection"),
+        "{owned}"
+    );
+    let cells = Type {
+        class: Class::Mac,
+        ..super::ACCOUNTS
+    }
+    .check()
+    .unwrap_err();
+    assert!(
+        cells.contains("a Mac file projects an owned collection"),
+        "{cells}"
+    );
+    // A Mac file over an owned collection or a log fits its class (`check` reads no family);
+    // this build compiles neither.
+    for file in [
+        seen,
+        Type {
+            collection: &crate::alab::journal::EV,
+            ..seen
+        },
+    ] {
+        let why = file.check().unwrap_err();
+        assert!(why.contains("only cells collections"), "{why}");
+    }
+    assert!(super::FILES.iter().all(|file| file.class == Class::Owner));
+
+    let intent = |key: &str, revert: Option<String>| aterm_file::Intent {
+        id: "0".repeat(32),
+        file: seen.file(),
+        ms: NOW,
+        by: "harness".to_owned(),
+        session: None,
+        born: false,
+        edits: if revert.is_some() {
+            Vec::new()
+        } else {
+            vec![aterm_file::Edit {
+                key: key.to_owned(),
+                column: "state".to_owned(),
+                elem: None,
+                value: json!("running"),
+                text: "running".to_owned(),
+                expected: Vec::new(),
+            }]
+        },
+        revert,
+        resolves: None,
+    };
+    let (mine, write) = (intent("ac-1.@self", None), intent("ac-1", None));
+    let revert = intent("", Some("1".repeat(64)));
+    assert_eq!(
+        Class::Owner.refuses(&mine),
+        Some("an owner file takes no Mac statement")
+    );
+    assert_eq!(Class::Owner.refuses(&write), None);
+    assert_eq!(Class::Owner.refuses(&revert), None);
+    assert_eq!(
+        Class::Mac.refuses(&write),
+        Some("a Mac file takes no owner write")
+    );
+    assert_eq!(
+        Class::Mac.refuses(&revert),
+        Some("a Mac file takes no owner write")
+    );
+    assert_eq!(Class::Mac.refuses(&mine), None);
+}
+
+/// The status counts the records of a file's collection the replica holds inert: a row a Mac
+/// wrote at another Mac's key in an owned collection never projects and is counted, while the
+/// owner files beside it hold none and say so.
+/// NEGATIVE CONTROL, observed: with `materialize::inert` leaving out the owned read's count,
+/// the Mac file's count is 0: `` left: 0 right: 1 ``.
+#[test]
+fn the_status_counts_the_records_a_file_holds_inert() {
+    let stand = Stand::new();
+    let registry = Registry::at(stand.paths().clone());
+    // An observation row at a uuid that is not its signer's: inert to every reader.
+    let foreign = format!("{}.{}", stand.claude_ada, "0".repeat(32));
+    registry
+        .write(vec![vec![crate::database::Change {
+            collection: ACCOUNT_OBS.name.to_owned(),
+            key: foreign,
+            value: Some(json!({"n": 1, "account": stand.claude_ada, "tabs": 1})),
+        }]])
+        .unwrap();
+    let view = registry.view().unwrap();
+    let seen = Type {
+        name: "ai/seen",
+        about: "",
+        family: &att::REGISTRY,
+        class: Class::Mac,
+        collection: &ACCOUNT_OBS,
+        computed: Computed::None,
+        handles: &[],
+    };
+    assert_eq!(materialize::inert(&seen, &view), 1);
+    all(&stand, &stand.pass(false), Word::Live, None);
+    for file in super::FILES {
+        assert_eq!(materialize::inert(file, &view), 0, "{}", file.name);
+        assert_eq!(
+            stand.file(file).state().unwrap().inert,
+            Some(0),
+            "{}",
+            file.name
+        );
+    }
+    let ls = verb(&stand.root(), &["ls"]);
+    assert!(!ls.contains("inert"), "{ls}");
+
+    // An older build rewrote a status without the count (a refused pass keeps the projection
+    // version it read): at the same frontier the next pass projects again rather than trust a
+    // count nobody recorded.
+    // NEGATIVE CONTROL, observed: with `opened` keeping a status that does not say its count,
+    // the pass projects nothing and the count stays unknown: `` left: None right: Some(0) ``.
+    let accounts = stand.file(&super::ACCOUNTS);
+    let path = stand.root().state(&super::ACCOUNTS.file());
+    let mut state: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    if let Value::Object(object) = &mut state {
+        assert!(object.remove("inert").is_some());
+    }
+    std::fs::write(&path, state.to_string()).unwrap();
+    assert_eq!(accounts.state().unwrap().inert, None);
+    let outcomes = stand.pass(false);
+    let outcome = outcomes
+        .iter()
+        .find(|outcome| outcome.name == super::ACCOUNTS.file())
+        .unwrap();
+    assert_eq!(outcome.word, Word::Live, "{outcome:?}");
+    assert_eq!(accounts.state().unwrap().inert, Some(0));
 }
 
 /// A pass projects what arrived, moves the revision only when the content changed, projects
@@ -683,16 +844,16 @@ fn a_pass_projects_what_arrived_and_withholds_what_the_guards_refuse() {
     assert!(stamps.is_sorted(), "oldest first: {stamps:?}");
 }
 
-/// A derived cell is held to the guards its source cell is: a machine's label stored unchecked
+/// A computed cell is held to the guards its source cell is: a machine's label stored unchecked
 /// by an older or modified build, shaped like a credential, shows the grid's refusal text in
-/// `lab/machines` and never reaches the cells derived from it (`ai/accounts` `=links`,
+/// `lab/machines` and never reaches the cells computed from it (`ai/accounts` `=links`,
 /// `ai/links` `=machine_name`), in the snapshot's shown text, its typed values or the face; and
 /// each cell left out is counted.
 /// NEGATIVE CONTROL: either guard alone holds the run back. With `machine_labels` taking the
-/// stored label as it is and `table` writing derived text unchecked, `=links` is the run:
+/// stored label as it is and `table` writing computed text unchecked, `=links` is the run:
 /// `` left: "k9k9k9…" right: "(refused value: not shown)" ``.
 #[test]
-fn a_derived_cell_never_carries_a_value_the_guards_refuse() {
+fn a_computed_cell_never_carries_a_value_the_guards_refuse() {
     let stand = Stand::new();
     all(&stand, &stand.pass(false), Word::Live, None);
     assert_eq!(
@@ -953,11 +1114,26 @@ fn env() -> write::Env<'static> {
     }
 }
 
+/// One write verb of `aterm file` over `paths`, as `env` runs it. The write verbs' clippy.toml
+/// row lets only `aterm file`'s own entry run them; this is aterm-db's one test helper past it.
+fn run_verb(
+    paths: &Paths,
+    config: &std::path::Path,
+    list: &[&str],
+    env: &write::Env<'_>,
+) -> Result<(String, u8), write::Refusal> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "aterm-db's one test helper for the write verbs"
+    )]
+    let said = write::verb(paths, config, &words(list), env);
+    said
+}
+
 /// One write verb of `aterm file` over `paths`: what it printed and its exit code.
 #[track_caller]
 fn wrote(paths: &Paths, config: &std::path::Path, list: &[&str]) -> (String, u8) {
-    write::verb(paths, config, &words(list), &env())
-        .unwrap_or_else(|refusal| panic!("{list:?}: {refusal:?}"))
+    run_verb(paths, config, list, &env()).unwrap_or_else(|refusal| panic!("{list:?}: {refusal:?}"))
 }
 
 /// The id a `queued <id>: <why>` or `held <id>: <why>` answer names.
@@ -1400,7 +1576,7 @@ fn the_write_verbs_queue_follow_bear_retire_and_revert() {
     assert_eq!(code, aterm_file::exit::CONFLICT, "{twice}");
     let twice = id_of(&twice);
     assert!(matches!(
-        write::verb(paths, config, &words(&["resolve", "lab/machines", &twice, "mine"]), &env()),
+        run_verb(paths, config, &["resolve", "lab/machines", &twice, "mine"], &env()),
         Err(write::Refusal::Problem(why)) if why.contains("revert")
     ));
     assert_eq!(held.outbox().held.len(), 1);
@@ -1441,10 +1617,10 @@ fn the_write_verbs_queue_follow_bear_retire_and_revert() {
     // A held birth would be held again as it is: `resolve … mine` refuses it, queues nothing,
     // and leaves it held for `set` on the row that is there or `theirs`.
     assert!(matches!(
-        write::verb(
+        run_verb(
             paths,
             config,
-            &words(&["resolve", "lab/machines", &id_of(&again), "mine"]),
+            &["resolve", "lab/machines", &id_of(&again), "mine"],
             &env()
         ),
         Err(write::Refusal::Problem(why)) if why.contains("new row")
@@ -1483,7 +1659,14 @@ fn the_write_verbs_queue_follow_bear_retire_and_revert() {
         format!("claude.{uuid}")
     );
     assert_eq!(publish::filled(&machine, &uuid), machine);
-    let mine = held
+    // A Mac's statement of its own row to `ai/accounts`, an owner file: the publisher holds it
+    // with the class's rule, never signs it and never writes it at another key, and a person
+    // drops it.
+    // NEGATIVE CONTROL, observed: with the publisher's class check removed, the statement
+    // reaches the typed grid and is held for the filled key instead: `` left: Held { why: "a
+    // typed cell key breaks its grammar" } ``.
+    let accounts = stand.file(&super::ACCOUNTS);
+    let mine = accounts
         .state_mine(
             "harness",
             aterm_file::Draft {
@@ -1491,7 +1674,7 @@ fn the_write_verbs_queue_follow_bear_retire_and_revert() {
                 revert: None,
                 edits: vec![aterm_file::Edit {
                     key: "@self".to_owned(),
-                    column: "note".to_owned(),
+                    column: "label".to_owned(),
                     elem: None,
                     value: json!("says the Mac itself"),
                     text: "says the Mac itself".to_owned(),
@@ -1501,22 +1684,41 @@ fn the_write_verbs_queue_follow_bear_retire_and_revert() {
             NOW,
         )
         .unwrap();
-    // The files of this build are owner-written cells, whose row keys are shorter than a
-    // machine uuid: the filled key is refused by the cell grammar under the writer, and the
-    // statement is held with that rule, never dropped and never written at another key.
     let outcomes = publish_pass(paths, config);
     assert_eq!(
         answer_of(&outcomes, &mine.id),
         Answer::Held {
-            why: "a typed cell key breaks its grammar".to_owned()
+            why: "an owner file takes no Mac statement".to_owned()
         },
         "{outcomes:?}"
     );
     assert!(carrying(paths, &mine.id).is_empty());
-    assert_eq!(held.outbox().held.len(), 1);
+    assert_eq!(accounts.outbox().held.len(), 1);
+    // A person cannot keep it as theirs: `resolve … mine` says so and how to drop it, and
+    // queues nothing.
+    // NEGATIVE CONTROL, observed: with `again` taking the statement as an owner's edits, the
+    // requeue refuses its `@self` keys as a malformed draft, which says nothing of `theirs`:
+    // `` Err(Problem("a Mac's own row is keyed `<pk>.@self`, and an owner's write never is")) ``.
+    let kept = run_verb(
+        paths,
+        config,
+        &["resolve", "ai/accounts", &mine.id, "mine"],
+        &env(),
+    );
+    assert!(
+        matches!(
+            &kept,
+            Err(write::Refusal::Problem(why))
+                if why.contains("an owner file takes no Mac statement")
+                    && why.contains(&format!("resolve ai/accounts {} theirs", mine.id))
+        ),
+        "{kept:?}"
+    );
+    let outbox = accounts.outbox();
+    assert_eq!((outbox.queued.len(), outbox.held.len()), (0, 1));
     assert_eq!(
         verb(&root, &["outbox", "drop", &mine.id]),
-        format!("dropped {} (lab/machines)\n", mine.id)
+        format!("dropped {} (ai/accounts)\n", mine.id)
     );
 
     // `outbox drop` is a person's word for a queued intent.
@@ -1566,7 +1768,7 @@ fn set_takes_the_documented_words_clears_reads_stdin_and_answers_json() {
         stdin: Some("from the pipe\n"),
         ..env()
     };
-    let set = |list: &[&str], env: &write::Env<'_>| write::verb(paths, config, &words(list), env);
+    let set = |list: &[&str], env: &write::Env<'_>| run_verb(paths, config, list, env);
     let (answer, _) = set(&["set", "lab/machines", "m7", "note", "--stdin"], &piped).unwrap();
     op_of(&answer);
     assert_eq!(
@@ -1673,7 +1875,7 @@ fn a_follow_up_is_compared_with_what_the_earlier_intent_left_in_the_register() {
         .unwrap();
     let a = held
         .write(
-            &aterm_file::OwnerAct::verb("person", None).unwrap(),
+            &seam::owner(),
             aterm_file::Draft {
                 born: false,
                 revert: None,
@@ -1831,7 +2033,7 @@ fn a_drop_before_the_publishers_claim_leaves_nothing_signed() {
     let (dropping, dropped) = (file.clone(), id.clone());
     publish::seam::before_next_claim(move || {
         assert_eq!(
-            dropping.drop_intent(&dropped).unwrap(),
+            dropping.drop_intent(&seam::owner(), &dropped).unwrap(),
             aterm_file::Dropped::Dropped
         );
     });
@@ -1850,4 +2052,51 @@ fn a_drop_before_the_publishers_claim_leaves_nothing_signed() {
         stored(paths, &stand.machine, "note"),
         Some(json!("dropped"))
     );
+}
+
+/// A pass whose vault wait is spent before it starts still reads a vault nobody holds: each
+/// wait for a holder tries before its deadline, and the writer-generation walks, which wait on
+/// no holder, run under the pass's own read bound. A pass whose read bound is spent says it ran
+/// out of time as `custody`, never as a succession nobody made.
+///
+/// NEGATIVE CONTROLS (observed 2026-11-14): with `with_custody`'s first walk bounded by the
+/// vault wait again, the first pass records every file `never` (`custody`), "ran out of time",
+/// where it reads them `live`; with `Refusal::of` lacking its out-of-time arm, the spent pass
+/// records them `never` (`succession`). With both, and the reading walk's conformance test
+/// (`model_read_tests`) given no vault wait, that test stops at its first pass on "a word the
+/// reading walk has no state for: (Never, Some(Succession))", the panic a loaded Mac gave it
+/// at 50 ms; with neither, it passes with no vault wait at all.
+#[test]
+fn a_spent_vault_wait_reads_an_unheld_vault_and_a_spent_pass_is_out_of_time_not_a_succession() {
+    let stand = Stand::new();
+    all(
+        &stand,
+        &stand.pass_waiting(false, Duration::ZERO),
+        Word::Live,
+        None,
+    );
+    let spent = Stand::new();
+    let outcomes = materialize::pass(
+        spent.paths(),
+        &spent.config,
+        None,
+        &Pass {
+            read_by: Instant::now(),
+            vault_wait: Duration::ZERO,
+            again: false,
+            now_ms: NOW,
+        },
+    );
+    all(&spent, &outcomes, Word::Never, Some(Why::Custody));
+    for outcome in &outcomes {
+        assert!(
+            outcome
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("ran out of time")),
+            "{}: {:?}",
+            outcome.name,
+            outcome.detail
+        );
+    }
 }

@@ -14,10 +14,10 @@ fn target(thread: &str) -> TapTarget {
     .into()
 }
 
-/// THE CADENCE: a proven claimant in front is asked for at once, then
-/// once per [`RECHECK`] however often the sweep looks; once no target
-/// stands (the program in front moved, the claim gone) its tap is
-/// stopped once, and a target again is asked for at once.
+/// THE CADENCE: a proven claimant in front is asked for at once, then,
+/// while it writes, at most once per [`RECHECK`] however often the sweep
+/// looks; once no target stands (the program in front moved, the claim
+/// gone) its tap is stopped once, and a target again is asked for at once.
 #[test]
 fn a_claimant_is_asked_once_a_recheck_and_stopped_once_gone() {
     const THREAD: &str = "019a0000-0000-7000-8000-00000000000a";
@@ -312,6 +312,7 @@ fn a_settle_read_follows_the_screens_last_move_while_the_record_counts() {
         owed: false,
         output: None,
         screen: None,
+        read: None,
         settle: None,
         wait: None,
         pair: None,
@@ -449,9 +450,19 @@ fn a_harness_read_wait_owes_one_read_at_or_after_it() {
         since: 9_000,
         read_ms,
     };
-    let read = |asked: &mut HashMap<u64, RolloutAsk>, ms: u64| {
-        due(asked, 7, Some(target(THREAD)), None, (at(ms), None))
+    // A sweep at `ms` of a tab whose last output was at `wrote`: the tab at rest is read on the
+    // slow clock alone, so the reads this law needs before and after the pair read are sweeps that
+    // find the output moved, each more than [`RECHECK`] old so no trailing read is owed.
+    let sweep = |asked: &mut HashMap<u64, RolloutAsk>, ms: u64, wrote: Option<u64>| {
+        due(
+            asked,
+            7,
+            Some(target(THREAD)),
+            None,
+            (at(ms), wrote.map(at)),
+        )
     };
+    let read = |asked: &mut HashMap<u64, RolloutAsk>, ms: u64| sweep(asked, ms, None);
 
     pair_wait(&mut asked, 7, Some((wait(0), at(3_000))));
     assert!(asked.is_empty(), "no ask, nothing taken");
@@ -467,7 +478,11 @@ fn a_harness_read_wait_owes_one_read_at_or_after_it() {
         Some(at(3_000)),
         "a new wait owes its read"
     );
-    assert_eq!(read(&mut asked, 1_500), Ask::Read(target(THREAD)));
+    assert_eq!(
+        sweep(&mut asked, 1_500, Some(400)),
+        Ask::Read(target(THREAD)),
+        "the output moved"
+    );
     assert_eq!(
         ask(&asked).wake(),
         Some(at(3_000)),
@@ -479,13 +494,26 @@ fn a_harness_read_wait_owes_one_read_at_or_after_it() {
         Some(at(3_000)),
         "the same wait again keeps it"
     );
-    assert_eq!(read(&mut asked, 2_000), Ask::Nothing, "inside the recheck");
+    assert_eq!(
+        sweep(&mut asked, 2_000, Some(400)),
+        Ask::Nothing,
+        "inside the recheck"
+    );
     assert_eq!(
         ask(&asked).wake(),
         Some(at(3_000)),
         "a refused sweep keeps it"
     );
-    assert_eq!(read(&mut asked, 3_000), Ask::Read(target(THREAD)));
+    assert_eq!(
+        sweep(&mut asked, 2_600, Some(400)),
+        Ask::Nothing,
+        "past the recheck the tab rests until the pair read"
+    );
+    assert_eq!(ask(&asked).wake(), Some(at(3_000)), "and the rest keeps it");
+    assert_eq!(
+        sweep(&mut asked, 3_000, Some(400)),
+        Ask::Read(target(THREAD))
+    );
     assert_eq!(ask(&asked).pair, None, "the read at it discharges it");
     assert_eq!(ask(&asked).wake(), None);
     pair_wait(&mut asked, 7, Some((wait(0), at(3_000))));
@@ -494,7 +522,11 @@ fn a_harness_read_wait_owes_one_read_at_or_after_it() {
         None,
         "a failed read leaves the wait as it was: nothing more is owed"
     );
-    assert_eq!(read(&mut asked, 4_000), Ask::Read(target(THREAD)));
+    assert_eq!(
+        sweep(&mut asked, 4_000, Some(2_900)),
+        Ask::Read(target(THREAD)),
+        "the output moved again"
+    );
     pair_wait(&mut asked, 7, Some((wait(0), at(4_000))));
     assert_eq!(ask(&asked).wake(), None, "nor at the next read's");
     pair_wait(&mut asked, 7, Some((wait(1_900), at(4_000))));
@@ -506,4 +538,296 @@ fn a_harness_read_wait_owes_one_read_at_or_after_it() {
     pair_wait(&mut asked, 7, None);
     assert_eq!((ask(&asked).wait, ask(&asked).pair), (None, None));
     assert_eq!(ask(&asked).wake(), None, "no wait clears it");
+}
+
+/// AT REST, THE SLOW CLOCK (S1): a tab whose output and screen stand since its last read, with no
+/// trailing, settle or pair read owed, is read once per [`REST_NEAR`] while it wrote within
+/// [`NEAR_FOR`], and once per [`REST_FAR`] after: swept each second for a minute, the tab that
+/// wrote 5 s before the first sweep is read at 0, 15, 30 and 45 s, the one that wrote 11 minutes
+/// before, and the one that never wrote, once. No rest read arms a wake. NEGATIVE CONTROL: with
+/// the rest branch of [`due`] deleted every sweep reads, 60 a tab.
+#[test]
+fn a_tab_at_rest_is_read_on_the_slow_clock() {
+    const THREAD: &str = "019a0000-0000-7000-8000-00000000000d";
+    let g = crate::control::ScreenGen { epoch: 1, seq: 9 };
+    let t0 = Instant::now() + Duration::from_secs(3_600);
+    let reads = |wrote: Option<Instant>, look: Option<Look>| {
+        let mut asked = HashMap::new();
+        let mut reads = Vec::new();
+        for k in 0..60u64 {
+            let now = t0 + Duration::from_secs(k);
+            match due(&mut asked, 7, Some(target(THREAD)), look, (now, wrote)) {
+                Ask::Read(to) => {
+                    assert_eq!(to, target(THREAD));
+                    reads.push(k);
+                }
+                Ask::Nothing => {}
+                Ask::Stop => panic!("{k}: a standing target is never stopped"),
+            }
+            assert_eq!(
+                asked.get(&7).and_then(RolloutAsk::wake),
+                None,
+                "{k}: a tab at rest arms no wake"
+            );
+        }
+        reads
+    };
+    let uncounted = Some(Look {
+        screen: g,
+        counted: false,
+    });
+    let near = Some(t0 - Duration::from_secs(5));
+    assert_eq!(reads(near, None), [0, 15, 30, 45]);
+    assert_eq!(reads(near, uncounted), [0, 15, 30, 45]);
+    let far = Some(t0 - Duration::from_secs(11 * 60));
+    assert_eq!(reads(far, None), [0]);
+    assert_eq!(reads(far, uncounted), [0]);
+    assert_eq!(reads(None, uncounted), [0], "a tab that never wrote");
+    // The ladder's edge: output 9 min 30 s old at the first sweep is near at the 15 s sweep and
+    // ten minutes old at the 30 s one, which then waits [`REST_FAR`] from the read at 15 s.
+    let edge = Some(t0 - Duration::from_secs(9 * 60 + 30));
+    assert_eq!(reads(edge, None), [0, 15]);
+    assert_eq!(
+        rest_recheck(t0, Some(t0 - NEAR_FOR + Duration::from_millis(1))),
+        REST_NEAR
+    );
+    assert_eq!(rest_recheck(t0, Some(t0 - NEAR_FOR)), REST_FAR);
+    assert_eq!(rest_recheck(t0, None), REST_FAR);
+}
+
+/// THE TRAILING READ STANDS THOUGH NO SWEEP FELL INSIDE ITS SECOND (S1): a read sent 250 ms after
+/// the tab's output owes one more, [`RECHECK`] later, and the first sweep past that reads though
+/// none came between to note it owed; the sweeps after that trailing read, the tab at rest, read
+/// nothing. NEGATIVE CONTROL: with the rest branch's "sent within `RECHECK` of the output" clause
+/// deleted the 1300 ms sweep answers `Nothing`.
+#[test]
+fn a_read_just_after_output_is_followed_by_its_trailing_read_then_rests() {
+    const THREAD: &str = "019a0000-0000-7000-8000-00000000000e";
+    let mut asked = HashMap::new();
+    let t0 = Instant::now() + Duration::from_secs(3_600);
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let wrote = Some(t0);
+    let mut said = Vec::new();
+    for ms in [250, 1_300, 2_300, 3_300] {
+        let ask = due(&mut asked, 7, Some(target(THREAD)), None, (at(ms), wrote));
+        said.push((ms, ask == Ask::Read(target(THREAD))));
+        assert_ne!(ask, Ask::Stop, "{ms}");
+    }
+    assert_eq!(
+        said,
+        [(250, true), (1_300, true), (2_300, false), (3_300, false)]
+    );
+    assert_eq!(
+        asked.get(&7).map(|a| a.at),
+        Some(at(1_300)),
+        "the rest is timed from the trailing read"
+    );
+}
+
+/// MOVEMENT ENDS THE REST (S1): a resting tab whose output moved, or whose screen moved, is read
+/// at the next sweep, and a settle or a pair read that came due is read at the sweep that finds
+/// it due; each such read starts the rest again. A screen that a sweep inside [`RECHECK`] was
+/// first to see moved is read at the first sweep past the recheck: the rest is judged against
+/// the screen the last read saw. CONTROL: the same sweeps with nothing moved read nothing.
+/// NEGATIVE CONTROLS, one for each test the rest branch of [`due`] makes, each deleted alone:
+/// without `output == prior.output` the sweep after the output moved answers `Nothing`; without
+/// `screen == prior.read`, the sweep after the screen moved; without the settle test, the sweep
+/// at the settle; without the pair test, the sweep at the pair read's instant. With the screen
+/// compared to the last call's (`prior.screen`), the sweep past the recheck after a move seen
+/// inside it answers `Nothing`.
+#[test]
+fn a_resting_tab_is_read_at_the_first_sweep_after_it_moved() {
+    const THREAD: &str = "019a0000-0000-7000-8000-00000000000f";
+    let g = |seq: u64| crate::control::ScreenGen { epoch: 1, seq };
+    let look = |seq: u64, counted: bool| {
+        Some(Look {
+            screen: g(seq),
+            counted,
+        })
+    };
+    let t0 = Instant::now() + Duration::from_secs(3_600);
+    let at = |s: u64| t0 + Duration::from_secs(s);
+    let old = Some(t0 - Duration::from_secs(5));
+    let rested = || {
+        let mut asked = HashMap::new();
+        assert_eq!(
+            due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                look(1, false),
+                (t0, old)
+            ),
+            Ask::Read(target(THREAD))
+        );
+        for s in 1..=19 {
+            let read = due(
+                &mut asked,
+                7,
+                Some(target(THREAD)),
+                look(1, false),
+                (at(s), old),
+            ) == Ask::Read(target(THREAD));
+            assert_eq!(read, s == 15, "{s}: the rest's own read alone");
+        }
+        asked
+    };
+
+    let mut still = rested();
+    assert_eq!(
+        due(
+            &mut still,
+            7,
+            Some(target(THREAD)),
+            look(1, false),
+            (at(20), old)
+        ),
+        Ask::Nothing,
+        "CONTROL: nothing moved"
+    );
+
+    let mut wrote = rested();
+    assert_eq!(
+        due(
+            &mut wrote,
+            7,
+            Some(target(THREAD)),
+            look(1, false),
+            (at(20), Some(at(20)))
+        ),
+        Ask::Read(target(THREAD)),
+        "the output moved"
+    );
+
+    let mut drew = rested();
+    assert_eq!(
+        due(
+            &mut drew,
+            7,
+            Some(target(THREAD)),
+            look(2, false),
+            (at(20), old)
+        ),
+        Ask::Read(target(THREAD)),
+        "the screen moved"
+    );
+    assert_eq!(
+        due(
+            &mut drew,
+            7,
+            Some(target(THREAD)),
+            look(2, false),
+            (at(21), old)
+        ),
+        Ask::Nothing,
+        "and the rest starts again from that read"
+    );
+
+    // A screen that moves while the record names a count is read at the move and owes its settle
+    // read, which the rest does not hold back.
+    let mut counted = rested();
+    assert_eq!(
+        due(
+            &mut counted,
+            7,
+            Some(target(THREAD)),
+            look(2, true),
+            (at(20), old)
+        ),
+        Ask::Read(target(THREAD))
+    );
+    assert_eq!(
+        counted.get(&7).and_then(RolloutAsk::wake),
+        Some(at(20) + SETTLE)
+    );
+    assert_eq!(
+        due(
+            &mut counted,
+            7,
+            Some(target(THREAD)),
+            look(2, true),
+            (at(21), old)
+        ),
+        Ask::Nothing,
+        "a settle still to come is not read early"
+    );
+    assert_eq!(
+        counted.get(&7).and_then(RolloutAsk::wake),
+        Some(at(20) + SETTLE),
+        "and the rest keeps its wake"
+    );
+    assert_eq!(
+        due(
+            &mut counted,
+            7,
+            Some(target(THREAD)),
+            look(2, true),
+            (at(20) + SETTLE, old)
+        ),
+        Ask::Read(target(THREAD)),
+        "the settle read"
+    );
+    assert_eq!(counted.get(&7).and_then(RolloutAsk::wake), None);
+
+    // A pair read the log names is read at the sweep that finds it due.
+    let mut paired = rested();
+    let wait = ReadWait {
+        since: 9_000,
+        read_ms: 0,
+    };
+    pair_wait(&mut paired, 7, Some((wait, at(25))));
+    assert_eq!(
+        due(
+            &mut paired,
+            7,
+            Some(target(THREAD)),
+            look(1, false),
+            (at(24), old)
+        ),
+        Ask::Nothing,
+        "a pair read still to come"
+    );
+    assert_eq!(paired.get(&7).and_then(RolloutAsk::wake), Some(at(25)));
+    assert_eq!(
+        due(
+            &mut paired,
+            7,
+            Some(target(THREAD)),
+            look(1, false),
+            (at(25), old)
+        ),
+        Ask::Read(target(THREAD)),
+        "the pair read"
+    );
+    assert_eq!(paired.get(&7).and_then(RolloutAsk::wake), None);
+
+    // A screen a sweep inside the recheck was first to see moved, on a tab whose record names no
+    // count: no wake is armed for it, and the first sweep past the recheck reads.
+    let mut early = HashMap::new();
+    let ms = |ms: u64| t0 + Duration::from_millis(ms);
+    let mut sweep = |seq: u64, at: Instant| {
+        let ask = due(
+            &mut early,
+            7,
+            Some(target(THREAD)),
+            look(seq, false),
+            (at, old),
+        );
+        (
+            ask == Ask::Read(target(THREAD)),
+            early.get(&7).and_then(RolloutAsk::wake),
+        )
+    };
+    assert_eq!(sweep(1, t0), (true, None));
+    assert_eq!(sweep(2, ms(500)), (false, None), "inside the recheck");
+    assert_eq!(
+        sweep(2, ms(1_500)),
+        (true, None),
+        "the screen moved since the read"
+    );
+    assert_eq!(
+        sweep(2, ms(2_500)),
+        (false, None),
+        "and the rest starts again from that read"
+    );
 }

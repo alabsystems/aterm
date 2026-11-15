@@ -15,7 +15,12 @@ const UNREAD_LOOK_MS: i64 = 5 * 60_000;
 
 /// The policy's maximum reset jitter, in milliseconds.
 fn reset_jitter_ms() -> i64 {
-    i64::try_from(turn_end::TurnEndTiming::default().reset_jitter.as_millis()).unwrap_or(i64::MAX)
+    i64::try_from(
+        alab_policy::config::TurnEndTiming::default()
+            .reset_jitter
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 fn goings_on(seen: &Seen, t1: i64) -> Vec<(i64, String)> {
@@ -224,7 +229,7 @@ pub(super) fn judge_wall_redraw(
     // The land check answers the program's own continuation's defense, no act on top of it.
     let after = on
         .iter()
-        .find(|(t, rule)| *t >= r2_ms && rule != turn_end::RULE_LAND_CHECK);
+        .find(|(t, rule)| *t >= r2_ms && rule != alab_policy::land_check::RULE_LAND_CHECK);
     let went_on = seen.cover.went_on_ms.filter(|t| *t >= lift);
     let gone = match (after, went_on) {
         (Some((ta, rule)), Some(tv)) if tv < *ta => {
@@ -333,7 +338,9 @@ fn land_act_after(seen: &Seen, t: i64) -> Option<(i64, &str)> {
         .filter(|(at, _)| *at > t)
         .find_map(|(at, l)| {
             act_rule(l)
-                .filter(|r| *r == turn_end::RULE_LAND || *r == turn_end::RULE_LAND_NUDGE)
+                .filter(|r| {
+                    *r == alab_policy::words::RULE_LAND || *r == alab_policy::words::RULE_LAND_NUDGE
+                })
                 .map(|r| (*at, r))
         })
 }
@@ -686,7 +693,7 @@ fn gone_past(
     // The land check answers the program's own continuation's defense, no act on top of it.
     let after = on
         .iter()
-        .find(|(t, rule)| *t >= r_ms && rule != turn_end::RULE_LAND_CHECK);
+        .find(|(t, rule)| *t >= r_ms && rule != alab_policy::land_check::RULE_LAND_CHECK);
     let went_on = seen.cover.went_on_ms.filter(|t| *t >= lift);
     let own = |tv: i64| {
         (

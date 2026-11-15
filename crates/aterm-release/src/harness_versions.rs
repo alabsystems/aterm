@@ -95,16 +95,8 @@ pub fn notes_gate_at(
 ) -> Result<()> {
     let read = |at: &str| -> Result<String> {
         let spec = format!("{at}:{}", crate::changelog::CHANGELOG_FILE);
-        let out = crate::ledger::git_read_ok(
-            git,
-            &[
-                "--no-lazy-fetch",
-                "--no-replace-objects",
-                "cat-file",
-                "blob",
-                &spec,
-            ],
-        )?;
+        let out =
+            crate::ledger::git_read_ok(git, &["--no-replace-objects", "cat-file", "blob", &spec])?;
         String::from_utf8(out.stdout)
             .map_err(|_| Error::new(format!("harness notes: non-UTF-8 {spec}")))
     };
@@ -144,7 +136,7 @@ pub fn notes_gate_at(
                 )));
             }
             let resolved = crate::ledger::git_read_ok(git, &[
-                "--no-lazy-fetch", "--no-replace-objects", "rev-parse", "--verify",
+                "--no-replace-objects", "rev-parse", "--verify",
                 &format!("refs/tags/v{anchor}^{{commit}}"),
             ]).map_err(|error| Error::new(format!("harness notes: cannot resolve announcement anchor v{anchor}: {error}\nfix: run `targo --unverified ship harness-bump`")))?.stdout_utf8();
             let wider = increased_versions(git, resolved.trim(), commit)?;
@@ -343,16 +335,15 @@ pub fn owed_between(git: &dyn GitRunner, released: &str, commit: &str) -> Result
 /// owed version file's text at `tip` rewritten to its new version: what the release's landing
 /// on main writes ([`crate::ledger::claim`]).
 ///
-/// A release's tag becomes the landing check's baseline (`verify census`, "harness landing
-/// debt") in the commit that brings the release commit into main's history, which is that
-/// landing. Every harness whose sources main changed past the release commit then owes a
-/// version above the release's; main last raised them for the window this release closes. The
-/// landing is the first commit in which that debt exists and the one in which it is exactly
-/// known, so it carries the raised versions and main is never red for it.
+/// A release's tag becomes the next release's harness baseline in the commit that brings the
+/// release commit into main's history, which is that landing. Every harness whose sources main
+/// changed past the release commit then owes a version above the release's; main last raised
+/// them for the window this release closes. The landing is the first commit in which that debt
+/// exists and the one in which it is exactly known, so it carries the raised versions.
 ///
-/// The diff reads renames as a removal and an addition, as the landing check's does. A version
-/// file `tip` no longer holds, or one with no `HARNESS_VER` declaration, is left as it is: the
-/// landing check names it to the next landing, and the release is not refused for it.
+/// The diff reads renames as a removal and an addition. A version file `tip` no longer holds, or
+/// one with no `HARNESS_VER` declaration, is left as it is: the next release's harness check
+/// names it, and this release is not refused for it.
 ///
 /// # Errors
 /// git cannot diff the two commits or read a version file.

@@ -235,17 +235,15 @@ fn the_bootstrap_gate_holds_a_pending_bootstrap_and_never_a_configured_pass() {
     doc.set_entry(&Audience::Everyone, "note", b"inert-note")
         .unwrap();
     admin_publish(&founder, &opened, &doc).unwrap();
-    let note = crate::materialize::target_path(&founder.home, "note").unwrap();
     // An intent setup wrote before this Mac had a vault, left beside the one it has now.
     fsx::write_atomic(&founder.dir.join(FILE), INTENT, 0o600).unwrap();
     for pass in ["with the stale intent", "with none"] {
-        let _ = std::fs::remove_file(&note);
         subscriber_pass(&founder, &mut None, &FOUND_NONE).unwrap_or_else(|e| {
             panic!("a configured Mac's pass {pass} is not the bootstrap gate's: {e}")
         });
         assert_eq!(
-            std::fs::read(&note).unwrap(),
-            b"inert-note",
+            stored(&founder, "note").as_deref(),
+            Some(&b"inert-note"[..]),
             "the pass {pass} read the vault"
         );
         assert!(!founder.dir.join(FILE).exists(), "the stale intent is gone");
@@ -389,7 +387,7 @@ fn bootstrap_intent_survives_first_fetch_and_authentication_failures_then_recove
         Membership::In { .. }
     ));
     assert_eq!(
-        std::fs::read(restarted.home.join(".secrets/bootstrap-test")).unwrap(),
+        crate::client::stored(&restarted, "bootstrap-test").unwrap(),
         b"fixture-only"
     );
 }

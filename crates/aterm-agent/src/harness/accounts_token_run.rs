@@ -14,14 +14,19 @@
 //!   where the account has a token entry (a launch on an account with none says nothing);
 //! - **serves** otherwise: it unsets every [`accounts::CREDENTIAL_KEYS`] variable (today's
 //!   judgment left only empty ones) and any inherited marker, sets
-//!   [`token_route::MARKER_ENV`] to the entry, writes the token and a newline into one end of a
-//!   socketpair and closes it, and execs the program holding the other end as an inherited guard
-//!   numbered in [`token_route::DESCRIPTOR_ENV`]. The token is never in argv, the environment, a
-//!   file, the scrollback or a pipe another process reads.
+//!   [`token_route::MARKER_ENV`] to the entry and [`token_route::MINTED_ENV`] to the served
+//!   token's `minted_at` (which token of the entry it is), writes the token and a newline into
+//!   one end of a socketpair and closes it, and execs the program holding the other end as an
+//!   inherited guard numbered in [`token_route::DESCRIPTOR_ENV`]. The token is never in argv, the
+//!   environment, a file, the scrollback or a pipe another process reads.
 //!
-//! It writes no table and takes no harness lock: a relaunch holds `accounts.lock` from admission
-//! through dispatch, and an unlabelled run reads the claims ring from a snapshot. A labelled
-//! line was admitted under that lock before it was typed, so it reads the claims ring not at all.
+//! It takes no harness lock: a relaunch holds `accounts.lock` from admission through dispatch,
+//! and an unlabelled run reads the claims ring from a snapshot. A labelled line was admitted
+//! under that lock before it was typed, so it reads the claims ring not at all. It writes one
+//! thing only: where the judgment holds a token for its basis and this Mac's token
+//! table keeps no row of that token, it makes the row (`accounts_tokens::note_held`) under the
+//! table's own `tokens.lock`, which no line's relaunch holds and each writer holds only for one
+//! table write; a row it could not make is made by the next judgment.
 
 use super::accounts::{self, ProcessLogin, Roster, Store, TokenEntry};
 use super::token_route::{self, Account, Ask, Decision, Facts, Fallback, Named, TokenFact};
@@ -127,7 +132,7 @@ impl Ctx {
             #[cfg(unix)]
             vault: aterm_secrets::client::Paths::live().ok(),
             now: found.as_ref().map_or(0, |env| env.now),
-            macos: cfg!(target_os = "macos"),
+            macos: token_route::LAUNCHES_ON_TOKEN,
         }
     }
 }
@@ -211,7 +216,15 @@ impl Ask for Asked<'_> {
             Duration::ZERO
         };
         let now = u64::try_from(self.ctx.now).unwrap_or(0);
-        let (fact, read) = token_route::standing_fact(vault, store, entry, account, now, wait);
+        let (fact, read) = token_route::standing_fact(
+            vault,
+            store,
+            self.ctx.roster.as_ref(),
+            entry,
+            account,
+            now,
+            wait,
+        );
         self.found.set(fact != TokenFact::Absent);
         *self.read.borrow_mut() = read;
         fact
@@ -323,10 +336,14 @@ pub fn main_entry(args: &[OsString]) -> ExitCode {
     #[cfg(unix)]
     {
         let error = match decided {
-            (Decision::Token { entry, .. }, Some(read), Some(build)) => match read.token() {
-                Some(token) => serve(build.as_os_str(), &run.args, token, entry),
-                None => as_typed(&run.program, &run.args),
-            },
+            (Decision::Token { entry, .. }, Some(read), Some(build)) => {
+                match (read.token(), read.standing.meta.as_ref()) {
+                    (Some(token), Some(meta)) => {
+                        serve(build.as_os_str(), &run.args, token, (entry, meta.minted_at))
+                    }
+                    _ => as_typed(&run.program, &run.args),
+                }
+            }
             _ => as_typed(&run.program, &run.args),
         };
         eprintln!("aterm: {}: {error}", Path::new(&run.program).display());
@@ -358,14 +375,15 @@ fn as_typed(program: &std::ffi::OsStr, args: &[OsString]) -> std::io::Error {
 }
 
 /// Exec `program` on `token` (§5.3, serving): the credential variables and any inherited marker
-/// unset, the marker naming `entry`, and the token behind an inherited socket numbered in the
-/// descriptor variable. Returns only where the exec failed.
+/// and `minted_at` unset, the marker naming `entry` and [`token_route::MINTED_ENV`] the token's
+/// `minted_at`, and the token behind an inherited socket numbered in the descriptor variable.
+/// Returns only where the exec failed.
 #[cfg(unix)]
 fn serve(
     program: &std::ffi::OsStr,
     args: &[OsString],
     token: &aterm_secrets::SecretBytes,
-    entry: TokenEntry,
+    (entry, minted_at): (TokenEntry, u64),
 ) -> std::io::Error {
     use std::io::Write as _;
     let (mut ours, theirs) = match std::os::unix::net::UnixStream::pair() {
@@ -385,7 +403,7 @@ fn serve(
     command.args(args);
     for name in accounts::CREDENTIAL_KEYS
         .iter()
-        .chain(&[token_route::MARKER_ENV])
+        .chain(&[token_route::MARKER_ENV, token_route::MINTED_ENV])
     {
         command.env_remove(name);
     }
@@ -404,6 +422,7 @@ fn serve(
     };
     command.env(token_route::DESCRIPTOR_ENV, number.to_string());
     command.env(token_route::MARKER_ENV, entry.name());
+    command.env(token_route::MINTED_ENV, minted_at.to_string());
     command.exec()
 }
 

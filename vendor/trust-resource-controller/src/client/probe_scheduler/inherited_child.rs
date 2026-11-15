@@ -140,11 +140,11 @@ impl InheritedChild {
 }
 impl Drop for InheritedChild {
     fn drop(&mut self) {
-        if let Err(error) = self.finish_callback() {
-            if !matches!(self.state, Retirement::Retired(_)) {
+        if let Err(error) = self.finish_callback()
+            && !matches!(self.state, Retirement::Retired(_))
+        {
                 eprintln!("inherited child retirement failed: {error}");
                 std::process::abort();
-            }
         }
     }
 }

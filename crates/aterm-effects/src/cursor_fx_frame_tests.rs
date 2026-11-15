@@ -679,3 +679,107 @@ fn the_unset_trail_colour_is_what_the_frame_draws() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// THE RAINBOW BLOCK DRAWS ITS INNERMOST HALO RING INSIDE THE BLOCK, AS A KEYLINE OVER ITS FILL,
+/// UNLESS ITS COLOUR IS PINNED ([`CursorFxFrame::keyline_tint`]). One pixel out, that ring was an
+/// outline that left its old cell and lit its new one on every move of the caret; inside, over
+/// the caret's own colour, it moves with the caret's pixels and still reads as a caret on the
+/// page. A cursor colour the program pinned is never recoloured: its ring stays outside, and no
+/// keyline lies over it. The control draws the ring outside again
+/// ([`with_block_rim_outside`]).
+#[test]
+fn the_rainbow_block_draws_its_inner_ring_inside_unless_its_colour_is_pinned() {
+    let (cur, g) = ((2u16, 4u16), geom());
+    let (cw, ch) = (g.cw as u16, g.ch as u16);
+    let left_of_block = cur.1 * cw - 1;
+    // The keyline, the caret's fill, and the brightest channel of light the additive quads that
+    // start one pixel left of the block on its rows add: the innermost ring's left side, where it
+    // hugs the block (an outer ring of a small cell may start there too, all but dark).
+    let read = |pinned: bool| -> (Option<u32>, Option<u32>, u32) {
+        let mut s = Session::new("rainbow", knobs(), false, LIGHT);
+        let now = s.t0;
+        s.fx.begin(true, true);
+        let blank = vec![' '; g.cols];
+        s.fx.glow.observe_row(cur.0, cur.1, &blank, now);
+        let frame = s.fx.tick(
+            &CursorFxInput {
+                now,
+                cur: Some(cur),
+                live_viewport: true,
+                cursor_style: s.shape,
+                blink_phase: true,
+                live_cursor: THEME_CURSOR,
+                cursor_color_pinned: pinned,
+                default_bg: LIGHT.1,
+                geom: g,
+                focused: true,
+                cursor_cell_bg: None,
+                trail_brightness: 1.0,
+                shed_envelope: 1.0,
+                body_allowed: true,
+                momentum_glow: false,
+                user_tinted: s.tinted,
+                accent_pinned: false,
+            },
+            &s.glow,
+            s.trail,
+        );
+        let (top, bot) = (cur.0 * ch, (cur.0 + 1) * ch);
+        let hugging =
+            s.fx.glow_scratch
+                .iter()
+                .filter(|q| q.alpha == 0 && q.x == left_of_block && q.y >= top && q.y < bot)
+                .map(|q| brightest_channel(q.color).max(brightest_channel(q.color2)))
+                .max()
+                .unwrap_or(0);
+        (frame.keyline_tint, frame.caret_fill(), hugging)
+    };
+    let (tint, fill, hugging) = read(false);
+    let tint = tint.expect("the rainbow block draws a keyline");
+    let fill = fill.expect("the rainbow fills its block");
+    let keyline = aterm_render::block_keyline_colour(fill, tint, LIGHT.1);
+    assert!(
+        hugging <= HUGGING_UNSEEN,
+        "the innermost ring left a side hugging the block, adding {hugging} to a channel"
+    );
+    assert_ne!(
+        keyline, fill,
+        "the keyline is the ring over the fill, not the fill"
+    );
+    let ratio = crate::color_math::contrast_ratio(keyline, LIGHT.1);
+    assert!(
+        ratio >= CARET_PAGE_MIN_CONTRAST,
+        "the keyline {keyline:06x} reads {ratio:.2}:1 on the page"
+    );
+    let against_fill = crate::color_math::contrast_ratio(keyline, fill);
+    assert!(
+        against_fill >= aterm_render::KEYLINE_FILL_MIN_CONTRAST,
+        "the keyline {keyline:06x} reads {against_fill:.2}:1 on the fill {fill:06x}"
+    );
+    let (pinned_keyline, _, pinned_hugging) = read(true);
+    assert_eq!(
+        pinned_keyline, None,
+        "a pinned cursor colour wears a keyline"
+    );
+    assert!(
+        pinned_hugging > HUGGING_UNSEEN,
+        "a pinned cursor colour lost its ring outside the block ({pinned_hugging} to a channel)"
+    );
+    let (outside_keyline, _, outside_hugging) = with_block_rim_outside(|| read(false));
+    assert!(
+        outside_keyline.is_none() && outside_hugging > HUGGING_UNSEEN,
+        "control: with the ring outside, the frame reads keyline {outside_keyline:?} and \
+         {outside_hugging} to a channel hugging the block"
+    );
+}
+
+/// The most light a quad hugging the block may add to a channel unseen: two steps of 255, a
+/// fiftieth of a flash's swing at the brightest.
+const HUGGING_UNSEEN: u32 = 2;
+
+/// The greatest of a colour's three channels.
+const fn brightest_channel(c: u32) -> u32 {
+    let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+    let m = if r > g { r } else { g };
+    if m > b { m } else { b }
+}

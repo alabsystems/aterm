@@ -33,6 +33,11 @@ const MAX_COMPARISONS: usize = 4_000_000;
 /// give none.
 #[must_use]
 pub fn minimal_edits(old: &str, new: &str) -> Vec<TextEdit> {
+    #[cfg(any(test, debug_assertions))]
+    crate::store::record_preparation_work(crate::store::PreparationWork {
+        diff_input_bytes: old.len().saturating_add(new.len()),
+        ..Default::default()
+    });
     let mut edits = Vec::new();
     if old != new {
         diff_pieces(

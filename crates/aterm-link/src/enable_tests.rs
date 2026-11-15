@@ -7,13 +7,13 @@ use super::*;
 fn an_accepted_retirement_waits_for_its_actual_publication() {
     let (send, reply) = std::sync::mpsc::channel();
     send.send(fabric::RetireProgress {
-        states: BTreeMap::from([("s-fixture".to_owned(), "exited".to_owned())]),
+        states: BTreeMap::from([("tf1xtvre000".to_owned(), "exited".to_owned())]),
         refusals_read: true,
         ..fabric::RetireProgress::default()
     })
     .unwrap();
     let outcome = await_retirement(
-        &["s-fixture"],
+        &["tf1xtvre000"],
         Instant::now() - Duration::from_secs(6),
         |_| Ok(reply.try_recv().unwrap_or_default()),
         || {},
@@ -24,36 +24,36 @@ fn an_accepted_retirement_waits_for_its_actual_publication() {
     assert!(outcome.refusals_read);
 
     send.send(fabric::RetireProgress {
-        states: BTreeMap::from([("s-fixture".to_owned(), "exited".to_owned())]),
+        states: BTreeMap::from([("tf1xtvre000".to_owned(), "exited".to_owned())]),
         ..fabric::RetireProgress::default()
     })
     .unwrap();
     let expired = await_retirement(
-        &["s-fixture"],
+        &["tf1xtvre000"],
         Instant::now() - Duration::from_secs(61),
         |_| panic!("an expired wait does not observe another result"),
         || panic!("an expired wait never pauses"),
     );
     assert_eq!(expired.done, 0);
-    assert_eq!(expired.pending, ["s-fixture"]);
+    assert_eq!(expired.pending, ["tf1xtvre000"]);
     assert_eq!(
         reply
             .try_recv()
             .unwrap()
             .states
-            .get("s-fixture")
+            .get("tf1xtvre000")
             .map(String::as_str),
         Some("exited")
     );
 
-    let reasons = BTreeMap::from([("s-fixture".to_owned(), "fixture refusal".to_owned())]);
+    let reasons = BTreeMap::from([("tf1xtvre000".to_owned(), "fixture refusal".to_owned())]);
     let mut progress = Some(fabric::RetireProgress {
         refused: reasons.clone(),
         refusals_read: true,
         ..fabric::RetireProgress::default()
     });
     let refused = await_retirement(
-        &["s-fixture"],
+        &["tf1xtvre000"],
         Instant::now(),
         |_| Ok(progress.take().expect("one actual refusal")),
         || {},
@@ -3715,21 +3715,21 @@ fn every_warning_shape() -> Vec<fabric::WarningKind> {
             sock: Some("/run/a b.sock".to_string()),
         },
         W::SessionHeld {
-            sid: "s-a".to_string(),
+            sid: "ta000000000".to_string(),
             pid: 1,
             sock: None,
             origin: Some("local".to_string()),
             fabric_lost: false,
         },
         W::SessionHeld {
-            sid: "s-a".to_string(),
+            sid: "ta000000000".to_string(),
             pid: 1,
             sock: None,
             origin: Some("person,remote,fleet,local".to_string()),
             fabric_lost: true,
         },
         W::SessionHeld {
-            sid: "s-a".to_string(),
+            sid: "ta000000000".to_string(),
             pid: 1,
             sock: None,
             origin: None,
@@ -4073,14 +4073,17 @@ fn a_fix_picks_the_remedy_the_warning_names() {
     }
     let held = |reason: &str, origin: &str| {
         fix_for(&fabric::WarningKind::SessionHeld {
-            sid: "s-a".to_string(),
+            sid: "ta000000000".to_string(),
             pid: 1,
             sock: None,
             origin: Some(origin.to_string()),
             fabric_lost: reason == "fabric-lost",
         })
     };
-    assert_eq!(held("x", "local"), "`aterm ctl --pid 1 hold s-a off`");
+    assert_eq!(
+        held("x", "local"),
+        "`aterm ctl --pid 1 hold ta000000000 off`"
+    );
     assert_eq!(
         fix_for(&fabric::WarningKind::SessionHeld {
             sid: String::new(),
@@ -4093,33 +4096,33 @@ fn a_fix_picks_the_remedy_the_warning_names() {
     );
     assert_eq!(
         fix_for(&fabric::WarningKind::SessionHeld {
-            sid: "s-a".to_string(),
+            sid: "ta000000000".to_string(),
             pid: 1,
             sock: Some("/tmp/at.x/a.sock".to_string()),
             origin: Some("local".to_string()),
             fabric_lost: false,
         }),
-        "`aterm ctl --sock /tmp/at.x/a.sock hold s-a off`"
+        "`aterm ctl --sock /tmp/at.x/a.sock hold ta000000000 off`"
     );
     assert_eq!(
         fix_for(&fabric::WarningKind::SessionHeld {
-            sid: "s-a".to_string(),
+            sid: "ta000000000".to_string(),
             pid: 0,
             sock: Some("/tmp/a b.sock".to_string()),
             origin: Some("local".to_string()),
             fabric_lost: false,
         }),
-        "`aterm ctl --sock '/tmp/a b.sock' hold s-a off`"
+        "`aterm ctl --sock '/tmp/a b.sock' hold ta000000000 off`"
     );
     assert_eq!(
         fix_for(&fabric::WarningKind::SessionHeld {
-            sid: "s-a".to_string(),
+            sid: "ta000000000".to_string(),
             pid: 0,
             sock: Some("/tmp/a'b.sock".to_string()),
             origin: Some("local".to_string()),
             fabric_lost: false,
         }),
-        "`aterm ctl --sock <sock> hold s-a off`"
+        "`aterm ctl --sock <sock> hold ta000000000 off`"
     );
     assert_eq!(
         arm_command(
@@ -4131,40 +4134,42 @@ fn a_fix_picks_the_remedy_the_warning_names() {
     );
     assert_eq!(
         fix_for(&fabric::WarningKind::SessionHeld {
-            sid: "s-a".to_string(),
+            sid: "ta000000000".to_string(),
             pid: 0,
             sock: None,
             origin: Some("local".to_string()),
             fabric_lost: false,
         }),
-        "`aterm ctl --pid <pid> hold s-a off`"
+        "`aterm ctl --pid <pid> hold ta000000000 off`"
     );
     let fleet = held("stop", "fleet");
     assert!(
-        fleet.contains("aterm fabric halt") && !fleet.contains("hold s-a off"),
+        fleet.contains("aterm fabric halt") && !fleet.contains("hold ta000000000 off"),
         "{fleet}"
     );
     let both = held("stop", "fleet,local");
     assert!(
-        both.contains("aterm fabric halt") && both.contains("`aterm ctl --pid 1 hold s-a off`"),
+        both.contains("aterm fabric halt")
+            && both.contains("`aterm ctl --pid 1 hold ta000000000 off`"),
         "{both}"
     );
     let lost = held("fabric-lost", "fleet,local");
     assert!(
-        lost.contains("bridge reconnects") && lost.contains("hold s-a off"),
+        lost.contains("bridge reconnects") && lost.contains("hold ta000000000 off"),
         "{lost}"
     );
     let person = held("taken-over", "person");
     assert_eq!(person, PERSON_HOLD_LIFT);
     let beside = held("taken-over", "person,local");
     assert!(
-        beside.starts_with(PERSON_HOLD_LIFT) && beside.contains("`aterm ctl --pid 1 hold s-a off`"),
+        beside.starts_with(PERSON_HOLD_LIFT)
+            && beside.contains("`aterm ctl --pid 1 hold ta000000000 off`"),
         "{beside}"
     );
     let remote = held("-", "remote");
     assert!(
         remote.starts_with(REMOTE_HOLD_LIFT)
-            && remote.ends_with("so does `aterm ctl --pid 1 hold s-a off`"),
+            && remote.ends_with("so does `aterm ctl --pid 1 hold ta000000000 off`"),
         "{remote}"
     );
     let beside = held("-", "remote,fleet");
@@ -4176,7 +4181,7 @@ fn a_fix_picks_the_remedy_the_warning_names() {
     assert!(
         all.starts_with(PERSON_HOLD_LIFT)
             && all.contains("aterm fabric halt")
-            && all.contains("hold s-a off"),
+            && all.contains("hold ta000000000 off"),
         "{all}"
     );
 
@@ -4288,16 +4293,16 @@ fn an_instance_replaced_after_the_listing_is_asked_with_its_own_token() {
     std::fs::remove_file(&sock).expect("unlink the old socket");
     let asked = serve(
         UnixListener::bind(&sock).expect("rebind"),
-        "OK 1\n0 s-1 - alive zsh\n",
+        "OK 1\n0 t0000000001 - alive zsh\n",
     );
-    assert_eq!(sessions_of(&inst), ["s-1"]);
+    assert_eq!(sessions_of(&inst), ["t0000000001"]);
     assert_eq!(
         asked.join().expect("server"),
         ["AUTH cafef00d\n", "sessions\n"]
     );
 }
 
-/// The proof against a scripted instance: its `sessions` listing names `s-1`, then the proof's
+/// The proof against a scripted instance: its `sessions` listing names `t0000000001`, then the proof's
 /// own connection gets `replies` in order. Answers the proof's result and that connection's
 /// requests.
 fn prove_against(name: &str, replies: &[&str]) -> (Result<u64, String>, Vec<String>) {
@@ -4322,7 +4327,7 @@ fn prove_against(name: &str, replies: &[&str]) -> (Result<u64, String>, Vec<Stri
                 .expect("AUTH, then sessions");
         }
         (&listing)
-            .write_all(b"OK 1\n0 s-1 - alive zsh\n")
+            .write_all(b"OK 1\n0 t0000000001 - alive zsh\n")
             .expect("list");
         let (conn, _) = aterm_uds::accept(
             &listener,
@@ -4364,14 +4369,14 @@ fn the_proof_waits_past_another_senders_note_for_its_own() {
             "OK 0 hold=0\n",
             "OK 1 off=6\n",
             "OK inbox 1\n",
-            "OK 1 hold=0\nmsg 1 off=5 t=1 from=s-9@n-b kind=note trust=agent\n",
+            "OK 1 hold=0\nmsg 1 off=5 t=1 from=t0000000009@n-b kind=note trust=agent\n",
             "OK inbox 2\n",
-            "OK 1 hold=0\nmsg 2 off=6 t=2 from=s-1@n-a kind=note trust=agent\n",
+            "OK 1 hold=0\nmsg 2 off=6 t=2 from=t0000000001@n-a kind=note trust=agent\n",
         ],
     );
     assert!(proved.is_ok(), "{proved:?}: {seen:#?}");
     assert!(
-        seen[4].starts_with("@s-1 await inbox since=1 kinds=note "),
+        seen[4].starts_with("@t0000000001 await inbox since=1 kinds=note "),
         "the second wait starts past the other sender's note: {seen:#?}"
     );
 }
@@ -4384,14 +4389,14 @@ fn the_proof_accepts_a_combined_bus_and_direct_mail_wake() {
             "OK 0 hold=0\n",
             "OK 1 off=6\n",
             "OK inbox 1 fleet=f1\n",
-            "OK 1 hold=0\nmsg 1 off=5 t=1 from=s-9@n-b kind=note trust=agent\n",
+            "OK 1 hold=0\nmsg 1 off=5 t=1 from=t0000000009@n-b kind=note trust=agent\n",
             "OK inbox 2\n",
-            "OK 1 hold=0\nmsg 2 off=6 t=2 from=s-1@n-a kind=note trust=agent\n",
+            "OK 1 hold=0\nmsg 2 off=6 t=2 from=t0000000001@n-a kind=note trust=agent\n",
         ],
     );
     assert!(proved.is_ok(), "{proved:?}: {seen:#?}");
     assert!(
-        seen[4].starts_with("@s-1 await inbox since=1 kinds=note "),
+        seen[4].starts_with("@t0000000001 await inbox since=1 kinds=note "),
         "the direct metadata must not replace the bus cursor: {seen:#?}"
     );
 }
@@ -4851,7 +4856,14 @@ fn a_node_id_is_n_dash_and_a_principal() {
     assert!(is_node_id("n-0123456789abcdef"));
     assert!(is_node_id("n-m7"));
     for bad in [
-        "new", "n-", "s-0123", "h-andrew", "n-UPPER", "n-a b", "n-a/b", "",
+        "new",
+        "n-",
+        "t0000000123",
+        "h-andrew",
+        "n-UPPER",
+        "n-a b",
+        "n-a/b",
+        "",
     ] {
         assert!(!is_node_id(bad), "{bad}");
     }

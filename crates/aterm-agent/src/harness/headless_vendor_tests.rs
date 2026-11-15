@@ -3,7 +3,7 @@
 
 //! Tests for the vendor sign-in pages' decision core ([`vendor_step`], a pure page model), the
 //! vendors' mail senders, the per-CLI rosters' label aliases and the fleet rosters' exemption
-//! from the `~/.secrets` mailbox catch-all.
+//! from the vault's mailbox catch-all.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -258,14 +258,29 @@ fn a_vendors_webmail_rows_are_chosen_by_its_senders() {
     assert!(!kimi.contains(r#"["claude","anthropic"]"#));
 }
 
+/// A home holding `files`, each `(path, text)` under it; a `.secrets/NAME` path is the vault
+/// entry NAME, published to the store this home administers and read in place, never a file.
 fn home_with(files: &[(&str, &str)]) -> aterm_tempfile::TempDir {
     let tmp = aterm_tempfile::tempdir().expect("tmp");
+    plant(tmp.path(), files);
+    tmp
+}
+
+/// Write `files` under `home` as [`home_with`] does.
+fn plant(home: &Path, files: &[(&str, &str)]) {
+    let mut entries = Vec::new();
     for (path, text) in files {
-        let at = tmp.path().join(path);
+        if let Some(name) = path.strip_prefix(".secrets/") {
+            entries.push((name, text.as_bytes()));
+            continue;
+        }
+        let at = home.join(path);
         std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
         std::fs::write(at, text).expect("write");
     }
-    tmp
+    if !entries.is_empty() {
+        crate::vault_entry::seed(home, &entries);
+    }
 }
 
 #[test]
@@ -668,9 +683,7 @@ fn a_label_two_pools_give_different_mailboxes_hands_its_password_to_no_other_poo
         ),
         (".config/aterm/accounts-kimi.toml", kimi_toml.as_str()),
     ] {
-        let at = home.path().join(path);
-        std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
-        std::fs::write(at, text).expect("write");
+        plant(home.path(), &[(path, text)]);
     }
     let kimi = home.path().join(".config/aterm/accounts-kimi.toml");
     assert_eq!(
@@ -737,9 +750,7 @@ region = "global"
 "#,
         ),
     ] {
-        let at = home.path().join(path);
-        std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
-        std::fs::write(at, text).expect("write");
+        plant(home.path(), &[(path, text)]);
     }
     let cfg = discover_mailbox_config_files_raw(Some(home.path()), None, None);
     assert!(cfg.contested_labels.contains("m27-2"));
@@ -927,9 +938,7 @@ fn mailbox_conflicts_include_csv_and_configured_fleets_before_totp_aliasing() {
             (other_path, other_text.as_str()),
             (".secrets/ai-mailbox.toml", secret.as_str()),
         ] {
-            let path = home.path().join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
+            plant(home.path(), &[(path, text)]);
         }
         let custom_config = home.path().join("custom/aterm/aterm.toml");
         let cfg = discover_mailbox_config_files_raw(
@@ -1007,9 +1016,7 @@ m27 = "KRSXG5A"
             ),
             ("store/mailbox.toml", new),
         ] {
-            let path = home.path().join(name);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, text).unwrap();
+            plant(home.path(), &[(name, text)]);
         }
         let store = home.path().join("store");
         let cfg = if source.ends_with("store") {

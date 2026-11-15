@@ -47,43 +47,46 @@ fn row_len_is_logical_length() {
 
 #[test]
 fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(3, 40, 2, scrollback);
-    for (i, ch) in ['A', 'B', 'C'].into_iter().enumerate() {
-        for _ in 0..30 {
-            grid.write_char(ch);
+    for ring_cap in [0, 2] {
+        let scrollback = Scrollback::new(100, 1000, 10_000_000);
+        let mut grid = Grid::with_tiered_scrollback(3, 40, ring_cap, scrollback);
+        for (i, ch) in ['A', 'B', 'C'].into_iter().enumerate() {
+            for _ in 0..30 {
+                grid.write_char(ch);
+            }
+            if i < 2 {
+                grid.line_feed();
+            }
         }
-        if i < 2 {
-            grid.line_feed();
-        }
+        grid.resize(3, 20);
+        grid.scroll_to_top();
+        assert!(grid.display_offset() > 0, "scrolled into history");
+
+        assert!(
+            grid.row(0).is_none(),
+            "row 0 is past the ring base (history)"
+        );
+        assert_eq!(
+            grid.row(1).is_none(),
+            ring_cap == 0,
+            "the continuation is store-backed with no ring, and ring-backed when room is available"
+        );
+        assert_eq!(grid.row_text(0).as_deref(), Some("A".repeat(20).as_str()));
+        assert_eq!(grid.row_text(1).as_deref(), Some("A".repeat(10).as_str()));
+
+        assert_eq!(grid.row_len(0), Some(20), "history head-row length");
+        assert_eq!(
+            grid.row_is_wrapped(0),
+            Some(false),
+            "history head not wrapped"
+        );
+        assert_eq!(grid.row_len(1), Some(10), "history continuation length");
+        assert_eq!(
+            grid.row_is_wrapped(1),
+            Some(true),
+            "history continuation is a wrap continuation"
+        );
+        assert_eq!(grid.row_len(999), None);
+        assert_eq!(grid.row_is_wrapped(999), None);
     }
-    grid.resize(3, 20);
-    grid.scroll_to_top();
-    assert!(grid.display_offset() > 0, "scrolled into history");
-
-    assert!(
-        grid.row(0).is_none(),
-        "row 0 is past the ring base (history)"
-    );
-    assert!(
-        grid.row(1).is_none(),
-        "row 1 is past the ring base (history)"
-    );
-    assert_eq!(grid.row_text(0).as_deref(), Some("A".repeat(20).as_str()));
-    assert_eq!(grid.row_text(1).as_deref(), Some("A".repeat(10).as_str()));
-
-    assert_eq!(grid.row_len(0), Some(20), "history head-row length");
-    assert_eq!(
-        grid.row_is_wrapped(0),
-        Some(false),
-        "history head not wrapped"
-    );
-    assert_eq!(grid.row_len(1), Some(10), "history continuation length");
-    assert_eq!(
-        grid.row_is_wrapped(1),
-        Some(true),
-        "history continuation is a wrap continuation"
-    );
-    assert_eq!(grid.row_len(999), None);
-    assert_eq!(grid.row_is_wrapped(999), None);
 }

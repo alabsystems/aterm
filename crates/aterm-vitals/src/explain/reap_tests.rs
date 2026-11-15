@@ -5,7 +5,7 @@
 
 use super::{ReapFault, ReapLedger, Scope, StepIn};
 use crate::explain::fixtures::tab;
-use crate::model::{ProcSample, ProcState, TabRoot, attribute};
+use crate::model::{NativeCpuCut, NativeCpuWindow, ProcSample, ProcState, TabRoot, attribute};
 
 const ME: u32 = 501;
 const ATERM: u32 = 100;
@@ -28,6 +28,8 @@ struct P {
     root: bool,
     /// Whether its usage and start go unread though it is this user's (mid-exit).
     unread: bool,
+    /// CPU alone is unread while its generation remains listed.
+    cpu_unread: bool,
     /// Whether the host read it no birth (gone before it could).
     unborn: bool,
     /// Its session; 0 for unread.
@@ -35,6 +37,8 @@ struct P {
     /// Whether the kernel reaps its children for it (it ignores `SIGCHLD`), as the sweep reads
     /// it: of every process, at every reading, whatever it has reaped.
     nocld: bool,
+    read_at: Option<u64>,
+    other_user_readable: bool,
 }
 
 fn p(pid: u32, ppid: u32, cpu: u64, child: u64) -> P {
@@ -48,13 +52,28 @@ fn p(pid: u32, ppid: u32, cpu: u64, child: u64) -> P {
         birth: None,
         root: false,
         unread: false,
+        cpu_unread: false,
         unborn: false,
         session: 0,
         nocld: false,
+        read_at: None,
+        other_user_readable: false,
     }
 }
 
 impl P {
+    fn other_user(self) -> Self {
+        Self {
+            other_user_readable: true,
+            ..self
+        }
+    }
+    fn read_at(self, ms: u64) -> Self {
+        Self {
+            read_at: Some(ms * MS),
+            ..self
+        }
+    }
     fn zombie(self) -> Self {
         Self {
             zombie: true,
@@ -123,6 +142,10 @@ struct Run {
     tabs: Vec<TabRoot>,
     /// The pids a delegated job holds.
     jobs: Vec<u32>,
+    native_roots: Vec<crate::delegated::ProcessKey>,
+    native_terminals: Vec<crate::model::NativeTerminal>,
+    native_incomplete: bool,
+    cpu_cut_boot: Option<u64>,
     at_ns: u64,
     /// Each process's start, unix ms, by pid and kernel start.
     births: std::collections::HashMap<(u32, u64), i64>,
@@ -139,6 +162,10 @@ impl Run {
             ledger: ReapLedger::default(),
             tabs: vec![tab(1, SHELL)],
             jobs: Vec::new(),
+            native_roots: Vec::new(),
+            native_terminals: Vec::new(),
+            native_incomplete: false,
+            cpu_cut_boot: None,
             at_ns: 0,
             births: std::collections::HashMap::new(),
         }
@@ -168,11 +195,16 @@ impl Run {
                 pid: q.pid,
                 ppid: q.ppid,
                 start: (!q.root && !q.unread).then_some(q.start),
-                cpu_ns: (!q.root && !q.unread).then_some(q.cpu * MS),
+                cpu_ns: (!q.root && !q.unread && !q.cpu_unread).then_some(q.cpu * MS),
                 child_cpu_ns: (!q.root && !q.unread).then_some(q.child * MS),
-                uid: Some(if q.root { 0 } else { ME }),
+                uid: Some(if q.root || q.other_user_readable {
+                    0
+                } else {
+                    ME
+                }),
                 sid: q.session,
                 reaps_unwaited: Some(q.nocld),
+                at_ns: q.read_at,
                 state: if q.zombie {
                     ProcState::Zombie
                 } else {
@@ -181,19 +213,91 @@ impl Run {
                 ..ProcSample::default()
             })
             .collect();
-        let members = attribute(&procs, ATERM, &self.tabs);
+        let mut members = attribute(&procs, ATERM, &self.tabs);
+        for (p, member) in procs.iter().zip(&mut members) {
+            if self
+                .native_roots
+                .iter()
+                .any(|key| key.pid == p.pid && Some(key.start) == p.start)
+            {
+                *member = crate::model::Membership {
+                    aterm: true,
+                    shared: false,
+                    tab: Some(0),
+                };
+            }
+        }
+        for _ in 0..procs.len() {
+            let mut changed = false;
+            for (k, process) in procs.iter().enumerate() {
+                if members[k].tab.is_none()
+                    && let Some(parent) = procs.iter().position(|p| p.pid == process.ppid)
+                    && members[parent].tab.is_some()
+                {
+                    members[k] = members[parent];
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
         let delegated: Vec<bool> = procs.iter().map(|q| self.jobs.contains(&q.pid)).collect();
+        self.prepare_terminals(at_ns);
         self.at_ns = at_ns;
-        self.ledger.step(&StepIn {
-            at_ns,
-            at_unix_ms: unix_ms(at_ns),
-            procs: &procs,
-            members: &members,
-            delegated: &delegated,
-            tabs: &self.tabs,
-            self_uid: ME,
-            truncated,
-        });
+        self.ledger.step_with_terminals(
+            &StepIn {
+                at_ns,
+                at_unix_ms: unix_ms(at_ns),
+                cpu_cut: NativeCpuCut {
+                    continuous_ns: Some(at_ns),
+                    boot: self.cpu_cut_boot,
+                },
+                procs: &procs,
+                members: &members,
+                delegated: &delegated,
+                tabs: &self.tabs,
+                self_uid: ME,
+                truncated,
+            },
+            &self.native_terminals,
+            self.native_incomplete,
+        );
+    }
+
+    /// Give synthetic native fixtures explicit first-delivery timing and birth evidence.
+    /// Tests of old or unpositioned receipts set their timing directly instead.
+    fn prepare_terminals(&mut self, at_ns: u64) {
+        for record in &mut self.native_terminals {
+            if record.timing != NativeCpuWindow::default() {
+                continue;
+            }
+            record.timing = NativeCpuWindow {
+                previous: NativeCpuCut {
+                    continuous_ns: Some(self.at_ns),
+                    boot: None,
+                },
+                current: NativeCpuCut {
+                    continuous_ns: Some(at_ns),
+                    boot: None,
+                },
+                exited_ns: Some(self.at_ns + (at_ns - self.at_ns) / 2),
+            };
+            if record.process.birth_ms.is_none() {
+                record.process.birth_ms = Some(
+                    if record
+                        .process
+                        .start
+                        .zip(self.ledger.newest)
+                        .is_some_and(|(start, before)| start > before)
+                    {
+                        unix_ms(self.at_ns) + 500
+                    } else {
+                        0
+                    },
+                );
+            }
+        }
     }
 
     fn step(&mut self, ps: &[P]) -> u64 {
@@ -233,6 +337,687 @@ fn owed(r: &Run, pid: u32) -> Option<(u64, u64)> {
     r.ledger
         .row(pid)
         .map(|v| (v.pending_ns / MS, v.doubt_ns / MS))
+}
+
+fn terminal(
+    seq: u64,
+    pid: u32,
+    start: u64,
+    cpu_ms: u64,
+    child_ms: u64,
+) -> crate::model::NativeTerminal {
+    crate::model::NativeTerminal {
+        timing: NativeCpuWindow::default(),
+        seq,
+        host: crate::delegated::ProcessKey {
+            pid: ATERM,
+            start: u64::from(ATERM) * 10,
+        },
+        process: ProcSample {
+            pid,
+            start: Some(start),
+            ppid: ATERM,
+            cpu_ns: Some(cpu_ms * MS),
+            child_cpu_ns: Some(child_ms * MS),
+            uid: Some(ME),
+            state: ProcState::Zombie,
+            reaps_unwaited: Some(false),
+            ..ProcSample::default()
+        },
+        wait_cpu_ns: Some((cpu_ms + child_ms) * MS),
+        tab: Some(1),
+    }
+}
+
+#[test]
+fn original_wait_finals_charge_short_siblings_once_and_leave_unrelated_reaps_own() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    r.native_terminals = vec![
+        terminal(1, 300, 3000, 40, 160),
+        terminal(2, 310, 3100, 10, 90),
+    ];
+    let now = [p(ATERM, 1, 0, 300), p(SHELL, ATERM, 0, 0)];
+    r.step(&now);
+    assert_eq!((r.tab(), r.all()), (300, 300));
+    r.step(&now);
+    assert_eq!(
+        (r.tab(), r.all()),
+        (300, 300),
+        "replaying the same terminal cursor adds nothing"
+    );
+    r.native_terminals.clear();
+    r.step(&[p(ATERM, 1, 0, 400), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!(
+        (r.tab(), r.all()),
+        (300, 400),
+        "the daemon's other child remains its own work"
+    );
+}
+
+#[test]
+fn terminal_transport_custody_survives_truncated_and_missing_process_sweeps() {
+    for truncated in [false, true] {
+        let mut r = Run::new();
+        r.step(&sweep(0, &[]));
+        let base = r.ledger.totals();
+        r.native_terminals = vec![terminal(1, 300, 3000, 40, 60)];
+        r.prepare_terminals(r.at_ns + 1000 * MS);
+        let record = r.native_terminals.pop().unwrap();
+        let now = [p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)];
+        if truncated {
+            r.native_terminals = vec![record];
+            r.step_cut(&now, true);
+            r.native_terminals.clear();
+        } else {
+            // Machine-only reads accept source records before WhyState's ordinary
+            // process/identity guard returns.
+            r.ledger.ingest_terminals(&[record], false);
+        }
+        r.step(&now);
+        assert_eq!((r.tab(), r.all()), (100, 100));
+        assert_eq!(
+            r.ledger.totals().floor_since(&base, 1).0,
+            40 * MS,
+            "a deferred whole sweep uses its actual broader adoption interval"
+        );
+        assert!(r.ledger.pending_terminals.is_empty());
+    }
+}
+
+#[test]
+fn delayed_native_receipts_never_recharge_an_old_wait_or_create_new_pending_debt() {
+    for parent_already_read in [false, true] {
+        let mut r = Run::new();
+        r.step(&sweep(0, &[]));
+        r.native_incomplete = true;
+        let before_receipt = if parent_already_read { 100 } else { 0 };
+        r.step(&[p(ATERM, 1, 0, before_receipt), p(SHELL, ATERM, 0, 0)]);
+        let base = r.ledger.totals();
+        let mut final_read = terminal(1, 300, 3000, 100, 0);
+        final_read.process.birth_ms = Some(unix_ms(1200 * MS));
+        final_read.timing = NativeCpuWindow {
+            previous: NativeCpuCut {
+                continuous_ns: Some(2000 * MS),
+                boot: None,
+            },
+            current: NativeCpuCut {
+                continuous_ns: Some(3000 * MS),
+                boot: None,
+            },
+            exited_ns: Some(1500 * MS),
+        };
+        r.native_terminals = vec![final_read.clone()];
+        r.native_incomplete = false;
+        r.step(&[p(ATERM, 1, 0, before_receipt), p(SHELL, ATERM, 0, 0)]);
+        let after = r.ledger.totals();
+        assert_eq!(
+            after.all, base.all,
+            "the receipt cannot add old raw CPU a second time"
+        );
+        assert_eq!(after.floor_since(&base, 1), (0, true));
+        assert!(after.since(&base, 1).1);
+        assert_eq!(r.ledger.row(ATERM).unwrap().pending_ns, 0);
+        assert_eq!(
+            r.native_terminals[0], final_read,
+            "source counters and timing are retained"
+        );
+        r.native_terminals.clear();
+        let later = if parent_already_read { 170 } else { 100 };
+        r.step(&[p(ATERM, 1, 0, later), p(SHELL, ATERM, 0, 0)]);
+        assert_eq!(
+            r.all(),
+            later,
+            "ordinary parent growth remains visible once"
+        );
+        assert_eq!(r.tab(), 0, "late receipts do not invent current tab rates");
+    }
+}
+
+#[test]
+fn a_fresh_exit_does_not_place_an_unobserved_old_lifetime_in_this_window() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    r.native_incomplete = true;
+    r.step(&sweep(0, &[]));
+    let base = r.ledger.totals();
+    let mut final_read = terminal(1, 300, 3000, 100, 0);
+    final_read.process.birth_ms = Some(0);
+    final_read.timing = NativeCpuWindow {
+        previous: NativeCpuCut {
+            continuous_ns: Some(2000 * MS),
+            boot: None,
+        },
+        current: NativeCpuCut {
+            continuous_ns: Some(3000 * MS),
+            boot: None,
+        },
+        exited_ns: Some(2500 * MS),
+    };
+    r.native_terminals = vec![final_read];
+    r.native_incomplete = false;
+    r.step(&[p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!((r.tab(), r.all()), (0, 100));
+    assert_eq!(r.ledger.totals().floor_since(&base, 1), (0, true));
+}
+
+#[test]
+fn an_unpositioned_native_receipt_is_consumed_as_diagnostic_evidence_only() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    let mut final_read = terminal(1, 300, 3000, 100, 0);
+    final_read.timing.current.continuous_ns = Some(2000 * MS);
+    r.native_terminals = vec![final_read];
+    let base = r.ledger.totals();
+    r.step(&[p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!((r.tab(), r.all()), (0, 100));
+    assert_eq!(r.ledger.totals().floor_since(&base, 1), (0, true));
+    assert!(r.ledger.pending_terminals.is_empty());
+    assert_eq!(
+        r.ledger.native_sequences.get(&r.native_terminals[0].host),
+        Some(&1)
+    );
+    r.native_terminals[0].timing.exited_ns = Some(2500 * MS);
+    r.step(&[p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!(
+        (r.tab(), r.all()),
+        (0, 100),
+        "a consumed diagnostic cannot later be retimed into work"
+    );
+}
+
+#[test]
+fn native_birth_uses_the_kernel_clock_and_requires_a_strict_new_birth() {
+    for start in [2500, 3000] {
+        let mut r = Run::new();
+        r.cpu_cut_boot = Some(2500);
+        r.step(&sweep(0, &[]));
+        let base = r.ledger.totals();
+        let mut final_read = terminal(1, 300, start, 100, 0);
+        // A coarse wall clock cannot override readable, incompatible boot-clock proof.
+        final_read.process.birth_ms = Some(unix_ms(1500 * MS));
+        final_read.timing = NativeCpuWindow {
+            exited_ns: Some(1500 * MS),
+            ..NativeCpuWindow::default()
+        };
+        r.cpu_cut_boot = Some(3500);
+        r.native_terminals = vec![final_read];
+        r.step(&[p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)]);
+        let proved = if start == 3000 { 100 } else { 0 };
+        assert_eq!(r.tab(), proved);
+        assert_eq!(r.all(), 100);
+        assert_eq!(r.ledger.totals().floor_since(&base, 1).0, proved * MS);
+    }
+}
+
+#[test]
+fn an_own_cpu_counter_read_after_an_unread_step_starts_a_new_floor_baseline() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[p(300, SHELL, 10, 0)]));
+    r.step(&sweep(0, &[p(300, SHELL, 30, 0)]));
+    r.step(&sweep(
+        0,
+        &[P {
+            cpu_unread: true,
+            ..p(300, SHELL, 60, 0)
+        }],
+    ));
+    let gap = r.ledger.totals();
+    r.step(&sweep(0, &[p(300, SHELL, 100, 0)]));
+    let recovered = r.ledger.totals();
+    assert_eq!(
+        recovered.floor_since(&gap, 1),
+        (0, true),
+        "the 70ms since the last readable counter spans more than this rate window"
+    );
+    assert!(recovered.since(&gap, 1).1);
+    r.step(&sweep(0, &[p(300, SHELL, 120, 0)]));
+    assert_eq!(
+        r.ledger.totals().floor_since(&recovered, 1),
+        (20 * MS, false)
+    );
+}
+
+#[test]
+fn a_decreasing_own_counter_preserves_its_maximum_until_a_new_baseline_is_read() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
+    r.step(&sweep(0, &[p(300, SHELL, 100, 0)]));
+    let before = r.ledger.totals();
+    r.step(&sweep(0, &[p(300, SHELL, 50, 0)]));
+    let rollback = r.ledger.totals();
+    assert_eq!(rollback.floor_since(&before, 1), (0, true));
+    assert!(rollback.since(&before, 1).1);
+    r.step(&sweep(0, &[p(300, SHELL, 110, 0)]));
+    let recovered = r.ledger.totals();
+    assert_eq!(
+        recovered.floor_since(&rollback, 1),
+        (0, true),
+        "110 is a new baseline, not 60ms of new work after the invalid 50ms counter"
+    );
+    assert!(recovered.since(&rollback, 1).1);
+    r.step(&sweep(0, &[p(300, SHELL, 120, 0)]));
+    let after = r.ledger.totals();
+    assert_eq!(after.floor_since(&recovered, 1), (10 * MS, false));
+    assert_eq!(
+        after.all_floor,
+        110 * MS,
+        "previously proved lifetime CPU is never counted twice"
+    );
+}
+
+#[test]
+fn final_child_counters_absorb_descendants_already_observed_in_the_tab() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    r.native_roots.push(crate::delegated::ProcessKey {
+        pid: 300,
+        start: 3000,
+    });
+    r.step(&sweep(0, &[p(300, ATERM, 10, 0), p(310, 300, 100, 0)]));
+    assert_eq!((r.tab(), r.all()), (110, 110));
+    r.native_terminals = vec![terminal(1, 300, 3000, 20, 150)];
+    r.step(&[p(ATERM, 1, 0, 170), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!(
+        (r.tab(), r.all()),
+        (170, 170),
+        "the final 150 includes the already credited descendant's 100"
+    );
+}
+
+#[test]
+fn a_native_final_does_not_double_a_descendant_still_listed_from_an_earlier_read() {
+    for aggregate in [false, true] {
+        let mut r = Run::new();
+        r.step(&sweep(0, &[]));
+        let base = r.ledger.totals();
+        r.native_roots.push(crate::delegated::ProcessKey {
+            pid: 300,
+            start: 3000,
+        });
+        r.step(&sweep(0, &[p(300, ATERM, 0, 0), p(310, 300, 100, 0)]));
+        let mut final_read = terminal(1, 300, 3000, 0, 160);
+        final_read.process.at_ns = Some(3000 * MS);
+        if aggregate {
+            final_read.process.cpu_ns = None;
+            final_read.process.child_cpu_ns = None;
+        }
+        r.native_terminals = vec![final_read];
+        r.step(&[
+            p(ATERM, 1, 0, 160),
+            p(SHELL, ATERM, 0, 0),
+            p(310, 300, 100, 0).read_at(2500),
+        ]);
+        assert_eq!(
+            (r.tab(), r.all()),
+            (160, 160),
+            "the final child160 may already include the listed descendant100; aggregate={aggregate}"
+        );
+        assert_eq!(r.ledger.totals().floor_since(&base, 1).0 / MS, 100);
+        assert!(r.ledger.totals().since(&base, 1).1);
+        assert!(r.ledger.totals().floor_since(&base, 1).1);
+    }
+}
+
+#[test]
+fn an_escaped_or_post_final_descendant_remains_independent_of_the_native_final() {
+    for escaped in [false, true] {
+        let mut r = Run::new();
+        r.step(&sweep(0, &[]));
+        r.native_roots.push(crate::delegated::ProcessKey {
+            pid: 300,
+            start: 3000,
+        });
+        r.step(&sweep(0, &[p(300, ATERM, 0, 0), p(310, 300, 100, 0)]));
+        let mut final_read = terminal(1, 300, 3000, 0, 160);
+        final_read.process.at_ns = Some(3000 * MS);
+        r.native_terminals = vec![final_read];
+        let child = if escaped {
+            p(310, 1, 100, 0).read_at(2500)
+        } else {
+            p(310, 300, 100, 0).read_at(3500)
+        };
+        r.step(&[p(ATERM, 1, 0, 160), p(SHELL, ATERM, 0, 0), child]);
+        assert_eq!(
+            (r.tab(), r.all()),
+            (260, 260),
+            "a child already escaped or read after the parent's final cannot be in that parent's final waited time"
+        );
+    }
+}
+
+#[test]
+fn an_ordinary_later_parent_read_deduplicates_the_older_child_snapshot() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    r.step(&sweep(0, &[p(300, SHELL, 0, 0), p(310, 300, 100, 0)]));
+    r.step(&sweep(
+        0,
+        &[
+            p(300, SHELL, 0, 160).read_at(3000),
+            p(310, 300, 100, 0).read_at(2500),
+        ],
+    ));
+    assert_eq!((r.tab(), r.all()), (160, 160));
+    r.step(&sweep(0, &[p(300, SHELL, 0, 160)]));
+    assert_eq!(
+        (r.tab(), r.all()),
+        (160, 160),
+        "the later disappearance does not make the parent absorb that lifetime twice"
+    );
+}
+
+#[test]
+fn own_floor_keeps_panes_separate_and_retains_a_closed_panes_logical_remainder() {
+    let mut ledger = ReapLedger::default();
+    let mut tabs = vec![tab(1, SHELL), tab(2, 201)];
+    tabs[1].tab = 1;
+    let input = |cpu_a, cpu_b| {
+        vec![
+            ProcSample {
+                pid: ATERM,
+                start: Some(1000),
+                ppid: 1,
+                cpu_ns: Some(0),
+                child_cpu_ns: Some(0),
+                uid: Some(ME),
+                ..ProcSample::default()
+            },
+            ProcSample {
+                pid: SHELL,
+                start: Some(2000),
+                ppid: 1,
+                cpu_ns: Some(cpu_a * MS),
+                child_cpu_ns: Some(0),
+                uid: Some(ME),
+                ..ProcSample::default()
+            },
+            ProcSample {
+                pid: 201,
+                start: Some(2010),
+                ppid: ATERM,
+                cpu_ns: Some(cpu_b * MS),
+                child_cpu_ns: Some(0),
+                uid: Some(ME),
+                ..ProcSample::default()
+            },
+        ]
+    };
+    let step = |ledger: &mut ReapLedger, at, procs: &[ProcSample], tabs: &[TabRoot]| {
+        let members = attribute(procs, ATERM, tabs);
+        ledger.step(&StepIn {
+            at_ns: at * MS,
+            at_unix_ms: unix_ms(at * MS),
+            cpu_cut: NativeCpuCut::default(),
+            procs,
+            members: &members,
+            delegated: &[false; 3],
+            tabs,
+            self_uid: ME,
+            truncated: false,
+        });
+    };
+    step(&mut ledger, 1000, &input(0, 0), &tabs);
+    let base = ledger.totals();
+    step(&mut ledger, 2000, &input(500, 250), &tabs);
+    let now = ledger.totals();
+    assert_eq!(now.pane_floor_since(&base, 1), 500 * MS);
+    assert_eq!(now.pane_floor_since(&base, 2), 250 * MS);
+    assert_eq!(now.floor_since(&base, 1).0, 750 * MS);
+    tabs.remove(0);
+    tabs[0].tab = 2;
+    step(&mut ledger, 3000, &input(600, 300), &tabs);
+    let later = ledger.totals();
+    assert_eq!(later.pane_floor_since(&now, 2), 50 * MS);
+    assert_eq!(
+        later.floor_since(&now, 2).0,
+        150 * MS,
+        "the closed pane's orphan stays in its logical tab without becoming the surviving pane's own work"
+    );
+}
+
+#[test]
+fn coalition_floor_reuses_only_an_observed_unchanged_exec_version() {
+    let mut ledger = ReapLedger::default();
+    let tabs = [tab(1, SHELL)];
+    for (at, cpu, coalition, version) in [
+        (1000, 0, Some(400), 1),
+        (2000, 100, Some(400), 1),
+        (3000, 150, None, 1),
+        (4000, 200, None, 2),
+        (5000, 250, None, 2),
+        (6000, 300, Some(500), 2),
+    ] {
+        let procs = [
+            ProcSample {
+                pid: ATERM,
+                start: Some(1000),
+                ppid: 1,
+                cpu_ns: Some(0),
+                child_cpu_ns: Some(0),
+                uid: Some(ME),
+                ..ProcSample::default()
+            },
+            ProcSample {
+                pid: SHELL,
+                start: Some(2000),
+                ppid: ATERM,
+                cpu_ns: Some(cpu * MS),
+                child_cpu_ns: Some(0),
+                uid: Some(ME),
+                coalition,
+                version: Some(version),
+                ..ProcSample::default()
+            },
+        ];
+        let members = attribute(&procs, ATERM, &tabs);
+        ledger.step(&StepIn {
+            at_ns: at * MS,
+            at_unix_ms: unix_ms(at * MS),
+            cpu_cut: NativeCpuCut::default(),
+            procs: &procs,
+            members: &members,
+            delegated: &[false; 2],
+            tabs: &tabs,
+            self_uid: ME,
+            truncated: false,
+        });
+    }
+    let totals = ledger.totals();
+    assert_eq!(totals.coalition_floors.get(&400), Some(&(150 * MS)));
+    assert_eq!(totals.coalition_floors.get(&500), Some(&(50 * MS)));
+    assert_eq!(totals.unmapped_floor, 100 * MS);
+    assert_eq!(totals.all_floor, 300 * MS);
+}
+
+#[test]
+fn own_floor_does_not_keep_a_foreign_process_after_delegated_custody_ends() {
+    use crate::model::Membership;
+    let mut ledger = ReapLedger::default();
+    let tabs = [tab(1, SHELL)];
+    for (at, owned, cpu) in [(1000, true, 0), (2000, true, 100), (3000, false, 200)] {
+        let processes = [
+            ProcSample {
+                pid: ATERM,
+                start: Some(1000),
+                ppid: 1,
+                uid: Some(ME),
+                cpu_ns: Some(0),
+                child_cpu_ns: Some(0),
+                ..ProcSample::default()
+            },
+            ProcSample {
+                pid: 400,
+                start: Some(4000),
+                ppid: 1,
+                uid: Some(ME),
+                cpu_ns: Some(cpu * MS),
+                child_cpu_ns: Some(0),
+                ..ProcSample::default()
+            },
+        ];
+        let members = [
+            Membership {
+                aterm: true,
+                ..Membership::default()
+            },
+            Membership {
+                aterm: owned,
+                tab: owned.then_some(0),
+                ..Membership::default()
+            },
+        ];
+        ledger.step(&StepIn {
+            at_ns: at * MS,
+            at_unix_ms: unix_ms(at * MS),
+            cpu_cut: NativeCpuCut::default(),
+            procs: &processes,
+            members: &members,
+            delegated: &[false, owned],
+            tabs: &tabs,
+            self_uid: ME,
+            truncated: false,
+        });
+    }
+    assert_eq!(ledger.totals().all_floor, 0);
+    assert_eq!(ledger.totals().all, 0);
+}
+
+#[test]
+fn readable_owned_cpu_keeps_its_real_other_uid_and_unrelated_processes_stay_out() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    let base = r.ledger.totals();
+    r.step(&sweep(
+        0,
+        &[
+            p(300, SHELL, 100, 0).other_user(),
+            p(400, 1, 300, 0).other_user(),
+        ],
+    ));
+    assert_eq!((r.tab(), r.all()), (100, 100));
+    assert_eq!(r.ledger.totals().floor_since(&base, 1), (100 * MS, false));
+    assert!(r.ledger.row(400).is_none());
+}
+
+#[test]
+fn own_cpu_floor_never_inherits_a_hidden_auto_reaping_child_charge() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    let base = r.ledger.totals();
+    r.step(&[p(ATERM, 1, 0, 0), p(SHELL, ATERM, 10, 200)]);
+    let total = r.ledger.totals();
+    assert_eq!(total.since(&base, 1).0 / MS, 210);
+    assert_eq!(total.floor_since(&base, 1), (10 * MS, true));
+    assert_eq!(total.own_floor_since(&base), (0, false));
+    r.tabs.clear();
+    let before_close = r.ledger.totals();
+    r.step(&[p(ATERM, 1, 5, 0), p(SHELL, ATERM, 20, 200)]);
+    assert_eq!(
+        r.ledger.totals().own_floor_since(&before_close).0 / MS,
+        15,
+        "folded historical tab floor does not become current own-scope work"
+    );
+}
+
+#[test]
+fn terminal_generations_and_a_live_reused_pid_each_keep_their_own_cpu() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    r.native_terminals = vec![terminal(1, 300, 3000, 10, 0), terminal(2, 300, 4000, 20, 0)];
+    r.step(&[
+        p(ATERM, 1, 0, 30),
+        p(SHELL, ATERM, 0, 0),
+        p(300, SHELL, 7, 0).started(5000),
+        p(600, SHELL, 5, 0),
+    ]);
+    assert_eq!((r.tab(), r.all()), (42, 42));
+    assert_eq!(r.ledger.row(300).map(|row| row.start), Some(5000));
+}
+
+#[test]
+fn a_missing_final_split_stays_incomplete_and_never_becomes_invented_own_cpu() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    let mut missing = terminal(1, 300, 3000, 0, 0);
+    missing.process.child_cpu_ns = None;
+    missing.wait_cpu_ns = None;
+    r.native_terminals = vec![missing];
+    let base = r.ledger.totals();
+    r.step(&[p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!((r.tab(), r.all()), (0, 100));
+    assert!(r.ledger.totals().since(&base, 1).1);
+}
+
+#[test]
+fn a_known_owning_wait_aggregate_is_credited_without_inventing_a_final_split() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    let mut aggregate = terminal(1, 300, 3000, 40, 60);
+    aggregate.process.cpu_ns = None;
+    aggregate.process.child_cpu_ns = None;
+    r.native_terminals = vec![aggregate];
+    r.step(&[p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!((r.tab(), r.all()), (100, 100));
+    r.step(&[p(ATERM, 1, 0, 100), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!((r.tab(), r.all()), (100, 100));
+}
+
+#[test]
+fn an_aggregate_final_deduplicates_observed_descendants_and_the_parent_reap() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    r.native_roots.push(crate::delegated::ProcessKey {
+        pid: 300,
+        start: 3000,
+    });
+    r.step(&sweep(0, &[p(300, ATERM, 10, 0), p(310, 300, 100, 0)]));
+    let mut aggregate = terminal(1, 300, 3000, 20, 150);
+    aggregate.process.cpu_ns = None;
+    aggregate.process.child_cpu_ns = None;
+    r.native_terminals = vec![aggregate];
+    r.step(&[p(ATERM, 1, 0, 170), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!((r.tab(), r.all()), (170, 170));
+}
+
+#[test]
+fn an_auto_reaping_original_never_turns_doubled_child_time_into_exact_work() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    r.native_roots.push(crate::delegated::ProcessKey {
+        pid: 300,
+        start: 3000,
+    });
+    r.step(&sweep(
+        0,
+        &[p(300, ATERM, 10, 0).nocld(), p(310, 300, 100, 0)],
+    ));
+    let base = r.ledger.totals();
+    let mut final_read = terminal(1, 300, 3000, 20, 300);
+    final_read.process.reaps_unwaited = Some(true);
+    r.native_terminals = vec![final_read];
+    r.step(&[p(ATERM, 1, 0, 320), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!(
+        (r.tab(), r.all()),
+        (120, 120),
+        "known own CPU and the observed descendant count once; unread tail stays unknown"
+    );
+    assert!(r.ledger.totals().since(&base, 1).1);
+
+    let mut r = Run::new();
+    r.step(&sweep(0, &[]));
+    let mut final_read = terminal(1, 300, 3000, 20, 300);
+    final_read.process.cpu_ns = None;
+    final_read.process.child_cpu_ns = None;
+    final_read.process.reaps_unwaited = Some(true);
+    r.native_terminals = vec![final_read];
+    r.step(&[p(ATERM, 1, 0, 320), p(SHELL, ATERM, 0, 0)]);
+    assert_eq!(
+        (r.tab(), r.all()),
+        (0, 0),
+        "the known wait aggregate is kept as a charge, not invented actual CPU"
+    );
+    assert!(r.ledger.totals().missed > 0);
 }
 
 /// The first step counts nothing (every process was there before it); a process born under a
@@ -606,6 +1391,29 @@ fn a_tail_launchd_reaped_is_marked_missed() {
     assert_eq!(run(p(310, 1, 150, 0).zombie()), (0, false));
 }
 
+#[test]
+fn an_own_scope_tail_marks_global_coverage_without_marking_an_unrelated_tab() {
+    let run = |zombie| {
+        let mut r = Run::new();
+        r.step(&sweep(0, &[p(300, ATERM, 0, 0)]));
+        let process = p(300, 1, 100, 0);
+        r.step(&sweep(
+            0,
+            &[if zombie { process.zombie() } else { process }],
+        ));
+        let base = r.ledger.totals();
+        r.step(&sweep(0, &[]));
+        let now = r.ledger.totals();
+        (now.missed > base.step, now.since(&base, 1).1)
+    };
+    assert_eq!(run(false), (true, false));
+    assert_eq!(
+        run(true),
+        (false, false),
+        "a zombie's final own CPU reading loses no tail"
+    );
+}
+
 /// A pid reused by another user's process, whose kernel start goes unread, is told from the
 /// member it held by its birth: the member is gone, and what was counted of it is pending at
 /// its parent, which reaped it (450, not 850). A setuid exec keeps its birth, and so its row.
@@ -663,36 +1471,38 @@ fn a_split_tab_keeps_its_counter_when_its_least_pane_closes() {
     assert_eq!(now.all - base.all, 200 * MS, "none in aterm's own");
 }
 
-/// A short job the sweep read but the host read no birth for (gone before it could) is dated by
-/// its kernel start: one newer than every start the last sweep read was born since and counts
-/// from its birth, unmarked; one older counts from its first reading, its work before it missed.
+/// A kernel start newer than the listed processes is insufficient to bound an unseen lifetime.
+/// A start after the actual previous source cut proves a current birth independently.
 #[test]
-fn a_process_with_no_birth_read_is_dated_by_its_kernel_start() {
-    let run = |start| {
+fn a_process_with_no_birth_read_needs_a_source_cut_to_prove_current_cpu() {
+    let run = |start, source_cut: bool| {
         let mut r = Run::new();
+        r.cpu_cut_boot = source_cut.then_some(8_000);
         r.step(&sweep(0, &[p(300, SHELL, 0, 0).started(3_000)]));
+        let base = r.ledger.totals();
+        r.cpu_cut_boot = source_cut.then_some(10_000);
         let job = p(310, 300, 40, 0).started(start).unborn();
-        let tab = r.step(&sweep(0, &[p(300, SHELL, 0, 0).started(3_000), job]));
-        (tab, missed(&r))
+        r.step(&sweep(0, &[p(300, SHELL, 0, 0).started(3_000), job]));
+        let (floor, ambiguous) = r.ledger.totals().floor_since(&base, 1);
+        (since(&r, &base, 1), (floor / MS, ambiguous))
     };
     assert_eq!(
-        run(9_000),
-        (40, 0),
-        "newer than every process the last sweep read"
+        run(9_000, false),
+        ((40, true), (0, true)),
+        "the reconciled counter charge stays known without a current own-CPU floor"
     );
-    assert_eq!(run(2_500), (0, 2), "older than one");
+    assert_eq!(run(2_500, false), ((0, true), (0, true)));
+    assert_eq!(
+        run(9_000, true),
+        ((40, false), (40, false)),
+        "a birth after the previous source cut places the whole own counter in this window"
+    );
 }
 
-/// A process whose spawn straddled a reading (`targo` spawning `trustc`: its fork stamped 1 ms
-/// before the reading's wall clock, but still being created as the sweep listed, so that sweep
-/// read it no start) is first read at the next reading, older than that wall clock by its birth:
-/// its kernel start, newer than every one that sweep read, says nothing counted it, so it counts
-/// from its birth, unmarked; one older than a process that sweep read counts from its first
-/// reading, its work before missed. Live (2026-10-26), dated by its birth alone, the first read
-/// `tab_mc=≥1019 … unattributed_mc=1650` over a 591 ms window, its 1,039 ms lost. NEGATIVE
-/// CONTROL (by hand): dated by its birth where the host read one, the first reads (0, true) too.
+/// A first counter whose birth predates the previous cut may include earlier CPU. Retain its
+/// reconciled charge separately while withholding an unproved current lifetime floor.
 #[test]
-fn a_process_spawned_as_a_sweep_listed_counts_from_its_birth() {
+fn a_process_first_seen_after_a_sweep_boundary_keeps_its_interval_uncertainty() {
     let run = |start| {
         let mut r = Run::new();
         r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
@@ -703,14 +1513,15 @@ fn a_process_spawned_as_a_sweep_listed_counts_from_its_birth() {
             ..p(310, 300, 1_039, 0).started(start)
         };
         r.step(&sweep(0, &[p(300, SHELL, 0, 0), spawned]));
-        (since(&r, &base, 1), missed(&r))
+        let (floor, ambiguous) = r.ledger.totals().floor_since(&base, 1);
+        (since(&r, &base, 1), (floor / MS, ambiguous))
     };
     assert_eq!(
         run(9_000),
-        ((1_039, false), 0),
-        "newer than every process the last sweep read"
+        ((1_039, true), (0, true)),
+        "a newer listed start does not place the lifetime after the previous cut"
     );
-    assert_eq!(run(2_500), ((0, true), 3), "older than one");
+    assert_eq!(run(2_500), ((0, true), (0, true)));
 }
 
 /// A pid reused by a new process is a new member, never the old one's row.

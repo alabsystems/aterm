@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The TOML 1.0.0 parser.
+//! The TOML 1.1.0 parser.
 
 use core::ops::Range;
 
@@ -190,7 +190,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Whitespace, newlines, and comments — the trivia between top-level
-    /// entries and inside arrays.
+    /// entries, arrays and inline tables.
     fn eat_trivia(&mut self) -> Result<()> {
         loop {
             self.eat_ws();
@@ -639,18 +639,23 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.pos += 1;
         let mut table = InlineTable::new();
-        let preamble_start = self.pos;
-        self.eat_ws();
-        if self.peek() == Some(b'}') {
-            table.preamble = RawString::from(self.src[preamble_start..self.pos].to_owned());
-            self.pos += 1;
-            table.span = Some(start..self.pos);
-            return Ok(table);
-        }
-        self.pos = preamble_start;
-
         loop {
             let entry_start = self.pos;
+            self.eat_trivia()?;
+            if self.peek() == Some(b'}') {
+                let trailing = RawString::from(self.src[entry_start..self.pos].to_owned());
+                if table.is_empty() {
+                    table.preamble = trailing;
+                } else {
+                    table.trailing = trailing;
+                }
+                self.pos += 1;
+                table.span = Some(start..self.pos);
+                return Ok(table);
+            }
+            if self.eof() {
+                return self.err(self.b.len()..self.b.len(), "unterminated inline table");
+            }
             let segs = self.key_path()?;
             self.check_depth(depth.saturating_add(segs.len()), entry_start)?;
             if self.peek() != Some(b'=') {
@@ -666,7 +671,7 @@ impl<'a> Parser<'a> {
             let value_prefix = self.src[value_prefix_start..self.pos].to_owned();
             let mut value = self.value(depth.saturating_add(segs.len()))?;
             let value_suffix_start = self.pos;
-            self.eat_ws();
+            self.eat_trivia()?;
             let decor = value.decor_mut();
             decor.set_prefix(value_prefix);
             decor.set_suffix(self.src[value_suffix_start..self.pos].to_owned());
@@ -687,16 +692,15 @@ impl<'a> Parser<'a> {
             )?;
 
             match self.peek() {
-                Some(b',') => self.pos += 1,
+                Some(b',') => {
+                    self.pos += 1;
+                    table.trailing_comma = true;
+                }
                 Some(b'}') => {
+                    table.trailing_comma = false;
                     self.pos += 1;
                     table.span = Some(start..self.pos);
                     return Ok(table);
-                }
-                Some(b'\n' | b'\r') => {
-                    return self.here(
-                        "a TOML 1.0 inline table must fit on one line: newlines are not allowed",
-                    );
                 }
                 _ => return self.here("expected `,` or `}` in an inline table"),
             }
@@ -846,8 +850,10 @@ impl<'a> Parser<'a> {
             b'n' => out.push('\n'),
             b'f' => out.push('\u{c}'),
             b'r' => out.push('\r'),
+            b'e' => out.push('\u{1b}'),
             b'"' => out.push('"'),
             b'\\' => out.push('\\'),
+            b'x' => self.unicode_escape(out, 2, start)?,
             b'u' => self.unicode_escape(out, 4, start)?,
             b'U' => self.unicode_escape(out, 8, start)?,
             b' ' | b'\t' | b'\n' | b'\r' if multiline => {

@@ -609,8 +609,6 @@ fn a_child_is_handed_its_stages_cover_marker() {
     {
         let _covering = crate::memory::covering(Some("0000000000001-7-0".into()));
         assert_eq!(said(&run(&ask, env)), "0000000000001-7-0");
-        let pooled = crate::testrun::pool(1, &[0], 1, |_| said(&run(&ask, env)));
-        assert_eq!(pooled, [Some("0000000000001-7-0".to_string())]);
         let dispatched = crate::testrun::dispatch_each(1, |_| said(&run(&ask, env)));
         assert_eq!(dispatched, [Some("0000000000001-7-0".to_string())]);
     }
@@ -677,10 +675,6 @@ fn a_child_is_bounded_by_its_stages_actual_core_grant() {
     let mut with_run_ceiling = env_in(&tmp);
     with_run_ceiling.add_env = &added;
     assert_eq!(said(&run(&ask, with_run_ceiling)), "6 1 4");
-    assert_eq!(
-        crate::testrun::pool(1, &[0], 1, |_| said(&run(&ask, env_in(&tmp)))),
-        [Some("6 1 6".to_owned())]
-    );
     assert_eq!(
         crate::testrun::dispatch_each(1, |_| said(&run(&ask, env_in(&tmp)))),
         [Some("6 1 6".to_owned())]
@@ -4186,17 +4180,17 @@ fn failed_case_evidence_is_durable_while_its_owned_child_is_still_held() {
         let dir = aterm_tempfile::tempdir().unwrap();
         let events_path = dir.path().join("events");
         let events = crate::event_log::EventLog::open(&events_path).unwrap();
-        let mut documentation = crate::ladder::Report::new("documentation fixture");
-        documentation.pass("complete");
+        let mut formatting = crate::ladder::Report::new("format fixture");
+        formatting.pass("complete");
         let green = crate::report::judge(
-            crate::Check::Doc,
-            &[&documentation],
+            crate::Check::Fmt,
+            &[&formatting],
             0.0,
             "",
             String::new(),
             None,
         );
-        events.write(&crate::report::check_event(&green, &[&documentation]));
+        events.write(&crate::report::check_event(&green, &[&formatting]));
         let mut cmd = Cmd::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -4259,7 +4253,7 @@ fn failed_case_evidence_is_durable_while_its_owned_child_is_still_held() {
         );
         assert_eq!(value["halts"].as_bool(), Some(false));
         assert_eq!(observed.checks.len(), 1);
-        assert_eq!(observed.checks[0].check, "doc");
+        assert_eq!(observed.checks[0].check, "fmt");
         assert_eq!(
             observed.checks[0]
                 .outcomes
@@ -4751,4 +4745,63 @@ fn only_a_demoted_child_that_can_run_is_spawned_under_utility_qos() {
         "no taskpolicy: the variables stay the Command's own"
     );
     std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// A STEP THAT RUNS TO ITS END HOLDS THE WATCHDOG (`group::hold`): a stand-in run with the
+/// interrupt handling verify's landing uses, its report grace a few milliseconds, takes a SIGTERM
+/// while a held step runs. The watchdog's grace passes and it waits on the hold, so the step's
+/// end is reached (the stand-in says `survived`); once the hold is dropped the grace runs again
+/// and the run dies of the SIGTERM, as without the hold. NEGATIVE CONTROL, run once as a mutant:
+/// a watchdog that does not wait on a hold killed the stand-in before it said `survived`.
+#[cfg(unix)]
+#[test]
+fn a_held_step_runs_to_its_end_before_the_interrupt_ends_the_run() {
+    use std::os::unix::process::ExitStatusExt as _;
+    const STANDIN: &str = "ATV_HOLD_STANDIN";
+    if std::env::var_os(STANDIN).is_some() {
+        group::set_report_grace_for_test(Duration::from_millis(5));
+        group::kill_on_interrupt();
+        let held = group::hold();
+        // SAFETY: kill takes integers and signals this process, whose handler is installed.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+        let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while !group::hold_waited() {
+            assert!(
+                Instant::now() < until,
+                "the watchdog never waited on the hold"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        println!("survived");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        drop(held);
+        // The watchdog ends the run; this hang detector only bounds a run it fails to end.
+        std::thread::sleep(aterm_spec::wait::MUST_HAPPEN);
+        println!("outlived the watchdog");
+        return;
+    }
+    let me = std::env::current_exe().expect("the test binary");
+    let output = aterm_uds::spawnfd::command(&me)
+        .args([
+            "--exact",
+            "exec::tests::a_held_step_runs_to_its_end_before_the_interrupt_ends_the_run",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(STANDIN, "1")
+        .output()
+        .expect("the stand-in ran");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("survived\n"),
+        "the held step reached its end: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("outlived the watchdog"),
+        "the watchdog ended the run once the hold was dropped: {stdout}"
+    );
+    assert_eq!(output.status.signal(), Some(libc::SIGTERM), "{stdout}");
 }

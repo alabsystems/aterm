@@ -1857,7 +1857,9 @@ impl State {
         })
     }
 
-    /// The answer of the op whose full flush just failed, once ([`State::flush_failed`]).
+    /// The answer of the op whose full flush just failed, once ([`State::flush_failed`]). astream
+    /// answers it to every op waiting on that flush (`settle_full_flush`), several pipelined
+    /// posts of one batch among them; the model has no batch boundaries, so one op meets it.
     fn outcome_unknown(&mut self) -> Option<Box<Response>> {
         std::mem::take(&mut self.flush_failed).then(|| {
             refused(

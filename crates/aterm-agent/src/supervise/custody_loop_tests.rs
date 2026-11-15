@@ -230,7 +230,7 @@ fn a_line_the_worker_read_and_never_drew_restarts_it_once_and_is_written_once() 
     assert!(
         t.enters()[0].contains(&format!(
             "if={}",
-            super::super::super::super::policy::row_guard(&format!("❯ {LINE}"))
+            alab_policy::guard::row_guard(&format!("❯ {LINE}"))
         )),
         "fenced on the read that showed it whole: {}",
         t.evidence()
@@ -1299,8 +1299,9 @@ fn a_persons_keys_drawn_after_a_held_line_end_its_hold() {
         t.evidence()
     );
     assert!(
-        noted.iter().any(|l| l.starts_with("WAITING ")
-            && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
+        noted
+            .iter()
+            .any(|l| l.starts_with("WAITING ") && l.contains(alab_policy::words::PERSON_TYPING)),
         "their grace waited on: {noted:#?}"
     );
 }
@@ -1644,7 +1645,7 @@ fn a_held_line_drawn_in_a_busy_spell_is_handed_back_to_its_writer() {
         );
         assert!(
             !noted.iter().any(|l| l.starts_with("WAITING ")
-                && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
+                && l.contains(alab_policy::words::PERSON_TYPING)),
             "{tag}: the loop's own line, no person's draft: {noted:#?}"
         );
         assert_eq!(
@@ -1749,7 +1750,7 @@ fn a_held_line_drawn_under_a_read_that_cannot_say_is_handed_back_once_one_can() 
         );
         assert!(
             !noted.iter().any(|l| l.starts_with("WAITING ")
-                && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
+                && l.contains(alab_policy::words::PERSON_TYPING)),
             "{tag}: the loop's own line, no person's draft: {noted:#?}"
         );
         assert_eq!(

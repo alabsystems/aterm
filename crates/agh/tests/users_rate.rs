@@ -187,7 +187,7 @@ fn agh_rate_shows_each_identity_from_the_api_and_the_book() {
         Source::File(root.path().join("tokens").join("dev.token")),
         Tier::Dev,
     );
-    let fingerprint = identity::load_for_tests(&dev, &common::env())
+    let fingerprint = identity::load_for_tests(&dev)
         .expect("the dev token")
         .fingerprint()
         .to_string();

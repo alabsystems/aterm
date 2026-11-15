@@ -6,6 +6,10 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[path = "summarize_discovery_hold.rs"]
+mod discovery_hold;
+
 /// The task Summarize the Fleet gives its worker.
 pub(crate) const FLEET_BRIEF: &str = "Summarize this aterm fleet for the person reading this \
 tab. Run `aterm ctl survey --fleet` once. Write, in this order: first what needs the person \
@@ -55,11 +59,12 @@ pub(crate) fn summary_order(fleet: bool, fabric: bool) -> crate::task_launch::Ta
         task: summary_brief(fleet, fabric).into_bytes(),
         agent: aterm_phase::Program::Claude,
         model: None,
+        effort: None,
         caller: None,
         manager_node: None,
         trusted_cwd: None,
         fact_line: false,
-        autopilot: aterm_agent::supervise::Autopilot::Land,
+        autopilot: alab_policy::config::Autopilot::Land,
         chrome: false,
         program: None,
     }
@@ -136,6 +141,8 @@ fn summary_spawn(
 /// Why Summarize cannot start a worker here, said in the row's tool tip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StartBlock {
+    /// The launch-path or fleet observation has not answered yet.
+    DiscoveryPending,
     /// No `claude` on the PATH a new tab's shell starts from.
     NoClaude,
     /// This instance starts no worker.
@@ -147,6 +154,7 @@ impl StartBlock {
     pub(crate) fn hint(&self) -> String {
         use crate::control::control_media::WorkerBlock;
         match self {
+            Self::DiscoveryPending => "(checking available agents)".to_string(),
             Self::NoClaude => "(claude not found \u{2014} aterm pkg install claude)".to_string(),
             Self::Worker(WorkerBlock::Unhosted) => {
                 "(needs the control socket \u{2014} this aterm started without one)".to_string()
@@ -154,7 +162,6 @@ impl StartBlock {
             Self::Worker(WorkerBlock::Unsupervised(switch)) => {
                 format!("(the window harness would not carry it \u{2014} {switch})")
             }
-            Self::Worker(WorkerBlock::Unseen(why)) => format!("({why})"),
             Self::Worker(WorkerBlock::NoIntegration) => {
                 "(needs shell integration \u{2014} off with --no-shell-integration)".to_string()
             }
@@ -171,19 +178,22 @@ pub(crate) const SUMMARY_STARTING: &str = "a summary is already starting";
 
 /// How long one look for `claude` answers [`claude_on_path`].
 const CLAUDE_LOOK_TTL: Duration = Duration::from_secs(2);
+static CLAUDE_LOOK: Look = Look::new();
 
 /// Whether the agent CLI (`claude`) is launchable from a new tab.
-pub(crate) fn claude_on_path() -> bool {
+fn claude_on_path(
+    proxy: Option<&aterm_window::event_loop::EventLoopProxy<crate::Wake>>,
+) -> Option<bool> {
     #[cfg(test)]
     if let Some(answer) = CLAUDE_ON_PATH_FOR_TEST.get() {
         return answer;
     }
-    static LOOK: Look = Look::new();
-    LOOK.answer(
+    CLAUDE_LOOK.answer(
         CLAUDE_LOOK_TTL,
         "aterm-claude-look",
         claude_on_path_now,
         Instant::now(),
+        discovery_wake(proxy),
     )
 }
 
@@ -194,10 +204,14 @@ pub(crate) struct Look {
 
 #[derive(Clone, Copy)]
 struct LookState {
-    /// The last look's answer, and when it ended.
-    last: Option<(bool, Instant)>,
+    /// The last completed look's answer.
+    last: Option<bool>,
     /// A look is out on its own thread.
     looking: bool,
+    /// The next refresh, or the retry after a worker could not start.
+    next: Option<Instant>,
+    /// Worker creation failed, so the event loop owes a timer to try again.
+    retry_pending: bool,
 }
 
 impl Look {
@@ -206,55 +220,105 @@ impl Look {
             state: Mutex::new(LookState {
                 last: None,
                 looking: false,
+                next: None,
+                retry_pending: false,
             }),
         }
     }
 
-    /// The answer at `now`.
+    /// The last answer at `now`, or `None` until the first background read finishes.
     pub(crate) fn answer(
         &'static self,
         ttl: Duration,
         name: &'static str,
-        look: fn() -> bool,
+        look: impl FnOnce() -> bool + Send + 'static,
         now: Instant,
-    ) -> bool {
+        wake: impl FnOnce() + Send + 'static,
+    ) -> Option<bool> {
+        self.answer_with_spawn(ttl, look, now, wake, |work| {
+            crate::qos::spawn_lane_thread(name, crate::qos::Role::Background, work).is_ok()
+        })
+    }
+
+    fn answer_with_spawn(
+        &'static self,
+        ttl: Duration,
+        look: impl FnOnce() -> bool + Send + 'static,
+        now: Instant,
+        wake: impl FnOnce() + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> bool,
+    ) -> Option<bool> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let Some((answer, at)) = state.last else {
-            let answer = look();
-            state.last = Some((answer, now));
-            return answer;
-        };
-        if !state.looking && now.saturating_duration_since(at) >= ttl {
+        let answer = state.last;
+        if !state.looking && state.next.is_none_or(|next| now >= next) {
             state.looking = true;
-            let spawned =
-                crate::qos::spawn_lane_thread(name, crate::qos::Role::Background, move || {
-                    let answer = look();
-                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                    *state = LookState {
-                        last: Some((answer, Instant::now())),
-                        looking: false,
-                    };
-                });
-            if spawned.is_err() {
+            state.retry_pending = false;
+            drop(state);
+            let spawned = spawn(Box::new(move || {
+                let answer = look();
+                let finished = Instant::now();
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                let changed = state.last != Some(answer);
                 *state = LookState {
-                    last: Some((answer, now)),
+                    last: Some(answer),
                     looking: false,
+                    next: Some(finished + ttl),
+                    retry_pending: false,
                 };
+                drop(state);
+                if changed {
+                    wake();
+                }
+            }));
+            if !spawned {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.looking = false;
+                state.next = Some(now + ttl);
+                state.retry_pending = true;
             }
         }
         answer
+    }
+
+    fn retry_deadline(&self) -> Option<Instant> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.retry_pending.then_some(state.next).flatten()
+    }
+
+    /// Service only failed worker creation; settled or inflight reads need no timer.
+    fn retry_if_due(&self, now: Instant, retry: impl FnOnce()) -> Option<Instant> {
+        let at = self.retry_deadline()?;
+        if now >= at {
+            retry();
+        }
+        self.retry_deadline()
+    }
+}
+
+fn discovery_wake(
+    proxy: Option<&aterm_window::event_loop::EventLoopProxy<crate::Wake>>,
+) -> impl FnOnce() + Send + 'static {
+    let proxy = proxy.cloned();
+    move || {
+        if let Some(proxy) = proxy {
+            let _ = proxy.send_event(crate::Wake::AgentsDiscoveryReady);
+        }
     }
 }
 
 #[cfg(test)]
 thread_local! {
     /// TEST ARM of [`claude_on_path`].
-    pub(crate) static CLAUDE_ON_PATH_FOR_TEST: std::cell::Cell<Option<bool>> =
+    pub(crate) static CLAUDE_ON_PATH_FOR_TEST: std::cell::Cell<Option<Option<bool>>> =
+        const { std::cell::Cell::new(None) };
+    static FLEET_FOR_TEST: std::cell::Cell<Option<Option<bool>>> =
         const { std::cell::Cell::new(None) };
 }
 
 /// [`claude_on_path`]'s look.
 fn claude_on_path_now() -> bool {
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    discovery_hold::claude();
     static MANAGED: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
     let managed = MANAGED.get_or_init(|| {
         let layout = atpkg::store::resolve_configured()?;
@@ -276,28 +340,81 @@ fn claude_on_path_now() -> bool {
 
 /// How long one look at the fleet secret answers [`in_fleet`].
 const FLEET_LOOK_TTL: Duration = Duration::from_secs(15);
+static FLEET_LOOK: Look = Look::new();
+
+fn in_fleet_now() -> bool {
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    discovery_hold::fleet();
+    aterm_types::dirs::state_dir().is_some_and(|dir| crate::fleet_glance::holds_fleet_key(&dir))
+}
 
 /// WHETHER THIS MAC IS IN A FLEET, for the Agents rows and Summarize's brief.
-pub(crate) fn in_fleet() -> bool {
-    static LOOK: Look = Look::new();
-    LOOK.answer(
+pub(crate) fn in_fleet(
+    proxy: Option<&aterm_window::event_loop::EventLoopProxy<crate::Wake>>,
+) -> Option<bool> {
+    #[cfg(test)]
+    if let Some(answer) = FLEET_FOR_TEST.get() {
+        return answer;
+    }
+    FLEET_LOOK.answer(
         FLEET_LOOK_TTL,
         "aterm-fleet-look",
-        || {
-            aterm_types::dirs::state_dir()
-                .is_some_and(|dir| crate::fleet_glance::holds_fleet_key(&dir))
-        },
+        in_fleet_now,
         Instant::now(),
+        discovery_wake(proxy),
     )
 }
 
 impl crate::App {
+    /// Retry a refused discovery worker from the loop's deadline, independent of menu reads.
+    pub(crate) fn agents_discovery_retry(&self, now: Instant) -> Option<Instant> {
+        let retry = |look: &'static Look, ttl: Duration, name: &'static str, read: fn() -> bool| {
+            look.retry_if_due(now, || {
+                let _ = look.answer(ttl, name, read, now, discovery_wake(self.proxy.as_ref()));
+            })
+        };
+        [
+            retry(
+                &CLAUDE_LOOK,
+                CLAUDE_LOOK_TTL,
+                "aterm-claude-look",
+                claude_on_path_now,
+            ),
+            retry(
+                &FLEET_LOOK,
+                FLEET_LOOK_TTL,
+                "aterm-fleet-look",
+                in_fleet_now,
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    /// Publish a completed discovery read without waiting for another input or the menu TTL.
+    pub(crate) fn on_agents_discovery_ready(&mut self) {
+        #[cfg(any(target_os = "macos", test))]
+        {
+            self.agents.agents_live_at = None;
+            self.publish_agents_live(true, Instant::now());
+        }
+        self.palette_refresh_live();
+    }
+
     /// Why Summarize cannot launch here, `None` when it can.
     pub(crate) fn summarize_start_block(&self) -> Option<StartBlock> {
         if let Err(block) = self.worker_shell(aterm_phase::Program::Claude) {
             return Some(StartBlock::Worker(block));
         }
-        (!claude_on_path()).then_some(StartBlock::NoClaude)
+        match claude_on_path(self.proxy.as_ref()) {
+            None => Some(StartBlock::DiscoveryPending),
+            Some(false) => Some(StartBlock::NoClaude),
+            Some(true) if in_fleet(self.proxy.as_ref()).is_none() => {
+                Some(StartBlock::DiscoveryPending)
+            }
+            Some(true) => None,
+        }
     }
 
     /// What a Summarize press books ([`summary_spawn`], [`in_fleet`], [`Self::fabric_configured`]).
@@ -311,7 +428,9 @@ impl crate::App {
         ),
         String,
     > {
-        summary_spawn(in_fleet(), self.fabric_configured(), folder)
+        let fleet =
+            in_fleet(self.proxy.as_ref()).ok_or_else(|| StartBlock::DiscoveryPending.hint())?;
+        summary_spawn(fleet, self.fabric_configured(), folder)
     }
 
     /// AGENTS ▸ SUMMARIZE THE FLEET IN A NEW TAB.

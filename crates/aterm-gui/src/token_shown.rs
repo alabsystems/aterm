@@ -13,7 +13,8 @@
 //! answer as "no token for this account".
 //!
 //! The read records each new offer pair (`note_offers`), so the quiet offer is journaled once per
-//! change of the pair whichever surface shows it first. Its one step ([`App::open_token_step`])
+//! change of the pair whichever surface shows it first, and asks the lab, never a person, for each
+//! offered token with none verified in use here (`ask_lab_here`). Its one step ([`App::open_token_step`])
 //! opens a tab beside the person's that runs `aterm harness accounts token <label> [--replace]`;
 //! nothing here raises a modal, a banner or a notification. A platform with no vault tokens reads
 //! none, and every surface then says nothing of them.
@@ -91,6 +92,10 @@ pub(crate) struct TokenFact {
     pub(crate) peers: Vec<String>,
     /// When that fleet read was.
     pub(crate) peers_read_at: Option<u64>,
+    /// The account's token step a check stopped, while its record holds it, in the record's own
+    /// words (`stopped 14 Nov: …; it is tried again only at …`), shown on demand
+    /// ([`aterm_agent::harness::token_steps`]).
+    pub(crate) step: Option<String>,
 }
 
 #[cfg(test)]
@@ -118,6 +123,7 @@ impl TokenFact {
             vault_words: None,
             peers: Vec::new(),
             peers_read_at: None,
+            step: None,
         }
     }
 }
@@ -318,19 +324,21 @@ fn due(last: Option<i64>, now: i64) -> bool {
 /// One read of this Mac's token view at `now`, with each new offer pair recorded.
 #[cfg(all(unix, not(test)))]
 fn read(now: i64) -> Option<Tokens> {
+    use aterm_agent::harness::accounts_token_view::{ask_lab_here, steps_here, view_here};
     let harness = crate::harness_host::harness_state()?;
     let config = crate::app_config::config_path();
     let home = aterm_types::dirs::home_dir();
-    Some(facts_of_view(
-        &harness,
-        aterm_agent::harness::accounts_token_view::view_here(
-            &harness,
-            config.as_deref(),
-            home.as_deref(),
-            now,
-        ),
-        now,
-    ))
+    let view = view_here(&harness, config.as_deref(), home.as_deref(), now);
+    if let (Some(accounts), Some(home)) = (&view, home.as_deref())
+        && let Err(why) = ask_lab_here(accounts, home, now)
+    {
+        aterm_log::warn!("accounts: the lab could not be asked for a token: {why}");
+    }
+    let steps = view
+        .as_deref()
+        .map(|accounts| steps_here(&harness, home.as_deref(), accounts))
+        .unwrap_or_default();
+    Some(facts_of_view(&harness, (view, &steps), now))
 }
 
 /// A platform with no vault tokens has no vault to read.
@@ -340,11 +348,15 @@ fn read(_now: i64) -> Option<Tokens> {
 }
 
 /// The window's facts of a token view (`None`: no home or no vault configured under it, so
-/// [`TokensRead::NoVault`]), each new offer pair recorded in the store under `harness`.
+/// [`TokensRead::NoVault`]) and of the token steps its records hold (`steps`, by account key),
+/// each new offer pair recorded in the store under `harness`.
 #[cfg(unix)]
 pub(crate) fn facts_of_view(
     harness: &std::path::Path,
-    view: Option<Vec<aterm_agent::harness::accounts_token_view::AccountToken>>,
+    (view, steps): (
+        Option<Vec<aterm_agent::harness::accounts_token_view::AccountToken>>,
+        &std::collections::BTreeMap<String, aterm_agent::harness::token_steps::Stopped>,
+    ),
     now: i64,
 ) -> Tokens {
     use aterm_agent::harness::accounts_step::Step;
@@ -380,6 +392,16 @@ pub(crate) fn facts_of_view(
                     vault_words: account.vault_words(),
                     peers: used.map(|used| used.peers.clone()).unwrap_or_default(),
                     peers_read_at: used.and_then(|used| used.peers_read_at),
+                    step: steps.get(&account.key).map(|step| {
+                        let person = account.label.as_ref().map(|label| {
+                            Step::Token {
+                                label: label.clone(),
+                                replace: false,
+                            }
+                            .to_string()
+                        });
+                        step.words(person.as_deref())
+                    }),
                     key: account.key.clone(),
                     label: account.label.clone(),
                     email: account.email.clone(),

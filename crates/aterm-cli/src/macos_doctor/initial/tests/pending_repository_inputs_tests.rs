@@ -28,10 +28,8 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
             symlink: false,
             len,
         };
-        let inventory = home.join(".secrets/github-repositories.json");
         let bytes = br#"{"schema":2,"account":"tester","repositories":[{"id":1,"name":"arrived","owner":{"login":"tester"},"full_name":"tester/arrived","private":true,"clone_url":"https://github.com/tester/arrived.git","default_branch":"main"}]}"#;
-        sys.file(inventory.to_str().unwrap(), bytes)
-            .stat_of(inventory.to_str().unwrap(), stat(false, bytes.len() as u64));
+        sys.vault_set(&home, "github-repositories.json", bytes);
         sys.executable(home.join(".local/bin/aterm").to_str().unwrap(), b"launcher");
         let checkout = home.join("arrived");
         let git_dir = checkout.join(".git");

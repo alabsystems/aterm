@@ -182,6 +182,14 @@ instance, `@self`, and `aterm ctl survey` for what every session is doing),
 
 ### CLI tour
 
+For same-machine research, reviews and one-off tasks, agents use their harness's
+native subagents. Run commands and scripts with the harness's own shell/background
+tools; without native subagents, do routine work directly. A new aterm tab or
+session adds a separate context, login and supervision lifecycle. Use one only
+when the person explicitly requests it or a concrete need native tools cannot
+meet justifies it, such as another machine or a persistent interactive terminal.
+State the reason before spawning.
+
 ```sh
 aterm --window -e htop          # a window running one command (-d <dir>, --hold, --shell)
 aterm ctl text                  # plain visible rows
@@ -189,19 +197,24 @@ aterm ctl screen                # lossless styled-grid JSON
 aterm ctl status                # phase, outcome, and confidence for this session
 aterm ctl image frame.png       # the rendered frame as PNG; the reply names where it was saved
 aterm ctl window shot.png       # the whole window with its native chrome (macOS)
-aterm ctl turn 'git status'     # type, submit, settle, and return the screen
 aterm ctl wait [<ms>]           # block until the running command completes (OSC 133)
 aterm ctl metrics               # live render and latency counters
 aterm ctl help text             # one verb's entry; bare `help` is the catalog
+```
 
-aterm ctl ls                                   # every session of every live instance
-sid=$(aterm ctl spawn window=1 | cut -d' ' -f2)
-aterm ctl "@$sid" turn 'make test'
-aterm ctl "@$sid" await match 'result:'        # block until a regex appears (one token)
-aterm ctl "@$sid" await agent idle,prompt,question,wall   # an agent peer's turn ended, a box waits, or a wall stops it
-aterm ctl "@$sid" await log kind=program since=<log_seq> ep=<log_ep>   # a codex peer reported (seq/ep from status, read before typing)
+To observe an existing session, select its full ID from `ls`. Replace the example
+ID below with the session you were asked to observe; these reads type nothing.
+
+```sh
+aterm ctl ls                                  # every session of every live instance
+sid=tqn5r6e0148                                # example full ID; select the existing session
+aterm ctl "@$sid" status                       # read its state and event positions first
+aterm ctl "@$sid" text trim tail=20            # the last 20 visible rows
+# Choose one wait: a recognized agent (agent neither unknown nor -), using agent_rev:
+aterm ctl "@$sid" await agent idle,prompt,question,wall since=<agent_rev> timeout=600000
+# For Codex (agent=unknown), use log_seq/log_ep/log_base instead:
+aterm ctl "@$sid" await log kind=program since=<log_seq> ep=<log_ep> base=<log_base> timeout=600000
 aterm ctl subscribe "@$sid" events,cursor      # add screen,cells,bytes as needed
-aterm ctl "@$sid" close
 ```
 
 `await` takes one predicate (`idle <ms>`, `seq [<n>]`, `match <re>`,
@@ -346,8 +359,8 @@ it as privileged:
   allowed unless `allow_palette_reconfigure = false`.
 
 **Release trust** — for the macOS and Linux app updaters and the toolchain
-package index — is anchored by a **paper master key** that exists on no
-computer. It signs only a machine roster: one signing key per publishing
+package index — is anchored by a **master key** held in the lab's credential
+vault, never in GitHub. It signs only a machine roster: one signing key per publishing
 machine, plus the deny-list that withdraws one. A release must carry a
 master-signed roster, a manifest signed by a rostered, unrevoked machine, a
 forward-only build number and a matching artifact digest. macOS additionally

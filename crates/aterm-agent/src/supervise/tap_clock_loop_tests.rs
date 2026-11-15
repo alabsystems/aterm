@@ -20,7 +20,7 @@ fn a_bare_footer_cannot_carry_a_tap_across_conflicting_named_zones() {
     let carried = notice + 120;
     s.seed_tap(
         "usage-session|4pm (UTC)".to_string(),
-        aterm_phase::WallKind::UsageSession,
+        alab_policy::vocab::WallKind::UsageSession,
         "You've hit your session limit",
         carried,
         TEST_NOW,
@@ -210,7 +210,11 @@ fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = tapped(&mut m, Some(ledger.clone()));
     let (r, a) = decide(&mut s, session_wall(None), &opts);
-    assert_eq!(r.wall, Some(aterm_phase::WallKind::UsageSession), "{r:#?}");
+    assert_eq!(
+        r.wall,
+        Some(alab_policy::vocab::WallKind::UsageSession),
+        "{r:#?}"
+    );
     let t = s.turn_end.timing.clone();
     let jitter = resume_jitter(SID, reset, t.reset_jitter);
     assert_eq!(r.jitter, jitter, "the session's share of the tap's reset");
@@ -266,7 +270,7 @@ fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
     let mut s = tapped(&mut m, None);
     let codex = s.tap_reset(
         opts_with(&host).idle_host.as_ref(),
-        aterm_phase::WallKind::UsageSession,
+        alab_policy::vocab::WallKind::UsageSession,
         "You've hit your usage limit",
         None,
         Program::Codex,
@@ -293,7 +297,7 @@ fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
         let seed = |s: &mut Session<'_, Mock>| {
             s.seed_tap(
                 "an older wall".to_owned(),
-                aterm_phase::WallKind::UsageSession,
+                alab_policy::vocab::WallKind::UsageSession,
                 "You've hit your session limit",
                 reset,
                 TEST_NOW,
@@ -303,7 +307,7 @@ fn a_cut_session_walls_wait_is_timed_by_the_taps_reset() {
         assert_eq!(
             s.tap_reset(
                 opts.idle_host.as_ref(),
-                aterm_phase::WallKind::UsageSession,
+                alab_policy::vocab::WallKind::UsageSession,
                 "You've hit your session limit",
                 None,
                 Program::Claude,
@@ -1048,7 +1052,7 @@ fn a_wall_met_again_is_read_afresh_by_the_tap() {
 /// to the notice's reset.
 #[test]
 fn a_walls_answer_read_again_with_its_zone_named_keeps_the_taps_timing() {
-    use crate::supervise::policy::turn_end::RULE_LAND;
+    use alab_policy::words::RULE_LAND;
     let five = UsageWindow::FiveHour;
     let ww = |rows: &str| -> Vec<String> {
         rows.lines()
@@ -1116,7 +1120,7 @@ fn a_spend_wall_is_never_timed_by_the_tap() {
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = tapped(&mut m, None);
     let (r, a) = decide(&mut s, spend, &opts);
-    assert_eq!(r.wall, Some(aterm_phase::WallKind::Spend), "{r:#?}");
+    assert_eq!(r.wall, Some(alab_policy::vocab::WallKind::Spend), "{r:#?}");
     assert_eq!((r.reset_at, host.asks()), (None, 0));
     assert!(
         matches!(&a, TurnEndAction::Escalate { reason } if reason.contains("only usage credits")),
@@ -1170,7 +1174,11 @@ fn a_transcript_limit_is_timed_by_the_tap_against_its_rows_reset() {
         let mut m = Mock::new(vec![idle.clone()]);
         let mut s = tapped(&mut m, Some(ledger.clone()));
         let (r, a) = decide(&mut s, idle.clone(), &opts);
-        assert_eq!(r.wall, Some(aterm_phase::WallKind::UsageWeekly), "{r:#?}");
+        assert_eq!(
+            r.wall,
+            Some(alab_policy::vocab::WallKind::UsageWeekly),
+            "{r:#?}"
+        );
         let at = r.reset_at.map(|at| s.unix_of(at));
         let waited = until_unix(&s, &a);
         let rows = std::fs::read_to_string(&ledger).unwrap_or_default();
@@ -1449,7 +1457,7 @@ fn tap_reset_rows(tag: &str, points: &[Point], restarts: &[usize]) -> (usize, St
                     let _ = decide(&mut s, screen.clone(), &opts);
                 }
                 Point::Typed => s.ledger_row(
-                    crate::supervise::policy::turn_end::RULE_CONTINUE,
+                    alab_policy::words::RULE_CONTINUE,
                     crate::supervise::approvals::Outcome::Typed,
                     "carry on",
                     "the turn-end policy (an act typed at the wall)",
@@ -1478,7 +1486,7 @@ fn tap_reset_rows(tag: &str, points: &[Point], restarts: &[usize]) -> (usize, St
 /// the new wall's pair). CONTROL: each run with no restart writes the rows named.
 #[test]
 fn a_successor_at_any_point_writes_the_tap_reset_rows_one_loop_writes() {
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let five = UsageWindow::FiveHour;
     let week = UsageWindow::SevenDay;
     let words = "11:35am (America/Los_Angeles)";
@@ -1601,7 +1609,7 @@ fn the_pair_a_successor_holds_is_folded_off_the_rows_in_their_order() {
     use crate::supervise::approvals::{
         LIMIT_ENDED, Outcome, Row, TapSaid, tap_reset_reason, tap_said_in, wall_wait_reason_of,
     };
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let n = TEST_NOW + 7200;
     let row = |rule_id: &str, outcome: Outcome, reason: &str| {
         Row {
@@ -1670,7 +1678,11 @@ fn a_successor_waits_to_the_taps_reset_over_a_transcript_limits_row() {
         let mut s = successor(&mut m, &ledger);
         let opts = opts_with(&weekly_standing(until, None));
         let (r, _) = decide(&mut s, idle.clone(), &opts);
-        assert_eq!(r.wall, Some(aterm_phase::WallKind::UsageWeekly), "{r:#?}");
+        assert_eq!(
+            r.wall,
+            Some(alab_policy::vocab::WallKind::UsageWeekly),
+            "{r:#?}"
+        );
         let got = reset_of(&s, &r);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);

@@ -43,6 +43,13 @@ impl Jv {
         Self::obj([("why", Self::s(word))])
     }
 
+    /// A figure unknown because the reader lane that feeds it stalled ([`crate::lanes`]):
+    /// `{"why": "stalled", "lane": lane}`.
+    #[must_use]
+    pub fn stalled(lane: &str) -> Self {
+        Self::obj([("why", Self::s("stalled")), ("lane", Self::s(lane))])
+    }
+
     /// A lower bound.
     #[must_use]
     pub fn at_least(v: u64, cause: &str) -> Self {
@@ -188,10 +195,16 @@ fn walk(v: &Jv, path: &str, out: &mut Vec<String>) {
                 return;
             }
             if has("why") {
-                let ok = keys.len() == 1
-                    && matches!(v.get("why"), Some(Jv::Str(w)) if super::is_unavailable_word(w));
+                let ok = (keys.len() == 1
+                    && matches!(v.get("why"), Some(Jv::Str(w)) if super::is_unavailable_word(w)))
+                    || (keys == ["why", "lane"]
+                        && matches!(v.get("why"), Some(Jv::Str(w)) if w == "stalled")
+                        && matches!(v.get("lane"), Some(Jv::Str(l)) if !l.is_empty()));
                 if !ok {
-                    out.push(format!("{path}: an unknown is exactly {{\"why\": <word>}}"));
+                    out.push(format!(
+                        "{path}: an unknown is exactly {{\"why\": <word>}}, or \
+                         {{\"why\": \"stalled\", \"lane\": <lane>}}"
+                    ));
                 }
                 return;
             }

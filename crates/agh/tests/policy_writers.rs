@@ -8,7 +8,7 @@ use std::path::Path;
 
 use agh::config::{self, Dirs};
 use agh::error::{Error, Kind, Sub};
-use agh::identity::{self, MapEnv};
+use agh::identity;
 use agh::policy::{
     Named, PermitTarget, Presence, Provenance, RefusalCode, RouteRequest, RouteTarget, Router, Tier,
 };
@@ -19,9 +19,9 @@ use crate::common;
 /// Each profile's presence on `router`, judged as the client judges it, with no environment.
 fn presence_on(router: &Router) -> impl Fn(&str) -> Presence + '_ {
     |name: &str| {
-        router.profile(name).map_or(Presence::Absent, |profile| {
-            identity::presence(profile, &MapEnv::new())
-        })
+        router
+            .profile(name)
+            .map_or(Presence::Absent, identity::presence)
     }
 }
 
@@ -287,7 +287,7 @@ fn dev_under_both(dirs: &Dirs) -> [(bool, Presence); 2] {
     let judge = |validated: Option<config::Validated>| {
         let validated = validated.expect("agh.toml is there");
         let dev = &validated.profiles()["dev"];
-        (dev.legacy_loose(), identity::presence(dev, &MapEnv::new()))
+        (dev.legacy_loose(), identity::presence(dev))
     };
     [
         judge(config::load(dirs).expect("load reads it")),
@@ -318,7 +318,7 @@ fn legacy_loose_is_honoured_by_the_host_loader_only() {
         let validated = config::load_for_host(&dirs)
             .expect("load_for_host reads it")
             .expect("agh.toml is there");
-        identity::load_for_tests(&validated.profiles()["dev"], &MapEnv::new())
+        identity::load_for_tests(&validated.profiles()["dev"])
             .expect("a credential")
             .loose_file()
     };
@@ -376,12 +376,8 @@ fn grant_vault(root: &Path, fake: &FakeGithub, recorded: bool) -> Dirs {
     let release = agh_fake::token("first-grant-release");
     fake.add_token(&dev, "fixture-dev");
     fake.add_token(&release, "fixture-release-bot");
-    common::write_token(&dirs.home.join(".secrets"), "gh_access_token", &dev);
-    common::write_token(
-        &dirs.home.join(".secrets"),
-        "gh_access_token_alabsystems",
-        &release,
-    );
+    common::vault_entry(&dirs.home, Slot::Dev.entry(), &dev);
+    common::vault_entry(&dirs.home, Slot::Release.entry(), &release);
     if recorded {
         vault::record_for_tests(
             &dirs,
@@ -455,7 +451,7 @@ fn first_grant_preserves_recorded_vault_routing_without_learning() {
             & 0o777,
         0o700
     );
-    let view = agh::routing::view(&dirs, &common::env()).unwrap();
+    let view = agh::routing::view(&dirs).unwrap();
     let router = view.router().unwrap();
     assert_eq!(router.writer_of("fixture-dev"), Some("dev"));
     assert_eq!(router.writer_of("alabsystems"), Some("release"));
@@ -492,7 +488,7 @@ fn first_grant_allows_one_recorded_vault_identity_without_its_partner() {
         let root = common::scratch("first-grant-single-identity");
         let fake = FakeGithub::start();
         let dirs = grant_vault(root.path(), &fake, true);
-        std::fs::remove_file(absent.path(&dirs.home)).unwrap();
+        agh::identity::vault::put_entry_for_tests(&dirs.home, absent.entry(), None);
         let (exit, stdout, stderr) = run(
             root.path(),
             &fake,
@@ -509,10 +505,9 @@ fn first_grant_allows_one_recorded_vault_identity_without_its_partner() {
 }
 
 #[test]
-fn first_grant_refuses_unrecorded_rotated_or_unsafe_vault_credentials() {
+fn first_grant_refuses_unrecorded_rotated_or_absent_vault_credentials() {
     use agh::identity::vault::Slot;
-    use std::os::unix::fs::PermissionsExt;
-    for state in ["unrecorded", "rotated", "loose", "absent", "damaged"] {
+    for state in ["unrecorded", "rotated", "absent", "damaged"] {
         let root = common::scratch("first-grant-refused");
         let fake = FakeGithub::start();
         let dirs = if state == "absent" {
@@ -521,13 +516,7 @@ fn first_grant_refuses_unrecorded_rotated_or_unsafe_vault_credentials() {
             grant_vault(root.path(), &fake, state != "unrecorded")
         };
         if state == "rotated" {
-            std::fs::write(Slot::Dev.path(&dirs.home), agh_fake::token("rotated")).unwrap();
-        } else if state == "loose" {
-            std::fs::set_permissions(
-                Slot::Dev.path(&dirs.home),
-                std::fs::Permissions::from_mode(0o644),
-            )
-            .unwrap();
+            common::vault_entry(&dirs.home, Slot::Dev.entry(), &agh_fake::token("rotated"));
         } else if state == "damaged" {
             std::fs::write(
                 dirs.config.join(agh::identity::vault::RECORD_FILE),
@@ -717,7 +706,7 @@ fn a_token_pasted_into_writers_is_never_printed() {
     let no_terminal = (false, false);
 
     let faulty = format!(
-        "{}\n[profiles.{legacy}]\nenv = \"AGH_LEAK_TOKEN\"\ntier = \"dev\"\n\
+        "{}\n[profiles.{legacy}]\ntoken_file = \"/agh-leak.token\"\ntier = \"dev\"\n\
          legacy_loose = true\n\n[[writers]]\ncaller = \"leaky\"\nrepos = [\"{legacy}\"]\n",
         common::canonical_config(root.path())
     );

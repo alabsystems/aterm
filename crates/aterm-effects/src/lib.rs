@@ -7,6 +7,8 @@
 
 /// The animal roster's bake path.
 pub mod animal_baker;
+/// What recording an effect as an Aos task needs, whatever the effect.
+pub mod aos_effect;
 /// The typing-momentum glow as an Aos task.
 pub mod aos_momentum;
 /// `@generated` animal drawlists.
@@ -68,7 +70,7 @@ pub mod host;
 /// The integer bag-of-ids MLP job kind and its CPU reference (Aos M5a).
 #[cfg(any(test, debug_assertions, feature = "int-bag-mlp"))]
 pub mod int_bag_mlp;
-/// The flying head no setting selects any more: the celebration's singer, which the pet replaces on the glass.
+/// The flying cat (the pet setting's flier, the brand cat's glide) and the celebration's singing head.
 pub mod kitty_cursor;
 /// The rainbow kitty pet.
 pub mod kitty_pet;

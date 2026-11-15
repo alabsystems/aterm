@@ -164,41 +164,25 @@ fn any_existing_target_even_host_specific_prevents_partial_replacement() {
     }
 }
 
+/// The migrated bundle is what this Mac reads in place beside the legacy one: every canonical
+/// name and both legacy ones are read by name, the canonical members hold the legacy values,
+/// and those values authorize the shared release machine.
 #[test]
-fn a_personal_legacy_profile_stays_while_the_modern_bundle_materializes() {
+fn the_migrated_bundle_is_read_in_place_beside_the_legacy_one_and_authorizes() {
     let fixture = Fixture::new();
     let next = fixture.ready();
-    let home = aterm_tempfile::tempdir().unwrap();
-    let personal = materialize::target_path(home.path(), LEGACY[2]).unwrap();
-    fsx::ensure_private_dir(personal.parent().unwrap()).unwrap();
-    fsx::write_atomic(&personal, b"personal profile unchanged", 0o600).unwrap();
-    let (_, report) =
-        materialize::apply(home.path(), &next.entries(), &Manifest::default(), 1).unwrap();
-    assert!(report.failed.is_empty(), "{report:?}");
-    assert_eq!(
-        fsx::read_private(&personal, 4096)
-            .unwrap()
-            .unwrap()
-            .as_slice(),
-        b"personal profile unchanged"
-    );
-    assert!(
-        !materialize::target_path(home.path(), LEGACY[0])
-            .unwrap()
-            .exists()
-    );
-    assert!(
-        !materialize::target_path(home.path(), LEGACY[1])
-            .unwrap()
-            .exists()
-    );
+    let report = record_applied(&mut State::default(), &next.entries());
+    assert!(report.refused.is_empty(), "{report:?}");
+    for name in LEGACY.iter().chain(&CANONICAL).chain(&CANONICAL_ROSTER) {
+        assert!(
+            report.held.iter().any(|held| held == name),
+            "{name}: {report:?}"
+        );
+    }
+    let read = |name: &str| next.entry(&Audience::Everyone, name).unwrap().value.clone();
     for (index, name) in CANONICAL.iter().enumerate() {
-        let actual =
-            fsx::read_private(&materialize::target_path(home.path(), name).unwrap(), 65536)
-                .unwrap()
-                .unwrap();
         assert_eq!(
-            actual,
+            read(name),
             fixture
                 .doc
                 .entry(&Audience::Everyone, LEGACY[index])
@@ -206,11 +190,6 @@ fn a_personal_legacy_profile_stays_while_the_modern_bundle_materializes() {
                 .value
         );
     }
-    let read = |name| {
-        fsx::read_private(&materialize::target_path(home.path(), name).unwrap(), 65536)
-            .unwrap()
-            .unwrap()
-    };
     assert!(
         crate::release_ring::authorize_with(
             read(CANONICAL[2]).as_slice(),
@@ -330,22 +309,26 @@ fn a_profile_naming_the_canonical_roster_can_bootstrap_from_the_signed_legacy_pa
 fn vault_owned_roster_pairs_advance_and_newer_canonical_pairs_never_roll_back() {
     let mut fixture = Fixture::new();
     let first = fixture.ready();
-    let home = aterm_tempfile::tempdir().unwrap();
-    let (manifest, report) =
-        materialize::apply(home.path(), &first.entries(), &Manifest::default(), 1).unwrap();
-    assert!(report.failed.is_empty());
+    let mut state = State::default();
+    assert!(record_applied(&mut state, &first.entries()).changed);
     fixture.doc = first.clone();
     fixture.roster.roster_seq = 6;
     fixture.sign_roster();
     let next = fixture.ready();
-    let (_, report) = materialize::apply(home.path(), &next.entries(), &manifest, 2).unwrap();
-    assert!(report.failed.is_empty());
-    for name in CANONICAL_ROSTER {
-        let actual =
-            fsx::read_private(&materialize::target_path(home.path(), name).unwrap(), 65536)
-                .unwrap()
-                .unwrap();
-        assert_eq!(actual, next.entry(&Audience::Everyone, name).unwrap().value);
+    let report = record_applied(&mut state, &next.entries());
+    assert!(
+        report.changed,
+        "the advanced pair is what this Mac reads: {report:?}"
+    );
+    let legacy_names = [LEGACY_ROSTER.to_owned(), format!("{LEGACY_ROSTER}.sig")];
+    for (name, legacy) in CANONICAL_ROSTER.iter().zip(&legacy_names) {
+        assert!(report.held.iter().any(|held| held == name), "{name}");
+        let read = &next.entry(&Audience::Everyone, name).unwrap().value;
+        assert_eq!(
+            read,
+            &next.entry(&Audience::Everyone, legacy).unwrap().value
+        );
+        assert_ne!(read, &first.entry(&Audience::Everyone, name).unwrap().value);
     }
     for name in CANONICAL {
         assert_eq!(
@@ -362,29 +345,6 @@ fn vault_owned_roster_pairs_advance_and_newer_canonical_pairs_never_roll_back() 
             .unwrap();
     }
     assert!(matches!(fixture.migrate(), Migration::Unchanged));
-}
-
-#[test]
-fn personal_canonical_roster_files_are_preserved() {
-    let next = Fixture::new().ready();
-    let home = aterm_tempfile::tempdir().unwrap();
-    for name in CANONICAL_ROSTER {
-        let path = materialize::target_path(home.path(), name).unwrap();
-        fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
-        fsx::write_atomic(&path, b"personal roster file", 0o600).unwrap();
-    }
-    let (_, report) =
-        materialize::apply(home.path(), &next.entries(), &Manifest::default(), 1).unwrap();
-    assert!(report.failed.is_empty());
-    for name in CANONICAL_ROSTER {
-        assert_eq!(
-            fsx::read_private(&materialize::target_path(home.path(), name).unwrap(), 65536)
-                .unwrap()
-                .unwrap()
-                .as_slice(),
-            b"personal roster file"
-        );
-    }
 }
 
 #[test]

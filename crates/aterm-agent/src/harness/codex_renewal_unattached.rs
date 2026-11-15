@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A login renewal's successor that never attached, kept against that successor. The root's end
+//! A successor at an authentication wall that never attached, kept against that successor: a
+//! login renewal's, or a lost login's move to another row ([`Purpose::auth_wall`]). The root's end
 //! hands its session back on the login it was on, where the same wall asks for the same successor
 //! again: without this record each new process (a new index key) would mint a new root onto it at
-//! once, and each would signal the agent and end the same way.
+//! once, and each would signal the agent and end the same way. A move's record is keyed by the
+//! source's identity and the destination's login and generation, so it holds that destination off
+//! for the source's sessions only.
 
 use super::*;
 
@@ -35,6 +38,22 @@ fn unattached_path(
     new_auth: &Path,
     generation: u64,
 ) -> Result<PathBuf, &'static str> {
+    Ok(unattached_path_in(
+        &env.accounts_store_for(accounts::Cli::Codex)
+            .ok_or("unattached-store")?,
+        identity,
+        new_auth,
+        generation,
+    ))
+}
+
+/// [`unattached_path`] in the Codex accounts store `store`.
+fn unattached_path_in(
+    store: &accounts::Store,
+    identity: &Identity,
+    new_auth: &Path,
+    generation: u64,
+) -> PathBuf {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(b"aterm/codex-renewal/unattached/v1\0");
     for part in [
@@ -47,12 +66,32 @@ fn unattached_path(
     }
     hash.update(generation.to_be_bytes());
     let digest = aterm_codec::hex::encode_lower(&hash.finalize());
-    Ok(env
-        .accounts_store_for(accounts::Cli::Codex)
-        .ok_or("unattached-store")?
+    store
         .dir
         .join("renewal-follow")
-        .join(format!("unattached-{digest}.json")))
+        .join(format!("unattached-{digest}.json"))
+}
+
+/// [`ReceiptWriter::unattached_login_until`] read from the Codex accounts store `store` at `now`,
+/// outside the receipt writer: what a lost login's pass over its candidates
+/// ([`super::super::codex_login_rotation`]) reads so as not to read a destination whose earlier
+/// successor for `identity` never attached. An observation only: the writer's own root creation
+/// holds the destination off again ([`ReceiptWriter::create`]).
+/// # Errors
+/// The record cannot be read safely.
+pub fn unattached_held_until(
+    store: &accounts::Store,
+    identity: &Identity,
+    new_auth: &Path,
+    generation: u64,
+    now: i64,
+) -> Result<Option<i64>, &'static str> {
+    let path = unattached_path_in(store, identity, new_auth, generation);
+    let Some(record) = read_record::<Unattached>(&path)? else {
+        return Ok(None);
+    };
+    let until = record.until();
+    Ok((now < until).then_some(until))
 }
 
 impl ReceiptWriter<'_> {
@@ -69,7 +108,7 @@ impl ReceiptWriter<'_> {
     /// The root is not a retired login renewal its cancellation ended with no successor, it
     /// changed, or the record cannot be read or durably written.
     pub fn note_unattached_login(&self, root: &Receipt) -> Result<(), &'static str> {
-        if root.intent.purpose != Purpose::Login
+        if !root.intent.purpose.auth_wall()
             || root.phase != Phase::Retired
             || !root.revoked
             || root.successor_pid.is_some()
@@ -122,7 +161,7 @@ impl ReceiptWriter<'_> {
     /// The root is not a login renewal whose successor registered, it changed, or the record
     /// cannot be removed durably.
     pub fn note_attached_login(&self, root: &Receipt) -> Result<(), &'static str> {
-        if root.intent.purpose != Purpose::Login
+        if !root.intent.purpose.auth_wall()
             || !matches!(root.phase, Phase::Committed | Phase::Consumed)
             || root.successor_pid.is_none()
             || root.successor_birth.is_none()

@@ -59,19 +59,14 @@ impl Reader {
         Ok(Self { stop, worker })
     }
 
-    pub(super) fn shutdown(self, mut pump: impl FnMut()) -> Result<(), String> {
+    pub(super) fn shutdown(self, pump: impl FnMut()) -> Result<(), String> {
         self.stop.store(true, Ordering::Release);
-        let until = std::time::Instant::now() + Duration::from_secs(60);
-        while !self.worker.is_finished() {
-            assert!(
-                std::time::Instant::now() < until,
-                "fixture live snapshot shutdown hang detector"
-            );
-            pump();
-        }
-        self.worker
-            .join()
-            .map_err(|_| "fixture live snapshot worker panicked".to_owned())?
+        join_pumping(
+            self.worker,
+            "fixture live snapshot shutdown hang detector",
+            pump,
+        )
+        .map_err(|_| "fixture live snapshot worker panicked".to_owned())?
     }
 }
 

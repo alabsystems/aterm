@@ -32,7 +32,7 @@ impl Fixture {
         let id = connection.id;
         let peer = Peer {
             caller: slot::Caller {
-                sid: format!("s-use-fixture-{id}"),
+                sid: aterm_types::tab_id::TabId::from_bits(id).to_string(),
                 pid: process.pid,
                 birth: process.birth,
             },
@@ -1381,6 +1381,17 @@ fn derived_child_owns_new_connection_without_transferring_parent_use_authority()
             &capability,
         )
         .unwrap();
+    {
+        let state = fixture.registry.state.lock().unwrap();
+        let observation = ProofUses::capture(&state, &fixture.peer.caller).unwrap();
+        let (uses, ancestry) = observation.metadata();
+        assert!(uses.is_empty(), "ended parent use is not active work");
+        assert_eq!(ancestry.len(), 1);
+        assert_eq!(ancestry[0].child, child.member);
+        assert_eq!(ancestry[0].parent, fixture.member);
+        assert!(observation.matches(&state, &fixture.peer.caller));
+        assert_eq!(ProofUses::counts(&state, &fixture.peer.caller), (0, 0, 0));
+    }
     assert_eq!(
         fixture
             .registry

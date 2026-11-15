@@ -1278,7 +1278,16 @@ fn under_root_the_proof_runs_no_toolchain_file_another_account_can_change() {
         "../../theirs/rustc",
         &scratch.join("lab/mixed-home/bin/rustc"),
     );
-    scratch.program("lab/root-store/store/trust/7/bin/targo", STORE_TARGO);
+    let root_targo = scratch.program("lab/root-store/store/trust/7/bin/targo", STORE_TARGO);
+    let mut qualification = aterm_uds::spawnfd::command(&root_targo);
+    qualification.arg("--version");
+    let output = aterm_uds::deadline::output_within(
+        &mut qualification,
+        aterm_uds::deadline::FIRST_EXEC_HANG,
+    )
+    .expect("the private store targo qualifies before the compiler ownership proof");
+    assert!(output.status.success(), "{root_targo:?}: {output:?}");
+    assert_eq!(output.stdout, format!("{STORE_TARGO_VERSION}\n").as_bytes());
     symlink(
         "../../../../../theirs/trustc",
         &scratch.join("lab/root-store/store/trust/7/bin/trustc"),

@@ -14,10 +14,20 @@
 //!    the compiled ones, published into the new generation; the old generation's cover rows are
 //!    not carried. Past-quota automatic records stay inert: they never project, so nothing of
 //!    them is restated, and the new generation gives every writer its whole quota again.
-//!    A `Secret` cell's token is sealed to its table and coordinates, so each candidate the roll
-//!    carries is opened through the old generation's sealer and sealed again through the new
-//!    one's (`typed::secret::Sealer`): the old token's bytes are never copied, and no plaintext
-//!    leaves the roll.
+//!    No table holds a secret (docs/PLAN.md LT-04): an earlier build sealed a password or a phone
+//!    number into its cell as a `sec1:` token under the generation's audience key, and the roll
+//!    is what takes each one out. A candidate holding such a token, in any column, is opened
+//!    through the old generation's sealer (`att::sealer`) at its coordinates: a `SecretRef`
+//!    column's value is put into this Mac's secret store (`alab::vault::Vault`) under the entry
+//!    the candidate's origin names (`typed::secret::moved_entry`, so every Mac that rolls the
+//!    candidate names and puts the same one; equal values of one register share the first) and
+//!    the candidate carries the reference; a `Phone` column's carries the number's digits, which
+//!    are ordinary data. A token in any other column, or
+//!    one that does not open, stops the roll, naming its coordinates and never a value. No token
+//!    and no plaintext reaches the new generation. The new generation is a table scope of its
+//!    own, so its audience key opens nothing of the old one; the old generation's records still
+//!    hold the sealed tokens until its seal and the storage release (step 5) delete this Mac's
+//!    storage of it.
 //! 2. **Archive.** Each owned row a reader projects (machine facts, mailbox observations) is
 //!    carried as the signed record that wrote it (`registry::ARCHIVED`), still sealed under the
 //!    old table's scope, so its signer and operation digest are its own: a reader authenticates
@@ -66,7 +76,7 @@ use crate::{
         self,
         cell::{self, CellKey, CellValue, Cells, Projection},
         keys, owned,
-        secret::Sealer,
+        secret::{self, Sealer, Secret},
     },
 };
 use astream_wire::sync::{Actor, Digest};
@@ -111,6 +121,31 @@ fn request_role(role: &str, log: &Log) -> String {
     )
 }
 
+/// What a restatement writes: the register changes, each secret-store entry the references
+/// among them name with the value it must hold, put only by a roll that applies
+/// (`Registry::roll`) before any change that names it is written, and each entry a candidate the
+/// restatement drops named (`drops`), owed removal by that roll so a sweep collects it once no
+/// cell names it.
+#[derive(Default)]
+pub(crate) struct Restated {
+    pub(crate) rows: Vec<Vec<Change>>,
+    pub(crate) puts: Vec<(String, Secret)>,
+    pub(crate) drops: Vec<String>,
+}
+
+/// The new generation's sealer, for a roll into a generation builds up to 0.200.0 still read
+/// ([`typed::Ty::Secret`]): a value is resealed for it, and a token it holds that opens there is
+/// carried already.
+pub(crate) type Reseal<'a> = &'a dyn Sealer;
+
+/// Store entries a restatement chose, each with the value it holds.
+type Moving = Vec<(String, Secret)>;
+
+/// What a roll's restatement reaches secrets through: the old generation's sealer (to open), the
+/// new one's [`Reseal`] where older builds still read it, and the secret store.
+pub(crate) type Secrets<'a> = (&'a dyn Sealer, Option<Reseal<'a>>, &'a dyn secret::Store);
+
+/// [`restate_with_claims`] with no claim provenance to carry.
 #[cfg(test)]
 pub(crate) fn restate(
     table: &typed::Table,
@@ -118,45 +153,54 @@ pub(crate) fn restate(
     held: &BTreeSet<Digest>,
     target: &Cells,
     carried: &Carried,
-    reseal: (&dyn Sealer, &dyn Sealer),
-) -> Result<Vec<Vec<Change>>> {
+    secrets: Secrets<'_>,
+) -> Result<Restated> {
     restate_with_claims(
         table,
         source,
         held,
         target,
         carried,
-        reseal,
+        secrets,
         &typed::claim::CarriedClaims::new(),
     )
 }
 
 /// The registers to write into the new generation (`target`, whose rolls already carried
 /// `carried`) from the old one's `source` cells, `held` being every operation this Mac holds of
-/// the old one. A register carries candidates not carried before, retains ones the new
-/// generation still holds, and drops ones this Mac's old history shows superseded. A previously
-/// carried candidate absent from the new generation stays absent: a later edit replaced it.
-/// An unchanged result writes nothing; an empty result clears the register. One change each.
-/// A collection `table` names as owned or log rows is no register: its rows go as archived
-/// records. A `Secret` column's candidates go through `reseal` (the old generation's sealer, then the
-/// new one's); a candidate the new generation already holds keeps the token it has there only
-/// where that token opens there: a token an older build's roll copied as it was is sealed for
-/// the old generation, so it is resealed, though its origin counts as carried.
+/// the old one, and `table` the compiled declaration both generations share. A register carries
+/// candidates not carried before, retains ones the new generation still holds, and drops ones
+/// this Mac's old history shows superseded. A previously carried candidate absent from the new
+/// generation stays absent: a later edit replaced it. An unchanged result writes nothing; an
+/// empty result clears the register. One change each. A collection `table` names as owned or log
+/// rows is no register: its rows go as archived records.
+///
+/// A candidate holding an earlier build's sealed token (`typed::secret::is_sealed`), in any
+/// column, is opened through `secrets.0` (the old generation's opener) at its coordinates
+/// ([`moved`]). Into a generation builds up to 0.199.0 still read, whose secret columns are
+/// [`typed::Ty::Secret`], it is resealed for that generation through `secrets.1`, and a token the
+/// new generation holds that opens there is carried already. Into the third generation it is
+/// never carried as a token: a `SecretRef` column's value goes to the store entry its origin
+/// names in `secrets.2`, and the candidate carries the reference; a `Phone` column's carries the
+/// number. A candidate the new generation already holds as a
+/// reference or a plain value keeps what it holds there.
 ///
 /// # Errors
 /// A register would hold more candidates than a carried value lists, a key breaks a rule, or a
-/// `Secret` cannot be opened or sealed again.
+/// sealed token does not open, sits in a column that is neither `SecretRef` nor `Phone`, or opens
+/// to a value its column cannot hold. Each names coordinates, never a value.
 fn restate_with_claims(
     table: &typed::Table,
     source: &Cells,
     held: &BTreeSet<Digest>,
     target: &Cells,
     carried: &Carried,
-    reseal: (&dyn Sealer, &dyn Sealer),
+    secrets: Secrets<'_>,
     claims: &typed::claim::CarriedClaims,
-) -> Result<Vec<Vec<Change>>> {
+) -> Result<Restated> {
     let target_claims = typed::claim::carried_claims(target)?;
-    let mut rows = Vec::new();
+    let reseal = secrets.1;
+    let mut out = Restated::default();
     for (coord @ (collection, key), cell) in source {
         if NOT_RESTATED.contains(&collection.as_str())
             || cell.stopped
@@ -166,25 +210,12 @@ fn restate_with_claims(
         {
             continue;
         }
-        let secret = table.collection(collection).and_then(|known| {
-            let parsed = CellKey::parse(key).ok()?;
-            (parsed.elem.is_none()
-                && known
-                    .column(parsed.col)
-                    .is_some_and(|column| matches!(column.ty, typed::Ty::Secret)))
-            .then_some(parsed)
-        });
         let now: BTreeMap<Digest, &Value> = target
             .get(coord)
             .map(cell::origins_refs)
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let opens = |value: &Value| {
-            secret
-                .as_ref()
-                .is_none_or(|parsed| opens_in(value, collection, parsed.pk, parsed.col, reseal.1))
-        };
         let carried_here = carried.get(coord);
         let mut old: BTreeMap<Digest, Value> = cell::origins_refs(cell)
             .into_iter()
@@ -194,15 +225,38 @@ fn restate_with_claims(
             })
             .map(|(origin, value)| (origin, value.clone()))
             .collect();
-        if let Some(parsed) = &secret {
-            for (origin, value) in &mut old {
-                if let Some(&there) = now.get(origin).filter(|&&there| opens(there)) {
-                    value.clone_from(there);
-                    continue;
-                }
-                reseal_value(value, collection, parsed.pk, parsed.col, reseal)?;
+        // Each moved value's entry is named by its origin ([`secret::moved_entry`]), so every Mac
+        // that rolls this register names the same entries; equal values share the first one, in
+        // origin order. `named` holds every entry chosen, `moving` those still to put.
+        let mut named: Vec<(String, Secret)> = Vec::new();
+        let mut moving: Vec<(String, Secret)> = Vec::new();
+        for (origin, value) in &mut old {
+            if let Some(&there) = now.get(origin).filter(|&&there| {
+                token_of(there).is_none_or(|token| {
+                    reseal.is_some_and(|opens| {
+                        CellKey::parse(key).is_ok_and(|parsed| {
+                            opens.open(collection, parsed.pk, parsed.col, token).is_ok()
+                        })
+                    })
+                })
+            }) {
+                value.clone_from(there);
+                continue;
+            }
+            if token_of(value).is_some() {
+                moved(
+                    table,
+                    (collection.as_str(), key.as_str(), origin),
+                    value,
+                    secrets,
+                    (&mut named, &mut moving),
+                )?;
+            } else {
+                stray_secret(table, (collection.as_str(), key.as_str()), value)?;
             }
         }
+        let chosen: BTreeSet<String> = named.into_iter().map(|(entry, _)| entry).collect();
+        out.puts.extend(moving);
         let mut merged: BTreeMap<Digest, Value> = now
             .iter()
             .filter(|(origin, _)| !held.contains(*origin) || old.contains_key(*origin))
@@ -222,6 +276,31 @@ fn restate_with_claims(
                 .all(|(origin, value)| now.get(origin) == Some(&value))
         {
             continue;
+        }
+        // What the register stops naming is owed removal; what it keeps naming from the new
+        // generation must still be in the store: a Mac that wrote the register meanwhile may
+        // have removed an entry this Mac's view of the new generation still names, and a late
+        // write naming it again would leave a candidate naming nothing. Such a roll stops until
+        // this Mac holds that write.
+        let kept: BTreeSet<&str> = merged
+            .values()
+            .filter_map(|value| secret_entry(table, (collection, key), value))
+            .collect();
+        for value in now.values() {
+            if let Some(entry) = secret_entry(table, (collection, key), value)
+                && !kept.contains(entry)
+            {
+                out.drops.push(entry.to_owned());
+            }
+        }
+        for entry in kept {
+            if !chosen.contains(entry) && secrets.2.get(entry)?.is_none() {
+                return Err(Error::new(&format!(
+                    "{collection} {key}: the new generation names a store entry this Mac's vault \
+                     does not hold; the roll stops until this Mac holds the write that removed it, \
+                     or the vault that put it"
+                )));
+            }
         }
         let value = if merged.is_empty() {
             None
@@ -251,47 +330,150 @@ fn restate_with_claims(
             }
             Some(encoded)
         };
-        rows.push(vec![Change {
+        out.rows.push(vec![Change {
             collection: collection.clone(),
             key: key.clone(),
             value,
         }]);
     }
-    Ok(rows)
+    Ok(out)
 }
 
-/// Whether a `Secret` candidate opens through `sealer`: an empty one (`null`, bare or typed)
-/// holds nothing to open.
-fn opens_in(value: &Value, collection: &str, pk: &str, column: &str, sealer: &dyn Sealer) -> bool {
-    match value.get("x").unwrap_or(value) {
-        Value::Null => true,
-        Value::String(token) => sealer.open(collection, pk, column, token).is_ok(),
-        _ => false,
-    }
-}
-
-/// A `Secret` candidate's token opened through the old generation's sealer and sealed again
-/// through the new one's, in place; an empty candidate (`null`, bare as a revert leaves it or
-/// typed) stays.
-fn reseal_value(
-    value: &mut Value,
-    collection: &str,
-    pk: &str,
-    column: &str,
-    (from, to): (&dyn Sealer, &dyn Sealer),
+/// Refuse a candidate of a `SecretRef` column that is neither empty nor a reference to an entry
+/// of its own cell ([`typed::cell::owns_entry`]): a value some writer left in plain text, or a
+/// reference to another entry, is never carried into the new generation.
+///
+/// # Errors
+/// That candidate, naming its coordinates only.
+fn stray_secret(
+    table: &typed::Table,
+    (collection, key): (&str, &str),
+    value: &Value,
 ) -> Result<()> {
-    if value.is_null() {
+    let Ok(parsed) = CellKey::parse(key) else {
+        return Ok(());
+    };
+    let Some(column) = table
+        .collection(collection)
+        .and_then(|known| known.column(parsed.col))
+        .filter(|column| matches!(column.ty, typed::Ty::SecretRef) && parsed.elem.is_none())
+    else {
+        return Ok(());
+    };
+    let x = value.get("x").unwrap_or(value);
+    if x.is_null()
+        || (typed::cell::admissible(&column.ty, x)
+            && typed::cell::owns_entry(collection, column, parsed.pk, x))
+    {
         return Ok(());
     }
+    Err(Error::new(&format!(
+        "{collection} {key}: a secret cell holds neither a sealed value nor a reference to its \
+         own store entry; the roll stops"
+    )))
+}
+
+/// The store entry a candidate of the `SecretRef` cell at `collection` and `key` names, where it
+/// names one of its own cell's ([`secret::bound`]).
+fn secret_entry<'v>(
+    table: &typed::Table,
+    (collection, key): (&str, &str),
+    value: &'v Value,
+) -> Option<&'v str> {
+    let parsed = CellKey::parse(key).ok()?;
+    let column = table.collection(collection)?.column(parsed.col)?;
+    if column.ty != typed::Ty::SecretRef || parsed.elem.is_some() {
+        return None;
+    }
+    secret::entry_of(value.get("x").unwrap_or(value))
+        .filter(|entry| secret::bound(collection, parsed.col, parsed.pk, entry))
+}
+
+/// The sealed token a candidate holds: its typed value's `x`, or the candidate itself where it
+/// is a bare string.
+fn token_of(value: &Value) -> Option<&str> {
+    value
+        .get("x")
+        .unwrap_or(value)
+        .as_str()
+        .filter(|text| secret::is_sealed(text))
+}
+
+/// Move one candidate's sealed token out of the history, in place (`restate`): open it at the
+/// coordinates `collection` and `key` name; in a `SecretRef` column the candidate carries the
+/// reference to the store entry its origin names ([`secret::moved_entry`]), and the value joins
+/// `moving`, the register's puts, unless the store holds it there already (another Mac's roll of
+/// the same candidate, or a rerun of this one); a value equal to one chosen already (`named`)
+/// shares its entry. An entry holding another value stops the roll. In a `Phone` column the
+/// candidate carries the number itself.
+///
+/// # Errors
+/// The token does not open, the column is neither, the candidate is not a typed cell value, the
+/// value is a has-password flag or no phone number, or no entry name fits; each names the
+/// coordinates only.
+fn moved(
+    table: &typed::Table,
+    (collection, key, origin): (&str, &str, &Digest),
+    value: &mut Value,
+    (opener, reseal, store): Secrets<'_>,
+    (named, moving): (&mut Moving, &mut Moving),
+) -> Result<()> {
+    let at = |why: &str| Error::new(&format!("{collection} {key}: {why}; the roll stops"));
+    let parsed = CellKey::parse(key)
+        .map_err(|_| at("a sealed value sits under a key this build cannot read"))?;
+    let ty = table
+        .collection(collection)
+        .and_then(|known| known.column(parsed.col))
+        .map(|column| &column.ty);
     let Some(object) = value.as_object_mut() else {
-        return Err(Error::new("a Secret register is not a typed cell value"));
+        return Err(at("a sealed value is not a typed cell value"));
     };
-    let Some(token) = object.get("x").and_then(Value::as_str) else {
-        return Ok(());
+    let token = object
+        .get("x")
+        .and_then(Value::as_str)
+        .ok_or_else(|| at("a sealed value is not a typed cell value"))?;
+    let opened = opener
+        .open(collection, parsed.pk, parsed.col, token)
+        .map_err(|_| at("an earlier build's sealed value does not open on this Mac"))?;
+    let carried = match ty {
+        Some(typed::Ty::SecretRef) if parsed.elem.is_none() => {
+            let entry = match named.iter().find(|(_, held)| held.same(&opened)) {
+                Some((entry, _)) => entry.clone(),
+                None => {
+                    if secret::flag_like(&opened) {
+                        return Err(at("a sealed value is a has-password flag, not a secret"));
+                    }
+                    let entry = secret::moved_entry((collection, parsed.col, parsed.pk), origin)
+                        .map_err(|_| at("the cell's coordinates make no store entry name"))?;
+                    match store.get(&entry)? {
+                        Some(held) if !held.same(&opened) => {
+                            return Err(at("the store entry this value moves into holds another"));
+                        }
+                        Some(_) => {}
+                        None => {
+                            moving.push((entry.clone(), Secret::new(opened.plaintext().to_owned())))
+                        }
+                    }
+                    named.push((entry.clone(), opened));
+                    entry
+                }
+            };
+            secret::reference(&store.vault()?, &entry)
+        }
+        Some(typed::Ty::Secret) if parsed.elem.is_none() => {
+            if secret::flag_like(&opened) {
+                return Err(at("a sealed value is a has-password flag, not a secret"));
+            }
+            let sealer = reseal.ok_or_else(|| at("the new generation's sealer is not at hand"))?;
+            Value::String(sealer.seal(collection, parsed.pk, parsed.col, &opened)?)
+        }
+        Some(typed::Ty::Phone) => Value::String(
+            typed::cell::phone_digits(opened.plaintext())
+                .ok_or_else(|| at("a sealed value opens to no phone number"))?,
+        ),
+        _ => return Err(at("a sealed value sits in a column that holds no secret")),
     };
-    let secret = from.open(collection, pk, column, token)?;
-    let sealed = to.seal(collection, pk, column, &secret)?;
-    object.insert("x".into(), Value::String(sealed));
+    object.insert("x".into(), carried);
     Ok(())
 }
 
@@ -439,7 +621,7 @@ pub(crate) fn within(held: &BTreeMap<String, u64>, covered: &BTreeMap<String, u6
 
 /// The cover row's cells for this Mac (`uuid`) restating generation `from` with `frontier`, or
 /// none where the new generation's row already says it.
-fn cover_row(
+pub(super) fn cover_row(
     target: &Projection,
     from: u32,
     uuid: &str,
@@ -603,40 +785,23 @@ pub(crate) fn covered(
     ))
 }
 
-/// Each `Secret` register of `cells` holding a candidate whose token does not open through
-/// `sealer`, as (collection, pk, column): a token sealed for another table (an older build's roll
-/// copied it as it was) or under a key this Mac does not hold. An empty candidate (`null`, bare
-/// or typed) opens, holding nothing; a column or collection `table` does not name as `Secret` is
-/// no Secret register. Names coordinates only, never a value.
-pub(crate) fn unopened(
-    table: &typed::Table,
-    cells: &Cells,
-    sealer: &dyn Sealer,
-) -> Vec<(String, String, String)> {
+/// Each register of `cells` holding a candidate whose sealed token (an earlier build's `sec1:`)
+/// does not open through `opener`, the generation's own, as (collection, pk, column): a token an
+/// older build's roll copied as it was, sealed for the generation before it, or one under a key
+/// this Mac does not hold. Any column is read, since no column holds a token by design; a key
+/// this build cannot parse is named whole, with an empty column. Names coordinates only, never
+/// a value.
+pub(crate) fn unopened(cells: &Cells, opener: &dyn Sealer) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     for ((collection, key), cell) in cells {
-        let Some(known) = table.collection(collection) else {
-            continue;
-        };
-        let Ok(parsed) = CellKey::parse(key) else {
-            continue;
-        };
-        if parsed.elem.is_some()
-            || !known
-                .column(parsed.col)
-                .is_some_and(|column| matches!(column.ty, typed::Ty::Secret))
-        {
-            continue;
-        }
-        if cell::origins_refs(cell)
-            .iter()
-            .any(|(_, value)| !opens_in(value, collection, parsed.pk, parsed.col, sealer))
-        {
-            out.push((
-                collection.clone(),
-                parsed.pk.to_owned(),
-                parsed.col.to_owned(),
-            ));
+        let parsed = CellKey::parse(key).ok();
+        let (pk, column) = parsed
+            .as_ref()
+            .map_or((key.as_str(), ""), |parsed| (parsed.pk, parsed.col));
+        if cell::origins_refs(cell).iter().any(|(_, value)| {
+            token_of(value).is_some_and(|token| opener.open(collection, pk, column, token).is_err())
+        }) {
+            out.push((collection.clone(), pk.to_owned(), column.to_owned()));
         }
     }
     out
@@ -647,16 +812,17 @@ pub(crate) fn unopened(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Judged {
     /// Its store is complete here, holds a roller's cover for the generation before it, and
-    /// every `Secret` candidate opens under its key.
+    /// every sealed token it holds opens under its key.
     Opens,
     /// It cannot be judged yet: this Mac holds no store of it, its history here is incomplete, no
     /// cover of the generation before it is there (a roller writes its cover last, so it says the
     /// restated records before it are there), or its key is unavailable. A later housekeeping
     /// pass judges it again.
     Unjudged,
-    /// This many `Secret` registers hold a token that does not open under its key ([`unopened`]):
+    /// This many registers hold a sealed token that does not open under its key ([`unopened`]):
     /// a roll by a build that copied tokens as they were (v0.154.0). Endorsing it would let that
-    /// roll seal and strand every such cell, so this Mac does not.
+    /// roll seal the generation before it, whose storage release deletes the only copy that
+    /// opens, so this Mac does not.
     Unopened(usize),
 }
 
@@ -689,8 +855,8 @@ fn judge(
             return Ok(Judged::Unjudged);
         }
         let name = compiled.name();
-        let sealer = att::sealer(&name, session, scope)?;
-        Ok(match unopened(compiled.table, &view.cells, &sealer).len() {
+        let opener = att::sealer(&name, session, scope)?;
+        Ok(match unopened(&view.cells, &opener).len() {
             0 => Judged::Opens,
             n => Judged::Unopened(n),
         })
@@ -739,18 +905,26 @@ fn later_generations(
 /// write.
 ///
 /// A generation is declared only once it is judged to open (`judge`, design one-mesh §4.8, §11
-/// step A6): a roll by a build that copied a `Secret` cell's token as it was (v0.154.0, whose
+/// step A6): a roll by a build that copied a sealed cell's token as it was (v0.154.0, whose
 /// restatement carried an unknown column as it is) leaves a token sealed to the old table's
 /// name, which never opens in the new one, so this Mac refuses to declare it and the roll's seal
 /// keeps waiting for it, reporting it among the Macs it waits for. Refusing changes nothing
-/// here; a roll by this build reseals every such token (`restate`), and the next pass declares
-/// the generation. A generation this Mac cannot judge yet (no store, an incomplete history, no
+/// here; a roll by this build moves every such token's value out of the history (`restate`),
+/// and the next pass declares the generation. A generation this build's roll wrote holds no
+/// token, so it opens. A generation this Mac cannot judge yet (no store, an incomplete history, no
 /// roller's cover) waits for a later pass. The roller's own roll declares its target directly,
 /// since its own restatement repairs the generation.
+///
+/// A generation whose secret cells name store entries is declared only while `store` admits a
+/// value ([`secret::Store::admit`], the fleet floor): a declaration is this Mac's word that it
+/// reads the generation, which lets a roll seal the one before, after which every secret is
+/// written into the store; a Mac the floor holds back says nothing, and the seal waits for it as
+/// for an older build.
 pub(crate) fn endorse(
     session: &Session<'_>,
     directory: &Directory,
     snapshot: &crate::catalog::Snapshot,
+    store: &dyn secret::Store,
 ) -> bool {
     let trust = directory.trust();
     let chain = att::REGISTRY.chain();
@@ -772,6 +946,9 @@ pub(crate) fn endorse(
         {
             continue;
         }
+        if compiled.table.names_store() && store.admit().is_err() {
+            continue;
+        }
         if judge(session, directory, previous, compiled) == Judged::Opens
             && directory.endorse(session, &descriptor).is_ok()
         {
@@ -781,14 +958,14 @@ pub(crate) fn endorse(
     endorsed
 }
 
-/// A later registry generation whose `Secret` cells do not all open under its key, as `aterm db
+/// A later registry generation holding sealed tokens that do not open under its key, as `aterm db
 /// alab check` names it: by generation and table digest, never a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unopened {
     pub generation: u32,
     /// Its descriptor's scope digest.
     pub table: Digest,
-    /// The `Secret` registers holding a token that does not open.
+    /// The registers holding a sealed token that does not open.
     pub cells: usize,
     /// Whether this Mac declared it anyway (before this build refused such a generation).
     pub declared: bool,
@@ -800,11 +977,28 @@ impl Registry {
     /// generation no cover carries, it restates those. `now_ms` stamps the cover row; the storage
     /// release reads `now_ms` as this Mac's clock.
     ///
+    /// A sealed value the old generation holds goes into this Mac's `aterm secrets` vault
+    /// (`alab::vault::Vault`), put only when `apply` is true.
+    ///
     /// # Errors
     /// No Commons writer; this Mac holds no registry; its history of either generation is
     /// incomplete; this build compiles no later generation; a register or record is too large to
-    /// carry; or a record cannot be written.
+    /// carry; a sealed value cannot be moved (`restate`) or the vault refuses it; or a record
+    /// cannot be written.
     pub fn roll(&self, apply: bool, now_ms: u64) -> Result<Rolled> {
+        self.roll_with(apply, now_ms, &super::secret::store(self.paths()))
+    }
+
+    /// [`Registry::roll`], putting each sealed value it moves into `secrets`.
+    ///
+    /// # Errors
+    /// As [`Registry::roll`].
+    pub(crate) fn roll_with(
+        &self,
+        apply: bool,
+        now_ms: u64,
+        secrets: &dyn secret::Store,
+    ) -> Result<Rolled> {
         let deadline = crate::admission::deadline();
         let paths = crate::application_paths_until(self.paths(), deadline)?;
         let (bootstrap, journal) = Bootstrap::required_with_journal_until(&paths, deadline)
@@ -863,7 +1057,7 @@ impl Registry {
             .map(|binding| keys::uuid32(binding.machine()))
             .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
 
-        let plan = |new: Option<&Store>| -> Result<(Vec<Vec<Change>>, usize, usize, bool)> {
+        let plan = |new: Option<&Store>| -> Result<(Restated, usize, usize, bool)> {
             let (target, carried, done_archive, rolls, target_claims) = match new {
                 Some(store) => {
                     let log = Log::read_with(&session, store, to_descriptor.scope, decode)?;
@@ -890,20 +1084,31 @@ impl Registry {
                 None => Default::default(),
             };
             let from_name = from.name();
+            let opener = att::sealer(&from_name, &session, old_scope)?;
+            // A generation builds up to 0.199.0 still read takes a token resealed for it, never
+            // a store reference ([`typed::Ty::Secret`]); only the third generation takes those.
             let to_name = to.name();
-            let old_sealer = att::sealer(&from_name, &session, old_scope)?;
-            let new_sealer = att::sealer(&to_name, &session, to_descriptor.scope)?;
+            let reseal = if to.table.collections.iter().any(|c| {
+                c.columns
+                    .iter()
+                    .any(|column| column.ty == typed::Ty::Secret)
+            }) {
+                Some(att::sealer(&to_name, &session, to_descriptor.scope)?)
+            } else {
+                None
+            };
             let mut claims = target_claims;
             typed::claim::merge_claims(&mut claims, old_claims.clone())?;
-            let mut rows = restate_with_claims(
-                from.table,
+            let mut restated = restate_with_claims(
+                to.table,
                 &old_view.cells,
                 &held,
                 &target,
                 &carried,
-                (&old_sealer, &new_sealer),
+                (&opener, reseal.as_ref().map(|s| s as &dyn Sealer), secrets),
                 &claims,
             )?;
+            let rows = &mut restated.rows;
             let registers = rows.len();
             let mut archived = 0;
             let mut operations: BTreeSet<Digest> = BTreeSet::new();
@@ -934,13 +1139,13 @@ impl Registry {
             if changed {
                 rows.push(cover);
             }
-            Ok((rows, registers, archived, changed))
+            Ok((restated, registers, archived, changed))
         };
 
         // The plan runs on what this Mac holds before anything is declared, so a roll it
         // refuses (a register past the candidates a carried value holds, a cover past its
         // writers, a record too large to archive) leaves no declaration of the next generation.
-        let (_, registers, archived, cover) = plan(observed.as_ref())?;
+        let (planned, registers, archived, cover) = plan(observed.as_ref())?;
         let unread = held_ops.iter().filter(|op| op.unread).count();
         let mut rolled = Rolled {
             from: from.generation,
@@ -961,16 +1166,79 @@ impl Registry {
             }
             return Ok(rolled);
         }
+        // No value goes into the store until every Mac reading it reads one in place (the fleet
+        // floor, [`secret::Store::admit`]): asked before anything is declared, so a roll it holds
+        // back writes nothing, to the store or the catalog. It is asked of every roll into a
+        // generation whose cells name store entries, puts or none: one with nothing to put still
+        // declares that generation and lets the one before it be sealed, after which every
+        // secret written goes into the store.
+        if !planned.puts.is_empty() || to.table.names_store() {
+            secrets.admit()?;
+        }
+        drop(planned);
         drop(observed);
         directory.publish(&session, &to_descriptor)?;
         directory.endorse(&session, &to_descriptor)?;
+        // A write the old generation took after it was read and before the next one was
+        // declared saw no roll, and may have removed an entry the plan carries
+        // (`alab::secret::settle_write`): the declared generation stops every later removal, and
+        // a roll that read the old generation too early is run again.
+        let reread = Log::read_with(&session, &old, old_scope, decode)?.snapshot();
+        if reread
+            .operations
+            .iter()
+            .any(|op| !held.contains(&op.header.id))
+        {
+            return Err(Error::new(
+                "the registry changed while the roll read it; run the roll again",
+            ));
+        }
         let mut store = Store::open(
             &session,
             &directory.path(to_descriptor.scope)?,
             to_descriptor.scope,
         )?;
-        let (rows, registers, archived, cover) = plan(Some(&store))?;
+        let (
+            Restated {
+                mut rows,
+                puts,
+                drops,
+            },
+            registers,
+            archived,
+            cover,
+        ) = plan(Some(&store))?;
         (rolled.registers, rolled.archived, rolled.cover) = (registers, archived, cover);
+        // Every record as the new generation holds it ([`att::conform`]), before any value
+        // goes into the store: a generation older builds read takes no store reference.
+        for row in &mut rows {
+            att::conform(to.table, row)?;
+        }
+        // Each moved value is in the store before any reference to it is written, owed first
+        // by this run ([`typed::secret::Store::owe`]) and paid once the records naming it are
+        // appended: a roll cut short leaves them owed, and no retire or sweep runs while the next
+        // generation is declared ([`att::sole_generation`]).
+        // The entries the candidates it drops named stay owed when it is done: a sweep collects
+        // each once no cell names it ([`typed::secret::sweep`]).
+        let moved: BTreeSet<String> = puts.iter().map(|(entry, _)| entry.clone()).collect();
+        secrets.owe(&moved.iter().chain(&drops).cloned().collect::<Vec<_>>())?;
+        for (entry, value) in &puts {
+            secrets.put(entry, value)?;
+        }
+        // A put the store took is not yet a copy: a vault write signed on this Mac and not
+        // posted, or a draft its vault pass may still drop, holds the value nowhere another Mac
+        // reads, and the seal and storage release that follow the references delete the sealed
+        // tokens. So every moved entry must read back equal before any record names it; one that
+        // does not stops the roll here, the entries owed, the old generation untouched.
+        for (entry, value) in &puts {
+            if !secrets.get(entry)?.is_some_and(|held| held.same(value)) {
+                return Err(Error::new(&format!(
+                    "the secret store does not hold {entry} as it was put yet, so no reference \
+                     to it is written; roll again once this Mac's vault has posted it"
+                )));
+            }
+        }
+        drop(puts);
         // The cover goes last, alone: it says the records before it are there.
         let (cover_rows, body): (Vec<_>, Vec<_>) = rows
             .into_iter()
@@ -1015,6 +1283,7 @@ impl Registry {
         }
         drop(log);
         drop(store);
+        secrets.paid(&moved)?;
         // A build that does not compile the next generation cannot read the registry once the
         // old one is sealed (its declarations conflict there, and the next is unknown to it),
         // so the seal waits until every current Writer has declared the next generation itself
@@ -1039,6 +1308,15 @@ impl Registry {
     /// # Errors
     /// No Commons writer here, or the catalog or a table's storage cannot be read or removed.
     pub fn release(&self, now_ms: u64) -> Result<Released> {
+        self.release_with(now_ms, &super::secret::store(self.paths()))
+    }
+
+    /// [`Self::release`], judging whether this Mac may declare a generation whose secret cells
+    /// name store entries by `store`'s floor ([`endorse`]).
+    ///
+    /// # Errors
+    /// As [`Self::release`].
+    pub(crate) fn release_with(&self, now_ms: u64, store: &dyn secret::Store) -> Result<Released> {
         let deadline = crate::admission::deadline();
         let paths = crate::application_paths_until(self.paths(), deadline)?;
         let (bootstrap, journal) = Bootstrap::required_with_journal_until(&paths, deadline)
@@ -1046,13 +1324,13 @@ impl Registry {
         let session = Session::from_admitted_journal_until(&bootstrap, journal, Some(deadline))?;
         let directory = Directory::new(&paths, bootstrap.trust());
         let mut snapshot = directory.snapshot(&session)?;
-        if endorse(&session, &directory, &snapshot) {
+        if endorse(&session, &directory, &snapshot, store) {
             snapshot = directory.snapshot(&session)?;
         }
         directory.release_sealed(&session, &snapshot, now_ms / 1000, &covered)
     }
 
-    /// Each later registry generation the catalog names whose `Secret` cells do not all open
+    /// Each later registry generation the catalog names holding sealed tokens that do not open
     /// under its key (`Judged::Unopened`), which `endorse` refuses to declare: what `aterm db alab
     /// check` names. A generation this Mac cannot judge yet is not listed. Reads only; declares
     /// nothing.

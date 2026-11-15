@@ -95,6 +95,23 @@ fn retain_sdk_lease(
     }
 }
 impl Keeper {
+    /// Reuse the SAME early original executable/runtime capture. A marker is
+    /// only a required capability check, never an SDK or resource grant.
+    pub(super) fn bootstrap_archive_program(
+        &self,
+        deadline: Instant,
+    ) -> io::Result<Arc<trust_resource_provenance::program::HeldProgram>> {
+        self.validate()?;
+        self.held.validate(deadline)?;
+        self.held.require_bootstrap_archive_protocol_marker(
+            &trust_resource_controller::bootstrap_graph::archive::PROTOCOL_MARKER,
+            deadline,
+        )?;
+        self.held.validate(deadline)?;
+        self.validate()?;
+        Ok(Arc::clone(&self.held))
+    }
+
     pub(super) fn execution(&self) -> &std::path::Path {
         &self.execution
     }

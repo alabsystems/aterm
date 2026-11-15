@@ -598,9 +598,9 @@ fn broker_rotation_and_policy_updates_reclaim_slots_without_evicting_other_grant
 #[test]
 fn broker_policy_authentication_and_advanced_floor_hold_old_tokens() {
     let (f, broker, token, grant) = setup();
-    let file = f.lab.paths[0].home.join(".secrets").join(broker::ENTRY);
-    let text = std::fs::read(&file).unwrap();
-    std::fs::write(&file, b"version = 1\n").unwrap();
+    // The vault's policy changed: the grant is gone, and a token issued under it dispatches
+    // nothing, also once the grant is published again.
+    publish(&f, vec![]);
     assert!(
         broker
             .dispatch_until(
@@ -609,11 +609,11 @@ fn broker_policy_authentication_and_advanced_floor_hold_old_tokens() {
                 [74; 16],
                 &[],
                 deadline(),
-                |_, _| panic!("local policy edit")
+                |_, _| panic!("changed policy")
             )
             .is_err()
     );
-    std::fs::write(&file, text).unwrap();
+    publish(&f, vec![grant.clone()]);
     assert!(
         broker
             .dispatch_until(
@@ -638,6 +638,10 @@ fn broker_policy_authentication_and_advanced_floor_hold_old_tokens() {
         doc.set_entry(&Audience::Everyone, "unrelated", b"updated")
             .unwrap();
     });
+    // A file at the policy's old `~/.secrets` path changes nothing: the vault's policy holds.
+    let file = f.lab.paths[0].home.join(".secrets").join(broker::ENTRY);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"version = 1\n").unwrap();
     let entered = Cell::new(0);
     assert!(
         broker

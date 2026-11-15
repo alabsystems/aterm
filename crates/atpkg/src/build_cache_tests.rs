@@ -2369,7 +2369,13 @@ fn generated_placement_survives_external_dispatch_and_nested_shims() {
         }
         let output =
             aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "shim route target={} cwd={} words={words:?} settings={env:?}: {error:?}",
+                        target.display(),
+                        cwd.display()
+                    )
+                });
         assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
         String::from_utf8(output.stdout).unwrap()

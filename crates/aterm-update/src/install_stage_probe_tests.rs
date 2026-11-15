@@ -73,6 +73,19 @@ fn stage(staging: &Staging, incoming: &Path, manifest: &Manifest) -> Result<(), 
     verify_and_publish_incoming(staging, incoming, manifest, &commit, "", "")
 }
 
+/// Qualify first execution only for a fixture whose exit status the stage will judge.
+/// Clearing its body marker requires a second execution through the real stage gate.
+fn qualify_probe_fixture(app: &Path, ran: &Path, exit: i32) {
+    let mut command = aterm_uds::spawnfd::command(app.join("Contents/MacOS/aterm"));
+    command.arg("--version");
+    let qualified =
+        aterm_uds::deadline::output_within(&mut command, aterm_uds::deadline::FIRST_EXEC_HANG)
+            .expect("the fixture's first execution completes");
+    assert_eq!(qualified.status.code(), Some(exit), "{qualified:?}");
+    assert!(ran.exists(), "the fixture proved its execution");
+    std::fs::remove_file(ran).unwrap();
+}
+
 #[test]
 fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
     aterm_uds::deadline::require_trust_service();
@@ -111,6 +124,7 @@ fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
     let staging = Staging::scratch("stage-probe-pass");
     let ran = staging.root.join("ran");
     let app = incoming(&staging, &ran, 0);
+    qualify_probe_fixture(&app, &ran, 0);
     stage(&staging, &app, &manifest(BUILD, COMMIT)).expect("a passing bundle publishes");
     assert!(ran.exists(), "the stage started the candidate");
     assert!(
@@ -197,6 +211,7 @@ fn a_candidate_that_cannot_start_is_refused_before_any_marker() {
     let staging = Staging::scratch("stage-probe-fails");
     let ran = staging.root.join("ran");
     let app = incoming(&staging, &ran, 1);
+    qualify_probe_fixture(&app, &ran, 1);
     let error = stage(&staging, &app, &manifest(BUILD, COMMIT))
         .expect_err("a candidate that exits 1 cannot be staged");
     assert!(error.starts_with("staged bundle cannot start: "), "{error}");

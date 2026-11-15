@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Local release-credential materialization after an authenticated vault apply
+//! Local release-credential setup from the authenticated store
 //! (docs/DESIGN-alab-swarm-2026-10-27.md §5.2, C1). The signed `release-notary` entry can
 //! populate the `notary` keychain profile `ship release` notarizes with; an existing profile
 //! that authenticates is preserved. Notarytool runs only where all of these hold, with no
 //! child process spawned by their preflight reads:
 //!
-//! - this member holds a private release-ring profile and key that prove one signer under
-//!   the current master-signed roster. The shared signer is independent of the physical
-//!   member's hostname; an expired, revoked, mismatched or untrusted ring runs nothing;
+//! - this member's store holds a release ring (key, record and profile, read as one set from one
+//!   verified version) and a public roster pair that prove one signer under the current
+//!   master-signed roster. The shared signer is independent of the physical member's hostname;
+//!   an expired, revoked, mismatched or untrusted ring runs nothing. No ring file under the
+//!   home is read;
 //! - xcrun has a developer directory that holds `notarytool` (the Command Line Tools', or the
 //!   selected Xcode's): without one, `/usr/bin/xcrun` puts Apple's install dialog on screen;
 //! - the login keychain is unlocked ([`aterm_uds::keychain::default_unlocked`]): notarytool
@@ -61,14 +63,11 @@ const NOTARY_FAILED_FILE: &str = "release-notary-failed";
 /// minute for is the network's; a dialog nobody answered is.
 const UNANSWERED: &str = "did not complete";
 
-/// The release-credentials profile, under the home. The 0.145 copies under `~/.aterm/` are
+/// The release-credentials profile's store entry. The 0.145 entries under `~/.aterm/` are
 /// duplicates recorded for retirement (ATERM-KI-1112-980): no code reads them.
-const RELEASE_PROFILE: &str = ".aterm/release-ring/release-credentials.toml";
+const RELEASE_PROFILE: &str = crate::entry_class::RELEASE_RING[2];
 
-/// The canonical roster, considered alongside the profile's named roster.
-const VAULT_ROSTER: &str = ".aterm/release-ring/roster/aterm-machines.toml";
-
-/// The largest profile or roster read.
+/// The largest file this module reads (the signing proof, the failure record).
 const MAX_READ: usize = 64 * 1024;
 
 /// Where `xcode-select -s` keeps the developer directory a person chose.
@@ -82,7 +81,7 @@ const CLT_DEVELOPER: &str = "/Library/Developer/CommandLineTools";
 
 /// What a round says while this Mac is no release host.
 const NOT_RELEASE_HOST: &str = "release-notary waits for an authorized release ring \
-     (a private matching profile/key and current master-signed roster)";
+     (the store's matching profile/key and current master-signed roster)";
 
 /// What a round says on a Mac while xcrun has nothing to run notarytool with.
 const WAITS_FOR_CLT: &str = "release-notary waits for Command Line Tools: xcrun has no \
@@ -438,57 +437,45 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
     } else {
         None
     };
-    let home = &paths.home;
-    let Ok(Some(profile)) = fsx::read_private(&home.join(RELEASE_PROFILE), MAX_READ) else {
+    let Ok(Some(expected)) = config(paths) else {
         return false;
     };
-    let key_path = home.join(".aterm/release-ring/machine.key");
-    let Ok(Some(key)) = fsx::read_private(&key_path, MAX_READ) else {
+    // The ring's key, record and profile, one set from one verified version, in place.
+    let Ok(Some(ring)) = read_verified_set(paths, &expected, &crate::entry_class::RELEASE_RING)
+    else {
         return false;
     };
-    let Some(text) = profile.as_str() else {
+    let [key, _record, profile] = ring.as_slice() else {
         return false;
     };
-    let Ok(named) = parse_named_roster(text, home) else {
+    // A malformed profile fails closed. The roster it names is the store's public pair, read
+    // below; no roster file is read.
+    let Some(text) = profile.value().as_str() else {
         return false;
     };
-    let read_pair = |path: PathBuf| -> crate::Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let Some(roster) = fsx::read_owned(&path, MAX_READ)? else {
-            return Ok(None);
-        };
-        let mut signature = path.into_os_string();
-        signature.push(".sig");
-        let signature = fsx::read_owned(Path::new(&signature), 64)?
-            .ok_or_else(|| Error::new("release roster signature is missing"))?;
-        Ok(Some((roster, signature)))
-    };
-    let mut candidates = Vec::new();
-    for path in named.into_iter().chain([home.join(VAULT_ROSTER)]) {
-        match read_pair(path) {
-            Ok(Some(pair)) => candidates.push(pair),
-            Ok(None) => {}
-            Err(_) => return false,
-        }
+    if parse_named_roster(text, &paths.home).is_err() {
+        return false;
     }
-    let Some((index, _)) = crate::release_ring::newest_roster(
-        anchors,
-        candidates
-            .iter()
-            .enumerate()
-            .map(|(index, (raw, signature))| (index, raw.as_slice(), signature.as_slice())),
-    ) else {
+    let Ok(super::PublicRosterRead::Pair(pair)) = super::current_public_roster(paths) else {
         return false;
     };
-    let (roster, signature) = candidates.swap_remove(index);
+    if crate::release_ring::newest_roster(
+        anchors,
+        [(0, pair.roster.as_slice(), pair.signature.as_slice())].into_iter(),
+    )
+    .is_none()
+    {
+        return false;
+    }
     let floor_path = paths.dir.join("release-ring-roster-floor");
     let Ok(floor) = roster_floor(paths) else {
         return false;
     };
     let Ok(signer) = crate::release_ring::authorize_with(
-        profile.as_slice(),
-        key.as_slice(),
-        roster.to_vec(),
-        &signature,
+        profile.value().as_slice(),
+        key.value().as_slice(),
+        pair.roster.clone(),
+        &pair.signature,
         anchors,
         floor,
         now,
@@ -505,11 +492,28 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
         .is_ok()
 }
 
+/// What a failed attempt and a successful check are keyed on: the SHA-256 of the entry's value
+/// as the store verified it, hex. It is the digest older builds keyed the same record on, so a
+/// record either build wrote keeps its meaning for the other.
+fn entry_digest(entry: &super::entry::VerifiedEntry) -> String {
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(entry.value().as_slice()))
+}
+
+/// The digest of the notary entry this Mac's store holds now ([`entry_digest`]); `None` where it
+/// holds none or its view is not verified now.
+fn current_digest(paths: &Paths) -> Option<String> {
+    let expected = config(paths).ok()??;
+    read_verified_entry(paths, &expected, ENTRY)
+        .ok()?
+        .as_ref()
+        .map(entry_digest)
+}
+
 /// Handle the current signed entry, preserving an already working profile: its line and the
 /// successfully handled entry's digest. `None` when the entry cannot be read as the vault
 /// applied it just now (another apply under way): the next round looks again. The password
 /// is passed directly to the bounded tool and never copied to output, logs or errors.
-fn materialize_with(
+fn install_with(
     paths: &Paths,
     tools: &mut Tools<'_>,
 ) -> crate::Result<Option<(&'static str, String)>> {
@@ -518,7 +522,7 @@ fn materialize_with(
     let Some(entry) = read_verified_entry(paths, &expected, ENTRY)? else {
         return Ok(None);
     };
-    let digest = materialize::digest_hex(entry.value().as_slice());
+    let digest = entry_digest(&entry);
     let notary = parse_notary(entry.value().as_slice())?;
     let authenticates = (tools.history)()?;
     check_notary_current(paths, &entry, tools)?;
@@ -550,7 +554,7 @@ fn check_notary_current(
     Ok(())
 }
 
-/// Revalidate and materialize the authenticated shared notary credential, without prompting.
+/// Revalidate and install the authenticated shared notary credential, without prompting.
 /// Returns `None` when no configured vault, authorized release ring or entry is available.
 /// An existing profile that authenticates is preserved. A previous successful check never
 /// suppresses this explicitly requested repair.
@@ -578,7 +582,10 @@ fn sync_notary_with(
     paths: &Paths,
     tools: &mut Tools<'_>,
 ) -> crate::Result<Option<(&'static str, String)>> {
-    if !(tools.authorized_ring)(paths) || !load_state(paths)?.manifest.files.contains_key(ENTRY) {
+    let Some(digest) = current_digest(paths) else {
+        return Ok(None);
+    };
+    if !(tools.authorized_ring)(paths) {
         return Ok(None);
     }
     if (tools.developer_dir)().is_none() {
@@ -587,17 +594,15 @@ fn sync_notary_with(
     if !(tools.keychain_answers)() {
         return Err(Error::new(WAITS_FOR_KEYCHAIN));
     }
-    let done = materialize_with(paths, tools);
+    let done = install_with(paths, tools);
     // What the release asked for is also what the subscriber's next round reads: a failure
     // here backs its retries off, and a success ends a backoff.
-    if let (Ok(state), Some(now)) = (load_state(paths), aterm_time::unix_secs())
-        && let Some(digest) = state.manifest.files.get(ENTRY)
-    {
+    if let Some(now) = aterm_time::unix_secs() {
         match &done {
             Ok(Some(_)) => Failed::clear(paths),
             Ok(None) => {}
             Err(error) => {
-                let _ = Failed::again(Failed::read(paths), digest, now, &error.to_string())
+                let _ = Failed::again(Failed::read(paths), &digest, now, &error.to_string())
                     .write(paths);
             }
         }
@@ -766,12 +771,10 @@ impl NotaryRounds {
         wall: impl Fn() -> Option<u64>,
     ) -> Step {
         let now = clock();
-        let Ok(state) = load_state(paths) else {
+        let Some(digest) = current_digest(paths) else {
             return Step::Quiet;
         };
-        let Some(digest) = state.manifest.files.get(ENTRY) else {
-            return Step::Quiet;
-        };
+        let digest = &digest;
         let Some(wall_now) = wall() else {
             return Step::Quiet;
         };
@@ -798,7 +801,7 @@ impl NotaryRounds {
             return Step::Waits(WAITS_FOR_KEYCHAIN);
         }
         self.checked = None;
-        match materialize_with(paths, tools) {
+        match install_with(paths, tools) {
             Ok(Some((line, stored))) => {
                 self.checked = Some((stored, clock()));
                 self.unrecorded = None;

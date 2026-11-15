@@ -314,6 +314,19 @@ impl App {
         self.install_session_colors(sid);
     }
 
+    /// Commit a valid user choice, including clearing an already-default session.
+    pub(crate) fn commit_session_theme(&mut self, sid: u64, theme: Option<SessionTheme>) {
+        if let Some(trial) = self
+            .palette_tab_theme
+            .as_mut()
+            .filter(|trial| trial.session == sid)
+        {
+            trial.prior = theme.clone();
+        }
+        self.pool.commit_theme(sid, theme);
+        self.install_session_colors(sid);
+    }
+
     /// `session_theme=<selector>|- theme_origin=<word>|instance`: the session `status` fields, the selector percent-encoded, so a name with spaces stays one field.
     pub(crate) fn session_theme_fields(&self, sid: u64) -> String {
         let choice = self.session_choice(sid);

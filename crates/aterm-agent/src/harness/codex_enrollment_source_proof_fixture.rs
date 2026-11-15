@@ -20,21 +20,73 @@ use std::path::{Path, PathBuf};
 #[path = "codex_enrollment_source_proof_tests.rs"]
 mod tests;
 
-pub const SOURCE_PROOF_TASK: &str = "ATERM-ISOLATED-SOURCE-PROOF/1 ";
-const DOMAIN: &[u8] = b"aterm/isolated-source-proof-launch/key/v1\0";
+pub const SOURCE_PROOF_TASK: &str = "ATERM-ISOLATED-SOURCE-PROOF/3 ";
+const DOMAIN: &[u8] = b"aterm/isolated-source-proof-launch/key/v3\0";
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Candidate {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+struct CandidateLease {
+    image: Image,
+    file: File,
+}
+impl CandidateLease {
+    fn qualify(path: &Path) -> Result<(Candidate, Self), String> {
+        let file = File::open(path).map_err(|_| "source proof candidate unavailable")?;
+        let path = std::fs::canonicalize(path).map_err(|_| "source proof candidate unavailable")?;
+        let image = Image::at(&path).ok_or("source proof candidate unavailable")?;
+        if !codex_alab::isolated_source_proof_candidate(&path)
+            .map_err(|_| "source proof candidate unavailable")?
+            || !astream_sys::file_matches_path(&file, &path).unwrap_or(false)
+        {
+            return Err("package is not a current isolated source proof candidate".into());
+        }
+        Ok((
+            Candidate {
+                path,
+                device: image.device,
+                inode: image.inode,
+            },
+            Self { image, file },
+        ))
+    }
+    fn admit(candidate: &Candidate) -> Result<Self, String> {
+        let (observed, lease) = Self::qualify(&candidate.path)?;
+        if &observed != candidate {
+            return Err("source proof candidate changed".into());
+        }
+        Ok(lease)
+    }
+    fn current(&self, candidate: &Candidate) -> bool {
+        Image::at(&candidate.path).as_ref() == Some(&self.image)
+            && astream_sys::file_matches_path(&self.file, &candidate.path).unwrap_or(false)
+    }
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Purpose {
+    Source,
+    Retained,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Body {
     schema: u32,
+    purpose: Purpose,
     nonce: String,
     root: PathBuf,
     root_identity: DirectoryIdentity,
     home_identity: DirectoryIdentity,
     state: PathBuf,
-    candidate: PathBuf,
-    device: u64,
-    inode: u64,
+    candidate: Candidate,
+    replacement: Option<Candidate>,
     auth: PathBuf,
     binding: owner::GrantBinding,
     driver: Driver,
@@ -91,8 +143,8 @@ struct Envelope {
 /// world's ticket. It is not cloneable or constructible from wire fields.
 pub struct SourceProofLaunch {
     body: Body,
-    image: Image,
-    candidate: File,
+    candidate: CandidateLease,
+    replacement: Option<CandidateLease>,
     scope: account_work::Scope,
 }
 
@@ -162,6 +214,12 @@ impl SourceProofSettlement {
 }
 
 impl SourceProofLaunch {
+    /// Authenticated fixture purpose only; native construction and process
+    /// admission still independently check this original launch.
+    pub fn retained_frontend(&self) -> bool {
+        matches!(self.body.purpose, Purpose::Retained)
+    }
+
     pub fn advance(&self, env: &Env) -> SourceProofAdvance {
         let Ok((binding, scope)) =
             self.with_refresh_fixture(env, |binding, scope| Ok((binding.clone(), scope.clone())))
@@ -217,7 +275,8 @@ impl SourceProofLaunch {
             return Err("source proof ticket authentication failed".into());
         }
         let body = envelope.body;
-        if body.schema != 1
+        if body.schema != 3
+            || body.replacement.is_some() && !matches!(body.purpose, Purpose::Retained)
             || body.nonce.len() != 32
             || !body
                 .nonce
@@ -232,19 +291,12 @@ impl SourceProofLaunch {
         {
             return Err("source proof world changed".into());
         }
-        let image = Image::at(&body.candidate).ok_or("source proof candidate unavailable")?;
-        if image.device != body.device
-            || image.inode != body.inode
-            || !codex_alab::isolated_source_proof_candidate(&body.candidate)
-                .map_err(|_| "source proof candidate unavailable")?
-        {
-            return Err("source proof candidate changed".into());
-        }
-        let candidate =
-            File::open(&body.candidate).map_err(|_| "source proof candidate unavailable")?;
-        if !astream_sys::file_matches_path(&candidate, &body.candidate).unwrap_or(false) {
-            return Err("source proof candidate changed".into());
-        }
+        let candidate = CandidateLease::admit(&body.candidate)?;
+        let replacement = body
+            .replacement
+            .as_ref()
+            .map(CandidateLease::admit)
+            .transpose()?;
         // A nonce belongs to one actual Rust host session/launch. A lost
         // outcome never permits a second child; absence of a reply is not an
         // unstarted child. The retained private world remains diagnostic custody.
@@ -261,8 +313,8 @@ impl SourceProofLaunch {
         }
         let launch = Self {
             body,
-            image,
             candidate,
+            replacement,
             scope: scope.clone(),
         };
         launch.current()?;
@@ -274,9 +326,12 @@ impl SourceProofLaunch {
             || crate::supervise::limit::unix_now() >= self.body.expires
             || DirectoryIdentity::capture(&self.body.root)? != self.body.root_identity
             || DirectoryIdentity::capture(&self.body.root.join("home"))? != self.body.home_identity
-            || Image::at(&self.body.candidate).as_ref() != Some(&self.image)
-            || !astream_sys::file_matches_path(&self.candidate, &self.body.candidate)
-                .unwrap_or(false)
+            || !self.candidate.current(&self.body.candidate)
+            || !match (&self.replacement, &self.body.replacement) {
+                (Some(lease), Some(candidate)) => lease.current(candidate),
+                (None, None) => true,
+                _ => false,
+            }
         {
             return Err("source proof launch changed".into());
         }
@@ -284,7 +339,28 @@ impl SourceProofLaunch {
     }
 
     pub fn candidate(&self) -> &Path {
-        &self.body.candidate
+        &self.body.candidate.path
+    }
+    /// Data selecting an already authenticated replacement, never an image
+    /// admission derived from an SDK checkpoint or supplied executable name.
+    pub fn replacement_candidate(&self) -> Option<&Path> {
+        self.body
+            .replacement
+            .as_ref()
+            .map(|candidate| candidate.path.as_path())
+    }
+    /// Native observations retained by this authenticated launch. This fixture
+    /// policy admits only these actual files and grants no Source or provider use.
+    pub fn retained_images(&self) -> Result<Vec<Image>, String> {
+        self.current()?;
+        if !self.retained_frontend() {
+            return Err("retained image policy requires its authenticated purpose".into());
+        }
+        let mut images = vec![self.candidate.image.clone()];
+        if let Some(replacement) = &self.replacement {
+            images.push(replacement.image.clone());
+        }
+        Ok(images)
     }
     pub fn directory(&self) -> &Path {
         &self.body.root
@@ -424,13 +500,30 @@ impl NativeSourceProofWorld {
     /// Sign only this constructor's actual published source and exact opened
     /// qualification image. The private source paths are not wire authority.
     pub fn launch_task(&self, candidate: &Path) -> Result<String, String> {
-        let candidate_file =
-            File::open(candidate).map_err(|_| "source proof candidate unavailable")?;
-        if !codex_alab::isolated_source_proof_candidate(candidate)
-            .map_err(|_| "source proof candidate unavailable")?
-        {
-            return Err("package is not an isolated source proof candidate".into());
-        }
+        self.task(candidate, Purpose::Source, None)
+    }
+    pub fn retained_task(&self, candidate: &Path) -> Result<String, String> {
+        self.task(candidate, Purpose::Retained, None)
+    }
+    pub fn retained_upgrade_task(
+        &self,
+        candidate: &Path,
+        replacement: &Path,
+    ) -> Result<String, String> {
+        self.task(candidate, Purpose::Retained, Some(replacement))
+    }
+    fn task(
+        &self,
+        candidate: &Path,
+        purpose: Purpose,
+        replacement: Option<&Path>,
+    ) -> Result<String, String> {
+        let (candidate, candidate_lease) = CandidateLease::qualify(candidate)?;
+        let replacement = replacement.map(CandidateLease::qualify).transpose()?;
+        let (replacement, replacement_lease) = match replacement {
+            Some((candidate, lease)) => (Some(candidate), Some(lease)),
+            None => (None, None),
+        };
         let env = self.env();
         let store = env
             .accounts_store_for(accounts::Cli::Codex)
@@ -457,11 +550,9 @@ impl NativeSourceProofWorld {
             .enrollment
             .published_grant("alpha", generation)
             .ok_or("fixture native publication unavailable")?;
-        let candidate =
-            std::fs::canonicalize(candidate).map_err(|_| "source proof candidate unavailable")?;
-        let image = Image::at(&candidate).ok_or("source proof candidate unavailable")?;
         let body = Body {
-            schema: 1,
+            schema: 3,
+            purpose,
             nonce: aterm_uds::rand::hex_token::<16>().map_err(|_| "fixture nonce unavailable")?,
             root: self.directory().to_path_buf(),
             root_identity: DirectoryIdentity::capture(self.directory())?,
@@ -469,9 +560,8 @@ impl NativeSourceProofWorld {
                 env.home.as_deref().ok_or("fixture home unavailable")?,
             )?,
             state: env.state.clone(),
-            candidate: candidate.clone(),
-            device: image.device,
-            inode: image.inode,
+            candidate,
+            replacement,
             auth: Path::new(directory).join("auth.json"),
             binding,
             driver: Driver::capture(
@@ -487,9 +577,16 @@ impl NativeSourceProofWorld {
             DOMAIN,
             &aterm_json::to_vec(&body).map_err(|_| "fixture ticket encoding failed")?,
         )?;
-        let bytes = aterm_json::to_vec(&Envelope { body, mac })
-            .map_err(|_| "fixture ticket encoding failed")?;
-        if !astream_sys::file_matches_path(&candidate_file, &candidate).unwrap_or(false) {
+        let envelope = Envelope { body, mac };
+        let bytes = aterm_json::to_vec(&envelope).map_err(|_| "fixture ticket encoding failed")?;
+        if bytes.len() > 8 * 1024
+            || !candidate_lease.current(&envelope.body.candidate)
+            || !match (&replacement_lease, &envelope.body.replacement) {
+                (Some(lease), Some(candidate)) => lease.current(candidate),
+                (None, None) => true,
+                _ => false,
+            }
+        {
             return Err("source proof candidate changed during ticket creation".into());
         }
         Ok(format!(

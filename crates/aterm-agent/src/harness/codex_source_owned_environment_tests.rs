@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::ffi::OsStringExt as _;
 
 fn starter(env: Vec<(String, String)>, unset: Vec<&'static str>) -> worker::Starter {
     worker::Starter {
@@ -13,6 +13,21 @@ fn starter(env: Vec<(String, String)>, unset: Vec<&'static str>) -> worker::Star
     }
 }
 
+fn entries<'a>(
+    words: impl Iterator<Item = &'a [u8]>,
+) -> Result<BTreeMap<OsString, OsString>, Error> {
+    let settings = words
+        .map(|word| {
+            let split = word.iter().position(|b| *b == b'=').ok_or(Error::Denied)?;
+            Ok((
+                std::ffi::OsString::from_vec(word[..split].to_vec()),
+                std::ffi::OsString::from_vec(word[split + 1..].to_vec()),
+            ))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    OwnedLaunchEnvironment::from_snapshot(&Process::observe(std::process::id()).unwrap(), settings)
+        .map(|env| env.values)
+}
 #[test]
 fn malformed_and_ambiguous_environment_entries_are_refused() {
     for words in [
@@ -21,15 +36,45 @@ fn malformed_and_ambiguous_environment_entries_are_refused() {
         vec![b"A=first".as_slice(), b"A=second".as_slice()],
         vec![b"A=value\0suffix".as_slice()],
     ] {
-        assert_eq!(entries(words.into_iter()), Err(Error::Unavailable));
+        assert_eq!(entries(words.into_iter()), Err(Error::Denied));
     }
+}
+
+#[test]
+fn backend_setting_comparison_excludes_only_the_replaced_native_constructor_nonce() {
+    let process = Process::observe(std::process::id()).unwrap();
+    let mut original = OwnedLaunchEnvironment::from_snapshot(&process, Vec::new()).unwrap();
+    original.values =
+        entries([b"HOME=/source".as_slice(), b"RAW=kept\xff".as_slice()].into_iter()).unwrap();
+    let mut next = OwnedLaunchEnvironment {
+        process: original.process.clone(),
+        identity: original.identity,
+        values: original.values.clone(),
+    };
+    original
+        .values
+        .insert(LAUNCH_ENV.into(), "original-native-nonce".into());
+    next.values
+        .insert(LAUNCH_ENV.into(), "different-native-nonce".into());
+    assert!(original.same_settings(&next));
+    next.values.insert("HOME".into(), "/other".into());
+    assert!(!original.same_settings(&next));
+    next.values.insert("HOME".into(), "/source".into());
+    next.values.insert("EXTRA".into(), "value".into());
+    assert!(!original.same_settings(&next));
+    next.values.remove(std::ffi::OsStr::new("EXTRA"));
+    next.values.insert(
+        "RAW".into(),
+        std::ffi::OsString::from_vec(b"changed\xff".to_vec()),
+    );
+    assert!(!original.same_settings(&next));
 }
 
 #[test]
 fn native_settings_are_raw_data_and_every_utf8_setting_is_admitted() {
     let process = Process::observe(std::process::id()).unwrap();
-    let mut environment = OwnedLaunchEnvironment::capture(&process).unwrap();
-    // Private fixture data only; public creation always reads the actual kernel.
+    let mut environment = OwnedLaunchEnvironment::from_snapshot(&process, Vec::new()).unwrap();
+    // Explicit startup DATA, not a claim of kernel environment observation.
     environment.values = entries(
         [
             b"NAME=source".as_slice(),
@@ -93,7 +138,7 @@ fn native_settings_are_raw_data_and_every_utf8_setting_is_admitted() {
 #[test]
 fn mismatched_source_identity_is_not_a_current_environment_producer() {
     let process = Process::observe(std::process::id()).unwrap();
-    let mut environment = OwnedLaunchEnvironment::capture(&process).unwrap();
+    let mut environment = OwnedLaunchEnvironment::from_snapshot(&process, Vec::new()).unwrap();
     environment.process.birth = environment.process.birth.wrapping_add(1);
     assert_eq!(environment.current(), Err(Error::Stale));
 }

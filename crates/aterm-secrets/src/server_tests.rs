@@ -2985,6 +2985,7 @@ fn the_advert_reregisters_on_a_route_change_and_says_why() {
             end_for_sleep: Arc::new(Registered::end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: |_, _, _, _, _, _| None,
+            pull: pull_from_peers_shared,
             name_answered: Box::new(|_, _| false),
             sharing: Box::new(|| true),
         },
@@ -3075,6 +3076,7 @@ fn the_advert_and_browse_end_while_sharing_is_held_and_restart_on() {
             end_for_sleep: Arc::new(Registered::end),
             sleep_bound: SLEEP_YIELD_BOUND,
             probe: |_, _, _, _, _, _| None,
+            pull: pull_from_peers_shared,
             name_answered: Box::new(|_, _| false),
             sharing: Box::new({
                 let mut switch = crate::swarm::Switch::new(&home);
@@ -3181,6 +3183,7 @@ fn a_verified_probe_and_a_current_role_are_required_for_holder_election() {
         &[],
         &[],
         &[],
+        pull_from_peers_shared,
         |_| Some(81),
     );
     assert!(primary.is_none());
@@ -3225,6 +3228,7 @@ fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
         &here,
         &[],
         &[],
+        pull_from_peers_shared,
         |_| None,
     );
     assert!(p1.is_none());
@@ -3245,6 +3249,7 @@ fn per_tick_role_decider_restarts_or_stops_the_registration_as_role_changes() {
         &here,
         &[],
         &[],
+        pull_from_peers_shared,
         |_| None,
     );
     let (name2, _, target2) = p2.expect("advertised on tick 2");
@@ -3381,6 +3386,7 @@ fn a_holder_whose_registration_loses_the_name_lets_it_go() {
             &here,
             &[],
             &m22,
+            pull_from_peers_shared,
             |target| {
                 probed_name += usize::from(target == crate::alab_advertised());
                 Some(81)
@@ -3482,6 +3488,7 @@ fn member_seams(
         end_for_sleep: Arc::new(Registered::end),
         sleep_bound: SLEEP_YIELD_BOUND,
         probe: |_, _, _, _, _, _| None,
+        pull: pull_from_peers_shared,
         name_answered,
         sharing: Box::new(|| true),
     }
@@ -4025,6 +4032,7 @@ fn a_holder_that_slept_competes_for_the_name_by_the_probe_after_its_wake() {
             &here,
             &[],
             &[],
+            pull_from_peers_shared,
             |target| {
                 probed.set(probed.get() + usize::from(target == alab));
                 None
@@ -4257,6 +4265,7 @@ fn the_servers_listener_ends_its_registration_at_a_will_sleep_until_the_wake() {
             end_for_sleep: Arc::new(Registered::end),
             sleep_bound: HANG_DETECTOR,
             probe: |_, _, _, _, _, _| None,
+            pull: pull_from_peers_shared,
             name_answered: Box::new(|_, _| false),
             sharing: Box::new(|| true),
         },

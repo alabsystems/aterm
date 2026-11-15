@@ -8,10 +8,10 @@
 
 use super::super::policy::approval::{RULE_LIMIT_RESET, kept_for_good};
 use super::super::policy::reset::{Verdict as ResetVerdict, confirm_verdict};
-use super::super::policy::row_guard;
 use super::*;
 use crate::harness::accounts::RESET_CLAIM_S;
-use aterm_phase::{ConfirmRead, ResetPending};
+use alab_policy::guard::row_guard;
+use aterm_phase::{ConfirmRead, ResetDrawn, ResetPending};
 
 /// How many times in a row the host may answer [`ResetWord::Again`].
 pub(super) const RESET_AGAIN_MAX: u8 = 5;
@@ -840,7 +840,7 @@ impl<C: Ctl> Session<'_, C> {
 
     fn reset_yes_written(
         &mut self,
-        kind: aterm_phase::ResetKind,
+        kind: alab_policy::vocab::ResetKind,
         head: &str,
         seq: u64,
         review: &mut dyn Review,
@@ -956,7 +956,7 @@ impl<C: Ctl> Session<'_, C> {
         let tries = self
             .reset_owed()
             .map_or(1, |owed| owed.tries.saturating_add(1));
-        let pause = crate::supervise::ladder::Ladder(&self.setup.survey_retry)
+        let pause = alab_policy::ladder::Ladder(&self.setup.survey_retry)
             .step(usize::try_from(tries - 1).unwrap_or(usize::MAX));
         let mut stuck = false;
         let fx = self.fx.clone();

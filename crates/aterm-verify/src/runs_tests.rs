@@ -4,7 +4,7 @@
 //! Tests for [`super::runs`].
 
 use super::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -87,6 +87,7 @@ fn lin_linux(pid: i32, ticks: u64, pgid: u32, parent: u32) -> Lineage {
 /// A fake kernel scripted with the processes a test lays out.
 #[derive(Default)]
 struct FakeKernel {
+    clock: Cell<Option<u64>>,
     lineages: RefCell<HashMap<i32, Lineage>>,
     groups: HashMap<u32, Vec<i32>>,
     /// Groups whose listing filled its buffer.
@@ -267,7 +268,7 @@ impl Kernel for FakeKernel {
         Some(pids)
     }
     fn now_ms(&self) -> u64 {
-        42
+        self.clock.get().unwrap_or(42)
     }
     fn end(&self, token: Identity, still: &dyn Fn(&Identity) -> bool) -> Result<Ended, EndRefusal> {
         let moved = self.moves.borrow_mut().remove(&token.pid);
@@ -920,11 +921,10 @@ fn a_held_programs_environment_is_never_read() {
         !read.contains(&71) && !read.contains(&90) && !read.contains(&91),
         "a held program's environment was read: {read:?}"
     );
-    assert_eq!(
-        lines[0],
+    assert!(lines[0].starts_with(
         "the verify run of pid 41983 (/wt-a) left 2 processes: named aterm \u{d7}1, \
          targo \u{d7}1; 1 not observed running, program-check cause unconfirmed; not judged"
-    );
+    ));
     assert!(
         dir.path().join("41983-999.run").exists(),
         "kept for a later pass"
@@ -932,11 +932,10 @@ fn a_held_programs_environment_is_never_read() {
 
     k.lineages.get_mut().remove(&71);
     let (_, lines) = start_pass(dir.path(), &k);
-    assert_eq!(
-        lines[0],
+    assert!(lines[0].starts_with(
         "the verify run of pid 41983 (/wt-a) left 1 processes: named targo \u{d7}1; \
          1 not observed running, program-check cause unconfirmed; not judged"
-    );
+    ));
     assert!(
         dir.path().join("41983-999.run").exists(),
         "kept while not judged"
@@ -996,7 +995,11 @@ fn the_stage_sweep_ends_under_roots_and_names_the_rest() {
     k.groups.insert(500, vec![500, 71, 72, 73, 74, 75, 76]);
     let report = sweep_group(&k, 500, "test -p aterm-link", &roots, &Inert);
     assert_eq!(report.ended, ["aterm", "aterm"], "{report:?}");
-    assert_eq!(report.named, ["ssh-agent", "aterm", "aterm"], "{report:?}");
+    assert_eq!(
+        survivor_words(&report.named),
+        ["ssh-agent", "aterm", "aterm"],
+        "{report:?}"
+    );
     assert_eq!(k.termed(), [71, 76]);
     assert!(
         k.signals.borrow().contains(&(76, SIGKILL)),
@@ -1042,7 +1045,7 @@ fn a_group_the_sweep_cannot_prove_empty_stays_open() {
     k.refused.insert(71);
     k.groups.insert(500, vec![500, 71]);
     let report = sweep_group(&k, 500, "s", &roots, &Inert);
-    assert_eq!(report.named, ["aterm"], "{report:?}");
+    assert_eq!(survivor_words(&report.named), ["aterm"], "{report:?}");
     assert!(!report.closed());
 
     let mut k = FakeKernel::default();
@@ -1055,6 +1058,106 @@ fn a_group_the_sweep_cannot_prove_empty_stays_open() {
         (1, Vec::new()),
         "{report:?}"
     );
+}
+
+/// Refusal diagnostics keep the exact end result without changing the signal decision.
+#[test]
+fn survivor_observations_retain_each_end_refusal() {
+    for refusal in [
+        EndRefusal::Stale,
+        EndRefusal::NotProven,
+        EndRefusal::SignalFailed,
+    ] {
+        let mut k = FakeKernel::default();
+        let initial = lin(71, 300, 500, 500);
+        k.put(initial, "/wt-a/target/debug/aterm");
+        k.groups.insert(500, vec![500, 71]);
+        match refusal {
+            EndRefusal::Stale => {
+                let mut moved = initial;
+                moved.identity.idversion = Some(72);
+                k.moves.borrow_mut().insert(71, moved);
+            }
+            EndRefusal::NotProven => {
+                let mut moved = initial;
+                moved.pgid = 71;
+                k.moves.borrow_mut().insert(71, moved);
+            }
+            EndRefusal::SignalFailed => {
+                k.refused.insert(71);
+            }
+        }
+        let report = sweep_group(&k, 500, "s", &[PathBuf::from("/wt-a")], &Inert);
+        assert_eq!(report.named.len(), 1, "{refusal:?}: {report:?}");
+        assert_eq!(report.named[0].pid, 71);
+        assert_eq!(report.named[0].lineage, Some(initial));
+        assert_eq!(report.named[0].reason, SurvivorReason::EndRefused(refusal));
+        assert!(k.signals.borrow().is_empty() && !report.closed());
+    }
+}
+
+/// An unread final presence does not claim the process was observed alive after its end.
+#[test]
+fn an_unconfirmed_exit_keeps_the_end_result_and_run_record() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let path = dir.path().join("41983-1.run");
+    std::fs::write(
+        &path,
+        "run v=1 boot=B id=41983-1 uniqueid=100 start=1 sid=-\nroot path=/wt-a\n",
+    )
+    .unwrap();
+    let runs = Runs {
+        log: Mutex::new(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+        ),
+        path: path.clone(),
+        boot: "B".into(),
+        id: RunId {
+            pid: 41983,
+            birth: Birth(1),
+        },
+        uniqueid: 100,
+        roots: vec![PathBuf::from("/wt-a")],
+        built: Vec::new(),
+        swept: Mutex::new(Vec::new()),
+        made: Mutex::new(BTreeMap::new()),
+        said: Mutex::new(Vec::new()),
+        may_forget: AtomicBool::new(false),
+        poster: Box::new(Inert),
+    };
+    let mut k = FakeKernel::default();
+    k.put(lin(41983, 100, 41983, 1), "/usr/local/bin/aterm-verify");
+    let initial = lin(71, 300, 71, 1);
+    k.put(initial, "/wt-a/target/debug/aterm");
+    k.markers.insert(71, verify_run("41983-1"));
+    k.birth_unreadable.insert(71);
+    k.presence.insert(71, ProcessPresence::Unknown);
+    let report = runs.end_of_run(&k);
+    assert_eq!(k.termed(), [71]);
+    assert!(
+        !k.lineages.borrow().contains_key(&71),
+        "the injected end actually removed the process"
+    );
+    assert_eq!(report.survivors.len(), 1);
+    let survivor = &report.survivors[0].survivor;
+    assert_eq!(survivor.lineage, Some(initial));
+    assert_eq!(
+        survivor.reason,
+        SurvivorReason::ExitUnconfirmedAfterEnd(Ended {
+            termed: true,
+            killed: false,
+            gone: true
+        })
+    );
+    assert_eq!(
+        report.survivors[0].payload()["end"]["gone"].as_bool(),
+        Some(true)
+    );
+    runs.finish(&k);
+    assert!(path.exists(), "the unconfirmed departure keeps the record");
 }
 
 /// Run roots include the worktree first and every target or build directory cargo reports.
@@ -1093,7 +1196,7 @@ fn the_roots_are_where_the_build_put_its_executables() {
         ["aterm_agent-336f0d9f2ce88bd5", "aterm"],
         "what runs from the build's own directories is ended: {report:?} over {roots:?}"
     );
-    assert_eq!(report.named, ["ssh-agent"]);
+    assert_eq!(survivor_words(&report.named), ["ssh-agent"]);
     assert_eq!(k.termed(), [71, 72]);
 
     let rec = Record {
@@ -1378,6 +1481,7 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
         },
         uniqueid: 100,
         roots: vec![PathBuf::from("/wt-a")],
+        built: Vec::new(),
         swept: Mutex::new(Vec::new()),
         made: Mutex::new(BTreeMap::new()),
         said: Mutex::new(Vec::new()),
@@ -1396,29 +1500,66 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
     k.put(lin(73, 302, 73, 1), "/usr/bin/ssh-agent");
     k.markers.insert(73, ours());
     k.put(lin(600, 1, 600, 1), "/bin/zsh");
-    k.put(lin(74, 303, 74, 600), "/wt-a/target/debug/aterm");
+    k.put(lin(74, 303, 74, 600), "/wt-a/one/debug/aterm");
     k.markers.insert(74, ours());
     k.put(lin(75, 304, 75, 1), "/wt-a/target/debug/aterm");
     k.markers.insert(75, ours());
     k.held.insert(75, Some(true));
     let mut on_tty = lin(76, 305, 76, 1);
     on_tty.tty = Some(77);
-    k.put(on_tty, "/wt-a/target/debug/aterm");
+    k.put(on_tty, "/wt-a/two/debug/aterm");
     k.markers.insert(76, ours());
     k.ttys.insert(77, Some(true));
     k.put(lin(77, 50, 77, 1), "/wt-a/target/debug/aterm");
     k.markers.insert(77, ours());
+    #[cfg(unix)]
+    let native_paths: Vec<PathBuf> = {
+        use std::os::unix::ffi::OsStringExt as _;
+        [
+            b"/wt-a/native-\xff/debug/aterm".to_vec(),
+            b"/wt-a/native-\xfe/debug/aterm".to_vec(),
+        ]
+        .into_iter()
+        .map(|units| std::ffi::OsString::from_vec(units).into())
+        .collect()
+    };
+    #[cfg(windows)]
+    let native_paths: Vec<PathBuf> = {
+        use std::os::windows::ffi::OsStringExt as _;
+        [0xd800, 0xd801]
+            .into_iter()
+            .map(|unpaired| {
+                let units: Vec<u16> = "/wt-a/native-"
+                    .encode_utf16()
+                    .chain([unpaired])
+                    .chain("/debug/aterm".encode_utf16())
+                    .collect();
+                std::ffi::OsString::from_wide(&units).into()
+            })
+            .collect()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let native_paths: Vec<PathBuf> = Vec::new();
+    for (offset, executable) in native_paths.iter().enumerate() {
+        let pid = 78 + i32::try_from(offset).unwrap();
+        k.put(
+            lin(
+                pid,
+                306 + u64::try_from(offset).unwrap(),
+                u32::try_from(pid).unwrap(),
+                600,
+            ),
+            "/wt-a/aterm",
+        );
+        k.exes.insert(pid, executable.clone());
+        k.markers.insert(pid, ours());
+    }
 
-    runs.settle_group(
-        500,
-        &GroupReport {
-            stage: "test -p aterm-link".into(),
-            named: vec!["ssh-agent".into()],
-            listed: Some(true),
-            ..GroupReport::default()
-        },
-        true,
-    );
+    k.clock.set(Some(17));
+    k.groups.insert(500, vec![500, 73]);
+    let stage = sweep_group(&k, 500, "test -p aterm-link", &runs.roots, &Inert);
+    runs.settle_group(500, &stage, true);
+    k.clock.set(Some(42));
     runs.settle_group(
         501,
         &GroupReport {
@@ -1448,19 +1589,169 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
     );
     std::fs::remove_file(&unknown).expect("retire private partial record");
 
-    let lines = runs.end_of_run(&k);
+    let report = runs.end_of_run(&k);
+    let lines = &report.lines;
     assert_eq!(k.termed(), [71], "{lines:?}");
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(
         lines[0].starts_with("stage test -p aterm-link left 1"),
         "{lines:?}"
     );
-    assert_eq!(
-        lines[1],
-        "the run left 4 processes: ended aterm \u{d7}1; named aterm \u{d7}2, ssh-agent \u{d7}1; \
+    assert!(lines[1].starts_with(&format!(
+        "the run left {} processes: ended aterm \u{d7}1; named aterm \u{d7}{}, ssh-agent \u{d7}1; \
          1 not observed running, program-check cause unconfirmed; not judged",
-        "{lines:?}"
+        4 + native_paths.len(), 2 + native_paths.len(),
+    )), "{lines:?}");
+    let events_path = dir.path().join("survivors.events");
+    let human_path = dir.path().join("survivors.log");
+    let ctx = Ctx::new(
+        dir.path().to_path_buf(),
+        crate::Scope::workspace(),
+        crate::EnvSnapshot::default(),
+        dir.path().to_path_buf(),
+    )
+    .with_events(Some(
+        crate::event_log::EventLog::open(&events_path).unwrap(),
+    ));
+    let signals_before = k.signals.borrow().clone();
+    let markers_before = k.markers_read.borrow().clone();
+    let mut console = Vec::new();
+    let mut human = std::fs::File::create(&human_path).unwrap();
+    crate::write_survivor_report(&ctx, report, &mut console, &mut human).unwrap();
+    drop(human);
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    let human = std::fs::read_to_string(&human_path).unwrap();
+    let console = String::from_utf8(console).unwrap();
+    assert_eq!(
+        human
+            .lines()
+            .filter(|line| line.starts_with("verify-event: "))
+            .collect::<Vec<_>>(),
+        events.lines().collect::<Vec<_>>(),
+        "the human log and companion keep identical stamped observations",
     );
+    assert!(human.ends_with(&console));
+    assert!(!console.contains("verify-event:"));
+    assert!(console.contains("pid=74") && console.contains("pid=76"));
+    let retained: Vec<_> = events
+        .lines()
+        .map(|line| {
+            let crate::event_log::Observation::Known { kind, value } =
+                crate::event_log::observation(line.strip_prefix("verify-event: ").unwrap())
+            else {
+                panic!("the actual survivor producer emitted an unreadable event: {line}");
+            };
+            assert_eq!(kind, crate::event_log::EventKind::ProcessSurvivor);
+            assert!(
+                !kind.projects_failure(),
+                "a survivor observation changes no check verdict"
+            );
+            value
+        })
+        .collect();
+    assert_eq!(retained.len(), 5 + native_paths.len());
+    assert_eq!(*k.signals.borrow(), signals_before);
+    assert_eq!(*k.markers_read.borrow(), markers_before);
+    let stage = retained
+        .iter()
+        .find(|v| v["scope"].as_str() == Some("stage"))
+        .expect("stage observation");
+    assert_eq!(stage["observed_ms"].as_u64(), Some(17));
+    assert_eq!(stage["group"].as_u64(), Some(500));
+    assert_eq!(stage["run_id"].as_str(), Some("41983-1"));
+    assert_eq!(stage["boot_id"].as_str(), Some("B"));
+    let same_name: Vec<_> = retained
+        .iter()
+        .filter(|v| v["word"].as_str() == Some("aterm") && v["executable"].as_str().is_some())
+        .collect();
+    assert_eq!(
+        same_name
+            .iter()
+            .map(|v| v["pid"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [74, 76]
+    );
+    for row in same_name {
+        let pid = i32::try_from(row["pid"].as_i64().unwrap()).unwrap();
+        assert_eq!(row["lineage"]["birth"].as_u64(), Some(born(pid)));
+        assert_eq!(row["lineage"]["idversion"].as_i64(), Some(i64::from(pid)));
+        assert_eq!(
+            row["executable"].as_str(),
+            Some(if pid == 74 {
+                "/wt-a/one/debug/aterm"
+            } else {
+                "/wt-a/two/debug/aterm"
+            })
+        );
+        assert_eq!(row["observed_ms"].as_u64(), Some(42));
+        assert_eq!(row["reason"].as_str(), Some("custody-not-proven"));
+        assert!(!row.as_object().unwrap().contains_key("executable_native"));
+    }
+    for (offset, expected) in native_paths.iter().enumerate() {
+        let pid = 78 + i32::try_from(offset).unwrap();
+        let row = retained
+            .iter()
+            .find(|v| v["pid"].as_i64() == Some(i64::from(pid)))
+            .expect("native executable observation");
+        assert_eq!(row["lineage"]["birth"].as_u64(), Some(born(pid)));
+        assert_eq!(row["lineage"]["idversion"].as_i64(), Some(i64::from(pid)));
+        assert_eq!(row["word"].as_str(), Some("aterm"));
+        assert!(row["executable"].is_null());
+        assert_eq!(row["observed_ms"].as_u64(), Some(42));
+        assert_eq!(row["reason"].as_str(), Some("custody-not-proven"));
+        let native = &row["executable_native"];
+        let units: Vec<u64> = native["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|unit| unit.as_u64().unwrap())
+            .collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            assert_eq!(native["encoding"].as_str(), Some("unix-bytes"));
+            let units = units
+                .into_iter()
+                .map(|unit| u8::try_from(unit).unwrap())
+                .collect();
+            assert_eq!(
+                &PathBuf::from(std::ffi::OsString::from_vec(units)),
+                expected
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+            assert_eq!(native["encoding"].as_str(), Some("windows-utf16"));
+            let units: Vec<u16> = units
+                .into_iter()
+                .map(|unit| u16::try_from(unit).unwrap())
+                .collect();
+            assert_eq!(
+                &PathBuf::from(std::ffi::OsString::from_wide(&units)),
+                expected
+            );
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = (expected, units);
+    }
+    let unjudged = retained
+        .iter()
+        .find(|v| v["pid"].as_i64() == Some(75))
+        .expect("unjudged pid retained");
+    assert!(
+        unjudged["lineage"].is_null()
+            && unjudged["word"].is_null()
+            && unjudged["executable"].is_null()
+    );
+    assert_eq!(unjudged["reason"].as_str(), Some("execution-unobserved"));
+    assert!(
+        !unjudged
+            .as_object()
+            .unwrap()
+            .contains_key("executable_native")
+    );
+    assert!(!k.markers_read.borrow().contains(&75));
     let before = std::fs::read(&path).expect("own record before leftover finish");
     runs.finish(&k);
     assert_eq!(
@@ -1468,7 +1759,7 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
         before
     );
 
-    for pid in [73, 74, 75, 76] {
+    for pid in [73, 74, 75, 76, 78, 79] {
         k.lineages.borrow_mut().remove(&pid);
     }
     let _ = runs.end_of_run(&k);
@@ -1526,6 +1817,7 @@ fn only_a_group_proven_empty_is_recorded_closed() {
         },
         uniqueid: 1,
         roots: Vec::new(),
+        built: Vec::new(),
         swept: Mutex::new(Vec::new()),
         made: Mutex::new(BTreeMap::new()),
         said: Mutex::new(Vec::new()),
@@ -1536,12 +1828,23 @@ fn only_a_group_proven_empty_is_recorded_closed() {
         (500, Some(true), vec![]),
         (501, None, vec![]),
         (502, Some(false), vec![]),
-        (503, Some(true), vec!["aterm".to_owned()]),
+        (
+            503,
+            Some(true),
+            vec![Survivor {
+                pid: 71,
+                lineage: None,
+                executable: Some(PathBuf::from("/wt-a/target/debug/aterm")),
+                reason: SurvivorReason::IdentityUnreadable,
+                observed_ms: 42,
+            }],
+        ),
     ] {
         runs.settle_group(
             pgid,
             &GroupReport {
                 stage: "s".into(),
+                pgid,
                 named,
                 listed,
                 ..GroupReport::default()
@@ -1649,6 +1952,9 @@ fn a_member_the_sweep_cannot_read_keeps_its_group_open() {
         (1, Vec::new()),
         "{report:?}"
     );
+    assert_eq!(report.named[0].pid, 71);
+    assert_eq!(report.named[0].lineage, None);
+    assert_eq!(report.named[0].reason, SurvivorReason::IdentityUnreadable);
     assert!(!report.closed(), "{report:?}");
 
     k.birth_unreadable.insert(71);
@@ -1665,7 +1971,11 @@ fn a_member_the_sweep_cannot_read_keeps_its_group_open() {
         k.unreadable.remove(&71);
         k.refused.insert(71);
         let report = sweep_group(&k, 500, "s", &roots, &Inert);
-        assert_eq!(report.named, ["aterm"], "{presence:?}: {report:?}");
+        assert_eq!(
+            survivor_words(&report.named),
+            ["aterm"],
+            "{presence:?}: {report:?}"
+        );
         assert!(report.ended.is_empty() && !report.closed(), "{report:?}");
         k.unreadable.insert(71);
     }
@@ -1714,7 +2024,15 @@ fn a_survivor_still_there_after_its_sigkill_is_named() {
     k.groups.insert(500, vec![500, 71]);
     let report = sweep_group(&k, 500, "s", &roots, &Inert);
     assert!(k.signals.borrow().contains(&(71, SIGKILL)), "{report:?}");
-    assert_eq!(report.named, ["aterm"], "{report:?}");
+    assert_eq!(survivor_words(&report.named), ["aterm"], "{report:?}");
+    assert_eq!(
+        report.named[0].reason,
+        SurvivorReason::ExitUnconfirmedAfterEnd(Ended {
+            termed: true,
+            killed: true,
+            gone: false,
+        })
+    );
     assert!(report.ended.is_empty() && !report.closed(), "{report:?}");
 }
 
@@ -2201,7 +2519,7 @@ fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
     let elsewhere = aterm_tempfile::tempdir().expect("roots that hold no executable");
     let (report, pid, birth) = stage(dir.path(), vec![canonical(elsewhere.path())]);
     std::fs::write(dir.path().join("stop"), "").expect("stop");
-    assert_eq!(report.named, [word], "{report:?}");
+    assert_eq!(survivor_words(&report.named), [word], "{report:?}");
     assert!(report.ended.is_empty() && !report.closed(), "{report:?}");
     gone(pid, birth);
 }
@@ -2246,7 +2564,7 @@ fn a_partly_listed_group_the_kernel_finds_empty_once_reaped_is_closed() {
         Some(true)
     });
     assert!(
-        !named.closed() && named.named == ["ssh-agent"] && !asked.get(),
+        !named.closed() && survivor_words(&named.named) == ["ssh-agent"] && !asked.get(),
         "{named:?}"
     );
     let never = sweep_group(&FakeKernel::default(), 500, "s", &roots, &Inert).reaped(|| Some(true));
@@ -2318,7 +2636,7 @@ fn a_real_stage_that_leaves_nothing_is_recorded_closed() {
         .expect("swept")
         .extend([(own, 0, partial("led")), (u32::MAX, 0, partial("unreaped"))]);
     runs.group_reaped(own, "led");
-    let said = runs.end_of_run(&FakeKernel::default());
+    let said = runs.end_of_run(&FakeKernel::default()).lines;
     let text = std::fs::read_to_string(&runs.path).expect("the record");
     assert_eq!(
         text.lines().filter(|l| l.starts_with("closed ")).count(),
@@ -2437,7 +2755,10 @@ fn a_closed_line_lands_on_the_group_its_sweep_proved_empty() {
     );
     let said = runs.said.lock().expect("said").clone();
     assert!(
-        !said.iter().any(|l| l.starts_with("stage alone:")),
+        !said
+            .iter()
+            .filter_map(GroupReport::line)
+            .any(|l| l.starts_with("stage alone:")),
         "{said:?}"
     );
 }
@@ -2795,7 +3116,7 @@ fn a_stage_sweep_tells_each_member_it_ended() {
     let poster = Recording::default();
     let report = sweep_group(&k, 500, "test -p aterm-link", &roots, &poster);
     assert_eq!(report.ended, ["aterm"], "{report:?}");
-    assert_eq!(report.named, ["ssh-agent"], "{report:?}");
+    assert_eq!(survivor_words(&report.named), ["ssh-agent"], "{report:?}");
     assert_eq!(
         poster.told(),
         [vec![
@@ -2819,15 +3140,19 @@ fn a_run_with_no_instance_posts_nothing_and_its_verdict_stands() {
     let graph = rendezvous.path().join("graph");
     std::fs::create_dir(&graph).expect("graph");
     let sock = rendezvous.path().join("gone.sock");
-    std::fs::write(graph.join("s-dead"), format!("sock {}\n", sock.display())).expect("entry");
+    std::fs::write(
+        graph.join("tdead000000"),
+        format!("sock {}\n", sock.display()),
+    )
+    .expect("entry");
     for poster in [
         ToInstance::default(),
         ToInstance {
-            sid: Some("s-0b0d1e5".to_owned()),
+            sid: Some("t0b0d1e5000".to_owned()),
             dir: Some(rendezvous.path().to_path_buf()),
         },
         ToInstance {
-            sid: Some("s-dead".to_owned()),
+            sid: Some("tdead000000".to_owned()),
             dir: Some(rendezvous.path().to_path_buf()),
         },
     ] {
@@ -2853,7 +3178,11 @@ fn the_hosting_instance_is_told_each_line_as_an_appnotice_proc() {
     let graph = rendezvous.path().join("graph");
     std::fs::create_dir(&graph).expect("graph");
     let sock = rendezvous.path().join("fake.sock");
-    std::fs::write(graph.join("s-5e55"), format!("sock {}\n", sock.display())).expect("entry");
+    std::fs::write(
+        graph.join("t5e55000000"),
+        format!("sock {}\n", sock.display()),
+    )
+    .expect("entry");
     let token = rendezvous
         .path()
         .join(aterm_types::control_socket::token_name_for_sock(
@@ -2883,7 +3212,7 @@ fn the_hosting_instance_is_told_each_line_as_an_appnotice_proc() {
         heard
     });
     ToInstance {
-        sid: Some("s-5e55".to_owned()),
+        sid: Some("t5e55000000".to_owned()),
         dir: Some(rendezvous.path().to_path_buf()),
     }
     .post(&["verify ended aterm (pid 71)".to_owned(), "a\nb".to_owned()]);

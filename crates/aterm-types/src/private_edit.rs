@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The folder a private edit lives in: one whose document holds plaintext the person asked to
-//! see and change (a registry grid with its `Secret` column revealed, `aterm db emails --edit`),
-//! so the editor keeps no copy of it and serves no read of it (one-mesh design §4.8, §11 A7).
+//! The folder a private edit lives in: one whose document holds a table's plaintext the person
+//! asked to see and change (a registry grid, `aterm db emails --edit`), so the editor keeps no
+//! copy of it and serves no read of it (one-mesh design §4.8, §11 A7).
 //!
 //! The writer names its scratch folder with [`DIR_SUFFIX`]; amacs reads the name: a document
 //! whose path has a component ending in it gets no draft journal (and any journal an earlier

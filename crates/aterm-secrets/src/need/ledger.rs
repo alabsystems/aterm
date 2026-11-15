@@ -19,8 +19,8 @@ pub const FILE: &str = "needs.toml";
 /// The lock the ledger's readers and writers take.
 const LOCK: &str = "needs.lock";
 
-/// The most rows kept: past it, the oldest ended rows go first.
-const MAX_ROWS: usize = 64;
+/// The most rows kept: past it, the oldest ended rows go first, a withdrawal by hand last ([`save`]).
+pub(crate) const MAX_ROWS: usize = 64;
 
 /// The largest ledger read.
 const MAX_BYTES: usize = 1 << 20;
@@ -293,8 +293,10 @@ fn render(paths: &Paths, rows: &[Need]) -> crate::Result<String> {
     Ok(text)
 }
 
-/// Write every row, keeping at most [`MAX_ROWS`] (the oldest ended ones go first). A row with
-/// no request id (a random source that failed) is refused.
+/// Write every row, keeping at most [`MAX_ROWS`] (the oldest ended ones go first, and a
+/// withdrawal by hand after every other: a person's word outlasts the record of a check, and
+/// [`ask_for_tokens`] reads it). A row with no request id (a random source that failed) is
+/// refused.
 pub(crate) fn save(paths: &Paths, rows: &mut Vec<Need>) -> crate::Result<()> {
     if rows.iter().any(|need| need.id == [0; 16]) {
         return Err(Error::new(
@@ -306,7 +308,7 @@ pub(crate) fn save(paths: &Paths, rows: &mut Vec<Need>) -> crate::Result<()> {
             .iter()
             .enumerate()
             .filter(|(_, need)| need.state.ended())
-            .min_by_key(|(_, need)| need.updated)
+            .min_by_key(|(_, need)| (need.withdrawn_by_hand(), need.updated))
             .map(|(at, _)| at)
         else {
             break;
@@ -334,19 +336,37 @@ pub fn with_ledger<T>(
     paths: &Paths,
     change: impl FnOnce(&mut Vec<Need>, &Facts) -> crate::Result<T>,
 ) -> crate::Result<T> {
-    let _lock = Lock::take(paths)?;
-    let facts = super::facts(paths, now())?;
-    with_rows(paths, &facts, change)
+    with_ledger_raising(paths, &[], change)
 }
 
+/// [`with_ledger`], its facts judging `raising` too ([`super::judged_for`]): the wants `change`
+/// may add to the ledger.
+fn with_ledger_raising<T>(
+    paths: &Paths,
+    raising: &[Want],
+    change: impl FnOnce(&mut Vec<Need>, &Facts) -> crate::Result<T>,
+) -> crate::Result<T> {
+    let _lock = Lock::take(paths)?;
+    let facts = super::facts(paths, now())?;
+    with_rows(paths, facts, raising, change)
+}
+
+/// `change` on the ledger's rows under `facts`, judged for the ledger's open wants with a producer
+/// and `raising` ([`super::judged_for`]), saving what it leaves.
 fn with_rows<T>(
     paths: &Paths,
-    facts: &Facts,
+    facts: Facts,
+    raising: &[Want],
     change: impl FnOnce(&mut Vec<Need>, &Facts) -> crate::Result<T>,
 ) -> crate::Result<T> {
     let mut rows = load(paths)?;
+    let open = rows
+        .iter()
+        .filter(|need| !need.state.ended())
+        .map(|need| &need.want);
+    let facts = super::judged_for(paths, facts, open.chain(raising));
     let before = rows.clone();
-    let out = change(&mut rows, facts)?;
+    let out = change(&mut rows, &facts)?;
     if rows != before {
         save(paths, &mut rows)?;
     }
@@ -371,6 +391,62 @@ fn new_id() -> crate::Result<[u8; 16]> {
 /// The ledger or the vault state cannot be read or written, or no request id can be drawn.
 pub fn raise(paths: &Paths, want: Want, purpose: Purpose) -> crate::Result<Need> {
     raise_with(paths, want, purpose, None)
+}
+
+/// Ask the lab for the Claude Code token of each of `keys` (`claude-token:<key>`), as the
+/// harness does for each account it offers a token for that has none verified in use here
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9), under [`Purpose::HarnessSignIn`].
+/// A key is raised as [`raise`] would ([`raise_in`]) unless a need of its want, whatever its
+/// purpose, is still under way, or the latest one on file was withdrawn by hand
+/// ([`Need::withdrawn_by_hand`]: it stands until a person raises the want again) or ended for a
+/// reason no change of this Mac's facts lifts ([`Reason::may_change`]). So a request a token
+/// answered (retired `not-needed` on its arrival) is raised again once the harness offers for
+/// that account again, that token having left use here. The keys left are decided under one
+/// lock and one reading of this Mac's facts; one whose retirement [`raise`] leaves standing
+/// (`not-authorized` at the policy in force) changes and writes nothing. Where no key is left
+/// it is one read of the ledger. Returns the needs raised under a new request id.
+///
+/// # Errors
+/// As [`peek`] and [`raise`].
+pub fn ask_for_tokens(
+    paths: &Paths,
+    keys: &[crate::claude_token::Key],
+) -> crate::Result<Vec<Need>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let filed = peek(paths)?;
+    let due: Vec<Want> = keys
+        .iter()
+        .map(|key| Want::ClaudeToken(key.clone()))
+        .filter(|want| {
+            let on_file: Vec<&Need> = filed.iter().filter(|need| need.want == *want).collect();
+            !on_file.iter().any(|need| !need.state.ended())
+                && on_file
+                    .iter()
+                    .max_by_key(|need| need.updated)
+                    .is_none_or(|latest| {
+                        !latest.withdrawn_by_hand()
+                            && latest
+                                .retired
+                                .as_ref()
+                                .is_none_or(|retired| retired.reason.may_change())
+                    })
+        })
+        .collect();
+    if due.is_empty() {
+        return Ok(Vec::new());
+    }
+    with_ledger_raising(paths, &due, |rows, facts| {
+        let mut raised = Vec::new();
+        for want in &due {
+            let need = raise_in(rows, facts, want.clone(), Purpose::HarnessSignIn, None)?;
+            if filed.iter().all(|was| was.id != need.id) {
+                raised.push(need);
+            }
+        }
+        Ok(raised)
+    })
 }
 
 /// File each vault entry of `exposures`, `(name, sections)`, for a new value under one lock: a
@@ -543,7 +619,7 @@ fn with_snapshot_ledger<T>(
     }
     snapshot.at_current_version(paths, entries, || {
         let facts = super::facts_with_commons(paths, now(), || commons)?;
-        with_rows(paths, &facts, |rows, facts| {
+        with_rows(paths, facts, &[], |rows, facts| {
             current()?;
             if require_signed
                 && facts
@@ -568,7 +644,8 @@ fn raise_with(
     purpose: Purpose,
     refused: Option<RefusalClaim>,
 ) -> crate::Result<Need> {
-    with_ledger(paths, |rows, facts| {
+    let raising = want.clone();
+    with_ledger_raising(paths, std::slice::from_ref(&raising), |rows, facts| {
         raise_in(rows, facts, want, purpose, refused)
     })
 }

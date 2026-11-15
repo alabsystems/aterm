@@ -33,6 +33,12 @@ aterm-uds = { workspace = true }
 # Debug/test PTY fixture admission shares the same quiet temporary root as the runners.
 aterm-tempfile = { workspace = true }
 
+# `quiet_errors`: every `CreateProcessW` of the Windows backend runs with the starting thread's
+# system error boxes off (`windows::ffi::CreateProcessW`), so a file that is no program is an
+# error, not a box that holds the start. Workspace crate; kernel32 FFI on Windows.
+[target.'cfg(windows)'.dependencies]
+aterm-sysprobe = { workspace = true }
+
 # Tests mint a root `Authority`; `launcher-mint` makes it nameable in this crate's test
 # build only. The production seam receives its `Cap`s by argument.
 [dev-dependencies]
@@ -42,6 +48,11 @@ aterm-cap = { workspace = true, features = ["launcher-mint"] }
 aterm-spec = { workspace = true }
 # The Windows tests' stand-in binaries, named when they run (`aterm_tempfile::bin_exe`).
 aterm-tempfile = { workspace = true }
+
+# The non-image start's re-exec (`tests/windows_smoke.rs`) is built by the spawn seam and waited
+# for within the hang detector (`deadline::output_within`). aterm-spec already depends on it.
+[target.'cfg(windows)'.dev-dependencies]
+aterm-uds = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 # `spawn_locale_model` conformance check (`unix_tests::spawn_locale_conformance_child_always_utf8_ctype`).

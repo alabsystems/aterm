@@ -49,7 +49,7 @@ impl RepositoryCredentialWithdrawal {
         if user.uid == 0 || sys.euid() != user.uid {
             return Ok(None);
         }
-        let choice = asked(profile(sys, user)?.and_then(|p| p.github), user)?;
+        let choice = asked(profile(sys, user)?.and_then(|p| p.github))?;
         if !matches!(choice, Asked::Default | Asked::Off) {
             return Ok(None);
         }
@@ -140,7 +140,7 @@ impl RepositoryCredentialWithdrawal {
         if let Some(empty) = &self.empty {
             empty.ensure_current(sys)
         } else if matches!(
-            asked(profile(sys, &self.user)?.and_then(|p| p.github), &self.user)?,
+            asked(profile(sys, &self.user)?.and_then(|p| p.github))?,
             Asked::Off
         ) {
             Ok(())
@@ -228,7 +228,7 @@ impl RepositorySelection {
         }
         let profile = profile(sys, user).map_err(Block::of(Wait::Settings))?;
         if !matches!(
-            asked(profile.and_then(|p| p.github), user).map_err(Block::of(Wait::Settings))?,
+            asked(profile.and_then(|p| p.github)).map_err(Block::of(Wait::Settings))?,
             Asked::Default
         ) {
             return Ok(None);
@@ -283,14 +283,8 @@ impl RepositorySelection {
         config: &client::Config,
     ) -> Result<client::MaterializationSnapshot, String> {
         client::with_materialization_ready_for_entries(paths, config, &VAULT_INPUT_ENTRIES, || {
-            let source = super::Github {
-                account: String::new(),
-                owner: String::new(),
-                token_file: super::token_file(Path::new(&user.home)),
-                token_key: None,
-            };
-            let now = super::read_token(sys, user, &source)
-                .map_err(|why| aterm_secrets::Error::new(why.why))?;
+            let now =
+                super::read_token(sys, user).map_err(|why| aterm_secrets::Error::new(why.why))?;
             if now.bytes() != token.bytes() {
                 return Err(aterm_secrets::Error::new(
                     "the consumer's credential changed",
@@ -338,7 +332,7 @@ impl RepositorySelection {
             || sys.euid() != self.user.uid
             || sys.identity()?.user != self.user
             || !matches!(
-                asked(profile(sys, &self.user)?.and_then(|p| p.github), &self.user)?,
+                asked(profile(sys, &self.user)?.and_then(|p| p.github))?,
                 Asked::Default
             )
         {

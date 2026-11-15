@@ -261,18 +261,17 @@ fn pending_kimi_env(tag: &str) -> (Tmp, Env) {
     let tmp = tmp_dir(tag);
     let env = env_at(&tmp);
     let home = env.home.as_ref().unwrap();
-    std::fs::create_dir_all(home.join(".secrets")).unwrap();
     aterm_uds::atomic_file::write(
         env.config.as_ref().unwrap(),
         ("[fleet]\nmachine = \"m16\"\n").as_ref(),
         0o600,
     )
     .unwrap();
-    std::fs::write(
-        home.join(".secrets/ai-accounts.csv"),
+    crate::vault_entry::put(
+        home,
+        "ai-accounts.csv",
         "email,computer,kimi\npending@example.test,m16,1\n",
-    )
-    .unwrap();
+    );
     (tmp, env)
 }
 
@@ -308,11 +307,11 @@ fn pending_import_requires_the_preferred_machine() {
     let (_tmp, env) = pending_kimi_env("import-preferred");
     let mut out = Vec::new();
     let mut err = Vec::new();
-    std::fs::write(
-        env.home.as_ref().unwrap().join(".secrets/ai-accounts.csv"),
+    crate::vault_entry::put(
+        env.home.as_ref().unwrap(),
+        "ai-accounts.csv",
         "email,computer,kimi\npending@example.test,m22,1\n",
-    )
-    .unwrap();
+    );
     let code = run_accounts_import(
         Cli::Kimi,
         &env,
@@ -350,11 +349,11 @@ fn pending_import_does_not_guess_a_missing_region() {
 #[test]
 fn pending_import_refuses_a_real_region_conflict() {
     let (_tmp, env) = pending_kimi_env("import-region-conflict");
-    std::fs::write(
-        env.home.as_ref().unwrap().join(".secrets/ai-accounts.csv"),
+    crate::vault_entry::put(
+        env.home.as_ref().unwrap(),
+        "ai-accounts.csv",
         "email,computer,kimi\npending@example.test,m16,global\n",
-    )
-    .unwrap();
+    );
     let mut out = Vec::new();
     let mut err = Vec::new();
     let code = run_accounts_import(
@@ -402,11 +401,11 @@ fn kimi_adopts_its_existing_default_login_without_inventing_an_email() {
 fn the_account_table_separates_assignment_readiness_and_local_logins() {
     let (_tmp, env) = pending_kimi_env("table-readiness");
     let home = env.home.as_ref().unwrap();
-    std::fs::write(
-        home.join(".secrets/ai-accounts.csv"),
+    crate::vault_entry::put(
+        home,
+        "ai-accounts.csv",
         "email,computer,kimi,grok\nfirst@example.test,m16,global,\nsecond@example.test,m22,1,\n",
-    )
-    .unwrap();
+    );
     let login = home.join("local-login");
     login_made_in(&login);
     std::fs::create_dir_all(login.join("credentials")).unwrap();
@@ -504,9 +503,9 @@ fn the_grammar_parses_what_the_help_text_advertises() {
             },
         ),
         (
-            "limits @s-abc --json",
+            "limits @t0000000abc --json",
             Cmd::Limits {
-                sid: Some("@s-abc".to_string()),
+                sid: Some("@t0000000abc".to_string()),
                 json: true,
             },
         ),
@@ -537,9 +536,9 @@ fn the_grammar_parses_what_the_help_text_advertises() {
             },
         ),
         (
-            "ledger @s-abc 5 --json",
+            "ledger @t0000000abc 5 --json",
             Cmd::Ledger {
-                file: LedgerFile::Approvals(Some("@s-abc".to_string())),
+                file: LedgerFile::Approvals(Some("@t0000000abc".to_string())),
                 count: 5,
                 json: true,
             },
@@ -561,9 +560,9 @@ fn the_grammar_parses_what_the_help_text_advertises() {
             },
         ),
         (
-            "upgrade s-abc --dry-run --json",
+            "upgrade t0000000abc --dry-run --json",
             Cmd::Upgrade {
-                sid: "s-abc".to_string(),
+                sid: "t0000000abc".to_string(),
                 dry_run: true,
                 json: true,
             },
@@ -658,40 +657,40 @@ fn the_grammar_parses_what_the_help_text_advertises() {
             },
         ),
         (
-            "upgrade s-abc --status --json",
+            "upgrade t0000000abc --status --json",
             Cmd::UpgradeOwner {
-                sid: "s-abc".to_string(),
+                sid: "t0000000abc".to_string(),
                 ask: OwnerAsk::Status,
                 json: true,
             },
         ),
         (
-            "upgrade s-abc --now",
+            "upgrade t0000000abc --now",
             Cmd::UpgradeOwner {
-                sid: "s-abc".to_string(),
+                sid: "t0000000abc".to_string(),
                 ask: OwnerAsk::Now,
                 json: false,
             },
         ),
         (
-            "upgrade s-abc --defer 6h",
+            "upgrade t0000000abc --defer 6h",
             Cmd::UpgradeOwner {
-                sid: "s-abc".to_string(),
+                sid: "t0000000abc".to_string(),
                 ask: OwnerAsk::Defer(6 * 3_600),
                 json: false,
             },
         ),
         (
-            "upgrade --skip s-abc",
+            "upgrade --skip t0000000abc",
             Cmd::UpgradeOwner {
-                sid: "s-abc".to_string(),
+                sid: "t0000000abc".to_string(),
                 ask: OwnerAsk::Skip,
                 json: false,
             },
         ),
         ("--help", Cmd::Help(HelpPage::Verbs)),
         ("disk --help", Cmd::Help(HelpPage::Disk)),
-        ("upgrade s-1 --help", Cmd::Help(HelpPage::Upgrade)),
+        ("upgrade t0000000001 --help", Cmd::Help(HelpPage::Upgrade)),
         ("upgrade --status -h", Cmd::Help(HelpPage::UpgradeStatus)),
         ("versions", Cmd::Versions { json: false }),
         ("version --json", Cmd::Versions { json: true }),
@@ -765,7 +764,7 @@ fn the_grammar_refuses_what_it_does_not_know() {
     for line in [
         "frobnicate",
         "usage extra",
-        "limits s-abc",
+        "limits t0000000abc",
         "limits @a @b",
         "ledger rm",
         "ledger recovery",
@@ -813,20 +812,20 @@ fn the_grammar_refuses_what_it_does_not_know() {
         "accounts use --auto --sock /a.sock",
         "upgrade --now",
         "upgrade --defer 1h",
-        "upgrade s-abc --now --skip",
-        "upgrade s-abc --status --now",
-        "upgrade s-abc --now --dry-run",
+        "upgrade t0000000abc --now --skip",
+        "upgrade t0000000abc --status --now",
+        "upgrade t0000000abc --now --dry-run",
         "upgrade --status --pool",
-        "upgrade s-abc --skip --auto",
-        "upgrade s-abc --now --email owner@example.com",
-        "upgrade s-abc --defer 1h --browser Work",
-        "upgrade s-abc --skip --due",
-        "upgrade s-abc --now --here",
+        "upgrade t0000000abc --skip --auto",
+        "upgrade t0000000abc --now --email owner@example.com",
+        "upgrade t0000000abc --defer 1h --browser Work",
+        "upgrade t0000000abc --skip --due",
+        "upgrade t0000000abc --now --here",
         "upgrade --status --on other-host",
-        "upgrade s-abc --skip --every 30",
-        "upgrade s-abc --defer",
-        "upgrade s-abc --defer 31d",
-        "upgrade s-abc s-def --now",
+        "upgrade t0000000abc --skip --every 30",
+        "upgrade t0000000abc --defer",
+        "upgrade t0000000abc --defer 31d",
+        "upgrade t0000000abc s-def --now",
         "usage --now",
         "ledger --status",
     ] {
@@ -840,7 +839,7 @@ fn the_grammar_refuses_what_it_does_not_know() {
         assert_eq!(format!("{:?}", main_entry(argv)), exit(2), "{line}");
     }
     assert!(matches!(
-        parse(&words("upgrade s-abc --dry-run"))
+        parse(&words("upgrade t0000000abc --dry-run"))
             .expect("the sweep")
             .0,
         Cmd::Upgrade { dry_run: true, .. }
@@ -2145,7 +2144,7 @@ fn the_memory_banner_is_its_own_wall_and_no_limit() {
         &|z, _| zone_none(z),
     );
     let wall = v.wall.as_ref().expect("the banner is read");
-    assert_eq!(wall.kind, aterm_phase::WallKind::Memory);
+    assert_eq!(wall.kind, alab_policy::vocab::WallKind::Memory);
     assert!(!wall.kind.reads_limited(), "a restart ends it, not a reset");
     assert_eq!(v.resets_at, None);
     assert!(v.windows.is_empty(), "{v:?}");
@@ -3474,6 +3473,140 @@ fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
         rows[2]
     );
     assert!(rows[2].contains("debug/incremental"), "{}", rows[2]);
+}
+
+/// WHO HOLDS THE DISK, in the row the tick writes below its floor: the largest folders of the
+/// home it was handed, largest first, each with its kind, bytes and the age of its measure,
+/// beside the free figure. NEGATIVE CONTROL: the same tick below the warning and above the
+/// floor writes its row with no holders, and measures nothing.
+#[cfg(unix)]
+#[test]
+fn the_disk_ticks_report_names_the_largest_holders_below_the_floor() {
+    let tmp = tmp_dir("disk-holders");
+    let state = tmp.path().join("state");
+    let home = tmp.path().join("home");
+    for (rel, bytes) in [
+        (".cache/alab-release-scope/big/clone/target/a.o", 600_000),
+        (".ubd/root-a/build/b.o", 200_000),
+        ("proj/src/lib.rs", 50_000),
+    ] {
+        let path = home.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&path, vec![b'x'; bytes]).expect("write");
+    }
+    let roots = disk::discover::Roots {
+        home: Some(home.clone()),
+        ..disk::discover::Roots::default()
+    };
+    let now = i64::try_from(aterm_time::unix_secs().expect("a clock")).expect("fits");
+    let gib = 1024 * 1024 * 1024;
+    let cfg = disk::Config::default();
+    let look = |free: u64| DiskLook {
+        state: &state,
+        volume: tmp.path(),
+        free: Some(free),
+        targets: &[],
+        discover: Some(&roots),
+        transcripts: None,
+        now,
+        room: None,
+        table: None,
+        demand: None,
+        projected: None,
+        session_cwds: &[],
+        session_cwd_unknown: None,
+        link_dirs: &[],
+    };
+    let ledger = atpkg::build_cache::holders::ledger(&home);
+    let above = (cfg.auto_free_gib + 1) * gib;
+    assert!(cfg.below_warn(Some(above)) && !cfg.below_auto_floor(Some(above)));
+    let _ = disk_tick(
+        &look(above),
+        cfg,
+        &mut |row| panic!("removed {}", row.path.display()),
+        &mut || Some(above),
+    );
+    let rows = std::fs::read_to_string(state.join(DISK_LEDGER)).expect("the ledger");
+    let row = rows.lines().next().expect("a report row");
+    assert!(row.contains("\"kind\":\"report\""), "{row}");
+    assert!(!row.contains("holders"), "above the floor: {row}");
+    assert!(!ledger.exists(), "nothing was measured above the floor");
+
+    let _ = disk_tick(
+        &look(gib),
+        cfg,
+        &mut |row| panic!("removed {}", row.path.display()),
+        &mut || Some(gib),
+    );
+    let rows = std::fs::read_to_string(state.join(DISK_LEDGER)).expect("the ledger");
+    let row = rows
+        .lines()
+        .filter(|row| row.contains("\"kind\":\"report\""))
+        .nth(1)
+        .expect("the second tick's report row");
+    let value: aterm_json::Value = aterm_json::from_str(row).expect("a JSON row");
+    assert_eq!(
+        value.get("free_bytes").and_then(aterm_json::Value::as_i64),
+        i64::try_from(gib).ok()
+    );
+    let holders = match value.get("holders") {
+        Some(aterm_json::Value::Array(holders)) => holders.clone(),
+        other => panic!("no holders in {row}: {other:?}"),
+    };
+    let named: Vec<(String, String, i64)> = holders
+        .iter()
+        .map(|h| {
+            (
+                h.get("path")
+                    .and_then(aterm_json::Value::as_str)
+                    .expect("a path")
+                    .strip_prefix(&format!("{}/", home.display()))
+                    .expect("under the home")
+                    .to_owned(),
+                h.get("kind")
+                    .and_then(aterm_json::Value::as_str)
+                    .expect("a kind")
+                    .to_owned(),
+                h.get("bytes")
+                    .and_then(aterm_json::Value::as_i64)
+                    .expect("bytes"),
+            )
+        })
+        .collect();
+    let places: Vec<(&str, &str)> = named
+        .iter()
+        .map(|(path, kind, _)| (path.as_str(), kind.as_str()))
+        .collect();
+    assert_eq!(
+        places,
+        [
+            (".cache/alab-release-scope/big", "campaign scope"),
+            (".ubd/root-a", "worktree root"),
+            ("proj", "folder in $HOME"),
+        ],
+        "{row}"
+    );
+    assert!(named[0].2 >= 600_000 && named[1].2 >= 200_000, "{named:?}");
+    for h in &holders {
+        assert_eq!(h.get("complete"), Some(&aterm_json::Value::Bool(true)));
+        assert_eq!(
+            h.get("measured_s_ago").and_then(aterm_json::Value::as_i64),
+            Some(0)
+        );
+    }
+    assert_eq!(
+        value
+            .get("holders_unmeasured")
+            .and_then(aterm_json::Value::as_i64),
+        Some(0)
+    );
+    assert!(
+        value
+            .get("holders_bytes")
+            .and_then(aterm_json::Value::as_i64)
+            .is_some_and(|sum| sum >= 850_000),
+        "{row}"
+    );
 }
 
 /// Set the mtime of the directory at `path` to `at` (unix seconds).
@@ -7294,7 +7427,7 @@ fn reported_state(env: &Env) {
     assert!(accounts::note_offer(
         &mut state,
         "main",
-        Some(aterm_phase::ResetKind::Weekly),
+        Some(alab_policy::vocab::ResetKind::Weekly),
         1,
         Some(now + 3 * 86_400),
         now - 3600,
@@ -9809,7 +9942,7 @@ fn the_accounts_report_shows_the_record_of_usage() {
 fn usage_shows_the_tap_reading_of_its_own_process() {
     let tmp = tmp_dir("usage-tap");
     let mut env = env_at(&tmp);
-    env.sid = "s-1a2b".to_owned();
+    env.sid = "t0000001a2b".to_owned();
     env.claude_pid = Some(FakeClaude::PID);
     let dir = env
         .transcripts_root()
@@ -9854,13 +9987,13 @@ fn usage_shows_the_tap_reading_of_its_own_process() {
         String::from_utf8(out).expect("utf-8")
     };
     let process = FakeClaude::with(&[("HOME", "/home/someone")]);
-    tap_into("s-9999");
+    tap_into("t0000009999");
     let hud = run(&env, &process, false);
     assert!(
         hud.contains("\u{2013}/5h · \u{2013}/7d"),
         "another tab's file: {hud}"
     );
-    tap_into("s-1a2b");
+    tap_into("t0000001a2b");
     let hud = run(&env, &process, false);
     assert!(
         hud.starts_with("opus 42%/5h · 61%/7d · acct account · resets in "),
@@ -9905,7 +10038,7 @@ fn usage_shows_the_tap_reading_of_its_own_process() {
 fn usage_says_why_claude_code_reports_no_five_hour_window() {
     let tmp = tmp_dir("usage-week-only");
     let mut env = env_at(&tmp);
-    env.sid = "s-1a2b".to_owned();
+    env.sid = "t0000001a2b".to_owned();
     env.claude_pid = Some(FakeClaude::PID);
     let dir = env
         .transcripts_root()
@@ -10037,7 +10170,7 @@ fn usage_takes_the_usage_cache_only_as_the_default_logins_own_account() {
         0o600,
     )
     .expect("config");
-    env.sid = "s-1a2b".to_owned();
+    env.sid = "t0000001a2b".to_owned();
     env.claude_pid = Some(FakeClaude::PID);
     let rl = super::super::tap::rl_dir_in(
         &env.aterm_state
@@ -12028,8 +12161,8 @@ mod shared_renewal_tests;
 
 /// THE RESERVE BREAKS THE FULL-DISK DEADLOCK: at an emergency it is unlinked
 /// FIRST and the `released` row journalled after it (the room it made is
-/// what that row is written into); well above the target it is written and
-/// journalled; between, nothing is written.
+/// what that row is written into); after a partial recovery it is written and
+/// journalled with hysteresis above the emergency line.
 #[cfg(any(unix, windows))]
 #[test]
 fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_back() {
@@ -12037,6 +12170,23 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
     let state = tmp.path().join("state");
     let reserve = disk::reserve::path_for(&tmp.path().join("home"));
     let t = disk::Config::default().thresholds(Some(460 << 30));
+    let off = disk::Config {
+        auto_free_gib: 0,
+        ..disk::Config::default()
+    }
+    .thresholds(Some(460 << 30));
+    assert_eq!(
+        disk_reserve_look(
+            &state,
+            &reserve,
+            disk::Level::Short,
+            Some(t.target),
+            &off,
+            1
+        ),
+        ReserveMove::Kept,
+        "an explicit automatic opt-out does not allocate a reserve"
+    );
     let rows = || -> Vec<String> {
         std::fs::read_to_string(state.join(DISK_LEDGER))
             .unwrap_or_default()
@@ -12047,13 +12197,15 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
             })
             .collect()
     };
-    let between = Some(t.target);
+    let between = Some(t.emergency + disk::reserve::RESERVE_BYTES);
     assert_eq!(
         disk_reserve_look(&state, &reserve, t.level(between, None), between, &t, 1),
         ReserveMove::Kept
     );
     assert!(!reserve.exists());
-    let plenty = Some(t.target + disk::reserve::RESERVE_BYTES);
+    let plenty_free = t.emergency + 2 * disk::reserve::RESERVE_BYTES;
+    assert!(plenty_free < t.floor, "partial recovery is sufficient");
+    let plenty = Some(plenty_free);
     assert_eq!(
         disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, 2),
         ReserveMove::Written
@@ -12075,6 +12227,22 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
     assert!(!reserve.exists());
     assert_eq!(rows(), ["written", "released"]);
 
+    assert_eq!(
+        disk_reserve_look(&state, &reserve, t.level(between, None), between, &t, 5),
+        ReserveMove::Kept,
+        "releasing the reserve alone cannot immediately rearm it"
+    );
+    assert_eq!(
+        disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, 6),
+        ReserveMove::Written,
+        "partial recovery rearms the journal's reserve below the build-room floor"
+    );
+    assert_eq!(
+        disk_reserve_look(&state, &reserve, t.level(full, None), full, &t, 7),
+        ReserveMove::Released(disk::reserve::RESERVE_BYTES)
+    );
+    assert_eq!(rows(), ["written", "released", "written", "released"]);
+
     let victim = tmp.path().join("victim");
     #[cfg(unix)]
     let kept = {
@@ -12090,11 +12258,14 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
         victim.join("keep")
     };
     assert!(matches!(
-        disk_reserve_look(&state, &reserve, disk::Level::Emergency, full, &t, 5),
+        disk_reserve_look(&state, &reserve, disk::Level::Emergency, full, &t, 8),
         ReserveMove::Refused(_)
     ));
     assert_eq!(std::fs::read(&kept).expect("victim"), b"keep");
-    assert_eq!(rows(), ["written", "released", "refused"]);
+    assert_eq!(
+        rows(),
+        ["written", "released", "written", "released", "refused"]
+    );
 }
 
 /// A COMPRESSED RESERVE FOLDER IS REFUSED, AND JOURNALLED ONCE (Windows): a
@@ -13510,15 +13681,15 @@ fn versions_prints_incremental_numeric_version_for_every_cli_harness() {
 /// (the controls): a window host's claim, a foreign contract 3 holder, an unclaimed tab and a
 /// non-session line.
 const VERSIONS_ROSTER: &str = "\
-1 s-aaa - live t meta=0 supervisor=grok-alab@4242 supervisor_proven=1 \
+1 t0000000aaa - live t meta=0 supervisor=grok-alab@4242 supervisor_proven=1 \
 supervisor_version=0.3.0+gabc supervisor_vendor=1.0.70 autopilot=-
-2 s-bbb - live t meta=0 supervisor=codex-alab%405150 supervisor_proven=1 \
+2 t0000000bbb - live t meta=0 supervisor=codex-alab%405150 supervisor_proven=1 \
 supervisor_version=- supervisor_vendor=- autopilot=-
-3 s-ccc - live t meta=0 supervisor=grok-alab@4343 supervisor_proven=0 \
+3 t0000000ccc - live t meta=0 supervisor=grok-alab@4343 supervisor_proven=0 \
 supervisor_version=0.3.1%0aevil supervisor_vendor=1.0.70%1b[31m autopilot=-
-4 s-ddd - live t meta=0 supervisor=aterm-harness@1234 supervisor_proven=0 autopilot=cruise
-5 s-eee - live t meta=0 supervisor=kimi-alab@77 supervisor_proven=0 autopilot=-
-6 s-fff - live t meta=0 supervisor=- supervisor_proven=0 autopilot=-
+4 t0000000ddd - live t meta=0 supervisor=aterm-harness@1234 supervisor_proven=0 autopilot=cruise
+5 t0000000eee - live t meta=0 supervisor=kimi-alab@77 supervisor_proven=0 autopilot=-
+6 t0000000fff - live t meta=0 supervisor=- supervisor_proven=0 autopilot=-
 7 s-ggg - live t meta=0 supervisor=codex-alab@ supervisor_proven=1 autopilot=-
 8 s-hhh - live t meta=0 supervisor=codex-alab@1 supervisor_proven=1 autopilot=-
 9 s-iii - live t meta=0 supervisor=codex-alab@05150 supervisor_proven=1 autopilot=-
@@ -13548,15 +13719,15 @@ fn versions_reads_the_harness_claims_off_the_roster() {
         shown,
         [
             (
-                "s-aaa",
+                "t0000000aaa",
                 "grok-alab@4242",
                 true,
                 Some("0.3.0+gabc"),
                 Some("1.0.70")
             ),
-            ("s-bbb", "codex-alab@5150", true, None, None),
-            ("s-ccc", "grok-alab@4343", false, None, None),
-            ("s-eee", "kimi-alab@77", false, None, None),
+            ("t0000000bbb", "codex-alab@5150", true, None, None),
+            ("t0000000ccc", "grok-alab@4343", false, None, None),
+            ("t0000000eee", "kimi-alab@77", false, None, None),
         ]
     );
     assert!(live_claims_of("").is_empty());
@@ -13617,14 +13788,14 @@ fn versions_lists_installed_packages_and_live_claims() {
     for line in [
         "installed harness packages\n  grok-alab         0.3.0  build 17\n  \
          muse-alab         version unrecorded  build 4\nlive claims\n",
-        "  @s-aaa grok-alab 0.3.0+gabc (grok 1.0.70)\n",
-        "  @s-bbb codex-alab unknown (self-claim)\n",
-        "  @s-ccc grok-alab unknown (grok unknown)  unproven\n",
-        "  @s-eee kimi-alab unknown (kimi unknown)  unproven\n",
+        "  @t0000000aaa grok-alab 0.3.0+gabc (grok 1.0.70)\n",
+        "  @t0000000bbb codex-alab unknown (self-claim)\n",
+        "  @t0000000ccc grok-alab unknown (grok unknown)  unproven\n",
+        "  @t0000000eee kimi-alab unknown (kimi unknown)  unproven\n",
     ] {
         assert!(text.contains(line), "{line:?} in:\n{text}");
     }
-    for skipped in ["s-ddd", "s-fff", "@9"] {
+    for skipped in ["t0000000ddd", "t0000000fff", "@9"] {
         assert!(!text.contains(skipped), "{skipped} in:\n{text}");
     }
     let (ok, json, err) = go(&Cmd::Versions { json: true }, &env);
@@ -13632,8 +13803,8 @@ fn versions_lists_installed_packages_and_live_claims() {
     for item in [
         r#"{"kind":"package","harness":"grok-alab","program":"grok-alab","build":17,"version":"0.3.0","link":null}"#,
         r#"{"kind":"package","harness":"muse-alab","program":"muse-alab","build":4,"version":null,"link":null}"#,
-        r#"{"kind":"claim","session":"s-aaa","holder":"grok-alab@4242","harness":"grok-alab","proven":true,"version":"0.3.0+gabc","agent":"grok","vendor":"1.0.70"}"#,
-        r#"{"kind":"claim","session":"s-ccc","holder":"grok-alab@4343","harness":"grok-alab","proven":false,"version":null,"agent":"grok","vendor":null}"#,
+        r#"{"kind":"claim","session":"t0000000aaa","holder":"grok-alab@4242","harness":"grok-alab","proven":true,"version":"0.3.0+gabc","agent":"grok","vendor":"1.0.70"}"#,
+        r#"{"kind":"claim","session":"t0000000ccc","holder":"grok-alab@4343","harness":"grok-alab","proven":false,"version":null,"agent":"grok","vendor":null}"#,
     ] {
         assert!(json.contains(item), "{item} in:\n{json}");
     }
@@ -13658,7 +13829,7 @@ fn versions_lists_installed_packages_and_live_claims() {
     );
     let text = String::from_utf8(text).expect("utf-8");
     assert!(
-        text.contains("  @s-bbb codex-alab 0.164.0+codex.0.130.0 (self-claim)\n"),
+        text.contains("  @t0000000bbb codex-alab 0.164.0+codex.0.130.0 (self-claim)\n"),
         "{text}"
     );
     assert_eq!(*asked_pids.borrow(), [5150]);
@@ -14420,5 +14591,45 @@ fn the_accounts_report_counts_other_macs_catalog_rows_and_its_json_keeps_them() 
         json["shared_accounts"]["accounts"].as_array().map(Vec::len),
         Some(2),
         "{json}"
+    );
+}
+
+/// `upgrade` names a tab by its tab ID in either form: `t` and 10 Crockford base32 characters,
+/// or the `s-` and 20 hex digits a tab opened before that form keeps until it closes; the
+/// `sessions` rows `versions` reads name a harness's tab in either form too. NEGATIVE CONTROLS: a
+/// malformed ID of each form is refused by the grammar and its row is not read.
+#[test]
+fn upgrade_and_versions_take_a_tab_id_of_either_form() {
+    const TABS: [&str; 2] = ["tqn5r6e0148", "s-0123456789abcdef0123"];
+    const NOT_TABS: [&str; 8] = [
+        "tqn5r6e014",
+        "tqn5r6e014u",
+        "TQN5R6E0148",
+        "t../x",
+        "s-0123456789abcdef012",
+        "s-0123456789ABCDEF0123",
+        "S-0123456789abcdef0123",
+        "s-abc",
+    ];
+    for tab in TABS {
+        assert_eq!(
+            parsed(&format!("upgrade {tab} --now")).expect(tab),
+            Cmd::UpgradeOwner {
+                sid: tab.to_string(),
+                ask: OwnerAsk::Now,
+                json: false,
+            }
+        );
+    }
+    for word in NOT_TABS {
+        let why = parsed(&format!("upgrade {word} --now")).expect_err(word);
+        assert!(why.contains("upgrade takes a tab's ID"), "{word}: {why}");
+    }
+    let row = |sid: &str| format!("1 {sid} supervisor=codex-alab@4242 supervisor_proven=1\n");
+    let body: String = TABS.iter().chain(&NOT_TABS).map(|s| row(s)).collect();
+    let read: Vec<String> = live_claims_of(&body).into_iter().map(|c| c.sid).collect();
+    assert_eq!(
+        read, TABS,
+        "each form read; NEGATIVE CONTROL: no malformed one"
     );
 }

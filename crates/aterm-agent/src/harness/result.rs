@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use aterm_json::Value;
 
 use super::upgrade::{ANNOUNCE_HEAD, is_land_act, is_land_check_prompt};
-use crate::supervise::policy::land_check::landed_reply;
-use crate::supervise::policy::turn_end::{is_done_check, says_done, without_finished_lines};
+use crate::supervise::policy::turn_end::is_done_check;
+use alab_policy::land_check::landed_reply;
+use alab_policy::words::{says_done, without_finished_lines};
 
 /// The most of a result one `result` reply prints, in characters.
 pub const RESULT_MAX_CHARS: usize = 24_000;
@@ -377,7 +378,7 @@ fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'
     // newest land act's done reply before it), the word itself adding nothing. Another land act's
     // reply answers it only as a claim (the defense it asks for). A DONE CHECK'S REPLY IS ITS
     // ANSWER WHATEVER ITS WORDS: the harness typed the check over a claim and the check asks for
-    // more work, which the reply reports; no words are read for a claim (`turn_end::says_done`),
+    // more work, which the reply reports; no words are read for a claim (`alab_policy::words::says_done`),
     // so a reply in words that an older check asked for is read too.
     let checked = newest.is_land_check();
     let land = newest.is_land();

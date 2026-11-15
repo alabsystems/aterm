@@ -5,8 +5,8 @@
 
 use std::collections::VecDeque;
 
+use alab_policy::vocab::WallKind;
 use aterm_json::{Map, Value};
-use aterm_phase::WallKind;
 
 use super::transcript;
 use super::usage::{Seen, SeenIds, TokenUsage};
@@ -344,6 +344,16 @@ pub enum StepEvent {
         /// Why (`unknown`: a discriminant of the wrong shape).
         why: &'static str,
     },
+    /// `n` facts of the row at its position the fold could not hand on: a row past the seed it
+    /// could not read (not UTF-8, not JSON, longer than the line bound), a part whose id is no id,
+    /// a turn that ran on a prompt naming none, or a row of the run's own dated below the
+    /// adoption ([`StepFold::set_adopted`]), which the join never places. A row like any other:
+    /// the join counts it once, at its position, and its watermark moves past it, so a fold
+    /// re-armed from that watermark never reads it again.
+    Lost {
+        /// How many.
+        n: u64,
+    },
 }
 
 /// One step, where it was read and at which state.
@@ -364,10 +374,22 @@ pub struct StepBatch {
     pub steps: Vec<Step>,
     /// Steps dropped from a full queue (the oldest): the join is desynced until the next prompt.
     pub overflow: u64,
-    /// Rows past the seed the fold could not read.
-    pub lost: u64,
     /// The main chain's end after the last row read.
     pub end: End,
+}
+
+impl StepBatch {
+    /// The facts its [`StepEvent::Lost`] steps count lost.
+    #[must_use]
+    pub fn lost(&self) -> u64 {
+        self.steps
+            .iter()
+            .map(|s| match s.ev {
+                StepEvent::Lost { n } => n,
+                _ => 0,
+            })
+            .fold(0, u64::saturating_add)
+    }
 }
 
 /// What the newest main-chain entry is.
@@ -872,6 +894,9 @@ struct Hold {
 pub struct StepFold {
     /// The process's start (wall ms): older rows are history.
     floor_ms: u64,
+    /// The adoption (wall ms; 0: none): a fresh row of the run's own dated below it is lost
+    /// ([`Self::set_adopted`]).
+    adopted_ms: u64,
     /// The glue's watermark, from the log.
     given: Option<StepMark>,
     /// The file bound: its fingerprint and identity.
@@ -902,7 +927,8 @@ pub struct StepFold {
     hold: Option<Hold>,
     queue: VecDeque<Step>,
     overflow: u64,
-    lost: u64,
+    /// The facts of the row being folded it could not hand on ([`StepEvent::Lost`]).
+    row_lost: u64,
 }
 
 impl StepFold {
@@ -911,6 +937,7 @@ impl StepFold {
     pub fn new(floor_ms: u64, given: Option<StepMark>) -> StepFold {
         StepFold {
             floor_ms,
+            adopted_ms: 0,
             given,
             bound: None,
             seed: 0,
@@ -927,7 +954,7 @@ impl StepFold {
             hold: None,
             queue: VecDeque::new(),
             overflow: 0,
-            lost: 0,
+            row_lost: 0,
         }
     }
 
@@ -940,6 +967,20 @@ impl StepFold {
     /// Raise the floor to `floor_ms` (wall ms) when that is later.
     pub fn raise_floor(&mut self, floor_ms: u64) {
         self.floor_ms = self.floor_ms.max(floor_ms);
+    }
+
+    /// THE ADOPTION: a seamless update's successor adopted the run at `adopted_ms` (wall ms; it
+    /// only rises), and its join never places a row older than that. A row of the run's own
+    /// past the seed and dated below it (at or past the floor), written after the predecessor's
+    /// last read, is queued as [`StepEvent::Lost`], never dropped as history: the join is short
+    /// of it and says so.
+    pub fn set_adopted(&mut self, adopted_ms: u64) {
+        self.adopted_ms = self.adopted_ms.max(adopted_ms);
+    }
+
+    /// The earliest a row may be dated and still be placed: the floor or the adoption.
+    fn live_from(&self) -> u64 {
+        self.floor_ms.max(self.adopted_ms)
     }
 
     /// The registry read named session `sid` (its id's fingerprint) and no transcript for it.
@@ -990,7 +1031,6 @@ impl StepFold {
         StepBatch {
             steps: self.queue.drain(..upto).collect(),
             overflow: std::mem::take(&mut self.overflow),
-            lost: std::mem::take(&mut self.lost),
             end: self.end.end,
         }
     }
@@ -1039,10 +1079,25 @@ impl StepFold {
     }
 
     /// A line of the main transcript longer than the line bound, ending at `end`.
-    pub const fn long_line(&mut self, end: u64) {
-        if end > self.seed {
-            self.lost = self.lost.saturating_add(1);
-        }
+    pub fn long_line(&mut self, end: u64) {
+        self.unread(end);
+    }
+
+    /// A whole line ending at `end` it could not read: lost, at its end, when it is past the seed
+    /// (a line at or below it is history) and the fold reads the file (a latched fold reads none
+    /// of it, which its [`StepEvent::Off`] said).
+    fn unread(&mut self, end: u64) {
+        let Some((fp, id)) = self.bound.filter(|_| end > self.seed && !self.broken) else {
+            return;
+        };
+        let pos = StepPos {
+            fp,
+            id,
+            off: end,
+            at_ms: self.floor_ms,
+        };
+        self.enqueue(pos, StepEvent::Lost { n: 1 });
+        self.through = self.through.max(end);
     }
 
     /// Fold one completed line of the main transcript, ending at offset `end` (its newline's).
@@ -1051,8 +1106,9 @@ impl StepFold {
             return;
         };
         let fresh = end > self.seed;
+        self.row_lost = 0;
         let Ok(text) = std::str::from_utf8(line) else {
-            self.lost = self.lost.saturating_add(u64::from(fresh));
+            self.unread(end);
             return;
         };
         let t = text.trim();
@@ -1065,7 +1121,7 @@ impl StepFold {
             transcript::steps_bare(t)
         };
         let Ok(value) = parsed else {
-            self.lost = self.lost.saturating_add(u64::from(fresh));
+            self.unread(end);
             return;
         };
         let Some(obj) = value.as_object() else {
@@ -1099,7 +1155,7 @@ impl StepFold {
             _ => None,
         };
         let mut late = None;
-        let live = fresh && at_ms.is_some_and(|t| t >= self.floor_ms);
+        let live = fresh && at_ms.is_some_and(|t| t >= self.live_from());
         let row = match kind {
             Some(ROW_ASSISTANT) => self.assistant(t, obj, live, &mut out, &mut bad),
             Some(ROW_USER) => {
@@ -1144,6 +1200,33 @@ impl StepFold {
         }
         let state = self.state();
         let k = out.len() as u64;
+        // THE ROW'S LOSS, at its position: the parts it could not hand on, and each fact of the
+        // run's own dated at or past the floor but below the adoption (written after the
+        // predecessor's last read, never placed by the join, so lost rather than history). It
+        // goes before whatever of the row is queued (its waited prompt at `end - k`, its steps
+        // up to `end`), else at the row's end, so the join's watermark passes the row either way.
+        let live_from = self.live_from();
+        let hidden = |t: u64| t >= self.floor_ms && t < self.adopted_ms;
+        let held = kind == Some(ROW_USER) && late.is_some() && self.hold.is_some();
+        let lost = std::mem::take(&mut self.row_lost)
+            .saturating_add(u64::from(!out.is_empty() && at_ms.is_some_and(hidden)))
+            .saturating_add(u64::from(
+                waited.is_some_and(|(_, when)| when.is_some_and(hidden)),
+            ))
+            .saturating_add(u64::from(held && at_ms.is_some_and(hidden)));
+        if lost > 0 {
+            let rest = at_ms.is_some_and(|t| t >= live_from)
+                || waited.is_some_and(|(_, when)| when.is_some_and(|t| t >= live_from));
+            let off = if rest { end.saturating_sub(k + 1) } else { end };
+            let pos = StepPos {
+                fp,
+                id,
+                off,
+                at_ms: at_ms.unwrap_or(self.floor_ms),
+            };
+            self.enqueue_as(pos, state, StepEvent::Lost { n: lost });
+            self.through = self.through.max(off);
+        }
         if kind == Some(ROW_USER) {
             // THE HELD TURN'S PROMPT, written late: dated before its rows,
             // it is queued before their steps; any other user row says no
@@ -1151,7 +1234,7 @@ impl StepFold {
             if let Some(h) = self.hold.take()
                 && let (Some(vref), Some(when)) = (late, at_ms)
                 && when <= h.at_ms
-                && when >= self.floor_ms
+                && when >= live_from
             {
                 let pos = StepPos {
                     fp,
@@ -1166,7 +1249,7 @@ impl StepFold {
             }
         }
         if let Some((vref, Some(when))) = waited
-            && when >= self.floor_ms
+            && when >= live_from
         {
             let off = end.saturating_sub(k);
             let pos = StepPos {
@@ -1178,7 +1261,7 @@ impl StepFold {
             self.enqueue_as(pos, state, StepEvent::Prompt { vref });
             self.through = self.through.max(off);
         }
-        let Some(at_ms) = at_ms.filter(|&t| t >= self.floor_ms) else {
+        let Some(at_ms) = at_ms.filter(|&t| t >= live_from) else {
             return;
         };
         if unasked && waited.is_none() && self.hold.is_none() {
@@ -1216,7 +1299,7 @@ impl StepFold {
         }
         self.turn = TurnTokens::default();
         let Some(vref) = p.vref else {
-            self.lost = self.lost.saturating_add(u64::from(p.fresh));
+            self.row_lost = self.row_lost.saturating_add(u64::from(p.fresh));
             return None;
         };
         p.fresh.then_some((vref, p.at_ms))
@@ -1318,7 +1401,7 @@ impl StepFold {
                 continue;
             };
             let Some(id) = StepId::new(id) else {
-                self.lost = self.lost.saturating_add(1);
+                self.row_lost = self.row_lost.saturating_add(1);
                 continue;
             };
             let name = part.get(KEY_NAME).and_then(Value::as_str).unwrap_or("");
@@ -1390,7 +1473,7 @@ impl StepFold {
                 continue;
             };
             let Some(id) = StepId::new(id) else {
-                self.lost = self.lost.saturating_add(1);
+                self.row_lost = self.row_lost.saturating_add(1);
                 continue;
             };
             out.push(StepEvent::ToolResult {
@@ -1440,7 +1523,7 @@ impl StepFold {
         self.turn = TurnTokens::default();
         match vref_of(obj) {
             Some(vref) => out.push(StepEvent::Prompt { vref }),
-            None => self.lost = self.lost.saturating_add(1),
+            None => self.row_lost = self.row_lost.saturating_add(1),
         }
     }
 

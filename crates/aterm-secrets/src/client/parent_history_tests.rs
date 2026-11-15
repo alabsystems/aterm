@@ -74,7 +74,7 @@ fn an_admin_reconciles_beyond_the_parent_window_before_a_reader_catches_up() {
     // The independent authenticated membership log can already deliver the
     // edit even though the envelope's bounded ancestry cannot advance yet.
     assert_eq!(
-        std::fs::read(lab.m7.home.join(".secrets/shared")).unwrap(),
+        crate::client::stored(&lab.m7, "shared").unwrap(),
         b"after long absence"
     );
 
@@ -99,7 +99,7 @@ fn an_admin_reconciles_beyond_the_parent_window_before_a_reader_catches_up() {
         Some(heads[0].envelope.digest())
     );
     assert_eq!(
-        std::fs::read(lab.m7.home.join(".secrets/shared")).unwrap(),
+        crate::client::stored(&lab.m7, "shared").unwrap(),
         b"after long absence"
     );
     second.stop();

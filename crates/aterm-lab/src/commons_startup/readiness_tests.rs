@@ -85,8 +85,9 @@ fn fixture(now: Instant) -> ([Observation; 2], [Binding; 2]) {
 fn active_transport_cannot_replace_current_shared_writer_admission() {
     let now = Instant::now();
     let (observed, expected) = fixture(now);
-    let valid =
-        |value: &[Observation; 2]| ready(value, &expected, [42, 43], true, now, Some(100_100));
+    let valid = |value: &[Observation; 2]| {
+        ready(value, &expected, [42, 43], true, now, Some(100_100), 90_000)
+    };
     assert!(valid(&observed));
     for field in 0..13 {
         let mut pending = observed.clone();
@@ -124,13 +125,18 @@ fn active_transport_cannot_replace_current_shared_writer_admission() {
     }
 }
 
+/// Each writer's observer must show the other Reachable on a contact and a check made during
+/// this run (it started at 90 s here): one from before it is no evidence, and one older than 15 s
+/// but within the run is, since two resting endpoints dial each other only at their audits.
+/// NEGATIVE CONTROL (run here): the contact and check from before the run, each alone.
 #[test]
 fn admitted_writers_still_need_exact_current_peer_contacts() {
     let now = Instant::now();
     let (observed, expected) = fixture(now);
-    let valid =
-        |value: &[Observation; 2]| ready(value, &expected, [42, 43], true, now, Some(100_100));
-    for field in 0..7 {
+    let valid = |value: &[Observation; 2]| {
+        ready(value, &expected, [42, 43], true, now, Some(100_100), 90_000)
+    };
+    for field in 0..8 {
         let mut pending = observed.clone();
         let network = &mut pending[0].network;
         match field {
@@ -140,17 +146,45 @@ fn admitted_writers_still_need_exact_current_peer_contacts() {
             3 => network.via_local_process = Some(99),
             4 => network.observed_at_ms = 100_101,
             5 => network.peers[0].last_seen_ms = 80_000,
+            6 => network.peers[0].last_checked_ms = Some(80_000),
             _ => network.peers[0].last_checked_ms = None,
         }
         assert!(!valid(&pending), "unready contact field {field}");
     }
+    let mut rested = observed.clone();
+    for observed in &mut rested {
+        observed.network.peers[0].first_seen_ms = 55_000;
+        observed.network.peers[0].last_seen_ms = 60_000;
+        observed.network.peers[0].last_checked_ms = Some(60_000);
+    }
+    assert!(
+        ready(
+            &rested,
+            &expected,
+            [42, 43],
+            true,
+            now,
+            Some(100_100),
+            50_000
+        ),
+        "a contact 40 s old within the run"
+    );
     assert!(!ready(
         &observed,
         &expected,
         [42, 43],
         true,
         now + Duration::from_secs(16),
-        Some(100_100)
+        Some(100_100),
+        90_000
     ));
-    assert!(!ready(&observed, &expected, [42, 43], true, now, None));
+    assert!(!ready(
+        &observed,
+        &expected,
+        [42, 43],
+        true,
+        now,
+        None,
+        90_000
+    ));
 }

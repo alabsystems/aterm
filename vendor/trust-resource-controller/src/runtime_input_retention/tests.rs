@@ -116,7 +116,7 @@ fn retention_support_and_transfer_versions_bind_original_call_and_never_cross_de
     assert!(SupportQuery::decode(&support.encode().unwrap()).unwrap() == support);
     assert!(SupportQuery::decode(&request.encode().unwrap()).is_err());
     assert!(Request::decode(&support.encode().unwrap()).is_err());
-    let ready = SupportReply::Supported { context: context() };
+    let ready = SupportReply::Supported { context: Box::new(context()) };
     assert_eq!(SupportReply::decode(&ready.encode().unwrap(), &support).unwrap(), ready);
     let accepted = Reply::Accepted { key: request.key(), context: context() };
     assert_eq!(Reply::decode(&accepted.encode().unwrap(), &request).unwrap(), accepted);

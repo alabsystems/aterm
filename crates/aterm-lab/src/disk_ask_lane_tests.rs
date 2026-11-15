@@ -508,7 +508,7 @@ fn a_ledger_row_is_read_as_the_box_of_its_command() {
 /// report that leaves work for later is none.
 #[test]
 fn the_workers_report_is_a_defense_land_lands() {
-    use aterm_agent::supervise::policy::turn_end::{clean_defense, land_open_found};
+    use alab_policy::open_work::{clean_defense, land_open_found};
     for report in [worker_report(Some(&planted())), worker_report(None)] {
         assert!(
             clean_defense(Some(&report)),

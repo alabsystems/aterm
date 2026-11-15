@@ -71,6 +71,10 @@ impl GitRunner for Network<'_> {
             stderr: out.stderr,
         })
     }
+    /// [`GitRunner::git`]: [`crate::ledger::object_git`] keeps every run of it local.
+    fn git_read(&self, args: &[&str]) -> crate::ledger::Result<crate::ledger::RunOut> {
+        self.git(args)
+    }
     fn git_input(
         &self,
         args: &[&str],
@@ -82,6 +86,17 @@ impl GitRunner for Network<'_> {
         let mut local = vec!["-c", "protocol.allow=never"];
         local.extend_from_slice(args);
         GitCli::new(&self.repo).git_input(&local, input)
+    }
+    /// A read needs no author context, so it runs as [`GitRunner::git`] does, local.
+    fn git_read_input(
+        &self,
+        args: &[&str],
+        input: &[u8],
+    ) -> crate::ledger::Result<crate::ledger::RunOut> {
+        self.running().map_err(crate::ledger::Error::new)?;
+        let mut cmd = crate::ledger::object_git(&self.repo)?;
+        cmd.args(["-c", "protocol.allow=never"]);
+        crate::ledger::run_with_input(cmd, args, input)
     }
 }
 
@@ -100,10 +115,13 @@ impl ClaimStore for Network<'_> {
         if let Err(error) = self.running() {
             return Write::Offline(error);
         }
-        match self
-            .remote
-            .write_claim_ref(name, (!before.is_empty()).then_some(before), after, main)
-        {
+        match self.remote.write_claim_ref(
+            name,
+            (!before.is_empty()).then_some(before),
+            after,
+            main,
+            &|| self.stopped.load(Ordering::SeqCst),
+        ) {
             Ok(crate::github_remote::ClaimWrite::Written) => Write::Written(after.into()),
             Ok(crate::github_remote::ClaimWrite::Conflict) => Write::Race,
             Ok(crate::github_remote::ClaimWrite::InventoryChanged { main, why }) => {
@@ -248,7 +266,9 @@ pub enum Take {
     Continue,
     /// `--supersede`: a session's explicit replacement of the unpublished line. It discards the
     /// holder's candidate whatever that holder is doing, so neither the holder's liveness nor its
-    /// lease decides anything; the compare-and-swap is its fence as for every take.
+    /// lease decides anything. It takes only the exact line it judged, checked against the ref
+    /// its compare-and-swap is from ([`attempt`]); one that ends with nothing of its own recorded
+    /// on main hands the line back ([`Claim::hand_back`]).
     Supersede,
 }
 
@@ -341,25 +361,78 @@ enum ClaimAttempt<T> {
     InventoryChanged { main: String, why: String },
 }
 
+/// How long a fleet line claim keeps reading main again and retrying while each attempt meets a
+/// remote inventory another writer moved outside the claimed ref (an unsent race: the claimed
+/// ref still holds its expected value). One claim attempt took up to about 55 s on m86 under
+/// load (0.201.0 hand4, 2026-11-14: its native object operations), and ten landings were
+/// pushing main at once: three back-to-back attempts all met a moved main and the cut ended
+/// exit 3. Ten minutes is about ten such attempts, as R34's wait behind an open intent
+/// (`github_remote::write::INTENT_WAIT`) outlasts a few writers in turn, and under the half
+/// hour of the shortest lease (`lease_s`).
+pub(crate) const INVENTORY_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The first pause before a claim attempt that met a moved inventory reads main again; each
+/// later pause doubles, up to [`INVENTORY_PAUSE_MAX`], so a burst of landings can settle.
+const INVENTORY_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+const INVENTORY_PAUSE_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How [`inventory_retry`] paces itself: how long it may keep trying and its first pause.
+#[derive(Clone, Copy, Debug)]
+struct InventoryWait {
+    bound: std::time::Duration,
+    pause: std::time::Duration,
+}
+
+impl InventoryWait {
+    const LIVE: InventoryWait = InventoryWait {
+        bound: INVENTORY_WAIT,
+        pause: INVENTORY_PAUSE,
+    };
+}
+
 /// Only an unsent inventory race restarts the complete claim selection. The
 /// callback must refresh main after this floor and recheck supersession and
-/// holder evidence. A receive failure never enters this loop.
+/// holder evidence. A receive failure never enters this loop, and a change of the
+/// claimed ref itself is the callback's conflict, never retried here. Attempts
+/// continue, each after a pause, until `wait.bound` has passed since the first.
+///
+/// # Errors
+/// The callback's own refusal; or, once the bound has passed, the last race's
+/// words with how many attempts met a moved inventory and over how long.
 fn inventory_retry<T>(
+    wait: InventoryWait,
     mut attempt: impl FnMut(Option<&str>) -> Result<ClaimAttempt<T>, String>,
 ) -> Result<T, String> {
+    let started = std::time::Instant::now();
     let mut floor = None;
-    for index in 0..3 {
+    let mut pause = wait.pause;
+    let mut raced = 0_u32;
+    loop {
         match attempt(floor.as_deref())? {
             ClaimAttempt::Done(value) => return Ok(value),
             ClaimAttempt::InventoryChanged { main, why } => {
-                if index == 2 {
-                    return Err(why);
+                raced += 1;
+                let spent = started.elapsed();
+                if spent >= wait.bound {
+                    return Err(format!(
+                        "{why}; {raced} claim attempt{} over {} s met a remote inventory moved \
+                         outside the claimed ref (bound {} s)",
+                        if raced == 1 { "" } else { "s" },
+                        spent.as_secs(),
+                        wait.bound.as_secs()
+                    ));
                 }
+                eprintln!(
+                    "release: fleet line claim attempt {raced} met a remote inventory moved \
+                     outside the claimed ref; reading main again in {} s",
+                    pause.as_secs_f64()
+                );
+                std::thread::sleep(pause.min(wait.bound - spent));
+                pause = (pause * 2).min(INVENTORY_PAUSE_MAX);
                 floor = Some(main);
             }
         }
     }
-    unreachable!("the third attempt returns")
 }
 
 fn claim_main(
@@ -538,30 +611,29 @@ fn installed_ctl(args: &[&str]) -> Result<String, String> {
     Err(aterm_codec::tty::one_line(err.trim(), 300))
 }
 
+/// How long the holder's Mac has to answer one read, in seconds (`survey --timeout`).
+const HOLDER_ANSWER_SECS: u64 = 3;
+
 /// Ask the holder's own Mac, through the installed aterm (`run`), to judge the claim's exact
-/// identity. A holder's Mac older than the `holder=` argument refuses it, and is then asked the
-/// plain survey, which carries its progress record where it keeps one. An installed aterm older
-/// than `--holder` names no proven node, and so is never read as an answer.
+/// identity. An installed aterm older than `--holder` refuses the argument, and a holder's Mac
+/// older than the `holder=` request refuses that; either is then asked the plain survey, which
+/// carries the holder's progress record where its Mac keeps one. Both argument lists are built
+/// by `aterm ctl`'s own crate, beside the parser that reads them
+/// ([`aterm_ctl::survey_host_ask_args`]).
 fn remote_observation(
     state: &State,
     run: &dyn Fn(&[&str]) -> Result<String, String>,
 ) -> Observation {
     let holder = &state.holder;
-    let word = identity_of(holder).word();
-    let plain = [
-        "survey",
-        "--host",
-        holder.node.as_str(),
-        "--timeout",
-        "3",
-        "--json",
-    ];
-    let mut asked = plain.to_vec();
-    asked.extend(["--holder", word.as_str()]);
-    let read = |args: &[&str]| run(args).and_then(|json| holder_answer(&json, holder));
-    match read(&asked) {
+    let identity = identity_of(holder);
+    let read = |judged: Option<&aterm_ctl::release_holder::Identity>| {
+        let args = aterm_ctl::survey_host_ask_args(&holder.node, HOLDER_ANSWER_SECS, judged);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run(&args).and_then(|json| holder_answer(&json, holder))
+    };
+    match read(Some(&identity)) {
         Ok(answer) => observation(&answer),
-        Err(why_asked) => match read(&plain) {
+        Err(why_asked) => match read(None) {
             Ok(answer) => observation(&answer),
             Err(why_plain) => Observation::Unproven(format!(
                 "its Mac's judgement could not be read ({why_asked}), nor its records ({why_plain})"
@@ -572,6 +644,14 @@ fn remote_observation(
 
 /// `aterm ctl survey --host … --json`'s answer about `holder`: only from a peer that proved, in
 /// the handshake, the very node the claim names. Every other outcome is why there is none.
+///
+/// An installed aterm that names the node its peer proved (`proven_node`, `null` for none) is
+/// held to that name. One older than the field (0.199.0) says the same thing in each record: it
+/// prints a record's `alive` only for an answer that proved its node's key from the node the
+/// read asked for and the record names, and `null` otherwise; a peer that proves another node
+/// than the one asked is an error row there. Such an answer is read when it is not `unproven`
+/// and its instance says it is the claim's node, and only its record speaks: it carries no
+/// kernel judgement. An aterm older still (0.198.0) prints no record and is no answer.
 fn holder_answer(json: &str, holder: &Holder) -> Result<HostAnswer, String> {
     let hosts: aterm_json::Value =
         aterm_json::from_str(json).map_err(|e| format!("unreadable survey: {e}"))?;
@@ -586,25 +666,45 @@ fn holder_answer(json: &str, holder: &Holder) -> Result<HostAnswer, String> {
     if let Some(error) = peer["error"].as_str() {
         return Err(format!("it did not answer: {error}"));
     }
-    if peer["unproven"].as_bool() == Some(true)
-        || peer["proven_node"].as_str() != Some(holder.node.as_str())
-    {
-        return Err(
-            "its answer did not prove that node's identity (or the installed aterm \
-                    predates naming it)"
-                .into(),
-        );
+    let unproven = peer["unproven"].as_bool() == Some(true);
+    let record = || {
+        peer["release_lines"].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|row| names(row, holder))
+                .map(|row| row["alive"].as_bool())
+        })
+    };
+    let Some(proven) = peer.get("proven_node") else {
+        if unproven || peer["instance"]["node"].as_str() != Some(holder.node.as_str()) {
+            return Err(
+                "its answer did not prove that node's identity (the installed aterm predates \
+                 naming the proven node, and the answer is unproven or from another node)"
+                    .into(),
+            );
+        }
+        return match record() {
+            Some(alive) => Ok(HostAnswer {
+                record: Some(alive),
+                judged: None,
+            }),
+            None => Err(
+                "its answer holds no record of this holder (the installed aterm predates the \
+                 kernel judgement that needs none)"
+                    .into(),
+            ),
+        };
+    };
+    if unproven || proven.as_str() != Some(holder.node.as_str()) {
+        return Err("its answer did not prove that node's identity".into());
     }
     let judged = match &peer["release_holder"] {
         aterm_json::Value::Null => None,
         value => Some(value["alive"].as_bool()),
     };
-    let record = peer["release_lines"].as_array().and_then(|rows| {
-        rows.iter()
-            .find(|row| names(row, holder))
-            .map(|row| row["alive"].as_bool())
-    });
-    Ok(HostAnswer { record, judged })
+    Ok(HostAnswer {
+        record: record(),
+        judged,
+    })
 }
 
 fn now() -> u64 {
@@ -638,19 +738,38 @@ fn another_mac(holder: &Holder) -> bool {
 
 /// Keep the holder from the same claim read used for selection.
 pub fn existing_with_holder(repo: &Path, version: &str) -> Result<Existing, String> {
+    standing(repo, version, false).map(|(existing, _)| existing)
+}
+
+/// [`existing_with_holder`] and, where `judged`, whether that same read's claim keeps a new
+/// contender on this Mac off the line now ([`Held`]): one read of the ref for both.
+/// # Errors
+/// The line's ref or main's supersession record could not be read.
+pub fn standing(
+    repo: &Path,
+    version: &str,
+    judged: bool,
+) -> Result<(Existing, Option<Held>), String> {
     let name = reference(version)?;
     let stopped = AtomicBool::new(false);
     let old = remote(&Network::new(repo, &stopped)?, &name)?.map(|(_, state)| state);
+    let held = old
+        .as_ref()
+        .filter(|_| judged)
+        .and_then(|state| held_here(repo, state, false));
     let holder = old
         .as_ref()
         .map(|s| (s.line.head().to_string(), holder_words(&s.holder)));
     let elsewhere = old.as_ref().is_some_and(|s| another_mac(&s.holder));
     let line = current(&GitCli::new(repo), version, old.map(|s| s.line))?;
-    Ok(Existing {
-        line,
-        holder,
-        elsewhere,
-    })
+    Ok((
+        Existing {
+            line,
+            holder,
+            elsewhere,
+        },
+        held,
+    ))
 }
 
 fn holder_words(holder: &Holder) -> String {
@@ -746,12 +865,21 @@ fn adopt(
         return;
     }
     let asks = journal.as_ref().map(|j| j.asks.clone()).unwrap_or_default();
+    // The Linux declaration is this clone's word about its cut of the version, not a record of
+    // the head it had selected: an unfinished journal of the same version keeps it through the
+    // adoption. Another version's journal says nothing about this one.
+    let linux = journal
+        .as_ref()
+        .filter(|j| !j.finished() && j.version == selected.version)
+        .map(|j| j.linux.clone())
+        .unwrap_or_default();
     *journal = Some(crate::release::Journal {
         version: selected.version.clone(),
         commit: selected.head().into(),
         started: selected.started,
         line: Some(selected),
         asks,
+        linux,
         ..crate::release::Journal::default()
     });
 }
@@ -802,9 +930,47 @@ enum Attempt {
     },
 }
 
+/// The boundary a `--supersede` take writes ([`Take::Supersede`]): the holder it displaced
+/// reads it when its next renewal loses the compare-and-swap ([`adopted`]).
+const SUPERSEDING: &str = "superseding";
+
+/// Why a holder whose ref another writer moved to `taken` stops: the line is no longer its own.
+/// It names who took the line and, for a supersession, what ends that take.
+fn adopted(taken: Option<&State>) -> String {
+    const LOST: &str = "COULD NOT RUN: fleet line adopted by another holder";
+    match taken {
+        Some(state) if state.boundary == SUPERSEDING => format!(
+            "{LOST}: {} took it with --supersede to replace line {}; a supersession that \
+             ends without recording its replacement hands the line back, and {} then resumes \
+             it",
+            holder_words(&state.holder),
+            state.line.head(),
+            crate::release::RELEASE_COMMAND
+        ),
+        Some(state) => format!(
+            "{LOST}: {} at {} ({})",
+            holder_words(&state.holder),
+            state.step,
+            state.boundary
+        ),
+        None => LOST.to_owned(),
+    }
+}
+
+/// The line `state`'s claim stands for once main's durable retirement applies ([`current`]).
+fn effective(state: &State, current: Option<&crate::line::Supersession>) -> crate::line::Line {
+    current.map_or_else(
+        || state.line.clone(),
+        |record| preferred(&state.line, &record.replacement),
+    )
+}
+
 /// One attempt to take `name` for `taker`: read the ref, admit its holder ([`admit`], unless
 /// this process continues it), record this taker on its host, and compare-and-swap from exactly
-/// the ref read, so of several takers of one read at most one is written.
+/// the ref read, so of several takers of one read at most one is written. A supersession admits
+/// no holder by liveness; it takes only a claim that stands for exactly `line`, the line it
+/// judged, and since the swap is from this same read, a line that advanced before the swap is
+/// refused with nothing written and its holder running.
 fn attempt(
     git: &dyn ClaimStore,
     taker: &Taker<'_>,
@@ -815,23 +981,36 @@ fn attempt(
     expected_ref: Option<&str>,
 ) -> Result<Attempt, String> {
     let old = remote_expected(git, name, expected_ref)?;
-    if let Some((_, state)) = &old
-        && taker.take != Take::Supersede
-        && !continues_holder(taker.take == Take::Continue, &state.holder, taker.holder)
-    {
-        admit(state, line, (taker.now)(), || (taker.observe)(state))?;
+    match &old {
+        None if taker.take == Take::Supersede => {
+            return Err("no fleet claim to supersede; nothing was taken".into());
+        }
+        Some((_, state)) if taker.take == Take::Supersede => {
+            let held = effective(state, current);
+            if held != *line {
+                return Err(format!(
+                    "the fleet line advanced before the replacement took its claim: it heads {} \
+                     where this supersession judged {}; nothing was taken, and its holder {} \
+                     keeps it. Resume that line and carry the fix instead of superseding its \
+                     new hop",
+                    held.head(),
+                    line.head(),
+                    holder_words(&state.holder)
+                ));
+            }
+        }
+        Some((_, state))
+            if !continues_holder(taker.take == Take::Continue, &state.holder, taker.holder) =>
+        {
+            admit(state, line, (taker.now)(), || (taker.observe)(state))?;
+        }
+        _ => {}
     }
+    // A carried fix extends this exact line. A different base selected on a moving main is
+    // discarded when adopting the fleet's existing line.
     let selected = old.as_ref().map_or_else(
         || line.clone(),
-        |(_, state)| {
-            // A carried fix extends this exact line. A different base selected on a moving main
-            // is discarded when adopting the fleet's existing line.
-            if let Some(record) = current {
-                preferred(line, &preferred(&state.line, &record.replacement))
-            } else {
-                preferred(line, &state.line)
-            }
-        },
+        |(_, state)| preferred(line, &effective(state, current)),
     );
     let previous_holder = old
         .as_ref()
@@ -841,20 +1020,26 @@ fn attempt(
         line: selected,
         holder: taker.holder.clone(),
         step: "commit".into(),
-        boundary: "claimed".into(),
+        boundary: if taker.take == Take::Supersede {
+            SUPERSEDING
+        } else {
+            "claimed"
+        }
+        .into(),
         at: (taker.now)(),
         p95_s: default_p95_s("commit"),
         evidence: "the claim itself, just taken".into(),
         rows: Vec::new(),
     };
+    let displaced = old
+        .as_ref()
+        .filter(|_| taker.take == Take::Supersede)
+        .map(|(_, state)| state.clone());
     let previous = old.as_ref().map_or("", |(sha, _)| sha.as_str());
     let local = taker
         .registry
         .join(aterm_agent::release_progress::DIRECTORY)
-        .join(format!(
-            "{}-{}-{}.json",
-            line.version, taker.holder.pid, taker.holder.start
-        ));
+        .join(identity_of(taker.holder).record_name(&line.version));
     let mut claim = Lease {
         repo: taker.repo.into(),
         name: name.to_owned(),
@@ -862,6 +1047,7 @@ fn attempt(
         state,
         local,
         previous_holder,
+        displaced,
     };
     // Make the identity observable before publishing it. A failure here can never strand a
     // remote lease with no host record from which to prove its death.
@@ -883,6 +1069,116 @@ fn attempt(
     )
 }
 
+/// This process as a line's holder, and the state folder whose release-lines registry keeps its
+/// host record.
+fn this_holder() -> Result<(Holder, PathBuf), String> {
+    let env = aterm_agent::harness::cli::Env::from_process()?;
+    let host = aterm_agent::survey_facts::release_machine_label()?;
+    #[cfg(unix)]
+    let node = aterm_agent::fleet_node().ok_or("no authenticated fleet node identity")?;
+    #[cfg(not(unix))]
+    let node = host.clone();
+    let pid = std::process::id();
+    let (boot, start) = aterm_agent::release_progress::identity(pid)
+        .ok_or("cannot read this process's identity")?;
+    let holder = Holder {
+        node,
+        host,
+        sid: std::env::var("ATERM_SESSION_ID").unwrap_or_default(),
+        pid,
+        boot,
+        start,
+    };
+    Ok((holder, env.state))
+}
+
+/// A line another holder keeps from a contender on this Mac now ([`held`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// Who holds it, as its claim names them ([`holder_words`]).
+    pub holder: String,
+    /// The head of the line it holds.
+    pub head: String,
+    /// Epoch seconds its lease runs until, unless it renews it first.
+    pub until: u64,
+    /// What a contender is told: the `CUTTING ELSEWHERE:` line a take would end with.
+    pub refusal: String,
+}
+
+/// Whether a take of the claim `state` by `taker` would be refused now, by the same judgement
+/// as the take ([`attempt`], [`admit`]) and with nothing written: no host record, no ref. `None`
+/// where its lease has run out, its holder's Mac proves its process dead, or `taker` continues
+/// it.
+fn held_of(state: &State, taker: &Taker<'_>) -> Option<Held> {
+    if taker.take == Take::Supersede
+        || continues_holder(taker.take == Take::Continue, &state.holder, taker.holder)
+    {
+        return None;
+    }
+    admit(state, &state.line, (taker.now)(), || (taker.observe)(state))
+        .err()
+        .map(|refusal| Held {
+            holder: holder_words(&state.holder),
+            head: state.line.head().to_string(),
+            until: state.at.saturating_add(lease_s(state)),
+            refusal,
+        })
+}
+
+/// Judge `state` as a contender started in `repo` on this Mac would ([`held_of`]). A Mac whose
+/// own fleet identity does not read asks no holder's Mac anything: the lease alone then says
+/// whether the line is held.
+fn held_here(repo: &Path, state: &State, continued: bool) -> Option<Held> {
+    let here = this_holder();
+    let nobody = (
+        Holder {
+            node: String::new(),
+            host: String::new(),
+            sid: String::new(),
+            pid: 0,
+            boot: String::new(),
+            start: 0,
+        },
+        PathBuf::new(),
+    );
+    let (holder, registry) = here.as_ref().unwrap_or(&nobody);
+    held_of(
+        state,
+        &Taker {
+            repo,
+            holder,
+            registry,
+            take: if continued && here.is_ok() {
+                Take::Continue
+            } else {
+                Take::Contend
+            },
+            now: &now,
+            observe: &|state| match &here {
+                Ok(_) => observe(state, holder, registry),
+                Err(why) => Observation::Unproven(format!(
+                    "this Mac's own fleet identity, which asks its holder's Mac, does not read \
+                     ({why})"
+                )),
+            },
+        },
+    )
+}
+
+/// Whether another holder keeps `version`'s fleet line from a release started in `repo` now:
+/// what its claim would be told (a take that `continued` this process's own line is never held
+/// from it), asked of the line's record alone before anything is built, judged or written.
+/// # Errors
+/// The line's ref could not be read, or this process has no fleet identity to claim with.
+pub fn held(repo: &Path, version: &str, continued: bool) -> Result<Option<Held>, String> {
+    let name = reference(version)?;
+    // A release that cannot name itself to the fleet is refused by its claim, in its words.
+    this_holder()?;
+    let stopped = AtomicBool::new(false);
+    let git = Network::new(repo, &stopped)?;
+    Ok(remote(&git, &name)?.and_then(|(_, state)| held_here(repo, &state, continued)))
+}
+
 /// One owned lease; the monitor retries its pending writes independently of progress.
 struct Lease {
     repo: PathBuf,
@@ -891,41 +1187,26 @@ struct Lease {
     pub state: State,
     local: PathBuf,
     previous_holder: Option<String>,
+    /// The exact claim a supersession took ([`Take::Supersede`]), which [`hand_back`] restores.
+    displaced: Option<State>,
 }
 
 impl Lease {
     fn take(repo: &Path, line: &crate::line::Line, take: Take) -> Result<Self, String> {
-        let env = aterm_agent::harness::cli::Env::from_process()?;
-        let host =
-            aterm_agent::survey_facts::machine_label().ok_or("no canonical fleet host label")?;
-        #[cfg(unix)]
-        let node = aterm_agent::fleet_node().ok_or("no authenticated fleet node identity")?;
-        #[cfg(not(unix))]
-        let node = host.clone();
-        let pid = std::process::id();
-        let (boot, start) = aterm_agent::release_progress::identity(pid)
-            .ok_or("cannot read this process's identity")?;
-        let holder = Holder {
-            node,
-            host,
-            sid: std::env::var("ATERM_SESSION_ID").unwrap_or_default(),
-            pid,
-            boot,
-            start,
-        };
+        let (holder, registry) = this_holder()?;
         let name = reference(&line.version)?;
         let stopped = AtomicBool::new(false);
         let git = Network::new(repo, &stopped)?;
         let taker = Taker {
             repo,
             holder: &holder,
-            registry: &env.state,
+            registry: &registry,
             take,
             now: &now,
-            observe: &|state| observe(state, &holder, &env.state),
+            observe: &|state| observe(state, &holder, &registry),
         };
         let mut expected_ref = None;
-        inventory_retry(|floor| {
+        inventory_retry(InventoryWait::LIVE, |floor| {
             loop {
                 let (main, current) = claim_main(
                     &crate::github_remote::Remote::origin(repo)?,
@@ -983,11 +1264,36 @@ impl Lease {
                     self.sha = sha;
                     Ok(false)
                 }
-                Ok(_) => Err("COULD NOT RUN: fleet line adopted by another holder".into()),
+                Ok(taken) => Err(adopted(taken.as_ref().map(|(_, state)| state))),
                 Err(_) => Ok(false),
             },
         }
     }
+}
+
+/// Give the claim `lease` took by supersession back to the holder it displaced: a
+/// compare-and-swap from this lease's last write to that holder's exact state, after which the
+/// holder's next renewal finds its own identity on the ref and goes on ([`Lease::write_with`]).
+/// `Ok(Some)` names the holder the line went back to; `Ok(None)` is a ref another writer took
+/// since, which is not this lease's to give and stays as it is. A write of this lease's own that
+/// landed unread is adopted and the swap made again from it.
+fn hand_back(git: &dyn ClaimStore, lease: &Lease) -> Result<Option<String>, String> {
+    let displaced = lease
+        .displaced
+        .as_ref()
+        .ok_or("this claim displaced no holder to hand the line back to")?;
+    let mut sha = lease.sha.clone();
+    for _ in 0..3 {
+        match replace(git, &lease.name, &sha, displaced) {
+            Write::Written(_) => return Ok(Some(holder_words(&displaced.holder))),
+            Write::Race => match remote(git, &lease.name)? {
+                Some((now, state)) if state.holder == lease.state.holder => sha = now,
+                _ => return Ok(None),
+            },
+            Write::Offline(why) | Write::InventoryChanged { why, .. } => return Err(why),
+        }
+    }
+    Err("the claim kept moving under this run while it was handed back".into())
 }
 
 type Reply = std::sync::mpsc::Sender<Result<bool, String>>;
@@ -1072,21 +1378,36 @@ impl Local {
         })
     }
 
+    /// Renew the lease at `now` on a wait the run names (`what`, kept as the evidence): its
+    /// step, rows and holder stand as they were.
+    fn waiting(&self, what: &str, now: u64) -> Result<(), String> {
+        self.update(|state| {
+            state.at = now;
+            state.evidence = what.into();
+        })
+    }
+
     /// One heartbeat at `now`: read this process's tree with `read` (no claim write running),
     /// and renew the lease where `pulse` finds it due ([`Pulse::beat`]). Whether it renewed;
     /// the host record is rewritten only then. A heartbeat never ends a cut: a host record it
     /// could not rewrite is the next row's or boundary's to report, as it is today.
+    ///
+    /// `waiting` is the line of a wait behind another writer's open intent that a write of
+    /// this process is in ([`crate::github_remote::intent_wait`]). A holder in that wait runs
+    /// nothing and writes nothing, so its tree shows no work, and it is in turn, not hung:
+    /// the wait is the evidence then, and it ends by itself at the write's own bound.
     fn beat(
         &self,
         pulse: &mut Pulse,
         read: &mut dyn FnMut() -> (Option<aterm_toolchain::stall::Work>, std::time::Instant),
+        waiting: Option<String>,
         now: u64,
     ) -> bool {
         let (work, at) = {
             let _quiet = self.quiet();
             read()
         };
-        let evidence = pulse.look(work, at);
+        let evidence = pulse.look(work, at).or(waiting);
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
@@ -1230,7 +1551,8 @@ fn pulse(
                 std::time::Instant::now(),
             )
         };
-        if local.beat(&mut pulse, &mut read, now()) && wake.send(Request::Wake).is_err() {
+        let waiting = crate::github_remote::intent_wait();
+        if local.beat(&mut pulse, &mut read, waiting, now()) && wake.send(Request::Wake).is_err() {
             break;
         }
     }
@@ -1244,7 +1566,7 @@ pub struct Claim {
     pub line: crate::line::Line,
     pub previous_holder: Option<String>,
     tx: std::sync::mpsc::Sender<Request>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    worker: Option<std::thread::JoinHandle<Lease>>,
     local: Arc<Local>,
     sampler: Option<std::thread::JoinHandle<()>>,
     sample_stop: std::sync::mpsc::Sender<()>,
@@ -1326,6 +1648,46 @@ impl Claim {
         Ok(())
     }
 
+    /// Undo a supersession's take ([`Take::Supersede`]) that ends with nothing of its own
+    /// recorded on main: stop this claim's heartbeat, row sampler and monitor, then hand the line
+    /// back to the holder it displaced by a compare-and-swap from the claim as this run last
+    /// wrote it, so that holder goes on as though nothing had taken it. `Ok(Some)` names that
+    /// holder; `Ok(None)` is a line another writer took from this claim since.
+    pub fn hand_back(mut self) -> Result<Option<String>, String> {
+        let lease = self.stop()?;
+        hand_back(&Network::new(&lease.repo, &self.stopped)?, &lease)
+    }
+
+    /// Stop this claim's heartbeat, row sampler and monitor, so nothing of this run renews the
+    /// claim again, and return the lease as the monitor last wrote it.
+    fn stop(&mut self) -> Result<Lease, String> {
+        let _ = self.heart_stop.send(());
+        let _ = self.sample_stop.send(());
+        let _ = self.tx.send(Request::Stop);
+        if let Some(heart) = self.heart.take() {
+            let _ = heart.join();
+        }
+        if let Some(sampler) = self.sampler.take() {
+            let _ = sampler.join();
+        }
+        self.worker
+            .take()
+            .ok_or("the fleet claim monitor already stopped")?
+            .join()
+            .map_err(|_| "the fleet claim monitor panicked".into())
+    }
+
+    /// Renew the lease while the run waits for `what`, which it says is the evidence: the
+    /// heartbeat renews only on work its process tree shows, and a run that waits on a time it
+    /// knows shows none. The caller bounds the wait; this renews once, as a boundary does.
+    pub fn waiting(&mut self, what: &str) -> Result<(), String> {
+        if let Some(error) = failure() {
+            return Err(error.into());
+        }
+        self.local.waiting(what, now())?;
+        self.tx.send(Request::Wake).map_err(|e| e.to_string())
+    }
+
     /// A public write needs a successful ownership round trip, which renews the lease. Offline
     /// retries wait here, preserving the qualified candidate, rather than turning a transport
     /// error into a red; a lease taken meanwhile fails the audit.
@@ -1363,16 +1725,17 @@ fn publish_progress(
     local: &Local,
     stopped: &AtomicBool,
     rx: &std::sync::mpsc::Receiver<Request>,
-) {
-    publish_progress_with(lease, local, rx, &mut |lease| lease.write(stopped));
+) -> Lease {
+    publish_progress_with(lease, local, rx, &mut |lease| lease.write(stopped))
 }
 
+/// The monitor's loop; it returns the lease as it last wrote it once stopped.
 fn publish_progress_with(
     mut lease: Lease,
     local: &Local,
     rx: &std::sync::mpsc::Receiver<Request>,
     write: &mut dyn FnMut(&mut Lease) -> Result<bool, String>,
-) {
+) -> Lease {
     let mut written = lease.state.clone();
     let mut backoff = 1;
     let mut next = std::time::Instant::now();
@@ -1436,6 +1799,7 @@ fn publish_progress_with(
             let _ = reply.send(result);
         }
     }
+    lease
 }
 
 pub fn failure() -> Option<&'static str> {

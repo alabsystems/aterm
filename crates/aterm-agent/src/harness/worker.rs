@@ -10,9 +10,6 @@ use atpkg::caller_shell::ProcArgs;
 
 use super::upgrade::{self, Dialect};
 
-#[path = "worker_grok.rs"]
-pub mod grok;
-
 /// How a starter's process is known to run a row's CLI, and the program a
 /// worker's line types for it ([`starter_of`]).
 #[derive(Clone, Copy)]
@@ -20,7 +17,7 @@ enum Launches {
     /// Claude Code: read by its relaunch's own reader
     /// (`relaunch::caller_claude`).
     Claude,
-    /// A CLI whose image is named by its word (agy, Muse Code, Grok Build): its
+    /// A CLI whose image is named by its word (agy, Muse Code): its
     /// own path, or — where `store_build` says it is a build in atpkg's store —
     /// atpkg's managed twin (the path its relaunch lane types), else the word.
     Image { store_build: fn(&Path) -> bool },
@@ -85,10 +82,6 @@ pub struct WorkerCli {
     /// ([`atpkg::yolo::decide`]), so a twin the line runs adds no yolo flag beside it: the floor
     /// holds whether or not the line runs that twin.
     flags: fn(&[String]) -> Result<Vec<String>, String>,
-    /// Why a worker carrying this environment must not start, under the user's home: a CLI
-    /// that, signed out, opens a sign-in page by itself and never reads its task
-    /// ([`WorkerCli::signed_out`]); `None` for a CLI with no such hazard.
-    login: Option<LoginGate>,
 }
 
 /// A CLI's flag naming the permission mode its run starts in ([`WorkerCli::permission_flag`]).
@@ -132,10 +125,6 @@ pub const CLAUDE_TOOLS_FLAG: &str = "--tools";
 /// that carries one is never handed aterm's usage tap, whose value is a `--settings` too
 /// ([`super::tap::launch_value`]).
 pub const CLAUDE_SETTINGS_FLAG: &str = "--settings";
-
-/// Why a worker carrying an environment (its variables, then the user's home where known) must
-/// not start: a CLI's sign-in floor ([`grok::signed_out`]).
-type LoginGate = fn(&[(String, String)], Option<&Path>) -> Option<String>;
 
 /// Claude Code's plan mode, as `--permission-mode` and the pill's flag spell it.
 const CLAUDE_PLAN: &str = "plan";
@@ -673,8 +662,10 @@ fn codex_home_env(args: &ProcArgs, user: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// Every worker harness `spawn` can start, one row per harness.
-pub static WORKERS: [WorkerCli; 5] = [
+/// Every worker harness `spawn` can start, one row per harness. The table is built through
+/// `every_end_seen`, so a build with a row whose worker's end nothing would see does not
+/// compile, and `spawn` never starts one.
+pub static WORKERS: [WorkerCli; 4] = every_end_seen([
     WorkerCli {
         agent: Program::Claude,
         word: "claude",
@@ -692,7 +683,6 @@ pub static WORKERS: [WorkerCli; 5] = [
         launches: Launches::Claude,
         homes: |_, _| Vec::new(),
         flags: claude_permission_flags,
-        login: None,
     },
     WorkerCli {
         agent: Program::Codex,
@@ -715,7 +705,6 @@ pub static WORKERS: [WorkerCli; 5] = [
         homes: codex_home_env,
         // Its argv alone: [`starter_of`] reads a starter's config beside it.
         flags: |argv| codex_lent(argv, None),
-        login: None,
     },
     WorkerCli {
         agent: Program::Agy,
@@ -736,7 +725,6 @@ pub static WORKERS: [WorkerCli; 5] = [
         },
         homes: |args, home| super::upgrade_agy::relaunch_env(|n| args.env_var(n), home),
         flags: |argv| Ok(super::upgrade_agy::worker_flags(argv)),
-        login: None,
     },
     WorkerCli {
         agent: Program::Muse,
@@ -766,30 +754,29 @@ pub static WORKERS: [WorkerCli; 5] = [
                 | upgrade::ArgvRefusal::NotResumable(flag) => flag,
             })
         },
-        login: None,
     },
-    WorkerCli {
-        agent: Program::Grok,
-        word: grok::PROGRAM,
-        operand: upgrade::TASK_OPERAND,
-        model_flag: "--model",
-        default_model: None,
-        default_flags: &[],
-        trust_flag: None,
-        permission_flag: None,
-        chrome_flag: None,
-        tools_flag: None,
-        settings_flag: None,
-        nicety: &[grok::NO_SELF_UPDATE],
-        dirs: &[grok::HOME_ENV],
-        launches: Launches::Image {
-            store_build: grok::store_build,
-        },
-        homes: |args, home| grok::relaunch_env(|n| args.env_var(n), home),
-        flags: grok::worker_flags,
-        login: Some(grok::signed_out),
-    },
-];
+]);
+
+/// `rows` as they are, where something sees each one's worker end ([`WorkerCli::end_seen`]):
+/// the task of a worker whose end nothing sees would stay `working` whatever it did, and `await
+/// task` would never wake on it.
+///
+/// # Panics
+/// A row's worker end is seen by nothing. In [`WORKERS`]' initializer, which is evaluated at
+/// compile time, that panic fails the build.
+const fn every_end_seen<const N: usize>(rows: [WorkerCli; N]) -> [WorkerCli; N] {
+    let mut at = 0;
+    while at < N {
+        assert!(
+            rows[at].end_seen(),
+            "a WORKERS row's worker end is seen by nothing: its agent is not \
+             Program::supervisable and it launches no codex-alab, so its task could never be \
+             marked done and `await task` would never wake on it"
+        );
+        at += 1;
+    }
+    rows
+}
 
 /// Worker row for `agent`, or `None` if unsupported by `spawn`.
 #[must_use]
@@ -843,16 +830,10 @@ fn codex_launch_program_by(twin: impl FnOnce(&str) -> Option<PathBuf>) -> PathBu
     cli.unstarted_by(|| twin(cli.word)).exe
 }
 
-/// The words of the [`WORKERS`] a `spawn` starts, as a usage line names them (`claude|…`): none
-/// whose end nothing sees ([`WorkerCli::end_unseen`]), which `spawn` refuses.
+/// The words of the [`WORKERS`] a `spawn` starts, as a usage line names them (`claude|…`).
 #[must_use]
 pub fn started_words() -> String {
-    WORKERS
-        .iter()
-        .filter(|w| w.end_unseen().is_none())
-        .map(|w| w.word)
-        .collect::<Vec<_>>()
-        .join("|")
+    WORKERS.iter().map(|w| w.word).collect::<Vec<_>>().join("|")
 }
 
 /// The [`WORKERS`] row a program spawn's `program` names by its file name, where `spawn agent=`
@@ -864,9 +845,7 @@ pub fn started_words() -> String {
 #[must_use]
 pub fn harness_of_program(program: &str) -> Option<&'static WorkerCli> {
     let name = Path::new(program).file_name()?.to_str()?;
-    WORKERS
-        .iter()
-        .find(|w| w.word == name && w.end_unseen().is_none())
+    WORKERS.iter().find(|w| w.word == name)
 }
 
 /// The shell command line a program worker runs at its first prompt: `program` and each of
@@ -907,29 +886,11 @@ impl std::fmt::Debug for Starter {
 }
 
 impl WorkerCli {
-    /// Why nothing would see this row's worker end, or `None` where something does: aterm's
-    /// engine reads and answers an agent whose screen policy acts on it
-    /// ([`Program::supervisable`]), and codex-alab supervises itself under its proven claim.
-    /// Any other worker's task would stay `working` whatever it did, and
-    /// `await task` would never wake on it, so `spawn` refuses it (fail closed) until its
-    /// reader reads its turn end.
-    ///
-    /// This refusal is all that keeps Grok Build workers from starting today, and flipping
-    /// `supervisable(Grok)` lifts it. The sign-in floor behind [`Self::signed_out`] then stands
-    /// alone: it refuses a missing, empty or refused sign-in file, not an expired one grok has
-    /// not refused yet (`docs/DESIGN-harness-repos-2026-10-24.md` D40). The Grok worker tests
-    /// pin the refusal, so the flip turns them red and is made on purpose.
-    #[must_use]
-    pub fn end_unseen(&self) -> Option<String> {
-        if matches!(self.launches, Launches::Alab) || self.agent.supervisable() {
-            return None;
-        }
-        Some(format!(
-            "{} is read, not supervised, by the aterm of the Mac asked to start it: no reader \
-             there sees its turn end yet, so its task could never be marked done and `await \
-             task` would never wake on it; no worker was started",
-            self.agent.product()
-        ))
+    /// Whether something sees this row's worker end: aterm's engine reads and answers an agent
+    /// whose screen policy acts on it ([`Program::supervisable`]), and codex-alab supervises
+    /// itself under its proven claim. [`WORKERS`] holds no other row ([`every_end_seen`]).
+    const fn end_seen(&self) -> bool {
+        matches!(self.launches, Launches::Alab) || self.agent.supervisable()
     }
 
     /// The atpkg program this row runs: the `atpkg::vendor_direct::VENDORS` row of its word, every
@@ -937,15 +898,6 @@ impl WorkerCli {
     #[must_use]
     pub fn atpkg_program(&self) -> Option<&'static str> {
         atpkg::vendor_direct::spec(self.word).map(|spec| spec.program)
-    }
-
-    /// Why a worker on `starter` must not start under the user's home `user` (`None`: not
-    /// known): a CLI that, signed out, opens a sign-in page by itself and never reads its task
-    /// (Grok Build, [`grok::signed_out`]). `None` to start it. [`admit`] asks this first, before
-    /// atpkg's store is read or anything is installed.
-    #[must_use]
-    pub fn signed_out(&self, starter: &Starter, user: Option<&Path>) -> Option<String> {
-        self.login.and_then(|login| login(&starter.env, user))
     }
 
     /// Whether the worker's first prompt may hold a blank line
@@ -984,8 +936,7 @@ impl WorkerCli {
     /// names the CLI's floor ([`Self::unnamed_posture`]): neither its own default, which asks a
     /// person (agy's and Muse Code's lines hold words atpkg's twin does not know, and the twin
     /// runs them as typed), nor the twin's yolo (codex-alab's bypass or packaged
-    /// danger-full-access, Grok Build's always-approve), which is past the floor. Two lines name
-    /// none: an unstarted Claude
+    /// danger-full-access), which is past the floor. Two lines name none: an unstarted Claude
     /// Code's, whose route no starter could tell ([`claude_route_kept`]), so atpkg's twin, where
     /// the line reaches it, starts it in bypass, as before the floor; and a bare `codex`, which
     /// may be a vendor Codex that refuses codex-alab's floor flag and would not start.
@@ -1121,10 +1072,9 @@ pub const REFUSAL_ROOM: usize = 85;
 /// Why a worker's launcher starts no worker ([`admit`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// The CLI is signed out for the login its line would start on ([`WorkerCli::signed_out`]),
-    /// or the launch's local check of a Google login found no usable grant and its renewal left
-    /// the login signed out ([`super::accounts_pool::prepare_google_worker`]). Only a person can
-    /// sign in.
+    /// The launch's local check of a Google login found no usable grant and its renewal left the
+    /// login signed out ([`super::accounts_pool::prepare_google_worker`]). Only a person can sign
+    /// in.
     SignedOut(String),
     /// atpkg's install of the CLI's absent program failed, or left nothing installed
     /// ([`ensure_program`]).
@@ -1205,7 +1155,7 @@ pub fn declared_codex_auth_file(
 }
 
 /// A worker's starter that its launcher admitted ([`admit`]). [`fn@line`] takes one in place of
-/// a bare [`Starter`], so no line can be written without the sign-in and install checks.
+/// a bare [`Starter`], so no line can be written without the install check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Admitted {
     starter: Starter,
@@ -1217,18 +1167,12 @@ impl Admitted {
     /// its readiness and returning the guard needed to recheck the prepared starter.
     ///
     /// # Errors
-    /// Preparation's own refusal, or [`Refused::SignedOut`] where the replacement starter fails
-    /// the CLI's sign-in check.
+    /// Preparation's own refusal.
     pub fn prepare<T>(
         self,
-        cli: &WorkerCli,
-        user: Option<&Path>,
         prepare: impl FnOnce(Starter) -> Result<(Starter, T), Refused>,
     ) -> Result<(Self, T), Refused> {
         let (starter, guard) = prepare(self.starter)?;
-        if let Some(why) = cli.signed_out(&starter, user) {
-            return Err(Refused::SignedOut(why));
-        }
         Ok((
             Self {
                 starter,
@@ -1324,28 +1268,19 @@ impl Admitted {
     }
 }
 
-/// ADMIT A WORKER BEFORE ITS LINE IS WRITTEN, SIGN-IN FIRST. A CLI that, signed out, opens a
-/// sign-in page by itself ([`WorkerCli::signed_out`]) is refused before atpkg's store is read or
-/// anything is installed: installing it would put a signed-out program on every shell's `PATH`
-/// (atpkg lays its `agents/<program>` twin), and its line would open that page in the person's
-/// browser. Only a starter that passes the sign-in check gets [`ensure_program`]'s install,
-/// through `present`, `held` and `install`.
+/// ADMIT A WORKER BEFORE ITS LINE IS WRITTEN: `starter` gets [`ensure_program`]'s install of the
+/// CLI's program, through `present`, `held` and `install`.
 ///
 /// # Errors
 ///
-/// [`Refused::SignedOut`] before `present`, `held` or `install` is asked, else
 /// [`ensure_program`]'s refusal as [`Refused::Program`].
 pub fn admit(
     cli: &WorkerCli,
     starter: Starter,
-    user: Option<&Path>,
     present: impl Fn(&str) -> bool,
     held: impl FnOnce(&str) -> Option<String>,
     install: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<Admitted, Refused> {
-    if let Some(why) = cli.signed_out(&starter, user) {
-        return Err(Refused::SignedOut(why));
-    }
     let readiness = ensure_program(cli, present, held, install).map_err(Refused::Program)?;
     Ok(Admitted { starter, readiness })
 }
@@ -1605,6 +1540,8 @@ pub struct Fresh<'a> {
     /// `model=`: the CLI's `--model`; `None` runs the row's
     /// [`WorkerCli::default_model`], where it has one.
     pub model: Option<&'a str>,
+    /// The native Codex reasoning selection (`-c model_reasoning_effort=…`).
+    pub reasoning_effort: Option<&'a str>,
     /// Whether the shell stands in the folder its starter trusted for it.
     pub trusted_here: bool,
     /// `--permission-mode`: the mode the CLI starts in, one its [`WorkerCli::permission_flag`]
@@ -1623,6 +1560,20 @@ pub struct Fresh<'a> {
     pub settings: Option<&'a str>,
 }
 
+/// Whether a worker accepts the native reasoning-effort launch option.
+/// Keep every engine explicit so adding one requires choosing its support.
+pub fn supports_reasoning_effort(program: Program) -> bool {
+    match program {
+        Program::Codex => true,
+        Program::Claude
+        | Program::Agy
+        | Program::Muse
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic => false,
+    }
+}
+
 /// Format the shell command line a worker runs at its first prompt, for the starter [`admit`]
 /// admitted.
 ///
@@ -1631,7 +1582,8 @@ pub struct Fresh<'a> {
 /// no table knows, `model` starts with `-`, a permission mode is named for a CLI with no such
 /// flag or is none of the modes its flag takes, tools are named for a CLI with no such flag or are
 /// none or a name that is not one word, a settings document is named for a CLI with no such flag
-/// or is no JSON object, or a variable [`Starter::unset`] removes is one its environment sets.
+/// or is no JSON object, reasoning effort is invalid or requested for a non-Codex CLI,
+/// or a variable [`Starter::unset`] removes is one its environment sets.
 pub fn line(
     cli: &WorkerCli,
     dialect: Dialect,
@@ -1695,6 +1647,17 @@ pub(super) fn line_of(
             "the model {model:?} opens with `-`, which {} reads as a flag",
             cli.agent.product()
         ));
+    }
+    if let Some(effort) = fresh.reasoning_effort {
+        if !supports_reasoning_effort(cli.agent) {
+            return Err(format!(
+                "{} has no supported reasoning-effort launch option",
+                cli.agent.product()
+            ));
+        }
+        if !aterm_types::agent_settings::valid_effort(effort) {
+            return Err(format!("invalid Codex reasoning effort {effort:?}"));
+        }
     }
     let mode = match (fresh.permission_mode, cli.permission_flag) {
         (None, _) => None,
@@ -1779,6 +1742,10 @@ pub(super) fn line_of(
     if let Some(model) = fresh.model.or(cli.default_model) {
         flags.push(cli.model_flag.to_string());
         flags.push(model.to_string());
+    }
+    if let Some(effort) = fresh.reasoning_effort {
+        flags.push("-c".to_string());
+        flags.push(format!("model_reasoning_effort=\"{effort}\""));
     }
     if let Some((flag, mode)) = mode {
         flags.push(flag.to_string());

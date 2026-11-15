@@ -2,15 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! `mac nux`'s tree rows (one-mesh design §11 A17c): `reveal-tab` runs `lab reveal-tab`'s world
-//! ([`crate::reveal_tab`]: its synthetic import, zsh rc and windowed instance) in a fresh clone of
+//! ([`crate::reveal_tab`]: its private grid, zsh rc and windowed instance) in a fresh clone of
 //! the person base, and `reveal-tab-control` runs it under the GUI's plain-publication negative
 //! control, so the window's accessibility tree is read with no person's grant.
 //!
 //! The run is the guest's own. This lab's executable (a debug image, which `reveal-tab` needs) and
 //! the aterm under test (a debug build, the only kind the lab's window guard takes) are shared into
 //! the guest ([`stage`]) and run there as an agent of the console's session ([`run_script`]). Its
-//! instance's window therefore opens on the guest's console, and its outside job is a launchd job
-//! of that session. The tree is read by the guest helper: the run's `--ax-helper` starts
+//! instance's window therefore opens on the guest's console. The tree is read by the guest helper: the run's `--ax-helper` starts
 //! `aterm-lab-guest ax-texts PID` disclaimed, so tccd judges the helper's own grant, which the
 //! person base writes for its path and identifier, and never the run's. What the helper read
 //! stays in the guest. The run's report carries its evidence and no value

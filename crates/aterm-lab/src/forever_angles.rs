@@ -3,8 +3,8 @@
 
 //! `cruise-angles` (`--mode angles`, v6 §14.5's 5a): Cruise asks for a new kind of work at each
 //! done claim. Every reply of its conversation is real work past the short-turn floor
-//! (`turn_end::MIN_WORK`) that ends in a done claim, each one its own, so neither hold meets it;
-//! the done check at each claim asks the next of `turn_end::DONE_ANGLES` (a seventh, where one is
+//! (`alab_policy::config::MIN_WORK`) that ends in a done claim, each one its own, so neither hold meets it;
+//! the done check at each claim asks the next of `alab_policy::words::DONE_ANGLES` (a seventh, where one is
 //! typed, the first again), and nothing holds the tab past the sixth. Each done claim is a short
 //! turn whatever work it reports, so the back-off before each check doubles; the run's aterm
 //! takes `--mode ladder`'s seam ([`super::ladder_env`]), the ladder at an eighth, or the sixth
@@ -12,8 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
-use aterm_agent::supervise::policy::go_ahead;
-use aterm_agent::supervise::policy::turn_end::{self, DONE_ANGLES, RULE_DONE_CHECK};
+use alab_policy::go_ahead;
+use alab_policy::words::{DONE_ANGLES, RULE_DONE_CHECK};
 
 use super::surfaces::held::{decided_after, stall_of};
 use super::{PAST_NEXT_STEP_MS, Seen, Verdict, at, git, git_out, lost_after, streak_at};
@@ -25,7 +25,7 @@ pub const CHECKS: usize = DONE_ANGLES.len();
 const JUDGED: usize = CHECKS + 1;
 
 /// The reply to the first prompt: real work, then a done claim, the token line an older primer
-/// taught (`turn_end::FINISHED`), a claim that is no defense.
+/// taught (`alab_policy::words::FINISHED`), a claim that is no defense.
 /// This chain specifically covers claims without a defense (its test asserts that premise).
 /// The current primer's defense is exercised by [`super::CLEAN`] in the other forever chains.
 pub const FIRST: &str = "Implemented the parser module for this repository together with its \
@@ -181,10 +181,10 @@ fn checks(seen: &Seen) -> Vec<(i64, &str)> {
 }
 
 /// Whether check `typed` is the `n`th claim's (counting from 0): it opens with
-/// `turn_end::done_check_words`'s words for `n`, whole or as the person's hour cuts them
+/// `alab_policy::words::done_check_words`'s words for `n`, whole or as the person's hour cuts them
 /// (`go_ahead::unless_held`), whatever suffix follows them.
 fn asks(typed: &str, n: usize) -> bool {
-    let words = turn_end::done_check_words(n);
+    let words = alab_policy::words::done_check_words(n);
     typed.starts_with(&words) || typed.starts_with(go_ahead::unless_held(&words, true).as_ref())
 }
 

@@ -124,6 +124,18 @@ fn session_theme_draws_only_that_session() {
 }
 
 #[test]
+fn an_explicit_clear_commits_even_when_default_and_a_refused_set_does_not() {
+    let mut app = two_sessions("");
+    assert!(!app.pool.theme_decided(1));
+    assert!(set(&mut app, 1, "No Such Theme").is_err());
+    assert!(!app.pool.theme_decided(1));
+    assert!(app.pool.theme(1).is_none());
+    run_on(&mut app, ThemeCtlOp::SessionClear, Some(1)).unwrap();
+    assert!(app.pool.theme_decided(1));
+    assert!(app.pool.theme(1).is_none());
+}
+
+#[test]
 fn a_session_theme_that_does_not_draw_is_refused() {
     let mut app = two_sessions("");
     let before = bg(&app, 1);

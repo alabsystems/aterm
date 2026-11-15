@@ -509,6 +509,7 @@ impl Worker {
         }
         input.coalesced = std::mem::take(&mut state.discarded);
         if let Some(old) = state.input.take() {
+            input.req.jobs_now |= old.req.jobs_now;
             input.coalesced = input
                 .coalesced
                 .saturating_add(old.coalesced)
@@ -740,7 +741,9 @@ fn run(shared: &Shared, core: &mut Core, read: &mut impl FnMut(&mut Core, &Input
             state.required_after = Some(state.required_after.map_or(after, |old| old.max(after)));
             state.need_input = true;
         }
-        let wake = !replies.is_empty() || (input.req.pull && input.req.jobs_now);
+        // A forced edge's result needs publication before queued observations can run, even
+        // when no control pull is waiting to collect it.
+        let wake = !replies.is_empty() || input.req.jobs_now;
         if input.coalesced > 0 {
             aterm_log::info!(
                 "system vitals: jobs observation {} followed {} coalesced pending observations; its original observation time is retained",

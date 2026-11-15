@@ -43,6 +43,9 @@ pub(crate) fn visible_row(t: &Terminal, r: usize) -> String {
 
 pub(crate) use aterm_control::wire::trimmed_len;
 
+#[path = "control_query_read_ready.rs"]
+mod read_ready;
+
 #[path = "control_reveal.rs"]
 mod reveal;
 pub(crate) use reveal::{SpawnMark, cmd_reveal, mark_ctl_spawned, marks_of};
@@ -503,12 +506,16 @@ fn read_dims(
     session: u64,
     proxy: &EventLoopProxy<Wake>,
 ) -> Result<DimsSnapshot, control_media::MainHopError> {
-    control_media::call_main(proxy, |reply| Wake::ReadDims {
-        session,
-        term: Arc::clone(term),
-        reply,
-    })?
-    .map_err(control_media::MainHopError::Reason)
+    read_ready::call_main_ready(
+        proxy,
+        |reply| Wake::ReadDims {
+            session,
+            term: Arc::clone(term),
+            reply,
+        },
+        // This producer's only refusal is a busy grid; no sample was taken in that turn.
+        |answer| Ok(answer.ok()),
+    )
 }
 
 fn try_metrics_dims(term: Option<&Arc<Mutex<Terminal>>>) -> Option<(u32, u32, u64)> {
@@ -2755,6 +2762,7 @@ const fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::
         glow_under_damage: _, // OMITTED: producer-side dirty-row revision for host-owned flame-body quads, not engine cell content
         fire_patch_damage: _, // OMITTED: producer-side dirty-row revision for host-owned fire patches, not engine cell content
         cursor_fill_override: _, // OMITTED: host-owned rainbow-cursor block fill, not engine cell content
+        cursor_keyline_tint: _, // OMITTED: host-owned rainbow-cursor rim keyline, not engine cell content
         bloom_gate: _, // OMITTED: host-owned bloom hold of the cursor effects, not engine cell content
         word_decorations: _, // OMITTED: host-owned sparkle-word decorations, not engine cell content
         ink: _, // OMITTED: host-owned animated-ink fg overrides (render bling), not engine cell content

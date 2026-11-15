@@ -117,7 +117,8 @@ fn machine_readings_continue_while_assessment_is_held() {
 }
 
 /// A completed assessment cannot be overtaken before publication. Pending generations may
-/// coalesce, but their replacement keeps its identity and its original observation time.
+/// coalesce, but their replacement keeps its identity, original observation time and owed forced
+/// jobs look.
 #[test]
 fn assessments_publish_in_order_and_only_unstarted_observations_coalesce() {
     for serial_seed in [0, u64::MAX - 1] {
@@ -140,6 +141,7 @@ fn ordered_assessment_publication(serial_seed: u64) {
             input.serial,
             input.sweep.as_ref().unwrap()[0].start,
             input.coalesced,
+            input.req.jobs_now,
         ))
         .unwrap();
         result
@@ -160,10 +162,15 @@ fn ordered_assessment_publication(serial_seed: u64) {
         input(epoch, now - std::time::Duration::from_secs(2), 22),
         true,
     );
-    lane.read(input(epoch, newest, 33), true);
+    let mut unforced = input(epoch, newest, 33);
+    unforced.req.jobs_now = false;
+    lane.read(unforced, true);
     release.send(()).unwrap();
     wait_ready(&shared, serial(1));
-    assert_eq!(seen.recv_timeout(HANG).unwrap(), (serial(1), Some(11), 0));
+    assert_eq!(
+        seen.recv_timeout(HANG).unwrap(),
+        (serial(1), Some(11), 0, true)
+    );
     assert!(
         matches!(seen.try_recv(), Err(TryRecvError::Empty)),
         "the next generation waits for publication"
@@ -176,7 +183,10 @@ fn ordered_assessment_publication(serial_seed: u64) {
     );
     lane.publish_names(Vec::new());
     wait_ready(&shared, serial(3));
-    assert_eq!(seen.recv_timeout(HANG).unwrap(), (serial(3), Some(33), 1));
+    assert_eq!(
+        seen.recv_timeout(HANG).unwrap(),
+        (serial(3), Some(33), 1, true)
+    );
     {
         let state = shared.lock();
         assert!(
@@ -198,20 +208,126 @@ fn ordered_assessment_publication(serial_seed: u64) {
         !lane.continuous(),
         "a changed process birth revokes the old witness immediately"
     );
-    lane.read(input(epoch, Instant::now(), 33), true);
+    let mut unforced = input(epoch, Instant::now(), 33);
+    unforced.req.jobs_now = false;
+    lane.read(unforced, true);
     assert!(
         !lane.continuous(),
         "returning to old evidence does not restore an invalidated witness"
     );
     lane.publish_names(Vec::new());
     wait_ready(&shared, serial(5));
-    assert_eq!(seen.recv_timeout(HANG).unwrap(), (serial(5), Some(33), 1));
+    assert_eq!(
+        seen.recv_timeout(HANG).unwrap(),
+        (serial(5), Some(33), 1, true)
+    );
     lane.carried();
     assert!(
         lane.continuous(),
         "only another actual assessment restores the witness"
     );
     // Stop while this result still awaits its acknowledgement.
+    lane.at_stop(&[], 0);
+    wait_dead(&shared);
+}
+
+/// A forced non-pull edge must wake its publisher. Its publication acknowledgement releases
+/// the next queued observation, including the agent call's final receipt, without another pull.
+#[test]
+fn forced_edge_publication_releases_queued_call_exit_without_another_pull() {
+    use aterm_vitals::jobs::{ExitOf, JobKind, LeaderExit, Verdict};
+    let (entered, at_gate) = mpsc::sync_channel(1);
+    let (release, go) = mpsc::sync_channel(1);
+    let (saw, seen) = mpsc::channel();
+    let mut world = world::World::new();
+    world.call(1, 300, 400, world::Proc::new(401, 400, "sleep"), None);
+    let mut first = true;
+    let mut lane = Lane::threaded(move |core, input| {
+        assert!(!input.req.pull, "only ordinary host edges were submitted");
+        let live = std::mem::take(&mut first);
+        if live {
+            entered.send(()).unwrap();
+            go.recv_timeout(HANG).unwrap();
+        }
+        let mut ended = Vec::new();
+        let view = core.jobs.scripted(input.reads.observed_at, |engine| {
+            std::mem::swap(engine, &mut world.jobs);
+            let view = if live {
+                let _ = world.tick(2_000);
+                world.tick(2_000)
+            } else {
+                world.exit(401, false);
+                world.exit(400, false);
+                world.exits.push(LeaderExit {
+                    pid: 400,
+                    start: Some(400_007),
+                    end: ExitOf::Code(0),
+                    at_ms: world.at + 1,
+                });
+                world.tick(2_000)
+            };
+            ended = world.jobs.take_ended();
+            std::mem::swap(engine, &mut world.jobs);
+            view
+        });
+        saw.send((input.serial, ended)).unwrap();
+        Reading {
+            jobs: Some(view),
+            jobs_at: core.jobs.observed_at(),
+            ..Reading::default()
+        }
+    });
+    let shared = shared(&lane);
+    let (tx, rx) = mpsc::sync_channel(2);
+    let owner = Arc::new(tx);
+    lane.install_wake(Arc::downgrade(&owner));
+    let now = Instant::now();
+    let epoch = now - std::time::Duration::from_millis(world::T0);
+    let live_at = now - std::time::Duration::from_secs(2);
+    let ended_at = now - std::time::Duration::from_secs(1);
+    lane.read(input(epoch, live_at, 1), true);
+    at_gate.recv_timeout(HANG).unwrap();
+    lane.read(input(epoch, ended_at, 2), true);
+    release.send(()).unwrap();
+    wait_ready(&shared, 1);
+    assert_eq!(
+        lane.work(),
+        Work::Publish,
+        "the forced edge owes publication"
+    );
+    assert!(matches!(
+        rx.recv_timeout(HANG).unwrap(),
+        Msg::AssessmentReady
+    ));
+    let live = lane.carried();
+    assert_eq!(live.jobs_at, Some(live_at));
+    assert_ne!(
+        live.jobs.unwrap().row("a400").unwrap().verdict,
+        Verdict::Exited
+    );
+    assert!(seen.recv_timeout(HANG).unwrap().1.is_empty());
+    lane.publish_names(Vec::new());
+    wait_ready(&shared, 2);
+    assert_eq!(lane.work(), Work::Publish);
+    assert!(matches!(
+        rx.recv_timeout(HANG).unwrap(),
+        Msg::AssessmentReady
+    ));
+    let ended = lane.carried();
+    assert_eq!(ended.jobs_at, Some(ended_at));
+    assert_eq!(
+        ended.jobs.unwrap().row("a400").unwrap().verdict,
+        Verdict::Exited
+    );
+    let (serial, receipts) = seen.recv_timeout(HANG).unwrap();
+    assert_eq!(serial, 2);
+    let calls: Vec<_> = receipts
+        .iter()
+        .filter(|row| row.kind == JobKind::AgentCall)
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].ended_by, Some(ExitOf::Code(0)));
+    lane.publish_names(Vec::new());
     lane.at_stop(&[], 0);
     wait_dead(&shared);
 }

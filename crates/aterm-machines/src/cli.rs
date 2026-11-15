@@ -40,16 +40,17 @@ SET UP
                               at most)
     enroll <address>…|--found [--user <admin>] [--parallel N]
     enroll <address> [--user <admin>] [--name <n>] [--fingerprint <fp>]
-                              install the agent on Macs, at a terminal: you type the
-                              admin's password once for every Mac (held in memory and
-                              piped to each Mac's ssh and sudo); --found adds every Mac
+                              install the agent on Macs with the vault's machines-admin
+                              password (piped to each Mac's ssh and sudo; when this Mac
+                              holds none, the want is filed with the lab's Macs and
+                              enroll stops naming the request); --found adds every Mac
                               scan sees that is not enrolled (one advertising macOS's
                               SFTP or Screen Sharing beside Remote Login, never this
                               Mac); the admin is --user, else the one earlier Macs
-                              enrolled with, else your login name (when the Macs refuse
-                              a name --user did not give, enroll asks for the name once
-                              and retries the typed password); a host key is trusted on
-                              first use unless --fingerprint checks it; a Mac is named
+                              enrolled with, else your login name; a Mac that refuses
+                              the password is skipped on one line; a host key is
+                              trusted on first use unless --fingerprint checks it;
+                              a Mac is named
                               by the tag its Local hostname starts with (m10 of
                               m10-MacBook-Pro-M4-Max-36GB-1TB), or by --name
     unenroll <host> [--unreachable]
@@ -171,18 +172,16 @@ At each Mac, once (the visit no software replaces):
      enroll logs in as the admin earlier Macs enrolled with, else as your login name on
      this Mac (--user <admin> names another), and installs the agent; apply installs
      aterm.app, whose switches step 5 flips, and the rest of the baseline. Many Macs at
-     once, the password typed once for all of them:
+     once, each with the vault's machines-admin password:
        aterm machines enroll --found        (every Mac scan sees, not yet enrolled)
        aterm machines enroll lab-07.local lab-08.local
        aterm machines apply --all
-     Each Mac's ID (its host key fingerprint) is printed before the one password prompt.
+     Each Mac's ID (its host key fingerprint) is printed before the password is sent.
      Trusted on first use, the password goes to whatever answers first (with --found,
      any machine on the LAN advertising a Mac's Remote Login): enroll on a LAN you
-     control. When the Macs refuse the password and --user named none, enroll asks the
-     admin account's name once and tries the same password under it; for each Mac that
-     still refuses, it asks for the password once more. A Mac that cannot be enrolled
-     says why on its own line and the rest go on; the same command again enrolls the
-     ones left (a Mac enrolled already is skipped).
+     control. A Mac that refuses the password (--user names another admin) or cannot be
+     enrolled says why on its own line and the rest go on; the same command again
+     enrolls the ones left (a Mac enrolled already is skipped).
   5. Then, while you are still at the Mac's keyboard:
        aterm machines person lab-07 --here
      It opens the Full Disk Access pane, then the Developer Tools pane, on that Mac's
@@ -541,7 +540,7 @@ fn controller(sys: &dyn System, paths: Paths, verb: &str, args: &[String]) -> Ex
         stderr: std::io::stderr().is_terminal(),
     };
     if verb == "enroll" {
-        return enroll::main(sys, &paths, args, terminals.stdin && terminals.stderr);
+        return enroll::main(sys, &paths, args);
     }
     let o = match parse(verb, args) {
         Ok(o) => o,

@@ -2668,9 +2668,11 @@ fn codex_default_completion_rechecks_identity_roster_and_source() {
                     std::fs::write(&path, format!("{original}held_by = 'm2'\n")).unwrap();
                 }
                 if race == "source" {
-                    let secrets = env.home.as_ref().unwrap().join(".secrets");
-                    std::fs::create_dir_all(&secrets).unwrap();
-                    std::fs::write(secrets.join("ai-accounts-codex.toml"), "[[account]]\nlabel = 'main'\nclass = 'dedicated'\nemail = 'other@example.test'\nmachines = ['m1']\n").unwrap();
+                    crate::vault_entry::put(
+                        env.home.as_ref().unwrap(),
+                        "ai-accounts-codex.toml",
+                        "[[account]]\nlabel = 'main'\nclass = 'dedicated'\nemail = 'other@example.test'\nmachines = ['m1']\n",
+                    );
                 }
                 if race == "policy" {
                     aterm_uds::atomic_file::write(
@@ -2860,7 +2862,6 @@ fn codex_default_completion_preserves_pool_holds_and_local_authority() {
         let env = env_at(&tmp);
         let home = env.home.as_ref().unwrap();
         std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::create_dir_all(home.join(".secrets")).unwrap();
         aterm_uds::atomic_file::write(
             env.config.as_ref().unwrap(),
             ("[fleet]\nmachine = 'm1'\n").as_ref(),
@@ -2869,11 +2870,11 @@ fn codex_default_completion_preserves_pool_holds_and_local_authority() {
         .unwrap();
         let path = tmp.path().join("accounts-codex.toml");
         std::fs::write(&path, "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n").unwrap();
-        let source = home.join(".secrets/ai-pool.toml");
+        let source = "ai-pool.toml";
         let raw = format!(
             "version = 1\n[[account]]\nprovider = 'codex'\nemail = 'owner@example.test'\nwarm = {warm}\n"
         );
-        std::fs::write(&source, &raw).unwrap();
+        crate::vault_entry::put(home, source, &raw);
         let result =
             default_completion::complete(&env, None, |_| Some("owner@example.test".into()));
         assert!(result.is_ok(), "{warm}: {result:?}");
@@ -2881,44 +2882,49 @@ fn codex_default_completion_preserves_pool_holds_and_local_authority() {
             .email
             .is_some();
         assert_eq!(filled, warm == "['m1']", "{warm}");
-        assert_eq!(read(&source), raw);
+        assert_eq!(delivered(home, source), raw);
     }
     for label in ["main", "another-machine"] {
         let tmp = tmp_dir("codex-complete-source-conflict");
         let env = env_at(&tmp);
         let home = env.home.as_ref().unwrap();
         std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::create_dir_all(home.join(".secrets")).unwrap();
         let path = tmp.path().join("accounts-codex.toml");
         std::fs::write(&path, "[[account]]\nlabel = 'main'\nclass = 'dedicated'\n").unwrap();
-        let source = home.join(".secrets/ai-accounts-codex.toml");
+        let source = "ai-accounts-codex.toml";
         let raw = format!(
             "[[account]]\nlabel = '{label}'\nemail = 'other@example.test'\nmachines = ['m2']\n"
         );
-        std::fs::write(&source, &raw).unwrap();
+        crate::vault_entry::put(home, source, &raw);
         let result =
             default_completion::complete(&env, None, |_| Some("owner@example.test".into()));
         assert_eq!(result.is_ok(), label != "main", "{result:?}");
-        assert_eq!(read(&source), raw);
+        assert_eq!(delivered(home, source), raw);
     }
+}
+
+/// The text of the vault entry `name` under `home`, read in place.
+fn delivered(home: &Path, name: &str) -> String {
+    crate::vault_entry::read_text(home, name, 4 << 20)
+        .text()
+        .expect("a delivered entry")
+        .to_owned()
 }
 
 /// The sheet at `tmp`'s home whose one line gives `address`'s account to `computer`, in the column
 /// `cells` fills, with this Mac named m16.
 fn sheet_of_other_macs(tmp: &Tmp, env: &Env, cells: &str, address: &str, computer: &str) {
-    let secrets = tmp.path().join("home/.secrets");
     let config = env.config.clone().expect("a config path");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     aterm_uds::atomic_file::write(&config, b"[fleet]\nmachine = \"m16\"\n", 0o600).unwrap();
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
-    std::fs::write(
-        secrets.join(crate::harness::accounts_sync::ACCOUNTS_CSV_FILE),
+    crate::vault_entry::put(
+        &tmp.path().join("home"),
+        crate::harness::accounts_sync::ACCOUNTS_CSV_FILE,
         format!(
             "m,email,computer,,claude,Open AI,xai,kimi,google,meta,Payment,notes\n\
              ,{address},{computer},,{cells},,,,\n"
         ),
-    )
-    .unwrap();
+    );
 }
 
 /// A host with nobody at it whose sign-ins each stop at a bot-check, recording the rows they were

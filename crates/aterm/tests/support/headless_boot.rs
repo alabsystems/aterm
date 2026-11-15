@@ -100,43 +100,162 @@ pub fn remove_world(root: &Path) {
     }
 }
 
-/// The instance's descendants as `ps` shows them now.
+/// The instance's descendants now, one `pid ppid stat command` row each, read process by process
+/// from the kernel (macOS `proc_listchildpids`, `proc_pidinfo` and `KERN_PROCARGS2`, Linux
+/// `/proc/<pid>/task/*/children`, `stat` and `cmdline`): never a whole-process-table `ps`, whose
+/// read can wait behind every process on a loaded Mac and hang the failure report it serves. A
+/// process whose children could not be listed (refused, gone, past the 255 macOS lists at once, or
+/// a platform with no per-process listing) says so in its row, `children unread`: an unread list
+/// is never shown as no children.
 #[cfg(unix)]
 pub fn process_tree(inst: &Instance) -> String {
-    let out = std::process::Command::new(aterm_uds::os_path!("ps"))
-        .args(["-axo", "pid=,ppid=,stat=,wchan=,etime=,command="])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(out) = out else {
-        return String::new();
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let rows: Vec<(u32, u32, &str)> = text
-        .lines()
-        .filter_map(|line| {
-            let mut it = line.split_whitespace();
-            let (pid, ppid) = (it.next()?.parse().ok()?, it.next()?.parse().ok()?);
-            Some((pid, ppid, line.trim()))
-        })
+    let (walked, cut) = descendants(inst);
+    let mut rows: Vec<String> = walked
+        .iter()
+        .map(|&(pid, kids_unread)| process_row(pid, kids_unread))
         .collect();
-    let mut under = std::collections::BTreeSet::from([inst.child.id()]);
-    loop {
-        let before = under.len();
-        for &(pid, ppid, _) in &rows {
-            if under.contains(&ppid) {
-                under.insert(pid);
-            }
-        }
-        if under.len() == before {
-            break;
-        }
+    if cut {
+        rows.push(format!("... cut at {MOST_DESCENDANTS} processes"));
     }
-    rows.iter()
-        .filter(|(pid, _, _)| under.contains(pid))
-        .map(|(_, _, line)| (*line).chars().take(200).collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n")
+    rows.join("\n")
+}
+
+/// The pid of the instance's first descendant whose whole command line is `command` (its argument
+/// words joined by spaces, as a [`process_tree`] row ends), read as that tree is. A test names a
+/// command here and never a column of a row: the row's layout is this file's to change, and a
+/// reader that counted its columns waited out its whole budget when `wchan` and `etime` left it.
+#[cfg(unix)]
+pub fn descendant_running(inst: &Instance, command: &str) -> Option<u32> {
+    descendants(inst)
+        .0
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .find(|&pid| process_command(pid).as_deref() == Some(command))
+}
+
+/// Enough processes for any instance's tree; a runaway tree is cut there, and
+/// [`process_tree`] says so in its last row.
+#[cfg(unix)]
+const MOST_DESCENDANTS: usize = 512;
+
+/// The instance and its descendants, a parent before its children, each with whether its
+/// children could not be listed; and whether the walk was cut at [`MOST_DESCENDANTS`].
+#[cfg(unix)]
+fn descendants(inst: &Instance) -> (Vec<(u32, bool)>, bool) {
+    let mut walked = Vec::new();
+    let mut next = vec![inst.child.id()];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(pid) = next.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if walked.len() == MOST_DESCENDANTS {
+            return (walked, true);
+        }
+        let kids = children_of(pid);
+        walked.push((pid, kids.is_none()));
+        let mut kids = kids.unwrap_or_default();
+        kids.sort_unstable_by(|a, b| b.cmp(a));
+        next.extend(kids);
+    }
+    (walked, false)
+}
+
+/// `pid`'s children, read from the kernel for that one process; `None` where they could not be
+/// listed (refused, gone, or past 255).
+#[cfg(target_os = "macos")]
+fn children_of(pid: u32) -> Option<Vec<u32>> {
+    aterm_sysprobe::jobs::child_pids(pid)
+}
+
+/// `pid`'s children, read from the kernel for that one process; `None` where they could not be
+/// listed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn children_of(pid: u32) -> Option<Vec<u32>> {
+    let mut kids = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()? {
+        let listed = std::fs::read_to_string(task.ok()?.path().join("children")).ok()?;
+        kids.extend(
+            listed
+                .split_whitespace()
+                .filter_map(|kid| kid.parse::<u32>().ok()),
+        );
+    }
+    Some(kids)
+}
+
+/// `pid`'s children: this platform has no per-process listing here, so they are unread.
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+fn children_of(_pid: u32) -> Option<Vec<u32>> {
+    None
+}
+
+/// `pid ppid stat command` for one process, `?` for what could not be read, closed by
+/// `[children unread]` where its children could not be listed.
+#[cfg(unix)]
+fn process_row(pid: u32, kids_unread: bool) -> String {
+    let id = i32::try_from(pid).unwrap_or(-1);
+    let ppid = aterm_uds::process::read_process_parent(id)
+        .map_or_else(|| "?".to_string(), |p| p.to_string());
+    let command = process_command(pid).unwrap_or_else(|| {
+        aterm_uds::process::read_process_path(id)
+            .map_or_else(|| "?".to_string(), |p| p.display().to_string())
+    });
+    let mut row: String = format!("{pid} {ppid} {} {command}", process_stat(id))
+        .chars()
+        .take(200)
+        .collect();
+    if kids_unread {
+        row.push_str(" [children unread]");
+    }
+    row
+}
+
+/// `pid`'s argument words, as `ps`'s `command` column shows them, read for that one process.
+#[cfg(target_os = "macos")]
+fn process_command(pid: u32) -> Option<String> {
+    let record = aterm_uds::procargs::read(pid).ok()?;
+    let args = aterm_uds::procargs::parse(&record)?;
+    let words: Vec<String> = args
+        .argv
+        .iter()
+        .map(|word| String::from_utf8_lossy(word).into_owned())
+        .collect();
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// `pid`'s argument words, as `ps`'s `command` column shows them, read for that one process.
+#[cfg(not(target_os = "macos"))]
+fn process_command(pid: u32) -> Option<String> {
+    let line = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let words: Vec<String> = line
+        .split(|b| *b == 0)
+        .filter(|word| !word.is_empty())
+        .map(|word| String::from_utf8_lossy(word).into_owned())
+        .collect();
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// `pid`'s run state as `ps` spells it (`R`, `S`, `T`, `Z`, ...), `?` where it cannot be read.
+#[cfg(target_os = "macos")]
+fn process_stat(pid: i32) -> char {
+    aterm_uds::process::read_short_info(pid).map_or('?', |info| match info.pbsi_status {
+        1 => 'I',
+        2 => 'R',
+        3 => 'S',
+        4 => 'T',
+        5 => 'Z',
+        _ => '?',
+    })
+}
+
+/// `pid`'s run state as `/proc/<pid>/stat` spells it, `?` where it cannot be read.
+#[cfg(not(target_os = "macos"))]
+fn process_stat(pid: i32) -> char {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(')')?.1.trim_start().chars().next())
+        .unwrap_or('?')
 }
 
 /// The tail of the instance log, for failure diagnostics.

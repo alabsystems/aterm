@@ -790,14 +790,99 @@ fn an_owner_reports_a_standing_refusal_once_with_its_error() {
     }
 }
 
+/// A dial scheduler that ends with none to follow it at once leaves no promise standing: a
+/// serving generation that fails (here, with Commons turned off) and presence-only serving,
+/// which dials nothing, each count every earlier contact's lease from the contact, two minutes
+/// at most ([`unscheduled`]). A peer contacted 200 s before a later generation's first look
+/// therefore reads LastSeen there, not Reachable on what the ended scheduler promised it.
+///
+/// NEGATIVE CONTROL (run here): with `UNSCHEDULED_KEEPS`, each reads Reachable.
+#[test]
+fn a_scheduler_that_ends_with_none_to_follow_leaves_no_promise_standing() {
+    use aterm_types::network_state::Reachability;
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::locate_for_home(home.path());
+    let off = home.path().join("off.toml");
+    fsx::write_atomic(&off, b"[commons]\nenabled=false\n", 0o600).unwrap();
+    let on = home.path().join("on.toml");
+    fsx::write_atomic(&on, b"[commons]\nenabled=true\n", 0o600).unwrap();
+    for keeps in [false, true] {
+        for presence in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let handle = ObservationHandle::default();
+            let mut observer = Observer::open(&root.path().join("config"), handle.clone()).unwrap();
+            let start = Instant::now();
+            let identity = MachineIdentity {
+                machine_id: [31; 16],
+                incarnation: [6; 16],
+                label: None,
+            };
+            observer.contact(identity, 1000, start, Duration::from_secs(660));
+            // Commons answers nothing here and opens no socket: the serve ends as it starts.
+            let network = Network {
+                isolated: Some(auto_sync_tests::Attachment::new(0)),
+                open_fails: true,
+                ..Network::default()
+            };
+            let stop = Stop::default();
+            UNSCHEDULED_KEEPS.with(|flag| flag.set(keeps));
+            let ended = if presence {
+                serve_presence(
+                    (&paths, &on),
+                    None,
+                    &stop,
+                    &mut |_| {},
+                    &mut observer,
+                    &network,
+                )
+            } else {
+                serve(
+                    &paths,
+                    &off,
+                    &stop,
+                    &mut |_| {},
+                    &mut observer,
+                    &network,
+                    &|_| {},
+                )
+            };
+            UNSCHEDULED_KEEPS.with(|flag| flag.set(false));
+            let status = if presence {
+                Status::Offline
+            } else {
+                Status::Disabled
+            };
+            assert_eq!(ended, Err(status), "presence {presence}");
+            // The next generation starts 200 s after the contact and looks at once.
+            let later = start + Duration::from_secs(200);
+            observer.curtail(later, Since::Now);
+            observer.observe(Visibility::Active, 0, "test", 201_000, later);
+            assert_eq!(
+                handle.snapshot().peers[0].reachability,
+                if keeps {
+                    Reachability::Reachable
+                } else {
+                    Reachability::LastSeen
+                },
+                "presence {presence}, keeps {keeps}"
+            );
+        }
+    }
+}
+
 #[test]
 fn delayed_worker_completion_does_not_refresh_old_authentication() {
     let root = aterm_tempfile::tempdir().unwrap();
     let handle = crate::network_state::ObservationHandle::default();
     let mut observer = Observer::open(&root.path().join("config"), handle.clone()).unwrap();
     let authenticated = Instant::now();
-    let completed = authenticated + Duration::from_secs(60);
-    let at_ms = contact_time(61_000, completed, authenticated);
+    // The round ends as long after it authenticated as its contact was promised the next one:
+    // counted from the authentication the promise has run out, counted from the completion it
+    // would have all of it left.
+    let promise = discovery::Hints::promise();
+    let completed = authenticated + promise;
+    let completed_ms = 1000 + promise.as_millis() as u64;
+    let at_ms = contact_time(completed_ms, completed, authenticated);
     assert_eq!(at_ms, 1000);
     observer.contact(
         MachineIdentity {
@@ -807,8 +892,9 @@ fn delayed_worker_completion_does_not_refresh_old_authentication() {
         },
         at_ms,
         authenticated,
+        promise,
     );
-    observer.observe(Visibility::Active, 0, "ok", 61_000, completed);
+    observer.observe(Visibility::Active, 0, "ok", completed_ms, completed);
     assert_eq!(
         handle.snapshot().peers[0].reachability,
         aterm_types::network_state::Reachability::LastSeen
@@ -818,6 +904,45 @@ fn delayed_worker_completion_does_not_refresh_old_authentication() {
         0,
         "invalid wall mapping is unknown, not a fresh timestamp"
     );
+}
+
+/// A serving loop reads a sleep where the wall clock moved on by more than ten seconds over
+/// what the steady clock counted between two ticks, and only there: clocks in step, a loop
+/// that was slow while both ran, a wall clock set back and one that cannot be read tell none,
+/// and a sleep is told once, with what the wall clock counted over the steady one.
+#[test]
+fn a_serving_loop_reads_a_sleep_where_the_wall_clock_outran_the_steady_one() {
+    let start = Instant::now();
+    let mut wake = Wake::default();
+    let hour = 3_600_000;
+    for (second, wall_ms, woke, what) in [
+        (0, Some(1_000_000), None, "the first tick"),
+        (2, Some(1_002_000), None, "in step"),
+        (4, Some(1_014_000), None, "ten seconds ahead and no more"),
+        (6, Some(1_026_001), Some(10_001), "over ten seconds ahead"),
+        (8, Some(1_028_001), None, "told once"),
+        (10, Some(900_000), None, "set back"),
+        (
+            3610,
+            Some(900_000 + hour),
+            None,
+            "a slow loop: both clocks ran",
+        ),
+        (3612, None, None, "no wall clock"),
+        (3614, Some(99_000_000), None, "nothing to compare with"),
+        (
+            3616,
+            Some(99_000_000 + 8 * hour),
+            Some(8 * hour - 2000),
+            "a night's sleep",
+        ),
+    ] {
+        assert_eq!(
+            wake.woke(start + Duration::from_secs(second), wall_ms),
+            woke.map(Duration::from_millis),
+            "{what}"
+        );
+    }
 }
 
 #[test]
@@ -839,6 +964,7 @@ fn the_hearing_ledger_keeps_a_version_at_its_round_and_the_contact_that_came_aft
     let crossed = transport::Contact {
         actor: [7; 48],
         at: after(4),
+        lease: discovery::Hints::promise(),
         said: Said::Version(Version::own()),
         said_at: after(0),
         clock: None,
@@ -848,6 +974,7 @@ fn the_hearing_ledger_keeps_a_version_at_its_round_and_the_contact_that_came_aft
     let silent = transport::Contact {
         actor: [8; 48],
         at: after(3),
+        lease: discovery::Hints::promise(),
         said: Said::Unknown,
         said_at: after(3),
         clock: None,

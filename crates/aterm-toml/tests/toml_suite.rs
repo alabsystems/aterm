@@ -15,4 +15,5 @@ mod edit;
 mod fuzz;
 mod roundtrip;
 mod spec;
+mod toml11;
 mod typed;

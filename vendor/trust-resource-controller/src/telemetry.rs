@@ -46,7 +46,7 @@ pub struct TelemetryReply {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TelemetryResponse {
-    Ready(TelemetryReply),
+    Ready(Box<TelemetryReply>),
     Unavailable(ContextUnavailable),
 }
 
@@ -168,7 +168,7 @@ impl TelemetryResponse {
     }
     pub fn decode(bytes: &[u8], query: &TelemetryQuery) -> io::Result<Self> {
         if header(bytes, 10).is_ok() {
-            return TelemetryReply::decode(bytes, query).map(Self::Ready);
+            return TelemetryReply::decode(bytes, query).map(Box::new).map(Self::Ready);
         }
         let mut d = header(bytes, 11)?;
         let value = ContextUnavailable::decode(&d.bytes()?, &query.query)?;

@@ -1024,7 +1024,7 @@ fn a_hosted_off_pane_wears_the_border_and_rewrites_with_it() {
         .expect("the claim");
         assert!(app.set_session_autopilot(
             session,
-            Some(aterm_agent::supervise::Autopilot::Off),
+            Some(alab_policy::config::Autopilot::Off),
             crate::autopilot::Surface::Chip
         ));
         crate::session_timeline::release_supervisor(

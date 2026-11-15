@@ -30,20 +30,34 @@ fn observation(usage: Rusage) -> AccountingObservation {
 /// status with explicitly absent fields; ownership errors never fabricate one.
 pub(crate) fn try_reap(
     child: &mut Child,
-    accounted: bool,
+    _accounted: bool,
 ) -> io::Result<Option<(ExitStatus, AccountingObservation)>> {
-    if !accounted {
-        return child
-            .try_wait()
-            .map(|status| status.map(|status| (status, AccountingObservation::uncollected())));
-    }
-    match child.try_wait_with_rusage() {
+    // The resource monitor always retains the original owning wait's account. Public
+    // lifecycle encoding still depends on the caller's explicitly negotiated protocol.
+    let mut observed = crate::resource_observation::native_observation_guard();
+    // WNOWAIT establishes exit while the original child remains unreaped. A running child's
+    // earlier counter can never be mislabeled final because it exits during try_wait.
+    let exited = match child.exited() {
+        Ok(false) => return Ok(None),
+        Ok(true) => true,
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => false,
+        Err(error) => return Err(error),
+    };
+    let exit_cut_ns = exited.then(aterm_uds::process::continuous_ns).flatten();
+    let final_usage = exited
+        .then(|| aterm_sysprobe::procs::process_usage(child.id()))
+        .flatten();
+    let result = match child.try_wait_with_rusage() {
         Ok(usage) => Ok(usage.map(|usage| (usage.status, observation(usage)))),
         Err(error) if error.kind() == io::ErrorKind::Unsupported => child
             .try_wait()
             .map(|status| status.map(|status| (status, AccountingObservation::uncollected()))),
         Err(error) => Err(error),
+    };
+    if let Ok(Some((_, accounting))) = &result {
+        observed.reaped_at(child.id(), *accounting, final_usage, exit_cut_ns);
     }
+    result
 }
 
 #[cfg(all(

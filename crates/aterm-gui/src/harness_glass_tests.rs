@@ -5,7 +5,7 @@
 
 use super::*;
 
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 
 use crate::autopilot::AutopilotView;
 use crate::claude_lights::autopilot_title;
@@ -401,7 +401,7 @@ fn serious_mode_and_acts_off_light_nothing_and_keep_the_trail() {
 #[test]
 fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
     let t0 = Instant::now();
-    let cruise = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip;
+    let cruise = crate::autopilot::mode_words(alab_policy::config::Autopilot::Cruise).chip;
     let today = T0_UNIX.div_euclid(86_400);
     let mut g = SessionGlass::default();
     let whole = |g: &SessionGlass, now: i64| {
@@ -719,8 +719,8 @@ fn a_pause_moves_the_read_title_and_nothing_at_rest() {
 fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
     use crate::claude_lights::lean_titles;
     let (cruise, land) = (
-        crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip,
-        crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Land).chip,
+        crate::autopilot::mode_words(alab_policy::config::Autopilot::Cruise).chip,
+        crate::autopilot::mode_words(alab_policy::config::Autopilot::Land).chip,
     );
     let pause = paused(18, 41, FRI, 3);
     let glass = ChipGlass {

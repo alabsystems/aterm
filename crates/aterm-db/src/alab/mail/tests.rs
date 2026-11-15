@@ -299,32 +299,37 @@ fn a_protected_address_never_resolves_a_mailbox() {
 }
 
 /// A sign-in's mailbox from registry rows alone (step A9): the MAILBOX row names its login by
-/// the address row, and its patterns, webmail and held credentials, never a value.
+/// the address row, and its patterns, webmail and held credentials, never a value; each value is
+/// read from the secret-store entry its `SecretRef` cell names.
 mod sign_in {
     use super::*;
     use crate::{
         alab::{registry::MAILBOX, secret::Journal},
         typed::{
             grid::tests::elem,
-            secret::{Fixed, Sealer, Secret},
+            secret::{Memory, Secret, reference},
         },
     };
 
-    const TABLE: &str = "alab/registry";
+    const TABLE: &str = "alab/registry.3";
+    const LOGIN_PASS: &str = "fixture-login-pass";
+    const SECOND_PASS: &str = "fixture-second-pass";
+    const TOTP: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
-    fn sealed(collection: &str, row: &str, column: &str, value: &str) -> Value {
-        json!(
-            Fixed(TABLE)
-                .seal(collection, row, column, &Secret::new(value.to_owned()))
-                .unwrap()
-        )
+    /// Put `value` into `store` under the cell's own entry and return the reference its cell
+    /// holds, as a landed write leaves it.
+    fn stored(store: &Memory, collection: &str, row: &str, column: &str, value: &str) -> Value {
+        use crate::typed::secret::Store as _;
+        let entry = crate::typed::secret::entry_name(collection, column, row).unwrap();
+        store.put(&entry, &Secret::new(value.to_owned())).unwrap();
+        reference(Memory::VAULT, &entry)
     }
 
     struct Fixture {
         book: Book,
+        store: Memory,
         login: String,
         mailbox: String,
-        member: String,
     }
 
     /// Every value is synthetic: an `example.test` login and fixture credentials.
@@ -332,6 +337,7 @@ mod sign_in {
         let login = pk("owner");
         let member = pk("ai1");
         let mailbox = keys::mailbox_pk(&login).unwrap();
+        let store = Memory::default();
         let mut book = Book::new();
         book.write(
             1,
@@ -342,7 +348,7 @@ mod sign_in {
                     &ADDRESS,
                     &login,
                     "password",
-                    sealed("address", &login, "password", "fixture-login-pass"),
+                    stored(&store, "address", &login, "password", LOGIN_PASS),
                 ),
                 put(&ADDRESS, &member, "addr", json!("ai1@example.test")),
                 put(&MAILBOX, &mailbox, "label", json!("proton-1")),
@@ -359,23 +365,13 @@ mod sign_in {
                     &MAILBOX,
                     &mailbox,
                     "mailbox_password",
-                    sealed(
-                        "mailbox",
-                        &mailbox,
-                        "mailbox_password",
-                        "fixture-second-pass",
-                    ),
+                    stored(&store, "mailbox", &mailbox, "mailbox_password", SECOND_PASS),
                 ),
                 put(
                     &MAILBOX,
                     &mailbox,
                     "totp",
-                    sealed(
-                        "mailbox",
-                        &mailbox,
-                        "totp",
-                        "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
-                    ),
+                    stored(&store, "mailbox", &mailbox, "totp", TOTP),
                 ),
                 elem(&MAILBOX, &mailbox, "receives", &member),
                 put(
@@ -388,9 +384,9 @@ mod sign_in {
         );
         Fixture {
             book,
+            store,
             login,
             mailbox,
-            member,
         }
     }
 
@@ -405,6 +401,7 @@ mod sign_in {
     fn reveal_all(
         addresses: &Projection,
         mailboxes: &Projection,
+        store: &Memory,
         journal: &Journal,
         mailbox: &str,
     ) -> Vec<std::result::Result<String, Withheld>> {
@@ -419,7 +416,8 @@ mod sign_in {
                 reveal_in(
                     addresses,
                     mailboxes,
-                    &Fixed(TABLE),
+                    TABLE,
+                    store,
                     journal,
                     ask,
                     str::to_owned,
@@ -429,18 +427,26 @@ mod sign_in {
             .collect()
     }
 
+    fn journal_lines(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("reveals.jsonl"))
+            .map(|log| log.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
     /// The mailbox reads its login, webmail, patterns and held credentials from its rows, and
-    /// each credential reveals through the sealer, journalled once, with no value in the journal.
+    /// each credential reveals from the store entry its cell names, journalled once, with no
+    /// value in the journal or the table.
     /// NEGATIVE CONTROL: with [`mailboxes`] reading the login from the MAILBOX row's own `label`
     /// instead of its `login` address row, the login reads `proton-1` and the assertion on
-    /// `owner@example.test` fails.
+    /// `owner@example.test` fails; a value written into a cell instead of the store shows up in
+    /// the table's cells and fails the last loop.
     #[test]
     fn a_sign_in_reads_the_login_and_its_credentials_from_registry_rows() {
         let Fixture {
             book,
+            store,
             login,
             mailbox,
-            member,
         } = fixture();
         let (addresses, mailboxes_rows) = projections(&book);
         let found = mailboxes(&addresses, &mailboxes_rows);
@@ -460,45 +466,52 @@ mod sign_in {
             "exact, then domain, then any"
         );
         assert_eq!(only.held, Credential::ALL);
-        let _ = member;
 
         let dir = aterm_tempfile::tempdir().unwrap();
         let journal = Journal::at(dir.path());
         assert_eq!(
-            reveal_all(&addresses, &mailboxes_rows, &journal, &mailbox),
+            reveal_all(&addresses, &mailboxes_rows, &store, &journal, &mailbox),
             [
-                Ok("fixture-login-pass".to_owned()),
-                Ok("fixture-second-pass".to_owned()),
-                Ok("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_owned()),
+                Ok(LOGIN_PASS.to_owned()),
+                Ok(SECOND_PASS.to_owned()),
+                Ok(TOTP.to_owned()),
             ]
         );
-        let log = std::fs::read_to_string(dir.path().join("reveals.jsonl")).unwrap();
-        assert_eq!(log.lines().count(), 3, "one record per reveal");
-        assert!(log.lines().all(|line| line.contains("SignIn")));
-        for value in ["fixture-login-pass", "fixture-second-pass", "GEZDGNBVGY3TQ"] {
+        let log = journal_lines(dir.path());
+        assert_eq!(log.len(), 3, "one record per reveal");
+        assert!(log.iter().all(|line| line.contains("SignIn")));
+        let log = log.concat();
+        assert!(log.contains(&login) && log.contains(&mailbox) && log.contains(TABLE));
+        let cells = format!("{:?}", book.cells());
+        for value in store.every() {
             assert!(
-                !log.contains(value),
+                !log.contains(&value),
                 "the journal holds coordinates, never a value"
             );
+            assert!(
+                !cells.contains(&value),
+                "a cell names its entry, never holds the value"
+            );
         }
-        assert!(log.contains(&login) && log.contains(&mailbox));
     }
 
-    /// Two writes of one password under fresh nonces are one value; two different values are
-    /// withheld until the owner picks one, an empty cell says so, and a mailbox whose login row
-    /// is retired is no sign-in's. Nothing withheld reaches the journal.
-    /// NEGATIVE CONTROL: with the candidate comparison in [`reveal_in`] removed (the first token
-    /// always revealed), the two-values assertion reads `Ok("fixture-other")`.
+    /// Two entries holding one value are one value: Macs that rolled one value from different
+    /// candidates name different entries for it, so a sign-in reads every entry the candidates
+    /// name before it withholds anything; one missing from the store withholds the cell.
+    /// NEGATIVE CONTROL: with `open_credential` withholding any second reference unread (before
+    /// the fix), `` left: Err(TwoValues) right: Ok("…") ``.
     #[test]
-    fn two_values_are_withheld_and_a_retired_login_is_no_mailbox() {
+    fn two_entries_holding_one_value_are_one_value() {
         let Fixture {
             mut book,
+            store,
             login,
             mailbox,
-            ..
         } = fixture();
-        // Two other Macs write, each unaware of the first's write: concurrent candidates. One
-        // writes the same login password under a fresh nonce, the other a different second one.
+        let twin = crate::typed::secret::test_entry(("address", "password", &login), 3);
+        store
+            .put(&twin, &Secret::new(LOGIN_PASS.to_owned()))
+            .unwrap();
         book.write(
             2,
             &[],
@@ -506,9 +519,44 @@ mod sign_in {
                 &ADDRESS,
                 &login,
                 "password",
-                sealed("address", &login, "password", "fixture-login-pass"),
+                reference(Memory::VAULT, &twin),
             )],
         );
+        let (addresses, mailboxes_rows) = projections(&book);
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let journal = Journal::at(dir.path());
+        let got = reveal_all(&addresses, &mailboxes_rows, &store, &journal, &mailbox);
+        assert_eq!(got[0], Ok(LOGIN_PASS.to_owned()));
+        store.remove(&twin).unwrap();
+        let got = reveal_all(&addresses, &mailboxes_rows, &store, &journal, &mailbox);
+        assert_eq!(got[0], Err(Withheld::NotInStore));
+    }
+
+    /// Two Macs writing the same reference are one value; references to two different values are
+    /// withheld until the owner picks one, an empty cell says so, and a mailbox whose login row is retired
+    /// is no sign-in's. Nothing withheld reaches the journal.
+    /// NEGATIVE CONTROL: with the value comparison in `open_credential` removed (the first
+    /// candidate always read), the two-values assertion reads `Ok(…)`.
+    #[test]
+    fn two_values_are_withheld_and_a_retired_login_is_no_mailbox() {
+        let Fixture {
+            mut book,
+            store,
+            login,
+            mailbox,
+        } = fixture();
+        // Two other Macs write, each unaware of the first's write: concurrent candidates. One
+        // writes the same login reference, the other a reference to a different entry.
+        let same = reference(
+            Memory::VAULT,
+            &crate::typed::secret::entry_name("address", "password", &login).unwrap(),
+        );
+        book.write(2, &[], vec![put(&ADDRESS, &login, "password", same)]);
+        let elsewhere =
+            crate::typed::secret::test_entry(("mailbox", "mailbox_password", &mailbox), 2);
+        store
+            .put(&elsewhere, &Secret::new("fixture-other".to_owned()))
+            .unwrap();
         book.write(
             3,
             &[],
@@ -516,23 +564,22 @@ mod sign_in {
                 &MAILBOX,
                 &mailbox,
                 "mailbox_password",
-                sealed("mailbox", &mailbox, "mailbox_password", "fixture-other"),
+                reference(Memory::VAULT, &elsewhere),
             )],
         );
         let (addresses, mailboxes_rows) = projections(&book);
         let dir = aterm_tempfile::tempdir().unwrap();
         let journal = Journal::at(dir.path());
-        let got = reveal_all(&addresses, &mailboxes_rows, &journal, &mailbox);
+        let got = reveal_all(&addresses, &mailboxes_rows, &store, &journal, &mailbox);
         assert_eq!(
             got[0],
-            Ok("fixture-login-pass".to_owned()),
-            "equal values are one"
+            Ok(LOGIN_PASS.to_owned()),
+            "one reference is one value"
         );
         assert_eq!(got[1], Err(Withheld::TwoValues));
-        assert_eq!(got[2], Ok("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_owned()));
-        let log = std::fs::read_to_string(dir.path().join("reveals.jsonl")).unwrap();
+        assert_eq!(got[2], Ok(TOTP.to_owned()));
         assert_eq!(
-            log.lines().count(),
+            journal_lines(dir.path()).len(),
             2,
             "a withheld value is never journalled"
         );
@@ -552,32 +599,89 @@ mod sign_in {
         let (addresses, mailboxes_rows) = projections(&empty);
         assert!(mailboxes(&addresses, &mailboxes_rows)[0].held.is_empty());
         assert_eq!(
-            reveal_all(&addresses, &mailboxes_rows, &journal, &mailbox)[0],
+            reveal_all(&addresses, &mailboxes_rows, &store, &journal, &mailbox)[0],
             Err(Withheld::NotSet)
         );
         empty.write(1, &[], vec![put(&ADDRESS, &login, "row", json!("retired"))]);
         let (addresses, mailboxes_rows) = projections(&empty);
         assert!(mailboxes(&addresses, &mailboxes_rows).is_empty());
         assert_eq!(
-            reveal_all(&addresses, &mailboxes_rows, &journal, &mailbox)[0],
+            reveal_all(&addresses, &mailboxes_rows, &store, &journal, &mailbox)[0],
             Err(Withheld::NoMailbox)
         );
+        assert_eq!(journal_lines(dir.path()).len(), 2);
+    }
+
+    /// A candidate naming an entry that is not its cell's own (another credential in the same
+    /// vault, which a writer that skipped the write check stored) or its own entry in another
+    /// vault is withheld as `NotOwnEntry`: the store is never asked for it, nothing is handed on
+    /// and nothing is journalled.
+    /// NEGATIVE CONTROL: the store holds the other credential, so with `open_credential` reading
+    /// `entry_of` unchecked the sign-in receives it: `` the sign-in read another entry ``.
+    #[test]
+    fn a_reference_to_an_entry_the_cell_does_not_own_is_never_read() {
+        let Fixture {
+            mut book,
+            store,
+            login,
+            mailbox,
+        } = fixture();
+        store
+            .put(
+                "gh_access_token",
+                &Secret::new("fixture-api-key".to_owned()),
+            )
+            .unwrap();
+        let own = crate::typed::secret::entry_name("address", "password", &login).unwrap();
+        let stray = |x: Value| crate::database::Change {
+            collection: ADDRESS.name.to_owned(),
+            key: format!("{login}.password"),
+            value: Some(cell::CellValue::owner(ADDRESS.version, x).encode()),
+        };
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let journal = Journal::at(dir.path());
+        for (n, x) in [
+            reference(Memory::VAULT, "gh_access_token"),
+            reference("other-vault", &own),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            book.write(1, &[], vec![stray(x)]);
+            let (addresses, mailboxes_rows) = projections(&book);
+            let got = reveal_all(&addresses, &mailboxes_rows, &store, &journal, &mailbox);
+            assert_ne!(
+                got[0],
+                Ok("fixture-api-key".to_owned()),
+                "the sign-in read another entry"
+            );
+            assert_eq!(got[0], Err(Withheld::NotOwnEntry), "case {n}");
+        }
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("reveals.jsonl"))
-                .unwrap()
-                .lines()
-                .count(),
-            2
+            journal_lines(dir.path()).len(),
+            4,
+            "only the two cells that name their own entries were journalled, twice each"
         );
     }
 
-    /// A token another table's sealer wrote does not open here: withheld as `Unopened`.
+    /// A reference whose entry this Mac's store lacks is withheld as `NotInStore`: no value is
+    /// handed on and nothing is journalled.
+    /// NEGATIVE CONTROL: with `open_credential` journalling or consuming before the store read
+    /// answers, `consumed` is set or the journal holds a line.
     #[test]
-    fn a_cell_that_does_not_open_here_is_withheld() {
-        let Fixture { book, mailbox, .. } = fixture();
+    fn a_reference_the_store_lacks_reveals_nothing_and_journals_nothing() {
+        let Fixture {
+            book,
+            store,
+            mailbox,
+            ..
+        } = fixture();
         let (addresses, mailboxes_rows) = projections(&book);
+        let entry = crate::typed::secret::entry_name("mailbox", "totp", &mailbox).unwrap();
+        store.remove(&entry).unwrap();
         let dir = aterm_tempfile::tempdir().unwrap();
         let journal = Journal::at(dir.path());
+        let mut consumed = false;
         let ask = Ask {
             mailbox: &mailbox,
             which: Credential::Totp,
@@ -587,14 +691,141 @@ mod sign_in {
             reveal_in(
                 &addresses,
                 &mailboxes_rows,
-                &Fixed("alab/other"),
+                TABLE,
+                &store,
+                &journal,
+                ask,
+                |_| consumed = true,
+            )
+            .unwrap(),
+            Err(Withheld::NotInStore)
+        );
+        assert!(!consumed, "nothing reached the sign-in");
+        assert!(
+            journal_lines(dir.path()).is_empty(),
+            "nothing was journalled"
+        );
+        // The cell still names its entry: the mailbox lists the credential as held.
+        assert!(
+            mailboxes(&addresses, &mailboxes_rows)[0]
+                .held
+                .contains(&Credential::Totp)
+        );
+        // The same store read with the entry present reveals it.
+        store.put(&entry, &Secret::new(TOTP.to_owned())).unwrap();
+        assert_eq!(
+            reveal_in(
+                &addresses,
+                &mailboxes_rows,
+                TABLE,
+                &store,
                 &journal,
                 ask,
                 str::to_owned
             )
             .unwrap(),
+            Ok(TOTP.to_owned())
+        );
+        assert_eq!(journal_lines(dir.path()).len(), 1);
+    }
+
+    /// Below the third generation a registry's secret cells hold sealed tokens, as builds up to
+    /// 0.199.0 write them, and a sign-in on this build opens each under its generation's key, so a
+    /// mixed fleet keeps signing in until the roll.
+    /// The listing a sign-in reads first (`mailboxes`) names each sealed credential as held.
+    /// NEGATIVE CONTROLS: another table's key opens nothing (`Unopened`), the store path reads
+    /// no token (`NotOwnEntry`), and `holds_tokens` sends only a generation before the third to
+    /// the opener; with `holds_credential` counting only references (before the fix), the
+    /// listing holds none: `` left: [] right: [Password, Totp] ``.
+    #[test]
+    #[cfg(unix)]
+    fn a_sign_in_below_the_third_generation_opens_its_sealed_token() {
+        use crate::{
+            alab::registry::{REGISTRY_2, REGISTRY_3, SEALED_ADDRESS, SEALED_MAILBOX},
+            typed::secret::{Fixed, Sealer as _},
+        };
+        assert!(holds_tokens(&REGISTRY_2));
+        assert!(!holds_tokens(&REGISTRY_3));
+        let login = pk("owner");
+        let mailbox = keys::mailbox_pk(&login).unwrap();
+        let key = Fixed("alab/registry.2");
+        let seal = |collection: &str, row: &str, column: &str, value: &str| {
+            json!(
+                key.seal(collection, row, column, &Secret::new(value.to_owned()))
+                    .unwrap()
+            )
+        };
+        let mut book = Book::new();
+        book.write(
+            1,
+            &[],
+            vec![
+                put(&SEALED_ADDRESS, &login, "addr", json!("owner@example.test")),
+                put(
+                    &SEALED_ADDRESS,
+                    &login,
+                    "password",
+                    seal("address", &login, "password", LOGIN_PASS),
+                ),
+                put(&SEALED_MAILBOX, &mailbox, "label", json!("proton-1")),
+                put(&SEALED_MAILBOX, &mailbox, "service", json!("proton")),
+                put(&SEALED_MAILBOX, &mailbox, "code_path", json!("webmail")),
+                put(&SEALED_MAILBOX, &mailbox, "login", json!(login)),
+                put(
+                    &SEALED_MAILBOX,
+                    &mailbox,
+                    "totp",
+                    seal("mailbox", &mailbox, "totp", TOTP),
+                ),
+            ],
+        );
+        let cells = book.cells();
+        let addresses = cell::project(&SEALED_ADDRESS, &cells);
+        let mailboxes_rows = cell::project(&SEALED_MAILBOX, &cells);
+        let read = |values: Values<'_>, which: Credential| {
+            open_credential(
+                &addresses,
+                &mailboxes_rows,
+                "alab/registry.2",
+                values,
+                Ask {
+                    mailbox: &mailbox,
+                    which,
+                    when_ms: 1,
+                },
+            )
+            .unwrap()
+            .map(|(_, held)| held.plaintext().to_owned())
+        };
+        assert_eq!(
+            read(Values::Sealed(&key), Credential::Password),
+            Ok(LOGIN_PASS.to_owned())
+        );
+        assert_eq!(
+            read(Values::Sealed(&key), Credential::Totp),
+            Ok(TOTP.to_owned())
+        );
+        assert_eq!(
+            read(Values::Sealed(&key), Credential::MailboxPassword),
+            Err(Withheld::NotSet)
+        );
+        assert_eq!(
+            read(
+                Values::Sealed(&Fixed("alab/registry")),
+                Credential::Password
+            ),
             Err(Withheld::Unopened)
         );
+        let store = Memory::default();
+        assert_eq!(
+            read(Values::Store(&store), Credential::Password),
+            Err(Withheld::NotOwnEntry)
+        );
+        // The listing a sign-in reads first names the sealed credentials it can open, so the
+        // harness asks for them.
+        let listed = mailboxes(&addresses, &mailboxes_rows);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].held, [Credential::Password, Credential::Totp]);
     }
 }
 

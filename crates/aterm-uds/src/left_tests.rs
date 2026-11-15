@@ -140,6 +140,10 @@ impl Kernel for Fake {
 }
 
 impl LeftKernel for Fake {
+    fn tty_masters_held(&self, devs: &[u32]) -> Vec<Option<bool>> {
+        self.reads.borrow_mut().push(("tty", 0));
+        vec![Some(false); devs.len()]
+    }
     fn listeners(&self) -> Option<HolderScan> {
         self.reads.borrow_mut().push(("listeners", 0));
         self.listeners.clone()
@@ -533,6 +537,39 @@ fn the_listener_table_is_read_at_most_once_a_minute() {
     assert_eq!(k.count("listeners"), 2);
     let _ = read_one(&k, 2606, &at(1_000 + SHARED_READS_MS));
     assert_eq!(k.count("listeners"), 3);
+}
+
+/// Distinct terminals must share the descriptor walk, rather than making one whole-user
+/// scan per terminal before the jobs assessment can publish. Removing the batch restores
+/// three reads here; the minute cache and the fresh action reading remain independent.
+#[test]
+fn distinct_terminals_share_one_descriptor_walk() {
+    let mut k = world();
+    for n in 0..3 {
+        k.add(2606 + n, 1, 2600 + n as u32, 1500 + n as u64).lin.tty = Some(0x1000_0005 + n as u32);
+    }
+    let mut reader = Reader::new();
+    read_at(&mut reader, &k, &[], 1_000);
+    assert_eq!(k.count("tty"), 1, "one descriptor walk for all terminals");
+    read_at(&mut reader, &k, &[], 2_000);
+    assert_eq!(k.count("tty"), 1, "reuse the minute reading");
+    read_at(&mut reader, &k, &[], 1_000 + SHARED_READS_MS);
+    assert_eq!(k.count("tty"), 2, "refresh the terminals together");
+    let known = Known {
+        self_pid: 100,
+        now_ms: 1_000 + SHARED_READS_MS,
+        boot: Some("b"),
+        records: &[],
+        held: &[],
+        waiting: &[],
+        shells: &[],
+    };
+    read_one(&k, 2606, &known).expect("fresh action reading");
+    assert_eq!(
+        k.count("tty"),
+        3,
+        "one fresh walk for an action's candidate"
+    );
 }
 
 /// Where the kernel keeps no pid version (Linux), an exec keeps the pid and the start: the

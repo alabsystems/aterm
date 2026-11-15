@@ -87,24 +87,102 @@ pub fn build_command(root: &Path, targo: &Path, plan: &NativeBuildPlan) -> Resul
 }
 
 /// Build the checkout's verifier without running it and return Cargo's exact reported image.
+/// The build stops once `stopped` reads true (read at least every
+/// [`aterm_uds::deadline::STOP_TICK`]): its process group is asked to end (`SIGTERM`), it is
+/// not awaited, and nothing it wrote is read.
 ///
 /// # Errors
-/// Preparation, launch, compilation or unambiguous executable identification fails.
-pub fn build(root: &Path, targo: &Path, plan: &NativeBuildPlan) -> Result<PathBuf, String> {
-    let output = build_command(root, targo, plan)?
-        .output()
-        .map_err(|error| {
-            format!(
-                "{} verifier bootstrap did not start: {error}",
-                targo.display()
-            )
-        })?;
+/// Preparation, launch, compilation or unambiguous executable identification fails, or the
+/// build was stopped.
+pub fn build(
+    root: &Path,
+    targo: &Path,
+    plan: &NativeBuildPlan,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<PathBuf, String> {
+    let mut command = build_command(root, targo, plan)?;
+    let started = |error: std::io::Error| {
+        format!(
+            "{} verifier bootstrap did not start: {error}",
+            targo.display()
+        )
+    };
+    let output = output_unless(&mut command, stopped)
+        .map_err(started)?
+        .ok_or("the landing was interrupted while it built the checkout's verifier")?;
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
     if !output.status.success() {
         eprint!("{}", String::from_utf8_lossy(&output.stdout));
         return Err(format!("verifier bootstrap exited {}", output.status));
     }
     built(root, &output.stdout)
+}
+
+/// Run `command`, which leads a process group of its own, to its end, its stdout and stderr
+/// captured whole; `None` where `stopped` read true first (read at least every
+/// [`aterm_uds::deadline::STOP_TICK`]): the group was then asked to end (`SIGTERM`) and nothing
+/// was awaited.
+///
+/// # Errors
+/// It did not start, or could not be waited on.
+pub(crate) fn output_unless(
+    command: &mut Command,
+    stopped: &mut dyn FnMut() -> bool,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::Read as _;
+    command
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::piped());
+    let mut child = command.spawn()?;
+    let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|err| Box::new(err) as Box<dyn std::io::Read + Send>),
+    );
+    let mut exit = aterm_uds::deadline::ExitWait::new(&child);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if stopped() {
+            #[cfg(unix)]
+            if child.owns_unreaped()
+                && let Ok(leader) = i32::try_from(child.id())
+                && leader > 1
+            {
+                // SAFETY: killpg takes two integers and touches no memory of this process. The
+                // group's leader is this process's unreaped child, so its id still names that
+                // group alone.
+                unsafe {
+                    libc::killpg(leader, libc::SIGTERM);
+                }
+            }
+            return Ok(None);
+        }
+        exit.wait(aterm_uds::deadline::STOP_TICK);
+    };
+    let joined = |reader: std::thread::JoinHandle<Vec<u8>>| reader.join().unwrap_or_default();
+    Ok(Some(std::process::Output {
+        status,
+        stdout: joined(stdout),
+        stderr: joined(stderr),
+    }))
 }
 
 /// Read the exact verifier executable from a successful bootstrap's Cargo JSON stdout.

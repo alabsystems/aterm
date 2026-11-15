@@ -338,7 +338,7 @@ fn the_chips_keep_a_blank_cell_on_each_side_at_every_width() {
     let rule = cell('\u{2500}', [90, 90, 90]);
     let cruise = format!(
         "autopilot: cruise \u{2014} {} \u{b7} click: land  ",
-        crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip
+        crate::autopilot::mode_words(alab_policy::config::Autopilot::Cruise).chip
     );
     let (off_title, off_short) = ("plan mode on \u{b7} click: yolo  ", "plan mode on  ");
     for facts in [facts(), facts_with_usage(), FooterFacts::default()] {
@@ -424,6 +424,7 @@ fn stopped_footer_watch_has_no_followup_or_idle_reads() {
     } = schedule.accept([Command::Stop {
         session: 7,
         pgid: None,
+        timeline: None,
     }]);
     assert!(model.fire("StopSession", &mut state));
     assert!(immediate.is_empty());
@@ -470,6 +471,7 @@ fn stale_group_stop_preserves_replacement_footer_watch() {
         Command::Stop {
             session: 7,
             pgid: Some(42),
+            timeline: None,
         },
     ]);
     assert!(model.fire("AskNew", &mut state));
@@ -487,6 +489,7 @@ fn stale_group_stop_preserves_replacement_footer_watch() {
     } = schedule.accept([Command::Stop {
         session: 7,
         pgid: Some(42),
+        timeline: None,
     }]);
     assert!(immediate.is_empty());
     assert!(stopped.is_empty());
@@ -573,11 +576,12 @@ fn a_watch_lapse_keeps_the_processs_pin() {
         assert_eq!(read(&mut tails, started, 180, t0), fable, "restored");
         let later = t0 + WATCH_FOR;
         match how {
-            "lapse" => schedule.prune(later, |_, _| false),
+            "lapse" => schedule.prune(later, |_| false),
             "stop" => {
                 let Accepted { stopped, .. } = schedule.accept([Command::Stop {
                     session: 7,
                     pgid: Some(4242),
+                    timeline: None,
                 }]);
                 assert_eq!(stopped, [7]);
             }
@@ -1453,21 +1457,19 @@ fn the_offset_cache_keeps_answers_and_asks_again_after_a_failure() {
     );
 }
 
+/// A LIVE SESSION STAYS WATCHED ON THE SLOW CLOCK: a watch stands for [`WATCH_FOR`] after its
+/// last ask whatever its process does, and past it while the process lives, read once per
+/// [`LONG_IDLE_RECHECK`]; with the process gone it ends.
 #[test]
-fn a_walled_live_session_stays_watched_on_the_slow_clock() {
+fn a_live_session_stays_watched_on_the_slow_clock() {
     let asked = std::time::Instant::now();
     let within = asked + WATCH_FOR - Duration::from_secs(1);
     let past = asked + WATCH_FOR + Duration::from_secs(1);
     assert_eq!(recheck_after(within, asked), IDLE_RECHECK);
-    assert_eq!(recheck_after(past, asked), WALL_RECHECK);
+    assert_eq!(recheck_after(past, asked), LONG_IDLE_RECHECK);
     assert!(still_watched(within, asked, || panic!("not asked within")));
     assert!(still_watched(past, asked, || true));
     assert!(!still_watched(past, asked, || false));
-    let mut walled = HashSet::new();
-    note_wall(&mut walled, 7, true);
-    assert!(walled.contains(&7));
-    note_wall(&mut walled, 7, false);
-    assert!(walled.is_empty());
     let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
     let mut schedule = WatchSchedule::default();
     schedule.watch(
@@ -1482,12 +1484,15 @@ fn a_walled_live_session_stays_watched_on_the_slow_clock() {
     );
     let _ = schedule.due_followups(past);
     schedule.read(7, past, true);
-    schedule.prune(past, |session, job| session == 7 && job.pgid == 42);
-    assert_eq!(schedule.next(past), Some(past + WALL_RECHECK));
+    schedule.prune(past, |job| job.session == 7 && job.pgid == 42);
+    assert_eq!(schedule.next(past), Some(past + LONG_IDLE_RECHECK));
     assert!(schedule.due_idle(past + IDLE_RECHECK).is_none());
-    assert!(schedule.due_idle(past + WALL_RECHECK).is_some());
-    schedule.prune(past, |_, _| false);
-    assert!(schedule.watched.is_empty(), "no wall: the watch ends");
+    assert!(schedule.due_idle(past + LONG_IDLE_RECHECK).is_some());
+    schedule.prune(past, |_| false);
+    assert!(
+        schedule.watched.is_empty(),
+        "its process gone: the watch ends"
+    );
 }
 
 #[test]
@@ -1503,7 +1508,6 @@ fn forgetting_a_session_drops_its_fold_and_watch() {
     let mut schedule = WatchSchedule::default();
     let mut known: HashMap<u64, Identity> = HashMap::new();
     let mut folds: HashMap<u64, footer::FooterCache> = HashMap::new();
-    let mut walled: HashSet<u64> = HashSet::new();
     for session in [1, 2] {
         schedule.watch(job(session), now, true);
         known.insert(
@@ -1525,7 +1529,6 @@ fn forgetting_a_session_drops_its_fold_and_watch() {
             },
         );
         folds.insert(session, footer::FooterCache::default());
-        walled.insert(session);
     }
     let Accepted {
         latest: immediate,
@@ -1534,11 +1537,12 @@ fn forgetting_a_session_drops_its_fold_and_watch() {
     } = schedule.accept([Command::Stop {
         session: 1,
         pgid: None,
+        timeline: None,
     }]);
     assert!(immediate.is_empty());
     assert_eq!(stopped, [1]);
     for session in stopped {
-        forget(session, &mut known, &mut folds, &mut walled);
+        forget(session, &mut known, &mut folds);
     }
     let due = schedule.due_followups(now + FOLLOW_UPS[FOLLOW_UPS.len() - 1]);
     assert_eq!(
@@ -1553,12 +1557,11 @@ fn forgetting_a_session_drops_its_fold_and_watch() {
     for held in [
         known.contains_key(&1),
         folds.contains_key(&1),
-        walled.contains(&1),
         schedule.watched.contains_key(&1),
     ] {
         assert!(!held);
     }
-    assert!(known.contains_key(&2) && folds.contains_key(&2) && walled.contains(&2));
+    assert!(known.contains_key(&2) && folds.contains_key(&2));
     assert!(schedule.watched.contains_key(&2));
 }
 
@@ -1569,7 +1572,6 @@ fn a_group_leaving_the_foreground_releases_its_fold() {
     let mut schedule = WatchSchedule::default();
     let mut known: HashMap<u64, Identity> = HashMap::new();
     let mut folds: HashMap<u64, footer::FooterCache> = HashMap::new();
-    let mut walled: HashSet<u64> = HashSet::new();
     schedule.watch(
         Job {
             session: 1,
@@ -1581,7 +1583,6 @@ fn a_group_leaving_the_foreground_releases_its_fold() {
         true,
     );
     folds.insert(1, footer::FooterCache::default());
-    walled.insert(1);
     let mut stop = |pgid| {
         let Accepted {
             latest: immediate,
@@ -1590,19 +1591,16 @@ fn a_group_leaving_the_foreground_releases_its_fold() {
         } = schedule.accept([Command::Stop {
             session: 1,
             pgid: Some(pgid),
+            timeline: None,
         }]);
         assert!(immediate.is_empty());
         for session in &stopped {
-            forget(*session, &mut known, &mut folds, &mut walled);
+            forget(*session, &mut known, &mut folds);
         }
-        (stopped, folds.contains_key(&1), walled.contains(&1))
+        (stopped, folds.contains_key(&1))
     };
-    assert_eq!(stop(39), (vec![], true, true), "an older group's stop");
-    assert_eq!(
-        stop(40),
-        (vec![1], false, false),
-        "the watched group's stop"
-    );
+    assert_eq!(stop(39), (vec![], true), "an older group's stop");
+    assert_eq!(stop(40), (vec![1], false), "the watched group's stop");
 }
 
 fn two_accounts() -> accounts::Roster {
@@ -2088,7 +2086,7 @@ fn selected_profile_changes_replace_subscription_even_when_registry_is_unreadabl
         route: |_, _, _| accounts::AuthRoute::Stored,
     };
     let mut refresh = || {
-        let (_, found) = resolve_facts(
+        let _ = resolve_facts(
             &timeline,
             &mut identity,
             &mut tail,
@@ -2099,9 +2097,9 @@ fn selected_profile_changes_replace_subscription_even_when_registry_is_unreadabl
         let held = timeline.lock().unwrap();
         let facts = held.claude_footer().unwrap();
         let binding = facts.plan.map(|plan| (plan.window, plan.used_x10));
-        (facts.subscription.clone().unwrap(), binding, found.timed)
+        (facts.subscription.clone().unwrap(), binding)
     };
-    let (first, plan, _) = refresh();
+    let (first, plan) = refresh();
     assert_eq!(first.email.as_deref(), Some("first@example.com"));
     assert_eq!(first.weekly.as_deref(), Some("weekly 29% left"));
     assert_eq!(
@@ -2121,23 +2119,22 @@ fn selected_profile_changes_replace_subscription_even_when_registry_is_unreadabl
     }
     assert_eq!(
         refresh(),
-        (first.clone(), Some((Bucket::SevenDayOpus, 800)), true)
+        (first.clone(), Some((Bucket::SevenDayOpus, 800)))
     );
     std::fs::remove_file(claude.join(format!("sessions/{PID}.json"))).unwrap();
-    assert_eq!(refresh(), (first, Some((Bucket::SevenDayOpus, 800)), true));
+    assert_eq!(refresh(), (first, Some((Bucket::SevenDayOpus, 800))));
     std::fs::write(
         &profile,
         aterm_json::to_string(&content("second@example.com", "second-account")).unwrap(),
     )
     .unwrap();
-    let (second, plan, timed) = refresh();
+    let (second, plan) = refresh();
     assert_eq!(second.email.as_deref(), Some("second@example.com"));
     assert!(
         second.weekly.is_none(),
         "the previous account's quota cannot survive"
     );
     assert_eq!(plan, None, "nor can its plan, on the kept facts");
-    assert!(!timed);
     let five_hour = aterm_json::json!({
         "oauthAccount": { "accountUuid": "second-account", "emailAddress": "second@example.com" },
         "cachedUsageUtilization": {
@@ -2146,17 +2143,15 @@ fn selected_profile_changes_replace_subscription_even_when_registry_is_unreadabl
         }
     });
     std::fs::write(&profile, aterm_json::to_string(&five_hour).unwrap()).unwrap();
-    let (shown, plan, timed) = refresh();
+    let (shown, plan) = refresh();
     assert!(shown.weekly.is_none());
     assert_eq!(plan, Some((Bucket::FiveHour, 400)));
-    assert!(timed, "the plan alone keeps the clock");
     std::fs::write(&profile, "{").unwrap();
     assert_eq!(
         refresh(),
         (
             aterm_agent::harness::profile::SubscriptionDisplay::default(),
-            None,
-            false
+            None
         )
     );
     std::fs::remove_dir_all(root).unwrap();
@@ -2562,7 +2557,7 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
 }
 
 #[test]
-fn weekly_quota_expires_on_the_local_clock_after_the_idle_watch_lapses() {
+fn weekly_quota_expires_on_the_local_clock_while_its_live_session_is_watched() {
     const PID: i32 = 4244;
     const START: u64 = 1_790_607_848;
     const OBSERVED: i64 = 1_792_050_000;
@@ -2638,7 +2633,6 @@ fn weekly_quota_expires_on_the_local_clock_after_the_idle_watch_lapses() {
         };
         let (found, display) = refresh(601);
         assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
-        assert!(found.timed, "weekly without a wall still needs the clock");
 
         let asked = std::time::Instant::now();
         let mut schedule = WatchSchedule::default();
@@ -2655,10 +2649,10 @@ fn weekly_quota_expires_on_the_local_clock_after_the_idle_watch_lapses() {
         let past = asked + Duration::from_secs(601);
         let _ = schedule.due_followups(past);
         schedule.read(7, past, found.row);
-        schedule.prune(past, |_, _| found.timed);
+        schedule.prune(past, |_| true);
         assert!(
             schedule.watched.contains_key(&7),
-            "quota keeps the idle clock"
+            "a live process keeps the idle clock"
         );
         for elapsed in (661..=3661).step_by(60) {
             let at = asked + Duration::from_secs(elapsed as u64);
@@ -2668,14 +2662,9 @@ fn weekly_quota_expires_on_the_local_clock_after_the_idle_watch_lapses() {
             assert_eq!(display.email.as_deref(), Some("expiry@example.com"));
             assert_eq!(display.plan.as_deref(), Some("Max 5x"));
             schedule.read(7, at, found.row);
-            schedule.prune(at, |_, _| found.timed);
+            schedule.prune(at, |_| true);
             if elapsed > expires_after {
                 assert!(display.weekly.is_none(), "stale quota cleared: {reset}");
-                assert!(!found.timed);
-                assert!(
-                    schedule.watched.is_empty(),
-                    "quota expiry releases the clock"
-                );
                 assert!(elapsed <= expires_after + 60, "bounded by the slow clock");
                 break;
             }
@@ -2689,7 +2678,15 @@ fn weekly_quota_expires_on_the_local_clock_after_the_idle_watch_lapses() {
                 display.weekly
             );
         }
-        assert!(schedule.watched.is_empty());
+        assert!(
+            schedule.watched.contains_key(&7),
+            "the watch stands while its process lives"
+        );
+        schedule.prune(asked + Duration::from_secs(3_700), |_| false);
+        assert!(
+            schedule.watched.is_empty(),
+            "its process gone: the watch ends"
+        );
     }
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -6402,12 +6399,12 @@ fn autopilot_off_keeps_the_harness_lit_in_white_for_claude_agy_and_muse() {
 
         assert!(app.set_session_autopilot(
             session,
-            Some(aterm_agent::supervise::Autopilot::Off),
+            Some(alab_policy::config::Autopilot::Off),
             crate::autopilot::Surface::Chip
         ));
         assert_eq!(
             app.session_autopilot(session).1.mode(),
-            Some(aterm_agent::supervise::Autopilot::Off),
+            Some(alab_policy::config::Autopilot::Off),
             "{prog}: the session's word is written Off"
         );
         frame(&mut app, wid);
@@ -6480,12 +6477,12 @@ fn autopilot_off_keeps_the_harness_lit_in_white_for_claude_agy_and_muse() {
 
         assert!(app.set_session_autopilot(
             session,
-            Some(aterm_agent::supervise::Autopilot::Cruise),
+            Some(alab_policy::config::Autopilot::Cruise),
             crate::autopilot::Surface::Chip
         ));
         assert_eq!(
             app.session_autopilot(session).1.mode(),
-            Some(aterm_agent::supervise::Autopilot::Cruise),
+            Some(alab_policy::config::Autopilot::Cruise),
             "{prog}: the session's word is written Cruise again"
         );
         frame(&mut app, wid);
@@ -6507,7 +6504,7 @@ fn autopilot_off_keeps_the_harness_lit_in_white_for_claude_agy_and_muse() {
         );
         assert!(app.set_session_autopilot(
             session,
-            Some(aterm_agent::supervise::Autopilot::Off),
+            Some(alab_policy::config::Autopilot::Off),
             crate::autopilot::Surface::Chip
         ));
         frame(&mut app, wid);
@@ -6522,7 +6519,7 @@ fn autopilot_off_keeps_the_harness_lit_in_white_for_claude_agy_and_muse() {
 
 #[test]
 fn the_composer_border_wears_the_cards_palette() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let rule = "\u{2500}".repeat(120);
     let rows: Vec<String> = vec![
         String::new(),

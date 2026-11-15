@@ -125,7 +125,7 @@ fn blocked_workers_share_one_observation_until_dispatch_changes() {
     machine.fixed.set(Reading::of_gib(48, 8, 14));
     machine.reads.store(0, Ordering::SeqCst);
     machine.sweeps.store(0, Ordering::SeqCst);
-    let mut plan = test_plan::plan(&vec![None; 32], 4, None, 4);
+    let mut plan = test_plan::plan(&vec![None; 32], &[], 4, None, 4);
     for binary in &mut plan.order {
         binary.peak = 4 << 30;
     }
@@ -333,7 +333,7 @@ fn acquired_claim_invalidates_before_a_partial_jobserver_attempt() {
     ));
     let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 2).unwrap();
     let held_token = pool.try_acquire().unwrap().unwrap();
-    let plan = test_plan::plan(&[None], 2, None, 2);
+    let plan = test_plan::plan(&[None], &[], 2, None, 2);
     let mut binary = plan.order[0];
     binary.charge = 2;
     binary.peak = 4 << 30;
@@ -374,7 +374,7 @@ fn cancellation_stops_before_a_warmed_possible_probe_can_start_work() {
             .unwrap()
             .allows(0, &ledger, &machine, &need, &Instant::now)
     );
-    let plan = test_plan::plan(&[None], 1, None, 1);
+    let plan = test_plan::plan(&[None], &[], 1, None, 1);
     let state = Mutex::new(Dispatcher::new(&plan, None));
     let turn = Condvar::new();
     let mut attempts = 0;

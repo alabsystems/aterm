@@ -6,7 +6,7 @@
 
 use aterm_agent::supervise::Outage;
 use aterm_agent::supervise::policy::turn_end::{
-    self, Cleared, Clearing, RULE_OUTAGE_RESUME, cleared_text,
+    Cleared, Clearing, RULE_OUTAGE_RESUME, cleared_text,
 };
 
 use super::*;
@@ -268,7 +268,7 @@ fn a_stand_in_never_met_or_never_cleared_is_unobserved() {
 
 #[test]
 fn the_stand_in_stands_past_the_first_rung_and_cruises_back_off_from_the_walls_reading() {
-    let t = turn_end::TurnEndTiming::default();
+    let t = alab_policy::config::TurnEndTiming::default();
     let ms = |d: std::time::Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
     let first = ms(t.outage_first);
     // Past the first rung and Cruise's short-turn back-off (4 min), so a plain point's act lands
@@ -981,7 +981,7 @@ fn past_an_outages_resume_a_streak_the_cut_act_lengthened_fails() {
         "{why}"
     );
     let step = |n: u32| {
-        let d = turn_end::TurnEndTiming::default()
+        let d = alab_policy::config::TurnEndTiming::default()
             .short_wait_at(n)
             .expect("a back-off");
         i64::try_from(d.as_millis()).expect("ms")

@@ -11,6 +11,40 @@ pub const ARG: &str = "holder=";
 /// The row that answers [`ARG`].
 pub const ROW: &str = "release_holder ";
 
+/// The folder, in the harness state folder, of this host's release-line records: one per holder
+/// that took a line here, written before the claim is published and kept after its holder dies,
+/// so a peer can tell a death from a failed read.
+pub const DIRECTORY: &str = "release-lines";
+
+/// The harness state folder under the aterm state root, where `ATERM_HARNESS_STATE` names none.
+const HARNESS_STATE: [&str; 2] = ["harness", "claude-harness"];
+
+/// This account's release-line registry: [`DIRECTORY`] in the harness state folder, which is
+/// `ATERM_HARNESS_STATE` when that is absolute, else `<aterm state>/harness/claude-harness`.
+/// `None` where neither names a folder (a relative `ATERM_HARNESS_STATE` is refused, never
+/// replaced).
+#[must_use]
+pub fn registry() -> Option<std::path::PathBuf> {
+    registry_from(
+        std::env::var_os("ATERM_HARNESS_STATE"),
+        aterm_types::dirs::state_dir(),
+    )
+}
+
+/// [`registry`] over the two values it reads.
+fn registry_from(
+    harness_state: Option<std::ffi::OsString>,
+    aterm_state: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let harness = match harness_state {
+        Some(dir) => Some(std::path::PathBuf::from(dir)).filter(|dir| dir.is_absolute())?,
+        None => HARNESS_STATE
+            .iter()
+            .fold(aterm_state?, |dir, part| dir.join(part)),
+    };
+    Some(harness.join(DIRECTORY))
+}
+
 /// One process identity: its pid, the boot it ran in and its kernel start in that boot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
@@ -48,6 +82,20 @@ impl Identity {
             boot: boot.to_owned(),
             start: start.parse().ok()?,
         })
+    }
+
+    /// The name of the record the holder of `version`'s line keeps in [`DIRECTORY`]:
+    /// `<version>-<pid>-<start>.json`.
+    #[must_use]
+    pub fn record_name(&self, version: &str) -> String {
+        format!("{version}{}", self.record_suffix())
+    }
+
+    /// What every record name of this identity ends with, whatever its version
+    /// ([`Identity::record_name`]): `-<pid>-<start>.json`.
+    #[must_use]
+    pub fn record_suffix(&self) -> String {
+        format!("-{}-{}.json", self.pid, self.start)
     }
 
     /// The survey argument asking about this identity.

@@ -53,6 +53,7 @@ struct Read {
     roster: Roster,
     state: State,
     enrolled: BTreeSet<String>,
+    signing_in: Option<&'static str>,
     label: Option<&'static str>,
     email: Option<&'static str>,
     pool: Option<Pool>,
@@ -67,6 +68,7 @@ impl Read {
             roster: roster(),
             state: state(),
             enrolled: ["alpha".to_owned()].into(),
+            signing_in: None,
             label: Some("alpha"),
             email: Some("alpha.m20.1@example.test"),
             pool: None,
@@ -89,6 +91,7 @@ impl Read {
             roster: &self.roster,
             state: &self.state,
             enrolled: &self.enrolled,
+            signing_in: self.signing_in,
             logins: &Logins::default(),
             session: Session {
                 label: self.label,
@@ -107,6 +110,33 @@ impl Read {
     fn card(&self) -> AccountCard {
         self.card_with(HistoryIn::NotRead)
     }
+}
+
+/// A CARD SAYS `signing in` BY THE RULE LINE E READS: the card of `alpha`, whose login was never
+/// made here, says its sign-in runs (`AccountCard::signing_in`, which its Login line says) only
+/// while the running record names `alpha` (`Figure::login` over its condition). CONTROL: a
+/// sign-in of `beta` running, and none, leave it false; and `alpha` with a login here keeps its
+/// words while it is renewed, as line E keeps its week.
+#[test]
+fn a_cards_sign_in_is_its_own_accounts_alone() {
+    let with = |signing_in, enrolled: &[&str]| {
+        Read {
+            signing_in,
+            enrolled: enrolled.iter().map(|label| (*label).to_owned()).collect(),
+            ..Read::new()
+        }
+        .card()
+    };
+    assert!(with(Some("alpha"), &[]).signing_in);
+    assert!(
+        !with(Some("beta"), &[]).signing_in,
+        "CONTROL: another account's sign-in"
+    );
+    assert!(!with(None, &[]).signing_in);
+    assert!(
+        !with(Some("alpha"), &["alpha"]).signing_in,
+        "CONTROL: a login that is here keeps its words while it is renewed"
+    );
 }
 
 fn pool(text: &str) -> Pool {
@@ -128,6 +158,7 @@ fn claims_row(machine: &str, label: &str, claims: Vec<Claim>) -> claims::Row {
         counter: 1,
         until: NOW + H,
         claims,
+        ranks_homes: false,
     }
 }
 
@@ -166,8 +197,13 @@ fn keyer(_realm: &str, email: &str) -> Option<String> {
     })
 }
 
+/// The Commons uuids of this Mac (m20) and of the peer m15, as a test's journal names them.
+const M20_UUID: &str = "20202020202020202020202020202020";
+const M15_UUID: &str = "15151515151515151515151515151515";
+
 fn journal_of(key: &str, account: AccountSeen) -> Journal {
     Journal::Read(Arc::new(JournalSeen {
+        me: [M20_UUID.to_owned()].into(),
         accounts: [(key.to_owned(), account)].into(),
         at: NOW,
     }))
@@ -347,10 +383,10 @@ const POOL_ALPHA: &str =
     "[[account]]\nprovider = \"claude\"\nemail = \"alpha.m20.1@example.test\"\nwarm = [\"m20\"]\n";
 
 /// A CLAIM ELSEWHERE IS A HOLDER WITH WHEN IT BEGAN, AND OURS IS OURS. The table's live claims
-/// on the account are listed, earliest first: another Mac by its label, this Mac (the table's
-/// own machine) as ours, and a Mac with no label as unnamed. A lapsed row and a claim on another
-/// account are not listed. An outside login's claims are found by its address, with no roster
-/// row.
+/// on the account are listed as they rank, here (no home among them) earliest first: another Mac
+/// by its label, this Mac (the table's own machine) as ours, and a Mac with no label as unnamed.
+/// A lapsed row and a claim on another account are not listed. An outside login's claims are
+/// found by its address, with no roster row.
 #[test]
 fn live_claims_are_holders_ours_and_others_by_when_they_began() {
     let mut read = Read::new();
@@ -416,7 +452,7 @@ fn live_claims_are_holders_ours_and_others_by_when_they_began() {
 /// NO CLAIMS TABLE IS NOT KNOWN, NEVER NOT IN USE. With no table in this process the claims are
 /// absent; a table that could not be read is unreadable; a program whose accounts are not in
 /// the claims ring is not tracked; and an empty table on a Mac with no pool file (where no
-/// claim is made) is absent too. Where this Mac's state holds the senior claim it last
+/// claim is made, but on an account the lab names it a home of) is absent too. Where this Mac's state holds the senior claim it last
 /// settled, still live, that one holder is given as the senior and no list is claimed; a
 /// lapsed one is not.
 #[test]
@@ -466,6 +502,24 @@ fn no_claims_table_says_not_known_never_not_in_use() {
     read.pool = None;
     read.claims = table(Vec::new());
     assert_eq!(read.card().machine.claims, Claims::Absent);
+    // Unless the lab names this Mac the account's home: it claims that one, so the table speaks.
+    // NEGATIVE CONTROL: drop the homes test from the card's empty-table rule, and the card said
+    // `Absent` (`left: Absent`, `right: Read([])`).
+    let alpha = LeaseKey::for_cli(Cli::Claude, None, "alpha.m20.1@example.test").expect("a key");
+    read.claims = Ok(Some((
+        View {
+            me: ME.into(),
+            homes: Some(claims::Homes::of_machines([(alpha, ME.to_owned())])),
+            ..View::default()
+        },
+        Book::default(),
+    )));
+    assert_eq!(
+        read.card().machine.claims,
+        Claims::Read(Vec::new()),
+        "a home with no pool file reads its account's claims"
+    );
+    read.claims = table(Vec::new());
     read.pool = Some(pool(POOL_ALPHA));
     assert_eq!(
         read.card().machine.claims,
@@ -483,7 +537,7 @@ fn no_claims_table_says_not_known_never_not_in_use() {
 
 /// A HOLD FOR A MAC WHOSE CLOCK DISAGREES IS NOT A CLAIM IT MADE. The hold this Mac keeps on a
 /// home account of a skewed peer ([`claims::holds`]) reaches the card as a holder with no
-/// beginning, listed after every real claim, so nothing formats its sentinel as a time. Where
+/// beginning, so nothing formats its sentinel as a time, listed first, as the senior it is. Where
 /// the peer's own row is live too, that row's beginning is the holder's. Negative control: a
 /// hold that has ended is no holder.
 #[test]
@@ -516,14 +570,14 @@ fn a_hold_for_a_skewed_mac_has_no_beginning() {
         read.card().machine.claims,
         Claims::Read(vec![
             Holder {
-                mac: this_mac(),
-                since: Some(NOW - 2 * H),
-                until: NOW + H,
-            },
-            Holder {
                 mac: mac("m22"),
                 since: None,
                 until: NOW + D,
+            },
+            Holder {
+                mac: this_mac(),
+                since: Some(NOW - 2 * H),
+                until: NOW + H,
             },
         ])
     );
@@ -550,6 +604,48 @@ fn a_hold_for_a_skewed_mac_has_no_beginning() {
         Claims::Read(Vec::new()),
         "CONTROL: an ended hold"
     );
+}
+
+/// THE SENIOR CLAIM IS LISTED FIRST, SO A CARD NAMES THE MAC THAT HOLDS THE ACCOUNT. On a Mac
+/// that holds nothing, m7's claim (a borrower's, the earliest) and m22's (the account's home,
+/// later) are both live. m22's ranks senior, as the claims settle ([`claims::Book::senior`]), so
+/// it is listed first, and a sentence that names who holds the account (the first holder that is
+/// not this Mac's, as the Account menu's `HeldElsewhere` sentence takes it) names m22, never m7.
+///
+/// NEGATIVE CONTROL: list the holders earliest first (the card's former sort by `since`), and m7
+/// came first (`left: Some("m7")`, `right: Some("m22")`).
+#[test]
+fn the_senior_claim_is_listed_first() {
+    let alpha = "alpha.m20.1@example.test";
+    let key = LeaseKey::for_cli(Cli::Claude, None, alpha).expect("a key");
+    let ranked = |machine: &str, label: &str, since: i64| claims::Row {
+        ranks_homes: true,
+        ..claims_row(machine, label, vec![claim(alpha, since)])
+    };
+    let mut read = Read::new();
+    read.pool = Some(pool(POOL_ALPHA));
+    read.claims = Ok(Some((
+        View {
+            me: ME.into(),
+            homes: Some(claims::Homes::of_machines([(key.clone(), PEER.to_owned())])),
+            ..View::default()
+        },
+        Book::of(vec![
+            ranked("cc77", "m7", NOW - 5 * H),
+            ranked(PEER, "m22", NOW - 2 * H),
+        ]),
+    )));
+    let Claims::Read(holders) = read.card().machine.claims else {
+        panic!("the table was read");
+    };
+    assert_eq!(
+        holders
+            .iter()
+            .find(|holder| !holder.mac.ours)
+            .map(|holder| holder.mac.name.as_str()),
+        Some("m22")
+    );
+    assert_eq!(holders.len(), 2);
 }
 
 /// AN ACCOUNT NOTHING NAMES WAS NOT LOOKED UP. With no row and no address (and for a row that
@@ -621,6 +717,7 @@ fn the_cards_clock_spans_a_change_of_offset_weeks_away() {
         roster: &read.roster,
         state: &read.state,
         enrolled: &read.enrolled,
+        signing_in: None,
         logins: &Logins::default(),
         session: Session::default(),
         pool: None,
@@ -670,8 +767,14 @@ fn week_line(t: i64, by: &str, pct_x10: u16, reset: i64) -> Line {
 /// THE JOURNAL IS OFF, NOT READ YET, SILENT OR HELD, AND ONLY HELD GIVES FACTS. Off and
 /// not-read-yet are told apart; a journal that says nothing of the account is silent; one that
 /// does gives its last use, its starts by Mac with the instant the count starts from, and, for
-/// an outside login this Mac's records hold nothing of, its week and five-hour window with the
-/// Mac that read them.
+/// an outside login this Mac's records hold nothing of, a peer's bound of its week with the Mac
+/// that read it (`alab_seen::bound_of`): at most what was left, however fresh the reading, since a
+/// peer's reading is evidence the account was used, never that it has room; and the five-hour
+/// window this Mac itself logged, under the glass's age rule, naming no Mac. A workspace's window
+/// says nothing of the account's.
+/// NEGATIVE CONTROL: with `journal_window` taking a peer's figure under the glass's age rule (as
+/// it did), the week is `Exact(160)`; with it giving a peer's bound alone, the five-hour window
+/// is `None`.
 #[test]
 fn the_journal_is_off_not_read_silent_or_held() {
     crate::harness::journal::with_keyer(keyer, || {
@@ -709,6 +812,8 @@ fn the_journal_is_off_not_read_silent_or_held() {
                         }),
                         read: Some((NOW - 60, "m15".into(), "tap".into())),
                         wall_until: None,
+                        reader: Some(M15_UUID.into()),
+                        wall_by: None,
                     },
                     WindowSeen {
                         window: "5h".into(),
@@ -719,6 +824,8 @@ fn the_journal_is_off_not_read_silent_or_held() {
                         }),
                         read: Some((NOW - 3 * H, "m20".into(), "tap".into())),
                         wall_until: None,
+                        reader: Some(M20_UUID.into()),
+                        wall_by: None,
                     },
                     WindowSeen {
                         window: "7d".into(),
@@ -729,6 +836,8 @@ fn the_journal_is_off_not_read_silent_or_held() {
                         }),
                         read: Some((NOW - 30, "m15".into(), "tap".into())),
                         wall_until: None,
+                        reader: Some(M15_UUID.into()),
+                        wall_by: None,
                     },
                 ],
                 history: vec![
@@ -749,12 +858,12 @@ fn the_journal_is_off_not_read_silent_or_held() {
         assert_eq!(
             card.budget.week,
             Some(Seen {
-                figure: Figure::Exact(160),
+                figure: Figure::AtLeast(160),
                 reset: Some(reset),
                 at: Some(NOW - 60),
                 by: Some(mac("m15")),
             }),
-            "the account's own week, not its workspace's"
+            "the account's own week, not its workspace's, a bound however fresh"
         );
         assert_eq!(
             card.budget.five,
@@ -764,7 +873,7 @@ fn the_journal_is_off_not_read_silent_or_held() {
                 at: Some(NOW - 3 * H),
                 by: None,
             }),
-            "an older reading is a bound; read on this Mac names no Mac"
+            "this Mac's own older reading is a bound under the age rule, naming no Mac"
         );
     });
 }

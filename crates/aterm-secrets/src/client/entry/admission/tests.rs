@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::super::tests::Fixture;
+use super::super::tests::{Fixture, publish_unresolved};
 use super::*;
 use aterm_spec::interp::State as ModelState;
 
@@ -71,7 +71,7 @@ fn transition_with_early_release(
     let fixture = Fixture::new();
     let mut snapshot = fixture.read_token().unwrap().snapshot;
     let mut writer = None;
-    let token = materialize::target_path(&fixture.paths.home, "token").unwrap();
+    let mut hidden = None;
     match state["scenario"] {
         0 => {}
         1 => fixture.publish(|doc| {
@@ -92,7 +92,15 @@ fn transition_with_early_release(
             .unwrap();
         }),
         4 => snapshot.config.name = "different-vault".into(),
-        5 => std::fs::remove_file(&token).unwrap(),
+        // Present in the version, its anchor chain unresolved: unavailable. (A file at the
+        // entry's old path, edited or gone, would change nothing: the read is in place.)
+        5 => {
+            hidden = Some(publish_unresolved(
+                &fixture,
+                "token",
+                b"inert-authentic-token",
+            ))
+        }
         6 => std::fs::remove_file(fixture.paths.lock_file()).unwrap(),
         7 => writer = Some(StateLock::take(&fixture.paths).unwrap()),
         8 => snapshot.name = crate::commons::ENTRY.into(),
@@ -129,6 +137,7 @@ fn transition_with_early_release(
     assert_eq!(marker.exists(), entered);
     next.insert("released", i64::from(writer_is_free(&fixture.paths)));
     drop(writer);
+    drop(hidden);
     next.insert("done", 1);
     next
 }

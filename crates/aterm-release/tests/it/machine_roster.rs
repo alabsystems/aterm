@@ -91,16 +91,11 @@ fn armed<'a>(master: &'a [&'a str], document: &'a machines::RosterDocument) -> R
     }
 }
 
-/// Signing anchors for `masters` and `identity`.
-fn anchors<'a>(
-    home: &'a Path,
-    masters: &'a [&'a str],
-    identity: Option<&'a Path>,
-) -> publish::SigningAnchors<'a> {
+/// Signing anchors for `masters`.
+fn anchors<'a>(home: &'a Path, masters: &'a [&'a str]) -> publish::SigningAnchors<'a> {
     publish::SigningAnchors {
         home: Some(home),
         master_pubkeys: masters,
-        identity_path: identity,
         now_unix: NOW,
         duty: publish::RosterDuty::Sign,
     }
@@ -502,8 +497,8 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
     );
     let creds = sign::ReleaseCredentials::load(&profile, None).expect("loads");
     assert_eq!(creds.machine_id(), Some("m3"));
-    assert_eq!(creds.machine_roster(), Some(roster_path.as_path()));
-    let read = machines::RosterDocument::read(creds.machine_roster().unwrap()).expect("reads");
+    assert_eq!(roster_file(&creds), Some(roster_path.as_path()));
+    let read = machines::RosterDocument::read(roster_file(&creds).unwrap()).expect("reads");
     assert_eq!(read, document, "the document is read whole, both halves");
 
     machines::RosterDocument::read(&dir.join("nope.toml"))
@@ -526,7 +521,7 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
 fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
     let dir = tempdir("tilde-roster");
     let document = roster_doc(&[], &MASTER);
-    let roster_dir = dir.join(".aterm/release-ring/roster");
+    let roster_dir = dir.join("fleet/roster");
     std::fs::create_dir_all(&roster_dir).unwrap();
     std::fs::write(roster_dir.join("aterm-machines.toml"), &document.bytes).unwrap();
     std::fs::write(
@@ -545,13 +540,13 @@ fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
         )
     };
 
-    let profile = named("~/.aterm/release-ring/roster/aterm-machines.toml");
+    let profile = named("~/fleet/roster/aterm-machines.toml");
     let creds = sign::ReleaseCredentials::load(&profile, Some(&dir)).expect("loads");
     assert_eq!(
-        creds.machine_roster(),
+        roster_file(&creds),
         Some(roster_dir.join("aterm-machines.toml").as_path())
     );
-    let read = machines::RosterDocument::read(creds.machine_roster().unwrap()).expect("reads");
+    let read = machines::RosterDocument::read(roster_file(&creds).unwrap()).expect("reads");
     assert_eq!(
         read, document,
         "the roster and its sibling signature, under this home"
@@ -560,10 +555,10 @@ fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
     let other_home = dir.join("elsewhere");
     let creds = sign::ReleaseCredentials::load(&profile, Some(&other_home)).expect("loads");
     assert_eq!(
-        creds.machine_roster(),
+        roster_file(&creds),
         Some(
             other_home
-                .join(".aterm/release-ring/roster/aterm-machines.toml")
+                .join("fleet/roster/aterm-machines.toml")
                 .as_path()
         ),
         "the same profile names the roster under each home it is loaded in"
@@ -578,10 +573,10 @@ fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
         assert!(refused.contains("HOME"), "{relative:?}: {refused}");
     }
 
-    let profile = named("~//.aterm/release-ring/roster/aterm-machines.toml");
+    let profile = named("~//fleet/roster/aterm-machines.toml");
     let creds = sign::ReleaseCredentials::load(&profile, Some(&dir)).expect("loads");
     assert_eq!(
-        creds.machine_roster(),
+        roster_file(&creds),
         Some(roster_dir.join("aterm-machines.toml").as_path()),
         "`~//r` is still under the home, as a shell reads it"
     );
@@ -589,15 +584,32 @@ fn a_profile_s_tilde_roster_is_read_under_the_home_it_is_loaded_in() {
     let absolute = roster_dir.join("aterm-machines.toml");
     let profile = named(&absolute.display().to_string());
     let creds = sign::ReleaseCredentials::load(&profile, Some(&other_home)).expect("loads");
-    assert_eq!(creds.machine_roster(), Some(absolute.as_path()));
+    assert_eq!(roster_file(&creds), Some(absolute.as_path()));
 
     let profile = named("~someone/aterm-machines.toml");
     let creds = sign::ReleaseCredentials::load(&profile, Some(&dir)).expect("loads");
     assert_eq!(
-        creds.machine_roster(),
+        roster_file(&creds),
         Some(Path::new("~someone/aterm-machines.toml")),
         "only `~/` names this home"
     );
+}
+
+/// A profile whose `machine_roster` names the store's roster entry is authorized by the store's
+/// pair, never by a file of that name under the home.
+#[test]
+fn a_profile_naming_the_stores_roster_reads_the_stores_pair() {
+    let dir = tempdir("store-roster");
+    let profile = write_profile(
+        &dir,
+        &format!(
+            "signing_key = \"{}\"\nmachine_roster = \"{}\"\n",
+            pkcs8_b64(),
+            sign::STORE_ROSTER
+        ),
+    );
+    let creds = sign::ReleaseCredentials::load(&profile, Some(&dir)).expect("loads");
+    assert_eq!(creds.machine_roster(), Some(&sign::RosterSource::Store));
 }
 
 /// End-to-end verdict from a real credentials profile and roster file on disk.
@@ -619,8 +631,8 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
     let creds = sign::ReleaseCredentials::load(&profile, None).expect("loads");
     let master = pk(&MASTER);
     let masters = [master.as_str()];
-    let verdict = publish::signing_verdict(Some(&creds), &anchors(&dir, &masters, None))
-        .expect("an armed cut");
+    let verdict =
+        publish::signing_verdict(Some(&creds), &anchors(&dir, &masters)).expect("an armed cut");
     assert!(verdict.policy.required);
     assert_eq!(verdict.policy.pubkey.as_deref(), Some(pubkey.as_str()));
     let who = verdict.attribution.expect("armed means attributed");
@@ -633,14 +645,6 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
         "the verdict must carry the exact document it verified, not the path"
     );
 
-    let identity = dir.join("machine.toml");
-    std::fs::write(&identity, "id = \"m11\"\npubkey = \"unused\"\n").unwrap();
-    publish::signing_verdict(Some(&creds), &anchors(&dir, &masters, Some(&identity)))
-        .expect_err("a mint record naming another machine must refuse");
-    std::fs::write(&identity, "id = \"m3\"\npubkey = \"unused\"\n").unwrap();
-    publish::signing_verdict(Some(&creds), &anchors(&dir, &masters, Some(&identity)))
-        .expect("a truthful mint record is not an obstacle");
-
     let orphan = write_profile2(
         &dir,
         "orphan.toml",
@@ -650,7 +654,7 @@ fn a_real_profile_plus_a_real_roster_file_produce_the_cut_s_verdict() {
         ),
     );
     let creds = sign::ReleaseCredentials::load(&orphan, None).expect("loads");
-    publish::signing_verdict(Some(&creds), &anchors(&dir, &masters, None))
+    publish::signing_verdict(Some(&creds), &anchors(&dir, &masters))
         .expect_err("a named-but-missing roster must refuse");
 }
 
@@ -676,7 +680,7 @@ fn current_signing_observes_the_floor_while_finish_preserves_completed_receipts(
     let creds = sign::ReleaseCredentials::load(&profile, None).unwrap();
     let master = pk(&MASTER);
     let masters = [master.as_str()];
-    let mut context = anchors(&dir, &masters, None);
+    let mut context = anchors(&dir, &masters);
     publish::signing_verdict(Some(&creds), &context).expect("no retained floor admits m3");
     // The floor as the vault writes it (0600 in a 0700 directory), so each verdict below
     // turns on the floor's generation, never on a file mode its reader refuses.
@@ -715,32 +719,12 @@ fn current_signing_observes_the_floor_while_finish_preserves_completed_receipts(
     }
 }
 
-/// The profile's machine id wins; the mint record answers only when the profile declares none.
-#[test]
-fn the_declared_machine_id_prefers_the_profile_and_falls_back_to_the_mint_record() {
-    let dir = tempdir("identity");
-    let identity = dir.join("machine.toml");
-    std::fs::write(
-        &identity,
-        format!("id = \"m11\"\npubkey = \"{}\"\n", pk(&M11)),
-    )
-    .unwrap();
-
-    assert_eq!(
-        machines::declared_machine_id(Some("m3"), Some(&identity)).unwrap(),
-        Some("m3".to_string())
-    );
-    assert_eq!(
-        machines::declared_machine_id(None, Some(&identity)).unwrap(),
-        Some("m11".to_string())
-    );
-    assert_eq!(
-        machines::declared_machine_id(None, Some(&dir.join("absent.toml"))).unwrap(),
-        None
-    );
-    assert_eq!(machines::declared_machine_id(None, None).unwrap(), None);
-    std::fs::write(&identity, "id = = =").unwrap();
-    assert!(machines::declared_machine_id(None, Some(&identity)).is_err());
+/// The roster file an operator's profile names, `None` where it names the store's or none.
+fn roster_file(creds: &sign::ReleaseCredentials) -> Option<&Path> {
+    match creds.machine_roster()? {
+        sign::RosterSource::File(path) => Some(path),
+        sign::RosterSource::Store => None,
+    }
 }
 
 struct TestDir(aterm_tempfile::TempDir);

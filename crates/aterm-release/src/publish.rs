@@ -372,28 +372,43 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The release-org token's registry entry: the vault lands it on every cutting Mac.
+/// The release-org token's store entry, which every cutting Mac's store holds.
 pub(crate) const CHANNEL_TOKEN: &str = aterm_secrets::entry_class::RELEASE_GH_TOKEN;
 
-/// The release-org token on disk: where the vault lands [`CHANNEL_TOKEN`].
-pub(crate) fn channel_token_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").and_then(|home| {
-        aterm_secrets::materialize::target_path(Path::new(&home), CHANNEL_TOKEN).ok()
-    })
+/// The release-org token, read in place from this Mac's store ([`CHANNEL_TOKEN`]): `None` where
+/// the store holds none, or only whitespace. It goes to curl on stdin; nothing writes it to a
+/// file.
+/// # Errors
+/// The store cannot be read, or the entry holds a token [`Token::new`] refuses.
+#[cfg(unix)]
+pub(crate) fn channel_token()
+-> std::result::Result<Option<aterm_update_core::github_rest::Token>, String> {
+    let Some(value) = aterm_secrets::read(CHANNEL_TOKEN)
+        .map_err(|error| format!("the store's {CHANNEL_TOKEN} entry cannot be read: {error}"))?
+    else {
+        return Ok(None);
+    };
+    if value.as_slice().trim_ascii().is_empty() {
+        return Ok(None);
+    }
+    aterm_update_core::github_rest::Token::new(value.as_slice())
+        .map(Some)
+        .map_err(|error| format!("the store's {CHANNEL_TOKEN} entry: {error}"))
 }
 
-/// [`CHANNEL_TOKEN`]'s registry pointer (`~/…`), as `aterm secrets ls --describe` names it.
-pub(crate) fn channel_token_pointer() -> String {
-    aterm_secrets::registry::pointer(CHANNEL_TOKEN).unwrap_or_else(|| CHANNEL_TOKEN.to_owned())
+/// No store off unix: no release-org token.
+#[cfg(not(unix))]
+pub(crate) fn channel_token()
+-> std::result::Result<Option<aterm_update_core::github_rest::Token>, String> {
+    Ok(None)
 }
 
-/// What a gate says when this Mac holds no release-org token: the pointer, and the one way
+/// What a gate says when this Mac holds no release-org token: the store entry, and the one way
 /// to get it.
 pub(crate) fn no_channel_token() -> String {
     format!(
-        "this Mac holds no release-org token at {} (`aterm secrets need gh:release` asks the \
-         lab's Macs for it)",
-        channel_token_pointer()
+        "this Mac's store holds no release-org token (the vault entry {CHANNEL_TOKEN}; \
+         `aterm secrets need gh:release` asks the lab's Macs for it)"
     )
 }
 
@@ -877,10 +892,103 @@ impl LocalProbe {
         None
     }
 
+    /// The members of `pgid` as libproc lists that group itself
+    /// ([`aterm_uds::process::group_members`], `proc_listpids(PROC_PGRP_ONLY)`), each named by
+    /// the kernel's short name for it (`pbi_comm`, [`Self::short_name`]). No program runs, no
+    /// process's arguments are read (a `ps` that reads every process's hung by the thousand in a
+    /// program-check wedge, `docs/DESIGN-leftover-processes-2026-10-16.md` M29), and the whole
+    /// `kern.proc` table is not read: that read is bounded and answers nothing while any process
+    /// on the Mac is in exec (ATERM-KI-1113-571), which on a loaded Mac made a provably dead
+    /// publisher unprovable. See [`Self::group_listed`] for what an empty answer must show.
+    #[cfg(target_os = "macos")]
+    fn members_of(pgid: u32) -> GroupState {
+        Self::group_listed(
+            aterm_uds::process::group_members(pgid),
+            || Self::own_pgid().and_then(aterm_uds::process::group_members),
+            std::process::id(),
+            Self::short_name,
+        )
+    }
+
+    /// `pid`'s kernel short name (`pbi_comm`, its image's basename, at most 16 bytes) read from
+    /// libproc; empty when its record does not read (an unreaped zombie's does not), which
+    /// leaves it a member named by its pid alone.
+    #[cfg(target_os = "macos")]
+    fn short_name(pid: u32) -> String {
+        let Some(info) = i32::try_from(pid)
+            .ok()
+            .and_then(aterm_uds::process::bsdinfo_uniq)
+        else {
+            return String::new();
+        };
+        let bytes: Vec<u8> = info
+            .pbsd
+            .pbi_comm
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| c.to_ne_bytes()[0])
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// [`Self::members_of`] over `listed`, libproc's listing of the group. A failed read
+    /// (`None`: libproc's own failure, told from an empty group by `errno`) is unknown. A listing
+    /// with members is the group alive, whole or not: a group libproc lists only its first
+    /// [`aterm_uds::process::MAX_GROUP_PIDS`] of is alive all the same, so a full buffer needs no
+    /// second, larger read. An empty listing is the group empty only when it is whole and the
+    /// same lister, asked for this process's own group (`own`), shows `me`: libproc answering
+    /// at all here is no proof that it can see the group, and an empty answer must mean an
+    /// empty group, never an unseen one.
+    #[cfg(target_os = "macos")]
+    fn group_listed(
+        listed: Option<aterm_uds::process::GroupMembers>,
+        own: impl FnOnce() -> Option<aterm_uds::process::GroupMembers>,
+        me: u32,
+        name: impl Fn(u32) -> String,
+    ) -> GroupState {
+        let Some(listed) = listed else {
+            return GroupState::Unknown(
+                "libproc could not list the group (proc_listpids(PROC_PGRP_ONLY) failed)"
+                    .to_string(),
+            );
+        };
+        let members: Vec<(u32, String)> = listed
+            .pids
+            .iter()
+            .filter_map(|pid| u32::try_from(*pid).ok())
+            .map(|pid| (pid, name(pid)))
+            .collect();
+        if !members.is_empty() {
+            return GroupState::Members(members);
+        }
+        if !listed.complete {
+            return GroupState::Unknown("libproc listed the group incompletely".to_string());
+        }
+        let Some(own) = own() else {
+            return GroupState::Unknown(
+                "libproc listed no member, but could not list this process's own group, so the \
+                 empty listing proves nothing"
+                    .to_string(),
+            );
+        };
+        if !own
+            .pids
+            .iter()
+            .any(|pid| u32::try_from(*pid).ok() == Some(me))
+        {
+            return GroupState::Unknown(
+                "libproc listed no member, but its listing of this process's own group did not \
+                 show this process, so the empty listing proves nothing"
+                    .to_string(),
+            );
+        }
+        GroupState::Empty
+    }
+
     /// The members of `pgid` in a listing of every process read in this process
     /// ([`crate::interrupt::listing`]), each named by the kernel's short name for it. No program
-    /// runs and no process's arguments are read: a `ps` that reads every process's hung by the
-    /// thousand in a program-check wedge (`docs/DESIGN-leftover-processes-2026-10-16.md` M29).
+    /// runs and no process's arguments are read.
+    #[cfg(not(target_os = "macos"))]
     fn members_of(pgid: u32) -> GroupState {
         let Some(procs) = crate::interrupt::listing() else {
             return GroupState::Unknown("the process table could not be read".to_string());
@@ -889,6 +997,7 @@ impl LocalProbe {
     }
 
     /// [`Self::members_of`] over `procs`, a listing that must show `me`.
+    #[cfg(any(not(target_os = "macos"), test))]
     fn group_of(procs: Vec<crate::interrupt::Proc>, pgid: u32, me: u32) -> GroupState {
         let own = |pid: i32| u32::try_from(pid).ok();
         if !procs.iter().any(|p| own(p.pid) == Some(me)) {
@@ -1414,7 +1523,7 @@ pub fn preflight_release_lease(origin: &dyn Origin) -> Result<()> {
 pub fn pre_cut_gates(
     repo: &Path,
     version: &str,
-    creds_path: &Path,
+    creds_path: Option<&Path>,
     kind: CutKind,
 ) -> Vec<(&'static str, String)> {
     let mut out: Vec<(&'static str, String)> = Vec::new();
@@ -1455,7 +1564,7 @@ pub fn pre_cut_gates(
     if let Err(e) = floor {
         out.push(("channel floor", format!("v{version}: {e}")));
     }
-    let Ok(Some(creds)) = sign::ReleaseCredentials::resolve(Some(creds_path), repo) else {
+    let Ok(Some(creds)) = sign::ReleaseCredentials::resolve(creds_path) else {
         return out;
     };
     let verdict = match preflight_signature_policy(Some(&creds), RosterDuty::Sign) {
@@ -2972,8 +3081,8 @@ pub fn channel_signature_policy(
     let Some(material) = material_pubkey else {
         return Err(Error::new(
             "no signing material, and the release channel takes only a rostered machine's \
-             key: cut with --release-credentials ~/.aterm/release-ring/release-credentials.toml (`targo \
-             --unverified ship provision --id <id>` writes it)",
+             key: cut on a release host whose store holds the release ring (`targo --unverified \
+             ship provision --id <id>` mints it)",
         ));
     };
     let material = canonical_update_pubkey(material)?;
@@ -2988,10 +3097,10 @@ pub fn channel_signature_policy(
     }
     let Some(document) = evidence.roster else {
         return Err(Error::new(
-            "the signing profile names no `machine_roster`: add `machine_roster = \
-             \"<path>/aterm-machines.toml\"` (its .sig beside it; a leading `~/` is this Mac's \
-             home), or move the profile aside and re-run `targo --unverified ship provision \
-             --id <id>`, which writes it",
+            "the signing profile names no `machine_roster`: cut with the store's release ring \
+             (no --release-credentials), whose roster is the store's signed pair, or add \
+             `machine_roster = \"<path>/aterm-machines.toml\"` (its .sig beside it; a leading \
+             `~/` is this Mac's home) to the operator's profile file",
         ));
     };
     let who = machines::authorize_cut(
@@ -4095,7 +4204,6 @@ fn preflight_signature_policy(
         &SigningAnchors {
             home: home.as_deref(),
             master_pubkeys: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
-            identity_path: machines::conventional_identity_path().as_deref(),
             now_unix: roster_now_unix(),
             duty,
         },
@@ -4114,7 +4222,6 @@ const fn roster_duty(build_done: bool) -> RosterDuty {
 pub struct SigningAnchors<'a> {
     pub home: Option<&'a Path>,
     pub master_pubkeys: &'a [&'a str],
-    pub identity_path: Option<&'a Path>,
     pub now_unix: i64,
     pub duty: RosterDuty,
 }
@@ -4137,21 +4244,30 @@ pub fn signing_verdict(
     #[cfg(unix)]
     let current = if armed {
         let home = anchors.home.ok_or_else(|| Error::new(NO_HOME_CONTEXT))?;
-        let named = creds
+        let source = creds
             .and_then(sign::ReleaseCredentials::machine_roster)
             .ok_or_else(|| Error::new("current signing authority needs a named roster pair"))?;
-        // A configured missing pair remains an error, not permission to fall back.
-        if machines::current_roster::read_local_candidate_with(named, anchors.master_pubkeys)?
-            .is_none()
-        {
-            return Err(Error::new(
-                "the profile's named public roster pair is absent",
-            ));
-        }
-        let canonical = home.join(atpkg_keys::provision::RELEASE_ROSTER_REL);
+        // The store's pair is always a candidate; an operator's profile file may name a pair of
+        // its own, and a configured missing pair remains an error, not permission to fall back.
+        let named = match source {
+            sign::RosterSource::Store => None,
+            sign::RosterSource::File(named) => {
+                if machines::current_roster::read_local_candidate_with(
+                    named,
+                    anchors.master_pubkeys,
+                )?
+                .is_none()
+                {
+                    return Err(Error::new(
+                        "the profile's named public roster pair is absent",
+                    ));
+                }
+                Some(named.as_path())
+            }
+        };
         Some(machines::current_roster::resolve(
             home,
-            &[named, &canonical],
+            &named.into_iter().collect::<Vec<_>>(),
             anchors.master_pubkeys,
             Ok(None),
             aterm_secrets::client::current_public_roster,
@@ -4166,10 +4282,9 @@ pub fn signing_verdict(
     #[cfg(not(unix))]
     let document = None;
     let declared = if armed {
-        machines::declared_machine_id(
-            creds.and_then(sign::ReleaseCredentials::machine_id),
-            anchors.identity_path,
-        )?
+        creds
+            .and_then(sign::ReleaseCredentials::machine_id)
+            .map(str::to_string)
     } else {
         None
     };
@@ -4206,8 +4321,9 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
         .ok_or_else(|| Error::new("signature-required cut has no persisted channel public key"))?;
     let creds = ctx.credentials.as_ref().ok_or_else(|| {
         Error::new(
-            "signature-required cut has no credentials; pass --release-credentials <path> \
-             (it is required on resume and recovery too, not only on the fresh cut)",
+            "signature-required cut has no credentials: the store holds no release ring and no \
+             --release-credentials <path> was named (a named profile is required on resume and \
+             recovery too, not only on the fresh cut)",
         )
     })?;
     let material = load_signing_material(Some(creds))?.ok_or_else(|| {
@@ -5820,17 +5936,8 @@ fn recover_published_cut(
 /// The commit's changelog cannot be read, is not UTF-8, or has no such section.
 pub fn release_body_of(git: &dyn ledger::GitRunner, commit: &str, version: &str) -> Result<String> {
     let spec = format!("{commit}:{}", changelog::CHANGELOG_FILE);
-    let out = ledger::git_read_ok(
-        git,
-        &[
-            "--no-lazy-fetch",
-            "--no-replace-objects",
-            "cat-file",
-            "blob",
-            &spec,
-        ],
-    )
-    .map_err(|e| Error::new(format!("read {spec}: {e}")))?;
+    let out = ledger::git_read_ok(git, &["--no-replace-objects", "cat-file", "blob", &spec])
+        .map_err(|e| Error::new(format!("read {spec}: {e}")))?;
     let text = String::from_utf8(out.stdout)
         .map_err(|_| Error::new(format!("{spec} is not valid UTF-8")))?;
     changelog::rolled_body(&text, version)
@@ -6101,7 +6208,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let _timing = crate::cut_timing::Timer::new("cut total");
     let preflight = crate::cut_timing::Timer::new("cut preflight");
     gates::arm_toolchain_lease();
-    let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref(), repo)
+    let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref())
         .map_err(Error::new)?;
     let credentials = credentials.as_ref();
     let t0 = Instant::now();
@@ -6779,7 +6886,7 @@ fn sign_beside_journal(existing: Option<&JournalHeader>, path: &Path) -> Result<
 /// re-proves it, runs the local self-check and writes the record the claim may adopt.
 pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
     gates::arm_toolchain_lease();
-    let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref(), repo)
+    let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref())
         .map_err(Error::new)?;
     let credentials = credentials.as_ref();
     let t0 = Instant::now();
@@ -9084,8 +9191,8 @@ pub fn preflight_channel_target(slug: &str, claimed: bool) -> Result<()> {
     if !push {
         return Err(Error::new(if crate::github::has_token() {
             format!(
-                "the release token ({}) cannot write {slug}: grant it write access{then}",
-                channel_token_pointer()
+                "the release token (vault entry {CHANNEL_TOKEN}) cannot write {slug}: grant it \
+                 write access{then}"
             )
         } else {
             format!(

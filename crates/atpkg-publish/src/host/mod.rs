@@ -134,9 +134,12 @@ pub trait ReleaseHost {
 
     /// Complete an existing release only through this host's original native
     /// create intent. This never creates a new release or adopts an unowned one.
-    /// `false` means no existing owned object could be completed.
+    /// `false` means no existing owned object could be completed. A host that
+    /// keeps no create-intent journal owns none, so it answers `false` and the
+    /// caller names the release it found rather than this host's missing journal.
     /// # Errors
-    /// Unsupported recovery, unknown ownership, permission or changed bytes.
+    /// A release this host's journal made for other notes or did not make (refused),
+    /// unknown ownership, permission or changed bytes.
     fn complete_created(
         &self,
         _slug: &Slug,
@@ -145,9 +148,7 @@ pub trait ReleaseHost {
         _notes: &str,
         _files: &[PathBuf],
     ) -> Result<bool, HostError> {
-        Err(HostError::Refused(
-            "the release host has no native create-intent recovery".into(),
-        ))
+        Ok(false)
     }
 
     /// Downloads `assets` of release `tag` into `dir`.

@@ -263,6 +263,15 @@ fn met_reply(row: &VolumeRow, freed: u64) -> String {
     )
 }
 
+fn timeout_reply(row: &VolumeRow, need: u64, freed: u64, adopted: bool, in_flight: bool) -> String {
+    format!(
+        "OK timeout status=timeout free_bytes={} need_bytes={need} vol={} freed_bytes={freed} demand={} pass_in_flight={in_flight}\n",
+        row.reading.free,
+        aterm_control::wire::pct_encode(&row.reading.mount.to_string_lossy()),
+        if adopted { "adopted" } else { "pending" },
+    )
+}
+
 /// `ERR unmet …`.
 fn unmet_reply(
     row: &VolumeRow,
@@ -469,6 +478,7 @@ fn park(
     let mut freed = 0u64;
     let mut adopted: Option<PassSummary> = None;
     let mut poked_at = demand.map_or_else(Instant::now, |d| d.poked);
+    let mut deadline_refreshed = false;
     loop {
         let g = shelf.board_lock();
         if !wait.observes_low_free()
@@ -536,6 +546,7 @@ fn park(
             beat_old,
             spent: adopted.as_ref().is_some_and(|p| p.spent && took(p, need)),
         };
+        let pass_in_flight = g.look_in_flight;
         let decision = decide(&facts);
         let now = Instant::now();
         let age = row.as_of.elapsed();
@@ -575,6 +586,13 @@ fn park(
             return "ERR exited\n".to_owned();
         }
         if Instant::now() >= deadline {
+            if demand.is_some() {
+                if !deadline_refreshed {
+                    deadline_refreshed = true;
+                    continue;
+                }
+                return timeout_reply(&row, need.unwrap_or(0), freed, taken, pass_in_flight);
+            }
             return "OK timeout\n".to_owned();
         }
         if row.as_of.elapsed() >= FRESH {

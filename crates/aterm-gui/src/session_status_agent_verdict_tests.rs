@@ -18,7 +18,8 @@ fn retiring_a_session_retires_its_footer_state() {
     observer.retire(4_321);
     assert_eq!(
         crate::claude_footer::STOPPED_SESSIONS.with(|r| r.borrow().clone()),
-        vec![4_321]
+        vec![(4_321, false)],
+        "a retired session's reader has no run left to mark"
     );
 }
 

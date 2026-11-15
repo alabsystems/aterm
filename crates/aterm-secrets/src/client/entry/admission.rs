@@ -29,7 +29,7 @@ std::thread_local! {
 }
 
 impl EntrySnapshot {
-    /// Revalidate an ordinary materialized entry and retain its shared vault
+    /// Revalidate an ordinary entry and retain its shared vault
     /// guard through `admit`. Acquisition is nonblocking. An unrelated signed
     /// update may pass; changed bytes, policy, recipient or a history rollback
     /// cannot continue this snapshot.
@@ -51,7 +51,7 @@ impl EntrySnapshot {
     ///
     /// # Errors
     /// The name is invalid or reserved, or the local state, signed cache,
-    /// decryption or materialized file cannot be safely read. Errors and unwinds
+    /// or decryption cannot be safely read. Errors and unwinds
     /// release the guard; a callback's durable effects are its responsibility.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -74,7 +74,7 @@ impl EntrySnapshot {
         paths: &Paths,
         admit: impl FnOnce(&VerifiedEntry) -> T,
     ) -> crate::Result<EntryAdmission<T>> {
-        validate_reading(&self.name, Reading::Materialized)?;
+        validate_reading(&self.name, Reading::Ordinary)?;
         if self.config.signer.is_none() {
             return Ok(EntryAdmission::Unavailable);
         }
@@ -88,7 +88,7 @@ impl EntrySnapshot {
             paths,
             &self.config,
             &self.name,
-            Reading::Materialized,
+            Reading::Ordinary,
             &mut None,
             observation.lock(),
         )?

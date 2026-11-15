@@ -120,7 +120,8 @@ pub enum EventKind {
     },
     /// A reader became unavailable or available again.
     Lane {
-        /// `cores`, `gpu`, `mem`, `procs` or `coalitions`.
+        /// `cores`, `gpu`, `mem`, `procs`, `coalitions`, or the kernel's process table
+        /// ([`crate::lanes::KPROC_TABLE`]).
         lane: &'static str,
         /// Available now.
         available: bool,
@@ -190,7 +191,7 @@ pub struct Detector {
     disk: Option<(String, [bool; 3])>,
     load: HashMap<LoadScope, LoadWatch>,
     tabs: Option<HashMap<u64, String>>,
-    lanes: [Option<bool>; 4],
+    lanes: [Option<bool>; 5],
     /// Whether the last facts' coalition lane read.
     coalitions: Option<bool>,
     /// Each tab's live processes in the last snapshot that swept them, for `orphan`.
@@ -383,6 +384,13 @@ impl Detector {
             ("gpu", s.gpu.is_some(), true),
             ("mem", s.mem.is_some(), true),
             ("procs", s.global.procs > 0, true),
+            (
+                crate::lanes::KPROC_TABLE,
+                !s.stalled
+                    .iter()
+                    .any(|l| l.lane == crate::lanes::KPROC_TABLE),
+                true,
+            ),
         ];
         for (i, (lane, now, seeds)) in lanes.into_iter().enumerate() {
             match self.lanes[i] {

@@ -567,39 +567,73 @@ fn width_reflow_tiered_history_precedes_visible_overflow() {
 
 #[test]
 fn width_reflow_tiered_restore_honors_line_limit() {
-    let scrollback = Scrollback::new(100, 1000, 10_000_000);
-    let mut grid = Grid::with_tiered_scrollback(3, 8, 2, scrollback);
-    grid.storage.set_store_line_limit(Some(4));
-
-    for i in 0..12u16 {
-        grid.set_cursor(2, 0);
-        for c in format!("H{i}").chars() {
-            grid.write_char(c);
-        }
-        grid.line_feed();
-        grid.carriage_return();
+    fn texts(grid: &mut Grid) -> Vec<String> {
+        (0..grid.scrollback_lines())
+            .map(|i| {
+                grid.get_history_line(i)
+                    .expect("history line present")
+                    .to_string()
+                    .trim_end_matches(' ')
+                    .to_string()
+            })
+            .collect()
     }
 
-    grid.resize(3, 6);
-    grid.assert_invariants();
+    let scrollback = Scrollback::new(100, 1000, 10_000_000);
+    let mut grid = Grid::with_tiered_scrollback(3, 8, 2, scrollback);
+    grid.set_scrollback_line_limit(Some(6));
+    let mut twin = Grid::with_scrollback(3, 8, 6);
 
+    for i in 0..12u16 {
+        for grid in [&mut grid, &mut twin] {
+            grid.set_cursor(2, 0);
+            for c in format!("H{i}").chars() {
+                grid.write_char(c);
+            }
+            grid.line_feed();
+            grid.carriage_return();
+        }
+    }
+    for grid in [&mut grid, &mut twin] {
+        grid.drain_lazy_buffer();
+        grid.assert_invariants();
+    }
+    assert_eq!(
+        texts(&mut grid),
+        texts(&mut twin),
+        "same history before resize"
+    );
+
+    for grid in [&mut grid, &mut twin] {
+        grid.resize(3, 6);
+        grid.assert_invariants();
+    }
     assert_eq!(
         grid.scrollback_lines(),
-        4,
-        "restore must enforce the line limit"
+        6,
+        "restore must retain the total ring and store limit"
     );
-    let texts: Vec<String> = (0..4)
-        .map(|i| {
-            grid.get_history_line(i)
-                .expect("history line present")
-                .to_string()
-                .trim_end_matches(' ')
-                .to_string()
-        })
-        .collect();
     assert_eq!(
-        texts,
-        vec!["H6", "H7", "H8", "H9"],
+        texts(&mut grid),
+        vec!["H4", "H5", "H6", "H7", "H8", "H9"],
         "oldest history evicted, newest kept"
     );
+    assert_eq!(texts(&mut grid), texts(&mut twin));
+
+    for (cols, label) in [(10, 'A'), (5, 'B'), (8, 'C')] {
+        for grid in [&mut grid, &mut twin] {
+            grid.set_cursor(2, 0);
+            grid.write_char(label);
+            grid.line_feed();
+            grid.carriage_return();
+            grid.resize(3, cols);
+            grid.assert_invariants();
+        }
+        assert_eq!(grid.scrollback_lines(), twin.scrollback_lines());
+        assert_eq!(
+            texts(&mut grid),
+            texts(&mut twin),
+            "streaming and another width change must preserve the same total at {cols} columns"
+        );
+    }
 }

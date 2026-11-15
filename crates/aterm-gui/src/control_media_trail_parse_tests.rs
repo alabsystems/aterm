@@ -9,14 +9,18 @@ fn the_status_keyword_and_a_ring_count_are_separate_forms() {
     assert_eq!(parse_trail_form("  status  "), Ok(TrailForm::Status));
     assert_eq!(parse_trail_form("light"), Ok(TrailForm::Light));
     assert_eq!(parse_trail_form(" light "), Ok(TrailForm::Light));
+    assert_eq!(parse_trail_form("warm"), Ok(TrailForm::Warm));
+    assert_eq!(parse_trail_form(" warm "), Ok(TrailForm::Warm));
     assert_eq!(parse_trail_form(""), Ok(TrailForm::Admissions(None)));
     assert_eq!(parse_trail_form("   "), Ok(TrailForm::Admissions(None)));
     assert_eq!(parse_trail_form("8"), Ok(TrailForm::Admissions(Some(8))));
     assert_eq!(parse_trail_form("0"), Ok(TrailForm::Admissions(Some(0))));
-    for bad in ["stats", "Status", "Light", "lights", "on", "-1", "3 4"] {
+    for bad in [
+        "stats", "Status", "Light", "lights", "Warm", "warmer", "on", "-1", "3 4",
+    ] {
         assert_eq!(
             parse_trail_form(bad),
-            Err("usage: trail [status|light|<n>]".to_string()),
+            Err("usage: trail [status|light|warm|<n>]".to_string()),
             "{bad:?} must be refused"
         );
     }

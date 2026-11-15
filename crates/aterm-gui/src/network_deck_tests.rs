@@ -388,10 +388,11 @@ fn peer_contact_and_check_clocks_each_bound_current_reachability() {
     }
 }
 
-/// A peer its observer reaches every 24 s is Reachable for 48 s after a contact. The deck ages
-/// it by that lease, as the observer does, and hands back the same snapshot while it holds.
+/// A peer whose contact was promised its next round within 48 s is Reachable for 48 s after it.
+/// The deck ages it by that lease, as the observer does, and hands back the same snapshot while
+/// it holds.
 #[test]
-fn a_measured_lease_keeps_a_slow_peer_reachable_in_the_deck() {
+fn a_contact_lease_keeps_a_peer_reachable_in_the_deck() {
     let mut snapshot = NetworkStateSnapshot::default();
     snapshot.network.visibility = Visibility::Active;
     snapshot.network.observed_at_ms = 120_000;
@@ -401,7 +402,7 @@ fn a_measured_lease_keeps_a_slow_peer_reachable_in_the_deck() {
     remote.lease_ms = Some(48_000);
     snapshot.network.peers.push(remote.clone());
     let snapshot = std::sync::Arc::new(snapshot);
-    // Twenty seconds after the contact, past the 15 s of a peer with no measured lease.
+    // Twenty seconds after the contact, past the 15 s of a peer whose row names no lease.
     let held = fresh_snapshot(snapshot.clone(), Some(120_000));
     assert!(std::sync::Arc::ptr_eq(&held, &snapshot));
     assert_eq!(held.network.peers[0].reachability, Reachability::Reachable);

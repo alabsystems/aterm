@@ -6,14 +6,14 @@
 use super::*;
 
 /// A candidate in the authenticated recipient view. A present entry whose
-/// materialized file cannot be verified is unavailable, never absent.
+/// anchor set does not resolve in the same view is unavailable, never absent.
 #[derive(Debug)]
 pub enum EntryRead {
-    /// Authenticated bytes that match this entry's materialization policy.
+    /// Authenticated bytes of this entry, read in place.
     Present(Box<VerifiedEntry>),
     /// No such entry in the authenticated view visible to this recipient.
     Absent(Box<EntryVersion>),
-    /// The source, custody or materialized entry cannot be verified.
+    /// The source, custody or entry's anchor set cannot be verified.
     Unavailable,
 }
 
@@ -40,7 +40,7 @@ impl EntryReader<'_> {
     /// # Errors
     /// The name is invalid or reserved, or its source cannot be safely read.
     pub fn observe(&self, name: &str) -> crate::Result<EntryRead> {
-        validate_reading(name, Reading::Materialized)?;
+        validate_reading(name, Reading::Ordinary)?;
         if !self.observation.observes(self.paths) {
             return Ok(EntryRead::Unavailable);
         }
@@ -50,7 +50,7 @@ impl EntryReader<'_> {
             self.paths,
             &self.version.config,
             name,
-            Reading::Materialized,
+            Reading::Ordinary,
             &mut version,
             (self.observation, &mut present),
             &mut None,
@@ -80,7 +80,7 @@ impl VaultLook<'_> {
     /// entry. A valid view with no entries can therefore support an all-absent
     /// decision. Unconfigured, incomplete or denied state does not enter the
     /// callback. This acquires no additional vault-state lock.
-    /// Each candidate's materialization is checked by `EntryReader::observe`.
+    /// Each candidate's anchor set is checked by `EntryReader::observe`.
     ///
     /// Acquire the application writer before this look. The callback must read
     /// every candidate relevant to its decision and compare those facts with
@@ -157,7 +157,7 @@ fn read_view_borrowed<T>(
 }
 
 impl EntrySnapshot {
-    /// Admit this ordinary materialized entry using an already-held vault
+    /// Admit this ordinary entry using an already-held vault
     /// look. The callback may inspect other candidates through `EntryReader`
     /// and persist one prepared local intent. Missing or stale custody refuses
     /// without acquiring another vault-state lock. The caller retains ownership of the
@@ -194,7 +194,7 @@ impl EntrySnapshot {
         look: &VaultLook<'_>,
         admit: impl FnOnce(&VerifiedEntry, &EntryReader<'_>) -> T,
     ) -> crate::Result<EntryAdmission<T>> {
-        validate_reading(&self.name, Reading::Materialized)?;
+        validate_reading(&self.name, Reading::Ordinary)?;
         if self.config.signer.is_none() {
             return Ok(EntryAdmission::Unavailable);
         }
@@ -229,7 +229,7 @@ impl EntrySnapshot {
             paths,
             &self.config,
             &self.name,
-            Reading::Materialized,
+            Reading::Ordinary,
             &mut None,
             observation,
         )?

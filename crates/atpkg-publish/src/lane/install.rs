@@ -290,14 +290,15 @@ pub fn install_with(
         ));
     }
     let keyless_ok = kind == LaneKind::Linux && flags.keyless;
-    let identity = [
-        ("machine key", &ctx.identity.key),
-        ("machine record", &ctx.identity.record),
-    ];
-    if !keyless_ok && let Some((what, path)) = identity.iter().find(|(_, p)| !p.is_file()) {
+    if !keyless_ok && let Some(what) = crate::identity::missing(ctx)? {
+        let path = if what == "machine key" {
+            &ctx.identity.key
+        } else {
+            &ctx.identity.record
+        };
         return Err(Error::refused(format!(
-            "no {what} at {} — the lane signs; provision this machine first (`atpkg-keys \
-             join --id <id>`){}",
+            "no {what}: the store holds no release ring and there is none at {} — the lane \
+             signs; provision this machine first (`atpkg-keys join --id <id>`){}",
             ctx.shown(path),
             if kind == LaneKind::Linux {
                 ", or say --keyless for a builder that only stages for a rostered machine's \

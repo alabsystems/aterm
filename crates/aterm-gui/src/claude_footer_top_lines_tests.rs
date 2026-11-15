@@ -516,7 +516,7 @@ fn agys_label_wears_the_moonbow_under_autopilot_off() {
     let (cruise, cruise_switch) = read(&app);
     assert!(app.set_session_autopilot(
         session,
-        Some(aterm_agent::supervise::Autopilot::Off),
+        Some(alab_policy::config::Autopilot::Off),
         crate::autopilot::Surface::Chip
     ));
     settle(&mut app);
@@ -1248,9 +1248,9 @@ fn codex_composer_is_unchanged_by_the_host_footer() {
         for proven in [false, true] {
             set_proven(&app, session, proven);
             for mode in [
-                aterm_agent::supervise::Autopilot::Cruise,
-                aterm_agent::supervise::Autopilot::Land,
-                aterm_agent::supervise::Autopilot::Off,
+                alab_policy::config::Autopilot::Cruise,
+                alab_policy::config::Autopilot::Land,
+                alab_policy::config::Autopilot::Off,
             ] {
                 assert!(app.set_session_autopilot(
                     session,

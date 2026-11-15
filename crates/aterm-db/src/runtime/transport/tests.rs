@@ -208,6 +208,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
     let transport = Transport {
         endpoint: Some(lab.endpoints[0].clone()),
         links: vec![],
+        linked: BTreeSet::new(),
         hints: Hints::new([1; 32]),
         workers: vec![worker],
         beacon: Instant::now(),
@@ -224,7 +225,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         push: None,
         failure: None,
         doorbell: None,
-        announced: Arc::default(),
+        moves: Moves::default(),
         stand_in: None,
         delivering: None,
         observed: std::collections::BTreeMap::new(),
@@ -837,91 +838,102 @@ fn an_inbound_round_from_a_peer_ends_its_endpoints_backoff() {
     }
 }
 
-/// C4 through real rounds and [`Transport::finish`], which reads each round dialled in as
-/// quiet or not. A's endpoint for B is verified and at rest. B dials A with nothing to move:
-/// A's own dial of B waits an ordinary interval again from that round. B then takes a record A
-/// lacks and dials again: that round moves it, and A's dial stays where it was.
-///
-/// NEGATIVE CONTROL (2026-11-12): with [`Hints::vouch`] not moving a resting endpoint's next
-/// dial, A's dial stayed inside the interval of its own last round (`a quiet round dialled in
-/// holds this side's dial back`).
-/// NEGATIVE CONTROL (2026-11-12): with [`Transport::finish`] calling every round dialled in
-/// quiet, the round that moved the record held A's dial back again (`a round that moved a
-/// record holds nothing back`).
+/// Through real rounds and [`Transport::finish`]: a round dialled in leaves this side's resting
+/// endpoint for its peer at its audit, whatever the round moved. A's endpoint for B is verified
+/// and rests until its audit. B dials A with nothing to move, then takes a record A lacks and
+/// dials again, that round moving it: A's audit of B stays where it was after each. This
+/// replaces main's law that a quiet round dialled in held this side's dial back an interval:
+/// a resting endpoint's next dial is already its audit, on this side's own clock.
+/// MUTANT (`REPULLS`): each round dialled in pulls the healthy endpoint in to the ordinary
+/// interval.
 #[test]
-fn a_quiet_round_dialled_in_holds_this_sides_dial_back_and_one_that_moved_a_record_does_not() {
-    let lab = Lab::new();
-    let mut a = loopback_mode(None, 0, [71; 32]);
-    let theirs = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
-    let ours = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
-    let address = theirs.local_addr().unwrap();
-    let mut now = Instant::now();
-    a.hints
-        .observe(&Hints::new([72; 32]).wire(address.port()), address, now);
-    // A dials B until a round moves nothing: B's endpoint here is verified and at rest.
-    for _ in 0..3 {
-        let (chosen, repair) = a.hints.next(now).unwrap();
-        assert_eq!(chosen, address);
-        let (dialled, served) = round_at(&lab.endpoints[0], &lab.endpoints[1], &theirs, repair);
-        assert!(served.task.join().unwrap().2);
-        a.finish(dialled, now);
-        if !a.hints.follow_up_contains(address) {
-            break;
+fn a_round_dialled_in_leaves_a_resting_endpoints_audit_where_it_was() {
+    for repulls in [false, true] {
+        let lab = Lab::new();
+        let mut a = loopback_mode(None, 0, [71; 32]);
+        let theirs = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let ours = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+        let address = theirs.local_addr().unwrap();
+        let mut now = Instant::now();
+        a.hints
+            .observe(&Hints::new([72; 32]).wire(address.port()), address, now);
+        // A dials B until a round moves nothing: B's endpoint here is verified and at rest.
+        for _ in 0..3 {
+            let (chosen, repair) = a.hints.next(now).unwrap();
+            assert_eq!(chosen, address);
+            let (dialled, served) = round_at(&lab.endpoints[0], &lab.endpoints[1], &theirs, repair);
+            assert!(served.task.join().unwrap().2);
+            a.finish(dialled, now);
+            if !a.hints.follow_up_contains(address) {
+                break;
+            }
+            now += Duration::from_millis(500);
         }
-        now += Duration::from_millis(500);
-    }
-    assert!(a.hints.established(address));
-    let rested = a.hints.next_at(address);
-    assert!(rested < now + Duration::from_secs(5), "its own interval");
-
-    let dial_in = || {
-        let (dialled, served) = round_at(
-            &lab.endpoints[1],
-            &lab.endpoints[0],
-            &ours,
-            Repair::default(),
+        assert!(a.hints.established(address));
+        let rested = a.hints.next_at(address);
+        assert!(
+            rested >= now + crate::runtime::discovery::AUDIT_FLOOR,
+            "at rest until its audit"
         );
-        assert!(dialled.task.join().unwrap().2);
-        served
-    };
-    let heard = now + Duration::from_secs(2);
-    a.finish(dial_in(), heard);
-    let held = a.hints.next_at(address);
-    assert!(
-        held >= heard + Duration::from_secs(3),
-        "a quiet round dialled in holds this side's dial back"
-    );
 
-    let after = Node::test_seal(
-        &[21; 32],
-        [9; 16],
-        Edit::Update {
-            parent: lab.update.id(),
-            hosts: &[],
-            payload: b"written at B",
-        },
-        &[Identity::generate().unwrap().recipient()],
-        0,
-        &[],
-    )
-    .unwrap();
-    Journal::open_existing(&lab.dirs[1], lab.trust)
-        .unwrap()
-        .ingest(after.bytes())
+        let dial_in = || {
+            let (dialled, served) = round_at(
+                &lab.endpoints[1],
+                &lab.endpoints[0],
+                &ours,
+                Repair::default(),
+            );
+            assert!(dialled.task.join().unwrap().2);
+            served
+        };
+        let heard = now + Duration::from_secs(2);
+        crate::runtime::discovery::REPULLS.with(|flag| flag.set(repulls));
+        a.finish(dial_in(), heard);
+        crate::runtime::discovery::REPULLS.with(|flag| flag.set(false));
+        if repulls {
+            assert!(
+                a.hints.next_at(address) <= heard + Duration::from_secs(5),
+                "MUTANT: the quiet round pulled the resting endpoint in"
+            );
+            continue;
+        }
+        assert_eq!(
+            a.hints.next_at(address),
+            rested,
+            "a quiet round dialled in moves nothing"
+        );
+
+        let after = Node::test_seal(
+            &[21; 32],
+            [9; 16],
+            Edit::Update {
+                parent: lab.update.id(),
+                hosts: &[],
+                payload: b"written at B",
+            },
+            &[Identity::generate().unwrap().recipient()],
+            0,
+            &[],
+        )
         .unwrap();
-    a.finish(dial_in(), heard + Duration::from_secs(2));
-    assert!(
-        Journal::open_existing(&lab.dirs[0], lab.trust)
+        Journal::open_existing(&lab.dirs[1], lab.trust)
             .unwrap()
-            .node(&after.id())
-            .is_some(),
-        "the second round dialled in moved B's record to A"
-    );
-    assert_eq!(
-        a.hints.next_at(address),
-        held,
-        "a round that moved a record holds nothing back"
-    );
+            .ingest(after.bytes())
+            .unwrap();
+        a.finish(dial_in(), heard + Duration::from_secs(2));
+        assert!(
+            Journal::open_existing(&lab.dirs[0], lab.trust)
+                .unwrap()
+                .node(&after.id())
+                .is_some(),
+            "the second round dialled in moved B's record to A"
+        );
+        assert_eq!(
+            a.hints.next_at(address),
+            rested,
+            "a round that moved a record moves nothing either"
+        );
+    }
 }
 
 #[test]
@@ -978,8 +990,9 @@ fn repeated_listener_restarts_do_not_pin_failed_verified_discovery_ports() {
     let mut listeners = listeners;
     let current = listeners.pop().unwrap();
     drop(listeners);
-    // Observe real failed dials, not an untrusted beacon's claim of failure.
-    let retry = now + Duration::from_secs(10);
+    // Observe real failed dials, not an untrusted beacon's claim of failure: each old port's
+    // audit is due by then.
+    let retry = now + crate::runtime::discovery::REVERIFY;
     for _ in 0..2 {
         let (address, repair) = hints.next(retry).unwrap();
         assert!(old_addresses.contains(&address));
@@ -1255,9 +1268,11 @@ fn unproved_candidates_leave_an_outgoing_slot_for_an_established_peer() {
     {
         held.push(accept_ready(&listeners[1]));
     }
-    // Virtual time passes the normal retry. Neither silent TLS peer has been
+    // Virtual time passes the established peer's audit. Neither silent TLS peer has been
     // released: an established peer must not wait for their network deadlines.
-    transport.tick(now + Duration::from_secs(6)).unwrap();
+    transport
+        .tick(now + crate::runtime::discovery::REVERIFY)
+        .unwrap();
     assert!(
         transport
             .workers
@@ -1473,6 +1488,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
             hints,
             delivering: None,
         }],
+        linked: BTreeSet::from([IpAddr::from(Ipv4Addr::LOCALHOST)]),
         hints: Hints::new(token),
         workers: vec![],
         beacon: now,
@@ -1489,7 +1505,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         push: None,
         failure: None,
         doorbell: None,
-        announced: Arc::default(),
+        moves: Moves::default(),
         stand_in: None,
         delivering: None,
         observed: std::collections::BTreeMap::new(),
@@ -1784,7 +1800,11 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
             .map(|clock| (clock.source, clock.class(crate::clock::Standing::Unknown))),
         Some((crate::clock::Source::Mark, crate::clock::Class::Agree))
     );
-    let contact = (newest.actor, newest.at);
+    // The contact carries what this transport's scheduler promises the peer: its next round
+    // within that long. Negative control: with `observe_contacts` handing the observer no
+    // promise (`Duration::ZERO`), the published lease below is the floor, `left: Some(15s)`.
+    assert_eq!(newest.lease, Hints::promise());
+    let contact = (newest.actor, newest.at, newest.lease);
     // Drive freshness from the real exchange's timestamp, not test execution speed.
     let at = contact.1;
     let wall = 100_000;
@@ -1803,7 +1823,7 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
         &bootstrap,
         &std::cell::OnceCell::new(),
         &mut observer,
-        vec![([0xff; 48], at)],
+        vec![([0xff; 48], at, newest.lease)],
         &[],
         &super::super::place::Publisher::default(),
         || (wall, at),
@@ -1884,6 +1904,11 @@ fn authenticated_transport_contacts_become_unconfirmed_retained_network_history(
     assert_eq!(live.peers.len(), 1);
     assert_eq!(live.peers[0].identity, expected);
     assert_eq!(live.peers[0].reachability, Reachability::Reachable);
+    // The peer is Reachable for as long as its contact was promised its next round.
+    assert_eq!(
+        live.peers[0].lease_ms.map(Duration::from_millis),
+        Some(Hints::promise())
+    );
     assert_eq!(
         live.peers[0].last_authenticated_endpoint.as_ref(),
         Some(&endpoint)
@@ -2007,28 +2032,27 @@ fn discovered_commons_tables_repair_without_a_peer_list_and_rejoin_after_offline
     );
 }
 
-/// C3, through two serving transports and the production store, listener and rounds. Once the
-/// two hold the same and nothing is due, a commit on this thread rings A's doorbell; the turn
-/// that ring wakes counts one announce and starts a dial of B with the clock not advanced; and
-/// B comes to hold the record. What B's round thread ingested for it announces nothing at B,
-/// whose listener hears every append to its custody: B's bank stays empty to the end.
+/// C3, through two serving transports, the production store, each one's watched look at what
+/// moved here ([`Moves::start`]) and real rounds. Once the two hold the same and nothing is due,
+/// a commit on this thread rings A's doorbell through A's watch; the turn that ring wakes looks,
+/// counts one look that found a move, and starts a dial of B with the clock not advanced; and B
+/// comes to hold the record. B's own look then finds what its round brought, and offers it to
+/// no seat: A, its only one, is the seat it came from (the walk's law of that is
+/// `a_moved_table_walks_untried_seats_until_two_already_held_it_and_skips_its_source`).
 ///
-/// NEGATIVE CONTROL (2026-11-12): with the listener noting the table and ringing nothing, A's
-/// wait stayed unready (`the commit rings the owner`).
-/// NEGATIVE CONTROL (2026-11-12): with [`Hints::announce`] leaving each endpoint's next dial
-/// where it was, the woken turn started no dial (`the woken turn dials B at the same instant`:
-/// `left: 0`, `right: 1`).
-/// NEGATIVE CONTROL (2026-11-12): with the listener not reading whether its thread runs a
-/// round, B announced the record its round brought it (`what a round brought B announces
-/// nothing there`: `left: Some(({…}, false))`, `right: None`).
+/// The merge of 2026-11-13 ported this law from main's in-process listener, which named the
+/// table of an append this process made and nothing a round or another process wrote, to the
+/// look, which reads what this Mac holds whoever wrote it. The ring is the watch's, so it is
+/// waited for with a one-minute hang detector rather than read at once.
+///
+/// NEGATIVE CONTROL (2026-11-12, as an announce): with the woken turn leaving each endpoint's
+/// next dial where it was, the woken turn started no dial (`the woken turn dials B at the same
+/// instant`: `left: 0`, `right: 1`); the walk's own control is `NO_WALK`.
 #[test]
-fn a_local_append_dials_the_peer_at_once_and_what_the_round_brings_announces_nothing() {
+fn a_local_append_dials_the_peer_at_once_and_its_peer_offers_it_back_to_nobody() {
     use crate::{
         catalog::Directory,
-        table::{
-            Session,
-            store::{Store, claim_dir_of, listen},
-        },
+        table::{Session, store::Store},
     };
     use aterm_secrets::commons::roster::Role;
     let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer]);
@@ -2060,15 +2084,21 @@ fn a_local_append_dials_the_peer_at_once_and_what_the_round_brings_announces_not
     a.doorbell = Some(Arc::new(Doorbell::new().unwrap()));
     let port = a.links[0].hints.port();
     let mut b = loopback(endpoint(1), port, [62; 32]);
-    let _hearing = [
-        listen(claim_dir_of(&bootstrap).unwrap(), a.announcer()).expect("a free slot"),
-        listen(claim_dir_of(&lab.bootstrap(1)).unwrap(), b.announcer()).expect("a free slot"),
-    ];
+    b.doorbell = Some(Arc::new(Doorbell::new().unwrap()));
+    for (mac, node) in [(&mut a, 0), (&mut b, 1)] {
+        let bootstrap = lab.bootstrap(node);
+        let bell = mac.doorbell();
+        mac.watching(Moves::start(
+            &lab.paths[node],
+            bootstrap.journal_dir(),
+            bootstrap.trust(),
+            bell,
+        ));
+    }
     let b_at = b.links[0].listener.as_ref().unwrap().local_addr().unwrap();
     // Tick both on one virtual clock until `done` holds with no round running: it advances a
-    // tick while both rest and follows the wall clock while a round runs. Before each of B's
-    // turns its bank is read, and must be empty. The hang detector is a minute with no round
-    // finished on either side.
+    // tick while both rest and follows the wall clock while a round runs. The hang detector is
+    // a minute with no round finished on either side.
     let drive = |a: &mut Transport,
                  b: &mut Transport,
                  mut now: Instant,
@@ -2078,11 +2108,6 @@ fn a_local_append_dials_the_peer_at_once_and_what_the_round_brings_announces_not
         let mut finished = (a.finished_rounds, b.finished_rounds);
         loop {
             a.tick(now).unwrap();
-            assert_eq!(
-                b.announced.take(),
-                None,
-                "what a round brought B announces nothing there"
-            );
             b.tick(now).unwrap();
             let idle = a.workers.is_empty() && b.workers.is_empty();
             if idle && done(a, b, now) {
@@ -2103,7 +2128,7 @@ fn a_local_append_dials_the_peer_at_once_and_what_the_round_brings_announces_not
     };
     let held = |b: &Transport| b.observed.get(&scope.digest()).copied().unwrap_or(0);
     // B holds the first record, A has B's endpoint established, and neither A's next dial of
-    // it nor its spacing is due.
+    // it, half a second on, nor its spacing is due.
     let now = drive(
         &mut a,
         &mut b,
@@ -2113,24 +2138,34 @@ fn a_local_append_dials_the_peer_at_once_and_what_the_round_brings_announces_not
             held(b) >= 1
                 && a.hints.established(b_at)
                 && a.dial <= now
-                && a.hints.next_at(b_at) > now
+                && a.hints.next_at(b_at) > now + Duration::from_millis(500)
         },
     );
+    // Past the walk's gap after A's last round with B, where its own rest is not over. What A's
+    // watch heard of the rounds' own writes is taken here: a look reads what A holds, and they
+    // moved nothing of it.
+    let now = now + Duration::from_millis(500);
+    assert!(a.hints.next_at(b_at) > now, "A's own dial of B rests");
     a.clear_doorbell();
     a.turn(now, false).unwrap();
     assert_eq!(a.workers.len(), 0, "nothing is due before the commit");
-    let ready = |a: &Transport| aterm_uds::ready::any_now(&a.waits_on().unwrap()).unwrap();
-    assert!(ready(&a).is_empty(), "and nothing wakes the owner");
+    a.clear_doorbell();
     let announces = census::cadence_here().announces;
 
     commit(b"second proposal");
-    assert!(!ready(&a).is_empty(), "the commit rings the owner");
+    // The watch rings from its own thread; a minute is the hang detector.
+    let rung = aterm_uds::ready::any_until(
+        &a.waits_on().unwrap(),
+        Instant::now() + Duration::from_secs(60),
+    )
+    .unwrap();
+    assert!(!rung.is_empty(), "the commit rings the owner");
     a.clear_doorbell();
     a.turn(now, false).unwrap();
     assert_eq!(
         census::cadence_here().announces - announces,
         1,
-        "the woken turn takes one announce"
+        "the woken turn's look finds one move"
     );
     assert_eq!(
         a.workers
@@ -2143,12 +2178,6 @@ fn a_local_append_dials_the_peer_at_once_and_what_the_round_brings_announces_not
     drive(&mut a, &mut b, now, "the second record", &|_, b, _| {
         held(b) >= 2
     });
-    assert_eq!(b.announced.take(), None);
-    assert_eq!(
-        census::cadence_here().announces - announces,
-        1,
-        "one commit, one announce, on either side"
-    );
 }
 
 #[test]
@@ -2261,7 +2290,12 @@ fn failed_transport_observation_replaces_the_active_reason_and_retains_history()
         label: None,
     };
     let contact_ms = aterm_time::unix_millis().unwrap();
-    observer.contact(identity.clone(), contact_ms, Instant::now());
+    observer.contact(
+        identity.clone(),
+        contact_ms,
+        Instant::now(),
+        Hints::promise(),
+    );
     let mut transport = loopback_mode(None, 0, [3; 32]);
     let modes = [
         ObservationMode::Repair,
@@ -2341,7 +2375,12 @@ fn an_undelivered_link_never_reads_active_between_its_refresh_and_its_send() {
         incarnation: [5; 16],
         label: None,
     };
-    observer.contact(identity, aterm_time::unix_millis().unwrap(), Instant::now());
+    observer.contact(
+        identity,
+        aterm_time::unix_millis().unwrap(),
+        Instant::now(),
+        Hints::promise(),
+    );
     delivering.store(false, Ordering::Release);
     transport.tick(Instant::now() + BEACON).unwrap();
     assert!(transport.unavailable(), "its next beacon undelivered");
@@ -2647,4 +2686,777 @@ fn an_idle_transport_waits_for_its_beacon_and_a_heard_peer_for_its_dial() {
         "with its one peer in a round, nothing is due before the beacon"
     );
     transport.stop();
+}
+
+/// A table written on this Mac is offered to a resting peer at once, across real rounds: with
+/// this Mac's endpoint for the peer at rest until its audit, minutes off, the tick after its
+/// polled round looks and finds the table moved, the walk dials the peer though its own wait is
+/// not over, and the round repairs the written table first, not the scan's turn.
+/// The peer's own look then finds the table moved there, names this Mac as where it came from,
+/// and does not offer it back. A peer that answers no ask of which tables differ (`witnessless`,
+/// a build from before witnesses) is offered the table the same way: the walk's lead asks it
+/// nothing.
+/// MUTANT (`NO_WALK`): the peer is not dialled until its own wait ends, witnesses or none.
+/// MUTANT (`SOURCE_WALKED`): the peer dials this Mac back to offer it its own write.
+#[test]
+fn a_table_written_here_is_offered_to_a_resting_peer_and_not_back_to_its_source() {
+    use crate::replica::tests::witness::{endpoint, held, tables, write};
+    use crate::runtime::discovery::{NO_WALK, SOURCE_WALKED};
+    use aterm_secrets::commons::roster::Role;
+    for (mutant, walks, witnessless) in [
+        (None, true, false),
+        (Some(&NO_WALK), false, false),
+        (Some(&SOURCE_WALKED), true, false),
+        (None, true, true),
+        (Some(&NO_WALK), false, true),
+    ] {
+        let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, 4);
+        let endpoints = [0, 1].map(|node| {
+            Arc::new(endpoint(&lab, &tables, node).with_witnesses(!(witnessless && node == 1)))
+        });
+        let listeners = [0, 1]
+            .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap());
+        let mut macs = [
+            loopback_mode(None, 0, [81; 32]),
+            loopback_mode(None, 0, [82; 32]),
+        ];
+        // Every scheduler call reads this one instant or a later one it names: no wait ends by
+        // the time the test takes.
+        let mut now = Instant::now();
+        // One round `from` dials its peer with, joined by both transports at `now`; its report.
+        let round = |macs: &mut [Transport; 2], from: usize, repair: Repair, now: Instant| {
+            let to = 1 - from;
+            let (dialled, served) =
+                round_at(&endpoints[from], &endpoints[to], &listeners[to], repair);
+            macs[to].finish(served, now);
+            macs[from].finish(dialled, now);
+            macs[to].reports().for_each(drop);
+            macs[from].reports().last().unwrap()
+        };
+        // Mac 0 dials its peer through its first sweep until its endpoint rests until its audit,
+        // minutes off: what reaches the peer before then is the walk's. Its peer beacons all the
+        // while, so no silence is probed. The peer dials Mac 0 until a round moves nothing.
+        let beacons: [_; 2] = std::array::from_fn(|from| {
+            let address = listeners[1 - from].local_addr().unwrap();
+            (address, Hints::new([83; 32]).wire(address.port()))
+        });
+        for from in [0, 1] {
+            let (address, beacon) = &beacons[from];
+            loop {
+                macs[from].hints.observe(beacon, *address, now);
+                let (chosen, repair) = macs[from].hints.next(now).unwrap();
+                assert_eq!(chosen, *address);
+                let report = round(&mut macs, from, repair, now);
+                assert!(report.control.is_ok(), "{report:?}");
+                let settled = if from == 0 {
+                    macs[0].hints.rests(*address)
+                } else {
+                    !macs[1].hints.follow_up_contains(*address)
+                };
+                if settled {
+                    break;
+                }
+                now = macs[from].hints.next_at(*address);
+            }
+            assert!(macs[from].hints.established(*address));
+        }
+        // A walk dials an endpoint once its gap after its last round is over.
+        now += crate::runtime::discovery::WALK_GAP;
+        for (node, mac) in macs.iter_mut().enumerate() {
+            let bootstrap = lab.bootstrap(node);
+            mac.watching(Moves::unwatched(
+                &lab.paths[node],
+                bootstrap.journal_dir(),
+                bootstrap.trust(),
+            ));
+            let (address, beacon) = &beacons[node];
+            mac.hints.observe(beacon, *address, now);
+            assert!(mac.hints.next(now).is_none(), "Mac {node}'s peer rests");
+        }
+        assert!(
+            macs[0].hints.rests(beacons[0].0),
+            "Mac 0's next dial of its peer is its audit"
+        );
+
+        write(&lab, &tables, 2, 0);
+        macs[0].look_soon();
+        macs[0].tick(now).unwrap();
+        assert_eq!(
+            macs[0].hints.hot_count(),
+            1,
+            "the look found the table moved"
+        );
+        let set = |on: bool| {
+            if let Some(flag) = mutant {
+                flag.with(|flag| flag.set(on));
+            }
+        };
+        set(true);
+        let dial = macs[0].hints.next(now);
+        set(false);
+        if !walks {
+            assert!(dial.is_none(), "MUTANT: the peer rests on");
+            continue;
+        }
+        let (_, repair) = dial.expect("the resting peer is dialled");
+        let report = round(&mut macs, 0, repair, now).application.unwrap();
+        assert_eq!(
+            report.table,
+            Some(tables[2].0.digest()),
+            "the written table"
+        );
+        assert!(!report.regular, "led, not the scan's turn");
+        assert_eq!((report.sent, report.caught_up), (1, true));
+        assert_eq!(held(&lab, &tables, 2, 1), 1, "the peer holds the record");
+
+        // The peer's round received the record: its next tick looks, and names this Mac as the
+        // source.
+        set(true);
+        macs[1].tick(now).unwrap();
+        let back = macs[1].hints.next(now).map(|(address, _)| address);
+        set(false);
+        if mutant.is_some() {
+            let source = listeners[0].local_addr().unwrap();
+            assert_eq!(back, Some(source), "MUTANT: offered back to its source");
+        } else {
+            assert_eq!(back, None, "nobody else to offer it to");
+            assert_eq!(macs[1].hints.hot_count(), 0);
+        }
+    }
+}
+
+/// Each Mac's own dials of its peer ([`a_converged_pair_is_quiet_until_its_audits_and_an_audit_brings_what_nothing_told`]):
+/// when each began, whether it was asked to audit, and the table its round took with whether
+/// that was the scan's regular turn.
+type OwnDials = Vec<(
+    Duration,
+    bool,
+    Option<(Option<astream_wire::sync::Digest>, bool)>,
+)>;
+
+/// Through two transports, real rounds over four tables and a stepped clock, with no look at
+/// what moved on either Mac (`Moves::default`): a converged pair is quiet until its audits.
+/// Each Mac dials its peer through its first sweep and then rests. From then each of its own
+/// dials is an audit, the first [`AUDIT_FLOOR`] or more after the sweep's first round and within
+/// [`REVERIFY`] of its last, each later one [`AUDIT_FLOOR`] to [`REVERIFY`] after the one before,
+/// and no other dial comes between, whatever rounds its peer dials in. Beacons are heard every
+/// five seconds, as from a live peer, so no silence is probed. Then the peer writes into the
+/// table this Mac's last audit took, which the scan's next turn passes by. Nothing tells this
+/// Mac: it dials nothing before its audit, whose round asks which tables differ, visits that
+/// table and brings the record.
+/// MUTANT (`AUDIT_UNASKED`): the audit's dial is not asked to audit; its round, inside the
+/// witness gap, asks nothing and takes the scan's next table, and the record stays at the peer.
+#[test]
+fn a_converged_pair_is_quiet_until_its_audits_and_an_audit_brings_what_nothing_told() {
+    use crate::replica::tests::witness::{endpoint, held, tables, write};
+    use crate::runtime::discovery::{AUDIT_FLOOR, AUDIT_UNASKED, REVERIFY};
+    use aterm_secrets::commons::roster::Role;
+    for unasked in [false, true] {
+        let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+        let tables = tables(&lab, 4);
+        let endpoints = [0, 1].map(|node| Arc::new(endpoint(&lab, &tables, node)));
+        let listeners = [0, 1]
+            .map(|_| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap());
+        let addresses = [0, 1].map(|node| listeners[node].local_addr().unwrap());
+        let tokens = [[91; 32], [92; 32]];
+        let mut macs = tokens.map(|token| loopback_mode(None, 0, token));
+        // One round `from` dials its peer with, joined by both transports at `now`; its report.
+        let round = |macs: &mut [Transport; 2], from: usize, repair: Repair, now: Instant| {
+            let to = 1 - from;
+            let (dialled, served) =
+                round_at(&endpoints[from], &endpoints[to], &listeners[to], repair);
+            macs[to].finish(served, now);
+            macs[from].finish(dialled, now);
+            macs[to].reports().for_each(drop);
+            macs[from].reports().last().unwrap()
+        };
+        let start = Instant::now();
+        let span = 3 * REVERIFY;
+        let mut own: [OwnDials; 2] = Default::default();
+        let mut rested: [Option<Duration>; 2] = [None; 2];
+        for second in 0..=span.as_secs() {
+            let since = Duration::from_secs(second);
+            let now = start + since;
+            for from in [0, 1] {
+                let to = 1 - from;
+                if second % 5 == 0 {
+                    let beacon = Hints::new(tokens[to]).wire(addresses[to].port());
+                    macs[from].hints.observe(&beacon, addresses[to], now);
+                }
+                let Some((chosen, repair)) = macs[from].hints.next(now) else {
+                    continue;
+                };
+                assert_eq!(chosen, addresses[to]);
+                let audited = repair.audited();
+                let report = round(&mut macs, from, repair, now);
+                assert!(report.control.is_ok(), "{report:?}");
+                let took = report.application.map(|took| (took.table, took.regular));
+                own[from].push((since, audited, took));
+                if rested[from].is_none() && macs[from].hints.rests(addresses[to]) {
+                    rested[from] = Some(since);
+                }
+            }
+        }
+        for (node, own) in own.iter().enumerate() {
+            let settled = rested[node].expect("each Mac rests after its first sweep");
+            assert!(settled < Duration::from_secs(60), "Mac {node}: {own:?}");
+            let audits: Vec<_> = own.iter().filter(|(at, ..)| *at > settled).collect();
+            assert!(
+                audits.iter().all(|(_, audited, _)| *audited),
+                "Mac {node}: once at rest, only audits: {own:?}"
+            );
+            assert!(audits.len() >= 2, "Mac {node}: {own:?}");
+            let first = audits[0].0;
+            assert!(
+                first >= own[0].0 + AUDIT_FLOOR && first <= settled + REVERIFY,
+                "Mac {node}: its first audit: {own:?}"
+            );
+            for pair in audits.windows(2) {
+                let gap = pair[1].0 - pair[0].0;
+                assert!(
+                    (AUDIT_FLOOR..=REVERIFY + Duration::from_secs(1)).contains(&gap),
+                    "Mac {node}: {gap:?} between two audits: {own:?}"
+                );
+            }
+        }
+
+        // The peer writes into the table Mac 0's last audit took.
+        let Some((_, true, Some((Some(last), true)))) = own[0].last().copied() else {
+            panic!(
+                "Mac 0's last dial was an audit that took the scan's turn: {:?}",
+                own[0]
+            );
+        };
+        let written = tables
+            .iter()
+            .position(|(scope, _)| scope.digest() == last)
+            .unwrap();
+        write(&lab, &tables, written, 1);
+        let after = start + span + Duration::from_secs(1);
+        assert!(macs[0].hints.rests(addresses[1]));
+        assert!(macs[0].hints.next(after).is_none(), "nothing told Mac 0");
+        let audit = macs[0].hints.next_at(addresses[1]);
+        // The peer still beacons: the dial is its audit, not a silence's probe.
+        let beacon = Hints::new(tokens[1]).wire(addresses[1].port());
+        macs[0].hints.observe(&beacon, addresses[1], audit);
+        AUDIT_UNASKED.with(|flag| flag.set(unasked));
+        let dial = macs[0].hints.next(audit);
+        AUDIT_UNASKED.with(|flag| flag.set(false));
+        let (_, repair) = dial.expect("its audit");
+        assert_eq!(repair.audited(), !unasked);
+        let took = round(&mut macs, 0, repair, audit).application.unwrap();
+        if unasked {
+            assert_ne!(took.table, Some(last), "MUTANT: the scan's next table");
+            assert_eq!(
+                held(&lab, &tables, written, 0),
+                0,
+                "MUTANT: still at the peer"
+            );
+            continue;
+        }
+        assert!(took.witnesses_asked, "{took:?}");
+        assert_eq!(took.table, Some(last), "the table whose witness differed");
+        assert_eq!(
+            held(&lab, &tables, written, 0),
+            1,
+            "the audit brought the record"
+        );
+    }
+}
+
+/// A peer whose listener closed is told gone by the first dial its port refuses, over real
+/// sockets and the real worker: the departure names its seat and the instant that dial began.
+/// A round this transport stopped itself asked the peer nothing: two of them in a row tell
+/// nothing, and leave the next refused dial to tell it. Once told, the port's later refusals
+/// tell nothing more.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `finish` passing `Outcome::dialled` no cancellation, the
+/// second stopped round told the peer gone (`a round this side stopped told its peer gone`).
+#[test]
+fn a_peer_whose_listener_closed_is_told_gone_by_its_first_refused_dial() {
+    let lab = Lab::new();
+    let mut a = loopback_mode(None, 0, [73; 32]);
+    let old = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let address = old.local_addr().unwrap();
+    let mut now = Instant::now();
+    a.hints
+        .observe(&Hints::new([74; 32]).wire(address.port()), address, now);
+    // A dials B until a round moves nothing: B's endpoint here is established.
+    for _ in 0..3 {
+        let (chosen, repair) = a.hints.next(now).unwrap();
+        assert_eq!(chosen, address);
+        let (dialled, served) = round_at(&lab.endpoints[0], &lab.endpoints[1], &old, repair);
+        assert!(served.task.join().unwrap().2);
+        a.finish(dialled, now);
+        now += Duration::from_millis(500);
+        if !a.hints.follow_up_contains(address) {
+            break;
+        }
+    }
+    assert!(a.hints.established(address));
+    let seat = a.take_contacts()[0].actor;
+    assert_eq!(a.take_departures(), [], "its rounds completed");
+    let mut dial = |a: &mut Transport, stopped: bool| {
+        now = a.hints.next_at(address).max(now);
+        let (chosen, repair) = a.hints.next(now).unwrap();
+        assert_eq!(chosen, address);
+        let dialled = Worker::start(
+            lab.endpoints[0].clone(),
+            None,
+            Some(address),
+            Scope::Loopback,
+            None,
+            repair,
+            now,
+        )
+        .unwrap();
+        if stopped {
+            // Nobody serves the listener, so the round cannot end before it is stopped.
+            dialled.stop();
+        }
+        a.finish(dialled, now);
+        (a.take_departures(), now)
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            dial(&mut a, true).0,
+            [],
+            "a round this side stopped told its peer gone"
+        );
+    }
+    // B goes away: its port refuses each dial.
+    drop(old);
+    let (told, began) = dial(&mut a, false);
+    assert_eq!(told, [(seat, began)], "its first refused dial");
+    assert_eq!(dial(&mut a, false).0, [], "told once");
+    assert!(
+        a.reports().any(|round| round.cancelled),
+        "the stopped rounds were cancelled, not failed"
+    );
+}
+
+/// When a link of this Mac's opens, its owner unsettles what stood on the network before: the
+/// transport's refresh says a link opened (and only then), the scheduler's next round with
+/// each established peer is an audit, and a contact made before then keeps two minutes from
+/// the contact, whatever it was promised.
+///
+/// NEGATIVE CONTROLS (2026-11-12): with `unsettle` not curtailing, the peer read Reachable
+/// (`a contact from before the link opened`); with it not unsettling the transport, the next
+/// dial was no audit (`the next round is an audit`); with `refresh` returning false, `the link
+/// opened` failed.
+#[test]
+fn a_link_that_opens_unsettles_the_scheduler_and_curtails_earlier_contacts() {
+    use crate::network_state::{ObservationHandle, Observer};
+    use aterm_types::network_state::{MachineIdentity, Reachability, Visibility};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let delivering = Arc::new(AtomicBool::new(false));
+    let mut transport = Transport::isolated(None, 0, Some(delivering.clone())).unwrap();
+    let loopback = [SocketAddr::from((Ipv4Addr::LOCALHOST, 0))];
+    assert_eq!(transport.interfaces(), 0);
+    assert!(!transport.refresh(&loopback), "its beacon is undelivered");
+
+    let start = Instant::now();
+    let after = |second: u64| start + Duration::from_secs(second);
+    // An endpoint this Mac remembered: no beacon named it, so no silence asks for its probe.
+    let address = SocketAddr::from(([127, 0, 0, 1], 9));
+    let remembered = Remembered {
+        actor: [7; 48],
+        address,
+        at_ms: 1000,
+    };
+    transport.hints.remember(vec![remembered], start, 1000);
+    let (chosen, _) = transport.hints.next(start).unwrap();
+    let quiet = Outcome::Repaired { transferred: false };
+    transport
+        .hints
+        .finish(chosen, Repair::heard_from([7; 48]), quiet, start);
+    assert!(transport.hints.established(address));
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let handle = ObservationHandle::default();
+    let mut observer = Observer::open(&root.path().join("config"), handle.clone()).unwrap();
+    let identity = MachineIdentity {
+        machine_id: [29; 16],
+        incarnation: [5; 16],
+        label: None,
+    };
+    // Promised eleven minutes, as a settled peer will be.
+    observer.contact(identity, 1000, start, Duration::from_secs(660));
+    let reads = |observer: &mut Observer, second: u64| {
+        observer.observe(
+            Visibility::Active,
+            0,
+            "test",
+            1000 + second * 1000,
+            after(second),
+        );
+        handle.snapshot().peers[0].reachability
+    };
+    assert_eq!(reads(&mut observer, 299), Reachability::Reachable);
+
+    delivering.store(true, Ordering::Release);
+    assert!(transport.refresh(&loopback), "the link opened");
+    super::super::unsettle(&mut transport, &mut observer, after(300), Duration::ZERO);
+    assert!(!transport.refresh(&loopback), "it has its link");
+    assert_eq!(
+        reads(&mut observer, 300),
+        Reachability::LastSeen,
+        "a contact from before the link opened"
+    );
+    let (chosen, repair) = transport.hints.next(after(300)).unwrap();
+    assert!(
+        chosen == address && repair.audited(),
+        "the next round is an audit"
+    );
+}
+
+/// A link a turn dropped after a transient failure reopens on an attachment that never left the
+/// refreshed addresses: the refresh says no link opened, so the owner unsettles nothing and
+/// every endpoint keeps its rest, however often that happens. An attachment that left the
+/// addresses and came back did change this Mac's network, and says so.
+///
+/// NEGATIVE CONTROL (run here): with `REOPEN_OPENS`, the reopen says a link opened.
+#[test]
+fn a_link_reopened_where_it_never_left_changes_nothing() {
+    use std::sync::atomic::AtomicBool;
+
+    let loopback = [SocketAddr::from((Ipv4Addr::LOCALHOST, 0))];
+    for reopens in [false, true] {
+        REOPEN_OPENS.with(|flag| flag.set(reopens));
+        let delivering = Arc::new(AtomicBool::new(true));
+        let mut transport = Transport::isolated(None, 0, Some(delivering)).unwrap();
+        assert_eq!(transport.interfaces(), 1, "its link opened as it was made");
+        assert!(!transport.refresh(&loopback), "it has its link");
+        // What a turn does to a link whose send failed ([`Transport::turn`]).
+        transport.links.clear();
+        assert_eq!(
+            transport.refresh(&loopback),
+            reopens,
+            "a link reopened where it never left"
+        );
+        assert_eq!(transport.interfaces(), 1, "the link is back");
+        transport.links.clear();
+        assert!(!transport.refresh(&[]), "the attachment left");
+        assert!(transport.refresh(&loopback), "an attachment that came back");
+        REOPEN_OPENS.with(|flag| flag.set(false));
+    }
+}
+
+/// A peer that stopped reads LastSeen at the first dial its closed port refuses, and not at
+/// its lease's end: through the real tick, worker and dial, the transport tells its owner the
+/// seat is gone, and the owner resolves the seat through current membership and ends its
+/// lease in the network observation. A departure of a seat that is no member, or one that
+/// began no later than the peer's contact, ends nothing.
+///
+/// NEGATIVE CONTROLS (2026-11-12): with `observe_departures` telling the observer nothing, the
+/// peer read Reachable (`found gone by a refused dial`); with `Hints::take_departures`
+/// returning none, the wait reached the minute (`the closed port's dial told nobody`).
+#[test]
+fn a_peer_that_stopped_reads_last_seen_at_its_next_dial_not_at_its_leases_end() {
+    use crate::{
+        catalog::Directory,
+        network_state::{ObservationHandle, Observer},
+        table::{Session, store::Store},
+    };
+    use aterm_secrets::commons::roster::Role;
+    use aterm_types::network_state::{Reachability, Visibility};
+
+    let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let remote = lab.bootstrap(1).request().unwrap().binding().actor();
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = directory
+        .open_application(&session, "accounts", "proposals", 1)
+        .unwrap();
+    Store::open(&session, &directory.path(scope).unwrap(), scope)
+        .unwrap()
+        .commit_catalog(&session, b"departure observation")
+        .unwrap();
+    drop(session);
+    let endpoint = |n| {
+        Arc::new(
+            Endpoint::from_bootstrap(&lab.bootstrap(n))
+                .unwrap()
+                .unwrap()
+                .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config"))
+                .unwrap(),
+        )
+    };
+    let mut a = loopback(endpoint(0), 0, [85; 32]);
+    let port = a.links[0].hints.port();
+    let mut b = loopback(endpoint(1), port, [86; 32]);
+    converge(&mut a, &mut b, scope.digest(), 1, "before the departure");
+    // Until a round A dialled to B's listener completed and every round ended: B's endpoint
+    // here is established, and A holds its contact.
+    let there = b.links[0].listener.as_ref().unwrap().local_addr().unwrap();
+    let mut now = Instant::now();
+    let until = Instant::now() + Duration::from_secs(60);
+    while !(a.hints.established(there) && a.workers.is_empty() && b.workers.is_empty()) {
+        a.tick(now).unwrap();
+        b.tick(now).unwrap();
+        assert!(Instant::now() < until, "A established no endpoint of B's");
+        if a.workers.is_empty() && b.workers.is_empty() {
+            now += crate::runtime::TICK;
+        } else {
+            now = now.max(Instant::now());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let contact = a
+        .take_contacts()
+        .into_iter()
+        .find(|contact| contact.actor == remote)
+        .unwrap();
+    assert_eq!(a.take_departures(), [], "B is there");
+
+    let config = lab.paths[0].home.join("network-departure-test.toml");
+    let published = ObservationHandle::default();
+    let mut observer = Observer::open(&config, published.clone()).unwrap();
+    observer
+        .local(
+            super::super::machine_identity(bootstrap.request().unwrap().binding()),
+            bootstrap.trust(),
+            Vec::new,
+        )
+        .unwrap();
+    let wall = 100_000;
+    super::super::observe_contacts(
+        &bootstrap,
+        &std::cell::OnceCell::new(),
+        &mut observer,
+        vec![(contact.actor, contact.at, contact.lease)],
+        &[],
+        &super::super::place::Publisher::default(),
+        || (wall, contact.at),
+    );
+    // One second after the contact, by both clocks: far inside its lease.
+    let reads = |observer: &mut Observer| {
+        let later = contact.at + Duration::from_secs(1);
+        observer.observe(Visibility::Active, 0, "test", wall + 1000, later);
+        published.snapshot().peers[0].reachability
+    };
+    assert_eq!(reads(&mut observer), Reachability::Reachable);
+
+    // B stops: its listener closes, and its port refuses A's next dial, which begins once its
+    // endpoint's wait is over, ten seconds after the contact here.
+    drop(b);
+    now = now.max(contact.at) + Duration::from_secs(10);
+    let until = Instant::now() + Duration::from_secs(60);
+    let departures = loop {
+        a.tick(now).unwrap();
+        let departures = a.take_departures();
+        if !departures.is_empty() {
+            break departures;
+        }
+        assert!(Instant::now() < until, "the closed port's dial told nobody");
+        if a.workers.is_empty() {
+            now += crate::runtime::TICK;
+        } else {
+            aterm_uds::deadline::poll_yield();
+        }
+    };
+    assert_eq!(departures.len(), 1);
+    let (seat, began) = departures[0];
+    assert_eq!(seat, remote);
+    assert!(began > contact.at, "the dial began after the contact");
+
+    let depart = |observer: &mut Observer, departures| {
+        super::super::observe_departures(
+            &bootstrap,
+            &std::cell::OnceCell::new(),
+            observer,
+            departures,
+        );
+    };
+    depart(&mut observer, vec![([0xff; 48], began)]);
+    assert_eq!(reads(&mut observer), Reachability::Reachable, "no member");
+    depart(&mut observer, vec![(seat, contact.at)]);
+    assert_eq!(
+        reads(&mut observer),
+        Reachability::Reachable,
+        "a contact no older than the dial stands"
+    );
+    depart(&mut observer, departures);
+    assert_eq!(
+        reads(&mut observer),
+        Reachability::LastSeen,
+        "found gone by a refused dial"
+    );
+}
+
+/// One real round `a` dials `b`'s listener with, begun at `now` and joined a quarter of a
+/// second later by both transports, on no clock but the test's: its report on the dialling
+/// side.
+fn round_from(a: &mut Transport, b: &mut Transport, repair: Repair, now: Instant) -> RepairRound {
+    let listener = b.links[0].listener.as_ref().unwrap();
+    let dialled = Worker::start(
+        a.endpoint.clone().unwrap(),
+        None,
+        Some(listener.local_addr().unwrap()),
+        Scope::Loopback,
+        None,
+        repair,
+        now,
+    )
+    .unwrap();
+    let served = Worker::start(
+        b.endpoint.clone().unwrap(),
+        Some(accept_ready(listener)),
+        None,
+        Scope::Loopback,
+        None,
+        Repair::default(),
+        now,
+    )
+    .unwrap();
+    let joined = now + Duration::from_millis(250);
+    b.finish(served, joined);
+    a.finish(dialled, joined);
+    b.reports().for_each(drop);
+    a.reports().last().unwrap()
+}
+
+/// A transport keeps its lab's catalog heard, over real sockets, the real worker and two Commons
+/// endpoints, on the test's clock alone. It is opened as an attachment's is, so its scheduler
+/// knows which table the catalog is from its endpoint, and each round that said something of
+/// the catalog tells the scheduler when it began and whether it left nothing to bring: the
+/// round that brings the peer's declaration of a table leaves the catalog unheard, and the
+/// first that brings nothing is when it was heard. An audit 299 s after that round is handed
+/// nothing; the audit after it, five minutes or more after that round, leads with the
+/// catalog: its round is over the catalog and is not the scan's turn. That round left nothing
+/// either, so the audit after it is handed nothing again.
+/// MUTANT (`CATALOG_UNLED`): the stale catalog waits for the scan's turn.
+///
+/// NEGATIVE CONTROLS (2026-11-12, each by an inverse edit then undone, each failing `the
+/// scheduler heard what the round said of the catalog`): `unopened` telling its scheduler no
+/// catalog; `finish` telling it of no round; `finish` telling it every round left nothing;
+/// and `finish` telling it when the round was joined, not when it began.
+#[test]
+fn an_audit_leads_the_catalog_five_minutes_after_a_round_over_it_left_nothing() {
+    use crate::{
+        catalog::Directory,
+        runtime::discovery::CATALOG_UNLED,
+        table::{Session, store::Store},
+    };
+    use aterm_secrets::commons::roster::Role;
+    for unled in [false, true] {
+        let lab = crate::table::tests::Lab::new(&[Role::Writer; 2]);
+        // The peer declared a table and wrote to it; this Mac holds neither yet.
+        let bootstrap = lab.bootstrap(1);
+        let directory = Directory::new(&lab.paths[1], bootstrap.trust());
+        let catalog = directory.catalog_scope().digest();
+        let session = Session::open(&bootstrap).unwrap();
+        let scope = directory
+            .open_application(&session, "accounts", "proposals", 1)
+            .unwrap();
+        Store::open(&session, &directory.path(scope).unwrap(), scope)
+            .unwrap()
+            .commit_catalog(&session, b"a table beside the catalog")
+            .unwrap();
+        drop(session);
+        let endpoint = |n: usize| {
+            Endpoint::from_bootstrap(&lab.bootstrap(n))
+                .unwrap()
+                .unwrap()
+                .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config"))
+                .unwrap()
+        };
+        let mut a = Transport::isolated(Some(endpoint(0)), 0, None).unwrap();
+        let mut b = Transport::isolated(Some(endpoint(1)), 0, None).unwrap();
+        let there = b.links[0].listener.as_ref().unwrap().local_addr().unwrap();
+        // Every scheduler call reads this instant or a later one the test names.
+        let mut now = Instant::now();
+        let beacon = b.hints.wire(there.port());
+        a.hints.observe(&beacon, there, now);
+
+        // A dials B, each round when B's endpoint is next due, until a round the scan's own
+        // turn gave the catalog leaves nothing to bring and asks no follow-up. `heard` is what
+        // the rounds' own observations say of the catalog: when the latest that left nothing
+        // began, none once a later one found more.
+        let mut heard = None;
+        let mut brought = false;
+        let mut rounds = 0;
+        loop {
+            let (chosen, repair) = a.hints.next(now).expect("B's endpoint is due");
+            assert_eq!(chosen, there);
+            let report = round_from(&mut a, &mut b, repair, now);
+            assert!(report.control.is_ok(), "{report:?}");
+            let (_, said, _) = report.observation().expect("an authenticated round");
+            if said.table == Some(catalog) && said.spoke() {
+                heard = said.left_nothing().then_some(now);
+                brought |= said.received.is_some_and(|n| n > 0);
+            }
+            assert_eq!(
+                a.hints.catalog_heard(),
+                heard,
+                "the scheduler heard what the round said of the catalog: {report:?}"
+            );
+            let settled = report.application.is_some_and(|app| {
+                app.regular && app.table == Some(catalog) && app.received == 0 && app.deferred == 0
+            });
+            if settled && heard == Some(now) && !a.hints.follow_up_contains(there) {
+                break;
+            }
+            rounds += 1;
+            assert!(
+                rounds < 64,
+                "the scan never settled on the catalog: {report:?}"
+            );
+            now = a.hints.next_at(there);
+        }
+        assert!(
+            brought,
+            "a round over the catalog brought the peer's declaration"
+        );
+        let heard = heard.unwrap();
+
+        // 299 s on, an audit: the catalog was heard within five minutes.
+        let at = heard + Duration::from_secs(299);
+        a.hints.unsettle(at, Duration::ZERO);
+        let (_, repair) = a.hints.next(at).expect("the unsettled endpoint is due");
+        assert!(repair.audited());
+        assert!(!repair.leads(&catalog), "heard 299 s ago");
+        let report = round_from(&mut a, &mut b, repair, at);
+        let app = report.application.unwrap();
+        assert_ne!(
+            app.table,
+            Some(catalog),
+            "the scan's next table: {report:?}"
+        );
+        assert_eq!(a.hints.catalog_heard(), Some(heard));
+
+        // The audit after it begins five minutes or more after that round over the catalog.
+        a.hints.unsettle(at, Duration::ZERO);
+        let at = a.hints.next_at(there);
+        assert!(at >= heard + Duration::from_secs(300));
+        CATALOG_UNLED.with(|flag| flag.set(unled));
+        let dial = a.hints.next(at);
+        CATALOG_UNLED.with(|flag| flag.set(false));
+        let (_, repair) = dial.expect("the unsettled endpoint is due");
+        assert!(repair.audited());
+        assert_eq!(repair.leads(&catalog), !unled);
+        let report = round_from(&mut a, &mut b, repair, at);
+        let app = report.application.unwrap();
+        if unled {
+            assert!(app.regular, "MUTANT: the scan's turn: {report:?}");
+            continue;
+        }
+        assert_eq!(app.table, Some(catalog), "{report:?}");
+        assert!(!app.regular, "led, not the scan's turn");
+        assert_eq!(
+            a.hints.catalog_heard(),
+            Some(at),
+            "the led round left nothing"
+        );
+
+        // Heard again: the next audit is handed nothing.
+        a.hints.unsettle(at, Duration::ZERO);
+        let at = a.hints.next_at(there);
+        let (_, repair) = a.hints.next(at).expect("the unsettled endpoint is due");
+        assert!(repair.audited());
+        assert!(!repair.leads(&catalog), "heard seconds ago");
+    }
 }

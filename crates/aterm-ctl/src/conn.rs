@@ -192,7 +192,9 @@ fn resource_metadata_reply(parts: &[String], status: &str) -> bool {
         [verb, query, session]
             if verb == "resource-admission-v3"
                 && query == "inspect"
-                && session.starts_with("session=s-") =>
+                && session.strip_prefix("session=").is_some_and(|sid| {
+                    aterm_types::tab_id::is_tab_id(sid) || aterm_types::tab_id::is_legacy(sid)
+                }) =>
         {
             status == "OK resource-admission-v3 inspect"
         }
@@ -285,7 +287,7 @@ enum SelTok<'a> {
 
 fn classify_selector(tok: &str) -> io::Result<SelTok<'_>> {
     let Some(body) = tok.strip_prefix('@') else {
-        if tok.starts_with("s-") && tok.len() > 2 {
+        if aterm_types::tab_id::is_tab_id(tok) || aterm_types::tab_id::is_legacy(tok) {
             return Err(usage(&format!("a session id needs an @: @{tok}")));
         }
         return Err(usage(&format!(
@@ -297,10 +299,7 @@ fn classify_selector(tok: &str) -> io::Result<SelTok<'_>> {
         "." => Err(usage(
             "@. (the active tab) retargets on every tab switch — name the session: @self, @<sid>, or @<local-id>",
         )),
-        b if b.starts_with("s-")
-            && b.len() > 2
-            && aterm_types::control_verbs::selector_body_names_something(b) =>
-        {
+        b if aterm_types::tab_id::is_tab_id(b) || aterm_types::tab_id::is_legacy(b) => {
             Ok(SelTok::Sid(b))
         }
         b => match (!b.is_empty() && b.bytes().all(|c| c.is_ascii_digit()))

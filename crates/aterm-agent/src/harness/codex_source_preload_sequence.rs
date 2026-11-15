@@ -467,6 +467,24 @@ impl Ledger {
     pub(super) fn fenced(&self) -> bool {
         self.retirement.is_some()
     }
+    /// Observe the accepted preload/Ready body, not the separate member-open nonce.
+    #[cfg(unix)]
+    pub(super) fn completed_ready(
+        &self,
+        process: &Process,
+        operation: &str,
+        registration: &str,
+        role: Option<ReadyRole>,
+    ) -> bool {
+        self.process == *process
+            && self.attempt.operation == operation
+            && self.completed(registration)
+            && self
+                .ready_report
+                .as_ref()
+                .is_some_and(|(saved, report)| saved == registration && Some(*report) == role)
+    }
+
     pub(super) fn completed(&self, registration: &str) -> bool {
         self.ready
             && self.retirement.is_none()

@@ -11,7 +11,7 @@ use crate::prompt::fixtures::{
     LOGIN_PICKER_WARNED, LOGIN_SUCCESS, MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE, TRUST,
     bash_one_row, composer, rows, screen,
 };
-use crate::wall::WallKind;
+use alab_policy::vocab::WallKind;
 
 /// [`ScreenReader::message_drawn`] detects a drawn message with or without words under it.
 #[test]
@@ -437,7 +437,7 @@ fn a_reading_carries_the_wall_and_the_turn_end_facts() {
             WallKind::ApiError {
                 code: None,
                 retryable: true,
-                cause: crate::wall::ApiCause::Unreachable,
+                cause: alab_policy::vocab::ApiCause::Unreachable,
             },
             crate::wall::Placement::ErrorRow,
         ))
@@ -743,10 +743,10 @@ fn a_long_blank_gap_does_not_cut_the_last_thing_said_out_of_the_zone() {
     assert_eq!(
         r.wall.as_ref().map(|w| (w.kind, w.placement)),
         Some((
-            crate::wall::WallKind::ApiError {
+            alab_policy::vocab::WallKind::ApiError {
                 code: None,
                 retryable: true,
-                cause: crate::wall::ApiCause::Unreachable
+                cause: alab_policy::vocab::ApiCause::Unreachable
             },
             crate::wall::Placement::ErrorRow
         ))

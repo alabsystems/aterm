@@ -43,6 +43,65 @@ fn queued_callbacks_keep_their_one_source_classification() {
 }
 
 #[test]
+fn queued_callbacks_keep_their_original_native_event_beside_a_later_key() {
+    let first = key(14);
+    let later = key(0);
+    let pending = {
+        let _source = source_with(first, |_| POSTED);
+        assert_eq!(window_event_native_input(), None, "not in callback delivery");
+        capture()
+    };
+    let _later = source_with(later, |_| PERSON);
+    pending.dispatch(|| {
+        assert_eq!(window_event_native_input(), Some(first));
+        assert_ne!(window_event_native_input(), Some(later));
+        assert_eq!(window_event_origin(), Some(POSTED));
+    });
+    assert_eq!(window_event_native_input(), None);
+    capture().dispatch(|| {
+        assert_eq!(window_event_native_input(), Some(later));
+        assert_eq!(window_event_origin(), Some(PERSON));
+    });
+}
+
+#[test]
+fn native_event_clock_is_masked_by_keyless_callbacks_and_restored_on_unwind() {
+    let keyless = capture();
+    let first = key(14);
+    let pending = {
+        let _source = source_with(first, |_| POSTED);
+        capture()
+    };
+    pending.dispatch(|| {
+        assert_eq!(window_event_native_input(), Some(first));
+        let result = std::panic::catch_unwind(|| {
+            keyless.dispatch(|| {
+                assert_eq!(window_event_native_input(), None);
+                assert_eq!(window_event_origin(), Some(PERSON));
+                panic!("leave the keyless callback");
+            });
+        });
+        assert!(result.is_err());
+        assert_eq!(window_event_native_input(), Some(first));
+        assert_eq!(window_event_origin(), Some(POSTED));
+        std::thread::spawn(|| {
+            assert_eq!(window_event_native_input(), None);
+            assert_eq!(window_event_origin(), None);
+        })
+        .join()
+        .unwrap();
+    });
+    assert_eq!(window_event_native_input(), None);
+    assert_eq!(window_event_origin(), None);
+    let result = std::panic::catch_unwind(|| {
+        pending.dispatch(|| panic!("leave the native callback"));
+    });
+    assert!(result.is_err());
+    assert_eq!(window_event_native_input(), None);
+    assert_eq!(window_event_origin(), None);
+}
+
+#[test]
 fn a_physical_callback_does_not_borrow_a_later_posted_keys_mark() {
     let physical = {
         let _source = source_with(key(0), |_| PERSON);
@@ -118,13 +177,21 @@ fn a_nested_native_key_does_not_inherit_the_outer_callback_verdict() {
     };
     posted.dispatch(|| {
         assert_eq!(window_event_origin(), Some(POSTED));
+        assert_eq!(window_event_native_input(), Some(key(14)));
         {
             let _physical = source_with(key(0), |_| PERSON);
             assert_eq!(window_event_origin(), None, "the native handler is not a window callback");
-            capture().dispatch(|| assert_eq!(window_event_origin(), Some(PERSON)));
+            assert_eq!(window_event_native_input(), None);
+            capture().dispatch(|| {
+                assert_eq!(window_event_origin(), Some(PERSON));
+                assert_eq!(window_event_native_input(), Some(key(0)));
+            });
             assert_eq!(window_event_origin(), None);
+            assert_eq!(window_event_native_input(), None);
         }
         assert_eq!(window_event_origin(), Some(POSTED));
+        assert_eq!(window_event_native_input(), Some(key(14)));
     });
     assert_eq!(window_event_origin(), None);
+    assert_eq!(window_event_native_input(), None);
 }

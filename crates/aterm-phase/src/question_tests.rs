@@ -6,9 +6,10 @@
 use std::collections::BTreeSet;
 
 use super::*;
-use crate::phase::{Phase, worker_phase};
+use crate::phase::worker_phase;
 use crate::prompt::fixtures::*;
 use crate::prompt::{PromptKind, PromptV2, Role, Select, parse_prompt_v2};
+use alab_policy::vocab::Phase;
 
 /// A fixture's rows, its box and its dialog.
 fn read(text: &str) -> (Vec<String>, PromptV2, QuestionDialog) {

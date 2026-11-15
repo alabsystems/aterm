@@ -2,8 +2,179 @@
 // Copyright 2026 Andrew Yates
 
 //! Exact account intent for a retained command. Admission never selects another row.
+//!
+//! Admission checks two things, by the intent's [`Purpose`]. Integrity, which the
+//! `AccountExecution` laws need, holds for every intent: the namespace, the canonical selector,
+//! one unambiguous owner row, the retained directory owner, the owner row's custody (another
+//! Mac's hold) and claims (the lease verdict: another Mac's senior claim, an off clock, a
+//! credential held for preparation only or failed to prepare here, an unrecordable non-home
+//! claim), the token entry, the login's identity, the credential generation, the account writer
+//! and the controls rechecked at the end. Custody and claims say whether this Mac may run the
+//! credential at all, which a relaunch starts afresh whatever it replaces: a session they refuse
+//! yields at its turn end (`accounts::row_available_here`), so no relaunch starts a new turn on
+//! it. Selection policy (signed out or not enrolled, a usage limit, the owner's pin or a pending
+//! one, and `accounts = "off"` naming another login) is checked only for a [`Purpose::Select`]
+//! intent: a [`Purpose::SameLogin`] relaunch replaces the process already running on that exact
+//! credential and chooses nothing.
 
 use super::*;
+
+/// What an execution intent's admission checks ([`capture_execution`], [`admit_execution`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Purpose {
+    /// The command keeps the exact credential the process it replaces runs on (the same stored
+    /// login under the same home, or the same token route): integrity alone.
+    SameLogin,
+    /// The command selects its login: integrity and the selection policy. A record that names no
+    /// purpose reads as this one, the stricter.
+    Select,
+}
+
+impl Purpose {
+    /// The stored record's word ([`ExecutionIntent::to_value`]); `None` for [`Self::Select`], which
+    /// a record states by naming none, so records written before purposes read back unchanged.
+    const fn word(self) -> Option<&'static str> {
+        match self {
+            Self::SameLogin => Some("same-login"),
+            Self::Select => None,
+        }
+    }
+}
+
+/// What lifts an account execution refusal ([`Refusal`]), named by its wait word
+/// ([`Self::word`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The account writer is held: a change is under way, and the next look plans again.
+    Lock,
+    /// The account controls or the credential generation changed during admission, or since the
+    /// intent was captured: the next look plans again.
+    Changing,
+    /// The command's authentication route is not positively attributed (a legacy record, a
+    /// custom home with no directory, a shell whose environment cannot be read or does not carry
+    /// the route its agent runs on, as where an rc file or a typed `export` set it).
+    Unattributed,
+    /// The account records, the login's files or the selection configuration cannot be read.
+    Unread,
+    /// The login's ownership or identity does not hold: an ambiguous or unbound owner, a token
+    /// entry or an identity of another account, a custom home over managed storage.
+    Integrity,
+    /// The vault token the route names is not in use on this Mac (none, ended, rejected,
+    /// mismatched, unreadable here, unverified with windows that differ here, or unverified off
+    /// the Mac that minted it at a person's terminal), or this platform has no token route: a new
+    /// token, or a move off the route, lifts it.
+    Token,
+    /// Selection policy: the account is signed out or has no login here.
+    SignedOut,
+    /// Selection policy: the account is at a usage limit.
+    Limited,
+    /// Selection policy: the owner's pin, a pending pin or `accounts = "off"` names another
+    /// account.
+    Pin,
+    /// Claims, checked for every purpose: the lease verdict refuses this Mac (another Mac's
+    /// claim, an off clock, a credential held for preparation only or failed to prepare here, a
+    /// non-home claim this Mac cannot record), the pinned row's included.
+    Lease,
+    /// Custody, checked for every purpose: the account is assigned to another Mac.
+    Held,
+}
+
+impl RefusalKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 11] = [
+        Self::Lock,
+        Self::Changing,
+        Self::Unattributed,
+        Self::Unread,
+        Self::Integrity,
+        Self::Token,
+        Self::SignedOut,
+        Self::Limited,
+        Self::Pin,
+        Self::Lease,
+        Self::Held,
+    ];
+
+    /// The wait word a plan or an admission refused for this kind records (`wait:<word>`).
+    /// [`Self::Lease`] and [`Self::Held`] keep the `account-policy-` words records and the footer
+    /// read, though every purpose checks them: the bare `account-held` is the account move's word
+    /// (`accounts_pool::MOVE_HELD`).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Lock => "account-lock",
+            Self::Changing => "account-changing",
+            Self::Unattributed => "account-unattributed",
+            Self::Unread => "account-unread",
+            Self::Integrity => "account-integrity",
+            Self::Token => "account-token",
+            Self::SignedOut => "account-policy-signed-out",
+            Self::Limited => "account-policy-limited",
+            Self::Pin => "account-policy-pin",
+            Self::Lease => "account-policy-lease",
+            Self::Held => "account-policy-held",
+        }
+    }
+
+    /// The kind whose [`Self::word`] is `word`.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.word() == word)
+    }
+
+    /// Whether only a [`Purpose::Select`] admission refuses for this kind.
+    #[must_use]
+    pub const fn policy(self) -> bool {
+        match self {
+            Self::Lock
+            | Self::Changing
+            | Self::Unattributed
+            | Self::Unread
+            | Self::Integrity
+            | Self::Token
+            | Self::Lease
+            | Self::Held => false,
+            Self::SignedOut | Self::Limited | Self::Pin => true,
+        }
+    }
+}
+
+/// An account execution refusal: what lifts it and the whole reason, which names no credential
+/// value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// What lifts it.
+    pub kind: RefusalKind,
+    /// The reason in full.
+    pub why: String,
+}
+
+impl Refusal {
+    /// A refusal of `kind` for `why`.
+    pub fn new(kind: RefusalKind, why: impl Into<String>) -> Self {
+        Self {
+            kind,
+            why: why.into(),
+        }
+    }
+
+    /// A step that returned a plain reason, as `kind`.
+    pub fn of(kind: RefusalKind) -> impl FnOnce(String) -> Self {
+        move |why| Self::new(kind, why)
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl From<Refusal> for String {
+    fn from(refusal: Refusal) -> Self {
+        refusal.why
+    }
+}
 
 /// Non-secret account attribution captured when a command is constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,11 +198,13 @@ pub enum ExecutionIntent {
         owner: Option<String>,
         /// Credential generation and sign-in provenance, including for unowned logins.
         generation: String,
+        /// What its admission checks.
+        purpose: Purpose,
     },
     /// A vault-token route (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.2) to one
     /// account's token entry, in one exact local account namespace. Admission checks the row's
-    /// custody and claims, the token's standing here and its record's email, never a stored
-    /// login: a token row may have none on this Mac.
+    /// custody and claims, the token's standing here and its record's email, whatever its
+    /// purpose, never a stored login: a token row may have none on this Mac.
     Token {
         /// Fingerprint of provider and local account roots, never a peer-supplied path.
         namespace: String,
@@ -41,6 +214,8 @@ pub enum ExecutionIntent {
         owner: Option<String>,
         /// The token entry the wrapper serves.
         entry: accounts::TokenEntry,
+        /// What its admission checks.
+        purpose: Purpose,
     },
 }
 
@@ -197,19 +372,37 @@ impl ExecutionIntent {
                 login,
                 owner,
                 generation,
-            } => aterm_json::json!({
-                "v": 1, "route": "stored", "namespace": namespace,
-                "login": login, "owner": owner, "generation": generation,
-            }),
+                purpose,
+            } => with_purpose(
+                aterm_json::json!({
+                    "v": 1, "route": "stored", "namespace": namespace,
+                    "login": login, "owner": owner, "generation": generation,
+                }),
+                *purpose,
+            ),
             Self::Token {
                 namespace,
                 login,
                 owner,
                 entry,
-            } => aterm_json::json!({
-                "v": 1, "route": "token", "namespace": namespace,
-                "login": login, "owner": owner, "entry": entry.name(),
-            }),
+                purpose,
+            } => with_purpose(
+                aterm_json::json!({
+                    "v": 1, "route": "token", "namespace": namespace,
+                    "login": login, "owner": owner, "entry": entry.name(),
+                }),
+                *purpose,
+            ),
+        }
+    }
+
+    /// What this intent's admission checks: `None` for an external route, whose admission reads
+    /// the shell's environment instead.
+    #[must_use]
+    pub const fn purpose(&self) -> Option<Purpose> {
+        match self {
+            Self::External { .. } => None,
+            Self::Stored { purpose, .. } | Self::Token { purpose, .. } => Some(*purpose),
         }
     }
 
@@ -291,12 +484,20 @@ impl ExecutionIntent {
                         Some(label.to_owned())
                     }
                 };
+                // A record that names no purpose (every one written before purposes) is a
+                // selection's, the stricter; a named one is only the word `with_purpose` writes.
+                let purpose = match value.get("purpose") {
+                    None => Purpose::Select,
+                    Some(word) if word.as_str() == Purpose::SameLogin.word() => Purpose::SameLogin,
+                    Some(_) => return None,
+                };
                 if route == "token" {
                     Self::Token {
                         namespace: digest(value.get("namespace")?)?,
                         login,
                         owner,
                         entry: accounts::TokenEntry::parse(value.get("entry")?.as_str()?)?,
+                        purpose,
                     }
                 } else {
                     Self::Stored {
@@ -304,6 +505,7 @@ impl ExecutionIntent {
                         login,
                         owner,
                         generation: digest(value.get("generation")?)?,
+                        purpose,
                     }
                 }
             }
@@ -311,6 +513,14 @@ impl ExecutionIntent {
         };
         (intent.to_value() == *value).then_some(intent)
     }
+}
+
+/// `value`, a stored or token record, with `purpose`'s word where it names one ([`Purpose::word`]).
+fn with_purpose(mut value: aterm_json::Value, purpose: Purpose) -> aterm_json::Value {
+    if let (Some(word), Some(fields)) = (purpose.word(), value.as_object_mut()) {
+        fields.insert("purpose".into(), aterm_json::json!(word));
+    }
+    value
 }
 
 fn directory_variable(name: &str) -> bool {
@@ -461,17 +671,152 @@ fn unowned_generation(
     Ok(aterm_codec::hex::encode_lower(&digest.finalize()))
 }
 
+/// The selection policy a [`Purpose::Select`] admission holds the login's owner row to: what the
+/// pool would choose a new run onto, which a [`Purpose::SameLogin`] relaunch never asks. Custody
+/// and claims are not here: every purpose holds the row to them ([`owner_may_run_here`]).
+struct Selection {
+    /// The rows with a login made here ([`accounts::enrolled_in`]).
+    enrolled: std::collections::BTreeSet<String>,
+    /// The owner's pin stands ([`launch_pin`]).
+    pinned: bool,
+    /// The configured rotation mode.
+    mode: Mode,
+}
+
+impl Selection {
+    /// Read the pin and hold `label`, the login's owner row (`None`: no row names it), and
+    /// `named`, whether the command names a login of its own, to it and to a pending pin.
+    fn read(
+        seat: &Seat<'_>,
+        cli: Cli,
+        snapshot: &PoolSnapshot,
+        mode: Mode,
+        label: Option<&str>,
+        named: bool,
+    ) -> Result<Self, Refusal> {
+        let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
+        // The pinned row's own standing (its sign-in, what this Mac may run) is this login's only
+        // where the pin names the login's row; a pin on any other row names another account,
+        // whatever that row's standing.
+        let pin = pin_of(cli, &snapshot.roster, &snapshot.state, &enrolled, seat.now).map_err(
+            |refusal| {
+                if refusal.kind == RefusalKind::Pin || snapshot.state.active.as_deref() == label {
+                    refusal
+                } else {
+                    Refusal::new(
+                        RefusalKind::Pin,
+                        format!(
+                            "execution account is not the pinned account, which refuses: {}",
+                            refusal.why
+                        ),
+                    )
+                }
+            },
+        )?;
+        if pin.is_some_and(|pin| Some(pin.label.as_str()) != label)
+            || snapshot
+                .state
+                .pending_pin
+                .as_ref()
+                .is_some_and(|selection| {
+                    selection
+                        .account()
+                        .is_some_and(|pin| Some(pin.label()) != label)
+                })
+            || (mode == Mode::Off && pin.is_none() && named)
+        {
+            return Err(Refusal::new(
+                RefusalKind::Pin,
+                "execution no longer matches the selected account policy",
+            ));
+        }
+        Ok(Self {
+            enrolled,
+            pinned: pin.is_some(),
+            mode,
+        })
+    }
+
+    /// Hold `row`, the login's owner, to its limit and, on a stored login (`stored`), its
+    /// sign-in. A stored-login route is judged by the stored login alone
+    /// ([`accounts::stored_login_condition`]): a row that only a reading of its vault token keeps
+    /// in rotation ([`accounts::LoginHere::OnToken`]) has a lapsed stored login here, so an intent
+    /// that starts on that login is refused as signed out, never relaunched on it.
+    fn admits(
+        &self,
+        row: &Row,
+        state: &accounts::State,
+        now: i64,
+        stored: bool,
+    ) -> Result<(), Refusal> {
+        let enrolled = self.enrolled.contains(&row.label);
+        let condition = if stored {
+            accounts::stored_login_condition(row, state, enrolled, now)
+        } else {
+            accounts::condition(row, state, enrolled, now)
+        };
+        if matches!(condition, accounts::Condition::Limited { .. })
+            && self.mode != Mode::Off
+            && !self.pinned
+        {
+            return Err(Refusal::new(
+                RefusalKind::Limited,
+                "execution account is at its limit",
+            ));
+        }
+        // No signed-out check on a token route: a token row may have no stored login on this Mac.
+        if stored
+            && matches!(
+                condition,
+                accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
+            )
+        {
+            return Err(Refusal::new(
+                RefusalKind::SignedOut,
+                "execution account is not signed in",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether this Mac may run `row`'s credential at `now`, whatever a relaunch on it replaces: no
+/// other Mac holds the row ([`Row::held_by`]) and the claims admit this Mac
+/// ([`accounts::State::lease_verdict`], which holds the credential's execution verdict too). The
+/// turn-end advice reads the same two facts as execution authority
+/// (`accounts::row_available_here`): a session they refuse yields, and no relaunch starts a new
+/// turn on it.
+fn owner_may_run_here(row: &Row, state: &accounts::State, now: i64) -> Result<(), Refusal> {
+    if row.held_by.is_some() {
+        return Err(Refusal::new(
+            RefusalKind::Held,
+            "execution account is held by another machine",
+        ));
+    }
+    state.lease_verdict(&row.label, now).map_err(|why| {
+        Refusal::new(
+            RefusalKind::Lease,
+            format!("execution account: {}", why.as_str()),
+        )
+    })
+}
+
 pub(super) fn capture_held(
     seat: &Seat<'_>,
     cli: Cli,
     who: &accounts::ProcessLogin,
     snapshot: &PoolSnapshot,
-) -> Result<ExecutionIntent, String> {
+    purpose: Purpose,
+) -> Result<ExecutionIntent, Refusal> {
+    use RefusalKind::{Changing, Integrity, Unread};
     let token = match who.route {
         accounts::AuthRoute::Stored => None,
         accounts::AuthRoute::VaultToken { entry } => Some(entry),
         accounts::AuthRoute::Outside => {
-            return Err("execution route is not the account's own credential".into());
+            return Err(Refusal::new(
+                Integrity,
+                "execution route is not the account's own credential",
+            ));
         }
     };
     let login = who
@@ -479,62 +824,75 @@ pub(super) fn capture_held(
         .as_deref()
         .filter(|login| !login.is_empty())
         .map(|login| {
-            accounts::canonical_directory(Path::new(login))?
+            accounts::canonical_directory(Path::new(login))
+                .map_err(Refusal::of(Unread))?
                 .into_os_string()
                 .into_string()
-                .map_err(|_| "execution login is not UTF-8".to_owned())
+                .map_err(|_| Refusal::new(Integrity, "execution login is not UTF-8"))
         })
         .transpose()?;
-    let default = accounts::canonical_directory(&seat.home.join(cli.accounts().default_home))?;
+    let default = accounts::canonical_directory(&seat.home.join(cli.accounts().default_home))
+        .map_err(Refusal::of(Unread))?;
     let directory = login.as_deref().map(Path::new).unwrap_or(&default);
     let (config, issues) = crate::supervise::config::SupervisorConfig::from_path(Some(
         &seat.config_dir.join("aterm.toml"),
     ));
     if !issues.is_empty() {
-        return Err("execution selection configuration is unavailable or invalid".into());
+        return Err(Refusal::new(
+            Unread,
+            "execution selection configuration is unavailable or invalid",
+        ));
     }
     let mode = config.accounts_for(cli.program());
-    let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
-    let pin = launch_pin(cli, &snapshot.roster, &snapshot.state, &enrolled, seat.now)?;
     let mut label = None;
     for row in &snapshot.roster.rows {
         let row_directory =
-            accounts::canonical_directory(row.dir.as_deref().map(Path::new).unwrap_or(&default))?;
+            accounts::canonical_directory(row.dir.as_deref().map(Path::new).unwrap_or(&default))
+                .map_err(Refusal::of(Unread))?;
         if row_directory == directory && label.replace(row.label.as_str()).is_some() {
-            return Err("execution login has ambiguous account ownership".into());
+            return Err(Refusal::new(
+                Integrity,
+                "execution login has ambiguous account ownership",
+            ));
         }
     }
-    if pin.is_some_and(|pin| Some(pin.label.as_str()) != label)
-        || snapshot
-            .state
-            .pending_pin
-            .as_ref()
-            .is_some_and(|selection| {
-                selection
-                    .account()
-                    .is_some_and(|pin| Some(pin.label()) != label)
-            })
-        || (mode == Mode::Off && pin.is_none() && login.is_some())
-    {
-        return Err("execution no longer matches the selected account policy".into());
-    }
+    let selection = match purpose {
+        Purpose::Select => Some(Selection::read(
+            seat,
+            cli,
+            snapshot,
+            mode,
+            label,
+            login.is_some(),
+        )?),
+        Purpose::SameLogin => None,
+    };
     let (owner, generation) = match label {
         None => {
             if accounts::retained_directory_owner_at(
                 &snapshot.logins,
                 &snapshot.roster.rows,
                 "",
-                directory.to_str().ok_or("execution login is not UTF-8")?,
+                directory
+                    .to_str()
+                    .ok_or_else(|| Refusal::new(Integrity, "execution login is not UTF-8"))?,
                 Some(&default),
-            )?
+            )
+            .map_err(Refusal::of(Unread))?
             .is_some()
             {
-                return Err("execution login has no current account binding".into());
+                return Err(Refusal::new(
+                    Integrity,
+                    "execution login has no current account binding",
+                ));
             }
             match token {
                 None => (
                     None,
-                    Some(unowned_generation(seat, cli, snapshot, login.as_deref())?),
+                    Some(
+                        unowned_generation(seat, cli, snapshot, login.as_deref())
+                            .map_err(Refusal::of(Unread))?,
+                    ),
                 ),
                 // An account no row names: the marker must name the entry of the account the
                 // session's own login record names (§5.2).
@@ -542,7 +900,10 @@ pub(super) fn capture_held(
                     let named = super::super::profile::login_record(seat.home, login.as_deref())
                         .and_then(|record| accounts::TokenEntry::of_email(&record.email));
                     if named != Some(entry) {
-                        return Err("execution token names another account's entry".into());
+                        return Err(Refusal::new(
+                            Integrity,
+                            "execution token names another account's entry",
+                        ));
                     }
                     (None, None)
                 }
@@ -552,40 +913,26 @@ pub(super) fn capture_held(
             let row = snapshot
                 .roster
                 .row(label)
-                .ok_or("execution account disappeared")?;
-            if row.held_by.is_some() {
-                return Err("execution account is held by another machine".into());
-            }
-            snapshot
-                .state
-                .lease_verdict(label, seat.now)
-                .map_err(|why| format!("execution account: {}", why.as_str()))?;
-            let condition =
-                accounts::condition(row, &snapshot.state, enrolled.contains(label), seat.now);
-            if matches!(condition, accounts::Condition::Limited { .. })
-                && mode != Mode::Off
-                && pin.is_none()
-            {
-                return Err("execution account is at its limit".into());
+                .ok_or_else(|| Refusal::new(Changing, "execution account disappeared"))?;
+            owner_may_run_here(row, &snapshot.state, seat.now)?;
+            if let Some(selection) = &selection {
+                selection.admits(row, &snapshot.state, seat.now, token.is_none())?;
             }
             match token {
                 None => {
-                    if matches!(
-                        condition,
-                        accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
-                    ) {
-                        return Err("execution account is not signed in".into());
-                    }
-                    check_login_identity(cli, row, seat.home).map_err(|why| why.to_string())?;
+                    check_login_identity(cli, row, seat.home)
+                        .map_err(|why| Refusal::new(Integrity, why.to_string()))?;
                     (
                         Some(label.to_owned()),
-                        Some(binding(seat, cli, snapshot, row)?),
+                        Some(binding(seat, cli, snapshot, row).map_err(Refusal::of(Unread))?),
                     )
                 }
-                // No signed-out check: a token row may have no stored login on this Mac.
                 Some(entry) => {
                     if accounts::TokenEntry::of_row(row) != Some(entry) {
-                        return Err("execution token names another account's entry".into());
+                        return Err(Refusal::new(
+                            Integrity,
+                            "execution token names another account's entry",
+                        ));
                     }
                     (Some(label.to_owned()), None)
                 }
@@ -599,31 +946,51 @@ pub(super) fn capture_held(
         || final_config.accounts_for(cli.program()) != mode
         || seat.keyring_held(cli)
     {
-        return Err("execution account controls changed during admission".into());
+        return Err(Refusal::new(
+            Changing,
+            "execution account controls changed during admission",
+        ));
     }
-    let namespace = namespace(seat, cli)?;
+    let namespace = namespace(seat, cli).map_err(Refusal::of(Unread))?;
     Ok(match (token, generation) {
         (Some(entry), _) => ExecutionIntent::Token {
             namespace,
             login,
             owner,
             entry,
+            purpose,
         },
         (None, Some(generation)) => ExecutionIntent::Stored {
             namespace,
             login,
             owner,
             generation,
+            purpose,
         },
-        (None, None) => return Err("execution stored login has no generation".into()),
+        (None, None) => {
+            return Err(Refusal::new(
+                Integrity,
+                "execution stored login has no generation",
+            ));
+        }
     })
 }
 
-/// Capture an already selected login under the writer, without choosing a replacement.
-/// The caller supplies positively observed authentication attribution.
+/// The account writer under `store`, or the refusal that names why it is not held.
+fn writer(store: &Store) -> Result<accounts::Lock, Refusal> {
+    store
+        .acquire_bounded()
+        .map_err(|why| Refusal::new(RefusalKind::Unread, why.to_string()))?
+        .ok_or_else(|| Refusal::new(RefusalKind::Lock, accounts::LOCK_HELD))
+}
+
+/// Capture an already selected login under the writer, without choosing a replacement, for
+/// `purpose`, which the intent carries so that [`admit_execution`] checks exactly what this
+/// capture checked. The caller supplies positively observed authentication attribution.
 ///
 /// # Errors
-/// The store, selected account, custody, credential identity or binding cannot be admitted.
+/// The store, selected account, custody, credential identity or binding cannot be admitted, or
+/// (for [`Purpose::Select`]) the selection policy refuses the account.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -636,26 +1003,31 @@ pub fn capture_execution(
     seat: &Seat<'_>,
     cli: Cli,
     who: &accounts::ProcessLogin,
-) -> Result<ExecutionIntent, String> {
+    purpose: Purpose,
+) -> Result<ExecutionIntent, Refusal> {
     let stored = match who.route {
         accounts::AuthRoute::Stored => true,
         accounts::AuthRoute::VaultToken { .. } => false,
         accounts::AuthRoute::Outside => return Ok(ExecutionIntent::external()),
     };
     if !who.default_home {
-        return Err("custom stored-login home requires directory attribution".into());
+        return Err(Refusal::new(
+            RefusalKind::Unattributed,
+            "custom stored-login home requires directory attribution",
+        ));
     }
     // The sign-in lock is a stored login's service; a token route never takes it (§5.8).
     if stored && seat.keyring_held(cli) {
-        return Err("execution stored-login route is unavailable".into());
+        return Err(Refusal::new(
+            RefusalKind::Integrity,
+            "execution stored-login route is unavailable",
+        ));
     }
     let store = seat.store(cli);
-    let held = store
-        .acquire_bounded()
-        .map_err(|why| why.to_string())?
-        .ok_or(accounts::LOCK_HELD)?;
-    let snapshot = snapshot_held(seat, cli, &store, &held)?;
-    capture_held(seat, cli, who, &snapshot)
+    let held = writer(&store)?;
+    let snapshot =
+        snapshot_held(seat, cli, &store, &held).map_err(Refusal::of(RefusalKind::Unread))?;
+    capture_held(seat, cli, who, &snapshot, purpose)
 }
 
 /// Admit a custom stored-login route only while its effective credential
@@ -668,32 +1040,52 @@ pub fn admit_external_execution(
     cli: Cli,
     directories: &[PathBuf],
 ) -> Result<ExecutionGuard, String> {
+    external_admission(seat, cli, directories).map_err(String::from)
+}
+
+/// [`admit_external_execution`], its refusal typed by what lifts it.
+/// # Errors
+/// As [`admit_external_execution`].
+pub fn external_admission(
+    seat: &Seat<'_>,
+    cli: Cli,
+    directories: &[PathBuf],
+) -> Result<ExecutionGuard, Refusal> {
+    use RefusalKind::{Integrity, Unattributed, Unread};
     if directories.is_empty() {
-        return Err("custom credential directory is unknown".into());
+        return Err(Refusal::new(
+            Unattributed,
+            "custom credential directory is unknown",
+        ));
     }
     let store = seat.store(cli);
-    let held = store
-        .acquire_bounded()
-        .map_err(|why| why.to_string())?
-        .ok_or(accounts::LOCK_HELD)?;
-    let snapshot = execution_snapshot_readonly(seat, cli, &store, &held)?;
-    let default = accounts::canonical_directory(&seat.home.join(cli.accounts().default_home))?;
-    let managed = accounts::canonical_directory(&store.logins_dir())?;
+    let held = writer(&store)?;
+    let snapshot =
+        execution_snapshot_readonly(seat, cli, &store, &held).map_err(Refusal::of(Unread))?;
+    let default = accounts::canonical_directory(&seat.home.join(cli.accounts().default_home))
+        .map_err(Refusal::of(Unread))?;
+    let managed =
+        accounts::canonical_directory(&store.logins_dir()).map_err(Refusal::of(Unread))?;
     for directory in directories {
-        let path = accounts::canonical_directory(directory)?;
+        let path = accounts::canonical_directory(directory).map_err(Refusal::of(Unread))?;
         if path == default
             || path.starts_with(&managed)
             || accounts::retained_directory_owner_at(
                 &snapshot.logins,
                 &snapshot.roster.rows,
                 "",
-                path.to_str()
-                    .ok_or("custom credential directory is not UTF-8")?,
+                path.to_str().ok_or_else(|| {
+                    Refusal::new(Integrity, "custom credential directory is not UTF-8")
+                })?,
                 Some(&default),
-            )?
+            )
+            .map_err(Refusal::of(Unread))?
             .is_some()
         {
-            return Err("custom credential directory overlaps managed accounts".into());
+            return Err(Refusal::new(
+                Integrity,
+                "custom credential directory overlaps managed accounts",
+            ));
         }
     }
     Ok(ExecutionGuard { _held: Some(held) })
@@ -703,8 +1095,25 @@ pub fn admit_external_execution(
 /// A successful result grants no replacement row and does not outlive its guard.
 ///
 /// # Errors
-/// The namespace, account owner or credential generation changed, or current account policy
-/// does not admit execution. Unknown and malformed intents must never call this API.
+/// As [`execution_admission`], in words.
+pub fn admit_execution(
+    seat: &Seat<'_>,
+    cli: Cli,
+    intent: &ExecutionIntent,
+) -> Result<ExecutionGuard, String> {
+    execution_admission(seat, cli, intent).map_err(String::from)
+}
+
+/// [`admit_execution`], its refusal typed by what lifts it. The intent's [`Purpose`] names what is
+/// checked: exactly what its capture checked, so a [`Purpose::SameLogin`] intent's integrity
+/// holds at exec as it held at the plan, and a [`Purpose::Select`] intent's selection policy too.
+///
+/// # Errors
+/// The namespace, account owner or credential generation changed, the owner row's custody or
+/// claims refuse this Mac, or (for [`Purpose::Select`]) current account policy does not admit
+/// execution. A token intent is also refused, whatever its purpose, where its token is not in use
+/// here or the vault or the token table cannot be read ([`token_in_use_here`]). Unknown and
+/// malformed intents must never call this API.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -753,27 +1162,123 @@ pub fn admit_external_execution(
         project = "harness::accounts_pool::tests::execution::transition"
     )
 )]
-pub fn admit_execution(
+pub fn execution_admission(
     seat: &Seat<'_>,
     cli: Cli,
     intent: &ExecutionIntent,
-) -> Result<ExecutionGuard, String> {
-    let (login, route) = match intent {
-        ExecutionIntent::External { .. } => return Ok(ExecutionGuard { _held: None }),
-        ExecutionIntent::Stored { login, .. } => (login, accounts::AuthRoute::Stored),
-        ExecutionIntent::Token { login, entry, .. } => {
-            (login, accounts::AuthRoute::VaultToken { entry: *entry })
+) -> Result<ExecutionGuard, Refusal> {
+    admission(seat, cli, intent, false)
+        .map(|(guard, _)| guard)
+        .map_err(Unadmitted::into_refusal)
+}
+
+/// Why [`execution_readmission`] admitted nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unadmitted {
+    /// A refusal that may lift ([`execution_admission`]'s): the next look admits again.
+    Refused(Refusal),
+    /// The login is no longer filed as the retained intent names it: captured afresh for its
+    /// purpose, it names another owner row or another namespace, so no admission of that intent
+    /// can match again. Its kind is [`RefusalKind::Changing`].
+    Moved(Refusal),
+}
+
+impl Unadmitted {
+    /// The refusal, whichever it is.
+    #[must_use]
+    pub fn into_refusal(self) -> Refusal {
+        match self {
+            Self::Refused(refusal) | Self::Moved(refusal) => refusal,
         }
+    }
+}
+
+/// [`execution_admission`] for a relaunch whose agent has already ended, where the retained
+/// intent's plan cannot be made again: where only the stored login's credential generation moved
+/// since its capture (a renewal or a sign-in of its row, a first usage reading creating the row's
+/// binding, or, for a row with no binding of its own, any account's change), the intent captured
+/// afresh for the same purpose, under the same writer, is admitted in its place and returned, for
+/// the caller to keep before it executes. The fresh capture holds every check the purpose names,
+/// and it names the same namespace, selector, owner row and route, so it grants the same login
+/// that a plan made now would. Every other refusal is [`execution_admission`]'s, and a fresh
+/// capture naming another owner row or namespace is [`Unadmitted::Moved`].
+///
+/// # Errors
+/// [`Unadmitted::Refused`] as [`execution_admission`] refuses; [`Unadmitted::Moved`] where the
+/// login is filed under another owner row or namespace than the intent names.
+pub fn execution_readmission(
+    seat: &Seat<'_>,
+    cli: Cli,
+    intent: &ExecutionIntent,
+) -> Result<(ExecutionGuard, Option<ExecutionIntent>), Unadmitted> {
+    admission(seat, cli, intent, true)
+}
+
+/// Whether `current`, captured afresh for `retained`'s purpose, names the same login on the same
+/// route for the same owner row in the same namespace as `retained`: equal but for a stored
+/// login's credential generation.
+fn same_login(current: &ExecutionIntent, retained: &ExecutionIntent) -> bool {
+    match (current, retained) {
+        (
+            ExecutionIntent::Stored {
+                namespace,
+                login,
+                owner,
+                purpose,
+                generation: _,
+            },
+            ExecutionIntent::Stored {
+                namespace: was_namespace,
+                login: was_login,
+                owner: was_owner,
+                purpose: was_purpose,
+                generation: _,
+            },
+        ) => {
+            namespace == was_namespace
+                && login == was_login
+                && owner == was_owner
+                && purpose == was_purpose
+        }
+        _ => current == retained,
+    }
+}
+
+/// [`execution_admission`], and with `renew`, [`execution_readmission`]: the guard, and the
+/// intent captured afresh where it was admitted in place of `intent`.
+fn admission(
+    seat: &Seat<'_>,
+    cli: Cli,
+    intent: &ExecutionIntent,
+    renew: bool,
+) -> Result<(ExecutionGuard, Option<ExecutionIntent>), Unadmitted> {
+    use RefusalKind::{Changing, Integrity, Unread};
+    let (login, route, purpose) = match intent {
+        ExecutionIntent::External { .. } => return Ok((ExecutionGuard { _held: None }, None)),
+        ExecutionIntent::Stored { login, purpose, .. } => {
+            (login, accounts::AuthRoute::Stored, *purpose)
+        }
+        ExecutionIntent::Token {
+            login,
+            entry,
+            purpose,
+            ..
+        } => (
+            login,
+            accounts::AuthRoute::VaultToken { entry: *entry },
+            *purpose,
+        ),
     };
     if route == accounts::AuthRoute::Stored && seat.keyring_held(cli) {
-        return Err("execution stored-login route is unavailable".into());
+        return Err(Unadmitted::Refused(Refusal::new(
+            Integrity,
+            "execution stored-login route is unavailable",
+        )));
     }
     let store = seat.store(cli);
-    let held = store
-        .acquire_bounded()
-        .map_err(|why| why.to_string())?
-        .ok_or(accounts::LOCK_HELD)?;
-    let snapshot = execution_snapshot_readonly(seat, cli, &store, &held)?;
+    let held = writer(&store).map_err(Unadmitted::Refused)?;
+    let snapshot = execution_snapshot_readonly(seat, cli, &store, &held)
+        .map_err(|why| Unadmitted::Refused(Refusal::new(Unread, why)))?;
     let current = capture_held(
         seat,
         cli,
@@ -783,10 +1288,26 @@ pub fn admit_execution(
             route,
         },
         &snapshot,
-    )?;
-    if current != *intent {
-        return Err("execution account namespace or credential generation changed".into());
-    }
+        purpose,
+    )
+    .map_err(Unadmitted::Refused)?;
+    // The whole intent, its purpose included: a capture for one purpose never stands for the
+    // other's. A readmission takes a fresh capture of the same login in its place.
+    let renewed = if current == *intent {
+        None
+    } else if !renew {
+        return Err(Unadmitted::Refused(Refusal::new(
+            Changing,
+            "execution account namespace or credential generation changed",
+        )));
+    } else if same_login(&current, intent) {
+        Some(current)
+    } else {
+        return Err(Unadmitted::Moved(Refusal::new(
+            Changing,
+            "execution login is filed under another account or namespace than its plan named",
+        )));
+    };
     if let ExecutionIntent::Token { owner, entry, .. } = intent {
         let email = match owner
             .as_deref()
@@ -796,37 +1317,64 @@ pub fn admit_execution(
             None => super::super::profile::login_record(seat.home, login.as_deref())
                 .map(|record| record.email),
         }
-        .ok_or("execution token's account names no email")?;
-        token_in_use_here(seat, &store, *entry, &email)?;
+        .ok_or_else(|| {
+            Unadmitted::Refused(Refusal::new(
+                Integrity,
+                "execution token's account names no email",
+            ))
+        })?;
+        token_in_use_here(seat, &store, *entry, &email).map_err(Unadmitted::Refused)?;
     }
-    Ok(ExecutionGuard { _held: Some(held) })
+    Ok((ExecutionGuard { _held: Some(held) }, renewed))
 }
 
 /// Whether the token `entry` is in use on this Mac (its standing in this Mac's vault, under
-/// `seat.home`, and the table's own facts: `active`, `soon`, `exposed`, or `unverified` on the
-/// Mac that minted it) and its record names `email` (§5.2). The words name the state, never a
-/// value.
+/// `seat.home`, and the table's own facts of that token, `Table::row_for`: `active`, `soon`,
+/// `exposed`, or `unverified` on every Mac where aterm's window or headless route minted it and
+/// on its minting Mac where a person's terminal did, but never `unverified (windows differ)`
+/// here, on which this Mac starts no session) and its record names `email` (§5.2). The hold of
+/// a token awaiting its basis is the route's judgment (`token_route::standing_judged`), which the
+/// plan and the wrapper make; this admits the intent they decided. The words name the state,
+/// never a value.
+///
+/// # Errors
+/// [`RefusalKind::Unread`] where the vault or the token table cannot be read (just now, or at
+/// all; a check file that does not read, for a token minted here alone); [`RefusalKind::Token`]
+/// where the token is not in use here; [`RefusalKind::Integrity`]
+/// where the entry is not a token's or its record names another account.
 #[cfg(unix)]
 fn token_in_use_here(
     seat: &Seat<'_>,
     store: &Store,
     entry: accounts::TokenEntry,
     email: &str,
-) -> Result<(), String> {
+) -> Result<(), Refusal> {
+    use super::super::accounts_tokens::TokenState;
     use aterm_secrets::claude_token::{self, Lookup};
-    let key = claude_token::Key::parse(entry.key().as_str())
-        .ok_or("execution token entry is not a token's")?;
+    let key = claude_token::Key::parse(entry.key().as_str()).ok_or_else(|| {
+        Refusal::new(
+            RefusalKind::Integrity,
+            "execution token entry is not a token's",
+        )
+    })?;
     let found = claude_token::standing(&aterm_secrets::client::Paths::for_home(seat.home), &key)
-        .map_err(|why| format!("execution token: {why}"))?;
-    let table = super::super::accounts_tokens::read_table(store)
-        .map_err(|why| format!("execution token table: {why}"))?;
+        .map_err(|why| Refusal::new(RefusalKind::Unread, format!("execution token: {why}")))?;
+    // Judged as the route judges it: a check file that does not read holds only a token minted
+    // here, whose verdict it holds.
+    let table = super::super::accounts_tokens::read_table_for(store, &found).map_err(|why| {
+        Refusal::new(RefusalKind::Unread, format!("execution token table: {why}"))
+    })?;
     let now = u64::try_from(seat.now).unwrap_or(0);
-    let state =
-        super::super::accounts_tokens::TokenState::of(&found, table.rows.get(key.as_str()), now);
+    let state = TokenState::of(&found, table.row_for(key.as_str(), &found), now);
     if !state.in_use() {
-        return Err(format!(
-            "execution token is not in use here: {}",
-            state.words()
+        // A vault not read just now is a fact aterm cannot read yet, not a token out of use.
+        let kind = match state {
+            TokenState::Unknown => RefusalKind::Unread,
+            _ => RefusalKind::Token,
+        };
+        return Err(Refusal::new(
+            kind,
+            format!("execution token is not in use here: {}", state.words()),
         ));
     }
     let named = match &found {
@@ -837,7 +1385,10 @@ fn token_in_use_here(
         Lookup::Absent | Lookup::Unknown => false,
     };
     if !named {
-        return Err("execution token's record names another account".into());
+        return Err(Refusal::new(
+            RefusalKind::Integrity,
+            "execution token's record names another account",
+        ));
     }
     Ok(())
 }
@@ -849,6 +1400,9 @@ fn token_in_use_here(
     _store: &Store,
     _entry: accounts::TokenEntry,
     _email: &str,
-) -> Result<(), String> {
-    Err("execution token route is unavailable on this platform".into())
+) -> Result<(), Refusal> {
+    Err(Refusal::new(
+        RefusalKind::Token,
+        "execution token route is unavailable on this platform",
+    ))
 }

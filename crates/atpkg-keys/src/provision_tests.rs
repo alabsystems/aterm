@@ -604,7 +604,7 @@ fn a_pending_roster_transaction_is_named_instead_of_a_mistyped_phrase() {
     assert!(err.contains("interrupted roster transaction"), "{err}");
     assert!(err.contains("is not what is wrong"), "{err}");
     assert!(
-        !err.contains("does not verify under the master you typed"),
+        !err.contains("does not verify under the vault's master"),
         "the phrase must not be blamed for a torn pair: {err}"
     );
 
@@ -619,7 +619,7 @@ fn a_pending_roster_transaction_is_named_instead_of_a_mistyped_phrase() {
     )
     .unwrap_err();
     assert!(
-        err.contains("does not verify under the master you typed"),
+        err.contains("does not verify under the vault's master"),
         "the recovered pair is read normally — and this fixture's bytes are not a \
          real roster, so the ordinary signature refusal is what should surface: {err}"
     );
@@ -769,11 +769,17 @@ fn a_record_that_cannot_be_written_fails_the_run_before_the_roster_is_published(
     assert!(err.contains("Nothing authorizes this machine yet"), "{err}");
     assert!(err.contains("rm "), "the recovery undoes the key: {err}");
     assert!(
-        err.contains(
-            "destroy the paper you just wrote, fix the problem above, and run \
-             `atpkg-keys setup` again."
-        ),
-        "setup armed the anchor, so its retry starts over: {err}"
+        err.contains(&concat(&[
+            "`git checkout -- ",
+            &paths.pins,
+            "`, ",
+            SETUP_START_OVER
+        ])),
+        "setup armed the anchor and the vault holds its phrase, so its retry removes both: {err}"
+    );
+    assert!(
+        err.contains("aterm secrets unset release-paper-master"),
+        "setup never replaces the vault's phrase, so the retry names its removal: {err}"
     );
     assert!(
         std::path::Path::new(&paths.key).exists(),
@@ -820,7 +826,7 @@ fn a_failure_that_authorized_nothing_undoes_only_what_its_verb_did() {
         "a join undoes its key and retries: {err}"
     );
     assert!(
-        !err.contains("git checkout") && !err.contains("destroy the paper"),
+        !err.contains("git checkout") && !err.contains("release-paper-master"),
         "a join never armed the anchor: {err}"
     );
 
@@ -968,7 +974,7 @@ fn join_refuses_a_phrase_that_does_not_match_the_committed_anchor() {
     )
     .unwrap_err();
     assert!(
-        err.contains("does not verify under the master you typed"),
+        err.contains("does not verify under the vault's master"),
         "{err}"
     );
 

@@ -3289,9 +3289,16 @@ impl TemporalRecorder {
         None
     }
 
-    /// Stamp every event from now on at `tick`, or at the clock again with `None`.
+    /// Stamp every event from now on at `tick`, or at the clock again with `None`. A frozen tick
+    /// never reads earlier than the newest event, as the writer's own stamps never do
+    /// ([`Self::stamp`]): events stamped behind it would sort before it and fold into its instant.
     #[cfg(test)]
-    pub(crate) const fn freeze_now_for_test(&mut self, tick: Option<Ticks>) {
+    pub(crate) fn freeze_now_for_test(&mut self, tick: Option<Ticks>) {
+        let newest = self.latest_tick();
+        assert!(
+            tick.is_none_or(|tick| tick >= newest),
+            "a clock frozen at {tick:?} reads earlier than the newest event, at {newest:?}"
+        );
         self.frozen_now = tick;
     }
 

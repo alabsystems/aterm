@@ -27,7 +27,8 @@ impl Store {
         std::fs::create_dir_all(root.join("bin")).unwrap();
         let program = root.join("bin/git");
         std::fs::write(&program, format!(
-            "#!/bin/sh\nprintf 'git version 2.{build}.0\\n'\nprintf 'exec=%s\\n' \"$GIT_EXEC_PATH\"\n"
+            "#!/bin/sh\nprintf 'git version 2.{build}.0\\n'\nprintf 'exec=%s\\n' \"$GIT_EXEC_PATH\"\n\
+             printf 'args=%s lazy=%s\\n' \"$*\" \"$GIT_NO_LAZY_FETCH\"\n"
         )).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let env = atpkg::shim_env::ShimEnv::admit(&["GIT_EXEC_PATH=managed-exec".into()]).unwrap();
@@ -63,21 +64,33 @@ fn absent_managed_git_keeps_the_os_fallback() {
     assert!(selected._lease.is_none());
 }
 
+/// The managed git runs with its package's environment, and a read that must stay local runs it
+/// with `--no-lazy-fetch` before every other argument and `GIT_NO_LAZY_FETCH=1`: the stand-in
+/// takes the option (it succeeds whatever it is given), as git 2.45 and later do. NEGATIVE
+/// CONTROL: the plain command carries neither.
 #[test]
 fn managed_git_uses_the_signed_payload_and_its_environment_for_object_reads() {
     let store = Store::new();
     let program = store.install(56);
     let selected = managed_git(&store.layout).unwrap();
     assert_eq!(selected.program, program);
-    for mut cmd in [
-        selected.command(),
-        selected.object_command(&store.layout.prefix),
+    let prefix = store.layout.prefix.display();
+    for (mut cmd, args) in [
+        (selected.command(), "args=version lazy=".to_owned()),
+        (
+            selected.local_read().unwrap(),
+            "args=--no-lazy-fetch version lazy=1".to_owned(),
+        ),
+        (
+            selected.object_command(&store.layout.prefix).unwrap(),
+            format!("args=--no-lazy-fetch -C {prefix} version lazy=1"),
+        ),
     ] {
         let output = cmd.arg("version").output().unwrap();
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            "git version 2.56.0\nexec=managed-exec\n"
+            format!("git version 2.56.0\nexec=managed-exec\n{args}\n")
         );
     }
     let subject = atpkg::lease::Subject::Build {

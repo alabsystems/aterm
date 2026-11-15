@@ -258,7 +258,7 @@ fn presence_band_and_the_published_need_say_a_box_and_a_wall_alike() {
         );
     }
     let overloaded = crate::presence::AgentPhase::Wall {
-        kind: aterm_phase::WallKind::Overloaded,
+        kind: alab_policy::vocab::WallKind::Overloaded,
         reset: None,
         until: None,
     };

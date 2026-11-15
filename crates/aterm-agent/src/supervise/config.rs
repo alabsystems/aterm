@@ -5,25 +5,15 @@
 
 use std::path::{Path, PathBuf};
 
-use aterm_phase::{Program, ResetKind};
+use alab_policy::config::{Autopilot, PolicyConfig, TurnEndTiming};
+use alab_policy::vocab::ResetKind;
+use aterm_phase::Program;
 
 use super::policy::approval::PriorityWord;
 
 use super::memory::MemoryCeiling;
 use super::occupancy::owner_rules::OwnerTables;
 use crate::harness::accounts::Mode;
-use crate::harness::harness_mark;
-
-/// CRUISE'S CONTINUATION, the default `continue_text` (Autopilot Cruise).
-pub const CONTINUE_TEXT: &str = concat!(
-    harness_mark!(),
-    " Autopilot is Cruise: keep going. Finish, verify and land the work, then find the next \
-     improvement. Decide and record why for later AI review; defer unavailable work and \
-     advance what can proceed. ",
-    super::policy::go_ahead::never_a_need!(),
-    " ",
-    super::policy::needs::restart_hint!(),
-);
 
 /// Every `[harness]` key, in the order the help and Settings list them.
 pub const KEYS: &[&str] = &[
@@ -118,49 +108,6 @@ impl Approve {
             Self::All => "all",
             Self::Safe => "safe",
             Self::None => "none",
-        }
-    }
-}
-
-/// How far the harness carries a session's work at its turn ends.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum Autopilot {
-    #[default]
-    Cruise,
-    Land,
-    Off,
-}
-
-impl Autopilot {
-    /// Every mode, in the order the chip cycles them.
-    pub const ALL: [Autopilot; 3] = [Autopilot::Cruise, Autopilot::Land, Autopilot::Off];
-
-    /// The mode's word as the table, the session's `meta` word and the chip spell it.
-    #[must_use]
-    pub const fn word(self) -> &'static str {
-        match self {
-            Autopilot::Cruise => "cruise",
-            Autopilot::Land => "land",
-            Autopilot::Off => "off",
-        }
-    }
-
-    /// A mode from its word ([`Self::word`]) or the owner's own words for it (`forever`, `infinity`: [`Autopilot::Cruise`]; `wrap-up`, `wrapup`, `wrap`: [`Autopilot::Land`]), trimmed, in any case.
-    #[must_use]
-    pub fn parse(word: &str) -> Option<Self> {
-        match word.trim().to_ascii_lowercase().as_str() {
-            "cruise" | "forever" | "infinity" => Some(Autopilot::Cruise),
-            "land" | "wrap-up" | "wrapup" | "wrap" => Some(Autopilot::Land),
-            "off" => Some(Autopilot::Off),
-            _ => None,
-        }
-    }
-
-    const fn rank(self) -> u8 {
-        match self {
-            Autopilot::Off => 0,
-            Autopilot::Land => 1,
-            Autopilot::Cruise => 2,
         }
     }
 }
@@ -268,8 +215,10 @@ pub struct SupervisorConfig {
     pub off: Vec<Program>,
     /// Supervise the sessions of a headless instance too.
     pub headless: bool,
-    /// The [`Autopilot`] of a session with no `autopilot` word of its own ([`Self::autopilot_for`]): [`Autopilot::Cruise`] by default.
-    pub autopilot: Autopilot,
+    /// The policy keys the turn-end decider reads ([`PolicyConfig`]): the [`Autopilot`] of a
+    /// session with no `autopilot` word of its own ([`Self::autopilot_for`]), and what a
+    /// continuation types when the worker offers no suggestion of its own.
+    pub turn_end: PolicyConfig,
     /// THE TIME A TIMED CRUISE IS OFFERED TO LAND AT (`[harness] land_at`, local `HH:MM`, `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.4).
     pub land_at: Option<LandAt>,
     /// What a permission box may be answered with, one level for every agent.
@@ -288,8 +237,6 @@ pub struct SupervisorConfig {
     pub dismiss_surveys: bool,
     /// Type a continuation when a worker ends a turn with work left.
     pub continue_policy: bool,
-    /// What a continuation types when the worker offers no suggestion of its own.
-    pub continue_text: String,
     /// At most this many continuations per session per hour; `0` is no cap.
     pub continue_per_hour: u32,
     /// A file whose text is appended to a continuation (standing rules).
@@ -461,7 +408,7 @@ impl Default for SupervisorConfig {
             enabled: true,
             off: Vec::new(),
             headless: true,
-            autopilot: Autopilot::Cruise,
+            turn_end: PolicyConfig::default(),
             land_at: None,
             approve: Approve::All,
             trust_roots: Vec::new(),
@@ -474,7 +421,6 @@ impl Default for SupervisorConfig {
                 .to_string(),
             dismiss_surveys: true,
             continue_policy: true,
-            continue_text: CONTINUE_TEXT.to_string(),
             continue_per_hour: 0,
             rules_file: None,
             retry_api_errors: true,
@@ -573,7 +519,7 @@ impl SupervisorConfig {
                 None => return bad(self, "all, safe or none"),
             },
             "autopilot" => match Autopilot::parse(value) {
-                Some(a) => self.autopilot = a,
+                Some(a) => self.turn_end.autopilot = a,
                 None => return bad(self, "cruise, land or off"),
             },
             "occupancy" => match Occupancy::parse(value) {
@@ -646,7 +592,7 @@ impl SupervisorConfig {
                 }
             },
             "continue_text" => match text {
-                Some(t) => self.continue_text = t,
+                Some(t) => self.turn_end.continue_text = t,
                 None => {
                     return Err(format!(
                         "harness.{key}: expected a non-empty text — {key} keeps its default"
@@ -752,7 +698,7 @@ impl SupervisorConfig {
         match key {
             "enabled" => self.enabled = false,
             "headless" => self.headless = false,
-            "autopilot" => self.autopilot = Autopilot::Off,
+            "autopilot" => self.turn_end.autopilot = Autopilot::Off,
             "approve" => self.approve = Approve::None,
             "answer_questions" => self.answer_questions = false,
             "dismiss_surveys" => self.dismiss_surveys = false,
@@ -869,7 +815,7 @@ impl SupervisorConfig {
     /// A session's Autopilot.
     #[must_use]
     pub fn autopilot_for(&self, word: Option<Autopilot>) -> Autopilot {
-        word.unwrap_or(self.autopilot)
+        word.unwrap_or(self.turn_end.autopilot)
     }
 
     /// THE ONE PREDICATE the stuck fact's line at a break passes: a [`StuckBreakGrant`] where
@@ -1314,7 +1260,7 @@ impl SupervisorConfig {
             && no_more(self.enabled, before.enabled)
             && before.off.iter().all(|agent| self.off.contains(agent))
             && no_more(self.headless, before.headless)
-            && self.autopilot.rank() <= before.autopilot.rank()
+            && self.turn_end.autopilot.rank() <= before.turn_end.autopilot.rank()
             && self.approve.rank() <= before.approve.rank()
             && no_more(!self.rm_breaker_ask, !before.rm_breaker_ask)
             && self
@@ -1327,7 +1273,7 @@ impl SupervisorConfig {
             && self.answer_text == before.answer_text
             && no_more(self.dismiss_surveys, before.dismiss_surveys)
             && no_more(self.continue_policy, before.continue_policy)
-            && self.continue_text == before.continue_text
+            && self.turn_end.continue_text == before.turn_end.continue_text
             && cap(self.continue_per_hour) <= cap(before.continue_per_hour)
             && self.rules_file == before.rules_file
             && no_more(self.retry_api_errors, before.retry_api_errors)
@@ -1367,7 +1313,11 @@ impl SupervisorConfig {
             enabled,
             off: _,
             headless,
-            autopilot,
+            turn_end:
+                PolicyConfig {
+                    autopilot,
+                    continue_text,
+                },
             land_at,
             approve,
             trust_roots,
@@ -1377,7 +1327,6 @@ impl SupervisorConfig {
             answer_text,
             dismiss_surveys,
             continue_policy,
-            continue_text,
             continue_per_hour,
             rules_file,
             retry_api_errors,
@@ -2328,6 +2277,65 @@ fn top_level(s: &str, sep: char) -> Vec<&str> {
     }
     parts.push(&s[start..]);
     parts
+}
+
+/// THE LADDER'S DEVELOPMENT SEAM.
+pub const LADDER_SCALE_SEAM: &str = "ATERM_DEV_LADDER_SCALE";
+
+/// THE RESET WAIT'S DEVELOPMENT SEAM: a factor in `(0, 1]` on the grace and jitter the harness
+/// waits past a wall's reset ([`TurnEndTiming::reset_scaled`]), so a world test's carry-on comes
+/// at the wall's own reset and its wait is that reset and the hang detector. Only a development
+/// build reads it.
+pub const RESET_SCALE_SEAM: &str = "ATERM_DEV_RESET_SCALE";
+
+/// THE RESET SPAN'S DEVELOPMENT SEAM: a factor in `(0, 1]` on the time from a wall's read to the
+/// reset its words name ([`TurnEndTiming::reset_span_scaled`]), so a world test waits out a wall
+/// that says `in 1m` in seconds while the carry-on still comes after its reset. The wall's words
+/// are not scaled. Only a development build reads it.
+pub const RESET_SPAN_SCALE_SEAM: &str = "ATERM_DEV_RESET_SPAN_SCALE";
+
+/// The factor [`LADDER_SCALE_SEAM`]'s value names.
+#[must_use]
+pub fn ladder_scale(raw: Option<&std::ffi::OsStr>) -> Option<f64> {
+    let s = raw?.to_str()?.trim();
+    if s.starts_with('+') {
+        return None;
+    }
+    let f: f64 = s.parse().ok()?;
+    (f.is_finite() && f > 0.0 && f <= 1.0).then_some(f)
+}
+
+/// The timings of a session this build starts: [`TurnEndTiming::default`], scaled where a
+/// development build's seams say so ([`timing_for_seams`]).
+#[must_use]
+pub fn timing_for_build() -> TurnEndTiming {
+    timing_for_seams(
+        aterm_types::dev_seam!(LADDER_SCALE_SEAM).as_deref(),
+        aterm_types::dev_seam!(RESET_SCALE_SEAM).as_deref(),
+        aterm_types::dev_seam!(RESET_SPAN_SCALE_SEAM).as_deref(),
+    )
+}
+
+/// [`timing_for_build`] under the values its three development seams read
+/// ([`LADDER_SCALE_SEAM`], [`RESET_SCALE_SEAM`], [`RESET_SPAN_SCALE_SEAM`]), each a factor in
+/// `(0, 1]`.
+#[must_use]
+pub fn timing_for_seams(
+    ladder: Option<&std::ffi::OsStr>,
+    reset: Option<&std::ffi::OsStr>,
+    span: Option<&std::ffi::OsStr>,
+) -> TurnEndTiming {
+    let mut timing = TurnEndTiming::default();
+    if let Some(factor) = ladder_scale(ladder) {
+        timing = timing.ladder_scaled(factor);
+    }
+    if let Some(factor) = ladder_scale(reset) {
+        timing = timing.reset_scaled(factor);
+    }
+    if let Some(factor) = ladder_scale(span) {
+        timing = timing.reset_span_scaled(factor);
+    }
+    timing
 }
 
 #[cfg(test)]

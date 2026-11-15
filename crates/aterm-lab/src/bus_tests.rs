@@ -220,9 +220,9 @@ fn a_broker_that_refuses_its_lifeline_is_no_failure() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let start = |name: &str, broker: &str| {
         let aterm = tmp.path().join(name);
-        std::fs::write(
+        aterm_tempfile::stand_in(
             &aterm,
-            format!(
+            &format!(
                 "#!/bin/sh\nusage() (printf '%s\\n' '{usage}' >&2)\n\
                  old='aterm link broker: unknown flag `--lifeline-fd`'\n\
                  case \"$2\" in\nmint) echo \"$3 00\" ;;\nbroker) {broker} ;;\nesac\n",
@@ -230,7 +230,6 @@ fn a_broker_that_refuses_its_lifeline_is_no_failure() {
             ),
         )
         .unwrap();
-        std::fs::set_permissions(&aterm, std::fs::Permissions::from_mode(0o755)).unwrap();
         Fabric::start(&aterm, &tmp.path().join(format!("{name}.bus"))).err()
     };
     let listen = ": > \"$3\"; read x";
@@ -289,4 +288,45 @@ fn a_broker_that_refuses_its_lifeline_is_no_failure() {
         )
     );
     assert_eq!(Unstarted::Failed("no".into()).fail("proof", aterm).code, 1);
+}
+
+/// The bus read's filter reaches the faces a bridge publishes its `ev` records on, the node's
+/// and each session's, and no other face of the node or of another node, and lies under the
+/// broker's `ev` rule. Negative control: the filter without its session wildcard
+/// (`/f/lab/pub/<node>/ev`) reaches neither `ev` face, and one widened to the node's subtree
+/// (`/f/lab/pub/<node>/>`) reaches its presence and ack faces and lies outside the rule.
+#[test]
+fn the_ev_read_reaches_the_bridges_ev_faces_alone() {
+    use astream_wire::Filter;
+    use aterm_link::broker_rules::EV_FILTER;
+    use aterm_link::subject::{node_face, session_face};
+    let node = "n-0123456789abcdef";
+    let filter = Filter::new(ev_filter(node)).expect("a filter");
+    for face in [
+        node_face(FLEET, node, "ev"),
+        session_face(FLEET, node, "s-1", "ev"),
+    ] {
+        assert!(filter.matches_str(&face), "{face}");
+    }
+    for face in [
+        node_face(FLEET, node, "presence"),
+        node_face(FLEET, node, "ack"),
+        session_face(FLEET, node, "s-1", "presence"),
+        node_face(FLEET, "n-fedcba9876543210", "ev"),
+    ] {
+        assert!(!filter.matches_str(&face), "{face}");
+    }
+    let rule = Filter::new(EV_FILTER).expect("the ev rule");
+    assert!(rule.contains(&filter), "{rule:?} holds {filter:?}");
+}
+
+/// A bridge's `ev` record body gives back the words it published, spaces and a `%` included,
+/// and a body with no `ev` field gives none. Negative control: returning the field as it lies in
+/// the body (no `pct::decode` in [`ev_of`]) gives `gap%203%20…` and the first assertion fails.
+#[test]
+fn an_ev_body_gives_back_the_words_the_bridge_published() {
+    let said = "gap 3 events-dropped=9 100%";
+    let body = format!("v=1 t=1 ev={}", aterm_link::pct::encode(said));
+    assert_eq!(ev_of(body.as_bytes()).as_deref(), Some(said));
+    assert_eq!(ev_of(b"v=1 t=1 state=live"), None);
 }

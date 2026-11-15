@@ -88,6 +88,29 @@ fn request_preserves_os_bytes_named_transport_and_refuses_ambiguous_input() {
     assert!(invalid.encode().is_err());
 }
 #[test]
+fn a_session_is_an_aterm_tab_id_in_either_form() {
+    for good in ["tqn5r6e0148", "t0000000000", "s-abcd", "s-0123456789abcdef0123"] {
+        let mut req = request();
+        req.binding.session = good.into();
+        assert!(req.encode().is_ok(), "{good}");
+    }
+    for bad in [
+        "tqn5r6e014",
+        "tqn5r6e01488",
+        "tqn5r6e014i",
+        "tqn5r6e014u",
+        "tQN5R6E0148",
+        "t",
+        "s-",
+        "s-ABCD",
+        "x0123456789",
+    ] {
+        let mut req = request();
+        req.binding.session = bad.into();
+        assert!(req.encode().is_err(), "{bad}");
+    }
+}
+#[test]
 fn metadata_probes_require_exact_bounded_queries_and_existing_cpu_only() {
     let mut probe = request();
     probe.role = Role::MetadataProbe;
@@ -415,7 +438,7 @@ fn telemetry_preserves_unknown_zero_and_original_age_and_rejects_cross_call_or_r
     let bytes = reply.encode().unwrap();
     assert_eq!(
         TelemetryResponse::decode(&bytes, &query).unwrap(),
-        TelemetryResponse::Ready(reply.clone())
+        TelemetryResponse::Ready(Box::new(reply.clone()))
     );
     assert!(ContextResponse::decode(&bytes, &query.query).is_err());
     assert!(

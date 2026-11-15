@@ -104,7 +104,7 @@ fn lab_labels_with_clock(
                 aterm_types::machine_name::OS_NOUN
             )));
         }
-        Stored::In if state.failed || !state.pending.is_empty() => {
+        Stored::In if state.failed => {
             return Err(Error::new(format!(
                 "this {}'s last vault apply did not finish, so its copy of the lab's labels is \
                  not whole",

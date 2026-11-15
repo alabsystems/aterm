@@ -42,16 +42,26 @@ fn owed_reads_each_step_and_an_unreadable_one_owes_nothing() {
         .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440));
     assert_eq!(owed(&on), Vec::<Owed>::new());
 
-    on.on(
-        "/usr/bin/mdutil -s /System/Volumes/Data",
-        Ran::ok("Indexing enabled."),
+    // The console account whose home holds folders Spotlight still indexes owes the scope
+    // until root's receipt names them (`init_spotlight::scope_owed`).
+    let mut account = Fake::root();
+    account.euid = 501;
+    crate::init_spotlight::tests::home(&account);
+    account
+        .logged_in(&user("alice", 501))
+        .stat_of("/dev/console", rule_stat(501, 0o600))
+        .on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
+        .stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440))
+        .on(
+            "/usr/bin/mdutil -s /System/Volumes/Data",
+            Ran::ok("Indexing enabled."),
+        );
+    assert_eq!(owed(&account), vec![Owed::Spotlight]);
+    account.file(
+        crate::init_spotlight::SCOPE_RECEIPT,
+        b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/My Projects\n",
     );
-    on.on(
-        "/usr/bin/mdutil -s /System/Volumes/Data",
-        Ran::ok("Indexing disabled."),
-    );
-    assert_eq!(owed(&on), vec![Owed::Spotlight]);
-    assert_eq!(owed(&on), Vec::<Owed>::new());
+    assert_eq!(owed(&account), Vec::<Owed>::new());
 
     let unread = Fake::root();
     unread

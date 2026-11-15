@@ -213,7 +213,7 @@ fn contact_age_survives_a_wall_rollback_before_publication() {
     let handle = ObservationHandle::default();
     let mut observer = Observer::open(&root.path().join("config"), handle.clone()).unwrap();
     let at = Instant::now();
-    observer.contact(peer(2, 1), 100_000, at);
+    observer.contact(peer(2, 1), 100_000, at, REACHABLE);
     observer.observe(
         Visibility::Active,
         0,
@@ -419,8 +419,8 @@ fn unchanged_account_exchanges_publish_live_and_checkpoint_periodically() {
     let published = handle();
     let mut observer = Observer::open(&config, published.clone()).unwrap();
     observer.local(peer(1, 1), trust(), Vec::new).unwrap();
-    observer.contact(peer(2, 1), 1000, at);
-    observer.contact(peer(3, 1), 1000, at);
+    observer.contact(peer(2, 1), 1000, at, REACHABLE);
+    observer.contact(peer(3, 1), 1000, at, REACHABLE);
     let projection = |observer: &Observer| {
         private_file::read_private(&observer.dir, "projection.json", MAX_BYTES).unwrap()
     };
@@ -486,8 +486,8 @@ fn unchanged_account_exchanges_publish_live_and_checkpoint_periodically() {
     );
     assert_eq!(projection(&observer), first_projection);
 
-    observer.contact(peer(2, 1), 62_000, at + CHECKPOINT);
-    observer.contact(peer(3, 1), 62_000, at + CHECKPOINT);
+    observer.contact(peer(2, 1), 62_000, at + CHECKPOINT, REACHABLE);
+    observer.contact(peer(3, 1), 62_000, at + CHECKPOINT, REACHABLE);
     observer.observe(Visibility::Active, 0, "observing", 62_000, at + CHECKPOINT);
     let periodic_head = observer.log.as_ref().unwrap().stats().head;
     assert!(periodic_head > first_head);
@@ -585,7 +585,7 @@ fn retained_endpoint_requires_exact_identity_and_never_refreshes_reachability() 
     };
     observer.endpoint(&identity, endpoint.clone());
     assert!(observer.state.peers.is_empty());
-    observer.contact(identity.clone(), 1000, now);
+    observer.contact(identity.clone(), 1000, now, REACHABLE);
     observer.endpoint(&peer(3, 1), endpoint.clone());
     observer.endpoint(&peer(2, 2), endpoint.clone());
     assert!(
@@ -613,7 +613,7 @@ fn retained_endpoint_requires_exact_identity_and_never_refreshes_reachability() 
         Some(endpoint)
     );
     assert_eq!(restored.peers[0].reachability, Reachability::Unknown);
-    observer.contact(peer(2, 2), 21_000, now + Duration::from_secs(20));
+    observer.contact(peer(2, 2), 21_000, now + Duration::from_secs(20), REACHABLE);
     assert!(
         observer.state.peers[0]
             .last_authenticated_endpoint
@@ -664,7 +664,7 @@ fn history_restores_stable_slots_but_never_live_reachability() {
     let out = handle();
     let mut observer = Observer::open(&config, out.clone()).unwrap();
     observer.local(peer(1, 1), trust(), Vec::new).unwrap();
-    observer.contact(peer(2, 1), 1000, now);
+    observer.contact(peer(2, 1), 1000, now, REACHABLE);
     observer.observe(Visibility::Active, 12, "observing", 1000, now);
     assert!(
         matches!(Observer::open(&config, handle()), Err(OpenFailure::Owned)),
@@ -676,7 +676,7 @@ fn history_restores_stable_slots_but_never_live_reachability() {
     );
     assert_eq!(observer.log.as_ref().unwrap().stats().retained_records, 1);
     let checkpoint_at = now + CHECKPOINT;
-    observer.contact(peer(2, 1), 61_000, checkpoint_at);
+    observer.contact(peer(2, 1), 61_000, checkpoint_at, REACHABLE);
     observer.observe(Visibility::Active, 12, "observing", 61_000, checkpoint_at);
     assert_eq!(
         observer.log.as_ref().unwrap().stats().retained_records,
@@ -704,8 +704,18 @@ fn history_restores_stable_slots_but_never_live_reachability() {
     );
     reopened.local(peer(1, 2), trust(), Vec::new).unwrap();
     assert_eq!(reopened.state.peers[0].reachability, Reachability::Unknown);
-    reopened.contact(peer(2, 2), 62_000, checkpoint_at + Duration::from_secs(1));
-    reopened.contact(peer(3, 1), 62_000, checkpoint_at + Duration::from_secs(1));
+    reopened.contact(
+        peer(2, 2),
+        62_000,
+        checkpoint_at + Duration::from_secs(1),
+        REACHABLE,
+    );
+    reopened.contact(
+        peer(3, 1),
+        62_000,
+        checkpoint_at + Duration::from_secs(1),
+        REACHABLE,
+    );
     reopened.observe(
         Visibility::Active,
         0,
@@ -745,22 +755,26 @@ fn history_restores_stable_slots_but_never_live_reachability() {
     );
 }
 /// An observer's history as this Mac's earlier writer seat (machine 1) left it: `peers`
-/// contacted at wall 1000, an exchanged repair round with the first of them, an account exchange
-/// retained, every transition checkpointed and the history closed. Returns its config and the
-/// instant it observed at.
+/// contacted at wall 1000, an exchanged repair round with the first of them, a quiet round over
+/// the catalog with the last of them (kept as the lab's), an account exchange retained, every
+/// transition checkpointed and the history closed. Returns its config and the instant it
+/// observed at.
 fn history_of_an_earlier_seat(root: &Path, peers: &[MachineIdentity]) -> (PathBuf, Instant) {
     let config = root.join("config");
     let at = Instant::now();
     let mut observer = Observer::open(&config, handle()).unwrap();
     observer.local(peer(1, 1), trust(), Vec::new).unwrap();
     for contacted in peers {
-        observer.contact(contacted.clone(), 1000, at);
+        observer.contact(contacted.clone(), 1000, at, REACHABLE);
     }
     observer.repair(
         &peers[0],
         round(aterm_types::network_state::RepairOutcome::Exchanged, 1000),
         at,
     );
+    let mut over_catalog = round(aterm_types::network_state::RepairOutcome::Exchanged, 1000);
+    over_catalog.table = Some(crate::catalog::scope(trust()).digest());
+    observer.repair(peers.last().unwrap(), over_catalog, at);
     observer.accounts_exchange(account_exchange::Candidate {
         observation: exchange(),
         sampled_at: at,
@@ -806,6 +820,10 @@ fn a_writer_successor_takes_up_its_own_history() {
         successor.state.peers[0].last_repair.is_some(),
         "PRECONDITION: the earlier seat's round"
     );
+    assert!(
+        successor.state.last_catalog_repair.is_some(),
+        "PRECONDITION: the earlier seat's round over the catalog, kept"
+    );
     let first = head(&successor);
     successor
         .local(peer(9, 1), trust(), || vec![[5; 16], [1; 16]])
@@ -836,11 +854,16 @@ fn a_writer_successor_takes_up_its_own_history() {
             .all(|peer| peer.last_repair.is_none()),
         "no round the earlier seat made is kept"
     );
+    // The same incarnation: only the take-up drops the kept round over the catalog.
+    assert_eq!(
+        successor.state.last_catalog_repair, None,
+        "nor its round over the catalog"
+    );
     assert_eq!(successor.state.accounts_exchange, None);
     assert!(successor.seen.is_empty() && successor.repair_sampled.is_empty());
     // Peer 3 is heard again; peer 2 left the LAN before the succession and never is.
     let later = at + Duration::from_secs(1);
-    successor.contact(peer(3, 1), 2000, later);
+    successor.contact(peer(3, 1), 2000, later, REACHABLE);
     successor.observe(Visibility::Active, 0, "observing", 2000, later);
     assert_eq!(head(&successor), first + 1);
     let snapshot = published.snapshot();
@@ -861,7 +884,7 @@ fn a_writer_successor_takes_up_its_own_history() {
     assert_eq!(snapshot.accounts_exchange, None);
     let window = Duration::from_secs(20 * 60);
     let past = 2000 + u64::try_from(window.as_millis()).unwrap() + 1000;
-    successor.contact(peer(3, 1), past, later + window);
+    successor.contact(peer(3, 1), past, later + window, REACHABLE);
     successor.observe(Visibility::Active, 0, "observing", past, later + window);
     let snapshot = published.snapshot();
     assert_eq!(snapshot.observer, Some(peer(9, 1)), "a confirmed observer");
@@ -915,7 +938,7 @@ fn a_stranger_cannot_take_up_another_observers_history() {
         assert!(observer.state.accounts_exchange.is_some());
     }
     let later = at + Duration::from_secs(1);
-    observer.contact(peer(4, 1), 2000, later);
+    observer.contact(peer(4, 1), 2000, later, REACHABLE);
     observer.observe(Visibility::Active, 0, "observing", 2000, later);
     let snapshot = published.snapshot();
     assert_eq!(snapshot.history, HistoryState::Unavailable);
@@ -953,8 +976,8 @@ fn a_failed_checkpoint_keeps_hearing_peers_and_naming_its_observer() {
     let published = handle();
     let mut observer = Observer::open(&config, published.clone()).unwrap();
     observer.local(peer(1, 1), trust(), Vec::new).unwrap();
-    observer.contact(peer(2, 1), 1000, at);
-    observer.contact(peer(3, 1), 1000, at);
+    observer.contact(peer(2, 1), 1000, at, REACHABLE);
+    observer.contact(peer(3, 1), 1000, at, REACHABLE);
     observer.observe(Visibility::Active, 0, "observing", 1000, at);
     // The projection can no longer be replaced: the next checkpoint fails.
     let projection = directory(&config).join("projection.json");
@@ -966,7 +989,7 @@ fn a_failed_checkpoint_keeps_hearing_peers_and_naming_its_observer() {
     assert!(observer.poisoned, "PRECONDITION: the checkpoint failed");
     // Peer 2 is heard after the failure; peer 3 is not.
     let later = failed + Duration::from_secs(1);
-    observer.contact(peer(2, 1), 1_500_000, later);
+    observer.contact(peer(2, 1), 1_500_000, later, REACHABLE);
     observer.observe(Visibility::Active, 0, "observing", 1_500_000, later);
     let snapshot = published.snapshot();
     assert_eq!(snapshot.history, HistoryState::Unavailable);
@@ -988,7 +1011,7 @@ fn wall_time_jump_and_unavailable_observer_withdraw_current_claims() {
     let root = aterm_tempfile::tempdir().unwrap();
     let now = Instant::now();
     let mut observer = Observer::open(&root.path().join("config"), handle()).unwrap();
-    observer.contact(peer(2, 1), 1000, now);
+    observer.contact(peer(2, 1), 1000, now, REACHABLE);
     observer.observe(Visibility::Active, 0, "ok", 1000, now);
     observer.observe(
         Visibility::Active,
@@ -1002,7 +1025,7 @@ fn wall_time_jump_and_unavailable_observer_withdraw_current_claims() {
         Reachability::LastSeen,
         "sleep cannot preserve a stale green cell"
     );
-    observer.contact(peer(2, 1), 100_001, now + Duration::from_secs(1));
+    observer.contact(peer(2, 1), 100_001, now + Duration::from_secs(1), REACHABLE);
     observer.observe(
         Visibility::Unavailable,
         0,
@@ -1021,7 +1044,7 @@ fn repeated_contacts_coalesce_and_history_is_bounded() {
     let root = aterm_tempfile::tempdir().unwrap();
     let now = Instant::now();
     let mut observer = Observer::open(&root.path().join("config"), handle()).unwrap();
-    observer.contact(peer(2, 1), 1000, now);
+    observer.contact(peer(2, 1), 1000, now, REACHABLE);
     observer.observe(Visibility::Active, 0, "ok", 1000, now);
     let head = observer.log.as_ref().unwrap().stats().head;
     for tick in 1..10 {
@@ -1029,6 +1052,7 @@ fn repeated_contacts_coalesce_and_history_is_bounded() {
             peer(2, 1),
             1000 + tick * 1000,
             now + Duration::from_secs(tick),
+            REACHABLE,
         );
         observer.observe(
             Visibility::Active,
@@ -1051,7 +1075,12 @@ fn repeated_contacts_coalesce_and_history_is_bounded() {
             tick * 1000,
             now + Duration::from_secs(tick),
         );
-        observer.contact(peer(2, 1), tick * 1000, now + Duration::from_secs(tick));
+        observer.contact(
+            peer(2, 1),
+            tick * 1000,
+            now + Duration::from_secs(tick),
+            REACHABLE,
+        );
         observer.observe(
             Visibility::Active,
             0,
@@ -1086,7 +1115,7 @@ fn corrupt_projection_cannot_replace_authoritative_journal_history() {
     let config = root.path().join("config");
     let now = Instant::now();
     let mut observer = Observer::open(&config, handle()).unwrap();
-    observer.contact(peer(2, 1), 1000, now);
+    observer.contact(peer(2, 1), 1000, now, REACHABLE);
     observer.observe(Visibility::Active, 0, "ok", 1000, now);
     drop(observer);
     private_file::write_private(&directory(&config), "projection.json", b"bad cache").unwrap();
@@ -1112,7 +1141,7 @@ fn identities_are_bounded_without_reassigning_old_slots() {
     for n in 0..=MAX_PEERS {
         let mut identity = peer(0, 1);
         identity.machine_id[..2].copy_from_slice(&(n as u16).to_be_bytes());
-        observer.contact(identity, 1000, now);
+        observer.contact(identity, 1000, now, REACHABLE);
     }
     assert_eq!(observer.state.peers.len(), MAX_PEERS);
     assert!(observer.state.retention_limited);
@@ -1126,7 +1155,7 @@ fn identities_are_bounded_without_reassigning_old_slots() {
         let mut overflow = peer(0, 1);
         overflow.machine_id[..2].copy_from_slice(&(MAX_PEERS as u16).to_be_bytes());
         let at = now + Duration::from_secs(elapsed);
-        observer.contact(overflow, 1000 + elapsed * 1000, at);
+        observer.contact(overflow, 1000 + elapsed * 1000, at, REACHABLE);
         observer.observe(Visibility::Active, 0, "ok", 1000 + elapsed * 1000, at);
         assert_eq!(observer.log.as_ref().unwrap().stats().head, head);
         assert_eq!(observer.state.peers, retained);
@@ -1139,12 +1168,12 @@ fn unavailable_storage_keeps_network_health_independent_without_rebuilding_histo
     let config = root.path().join("config");
     let now = Instant::now();
     let mut durable = Observer::open(&config, handle()).unwrap();
-    durable.contact(peer(2, 1), 1000, now);
+    durable.contact(peer(2, 1), 1000, now, REACHABLE);
     durable.observe(Visibility::Active, 0, "ok", 1000, now);
     drop(durable);
     let before = std::fs::read(directory(&config).join("observations.astream")).unwrap();
     let mut memory = Observer::unavailable(&config, handle());
-    memory.contact(peer(3, 1), 2000, now);
+    memory.contact(peer(3, 1), 2000, now, REACHABLE);
     memory.observe(Visibility::Active, 3, "presence active", 2000, now);
     assert_eq!(memory.state.visibility, Visibility::Active);
     assert_eq!(memory.state.history, HistoryState::Unavailable);
@@ -1204,7 +1233,7 @@ fn transitions_inside_one_settle_interval_make_one_checkpoint() {
     // in between publishes them live.
     for n in 0..40_u64 {
         let now = at + Duration::from_millis(500 * (n + 1));
-        observer.contact(numbered(n as u16 + 2), 1500 + 500 * n, now);
+        observer.contact(numbered(n as u16 + 2), 1500 + 500 * n, now, REACHABLE);
         observer.observe(Visibility::Active, 0, "observing", 1500 + 500 * n, now);
         assert_eq!(published.snapshot().peers.len(), n as usize + 1);
     }
@@ -1230,7 +1259,7 @@ fn transitions_inside_one_settle_interval_make_one_checkpoint() {
     // More transitions before the next interval ends wait again.
     for n in 40..60_u64 {
         let now = at + SETTLE + Duration::from_millis(500 * (n - 39));
-        observer.contact(numbered(n as u16 + 2), 40_000 + n, now);
+        observer.contact(numbered(n as u16 + 2), 40_000 + n, now, REACHABLE);
         observer.observe(Visibility::Active, 0, "observing", 40_000 + n, now);
     }
     assert_eq!(head(&observer), first + 1);
@@ -1280,227 +1309,429 @@ fn own_identity_and_trust_are_checkpointed_without_waiting() {
     assert!(reopened.local(peer(9, 1), trust(), Vec::new).is_err());
 }
 
-#[test]
-fn a_steady_contact_cadence_makes_no_reachability_transition() {
-    // Slower than REACHABLE, as in a lab of dozens of peers: the measured period keeps the
-    // lease, and the peer reads LastSeen only once it misses a whole scheduled contact.
-    const PERIOD: u64 = 24;
-    const { assert!(Duration::from_secs(PERIOD).as_millis() > REACHABLE.as_millis()) };
-    let root = aterm_tempfile::tempdir().unwrap();
-    let config = root.path().join("config");
-    let at = Instant::now();
-    let published = handle();
-    let mut observer = Observer::open(&config, published.clone()).unwrap();
-    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
-    observer.contact(peer(2, 1), 1000, at);
-    tick(&mut observer, at, 0, PERIOD - 1);
-    // The first gap is past the lease of a peer not yet measured: a candidate. The second
-    // confirms it, and the third contact has the period.
-    observer.contact(
-        peer(2, 1),
-        1000 + PERIOD * 1000,
-        at + Duration::from_secs(PERIOD),
-    );
-    tick(&mut observer, at, PERIOD, 2 * PERIOD - 1);
-    assert_eq!(observer.state.peers[0].reachability, Reachability::LastSeen);
-    observer.contact(
-        peer(2, 1),
-        1000 + 2 * PERIOD * 1000,
-        at + Duration::from_secs(2 * PERIOD),
-    );
-    tick(&mut observer, at, 2 * PERIOD, 2 * PERIOD);
-    let measured = observer.state.peers[0].samples.clone();
-    assert_eq!(measured.last().unwrap().state, Reachability::Reachable);
-    // The lease travels with the live observation, on the Reachable peer, and is no part of
-    // the state the journal stores.
-    assert_eq!(
-        published.try_publication().unwrap().observation().peers[0].lease_ms,
-        Some(2 * PERIOD * 1000)
-    );
-    assert_eq!(observer.state.peers[0].lease_ms, None);
-    for cycle in 3..=40 {
-        tick(
-            &mut observer,
-            at,
-            (cycle - 1) * PERIOD + 1,
-            cycle * PERIOD - 1,
-        );
-        // What a reader of the publication sees just before the next contact.
-        let now = at + Duration::from_secs(cycle * PERIOD - 1);
-        let publication = published.try_publication().unwrap();
-        assert_eq!(
-            publication
-                .current_at(now, Some(1000 + (cycle * PERIOD - 1) * 1000))
-                .peers[0]
-                .reachability,
-            Reachability::Reachable,
-            "cycle {cycle}"
-        );
-        observer.contact(
-            peer(2, 1),
-            1000 + cycle * PERIOD * 1000,
-            at + Duration::from_secs(cycle * PERIOD),
-        );
-        tick(&mut observer, at, cycle * PERIOD, cycle * PERIOD);
+/// `body`'s result with the mutant `flag`, if any, on for this thread.
+fn under<R>(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+    body: impl FnOnce() -> R,
+) -> R {
+    if let Some(flag) = flag {
+        flag.with(|flag| flag.set(true));
     }
-    assert_eq!(
-        observer.state.peers[0].samples, measured,
-        "a peer contacted on schedule adds no presence sample"
-    );
-    assert!(!observer.state.retention_limited);
-    // It misses a whole contact: LastSeen at twice its period, and no earlier.
-    let last = 40 * PERIOD;
-    tick(&mut observer, at, last + 1, last + 2 * PERIOD - 1);
-    assert_eq!(
-        observer.state.peers[0].reachability,
-        Reachability::Reachable
-    );
-    tick(&mut observer, at, last + 2 * PERIOD, last + 2 * PERIOD);
-    assert_eq!(observer.state.peers[0].reachability, Reachability::LastSeen);
-    assert_eq!(
-        published
-            .try_publication()
-            .unwrap()
-            .current_at(
-                at + Duration::from_secs(last + 2 * PERIOD),
-                Some(1000 + (last + 2 * PERIOD) * 1000)
-            )
-            .peers[0]
-            .reachability,
-        Reachability::LastSeen
-    );
+    let result = body();
+    if let Some(flag) = flag {
+        flag.with(|flag| flag.set(false));
+    }
+    result
 }
 
-#[test]
-fn a_contact_lease_is_measured_and_bounded() {
-    let at = Instant::now();
-    let secs = Duration::from_secs;
-    let first = Contact::first(at);
-    assert_eq!(first.lease(), REACHABLE, "one contact measures no period");
-    // Faster than half of REACHABLE: the floor.
-    assert_eq!(first.then(at + secs(4)).lease(), REACHABLE);
-    // A gap inside the lease: a longer one is the period at once, a shorter one lowers it a
-    // quarter of the way.
-    let uneven = first.then(at + secs(10)).then(at + secs(24));
-    assert_eq!(uneven.period, Some(secs(14)));
-    let uneven = uneven.then(at + secs(50));
-    assert_eq!(uneven.period, Some(secs(26)));
-    let uneven = uneven.then(at + secs(60));
-    assert_eq!(uneven.period, Some(secs(22)));
-    assert!(
-        uneven.lease() > secs(26),
-        "alternating gaps keep the slower one's lease"
-    );
-    // A gap past the lease is a candidate, and the period only once the next gap is at least
-    // half of it: a slow peer is measured by its third contact.
-    let slow = first.then(at + secs(24));
-    assert_eq!((slow.period, slow.candidate), (None, Some(secs(24))));
-    assert_eq!(slow.lease(), REACHABLE);
-    let slow = slow.then(at + secs(48));
-    assert_eq!((slow.period, slow.candidate), (Some(secs(24)), None));
-    assert_eq!(slow.lease(), secs(48));
-    // The confirming gap may be the shorter one, down to half; the longer is kept.
-    let halved = first.then(at + secs(24)).then(at + secs(36));
-    assert_eq!(halved.period, Some(secs(24)));
-    // No contact older than LEASE_MAX reads Reachable, however slow the peer is.
-    let slowest = first.then(at + secs(100)).then(at + secs(200));
-    assert_eq!(slowest.lease(), LEASE_MAX);
-    assert_eq!(slowest.period, Some(LEASE_MAX / 2));
-    // A contact that is not later than the last one measures nothing.
-    assert_eq!(slowest.then(at).at, slowest.at);
-    assert_eq!(slowest.then(slowest.at).period, slowest.period);
+/// An observer of its own scratch history, with the handle it publishes to; the directory
+/// lives as long as the observer is used.
+fn observed() -> (aterm_tempfile::TempDir, Observer, ObservationHandle) {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let published = handle();
+    let mut observer = Observer::open(&root.path().join("config"), published.clone()).unwrap();
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
+    (root, observer, published)
 }
 
-#[test]
-fn an_absence_does_not_lengthen_the_lease() {
-    let at = Instant::now();
-    let secs = Duration::from_secs;
-    // Measured at 24 s, away for five minutes, then back at its pace: the gap is dismissed.
-    let steady = Contact::first(at)
-        .then(at + secs(24))
-        .then(at + secs(48))
-        .then(at + secs(72));
-    assert_eq!(steady.period, Some(secs(24)));
-    let back = steady.then(at + secs(372));
-    assert_eq!((back.period, back.candidate), (Some(secs(24)), None));
-    assert_eq!(
-        back.lease(),
-        secs(48),
-        "an absence leaves the lease as it was"
-    );
-    let resumed = back.then(at + secs(396));
-    assert_eq!((resumed.period, resumed.candidate), (Some(secs(24)), None));
-    // A shorter absence, one some lease could cover, is a candidate the next gap dismisses.
-    let short = steady.then(at + secs(172));
-    assert_eq!(
-        (short.period, short.candidate),
-        (Some(secs(24)), Some(secs(100)))
-    );
-    let resumed = short.then(at + secs(196));
-    assert_eq!((resumed.period, resumed.candidate), (Some(secs(24)), None));
-    // Absences in a row, one contact between them (a Mac that answers once each time it
-    // wakes), never read as a pace: the second does not confirm the first. Negative control:
-    // a gap past LEASE_MAX that may be a candidate gives this peer the longest lease.
-    let fast = Contact::first(at).then(at + secs(5)).then(at + secs(10));
-    assert_eq!(fast.lease(), REACHABLE);
-    let woke = fast
-        .then(at + secs(3610))
-        .then(at + secs(7210))
-        .then(at + secs(10_810));
-    assert_eq!((woke.period, woke.candidate), (Some(secs(5)), None));
-    assert_eq!(
-        woke.lease(),
-        REACHABLE,
-        "two absences running are not a slow pace"
-    );
-    // Nor does an absence confirm a candidate a lease could have covered.
-    let away = steady.then(at + secs(172)).then(at + secs(3772));
-    assert_eq!((away.period, away.candidate), (Some(secs(24)), None));
-    // A peer whose pace really slowed is measured by the second slow gap.
-    let slowed = steady.then(at + secs(132)).then(at + secs(192));
-    assert_eq!(slowed.period, Some(secs(60)));
+/// What one peer reads to its observer, and to a reader of what that observer published.
+type Both = (Reachability, Reachability);
 
-    // The observer's view: steady contacts every 5 s, one 300 s absence, three more contacts,
-    // then silence. The peer reads LastSeen at twice its steady period (the 15 s floor), not at
-    // a lease the absence stretched.
-    let root = aterm_tempfile::tempdir().unwrap();
-    let config = root.path().join("config");
-    let published = handle();
-    let mut observer = Observer::open(&config, published.clone()).unwrap();
-    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
-    let contact = |observer: &mut Observer, second: u64| {
-        observer.contact(peer(2, 1), 1000 + second * 1000, at + secs(second));
-        tick(observer, at, second, second);
-    };
-    for second in (0..=40).step_by(5) {
-        contact(&mut observer, second);
-    }
-    tick(&mut observer, at, 41, 339);
-    assert_eq!(observer.state.peers[0].reachability, Reachability::LastSeen);
-    for second in [340, 345, 350, 355] {
-        contact(&mut observer, second);
-    }
-    let reading = |second: u64| {
-        published
-            .try_publication()
+/// One observation `second` seconds after `at`, the wall clock in step, and what `machine`
+/// then reads: to the observer, and to a reader of what it published.
+fn reading(
+    observer: &mut Observer,
+    published: &ObservationHandle,
+    at: Instant,
+    second: u64,
+    machine: u8,
+) -> Both {
+    tick(observer, at, second, second);
+    let of = |observation: &NetworkObservation| {
+        observation
+            .peers
+            .iter()
+            .find(|peer| peer.identity.machine_id == [machine; 16])
             .unwrap()
-            .current_at(at + secs(second), Some(1000 + second * 1000))
-            .peers[0]
             .reachability
     };
-    tick(&mut observer, at, 356, 369);
+    let read = published
+        .try_publication()
+        .unwrap()
+        .current_at(at + Duration::from_secs(second), Some(1000 + second * 1000));
+    let read = (of(&observer.state), of(&read));
     assert_eq!(
-        observer.state.peers[0].reachability,
-        Reachability::Reachable
+        read.0, read.1,
+        "second {second}: a reader of the publication reads machine {machine} as its observer"
     );
-    assert_eq!(reading(369), Reachability::Reachable);
+    read
+}
+
+/// The longest promise a scheduler can make: eleven minutes, the longest lease there is.
+const SETTLED: Duration = LEASE_MAX;
+/// Nine minutes between two rounds with one peer, in seconds: inside that promise, and longer
+/// than any lease the observer once measured.
+const AUDIT: u64 = 540;
+const REACHABLE_BOTH: Both = (Reachability::Reachable, Reachability::Reachable);
+const LAST_SEEN_BOTH: Both = (Reachability::LastSeen, Reachability::LastSeen);
+
+/// A peer contacted every nine minutes on an eleven-minute promise, read once a minute for
+/// twelve contacts and then left uncontacted: its presence samples, the lease its observer
+/// published and stored for it, and the second after its last contact at which it first read
+/// LastSeen.
+fn nine_minute_contacts(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> (Vec<Reachability>, Option<u64>, Option<u64>, Option<u64>) {
+    under(flag, || {
+        let (_root, mut observer, published) = observed();
+        let at = Instant::now();
+        let mut lease = None;
+        for cycle in 0..12 {
+            let second = cycle * AUDIT;
+            observer.contact(
+                peer(2, 1),
+                1000 + second * 1000,
+                at + Duration::from_secs(second),
+                SETTLED,
+            );
+            // What the observer and a reader of its publication see through the wait, to the
+            // second before the next contact.
+            for minute in (0..AUDIT).step_by(60).chain([AUDIT - 1]) {
+                reading(&mut observer, &published, at, second + minute, 2);
+            }
+            lease = published.try_publication().unwrap().observation().peers[0].lease_ms;
+        }
+        let last = 11 * AUDIT;
+        let gone = (AUDIT..=AUDIT + 300).find(|after| {
+            reading(&mut observer, &published, at, last + after, 2) != REACHABLE_BOTH
+        });
+        (
+            observer.state.peers[0]
+                .samples
+                .iter()
+                .map(|sample| sample.state)
+                .collect(),
+            lease,
+            observer.state.peers[0].lease_ms,
+            gone,
+        )
+    })
+}
+
+/// A peer whose scheduler dials it once in nine minutes, and promises each contact its next
+/// round within eleven, makes no reachability transition while each round comes as promised, to
+/// its observer or to a reader of the publication. It reads LastSeen once a promised round did
+/// not come: eleven minutes after its last contact. The lease travels with the live
+/// observation, on the Reachable peer, and is no part of the state the journal stores.
+/// MUTANT (`UNPROMISED`): every contact keeps the peer Reachable for the 15 s floor, so it
+/// reads LastSeen and Reachable again around each contact.
+#[test]
+fn contacts_nine_minutes_apart_make_no_reachability_transition() {
+    const { assert!(AUDIT * 1000 < aterm_types::network_state::LEASE_MAX_MS) };
     assert_eq!(
-        published.try_publication().unwrap().observation().peers[0].lease_ms,
-        Some(15_000)
+        nine_minute_contacts(None),
+        (
+            vec![Reachability::Reachable, Reachability::LastSeen],
+            Some(660_000),
+            None,
+            Some(660),
+        ),
+        "one sample at the first contact and one when the promised round did not come"
     );
-    tick(&mut observer, at, 370, 370);
-    assert_eq!(observer.state.peers[0].reachability, Reachability::LastSeen);
-    assert_eq!(reading(370), Reachability::LastSeen);
+    let (samples, lease, _, gone) = nine_minute_contacts(Some(&UNPROMISED));
+    assert_eq!(samples.len(), 24, "MUTANT: a transition at every contact");
+    assert_eq!(
+        (lease, gone),
+        (None, Some(AUDIT)),
+        "MUTANT: no lease is held"
+    );
+}
+
+/// A promise is honoured within the bounds every reader keeps: none is shorter than a
+/// publication stays current, and none outlasts the longest lease, whatever a scheduler says.
+#[test]
+fn a_promise_is_kept_within_the_lease_bounds() {
+    let at = Instant::now();
+    let secs = Duration::from_secs;
+    assert_eq!(Contact::first(at, Duration::ZERO).lease(), REACHABLE);
+    assert_eq!(Contact::first(at, secs(120)).lease(), secs(120));
+    assert_eq!(Contact::first(at, secs(3600)).lease(), LEASE_MAX);
+    // A later contact takes its own promise; one that is not later changes nothing, whatever
+    // it was promised: rounds end out of the order they authenticated in.
+    let held = Contact::first(at + secs(10), secs(120));
+    let later = held.then(at + secs(20), secs(600));
+    assert_eq!((later.at, later.lease()), (at + secs(20), secs(600)));
+    for earlier in [at, at + secs(10)] {
+        let same = held.then(earlier, secs(600));
+        assert_eq!((same.at, same.lease()), (held.at, secs(120)));
+    }
+}
+
+/// What two peers read around a departure: both are contacted on an eleven-minute promise,
+/// then the transport finds the first gone at second 60.
+fn departure(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> (Vec<(&'static str, Both)>, usize) {
+    under(flag, || {
+        let (_root, mut observer, published) = observed();
+        let at = Instant::now();
+        let secs = Duration::from_secs;
+        let mut read = Vec::new();
+        for machine in [2, 3] {
+            observer.contact(peer(machine, 1), 1000, at, SETTLED);
+        }
+        // A departure that names another installation of the machine, or a machine never
+        // observed, ends nothing, and neither does one no later than the contact.
+        observer.left(&peer(2, 9), at + secs(30));
+        observer.left(&peer(7, 1), at + secs(30));
+        observer.left(&peer(2, 1), at);
+        read.push(("before", reading(&mut observer, &published, at, 59, 2)));
+        observer.left(&peer(2, 1), at + secs(60));
+        read.push(("gone", reading(&mut observer, &published, at, 60, 2)));
+        read.push(("other", reading(&mut observer, &published, at, 60, 3)));
+        // A round that authenticated before the departure and ended after it is a contact,
+        // and no evidence that the peer is back.
+        observer.contact(peer(2, 1), 51_000, at + secs(50), SETTLED);
+        read.push(("earlier", reading(&mut observer, &published, at, 61, 2)));
+        // An earlier departure heard late does not undo the later one either.
+        observer.left(&peer(2, 1), at + secs(40));
+        observer.contact(peer(2, 1), 56_000, at + secs(55), SETTLED);
+        read.push(("still", reading(&mut observer, &published, at, 62, 2)));
+        // One that authenticated at the departure or later is.
+        observer.contact(peer(2, 1), 61_000, at + secs(60), SETTLED);
+        read.push(("back", reading(&mut observer, &published, at, 63, 2)));
+        let samples = observer.state.peers[0].samples.len();
+        // Another installation of a machine found gone is another peer: its contact stands,
+        // though it authenticated before the installation it replaced was found gone.
+        observer.left(&peer(2, 1), at + secs(70));
+        read.push(("gone again", reading(&mut observer, &published, at, 70, 2)));
+        observer.contact(peer(2, 2), 66_000, at + secs(65), SETTLED);
+        read.push(("reinstalled", reading(&mut observer, &published, at, 71, 2)));
+        (read, samples)
+    })
+}
+
+/// A peer the transport found gone reads LastSeen at the next observation, though its contact
+/// was promised eleven minutes: to its observer and to a reader of the publication. Only a
+/// contact that authenticated at the departure or after it returns the peer; every other peer
+/// keeps its lease. MUTANT (`LEFT_STANDS`): the departed peer stays Reachable. MUTANT
+/// (`LEFT_FORGOTTEN`): a round that authenticated before the departure and ended after it
+/// returns the peer.
+#[test]
+fn a_peer_found_gone_reads_last_seen_until_a_contact_after_its_departure() {
+    let (read, samples) = departure(None);
+    assert_eq!(
+        read,
+        [
+            ("before", REACHABLE_BOTH),
+            ("gone", LAST_SEEN_BOTH),
+            ("other", REACHABLE_BOTH),
+            ("earlier", LAST_SEEN_BOTH),
+            ("still", LAST_SEEN_BOTH),
+            ("back", REACHABLE_BOTH),
+            ("gone again", LAST_SEEN_BOTH),
+            ("reinstalled", REACHABLE_BOTH),
+        ]
+    );
+    assert_eq!(
+        samples, 3,
+        "Reachable, LastSeen as it left, Reachable again"
+    );
+    assert_eq!(
+        departure(Some(&LEFT_STANDS)).0[1],
+        ("gone", REACHABLE_BOTH),
+        "MUTANT: a departure ends no lease"
+    );
+    assert_eq!(
+        departure(Some(&LEFT_FORGOTTEN)).0[3],
+        ("earlier", REACHABLE_BOTH),
+        "MUTANT: an earlier contact returns the peer"
+    );
+}
+
+/// The second, from 300 to 600, at which each of four peers first reads LastSeen, to its
+/// observer and to a reader of the publication alike. Three were promised eleven minutes: the
+/// first was contacted at second 0, the second at 250, and the third at 320, after the
+/// promises were curtailed at second 300. The fourth was contacted at second 290 and promised
+/// 15 s.
+fn curtailed(
+    since: Since,
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> [Option<u64>; 4] {
+    under(flag, || {
+        let (_root, mut observer, published) = observed();
+        let at = Instant::now();
+        let secs = Duration::from_secs;
+        observer.contact(peer(2, 1), 1000, at, SETTLED);
+        observer.contact(peer(3, 1), 251_000, at + secs(250), SETTLED);
+        observer.contact(peer(5, 1), 291_000, at + secs(290), REACHABLE);
+        for second in [299, 300] {
+            for machine in [2, 3, 5] {
+                assert_eq!(
+                    reading(&mut observer, &published, at, second, machine),
+                    REACHABLE_BOTH
+                );
+            }
+        }
+        observer.curtail(at + secs(300), since);
+        let mut gone = [None; 4];
+        for second in 300..=600 {
+            if second == 320 {
+                observer.contact(peer(4, 1), 321_000, at + secs(320), SETTLED);
+            }
+            if second == 330 {
+                // Heard again, the same change takes no more from a contact than it did, and
+                // nothing from a contact made since.
+                observer.curtail(at + secs(300), since);
+            }
+            for (machine, gone) in [2, 3, 4, 5].into_iter().zip(&mut gone) {
+                if machine == 4 && second < 320 {
+                    continue;
+                }
+                let read = reading(&mut observer, &published, at, second, machine);
+                if gone.is_none() && read.0 != Reachability::Reachable {
+                    *gone = Some(second);
+                }
+            }
+        }
+        gone
+    })
+}
+
+/// When what promised a contact its next round no longer stands, the contact keeps at most two
+/// minutes of its lease, counted from the contact where this Mac's network changed (a peer
+/// contacted before then may be on a network this Mac left) and from now where the scheduler
+/// starts over (it reaches every peer again from here). A contact made after that keeps its
+/// promise, and one that had less left keeps what it had: a lease is only ever shortened.
+/// MUTANT (`UNCURTAILED`): each keeps its eleven minutes. MUTANT (`CURTAILS_FROM_NOW`):
+/// a network change leaves a five-minute-old contact two more minutes. MUTANT
+/// (`CURTAILS_FROM_CONTACT`): a scheduler that starts over finds a peer it contacted over two
+/// minutes ago LastSeen at once.
+#[test]
+fn curtailed_contacts_keep_two_minutes_from_the_contact_or_from_now() {
+    const { assert!(CURTAILED.as_millis() >= REACHABLE.as_millis()) };
+    // From the contact: the one from second 0 is already older than two minutes, the one from
+    // second 250 has until 370. The 15 s promise made at second 290 runs out at 305 either way.
+    assert_eq!(
+        curtailed(Since::Contact, None),
+        [Some(300), Some(370), None, Some(305)]
+    );
+    // From now, second 300: both have until 420.
+    assert_eq!(
+        curtailed(Since::Now, None),
+        [Some(420), Some(420), None, Some(305)]
+    );
+    for since in [Since::Contact, Since::Now] {
+        assert_eq!(
+            curtailed(since, Some(&UNCURTAILED)),
+            [None, None, None, Some(305)],
+            "MUTANT: no lease is shortened by {since:?}"
+        );
+    }
+    assert_eq!(
+        curtailed(Since::Contact, Some(&CURTAILS_FROM_NOW)),
+        [Some(420), Some(420), None, Some(305)],
+        "MUTANT: counted from now"
+    );
+    assert_eq!(
+        curtailed(Since::Now, Some(&CURTAILS_FROM_CONTACT)),
+        [Some(300), Some(370), None, Some(305)],
+        "MUTANT: counted from the contact"
+    );
+}
+
+/// The second, from 300 to 700, at which each of two peers first reads LastSeen after this
+/// Mac's network changed at second 300, each promised eleven minutes by a round that ended,
+/// and was told to the observer, at second 301. The first's round authenticated at second 250,
+/// before the change, and the second's at second 301, after it.
+fn told_late(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> [Option<u64>; 2] {
+    under(flag, || {
+        let (_root, mut observer, published) = observed();
+        let at = Instant::now();
+        let secs = Duration::from_secs;
+        observer.curtail(at + secs(300), Since::Contact);
+        observer.contact(peer(2, 1), 251_000, at + secs(250), SETTLED);
+        observer.contact(peer(3, 1), 302_000, at + secs(301), SETTLED);
+        let mut gone = [None; 2];
+        for second in 301..=700 {
+            for (machine, gone) in [2, 3].into_iter().zip(&mut gone) {
+                let read = reading(&mut observer, &published, at, second, machine);
+                if gone.is_none() && read.0 != Reachability::Reachable {
+                    *gone = Some(second);
+                }
+            }
+        }
+        gone
+    })
+}
+
+/// Rounds end out of the order they authenticated in, so a contact can be told to the observer
+/// after this Mac's network changed though it was made before: a round that authenticated,
+/// then outlasted a sleep. It is promised what the contacts curtailed at the change kept, two
+/// minutes from the contact, and not the eleven its scheduler promised; a contact made after
+/// the change keeps its promise.
+/// MUTANT (`LATE_PROMISED`): the contact from before the change keeps its eleven minutes.
+#[test]
+fn a_contact_made_before_a_network_change_and_told_after_it_keeps_two_minutes() {
+    assert_eq!(told_late(None), [Some(370), None]);
+    assert_eq!(
+        told_late(Some(&LATE_PROMISED)),
+        [None, None],
+        "MUTANT: Reachable on a contact from before the change"
+    );
+}
+
+/// What a peer promised eleven minutes reads once this Mac is back on a network after three
+/// minutes off any: as the link opens, before any round, and after the first contact since.
+fn back_online(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> [Reachability; 3] {
+    under(flag, || {
+        let (_root, mut observer, published) = observed();
+        let at = Instant::now();
+        let secs = Duration::from_secs;
+        observer.contact(peer(2, 1), 1000, at, SETTLED);
+        assert_eq!(
+            reading(&mut observer, &published, at, 10, 2),
+            REACHABLE_BOTH
+        );
+        for second in [11, 100, 190] {
+            observer.observe(
+                Visibility::Offline,
+                0,
+                "no network",
+                1000 + second * 1000,
+                at + secs(second),
+            );
+            assert_eq!(observer.state.peers[0].reachability, Reachability::Unknown);
+        }
+        // The link opens: its owner curtails the promises made before it.
+        observer.curtail(at + secs(191), Since::Contact);
+        let opened = reading(&mut observer, &published, at, 191, 2);
+        let waiting = reading(&mut observer, &published, at, 200, 2);
+        observer.contact(peer(2, 1), 202_000, at + secs(201), SETTLED);
+        let contacted = reading(&mut observer, &published, at, 201, 2);
+        [opened.0, waiting.0, contacted.0]
+    })
+}
+
+/// A Mac that left its network and came back three minutes later reads no peer Reachable on a
+/// contact from before it left: each reads LastSeen until a round authenticates it again. So
+/// the first Reachable peer after a silence is a contact made since, which is what a watch for
+/// "a peer heard after every peer's silence" takes it for (`aterm-gui`'s `network_moved`).
+/// MUTANT (`UNCURTAILED`): the old contact's eleven minutes outlast the absence, and the peer
+/// reads Reachable the moment the link opens.
+#[test]
+fn a_mac_back_on_its_network_reads_no_peer_reachable_before_a_contact() {
+    use Reachability::{LastSeen, Reachable};
+    assert_eq!(back_online(None), [LastSeen, LastSeen, Reachable]);
+    assert_eq!(
+        back_online(Some(&UNCURTAILED)),
+        [Reachable; 3],
+        "MUTANT: Reachable on return with no contact"
+    );
 }
 
 #[test]
@@ -1519,6 +1750,7 @@ fn idle_contact_progress_makes_one_checkpoint_per_period() {
                 peer(2, 1),
                 1000 + second * 1000,
                 at + Duration::from_secs(second),
+                REACHABLE,
             );
         }
         tick(&mut observer, at, second, second);
@@ -1551,7 +1783,7 @@ fn the_journal_is_compacted_by_size_and_keeps_its_latest_checkpoint() {
     let mut observer = observing(&config, at);
     // A state large enough that a few checkpoints pass COMPACT.
     for n in 0..200_u16 {
-        observer.contact(numbered(n + 2), 1000, at);
+        observer.contact(numbered(n + 2), 1000, at, REACHABLE);
     }
     let floor = |observer: &Observer| observer.log.as_ref().unwrap().read_floor();
     let retained = |observer: &Observer| observer.log.as_ref().unwrap().stats().retained_bytes;
@@ -1608,13 +1840,18 @@ fn a_crash_loses_at_most_the_settle_interval_and_a_drop_loses_nothing() {
     let config = root.path().join("config");
     let at = Instant::now();
     let mut observer = observing(&config, at);
-    observer.contact(peer(2, 1), 2000, at + Duration::from_secs(1));
+    observer.contact(peer(2, 1), 2000, at + Duration::from_secs(1), REACHABLE);
     tick(&mut observer, at, 1, SETTLE.as_secs());
     let checkpointed = head(&observer);
     let saved = observer.state.peers[0].clone();
     // A transition inside the next interval, then the process dies: the observer is never
     // dropped, so nothing more is written.
-    observer.contact(peer(3, 1), 40_000, at + SETTLE + Duration::from_secs(5));
+    observer.contact(
+        peer(3, 1),
+        40_000,
+        at + SETTLE + Duration::from_secs(5),
+        REACHABLE,
+    );
     tick(
         &mut observer,
         at,
@@ -1646,7 +1883,12 @@ fn a_crash_loses_at_most_the_settle_interval_and_a_drop_loses_nothing() {
     let later = at + SETTLE + Duration::from_secs(100);
     reopened.observe(Visibility::Active, 0, "observing", 200_000, later);
     let before = head(&reopened);
-    reopened.contact(peer(3, 1), 201_000, later + Duration::from_secs(1));
+    reopened.contact(
+        peer(3, 1),
+        201_000,
+        later + Duration::from_secs(1),
+        REACHABLE,
+    );
     reopened.observe(
         Visibility::Active,
         0,
@@ -1687,7 +1929,7 @@ fn a_history_is_closed_only_by_its_observers_drop() {
     // Nothing was ever observed: there is nothing an observer could have left out.
     assert!(read_closed_history(&config).unwrap().is_some());
     let mut observer = observing(&config, at);
-    observer.contact(peer(2, 1), 2000, at + Duration::from_secs(1));
+    observer.contact(peer(2, 1), 2000, at + Duration::from_secs(1), REACHABLE);
     let exchanged = round(RepairOutcome::Exchanged, 2000);
     observer.repair(&peer(2, 1), exchanged.clone(), at + Duration::from_secs(1));
     tick(&mut observer, at, 1, SETTLE.as_secs());
@@ -1757,7 +1999,7 @@ fn a_record_that_does_not_say_closed_is_open() {
     let config = root.path().join("config");
     let at = Instant::now();
     let mut observer = observing(&config, at);
-    observer.contact(peer(2, 1), 2000, at);
+    observer.contact(peer(2, 1), 2000, at, REACHABLE);
     drop(observer);
     assert!(read_closed_history(&config).unwrap().is_some());
     // The same record as an aterm from before records said wrote it.
@@ -1778,4 +2020,102 @@ fn a_record_that_does_not_say_closed_is_open() {
     // A projection that cannot be read is an error, not an open or a closed history.
     private_file::write_private(&dir, "projection.json", b"{").unwrap();
     assert!(read_closed_history(&config).is_err());
+}
+
+/// An observer publishes since when it has listened for its peers in this run
+/// (`NetworkObservation::listening_since_ms`, which the account claims' presence judges an
+/// absence over), and only while it listens: discovery Active, this Mac's identity confirmed,
+/// each observation within [`REACHABLE`] of the one before on both clocks ([`Listening`]).
+///
+/// A steady run keeps when it began however long it lasts, a gap of [`REACHABLE`] included, so a
+/// peer it goes on not hearing is judged absent over the whole run (genuine absence still
+/// lapses). Each break begins it again at the observation after it: a wake (the wall clock jumps
+/// while `Instant`, macOS's uptime clock, stands still), a stalled loop (both clocks run on), a
+/// wall clock stepped back, discovery that stops being Active, and a withdrawn confirmation. A
+/// history reopened (its observer dropped, closing it, or killed, leaving it open) has not
+/// listened: the journal and its projection never carry it, and listening begins with the first
+/// observation after this run confirms this Mac.
+///
+/// Negative control: with `Listening::then` judging the monotonic gap alone, the wake kept the
+/// start from before the sleep (`a wake begins listening again`, `left: Some(2000)`,
+/// `right: Some(3016000)`).
+#[test]
+fn an_observer_listens_only_over_its_unbroken_run() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let at = Instant::now();
+    let since = |published: &ObservationHandle| published.snapshot().listening_since_ms;
+    let s = Duration::from_secs;
+    let published = handle();
+    let mut observer = Observer::open(&config, published.clone()).unwrap();
+    assert_eq!(since(&published), None, "an observer just opened");
+    observer.observe(Visibility::Active, 0, "observing", 1000, at);
+    assert_eq!(since(&published), None, "not yet confirmed");
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
+    // One observation a second for longer than any presence window: the run keeps its start.
+    tick(&mut observer, at, 1, 1500);
+    assert_eq!(since(&published), Some(2000), "a steady run");
+    let mut wall: u64 = 1_501_000;
+    let mut mono = at + s(1500);
+    let mut observe = |observer: &mut Observer, visibility, wall_step: i64, mono_step: u64| {
+        wall = wall.checked_add_signed(wall_step).unwrap();
+        mono += s(mono_step);
+        observer.observe(visibility, 0, "observing", wall, mono);
+        wall
+    };
+    observe(&mut observer, Visibility::Active, 15_000, 15);
+    assert_eq!(since(&published), Some(2000), "a gap of REACHABLE");
+    let woke = observe(&mut observer, Visibility::Active, 25 * 60_000, 1);
+    assert_eq!(
+        since(&published),
+        Some(woke),
+        "a wake begins listening again"
+    );
+    let stalled = observe(&mut observer, Visibility::Active, 16_000, 16);
+    assert_eq!(since(&published), Some(stalled), "a stall");
+    let stalled = observe(&mut observer, Visibility::Active, 1000, 16);
+    assert_eq!(
+        since(&published),
+        Some(stalled),
+        "a stall the wall clock missed"
+    );
+    let stepped = observe(&mut observer, Visibility::Active, -3000, 1);
+    assert_eq!(
+        since(&published),
+        Some(stepped),
+        "a wall clock stepped back"
+    );
+    observe(&mut observer, Visibility::Offline, 1000, 1);
+    assert_eq!(since(&published), None, "offline");
+    let online = observe(&mut observer, Visibility::Active, 1000, 1);
+    assert_eq!(since(&published), Some(online), "online again");
+    observer.unconfirm_local();
+    observe(&mut observer, Visibility::Active, 1000, 1);
+    assert_eq!(since(&published), None, "a withdrawn confirmation");
+    observer.local(peer(1, 1), trust(), Vec::new).unwrap();
+    let confirmed = observe(&mut observer, Visibility::Active, 1000, 1);
+    assert_eq!(since(&published), Some(confirmed), "confirmed again");
+    observe(&mut observer, Visibility::Active, 1000, 1);
+    assert_eq!(since(&published), Some(confirmed));
+    assert!(
+        !String::from_utf8(projection_bytes(&config))
+            .unwrap()
+            .contains("listening"),
+        "the projection carries no listening"
+    );
+    // Reopened after a drop (the history closed) and after a kill (left open).
+    for kill in [false, true] {
+        if kill {
+            observer.die();
+        } else {
+            drop(observer);
+        }
+        let published = handle();
+        observer = Observer::open(&config, published.clone()).unwrap();
+        assert_eq!(since(&published), None, "reopened (killed: {kill})");
+        observer.local(peer(1, 1), trust(), Vec::new).unwrap();
+        let resumed = 9_000_000 + u64::from(kill);
+        observer.observe(Visibility::Active, 0, "observing", resumed, Instant::now());
+        assert_eq!(since(&published), Some(resumed), "resumed (killed: {kill})");
+    }
 }

@@ -27,8 +27,11 @@ const CONTENTS: &str = "contents";
 
 mod materialization;
 pub use materialization::MaterializationAttempt;
+mod workspace;
+pub use workspace::MaterializationWorkspace;
 mod preparation_inputs;
 pub use preparation_inputs::PreparationInputs;
+mod original_parent;
 
 const LOCK: &str = ".input-owner.lock";
 const STATE: &str = ".input-owner";
@@ -211,6 +214,15 @@ impl Producer {
         name: &str,
         after_create: impl FnOnce(&Path) -> io::Result<()>,
     ) -> io::Result<Self> {
+        Self::create_with_parent(parent_path, name, None, after_create)
+    }
+
+    fn create_with_parent(
+        parent_path: &Path,
+        name: &str,
+        original: Option<std::os::fd::BorrowedFd<'_>>,
+        after_create: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<Self> {
         if !parent_path.is_absolute()
             || name.contains('/')
             || name.contains('\0')
@@ -227,12 +239,7 @@ impl Producer {
                 "private input requires an absolute parent and one bounded name",
             ));
         }
-        let parent_file = File::from(fd::openat(
-            fd::CWD,
-            parent_path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
+        let parent_file = original_parent::open(parent_path, original)?;
         let parent = PrivateDirectory::from_file(aterm_uds::kept_out(|| parent_file.try_clone())?)?;
         if !parent.is_at(parent_path)? {
             return Err(refused("private input parent changed before creation"));

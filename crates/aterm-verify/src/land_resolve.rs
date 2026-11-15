@@ -8,8 +8,6 @@
 //! or one its rule refuses, leaves the whole conflict as git left it, for the person
 //! ([`crate::exit::CONFLICT`]).
 //!
-//! - `changelog-to-changes`: `CHANGELOG.md` takes main's file, and each entry the branch added
-//!   under `[Unreleased]` becomes its own `changes/<kind>/` file ([`changelog`]).
 //! - `tracker-docs-take-main`: `docs/PLAN.md` and `docs/STATUS.md`, which `goals.py
 //!   repo-docs` regenerates from the lab tracker, take main's side.
 //! - `spec-table-rows`: a `SPECS.md` takes each table row from the side that changed it
@@ -19,11 +17,8 @@
 //! branch's work silently; the judgment then reads every file a rule wrote.
 
 use super::{Git, display_git_path};
-use crate::changelog_fragments::{self, Fragment, Section};
-use aterm_census::changelog::{CHANGELOG_FILE, HARNESS_ENTRY_HEAD, section_span};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::path::PathBuf;
 
 /// The mode of a regular, non-executable file: the one every rule reads and writes.
 const REGULAR: &str = "100644";
@@ -80,12 +75,7 @@ struct Rule {
 }
 
 /// The rule table, in the order a path is matched against it.
-static RULES: [Rule; 3] = [
-    Rule {
-        name: "changelog-to-changes",
-        covers: is_changelog,
-        resolve: changelog_rule,
-    },
+static RULES: [Rule; 2] = [
     Rule {
         name: "tracker-docs-take-main",
         covers: is_tracker_doc,
@@ -100,9 +90,8 @@ static RULES: [Rule; 3] = [
 
 /// The resolution of every path of `conflicted`, read from the index and the objects and
 /// writing nothing; or, where any path has no rule or its rule refuses, one refusal per such
-/// path, and no path is resolved. A read that fails is a refusal too, and so is a resolution
-/// naming a file [`super::Git::writable`] refuses, so the conflict is then left exactly as git
-/// left it.
+/// path, and no path is resolved. A read that fails is a refusal too, so the conflict is then
+/// left exactly as git left it.
 pub(super) fn plan(
     git: &Git<'_>,
     conflicted: &BTreeSet<Vec<u8>>,
@@ -137,15 +126,6 @@ pub(super) fn plan(
             Some(sides) => (rule.resolve)(git, path, sides),
             None => Err("the index holds no stage of it".to_owned()),
         };
-        // A file the checkout cannot hold where the resolution names it (a path through a
-        // symbolic link, say) is the rule's refusal here, before anything is written, not a
-        // failed write that aborts the merge the person could resolve by hand.
-        let resolved = resolved.and_then(|(files, detail)| {
-            match files.iter().find_map(|(file, _)| git.writable(file).err()) {
-                Some(why) => Err(why),
-                None => Ok((files, detail)),
-            }
-        });
         match resolved {
             Ok((files, detail)) => {
                 writes.extend(files);
@@ -161,19 +141,12 @@ pub(super) fn plan(
     }
 }
 
-/// Write and stage every file of `resolution`, in order ([`super::Git::put`]). On the first
-/// failure every file this call created is removed again before the error returns, so the
-/// caller's abort of the merge (which restores the tracked files) finds no file of the rules
-/// left behind.
+/// Write and stage every file of `resolution`, in order ([`super::Git::put`]); the first
+/// failure returns, and the caller aborts the merge, which restores the tracked files.
 pub(super) fn apply(git: &Git<'_>, resolution: &Resolution) -> Result<(), String> {
-    let mut created: Vec<PathBuf> = Vec::new();
     for (path, bytes) in &resolution.writes {
-        if let Err(why) = git.put(path, bytes, &mut created) {
-            for file in &created {
-                let _ = std::fs::remove_file(file);
-            }
-            return Err(format!("the rules' write of {path:?} failed: {why}"));
-        }
+        git.put(path, bytes)
+            .map_err(|why| format!("the rules' write of {path:?} failed: {why}"))?;
     }
     Ok(())
 }
@@ -200,241 +173,6 @@ fn text(git: &Git<'_>, side: &str, stage: Option<&Stage>) -> Result<String, Stri
         ));
     }
     String::from_utf8(git.blob(&stage.oid)?).map_err(|_| format!("{side}'s copy is not UTF-8"))
-}
-
-fn is_changelog(path: &str) -> bool {
-    path == CHANGELOG_FILE
-}
-
-/// The changelog rule on the index: [`changelog`] over the three sides, with a fragment path
-/// taken where anything stands at it in the checkout (main's own new files are there already).
-/// `CHANGELOG.md` becomes main's file, and each fragment is written beside it.
-fn changelog_rule(git: &Git<'_>, path: &str, stages: &Stages) -> Result<Resolved, String> {
-    let [base, ours, theirs] = texts(git, stages)?;
-    let root = git.root;
-    let taken = |candidate: &str| std::fs::symlink_metadata(root.join(candidate)).is_ok();
-    let (fragments, detail) = changelog(&base, &ours, &theirs, &taken)?;
-    let mut writes = vec![(path.to_owned(), theirs.into_bytes())];
-    writes.extend(
-        fragments
-            .into_iter()
-            .map(|fragment| (fragment.path, fragment.text.into_bytes())),
-    );
-    Ok((writes, detail))
-}
-
-/// The longest slug of an entry's words a fragment name carries.
-const SLUG_BYTES: usize = 60;
-
-/// How many names one entry tries (`land-<slug>`, then `-2`, `-3`, …) before the rule refuses.
-const NAME_TRIES: usize = 100;
-
-/// THE CHANGELOG RULE: `CHANGELOG.md` takes main's file (`theirs`), and each entry the branch
-/// (`ours`) added under `[Unreleased]` since the merge base (`base`) becomes its own fragment
-/// ([`changelog_fragments::fragment`]), named `land-<slug of its words>` (suffixed `-2`, `-3`, …
-/// where `taken` says a path is), with what was done in a few words. An entry main's
-/// `[Unreleased]` already holds is not written again, and a harness-versions entry the branch
-/// added is dropped, since `ship release` derives it.
-///
-/// It refuses, so the conflict stays the person's, wherever main's file would drop the
-/// branch's work: a change outside `[Unreleased]`, a changed HTML comment in it, a base entry
-/// the branch removed, reworded or moved to another kind, an added entry under no `### <kind>`
-/// heading, an added entry whose words only a released section of main's file holds, a
-/// malformed `[Unreleased]` and an entry no file the checker accepts can hold.
-pub(super) fn changelog(
-    base: &str,
-    ours: &str,
-    theirs: &str,
-    taken: &dyn Fn(&str) -> bool,
-) -> Result<(Vec<Fragment>, String), String> {
-    let (Some(base_outside), Some(ours_outside)) =
-        (outside_unreleased(base), outside_unreleased(ours))
-    else {
-        return Err("the merge base or the branch has no ## [Unreleased] section".into());
-    };
-    if base_outside != ours_outside {
-        return Err(
-            "the branch changed CHANGELOG.md outside [Unreleased], which main's file would drop"
-                .into(),
-        );
-    }
-    let malformed = |side: &str, findings: Vec<String>| {
-        format!(
-            "{side}'s [Unreleased] is malformed: {}",
-            findings.join("; ")
-        )
-    };
-    let base_body =
-        changelog_fragments::unreleased_by_kind(base).map_err(|f| malformed(SIDES[0], f))?;
-    let ours_body =
-        changelog_fragments::unreleased_by_kind(ours).map_err(|f| malformed(SIDES[1], f))?;
-    if base_body.comments != ours_body.comments {
-        return Err(
-            "the branch changed an HTML comment in [Unreleased], which main's file would drop"
-                .into(),
-        );
-    }
-    let key = changelog_fragments::entry_key;
-    for (kind, text) in &base_body.entries {
-        let words = key(text);
-        match ours_body
-            .entries
-            .iter()
-            .find(|(_, other)| key(other) == words)
-        {
-            Some((other, _)) if other == kind => {}
-            Some(_) => {
-                return Err(format!(
-                    "the branch moved the entry {:?} to another kind",
-                    first_line(text)
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "the branch removed or reworded the entry {:?}, which main's file keeps or \
-                     shipped",
-                    first_line(text)
-                ));
-            }
-        }
-    }
-    let based: BTreeSet<String> = base_body.entries.iter().map(|(_, t)| key(t)).collect();
-    // Main's entries by where they sit: one in its `[Unreleased]` ships in the next notes as
-    // the branch's would, while one in a released section says nothing of the branch's change.
-    let (mut main_unreleased, mut main_released) = (BTreeSet::new(), BTreeSet::new());
-    for entry in changelog_fragments::entries(theirs) {
-        if matches!(entry.section, Section::Released(_)) {
-            main_released.insert(key(&entry.text));
-        } else {
-            main_unreleased.insert(key(&entry.text));
-        }
-    }
-    let mut fragments: Vec<Fragment> = Vec::new();
-    let mut already = 0;
-    for (kind, text) in &ours_body.entries {
-        let words = key(text);
-        if based.contains(&words) {
-            continue;
-        }
-        if main_unreleased.contains(&words) {
-            already += 1;
-            continue;
-        }
-        if main_released.contains(&words) {
-            return Err(format!(
-                "the branch's entry {:?} has the words of an entry main has already released, \
-                 so the next notes would not carry it",
-                first_line(text)
-            ));
-        }
-        let Some(kind) = kind else {
-            return Err(format!(
-                "the branch's entry {:?} sits under no ### <kind> heading",
-                first_line(text)
-            ));
-        };
-        let stem = format!("land-{}", slug(first_line(text)));
-        let mut named = None;
-        for n in 1..=NAME_TRIES {
-            let name = if n == 1 {
-                stem.clone()
-            } else {
-                format!("{stem}-{n}")
-            };
-            let fragment = changelog_fragments::fragment(kind, &name, text).map_err(|found| {
-                format!(
-                    "the branch's entry {:?} makes no file the checker accepts: {}",
-                    first_line(text),
-                    found.join("; ")
-                )
-            })?;
-            if !taken(&fragment.path) && !fragments.iter().any(|f| f.path == fragment.path) {
-                named = Some(fragment);
-                break;
-            }
-        }
-        let Some(fragment) = named else {
-            return Err(format!(
-                "every name {stem}… up to -{NAME_TRIES} is taken in changes/"
-            ));
-        };
-        fragments.push(fragment);
-    }
-    let mut detail = if fragments.is_empty() {
-        "main's file; the branch added no entry of its own".to_owned()
-    } else {
-        format!(
-            "main's file, and the branch's entries as {}",
-            fragments
-                .iter()
-                .map(|fragment| fragment.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    if already > 0 {
-        detail.push_str(&format!(
-            "; {already} entr{} the branch added main's file already holds",
-            if already == 1 { "y" } else { "ies" }
-        ));
-    }
-    if harness_entries(ours) > harness_entries(base) {
-        detail
-            .push_str("; the branch's harness-versions entry dropped, which ship release derives");
-    }
-    Ok((fragments, detail))
-}
-
-/// `text`'s lines outside the `[Unreleased]` body (its heading included), and whether it ends
-/// in a newline; `None` where it has no `## [Unreleased]`.
-fn outside_unreleased(text: &str) -> Option<(Vec<&str>, bool)> {
-    let (start, end) = section_span(text, "Unreleased")?;
-    let lines: Vec<&str> = text.lines().collect();
-    let mut kept = lines[..=start].to_vec();
-    kept.extend_from_slice(&lines[end..]);
-    Some((kept, text.ends_with('\n')))
-}
-
-/// How many harness-versions entries `text`'s `[Unreleased]` body holds.
-fn harness_entries(text: &str) -> usize {
-    section_span(text, "Unreleased").map_or(0, |(start, end)| {
-        text.lines()
-            .take(end)
-            .skip(start + 1)
-            .filter(|line| line.starts_with(HARNESS_ENTRY_HEAD))
-            .count()
-    })
-}
-
-/// An entry's first line.
-fn first_line(text: &str) -> &str {
-    text.lines().next().unwrap_or_default()
-}
-
-/// An entry line's words as a fragment name's slug: lowercase ASCII letters and digits, every
-/// run of anything else one `-`, none at either end, at most [`SLUG_BYTES`] bytes; `entry`
-/// where nothing is left.
-fn slug(line: &str) -> String {
-    let mut out = String::new();
-    let mut gap = false;
-    for c in changelog_fragments::entry_key(line).chars() {
-        if c.is_ascii_alphanumeric() {
-            if gap && !out.is_empty() {
-                out.push('-');
-            }
-            gap = false;
-            out.push(c.to_ascii_lowercase());
-        } else {
-            gap = true;
-        }
-    }
-    out.truncate(SLUG_BYTES);
-    let out = out.trim_end_matches('-');
-    if out.is_empty() {
-        "entry".to_owned()
-    } else {
-        out.to_owned()
-    }
 }
 
 /// The documents `goals.py repo-docs` regenerates whole from the lab tracker.
@@ -491,11 +229,15 @@ fn generated(text: &str) -> bool {
     })
 }
 
-/// The file name of a crate's spec table.
-const SPEC_FILE: &str = "SPECS.md";
+/// What a workspace member's spec table's path ends with (`<dir>/SPECS.md`), matched against a
+/// merge's conflicted paths. Kept with its separator, it is a path suffix and never a bare table
+/// name: `verify land`'s backstop ([`aterm_census::no_reach::may_read`]) reads a bare `SPECS.md`
+/// string in code as a walk of every crate's table, which would count each table as read by this
+/// file and make every landing that shares one with a moved main judge again in full.
+const SPEC_SUFFIX: &str = "/SPECS.md";
 
 fn is_spec_table(path: &str) -> bool {
-    path.rsplit('/').next() == Some(SPEC_FILE)
+    path.ends_with(SPEC_SUFFIX)
 }
 
 /// The spec-table rule on the index: [`spec_table`] over the three sides.

@@ -109,6 +109,13 @@ impl System for Spawns<'_> {
     ) -> io::Result<Vec<u8>> {
         self.live.read_owned_file_scoped(path, uid, max, private)
     }
+    fn vault_entry(
+        &self,
+        home: &Path,
+        name: &str,
+    ) -> io::Result<Option<aterm_secrets::SecretBytes>> {
+        self.live.vault_entry(home, name)
+    }
     fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         self.live.write_file(path, bytes, mode)
     }

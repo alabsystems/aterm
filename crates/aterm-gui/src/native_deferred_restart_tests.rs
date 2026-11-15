@@ -41,6 +41,7 @@ impl DeferredFacts {
                 login: Some("/selected-account".into()),
                 owner: Some("selected-account".into()),
                 generation: "22".repeat(32),
+                purpose: aterm_agent::harness::accounts_pool::Purpose::Select,
             },
         ));
         Self {

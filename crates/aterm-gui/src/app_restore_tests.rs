@@ -413,7 +413,7 @@ fn restore_leaf_reseeds_user_metadata_onto_the_respawned_session() {
 
 #[test]
 fn a_restored_worker_with_no_word_stays_land() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let row = "rev=3 state=working from=s-0123456789abcdef0123 since=1789000000000 \
                result_bytes=0 attention=0";
     let word = |ctx: &crate::SessionCtx| ctx.meta.lock().unwrap().autopilot_word();
@@ -742,7 +742,7 @@ fn about_and_legacy_settings_drafts_survive_split_restore_and_update_carry() {
         app.close_focused_mixed_leaf(wid).unwrap();
         assert!(app.view_store.get(about_view).is_none());
         assert_eq!(settings_snapshot(&app, settings_view), before);
-        app.reopen_last_closed_view().unwrap();
+        app.reopen_closed_view_and_wait_for_test().unwrap();
         let (instance, reopened_view) = app.active_native_view(wid).unwrap();
         assert_eq!(
             app.native_runtime.app(instance).unwrap().kind(),
@@ -789,7 +789,7 @@ fn about_control_open_and_closed_tab_restore_keep_distinct_views_of_one_controll
     assert_eq!(app.active_native_view(wid).unwrap().0, original.0);
     app.close_active_native_tab(wid).unwrap();
     assert!(app.view_store.get(mirror).is_none());
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     let reopened = app.active_native_view(wid).unwrap();
     assert_eq!(reopened.0, original.0);
     assert_ne!(reopened.1, mirror);
@@ -1177,28 +1177,6 @@ fn a_successors_fresh_bootstrap_is_retired_by_a_native_only_window_0() {
 }
 
 #[test]
-fn missing_native_document_skips_without_placeholder_or_id_reuse() {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let old_active = app.windows[&wid].tab_set.active_id();
-    let layout = legacy_native_window(restore::NativeTabRestore::Markdown {
-        // Distinct branch.
-        uri: "file:///definitely/missing/aterm-restore-document.md".to_string(),
-    });
-    app.restore_into_window(wid, layout);
-    let ws = &app.windows[&wid];
-    assert_eq!(ws.tab_set.len(), 1, "safe bootstrap remains usable");
-    assert_eq!(ws.tab_set.active_id(), old_active);
-    assert_eq!(ws.layouts.len(), 1);
-    assert!(
-        app.native_runtime
-            .instance_by_kind(crate::native_app::AppKind::Markdown)
-            .is_none()
-    );
-    assert!(app.structural_invariants_ok());
-}
-
-#[test]
 fn recursive_mixed_restore_keeps_topology_and_substitutes_only_failed_leaf() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -1428,19 +1406,28 @@ fn manual_editor_identity_survives_capture_restore_and_blocks_malformed_save() {
     assert!(descriptor.config_editor);
 
     let mut retry = App::headless_for_test();
-    let retried = retry.execute_recovery_request(
-        WindowId(0),
-        crate::native_app::RecoveryRequest::Retry(
-            crate::native_app::RecoveryCapability::Document {
-                kind: crate::native_app::AppKind::Editor,
-                uri: descriptor.uri.clone().unwrap(),
-                config_editor: true,
+    let retried = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let received = std::rc::Rc::clone(&retried);
+    retry
+        .execute_recovery_request(
+            WindowId(0),
+            crate::native_app::RecoveryRequest::Retry(
+                crate::native_app::RecoveryCapability::Document {
+                    kind: crate::native_app::AppKind::Editor,
+                    uri: descriptor.uri.clone().unwrap(),
+                    config_editor: true,
+                },
+            ),
+            |_| true,
+            move |_, outcome| {
+                *received.borrow_mut() = Some(outcome);
+                Ok(())
             },
-        ),
-    );
+        )
+        .unwrap();
     assert!(matches!(
-        retried,
-        crate::native_app::RecoveryOutcome::Opened { .. }
+        retried.take(),
+        Some(crate::native_app::RecoveryOutcome::Opened { .. })
     ));
     let (retry_instance, _) = retry.active_native_view(WindowId(0)).unwrap();
     assert!(
@@ -1532,7 +1519,7 @@ fn reopening_a_closed_aterm_toml_tab_beside_an_open_one_lifts_no_tab_of_the_pers
             app.switch_tab_in(wid, 0);
         }
 
-        app.reopen_last_closed_tab()
+        app.reopen_closed_tab_and_wait_for_test()
             .expect("the closed tab reopens");
         let ws = &app.windows[&wid];
         let reopened = ws.tab_set.active().unwrap();
@@ -1597,6 +1584,30 @@ fn manual_settings_restore_is_the_manual_page_with_or_without_singleton() {
             app.native_runtime.config_editor_document().is_none(),
             "restoring the page opens no editor"
         );
+        app.remove_view_link(view);
+    }
+}
+
+/// A restored This Mac tab asks for its page's read, as opening the page does: the page leaves
+/// Reading (here, with no name writer, for its refusal; off macOS, for what changes the name).
+/// NEGATIVE CONTROL: a restored tab on another page asks for none.
+#[test]
+fn a_restored_machine_tab_asks_for_a_read() {
+    let wid = WindowId(0);
+    for (path, asks) in [("/machine", true), ("/terminal", false)] {
+        let mut app = App::headless_for_test();
+        let descriptor = restore::NativeLeafRestore::settings(path.to_string());
+        let (view, _, _) = app.restore_native_leaf(wid, &descriptor).unwrap();
+        assert_eq!(
+            !matches!(
+                app.machine_page.state.read,
+                crate::native_settings::PageRead::Reading
+            ),
+            asks,
+            "{path}"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(app.machine_page.reads, u64::from(asks), "{path}");
         app.remove_view_link(view);
     }
 }
@@ -1891,12 +1902,16 @@ fn reopening_a_restored_document_focuses_its_leaf_before_revealing_a_line() {
         assert_eq!(before_documents[0].2.as_ref(), text_a);
         assert_eq!(before_documents[1].2.as_ref(), text_b);
 
-        app.open_document_tab_at(
+        app.open_path_for_person(
             wid,
             crate::native_app::AppKind::Editor,
-            &uri_a,
-            Some(3),
-            Some(3),
+            &crate::native_document_host::file_uri_path(&uri_a).unwrap(),
+            Some(crate::app_documents::DocumentReveal::Line(
+                crate::app_documents::LineReveal {
+                    line: 3,
+                    col: Some(3),
+                },
+            )),
         )
         .expect("the already-restored document reopens");
 
@@ -2046,6 +2061,7 @@ fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayo
 
 fn bare_leaf() -> restore::TerminalLeafRestore {
     restore::TerminalLeafRestore {
+        pinned: false,
         sid: None,
         lineage: None,
         log_ep: None,
@@ -6667,7 +6683,7 @@ fn the_setter_rides_the_cold_restore_the_reopen_and_the_graft() {
         let mut parent = App::headless_for_test();
         assert!(parent.set_session_autopilot(
             0,
-            Some(aterm_agent::supervise::Autopilot::Off),
+            Some(alab_policy::config::Autopilot::Off),
             crate::autopilot::Surface::Chip
         ));
         let (layout, _) = handoff_layout_placed(&parent);
@@ -6839,7 +6855,7 @@ fn a_hand_edited_setter_costs_the_setter_never_the_window() {
     let mut parent = App::headless_for_test();
     assert!(parent.set_session_autopilot(
         0,
-        Some(aterm_agent::supervise::Autopilot::Off),
+        Some(alab_policy::config::Autopilot::Off),
         crate::autopilot::Surface::Chip
     ));
     let wire = parent
@@ -6881,7 +6897,7 @@ fn a_hand_edited_setter_costs_the_setter_never_the_window() {
 #[cfg(unix)]
 #[test]
 fn a_timed_cruise_crosses_the_handoff_and_lands_once_after_the_commit() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let wall = 1_792_177_200_000_i64;
     let mono = std::time::Instant::now();
     let at = |secs: u64| {
@@ -7092,6 +7108,112 @@ fn a_cold_restore_opens_with_prev_and_lineage() {
     );
 }
 
+/// LT-01's exit test: a cold restore (a quit, a reboot or a crash with no keeper, so nothing
+/// hands a shell over) runs each leaf's new shell under the tab ID the leaf was saved with, and
+/// the next capture saves that same ID. NEGATIVE CONTROLS: an ID a tab of this process holds,
+/// and one a live instance on this Mac serves, each go to a new ID (the restored shell stands in
+/// for the old one, `prev=`); a reopened closed tab (`LeafIds::Live`) is a new tab and keeps none.
+#[test]
+fn cold_restore_keeps_the_tab_id() {
+    const KEPT: &str = "tkeptab0001";
+    const SERVED: &str = "tkeptab0002";
+    const REOPENED: &str = "tkeptab0003";
+    let control = aterm_tempfile::tempdir().expect("scratch control dir");
+    let _rendezvous = crate::identity_claim::rendezvous_override(control.path());
+    // Another live instance serves SERVED: its graph entry names a live pid that is not ours.
+    std::fs::create_dir_all(control.path().join("graph")).expect("graph dir");
+    std::fs::write(
+        control.path().join("graph").join(SERVED),
+        format!(
+            "sock /nonexistent/aterm.sock\nnonce {}\npid {}\n",
+            aterm_session::LaunchNonce::generate().to_hex(),
+            if cfg!(windows) { 4 } else { 1 }
+        ),
+    )
+    .expect("plant the live entry");
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let held = app.pool.get(0).expect("session 0").ctx.self_id.to_string();
+    assert!(
+        aterm_types::tab_id::is_tab_id(&held) && held.starts_with('t'),
+        "PRECONDITION: session 0 was minted a t ID: {held}"
+    );
+    app.restore_into_window(
+        wid,
+        restore::WindowLayout {
+            restored_tabs: vec![
+                lineage_tab(0, None, None),
+                lineage_tab(1, Some(KEPT), None),
+                lineage_tab(2, Some(&held), None),
+                lineage_tab(3, Some(SERVED), None),
+            ],
+            ..single_leaf_window(bare_leaf())
+        },
+    );
+    let sid_of = |s: u64| app.pool.get(s).unwrap().ctx.self_id.as_str().to_string();
+
+    let (kept_leaf, kept) = captured_leaf(&app, wid, 1);
+    assert_eq!(
+        sid_of(kept),
+        KEPT,
+        "the restored shell runs under the tab's own ID"
+    );
+    assert_eq!(
+        kept_leaf.sid.as_deref(),
+        Some(KEPT),
+        "and the next restore saves it"
+    );
+    let opened = slog_lines(&app, kept);
+    assert!(
+        opened
+            .iter()
+            .all(|l| !l.contains(" restore ") || !l.contains("prev=")),
+        "the same tab: no record of standing in for another: {opened:?}"
+    );
+    let known = aterm_types::tab_id::TabId::parse(KEPT).expect("a tab id");
+    assert!(
+        crate::tab_ids::known(&known),
+        "no mint hands the kept ID out again"
+    );
+
+    for (index, old, why) in [
+        (2, held.as_str(), "a tab of this process holds it"),
+        (3, SERVED, "a live instance serves it"),
+    ] {
+        let (leaf, session) = captured_leaf(&app, wid, index);
+        let now = sid_of(session);
+        assert_ne!(now, old, "NEGATIVE CONTROL ({why}): a new ID");
+        assert!(
+            aterm_types::tab_id::is_tab_id(&now) && now.starts_with('t'),
+            "NEGATIVE CONTROL ({why}): a freshly minted t ID: {now}"
+        );
+        assert_eq!(leaf.sid.as_deref(), Some(now.as_str()));
+        let opened = slog_lines(&app, session);
+        assert!(
+            opened[0].contains(" open - restore ") && opened[0].contains(&format!(" prev={old} ")),
+            "NEGATIVE CONTROL ({why}): it stands in for {old}: {opened:?}"
+        );
+    }
+
+    let reopened = restore::TerminalLeafRestore {
+        sid: Some(REOPENED.to_string()),
+        ..bare_leaf()
+    };
+    assert_eq!(
+        app.kept_leaf_identity(&reopened, crate::app_restore::LeafIds::Live),
+        None,
+        "NEGATIVE CONTROL: a reopened closed tab is a new tab"
+    );
+    assert_eq!(
+        app.kept_leaf_identity(&reopened, crate::app_restore::LeafIds::Retired)
+            .as_ref()
+            .map(aterm_session::SessionId::as_str),
+        Some(REOPENED),
+        "the same leaf restored cold keeps it"
+    );
+}
+
 #[test]
 fn a_seamless_update_keeps_a_sessions_lineage_for_its_next_restore() {
     let old = App::headless_for_test();
@@ -7150,7 +7272,7 @@ fn a_reopened_closed_tab_names_the_session_it_was() {
     let sid = app.pool.get(closing).unwrap().ctx.self_id.clone();
     assert!(!app.close_tab_at(wid, 1));
     assert!(app.pool.get(closing).is_none(), "PRECONDITION: it closed");
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     let reopened = app.focused_session_id(wid).expect("the reopened tab");
     assert_ne!(reopened, closing);
     let opened = slog_lines(&app, reopened);
@@ -7227,7 +7349,7 @@ fn a_session_theme_rides_the_layout_and_comes_back_restored() {
 
 #[test]
 fn a_word_about_typing_reaches_windows_end_session_snapshot_at_once() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
 
     use crate::fabric::{Hold, apply_hold_for_test};
     use crate::session_timeline::{MetaField, apply_meta_value};
@@ -7343,7 +7465,7 @@ fn a_word_about_typing_reaches_windows_end_session_snapshot_at_once() {
 #[cfg(unix)]
 #[test]
 fn a_word_about_typing_inside_the_write_interval_is_journaled_at_once_and_reopened() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
 
     use crate::fabric::{Hold, apply_hold_for_test};
     use crate::session_timeline::{MetaField, apply_meta_value};
@@ -8010,7 +8132,8 @@ fn a_restored_row_the_owner_dismissed_does_not_come_back_inside_the_next() {
         app.post_restored_row(restored_row(1, &[(&sids[0], "in tab 1", 1)]), stamp);
         let first = app.restored_shown.id.expect("posted");
         if dismissed {
-            assert!(app.messages.dismiss(first, std::time::Instant::now()));
+            let wall = app.messages_wall.now();
+            assert!(app.messages.dismiss(first, wall, std::time::Instant::now()));
         }
         app.post_restored_row(
             restored_row(3, &[(&sids[0], "in tab 1", 1), (&sids[1], "in tab 2", 2)]),
@@ -8138,7 +8261,7 @@ fn a_restored_row_nobody_saw_through_comes_back_inside_the_next() {
         (
             "folded",
             |app, id| {
-                assert!(app.messages.mark_seen(id, now()));
+                assert!(app.messages.mark_seen(id, app.messages_wall.now(), now()));
                 let _ = app
                     .messages
                     .settle(now() + std::time::Duration::from_secs(3600), true);
@@ -8154,7 +8277,7 @@ fn a_restored_row_nobody_saw_through_comes_back_inside_the_next() {
         ),
         (
             "dismissed",
-            |app, id| assert!(app.messages.dismiss(id, now())),
+            |app, id| assert!(app.messages.dismiss(id, app.messages_wall.now(), now())),
             Retired::Dismissed,
             false,
         ),
@@ -8357,6 +8480,7 @@ fn a_carried_full_screen_s_tabs_wait_for_its_size_from_its_entry() {
         fullscreen: Some(true),
         ..Default::default()
     };
+    new.prepare_restore_focus();
     new.carried_window_show = Some(CarriedShow::new(
         ShowLane::Cold,
         plan(&[(wid, show)], ShowLane::Cold),
@@ -9181,4 +9305,127 @@ fn a_cold_restart_keeps_a_workers_manager() {
         Some(manager.ctx.self_id.as_str().to_owned()),
         "the manager came back first"
     );
+}
+
+/// A document the person asked to open that did not open is captured as that document's leaf, so
+/// a relaunch tries the file again and opens it once it can; one no file URI names is left out,
+/// its tab with it, or beside a terminal its sibling taking its place, rather than come back as a
+/// restore's recovery request. CONTROL: a restored leaf's Recovery tab, standing for a file that
+/// could not be reopened, is still captured as its Placeholder. NEGATIVE CONTROLS (scratch):
+/// capturing every Recovery tab as a Placeholder fails the first, and capturing the unnamed one
+/// as a Placeholder fails it; not leaving the unnamed one out of its split drops the terminal
+/// with it.
+#[test]
+fn a_failed_opens_recovery_tab_is_captured_as_its_document() {
+    use crate::native_app::{AppKind, NativeApp, RecoveryCapability, RecoveryOrigin};
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let path = base.join("later.md");
+    std::fs::write(&path, "# Later\n").unwrap();
+    let uri = file_uri(&path);
+    let wid = WindowId(0);
+    let mut app = App::headless_for_test();
+    let held = app.hold_draft_lock_for_test(&uri);
+    app.open_path_for_person(wid, AppKind::Markdown, &path, None)
+        .unwrap_err();
+    drop(held);
+    let (instance, view) = app.active_native_view(wid).unwrap();
+    assert!(
+        matches!(
+            app.native_runtime.app(instance),
+            Some(NativeApp::Recovery(recovery)) if matches!(recovery.origin, RecoveryOrigin::Open { .. })
+        ),
+        "the busy open's failure is in front"
+    );
+    let Some(restore::RestoredView::Native(descriptor)) = app.view_restore_descriptor(view) else {
+        panic!(
+            "a failed open is captured as its document: {:?}",
+            app.view_restore_descriptor(view)
+        );
+    };
+    assert_eq!(
+        descriptor,
+        restore::NativeLeafRestore::document("markdown", uri.clone())
+    );
+    let mut relaunched = App::headless_for_test();
+    relaunched.restore_into_window(wid, window_of(vec![native_leaf(descriptor)]));
+    let (instance, _) = relaunched.active_native_view(wid).unwrap();
+    let document = relaunched
+        .native_runtime
+        .document_id(instance)
+        .expect("the relaunch opens the document");
+    assert_eq!(
+        relaunched.document_store.canonical_uri(document),
+        Some(uri.as_str())
+    );
+
+    let gone = file_uri(&base.join("gone.md"));
+    let mut restored = App::headless_for_test();
+    restored.restore_into_window(
+        wid,
+        window_of(vec![native_leaf(restore::NativeLeafRestore::document(
+            "markdown",
+            gone.clone(),
+        ))]),
+    );
+    let (instance, view) = restored.active_native_view(wid).unwrap();
+    let Some(NativeApp::Recovery(recovery)) = restored.native_runtime.app(instance) else {
+        panic!("the missing file restores as a Recovery tab");
+    };
+    assert_eq!(recovery.origin, RecoveryOrigin::Restore);
+    assert!(
+        matches!(&recovery.capability, Some(RecoveryCapability::Document { uri, .. }) if *uri == gone),
+        "{:?}",
+        recovery.capability
+    );
+    assert!(
+        matches!(
+            restored.view_restore_descriptor(view),
+            Some(restore::RestoredView::Placeholder(_))
+        ),
+        "CONTROL: a restored leaf's Recovery tab keeps its Placeholder"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let unnamed = base.join(std::ffi::OsStr::from_bytes(b"caf\xe9.md"));
+        let mut app = App::headless_for_test();
+        app.open_path_for_person(wid, AppKind::Markdown, &unnamed, None)
+            .unwrap_err();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        assert!(
+            matches!(
+                app.native_runtime.app(instance),
+                Some(NativeApp::Recovery(recovery))
+                    if matches!(recovery.origin, RecoveryOrigin::Open { .. }) && recovery.capability.is_none()
+            ),
+            "the unnamed path's failure is in front"
+        );
+        assert!(
+            app.view_restore_descriptor(view).is_none(),
+            "a failed open no file URI names is not described"
+        );
+        let tab = app.windows[&wid].tab_set.active().unwrap();
+        assert!(
+            app.tab_restore_descriptor(tab).is_none(),
+            "a tab holding only it is left out"
+        );
+        let _ = app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let tab = app.windows[&wid].tab_set.active().unwrap();
+        assert_eq!(tab.root.len(), 2);
+        let captured = app.tab_restore_descriptor(tab);
+        assert!(
+            matches!(
+                captured,
+                Some(restore::RestoredTab {
+                    root: restore::RestoredSplitTree::Leaf {
+                        view: restore::RestoredView::Terminal(_)
+                    },
+                    ..
+                })
+            ),
+            "split beside a terminal, it is left out and the terminal takes its place: {captured:?}"
+        );
+    }
 }

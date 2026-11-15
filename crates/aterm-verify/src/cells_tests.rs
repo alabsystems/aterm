@@ -889,86 +889,83 @@ fn only_the_triples_own_artifacts_count() {
     );
 }
 
-/// rustc's own warnings are the cell's: an item only another OS calls
-/// (`dead_code`) or an import only it uses never warns on the host, so the
-/// cell's compile is where it shows.
+/// A CELL JUDGES ERRORS, NEVER A WARNING: a dead item, an unused import or a clippy warning in a
+/// cell's stream leaves every cell green on either pass, whatever its OS; the host's lint judges
+/// warnings on its own code. NEGATIVE CONTROL: an error in the same stream is the cell's finding,
+/// its row the diagnostic's first line and location, plain, and its full text in the report.
 #[test]
-fn a_rustc_warning_is_a_cell_finding_and_a_clippy_one_is_the_hosts() {
+fn a_cell_judges_errors_and_never_a_warning() {
     let graph = names(&["gui"]);
-    let warning = |code: &str, rendered: &str| {
+    let line = |level: &str, code: &str, rendered: &str| {
         format!(
-            r#"{{"reason":"compiler-message","package_id":"path+file:///r/gui#gui@1","message":{{"level":"warning","code":{code},"rendered":{}}}}}"#,
+            r#"{{"reason":"compiler-message","package_id":"path+file:///r/gui#gui@1","message":{{"level":"{level}","code":{code},"rendered":{}}}}}"#,
             aterm_json::to_string(rendered).unwrap()
         )
     };
-    let message = "warning: function `launchctl_list` is never used";
-    let location = "crates/gui/src/launch.rs:42:5";
-    let dead = format!(
-        "\u{1b}[1m{message}\u{1b}[0m\n  --> {location}\n   |\n42 | fn launchctl_list() {{}}\n"
-    );
-    let out = [
-        warning(r#"{"code":"dead_code","explanation":null}"#, &dead),
-        warning(r#"{"code":"dead_code","explanation":null}"#, &dead),
-        warning(
+    let warnings = [
+        line(
+            "warning",
+            r#"{"code":"dead_code","explanation":null}"#,
+            "warning: function `launchctl_list` is never used",
+        ),
+        line(
+            "warning",
             r#"{"code":"unused_imports","explanation":null}"#,
             "warning: unused import: `HashSet`",
         ),
-        warning(
+        line(
+            "warning",
             r#"{"code":"clippy::duration_suboptimal_units","explanation":null}"#,
             "warning: constructing a `Duration` using a smaller unit",
         ),
-        warning(
-            r#"{"code":"unknown_lints","explanation":null}"#,
-            "warning: unknown lint: `newer_lint`",
-        ),
-        warning("null", "warning: 3 warnings emitted"),
+        line("warning", "null", "warning: 3 warnings emitted"),
     ]
     .join("\n");
-    let read = read_cargo_json(&out, "aarch64-unknown-linux-gnu", &graph, false);
-    assert!(read.errors.is_empty());
-    assert_eq!(
-        read.warnings,
-        [
-            ("gui".to_string(), dead.clone()),
-            (
-                "gui".to_string(),
-                "warning: unused import: `HashSet`".to_string()
-            ),
-        ]
-    );
-    assert!(is_cell_warning(Some("unused_variables")));
-    for (triple, judged) in [
-        ("aarch64-unknown-linux-gnu", true),
-        ("x86_64-unknown-linux-gnu", true),
-        ("aarch64-apple-darwin", true),
-        ("x86_64-apple-darwin", true),
-        ("x86_64-pc-windows-msvc", true),
-        ("aarch64-pc-windows-msvc", true),
-        ("x86_64-pc-windows-gnu", false),
-        ("wasm32-unknown-unknown", false),
+    let run = |output: String| exec::Run {
+        case_observations: None,
+        stopped_at: None,
+        hung: None,
+        ok: true,
+        output,
+        code: Some(0),
+        spawn_error: None,
+        usage: None,
+    };
+    for triple in [
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-pc-windows-msvc",
+        "wasm32-unknown-unknown",
     ] {
-        assert_eq!(judges_warnings(triple), judged, "{triple}");
+        for tests in [false, true] {
+            let mut red = Red::default();
+            let read = read_cargo_run(&run(warnings.clone()), triple, &graph, tests, &mut red)
+                .expect("the compiler ran");
+            assert!(read.errors.is_empty());
+            assert!(red.status.is_none(), "{triple} {tests}: {:?}", red.detail);
+        }
     }
-    assert!(!is_cell_warning(Some("clippy::single_match")));
-    assert!(!is_cell_warning(Some("renamed_and_removed_lints")));
-    assert!(!is_cell_warning(None));
-    for (tests, status) in [(false, "WARNING(2)"), (true, "TEST-TARGET-WARNING(2)")] {
-        let run = exec::Run {
-            case_observations: None,
-            stopped_at: None,
-            hung: None,
-            ok: true,
-            output: out.clone(),
-            code: Some(0),
-            spawn_error: None,
-            usage: None,
-        };
+
+    let message = "error[E0425]: cannot find function `launchctl_list` in this scope";
+    let location = "crates/gui/src/launch.rs:42:5";
+    let error =
+        format!("\u{1b}[1m{message}\u{1b}[0m\n  --> {location}\n   |\n42 | launchctl_list();\n");
+    let stream = format!(
+        "{warnings}\n{}",
+        line("error", r#"{"code":"E0425","explanation":null}"#, &error)
+    );
+    for (tests, status) in [(false, "TYPE-ERROR(1)"), (true, "TEST-TARGET-ERROR(1)")] {
         let mut red = Red::default();
-        read_cargo_run(&run, "aarch64-unknown-linux-gnu", &graph, tests, &mut red)
-            .expect("the compiler ran");
-        assert_eq!(red.status.as_deref(), Some(status));
-        assert_eq!(red.detail.len(), 2);
-        assert!(red.detail[0].contains("launchctl_list"), "{:?}", red.detail);
+        read_cargo_run(
+            &run(stream.clone()),
+            "aarch64-unknown-linux-gnu",
+            &graph,
+            tests,
+            &mut red,
+        )
+        .expect("the compiler ran");
+        assert_eq!(red.status.as_deref(), Some(status), "{:?}", red.detail);
+        assert_eq!(red.detail.len(), 1, "{:?}", red.detail);
         let mut report = Report::new("cells");
         record_cell(
             &mut report,
@@ -1009,83 +1006,8 @@ fn a_rustc_warning_is_a_cell_finding_and_a_clippy_one_is_the_hosts() {
             first.contains(message) && first.contains(location),
             "{shown}"
         );
-        assert!(report.render().contains(&dead), "full original diagnostic");
+        assert!(report.render().contains(&error), "full original diagnostic");
     }
-    let run = exec::Run {
-        case_observations: None,
-        stopped_at: None,
-        hung: None,
-        ok: true,
-        output: out.clone(),
-        code: Some(0),
-        spawn_error: None,
-        usage: None,
-    };
-    let mut red = Red::default();
-    read_cargo_run(&run, "x86_64-pc-windows-msvc", &graph, false, &mut red)
-        .expect("the compiler ran");
-    assert_eq!(
-        red.status.as_deref(),
-        Some("WARNING(2)"),
-        "{:?}",
-        red.detail
-    );
-    let mut red = Red::default();
-    read_cargo_run(&run, "wasm32-unknown-unknown", &graph, false, &mut red)
-        .expect("the compiler ran");
-    assert!(red.status.is_none(), "{:?}", red.detail);
-    // A pulled run names a Windows cell's test-target warnings and is not red on them. CONTROL:
-    // the same warnings in its lint pass, a run naming `cells`, and a pulled Linux cell.
-    let run = exec::Run {
-        case_observations: None,
-        stopped_at: None,
-        hung: None,
-        ok: true,
-        output: out.clone(),
-        code: Some(0),
-        spawn_error: None,
-        usage: None,
-    };
-    let read = |triple: &str, pulled: bool, tests: bool| {
-        let mut red = Red {
-            leaves_test_warnings: leaves_test_warnings(pulled, triple),
-            ..Red::default()
-        };
-        read_cargo_run(&run, triple, &graph, tests, &mut red).expect("the compiler ran");
-        (red.status, red.unjudged)
-    };
-    let win = "aarch64-pc-windows-msvc";
-    let (status, unjudged) = read(win, true, true);
-    assert_eq!(status, None);
-    assert_eq!(unjudged.len(), 2, "{unjudged:?}");
-    assert!(unjudged[0].starts_with("in `"), "{unjudged:?}");
-    assert_eq!(read(win, true, false).0.as_deref(), Some("WARNING(2)"));
-    assert_eq!(
-        read(win, false, true).0.as_deref(),
-        Some("TEST-TARGET-WARNING(2)")
-    );
-    assert_eq!(
-        read("aarch64-unknown-linux-gnu", true, true).0.as_deref(),
-        Some("TEST-TARGET-WARNING(2)")
-    );
-    let clippy_only = warning(
-        r#"{"code":"clippy::duration_suboptimal_units","explanation":null}"#,
-        "warning: constructing a `Duration` using a smaller unit",
-    );
-    let run = exec::Run {
-        case_observations: None,
-        stopped_at: None,
-        hung: None,
-        ok: true,
-        output: clippy_only,
-        code: Some(0),
-        spawn_error: None,
-        usage: None,
-    };
-    let mut red = Red::default();
-    read_cargo_run(&run, "aarch64-unknown-linux-gnu", &graph, false, &mut red)
-        .expect("the compiler ran");
-    assert!(red.status.is_none(), "{:?}", red.detail);
 }
 
 /// Both passes can leave every owed artifact before cargo itself fails.

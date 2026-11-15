@@ -20,6 +20,7 @@ aterm-codec = { workspace = true }
 aterm-digest = { workspace = true }
 aterm-json = { workspace = true }
 aterm-durable = { workspace = true }
+aterm-tempfile = { workspace = true }
 atpkg = { workspace = true }
 libc = { workspace = true }
 jobserver_utils = { workspace = true }
@@ -27,7 +28,6 @@ jobserver_utils = { workspace = true }
 [dev-dependencies]
 ring = { workspace = true }
 aterm-update-core = { workspace = true }
-aterm-tempfile = { workspace = true }
 aterm-toolchain = { workspace = true }
 # The `kind=admission` rows the queue's memory admissions write, as its tests read them
 # (`aterm_capacity::telemetry::capture`). aterm-capacity already links it.

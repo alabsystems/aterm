@@ -9,6 +9,85 @@ const TRUST: &str = "7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15";
 const STOCK: &str = "8bab26f4f68e0e26f0bb7960be334d5b520ea452";
 const MACHO: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00, 0x00, 0x01];
 
+#[cfg(unix)]
+fn native_version_report(bytes: &[u8]) -> Result<String, String> {
+    let (_dir, root) = tmp("version-output");
+    let path = root.join("version.stdout");
+    std::fs::write(&path, bytes).expect("report");
+    let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+    let mut cmd = aterm_uds::spawnfd::command(cat);
+    cmd.arg(path);
+    version_output(&mut cmd)
+}
+
+#[cfg(unix)]
+#[test]
+fn compiler_probe_keeps_the_real_first_line_on_the_native_transport() {
+    let report = trust_vv(TRUST);
+    let tail = format!(
+        "{report}{}",
+        "\n".repeat(aterm_uds::deadline::OUTPUT_KEEP - report.len())
+    );
+    assert!(
+        parse_version_verbose(&tail).is_ok(),
+        "tail negative control"
+    );
+    let whole = format!("not a Trust compiler report\n{tail}");
+    let observed = native_version_report(whole.as_bytes()).expect("native complete capture");
+    assert!(
+        parse_version_verbose(&observed).is_err(),
+        "the native client must judge the actual first line"
+    );
+    assert!(observed == whole, "the native report must remain complete");
+}
+
+#[test]
+fn compiler_probe_refuses_invalid_utf8_in_an_identity_field() {
+    let report = trust_vv(TRUST);
+    let index = report.find("trust: ").expect("identity field") + "trust: ".len();
+    let mut bytes = report.into_bytes();
+    bytes[index] = 0xff;
+    assert!(
+        parse_version_verbose(&String::from_utf8_lossy(&bytes)).is_ok(),
+        "replacement decoding masks malformed identity bytes"
+    );
+    #[cfg(unix)]
+    assert!(native_version_report(&bytes).is_err());
+    assert!(decode_version_stdout(bytes).is_err());
+}
+
+#[test]
+fn compiler_probe_preserves_valid_utf8() {
+    let report = format!("{}note: compiler π\n", trust_vv(TRUST));
+    let observed = decode_version_stdout(report.clone().into_bytes()).expect("valid UTF-8");
+    assert_eq!(observed, report);
+    assert!(parse_version_verbose(&observed).is_ok());
+    #[cfg(unix)]
+    assert_eq!(
+        native_version_report(report.as_bytes()).expect("native UTF-8 capture"),
+        report
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn compiler_probe_native_capture_has_an_inclusive_output_bound() {
+    for extra in [0, 1] {
+        let report = vec![b'x'; aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES + extra];
+        assert_eq!(native_version_report(&report).is_ok(), extra == 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn compiler_probe_refuses_a_failed_native_command() {
+    let (_dir, root) = tmp("version-command-failure");
+    let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+    let mut cmd = aterm_uds::spawnfd::command(cat);
+    cmd.arg(root.join("absent.stdout"));
+    assert!(version_output(&mut cmd).is_err());
+}
+
 fn tmp(label: &str) -> (crate::testdir::Dir, PathBuf) {
     let dir = crate::testdir::dir(&format!("atpkg-lineage-{label}-"));
     let path = dir.to_path_buf();
@@ -450,6 +529,33 @@ fn the_version_report_must_be_a_trust_self_report() {
     let err = parse_version_verbose(&mismatched).expect_err("mismatch");
     assert!(err.iter().any(|l| l.contains("321aaeda7")), "{err:?}");
     assert!(parse_version_verbose(&trust_vv(TRUST).replace("trust: 0.1.0\n", "")).is_err());
+}
+
+#[test]
+fn compiler_identity_fields_must_be_unique() {
+    let report = trust_vv(TRUST);
+    assert!(parse_version_verbose(&report).is_ok());
+    for key in ["binary:", "trust:", "commit-hash:", "release:", "host:"] {
+        let original = report
+            .lines()
+            .find(|line| line.starts_with(key))
+            .expect("required identity field");
+        for duplicate in [original.to_string(), format!("{key} conflicting")] {
+            for text in [
+                format!("{report}{duplicate}\n"),
+                report.replacen(original, &format!("{duplicate}\n{original}"), 1),
+            ] {
+                let refusals = parse_version_verbose(&text).expect_err("duplicate identity field");
+                assert!(
+                    refusals
+                        .iter()
+                        .any(|line| line.contains("duplicate") && line.contains(key)),
+                    "{key}: {refusals:?}"
+                );
+            }
+        }
+    }
+    assert!(parse_version_verbose(&format!("{report}note: one\nnote: two\n")).is_ok());
 }
 
 #[test]

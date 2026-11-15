@@ -17,7 +17,11 @@
 //! again when its phases are done, and fails unless the arm's band holds both times: every
 //! thread at 4 (background), the highest at 31 (interactive). With a `backlog=` the attach
 //! world's log is seeded before its broker starts, and the broker's own process is read through
-//! its open and the world (`run/seeded.rs`, F09).
+//! its open and the world (`run/seeded.rs`, F09). That sealed log is started twice: after the
+//! seed's clean close, then, once that broker served, took records past its open's head and was
+//! `SIGKILL`ed from here, again on the same log, which takes astream's open after an unclean stop
+//! and serves the world ([`Seeds`], KI-1111-10); `verify perf fabric`, on this arm alone, holds
+//! both starts' peak footprint to C27.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,12 +54,14 @@ const EXIT_POLL: Duration = Duration::from_millis(20);
 
 /// A broker's root, made before its broker starts and kept until it is dropped, past the
 /// broker's end: a 0700 directory, the argv `aterm link broker` runs there, and the socket and
-/// log that argv names.
+/// log that argv names. A clone shares the directory: a broker started again on the same log
+/// (after an unclean stop, [`Seeds::open`]) keeps it as long as the first.
+#[derive(Clone)]
 struct Root {
     /// `bus.sock`, `bus.log`, `mint.secret`, `rest.key`, `broker.err` (a plaintext root's log and
     /// socket under `plain/`, its secret above them and no key: `at_rest::prepare` mints none
     /// for a log with no mint secret beside it, which is why that broker serves plaintext).
-    dir: aterm_tempfile::TempDir,
+    dir: std::sync::Arc<aterm_tempfile::TempDir>,
     argv: Vec<String>,
     sock: String,
     log: PathBuf,
@@ -85,7 +91,7 @@ impl Root {
         assert!(key.is_some(), "a root with a key beside its log seals it");
         Self {
             sock: dir.path().join("bus.sock").to_string_lossy().into_owned(),
-            dir,
+            dir: std::sync::Arc::new(dir),
             argv,
             log,
             key,
@@ -111,7 +117,7 @@ impl Root {
         let log = served_log(&argv);
         Self {
             sock: root.join("bus.sock").to_string_lossy().into_owned(),
-            dir,
+            dir: std::sync::Arc::new(dir),
             argv,
             log,
             key: None,
@@ -185,6 +191,8 @@ struct ShippedBroker {
     started: Instant,
     /// Its open as sampled (F09); `None` for a broker started without the sampler.
     open: Option<seeded::Open>,
+    /// Its start, split by the stamps on its stderr (KI-1111-2); `None` where it wrote none.
+    split: Option<seeded::Split>,
 }
 
 impl ShippedBroker {
@@ -212,11 +220,14 @@ impl ShippedBroker {
             .stderr(err_file);
         let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut cmd, root.dir.path())
             .expect("arm the broker's lifeline");
+        // The clock the broker stamps its start on, read here too: its phases count from here.
+        let spawn_ns = aterm_uds::process::continuous_ns();
         let started = Instant::now();
         let mut child = cmd.spawn().expect("start `aterm link broker`");
         let sampler = sample.then(|| seeded::Sampler::start(child.id(), started));
         let first = harness::first_line_within(&mut child, "the broker's `listening` line");
         let listening = Instant::now();
+        let seen_ns = aterm_uds::process::continuous_ns();
         assert_eq!(
             first.trim_end(),
             format!("listening {}", root.sock),
@@ -224,14 +235,16 @@ impl ShippedBroker {
             std::fs::read_to_string(&err).unwrap_or_default()
         );
         // A whole line: the broker writes its start line after `listening`, and a read can land
-        // inside that write.
-        let banner = until("the broker's start line on broker.err", || {
-            std::fs::read_to_string(&err)
-                .ok()?
+        // inside that write. Its stamps' line comes before it.
+        let (banner, stderr) = until("the broker's start line on broker.err", || {
+            let text = std::fs::read_to_string(&err).ok()?;
+            let banner = text
                 .split_inclusive('\n')
                 .find(|l| l.starts_with(BANNER) && l.ends_with('\n'))
-                .map(|l| l.trim_end().to_string())
+                .map(|l| l.trim_end().to_string())?;
+            Some((banner, text))
         });
+        let split = seeded::Split::of(&stderr, spawn_ns, seen_ns);
         let open = sampler.map(|sampler| {
             seeded::Open::finish(
                 sampler,
@@ -250,6 +263,7 @@ impl ShippedBroker {
             process,
             started,
             open,
+            split,
         }
     }
 
@@ -270,6 +284,24 @@ impl ShippedBroker {
         if exited.is_none() {
             aterm_uds::deadline::kill_within(&mut self.child, DEADLINE);
         }
+    }
+
+    /// Stop it as a crash, a jetsam kill or a power loss would: `SIGKILL` from the bench, no
+    /// clean close, no dev seam in the broker; its lifeline let go once it is reaped, so nothing
+    /// ends it first. The signal its exit status names and the kill to its reaping, ms.
+    fn kill(&mut self) -> (Option<i32>, f64) {
+        use std::os::unix::process::ExitStatusExt as _;
+        let killed = Instant::now();
+        self.child.kill().expect("SIGKILL the broker");
+        let child = &mut self.child;
+        let status =
+            aterm_spec::wait::within(DEADLINE, EXIT_POLL, || child.try_wait().ok().flatten())
+                .unwrap_or_else(|| {
+                    panic!("the SIGKILLed broker was not reaped within {DEADLINE:?}")
+                });
+        let reaped_ms = killed.elapsed().as_secs_f64() * 1e3;
+        self.lifeline = None;
+        (status.signal(), reaped_ms)
     }
 
     /// The base priority of each of the broker's threads now, held to the arm's band: every one
@@ -305,6 +337,7 @@ impl ShippedBroker {
             "root": self.root.dir.path().to_string_lossy().into_owned(),
             "argv": self.root.argv.clone(),
             "banner": self.banner.clone(),
+            "start_split": self.split.as_ref().map_or(Value::Null, seeded::Split::json),
             "thread_base_priorities": { "ready": start.to_vec(), "done": end.to_vec() },
         })
     }
@@ -327,12 +360,16 @@ impl ShippedBroker {
         format!(
             "The world's broker is `aterm link broker` in a process of its own, started as {} \
              (`{asked}`), argv `{}`; its threads' base priorities read {} when it was ready and {} \
-             when the phases were done ({shown}). Its start line: `{}`\n",
+             when the phases were done ({shown}). Its start line: `{}`. Its start, split by the \
+             stamps on its stderr (ms, on the machine's continuous clock): {}.\n",
             self.process.runs_as(),
             self.root.argv.join(" "),
             spread(start),
             spread(end),
-            self.banner.trim_start_matches("aterm link broker: ")
+            self.banner.trim_start_matches("aterm link broker: "),
+            self.split
+                .as_ref()
+                .map_or_else(|| "none stamped".to_string(), seeded::Split::brief)
         )
     }
 }
@@ -753,15 +790,33 @@ pub(super) fn attach(spec: &Spec, clock: Clock) -> (Value, Vec<String>) {
 
 /// F09's opens before the attach world: `aterm link broker` on an empty log (the process
 /// alone), on the seeded log plaintext (ended at once, its root kept for the cold reads), and
-/// on the seeded log sealed, which goes on to serve the world. Each is sampled through its open.
+/// on the seeded log sealed, twice: started on the seed's clean close, given
+/// [`seeded::UNCLEAN_TAIL`] records past its open's head, read whole and `SIGKILL`ed, then
+/// started again on the same log after that unclean stop, which goes on to serve the world
+/// (KI-1111-10). Each is sampled through its open.
 struct Seeds {
     /// The records seeded: `backlog` for each attach population.
     records: usize,
     empty: seeded::Open,
     empty_banner: String,
+    empty_split: Option<seeded::Split>,
     plain: ShippedBroker,
     plain_seed: seeded::Seeded,
     sealed_seed: seeded::Seeded,
+    /// The sealed log's start on the seed's clean close, and its banner.
+    clean: seeded::Open,
+    clean_banner: String,
+    clean_split: Option<seeded::Split>,
+    /// How that broker was stopped.
+    killed: seeded::Killed,
+    /// What the clean start served, read whole before its kill; the start after the kill served
+    /// the same.
+    served: seeded::Whole,
+}
+
+/// The base, head, retained count and identity a start's health snapshot says of its log.
+fn log_facts(h: &seeded::Health) -> (u64, u64, u64, astream_broker::LogIdentity) {
+    (h.base, h.head, h.retained, h.identity)
 }
 
 impl Seeds {
@@ -775,6 +830,7 @@ impl Seeds {
         empty.end();
         let empty_open = empty.open.take().expect("a sampled open");
         let empty_banner = empty.banner.clone();
+        let empty_split = empty.split.take();
         drop(empty);
         eprintln!("fabric bench: {records} records seeded plaintext, then its open, sampled");
         let plain_root = Root::plaintext("f09p", spec);
@@ -784,7 +840,84 @@ impl Seeds {
         eprintln!("fabric bench: {records} records seeded sealed, then its open, sampled");
         let sealed_root = Root::shipped("fbench-att-b", spec);
         let sealed_seed = seeded::seed(&sealed_root.log, sealed_root.key, tier, records);
-        let sealed = ShippedBroker::launch(sealed_root, process, true);
+        let sidecar = astream_broker::identity_path(&sealed_root.log);
+        let read_sidecar = |when: &str| {
+            std::fs::read(&sidecar)
+                .unwrap_or_else(|e| panic!("the {when} log's {}: {e}", sidecar.display()))
+        };
+        let closed = read_sidecar("seeded");
+        let mut clean = ShippedBroker::launch(sealed_root, process, true);
+        eprintln!(
+            "fabric bench: {} records written through the sealed log's clean start, the log read \
+             whole, then SIGKILL",
+            seeded::UNCLEAN_TAIL
+        );
+        let opened = read_sidecar("served");
+        seeded::append_tail(&clean.root.sock);
+        let served = seeded::Whole::read(&clean.root.sock);
+        let (signal, reaped_ms) = clean.kill();
+        let after = read_sidecar("killed");
+        let clean_open = clean.open.take().expect("a sampled open");
+        let clean_banner = clean.banner.clone();
+        let clean_split = clean.split.take();
+        let before = clean_open
+            .health
+            .expect("the clean start's health snapshot");
+        let killed = seeded::Killed {
+            signal,
+            reaped_ms,
+            sidecar_rewritten_by_open: opened != closed,
+            sidecar_unchanged: after == opened,
+            past_sidecar_head: served.head.saturating_sub(before.head),
+        };
+        // A kill that missed (the broker closed cleanly first, or exited otherwise), an open that
+        // left the seed's closed sidecar as it was, or a log that took nothing past its head
+        // leaves the start below on the exact branch, or on the other branch with nothing over
+        // its floor to reserve for, and not the one this run says it is.
+        assert!(
+            killed.unclean() && killed.past_sidecar_head >= seeded::UNCLEAN_TAIL as u64,
+            "the sealed broker's stop was not unclean, after the {} records written past its \
+             open: {:?}, so the next start does not take astream's open after a crash",
+            seeded::UNCLEAN_TAIL,
+            killed
+        );
+        // The killed broker's stderr, kept apart from the next start's.
+        let killed_err = clean.root.dir.path().join("broker.killed.err");
+        std::fs::rename(clean.root.dir.path().join("broker.err"), &killed_err)
+            .expect("keep the killed broker's broker.err");
+        let killed_err = std::fs::read_to_string(&killed_err).unwrap_or_default();
+        eprintln!("fabric bench: the sealed log started again after the SIGKILL, sampled");
+        let sealed = ShippedBroker::launch(clean.root.clone(), process, true);
+        drop(clean);
+        // The start after the kill serves the log the clean start served once it took the tail:
+        // its identity and base, the head and count past the tail, and every record, in order,
+        // byte for byte.
+        let restarted = until("the restarted broker's own health snapshot", || {
+            seeded::Health::of(&sealed.root.log).filter(|h| h.pid == sealed.child.id())
+        });
+        assert_eq!(
+            log_facts(&restarted),
+            (
+                before.base,
+                served.head,
+                before.retained + killed.past_sidecar_head,
+                before.identity
+            ),
+            "the start after the SIGKILL serves another log than the clean start did once it \
+             took the tail (base, head, retained, identity); the killed broker's stderr:\n\
+             {killed_err}"
+        );
+        let again = seeded::Whole::read(&sealed.root.sock);
+        assert_eq!(
+            again, served,
+            "the start after the SIGKILL serves other records than the clean start; the killed \
+             broker's stderr:\n{killed_err}"
+        );
+        assert!(
+            served.seeded == records as u64,
+            "the sealed log serves {} seeded records of the {records} seeded",
+            served.seeded
+        );
         for (broker, word) in [(&plain, "plaintext"), (&sealed, "sealed")] {
             assert!(
                 broker.banner.contains(&format!("at-rest={word};")),
@@ -803,9 +936,15 @@ impl Seeds {
                 records,
                 empty: empty_open,
                 empty_banner,
+                empty_split,
                 plain,
                 plain_seed,
                 sealed_seed,
+                clean: clean_open,
+                clean_banner,
+                clean_split,
+                killed,
+                served,
             },
             sealed,
         )
@@ -858,7 +997,22 @@ impl Seeds {
              pause a reading; the table gives the gaps its readings lay apart. Two more \
              opens of the same binary say where its memory goes: an empty log's (the process \
              alone) and the same records seeded plaintext ({:.0} ms), whose log lies in a \
-             directory with no mint secret, so it is served plaintext (no shipped root is).\n",
+             directory with no mint secret, so it is served plaintext (no shipped root is). \
+             The sealed log is opened twice. Its first start follows the seed's clean close, \
+             which recorded the log's head as closed in its identity sidecar, so astream's open \
+             reserves the tier's columns at once for that count. Once it serves, the bench \
+             writes {} records through it on `{}`, past the head its open wrote into the \
+             sidecar ({} records past it), reads every record through it ({} records to head \
+             {}) and `SIGKILL`s it: its exit names signal {}, {:.1} ms from the kill to its \
+             reaping, its open rewrote the sidecar the seed closed ({}), and the sidecar holds \
+             the bytes its open wrote ({}), so no clean close recorded the head, as after a \
+             crash. The second start, on the same log, takes the open's other branch (the \
+             columns grown to 1,024 records, then reserved at the count the file's length \
+             predicts, with an eighth over the records past the sidecar's head). It serves the \
+             same identity and base, the head and count past those records, and every record \
+             again, byte for byte (SHA-256 `{}`), and it serves the world, so the world's \
+             readings here are the restarted broker's. `verify perf fabric` holds both starts' \
+             peak footprint to C27's 50 MB on this arm.\n",
             self.records,
             backlog::FILL_BODY_LEN,
             seeded::subject(),
@@ -870,6 +1024,26 @@ impl Seeds {
             seeded::SETTLE.as_secs(),
             seeded::SAMPLE_PAUSE.as_millis(),
             self.plain_seed.fill_ms,
+            seeded::UNCLEAN_TAIL,
+            seeded::tail_subject(),
+            self.killed.past_sidecar_head,
+            self.served.records,
+            self.served.head,
+            self.killed
+                .signal
+                .map_or_else(|| "none".to_string(), |s| s.to_string()),
+            self.killed.reaped_ms,
+            if self.killed.sidecar_rewritten_by_open {
+                "its bytes differ"
+            } else {
+                "its bytes are the seed's"
+            },
+            if self.killed.sidecar_unchanged {
+                "unchanged"
+            } else {
+                "rewritten"
+            },
+            self.served.digest,
         ));
         md.extend(seeded::opens_table(&[
             ("an empty log, sealed", 0, 0, &self.empty),
@@ -880,10 +1054,44 @@ impl Seeds {
                 plain_open,
             ),
             (
-                "the seeded log, sealed (serves the world)",
+                "the seeded log, sealed, after its clean close (then SIGKILLed)",
+                self.records,
+                self.sealed_seed.log_bytes,
+                &self.clean,
+            ),
+            (
+                "the seeded log, sealed, after the SIGKILL (serves the world)",
                 self.records,
                 self.sealed_seed.log_bytes,
                 sealed_open,
+            ),
+        ]));
+        md.push(format!(
+            "**Each start, split** (ATERM-KI-1111-2), as {}: the bench reads the machine's \
+             continuous clock (`aterm_uds::process::continuous_ns`) just before its spawn and \
+             once it has read the `listening` line (`seen`), and `aterm link broker` writes one \
+             line on its stderr after `listening` (`aterm_link::start_stamps`) with the same \
+             clock read as `aterm`'s `main` is entered, as `aterm link broker` is, once its \
+             `rest.key` is read and its notes written (`key`), as astream's open, the log file \
+             opened (on a new log created and its folder synced) and locked, calls its \
+             `prepare` (`locked`, before its recovery scan), as that open returns (`opened`: \
+             `prepare`'s reads, the scan, the index built and the broker started, which astream \
+             splits nowhere aterm reads), once the open's notes are written and the health seam \
+             armed (`armed`), once its retention and rate rules are set, once `serve` has bound \
+             its socket and as it writes `listening`. Each column is the step that ends there \
+             and holds everything since the column before.\n",
+            spec.broker_process.runs_as(),
+        ));
+        md.extend(seeded::split_table(&[
+            ("an empty log, sealed", self.empty_split.as_ref()),
+            ("the seeded log, plaintext", self.plain.split.as_ref()),
+            (
+                "the seeded log, sealed, after its clean close",
+                self.clean_split.as_ref(),
+            ),
+            (
+                "the seeded log, sealed, after the SIGKILL",
+                sealed.split.as_ref(),
             ),
         ]));
         md.push(format!(
@@ -910,8 +1118,9 @@ impl Seeds {
              newest) with no retention rules (no tick walks it beside the reads), served on a \
              socket of its own, and {} passes over each, a pass `Fetch`ing its first {} seeded \
              records at most {} a page, the two logs' passes alternating. `Broker::cold_reads` \
-             counted every record of every pass read back from the file (the column), which the \
-             run asserts. A record's time is its pass's over {}: the page cache warm, the \
+             counted every record of every pass read back from the file (the column) but the \
+             log's newest, which a budget of 0 keeps decoded, as the run asserts. A record's \
+             time is its pass's over {}: the page cache warm, the \
              unseal under the key (sealed) or not (plaintext), the decode, the wire and the \
              reader.\n",
             seeded::COLD_PASSES,
@@ -927,10 +1136,29 @@ impl Seeds {
             "body_bytes": backlog::FILL_BODY_LEN,
             "seed": { "sealed": self.sealed_seed.json(), "plaintext": self.plain_seed.json() },
             "opens": {
-                "empty": { "banner": self.empty_banner, "open": self.empty.json() },
-                "plaintext": { "banner": self.plain.banner.clone(), "open": plain_open.json() },
-                "sealed": { "banner": sealed.banner.clone(), "open": sealed_open.json() },
+                "empty": {
+                    "banner": self.empty_banner,
+                    "open": self.empty.json(),
+                    "split": self.empty_split.as_ref().map_or(Value::Null, seeded::Split::json),
+                },
+                "plaintext": {
+                    "banner": self.plain.banner.clone(),
+                    "open": plain_open.json(),
+                    "split": self.plain.split.as_ref().map_or(Value::Null, seeded::Split::json),
+                },
+                "sealed": {
+                    "banner": self.clean_banner,
+                    "open": self.clean.json(),
+                    "split": self.clean_split.as_ref().map_or(Value::Null, seeded::Split::json),
+                },
+                "sealed_unclean": {
+                    "banner": sealed.banner.clone(),
+                    "open": sealed_open.json(),
+                    "split": sealed.split.as_ref().map_or(Value::Null, seeded::Split::json),
+                },
             },
+            "unclean_stop": self.killed.json(),
+            "served_whole": self.served.json(),
             "readings": memory
                 .iter()
                 .scan(None, |before: &mut Option<f64>, (read, r, h)| {

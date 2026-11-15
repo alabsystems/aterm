@@ -35,7 +35,8 @@ fn a_full_series_is_near_the_bound_and_its_tails_read_what_the_whole_read_reads(
 }
 
 /// Every scene seeds the default home's row first and active in the store (`me`, `main` in the
-/// glass scenes I to K, and in L `alt1`, whose profile is a login no row names), writes only
+/// glass scenes I to K and the logins' scenes N and O, and in L `alt1`, whose profile is a login
+/// no row names), writes only
 /// inside its world, and C's `pool1` is never read; B's and C's `alt1` stand at 92%. Only the
 /// card's own scenes L and M give every row an address, a pool file and this Mac its lab name:
 /// the file parses and gives the profile's account its home, another Mac in L and this one in
@@ -48,7 +49,7 @@ fn the_seeds_are_synthetic_and_stay_in_their_world() {
         let now = 1_792_956_600;
         let plan = plan(scene);
         let first = match scene {
-            'I'..='K' => "main",
+            'I'..='K' | 'N' | 'O' => "main",
             'L' => "alt1",
             _ => "me",
         };
@@ -104,7 +105,8 @@ fn the_seeds_are_synthetic_and_stay_in_their_world() {
 }
 
 /// The outlook a window reads from `world` at `now`, on UTC, as its memo reads it
-/// ([`resolver_cost`]'s reads): the roster, the store, the logins and the series.
+/// ([`resolver_cost`]'s reads): the roster, the store, the logins, the series and the sign-in
+/// running on this Mac.
 fn outlook_of(world: &World, now: i64) -> aterm_agent::harness::outlook::Outlook {
     use aterm_agent::harness::outlook;
     let roster =
@@ -118,18 +120,142 @@ fn outlook_of(world: &World, now: i64) -> aterm_agent::harness::outlook::Outlook
         .map(|(logins, _)| outlook::renewals_of(&roster, &logins))
         .unwrap_or_default();
     let series = outlook::series_of(&dir, &roster, &state.machine, now);
+    let signing_in = store.signing_in();
     outlook::outlook(&outlook::Inputs {
         roster: &roster,
         state: &state,
         enrolled: &enrolled,
         series: &series,
         renewals: &renewals,
+        lab: &std::collections::BTreeMap::new(),
         mode: accounts::Mode::Early,
         credits: false,
         now,
         offset: |_| 0,
-        signing_in: None,
+        signing_in: signing_in.as_deref(),
     })
+}
+
+/// SCENE N'S WORLD SAYS EACH LOGIN: N is a tapped card scene whose readings are this Mac's, and
+/// the outlook read from its world as the window reads it says `main`'s week, `alt1` signed out
+/// though the store holds its reading (no published figure beside `signed out`), `alt3` signed
+/// out with no login made here, and `alt2` signed out, then signing in while this process holds
+/// its running sign-in record ([`hold_sign_in`]), and signed out again once that drops.
+/// NEGATIVE CONTROL: the same record held for `main`, whose login is here, leaves `main` its
+/// week: the record alone makes no row say `signing in`.
+#[test]
+fn scene_ns_world_says_each_login() {
+    use aterm_agent::harness::outlook::Figure;
+    let plan_n = plan('N');
+    assert!(plan_n.tapped && plan_n.read_here && CARD_SCENES.contains(&'N'));
+    let now = 1_792_956_600;
+    let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
+    seed(&world, &plan_n, now).expect("seeded");
+    let figure = |outlook: &aterm_agent::harness::outlook::Outlook, label: &str| {
+        outlook
+            .rows
+            .iter()
+            .find(|row| row.label == label)
+            .unwrap_or_else(|| panic!("{label}'s row"))
+            .figure(now)
+    };
+    let roster =
+        accounts::Roster::load(&world.cfg.join("aterm").join("accounts.toml")).expect("the roster");
+    let store = accounts::Store::at(&harness_state(&world));
+    let (state, _) = store.load(now).expect("the store");
+    assert!(
+        state.accounts["alt1"]
+            .windows
+            .contains_key(accounts::WEEK_LIMIT)
+    );
+    assert!(!accounts::enrolled(&roster).contains("alt3"));
+    let ours = outlook_of(&world, now);
+    assert_eq!(figure(&ours, "main").used_x10(), Some(750));
+    for label in ["alt1", "alt2", "alt3"] {
+        assert_eq!(figure(&ours, label), Figure::SignedOut, "{label}");
+    }
+    let held = hold_sign_in(&world, "alt2", now).expect("the record is written");
+    assert_eq!(store.signing_in().as_deref(), Some("alt2"));
+    assert_eq!(figure(&outlook_of(&world, now), "alt2"), Figure::SigningIn);
+    drop(held);
+    assert_eq!(figure(&outlook_of(&world, now), "alt2"), Figure::SignedOut);
+    let held = hold_sign_in(&world, "main", now).expect("the record is written");
+    assert_eq!(store.signing_in().as_deref(), Some("main"));
+    assert_eq!(
+        figure(&outlook_of(&world, now), "main").used_x10(),
+        Some(750),
+        "NEGATIVE CONTROL: a login that is here keeps its week while its sign-in runs"
+    );
+    drop(held);
+}
+
+/// SCENE O'S WORLD PUTS THE LOGINS WHERE THEY ARE SHOWN: O is a tapped card scene of three rows,
+/// all named in line E's view, and the outlook read from its world as the window reads it says
+/// the tab's own account `main` signed out though its week stands at 75% (its session is the
+/// evidence that it runs: its lead says the week), then signing in while this process holds its
+/// running sign-in record ([`hold_sign_in`]), the word its card's Login line reads; `alt1` signed
+/// out though its week reads 80%; and `alt2` signed out with no login made here, and no plan
+/// read of it. NEGATIVE CONTROL: the record held for `alt1` instead leaves `main` signed out: the
+/// record says `signing in` only of the row it names.
+#[test]
+fn scene_os_world_puts_the_logins_where_they_are_shown() {
+    use aterm_agent::harness::outlook::{self, Figure};
+    let plan_o = plan('O');
+    assert!(plan_o.tapped && plan_o.read_here && CARD_SCENES.contains(&'O'));
+    let now = 1_792_956_600;
+    let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
+    seed(&world, &plan_o, now).expect("seeded");
+    let row = |outlook: &outlook::Outlook, label: &str| {
+        outlook
+            .rows
+            .iter()
+            .find(|row| row.label == label)
+            .unwrap_or_else(|| panic!("{label}'s row"))
+            .clone()
+    };
+    let roster =
+        accounts::Roster::load(&world.cfg.join("aterm").join("accounts.toml")).expect("the roster");
+    let store = accounts::Store::at(&harness_state(&world));
+    let (state, _) = store.load(now).expect("the store");
+    assert_eq!(state.active.as_deref(), Some("main"));
+    assert!(!accounts::enrolled(&roster).contains("alt2"));
+    let ours = outlook_of(&world, now);
+    let view = ours.quota("main", None, true);
+    let named: Vec<&str> = view.named.iter().map(|n| n.label.as_str()).collect();
+    assert_eq!(named, ["main", "alt1", "alt2"]);
+    assert!(view.folded.is_empty(), "{:?}", view.folded);
+    assert_eq!(row(&ours, "main").week_figure(now).used_x10(), Some(750));
+    assert_eq!(row(&ours, "alt1").week_figure(now).used_x10(), Some(800));
+    for label in ["main", "alt1", "alt2"] {
+        assert_eq!(row(&ours, label).figure(now), Figure::SignedOut, "{label}");
+    }
+    // A login's plan read is a row of its series file: `alt2`, never signed in here, has none,
+    // while `alt1`, read here, has its file.
+    let series = |label: &str| {
+        aterm_agent::harness::account_series::path_of(&harness_state(&world), label, &state.machine)
+            .expect("an admissible label and machine")
+    };
+    assert!(!series("alt2").exists(), "no plan read of alt2 here");
+    assert!(series("alt1").exists(), "CONTROL: alt1's series file");
+    let held = hold_sign_in(&world, "main", now).expect("the record is written");
+    assert_eq!(store.signing_in().as_deref(), Some("main"));
+    let signing = row(&outlook_of(&world, now), "main");
+    assert_eq!(signing.figure(now), Figure::SigningIn);
+    assert_eq!(signing.week_figure(now).used_x10(), Some(750));
+    drop(held);
+    assert_eq!(
+        row(&outlook_of(&world, now), "main").figure(now),
+        Figure::SignedOut
+    );
+    let held = hold_sign_in(&world, "alt1", now).expect("the record is written");
+    let other = outlook_of(&world, now);
+    assert_eq!(row(&other, "alt1").figure(now), Figure::SigningIn);
+    assert_eq!(
+        row(&other, "main").figure(now),
+        Figure::SignedOut,
+        "NEGATIVE CONTROL: the record says `signing in` only of the row it names"
+    );
+    drop(held);
 }
 
 /// SCENE M'S SERIES CROSSES A WEEK'S RESET: the readings of the last eight days the outlook
@@ -259,7 +385,7 @@ fn a_card_is_shown_once_its_reader_and_observer_have_answered() {
 fn the_tapped_scenes_hand_the_tap_the_stores_week() {
     let now = 1_792_956_600;
     let vars = tap::TapVars {
-        sid: Some("s-01".into()),
+        sid: Some("t0000000002".into()),
         pid: Some("7".into()),
         ..tap::TapVars::default()
     };

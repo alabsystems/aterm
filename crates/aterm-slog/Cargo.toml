@@ -42,8 +42,9 @@ astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-session = { workspace = true }
-# The vocabularies the box and wall words mirror (`PromptKind::name`,
-# `WallKind::name`), held equal by `vocab_mirrors_the_screen_reader`.
+# The vocabularies the box and wall words mirror (aterm-phase's `PromptKind::name` and
+# alab-policy's `WallKind::name`), held equal by `vocab_mirrors_the_screen_reader`.
+alab-policy = { workspace = true }
 aterm-phase = { workspace = true }
 # The `.seq` replay corpus is found from the package directory when the tests run
 # (`aterm_tempfile::manifest_dir`).

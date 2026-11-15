@@ -58,7 +58,7 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
         &timeline,
         Some("claude"),
         42,
-        now,
+        (now, 0),
         &crate::claude_footer::LogWake::default(),
         false,
     );
@@ -74,7 +74,7 @@ fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
         &timeline,
         Some("claude"),
         42,
-        now,
+        (now, 0),
         &crate::claude_footer::LogWake::default(),
         false,
     );
@@ -118,7 +118,7 @@ fn an_exec_into_a_store_or_native_claude_asks_for_the_footer_again() {
             &timeline,
             Some("claude"),
             42,
-            now + Duration::from_millis(ms),
+            (now + Duration::from_millis(ms), 0),
             &crate::claude_footer::LogWake::default(),
             edged,
         );
@@ -153,12 +153,208 @@ fn an_exec_into_a_store_or_native_claude_asks_for_the_footer_again() {
     crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = None);
 }
 
+/// A FOOTER IS ASKED FOR WHEN ITS TAB WROTE (S2, [`StatusObserver::request_footer_if_due`]): 30
+/// visits 2 s apart of a Claude tab whose output instant stands send 1 ask, the first; an
+/// instant that moved between two later visits sends 1 more, at the second of them; one that
+/// moved again before the visits 1 s and 1.999 s after that ask sends none at either and 1 at the
+/// visit 2 s after it ([`crate::claude_footer::RECHECK`]). Counts are the asks the call handed
+/// [`crate::claude_footer::request_footer`]. NEGATIVE CONTROL: with the `ask.output != output`
+/// term dropped from the time arm the 30 still visits send 30 asks.
+#[test]
+fn a_footer_is_asked_for_once_and_again_only_when_its_tab_wrote() {
+    const SESSION: u64 = 7;
+    let t0 = Instant::now();
+    let mut observer = StatusObserver::new(policy(), Duration::from_millis(50));
+    let timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
+    {
+        let mut current = timeline.lock().unwrap();
+        current.note_foreground_group(42);
+        current.set_program(42, Some("claude".into()));
+    }
+    // The asks sent so far after a visit at `ms` that saw the tab's output instant `output`.
+    let mut visit = |ms: u64, output: u64| {
+        observer.request_footer_if_due(
+            SESSION,
+            &timeline,
+            Some("claude"),
+            42,
+            (t0 + Duration::from_millis(ms), output),
+            &crate::claude_footer::LogWake::default(),
+            false,
+        );
+        crate::claude_footer::CAPTURED_ASKS.with(|asks| asks.borrow().as_ref().map_or(0, Vec::len))
+    };
+    crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = Some(Vec::new()));
+    let still: Vec<usize> = (0..30).map(|k| visit(k * 2_000, 5)).collect();
+    assert_eq!(
+        still, [1; 30],
+        "one ask, at the first visit, and none after"
+    );
+    // The tab wrote between visits: asked for at the next one.
+    let moved: Vec<usize> = (30..40)
+        .map(|k| visit(k * 2_000, if k < 35 { 5 } else { 6 }))
+        .collect();
+    assert_eq!(moved, [1, 1, 1, 1, 1, 2, 2, 2, 2, 2]);
+    // That ask went out at 70 s. The tab has written again by the next visit.
+    assert_eq!(visit(71_000, 7), 2, "inside the recheck: not yet");
+    assert_eq!(visit(71_999, 7), 2);
+    assert_eq!(visit(72_000, 7), 3, "the recheck after the ask: asked");
+    assert_eq!(visit(74_000, 7), 3, "and not again while the output stands");
+    assert_eq!(
+        crate::claude_footer::CAPTURED_ASKS.with(|asks| asks.borrow().clone()),
+        Some(vec![(SESSION, 42); 3])
+    );
+    crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = None);
+}
+
+/// A TAB AT REST IS ASKED FOR AGAIN ONCE ITS RESOLVER ENDED
+/// ([`StatusObserver::request_footer_if_due`]): the resolver that took a tab's ask holds the
+/// watch that keeps the tab's footer read, so when it has ended
+/// ([`crate::claude_footer::resolver_epoch`] moved) the next visit sends 1 ask though the tab
+/// wrote nothing, and the visits after none. An ask no resolver took is sent again at each
+/// visit [`crate::claude_footer::RECHECK`] or more after it, until one is taken. Counts are the
+/// asks the call handed [`crate::claude_footer::request_footer`].
+/// NEGATIVE CONTROL: with the `ask.resolver != Some(resolver)` term dropped from the time arm,
+/// the visits after the resolver ended send nothing.
+#[test]
+fn a_resting_tab_is_asked_for_again_once_the_resolver_that_took_its_ask_ended() {
+    const SESSION: u64 = 7;
+    let t0 = Instant::now();
+    let mut observer = StatusObserver::new(policy(), Duration::from_millis(50));
+    let timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
+    {
+        let mut current = timeline.lock().unwrap();
+        current.note_foreground_group(42);
+        current.set_program(42, Some("claude".into()));
+    }
+    // The asks sent so far after a visit at `ms`, the tab's output instant standing.
+    let mut visit = |ms: u64| {
+        observer.request_footer_if_due(
+            SESSION,
+            &timeline,
+            Some("claude"),
+            42,
+            (t0 + Duration::from_millis(ms), 5),
+            &crate::claude_footer::LogWake::default(),
+            false,
+        );
+        crate::claude_footer::CAPTURED_ASKS.with(|asks| asks.borrow().as_ref().map_or(0, Vec::len))
+    };
+    // The captured resolver: how many of it have ended, and whether it takes an ask.
+    let resolver = |ended: u64, takes: bool| {
+        crate::claude_footer::CAPTURED_RESOLVER.with(|resolver| resolver.set((ended, takes)));
+    };
+    crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = Some(Vec::new()));
+    resolver(0, true);
+    let still: Vec<usize> = (0..5).map(|k| visit(k * 2_000)).collect();
+    assert_eq!(still, [1; 5], "one ask while its resolver runs");
+    resolver(1, true);
+    let ended: Vec<usize> = (5..10).map(|k| visit(k * 2_000)).collect();
+    assert_eq!(
+        ended, [2; 5],
+        "the resolver ended: one ask at the next visit, taken by the one that runs now"
+    );
+    // That resolver ended too, and none can start: the ask at 20 s is taken by nobody.
+    resolver(2, false);
+    assert_eq!(visit(20_000), 3, "asked for, and not taken");
+    assert_eq!(visit(21_999), 3, "inside the recheck: not yet");
+    assert_eq!(visit(22_000), 4, "sent again at the recheck");
+    resolver(2, true);
+    assert_eq!(visit(24_000), 5, "and again, taken this time");
+    let taken: Vec<usize> = (13..18).map(|k| visit(k * 2_000)).collect();
+    assert_eq!(taken, [5; 5], "a taken ask is not sent again");
+    crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = None);
+    crate::claude_footer::CAPTURED_RESOLVER.with(|resolver| resolver.set((0, true)));
+}
+
+/// THE SWEEP HANDS THE FOOTER ASK ITS TAB'S OUTPUT INSTANT (S2): the real sweep
+/// (`App::observe_session_statuses`) over a tab with Claude Code in front, 30 times 2 s apart
+/// with the tab's `latest_output_activity_ns` standing, has sent 1 footer ask; the instant moved,
+/// the next sweep sends 1 more and the one after none; the footer resolver ended
+/// ([`crate::claude_footer::resolver_epoch`] moved), the next sweep sends 1 more and the one
+/// after none. NEGATIVE CONTROLS: with the `ask.output != output` term dropped from the ask's
+/// time arm the 30 sweeps send 30; with the `ask.resolver != Some(resolver)` term dropped the
+/// sweep after the resolver ended sends none.
+#[test]
+fn the_sweep_asks_for_a_claude_tabs_footer_once_and_again_when_the_tab_writes() {
+    use super::program::{LeaderFacts, ProgramResolver};
+    const CLAUDE: i32 = i32::MAX - 21;
+    let mut app = crate::App::headless_for_test();
+    app.session_factory.fg_probe = |master| master;
+    app.session_status.programs = ProgramResolver::with_lookup(|pgid, _shell| LeaderFacts {
+        program: (pgid == CLAUDE).then(|| "claude".to_string()),
+        ..LeaderFacts::default()
+    });
+    let sid = app.next_session_id;
+    app.push_stub_tab(crate::WindowId(0), crate::stub_session(sid));
+    app.pool
+        .sessions
+        .get_mut(&sid)
+        .expect("pooled")
+        .session
+        .master = CLAUDE;
+    let timeline = Arc::clone(&app.pool.get(sid).expect("pooled").ctx.timeline);
+    let wrote = |app: &crate::App, ns: u64| {
+        app.pool
+            .get(sid)
+            .expect("pooled")
+            .latest_output_activity_ns
+            .store(ns, std::sync::atomic::Ordering::Release);
+    };
+    let asks = || {
+        crate::claude_footer::CAPTURED_ASKS.with(|asks| asks.borrow().as_ref().map_or(0, Vec::len))
+    };
+    crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = Some(Vec::new()));
+    let step = Duration::from_secs(2);
+    let mut t = Instant::now();
+    wrote(&app, 1);
+    let _ = app.observe_session_statuses(t);
+    let program = || timeline.lock().unwrap().agent().program.clone();
+    let named = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(1),
+        || (program().as_deref() == Some("claude")).then_some(()),
+    );
+    assert!(named.is_some(), "never named claude: {:?}", program());
+    let mut sent = Vec::new();
+    for _ in 0..30 {
+        t += step;
+        let _ = app.observe_session_statuses(t);
+        sent.push(asks());
+    }
+    assert_eq!(sent, [1; 30], "one ask while the tab's output stands");
+    wrote(&app, 2);
+    t += step;
+    let _ = app.observe_session_statuses(t);
+    assert_eq!(asks(), 2, "the tab wrote: asked for at the next sweep");
+    t += step;
+    let _ = app.observe_session_statuses(t);
+    assert_eq!(asks(), 2, "and not again");
+    crate::claude_footer::CAPTURED_RESOLVER.with(|resolver| resolver.set((1, true)));
+    t += step;
+    let _ = app.observe_session_statuses(t);
+    assert_eq!(asks(), 3, "the resolver ended: asked for at the next sweep");
+    t += step;
+    let _ = app.observe_session_statuses(t);
+    assert_eq!(asks(), 3, "and not again");
+    assert_eq!(
+        crate::claude_footer::CAPTURED_ASKS.with(|asks| asks.borrow().clone()),
+        Some(vec![(sid, CLAUDE); 3])
+    );
+    crate::claude_footer::CAPTURED_ASKS.with(|asks| *asks.borrow_mut() = None);
+    crate::claude_footer::CAPTURED_RESOLVER.with(|resolver| resolver.set((0, true)));
+}
+
 /// THE SWEEP ASKS FOR A RELEASED CODEX TAB'S ROLLOUT, READ ONLY
 /// ([`StatusObserver::request_rollout_if_due`]): a codex-alab tab whose proven claim was given
 /// back while its process runs and its record shows no end keeps its rollout asked for while that
 /// process, alive as its claim proved it, leads the group the sweep reads in front. NEGATIVE
 /// CONTROLS: another group in front, or a shell, asks nothing; the asked tab whose process leaves
 /// the front is stopped.
+/// AT REST THE SWEEP ASKS ON THE SLOW CLOCK (S1, [`crate::codex_rollout_tap::due`]): swept each
+/// second for a minute with its output 5 s old at the first sweep and nothing moving, the tab is
+/// asked for at 0, 15, 30 and 45 s, 4 asks, counted by the instants the sweep's own ask took.
+/// NEGATIVE CONTROL: with `due`'s rest branch deleted the minute's sweeps ask 60 times.
 #[test]
 fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it() {
     use aterm_agent::harness::self_claimed::{Copy, Record, Seen};
@@ -228,6 +424,8 @@ fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it(
     let wake = crate::claude_footer::LogWake::default();
     let now = Instant::now();
     let screen = crate::control::ScreenGen { epoch: 1, seq: 1 };
+    let wrote = Some(now - Duration::from_secs(5));
+    // The instant of the session's last ask after a sweep at `at`, or none where it has no ask.
     let mut sweep = |program, pgid, at| {
         observer.request_rollout_if_due(
             SESSION,
@@ -235,28 +433,163 @@ fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it(
             Some(program),
             pgid,
             screen,
-            (at, None),
+            (at, wrote),
             &wake,
         );
-        observer.rollout_asked.contains_key(&SESSION)
+        observer.rollout_asked.get(&SESSION).map(|ask| ask.at)
     };
-    assert!(!sweep("codex", group + 1, now), "another group in front");
-    assert!(!sweep("zsh", group, now), "a shell in front");
-    assert!(
-        sweep("codex", group, now),
-        "the released claim's process fronts its tab: its rollout is asked for"
+    assert_eq!(
+        sweep("codex", group + 1, now),
+        None,
+        "another group in front"
     );
-    assert!(
-        sweep("codex", group, now + crate::codex_rollout_tap::RECHECK),
-        "and asked for again at the next recheck"
+    assert_eq!(sweep("zsh", group, now), None, "a shell in front");
+    let mut asks = Vec::new();
+    for k in 0..60 {
+        let at = now + Duration::from_secs(k);
+        let asked = sweep("codex", group, at).expect(
+            "the released claim's process fronts its tab: its rollout is asked for, and stays so",
+        );
+        if asked == at {
+            asks.push(k);
+        }
+    }
+    assert_eq!(
+        asks,
+        [0, 15, 30, 45],
+        "asked for at once, then on the rest clock while nothing moves"
     );
-    assert!(
-        !sweep(
-            "codex",
-            group + 1,
-            now + crate::codex_rollout_tap::RECHECK * 2
-        ),
+    assert_eq!(
+        sweep("codex", group + 1, now + Duration::from_secs(60)),
+        None,
         "the process left the front: the tap is stopped"
+    );
+    crate::self_claim::forget(sid);
+}
+
+/// THE SWEEP HANDS THE ROLLOUT ASK ITS TAB'S OUTPUT INSTANT (S1): the real sweep
+/// (`App::observe_session_statuses`) over a tab that a proven codex-alab claim stands on, its
+/// process in front, each second for a minute with the tab's `latest_output_activity_ns` standing
+/// 5 s before the first of them, asks for the rollout at 0, 15, 30 and 45 s
+/// ([`crate::codex_rollout_tap::REST_NEAR`]), counted by the instants the sweep's own ask took.
+/// The tab then writes: the next sweep asks, the one after asks again (the trailing read of a
+/// read sent just after output), and the one after that does not. NEGATIVE CONTROL: with the
+/// sweep's call handing the ask no output instant (`(now, None)`), the tab rests on
+/// [`crate::codex_rollout_tap::REST_FAR`] and the minute's sweeps ask once.
+#[test]
+fn the_sweep_asks_for_a_resting_codex_tabs_rollout_on_the_slow_clock_and_again_when_it_writes() {
+    use aterm_agent::harness::self_claimed::{Copy, Record, Seen};
+
+    use super::program::{LeaderFacts, ProgramResolver};
+    use crate::session_timeline::claim_supervisor_as;
+    static GROUP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    let proven = crate::self_claim::stand_in::running();
+    let group = i32::try_from(proven.pid).expect("a pid");
+    GROUP.store(group, std::sync::atomic::Ordering::Release);
+    let mut app = crate::App::headless_for_test();
+    app.session_factory.fg_probe = |master| master;
+    app.session_status.programs = ProgramResolver::with_lookup(|pgid, _shell| LeaderFacts {
+        program: (pgid == GROUP.load(std::sync::atomic::Ordering::Acquire))
+            .then(|| "codex".to_string()),
+        ..LeaderFacts::default()
+    });
+    let session = app.next_session_id;
+    app.push_stub_tab(crate::WindowId(0), crate::stub_session(session));
+    app.pool
+        .sessions
+        .get_mut(&session)
+        .expect("pooled")
+        .session
+        .master = group;
+    let ctx = Arc::clone(&app.pool.get(session).expect("pooled").ctx);
+    let sid = ctx.self_id.as_str();
+    let copy = Copy {
+        lifetime: None,
+        pid: proven.pid,
+        start: proven.start.clone(),
+        home: "/private/tmp/x/codex-home".into(),
+        seen: Seen::Present(Record {
+            pid: proven.pid,
+            session_id: Some("019a0000-0000-7000-8000-00000000001c".to_string()),
+            resume_argv: None,
+            env: Vec::new(),
+            status: Some("idle".to_string()),
+            exit: None,
+            cwd: None,
+            draft_empty: Some(true),
+            frame: None,
+            goal: None,
+            background_terminals: None,
+            initializing: false,
+        }),
+        resume: Err("no-resume-line"),
+    };
+    let now_us = crate::metrics::now_us();
+    crate::self_claim::forget(sid);
+    claim_supervisor_as(
+        &ctx,
+        &format!("codex-alab@{}", proven.pid),
+        Some(1),
+        None,
+        Some(proven.clone()),
+        now_us,
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the proven claim");
+    crate::self_claim::set_copy_for_test(sid, Some(copy));
+    assert!(
+        crate::self_claim::rollout_target(&ctx).is_some(),
+        "the proven claim's rollout stands"
+    );
+
+    // The sweep's clock: `t0` is its first counted instant, an hour past the epoch its output
+    // instants are counted from.
+    let t0 = app.lat_epoch + Duration::from_secs(3_600);
+    let wrote = |app: &crate::App, at: Instant| {
+        let ns = u64::try_from(at.duration_since(app.lat_epoch).as_nanos()).expect("nanoseconds");
+        app.pool
+            .get(session)
+            .expect("pooled")
+            .latest_output_activity_ns
+            .store(ns, std::sync::atomic::Ordering::Release);
+    };
+    wrote(&app, t0 - Duration::from_secs(5));
+    // A sweep before the counted ones starts the front program's resolution.
+    let _ = app.observe_session_statuses(t0 - Duration::from_secs(10));
+    let program = || ctx.timeline.lock().unwrap().agent().program.clone();
+    let named = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(1),
+        || (program().as_deref() == Some("codex")).then_some(()),
+    );
+    assert!(named.is_some(), "never named codex: {:?}", program());
+    // Whether the sweep at `at` asked for the tab's rollout: its ask took that instant.
+    let asked = |app: &mut crate::App, at: Instant| {
+        let _ = app.observe_session_statuses(at);
+        app.session_status
+            .rollout_asked
+            .get(&session)
+            .is_some_and(|ask| ask.at == at)
+    };
+    let mut asks = Vec::new();
+    for k in 0..60 {
+        if asked(&mut app, t0 + Duration::from_secs(k)) {
+            asks.push(k);
+        }
+    }
+    assert_eq!(
+        asks,
+        [0, 15, 30, 45],
+        "asked for at once, then on the rest clock while the tab's output stands"
+    );
+    wrote(&app, t0 + Duration::from_millis(59_500));
+    let after: Vec<bool> = (60..63)
+        .map(|k| asked(&mut app, t0 + Duration::from_secs(k)))
+        .collect();
+    assert_eq!(
+        after,
+        [true, true, false],
+        "the tab wrote: read at the next sweep, its trailing read a second later, then at rest"
     );
     crate::self_claim::forget(sid);
 }
@@ -1417,7 +1750,15 @@ fn turning_tab_status_off_stops_classifying_and_retires_the_records() {
     assert!(attention_of(&app, wid, tab_id));
 
     app.config.tab_status = Some(false);
+    crate::claude_footer::STOPPED_SESSIONS.with(|r| r.borrow_mut().clear());
     app.reconfigure_session_status();
+    let sessions: Vec<u64> = app.pool.iter().map(|s| s.id).collect();
+    assert!(!sessions.is_empty(), "PRECONDITION: a session in the pool");
+    assert_eq!(
+        crate::claude_footer::STOPPED_SESSIONS.with(|r| r.borrow().clone()),
+        sessions.iter().map(|&id| (id, true)).collect::<Vec<_>>(),
+        "each session's Claude reader stops with its timeline, so its run says it stopped"
+    );
     assert!(
         app.session_status.status(0).is_none(),
         "a stale phase must not sit on a tab after the classifier stops"
@@ -1945,7 +2286,7 @@ fn the_status_record_carries_the_effective_autopilot_beside_supervisor() {
     assert!(
         observed.contains(
             " supervisor=- supervisor_proven=0 supervisor_version=- supervisor_vendor=- \
-             supervisor_act=observe autopilot=land human_ms="
+             supervisor_act=observe autopilot=land pinned=0 human_ms="
         ),
         "{observed}"
     );
@@ -2357,7 +2698,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              occupancy_hold ready slots \
              idle_ready_min waits waits_ready supervisor_contract supervisor_scope \
              supervisor_revision supervisor supervisor_proven supervisor_version \
-             supervisor_vendor supervisor_act autopilot \
+             supervisor_vendor supervisor_act autopilot pinned \
              human_ms human_typed_ms human_seq launch launch_seq path_evidence copy upgrade \
              history_lost \
              journal journal_off integration_rev born render \
@@ -2537,34 +2878,38 @@ fn a_pair_read_stays_owed_through_sweeps_that_miss_it() {
         home: std::path::PathBuf::from("/private/tmp/x/codex-home"),
     }
     .into();
-    let sweep = |observer: &mut StatusObserver, at: Instant| {
+    // A sweep at `at` of the tab, its last output at `wrote`.
+    let sweep = |observer: &mut StatusObserver, at: Instant, wrote: Option<Instant>| {
         observer.observe(SESSION, &at_prompt, at);
         due(
             &mut observer.rollout_asked,
             SESSION,
             Some(target.clone()),
             None,
-            (at, None),
+            (at, wrote),
         )
     };
     let wait = ReadWait {
         since: 9_000,
         read_ms: 0,
     };
+    // The tab at rest is read on its slow clock alone, so the read before the wait's time is one
+    // a sweep sends for output that moved, more than a recheck old so it owes no trailing read.
+    let wrote = Some(t0 + RECHECK * 3 / 4);
 
-    assert_eq!(sweep(&mut observer, t0), Ask::Read(target.clone()));
+    assert_eq!(sweep(&mut observer, t0, None), Ask::Read(target.clone()));
     assert_eq!(observer.next_wake(), None, "premise: nothing owed at rest");
     let owed = t0 + RECHECK * 3;
     observer.note_pair_wait(SESSION, Some((wait, owed)));
     assert_eq!(observer.next_wake(), Some(owed), "the pair read is owed");
     assert_eq!(
-        sweep(&mut observer, t0 + RECHECK / 2),
+        sweep(&mut observer, t0 + RECHECK / 2, None),
         Ask::Nothing,
         "premise: a sweep inside the recheck reads nothing"
     );
     assert_eq!(observer.next_wake(), Some(owed), "and leaves it owed");
     assert_eq!(
-        sweep(&mut observer, t0 + RECHECK * 2),
+        sweep(&mut observer, t0 + RECHECK * 2, wrote),
         Ask::Read(target.clone())
     );
     assert_eq!(
@@ -2579,7 +2924,7 @@ fn a_pair_read_stays_owed_through_sweeps_that_miss_it() {
         "a sweep that skips it leaves it owed, at the slot's next gate"
     );
     assert_eq!(
-        sweep(&mut observer, owed + interval),
+        sweep(&mut observer, owed + interval, wrote),
         Ask::Read(target.clone())
     );
     assert_eq!(observer.next_wake(), None, "the read at it discharges it");
@@ -2682,8 +3027,21 @@ fn a_refused_sample_still_advances_the_observation_gate() {
 /// function's definition, which the reader blanks ([`undefined`]), counts as one element where it
 /// was typed, its body's parts for none, and is never the one read; one whose end the reader does
 /// not find (zsh's `qzf() true; make`) took the rest of the line unread, which counts as one more.
-/// NEGATIVE CONTROLS (run): the read position taken as the last element's fails the `||` rows;
-/// `shared` never set fails the `make`, `vim`, `claude` and `git` rows marked shared.
+/// The reader blanks a definition in a later pipeline stage or job too: one that is a job of its
+/// own counts as one element before or after the read command, where it stands (`make & qzf() {
+/// true; }` is read from its first element of two, so `make`'s run never takes the definition's
+/// status; `qzf() { true; } & make` from its second), and one that is a stage of a pipeline beside
+/// others is a part of that pipeline's one element (`make | qzf() { true; }`); one that starts its
+/// pipeline takes its pipe into its blank, so the pipeline reads its next stage
+/// (`qzf() { true; } | make` reads `make`, as its one element). NEGATIVE CONTROLS (run): the read
+/// position taken as the last element's fails the `||` rows; `shared` never set fails the `make`,
+/// `vim`, `claude` and `git` rows marked shared. NEGATIVE CONTROLS of the stage and job rows
+/// (scratch; not yet run when they were written): a definition counted as before the read
+/// command wherever it stands in the read segment (`count` up to the segment's end, not
+/// [`command_start`]) fails `make & qzf() { true; }` (read 2); a piped definition counted as an
+/// element (no `piped_into`, or no `pipe_after`) fails the pipeline row it covers (2 elements);
+/// no pipe taken into a pipeline's first definition's blank fails `qzf() { true; } | make` (read
+/// from it, nothing).
 #[test]
 fn a_lines_shape_is_its_top_level_elements_and_the_one_the_detail_reads() {
     let shape = |elements, read| LineShape {
@@ -2732,6 +3090,10 @@ fn a_lines_shape_is_its_top_level_elements_and_the_one_the_detail_reads() {
         ("function qzf; claude; end; make", shape(2, 2), Some("make")),
         ("qzf() { claude; }", shape(1, 0), None),
         ("qzf() true; make", shape(2, 0), None),
+        ("make & qzf() { true; }", shape(2, 1), Some("make")),
+        ("qzf() { true; } & make", shape(2, 2), Some("make")),
+        ("make | qzf() { true; }", shape(1, 1), Some("make")),
+        ("qzf() { true; } | make", shape(1, 1), Some("make")),
     ] {
         assert_eq!(line_shape(line), want, "{line:?}");
         assert_eq!(command_detail(line).as_deref(), word, "{line:?}");
@@ -4882,17 +5244,46 @@ type FormsRow = (
 /// command; a function's definition runs nothing where it is typed, so it reads nothing in every
 /// shell, never a word of its body, and the commands around it read as they would without it.
 /// What H2's live run read instead: fish's `mkdir -p X; and X/` read `and`, fish's `function
-/// qzf2; true; end` read `true`, and pwsh's definitions read `function`. NEGATIVE CONTROLS
-/// (scratch): no connector cut fails the `and` and `or` rows (`and`, `or`); `not` not stepped
-/// over fails the `not` rows (`not`); a lone `begin` read without its negation fails `not
-/// begin` (`begin`); no definition blanked fails the definition rows (fish's `true` and `if`,
-/// zsh's and pwsh's `function`, pwsh's filter's `echo`) and the rows of a command after or
-/// before one; no fish `end` matched, or no brace matched, fails the definition then its call
-/// (nothing, for the stand-in); a block nested in a body not counted fails the nested rows
-/// (`true`); the first brace after `function` taken for the body, wherever it stands, fails
+/// qzf2; true; end` read `true`, and pwsh's definitions read `function`; what J2-3's review read
+/// instead: a fish body that pipes into a block (`… | while read n; …; end; true; end`) read
+/// `true`, a body's brace on a line of its own read nothing after the body, and
+/// `[Console]::Clear(); ls`, a subshell body and a program named `filter` read nothing (and
+/// bash's `qzf2() { echo }; if true; then true; fi; }` read `if`, a word of its body: the
+/// shells-apart test below); what the review of its port read instead: a subshell body holding
+/// `${x:-)}`, `"$(echo ")")"` or `$'\')'`, and `(qzf2() { :; { true; }; })`, read `true`, a word
+/// of the body; pwsh's `function qzf2 { echo | % { $_ } }; ls`, `qzf2() { true; } | sleep 1` and
+/// `ls; [() { echo; }` read nothing; and `filter out {a,b}.log` read `.log`, an argument.
+/// NEGATIVE CONTROLS (scratch): no connector cut fails the `and` and `or` rows (`and`, `or`);
+/// `not` not stepped over fails the `not` rows (`not`); a lone `begin` read without its negation
+/// fails `not begin` (`begin`); no definition blanked fails the definition rows (fish's `true`
+/// and `if`, zsh's and pwsh's `function`, pwsh's filter's `echo`) and the rows of a command
+/// after or before one; no fish `end` matched, or no brace matched, fails the definition then
+/// its call (nothing, for the stand-in); a block nested in a body not counted fails the nested
+/// rows (`true`); the first brace after `function` taken for the body, wherever it stands, fails
 /// fish's `-a {a,b}` row (`true`), its quoted `-d '{x}'` row with `ls` after it (nothing) and
-/// pwsh's typed parameter's (`echo`); a `#` after a brace read as a comment fails bash's
-/// `${#1}` row (nothing, for `ls`).
+/// pwsh's typed parameter's (`echo`); a `#` after a brace read as a comment fails bash's `${#1}`
+/// row (nothing, for `ls`). And: a segment read as one stage fails the piped and backgrounded
+/// fish bodies (`true`, `set`, `echo`) and the job before a definition (`true`); fish's
+/// negations, its `time`, or its `else` not read past fails those rows (`true`); FISH_BLOCKS cut
+/// to `if` fails the `while`, `for`, `switch`, `begin` and nested `function` rows (`true`, or
+/// nothing for `ls`); the `name ()` form not read fails `qzf2 () ( true )` (`qzf2`); a later
+/// definition read again inside an earlier one's body panics on fish's nested `function`; a name
+/// that opens with `[` taken for one fails `[Console]::Clear(); ls` (nothing); a subshell body
+/// not read, or `filter` taken for a definition without its body, fails those rows (nothing); a
+/// brace body read by bash's rule alone fails zsh's `echo }` row (nothing); quotes, a comment,
+/// a `${…}` with a blank, or a `function` name before its body's brace not read by the sh rule
+/// fails those rows (nothing, or `true`); pwsh's rule reading no quote, comment or backquote
+/// escape fails those rows (nothing, or `true`); no line end read before a body's brace fails
+/// the brace-on-its-own-line rows (nothing). NEGATIVE CONTROLS of the rows the port's review
+/// added (scratch; not yet run when they were written): a subshell body counted by
+/// [`paren_close`], which reads no word's parts, fails the `${x:-)}`, `"$(echo ")")"` and
+/// `$'\')'` rows (`true`); a subshell's `(` typed against the name not read past fails
+/// `(qzf2() …)` (`true`); zsh's reading not refused for the `}` it leaves closing nothing fails
+/// pwsh's `% { $_ }` row (nothing); a name that opens with `[` refused whatever follows it fails
+/// `ls; [() { echo; }` (nothing); `case` looked for in a quote's text too fails the `"in case"`
+/// row (nothing); no pipe taken into a definition's blank fails `qzf2() { true; } | sleep 1`
+/// (nothing); no statement's end required after pwsh's block fails the `filter out {a,b}.log`
+/// rows (`filter`, standing in for `.log`).
 #[test]
 fn a_line_reads_the_same_detail_in_every_shells_form_of_it() {
     use crate::command_ran::ran_of;
@@ -4984,6 +5375,58 @@ fn a_line_reads_the_same_detail_in_every_shells_form_of_it() {
                     "pwsh",
                     "function qzf2([ValidateScript({ $_ })]$a) { true; echo }",
                 ),
+                ("bash", "qzf2 () ( true )"),
+                ("zsh", "function qzf2 () ( true )"),
+                ("bash", "qzf2() { echo \" } \"; true; }"),
+                ("zsh", "qzf2() { echo ' } '; true }"),
+                ("pwsh", "function qzf2 { echo \" } \"; true }"),
+                ("bash", "qzf2() { echo # }\n  true; }"),
+                ("pwsh", "function qzf2 { # }\n  true }"),
+                ("pwsh", "function qzf2 { echo `}; true }"),
+                ("bash", "qzf2() { qzg() { :; }; true; }"),
+                ("zsh", "qzf2() { function qzg { : }; true }"),
+                ("zsh", "qzf2() { echo ${x:- }; true }"),
+                ("pwsh", "function qzf2\n{\n  true\n}"),
+                (
+                    "fish",
+                    "function qzf2; seq 3 | while read n; echo $n; end; true; end",
+                ),
+                (
+                    "fish",
+                    "function qzf2\n  seq 3 | while read n\n    echo $n\n  end\n  true\nend",
+                ),
+                (
+                    "fish",
+                    "function qzf2; echo x | begin; cat; end; set -g y 1; end",
+                ),
+                (
+                    "fish",
+                    "function qzf2; true | if true; echo; end; echo hi; end",
+                ),
+                ("fish", "function qzf2; true & begin; echo; end; true; end"),
+                ("fish", "function qzf2; not begin; echo; end; true; end"),
+                ("fish", "function qzf2; not if true; echo; end; true; end"),
+                ("fish", "function qzf2; time begin; echo; end; true; end"),
+                ("fish", "function qzf2; while true; echo; end; true; end"),
+                ("fish", "function qzf2; for x in a; echo; end; true; end"),
+                (
+                    "fish",
+                    "function qzf2; switch x; case x; echo; end; true; end",
+                ),
+                ("fish", "function qzf2; begin; echo; end; true; end"),
+                ("fish", "function qzf2; function qzg; echo; end; true; end"),
+                (
+                    "fish",
+                    "function qzf2; if false; echo; else while false; end; true; end; true; end",
+                ),
+                (
+                    "fish",
+                    "function qzf2; if false; echo; else if true; echo; end; true; end",
+                ),
+                ("bash", "qzf2() ( echo ${x:-)}; true )"),
+                ("bash", "qzf2() ( x=\"$(echo \")\")\"; true )"),
+                ("bash", "qzf2() ( echo $'\\')' \\'; true )"),
+                ("bash", "(qzf2() { :; { true; }; })"),
             ],
             &[],
             None,
@@ -5008,9 +5451,55 @@ fn a_line_reads_the_same_detail_in_every_shells_form_of_it() {
                 ("fish", "function qzf2 -a {a,b}; true; end; ls"),
                 ("pwsh", "ls; function qzf2 { true }"),
                 ("pwsh", "function qzf2($a = -1) { true }; ls"),
+                ("bash", "qzf2 () { true; }; ls"),
+                ("bash", "qzf2() ( true ); ls"),
+                ("zsh", "function qzf2 () ( true ); ls"),
+                ("pwsh", "[Console]::Clear(); ls"),
+                ("bash", "qzf2() { echo \" } \"; true; }; ls"),
+                ("pwsh", "function qzf2 { echo \" } \" }; ls"),
+                ("bash", "qzf2() { echo # }\n  true; }; ls"),
+                ("pwsh", "function qzf2 { # }\n  true }; ls"),
+                ("bash", "qzf2() { qzg() { :; }; true; }; ls"),
+                ("zsh", "qzf2() { echo }; ls"),
+                ("zsh", "qzf2() { echo ${x:- }; true }; ls"),
+                ("bash", "function qzf2\n{\n  true\n}\nls"),
+                ("zsh", "function qzf2\n{\n  true\n}\nls"),
+                ("pwsh", "function qzf2\n{\n  true\n}\nls"),
+                ("pwsh", "function qzf2 {true}; ls"),
+                ("pwsh", "filter qzf2 { $_ }; ls"),
+                (
+                    "fish",
+                    "function qzf2; seq 3 | while read n; echo $n; end; end; ls",
+                ),
+                ("fish", "function qzf2; function qzg; echo; end; end; ls"),
+                ("pwsh", "function qzf2 { echo | % { $_ } }; ls"),
+                ("bash", "ls; [() { echo; }"),
+                ("bash", "qzf2() ( echo \"in case\" ); ls"),
             ],
             &["ls"],
             Some(("ls", true)),
+        ),
+        (
+            &[
+                ("bash", "sleep 1 & qzf2() { true; }"),
+                ("zsh", "sleep 1 & function qzf2 { true }"),
+                ("fish", "sleep 1 & function qzf2; true; end"),
+                ("pwsh", "sleep 1 & function qzf2 { true }"),
+                ("bash", "qzf2() { true; } | sleep 1"),
+            ],
+            &["sleep"],
+            Some(("sleep", true)),
+        ),
+        (
+            &[
+                ("bash", "filter --x file"),
+                ("zsh", "filter --x file"),
+                ("fish", "filter --x file"),
+                ("bash", "filter out {a,b}.log"),
+                ("zsh", "filter out {a,b}.log"),
+            ],
+            &["filter"],
+            Some(("filter", true)),
         ),
     ];
     let wrong: Vec<String> = rows
@@ -5025,6 +5514,74 @@ fn a_line_reads_the_same_detail_in_every_shells_form_of_it() {
         })
         .collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// J2-3, A DEFINITION WHOSE END THE SHELLS READ APART READS NOTHING AFTER IT: where the shells
+/// with a definition's form end its body at different places (fish's `function` ends at its `end`
+/// where a brace on the next line closes bash's, zsh's and pwsh's), where no shell ends it in a
+/// line that shell takes (zsh's `if [[ … ]] { … }` and `repeat 3 { … }`, which the reader does not
+/// know: zsh's reading closes the body at their `}` and leaves the body's own `}` closing nothing,
+/// so it is refused, and bash's runs to the line's end), or where its end lies past what the
+/// reader reads (a here-document's or a here-string's text, a `case` list's patterns in a
+/// subshell body or in a word's `$(…)`), the reader cannot tell which words are its body, so it
+/// reads nothing after the definition, never a word that may be one. Where bash runs `{ echo }`
+/// on to a `}` in a command's first place, zsh's reading, closed at `echo }`, leaves that `}`
+/// closing nothing, so bash's end is the definition's and the whole line is the definition (the
+/// `echo }` row). NEGATIVE CONTROLS (scratch): the here-document, the here-string or the `case`
+/// list read as text fails its row (`ls`); fish's reading dropped fails the brace-then-`end` row
+/// (`ls`). NEGATIVE CONTROLS of the rows added when the reader was carried onto main and with the
+/// review of that port (scratch; not yet run when they were written): `case` looked for only as a
+/// blank-separated word fails the `(case` row (`ls`); a word's `$(…)` read as plain text, not as
+/// a subshell's body, fails the `$(case` row (`ls`); zsh's reading not refused for a `}` that
+/// closes nothing fails the `if [[` and `repeat` rows (`true`) and, with the earliest end taken
+/// where the readings part, the `echo }` row (`if`).
+#[test]
+fn a_definition_whose_end_the_shells_read_apart_reads_nothing_after_it() {
+    use crate::command_ran::ran_of;
+    let ran = &gate_ran();
+    let rows: &[(&str, &str, &[&str])] = &[
+        ("bash", "qzf2() { echo }; if true; then true; fi; }", &[]),
+        ("bash", "qzf2() { cat <<X\n}\nX\n}; ls", &["ls"]),
+        ("pwsh", "function qzf2 { echo @'\n}\n'@\n}; ls", &["ls"]),
+        ("bash", "qzf2() ( case x in x) echo;; esac ); ls", &["ls"]),
+        ("bash", "qzf2() (case x in x) echo;; esac); ls", &["ls"]),
+        (
+            "bash",
+            "qzf2() { x=$(case a in a) echo;; esac); }; ls",
+            &["ls"],
+        ),
+        ("fish", "function qzf2\n{ echo; }\nend; ls", &["ls"]),
+        (
+            "zsh",
+            "qzf2() { if [[ -n x ]] { echo }; { true } }; ls",
+            &["ls"],
+        ),
+        ("zsh", "qzf2() { repeat 3 { echo }; { true } }; ls", &["ls"]),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter_map(|(shell, line, runs)| {
+            let got = read_gated(ran, line, ran_of(runs));
+            got.is_some()
+                .then(|| format!("{shell} {line:?} (ran {runs:?}): {got:?}, want None"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A LINE OF MORE DEFINITIONS THAN THE READER READS PAST READS NOTHING AFTER THEM: each shell's
+/// reading of where a definition ends reads on to the line's end ([`undefined`]), so the
+/// definitions read are capped at [`MAX_DEFINITIONS`] and a line's cost is its length times that
+/// count, never its length squared. The definition past them takes the rest of the line unread,
+/// as one whose end the shells do not agree on does, so the command after it reads nothing, while
+/// a line of as many definitions as the cap reads that command. NEGATIVE CONTROL (scratch; not
+/// yet run when it was written): no cap fails the line past it (`ls`).
+#[test]
+fn a_definition_past_the_cap_reads_nothing_after_it() {
+    let read =
+        |definitions: usize| command_detail(&format!("{}ls", "qzf() { :; }; ".repeat(definitions)));
+    assert_eq!(read(MAX_DEFINITIONS).as_deref(), Some("ls"));
+    assert_eq!(read(MAX_DEFINITIONS + 1), None);
 }
 
 /// CONFIRMED BY FILE IDENTITY: a program reached by a name its image does not carry is the

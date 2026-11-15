@@ -1096,7 +1096,7 @@ fn run_one(
         .ctl(&["sessions"])
         .stdout
         .split_whitespace()
-        .find(|w| w.len() == 22 && w.starts_with("s-"))
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .map(str::to_string);
     let Some(sid) = sid else {
         return Ok(Err("the tab has no session id".into()));

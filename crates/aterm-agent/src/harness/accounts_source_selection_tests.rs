@@ -27,8 +27,6 @@ fn resolve_scope(state: &State, action: &str, promote: bool) -> State {
     let home = scratch.path();
     let config = home.join("aterm.toml");
     let roster = home.join("accounts.toml");
-    let secrets = home.join(".secrets");
-    fs::create_dir(&secrets).unwrap();
     fs::write(
         &config,
         if state["key"] == 1 {
@@ -49,15 +47,18 @@ fn resolve_scope(state: &State, action: &str, promote: bool) -> State {
         )
         .unwrap();
     }
-    for (key, name) in [
+    // Unusable content still selects its entry; selection must not fall through.
+    let entries = [
         ("pool", super::super::super::ai_pool::AI_POOL_FILE),
         ("vault", FLEET_ROSTER_FILE),
         ("sheet", ACCOUNTS_CSV_FILE),
-    ] {
-        if state[key] == 1 {
-            // Unusable content still selects this entry; selection must not fall through.
-            fs::write(secrets.join(name), "unusable source").unwrap();
-        }
+    ]
+    .into_iter()
+    .filter(|(key, _)| state[*key] == 1)
+    .map(|(_, name)| (name, b"unusable source".as_slice()))
+    .collect::<Vec<_>>();
+    if !entries.is_empty() {
+        crate::vault_entry::seed(home, &entries);
     }
     let scope = if state["init"] == 1 || promote {
         Scope::Init
@@ -127,19 +128,25 @@ fn assignment_and_missing_roster_read_the_selected_source_instead_of_its_copy() 
         )
     };
     fs::write(desk.fleet_file(), row("stale")).unwrap();
-    let secrets = desk.home.join(".secrets");
-    fs::create_dir(&secrets).unwrap();
-    let vault = secrets.join(FLEET_ROSTER_FILE);
-    fs::write(&vault, row("selected")).unwrap();
+    crate::vault_entry::seed(
+        &desk.home,
+        &[(FLEET_ROSTER_FILE, row("selected").as_bytes())],
+    );
     let selected = select(
         Some(&desk.home),
         Some(&config),
         Some(&desk.roster()),
         Scope::Init,
     );
-    assert_eq!(selected.source(), Some(vault.display().to_string()));
+    assert_eq!(
+        selected.source(),
+        Some(crate::vault_entry::source_name(FLEET_ROSTER_FILE))
+    );
     // A one-machine input is still read-only; row contents cannot grant write authority.
-    assert_eq!(selected.origin(), FleetOrigin::Vault(vault));
+    assert_eq!(
+        selected.origin(),
+        FleetOrigin::Vault(FLEET_ROSTER_FILE.to_owned())
+    );
     let env = quiet_env(&desk.home, &desk.state, &config, NOW);
     let Assigning::Names(fleet, _) = assigning_source(Cli::Claude, &env) else {
         panic!("the selected source must supply the assignments");
@@ -164,7 +171,7 @@ fn assignment_and_missing_roster_read_the_selected_source_instead_of_its_copy() 
 }
 
 #[test]
-fn a_legacy_copy_directs_edits_only_to_the_local_projection() {
+fn a_backup_file_the_vault_never_delivered_is_not_a_source() {
     use super::super::login_tests::{Desk, NOW};
     let _registry = TestSourceOverride::new(SourceSnapshot::Absent);
     let desk = Desk::new("m27");
@@ -174,7 +181,7 @@ fn a_legacy_copy_directs_edits_only_to_the_local_projection() {
     let copy = secrets.join(FLEET_ROSTER_FILE);
     let text = FleetRoster::from_toml(
         "[[account]]\nlabel='old'\nemail='old@example.test'\nmachines=['m27']\n",
-        "legacy fixture",
+        "backup fixture",
     )
     .unwrap()
     .to_toml_for(Some(OptIn::Discovered));
@@ -187,7 +194,7 @@ fn a_legacy_copy_directs_edits_only_to_the_local_projection() {
         Scope::Init,
     );
     let FleetOrigin::Local { files, .. } = selected.origin() else {
-        panic!("the legacy copy must retain a local editing destination");
+        panic!("a hand-placed ~/.secrets file must leave local discovery in charge");
     };
     assert_eq!(files, [desk.fleet_file()]);
     let env = quiet_env(&desk.home, &desk.state, &config, NOW);
@@ -209,36 +216,30 @@ fn a_legacy_copy_directs_edits_only_to_the_local_projection() {
 
 #[cfg(unix)]
 #[test]
-fn local_edit_targets_cannot_alias_a_vault_input() {
+fn local_edit_targets_cannot_resolve_into_the_backup() {
     use super::super::login_tests::{Desk, NOW};
-    for hard in [false, true] {
-        let desk = Desk::new("m27");
-        let secrets = desk.home.join(".secrets");
-        fs::create_dir(&secrets).unwrap();
-        let source = secrets.join(FLEET_ROSTER_FILE);
-        let text = "[[account]]\nlabel='old'\nemail='old@example.test'\nmachines=['m27']\n";
-        fs::write(&source, text).unwrap();
-        if hard {
-            fs::hard_link(&source, desk.fleet_file()).unwrap();
-        } else {
-            std::os::unix::fs::symlink(&source, desk.fleet_file()).unwrap();
-        }
-        let env = quiet_env(
-            &desk.home,
-            &desk.state,
-            &desk.config.join("aterm.toml"),
-            NOW,
-        );
-        let result = local_fleet_edit(
-            &env,
-            &desk.fleet_file(),
-            &Row {
-                label: "new".into(),
-                email: Some("new@example.test".into()),
-                ..Row::default()
-            },
-        );
-        assert!(result.unwrap_err().contains("aliases"));
-        assert_eq!(fs::read_to_string(source).unwrap(), text);
-    }
+    let desk = Desk::new("m27");
+    let secrets = desk.home.join(".secrets");
+    fs::create_dir(&secrets).unwrap();
+    let backup = secrets.join(FLEET_ROSTER_FILE);
+    let text = "[[account]]\nlabel='old'\nemail='old@example.test'\nmachines=['m27']\n";
+    fs::write(&backup, text).unwrap();
+    std::os::unix::fs::symlink(&backup, desk.fleet_file()).unwrap();
+    let env = quiet_env(
+        &desk.home,
+        &desk.state,
+        &desk.config.join("aterm.toml"),
+        NOW,
+    );
+    let result = local_fleet_edit(
+        &env,
+        &desk.fleet_file(),
+        &Row {
+            label: "new".into(),
+            email: Some("new@example.test".into()),
+            ..Row::default()
+        },
+    );
+    assert!(result.unwrap_err().contains("~/.secrets"));
+    assert_eq!(fs::read_to_string(backup).unwrap(), text);
 }

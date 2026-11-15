@@ -402,6 +402,7 @@ fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
                 number: None,
                 nick: None,
             },
+            origin: Origin::Panel,
         })
         .expect("queues");
     }
@@ -428,7 +429,7 @@ fn the_writer_applies_number_and_nickname_requests_in_submission_order() {
                     .expect("sets a nickname")
                     .name
             }
-            NameChange::Synchronize(_) | NameChange::SynchronizeCurrent => {
+            NameChange::Synchronize(_) | NameChange::SynchronizeCurrent | NameChange::Undo(_) => {
                 unreachable!("this writer-order fixture queues edits only")
             }
         };

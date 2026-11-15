@@ -100,3 +100,11 @@ name = "rewind"
 path = "benches/rewind.rs"
 harness = false
 test = false
+
+# The size row: the release executable's slice for this Mac against its ceiling, with
+# ATERM_SIZE_BIN (or ATERM_PAINT_BIN). It reads the file and launches nothing.
+[[bench]]
+name = "size"
+path = "benches/size.rs"
+harness = false
+test = false

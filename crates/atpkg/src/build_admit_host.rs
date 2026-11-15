@@ -315,7 +315,7 @@ impl Jobs {
             command,
             configured,
         };
-        let (mut owned, failure) = launch_held(Some(&mut held), restore.command)?;
+        let (mut owned, failure) = launch_held(Some(&mut held), restore.command, None)?;
         let meter = TreeMeter::start(owned.child_mut().id());
         let id = JobId {
             table: Arc::clone(&self.seal),
@@ -638,7 +638,9 @@ struct NativeJob {
 
 impl NativeJob {
     fn dispatch(&mut self, command: &mut spawnfd::Command) {
-        self.dispatch_with(command, |held, command| launch_held(Some(held), command));
+        self.dispatch_with(command, |held, command| {
+            launch_held(Some(held), command, None)
+        });
     }
 
     fn dispatch_with(

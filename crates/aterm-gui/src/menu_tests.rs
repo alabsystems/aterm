@@ -394,7 +394,7 @@ fn the_agents_rows_grey_from_their_live_bits() {
             "{a:?} greys without its fact"
         );
     }
-    assert!(native_menu_action_enabled(MenuAction::SummarizeFleet));
+    assert!(!native_menu_action_enabled(MenuAction::SummarizeFleet));
     assert!(
         native_menu_action_enabled(MenuAction::ReadThisMac),
         "always live"
@@ -402,7 +402,7 @@ fn the_agents_rows_grey_from_their_live_bits() {
     assert_eq!(native_item_tip(MenuAction::SummarizeFleet), None);
     set_agents_live(AgentsLive {
         needs_local: true,
-        in_fleet: true,
+        in_fleet: Some(true),
         any_window: true,
         summarize_block: Some("(claude not found)".to_string()),
     });
@@ -422,12 +422,22 @@ fn the_agents_rows_grey_from_their_live_bits() {
     );
     assert_eq!(
         native_live_title(MenuAction::SummarizeFleet),
-        Some(super::summarize_title(true))
+        Some(super::summarize_title(Some(true)))
     );
     set_agents_live(quiet);
     assert_eq!(
         native_live_title(MenuAction::SummarizeFleet),
-        Some(super::summarize_title(false))
+        Some(super::summarize_title(None))
+    );
+    set_agents_live(AgentsLive {
+        in_fleet: Some(false),
+        ..AgentsLive::default()
+    });
+    assert!(native_menu_action_enabled(MenuAction::SummarizeFleet));
+    assert!(!native_menu_action_enabled(MenuAction::ReadFleet));
+    assert_eq!(
+        native_live_title(MenuAction::SummarizeFleet),
+        Some(super::summarize_title(Some(false)))
     );
     set_agents_live(AgentsLive::UNPUBLISHED);
 }

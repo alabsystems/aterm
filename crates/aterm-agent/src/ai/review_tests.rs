@@ -142,6 +142,25 @@ fn only_a_failed_run_is_read_for_a_lost_login() {
     assert_eq!(verdict_of(&CLAUDE, &failed, None, "n", "").0, Verdict::Auth);
     let codex = Ok(ran(1, "", "ERROR: unexpected status 401 Unauthorized"));
     assert_eq!(verdict_of(&CODEX, &codex, None, "n", "").0, Verdict::Auth);
+    // Cloudflare's block page in the API's place, which Claude Code 2.1.323 words as a lost
+    // login: a failed run, never a login's end.
+    let edge = Ok(ran(
+        1,
+        "",
+        "Please run /login · API Error: 403 Attention Required! | Cloudflare",
+    ));
+    assert_eq!(verdict_of(&CLAUDE, &edge, None, "n", "").0, Verdict::Failed);
+    let under = Ok(ran(
+        1,
+        "",
+        "Error: the turn did not finish\nPlease run /login · API Error: 403 Attention Required! | \
+         Cloudflare",
+    ));
+    assert_eq!(
+        verdict_of(&CLAUDE, &under, None, "n", "").0,
+        Verdict::Failed,
+        "the page on a line of its own under another"
+    );
     let limit = Ok(ran(
         1,
         "",
@@ -286,6 +305,7 @@ fn claude_account(login: Option<&str>) -> ClaudeAccounts {
         made: true,
         state: Some("ok"),
         renew_by: None,
+        on_token_until: None,
         limited_until: None,
         served_at: None,
         renewed_at: None,

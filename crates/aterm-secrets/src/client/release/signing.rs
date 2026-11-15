@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Automatic import and proof of the Developer ID pair delivered by the admitted vault.
+//! Automatic import and proof of the Developer ID pair the admitted vault holds, read in place
+//! from the store: the pair is one set from one verified version, and no file under the home is
+//! read.
 
-use super::super::entry::read_signing_material;
 use super::*;
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 const RETRY: Duration = Duration::from_secs(60);
@@ -50,6 +50,12 @@ impl ProofRecord {
     }
 }
 
+/// The SHA-256 of `bytes`, hex: the proof record's digests, spelled as older builds spelled them
+/// so a record either build wrote keeps its meaning for the other.
+fn hex_digest(bytes: &[u8]) -> String {
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
+}
+
 fn now() -> crate::Result<u64> {
     aterm_time::unix_secs().ok_or_else(|| Error::new("signing proof clock is unavailable"))
 }
@@ -85,7 +91,7 @@ fn local_stamp(paths: &Paths) -> crate::Result<Option<String>> {
         meta.len(),
         meta.mtime(),
         meta.mtime_nsec(),
-        materialize::digest_hex(password.as_slice())
+        hex_digest(password.as_slice())
     )))
 }
 
@@ -127,12 +133,7 @@ pub fn signing_status(paths: &Paths) -> crate::Result<SigningStatus> {
             "no vault is configured".into(),
         ));
     };
-    if !alab_vault(&config)
-        && !matches!(
-            fsx::kind(&paths.home.join(RELEASE_PROFILE)),
-            Ok(fsx::Kind::File)
-        )
-    {
+    if !alab_vault(&config) && read_verified_entry(paths, &config, RELEASE_PROFILE)?.is_none() {
         return Ok(SigningStatus::NotApplicable(
             "this vault has no shared release ring".into(),
         ));
@@ -147,7 +148,7 @@ fn status_authorized(
 ) -> crate::Result<SigningStatus> {
     if !authorized {
         return Ok(SigningStatus::Pending(
-            "awaiting a private matching release profile/key and current master-signed roster"
+            "awaiting the store's matching release profile/key and current master-signed roster"
                 .into(),
         ));
     }
@@ -166,7 +167,7 @@ fn status_with(paths: &Paths, config: &Config) -> crate::Result<SigningStatus> {
             material.identity
         )))
     } else {
-        Ok(SigningStatus::Pending("authorized signing files present; automatic keychain repair and signature proof pending".into()))
+        Ok(SigningStatus::Pending("authorized signing material held; automatic keychain repair and signature proof pending".into()))
     }
 }
 
@@ -205,12 +206,12 @@ struct Material {
     stamp: String,
 }
 
-fn profile_identity(paths: &Paths) -> crate::Result<Option<String>> {
-    let profile = fsx::read_private(&paths.home.join(RELEASE_PROFILE), MAX_READ)?;
-    let Some(profile) = profile else {
+fn profile_identity(paths: &Paths, config: &Config) -> crate::Result<Option<String>> {
+    let Some(profile) = read_verified_entry(paths, config, RELEASE_PROFILE)? else {
         return Ok(None);
     };
     let text = profile
+        .value()
         .as_str()
         .ok_or_else(|| Error::new("release profile is not UTF-8"))?;
     let value: aterm_toml::Value =
@@ -247,33 +248,34 @@ fn certificate_identity(bytes: &[u8]) -> crate::Result<String> {
 }
 
 fn material(paths: &Paths, config: &Config) -> crate::Result<Option<Material>> {
-    let state = load_state(paths)?;
-    let wanted = profile_identity(paths)?;
+    let wanted = profile_identity(paths, config)?;
     let mut shared = None;
-    // Ownership is only a candidate index. Both tracked and adopted files must still match
-    // current authenticated entries, and an adopted file stays outside the manifest.
-    let names: BTreeSet<_> = state
-        .manifest
-        .files
-        .keys()
-        .chain(state.own.iter().flat_map(|names| names.iter()))
-        .collect();
-    for name in names {
+    // The candidates are the certificate names the verified view holds; each pair is read as one
+    // set from one version, in place.
+    let names = super::super::entry::held_names(paths, config)?.unwrap_or_default();
+    for name in &names {
         if !name.starts_with(crate::entry_class::APPLE_PREFIX) || !name.ends_with(".cer") {
             continue;
         }
         let key_name = format!("{}.key", name.strip_suffix(".cer").unwrap_or(name));
-        let Some(cert) = read_signing_material(paths, config, name)? else {
+        if !crate::entry_class::signing_material(name)
+            || !crate::entry_class::signing_material(&key_name)
+        {
+            continue;
+        }
+        let Some(pair) = read_verified_set(paths, config, &[name.as_str(), key_name.as_str()])?
+        else {
             continue;
         };
-        let Some(key) = read_signing_material(paths, config, &key_name)? else {
+        let mut pair = pair.into_iter().map(|entry| entry.into_parts().0);
+        let (Some(cert), Some(key)) = (pair.next(), pair.next()) else {
             continue;
         };
         let identity = certificate_identity(cert.as_slice())?;
         let stamp = format!(
             "{}:{}",
-            materialize::digest_hex(cert.as_slice()),
-            materialize::digest_hex(key.as_slice())
+            hex_digest(cert.as_slice()),
+            hex_digest(key.as_slice())
         );
         let pair = Material {
             cert,
@@ -294,13 +296,13 @@ fn material(paths: &Paths, config: &Config) -> crate::Result<Option<Material>> {
     Ok(shared)
 }
 
-/// The previously proven, currently authorized Apple identity for this exact local release
-/// profile. Keychain upkeep or an expired readiness receipt does not select a different
-/// identity: the cutter still checks its keychain and signs with it. This grants no current
-/// readiness and leaves the profile's bytes unchanged. An explicit unrelated profile never
-/// adopts this member's shared identity.
-pub fn effective_signing_identity(paths: &Paths, profile: &Path) -> crate::Result<Option<String>> {
-    effective_identity_with(paths, profile, authorized_ring_readonly(paths))
+/// The previously proven, currently authorized Apple identity for the store's release profile.
+/// Keychain upkeep or an expired readiness receipt does not select a different identity: the
+/// cutter still checks its keychain and signs with it. This grants no current readiness. A
+/// profile the operator names by file is not the store's and never adopts this member's shared
+/// identity, so the cutter asks this only of the store's.
+pub fn effective_signing_identity(paths: &Paths) -> crate::Result<Option<String>> {
+    effective_identity_with(paths, authorized_ring_readonly(paths))
 }
 
 /// The same selection under a fixture's roster anchors, with real ring authorization.
@@ -308,31 +310,19 @@ pub fn effective_signing_identity(paths: &Paths, profile: &Path) -> crate::Resul
 #[cfg(any(test, debug_assertions))]
 pub fn test_signing_observation(
     paths: &Paths,
-    profile: &Path,
     anchors: &[&str],
     at: i64,
 ) -> crate::Result<(Option<String>, SigningStatus)> {
     let authorized = authorized_ring_check(paths, anchors, at, false);
     let config = config(paths)?.ok_or_else(|| Error::new("fixture has no vault"))?;
     Ok((
-        effective_identity_with(paths, profile, authorized)?,
+        effective_identity_with(paths, authorized)?,
         status_authorized(paths, &config, authorized)?,
     ))
 }
 
-fn effective_identity_with(
-    paths: &Paths,
-    profile: &Path,
-    authorized: bool,
-) -> crate::Result<Option<String>> {
-    let selected = paths.home.join(RELEASE_PROFILE);
-    let same_profile = matches!(fsx::kind(profile), Ok(fsx::Kind::File))
-        && matches!(fsx::kind(&selected), Ok(fsx::Kind::File))
-        && std::fs::canonicalize(profile)
-            .ok()
-            .zip(std::fs::canonicalize(selected).ok())
-            .is_some_and(|(a, b)| a == b);
-    if !same_profile || !authorized {
+fn effective_identity_with(paths: &Paths, authorized: bool) -> crate::Result<Option<String>> {
+    if !authorized {
         return Ok(None);
     }
     let Some(config) = config(paths)? else {
@@ -380,6 +370,8 @@ fn write_proof(paths: &Paths, material: &Material) -> crate::Result<()> {
     fsx::write_atomic(&paths.dir.join(PROOF), record.text().as_bytes(), 0o600)
 }
 
+/// Hand the pair to `security import`, which reads only files: the one place a vault value is on
+/// disk, a private temporary directory outside the home that is removed when this returns.
 fn prepare(paths: &Paths, material: &Material) -> crate::Result<()> {
     let dir = aterm_tempfile::tempdir()
         .map_err(|error| Error::new(format!("stage shared signing material: {error}")))?;

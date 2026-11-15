@@ -14,6 +14,7 @@ pub mod pack;
 pub mod package;
 pub mod pkgdoc;
 pub mod qualify;
+pub mod queue_clock;
 mod relink;
 pub mod relocate;
 pub mod sign;

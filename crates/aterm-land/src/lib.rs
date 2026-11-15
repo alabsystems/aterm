@@ -109,10 +109,18 @@ impl Watch {
     }
     /// A doomed tip requests interruption, never grants or invalidates a completed owner.
     /// An actual run that ends while a read is pending still decides by its own outcome.
+    ///
+    /// Main does not move back short of a force-push, so a tip the last composed one already
+    /// holds (`behind(tip, composed)`: its ancestor, as every ancestor of the base is) is a
+    /// stale read, another reader's older snapshot say, not news. The poll says so as `failed`
+    /// says a failed read, and neither tests it nor cuts for it: a cut would merge it, and
+    /// merging a tip the base holds merges nothing. A real rewind still meets the push, which
+    /// expects the main it composed onto.
     pub fn poll(
         &mut self,
         moot: Moot<'_>,
         refresh: &mut dyn FnMut(Moot<'_>) -> Result<String, String>,
+        behind: &mut dyn FnMut(&str, &str) -> Result<bool, String>,
         composition: &mut dyn FnMut(&str) -> Result<Composition, String>,
         failed: &mut dyn FnMut(&str),
     ) -> bool {
@@ -122,6 +130,12 @@ impl Watch {
         let read = refresh(&mut *moot).and_then(|tip| {
             if tip == self.composed {
                 return Ok(None);
+            }
+            if behind(&tip, &self.composed)? {
+                return Err(format!(
+                    "it read {tip}, which {} already holds: a stale read, or main was rewound",
+                    self.composed
+                ));
             }
             match composition(&tip)? {
                 Composition::Composes { .. }

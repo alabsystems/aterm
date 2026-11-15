@@ -44,6 +44,7 @@ const MARK_CAPACITY: usize = 17 + MAX_OWNERS * 17;
 pub(crate) struct JournalOwner {
     id: JournalOwnerId,
     sender: mpsc::Sender<Message>,
+    /// Sent once by the worker, after it has dropped the owner's lease ([`start_worker`]).
     #[cfg(test)]
     finished: Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
 }
@@ -55,7 +56,7 @@ impl JournalOwner {
 
     /// Answers once this owner's custody worker has run every release and dropped its lease.
     #[cfg(test)]
-    pub(crate) fn finished_for_test(&self) -> Arc<std::sync::Mutex<mpsc::Receiver<()>>> {
+    pub(super) fn finished_for_test(&self) -> Arc<std::sync::Mutex<mpsc::Receiver<()>>> {
         Arc::clone(&self.finished)
     }
 }
@@ -146,6 +147,22 @@ impl Custody {
             return;
         };
         pin.settle(&owners, image, clean, Some(owner));
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static INSIDE_SETTLE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl JournalOwner {
+    /// Run `then` once on this owner's custody worker, inside the journal lock of the next
+    /// image it settles: a release slowed while it holds that lock.
+    pub(crate) fn inside_next_settle_for_test(&self, then: impl FnOnce() + Send + 'static) {
+        self.run(move |_| INSIDE_SETTLE.with(|hook| *hook.borrow_mut() = Some(Box::new(then))))
+            .expect("journal custody worker took the hook");
     }
 }
 
@@ -611,7 +628,11 @@ impl Candidate {
             stamp,
             ..
         } = self;
-        with_journal_lock(&path, JournalLockPatience::Sweep, || {
+        with_journal_lock::<_, String>(&path, JournalLockPatience::Sweep, || {
+            #[cfg(test)]
+            if let Some(then) = INSIDE_SETTLE.with(|hook| hook.borrow_mut().take()) {
+                then();
+            }
             if !sys::stamp_at(&path).is_ok_and(|now| now == stamp) {
                 return Ok(false);
             }
@@ -784,7 +805,7 @@ fn sweep_leftover(root: &Path, name: &str) -> bool {
     }
     let image_path = root.join(image);
     let leftover = root.join(name);
-    with_journal_lock(&image_path, JournalLockPatience::Sweep, || {
+    with_journal_lock::<_, String>(&image_path, JournalLockPatience::Sweep, || {
         let image_gone = fs::symlink_metadata(&image_path).is_err();
         if !temporary && !image_gone {
             return Ok(false);
@@ -1177,7 +1198,7 @@ mod sys {
 
 #[cfg(test)]
 #[path = "native_document_journal_owner_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 thread_local! { static FORBID_FS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }

@@ -222,7 +222,7 @@ fn admitted_http_join_rechecks_under_the_apply_lock_after_its_own_source_publica
         "{joined:?}"
     );
     assert_eq!(
-        std::fs::read(paths.home.join(".secrets/fixture-token")).unwrap(),
+        crate::client::stored(&paths, "fixture-token").unwrap(),
         b"fixture-value"
     );
     server.stop();
@@ -5028,7 +5028,7 @@ fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
         "{logged:?}"
     );
     assert_eq!(
-        std::fs::read(mb.home.join(".secrets/token")).expect("materialized"),
+        crate::client::stored(&mb, "token").expect("materialized"),
         b"inert-token"
     );
     assert_eq!(
@@ -5735,4 +5735,122 @@ fn the_members_asking_rings_as_what_its_worker_reads_moves() {
     assert!(!bell.clear(), "a round that moved nothing rings nothing");
     asked.telling(MembersAsked::ended);
     assert!(bell.clear(), "a wait ended rings");
+}
+
+/// A SUBSCRIBER'S PROJECTION HANDS EACH RUNNER THE NOTE OF WHY IT STARTS: the runner command
+/// built inside its start carries [`crate::converge::START_NOTE_ENV`] and nothing else, set to
+/// the start's note as the projection's own update made it. The first start says `start` and
+/// `recheck`; an input look that asked for a repair with the index moved says `input-repair`,
+/// `m=index`, `n=1`; a runner that found the lock held is reaped with its CPU and the retry 5 s
+/// later says what that held start was owed for, `retry-held`, one held start, its CPU, the 5 s
+/// waited and the same class.
+/// NEGATIVE CONTROL: a projection that starts its runner under an empty note
+/// (`noting(&StartNote::default(), …)`) builds commands that carry no variable: the first
+/// start's is `[]` where `[("ATERM_CONVERGE_START", Some("c=start+recheck"))]` is wanted.
+#[cfg(unix)]
+#[test]
+fn a_projection_hands_each_runner_the_note_of_why_it_starts() {
+    use crate::converge::{MarkMoved, RepositoryRequest};
+    use std::sync::atomic::AtomicU64;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&root.path().join("noted"));
+    let config = paths.home.join(".config/aterm/aterm.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = true\n");
+    let asked = std::sync::Arc::new(AtomicBool::new(false));
+    let asks = std::sync::Arc::clone(&asked);
+    let moved = std::sync::Arc::clone(&asked);
+    let inputs = ConvergenceInputs::new(Box::new(move |_| {
+        asks.load(Ordering::SeqCst)
+            .then_some(RepositoryRequest::Repair)
+    }))
+    .with_moved(Box::new(move || {
+        if moved.swap(false, Ordering::SeqCst) {
+            (MarkMoved::INDEX, 1)
+        } else {
+            (MarkMoved::default(), 0)
+        }
+    }));
+    let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    // How each runner ends: it ran; it found the lock held, after spending CPU enough that its
+    // reap measures some; it ran.
+    let ends = std::sync::Mutex::new(std::collections::VecDeque::from([
+        "exit 0",
+        "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; exit 75",
+        "exit 0",
+    ]));
+    let notes = std::sync::Mutex::new(Vec::new());
+    let start = |exe: &Path, request: RepositoryRequest| {
+        let command = crate::converge::runner_requested(exe, crate::converge::SUBSCRIBER, request);
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        notes.lock().unwrap().push(envs);
+        let end = ends.lock().unwrap().pop_front().expect("a scripted runner");
+        let mut child = aterm_uds::spawnfd::command(&sh)
+            .args(["-c", end])
+            .spawn()
+            .unwrap();
+        child.wait_exited().unwrap();
+        Some(child)
+    };
+    let ports = Converging {
+        start: &start,
+        routes: &|| [None; 3],
+    };
+    let now = AtomicU64::new(0);
+    let projection = projection::Projection::observing(&paths, &ports, inputs)
+        .at_clock(|| now.load(Ordering::SeqCst));
+    let noted = |word: &str| {
+        vec![(
+            crate::converge::START_NOTE_ENV.to_owned(),
+            Some(word.to_owned()),
+        )]
+    };
+    projection.start();
+    assert_eq!(*notes.lock().unwrap(), [noted("c=start+recheck")]);
+    asked.store(true, Ordering::SeqCst);
+    projection.poll();
+    asked.store(false, Ordering::SeqCst);
+    assert_eq!(
+        notes.lock().unwrap()[1..],
+        [noted("c=input-repair,m=index,n=1")]
+    );
+    projection.poll();
+    assert_eq!(
+        notes.lock().unwrap().len(),
+        2,
+        "a held runner's retry waits"
+    );
+    now.store(crate::converge::FIRST_RETRY_MS, Ordering::SeqCst);
+    projection.poll();
+    let notes = notes.lock().unwrap().clone();
+    assert_eq!(notes.len(), 3, "{notes:?}");
+    let [(name, Some(word))] = notes[2].as_slice() else {
+        panic!("one variable, set: {notes:?}");
+    };
+    assert_eq!(name, crate::converge::START_NOTE_ENV);
+    let fields: Vec<&str> = word.split(',').collect();
+    let [causes, held, held_cpu, waited, classes, looks] = fields.as_slice() else {
+        panic!("every field: {word}");
+    };
+    assert_eq!(
+        [*causes, *held, *waited, *classes, *looks],
+        [
+            "c=input-repair+retry-held",
+            "h=1",
+            "w=5000",
+            "m=index",
+            "n=1"
+        ],
+        "{word}"
+    );
+    let held_cpu: u64 = held_cpu.strip_prefix("hc=").unwrap().parse().unwrap();
+    assert!(held_cpu >= 1, "{word}");
 }

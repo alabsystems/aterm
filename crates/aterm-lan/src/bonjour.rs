@@ -43,11 +43,17 @@ pub(crate) trait Live {
 }
 
 /// Drive `live` for the client on `stream` until the client hangs up (or sends anything, which a
-/// connection past its request may not), a send to it fails, or the operation fails.
+/// connection past its request may not), a send to it fails, or the operation fails. `heard` is
+/// called once for each batch the operation heard, before the batch is sent: a standing
+/// operation's thread may never end, so its CPU time is added to the broker's counts there.
 ///
 /// # Errors
 /// The operation's failure, for the client to hear.
-pub(crate) fn drive(stream: &CtlStream, live: &mut dyn Live) -> Result<(), Failure> {
+pub(crate) fn drive(
+    stream: &CtlStream,
+    live: &mut dyn Live,
+    heard: &mut dyn FnMut(),
+) -> Result<(), Failure> {
     loop {
         let ready = aterm_uds::ready::either(live.fd(), stream.as_fd())
             .map_err(|error| (libc::EIO, error.to_string()))?;
@@ -55,7 +61,9 @@ pub(crate) fn drive(stream: &CtlStream, live: &mut dyn Live) -> Result<(), Failu
             return Ok(());
         }
         if ready.first {
-            for event in live.process()? {
+            let events = live.process()?;
+            heard();
+            for event in events {
                 if wire::send(stream, &Frame::Event(event)).is_err() {
                     return Ok(());
                 }

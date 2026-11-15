@@ -70,15 +70,15 @@ pub(crate) fn policy_check(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         rows,
     } = judge(&dir, &name, &home, agh_dir);
     let adoption = match (&ctx.dirs, inv.flag("--config")) {
-        (Some(dirs), None) => vault::view(dirs, &*ctx.env),
+        (Some(dirs), None) => vault::view(dirs),
         _ => None,
     };
     let adopted = adoption
         .as_ref()
         .map(|adoption| {
             faults.extend_from_slice(adoption.faults());
-            faults.extend(unusable_faults(adoption, &home));
-            adopted_rows(adoption, &home, &ctx.redactor)
+            faults.extend(unusable_faults(adoption));
+            adopted_rows(adoption, &ctx.redactor)
         })
         .unwrap_or_default();
     let mut value = report(
@@ -145,10 +145,10 @@ pub(crate) fn policy_check(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// A `file` fault for each vault token adoption cannot use because its file fails the
-/// private-file or token rules, with its remedy: a token that would route is never quietly
+/// A `file` fault for each vault token adoption cannot use because its entry fails the token
+/// rules or the store cannot be read, with its remedy: a token that would route is never quietly
 /// left out (design §6.2).
-fn unusable_faults(adoption: &vault::Adoption, home: &Path) -> Vec<ConfigFault> {
+fn unusable_faults(adoption: &vault::Adoption) -> Vec<ConfigFault> {
     adoption
         .vaulted()
         .iter()
@@ -156,9 +156,9 @@ fn unusable_faults(adoption: &vault::Adoption, home: &Path) -> Vec<ConfigFault> 
             Found::Unusable { slug, why, remedy } => Some(ConfigFault {
                 rule: "file",
                 what: format!(
-                    "vault token {} ({}) is not used: {slug}: {why}{}",
+                    "vault token {} (vault entry {}) is not used: {slug}: {why}{}",
                     vaulted.slot.profile(),
-                    tilde(&vaulted.token_file, home),
+                    vaulted.slot.entry(),
                     remedy
                         .as_deref()
                         .map_or_else(String::new, |r| format!("; remedy: {r}"))
@@ -169,14 +169,14 @@ fn unusable_faults(adoption: &vault::Adoption, home: &Path) -> Vec<ConfigFault> 
         .collect()
 }
 
-/// One row per vault token found with no agh.toml (design §6.10), as the record and the files
-/// stand (`vault::view`: nothing is asked of GitHub): its profile, tier, file, the owner and
-/// login it routes as once adopted, and its state, `adopted`, `pending` (its login is learned
-/// on the next call that routes), `rotated` (the file holds another token than the one
+/// One row per vault token found with no agh.toml (design §6.10), as the record and the store
+/// stand (`vault::view`: nothing is asked of GitHub): its profile, tier, vault entry, the owner
+/// and login it routes as once adopted, and its state, `adopted`, `pending` (its login is learned
+/// on the next call that routes), `rotated` (the entry holds another token than the one
 /// recorded: the next call that routes learns its login again, and refuses it if the login
 /// changed), `unusable` (with why and the remedy), `faulted` (its rows break a rule beside the
 /// others, with the step that fixes the cause) or `changed`.
-fn adopted_rows(adoption: &vault::Adoption, home: &Path, redactor: &Redactor) -> Vec<Value> {
+fn adopted_rows(adoption: &vault::Adoption, redactor: &Redactor) -> Vec<Value> {
     let text = |s: &str| Value::from(redactor.apply(s));
     adoption
         .vaulted()
@@ -223,7 +223,7 @@ fn adopted_rows(adoption: &vault::Adoption, home: &Path, redactor: &Redactor) ->
             row.insert("remedy".into(), remedy.as_deref().map_or(Value::Null, text));
             row.insert("state".into(), Value::from(state));
             row.insert("tier".into(), Value::from(vaulted.slot.tier().slug()));
-            row.insert("token_file".into(), text(&tilde(&vaulted.token_file, home)));
+            row.insert("entry".into(), Value::from(vaulted.slot.entry()));
             row.insert("why".into(), why.as_deref().map_or(Value::Null, text));
             Some(Value::Object(row))
         })
@@ -393,7 +393,7 @@ fn edit_grant(ctx: &mut Ctx, inv: &Invocation, add: bool) -> Result<Outcome> {
             "no config directory: agh cannot provision here",
         ));
     };
-    let (change, repos) = write_grant(&dirs, &*ctx.env, caller, &slug, add)?;
+    let (change, repos) = write_grant(&dirs, caller, &slug, add)?;
     let mut value = writer_row(caller, &repos, &ctx.redactor);
     if let Some(object) = value.as_object_mut() {
         object.insert("change".into(), Value::from(change));
@@ -419,7 +419,6 @@ const AUTH_EDIT_BUSY: &str = "another agh auth edit is in progress";
 #[cfg(unix)]
 fn write_grant(
     dirs: &config::Dirs,
-    env: &dyn crate::identity::EnvSource,
     caller: &str,
     slug: &Slug,
     add: bool,
@@ -434,7 +433,7 @@ fn write_grant(
         if !add {
             return Err(missing());
         }
-        Some(first_grant_seed(dirs, env)?)
+        Some(first_grant_seed(dirs)?)
     } else {
         None
     };
@@ -514,12 +513,12 @@ fn write_grant(
 /// Preserve absent-file routing: only already-recorded, healthy vault identities can seed
 /// the first explicit grant. This view neither learns a login nor writes its record.
 #[cfg(unix)]
-fn first_grant_seed(dirs: &config::Dirs, env: &dyn crate::identity::EnvSource) -> Result<String> {
+fn first_grant_seed(dirs: &config::Dirs) -> Result<String> {
     let refused = || {
         Error::refused("a first grant needs healthy recorded vault identities")
             .with_next(config::POLICY_CHECK)
     };
-    let adoption = vault::view(dirs, env).ok_or_else(refused)?;
+    let adoption = vault::view(dirs).ok_or_else(refused)?;
     adoption.router()?;
     if !adoption.adopted_any()
         || !adoption.faults().is_empty()
@@ -557,12 +556,11 @@ fn create_grant_config(dirs: &config::Dirs, text: &str) -> Result<()> {
 #[cfg(not(unix))]
 fn write_grant(
     dirs: &config::Dirs,
-    env: &dyn crate::identity::EnvSource,
     caller: &str,
     slug: &Slug,
     add: bool,
 ) -> Result<(&'static str, Vec<String>)> {
-    let _ = (dirs, env, caller, slug, add);
+    let _ = (dirs, caller, slug, add);
     Err(Error::local(
         "agh reads and writes agh.toml only on unix, where its permissions are checked",
     ))

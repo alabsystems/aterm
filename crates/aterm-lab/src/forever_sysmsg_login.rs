@@ -53,11 +53,12 @@
 //!   [`super::streak_kept`], v6 §14.17.5.7), the notice or escalation down, then Cruise's own act
 //!   by its own back-off ([`go_on_by`]), or Land's landing ([`land_by`]).
 
+use alab_policy::config::TurnEndTiming;
 use aterm_agent::supervise::policy::login::{RULE_LOGIN_DONE, RULE_LOGIN_METHOD};
 use aterm_agent::supervise::policy::notice::{
     LOGIN_CANCELLED, LOGIN_CHOOSE, LOGIN_LEFT, LOGIN_NOT_RUN, NoticeText, WHY_PINNED,
 };
-use aterm_agent::supervise::policy::turn_end::{self, RULE_LOGIN, RULE_LOGIN_BACK, TurnEndTiming};
+use aterm_agent::supervise::policy::turn_end::{self, RULE_LOGIN, RULE_LOGIN_BACK};
 use aterm_phase::LoginMethod;
 
 use super::super::outage::{Act, acts_after, first_read};

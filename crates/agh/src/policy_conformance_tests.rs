@@ -17,7 +17,7 @@ use aterm_spec::xref::{self, StepEvidence};
 use super::*;
 use crate::config::{self, Dirs, OwnerRule, Validated};
 use crate::identity::vault::{self, Slot};
-use crate::identity::{self, Credential, MapEnv};
+use crate::identity::{self, Credential};
 use crate::test_fixtures::{setup_file, write_config};
 use crate::wire::door::AuthHeader;
 use crate::wire::hop;
@@ -205,8 +205,8 @@ fn world(dev: bool, rel: bool, relread: bool) -> World {
 }
 
 /// The router a call with no agh.toml builds (`vault::view`, as `vault::adopt` does once each
-/// login is recorded): the vault's dev token (login `fixture-dev`, so the dev owner is the
-/// model's tier 0) when `dev`, its release token when `rel`, and a record holding both logins,
+/// login is recorded), the store holding or lacking each entry: the vault's dev token (login
+/// `fixture-dev`, so the dev owner is the model's tier 0) when `dev`, its release token when `rel`, and a record holding both logins,
 /// as a machine whose tokens were adopted before has. Adoption's rows hold no chain that
 /// `relread` names, so it builds the same world either way.
 fn vault_world(dev: bool, rel: bool, relread: bool) -> World {
@@ -214,8 +214,6 @@ fn vault_world(dev: bool, rel: bool, relread: bool) -> World {
     let root = crate::test_fixtures::scratch_dir("wall-vault");
     let dirs = Dirs::under(root.path());
     std::fs::create_dir_all(&dirs.home).expect("the home");
-    aterm_uds::private_file::create_private_dir(&dirs.home.join(".secrets"))
-        .expect("the vault directory");
     let tokens = [
         (Slot::Dev, "dev", "fixture-dev", dev),
         (Slot::Release, "release", "fixture-release-bot", rel),
@@ -224,7 +222,11 @@ fn vault_world(dev: bool, rel: bool, relread: bool) -> World {
     for (slot, seed, login, present) in tokens {
         let token = agh_fake::token(seed);
         if present {
-            setup_file(&slot.path(&dirs.home), format!("{token}\n").as_bytes());
+            vault::put_entry_for_tests(
+                &dirs.home,
+                slot.entry(),
+                Some(format!("{token}\n").as_bytes()),
+            );
         }
         learned.push((slot, identity::fingerprint(token.as_bytes()), login));
     }
@@ -233,7 +235,7 @@ fn vault_world(dev: bool, rel: bool, relread: bool) -> World {
         .map(|(slot, fingerprint, login)| (*slot, fingerprint.as_str(), *login))
         .collect();
     vault::record_for_tests(&dirs, &rows).expect("the record");
-    let adoption = vault::view(&dirs, &MapEnv::new()).expect("no agh.toml: the vault adopts");
+    let adoption = vault::view(&dirs).expect("no agh.toml: the vault adopts");
     World {
         _root: root,
         router: adoption.router().expect("the adopted rows validate"),
@@ -265,24 +267,11 @@ fn world_of<'a>(worlds: &'a Worlds, state: &State) -> &'a World {
     &worlds[&key]
 }
 
-fn env(amb: bool) -> MapEnv {
-    if amb {
-        MapEnv::new().with("GH_TOKEN", &agh_fake::token("ambient"))
-    } else {
-        MapEnv::new()
-    }
-}
-
-fn decide(
-    router: &Router,
-    req: &RouteRequest,
-    env: &MapEnv,
-    ev: Option<&mut StepEvidence>,
-) -> Decision {
+fn decide(router: &Router, req: &RouteRequest, ev: Option<&mut StepEvidence>) -> Decision {
     let presence = |name: &str| {
         router
             .profile(name)
-            .map_or(Presence::Absent, |profile| identity::presence(profile, env))
+            .map_or(Presence::Absent, identity::presence)
     };
     match ev {
         Some(ev) => ev.step("Decide", || router.decide(req, &presence)),
@@ -366,22 +355,15 @@ fn conform(model: &Model, make: fn(bool, bool, bool) -> World, grants: bool) {
 
     for state in states.iter().filter(|s| var(s, "phase") == 0) {
         let world = world_of(&worlds, state);
-        let amb = env(var(state, "amb") == 1);
         let expected = successor(model, state, "Decide").expect("Decide fires in phase 0");
         let mut projected = BTreeSet::new();
         for req in requests(state, &world.router, grants) {
-            let decision = decide(&world.router, &req, &amb, Some(&mut ev));
+            let decision = decide(&world.router, &req, Some(&mut ev));
             let projection = project_decision(&decision);
             assert_eq!(
                 (expected["phase"], expected["used"]),
                 projection,
                 "{state:?}: {decision:?}"
-            );
-            let opposite = env(var(state, "amb") != 1);
-            let other = decide(&world.router, &req, &opposite, Some(&mut ev));
-            assert_eq!(
-                other, decision,
-                "GH_TOKEN changed the decision at {state:?}"
             );
             projected.insert(projection);
         }
@@ -469,9 +451,8 @@ fn conform(model: &Model, make: fn(bool, bool, bool) -> World, grants: bool) {
             var(state, "relread") == 1,
         );
         let router = &forged[&at];
-        let amb = env(var(state, "amb") == 1);
         for req in requests(state, router, grants) {
-            let decision = decide(router, &req, &amb, Some(&mut ev));
+            let decision = decide(router, &req, Some(&mut ev));
             let projection = project_decision(&decision);
             let next = with_decision(state, projection);
             for law in LAWS {
@@ -530,9 +511,8 @@ fn conform(model: &Model, make: fn(bool, bool, bool) -> World, grants: bool) {
         );
         let mut ungranted = state.clone();
         ungranted.insert("granted", 0);
-        let amb = env(var(state, "amb") == 1);
         for req in requests(&ungranted, text_router, false) {
-            let decision = decide(text_router, &req, &amb, None);
+            let decision = decide(text_router, &req, None);
             assert_eq!(
                 project_decision(&decision),
                 real[&key(&ungranted)],

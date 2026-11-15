@@ -292,16 +292,18 @@ fn end_after_unlinks(
     Some(wake)
 }
 
-/// `(pid, birth, sid)` of a FIFO's name, its sid `s-<hex>` of at most 64 characters.
+/// `(pid, birth, sid)` of a FIFO's name, its sid an ID aterm minted
+/// ([`aterm_types::control_verbs::is_minted_sid`]: a tab ID, or the `s-` and 20 hex digits a
+/// shell opened before the `t` form holds, whose FIFOs an earlier build left).
 fn name_parts(name: &str) -> Option<(u32, u64, &str)> {
     let uint = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let mut parts = name.splitn(3, '-');
     let pid = parts.next().filter(|s| uint(s))?.parse().ok()?;
     let birth = parts.next().filter(|s| uint(s))?.parse().ok()?;
-    let sid = parts.next()?;
-    let hex = sid.strip_prefix("s-")?;
-    (sid.len() <= 64 && !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-        .then_some((pid, birth, sid))
+    let sid = parts
+        .next()
+        .filter(|sid| aterm_types::control_verbs::is_minted_sid(sid))?;
+    Some((pid, birth, sid))
 }
 
 /// Positive evidence that the owner ended or its pid was reused. Identity reads can fail for a

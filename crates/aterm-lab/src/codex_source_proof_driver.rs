@@ -483,6 +483,69 @@ fn advance(guardian: &mut Guardian, generation: u64) -> Result<(), Fail> {
     }
 }
 
+// The qualification exports only closed phase/error categories, never arbitrary
+// SDK stderr, request/configuration payloads or credential values.
+fn retained_diagnostic(report: &str) -> bool {
+    if let Some(phase) = report.strip_prefix("Retained qualification: phase=") {
+        return matches!(
+            phase,
+            "independent-control"
+                | "startup-settings"
+                | "startup-settings-created"
+                | "physical-attachment"
+                | "physical-endpoint-received"
+                | "actual-config-request"
+                | "exec-with-live-work-and-uncommitted-result"
+                | "after-frontend-exec"
+                | "new-core-startup"
+                | "new-core-work-completed"
+                | "shared-client-application-boundary"
+                | "withdraw-frontend"
+        );
+    }
+    let Some((stage, kind)) = report
+        .strip_prefix("Retained qualification: failure-stage=")
+        .and_then(|body| body.split_once(" kind="))
+    else {
+        return false;
+    };
+    matches!(
+        stage,
+        "independent-control"
+            | "startup-create"
+            | "startup-wait"
+            | "attachment-create"
+            | "physical-receive"
+            | "bridge-handshake"
+            | "bridge-startup"
+            | "typed-config-read"
+            | "reexec-independent-control"
+            | "resume-original-operation"
+            | "new-config-read"
+    ) && matches!(
+        kind,
+        "NotFound"
+            | "PermissionDenied"
+            | "ConnectionRefused"
+            | "ConnectionReset"
+            | "ConnectionAborted"
+            | "NotConnected"
+            | "AddrInUse"
+            | "AddrNotAvailable"
+            | "BrokenPipe"
+            | "AlreadyExists"
+            | "WouldBlock"
+            | "InvalidInput"
+            | "InvalidData"
+            | "TimedOut"
+            | "WriteZero"
+            | "Interrupted"
+            | "UnexpectedEof"
+            | "Unsupported"
+            | "Other"
+    )
+}
+
 fn wait_host(host: &mut Child) -> Result<(), Fail> {
     let until = Instant::now() + MUST_HAPPEN;
     loop {
@@ -503,27 +566,14 @@ fn wait_host(host: &mut Child) -> Result<(), Fail> {
     }
 }
 
-pub fn cmd(args: &[String]) -> Res {
-    let mut args = args.to_vec();
-    let host_path = instance::take_value(&mut args, "--aterm")?.ok_or_else(|| {
-        Fail::usage("codex-source-proof requires --aterm <native_host debug fixture>")
-    })?;
-    let package_path = instance::take_value(&mut args, "--package")?.ok_or_else(|| {
-        Fail::usage("codex-source-proof requires --package <isolated debug SDK candidate>")
-    })?;
-    let keep = instance::take_flag(&mut args, "--keep");
-    if !args.is_empty() {
-        return Err(Fail::usage("codex-source-proof: unexpected arguments"));
-    }
-    let pkg = codex_alab_proof::package(Some(&package_path), paths::paths().need_store_home()?)?;
-    let fixture = NativeSourceProofWorld::new().map_err(Fail::die)?;
-    let world = instance::World::source_proof(&fixture).map_err(Fail::die)?;
-    let root = fixture.directory();
-    let copied = root.join("candidate");
+fn copy_candidate(
+    package: &std::path::Path,
+    copied: &std::path::Path,
+) -> Result<std::path::PathBuf, Fail> {
     let copy = aterm_uds::spawnfd::command("/bin/cp")
         .arg("-cR")
-        .arg(pkg)
-        .arg(&copied)
+        .arg(package)
+        .arg(copied)
         .stdin(Stdio::null())
         .status()
         .map_err(|_| Fail::die("source proof package copy failed"))?;
@@ -543,11 +593,61 @@ pub fn cmd(args: &[String]) -> Res {
             "package lacks explicit debug Source proof feature",
         ));
     }
+    Ok(executable)
+}
+
+pub fn cmd(args: &[String]) -> Res {
+    let mut args = args.to_vec();
+    let host_path = instance::take_value(&mut args, "--aterm")?.ok_or_else(|| {
+        Fail::usage("codex-source-proof requires --aterm <native_host debug fixture>")
+    })?;
+    let package_path = instance::take_value(&mut args, "--package")?.ok_or_else(|| {
+        Fail::usage("codex-source-proof requires --package <isolated debug SDK candidate>")
+    })?;
+    let keep = instance::take_flag(&mut args, "--keep");
+    let retained = instance::take_flag(&mut args, "--retained-service");
+    let replacement = instance::take_value(&mut args, "--replacement-package")?;
+    if replacement.is_some() && !retained {
+        return Err(Fail::usage(
+            "replacement package requires the retained qualification",
+        ));
+    }
+    if !args.is_empty() {
+        return Err(Fail::usage("codex-source-proof: unexpected arguments"));
+    }
+    let pkg = codex_alab_proof::package(Some(&package_path), paths::paths().need_store_home()?)?;
+    let fixture = NativeSourceProofWorld::new().map_err(Fail::die)?;
+    let world = instance::World::source_proof(&fixture).map_err(Fail::die)?;
+    let root = fixture.directory();
+    let copied = root.join("candidate");
+    let executable = copy_candidate(&pkg, &copied)?;
+    let replacement = replacement
+        .as_deref()
+        .map(|path| {
+            let package = codex_alab_proof::package(Some(path), paths::paths().need_store_home()?)?;
+            let replacement = copy_candidate(&package, &root.join("replacement"))?;
+            if crate::windows::sha256_file(&replacement)?
+                == crate::windows::sha256_file(&executable)?
+            {
+                return Err(Fail::usage(
+                    "replacement qualification requires different executable bytes",
+                ));
+            }
+            Ok(replacement)
+        })
+        .transpose()?;
     let copied_host = root.join("native-host");
     std::fs::copy(crate::paths::from_caller(&host_path), &copied_host)
         .map_err(|_| Fail::die("native Source fixture artifact unavailable"))?;
     fixture.publish().map_err(Fail::die)?;
-    let task = fixture.launch_task(&executable).map_err(Fail::die)?;
+    let task = if let Some(replacement) = &replacement {
+        fixture.retained_upgrade_task(&executable, replacement)
+    } else if retained {
+        fixture.retained_task(&executable)
+    } else {
+        fixture.launch_task(&executable)
+    }
+    .map_err(Fail::die)?;
     let task_file = root.join("source-proof.task");
     publish_task(root, &task).map_err(|_| Fail::die("source proof task write failed"))?;
     let guardian_path = root.join("proof-guardian.sock");
@@ -676,6 +776,9 @@ pub fn cmd(args: &[String]) -> Res {
         {
             return Err(Fail::die("source child mapped candidate changed"));
         }
+        if header["retained"].as_bool().unwrap_or(false) != retained {
+            return Err(Fail::die("source proof qualification kind changed"));
+        }
         let mut output = File::from(
             received
                 .fds
@@ -694,6 +797,43 @@ pub fn cmd(args: &[String]) -> Res {
                 .map_err(|_| Fail::die("source proof entropy unavailable"))?,
             counter: 0,
         };
+        if retained {
+            input
+                .write_all(b"RUN retained\n")
+                .map_err(|_| Fail::die("retained SDK start barrier failed"))?;
+            let until = Instant::now() + Duration::from_secs(120);
+            loop {
+                let fd = output.as_raw_fd();
+                let bytes = match line(&mut output, fd, SDK_REPLY_LIMIT) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        // Let the actual native owner report and settle its failure
+                        // before the outer driver resorts to bounded host cleanup.
+                        drop((input, output, guardian));
+                        let _ = wait_host(&mut host);
+                        return Err(error);
+                    }
+                };
+                let report = std::str::from_utf8(&bytes)
+                    .map_err(|_| Fail::die("invalid retained SDK output"))?
+                    .trim_end_matches('\r');
+                // Export only these fixed phase labels, never arbitrary SDK,
+                // configuration, credential or terminal output.
+                if retained_diagnostic(report) {
+                    eprintln!("{report}");
+                }
+                if report
+                    == "PASS retained SDK startup, physical attachment and actual configuration response"
+                {
+                    break;
+                }
+                if Instant::now() >= until {
+                    return Err(Fail::die("retained SDK report hang detector"));
+                }
+            }
+            drop((input, output, guardian));
+            return wait_host(&mut host);
+        }
         sdk_step(&mut input, &mut output, "startup")?;
         await_native(&mut guardian, 1)?;
         let primary = rebound_step(&mut input, &mut output, &mut guardian, 1, false, None)?;
@@ -760,9 +900,15 @@ pub fn cmd(args: &[String]) -> Res {
         println!("WORLD isolated_source_proof={}", kept.display());
     }
     result?;
-    println!(
-        "PASS joined Source SDK/native protocol; synthetic issuer only, no vendor or production SourceV1 activation"
-    );
+    if retained {
+        println!(
+            "PASS joined foreground retained SDK/native service; synthetic issuer only, no work preservation or production activation"
+        );
+    } else {
+        println!(
+            "PASS joined Source SDK/native protocol; synthetic issuer only, no vendor or production SourceV1 activation"
+        );
+    }
     Ok(0)
 }
 

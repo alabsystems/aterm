@@ -21,4 +21,6 @@ mod conformance_test_dispatch;
 mod gate_contract;
 mod profile_reuse;
 mod remote_cli;
+#[cfg(unix)]
+mod runtime_capture;
 mod tether_entry;

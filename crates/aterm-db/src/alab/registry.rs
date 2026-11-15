@@ -9,17 +9,19 @@
 //! collections each Mac states about itself (`machine-facts`, `mailbox-obs`) under the per-Mac
 //! quota.
 //!
-//! **Secrets are `Secret` cells** (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.7, §4.8): an
-//! address's `password` and a phone's `number` (version 2) hold an authenticated inner seal,
-//! masked on every surface and opened only through the audited reveal
-//! ([`crate::alab::secret::reveal`]); a column whose name says secret must be `Secret` (checked
-//! at compile time). A row whose `protected` cell is true holds no `Secret` cell
-//! ([`crate::typed::check::protected`]). The one column typed `email` is `address.addr`, masked
-//! on every surface; every other address is a reference to its `address` row, a mailbox's
-//! `login` included, and a mailbox's key derives from that login's key
-//! ([`keys::mailbox_pk`]). A phone's key is random, never a digest of the number: the importer
-//! finds a phone by opening its `number` cell. The version-1 `vault_ref` columns of `mailbox`
-//! and `phone` stay, unwritten, until every Mac reads version 2. An imported note's text goes in
+//! **Secrets** (docs/PLAN.md LT-04) are an address's `password` and a mailbox's
+//! `mailbox_password` and `totp`. In the first two generations, the ones builds up to 0.200.0
+//! read and every Mac holds until a roll, each is a sealed token in its cell (`Secret`), which no
+//! table view opens. From the third each is a `SecretRef` cell naming the `aterm secrets` entry
+//! that holds its value ([`crate::typed::secret`]): the value is never a cell there, so no table,
+//! history, export or page holds it. A column whose name says secret must be one of the two
+//! (checked at compile time). A row whose `protected` cell is true holds no secret
+//! ([`crate::typed::check::protected`]). Contacts are ordinary data: the one column typed
+//! `email`, `address.addr`, and a phone's `number` (typed `phone`) show as they are. Every other
+//! address is a reference to its `address` row, a mailbox's `login` included, and a mailbox's key
+//! derives from that login's key ([`keys::mailbox_pk`]). A phone's key is random, never a digest
+//! of the number, and the importer finds a phone by its `number`. The version-1 `vault_ref`
+//! columns of `mailbox` and `phone` stay unwritten. An imported note's text goes in
 //! the row's `note` only when the note guard passes it (design §0); a refused note and every
 //! losing value stay coordinates in `notes_src`.
 
@@ -319,14 +321,16 @@ pub fn held_machines(facts: &Value) -> Vec<&str> {
     held
 }
 
-crate::att_collection!(
-    /// A login or mail address, keyed `ad-<16hex>` from the address it was born with, which is
-    /// the one value typed `email` in the registry. A rename keeps the key, so a row is found
-    /// by what its `addr` says now ([`AddressIndex`]). Version 2 adds its mailbox `password`, a
-    /// `Secret`, which a `protected` row never holds.
-    pub ADDRESS = Collection {
+/// The `address` collection of a registry generation: version 3 (the third generation's)
+/// with its secret columns typed as this build reads them, or version 2, sealed, as builds up to
+/// 0.200.0 read the first and second generations.
+macro_rules! address_collection {
+    ($(#[$meta:meta])* $name:ident, $version:expr, $password:expr) => {
+        crate::att_collection!(
+            $(#[$meta])*
+            pub $name = Collection {
         name: "address",
-        version: 2,
+        version: $version,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "ad",
@@ -369,11 +373,31 @@ crate::att_collection!(
             note(),
             src(),
             notes_src(),
-            Column::new("password", Ty::Secret).null().since(2),
+            Column::new("password", $password).null().since(2),
         ],
         unique: &[&["addr"]],
         max_row: 0,
     }
+        );
+    };
+}
+
+address_collection!(
+    /// A login or mail address, keyed `ad-<16hex>` from the address it was born with, which is
+    /// the one value typed `email` in the registry. A rename keeps the key, so a row is found
+    /// by what its `addr` says now ([`AddressIndex`]). Version 2 adds its mailbox `password`;
+    /// version 3 makes it the name of its secret-store entry, which a `protected` row never names.
+    ADDRESS,
+    3,
+    Ty::SecretRef
+);
+
+address_collection!(
+    /// [`ADDRESS`] as the registry's first and second generations hold it: version 2, each secret
+    /// column a sealed token ([`Ty::Secret`]), the shape builds up to 0.200.0 read.
+    SEALED_ADDRESS,
+    2,
+    Ty::Secret
 );
 
 /// Which `address` row holds an address now. A rename keeps the row's `BirthSha256` key
@@ -803,19 +827,16 @@ fn safe(pk: &str) -> &str {
     keys::safe_key(pk)
 }
 
-crate::att_collection!(
-    /// A mailbox that receives codes, keyed `mb-<16hex>` from its login address's key
-    /// ([`keys::mailbox_pk`]). Version 2 adds `login`, that address row, whose own `password`
-    /// is the mailbox's login password (one fact, one cell); the `Secret`s `mailbox_password`
-    /// (a two-password webmail's second) and `totp` (the login's RFC 6238 seed or `otpauth://`
-    /// URI); and what `ai-mailbox.toml`'s `receives` said it receives: `receives`, the exact
-    /// addresses, and `receives_domains`, each `*@<domain>` as its domain and `*` as itself
-    /// (`harness/mailbox_routes.rs`); and its `imap_url` and `http_url`, `imap` and `http`, which
-    /// hold no user part. The version-1 `vault_ref` stays unwritten until every Mac reads
-    /// version 2.
-    pub MAILBOX = Collection {
+/// The `mailbox` collection of a registry generation: version 3 (the third generation's)
+/// with its secret columns typed as this build reads them, or version 2, sealed, as builds up to
+/// 0.200.0 read the first and second generations.
+macro_rules! mailbox_collection {
+    ($(#[$meta:meta])* $name:ident, $version:expr, $password:expr, $totp:expr) => {
+        crate::att_collection!(
+            $(#[$meta])*
+            pub $name = Collection {
         name: "mailbox",
-        version: 2,
+        version: $version,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "mb",
@@ -833,8 +854,8 @@ crate::att_collection!(
             row(),
             note(),
             Column::new("login", Ty::Ref("address")).null().since(2),
-            Column::new("mailbox_password", Ty::Secret).null().since(2),
-            Column::new("totp", Ty::Secret).null().since(2),
+            Column::new("mailbox_password", $password).null().since(2),
+            Column::new("totp", $totp).null().since(2),
             Column::new("receives", Ty::Set(&Ty::Ref("address"))).since(2),
             // A domain is no set element (its dots break the cell key's grammar): a list.
             Column::new("receives_domains", Ty::List(&Ty::Text(253), 64))
@@ -849,6 +870,32 @@ crate::att_collection!(
         unique: &[&["label"]],
         max_row: 0,
     }
+        );
+    };
+}
+
+mailbox_collection!(
+    /// A mailbox that receives codes, keyed `mb-<16hex>` from its login address's key
+    /// ([`keys::mailbox_pk`]). Version 2 adds `login`, that address row, whose own `password`
+    /// is the mailbox's login password (one fact, one cell); `mailbox_password` (a two-password
+    /// webmail's second) and `totp` (the login's RFC 6238 seed or `otpauth://` URI), which version 3
+    /// makes the names of their secret-store entries; and what `ai-mailbox.toml`'s `receives` said it receives: `receives`, the exact
+    /// addresses, and `receives_domains`, each `*@<domain>` as its domain and `*` as itself
+    /// (`harness/mailbox_routes.rs`); and its `imap_url` and `http_url`, `imap` and `http`, which
+    /// hold no user part. The version-1 `vault_ref` stays unwritten.
+    MAILBOX,
+    3,
+    Ty::SecretRef,
+    Ty::SecretRef
+);
+
+mailbox_collection!(
+    /// [`MAILBOX`] as the registry's first and second generations hold it: version 2, each secret
+    /// column a sealed token ([`Ty::Secret`]), the shape builds up to 0.200.0 read.
+    SEALED_MAILBOX,
+    2,
+    Ty::Secret,
+    Ty::Secret
 );
 
 crate::att_collection!(
@@ -905,14 +952,16 @@ crate::att_collection!(
     }
 );
 
-crate::att_collection!(
-    /// A phone, keyed `ph-<16 random hex>`, never a digest of the number: with the country
-    /// code and the last four digits known, an unkeyed hash falls to about 10⁶ guesses.
-    /// Version 2 holds the full number as a `Secret` (`number`, digits only); the importer
-    /// finds a phone by opening it, and `check` lists two rows holding one number by key.
-    pub PHONE = Collection {
+/// The `phone` collection of a registry generation: version 3 (the third generation's)
+/// with its secret columns typed as this build reads them, or version 2, sealed, as builds up to
+/// 0.200.0 read the first and second generations.
+macro_rules! phone_collection {
+    ($(#[$meta:meta])* $name:ident, $version:expr, $number:expr) => {
+        crate::att_collection!(
+            $(#[$meta])*
+            pub $name = Collection {
         name: "phone",
-        version: 2,
+        version: $version,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "ph",
@@ -928,11 +977,31 @@ crate::att_collection!(
             note(),
             src(),
             notes_src(),
-            Column::new("number", Ty::Secret).null().since(2),
+            Column::new("number", $number).null().since(2),
         ],
         unique: &[],
         max_row: 0,
     }
+        );
+    };
+}
+
+phone_collection!(
+    /// A phone, keyed `ph-<16 random hex>`, never a digest of the number: with the country
+    /// code and the last four digits known, an unkeyed hash falls to about 10⁶ guesses.
+    /// Version 2 adds the full number; version 3 holds it as ordinary data (`number`, typed
+    /// `phone`): the importer finds a phone by it, and `check` lists two rows holding one number.
+    PHONE,
+    3,
+    Ty::Phone
+);
+
+phone_collection!(
+    /// [`PHONE`] as the registry's first and second generations hold it: version 2, each secret
+    /// column a sealed token ([`Ty::Secret`]), the shape builds up to 0.200.0 read.
+    SEALED_PHONE,
+    2,
+    Ty::Secret
 );
 
 /// The account statuses, safest first for a conflict.
@@ -1165,8 +1234,11 @@ pub const DIFFER_COLLECTIONS: &[&str] = &[
 ];
 
 /// The columns of [`DIFFER_COLLECTIONS`] by name: a column is a name, never free text, so a
-/// `Secret` column's name passes where the free-text guard would refuse it. A column added
-/// later and not named here is reported by the import and left out of the source row.
+/// secret column's name passes where the free-text guard would refuse it. A column added
+/// later and not named here (a mailbox's `mailbox_password` and `totp`) is reported by the
+/// import and left out of the source row: the list is a source row's enum in every generation,
+/// and a word builds up to 0.200.0 do not know is one they cannot read in a generation they
+/// read.
 pub const DIFFER_COLUMNS: &[&str] = &[
     "account",
     "addr",
@@ -1336,11 +1408,11 @@ pub const COLLECTIONS: [&Collection; 16] = [
     &MODEL,
     &MACHINE,
     &MACHINE_FACTS,
-    &ADDRESS,
-    &MAILBOX,
+    &SEALED_ADDRESS,
+    &SEALED_MAILBOX,
     &MAILBOX_OBS,
     &ACCOUNT_OBS,
-    &PHONE,
+    &SEALED_PHONE,
     &ACCOUNT,
     &SUBACCOUNT,
     &AUTH_ROUTE,
@@ -1363,6 +1435,29 @@ pub const ROLE_2: &str = "registry.2";
 /// The second generation's collections: the first's, the rows a roll carries archived, and its
 /// cover rows.
 pub const COLLECTIONS_2: [&Collection; 18] = [
+    &PROVIDER,
+    &CLI,
+    &PLAN,
+    &MODEL,
+    &MACHINE,
+    &MACHINE_FACTS,
+    &SEALED_ADDRESS,
+    &SEALED_MAILBOX,
+    &MAILBOX_OBS,
+    &ACCOUNT_OBS,
+    &SEALED_PHONE,
+    &ACCOUNT,
+    &SUBACCOUNT,
+    &AUTH_ROUTE,
+    &PREFERENCE,
+    &SOURCE,
+    &ARCHIVED,
+    &ROLL,
+];
+
+/// The third generation's collections: the second's, with `address`, `mailbox` and `phone` at
+/// version 3, each secret column naming a secret-store entry and a phone number ordinary data.
+pub const COLLECTIONS_3: [&Collection; 18] = [
     &PROVIDER,
     &CLI,
     &PLAN,
@@ -1393,8 +1488,23 @@ pub const REGISTRY_2: Table = Table {
     ends: &["preference"],
 };
 
+/// The third generation's role: the first whose history holds no secret (docs/PLAN.md LT-04).
+pub const ROLE_3: &str = "registry.3";
+
+/// `alab/registry.3`: the second's collections as a roll restates them once every sealed value
+/// earlier generations hold has moved into the secret store, under a table scope of its own, so
+/// its audience key opens nothing of theirs. This build declares it and refuses that roll
+/// ([`crate::alab::Registry::roll`]).
+pub const REGISTRY_3: Table = Table {
+    application: APPLICATION,
+    role: ROLE_3,
+    collections: &COLLECTIONS_3,
+    self_quota: SELF_QUOTA,
+    ends: &["preference"],
+};
+
 /// The registry's generations, oldest first: generation `n` is `GENERATIONS[n - 1]`.
-pub const GENERATIONS: [&Table; 2] = [&REGISTRY, &REGISTRY_2];
+pub const GENERATIONS: [&Table; 3] = [&REGISTRY, &REGISTRY_2, &REGISTRY_3];
 
 /// The key a new grid row of `collection` is born under (design §5, §8), from the typed values
 /// the owner gave its cells: a mailbox's from its login address's key; a random key for a

@@ -5,8 +5,8 @@
 // for go ahead!"): the person's hour holds a park, and nothing the parked agent does ends it
 // early or keeps it past its end.
 
-use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
-use crate::supervise::policy::turn_end::GO_AHEAD_HELD;
+use alab_policy::go_ahead::GO_AHEAD_ANSWER;
+use alab_policy::words::GO_AHEAD_HELD;
 
 /// Recovery uses signed wall-clock stamps, including hostile extremes, without renewing an
 /// expired hour. A future stamp retains the existing conservative zero-age interpretation.
@@ -14,7 +14,7 @@ use crate::supervise::policy::turn_end::GO_AHEAD_HELD;
 fn hour_recovery_signed_stamps_preserve_only_the_remaining_hour() {
     use crate::supervise::approvals::{Outcome, Row};
     use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
-    use crate::supervise::policy::turn_end::RULE_GO_AHEAD_HOUR;
+    use alab_policy::words::RULE_GO_AHEAD_HOUR;
     let dir = crate::supervise::ScratchDir::new("go-ahead-hour", "signed-recovery");
     let path = dir.join("books.jsonl");
     let now_ms = 1_790_000_000_000_i64;
@@ -81,7 +81,7 @@ fn hour_recovery_monotonic_underflow_never_renews_an_expired_hour() {
 fn hour_recovery_after_a_cut_keeps_each_sessions_maximum_valid_start() {
     use crate::supervise::approvals::{self, Outcome, Row};
     use crate::supervise::fx::{ClockSource, Fx, VirtualClock};
-    use crate::supervise::policy::turn_end::RULE_GO_AHEAD_HOUR;
+    use alab_policy::words::RULE_GO_AHEAD_HOUR;
     let dir = crate::supervise::ScratchDir::new("go-ahead-hour", "cut-recovery");
     let path = dir.join("books.jsonl");
     let now_ms = 1_790_000_000_000_i64;

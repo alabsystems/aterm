@@ -1,4 +1,4 @@
-<!-- aterm skill v15 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v16 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # The aterm fabric: inbox, outbox and the halt
 
@@ -85,9 +85,12 @@ fleet` is the LAN across Macs.
 
 `aterm fabric` and `aterm link ls` show each session's `phase=`: a `busy` one reads mail only
 when it next looks, and a `prompt` or `question` one waits on somebody (in an aterm window
-its host answers; `aterm help harness`). A worker (Claude Code, codex-alab, agy or Muse
-Code) gets its task as its first prompt, not as mail: `aterm ctl @self spawn agent=claude -`
-with the task on stdin.
+its host answers; `aterm help harness`). Prefer your harness's native subagents for
+same-machine delegation and your own shell/background tools for commands and scripts.
+A new aterm session needs an explicit request or a concrete reason native tools cannot
+meet, such as another machine or a persistent interactive terminal; state that reason
+before spawning. For such a separate worker (Claude Code, codex-alab, agy or Muse Code),
+the task is its first prompt, not mail (`aterm help workers`).
 
 ## The halt
 

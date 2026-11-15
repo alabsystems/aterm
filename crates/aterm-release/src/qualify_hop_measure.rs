@@ -133,7 +133,6 @@ fn two_historical_trees() {
         .expect("retain prior measurements; choose a new root for a repeat");
     let started = Instant::now();
     let mut rows = Vec::new();
-    let mut prior_binaries = aterm_verify::testrun::Passed::new();
     for (index, head) in HEADS.into_iter().enumerate() {
         git(&repo, &["checkout", "--detach", head]);
         git(
@@ -230,16 +229,6 @@ fn two_historical_trees() {
                 "tests",
                 &["--unverified", "test", "--tests", "--no-run", "--workspace"],
             );
-            // Offer even the base's candidates directly to hop 2: a stronger adversarial
-            // input than the immediate-predecessor rule permits. Changed context must reject
-            // every one; the affected unbounded packages must execute regardless of context.
-            let offered = prior_binaries.len();
-            let proofs = out.join("prior-binaries.jsonl");
-            crate::durable::write_fresh(
-                &proofs,
-                aterm_verify::testrun::encode_passed(&prior_binaries).unwrap(),
-            )
-            .unwrap();
             let mut cmd = command(&verifier);
             cmd.current_dir(&repo)
                 .args(["release", "--tree", "--checks=test"])
@@ -249,11 +238,7 @@ fn two_historical_trees() {
                 .env(
                     aterm_toolchain::build_cache::BUILD_DIR_ENV,
                     target.join("build.noindex"),
-                )
-                .arg("--passed-binaries")
-                .arg(proofs)
-                .arg("--carry-context")
-                .arg(crate::check_content::item_context(&tool_set, "local-audit"));
+                );
             let log = crate::durable::create_fresh(&out.join("test.log")).unwrap();
             cmd.stdout(log.try_clone().unwrap()).stderr(log);
             let clock = Instant::now();
@@ -262,27 +247,11 @@ fn two_historical_trees() {
             let events = crate::check_record::events(&out.join("test.events.jsonl")).unwrap();
             assert!(events.whole());
             let executed = events.binaries.len();
-            let binary_outcomes = events.binaries.clone();
-            prior_binaries = events
-                .binaries
-                .into_iter()
-                .filter_map(|b| b.proof().map(|p| (p.spec.clone(), p)))
-                .collect();
-            let carried = std::fs::read_to_string(out.join("test.events.jsonl"))
-                .unwrap()
-                .lines()
-                .map(|s| s.strip_prefix("verify-event: ").unwrap_or(s))
-                .filter_map(|s| aterm_json::from_str::<aterm_json::Value>(s).ok())
-                .filter(|e| {
-                    e["event"].as_str() == Some("test-binary-finished")
-                        && e["carried"].as_bool() == Some(true)
-                })
-                .count();
+            let binary_outcomes = events.binaries;
             aterm_json::json!({"tools":tools,"compile":compile,"cutter_sha256":cutter_sha,
                 "verifier_sha256":verifier_sha,"tool_set_sha256":tool_set,"test_wall_s":execution_s,
                 "test_cpu_s":usage.cpu.as_secs_f64(),"test_success":usage.status.success(),
-                "offered_receipts":offered,"binary_rows":executed,"carried_binaries":carried,
-                "binary_outcomes":binary_outcomes})
+                "binary_rows":executed,"binary_outcomes":binary_outcomes})
         };
         let row = aterm_json::json!({"commit":commit,"tree":tree,"wall_s":start.elapsed().as_secs_f64(),"result":result});
         write(&out.join("result.json"), &row);
@@ -343,16 +312,6 @@ fn validate_results(mode: &str, rows: &[aterm_json::Value]) {
                 );
             }
         }
-        let previous: Vec<crate::check_record::Binary> =
-            aterm_json::from_str(&rows[0]["result"]["binary_outcomes"].to_string()).unwrap();
-        let candidates = previous.iter().filter(|b| b.proof().is_some()).count();
-        // A fail-fast base can stop before any bounded reader runs. Zero candidates is
-        // evidence, not an invalid experiment; it must never be invented into a carry.
-        assert_eq!(
-            rows[1]["result"]["offered_receipts"].as_u64(),
-            Some(candidates as u64)
-        );
-        assert_eq!(rows[1]["result"]["carried_binaries"].as_u64(), Some(0));
         assert_eq!(rows[1]["result"]["test_success"].as_bool(), Some(true));
         let current: Vec<crate::check_record::Binary> =
             aterm_json::from_str(&rows[1]["result"]["binary_outcomes"].to_string()).unwrap();
@@ -376,7 +335,7 @@ fn validate_results(mode: &str, rows: &[aterm_json::Value]) {
 }
 
 /// Read back the immutable reports without repeating compilation or any test execution.
-/// Negative controls corrupt a slice digest, a carried count and a failed base's pass flag.
+/// Negative controls corrupt a slice digest, the second take's pass flag and a failed base's.
 #[test]
 #[ignore = "explicit readback of two_historical_trees output"]
 fn saved_historical_reports() {
@@ -409,20 +368,6 @@ fn saved_historical_reports() {
             let stored: Vec<crate::check_record::Binary> =
                 aterm_json::from_str(&row["result"]["binary_outcomes"].to_string()).unwrap();
             assert_eq!(stored, events.binaries);
-            let carried = std::fs::read_to_string(&event_path)
-                .unwrap()
-                .lines()
-                .map(|s| s.strip_prefix("verify-event: ").unwrap_or(s))
-                .filter_map(|s| aterm_json::from_str::<aterm_json::Value>(s).ok())
-                .filter(|e| {
-                    e["event"].as_str() == Some("test-binary-finished")
-                        && e["carried"].as_bool() == Some(true)
-                })
-                .count();
-            assert_eq!(
-                row["result"]["carried_binaries"].as_u64(),
-                Some(carried as u64)
-            );
         }
     }
     let mut wrong = rows.to_vec();
@@ -439,7 +384,7 @@ fn saved_historical_reports() {
             .unwrap()
             .insert("sha256".into(), aterm_json::json!("00"));
     } else {
-        result.insert("carried_binaries".into(), aterm_json::json!(1));
+        result.insert("test_success".into(), aterm_json::json!(false));
     }
     assert!(std::panic::catch_unwind(|| validate_results(&mode, &wrong)).is_err());
     if mode == "tree" && rows[0]["result"]["test_success"].as_bool() == Some(false) {

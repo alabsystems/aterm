@@ -137,6 +137,10 @@ fn the_armed_seam_poisons_a_relaxed_log_at_its_first_escalated_record() {
         .publish(1, 3, "/e/a", b"escalated")
         .expect_err("its full flush failed");
     assert!(e.to_string().contains("durability flush failed"), "{e}");
+    assert!(
+        crate::bridge::outcome_unknown(&e),
+        "the bridge reads astream's own words as no answer: {e}"
+    );
     let why = broker.poisoned().expect("the log is poisoned");
     assert!(!why.is_empty());
     let refused = c.publish(1, 4, "/o/b", b"after").expect_err("poisoned");

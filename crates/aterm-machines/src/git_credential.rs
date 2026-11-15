@@ -137,35 +137,10 @@ impl Helper {
     /// The helper over the secrets registry's `gh:dev` entry; `None` while `user` has no
     /// nonempty executable installed command.
     pub(crate) fn vault(sys: &dyn System, user: &User) -> Option<Self> {
-        Self::run(sys, user, String::new())
-    }
-
-    /// The helper over `token_file` (the line of it `token_key` names, when one does), answering
-    /// as `account`; `None` while `user` has no usable installed command.
-    pub(crate) fn token_file(
-        sys: &dyn System,
-        user: &User,
-        account: &str,
-        token_file: &Path,
-        token_key: Option<&str>,
-    ) -> Option<Self> {
-        let word = crate::port::shell_word;
-        let mut options = format!(
-            " --dev-user {} --token-file {}",
-            word(account),
-            word(&token_file.to_string_lossy())
-        );
-        if let Some(key) = token_key {
-            options.push_str(&format!(" --token-key {}", word(key)));
-        }
-        Self::run(sys, user, options)
-    }
-
-    fn run(sys: &dyn System, user: &User, options: String) -> Option<Self> {
         let (launcher, _) = Self::target(sys, user).ok()?;
         Some(Self {
             value: format!(
-                "!{} secrets git-credential{options}",
+                "!{} secrets git-credential",
                 crate::port::shell_word(&launcher.to_string_lossy())
             ),
         })

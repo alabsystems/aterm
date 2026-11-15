@@ -12,6 +12,7 @@ use crate::{App, WindowId, restore};
 fn leaf(title: &str) -> restore::RestoredSplitTree {
     restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
         restore::TerminalLeafRestore {
+            pinned: false,
             sid: None,
             lineage: None,
             log_ep: None,
@@ -73,20 +74,24 @@ fn window(titles: &[&str], front: usize) -> restore::WindowLayout {
 }
 
 fn slice(app: &mut App) -> bool {
-    app.drain_restore_slice(Duration::ZERO, |app, first, wl, placed, filling| {
-        if first {
-            app.restore_bootstrap_window(wl, placed, Some(filling));
-        } else {
-            let wid = app.insert_logical_window(
-                crate::stub_session(app.next_session_id),
-                wl.rows,
-                wl.cols,
-            );
-            placed.shown.push((wid, wl.show));
-            app.fill_restored_window(wid, wl, Some(filling));
-        }
-        ControlFlow::Continue(())
-    })
+    app.drain_restore_slice(
+        Duration::ZERO,
+        |app, first, wl, placed, filling| {
+            if first {
+                app.restore_bootstrap_window(wl, placed, Some(filling));
+            } else {
+                let wid = app.insert_logical_window(
+                    crate::stub_session(app.next_session_id),
+                    wl.rows,
+                    wl.cols,
+                );
+                placed.shown.push((wid, wl.show));
+                app.fill_restored_window(wid, wl, Some(filling));
+            }
+            ControlFlow::Continue(())
+        },
+        |_, _| true,
+    )
 }
 
 fn drain(app: &mut App) {
@@ -180,7 +185,7 @@ fn a_cold_drain_lands_the_front_tab_second_and_ends_as_recorded() {
         slices += 1;
         assert!(app.restore_pass_queued());
     }
-    assert_eq!(slices + 1, 5, "one tab per slice");
+    assert!(slices >= 5, "the final re-grid also yields between leaves");
     assert_eq!(titles(&app, wid), ["A", "B", "C", "D", "E"]);
     assert_eq!(front(&app, wid), "D");
     assert!(app.restore_drain.is_none() && !app.restore_pass_queued());
@@ -1035,6 +1040,34 @@ struct TwoDoneWorkers {
     own: aterm_agent::harness::result::Snapshot,
     /// `W2`'s task file.
     own_task: std::path::PathBuf,
+    /// Another live instance serves `W1`'s earlier ID ([`served_elsewhere`]), held until the
+    /// desk drops.
+    _served: crate::identity_claim::RendezvousOverride,
+    _control: aterm_tempfile::TempDir,
+}
+
+/// A control directory in which another live instance on this Mac serves `sid` (its graph entry
+/// names a live pid that is not ours), so a cold restore cannot keep that ID for its leaf
+/// ([`crate::tab_ids::keep`]) and the leaf's tab comes back under a new one.
+fn served_elsewhere(
+    sid: &aterm_session::SessionId,
+) -> (
+    crate::identity_claim::RendezvousOverride,
+    aterm_tempfile::TempDir,
+) {
+    let control = aterm_tempfile::tempdir().expect("scratch control dir");
+    let served = crate::identity_claim::rendezvous_override(control.path());
+    std::fs::create_dir_all(control.path().join("graph")).expect("graph dir");
+    std::fs::write(
+        control.path().join("graph").join(sid.as_str()),
+        format!(
+            "sock /nonexistent/aterm.sock\nnonce {}\npid {}\n",
+            aterm_session::LaunchNonce::generate().to_hex(),
+            if cfg!(windows) { 4 } else { 1 }
+        ),
+    )
+    .expect("plant the live entry");
+    (served, control)
 }
 
 impl TwoDoneWorkers {
@@ -1048,11 +1081,13 @@ impl TwoDoneWorkers {
 }
 
 /// [`TwoDoneWorkers`], restored from a layout a crashed run left: `W1`'s leaf names the ID it
-/// had, whose task file no quit removed.
+/// had, whose task file no quit removed, and which another live instance serves now, so `W1`
+/// comes back under a new ID.
 fn two_done_workers(scratch: &std::path::Path) -> TwoDoneWorkers {
     use crate::task_record::{TaskMark, TaskState, cmd_result, mark_session_task};
     let wid = WindowId(0);
     let was = aterm_session::SessionId::generate();
+    let (served, control) = served_elsewhere(&was);
     let carried = stored_result(&was, 2, scratch);
     let left = task_file(&was);
     let mut app = App::headless_for_test();
@@ -1088,6 +1123,8 @@ fn two_done_workers(scratch: &std::path::Path) -> TwoDoneWorkers {
         carried,
         own,
         own_task,
+        _served: served,
+        _control: control,
     }
 }
 
@@ -1408,4 +1445,82 @@ fn the_restore_s_close_sweeps_no_layout_of_a_seamless_successor() {
     app.handoff_successor = false;
     app.close_restore_pass(&[], &tasks);
     assert!(!left.exists(), "CONTROL: a cold restore's close sweeps it");
+}
+
+/// A RESTORED WORKER IS TITLED BY ITS TASK'S FIRST LINE THOUGH ITS TASK FILE IS GONE (tracker
+/// ST-02): the quit removes the task file, which no restored session reads, so the line rides the
+/// task row the layout keeps, and the relaunched tab, at a prompt its shell titles by its folder,
+/// is named by it.
+#[test]
+fn a_restored_worker_is_titled_by_its_line_with_its_task_file_gone() {
+    const LINE: &str = "Fix the flaky title test";
+    let wid = WindowId(0);
+    let mut app = App::headless_for_test();
+    let mut wl = window(&["A", "W1"], 0);
+    parked_at(&mut wl, &[1]);
+    app.pending_restore = Some(restore::RestoreManifest::new(vec![wl]));
+    drain(&mut app);
+    let (w1, ctx) = worker(&app, wid, "W1").expect("W1 came back parked");
+    ctx.meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .user_title = None;
+    app.on_meta_changed(w1);
+    let task = task_file(&ctx.self_id);
+    ctx.timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .set_task_line(crate::task_record::task_line(
+            b"\n  Fix the flaky title test\nthen run verify\n",
+        ));
+    app.on_task_changed(w1);
+
+    assert!(matches!(
+        app.close_window_logical(wid),
+        crate::CloseOutcome::Exit
+    ));
+    let mut published = None;
+    app.settle_quit_desk_and_tasks(
+        |app| app.write_quit_desk_with(|_, _| Ok(())),
+        |_, quit| published.clone_from(&quit.published),
+    );
+    let layout = published.expect("the quit published its layout");
+    assert!(!task.exists(), "the quit took the task file");
+    let mut rows = Vec::new();
+    for window in &layout.windows {
+        for tab in &window.restored_tabs {
+            tab.root
+                .visit_terminals(&mut |leaf| rows.extend(leaf.task.clone()));
+        }
+    }
+    assert!(
+        rows.iter()
+            .any(|row| row.contains(" line=Fix%20the%20flaky%20title%20test")),
+        "the layout's task row carries the line: {rows:?}"
+    );
+
+    let mut next = App::headless_for_test();
+    next.pending_restore = Some(
+        restore::RestoreManifest::from_toml(&layout.to_toml().expect("the layout writes"))
+            .expect("the layout parses back"),
+    );
+    drain(&mut next);
+    let session = next.windows[&wid]
+        .tab_set
+        .parked()
+        .iter()
+        .find_map(|tab| {
+            next.view_store
+                .get(tab.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+        })
+        .expect("the worker came back parked");
+    let term = next.pool.get(session).expect("pooled").term.clone();
+    crate::term_lock(&term).process(&crate::app_workers_tests::prompt_in("~/demo-aterm"));
+    assert_eq!(
+        next.tab_label_of_session(session),
+        LINE,
+        "the restored worker is named by its line, not its folder or its agent"
+    );
 }

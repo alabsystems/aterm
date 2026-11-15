@@ -36,6 +36,45 @@ fn the_tag_round_trips_and_refuses_what_it_cannot_trust() {
     assert_eq!(Tag::decode(b"v=1\nslog_ep=-3\n").unwrap().slog_ep, None);
 }
 
+/// A tag names its tab in either form: an `s-` tag keeps its sid (the ID an earlier build's
+/// shell holds), a `t` tag is read, and a malformed sid of either form is dropped.
+#[test]
+fn a_tag_reads_a_tab_id_in_either_form_and_drops_a_malformed_one() {
+    let sid_of = |sid: &str| {
+        Tag::decode(format!("v=1\nsid={sid}\nowner=7\n").as_bytes())
+            .expect("v1")
+            .sid
+    };
+    // An `s-` tag keeps the looser shape earlier builds wrote (any hex, upper case too, at most 64
+    // characters): the tab's shell holds that ID, so it is read as written.
+    for kept in [
+        "s-1a2b3c4d5e6f70819203",
+        "s-1A2B3C4D5E6F70819203",
+        "tqn5r6e0148",
+        "t0000000000",
+    ] {
+        assert_eq!(sid_of(kept).as_deref(), Some(kept), "{kept}");
+        let tag = Tag {
+            sid: Some(kept.to_string()),
+            ..Tag::default()
+        };
+        assert_eq!(Tag::decode(&tag.encode()), Some(tag), "{kept} round-trips");
+    }
+    for malformed in [
+        "s-",
+        "s-xyz",
+        "S-1a2b",
+        "t",
+        "t000000000",
+        "t00000000000",
+        "T0000000000",
+        "tqn5r6e014u",
+        "tQN5R6E0148",
+    ] {
+        assert_eq!(sid_of(malformed), None, "{malformed}");
+    }
+}
+
 fn tag_under_the_wire_bound() -> bool {
     let long = Tag {
         sid: Some(format!("s-{}", "f".repeat(62))),

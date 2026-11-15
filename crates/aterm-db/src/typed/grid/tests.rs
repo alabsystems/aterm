@@ -174,12 +174,12 @@ fn registry_birth(
     move |collection, values| crate::alab::registry::birth(collection, values, cells)
 }
 
-/// An export masks every address unless the owner asks, and a save of the file as exported asks
-/// for nothing: no cell is written for a cell whose text did not change, masked ones included.
-/// NEGATIVE CONTROL: with `mask` returning the address whole, the masked export holds it:
-/// `` assertion failed: !masked.text.contains("ann.lee") ``.
+/// An export shows every address as it is, and a save of the file as exported asks for nothing:
+/// no cell is written for a cell whose text did not change.
+/// NEGATIVE CONTROL: with `show` abbreviating an address, the export lacks it:
+/// `` assertion failed: shown.text.contains("ann.lee@example.invalid") ``.
 #[test]
-fn an_unchanged_save_asks_for_nothing_and_addresses_stay_masked() {
+fn an_unchanged_save_asks_for_nothing_and_addresses_show_as_they_are() {
     let mut book = Book::new();
     let pk = keys::address_pk("ann.lee@example.invalid").unwrap();
     book.write(
@@ -193,17 +193,14 @@ fn an_unchanged_save_asks_for_nothing_and_addresses_stay_masked() {
         ],
     );
     let cells = book.cells();
-    let masked = export(&REGISTRY, &ADDRESS, &cells, &[], false).unwrap();
-    assert!(!masked.text.contains("ann.lee"));
-    assert!(masked.text.contains("an…@…"));
-    let shown = export(&REGISTRY, &ADDRESS, &cells, &[], true).unwrap();
+    let shown = export(&REGISTRY, &ADDRESS, &cells, &[]).unwrap();
     assert!(shown.text.contains("ann.lee@example.invalid"));
-    assert!(!masked.text.contains("@example.invalid"));
-    let plan = super::plan(&REGISTRY, &ADDRESS, &masked.base, &masked.text, &no_birth).unwrap();
+    assert!(!shown.text.contains("…@…"));
+    let plan = super::plan(&REGISTRY, &ADDRESS, &shown.base, &shown.text, &no_birth).unwrap();
     assert!(plan.is_empty(), "{plan:?}");
     let mut book = Book::new();
     book.write(1, &[], machine(MC));
-    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[], false).unwrap();
+    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[]).unwrap();
     assert_eq!(
         super::plan(
             &REGISTRY,
@@ -227,7 +224,7 @@ fn an_owner_edit_an_import_matched_meanwhile_is_still_written() {
     let source = "sr-0011223344556677";
     let mut book = Book::new();
     let first = book.write(1, &[], machine(MC));
-    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[], false).unwrap();
+    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[]).unwrap();
     // A peer's import writes the very value the owner is about to type.
     book.write(
         2,
@@ -277,7 +274,7 @@ fn an_owner_edit_an_import_matched_meanwhile_is_still_written() {
 fn an_edit_replaces_only_the_candidates_the_export_showed() {
     let mut book = Book::new();
     let first = book.write(1, &[], machine(MC));
-    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[], false).unwrap();
+    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[]).unwrap();
     // A peer edits status after the export, having seen the row.
     book.write(
         2,
@@ -317,7 +314,7 @@ fn an_edit_replaces_only_the_candidates_the_export_showed() {
     assert_eq!(projection.rows[MC].get("location"), Some(&json!("rack b")));
     // Reopened: the stale cell shows both values, mine first.
     let reopened = reopen(
-        export(&REGISTRY, &MACHINE, &now, &[], false).unwrap().base,
+        export(&REGISTRY, &MACHINE, &now, &[]).unwrap().base,
         &settled.stale,
     );
     let text = render(&reopened);
@@ -355,7 +352,7 @@ fn a_conflicted_cell_shows_both_values_and_one_value_resolves_it() {
         vec![put(&MACHINE, MC, "location", json!("rack c"))],
     );
     let cells = book.cells();
-    let exported = export(&REGISTRY, &MACHINE, &cells, &[], false).unwrap();
+    let exported = export(&REGISTRY, &MACHINE, &cells, &[]).unwrap();
     assert!(
         exported.text.contains("⚠ rack b ‖ rack c"),
         "{}",
@@ -398,7 +395,7 @@ fn a_conflicted_cell_shows_both_values_and_one_value_resolves_it() {
 fn read_only_columns_and_bad_values_refuse_and_name_no_value() {
     let mut book = Book::new();
     book.write(1, &[], machine(MC));
-    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[], false).unwrap();
+    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[]).unwrap();
     assert!(exported.text.starts_with("label\taliases\tstatus"));
     assert!(exported.text.contains("\t=src\t=notes_src\t=pk\n"));
     let row = record(&exported.text, MC);
@@ -480,7 +477,7 @@ fn a_deleted_row_retires_and_a_deleted_preference_ends() {
         ],
     );
     let cells = book.cells();
-    let machines = export(&REGISTRY, &MACHINE, &cells, &[], false).unwrap();
+    let machines = export(&REGISTRY, &MACHINE, &cells, &[]).unwrap();
     let saved = delete(&machines.text, record(&machines.text, MC));
     let retire = super::plan(&REGISTRY, &MACHINE, &machines.base, &saved, &no_birth).unwrap();
     assert_eq!(retire.retired, [MC]);
@@ -491,7 +488,7 @@ fn a_deleted_row_retires_and_a_deleted_preference_ends() {
         settled.rows[0][0].value.as_ref().unwrap()["x"],
         json!("retired")
     );
-    let preferences = export(&REGISTRY, &PREFERENCE, &cells, &[], false).unwrap();
+    let preferences = export(&REGISTRY, &PREFERENCE, &cells, &[]).unwrap();
     let ended = plan(
         &REGISTRY,
         &PREFERENCE,
@@ -503,7 +500,7 @@ fn a_deleted_row_retires_and_a_deleted_preference_ends() {
     assert_eq!(ended.rows[0].1[0].x, json!("ended"));
     // A row already retired that is deleted again asks for nothing.
     book.write(1, &book.all(), settled.rows.concat());
-    let after = export(&REGISTRY, &MACHINE, &book.cells(), &[], false).unwrap();
+    let after = export(&REGISTRY, &MACHINE, &book.cells(), &[]).unwrap();
     let again = delete(&after.text, record(&after.text, MC));
     assert!(
         super::plan(&REGISTRY, &MACHINE, &after.base, &again, &no_birth)
@@ -533,7 +530,7 @@ fn a_preferences_pair_is_not_edited() {
         ],
     );
     let cells = book.cells();
-    let sheet = export(&REGISTRY, &PREFERENCE, &cells, &[], false).unwrap();
+    let sheet = export(&REGISTRY, &PREFERENCE, &cells, &[]).unwrap();
     let other = keys::machine_pk("m5");
     let edited = sheet.text.replace(&machine_pk, &other);
     let problems = plan(&REGISTRY, &PREFERENCE, &sheet.base, &edited, &no_birth).unwrap_err();
@@ -571,7 +568,7 @@ fn a_new_row_is_born_under_its_derived_key_in_one_record() {
     );
     let cells = book.cells();
     let birth = registry_birth(&cells);
-    let exported = export(&REGISTRY, &ADDRESS, &cells, &[], false).unwrap();
+    let exported = export(&REGISTRY, &ADDRESS, &cells, &[]).unwrap();
     let mut text = add_row(&exported.text, 1);
     for (name, value) in [
         ("addr", "Bob.Ray@Example.invalid"),
@@ -618,7 +615,7 @@ fn a_new_row_is_born_under_its_derived_key_in_one_record() {
     );
     // A mailbox's key derives from its login's address key, a member-readable row's.
     let login = keys::address_pk("box@example.invalid").unwrap();
-    let mailboxes = export(&REGISTRY, &MAILBOX, &cells, &[], false).unwrap();
+    let mailboxes = export(&REGISTRY, &MAILBOX, &cells, &[]).unwrap();
     let mut text = add_row(&mailboxes.text, 0);
     for (name, value) in [
         ("label", "proton-1"),
@@ -632,18 +629,16 @@ fn a_new_row_is_born_under_its_derived_key_in_one_record() {
     assert_eq!(plan.born, [keys::mailbox_pk(&login).unwrap()]);
 }
 
-/// A revealed grid: a new row's password is plaintext, sealed as typed (never read as JSON), and
-/// a save that protects a row and types its password together seals nothing; a stored-protected
-/// row's password is read-only, so a save that unprotects the row and types it is refused.
-/// NEGATIVE CONTROLS: with the new-row path reading a `Secret` cell through `read`, the plan
-/// refuses the password as JSON: `` called `Result::unwrap()` on an `Err` value ``; with `seal`
-/// reading protection from the stored row alone, the protecting save seals:
-/// `` called `Result::unwrap_err()` on an `Ok` value ``.
+/// A secret cell shows as the name of its store entry and is read-only: a new row's password,
+/// or one typed over a reference, is refused, so a value typed into a grid never reaches a
+/// change.
+/// NEGATIVE CONTROL: with `read_only` leaving `SecretRef` editable, the typed-over reference is
+/// read as JSON and refused for that instead: the `read-only` assertion fails.
 #[test]
-fn a_revealed_grid_seals_a_new_rows_password_and_none_into_a_row_it_protects() {
-    use crate::typed::secret::{Fixed, Sealer as _};
+fn a_secret_cell_shows_its_entry_name_and_takes_no_typed_value() {
     let mut book = Book::new();
     let ann = keys::address_pk("ann.lee@example.invalid").unwrap();
+    let entry = format!("alab-address-password-{ann}");
     book.write(
         1,
         &[],
@@ -652,13 +647,26 @@ fn a_revealed_grid_seals_a_new_rows_password_and_none_into_a_row_it_protects() {
             put(&ADDRESS, &ann, "domain", json!("example.invalid")),
             put(&ADDRESS, &ann, "origin", json!("owner")),
             put(&ADDRESS, &ann, "row", json!("live")),
+            put(
+                &ADDRESS,
+                &ann,
+                "password",
+                crate::typed::secret::reference("test-vault", &entry),
+            ),
         ],
     );
     let cells = book.cells();
     let birth = registry_birth(&cells);
-    let sealer = Fixed("alab/registry");
-    let opened = Opened::new();
-    let exported = export_opened(&REGISTRY, &ADDRESS, &cells, &[], false, Some(&opened)).unwrap();
+    let exported = export(&REGISTRY, &ADDRESS, &cells, &[]).unwrap();
+    assert!(exported.text.contains(&entry), "{}", exported.text);
+    assert!(exported.base.header.iter().any(|h| h == "=password"));
+    let over = type_in(&exported.text, 1, "password", "pw-for-ann-01");
+    let refused = super::plan(&REGISTRY, &ADDRESS, &exported.base, &over, &birth).unwrap_err();
+    assert!(
+        refused.iter().any(|p| p.rule.contains("read-only")),
+        "{refused:?}"
+    );
+    assert!(refused.iter().all(|p| !p.rule.contains("pw-for-ann-01")));
     let mut text = add_row(&exported.text, 1);
     for (name, value) in [
         ("addr", "bob.ray@example.invalid"),
@@ -668,55 +676,9 @@ fn a_revealed_grid_seals_a_new_rows_password_and_none_into_a_row_it_protects() {
     ] {
         text = type_in(&text, 2, name, value);
     }
-    let mut plan = super::plan(&REGISTRY, &ADDRESS, &exported.base, &text, &birth).unwrap();
-    super::seal(&ADDRESS, &mut plan, &sealer, &cells).unwrap();
-    let born = keys::address_pk("bob.ray@example.invalid").unwrap();
-    let (_, edits) = plan.rows.iter().find(|(pk, _)| *pk == born).unwrap();
-    let password = edits.iter().find(|e| e.column == "password").unwrap();
-    let token = password.x.as_str().unwrap();
+    let refused = super::plan(&REGISTRY, &ADDRESS, &exported.base, &text, &birth).unwrap_err();
     assert!(
-        crate::typed::secret::is_sealed(token),
-        "sealed, not plaintext"
-    );
-    let typed = crate::typed::secret::Secret::new("pw-for-bob-01".to_owned());
-    assert!(sealer.holds("address", &born, "password", token, &typed));
-
-    let both = type_in(
-        &type_in(&exported.text, 1, "protected", "true"),
-        1,
-        "password",
-        "pw-for-ann-01",
-    );
-    let mut plan = super::plan(&REGISTRY, &ADDRESS, &exported.base, &both, &birth).unwrap();
-    let refused = super::seal(&ADDRESS, &mut plan, &sealer, &cells).unwrap_err();
-    assert!(refused.to_string().contains("protected"), "{refused}");
-
-    let mut stored = Book::new();
-    let cat = keys::address_pk("cat.ng@example.invalid").unwrap();
-    stored.write(
-        1,
-        &[],
-        vec![
-            put(&ADDRESS, &cat, "addr", json!("cat.ng@example.invalid")),
-            put(&ADDRESS, &cat, "domain", json!("example.invalid")),
-            put(&ADDRESS, &cat, "origin", json!("owner")),
-            put(&ADDRESS, &cat, "row", json!("live")),
-            put(&ADDRESS, &cat, "protected", json!(true)),
-        ],
-    );
-    let cells = stored.cells();
-    let birth = registry_birth(&cells);
-    let exported = export_opened(&REGISTRY, &ADDRESS, &cells, &[], false, Some(&opened)).unwrap();
-    let unprotect = type_in(&exported.text, 1, "protected", "false");
-    // The control: unprotecting alone saves.
-    let mut plan = super::plan(&REGISTRY, &ADDRESS, &exported.base, &unprotect, &birth).unwrap();
-    super::seal(&ADDRESS, &mut plan, &sealer, &cells).unwrap();
-    let typed = type_in(&unprotect, 1, "password", "pw-for-cat-01");
-    let refused = super::plan(&REGISTRY, &ADDRESS, &exported.base, &typed, &birth).unwrap_err();
-    assert!(
-        refused
-            .iter()
-            .any(|problem| problem.rule.contains("protected")),
+        refused.iter().all(|p| !p.rule.contains("pw-for-bob-01")),
         "{refused:?}"
     );
 }
@@ -731,7 +693,7 @@ fn a_born_row_a_peer_made_meanwhile_is_written_all_or_nothing() {
     let mut book = Book::new();
     let cells = book.cells();
     let birth = registry_birth(&cells);
-    let exported = export(&REGISTRY, &ADDRESS, &cells, &[], false).unwrap();
+    let exported = export(&REGISTRY, &ADDRESS, &cells, &[]).unwrap();
     let mut text = add_row(&exported.text, 0);
     for (name, value) in [
         ("addr", "bob.ray@example.invalid"),
@@ -771,7 +733,7 @@ fn a_set_cell_writes_only_the_members_that_changed() {
     let mut book = Book::new();
     book.write(1, &[], machine(MC));
     let cells = book.cells();
-    let exported = export(&REGISTRY, &MACHINE, &cells, &[], false).unwrap();
+    let exported = export(&REGISTRY, &MACHINE, &cells, &[]).unwrap();
     assert!(exported.text.contains("\tclaude, codex\t"));
     let saved = type_in(
         &exported.text,
@@ -846,7 +808,7 @@ fn a_text_set_member_with_a_comma_shows_and_saves_as_a_json_list() {
         ],
     );
     let cells = book.cells();
-    let exported = export(&SETS, &TEXT_SETS, &cells, &[], false).unwrap();
+    let exported = export(&SETS, &TEXT_SETS, &cells, &[]).unwrap();
     assert!(
         exported
             .text
@@ -884,7 +846,7 @@ fn a_text_set_member_with_a_comma_shows_and_saves_as_a_json_list() {
 fn the_baseline_reads_back_as_it_was_stored() {
     let mut book = Book::new();
     book.write(1, &[], machine(MC));
-    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[], true).unwrap();
+    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[]).unwrap();
     assert!(!exported.base.rows[0].1["clis"].elements.is_empty());
     assert_eq!(
         Base::from_json(&exported.base.to_json()).unwrap(),
@@ -893,6 +855,63 @@ fn the_baseline_reads_back_as_it_was_stored() {
     let accounts = layout(&ACCOUNT, &Projection::default());
     let billing = accounts.iter().find(|c| c.name == "billing").unwrap();
     assert_eq!(billing.header(), "=billing");
+}
+
+/// A baseline says nothing of masking now that an address is ordinary data: `to_json` writes no
+/// `reveal`, and `from_json` still reads the baseline of a build that masked addresses, its
+/// `reveal` true or false, as the same baseline; a `reveal` that is no boolean is no baseline.
+/// Such a build's masked export still saves: its cells are compared by what they showed, so the
+/// file as exported asks for nothing.
+/// NEGATIVE CONTROL: with `from_json` holding every baseline to the six fields `to_json` writes
+/// (`exact(value, &FIELDS[..6])`), an older build's baseline is refused: `` reveal=false:
+/// Error("not a grid baseline") ``.
+#[test]
+fn a_baseline_writes_no_reveal_and_an_older_builds_still_reads() {
+    let mut book = Book::new();
+    let pk = keys::address_pk("ann.lee@example.invalid").unwrap();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&ADDRESS, &pk, "addr", json!("ann.lee@example.invalid")),
+            put(&ADDRESS, &pk, "domain", json!("example.invalid")),
+            put(&ADDRESS, &pk, "origin", json!("owner")),
+            put(&ADDRESS, &pk, "row", json!("live")),
+        ],
+    );
+    let exported = export(&REGISTRY, &ADDRESS, &book.cells(), &[]).unwrap();
+    let stored = exported.base.to_json();
+    assert!(stored.get("reveal").is_none(), "{stored}");
+    assert_eq!(Base::from_json(&stored).unwrap(), exported.base);
+    let with = |reveal: Value| {
+        let mut older = stored.clone();
+        older
+            .as_object_mut()
+            .unwrap()
+            .insert("reveal".into(), reveal);
+        older
+    };
+    for reveal in [false, true] {
+        let read = Base::from_json(&with(json!(reveal)));
+        assert_eq!(
+            read.unwrap_or_else(|e| panic!("reveal={reveal}: {e:?}")),
+            exported.base
+        );
+    }
+    for reveal in [json!(1), json!("true"), Value::Null, json!([true])] {
+        assert!(
+            Base::from_json(&with(reveal.clone())).is_err(),
+            "reveal={reveal}"
+        );
+    }
+    // What a build that masked addresses exported: the mask in the file and in the baseline.
+    let masked = |text: &str| text.replace("ann.lee@example.invalid", "an…@…");
+    let older = masked(&aterm_json::to_string(&with(json!(false))).unwrap());
+    let base = Base::from_json(&aterm_json::from_str::<Value>(&older).unwrap()).unwrap();
+    let file = masked(&exported.text);
+    assert!(file.contains("an…@…") && !file.contains("ann.lee"));
+    let plan = super::plan(&REGISTRY, &ADDRESS, &base, &file, &no_birth).unwrap();
+    assert!(plan.is_empty(), "{plan:?}");
 }
 
 /// Malformed baselines (empty headers, missing `=pk`, duplicate headers or rows, unknown fields)
@@ -907,7 +926,7 @@ fn malformed_baselines_and_set_filters_fail_closed_and_canonicalize() {
     m.push(elem(&MACHINE, MC, "aliases", "m1"));
     book.write(1, &[], m);
     let cells = book.cells();
-    let exported = export(&REGISTRY, &MACHINE, &cells, &[], false).unwrap();
+    let exported = export(&REGISTRY, &MACHINE, &cells, &[]).unwrap();
 
     let mut empty_header = exported.base.clone();
     empty_header.header.clear();
@@ -1116,7 +1135,7 @@ fn a_text_set_member_that_starts_as_a_conflict_does_reads_back_as_itself() {
             elem(&TEXT_SETS, MC, "nickname_aliases", "⚠ check"),
         ],
     );
-    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[], false).unwrap();
+    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[]).unwrap();
     let saved = type_in(
         &exported.text,
         record(&exported.text, MC),
@@ -1142,11 +1161,13 @@ fn a_text_set_member_that_starts_as_a_conflict_does_reads_back_as_itself() {
 /// A save's add settles against what each candidate adds as a projection reads it: a string a
 /// text set's key does not digest, or one under a set of keys, adds nothing, so an owner's add
 /// beside one is stale (reopened for the owner), never counted as already held and dropped; so
-/// is an add of a text set's member whose element also holds a candidate no build of this
-/// version decodes, which a projection shows raw, never as a member.
+/// is an add, or a removal, of a text set's member whose element also holds a candidate no build
+/// of this version decodes, which a projection shows raw, confirming neither.
 /// NEGATIVE CONTROLS: with `settle` counting any string as an add (as it did), the first two
 /// adds count as unchanged: their `stale` assertions fail; with `settle` reading an undecodable
-/// candidate as an absence, the third add counts as unchanged: its assertion fails.
+/// candidate as an absence, the third add counts as unchanged: its assertion fails; with
+/// `cell::element_holds` reading such an element as absent (as it did), the removal counts as
+/// unchanged and is lost: the last assertion fails.
 #[test]
 fn a_save_settles_a_set_add_against_what_the_projection_reads() {
     // A text set.
@@ -1159,7 +1180,7 @@ fn a_save_settles_a_set_add_against_what_the_projection_reads() {
             elem(&TEXT_SETS, MC, "hosts", "a.lan"),
         ],
     );
-    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[], false).unwrap();
+    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[]).unwrap();
     book.write(
         2,
         &[],
@@ -1182,7 +1203,7 @@ fn a_save_settles_a_set_add_against_what_the_projection_reads() {
     // A set of keys.
     let mut book = Book::new();
     book.write(1, &[], machine(MC));
-    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[], false).unwrap();
+    let exported = export(&REGISTRY, &MACHINE, &book.cells(), &[]).unwrap();
     book.write(
         2,
         &[],
@@ -1212,7 +1233,7 @@ fn a_save_settles_a_set_add_against_what_the_projection_reads() {
             elem(&TEXT_SETS, MC, "hosts", "a.lan"),
         ],
     );
-    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[], false).unwrap();
+    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[]).unwrap();
     book.write(2, &[], vec![elem(&TEXT_SETS, MC, "hosts", "c.lan")]);
     book.write(
         3,
@@ -1230,6 +1251,34 @@ fn a_save_settles_a_set_add_against_what_the_projection_reads() {
         "a.lan, c.lan",
     );
     let plan = super::plan(&SETS, &TEXT_SETS, &exported.base, &saved, &no_birth).unwrap();
+    let settled = settle(&TEXT_SETS, &plan, &book.cells());
+    assert_eq!((settled.unchanged, settled.stale.len()), (0, 1));
+
+    // The owner removes a text set's member while a peer stores, at its element, a candidate
+    // this build cannot decode.
+    let mut book = Book::new();
+    book.write(
+        1,
+        &[],
+        vec![
+            put(&TEXT_SETS, MC, "row", json!("live")),
+            elem(&TEXT_SETS, MC, "hosts", "a.lan"),
+            elem(&TEXT_SETS, MC, "hosts", "c.lan"),
+        ],
+    );
+    let exported = export(&SETS, &TEXT_SETS, &book.cells(), &[]).unwrap();
+    book.write(
+        2,
+        &[],
+        vec![stored(
+            &TEXT_SETS,
+            format!("{MC}.hosts.{}", keys::text_elem("c.lan")),
+            Some(json!({"r": 1, "x": "c.lan", "z": 1})),
+        )],
+    );
+    let saved = type_in(&exported.text, record(&exported.text, MC), "hosts", "a.lan");
+    let plan = super::plan(&SETS, &TEXT_SETS, &exported.base, &saved, &no_birth).unwrap();
+    assert_eq!(plan.rows[0].1[0].x, Value::Bool(false));
     let settled = settle(&TEXT_SETS, &plan, &book.cells());
     assert_eq!((settled.unchanged, settled.stale.len()), (0, 1));
 }
@@ -1258,7 +1307,7 @@ fn a_raw_text_set_shows_a_member_with_a_comma_as_one() {
     let cells = book.cells();
     let row = cell::project(&TEXT_SETS, &cells).rows.remove(MC).unwrap();
     assert!(row.raw.contains("nickname_aliases"));
-    let exported = export(&SETS, &TEXT_SETS, &cells, &[], false).unwrap();
+    let exported = export(&SETS, &TEXT_SETS, &cells, &[]).unwrap();
     assert!(
         exported.text.contains(r#""[""Paris, France"",""Rome""]""#),
         "{}",

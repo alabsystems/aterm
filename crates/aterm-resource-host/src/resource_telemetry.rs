@@ -108,7 +108,7 @@ pub(crate) fn serve(
             .map(|snapshot| TelemetryReply { context, snapshot })
     });
     let response = match observed {
-        Ok(reply) => TelemetryResponse::Ready(reply),
+        Ok(reply) => TelemetryResponse::Ready(Box::new(reply)),
         Err(_) => TelemetryResponse::Unavailable(ContextUnavailable::for_query(
             &query.query,
             "no authenticated live native machine observation".into(),

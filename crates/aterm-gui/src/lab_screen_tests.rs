@@ -123,7 +123,7 @@ fn periodic_publication_does_not_wait_on_a_session_writer_or_rebuild_the_harness
     assert!(app.open_settings_tab_in_window(wid, crate::native_settings::SettingsRoute::Lab));
     assert_eq!(
         app.front_control_surface(),
-        crate::control::FrontControlSurface::HarnessSettings
+        crate::control::FrontControlSurface::OwnerSettings
     );
     let (instance, _) = app.active_native_view(wid).unwrap();
     let snapshot = |app: &crate::App| match app.native_runtime.app(instance).unwrap() {

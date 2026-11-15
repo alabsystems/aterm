@@ -806,7 +806,8 @@ impl MessageCenter {
             if let Some(slot) = self.glass.iter_mut().find(|g| **g == old.id) {
                 *slot = id;
             }
-            self.log_retired(&old, Retired::Superseded { by: id }, None, now);
+            let unix_ms = old.wall_at(now);
+            self.log_retired(&old, Retired::Superseded { by: id }, None, unix_ms, now);
             self.live.insert(i, entry);
             PostOutcome::Superseded(old.id)
         } else {
@@ -846,6 +847,19 @@ impl MessageCenter {
         self.retire_at_with(i, how, echo, now)
     }
 
+    /// A person's read, dismissal or answer retires row `i` `how`, filed at `wall`, the host's
+    /// wall clock at the press. Every other ending is filed at the row's own reading
+    /// ([`Live::wall_at`]): the post's wall plus the monotonic time since, which stops while
+    /// the Mac sleeps. A person's filing starts the quiet that a re-post's stamp, read off the
+    /// host's wall clock, is judged against ([`Self::quiet_standing`]), so it is read off that
+    /// clock too, as the digest's own filings are ([`Self::file_digest_one`]): a read a minute
+    /// after a long sleep keeps its fact quiet for a day from that minute, not from a reading
+    /// the sleep left behind by as long as it lasted.
+    fn file_at(&mut self, i: usize, how: Retired, wall: WallStamp, now: Instant) -> Live {
+        let echo = EchoKind::for_retired(&how);
+        self.retire_filed(i, how, echo, wall.unix_ms, now)
+    }
+
     fn retire_at_with(
         &mut self,
         i: usize,
@@ -853,12 +867,24 @@ impl MessageCenter {
         echo: Option<EchoKind>,
         now: Instant,
     ) -> Live {
+        let unix_ms = self.live[i].wall_at(now);
+        self.retire_filed(i, how, echo, unix_ms, now)
+    }
+
+    fn retire_filed(
+        &mut self,
+        i: usize,
+        how: Retired,
+        echo: Option<EchoKind>,
+        unix_ms: u64,
+        now: Instant,
+    ) -> Live {
         if let Some(kind) = echo {
             self.record_echo(i, kind, now);
         }
         let row = self.live.remove(i);
         self.glass.retain(|g| *g != row.id);
-        self.log_retired(&row, how, echo, now);
+        self.log_retired(&row, how, echo, unix_ms, now);
         self.revision += 1;
         row
     }
@@ -898,7 +924,14 @@ impl MessageCenter {
         self.echoes.push(echo);
     }
 
-    fn log_retired(&mut self, row: &Live, how: Retired, echo: Option<EchoKind>, now: Instant) {
+    fn log_retired(
+        &mut self,
+        row: &Live,
+        how: Retired,
+        echo: Option<EchoKind>,
+        unix_ms: u64,
+        now: Instant,
+    ) {
         let outcome = outcome_title(&row.msg, &how, echo);
         let mark = outcome_mark(&row.msg, &how, echo).or_else(|| {
             let shown = (row.msg.severity, row.msg.glyph);
@@ -925,7 +958,7 @@ impl MessageCenter {
         self.log.record_retired(
             row.id,
             how,
-            row.wall_at(now),
+            unix_ms,
             now,
             FinalWords {
                 title,
@@ -1282,12 +1315,12 @@ impl MessageCenter {
         ids.len() + self.end_digest_prefix(prefix, &Retired::Withdrawn, now)
     }
 
-    /// A person dismissed it.
-    pub fn dismiss(&mut self, id: MessageId, now: Instant) -> bool {
+    /// A person dismissed it at `wall`, the host's wall clock at the press, where it is filed.
+    pub fn dismiss(&mut self, id: MessageId, wall: WallStamp, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
             return false;
         };
-        self.retire_at(i, Retired::Dismissed, now);
+        self.file_at(i, Retired::Dismissed, wall, now);
         self.rebalance(now);
         true
     }
@@ -1344,24 +1377,27 @@ impl MessageCenter {
         true
     }
 
-    /// The person answered the row with a word its reporter confirmed was taken.
-    pub fn answer(&mut self, id: MessageId, label: &str, now: Instant) -> bool {
+    /// The person answered the row, at `wall` (the host's wall clock, where it is filed), with a
+    /// word its reporter confirmed was taken.
+    pub fn answer(&mut self, id: MessageId, label: &str, wall: WallStamp, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
             return false;
         };
-        self.retire_at(
+        self.file_at(
             i,
             Retired::Answered {
                 label: label.to_string(),
             },
+            wall,
             now,
         );
         self.rebalance(now);
         true
     }
 
-    /// The row was read: a Default, For or Standing row folds now; Live and Ask rows stay.
-    pub fn mark_seen(&mut self, id: MessageId, now: Instant) -> bool {
+    /// The row was read at `wall`, the host's wall clock: a Default, For or Standing row folds
+    /// now, filed at `wall`; Live and Ask rows stay.
+    pub fn mark_seen(&mut self, id: MessageId, wall: WallStamp, now: Instant) -> bool {
         let Some(i) = self.index(id) else {
             return false;
         };
@@ -1371,30 +1407,37 @@ impl MessageCenter {
             self.live[i].msg.hold,
             Hold::Default | Hold::For(_) | Hold::Standing(_)
         ) {
-            self.retire_at(i, Retired::Folded, now);
+            self.file_at(i, Retired::Folded, wall, now);
             self.rebalance(now);
         }
         true
     }
 
-    /// A capsule press.
-    pub fn act(&mut self, id: MessageId, action: ActionIndex, now: Instant) -> Option<Intent> {
+    /// A capsule press at `wall`, the host's wall clock: the press, and the answer a decline
+    /// files, are logged at `wall`.
+    pub fn act(
+        &mut self,
+        id: MessageId,
+        action: ActionIndex,
+        wall: WallStamp,
+        now: Instant,
+    ) -> Option<Intent> {
         let i = self.index(id)?;
         if action.is_details() {
-            self.mark_seen(id, now);
+            self.mark_seen(id, wall, now);
             return Some(Intent::Details);
         }
         let intent = self.live[i].msg.actions.get(usize::from(action.0))?.clone();
         let label = intent.label();
-        let unix_ms = self.live[i].wall_at(now);
-        self.log.record_acted(id, unix_ms, label);
+        self.log.record_acted(id, wall.unix_ms, label);
         self.revision += 1;
         if intent.closes_row() {
-            self.retire_at(
+            self.file_at(
                 i,
                 Retired::Answered {
                     label: label.to_string(),
                 },
+                wall,
                 now,
             );
             self.rebalance(now);

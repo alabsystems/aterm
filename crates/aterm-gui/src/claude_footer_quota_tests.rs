@@ -1214,7 +1214,7 @@ fn the_kitty_keeps_off_the_painted_cells() {
 #[test]
 fn quota_row_gallery() {
     use crate::scripted_redraw_fixture as fixture;
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let (dir, _gallery) = fixture::gallery_directory("ATERM_QUOTA_ROW_GALLERY");
     let mut first = true;
     let mut readings = format!("{}\n", fixture::At2x::HEAD);

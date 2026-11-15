@@ -1149,9 +1149,10 @@ fn a_slot_rule_is_never_answered_a_bare_grant() {
     }
 }
 
+use alab_policy::config::Autopilot;
+use aterm_agent::supervise::Guard;
 use aterm_agent::supervise::occupancy::rules::Guards;
 use aterm_agent::supervise::occupancy::{SaidHold, SaidRule, SaidVerdict};
-use aterm_agent::supervise::{Autopilot, Guard};
 
 const HOUR_MS: i64 = 60 * MIN_MS;
 

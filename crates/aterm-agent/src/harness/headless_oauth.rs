@@ -58,9 +58,12 @@ pub const TOTP_SECRET_ENV: &str = "ATERM_OPEN_URL_TOTP_SECRET";
 /// File name for mailbox configuration under `<accounts store>` or `~/.config/aterm/`.
 pub const MAILBOX_TOML_FILE: &str = aterm_secrets::entry_class::MAILBOX;
 
-/// File name for mailbox configuration under `~/.secrets/`
-/// ([`aterm_secrets::entry_class::AI_MAILBOX`]).
+/// The vault entry holding the mailbox routes ([`aterm_secrets::entry_class::AI_MAILBOX`]), read
+/// from this Mac's store ([`crate::vault_entry`]).
 pub const SECRETS_MAILBOX_TOML_FILE: &str = aterm_secrets::entry_class::AI_MAILBOX;
+
+/// The most of a mailbox configuration, file or vault entry, a reader takes.
+pub(crate) const MAILBOX_TOML_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// Subdirectory under the accounts store holding persistent per-account browser profiles.
 pub const BROWSER_PROFILES_DIR: &str = "browsers";
@@ -1059,9 +1062,17 @@ impl MailboxConfig {
             }
             PathBuf::from(raw)
         };
+        // A `*_file` naming `~/.secrets/<name>` names the vault's entry `<name>`, read from this
+        // Mac's store: no file there is opened.
         let read_secret_file = |raw: &str| -> Option<String> {
             let path = expand_path(raw);
-            let s = super::accounts::read_bounded(&path, 4096).ok()??;
+            let s = if let Some(name) = vault_entry_named_by(home, &path) {
+                crate::vault_entry::read_text(home?, &name, 4096)
+                    .text()?
+                    .to_owned()
+            } else {
+                super::accounts::read_bounded(&path, 4096).ok()??
+            };
             let trimmed = s.trim_end_matches(['\r', '\n']).trim();
             (!trimmed.is_empty()).then(|| trimmed.to_owned())
         };
@@ -1543,7 +1554,7 @@ pub fn mailbox_precedence_environment() {}
 )]
 pub fn mailbox_scope_environment() {}
 
-/// Whether a `~/.secrets` name is a fleet roster, the accounts sheet or a CLI's roster
+/// Whether a vault entry's name is a fleet roster, the accounts sheet or a CLI's roster
 /// (`ai-accounts.csv`, `ai-accounts-<cli>.toml`): fleet data, never a mailbox fragment, whatever
 /// machine or account its name happens to carry.
 fn is_fleet_roster_name(lower: &str) -> bool {
@@ -1798,10 +1809,25 @@ fn parse_single_line_mailbox_secret(text: &str) -> Option<MailboxConfig> {
     (cfg != MailboxConfig::default()).then_some(cfg)
 }
 
-fn read_single_line_secret_file(path: &Path) -> Option<String> {
-    let s = super::accounts::read_bounded(path, 4096).ok()??;
-    let trimmed = s.trim_end_matches(['\r', '\n']).trim();
+/// The one line a single-line secret entry holds, without its line ending; none for an empty
+/// value or one of several lines.
+fn single_line_secret(text: &str) -> Option<String> {
+    let trimmed = text.trim_end_matches(['\r', '\n']).trim();
     (!trimmed.is_empty() && !trimmed.contains(['\r', '\n'])).then(|| trimmed.to_owned())
+}
+
+/// The vault entry a mailbox configuration's `*_file` path names: `~/.secrets/<name>` (spelled
+/// so, or under `home`), which older builds wrote the entry `<name>` to.
+fn vault_entry_named_by(home: Option<&Path>, path: &Path) -> Option<String> {
+    let rest = path
+        .strip_prefix("~/.secrets")
+        .ok()
+        .or_else(|| path.strip_prefix(home?.join(".secrets")).ok())?;
+    let mut parts = rest.components();
+    let (Some(std::path::Component::Normal(name)), None) = (parts.next(), parts.next()) else {
+        return None;
+    };
+    name.to_str().map(str::to_owned)
 }
 
 /// One configured association, captured once for both conflict detection and aliasing.
@@ -1815,7 +1841,7 @@ fn mailbox_aliases(
     home: Option<&Path>,
     claude_rosters: &[PathBuf],
     cli_rosters: &[(super::accounts::Cli, PathBuf)],
-    claude_fleets: &[PathBuf],
+    claude_fleets: &[Option<String>],
 ) -> Vec<MailboxAlias> {
     let mut aliases = Vec::new();
     let mut note = |own: bool, label: &str, email: Option<&str>| {
@@ -1853,19 +1879,21 @@ fn mailbox_aliases(
         }
         return aliases;
     }
-    for path in claude_fleets {
-        if let Ok(Some(text)) = super::accounts::read_bounded(path, 256 * 1024)
-            && let Ok(fleet) = super::accounts_sync::FleetRoster::from_toml(&text, "fleet")
-        {
+    for text in claude_fleets.iter().flatten() {
+        if let Ok(fleet) = super::accounts_sync::FleetRoster::from_toml(text, "fleet") {
             for acct in &fleet.accounts {
                 note(true, &acct.label, Some(&acct.email));
             }
         }
     }
     if let Some(h) = home {
-        let csv = super::accounts::read_bounded(&h.join(".secrets/ai-accounts.csv"), 512 * 1024)
-            .ok()
-            .flatten();
+        // The sheet and each CLI's roster, from one version of the vault.
+        let cli_files = super::accounts_sync::OTHER_CLIS.map(super::accounts_sync::cli_fleet_file);
+        let names = std::iter::once(aterm_secrets::entry_class::AI_ACCOUNTS_CSV)
+            .chain(cli_files.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        let mut reads = crate::vault_entry::read_set(h, &names, 512 * 1024).into_iter();
+        let csv = reads.next().and_then(|read| read.text().map(str::to_owned));
         if let Some(text) = csv.as_deref()
             && let Ok(fleet) = super::accounts_sync::parse_accounting_csv(text, "csv")
         {
@@ -1873,17 +1901,11 @@ fn mailbox_aliases(
                 note(true, &acct.label, Some(&acct.email));
             }
         }
-        for cli in super::accounts_sync::OTHER_CLIS {
-            let path = h
-                .join(".secrets")
-                .join(super::accounts_sync::cli_fleet_file(cli));
-            let fleet = if path.is_file() {
-                super::accounts::read_bounded(&path, 256 * 1024)
-                    .ok()
-                    .flatten()
-                    .and_then(|text| {
-                        super::accounts_sync::FleetRoster::from_toml_for(cli, &text, "fleet").ok()
-                    })
+        for (cli, read) in super::accounts_sync::OTHER_CLIS.into_iter().zip(reads) {
+            let fleet = if read.occupies() {
+                read.text().and_then(|text| {
+                    super::accounts_sync::FleetRoster::from_toml_for(cli, text, "fleet").ok()
+                })
             } else {
                 csv.as_deref()
                     .filter(|text| super::accounts_sync::csv_names_column(cli, text))
@@ -1934,23 +1956,51 @@ fn discover_mailbox_config_sources(
     store_dir: Option<&Path>,
     config_path: Option<&Path>,
 ) -> (MailboxConfig, Vec<MailboxAlias>) {
+    /// One mailbox configuration, in precedence order: a local file, or the text of a vault
+    /// entry read from this Mac's store.
+    enum Candidate {
+        File(PathBuf),
+        Entry(Option<String>),
+    }
     let mut cfg = MailboxConfig::default();
     let mut toml_candidates = Vec::new();
+    let mut vault_fleet = None;
     if let Some(store) = store_dir {
-        toml_candidates.push(store.join(MAILBOX_TOML_FILE));
+        toml_candidates.push(Candidate::File(store.join(MAILBOX_TOML_FILE)));
     }
     if let Some(h) = home {
-        toml_candidates.push(h.join(".secrets").join(SECRETS_MAILBOX_TOML_FILE));
-        toml_candidates.push(h.join(".secrets").join(MAILBOX_TOML_FILE));
-        toml_candidates.push(h.join(".config/aterm").join(MAILBOX_TOML_FILE));
-        toml_candidates.push(h.join(".config/aterm/aterm.toml"));
+        // The vault's two mailbox entries and its fleet roster, from one version of the vault.
+        let [routes, mailbox, fleet] = <[_; 3]>::try_from(crate::vault_entry::read_set(
+            h,
+            &[
+                SECRETS_MAILBOX_TOML_FILE,
+                MAILBOX_TOML_FILE,
+                super::accounts_sync::FLEET_ROSTER_FILE,
+            ],
+            MAILBOX_TOML_MAX_BYTES,
+        ))
+        .unwrap_or_else(|_| {
+            std::array::from_fn(|_| crate::vault_entry::Read::Unavailable(String::new()))
+        });
+        toml_candidates.push(Candidate::Entry(routes.text().map(str::to_owned)));
+        toml_candidates.push(Candidate::Entry(mailbox.text().map(str::to_owned)));
+        toml_candidates.push(Candidate::File(
+            h.join(".config/aterm").join(MAILBOX_TOML_FILE),
+        ));
+        toml_candidates.push(Candidate::File(h.join(".config/aterm/aterm.toml")));
+        vault_fleet = fleet.text().map(str::to_owned);
     }
     let mut roster_candidates = Vec::new();
     let mut cli_roster_candidates = Vec::new();
     let mut fleet_roster_candidates = Vec::new();
+    let fleet_file = |path: PathBuf| {
+        super::accounts::read_bounded(&path, 256 * 1024)
+            .ok()
+            .flatten()
+    };
     if let Some(h) = home {
         let roster_path = h.join(".config/aterm/accounts.toml");
-        toml_candidates.push(roster_path.clone());
+        toml_candidates.push(Candidate::File(roster_path.clone()));
         roster_candidates.push(roster_path);
         for cli in super::accounts::Cli::ALL {
             if cli != super::accounts::Cli::Claude {
@@ -1960,29 +2010,28 @@ fn discover_mailbox_config_sources(
                 ));
             }
         }
-        fleet_roster_candidates.push(
+        fleet_roster_candidates.push(fleet_file(
             h.join(".config/aterm")
                 .join(super::accounts_sync::FLEET_ROSTER_FILE),
-        );
-        fleet_roster_candidates.push(
-            h.join(".secrets")
-                .join(super::accounts_sync::FLEET_ROSTER_FILE),
-        );
+        ));
+        fleet_roster_candidates.push(vault_fleet.take());
     }
     if let Some(cfg_file) = config_path {
         if let Some(parent) = cfg_file.parent() {
-            toml_candidates.push(parent.join(MAILBOX_TOML_FILE));
+            toml_candidates.push(Candidate::File(parent.join(MAILBOX_TOML_FILE)));
             let sibling_roster = parent.join("accounts.toml");
-            toml_candidates.push(sibling_roster.clone());
+            toml_candidates.push(Candidate::File(sibling_roster.clone()));
             roster_candidates.push(sibling_roster);
             for cli in super::accounts::Cli::ALL {
                 if cli != super::accounts::Cli::Claude {
                     cli_roster_candidates.push((cli, parent.join(cli.accounts().roster_file)));
                 }
             }
-            fleet_roster_candidates.push(parent.join(super::accounts_sync::FLEET_ROSTER_FILE));
+            fleet_roster_candidates.push(fleet_file(
+                parent.join(super::accounts_sync::FLEET_ROSTER_FILE),
+            ));
         }
-        toml_candidates.push(cfg_file.to_path_buf());
+        toml_candidates.push(Candidate::File(cfg_file.to_path_buf()));
     }
     let aliases = mailbox_aliases(
         home,
@@ -1991,8 +2040,14 @@ fn discover_mailbox_config_sources(
         &fleet_roster_candidates,
     );
     cfg.contested_labels = contested_labels(&aliases);
-    for path in toml_candidates {
-        if let Some(text) = super::ai_pool::read_bounded_text(&path, 2 * 1024 * 1024)
+    for candidate in toml_candidates {
+        let text = match candidate {
+            Candidate::File(path) => {
+                super::ai_pool::read_bounded_text(&path, MAILBOX_TOML_MAX_BYTES as u64)
+            }
+            Candidate::Entry(text) => text,
+        };
+        if let Some(text) = text
             && let Some(parsed) = MailboxConfig::parse_toml(&text, home)
         {
             cfg.merge_from(parsed);
@@ -2010,213 +2065,7 @@ fn discover_mailbox_config_sources(
         &super::alab_roster::mail(),
     );
     if let Some(h) = home {
-        let secrets_dir = h.join(".secrets");
-        if secrets_dir.is_dir() {
-            for name in [
-                "ai_mailbox_password",
-                "ai-mailbox-password",
-                "mailbox_password",
-                "mailbox-password",
-                "proton_password",
-                "proton-password",
-                "imap_password",
-                "webmail_password",
-            ] {
-                if cfg.password.is_none()
-                    && let Some(secret) = read_single_line_secret_file(&secrets_dir.join(name))
-                {
-                    cfg.password = Some(secret);
-                }
-            }
-            for name in [
-                "ai_mailbox_second_password",
-                "ai-mailbox-second-password",
-                "second_password",
-                "second-password",
-                "proton_mailbox_password",
-                "proton-mailbox-password",
-                "proton_second_password",
-                "proton-second-password",
-            ] {
-                if cfg.mailbox_password.is_none()
-                    && let Some(secret) = read_single_line_secret_file(&secrets_dir.join(name))
-                {
-                    cfg.mailbox_password = Some(secret);
-                }
-            }
-            for name in [
-                "ai_mailbox_totp",
-                "ai-mailbox-totp",
-                "mailbox_totp",
-                "mailbox-totp",
-                "proton_totp",
-                "proton-totp",
-                "totp_secret",
-                "totp-secret",
-            ] {
-                if cfg.totp_secret.is_none()
-                    && let Some(secret) = read_single_line_secret_file(&secrets_dir.join(name))
-                {
-                    cfg.totp_secret = Some(secret);
-                }
-            }
-            if let Ok(entries) = std::fs::read_dir(&secrets_dir) {
-                for entry in entries.flatten() {
-                    if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
-                        continue;
-                    }
-                    let Ok(fname) = entry.file_name().into_string() else {
-                        continue;
-                    };
-                    let lower = fname.to_ascii_lowercase();
-                    if matches!(
-                        lower.as_str(),
-                        "ai_mailbox_password"
-                            | "ai-mailbox-password"
-                            | "mailbox_password"
-                            | "mailbox-password"
-                            | "proton_password"
-                            | "proton-password"
-                            | "imap_password"
-                            | "webmail_password"
-                            | "ai_mailbox_second_password"
-                            | "ai-mailbox-second-password"
-                            | "second_password"
-                            | "second-password"
-                            | "proton_mailbox_password"
-                            | "proton-mailbox-password"
-                            | "proton_second_password"
-                            | "proton-second-password"
-                            | "ai_mailbox_totp"
-                            | "ai-mailbox-totp"
-                            | "mailbox_totp"
-                            | "mailbox-totp"
-                            | "proton_totp"
-                            | "proton-totp"
-                            | "totp_secret"
-                            | "totp-secret"
-                    ) {
-                        continue;
-                    }
-                    if let Some(acct) = lower
-                        .strip_suffix("_mailbox_password")
-                        .or_else(|| lower.strip_suffix("-mailbox-password"))
-                        .or_else(|| lower.strip_suffix("_second_password"))
-                        .or_else(|| lower.strip_suffix("-second-password"))
-                        .filter(|a| !a.is_empty())
-                    {
-                        if let Some(secret) = read_single_line_secret_file(&entry.path()) {
-                            for key in legacy_credential_keys(acct) {
-                                insert_credential(&mut cfg.mailbox_passwords, key, secret.clone());
-                            }
-                        }
-                    } else if let Some(acct) = lower
-                        .strip_suffix("_password")
-                        .or_else(|| lower.strip_suffix("-password"))
-                        .or_else(|| lower.strip_suffix("_pass"))
-                        .or_else(|| lower.strip_suffix("-pass"))
-                        .or_else(|| lower.strip_suffix(".pass"))
-                        .filter(|a| !a.is_empty())
-                    {
-                        if let Some(secret) = read_single_line_secret_file(&entry.path()) {
-                            for key in legacy_credential_keys(acct) {
-                                insert_credential(&mut cfg.passwords, key, secret.clone());
-                            }
-                        }
-                    } else if let Some(acct) = lower
-                        .strip_suffix("_totp_secret")
-                        .or_else(|| lower.strip_suffix("-totp-secret"))
-                        .or_else(|| lower.strip_suffix("_totp"))
-                        .or_else(|| lower.strip_suffix("-totp"))
-                        .or_else(|| lower.strip_suffix(".totp"))
-                        .or_else(|| lower.strip_suffix("_otpauth"))
-                        .or_else(|| lower.strip_suffix("-otpauth"))
-                        .or_else(|| lower.strip_suffix("_2fa"))
-                        .or_else(|| lower.strip_suffix("-2fa"))
-                        .filter(|a| !a.is_empty())
-                        && let Some(secret) = read_single_line_secret_file(&entry.path())
-                    {
-                        for key in legacy_credential_keys(acct) {
-                            insert_credential(&mut cfg.totp_secrets, key, secret.clone());
-                        }
-                    } else if !lower.starts_with('.')
-                        && !is_fleet_roster_name(&lower)
-                        && !matches!(
-                            lower.as_str(),
-                            "fleet-accounts.toml" | "ai-mailbox.toml" | "mailbox.toml"
-                        )
-                    {
-                        let stem = lower
-                            .strip_suffix(".toml")
-                            .or_else(|| lower.strip_suffix(".txt"))
-                            .or_else(|| lower.strip_suffix(".secret"))
-                            .or_else(|| lower.strip_suffix(".env"))
-                            .or_else(|| lower.strip_suffix(".conf"))
-                            .unwrap_or(&lower);
-                        // An email-named file is scoped to that address. Only a label-like
-                        // filename may supply a derived machine label.
-                        let derived = if stem.contains('@') {
-                            None
-                        } else {
-                            derive_account_label_from_email(&format!("{stem}@proton.me"))
-                        };
-                        if (is_machine_account_label(stem)
-                            || stem.contains('@')
-                            || derived.is_some())
-                            && let Ok(Some(raw_text)) =
-                                super::accounts::read_bounded(&entry.path(), 4096)
-                            && let Some(parsed) = MailboxConfig::parse_toml(&raw_text, home)
-                        {
-                            let mut target_keys = legacy_credential_keys(stem);
-                            if let Some(d) = derived.as_deref() {
-                                for k in legacy_credential_keys(d) {
-                                    if !target_keys.contains(&k) {
-                                        target_keys.push(k);
-                                    }
-                                }
-                            }
-                            for key in &target_keys {
-                                if let Some(pw) = parsed.password.as_ref() {
-                                    insert_credential(&mut cfg.passwords, key.clone(), pw.clone());
-                                }
-                                if let Some(mpw) = parsed.mailbox_password.as_ref() {
-                                    insert_credential(
-                                        &mut cfg.mailbox_passwords,
-                                        key.clone(),
-                                        mpw.clone(),
-                                    );
-                                }
-                                if let Some(totp) = parsed.totp_secret.as_ref() {
-                                    insert_credential(
-                                        &mut cfg.totp_secrets,
-                                        key.clone(),
-                                        totp.clone(),
-                                    );
-                                }
-                            }
-                            merge_credentials(&mut cfg.passwords, parsed.passwords);
-                            merge_credentials(&mut cfg.mailbox_passwords, parsed.mailbox_passwords);
-                            merge_credentials(&mut cfg.totp_secrets, parsed.totp_secrets);
-                            if cfg.webmail_url.is_none() {
-                                cfg.webmail_url = parsed.webmail_url;
-                            }
-                            if cfg.imap_url.is_none() {
-                                cfg.imap_url = parsed.imap_url;
-                            }
-                            if cfg.http_url.is_none() {
-                                cfg.http_url = parsed.http_url;
-                            }
-                            if cfg.bearer_token.is_none() {
-                                cfg.bearer_token = parsed.bearer_token;
-                            }
-                            if cfg.dir.is_none() {
-                                cfg.dir = parsed.dir;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        merge_vault_mailbox_secrets(h, &mut cfg);
     }
     if cfg.dir.is_none() {
         if let Some(store) = store_dir {
@@ -2244,6 +2093,255 @@ fn discover_mailbox_config_sources(
     }
     super::mailbox_needs::load_components(home, &mut cfg);
     (cfg, aliases)
+}
+
+/// The legacy names of the mailbox's own password, second password and TOTP secret, each list
+/// in the order a reader takes them.
+const LEGACY_MAILBOX_PASSWORDS: [&str; 8] = [
+    "ai_mailbox_password",
+    "ai-mailbox-password",
+    "mailbox_password",
+    "mailbox-password",
+    "proton_password",
+    "proton-password",
+    "imap_password",
+    "webmail_password",
+];
+const LEGACY_MAILBOX_SECOND_PASSWORDS: [&str; 8] = [
+    "ai_mailbox_second_password",
+    "ai-mailbox-second-password",
+    "second_password",
+    "second-password",
+    "proton_mailbox_password",
+    "proton-mailbox-password",
+    "proton_second_password",
+    "proton-second-password",
+];
+const LEGACY_MAILBOX_TOTPS: [&str; 8] = [
+    "ai_mailbox_totp",
+    "ai-mailbox-totp",
+    "mailbox_totp",
+    "mailbox-totp",
+    "proton_totp",
+    "proton-totp",
+    "totp_secret",
+    "totp-secret",
+];
+
+/// What a vault entry's name makes of it for a mailbox ([`merge_vault_mailbox_secrets`]).
+enum MailboxSecretName<'a> {
+    /// One of the mailbox's own legacy names.
+    Legacy,
+    /// `<account>_mailbox_password` (or `_second_password`).
+    SecondPassword(&'a str),
+    /// `<account>_password` (or `_pass`, `.pass`).
+    Password(&'a str),
+    /// `<account>_totp` (or `_totp_secret`, `_otpauth`, `_2fa`).
+    Totp(&'a str),
+    /// A label- or email-named mailbox configuration (`m27.toml`, `a@b.test`).
+    Config {
+        stem: &'a str,
+        derived: Option<String>,
+    },
+}
+
+fn mailbox_secret_name(lower: &str) -> Option<MailboxSecretName<'_>> {
+    if lower.contains('/') || lower.starts_with('~') {
+        return None;
+    }
+    if LEGACY_MAILBOX_PASSWORDS
+        .iter()
+        .chain(&LEGACY_MAILBOX_SECOND_PASSWORDS)
+        .chain(&LEGACY_MAILBOX_TOTPS)
+        .any(|name| *name == lower)
+    {
+        return Some(MailboxSecretName::Legacy);
+    }
+    if let Some(acct) = lower
+        .strip_suffix("_mailbox_password")
+        .or_else(|| lower.strip_suffix("-mailbox-password"))
+        .or_else(|| lower.strip_suffix("_second_password"))
+        .or_else(|| lower.strip_suffix("-second-password"))
+        .filter(|a| !a.is_empty())
+    {
+        return Some(MailboxSecretName::SecondPassword(acct));
+    }
+    if let Some(acct) = lower
+        .strip_suffix("_password")
+        .or_else(|| lower.strip_suffix("-password"))
+        .or_else(|| lower.strip_suffix("_pass"))
+        .or_else(|| lower.strip_suffix("-pass"))
+        .or_else(|| lower.strip_suffix(".pass"))
+        .filter(|a| !a.is_empty())
+    {
+        return Some(MailboxSecretName::Password(acct));
+    }
+    if let Some(acct) = lower
+        .strip_suffix("_totp_secret")
+        .or_else(|| lower.strip_suffix("-totp-secret"))
+        .or_else(|| lower.strip_suffix("_totp"))
+        .or_else(|| lower.strip_suffix("-totp"))
+        .or_else(|| lower.strip_suffix(".totp"))
+        .or_else(|| lower.strip_suffix("_otpauth"))
+        .or_else(|| lower.strip_suffix("-otpauth"))
+        .or_else(|| lower.strip_suffix("_2fa"))
+        .or_else(|| lower.strip_suffix("-2fa"))
+        .filter(|a| !a.is_empty())
+    {
+        return Some(MailboxSecretName::Totp(acct));
+    }
+    if lower.starts_with('.')
+        || is_fleet_roster_name(lower)
+        || matches!(
+            lower,
+            "fleet-accounts.toml" | "ai-mailbox.toml" | "mailbox.toml"
+        )
+    {
+        return None;
+    }
+    let stem = lower
+        .strip_suffix(".toml")
+        .or_else(|| lower.strip_suffix(".txt"))
+        .or_else(|| lower.strip_suffix(".secret"))
+        .or_else(|| lower.strip_suffix(".env"))
+        .or_else(|| lower.strip_suffix(".conf"))
+        .unwrap_or(lower);
+    // An email-named entry is scoped to that address. Only a label-like name may supply a
+    // derived machine label.
+    let derived = if stem.contains('@') {
+        None
+    } else {
+        derive_account_label_from_email(&format!("{stem}@proton.me"))
+    };
+    (is_machine_account_label(stem) || stem.contains('@') || derived.is_some())
+        .then_some(MailboxSecretName::Config { stem, derived })
+}
+
+/// Every vault entry a mailbox read takes for `home` ([`discover_mailbox_config_files`]): the
+/// two mailbox configurations, the sealed sign-in routes, and each name the vault holds that
+/// [`merge_vault_mailbox_secrets`] reads (a password, second password, TOTP secret or
+/// per-account configuration). Names only; a scheduler digests what they hold.
+pub(crate) fn vault_mailbox_entries(home: &Path) -> Vec<String> {
+    [
+        SECRETS_MAILBOX_TOML_FILE,
+        MAILBOX_TOML_FILE,
+        aterm_secrets::entry_class::AI_SIGNIN,
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(
+        crate::vault_entry::names(home)
+            .into_iter()
+            .filter(|name| mailbox_secret_name(&name.to_ascii_lowercase()).is_some()),
+    )
+    .collect()
+}
+
+/// The mailbox passwords, second passwords, TOTP secrets and per-account configurations the
+/// vault holds under their names, read from `home`'s store in one version of the vault
+/// ([`crate::vault_entry`]): the mailbox's own legacy names fill what `cfg` leaves empty, in their
+/// order; `<account>_password`, `_mailbox_password` and `_totp` entries and label- or email-named
+/// configurations add per-account credentials. Each value is bounded at 4096 bytes, and a secret
+/// is one line.
+fn merge_vault_mailbox_secrets(home: &Path, cfg: &mut MailboxConfig) {
+    let names = crate::vault_entry::names(home);
+    let wanted = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| mailbox_secret_name(&name.to_ascii_lowercase()).is_some())
+        .collect::<Vec<_>>();
+    if wanted.is_empty() {
+        return;
+    }
+    let values = wanted
+        .iter()
+        .copied()
+        .zip(crate::vault_entry::read_set(home, &wanted, 4096))
+        .filter_map(|(name, read)| Some((name, read.text()?.to_owned())))
+        .collect::<BTreeMap<_, _>>();
+    let line = |name: &str| values.get(name).and_then(|text| single_line_secret(text));
+    for (legacy, slot) in [
+        (&LEGACY_MAILBOX_PASSWORDS, &mut cfg.password),
+        (&LEGACY_MAILBOX_SECOND_PASSWORDS, &mut cfg.mailbox_password),
+        (&LEGACY_MAILBOX_TOTPS, &mut cfg.totp_secret),
+    ] {
+        for name in legacy {
+            if slot.is_none()
+                && let Some(secret) = line(name)
+            {
+                *slot = Some(secret);
+            }
+        }
+    }
+    for (name, text) in &values {
+        let lower = name.to_ascii_lowercase();
+        match mailbox_secret_name(&lower) {
+            None | Some(MailboxSecretName::Legacy) => {}
+            Some(MailboxSecretName::SecondPassword(acct)) => {
+                if let Some(secret) = single_line_secret(text) {
+                    for key in legacy_credential_keys(acct) {
+                        insert_credential(&mut cfg.mailbox_passwords, key, secret.clone());
+                    }
+                }
+            }
+            Some(MailboxSecretName::Password(acct)) => {
+                if let Some(secret) = single_line_secret(text) {
+                    for key in legacy_credential_keys(acct) {
+                        insert_credential(&mut cfg.passwords, key, secret.clone());
+                    }
+                }
+            }
+            Some(MailboxSecretName::Totp(acct)) => {
+                if let Some(secret) = single_line_secret(text) {
+                    for key in legacy_credential_keys(acct) {
+                        insert_credential(&mut cfg.totp_secrets, key, secret.clone());
+                    }
+                }
+            }
+            Some(MailboxSecretName::Config { stem, derived }) => {
+                let Some(parsed) = MailboxConfig::parse_toml(text, Some(home)) else {
+                    continue;
+                };
+                let mut target_keys = legacy_credential_keys(stem);
+                if let Some(d) = derived.as_deref() {
+                    for k in legacy_credential_keys(d) {
+                        if !target_keys.contains(&k) {
+                            target_keys.push(k);
+                        }
+                    }
+                }
+                for key in &target_keys {
+                    if let Some(pw) = parsed.password.as_ref() {
+                        insert_credential(&mut cfg.passwords, key.clone(), pw.clone());
+                    }
+                    if let Some(mpw) = parsed.mailbox_password.as_ref() {
+                        insert_credential(&mut cfg.mailbox_passwords, key.clone(), mpw.clone());
+                    }
+                    if let Some(totp) = parsed.totp_secret.as_ref() {
+                        insert_credential(&mut cfg.totp_secrets, key.clone(), totp.clone());
+                    }
+                }
+                merge_credentials(&mut cfg.passwords, parsed.passwords);
+                merge_credentials(&mut cfg.mailbox_passwords, parsed.mailbox_passwords);
+                merge_credentials(&mut cfg.totp_secrets, parsed.totp_secrets);
+                if cfg.webmail_url.is_none() {
+                    cfg.webmail_url = parsed.webmail_url;
+                }
+                if cfg.imap_url.is_none() {
+                    cfg.imap_url = parsed.imap_url;
+                }
+                if cfg.http_url.is_none() {
+                    cfg.http_url = parsed.http_url;
+                }
+                if cfg.bearer_token.is_none() {
+                    cfg.bearer_token = parsed.bearer_token;
+                }
+                if cfg.dir.is_none() {
+                    cfg.dir = parsed.dir;
+                }
+            }
+        }
+    }
 }
 
 #[cfg_attr(
@@ -6176,7 +6274,7 @@ fn cdp_tick(
     scope: Option<&super::account_work::Scope>,
 ) -> Result<Duration, CdpReceiveError> {
     let left = deadline.remaining().map_err(|_| CdpReceiveError::Timeout)?;
-    Ok(if scope.is_some() || deadline.counts_sleep() {
+    Ok(if scope.is_some() || deadline.looks_again() {
         left.min(Duration::from_millis(25))
     } else {
         left
@@ -7734,6 +7832,64 @@ pub const BOT_CHECK_UNCLEARED: &str =
 pub const BLOCK_PAGE_MET: &str =
     "Cloudflare's block page answered the sign-in; aterm never tries to pass it";
 
+/// A token consent page's end on the account's headless profile where it carried a human
+/// check's widget (hCaptcha, reCAPTCHA or Turnstile) until the drive's deadline
+/// ([`MetWord::HumanCheck`]): nothing was pressed.
+pub const TOKEN_HUMAN_CHECK: &str = "the token's consent page carried a human check (hCaptcha, \
+                                     reCAPTCHA or Turnstile); aterm never operates one, and \
+                                     pressed nothing there";
+
+/// A token consent page's end on the account's headless profile where the page did not show
+/// the account's email as the one signed in, or reached its callback with nothing pressed
+/// ([`MetWord::ConsentUnproven`]): nothing was pressed or handed over.
+pub const TOKEN_CONSENT_UNPROVEN: &str = "the token's consent page did not show the account as \
+                                          the one signed in, so aterm pressed nothing";
+
+/// Serves an account's token consent page (`url`, which `claude setup-token` handed its
+/// opener) on the account's own proven headless profile under the accounts store `store_dir`,
+/// as the second pinned request of the headless route after its sign-in (plan package FL-137;
+/// `docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` S5). The request must be a setup-token's
+/// ([`super::setup_token::admit_url`]) under [`super::open_url::CLAUDE_PIN`], and the profile
+/// one a sign-in proved ([`has_browser_profile`]); none is made here. `Authorize` is pressed
+/// once, and only where the page shows `target_email` as the account signed in
+/// ([`shows_email`]); Cloudflare's check and the consent page's human check are waited on with
+/// nothing pressed. What it met is noted for [`take_met`].
+///
+/// # Errors
+/// The request or profile is not one it serves, the browser could not start or be driven, or
+/// the page met what it never passes or did not show the account; the error says which.
+pub fn authorize_token_consent(
+    url: &str,
+    store_dir: Option<&Path>,
+    label: Option<&str>,
+    target_email: Option<&str>,
+    timeout: Duration,
+) -> Result<(), &'static str> {
+    let _ = take_met();
+    #[cfg(target_os = "macos")]
+    {
+        let request = token_consent::TokenRequest::of(url, store_dir, label, target_email)?;
+        let clock = Instant::now;
+        let deadline = Deadline::new(timeout, &clock);
+        finish_deadline(
+            authorize_pinned_browser_until(
+                url,
+                store_dir,
+                Some(&request.email),
+                deadline,
+                PinnedRequest::TokenConsent(&request),
+                super::open_url::CLAUDE_PIN,
+            ),
+            deadline,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (url, store_dir, label, target_email, timeout);
+        Err("a token's consent page is served only on macOS, where a token is made")
+    }
+}
+
 /// A Claude sign-in's end where the sign-in in aterm's own window returned no callback
 /// ([`VisibleStop::Failed`]).
 pub const BROWSER_SIGN_IN_FAILED: &str = "the sign-in in aterm's sign-in window did not complete";
@@ -7813,9 +7969,15 @@ pub(super) enum VisibleStop {
     Closed,
     /// The consent page named an account that is not the row's.
     WrongAccount,
+    /// The code page asked for a login code until the sign-in's deadline and nobody typed one,
+    /// where the window reads no mailbox of the account here: that, in words. A mailbox the
+    /// window read and then dropped is [`Self::Failed`], since another try may read it.
+    CodeNoMailbox(String),
+    /// The sign-in's deadline came where it stood on no check and no code page: where it stood.
+    Deadline(String),
     /// It ran and returned no callback of this flow, for a reason another try may not meet
-    /// (a page that did not load, a mailbox that did not answer, a deadline): why, without
-    /// the callback or a code.
+    /// (a page that did not load, a mailbox that did not answer or that the window dropped):
+    /// why, without the callback or a code.
     Failed(String),
 }
 
@@ -8107,41 +8269,47 @@ pub(super) fn note_visible_stop(stop: VisibleStop) -> &'static str {
             note_met(MetWord::WindowWrongAccount, None);
             WINDOW_WRONG_ACCOUNT
         }
-        VisibleStop::Failed(why) => {
-            // The reason goes with the outcome, so the renewal that reads it prints and
-            // records why the window's sign-in ended, not only that it did. Standard error
-            // says the same admitted line and nothing more.
-            let met = super::open_url::Met::new(MetWord::BrowserSignIn, None).because(&why);
-            #[cfg(not(test))]
-            eprintln!(
-                "aterm: the sign-in in aterm's sign-in window failed: {}",
-                met.why.as_deref().unwrap_or("no reason it can print")
-            );
-            MET.with(|slot| *slot.borrow_mut() = Some(met));
-            BROWSER_SIGN_IN_FAILED
-        }
+        VisibleStop::CodeNoMailbox(why) => note_failed_visible(MetWord::WindowCodeNoMailbox, &why),
+        VisibleStop::Deadline(why) => note_failed_visible(MetWord::WindowDeadline, &why),
+        VisibleStop::Failed(why) => note_failed_visible(MetWord::BrowserSignIn, &why),
     }
 }
 
-fn drive_cdp_oauth_flow_until(
-    cdp: &mut CdpClient,
-    (authorize_url, flow, google_config): (&str, MailboxFlow, Option<&MailboxConfig>),
-    target_email: Option<&str>,
-    (deadline, poll_interval): (Deadline<'_>, Duration),
-    bot_stall: Duration,
-    mut mailbox_credential: impl FnMut(
-        &mut CdpClient,
-        Option<&str>,
-    ) -> Result<MailboxCredential, &'static str>,
-    mut deliver_callback: impl FnMut(&str) -> Result<u16, &'static str>,
-) -> Result<(), &'static str> {
-    let _ = take_met();
-    let email = target_email
-        .filter(|e| !e.trim().is_empty())
-        .map(str::to_owned)
-        .or_else(|| extract_login_hint(authorize_url));
-    let step_timeout = || deadline.left();
+/// Notes a sign-in in aterm's window that returned no callback for `word`, with `why`
+/// ([`super::open_url::Met::because`]), and answers the drive's words for it: the reason goes
+/// with the outcome, so the renewal that reads it prints and records why the window's sign-in
+/// ended, not only that it did. Standard error says the same admitted line and nothing more.
+fn note_failed_visible(word: MetWord, why: &str) -> &'static str {
+    let met = super::open_url::Met::new(word, None).because(why);
+    #[cfg(not(test))]
+    eprintln!(
+        "aterm: the sign-in in aterm's sign-in window failed: {}",
+        met.why.clone().unwrap_or_else(|| word.words())
+    );
+    MET.with(|slot| *slot.borrow_mut() = Some(met));
+    BROWSER_SIGN_IN_FAILED
+}
 
+/// Opens a tab on `authorize_url` in the browser `cdp` drives and attaches to it with its page
+/// and runtime events on: the tab's target and its session ([`close_flow_page`] ends both).
+fn open_flow_page(
+    cdp: &mut CdpClient,
+    authorize_url: &str,
+    deadline: Deadline<'_>,
+) -> Result<(String, String), &'static str> {
+    let (target_id, session) = open_flow_tab(cdp, deadline)?;
+    navigate_flow_tab(cdp, &session, authorize_url, deadline)?;
+    Ok((target_id, session))
+}
+
+/// Opens a blank tab in the browser `cdp` drives and attaches to it with its page and runtime
+/// events on, before any page of a flow is asked for: the tab's target and its session
+/// ([`navigate_flow_tab`] sends it to the flow's page, [`close_flow_page`] ends both).
+fn open_flow_tab(
+    cdp: &mut CdpClient,
+    deadline: Deadline<'_>,
+) -> Result<(String, String), &'static str> {
+    let step_timeout = || deadline.left();
     let target = cdp
         .call(
             None,
@@ -8176,15 +8344,57 @@ fn drive_cdp_oauth_flow_until(
             .call(Some(&session), method, json!({}), step_timeout()?)
             .map_err(browser_control_failed)?;
     }
+    Ok((target_id, session))
+}
 
-    let _ = cdp
-        .call(
-            Some(&session),
-            "Page.navigate",
-            json!({"url": authorize_url}),
-            step_timeout()?,
-        )
-        .map_err(browser_control_failed)?;
+/// Sends the tab `session` ([`open_flow_tab`]) to `authorize_url`.
+fn navigate_flow_tab(
+    cdp: &mut CdpClient,
+    session: &str,
+    authorize_url: &str,
+    deadline: Deadline<'_>,
+) -> Result<(), &'static str> {
+    cdp.call(
+        Some(session),
+        "Page.navigate",
+        json!({"url": authorize_url}),
+        deadline.left()?,
+    )
+    .map(drop)
+    .map_err(browser_control_failed)
+}
+
+/// Closes the tab [`open_flow_page`] opened, then the browser, each within two seconds and
+/// whatever either answers.
+fn close_flow_page(cdp: &mut CdpClient, target_id: &str) {
+    let _ = cdp.call(
+        None,
+        "Target.closeTarget",
+        json!({"targetId": target_id}),
+        Duration::from_secs(2),
+    );
+    let _ = cdp.call(None, "Browser.close", json!({}), Duration::from_secs(2));
+}
+
+fn drive_cdp_oauth_flow_until(
+    cdp: &mut CdpClient,
+    (authorize_url, flow, google_config): (&str, MailboxFlow, Option<&MailboxConfig>),
+    target_email: Option<&str>,
+    (deadline, poll_interval): (Deadline<'_>, Duration),
+    bot_stall: Duration,
+    mut mailbox_credential: impl FnMut(
+        &mut CdpClient,
+        Option<&str>,
+    ) -> Result<MailboxCredential, &'static str>,
+    mut deliver_callback: impl FnMut(&str) -> Result<u16, &'static str>,
+) -> Result<(), &'static str> {
+    let _ = take_met();
+    let email = target_email
+        .filter(|e| !e.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| extract_login_hint(authorize_url));
+    let step_timeout = || deadline.left();
+    let (target_id, session) = open_flow_page(cdp, authorize_url, deadline)?;
 
     let google = authorize_url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?");
     let google_password = google_config
@@ -8487,13 +8697,7 @@ fn drive_cdp_oauth_flow_until(
         }
     })();
 
-    let _ = cdp.call(
-        None,
-        "Target.closeTarget",
-        json!({"targetId": target_id}),
-        Duration::from_secs(2),
-    );
-    let _ = cdp.call(None, "Browser.close", json!({}), Duration::from_secs(2));
+    close_flow_page(cdp, &target_id);
     result
 }
 
@@ -8595,10 +8799,12 @@ pub fn authorize_google_mail(
             authorize_pinned_browser_until(
                 authorize_url,
                 Some(store_dir),
-                mailbox_cfg,
                 Some(target_email),
                 deadline,
-                None,
+                PinnedRequest::SignIn {
+                    mailbox_cfg,
+                    pending_credential: None,
+                },
                 super::open_url::Pin::Hosts(&["accounts.google.com"]),
             ),
             deadline,
@@ -8668,22 +8874,57 @@ pub(super) fn authorize_with_headless_browser_until(
     authorize_pinned_browser_until(
         authorize_url,
         store_dir,
-        mailbox_cfg,
         target_email,
         deadline,
-        pending_credential,
+        PinnedRequest::SignIn {
+            mailbox_cfg,
+            pending_credential,
+        },
         super::open_url::CLAUDE_PIN,
     )
+}
+
+/// What a pinned browser serves ([`authorize_pinned_browser_until`]).
+#[cfg(unix)]
+enum PinnedRequest<'a> {
+    /// A sign-in, driven page by page, with the mailbox's code or link where a page asks for
+    /// one ([`drive_cdp_oauth_with_webmail`]).
+    SignIn {
+        /// The mailbox the sign-in's code comes from.
+        mailbox_cfg: Option<&'a MailboxConfig>,
+        /// A credential an HTTP probe already took from the mailbox.
+        pending_credential: Option<MailboxCredential>,
+    },
+    /// An account's token consent page, the second pinned request on the account's proven
+    /// profile (plan package FL-137; [`token_consent`]): read, and `Authorize` pressed only
+    /// where the page shows the account.
+    #[cfg(target_os = "macos")]
+    TokenConsent(&'a token_consent::TokenRequest<'a>),
+}
+
+/// Hands a Claude flow's callback `cb_url` to the waiting CLI: a hosted code to the file the
+/// capture or renewal reads, whatever is left of the drive's own `deadline`; a loopback
+/// callback, which only the headless page reaches here, to its listener inside it.
+#[cfg(unix)]
+fn deliver_claude_callback(cb_url: &str, deadline: Deadline<'_>) -> Result<u16, &'static str> {
+    if cb_url.split('?').next() == Some("https://platform.claude.com/oauth/code/callback") {
+        super::open_url::hand_over_hosted(cb_url)?;
+        return Ok(200);
+    }
+    deadline.left()?;
+    note_callback_offered();
+    let mut cookies = BTreeMap::new();
+    super::open_url::loopback_http_exchange_until("GET", cb_url, &mut cookies, None, deadline)
+        .map(|r| r.status)
 }
 
 #[cfg(unix)]
 fn authorize_pinned_browser_until(
     authorize_url: &str,
     store_dir: Option<&Path>,
-    mailbox_cfg: Option<&MailboxConfig>,
     target_email: Option<&str>,
     deadline: Deadline<'_>,
-    mut pending_credential: Option<MailboxCredential>,
+    request: PinnedRequest<'_>,
     pin: super::open_url::Pin,
 ) -> Result<(), &'static str> {
     use std::os::fd::OwnedFd;
@@ -8723,9 +8964,24 @@ fn authorize_pinned_browser_until(
             let make_up_until = deadline.limited(super::browser_window::MAKE_UP_WITHIN);
             deadline.left()?;
             let _ = super::browser_window::make_up_tidy_until(&mut cdp, profile_dir, make_up_until);
-            let mut seen_otps = BTreeSet::new();
-
             deadline.left()?;
+            let (mailbox_cfg, mut pending_credential) = match request {
+                PinnedRequest::SignIn {
+                    mailbox_cfg,
+                    pending_credential,
+                } => (mailbox_cfg, pending_credential),
+                #[cfg(target_os = "macos")]
+                PinnedRequest::TokenConsent(token) => {
+                    return token_consent::drive_until(
+                        &mut cdp,
+                        token,
+                        (deadline, Duration::from_millis(200)),
+                        (VENDOR_STALL, token_consent::PROOF_STALL),
+                        |cb_url| deliver_claude_callback(cb_url, deadline),
+                    );
+                }
+            };
+            let mut seen_otps = BTreeSet::new();
             drive_cdp_oauth_flow_until(
                 &mut cdp,
                 (
@@ -8761,28 +9017,7 @@ fn authorize_pinned_browser_until(
                         &mut seen_otps,
                     )
                 },
-                |cb_url| {
-                    // A hosted code is a file the renewal reads, so it is handed over whatever
-                    // is left of the drive's own deadline; a loopback callback only the
-                    // headless page reaches here, inside it.
-                    if cb_url.split('?').next()
-                        == Some("https://platform.claude.com/oauth/code/callback")
-                    {
-                        super::open_url::hand_over_hosted(cb_url)?;
-                        return Ok(200);
-                    }
-                    deadline.left()?;
-                    note_callback_offered();
-                    let mut cookies = BTreeMap::new();
-                    super::open_url::loopback_http_exchange_until(
-                        "GET",
-                        cb_url,
-                        &mut cookies,
-                        None,
-                        deadline,
-                    )
-                    .map(|r| r.status)
-                },
+                |cb_url| deliver_claude_callback(cb_url, deadline),
             )
         },
         |error| {
@@ -9707,10 +9942,11 @@ fn page_step(page: &Page, gate: &Gate<'_>) -> Step {
     Step::Wait
 }
 
-/// Reads the page into a [`Page`]: its URL, first heading, visible text (8000 characters at
-/// most), enabled visible buttons' labels and inputs' kinds, title, and the [`Marker`]s of
-/// Cloudflare's challenge on it.
-pub const VENDOR_PAGE_JS: &str = concat!(
+/// [`VENDOR_PAGE_JS`]'s expression, for a reader that answers more than its [`Page`]
+/// (`token_consent`'s).
+macro_rules! vendor_page_js {
+    () => {
+        concat!(
     "(() => {",
     bot_check_helpers_js!(),
     r#"  const visible = el => !el.disabled && !el.hidden && el.type !== "hidden" &&
@@ -9740,7 +9976,14 @@ pub const VENDOR_PAGE_JS: &str = concat!(
     markers: botCheckMarkers()
   };
 })()"#
-);
+        )
+    };
+}
+
+/// Reads the page into a [`Page`]: its URL, first heading, visible text (8000 characters at
+/// most), enabled visible buttons' labels and inputs' kinds, title, and the [`Marker`]s of
+/// Cloudflare's challenge on it.
+pub const VENDOR_PAGE_JS: &str = vendor_page_js!();
 
 /// The JavaScript that carries out `step` on the page read by [`VENDOR_PAGE_JS`]: a press of the
 /// same enumeration's button, or `value` typed into the first input of the step's kind and
@@ -10803,6 +11046,10 @@ impl VendorApprover {
         }
     }
 }
+
+#[cfg(all(unix, any(test, target_os = "macos")))]
+#[path = "headless_token_consent.rs"]
+pub(super) mod token_consent;
 
 #[cfg(test)]
 #[path = "headless_vendor_tests.rs"]

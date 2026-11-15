@@ -521,11 +521,12 @@ fn line(l: &Launch, via: Via, keeper: &Path, sock: &Path) -> Vec<String> {
 }
 
 /// The admission a caller requests for its window. Timing stays the default;
-/// functional work must name its memory reservation explicitly.
+/// non-timing work must name its memory reservation explicitly.
 #[derive(Clone, Copy)]
 enum WindowWork {
     Timing,
     Functional { memory_bytes: u64, retain: bool },
+    Correctness { memory_bytes: u64 },
 }
 
 enum WindowAdmission {
@@ -538,13 +539,36 @@ enum WindowAdmission {
     Functional {
         _claim: aterm_capacity::Claim,
     },
+    Correctness {
+        _claim: aterm_capacity::Claim,
+    },
 }
 
 impl WindowAdmission {
     fn memory(&self) -> Option<&aterm_capacity::RetainedClaim> {
         match self {
             Self::Retained { memory } => Some(memory),
-            Self::Timing { .. } | Self::Functional { .. } => None,
+            Self::Timing { .. } | Self::Functional { .. } | Self::Correctness { .. } => None,
+        }
+    }
+
+    fn measurement_entry(&mut self) -> Result<aterm_capacity::TimingEvidence, String> {
+        match self {
+            Self::Timing { _claim } => {
+                _claim.measurement_entry().map_err(|e| e.to_string())?;
+                Ok(_claim.record().timing)
+            }
+            _ => Err("the instance has no strict Timing claim".into()),
+        }
+    }
+
+    fn timing_admission(&self) -> Result<aterm_capacity::TimingEvidence, String> {
+        match self {
+            Self::Timing { _claim } => {
+                _claim.timing_admission().map_err(|e| e.to_string())?;
+                Ok(_claim.record().timing)
+            }
+            _ => Err("the instance has no strict Timing claim".into()),
         }
     }
 }
@@ -565,6 +589,11 @@ fn windowed_admission(l: &Launch, work: WindowWork) -> Result<Option<WindowAdmis
         WindowWork::Timing => crate::admission::quiet(&what)
             .map(|claim| WindowAdmission::Timing { _claim: claim })
             .map_err(|fail| fail.msg.unwrap_or_default()),
+        WindowWork::Correctness { memory_bytes } => {
+            crate::admission::correctness(&what, memory_bytes)
+                .map(|claim| WindowAdmission::Correctness { _claim: claim })
+                .map_err(|fail| fail.msg.unwrap_or_default())
+        }
         WindowWork::Functional {
             memory_bytes,
             retain,
@@ -803,7 +832,64 @@ impl Instance {
         memory_bytes: u64,
         band: Band,
     ) -> Result<Instance, String> {
-        Self::start_functional_custody(world, l, memory_bytes, band, false)
+        Self::start_functional_custody(world, l, memory_bytes, band, false, None)
+    }
+
+    /// The sizing recorder starts only after an ordinary functional memory claim is
+    /// admitted and before the child is born. This never supplies Timing authority.
+    /// # Errors
+    /// A headless launch, zero budget, refused functional admission, recorder startup
+    /// failure, or the process/launch errors of [`Self::start_in`].
+    pub(super) fn start_functional_sizing(
+        world: &World,
+        l: Launch,
+        memory_bytes: u64,
+        generation: crate::band::Generation,
+        on_admitted: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Instance, String> {
+        if l.headless || memory_bytes == 0 {
+            return Err("sizing needs a native window and an explicit positive functional budget; it started nothing".into());
+        }
+        Self::start_in_on_socket_generation(
+            world,
+            l,
+            Band::App,
+            &world.sock,
+            WindowWork::Functional {
+                memory_bytes,
+                retain: false,
+            },
+            |_| on_admitted(),
+            Some(generation),
+            None,
+        )
+    }
+
+    /// Start a correctness-only native window under both window and quiet-claim exclusion.
+    /// Requires a positive memory budget, but neither CPU quiet nor timing qualification.
+    /// # Errors
+    /// A headless launch, zero budget, unavailable resources, or a failure named by
+    /// [`Self::start_in`]. No child starts when admission fails.
+    pub(crate) fn start_correctness_in(
+        world: &World,
+        l: Launch,
+        memory_bytes: u64,
+        band: Band,
+    ) -> Result<Instance, String> {
+        if l.headless || memory_bytes == 0 {
+            return Err(
+                "correctness window needs a window and a nonzero memory budget; it started nothing"
+                    .into(),
+            );
+        }
+        Self::start_in_on_socket(
+            world,
+            l,
+            band,
+            &world.sock,
+            WindowWork::Correctness { memory_bytes },
+            |_| Ok(()),
+        )
     }
 
     /// Explicit private qualification of a detached original reservation.
@@ -814,7 +900,19 @@ impl Instance {
         memory_bytes: u64,
         band: Band,
     ) -> Result<Instance, String> {
-        Self::start_functional_custody(world, l, memory_bytes, band, true)
+        Self::start_retained_functional_generation(world, l, memory_bytes, band, None)
+    }
+
+    /// The independent custody controller reserves this exact generation before
+    /// the owner starts, so missing readiness cannot lose its cleanup locator.
+    pub(crate) fn start_retained_functional_generation(
+        world: &World,
+        l: Launch,
+        memory_bytes: u64,
+        band: Band,
+        generation: Option<crate::band::Generation>,
+    ) -> Result<Instance, String> {
+        Self::start_functional_custody(world, l, memory_bytes, band, true, generation)
     }
 
     fn start_functional_custody(
@@ -823,11 +921,12 @@ impl Instance {
         memory_bytes: u64,
         band: Band,
         retain: bool,
+        generation: Option<crate::band::Generation>,
     ) -> Result<Instance, String> {
         if l.headless || memory_bytes == 0 {
             return Err("functional window needs a window and a nonzero memory reservation; it started nothing".into());
         }
-        Self::start_in_on_socket(
+        Self::start_in_on_socket_generation(
             world,
             l,
             band,
@@ -837,6 +936,8 @@ impl Instance {
                 retain,
             },
             |_| Ok(()),
+            generation,
+            None,
         )
     }
 
@@ -976,16 +1077,79 @@ impl Instance {
 
     fn start_in_on_socket(
         world: &World,
-        mut l: Launch,
+        l: Launch,
         band: Band,
         socket: &Path,
         work: WindowWork,
         prepare: impl FnOnce(&mut Vec<(String, String)>) -> Result<(), String>,
     ) -> Result<Instance, String> {
+        Self::start_in_on_socket_generation(world, l, band, socket, work, prepare, None, None)
+    }
+
+    /// Only the typed quad owner calls this path; ordinary starts always acquire their
+    /// own admission. Borrowing cannot transfer or renew the original claim.
+    pub(super) fn start_comparison<'q>(
+        world: &World,
+        l: Launch,
+        permit: crate::timing_comparison::LaunchPermit<'q>,
+    ) -> Result<crate::timing_comparison::Arm<'q>, String> {
+        let inst = Self::start_in_on_socket_generation(
+            world,
+            l,
+            Band::App,
+            &world.sock,
+            WindowWork::Timing,
+            |_| Ok(()),
+            Some(permit.generation()),
+            Some(permit.claim()),
+        )?;
+        Ok(permit.bind(inst))
+    }
+
+    pub(super) fn comparison_generation(&self) -> Option<&str> {
+        match &self.child {
+            Proc::Job(job) => Some(job.generation.word()),
+            _ => None,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one launch path binds generation and optional borrowed comparison custody before spawn"
+    )]
+    fn start_in_on_socket_generation(
+        world: &World,
+        mut l: Launch,
+        band: Band,
+        socket: &Path,
+        work: WindowWork,
+        prepare: impl FnOnce(&mut Vec<(String, String)>) -> Result<(), String>,
+        generation: Option<crate::band::Generation>,
+        comparison: Option<&aterm_capacity::Claim>,
+    ) -> Result<Instance, String> {
+        if let Some(claim) = comparison {
+            if l.headless || Via::of(&l, band)? == Via::Child {
+                return Err("a comparison arm requires an app-band native window".into());
+            }
+            crate::admission::window_lane().map_err(|f| f.msg.unwrap_or_default())?;
+            claim.comparison_custody().map_err(|e| e.to_string())?;
+        }
         if Via::of(&l, band)? == Via::Child {
+            if generation.is_some() {
+                return Err("an app-band generation cannot name a child launch".into());
+            }
             return Self::start_on_socket(world, l, socket, work, prepare);
         }
-        let admission = windowed_admission(&l, work)?;
+        if l.headless && generation.is_some() {
+            return Err("custody generation requires a windowed app-band launch".into());
+        }
+        // The comparison owner lends its original claim for this synchronous launch and
+        // retains it until this exact instance has completed recorded cleanup.
+        let admission = if comparison.is_some() {
+            None
+        } else {
+            windowed_admission(&l, work)?
+        };
         let log = world.dir.join("aterm.log");
         crate::util::create_stdio_file(&log)
             .map_err(|e| format!("cannot create {}: {e}", log.display()))?;
@@ -1002,8 +1166,14 @@ impl Instance {
                 admission.as_ref().and_then(WindowAdmission::memory),
             )?;
             prepare(&mut l.env)?;
-            Job::start_with_guards(&world.dir, &line, &l.env, &l.cwd, &log, guards)
-                .map_err(|error| world.retain_start_failure(error))?
+            let generation = match generation {
+                Some(generation) => generation,
+                None => crate::band::Generation::fresh()?,
+            };
+            Job::start_with_guards_generation(
+                &world.dir, &line, &l.env, &l.cwd, &log, guards, generation,
+            )
+            .map_err(|error| world.retain_start_failure(error))?
         };
         let pid = job.pid;
         Ok(Instance {
@@ -1151,6 +1321,28 @@ impl Instance {
             .map_err(|e| format!("cannot reach {}: {e}", self.sock.display()))
     }
 
+    /// Refresh the existing window's strict Timing claim after setup and warmup.
+    /// This does not acquire another claim or turn functional admission into timing evidence.
+    /// # Errors
+    /// The instance has no Timing claim, or its fresh CPU observation refuses measurement.
+    pub fn measurement_entry(&mut self) -> Result<aterm_capacity::TimingEvidence, String> {
+        self._admission
+            .as_mut()
+            .ok_or("the instance has no strict Timing claim")?
+            .measurement_entry()
+    }
+
+    /// Revalidate the held Timing admission before publishing measurements.
+    /// This checks its original sampled admission and unexpired hold, not continuous quiet.
+    /// # Errors
+    /// The instance has no qualified, unexpired Timing claim.
+    pub fn timing_admission(&self) -> Result<aterm_capacity::TimingEvidence, String> {
+        self._admission
+            .as_ref()
+            .ok_or("the instance has no strict Timing claim")?
+            .timing_admission()
+    }
+
     /// Whether it still runs.
     pub fn running(&mut self) -> bool {
         self.exited().is_none()
@@ -1215,6 +1407,14 @@ impl Instance {
     pub(crate) fn qualification_job_label(&self) -> Option<&str> {
         match &self.child {
             Proc::Job(job) => Some(&job.label),
+            Proc::Child(_) => None,
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn qualification_job_generation(&self) -> Option<&crate::band::Generation> {
+        match &self.child {
+            Proc::Job(job) => Some(&job.generation),
             Proc::Child(_) => None,
         }
     }

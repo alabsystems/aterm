@@ -34,6 +34,7 @@ pub(crate) fn history(t: &Terminal) -> Vec<String> {
 
 fn record(local_id: u64) -> SessionRecord {
     SessionRecord {
+        pinned: false,
         local_id,
         sid: format!("s-{local_id:04x}"),
         parent: None,

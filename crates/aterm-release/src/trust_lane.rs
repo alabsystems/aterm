@@ -1792,7 +1792,7 @@ impl TreeTimes {
 /// socket now, when the `trustd` it ran beside went away while it ran.
 ///
 /// # Errors
-/// Returns an error if any sidecar mark file cannot be written.
+/// Returns an error if the diagnostic log cannot be read completely or a sidecar cannot be written.
 pub fn record(
     f: &Finished,
     budget: Duration,
@@ -1801,30 +1801,63 @@ pub fn record(
 ) -> std::io::Result<()> {
     let log = &f.job.log;
     let beside = |ext: &str| PathBuf::from(format!("{}.{ext}", log.display()));
-    crate::durable::write_fresh(&beside("rc"), format!("{}\n", f.ended.code))?;
-    crate::durable::write_fresh(&beside("pace"), format!("{}\n", pace_of(f, cores).text()))?;
+    let mut errors = Vec::new();
+    let mut write = |ext: &str, text: String| {
+        let path = beside(ext);
+        if let Err(error) = crate::durable::write_fresh(&path, text) {
+            errors.push(format!("{}: {error}", path.display()));
+        }
+    };
+    write("rc", format!("{}\n", f.ended.code));
+    write("pace", format!("{}\n", pace_of(f, cores).text()));
     if f.over_budget {
-        crate::durable::write_fresh(&beside("budget"), format!("{}\n", budget.as_secs()))?;
+        write("budget", format!("{}\n", budget.as_secs()));
     }
-    let text = crate::durable::read_file(log).unwrap_or_default();
-    let refused = text
-        .windows(trust_facts::TRUSTD_REFUSED.len())
-        .any(|w| w == trust_facts::TRUSTD_REFUSED.as_bytes());
-    if refused {
-        crate::durable::write_fresh(&beside("trustd"), format!("{}\n", probe()))?;
+    let refused = crate::durable::open_regular_file(log).and_then(log_refused);
+    if matches!(refused, Ok(true)) {
+        write("trustd", format!("{}\n", probe()));
     }
     if f.trustd_lost {
         // What serves the socket now that the trustd the check ran beside went away.
         let now = probe();
         let what = now.split_once('\t').map_or(now.as_str(), |(_, what)| what);
-        crate::durable::write_fresh(&beside("trustd-lost"), format!("{what}\n"))?;
+        write("trustd-lost", format!("{what}\n"));
     }
     if let Some(lock) = &f.job.lock
         && lock.created
     {
         let _ = fs::remove_file(&lock.path);
     }
-    Ok(())
+    if let Err(error) = refused {
+        errors.push(format!("{}: {error}", log.display()));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(errors.join("; ")))
+    }
+}
+
+/// Search the entire log with constant storage, retaining enough overlap for a split literal.
+/// Even after a match, finish reading so a later IO failure cannot establish a complete receipt.
+fn log_refused(mut log: impl std::io::Read) -> std::io::Result<bool> {
+    const NEEDLE: &[u8] = trust_facts::TRUSTD_REFUSED.as_bytes();
+    let mut buf = [0u8; 8192 + NEEDLE.len()];
+    let mut kept = 0;
+    let mut found = false;
+    loop {
+        let n = match log.read(&mut buf[kept..]) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            read => read?,
+        };
+        if n == 0 {
+            return Ok(found);
+        }
+        let end = kept + n;
+        found = found || buf[..end].windows(NEEDLE.len()).any(|w| w == NEEDLE);
+        kept = (NEEDLE.len() - 1).min(end);
+        buf.copy_within(end - kept..end, 0);
+    }
 }
 
 /// Host prover, metadata resolver, and slot runner abstraction.
@@ -2499,6 +2532,29 @@ fn work(prep: &Prepared) -> Vec<&Selected> {
         .collect()
 }
 
+/// Clear one owned receipt name before any check runs, preserving an unexpected entry.
+fn clear_receipt(path: &Path, directory: bool) -> std::io::Result<()> {
+    let remove = || {
+        let meta = fs::symlink_metadata(path)?;
+        if directory && meta.is_dir() {
+            fs::remove_dir_all(path)
+        } else if !directory && meta.is_file() {
+            fs::remove_file(path)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unexpected receipt entry; preserved",
+            ))
+        }
+    };
+    match remove() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => {
+            result.map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+        }
+    }
+}
+
 /// The checks, then the judge: `Err` is why nothing was decided.
 fn check_and_conclude(
     cfg: &Config,
@@ -2508,7 +2564,8 @@ fn check_and_conclude(
 ) -> Result<Outcome, String> {
     let work = work(prep);
     for stale in [".trustd-grants", ".trustd-seen"] {
-        let _ = fs::remove_file(prep.logdir.join(stale));
+        clear_receipt(&prep.logdir.join(stale), false)
+            .map_err(|e| format!("compiler receipt namespace could not be cleared: {e}"))?;
     }
     for s in &work {
         let log = prep.logdir.join(format!("{}.log", s.lib.spec));
@@ -2522,9 +2579,11 @@ fn check_and_conclude(
             ".oblig.tsv",
             ".oblig.err",
         ] {
-            let _ = fs::remove_file(format!("{}{ext}", log.display()));
+            clear_receipt(Path::new(&format!("{}{ext}", log.display())), false)
+                .map_err(|e| format!("compiler receipt namespace could not be cleared: {e}"))?;
         }
-        let _ = fs::remove_dir_all(format!("{}.report", log.display()));
+        clear_receipt(Path::new(&format!("{}.report", log.display())), true)
+            .map_err(|e| format!("compiler receipt namespace could not be cleared: {e}"))?;
     }
     let seed = cfg.repo.join(trust_facts::COSTS);
     let costs = &prep.costs;
@@ -2553,6 +2612,7 @@ fn check_and_conclude(
     let mut credit = crate::trust_credit::Credit::default();
     // Each check's mean load, for the run's provenance.
     let mut loads: Vec<f64> = Vec::new();
+    let mut receipt_errors = Vec::new();
     if !jobs.is_empty() {
         let slots = prep.jobs.min(jobs.len());
         let _ = writeln!(
@@ -2567,35 +2627,53 @@ fn check_and_conclude(
         let budget = cfg.budget;
         let cores = prep.cores;
         let mut done = |f: Finished, checks: &mut dyn Checks| {
+            let cost = match cost_of(&f, &prep.driver) {
+                Ok(cost) => cost,
+                Err(error) => {
+                    receipt_errors.push(format!("{}: {error}", f.job.log.display()));
+                    cost_when_cut(&f, &prep.driver, Some(Cut::Failed))
+                }
+            };
+            if let Some(c) = cost {
+                new_costs.insert(f.job.name.clone(), c);
+            }
             if f.interrupted {
                 // Ended by the run's stop, it decides nothing: only what it measured is kept.
-                if let Some(c) = cost_of(&f, &prep.driver) {
-                    new_costs.insert(f.job.name.clone(), c);
-                }
                 return;
             }
             let mut probe = || checks.probe_trustd();
             if let Some(l) = f.load {
                 loads.push(l);
             }
-            let _ = record(&f, budget, cores, &mut probe);
+            if let Err(error) = record(&f, budget, cores, &mut probe) {
+                receipt_errors.push(format!("{}: {error}", f.job.name));
+            }
             // Read before the slot runs another check: the package's graded record.
             credit.add(
                 &f.job.name,
                 crate::trust_credit::read_record(&f.job.target, package_identity(&f.job.name)),
             );
             if let Some(r) = &reducer {
-                r.send(&f.job);
-            }
-            if let Some(c) = cost_of(&f, &prep.driver) {
-                new_costs.insert(f.job.name.clone(), c);
+                if let Err(error) = r.send(&f.job) {
+                    receipt_errors.push(error.to_string());
+                }
             }
         };
         let ran = bench.checks(cfg, prep, jobs, slots, &mut done, out);
         if let Some(r) = reducer {
-            r.finish(ran.is_err());
+            receipt_errors.extend(r.finish(ran.is_err()).into_iter().map(|e| e.to_string()));
         }
         write_costs(prep.costs_path.as_deref(), &new_costs, out);
+        if !receipt_errors.is_empty() {
+            let mut why = format!(
+                "compiler execution receipts could not be completed: {}",
+                receipt_errors.join("; ")
+            );
+            if let Err(error) = &ran {
+                why.push_str(&format!("; slot execution also ended: {error}"));
+            }
+            return Err(why);
+        }
         ran?;
     }
     let mut plan = prep.plan.clone();
@@ -2748,26 +2826,52 @@ fn with_credit(
 struct Reducer {
     tx: Option<std::sync::mpsc::Sender<Job>>,
     skip: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<Vec<ReductionError>>>,
+}
+
+#[derive(Debug)]
+enum ReductionError {
+    Report {
+        path: PathBuf,
+        why: String,
+        diagnostic: Option<(PathBuf, std::io::Error)>,
+    },
+    Queue(PathBuf),
+    Worker,
+}
+
+impl std::fmt::Display for ReductionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Report {
+                path,
+                why,
+                diagnostic,
+            } => {
+                write!(f, "{}: {why}; raw report cleanup skipped", path.display())?;
+                if let Some((path, error)) = diagnostic {
+                    write!(f, "; {} could not be written: {error}", path.display())?;
+                }
+                Ok(())
+            }
+            Self::Queue(log) => write!(
+                f,
+                "{}: report reduction queue closed; raw report cleanup skipped",
+                log.display()
+            ),
+            Self::Worker => {
+                f.write_str("report reduction worker panicked; unprocessed raw reports retained")
+            }
+        }
+    }
 }
 
 impl Reducer {
     fn start(repo: PathBuf) -> Reducer {
-        use std::sync::atomic::Ordering;
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let skip = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let skipping = std::sync::Arc::clone(&skip);
-        let thread = std::thread::spawn(move || {
-            for job in rx {
-                if skipping.load(Ordering::SeqCst) {
-                    if let Some(r) = &job.report {
-                        let _ = fs::remove_dir_all(r);
-                    }
-                } else {
-                    reduce_report(&job, &repo);
-                }
-            }
-        });
+        let thread = std::thread::spawn(move || reduce_reports(rx, &repo, &skipping));
         Reducer {
             tx: Some(tx),
             skip,
@@ -2775,50 +2879,71 @@ impl Reducer {
         }
     }
 
-    fn send(&self, job: &Job) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(job.clone());
-        }
+    fn send(&self, job: &Job) -> Result<(), ReductionError> {
+        let closed = || ReductionError::Queue(job.log.clone());
+        self.tx
+            .as_ref()
+            .ok_or_else(closed)?
+            .send(job.clone())
+            .map_err(|_| closed())
     }
 
-    /// Waits for queued reductions to finish, or removes unstarted reports when `skip` is set.
-    fn finish(mut self, skip: bool) {
+    /// Waits for queued reductions, retaining unstarted reports when the run was cancelled.
+    fn finish(mut self, skip: bool) -> Vec<ReductionError> {
         self.skip.store(skip, std::sync::atomic::Ordering::SeqCst);
-        self.join();
+        self.join()
     }
 
-    fn join(&mut self) {
+    fn join(&mut self) -> Vec<ReductionError> {
         drop(self.tx.take());
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        self.thread.take().map_or_else(Vec::new, |t| {
+            t.join().unwrap_or_else(|_| vec![ReductionError::Worker])
+        })
     }
 }
 
 impl Drop for Reducer {
     fn drop(&mut self) {
-        self.join();
+        // Unwinding cannot conclude or publish facts; still retire the owned worker.
+        let _ = self.join();
     }
+}
+
+fn reduce_reports(
+    jobs: std::sync::mpsc::Receiver<Job>,
+    repo: &Path,
+    skip: &std::sync::atomic::AtomicBool,
+) -> Vec<ReductionError> {
+    let mut errors = Vec::new();
+    for job in jobs {
+        if !skip.load(std::sync::atomic::Ordering::SeqCst)
+            && let Err(error) = reduce_report(&job, repo)
+        {
+            errors.push(error);
+        }
+    }
+    errors
 }
 
 /// The resource [`Cost`] of `f` under the prover `driver` names: what a check that finished
 /// took (its log has a summary, a whole one, and no transport failure), or what one cut short
 /// took before it ended ([`Cut`]: at its budget, by the run's stop, or by itself), each figure
 /// then the least it would have taken. `None` for a cut check whose peak was not read.
-fn cost_of(f: &Finished, driver: &Driver) -> Option<Cost> {
-    let finished = || {
-        crate::durable::open_regular_file(&f.job.log).is_ok_and(|file| {
-            let m = trust_facts::Measured::of_log(BufReader::new(file), &f.ended.code.to_string());
-            !m.summary.is_empty() && m.ended.is_empty() && !m.transport
-        })
-    };
+fn cost_of(f: &Finished, driver: &Driver) -> std::io::Result<Option<Cost>> {
     let cut = if f.interrupted {
         Some(Cut::Interrupted)
     } else if f.over_budget {
         Some(Cut::OverBudget)
     } else {
-        (!finished()).then_some(Cut::Failed)
+        let file = crate::durable::open_regular_file(&f.job.log)?;
+        let m = trust_facts::Measured::of_log(BufReader::new(file), &f.ended.code.to_string())?;
+        (m.summary.is_empty() || !m.ended.is_empty() || m.transport).then_some(Cut::Failed)
     };
+    Ok(cost_when_cut(f, driver, cut))
+}
+
+/// Keep a failed log read's resource measurements as a lower bound, never a completed check.
+fn cost_when_cut(f: &Finished, driver: &Driver, cut: Option<Cut>) -> Option<Cost> {
     (cut.is_none() || f.ended.maxrss > 0).then(|| Cost {
         cpu: f.ended.cpu.as_secs(),
         wall: f.wall.as_secs(),
@@ -2889,9 +3014,9 @@ fn write_cost_file(path: &Path, header: &str, all: &CostRows, out: &mut dyn Writ
 
 /// Reduces `job`'s `--obligations` proof report beside its log and removes the raw directory
 /// on success.
-fn reduce_report(job: &Job, repo: &Path) {
+fn reduce_report(job: &Job, repo: &Path) -> Result<(), ReductionError> {
     let Some(report) = &job.report else {
-        return;
+        return Ok(());
     };
     let manifest = manifest_of(&job.argv).map(str::to_string);
     let args = crate::trust_oblig::ReduceArgs {
@@ -2906,16 +3031,24 @@ fn reduce_report(job: &Job, repo: &Path) {
         )),
     };
     if let Err(why) = crate::trust_oblig::write_record(&args) {
-        let _ = crate::durable::write_fresh(
-            Path::new(&format!("{}.oblig.err", job.log.display())),
+        let diagnostic_path = PathBuf::from(format!("{}.oblig.err", job.log.display()));
+        let diagnostic = crate::durable::write_fresh(
+            &diagnostic_path,
             format!(
                 "{why}\nraw report cleanup skipped for {}\n",
                 report.display()
             ),
-        );
-        return;
+        )
+        .err()
+        .map(|error| (diagnostic_path, error));
+        return Err(ReductionError::Report {
+            path: report.clone(),
+            why,
+            diagnostic,
+        });
     }
     let _ = fs::remove_dir_all(report);
+    Ok(())
 }
 
 /// Returns `(HEAD, HEAD^{tree})` when `repo` is strictly clean, or `None` otherwise.

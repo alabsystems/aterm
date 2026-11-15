@@ -4310,12 +4310,6 @@ fn the_strip_says_a_trials_facts_the_strip_wide() {
     const SHORT: &str = "for Dark \u{b7} was Default \u{b7} 2 custom colors";
     super::at_each_text_scale(&[1.0, 2.0], "a trial's facts", |scale| {
         for width in [444.0, 584.0, 744.0, 1_095.0] {
-            // At 2x in a 444pt window the facts take more than its 412pt strip in their full forms.
-            let said = if scale > 1.5 && width < 500.0 {
-                SHORT
-            } else {
-                FACTS
-            };
             let context = format!("{scale}\u{d7} {width}pt");
             let mut cx = view_cx_at(width, 900.0);
             cx.motion.system_dark = true;
@@ -4353,6 +4347,16 @@ fn the_strip_says_a_trials_facts_the_strip_wide() {
             let UiContent::Text(text) = &detail.content else {
                 panic!("{context}: line 2 is one band of words");
             };
+            // Host UI fonts have different advances. The available strip, rather than a
+            // window width measured on another host, decides whether the full statement fits.
+            let (px, face) =
+                crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+            let full_width = crate::tray_raster::ui_text_width_for(face, FACTS, px);
+            let said = if full_width <= strip.width + crate::native_ui::TEXT_FIT_SLACK {
+                FACTS
+            } else {
+                SHORT
+            };
             if scale > 1.5 && width < 600.0 && width > 500.0 {
                 let keep = compiled
                     .paint
@@ -4367,8 +4371,9 @@ fn the_strip_says_a_trials_facts_the_strip_wide() {
                 );
             }
             assert!(
-                detail.rect.right() <= strip.right() + 0.01,
-                "{context}: line 2 {:?} runs past the strip {strip:?}",
+                (detail.rect.x - strip.x).abs() < 0.01
+                    && (detail.rect.right() - strip.right()).abs() < 0.01,
+                "{context}: line 2 {:?} must span the strip {strip:?}",
                 detail.rect
             );
             assert_eq!(text.text, said, "{context}: line 2 says every fact whole");

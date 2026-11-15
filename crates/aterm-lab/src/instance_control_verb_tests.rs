@@ -46,10 +46,10 @@ fn captures_with_a_terminal_require_a_successful_idle_wait() {
         let mut captured = false;
         let result = request_settled_image(|args| match args {
             ["sessions"] => Reply {
-                stdout: "OK 1\n0 s-aa - alive shell active=1 wfocus=1\n".into(),
+                stdout: "OK 1\n0 t00000000aa - alive shell active=1 wfocus=1\n".into(),
                 ..Reply::default()
             },
-            ["@s-aa", "await", "idle", "500", "timeout=60000"] => Reply {
+            ["@t00000000aa", "await", "idle", "500", "timeout=60000"] => Reply {
                 code,
                 stderr: "idle wait result".into(),
                 ..Reply::default()

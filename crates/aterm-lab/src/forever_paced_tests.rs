@@ -43,7 +43,7 @@ fn recovery(t: i64, seq: u32, step: i64) -> (i64, String) {
         &format!(
             "WAITING seq={seq} until={} {}",
             until(t + step),
-            turn_end::REPEAT_RECOVERY_WAIT
+            alab_policy::words::REPEAT_RECOVERY_WAIT
         ),
     )
 }
@@ -54,9 +54,12 @@ const CHECK: &str = "[aterm harness] Autopilot is Cruise: done is never the end.
                      the widest check this repository has on the merged tree and fix what it finds.";
 
 /// The request's journal line, as `g2-cl-lad` journaled main's (the head of
-/// [`turn_end::FORWARD_RECOVERY`], cut where the journal cuts it).
+/// [`alab_policy::words::FORWARD_RECOVERY`], cut where the journal cuts it).
 fn request(t: i64, seq: u32) -> (i64, String) {
-    let text: String = turn_end::FORWARD_RECOVERY.chars().take(200).collect();
+    let text: String = alab_policy::words::FORWARD_RECOVERY
+        .chars()
+        .take(200)
+        .collect();
     j(t, &format!("CONTINUED seq={seq} rule=continue@v1 {text}"))
 }
 
@@ -196,7 +199,10 @@ fn a_build_typing_at_a_constant_rate_fails() {
         let text = if n <= 2 {
             CHECK.to_string()
         } else {
-            turn_end::FORWARD_RECOVERY.chars().take(200).collect()
+            alab_policy::words::FORWARD_RECOVERY
+                .chars()
+                .take(200)
+                .collect()
         };
         s.journal
             .push(j(act, &format!("CONTINUED seq={n} rule={rule} {text}")));
@@ -349,6 +355,6 @@ fn the_hours_bound_is_the_ladders() {
     assert_eq!(per_hour(super::super::LADDER_SCALE), 12);
     let head = recovery_head();
     assert!(!head.is_empty() && !head.contains(']'), "{head:?}");
-    assert!(turn_end::FORWARD_RECOVERY.contains(head));
+    assert!(alab_policy::words::FORWARD_RECOVERY.contains(head));
     assert!(request(0, 1).1.contains(head));
 }

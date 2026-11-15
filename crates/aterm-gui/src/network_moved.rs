@@ -8,7 +8,7 @@
 //! after every member's silence of [`aterm_secrets::discover::SILENCE`] and resolves what it
 //! holds to dial hints ([`hear_alab_tcp`]: the node job's,
 //! and a window's only while it serves the fleet port, §4.1 F17), and the Commons runtime's peers, the first heard after every
-//! peer's silence of [`SILENCE`], or one heard for the first time ([`Heard`]). Each consumer (the window's converge lane, a fleet heartbeat, the sign-in
+//! peer's silence of [`SILENCE`] ([`Heard`]). Each consumer (the window's converge lane, a fleet heartbeat, the sign-in
 //! ladder's waits and the account claims, the fleet glance's backoff) holds its own [`Watch`],
 //! is woken once this Mac's spread has passed ([`spread_of`]: a few seconds, the same every time
 //! on one Mac and different between Macs, so ~35 Macs back on one LAN do not dial the issuer and
@@ -35,7 +35,7 @@ pub(crate) enum Woke {
         expect(dead_code, reason = "the browse source is macOS's")
     )]
     Browse,
-    /// The Commons runtime heard a peer after every peer's silence ([`SILENCE`]), or a new one.
+    /// The Commons runtime heard a peer after every peer's silence ([`SILENCE`]).
     Beacon,
     /// The network place settled ([`hear_place`], `aterm_netplace::moves`): the keeper read the
     /// new network, so it is usable now, told behind a route move's with only the flap rest
@@ -58,7 +58,7 @@ impl Woke {
             Self::Timer => "its timer",
             Self::Route => "a route change",
             Self::Browse => "a member heard on the _alab._tcp browse after two minutes of none",
-            Self::Beacon => "a Commons beacon after two minutes of no peer, or from a new one",
+            Self::Beacon => "a Commons beacon after two minutes of no peer",
             Self::Place => "the network place settling onto a network",
         }
     }
@@ -1018,19 +1018,30 @@ pub(crate) fn hear_place(
 /// How long every peer the Commons runtime heard must go unheard for the next one heard to be a
 /// move: this Mac back from away is a move, one peer's silence is none. It counts awake time
 /// ([`Instant`] stops while macOS sleeps), so a wake on a changed network is the route source's
-/// to tell. A live LAN's peers drop out of Reachable and back all the time (an authenticated
-/// contact keeps one Reachable 15 s, and the runtime contacts its peers a few at a time), and
-/// among some 40 Macs one is always back from longer than this: counted a peer at a time, the
-/// source fired 110 times an hour where its rest allows 120 (0.147.0, 2026-11-01).
+/// to tell. A live LAN's peers drop out of Reachable and back (an authenticated contact keeps
+/// one Reachable only for as long as the runtime's dial scheduler promised its next round, and
+/// the runtime contacts its peers a few at a time), and among some 40 Macs one is always back
+/// from longer than this: counted a peer at a time, the source fired 110 times an hour where
+/// its rest allows 120 (0.147.0, 2026-11-01).
+///
+/// A peer heard after the silence is one the runtime contacted since, not one it still reads
+/// Reachable from before: once this Mac's network changed, the runtime's observer leaves a
+/// contact at most [`aterm_types::network_state::CURTAILED_MS`] of its lease, counted from the
+/// contact, however long it was promised. A silence at least that long has outlasted every
+/// such contact.
 const SILENCE: Duration = Duration::from_secs(2 * 60);
+const _: () = assert!(SILENCE.as_secs() * 1000 >= aterm_types::network_state::CURTAILED_MS);
 
 /// What the Commons runtime has told of its peers: when each heard (reachable) within the last
-/// [`SILENCE`] was last heard, every peer this watch has heard, and how many looks remain of the
-/// baseline.
+/// [`SILENCE`] was last heard, and how many looks remain of the baseline. A peer this watch
+/// never heard is a peer coming, not this Mac's network moving, as on the browse: a process
+/// just started hears its fleet's members one at a time for minutes, and with each counted a
+/// move the source fired at its rest for the first ten minutes of every launch (0.200.0, 79
+/// members, 2026-11-13: 15 moves in 10 minutes, each an accounts upkeep, a converge pass, an
+/// update check and a fleet heartbeat).
 #[derive(Debug)]
 pub(crate) struct Heard {
     heard: std::collections::BTreeMap<[u8; 16], Instant>,
-    known: std::collections::BTreeSet<[u8; 16]>,
     baseline: usize,
 }
 
@@ -1039,7 +1050,6 @@ impl Heard {
     pub(crate) const fn new(baseline: usize) -> Self {
         Self {
             heard: std::collections::BTreeMap::new(),
-            known: std::collections::BTreeSet::new(),
             baseline,
         }
     }
@@ -1065,8 +1075,8 @@ impl Heard {
     }
 
     /// One look at the peers at `now`: whether, once the baseline is over, one is heard where no
-    /// peer was within [`SILENCE`], or one this watch never heard. It forgets when each peer
-    /// unheard for longer was heard, so it holds only those heard lately.
+    /// peer was within [`SILENCE`]. It forgets when each peer unheard for longer was heard, so
+    /// it holds only those heard lately.
     pub(crate) fn look_at(
         &mut self,
         peers: &[aterm_types::network_state::PeerObservation],
@@ -1077,20 +1087,18 @@ impl Heard {
             .retain(|_, at| now.saturating_duration_since(*at) <= SILENCE);
         let alone = self.heard.is_empty();
         let mut back = false;
-        let mut new = false;
         for peer in peers
             .iter()
             .filter(|peer| peer.reachability == Reachability::Reachable)
         {
             back = true;
-            new |= self.known.insert(peer.identity.machine_id);
             self.heard.insert(peer.identity.machine_id, now);
         }
         if self.baseline > 0 {
             self.baseline -= 1;
             return false;
         }
-        new || (alone && back)
+        alone && back
     }
 }
 
@@ -1107,7 +1115,7 @@ pub(crate) fn beacon_peers(
 }
 
 /// Hear this process's Commons runtime (`read`: its peers as it observes them now, or no sample
-/// while unavailable): a peer heard after every peer's silence, or a new one, is a move
+/// while unavailable): a peer heard after every peer's silence is a move
 /// ([`Heard`]). An unavailable
 /// sample leaves the watch unchanged. Once per process; none in a test build.
 pub fn hear_commons(

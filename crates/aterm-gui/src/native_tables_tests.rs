@@ -8,10 +8,14 @@ use super::*;
 use crate::native_app::{ActionInvocation, AppViewState, ViewMotionCx};
 use crate::native_ui::{CompiledUi, LogicalRect};
 use crate::{App, WindowId};
-use aterm_db::alab::{Registry, registry::MACHINE};
+use aterm_db::alab::Registry;
+use aterm_db::alab::registry::{ADDRESS, MACHINE, PHONE};
 use aterm_db::att::{Handle, REGISTRY};
 use aterm_db::table::fixture::{Lab, repair_commons};
+use aterm_db::typed::Collection;
 use aterm_db::typed::cell::{self, CellKey, CellValue};
+use aterm_db::typed::keys::{self, Random};
+use aterm_db::typed::secret::{self, Memory, Secret};
 use aterm_json::json;
 use aterm_secrets::commons::roster::Role;
 
@@ -19,14 +23,23 @@ const WID: WindowId = WindowId(0);
 const MC: &str = "mc-0000000000000009";
 
 fn put(column: &str, value: aterm_json::Value) -> aterm_db::database::Change {
+    put_in(&MACHINE, MC, column, value)
+}
+
+fn put_in(
+    collection: &'static Collection,
+    pk: &str,
+    column: &str,
+    value: aterm_json::Value,
+) -> aterm_db::database::Change {
     cell::change(
-        &MACHINE,
+        collection,
         CellKey {
-            pk: MC,
+            pk,
             col: column,
             elem: None,
         },
-        &CellValue::owner(MACHINE.version, value),
+        &CellValue::owner(collection.version, value),
     )
     .unwrap()
 }
@@ -70,6 +83,14 @@ fn cell_says(ui: &CompiledUi, pk: &str, column: &str) -> String {
         .split_once(": ")
         .map(|(_, rest)| rest.to_owned())
         .unwrap_or_default()
+}
+
+/// Whether a cell or pane value shows `full`, whole or cut to its width with `…`.
+fn shows(cell: &str, full: &str) -> bool {
+    cell == full
+        || cell
+            .strip_suffix('…')
+            .is_some_and(|start| !start.is_empty() && full.starts_with(start))
 }
 
 fn act(app: &mut App, key: &str, value: Option<SemanticInput>) {
@@ -313,11 +334,13 @@ fn the_tables_page_reads_as_of_a_point_and_compares_it_with_now() {
 }
 
 /// In a past table the pane names every writer of a cell's concurrent values since, and a
-/// changed secret says only that it changed.
-/// NEGATIVE CONTROL: with the pane's secret branch removed, the line says what the mask says:
-/// `` left: Some("Password: set → set") right: Some("Password: changed") ``.
+/// changed secret cell by the `aterm secrets` entry it names now, as every surface shows it: no
+/// table holds a secret.
+/// NEGATIVE CONTROL: with the pane saying only `set`, `cleared` or `changed` of a secret column
+/// (as when it held sealed values), no entry is named: `` Password: changed ``.
 #[test]
-fn a_past_table_names_every_writer_since_and_never_a_secret() {
+fn a_past_table_names_every_writer_since_and_a_secret_by_its_entry() {
+    const ENTRY: &str = "address.password.0123456789abcdef";
     let mut snapshot = one_sheet(Shown {
         text: "Spare".into(),
         ..Shown::default()
@@ -330,7 +353,7 @@ fn a_past_table_names_every_writer_since_and_never_a_secret() {
     sheet.since.insert(
         (MC.into(), "password".into()),
         Since {
-            now: aterm_db::typed::secret::MASK.into(),
+            now: ENTRY.into(),
             by: vec![author("m55", 2_000)],
             members: false,
         },
@@ -346,9 +369,12 @@ fn a_past_table_names_every_writer_since_and_never_a_secret() {
     let mut app = open_with(snapshot);
     act(&mut app, &format!("tables/cell/{MC}/nickname"), None);
     let ui = render(&app);
-    assert_eq!(
-        said(&ui, "tables/pane/now/password/what").as_deref(),
-        Some("Password: changed")
+    let password = said(&ui, "tables/pane/now/password/what").unwrap();
+    // The line names the entry the cell named then (the row's cell, cut to the pane's width)
+    // where a sealed column's said only `changed`.
+    assert!(
+        password.starts_with("Password: alab-") && !password.ends_with("changed"),
+        "{password}"
     );
     assert_eq!(
         said(&ui, "tables/pane/now/nickname/who").as_deref(),
@@ -424,6 +450,9 @@ fn author(label: &str, at_ms: u64) -> Author {
     }
 }
 
+/// The store entry the hand-made sheet's password cell names.
+const ENTRY: &str = "alab-machine-password-mc-0000000000000009";
+
 fn one_sheet(nickname: Shown) -> Snapshot {
     let column = |name: &str| SheetColumn {
         name: name.into(),
@@ -431,19 +460,17 @@ fn one_sheet(nickname: Shown) -> Snapshot {
         group: Group::Stored,
         editable: true,
         numeric: false,
-        secret: false,
-        masked: false,
         links: None,
     };
+    // A secret reference column is read-only on the page (`grid::read_only`).
     let mut password = column("password");
-    password.secret = true;
     password.editable = false;
     let mut cells = BTreeMap::new();
     cells.insert("nickname".to_owned(), nickname);
     cells.insert(
         "password".to_owned(),
         Shown {
-            text: aterm_db::typed::secret::MASK.into(),
+            text: ENTRY.into(),
             ..Shown::default()
         },
     );
@@ -464,7 +491,6 @@ fn one_sheet(nickname: Shown) -> Snapshot {
                 table: "alab/registry".into(),
                 collection: "machine".into(),
                 version: 2,
-                reveal: false,
                 header: Vec::new(),
                 rows: Vec::new(),
             },
@@ -528,10 +554,11 @@ fn a_conflict_shows_every_value_and_keep_stages_one() {
     assert!(said(&render(&app), "tables/bar/count").is_none());
 }
 
-/// A secret cell shows only the mask, says only `set` in the pane, and never opens.
+/// A secret cell shows the name of its secret-store entry, in the grid and in the pane, and
+/// never opens.
 /// NEGATIVE CONTROL: with `open_edit` ignoring `editable`, the second press opens an edit field.
 #[test]
-fn a_secret_cell_shows_only_that_it_holds_one() {
+fn a_secret_cell_names_its_store_entry() {
     let mut app = open_with(one_sheet(Shown {
         text: "m9".into(),
         ..Shown::default()
@@ -541,13 +568,239 @@ fn a_secret_cell_shows_only_that_it_holds_one() {
     act(&mut app, &cell, None);
     let ui = render(&app);
     assert!(said(&ui, EDIT).is_none(), "a secret never opens here");
+    assert!(shows(&cell_says(&ui, MC, "password"), ENTRY));
+    assert!(shows(
+        &said(&ui, "tables/pane/field/password/value").unwrap_or_default(),
+        ENTRY
+    ));
+}
+
+/// Every word the page and its read hold: each cell's text and values, each history entry's
+/// value, and each rendered node's label and value.
+fn every_word(app: &mut App, ui: &CompiledUi) -> Vec<String> {
+    let mut words: Vec<String> = ui
+        .semantics
+        .iter()
+        .map(|node| format!("{} {:?}", node.label, node.value))
+        .collect();
+    let tables = app.native_runtime.tables_mut().unwrap();
+    for sheet in &tables.snapshot.as_ref().unwrap().sheets {
+        for row in &sheet.rows {
+            for shown in row.cells.values() {
+                words.push(shown.text.clone());
+                words.extend(shown.values.iter().map(|(v, _)| v.clone()));
+            }
+        }
+        for written in &sheet.written {
+            words.extend(written.cells.iter().map(|c| c.now.clone()));
+        }
+        for (_, seen) in &sheet.base.rows {
+            words.extend(seen.values().map(|s| s.shown.clone()));
+        }
+    }
+    words
+}
+
+/// On a scratch registry an address and a phone number read as stored, and a password held in
+/// the secret store reads as its entry's name, never its value.
+/// NEGATIVE CONTROL: the sentinel value went into a `Memory` store (`every()` holds it); were the
+/// page to show a secret reference's value, or were a value written into the table rather than
+/// through `secret::store_cell`, the last assertion would find the sentinel in a word.
+#[test]
+fn addresses_and_phones_are_plain_and_a_password_names_its_entry() {
+    const ADDR: &str = "ann.synthetic@example.com";
+    const NUMBER: &str = "5550100123";
+    const SENTINEL: &str = "sentinel-not-for-any-page-7f3a";
+    let lab = Lab::new(&[Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    // The generation that names store entries and holds plain numbers: the newest, which no
+    // roll of this build reaches.
+    registry.open_newest(1_800_000_000_000).unwrap();
+    repair_commons(&lab, 4);
+
+    let address = keys::address_pk(ADDR).unwrap();
+    let phone = keys::random_pk(Random::Phone).unwrap();
+    let store = Memory::default();
+    let reference = secret::store_cell(
+        &store,
+        "address",
+        "password",
+        &address,
+        &Secret::new(SENTINEL.into()),
+    )
+    .unwrap();
+    let entry = secret::entry_of(&reference).unwrap().to_owned();
     assert_eq!(
-        cell_says(&ui, MC, "password"),
-        aterm_db::typed::secret::MASK
+        store.every(),
+        vec![SENTINEL.to_owned()],
+        "the store holds it"
     );
+    registry
+        .write(vec![
+            vec![
+                put_in(&PHONE, &phone, "last4", json!("0123")),
+                put_in(&PHONE, &phone, "number", json!(NUMBER)),
+                put_in(&PHONE, &phone, "row", json!("live")),
+            ],
+            vec![
+                put_in(&ADDRESS, &address, "addr", json!(ADDR)),
+                put_in(&ADDRESS, &address, "domain", json!("example.com")),
+                put_in(&ADDRESS, &address, "origin", json!("owner")),
+                put_in(&ADDRESS, &address, "phone", json!(phone)),
+                put_in(&ADDRESS, &address, "password", reference),
+                put_in(&ADDRESS, &address, "row", json!("live")),
+            ],
+        ])
+        .unwrap();
+
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
+    settle(&mut app);
+    let mut words = Vec::new();
+
+    act(&mut app, "tables/sheet/address", None);
+    act(&mut app, &format!("tables/cell/{address}/password"), None);
+    act(&mut app, &format!("tables/cell/{address}/password"), None);
+    let ui = render(&app);
+    assert!(
+        said(&ui, EDIT).is_none(),
+        "a secret reference never opens here"
+    );
+    assert_eq!(cell_says(&ui, &address, "addr"), ADDR);
+    assert!(shows(&cell_says(&ui, &address, "password"), &entry));
+    assert!(shows(
+        &said(&ui, "tables/pane/field/password/value").unwrap_or_default(),
+        &entry
+    ));
+    words.extend(every_word(&mut app, &ui));
+
+    act(&mut app, "tables/sheet/phone", None);
+    let ui = render(&app);
+    assert_eq!(cell_says(&ui, &phone, "number"), NUMBER);
+    words.extend(every_word(&mut app, &ui));
+
+    assert!(
+        words.iter().any(|w| w.contains(ADDR)) && words.iter().any(|w| w.contains(NUMBER)),
+        "the scan reads what the page shows"
+    );
+    for value in store.every() {
+        assert!(
+            !words.iter().any(|w| w.contains(&value)),
+            "a secret value reached the page"
+        );
+    }
+}
+
+/// Where the registry holds a phone's number and a password as sealed tokens (the generation a
+/// lab starts at, which builds up to 0.200.0 read), the page shows the number as it is, opened
+/// with nothing recorded and read-only, and the password as the mask: no word of the page or
+/// its read holds the password, and no control opens it.
+/// NEGATIVE CONTROL: with `tables_store::read` laying the sheet out without
+/// `open_every_ordinary` (`Opened::new()` in its place), the number reads as the mask:
+/// `` left: "••••••" right: "5550100123" ``.
+#[test]
+fn a_sealed_number_shows_as_it_is_and_a_sealed_password_as_the_mask() {
+    const ADDR: &str = "ann.synthetic@example.com";
+    const NUMBER: &str = "5550100123";
+    const SENTINEL: &str = "sentinel-not-for-any-page-91c4";
+    let lab = Lab::new(&[Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    assert!(
+        registry.generation().successor.is_some(),
+        "control: a generation that holds sealed tokens"
+    );
+    repair_commons(&lab, 4);
+    let address = keys::address_pk(ADDR).unwrap();
+    let phone = keys::random_pk(Random::Phone).unwrap();
+    registry
+        .write(vec![
+            vec![
+                put_in(&PHONE, &phone, "last4", json!("0123")),
+                put_in(&PHONE, &phone, "row", json!("live")),
+            ],
+            vec![
+                put_in(&ADDRESS, &address, "addr", json!(ADDR)),
+                put_in(&ADDRESS, &address, "domain", json!("example.com")),
+                put_in(&ADDRESS, &address, "origin", json!("owner")),
+                put_in(&ADDRESS, &address, "row", json!("live")),
+            ],
+        ])
+        .unwrap();
+    registry
+        .seal_as_older("phone", &phone, "number", NUMBER)
+        .unwrap();
+    registry
+        .seal_as_older("address", &address, "password", SENTINEL)
+        .unwrap();
+
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
+    settle(&mut app);
+    let mut words = Vec::new();
+
+    act(&mut app, "tables/sheet/address", None);
+    let password = format!("tables/cell/{address}/password");
+    act(&mut app, &password, None);
+    act(&mut app, &password, None);
+    let ui = render(&app);
+    assert!(
+        said(&ui, EDIT).is_none(),
+        "a sealed secret never opens here"
+    );
+    assert_eq!(cell_says(&ui, &address, "password"), secret::MASK);
+    words.extend(every_word(&mut app, &ui));
+
+    act(&mut app, "tables/sheet/phone", None);
+    let number = format!("tables/cell/{phone}/number");
+    act(&mut app, &number, None);
+    act(&mut app, &number, None);
+    let ui = render(&app);
+    assert!(said(&ui, EDIT).is_none(), "a sealed number is read-only");
+    assert_eq!(cell_says(&ui, &phone, "number"), NUMBER);
+    words.extend(every_word(&mut app, &ui));
+
+    assert!(
+        words.iter().any(|w| w.contains(NUMBER)),
+        "the scan reads what the page shows"
+    );
+    assert!(
+        !words.iter().any(|w| w.contains(SENTINEL)),
+        "a sealed password reached the page"
+    );
+}
+
+/// A sealed number two Macs wrote at once shows each of its numbers as it is, as `aterm db
+/// phones` does: the cell is a conflict of two readable values, not of two masks.
+/// NEGATIVE CONTROL: with `tables_store::read` reading a conflict's values through
+/// `shown_value` whatever opened, the cell reads `` "•••••• / ••••••, 2 values" ``.
+#[test]
+fn a_conflicted_sealed_number_shows_each_number() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let a = Registry::at(lab.paths[0].clone());
+    a.open().unwrap();
+    let phone = keys::random_pk(Random::Phone).unwrap();
+    a.write(vec![vec![
+        put_in(&PHONE, &phone, "last4", json!("0123")),
+        put_in(&PHONE, &phone, "row", json!("live")),
+    ]])
+    .unwrap();
+    repair_commons(&lab, 4);
+    let b = Registry::at(lab.paths[1].clone());
+    a.seal_as_older("phone", &phone, "number", "5550100123")
+        .unwrap();
+    b.seal_as_older("phone", &phone, "number", "5550100456")
+        .unwrap();
+    repair_commons(&lab, 4);
+
+    let mut app = App::headless_for_test();
+    app.open_tables_tab_at(Some(lab.paths[0].clone())).unwrap();
+    settle(&mut app);
+    act(&mut app, "tables/sheet/phone", None);
+    let ui = render(&app);
     assert_eq!(
-        said(&ui, "tables/pane/field/password/value").as_deref(),
-        Some("set")
+        cell_says(&ui, &phone, "number"),
+        "5550100123 / 5550100456, 2 values"
     );
 }
 
@@ -895,7 +1148,7 @@ fn an_unknown_writer_shows_its_short_id_dimmed() {
     snapshot.sheets[0].rows[0].cells.insert(
         "password".into(),
         Shown {
-            text: aterm_db::typed::secret::MASK.into(),
+            text: ENTRY.into(),
             by: Some(unknown.clone()),
             ..Shown::default()
         },
@@ -906,8 +1159,7 @@ fn an_unknown_writer_shows_its_short_id_dimmed() {
         cells: vec![WrittenCell {
             pk: MC.into(),
             column: "password".into(),
-            secret: true,
-            now: "set".into(),
+            now: ENTRY.into(),
         }],
     });
     let mut app = open_with(snapshot);

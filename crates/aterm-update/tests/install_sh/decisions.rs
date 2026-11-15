@@ -270,10 +270,18 @@ fn a_ctrl_c_a_child_catches_ends_the_run() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
+    let openssl = scratch.stand_in("caught-openssl", "#!/bin/sh\nexit 0\n");
+    let python = scratch.stand_in(
+        "caught-python",
+        "#!/bin/sh\ntrap \"exit 1\" INT\nkill -s INT 0\nexit 1\n",
+    );
+    lib.step(format!(
+        "mkdir -p \"$TMPDIR/bin\" && ln -s {} \"$TMPDIR/bin/openssl\" && ln -s {} \"$TMPDIR/bin/python3\"",
+        q(s(&openssl)),
+        q(s(&python))
+    ));
     lib.step(
-        "mkdir -p \"$TMPDIR/bin\" && printf '#!/bin/sh\\nexit 0\\n' >\"$TMPDIR/bin/openssl\" && \
-         printf '#!/bin/sh\\ntrap \"exit 1\" INT\\nkill -s INT 0\\nexit 1\\n' >\"$TMPDIR/bin/python3\" && \
-         chmod +x \"$TMPDIR/bin/openssl\" \"$TMPDIR/bin/python3\" && cat >\"$TMPDIR/caught.bash\" <<'EOF'
+        "cat >\"$TMPDIR/caught.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 unset ATERM_INSTALL_VERIFIER
@@ -327,21 +335,24 @@ fn a_ctrl_backslash_ends_the_run_after_its_cleanup() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
+    let openssl = scratch.stand_in("quit-openssl", "#!/bin/sh\nexit 0\n");
+    let python = scratch.stand_in(
+        "quit-python",
+        "#!/bin/sh\ntrap \"exit 1\" QUIT\nkill -s \"$SIG\" 0\nexit 1\n",
+    );
+    let rm = scratch.stand_in("quit-rm", "#!/bin/sh\n[ \"$1 $2\" != \"-f --\" ] || [ -e \"$TMPDIR/again\" ] || { : >\"$TMPDIR/again\"; kill -s \"$SIG\" 0; }\nexec /bin/rm \"$@\"\n");
+    lib.step(format!(
+        "mkdir -p \"$TMPDIR/bin\" && ln -s {} \"$TMPDIR/bin/openssl\" && ln -s {} \"$TMPDIR/bin/python3\" && ln -s {} \"$TMPDIR/rm\"",
+        q(s(&openssl)), q(s(&python)), q(s(&rm))
+    ));
     lib.step(
-        "mkdir -p \"$TMPDIR/bin\" && printf '#!/bin/sh\\nexit 0\\n' >\"$TMPDIR/bin/openssl\" && \
-         printf '#!/bin/sh\\ntrap \"exit 1\" QUIT\\nkill -s \"$SIG\" 0\\nexit 1\\n' >\"$TMPDIR/bin/python3\" && \
-         chmod +x \"$TMPDIR/bin/openssl\" \"$TMPDIR/bin/python3\" && cat >\"$TMPDIR/rm\" <<'EOF'
-#!/bin/sh
-[ \"$1 $2\" != \"-f --\" ] || [ -e \"$TMPDIR/again\" ] || { : >\"$TMPDIR/again\"; kill -s \"$SIG\" 0; }
-exec /bin/rm \"$@\"
-EOF
-chmod +x \"$TMPDIR/rm\" && cat >\"$TMPDIR/quit.bash\" <<'EOF'
+        "cat >\"$TMPDIR/quit.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 unset ATERM_INSTALL_VERIFIER
 PATH=\"$TMPDIR/bin:$PATH\" LINUX_VERIFIER_SHA256_AARCH64=\"\" LINUX_VERIFIER=\"\" LINUX_ARCH=aarch64 row=$1 SIG=QUIT
 export SIG
-[ \"$1\" != twice ] || cp \"$TMPDIR/rm\" \"$TMPDIR/bin/rm\"
+[ \"$1\" != twice ] || ln -s \"$TMPDIR/rm\" \"$TMPDIR/bin/rm\"
 trap 'echo cleaned >\"$TMPDIR/cleaned-$row\"' EXIT
 linux_verifier_ready aarch64 || echo \"went on: $LINUX_VERIFIER_WHY\"
 EOF",
@@ -373,13 +384,13 @@ fn a_ctrl_c_never_cuts_the_linux_cleanup_short() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
+    let rm = scratch.stand_in("linux-cleanup-rm", "#!/bin/sh\n[ -e \"$TMPDIR/cut\" ] || { : >\"$TMPDIR/cut\"; kill -s INT 0; }\nexec /bin/rm \"$@\"\n");
+    lib.step(format!(
+        "mkdir -p \"$TMPDIR/bin\" && ln -s {} \"$TMPDIR/bin/rm\"",
+        q(s(&rm))
+    ));
     lib.step(
-        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/rm\" <<'EOF'
-#!/bin/sh
-[ -e \"$TMPDIR/cut\" ] || { : >\"$TMPDIR/cut\"; kill -s INT 0; }
-exec /bin/rm \"$@\"
-EOF
-chmod +x \"$TMPDIR/bin/rm\" && cat >\"$TMPDIR/linux.bash\" <<'EOF'
+        "cat >\"$TMPDIR/linux.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 TMP=\"$TMPDIR/tmp\" LINUX_VERIFIER_DIR=\"$TMPDIR/verifier\"
@@ -417,24 +428,29 @@ fn a_ctrl_c_never_empties_the_config() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
-    lib.step(
-        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/cat\" <<'EOF'
-#!/bin/sh
+    let cat = scratch.stand_in(
+        "config-signal-cat",
+        "#!/bin/sh
 case \"$1:$SIG\" in
 *:) ;;
 */.aterm-config.*:INT | */.aterm-config.*:QUIT) kill -s \"$SIG\" 0 ;;
 */.aterm-config.*:*) kill -s \"$SIG\" \"$PPID\" ;;
 esac
 exec /bin/cat \"$@\"
-EOF
-cat >\"$TMPDIR/bin/later\" <<'EOF'
-#!/bin/sh
+",
+    );
+    let later = scratch.stand_in("config-signal-later", "#!/bin/sh
 kill -s TERM \"$PPID\"
 i=0
 while kill -0 \"$PPID\" 2>/dev/null && [ $i -lt 600 ]; do /bin/sleep 0.1; i=$((i + 1)); done
 if kill -0 \"$PPID\" 2>/dev/null; then echo waited >\"$TMPDIR/later-$row\"; else echo ended >\"$TMPDIR/later-$row\"; fi
-EOF
-chmod +x \"$TMPDIR/bin/cat\" \"$TMPDIR/bin/later\" && cat >\"$TMPDIR/config.bash\" <<'EOF'
+");
+    lib.step(format!(
+        "mkdir -p \"$TMPDIR/bin\" && ln -s {} \"$TMPDIR/bin/cat\" && ln -s {} \"$TMPDIR/bin/later\"",
+        q(s(&cat)), q(s(&later))
+    ));
+    lib.step(
+        "cat >\"$TMPDIR/config.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 export SIG=$1 row=$1
@@ -520,9 +536,11 @@ EOF",
 fn a_config_rewrite_that_cannot_finish_loses_nothing() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
-    lib.step(
-        "mkdir -p \"$TMPDIR/full\" && printf '#!/bin/sh\\nexit 1\\n' >\"$TMPDIR/full/cat\" && chmod +x \"$TMPDIR/full/cat\"",
-    );
+    let cat = scratch.stand_in("full-cat", "#!/bin/sh\nexit 1\n");
+    lib.step(format!(
+        "mkdir -p \"$TMPDIR/full\" && ln -s {} \"$TMPDIR/full/cat\"",
+        q(s(&cat))
+    ));
     let full = lib.call(
         "mkdir -p \"$HOME/full\"; cfg=\"$HOME/full/aterm.toml\"; printf '[packages]\\nkeep = 1\\n' >\"$cfg\"; s=0; \
          note=\"$(PATH=\"$TMPDIR/full:$PATH\" persist_no_toolchain \"$cfg\" 2>&1 >/dev/null)\" || s=$?; \
@@ -780,9 +798,13 @@ fn a_ctrl_c_in_a_check_leaves_the_cleanup_its_output() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
+    let said = scratch.stand_in(
+        "check-signal-said",
+        "#!/bin/sh\nkill -s INT -- \"-$G\"\necho aterm 1.0\n",
+    );
+    lib.step(format!("ln -s {} \"$TMPDIR/said\"", q(s(&said))));
     lib.step(
-        "printf '#!/bin/sh\\nkill -s INT -- \"-$G\"\\necho aterm 1.0\\n' >\"$TMPDIR/said\" && chmod +x \"$TMPDIR/said\" && \
-         cat >\"$TMPDIR/note.bash\" <<'EOF'
+        "cat >\"$TMPDIR/note.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 export G=$PPID
@@ -916,7 +938,7 @@ fn the_linux_candidate_is_judged_by_its_identity_line() {
         .iter()
         .enumerate()
         .map(|(n, (body, tag, _, _))| {
-            let exe = scratch.exe(&format!("candidate/{n}/aterm-linux"), body);
+            let exe = scratch.stand_in(&format!("candidate/{n}/aterm-linux"), body);
             lib.call(
                 format!("linux_candidate_answers_tag {} {tag}", q(s(&exe))),
                 &["LINUX_CANDIDATE_SAID"],

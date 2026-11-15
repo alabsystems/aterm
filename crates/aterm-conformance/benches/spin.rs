@@ -21,13 +21,15 @@ mod measuring {
     use aterm_conformance::measure::Rig;
     use aterm_conformance::measure::instance::CouldNotRun;
     use aterm_conformance::measure::spin::{
-        EFFECT_LANE, LIVE_LANE, NEEDLE_LANE, SpinRow, SpinScene, measure,
+        BLINK_LANE, EFFECT_LANE, LIVE_LANE, NEEDLE_LANE, SpinRow, SpinScene, measure,
     };
     use aterm_conformance::measure::starvation::ShapeVerdict;
 
     const MAX_ARMS: u64 = 100;
     const RESTING_MAX_WAKES: u64 = 60;
     const RESTING_MAX_FRAMES: u64 = 20;
+    const HIDDEN_MAX_WAKES: u64 = 200;
+    const HIDDEN_MIN_PARKED: u64 = 5;
 
     // `max_wakes` bounds every loop wake in the window (`event_wakes`), not only its timers: a loop
     // that wakes itself as it parks takes wait-cancelled wakes and turns, which neither
@@ -38,12 +40,29 @@ mod measuring {
     // signalled its own wake source as it parked (a mutant, reverted): the three rows measured
     // 682,944, 507,404 and 833,204 wakes with at most 1 arm and 2 timer wakes, which the arm and
     // timer bounds alone passed.
+    //
+    // Both arms: every row writes its recording (`temporal_recording`), on or off, and the take
+    // reads it back from `temporal status` before its window opens (`require_recording`).
+    // Recording is the shipped default; the rows write `temporal_recording = true` anyway, so the
+    // matrix keeps measuring what ships if that default moves. The recording-off arm is a sample:
+    // the three cheapest scenes that open no Rewind view (claude-shaped, idle, windowed) run again
+    // with recording off, as a person who turns Settings > Terminal > Rewind off leaves them, each
+    // under its recording-on row's bounds; the pet, resting and hidden scenes, the longest takes,
+    // run recording on only, which adding their rows below would reverse. No bound is loosened
+    // for either arm. A build that records even under `temporal_recording = false` (throwaway, on
+    // main c3682d2db0d, 2026-11-13) has every off-arm row refuse on the read-back, never pass.
+    // The measurements in the row comments below come from heads that wrote no recording line
+    // (the Rewound row's apart), so from whatever their build's default was, unless they say
+    // otherwise. Recording-on readings of 2026-10-27 on a build of 5bf00deb90, timer wakes /
+    // wakes, one take each: ClaudeShaped 8 / 86, Idle 0 / 2, Rewound 0 / 1, Windowed 33 / 74,
+    // PetAsleep 53 / 115, WindowedRewound 12 / 35 (its row below gives its other takes).
     const ROWS: &[(&str, SpinRow)] = &[
         // The repainter writes every 166.7 ms, about 66 output wakes in the window: 75 and 76
         // wakes measured, bounded at twice that.
         (
             "an_idle_claude_shaped_client_banks_no_past_deadline_arms",
             SpinRow {
+                recording: true,
                 scene: SpinScene::ClaudeShaped,
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
@@ -52,12 +71,14 @@ mod measuring {
                 needle_owed: false,
                 max_wakes: 150,
                 max_frames: None,
+                min_hidden_parked: None,
             },
         ),
         // No timer fired and no event came: 0 wakes measured in each take, bounded at one a second.
         (
             "a_bare_idle_instance_banks_no_past_deadline_arms",
             SpinRow {
+                recording: true,
                 scene: SpinScene::Idle,
                 window: Duration::from_secs(6),
                 max_arms: MAX_ARMS,
@@ -66,6 +87,7 @@ mod measuring {
                 needle_owed: false,
                 max_wakes: 6,
                 max_frames: None,
+                min_hidden_parked: None,
             },
         ),
         // A recording prompt frozen in an open Rewind view (design §14.5 R0 item 7). Proven red
@@ -76,6 +98,7 @@ mod measuring {
         (
             "an_idle_open_rewind_view_arms_no_timer",
             SpinRow {
+                recording: true,
                 scene: SpinScene::Rewound,
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
@@ -84,6 +107,7 @@ mod measuring {
                 needle_owed: false,
                 max_wakes: 12,
                 max_frames: None,
+                min_hidden_parked: None,
             },
         ),
         // A bare prompt in a window: AppKit's loop, which no headless row runs. Under
@@ -103,6 +127,7 @@ mod measuring {
         (
             "an_idle_window_parks_until_its_next_deadline",
             SpinRow {
+                recording: true,
                 scene: SpinScene::Windowed,
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
@@ -111,6 +136,7 @@ mod measuring {
                 needle_owed: false,
                 max_wakes: 200,
                 max_frames: None,
+                min_hidden_parked: None,
             },
         ),
         // The window above at full motion (what the shipped `auto` resolves to on a Mac whose
@@ -154,6 +180,7 @@ mod measuring {
         (
             "a_pet_in_deep_sleep_fires_no_effect_wake",
             SpinRow {
+                recording: true,
                 scene: SpinScene::PetAsleep,
                 window: Duration::from_secs(10),
                 max_arms: MAX_ARMS,
@@ -162,6 +189,7 @@ mod measuring {
                 needle_owed: true,
                 max_wakes: 200,
                 max_frames: None,
+                min_hidden_parked: None,
             },
         ),
         // The row above with the window's rest on (`idle_rest_secs = 30`, ATERM-KI-1027-4; the
@@ -180,6 +208,7 @@ mod measuring {
         (
             "a_resting_window_takes_no_live_frame",
             SpinRow {
+                recording: true,
                 scene: SpinScene::Resting,
                 window: Duration::from_secs(20),
                 max_arms: MAX_ARMS,
@@ -188,6 +217,117 @@ mod measuring {
                 needle_owed: false,
                 max_wakes: RESTING_MAX_WAKES,
                 max_frames: Some(RESTING_MAX_FRAMES),
+                min_hidden_parked: None,
+            },
+        ),
+        // A minimised window (`docs/ATERM_DESIGN.md` §7.4, ATERM-KI-1027-4) whose tab prints a
+        // line a second, measured over 10 s once it reads `sight=off-glass`: it composes and
+        // presents nothing, so its frames are bounded at 0, its cursor-effect lane too (the typed
+        // counter wakes the pet), and its parked redraws from below at 5, so a take whose output
+        // never reached the window, or a build that parks nothing, fails rather than passing on
+        // the frames it did not draw. A take whose window does not read off-glass as it opens and
+        // as it ends, or that takes a window event, is a refusal (`hidden_unready`). A debug build
+        // of this change (2026-11-07, the Mac busy: 16 to 18 of its 18 cores loaded) measured 0
+        // frames, 25 parked redraws and 106 wakes at a 104.0 MiB footprint (median). Proven red
+        // on the same build with the frontend park and the Metal gate both reverted: 20 frames
+        // and none parked at 294.0 MiB, which the frame and park bounds each fail.
+        (
+            "a_minimised_window_presents_no_frame",
+            SpinRow {
+                recording: true,
+                scene: SpinScene::Hidden,
+                window: Duration::from_secs(10),
+                max_arms: MAX_ARMS,
+                max_timer_wakes: None,
+                max_owner_fires: &[(EFFECT_LANE, 0)],
+                needle_owed: false,
+                max_wakes: HIDDEN_MAX_WAKES,
+                max_frames: Some(0),
+                min_hidden_parked: Some(HIDDEN_MIN_PARKED),
+            },
+        ),
+        // The Rewound scene above in a window, the only row of this matrix that draws a rewound
+        // pane on the windowed GPU backend: a focused window's rewound pane, its band and border
+        // presented by AppKit's loop, under `motion = "reduced"` as the bare window row. Its caret
+        // must not blink over the past (the `is_rewound` arm of the blink deadline), so the blink
+        // lane is bounded at 0. The take raises its window and waits for the focus before it
+        // settles; one whose window is not focused as its measured window opens and as it ends,
+        // or that another renderer drew, is a refusal. A release build of 5bf00deb90 measured on
+        // 2026-10-27, focused on the GPU renderer in each of three takes, 0 blink fires, 14, 13
+        // and 13 timer wakes (the vitals 10, the crash journal 3 or 4) and 38 wakes. A window's
+        // vitals run at 1 Hz, so the headless Rewound row's 12 timer wakes do not fit a window
+        // (the first take failed that bound); 20 leaves the two devtools hand-overs the pet row
+        // saw and fails a refresh deadline of 1 Hz or faster that a view arms. 200 wakes as the
+        // window rows.
+        // Proven red 2026-10-27: that build with the `is_rewound` arm of the blink deadline taken
+        // out (a mutant, never committed) measured 19 blink fires, 32 timer wakes and 74 wakes
+        // in each of two takes, and failed this row by name. Again 2026-11-13 on main
+        // c3682d2db0d's release build: focused on the GPU renderer, 0 blink fires, 16 timer wakes
+        // (the vitals 10, the crash journal 4, disk facts 2) and 40 wakes, a pass; with that arm
+        // taken out, 19 blink fires, 34 timer wakes and 78 wakes, failed by name. Once more
+        // 2026-11-14 with the take raising its window and reading its focus at both ends, on the
+        // same two builds: 0 blink fires, 16 timer wakes and 41 wakes, a pass; 19 blink fires,
+        // 34 timer wakes and 79 wakes, failed by name; each window read focused at both ends.
+        (
+            "an_idle_rewound_window_blinks_no_caret_and_arms_no_timer",
+            SpinRow {
+                recording: true,
+                scene: SpinScene::WindowedRewound,
+                window: Duration::from_secs(10),
+                max_arms: MAX_ARMS,
+                max_timer_wakes: Some(20),
+                max_owner_fires: &[(BLINK_LANE, 0)],
+                needle_owed: false,
+                max_wakes: 200,
+                max_frames: None,
+                min_hidden_parked: None,
+            },
+        ),
+        // The recording-off arm: the claude-shaped, idle and windowed scenes above with recording
+        // off, each under its recording-on row's bounds.
+        (
+            "an_idle_claude_shaped_client_with_recording_off_banks_no_past_deadline_arms",
+            SpinRow {
+                recording: false,
+                scene: SpinScene::ClaudeShaped,
+                window: Duration::from_secs(10),
+                max_arms: MAX_ARMS,
+                max_timer_wakes: Some(12),
+                max_owner_fires: &[],
+                needle_owed: false,
+                max_wakes: 150,
+                max_frames: None,
+                min_hidden_parked: None,
+            },
+        ),
+        (
+            "a_bare_idle_instance_with_recording_off_banks_no_past_deadline_arms",
+            SpinRow {
+                recording: false,
+                scene: SpinScene::Idle,
+                window: Duration::from_secs(6),
+                max_arms: MAX_ARMS,
+                max_timer_wakes: None,
+                max_owner_fires: &[],
+                needle_owed: false,
+                max_wakes: 6,
+                max_frames: None,
+                min_hidden_parked: None,
+            },
+        ),
+        (
+            "an_idle_window_with_recording_off_parks_until_its_next_deadline",
+            SpinRow {
+                recording: false,
+                scene: SpinScene::Windowed,
+                window: Duration::from_secs(10),
+                max_arms: MAX_ARMS,
+                max_timer_wakes: None,
+                max_owner_fires: &[],
+                needle_owed: false,
+                max_wakes: 200,
+                max_frames: None,
+                min_hidden_parked: None,
             },
         ),
     ];

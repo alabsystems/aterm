@@ -4,11 +4,10 @@
 //! Undo and redo under one writer: every change to a document, whoever made
 //! it, is a labelled frame on that document's one linear history.
 //!
-//! [`EditorWorkspace::apply`] is the only way a document's text changes. A
-//! person's keys (through `apply_recorded`), an agent's request, a reload
-//! from disk, a recovered draft and a revert all commit through it, so the
-//! history always knows the document's head, and an undo never meets text it
-//! did not see.
+//! [`EditorWorkspace::apply`] records live edits; [`EditorWorkspace::adopt_recovery`]
+//! installs a worker-prepared recovery frame before views exist. A person's keys,
+//! an agent's request, a reload and a revert use the live writer, so history knows
+//! every head and undo never meets text it did not see.
 //!
 //! A frame holds the edits that undo it, in the coordinates of the head. Each
 //! later commit maps those edits through its deltas, unless it touches them
@@ -244,6 +243,63 @@ pub(super) struct DocumentHistory {
     run: Option<Run>,
 }
 
+/// A prepared history keeps its reserved retirement slot until publication.
+/// Live histories created by the ordinary writer need no preparation permit.
+#[derive(Debug)]
+pub(super) struct OwnedHistory {
+    history: Option<DocumentHistory>,
+    permit: Option<crate::prepared::Permit>,
+    evidence: crate::prepared::Evidence,
+}
+impl Default for OwnedHistory {
+    fn default() -> Self {
+        Self {
+            history: Some(DocumentHistory::default()),
+            permit: None,
+            evidence: crate::prepared::Evidence::default(),
+        }
+    }
+}
+impl std::ops::Deref for OwnedHistory {
+    type Target = DocumentHistory;
+    fn deref(&self) -> &DocumentHistory {
+        self.history.as_ref().expect("initialized history")
+    }
+}
+impl std::ops::DerefMut for OwnedHistory {
+    fn deref_mut(&mut self) -> &mut DocumentHistory {
+        self.history.get_or_insert_with(DocumentHistory::default)
+    }
+}
+impl OwnedHistory {
+    fn publish(&mut self) {
+        drop(self.permit.take());
+    }
+}
+impl Drop for OwnedHistory {
+    fn drop(&mut self) {
+        if let Some(history) = self.history.take() {
+            let release = move || {
+                #[cfg(any(test, debug_assertions))]
+                crate::store::record_preparation_work(crate::store::PreparationWork {
+                    retired_history_edits: history
+                        .undo
+                        .iter()
+                        .map(|frame| frame.inverse.len())
+                        .sum(),
+                    ..Default::default()
+                });
+                drop(history);
+            };
+            if let Some(permit) = self.permit.take() {
+                permit.retire(self.evidence.clone(), release);
+            } else {
+                release();
+            }
+        }
+    }
+}
+
 impl DocumentHistory {
     /// Meet the document at `current`. A head the history did not record came
     /// from a commit that bypassed the writer: every frame's coordinates are
@@ -372,7 +428,106 @@ pub(super) enum HistoryMutant {
     NoUnblock,
 }
 
+/// Worker-prepared recovery for a fresh, unviewed canonical document.
+/// Contains no identity, view, Surface or write authority.
+#[derive(Debug)]
+pub struct PreparedRecovery {
+    base: std::sync::Arc<str>,
+    text: crate::store::PreparedText,
+    history: OwnedHistory,
+}
+
+impl PreparedRecovery {
+    #[cfg(any(test, debug_assertions))]
+    pub fn retirement_receipts(
+        &self,
+    ) -> (
+        crate::store::RetirementReceipt,
+        crate::store::RetirementReceipt,
+    ) {
+        (
+            self.text.retirement_receipt(),
+            self.history.evidence.receipt(),
+        )
+    }
+    pub fn new(
+        base: &crate::store::PreparedText,
+        recovered: &str,
+    ) -> Result<Option<Self>, EditorError> {
+        let crate::prepared::RecoveryReservation {
+            text: text_permit,
+            history: history_permit,
+            work: _construction,
+        } = base
+            .recovery_permits()
+            .map_err(|()| EditorError::TransactionRejected)?;
+        let before = base.projection();
+        let edits = crate::diff::minimal_edits(&before, recovered);
+        if edits.is_empty() {
+            return Ok(None);
+        }
+        let inverse = inverse_edits(&before, &edits)?;
+        let mut history = DocumentHistory::default();
+        history.push(Frame {
+            id: 0,
+            origin: Origin::Recovered,
+            undoes: None,
+            seq_before: Seq(0),
+            seq_after: Seq(0),
+            inverse,
+            blocked_by: None,
+            #[cfg(test)]
+            before: before.clone(),
+        });
+        history.next_id = 1;
+        Ok(Some(Self {
+            base: before,
+            text: crate::store::PreparedText::recovered(recovered.to_owned(), text_permit),
+            history: OwnedHistory {
+                history: Some(history),
+                permit: history_permit,
+                evidence: crate::prepared::Evidence::default(),
+            },
+        }))
+    }
+}
+
 impl EditorWorkspace {
+    /// Publication ends preparation retirement ownership without dropping live history.
+    pub fn publish_recovery(&mut self, document: DocumentId) {
+        if let Some(history) = self.histories.get_mut(&document) {
+            history.publish();
+        }
+    }
+
+    /// Adopt recovery only at its exact immutable base, before views or history exist.
+    pub fn adopt_recovery(
+        &mut self,
+        store: &mut DocumentStore,
+        document: DocumentId,
+        base: Seq,
+        prepared: PreparedRecovery,
+    ) -> Result<(), EditorError> {
+        if self.histories.contains_key(&document) || store.view_count(document) != Some(0) {
+            return Err(EditorError::TransactionRejected);
+        }
+        let PreparedRecovery {
+            base: witness,
+            text,
+            mut history,
+        } = prepared;
+        let seq = store
+            .adopt_prepared_text(document, base, &witness, text)
+            .map_err(|_| EditorError::TransactionRejected)?;
+        if let Some(frame) = history.undo.front_mut() {
+            frame.seq_before = base;
+            frame.seq_after = seq;
+        }
+        history.head = Some(seq);
+        self.histories.insert(document, history);
+        Ok(())
+    }
+
     /// Whether `C-/` has a frame to take: there is one, and it is not a
     /// recovered draft's ([`RECOVERED_FLOOR`]).
     pub fn can_undo(&self, document: DocumentId) -> bool {
@@ -396,10 +551,15 @@ impl EditorWorkspace {
     /// client edited).
     pub fn start_history_here(&mut self, document: DocumentId) {
         if let Some(history) = self.histories.get_mut(&document) {
-            *history = DocumentHistory {
+            let next = DocumentHistory {
                 head: history.head,
                 next_id: history.next_id,
                 ..DocumentHistory::default()
+            };
+            *history = OwnedHistory {
+                history: Some(next),
+                permit: None,
+                evidence: crate::prepared::Evidence::default(),
             };
         }
     }
@@ -878,6 +1038,11 @@ fn inverse_edits(source: &str, edits: &[TextEdit]) -> Result<Vec<TextEdit>, Edit
             return Err(EditorError::InvalidSelections);
         }
         let start = edit.range.start.saturating_add_signed(growth);
+        #[cfg(any(test, debug_assertions))]
+        crate::store::record_preparation_work(crate::store::PreparationWork {
+            inverse_bytes: edit.range.end.saturating_sub(edit.range.start),
+            ..Default::default()
+        });
         inverse.push(TextEdit {
             range: start..start.saturating_add(edit.insert.len()),
             insert: source[edit.range.clone()].to_owned(),

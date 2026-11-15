@@ -492,6 +492,8 @@ struct Inner {
     backstop: Option<Duration>,
     no_anonymous_api: bool,
     core_reserve: u64,
+    /// The release-line registry whose live holder makes this process the cutter.
+    cut_registry: Option<std::path::PathBuf>,
     /// Each profile's load, once per process.
     credentials: Mutex<BTreeMap<String, std::result::Result<Arc<Credential>, LoadError>>>,
     /// Each repository's numeric id, by [`Slug`].
@@ -534,6 +536,7 @@ pub struct GithubBuilder {
     backstop: Option<Duration>,
     no_anonymous_api: bool,
     core_reserve: u64,
+    cut_registry: Option<std::path::PathBuf>,
     dirs: Option<Dirs>,
     notifier: Arc<dyn Notifier>,
     git_helper: Option<HelperCommand>,
@@ -558,6 +561,7 @@ impl GithubBuilder {
             backstop: None,
             no_anonymous_api: false,
             core_reserve: 1000,
+            cut_registry: aterm_ctl::release_holder::registry(),
             dirs: None,
             notifier: Arc::new(NoNotifier),
             git_helper: None,
@@ -588,7 +592,7 @@ impl GithubBuilder {
         self
     }
 
-    /// The environment: proxy variables, env profiles, ambient tokens.
+    /// The environment: proxy variables and what a git run inherits.
     #[must_use]
     pub fn env(mut self, env: Arc<dyn EnvSource + Send + Sync>) -> GithubBuilder {
         self.env = env;
@@ -607,6 +611,17 @@ impl GithubBuilder {
     #[must_use]
     pub const fn core_reserve(mut self, reserve: u64) -> GithubBuilder {
         self.core_reserve = reserve;
+        self
+    }
+
+    /// The release-line registry a cut's own process tree is proven by
+    /// ([`crate::rate::in_cut_tree`]): a read the reserve would refuse is sent where a record in
+    /// it names this process or a live ancestor as a line's holder. The default is this
+    /// account's ([`aterm_ctl::release_holder::registry`]); `None` proves nothing. Naming a
+    /// folder makes no process the cutter: only a record of a running ancestor does.
+    #[must_use]
+    pub fn cut_registry(mut self, registry: Option<std::path::PathBuf>) -> GithubBuilder {
+        self.cut_registry = registry;
         self
     }
 
@@ -702,6 +717,7 @@ impl GithubBuilder {
                 backstop: self.backstop,
                 no_anonymous_api: self.no_anonymous_api,
                 core_reserve: self.core_reserve,
+                cut_registry: self.cut_registry,
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
@@ -912,7 +928,7 @@ impl Github {
                 Err(e) => e.presence(),
             };
         }
-        let loaded = identity::load(row, &*self.inner.env).map(Arc::new);
+        let loaded = identity::load(row).map(Arc::new);
         if let Ok(cred) = &loaded {
             self.inner.redactor.learn(cred.expose());
         }
@@ -922,6 +938,13 @@ impl Github {
         };
         credentials.insert(profile.to_string(), loaded);
         presence
+    }
+
+    /// Capture the actual immutable credential once for a native operation.
+    #[cfg(unix)]
+    pub(crate) fn git_credential_snapshot(&self, profile: &str) -> Result<Arc<Credential>> {
+        let _ = self.presence(profile);
+        self.credential(profile).ok_or_else(|| not_loaded(profile))
     }
 
     /// Whether the profile's cached credential vouches for draft access.
@@ -1039,6 +1062,7 @@ impl Github {
                 backstop: inner.backstop,
                 no_anonymous_api: inner.no_anonymous_api,
                 core_reserve: inner.core_reserve,
+                cut_registry: inner.cut_registry.clone(),
                 credentials: Mutex::new(BTreeMap::new()),
                 ids: Mutex::new(BTreeMap::new()),
                 meter: Mutex::new(Meter::default()),
@@ -1443,7 +1467,7 @@ impl Github {
         let id = intents.begin(&draft)?;
         // This private entry is reached only after the durable intent begins.
         // Public run_git refuses unjournaled mutable control transactions.
-        let result = crate::git::run(self, run);
+        let result = crate::git::run_with_credential(self, run, decided.cred.clone());
         let settled = match &result {
             Ok(_) => Settled::Created {
                 id: 0,
@@ -2310,10 +2334,11 @@ impl Github {
         self.decided_as(permit.profile())
     }
 
-    /// Login binding (design §6.1): before the first send as an inline profile in this
-    /// client, one `GET /user` as that profile, whose `login` must be the profile's
-    /// (ASCII case-insensitive). Unauthenticated `Sub::LoginMismatch` otherwise, and nothing
-    /// else is sent. A profile of a file or the environment needs no binding.
+    /// Login binding (design §6.1): before the first send as an inline profile that names a
+    /// login in this client, one `GET /user` as that profile, whose `login` must be the
+    /// profile's (ASCII case-insensitive). Unauthenticated `Sub::LoginMismatch` otherwise, and
+    /// nothing else is sent. A profile of a file needs no binding, nor does an inline one with
+    /// no login (`Router::default_reader`'s), whose caller vouched for its token.
     ///
     /// A send that finds another send of this client binding the same profile waits for that
     /// binding to end, so nothing else goes out as the profile while its login is unchecked.
@@ -2322,7 +2347,7 @@ impl Github {
         let Some(row) = self.inner.router.profile(profile) else {
             return Ok(());
         };
-        if !matches!(row.source, Source::Inline(_)) {
+        if !matches!(row.source, Source::Inline(_)) || row.login.is_none() {
             return Ok(());
         }
         let mut held = self.inner.bound.lock_or_recover();
@@ -2789,12 +2814,20 @@ impl Github {
             } else {
                 None
             };
+            // The reserve is kept for a release cut, so a read from inside a cut's own
+            // process tree spends it. The proof is read only here, where a read would
+            // otherwise be refused: every other request costs nothing for it.
             if background
                 && let Some(error) = self.inner.rate_book.refuse_background(
                     book_key_str(&prepared.as_),
                     self.inner.fx.wall_secs()?,
                     self.inner.core_reserve,
                 )
+                && !self
+                    .inner
+                    .cut_registry
+                    .as_deref()
+                    .is_some_and(crate::rate::in_cut_tree)
             {
                 return Err(self.finish_error(error, call, &prepared.as_, None));
             }

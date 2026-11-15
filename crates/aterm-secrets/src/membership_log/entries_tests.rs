@@ -2462,4 +2462,44 @@ fn the_keyed_epoch_reading_disagrees_under_each_mutant() {
     }
 }
 
+/// `value_digest` is SHA-256 through ring's hardware path: FIPS 180-4's vectors (the empty
+/// message, one block, two blocks, a million `a`), and equal to the portable [`Sha256`] it
+/// replaced over pseudo-random values of every length to 4,200 bytes and across the 8 KiB and
+/// 64 KiB marks, so a value's class is what it was.
+#[test]
+fn value_digest_is_sha256_through_ring() {
+    let hex = |value: &[u8]| aterm_codec::hex::encode_lower(&value_digest(value));
+    assert_eq!(
+        hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
+    assert_eq!(
+        hex(&vec![b'a'; 1_000_000]),
+        "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+    );
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for len in (0..=4_200).chain([8_191, 8_192, 8_193, 65_537]) {
+        let value: Vec<u8> = (0..len).map(|_| next().to_le_bytes()[0]).collect();
+        assert_eq!(
+            value_digest(&value),
+            Sha256::digest(&value),
+            "the two agree on a value of {len} bytes"
+        );
+    }
+}
+
 include!("entries/host_carry_tests.rs");

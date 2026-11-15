@@ -409,6 +409,19 @@ pub(crate) fn counts_of(payload: Option<&Value>) -> Option<(TurnTokens, u64, Tur
     Some((total, total_tokens, last))
 }
 
+/// A `token_count` payload's running totals for the whole rollout
+/// (`info.total_token_usage`'s `input_tokens` and `output_tokens`), each `None` where the row
+/// does not say it; `None` where the row names neither.
+pub(crate) fn whole_tokens_of(payload: &Value) -> Option<(Option<u64>, Option<u64>)> {
+    let total = payload
+        .get(KEY_INFO)
+        .filter(|i| i.is_object())?
+        .get(KEY_TOTAL_USAGE)?;
+    let n = |key: &str| total.get(key).and_then(Value::as_u64);
+    let counts = (n(KEY_INPUT_TOKENS), n(KEY_OUTPUT_TOKENS));
+    (counts != (None, None)).then_some(counts)
+}
+
 impl TurnReader {
     /// Processes the next line of the rollout and returns its [`Row`] classification.
     pub fn line(&mut self, line: &str) -> Row {

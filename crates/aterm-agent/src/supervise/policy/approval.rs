@@ -6,31 +6,32 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use alab_policy::vocab::Phase;
 use aterm_phase::prompt::{
     Opt, PromptKind, PromptV2, RmBreaker, RmBreakerKind, RmCommand, Role, Select, asks, cut_short,
     kept_answer, rm_breaker_of, settles_later,
 };
-use aterm_phase::{Phase, Program, Reading, anchor};
+use aterm_phase::{Program, Reading, anchor};
 
 use super::super::config::{Approve, SupervisorConfig};
 use super::a_or_an;
 use super::box_command;
 use super::claude_settings::{AskKind, OwnerAsk};
 use super::git_config::{GitView, WorkerEnv, cd_operand, cdpath_searched, git_reads, hazard};
-use super::guard::row_guard;
 use super::probe::{Below, PolicyProbe, WorkerWrites};
 use super::rm_breaker::{RmScope, ScratchRoot, abs_components, clip, resolve_rm_line};
 use super::shell_startup::ShellStartup;
 use super::trace::{NoTrace, Outcome, Trace, note};
 use crate::harness::disk::fence;
 use crate::harness::lights::Mode;
-use crate::supervise::classify::{
+use alab_policy::classify::{
     QUOTED_SUBSTITUTION, SUBSTITUTION, brace_expansion, classify_command_except,
     classify_command_with, classify_except_rm, command_words, command_words_globbed,
     expanded_parameters, git_grep_operands, git_log_operands, git_subcommand, git_tree_path,
     glob_match, grammar_names_operand, path_operands_except, path_operands_of, plain_zsh_line,
     program, runs, unquoted_glob, unredirected,
 };
+use alab_policy::guard::row_guard;
 
 /// Rule identifier for the read-only Bash classifier approval rule.
 pub const RULE_READ_ONLY: &str = "read-only@classify-v13";
@@ -531,7 +532,7 @@ pub struct ApprovalCtx {
     pub answer_questions: bool,
     pub limit_wait: bool,
     pub limit_reset: bool,
-    pub reset_kinds: Vec<aterm_phase::ResetKind>,
+    pub reset_kinds: Vec<alab_policy::vocab::ResetKind>,
     pub usage_credits: bool,
     pub autocompact_offer: Option<u32>,
     pub login_carry: bool,

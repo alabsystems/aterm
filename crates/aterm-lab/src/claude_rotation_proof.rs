@@ -51,18 +51,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use alab_policy::config::TurnEndTiming;
+use alab_policy::cruise_carry::RULE_BACKGROUND;
+use alab_policy::guard::ROW_END;
+use alab_policy::guard::row_guard;
+use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED};
 use aterm_agent::harness::accounts::{
     ACCOUNTS_FILE, LOGIN_ENV, RESET_GRACE_S, Recorded, Roster, StayWhy, Store,
 };
 use aterm_agent::harness::accounts_sync::{FLEET_ROSTER_FILE, FleetRoster, OptIn};
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::approvals::ACCOUNT_MOVE_COMMAND;
-use aterm_agent::supervise::policy::cruise_carry::RULE_BACKGROUND;
-use aterm_agent::supervise::policy::guard::ROW_END;
-use aterm_agent::supervise::policy::row_guard;
 use aterm_agent::supervise::policy::turn_end::{
-    RULE_ACCOUNT, RULE_CONTINUE, RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LIMIT_RESUME, RULE_LOGIN,
-    RULE_OPEN_ITEMS, RULE_SUGGESTION, RULE_UNCOMMITTED, TurnEndTiming,
+    RULE_ACCOUNT, RULE_HOST_TURN, RULE_LIMIT_RESUME, RULE_LOGIN, RULE_SUGGESTION,
 };
 
 use crate::claude_login_proof::{
@@ -835,7 +836,7 @@ pub fn judge_r4(ev: &Ev, leg: &Leg) -> Judged {
     }
     let past = i64::try_from(r4_wait_past_reset().as_millis()).unwrap_or(i64::MAX);
     let names = (leg.reset * 1000 - 60_000)..=(leg.reset * 1000).saturating_add(past);
-    let usage = aterm_phase::WallKind::UsageSession.name();
+    let usage = alab_policy::vocab::WallKind::UsageSession.name();
     let waiting = ev.journal.iter().find(|s| {
         (leg.from..=leg.to).contains(&s.t_ms)
             && s.line.starts_with("WAITING ")

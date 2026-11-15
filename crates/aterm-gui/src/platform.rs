@@ -867,7 +867,8 @@ pub(crate) const fn option_composes(option_is_alt: bool) -> bool {
 #[path = "platform_option_as_alt_tests.rs"]
 mod option_as_alt_tests;
 
-/// How long the NSEvent currently being dispatched sat in the NSApp queue before this code ran, in nanoseconds.
+/// Age of this callback's original native key-down, including deferred callback delivery.
+/// An absent or unsupported native clock remains unavailable.
 #[cfg(target_os = "macos")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     use std::ffi::c_void;
@@ -877,19 +878,7 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
 
     use crate::appkit::{self, MainThread};
 
-    static NS_APPLICATION_CLASS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static NS_PROCESS_INFO_CLASS: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-    #[inline]
-    fn ns_application_class() -> Id {
-        let cached = NS_APPLICATION_CLASS.load(Ordering::Relaxed);
-        if !cached.is_null() {
-            return Id::from_ptr(cached);
-        }
-        let cls = class(c"NSApplication").as_id();
-        NS_APPLICATION_CLASS.store(cls.cast(), Ordering::Relaxed);
-        cls
-    }
 
     #[inline]
     fn ns_process_info_class() -> Id {
@@ -904,33 +893,42 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
 
     let _windowed = Windowed::get()?;
     let _main_thread = MainThread::new()?;
-    // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit singleton (`_main_thread` is the witness); `-currentEvent` is `-(id)` and nil outside a dispatch, which is the fail-closed case; `-timestamp` and `-systemUptime` are `-(NSTimeInterval)`, i.e. `double`, side-effect-free scalar reads; `+processInfo` is `-(id)`, another immortal singleton.
-    let (ts, uptime) = unsafe {
-        let app = appkit::send_id(ns_application_class(), sel!(sharedApplication));
-        if app.is_null() {
-            return None;
-        }
-        let ev = appkit::send_id(app, sel!(currentEvent));
-        if ev.is_null() {
-            return None;
-        }
-        let info = appkit::send_id(ns_process_info_class(), sel!(processInfo));
-        if info.is_null() {
-            return None;
-        }
-        (
-            appkit::send_f64(ev, sel!(timestamp)),
-            appkit::send_f64(info, sel!(systemUptime)),
-        )
-    };
-    nsevent_queue_age_ns(ts, uptime)
+    let native = aterm_window::platform::macos::window_event_native_input()
+        .map(|event| (event.kind, event.timestamp));
+    retained_key_queue_age_ns(native, || {
+        // SAFETY: `+processInfo` is `-(id)`, an immortal singleton; `-systemUptime`
+        // is `-(NSTimeInterval)` (`double`). The windowed and main-thread witnesses
+        // above remain live throughout this side-effect-free read.
+        let uptime = unsafe {
+            let info = appkit::send_id(ns_process_info_class(), sel!(processInfo));
+            if info.is_null() {
+                return None;
+            }
+            appkit::send_f64(info, sel!(systemUptime))
+        };
+        Some(uptime)
+    })
+}
+
+/// Convert the retained key's timestamp only after its callback supplied one. The uptime
+/// reader is injected so unknown input needs no native probe, including in headless tests.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn retained_key_queue_age_ns(
+    native: Option<(usize, f64)>,
+    uptime: impl FnOnce() -> Option<f64>,
+) -> Option<u64> {
+    let (kind, timestamp) = native?;
+    if kind != 10 || !timestamp.is_finite() || timestamp <= 0.0 {
+        return None;
+    }
+    nsevent_queue_age_ns(timestamp, uptime()?)
 }
 
 /// An observed AppKit timestamp may be rounded slightly ahead of uptime; other
 /// unsupported clock values stay unavailable rather than becoming a zero wait.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn nsevent_queue_age_ns(timestamp: f64, uptime: f64) -> Option<u64> {
-    if timestamp <= 0.0 {
+    if !timestamp.is_finite() || !uptime.is_finite() || timestamp <= 0.0 {
         return None;
     }
     let age_s = uptime - timestamp;
@@ -938,6 +936,10 @@ pub(crate) fn nsevent_queue_age_ns(timestamp: f64, uptime: f64) -> Option<u64> {
         .contains(&age_s)
         .then(|| (age_s.max(0.0) * 1e9) as u64)
 }
+
+#[cfg(test)]
+#[path = "platform_native_key_clock_tests.rs"]
+mod native_key_clock_tests;
 
 /// The key or mouse event AppKit is dispatching now (`-[NSApp currentEvent]`), as `hwkey`
 /// records the events it posts ([`crate::hwkey::NativeInput`]); `None` headless, off the main

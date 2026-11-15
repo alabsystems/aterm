@@ -17,6 +17,91 @@ fn canonical_uri_reuses_one_document() {
     assert_eq!(store.snapshot(id).unwrap().text.as_ref(), "hello\nworld");
 }
 
+#[test]
+fn unpublished_attachment_rollback_preserves_shared_dirty_text_and_published_views() {
+    let (mut store, document) = open();
+    let published = DocumentViewId(1);
+    let staged = DocumentViewId(2);
+    store.attach_view(document, published).unwrap();
+    let before = store.snapshot(document).unwrap();
+    assert!(matches!(
+        store.replace_text(document, before.seq, "new unsaved text"),
+        DocumentTxnOutcome::Committed { .. }
+    ));
+    let edited = store.snapshot(document).unwrap();
+    let checkpoint = store.checkpoint_seq(document);
+    assert!(
+        store.attach_unpublished_view(document, published).is_err(),
+        "a published edge cannot mint rollback authority"
+    );
+    let attachment = store.attach_unpublished_view(document, staged).unwrap();
+    store.rollback_attachment(attachment).unwrap();
+    assert_eq!(store.view_ids(document), Some(vec![published]));
+    let after = store.snapshot(document).unwrap();
+    assert_eq!((after.seq, after.text), (edited.seq, edited.text));
+    assert_eq!(store.checkpoint_seq(document), checkpoint);
+    assert_eq!(store.dirty(document), Some(true));
+}
+
+#[test]
+fn an_unpublished_last_view_can_be_rolled_back_without_discarding_its_dirty_document() {
+    let (mut store, document) = open();
+    let before = store.snapshot(document).unwrap();
+    store.replace_text(document, before.seq, "recovered draft");
+    let attachment = store
+        .attach_unpublished_view(document, DocumentViewId(7))
+        .unwrap();
+    let edited = store.snapshot(document).unwrap();
+    store.rollback_attachment(attachment).unwrap();
+    assert_eq!(store.phase(document), Some(DocumentPhase::Suspended));
+    assert_eq!(store.view_count(document), Some(0));
+    assert_eq!(store.snapshot(document).unwrap().text, edited.text);
+    assert_eq!(store.dirty(document), Some(true));
+}
+
+#[test]
+fn publication_revokes_rollback_and_requires_the_ordinary_dirty_close_decision() {
+    let (mut store, document) = open();
+    let view = DocumentViewId(9);
+    let before = store.snapshot(document).unwrap();
+    store.replace_text(document, before.seq, "unsaved");
+    let attachment = store.attach_unpublished_view(document, view).unwrap();
+    store.publish_attachment(attachment).unwrap();
+    assert!(store.attach_unpublished_view(document, view).is_err());
+    assert_eq!(
+        store.detach_view_if_ready(document, view),
+        Err(DocumentError::CloseNotReady)
+    );
+    assert_eq!(store.view_ids(document), Some(vec![view]));
+
+    let other = DocumentViewId(10);
+    let stale = store.attach_unpublished_view(document, other).unwrap();
+    store.attach_view(document, other).unwrap();
+    assert_eq!(
+        store.rollback_attachment(stale),
+        Err(DocumentError::CloseNotReady)
+    );
+    assert_eq!(store.view_ids(document), Some(vec![view, other]));
+}
+
+#[test]
+fn attachment_authority_is_bound_to_the_store_that_minted_it() {
+    let (mut first, document) = open();
+    let (mut second, other_document) = open();
+    let view = DocumentViewId(3);
+    let first_token = first.attach_unpublished_view(document, view).unwrap();
+    let second_token = second
+        .attach_unpublished_view(other_document, view)
+        .unwrap();
+    assert_eq!(
+        second.rollback_attachment(first_token),
+        Err(DocumentError::CloseNotReady)
+    );
+    assert!(second.holds_attachment(&second_token));
+    assert_eq!(second.view_count(other_document), Some(1));
+    assert_eq!(first.view_count(document), Some(1));
+}
+
 /// A read-only document refuses every transaction, a replacement included, keeps its text and
 /// sequence, and stays read-only when its URI is opened again.
 /// NEGATIVE CONTROL: with `transact` checking only `directory`, the edit commits:
@@ -623,4 +708,50 @@ fn rebase_positions_tracks_atomic_deltas() {
         inserted_len: huge,
     }];
     assert_eq!(rebase_position(3, &past_isize), huge + 1);
+}
+
+#[test]
+fn prepared_storage_transfers_without_content_work_and_keeps_canonical_edits() {
+    for repeats in [1, 131_072] {
+        let (prepared, work) = std::thread::spawn(move || {
+            take_preparation_work();
+            let text = PreparedText::new("é\r\nline\n".repeat(repeats));
+            let work = take_preparation_work();
+            (text, work)
+        })
+        .join()
+        .unwrap();
+        assert!(work.projection_input_bytes > 0);
+        assert_eq!(work.rope_input_bytes, work.projection_input_bytes);
+        take_preparation_work();
+        let mut store = DocumentStore::for_test();
+        let id = store
+            .open_prepared("mem://prepared".into(), prepared.clone())
+            .unwrap();
+        assert_eq!(
+            take_preparation_work(),
+            PreparationWork {
+                adoptions: 1,
+                ..Default::default()
+            }
+        );
+        let base = store.snapshot(id).unwrap();
+        store.replace_text(id, base.seq, "live");
+        take_preparation_work();
+        assert_eq!(
+            store
+                .open_prepared("mem://prepared".into(), prepared)
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            store.open("mem://prepared".into(), "ignored".repeat(repeats)),
+            id
+        );
+        assert_eq!(take_preparation_work(), PreparationWork::default());
+        assert_eq!(&*store.snapshot(id).unwrap().text, "live");
+        // Negative control: the old String materialization boundary is counted.
+        store.open("mem://unprepared".into(), "control".repeat(repeats));
+        assert!(take_preparation_work().rope_input_bytes > 0);
+    }
 }

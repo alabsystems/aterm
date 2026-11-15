@@ -567,6 +567,23 @@ pub(crate) struct FleetSnapshot {
 }
 
 impl FleetSnapshot {
+    /// Every tab ID this read names on another Mac (its agent sessions, needs, holds and
+    /// managers): the fleet half of the tab IDs a mint refuses ([`crate::tab_ids`]).
+    pub(crate) fn tab_ids(&self) -> Vec<aterm_types::tab_id::TabId> {
+        let mut ids = Vec::new();
+        for mac in &self.macs {
+            let words = mac
+                .agent_sessions
+                .iter()
+                .map(|s| s.sid.as_str())
+                .chain(mac.needs.iter().map(|n| n.sid.as_str()))
+                .chain(mac.held_here.iter().map(|h| h.sid.as_str()))
+                .chain(mac.managers.iter().map(|m| m.sid.as_str()));
+            ids.extend(words.filter_map(aterm_types::tab_id::TabId::parse));
+        }
+        ids
+    }
+
     /// Whether the read itself is no older than [`COUNT_FRESH`] at `now_ms`, without a future
     /// timestamp (each Mac's own rows: [`FleetMac::fresh`]).
     pub(crate) fn fresh(&self, now_ms: u64) -> bool {
@@ -659,6 +676,11 @@ pub(crate) fn short_name(dial: &str) -> String {
         .to_string()
 }
 
+/// Whether `word` names a tab on another Mac: a tab ID ([`aterm_types::tab_id::is_tab_id`]).
+fn names_tab(word: &str) -> bool {
+    aterm_types::tab_id::is_tab_id(word)
+}
+
 /// A member of a JSON object as a string, `None` for `-`, empty or absent.
 fn field<'a>(object: &'a aterm_json::Map, key: &str) -> Option<&'a str> {
     object
@@ -744,7 +766,7 @@ fn mac_of(
                 mac.sessions_more += 1;
             }
         }
-        if let Some(from) = field(row, "task_from").filter(|f| f.starts_with("s-")) {
+        if let Some(from) = field(row, "task_from").filter(|f| names_tab(f)) {
             match mac.managers.iter_mut().find(|m| m.sid == from) {
                 Some(manager) => manager.workers += 1,
                 None => {
@@ -1690,6 +1712,7 @@ fn reader_loop(
                             snapshot
                         };
                         slot.generation = slot.generation.wrapping_add(1);
+                        crate::tab_ids::note_fleet(snapshot.tab_ids());
                         slot.snapshot = Some(Arc::new(snapshot));
                         slot.error = None;
                     }

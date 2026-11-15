@@ -249,7 +249,7 @@ fn a_headless_launch_is_not_an_activatable_app_and_never_takes_the_front() {
 
     let spawned = client_ok(&inst, &["ctl", "--sock", &sock, "spawn"]);
     assert!(
-        spawned.starts_with("OK s-"),
+        aterm_agent::spawned_tab_id(&spawned).is_some(),
         "spawn replies `OK <sid>`: {spawned:?}"
     );
     let chrome = client_ok(&inst, &["ctl", "--sock", &sock, "chrome"]);

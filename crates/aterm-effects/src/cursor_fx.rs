@@ -188,6 +188,15 @@ pub struct CursorFxFrame {
     /// The momentum glow is hot: this Blinking* style pinned to its Steady* twin (`None` when
     /// cold, or when the style does not blink).
     pub momentum_steady: Option<CursorStyle>,
+    /// The rainbow block's innermost halo ring, which the host draws as a one-pixel keyline just
+    /// inside the block over its fill: the ring's premultiplied additive tint (`0x00RRGGBB`),
+    /// where the fill is the rainbow's own; `None` leaves no keyline. The renderer works the
+    /// line's colour from it and the fill it draws ([`aterm_render::block_keyline_colour`]).
+    /// Drawn outside, the ring's only visible pixel was a one-pixel outline around the caret that
+    /// left its old cell and lit its new one on every move, a flash turn pair on each pixel of the
+    /// outline ([`crate::cursor_rainbow::RainbowFrame::inner_ring`]); inside, it moves with the
+    /// caret's own pixels. A pinned cursor colour keeps it outside.
+    pub keyline_tint: Option<u32>,
 }
 
 impl CursorFxFrame {
@@ -406,7 +415,7 @@ pub const fn resolve_block_fill(
 }
 
 /// The least WCAG contrast an effect-owned caret fill keeps against the ground under it.
-pub const CARET_PAGE_MIN_CONTRAST: f32 = 4.5;
+pub const CARET_PAGE_MIN_CONTRAST: f32 = aterm_render::CARET_PAGE_MIN_CONTRAST;
 
 /// The margin past [`CARET_PAGE_MIN_CONTRAST`] Sparkle's gold paper caret keeps for the renderer's
 /// rounding.
@@ -2106,6 +2115,13 @@ impl CursorFx {
             Some(fill) => glow_fp.rotate_left(11) ^ (u64::from(fill) | (1 << 33)),
             None => glow_fp,
         };
+        // The innermost ring lay inside the block, under its fill: its edge is the keyline, which
+        // the renderer draws from this tint and the fill it draws.
+        let keyline_tint = rainbow_frame.inner_ring;
+        let glow_fp = match keyline_tint {
+            Some(tint) => glow_fp.rotate_left(13) ^ (u64::from(tint) | (1 << 34)),
+            None => glow_fp,
+        };
         CursorFxFrame {
             glow_fp,
             trail_fp,
@@ -2115,8 +2131,42 @@ impl CursorFx {
             bolt_cursor: bolt_cursor && !bolt_down,
             twinkle_cursor: twinkle_cursor || bolt_down,
             momentum_steady,
+            keyline_tint,
         }
     }
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static BLOCK_RIM_OUTSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`with_block_rim_outside`] holds on this thread: always `false` in a release build.
+#[inline]
+pub(crate) fn block_rim_outside() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        BLOCK_RIM_OUTSIDE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// A test's negative control: `f` run with the rainbow block's innermost halo ring drawn outside
+/// the block, one pixel out, as it was ([`CursorFxFrame::keyline_tint`]). Debug and test builds only;
+/// the flag is this thread's and is put back as it was when `f` returns or panics.
+#[cfg(any(test, debug_assertions))]
+pub fn with_block_rim_outside<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            BLOCK_RIM_OUTSIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(BLOCK_RIM_OUTSIDE.with(|c| c.replace(true)));
+    f()
 }
 
 #[cfg(test)]

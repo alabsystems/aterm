@@ -949,3 +949,55 @@ fn bidi_map_only_cost() {
         }
     }
 }
+
+#[test]
+fn budgeted_search_does_not_materialize_rows_before_its_retained_window() {
+    use aterm_core::terminal::Terminal;
+    use aterm_scrollback::Scrollback;
+    use aterm_search::DEFAULT_MAX_CACHED_LINES;
+
+    let depth = DEFAULT_MAX_CACHED_LINES + 64;
+    let store = Scrollback::new(depth, depth, 64 * 1024 * 1024);
+    let mut terminal = Terminal::with_scrollback(2, 8, depth, store);
+    terminal.process("x\r\n".repeat(depth).as_bytes());
+    let first = terminal
+        .search_budgeted("x", true, false, None, 1)
+        .expect("start search");
+    assert!(first.total_rows > DEFAULT_MAX_CACHED_LINES + 17);
+    assert_eq!(first.rows_fed, 1);
+    assert!(first.results.matches.is_empty());
+    let (next, calls) = allocs_in(|| {
+        terminal
+            .search_budgeted("x", true, false, first.cursor, 16)
+            .expect("resume search")
+    });
+    assert_eq!(next.rows_fed, 17, "the row budget still advances normally");
+    assert_eq!(next.search_id, first.search_id);
+    assert!(!next.reset);
+    assert!(!next.complete);
+    assert!(next.results.matches.is_empty());
+    assert!(next.results.incomplete);
+    assert_eq!(
+        next.results.lowest_retained_line,
+        first.results.lowest_retained_line
+    );
+    assert_eq!(next.results.cut_short_lines, 0);
+    eprintln!("unretained search prefix: 16 rows, {calls} allocations");
+    assert_eq!(calls, 0, "discarded rows need no text or cell allocation");
+
+    let excluded = next.results.lowest_retained_line
+        - usize::try_from(terminal.grid().oldest_absolute_row()).expect("fixture row fits");
+    let crossing = terminal
+        .search_budgeted("x", true, false, next.cursor, excluded - next.rows_fed + 1)
+        .expect("cross into the retained window");
+    assert_eq!(crossing.rows_fed, excluded + 1);
+    assert_eq!(crossing.search_id, first.search_id);
+    assert_eq!(crossing.results.matches.len(), 1);
+    assert_eq!(
+        crossing.results.matches[0].line,
+        next.results.lowest_retained_line
+    );
+    assert_eq!(crossing.results.matches[0].start_col, 0);
+    assert_eq!(crossing.results.matches[0].end_col, 1);
+    assert_eq!(crossing.results.cut_short_lines, 0);
+}

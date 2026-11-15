@@ -614,6 +614,7 @@ fn exec_args(pid: u32) -> Steers {
             buf.resize(STEER_READ_MAX, 0);
         }
         aterm_uds::procargs::read_into(pid, buf)
+            .ok()
             .and_then(|len| buf.get(..len))
             .map(|record| {
                 let (env_path, handed) = steers_of_procargs(record);

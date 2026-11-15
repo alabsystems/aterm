@@ -44,6 +44,39 @@ fn functional_window_rejects_headless_and_zero_before_starting() {
 }
 
 #[test]
+fn correctness_window_rejects_invalid_launch_and_cannot_measure() {
+    let world = World::new(CONFIG_OFF).unwrap();
+    for (headless, bytes) in [(true, 1024), (false, 0)] {
+        assert!(
+            Instance::start_correctness_in(&world, launch(&world, headless), bytes, Band::App)
+                .is_err()
+        );
+        assert!(!world.dir.join("aterm.log").exists());
+    }
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+    let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+    let claim = aterm_capacity::admit_with(
+        &ledger,
+        &machine,
+        aterm_capacity::Need::new("correctness guard")
+            .mem_gib(2)
+            .margin(128 << 20)
+            .quiet(f64::INFINITY),
+        aterm_capacity::Admit::Wait,
+        aterm_capacity::Pace::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+    let mut guard = WindowAdmission::Correctness { _claim: claim };
+    assert!(guard.measurement_entry().is_err());
+    assert!(guard.timing_admission().is_err());
+    assert_eq!(ledger.list().unwrap().len(), 1);
+    drop(guard);
+    assert!(ledger.list().unwrap().is_empty());
+}
+
+#[test]
 fn cli_window_selection_defaults_to_timing_and_preserves_checked_budget() {
     assert!(matches!(
         instance_window_work(&mut vec![], true).unwrap(),
@@ -103,4 +136,25 @@ fn cli_rejects_invalid_functional_modes_before_resolving_or_spawning_app() {
     ]
     .map(String::from);
     assert_eq!(cmd_instance(&args).unwrap_err().code, 2);
+}
+
+#[test]
+fn sizing_rejects_invalid_authority_before_recorder_or_child_starts() {
+    let world = World::new(CONFIG_OFF).unwrap();
+    for (headless, bytes) in [(true, 1024), (false, 0)] {
+        let mut called = false;
+        let result = Instance::start_functional_sizing(
+            &world,
+            launch(&world, headless),
+            bytes,
+            crate::band::Generation::fresh().unwrap(),
+            || {
+                called = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!called);
+        assert!(!world.dir.join("aterm.log").exists());
+    }
 }

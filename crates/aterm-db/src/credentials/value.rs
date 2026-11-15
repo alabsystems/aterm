@@ -50,6 +50,20 @@ pub(super) fn validate(want: &Want, values: &Values) -> Result<Option<String>> {
     let refused = || Error::new("the contribution failed the want's validator");
     let bytes = values.0[0].1.as_slice();
     match want {
+        Want::AzureSigningPrincipal => {
+            let text = std::str::from_utf8(bytes).map_err(|_| refused())?;
+            aterm_secrets::azure_principal::parse(text).map_err(|_| refused())?;
+        }
+        Want::MachinesAdmin => {
+            if !line(bytes) {
+                return Err(refused());
+            }
+        }
+        Want::PaperMaster => {
+            if !line(bytes) || !aterm_secrets::paper_master::well_formed(bytes) {
+                return Err(refused());
+            }
+        }
         Want::Mailbox(_) | Want::MailboxComponent(_) => {
             if values.0.iter().any(|(_, value)| !line(value.as_slice())) {
                 return Err(refused());

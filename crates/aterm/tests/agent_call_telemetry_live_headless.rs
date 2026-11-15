@@ -203,12 +203,82 @@ fn call_rows(inst: &Instance, n: usize) -> Vec<String> {
         }
         assert!(
             Instant::now() < deadline,
-            "{} of {n} agent-call rows within {HANG:?}:\n{body}\n{}",
+            "{} of {n} agent-call rows within {HANG:?}:\n{body}\n{}\n{}\n{}",
             rows.len(),
+            headless_boot::ctl_ok(inst, &["telemetry"]),
+            readers_evidence(inst),
             headless_boot::log_tail(&inst.log)
         );
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// What the instance's vitals threads were doing when a call or its completion row did not
+/// arrive: each thread's stack (`aterm-vitals`, the probe that reads the machine and answers a
+/// pull; `aterm-vitals-jobs`,
+/// the engine that makes the jobs view) from a two-second `sample` of the instance. This
+/// failure came only on a loaded Mac, beside the whole suite, with the stand-in's calls started
+/// and the probe still reading about once a second (2026-11-14, ATERM-KI-1110-147), and what it
+/// printed could not tell an engine that was never asked from one that was reading or one that
+/// waited to be published. Never a reason to fail: what does not read is said in its place.
+fn readers_evidence(inst: &Instance) -> String {
+    let to = inst.tmp.join("vitals-threads.sample");
+    let pid = inst.child.id().to_string();
+    let mut sample = match aterm_uds::spawnfd::command("/usr/bin/sample")
+        .args([pid.as_str(), "2", "-mayDie", "-file"])
+        .arg(&to)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return format!("vitals threads: sample did not start: {e}"),
+    };
+    let deadline = Instant::now() + HANG;
+    loop {
+        match sample.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                let _ = sample.kill();
+                let _ = sample.wait();
+                return format!("vitals threads: sample of pid {pid} did not end within {HANG:?}");
+            }
+            Err(e) => return format!("vitals threads: sample could not be waited on: {e}"),
+        }
+    }
+    match std::fs::read_to_string(&to) {
+        Ok(body) => vitals_threads(&body),
+        Err(e) => format!("vitals threads: {} did not read: {e}", to.display()),
+    }
+}
+
+/// The call graph of each thread named `aterm-vitals…` in a `sample` report: its `Thread_` line
+/// and the frames under it, to the next thread's line or the graph's end, at most 60 lines a
+/// thread and 200 characters a line (a frame's mangled name runs to several hundred).
+fn vitals_threads(report: &str) -> String {
+    const MOST: usize = 60;
+    const WIDEST: usize = 200;
+    let mut out = vec!["vitals threads (sample, 2 s):".to_owned()];
+    let mut kept = None;
+    for line in report.lines() {
+        if line.contains("Thread_") {
+            kept = line.contains("aterm-vitals").then_some(0usize);
+        } else if line.trim().is_empty() || line.starts_with("Total number in stack") {
+            kept = None;
+        }
+        if let Some(n) = kept.as_mut() {
+            if *n < MOST {
+                out.push(line.trim_end().chars().take(WIDEST).collect());
+            }
+            *n += 1;
+        }
+    }
+    if out.len() == 1 {
+        out.push("none named aterm-vitals in the report".to_owned());
+    }
+    out.join("\n")
 }
 
 fn word<'a>(row: &'a str, key: &str) -> &'a str {
@@ -241,7 +311,8 @@ fn run(prefix: &str, calls: &[(u64, &str)]) -> (Vec<String>, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "calls were not observed:\n{jobs}\n{telemetry}"
+            "calls were not observed:\n{jobs}\n{telemetry}\n{}",
+            readers_evidence(&inst)
         );
         std::thread::sleep(Duration::from_millis(20));
     }

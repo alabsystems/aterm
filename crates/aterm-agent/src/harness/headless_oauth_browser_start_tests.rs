@@ -44,6 +44,7 @@ fn discovery_and_rejected_browser_spawn_reach_a_hostless_outcome() {
         super::super::cli::Renewal::Failed,
         None,
         Some(&retained),
+        None,
     );
     assert!(history.ends_with(&expected.words()));
     assert!(!history.contains("private") && !history.contains("old.example"));

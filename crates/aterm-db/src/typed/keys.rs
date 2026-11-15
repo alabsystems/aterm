@@ -271,7 +271,7 @@ pub fn mailbox_pk(login: &str) -> Result<String> {
 /// Prefixes of keys minted at random.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Random {
-    /// A phone: its number is a low-entropy secret, found by its sealed `number` cell.
+    /// A phone: found by its `number` cell; a key made from the number would change with it.
     Phone,
 }
 

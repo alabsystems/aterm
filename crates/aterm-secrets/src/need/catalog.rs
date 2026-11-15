@@ -7,8 +7,6 @@
 //! never asked is never asked. No record and no admin can make a want askable that this file
 //! does not.
 
-use std::path::{Path, PathBuf};
-
 /// The vault entry the site deployer's key arrives as ([`crate::entry_class::SITE_DEPLOYER_KEY`]).
 pub const SITE_DEPLOYER_KEY_ENTRY: &str = crate::entry_class::SITE_DEPLOYER_KEY;
 
@@ -17,8 +15,16 @@ pub const SITE_DEPLOYER_KEY_ENTRY: &str = crate::entry_class::SITE_DEPLOYER_KEY;
 /// is never supplied.
 pub const NOTARY_ENTRY: &str = crate::entry_class::NOTARY;
 
+/// The vault entry the release roster's paper master phrase arrives as
+/// ([`crate::entry_class::PAPER_MASTER`]).
+pub const PAPER_MASTER_ENTRY: &str = crate::entry_class::PAPER_MASTER;
+
+/// The vault entry the Azure signing principal arrives as: its `AZURE_TENANT_ID`,
+/// `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET` lines, which `aterm-winsign` hands to signtool.
+pub const AZURE_SIGNING_PRINCIPAL_ENTRY: &str = "azure_signing_principal";
+
 /// The catalog's version, cited as a catalog retirement's evidence.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// The most characters a mailbox label or a `login:` name takes.
 const MAX_LABEL: usize = 63;
@@ -30,27 +36,43 @@ pub enum GhProfile {
     Dev,
     /// `gh_access_token_alabsystems`, the release identity.
     Release,
+    /// `gh_access_token_fleet`, the machine user `aterm machines` registers hosts' keys with.
+    Fleet,
 }
+
+/// The vault entry the fleet machine user's GitHub token arrives as.
+pub const FLEET_GH_TOKEN_ENTRY: &str = "gh_access_token_fleet";
+
+/// The vault entry `aterm machines enroll` signs in to a Mac's admin account with.
+pub const MACHINES_ADMIN_ENTRY: &str = "machines_admin_password";
+
+/// The kind word of a Claude Code token want: `claude-token:<key>`.
+const CLAUDE_TOKEN: &str = "claude-token";
+
+/// The one verb that makes a Claude Code token ([`Want::producer`]): a person signs in to the
+/// account in a browser, and the verb stores the token in the vault's log
+/// (docs/DESIGN-claude-setup-token-2026-11-05.md §4.6).
+pub const CLAUDE_TOKEN_PRODUCER: &str = "aterm harness accounts token <label|email>";
 
 /// What a request names: never a file path a record could choose.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Want {
     /// `site-deployer-key`: the site deployer's service-account key.
     SiteDeployerKey,
-    /// `notary`: the notary credential (`~/.secrets/release-notary`).
+    /// `notary`: the notary credential, the vault entry `release-notary`.
     Notary,
-    /// `developer-id:<stem>`: a Developer ID Application certificate and its key, the vault's
-    /// `~/.aterm/apple/devid-<stem>.cer` and `.key`.
+    /// `developer-id:<stem>`: a Developer ID Application certificate and its key, the vault
+    /// entries `~/.aterm/apple/devid-<stem>.cer` and `.key`.
     DeveloperId(String),
     /// `mailbox:<label>`: one AI account's mailbox password (and TOTP seed).
     Mailbox(String),
     /// One credential of a registered mailbox, bound to its authority and login.
     MailboxComponent(crate::mailbox_component::Component),
-    /// `gh:<dev|release>`: a vault GitHub token.
+    /// `gh:<dev|release|fleet>`: a vault GitHub token.
     Gh(GhProfile),
     /// `entry:<name>`: any vault entry by name, answered from this Mac's own envelope.
     Entry(String),
-    /// `paper-master`: the release roster's paper master.
+    /// `paper-master`: the release roster's paper master phrase.
     PaperMaster,
     /// `login:<provider>/<label>`: a vendor login.
     Login(String),
@@ -64,6 +86,18 @@ pub enum Want {
     CommonsDeviceKey,
     /// `commons-control`: the Commons control entry.
     CommonsControl,
+    /// `machines-admin`: the admin password `aterm machines enroll` signs in to a Mac with.
+    MachinesAdmin,
+    /// `claude-token:<key>`: the Claude Code token of the account `<key>` (`ac-<16 hex>`), the
+    /// `[everyone]` entry `aterm-claude-token-<key>` of the vault's log. It has one producer
+    /// ([`Want::producer`]) and lives only in the log, inner-sealed: no Mac gives or copies it,
+    /// and a request for it ends once the log gives the requester a token in use there.
+    ClaudeToken(crate::claude_token::Key),
+    /// `azure-signing-principal`: the Azure service principal Windows images are signed as.
+    AzureSigningPrincipal,
+    /// `fleet-code`: the default ALab fleet's join code, the vault's `[everyone]` control entry
+    /// ([`crate::client::FLEET_CODE_ENTRY`]) an ALab admin publishes (`aterm fleet publish`).
+    FleetCode,
 }
 
 /// Where a want's copies live by design, which decides whether it is ever posted.
@@ -71,10 +105,9 @@ pub enum Want {
 pub enum Class {
     /// Copies live on Macs' disks (release Macs): posted, and holders may offer one.
     Copyable,
-    /// Copies live in the vault by design: posted; a stray copy may still be offered.
+    /// Copies live in the vault by design: posted; a stray copy may still be offered, except of a
+    /// want with a [`Want::producer`], which no Mac offers.
     VaultOnly,
-    /// It exists on no computer.
-    Nowhere,
     /// Each Mac makes its own; none is ever copied.
     PerMac,
     /// An act of the vault's admin, not a value anyone holds.
@@ -88,7 +121,6 @@ impl Class {
         match self {
             Self::Copyable => "copyable",
             Self::VaultOnly => "vault-only",
-            Self::Nowhere => "nowhere",
             Self::PerMac => "per-mac",
             Self::AdminAct => "admin-act",
         }
@@ -118,9 +150,9 @@ impl Want {
         let bad = |what: &str| {
             Err(format!(
                 "{word:?}: {what} (wants: site-deployer-key, notary, developer-id:<stem>, mailbox:<label>, mailbox-field:<identity>/<component>, gh:dev, \
-                 gh:release, entry:<name>, paper-master, login:<provider>/<label>, \
+                 gh:release, gh:fleet, machines-admin, claude-token:<ac-key>, entry:<name>, paper-master, login:<provider>/<label>, \
                  browser-profile:<label>, refresh-token:<provider>/<label>, vault-identity, \
-                 commons-device-key, commons-control)"
+                 commons-device-key, commons-control, azure-signing-principal, fleet-code)"
             ))
         };
         let want = match word {
@@ -130,6 +162,10 @@ impl Want {
             "vault-identity" => Self::VaultIdentity,
             "commons-device-key" => Self::CommonsDeviceKey,
             "commons-control" => Self::CommonsControl,
+            "machines-admin" => Self::MachinesAdmin,
+            "gh:fleet" => Self::Gh(GhProfile::Fleet),
+            "azure-signing-principal" => Self::AzureSigningPrincipal,
+            "fleet-code" => Self::FleetCode,
             "gh:dev" => Self::Gh(GhProfile::Dev),
             "gh:release" => Self::Gh(GhProfile::Release),
             _ => {
@@ -154,11 +190,22 @@ impl Want {
                         Self::RefreshToken(rest.to_owned())
                     }
                     "browser-profile" if valid_label(rest) => Self::BrowserProfile(rest.to_owned()),
+                    CLAUDE_TOKEN => match crate::claude_token::Key::parse(rest) {
+                        Some(key) => Self::ClaudeToken(key),
+                        None => {
+                            return bad(
+                                "claude-token: takes an account key, ac-<16 lower-case hex> (the <key> of the vault entry aterm-claude-token-<key>)",
+                            );
+                        }
+                    },
                     "mailbox" | "developer-id" | "login" | "refresh-token" | "browser-profile" => {
                         return bad("not a valid label");
                     }
+                    "entry" if crate::entry_class::claude_token(rest) => {
+                        return bad("a Claude Code token is asked for as claude-token:<ac-key>");
+                    }
                     "entry" => return bad("not a valid vault entry name"),
-                    "gh" => return bad("gh: takes dev or release"),
+                    "gh" => return bad("gh: takes dev, release or fleet"),
                     _ => return bad("not a want the catalog names"),
                 }
             }
@@ -177,6 +224,7 @@ impl Want {
             Self::MailboxComponent(component) => component.key(),
             Self::Gh(GhProfile::Dev) => "gh:dev".to_owned(),
             Self::Gh(GhProfile::Release) => "gh:release".to_owned(),
+            Self::Gh(GhProfile::Fleet) => "gh:fleet".to_owned(),
             Self::Entry(name) => format!("entry:{name}"),
             Self::PaperMaster => "paper-master".to_owned(),
             Self::Login(name) => format!("login:{name}"),
@@ -185,6 +233,10 @@ impl Want {
             Self::VaultIdentity => "vault-identity".to_owned(),
             Self::CommonsDeviceKey => "commons-device-key".to_owned(),
             Self::CommonsControl => "commons-control".to_owned(),
+            Self::MachinesAdmin => "machines-admin".to_owned(),
+            Self::ClaudeToken(key) => format!("{CLAUDE_TOKEN}:{}", key.as_str()),
+            Self::AzureSigningPrincipal => "azure-signing-principal".to_owned(),
+            Self::FleetCode => "fleet-code".to_owned(),
         }
     }
 
@@ -197,8 +249,12 @@ impl Want {
             | Self::Mailbox(_)
             | Self::MailboxComponent(_)
             | Self::Gh(_)
-            | Self::Entry(_) => Class::VaultOnly,
-            Self::PaperMaster => Class::Nowhere,
+            | Self::Entry(_)
+            | Self::MachinesAdmin
+            | Self::PaperMaster
+            | Self::ClaudeToken(_)
+            | Self::AzureSigningPrincipal
+            | Self::FleetCode => Class::VaultOnly,
             Self::Login(_)
             | Self::BrowserProfile(_)
             | Self::RefreshToken(_)
@@ -209,7 +265,9 @@ impl Want {
     }
 
     /// Whether a request for it is ever posted to the lab: copyable wants and the vault-only
-    /// `developer-id:*`, `mailbox:*` and `gh:*`. `entry:<name>` is answered from this Mac's own envelope.
+    /// `developer-id:*`, `mailbox:*`, `mailbox-field:*`, `gh:*`, `machines-admin`, `paper-master`,
+    /// `azure-signing-principal` and `claude-token:*`. `entry:<name>` and `fleet-code` are answered
+    /// from this Mac's own envelope.
     #[must_use]
     pub const fn posted(&self) -> bool {
         matches!(
@@ -220,7 +278,43 @@ impl Want {
                 | Self::Mailbox(_)
                 | Self::MailboxComponent(_)
                 | Self::Gh(_)
+                | Self::MachinesAdmin
+                | Self::PaperMaster
+                | Self::ClaudeToken(_)
+                | Self::AzureSigningPrincipal
         )
+    }
+
+    /// The one verb that makes its value, for a want no Mac gives or copies: a Claude Code token
+    /// is made by a person's sign-in and lives only in the vault's log, so a request for it is
+    /// answered once the log gives the requester a value in use there ([`super::settle`]), never
+    /// by a holder's offer, a `need give` or the custodian's copy. `None` for every other want.
+    #[must_use]
+    pub const fn producer(&self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeToken(_) => Some(CLAUDE_TOKEN_PRODUCER),
+            _ => None,
+        }
+    }
+
+    /// Why `need give <word>` is refused before it reads anything: `word`, a want or a request
+    /// id, names a want with a [`Want::producer`]. A `claude-token:` word is refused whether or not
+    /// its key parses. `None` for any other word.
+    #[must_use]
+    pub fn give_refusal(word: &str) -> Option<String> {
+        let (what, producer) = match Self::parse(word) {
+            Ok(want) => (want.title(), want.producer()?),
+            Err(_) => {
+                let (kind, _) = word.split_once(':')?;
+                (kind == CLAUDE_TOKEN)
+                    .then(|| ("a Claude Code token".to_owned(), CLAUDE_TOKEN_PRODUCER))?
+            }
+        };
+        Some(format!(
+            "{what} is never given: its one producer is {producer}, which stores it in the vault's \
+             log, inner-sealed, where every member reads it in place; a request for it ends once \
+             one in use there reaches the requester"
+        ))
     }
 
     /// The vault entries it arrives as, the first the one a request is answered by.
@@ -236,10 +330,15 @@ impl Want {
             Self::MailboxComponent(component) => vec![component.entry()],
             Self::Gh(GhProfile::Dev) => vec![crate::entry_class::DEV_GH_TOKEN.to_owned()],
             Self::Gh(GhProfile::Release) => vec![crate::entry_class::RELEASE_GH_TOKEN.to_owned()],
+            Self::Gh(GhProfile::Fleet) => vec![FLEET_GH_TOKEN_ENTRY.to_owned()],
+            Self::MachinesAdmin => vec![MACHINES_ADMIN_ENTRY.to_owned()],
+            Self::ClaudeToken(key) => vec![key.entry(), key.meta_entry()],
             Self::Entry(name) => vec![name.clone()],
             Self::CommonsControl => vec![crate::commons::ENTRY.to_owned()],
-            Self::PaperMaster
-            | Self::Login(_)
+            Self::AzureSigningPrincipal => vec![AZURE_SIGNING_PRINCIPAL_ENTRY.to_owned()],
+            Self::FleetCode => vec![crate::client::FLEET_CODE_ENTRY.to_owned()],
+            Self::PaperMaster => vec![PAPER_MASTER_ENTRY.to_owned()],
+            Self::Login(_)
             | Self::BrowserProfile(_)
             | Self::RefreshToken(_)
             | Self::VaultIdentity
@@ -273,14 +372,25 @@ impl Want {
             Self::MailboxComponent(component) => format!("the {}", component.part().description()),
             Self::Gh(GhProfile::Dev) => "the dev GitHub token".to_owned(),
             Self::Gh(GhProfile::Release) => "the release GitHub token".to_owned(),
+            Self::Gh(GhProfile::Fleet) => "the fleet machine user's GitHub token".to_owned(),
+            Self::MachinesAdmin => {
+                "the admin password aterm machines enroll signs in with".to_owned()
+            }
+            Self::ClaudeToken(key) => {
+                format!("the Claude Code token of account {}", key.as_str())
+            }
             Self::Entry(name) => format!("the vault entry {name}"),
-            Self::PaperMaster => "the paper master".to_owned(),
+            Self::PaperMaster => "the release roster's paper master phrase".to_owned(),
             Self::Login(name) => format!("the vendor login {name}"),
             Self::BrowserProfile(label) => format!("{label}'s browser profile"),
             Self::RefreshToken(name) => format!("the refresh token of {name}"),
             Self::VaultIdentity => "this Mac's vault identity".to_owned(),
             Self::CommonsDeviceKey => "this Mac's Commons device key".to_owned(),
             Self::CommonsControl => "the Commons control entry".to_owned(),
+            Self::AzureSigningPrincipal => {
+                "the Azure service principal Windows images are signed as".to_owned()
+            }
+            Self::FleetCode => "the default ALab fleet's join code".to_owned(),
         }
     }
 
@@ -291,14 +401,6 @@ impl Want {
     pub fn catalog_retirement(&self) -> Option<(super::Reason, String)> {
         use super::Reason;
         match self.class() {
-            Class::Nowhere => Some((
-                Reason::NeverStored,
-                "the paper master is 52 base32 characters on paper and exists on no computer \
-                 (docs/RELEASE-KEYS.md:14); machines hold only PAPER_MASTER_PUBKEYS \
-                 (crates/aterm-update-core/src/pins.rs:8), and roster signing asks for it at \
-                 the terminal that signs"
-                    .to_owned(),
-            )),
             Class::PerMac => Some((
                 Reason::NeverCopied,
                 match self {
@@ -316,19 +418,17 @@ impl Want {
         }
     }
 
-    /// The hold probe's one path under `home`: a holder offers only what this resolves to, and
-    /// the probe stats it, never reads it. `None` for a want no holder can offer.
+    /// The hold probe's one entry: a holder offers only what this names, and the probe asks this
+    /// Mac's store whether it holds that entry ([`crate::client::registered_names`]), never a
+    /// file and never the value. `None` for a want no holder can offer, a want with a
+    /// [`Want::producer`] among them.
     #[must_use]
-    pub fn hold_path(&self, home: &Path) -> Option<PathBuf> {
+    pub fn hold_entry(&self) -> Option<String> {
         match self {
-            Self::SiteDeployerKey => {
-                crate::materialize::target_path(home, SITE_DEPLOYER_KEY_ENTRY).ok()
-            }
-            Self::Notary => Some(home.join(".secrets").join(NOTARY_ENTRY)),
-            Self::Mailbox(label) => Some(home.join(".secrets").join(format!("{label}_password"))),
-            Self::MailboxComponent(component) => {
-                Some(home.join(".secrets").join(component.entry()))
-            }
+            Self::SiteDeployerKey => Some(SITE_DEPLOYER_KEY_ENTRY.to_owned()),
+            Self::Notary => Some(NOTARY_ENTRY.to_owned()),
+            Self::Mailbox(label) => Some(format!("{label}_password")),
+            Self::MailboxComponent(component) => Some(component.entry()),
             _ => None,
         }
     }
@@ -343,7 +443,9 @@ pub enum Purpose {
     ReleaseNotary,
     /// `ship provision`'s Apple Developer ID row.
     ReleaseDeveloperId,
-    /// An AI account's unattended email-code sign-in route.
+    /// An AI account's unattended sign-in: its email-code route's mailbox, or its Claude Code
+    /// token (`claude-token:`), which the harness asks for where it offers one
+    /// ([`super::ask_for_tokens`]).
     HarnessSignIn,
     /// The default repository consumer's development GitHub identity.
     AghDev,
@@ -351,6 +453,17 @@ pub enum Purpose {
     AghRelease,
     /// Commons readiness.
     Commons,
+    /// `aterm machines`' host key registration with the fleet machine user.
+    MachinesKeys,
+    /// `aterm machines enroll`'s admin sign-in.
+    MachinesEnroll,
+    /// `aterm-winsign sign`'s Azure Artifact Signing principal.
+    WinsignAzure,
+    /// `aterm fleet join` given no code: it joins the default ALab fleet with the vault's.
+    FleetJoin,
+    /// Roster signing: `atpkg-keys join`, `machine-revoke` and `master-check`, and `ship
+    /// provision`'s mint.
+    ReleaseRoster,
     /// A person or an agent at `aterm secrets need <want>`.
     ByHand,
     /// An entry a stolen Mac could read, filed for a new value by `revoke --stolen` or
@@ -362,7 +475,7 @@ pub enum Purpose {
 
 impl Purpose {
     /// Every purpose.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 14] = [
         Self::ReleaseSiteKey,
         Self::ReleaseNotary,
         Self::ReleaseDeveloperId,
@@ -370,6 +483,11 @@ impl Purpose {
         Self::AghDev,
         Self::AghRelease,
         Self::Commons,
+        Self::MachinesKeys,
+        Self::MachinesEnroll,
+        Self::WinsignAzure,
+        Self::FleetJoin,
+        Self::ReleaseRoster,
         Self::ByHand,
         Self::StolenRotation,
     ];
@@ -385,6 +503,11 @@ impl Purpose {
             Self::AghDev => "agh.dev",
             Self::AghRelease => "agh.release",
             Self::Commons => "commons.control",
+            Self::MachinesKeys => "machines.keys",
+            Self::MachinesEnroll => "machines.enroll",
+            Self::WinsignAzure => "winsign.azure",
+            Self::FleetJoin => "fleet.join",
+            Self::ReleaseRoster => "release.roster",
             Self::ByHand => "by-hand",
             Self::StolenRotation => "revoke.stolen",
         }
@@ -420,3 +543,7 @@ impl Purpose {
         !matches!(self, Self::StolenRotation)
     }
 }
+
+#[cfg(test)]
+#[path = "catalog_tests.rs"]
+mod tests;

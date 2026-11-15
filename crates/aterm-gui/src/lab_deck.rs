@@ -416,6 +416,8 @@ fn fixture(now: i64) -> LabDeck {
         }),
         read: Some((now - 720, "m1".into(), "statusline".into())),
         wall_until: wall.then_some(Some(now + 3_600)),
+        reader: None,
+        wall_by: None,
     };
     let mut seen = Seen {
         at: now,

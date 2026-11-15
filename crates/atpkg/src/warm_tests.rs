@@ -705,30 +705,13 @@ fn a_signed_out_account_runs_neither_the_login_shell_nor_the_program() {
 fn the_program_and_the_login_shell_run_in_sessions_of_their_own() {
     let scratch = scratch("session");
     let layout = &scratch.layout;
-    install(layout, "claude", 7, "#!/bin/sh\nexit 0\n");
     let tool = ToolName::new("claude").unwrap();
     let warm = crate::vendor_direct::spec("claude").unwrap().warm.unwrap();
-    let exe = layout
-        .build_dir("claude", 7)
-        .join("bin")
-        .join(tool.exe_file());
-    let session_of = |command: &mut WarmCommand| {
-        let mut child = command
-            .stdin(aterm_uds::spawnfd::Stdio::piped())
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = libc::pid_t::try_from(child.id()).unwrap();
-        // SAFETY: `getsid` reads the session of a child this test holds unreaped.
-        let session = unsafe { libc::getsid(pid) };
-        kill_group(&mut child);
-        let _ = child.wait();
-        (session, pid)
-    };
+    let exe = aterm_tempfile::bin_exe("atpkg-status-fixture");
     let mut program = warm_command(layout, &tool, &exe, &warm, [], None).unwrap();
-    let (session, pid) = session_of(&mut program);
+    let (session, pid) = held_fixture_session(&mut program, &layout.prefix.join("program.session"));
     assert_eq!(session, pid, "the program leads its own session");
-    let mut shell = login_shell_command(Path::new("/bin/cat"));
+    let mut shell = login_shell_command(&exe);
     for (name, value) in NO_DESK {
         assert!(
             shell
@@ -737,13 +720,76 @@ fn the_program_and_the_login_shell_run_in_sessions_of_their_own() {
             "{name}"
         );
     }
-    let (session, pid) = session_of(&mut shell);
+    let (session, pid) = held_fixture_session(&mut shell, &layout.prefix.join("shell.session"));
     assert_eq!(session, pid, "the login shell leads its own session");
-    let mut plain = aterm_uds::spawnfd::command("/bin/cat");
-    let (session, pid) = session_of(&mut plain);
+    let mut plain = aterm_uds::spawnfd::command(&exe);
+    let (session, pid) = held_fixture_session(&mut plain, &layout.prefix.join("plain.session"));
     // SAFETY: `getsid(0)` reads this process's own session.
     assert_eq!(session, unsafe { libc::getsid(0) }, "the control");
     assert_ne!(session, pid);
+}
+
+/// The actor acknowledges its own PID and SID before blocking on stdin. Query the held
+/// child's session, then release EOF and reap it before checking either observation.
+#[cfg(unix)]
+fn held_fixture_session(command: &mut WarmCommand, report: &Path) -> (libc::pid_t, libc::pid_t) {
+    let hang = Duration::from_secs(60);
+    let mut child = command
+        .env("ATPKG_WARM_TEST_REPORT", report)
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = libc::pid_t::try_from(child.id()).unwrap();
+    aterm_uds::deadline::prints(&mut child, "warm-session-ready", hang);
+    let witnessed = std::fs::read_to_string(report);
+    // SAFETY: the actor acknowledged readiness and still waits on the stdin writer held here.
+    let session = unsafe { libc::getsid(pid) };
+    let query_error = (session < 0).then(std::io::Error::last_os_error);
+    let mut exit = aterm_uds::deadline::ExitWait::new(&child);
+    drop(child.stdin.take());
+    let by = std::time::Instant::now() + hang;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(error) => break Err(error),
+            Ok(None) => {
+                let left = by.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the ready warm fixture did not end after stdin EOF",
+                    ));
+                }
+                exit.wait(left);
+            }
+        }
+    };
+    if status.is_err() {
+        aterm_uds::deadline::kill_within(&mut child, hang);
+    }
+    assert!(
+        status.unwrap().success(),
+        "the warm fixture failed after EOF"
+    );
+    let witnessed = witnessed.unwrap();
+    let fields = witnessed.split_whitespace().collect::<Vec<_>>();
+    let [actor_pid, actor_session]: [&str; 2] = fields.try_into().unwrap();
+    let actor_pid = actor_pid.parse::<u32>().unwrap();
+    let actor_session = actor_session.parse::<libc::pid_t>().unwrap();
+    assert!(actor_pid > 0, "the ready actor reported no PID");
+    assert!(
+        session > 0,
+        "held getsid({pid}): {query_error:?}; actor={witnessed:?}"
+    );
+    assert_eq!(
+        session, actor_session,
+        "held child and ready actor disagree"
+    );
+    eprintln!(
+        "warm fixture Ready: actor pid={actor_pid} sid={actor_session}; child={pid} sid={session}"
+    );
+    (session, pid)
 }
 
 /// In-process with short durations: a program that exits on stdin EOF ends once the

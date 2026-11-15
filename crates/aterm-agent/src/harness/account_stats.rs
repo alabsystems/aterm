@@ -7,8 +7,8 @@
 
 use std::fmt::Write as _;
 
+use alab_policy::vocab::ResetKind;
 use aterm_json::{Map, Value};
-use aterm_phase::ResetKind;
 
 use super::account_series::{self, Moved, SeriesRow, Since};
 use super::accounts::{

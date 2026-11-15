@@ -288,184 +288,40 @@ fn a_replanning_change_narrows_to_what_it_reaches() {
     ));
 }
 
-/// A cone's lint compiles every target of a crate whose own files changed and of one a changed
-/// file is tested by. CONTROL: a seed the change reached any other way (a lock row, a root
-/// manifest row, a fork) can move code under any member's tests, so the whole cone keeps its
-/// test targets, and a root manifest row does so whichever files changed beside it.
+/// EVERY CRATE OF A CONE IS LINTED WITH EVERY TARGET: what the change touched, what links it,
+/// and a crate the cone holds only by a dev edge, whose test targets alone link the change and so
+/// may name what it touched (a renamed `cfg(any(test, debug_assertions))` seam of a dependency),
+/// in one pass; the test compile takes the same crates. CONTROL: a member the change does not
+/// reach is in neither.
 #[test]
-fn only_what_the_change_touched_has_all_its_targets_linted() {
-    let m = members(&["aterm-grid", "aterm-gui", "aterm-update", "aterm-release"]);
-    let edges: &'static [(&str, &str)] = &[("ring", "aterm-grid"), ("aterm-grid", "aterm-gui")];
-    let forks = || Some(vec![("ring".to_string(), "vendor/ring".to_string())]);
-    let all_targets = |changed: &[&str], replan: Replan| match super::select(
-        &paths(changed),
-        &BTreeSet::new(),
-        &manifests(),
-        &m,
-        &forks,
-        &|name| graph(edges)(name).map(linking),
-        &|_| replan.clone(),
-        &|_, _| false,
-        &BTreeMap::new,
-    ) {
-        Selection::Narrowed { all_targets, .. } => all_targets,
-        Selection::Widened(why) => panic!("widened unexpectedly: {why}"),
-    };
-    assert_eq!(
-        all_targets(&["crates/aterm-grid/src/lib.rs"], Replan::Nothing),
-        ["aterm-grid"],
-        "its dependent aterm-gui is in the cone for its default targets"
-    );
-    assert_eq!(
-        all_targets(&["publish/config.sh"], Replan::Nothing),
-        ["aterm-release"]
-    );
-    assert_eq!(
-        all_targets(
-            &["crates/aterm-grid/src/lib.rs", "publish/config.sh"],
-            Replan::Nothing
-        ),
-        ["aterm-grid", "aterm-release"]
-    );
-    let cone_of_ring = ["aterm-grid", "aterm-gui"];
-    let lock_row = Replan::Packages(BTreeSet::from(["ring".to_string()]));
-    assert_eq!(all_targets(&["Cargo.lock"], lock_row.clone()), cone_of_ring);
-    assert_eq!(
-        all_targets(&["Cargo.toml"], lock_row),
-        cone_of_ring,
-        "a [workspace.dependencies] row"
-    );
-    assert_eq!(
-        all_targets(&["vendor/ring/src/lib.rs"], Replan::Nothing),
-        cone_of_ring
-    );
-    assert_eq!(
-        all_targets(
-            &["Cargo.toml"],
-            Replan::Packages(BTreeSet::from(["aterm-grid".to_string()]))
-        ),
-        cone_of_ring,
-        "a row naming a member changes how its dependents build it"
-    );
-    assert_eq!(
-        all_targets(
-            &["Cargo.toml", "crates/aterm-grid/src/lib.rs"],
-            Replan::Packages(BTreeSet::from(["aterm-grid".to_string()]))
-        ),
-        cone_of_ring,
-        "and still does when that member's own files changed with it"
-    );
-    assert_eq!(
-        all_targets(
-            &["crates/aterm-grid/Cargo.toml", "Cargo.lock"],
-            Replan::Packages(BTreeSet::from(["aterm-grid".to_string()]))
-        ),
-        ["aterm-grid"],
-        "a member's own lock entry, from its own manifest, reaches no one else's tests"
-    );
-}
-
-/// A crate the cone holds only by a dev edge leaves the lint, because its library and binaries
-/// link nothing that changed, and stays in the test compile, which takes its tests. One a seed
-/// also links keeps its default targets, and one a changed file is tested by keeps all its
-/// targets. CONTROL: a fork keeps the whole cone in the first pass, those crates included.
-#[test]
-fn a_crate_the_cone_holds_only_by_a_dev_edge_leaves_the_lint() {
-    let m = members(&["seed", "seed-two", "normal", "dev", "both", "aterm-update"]);
+fn every_crate_of_a_cone_is_linted_with_every_target() {
+    let m = members(&[
+        "seed",
+        "seed-two",
+        "normal",
+        "dev",
+        "both",
+        "aterm-update",
+        "apart",
+    ]);
     let reach = |name: &str| {
         let (links, dev_only): (&[&str], &[&str]) = match name {
             "seed" => (&["seed", "normal"], &["dev", "both", "aterm-update"]),
-            "ring" => (&["normal"], &["dev"]),
             _ => (&["seed-two", "both"], &[]),
         };
         let owned = |names: &[&str]| names.iter().map(ToString::to_string).collect();
         Some(Reach {
             links: owned(links),
             dev_only: owned(dev_only),
-            direct: Vec::new(),
         })
     };
-    let forks = || Some(vec![("ring".to_string(), "vendor/ring".to_string())]);
-    let pick = |changed: &[&str]| {
-        let manifests: Manifests = ["crates/seed", "crates/seed-two"].into_iter().collect();
-        super::select(
-            &paths(changed),
-            &BTreeSet::new(),
-            &manifests,
-            &m,
-            &forks,
-            &reach,
-            &|_| Replan::Nothing,
-            &|_, _| false,
-            &BTreeMap::new,
-        )
-    };
-    let touched = [
-        "crates/seed/src/lib.rs",
-        "crates/seed-two/src/lib.rs",
-        "tools/install.sh",
-    ];
-    let selection = pick(&touched);
-    let Selection::Narrowed {
-        crates,
-        all_targets,
-        unlinted,
-        ..
-    } = &selection
-    else {
-        panic!("widened unexpectedly: {selection:?}");
-    };
-    let cone_of_all = ["aterm-update", "both", "dev", "normal", "seed", "seed-two"];
-    assert_eq!(crates, &cone_of_all);
-    assert_eq!(all_targets, &["aterm-update", "seed", "seed-two"]);
-    assert_eq!(unlinted, &["dev"]);
-    let (scope, _) = cone("main", &selection);
-    let linted = crate::stages::tippy_passes(&scope)
-        .into_iter()
-        .flat_map(|pass| pass.args)
-        .collect::<Vec<_>>();
-    assert!(
-        !linted.iter().any(|arg| arg == "dev"),
-        "the lint leaves it out: {linted:?}"
-    );
-    assert!(
-        crate::stages::test_compile_args(&scope)
-            .iter()
-            .any(|arg| arg == "dev"),
-        "the test compile keeps it"
-    );
-    let Selection::Narrowed {
-        all_targets,
-        unlinted,
-        ..
-    } = pick(&["crates/seed/src/lib.rs", "vendor/ring/src/lib.rs"])
-    else {
-        panic!("widened unexpectedly");
-    };
-    assert_eq!(
-        all_targets,
-        ["aterm-update", "both", "dev", "normal", "seed"]
-    );
-    assert!(unlinted.is_empty(), "{unlinted:?}");
-}
-
-/// What depends directly on a seed, over any edge, reaches the scope: its required-features
-/// targets are linted beside the seed's, and those of a member further away are not. A direct
-/// dependent outside the workspace is no member. CONTROL: one only further away, `far`.
-#[test]
-fn the_direct_dependents_of_a_seed_reach_the_scope() {
-    let m = members(&["seed", "near", "far", "dev"]);
-    let reach = |name: &str| {
-        let owned = |names: &[&str]| names.iter().map(ToString::to_string).collect();
-        (name == "seed").then(|| Reach {
-            links: owned(&["far", "near", "seed"]),
-            dev_only: owned(&["dev"]),
-            direct: owned(&["dev", "near", "registry-only"]),
-        })
-    };
-    let manifests: Manifests = ["crates/seed"].into_iter().collect();
+    let manifests: Manifests = ["crates/seed", "crates/seed-two"].into_iter().collect();
     let selection = super::select(
-        &paths(&["crates/seed/src/lib.rs"]),
+        &paths(&[
+            "crates/seed/src/lib.rs",
+            "crates/seed-two/src/lib.rs",
+            "tools/install.sh",
+        ]),
         &BTreeSet::new(),
         &manifests,
         &m,
@@ -475,24 +331,27 @@ fn the_direct_dependents_of_a_seed_reach_the_scope() {
         &|_, _| false,
         &BTreeMap::new,
     );
-    let Selection::Narrowed {
-        direct_dependents, ..
-    } = &selection
-    else {
+    let Selection::Narrowed { crates, .. } = &selection else {
         panic!("widened unexpectedly: {selection:?}");
     };
-    assert_eq!(direct_dependents, &["dev", "near"]);
+    let cone_of_all = ["aterm-update", "both", "dev", "normal", "seed", "seed-two"];
+    assert_eq!(crates, &cone_of_all);
     let (scope, _) = cone("main", &selection);
-    let gated = |name: &str| scope.gated_spec_of(name);
-    assert_eq!(
-        ["seed", "near", "dev", "far"].map(gated),
-        [
-            Some("seed".to_string()),
-            Some("near".to_string()),
-            Some("dev".to_string()),
-            None
-        ]
-    );
+    let lint = crate::stages::lint_invocations(&scope, &[], false);
+    assert_eq!(lint.len(), 1, "one pass: {lint:?}");
+    let args = &lint[0].args;
+    assert!(args.iter().any(|arg| arg == "--all-targets"), "{args:?}");
+    let compile = crate::stages::test_compile_args(&scope);
+    for name in cone_of_all {
+        let selects = |args: &[String]| args.windows(2).any(|w| w[0] == "-p" && w[1] == name);
+        assert!(selects(args), "the lint selects {name}: {args:?}");
+        assert!(
+            selects(&compile),
+            "the test compile selects {name}: {compile:?}"
+        );
+    }
+    assert!(!args.iter().any(|arg| arg == "apart"), "{args:?}");
+    assert!(!compile.iter().any(|arg| arg == "apart"), "{compile:?}");
 }
 
 #[test]
@@ -695,9 +554,6 @@ fn a_change_confined_to_its_own_tests_judges_its_member_alone() {
             seeds: paths(&["aterm-grid"]),
             crates: paths(&["aterm-grid"]),
             any_lib: true,
-            all_targets: paths(&["aterm-grid"]),
-            unlinted: Vec::new(),
-            direct_dependents: Vec::new(),
             alone: paths(&["aterm-grid"]),
         }
     );
@@ -800,7 +656,6 @@ fn an_observer_is_walked_or_joins_by_how_it_observes() {
     let Selection::Narrowed {
         seeds,
         crates,
-        all_targets,
         alone,
         ..
     } = sel
@@ -809,7 +664,6 @@ fn an_observer_is_walked_or_joins_by_how_it_observes() {
     };
     assert_eq!(seeds, paths(&["u", "x", "y"]));
     assert_eq!(crates, paths(&["u", "ud", "w", "x", "y", "yd", "z"]));
-    assert_eq!(all_targets, paths(&["u", "w", "x", "y", "z"]));
     assert_eq!(alone, paths(&["x"]));
     let control = pick(&[]);
     assert_eq!(observed.get(), 1);
@@ -865,7 +719,6 @@ fn a_confined_seeds_namers_walk_only_where_that_adds_fewer_members() {
                         .filter(|(dep, _)| *dep == name)
                         .map(|(_, user)| (*user).to_string())
                         .collect(),
-                    ..Reach::default()
                 })
             },
             &|_| replan_everything(),
@@ -1121,14 +974,6 @@ fn workspace(
     (made, root)
 }
 
-/// A selection's members whose test, bench and example targets the lint compiles.
-fn all_targets(selection: &Selection) -> Vec<String> {
-    match selection {
-        Selection::Narrowed { all_targets, .. } => all_targets.clone(),
-        Selection::Widened(why) => panic!("widened: {why}"),
-    }
-}
-
 /// A selection's seeds, crates and alone seeds.
 fn picked(selection: Selection) -> (Vec<String>, Vec<String>, Vec<String>) {
     match selection {
@@ -1296,13 +1141,9 @@ fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
         ("crates/c/src/lib.rs", &reader_tests),
     ]));
     let named = picked(checkout.change(&[("crates/a/src/named.rs", tested)]));
-    let named_shipped = checkout.change(&[("crates/a/src/named.rs", "pub fn x() {}\n")]);
-    let shipped_rows = all_targets(&named_shipped);
-    let named_shipped = picked(named_shipped);
-    let named_tests = checkout.change(&[("crates/a/src/named_tests.rs", tested)]);
-    let named_support = checkout.change(&[("crates/a/src/named_support.rs", tested)]);
-    let watched = [&named_tests, &named_support].map(all_targets);
-    let (named_tests, named_support) = (picked(named_tests), picked(named_support));
+    let named_shipped = picked(checkout.change(&[("crates/a/src/named.rs", "pub fn x() {}\n")]));
+    let named_tests = picked(checkout.change(&[("crates/a/src/named_tests.rs", tested)]));
+    let named_support = picked(checkout.change(&[("crates/a/src/named_support.rs", tested)]));
     // `t` spells one of each pair in its library and the other in its tests, the library's
     // first in one pair and last in the other: it observes each pair as the most of the two.
     let pair_a = picked(checkout.change(&[
@@ -1313,9 +1154,7 @@ fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
         ("crates/a/src/pair_b1.rs", tested),
         ("crates/a/src/pair_b2.rs", tested),
     ]));
-    let pair_tests = checkout.change(&[("crates/a/src/pair_b1.rs", tested)]);
-    let pair_watched = all_targets(&pair_tests);
-    let pair_tests = picked(pair_tests);
+    let pair_tests = picked(checkout.change(&[("crates/a/src/pair_b1.rs", tested)]));
     let named_comment = picked(checkout.change(&[("crates/a/src/named_comment.rs", tested)]));
     let named_nested = picked(checkout.change(&[("crates/a/src/named_nested.rs", tested)]));
     let named_outside = picked(checkout.change(&[("crates/a/src/named_outside.rs", tested)]));
@@ -1349,17 +1188,13 @@ fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
         named_shipped,
         (a.clone(), paths(&["a", "b", "b2", "c"]), Vec::new())
     );
-    assert_eq!(shipped_rows, ac);
     assert_eq!(named_tests, (a.clone(), paths(&["a", "n"]), a.clone()));
-    // A member whose tests alone observe the path joins with all of its targets.
-    assert_eq!(watched, [paths(&["a", "n"]), paths(&["a", "n", "q"])]);
     let at = paths(&["a", "t"]);
     let atu = paths(&["a", "t", "u"]);
     assert_eq!(pair_a, (at.clone(), atu.clone(), a.clone()));
     assert_eq!(pair_b, (at.clone(), atu, a.clone()));
-    // CONTROL: the test spelling alone adds `t` with its rows and walks nothing.
-    assert_eq!(pair_tests, (a.clone(), at.clone(), a.clone()));
-    assert_eq!(pair_watched, at);
+    // CONTROL: the test spelling alone adds `t` and walks nothing.
+    assert_eq!(pair_tests, (a.clone(), at, a.clone()));
     // `q`'s tests mount the file of `n` that spells the path: a reader, judged where it compiles.
     assert_eq!(
         named_support,
@@ -1570,6 +1405,260 @@ fn a_round_of_shared_markdown_no_cone_holds_judges_no_crate() {
     let _ = std::fs::remove_dir_all(&made);
 }
 
+/// The spec-table fixture: `r`, whose library reads its own spec table, with its dependent
+/// `rd`; `t`, whose integration test alone reads its own, with its dependent `td`; and
+/// [`round_workspace`]'s `c`, `d` and `y`, none of which reads either. Its root manifest names
+/// the members as the no-reach class reads them (`aterm_census::no_reach::Layout`: plain
+/// double-quoted strings), so each member's spec table is Markdown no cone holds, as in this
+/// repository.
+fn reading_workspace(prefix: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let reads = "std::fs::read_to_string(\"SPECS.md\").unwrap_or_default()";
+    let (made, root) = workspace(
+        prefix,
+        &[
+            ("c", "", vec![("src/lib.rs", C_BASE.to_string())]),
+            (
+                "d",
+                "[dependencies]\nc={path='../c'}\n",
+                vec![("src/lib.rs", D_BASE.to_string())],
+            ),
+            ("y", "", vec![("src/lib.rs", Y_BASE.to_string())]),
+            (
+                "r",
+                "",
+                vec![
+                    (
+                        "src/lib.rs",
+                        format!("pub fn rows() -> String {{\n    {reads}\n}}\n"),
+                    ),
+                    ("SPECS.md", ROWS_BASE.to_string()),
+                ],
+            ),
+            ("rd", "[dependencies]\nr={path='../r'}\n", vec![]),
+            (
+                "t",
+                "",
+                vec![
+                    (
+                        "tests/rows.rs",
+                        format!("#[test]\nfn rows() {{\n    assert!(!{reads}.is_empty());\n}}\n"),
+                    ),
+                    ("SPECS.md", ROWS_BASE.to_string()),
+                ],
+            ),
+            ("td", "[dependencies]\nt={path='../t'}\n", vec![]),
+        ],
+        &[(
+            "tools/gen.rs",
+            "pub const ROWS: &str = \"crates/r/SPECS.md\";\n",
+        )],
+    );
+    let manifest = root.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).expect("the workspace manifest");
+    std::fs::write(&manifest, text.replace('\'', "\"")).expect("the workspace manifest");
+    (made, root)
+}
+
+const R_SPEC: &str = "crates/r/SPECS.md";
+const R_LIB: &str = "crates/r/src/lib.rs";
+const T_SPEC: &str = "crates/t/SPECS.md";
+const T_ROWS: &str = "crates/t/tests/rows.rs";
+/// A spec table of eight rows, and it with its first or its last row changed.
+const ROWS_BASE: &str = "1\n2\n3\n4\n5\n6\n7\n8\n";
+const ROWS_OURS: &str = "one\n2\n3\n4\n5\n6\n7\n8\n";
+const ROWS_THEIRS: &str = "1\n2\n3\n4\n5\n6\n7\neight\n";
+
+/// `r`'s library and `t`'s test, each with something added, so a change to either puts its
+/// member in the branch's cone.
+fn readers_ours() -> (String, String) {
+    let reads = "std::fs::read_to_string(\"SPECS.md\").unwrap_or_default()";
+    (
+        format!("pub fn rows() -> String {{\n    {reads}\n}}\n\npub fn more() {{}}\n"),
+        format!(
+            "#[test]\nfn rows() {{\n    assert!(!{reads}.is_empty());\n}}\n\n#[test]\nfn more() {{}}\n"
+        ),
+    )
+}
+
+/// SHARED MARKDOWN STANDS FOR THE FILES THAT MAY READ IT, AS A SHARED CODE PATH STANDS FOR
+/// ITSELF: the branch and main each change a row of a member's spec table, which no cone
+/// holds, and Git merges them. Named the files that may read the table, the round is what a
+/// round over a shared code path is: of the merge's cone, the crates those files' members
+/// reach (with their dependents where a library is the reader, alone where only the member's
+/// own test is) and the crates main's change reaches. The landing this was written for: the
+/// branch changed the reader's crate and its table, and the round judges that crate and its
+/// dependent, not the rest of the branch's cone. Main's change to a crate of the branch's cone
+/// is judged beside it, as for a shared code path. A reader whose member is outside the
+/// merge's cone is judged by neither the round nor a full judgment of the merge, and where
+/// nothing of that cone is left the round is all of it (the land cuts the judgment there).
+/// NEGATIVE CONTROLS: the same rounds named no reader judge no crate, or only what a shared
+/// code path and main's change reach, as before; and a reader no workspace member owns makes
+/// the round the merge's whole cone, since no cone holds what it reads.
+#[test]
+fn a_round_judges_the_members_whose_files_may_read_the_shared_markdown() {
+    let y_ours = Y_BASE.replacen("pub fn y() {}", "pub fn y() -> u8 {\n    2\n}", 1);
+    let y_theirs = Y_BASE.replacen("pub fn z() {}", "pub fn z() -> u8 {\n    3\n}", 1);
+    let (r_ours, t_ours) = readers_ours();
+    let (made, root) = reading_workspace("atv-changed-round-readers");
+    let fixture = Committed::new(&root);
+
+    // The landing this was written for: the branch changed the reader's crate and its table.
+    let (judged, tip) = fixture.merged(
+        "library",
+        &[(C, C_OURS), (R_LIB, &r_ours), (R_SPEC, ROWS_OURS)],
+        &[(R_SPEC, ROWS_THEIRS)],
+        None,
+    );
+    assert_eq!(
+        picked(fixture.round_reading(&tip, &judged, &[R_SPEC], &[R_LIB], true)),
+        (paths(&["c", "r"]), paths(&["r", "rd"]), Vec::new())
+    );
+    assert_eq!(
+        picked(fixture.round(&tip, &judged, &[R_SPEC], true)),
+        (Vec::new(), Vec::new(), Vec::new()),
+        "named no reader, the source readers alone"
+    );
+    assert_eq!(
+        picked(fixture.round_reading(&tip, &judged, &[R_SPEC], &["tools/gen.rs"], true)),
+        (
+            paths(&["c", "r"]),
+            paths(&["c", "d", "r", "rd"]),
+            Vec::new()
+        ),
+        "a reader no member owns: the merge's whole cone"
+    );
+
+    // Main's change to a crate of the branch's cone is judged beside the reader's.
+    let (judged, tip) = fixture.merged(
+        "main",
+        &[(C, C_OURS), (R_LIB, &r_ours), (R_SPEC, ROWS_OURS)],
+        &[(D, D_THEIRS), (R_SPEC, ROWS_THEIRS)],
+        None,
+    );
+    assert_eq!(
+        picked(fixture.round_reading(&tip, &judged, &[R_SPEC], &[R_LIB], true)).1,
+        paths(&["d", "r", "rd"])
+    );
+
+    // A reader only its member's own test compiles: no dependent's build or test runs it.
+    let (judged, tip) = fixture.merged(
+        "test",
+        &[(C, C_OURS), (T_ROWS, &t_ours), (T_SPEC, ROWS_OURS)],
+        &[(T_SPEC, ROWS_THEIRS)],
+        None,
+    );
+    assert_eq!(
+        picked(fixture.round_reading(&tip, &judged, &[T_SPEC], &[T_ROWS], true)),
+        (paths(&["c", "t"]), paths(&["t"]), paths(&["t"]))
+    );
+
+    // A reader whose member the merge's cone does not hold: main's change alone is judged.
+    let (judged, tip) = fixture.merged(
+        "outside",
+        &[(C, C_OURS), (T_SPEC, ROWS_OURS)],
+        &[(D, D_THEIRS), (T_SPEC, ROWS_THEIRS)],
+        None,
+    );
+    assert_eq!(
+        picked(fixture.round_reading(&tip, &judged, &[T_SPEC], &[T_ROWS], true)),
+        (paths(&["c"]), paths(&["d"]), Vec::new())
+    );
+    // ... and with main's change outside it too, nothing of the cone is left: all of it.
+    let (judged, tip) = fixture.merged(
+        "nothing-left",
+        &[(C, C_OURS), (T_SPEC, ROWS_OURS)],
+        &[(T_SPEC, ROWS_THEIRS)],
+        None,
+    );
+    assert_eq!(
+        picked(fixture.round_reading(&tip, &judged, &[T_SPEC], &[T_ROWS], true)),
+        (paths(&["c"]), paths(&["c", "d"]), Vec::new())
+    );
+
+    // Beside a shared path a crate owns, and main's own change to a crate of the branch's cone.
+    let (judged, tip) = fixture.merged(
+        "beside",
+        &[
+            (C, C_OURS),
+            (Y, &y_ours),
+            (R_LIB, &r_ours),
+            (R_SPEC, ROWS_OURS),
+        ],
+        &[(D, D_THEIRS), (Y, &y_theirs), (R_SPEC, ROWS_THEIRS)],
+        None,
+    );
+    let (seeds, crates, _) =
+        picked(fixture.round_reading(&tip, &judged, &[R_SPEC, Y], &[R_LIB], true));
+    assert_eq!(
+        (seeds, crates),
+        (paths(&["c", "r", "y"]), paths(&["d", "r", "rd", "y"]))
+    );
+    assert_eq!(
+        picked(fixture.round(&tip, &judged, &[R_SPEC, Y], true)).1,
+        paths(&["d", "y"]),
+        "named no reader, the reader's member is in no cone the round reaches"
+    );
+    let _ = std::fs::remove_dir_all(&made);
+}
+
+/// THE READERS' WORD REACHES THE SELECTION: `--readers`, as `verify land` writes it beside
+/// `--judged` and `--shared` and this build parses it, selects through the one function a run
+/// selects by, so the crate of the file that may read the shared table is judged with main's
+/// change to the branch's cone. NEGATIVE CONTROLS: the same round without the word judges no
+/// crate (the Markdown alone is shared); and a readers file that is not there stops the run
+/// with a usage line naming it.
+#[test]
+fn a_rounds_readers_word_selects_the_readers_crates() {
+    let (r_ours, _) = readers_ours();
+    let (made, root) = reading_workspace("atv-changed-round-readers-words");
+    let fixture = Committed::new(&root);
+    let (judged, tip) = fixture.merged(
+        "words",
+        &[(C, C_OURS), (R_LIB, &r_ours), (R_SPEC, ROWS_OURS)],
+        &[(D, D_THEIRS), (R_SPEC, ROWS_THEIRS)],
+        None,
+    );
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let (shared, readers) = (
+        scratch.path().join("verify.shared"),
+        scratch.path().join("verify.readers"),
+    );
+    std::fs::write(&shared, format!("{R_SPEC}\0")).expect("the shared paths");
+    std::fs::write(&readers, format!("{R_LIB}\0")).expect("the readers");
+    let select = |words: &[&str]| {
+        let parsed = crate::cli::parse(words.iter().copied()).expect("the words parse");
+        let round = crate::round_of(&parsed, &root).expect("the files read");
+        picked(crate::cone_selection(
+            round,
+            &root,
+            &fixture.tools,
+            &fixture.path,
+            &tip,
+        ))
+        .1
+    };
+    let (shared, readers) = (
+        shared.to_str().expect("UTF-8"),
+        readers.to_str().expect("UTF-8"),
+    );
+    let round = ["--base", &tip, "--judged", &judged, "--shared", shared];
+    let mut reading = round.to_vec();
+    reading.extend([crate::cli::READERS, readers]);
+    assert_eq!(select(&reading), paths(&["d", "r", "rd"]));
+    assert_eq!(select(&round), Vec::<String>::new());
+
+    let absent = scratch.path().join("absent");
+    let mut words = round.to_vec();
+    words.extend([crate::cli::READERS, absent.to_str().expect("UTF-8")]);
+    let parsed = crate::cli::parse(words.iter().copied()).expect("the words parse");
+    let refused = crate::round_of(&parsed, &root).unwrap_err();
+    assert!(
+        refused.starts_with("verify: --readers ") && refused.contains("absent"),
+        "{refused}"
+    );
+    let _ = std::fs::remove_dir_all(&made);
+}
+
 /// THE ROUND'S WORDS REACH ITS SELECTION: `--judged`, `--shared` and `--by-hand`, as
 /// `verify land` composes them and this build parses them, select through the one function a
 /// run selects by. The shared file names the path main's dropped change sits in: without
@@ -1594,7 +1683,6 @@ fn a_rounds_words_select_what_the_round_judges() {
         let parsed = crate::cli::parse(words.iter().copied()).expect("the words parse");
         let round = crate::round_of(&parsed, &root).expect("the shared file reads");
         picked(crate::cone_selection(
-            &parsed,
             round,
             &root,
             &fixture.tools,
@@ -1639,9 +1727,6 @@ fn a_meet_keeps_the_judgments_seeds_and_only_the_crates_reached() {
         seeds: paths(seeds),
         crates: paths(crates),
         any_lib: true,
-        all_targets: paths(crates),
-        unlinted: Vec::new(),
-        direct_dependents: Vec::new(),
         alone: paths(alone),
     };
     let whole = narrowed(&["a", "b"], &["a", "b", "c@1.0.0", "d"], &["b"]);
@@ -1664,9 +1749,6 @@ fn a_meet_keeps_the_judgments_seeds_and_only_the_crates_reached() {
             seeds: paths(&["a", "b"]),
             crates: paths(&["c@1.0.0", "d"]),
             any_lib: false,
-            all_targets: paths(&["a", "b", "c@1.0.0", "d"]),
-            unlinted: Vec::new(),
-            direct_dependents: Vec::new(),
             alone: paths(&["b"]),
         }
     );
@@ -2029,7 +2111,7 @@ fn a_path_is_owned_by_the_member_whose_manifest_is_nearest() {
             None,
         ),
         ("libc-oracle/src/lib.rs", None),
-        ("docs/PROCESS.md", None),
+        ("docs/NOTES.md", None),
         ("tools/install.sh", None),
         ("README.md", None),
         ("AGENTS.md", None),
@@ -2083,7 +2165,7 @@ fn the_cone_is_the_seeds_and_what_builds_on_them() {
         ["aterm-grid", "aterm-gui"],
         "a changed crate stays in the cone though the answer leaves it out"
     );
-    let (seeds, crates) = pick(&["docs/PROCESS.md", "tools/install.sh"], &graph(EDGES));
+    let (seeds, crates) = pick(&["docs/NOTES.md", "tools/install.sh"], &graph(EDGES));
     assert!(seeds.is_empty() && crates.is_empty());
 }
 
@@ -2185,10 +2267,9 @@ fn a_dev_edge_is_the_final_hop_of_the_cone() {
     let owned = |names: &[&str]| -> Vec<String> {
         names.iter().map(|n| (*n).to_string()).collect::<Vec<_>>()
     };
-    let reach = |links: &[&str], dev_only: &[&str], direct: &[&str]| Reach {
+    let reach = |links: &[&str], dev_only: &[&str]| Reach {
         links: owned(links),
         dev_only: owned(dev_only),
-        direct: owned(direct),
     };
     let (anchored, vendored, macros) = (found("anchored"), found("vendored"), found("macros"));
     let offhost = found("offhost");
@@ -2206,15 +2287,11 @@ fn a_dev_edge_is_the_final_hop_of_the_cone() {
     let _ = std::fs::remove_dir_all(&made);
     assert_eq!(
         anchored,
-        reach(
-            &["anchored", "linked"],
-            &["closure", "tested_linked"],
-            &["closure", "linked"]
-        ),
-        "a dev dependent is direct; what depends on a direct dependent is not"
+        reach(&["anchored", "linked"], &["closure", "tested_linked"]),
+        "a dev dependent is reached only by its dev edge"
     );
-    assert_eq!(vendored, reach(&[], &["conformance"], &["conformance"]));
-    assert_eq!(macros, reach(&["abi", "consumer", "macros"], &[], &["abi"]));
+    assert_eq!(vendored, reach(&[], &["conformance"]));
+    assert_eq!(macros, reach(&["abi", "consumer", "macros"], &[]));
     assert_eq!(
         offhost,
         Reach::default(),
@@ -2424,14 +2501,29 @@ impl<'a> Committed<'a> {
     /// What [`resolve_round`] selects for the merge the checkout stands at, of main's `tip`
     /// into `judged`, sharing `shared`.
     fn round(&self, tip: &str, judged: &str, shared: &[&str], mechanical: bool) -> Selection {
+        self.round_reading(tip, judged, shared, &[], mechanical)
+    }
+
+    /// [`Self::round`], where each of `readers` may read Markdown among `shared`.
+    fn round_reading(
+        &self,
+        tip: &str,
+        judged: &str,
+        shared: &[&str],
+        readers: &[&str],
+        mechanical: bool,
+    ) -> Selection {
         resolve_round(
             self.root,
             &self.tools,
             &self.path,
             tip,
-            judged,
-            paths(shared),
-            mechanical,
+            &Round {
+                judged: judged.to_owned(),
+                shared: paths(shared),
+                readers: paths(readers),
+                mechanical,
+            },
         )
     }
 
@@ -2577,7 +2669,6 @@ fn a_tree_read_it_cannot_follow_fails_rather_than_narrowing() {
         Some(Reach {
             links: ["a", "c", "x"].map(String::from).to_vec(),
             dev_only: ["b", "d"].map(String::from).to_vec(),
-            direct: ["a", "c", "d"].map(String::from).to_vec(),
         })
     );
     let coloured = "x v1.0.0 (/r/x)\n\
@@ -2953,7 +3044,7 @@ fn shared_source_and_asset_consumers_join_the_change_cone_transitively() {
             "crates/g/tests/pin.rs"
         ])
     );
-    let docs = paths(&["docs/PROCESS.md"]);
+    let docs = paths(&["docs/NOTES.md"]);
     assert_eq!(
         with_shared_inputs(&repo, &listed, docs.clone(), &m)
             .unwrap()

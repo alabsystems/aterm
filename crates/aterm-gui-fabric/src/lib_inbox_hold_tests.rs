@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::test_support::{SessionCtx, Store, new_store, test_handle};
+use crate::test_support::{SessionCtx, Store, new_store, test_handle, test_handle_as};
 use aterm_types::fabric_grammar::{PRINCIPAL_MAX, PRINCIPAL_NAME_MAX, VIA_MAX_HOPS};
 
 use super::with_link_reset as with_link;
@@ -71,7 +71,7 @@ pub(super) fn broadcast(store: &Store, sid: &str, off: u64, topic: &str, text: &
     cmd_deliver(
         store,
         &format!(
-            "{sid} off={off} from=s-peer@n-lab kind=note trust=agent topic={topic} text={text}"
+            "{sid} off={off} from=t0000100000@n-lab kind=note trust=agent topic={topic} text={text}"
         ),
     )
 }
@@ -82,7 +82,7 @@ fn mail_since_answers_metadata_a_cursor_and_the_oldest_row_held() {
     let (sid, ctx) = registered(&store);
     for (n, (from, kind)) in [
         ("h-andrew", "task"),
-        ("s-peer", "note"),
+        ("t0000100000", "note"),
         ("h-andrew", "ask"),
     ]
     .iter()
@@ -135,7 +135,7 @@ fn mail_since_answers_metadata_a_cursor_and_the_oldest_row_held() {
     );
     let exact = MailFilter {
         kinds: Vec::new(),
-        from: Some("s-peer".to_string()),
+        from: Some("t0000100000".to_string()),
         topic: None,
     };
     assert_eq!(
@@ -148,9 +148,61 @@ fn mail_since_answers_metadata_a_cursor_and_the_oldest_row_held() {
         [2]
     );
     assert_eq!(sender_class("h-a"), "human");
-    assert_eq!(sender_class("s-a"), "agent");
+    assert_eq!(sender_class("t0000100001"), "agent");
     assert_eq!(sender_class("a-a"), "service");
     assert_eq!(sender_class("weird"), "other");
+    assert_eq!(sender_class("tqn5r6e0148"), "agent", "a t tab");
+    assert_eq!(
+        sender_class("tqn5r6e0148@n-lab"),
+        "agent",
+        "a t tab on a node"
+    );
+    assert_eq!(sender_class("s-1a2b3c4d5e6f70819203"), "agent", "an s- tab");
+    for malformed in [
+        "t000000000",
+        "T0000000000",
+        "tqn5r6e014u",
+        "tqn5r6e0148x@n-lab",
+    ] {
+        assert_eq!(sender_class(malformed), "other", "{malformed}");
+    }
+}
+
+/// A `t` tab is found by its ID and takes mail from a `t` sender, which reads as an agent; a
+/// malformed ID of either form names no session and sends nothing.
+#[test]
+fn a_t_tab_is_found_and_mailed_by_its_id() {
+    let store = new_store();
+    let sid = "tqn5r6e0148";
+    let h = test_handle_as(1, SessionId::parse(sid).expect("a t tab ID"));
+    let ctx = h.ctx.clone();
+    store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+    assert!(deliver(&store, sid, 100, "t0000000001", "task", "x").starts_with("OK"));
+    assert!(deliver(&store, sid, 101, "s-1a2b3c4d5e6f70819203", "task", "y").starts_with("OK"));
+    let agents = MailFilter {
+        kinds: Vec::new(),
+        from: Some("agent".to_string()),
+        topic: None,
+    };
+    let got = ctx.fabric.mail_since(0, &agents);
+    assert_eq!(
+        got.rows.iter().map(|r| r.from.as_str()).collect::<Vec<_>>(),
+        ["t0000000001", "s-1a2b3c4d5e6f70819203"]
+    );
+    for malformed in ["T0000000001", "t000000000"] {
+        assert_eq!(
+            deliver(&store, sid, 102, malformed, "task", "z"),
+            DELIVER_USAGE,
+            "from={malformed}"
+        );
+    }
+    for other in ["tqn5r6e014u", "TQN5R6E0148", "t0000000001"] {
+        assert_eq!(
+            deliver(&store, other, 103, "h-andrew", "task", "z"),
+            "ERR no such session\n",
+            "{other}"
+        );
+    }
 }
 
 #[test]
@@ -161,7 +213,7 @@ fn mail_since_reports_what_was_evicted_even_when_the_front_row_is_pinned() {
     let overflow = RING_CAP + 100;
     for n in 1..overflow {
         let off = 1000 + n as u64;
-        let from = format!("s-p{n}");
+        let from = format!("tp{n:09}");
         let reply = deliver(&store, &sid, off, &from, "note", "x");
         assert!(reply.starts_with("OK"), "row {n}: {reply}");
     }
@@ -439,24 +491,32 @@ fn post_and_deliver_hold_their_words_to_the_fabric_grammar() {
         DELIVER_USAGE
     );
     assert!(valid_principal(&format!(
-        "s-{}@n-{}",
+        "a-{}@n-{}",
         name(PRINCIPAL_NAME_MAX),
         name(PRINCIPAL_NAME_MAX)
     )));
     assert!(!valid_principal(&format!(
-        "s-{}@n-{}",
+        "a-{}@n-{}",
         name(PRINCIPAL_NAME_MAX),
         name(PRINCIPAL_NAME_MAX + 1)
     )));
 
-    let hop = format!("s-{}", name(PRINCIPAL_NAME_MAX));
+    let hop = format!("a-{}", name(PRINCIPAL_NAME_MAX));
     let over = vec![hop.as_str(); VIA_MAX_HOPS + 1].join(",");
     assert_eq!(
-        cmd_post(&ctx, &format!("to=@s-b kind=note via={over} x"), None),
+        cmd_post(
+            &ctx,
+            &format!("to=@t0000100003 kind=note via={over} x"),
+            None
+        ),
         POST_USAGE
     );
     assert_eq!(
-        cmd_post(&ctx, "to=@s-b kind=note via=s-a@n-b x", None),
+        cmd_post(
+            &ctx,
+            "to=@t0000100003 kind=note via=t0000100001@n-b x",
+            None
+        ),
         POST_USAGE
     );
     assert_eq!(
@@ -467,7 +527,7 @@ fn post_and_deliver_hold_their_words_to_the_fabric_grammar() {
         DELIVER_USAGE
     );
     assert_eq!(
-        cmd_post(&ctx, "to=@s-b kind=note via=s-a x", None),
+        cmd_post(&ctx, "to=@t0000100003 kind=note via=t0000100001 x", None),
         "OK 1\n"
     );
 }
@@ -476,10 +536,14 @@ fn post_and_deliver_hold_their_words_to_the_fabric_grammar() {
 fn a_queued_post_counts_its_via_and_a_retired_one_keeps_neither() {
     let store = new_store();
     let (sid, ctx) = registered(&store);
-    let via = vec!["s-aaaaaaaa"; VIA_MAX_HOPS].join(",");
+    let via = vec!["t0000100004"; VIA_MAX_HOPS].join(",");
     let body = "x".repeat(1000);
     assert_eq!(
-        cmd_post(&ctx, &format!("to=@s-b kind=note via={via} {body}"), None),
+        cmd_post(
+            &ctx,
+            &format!("to=@t0000100003 kind=note via={via} {body}"),
+            None
+        ),
         "OK 1\n"
     );
     let (queued, bytes) = ctx.fabric.lock().queued_load();
@@ -514,15 +578,21 @@ fn a_queued_post_counts_its_via_and_a_retired_one_keeps_neither() {
 fn an_address_carries_one_at_sign_and_not_a_run_of_them() {
     let store = new_store();
     let (_sid, ctx) = registered(&store);
-    assert_eq!(cmd_post(&ctx, "to=@s-abc kind=note hi", None), "OK 1\n");
     assert_eq!(
-        cmd_post(&ctx, "to=@s-abc@n-lab kind=note hi", None),
+        cmd_post(&ctx, "to=@t0000100005 kind=note hi", None),
+        "OK 1\n"
+    );
+    assert_eq!(
+        cmd_post(&ctx, "to=@t0000100005@n-lab kind=note hi", None),
         "OK 2\n"
     );
     assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note hi", None), "OK 3\n");
     assert_eq!(cmd_post(&ctx, "to=say kind=note hi", None), "OK 4\n");
-    assert_eq!(cmd_post(&ctx, "to=@@s-abc kind=note hi", None), POST_USAGE);
-    let padded = format!("{}s-abc", "@".repeat(4096));
+    assert_eq!(
+        cmd_post(&ctx, "to=@@t0000100005 kind=note hi", None),
+        POST_USAGE
+    );
+    let padded = format!("{}t0000100005", "@".repeat(4096));
     assert_eq!(
         cmd_post(&ctx, &format!("to={padded} kind=note hi"), None),
         POST_USAGE
@@ -546,16 +616,16 @@ fn a_reply_names_its_offset_with_or_without_the_at_sign() {
     let store = new_store();
     let (_sid, ctx) = registered(&store);
     assert_eq!(
-        cmd_post(&ctx, "to=@s-abc kind=note re=21 hi", None),
+        cmd_post(&ctx, "to=@t0000100005 kind=note re=21 hi", None),
         "OK 1\n"
     );
     assert_eq!(
-        cmd_post(&ctx, "to=@s-abc kind=note re=@21 hi", None),
+        cmd_post(&ctx, "to=@t0000100005 kind=note re=@21 hi", None),
         "OK 2\n"
     );
     for bad in ["re=@", "re=@@21", "re=+5", "re=x"] {
         assert_eq!(
-            cmd_post(&ctx, &format!("to=@s-abc kind=note {bad} hi"), None),
+            cmd_post(&ctx, &format!("to=@t0000100005 kind=note {bad} hi"), None),
             POST_USAGE,
             "{bad}"
         );
@@ -579,7 +649,7 @@ fn the_door_measures_the_row_the_fold_will_measure() {
         assert_eq!(
             cmd_post(
                 &ctx,
-                &format!("to=@s-abc kind=note len={BODY_MAX}"),
+                &format!("to=@t0000100005 kind=note len={BODY_MAX}"),
                 Some(vec![b'x'; BODY_MAX])
             ),
             format!("OK {}\n", i + 1)
@@ -590,12 +660,12 @@ fn the_door_measures_the_row_the_fold_will_measure() {
         (fills, OUTBOX_BYTES_MAX - BODY_MAX)
     );
 
-    let via = format!("s-{}", "a".repeat(18));
+    let via = format!("a-{}", "a".repeat(18));
     assert_eq!(via.len(), 20);
     assert!(
         cmd_post(
             &ctx,
-            &format!("to=@s-abc kind=note via={via} len={}", BODY_MAX - 10),
+            &format!("to=@t0000100005 kind=note via={via} len={}", BODY_MAX - 10),
             Some(vec![b'x'; BODY_MAX - 10])
         )
         .starts_with("ERR outbox full"),
@@ -605,7 +675,7 @@ fn the_door_measures_the_row_the_fold_will_measure() {
     assert!(
         cmd_post(
             &ctx,
-            &format!("to=@s-abc kind=note len={}", 100 * 1024),
+            &format!("to=@t0000100005 kind=note len={}", 100 * 1024),
             Some(vec![0xff; 100 * 1024])
         )
         .starts_with("ERR outbox full"),
@@ -615,7 +685,7 @@ fn the_door_measures_the_row_the_fold_will_measure() {
     assert_eq!(
         cmd_post(
             &ctx,
-            &format!("to=@s-abc kind=note len={}", BODY_MAX - 10),
+            &format!("to=@t0000100005 kind=note len={}", BODY_MAX - 10),
             Some(vec![b'x'; BODY_MAX - 10])
         ),
         format!("OK {}\n", fills + 1)
@@ -638,14 +708,17 @@ fn the_header_count_is_every_row_that_follows() {
         deliver(&store, &sid, 10, "h-andrew", "task", "go"),
         "OK 1\n"
     );
-    assert_eq!(cmd_post(&ctx, "to=@s-abc kind=note hello", None), "OK 1\n");
+    assert_eq!(
+        cmd_post(&ctx, "to=@t0000100005 kind=note hello", None),
+        "OK 1\n"
+    );
     let reply = cmd_inbox(&ctx, "");
     let header = reply.lines().next().expect("a header");
     assert!(header.starts_with("OK 2 "), "{header}");
     assert_eq!(rows(&reply).len(), 2, "{reply}");
     assert!(rows(&reply)[0].starts_with("msg 1 off=10 "), "{reply}");
     assert!(
-        rows(&reply)[1].starts_with("post 1 to=@s-abc kind=note off=-"),
+        rows(&reply)[1].starts_with("post 1 to=@t0000100005 kind=note off=-"),
         "{reply}"
     );
     for field in [
@@ -696,11 +769,13 @@ fn a_moved_copy_of_mail_shown_before_the_move_is_not_shown_again() {
     let moved = |off: u64, was: u64| {
         cmd_deliver(
             &store,
-            &format!("{sid} off={off} from=s-b@n-peer kind=ask trust=agent was={was} text=read"),
+            &format!(
+                "{sid} off={off} from=t0000100003@n-peer kind=ask trust=agent was={was} text=read"
+            ),
         )
     };
     assert_eq!(
-        deliver(&store, &sid, 7, "s-b@n-peer", "ask", "read"),
+        deliver(&store, &sid, 7, "t0000100003@n-peer", "ask", "read"),
         "OK 1\n"
     );
     assert_eq!(moved(40, 7), "OK 1\n", "answered as the row 7 got");
@@ -724,14 +799,14 @@ fn a_moved_copy_of_mail_shown_before_the_move_is_not_shown_again() {
     );
 
     assert_eq!(
-        deliver(&store, &sid, 41, "s-b@n-peer", "ask", "read"),
+        deliver(&store, &sid, 41, "t0000100003@n-peer", "ask", "read"),
         "OK 3\n",
         "without was= the copy is another row"
     );
     assert_eq!(
         cmd_deliver(
             &store,
-            &format!("{sid} off=42 from=s-b@n-peer kind=ask was=x")
+            &format!("{sid} off=42 from=t0000100003@n-peer kind=ask was=x")
         ),
         DELIVER_USAGE,
         "was= names an offset"
@@ -749,7 +824,7 @@ fn a_walk_again_neither_duplicates_a_held_row_nor_counts_a_refusal_twice() {
     assert_eq!(deliver(&store, &sid, 1, "h-a", "task", "keep"), "OK 1\n");
     let cap = u64::try_from(DEDUP_CAP).unwrap();
     for i in 0..cap {
-        let from = format!("s-x@n-p{i}");
+        let from = format!("t0000100006@n-p{i}");
         assert!(deliver(&store, &sid, 100 + i, &from, "note", "n").starts_with("OK "));
     }
     assert!(
@@ -795,13 +870,13 @@ fn a_walk_again_neither_duplicates_a_held_row_nor_counts_a_refusal_twice() {
         "an offset neither holds is judged as new"
     );
     for off in 0..quota {
-        let reply = deliver(&fresh, &bsid, 9000 + off, "s-peer@n-far", "note", "a");
+        let reply = deliver(&fresh, &bsid, 9000 + off, "t0000100000@n-far", "note", "a");
         assert!(reply.starts_with("OK "), "{reply}");
     }
     let addressed = 9000 + quota;
     for _ in 0..2 {
         assert_eq!(
-            deliver(&fresh, &bsid, addressed, "s-peer@n-far", "note", "a"),
+            deliver(&fresh, &bsid, addressed, "t0000100000@n-far", "note", "a"),
             "ERR quota\n"
         );
     }
@@ -1462,7 +1537,7 @@ fn a_scoped_link_gap_tells_one_session_unless_its_ring_holds_the_range() {
         assert_eq!(tell(&format!("gap from=10 to=20 sid={sa}")), "OK\n");
         assert_eq!(marks(&a).len(), 1, "a repeat is not marked again");
 
-        assert!(deliver(&store, &sb, 31, "s-peer", "note", "kept").starts_with("OK"));
+        assert!(deliver(&store, &sb, 31, "t0000100000", "note", "kept").starts_with("OK"));
         assert_eq!(b.fabric.topic_add("news", "@40", &b.timeline), Ok(true));
         assert!(broadcast(&store, &sb, 45, "news", "heard").starts_with("OK"));
         assert_eq!(tell(&format!("gap from=30 to=40 sid={sb}")), "OK\n");
@@ -1505,7 +1580,7 @@ fn a_scoped_link_gap_tells_one_session_unless_its_ring_holds_the_range() {
             "OK\n"
         );
         assert_eq!(marks(&a).len(), 1, "a topic the session does not hold");
-        assert_eq!(tell("gap from=50 to=60 sid=s-nobody"), "OK\n");
+        assert_eq!(tell("gap from=50 to=60 sid=t0000100007"), "OK\n");
 
         assert!(cmd_topic(&*b, "drop news").starts_with("OK news dropped=1"));
         assert_eq!(b.fabric.topic_add("news", "@40", &b.timeline), Ok(true));
@@ -1524,10 +1599,10 @@ fn a_scoped_link_gap_tells_one_session_unless_its_ring_holds_the_range() {
 
         for bad in [
             "gap from=1 to=2 topic=news",
-            "gap from=1 to=2 sid=s-a sid=s-b",
+            "gap from=1 to=2 sid=t0000100001 sid=t0000100003",
             "gap from=1 to=2 sid=",
-            "gap from=1 to=2 sid=s-a topic=News!",
-            "gap from=1 to=2 sid=s-a topic=news topic=news",
+            "gap from=1 to=2 sid=t0000100001 topic=News!",
+            "gap from=1 to=2 sid=t0000100001 topic=news topic=news",
         ] {
             assert!(
                 cmd_link(&store, bad, Some(generation)).starts_with("ERR usage"),
@@ -2001,7 +2076,7 @@ fn every_fabric_site_hands_its_facts_to_the_one_hook() {
     assert_eq!(cmd_deliver_waking(&store, &line, &wake), "OK 1\n");
     assert_eq!(cmd_deliver_waking(&store, &line, &wake), "OK 1\n");
     let watcher = test_support::Subscription::single(&ctx.watchers);
-    let _ = cmd_post(&ctx, "to=@s-peer kind=ask --wait=0 SECRET-POST", None);
+    let _ = cmd_post(&ctx, "to=@t0000100000 kind=ask --wait=0 SECRET-POST", None);
     assert!(watcher.wait(Duration::ZERO), "the post's record rang");
     let landed = format!("{sid} landed=1 off=9");
     assert_eq!(cmd_deliver_waking(&store, &landed, &wake), "OK\n");
@@ -2030,7 +2105,7 @@ fn every_fabric_site_hands_its_facts_to_the_one_hook() {
         facts,
         [
             "inbox: MailIn { kind: \"task\", from: \"h-a\", off: 7, inbox: 1 }",
-            "post: MailOut { kind: \"ask\", to: \"@s-peer\", post: 1, re: None, dl: None, \
+            "post: MailOut { kind: \"ask\", to: \"@t0000100000\", post: 1, re: None, dl: None, \
              via: None, idem: None }",
             "post-landed: MailLanded { post: 1, off: Some(9), why: None }",
             "inbox-seen: MailSeen { inbox: 1, off: Some(7), floor: Some(8), seen: 1, \
@@ -2066,7 +2141,7 @@ fn deliver_refuses_a_label_it_cannot_interpret() {
     assert_eq!(bad("off=1 from=x-a kind=task text=x"), DELIVER_USAGE);
     assert_eq!(bad("from=h-a kind=task text=x"), DELIVER_USAGE, "no offset");
     assert_eq!(
-        cmd_deliver(&store, "s-nope off=1 from=h-a kind=task"),
+        cmd_deliver(&store, "t0000100008 off=1 from=h-a kind=task"),
         "ERR no such session\n"
     );
     assert_eq!(bad("off=2 from=h-a kind=task text=x"), "OK 1\n");
@@ -2155,7 +2230,10 @@ fn the_halt_refuses_the_pty_verbs_and_nothing_else_body() {
         bridge_hold(&store, &format!("{sid} on origin=nowhere")),
         HOLD_USAGE
     );
-    assert_eq!(bridge_hold(&store, "s-nope on"), "ERR no such session\n");
+    assert_eq!(
+        bridge_hold(&store, "t0000100008 on"),
+        "ERR no such session\n"
+    );
 }
 
 #[test]
@@ -2698,7 +2776,7 @@ fn a_ghost_lanes_link_report_is_dropped_and_a_lost_bridge_stays_lost() {
                 &store,
                 &other_sid,
                 1,
-                "s-peer",
+                "t0000100000",
                 "note",
                 "unscoped%20fixture"
             ),
@@ -2856,7 +2934,7 @@ fn review_an_old_bridge_that_delivers_mail_reads_connected() {
             "under `starting` the wait parks and runs its course; it is not refused"
         );
         let delivered = on_lane(generation, || {
-            deliver(&store, &sid, 3, "s-peer", "note", "hi")
+            deliver(&store, &sid, 3, "t0000100000", "note", "hi")
         });
         assert!(delivered.starts_with("OK"), "{delivered}");
         assert_eq!(fabric_state(), "connected");
@@ -2885,7 +2963,7 @@ fn review_an_old_bridge_that_delivers_mail_reads_connected() {
         );
         assert_eq!(fabric_state(), "stalled");
         let delivered = on_lane(generation, || {
-            deliver(&store, &sid, 4, "s-peer", "note", "again")
+            deliver(&store, &sid, 4, "t0000100000", "note", "again")
         });
         assert!(delivered.starts_with("OK"), "{delivered}");
         assert_eq!(fabric_state(), "stalled");
@@ -2897,7 +2975,9 @@ fn review_an_old_bridge_that_delivers_mail_reads_connected() {
         bridge_attached(next);
         assert_eq!(fabric_state(), "stalled");
         assert_eq!(fabric_link_facts().0, LINK_STARTING);
-        let delivered = on_lane(next, || deliver(&store, &sid, 5, "s-peer", "note", "third"));
+        let delivered = on_lane(next, || {
+            deliver(&store, &sid, 5, "t0000100000", "note", "third")
+        });
         assert!(delivered.starts_with("OK"), "{delivered}");
         assert_eq!(fabric_state(), "connected");
     });
@@ -2922,7 +3002,7 @@ fn a_parked_waiter_is_woken_by_a_down_report_from_starting_or_up() {
                 std::thread::spawn(move || {
                     cmd_post(
                         &ctx,
-                        "to=@s-peer kind=ask --wait=600000 which branch?",
+                        "to=@t0000100000 kind=ask --wait=600000 which branch?",
                         None,
                     )
                 })
@@ -3001,7 +3081,7 @@ fn a_hold_naming_its_session_with_an_at_gets_the_bare_sid_form() {
             for rest in [
                 format!("@{sid} on"),
                 format!("@{sid} off reason=x"),
-                "@s-nope on".to_owned(),
+                "@t0000100008 on".to_owned(),
                 "@self on".to_owned(),
             ] {
                 assert_eq!(cmd_hold(&store, &rest, issuer), bare, "{issuer:?} {rest}");
@@ -3302,7 +3382,7 @@ fn await_inbox_topic_latches_only_on_that_topics_broadcasts() {
         cmd_deliver(
             &store,
             &format!(
-                "{sid} off={off} from=s-peer@n-lab kind=note trust=agent topic={topic} \
+                "{sid} off={off} from=t0000100000@n-lab kind=note trust=agent topic={topic} \
                  text=shout"
             ),
         )
@@ -3359,7 +3439,7 @@ fn an_accepted_post_wakes_before_its_wait_parks_and_a_refused_one_never() {
         let (sid, ctx) = registered(&store);
         attach_up(&store, next_bridge_generation());
         let watcher = test_support::Subscription::single(&ctx.watchers);
-        assert!(cmd_post(&ctx, "to=@s-b kind=shout hi", None).starts_with("ERR usage"));
+        assert!(cmd_post(&ctx, "to=@t0000100003 kind=shout hi", None).starts_with("ERR usage"));
         assert!(!watcher.wait(Duration::ZERO), "a refused post wakes nobody");
         assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note hi", None), "OK 1\n");
         assert!(watcher.wait(Duration::ZERO), "an accepted post wakes");
@@ -3557,7 +3637,7 @@ fn post_key_is_bounded_rides_the_outbox_and_a_dup_retirement_reaches_the_wait() 
         assert!(!valid_key("kä"), "not ASCII");
         for bad in ["key= x", "key=k/1 x", "key=a@b x"] {
             assert_eq!(
-                cmd_post(&ctx, &format!("to=@s-b kind=note {bad}"), None),
+                cmd_post(&ctx, &format!("to=@t0000100003 kind=note {bad}"), None),
                 POST_USAGE,
                 "{bad}"
             );
@@ -3565,14 +3645,17 @@ fn post_key_is_bounded_rides_the_outbox_and_a_dup_retirement_reaches_the_wait() 
         assert_eq!(
             cmd_post(
                 &ctx,
-                &format!("to=@s-b kind=note key={} x", "k".repeat(KEY_MAX + 1)),
+                &format!(
+                    "to=@t0000100003 kind=note key={} x",
+                    "k".repeat(KEY_MAX + 1)
+                ),
                 None
             ),
             POST_USAGE
         );
 
         assert_eq!(
-            cmd_post(&ctx, "to=@s-b kind=note key=k-1 hi", None),
+            cmd_post(&ctx, "to=@t0000100003 kind=note key=k-1 hi", None),
             "OK 1\n"
         );
         let (_, posts) = parse_outbox(&cmd_outbox(&store, ""));
@@ -3588,11 +3671,15 @@ fn post_key_is_bounded_rides_the_outbox_and_a_dup_retirement_reaches_the_wait() 
             "a peek: the key is there on the next drain too"
         );
         assert!(
-            cmd_inbox(&ctx, "--peek").contains("post 1 to=@s-b kind=note off=- len=2 key=k-1"),
+            cmd_inbox(&ctx, "--peek")
+                .contains("post 1 to=@t0000100003 kind=note off=- len=2 key=k-1"),
             "{}",
             cmd_inbox(&ctx, "--peek")
         );
-        assert_eq!(cmd_post(&ctx, "to=@s-b kind=note plain", None), "OK 2\n");
+        assert_eq!(
+            cmd_post(&ctx, "to=@t0000100003 kind=note plain", None),
+            "OK 2\n"
+        );
         let (_, both) = parse_outbox(&cmd_outbox(&store, ""));
         assert!(!both[1].0.contains("key="), "{:?}", both[1].0);
 
@@ -3644,9 +3731,9 @@ fn post_key_is_bounded_rides_the_outbox_and_a_dup_retirement_reaches_the_wait() 
 fn post_refuses_what_it_cannot_address() {
     let store = new_store();
     let (_sid, ctx) = registered(&store);
-    assert!(cmd_post(&ctx, "to=@s-b kind=shout hi", None).starts_with("ERR usage"));
+    assert!(cmd_post(&ctx, "to=@t0000100003 kind=shout hi", None).starts_with("ERR usage"));
     assert!(cmd_post(&ctx, "kind=note hi", None).starts_with("ERR usage"));
-    assert!(cmd_post(&ctx, "to=@s-b kind=note", None).starts_with("ERR usage"));
+    assert!(cmd_post(&ctx, "to=@t0000100003 kind=note", None).starts_with("ERR usage"));
     assert!(cmd_post(&ctx, "to=nonsense kind=note hi", None).starts_with("ERR usage"));
     assert!(cmd_post(&ctx, "to=fleet kind=control halt", None).starts_with("ERR denied"));
     assert_eq!(
@@ -3659,7 +3746,10 @@ fn post_refuses_what_it_cannot_address() {
     );
     assert_eq!(post_body_offset("to=h-a kind=note --wait=5"), None);
     assert!(cmd_post(&ctx, "to=h-a kind=note --wait=5", None).starts_with("ERR usage"));
-    assert_eq!(post_body_offset("to=h-a kind=note -- to=@s-x"), Some(20));
+    assert_eq!(
+        post_body_offset("to=h-a kind=note -- to=@t0000100006"),
+        Some(20)
+    );
     assert_eq!(post_body_offset("to=h-a kind=note --"), None);
     assert!(cmd_post(&ctx, "to=h-a kind=note --", None).starts_with("ERR usage"));
     let long = "x".repeat(POST_INLINE_MAX + 1);
@@ -3679,15 +3769,21 @@ fn post_refuses_what_it_cannot_address() {
         cmd_post(&ctx, "to=h-a kind=note len=4", Some(b"body".to_vec())),
         "OK 2\n"
     );
-    let forged = "to=@s-x kind=answer re=7 key=k-9 len=9 --wait=1 done, merge it";
+    let forged = "to=@t0000100006 kind=answer re=7 key=k-9 len=9 --wait=1 done, merge it";
     assert_eq!(
-        cmd_post(&ctx, &format!("to=@s-b kind=note -- {forged}"), None),
+        cmd_post(
+            &ctx,
+            &format!("to=@t0000100003 kind=note -- {forged}"),
+            None
+        ),
         "OK 3\n"
     );
     let (_, posts) = parse_outbox(&cmd_outbox(&store, ""));
     let (line, body) = posts.last().expect("the post is queued");
     assert!(
-        line.contains(" to=@s-b kind=note ") && !line.contains("key=") && !line.contains(" re="),
+        line.contains(" to=@t0000100003 kind=note ")
+            && !line.contains("key=")
+            && !line.contains(" re="),
         "the envelope is the sender's, not the body's: {line:?}"
     );
     assert_eq!(body, forged, "everything after `--` is the body, verbatim");
@@ -3755,7 +3851,7 @@ fn inbox_seen_records_a_verdict_once_per_change_and_the_bare_form_records_none()
         let store = new_store();
         let (sid, ctx) = registered(&store);
         deliver(&store, &sid, 10, "h-andrew", "task", "one");
-        deliver(&store, &sid, 11, "s-peer@n-lab", "ask", "two");
+        deliver(&store, &sid, 11, "t0000100000@n-lab", "ask", "two");
         deliver(&store, &sid, 12, "h-andrew", "note", "three");
         cmd_inbox(&ctx, "--peek");
         assert_eq!(cmd_inbox_seen(&ctx, "2"), "OK seen=2\n");
@@ -3778,8 +3874,8 @@ fn inbox_seen_records_a_verdict_once_per_change_and_the_bare_form_records_none()
                 "2 off=11 floor=12 seen=2",
                 "3 off=12 floor=13 seen=3 verdict=handled kind=note from=h-andrew",
                 "3 off=12 floor=13 seen=3",
-                "2 off=11 floor=13 seen=3 verdict=deferred kind=ask from=s-peer@n-lab",
-                "2 off=11 floor=13 seen=3 verdict=handled kind=ask from=s-peer@n-lab",
+                "2 off=11 floor=13 seen=3 verdict=deferred kind=ask from=t0000100000@n-lab",
+                "2 off=11 floor=13 seen=3 verdict=handled kind=ask from=t0000100000@n-lab",
             ],
             "one verdict per row per CHANGE; the bare form and a repeat carry none"
         );
@@ -3791,7 +3887,10 @@ fn an_ack_row_carries_its_verdict_and_await_inbox_re_latches_on_it() {
     with_link(|| {
         let store = new_store();
         let (sid, ctx) = registered(&store);
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note do it", None), "OK 1\n");
+        assert_eq!(
+            cmd_post(&ctx, "to=@t0000100000 kind=note do it", None),
+            "OK 1\n"
+        );
         assert_eq!(
             cmd_deliver(&store, &format!("{sid} landed=1 off=70")),
             "OK\n"
@@ -3799,7 +3898,7 @@ fn an_ack_row_carries_its_verdict_and_await_inbox_re_latches_on_it() {
         assert_eq!(
             cmd_deliver(
                 &store,
-                &format!("{sid} off=80 from=s-peer@n-lab kind=ack re=70 verdict=maybe text=x")
+                &format!("{sid} off=80 from=t0000100000@n-lab kind=ack re=70 verdict=maybe text=x")
             ),
             DELIVER_USAGE
         );
@@ -3815,7 +3914,7 @@ fn an_ack_row_carries_its_verdict_and_await_inbox_re_latches_on_it() {
             cmd_deliver(
                 &store,
                 &format!(
-                    "{sid} off=81 from=s-peer@n-lab kind=ack re=70 verdict=refused \
+                    "{sid} off=81 from=t0000100000@n-lab kind=ack re=70 verdict=refused \
                      text=ack%20re%3D70%20verdict%3Drefused"
                 )
             ),
@@ -3846,7 +3945,7 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
         let (sid, ctx) = registered(&store);
         attach_up(&store, next_bridge_generation());
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=note --wait-ack hello", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=note --wait-ack hello", None),
             POST_USAGE
         );
         let poster = {
@@ -3854,7 +3953,7 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
             std::thread::spawn(move || {
                 cmd_post(
                     &ctx,
-                    &format!("to=@s-peer kind=task --wait-ack={} ship it", hang_ms()),
+                    &format!("to=@t0000100000 kind=task --wait-ack={} ship it", hang_ms()),
                     None,
                 )
             })
@@ -3868,7 +3967,9 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
         assert_eq!(
             cmd_deliver(
                 &store,
-                &format!("{sid} off=50 from=s-peer@n-lab kind=ack re=42 verdict=handled text=ok")
+                &format!(
+                    "{sid} off=50 from=t0000100000@n-lab kind=ack re=42 verdict=handled text=ok"
+                )
             ),
             "OK 1\n"
         );
@@ -3880,7 +3981,11 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 TEST_EXPIRY_GRACE_MS.with(|grace| grace.set(Some(hang_ms())));
-                cmd_post(&ctx, "to=@s-peer kind=ask dl=30000 --wait-ack why?", None)
+                cmd_post(
+                    &ctx,
+                    "to=@t0000100000 kind=ask dl=30000 --wait-ack why?",
+                    None,
+                )
             })
         };
         loop {
@@ -3905,7 +4010,11 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 TEST_EXPIRY_GRACE_MS.with(|grace| grace.set(Some(TEST_GRACE_MS)));
-                cmd_post(&ctx, "to=@s-peer kind=task dl=150 --wait-ack quick", None)
+                cmd_post(
+                    &ctx,
+                    "to=@t0000100000 kind=task dl=150 --wait-ack quick",
+                    None,
+                )
             })
         };
         loop {
@@ -3922,7 +4031,11 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 TEST_EXPIRY_GRACE_MS.with(|grace| grace.set(Some(hang_ms())));
-                cmd_post(&ctx, "to=@s-peer kind=ask dl=100 --wait-ack late?", None)
+                cmd_post(
+                    &ctx,
+                    "to=@t0000100000 kind=ask dl=100 --wait-ack late?",
+                    None,
+                )
             })
         };
         loop {
@@ -3949,7 +4062,7 @@ fn post_wait_ack_returns_the_verdict_or_the_expiry_and_is_bounded_by_dl() {
                 TEST_EXPIRY_GRACE_MS.with(|grace| grace.set(Some(WAIT_MAX_MS)));
                 cmd_post(
                     &ctx,
-                    "to=@s-peer kind=ask dl=100 --wait-ack=200 exact",
+                    "to=@t0000100000 kind=ask dl=100 --wait-ack=200 exact",
                     None,
                 )
             })
@@ -3979,8 +4092,8 @@ fn a_decided_ask_owes_a_receipt_on_the_outbox_until_the_bridge_retires_it() {
         let store = new_store();
         let (sid, ctx) = registered(&store);
         deliver(&store, &sid, 10, "h-andrew", "task", "one");
-        deliver(&store, &sid, 11, "s-peer@n-lab", "ask", "two");
-        deliver(&store, &sid, 12, "s-peer@n-lab", "note", "three");
+        deliver(&store, &sid, 11, "t0000100000@n-lab", "ask", "two");
+        deliver(&store, &sid, 12, "t0000100000@n-lab", "note", "three");
         let receipts = |store: &Store| -> Vec<String> {
             let reply = cmd_outbox(store, "");
             let (_, mut rest) = reply.split_once('\n').expect("a header");
@@ -4012,11 +4125,11 @@ fn a_decided_ask_owes_a_receipt_on_the_outbox_until_the_bridge_retires_it() {
             owed,
             [
                 format!(
-                    "receipt sid={sid} rid=1 off=11 verdict=deferred kind=ask from=s-peer@n-lab"
+                    "receipt sid={sid} rid=1 off=11 verdict=deferred kind=ask from=t0000100000@n-lab"
                 ),
                 format!("receipt sid={sid} rid=2 off=10 verdict=handled kind=task from=h-andrew"),
                 format!(
-                    "receipt sid={sid} rid=3 off=11 verdict=handled kind=ask from=s-peer@n-lab"
+                    "receipt sid={sid} rid=3 off=11 verdict=handled kind=ask from=t0000100000@n-lab"
                 ),
             ],
             "one per decision, in order; the repeated word owes nothing"
@@ -4057,7 +4170,10 @@ fn a_decided_ask_owes_a_receipt_on_the_outbox_until_the_bridge_retires_it() {
                 "receipt sid={sid} rid=2 off=10 verdict=handled kind=task from=h-andrew"
             )]
         );
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note after", None), "OK 1\n");
+        assert_eq!(
+            cmd_post(&ctx, "to=@t0000100000 kind=note after", None),
+            "OK 1\n"
+        );
         let reply = cmd_outbox(&store, "");
         let post_at = reply.find("post sid=").expect("the post");
         let receipt_at = reply.find("receipt sid=").expect("the receipt");
@@ -4103,7 +4219,7 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
                     &store,
                     &sid,
                     off,
-                    "s-peer@n-lab",
+                    "t0000100000@n-lab",
                     "note",
                     &format!("body-{off}")
                 ),
@@ -4123,7 +4239,9 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
         );
         assert_eq!(
             cmd_inbox_get(&ctx, &format!("@{newest}")),
-            format!("OK 9 off={newest} from=s-peer@n-lab kind=note trust=agent\nbody-{newest}")
+            format!(
+                "OK 9 off={newest} from=t0000100000@n-lab kind=note trust=agent\nbody-{newest}"
+            )
         );
         let reader = {
             let ctx = ctx.clone();
@@ -4137,7 +4255,7 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
             cmd_deliver(
                 &store,
                 &format!(
-                    "{sid} fetched=1000 from=s-peer@n-lab kind=note trust=agent \
+                    "{sid} fetched=1000 from=t0000100000@n-lab kind=note trust=agent \
                      text=body-1000"
                 )
             ),
@@ -4145,11 +4263,11 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
         );
         assert_eq!(
             reader.join().expect("the reader finished"),
-            "OK 9 off=1000 from=s-peer@n-lab kind=note trust=agent\nbody-1000"
+            "OK 9 off=1000 from=t0000100000@n-lab kind=note trust=agent\nbody-1000"
         );
         assert_eq!(
             cmd_inbox_get(&ctx, "@1000"),
-            "OK 9 off=1000 from=s-peer@n-lab kind=note trust=agent\nbody-1000"
+            "OK 9 off=1000 from=t0000100000@n-lab kind=note trust=agent\nbody-1000"
         );
         assert!(!cmd_outbox(&store, "").contains("fetch "));
         assert_eq!(cmd_inbox_get(&ctx, "1"), "ERR no such message\n");
@@ -4202,7 +4320,7 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
         let line = |tail: &str| {
             cmd_deliver(
                 &store,
-                &format!("{sid} fetched=1002 from=s-peer@n-lab kind=note trust=agent {tail}"),
+                &format!("{sid} fetched=1002 from=t0000100000@n-lab kind=note trust=agent {tail}"),
             )
         };
         assert_eq!(line("more=1 text=abc"), "OK\n");
@@ -4214,7 +4332,7 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
         assert_eq!(line("at=6 text=gh%20i"), "OK\n");
         assert_eq!(
             reader.join().expect("the reader finished"),
-            "OK 10 off=1002 from=s-peer@n-lab kind=note trust=agent\nabcdefgh i"
+            "OK 10 off=1002 from=t0000100000@n-lab kind=note trust=agent\nabcdefgh i"
         );
         let reader = {
             let ctx = ctx.clone();
@@ -4227,7 +4345,7 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
         let line = |tail: &str| {
             cmd_deliver(
                 &store,
-                &format!("{sid} fetched=1003 from=s-peer@n-lab kind=note trust=agent {tail}"),
+                &format!("{sid} fetched=1003 from=t0000100000@n-lab kind=note trust=agent {tail}"),
             )
         };
         assert_eq!(line("more=1 text=abc"), "OK\n");
@@ -4250,7 +4368,7 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
             cmd_deliver(
                 &store,
                 &format!(
-                    "{sid} fetched=1004 from=s-peer@n-lab kind=note trust=agent len={big} \
+                    "{sid} fetched=1004 from=t0000100000@n-lab kind=note trust=agent len={big} \
                      text=head"
                 )
             ),
@@ -4259,7 +4377,7 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
         assert_eq!(
             reader.join().expect("the reader finished"),
             format!(
-                "OK 4 off=1004 from=s-peer@n-lab kind=note trust=agent truncated=1 \
+                "OK 4 off=1004 from=t0000100000@n-lab kind=note trust=agent truncated=1 \
                  len={big}\nhead"
             )
         );
@@ -4267,7 +4385,9 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
         assert!(
             cmd_deliver(
                 &store,
-                &format!("{sid} off=5000 from=s-peer@n-lab kind=note trust=agent len=12 text=cut-")
+                &format!(
+                    "{sid} off=5000 from=t0000100000@n-lab kind=note trust=agent len=12 text=cut-"
+                )
             )
             .starts_with("OK ")
         );
@@ -4283,7 +4403,7 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
             cmd_deliver(
                 &store,
                 &format!(
-                    "{sid} fetched=5000 from=s-peer@n-lab kind=note trust=agent \
+                    "{sid} fetched=5000 from=t0000100000@n-lab kind=note trust=agent \
                      text=cut-no-more%21"
                 )
             ),
@@ -4291,13 +4411,13 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
         );
         assert_eq!(
             reader.join().expect("the reader finished"),
-            "OK 12 off=5000 from=s-peer@n-lab kind=note trust=agent\ncut-no-more!"
+            "OK 12 off=5000 from=t0000100000@n-lab kind=note trust=agent\ncut-no-more!"
         );
         assert!(
             cmd_deliver(
                 &store,
                 &format!(
-                    "{sid} off=5001 from=s-peer@n-lab kind=note trust=agent len=40 text=prefix"
+                    "{sid} off=5001 from=t0000100000@n-lab kind=note trust=agent len=40 text=prefix"
                 )
             )
             .starts_with("OK ")
@@ -4316,7 +4436,7 @@ fn inbox_get_at_an_offset_answers_the_ring_or_the_bus_and_the_header_names_the_o
         );
         assert_eq!(
             reader.join().expect("the reader finished"),
-            "OK 6 off=5001 from=s-peer@n-lab kind=note trust=agent truncated=1 len=40\nprefix"
+            "OK 6 off=5001 from=t0000100000@n-lab kind=note trust=agent truncated=1 len=40\nprefix"
         );
     });
 }
@@ -4368,11 +4488,11 @@ fn a_log_switch_forgets_every_offset_the_endpoint_holds() {
         let tell = |ident: &str| cmd_link(&store, &format!("log {ident}"), Some(generation));
         assert_eq!(tell(&a), "OK\n", "the first log forgets nothing");
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "note", "on-a"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "note", "on-a"),
             "OK 1\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "note", "on-a"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "note", "on-a"),
             "OK 1\n",
             "on one log an offset is one record"
         );
@@ -4399,13 +4519,13 @@ fn a_log_switch_forgets_every_offset_the_endpoint_holds() {
             "ERR fetch failed reason=log-replaced off=1000\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "note", "on-b"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "note", "on-b"),
             "OK 2\n",
             "B's record at 7 is not A's"
         );
         assert_eq!(
             cmd_inbox_get(&ctx, "@7"),
-            "OK 4 off=7 from=s-peer@n-lab kind=note trust=agent\non-b"
+            "OK 4 off=7 from=t0000100000@n-lab kind=note trust=agent\non-b"
         );
         assert!(
             cmd_inbox(&ctx, "0 --peek --meta").contains(" bus_head=7 oldest_on_bus=@7 "),
@@ -4423,7 +4543,7 @@ fn a_log_switch_forgets_every_offset_the_endpoint_holds() {
             "OK stale=1\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "note", "on-b"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "note", "on-b"),
             "OK 2\n",
             "a stale lane forgot nothing"
         );
@@ -4446,7 +4566,7 @@ fn log_switch_retires_old_receipt_debt_without_erasing_the_mail() {
         };
         assert_eq!(tell("a"), "OK\n");
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "old"),
             "OK 1\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
@@ -4466,7 +4586,7 @@ fn log_switch_retires_old_receipt_debt_without_erasing_the_mail() {
             Some("handled")
         );
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "new"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "new"),
             "OK 2\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
@@ -4494,7 +4614,7 @@ fn log_switch_a_later_historical_verdict_is_local() {
         };
         assert_eq!(tell("a"), "OK\n");
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "task", "old"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "task", "old"),
             "OK 1\n"
         );
         assert_eq!(tell("b"), "OK forgot=1\n");
@@ -4508,7 +4628,7 @@ fn log_switch_a_later_historical_verdict_is_local() {
             Some("handled")
         );
         assert_eq!(
-            deliver(&store, &sid, 8, "s-peer@n-lab", "task", "new"),
+            deliver(&store, &sid, 8, "t0000100000@n-lab", "task", "new"),
             "OK 2\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
@@ -4534,12 +4654,15 @@ fn log_switch_receipt_waits_do_not_match_another_logs_offset() {
             cmd_deliver(
                 &store,
                 &format!(
-                    "{sid} off=20 from=s-peer@n-lab kind=ack trust=agent re=7 verdict=handled text=receipt"
+                    "{sid} off=20 from=t0000100000@n-lab kind=ack trust=agent re=7 verdict=handled text=receipt"
                 ),
             )
         };
         assert_eq!(tell("a"), "OK\n");
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note old", None), "OK 1\n");
+        assert_eq!(
+            cmd_post(&ctx, "to=@t0000100000 kind=note old", None),
+            "OK 1\n"
+        );
         assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 1 off=7")), "OK\n");
         assert_eq!(ack(), "OK 1\n");
         assert_eq!(
@@ -4548,7 +4671,10 @@ fn log_switch_receipt_waits_do_not_match_another_logs_offset() {
             "same-log receipt is valid"
         );
         assert_eq!(tell("b"), "OK forgot=1\n");
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note new", None), "OK 2\n");
+        assert_eq!(
+            cmd_post(&ctx, "to=@t0000100000 kind=note new", None),
+            "OK 2\n"
+        );
         assert_eq!(cmd_outbox_sent(&store, &format!("{sid} 2 off=7")), "OK\n");
         assert_eq!(
             wait_receipt(&ctx, 2, 7, "", 0),
@@ -4589,7 +4715,7 @@ fn log_switch_keeps_a_queued_posts_new_log_thread() {
         };
         assert_eq!(tell("a"), "OK\n");
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=note queued", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=note queued", None),
             "OK 1\n"
         );
         assert_eq!(tell("b"), "OK forgot=1\n");
@@ -4601,7 +4727,9 @@ fn log_switch_keeps_a_queued_posts_new_log_thread() {
         assert_eq!(
             cmd_deliver(
                 &store,
-                &format!("{sid} off=8 from=s-peer@n-lab kind=answer trust=agent re=7 text=reply")
+                &format!(
+                    "{sid} off=8 from=t0000100000@n-lab kind=answer trust=agent re=7 text=reply"
+                )
             ),
             "OK 1\n"
         );
@@ -4629,11 +4757,11 @@ fn log_switch_a_queued_reply_cannot_reuse_a_historical_reference() {
         };
         assert_eq!(tell("a"), "OK\n");
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "old"),
             "OK 1\n"
         );
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=answer re=7 queued-reply", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=answer re=7 queued-reply", None),
             "OK 1\n"
         );
         assert_eq!(tell("b"), "OK forgot=1\n");
@@ -4664,7 +4792,7 @@ fn log_switch_waits_for_the_commit_receipt_fence_and_retries() {
         };
         assert_eq!(tell("a"), "OK\n");
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "old"),
             "OK 1\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
@@ -4708,16 +4836,16 @@ fn log_switch_a_successors_first_attach_checks_the_carried_log() {
             "OK\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "old"),
             "OK 1\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=answer re=7 reply", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=answer re=7 reply", None),
             "OK 1\n"
         );
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=note independent", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=note independent", None),
             "OK 2\n"
         );
         let mut budget = CARRY_MAIL_BYTES;
@@ -4792,12 +4920,12 @@ fn log_switch_a_late_fresh_session_keeps_same_log_receipts_and_dedup() {
                 .register(late);
         });
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "live"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "live"),
             "OK 1\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=answer re=7 reply", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=answer re=7 reply", None),
             "OK 1\n"
         );
         assert_eq!(tell(), "OK\n", "reattaching to A keeps A's live references");
@@ -4808,7 +4936,7 @@ fn log_switch_a_late_fresh_session_keeps_same_log_receipts_and_dedup() {
             "{outbox}"
         );
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "live"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "live"),
             "OK 1\n"
         );
         assert_eq!(
@@ -4818,7 +4946,7 @@ fn log_switch_a_late_fresh_session_keeps_same_log_receipts_and_dedup() {
         );
         assert_eq!(
             cmd_inbox_get(&ctx, "@7"),
-            "OK 4 off=7 from=s-peer@n-lab kind=ask trust=agent\nlive"
+            "OK 4 off=7 from=t0000100000@n-lab kind=ask trust=agent\nlive"
         );
     });
 }
@@ -4839,16 +4967,16 @@ fn log_switch_a_late_adoption_checks_carry_before_its_first_outbox() {
             "OK\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "old"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "old"),
             "OK 1\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=answer re=7 reply", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=answer re=7 reply", None),
             "OK 1\n"
         );
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=note independent", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=note independent", None),
             "OK 2\n"
         );
         ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone())
@@ -4913,12 +5041,18 @@ fn a_post_queued_across_a_log_switch_threads_its_reply_on_the_new_log() {
         attach_up(&store, generation);
         let tell = |ident: String| cmd_link(&store, &format!("log {ident}"), Some(generation));
         assert_eq!(tell(format!("{}.0", "aa".repeat(16))), "OK\n");
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note on a", None), "OK 1\n");
+        assert_eq!(
+            cmd_post(&ctx, "to=@t0000100000 kind=note on a", None),
+            "OK 1\n"
+        );
         assert_eq!(
             cmd_deliver(&store, &format!("{sid} landed=1 off=70")),
             "OK\n"
         );
-        assert_eq!(cmd_post(&ctx, "to=@s-peer kind=note on b", None), "OK 2\n");
+        assert_eq!(
+            cmd_post(&ctx, "to=@t0000100000 kind=note on b", None),
+            "OK 2\n"
+        );
         assert_eq!(tell(format!("{}.1", "aa".repeat(16))), "OK forgot=1\n");
         assert_eq!(
             cmd_deliver(&store, &format!("{sid} landed=2 off=70")),
@@ -4927,7 +5061,7 @@ fn a_post_queued_across_a_log_switch_threads_its_reply_on_the_new_log() {
         assert_eq!(
             cmd_deliver(
                 &store,
-                &format!("{sid} off=71 from=s-peer@n-lab kind=note re=70 trust=agent text=re")
+                &format!("{sid} off=71 from=t0000100000@n-lab kind=note re=70 trust=agent text=re")
             ),
             "OK 1\n"
         );
@@ -4989,7 +5123,7 @@ fn a_moved_generation_keeps_what_names_a_record_below_the_fork() {
                 cmd_deliver(
                     &store,
                     &format!(
-                        "{sid} fetched={off} from=s-peer@n-lab kind=note trust=agent text={text}"
+                        "{sid} fetched={off} from=t0000100000@n-lab kind=note trust=agent text={text}"
                     ),
                 )
             };
@@ -4997,7 +5131,7 @@ fn a_moved_generation_keeps_what_names_a_record_below_the_fork() {
                 cmd_deliver(
                     &store,
                     &format!(
-                        "{sid} off={off} from=s-peer@n-lab kind=ack trust=agent re={re} \
+                        "{sid} off={off} from=t0000100000@n-lab kind=ack trust=agent re={re} \
                          verdict=handled text=ack"
                     ),
                 )
@@ -5013,26 +5147,30 @@ fn a_moved_generation_keeps_what_names_a_record_below_the_fork() {
 
             assert_eq!(tell(&a0), "OK\n", "{case}");
             assert_eq!(
-                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "below"),
+                deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "below"),
                 "OK 1\n"
             );
             assert_eq!(
-                deliver(&store, &sid, 40, "s-peer@n-lab", "ask", "above"),
+                deliver(&store, &sid, 40, "t0000100000@n-lab", "ask", "above"),
                 "OK 2\n"
             );
             assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
             assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
             assert_eq!(
-                cmd_post(&ctx, "to=@s-peer kind=answer re=7 reply-below", None),
+                cmd_post(&ctx, "to=@t0000100000 kind=answer re=7 reply-below", None),
                 "OK 1\n"
             );
             assert_eq!(
-                cmd_post(&ctx, "to=@s-peer kind=answer re=40 reply-above", None),
+                cmd_post(&ctx, "to=@t0000100000 kind=answer re=40 reply-above", None),
                 "OK 2\n"
             );
             for (id, off) in [(3, 9), (4, 41)] {
                 assert_eq!(
-                    cmd_post(&ctx, &format!("to=@s-peer kind=note landed-at-{off}"), None),
+                    cmd_post(
+                        &ctx,
+                        &format!("to=@t0000100000 kind=note landed-at-{off}"),
+                        None
+                    ),
                     format!("OK {id}\n")
                 );
                 assert_eq!(
@@ -5141,13 +5279,13 @@ fn a_moved_generation_keeps_what_names_a_record_below_the_fork() {
             let earlier = cmd_outbox(&store, "earlier-receipts=1");
             assert!(
                 earlier.contains(
-                    " rid=2 off=40 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    " rid=2 off=40 verdict=handled kind=ask from=t0000100000@n-lab log=earlier\n"
                 ),
                 "{case}: {earlier}"
             );
             assert_eq!(
                 earlier.contains(
-                    " rid=1 off=7 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    " rid=1 off=7 verdict=handled kind=ask from=t0000100000@n-lab log=earlier\n"
                 ),
                 !lineage,
                 "{case}: {earlier}"
@@ -5178,12 +5316,12 @@ fn a_moved_generation_keeps_what_names_a_record_below_the_fork() {
             );
 
             assert_eq!(
-                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "below"),
+                deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "below"),
                 if lineage { "OK 1\n" } else { "OK 5\n" },
                 "{case}"
             );
             assert_eq!(
-                deliver(&store, &sid, 40, "s-peer@n-lab", "ask", "new-40"),
+                deliver(&store, &sid, 40, "t0000100000@n-lab", "ask", "new-40"),
                 if lineage { "OK 5\n" } else { "OK 6\n" },
                 "{case}"
             );
@@ -5202,7 +5340,7 @@ fn across_two_moves_an_offset_is_kept_only_below_both_forks() {
         let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
         let land = |id: u64, off: u64| {
             assert_eq!(
-                cmd_post(&ctx, &format!("to=@s-peer kind=note on-{id}"), None),
+                cmd_post(&ctx, &format!("to=@t0000100000 kind=note on-{id}"), None),
                 format!("OK {id}\n")
             );
             assert_eq!(
@@ -5214,7 +5352,7 @@ fn across_two_moves_an_offset_is_kept_only_below_both_forks() {
             (
                 cmd_outbox(&store, "").contains(" rid=1 off=35 "),
                 cmd_outbox(&store, "earlier-receipts=1").contains(
-                    " rid=1 off=35 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n",
+                    " rid=1 off=35 verdict=handled kind=ask from=t0000100000@n-lab log=earlier\n",
                 ),
             )
         };
@@ -5222,11 +5360,11 @@ fn across_two_moves_an_offset_is_kept_only_below_both_forks() {
         assert_eq!(tell(a(0)), "OK\n");
         land(1, 40);
         assert_eq!(
-            deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a0-at-40"),
+            deliver(&store, &sid, 40, "t0000100000@n-lab", "note", "a0-at-40"),
             "OK 1\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 35, "s-peer@n-lab", "ask", "a0-at-35"),
+            deliver(&store, &sid, 35, "t0000100000@n-lab", "ask", "a0-at-35"),
             "OK 2\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
@@ -5242,7 +5380,7 @@ fn across_two_moves_an_offset_is_kept_only_below_both_forks() {
         assert_eq!(receipt_at_35(), (false, true), "35 is at or above 30");
         land(2, 40);
         assert_eq!(
-            deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a1-at-40"),
+            deliver(&store, &sid, 40, "t0000100000@n-lab", "note", "a1-at-40"),
             "OK 3\n",
             "A.1's record at 40 is not A.0's"
         );
@@ -5254,7 +5392,9 @@ fn across_two_moves_an_offset_is_kept_only_below_both_forks() {
         assert_eq!(
             cmd_deliver(
                 &store,
-                &format!("{sid} off=55 from=s-peer@n-lab kind=answer trust=agent re=40 text=re")
+                &format!(
+                    "{sid} off=55 from=t0000100000@n-lab kind=answer trust=agent re=40 text=re"
+                )
             ),
             "OK 4\n"
         );
@@ -5269,11 +5409,11 @@ fn across_two_moves_an_offset_is_kept_only_below_both_forks() {
         );
         assert_eq!(
             cmd_inbox_get(&ctx, "@40"),
-            "OK 8 off=40 from=s-peer@n-lab kind=note trust=agent\na1-at-40",
+            "OK 8 off=40 from=t0000100000@n-lab kind=note trust=agent\na1-at-40",
             "A.1's row, not A.0's"
         );
         assert_eq!(
-            deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a1-at-40"),
+            deliver(&store, &sid, 40, "t0000100000@n-lab", "note", "a1-at-40"),
             "OK 3\n",
             "A.1's record handed again on A.2 is the row it was"
         );
@@ -5301,15 +5441,15 @@ fn a_session_ahead_of_the_bridges_witness_keeps_below_the_chains_fork() {
         let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
         assert_eq!(tell(a(0)), "OK\n");
         assert_eq!(
-            deliver(&store, &sid, 10, "s-peer@n-lab", "note", "a0-at-10"),
+            deliver(&store, &sid, 10, "t0000100000@n-lab", "note", "a0-at-10"),
             "OK 1\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 35, "s-peer@n-lab", "ask", "a0-at-35"),
+            deliver(&store, &sid, 35, "t0000100000@n-lab", "ask", "a0-at-35"),
             "OK 2\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a0-at-40"),
+            deliver(&store, &sid, 40, "t0000100000@n-lab", "note", "a0-at-40"),
             "OK 3\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "2 handled"), "OK seen=2\n");
@@ -5322,18 +5462,19 @@ fn a_session_ahead_of_the_bridges_witness_keeps_below_the_chains_fork() {
             "OK forgot=1\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 10, "s-peer@n-lab", "note", "a0-at-10"),
+            deliver(&store, &sid, 10, "t0000100000@n-lab", "note", "a0-at-10"),
             "OK 1\n",
             "below the chain's fork: the row it was"
         );
         assert_eq!(
-            deliver(&store, &sid, 40, "s-peer@n-lab", "note", "a2-at-40"),
+            deliver(&store, &sid, 40, "t0000100000@n-lab", "note", "a2-at-40"),
             "OK 4\n",
             "at or above it: A.2's record at 40 is a new row"
         );
         assert!(
-            cmd_outbox(&store, "earlier-receipts=1")
-                .contains(" rid=1 off=35 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"),
+            cmd_outbox(&store, "earlier-receipts=1").contains(
+                " rid=1 off=35 verdict=handled kind=ask from=t0000100000@n-lab log=earlier\n"
+            ),
             "the receipt at 35 is an earlier log's"
         );
 
@@ -5343,7 +5484,14 @@ fn a_session_ahead_of_the_bridges_witness_keeps_below_the_chains_fork() {
         let b0 = format!("{}.0", "bb".repeat(16));
         assert!(other_link(b0).starts_with("OK"));
         assert_eq!(
-            deliver(&other, &other_sid, 10, "s-peer@n-lab", "note", "b0-at-10"),
+            deliver(
+                &other,
+                &other_sid,
+                10,
+                "t0000100000@n-lab",
+                "note",
+                "b0-at-10"
+            ),
             "OK 1\n"
         );
         assert_eq!(
@@ -5351,7 +5499,14 @@ fn a_session_ahead_of_the_bridges_witness_keeps_below_the_chains_fork() {
             "OK forgot=1\n"
         );
         assert_eq!(
-            deliver(&other, &other_sid, 10, "s-peer@n-lab", "note", "a3-at-10"),
+            deliver(
+                &other,
+                &other_sid,
+                10,
+                "t0000100000@n-lab",
+                "note",
+                "a3-at-10"
+            ),
             "OK 2\n",
             "a session on another log keeps nothing"
         );
@@ -5368,7 +5523,7 @@ fn link_log_continues_takes_only_an_earlier_generation_of_the_same_log() {
         let a = |g: u64| format!("{}.{g}", "aa".repeat(16));
         let b0 = format!("{}.0", "bb".repeat(16));
         let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
-        let at_seven = || deliver(&store, &sid, 7, "s-peer@n-lab", "note", "seven");
+        let at_seven = || deliver(&store, &sid, 7, "t0000100000@n-lab", "note", "seven");
         assert_eq!(tell(a(0)), "OK\n");
         assert_eq!(at_seven(), "OK 1\n");
         for line in [
@@ -5423,7 +5578,7 @@ fn a_padded_generation_told_by_link_log_is_the_clock_already_held() {
         let hex = "aa".repeat(16);
         let held = format!("{hex}.1");
         let tell = |line: &str| cmd_link(&store, &format!("log {line}"), Some(generation));
-        let at_seven = || deliver(&store, &sid, 7, "s-peer@n-lab", "note", "seven");
+        let at_seven = || deliver(&store, &sid, 7, "t0000100000@n-lab", "note", "seven");
         assert_eq!(tell(&held), "OK\n");
         assert_eq!(at_seven(), "OK 1\n");
         let as_text_another_log = |told: &str| told != held;
@@ -5465,12 +5620,12 @@ fn a_carry_naming_a_padded_generation_keeps_what_the_clock_names() {
             "OK\n"
         );
         assert_eq!(
-            deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "ask"),
+            deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "ask"),
             "OK 1\n"
         );
         assert_eq!(cmd_inbox_seen(&ctx, "1 handled"), "OK seen=1\n");
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=answer re=7 reply-7", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=answer re=7 reply-7", None),
             "OK 1\n"
         );
         aterm_toml::to_string(&ctx.fabric.handoff_carry(&mut CARRY_MAIL_BYTES.clone()))
@@ -5605,7 +5760,7 @@ fn a_session_carried_on_the_continued_generation_keeps_what_is_below_the_fork() 
             );
             for (id, off) in [(1, 7), (2, 40)] {
                 assert_eq!(
-                    deliver(&store, &sid, off, "s-peer@n-lab", "ask", "ask"),
+                    deliver(&store, &sid, off, "t0000100000@n-lab", "ask", "ask"),
                     format!("OK {id}\n")
                 );
                 assert_eq!(
@@ -5615,7 +5770,7 @@ fn a_session_carried_on_the_continued_generation_keeps_what_is_below_the_fork() 
                 assert_eq!(
                     cmd_post(
                         &ctx,
-                        &format!("to=@s-peer kind=answer re={off} reply-{off}"),
+                        &format!("to=@t0000100000 kind=answer re={off} reply-{off}"),
                         None
                     ),
                     format!("OK {id}\n")
@@ -5703,15 +5858,15 @@ fn a_verdict_given_after_the_move_owes_its_receipt_below_the_fork() {
             let tell = |line: &str| cmd_link(&store, &format!("log {line}"), Some(generation));
             assert_eq!(tell(&a0), "OK\n", "{case}");
             assert_eq!(
-                deliver(&store, &sid, 3, "s-peer@n-lab", "note", "read"),
+                deliver(&store, &sid, 3, "t0000100000@n-lab", "note", "read"),
                 "OK 1\n"
             );
             assert_eq!(
-                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "below"),
+                deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "below"),
                 "OK 2\n"
             );
             assert_eq!(
-                deliver(&store, &sid, 40, "s-peer@n-lab", "ask", "above"),
+                deliver(&store, &sid, 40, "t0000100000@n-lab", "ask", "above"),
                 "OK 3\n"
             );
             assert_eq!(cmd_inbox_seen(&ctx, "1"), "OK seen=1\n");
@@ -5746,13 +5901,13 @@ fn a_verdict_given_after_the_move_owes_its_receipt_below_the_fork() {
             let earlier = cmd_outbox(&store, "earlier-receipts=1");
             assert!(
                 earlier.contains(
-                    " rid=2 off=40 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    " rid=2 off=40 verdict=handled kind=ask from=t0000100000@n-lab log=earlier\n"
                 ),
                 "{case}: {earlier}"
             );
             assert_eq!(
                 earlier.contains(
-                    " rid=1 off=7 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    " rid=1 off=7 verdict=handled kind=ask from=t0000100000@n-lab log=earlier\n"
                 ),
                 !lineage,
                 "{case}: {earlier}"
@@ -5791,7 +5946,7 @@ fn await_inbox_re_follows_what_the_move_kept() {
             assert_eq!(tell(&a0), "OK\n", "{case}");
             for (id, off) in [(1, 9), (2, 41)] {
                 assert_eq!(
-                    cmd_post(&ctx, &format!("to=@s-peer kind=note at-{off}"), None),
+                    cmd_post(&ctx, &format!("to=@t0000100000 kind=note at-{off}"), None),
                     format!("OK {id}\n")
                 );
                 assert_eq!(
@@ -5802,7 +5957,9 @@ fn await_inbox_re_follows_what_the_move_kept() {
             assert_eq!(
                 cmd_deliver(
                     &store,
-                    &format!("{sid} off=15 from=s-peer@n-lab kind=answer trust=agent re=9 text=r")
+                    &format!(
+                        "{sid} off=15 from=t0000100000@n-lab kind=answer trust=agent re=9 text=r"
+                    )
                 ),
                 "OK 1\n"
             );
@@ -5842,7 +5999,7 @@ fn await_inbox_re_follows_what_the_move_kept() {
                     cmd_deliver(
                         &store,
                         &format!(
-                            "{sid} off=21 from=s-peer@n-lab kind=ack trust=agent re=9 \
+                            "{sid} off=21 from=t0000100000@n-lab kind=ack trust=agent re=9 \
                              verdict=handled text=ack"
                         )
                     ),
@@ -5875,7 +6032,7 @@ fn a_chain_of_moves_keeps_what_is_below_every_fork_however_long() {
             let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
             assert_eq!(tell(a(0)), "OK\n", "{case}");
             assert_eq!(
-                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "seven"),
+                deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "seven"),
                 "OK 1\n"
             );
             for g in 1..=9 {
@@ -5895,20 +6052,20 @@ fn a_chain_of_moves_keeps_what_is_below_every_fork_however_long() {
             );
             assert_eq!(
                 cmd_outbox(&store, "earlier-receipts=1").contains(
-                    " rid=1 off=7 verdict=handled kind=ask from=s-peer@n-lab log=earlier\n"
+                    " rid=1 off=7 verdict=handled kind=ask from=t0000100000@n-lab log=earlier\n"
                 ),
                 !lineage,
                 "{case}"
             );
             assert_eq!(
-                deliver(&store, &sid, 7, "s-peer@n-lab", "ask", "seven"),
+                deliver(&store, &sid, 7, "t0000100000@n-lab", "ask", "seven"),
                 if lineage { "OK 1\n" } else { "OK 2\n" },
                 "{case}"
             );
             if lineage {
                 assert_eq!(
                     cmd_inbox_get(&ctx, "@7"),
-                    "OK 5 off=7 from=s-peer@n-lab kind=ask trust=agent\nseven",
+                    "OK 5 off=7 from=t0000100000@n-lab kind=ask trust=agent\nseven",
                     "{case}"
                 );
             }
@@ -5922,7 +6079,7 @@ fn a_chain_of_moves_keeps_what_is_below_every_fork_however_long() {
         let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
         assert_eq!(tell(format!("{}.0", "bb".repeat(16))), "OK\n");
         assert_eq!(
-            deliver(&store, &sid, 5, "s-peer@n-lab", "note", "b0"),
+            deliver(&store, &sid, 5, "t0000100000@n-lab", "note", "b0"),
             "OK 1\n"
         );
         assert_eq!(tell(a(0)), "OK forgot=1\n", "another log");
@@ -5934,13 +6091,13 @@ fn a_chain_of_moves_keeps_what_is_below_every_fork_however_long() {
             );
         }
         assert_eq!(
-            deliver(&store, &sid, 5, "s-peer@n-lab", "note", "a9"),
+            deliver(&store, &sid, 5, "t0000100000@n-lab", "note", "a9"),
             "OK 2\n",
             "A.9's record at 5 is not B.0's"
         );
         assert_eq!(
             cmd_inbox_get(&ctx, "@5"),
-            "OK 2 off=5 from=s-peer@n-lab kind=note trust=agent\na9"
+            "OK 2 off=5 from=t0000100000@n-lab kind=note trust=agent\na9"
         );
     });
 }
@@ -6012,7 +6169,7 @@ fn a_retired_posts_row_says_the_reason_the_bridge_gave() {
     ]);
     for (id, (reason, why)) in (1u64..).zip(&cases) {
         assert_eq!(
-            cmd_post(&ctx, "to=@s-abc@n-nowhere kind=note x", None),
+            cmd_post(&ctx, "to=@t0000100005@n-nowhere kind=note x", None),
             format!("OK {id}\n")
         );
         assert_eq!(
@@ -6046,7 +6203,7 @@ fn a_retired_posts_row_says_the_reason_the_bridge_gave() {
     }
     let id = cases.len() + 1;
     assert_eq!(
-        cmd_post(&ctx, "to=@s-abc kind=note y", None),
+        cmd_post(&ctx, "to=@t0000100005 kind=note y", None),
         format!("OK {id}\n")
     );
     assert_eq!(
@@ -6067,13 +6224,13 @@ fn outbox_hands_the_bridge_the_body_and_outbox_sent_retires_it() {
     let store = new_store();
     let (sid, ctx) = registered(&store);
     assert_eq!(
-        cmd_post(&ctx, "to=@s-abc kind=note first body", None),
+        cmd_post(&ctx, "to=@t0000100005 kind=note first body", None),
         "OK 1\n"
     );
     assert_eq!(
         cmd_post(
             &ctx,
-            "to=h-andrew kind=answer re=90312 dl=240000 via=s-inner second",
+            "to=h-andrew kind=answer re=90312 dl=240000 via=t0000100009 second",
             None
         ),
         "OK 2\n"
@@ -6081,15 +6238,15 @@ fn outbox_hands_the_bridge_the_body_and_outbox_sent_retires_it() {
     let (_, posts) = parse_outbox(&cmd_outbox(&store, ""));
     assert_eq!(posts.len(), 2, "both queued posts drain");
     assert!(
-        posts[0]
-            .0
-            .starts_with(&format!("post sid={sid} id=1 to=@s-abc kind=note len=")),
+        posts[0].0.starts_with(&format!(
+            "post sid={sid} id=1 to=@t0000100005 kind=note len="
+        )),
         "{:?}",
         posts[0].0
     );
     assert_eq!(posts[0].1, "first body");
     assert_eq!(posts[1].1, "second");
-    for field in ["kind=answer", "re=90312", "dl=240000", "via=s-inner"] {
+    for field in ["kind=answer", "re=90312", "dl=240000", "via=t0000100009"] {
         assert!(posts[1].0.contains(field), "{} lacks {field}", posts[1].0);
     }
 
@@ -6135,7 +6292,7 @@ fn outbox_hands_the_bridge_the_body_and_outbox_sent_retires_it() {
         "ERR no such post\n"
     );
     assert_eq!(
-        cmd_outbox_sent(&store, "s-nope 1 off=1"),
+        cmd_outbox_sent(&store, "t0000100008 1 off=1"),
         "ERR no such session\n"
     );
 }
@@ -6148,7 +6305,7 @@ fn an_outbound_body_may_contain_newlines() {
     assert_eq!(
         cmd_post(
             &ctx,
-            &format!("to=@s-abc kind=note len={}", body.len()),
+            &format!("to=@t0000100005 kind=note len={}", body.len()),
             Some(body.as_bytes().to_vec())
         ),
         "OK 1\n"
@@ -6168,11 +6325,11 @@ fn a_full_outbox_refuses_the_post_instead_of_dropping_one() {
     let (_sid, ctx) = registered(&store);
     for i in 1..=OUTBOX_CAP {
         assert_eq!(
-            cmd_post(&ctx, &format!("to=@s-abc kind=note m{i}"), None),
+            cmd_post(&ctx, &format!("to=@t0000100005 kind=note m{i}"), None),
             format!("OK {i}\n")
         );
     }
-    let refused = cmd_post(&ctx, "to=@s-abc kind=note one-too-many", None);
+    let refused = cmd_post(&ctx, "to=@t0000100005 kind=note one-too-many", None);
     assert!(
         refused.starts_with(&format!("ERR outbox full queued={OUTBOX_CAP} ")),
         "{refused}"
@@ -6196,7 +6353,7 @@ fn a_parked_post_wakes_on_an_undeliverable_verdict() {
         let waiter = {
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                cmd_post(&ctx, "to=@s-abc kind=ask --wait=60000 hello", None)
+                cmd_post(&ctx, "to=@t0000100005 kind=ask --wait=60000 hello", None)
             })
         };
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
@@ -6259,7 +6416,7 @@ fn a_parked_post_learns_the_bridge_died_rather_than_timing_out() {
             std::thread::spawn(move || {
                 cmd_post(
                     &ctx,
-                    "to=@s-peer kind=ask --wait=600000 which branch?",
+                    "to=@t0000100000 kind=ask --wait=600000 which branch?",
                     None,
                 )
             })
@@ -6295,7 +6452,7 @@ fn post_may_not_claim_a_verdict_a_bridge_records_body() {
         assert_eq!(
             cmd_post(
                 &ctx,
-                &format!("to=@s-victim kind={kind} re=90312 nope"),
+                &format!("to=@t0000100010 kind={kind} re=90312 nope"),
                 None
             ),
             POST_USAGE,
@@ -6304,7 +6461,7 @@ fn post_may_not_claim_a_verdict_a_bridge_records_body() {
     }
     for (i, kind) in POSTABLE.iter().enumerate() {
         let id = i + 1;
-        let reply = cmd_post(&ctx, &format!("to=@s-peer kind={kind} hi"), None);
+        let reply = cmd_post(&ctx, &format!("to=@t0000100000 kind={kind} hi"), None);
         let expected = if matches!(*kind, "ask" | "task") {
             format!("ERR fabric absent id={id} no-bridge=1\n")
         } else {
@@ -6705,7 +6862,7 @@ fn one_peer_cannot_mint_extra_quota_by_rotating_the_sid_it_claims() {
     let mut accepted = 0usize;
     let mut refused = 0usize;
     for off in 2..=201u64 {
-        let from = format!("s-rogue{off:04}@n-rogue");
+        let from = format!("tr{off:09}@n-rogue");
         match deliver(&store, &sid, off, &from, "note", "spam").as_str() {
             "ERR quota\n" => refused += 1,
             ok if ok.starts_with("OK ") => accepted += 1,
@@ -6719,7 +6876,7 @@ fn one_peer_cannot_mint_extra_quota_by_rotating_the_sid_it_claims() {
     assert_eq!(refused, 200 - SENDER_QUOTA);
 
     assert!(
-        deliver(&store, &sid, 900, "s-a@n-other", "note", "hello").starts_with("OK "),
+        deliver(&store, &sid, 900, "t0000100001@n-other", "note", "hello").starts_with("OK "),
         "an honest peer must not be charged for the rogue's flood"
     );
     assert!(deliver(&store, &sid, 901, "h-andrew", "note", "hi").starts_with("OK "));
@@ -6727,7 +6884,7 @@ fn one_peer_cannot_mint_extra_quota_by_rotating_the_sid_it_claims() {
     assert!(reply.contains("from=h-andrew kind=task"), "{reply}");
     assert!(reply.contains(" dropped=0 "), "{reply}");
     cmd_inbox(&ctx, "");
-    assert!(deliver(&store, &sid, 902, "s-rogue9999@n-rogue", "note", "again").starts_with("OK "));
+    assert!(deliver(&store, &sid, 902, "tr000009999@n-rogue", "note", "again").starts_with("OK "));
 }
 
 #[test]
@@ -6735,16 +6892,16 @@ fn an_ack_releases_the_senders_quota() {
     let store = new_store();
     let (sid, ctx) = registered(&store);
     for off in 1..=SENDER_QUOTA as u64 {
-        assert!(deliver(&store, &sid, off, "s-p@n-peer", "note", "x").starts_with("OK "));
+        assert!(deliver(&store, &sid, off, "t0000100002@n-peer", "note", "x").starts_with("OK "));
     }
     assert_eq!(
-        deliver(&store, &sid, 100, "s-p@n-peer", "note", "x"),
+        deliver(&store, &sid, 100, "t0000100002@n-peer", "note", "x"),
         "ERR quota\n",
         "the quota is full"
     );
     cmd_inbox(&ctx, "--peek");
     assert_eq!(
-        deliver(&store, &sid, 101, "s-p@n-peer", "note", "x"),
+        deliver(&store, &sid, 101, "t0000100002@n-peer", "note", "x"),
         "ERR quota\n",
         "`--peek` must not relieve the quota"
     );
@@ -6753,7 +6910,7 @@ fn an_ack_releases_the_senders_quota() {
         format!("OK seen={SENDER_QUOTA}\n")
     );
     assert!(
-        deliver(&store, &sid, 102, "s-p@n-peer", "note", "x").starts_with("OK "),
+        deliver(&store, &sid, 102, "t0000100002@n-peer", "note", "x").starts_with("OK "),
         "an acknowledged row must stop counting against its sender"
     );
     let _ = sid;
@@ -6766,7 +6923,9 @@ fn a_bridge_truncated_body_says_so_in_the_row_and_in_inbox_get() {
     assert_eq!(
         cmd_deliver(
             &store,
-            &format!("{sid} off=1 from=s-a@n-b kind=report trust=agent len=200000 text=cut")
+            &format!(
+                "{sid} off=1 from=t0000100001@n-b kind=report trust=agent len=200000 text=cut"
+            )
         ),
         "OK 1\n"
     );
@@ -6789,7 +6948,7 @@ fn a_bridge_truncated_body_says_so_in_the_row_and_in_inbox_get() {
     assert_eq!(
         cmd_deliver(
             &store,
-            &format!("{sid} off=2 from=s-a@n-b kind=report trust=agent text=whole")
+            &format!("{sid} off=2 from=t0000100001@n-b kind=report trust=agent text=whole")
         ),
         "OK 2\n"
     );
@@ -6805,13 +6964,17 @@ fn a_post_refused_for_want_of_a_link_says_it_is_still_queued() {
         let (_sid, ctx) = registered(&store);
 
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=ask --wait=0 no fabric?", None),
+            cmd_post(&ctx, "to=@t0000100000 kind=ask --wait=0 no fabric?", None),
             "ERR fabric absent id=1 no-bridge=1\n"
         );
 
         note_bridge_supervised();
         assert_eq!(
-            cmd_post(&ctx, "to=@s-peer kind=ask --wait=0 which branch?", None),
+            cmd_post(
+                &ctx,
+                "to=@t0000100000 kind=ask --wait=0 which branch?",
+                None
+            ),
             "ERR fabric absent id=2 queued=1\n"
         );
 
@@ -6829,7 +6992,7 @@ fn one_outbox_drain_is_bounded_in_bytes_across_every_session() {
         let (_sid, ctx) = registered_as(&store, local);
         for _ in 0..(OUTBOX_BYTES_MAX / BODY_MAX) {
             assert!(
-                cmd_post(&ctx, "to=@s-peer kind=note", Some(body.clone())).starts_with("OK "),
+                cmd_post(&ctx, "to=@t0000100000 kind=note", Some(body.clone())).starts_with("OK "),
                 "the per-session queue takes its own {OUTBOX_BYTES_MAX} bytes"
             );
         }
@@ -6865,9 +7028,11 @@ fn a_walk_stopped_at_the_budget_with_nothing_left_says_no_more() {
     let (_a, ctx_a) = registered_as(&store, 1);
     let (_b, ctx_b) = registered_as(&store, 2);
     for _ in 1..budget {
-        assert!(cmd_post(&ctx_a, "to=@s-peer kind=note", Some(body.clone())).starts_with("OK "));
+        assert!(
+            cmd_post(&ctx_a, "to=@t0000100000 kind=note", Some(body.clone())).starts_with("OK ")
+        );
     }
-    assert!(cmd_post(&ctx_b, "to=@s-peer kind=note", Some(body.clone())).starts_with("OK "));
+    assert!(cmd_post(&ctx_b, "to=@t0000100000 kind=note", Some(body.clone())).starts_with("OK "));
     let whole = cmd_outbox(&store, "");
     let (_, posts) = parse_outbox(&whole);
     assert_eq!(posts.len(), budget);
@@ -6889,7 +7054,7 @@ fn a_full_queue_ahead_in_drain_order_does_not_hide_a_later_sessions_post() {
     let (sid_a, ctx_a) = registered_as(&store, 1);
     for _ in 0..(OUTBOX_BYTES_MAX / BODY_MAX) {
         assert!(
-            cmd_post(&ctx_a, "to=@s-peer kind=note", Some(body.clone())).starts_with("OK "),
+            cmd_post(&ctx_a, "to=@t0000100000 kind=note", Some(body.clone())).starts_with("OK "),
             "A's queue takes its own {OUTBOX_BYTES_MAX} bytes"
         );
     }
@@ -7035,4 +7200,38 @@ fn wire_parsers_reject_leading_plus_signs_on_unsigned_fields() {
             );
         }
     });
+}
+
+/// A tab's mail is an agent's in either tab-ID form, bare or as `<sid>@<node>`, so `from=agent`
+/// shows a `t` tab's mail as it does an `s-` tab's; a malformed `t` ID is no session's.
+#[test]
+fn mail_from_a_tab_is_an_agents_in_either_form() {
+    for from in [
+        "s-0123456789abcdef0123",
+        "s-0123456789abcdef0123@n-x",
+        "tqn5r6e0148",
+        "tqn5r6e0148@n-x",
+    ] {
+        assert_eq!(sender_class(from), "agent", "{from}");
+    }
+    for malformed in ["tqn5r6e014i", "tqn5r6e014i@n-x", "tqn5r6e01@n-x"] {
+        assert_eq!(sender_class(malformed), "other", "{malformed}");
+    }
+    let store = new_store();
+    let (sid, ctx) = registered(&store);
+    assert!(
+        deliver(&store, &sid, 100, "s-0123456789abcdef0123@n-x", "note", "a").starts_with("OK")
+    );
+    assert!(deliver(&store, &sid, 101, "tqn5r6e0148@n-x", "note", "b").starts_with("OK"));
+    let agent = MailFilter {
+        kinds: Vec::new(),
+        from: Some("agent".to_string()),
+        topic: None,
+    };
+    let shown = ctx.fabric.mail_since(0, &agent).rows;
+    assert_eq!(
+        shown.iter().map(|r| r.id).collect::<Vec<_>>(),
+        [1, 2],
+        "{shown:?}"
+    );
 }

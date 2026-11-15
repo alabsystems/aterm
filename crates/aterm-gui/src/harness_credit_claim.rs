@@ -52,9 +52,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::credit_offers::{self, Offer, OfferId, OfferKey, Stamp};
 use aterm_agent::harness::profile::NoProfile;
-use aterm_agent::supervise::Autopilot;
 
 use crate::task_record::{TaskRecord, TaskState};
 
@@ -613,6 +613,7 @@ pub(crate) fn claim_order(offer: &Offer, folder: Option<&Path>) -> crate::task_l
         task: credit_offers::claim_task(offer).into_bytes(),
         agent: aterm_phase::Program::Claude,
         model: None,
+        effort: None,
         caller: None,
         manager_node: None,
         trusted_cwd: folder

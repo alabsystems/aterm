@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-pub use crate::fleet_member::prove_discovery_address;
+pub use crate::fleet_member::{prove_discovery_address, prove_fleet_route};
 
 /// The launchd label and systemd user unit stem for the fleet/swarm node job.
 pub const NODE_LABEL: &str = "systems.alab.aterm-node";
@@ -90,11 +90,11 @@ impl DiscoveryPolicy {
     }
 }
 
-/// The node job's single browse, with an address-only cache keyed by proven node id.
-/// The job lock is held before this service starts; windows and CLI processes never start it.
+/// The node job's proven route cache. The current protocol feeds it from the existing browse;
+/// mesh policy decides only whether this object starts and owns the browse itself.
 pub struct MeshDiscovery {
     /// Captured release policy, independently configurable in tests.
-    pub mesh: bool,
+    mesh_browse: bool,
     watch: Option<std::sync::Arc<aterm_secrets::discover::Watch>>,
     bell: std::sync::Arc<aterm_secrets::wake::Bell>,
     addresses: std::collections::BTreeMap<String, std::net::SocketAddr>,
@@ -115,7 +115,7 @@ impl MeshDiscovery {
     #[must_use]
     pub fn new(mesh: bool) -> Self {
         Self {
-            mesh,
+            mesh_browse: mesh,
             watch: None,
             bell: std::sync::Arc::new(aterm_secrets::wake::Bell::default()),
             addresses: std::collections::BTreeMap::new(),
@@ -127,9 +127,7 @@ impl MeshDiscovery {
     /// Keep last-known addresses across a node restart, including sleeping members' hints.
     /// These are authenticated again when dialled, like newly resolved mDNS hints.
     pub fn restore(&mut self, state: &Path) {
-        if self.mesh {
-            self.addresses.extend(mesh_addresses(state));
-        }
+        self.addresses.extend(mesh_addresses(state));
     }
 
     /// Start at most one browse for this service.
@@ -152,7 +150,7 @@ impl MeshDiscovery {
             &[&str],
         ) -> aterm_secrets::discover::Watch,
     ) -> Option<std::sync::Arc<aterm_secrets::discover::Watch>> {
-        if !self.mesh {
+        if !self.mesh_browse {
             return None;
         }
         Some(std::sync::Arc::clone(self.watch.get_or_insert_with(|| {
@@ -170,7 +168,7 @@ impl MeshDiscovery {
             &aterm_secrets::discover::Advert,
         ) -> Option<(String, std::net::SocketAddr)>,
     ) -> bool {
-        if !self.mesh || self.next.is_some_and(|next| now < next) {
+        if self.next.is_some_and(|next| now < next) {
             return false;
         }
         self.next = Some(now + DISCOVERY_PERIOD);

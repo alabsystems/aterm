@@ -314,9 +314,10 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         self.relaunch_owed()
     }
     /// Whether the foreground agent in the tab resumes a conversation, aterm's relaunch or its own
-    /// arguments ([`AgentResumed`]), `None` when no foreground agent snapshot is read.
-    fn agent_resumed(&self) -> Option<AgentResumed> {
-        None
+    /// arguments ([`AgentResumed`]): [`HostAgent::Absent`] when the read found no foreground agent
+    /// snapshot, [`HostAgent::Unread`] when the read did not answer within its bound.
+    fn agent_resumed(&self) -> HostAgent {
+        HostAgent::Absent
     }
     fn agent_conversation(&self) -> Option<String> {
         None
@@ -349,16 +350,22 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         Some(crate::harness::leftover::LeftRead::NotAsked)
     }
     /// HOW THE CREDENTIAL `wants` THE TURN NAMED RESOLVE
-    /// ([`crate::supervise::policy::credential_need::CredentialRead`]): the registry entries that
+    /// ([`alab_policy::credential_need::CredentialRead`]): the registry entries that
     /// hold each, value-free, else `aterm secrets need` filed for it. Asked only where the turn
     /// names a credential line, and `None` while the host works, as [`Self::leftover`]'s is. A
     /// host that resolves none was not asked.
     fn credentials(
         &self,
         wants: Vec<String>,
-    ) -> Option<crate::supervise::policy::credential_need::CredentialRead> {
+    ) -> Option<alab_policy::credential_need::CredentialRead> {
         drop(wants);
-        Some(crate::supervise::policy::credential_need::CredentialRead::NotAsked)
+        Some(alab_policy::credential_need::CredentialRead::NotAsked)
+    }
+    /// THE SESSION'S GOAL AS ITS CLAUDE CODE TRANSCRIPT READS IT
+    /// ([`crate::harness::goal::GoalRead`]): asked at each point the loop decides under Cruise or
+    /// Land for Claude Code, and nowhere else. A host that reads no transcript reads nothing.
+    fn goal(&self) -> crate::harness::goal::GoalRead {
+        crate::harness::goal::GoalRead::Unread
     }
     fn lifted_off(&self) -> bool {
         false
@@ -696,6 +703,17 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// state, and answers nothing.
     fn login_seen(&self, seen: crate::supervise::policy::turn_end::LoginSeen) {
         let _ = seen;
+    }
+
+    /// The session's own Claude Code login served a turn that worked to a break of its own
+    /// background work, dated `at` (unix seconds) by the model's reply that ended it in the
+    /// transcript ([`super::Session::break_login`]): a break reaches no point, and is told only
+    /// once settled, a while after that reply, so the reply's own time dates the evidence and a
+    /// strike recorded between the two is none it speaks for. The host records it on the
+    /// account the process runs on as [`Self::login_seen`]'s served, once per turn, and answers
+    /// nothing.
+    fn login_served_at(&self, at: i64) {
+        let _ = at;
     }
 
     fn account_answered(&self, bad: AccountBad) {

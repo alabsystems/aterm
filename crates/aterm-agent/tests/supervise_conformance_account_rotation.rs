@@ -13,21 +13,21 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use alab_policy::config::TurnEndTiming;
+use alab_policy::vocab::{Phase, WallKind};
+use alab_policy::words::RULE_CONTINUE;
 use aterm_agent::harness::accounts::{
     self, Advice, Canary, Class, Condition, Lost, Me, Mode, Mover, Point, Roster, Row, Sample,
     StayWhy, Strike,
 };
 use aterm_agent::harness::relaunch;
 use aterm_agent::supervise::SupervisorConfig;
-use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
     ACCOUNT_MOVES_PER_WINDOW, AccountAdvice, AccountAnswer, AccountAt, AccountBad, AccountMove,
-    AccountPoint, Cleared, Clearing, Composer, RULE_ACCOUNT, RULE_CONTINUE, RULE_LIMIT_RESUME,
-    Restart, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, cleared_text,
-    decide_turn_end,
+    AccountPoint, Cleared, Clearing, Composer, RULE_ACCOUNT, RULE_LIMIT_RESUME, Restart,
+    TurnEndAction, TurnEndReading, TurnEndState, cleared_text, decide_turn_end,
 };
 use aterm_models_harness::supervisor_account_rotation_model;
-use aterm_phase::WallKind;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::Resolved;
 
@@ -794,7 +794,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         seat: Default::default(),
         account: None,
         route: None,
-        autopilot: aterm_agent::supervise::Autopilot::Cruise,
+        autopilot: alab_policy::config::Autopilot::Cruise,
         login_label: None,
         autopilot_by_person: false,
         login_superseded: false,
@@ -817,7 +817,8 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
-        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: aterm_agent::harness::goal::GoalRead::Unread,
         fact: None,
         wake: None,
     }

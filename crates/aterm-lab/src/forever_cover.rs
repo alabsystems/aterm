@@ -105,7 +105,7 @@ fn said_before(said: &str, v: Verdict) -> Verdict {
 /// sequence identity and each record stream's append order join its reply, point and act.
 /// An earlier instruction, ambiguous act or real back-off takes the ordinary path.
 fn first_land_at_point(seen: &Seen, tt: i64, point: &(i64, String), act: &(i64, String)) -> bool {
-    if act_rule(&act.1) != Some(turn_end::RULE_LAND) {
+    if act_rule(&act.1) != Some(alab_policy::words::RULE_LAND) {
         return false;
     }
     let Some(seq) = word(&point.1, "seq").and_then(|seq| seq.parse::<u64>().ok()) else {
@@ -115,7 +115,7 @@ fn first_land_at_point(seen: &Seen, tt: i64, point: &(i64, String), act: &(i64, 
         return false;
     }
     let mut acts = seen.journal.iter().enumerate().filter(|(_, (_, line))| {
-        act_rule(line) == Some(turn_end::RULE_LAND)
+        act_rule(line) == Some(alab_policy::words::RULE_LAND)
             && word(line, "seq").and_then(|seq| seq.parse::<u64>().ok()) == Some(seq)
     });
     let Some((act_index, recorded)) = acts.next() else {
@@ -130,7 +130,8 @@ fn first_land_at_point(seen: &Seen, tt: i64, point: &(i64, String), act: &(i64, 
     if point_index >= act_index {
         return false;
     }
-    let typed_land = |row: &Row| row.rule == turn_end::RULE_LAND && row.decision == "typed";
+    let typed_land =
+        |row: &Row| row.rule == alab_policy::words::RULE_LAND && row.decision == "typed";
     let mut typed = seen
         .ledger
         .iter()
@@ -144,7 +145,7 @@ fn first_land_at_point(seen: &Seen, tt: i64, point: &(i64, String), act: &(i64, 
     }
     let prior_land = seen.journal[..act_index]
         .iter()
-        .any(|(_, line)| act_rule(line) == Some(turn_end::RULE_LAND))
+        .any(|(_, line)| act_rule(line) == Some(alab_policy::words::RULE_LAND))
         || seen.ledger[..typed_index].iter().any(typed_land);
     let backoff = seen.journal[point_index..act_index]
         .iter()
@@ -247,7 +248,11 @@ fn judged_resumption<'a>(
 
 /// Judges L12: a question in prose at the land act's yield.
 pub(super) fn judge_answer(seen: &Seen, t0: i64) -> Verdict {
-    let Some(t1) = seen.acts(turn_end::RULE_LAND).first().map(|(t, _)| *t) else {
+    let Some(t1) = seen
+        .acts(alab_policy::words::RULE_LAND)
+        .first()
+        .map(|(t, _)| *t)
+    else {
         return Verdict::Fail(format!("no land@v1 typed within {}", at(t0, seen.end_ms)));
     };
     let acts = seen.all_acts();
@@ -302,7 +307,7 @@ pub(super) fn judge_answer(seen: &Seen, t0: i64) -> Verdict {
         });
     };
     let rule = act_rule(&act.1).unwrap_or("?");
-    if rule != turn_end::RULE_LAND_ANSWER {
+    if rule != alab_policy::words::RULE_LAND_ANSWER {
         return Verdict::Fail(format!(
             "the question at land@v1's yield got {rule} at +{}, not land-answer@v1: {}",
             at(t0, act.0),
@@ -315,13 +320,13 @@ pub(super) fn judge_answer(seen: &Seen, t0: i64) -> Verdict {
             at(t0, act.0)
         ));
     };
-    let Some(row) = seen.typed_row(turn_end::RULE_LAND_ANSWER, act.0) else {
+    let Some(row) = seen.typed_row(alab_policy::words::RULE_LAND_ANSWER, act.0) else {
         return Verdict::Fail(format!(
             "land-answer@v1 journaled at +{}, but NO ledger row typed",
             at(t0, act.0)
         ));
     };
-    if !row.command.starts_with(turn_end::LAND_ANSWER) {
+    if !row.command.starts_with(alab_policy::words::LAND_ANSWER) {
         return Verdict::Fail(format!(
             "the answer at +{} is not Land's answer: {}",
             at(t0, act.0),
@@ -362,7 +367,8 @@ pub(super) fn judge_answer(seen: &Seen, t0: i64) -> Verdict {
         .copied()
         .filter(|(t, _)| *t > act.0 && *t < done.0)
         .collect();
-    let checked = between.len() == 1 && act_rule(&between[0].1) == Some(turn_end::RULE_LAND_CHECK);
+    let checked = between.len() == 1
+        && act_rule(&between[0].1) == Some(alab_policy::land_check::RULE_LAND_CHECK);
     if let Some((tb, lb)) = between.iter().copied().find(|_| !checked) {
         return Verdict::Fail(format!(
             "{said}; but {} typed at +{} before the landing: the answer's yield got {} act(s), not the one land check",
@@ -408,7 +414,7 @@ pub(super) fn judge_theirs(seen: &Seen, t0: i64) -> Verdict {
     let typed = format!("typed through {path}");
     let until = seen.cover.turn_ms.unwrap_or(seen.end_ms);
     let inside = |t: i64| t > p && t < until;
-    let left_rule = format!("rule={}", turn_end::RULE_LEFT);
+    let left_rule = format!("rule={}", alab_policy::words::RULE_LEFT);
     let left = seen
         .journal
         .iter()
@@ -644,7 +650,7 @@ pub(super) fn judge_wrote_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: 
         }
     };
     if let Some((t, l)) = first
-        && act_rule(l) != Some(turn_end::RULE_DONE_CHECK)
+        && act_rule(l) != Some(alab_policy::words::RULE_DONE_CHECK)
     {
         return Verdict::Fail(format!(
             "the done claim got {} at +{}, not the done check",
@@ -672,7 +678,11 @@ pub(super) fn judge_owner_continuation(
     done: Option<&(i64, String)>,
     t0: i64,
 ) -> Verdict {
-    let Some(act) = seen.acts(turn_end::RULE_CONTINUE).first().copied() else {
+    let Some(act) = seen
+        .acts(alab_policy::words::RULE_CONTINUE)
+        .first()
+        .copied()
+    else {
         return match lost_after(seen, t0, t0) {
             Some(lost) => Verdict::Fail(format!("no continuation was typed: {lost}")),
             None => Verdict::Unobserved(format!(
@@ -681,7 +691,7 @@ pub(super) fn judge_owner_continuation(
             )),
         };
     };
-    let typed = seen.act_text(turn_end::RULE_CONTINUE, act);
+    let typed = seen.act_text(alab_policy::words::RULE_CONTINUE, act);
     let mut bad = Vec::new();
     if !(typed.contains(OWNER_KEY) && typed.contains(OWNER_TAIL)) {
         bad.push(format!(
@@ -1189,7 +1199,9 @@ pub(super) fn judge_wall(
     // A land check past the lift answers the program's own continuation's defense, read on a
     // screen without the wall (§14.17 item 5): no act into the wall.
     let in_wall = |t: i64, rule: &str| {
-        t > t1 + AT_DONE_MS && t < reset && !(rule == turn_end::RULE_LAND_CHECK && t >= lift)
+        t > t1 + AT_DONE_MS
+            && t < reset
+            && !(rule == alab_policy::land_check::RULE_LAND_CHECK && t >= lift)
     };
     let acts = seen.all_acts();
     let typed_in: Vec<&(i64, String)> = acts
@@ -1325,10 +1337,9 @@ pub(super) fn judge_wall(
     let went_on = seen.cover.went_on_ms;
     // The land check is typed only at a land act's yield with a defense, never at a wall: the
     // program's own continuation's defense gets it, which is no act on top of that continuation.
-    let first_act = acts
-        .iter()
-        .copied()
-        .find(|(t, l)| *t >= reset && act_rule(l) != Some(turn_end::RULE_LAND_CHECK));
+    let first_act = acts.iter().copied().find(|(t, l)| {
+        *t >= reset && act_rule(l) != Some(alab_policy::land_check::RULE_LAND_CHECK)
+    });
     let resumed = match first_act {
         Some((ta, la)) => {
             if *ta > lost_at {
@@ -1524,7 +1535,7 @@ fn hidden_facts(
     let Some((ta, la)) = seen
         .all_acts()
         .into_iter()
-        .find(|(t, l)| *t >= reset && act_rule(l) != Some(turn_end::RULE_LAND_CHECK))
+        .find(|(t, l)| *t >= reset && act_rule(l) != Some(alab_policy::land_check::RULE_LAND_CHECK))
         .map(|(t, l)| (*t, l.as_str()))
     else {
         return (
@@ -2167,7 +2178,7 @@ pub(super) fn judge_dialog(seen: &Seen, land: bool, t0: i64) -> Verdict {
     if !land {
         return Verdict::Pass(said);
     }
-    let land_act = seen.acts(turn_end::RULE_LAND).first().copied();
+    let land_act = seen.acts(alab_policy::words::RULE_LAND).first().copied();
     compose(
         &said,
         &[("landed", judge_clean_landing(seen, land_act, t0))],

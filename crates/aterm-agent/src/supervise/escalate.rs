@@ -435,7 +435,7 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let _duty = self.metadata_duty_guard(self.attention_scope());
-        self.metadata_global = opts.policy.autopilot;
+        self.metadata_global = opts.policy.turn_end.autopilot;
         self.arm_attention_retry();
         match self.metadata_authority(false) {
             Ok(claim::MetadataAuthority::Ours) => {}
@@ -584,7 +584,7 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let _duty = self.metadata_duty_guard(Scope::TurnEnd);
-        self.metadata_global = opts.policy.autopilot;
+        self.metadata_global = opts.policy.turn_end.autopilot;
         // A refused or lost policy read also waits before another attempt.
         self.arm_needs_retry();
         match self.metadata_authority(false) {
@@ -827,13 +827,14 @@ pub(super) fn kinds_name_owner(kinds: &str, owner: &str) -> bool {
         .any(|entry| entry.split_once(':').is_some_and(|(_, o)| o == owner))
 }
 
-/// The needs entry's text: the first need and a count of the rest, then what the harness does
-/// beside them (`tail`), within [`ATTENTION_BYTES`].
-pub(super) fn needs_attention_text(program: &str, needs: &[String], tail: NeedTail) -> String {
-    let first = needs.first().map_or("", String::as_str);
-    let more = match needs.len() {
-        0 | 1 => String::new(),
-        n => format!(" (+{} more)", n - 1),
+/// The needs entry's text: the `first` need and a count of the `more` behind it, then what the
+/// harness does beside them (`tail`), within the keyed attention cap. aterm writes it for its own
+/// loop and for a self-claim's set it took credential lines off (`meta set harness_needs`).
+#[must_use]
+pub fn needs_attention_text(program: &str, first: &str, more: usize, tail: NeedTail) -> String {
+    let more = match more {
+        0 => String::new(),
+        n => format!(" (+{n} more)"),
     };
     let head = format!("{program} needs you: ");
     let tail = format!("{more} \u{2014} {}", tail.words());
@@ -894,7 +895,7 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let _duty = self.metadata_duty_guard(Scope::TurnEnd);
-        self.metadata_global = cfg.autopilot;
+        self.metadata_global = cfg.turn_end.autopilot;
         if self.needs_not_ours() {
             return self.needs_down(
                 screen.seq,
@@ -924,7 +925,8 @@ impl<C: Ctl> Session<'_, C> {
         }
         let needs = self.turn_end.shown_needs().to_vec();
         let program = self.reader(&screen.rows).program().name();
-        let mut text = needs_attention_text(program, &needs, tail);
+        let first = needs.first().map_or("", String::as_str);
+        let mut text = needs_attention_text(program, first, needs.len().saturating_sub(1), tail);
         let owner = format!("owner={NEEDS_ATTENTION_OWNER}");
         let kind = format!("kind={}", aterm_types::needs::AttentionKind::Ask.word());
         self.arm_needs_retry();

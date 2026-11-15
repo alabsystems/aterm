@@ -662,6 +662,15 @@ mod macos {
                     return Ok(());
                 }
             };
+            // Long OS observations exercise scrolling independently of bounded draft refusals.
+            let scrolling = NamingCase {
+                values: [
+                    Some("Observed computer name ".repeat(128)),
+                    synchronized.values[1].clone(),
+                    synchronized.values[2].clone(),
+                ],
+                ..synchronized.clone()
+            };
             assert_eq!(
                 preview.name().class,
                 Class::Seeded,
@@ -680,6 +689,8 @@ mod macos {
             };
             let w = || word.clone();
             let s = |text: &str| text.to_owned();
+            let scroll_number = "not a number ".repeat(128);
+            let scroll_word = s("研究室研究室研究室研究室研究室研究室研究室");
             let typed = |text: &str| Some(text.to_owned());
             let rename = |number: Option<String>, nick: Option<String>, requested| Answer::Rename {
                 number,
@@ -912,7 +923,7 @@ mod macos {
                 (
                     "fleet discovery preserves typed fields and focus",
                     &named_preview,
-                    Some(&synchronized),
+                    Some(&scrolling),
                     "Save",
                     view("m85", named_preview.name().nick.as_str()),
                     (None, None),
@@ -931,13 +942,17 @@ mod macos {
                         Step::Status("discovery unavailable"),
                         Step::Fields(s("86"), s("Blue Heron")),
                         Step::Editing(1),
-                        Step::Type(1, s("研究室研究室研究室研究室研究室研究室研究室")),
-                        Step::Type(0, "not a number ".repeat(128)),
+                        Step::Type(1, scroll_word.clone()),
+                        Step::Type(0, scroll_number.clone()),
                         Step::ScrollStatus(32.0),
                         Step::Discover(Ok(true)),
                         Step::StatusOffset(32.0),
+                        Step::Fields(scroll_number.clone(), scroll_word.clone()),
+                        Step::Editing(0),
                         Step::Diagnostics(Ok(())),
                         Step::StatusOffset(32.0),
+                        Step::Fields(scroll_number, scroll_word),
+                        Step::Editing(0),
                         Step::Keys(&[ESCAPE]),
                     ],
                     Answer::Cancel,

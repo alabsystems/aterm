@@ -53,8 +53,8 @@ impl Fixture {
             self.paths.identity_file(),
             self.paths.lock_file(),
             self.source.clone(),
-            materialize::target_path(&self.paths.home, "token").unwrap(),
-            materialize::target_path(&self.paths.home, "other").unwrap(),
+            old_path(&self.paths.home, "token"),
+            old_path(&self.paths.home, "other"),
         ]
     }
 
@@ -64,6 +64,23 @@ impl Fixture {
             .map(|p| std::fs::read(p).ok())
             .collect()
     }
+}
+
+/// Where an older build wrote `name` under `home`: `~/<path>` for a home path, else
+/// `~/.secrets/<name>`. A file there is the person's or that build's; no read consults it.
+fn old_path(home: &Path, name: &str) -> PathBuf {
+    match name.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => home.join(".secrets").join(name),
+    }
+}
+
+/// Write `bytes` at `name`'s [`old_path`], as a person or an older build left it.
+fn plant(home: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let path = old_path(home, name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fsx::write_atomic(&path, bytes, 0o600).unwrap();
+    path
 }
 
 fn set_state(paths: &Paths, change: impl FnOnce(&mut State)) {
@@ -131,9 +148,7 @@ fn authenticated_local_default_policy_preserves_always_managed_and_anchor_bounda
 fn public_roster_reads_current_pair_without_adopting_stale_files() {
     let f = Fixture::new();
     for name in PUBLIC_ROSTER_NAMES {
-        let path = materialize::target_path(&f.paths.home, name).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fsx::write_atomic(&path, b"personal old pair", 0o600).unwrap();
+        plant(&f.paths.home, name, b"personal old pair");
     }
     let signature = [7; 64];
     publish_public_pair(&f, b"new public roster including a revocation", &signature);
@@ -142,16 +157,21 @@ fn public_roster_reads_current_pair_without_adopting_stale_files() {
     assert!(
         PUBLIC_ROSTER_NAMES
             .iter()
-            .all(|name| !state.manifest.files.contains_key(*name))
+            .all(|name| !state.legacy_manifest.contains_key(*name))
     );
-    assert!(
+    // An ordinary read of the complete pair's roster reads the vault in place, not the person's
+    // old file at its path.
+    assert_eq!(
         read_verified_entry(
             &f.paths,
             &config(&f.paths).unwrap().unwrap(),
             PUBLIC_ROSTER_NAMES[0]
         )
         .unwrap()
-        .is_none()
+        .unwrap()
+        .value()
+        .as_slice(),
+        b"new public roster including a revocation"
     );
     let PublicRosterRead::Pair(pair) = current_public_roster(&f.paths).unwrap() else {
         panic!("current public pair unavailable");
@@ -161,7 +181,7 @@ fn public_roster_reads_current_pair_without_adopting_stale_files() {
     assert_eq!(f.bytes(), before, "observation changes no vault state");
     for name in PUBLIC_ROSTER_NAMES {
         assert_eq!(
-            std::fs::read(materialize::target_path(&f.paths.home, name).unwrap()).unwrap(),
+            std::fs::read(old_path(&f.paths.home, name)).unwrap(),
             b"personal old pair"
         );
     }
@@ -211,9 +231,7 @@ fn public_roster_absence_is_authenticated_and_partial_pairs_are_errors() {
 
 #[test]
 fn public_roster_refuses_unavailable_or_noncanonical_source() {
-    for fault in [
-        "busy", "pending", "failed", "revoked", "denied", "source", "audience",
-    ] {
+    for fault in ["busy", "failed", "revoked", "denied", "source", "audience"] {
         let f = Fixture::new();
         publish_public_pair(&f, b"public body", &[8; 64]);
         assert!(matches!(
@@ -222,12 +240,6 @@ fn public_roster_refuses_unavailable_or_noncanonical_source() {
         ));
         let guard = match fault {
             "busy" => Some(StateLock::take(&f.paths).unwrap()),
-            "pending" => {
-                set_state(&f.paths, |s| {
-                    s.pending.insert("token".into(), "pending".into());
-                });
-                None
-            }
             "failed" => {
                 set_state(&f.paths, |s| s.failed = true);
                 None
@@ -402,17 +414,19 @@ fn mailbox_component_index_is_bound_to_verified_source_and_exact_fields() {
         "authorized unchanged sync backfills the index"
     );
     assert!(mailbox_component_held(&f.paths, password).unwrap());
-    let source = materialize::target_path(&f.paths.home, SOURCE_ENTRY).unwrap();
-    std::fs::write(
-        &source,
+    // A file at the source's old path is no source: the index and the read follow the vault.
+    plant(
+        &f.paths.home,
+        SOURCE_ENTRY,
         b"user = 'owner@example'\npassword = 'untrusted-change'\n",
-    )
-    .unwrap();
-    assert!(!mailbox_component_held(&f.paths, password).unwrap());
-    assert!(
+    );
+    assert!(mailbox_component_held(&f.paths, password).unwrap());
+    assert_eq!(
         read_mailbox_component(&f.paths, password)
             .unwrap()
-            .is_none()
+            .unwrap()
+            .as_slice(),
+        b"fixture-login"
     );
 }
 
@@ -495,75 +509,6 @@ fn mailbox_component_index_excludes_ambiguous_fields_and_stale_versions() {
     );
 }
 
-/// NEGATIVE CONTROL: without checking private mode, parent directory links, and `file_stamp` in
-/// `read_mailbox_component`, a `0644` or symlink-parented `ai-mailbox.toml` still reports held
-/// components, and a hard-linked `ai-mailbox.toml` (`nlink == 2`) opens the vault and discloses
-/// the secret component from `read_mailbox_component`.
-#[test]
-fn mailbox_component_index_refuses_hardlinked_exposed_or_symlink_parented_source_without_vault_reads()
- {
-    use crate::mailbox_component::{Component, Part, SOURCE_ENTRY};
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let f = Fixture::new();
-    let password =
-        Component::for_mailbox("https://mail.example/", "owner@example", Part::Password).unwrap();
-    f.publish(|doc| {
-        doc.set_entry(
-            &Audience::Everyone,
-            SOURCE_ENTRY,
-            b"user = 'owner@example'\nwebmail_url = 'https://mail.example/'\npassword = 'fixture-login'\n",
-        )
-        .unwrap();
-    });
-    assert!(mailbox_component_held(&f.paths, password).unwrap());
-    let source = materialize::target_path(&f.paths.home, SOURCE_ENTRY).unwrap();
-
-    // 1. Hard-linked `ai-mailbox.toml` (`nlink == 2`) must neither claim custody nor open vault plaintext.
-    let hardlink = f.paths.home.join("linked-mailbox.toml");
-    std::fs::hard_link(&source, &hardlink).unwrap();
-    let reads = MAILBOX_READS.with(std::cell::Cell::get);
-    assert!(!mailbox_component_held(&f.paths, password).unwrap());
-    assert!(
-        read_mailbox_component(&f.paths, password)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(reads, MAILBOX_READS.with(std::cell::Cell::get));
-    std::fs::remove_file(&hardlink).unwrap();
-    assert!(refresh_mailbox_component_index(&f.paths).unwrap());
-    assert!(mailbox_component_held(&f.paths, password).unwrap());
-
-    // 2. Group/world-readable `ai-mailbox.toml` (`0644`) must neither claim custody nor open vault plaintext.
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let reads = MAILBOX_READS.with(std::cell::Cell::get);
-    assert!(!mailbox_component_held(&f.paths, password).unwrap());
-    assert!(
-        read_mailbox_component(&f.paths, password)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(reads, MAILBOX_READS.with(std::cell::Cell::get));
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(refresh_mailbox_component_index(&f.paths).unwrap());
-    assert!(mailbox_component_held(&f.paths, password).unwrap());
-
-    // 3. Replacing `.secrets` with a symlink to a moved directory preserves the child inode's
-    // `dev:ino:len:mtime:ctime`, so `file_stamp` must reject parent symlinks directly.
-    let secrets_dir = f.paths.home.join(".secrets");
-    let moved_dir = f.paths.home.join("moved-secrets");
-    std::fs::rename(&secrets_dir, &moved_dir).unwrap();
-    std::os::unix::fs::symlink(&moved_dir, &secrets_dir).unwrap();
-    let reads = MAILBOX_READS.with(std::cell::Cell::get);
-    assert!(!mailbox_component_held(&f.paths, password).unwrap());
-    assert!(
-        read_mailbox_component(&f.paths, password)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(reads, MAILBOX_READS.with(std::cell::Cell::get));
-}
-
 #[test]
 fn authenticated_reads_are_local_redacted_and_bound_to_one_entry() {
     let f = Fixture::new();
@@ -628,6 +573,7 @@ fn authenticated_entry_versions_retain_absence_and_reject_rollback_forks() {
     assert!(
         restored
             .entry
+            .as_ref()
             .unwrap()
             .snapshot()
             .continues(first.entry.unwrap().snapshot())
@@ -636,16 +582,21 @@ fn authenticated_entry_versions_retain_absence_and_reject_rollback_forks() {
         .unwrap()
         .unwrap();
     assert!(!other.version.not_before(&restored.version));
-    std::fs::write(
-        materialize::target_path(&f.paths.home, "token").unwrap(),
-        b"forged",
-    )
-    .unwrap();
+    // A forged file at the entry's old path changes neither the version nor the bytes: the
+    // observation reads the vault in place.
+    plant(&f.paths.home, "token", b"forged");
     let forged = observe_verified_entry(&f.paths, &config, "token")
         .unwrap()
         .unwrap();
-    assert!(forged.entry.is_none());
     assert!(forged.version.not_before(&restored.version));
+    assert!(restored.version.not_before(&forged.version));
+    let entry = forged.entry.unwrap();
+    assert_eq!(entry.value().as_slice(), b"inert-authentic-token");
+    assert!(
+        entry
+            .snapshot()
+            .continues(restored.entry.as_ref().unwrap().snapshot())
+    );
 }
 
 #[test]
@@ -1144,142 +1095,6 @@ fn a_log_removed_admin_cannot_reuse_its_cached_admin_locker() {
 }
 
 #[test]
-fn an_update_removes_the_fleet_code_file_an_older_build_wrote_at_the_same_version() {
-    let f = Fixture::new();
-    f.publish(|doc| {
-        doc.set_entry(
-            &Audience::Everyone,
-            "aterm-fleet-code",
-            b"inert-reserved-code",
-        )
-        .unwrap()
-    });
-    // What a build that did not reserve the name left: the file, and its manifest record.
-    let path = f.paths.home.join(".secrets/aterm-fleet-code");
-    fsx::write_atomic(&path, b"inert-reserved-code", 0o600).unwrap();
-    let mut state = load_state(&f.paths).unwrap();
-    let seq = state.seq;
-    state.manifest.files.insert(
-        "aterm-fleet-code".into(),
-        materialize::digest_hex(b"inert-reserved-code"),
-    );
-    save_state(&f.paths, &state).unwrap();
-    match sync(&f.paths, None).unwrap() {
-        SyncOutcome::Applied {
-            seq: applied,
-            report,
-        } => {
-            assert_eq!(applied, seq, "no new version was published");
-            assert_eq!(report.removed, ["aterm-fleet-code"], "{report:?}");
-            assert!(report.failed.is_empty(), "{report:?}");
-        }
-        other => panic!("{other:?}"),
-    }
-    assert!(!path.exists());
-    assert!(
-        !load_state(&f.paths)
-            .unwrap()
-            .manifest
-            .files
-            .contains_key("aterm-fleet-code")
-    );
-    assert!(matches!(
-        sync(&f.paths, None).unwrap(),
-        SyncOutcome::Unchanged { .. }
-    ));
-    let expected = config(&f.paths).unwrap().unwrap();
-    let entry = read_reserved_entry(&f.paths, &expected, "aterm-fleet-code")
-        .unwrap()
-        .expect("the vault still holds the code");
-    assert_eq!(entry.value().as_slice(), b"inert-reserved-code");
-}
-
-/// Holds a file immutable (`chflags uchg`, as its owner can), so no unlink of it succeeds until
-/// this drops, unwinding included.
-#[cfg(target_os = "macos")]
-struct Immutable(PathBuf);
-
-#[cfg(target_os = "macos")]
-impl Immutable {
-    fn set(path: &Path) -> Self {
-        assert!(Self::chflags("uchg", path), "{}", path.display());
-        Self(path.to_path_buf())
-    }
-
-    fn chflags(flags: &str, path: &Path) -> bool {
-        aterm_uds::spawnfd::command("/usr/bin/chflags")
-            .arg(flags)
-            .arg(path)
-            .status()
-            .is_ok_and(|status| status.success())
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for Immutable {
-    fn drop(&mut self) {
-        Self::chflags("nouchg", &self.0);
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn a_fleet_code_file_whose_removal_fails_keeps_no_read_back_and_goes_on_a_later_pass() {
-    let f = Fixture::new();
-    f.publish(|doc| {
-        doc.set_entry(
-            &Audience::Everyone,
-            "aterm-fleet-code",
-            b"inert-reserved-code",
-        )
-        .unwrap()
-    });
-    let path = f.paths.home.join(".secrets/aterm-fleet-code");
-    fsx::write_atomic(&path, b"inert-reserved-code", 0o600).unwrap();
-    set_state(&f.paths, |s| {
-        s.manifest.files.insert(
-            "aterm-fleet-code".into(),
-            materialize::digest_hex(b"inert-reserved-code"),
-        );
-    });
-    let immutable = Immutable::set(&path);
-    let stuck = sync(&f.paths, None);
-    drop(immutable);
-    match stuck.unwrap() {
-        SyncOutcome::Applied { report, .. } => {
-            let failed: Vec<&str> = report.failed.iter().map(|(n, _)| n.as_str()).collect();
-            assert_eq!(failed, ["aterm-fleet-code"], "{report:?}");
-            assert!(report.removed.is_empty(), "{report:?}");
-        }
-        other => panic!("{other:?}"),
-    }
-    assert!(path.exists(), "the removal failed");
-    let state = load_state(&f.paths).unwrap();
-    assert!(
-        !state.failed,
-        "every entry the vault holds is in place: no read of the applied copy is kept back"
-    );
-    assert!(
-        state.manifest.files.contains_key("aterm-fleet-code"),
-        "kept, so the next pass tries again"
-    );
-    let expected = config(&f.paths).unwrap().unwrap();
-    let code = fleet::reserved_code(&f.paths, &expected).unwrap();
-    assert_eq!(
-        code.as_ref().map(SecretBytes::as_slice),
-        Some(b"inert-reserved-code".as_slice())
-    );
-    match sync(&f.paths, None).unwrap() {
-        SyncOutcome::Applied { report, .. } => {
-            assert_eq!(report.removed, ["aterm-fleet-code"], "{report:?}");
-            assert!(report.failed.is_empty(), "{report:?}");
-        }
-        other => panic!("{other:?}"),
-    }
-    assert!(!path.exists());
-}
-
-#[test]
 fn a_fleet_code_read_before_the_apply_finished_says_so_rather_than_none() {
     let f = Fixture::new();
     let expected = config(&f.paths).unwrap().unwrap();
@@ -1298,7 +1113,6 @@ fn a_fleet_code_read_before_the_apply_finished_says_so_rather_than_none() {
     let held = load_state(&f.paths).unwrap();
     for (fault, said) in [
         ("failed", "did not finish"),
-        ("pending", "did not finish"),
         (
             "busy",
             "a vault pass on this machine has held the vault's state lock",
@@ -1307,13 +1121,6 @@ fn a_fleet_code_read_before_the_apply_finished_says_so_rather_than_none() {
         let guard = match fault {
             "failed" => {
                 set_state(&f.paths, |s| s.failed = true);
-                None
-            }
-            "pending" => {
-                set_state(&f.paths, |s| {
-                    s.pending
-                        .insert("other".into(), materialize::digest_hex(b"pending"));
-                });
                 None
             }
             "busy" => Some(StateLock::take(&f.paths).unwrap()),
@@ -1465,21 +1272,103 @@ fn reserved_fleet_distinguishes_admin_locker_holders_from_members() {
     ));
 }
 
+/// Restores the anchor walk when dropped ([`HIDDEN_ANCHOR`]).
+pub(super) struct HiddenAnchor;
+
+impl Drop for HiddenAnchor {
+    fn drop(&mut self) {
+        HIDDEN_ANCHOR.set(None);
+    }
+}
+
+/// Publish `name` put-if-absent, anchored to a put-if-absent `unreceived-anchor`, and read that
+/// anchor as absent from this reader's view while the returned guard lives: `name` is present in
+/// the version, its chain unresolved. The document check refuses any envelope that holds such a
+/// chain, so the walk's test seam stands in for it.
+pub(super) fn publish_unresolved(f: &Fixture, name: &str, value: &[u8]) -> HiddenAnchor {
+    f.publish(|doc| {
+        doc.set_entry_with(
+            &Audience::Everyone,
+            "unreceived-anchor",
+            b"inert-anchor",
+            true,
+            None,
+        )
+        .unwrap();
+        doc.set_entry_with(
+            &Audience::Everyone,
+            name,
+            value,
+            true,
+            Some("unreceived-anchor"),
+        )
+        .unwrap();
+    });
+    hide_anchor("unreceived-anchor")
+}
+
+/// Read `name` as absent from the view in the anchor walk while the returned guard lives.
+pub(super) fn hide_anchor(name: &str) -> HiddenAnchor {
+    HIDDEN_ANCHOR.set(Some(name.into()));
+    HiddenAnchor
+}
+
 #[test]
-fn local_if_absent_files_are_not_promoted_to_authenticated_entries() {
+fn if_absent_entries_read_their_vault_value_whatever_a_local_file_holds() {
     let f = Fixture::new();
     let name = "local-value";
-    let path = materialize::target_path(&f.paths.home, name).unwrap();
-    fsx::write_atomic(&path, b"same-inert-value", 0o600).unwrap();
+    // The person's own file was there first; the read ignores it.
+    let path = plant(&f.paths.home, name, b"person-inert-value");
     f.publish(|doc| {
-        doc.set_entry_with(&Audience::Everyone, name, b"same-inert-value", true, None)
+        doc.set_entry_with(&Audience::Everyone, name, b"vault-inert-value", true, None)
             .unwrap()
     });
     let expected = config(&f.paths).unwrap().unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(
+        read_verified_entry(&f.paths, &expected, name)
+            .unwrap()
+            .unwrap()
+            .value()
+            .as_slice(),
+        b"vault-inert-value"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the read writes no file"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        read_verified_entry(&f.paths, &expected, name)
+            .unwrap()
+            .unwrap()
+            .value()
+            .as_slice(),
+        b"vault-inert-value"
+    );
+    assert!(!path.exists(), "the read writes no file");
+    // NEGATIVE CONTROL: an if-absent entry whose anchor chain does not resolve in this view is
+    // unavailable: present in the version, never read.
+    let hidden = publish_unresolved(&f, name, b"vault-inert-value");
+    let observed = observe_verified_entry(&f.paths, &expected, name)
+        .unwrap()
+        .unwrap();
+    assert!(observed.entry.is_none());
     assert!(
         read_verified_entry(&f.paths, &expected, name)
             .unwrap()
             .is_none()
+    );
+    // With its anchor in the view again, the same entry reads.
+    drop(hidden);
+    assert_eq!(
+        read_verified_entry(&f.paths, &expected, name)
+            .unwrap()
+            .unwrap()
+            .value()
+            .as_slice(),
+        b"vault-inert-value"
     );
     f.publish(|doc| {
         doc.set_entry_with(
@@ -1501,11 +1390,15 @@ fn local_if_absent_files_are_not_promoted_to_authenticated_entries() {
     );
 }
 
-fn adopted_signing_fixture(anchored: bool) -> Fixture {
+/// A vault holding a Developer ID key (anchored to its certificate when `anchored`), with the
+/// copy an older build wrote at the key's old home path, identical bytes.
+fn signing_fixture(anchored: bool) -> Fixture {
     let f = Fixture::new();
-    let key = materialize::target_path(&f.paths.home, "~/.aterm/apple/devid-existing.key").unwrap();
-    fsx::ensure_private_dir(key.parent().unwrap()).unwrap();
-    fsx::write_atomic(&key, b"inert-existing-key", 0o600).unwrap();
+    plant(
+        &f.paths.home,
+        "~/.aterm/apple/devid-existing.key",
+        b"inert-existing-key",
+    );
     f.publish(|doc| {
         let anchor = "~/.aterm/apple/devid-existing.cer";
         if anchored {
@@ -1531,50 +1424,63 @@ fn adopted_signing_fixture(anchored: bool) -> Fixture {
 }
 
 #[test]
-fn signing_reader_accepts_identical_adopted_bytes_without_claiming_ownership() {
-    let f = adopted_signing_fixture(false);
+fn signing_material_reads_in_place_and_claims_nothing() {
+    let f = signing_fixture(false);
     let name = "~/.aterm/apple/devid-existing.key";
     let expected = config(&f.paths).unwrap().unwrap();
-    let key = materialize::target_path(&f.paths.home, name).unwrap();
-    let state = load_state(&f.paths).unwrap();
-    assert!(!state.manifest.files.contains_key(name));
-    assert!(state.own.as_ref().unwrap().contains(name));
-    let before = (
-        std::fs::read(f.paths.state_file()).unwrap(),
-        std::fs::read(&key).unwrap(),
-    );
-    assert!(
-        read_verified_entry(&f.paths, &expected, name)
+    let key = old_path(&f.paths.home, name);
+    let state = std::fs::read(f.paths.state_file()).unwrap();
+    // The file at the old path, as written, edited, then gone: each read returns the vault's
+    // bytes, through the signing reader and the ordinary one alike, and changes nothing.
+    for file in ["kept", "edited", "missing"] {
+        match file {
+            "kept" => {}
+            "edited" => fsx::write_atomic(&key, b"foreign-key", 0o600).unwrap(),
+            "missing" => std::fs::remove_file(&key).unwrap(),
+            _ => unreachable!(),
+        }
+        let held = std::fs::read(&key).ok();
+        let signing = read_verified_entry(&f.paths, &expected, name)
+            .map(|read| read.map(|entry| entry.into_parts().0))
             .unwrap()
-            .is_none()
-    );
+            .unwrap();
+        let ordinary = read_verified_entry(&f.paths, &expected, name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(signing.as_slice(), b"inert-existing-key", "{file}");
+        assert_eq!(ordinary.value().as_slice(), b"inert-existing-key", "{file}");
+        assert_eq!(
+            std::fs::read(f.paths.state_file()).unwrap(),
+            state,
+            "{file}"
+        );
+        assert_eq!(std::fs::read(&key).ok(), held, "{file}");
+    }
+    // NEGATIVE CONTROL: the vault is what the read follows; a rotated key reads rotated.
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, name, b"inert-rotated-key")
+            .unwrap();
+    });
     assert_eq!(
-        read_signing_material(&f.paths, &expected, name)
+        read_verified_entry(&f.paths, &expected, name)
+            .map(|read| read.map(|entry| entry.into_parts().0))
             .unwrap()
             .unwrap()
             .as_slice(),
-        b"inert-existing-key"
-    );
-    assert_eq!(
-        before,
-        (
-            std::fs::read(f.paths.state_file()).unwrap(),
-            std::fs::read(&key).unwrap()
-        )
+        b"inert-rotated-key"
     );
     for other in [
         "token",
         "~/.aterm/apple/devid-nested/other.key",
         "~/.aterm/apple/devid-existing.txt",
     ] {
-        assert!(read_signing_material(&f.paths, &expected, other).is_err());
+        assert!(!crate::entry_class::signing_material(other), "{other}");
     }
 }
 
-fn adopted_publication_fixture(name: &str) -> Fixture {
+fn publication_fixture(name: &str) -> Fixture {
     let f = Fixture::new();
-    let path = materialize::target_path(&f.paths.home, name).unwrap();
-    fsx::write_atomic(&path, b"inert-publication-token", 0o600).unwrap();
+    plant(&f.paths.home, name, b"inert-publication-token");
     f.publish(|doc| {
         doc.set_entry(&Audience::Everyone, name, b"inert-publication-token")
             .unwrap();
@@ -1583,32 +1489,38 @@ fn adopted_publication_fixture(name: &str) -> Fixture {
 }
 
 #[test]
-fn publication_reader_accepts_only_authenticated_equal_adopted_tokens_without_claiming_them() {
+fn publication_reader_reads_the_two_token_names_in_place_and_claims_nothing() {
     for name in ["gh_access_token", "gh_access_token_alabsystems"] {
-        let f = adopted_publication_fixture(name);
+        let f = publication_fixture(name);
         let expected = config(&f.paths).unwrap().unwrap();
-        let state = load_state(&f.paths).unwrap();
-        assert!(!state.manifest.files.contains_key(name));
-        assert!(state.own.as_ref().unwrap().contains(name));
+        let path = old_path(&f.paths.home, name);
         let before = std::fs::read(f.paths.state_file()).unwrap();
-        assert!(
+        // A forged file at the old path changes nothing: every reader returns the vault's bytes.
+        fsx::write_atomic(&path, b"forged-publication-token", 0o600).unwrap();
+        assert_eq!(
             read_verified_entry(&f.paths, &expected, name)
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .value()
+                .as_slice(),
+            b"inert-publication-token"
         );
         let entry = read_publication_material(&f.paths, &expected, name)
             .unwrap()
             .unwrap();
         assert_eq!(entry.value().as_slice(), b"inert-publication-token");
-        assert!(entry.snapshot().read(&f.paths).unwrap().is_none());
-        assert!(
-            entry
-                .snapshot()
-                .read_publication(&f.paths)
-                .unwrap()
-                .is_some()
-        );
+        for again in [
+            entry.snapshot().read(&f.paths).unwrap(),
+            entry.snapshot().read_publication(&f.paths).unwrap(),
+        ] {
+            assert_eq!(
+                again.unwrap().value().as_slice(),
+                b"inert-publication-token"
+            );
+        }
         assert_eq!(std::fs::read(f.paths.state_file()).unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), b"forged-publication-token");
+        // NEGATIVE CONTROL: the narrow reading names only the two token entries.
         for unrelated in [
             "token",
             "aterm-commons",
@@ -1620,26 +1532,16 @@ fn publication_reader_accepts_only_authenticated_equal_adopted_tokens_without_cl
 }
 
 #[test]
-fn publication_token_and_snapshot_refuse_stale_foreign_revoked_or_unsafe_material() {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
+fn publication_token_and_snapshot_refuse_stale_foreign_or_revoked_material() {
     let name = "gh_access_token";
-    for fault in [
-        "mismatch", "manifest", "audience", "revoked", "source", "public", "link", "hardlink",
-        "stale", "failed", "pending",
-    ] {
-        let f = adopted_publication_fixture(name);
+    for fault in ["none", "audience", "revoked", "source", "stale", "failed"] {
+        let f = publication_fixture(name);
         let expected = config(&f.paths).unwrap().unwrap();
         let entry = read_publication_material(&f.paths, &expected, name)
             .unwrap()
             .unwrap();
-        let path = materialize::target_path(&f.paths.home, name).unwrap();
         match fault {
-            "mismatch" => fsx::write_atomic(&path, b"foreign", 0o600).unwrap(),
-            "manifest" => set_state(&f.paths, |s| {
-                s.manifest
-                    .files
-                    .insert(name.into(), materialize::digest_hex(b"foreign"));
-            }),
+            "none" => {}
             "audience" => f.publish(|doc| {
                 doc.unset_entry(&Audience::Everyone, name).unwrap();
                 doc.set_entry(
@@ -1655,70 +1557,57 @@ fn publication_token_and_snapshot_refuse_stale_foreign_revoked_or_unsafe_materia
                 changed.source = Source::Path(f.paths.home.join("different.vault"));
                 save_config(&f.paths, &changed).unwrap();
             }
-            "public" => {
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap()
-            }
-            "link" => {
-                let held = path.with_extension("held");
-                std::fs::rename(&path, &held).unwrap();
-                symlink(held, &path).unwrap();
-            }
-            "hardlink" => std::fs::hard_link(&path, path.with_extension("held")).unwrap(),
             "stale" => set_state(&f.paths, |s| s.seq = 0),
             "failed" => set_state(&f.paths, |s| s.failed = true),
-            "pending" => set_state(&f.paths, |s| {
-                s.pending
-                    .insert(name.into(), materialize::digest_hex(b"pending"));
-            }),
             _ => unreachable!(),
         }
         let before = std::fs::read(f.paths.state_file()).unwrap();
-        assert!(
-            !matches!(
-                read_publication_material(&f.paths, &expected, name),
-                Ok(Some(_))
-            ),
-            "{fault}"
-        );
-        assert!(
-            !matches!(entry.snapshot().read_publication(&f.paths), Ok(Some(_))),
-            "snapshot {fault}"
-        );
+        let read = read_publication_material(&f.paths, &expected, name);
+        let again = entry.snapshot().read_publication(&f.paths);
+        // NEGATIVE CONTROL: with no fault, both reads return the vault's bytes.
+        let accepted = |read: &crate::Result<Option<VerifiedEntry>>| {
+            read.as_ref().is_ok_and(|read| {
+                read.as_ref()
+                    .is_some_and(|entry| entry.value().as_slice() == b"inert-publication-token")
+            })
+        };
+        assert_eq!(accepted(&read), fault == "none", "{fault}");
+        assert_eq!(accepted(&again), fault == "none", "snapshot {fault}");
         assert_eq!(std::fs::read(f.paths.state_file()).unwrap(), before);
     }
 }
 
 #[test]
-fn signing_adopted_reader_keeps_current_authority_and_private_path_guards() {
+fn signing_material_reader_keeps_current_authority_whatever_the_file_holds() {
     use std::os::unix::fs::PermissionsExt as _;
     for fault in [
         "changed",
         "manifest",
-        "failed",
-        "pending",
-        "revoked",
-        "audience",
-        "config",
         "public",
         "link",
         "parent-link",
+        "failed",
+        "revoked",
+        "audience",
+        "config",
     ] {
-        let f = adopted_signing_fixture(false);
+        // A fault of the file at the old path, or of the older build's manifest that tracked it,
+        // changes nothing; a fault of the vault's authority refuses.
+        let file = matches!(
+            fault,
+            "changed" | "manifest" | "public" | "link" | "parent-link"
+        );
+        let f = signing_fixture(false);
         let name = "~/.aterm/apple/devid-existing.key";
         let expected = config(&f.paths).unwrap().unwrap();
-        let key = materialize::target_path(&f.paths.home, name).unwrap();
+        let key = old_path(&f.paths.home, name);
         match fault {
             "changed" => fsx::write_atomic(&key, b"foreign-key", 0o600).unwrap(),
             "manifest" => set_state(&f.paths, |s| {
-                s.manifest
-                    .files
-                    .insert(name.into(), materialize::digest_hex(b"different"));
+                s.legacy_manifest
+                    .insert(name.into(), crate::digest_hex(b"different"));
             }),
             "failed" => set_state(&f.paths, |s| s.failed = true),
-            "pending" => set_state(&f.paths, |s| {
-                s.pending
-                    .insert(name.into(), materialize::digest_hex(b"pending"));
-            }),
             "revoked" => set_state(&f.paths, |s| s.membership = Stored::Revoked),
             "audience" => f.publish(|doc| {
                 doc.unset_entry(&Audience::Everyone, name).unwrap();
@@ -1754,13 +1643,16 @@ fn signing_adopted_reader_keeps_current_authority_and_private_path_guards() {
             std::fs::read(f.paths.state_file()).unwrap(),
             std::fs::read(&key).ok(),
         );
-        assert!(
-            !matches!(
-                read_signing_material(&f.paths, &expected, name),
-                Ok(Some(_))
-            ),
+        let read = read_verified_entry(&f.paths, &expected, name)
+            .map(|read| read.map(|entry| entry.into_parts().0));
+        assert_eq!(
+            matches!(&read, Ok(Some(value)) if value.as_slice() == b"inert-existing-key"),
+            file,
             "{fault}"
         );
+        if !file {
+            assert!(!matches!(read, Ok(Some(_))), "{fault}");
+        }
         assert_eq!(
             before,
             (
@@ -1773,44 +1665,150 @@ fn signing_adopted_reader_keeps_current_authority_and_private_path_guards() {
 }
 
 #[test]
-fn an_adopted_signing_key_requires_its_current_vault_owned_anchor_chain() {
+fn an_anchored_signing_key_reads_only_with_its_anchor_chain_in_the_same_view() {
     use std::os::unix::fs::PermissionsExt as _;
-    for fault in ["none", "changed", "untracked", "missing", "public"] {
-        let f = adopted_signing_fixture(true);
-        let key_name = "~/.aterm/apple/devid-existing.key";
-        let cert_name = "~/.aterm/apple/devid-existing.cer";
+    let key_name = "~/.aterm/apple/devid-existing.key";
+    let cert_name = "~/.aterm/apple/devid-existing.cer";
+    for fault in ["none", "anchor-file", "pair", "unreceived"] {
+        let f = signing_fixture(true);
         let expected = config(&f.paths).unwrap().unwrap();
-        let cert = materialize::target_path(&f.paths.home, cert_name).unwrap();
-        let state = load_state(&f.paths).unwrap();
-        assert!(!state.manifest.files.contains_key(key_name));
-        assert!(state.own.as_ref().unwrap().contains(key_name));
-        assert!(state.manifest.files.contains_key(cert_name));
+        let cert = old_path(&f.paths.home, cert_name);
+        let mut hidden = None;
         match fault {
             "none" => {}
-            "changed" => fsx::write_atomic(&cert, b"foreign-anchor", 0o600).unwrap(),
-            "untracked" => set_state(&f.paths, |s| {
-                s.manifest.files.remove(cert_name);
-            }),
-            "missing" => std::fs::remove_file(&cert).unwrap(),
-            "public" => {
-                std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap()
+            // A foreign, loosened file at the anchor's old path: no part of the chain.
+            "anchor-file" => {
+                fsx::write_atomic(&cert, b"foreign-anchor", 0o600).unwrap();
+                std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap();
             }
+            // The certificate anchored back to the key: a complete pair, as a Developer ID pair
+            // is published, which resolves.
+            "pair" => f.publish(|doc| {
+                doc.set_entry_with(
+                    &Audience::Everyone,
+                    cert_name,
+                    b"inert-certificate",
+                    true,
+                    Some(key_name),
+                )
+                .unwrap();
+            }),
+            // The certificate absent from this reader's view: the chain does not resolve.
+            "unreceived" => hidden = Some(hide_anchor(cert_name)),
             _ => unreachable!(),
         }
+        let resolves = fault != "unreceived";
         let before = std::fs::read(f.paths.state_file()).unwrap();
-        let accepted = read_signing_material(&f.paths, &expected, key_name)
-            .ok()
-            .flatten()
-            .is_some();
-        assert_eq!(accepted, fault == "none", "{fault}");
+        let signing = read_verified_entry(&f.paths, &expected, key_name)
+            .map(|read| read.map(|entry| entry.into_parts().0))
+            .unwrap();
+        let ordinary = read_verified_entry(&f.paths, &expected, key_name).unwrap();
+        assert_eq!(
+            signing.is_some_and(|value| value.as_slice() == b"inert-existing-key"),
+            resolves,
+            "{fault}"
+        );
+        assert_eq!(
+            ordinary.is_some_and(|entry| entry.value().as_slice() == b"inert-existing-key"),
+            resolves,
+            "{fault}"
+        );
+        // The pair reads together from one version, or not at all.
+        let set = read_verified_set(&f.paths, &expected, &[cert_name, key_name]).unwrap();
+        assert_eq!(
+            set.map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry.value().as_slice().to_vec())
+                    .collect::<Vec<_>>()
+            }),
+            resolves.then(|| vec![
+                b"inert-certificate".to_vec(),
+                b"inert-existing-key".to_vec()
+            ]),
+            "{fault}"
+        );
+        // NEGATIVE CONTROL: one absent member makes the whole set absent; a reserved one refuses.
         assert!(
-            read_verified_entry(&f.paths, &expected, key_name)
-                .ok()
-                .flatten()
+            read_verified_set(&f.paths, &expected, &[key_name, "absent-member"])
+                .unwrap()
                 .is_none()
         );
+        assert!(
+            read_verified_set(&f.paths, &expected, &[key_name, crate::commons::ENTRY]).is_err()
+        );
         assert_eq!(before, std::fs::read(f.paths.state_file()).unwrap());
+        drop(hidden);
     }
+}
+
+#[test]
+fn a_complete_anchor_ring_reads_member_by_member_and_as_one_set() {
+    // Shaped like the release ring (DESIGN-secrets §4): each member put-if-absent and anchored
+    // to the next, the last back to the first.
+    let ring = ["ring-key", "ring-machine", "ring-credentials"];
+    let values: [&[u8]; 3] = [
+        b"inert-ring-key",
+        b"inert-ring-machine",
+        b"inert-ring-credentials",
+    ];
+    let f = Fixture::new();
+    f.publish(|doc| {
+        for (index, name) in ring.iter().enumerate() {
+            doc.set_entry_with(&Audience::Everyone, name, values[index], true, None)
+                .unwrap();
+        }
+        for (index, name) in ring.iter().enumerate() {
+            doc.set_entry_with(
+                &Audience::Everyone,
+                name,
+                values[index],
+                true,
+                Some(ring[(index + 1) % ring.len()]),
+            )
+            .unwrap();
+        }
+    });
+    let expected = config(&f.paths).unwrap().unwrap();
+    for (index, name) in ring.iter().enumerate() {
+        let entry = read_verified_entry(&f.paths, &expected, name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.value().as_slice(), values[index], "{name}");
+        assert!(entry.snapshot().read(&f.paths).unwrap().is_some(), "{name}");
+    }
+    let set = read_verified_set(&f.paths, &expected, &ring)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        set.iter()
+            .map(|entry| entry.value().as_slice())
+            .collect::<Vec<_>>(),
+        values
+    );
+    // NEGATIVE CONTROL: one member missing from this reader's view (a document holding the rest
+    // without it is refused, so the walk's seam drops it): the members anchored through it read
+    // nothing, and the set reads nothing.
+    let hidden = hide_anchor("ring-credentials");
+    for name in ["ring-key", "ring-machine"] {
+        assert!(
+            read_verified_entry(&f.paths, &expected, name)
+                .unwrap()
+                .is_none(),
+            "{name}"
+        );
+    }
+    assert!(
+        read_verified_set(&f.paths, &expected, &ring)
+            .unwrap()
+            .is_none()
+    );
+    drop(hidden);
+    assert!(
+        read_verified_set(&f.paths, &expected, &ring)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -1865,22 +1863,29 @@ fn unsigned_and_unconfigured_reads_create_nothing() {
 }
 
 #[test]
-fn stale_apply_context_and_unsafe_files_never_supply_authenticated_bytes() {
+fn stale_apply_context_never_supplies_authenticated_bytes_and_unsafe_files_change_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
     for fault in [
+        "none",
+        "public-file",
+        "file-link",
+        "file-missing",
         "failed",
         "unbound",
         "no-digest",
         "sequence",
         "recipient",
-        "public-file",
-        "file-link",
         "source",
     ] {
+        // NEGATIVE CONTROL: with no fault, and with any fault of the file at the old path, the
+        // read returns the vault's bytes; any fault of the applied context refuses.
+        let in_place = matches!(fault, "none" | "public-file" | "file-link" | "file-missing");
         let f = Fixture::new();
         let expected = config(&f.paths).unwrap().unwrap();
-        let token = materialize::target_path(&f.paths.home, "token").unwrap();
+        // The file an older build wrote at the token's old path, which the file faults change.
+        let token = plant(&f.paths.home, "token", b"inert-authentic-token");
         match fault {
+            "none" => {}
             "failed" => set_state(&f.paths, |s| s.failed = true),
             "unbound" => set_state(&f.paths, |s| s.source_identity = None),
             "no-digest" => set_state(&f.paths, |s| s.digest = None),
@@ -1899,6 +1904,7 @@ fn stale_apply_context_and_unsafe_files_never_supply_authenticated_bytes() {
                 std::fs::rename(&token, &kept).unwrap();
                 std::os::unix::fs::symlink(kept, &token).unwrap();
             }
+            "file-missing" => std::fs::remove_file(&token).unwrap(),
             "source" => {
                 let mut changed = expected.clone();
                 changed.source = Source::Path(f.paths.home.join("different.vault"));
@@ -1907,13 +1913,15 @@ fn stale_apply_context_and_unsafe_files_never_supply_authenticated_bytes() {
             _ => unreachable!(),
         }
         let before = f.bytes();
-        assert!(
-            !matches!(
-                read_verified_entry(&f.paths, &expected, "token"),
-                Ok(Some(_))
-            ),
+        let read = read_verified_entry(&f.paths, &expected, "token");
+        assert_eq!(
+            matches!(&read, Ok(Some(entry)) if entry.value().as_slice() == b"inert-authentic-token"),
+            in_place,
             "{fault}"
         );
+        if !in_place {
+            assert!(!matches!(read, Ok(Some(_))), "{fault}");
+        }
         assert_eq!(before, f.bytes(), "{fault}");
     }
 }
@@ -1923,8 +1931,8 @@ const CLASS_TOKEN: &[u8] = concat!("sk-ant-", "oat01-inert-conformance_fixture")
 
 /// The class scenarios of [`entry_transition`] (DESIGN-claude-setup-token §4.2): on a seated
 /// member (m7) of a log vault, `claude_token::write` stores a token, and the typed read
-/// (`ClaudeToken`, [`Reading::ClaudeToken`]) or a materialized reading
-/// (`ClaudeTokenMaterialized`, [`read_verified_entry`]) of its entry is made.
+/// (`ClaudeToken`, [`Reading::ClaudeToken`]) or an ordinary read
+/// (`ClaudeTokenOrdinary`, [`read_verified_entry`]) of its entry is made.
 fn claude_token_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -1940,6 +1948,7 @@ fn claude_token_transition(
         expiry_from: crate::claude_token::ExpiryFrom::Assumed,
         minted_on: "m7".into(),
         cli: "2.1.318".into(),
+        minted_by: None,
         verified: None,
     };
     let soon = Instant::now() + Duration::from_secs(60);
@@ -1976,7 +1985,7 @@ fn claude_token_transition(
                 .flatten()
                 .is_some_and(|(entry, _)| entry.value().as_slice() == CLASS_TOKEN),
         ),
-        "ClaudeTokenMaterialized" => (
+        "ClaudeTokenOrdinary" => (
             20,
             read_verified_entry(m7, &expected, &name)
                 .ok()
@@ -2003,24 +2012,28 @@ pub(crate) fn entry_transition(
     let f = Fixture::new();
     let mut pin = f.read_token().unwrap().snapshot;
     let mut expected = config(&f.paths).unwrap().unwrap();
-    let token = materialize::target_path(&f.paths.home, "token").unwrap();
     let mut guard = None;
     let mut rebound = false;
     let mut name = "token";
+    let mut exact = true;
     let scenario = match action {
         "Valid" => 1,
-        "LocalEdit" => {
-            fsx::write_atomic(&token, b"tampered", 0o600).unwrap();
+        "FileIgnored" => {
+            // The file an older build wrote, edited, then behind a link, then gone: the read
+            // returns the vault's bytes each time and opens none of them.
+            plant(&f.paths.home, "token", b"tampered");
+            let edited = read_verified_entry(&f.paths, &expected, name)
+                .unwrap()
+                .is_some_and(|entry| entry.value().as_slice() == b"inert-authentic-token");
+            let kept = f.paths.home.join("kept-secrets");
+            std::fs::rename(f.paths.home.join(".secrets"), &kept).unwrap();
+            std::os::unix::fs::symlink(&kept, f.paths.home.join(".secrets")).unwrap();
+            let linked = read_verified_entry(&f.paths, &expected, name)
+                .unwrap()
+                .is_some_and(|entry| entry.value().as_slice() == b"inert-authentic-token");
+            std::fs::remove_file(f.paths.home.join(".secrets")).unwrap();
+            exact = edited && linked;
             2
-        }
-        "ForgedManifest" => {
-            fsx::write_atomic(&token, b"tampered", 0o600).unwrap();
-            set_state(&f.paths, |s| {
-                s.manifest
-                    .files
-                    .insert("token".into(), materialize::digest_hex(b"tampered"));
-            });
-            3
         }
         "Cache" => {
             let mut bytes = std::fs::read(f.paths.cache_file()).unwrap();
@@ -2042,10 +2055,8 @@ pub(crate) fn entry_transition(
             7
         }
         "Partial" => {
-            set_state(&f.paths, |s| {
-                s.pending
-                    .insert("other".into(), materialize::digest_hex(b"pending"));
-            });
+            // An apply that began and recorded nothing.
+            set_state(&f.paths, |s| s.failed = true);
             8
         }
         "Unsigned" => {
@@ -2117,12 +2128,6 @@ pub(crate) fn entry_transition(
             rebound = true;
             14
         }
-        "ParentLink" => {
-            let kept = f.paths.home.join("kept-secrets");
-            std::fs::rename(f.paths.home.join(".secrets"), &kept).unwrap();
-            std::os::unix::fs::symlink(&kept, f.paths.home.join(".secrets")).unwrap();
-            15
-        }
         "Fork" => {
             let admin = admin_open(&f.paths).unwrap();
             let state = load_state(&f.paths).unwrap();
@@ -2147,10 +2152,6 @@ pub(crate) fn entry_transition(
             rebound = true;
             16
         }
-        "Missing" => {
-            std::fs::remove_file(&token).unwrap();
-            17
-        }
         "Reserved" => {
             name = crate::commons::ENTRY;
             18
@@ -2163,7 +2164,10 @@ pub(crate) fn entry_transition(
     } else {
         read_verified_entry(&f.paths, &expected, name)
     };
-    let accepted = result.ok().flatten().is_some();
+    let accepted = exact
+        && result.ok().flatten().is_some_and(|entry| {
+            name != "token" || rebound || entry.value().as_slice() == b"inert-authentic-token"
+        });
     let mut next = state.clone();
     next.insert("scenario", scenario);
     next.insert("accepted", i64::from(accepted));
@@ -2173,7 +2177,7 @@ pub(crate) fn entry_transition(
 }
 
 #[test]
-fn verified_entry_reads_conform_and_forged_files_or_rolled_back_pins_are_caught() {
+fn verified_entry_reads_conform_in_place_and_rolled_back_pins_are_caught() {
     let model = aterm_models_db::verified_entry_model();
     assert!(aterm_spec::interp::prove_and_catch(&model) > 1);
     for state in aterm_spec::interp::reachable_states(&model) {
@@ -2189,16 +2193,21 @@ fn verified_entry_reads_conform_and_forged_files_or_rolled_back_pins_are_caught(
         }
     }
     // NEGATIVE CONTROL: each of these readings accepting the bytes is no step of the model, and
-    // breaks its law; a materialized reading of a Claude Code token entry among them.
-    for action in [
-        "ForgedManifest",
-        "Rollback",
-        "Fork",
-        "ClaudeTokenMaterialized",
-    ] {
+    // breaks its law; an ordinary read of a Claude Code token entry among them.
+    for action in ["Rollback", "Fork", "Revoked", "ClaudeTokenOrdinary"] {
         let mut bad = entry_transition(&model.init_state(), action);
         bad.insert("accepted", 1);
         assert!(!model.check_invariant("OnlyBoundBytes", &bad));
         assert!(!model.successors(action, &model.init_state()).contains(&bad));
     }
+    // NEGATIVE CONTROL: a read the file at the old path turned away (a file-backed reader) breaks
+    // availability.
+    let mut bad = entry_transition(&model.init_state(), "FileIgnored");
+    bad.insert("accepted", 0);
+    assert!(!model.check_invariant("Available", &bad));
+    assert!(
+        !model
+            .successors("FileIgnored", &model.init_state())
+            .contains(&bad)
+    );
 }

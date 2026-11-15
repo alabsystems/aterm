@@ -53,6 +53,23 @@ impl FileIdentity {
 }
 
 impl LoadedImage {
+    /// The immutable device/inode of the loaded executable, including the guest executable
+    /// of a binary translator. Missing platform support supplies no identity.
+    #[must_use]
+    pub fn file_identity(&self) -> Option<aterm_sysprobe::kproc::ImageFile> {
+        #[cfg(unix)]
+        {
+            Some(aterm_sysprobe::kproc::ImageFile {
+                device: self.file.device,
+                inode: self.file.inode,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     /// Read `pid`'s loaded image from the kernel, not from the file currently at its pathname.
     /// Linux reads through the process's held `/proc` directory, including the exec descriptor
     /// of a binary translator. Unsupported platforms or unreadable identities return `None`.

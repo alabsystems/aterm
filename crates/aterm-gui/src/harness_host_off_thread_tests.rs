@@ -184,6 +184,109 @@ fn a_slow_relaunch_read_never_holds_the_turn_end_reading() {
     }
 }
 
+/// A RELAUNCH READ STILL OUT IS NO ANSWER (LS-15): the loop's read of the foreground agent
+/// ([`IdleHost::agent_resumed`]) whose snapshot read is held past its bound says
+/// [`HostAgent::Unread`], never [`HostAgent::Absent`], which the loop reads as no agent; once the
+/// read lands it names the agent. NEGATIVE CONTROL on main: the held read answered `None`, the same
+/// word as a tab with no agent, and a loop within its restart's grace read the fresh program's
+/// banner as the resume's.
+#[test]
+fn a_slow_relaunch_read_leaves_the_agent_unread_not_absent() {
+    let (idle, held) = gated_idle(Program::Claude, Duration::ZERO, |h, _| {
+        h.acts.follow = Arc::new(|_, _| Foreground::Agent);
+        h.acts.agent_resumed = Arc::new(|_, _| false);
+    });
+    with_kept_of(&idle.kept, |k| k.snapshot = None);
+    let at = Arc::clone(&idle);
+    let reading = std::thread::spawn(move || at.agent_resumed());
+    until(
+        "the read of the agent returns while its read is held",
+        || reading.is_finished(),
+    );
+    assert_eq!(
+        reading.join().unwrap(),
+        HostAgent::Unread,
+        "a read still out is unread, not no agent"
+    );
+    until("the read began", || held.began.load(Ordering::SeqCst) == 1);
+    held.let_go();
+    until("the read lands", || {
+        kept_session(&idle).as_deref() == Some(NAMED)
+    });
+    until("no read is out", || !read_out(&idle));
+    assert!(
+        matches!(
+            idle.agent_resumed(),
+            HostAgent::Read(AgentResumed { resumed: false, .. })
+        ),
+        "the landed read names the fresh agent"
+    );
+}
+
+/// A RELAUNCH READ THAT FAILED BEFORE THE HOST ANSWERED IS UNREAD, NOT NO AGENT (LS-15): a read
+/// refused for want of the control socket, its roster or a process fact (a loaded host refuses a
+/// connect to a full backlog at once, well inside the read's bound) is [`HostAgent::Unread`], as a
+/// read still out is; only a refusal that is the host's answer (no foreground group, a program no
+/// lane reads, a group no one tab owns, a terminal aterm did not open) is [`HostAgent::Absent`]. A
+/// read that lands after a failed one names the agent: the failure is not kept. NEGATIVE CONTROL:
+/// the first cut made every refusal that ended within the bound `Absent`, and a loop within its
+/// restart's grace read the fresh program's banner as the resume's.
+#[test]
+fn a_failed_relaunch_read_leaves_the_agent_unread_not_absent() {
+    let idle_reading = |snapshot: Arc<SnapshotFn>| {
+        let world = Arc::new(World::default());
+        let mut h = hooks(&world, parking_body(&world));
+        h.acts.snapshot = snapshot;
+        h.acts.follow = Arc::new(|_, _| Foreground::Agent);
+        h.acts.agent_resumed = Arc::new(|_, _| false);
+        let idle = idle_of(h, Program::Claude, None);
+        with_kept_of(&idle.kept, |k| k.snapshot = None);
+        idle
+    };
+    let answer = |why: &'static str| {
+        idle_reading(Arc::new(move |_| Err(SnapshotRefusal::of(why)))).agent_resumed()
+    };
+    for why in [
+        "no-socket",
+        "roster",
+        "argv-unreadable",
+        "start",
+        "terminal-unread",
+        "exe-unreadable",
+        "files-unreadable",
+    ] {
+        assert_eq!(answer(why), HostAgent::Unread, "{why}: the read failed");
+    }
+    for why in [
+        "no-foreground",
+        "not-claude",
+        "no-lane",
+        "tab-ambiguous",
+        "terminal",
+    ] {
+        assert_eq!(answer(why), HostAgent::Absent, "{why}: the host answered");
+    }
+
+    let failed = Arc::new(AtomicBool::new(true));
+    let fails = Arc::clone(&failed);
+    let idle = idle_reading(Arc::new(move |sid| {
+        if fails.load(Ordering::SeqCst) {
+            Err(SnapshotRefusal::of("no-socket"))
+        } else {
+            Ok(snap(sid))
+        }
+    }));
+    assert_eq!(idle.agent_resumed(), HostAgent::Unread, "the read failed");
+    failed.store(false, Ordering::SeqCst);
+    assert!(
+        matches!(
+            idle.agent_resumed(),
+            HostAgent::Read(AgentResumed { resumed: false, .. })
+        ),
+        "the read that lands names the agent"
+    );
+}
+
 #[test]
 fn a_slow_relaunch_read_never_holds_the_step_after_an_act() {
     let stepping = |held: Option<Arc<GatedRead>>| {
@@ -234,7 +337,7 @@ fn a_slow_relaunch_read_never_holds_the_step_after_an_act() {
             h.acts.snapshot = Arc::new(move |sid| {
                 read.pass();
                 let n = read.began.load(Ordering::SeqCst);
-                Some(Snapshot {
+                Ok(Snapshot {
                     session: Some(format!("read-{n}")),
                     ..snap(sid)
                 })
@@ -504,7 +607,7 @@ fn a_read_begun_before_an_act_is_read_as_after_it_by_no_one() {
                         BEFORE
                     };
                     read.pass();
-                    Some(Snapshot {
+                    Ok(Snapshot {
                         session: Some(session.to_string()),
                         ..snap(sid)
                     })

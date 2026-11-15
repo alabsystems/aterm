@@ -26,7 +26,9 @@ mod macros;
 pub mod ser;
 mod value;
 
-pub use de::{Deserializer, PathSegment, from_slice, from_str, number_lexeme_at_path};
+pub use de::{
+    Deserializer, PathSegment, from_slice, from_slice_with_budget, from_str, number_lexeme_at_path,
+};
 pub use error::{Error, Result};
 pub use ser::{quoted_capacity, quoted_string, to_string, to_vec};
 pub use value::{Map, Number, Value};

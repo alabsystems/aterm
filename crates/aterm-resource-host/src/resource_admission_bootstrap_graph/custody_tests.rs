@@ -19,7 +19,7 @@ fn key() -> wire::Key {
     wire::Key {
         query: ContextQuery {
             binding: JobBinding {
-                session: "s-abcd".into(),
+                session: "s-0000000000000000abcd".into(),
                 root_attempt: [1; 16],
                 capability: [9; 32],
             },
@@ -78,12 +78,12 @@ fn record(file: &File, bytes: &[u8]) -> wire::SourceRecord {
         sha256: aterm_digest::Sha256::digest(bytes),
     }
 }
-struct Inputs {
+pub(super) struct Inputs {
     _scratch: aterm_tempfile::TempDir,
-    original: Arc<OriginalSource>,
+    pub(super) original: Arc<OriginalSource>,
 }
 impl Inputs {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let path = scratch.path().canonicalize().unwrap();
         let holder = path.join(".trust-build-lock");
@@ -128,7 +128,7 @@ impl Inputs {
             original,
         }
     }
-    fn preparing(&self) -> Preparing {
+    pub(super) fn preparing(&self) -> Preparing {
         Preparing {
             request: wire::Enrollment {
                 key: key(),
@@ -151,6 +151,9 @@ impl Inputs {
             deadline: self.original.deadline,
             submitted: false,
             source_submitted: false,
+            configuration_budget: Default::default(),
+            materialization_submitted: false,
+            configuration_anchor: Instant::now(),
             output_submitted: false,
         }
     }
@@ -280,6 +283,14 @@ fn source_refusal_does_not_finish_the_actual_receiving_handler() {
             control: None,
             source_requested: Some(inputs.original.request.clone()),
             source: Some(Arc::clone(&inputs.original)),
+            configuration_requested: None,
+            materialization_requested: None,
+            configuration: Vec::new(),
+            configuration_budget: Default::default(),
+            configuration_rejected: Vec::new(),
+            workspace: None,
+            materialization_inputs: None,
+            configuration_anchor: preparing.configuration_anchor,
             output_requested: None,
             output: None,
         }),

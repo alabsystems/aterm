@@ -5,8 +5,9 @@
 //! `adopt`, `roll`, `export`, `prefer` and `unprefer` over `alab/registry`, and the readers and
 //! owner writers of `verbs` (`machines`, `accounts`, `preferences`, `mail`, `who`, `quota`, `log`,
 //! `signins`, `add`, `retire`, `relabel`, `edit`). Every report names keys, columns, counts
-//! and source coordinates, never a value; addresses are masked unless `--show-addresses` is
-//! given. A sheet's note crosses into its row's `note` only past the note guard. The import's
+//! and source coordinates, never a secret; a secret cell names its secret-store entry or holds
+//! a sealed token, never its value in the clear, and addresses and phone numbers are ordinary
+//! data. A sheet's note crosses into its row's `note` only past the note guard. The import's
 //! review (`--review`: a private `$TMPDIR/.ubd/alab-import-*.noindex/` folder opened in amacs and
 //! removed once the owner closes it) is the only place a withheld note's text or a losing value
 //! is shown, and only on this Mac; a cell shaped like a credential, or one that names a secret, is
@@ -15,7 +16,7 @@
 use super::{
     Registry, checks,
     import::{self, Coord, Finding, Input, KnownMac, Mode, Plan, Sheet, SheetKind, Step, Vendors},
-    registry::{self, ACCOUNT, MACHINE, PHONE, PREFERENCE, REGISTRY},
+    registry::{self, ACCOUNT, MACHINE, PHONE, PREFERENCE},
 };
 use crate::{
     Error, Result,
@@ -25,7 +26,7 @@ use crate::{
         Ty,
         cell::{self, CellKey, CellValue, Projection},
         grid, guard, keys,
-        secret::{Sealer, Secret},
+        secret::{Sealer, Secret, Store},
     },
 };
 use astream_wire::sync::Digest;
@@ -43,24 +44,27 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
   import [--vault-sheet <csv>] [--logins <csv>] [--fleet-accounts <toml>]... [--ai-pool <toml>]\n\
          [--emails|--computers|--phones <csv>|<xlsx>[#<tab>]] [--mailbox-toml <toml>]\n\
          [--fleet-db --authoritative|--fill-only]\n\
-         [--dry-run|--apply] [--review] [--findings] [--show-addresses]\n\
+         [--dry-run|--apply] [--review] [--findings]\n\
                     plan the account sheets, this Mac's fleet_db replica (~/.aterm/lab-db, read\n\
                     in place; no dump is written), the harness's fleet and pool files and its\n\
-                    mailbox file (~/.secrets/ai-mailbox.toml, only when named) as registry\n\
+                    mailbox file (--mailbox-toml <toml>, only when named) as registry\n\
                     writes: a dry run unless --apply. A sheet is a CSV, or an xlsx workbook's\n\
                     tab, read in memory (`#<tab>` names it; else the tab the flag names:\n\
                     Emails, Computers, Phones). A sheet only fills: it\n\
                     writes empty cells and its own earlier import's, and a cell another import\n\
                     wrote otherwise is a `differs` finding, by key and column. The replica\n\
                     that holds the corrections is --authoritative, any other --fill-only; its\n\
-                    passwords and phone numbers become Secret cells, sealed here, and a sheet's\n\
-                    password column is only a flag, never one. After --apply the import judges\n\
+                    passwords and TOTP seeds are sealed here into their cells, the form the\n\
+                    registry holds one in, and its phone numbers are written as ordinary data.\n\
+                    A sheet's password column is only a flag, never a password.\n\
+                    After --apply the import judges\n\
                     each replica cell and records beside the replica whether the registry\n\
                     covers them all (`covered`, else each uncovered cell by key and column),\n\
                     with the replica's keyed digest; once covered, fleet_db's put, delete,\n\
                     load, bootstrap and rekey refuse there. The mailbox file's every field goes\n\
-                    to its MAILBOX or login address cell, its passwords and TOTP seeds as Secret\n\
-                    cells; a field with no column is a finding by name, and after --apply the\n\
+                    to its MAILBOX or login address cell, its passwords and TOTP seeds as a\n\
+                    replica's passwords do; a field with no column is a finding by name, and\n\
+                    after --apply the\n\
                     report says whether the file is `covered`. The owner's edits stay and show as\n\
                     findings. A note\n\
                     crosses into its row's note unless it is shaped like a credential, says or\n\
@@ -79,7 +83,7 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
                     value, and nothing is imported\n\
   import --compare-sheet <csv>\n\
                     what importing the sheet would do, by count, key and column, and how its\n\
-                    password flags meet the registry's Secret cells: never a value\n\
+                    password flags meet the registry's secret cells: never a value\n\
   check             preferences, labels, logins, aliases and mailboxes, then every conflict,\n\
                     dangling\n\
                     reference and unique clash, what this Mac's self-registration decides\n\
@@ -136,9 +140,9 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
   edit accounts|preferences|machines|mail\n\
                     the rows as a grid in amacs, saved cell by cell: a cell that changed\n\
                     meanwhile reopens with both values; a deleted row retires (a preference ends)\n\
-  The sheets default to ~/.secrets/ai-accounts.csv and ~/ai-account-logins.csv, the harness's\n\
-  files to ~/.secrets/fleet-accounts.toml, ai-accounts-<cli>.toml and ai-pool.toml, each read\n\
-  when present. Addresses are masked unless --show-addresses is given.\n";
+  The sheets default to the vault's ai-accounts.csv entry and ~/ai-account-logins.csv, the\n\
+  harness's files to its fleet-accounts.toml, ai-accounts-<cli>.toml and ai-pool.toml entries,\n\
+  each read in place from this Mac's verified store when it holds them.\n";
 
 /// Opens a review file for the owner and returns once they have closed it: the review folder
 /// lives only that long.
@@ -238,7 +242,6 @@ struct Args {
     dry_run: bool,
     review: bool,
     findings: bool,
-    reveal: bool,
     vault: Option<PathBuf>,
     logins: Option<PathBuf>,
     computers: Option<PathBuf>,
@@ -269,13 +272,15 @@ struct Args {
 }
 
 /// What a verb reads from and opens beyond the Commons: the import's review opener, the grid
-/// opener `edit` waits on, the stdin `add account` reads its address from, and this Mac's journal
-/// spool, whose heard archive `log` reads (`None`: the window alone).
+/// opener `edit` waits on, the stdin `add account` reads its address from, this Mac's journal
+/// spool, whose heard archive `log` reads (`None`: the window alone), and the secret store the
+/// registry's secret cells name entries of ([`super::secret::store`]).
 pub struct Io<'a> {
     pub review: Review<'a>,
     pub open: att::Opener<'a>,
     pub stdin: &'a mut dyn FnMut() -> Result<String>,
     pub heard: Option<super::journal::Spool>,
+    pub store: &'a dyn Store,
 }
 
 /// The first line of this process's stdin, at most 1 KiB: where `add account` reads its address.
@@ -379,7 +384,6 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
             ("import", "--review") => args.review = true,
             ("import", "--no-review") => args.review = false,
             ("import" | "adopt", "--findings") => args.findings = true,
-            (_, "--show-addresses") => args.reveal = true,
             ("import", "--vault-sheet") => {
                 if args.vault.is_some() {
                     return Err(Error::new("duplicate --vault-sheet"));
@@ -513,10 +517,12 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
     Ok(args)
 }
 
-/// Run one verb against the Commons at `paths`, reading `now_ms` as this Mac's clock.
+/// Run one verb against the Commons at `paths`, reading `now_ms` as this Mac's clock, with the
+/// registry's secret store as this build has it ([`super::secret::store`]).
 ///
 /// # Errors
-/// The words are not a verb, a sheet cannot be read, or the registry cannot be read or written.
+/// The words are not a verb, a sheet cannot be read, the registry cannot be read or written, or
+/// the secret store refuses an import's entry.
 pub fn run(
     paths: &Paths,
     words: &[String],
@@ -524,14 +530,17 @@ pub fn run(
     review: Review<'_>,
     now_ms: u64,
 ) -> Result<Value> {
-    let mut open =
-        |file: &Path, line: usize, secret: &[String]| att::amacs(file, line, Some(secret));
+    // A grid's opener names no concealed column (no grid cell shows a secret); `None` would
+    // conceal every cell of the private file.
+    let mut open = |file: &Path, line: usize| att::amacs(file, line, Some(&[]));
     let mut stdin = stdin_line;
+    let store = super::secret::store(paths);
     let mut io = Io {
         review,
         open: &mut open,
         stdin: &mut stdin,
         heard: super::journal::Spool::local(),
+        store: &store,
     };
     run_io(paths, words, vendors, &mut io, now_ms)
 }
@@ -574,7 +583,7 @@ pub fn run_io(
             let vendors = vendors.ok_or_else(|| {
                 Error::new("the importer reads the sheets the harness's way; run it as `aterm db alab import`")
             })?;
-            import(paths, &args, vendors, &mut *io.review, now_ms)
+            import(paths, &args, vendors, &mut *io.review, io.store, now_ms)
         }
         "check" => {
             let handle = Handle::at(paths.clone(), &att::REGISTRY);
@@ -586,22 +595,14 @@ pub fn run_io(
             };
             // No import has run where no source row is: what `check` reads is the Macs' own rows.
             let imported = !view.project(&registry::SOURCE).rows.is_empty();
-            // Two phone rows whose sealed numbers open to one number, by key only.
-            let phones = view.project(&PHONE);
-            let live_numbers = phones
-                .rows
-                .values()
-                .filter(|row| row.live() && row.get("number").and_then(Value::as_str).is_some())
-                .take(2)
-                .count();
-            let duplicates = if live_numbers >= 2 {
-                handle
-                    .with_sealer(|sealer| Ok(duplicate_numbers(&phones, sealer)))
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let (mut lab, generic) = checks::lab(&view.cells);
+            // Two live phone rows whose numbers are one number, by key only: a number as the
+            // generation here holds it, a sealed one opened to be compared. Where none opens
+            // (this Mac holds no key of the table), no duplicate is named.
+            let phone = handle.compiled().collection(PHONE.name)?;
+            let numbers =
+                att::open_ordinary(&handle, phone, "number", &view.cells).unwrap_or_default();
+            let duplicates = duplicate_numbers(&view.project(phone), &numbers);
+            let (mut lab, generic) = checks::lab(handle.compiled().table, &view.cells);
             lab.extend(checks::facts(
                 view.owned
                     .get(registry::MACHINE_FACTS.name)
@@ -639,7 +640,7 @@ pub fn run_io(
             let journal = super::journal::Spool::local().map(|spool| {
                 super::journal::status(&spool, aterm_types::dirs::aterm_config_path().as_deref())
             });
-            // The generated exports against what this Mac's `~/.secrets` holds (design §7).
+            // The generated exports against what this Mac's verified store holds (design §7).
             let exports = super::export::check(paths, vendors, now_ms / 1000);
             let table = handle.compiled().table;
             let mut findings: Vec<Value> = generic.iter().map(att::command::finding_json).collect();
@@ -648,8 +649,8 @@ pub fn run_io(
                     .iter()
                     .map(|found| att::command::capacity_json(table, found, &usage.actor)),
             );
-            // A later generation whose Secret tokens do not open under its key (an older build's
-            // roll copied them): `roll::endorse` refuses it; named by id, never a value.
+            // A later generation whose sealed tokens do not open under its key
+            // (`roll::Registry::unopened`); named by id, never a value.
             findings.extend(
                 Registry::at(paths.clone())
                     .unopened()
@@ -677,7 +678,7 @@ pub fn run_io(
                 "exports": exports,
             }))
         }
-        "adopt" => adopt(paths, &args, now_ms),
+        "adopt" => adopt(paths, &args, io.store, now_ms),
         "merge" => merge(paths, &args),
         "roll" => roll(paths, &args, now_ms),
         "export" => super::export::run(paths, vendors, args.apply, now_ms / 1000),
@@ -708,56 +709,74 @@ fn unopened_json(found: &super::roll::Unopened) -> Value {
     })
 }
 
-/// The live phone rows whose `number` cells open to one number, each group by key: two Macs
-/// that imported one new phone at once. A token that does not open is no duplicate.
-pub(super) fn duplicate_numbers(phones: &Projection, sealer: &dyn Sealer) -> Vec<Vec<String>> {
-    let opened: Vec<(&String, Secret)> = phones
-        .rows
-        .iter()
-        .filter(|(_, row)| row.live())
-        .filter_map(|(pk, row)| {
-            let token = row.get("number")?.as_str()?;
-            Some((pk, sealer.open(PHONE.name, pk, "number", token).ok()?))
-        })
-        .collect();
-    let mut grouped: Vec<Vec<String>> = Vec::new();
-    let mut placed = vec![false; opened.len()];
-    for (i, (pk, number)) in opened.iter().enumerate() {
-        if placed[i] {
-            continue;
-        }
-        let mut group = vec![(*pk).clone()];
-        for (j, (other, same)) in opened.iter().enumerate().skip(i + 1) {
-            if !placed[j] && number.same(same) {
-                placed[j] = true;
-                group.push((*other).clone());
-            }
-        }
-        if group.len() > 1 {
-            grouped.push(group);
+/// The live phone rows whose numbers are one number, each group by key: two Macs that imported
+/// one new phone at once. A row's number is its plain `number` cell, or, where the generation
+/// holds it sealed, what its one token opens to (`opened`, [`att::open_ordinary`]); a sealed
+/// number that did not open, or a conflicted one, is no duplicate.
+pub(super) fn duplicate_numbers(phones: &Projection, opened: &grid::Opened) -> Vec<Vec<String>> {
+    let mut by_number: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (pk, row) in phones.rows.iter().filter(|(_, row)| row.live()) {
+        let number = match opened.get(&(pk.clone(), "number".to_owned())) {
+            Some(values) => match values.as_slice() {
+                [one] if !one.is_empty() => Some(grid::show_opened(values)),
+                _ => None,
+            },
+            None => row
+                .get("number")
+                .and_then(Value::as_str)
+                .filter(|text| !crate::typed::secret::is_sealed(text))
+                .map(str::to_owned),
+        };
+        if let Some(number) = number {
+            by_number.entry(number).or_default().push(pk.clone());
         }
     }
-    grouped
+    by_number
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect()
 }
 
-/// The sheet at `explicit`, or the default file under `home` when it exists. An explicit
-/// `<file>.xlsx`, or `<file>.xlsx#<tab>`, is that workbook's tab ([`workbook`]).
-fn sheet(kind: SheetKind, explicit: Option<&Path>, default: PathBuf) -> Result<Option<Sheet>> {
+/// Where a sheet comes from when no flag names one.
+enum SheetDefault<'a> {
+    /// The entry of this Mac's verified store, read in place (never a file under `~/.secrets`).
+    Entry(&'a Paths, &'a str),
+    /// The person's own file, when it exists.
+    File(PathBuf),
+}
+
+/// The sheet at `explicit`, or its default when that holds one. An explicit `<file>.xlsx`, or
+/// `<file>.xlsx#<tab>`, is that workbook's tab ([`workbook`]).
+fn sheet(
+    kind: SheetKind,
+    explicit: Option<&Path>,
+    default: SheetDefault<'_>,
+) -> Result<Option<Sheet>> {
     let (path, tab) = match explicit {
         Some(path) => match workbook(path, kind) {
             Some((file, tab)) => (file, Some(tab)),
             None => (path.to_path_buf(), None),
         },
-        None => {
-            let Some(bytes) = crate::import::read_bounded_if_file(&default)? else {
-                return Ok(None);
-            };
-            let name = default
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| Error::new("a sheet's file name is not UTF-8"))?;
-            return Sheet::parse(kind, name, &bytes).map(Some);
-        }
+        None => match default {
+            SheetDefault::Entry(paths, name) => {
+                let Some(bytes) = aterm_secrets::client::read_in_place(paths, name)
+                    .map_err(|e| Error::new(&format!("the vault entry {name}: {e}")))?
+                else {
+                    return Ok(None);
+                };
+                return Sheet::parse(kind, name, bytes.as_slice()).map(Some);
+            }
+            SheetDefault::File(default) => {
+                let Some(bytes) = crate::import::read_bounded_if_file(&default)? else {
+                    return Ok(None);
+                };
+                let name = default
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| Error::new("a sheet's file name is not UTF-8"))?;
+                return Sheet::parse(kind, name, &bytes).map(Some);
+            }
+        },
     };
     let name = path
         .file_name()
@@ -863,64 +882,63 @@ fn known_macs(paths: &Paths) -> Result<Vec<KnownMac>> {
     Ok(roster_macs(paths)?.unwrap_or_default())
 }
 
-/// The harness files this import reads: those named, else the ones beside the vault sheet that
-/// exist. A file named and unreadable refuses the run; one found and unreadable is reported in
-/// `unread`, and since its kind then counts as unread this run it retracts nothing and no
-/// preference ends. Each is a secrets file, so its source is keyed under the `[everyone]` key
-/// (`Sheet::stated`): where this Mac holds none, a file is unreadable here, never digested plain.
+/// The harness sources this import reads: the files named, else the entries this Mac's verified
+/// store holds of them (read in place; no file under `~/.secrets` is opened). A file named and
+/// unreadable refuses the run; an entry held and unreadable is reported in `unread`, and since
+/// its kind then counts as unread this run it retracts nothing and no preference ends. Each is a
+/// secret source, so it is keyed under the `[everyone]` key (`Sheet::stated`): where this Mac
+/// holds none, a source is unreadable here, never digested plain.
 fn harness_sheets(
     paths: &Paths,
     args: &Args,
     vendors: &dyn Vendors,
 ) -> Result<(Vec<Sheet>, Unread)> {
-    let secrets = paths.home.join(".secrets");
     let named = !args.fleets.is_empty() || args.pool.is_some();
-    let files: Vec<(SheetKind, PathBuf)> = if named {
+    let sources: Vec<(SheetKind, String, Option<&Path>)> = if named {
         args.fleets
             .iter()
-            .map(|path| (SheetKind::FleetAccounts, path.clone()))
-            .chain(
-                args.pool
-                    .iter()
-                    .map(|path| (SheetKind::AiPool, path.clone())),
-            )
-            .collect()
+            .map(|path| (SheetKind::FleetAccounts, path))
+            .chain(args.pool.iter().map(|path| (SheetKind::AiPool, path)))
+            .map(|(kind, path)| {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| Error::new("a source's file name is not UTF-8"))?;
+                Ok((kind, name.to_owned(), Some(path.as_path())))
+            })
+            .collect::<Result<_>>()?
     } else {
         std::iter::once(aterm_secrets::entry_class::FLEET_ACCOUNTS.to_owned())
             .chain(["codex", "grok", "kimi"].map(aterm_secrets::entry_class::cli_accounts))
-            .map(|name| (SheetKind::FleetAccounts, secrets.join(name)))
+            .map(|name| (SheetKind::FleetAccounts, name, None))
             .chain([(
                 SheetKind::AiPool,
-                secrets.join(aterm_secrets::entry_class::AI_POOL),
+                aterm_secrets::entry_class::AI_POOL.to_owned(),
+                None,
             )])
             .collect()
     };
     let everyone = everyone(paths);
     let mut sheets = Vec::new();
     let mut unread = Vec::new();
-    for (kind, path) in files {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| Error::new("a source's file name is not UTF-8"))?
-            .to_owned();
-        // A file found is read through a final link like a named one; one absent (a dangling
-        // link included) or not a regular file is not there, and one there and unreadable is
-        // reported in `unread`.
-        let bytes = if named {
-            crate::import::read_bounded(&path).ok()
-        } else {
-            match crate::import::read_bounded_if_file(&path) {
+    for (kind, name, path) in sources {
+        // A file named is read through a final link; an entry the store does not hold is not
+        // there, and one it holds and cannot hand out is reported in `unread`.
+        let bytes = match path {
+            Some(path) => crate::import::read_bounded(path)
+                .ok()
+                .map(aterm_secrets::SecretBytes::new),
+            None => match aterm_secrets::client::read_in_place(paths, &name) {
                 Ok(None) => continue,
                 Ok(Some(bytes)) => Some(bytes),
                 Err(_) => None,
-            }
+            },
         };
         // Never the parser's own words, which may quote a row.
         let read = everyone.as_ref().zip(bytes).and_then(|((_, key), bytes)| {
-            let text = std::str::from_utf8(&bytes).ok()?;
+            let text = bytes.as_str()?;
             let rows = vendors.stated(kind, &name, text).ok()?;
-            Sheet::stated(kind, &name, &bytes, &rows, key).ok()
+            Sheet::stated(kind, &name, bytes.as_slice(), &rows, key).ok()
         });
         match read {
             Some(sheet) => sheets.push(sheet),
@@ -1067,9 +1085,10 @@ fn record_coverage(
     replica: &Replica,
     sheets: &[Sheet],
     vendors: &dyn Vendors,
+    store: &dyn Store,
     now_ms: u64,
 ) -> Result<Value> {
-    let mut listed = uncovered(handle, sheets, vendors, now_ms, true)?;
+    let mut listed = uncovered(handle, sheets, vendors, store, now_ms, true)?;
     let count = listed.len() + replica.withheld.len();
     // No cell of the dump, and first, so the listing's cap cannot drop it.
     if !replica.withheld.is_empty() {
@@ -1103,31 +1122,33 @@ fn record_coverage(
 }
 
 /// The cells of `sheets` the registry does not cover, `sheets` planned alone against the
-/// registry as an `--apply` left it ([`import::covered::judge`]). With `flags`, a flag-shaped
-/// `Secret` value (a replica's has-password `1`) is covered where it agrees with whether the
-/// registry's cell is set; without, it never is (a mailbox file's short value is a real, too
-/// short credential).
+/// registry as an `--apply` left it ([`import::covered::judge`]), its secret cells compared with
+/// the store entries they name, or with what their sealed tokens open to ([`plan_at`]). With
+/// `flags`, a flag-shaped secret value (a replica's has-password `1`) is covered where it agrees
+/// with whether the registry's cell is set; without, it never is (a mailbox file's short value
+/// is a real, too short credential).
 ///
 /// # Errors
-/// The registry cannot be read back.
+/// The registry or a store entry it names cannot be read back.
 fn uncovered(
     handle: &Handle,
     sheets: &[Sheet],
     vendors: &dyn Vendors,
+    store: &dyn Store,
     now_ms: u64,
     flags: bool,
 ) -> Result<Vec<import::covered::Uncovered>> {
+    let input = Input {
+        sheets,
+        macs: &[],
+        vendors,
+        store,
+        now_ms,
+        births: import::Births::Named,
+        unread: &[],
+    };
     handle.view_sealed(|view, sealer| {
-        let input = Input {
-            sheets,
-            macs: &[],
-            vendors,
-            sealer,
-            now_ms,
-            births: import::Births::Named,
-            unread: &[],
-        };
-        let plan = import::plan(&input, view)?;
+        let plan = plan_at(handle, &input, view, sealer)?;
         let projections: BTreeMap<&str, Projection> = [
             &registry::ADDRESS,
             &registry::MAILBOX,
@@ -1164,7 +1185,7 @@ fn uncovered(
     })
 }
 
-/// What the replica's `Secret` value at `at` says as a flag word
+/// What the replica's secret value at `at` says as a flag word
 /// ([`crate::typed::secret::flag_says`]); `None` where it is no flag word or is not there.
 fn flag_at(sheets: &[Sheet], at: &Coord) -> Option<bool> {
     let col = at.col.checked_sub(1)?;
@@ -1172,8 +1193,9 @@ fn flag_at(sheets: &[Sheet], at: &Coord) -> Option<bool> {
     crate::typed::secret::flag_says(value)
 }
 
-/// How recent a peer's repair round must be to speak for the lab now.
-pub(super) const FRESH_MS: u64 = 15 * 60 * 1000;
+/// How recent a peer's repair round must be to speak for the lab now. The Commons dialer
+/// keeps a round over the catalog well within it (`crate::runtime`'s dial scheduler).
+pub(crate) const FRESH_MS: u64 = 15 * 60 * 1000;
 
 /// Why an import into a registry this Mac holds nothing of must wait, read from the node
 /// service's latest repair round with each peer it knows (`peers`, `None` for a peer with no
@@ -1197,20 +1219,32 @@ pub(super) const FRESH_MS: u64 = 15 * 60 * 1000;
 /// import now could write concurrent candidates over every row and mint a second key for every
 /// phone, so it waits too. `None` where no peer is known or a round that speaks found nothing to
 /// bring.
+///
+/// A round repairs one table and a peer's next round takes another, so a peer's latest round
+/// is over the catalog one time in as many as the two Macs share tables, and for as long as the
+/// dialer waits before that peer's next round. `kept` is the latest round over the catalog,
+/// with any peer, that said something of it (`NetworkObservation::last_catalog_repair`), kept
+/// through the rounds over other tables that followed it. Fresh, and having exchanged and
+/// brought nothing (`RepairObservation::left_nothing`), it gives the catalog's word above as
+/// a peer's latest round would. It gives no other: a round that deferred or brought records
+/// holds an import back only while it is its peer's latest; kept, it takes the place of the
+/// word before it, and the import waits for the next round over the catalog that brings
+/// nothing.
 pub(super) fn empty_view_wait<'r>(
     table: Option<[u8; 32]>,
     catalog: Option<[u8; 32]>,
     peers: impl IntoIterator<Item = Option<&'r aterm_types::network_state::RepairObservation>>,
+    kept: Option<&aterm_types::network_state::RepairObservation>,
     now_ms: u64,
 ) -> Option<&'static str> {
-    use aterm_types::network_state::RepairOutcome;
+    use aterm_types::network_state::{RepairObservation, RepairOutcome};
+    let fresh =
+        |round: &RepairObservation| now_ms.saturating_sub(round.completed_at_ms) <= FRESH_MS;
     let mut known = false;
     let mut drained = false;
     for round in peers {
         known = true;
-        let Some(round) =
-            round.filter(|round| now_ms.saturating_sub(round.completed_at_ms) <= FRESH_MS)
-        else {
+        let Some(round) = round.filter(|round| fresh(round)) else {
             continue;
         };
         let deferred = matches!(round.outcome, RepairOutcome::Deferred(_))
@@ -1244,6 +1278,15 @@ pub(super) fn empty_view_wait<'r>(
             }
             drained |= exchanged && !received;
         }
+    }
+    // The catalog's word from a round that later rounds, over other tables, followed. It
+    // speaks only where this Mac names both tables apart, as the catalog arm above does.
+    if let (Some(table), Some(catalog)) = (table, catalog)
+        && table != catalog
+    {
+        drained |= kept.is_some_and(|round| {
+            fresh(round) && round.table == Some(catalog) && round.left_nothing()
+        });
     }
     (known && !drained).then_some(
         "no peer's repair round over the registry or the catalog in the last 15 minutes says whether the lab holds it",
@@ -1347,7 +1390,29 @@ fn latest_rounds_asking(
     }
 }
 
-/// [`empty_view_wait`] over this Mac's latest repair rounds ([`latest_rounds`]), for a registry
+/// [`empty_view_wait`] over the rounds `network` keeps: the latest of each peer it knows, and
+/// the lab's latest over the catalog.
+pub(crate) fn rounds_wait(
+    network: &aterm_types::network_state::NetworkObservation,
+    table: Option<[u8; 32]>,
+    catalog: Option<[u8; 32]>,
+    now_ms: u64,
+) -> Option<&'static str> {
+    let peers = network.peers.iter().map(|peer| peer.last_repair.as_ref());
+    let kept = network.last_catalog_repair.as_ref();
+    #[cfg(test)]
+    let kept = kept.filter(|_| !KEPT_UNREAD.with(std::cell::Cell::get));
+    empty_view_wait(table, catalog, peers, kept, now_ms)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`rounds_wait`], on for one test thread: the guard reads each peer's latest
+    /// round alone, as before a round over the catalog was kept.
+    pub(crate) static KEPT_UNREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`rounds_wait`] over this Mac's latest repair rounds ([`latest_rounds`]), for a registry
 /// it holds `ops` operations of, with the catalog [`empty_view_catalog`] read.
 ///
 /// # Errors
@@ -1371,12 +1436,54 @@ fn empty_view_guard(
         ))
     })?;
     let table = Registry::at(paths.clone()).table().ok().flatten();
-    let peers = network.peers.iter().map(|peer| peer.last_repair.as_ref());
-    match empty_view_wait(table, catalog, peers, now_ms) {
+    match rounds_wait(&network, table, catalog, now_ms) {
         Some(why) => Err(Error::new(&format!(
             "this Mac holds none of the registry yet and {why}; import once its repair round brings it"
         ))),
         None => Ok(()),
+    }
+}
+
+/// What one import reads but the registry.
+struct Sources<'a> {
+    sheets: &'a [Sheet],
+    macs: &'a [KnownMac],
+    vendors: &'a dyn Vendors,
+    store: &'a dyn Store,
+    now_ms: u64,
+    unread: &'a [SheetKind],
+}
+
+impl Sources<'_> {
+    fn input(&self) -> Input<'_> {
+        Input {
+            sheets: self.sheets,
+            macs: self.macs,
+            vendors: self.vendors,
+            store: self.store,
+            now_ms: self.now_ms,
+            births: import::Births::Named,
+            unread: self.unread,
+        }
+    }
+}
+
+/// The plan of `input` against `view`, the registry as the generation `handle` reaches holds it.
+/// A generation whose secret cells name store entries is planned against the store
+/// ([`import::plan`]); one that holds its secrets and phone numbers as sealed tokens, the form
+/// builds up to 0.200.0 read, with `sealer` ([`import::plan_sealed`]): its numbers and secrets
+/// are compared by opening them in memory and written sealed.
+fn plan_at(
+    handle: &Handle,
+    input: &Input<'_>,
+    view: &crate::att::View,
+    sealer: &dyn Sealer,
+) -> Result<Plan> {
+    let table = handle.compiled().table;
+    if table.names_store() {
+        import::plan(input, view)
+    } else {
+        import::plan_sealed(input, view, import::Sealed { table, sealer })
     }
 }
 
@@ -1403,35 +1510,13 @@ impl Sealer for Unheld {
     }
 }
 
-/// What one import reads but the registry's sealer.
-struct Sources<'a> {
-    sheets: &'a [Sheet],
-    macs: &'a [KnownMac],
-    vendors: &'a dyn Vendors,
-    now_ms: u64,
-    unread: &'a [SheetKind],
-}
-
-impl Sources<'_> {
-    fn input<'b>(&'b self, sealer: &'b dyn Sealer) -> Input<'b> {
-        Input {
-            sheets: self.sheets,
-            macs: self.macs,
-            vendors: self.vendors,
-            sealer,
-            now_ms: self.now_ms,
-            births: import::Births::Named,
-            unread: self.unread,
-        }
-    }
-}
-
 /// The plan of `sources` against this Mac's registry, writing nothing, with how much of it is
 /// held here and the seed records a write would add.
 ///
 /// # Errors
-/// The plan fails against the registry this Mac holds; one it cannot open (no key here) is
-/// planned against an empty registry instead.
+/// The plan fails against the registry this Mac holds, or a store entry a secret cell names
+/// cannot be read; a registry this Mac cannot read or open (no key here) is planned against an
+/// empty one instead.
 fn dry_plan(handle: &Handle, sources: &Sources<'_>) -> Result<(Plan, &'static str, usize)> {
     let (plan, registry, seeds, _) = dry_plan_with(handle, sources, |_| ())?;
     Ok((plan, registry, seeds))
@@ -1442,36 +1527,35 @@ fn dry_plan_with<T>(
     sources: &Sources<'_>,
     extra: impl FnOnce(&crate::att::View) -> T,
 ) -> Result<(Plan, &'static str, usize, Option<T>)> {
-    let planned = |view: &crate::att::View,
-                   sealer: &dyn Sealer,
-                   extra: &mut Option<T>|
-     -> Result<(Plan, &'static str, usize)> {
-        let plan = import::plan(&sources.input(sealer), view)?;
-        let seeds = crate::att::pack(super::seeds::rows_for(&view.cells)?)?.len();
-        let _ = extra;
-        Ok((
-            plan,
-            if view.complete {
-                "held"
-            } else {
-                "incomplete here"
-            },
-            seeds,
-        ))
-    };
-    let mut out_extra = None;
-    match handle.view_sealed(|view, sealer| {
-        let res = planned(view, sealer, &mut out_extra);
-        out_extra = Some(extra(view));
-        Ok(res)
-    }) {
-        Ok(planned) => {
-            let (plan, registry, seeds) = planned?;
-            Ok((plan, registry, seeds, out_extra))
+    let read = handle.view_sealed(|view, sealer| {
+        // The plan's own failure is the dry run's; only a registry that cannot be read is
+        // planned as not held.
+        let planned = plan_at(handle, &sources.input(), view, sealer).and_then(|plan| {
+            let seeds = crate::att::pack(super::seeds::rows_for(&view.cells)?)?.len();
+            Ok((plan, seeds))
+        });
+        let registry = if view.complete {
+            "held"
+        } else {
+            "incomplete here"
+        };
+        Ok((planned, registry, extra(view)))
+    });
+    match read {
+        Ok((planned, registry, extra)) => {
+            let (plan, seeds) = planned?;
+            Ok((plan, registry, seeds, Some(extra)))
         }
         Err(_) => {
             let cells = Default::default();
-            let plan = import::plan_unheld(&sources.input(&Unheld))?;
+            // The generation an apply would write: a sealed one is planned with a sealer that
+            // seals nothing, and the store is never asked.
+            let table = handle.compiled().table;
+            let sealed = (!table.names_store()).then_some(import::Sealed {
+                table,
+                sealer: &Unheld,
+            });
+            let plan = import::plan_unheld(&sources.input(), sealed)?;
             let seeds = crate::att::pack(super::seeds::rows_for(&cells)?)?.len();
             Ok((plan, "not held here", seeds, None))
         }
@@ -1512,15 +1596,23 @@ fn differs_json(plan: &Plan) -> Vec<Value> {
         .collect()
 }
 
+/// `import`: plan the sources against the registry as its generation here holds it
+/// ([`plan_at`]); with `--apply`, put each secret the plan names into its store entry and write
+/// the rows, in one pass under the registry's writer. In a generation builds up to 0.200.0 read
+/// the plan names no store entry: a secret is sealed into its cell, as those builds read it.
+///
+/// # Errors
+/// A source cannot be read, the registry cannot be read or written, or the store refuses an entry.
 fn import(
     paths: &Paths,
     args: &Args,
     vendors: &dyn Vendors,
     review: Review<'_>,
+    store: &dyn Store,
     now_ms: u64,
 ) -> Result<Value> {
     if let Some(csv) = &args.compare {
-        return compare_sheet(paths, csv, vendors, now_ms);
+        return compare_sheet(paths, csv, vendors, store, now_ms);
     }
     if args.digest {
         return replica_digest_report(paths);
@@ -1529,39 +1621,27 @@ fn import(
         sheet(
             SheetKind::Vault,
             args.vault.as_deref(),
-            paths
-                .home
-                .join(".secrets")
-                .join(aterm_secrets::entry_class::AI_ACCOUNTS_CSV),
+            SheetDefault::Entry(paths, aterm_secrets::entry_class::AI_ACCOUNTS_CSV),
         )?,
         sheet(
             SheetKind::Phones,
             args.phones.as_deref(),
-            paths
-                .home
-                .join(".secrets")
-                .join(aterm_secrets::entry_class::ALAB_PHONES),
+            SheetDefault::Entry(paths, aterm_secrets::entry_class::ALAB_PHONES),
         )?,
         sheet(
             SheetKind::Computers,
             args.computers.as_deref(),
-            paths
-                .home
-                .join(".secrets")
-                .join(aterm_secrets::entry_class::ALAB_COMPUTERS),
+            SheetDefault::Entry(paths, aterm_secrets::entry_class::ALAB_COMPUTERS),
         )?,
         sheet(
             SheetKind::Emails,
             args.emails.as_deref(),
-            paths
-                .home
-                .join(".secrets")
-                .join(aterm_secrets::entry_class::ALAB_EMAILS),
+            SheetDefault::Entry(paths, aterm_secrets::entry_class::ALAB_EMAILS),
         )?,
         sheet(
             SheetKind::Logins,
             args.logins.as_deref(),
-            paths.home.join("ai-account-logins.csv"),
+            SheetDefault::File(paths.home.join("ai-account-logins.csv")),
         )?,
     ]
     .into_iter()
@@ -1612,6 +1692,7 @@ fn import(
         sheets: &sheets,
         macs: &macs,
         vendors,
+        store,
         now_ms,
         unread: &unread_kinds,
     };
@@ -1631,15 +1712,84 @@ fn import(
         let seeded =
             Registry::at(paths.clone()).seed_until(std::time::Instant::now() + IMPORT_PASS);
         let pass = std::time::Instant::now() + IMPORT_PASS;
-        let (plan, applied) = handle.commit_sealed_until(true, pass, |view, sealer| {
+        let committed = handle.commit_sealed_until(true, pass, |view, sealer| {
             empty_view_guard(paths, view.ops.len(), catalog, now_ms)?;
-            let mut plan = import::plan(&sources.input(sealer), view)?;
+            let mut plan = plan_at(&handle, &sources.input(), view, sealer)?;
+            // Each secret goes into its entry before any row names it, so a cell never names an
+            // entry the store lacks. Each entry put and each the write replaces is owed first
+            // ([`crate::typed::secret::Store::owe`]), by this run: a pass cut short or refused
+            // leaves them to a sweep once this run has ended, never a value no cell names. A plan
+            // that names no entry (every plan against a generation that holds its secrets
+            // sealed) never asks the store.
+            let owed: Vec<String> = plan
+                .puts
+                .iter()
+                .map(|(entry, _)| entry.clone())
+                .chain(plan.removes.iter().cloned())
+                .collect();
+            if !plan.puts.is_empty() {
+                store.admit()?;
+            }
+            if !owed.is_empty() {
+                store.owe(&owed)?;
+            }
+            for (entry, value) in &plan.puts {
+                store.put(entry, value)?;
+            }
             let rows = std::mem::take(&mut plan.rows);
             Ok((plan, rows))
-        })?;
+        });
+        // A landed import pays its puts and retires the entries it replaced; a refused one
+        // leaves its puts owed ([`super::secret::settle_write`]). Only a generation whose cells
+        // name store entries has anything to settle: an import into one that holds its secrets
+        // sealed leaves the store as it is.
+        let landed = committed.as_ref().ok().map(|(plan, _)| {
+            (
+                plan.puts
+                    .iter()
+                    .map(|(entry, _)| entry.clone())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                plan.removes
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        });
+        // The import's outcome is reported whatever the settle after it meets: what landed is
+        // in the registry, and a settle that failed leaves what it owes to a later sweep.
+        let settled = handle.compiled().table.names_store().then(|| {
+            super::secret::settle_write(
+                &handle,
+                store,
+                landed.as_ref().map(|(put, replaced)| (put, replaced)),
+            )
+        });
+        let (plan, applied) = committed?;
         let mut report = summary(&plan, &sheets, &macs, "held", args.findings);
         insert(&mut report, "dry_run", json!(false));
         insert(&mut report, "unread", json!(unread));
+        insert(&mut report, "store_puts", json!(plan.puts.len()));
+        match settled {
+            Some(Ok(settled)) => {
+                insert(&mut report, "store_removes", json!(settled.removed));
+                insert(&mut report, "store_owed", json!(settled.left));
+            }
+            Some(Err(error)) => {
+                // Nothing is known removed, and each put may still be on the owed record beside
+                // the entries the write replaced: a later sweep settles each.
+                insert(&mut report, "store_removes", json!(0));
+                insert(
+                    &mut report,
+                    "store_owed",
+                    json!(plan.removes.len() + plan.puts.len()),
+                );
+                insert(&mut report, "settle_error", json!(error.to_string()));
+            }
+            None => {
+                insert(&mut report, "store_removes", json!(0));
+                insert(&mut report, "store_owed", json!(0));
+            }
+        }
         insert(&mut report, "records", json!(applied.records));
         insert(&mut report, "written", json!(applied.cells));
         insert(
@@ -1654,12 +1804,13 @@ fn import(
                 replica,
                 &sheets[at.clone()],
                 vendors,
+                store,
                 now_ms,
             )?;
             insert(&mut report, "replica", record);
         }
         if let Some(at) = mailboxes {
-            let uncovered = uncovered(&handle, &sheets[at..=at], vendors, now_ms, false)?;
+            let uncovered = uncovered(&handle, &sheets[at..=at], vendors, store, now_ms, false)?;
             insert(
                 &mut report,
                 "mailbox_toml",
@@ -1674,6 +1825,7 @@ fn import(
     let matches = matches_registry(&plan);
     insert(&mut report, "dry_run", json!(true));
     insert(&mut report, "unread", json!(unread));
+    insert(&mut report, "store_puts", json!(plan.puts.len()));
     if let Some((replica, _)) = &replica {
         insert(
             &mut report,
@@ -1688,7 +1840,7 @@ fn import(
     if args.review {
         // The folder lives while the owner looks: dropping it removes it, however the review
         // ends, so no note's text is left behind in a temporary folder.
-        let folder = write_review(&plan, &sheets, args.reveal)?;
+        let folder = write_review(&plan, &sheets)?;
         for file in ["findings.tsv", "planned.tsv"] {
             review(&folder.path().join(file))?;
         }
@@ -1700,7 +1852,13 @@ fn import(
 /// `import --compare-sheet <csv>`: what the sheet's fill-only import would do, counted and keyed
 /// by row key and column, and how its password flags meet the registry's `address.password`
 /// cells (set, held, missing). It writes nothing and prints no value: no cell, no address.
-fn compare_sheet(paths: &Paths, csv: &Path, vendors: &dyn Vendors, now_ms: u64) -> Result<Value> {
+fn compare_sheet(
+    paths: &Paths,
+    csv: &Path,
+    vendors: &dyn Vendors,
+    store: &dyn Store,
+    now_ms: u64,
+) -> Result<Value> {
     let name = csv
         .file_name()
         .and_then(|n| n.to_str())
@@ -1716,6 +1874,7 @@ fn compare_sheet(paths: &Paths, csv: &Path, vendors: &dyn Vendors, now_ms: u64) 
         sheets: &sheets,
         macs: &macs,
         vendors,
+        store,
         now_ms,
         unread: &[],
     };
@@ -1743,17 +1902,17 @@ fn compare_sheet(paths: &Paths, csv: &Path, vendors: &dyn Vendors, now_ms: u64) 
             }
         })
         .collect();
-    let sealed = |pk: &String| {
+    let stored = |pk: &String| {
         addresses
             .rows
             .get(pk)
             .is_some_and(|row| row.live() && row.get("password").is_some_and(|x| !x.is_null()))
     };
-    let held = flagged.iter().filter(|pk| sealed(pk)).count();
+    let held = flagged.iter().filter(|pk| stored(pk)).count();
     let unflagged = addresses
         .rows
         .iter()
-        .filter(|(pk, _)| sealed(pk) && !flagged.contains(*pk))
+        .filter(|(pk, _)| stored(pk) && !flagged.contains(*pk))
         .count();
     let mut report = summary(&plan, &sheets, &[], registry, false);
     insert(&mut report, "kind", json!(kind.word()));
@@ -1768,10 +1927,10 @@ fn compare_sheet(paths: &Paths, csv: &Path, vendors: &dyn Vendors, now_ms: u64) 
         "password_flags",
         json!({
             "set": set,
-            "sealed_in_registry": held,
+            "stored_in_registry": held,
             "missing_in_registry": flagged.len() - held + unmatched,
             "no_address": unkeyed,
-            "sealed_unflagged": unflagged,
+            "stored_unflagged": unflagged,
         }),
     );
     Ok(report)
@@ -1809,7 +1968,7 @@ fn roll(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
     }))
 }
 
-fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
+fn adopt(paths: &Paths, args: &Args, store: &dyn Store, now_ms: u64) -> Result<Value> {
     struct NoSheets;
     impl Vendors for NoSheets {
         fn mark(&self, _: &str, _: &str, _: &str) -> import::Mark {
@@ -1821,7 +1980,7 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
         sheets: &[],
         macs: &macs,
         vendors: &NoSheets,
-        sealer: &Unheld,
+        store,
         now_ms,
         births: import::Births::None,
         unread: &[],
@@ -2107,32 +2266,14 @@ fn summary(plan: &Plan, sheets: &[Sheet], macs: &[KnownMac], registry: &str, lis
 /// What the review shows in place of a cell shaped like a credential or naming a secret.
 pub const WITHHELD: &str = "(withheld: shaped like a secret)";
 
-/// A sheet cell for the local review: every word holding `@` masked unless `reveal`; a cell
-/// shaped like a credential, naming a secret or holding a phone number (a `Secret` cell's
-/// value) is never shown, not even here.
-fn review_text(text: &str, reveal: bool) -> String {
-    if guard::withheld(text) || guard::phone_shaped(text) {
-        return WITHHELD.to_owned();
+/// A sheet cell for the local review: a cell shaped like a credential or naming a secret is
+/// never shown, not even here; an address or a phone number shows as it is.
+fn review_text(text: &str) -> &str {
+    if guard::withheld(text) {
+        WITHHELD
+    } else {
+        text
     }
-    let flat: String = text
-        .chars()
-        .map(|c| if c == '\t' || c.is_control() { ' ' } else { c })
-        .collect();
-    if reveal || !flat.contains('@') {
-        return flat;
-    }
-    let mut out = String::with_capacity(flat.len());
-    for (i, word) in flat.split(' ').enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        if word.contains('@') {
-            out.push_str(&grid::mask(word));
-        } else {
-            out.push_str(word);
-        }
-    }
-    out
 }
 
 fn tsv(rows: &[Vec<String>]) -> String {
@@ -2159,7 +2300,7 @@ fn tsv(rows: &[Vec<String>]) -> String {
 /// finding with the text at its coordinates, the only place that text is shown, never for a
 /// credential-shaped cell) and `planned.tsv` (each register the import would write, leave or
 /// find unchanged).
-fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tempfile::TempDir> {
+fn write_review(plan: &Plan, sheets: &[Sheet]) -> Result<aterm_tempfile::TempDir> {
     let folder = aterm_tempfile::Builder::new()
         .prefix("alab-import-")
         .suffix(".noindex")
@@ -2210,7 +2351,7 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
                 }
                 Some(s) => (
                     s.name.clone(),
-                    review_text(s.text(at).unwrap_or_default(), reveal),
+                    review_text(s.text(at).unwrap_or_default()).to_owned(),
                 ),
                 None if at.sheet == import::ROSTER => ("swarm roster".to_owned(), String::new()),
                 None => (String::new(), String::new()),
@@ -2237,11 +2378,14 @@ fn write_review(plan: &Plan, sheets: &[Sheet], reveal: bool) -> Result<aterm_tem
         let shown = match item.column.split_once('.') {
             Some((_, elem)) => elem.to_owned(),
             None => {
-                let ty = REGISTRY
+                // The planner's own shape, the registry's newest: a planned number shows as it
+                // is, a secret reference by its entry name, and anything else a secret column
+                // holds (the mask of a sealed cell) as the mask.
+                let ty = registry::REGISTRY_3
                     .collection(item.collection)
                     .and_then(|c| c.column(&item.column))
                     .map_or(Ty::Json(0), |c| c.ty);
-                grid::show(&ty, &item.x, reveal)
+                grid::show(&ty, &item.x)
             }
         };
         let step = match item.step {

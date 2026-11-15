@@ -5,6 +5,7 @@
 
 use std::io::{Read as _, Write as _};
 
+use super::index_snapshot::Standing;
 use super::*;
 use crate::artifact::package::{PackageOutcome, PackageRequest};
 use crate::artifact::tools::Tools;
@@ -117,9 +118,21 @@ impl Campaign {
 
     /// Publish a frozen package and its index as one resumable native operation.
     /// Index retries use the previously retained candidate, never a newly signed
-    /// replacement. Installation and running-process adoption are separate.
+    /// replacement. A retained candidate the public channel can never serve is
+    /// retired by receipt, and the frozen pin is planned afresh over the channel
+    /// head, signed until `valid_until` when given and otherwise until the head's
+    /// horizon. A head that pins a newer build, yanks the frozen one or holds it
+    /// below its floor is refused before anything is staged. An index the channel
+    /// already serves for this campaign is read back and reported, never repinned.
+    /// Installation and running-process adoption are separate.
     /// # Errors
-    /// Every native package, staging, index or durable receipt failure.
+    /// Every native package, staging, index or durable receipt failure, a head
+    /// that supersedes or withdrew the frozen build, or a `valid_until` other than
+    /// the horizon a resumed candidate was signed with.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "native qualification's inputs plus the one index horizon a new plan takes"
+    )]
     pub fn publish_package(
         &mut self,
         ctx: &Ctx,
@@ -127,17 +140,45 @@ impl Campaign {
         tools: &dyn Tools,
         inputs: &crate::project_toolchain::Inputs,
         signed_root: &dyn Fn(u64) -> std::result::Result<String, String>,
+        valid_until: Option<&str>,
         log: &mut Log,
-    ) -> Result<crate::channel::index::Outcome> {
-        if self.retained_index(ctx)?.is_some() {
-            self.qualify_package(ctx, request, tools, inputs, signed_root)?;
-            return self.resume_index(ctx, log);
+    ) -> Result<Outcome> {
+        match self.standing(ctx, log)? {
+            Standing::Published(index_build) => {
+                return Ok(Outcome {
+                    index_build,
+                    published_now: false,
+                });
+            }
+            Standing::Resume => {
+                let retained = self
+                    .retained_index(ctx)?
+                    .ok_or_else(|| Error::refused("the retained index attempt disappeared"))?;
+                let signed = &retained.candidate().index.valid_until;
+                if let Some(asked) = valid_until
+                    && asked != signed.as_str()
+                {
+                    return Err(Error::refused(format!(
+                        "the retained {} resumes exactly as signed, valid until {signed}; \
+                         re-run without --valid-until {asked}",
+                        crate::quad::index_tag(retained.candidate().index.index_build)
+                    )));
+                }
+                self.qualify_package(ctx, request, tools, inputs, signed_root)?;
+                let outcome = self.resume_index(ctx, log)?;
+                return Ok(Outcome {
+                    index_build: outcome.published.index_build,
+                    published_now: true,
+                });
+            }
+            Standing::Plan => {}
         }
         self.stage_package(ctx, request, tools, inputs, signed_root)?;
         let mut delta = crate::api::Delta::default();
         delta
             .pins
             .insert(self.inputs.program.clone(), self.inputs.build);
+        delta.valid_until = valid_until.map(str::to_string);
         let index_request = crate::api::IndexRequest {
             baseline: crate::api::Baseline::ChannelHead,
             delta,
@@ -158,7 +199,10 @@ impl Campaign {
             build: outcome.published.index_build,
             quad: crate::channel::index::quad_digests(retained.candidate())?,
         })?;
-        Ok(outcome)
+        Ok(Outcome {
+            index_build: outcome.published.index_build,
+            published_now: true,
+        })
     }
 
     /// Requalify the actual package with native source, compiler, tree, signing

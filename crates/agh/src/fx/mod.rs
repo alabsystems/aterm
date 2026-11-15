@@ -117,10 +117,6 @@ pub const DOOR_FABRIC: &str = "fabric";
 /// The git runner's door: an exchange, the run's canonical command out and its exit,
 /// stdout and stderr back.
 pub const DOOR_GIT: &str = "git";
-/// A child's door (`gh auth token`): never taped. `auth import` is a Provision verb, and
-/// tapes refuse those.
-pub const DOOR_CHILD: &str = "child";
-
 /// Which world the doors reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -308,14 +304,6 @@ fn stream_without_source() -> Error {
          (Fx::with_source)",
     )
     .with_next("run it without --record or --replay")
-}
-
-fn child_not_taped() -> Error {
-    Error::replay(
-        Replay::StreamNotTaped,
-        "a child process is not taped: the verbs that run one provision, and tapes refuse those",
-    )
-    .with_next("run it without --record or --replay: a tape never runs a child")
 }
 
 fn ended(d: &ReplayDivergence, len: usize) -> Error {
@@ -1479,52 +1467,9 @@ impl Fx {
         }
     }
 
-    /// One child process (`gh auth token`). Live: `child::run(spec)`. Simulated: first the
-    /// live arm's refusal of a relative program (`child::check`, so a run the live seam would
-    /// refuse fails its simulated test too), then the next scripted child, whose program and
-    /// args must equal `spec`'s (a mismatch panics in the test that scripted it); an empty
-    /// scripted queue is could_not_run, why `{program} could not start: no scripted child`, as
-    /// a missing program is live. Under any tape: `Replay::StreamNotTaped`, before anything
-    /// runs.
-    ///
-    /// # Errors
-    ///
-    /// As above; the run's could_not_run.
-    pub(crate) fn child(&self, spec: &child::ChildSpec) -> Result<child::ChildOut> {
-        match &self.seam {
-            Seam::Live(_) => child::run(spec),
-            #[cfg(any(test, debug_assertions))]
-            Seam::Simulated(clock) => {
-                child::check(spec)?;
-                clock.log(spec);
-                let Some(scripted) = clock.next_child() else {
-                    return Err(Error::local(format!(
-                        "{} could not start: no scripted child",
-                        spec.program.display()
-                    )));
-                };
-                let args: Vec<String> = spec
-                    .args
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect();
-                assert_eq!(
-                    (&scripted.program, &scripted.args),
-                    (&spec.program, &args),
-                    "the scripted child is not the one this run asked for"
-                );
-                Ok(scripted.out)
-            }
-            Seam::Recording { .. } | Seam::Replaying { .. } | Seam::Rerecording { .. } => {
-                self.latched()?;
-                Err(self.latch(child_not_taped()))
-            }
-        }
-    }
-
-    /// One git run (`Github::run_git`). Live and simulated: `child::run(spec)`, the real
+    /// One git run (`Github::run_git`). Live and simulated: `child::run_unless(spec)`, the real
     /// `git` (a simulated test runs the host's git against agh-fake or a local repository;
-    /// simulated, `child::check` passes before the spec is logged, as in `child`).
+    /// simulated, `child::check` passes before the spec is logged).
     /// Recording: run, and taped as an exchange at `DOOR_GIT` (`canon::git_request`,
     /// `canon::git_reply`); a run that ended with no exit is taped as its error
     /// (`canon::git_failure`). Replaying: the tape's answer, its output or its error
@@ -1706,27 +1651,6 @@ impl Fx {
         result
     }
 
-    /// Tests: the same simulated `Fx`, answering `child` from `children` in order.
-    ///
-    /// # Panics
-    ///
-    /// When the `Fx` is not simulated: a live `Fx` would run the real child (the host's
-    /// `gh auth token`) in place of the scripted one, and a taped one answers every child
-    /// `Replay::StreamNotTaped` and latches. A test built either way fails here, before it
-    /// reads a real credential or poisons a tape.
-    #[cfg(any(test, debug_assertions))]
-    #[must_use]
-    pub fn with_children(self, children: Vec<child::ScriptedChild>) -> Fx {
-        let Seam::Simulated(clock) = &self.seam else {
-            panic!(
-                "Fx::with_children scripts only a simulated Fx, not {:?}",
-                self.mode()
-            );
-        };
-        clock.script(children);
-        self
-    }
-
     /// Tests: answer each accepted simulated Git child from `answers`, without running Git.
     /// An installed script is fail-closed: one more child than answers is a local error.
     #[cfg(all(unix, any(test, debug_assertions)))]
@@ -1749,7 +1673,7 @@ impl Fx {
         }
     }
 
-    /// Tests: every spec `child` or `git` accepted (one `child::check` passed) under a simulated
+    /// Tests: every spec `git` accepted (one `child::check` passed) under a simulated
     /// `Fx`, in call order, so a test of the git runner reads the environment and directories
     /// its children got.
     /// Empty in every other mode.

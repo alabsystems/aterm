@@ -312,8 +312,8 @@ fn parse_single_grant(
             }
             if !valid_principal(p) {
                 return Err(format!(
-                    "invalid principal {p:?}: expected one of {PRINCIPAL_CLASSES:?} \
-                     then 1..={PRINCIPAL_NAME_MAX} of [a-z0-9-]"
+                    "invalid principal {p:?}: expected a tab ID (t and 10 base32 characters) \
+                     or one of {PRINCIPAL_CLASSES:?} then 1..={PRINCIPAL_NAME_MAX} of [a-z0-9-]"
                 ));
             }
             principal = Some(p.to_string());
@@ -502,18 +502,47 @@ fn decode_lower_hex_utf8(hex: &str) -> Option<String> {
     }
 }
 
+/// The bytes of an aterm tab ID: `t` and 10 lower-case Crockford base32 characters.
+const TAB_ID_LEN: usize = 11;
+
+/// Whether `p` is an aterm tab ID: `t` and 10 characters of `0-9` and `a-z` without `i`, `l`,
+/// `o` and `u` (aterm's `aterm_types::tab_id`). A session's principal is its tab ID. No
+/// reserved literal subject segment is one: each is shorter than 11 bytes or holds an `i`,
+/// `l`, `o` or `u`.
+const fn is_tab_id(p: &[u8]) -> bool {
+    if p.len() != TAB_ID_LEN {
+        return false;
+    }
+    let &[b't', ref rest @ ..] = p else {
+        return false;
+    };
+    let mut rest = rest;
+    while let &[b, ref tail @ ..] = rest {
+        if !(matches!(b, b'0'..=b'9' | b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't')
+            || matches!(b, b'v'..=b'z'))
+        {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
 const fn is_principal_body_byte(b: u8) -> bool {
     (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') || b == b'-'
 }
 
-/// Whether `p` is a well-formed principal: a class prefix (`s-` session, `n-`
-/// node, `h-` human, `a-` service) then `[a-z0-9-]{1,32}`.
+/// Whether `p` is a well-formed principal: an aterm tab ID ([`is_tab_id`]), or a class prefix
+/// (`s-` session, `n-` node, `h-` human, `a-` service) then `[a-z0-9-]{1,32}`.
 ///
-/// HONEST BOUNDARY: the per-class *shape* of the name (`s-<20 hex>`, `n-<16 hex>`)
-/// is deliberately not enforced here. What this rejects is anything that could
-/// confuse the grant grammar or the subject grammar — a `:`, a `/`, a wildcard, a
-/// control byte, an over-long or empty name — not anything about who issued the id.
+/// HONEST BOUNDARY: the per-class *shape* of the name (`n-<16 hex>`) is deliberately not
+/// enforced here. What this rejects is anything that could confuse the grant grammar or the
+/// subject grammar — a `:`, a `/`, a wildcard, a control byte, an over-long or empty name — not
+/// anything about who issued the id.
 const fn valid_principal(p: &str) -> bool {
+    if is_tab_id(p.as_bytes()) {
+        return true;
+    }
     let bytes = p.as_bytes();
     if bytes.len() > PRINCIPAL_TOTAL_MAX {
         return false;
@@ -1945,6 +1974,25 @@ mod tests {
             );
             assert!(mint(b"secret", bad).is_err(), "{bad:?} must not mint");
             assert_eq!(mode_of(bad), None, "{bad:?} has no mode");
+        }
+        // An aterm tab ID is a session's principal; every near miss is refused.
+        let tab = "rw,p=tqn5r6e0148:/f/F/pub/>";
+        assert_eq!(
+            Grant::parse(tab).map(|g| g.principal),
+            Ok(Some("tqn5r6e0148".to_string()))
+        );
+        for near in [
+            "tqn5r6e014",   // 10 bytes
+            "tqn5r6e01488", // 12 bytes
+            "tqn5r6e014i",  // Crockford excludes i, l, o and u
+            "tqn5r6e014u",
+            "tQN5R6E0148", // upper case
+            "xqn5r6e0148", // not `t`
+        ] {
+            assert!(
+                Grant::parse(&format!("rw,p={near}:/f/F/pub/>")).is_err(),
+                "{near:?} is not a principal"
+            );
         }
         // A 32-character name is the boundary; 33 is over it.
         let name32 = "h-".to_string() + &"a".repeat(32);

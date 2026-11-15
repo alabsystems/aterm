@@ -328,7 +328,7 @@ pub fn scan(listing: &Listing<'_>, engine: Option<&Engine>, into: Option<&Path>)
     let judged = AtomicUsize::new(0);
     let next = AtomicUsize::new(0);
     let workers = aterm_cores::available_parallelism().map_or(4, |n| n.get().min(16));
-    let found: Vec<Vec<Finding>> = crate::memo::threads(|s| {
+    let found: Vec<Vec<Finding>> = crate::workers::threads(|s| {
         let running: Vec<_> = (0..workers)
             .map(|_| {
                 s.spawn(|| {

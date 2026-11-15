@@ -155,11 +155,9 @@ fn measure(json_out: Option<&Path>, sustained: bool, workload: Workload) -> Resu
     let build = targo.display("test", &args);
     eprintln!("  {}", plan.summary());
     eprintln!("  $ {build}");
-    let built = targo
-        .command("test")?
-        .args(args)
-        .current_dir(&root)
-        .output()
+    let mut build_command = targo.command("test")?;
+    build_command.args(args).current_dir(&root);
+    let built = super::driver::compiler_output(&mut build_command)
         .map_err(|error| format!("could not build Commons measurement: {error}"))?;
     if !built.status.success() {
         return Err(Halt::Fail(format!(

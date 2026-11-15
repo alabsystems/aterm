@@ -187,7 +187,12 @@ fn journal_references_name_live_registry_collections() {
     for collection in JOURNAL.collections {
         assert_eq!(collection.check(), Ok(()), "{}", collection.name);
         for column in collection.columns {
-            assert!(!column.ty.pii(), "{}.{}", collection.name, column.name);
+            assert!(
+                !column.ty.holds_address(),
+                "{}.{}",
+                collection.name,
+                column.name
+            );
             let mut named = Vec::new();
             refs(&column.ty, &mut named);
             dangling.extend(

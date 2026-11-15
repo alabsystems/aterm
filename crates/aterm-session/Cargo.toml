@@ -14,6 +14,8 @@ description = "Hierarchical-session routing fabric: stable session ids, the per-
 [features]
 
 [dependencies]
+# The one tab-ID parser (`aterm_types::tab_id`): a session's ID is its tab's.
+aterm-types = { workspace = true }
 aterm-pty = { workspace = true }
 # The workspace's audited entropy source (`aterm_uds::rand::fill`): session ids and
 # launch nonces mint through it, so this crate needs no `rand_core`.

@@ -218,8 +218,6 @@ enum Deploy {
     Stale,
     /// Goes live, but the live engine names a commit no repo holds.
     Ghost,
-    /// No service-account key could be read.
-    NoKey,
     /// Google's token endpoint refused the key.
     Refused,
     /// An upload failed: nothing released.
@@ -233,7 +231,7 @@ enum Deploy {
 struct Deployed {
     /// The plan's paths, in order.
     files: Vec<String>,
-    key: Option<PathBuf>,
+    key: Vec<u8>,
     message: String,
 }
 
@@ -442,24 +440,17 @@ impl World for Fake {
     fn deploy(
         &mut self,
         plan: &hosting::Plan,
-        key: Option<&Path>,
+        key: &aterm_uds::secret::Secret,
         message: &str,
         _out: &mut dyn std::io::Write,
     ) -> Result<Released, Failed> {
         self.calls.push(Call::Deploy(Deployed {
             files: plan.files.iter().map(|f| f.path.clone()).collect(),
-            key: key.map(Path::to_path_buf),
+            key: key.expose().to_vec(),
             message: message.into(),
         }));
         let version = "sites/fixture-site/versions/v1".to_string();
         match self.deploy {
-            Deploy::NoKey => {
-                return Err(Failed::Credential(
-                    "no service-account key is named (FIREBASE_SA_KEY, or publish/site.toml's \
-                     firebase_sa_key)"
-                        .into(),
-                ));
-            }
             Deploy::Refused => {
                 return Err(Failed::Credential(
                     "the token endpoint refused the service-account key deployer@fixture: HTTP \
@@ -562,14 +553,20 @@ impl Lab {
             fresh = Some(lab);
             built
         });
-        if let Some(lab) = fresh {
-            return lab;
-        }
-        let mut lab = Self::empty(site_root);
-        built.tree.lay(&built.root, &lab.root);
-        lab.public_sha = built.public_sha.clone();
-        lab.generation = built.generation;
+        let lab = fresh.unwrap_or_else(|| {
+            let mut lab = Self::empty(site_root);
+            built.tree.lay(&built.root, &lab.root);
+            lab.public_sha = built.public_sha.clone();
+            lab.generation = built.generation;
+            lab
+        });
+        crate::site::tests::registry_under(&lab.root.join("home"), Some("{}"));
         lab
+    }
+
+    /// The deployer's key this Mac's store holds: what every deploy is handed.
+    fn deployer_key(&self) -> Vec<u8> {
+        b"{}".to_vec()
     }
 
     fn build(site_root: &str, changelog: bool) -> Self {
@@ -725,8 +722,6 @@ impl Lab {
             verify_sleep: 0,
             today: TODAY.into(),
             firebase_site: Some("fixture-site".into()),
-            firebase_sa_key: None,
-            firebase_sa_key_in_site: Some("../deployer.json".into()),
             author: Some(("Andrew Yates (pub)".into(), "pub@example.invalid".into())),
             subject_prefix: "site: ".into(),
             wasm_pin: Some(PIN.into()),
@@ -833,12 +828,12 @@ fn public_files(site: &Path) -> Vec<String> {
     found
 }
 
-/// The one deploy a sync of `lab` hands Hosting: public/ as it is now, the key
-/// publish/site.toml names under the site checkout, released for the public commit.
+/// The one deploy a sync of `lab` hands Hosting: public/ as it is now, the key this Mac's vault
+/// registry holds, released for the public commit.
 fn the_deploy(lab: &Lab) -> Deployed {
     Deployed {
         files: public_files(&lab.site),
-        key: Some(lab.site.canonicalize().unwrap().join("../deployer.json")),
+        key: lab.deployer_key(),
         message: format!("ship site: {SLUG} @ {}", &lab.public_sha[..12]),
     }
 }
@@ -1298,24 +1293,34 @@ fn no_usable_site_checkout_touches_nothing() {
     assert!(world.calls.is_empty());
 }
 
+/// A key this Mac's vault registry does not hold is filed with the lab, and nothing is handed
+/// Hosting; a key Hosting refuses is not deployed either; a failure past the key is a failure.
 #[test]
 fn a_missing_or_refused_key_commits_and_pushes_but_never_hides_a_real_failure() {
     at_once(
         [
-            (Deploy::NoKey, None),
-            (Deploy::Refused, None),
+            (Deploy::Ok, false, None),
+            (Deploy::Refused, true, None),
             (
                 Deploy::Unreleased,
+                true,
                 Some("the live site still serves its previous release"),
             ),
-            (Deploy::ReleaseFails, Some("whether the live site switched")),
+            (
+                Deploy::ReleaseFails,
+                true,
+                Some("whether the live site switched"),
+            ),
         ],
         a_key_case,
     );
 }
 
-fn a_key_case((deploy, failure): (Deploy, Option<&str>)) {
+fn a_key_case((deploy, held, failure): (Deploy, bool, Option<&str>)) {
     let lab = Lab::new();
+    if !held {
+        crate::site::tests::registry_under(&lab.root.join("home"), None);
+    }
     let mut world = lab.fake("releases-fat.json");
     world.deploy = deploy;
     let (ended, out) = lab.run(&mut world);
@@ -1343,9 +1348,18 @@ fn a_key_case((deploy, failure): (Deploy, Option<&str>)) {
                     && last.contains("nothing was published"),
                 "{deploy:?}: {last}"
             );
+            assert_eq!(
+                last.contains(
+                    "holds no site-deployer-key entry; filed `aterm secrets need \
+                     site-deployer-key` with the lab: "
+                ),
+                !held,
+                "{deploy:?}: {last}"
+            );
         }
     }
-    assert_eq!(world.deploys(), [the_deploy(&lab)], "{deploy:?}");
+    let handed: &[Deployed] = if held { &[the_deploy(&lab)] } else { &[] };
+    assert_eq!(world.deploys(), handed, "{deploy:?}");
     assert!(
         lab.owed_marker().is_file(),
         "{deploy:?}: the commit stays owed"

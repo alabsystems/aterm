@@ -3,7 +3,7 @@
 
 //! Tests for draft journal owner identity and the launch sweep.
 
-use super::super::DraftJournalHost;
+use super::super::{DraftJournalHost, JournalFault};
 use super::*;
 use crate::document_store::DocumentSnapshot;
 use crate::native_document_io::JournalRecord;
@@ -45,7 +45,7 @@ fn open_clean(host: &DraftJournalHost, uri: &str, disk: &str) -> PathBuf {
         .expect("inspect");
     // Sweep fixtures deliberately have no per-open registration: only the owner lease
     // and on-disk membership protect them, as after an interrupted acquisition.
-    host.initialize_owned(decision, &disk, &disk, None)
+    host.initialize_owned(decision, &disk, &disk, JournalLockPatience::EventLoop, None)
         .expect("initialize")
         .path
 }
@@ -68,9 +68,15 @@ fn open_with_draft(host: &DraftJournalHost, uri: &str, disk: &str, draft: &str) 
         crate::document_store::DocumentTxnOutcome::Committed { .. }
     ));
     let current = store.snapshot(disk_snapshot.id).expect("draft");
-    host.initialize_owned(decision, &disk_snapshot, &current, None)
-        .expect("initialize")
-        .path
+    host.initialize_owned(
+        decision,
+        &disk_snapshot,
+        &current,
+        JournalLockPatience::EventLoop,
+        None,
+    )
+    .expect("initialize")
+    .path
 }
 
 fn mark(path: &Path) -> OwnerMark {
@@ -116,7 +122,7 @@ fn a_clean_prefix_does_not_authorize_sweeping_an_uninterpreted_tail() {
         &BTreeSet::from([gone.owner_id().unwrap()]),
     )
     .unwrap();
-    finish_host(gone);
+    gone.end_for_test();
     let sweep = sweep_unheld_journals(&root.path);
     assert_eq!(sweep.removed, 0, "{sweep:?}");
     assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -161,7 +167,7 @@ fn a_launch_sweep_takes_only_a_clean_journal_nobody_holds() {
     };
     assert_eq!(images(), 5, "every open left its journal");
 
-    finish_host(gone);
+    gone.end_for_test();
     let sweep = sweep_unheld_journals(&root.path);
     assert_eq!(sweep.removed, 1, "{sweep:?}");
     assert_eq!(sweep.kept, 4, "{sweep:?}");
@@ -190,7 +196,7 @@ fn a_launch_sweep_takes_only_a_clean_journal_nobody_holds() {
     assert_eq!(sweep.dead_owners, 1, "the gone owner's lease goes");
 
     assert_eq!(sweep_unheld_journals(&root.path).removed, 0);
-    finish_host(live);
+    live.end_for_test();
     assert_eq!(sweep_unheld_journals(&root.path).removed, 1);
     assert!(!exists(&clean_held));
     assert!(exists(&draft_unheld) && exists(&older) && exists(&stale));
@@ -261,9 +267,7 @@ fn a_live_stores_writes_name_it_and_are_never_swept() {
         "its owner lives"
     );
     drop(plan);
-    let done = store.host.owner.as_ref().unwrap().finished.clone();
-    drop(store);
-    wait_finished(done);
+    store.end_for_test();
     assert!(
         !exists(&path),
         "the final registration retired the clean journal"
@@ -284,13 +288,13 @@ fn an_identical_republish_keeps_the_live_holders_claim() {
     );
     let both = BTreeSet::from([first.owner_id().unwrap(), second.owner_id().unwrap()]);
     assert_eq!(named(&path), Some(both));
-    finish_host(second);
+    second.end_for_test();
     assert_eq!(
         sweep_unheld_journals(&root.path).removed,
         0,
         "the first holder still appends to these bytes"
     );
-    finish_host(first);
+    first.end_for_test();
     assert_eq!(sweep_unheld_journals(&root.path).removed, 1);
 }
 
@@ -308,7 +312,7 @@ fn an_identical_republish_over_an_older_aterms_image_stays_unmarked() {
     .unwrap();
     assert_eq!(open_clean(&host, uri, "older"), path);
     assert_eq!(mark(&path), OwnerMark::Unmarked);
-    finish_host(host);
+    host.end_for_test();
     assert_eq!(sweep_unheld_journals(&root.path).removed, 0);
     assert!(exists(&path));
 }
@@ -319,7 +323,7 @@ fn a_clean_journal_swept_after_the_inspection_still_opens() {
     let uri = "file:///tmp/mid-open.md";
     let gone = root.host();
     let path = open_clean(&gone, uri, "text");
-    finish_host(gone);
+    gone.end_for_test();
     let host = root.host();
     let (_store, disk) = snapshot("text");
     let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
@@ -342,10 +346,7 @@ fn a_clean_journal_swept_after_the_inspection_still_opens() {
     )
     .unwrap();
     let refused = host.initialize(decision, &disk, &disk).unwrap_err();
-    assert!(
-        refused.contains("changed after recovery inspection"),
-        "{refused}"
-    );
+    assert_eq!(refused, JournalFault::Changed);
 }
 
 #[test]
@@ -359,7 +360,7 @@ fn a_reseat_that_finds_its_own_image_joins_its_owner_set() {
     let path = store.initialize(decision, &disk, &disk).unwrap().path;
     let other = root.host();
     let other_id = other.owner_id().unwrap();
-    finish_host(other);
+    other.end_for_test();
     write_mark(
         &path,
         &sys::open_regular(&path).unwrap(),
@@ -380,9 +381,7 @@ fn a_reseat_that_finds_its_own_image_joins_its_owner_set() {
     assert_eq!(named(&path), Some(BTreeSet::from([owner])));
     assert_eq!(sweep_unheld_journals(&root.path).removed, 0);
     drop(plan);
-    let done = store.host.owner.as_ref().unwrap().finished.clone();
-    drop(store);
-    wait_finished(done);
+    store.end_for_test();
     assert!(!exists(&path));
 }
 
@@ -426,7 +425,7 @@ fn only_a_gone_owners_lease_is_removed() {
     let live_id = live.owner_id().unwrap();
     let gone_id = gone.owner_id().unwrap();
     assert!(owner_alive(&owners, live_id) && owner_alive(&owners, gone_id));
-    finish_host(gone);
+    gone.end_for_test();
     assert!(!owner_alive(&owners, gone_id));
     assert_eq!(sweep_unheld_journals(&root.path).dead_owners, 1);
     assert!(!exists(&owners.join(gone_id.lease_name())));
@@ -440,7 +439,7 @@ fn a_journal_republished_after_the_sweeps_look_is_kept() {
     let uri = "file:///tmp/republished.md";
     let gone = root.host();
     let path = open_clean(&gone, uri, "restored");
-    finish_host(gone);
+    gone.end_for_test();
     let (look, image) = candidate(&path).expect("clean, and nobody holds it");
     let live = root.host();
     assert_eq!(open_clean(&live, uri, "restored"), path);
@@ -461,7 +460,7 @@ fn an_owner_named_after_the_sweeps_look_keeps_the_journal() {
     let root = Root::new("named-mid-sweep");
     let gone = root.host();
     let path = open_clean(&gone, "file:///tmp/adopted.md", "adopted");
-    finish_host(gone);
+    gone.end_for_test();
     let (look, image) = candidate(&path).expect("clean, and nobody holds it");
     let live = root.host();
     adopt(&path, image, live.owner_id());
@@ -478,18 +477,18 @@ fn a_lock_removed_while_a_writer_waits_on_it_is_never_taken_as_held() {
     let root = Root::new("lock-removed");
     let gone = root.host();
     let path = open_clean(&gone, "file:///tmp/waiter.md", "waiter");
-    finish_host(gone);
+    gone.end_for_test();
     let lock = journal_lock_path(&path).unwrap();
     let swept = root.path.clone();
     super::super::between_lock_open_and_take_for_test(move || {
         assert_eq!(sweep_unheld_journals(&swept).removed, 1);
     });
-    let inside = with_journal_lock(&path, JournalLockPatience::Worker, || {
+    let inside = with_journal_lock::<_, String>(&path, JournalLockPatience::Worker, || {
         // The lock this writer holds is the one its name names, so a second taker is refused while
         // it is in.
         Ok((
             exists(&lock),
-            with_journal_lock(&path, JournalLockPatience::Sweep, || Ok(())).is_err(),
+            with_journal_lock::<_, String>(&path, JournalLockPatience::Sweep, || Ok(())).is_err(),
         ))
     });
     assert_eq!(inside, Ok((true, true)));
@@ -520,9 +519,7 @@ fn a_release_takes_a_clean_journal_once_no_live_owner_is_left_on_it() {
     );
     // Its pinned inode was replaced by the second process. It cannot retarget that
     // process's identical image, so its old mark conservatively lives until lease exit.
-    let done = first.host.owner.as_ref().unwrap().finished.clone();
-    drop(first);
-    wait_finished(done);
+    first.end_for_test();
     second.forget(&[disk.id]);
     fence(&second.host);
     assert!(!exists(&path), "nobody holds it now");
@@ -587,22 +584,9 @@ fn fence(host: &DraftJournalHost) {
     host.owner.as_ref().unwrap().run(|_| ()).unwrap();
 }
 
-fn wait_finished(done: Arc<std::sync::Mutex<mpsc::Receiver<()>>>) {
-    done.lock()
-        .unwrap()
-        .recv_timeout(HANG)
-        .expect("custody worker finished");
-}
-
-fn finish_host(host: DraftJournalHost) {
-    let done = host.owner.as_ref().unwrap().finished.clone();
-    drop(host);
-    wait_finished(done);
-}
-
-struct Gate(mpsc::Sender<()>);
+pub(crate) struct Gate(Option<mpsc::Sender<()>>);
 impl Gate {
-    fn hold(host: &DraftJournalHost) -> Self {
+    pub(crate) fn hold(host: &DraftJournalHost) -> Self {
         let (entered, ready) = mpsc::channel();
         let (resume, wait) = mpsc::channel();
         host.owner
@@ -615,11 +599,31 @@ impl Gate {
             })))
             .unwrap();
         ready.recv_timeout(HANG).expect("worker at gate");
-        Self(resume)
+        Self(Some(resume))
     }
-    fn release(self) {
-        self.0.send(()).unwrap();
+    fn release(mut self) {
+        self.0.take().unwrap().send(()).unwrap();
     }
+}
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        if let Some(resume) = self.0.take() {
+            let _ = resume.send(());
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn without_fs<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORBID_FS.with(|forbidden| forbidden.set(self.0));
+        }
+    }
+    let _restore = Restore(FORBID_FS.with(|forbidden| forbidden.replace(true)));
+    work()
 }
 
 #[test]
@@ -743,7 +747,13 @@ fn an_undelivered_initialization_result_releases_its_provisional_registration() 
         .unwrap()
         .sender
         .send(Message::Run(Box::new(move |custody| {
-            let result = worker_host.initialize_owned(decision, &disk, &disk, Some(custody));
+            let result = worker_host.initialize_owned(
+                decision,
+                &disk,
+                &disk,
+                JournalLockPatience::Worker,
+                Some(custody),
+            );
             let _ = sender.send(result);
         })))
         .unwrap();
@@ -977,7 +987,7 @@ fn a_panicked_worker_keeps_active_custody_and_rejects_work_until_logical_owner_e
             owner_alive(&owners, id),
             "logical host lifetime still protects custody"
         );
-        finish_host(host);
+        host.end_for_test();
         assert!(!owner_alive(&owners, id));
         let sweep = sweep_unheld_journals(&root.path);
         if image == "clean" {

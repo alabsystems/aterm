@@ -24,6 +24,7 @@ pub mod advance_clock;
 pub mod dev_seam;
 pub mod wait_tally;
 
+pub mod agent_settings;
 pub mod argv0;
 pub mod channel;
 pub mod cli_path;
@@ -42,6 +43,7 @@ pub mod installed_command;
 pub use hyperlink::HyperlinkData;
 pub mod http_retry;
 pub mod lab_window_guard;
+pub mod look_words;
 pub mod machine_name;
 pub mod needs;
 pub mod network_state;
@@ -83,6 +85,7 @@ pub mod fabric_grammar;
 pub mod resource_admission;
 pub mod resource_inspection;
 pub mod resource_subgroup;
+pub mod tab_id;
 pub mod verb_page;
 
 pub mod fabric_command;

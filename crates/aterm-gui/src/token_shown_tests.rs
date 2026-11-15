@@ -10,6 +10,7 @@ use crate::claude_lights::Fact;
 use crate::fact_menu::FactAct;
 use aterm_agent::harness::accounts::AuthRoute;
 use aterm_agent::harness::footer::FooterFacts;
+use std::collections::BTreeMap;
 
 const KEY: &str = "ac-fedcba9876543210";
 
@@ -217,16 +218,20 @@ fn a_view_becomes_facts_and_records_its_offer_once() {
         }),
     };
     assert_eq!(
-        facts_of_view(dir.path(), None, 100),
+        facts_of_view(dir.path(), (None, &BTreeMap::new()), 100),
         Tokens::no_vault(),
         "no view is no vault, never a read that found no token"
     );
     assert_eq!(
-        facts_of_view(dir.path(), Some(Vec::new()), 100),
+        facts_of_view(dir.path(), (Some(Vec::new()), &BTreeMap::new()), 100),
         Tokens::read(Vec::new()),
         "a vault that covers no account was still read"
     );
-    let read = facts_of_view(dir.path(), Some(vec![account.clone()]), 100);
+    let read = facts_of_view(
+        dir.path(),
+        (Some(vec![account.clone()]), &BTreeMap::new()),
+        100,
+    );
     assert_eq!(read.read, TokensRead::Read);
     let facts = read.facts;
     let [shown] = facts.as_slice() else {
@@ -251,13 +256,57 @@ fn a_view_becomes_facts_and_records_its_offer_once() {
     let table = aterm_agent::harness::accounts_tokens::read_table(&store).expect("recorded");
     let recorded = table.offers.get(KEY).expect("the pair is recorded");
     assert_eq!((recorded.pair.as_str(), recorded.at), ("none:-/ok:-", 100));
-    let _ = facts_of_view(dir.path(), Some(vec![account]), 200);
+    let _ = facts_of_view(dir.path(), (Some(vec![account]), &BTreeMap::new()), 200);
     let again = aterm_agent::harness::accounts_tokens::read_table(&store).expect("kept");
     assert_eq!(
         again.offers.get(KEY).map(|o| o.at),
         Some(100),
         "a re-read records nothing"
     );
+}
+
+/// A TOKEN STEP ITS RECORD HOLDS IS IN THE ACCOUNT'S FACT: the record's own words, naming the
+/// row's one step, and nothing for an account whose step no record holds.
+/// NEGATIVE CONTROL: with `facts_of_view` leaving `step` out, the fact has none: `` the held
+/// step is not in the fact ``.
+#[cfg(unix)]
+#[test]
+fn a_held_token_step_is_in_the_accounts_fact() {
+    use aterm_agent::harness::accounts_token_view::AccountToken;
+    use aterm_agent::harness::open_url::MetWord;
+    use aterm_agent::harness::token_steps::Stopped;
+    let dir = crate::test_scratch::short_dir("token-step");
+    let account = |key: &str, label: &str| AccountToken {
+        key: key.into(),
+        email: format!("{label}@example.com"),
+        label: Some(label.into()),
+        state: TokenState::None,
+        standing: None,
+        row: None,
+        pending: Some(false),
+        logged_in: true,
+        login: LoginHere::Half(LoginHalf::Ok),
+        offer: None,
+    };
+    let other = "ac-0123456789abcdef";
+    let step = Stopped::new(MetWord::HumanCheck, 1_000, "2.1.318", "").expect("a record");
+    let steps = BTreeMap::from([(KEY.to_owned(), step.clone())]);
+    let read = facts_of_view(
+        dir.path(),
+        (
+            Some(vec![account(KEY, "work"), account(other, "home")]),
+            &steps,
+        ),
+        100,
+    );
+    let words = step.words(Some("aterm harness accounts token work"));
+    assert_eq!(
+        read.of_key(KEY).and_then(|fact| fact.step.as_deref()),
+        Some(words.as_str()),
+        "the held step is not in the fact"
+    );
+    assert!(words.contains("human check"), "{words}");
+    assert_eq!(read.of_key(other).map(|fact| fact.step.clone()), Some(None));
 }
 
 /// A fact keeps what the view typed of a token this Mac's table holds: its dates, the Mac that
@@ -294,7 +343,6 @@ fn a_fact_keeps_the_views_typed_fields() {
                 peers_read_at: Some(2_000),
                 ..UsedOn::default()
             },
-            rejected_at: None,
             removed_at: None,
         }),
         pending: Some(false),
@@ -302,7 +350,11 @@ fn a_fact_keeps_the_views_typed_fields() {
         login: LoginHere::Half(LoginHalf::Ending { end: 7_000 }),
         offer: None,
     };
-    let read = facts_of_view(dir.path(), Some(vec![account.clone()]), 100);
+    let read = facts_of_view(
+        dir.path(),
+        (Some(vec![account.clone()]), &BTreeMap::new()),
+        100,
+    );
     let [shown] = read.facts.as_slice() else {
         panic!("one account: {read:?}");
     };

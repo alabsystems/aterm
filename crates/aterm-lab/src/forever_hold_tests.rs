@@ -6,6 +6,7 @@
 use super::*;
 use crate::forever::surfaces::Window;
 use crate::forever::{Chain, Row, Seen};
+use aterm_agent::supervise::policy::turn_end;
 
 /// The watch's start (unix ms).
 const T0: i64 = 1_792_000_000_000;
@@ -340,18 +341,18 @@ fn l6_is_its_need_alone() {
 /// saying `open` after their heads.
 fn listed(quoted: Option<&str>, open: &str) -> Seen {
     let mut s = seen("open", open, "x", false);
-    let text = aterm_agent::supervise::policy::land_check::land_check_text(None, false, None);
+    let text = alab_policy::land_check::land_check_text(None, false, None);
     s.journal[1] = j(
         30_000,
         "CONTINUED seq=2 rule=land-check@v1 [aterm harness] Land check:",
     );
-    s.ledger[1] = typed(30_000, turn_end::RULE_LAND_CHECK, &text);
+    s.ledger[1] = typed(30_000, alab_policy::land_check::RULE_LAND_CHECK, &text);
     s.journal.push(j(
         70_000,
         "TYPED seq=3 rule=land-nudge@v1 [aterm harness] Still landing:",
     ));
     let suffix = quoted
-        .and_then(aterm_agent::supervise::policy::land_check::listed_suffix)
+        .and_then(alab_policy::land_check::listed_suffix)
         .unwrap_or_default();
     s.ledger.push(typed(
         70_000,
@@ -825,7 +826,7 @@ fn the_list_is_read_from_the_nudge_and_from_the_contradiction() {
     let list = "The docs PR is still open.";
     let nudge = format!(
         "{} {}",
-        turn_end::LAND_NUDGE,
+        alab_policy::words::LAND_NUDGE,
         land_check::listed_suffix(list).expect("quoted")
     );
     let contradiction = turn_end::land_contradicted(
@@ -838,5 +839,5 @@ fn the_list_is_read_from_the_nudge_and_from_the_contradiction() {
     for text in [&nudge, &contradiction] {
         assert_eq!(listed_in_nudge(text), Some(list), "{text}");
     }
-    assert_eq!(listed_in_nudge(turn_end::LAND_NUDGE), None);
+    assert_eq!(listed_in_nudge(alab_policy::words::LAND_NUDGE), None);
 }

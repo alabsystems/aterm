@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use amacs::protocol::edit::{AwaitKey, EditOk, EditOutcome, EditResult, Ticket};
 use aterm_buffer::Seq;
 
-use crate::app_documents::{DocumentAdmissionKey, DocumentOpenFailure, LineReveal};
+use crate::app_documents::{DocumentAdmissionKey, DocumentOpenFailure, InstallFailure, LineReveal};
 use crate::control_edit::{AwaitCall, EditCall, WaiterId, hold};
 use crate::document_store::DocumentId;
 use crate::native_app::AppKind;
@@ -449,6 +449,7 @@ impl App {
             uri,
             kind: AppKind::Editor,
             edit: Some(ticket),
+            config: false,
         };
         let admission = self.mint_document_admission(window, key.clone());
         Some((window, key, admission))
@@ -490,11 +491,28 @@ impl App {
             project = "aterm_gui::app_edit::edit_ticket_conformance::Rig::project"
         )
     )]
+    ///
+    /// An open that met a busy or changed draft answers `ERR busy drafts (…)`: its
+    /// preparation's refusal once the file's draft stayed busy through two attempts (about five
+    /// seconds, well inside the verb's 30 s admission deadline), or its own install's where no
+    /// worker prepared the journal. A draft that changed under the open is one another aterm
+    /// process is writing as surely as one whose lock it held, and amacs ends on both rather
+    /// than open the file in a terminal beside the draft's writer.
     pub(crate) fn finish_edit_admission(
         &mut self,
         wid: WindowId,
         key: DocumentAdmissionKey,
         result: Result<Box<AdmittedDocument>, DocumentOpenFailure>,
+    ) -> Result<String, String> {
+        self.finish_edit_admission_prepared(wid, key, result, None)
+    }
+
+    pub(crate) fn finish_edit_admission_prepared(
+        &mut self,
+        wid: WindowId,
+        key: DocumentAdmissionKey,
+        result: Result<Box<AdmittedDocument>, DocumentOpenFailure>,
+        prepared: Option<Result<crate::app_documents::PreparedDocument, InstallFailure>>,
     ) -> Result<String, String> {
         let Some(ticket) = key.edit else {
             return Err(format!("{} is no edit admission", key.uri));
@@ -520,23 +538,48 @@ impl App {
             }
         };
         let installed = match (refusal, result) {
-            (None, Ok(admitted)) => self.install_admitted_document(
-                wid,
-                AppKind::Editor,
-                &key.uri,
-                *admitted,
-                Placement::NewTabAfter { ticket },
-            ),
-            (Some(line), _) => Err(line),
-            (None, Err(failure)) => Err(format!("ERR refused {}\n", failure.0.refusal_word())),
+            (None, Ok(admitted)) => match prepared {
+                Some(Err(failure)) => Err(failure),
+                Some(Ok(prepared)) => self.install_prepared_document(
+                    wid,
+                    AppKind::Editor,
+                    &key.uri,
+                    prepared,
+                    Placement::NewTabAfter { ticket },
+                ),
+                None => self.install_admitted_document(
+                    wid,
+                    AppKind::Editor,
+                    &key.uri,
+                    *admitted,
+                    Placement::NewTabAfter { ticket },
+                ),
+            },
+            (Some(line), _) => Err(InstallFailure::Reply(line)),
+            (None, Err(failure)) => Err(InstallFailure::Reply(format!(
+                "ERR refused {}\n",
+                failure.0.refusal_word()
+            ))),
         };
         let installed = match installed {
             Ok(installed) => installed,
-            Err(why) => {
-                let line = if why.starts_with("ERR ") {
-                    why
-                } else {
-                    format!("ERR refused unreadable ({})\n", one_line(&why))
+            Err(failure) => {
+                let line = match failure {
+                    InstallFailure::DraftsBusy => format!(
+                        "ERR busy drafts ({})\n",
+                        crate::native_document_journal::JournalFault::BUSY
+                    ),
+                    InstallFailure::DraftChanged => format!(
+                        "ERR busy drafts ({})\n",
+                        crate::native_document_journal::JournalFault::CHANGED
+                    ),
+                    InstallFailure::Reply(line) => line,
+                    InstallFailure::Refused(error) => {
+                        format!("ERR refused {}\n", error.refusal_word())
+                    }
+                    InstallFailure::Failed(why) => {
+                        format!("ERR refused unreadable ({})\n", one_line(&why))
+                    }
                 };
                 if let Some(OpenTicket {
                     phase: Phase::Admitting { reply },
@@ -691,6 +734,17 @@ impl App {
         self.sweep_orphaned_edits(now);
         self.sync_edit_header(ticket);
         self.settle_uncovered_edit_waiters();
+    }
+
+    /// Whether this exact ticket still owns its requesting admission.
+    pub(crate) fn edit_admission_is_current(&self, wid: WindowId, ticket: EditTicketId) -> bool {
+        self.native_documents
+            .edits
+            .open
+            .get(&ticket)
+            .is_some_and(|entry| {
+                entry.window == wid && matches!(entry.phase, Phase::Admitting { .. })
+            })
     }
 
     /// Answers an `await edit` request immediately or parks the waiter until resolution.

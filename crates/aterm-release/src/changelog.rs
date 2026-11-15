@@ -5,18 +5,20 @@
 
 use crate::ledger::{Error, GitRunner, Result, git_read_ok};
 
-use aterm_census::changelog::is_section_header;
-pub use aterm_census::changelog::{
-    CHANGELOG_FILE, GateSummary, HARNESS_ENTRY_HEAD, has_section, real_body,
-};
-pub use aterm_verify::changelog_fragments::{FRAGMENT_DIR, Fragment};
-use aterm_verify::changelog_fragments::{
+pub use fragments::{FRAGMENT_DIR, Fragment};
+use fragments::{
     MAX_FRAGMENT_BYTES, MAX_FRAGMENTS, MAX_TOTAL_BYTES, Section, assemble, entries, entry_key,
     unreleased_entries,
 };
+use rules::is_section_header;
+pub use rules::{CHANGELOG_FILE, GateSummary, HARNESS_ENTRY_HEAD, has_section, real_body};
 
+#[path = "changelog_fragments.rs"]
+pub mod fragments;
 #[path = "changelog_published.rs"]
 mod published;
+#[path = "changelog_rules.rs"]
+mod rules;
 pub(crate) use published::gate as gate_published;
 
 /// Judge the notes the next release will ship.
@@ -26,7 +28,7 @@ pub fn gate_unreleased(text: &str) -> Result<GateSummary> {
 
 /// Judge a release or recut through the shared structural rules.
 pub fn gate_section(text: &str, section: &str) -> Result<GateSummary> {
-    let found = aterm_census::changelog::gate_section(text, section).map_err(Error::new)?;
+    let found = rules::gate_section(text, section).map_err(Error::new)?;
     crate::harness_versions::notes_gate(text, section)?;
     Ok(found)
 }
@@ -115,15 +117,7 @@ impl Window {
         };
         let listed = git_read_ok(
             git,
-            &[
-                "--no-lazy-fetch",
-                "--no-replace-objects",
-                "ls-tree",
-                "-r",
-                "-l",
-                "-z",
-                &tree,
-            ],
+            &["--no-replace-objects", "ls-tree", "-r", "-l", "-z", &tree],
         )?
         .stdout;
         let mut fragments = Vec::new();
@@ -184,16 +178,7 @@ impl Window {
 
 /// A blob's text by object name (`<rev>:<path>` or an id), strict UTF-8.
 fn blob_text(git: &dyn GitRunner, spec: &str) -> Result<String> {
-    let out = git_read_ok(
-        git,
-        &[
-            "--no-lazy-fetch",
-            "--no-replace-objects",
-            "cat-file",
-            "blob",
-            spec,
-        ],
-    )?;
+    let out = git_read_ok(git, &["--no-replace-objects", "cat-file", "blob", spec])?;
     String::from_utf8(out.stdout).map_err(|_| Error::new(format!("{spec} is not valid UTF-8")))
 }
 
@@ -212,7 +197,6 @@ fn fragment_tree(git: &dyn GitRunner, commit: &str, strict: bool) -> Result<Opti
     let listed = git_read_ok(
         git,
         &[
-            "--no-lazy-fetch",
             "--no-replace-objects",
             "ls-tree",
             "-z",
@@ -252,18 +236,7 @@ pub fn fragment_listing(git: &dyn GitRunner, commit: &str) -> Result<Vec<(String
     let Some(tree) = fragment_tree(git, commit, false)? else {
         return Ok(Vec::new());
     };
-    let listed = git_read_ok(
-        git,
-        &[
-            "--no-lazy-fetch",
-            "--no-replace-objects",
-            "ls-tree",
-            "-r",
-            "-z",
-            &tree,
-        ],
-    )?
-    .stdout;
+    let listed = git_read_ok(git, &["--no-replace-objects", "ls-tree", "-r", "-z", &tree])?.stdout;
     let mut out = Vec::new();
     for record in listed.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         let Ok((meta, rel)) = split_record(record) else {
@@ -504,18 +477,9 @@ pub fn landing_raw_removals(
 /// reads of main's files, which never refuse.
 #[must_use]
 pub fn small_blob_text(git: &dyn GitRunner, oid: &str) -> Option<String> {
-    let size = git_read_ok(
-        git,
-        &[
-            "--no-lazy-fetch",
-            "--no-replace-objects",
-            "cat-file",
-            "-s",
-            oid,
-        ],
-    )
-    .ok()?
-    .stdout;
+    let size = git_read_ok(git, &["--no-replace-objects", "cat-file", "-s", oid])
+        .ok()?
+        .stdout;
     let size: usize = std::str::from_utf8(&size).ok()?.trim().parse().ok()?;
     if size > MAX_FRAGMENT_BYTES {
         return None;

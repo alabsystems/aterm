@@ -3,9 +3,9 @@
 
 use super::*;
 use crate::engine::{self, NoJournal};
-use crate::items::defaults::tests::{ctx, user};
+use crate::items::defaults::tests::{ctx, export, user};
 use crate::model::{Mode, Outcome};
-use crate::port::{Fake, Ran};
+use crate::port::{Fake, Ran, Stat};
 
 const ENV: &str = "alice$ CARGO_HOME=/Users//alice/.cargo RUSTUP_HOME=/Users//alice/.rustup /Users//alice/.cargo/bin/rustup";
 const STABLE: &str =
@@ -36,7 +36,11 @@ fn indexing_status_requires_a_successful_unambiguous_reading() {
     ] {
         let sys = Fake::root();
         sys.on(status, Ran::ok(output));
-        assert_eq!(indexing(&sys).ok(), expected, "{output}");
+        assert_eq!(
+            spotlight_scope::indexing(&Port(&sys)).ok(),
+            expected,
+            "{output}"
+        );
     }
     let sys = Fake::root();
     sys.on(
@@ -47,48 +51,497 @@ fn indexing_status_requires_a_successful_unambiguous_reading() {
             stderr: Vec::new(),
         },
     );
-    assert!(indexing(&sys).is_err());
+    assert!(spotlight_scope::indexing(&Port(&sys)).is_err());
 }
 
+const ALICE: &str = "/Users//alice";
+const RECEIPT_WRITE: &str = "write /Library/Application Support/aterm/spotlight-scope 644";
+
+fn folder() -> Stat {
+    Stat {
+        uid: 501,
+        gid: 20,
+        mode: 0o755,
+        dir: true,
+        symlink: false,
+        len: 0,
+    }
+}
+
+/// Alice's home as its top level lists: the folders Spotlight keeps, three it should leave
+/// out (one with a space in its name), and what is never a candidate (a dot-folder, a
+/// `.noindex` folder, a file, a link).
+pub(crate) fn home(sys: &Fake) {
+    for name in [
+        "Documents",
+        "Desktop",
+        "Library",
+        "Applications",
+        "Developer",
+        "Downloads",
+        "My Projects",
+        ".cargo",
+        "build.noindex",
+    ] {
+        let path = format!("{ALICE}/{name}");
+        sys.file(&path, b"").stat_of(&path, folder());
+    }
+    sys.file(&format!("{ALICE}/notes.txt"), b"x")
+        .link(&format!("{ALICE}/Linked"), "/Volumes/Work");
+}
+
+/// How the fake `plutil` treats an insert.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Config {
+    /// It adds the path.
+    Writes,
+    /// It exits 0 and adds nothing.
+    Deaf,
+    /// It adds the path, and `mds` rewrites the configuration before the edit lands.
+    Rewritten,
+}
+
+/// What the fake configuration file holds where the key is absent, and where it is no array.
+const NO_LIST: &[u8] = b"\0absent";
+const NO_ARRAY: &[u8] = b"\0string";
+
+/// The excluded folders the fake configuration at `path` lists, in order (`None`: the file
+/// or its list is absent, or the key holds no array).
+fn list_at(sys: &Fake, path: &str) -> Option<Vec<String>> {
+    let bytes = sys.written(path)?;
+    if bytes.starts_with(b"\0") {
+        return None;
+    }
+    Some(
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// The excluded folders the live fake configuration lists ([`spotlight`]).
+pub(crate) fn config_list(sys: &Fake) -> Option<Vec<String>> {
+    list_at(sys, VOLUME_CONFIG)
+}
+
+fn put(sys: &Fake, path: &str, list: &[String]) {
+    let text: String = list.iter().map(|entry| format!("{entry}\n")).collect();
+    sys.file(path, text.as_bytes());
+}
+
+/// The data volume's Spotlight as root drives it: `mdutil -s` says indexing is enabled, the
+/// configuration is a file holding `excluded` (`None`: it has no list yet), `plutil` reads,
+/// extends and lints whichever file it is given (the live one or a copy), and
+/// `killall -9 mds` succeeds.
+pub(crate) fn spotlight(sys: &Fake, excluded: Option<&[&str]>, config: Config) {
+    match excluded {
+        Some(paths) => {
+            let paths: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+            put(sys, VOLUME_CONFIG, &paths);
+        }
+        None => {
+            sys.file(VOLUME_CONFIG, NO_LIST);
+        }
+    }
+    sys.simulate(move |sys, cmd| {
+        let args: Vec<String> = cmd
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match (cmd.program.to_str()?, args.as_slice()) {
+            (MDUTIL, ["-s", DATA_VOLUME]) => {
+                Some(Ran::ok("/System/Volumes/Data:\n\tIndexing enabled.\n"))
+            }
+            (PLUTIL, ["-extract", EXCLUSIONS, "xml1", "-o", "-", file]) => {
+                Some(match list_at(sys, file) {
+                    Some(paths) => {
+                        let entries: String = paths
+                            .iter()
+                            .map(|path| format!("<string>{path}</string>"))
+                            .collect();
+                        export(&format!("<array>{entries}</array>"))
+                    }
+                    None if sys.written(file).as_deref() == Some(NO_ARRAY) => {
+                        export("<string>not a list</string>")
+                    }
+                    None => Ran::exit(1, "No value at that key path"),
+                })
+            }
+            (PLUTIL, ["-insert", EXCLUSIONS, "-array", file]) => {
+                Some(if sys.written(file).as_deref() == Some(NO_LIST) {
+                    put(sys, file, &[]);
+                    Ran::ok("")
+                } else {
+                    Ran::exit(1, "Value already exists at key path")
+                })
+            }
+            (PLUTIL, ["-insert", "Exclusions.0", "-string", path, file]) => {
+                let mut list = list_at(sys, file)?;
+                if config != Config::Deaf {
+                    list.insert(0, (*path).to_owned());
+                    put(sys, file, &list);
+                }
+                Some(Ran::ok(""))
+            }
+            (PLUTIL, ["-lint", _]) => {
+                if config == Config::Rewritten {
+                    let mut live = config_list(sys)?;
+                    live.push("/Volumes/Added By mds".to_owned());
+                    put(sys, VOLUME_CONFIG, &live);
+                }
+                Some(Ran::ok(""))
+            }
+            (KILLALL, ["-9", "mds"]) => Some(Ran::ok("")),
+            _ => None,
+        }
+    });
+}
+
+/// Alice at the console, which is whose home the root step scopes.
+fn at_console() -> Ctx {
+    let mut ctx = context();
+    ctx.console = Some(user("alice", 501));
+    ctx
+}
+
+fn scope_rows(sys: &Fake, mode: Mode) -> Vec<crate::model::ItemReport> {
+    let items: Vec<Box<dyn Item>> = vec![Box::new(Scope)];
+    engine::run(&items, mode, sys, &at_console(), &mut NoJournal)
+}
+
+fn count(sys: &Fake, call: &str) -> usize {
+    sys.calls().iter().filter(|c| c.as_str() == call).count()
+}
+
+fn sorted(sys: &Fake) -> Vec<String> {
+    let mut list = config_list(sys).unwrap();
+    list.sort();
+    list
+}
+
+const KILL: &str = "/usr/bin/killall -9 mds";
+const FULL: &[u8] = b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/My Projects\n";
+
+/// Root adds each home folder but Documents, Desktop, Library and Applications to the
+/// excluded folders, keeps the entry a person put there, restarts mds once, and leaves a
+/// receipt naming what it excluded; a second run changes nothing. The live configuration is
+/// only ever replaced by a rename of a checked copy with its owner and mode, never edited
+/// where it stands.
+/// NEGATIVE CONTROLS: a dot-folder, a `.noindex` folder, a file and a link are never added; a
+/// new folder is a change again.
 #[test]
-fn setup_disables_indexing_and_verifies_the_result() {
+fn setup_excludes_the_home_folders_spotlight_need_not_index() {
     let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, Some(&["/Volumes/Backup"]), Config::Writes);
+    sys.stat_of(
+        VOLUME_CONFIG,
+        Stat {
+            uid: 0,
+            gid: 89,
+            mode: 0o640,
+            dir: false,
+            symlink: false,
+            len: 0,
+        },
+    );
+    let rows = scope_rows(&sys, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+    assert_eq!(
+        rows[0].from.as_deref(),
+        Some("indexed: Developer, Downloads, My Projects")
+    );
+    assert_eq!(
+        sorted(&sys),
+        [
+            "/Users//alice/Developer",
+            "/Users//alice/Downloads",
+            "/Users//alice/My Projects",
+            "/Volumes/Backup",
+        ]
+    );
+    assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(FULL));
+    let calls = sys.calls();
+    let at = |start: &str| calls.iter().position(|c| c.starts_with(start)).unwrap();
+    let landed = |c: &String| c.starts_with("rename ") && c.ends_with(VOLUME_CONFIG);
+    assert_eq!(calls.iter().filter(|c| landed(c)).count(), 1, "{calls:?}");
+    let rename = calls.iter().position(landed).unwrap();
+    assert!(at("/usr/bin/plutil -lint") < rename, "{calls:?}");
+    assert!(at("own 0:89 640") < rename, "{calls:?}");
+    assert!(
+        rename < at(KILL) && at(KILL) < at(RECEIPT_WRITE),
+        "{calls:?}"
+    );
+    assert_eq!(count(&sys, KILL), 1);
+    // No editing command ever named the live file.
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with("/usr/bin/plutil -insert") && c.ends_with(VOLUME_CONFIG)),
+        "{calls:?}"
+    );
+
+    let rows = scope_rows(&sys, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
+    assert_eq!(count(&sys, KILL), 1);
+    assert_eq!(count(&sys, RECEIPT_WRITE), 1);
+
+    let new = format!("{ALICE}/Scratch");
+    sys.file(&new, b"").stat_of(&new, folder());
+    let rows = scope_rows(&sys, Mode::Plan);
+    assert_eq!(rows[0].outcome, Outcome::Planned, "{rows:?}");
+    assert_eq!(rows[0].from.as_deref(), Some("indexed: Scratch"));
+    let rows = scope_rows(&sys, Mode::Apply);
+    assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+    assert_eq!(count(&sys, KILL), 2);
+    assert_eq!(config_list(&sys).unwrap().len(), 5);
+}
+
+/// A folder the person took out of the excluded folders stays out: an ordinary account and
+/// root both read the receipt, which still names it, so nothing is owed, nothing is added
+/// back and mds is not restarted, even when a new folder makes root edit the list again.
+/// NEGATIVE CONTROL: the new folder of the same run is added, and so was Downloads the first
+/// time, before any receipt named it.
+#[test]
+fn a_folder_the_person_made_searchable_again_is_never_excluded_again() {
+    let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, Some(&[]), Config::Writes);
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    assert!(sorted(&sys).contains(&"/Users//alice/Downloads".to_owned()));
+
+    let mut list = config_list(&sys).unwrap();
+    list.retain(|path| path != "/Users//alice/Downloads");
+    put(&sys, VOLUME_CONFIG, &list);
+    assert_eq!(scope_rows(&sys, Mode::Plan)[0].outcome, Outcome::Ok);
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Ok);
+    assert_eq!(count(&sys, KILL), 1);
+
+    let new = format!("{ALICE}/Scratch");
+    sys.file(&new, b"").stat_of(&new, folder());
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    assert_eq!(
+        sorted(&sys),
+        [
+            "/Users//alice/Developer",
+            "/Users//alice/My Projects",
+            "/Users//alice/Scratch",
+        ]
+    );
+    // The receipt keeps naming it, which is the record of the person's choice.
+    let receipt = String::from_utf8(sys.written(SCOPE_RECEIPT).unwrap()).unwrap();
+    assert!(receipt.contains("/Users//alice/Downloads\n"), "{receipt}");
+}
+
+/// A receipt that is gone while the configuration already holds every folder is written
+/// again with no edit and no restart of mds.
+/// NEGATIVE CONTROL: the first run of the same world renames a copy in and kills mds once.
+#[test]
+fn a_lost_receipt_is_rewritten_without_restarting_the_indexer() {
+    let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, Some(&[]), Config::Writes);
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    let renames = |sys: &Fake| {
+        sys.calls()
+            .iter()
+            .filter(|c| c.starts_with("rename ") && c.ends_with(VOLUME_CONFIG))
+            .count()
+    };
+    assert_eq!((count(&sys, KILL), renames(&sys)), (1, 1));
+
+    sys.remove(Path::new(SCOPE_RECEIPT)).unwrap();
+    assert_eq!(scope_rows(&sys, Mode::Plan)[0].outcome, Outcome::Planned);
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    assert_eq!((count(&sys, KILL), renames(&sys)), (1, 1));
+    assert_eq!(sys.written(SCOPE_RECEIPT).as_deref(), Some(FULL));
+    assert_eq!(scope_rows(&sys, Mode::Plan)[0].outcome, Outcome::Ok);
+}
+
+/// A configuration with no list yet gets one. An edit that cannot be made leaves the live
+/// configuration byte for byte as it was, mds running and no receipt, and records the
+/// folders it could not exclude: a copy whose inserts did not take, a key that holds no
+/// array, a configuration that is not there, and one mds rewrote while the copy was edited.
+/// A later apply that succeeds removes that record.
+/// NEGATIVE CONTROL: the same world with a `plutil` that writes ends changed, with no record.
+#[test]
+fn setup_makes_a_missing_list_and_a_failed_edit_leaves_the_configuration_alone() {
+    let sys = Fake::root();
+    home(&sys);
+    spotlight(&sys, None, Config::Writes);
+    assert_eq!(scope_rows(&sys, Mode::Apply)[0].outcome, Outcome::Changed);
+    assert_eq!(config_list(&sys).map(|list| list.len()), Some(3));
+    assert!(sys.written(SCOPE_REFUSED).is_none());
+
+    let failed = |seed: &dyn Fn(&Fake)| {
+        let sys = Fake::root();
+        home(&sys);
+        seed(&sys);
+        let before = sys.written(VOLUME_CONFIG);
+        let rows = scope_rows(&sys, Mode::Apply);
+        assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
+        assert_eq!(count(&sys, KILL), 0);
+        assert!(sys.written(SCOPE_RECEIPT).is_none());
+        assert_eq!(sys.written(SCOPE_REFUSED).as_deref(), Some(FULL));
+        (sys, before)
+    };
+    let (deaf, before) = failed(&|sys| spotlight(sys, Some(&["/Volumes/Backup"]), Config::Deaf));
+    assert_eq!(deaf.written(VOLUME_CONFIG), before);
+    let (no_array, before) = failed(&|sys| {
+        spotlight(sys, Some(&[]), Config::Writes);
+        sys.file(VOLUME_CONFIG, NO_ARRAY);
+    });
+    assert_eq!(no_array.written(VOLUME_CONFIG), before);
+    let (absent, _) = failed(&|sys| {
+        spotlight(sys, Some(&[]), Config::Writes);
+        sys.remove(Path::new(VOLUME_CONFIG)).unwrap();
+    });
+    assert!(absent.written(VOLUME_CONFIG).is_none());
+    let (raced, _) = failed(&|sys| spotlight(sys, Some(&["/Volumes/Backup"]), Config::Rewritten));
+    assert_eq!(
+        config_list(&raced).unwrap(),
+        ["/Volumes/Backup", "/Volumes/Added By mds"]
+    );
+
+    // The same Mac once its configuration takes the edit.
+    spotlight(&deaf, Some(&["/Volumes/Backup"]), Config::Writes);
+    assert_eq!(scope_rows(&deaf, Mode::Apply)[0].outcome, Outcome::Changed);
+    assert!(deaf.written(SCOPE_REFUSED).is_none());
+    assert_eq!(deaf.written(SCOPE_RECEIPT).as_deref(), Some(FULL));
+}
+
+/// A volume whose indexing is already off is left off, and nothing is excluded or restarted;
+/// off macOS and with no one at the console there is nothing to scope.
+/// NEGATIVE CONTROL: the first test's enabled volume runs `plutil` and `killall`.
+#[test]
+fn a_disabled_volume_is_left_as_it_is() {
+    let sys = Fake::root();
+    home(&sys);
     sys.on(
         "/usr/bin/mdutil -s /System/Volumes/Data",
-        Ran::ok("Indexing enabled."),
-    )
-    .on(
-        "/usr/bin/mdutil -s /System/Volumes/Data",
-        Ran::ok("Indexing disabled."),
-    )
-    .on(
-        "/usr/bin/mdutil -i off /System/Volumes/Data",
-        Ran::ok("Indexing disabled."),
+        Ran::ok("/System/Volumes/Data:\n\tIndexing disabled.\n"),
     );
-    let items: Vec<Box<dyn Item>> = vec![Box::new(Indexing)];
-    let rows = engine::run(&items, Mode::Apply, &sys, &context(), &mut NoJournal);
-    assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
-    let rows = engine::run(&items, Mode::Apply, &sys, &context(), &mut NoJournal);
+    let rows = scope_rows(&sys, Mode::Apply);
     assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
+    assert_eq!(sys.calls(), ["/usr/bin/mdutil -s /System/Volumes/Data"]);
 
-    let still_on = Fake::root();
-    still_on
-        .on(
-            "/usr/bin/mdutil -s /System/Volumes/Data",
-            Ran::ok("Indexing enabled."),
-        )
-        .on("/usr/bin/mdutil -i off /System/Volumes/Data", Ran::ok(""));
-    let rows = engine::run(&items, Mode::Apply, &still_on, &context(), &mut NoJournal);
-    assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
-
+    assert!(matches!(
+        Scope.probe(&sys, &context()),
+        Probe::NotApplicable { .. }
+    ));
     let mut linux = Fake::root();
     linux.linux = true;
     assert!(matches!(
-        Indexing.probe(&linux, &context()),
+        Scope.probe(&linux, &at_console()),
         Probe::NotApplicable { .. }
     ));
-    assert!(Indexing.apply(&linux, &context()).is_err());
+    assert!(Scope.apply(&linux, &at_console()).is_err());
     assert!(linux.calls().is_empty());
+}
+
+/// An ordinary account reads only the receipt (the configuration is root's): it is owed the
+/// step while a folder of its home is on no receipt, and only at the console. Folders an
+/// apply already failed to exclude are not owed again until the home gains another.
+/// NEGATIVE CONTROLS: a receipt naming every folder owes nothing; one that is not root's own
+/// file, an unread indexing state, a disabled volume, another account at the console, root
+/// and Linux owe nothing either, and no reading runs `plutil`; a refusal that names only
+/// some of the indexed folders, or is not root's own file, is still owed.
+#[test]
+fn an_ordinary_account_is_owed_the_scope_by_the_receipt() {
+    let console = |uid| Stat {
+        uid,
+        gid: 0,
+        mode: 0o600,
+        dir: false,
+        symlink: false,
+        len: 0,
+    };
+    let theirs = Stat {
+        uid: 501,
+        gid: 20,
+        mode: 0o644,
+        dir: false,
+        symlink: false,
+        len: 0,
+    };
+    let account = || {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        home(&sys);
+        sys.logged_in(&user("alice", 501))
+            .stat_of("/dev/console", console(501));
+        sys.on(
+            "/usr/bin/mdutil -s /System/Volumes/Data",
+            Ran::ok("/System/Volumes/Data:\n\tIndexing enabled.\n"),
+        );
+        sys
+    };
+    let sys = account();
+    assert!(scope_owed(&sys));
+    sys.file(SCOPE_RECEIPT, b"/Users//alice/Developer\n");
+    assert!(scope_owed(&sys));
+    sys.file(SCOPE_RECEIPT, FULL);
+    assert!(!scope_owed(&sys));
+    assert!(
+        !sys.calls().iter().any(|call| call.contains("plutil")),
+        "{:?}",
+        sys.calls()
+    );
+
+    let refused = account();
+    refused.file(SCOPE_REFUSED, b"/Users//alice/Developer\n");
+    assert!(scope_owed(&refused));
+    refused.file(SCOPE_REFUSED, FULL);
+    assert!(!scope_owed(&refused));
+    let new = format!("{ALICE}/Scratch");
+    refused.file(&new, b"").stat_of(&new, folder());
+    assert!(scope_owed(&refused));
+    let forged = account();
+    forged
+        .file(SCOPE_REFUSED, FULL)
+        .stat_of(SCOPE_REFUSED, theirs);
+    assert!(scope_owed(&forged));
+
+    let foreign = account();
+    foreign
+        .file(SCOPE_RECEIPT, b"")
+        .stat_of(SCOPE_RECEIPT, theirs);
+    assert!(!scope_owed(&foreign));
+
+    let unread = account();
+    unread.on(
+        "/usr/bin/mdutil -s /System/Volumes/Data",
+        Ran::ok("Spotlight server is disabled."),
+    );
+    // The scripted replies answer in order: the enabled one first, then the unrecognized one.
+    assert!(scope_owed(&unread));
+    assert!(!scope_owed(&unread));
+
+    let disabled = account();
+    disabled.on(
+        "/usr/bin/mdutil -s /System/Volumes/Data",
+        Ran::ok("Indexing disabled."),
+    );
+    assert!(scope_owed(&disabled));
+    assert!(!scope_owed(&disabled));
+
+    let elsewhere = account();
+    elsewhere.stat_of("/dev/console", console(502));
+    assert!(!scope_owed(&elsewhere));
+
+    let root = Fake::root();
+    home(&root);
+    root.logged_in(&user("alice", 501))
+        .stat_of("/dev/console", console(0));
+    assert!(!scope_owed(&root));
+
+    let mut linux = account();
+    linux.linux = true;
+    assert!(!scope_owed(&linux));
 }
 
 fn run(sys: &Fake, mode: Mode) -> Vec<crate::model::ItemReport> {

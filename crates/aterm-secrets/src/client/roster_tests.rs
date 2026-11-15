@@ -641,9 +641,7 @@ fn swarm_roster_and_resolve_local_swarm_label_refuse_failed_pending_or_unpinned_
     );
 
     let mut pending_state = clean_state.clone();
-    pending_state
-        .pending
-        .insert("other".to_owned(), "00".repeat(32));
+    pending_state.failed = true;
     save_state(&admin_paths, &pending_state).unwrap();
     assert!(
         swarm_roster_until(

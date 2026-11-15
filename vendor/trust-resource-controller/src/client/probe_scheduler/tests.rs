@@ -124,7 +124,7 @@ fn panic_retires_group_and_poisoned_borrow_never_reexecutes() {
     let owner = owner();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         owner
-            .run_inherited_child(&mut Command::new("/bin/sleep").arg("30"), |_| -> io::Result<()> {
+            .run_inherited_child(Command::new("/bin/sleep").arg("30"), |_| -> io::Result<()> {
                 panic!("intentional consumer panic");
             })
             .unwrap();
@@ -182,7 +182,7 @@ fn external_signal_retires_the_child_and_blocks_later_borrowers() {
     let owner = owner();
     let started = std::time::Instant::now();
     let error = owner
-        .run_inherited_child(&mut Command::new("/bin/sleep").arg("30"), |child| {
+        .run_inherited_child(Command::new("/bin/sleep").arg("30"), |child| {
             // The installed shared handler records cancellation. The watcher must
             // stop/reap our actual group before returning an Interrupted result.
             assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);

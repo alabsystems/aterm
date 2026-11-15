@@ -589,6 +589,8 @@ pub struct Kept {
     pub caret_ground: Option<u32>,
     /// What the frame's sidecars would say of it ([`Glass`]).
     pub glass: Glass,
+    /// The keyline tint the frame's caret wore (`RenderInput::cursor_keyline_tint`).
+    pub keyline_tint: Option<u32>,
 }
 
 /// What a kept frame's sidecars say of it, as the trail gallery keeps them beside a real
@@ -610,10 +612,37 @@ pub struct Glass {
     pub pet_seat: String,
     /// The flying head's drawn body (`head_body=`).
     pub head_body: Option<(i32, i32, i32, i32)>,
+    /// The flier's alpha and what it drew (`head_alpha=`, `head_pose=`): the face's pose id,
+    /// or `head` for a head; 0 and `none` where nothing flies.
+    pub head_alpha: u8,
+    pub head_pose: String,
     /// The word icons on glass (`word_icons=`).
     pub word_icons: Vec<(i32, i32, i32, i32)>,
     /// Rainbow kitty v2's quads, halos, stars and meteors, where it owns the frame.
     pub v2: Option<[u32; 4]>,
+    /// The frame's light (`EffectsPipeline::frame_light`, its bits as the trail-diff dump
+    /// prints them): `0` on a frame no light latched, which is every frame of a bare replay.
+    pub light: aterm_effects::cursor_glow::Light,
+    /// The light arms the frame drew (`EffectsPipeline::light_arms`), as the trail-diff dump
+    /// spells them: `glass:glow_under+glow_under_ramps,...`, or `-` for none.
+    pub arms: String,
+    /// How far toward the page the face lays its thinnest glyph's darkest pixel on the look's
+    /// ink (`GlyphInk::thin_share` of the glyph ink the frame observed), the page fact the
+    /// glass is admitted by; `None` before any ink was observed.
+    pub thin_ink: Option<f32>,
+}
+
+/// What the flier's frame drew, as `trail status`'s `head_pose=` names it: the glide face's pose
+/// id, or `head` for a head.
+fn flier_pose_name(frame: &aterm_effects::kitty_cursor::CatFrame) -> String {
+    match frame.body {
+        aterm_effects::kitty_cursor::CursorBody::Head => "head".to_string(),
+        aterm_effects::kitty_cursor::CursorBody::Glide(face) => {
+            aterm_effects::pet_glyphs_gen::PET_GLYPHS[face as usize]
+                .id
+                .to_string()
+        }
+    }
 }
 
 /// `cursor_glow_sdr_boost`'s default, the SDR crown's ([`Replay::post`]).
@@ -699,7 +728,8 @@ pub fn lays_the_bundled_cell() -> bool {
 /// What a replay's `style` word asks for: a `cursor_trail_style`, the pet beside it, and the
 /// rainbow's ribbon body.
 ///
-/// The word is `[underline |flat ]<cursor_trail_style>[ + cat| + dog]`. `rainbow` is the
+/// The word is `[underline |flat ]<cursor_trail_style>[ + <cursor_pet>]`: a walker (`cat`,
+/// `dog`) or a flier (`flying cat`, carried as `flier`). `rainbow` is the
 /// shipped theme, the tall body (its band behind the words, its rail under them), and
 /// `rainbow + cat` the shipped default beside its pet. `underline` and `flat` name the two
 /// ribbon bodies no built-in theme picks ([`EffectsPipeline::set_ribbon_shape`]): the replays
@@ -708,21 +738,22 @@ pub fn lays_the_bundled_cell() -> bool {
 pub struct Spec<'a> {
     pub trail: &'a str,
     pub pet: Option<aterm_effects::kitty_pet::PetSpecies>,
+    /// The flier the pet word names (`flying cat`): the replay flies it as the window does.
+    pub flier: Option<aterm_effects::kitty_pet::PetSpecies>,
     pub tall: bool,
     pub flat: bool,
 }
 
 impl<'a> Spec<'a> {
     pub fn of(word: &'a str) -> Self {
-        let (body, pet) = match word.split_once(" + ") {
-            Some((body, pet)) => (
-                body,
-                Some(
-                    aterm_effects::cursor_pet::species(pet)
-                        .unwrap_or_else(|| panic!("{word:?}: {pet:?} is no pet")),
-                ),
-            ),
-            None => (word, None),
+        let (body, pet, flier) = match word.split_once(" + ") {
+            Some((body, pet)) => {
+                let row = aterm_effects::cursor_pet::row(pet)
+                    .filter(|row| row.species.is_some() || row.flies.is_some())
+                    .unwrap_or_else(|| panic!("{word:?}: {pet:?} is no pet"));
+                (body, row.species, row.flies)
+            }
+            None => (word, None, None),
         };
         let (trail, tall, flat) = if let Some(trail) = body.strip_prefix("underline ") {
             (trail, false, false)
@@ -738,6 +769,7 @@ impl<'a> Spec<'a> {
         Self {
             trail,
             pet,
+            flier,
             tall,
             flat,
         }
@@ -829,11 +861,13 @@ impl Replay {
             if classic { 0.7 } else { 1.0 },
             look.cursor,
         );
-        let pet = Spec::of(style).pet;
+        let spec = Spec::of(style);
+        let pet = spec.pet;
         if let Some(species) = pet {
             fx.set_cursor_pet_species(species);
         }
         fx.set_cursor_pet(pet.is_some(), 0x5EED);
+        fx.set_cursor_flier(spec.flier);
         Self {
             term,
             fx,
@@ -902,6 +936,11 @@ impl Replay {
                 None => "none".to_string(),
             },
             head_body: self.fx.cursor().glow.head_body_window_box().map(placed),
+            head_alpha: self.fx.cursor_flier_frame().map_or(0, |f| f.alpha),
+            head_pose: match self.fx.cursor_flier_frame() {
+                Some(f) if f.alpha > 0 => flier_pose_name(&f),
+                _ => "none".to_string(),
+            },
             word_icons: self
                 .fx
                 .word_icon_boxes()
@@ -915,6 +954,28 @@ impl Replay {
                 .glow
                 .v2_status()
                 .map(|s| [s.quads, s.halos, s.stars, s.meteors]),
+            light: self.fx.frame_light(self.fx.now()),
+            arms: {
+                let mut arms = String::new();
+                for (arm, streams) in self.fx.light_arms().iter() {
+                    if !arms.is_empty() {
+                        arms.push(',');
+                    }
+                    arms.push_str(arm);
+                    arms.push(':');
+                    arms.push_str(&streams.names().collect::<Vec<_>>().join("+"));
+                }
+                if arms.is_empty() {
+                    arms.push('-');
+                }
+                arms
+            },
+            thin_ink: self.fx.cursor().glow.glyph_ink().map(|ink| {
+                ink.thin_share(
+                    aterm_render::linear_luminance(self.look.fg),
+                    aterm_render::linear_luminance(self.look.bg),
+                )
+            }),
         }
     }
 
@@ -1181,6 +1242,7 @@ impl Replay {
                 cell: self.cell,
                 caret_ground: self.fx.thin_caret_ground(),
                 glass: self.glass((place.pad as i32, place.grid_top as i32)),
+                keyline_tint: input.cursor_keyline_tint,
             };
             match &self.keep_to {
                 Some(to) => to.send(kept).expect("the kept frames' reader"),
@@ -1977,7 +2039,7 @@ fn replay_with(
     }
 }
 
-/// [`replay_in`] every job in the automatic colour, spread over the machine's cores.
+/// [`replay_in`] every job in the automatic colour, spread over this test's cores.
 pub fn replay_all(
     jobs: &[(&'static str, Look, Scene)],
     guard: bool,
@@ -1986,33 +2048,17 @@ pub fn replay_all(
     replay_all_in(jobs, guard, dump, TrailColor::Automatic)
 }
 
-/// [`replay_in`] every job in the trail colour `color`, spread over the machine's cores.
+/// [`replay_in`] every job in the trail colour `color`, spread over this test's cores
+/// (`aterm_spec::check::each`: a worker takes the next job when it ends one, so replays of
+/// unequal length leave no worker idle while another works through a fixed share).
 pub fn replay_all_in(
     jobs: &[(&'static str, Look, Scene)],
     guard: bool,
     dump: impl Fn(&str, Look, Scene) -> Vec<(u64, String)> + Sync,
     color: TrailColor,
 ) -> Vec<Verdict> {
-    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
-    let dump = &dump;
-    std::thread::scope(|s| {
-        let handles: Vec<_> = jobs
-            .chunks(jobs.len().div_ceil(lanes).max(1))
-            .map(|chunk| {
-                s.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|&(style, look, scene)| {
-                            replay_in(style, look, scene, guard, dump(style, look, scene), color)
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("a replay lane"))
-            .collect()
+    aterm_spec::check::each(jobs, |&(style, look, scene)| {
+        replay_in(style, look, scene, guard, dump(style, look, scene), color)
     })
 }
 
@@ -2138,9 +2184,49 @@ fn the_post_passes_spare_the_letters() {
     }
 }
 
+/// The OSC 12 a program pins its cursor colour with: `trail_film`'s `block-pinned` caret.
+const PINNED_CARET: &[u8] = b"\x1b]12;#cf222e\x07";
+
+/// `style` on `look` replaying `scene` with the letter guard off under a block whose colour the
+/// program pinned ([`PINNED_CARET`]): the effects wear it and never recolour it, and its block's
+/// halo rings all lie outside it.
+fn pinned_unguarded(style: &'static str, look: Look, scene: Scene) -> Verdict {
+    let mut r = Replay::sized(style, look, TrailColor::Automatic, scene.rows());
+    r.letters = true;
+    r.fx.set_letter_guard(false);
+    r.fx.set_bloom_spares_letters(true);
+    r.post = true;
+    r.own = scene.on_context();
+    let (mut ev, tail) = scene.events_on(look);
+    ev.insert(0, (0, Ev::Out(PINNED_CARET.to_vec())));
+    let judged = r.run(&ev, tail);
+    let bar = look_bar(look);
+    Verdict {
+        style,
+        look: r.look.name,
+        scene,
+        under: judged
+            .iter()
+            .map(|j| {
+                j.letters()
+                    .iter()
+                    .filter(|l| l.judged() < bar.min(OWN_SHARE * l.own))
+                    .count()
+            })
+            .sum(),
+        worst: worst(&judged),
+        spared: r.spared,
+    }
+}
+
 /// Negative control: with the letter guard off, each of these replays buries a letter (Laser's
 /// Enter flare across the printed line, the caret blooms on the newest letters, Water's wave, the
-/// ribbon head's bloom in the burst, Fire's spark on a wide letter). The flat ribbon's Enter on
+/// rainbow block's innermost halo ring on the letter beside it in the burst, Fire's spark on a
+/// wide letter). That ring hugs the block one pixel out only where a pinned cursor colour keeps it
+/// there; the rainbow's own colour draws it inside the block as a keyline, and unguarded the burst
+/// then keeps every letter (4.70:1 at worst on Dark), so the rainbow's row replays under a block
+/// the program pinned ([`pinned_unguarded`]): it buries 4 letters, `m` at 3.48:1 the worst
+/// (macOS, 2026-11-14). The flat ribbon's Enter on
 /// Default Light stood here until its paper Return came out from under the printed line instead
 /// of flaring across it (looks9 Q5, `rainbow_kitty::meteor`): unguarded it now keeps every letter
 /// at 7.28:1 or better, so it controls nothing.
@@ -2174,7 +2260,6 @@ fn without_the_letter_guard_the_trails_bury_letters() {
         ("sparkle", DARK, Scene::Typing),
         ("water", DARK, Scene::Typing),
         ("water", DEFAULT_LIGHT, water),
-        ("rainbow", DARK, Scene::Burst),
     ];
     if cfg!(target_os = "macos") {
         jobs.extend([
@@ -2182,7 +2267,8 @@ fn without_the_letter_guard_the_trails_bury_letters() {
             ("fire", DEFAULT_LIGHT, Scene::Cjk),
         ]);
     }
-    let off = replay_all(&jobs, false, |_, _, _| Vec::new());
+    let mut off = replay_all(&jobs, false, |_, _, _| Vec::new());
+    off.push(pinned_unguarded("rainbow", DARK, Scene::Burst));
     let held: Vec<String> = off
         .iter()
         .filter(|v| v.under == 0)
@@ -2430,27 +2516,10 @@ fn a_dim_theme_s_letters_take_no_bloom() {
             }
         }
     }
-    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
-    let worst = &worst;
-    let verdicts: Vec<(&str, Look, Scene, f64)> = std::thread::scope(|s| {
-        let handles: Vec<_> = jobs
-            .chunks(jobs.len().div_ceil(lanes).max(1))
-            .map(|chunk| {
-                s.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|&(style, look, scene)| {
-                            (style, look, scene, worst(style, look, scene, Some(false)))
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("a replay lane"))
-            .collect()
-    });
+    let verdicts: Vec<(&str, Look, Scene, f64)> =
+        aterm_spec::check::each(&jobs, |&(style, look, scene)| {
+            (style, look, scene, worst(style, look, scene, Some(false)))
+        });
     let under: Vec<String> = verdicts
         .iter()
         .filter(|v| v.3 < look_bar(v.1))
@@ -2555,7 +2624,8 @@ struct OwnShare {
 /// the stroke over the selected row, in that face on Solarized Dark: 281 letters under the bar,
 /// `c` at 1.13:1 (macOS, 2026-11-06; in the window's SF Mono 1.11:1, and Comet's, Sparkle's,
 /// Lumen's and Beam's lines under the bar with it on both dim looks), unmeasured on Linux and
-/// Windows. And the guard off buries a letter under the bar in each of four replays.
+/// Windows. And the guard off buries a letter under the bar in each of four replays (the
+/// rainbow's under a block the program pinned, whose innermost ring stays outside it).
 /// A letter whose glyph the face's table holds no raster for is held by
 /// [`a_dim_letter_with_no_raster_keeps_its_own_reading`].
 #[test]
@@ -2643,26 +2713,8 @@ fn a_dim_letter_keeps_its_own_reading() {
         }
         (verdict, least)
     };
-    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
-    let least = &least;
     let sweep = |jobs: &[(&'static str, Look, Scene)], k: Knobs| -> Vec<(Verdict, OwnShare)> {
-        std::thread::scope(|s| {
-            let handles: Vec<_> = jobs
-                .chunks(jobs.len().div_ceil(lanes).max(1))
-                .map(|chunk| {
-                    s.spawn(move || {
-                        chunk
-                            .iter()
-                            .map(|&(style, look, scene)| least(style, look, scene, k))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().expect("a replay lane"))
-                .collect()
-        })
+        aterm_spec::check::each(jobs, |&(style, look, scene)| least(style, look, scene, k))
     };
     let under = |swept: &[(Verdict, OwnShare)]| -> Vec<String> {
         swept
@@ -2805,11 +2857,14 @@ fn a_dim_letter_keeps_its_own_reading() {
     );
     let controls = [
         ("sparkle", DIM_GREY, Scene::Typing),
-        ("rainbow + cat", DIM_GREY, Scene::Burst),
         ("laser", SOLARIZED_DARK, Scene::EnterBottom),
         ("water", SOLARIZED_DARK, Scene::Typing),
     ];
-    let off = replay_all(&controls, false, |_, _, _| Vec::new());
+    let mut off = replay_all(&controls, false, |_, _, _| Vec::new());
+    // Under a block the program pinned, whose innermost ring stays outside it: drawn inside as
+    // the rainbow's keyline, the unguarded burst keeps every dim letter's reading (4.27:1 at
+    // worst); pinned, it takes 4 (`m` at 3.30:1, macOS, 2026-11-14).
+    off.push(pinned_unguarded("rainbow + cat", DIM_GREY, Scene::Burst));
     let held: Vec<String> = off
         .iter()
         .filter(|v| v.under == 0)
@@ -2893,24 +2948,8 @@ fn a_dim_letter_with_no_raster_keeps_its_own_reading() {
     if control.3 != GALLERY_PX {
         jobs.push(control);
     }
-    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
-    let least = &least;
-    let verdicts: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = jobs
-            .chunks(jobs.len().div_ceil(lanes).max(1))
-            .map(|chunk| {
-                s.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|&(style, look, every, px)| least(style, look, every, px, true, true))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("a replay lane"))
-            .collect()
+    let verdicts: Vec<_> = aterm_spec::check::each(&jobs, |&(style, look, every, px)| {
+        least(style, look, every, px, true, true)
     });
     let fell: Vec<String> = verdicts
         .iter()
@@ -3019,24 +3058,8 @@ fn a_letter_at_aa_keeps_aa() {
         (style, look.name, scene, at, under, least)
     };
     let sweep = |jobs: &[(&'static str, Look, Scene)], share: bool| {
-        let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
-        let read = &read;
-        std::thread::scope(|s| {
-            let handles: Vec<_> = jobs
-                .chunks(jobs.len().div_ceil(lanes).max(1))
-                .map(|chunk| {
-                    s.spawn(move || {
-                        chunk
-                            .iter()
-                            .map(|&(style, look, scene)| read(style, look, scene, share, true))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().expect("a replay lane"))
-                .collect::<Vec<_>>()
+        aterm_spec::check::each(jobs, |&(style, look, scene)| {
+            read(style, look, scene, share, true)
         })
     };
     let mut jobs = Vec::new();
@@ -3167,25 +3190,8 @@ fn the_cursor_trail_s_fill_is_a_letter_s_ground() {
             }
         }
     }
-    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
-    let run = &run;
-    let verdicts: Vec<Verdict> = std::thread::scope(|s| {
-        let handles: Vec<_> = jobs
-            .chunks(jobs.len().div_ceil(lanes).max(1))
-            .map(|chunk| {
-                s.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|&(style, look, scene)| run(style, look, scene, true))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("a replay lane"))
-            .collect()
-    });
+    let verdicts: Vec<Verdict> =
+        aterm_spec::check::each(&jobs, |&(style, look, scene)| run(style, look, scene, true));
     let failed: Vec<String> = verdicts
         .iter()
         .filter(|v| v.under > 0)
@@ -3267,18 +3273,13 @@ fn a_dim_page_s_trails_lay_no_shade() {
             jobs.push((style, scene));
         }
     }
-    let lit: Vec<String> = std::thread::scope(|s| {
-        let handles: Vec<_> = jobs
-            .iter()
-            .map(|&(style, scene)| s.spawn(move || (style, scene, shaded(style, scene, true))))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("a replay"))
-            .filter(|&(_, _, n)| n > 0)
-            .map(|(style, scene, n)| format!("{style} {scene:?}: {n} px of shade"))
-            .collect()
-    });
+    let lit: Vec<String> = aterm_spec::check::each(&jobs, |&(style, scene)| {
+        (style, scene, shaded(style, scene, true))
+    })
+    .into_iter()
+    .filter(|&(_, _, n)| n > 0)
+    .map(|(style, scene, n)| format!("{style} {scene:?}: {n} px of shade"))
+    .collect();
     assert!(
         lit.is_empty(),
         "shade on Solarized Dark:\n{}",
@@ -4165,25 +4166,8 @@ fn the_letter_under_the_caret_reads() {
             jobs.push((style, look));
         }
     }
-    let lanes = aterm_cores::available_parallelism().map_or(4, usize::from);
-    let verdicts: Vec<CaretVerdict> = std::thread::scope(|s| {
-        let handles: Vec<_> = jobs
-            .chunks(jobs.len().div_ceil(lanes).max(1))
-            .map(|chunk| {
-                s.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|&(style, look)| {
-                            (style, look, caret_letter_least(style, look, None, true))
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("a replay lane"))
-            .collect()
+    let verdicts: Vec<CaretVerdict> = aterm_spec::check::each(&jobs, |&(style, look)| {
+        (style, look, caret_letter_least(style, look, None, true))
     });
     let under: Vec<String> = verdicts
         .iter()

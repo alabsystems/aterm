@@ -468,10 +468,7 @@ fn a_candidate_that_skips_the_continuation_diverges_at_it() {
     let turn = recorded_act(&report)
         .unwrap_or_else(|| panic!("the continuation named: {}", report.render()));
     assert!(
-        turn.words.starts_with("turn ")
-            && turn
-                .words
-                .ends_with(crate::supervise::config::CONTINUE_TEXT),
+        turn.words.starts_with("turn ") && turn.words.ends_with(alab_policy::config::CONTINUE_TEXT),
         "{turn:?}"
     );
     assert_eq!(Some(d.at), turn.at);

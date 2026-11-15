@@ -5,7 +5,7 @@
 
 use crate::hardware;
 use crate::model::{Form, HostFacts, Keyboard, User};
-use crate::port::{Cmd, MachineReading, Ran, System};
+use crate::port::{Cmd, Ran, System};
 use aterm_capacity::host_vitals::HostVitals;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -683,8 +683,8 @@ fn parse_hex(text: &str) -> Option<u32> {
 
 /// This host's vitals ([`HostVitals`]) as `hello` carries them: one look at the machine through
 /// the system's reading ([`System::machine_reading`]), its volume the one holding this account's
-/// home, mapped by [`vitals_of`], with the uptime since `facts`' boot; `None` where the system
-/// reads no machine.
+/// home, mapped by [`HostVitals::of`], with the uptime since `facts`' boot; `None` where the
+/// system reads no machine.
 #[must_use]
 pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<HostVitals> {
     let home = sys.account_home().filter(|home| home.is_absolute());
@@ -692,58 +692,7 @@ pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<HostVitals> 
     let uptime_secs = (facts.boot_time > 0)
         .then(|| sys.now().saturating_sub(facts.boot_time))
         .filter(|u| *u > 0);
-    Some(vitals_of(&reading, uptime_secs))
-}
-
-/// The vitals one look at the machine `r` gives, `uptime_secs` beside them: each figure from the
-/// one reading that owns it, `None` where that reading is absent.
-/// - The CPU layout's: the logical cores.
-/// - The load averages': the 1-, 5- and 15-minute load.
-/// - The memory classes': total, available ([`aterm_sysprobe::MemoryDetail::available`], what
-///   admission counts too), used ([`aterm_sysprobe::MemoryDetail::used`]), wired, compressed,
-///   swap used and the pressure word.
-/// - The GPU's: how busy it is, its name and core count.
-/// - The home volume's: its size and free bytes (`f_bavail`).
-#[must_use]
-pub fn vitals_of(r: &MachineReading, uptime_secs: Option<u64>) -> HostVitals {
-    let memory = r.memory.as_ref();
-    let gpu = r.gpu.as_ref();
-    let volume = r.volume.as_ref();
-    HostVitals {
-        cpu_cores: r.cores.filter(|n| *n > 0),
-        load_avg_100: r.load.map(|l| l.map(hundredths)),
-        gpu_name: gpu
-            .and_then(|g| g.name.as_deref())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned),
-        gpu_cores: gpu.and_then(|g| g.cores).filter(|n| *n > 0).map(u32::from),
-        gpu_busy_pct: gpu.and_then(|g| g.device_pct).map(|p| p.min(100)),
-        mem_total_bytes: memory.map(|m| m.total).filter(|t| *t > 0),
-        mem_available_bytes: memory.map(|m| m.available),
-        mem_used_bytes: memory.map(aterm_sysprobe::MemoryDetail::used),
-        mem_wired_bytes: memory.map(|m| m.wired),
-        mem_compressed_bytes: memory.and_then(|m| m.compressed),
-        swap_used_bytes: memory.map(|m| m.swap_used),
-        mem_pressure: memory
-            .and_then(|m| m.pressure)
-            .map(|p| p.as_str().to_owned()),
-        disk_total_bytes: volume.map(|v| v.total),
-        disk_free_bytes: volume.map(|v| v.free),
-        uptime_secs,
-        rtt_us: None,
-    }
-}
-
-/// A load average in hundredths (`1.42` reads 142), rounded; a negative or non-finite one
-/// (which [`aterm_sysprobe::load_average`] never gives) reads 0.
-fn hundredths(load: f64) -> u32 {
-    let scaled = (load * 100.0).round();
-    if scaled.is_finite() && scaled > 0.0 {
-        scaled.min(f64::from(u32::MAX)) as u32
-    } else {
-        0
-    }
+    Some(HostVitals::of(&reading, uptime_secs))
 }
 
 #[cfg(test)]

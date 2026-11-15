@@ -108,7 +108,7 @@ fn a_label_cannot_fault_the_signed_out_entry() {
 #[test]
 fn an_autopilot_set_from_the_window_is_a_keyed_record() {
     use crate::autopilot::{AutopilotView, mode_words};
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let (land, cruise) = (mode_words(Autopilot::Land), mode_words(Autopilot::Cruise));
     let msg = super::autopilot_set("s-a1", "in tab 2", AutopilotView::Land, true, None, None);
     assert_eq!(msg.title, "Autopilot set to land");
@@ -193,7 +193,7 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
         super::autopilot_timer_ended("s-1", "in tab 3", clock, passed, over, None)
     };
     let turned = "Tab 3: at 18:00 Autopilot switched to land; ";
-    let land_record = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Land).record;
+    let land_record = crate::autopilot::mode_words(alab_policy::config::Autopilot::Land).record;
     for (over, then) in [
         (FireOver::Work, land_record.to_string()),
         (
@@ -1586,7 +1586,6 @@ fn a_folder_row_reads_back_as_the_folders_it_names() {
     let past_the_cap = named(&many.iter().map(String::as_str).collect::<Vec<_>>());
     let back = folder_row_named(&folder_row(Fault::Missing, &past_the_cap)).expect("reads");
     assert_eq!((back.dirs.len(), back.unnamed), (22, 18));
-    assert_eq!(folder_row_named(&restored_tab_failed("x")), None);
 }
 
 #[test]
@@ -1644,7 +1643,6 @@ fn gesture_failures() -> Vec<Message> {
         keystrokes_dropped(3),
         restore_stopped_early(),
         shell_lost_in_update("descriptor 9 was closed"),
-        restored_tab_failed("exec failed"),
         input_refused("the paste is too large \u{2014} paste it in smaller pieces"),
     ]
 }

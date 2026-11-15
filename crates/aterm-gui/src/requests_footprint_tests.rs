@@ -908,8 +908,9 @@ fn a_touch_counts_from_the_birth_and_an_untouched_claim_is_watched() {
 }
 
 /// The repo search answers unknown wherever it did not see the whole folder: a folder past its
-/// depth holding a folder, more repos than it reads, a folder it cannot list. CONTROL: the repos
-/// of a folder it saw whole, and none in a folder with none.
+/// depth holding a folder, more repos than it reads, a folder it cannot list, a repo past its
+/// depth inside a repo. CONTROL: the repos of a folder it saw whole (a clone inside a repo among
+/// them), and none in a folder with none.
 #[cfg(unix)]
 #[test]
 fn repos_in_is_unknown_where_it_did_not_see_the_whole_folder() {
@@ -918,11 +919,27 @@ fn repos_in_is_unknown_where_it_did_not_see_the_whole_folder() {
     let mk = |path: &Path| std::fs::create_dir_all(path).unwrap();
     let seen = here.folder("seen");
     mk(&seen.join("a/.git"));
-    mk(&seen.join("b/c/.git/objects"));
+    mk(&seen.join("a/vendor/inner/.git"));
+    mk(&seen.join("b/c/.git/objects/1/2/3/4"));
     mk(&seen.join("plain/x"));
     let mut found = repos_in(&seen, &home).expect("seen whole");
     found.sort();
-    assert_eq!(found, [seen.join("a"), seen.join("b/c")]);
+    assert_eq!(
+        found,
+        [
+            seen.join("a"),
+            seen.join("a/vendor/inner"),
+            seen.join("b/c")
+        ]
+    );
+    let nested = here.folder("nested");
+    mk(&nested.join("r/.git"));
+    mk(&nested.join("r/1/2/3/4/5"));
+    assert_eq!(
+        repos_in(&nested, &home),
+        None,
+        "past its depth inside a repo"
+    );
     let none = here.folder("none");
     mk(&none.join("x/y"));
     assert_eq!(repos_in(&none, &home), Some(Vec::new()));

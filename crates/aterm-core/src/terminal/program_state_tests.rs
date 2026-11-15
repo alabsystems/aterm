@@ -705,3 +705,32 @@ fn a_report_with_a_title_and_message_at_the_protocols_caps_is_taken() {
     assert!(parse(&edge).is_some(), "at the cap");
     assert_eq!(parse(&format!("{edge}C")), None, "past it");
 }
+
+/// Claude Code's root lifecycle survives the real parser and checkpoint. Child reports,
+/// unknown app spellings and a query are negative controls: none changes the root.
+#[test]
+fn claude_code_root_reports_survive_parsing_and_checkpoint() {
+    use crate::terminal::Terminal;
+    let mut term = Terminal::new(24, 80);
+    for word in ["idle", "working", "blocked", "done", "error"] {
+        term.process(format!("\x1b]7501;state={word}:app=claude-code\x1b\\").as_bytes());
+        let report = term.program_state();
+        let state = report.state.expect("Claude Code root report");
+        assert_eq!(state.app, ProgramApp::ClaudeCode);
+        assert_eq!(state.state.as_str(), word);
+        for body in [
+            "state=working:app=claude-code:id=child",
+            "state=clear:app=claude-code:id=child",
+            "state=working:app=claude",
+            "?",
+        ] {
+            term.process(format!("\x1b]7501;{body}\x1b\\").as_bytes());
+            assert_eq!(term.program_state(), report, "{body}");
+        }
+        let mut restored = ProgramStateReport::default();
+        restored.restore(report.carried().as_deref());
+        assert_eq!(restored.state, Some(state));
+    }
+    term.process(b"\x1b]7501;state=clear:app=claude-code\x1b\\");
+    assert_eq!(term.program_state().state, None);
+}

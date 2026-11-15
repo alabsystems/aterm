@@ -158,6 +158,13 @@ fn read_journal(
     Ok(held)
 }
 
+/// The claim directories [`held_lengths`] reads under `paths`, the primary stores' then the
+/// recovery stores': an append to a store there renames a new claim over its old one, which a
+/// watch on the directory's entries hears (`crate::runtime`'s look at what moved).
+pub(crate) fn claim_dirs(paths: &Paths) -> [PathBuf; 2] {
+    [false, true].map(|recovery| dirs(paths, region(recovery)).0)
+}
+
 /// The witnessed length of one enrolled table store (`table`, recovery or primary); `None` where
 /// the claim is absent, unreadable, pending, damaged or misnamed.
 ///

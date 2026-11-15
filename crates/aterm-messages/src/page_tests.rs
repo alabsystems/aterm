@@ -393,7 +393,7 @@ fn a_story_told_on_is_one_row_in_its_latest_words() {
         "the center's own keyed supersede"
     );
     c.commit_rows(now, 3);
-    assert!(c.mark_seen(si2, now));
+    assert!(c.mark_seen(si2, stamp(NOW - 7 * 60_000), now));
     let ca = c
         .post(
             notice("Sign-in cancelled in tab 1", "n.s-1.ca", "Type /login"),
@@ -779,7 +779,7 @@ fn install_now_follows_the_hosts_staged_build_and_the_sentence_is_the_hosts() {
         )
         .id;
     assert_eq!(
-        c.act(answered, crate::ActionIndex(0), now),
+        c.act(answered, crate::ActionIndex(0), stamp(NOW - 30_000), now),
         Some(Intent::NotNow {
             decision: Decision::FileAccess
         })

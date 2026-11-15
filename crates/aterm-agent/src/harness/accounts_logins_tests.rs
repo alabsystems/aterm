@@ -660,6 +660,98 @@ fn a_login_signed_back_in_is_ok_again_and_due_no_more() {
     assert_eq!(state.account("work-2").auth, Auth::SignedOut);
 }
 
+/// A STRIKE LIFTED ON EVIDENCE ITS OWN LOGIN SERVED IS NO SIGN-IN ([`note_served_back`]): the word
+/// is ok again, the strike's end and the sign-in it led to (stopped at Cloudflare's bot check) are
+/// gone and the service is recorded, while the login's renewal, the expiry notice Claude Code gave
+/// and its learned lifetime stand, so its forecast is still the notice's, and the ledger records
+/// the word's return alone (`auth ok`), never `signed-in`. A row not signed out has nothing to
+/// lift, and a word on record later than the lift stands. CONTROL: a sign-in where it stands
+/// ([`note_signed_back`]) stamps a renewal from its own time and drops the notice, which moves
+/// the forecast past the expiry Claude Code named.
+#[test]
+fn a_strike_lifted_on_served_evidence_keeps_its_logins_renewal_and_notice() {
+    let r = roster();
+    let row = r.row("main").expect("main");
+    let (mut state, mut logins) = renewed(NOW);
+    assert!(note_login_notice(&mut logins, "main", 3, NOW + HOUR));
+    let notice = NOW + HOUR + 3 * DAY;
+    let lifetime = logins.get("main").expect("bound").lifetime();
+    let struck = NOW + 2 * HOUR;
+    note_login_end(&mut state, &mut logins, "main", struck);
+    admitted_observation(&mut logins, "main", struck + 60, |logins| {
+        note_sign_in_attempt(
+            logins,
+            "main",
+            AttemptOutcome::Blocked,
+            "mailbox(cloudflare bot check)",
+            struck + 60,
+        )
+    });
+    assert_eq!(
+        (
+            state.account("main").auth,
+            login_ended_at(row, &logins, &state),
+            logins.get("main").expect("bound").sign_in_attempt.is_some(),
+        ),
+        (Auth::SignedOut, Some(struck), true),
+        "PRECONDITION: struck, its sign-in blocked"
+    );
+    let back = struck + HOUR;
+    let signed = {
+        let (mut state, mut logins) = (state.clone(), logins.clone());
+        assert!(!note_signed_back(&mut state, &mut logins, "main", back).is_empty());
+        (state, logins)
+    };
+    let events = note_served_back(&mut state, &mut logins, "main", back);
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| (e.kind, e.why.as_str()))
+            .collect::<Vec<_>>(),
+        [(Kind::Auth, "ok")]
+    );
+    assert!(events[0].wakes());
+    assert_eq!(state.account("main").auth, Auth::Ok);
+    let binding = logins.get("main").expect("bound");
+    assert_eq!(
+        (
+            binding.renewed_at,
+            binding.notice_end,
+            binding.lifetime(),
+            binding.ended_at,
+            binding.served_at,
+            binding.sign_in_attempt.is_some(),
+        ),
+        (Some(NOW), Some(notice), lifetime, None, Some(back), false)
+    );
+    assert_eq!(login_ended_at(row, &logins, &state), None);
+    assert_eq!(login_forecast(row, &logins, &state), Some(notice));
+    let before = (state.clone(), logins.clone());
+    assert!(
+        note_served_back(&mut state, &mut logins, "main", back + 60).is_empty(),
+        "not signed out: nothing to lift"
+    );
+    assert_eq!((state.clone(), logins.clone()), before);
+    note_auth(&mut state, "main", Auth::SignedOut, back + 2 * HOUR);
+    assert!(
+        note_served_back(&mut state, &mut logins, "main", back + HOUR).is_empty(),
+        "a later strike stands"
+    );
+    assert_eq!(state.account("main").auth, Auth::SignedOut);
+    let (state, logins) = signed;
+    let binding = logins.get("main").expect("bound");
+    assert_eq!(
+        (binding.renewed_at, binding.notice_end),
+        (Some(back), None),
+        "CONTROL: a sign-in stamps a renewal and drops the notice"
+    );
+    assert_ne!(
+        login_forecast(row, &logins, &state),
+        Some(notice),
+        "CONTROL"
+    );
+}
+
 #[test]
 fn due_logins_and_none_working_are_the_renewable_rows() {
     let r = roster();
@@ -1347,7 +1439,7 @@ fn an_automatic_sign_in_is_written_once_per_finding_and_a_new_login_ends_its_fai
 #[test]
 fn a_failed_hand_run_leaves_the_page_that_stopped_its_row_on_record() {
     let page = "claude.ai bot-check";
-    let by_hand = "by hand: claude auth login exited 1 with no login made";
+    let by_hand = "by hand: the sign-in exited 1 with no login made";
     let stopped = SignInAttempt {
         outcome: AttemptOutcome::Blocked,
         routes: page.to_owned(),

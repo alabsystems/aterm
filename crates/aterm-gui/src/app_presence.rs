@@ -924,7 +924,7 @@ impl App {
         let (word, view, _) = self.session_autopilot(session);
         view.mode()
             .or(word)
-            .is_none_or(|mode| mode == aterm_agent::supervise::Autopilot::Land)
+            .is_none_or(|mode| mode == alab_policy::config::Autopilot::Land)
     }
 
     /// The wake arms: resolve the fabric sid to the pool's local id.

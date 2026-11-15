@@ -240,7 +240,6 @@ impl CurrentRosterCut {
             &SigningAnchors {
                 home: Some(self.home.path()),
                 master_pubkeys: &[&self.master],
-                identity_path: None,
                 now_unix: 1_793_000_000,
                 duty,
             },

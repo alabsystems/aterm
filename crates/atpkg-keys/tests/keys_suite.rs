@@ -17,6 +17,4 @@ aterm_durable::plain_durable_flushes_in_tests!();
 mod owner_to_client;
 mod paper_master_to_client;
 mod provision_cli;
-#[cfg(unix)]
-mod pty;
 mod roster_redo_model;

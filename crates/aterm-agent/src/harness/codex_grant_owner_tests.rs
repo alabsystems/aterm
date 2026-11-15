@@ -46,7 +46,7 @@ pub(super) fn fixture(
         codex_login: None,
         agy_conversation: None,
         now: 1_790_000_000,
-        sid: "s-test-owner".into(),
+        sid: "t000000test-owner".into(),
         sock: None,
         config: None,
         claude_tmp: None,

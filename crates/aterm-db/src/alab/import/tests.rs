@@ -14,7 +14,7 @@ use crate::{
     alab::registry::{ACCOUNT, ADDRESS, MACHINE, PREFERENCE},
     typed::{
         grid::tests::{Book, elem, put},
-        secret::Fixed,
+        secret::Memory,
     },
 };
 
@@ -109,15 +109,30 @@ pub(crate) fn logins(rows: &[&str]) -> Sheet {
     Sheet::parse(SheetKind::Logins, "ai-account-logins.csv", text.as_bytes()).unwrap()
 }
 
-/// The registry's sealer in these plans: a fixed key, the registry's table name.
-pub(crate) const SEALER: Fixed = Fixed("alab/registry");
+thread_local! {
+    /// Each test thread's secret store: what its plans' puts put, read by its later plans.
+    static STORE: &'static Memory = Box::leak(Box::default());
+}
+
+/// The secret store of this test's plans: one per test (each test runs on its own thread), so a
+/// test's puts reach its own later plans and no other test's.
+pub(crate) fn store() -> &'static Memory {
+    STORE.with(|store| *store)
+}
+
+/// Put what `plan` names into [`store`], as an `--apply` does before its rows commit.
+pub(crate) fn put_all(plan: &Plan) {
+    for (entry, value) in &plan.puts {
+        crate::typed::secret::Store::put(store(), entry, value).unwrap();
+    }
+}
 
 fn input<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac]) -> Input<'a> {
     Input {
         sheets,
         macs,
         vendors: &Stand,
-        sealer: &SEALER,
+        store: store(),
         now_ms: 1_800_000_000_000,
         births: Births::Named,
         unread: &[],
@@ -1242,7 +1257,7 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
         sheets: &[],
         macs: &macs,
         vendors: &Stand,
-        sealer: &SEALER,
+        store: store(),
         now_ms: 0,
         births: Births::None,
         unread: &[],
@@ -2007,7 +2022,8 @@ fn computers_emails_and_phones_sheets_import_and_protect_private_addresses() {
     let plan1 = plan(&input(&[phones, computers, emails], &[]), &Cells::new()).unwrap();
     assert!(!kinds(&plan1).contains(&"credential-shaped"));
     let cells = apply(&mut book, &plan1);
-    let (lab_findings, generic_findings) = crate::alab::checks::lab(&cells);
+    let (lab_findings, generic_findings) =
+        crate::alab::checks::lab(&crate::alab::registry::REGISTRY_3, &cells);
     assert!(lab_findings.is_empty(), "{lab_findings:?}");
     assert!(generic_findings.is_empty(), "{generic_findings:?}");
 
@@ -2034,7 +2050,19 @@ fn computers_emails_and_phones_sheets_import_and_protect_private_addresses() {
         Some(&json!(root_pk))
     );
     assert!(planned(&plan1, "address", &alias_pk, "mailbox").is_some());
-    assert!(planned(&plan1, "address", &alias_pk, "phone").is_some());
+    // The phone number is ordinary data: its digits in the row's plain `number`, and the one row
+    // both sheets name. The sheet's password column is a flag: no value of it is written or put.
+    let phone = planned(&plan1, "address", &alias_pk, "phone")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        planned(&plan1, "phone", &phone, "number"),
+        Some(&json!("4155550199"))
+    );
+    assert_eq!(cell::project(&PHONE, &cells).rows.len(), 1);
+    assert!(plan1.puts.is_empty());
+    assert!(!values(&plan1).iter().any(|v| v.contains("secret-ignored")));
 }
 
 /// A `~/.secrets` harness file's source is keyed under the `[everyone]` key, tokens or not: no
@@ -2070,4 +2098,23 @@ fn a_secrets_file_source_is_a_keyed_digest() {
     assert_ne!(changed.source, one.source);
     assert_ne!(read(text, &[0xc3; 32]).sha256, one.sha256);
     assert_eq!(read(text, &KEY).source, one.source);
+}
+
+/// The import compares a held secret only with the entry of its own cell in this store's vault:
+/// a reference to another cell's entry, or to its own name in another vault, is no value of the
+/// cell even where that entry holds the same text, so the import writes the cell's own entry.
+/// NEGATIVE CONTROL: the cell's own reference to an entry holding the value is the value.
+#[test]
+fn a_held_reference_to_an_entry_not_the_cells_own_is_never_compared() {
+    use crate::typed::secret::{Secret, Store, entry_name, reference};
+    let store = Memory::default();
+    let wanted = Secret::new("same-text-value-1".into());
+    let own = entry_name("address", "password", "ad-x").unwrap();
+    let other = entry_name("address", "password", "ad-y").unwrap();
+    store.put(&own, &wanted).unwrap();
+    store.put(&other, &wanted).unwrap();
+    let cell = ("address", "password", "ad-x");
+    assert!(store_holds(&store, cell, &reference(Memory::VAULT, &own), &wanted).unwrap());
+    assert!(!store_holds(&store, cell, &reference(Memory::VAULT, &other), &wanted).unwrap());
+    assert!(!store_holds(&store, cell, &reference("other-vault", &own), &wanted).unwrap());
 }

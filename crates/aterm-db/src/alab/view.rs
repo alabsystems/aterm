@@ -71,8 +71,7 @@ pub struct Account {
     pub label: Option<String>,
     /// What a Mac called the row before labels named no machine (`m8-2`, `kimi-m16`).
     pub legacy_label: Option<String>,
-    /// The login address, local to this process: the registry types it `email`, so it is
-    /// shown masked and never printed by this view.
+    /// The login address, local to this process: this view never prints it.
     pub login: Option<String>,
     /// The provider identity, when the login is an alias.
     pub identity: Option<String>,

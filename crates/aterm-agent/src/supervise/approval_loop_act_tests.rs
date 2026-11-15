@@ -5,10 +5,36 @@ use super::*;
 use crate::harness::acts::{Act, TaskFace};
 use crate::supervise::approvals::Outcome;
 use crate::supervise::policy::question::RULE_ANSWER_RECOMMENDED;
-use crate::supervise::policy::turn_end::{
-    RULE_ANSWER, RULE_COMPACT, RULE_CONTINUE, RULE_LAND, RULE_LAND_NUDGE, RULE_LOGIN,
-};
+use crate::supervise::policy::turn_end::{RULE_ANSWER, RULE_COMPACT, RULE_LOGIN};
+use alab_policy::words::{RULE_CONTINUE, RULE_LAND, RULE_LAND_NUDGE};
 use std::sync::Mutex;
+
+/// A RE-ASKED QUESTION'S PAUSE DOUBLES TO ITS CAP ([`reask_pause`]): the refusal pause for the
+/// first answers, then doubled at each one past them, never past the press retry's cap.
+#[test]
+fn a_reasked_questions_pause_doubles_to_its_cap() {
+    let ms = Duration::from_millis;
+    let s = Duration::from_secs;
+
+    assert_eq!(
+        (0..7).map(reask_pause).collect::<Vec<_>>(),
+        [
+            ms(250),
+            ms(250),
+            ms(250),
+            ms(500),
+            ms(1000),
+            ms(2000),
+            ms(4000),
+        ]
+    );
+    for a in 0..20 {
+        assert!(reask_pause(a) <= reask_pause(a + 1), "{a}");
+        assert!(reask_pause(a) <= s(60), "{a}");
+    }
+    assert_eq!(reask_pause(12), s(60));
+    assert_eq!(reask_pause(usize::MAX), s(60));
+}
 
 struct Silent;
 

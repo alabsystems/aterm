@@ -14,24 +14,34 @@
 //! ciphertext. Neither ever becomes a file, enters a vault text or prints: `secrets get` refuses
 //! the class, and `ls --describe` names no file for it.
 //!
-//! A stored token counts ([`Standing`]) when both names' winning `Put`s come from one draft, the
-//! value is a setup-token ([`value_grammar`]), its end ([`Meta::expires_at`]) has not passed, and
-//! it is verified, or this Mac minted it (its own seat signed the earliest `Put` of the value). The
-//! signer is read from the log, never from the meta, and is shown, never used as a gate. Its
-//! exposure is read from the lineage: every epoch that sealed a `Put` of the value, and whether
-//! one was handed to a Mac the log now removes.
+//! A stored token is in use ([`Standing::serves_here`], [`State`]) when both names' winning
+//! `Put`s come from one draft, the value is a setup-token ([`value_grammar`]) and its end
+//! ([`Meta::expires_at`]) has not passed, on every member Mac from the moment it is minted where
+//! its mint proved the account: aterm's window or headless route ([`MintedBy::proves_account`])
+//! presses `Authorize` only in the account's own session. A token made at a person's terminal, or
+//! one whose meta names no route (an earlier build's, or one an earlier build wrote again), is in
+//! use only on the Mac that minted it (its own seat signed the earliest `Put` of the value) until
+//! it is verified ([`Meta::verification`]: a comparison with the account's stored login, never an
+//! earlier build's stamp from a usage sample), then on every Mac. Verification is a label: it
+//! widens a terminal token's use and never withdraws a token. A refusal of the token (Claude Code
+//! refused it on this Mac, [`note_refused`], kept beside this Mac's vault state), or a comparison
+//! that found its windows another account's (the harness's table there), is the observing Mac's
+//! alone, and the vault holds neither: a token refused on this Mac is in use nowhere here until a
+//! newer one replaces it. The signer is read from the log, never from the meta, and is shown,
+//! never used as a gate. Its exposure is read from the lineage: every epoch that sealed a `Put` of
+//! the value, and whether one was handed to a Mac the log now removes.
 
 use crate::client::{
     MemberEntry, MemberUnset, MemberWritten, OnBusy, Paths, member_unset_names, member_waits_here,
     member_write, read_claude_token_until, recipient_label, seat_label,
 };
-pub use crate::entry_class::Mismatch;
 use crate::entry_class::{CLAUDE_TOKEN_META, CLAUDE_TOKEN_PREFIX};
+pub use crate::entry_class::{MintedBy, Mismatch};
 use crate::membership_log::entries::inner::{self, Form};
 use crate::membership_log::{Log, MemberId};
 use crate::text::Audience;
 use crate::{Result, SecretBytes};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 /// What every setup-token begins with.
@@ -45,23 +55,23 @@ pub const SOON_SECS: u64 = 30 * 86_400;
 const STANDING_WAIT: Duration = Duration::from_secs(2);
 
 /// One account's key in the Claude realm: `ac-<16 lower-case hex>`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Key(String);
 
 impl Key {
-    /// The key `key` spells, where it is one.
+    /// The key `key` spells, where it is one. A key never ends in the meta suffix: the class's
+    /// grammar strips it from an entry name, and a key that kept it would name the meta record.
     #[must_use]
     pub fn parse(key: &str) -> Option<Self> {
-        crate::entry_class::claude_token(&format!("{CLAUDE_TOKEN_PREFIX}{key}"))
-            .then(|| Self(key.to_owned()))
+        (!key.ends_with(CLAUDE_TOKEN_META)
+            && crate::entry_class::claude_token(&format!("{CLAUDE_TOKEN_PREFIX}{key}")))
+        .then(|| Self(key.to_owned()))
     }
 
-    /// The key of the token entry `name` (not its meta), where it is one.
+    /// The key of the token entry `name` (not its meta, whose stripped key [`Self::parse`]
+    /// refuses), where it is one.
     #[must_use]
     pub fn of_entry(name: &str) -> Option<Self> {
-        if name.ends_with(CLAUDE_TOKEN_META) {
-            return None;
-        }
         Self::parse(name.strip_prefix(CLAUDE_TOKEN_PREFIX)?)
     }
 
@@ -129,13 +139,21 @@ pub struct Verified {
     pub on: String,
     /// When (unix seconds).
     pub at: u64,
-    /// What compared: `windows`, the rate-limit windows.
+    /// What compared: [`BY_WINDOWS`] (the token session's rate-limit windows with a reading of a
+    /// session on the account's stored login), the only word that verifies
+    /// ([`Meta::verification`]). An earlier build wrote `windows`, from the row's usage sample,
+    /// into which a token's own readings, or an earlier token's, fold: such a stamp proves no
+    /// account and verifies nothing on any Mac.
     pub by: String,
     /// The seven-day window's reset the token session read (unix seconds), where it read one.
     pub seven_day_resets_at: Option<u64>,
     /// The five-hour window's reset the token session read (unix seconds), where it read one.
     pub five_hour_resets_at: Option<u64>,
 }
+
+/// [`Verified::by`] of a verification whose basis was a reading of a session on the account's
+/// stored login (§5.6): the stamp this build writes.
+pub const BY_WINDOWS: &str = "windows-login";
 
 /// A token's value-free record, schema 1 (§4.1). The signer is not a field: the standing reads it
 /// from the log, since a writer would assert it about itself.
@@ -155,13 +173,32 @@ pub struct Meta {
     pub minted_on: String,
     /// The Claude Code version that made the token.
     pub cli: String,
-    /// Absent at mint; written by the verifying draft ([`verify`]).
+    /// The route that made the token, written at mint: what says whether its mint proved the
+    /// account ([`MintedBy::proves_account`]). `None` where the meta names none this build
+    /// knows: an earlier build's meta, one an earlier build wrote again (it drops what it does
+    /// not know), or a route a later build added.
+    pub minted_by: Option<MintedBy>,
+    /// Absent at mint; written by the verifying draft ([`verify`]). Only a stamp by
+    /// [`BY_WINDOWS`] verifies ([`Meta::verification`]).
     pub verified: Option<Verified>,
 }
 
 const SCHEMA: i64 = 1;
 
 impl Meta {
+    /// The verification the meta carries, where it is one: a stamp by [`BY_WINDOWS`], a
+    /// comparison with a reading of a session on the account's stored login. An earlier build's
+    /// stamp from the row's usage sample is none, on every Mac, the minting one included: that
+    /// sample can hold another account's readings, so the token serves only where its route
+    /// serves an unverified one ([`MintedBy::serves_unverified`]), and its minting Mac compares
+    /// it again, whose stamp by [`BY_WINDOWS`] replaces the earlier one ([`verify`]).
+    #[must_use]
+    pub fn verification(&self) -> Option<&Verified> {
+        self.verified
+            .as_ref()
+            .filter(|verified| verified.by == BY_WINDOWS)
+    }
+
     /// The record as its entry holds it: one line of JSON.
     #[must_use]
     pub fn to_json(&self) -> String {
@@ -183,12 +220,14 @@ impl Meta {
             "expiry_from": self.expiry_from.word(),
             "minted_on": self.minted_on,
             "cli": self.cli,
+            "minted_by": self.minted_by.map(MintedBy::word),
             "verified": verified,
         });
         aterm_json::to_string(&value).unwrap_or_default()
     }
 
-    /// The record `bytes` holds, where it is one of schema 1.
+    /// The record `bytes` holds, where it is one of schema 1. A `minted_by` that is absent, null
+    /// or a word this build does not know reads as `None`: the record still parses.
     #[must_use]
     pub fn from_json(bytes: &[u8]) -> Option<Self> {
         let value: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
@@ -221,6 +260,10 @@ impl Meta {
             },
             minted_on: text("minted_on")?,
             cli: text("cli")?,
+            minted_by: value
+                .get("minted_by")
+                .and_then(aterm_json::Value::as_str)
+                .and_then(MintedBy::parse),
             verified,
         })
     }
@@ -256,6 +299,10 @@ pub struct Standing {
     /// The labels of the Macs the log now removes that were handed an epoch that sealed a `Put`
     /// of the value (or signed one), in order.
     pub exposed: Vec<String>,
+    /// When this Mac recorded Claude Code's refusal of this token (the one its meta's `minted_at`
+    /// names), where it did ([`note_refused`]): this Mac's observation, kept beside its vault
+    /// state, never in the vault.
+    pub refused_at: Option<u64>,
 }
 
 /// A stored token's state, in the order its checks run (§5.1, the states a standing decides).
@@ -267,10 +314,18 @@ pub enum State {
     Mismatched(Mismatch),
     /// `ended`: its end has passed.
     Ended,
-    /// `unverified`: it serves only its minting Mac (`served_here` there), exposure beside it.
+    /// `rejected`: this Mac saw Claude Code refuse it ([`Standing::refused_at`]).
+    Rejected,
+    /// `unverified`: no verification yet, exposure beside it. By the vault's records it is in use
+    /// on every member Mac where its mint proved the account, else on its minting Mac only
+    /// ([`MintedBy::serves_unverified`]). Whether a Mac starts sessions on it is the harness's to
+    /// say: a comparison there may have found the token's windows different, or may still wait
+    /// for a reading of the account's stored login, and no vault record holds either.
     Unverified {
         /// This Mac minted it.
-        served_here: bool,
+        minted_here: bool,
+        /// [`Meta::minted_by`].
+        minted_by: Option<MintedBy>,
         /// [`Standing::exposed`].
         exposed: Vec<String>,
     },
@@ -292,15 +347,31 @@ impl State {
             Self::Mismatched(Mismatch::Draft) => "mismatched (draft)".to_owned(),
             Self::Mismatched(Mismatch::Value) => "mismatched (value)".to_owned(),
             Self::Ended => "ended".to_owned(),
+            Self::Rejected => "rejected".to_owned(),
             Self::Unverified {
-                served_here,
+                minted_here,
+                minted_by,
                 exposed,
             } => {
-                let mut words = if *served_here {
-                    "unverified (served here, where it was minted)".to_owned()
-                } else {
-                    "unverified (served only where it was minted)".to_owned()
+                let route = match minted_by {
+                    Some(MintedBy::Window) => " in aterm's window",
+                    Some(MintedBy::Headless) => " headless",
+                    Some(MintedBy::Terminal) => " at a terminal",
+                    None => "",
                 };
+                let place = if *minted_here {
+                    "here"
+                } else {
+                    "on another Mac"
+                };
+                let used = if minted_by.is_some_and(MintedBy::proves_account) {
+                    "in use on every Mac"
+                } else if *minted_here {
+                    "in use here only until verified"
+                } else {
+                    "not in use here until verified"
+                };
+                let mut words = format!("unverified (made{route} {place}; {used})");
                 if !exposed.is_empty() {
                     words.push_str(", ");
                     words.push_str(&removed(exposed));
@@ -315,12 +386,41 @@ impl State {
 }
 
 impl Standing {
-    /// Whether the meta carries a verification.
+    /// Whether the meta carries a verification ([`Meta::verification`]: a stamp by
+    /// [`BY_WINDOWS`]), on every Mac alike.
     #[must_use]
     pub fn verified(&self) -> bool {
         self.meta
             .as_ref()
-            .is_some_and(|meta| meta.verified.is_some())
+            .is_some_and(|meta| meta.verification().is_some())
+    }
+
+    /// Whether the vault's records put the token in use on this Mac, its end and its checks aside
+    /// ([`Self::state`] judges those): verified, or not verified and made by a route that proved
+    /// the account, on every member Mac from mint; otherwise only where this Mac minted it
+    /// ([`MintedBy::serves_unverified`]).
+    #[must_use]
+    pub fn serves_here(&self) -> bool {
+        self.verified()
+            || self
+                .meta
+                .as_ref()
+                .is_some_and(|meta| MintedBy::serves_unverified(meta.minted_by, self.minted_here))
+    }
+
+    /// Whether the vault's records put the token in use on some Mac other than this one, its end
+    /// and its checks aside: one another Mac minted (in use there at least), one verified, or one
+    /// made by a route that proved the account ([`MintedBy::serves_unverified`]). Only a token
+    /// this Mac minted at a person's terminal, or whose meta names no route, and that is not
+    /// verified, serves this Mac alone: replacing it replaces no other Mac's token.
+    #[must_use]
+    pub fn serves_elsewhere(&self) -> bool {
+        !self.minted_here
+            || self.verified()
+            || self
+                .meta
+                .as_ref()
+                .is_some_and(|meta| MintedBy::serves_unverified(meta.minted_by, false))
     }
 
     /// The state at `now` (unix seconds).
@@ -337,9 +437,13 @@ impl Standing {
         if meta.expires_at <= now {
             return State::Ended;
         }
+        if self.refused_at.is_some() {
+            return State::Rejected;
+        }
         if !self.verified() {
             return State::Unverified {
-                served_here: self.minted_here,
+                minted_here: self.minted_here,
+                minted_by: meta.minted_by,
                 exposed: self.exposed.clone(),
             };
         }
@@ -352,15 +456,19 @@ impl Standing {
         State::Active
     }
 
-    /// Whether sessions on this Mac start on the token at `now`: `active`, `soon` or `exposed`
-    /// on every Mac, `unverified` on its minting Mac only.
+    /// Whether the token is in use on this Mac by what the vault's records and this Mac's
+    /// refusals say alone: `active`, `soon` or `exposed`, a verified token every Mac starts
+    /// sessions on, never one this Mac saw refused nor one ended. An `unverified` token is not,
+    /// even one its route puts in use on every Mac ([`Self::serves_here`]): whether a Mac serves
+    /// it is the harness's verdict there (a comparison there may have found its windows different,
+    /// or it may still wait for a stored-login reading), which no vault record holds. What a
+    /// `claude-token:` need waits for ([`crate::need`]).
     #[must_use]
-    pub fn in_use(&self, now: u64) -> bool {
-        match self.state(now) {
-            State::Active | State::Soon | State::Exposed(_) => true,
-            State::Unverified { served_here, .. } => served_here,
-            _ => false,
-        }
+    pub fn verified_in_use(&self, now: u64) -> bool {
+        matches!(
+            self.state(now),
+            State::Active | State::Soon | State::Exposed(_)
+        )
     }
 }
 
@@ -380,6 +488,9 @@ pub enum Lookup<T> {
 /// that opens here, and its standing.
 pub struct TokenRead {
     token: Option<SecretBytes>,
+    /// The meta's value as the log holds it, beside [`TokenRead::token`]: what a verification
+    /// stands on ([`verify`]), byte for byte, whatever build wrote it.
+    meta_value: Option<SecretBytes>,
     /// The standing.
     pub standing: Standing,
 }
@@ -431,28 +542,38 @@ pub fn write(
             "a new token is written unverified; its first use verifies it".to_owned(),
         ));
     }
-    write_pair(paths, key, token, meta, on_busy)
+    write_pair(paths, key, token, meta, None, on_busy)
 }
 
+/// Write `token` and `meta` as the account `key`'s entries, in one draft. Where `read` names the
+/// token and meta values the writer read ([`verify`]: the same token, beside a meta it amends),
+/// each entry stands on its value there, so the write is refused where either changed since
+/// ([`MemberEntry::read_as`]); otherwise it is a person's write, which replaces what it finds.
 fn write_pair(
     paths: &Paths,
     key: &Key,
     token: &SecretBytes,
     meta: &Meta,
+    read: Option<(&SecretBytes, &SecretBytes)>,
     on_busy: OnBusy,
 ) -> Result<MemberWritten> {
-    let entry = |name: String, value: SecretBytes| MemberEntry {
+    let entry = |name: String, value: SecretBytes, read_as: Option<&SecretBytes>| MemberEntry {
         name,
         value,
         if_absent: false,
         anchor: crate::client::Anchor::Drop,
         fleet_reads_anchors: false,
+        read_as: read_as.cloned(),
     };
     member_write(
         paths,
         &[
-            entry(key.entry(), token.clone()),
-            entry(key.meta_entry(), SecretBytes::from(meta.to_json())),
+            entry(key.entry(), token.clone(), read.map(|(token, _)| token)),
+            entry(
+                key.meta_entry(),
+                SecretBytes::from(meta.to_json()),
+                read.map(|(_, meta)| meta),
+            ),
         ],
         on_busy,
     )
@@ -482,7 +603,7 @@ fn read_until(paths: &Paths, key: &Key, deadline: Instant) -> Result<Lookup<Toke
     let Some(opened) = snapshot.log.open_audience_entries(&snapshot.identity)? else {
         return Ok(Lookup::Unknown);
     };
-    let judged = judge(
+    let mut judged = judge(
         &snapshot.log,
         &snapshot.identity,
         &opened,
@@ -490,6 +611,7 @@ fn read_until(paths: &Paths, key: &Key, deadline: Instant) -> Result<Lookup<Toke
         token.as_ref(),
         meta.as_ref(),
     )?;
+    judged.standing.refused_at = refused_at(&refusals(paths), &judged.standing);
     Ok(Lookup::Found(judged))
 }
 
@@ -532,13 +654,14 @@ pub fn listed(paths: &Paths) -> Result<Lookup<Vec<Standing>>> {
             })
         })
         .collect();
+    let refused = refusals(paths);
     let mut out = Vec::with_capacity(keys.len());
     for key in keys {
         let value = |name: String| {
             held.and_then(|entries| entries.get(&name))
                 .map(|e| &e.value)
         };
-        let read = judge(
+        let mut read = judge(
             &snapshot.log,
             &snapshot.identity,
             &opened,
@@ -546,9 +669,103 @@ pub fn listed(paths: &Paths) -> Result<Lookup<Vec<Standing>>> {
             value(key.entry()),
             value(key.meta_entry()),
         )?;
+        read.standing.refused_at = refused_at(&refused, &read.standing);
         out.push(read.standing);
     }
     Ok(Lookup::Found(out))
+}
+
+/// The file of this Mac's refusals (§5.6), beside its vault state, which no vault entry can name:
+/// value-free, one per account.
+const REFUSALS: &str = "claude-token-refusals.json";
+
+/// The lock a refusal's writer takes.
+const REFUSALS_LOCK: &str = "claude-token-refusals.lock";
+
+/// How long a refusal's writer waits for another to let the lock go: it runs at a session's
+/// lost-login point, so it never waits like a person's verb; that session's next one records it.
+const REFUSALS_WAIT: Duration = Duration::from_secs(2);
+
+/// The largest refusals file read.
+const MAX_REFUSALS: usize = 1 << 16;
+
+/// The refusals file's schema.
+const REFUSALS_SCHEMA: i64 = 1;
+
+/// This Mac's refusals by account key: the refused token's `minted_at` and when the refusal was
+/// recorded. A file that is absent or does not read holds none: each session here meets a refused
+/// token's refusal again at its next request, which records it again ([`note_refused`]).
+fn refusals(paths: &Paths) -> BTreeMap<String, (u64, u64)> {
+    let Ok(Some(bytes)) = crate::fsx::read_private(&paths.dir.join(REFUSALS), MAX_REFUSALS) else {
+        return BTreeMap::new();
+    };
+    let Ok(value) = aterm_json::from_slice::<aterm_json::Value>(bytes.as_slice()) else {
+        return BTreeMap::new();
+    };
+    if value.get("schema").and_then(aterm_json::Value::as_i64) != Some(REFUSALS_SCHEMA) {
+        return BTreeMap::new();
+    }
+    let secs = |of: &aterm_json::Value, key: &str| {
+        of.get(key)?.as_i64().and_then(|n| u64::try_from(n).ok())
+    };
+    value
+        .get("refused")
+        .and_then(aterm_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let key = Key::parse(row.get("key")?.as_str()?)?;
+            Some((key.0, (secs(row, "minted_at")?, secs(row, "at")?)))
+        })
+        .collect()
+}
+
+/// When this Mac refused the token `standing` reads, by `refused`: only a refusal of that very
+/// token, the one its meta's `minted_at` names, counts, so a newer token is never one refused.
+fn refused_at(refused: &BTreeMap<String, (u64, u64)>, standing: &Standing) -> Option<u64> {
+    let (minted_at, at) = refused.get(standing.key.as_str())?;
+    (standing.meta.as_ref()?.minted_at == *minted_at).then_some(*at)
+}
+
+/// RECORDS THIS MAC'S REFUSAL OF A TOKEN (§5.6): Claude Code refused, on this Mac at `now`, the
+/// token whose standing is `standing`. The refusal is kept beside this Mac's vault state, value-free
+/// (the account's key, the token's `minted_at`, when), and never written to the vault: it is this
+/// Mac's observation, and each Mac's sessions meet the same refusal at their next request. Every
+/// later reading here judges that token `rejected` ([`State::Rejected`]: not in use), until a newer
+/// one replaces it; a refusal of the newer one replaces the older record. Returns whether this call
+/// recorded it first; a standing with no meta names no token and records nothing.
+///
+/// # Errors
+/// This Mac's vault state folder or the refusals file cannot be written, or another writer held
+/// the refusals file's lock past [`REFUSALS_WAIT`].
+pub fn note_refused(paths: &Paths, standing: &Standing, now: u64) -> Result<bool> {
+    let Some(meta) = standing.meta.as_ref() else {
+        return Ok(false);
+    };
+    crate::fsx::ensure_private_dir(&paths.dir)?;
+    let lock_path = paths.dir.join(REFUSALS_LOCK);
+    let _held = aterm_uds::file_lock::LockFile::take(
+        &lock_path,
+        Instant::now() + REFUSALS_WAIT,
+        "another refusal is being recorded",
+    )
+    .map_err(|e| crate::Error::new(format!("{}: {e}", lock_path.display())))?;
+    let mut refused = refusals(paths);
+    if refused_at(&refused, standing).is_some() {
+        return Ok(false);
+    }
+    refused.insert(standing.key.0.clone(), (meta.minted_at, now));
+    let rows: Vec<aterm_json::Value> = refused
+        .iter()
+        .map(|(key, (minted_at, at))| {
+            aterm_json::json!({"key": key, "minted_at": minted_at, "at": at})
+        })
+        .collect();
+    let text =
+        aterm_json::to_string(&aterm_json::json!({"schema": REFUSALS_SCHEMA, "refused": rows}))
+            .map_err(|e| crate::Error::new(format!("{REFUSALS}: {e}")))?;
+    crate::fsx::write_atomic(&paths.dir.join(REFUSALS), text.as_bytes(), 0o600)?;
+    Ok(true)
 }
 
 /// Whether a write of this Mac's of the account `key`'s token is still to be signed: it waits in
@@ -614,12 +831,14 @@ fn judge(
         signer: None,
         minted_here: false,
         exposed: Vec::new(),
+        refused_at: None,
     };
-    let token = match (check, token) {
-        (Check::Readable, Some(token)) => token.clone(),
+    let (token, meta) = match (check, token, meta) {
+        (Check::Readable, Some(token), Some(meta)) => (token.clone(), meta.clone()),
         _ => {
             return Ok(TokenRead {
                 token: None,
+                meta_value: None,
                 standing,
             });
         }
@@ -632,6 +851,7 @@ fn judge(
     }
     Ok(TokenRead {
         token: Some(token),
+        meta_value: Some(meta),
         standing,
     })
 }
@@ -705,14 +925,28 @@ fn exposure(log: &Log, lineage: &crate::membership_log::entries::Lineage) -> Vec
 }
 
 /// Write the account `key`'s token again with its meta's `verified` set to `evidence`, both in
-/// one draft (§5.6): the same token, the meta with the verification. Only the Mac that minted the
-/// token verifies it; any other is refused, and so is a token that does not read as one here.
+/// one draft (§5.6): the same token, the meta with the verification (its route, `minted_by`,
+/// kept). Only the Mac that minted the token verifies it; any other is refused, and so is a token
+/// that does not read as one here. `minted_at` names the token the evidence was read on (its
+/// meta's `minted_at` in the standing the reading was judged against): where the vault's token is
+/// another (a replacement landed before this call read it), the write is refused, so a
+/// verification never stamps a token it did not compare. A verification is of the pair it read:
+/// each entry stands on the value it read ([`MemberEntry::read_as`]: the token, and the meta byte
+/// for byte as the log holds it), so the write is refused where the token or its meta changed
+/// before the write lands: at its draft, where the log holds another value or concurrent values (a
+/// replacement that committed after this read, this Mac's own or one a vault pass applied, another
+/// Mac's token beside it included), and as it lands what waits, where a write of this Mac's still
+/// to be signed leaves the name otherwise (a `--replace` that waits for the vault pass, whose
+/// token sessions here do not use yet, even one that keeps the token and changes only its meta). A
+/// verification that itself waits for the vault pass is dropped there as overtaken, both entries,
+/// where either changed by then. It never replaces a newer token or meta and settles no conflict.
 ///
 /// # Errors
 /// As [`write`].
 pub fn verify(
     paths: &Paths,
     key: &Key,
+    minted_at: u64,
     evidence: Verified,
     on_busy: OnBusy,
 ) -> Result<MemberWritten> {
@@ -729,13 +963,23 @@ pub fn verify(
         }
         Lookup::Unknown => return Ok(MemberWritten::Busy),
     };
-    let (Some(token), Some(meta)) = (read.token(), read.standing.meta.as_ref()) else {
+    let (Some(token), Some(meta_value), Some(meta)) = (
+        read.token(),
+        read.meta_value.as_ref(),
+        read.standing.meta.as_ref(),
+    ) else {
         return Ok(MemberWritten::Refused(format!(
             "the token for {} reads {} here",
             key.as_str(),
             read.standing.state(now_secs()).words()
         )));
     };
+    if meta.minted_at != minted_at {
+        return Ok(MemberWritten::Refused(format!(
+            "the vault's token for {} is not the one compared: another replaced it",
+            key.as_str()
+        )));
+    }
     if !read.standing.minted_here {
         return Ok(MemberWritten::Refused(
             "only the Mac that minted a token verifies it".to_owned(),
@@ -743,7 +987,7 @@ pub fn verify(
     }
     let mut meta = meta.clone();
     meta.verified = Some(evidence);
-    write_pair(paths, key, token, &meta, on_busy)
+    write_pair(paths, key, token, &meta, Some((token, meta_value)), on_busy)
 }
 
 /// Remove the account `key`'s token and meta, both in one draft under a fresh `[everyone]` epoch

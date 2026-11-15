@@ -30,6 +30,54 @@ pub struct RewindRow {
     pub chain_bytes: usize,
 }
 
+/// Inclusive nanosecond bounds for the histogram bucket containing the shown-step p99.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuantileBounds {
+    pub lower_ns: u64,
+    pub upper_ns: u64,
+}
+
+impl QuantileBounds {
+    /// Read exact integer bounds from one `metrics percentiles` response.
+    /// # Errors
+    /// [`CouldNotRun::Unanswered`] when a bound is absent; [`CouldNotRun::Refused`] when a
+    /// bound is not an unsigned nanosecond count or the interval is reversed.
+    pub fn from_metrics(line: &str) -> Result<Self, CouldNotRun> {
+        let read = |key| {
+            let value = field(line, key).ok_or_else(|| {
+                CouldNotRun::Unanswered(format!("ctl metrics percentiles named no {key}="))
+            })?;
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return could_not_run(format!(
+                    "ctl metrics percentiles named an invalid nanosecond count for {key}"
+                ));
+            }
+            value.parse::<u64>().map_err(|_| {
+                CouldNotRun::Refused(format!(
+                    "ctl metrics percentiles named an out-of-range nanosecond count for {key}"
+                ))
+            })
+        };
+        let bounds = Self {
+            lower_ns: read("rewind_shown_p99_lower_ns")?,
+            upper_ns: read("rewind_shown_p99_upper_ns")?,
+        };
+        if bounds.lower_ns > bounds.upper_ns {
+            return could_not_run("ctl metrics percentiles named reversed shown-step p99 bounds");
+        }
+        Ok(bounds)
+    }
+}
+
+/// The row's judgment before accounting for the driver's scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Pass,
+    Fail,
+    /// The recorded percentile interval does not decide whether the bound was met.
+    Unproved,
+}
+
 /// A take's wall-clock limit: every wait and request on the instance ends with it.
 pub const BUDGET_SECS: u64 = 300;
 
@@ -47,17 +95,21 @@ pub struct RewindReport {
     pub keyframes: u64,
     /// The recorded states the view steps among.
     pub states: u64,
-    /// Steps taken, steps the metrics booked as shown, and their p99 in microseconds (a headless instance presents nothing, so a step is booked when its fold is shown and its redraw asked for).
+    /// Steps taken and booked as shown (a headless instance books a step when its fold is shown
+    /// and its redraw asked for).
     pub steps: u32,
     pub booked: u64,
+    /// Rounded display value only; [`Self::p99_bounds`] decides latency.
     pub p99_us: u64,
+    /// Exact inclusive percentile bounds, absent for an idle row.
+    pub p99_bounds: Option<QuantileBounds>,
     /// Over an idle window: the worker's wakes, frames, timer wakes, and every wake by variant.
     pub done_wakes: u64,
     pub frames: u64,
     pub timer_wakes: u64,
     pub wakes: String,
     /// The row's own judgment ([`judge`]).
-    pub verdict: ShapeVerdict,
+    pub verdict: Verdict,
     /// Over a step row's steps, how late the driver's ticks woke, against the row's bound; none
     /// for an idle row.
     pub starvation: Option<Starvation>,
@@ -72,11 +124,16 @@ impl std::fmt::Display for RewindReport {
         match self.row.scene {
             RewindScene::Steps { max_p99_us, .. } => write!(
                 f,
-                "REWIND steps={} booked={} p99_us={} max_p99_us={max_p99_us} chain_bytes={} \
+                "REWIND steps={} booked={} p99_us={} p99_lower_ns={} p99_upper_ns={} \
+                 max_p99_us={max_p99_us} chain_bytes={} \
                  keyframes={} states={} verdict={:?} starved={:?} reason=\"{}\" disposition={:?} {}",
                 self.steps,
                 self.booked,
                 self.p99_us,
+                self.p99_bounds
+                    .map_or_else(|| "none".to_string(), |bounds| bounds.lower_ns.to_string()),
+                self.p99_bounds
+                    .map_or_else(|| "none".to_string(), |bounds| bounds.upper_ns.to_string()),
                 self.row.chain_bytes,
                 self.keyframes,
                 self.states,
@@ -107,10 +164,32 @@ impl std::fmt::Display for RewindReport {
     }
 }
 
-/// The row's bound: a step row passes when every step was booked and the p99 is within its bound; an idle row when the view woke the app for nothing and drew no frame.
+/// Judge every step booked in one chain, then its percentile interval: wholly within the bound
+/// passes, wholly above fails, and overlap is unproved. An idle row allows no wake or frame.
 #[must_use]
-pub fn judge(row: &RewindRow, report: &RewindReport) -> ShapeVerdict {
-    verdict(whole(row, report) && within(row, report))
+pub fn judge(row: &RewindRow, report: &RewindReport) -> Verdict {
+    if !whole(row, report) {
+        return Verdict::Fail;
+    }
+    match row.scene {
+        RewindScene::Steps { max_p99_us, .. } => {
+            let Some(bounds) = report.p99_bounds else {
+                return Verdict::Unproved;
+            };
+            if bounds.lower_ns > bounds.upper_ns {
+                return Verdict::Unproved;
+            }
+            let limit_ns = u128::from(max_p99_us) * 1_000;
+            if u128::from(bounds.upper_ns) <= limit_ns {
+                Verdict::Pass
+            } else if u128::from(bounds.lower_ns) > limit_ns {
+                Verdict::Fail
+            } else {
+                Verdict::Unproved
+            }
+        }
+        RewindScene::Idle { .. } => Verdict::Pass,
+    }
 }
 
 /// Everything the row asks but a step's latency: one chain, and every step booked or an idle view that woke and drew nothing.
@@ -124,34 +203,23 @@ fn whole(row: &RewindRow, report: &RewindReport) -> bool {
     }
 }
 
-/// A step row's p99 within its bound.
-const fn within(row: &RewindRow, report: &RewindReport) -> bool {
-    match row.scene {
-        RewindScene::Steps { max_p99_us, .. } => report.p99_us <= max_p99_us,
-        RewindScene::Idle { .. } => true,
-    }
-}
-
-const fn verdict(pass: bool) -> ShapeVerdict {
-    if pass {
-        ShapeVerdict::Pass
-    } else {
-        ShapeVerdict::Fail
-    }
-}
-
 /// The row's disposition: what the row asks besides latency fails it whatever the machine did,
-/// and a p99 past the bound fails it unless the driver was descheduled for as long as the bound
-/// while it stepped, which makes the take no evidence ([`latency_verdict`]).
+/// percentile overlap remains unproved, and a percentile wholly past the bound fails unless the
+/// driver was descheduled for as long as the bound ([`latency_verdict`]).
 #[must_use]
 pub fn dispose(row: &RewindRow, report: &RewindReport) -> Disposition {
     if !whole(row, report) {
         return Disposition::Fail;
     }
-    match &report.starvation {
-        Some(starvation) => latency_verdict(verdict(within(row, report)), starvation.label()),
-        None if within(row, report) => Disposition::Pass,
-        None => Disposition::Fail,
+    match judge(row, report) {
+        Verdict::Pass => Disposition::Pass,
+        Verdict::Unproved => Disposition::Unproved,
+        Verdict::Fail => report
+            .starvation
+            .as_ref()
+            .map_or(Disposition::Fail, |starvation| {
+                latency_verdict(ShapeVerdict::Fail, starvation.label())
+            }),
     }
 }
 
@@ -263,11 +331,12 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
         steps: 0,
         booked: 0,
         p99_us: 0,
+        p99_bounds: None,
         done_wakes: 0,
         frames: 0,
         timer_wakes: 0,
         wakes: String::new(),
-        verdict: ShapeVerdict::Fail,
+        verdict: Verdict::Fail,
         starvation: None,
         disposition: Disposition::Fail,
         checks: String::new(),
@@ -303,6 +372,7 @@ pub fn measure(rig: &Rig, row: &RewindRow) -> Result<RewindReport, CouldNotRun> 
             report.starvation = Some(steps_standing(&sampler.finish(), max_p99_us));
             let metrics = ctl.ok(&["metrics", "percentiles"])?;
             report.booked = uint_field(&metrics, "n_rewind_shown").unwrap_or(0);
+            report.p99_bounds = Some(QuantileBounds::from_metrics(&metrics)?);
             report.p99_us = ms_field_us(&metrics, "rewind_shown_p99_ms").ok_or_else(|| {
                 CouldNotRun::Unanswered(format!(
                     "ctl metrics percentiles named no rewind_shown_p99_ms= ({metrics})"

@@ -660,6 +660,10 @@ fn retirement_chain_ignores_log_order_and_rejects_cycles() {
                 stderr: Vec::new(),
             })
         }
+        /// The table starts no git, so its reads are its answers.
+        fn git_read(&self, args: &[&str]) -> ledger::Result<RunOut> {
+            self.git(args)
+        }
     }
     let a = Line::start(VERSION, "a", 1);
     let b = Line::start(VERSION, "b", 2);
@@ -1254,13 +1258,27 @@ impl Origin for LocalOrigin<'_> {
 /// Fail the test if production line plumbing tries to use Git for origin I/O.
 struct LocalOnly<'a>(&'a dyn GitRunner);
 
-impl GitRunner for LocalOnly<'_> {
-    fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
+impl LocalOnly<'_> {
+    fn local(args: &[&str]) {
         assert!(!matches!(
             args.first(),
             Some(&"fetch" | &"push" | &"ls-remote")
         ));
+    }
+}
+
+impl GitRunner for LocalOnly<'_> {
+    fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
+        Self::local(args);
         self.0.git(args)
+    }
+    fn git_read(&self, args: &[&str]) -> ledger::Result<RunOut> {
+        Self::local(args);
+        self.0.git_read(args)
+    }
+    fn git_read_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
+        Self::local(args);
+        self.0.git_read_input(args, input)
     }
 }
 
@@ -1368,6 +1386,8 @@ fn a_clean_hop_is_the_landed_fixs_patch_on_the_base_and_verifies() {
 }
 
 const OWN_STOP_PROBE: &str = "ATERM_RELEASE_OWN_STOP_PROBE";
+const OWN_STOP_WORK: &str = "ATERM_RELEASE_OWN_STOP_WORK";
+const OWN_STOP_LINE: &str = "ATERM_RELEASE_OWN_STOP_LINE";
 
 /// A LOST FLEET LINE'S OWN STOP STILL SETTLES ITS PRIVATE HEAD, ON THE REAL BACKEND. The fleet
 /// claim's progress worker loses the line as production does (`line_claim::fail`: the loss
@@ -1396,6 +1416,13 @@ fn a_lost_fleet_lines_own_stop_settles_the_real_clone_and_a_persons_stop_does_no
         return;
     }
     for mode in ["own", "person", "elsewhere"] {
+        let fix = Fixture::merging("own-stop");
+        let (git, s) = (fix.git(), &fix.shas);
+        let mut carried = Line::start(VERSION, &s.g, 1_790_000_000);
+        carried.hops = line::carry(&git, &carried, &[fix_of(&git, &carried, &s.fix_b)]).unwrap();
+        // Prepare the repository before timing the signal-and-settlement probe.
+        assert!(run(&fix.work, &["status", "--porcelain"]).is_empty());
+        run(&fix.work, &["reset", "-q", "--keep", carried.head()]);
         let mut probe = command(std::env::current_exe().unwrap());
         probe
             .args([
@@ -1404,7 +1431,9 @@ fn a_lost_fleet_lines_own_stop_settles_the_real_clone_and_a_persons_stop_does_no
                 "--nocapture",
                 "--test-threads=1",
             ])
-            .env(OWN_STOP_PROBE, mode);
+            .env(OWN_STOP_PROBE, mode)
+            .env(OWN_STOP_WORK, &fix.work)
+            .env(OWN_STOP_LINE, aterm_json::to_string(&carried).unwrap());
         // A one-minute hang detector that drains both pipes while it waits.
         let out = aterm_uds::deadline::output_within(&mut probe, aterm_spec::wait::MUST_HAPPEN)
             .unwrap_or_else(|e| panic!("{mode}: the probe did not end: {e}"));
@@ -1439,16 +1468,17 @@ fn own_stop_probe(mode: &str) {
         signal(SIGTERM, 0);
     }
     crate::interrupt::install();
-    let fix = Fixture::merging("own-stop");
-    let (git, s) = (fix.git(), &fix.shas);
-    let start = Line::start(VERSION, &s.g, 1_790_000_000);
-    let mut carried = start.clone();
-    carried.hops = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_b)]).unwrap();
-    // A status refreshes the laid template's index, as a release's clean check does.
-    assert!(run(&fix.work, &["status", "--porcelain"]).is_empty());
-    run(&fix.work, &["reset", "-q", "--keep", carried.head()]);
-    let mut real =
-        crate::release_steps::Real::new(&fix.work, Some(&fix.work), true, false).unwrap();
+    let work = PathBuf::from(std::env::var_os(OWN_STOP_WORK).expect("prepared private clone"));
+    let carried: Line = aterm_json::from_str(
+        &std::env::var(OWN_STOP_LINE).expect("the prepared clone's carried line"),
+    )
+    .unwrap();
+    assert_eq!(
+        rev(&work, "HEAD"),
+        carried.head(),
+        "the prepared carried head"
+    );
+    let mut real = crate::release_steps::Real::new(&work, Some(&work), true, false).unwrap();
     let pid = i32::try_from(std::process::id()).unwrap();
     let until_caught = |what: &str, sig: i32| {
         aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
@@ -1491,8 +1521,8 @@ fn own_stop_probe(mode: &str) {
                 "the line's own stop refused its settlement: {rewound:?}"
             );
             assert_eq!(
-                rev(&fix.work, "HEAD"),
-                start.head(),
+                rev(&work, "HEAD"),
+                carried.base,
                 "the private head is restored to its recorded prefix"
             );
         }
@@ -1506,7 +1536,7 @@ fn own_stop_probe(mode: &str) {
                     .any(|l| l.contains("not started: the release was interrupted")),
                 "{refusal:?}"
             );
-            assert_eq!(rev(&fix.work, "HEAD"), carried.head(), "main is not moved");
+            assert_eq!(rev(&work, "HEAD"), carried.head(), "main is not moved");
         }
         other => panic!("unknown own-stop probe mode {other}"),
     }

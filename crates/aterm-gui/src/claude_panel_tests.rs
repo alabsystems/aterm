@@ -8,7 +8,7 @@ use super::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 use aterm_window::event::{ElementState, MouseButton};
 
 use crate::claude_footer::probe::{self, COLS, DONE, Live, ROWS};

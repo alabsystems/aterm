@@ -40,7 +40,7 @@ fn run_case(state: &aterm_spec::interp::State, buggy: u8) -> (bool, bool) {
     if scenario == 6 {
         let mut intent = initial.intent.clone();
         intent.purpose = Purpose::WeeklyQuota;
-        key = IndexKey::quota(&intent, initial.old_pid, initial.old_birth, "start").unwrap();
+        key = IndexKey::moved(&intent, initial.old_pid, initial.old_birth, "start").unwrap();
     }
     let path = key.path(&env).unwrap();
     let prior = match scenario {
@@ -327,4 +327,50 @@ fn receipt_index_rejects_unsafe_files_and_uses_the_writers_store() {
         .unwrap();
     assert_eq!(key.observe(&other_env).unwrap(), None);
     assert_eq!(key.observe(&env).unwrap(), Some(initial.id));
+}
+
+/// Each move's index has its own name: a usage-limit handoff's and a lost login's move of the
+/// same wall, process and start are two indexes, so neither can read the other's receipt as its
+/// own, and a login renewal's intent names no move's index at all.
+#[test]
+fn each_moves_index_is_named_for_its_purpose() {
+    let (_tmp, env, initial, login) = fixture();
+    let keyed = |purpose| {
+        let mut intent = initial.intent.clone();
+        intent.purpose = purpose;
+        IndexKey::moved(&intent, initial.old_pid, initial.old_birth, "start")
+    };
+    assert_eq!(keyed(Purpose::Login), Err("index-purpose"));
+    let quota = keyed(Purpose::WeeklyQuota).unwrap();
+    let moved = keyed(Purpose::LoginRotation).unwrap();
+    let name = |key: &IndexKey| {
+        key.path(&env)
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert!(
+        name(&quota).starts_with("quota-intent-"),
+        "{}",
+        name(&quota)
+    );
+    assert!(
+        name(&moved).starts_with("login-rotation-intent-"),
+        "{}",
+        name(&moved)
+    );
+    assert!(name(&login).starts_with("intent-"), "{}", name(&login));
+    assert_ne!(quota.path(&env).unwrap(), moved.path(&env).unwrap());
+    // A login renewal's root under a move's index is refused, as a move's under another's.
+    with_receipt_writer(&env, |writer| {
+        assert_eq!(
+            writer.publish_indexed(&moved, None, &initial),
+            Err("index-purpose")
+        );
+        Ok(())
+    })
+    .unwrap()
+    .unwrap();
 }

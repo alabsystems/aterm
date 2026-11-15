@@ -11,7 +11,7 @@
 //! was not read exits 1 with no row rather than print an empty fleet. Under the dev seam
 //! `ATERM_DEV_FLEET_FIXTURE` (debug and dev-seams builds) it prints the fixture's lab instead.
 //!
-//! A cell nobody read prints `?` (JSON `null`), never 0; a login address prints masked.
+//! A cell nobody read prints `?` (JSON `null`), never 0; a login address prints as it is.
 
 use super::fold::{FleetTables, Inputs, Source, SourceState, Sources, fold};
 use super::rows::{self, Cell, Row, Schema};
@@ -96,19 +96,21 @@ fn parse(words: &[String]) -> Result<Args> {
 }
 
 /// One cell as a table shows it: `?` for a cell nobody read, nothing for one known empty, and
-/// a value as the registry's grid shows a value of its type, an address masked.
+/// a value as the registry's grid shows a value of its type.
 pub fn shown(ty: &Ty, cell: &Cell) -> String {
     match cell {
         Cell::Unread => "?".to_owned(),
         Cell::Empty => String::new(),
-        Cell::Value(value) => grid::show(ty, value, false),
+        Cell::Value(value) => grid::show(ty, value),
     }
 }
 
-/// One cell as JSON: `null` for a cell with no value, an address masked.
+/// One cell as JSON: `null` for a cell with no value, a value of its column's type as it is, and
+/// one that fails its type or the guards (another writer's build stored it) as the grid gives a
+/// raw value ([`grid::raw_shown`]), so the JSON shows nothing [`shown`] withholds.
 fn cell_json(ty: &Ty, cell: &Cell) -> Value {
     match cell {
-        Cell::Value(value) if ty.pii() => Value::String(grid::show(ty, value, false)),
+        Cell::Value(value) if !crate::typed::cell::admissible(ty, value) => grid::raw_shown(value),
         other => other.json(),
     }
 }
@@ -128,7 +130,7 @@ fn cell_matches(ty: &Ty, cell: &Cell, text: &str) -> bool {
             Value::String(word) => word == text,
             other => other.to_string() == text,
         }),
-        other => grid::show(inner, other, false) == text,
+        other => grid::show(inner, other) == text,
     })
 }
 
@@ -306,7 +308,6 @@ pub fn print_schema(only: Option<&str>, json: bool) -> Result<String> {
                         "name": col.column.name,
                         "type": col.column.ty.word(),
                         "null": col.column.null,
-                        "pii": col.column.ty.pii(),
                         "doc": col.doc,
                     })).collect::<Vec<_>>(),
                 })

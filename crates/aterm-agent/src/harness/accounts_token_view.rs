@@ -17,6 +17,10 @@
 //!   stands for an account a session here is logged into, in a state [`TokenState::offer`] offers
 //!   for, while no write of this Mac's of the token waits. [`note_offers`] journals
 //!   `token-offered` once per pair, so a re-read journals nothing and no timer offers again.
+//! - **The lab's ask** ([`ask_lab`]): each offer whose account has no verified token in use here
+//!   is asked of the lab as `claude-token:<key>` through the need ledger, never of a person; the
+//!   request ends by itself when such a token arrives, and is asked again once that token has
+//!   left use and an offer stands again.
 //! - **Peers' use** ([`peers_of`]) comes from one bounded fleet read: each peer whose session
 //!   rows carry `token=<ac key>`; with no read, the report says "peers not read".
 //!
@@ -29,6 +33,7 @@ use super::accounts_tokens::{
     self as tokens, InVault, Offered, SessionLogin, TokenNote, TokenRow, TokenState, TokenVault,
     date,
 };
+use super::token_steps::{self, Since, Stopped};
 use aterm_json::{Map, Value};
 use aterm_secrets::claude_token::{Key, Lookup, Standing};
 use std::collections::BTreeMap;
@@ -129,6 +134,14 @@ impl AccountToken {
             .or_else(|| self.row.as_ref()?.minted_on.clone())
     }
 
+    /// The route that made it (`window`, `headless` or `terminal`), as its meta names it: whether
+    /// it serves every Mac before verification. `None`: no meta read, or one naming no route
+    /// this build knows.
+    #[must_use]
+    pub fn minted_by(&self) -> Option<aterm_secrets::claude_token::MintedBy> {
+        self.meta()?.minted_by
+    }
+
     /// Where its end came from: `printed` or `assumed`.
     #[must_use]
     pub fn expiry_from(&self) -> Option<String> {
@@ -144,6 +157,12 @@ impl AccountToken {
             .as_ref()
             .and_then(|standing| standing.signer.clone())
             .or_else(|| self.row.as_ref()?.signer.clone())
+    }
+
+    /// When this Mac recorded Claude Code's refusal of its token, where it did.
+    #[must_use]
+    pub fn rejected_at(&self) -> Option<u64> {
+        self.standing.as_ref()?.refused_at
     }
 
     /// Whether a token made here is not yet in vault: a write of it waits, or it was signed here
@@ -190,7 +209,9 @@ impl AccountToken {
                 }
             }
             Some(LoginHalf::Ended { .. }) => format!("login ended; {token}"),
-            Some(LoginHalf::SignedOut { .. }) => format!("login signed out; {token}"),
+            Some(LoginHalf::SignedOut { .. }) => {
+                format!("login {}; {token}", super::outlook::SIGNED_OUT)
+            }
             Some(LoginHalf::InUse | LoginHalf::Ok) | None => token,
         })
     }
@@ -220,7 +241,13 @@ impl AccountToken {
             let on = self
                 .minted_on()
                 .map_or_else(String::new, |on| format!(" on {on}"));
-            parts.push(format!("made {}{on}", date(at)));
+            let by = match self.minted_by() {
+                Some(aterm_secrets::claude_token::MintedBy::Window) => " in aterm's window",
+                Some(aterm_secrets::claude_token::MintedBy::Headless) => " headless",
+                Some(aterm_secrets::claude_token::MintedBy::Terminal) => " at a terminal",
+                None => "",
+            };
+            parts.push(format!("made {}{on}{by}", date(at)));
         }
         if let Some(at) = self.expires_at() {
             let from = self
@@ -234,13 +261,13 @@ impl AccountToken {
         if let Some(vault) = self.vault_words() {
             parts.push(vault);
         }
+        if let Some(at) = self.row.as_ref().and_then(|row| row.verified) {
+            parts.push(format!("verified {}", date(at)));
+        }
+        if let Some(at) = self.rejected_at() {
+            parts.push(format!("rejected here {}", date(at)));
+        }
         if let Some(row) = &self.row {
-            if let Some(at) = row.verified {
-                parts.push(format!("verified {}", date(at)));
-            }
-            if let Some(at) = row.rejected_at {
-                parts.push(format!("rejected here {}", date(at)));
-            }
             if let (Some(first), Some(last)) =
                 (row.used_on.first_served_at, row.used_on.last_served_at)
             {
@@ -279,6 +306,13 @@ impl AccountToken {
         o.insert("expires_at".into(), Value::from(self.expires_at()));
         o.insert("expiry_from".into(), Value::from(self.expiry_from()));
         o.insert("minted_on".into(), Value::from(self.minted_on()));
+        o.insert(
+            "minted_by".into(),
+            Value::from(
+                self.minted_by()
+                    .map(aterm_secrets::claude_token::MintedBy::word),
+            ),
+        );
         o.insert("signer".into(), Value::from(self.signer()));
         o.insert("vault".into(), Value::from(self.vault_words()));
         o.insert("not_yet_in_vault".into(), Value::from(self.not_yet()));
@@ -287,10 +321,7 @@ impl AccountToken {
             "verified".into(),
             Value::from(row.and_then(|row| row.verified)),
         );
-        o.insert(
-            "rejected_at".into(),
-            Value::from(row.and_then(|row| row.rejected_at)),
-        );
+        o.insert("rejected_at".into(), Value::from(self.rejected_at()));
         let used = row.map(|row| &row.used_on);
         let mut here = Map::new();
         here.insert(
@@ -502,11 +533,17 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
 }
 
 /// Each covered account ([`covered`]) and each account this Mac's table keeps a row of, as one
-/// read of `vault` and the table make it now, each with no offer where `places` offers none.
+/// read of `vault` and the table make it now, each with no offer where `places` offers none. An
+/// account's token is judged by this Mac's row of the token the vault holds
+/// ([`tokens::Table::row_for`]), as the route, the verb and execution admission judge it.
 #[must_use]
 pub fn view(places: &Places<'_>, vault: &dyn TokenVault) -> Vec<AccountToken> {
     let mut covered = covered(places);
-    let table = tokens::read_table(places.store).unwrap_or_default();
+    // A check file that does not read leaves `tokens.json`'s rows, by which a token minted on
+    // another Mac is judged as the route judges it ([`tokens::TableRead::for_token`]).
+    let table = tokens::read_parts(places.store)
+        .map(|read| read.table)
+        .unwrap_or_default();
     for row in table.rows.values() {
         let Some(key) = Key::parse(&row.key) else {
             continue;
@@ -536,7 +573,9 @@ pub fn view(places: &Places<'_>, vault: &dyn TokenVault) -> Vec<AccountToken> {
                     .map_or(Lookup::Absent, |standing| Lookup::Found(standing.clone())),
             };
             let pending = vault.waiting_here(&account_here.key).ok();
-            let row = table.rows.get(account_here.key.as_str()).cloned();
+            // The vault's token is judged, and shown, by this Mac's facts of that token: while a
+            // later write of this Mac's is on its way, its kept row, never the waiting token's.
+            let row = table.row_for(account_here.key.as_str(), &found).cloned();
             let mut shown = account(account_here, &found, row, pending, now);
             // The step makes a token only where aterm's wrapper serves one (the verb refuses
             // elsewhere), so no other host is offered it; its surfaces still say the state.
@@ -604,6 +643,41 @@ pub fn note_offers(store: &Store, accounts: &mut [AccountToken], now: u64) -> io
         }
     }
     Ok(noted.len())
+}
+
+/// ASKS THE LAB FOR EACH OFFERED TOKEN (§5.9; docs/DESIGN-credential-requests-2026-10-27.md, the
+/// `claude-token:<key>` row): each account an offer stands for whose vault token is not verified
+/// and in use here ([`Standing::verified_in_use`], what the request waits for, so a request it
+/// files is never met as it is made) is asked of the lab through `vault`'s need ledger
+/// ([`TokenVault::ask`]): no person is asked, and the request ends by itself once such a token
+/// arrives (where the vault's policy gives the want by request; elsewhere it is retired
+/// `not-authorized` as it is made). An offer whose token is still in use (`soon`, `exposed`) asks nothing: the want would
+/// be met at once. Asks nothing where no such offer stands; where one does, the ledger decides
+/// whether to raise ([`aterm_secrets::need::ask_for_tokens`]), so a re-read writes nothing.
+/// Returns how many needs it raised.
+///
+/// # Errors
+/// The need ledger could not be read or written.
+pub fn ask_lab(
+    accounts: &[AccountToken],
+    vault: &dyn TokenVault,
+    now: u64,
+) -> Result<usize, String> {
+    let keys: Vec<Key> = accounts
+        .iter()
+        .filter(|account| account.offer.is_some())
+        .filter(|account| {
+            account
+                .standing
+                .as_ref()
+                .is_none_or(|standing| !standing.verified_in_use(now))
+        })
+        .filter_map(|account| Key::parse(&account.key))
+        .collect();
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    vault.ask(&keys)
 }
 
 /// How often a surface's read retries the post of a `signed here` row's write (§5.1).
@@ -857,6 +931,9 @@ pub enum Report {
         peers: PeersShown,
         /// This aterm's Claude Code sessions, where its survey was read.
         sessions: Option<Vec<SessionRoute>>,
+        /// Each account's token step a check stopped and still holds, by its key
+        /// ([`super::token_steps`]): shown here, on demand, and posted nowhere.
+        steps: BTreeMap<String, Stopped>,
     },
 }
 
@@ -870,6 +947,7 @@ impl Report {
                 accounts,
                 peers,
                 sessions,
+                steps,
             } => {
                 let mut text = String::from("vault tokens:\n");
                 if accounts.is_empty() {
@@ -877,6 +955,19 @@ impl Report {
                 }
                 for account in accounts {
                     text.push_str(&account.text(peers));
+                    if let Some(step) = steps.get(&account.key) {
+                        let person = account.label.as_ref().map(|label| {
+                            Step::Token {
+                                label: label.clone(),
+                                replace: false,
+                            }
+                            .to_string()
+                        });
+                        text.push_str(&format!(
+                            "\n    token step: {}",
+                            step.words(person.as_deref())
+                        ));
+                    }
                     text.push('\n');
                 }
                 if let Some(sessions) = sessions.as_ref().filter(|s| !s.is_empty()) {
@@ -918,10 +1009,25 @@ impl Report {
                 accounts,
                 peers,
                 sessions,
+                steps,
             } => {
                 o.insert(
                     "accounts".into(),
-                    Value::Array(accounts.iter().map(|a| a.json(peers)).collect()),
+                    Value::Array(
+                        accounts
+                            .iter()
+                            .map(|a| {
+                                let mut account = a.json(peers);
+                                if let Some(o) = account.as_object_mut() {
+                                    o.insert(
+                                        "step".into(),
+                                        steps.get(&a.key).map_or(Value::Null, Stopped::json),
+                                    );
+                                }
+                                account
+                            })
+                            .collect(),
+                    ),
                 );
                 o.insert("peers_read".into(), Value::from(peers.read()));
                 o.insert(
@@ -968,6 +1074,57 @@ impl Report {
     }
 }
 
+/// Each of `accounts`' token steps a check stopped that its record still holds
+/// ([`Stopped::holds`]), by account key, judged by the Claude Code build a capture would run now
+/// (`cli`, asked only where a record is there), this aterm's build, the account's window store
+/// and the mailbox configurations under `home` ([`token_steps::route_at`]), and the token the
+/// vault holds: what the report shows on demand. None where the steps file does not read.
+pub fn held_steps(
+    store: &Store,
+    accounts: &[AccountToken],
+    home: Option<&Path>,
+    cli: impl FnOnce() -> Option<String>,
+) -> BTreeMap<String, Stopped> {
+    let Ok(mut steps) = token_steps::read(store) else {
+        return BTreeMap::new();
+    };
+    steps.retain(|key, _| accounts.iter().any(|account| account.key == *key));
+    if steps.is_empty() {
+        return steps;
+    }
+    let cli = cli();
+    let aterm = aterm_stamp::build_id();
+    accounts
+        .iter()
+        .filter_map(|account| {
+            let step = steps.remove(&account.key)?;
+            step.holds(&Since {
+                cli: cli.as_deref(),
+                aterm: Some(&aterm),
+                route_at: token_steps::route_at(store, home, &account.email),
+                token_at: account.minted_at(),
+            })
+            .then(|| (account.key.clone(), step))
+        })
+        .collect()
+}
+
+/// Each of `accounts`' token steps a check stopped that its record still holds on this Mac
+/// ([`held_steps`] for the store under `harness` and the mailbox configurations under `home`),
+/// judged by the Claude Code build aterm manages here, as a capture would run it, read from its
+/// twin and never run: what the Account card's details show on demand.
+#[must_use]
+pub fn steps_here(
+    harness: &Path,
+    home: Option<&Path>,
+    accounts: &[AccountToken],
+) -> BTreeMap<String, Stopped> {
+    held_steps(&Store::at(harness), accounts, home, || {
+        let twin = super::upgrade_drive::managed_agent_twin("claude")?;
+        super::upgrade_drive::twin_version(&twin)
+    })
+}
+
 /// The account key `session`'s login record names, and that account among `accounts`.
 fn login_of<'a>(
     session: &'a SessionRoute,
@@ -995,7 +1152,7 @@ pub fn doctor_words(accounts: &[AccountToken]) -> String {
         count(&|a| a.state == TokenState::Soon),
         count(&|a| matches!(a.state, TokenState::Unverified { .. })),
         count(&AccountToken::not_yet),
-        count(&|a| a.state == TokenState::Rejected),
+        count(&|a| matches!(a.state, TokenState::Rejected { .. })),
     )
 }
 
@@ -1044,6 +1201,22 @@ pub fn view_here(
         u64::try_from(now).unwrap_or(0),
     );
     Some(accounts)
+}
+
+/// [`ask_lab`] for a surface that has no host, through the vault configured under `home`
+/// ([`tokens::configured_vault`]): the window's token read, beside its [`note_offers`]. Asks
+/// nothing where no vault is configured there.
+///
+/// # Errors
+/// As [`ask_lab`].
+pub fn ask_lab_here(accounts: &[AccountToken], home: &Path, now: i64) -> Result<usize, String> {
+    if accounts.iter().all(|account| account.offer.is_none()) {
+        return Ok(0);
+    }
+    match tokens::configured_vault(aterm_secrets::client::Paths::for_home(home)) {
+        Some(vault) => ask_lab(accounts, &vault, u64::try_from(now).unwrap_or(0)),
+        None => Ok(0),
+    }
 }
 
 #[cfg(test)]

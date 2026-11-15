@@ -462,7 +462,12 @@ pub fn judge_text(
     if budget_cut {
         let marks = text
             .lines()
-            .filter(|l| l.starts_with("s-") && l.contains(aterm_ctl::EXCERPTS_CUT))
+            .filter(|l| {
+                l.split(' ')
+                    .next()
+                    .is_some_and(aterm_types::tab_id::is_tab_id)
+                    && l.contains(aterm_ctl::EXCERPTS_CUT)
+            })
             .count();
         let wrong_marks = claude
             .iter()
@@ -759,13 +764,17 @@ pub fn judge_json(json: &str, want: &[WantInstance]) -> Vec<Check> {
                 ));
             }
             let has = |k: &str| str_of(row, k).is_some_and(|v| v != "-" && !v.is_empty());
-            let content = if s.program == "claude" {
-                has("prompt") && has("said")
+            let required: &[&str] = if s.program == "claude" {
+                &["prompt", "said"]
             } else {
-                has("cwd")
+                &["cwd"]
             };
-            if !content {
-                wrong.push(format!("m{:02} {}: no excerpt", w.i, s.sid));
+            let missing: Vec<_> = required.iter().copied().filter(|key| !has(key)).collect();
+            if !missing.is_empty() {
+                wrong.push(format!(
+                    "m{:02} {}: missing content fields {missing:?}; program={program:?}, expected={:?}",
+                    w.i, s.sid, s.program
+                ));
             }
         }
     }

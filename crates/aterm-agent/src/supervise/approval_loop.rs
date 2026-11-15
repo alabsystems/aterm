@@ -47,7 +47,7 @@ pub(super) const NOT_TAKEN: &str =
 /// The pause before a re-asked question answered `answered` times is answered again.
 pub(crate) fn reask_pause(answered: usize) -> Duration {
     let n = u32::try_from(answered.saturating_sub(REASKED_AFTER)).unwrap_or(u32::MAX);
-    crate::supervise::ladder::doubling(REFUSAL_PAUSE, n, PRESS_RETRY_MAX)
+    alab_policy::ladder::doubling(REFUSAL_PAUSE, n, PRESS_RETRY_MAX)
 }
 
 const MAX_UNSETTLED_WAITS: u32 = 3;
@@ -188,12 +188,12 @@ pub(crate) fn whole_box_decision(
         } => {
             let guard = if rows[shown..]
                 .iter()
-                .any(|r| super::super::policy::row_guard(r) == guard)
+                .any(|r| alab_policy::guard::row_guard(r) == guard)
             {
                 guard
             } else {
                 match screen.iter().find(|r| !r.trim().is_empty()) {
-                    Some(top) => super::super::policy::row_guard(top),
+                    Some(top) => alab_policy::guard::row_guard(top),
                     None => return cut(),
                 }
             };
@@ -755,7 +755,7 @@ fn may_run_git(p: &aterm_phase::PromptV2) -> bool {
     p.kind == PromptKind::Bash && p.command_rows.iter().any(|r| r.contains("git"))
 }
 
-/// The session's `s-…` id and its PTY's foreground process group, off a `who` reply's rows ([`roster_rows`]).
+/// The session's tab ID and its PTY's foreground process group, off a `who` reply's rows ([`roster_rows`]).
 pub(super) fn session_group(
     rows: &str,
     stable: Option<&str>,
@@ -933,7 +933,7 @@ impl<C: Ctl> Session<'_, C> {
             .sid
             .as_deref()
             .and_then(|s| s.strip_prefix('@'))
-            .filter(|s| s.starts_with("s-"))
+            .filter(|s| aterm_types::control_verbs::is_minted_sid(s))
             .map(str::to_string);
         let r = match stable.as_deref() {
             Some(sid) => self.ctl.call_at_host_of(sid, &["who"]),
@@ -1798,7 +1798,7 @@ impl<C: Ctl> Session<'_, C> {
         let who = if self.driver {
             "another driver's hand is on the session"
         } else {
-            super::super::policy::turn_end::PERSON_TYPING
+            alab_policy::words::PERSON_TYPING
         };
         let (until, why) = match (clock, self.touched()) {
             (DenyClock::None, _) => (grace_ends, String::new()),
@@ -1842,7 +1842,7 @@ impl<C: Ctl> Session<'_, C> {
             .setup
             .person_hold_wait
             .map_or(until, |wait| until.min(self.fx.mono() + wait));
-        self.set_due(until, super::super::policy::turn_end::PERSON_TYPING);
+        self.set_due(until, alab_policy::words::PERSON_TYPING);
         self.held = true;
         Ok(true)
     }
@@ -2449,7 +2449,7 @@ impl<C: Ctl> Session<'_, C> {
                 guard,
                 &n.to_string(),
                 &turn.screen,
-                super::super::policy::KeyAct::Approve,
+                alab_policy::guard::KeyAct::Approve,
             )?,
             Act::Approve {
                 guard,
@@ -2462,7 +2462,7 @@ impl<C: Ctl> Session<'_, C> {
                 guard,
                 &turn.screen,
                 person,
-                Some(super::super::policy::KeyAct::Approve),
+                Some(alab_policy::guard::KeyAct::Approve),
             )?,
             Act::Approve {
                 guard,
@@ -2833,7 +2833,7 @@ impl<C: Ctl> Session<'_, C> {
             self.reset_pass(seq, why, opts, review);
             return Ok(Step::Again { settle: false });
         }
-        let pause = crate::supervise::ladder::doubling(REFUSAL_PAUSE, tries - 1, PRESS_RETRY_MAX);
+        let pause = alab_policy::ladder::doubling(REFUSAL_PAUSE, tries - 1, PRESS_RETRY_MAX);
         review.note(&format!(
             "WAITING seq={seq} rule={RULE_LIMIT_RESET} {why} (try {tries}): read and tried again \
              in {} ms",
@@ -2864,7 +2864,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(Step::Again { settle: false });
         };
         r.tries = r.tries.saturating_add(1);
-        let pause = crate::supervise::ladder::doubling(REFUSAL_PAUSE, r.tries - 1, PRESS_RETRY_MAX);
+        let pause = alab_policy::ladder::doubling(REFUSAL_PAUSE, r.tries - 1, PRESS_RETRY_MAX);
         let badge = !r.badged && now.duration_since(r.since) >= self.setup.press_badge_after;
         r.badged |= badge;
         let tries = r.tries;

@@ -2,16 +2,16 @@
 // Copyright 2026 Andrew Yates
 
 //! THE HOST'S RESOLUTION OF CREDENTIAL WANTS (`IdleHost::credentials`), the one path every
-//! credential need takes ([`crate::supervise::policy::credential_need`]): each want is looked up
+//! credential need takes ([`alab_policy::credential_need`]): each want is looked up
 //! in this Mac's secrets registry (`aterm_secrets::registry::read`: `state.toml` alone, never the
 //! identity or a value) by the entries the need catalog says it arrives as (`Want::entries`), and
 //! one it holds no entry for is filed in the need ledger (`aterm_secrets::need::raise`, by hand),
 //! which asks the lab's Macs for it. A registry that cannot be read is no empty one: the want is
 //! filed, and the ledger answers from what this Mac holds.
 
-use crate::supervise::policy::credential_need::CredentialRead;
+use alab_policy::credential_need::CredentialRead;
 #[cfg(unix)]
-use crate::supervise::policy::credential_need::{Resolution, VaultEntry};
+use alab_policy::credential_need::{Resolution, VaultEntry};
 
 /// A read whose thread could not start, or that panicked: each want unresolved, so the agent
 /// files it itself.
@@ -42,7 +42,6 @@ pub fn resolve(home: &std::path::Path, wants: &[String]) -> CredentialRead {
                         .filter(|e| names.contains(&e.name))
                         .map(|e| VaultEntry {
                             name: e.name.clone(),
-                            pointer: e.pointer.clone(),
                             purpose: e.purpose.clone(),
                         })
                         .collect();

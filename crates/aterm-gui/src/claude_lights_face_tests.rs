@@ -73,7 +73,7 @@ struct Row {
 fn rows() -> Vec<Row> {
     use crate::autopilot::mode_words;
     use ChipTone::{Letter, Quiet};
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let timed = crate::autopilot::TIMED_CRUISE_CHIP;
     let landed = aterm_agent::supervise::mode_words::landed_brief(None);
     let (cruise, land, off) = (

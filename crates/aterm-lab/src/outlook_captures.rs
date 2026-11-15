@@ -8,13 +8,14 @@
 //! store and `me`'s series ([`seed`]). Its one tab runs the lab's `claude` fixture
 //! ([`crate::fleet_fixture::claude`], by a link of that name), so the footer reads the profile it
 //! was seeded with. Each scene's footer is shot at the three widths of §2.4, and the Account card
-//! of the covered, gap, never-read, no-pace and no-figure scenes, of the glass's case (c) (J) and
-//! of the two card scenes L and M at 60 and 44 cells ([`CARD_SCENES`]); beside each png the
-//! card's rows (`controls fact-menu`) and a `manifest-<tag>.tsv` row. `--aterm` points the same
-//! seeds at another build (main's, for the shots side by side).
+//! of the covered, gap, never-read, no-pace and no-figure scenes, of the glass's case (c) (J), of
+//! the two card scenes L and M and of the logins' scenes N and O at 60 and 44 cells
+//! ([`CARD_SCENES`]);
+//! beside each png the card's rows (`controls fact-menu`) and a `manifest-<tag>.tsv` row.
+//! `--aterm` points the same seeds at another build (main's, for the shots side by side).
 //!
 //! L and M are the card's own scenes, the two a Mac in a lab shows and no other scene seeds: a
-//! pool file (`~/.secrets/ai-pool.toml`) that gives each account its home Mac and names this Mac
+//! pool entry (the vault's `ai-pool.toml`, read in place) that gives each account its home Mac and names this Mac
 //! `m20`, and a scratch vault this lab process serves on loopback with the instance's home
 //! seated in it ([`crate::setup_token_lab::seat_scratch_vault`]). L's tab runs on a login no
 //! roster row names, whose home is another Mac and for which the vault holds no token; M's runs
@@ -23,7 +24,14 @@
 //!
 //! Scenes I, J and K are the harness glass's cases (b), (c) and (d)
 //! (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1, §6 S5, §7), under Cruise, their
-//! accounts `main`, `alt1` and `alt2`: the fixture's `--settings` names the build's own usage tap
+//! accounts `main`, `alt1` and `alt2`. N is J's world with each login on this Mac that is not
+//! signed in: `alt1` signed out though its week was read, `alt2` signed out while this lab
+//! process holds its running sign-in record ([`hold_sign_in`]), and `alt3` never signed in here.
+//! O puts those logins where N's frames could not show them: the tab's own account `main`
+//! signed out while its sign-in runs, so the card's Login line is of a login that is not here,
+//! and three rows, which line E's view names (its wide rung draws them, narrower rungs fold them
+//! into `+N`): `alt1` signed out though read and `alt2` never signed in here.
+//! In each glass scene the fixture's `--settings` names the build's own usage tap
 //! (`<aterm> harness tap`) as its statusLine, which the fixture runs with `main`'s seeded figures
 //! as its payload's `rate_limits` ([`crate::fleet_fixture::RATE_LIMITS`]) and prints under its
 //! bottom rule, so line E is the quota row the window draws over the tap's words; every glass
@@ -53,16 +61,21 @@ const D: i64 = 86_400;
 /// F walled, G an aged figure, H no figure; and the glass design's line E: I one account out
 /// before its reset (case (b)), J three accounts whose work moves then waits (case (c)), K no
 /// figure yet (case (d)). And the Account card's own: L a login outside this Mac's pool whose
-/// home is another Mac, M a pool account with a vault token whose home is this Mac.
-pub const SCENES: [char; 13] = [
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+/// home is another Mac, M a pool account with a vault token whose home is this Mac. N the
+/// logins: J's world with an account signed out though read, one signed out whose sign-in runs,
+/// and one never signed in here. O the same logins where they are shown: the tab's own account
+/// signed out while its sign-in runs, beside one signed out though read and one never signed in
+/// here, three rows that line E's view names.
+pub const SCENES: [char; 15] = [
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
 ];
 
 /// The scenes whose Account card is shot: covered, a gap, an alt never read (§8.2), no pace yet,
 /// no figure and no history (H), the glass design's case (c) under Cruise (J), the one card here
 /// whose tab aterm can switch, so the one whose `Forecast` row holds a projection (its §1.4),
-/// and the card's own two (L, M).
-pub const CARD_SCENES: [char; 8] = ['A', 'B', 'C', 'E', 'H', 'J', 'L', 'M'];
+/// the card's own two (L, M), and the logins' scenes, N, whose items say each login, and O,
+/// whose Login line says the tab's own.
+pub const CARD_SCENES: [char; 10] = ['A', 'B', 'C', 'E', 'H', 'J', 'L', 'M', 'N', 'O'];
 
 /// The footer's three widths of §2.4, as pane columns.
 pub const WIDTHS: [(&str, u16); 3] = [("wide", 170), ("medium", 100), ("narrow", 70)];
@@ -145,6 +158,13 @@ pub struct Plan {
     home: Option<&'static str>,
     /// The scratch vault the instance's home is seated in, or none.
     vault: Option<Vault>,
+    /// The rows whose login was never made on this Mac: their folder holds no login.
+    not_made: &'static [&'static str],
+    /// The rows whose login the store records as signed out here.
+    signed_out: &'static [&'static str],
+    /// The row whose sign-in this lab process names as running on this Mac while the instance
+    /// runs ([`hold_sign_in`]).
+    signing_in: Option<&'static str>,
 }
 
 /// What a scene's scratch vault holds for the tab's account.
@@ -407,6 +427,53 @@ pub fn plan(scene: char) -> Plan {
             profile: Some((75, 20, 0)),
             ..tapped()
         },
+        'N' => Plan {
+            rows: vec![
+                ("main", Class::Preferred),
+                ("alt1", Class::Preferred),
+                ("alt2", Class::Preferred),
+                ("alt3", Class::Preferred),
+            ],
+            seen: vec![
+                (
+                    "main",
+                    Seen {
+                        week: Some((750, MAIN_WEEK, 0)),
+                        five: Some(MAIN_FIVE),
+                    },
+                ),
+                ("alt1", week(800, ALT1_WEEK, 0)),
+            ],
+            series: vec![(-24 * H, 390), (-12 * H, 570), (0, 750)],
+            profile: Some((75, 20, 0)),
+            not_made: &["alt3"],
+            signed_out: &["alt1", "alt2"],
+            signing_in: Some("alt2"),
+            ..tapped()
+        },
+        'O' => Plan {
+            rows: vec![
+                ("main", Class::Preferred),
+                ("alt1", Class::Preferred),
+                ("alt2", Class::Preferred),
+            ],
+            seen: vec![
+                (
+                    "main",
+                    Seen {
+                        week: Some((750, MAIN_WEEK, 0)),
+                        five: Some(MAIN_FIVE),
+                    },
+                ),
+                ("alt1", week(800, ALT1_WEEK, 0)),
+            ],
+            series: vec![(-24 * H, 390), (-12 * H, 570), (0, 750)],
+            profile: Some((75, 20, 0)),
+            not_made: &["alt2"],
+            signed_out: &["main", "alt1"],
+            signing_in: Some("main"),
+            ..tapped()
+        },
         'L' => Plan {
             rows: vec![
                 ("alt1", Class::Preferred),
@@ -478,12 +545,15 @@ fn untapped() -> Plan {
         outside: false,
         home: None,
         vault: None,
+        not_made: &[],
+        signed_out: &[],
+        signing_in: None,
     }
 }
 
-/// The rest of a plan of the glass scenes I to K: `main`'s plan rows, the usage tap as the
-/// fixture's statusLine, every reading this Mac's, Autopilot Cruise (the design's §1 is under
-/// Cruise).
+/// The rest of a plan of the glass scenes I to K and the logins' scenes N and O: `main`'s plan
+/// rows, the usage tap as the fixture's statusLine, every reading this Mac's, Autopilot Cruise
+/// (the design's §1 is under Cruise).
 fn tapped() -> Plan {
     Plan {
         plans: MAIN_PLANS,
@@ -540,9 +610,11 @@ fn profile(plan: &Plan, now: i64) -> String {
 }
 
 /// Seed `world` for `plan` at `now`: the profile in its HOME, the roster beside its
-/// `aterm.toml`, a placeholder file in each other login's folder, the store's readings with the
-/// default home's row active, the own login's series (and, where every
-/// reading is this Mac's, each other login's week as its series row), the plan rows, where the
+/// `aterm.toml`, a placeholder file in each other login's folder but those never made here, the
+/// store's readings and the logins it records signed out, with the default home's row active,
+/// the own login's series (and, where every
+/// reading is this Mac's, each other login's week as its series row), the plan rows (none of a
+/// login never made here), where the
 /// fixture runs the tap its statusLine payload's `rate_limits`, and where the scene has a pool
 /// file that file and this Mac's lab name in the store. Nothing outside `world` is written.
 /// # Errors
@@ -564,7 +636,10 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
         let dir = (label != plan.default_row()).then(|| world.home.join("logins").join(label));
         if let Some(dir) = &dir {
             std::fs::create_dir_all(dir).map_err(|e| io(label, e))?;
-            crate::util::write_fresh(&dir.join("a-login-file"), "{}").map_err(|e| io(label, e))?;
+            if !plan.not_made.contains(&label) {
+                crate::util::write_fresh(&dir.join("a-login-file"), "{}")
+                    .map_err(|e| io(label, e))?;
+            }
         }
         rows.push(accounts::Row {
             label: label.into(),
@@ -588,13 +663,12 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
     if let Some(text) = plan.pool_file(now) {
         // The pool file names Macs by their lab names; the store says which is this one.
         state.swarm_label = Some(THIS_MAC.into());
-        let secrets = world.home.join(".secrets");
-        crate::util::create_private_dir_all(&secrets).map_err(|e| io("pool file", e))?;
-        crate::util::write_fresh(
-            &secrets.join(aterm_agent::harness::ai_pool::AI_POOL_FILE),
-            text,
+        crate::util::publish_scratch_entry(
+            &world.home,
+            aterm_agent::harness::ai_pool::AI_POOL_FILE,
+            text.as_bytes(),
         )
-        .map_err(|e| io("pool file", e))?;
+        .map_err(|e| format!("outlook seed: {e}"))?;
     }
     let window = |seen: Option<(u32, i64, i64)>| {
         seen.map(|(pct_x10, reset, _)| WindowRead {
@@ -620,6 +694,9 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
             at,
             accounts::ReadingOwner::Unobserved,
         );
+    }
+    for label in plan.signed_out {
+        let _ = accounts::note_auth(&mut state, label, accounts::Auth::SignedOut, now - H);
     }
     store.save(&state).map_err(|e| io("store", e))?;
     for &(offset, pct_x10) in &plan.series {
@@ -670,10 +747,10 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
         }
     }
     // The plans, as earlier footers' gated profile reads wrote them (the own login's only where
-    // its profile was read); `pool1`'s was never seen. The instance's own read of the own login
-    // writes nothing new for the same tier.
+    // its profile was read, none of a login never made here); `pool1`'s was never seen. The
+    // instance's own read of the own login writes nothing new for the same tier.
     for &(label, tier, ago) in plan.plans {
-        let read = label != own || plan.profile.is_some();
+        let read = !plan.not_made.contains(&label) && (label != own || plan.profile.is_some());
         if read && plan.rows.iter().any(|(l, _)| *l == label) {
             let said = account_series::PlanSaid {
                 word: "max".into(),
@@ -709,17 +786,21 @@ struct Opts {
 
 const HELP: &str =
     "usage: targo --unverified lab outlook-captures --out DIR [--aterm ATERM] [--tag NAME]
-       [--scenes ABCDEFGHIJKLM] [--look day|night|both] [--scale 1|2|both]
+       [--scenes ABCDEFGHIJKLMNO] [--look day|night|both] [--scale 1|2|both]
 
 The accounts outlook on a private headless instance per scene, look and scale, seeded with
-synthetic identities only: the footer at 170, 100 and 70 columns, and the A, B, C, E, H, J, L
-and M scenes' Account card at 60 and 44 cells. Scenes I, J and K are the harness glass's line E
+synthetic identities only: the footer at 170, 100 and 70 columns, and the A, B, C, E, H, J, L,
+M, N and O scenes' Account card at 60 and 44 cells. Scenes I, J and K are the harness glass's line E
 (its cases (b), (c) and (d), under Cruise): the fixture runs the build's usage tap as its
 statusLine and prints its row under the bottom rule, which the glass takes over. J's card is the
 one whose tab aterm can switch: its Forecast row holds the projection. L and M are the card's
 own: a pool file gives each account its home Mac and a scratch vault served on loopback seats
 the instance's home; L's tab runs on a login outside the roster whose home is another Mac and
-which has no vault token, M's on a pool account at home here with a verified lab token. Writes
+which has no vault token, M's on a pool account at home here with a verified lab token. N is
+J's world with alt1 signed out though read, alt2 signed out while its sign-in runs (this
+process holds the record) and alt3 never signed in here. O shows those logins where N cannot:
+the tab's own account main signed out while its sign-in runs, alt1 signed out though read and
+alt2 never signed in here, three rows line E's wide rung names. Writes
 outlook-<tag>-<scene>-<width>-<look>-<scale>x.png, the card's rows beside each card png, and
 manifest-<tag>.tsv.
 ";
@@ -812,6 +893,9 @@ struct Lab {
     /// The scratch vault's server, where the scene has a vault: it runs while the instance
     /// does, which reads the vault through it.
     _vault: Option<aterm_secrets::server::Running>,
+    /// The running sign-in record this process holds for the instance to read, where the scene
+    /// names one ([`Plan::signing_in`]).
+    _signing_in: Option<Box<dyn std::any::Any>>,
 }
 
 /// How long a vault write may take: a hang detector, not a budget.
@@ -859,6 +943,7 @@ fn seat(world: &World, holds: Vault, now: i64) -> Result<aterm_secrets::server::
         expiry_from: ExpiryFrom::Printed,
         minted_on: here.clone(),
         cli: "2.1.318".into(),
+        minted_by: None,
         verified: None,
     };
     let wrote = |written: aterm_secrets::Result<MemberWritten>, what: &str| match written {
@@ -882,10 +967,11 @@ fn seat(world: &World, holds: Vault, now: i64) -> Result<aterm_secrets::server::
         claude_token::verify(
             &vault,
             &key,
+            meta.minted_at,
             Verified {
                 on: here,
                 at: at.saturating_sub(19 * 86_400),
-                by: "windows".into(),
+                by: claude_token::BY_WINDOWS.into(),
                 seven_day_resets_at: None,
                 five_hour_resets_at: None,
             },
@@ -903,6 +989,34 @@ fn seat(world: &World, holds: Vault, now: i64) -> Result<aterm_secrets::server::
 fn seat(_: &World, _: Vault, _: i64) -> Result<aterm_secrets::server::Running, Fail> {
     Err(Fail::die(
         "outlook-captures: scenes L and M need a debug lab image for the vault seam",
+    ))
+}
+
+/// Name `label`'s sign-in as running on `world`'s Mac from `now`, by this process, until what this
+/// returns drops ([`accounts::Store::signing_in_fixture`]): the record names this process, the
+/// sign-in lock's holder as the record has it, so it reads as running while this lab process
+/// lives, which it does while the instance does. No sign-in runs and no lock is taken.
+/// A debug lab image only: the record is written through a seam no release build has.
+/// # Errors
+/// The record could not be written.
+#[cfg(debug_assertions)]
+fn hold_sign_in(world: &World, label: &str, now: i64) -> Result<Box<dyn std::any::Any>, Fail> {
+    accounts::Store::at(&harness_state(world))
+        .signing_in_fixture(label, now)
+        .ok_or_else(|| {
+            Fail::die(format!(
+                "outlook-captures: the running sign-in record of {label} could not be written"
+            ))
+        })
+}
+
+/// A release lab image has no sign-in seam, so it shoots no scene with a running sign-in (N, O).
+/// # Errors
+/// Always: the scene needs a debug lab image.
+#[cfg(not(debug_assertions))]
+fn hold_sign_in(_: &World, _: &str, _: i64) -> Result<Box<dyn std::any::Any>, Fail> {
+    Err(Fail::die(
+        "outlook-captures: scenes N and O need a debug lab image for the sign-in seam",
     ))
 }
 
@@ -940,12 +1054,16 @@ fn launch(aterm: &Path, scene: char, look: Look, scale: u8, cols: u16) -> Result
     let config = with_harness_keys(&config, &[format!("autopilot = {:?}", plan.autopilot)]);
     let world = World::new(&config)?;
     let now = crate::util::now_secs();
-    // The vault first: it makes the home's `.secrets`, which the pool file then joins.
+    // The vault first: the pool is its entry.
     let vault = plan
         .vault
         .map(|holds| seat(&world, holds, now))
         .transpose()?;
     seed(&world, &plan, now).map_err(Fail::die)?;
+    let signing_in = plan
+        .signing_in
+        .map(|label| hold_sign_in(&world, label, now))
+        .transpose()?;
     let bin = world.dir.join("bin");
     std::fs::create_dir_all(&bin).map_err(|e| Fail::die(format!("bin: {e}")))?;
     let claude = bin.join("claude");
@@ -984,6 +1102,7 @@ fn launch(aterm: &Path, scene: char, look: Look, scale: u8, cols: u16) -> Result
         world,
         tapped: plan.tapped,
         _vault: vault,
+        _signing_in: signing_in,
     })
 }
 
@@ -1629,6 +1748,7 @@ fn resolver_cost(n: usize) -> Result<String, Fail> {
             enrolled: &enrolled,
             series: &series,
             renewals: &renewals,
+            lab: &std::collections::BTreeMap::new(),
             mode: accounts::Mode::Early,
             credits: false,
             now,

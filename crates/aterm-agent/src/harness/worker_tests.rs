@@ -100,8 +100,8 @@ fn proc_args(argv: &[&str], env: &[&str]) -> ProcArgs {
 /// NUL-separated, named as the CLI — gets the trust flag (Muse Code's, where
 /// the folder is the trusted one) and its default flags (Muse Code's
 /// contributor mode off at xhigh), `--model <m>`, then the task file's text
-/// with its trailing newlines trimmed: Claude Code's, codex-alab's, Muse
-/// Code's and Grok Build's after `--`, agy's as the attached value of
+/// with its trailing newlines trimmed: Claude Code's, codex-alab's and
+/// Muse Code's after `--`, agy's as the attached value of
 /// `--prompt-interactive=`.
 #[cfg(unix)]
 #[test]
@@ -124,7 +124,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
         shells.retain(|(_, sh)| Path::new(sh).exists());
     }
     let prompt_flag = format!("--prompt-interactive={trimmed}");
-    let cases: [(Program, Vec<&str>, &str); 5] = [
+    let cases: [(Program, Vec<&str>, &str); 4] = [
         (
             Program::Claude,
             vec!["--model", "m-1.5", "--", trimmed],
@@ -132,7 +132,14 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
         ),
         (
             Program::Codex,
-            vec!["--model", "m-1.5", "--", trimmed],
+            vec![
+                "--model",
+                "m-1.5",
+                "-c",
+                "model_reasoning_effort=\"ultra\"",
+                "--",
+                trimmed,
+            ],
             "CODEX_HOME",
         ),
         (
@@ -154,11 +161,6 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
                 trimmed,
             ],
             "XDG_DATA_HOME",
-        ),
-        (
-            Program::Grok,
-            vec!["--model", "m-1.5", "--", trimmed],
-            "GROK_HOME",
         ),
     ];
     for (agent, want, home_var) in cases {
@@ -186,6 +188,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
         let fresh = Fresh {
             config: None,
             model: Some("m-1.5"),
+            reasoning_effort: (agent == Program::Codex).then_some("ultra"),
             trusted_here: true,
             permission_mode: None,
             chrome: false,
@@ -254,13 +257,7 @@ fn every_workers_first_line_hands_the_task_over_as_one_argument() {
             Program::Agy => super::super::upgrade_agy::rewrite_argv(&process(&["agy"]), None),
             Program::Muse => super::super::upgrade_muse::rewrite_argv(&process(&["muse"]), None),
             Program::Codex => super::super::codex_alab::rewrite_argv(&process(&["codex"]), None),
-            // aterm has no Grok Build relaunch lane (grok-alab carries its relaunches): a Grok
-            // worker's own argv, read as the starter of the next Grok worker, lends it only the
-            // floor, neither its task nor its model.
-            Program::Grok => super::grok::worker_flags(&process(&["grok"]))
-                .map_err(super::super::upgrade::ArgvRefusal::UnknownFlag)
-                .inspect(|kept| assert_eq!(kept, &floor_of(Program::Grok), "{kept:?}")),
-            Program::Kimi | Program::Generic => unreachable!(),
+            Program::Grok | Program::Kimi | Program::Generic => unreachable!(),
         }
         .unwrap_or_else(|e| panic!("{agent:?}: the lane refused the worker's argv: {e:?}"));
         assert!(
@@ -284,6 +281,7 @@ fn model_and_the_trust_are_each_clis_own() {
         let fresh = |model, trusted_here| Fresh {
             config: None,
             model,
+            reasoning_effort: None,
             trusted_here,
             permission_mode: None,
             chrome: false,
@@ -699,7 +697,7 @@ fn a_starters_homes_are_its_lanes_and_absolute() {
 fn a_starters_program_rides_only_where_it_runs_the_same_cli() {
     let user = Path::new("/Users//u");
     let args = |argv: &[&str]| proc_args(argv, &[]);
-    for agent in [Program::Agy, Program::Muse, Program::Grok] {
+    for agent in [Program::Agy, Program::Muse] {
         let cli = row(agent);
         let word = cli.word;
         let own = PathBuf::from(format!("/usr/local/bin/{word}"));
@@ -1538,9 +1536,8 @@ fn floor_of(agent: Program) -> Vec<String> {
         Program::Codex => strings(&CODEX_WORKER_FLOOR),
         Program::Agy => strings(&super::super::upgrade_agy::WORKER_FLOOR),
         Program::Muse => strings(&super::super::upgrade_muse::WORKER_FLOOR),
-        Program::Grok => strings(&super::grok::WORKER_FLOOR),
         Program::Claude => claude_mode_flags(CLAUDE_WORKER_FLOOR),
-        Program::Kimi | Program::Generic => unreachable!("no worker row"),
+        Program::Grok | Program::Kimi | Program::Generic => unreachable!("no worker row"),
     }
 }
 
@@ -1579,8 +1576,8 @@ fn the_twin_adds_nothing(agent: Program, flags: &[String]) {
 
 /// A STARTER BELOW ITS CLI'S FLOOR, OR NAMING NO POSTURE, LENDS ITS WORKER THE FLOOR IN PLACE OF
 /// ITS OWN, and a CLI's own refusals beside the floor never reach the line: codex-alab's
-/// `--approve-for-me` stands beside no `-a`, `-s` or posture `-c`, and Muse Code's and Grok
-/// Build's floor mode flag appears once. What a starter lends beside its posture stays, its
+/// `--approve-for-me` stands beside no `-a`, `-s` or posture `-c`, and Muse Code's floor mode
+/// flag appears once. What a starter lends beside its posture stays, its
 /// sandbox's settings among them; a flag that turns its sandbox off does not. CONTROL: each
 /// starter's own argv holds no floor, so the floor is the rule's, and the floor's line, which
 /// the twin runs as typed, gets no yolo from it.
@@ -1703,22 +1700,6 @@ fn a_starter_below_its_clis_floor_lends_the_floor() {
                 "restricted",
             ],
             &["--sandbox-network", "restricted"],
-        ),
-        (Program::Grok, &["grok"], &[]),
-        (
-            Program::Grok,
-            &["grok", "--permission-mode", "default"],
-            &[],
-        ),
-        (
-            Program::Grok,
-            &["grok", "--permission-mode=plan", "--sandbox", "strict"],
-            &["--sandbox", "strict"],
-        ),
-        (
-            Program::Grok,
-            &["grok", "--permission-mode", "acceptEdits"],
-            &[],
         ),
     ];
     for (agent, argv, stays) in cases {
@@ -1872,28 +1853,6 @@ fn a_starter_at_or_above_its_clis_floor_lends_its_own() {
             &["muse", "--approval-judge", "off"],
         ),
         (Program::Muse, &["muse", "--yolo"], &["muse"]),
-        (
-            Program::Grok,
-            &["grok", "--permission-mode", "auto"],
-            &["grok", "--permission-mode", "acceptEdits"],
-        ),
-        (
-            Program::Grok,
-            &["grok", "--permission-mode=dontAsk", "--sandbox", "strict"],
-            &["grok", "--permission-mode=default", "--sandbox", "strict"],
-        ),
-        (
-            Program::Grok,
-            &["grok", "--permission-mode", "bypassPermissions"],
-            &["grok", "--permission-mode", "plan"],
-        ),
-        (Program::Grok, &["grok", "--always-approve"], &["grok"]),
-        (Program::Grok, &["grok", "--yolo"], &["grok"]),
-        (
-            Program::Grok,
-            &["grok", "--dangerously-skip-permissions"],
-            &["grok"],
-        ),
     ];
     for (agent, argv, below) in cases {
         let got = lent(*agent, argv);
@@ -1923,10 +1882,10 @@ fn a_starter_at_or_above_its_clis_floor_lends_its_own() {
 /// words a shell hands it, which hold the floor once, and the twin's own reading of those words
 /// ([`atpkg::yolo::decide`]) adds no yolo beside them, so the floor holds whichever program the
 /// line runs. CONTROL: the line of a starter that lends nothing names no posture, and is one the
-/// twin raises to its yolo, past the floor (codex-alab's bypass, Grok Build's always-approve), or
-/// runs as typed in the CLI's own default, which asks (agy's and Muse Code's lines hold words the
-/// twin does not know); a starter above the floor types its own posture and no floor; and the
-/// two unstarted lines that name none, Claude Code's and a bare `codex`'s, name none.
+/// twin raises to its yolo, past the floor (codex-alab's bypass), or runs as typed in the CLI's
+/// own default, which asks (agy's and Muse Code's lines hold words the twin does not know); a
+/// starter above the floor types its own posture and no floor; and the two unstarted lines that
+/// name none, Claude Code's and a bare `codex`'s, name none.
 #[cfg(unix)]
 #[test]
 fn a_workers_typed_line_holds_its_floor_and_the_twin_runs_it_as_typed() {
@@ -1997,7 +1956,7 @@ fn a_workers_typed_line_holds_its_floor_and_the_twin_runs_it_as_typed() {
     };
     // Each CLI, a starter below its floor and one above it, and whether the twin raises a line
     // naming no posture to its yolo.
-    let cases: [(Program, &[&str], &[&str], bool); 4] = [
+    let cases: [(Program, &[&str], &[&str], bool); 3] = [
         (
             Program::Codex,
             &["codex", "-a", "on-request"],
@@ -2015,12 +1974,6 @@ fn a_workers_typed_line_holds_its_floor_and_the_twin_runs_it_as_typed() {
             &["muse", "--approval-mode", "on-request"],
             &["muse", "--disable-approval"],
             false,
-        ),
-        (
-            Program::Grok,
-            &["grok", "--permission-mode", "default"],
-            &["grok", "--permission-mode", "dontAsk"],
-            true,
         ),
     ];
     for (agent, below, above, raised) in cases {
@@ -2389,4 +2342,413 @@ fn a_process_that_has_ended_is_no_failed_read() {
             "launchd lives and is another user's"
         );
     }
+}
+
+#[test]
+fn requested_reasoning_effort_is_codex_only_and_cannot_be_a_flag() {
+    for cli in &WORKERS {
+        for effort in ["ultra", "high", "", "bogus", "ultra\n--yolo", "--yolo"] {
+            let fresh = Fresh {
+                reasoning_effort: Some(effort),
+                ..Fresh::default()
+            };
+            let result = line(cli, Dialect::Zsh, &cli.plain(), &fresh);
+            if cli.agent == Program::Codex && aterm_types::agent_settings::valid_effort(effort) {
+                let typed = result.expect("a native Codex effort");
+                assert!(
+                    typed.contains(&format!(" '-c' 'model_reasoning_effort=\"{effort}\"'")),
+                    "{typed}"
+                );
+            } else {
+                assert!(result.is_err(), "{:?} accepted {effort:?}", cli.agent);
+            }
+        }
+    }
+}
+
+/// NO WORKER IS STARTED WHOSE END NOTHING WOULD SEE: a row's worker end is seen where its agent's
+/// reader reads its turn end (`Program::supervisable`) or it launches codex-alab, which carries
+/// itself though aterm's policy acts on no Codex screen. [`WORKERS`] is built through
+/// `every_end_seen`, so it holds no other row; the rows nothing sees are built here from a held
+/// one: Grok Build's agent on agy's image launch, and Codex's agent on that launch in place of its
+/// ALab claim. CONTROL: every row of [`WORKERS`], codex-alab's among them, is seen.
+#[test]
+fn only_a_supervised_or_self_carried_worker_is_seen() {
+    for cli in &WORKERS {
+        assert!(cli.end_seen(), "{:?}", cli.agent);
+    }
+    let codex = worker_cli(Program::Codex).expect("codex-alab's row");
+    assert!(
+        !Program::Codex.supervisable() && matches!(codex.launches, Launches::Alab),
+        "PRECONDITION: codex-alab is seen by its own claim, not by aterm's policy"
+    );
+    for agent in [Program::Grok, Program::Codex] {
+        assert!(
+            !agent.supervisable(),
+            "PRECONDITION: {agent:?} is read, not supervised"
+        );
+        assert!(!unseen_row(agent).end_seen(), "{agent:?}");
+    }
+}
+
+/// A TABLE WITH A ROW WHOSE END NOTHING SEES IS REFUSED: [`WORKERS`]' initializer runs
+/// `every_end_seen` at compile time, so its panic here is a build that fails there. CONTROL: a
+/// table of held rows passes it as it is.
+#[test]
+fn a_table_with_a_row_whose_end_nothing_sees_does_not_build() {
+    let agy = worker_cli(Program::Agy).expect("agy's row");
+    let held = [WorkerCli { ..*agy }, WorkerCli { ..*agy }];
+    let built = std::panic::catch_unwind(move || every_end_seen(held));
+    assert!(
+        built.is_ok_and(|rows| rows.iter().all(|row| row.agent == Program::Agy)),
+        "CONTROL: a table of held rows builds"
+    );
+    let unseen = [WorkerCli { ..*agy }, unseen_row(Program::Grok)];
+    let built = std::panic::catch_unwind(move || every_end_seen(unseen));
+    assert!(
+        built.is_err(),
+        "a table holding a Grok Build row whose end nothing sees built"
+    );
+}
+
+/// A row nothing sees end: `agent` on agy's image launch, which claims nothing of its own.
+fn unseen_row(agent: Program) -> WorkerCli {
+    let agy = worker_cli(Program::Agy).expect("agy's row");
+    assert!(
+        matches!(agy.launches, Launches::Image { .. }),
+        "PRECONDITION: the base row claims nothing of its own"
+    );
+    WorkerCli { agent, ..*agy }
+}
+
+/// What a fake atpkg store was asked, in order, and what it does: it holds a build once `lays`
+/// ran an install, and `fails` is the words of an install that failed.
+struct FakeStore {
+    asked: std::cell::RefCell<Vec<String>>,
+    present: std::cell::RefCell<bool>,
+    held: Option<&'static str>,
+    lays: bool,
+    fails: Option<&'static str>,
+}
+
+impl FakeStore {
+    fn new(
+        present: bool,
+        held: Option<&'static str>,
+        lays: bool,
+        fails: Option<&'static str>,
+    ) -> Self {
+        Self {
+            asked: std::cell::RefCell::new(Vec::new()),
+            present: std::cell::RefCell::new(present),
+            held,
+            lays,
+            fails,
+        }
+    }
+
+    fn present(&self, program: &str) -> bool {
+        self.asked.borrow_mut().push(format!("present {program}"));
+        *self.present.borrow()
+    }
+
+    fn held(&self, program: &str) -> Option<String> {
+        self.asked.borrow_mut().push(format!("held {program}"));
+        self.held.map(str::to_string)
+    }
+
+    fn install(&self, program: &str) -> Result<(), String> {
+        self.asked.borrow_mut().push(format!("install {program}"));
+        if let Some(why) = self.fails {
+            return Err(why.to_string());
+        }
+        if self.lays {
+            *self.present.borrow_mut() = true;
+        }
+        Ok(())
+    }
+
+    fn ensure(&self, cli: &WorkerCli) -> Result<Readiness, String> {
+        ensure_program(
+            cli,
+            |p| self.present(p),
+            |p| self.held(p),
+            |p| self.install(p),
+        )
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.borrow().clone()
+    }
+}
+
+/// A SPAWN INSTALLS ITS PROGRAM WHERE ATPKG'S STORE HOLDS NONE AND NOBODY KEEPS IT OFF, FOR EVERY
+/// ROW ATPKG SHIPS: every one is in atpkg's default set, but a spawn can come before its update
+/// pass lands it (a fresh Mac) or after its install failed, and the line must not type a program
+/// that is not there. Absent, atpkg's install runs once by name and the worker goes on once the
+/// build is there. CONTROLS: present, nothing installs; a person's hold (`[packages] exclude`, a
+/// removal) installs nothing and is said, carrying the hold's words, and the line runs any copy
+/// of the shell's own; a failed install, or one that leaves nothing, starts no worker and
+/// carries atpkg's words.
+#[test]
+fn a_spawn_installs_an_absent_program_unless_a_person_keeps_it_off() {
+    for cli in &WORKERS {
+        let Some(program) = cli.atpkg_program() else {
+            let untouched = FakeStore::new(false, None, true, None);
+            assert_eq!(untouched.ensure(cli), Ok(Readiness::Unshipped));
+            assert!(untouched.asked().is_empty(), "{:?}", cli.agent);
+            continue;
+        };
+        let absent = FakeStore::new(false, None, true, None);
+        assert_eq!(
+            absent.ensure(cli),
+            Ok(Readiness::Installed),
+            "{:?}",
+            cli.agent
+        );
+        assert_eq!(
+            absent.asked(),
+            [
+                format!("present {program}"),
+                format!("held {program}"),
+                format!("install {program}"),
+                format!("present {program}"),
+            ],
+            "{:?}: installed once, by name",
+            cli.agent
+        );
+
+        let there = FakeStore::new(true, Some("never asked"), true, None);
+        assert_eq!(there.ensure(cli), Ok(Readiness::Present), "{:?}", cli.agent);
+        assert_eq!(
+            there.asked(),
+            [format!("present {program}")],
+            "CONTROL: present"
+        );
+
+        for hold in [
+            "`[packages] exclude` in aterm.toml names it",
+            "a person removed it (`aterm pkg install x` brings it back)",
+        ] {
+            let held = FakeStore::new(false, Some(hold), true, None);
+            let readiness = held.ensure(cli).expect("a hold is no refusal");
+            let Readiness::KeptOff { why, said } = &readiness else {
+                panic!("{:?}: {readiness:?}", cli.agent);
+            };
+            assert_eq!(why, hold, "a stall quotes the hold's words alone");
+            assert!(said.contains(hold), "the hold's words are carried: {said}");
+            assert_eq!(
+                held.asked(),
+                [format!("present {program}"), format!("held {program}")],
+                "CONTROL: {:?} kept off installs nothing",
+                cli.agent
+            );
+        }
+
+        let failing = FakeStore::new(false, None, true, Some("vendor head unreachable"));
+        let err = failing.ensure(cli).expect_err("a failed install");
+        assert!(err.contains("vendor head unreachable"), "{err}");
+
+        let empty = FakeStore::new(false, None, false, None);
+        assert!(empty.ensure(cli).is_err(), "{:?}: nothing laid", cli.agent);
+        assert_eq!(empty.asked().len(), 4, "{:?}", cli.agent);
+    }
+    assert_eq!(
+        row(Program::Claude).atpkg_program(),
+        Some("claude"),
+        "PRECONDITION: atpkg ships claude"
+    );
+}
+
+/// ADMISSION INSTALLS AN ABSENT PROGRAM ONCE AND CARRIES THE STARTER AS IT IS: an absent `claude`
+/// is installed once and the starter is admitted as installed; a held one is admitted kept off,
+/// installing nothing; a present one is admitted as present; a failed install is refused as
+/// [`Refused::Program`].
+#[test]
+fn admission_installs_an_absent_program_once() {
+    let claude = row(Program::Claude);
+    let admit_on = |store: &FakeStore| {
+        admit(
+            claude,
+            claude.plain(),
+            |p| store.present(p),
+            |p| store.held(p),
+            |p| store.install(p),
+        )
+    };
+
+    let absent = FakeStore::new(false, None, true, None);
+    let admitted = admit_on(&absent).expect("absent: admitted");
+    assert_eq!(admitted.readiness(), &Readiness::Installed);
+    assert_eq!(admitted.kept_off(), None);
+    assert_eq!(admitted.starter(), &claude.plain());
+    assert_eq!(
+        absent.asked(),
+        [
+            "present claude",
+            "held claude",
+            "install claude",
+            "present claude"
+        ],
+        "installed once"
+    );
+
+    let held = FakeStore::new(
+        false,
+        Some("`[packages] exclude` in aterm.toml names it"),
+        true,
+        None,
+    );
+    let admitted = admit_on(&held).expect("held: admitted");
+    assert!(
+        admitted
+            .kept_off()
+            .is_some_and(|said| said.contains("`[packages] exclude` in aterm.toml names it")),
+        "{admitted:?}"
+    );
+    assert_eq!(
+        held.asked(),
+        ["present claude", "held claude"],
+        "nothing installed"
+    );
+
+    let there = FakeStore::new(true, None, true, None);
+    let present = admit_on(&there).expect("present");
+    assert_eq!(present.readiness(), &Readiness::Present);
+    assert_eq!(there.asked(), ["present claude"], "CONTROL: present");
+
+    let failing = FakeStore::new(false, None, true, Some("vendor unreachable: anthropic"));
+    let refused = admit_on(&failing).expect_err("a failed install");
+    assert!(
+        matches!(&refused, Refused::Program(why) if why.contains("vendor unreachable: anthropic")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.short(),
+        "install failed: vendor unreachable: anthropic"
+    );
+}
+
+/// A REFUSAL'S SHORT FORM LEADS WITH ITS CAUSE, so a stall's attention can hold it. Of a failed
+/// install it is the last line atpkg said of the failure (its lines come joined by ` | `,
+/// `PassRun::why`), not the lock wait it may have started with. A sign-out is a person's to mend,
+/// and a preparation's words stand as they are. An install that left nothing leads with why.
+/// CONTROL: the whole words stay in [`Refused::why`] for the launch's note and log.
+#[test]
+fn a_refusals_short_form_leads_with_its_cause() {
+    let waited =
+        "atpkg: another atpkg process holds the store lock | atpkg: no space left on device";
+    let cli = row(Program::Claude);
+    let failed = ensure_program(cli, |_| false, |_| None, |_| Err(waited.to_owned()))
+        .map(|_| ())
+        .map_err(Refused::Program)
+        .expect_err("a failed install");
+    assert_eq!(
+        failed.short(),
+        "install failed: atpkg: no space left on device"
+    );
+    assert!(failed.why().contains("holds the store lock"), "{failed:?}");
+
+    let empty = ensure_program(cli, |_| false, |_| None, |_| Ok(()))
+        .map(|_| ())
+        .map_err(Refused::Program)
+        .expect_err("nothing laid");
+    assert!(
+        empty
+            .short()
+            .starts_with("no build of claude serves this machine, or its install was refused; "),
+        "{empty:?}"
+    );
+
+    let signed_out = Refused::SignedOut("no sign-in at /home/auth.json".to_owned());
+    assert_eq!(signed_out.short(), "signed out, a person must sign in");
+    assert_eq!(signed_out.why(), "no sign-in at /home/auth.json");
+
+    let why = "Native Google pool location is unavailable";
+    assert_eq!(Refused::from(why), Refused::Preparation(why.to_owned()));
+    assert_eq!(Refused::from(why).short(), why);
+}
+
+/// A FAILED INSTALL'S SHORT FORM SAYS WHAT COULD NOT BE REACHED, not what follows it. These are
+/// atpkg's real stderr lines (`crates/atpkg/src/cli.rs`, its install's two failure arms and
+/// `print_unreachable_followup`, with the vendor's words from `vendor_direct/lane.rs`), joined as
+/// `PassRun::why` joins them. A stall keeps the first clause of the vendor's and the whole of the
+/// index's. NEGATIVE CONTROL: before, the short form was the re-run line, or the GitHub limit's,
+/// with the cause gone. A refusal can hold ` | ` of its own (`vendor.rs`'s payload row), which is
+/// no line of atpkg's. NEGATIVE CONTROL: a split at every ` | ` left `install failed: dmg, got
+/// tar-xz`. CONTROL: the whole words keep every line for the launch's note and log.
+#[test]
+fn a_failed_installs_short_form_skips_atpkgs_follow_up() {
+    let rerun = "atpkg:   when the connection is back, re-run: aterm pkg install claude";
+    let limit = "atpkg:   the anonymous GitHub limit resets within the hour";
+    let cli = row(Program::Claude);
+    let refused = |said: String| {
+        ensure_program(cli, |_| false, |_| None, |_| Err(said.clone()))
+            .map(|_| ())
+            .map_err(Refused::Program)
+            .expect_err("a failed install")
+    };
+
+    let vendor = refused(format!(
+        "atpkg: claude — Anthropic's release channel is unreachable; nothing is installed yet \
+         | {rerun}"
+    ));
+    assert_eq!(
+        vendor.short(),
+        "install failed: atpkg: claude — Anthropic's release channel is unreachable; nothing is \
+         installed yet"
+    );
+    let short = vendor.short();
+    let (cause, _) = short.split_once("; ").expect("two clauses");
+    assert!(
+        cause.len() <= REFUSAL_ROOM,
+        "{} bytes: {cause}",
+        cause.len()
+    );
+    assert!(vendor.why().contains(rerun), "CONTROL: {vendor:?}");
+
+    let payload = "artifact row refused: payload must be raw-binary | tar-gz-binary | tar-gz | \
+                   tar-zst | zip | dmg, got tar-xz";
+    for said in [
+        format!("atpkg: install claude failed: {payload}"),
+        format!("atpkg: install claude failed: {payload} | {rerun}"),
+        format!("atpkg: fetching the index | atpkg: install claude failed: {payload} | {rerun}"),
+    ] {
+        assert_eq!(
+            refused(said.clone()).short(),
+            format!("install failed: {payload}"),
+            "{said}"
+        );
+    }
+    let unled =
+        refused("atpkg: install claude failed: disk full | a line of another program's".to_owned());
+    assert_eq!(
+        unled.short(),
+        "install failed: disk full | a line of another program's",
+        "a line with no lead of atpkg's stays with the one before it"
+    );
+    assert_eq!(
+        refused(format!("{rerun} | {limit}")).short(),
+        format!("install failed: {rerun} | {limit}"),
+        "CONTROL: follow-ups alone are all it said"
+    );
+
+    let index = refused(format!(
+        "atpkg: install claude failed: could not reach the toolchain index: HTTP 403: rate limit \
+         exceeded | {rerun} | {limit}"
+    ));
+    let short = index.short();
+    assert_eq!(
+        short,
+        "install failed: could not reach the toolchain index: HTTP 403: rate limit exceeded"
+    );
+    assert!(
+        short.len() <= REFUSAL_ROOM,
+        "{} bytes: {short}",
+        short.len()
+    );
+    assert!(
+        index.why().contains(rerun) && index.why().contains(limit),
+        "CONTROL: {index:?}"
+    );
 }

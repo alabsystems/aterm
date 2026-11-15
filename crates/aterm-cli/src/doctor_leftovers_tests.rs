@@ -15,6 +15,36 @@ fn body(entry: bool, links: usize, more: u64) -> String {
 }
 
 #[test]
+fn missing_or_malformed_view_totals_do_not_prove_absence() {
+    use aterm_json::Value;
+    let empty = r#"{"schema":1,"kind":"sys.left","left":{"complete":true,"bounded":false},"procs":[],"more":0,"runs":[],"links":[]}"#;
+    for (field, value) in [
+        ("more", None),
+        ("more", Some("null")),
+        ("more", Some("\"0\"")),
+        ("more", Some("-1")),
+        ("more", Some("0.5")),
+        ("links", None),
+        ("links", Some("null")),
+        ("links", Some("{}")),
+        ("links", Some("\"none\"")),
+    ] {
+        let mut doc: Value = aterm_json::from_str(empty).unwrap();
+        let fields = doc.as_object_mut().unwrap();
+        if let Some(value) = value {
+            fields.insert(field.into(), aterm_json::from_str(value).unwrap());
+        } else {
+            fields.remove(field);
+        }
+        let fact = fact_of(Asked::View(aterm_json::to_string(&doc).unwrap()), || {
+            panic!("an answering instance cannot fall back to the process table")
+        });
+        assert!(fact.is_err(), "{field}={value:?}: {fact:?}");
+        assert_eq!(row(&fact).0, Mark::Note);
+    }
+}
+
+#[test]
 fn missing_or_non_string_process_classifications_are_not_a_clean_reading() {
     for rows in [
         "null",

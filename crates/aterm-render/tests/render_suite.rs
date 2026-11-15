@@ -18,6 +18,7 @@ mod bar_caret_read;
 mod bg_base_elision;
 mod bg_fill_count;
 mod burst_companion_reads;
+mod caret_keyline;
 mod combining_stack;
 mod companion_knock_out;
 mod companion_off_letters;

@@ -678,6 +678,7 @@ fn own_target() -> String {
 #[cfg(unix)]
 fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
     SessionRecord {
+        pinned: false,
         local_id,
         sid: sid.to_string(),
         parent: None,
@@ -814,6 +815,7 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
             .iter()
             .map(|id| RestoredTab {
                 root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                    pinned: false,
                     sid: None,
                     lineage: None,
                     log_ep: None,
@@ -4066,6 +4068,7 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
     let unread_leaf = |id: u64| {
         Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
             TerminalLeafRestore {
+                pinned: false,
                 sid: None,
                 lineage: None,
                 log_ep: None,
@@ -5555,4 +5558,112 @@ fn a_stalled_launchs_exit_is_structural_to_a_parent_that_reads_no_progress() {
     ] {
         assert_ne!(EXIT_SUCCESSOR_LAUNCH_STALLED, other);
     }
+}
+
+/// A seamless update adopts each tab under the ID its record carries, in either form: a tab an
+/// earlier build opened keeps its `s-` ID, a `t` tab keeps its `t` ID, and a looser `s-` ID the
+/// keeper path admits (upper-case hex) is kept as written, never renamed, because its shell, its
+/// carried Autopilot end, its status row and its rekey path are all keyed by it. Each is found by
+/// its ID, and a control request naming `@<id>` (what `aterm ctl` expands `@self` to from the
+/// shell's `ATERM_PARENT_SESSION_ID`) reaches the `s-` and the `t` tab. Negative controls: a
+/// malformed ID of each form is no selector at all, so it names nothing.
+#[test]
+#[cfg(unix)]
+fn an_adopted_earlier_tab_keeps_its_s_id_and_its_selector() {
+    const EARLIER: &str = "s-1a2b3c4d5e6f70819203";
+    const LATER: &str = "tqn5r6e0148";
+    const LOOSE: &str = "s-1A2B3C4D5E6F70819203";
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    let staged = stage_outgoing_handoff("earlier-sid", 3, None);
+    let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
+    let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
+    let mut published = SessionHandoff::from_toml(toml).expect("parse the manifest");
+    for (rec, sid) in published.sessions.iter_mut().zip([EARLIER, LATER, LOOSE]) {
+        rec.sid = sid.to_string();
+    }
+    std::fs::write(
+        &staged.manifest_path,
+        format!("{file_nonce}\n{}", published.to_toml().expect("toml")),
+    )
+    .expect("republish");
+
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    assert!(
+        incoming.refusal.is_none(),
+        "a record in either form is no reason to refuse"
+    );
+    let (_, adopted) = child_proof_from(incoming).expect("the child adopts and proves");
+    assert_eq!(adopted.len(), 3, "every session adopts");
+    for (local_id, sid) in [(0, EARLIER), (1, LATER), (2, LOOSE)] {
+        let a = adopted
+            .iter()
+            .find(|a| a.local_id == local_id)
+            .expect("the session");
+        assert_eq!(a.sid.as_str(), sid, "session {local_id} keeps its ID");
+    }
+
+    let store = crate::session_store::new_store();
+    let at = aterm_slog::Stamp::new(1_792_000_000_000, 1_000);
+    let epochs = std::sync::Arc::new(crate::session_log::Epochs::new());
+    for a in &adopted {
+        store
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register(crate::session_store::test_handle_identified(
+                a.local_id,
+                a.sid.clone(),
+                a.nonce,
+                std::sync::Arc::clone(&epochs),
+                at,
+            ));
+    }
+    for (local_id, sid) in [(0, EARLIER), (1, LATER), (2, LOOSE)] {
+        assert_eq!(
+            store
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .by_sid(&SessionId::new(sid))
+                .map(|h| h.local_id),
+            Some(local_id),
+            "{sid}"
+        );
+    }
+    let found = |line: &str| {
+        let selector = aterm_types::control_request::head(line).selector?;
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_selector(&selector)
+            .map(|h| (h.local_id, h.ctx.self_id.as_str().to_string()))
+    };
+    assert_eq!(
+        found(&format!("@{EARLIER} status")),
+        Some((0, EARLIER.to_string())),
+        "@self from the earlier shell's env reaches its tab"
+    );
+    assert_eq!(
+        found(&format!("@{LATER} status")),
+        Some((1, LATER.to_string())),
+        "@self from a t tab's env reaches its tab"
+    );
+    for malformed in ["Tqn5r6e0148", "tqn5r6e014i", "s-1a2b3c4d5e6f7081920g"] {
+        let line = format!("@{malformed} status");
+        assert_eq!(
+            aterm_types::control_request::head(&line).selector,
+            Some(aterm_types::control_request::Selector::Invalid(malformed)),
+            "{malformed} is no tab ID"
+        );
+        assert_eq!(found(&line), None, "{malformed}");
+    }
+    drop(adopted);
+    for fd in [ready_read, ready_write, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
 }

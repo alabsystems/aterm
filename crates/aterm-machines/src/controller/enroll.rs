@@ -10,6 +10,7 @@ use crate::envelope::{self, Action, Disrupt, Envelope};
 use crate::model::{HostReport, Outcome, Read};
 use crate::port::{Cmd, Ran, Scratch, Secret, System, shell_word};
 use crate::protocol::{Hello, Line};
+use aterm_secrets::need::{Purpose, Want};
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -56,7 +57,6 @@ pub struct Args {
     pub found: bool,
     pub user: String,
     pub user_given: bool,
-    pub user_recorded: bool,
     pub name: Option<String>,
     pub trust: Trust,
     pub parallel: Option<usize>,
@@ -171,7 +171,6 @@ pub fn parse_args(sys: &dyn System, args: &[String]) -> Result<Args, String> {
         found,
         user,
         user_given,
-        user_recorded: false,
         name,
         trust,
         parallel,
@@ -202,7 +201,6 @@ pub fn with_recorded_admin(mut args: Args, inv: &Inventory) -> Args {
         && let Some(admin) = recorded_admin(inv)
     {
         args.user = admin;
-        args.user_recorded = true;
     }
     args
 }
@@ -408,7 +406,6 @@ pub fn host_key_through(
         .run(&remote_sh(
             master,
             "/bin/cat /etc/ssh/ssh_host_ed25519_key.pub",
-            false,
         ))
         .map_err(|e| format!("reading the host key: {e}"))?;
     let mut words = ran
@@ -593,12 +590,9 @@ fn through(master: &Master) -> Vec<OsString> {
 
 /// Run `script` on the remote host via `/bin/sh` over `master`.
 #[must_use]
-pub fn remote_sh(master: &Master, script: &str, tty: bool) -> Cmd {
-    let mut cmd = Cmd::new(SSH);
-    if tty {
-        cmd = cmd.arg("-t");
-    }
-    cmd.args(through(master))
+pub fn remote_sh(master: &Master, script: &str) -> Cmd {
+    Cmd::new(SSH)
+        .args(through(master))
         .arg("--")
         .arg(&master.destination)
         .arg(format!("/bin/sh -c {}", shell_word(script)))
@@ -715,7 +709,7 @@ pub fn parse_facts(out: &str) -> Result<Facts, String> {
 /// Read remote [`Facts`] over `master`.
 pub fn read_facts(sys: &dyn System, master: &Master) -> Result<Facts, String> {
     let ran = sys
-        .run(&remote_sh(master, FACTS_SCRIPT, false).budget(Duration::from_secs(60)))
+        .run(&remote_sh(master, FACTS_SCRIPT).budget(Duration::from_secs(60)))
         .map_err(|e| format!("reading the host's facts: {e}"))?;
     if !ran.success() {
         return Err(format!("reading the host's facts: {}", ran.describe()));
@@ -1017,22 +1011,12 @@ pub fn root_script(i: &Install<'_>) -> String {
     s
 }
 
-/// How the install command line's one `sudo` gets the admin's password.
-#[derive(Debug, Clone, Copy)]
-pub enum Sudo<'p> {
-    Terminal,
-    Password(&'p Secret),
-}
-
-/// Generate the admin `/bin/sh` command line that runs [`root_script`] under `sudo` and cleans up.
+/// Generate the admin `/bin/sh` command line that runs [`root_script`] under `sudo`, which reads
+/// the admin's password from standard input, and cleans up.
 #[must_use]
-pub fn install_command(i: &Install<'_>, sudo: Sudo<'_>) -> String {
-    let sudo = match sudo {
-        Sudo::Terminal => "/usr/bin/sudo --",
-        Sudo::Password(_) => "/usr/bin/sudo -S -p '' --",
-    };
+pub fn install_command(i: &Install<'_>) -> String {
     format!(
-        "{sudo} /bin/sh -c {}\nstatus=$?\n/bin/rm -f {} {}\nexit $status\n",
+        "/usr/bin/sudo -S -p '' -- /bin/sh -c {}\nstatus=$?\n/bin/rm -f {} {}\nexit $status\n",
         shell_word(&root_script(i)),
         shell_word(&i.remote_archive),
         shell_word(&i.remote_signers)
@@ -1046,9 +1030,17 @@ pub fn own_exe() -> Result<PathBuf, String> {
         .map_err(|e| format!("this aterm cannot name its executable: {e}"))
 }
 
+/// The vault's `machines-admin` password, through [`super::credential::resolve`].
+///
+/// # Errors
+/// One line naming the want and the request filed for it with the lab's Macs.
+pub fn admin_password(sys: &dyn System) -> Result<Secret, String> {
+    super::credential::resolve(sys, &Want::MachinesAdmin, Purpose::MachinesEnroll, false)
+}
+
 /// Runs `aterm machines enroll`.
 #[must_use = "handle or propagate the command's exit status"]
-pub fn main(sys: &dyn System, paths: &Paths, args: &[String], tty: bool) -> ExitCode {
+pub fn main(sys: &dyn System, paths: &Paths, args: &[String]) -> ExitCode {
     let args = match parse_args(sys, args) {
         Ok(a) => a,
         Err(why) => {
@@ -1056,13 +1048,6 @@ pub fn main(sys: &dyn System, paths: &Paths, args: &[String], tty: bool) -> Exit
             return ExitCode::from(2);
         }
     };
-    if !tty {
-        eprintln!(
-            "aterm machines enroll: not run: you type the admin's password, once, and standard \
-             input or error is not a terminal"
-        );
-        return ExitCode::from(2);
-    }
     let exe = match own_exe() {
         Ok(e) => e,
         Err(why) => {
@@ -1301,11 +1286,12 @@ pub fn labels(macs: &[Request]) -> Vec<String> {
 enum Done {
     Enrolled(Host),
     Already(String),
-    Refused(String),
     Skipped(String),
 }
 
-/// Enroll `macs` in parallel after scanning host keys and prompting for the admin password.
+/// Enroll `macs` in parallel after scanning host keys, signing in with the vault's
+/// `machines-admin` password ([`super::credential`]): where this Mac holds none, the want is
+/// filed with the lab and the run stops naming it. A Mac that refuses the password is skipped.
 pub fn enroll_macs(
     sys: &dyn System,
     paths: &Paths,
@@ -1354,7 +1340,7 @@ pub fn enroll_macs(
                     );
                 }
                 Done::Skipped(why) => say(sink, label, &format!("not enrolled: {why}")),
-                Done::Enrolled(_) | Done::Refused(_) => {}
+                Done::Enrolled(_) => {}
             }
         }
     }
@@ -1363,12 +1349,12 @@ pub fn enroll_macs(
         .copied()
         .filter(|&i| scanned.get(i).is_some_and(Result::is_ok))
         .collect();
-    let one = |i: usize, user: &str, password: &Secret| -> Done {
+    let one = |i: usize, password: &Secret| -> Done {
         let (Some(mac), Some(Ok(scan))) = (macs.get(i), scanned.get(i)) else {
             return Done::Skipped("no such Mac".into());
         };
         let req = Request {
-            user: user.to_owned(),
+            user: args.user.clone(),
             ..mac.clone()
         };
         let mut out = Lines::new(label_of(i), sink);
@@ -1381,177 +1367,20 @@ pub fn enroll_macs(
             }
         }
     };
-    let refusing = |done: &[Done]| -> Vec<usize> {
-        all.iter()
-            .copied()
-            .filter(|&i| matches!(done.get(i), Some(Done::Refused(_))))
-            .collect()
-    };
-    let mut user = args.user.clone();
     if !ready.is_empty() {
-        let Some(password) = ask(sys, &first_prompt(args, macs, &ready, &user), true)? else {
-            return Err("not run: no password typed".into());
-        };
-        let tried = ssh::fan_out(&ready, parallel, |&i| one(i, &user, &password));
+        let password = admin_password(sys).map_err(|why| format!("not run: {why}"))?;
+        let tried = ssh::fan_out(&ready, parallel, |&i| one(i, &password));
         store(&mut done, &ready, tried);
-        let mut name_asked = args.user_given;
-        let mut asked: Vec<usize> = Vec::new();
-        let mut stopped = false;
-        loop {
-            let refused = refusing(&done);
-            if refused.is_empty() {
-                break;
-            }
-            if !name_asked {
-                name_asked = true;
-                say_line(
-                    sink,
-                    &format!(
-                        "{}: no login as {user} with that password (a wrong password, or no \
-                         account called {user} there)",
-                        who(&labels, &refused)
-                    ),
-                );
-                let on = if several { "the Macs" } else { "that Mac" };
-                match ask_name(sys, &user, on) {
-                    Err(_) => {
-                        stopped = true;
-                        break;
-                    }
-                    Ok(Some(name)) if name != user => {
-                        user = name;
-                        let retried =
-                            ssh::fan_out(&refused, parallel, |&j| one(j, &user, &password));
-                        store(&mut done, &refused, retried);
-                        continue;
-                    }
-                    Ok(_) => {}
-                }
-            }
-            let Some(i) = refused.iter().copied().find(|i| !asked.contains(i)) else {
-                break;
-            };
-            asked.push(i);
-            let label = labels.get(i).cloned().unwrap_or_default();
-            let at = if several {
-                label.clone()
-            } else {
-                macs.get(i).map_or(label.clone(), |m| m.address.clone())
-            };
-            let also = if refused.len() > 1 {
-                "it is also tried on the other Macs that refused; Enter skips this Mac"
-            } else {
-                "Enter skips it"
-            };
-            let prompt =
-                format!("{at} did not take the password for {user}. Type it again ({also}): ");
-            let retyped = match ask(sys, &prompt, true) {
-                Ok(retyped) => retyped,
-                Err(_) => {
-                    stopped = true;
-                    break;
-                }
-            };
-            let Some(retyped) = retyped else {
-                if let Some(slot) = done.get_mut(i)
-                    && let Done::Refused(why) = slot
-                {
-                    *slot = Done::Skipped(format!(
-                        "{why}; skipped at its password prompt: run the same enroll command \
-                         again to enroll it"
-                    ));
-                }
-                continue;
-            };
-            let again = one(i, &user, &retyped);
-            if matches!(again, Done::Refused(_)) {
-                say(sink, &label, "did not take that password either");
-            }
-            let worked = matches!(again, Done::Enrolled(_));
-            store(&mut done, &[i], vec![again]);
-            let others = refusing(&done);
-            if worked && !others.is_empty() {
-                let retried = ssh::fan_out(&others, parallel, |&j| one(j, &user, &retyped));
-                store(&mut done, &others, retried);
-            }
-        }
-        for slot in &mut done {
-            if let Done::Refused(why) = slot {
-                let next = if stopped {
-                    "not asked again: the prompt was stopped"
-                } else {
-                    "run the same enroll command again to retry it"
-                };
-                *slot = Done::Skipped(format!("{why}; {next}"));
-            }
-        }
     }
     let mut summary = Summary::default();
     for (label, result) in labels.into_iter().zip(done) {
         match result {
             Done::Enrolled(host) => summary.enrolled.push((label, host)),
             Done::Already(name) => summary.already.push((label, name)),
-            Done::Refused(why) | Done::Skipped(why) => summary.skipped.push((label, why)),
+            Done::Skipped(why) => summary.skipped.push((label, why)),
         }
     }
     Ok(summary)
-}
-
-fn first_prompt(args: &Args, macs: &[Request], ready: &[usize], user: &str) -> String {
-    let whose = if args.user_given || args.user_recorded {
-        format!("Password for {user}")
-    } else {
-        "Admin password".to_owned()
-    };
-    match ready {
-        [i] => format!(
-            "{whose} on {} (never saved): ",
-            macs.get(*i).map_or("the Mac", |m| m.address.as_str())
-        ),
-        _ => format!(
-            "{whose} on the {} Macs (typed once, used for each, never saved): ",
-            ready.len()
-        ),
-    }
-}
-
-fn who(labels: &[String], refused: &[usize]) -> String {
-    let named: Vec<&str> = refused
-        .iter()
-        .filter_map(|&i| labels.get(i).map(String::as_str))
-        .collect();
-    match named.as_slice() {
-        [one] => (*one).to_owned(),
-        _ => format!("{} Macs ({})", named.len(), named.join(", ")),
-    }
-}
-
-fn ask_name(sys: &dyn System, user: &str, on: &str) -> Result<Option<String>, String> {
-    let prompt = format!("What is the admin account called on {on}? (Enter keeps {user}): ");
-    let Some(name) = ask(sys, &prompt, false)? else {
-        return Ok(None);
-    };
-    let name = String::from_utf8_lossy(name.bytes()).trim().to_owned();
-    if name.is_empty() {
-        return Ok(None);
-    }
-    if !plain_account(&name) {
-        say_stderr(&format!(
-            "that is not an account name (letters, digits, '.', '_' or '-'); keeping {user}"
-        ));
-        return Ok(None);
-    }
-    Ok(Some(name))
-}
-
-fn ask(sys: &dyn System, prompt: &str, secret: bool) -> Result<Option<Secret>, String> {
-    sys.ask(prompt, secret).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            "stopped at the prompt".to_owned()
-        } else {
-            format!("the terminal: {e}")
-        }
-    })
 }
 
 fn say(sink: &Sink<'_>, label: &str, line: &str) {
@@ -1562,10 +1391,6 @@ fn say_line(sink: &Sink<'_>, line: &str) {
     let mut out = locked(sink);
     let _ = writeln!(out, "{}", shown(line));
     let _ = out.flush();
-}
-
-fn say_stderr(line: &str) {
-    eprintln!("aterm machines enroll: {line}");
 }
 
 /// Shared agent archive, `allowed_signers`, and fleet public key payload for an `enroll` run.
@@ -1738,7 +1563,7 @@ impl Drop for Claimed<'_, '_> {
     }
 }
 
-/// How one Mac's `ssh` login with the typed password ended.
+/// How one Mac's `ssh` login with the vault's machines-admin password ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Login {
     In,
@@ -1906,15 +1731,15 @@ fn enroll_one(
     match log_in(sys, &master, known, alias, askpass, password) {
         Login::In => {}
         Login::Refused => {
-            return Done::Refused(format!(
-                "no login as {} with the password typed (a wrong password, or no account \
-                 called {} there)",
+            return Done::Skipped(format!(
+                "no login as {} with the vault's machines-admin password (a wrong password, or \
+                 no account called {} there; --user names another)",
                 req.user, req.user
             ));
         }
         Login::Failed(why) => return Done::Skipped(why),
     }
-    let host = install_through(shared, req, &master, key, Sudo::Password(password), out);
+    let host = install_through(shared, req, &master, key, password, out);
     close_master(sys, &master);
     match host {
         Ok(host) => {
@@ -1927,7 +1752,8 @@ fn enroll_one(
     }
 }
 
-/// Complete enrollment over an already authenticated `master` connection.
+/// Complete enrollment over an already authenticated `master` connection, `sudo` taking
+/// `password` ([`admin_password`]).
 #[expect(clippy::too_many_arguments, reason = "each is one input of enrollment")]
 pub fn enroll_through(
     sys: &dyn System,
@@ -1937,10 +1763,11 @@ pub fn enroll_through(
     master: &Master,
     key: &HostKey,
     scratch: &Path,
+    password: &Secret,
     out: &mut dyn Write,
 ) -> Result<Host, String> {
     let shared = Shared::new(sys, paths, exe, scratch);
-    install_through(&shared, req, master, key, Sudo::Terminal, out)
+    install_through(&shared, req, master, key, password, out)
 }
 
 fn install_through(
@@ -1948,7 +1775,7 @@ fn install_through(
     req: &Request,
     master: &Master,
     key: &HostKey,
-    sudo: Sudo<'_>,
+    password: &Secret,
     out: &mut dyn Write,
 ) -> Result<Host, String> {
     let (sys, paths) = (shared.sys, shared.paths);
@@ -1990,7 +1817,7 @@ fn install_through(
         &[&payload.archive.path, &payload.signers],
         &format!("{remote_dir}/"),
     )?;
-    run_install(sys, master, &install, sudo, req, out)?;
+    run_install(sys, master, &install, password, req, out)?;
     shared.recorded(|| pin_host_key(sys, paths, &facts.uuid, key))?;
     match first_hello(sys, paths, &host) {
         Ok(hello) => {
@@ -2024,7 +1851,7 @@ fn run_install(
     sys: &dyn System,
     master: &Master,
     install: &Install<'_>,
-    sudo: Sudo<'_>,
+    password: &Secret,
     req: &Request,
     out: &mut dyn Write,
 ) -> Result<(), String> {
@@ -2032,26 +1859,6 @@ fn run_install(
         "nothing outside {}/.staging is changed unless `agent install` said so",
         crate::AGENT_ROOT
     );
-    let password = match sudo {
-        Sudo::Password(password) => password,
-        Sudo::Terminal => {
-            let _ = writeln!(
-                out,
-                "sudo asks for {}'s password on {}:",
-                req.user, req.address
-            );
-            return match sys.run_tty(
-                &remote_sh(master, &install_command(install, sudo), true),
-                &mut |_| Ok(()),
-            ) {
-                Ok(Some(0)) => Ok(()),
-                Ok(code) => Err(format!(
-                    "the install command line failed (status {code:?}); {left}"
-                )),
-                Err(e) => Err(format!("ssh -t: {e}")),
-            };
-        }
-    };
     let _ = writeln!(
         out,
         "installing aterm's helper: installing system software takes the admin password, \
@@ -2059,7 +1866,7 @@ fn run_install(
     );
     let ran = sys
         .run_fed(
-            &remote_sh(master, &install_command(install, sudo), false).budget(INSTALL_BUDGET),
+            &remote_sh(master, &install_command(install)).budget(INSTALL_BUDGET),
             password,
         )
         .map_err(|e| format!("the install command line: {e}; {left}"))?;
@@ -2272,7 +2079,7 @@ pub fn unenroll(
     })?;
     let ids: Vec<u64> = state.github_keys.iter().map(|(_, id)| *id).collect();
     if let (Some(github), false) = (&inv.github, ids.is_empty()) {
-        super::github::revoke_via(sys, paths, github, &ids)?;
+        super::github::revoke_via(sys, github, &ids)?;
         let _ = writeln!(
             out,
             "deleted {} GitHub key(s) from {}",

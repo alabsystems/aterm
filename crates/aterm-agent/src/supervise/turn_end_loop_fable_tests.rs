@@ -9,10 +9,10 @@ use crate::supervise::approvals::{
     model_switch_reason, open_model_switch, open_wall,
 };
 use crate::supervise::policy::turn_end::{
-    AccountAt, FABLE_FALLBACK, FableWeek, LaunchModel, RULE_ACCOUNT, RULE_CONTINUE,
-    RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, Restart, RestartAnswer, RestartAsk, RestartClaim,
-    decide_turn_end,
+    AccountAt, FABLE_FALLBACK, FableWeek, LaunchModel, RULE_ACCOUNT, RULE_MODEL_FALLBACK,
+    RULE_MODEL_RESTORE, Restart, RestartAnswer, RestartAsk, RestartClaim, decide_turn_end,
 };
+use alab_policy::words::RULE_CONTINUE;
 use aterm_phase::prompt::fixtures as fx;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
@@ -235,12 +235,14 @@ impl IdleHost for FableHost {
     fn relaunch_owed(&self) -> bool {
         self.relaunch_owed.load(Ordering::SeqCst)
     }
-    fn agent_resumed(&self) -> Option<AgentResumed> {
-        let (pid, started, conversation) = self.late_agent.lock().unwrap().take()?;
+    fn agent_resumed(&self) -> HostAgent {
+        let Some((pid, started, conversation)) = self.late_agent.lock().unwrap().take() else {
+            return HostAgent::Absent;
+        };
         *self.pid.lock().unwrap() = Some(pid);
         *self.started.lock().unwrap() = Some(started);
         *self.conversation.lock().unwrap() = conversation.map(str::to_string);
-        Some(AgentResumed {
+        HostAgent::Read(AgentResumed {
             pid,
             started: Some(started),
             resumed: false,

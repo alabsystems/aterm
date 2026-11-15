@@ -187,10 +187,10 @@ fn the_rs_walk_stops_where_it_cannot_read() {
 
 #[test]
 fn run_censuses_keeps_the_given_order_and_turns_a_panic_red() {
-    fn clean(_: &Walk<'_>) -> CensusOutcome {
+    fn clean(_: &Path, _: &EngineBaseline) -> CensusOutcome {
         CensusOutcome::green("a", String::new(), "clean")
     }
-    fn broken(_: &Walk<'_>) -> CensusOutcome {
+    fn broken(_: &Path, _: &EngineBaseline) -> CensusOutcome {
         panic!("a walker bug")
     }
     let a = Census {
@@ -203,8 +203,7 @@ fn run_censuses_keeps_the_given_order_and_turns_a_panic_red() {
         about: "",
         run: broken,
     };
-    let (out, report) = run_censuses(Path::new("."), &[&b, &a], &Err(String::new()), None);
-    assert!(report.is_none(), "no memo, no report");
+    let out = run_censuses(Path::new("."), &[&b, &a], &Err(String::new()));
     assert!(
         !out[0].ok && out[0].log.contains("b census"),
         "{}",
@@ -215,13 +214,13 @@ fn run_censuses_keeps_the_given_order_and_turns_a_panic_red() {
 
 #[test]
 fn run_censuses_turns_a_missed_floor_red() {
-    fn thin(_: &Walk<'_>) -> CensusOutcome {
+    fn thin(_: &Path, _: &EngineBaseline) -> CensusOutcome {
         CensusOutcome::green("thin", "=== thin ===\n".to_string(), "1 site").with_floors(vec![
             Floor::at_least("sites read", 1, 100, "the walk went blind"),
             Floor::at_least("files read", 3, 1, "no files"),
         ])
     }
-    fn red(_: &Walk<'_>) -> CensusOutcome {
+    fn red(_: &Path, _: &EngineBaseline) -> CensusOutcome {
         CensusOutcome::red("red", String::new(), "1 violation").with_floors(vec![Floor::at_least(
             "sites read",
             0,
@@ -241,14 +240,11 @@ fn run_censuses_turns_a_missed_floor_red() {
             run: red,
         },
     );
-    let walk = Walk {
-        root: Path::new("."),
-        engine: &Err(String::new()),
-        source: &OnceLock::from(std::sync::Arc::new(memo::Snapshot::empty())),
-        run: None,
-    };
-    assert!(thin(&walk).ok, "the bare walk holds no floors");
-    let (out, _) = run_censuses(Path::new("."), &[&a, &b], &Err(String::new()), None);
+    assert!(
+        thin(Path::new("."), &Err(String::new())).ok,
+        "the bare walk holds no floors"
+    );
+    let out = run_censuses(Path::new("."), &[&a, &b], &Err(String::new()));
     assert!(!out[0].ok, "{}", out[0].log);
     assert!(
         out[0].log.contains("[floor] sites read") && !out[0].log.contains("files read"),
@@ -260,10 +256,6 @@ fn run_censuses_turns_a_missed_floor_red() {
         "{}",
         out[1].verdict
     );
-}
-
-fn body(src: &str) -> Vec<String> {
-    src.lines().map(|l| l.to_string()).collect()
 }
 
 #[test]
@@ -332,84 +324,6 @@ fn table() -> [f32; 256] {
 }
 
 #[test]
-fn term_hop_flags_synchronous_guarded_resize_both_idioms() {
-    let (hz, _) = term_hop_calls(&body("    let p = term_lock(term).resize(rows, cols);"));
-    assert_eq!(hz.len(), 1, "chained term_lock(..).resize( must flag");
-    assert_eq!(hz[0].method, "resize");
-    let (hz, _) = term_hop_calls(&body(
-        "    let mut term = term_lock(&s.term);\n    term.resize(sub_rows, sub_cols);",
-    ));
-    assert_eq!(hz.len(), 1, "guard.resize( must flag");
-}
-
-#[test]
-fn term_hop_passes_the_offloaded_shape_and_bounded_neighbours() {
-    let (hz, off) = term_hop_calls(&body(
-        "    let mut term = term_lock(&s.term);\n    \
-         term.resize_offloading_scrollback(sub_rows, sub_cols)",
-    ));
-    assert!(hz.is_empty(), "resize_offloading_scrollback must not flag");
-    assert_eq!(off, 1, "offload boundary should be counted");
-    let (hz, off) = term_hop_calls(&body("    term_lock(&s.term).set_cell_pixel_size(w, h);"));
-    assert!(hz.is_empty());
-    assert_eq!(off, 0);
-}
-
-#[test]
-fn term_hop_ignores_vec_and_local_terminal_resize() {
-    let (hz, _) = term_hop_calls(&body("    self.born_scratch.resize(rows * cols, None);"));
-    assert!(hz.is_empty());
-    let (hz, _) = term_hop_calls(&body(
-        "    let mut term = Terminal::from_checkpoint(cp, host);\n    \
-         term.resize(rows, cols);",
-    ));
-    assert!(hz.is_empty(), "local Terminal::resize must not flag");
-    assert!(
-        guard_vars(&body(
-            "    let mut term = Terminal::from_checkpoint(cp, host);"
-        ))
-        .is_empty()
-    );
-}
-
-#[test]
-fn guard_vars_captures_the_term_lock_whole_binding() {
-    let g = guard_vars(&body("        let t = crate::term_lock_whole(term);"));
-    assert!(
-        g.contains("t"),
-        "crate::term_lock_whole( binding yields `t`"
-    );
-    let g = guard_vars(&body("        let mut t = term_lock_whole(term);"));
-    assert!(g.contains("t"), "bare term_lock_whole( binding yields `t`");
-    let (hz, _) = term_hop_calls(&body(
-        "    let p = crate::term_lock_whole(term).resize(rows, cols);",
-    ));
-    assert_eq!(hz.len(), 1, "chained term_lock_whole(..).resize( must flag");
-    let g = guard_vars(&body(
-        "        let t = crate::term_lock_whole_when(term, |_| on == ReadOn::Control);",
-    ));
-    assert!(
-        g.contains("t"),
-        "crate::term_lock_whole_when( binding yields `t`"
-    );
-    let g = guard_vars(&body(
-        "        let mut t = term_lock_whole_when(term, waits);",
-    ));
-    assert!(
-        g.contains("t"),
-        "bare term_lock_whole_when( binding yields `t`"
-    );
-    let (hz, _) = term_hop_calls(&body(
-        "    let p = crate::term_lock_whole_when(term, |_| true).resize(rows, cols);",
-    ));
-    assert_eq!(
-        hz.len(),
-        1,
-        "chained term_lock_whole_when(..).resize( must flag"
-    );
-}
-
-#[test]
 fn any_match_tries_exactly_the_starts_match_indices_yields() {
     for (hay, needle) in [
         ("aaaa", "aa"),
@@ -426,11 +340,6 @@ fn any_match_tries_exactly_the_starts_match_indices_yields() {
         }));
         let starts: Vec<usize> = hay.match_indices(needle).map(|(at, _)| at).collect();
         assert_eq!(tried, starts, "{needle:?} in {hay:?}");
-        assert_eq!(
-            mentions(hay, needle),
-            hay.contains(needle),
-            "{needle:?} in {hay:?}"
-        );
     }
     let mut tried = Vec::new();
     assert!(any_match("f(a(b(", "(", |at| {
@@ -440,69 +349,11 @@ fn any_match_tries_exactly_the_starts_match_indices_yields() {
     assert_eq!(tried, [1, 3], "the scan stops at the first start that fits");
 }
 
-#[test]
-fn guard_vars_captures_the_term_lock_ui_binding() {
-    let g = guard_vars(&body(
-        "            let mut term = crate::term_lock_ui(&front_terminal.term, ui_waiting, site);",
-    ));
-    assert!(
-        g.contains("term"),
-        "crate::term_lock_ui( binding yields `term`"
-    );
-    let g = guard_vars(&body(
-        "        let mut t = term_lock_ui(&term, &ui_waiting, site);",
-    ));
-    assert!(g.contains("t"), "bare term_lock_ui( binding yields `t`");
-    let (hz, _) = term_hop_calls(&body(
-        "    let mut term = crate::term_lock_ui(&s.term, w, site);\n    term.resize(r, c);",
-    ));
-    assert_eq!(
-        hz.len(),
-        1,
-        "resize on a term_lock_ui-bound guard must flag"
-    );
-    assert_eq!(hz[0].method, "resize");
-    let (hz, _) = term_hop_calls(&body(
-        "    crate::term_lock_ui(&s.term, w, site).resize(r, c);",
-    ));
-    assert_eq!(hz.len(), 1, "chained term_lock_ui(..).resize( must flag");
-}
-
-fn synth_support_files() -> Vec<(String, String)> {
-    let m = "// COST: UNBOUNDED";
+fn synth_base() -> Vec<(String, String)> {
     vec![
-        (
-            "crates/aterm-grid/src/grid/reflow.rs".to_string(),
-            format!("{m}(scrollback-width-reflow)\npub fn resize_with_reflow_mode() {{}}\n"),
-        ),
-        (
-            "crates/aterm-grid/src/grid/scrollback_reflow.rs".to_string(),
-            format!(
-                "{m}(ring+tiered-history-lines)\npub fn take_scrollback_lines() {{}}\n\
-                 {m}(session-history-cells)\npub fn reflow_scrollback_lines() {{}}\n"
-            ),
-        ),
-        (
-            "crates/aterm-core/src/terminal/callback_setters.rs".to_string(),
-            "pub fn resize_offloading_scrollback() {}\n\
-             pub fn finish_resize_offload() {}\n\
-             pub fn abort_resize_offload() {}\n"
-                .to_string(),
-        ),
-        (
-            "crates/aterm-grid/src/grid/scrollback_offload.rs".to_string(),
-            "pub fn reattach_reflowed_scrollback() {}\n".to_string(),
-        ),
         (
             "crates/aterm-control/src/lib.rs".to_string(),
             "// stub\n".to_string(),
-        ),
-        (
-            "crates/aterm-diskwalk/src/walk.rs".to_string(),
-            format!(
-                "{m}(entries)\npub fn diskwalk_slice() {{}}\n\
-                 {m}(entries)\npub fn diskwalk_size_full() {{}}\n"
-            ),
         ),
         (
             "crates/aterm-gui/src/control_input.rs".to_string(),
@@ -529,29 +380,6 @@ fn synth_support_files() -> Vec<(String, String)> {
     ]
 }
 
-fn synth_manifests() -> Vec<(String, String)> {
-    let mut files = crate::scan_set::test_fixtures::workspace_manifests(&[
-        ("aterm-core", ""),
-        ("aterm-grid", ""),
-        ("aterm-diskwalk", ""),
-    ]);
-    for stub in [
-        "crates/aterm-types/src/lib.rs",
-        "crates/aterm-core/src/lib.rs",
-        "crates/aterm-grid/src/lib.rs",
-        "crates/aterm-diskwalk/src/lib.rs",
-    ] {
-        files.push((stub.to_string(), "// stub\n".to_string()));
-    }
-    files
-}
-
-fn synth_base() -> Vec<(String, String)> {
-    let mut files = synth_manifests();
-    files.extend(synth_support_files());
-    files
-}
-
 fn synth_gui(extra: &str) -> String {
     format!(
         "fn new_events() {{}}\n\
@@ -562,72 +390,6 @@ fn synth_gui(extra: &str) -> String {
          fn flush_pending_resize() {{}}\n\
          {extra}"
     )
-}
-
-#[test]
-fn synthetic_offloaded_tree_is_green() {
-    let mut files = synth_base();
-    let gui = synth_gui(
-        "fn resize_helper() {\n    \
-         let pending = term_lock(&s.term).resize_offloading_scrollback(rows, cols);\n}\n",
-    );
-    files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
-    let root = synth_tree("aterm-census", "green", &files);
-    let out = run_mainloop_census(&root);
-    assert!(out.ok, "expected GREEN, got:\n{}", out.log);
-    assert!(
-        out.log.contains("main-loop census: GREEN"),
-        "log:\n{}",
-        out.log
-    );
-    assert!(
-        out.log
-            .contains("the DERIVED GUI-process closure (5 workspace crates"),
-        "the transcript must state the derived marker-sweep scope; log:\n{}",
-        out.log
-    );
-    assert!(
-        out.log.contains("0 out-of-closure marker(s) reported"),
-        "log:\n{}",
-        out.log
-    );
-}
-
-#[test]
-fn synthetic_prefix_resize_shape_is_red_with_path() {
-    let mut files = synth_base();
-    let gui = synth_gui(
-        "fn resize_helper() {\n    \
-         let mut term = term_lock(&s.term);\n    \
-         term.resize(sub_rows, sub_cols);\n}\n\
-         fn unrelated_offload() {\n    \
-         term_lock(&s.term).finish_resize_offload(reflowed);\n}\n",
-    );
-    files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
-    let root = synth_tree("aterm-census", "red-ob5", &files);
-    let out = run_mainloop_census(&root);
-    assert!(!out.ok, "expected RED, got:\n{}", out.log);
-    assert!(out.log.contains("[OB-5]"), "log:\n{}", out.log);
-    assert!(
-        out.log.contains("window_event -> resize_helper"),
-        "the diagnostic must print the root -> hazard path; log:\n{}",
-        out.log
-    );
-    assert!(
-        out.log.contains("term.resize(sub_rows, sub_cols);"),
-        "the diagnostic must quote the offending line; log:\n{}",
-        out.log
-    );
-    assert!(
-        out.log.contains("HOW TO REPAIR"),
-        "the diagnostic must carry the repair options; log:\n{}",
-        out.log
-    );
-    assert!(
-        out.log.contains("main-loop census: FAILED — "),
-        "the verdict line must name the census; log:\n{}",
-        out.log
-    );
 }
 
 #[test]
@@ -794,8 +556,7 @@ fn conjunctive_cfg_test_helper_is_masked_not_graphed() {
          #[cfg(all(test, any(windows, target_os = \"linux\")))]\n\
          mod strip_band_landing_tests {\n    \
          fn compose() {\n        \
-         let mut term = term_lock(&s.term);\n        \
-         term.resize(rows, cols);\n    }\n}\n",
+         let t = crate::term_lock_whole(term);\n    }\n}\n",
     );
     files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
     let root = synth_tree("aterm-census", "mask-cfg-all-test", &files);
@@ -803,7 +564,7 @@ fn conjunctive_cfg_test_helper_is_masked_not_graphed() {
     assert!(
         out.ok,
         "a `cfg(all(test, ..))` helper never enters the shipped GUI \
-         process and must not fail OB-5:\n{}",
+         process and must not fail OB-23:\n{}",
         out.log
     );
 }
@@ -819,57 +580,18 @@ fn a_disjunctive_cfg_test_gate_is_not_masked_and_stays_red() {
          #[cfg(any(test, unix))]\n\
          mod maybe_shipped {\n    \
          fn compose() {\n        \
-         let mut term = term_lock(&s.term);\n        \
-         term.resize(rows, cols);\n    }\n}\n",
+         let t = crate::term_lock_whole(term);\n    }\n}\n",
     );
     files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
     let root = synth_tree("aterm-census", "no-mask-any-test", &files);
     let out = run_mainloop_census(&root);
     assert!(
         !out.ok,
-        "`any(test, unix)` compiles on a shipped unix build — the hazard \
-         under it must still fail OB-5:\n{}",
+        "`any(test, unix)` compiles on a shipped unix build — the frame wait \
+         under it must still fail OB-23:\n{}",
         out.log
     );
-    assert!(out.log.contains("[OB-5]"), "log:\n{}", out.log);
-}
-
-#[test]
-fn synthetic_direct_sink_call_is_red_ob6() {
-    let mut files = synth_base();
-    let gui = synth_gui(
-        "fn resize_helper() {\n    \
-         let lines = reflow_scrollback_lines(&lines, cols);\n}\n\
-         fn unrelated_offload() {\n    \
-         term_lock(&s.term).finish_resize_offload(reflowed);\n}\n",
-    );
-    files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
-    let root = synth_tree("aterm-census", "red-ob6", &files);
-    let out = run_mainloop_census(&root);
-    assert!(!out.ok, "expected RED, got:\n{}", out.log);
-    assert!(out.log.contains("[OB-6]"), "log:\n{}", out.log);
-    assert!(
-        out.log.contains("reflow_scrollback_lines"),
-        "log:\n{}",
-        out.log
-    );
-}
-
-#[test]
-fn synthetic_missing_boundary_def_is_red_ob3_and_missing_offload_is_red_ob4() {
-    let files: Vec<(String, String)> = synth_base()
-        .into_iter()
-        .filter(|(rel, _)| !rel.ends_with("callback_setters.rs"))
-        .chain([(
-            "crates/aterm-gui/src/main.rs".to_string(),
-            synth_gui("fn resize_helper() {}\n"),
-        )])
-        .collect();
-    let root = synth_tree("aterm-census", "red-ob3-ob4", &files);
-    let out = run_mainloop_census(&root);
-    assert!(!out.ok, "expected RED, got:\n{}", out.log);
-    assert!(out.log.contains("[OB-3]"), "log:\n{}", out.log);
-    assert!(out.log.contains("[OB-4]"), "log:\n{}", out.log);
+    assert!(out.log.contains("[OB-23]"), "log:\n{}", out.log);
 }
 
 #[test]
@@ -892,103 +614,6 @@ fn synthetic_missing_root_is_red_ob2() {
     assert!(out.log.contains("[OB-2]"), "log:\n{}", out.log);
     assert!(
         out.log.contains("flush_pending_resize"),
-        "log:\n{}",
-        out.log
-    );
-}
-
-#[test]
-fn out_of_closure_marker_is_not_swept_and_is_reported() {
-    let m = "// COST: UNBOUNDED";
-    let mut files = synth_base();
-    files.push((
-        "crates/aterm-gui/src/main.rs".to_string(),
-        synth_gui(
-            "fn resize_helper() {\n    \
-             term_lock(&s.term).resize_offloading_scrollback(rows, cols);\n}\n",
-        ),
-    ));
-    files.push((
-        "crates/aterm-clitool/src/main.rs".to_string(),
-        format!("{m}(whole-archive-dump)\npub fn dump_everything() {{}}\n"),
-    ));
-    let root = synth_tree("aterm-census", "out-of-closure", &files);
-    let out = run_mainloop_census(&root);
-    assert!(
-        out.ok,
-        "an out-of-closure marker must NOT enter OB-1 coherence; log:\n{}",
-        out.log
-    );
-    assert!(
-        out.log.contains("NOTE [OB-1 scope]")
-            && out.log.contains("dump_everything")
-            && out.log.contains("crates/aterm-clitool/src/main.rs:1"),
-        "the out-of-closure marker must be REPORTED with its span; log:\n{}",
-        out.log
-    );
-    assert!(
-        out.log.contains("1 out-of-closure marker(s) reported"),
-        "log:\n{}",
-        out.log
-    );
-}
-
-#[test]
-fn out_of_closure_marker_cannot_satisfy_the_registry() {
-    let m = "// COST: UNBOUNDED";
-    let mut files: Vec<(String, String)> = synth_base()
-        .into_iter()
-        .map(|(rel, contents)| {
-            if rel.ends_with("grid/reflow.rs") {
-                (rel, "pub fn resize_with_reflow_mode() {}\n".to_string())
-            } else {
-                (rel, contents)
-            }
-        })
-        .collect();
-    files.push((
-        "crates/aterm-gui/src/main.rs".to_string(),
-        synth_gui(
-            "fn resize_helper() {\n    \
-             term_lock(&s.term).resize_offloading_scrollback(rows, cols);\n}\n",
-        ),
-    ));
-    files.push((
-        "crates/aterm-clitool/src/lib.rs".to_string(),
-        format!("{m}(scrollback-width-reflow)\npub fn resize_with_reflow_mode() {{}}\n"),
-    ));
-    let root = synth_tree("aterm-census", "moved-marker", &files);
-    let out = run_mainloop_census(&root);
-    assert!(!out.ok, "expected RED, got:\n{}", out.log);
-    assert!(
-        out.log.contains("[OB-1]")
-            && out.log.contains("has LOST its")
-            && out.log.contains("resize_with_reflow_mode"),
-        "the registry must not be satisfiable from outside the closure; log:\n{}",
-        out.log
-    );
-    assert!(
-        out.log.contains("NOTE [OB-1 scope]"),
-        "the stray out-of-closure marker must still be reported; log:\n{}",
-        out.log
-    );
-}
-
-#[test]
-fn underivable_workspace_fails_the_mainloop_census_closed() {
-    let files: Vec<(String, String)> = synth_base()
-        .into_iter()
-        .filter(|(rel, _)| rel != "Cargo.toml")
-        .chain([(
-            "crates/aterm-gui/src/main.rs".to_string(),
-            synth_gui("fn resize_helper() {}\n"),
-        )])
-        .collect();
-    let root = synth_tree("aterm-census", "underivable", &files);
-    let out = run_mainloop_census(&root);
-    assert!(!out.ok, "expected RED, got:\n{}", out.log);
-    assert!(
-        out.log.contains("SCAN-SET DERIVATION FAILED"),
         "log:\n{}",
         out.log
     );

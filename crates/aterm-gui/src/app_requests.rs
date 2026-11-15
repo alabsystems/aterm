@@ -257,7 +257,11 @@ impl App {
     /// seen): each live tab's shell blocks since the last look and its person's typing, handed to
     /// the requests' writer, and each open request tab's tree sampled. Otherwise no terminal is
     /// read and the cursors are dropped, so the next look starts from its tabs' recent blocks.
-    fn look_at_footprints(&mut self, handles: &[crate::session_store::SessionHandle], now_ms: u64) {
+    pub(crate) fn look_at_footprints(
+        &mut self,
+        handles: &[crate::session_store::SessionHandle],
+        now_ms: u64,
+    ) {
         const RECENT_MS: u64 = 2 * 60_000;
         if !crate::requests_host::any_live(now_ms.saturating_sub(RECENT_MS))
             && !crate::requests_host::watching()

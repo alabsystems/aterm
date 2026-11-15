@@ -23,6 +23,43 @@ const EXCHANGE: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const EXCHANGE: Duration = Duration::from_secs(60);
 
+/// The snapshot version this relay writes: 2, whose leases reach [`LEASE_MAX`], the promise of a
+/// scheduler that dials a settled peer once an audit (`crate::runtime::discovery`). A reader
+/// that knows only version 1 (every aterm before version 2's reader) refuses it whole: an older
+/// process on this Mac that has not restarted reads no observation, which says nothing of who
+/// is gone, and never a peer held Reachable past what it was promised.
+const WRITES: u64 = 2;
+
+/// The longest lease a snapshot of `version` carries, or none for a version this reader does
+/// not know. Version 1 is what every aterm before version 2 reads, and those refuse a whole
+/// snapshot over one lease past two minutes: that bound is version 1's for good, whatever
+/// [`LEASE_MAX`] is. Version 2 is the same snapshot with leases up to [`LEASE_MAX`].
+const fn lease_max(version: u64) -> Option<Duration> {
+    match version {
+        1 => Some(Duration::from_secs(120)),
+        2 => Some(LEASE_MAX),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of the reader, on for one test thread: it knows version 1 alone, as every aterm
+    /// before it, so an owner that writes version 2 has no reader.
+    static ONLY_VERSION_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of the reader, on for one test thread: version 1 is read by version 2's bound, so
+    /// a version-1 snapshot may hold a peer Reachable past two minutes.
+    static ONE_BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// MUTANT of the writer, on for one test thread: it writes any lease under its version.
+    static WRITES_ANY_LEASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The longest lease this relay's snapshots carry: the bound of the version it writes.
+pub(super) const WRITTEN_LEASE: Duration = match lease_max(WRITES) {
+    Some(most) => most,
+    None => panic!("the relay writes a version it reads"),
+};
+
 fn refused() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "local observation unavailable")
 }
@@ -420,6 +457,19 @@ fn live_encode(state: &NetworkObservation, age_ms: u64) -> io::Result<Vec<u8>> {
 }
 
 fn live_encode_publication(publication: &Publication, age_ms: u64) -> io::Result<Vec<u8>> {
+    live_encode_version(publication, age_ms, WRITES)
+}
+
+/// The snapshot as `version` carries it: no snapshot where a Reachable peer's lease is past
+/// that version's bound ([`lease_max`]), since a reader of that version would hold the peer
+/// Reachable for longer than it may. Nothing is cut to fit: a lease shortened here would no
+/// longer be the one its owner reads the peer by.
+fn live_encode_version(
+    publication: &Publication,
+    age_ms: u64,
+    version: u64,
+) -> io::Result<Vec<u8>> {
+    let most = lease_max(version).ok_or_else(refused)?;
     let state = &publication.observation;
     let history = encode_value(state, None);
     // A Reachable peer's contact age comes with the lease it is read against (`Contact::lease`);
@@ -432,12 +482,18 @@ fn live_encode_publication(publication: &Publication, age_ms: u64) -> io::Result
             None
         };
         let lease = peer.lease_ms.filter(|_| reachable);
+        #[cfg(test)]
+        let most = if mutant(&WRITES_ANY_LEASE) { Duration::MAX } else { most };
+        if lease.is_some_and(|lease| Duration::from_millis(lease) > most) {
+            return Err(refused());
+        }
         Ok(json!({"slot":peer.slot,"state":state_value(peer.reachability),"checked":peer.last_checked_ms,"contact_age_ms":age,"lease_ms":lease}))
     }).collect::<io::Result<Vec<_>>>()?;
     let wire = aterm_json::to_vec(&json!({
-        "version":1, "source_age_ms":age_ms, "history":history, "visibility":visibility(state.visibility),
+        "version":version, "source_age_ms":age_ms, "history":history, "visibility":visibility(state.visibility),
         "history_state":match state.history {HistoryState::Ready=>"ready",HistoryState::Restoring=>"restoring",HistoryState::Unavailable=>"unavailable"},
         "detail":state.detail, "unverified":state.unverified_endpoints,
+        "listening_since_ms":state.listening_since_ms,
         "live":live
     })).map_err(|_| refused())?;
     if wire.len() > MAX_BYTES {
@@ -501,9 +557,15 @@ fn live_decode_parts(
         return Err(refused_at("clock"));
     }
     let value: Value = aterm_json::from_slice(wire).map_err(|_| refused_at("snapshot-json"))?;
-    if number(&value, "version").map_err(|_| refused_at("snapshot-version"))? != 1 {
-        return Err(refused_at("snapshot-version"));
-    }
+    // Each version this reader knows bounds the leases its rows may name.
+    let version = number(&value, "version").map_err(|_| refused_at("snapshot-version"))?;
+    #[cfg(test)]
+    let version = match version {
+        2 if mutant(&ONLY_VERSION_ONE) => 0,
+        1 if mutant(&ONE_BOUND) => 2,
+        version => version,
+    };
+    let lease_max = lease_max(version).ok_or_else(|| refused_at("snapshot-version"))?;
     let age_ms = number(&value, "source_age_ms").map_err(|_| refused_at("snapshot-age"))?;
     if age_ms > aterm_types::network_state::REACHABLE_MS {
         return Err(refused_at("source-stale"));
@@ -547,6 +609,23 @@ fn live_decode_parts(
     if observation.unverified_endpoints > crate::runtime::MAX_UNVERIFIED_ENDPOINTS {
         return Err(refused_at("snapshot-hints"));
     }
+    // When its observer began listening: never after the sample, and only where it observes
+    // Active as this Mac's confirmed observer, as every producer publishes it. A frame that names
+    // none (its producer does not listen) gives no presence to judge an absence by.
+    observation.listening_since_ms = match value.get("listening_since_ms") {
+        None => None,
+        Some(since) if since.is_null() => None,
+        Some(since) => Some(
+            since
+                .as_u64()
+                .filter(|since| {
+                    (1..=observation.observed_at_ms).contains(since)
+                        && observation.visibility == Visibility::Active
+                        && observation.observer.is_some()
+                })
+                .ok_or_else(|| refused_at("snapshot-listening"))?,
+        ),
+    };
     let live = value
         .get("live")
         .and_then(Value::as_array)
@@ -568,8 +647,9 @@ fn live_decode_parts(
         let peer = &mut observation.peers[peer_idx];
         peer.reachability = state(row.get("state").ok_or_else(|| refused_at("peer-state"))?)
             .map_err(|_| refused_at("peer-state"))?;
-        // The lease a contact is read against: the producer's measured one, within the
-        // bounds every producer keeps, or `REACHABLE` where the row names none.
+        // The lease a contact is read against: the one its producer gave it, within the
+        // bounds every producer of this snapshot's version keeps, or `REACHABLE` where the row
+        // names none.
         let named = match row.get("lease_ms") {
             None => None,
             Some(value) if value.is_null() => None,
@@ -577,7 +657,7 @@ fn live_decode_parts(
                 value
                     .as_u64()
                     .filter(|lease| {
-                        (REACHABLE..=LEASE_MAX).contains(&Duration::from_millis(*lease))
+                        (REACHABLE..=lease_max).contains(&Duration::from_millis(*lease))
                     })
                     .ok_or_else(|| refused_at("peer-lease"))?,
             ),

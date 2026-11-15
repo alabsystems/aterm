@@ -223,13 +223,17 @@ fn envelope_work(ask: impl FnOnce()) -> (usize, usize) {
 /// the first parses an envelope or asks for a signature: the held entry verified its own
 /// once. A new version, and a file of the same length renamed over it, are each verified again,
 /// once; one whose signature fails is refused at every ask with the reader's own error, and
-/// the applied bytes put back open again.
+/// the applied bytes put back open again, even after another thread filled the process's cache:
+/// this thread reads a cache of its own ([`OwnCache`](super::super::chain_cache::OwnCache)).
 /// NEGATIVE CONTROL: with `admin_cached_observed` giving the held bytes to
 /// `envelope::verify_for_reader`, the eight asks over the unchanged vault parse eight
-/// envelopes and ask for eight signatures (`left: (8, 8)`, `right: (0, 0)`).
+/// envelopes and ask for eight signatures (`left: (8, 8)`, `right: (0, 0)`). With no
+/// `OwnCache`, the other thread's reads push the applied entry out ("the applied bytes again",
+/// `left: (1, 1)`, `right: (0, 0)`).
 #[test]
 fn cached_admin_verifies_an_unchanged_held_vault_once() {
     const ASKS: usize = 8;
+    let _own = super::super::chain_cache::OwnCache::new();
     let root = aterm_tempfile::tempdir().unwrap();
     let (paths, _) = founded(root.path());
     let held = || {
@@ -301,6 +305,18 @@ fn cached_admin_verifies_an_unchanged_held_vault_once() {
         "refused at every ask from the one check"
     );
     assert_eq!(rewritten.signature_checks(), 1);
+
+    // Another thread reads more vault files than the process's cache keeps, as other tests of
+    // this binary do: none of its entries is this thread's.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for n in 0..=super::super::chain_cache::MAX_ENTRIES {
+                let other = paths.cache_file().with_file_name(format!("other-{n}"));
+                crate::fsx::write_atomic(&other, format!("other {n}").as_bytes(), 0o600).unwrap();
+                assert!(super::super::chain_cache::held(&other).unwrap().is_some());
+            }
+        });
+    });
 
     // The applied bytes renamed back: another file, the same bytes, so the same entry.
     crate::fsx::write_atomic(&paths.cache_file(), applied.bytes(), 0o600).unwrap();

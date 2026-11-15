@@ -45,6 +45,7 @@ fn constant(model: &Model, name: &str) -> i64 {
 
 fn record() -> SessionRecord {
     SessionRecord {
+        pinned: false,
         local_id: 1,
         sid: "s-0001".to_string(),
         parent: None,

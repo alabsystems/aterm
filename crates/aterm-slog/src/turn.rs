@@ -2516,11 +2516,21 @@ pub enum TxEvent<'a> {
         /// The notice's wall.
         kind: WallKind,
     },
-    /// `n` rows the glue could not hand on (an over-long line, a restart's gap): counted `dropped=` (S23, S27: never a ring loss).
+    /// `n` facts of the row at its position the glue could not hand on (a row it could not parse,
+    /// an over-long line, a part whose id is no id, a row of the run's own dated below the
+    /// adoption, which the join never places): counted `dropped=` (S23, S27: never a ring loss).
+    /// It is a row: past the watermark it counts and moves the watermark past it, so a fold
+    /// re-armed from the watermark (a seamless update, a tap bound again) never counts it again;
+    /// at or below it, it is a re-read and counts nothing.
     Lost {
         /// How many.
         n: u64,
     },
+    /// The glue's fold latched off on the row at its position (a row it could not read; it reads
+    /// none of that file's after it): that row is lost, counted `dropped=` once per position,
+    /// with `state=off`. A re-read of the same row (a fold re-armed from the join's watermark by
+    /// a seamless update, a tap that binds again after a stale read) counts nothing more.
+    Off,
     /// The glue's queue overflowed by `n`.
     Overflow {
         /// How many.
@@ -2535,8 +2545,13 @@ pub enum TxEvent<'a> {
 pub struct TxView {
     /// The watermark.
     pub through: Option<TxMark>,
-    /// The floor (wall ms): the latest of the bound process's start and the adoption; the run's open is added at each read.
+    /// The floor (wall ms): the bound process's start; the run's open is added at each read. A
+    /// row older than it is history.
     pub floor_ms: u64,
+    /// The adoption (wall ms; 0 for a join no update carried): the join never places a row older
+    /// than it, so a row of the run's own (at or past the floor) dated below it and past the
+    /// watermark, written after the predecessor's last read, is lost.
+    pub adopted_ms: u64,
     /// The running vendor turn's id.
     pub vref: Option<ShortId>,
     /// The log turn it maps to (open or closed).
@@ -2555,6 +2570,9 @@ pub struct TxView {
     pub dropped: u64,
     /// A loss counted that no `source` mark said yet ([`TxEvent::Flush`]).
     pub unsaid: bool,
+    /// Its reader stopped since the last transcript fact ([`TurnTracker::tx_stopped`]): no row
+    /// reaches the join until its reader reads again.
+    pub stopped: bool,
     /// The running vendor turn's prompt time (wall ms; 0 when not known, a carry from before it was carried).
     pub prompt_ms: u64,
     /// The wall time of the newest row it applied (0 before one, and after a carry): a source's
@@ -2580,7 +2598,11 @@ struct VTurn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TxJoin {
     through: Option<TxMark>,
+    /// The bound process's start (wall ms): older rows are history.
     floor_ms: u64,
+    /// The adoption (wall ms; 0: none, never carried): a row of the run's own past the
+    /// watermark and dated below it is lost ([`TxView::adopted_ms`]).
+    adopted_ms: u64,
     cur: Option<VTurn>,
     interrupt: Option<VendorInterrupt>,
     /// Transcript steps by call id: open, or closed by their turn's cascade
@@ -2590,6 +2612,11 @@ struct TxJoin {
     refuted: Option<WallKind>,
     desync: bool,
     dropped: u64,
+    /// The row the newest [`TxEvent::Off`] it counted latched on: an `Off` at the same position
+    /// is a re-read of that row, never another lost one. Carried as its offset in the
+    /// watermark's file (`tx_loff=`), the only file a re-armed fold reads it again in; a carry
+    /// without it counted none.
+    latched: Option<TxMark>,
     /// `dropped` moved since a `source` mark last said it.
     unsaid: bool,
     /// Rebuild `tools` from the log at the next read (an adoption).
@@ -2608,6 +2635,7 @@ impl TxJoin {
         TxJoin {
             through: None,
             floor_ms: 0,
+            adopted_ms: 0,
             cur: None,
             interrupt: None,
             tools: Vec::new(),
@@ -2615,6 +2643,7 @@ impl TxJoin {
             refuted: None,
             desync: false,
             dropped: 0,
+            latched: None,
             unsaid: false,
             rebuild: false,
             stopped: false,
@@ -2663,6 +2692,14 @@ impl TxJoin {
         if self.dropped > 0 {
             s.push_str(&format!(" tx_dr={}", self.dropped));
         }
+        // Only a latch in the watermark's file can be read again (a fold re-armed from the
+        // watermark reads that file from it), so the carry says its offset alone, in that file.
+        if let Some(l) = self
+            .latched
+            .filter(|l| self.through.is_some_and(|m| m.fp == l.fp && m.id == l.id))
+        {
+            s.push_str(&format!(" tx_loff={}", l.off));
+        }
         if self.unsaid {
             s.push_str(" tx_du=1");
         }
@@ -2701,7 +2738,8 @@ impl TxJoin {
         });
         TxJoin {
             through,
-            floor_ms: now.wall_ms,
+            floor_ms: 0,
+            adopted_ms: now.wall_ms,
             cur: cur.filter(|_| through.is_some()),
             interrupt: None,
             tools: Vec::new(),
@@ -2709,6 +2747,12 @@ impl TxJoin {
             refuted: get("tx_ref").and_then(WallKind::from_name),
             desync: get("tx_ds") == Some("1"),
             dropped: get("tx_dr").and_then(dec).unwrap_or(0),
+            latched: through.and_then(|m| {
+                Some(TxMark {
+                    off: get("tx_loff").and_then(dec)?,
+                    ..m
+                })
+            }),
             unsaid: get("tx_du") == Some("1"),
             rebuild: true,
             stopped: false,
@@ -2777,6 +2821,7 @@ impl TurnTracker {
         TxView {
             through: self.tx.through,
             floor_ms: self.tx.floor_ms,
+            adopted_ms: self.tx.adopted_ms,
             vref: self.tx.cur.map(|v| v.vref),
             mapped: self.tx.cur.and_then(|v| v.node),
             ended: self.tx.cur.is_some_and(|v| v.end_ms.is_some()),
@@ -2786,6 +2831,7 @@ impl TurnTracker {
             desync: self.tx.desync,
             dropped: self.tx.dropped,
             unsaid: self.tx.unsaid,
+            stopped: self.tx.stopped,
             prompt_ms: self.tx.cur.map_or(0, |v| v.at_ms),
             read_ms: self.tx.read_ms,
         }
@@ -2813,12 +2859,12 @@ impl TurnTracker {
             self.bind(log, pos, len, floor_ms, state, now);
             return self.wake_at();
         }
-        if matches!(ev, TxEvent::Lost { .. } | TxEvent::Overflow { .. }) {
+        if matches!(ev, TxEvent::Overflow { .. }) {
             self.invalidate_vendor_interrupt();
         }
         let row = !matches!(
             ev,
-            TxEvent::Wall { .. } | TxEvent::Lost { .. } | TxEvent::Overflow { .. } | TxEvent::Flush
+            TxEvent::Wall { .. } | TxEvent::Off | TxEvent::Overflow { .. } | TxEvent::Flush
         );
         if self.tx.through.is_none() {
             return self.wake_at();
@@ -2828,13 +2874,35 @@ impl TurnTracker {
                 return self.wake_at();
             }
             self.tx.through = Some(TxMark::of(pos));
+            // A lost row counts whatever its date (a row it could not parse has none). Any other
+            // older than the bound process or the run is history; one of the run's own dated
+            // below the adoption was written after the predecessor's last read and is one the
+            // join never places, so it is lost and the join says it is short of rows (each such
+            // fact counts here; the glue's fold counts the row once itself and hands on only
+            // its `Lost`).
             let run_t = log.open_entry(self.run).map_or(0, |e| e.t);
-            if pos.wall_ms < self.tx.floor_ms.max(run_t) {
+            if !matches!(ev, TxEvent::Lost { .. }) && pos.wall_ms < self.tx.floor_ms.max(run_t) {
+                return self.wake_at();
+            }
+            if !matches!(ev, TxEvent::Lost { .. }) && pos.wall_ms < self.tx.adopted_ms {
+                self.tx.lose(1);
+                self.invalidate_vendor_interrupt();
                 return self.wake_at();
             }
         }
         match ev {
-            TxEvent::Lost { n } => self.tx.lose(n),
+            TxEvent::Lost { n } => {
+                self.tx.lose(n);
+                self.invalidate_vendor_interrupt();
+            }
+            TxEvent::Off => {
+                let at = TxMark::of(pos);
+                if self.tx.latched != Some(at) {
+                    self.tx.latched = Some(at);
+                    self.tx.lose(1);
+                    self.invalidate_vendor_interrupt();
+                }
+            }
             TxEvent::Overflow { n } => {
                 self.tx.lose(n);
                 self.tx.desync = true;
@@ -2861,6 +2929,7 @@ impl TurnTracker {
         match ev {
             TxEvent::Bind { .. }
             | TxEvent::Lost { .. }
+            | TxEvent::Off
             | TxEvent::Overflow { .. }
             | TxEvent::Flush => {}
             TxEvent::Prompt { vref } => {
@@ -2917,7 +2986,20 @@ impl TurnTracker {
             .through
             .is_some_and(|m| m.fp == pos.fp && m.id == pos.id && m.off <= len);
         if kept {
-            self.say_state(log, state, None, now);
+            // A fold re-armed on the file whose row it latched off on, that row past the
+            // watermark: it reaches that row again before any other (the rows before it are
+            // applied), so the join stays `state=off` rather than saying a state it is about to
+            // take back. A build that reads the row says its state with the row.
+            let relatch = self.tx.state == Some(TxState::Off)
+                && self.tx.latched.is_some_and(|l| {
+                    l.fp == pos.fp
+                        && l.id == pos.id
+                        && l.off <= len
+                        && self.tx.through.is_some_and(|m| l.off > m.off)
+                });
+            if !relatch {
+                self.say_state(log, state, None, now);
+            }
             return;
         }
         if self.tx.through.is_some() {

@@ -58,8 +58,13 @@ pub struct WindowSeen {
     pub figure: Option<Figure>,
     /// Original time, Mac and source of the quota reading retained with this window.
     pub read: Option<(i64, Mac, String)>,
+    /// The Commons uuid (32 hex) of the Mac that made [`Self::read`]: whether it is this Mac's
+    /// own ([`Seen::me`]) is told by it, never by a name.
+    pub reader: Option<String>,
     /// A wall standing at the read, until when.
     pub wall_until: Option<Option<i64>>,
+    /// When the standing wall was seen, the Mac that saw it, and that Mac's Commons uuid.
+    pub wall_by: Option<(i64, Mac, String)>,
 }
 
 impl WindowSeen {
@@ -123,6 +128,10 @@ pub struct Seen {
     pub accounts: BTreeMap<String, AccountSeen>,
     /// When it was read (Unix seconds).
     pub at: i64,
+    /// This Mac's own Commons uuids (32 hex): its seat's, the seats it succeeded and each the
+    /// registry binds to this machine. A fact one of them made is this Mac's own, which its own
+    /// records already hold, and never a peer's ([`bound_of`]).
+    pub me: std::collections::BTreeSet<String>,
 }
 
 /// What gives the harness its [`Seen`]: the `aterm` executable's cache.
@@ -343,6 +352,166 @@ pub fn lines(account: &AccountSeen, now: i64) -> Vec<String> {
     }
     out.extend(account.windows.iter().map(|w| window_line(w, now)));
     out
+}
+
+/// How far ahead of this Mac's clock a peer's reading may be dated and still be admitted
+/// ([`bound_of`]): the clock-skew bound the claims ring reads a Mac's clock as split past.
+pub const BOUND_AHEAD_S: i64 = 900;
+
+/// How far past a whole window from now a peer's reset may lie and still name the window now
+/// ([`bound_of`]): the skew bound plus the coarsest a reset is read to (an hour, "Resets 1pm").
+pub const BOUND_RESET_SLACK_S: i64 = 3_600;
+
+/// The journal's word of the five-hour window.
+pub const FIVE: &str = "5h";
+
+/// What a peer's evidence admits of one window, for display beside a row whose own reading is
+/// unknown or whose reset passed ([`bound_of`]). A peer's reading is evidence the account was
+/// used, never that it has room: a figure is a lower bound of use until its reset, since any Mac
+/// may have spent the window since. Nothing here enters the accounts state, a pick, a launch, an
+/// advice or a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Bound {
+    /// At least `pct_x10` tenths used until `reset`, read at `read` (never after the read's own
+    /// instant) on `by` from `src`.
+    Used {
+        pct_x10: u16,
+        reset: i64,
+        read: i64,
+        by: Mac,
+        src: String,
+    },
+    /// `by` saw the window at its limit at `read`, standing until `until`.
+    Wall { until: i64, read: i64, by: Mac },
+}
+
+impl Bound {
+    /// The instant the bound holds to: the reading's reset, or the wall's end.
+    #[must_use]
+    pub const fn until(&self) -> i64 {
+        match self {
+            Bound::Used { reset, .. } => *reset,
+            Bound::Wall { until, .. } => *until,
+        }
+    }
+
+    /// The tenths used it bounds: the reading's figure, a whole window for a wall.
+    #[must_use]
+    pub const fn used_x10(&self) -> u16 {
+        match self {
+            Bound::Used { pct_x10, .. } => *pct_x10,
+            Bound::Wall { .. } => 1000,
+        }
+    }
+}
+
+/// A peer's bound of an account's week and five-hour window ([`bounds_of`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bounds {
+    /// The week's (`7d`).
+    pub week: Option<Bound>,
+    /// The five-hour window's (`5h`).
+    pub five: Option<Bound>,
+}
+
+/// The display bound one journal window admits at `now` (`me`: this Mac's own Commons uuids,
+/// [`Seen::me`]), or none. Admitted only for the account's own (never a workspace's) week or
+/// five-hour window, made by a Mac that is not this one (told by its raw uuid; a fact with no
+/// uuid is not admitted), dated at most [`BOUND_AHEAD_S`] ahead (and said as of now at the
+/// latest): a standing wall whose end is known and ahead, else a figure of use whose reset is
+/// known and ahead; either at most a window and [`BOUND_RESET_SLACK_S`] from now (a reset read
+/// to the hour and rolled a day on names no window now). An unread reset, an unknown reset and a
+/// wall with no end admit nothing.
+#[must_use]
+pub fn bound_of(
+    window: &WindowSeen,
+    me: &std::collections::BTreeSet<String>,
+    now: i64,
+) -> Option<Bound> {
+    let length = match window.window.as_str() {
+        WEEK => super::accounts::WEEK_WINDOW_S,
+        FIVE => super::accounts::SESSION_WINDOW_S,
+        _ => return None,
+    };
+    if window.sub.is_some() {
+        return None;
+    }
+    let peer = |uuid: &str| !me.contains(uuid);
+    let dated = |t: i64| (t <= now.saturating_add(BOUND_AHEAD_S)).then_some(t.min(now));
+    let latest = now
+        .saturating_add(length)
+        .saturating_add(BOUND_RESET_SLACK_S);
+    let ahead = |end: i64| now < end && end <= latest;
+    let wall = window.wall_by.as_ref().and_then(|(t, by, uuid)| {
+        let until = window.wall_until.flatten().filter(|until| ahead(*until))?;
+        peer(uuid).then_some(())?;
+        Some(Bound::Wall {
+            until,
+            read: dated(*t)?,
+            by: by.clone(),
+        })
+    });
+    if wall.is_some() {
+        return wall;
+    }
+    let Some(Figure::Used {
+        pct_x10,
+        reset: Some(reset),
+    }) = window.figure
+    else {
+        return None;
+    };
+    let (t, by, src) = window.read.as_ref()?;
+    peer(window.reader.as_deref()?).then_some(())?;
+    ahead(reset).then_some(())?;
+    Some(Bound::Used {
+        pct_x10,
+        reset,
+        read: dated(*t)?,
+        by: by.clone(),
+        src: src.clone(),
+    })
+}
+
+/// The display bounds of one account's week and five-hour window at `now` ([`bound_of`]).
+#[must_use]
+pub fn bounds_of(
+    account: &AccountSeen,
+    me: &std::collections::BTreeSet<String>,
+    now: i64,
+) -> Bounds {
+    let of = |word: &str| {
+        account
+            .windows
+            .iter()
+            .filter(|w| w.window == word)
+            .find_map(|w| bound_of(w, me, now))
+    };
+    Bounds {
+        week: of(WEEK),
+        five: of(FIVE),
+    }
+}
+
+/// Each roster row's display bounds at `now` from the journal snapshot `seen`, by its label: a
+/// row the journal admits nothing of is left out. A pure function of what the snapshot holds; the
+/// outlook and the card show what it gives, and no decision reads it.
+#[must_use]
+pub fn bounds(
+    cli: super::accounts::Cli,
+    roster: &super::accounts::Roster,
+    seen: &Seen,
+    now: i64,
+) -> BTreeMap<String, Bounds> {
+    roster
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let account = seen.accounts.get(&row_key(cli, row)?)?;
+            let bounds = bounds_of(account, &seen.me, now);
+            (bounds != Bounds::default()).then(|| (row.label.clone(), bounds))
+        })
+        .collect()
 }
 
 /// The current row's canonical claims key. Historical label state and registry alias matches

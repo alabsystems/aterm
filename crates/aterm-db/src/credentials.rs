@@ -799,6 +799,11 @@ impl Book {
                         "offer" if thread.offers.contains(&entry.actor) => {
                             inert(entry.id, "a second offer from one holder");
                         }
+                        // No Mac holds a copy of a want with a producer to give: an offer of one
+                        // moves no requester and starts no custodian's handoff.
+                        "offer" if thread.want.producer().is_some() => {
+                            inert(entry.id, "a want with a producer takes no offer");
+                        }
                         "offer" => thread.offers.push(entry.actor),
                         _ if !by_requester => inert(entry.id, "only the requester writes this"),
                         "fulfilled" if thread.fulfilled.is_some() => {
@@ -923,9 +928,9 @@ impl Book {
                         Reason::Declined => (!by_requester && !attested)
                             .then_some("a decline from a Mac that is neither the requester nor a custodian"),
                         Reason::NeverStored | Reason::NeverCopied => {
-                            thread.want.catalog_retirement().is_none().then_some(
-                                "the catalog gives this reason to no posted want",
-                            )
+                            (thread.want.catalog_retirement().map(|(given, _)| given)
+                                != Some(reason))
+                            .then_some("the catalog gives this want no such reason")
                         }
                         Reason::NotAuthorized => (context.policy.allows(&thread.want)
                             || evidence
@@ -965,16 +970,19 @@ impl Book {
         }
         // At most one live request per requester, want and purpose (the need ledger's own
         // identity, so two consumers of one want each hear their answer), and 16 live per
-        // requester.
+        // requester in each pool ([`need::pool`]), so the requests that wait on a producer for
+        // as long as a person takes never hold back the rest.
         let mut order: Vec<&Thread> = threads.values().collect();
         order.sort_unstable_by_key(|thread| (thread.requester, thread.sequence));
-        let mut live: BTreeMap<Actor, Vec<(&Want, Purpose)>> = BTreeMap::new();
+        let mut live: BTreeMap<(Actor, usize), Vec<(&Want, Purpose)>> = BTreeMap::new();
         let mut dropped = Vec::new();
         for thread in order {
             if thread.ended() {
                 continue;
             }
-            let mine = live.entry(thread.requester).or_default();
+            let mine = live
+                .entry((thread.requester, need::pool(&thread.want)))
+                .or_default();
             let identity = (&thread.want, thread.purpose);
             if mine.contains(&identity) {
                 dropped.push((
@@ -986,7 +994,7 @@ impl Book {
                 dropped.push((
                     thread.id,
                     thread.operation,
-                    "past 16 live requests from one Mac",
+                    "past 16 live requests in one pool from one Mac",
                 ));
             } else {
                 mine.push(identity);
@@ -1254,13 +1262,14 @@ fn decision_for(thread: &Thread, need: &Need) -> Option<Decision> {
     (!thread.offers.is_empty() && need.state == State::Open).then_some(Decision::Offered)
 }
 
-/// The holder's probe (§7.3): the one compiled path the want resolves to under this Mac's
-/// home holds a file. It stats the path and never reads it.
+/// The holder's probe (§7.3): a holder has a copy the vault lacks only as one exact component of
+/// its authenticated registered mailbox source. A value this Mac's store holds is the vault's own,
+/// which the custodian copies to the requester itself and never takes an offer of
+/// (`handoff::Round::candidate`), so it is offered by no holder; any other copy is given by hand
+/// (`aterm secrets need give`, [`give_from`]). Nothing under `~/.secrets` is consulted.
 fn holds(paths: &Paths, want: &Want) -> bool {
-    want.hold_path(&paths.home).is_some_and(|path| {
-        aterm_secrets::fsx::has_private_nonempty(&path, need::transfer::MAX_VALUE)
-    }) || matches!(want, Want::MailboxComponent(component)
-            if client::mailbox_component_held(paths, *component).unwrap_or(false))
+    matches!(want, Want::MailboxComponent(component)
+        if client::mailbox_component_held(paths, *component).unwrap_or(false))
 }
 
 /// One member's pass over `credentials/requests/1` (§9.1, §9.2): post this Mac's needs, take
@@ -1301,13 +1310,17 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
             writer,
             ..Pass::default()
         };
-        // A request past the 16 live per Mac would be inert and wait for good: it stays in the
-        // ledger until one of this Mac's live requests ends.
-        let mut open = book
+        // A request past the 16 live per Mac in its pool ([`need::pool`]) would be inert and
+        // wait for good: it stays in the ledger until one of this Mac's live requests in that
+        // pool ends.
+        let mut open = [0_usize; 2];
+        for thread in book
             .threads
             .values()
             .filter(|thread| thread.requester == me && !thread.ended())
-            .count();
+        {
+            open[need::pool(&thread.want)] += 1;
+        }
         for need in &needs {
             let key = request_key(&me, &need.id);
             let thread = book
@@ -1337,14 +1350,15 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 None
             };
             let allowed = need.purpose.asks_the_lab() && context.policy.allows(&need.want);
-            let room = open < need::MAX_OPEN;
+            let pool = need::pool(&need.want);
+            let room = open[pool] < need::MAX_OPEN;
             match (need.state, thread) {
                 (State::Local, None) if writer && allowed && room => {
                     let receipt =
                         request(request_record(&me, need)?)?.commit(session, store, &log)?;
                     moves.push((need.id, Absorb::Flushed(receipt.id.to_vec())));
                     report.posted += 1;
-                    open += 1;
+                    open[pool] += 1;
                 }
                 (State::Open | State::Offered | State::Published, None)
                     if writer && allowed && room && need.posted =>
@@ -1372,7 +1386,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                         },
                     ));
                     report.posted += 1;
-                    open += 1;
+                    open[pool] += 1;
                 }
                 (State::Local, Some(thread)) => {
                     moves.push((need.id, Absorb::Flushed(thread.operation.to_vec())));
@@ -1472,7 +1486,11 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
         if writer {
             let mut covers = Vec::new();
             for thread in book.threads.values() {
-                let unanswered = thread.requester != me
+                // A want with a producer is swept by no member (the model's `Sweep` takes no
+                // `kind` 4): no member holds a copy to offer, and the custodian waits on its
+                // requester, never on sweeps, so a cover of it would spend the pass's covers.
+                let unanswered = thread.want.producer().is_none()
+                    && thread.requester != me
                     && context.members.contains(&thread.requester)
                     && !thread.ended()
                     && thread.published.is_none()
@@ -1533,15 +1551,21 @@ pub struct Given {
 
 /// Answer current requests selected by want or request id. Authorization is resolved before
 /// `read` opens the person's input. A member keeps a private value and posts an Offer; an
-/// admin publishes it immediately. A value never comes from a command-line argument.
+/// admin publishes it immediately. A value never comes from a command-line argument. A want
+/// with a producer ([`Want::producer`]) is never given: a selector that names one, or a request
+/// for one, is refused before anything reads the input.
 ///
 /// # Errors
-/// No permitted request matches, input/validation fails, or retention/publication fails.
+/// No permitted request matches, the selector or a selected request names a want with a
+/// producer, input/validation fails, or retention/publication fails.
 pub fn give_from(
     paths: &Paths,
     selector: &str,
     read: impl FnOnce() -> Result<aterm_secrets::SecretBytes>,
 ) -> Result<Given> {
+    if let Some(why) = Want::give_refusal(selector) {
+        return Err(Error::new(&why));
+    }
     let logical = crate::generation::logical_paths(paths)?;
     let paths = &logical;
     let config = if Paths::live().ok().as_ref() == Some(paths) {
@@ -1603,6 +1627,12 @@ pub fn give_from(
             return Err(Error::new(
                 "give matches no permitted open request retained here",
             ));
+        }
+        if let Some(why) = threads
+            .iter()
+            .find_map(|thread| Want::give_refusal(&thread.want.key()))
+        {
+            return Err(Error::new(&why));
         }
         Ok((scope.trust().network, threads))
     })?;
@@ -1774,7 +1804,8 @@ enum Plan {
 /// `None` elsewhere. For each live request the policy decides first, before anything reads
 /// whether the vault holds the entry. A held entry is copied into the requester's own host
 /// section (matched by the recipient its Commons binding names) and published; one the vault
-/// lacks waits for the sweeps or the want window, then is retired `not-held`. Every decision is
+/// lacks waits for the sweeps or the want window, then is retired `not-held`. A want with a
+/// producer ([`Want::producer`]) is never copied: it waits on that producer. Every decision is
 /// attested. A copy the draft refuses, or a publication that fails, is the failure of the
 /// requests it carries alone ([`Custodian::failed`]): the pass's other decisions are committed
 /// all the same.
@@ -1830,6 +1861,17 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                     thread.id,
                     Reason::Lapsed,
                     "30 days unheard".into(),
+                ));
+                continue;
+            }
+            // Its value lives only in the vault's log, which carries it to every member: the
+            // custodian copies nothing and retires nothing `not-held`; the requester ends it.
+            if let Some(producer) = thread.want.producer() {
+                report.waiting.push((
+                    thread.id,
+                    format!(
+                        "waits on its one producer, {producer}; the vault's log carries it to every member, and its requester ends the request once one is in use there"
+                    ),
                 ));
                 continue;
             }

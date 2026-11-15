@@ -821,7 +821,7 @@ fn a_mac_already_in_the_vault_is_ok_without_a_prompt_or_a_join() {
         assert_eq!(
             rows[0].to.as_deref(),
             Some(
-                "in vault alab (seq 7): 2 secrets in ~/.secrets and 1 elsewhere in ~, kept in sync by the subscriber"
+                "in vault alab (seq 7): 3 secrets in the vault here, kept in sync by the subscriber"
             )
         );
         assert_eq!(asked(&sys), 0);
@@ -850,7 +850,9 @@ fn a_mac_in_the_vault_whose_files_are_not_all_written_is_a_change_that_syncs() {
         assert_eq!(rows[0].outcome, want, "{rows:?}");
         assert_eq!(
             rows[0].from.as_deref(),
-            Some("in vault alab (seq 7), but a file it wrote failed, is missing or was changed")
+            Some(
+                "in vault alab (seq 7), but its local vault copy is incomplete or does not verify"
+            )
         );
         if mode == Mode::Plan {
             assert_eq!(rows[0].to.as_deref(), Some(WRITTEN));
@@ -1103,10 +1105,10 @@ fn configured_settle_rechecks_after_the_real_http_response_before_materializing(
             previous.as_ref(),
         )
         .unwrap();
-        let target = paths.home.join(".secrets/settle-fixture");
-        std::fs::write(&target, b"preserved-local-value").unwrap();
+        // The store this Mac reads in place lost its verified copy: the one local fault a
+        // settle still repairs, now that the vault writes no file under the home.
+        std::fs::remove_file(&cache_file).unwrap();
         let state = std::fs::read(&state_file).unwrap();
-        let cache = std::fs::read(&cache_file).unwrap();
         let ops = Scripted::new(vec![Ok(aterm_secrets::client::status(&paths).unwrap())]);
         *ops.local_home.lock().unwrap() = Some(paths.home.clone());
         ops.subscribed(Ok(installed_state()));
@@ -1160,13 +1162,19 @@ fn configured_settle_rechecks_after_the_real_http_response_before_materializing(
         assert_eq!(*ops.syncs.lock().unwrap(), 1);
         assert!(ops.joins().is_empty());
         if withdraw {
-            assert_eq!(std::fs::read(&target).unwrap(), b"preserved-local-value");
             assert_eq!(std::fs::read(&state_file).unwrap(), state);
-            assert_eq!(std::fs::read(&cache_file).unwrap(), cache);
+            assert!(!cache_file.exists());
         } else {
-            assert_eq!(std::fs::read(&target).unwrap(), b"fixture-value");
+            assert_eq!(
+                aterm_secrets::client::read_in_place(&paths, "settle-fixture")
+                    .unwrap()
+                    .unwrap()
+                    .as_slice(),
+                b"fixture-value"
+            );
             assert!(aterm_secrets::client::materialization_ready(&paths).unwrap());
         }
+        assert!(!paths.home.join(".secrets").exists());
     }
 }
 
@@ -2378,8 +2386,7 @@ fn a_join_that_gave_up_waiting_on_a_mac_the_subscriber_let_in_is_done() {
 
 #[test]
 fn github_waits_for_a_vault_join_that_waits_to_be_let_in() {
-    const PROFILE: &[u8] =
-        b"[github]\naccount='octocat'\nowner='octocat'\ntoken_file='~/.secrets/github'\n";
+    const PROFILE: &[u8] = b"[github]\naccount='octocat'\nowner='octocat'\n";
     const INIT_TOML: &str = "/Users//alice/.config/aterm/init.toml";
     let configured_github = |sys: &Fake| {
         sys.file(INIT_TOML, PROFILE).stat_of(
@@ -2488,9 +2495,8 @@ fn with_git(github: Option<&[u8]>) -> Fake {
 /// `[github]`, GitHub reads its own row, no token on this Mac yet, rather than one blocked on
 /// the vault with no wait to name, and the apply exits 0. A running subscriber still finishes
 /// the join, so GitHub waits for it, and the apply exits 0 too. An init.toml `[github]` that
-/// names a `token_file` reads that file's own step, which says the file is not on this Mac
-/// yet and fails (exit 1); one that names only an account reads the vault's token file, whose
-/// absence blocks the step (exit 1), never a person's step.
+/// names an account reads the vault's token file, whose absence blocks the step (exit 1),
+/// never a person's step.
 /// NEGATIVE CONTROL: GitHub composed after the held vault whatever the subscriber (as it
 /// was) reads Blocked on it with no wait of its own, and the apply exits 1.
 #[test]
@@ -2529,22 +2535,6 @@ fn a_held_waiting_vault_with_its_subscriber_down_leaves_github_its_own_row() {
         "{own:?}"
     );
     assert_eq!(crate::init::apply_status_for_test(&rows), 0, "{rows:?}");
-
-    let rows = applied(
-        State::Absent,
-        None,
-        Some(b"[github]\naccount='octocat'\ntoken_file='~/.secrets/github'\n"),
-    );
-    assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
-    let file = github(&rows);
-    assert_eq!(file.outcome, Outcome::Blocked, "{file:?}");
-    assert_eq!(
-        file.why.as_deref(),
-        Some("the GitHub token file (/Users//alice/.secrets/github) is not on this Mac yet"),
-        "{file:?}"
-    );
-    assert!(file.stood_aside.is_none(), "{file:?}");
-    assert_eq!(crate::init::apply_status_for_test(&rows), 1, "{rows:?}");
 
     let rows = applied(State::Absent, None, Some(b"[github]\naccount='octocat'\n"));
     assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
@@ -2739,7 +2729,7 @@ fn a_pending_mac_needs_an_admin_and_a_revoked_one_is_blocked() {
     assert_eq!(
         rows[0].to.as_deref(),
         Some(
-            "reading the plain text file /Volumes/Keys/vault.txt: 1 secret in ~/.secrets, kept in sync by the subscriber"
+            "reading the plain text file /Volumes/Keys/vault.txt: 1 secret in the vault here, kept in sync by the subscriber"
         )
     );
 }
@@ -2966,14 +2956,21 @@ fn journaled_first(log: &[String]) {
     );
     for change in changes {
         let undone = match change.as_str() {
-            "install" => "aterm secrets agent off",
-            "sync" => "~/.secrets/.replaced",
-            join if join.starts_with("join ") => "source.toml",
-            keep if keep.starts_with("keep ") => "~/.config/aterm/secrets/before-join-",
+            "install" => Some("aterm secrets agent off"),
+            // A sync puts nothing in the home a revert would take back.
+            "sync" => None,
+            join if join.starts_with("join ") => Some("source.toml"),
+            keep if keep.starts_with("keep ") => Some("~/.config/aterm/secrets/before-join-"),
             other => panic!("an unknown change {other}"),
         };
-        assert!(line.contains(undone), "{change} is not undone by {line}");
+        if let Some(undone) = undone {
+            assert!(line.contains(undone), "{change} is not undone by {line}");
+        }
     }
+    assert!(
+        !line.contains("~/.secrets"),
+        "no revert asks anyone to touch ~/.secrets: {line}"
+    );
 }
 
 fn password() -> SecretBytes {
@@ -3149,7 +3146,7 @@ fn the_setup_stage_journals_into_the_accounts_journal() {
         revert.contains("~/.config/aterm/secrets/state.toml"),
         "{revert}"
     );
-    assert!(revert.contains("~/.secrets/.replaced"), "{revert}");
+    assert!(!revert.contains("~/.secrets"), "{revert}");
 }
 
 #[test]
@@ -3781,10 +3778,7 @@ fn a_join_from_another_vault_keeps_it_and_its_line_puts_this_mac_back() {
         )),
         "{line}"
     );
-    assert!(
-        line.contains("rm each file aterm secrets ls names"),
-        "{line}"
-    );
+    assert!(!line.contains("~/.secrets"), "{line}");
     assert!(
         !line.contains("rm ~/.config/aterm/secrets/source.toml"),
         "{line}"
@@ -3880,12 +3874,12 @@ fn an_apply_makes_only_what_the_probe_planned_and_its_line_undoes() {
     *ops.spoiled_by_install.lock().unwrap() = true;
     setup_pass(&ops, source, &mut None, false);
     assert_eq!(ops.changes(), ["install"], "{:?}", ops.log());
-    assert!(!ops.log()[0].contains(".replaced"), "{:?}", ops.log());
+    assert!(!ops.log()[0].contains("~/.secrets"), "{:?}", ops.log());
     *ops.spoiled_by_install.lock().unwrap() = false;
     let row = setup_pass(&ops, source, &mut None, false);
     assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
     assert_eq!(ops.changes(), ["install", "sync"]);
-    assert!(ops.log()[2].contains(".replaced"), "{:?}", ops.log());
+    assert!(!ops.log()[2].contains("~/.secrets"), "{:?}", ops.log());
 }
 
 fn joined_elsewhere() -> Status {
@@ -4673,7 +4667,7 @@ fn aterm_init_keeps_the_persons_sync_off() {
                         let to = row.to.as_deref().expect("Sync off value");
                         assert!(to.ends_with(SYNC_OFF), "{case}: {row:?}");
                         assert!(
-                            !to.contains(" in ~/.secrets") && !to.contains("kept in sync"),
+                            !to.contains(" in the vault here") && !to.contains("kept in sync"),
                             "{case}: no materialization claim: {row:?}"
                         );
                         assert!(ops.changes().is_empty(), "{case}: {:?}", ops.changes());

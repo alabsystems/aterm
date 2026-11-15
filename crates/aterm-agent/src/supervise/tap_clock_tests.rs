@@ -38,7 +38,7 @@ const WEEK: UsageWindow = UsageWindow::SevenDay;
 
 #[test]
 fn each_wall_is_timed_by_its_own_window() {
-    use aterm_phase::{ApiCause, WallKind as K};
+    use alab_policy::vocab::{ApiCause, WallKind as K};
     assert_eq!(
         UsageWindow::of_wall(
             K::UsageSession,
@@ -118,7 +118,7 @@ fn a_full_window_read_since_the_wall_times_it_to_its_reset() {
 fn a_window_is_full_only_where_the_vendors_figure_is_100() {
     let reset = NOW + 3600;
     let vars = crate::harness::tap::TapVars {
-        sid: Some("s-1a".to_string()),
+        sid: Some("t000000001a".to_string()),
         pid: Some("77".to_string()),
         login: None,
         home: None,
@@ -154,7 +154,7 @@ fn a_repeat_written_after_the_walls_first_read_times_it() {
         r#"{{"cost":{{"total_api_duration_ms":900}},"rate_limits":{{"five_hour":{{"used_percentage":100,"resets_at":{reset}}}}}}}"#
     );
     let vars = crate::harness::tap::TapVars {
-        sid: Some("s-1a".to_string()),
+        sid: Some("t000000001a".to_string()),
         pid: Some("77".to_string()),
         login: None,
         home: None,

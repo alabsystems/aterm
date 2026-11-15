@@ -665,11 +665,12 @@ fn the_sidebar_is_one_tab_stop_and_its_arrows_open_pages() {
         &mut lab,
         AppEvent::FocusChanged(Some(key("settings/nav/terminal"))),
     );
+    // Terminal's next Workspace row is This Mac (`NAVIGATION_GROUPS`).
     dispatch(&mut lab, AppEvent::StepFocus(1));
-    assert_eq!(lab.state().route, SettingsRoute::Harness);
+    assert_eq!(lab.state().route, SettingsRoute::Machine);
     assert_eq!(
         lab.state().common.last_focus.as_ref().map(UiKey::as_str),
-        Some("settings/nav/harness"),
+        Some("settings/nav/machine"),
         "the keyboard stays in the sidebar"
     );
 }
@@ -9882,21 +9883,34 @@ fn a_press_in_the_least_view_neither_covers_nor_moves_what_it_pressed() {
 }
 
 /// A STATUS ITS BAR CUTS SAYS WHAT CHANGED FIRST ([`shown_status`]): in a bar of one line a few
-/// words wide (Keyboard & Input in a 164x96 view with 1× text), a switch's status showed the
+/// words wide, a switch's status showed the
 /// start of its name, its outcome out of sight: "Copy on select turned off" read "Copy on", the
 /// opposite of what happened. The bar shows the form of the status that leads with what
 /// changed, "Off: …", reading it all reaches every word of that form, and the status reads whole
 /// to assistive technology.
 #[test]
 fn a_status_its_bar_cuts_says_what_changed_first() {
-    let mut lab = Lab::new("");
-    lab.state_mut().navigate(SettingsRoute::KeyboardInput);
-    let key = UiKey::new("settings/control/predictive_echo_editing");
-    let _ = lab.compile(164.0, 96.0);
-    lab.dispatch(AppEvent::FocusChanged(Some(key)));
-    let _ = lab.compile(164.0, 96.0);
-    lab.commit("settings/set/predictive_echo_editing", None);
-    let after = lab.compile(164.0, 96.0);
+    // The host's UI face decides whether a status fits. Select a bar whose text actually
+    // scrolls, independently of which words lead it; a fully fitting shorter form is no
+    // witness of the clipped-status law.
+    let mut chosen = None;
+    for width in (96_u16..=164).rev().step_by(4) {
+        let width = f32::from(width);
+        let mut lab = Lab::new("");
+        lab.state_mut().navigate(SettingsRoute::KeyboardInput);
+        let key = UiKey::new("settings/control/predictive_echo_editing");
+        let _ = lab.compile(width, 96.0);
+        lab.dispatch(AppEvent::FocusChanged(Some(key)));
+        let _ = lab.compile(width, 96.0);
+        lab.commit("settings/set/predictive_echo_editing", None);
+        let after = lab.compile(width, 96.0);
+        let scrolls = lab.state().status_scroll.borrow().limit > 0.01;
+        if scrolls {
+            chosen = Some((lab, after, width));
+            break;
+        }
+    }
+    let (mut lab, after, width) = chosen.expect("the fixture has a status the bar cannot hold");
     let feedback = lab.state().feedback.clone().unwrap_or_default();
     let name = feedback
         .strip_suffix(" turned off")
@@ -9913,7 +9927,7 @@ fn a_status_its_bar_cuts_says_what_changed_first() {
         read.starts_with("Off") && read != feedback,
         "the bar's words, cut, say what changed first: {read:?}"
     );
-    let every = every_status_line(&mut lab, 164.0, 96.0, "settings/status/visual").join(" ");
+    let every = every_status_line(&mut lab, width, 96.0, "settings/status/visual").join(" ");
     assert_eq!(
         every.replace("- ", ""),
         format!("Off: {name}"),

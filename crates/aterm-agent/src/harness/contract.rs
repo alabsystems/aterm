@@ -111,7 +111,13 @@ pub struct Row {
 /// proven claim (§11 D53): the upgrade lane on `status supervisor_proven=1`, whatever the scope
 /// (`upgrade_drive::self_claimed_by_status`, D29); the relaunch lane and the restart act on a
 /// scope naming `relaunch` (`SupervisorAuthority::builtin_keeps`, and aterm-gui's `restart_act`,
-/// which then sends the harness `restart cause=` in place of a signal). Its tool is `claude-alab`
+/// which then sends the harness `restart cause=` in place of a signal). claude-code-alab's row
+/// also allows the typing duties (`turn-end`, `approvals`, `questions`, `walls`): while a scoped
+/// claim stands, the built-in engine's own typing names its duty and is refused one a proven
+/// claim takes (`SupervisorAuthority::builtin_keeps` again, in `SupervisorInputFence::authorize`),
+/// and in a tab the harness leads the engine types nothing at all (aterm-gui's `agent_act`). HX-07
+/// (`docs/DESIGN-harness-interface-2026-11-12.md` §5) measured that a tab's own process types
+/// under `if-human=` without losing or reordering a person's key. Its tool is `claude-alab`
 /// (D19); the image rule reads the package, never the tool's name. A harness whose agent aterm
 /// supervises joins in the change that teaches the built-in engine to stand down from the scopes
 /// its row allows (§8.3).
@@ -142,7 +148,7 @@ pub const ROSTER: &[Row] = &[
         program: Program::Claude,
         package: "claude-code-alab",
         vendor: "claude",
-        allows: &[Scope::Relaunch, Scope::Upgrade],
+        allows: &Scope::ALL,
     },
 ];
 

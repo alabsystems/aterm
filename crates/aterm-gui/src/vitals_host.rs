@@ -37,6 +37,9 @@ use strip::StripStore;
 #[path = "vitals_assessment.rs"]
 mod assessment;
 
+#[path = "vitals_ownership.rs"]
+mod ownership;
+
 /// A reading a second while a focused window shows the Deck.
 pub(crate) const FOCUSED_PERIOD: Duration = Duration::from_secs(1);
 /// One every five seconds while aterm is in the background.
@@ -88,11 +91,10 @@ pub(crate) const MIN_WINDOW: Duration = Duration::from_millis(250);
 /// Minimum interval between pane-layout checks between readings.
 pub(crate) const LAYOUT_EVERY: Duration = Duration::from_millis(250);
 const JOB_EVENTS_CAP: usize = 256;
-/// How often, at most, the bars' reading reads the split set: each process's coalition and the
-/// split. The coalitions' counters it splits are read at every reading
-/// ([`SplitReader::coalitions`]).
+/// How often the bars refresh signature and timeline details. Every whole reading retains
+/// current process/coalition counters; intervening readings reuse only version-checked details.
 pub(crate) const SPLIT_EVERY: Duration = Duration::from_secs(5);
-/// How often, at most, the bars' reading reads the split set while a lens is open.
+/// How often a lens refreshes signature and timeline details.
 pub(crate) const SPLIT_EVERY_LENS: Duration = Duration::from_secs(1);
 /// The longest window a split reads.
 pub(crate) const SPLIT_WINDOW_MAX: Duration =
@@ -280,6 +282,13 @@ impl std::fmt::Debug for ProcEdge {
 /// The process-wide kernel edge shared by session gathers and [`VitalsHost`].
 pub(crate) static PROC_EDGE: ProcEdge = ProcEdge::new();
 
+/// A forced jobs observation owed since `after`, retried at `retry_at` until a fresh view covers it.
+#[derive(Clone, Copy, Debug)]
+struct JobsOwed {
+    after: Instant,
+    retry_at: Instant,
+}
+
 /// Newest snapshot and job events handed from the probe thread to the loop.
 #[derive(Default)]
 pub(crate) struct Handover {
@@ -418,6 +427,8 @@ pub(crate) struct Request {
     /// Every pane's shell: each terminal session a tab holds is its own root, so a split pane's
     /// processes count in that pane.
     pub(crate) tabs: Vec<TabRoot>,
+    /// Shell generations recorded when each pooled session took its process.
+    pub(crate) shell_identities: Vec<(u64, aterm_pty::ShellIdentity)>,
     /// Those roots' terminal mode words, where read ([`TtyWord`]).
     pub(crate) ttys: Vec<TtyWord>,
     /// Where each of those roots' words is read again ([`Request::reread_words`]).
@@ -832,10 +843,13 @@ pub(crate) struct VitalsHost {
     pub(crate) next_due: Option<Instant>,
     asked_at: Option<Instant>,
     jobs_due: Option<Instant>,
-    /// When a full queue dropped the loop's last windowless ask (`App::serve_windowless_vitals`),
-    /// until an ask is sent, the thread is gone, or a reading begun since makes a new jobs view
-    /// ([`Self::adopt`]): the look it owes is due [`JOBS_FLOOR`] on ([`Self::windowless_due`]).
-    jobs_dropped: Option<Instant>,
+    /// A forced look remains owed through queue acceptance and cached or stalled readings until
+    /// a new jobs view observed since its requirement arrives ([`Self::adopt`]). Each attempt
+    /// moves only its retry, never the observation it requires.
+    jobs_owed: Option<JobsOwed>,
+    /// An external output, process or close edge has not yet been given its required observation
+    /// time. Service stamps it before adopting an in-flight view; retries never raise this flag.
+    jobs_changed: bool,
     delegated_due: Option<Instant>,
     windowed: bool,
     disk_pull: bool,
@@ -919,7 +933,8 @@ impl Default for VitalsHost {
             next_due: None,
             asked_at: None,
             jobs_due: None,
-            jobs_dropped: None,
+            jobs_owed: None,
+            jobs_changed: false,
             delegated_due: None,
             windowed: false,
             disk_pull: false,
@@ -968,6 +983,7 @@ impl VitalsHost {
 
     /// Adopts the thread's newest snapshot if newer than the held one, along with its job events.
     pub(crate) fn adopt(&mut self, now: Instant) -> bool {
+        self.require_changed_jobs(now);
         let (fresh, began, words, events, leases, sampled_at, jobs_continuous) = {
             let mut h = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
             (
@@ -997,13 +1013,14 @@ impl VitalsHost {
                 };
                 if !same {
                     self.adopted_at = Some(now);
-                    // The engine made this view in a reading begun since the dropped ask: the
-                    // look that ask owed.
-                    if began
-                        .zip(self.jobs_dropped)
-                        .is_some_and(|(began, dropped)| began >= dropped)
+                    // Only the actual observation of a new jobs view can discharge a forced
+                    // look. An older in-flight view and a cached reading leave it owed.
+                    if snap.jobs.is_some()
+                        && began
+                            .zip(self.jobs_owed)
+                            .is_some_and(|(began, owed)| began >= owed.after)
                     {
-                        self.jobs_dropped = None;
+                        self.jobs_owed = None;
                     }
                     self.parked = snap
                         .jobs
@@ -1038,17 +1055,18 @@ impl VitalsHost {
     }
 
     fn windowless_due(&self) -> Option<Instant> {
-        let engine = self.snapshot.as_ref().and_then(|snap| {
+        if !self.reader_runs() {
+            return None;
+        }
+        if let Some(owed) = self.jobs_owed {
+            return Some(owed.retry_at);
+        }
+        self.snapshot.as_ref().and_then(|snap| {
             let view = snap.jobs.as_deref()?;
             let after = crate::vitals_jobs::windowless_after(view)
                 .or_else(|| held_wait_after(view, snap.left.as_deref()))?;
             Some(self.adopted_at? + after)
-        });
-        let owed = self.jobs_dropped.map(|at| at + JOBS_FLOOR);
-        match (engine, owed) {
-            (Some(engine), Some(owed)) => Some(engine.min(owed)),
-            (engine, owed) => engine.or(owed),
-        }
+        })
     }
 
     fn windowless_deadline(&self, hidden: Option<Duration>, now: Instant) -> Option<Instant> {
@@ -1068,12 +1086,40 @@ impl VitalsHost {
     /// not, so the leftover pass reads the closed tab's horizon at the exit edge.
     pub(crate) const fn note_tab_closed(&mut self) {
         self.tab_closed = true;
+        self.jobs_changed = true;
     }
 
     /// Marks an output or process-event edge when no window shows the bars.
     pub(crate) const fn note_edge(&mut self) {
         if !self.windowed && self.tx.is_some() {
             self.edge = true;
+            self.jobs_changed = true;
+        }
+    }
+
+    /// Keep the look owed by an external change, or by a timed forced pass. A retry uses the
+    /// existing requirement; a newer external change supersedes it before any old view lands.
+    fn owe_jobs(&mut self, now: Instant, changed: bool) {
+        if !self.reader_runs() {
+            self.jobs_owed = None;
+            self.jobs_due = None;
+            return;
+        }
+        match &mut self.jobs_owed {
+            Some(owed) if changed => owed.after = owed.after.max(now),
+            Some(_) => {}
+            None => {
+                self.jobs_owed = Some(JobsOwed {
+                    after: now,
+                    retry_at: now + JOBS_FLOOR,
+                })
+            }
+        }
+    }
+
+    fn require_changed_jobs(&mut self, now: Instant) {
+        if std::mem::take(&mut self.jobs_changed) {
+            self.owe_jobs(now, true);
         }
     }
 
@@ -1192,6 +1238,10 @@ impl VitalsHost {
         }
         self.assessment_wake = None;
         self.tx = None;
+        self.jobs_owed = None;
+        self.jobs_due = None;
+        self.jobs_changed = false;
+        self.next_due = None;
         if let Some(shared) = self.sys.take() {
             shared.uninstall();
         }
@@ -1239,6 +1289,9 @@ impl VitalsHost {
 
     fn offer(&mut self, msg: Msg) -> bool {
         let Some(tx) = self.tx.as_ref() else {
+            self.jobs_owed = None;
+            self.jobs_due = None;
+            self.next_due = None;
             if let Msg::Read(r) | Msg::Facts(r) = msg {
                 self.pending_gaps.extend(r.note_gaps);
                 self.pending_events.extend(r.note_events);
@@ -1260,6 +1313,9 @@ impl VitalsHost {
                     self.pending_events.extend(r.note_events);
                 }
                 self.tx = None;
+                self.jobs_owed = None;
+                self.jobs_due = None;
+                self.next_due = None;
                 false
             }
         }
@@ -2330,6 +2386,157 @@ impl CoalProbe {
     };
 }
 
+/// How long a reading waits for its process reads ([`ProcsRead::Lane`]): under a pull's own wait
+/// ([`crate::sys_host::PULL_WAIT`]), so a pull is answered from the reading it asked for even
+/// when the sweep does not answer. A sweep reads in tens of ms; one past this is held in the
+/// kernel (a process in the middle of an exec holds every read of it).
+pub(crate) const PROCS_WAIT: Duration = Duration::from_millis(400);
+
+/// The process sweep's reader ([`CoalProbe::sweep`]).
+pub(crate) type SweepFn = fn(
+    aterm_sysprobe::SweepOpts,
+    &mut aterm_sysprobe::coalitions::CoalitionIds,
+) -> Option<aterm_sysprobe::Sweep>;
+
+/// What a reading asks of the process reads: a sweep (none for a machine-only reading) with the
+/// coalition ids it keeps, and the pid lists' counts for real user `uid`.
+pub(crate) struct ProcsAsk {
+    sweep: Option<(SweepFn, aterm_sysprobe::SweepOpts)>,
+    ids: aterm_sysprobe::coalitions::CoalitionIds,
+    uid: u32,
+    ownership: Option<OwnershipAsk>,
+}
+
+struct OwnershipAsk {
+    images: ownership::Images,
+    self_pid: u32,
+    tabs: Vec<TabRoot>,
+    identities: Vec<(u64, aterm_pty::ShellIdentity)>,
+    epoch: Instant,
+}
+
+struct OwnershipAnswer {
+    images: ownership::Images,
+    tabs: Vec<TabRoot>,
+    unproved: Vec<u64>,
+    shared: Vec<aterm_vitals::model::SharedRoot>,
+}
+
+impl OwnershipAsk {
+    fn read(mut self, sweep: &mut aterm_sysprobe::Sweep) -> OwnershipAnswer {
+        let present = sweep.procs.iter().map(|p| p.pid).collect();
+        let unproved =
+            self.images
+                .tab_roots(&mut self.tabs, &self.identities, &present, !sweep.truncated);
+        let mut procs: Vec<_> = sweep
+            .procs
+            .iter()
+            .map(|p| proc_sample(p, self.epoch))
+            .collect();
+        let shared = self.images.roots(self.self_pid, &mut procs, &self.tabs);
+        // Metadata proofs can fill an unread generation. Counters and their read clocks remain
+        // exactly the process sweep's; no ownership callback supplies measurements.
+        for (raw, proved) in sweep.procs.iter_mut().zip(procs) {
+            debug_assert_eq!(raw.pid, proved.pid);
+            raw.start = proved.start;
+            raw.version = proved.version;
+        }
+        OwnershipAnswer {
+            images: self.images,
+            tabs: self.tabs,
+            unproved,
+            shared,
+        }
+    }
+}
+
+/// What the process reads answered.
+pub(crate) struct ProcsAnswer {
+    sweep: Option<aterm_sysprobe::Sweep>,
+    ids: aterm_sysprobe::coalitions::CoalitionIds,
+    /// Every process and this user's, from the pid lists ([`aterm_sysprobe::pid_counts`]).
+    pids: (Option<u64>, Option<u64>),
+    ownership: Option<OwnershipAnswer>,
+}
+
+/// The process reads, wherever they run: the sweep, then the pid counts.
+fn read_procs(ask: ProcsAsk) -> ProcsAnswer {
+    let mut ids = ask.ids;
+    let mut sweep = ask.sweep.and_then(|(sweep, opts)| sweep(opts, &mut ids));
+    let ownership = sweep
+        .as_mut()
+        .zip(ask.ownership)
+        .map(|(sweep, ownership)| ownership.read(sweep));
+    ProcsAnswer {
+        sweep,
+        ids,
+        pids: aterm_sysprobe::pid_counts(ask.uid),
+        ownership,
+    }
+}
+
+/// What a reading's process reads gave ([`Reader::read_procs`]).
+struct ProcReads {
+    /// The sweep, where one was asked and answered.
+    sweep: Option<aterm_sysprobe::Sweep>,
+    /// Every process and this user's, from the pid lists.
+    pids: (Option<u64>, Option<u64>),
+    /// The lanes the reading found stalled.
+    stalled: Vec<aterm_vitals::lanes::LaneStall>,
+    ownership: Option<OwnershipAnswer>,
+}
+
+/// Where a reading's process reads run. Every read of another process can sit in the kernel
+/// for as long as something else takes (a process in the middle of an exec holds the table), so
+/// the probe makes them on a lane ([`aterm_sysprobe::lane`]) and waits [`PROCS_WAIT`] at most:
+/// a reading whose sweep did not answer publishes every other figure, names the lane stalled
+/// and the call it is in, and asks nothing more of the lane until that call returns. A unit
+/// test's reader reads inline, on the reading's thread, where its stand-in readers count.
+pub(crate) enum ProcsRead {
+    /// On the reading's own thread (a unit test's).
+    Inline,
+    /// On a lane, waited for `wait` at most.
+    Lane {
+        lane: aterm_sysprobe::lane::Lane<ProcsAsk, ProcsAnswer>,
+        wait: Duration,
+    },
+}
+
+impl ProcsRead {
+    /// On a lane of the reader's own, waited for `wait` at most.
+    pub(crate) const fn lane(wait: Duration) -> Self {
+        Self::Lane {
+            lane: aterm_sysprobe::lane::Lane::new(aterm_vitals::lanes::PROCS, read_procs),
+            wait,
+        }
+    }
+
+    /// The answer, or the stall that kept it (none where the lane cannot read).
+    fn read(&self, ask: ProcsAsk) -> Result<ProcsAnswer, Option<aterm_sysprobe::lane::Stall>> {
+        match self {
+            Self::Inline => Ok(read_procs(ask)),
+            Self::Lane { lane, wait } => match lane.ask_within(ask, *wait) {
+                aterm_sysprobe::lane::Read::Answered { out, ended, .. } => {
+                    if let Some(ended) = ended {
+                        aterm_log::info!(
+                            "system vitals: the {} lane's {} returned after {} ms",
+                            ended.lane,
+                            ended.call,
+                            ended.for_ms
+                        );
+                    }
+                    Ok(out)
+                }
+                aterm_sysprobe::lane::Read::Stalled(stall) => Err(Some(stall)),
+                aterm_sysprobe::lane::Read::Off(why) => {
+                    aterm_log::warn!("system vitals: the process reads are off: {why}");
+                    Err(None)
+                }
+            },
+        }
+    }
+}
+
 /// The network lane's passive kernel readers (`KERNEL` in production, `INERT` for deterministic
 /// unit tests).
 #[derive(Clone, Copy)]
@@ -2410,6 +2617,8 @@ pub(crate) struct SplitReader {
     vouches: bool,
     armed: &'static Arming,
     last: Option<Instant>,
+    /// Most recent whole counter/ownership reading, independently of signature details.
+    last_accounting: Option<Instant>,
     births: IdMap<u32, Birth>,
     /// When [`Self::births`] last read: its own gap clock, since births are
     /// read on every whole reading, split tick or not.
@@ -2454,6 +2663,7 @@ impl SplitReader {
             vouches,
             armed,
             last: None,
+            last_accounting: None,
             births: IdMap::default(),
             births_at: None,
             idents: IdMap::default(),
@@ -2495,7 +2705,7 @@ impl SplitReader {
     fn cold(&self, now: Instant) -> bool {
         self.lane.on()
             && self.armed.armed()
-            && self.last.is_none_or(|t| {
+            && self.last_accounting.is_none_or(|t| {
                 now.saturating_duration_since(t) + SPLIT_COLD_MARGIN > SPLIT_WINDOW_MAX
             })
     }
@@ -2541,12 +2751,13 @@ impl SplitReader {
         sample: &mut Sample,
         read: aterm_sysprobe::coalitions::CoalitionRead,
         now: Instant,
+        details: bool,
     ) {
         if sample.procs.is_none() {
             return;
         }
         if self
-            .last
+            .last_accounting
             .is_some_and(|t| now.saturating_duration_since(t) > SPLIT_WINDOW_MAX)
         {
             self.idents.clear();
@@ -2566,15 +2777,32 @@ impl SplitReader {
             let Some(&(birth, version)) = born.get(&pid) else {
                 continue;
             };
-            let id = self.identity(pid, birth, version, &mut kept);
+            let id = if details {
+                self.identity(pid, birth, version, &mut kept)
+            } else if let Some(cached) = self
+                .idents
+                .remove(&pid)
+                .filter(|cached| cached.birth == birth && Some(cached.version) == version)
+            {
+                let identity = cached.id.clone();
+                kept.insert(pid, cached);
+                identity
+            } else {
+                aterm_sysprobe::identity::Identity::default()
+            };
             sample
                 .leads
                 .push(lead_identity(pid, birth, id, self.vouches));
         }
         self.idents = kept;
         sample.coalitions = Some(coal_sample(read));
-        sample.timeline = self.timeline();
-        self.last = Some(now);
+        self.last_accounting = Some(now);
+        if details {
+            sample.timeline = self.timeline();
+            self.last = Some(now);
+        } else {
+            sample.timeline = self.timeline.clone();
+        }
     }
 
     /// Lead `pid`'s identity (born at `birth`, at pid `version` as this
@@ -2937,6 +3165,7 @@ impl WhyFixture {
 /// The readers and the model: one per thread.
 pub(crate) struct Reader {
     probe: aterm_sysprobe::Probe,
+    ownership: ownership::Images,
     hardware: aterm_sysprobe::cpu_hardware::Probe,
     hardware_read: HardwareProbe,
     /// The queries that arm a pull's CPU Stats ([`HARDWARE_ARMED`]; a unit test's reader has its
@@ -2985,6 +3214,13 @@ pub(crate) struct Reader {
     situation: crate::vitals_situation::SituationReader,
     /// The own-thread D-state census's worker (macOS; inert in a unit test's reader).
     census: crate::vitals_census::CensusLane,
+    /// Where the process reads run: a lane, or a unit test's reading thread.
+    pub(crate) procs: ProcsRead,
+    /// The processes of the last whole sweep that answered: the names a stalled read's pid goes
+    /// by, never read live. The sweep itself goes to the assessment owner.
+    last_procs: Option<Vec<ProcSample>>,
+    /// The stall the last reading named, so its start is journaled once.
+    procs_stalled: Option<i64>,
 }
 
 /// What a reading takes of its tabs before its sweep ([`Request::tab_reads`]): the pass's clock,
@@ -3117,6 +3353,11 @@ impl Reader {
         );
         let mut reader = Self {
             probe: aterm_sysprobe::Probe::new(),
+            ownership: if cfg!(test) {
+                ownership::Images::INERT
+            } else {
+                ownership::Images::NATIVE
+            },
             block: aterm_sysprobe::blockio::BlockReader::new(),
             census: crate::vitals_census::CensusLane::new(cfg!(all(
                 target_os = "macos",
@@ -3205,6 +3446,13 @@ impl Reader {
             } else {
                 crate::vitals_situation::SituationReader::host()
             },
+            procs: if cfg!(test) {
+                ProcsRead::Inline
+            } else {
+                ProcsRead::lane(PROCS_WAIT)
+            },
+            last_procs: None,
+            procs_stalled: None,
         };
         reader.read_scene(fixture);
         reader
@@ -3224,6 +3472,79 @@ impl Reader {
             read,
             at_ns: u64::try_from(middle.as_nanos()).unwrap_or(u64::MAX),
         })
+    }
+
+    /// The process reads `sweep` asks for (none: the pid counts alone), and the lanes this
+    /// reading finds stalled. The kept coalition ids go with the ask and come back with its
+    /// answer; a stalled ask's are lost, and the next sweep keeps them afresh.
+    fn read_procs(
+        &mut self,
+        sweep: Option<aterm_sysprobe::SweepOpts>,
+        req: Option<&Request>,
+    ) -> ProcReads {
+        let ask = ProcsAsk {
+            sweep: sweep.map(|opts| (self.split.probe.sweep, opts)),
+            ids: std::mem::take(&mut self.split.coalition_ids),
+            uid: self.uid.unwrap_or(0),
+            ownership: req.map(|req| OwnershipAsk {
+                images: self.ownership.clone(),
+                self_pid: req.self_pid,
+                tabs: req.tabs.clone(),
+                identities: req.shell_identities.clone(),
+                epoch: self.epoch,
+            }),
+        };
+        let (sweep, pids, procs, ownership) = match self.procs.read(ask) {
+            Ok(answer) => {
+                self.split.coalition_ids = answer.ids;
+                (answer.sweep, answer.pids, None, answer.ownership)
+            }
+            Err(stall) => (None, (None, None), stall, None),
+        };
+        match (procs, self.procs_stalled) {
+            (Some(stall), None) => {
+                aterm_log::info!(
+                    "system vitals: the process sweep is stalled in {} (pid {:?}) since unix ms \
+                     {}: its figures are unknown until it returns",
+                    stall.call,
+                    stall.pid,
+                    stall.since_unix_ms
+                );
+                self.procs_stalled = Some(stall.since_unix_ms);
+            }
+            (None, Some(_)) => self.procs_stalled = None,
+            _ => {}
+        }
+        let stalled = procs
+            .into_iter()
+            .chain(aterm_sysprobe::lane::stalls())
+            .map(|stall| self.lane_stall(stall))
+            .collect();
+        ProcReads {
+            sweep,
+            pids,
+            stalled,
+            ownership,
+        }
+    }
+
+    /// `stall` as the model holds it, its pid named by the last whole sweep that answered.
+    fn lane_stall(&self, stall: aterm_sysprobe::lane::Stall) -> aterm_vitals::lanes::LaneStall {
+        let name = stall.pid.and_then(|pid| {
+            self.last_procs
+                .as_ref()?
+                .iter()
+                .find(|p| p.pid == pid)
+                .map(|p| p.name.clone())
+        });
+        aterm_vitals::lanes::LaneStall {
+            lane: stall.lane,
+            call: stall.call,
+            pid: stall.pid,
+            name,
+            since_unix_ms: stall.since_unix_ms,
+            for_ms: stall.for_ms,
+        }
     }
 
     fn read_scene(&mut self, fixture: Option<WhyFixture>) {
@@ -3278,7 +3599,8 @@ impl Reader {
         self.machine_observed_at = Some(reads.observed_at);
         let now = Instant::now();
         let split = self.split.due(req, now);
-        let live_split = split && !self.fixture.as_ref().is_some_and(WhyFixture::is_recorded);
+        let live_accounting =
+            self.split.lane.on() && !self.fixture.as_ref().is_some_and(WhyFixture::is_recorded);
         // The reading's wall clock, read before the sweep lists the
         // processes: one born at or after it is in no earlier sweep, which is
         // how the reap credit tells a process born since the last reading
@@ -3287,31 +3609,74 @@ impl Reader {
         // Every whole reading reads the pid version of each process whose
         // start it cannot read (another user's), so the births kept for them
         // (`SplitReader::known`) hold from one reading to the next.
-        let sweep = (self.split.probe.sweep)(
-            aterm_sysprobe::SweepOpts {
-                coalitions: live_split,
+        let ProcReads {
+            sweep,
+            pids,
+            stalled,
+            ownership,
+        } = self.read_procs(
+            Some(aterm_sysprobe::SweepOpts {
+                coalitions: live_accounting,
                 versions: true,
-            },
-            &mut self.split.coalition_ids,
+            }),
+            Some(req),
         );
+        let mut checked_req = req.clone();
+        let (unproved_tabs, shared_roots) = if let Some(ownership) = ownership {
+            self.ownership = ownership.images;
+            checked_req.tabs = ownership.tabs;
+            (ownership.unproved, ownership.shared)
+        } else {
+            let unproved = checked_req
+                .tabs
+                .iter_mut()
+                .filter_map(|root| {
+                    if root.shell_pid == 0 {
+                        return None;
+                    }
+                    root.shell_pid = 0;
+                    Some(root.key)
+                })
+                .collect();
+            (unproved, Vec::new())
+        };
+        let req = &checked_req;
         let mut coalitions = self.coalitions();
         let mut sample = self.machine_sample(
             req,
             at_unix_ms,
             sweep.as_ref().map(|sweep| sweep.procs.as_slice()),
+            pids,
         );
+        sample.stalled = stalled;
         sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.machine_only = false;
         if let aterm_vitals::blockage::DStateRead::Census(pass) = &mut sample.dstate {
             *pass = self.census.step(now, self.epoch);
         }
         sample.procs_truncated = sweep.as_ref().is_some_and(|s| s.truncated);
+        sample.unproved_tabs = unproved_tabs;
+        // Native final events use the same cross-process clock. A final whose exit proof is
+        // later than this complete frontend CPU sample belongs to a subsequent reading.
+        let native_cutoff = aterm_vitals::model::NativeCpuCut {
+            continuous_ns: aterm_uds::process::continuous_ns(),
+            boot: aterm_uds::process::boot_clock_now().map(|clock| clock.0),
+        };
+        sample.native_cpu_cut = native_cutoff;
         let observed = sweep
             .as_ref()
-            .map(|sweep| crate::resource_jobs::sample(sweep, &req.session_ids, self.epoch))
+            .map(|sweep| {
+                crate::resource_jobs::sample(sweep, &req.session_ids, self.epoch, native_cutoff)
+            })
             .unwrap_or_default();
         sample.procs = observed.procs;
         sample.delegated = observed.delegated;
+        sample.native_roots = observed.native_roots;
+        sample.native_terminals = observed.native_terminals;
+        sample.native_incomplete = observed.incomplete;
+        sample.native_source_lost = observed.source_lost;
+        sample.unproved_tabs.extend(observed.unproved_tabs);
+        sample.shared_roots = shared_roots;
         if let Some(procs) = sample.procs.as_deref() {
             let (aterm_sockets, tab_sockets) =
                 read_sockets(procs, req.self_pid, &req.tabs, self.net.open_sockets);
@@ -3326,8 +3691,10 @@ impl Reader {
                 complete,
             }
         });
-        if let Some(CoalRead { read, .. }) = coalitions.filter(|_| live_split && sweep.is_some()) {
-            self.split.fill(&mut sample, read, now);
+        if let Some(CoalRead { read, .. }) =
+            coalitions.filter(|_| live_accounting && sweep.is_some())
+        {
+            self.split.fill(&mut sample, read, now, split);
         } else {
             // Every whole reading, a jobs-only edge's too: `sys` answers a
             // pull from whichever whole reading is fresh, so one read without
@@ -3350,7 +3717,17 @@ impl Reader {
                 }
                 fixture.reading(&sample, split)
             });
+        if scene.is_none() {
+            sample.ownership_incomplete =
+                crate::resource_jobs::restore_origins(&mut self.vitals, &req.session_ids);
+        }
         let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
+        if scene.is_none() {
+            crate::resource_jobs::publish_origins(self.vitals.process_origins(), &req.session_ids);
+            if sample.procs.is_some() {
+                crate::resource_jobs::native_model_pending(self.vitals.has_pending_native());
+            }
+        }
         if self.split.lane.on() && snap.coal_lane == CoalLane::Off && scene.is_none() {
             aterm_log::warn!(
                 "system vitals: the coalitions lane is off: a read did not read as the \
@@ -3376,7 +3753,12 @@ impl Reader {
                 .procs
                 .as_ref()
                 .and(snap.aterm.as_ref())
-                .filter(|_| scene.is_none())
+                .filter(|_| {
+                    scene.is_none()
+                        && !sample.native_incomplete
+                        && !sample.ownership_incomplete
+                        && snap.delegated.len() == sample.delegated.len()
+                })
                 .map(|_| snap.delegated.clone()),
         );
         let thrashing = sample.mem.is_some_and(|m| m.pressure == Pressure::Critical);
@@ -3403,14 +3785,19 @@ impl Reader {
             self.vitals.record_strip_event(ev);
         }
         self.watch_jobs(&mut snap);
+        if sample.procs.is_some() {
+            self.last_procs = sample.procs;
+        }
         self.fixture_snapshot(snap)
     }
 
     /// Takes a hidden deck's reading (machine counters alone, no process sweep).
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
         self.machine_observed_at = Some((self.clock)());
+        let ProcReads { pids, stalled, .. } = self.read_procs(None, None);
         let mut coalitions = self.coalitions();
-        let mut sample = self.machine_sample(req, unix_ms_now(), None);
+        let mut sample = self.machine_sample(req, unix_ms_now(), None, pids);
+        sample.stalled = stalled;
         sample.machine_only = true;
         sample.starts = self.split.start_count(coalitions.as_mut(), &self.probe);
         sample.timeline = self.split.timeline();
@@ -3472,13 +3859,15 @@ impl Reader {
     }
 
     /// The machine's counters, stamped `at_unix_ms` on the wall clock; `procs` is the whole
-    /// reading's sweep (`None` for a machine-only reading), which names Windows' compressed
-    /// memory ([`compression_named`]).
+    /// reading's sweep (`None` for a machine-only reading, or where it did not answer), which
+    /// names Windows' compressed memory ([`compression_named`]), and `pids` the process lane's
+    /// pid counts ([`aterm_sysprobe::pid_counts`]). Nothing here reads another process.
     fn machine_sample(
         &mut self,
         req: &Request,
         at_unix_ms: i64,
         procs: Option<&[aterm_sysprobe::ProcessReading]>,
+        pids: (Option<u64>, Option<u64>),
     ) -> Sample {
         let since = self.epoch.elapsed();
         let shelf = &crate::disk_board::SHELF;
@@ -3497,7 +3886,7 @@ impl Reader {
             .map(|links| links.iter().map(link_sample).collect());
         let tcp_sum = (self.net.tcp)(&mut self.scratch);
         let gpu = aterm_sysprobe::gpu();
-        let room = aterm_sysprobe::task_room(self.uid.unwrap_or(0));
+        let room = aterm_sysprobe::task_tables(self.uid.unwrap_or(0)).with_pids(pids.0, pids.1);
         let capacity = aterm_sysprobe::capacity();
         let mut sample = Sample {
             hardware: None,
@@ -3527,9 +3916,18 @@ impl Reader {
                 mount: v.mount.display().to_string(),
             }),
             procs: None,
+            stalled: Vec::new(),
             self_pid: req.self_pid,
             tabs: req.tabs.clone(),
             delegated: Vec::new(),
+            shared_roots: Vec::new(),
+            unproved_tabs: Vec::new(),
+            native_roots: Vec::new(),
+            native_terminals: Vec::new(),
+            native_incomplete: false,
+            native_source_lost: false,
+            native_cpu_cut: Default::default(),
+            ownership_incomplete: false,
             at_unix_ms,
             mono_ms: u64::try_from(since.as_millis()).unwrap_or(u64::MAX),
             cadence_ms: req.cadence_ms,
@@ -4740,10 +5138,14 @@ impl crate::App {
 
     /// The deadline the loop folds for the next reading.
     pub(crate) fn vitals_deadline(&self) -> Option<Instant> {
-        match (self.vitals.next_due, self.vitals.edge_at(Instant::now())) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [
+            self.vitals.next_due,
+            self.vitals.edge_at(Instant::now()),
+            self.vitals.jobs_owed.map(|owed| owed.retry_at),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// A level judged every wake.
@@ -4762,6 +5164,7 @@ impl crate::App {
         if let Some(proxy) = self.proxy.as_ref() {
             self.vitals.ensure_thread(proxy);
         }
+        self.vitals.require_changed_jobs(now);
         let audience = self.vitals_audience();
         // A close's reading stays owed until it is sent: a full queue asks it at the next
         // service.
@@ -4812,7 +5215,11 @@ impl crate::App {
             now,
             wall_ms,
         );
-        if due > now {
+        let jobs_now = self
+            .vitals
+            .jobs_owed
+            .is_some_and(|owed| owed.retry_at <= now);
+        if due > now && !jobs_now {
             self.vitals.next_due = Some(due);
             self.send_layout(now, period, machine_only);
             return;
@@ -4824,7 +5231,7 @@ impl crate::App {
         if self.allocation_visible() {
             self.publish_allocation();
         }
-        self.ask_reading(now, period, machine_only, false);
+        self.ask_reading(now, period, machine_only && !jobs_now, jobs_now);
         if self.tabs_page_shown() && self.harness_screen.fleet_sweep_due(now) {
             self.start_harness_stats_refresh_at(now);
         }
@@ -4853,6 +5260,12 @@ impl crate::App {
         machine_only: bool,
         jobs_now: bool,
     ) -> bool {
+        if jobs_now {
+            self.vitals.owe_jobs(now, false);
+            if let Some(owed) = &mut self.vitals.jobs_owed {
+                owed.retry_at = now + JOBS_FLOOR;
+            }
+        }
         let mut req = self.vitals_request(period, machine_only);
         req.jobs_now = jobs_now;
         req.note_gaps = std::mem::take(&mut self.vitals.pending_gaps);
@@ -4888,9 +5301,10 @@ impl crate::App {
     }
 
     fn serve_windowless_vitals(&mut self, audience: Audience, now: Instant, delegated: bool) {
+        self.vitals.require_changed_jobs(now);
         let was_delegated = std::mem::replace(&mut self.vitals.delegated_active, delegated);
         let was_windowed = std::mem::replace(&mut self.vitals.windowed, false);
-        if was_windowed {
+        if was_windowed || self.vitals.jobs_owed.is_some() || !self.vitals.reader_runs() {
             self.vitals.jobs_due = self.vitals.windowless_due();
         }
         if was_windowed || was_delegated != delegated {
@@ -4910,6 +5324,7 @@ impl crate::App {
             || self.vitals.jobs_due.is_some_and(|due| due <= now)
             || self.vitals.delegated_due.is_some_and(|due| due <= now)
         {
+            self.vitals.owe_jobs(now, pulled || first_job);
             // The engine reads the sweep: a whole reading. Beside a hidden
             // deck it keeps the deck's cadence for the gap rule; with no deck
             // it has none, so it starts a new baseline and draws no rate.
@@ -4930,17 +5345,8 @@ impl crate::App {
             } else {
                 period
             };
-            if self.ask_reading(now, period, false, true) || !self.vitals.reader_runs() {
-                self.vitals.jobs_dropped = None;
-            } else {
-                // The queue was full (a `sys` pull's reading, two more asks behind it). A pull's
-                // reading wakes no one, so ask again at the floor, not at the next edge or look;
-                // the pull's own reading need not have looked (its engine paced, `jobs_now` off),
-                // so the ask stays owed until one begun since makes a new view
-                // (`VitalsHost::adopt`).
-                self.vitals.jobs_dropped = Some(now);
-                self.vitals.jobs_due = Some(now + JOBS_FLOOR);
-            }
+            self.ask_reading(now, period, false, true);
+            self.vitals.jobs_due = self.vitals.windowless_due();
         } else if let Some((period, machine_only)) = hidden
             && due_on_phase(
                 self.vitals.asked_at,
@@ -5576,10 +5982,19 @@ impl crate::App {
             .collect();
         let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
         let grant = self.vitals_grant(&tabs);
+        let shell_identities = tabs
+            .iter()
+            .filter_map(|root| {
+                self.pool
+                    .get(root.key)
+                    .map(|session| (root.key, session.shell_identity))
+            })
+            .collect();
         Request {
             allocation: self.allocation_visible(),
             self_pid: std::process::id(),
             tabs,
+            shell_identities,
             ttys,
             tty_sources,
             feeds,
@@ -5719,3 +6134,7 @@ mod tests;
 #[cfg(test)]
 #[path = "vitals_host_split_tests.rs"]
 mod split_tests;
+
+#[cfg(test)]
+#[path = "vitals_host_lanes_tests.rs"]
+mod lanes_tests;

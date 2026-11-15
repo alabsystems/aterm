@@ -20,6 +20,7 @@ const KEY_SURFACE: &[&str] = &[
     "crates/aterm-update-core/src/roster.rs",
     "crates/aterm-release/src/machines.rs",
     "crates/aterm-release/src/provision.rs",
+    "crates/aterm-secrets/src/paper_master.rs",
     "docs/RELEASE-KEYS.md",
 ];
 

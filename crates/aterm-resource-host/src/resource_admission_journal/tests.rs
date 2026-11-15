@@ -20,6 +20,71 @@ fn faults(journal: &Journal, site: &str) -> Vec<Value> {
         .collect()
 }
 
+/// A journal file is named by its session's tab ID, in either form: a tab opened before the `t`
+/// form keeps its `s-` ID until it closes. NEGATIVE CONTROL: a malformed ID of each form names
+/// no file.
+#[test]
+fn a_journal_file_is_named_by_a_tab_id_in_either_form() {
+    let named = |session: &str| {
+        name(&Binding {
+            session: session.into(),
+            attempt: [0xab; 16],
+        })
+    };
+    let attempt = "ab".repeat(16);
+    for session in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        assert_eq!(named(session).unwrap(), format!("{session}.{attempt}.json"));
+    }
+    for session in [
+        "tqn5r6e014",
+        "tqn5r6e014u",
+        "TQN5R6E0148",
+        "s-0123456789abcdef012",
+        "s-0123456789ABCDEF0123",
+        "s-",
+        "",
+    ] {
+        assert!(named(session).is_err(), "CONTROL: {session:?}");
+    }
+}
+
+#[test]
+fn materialization_workspaces_include_the_session_in_the_original_binding() {
+    let world = World::new();
+    let first = Binding {
+        session: "t0000000001".into(),
+        attempt: [21; 16],
+    };
+    let second = Binding {
+        session: "t0000000002".into(),
+        attempt: first.attempt,
+    };
+    let deadline = crate::fixture_wait::deadline(Instant::now());
+    let a = world
+        .journal
+        .materialization_workspace(&first, [31; 16], deadline)
+        .unwrap();
+    let b = world
+        .journal
+        .materialization_workspace(&second, [31; 16], deadline)
+        .unwrap();
+    assert_ne!(a.path(), b.path());
+    a.check_current().unwrap();
+    b.check_current().unwrap();
+    std::fs::write(a.path().join("session-a"), b"first original").unwrap();
+    assert!(!b.path().join("session-a").exists());
+    assert!(
+        world
+            .journal
+            .materialization_workspace(&first, [31; 16], deadline)
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(a.path().join("session-a")).unwrap(),
+        b"first original"
+    );
+}
+
 #[test]
 fn fault_diagnostics_keep_io_and_condition_causes_without_changing_custody() {
     let world = World::new();
@@ -127,7 +192,7 @@ impl World {
 
     fn binding(&self, attempt: u8) -> Binding {
         Binding {
-            session: "s-acde".into(),
+            session: "s-0000000000000000acde".into(),
             attempt: [attempt; 16],
         }
     }

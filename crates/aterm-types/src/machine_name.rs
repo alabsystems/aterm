@@ -261,15 +261,27 @@ impl Nickname {
     /// The [`Refusal`]: a number shape (`m12`, `m8.2`, `m0`), a node word, eight or more
     /// hex digits alone, a reserved word, or a character or length outside the grammar.
     pub fn parse(word: &str) -> Result<Self, Refusal> {
-        let normalized = word.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut normalized = String::new();
+        let mut characters = 0;
+        for part in word.split_whitespace() {
+            let separator = usize::from(!normalized.is_empty());
+            if normalized.len() + separator + part.len() > Self::MAX_BYTES {
+                return Err(Refusal::TooLong);
+            }
+            characters += separator + part.chars().count();
+            if characters > Self::MAX_CHARS {
+                return Err(Refusal::TooLong);
+            }
+            if separator != 0 {
+                normalized.push(' ');
+            }
+            normalized.push_str(part);
+        }
         let word = normalized.as_str();
         let mut chars = word.chars();
         let Some(first) = chars.next() else {
             return Err(Refusal::Empty);
         };
-        if word.chars().count() > Self::MAX_CHARS || word.len() > Self::MAX_BYTES {
-            return Err(Refusal::TooLong);
-        }
         if word.eq_ignore_ascii_case(UNNUMBERED) {
             return Err(Refusal::Unnumbered);
         }
@@ -292,7 +304,7 @@ impl Nickname {
         if is_reserved(word) {
             return Err(Refusal::Reserved);
         }
-        Ok(Self(word.to_owned()))
+        Ok(Self(normalized))
     }
 
     /// The nickname as it was typed.

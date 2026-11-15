@@ -320,6 +320,6 @@ mod tests {
         let request = request(&[b"-vV"]);
         assert!(request.encode().is_ok());
         assert!(crate::Call::decode(&request.member.encode().unwrap()).is_err());
-        assert!(crate::Call::Member(request.member).encode().is_err());
+        assert!(crate::Call::Member(Box::new(request.member)).encode().is_err());
     }
 }

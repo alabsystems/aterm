@@ -38,6 +38,8 @@ fn a_left_waiting_write_keeps_its_settle_and_its_bases() {
         to: Some(a.clone()),
         bases: BTreeSet::from([Some(entry_digest(&a))]),
         resolve: true,
+        draft: None,
+        guarded: false,
     });
     let log = BTreeMap::from([("shared".to_owned(), a.clone())]);
     let doc = BTreeMap::from([
@@ -59,7 +61,7 @@ fn a_left_waiting_write_keeps_its_settle_and_its_bases() {
         .expect("CONTROL: it is rewritten");
     assert!(write.resolve, "a left settle of a conflict stays one");
     assert!(
-        write.stands_over(Some(&a)) && !write.done(Some(&a), true),
+        write.stands_over(Some(&a), true) && !write.done(Some(&a), true),
         "it stands, not done while the conflict does"
     );
     assert!(
@@ -72,6 +74,8 @@ fn a_left_waiting_write_keeps_its_settle_and_its_bases() {
         to: Some(v1.clone()),
         bases: BTreeSet::from([Some(entry_digest(&v0))]),
         resolve: false,
+        draft: None,
+        guarded: false,
     });
     let text = BTreeMap::from([("shared".to_owned(), v1.clone())]);
     let doc = BTreeMap::from([
@@ -92,7 +96,7 @@ fn a_left_waiting_write_keeps_its_settle_and_its_bases() {
         .get("shared")
         .expect("CONTROL: it is rewritten");
     assert!(
-        write.stands_over(Some(&v0)),
+        write.stands_over(Some(&v0), false),
         "a write over the text's value stands over the log's value its earlier write did"
     );
 }

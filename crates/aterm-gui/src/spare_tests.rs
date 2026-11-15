@@ -1807,9 +1807,12 @@ fn adopted_orphan(
     owned.daemon = Some((pid, birth));
     aterm_uds::deadline::execd(pid, &sleeper);
     assert_eq!(
-        atpkg::caller_shell::process_args(pid as u32)
-            .expect("the exec'd orphan's arguments")
-            .env_var(aterm_types::domain::ENV_PARENT_SESSION_ID),
+        atpkg::caller_shell::parse_procargs2(
+            &aterm_sysprobe::procargs::read(pid as u32)
+                .expect("the exec'd orphan's KERN_PROCARGS2 read"),
+        )
+        .expect("the exec'd orphan's argument record parses")
+        .env_var(aterm_types::domain::ENV_PARENT_SESSION_ID),
         Some(FIXTURE_SID)
     );
     let mut launcher = owned.child.take().expect("the owned launcher");

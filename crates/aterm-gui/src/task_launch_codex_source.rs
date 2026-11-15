@@ -8,7 +8,7 @@ use aterm_agent::harness::{
     cli::Env,
     codex_source_gate::SourceWorkLease,
     codex_source_registry::{Error, LaunchReservation, Registry},
-    worker::{Admitted, WorkerCli},
+    worker::{Admitted, Refused},
 };
 
 pub(super) struct Preparation {
@@ -64,7 +64,14 @@ impl Preparation {
         })
     }
 
-    pub(super) fn arm(&mut self, admitted: Admitted, cli: &WorkerCli) -> Result<Admitted, String> {
+    /// Reserve and arm the native source constructor for `admitted`, or keep a legacy launch
+    /// where its declared source allows one.
+    ///
+    /// # Errors
+    ///
+    /// A [`Refused::Preparation`] naming why the constructor could not be reserved or armed: no
+    /// failure here is a sign-out, so none asks a person to sign in.
+    pub(super) fn arm(&mut self, admitted: Admitted) -> Result<Admitted, Refused> {
         match self
             .registry
             .reserve_worker(&self.env, &self.sid, &admitted, &self.scope)
@@ -76,7 +83,7 @@ impl Preparation {
                 self.reservation
                     .as_ref()
                     .ok_or("Codex constructor is unavailable")?
-                    .arm(admitted, cli, self.env.home.as_deref())
+                    .arm(admitted)
                     .map_err(|_| "Codex source constructor could not be armed".into())
             }
             Err(Error::Unsupported) if legacy_source_allowed(&admitted, &self.env) => {
@@ -114,31 +121,6 @@ impl Preparation {
                 .map_err(|_| "Codex constructor write receipt is unavailable")?;
         }
         Ok(())
-    }
-
-    /// The Rust-only joined fixture launches through spawnfd rather than the
-    /// worker UI. Bind only its actual kernel child to the same reservation;
-    /// this is not evidence that the normal main-thread UI wrote a command.
-    #[cfg(debug_assertions)]
-    pub(super) fn spawned(&mut self, pid: u32) -> Result<(), &'static str> {
-        let process = aterm_agent::harness::native_act::Process::observe(pid)
-            .ok_or("source proof child unavailable")?;
-        let caller = aterm_agent::harness::codex_session_slot::Caller {
-            sid: self.sid.clone(),
-            pid,
-            birth: process.birth,
-        };
-        let reservation = self
-            .reservation
-            .as_ref()
-            .ok_or("source proof reservation unavailable")?;
-        self.registry
-            .reserved_peer(&caller, reservation.token())
-            .map_err(|_| "source proof child does not match its reservation")?;
-        self.typed = true;
-        reservation
-            .mark_typed()
-            .map_err(|_| "source proof spawn receipt unavailable")
     }
 }
 
@@ -188,8 +170,7 @@ pub(super) fn pending_for_drain() -> (
     aterm_agent::harness::account_work::Lifetime,
 ) {
     let (root, mut preparation, admitted, host_registry, lifetime) = tests::fixture();
-    let cli = aterm_agent::harness::worker::worker_cli(aterm_phase::Program::Codex).unwrap();
-    preparation.arm(admitted, cli).unwrap();
+    preparation.arm(admitted).unwrap();
     preparation.typed().unwrap();
     drop(preparation);
     (root, host_registry, lifetime)

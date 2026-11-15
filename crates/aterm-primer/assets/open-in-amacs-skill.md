@@ -29,6 +29,10 @@ amacs --no-wait +3:12 config.toml notes.md   # +LINE[:COL] is for the next FILE 
   `the aterm window did not open it (…)` on stderr first: a file under a cloud-storage folder
   is refused (`refused file-provider`), and a sandboxed tool shell that cannot reach the control
   socket gets `no aterm window could be asked`. Give the person the path then.
+- One refusal never falls back: while another aterm process is writing the file's draft,
+  amacs exits 1, having opened nothing (a terminal editor beside that writer would split the
+  draft). The window tries for about five seconds, then answers `ERR busy drafts (…)` and
+  amacs says `run amacs again` on stderr. Run it again.
 - Each run opens another Editor tab, even of a file already open: to wait on the one open, use
   `await edit uri=` below rather than running amacs on it again.
 - A FILE that does not exist yet opens empty and its first save creates it. To have the person
@@ -40,9 +44,9 @@ amacs --no-wait +3:12 config.toml notes.md   # +LINE[:COL] is for the next FILE 
 ## Wait until they close it
 
 - `amacs --wait +7 accounts.csv` returns once the tab is closed (several FILEs open one after
-  another): exit 0 closed, 1 abandoned (C-c C-k) or failed, 2 not opened (above), 130
-  interrupted (the tab stays open), 75 the aterm serving it went away. It takes as long as the
-  person does and has no timeout, so run it as a background command.
+  another): exit 0 closed, 1 abandoned (C-c C-k), failed or a busy draft (above), 2 not opened
+  (above), 130 interrupted (the tab stays open), 75 the aterm serving it went away. It takes as
+  long as the person does and has no timeout, so run it as a background command.
 - After `--no-wait`, `aterm ctl @self await edit uri=file:///abs/accounts.csv
   timeout=600000` answers `OK edit done result=<finished|closed|aborted> saved=<0|1> seq=<n>`
   when they are done, or `OK timeout` (exit 124) once its `timeout=` passes (an hour without

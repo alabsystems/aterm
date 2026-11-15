@@ -1862,6 +1862,52 @@ fn commands_publish_reopen_and_report_signed_provenance() {
     assert!(declarations[0]["authored_ms"].as_u64().is_some());
 }
 
+/// `commons-open` declares the registry's generations builds up to 0.200.0 read and refuses the
+/// one whose secret cells name store entries: a declaration is this Mac's word that it reads
+/// the table, which a roll's seal stops waiting on.
+/// NEGATIVE CONTROL: with the `names_store` guard removed from `commons-open`, the third
+/// generation is declared: `` called `Result::unwrap_err()` on an `Ok` value ``.
+#[test]
+fn commons_open_declares_no_table_whose_secret_cells_name_store_entries() {
+    use crate::alab::registry::{APPLICATION, GENERATIONS};
+    let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+    let config = lab.paths[0].home.join("config");
+    let open = |role: &'static str| {
+        run_at(
+            "commons-open",
+            &mut BTreeMap::from([("--application", APPLICATION), ("--role", role)]),
+            &lab.paths[0],
+            &config,
+        )
+    };
+    let mut refused = 0;
+    for table in GENERATIONS {
+        if table.names_store() {
+            let why = open(table.role).unwrap_err().to_string();
+            assert!(why.contains("secret-store"), "{why}");
+            refused += 1;
+        } else {
+            open(table.role).unwrap();
+        }
+    }
+    assert_eq!(refused, 1, "control: one generation names store entries");
+    let listing = run_at(
+        "commons-tables",
+        &mut BTreeMap::new(),
+        &lab.paths[0],
+        &config,
+    )
+    .unwrap();
+    let declared: Vec<&str> = listing["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|table| table["declarations"].as_array().unwrap())
+        .filter_map(|declaration| declaration["role"].as_str())
+        .collect();
+    assert_eq!(declared.len(), GENERATIONS.len() - 1, "{listing}");
+}
+
 #[test]
 fn commons_status_reports_membership_inactive_when_superseded_by_another_recipient_seat_in_log() {
     use aterm_secrets::{

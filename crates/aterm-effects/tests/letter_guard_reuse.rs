@@ -296,12 +296,32 @@ fn run_switched(
     frames
 }
 
+/// A test whose scenes were chosen on this host's raster (CoreText on macOS, the hinted portable
+/// rasterizer elsewhere) could not run where `ATERM_RASTERIZER` pins the unhinted one: the
+/// developer chose letters its scenes were not chosen on.
+fn on_the_hosts_raster() {
+    if std::env::var_os("ATERM_RASTERIZER").is_some_and(|v| v == "portable" || v == "fontdue") {
+        aterm_spec::host::could_not_run(
+            "ATERM_RASTERIZER pins the unhinted rasterizer; these scenes were chosen on the host's",
+        );
+    }
+}
+
 /// A grey on white that reads AA, under the floor.
 const GREY: (u32, u32, u32) = (0x0076_7676, 0x00FF_FFFF, 0x0009_69DA);
 /// A rose on white that reads 4.5553, some of whose letters read by their rasters at AA as the
 /// judges read it and under 4.5 itself (`with_aa_unrounded` changes Comet's and Phaser's streams
 /// over them typing).
 const ROSE: (u32, u32, u32) = (0x00D8_3270, 0x00FF_FFFF, 0x0009_69DA);
+/// GREY's and ROSE's places off macOS, where the portable rasterizer reads their letters and
+/// neither `with_aa_unrounded` nor, at rest, `with_share_over_aa` moves their streams: a grey
+/// reading 4.674 whose letters `with_share_over_aa` moves at rest for all four styles, and a rose
+/// reading 4.9015 whose letters `with_aa_unrounded` moves for all four styles typing and none at
+/// rest (greys 585858 to 909090 and 37 roses round D83270 scanned, 2026-11-13).
+const PORTABLE_LOOKS: [(u32, u32, u32); 2] = [
+    (0x0074_7474, 0x00FF_FFFF, 0x0009_69DA),
+    (0x00D8_1870, 0x00FF_FFFF, 0x0009_69DA),
+];
 
 /// A CONTROL SWITCHED BETWEEN TWO FRAMES TAKES BACK NOTHING JUDGED UNDER THE OTHER. The guard takes
 /// a frame's streams back whole, and a cell's verdict, by keys that hold everything they depend on,
@@ -310,31 +330,43 @@ const ROSE: (u32, u32, u32) = (0x00D8_3270, 0x00FF_FFFF, 0x0009_69DA);
 /// while the caret rests, where it takes whole frames back, the guard that keeps frames and
 /// verdicts publishes what one judging every cell afresh does under the same switch, and each
 /// switch changes what is published on some ground, so what was taken back had a stale read to
-/// take. The rest leg switches at 3500 ms: after the typing the guard takes no frame back whole
-/// before 3408 ms, so a switch at 2600 ms reached no frame it would take back, and the first frame
-/// a switch at 3500 ms draws (3504 ms) is one it takes back whole unswitched for Phaser, Laser and
-/// Fire. There `with_share_over_aa` changes what the guard would take back whole on Solarized
-/// Dark, which pins the frame memo's word; `with_aa_unrounded` and the whole reading's switch
-/// change no stream at rest in these scenes, so the memo's bits for those two are pinned by
-/// none.
-/// NEGATIVE CONTROLS (2026-11-11): `letter_bar`'s two switches left out of the seams word, as they
-/// were, fired "phaser on ffffff, ShareOverAa from 1400 ms: the kept guard's streams, of 297
-/// frames" (left 4, right 0); `with_aa_unrounded`'s alone left out fired that for AaUnrounded
+/// take. The typing leg switches at 1400 ms on macOS and at 1250 ms elsewhere, where of switches
+/// at 1100, 1250, 1400, 1550, 1700 and 3500 ms only one at 1250 ms shows a verdict taken back
+/// across `with_aa_unrounded` (Phaser's, on `PORTABLE_LOOKS`' rose). The rest leg switches at
+/// 3500 ms: after the typing the guard takes no frame back whole before 3408 ms, so a switch at
+/// 2600 ms reached no frame it would take back, and the first frame a switch at 3500 ms draws
+/// (3504 ms) is one it takes back whole unswitched for Phaser, Laser and Fire. There
+/// `with_share_over_aa` changes what the guard would take back whole on Solarized Dark (off
+/// macOS, on `PORTABLE_LOOKS`' grey), which pins the frame memo's word; `with_aa_unrounded` and
+/// the whole reading's switch change no stream at rest in these scenes, so the memo's bits for
+/// those two are pinned by none.
+/// NEGATIVE CONTROLS (2026-11-11, macOS): `letter_bar`'s two switches left out of the seams word,
+/// as they were, fired "phaser on ffffff, ShareOverAa from 1400 ms: the kept guard's streams, of
+/// 297 frames" (left 4, right 0); `with_aa_unrounded`'s alone left out fired that for AaUnrounded
 /// (left 4); the word left out of a verdict's key, as it was (the room and luma switches alone),
 /// fired the ShareOverAa line (left 4); the two left out of the frame memo's word alone (each
 /// verdict's key keeping them), with the rest leg at 2600 ms, fired nothing, and at 3500 ms fired
 /// "phaser on 002b36, ShareOverAa from 3500 ms: the kept guard's streams, of 297 frames" (left 1,
 /// right 0). The whole reading's switch changes Fire's dim streams, but no scene of ten styles on
 /// six grounds, switched at four times, took a verdict back across it, so its place in the key is
-/// pinned by none.
+/// pinned by none. Off macOS (2026-11-13, Linux aarch64): the two left out of the seams word fired
+/// "phaser on ffffff, ShareOverAa from 1250 ms: the kept guard's streams, of 297 frames" (left 9,
+/// right 0); `with_aa_unrounded`'s alone left out fired that for AaUnrounded (left 9), and with the
+/// typing leg at 1400 ms fired nothing; the whole reading's bar left out of it fired nothing.
 #[test]
 fn a_control_switched_between_two_frames_takes_back_nothing_judged_under_the_other() {
+    on_the_hosts_raster();
     let mut ev = vec![(200, Ev::Out(b"\x1b[2J\x1b[5H$ ".to_vec()))];
     ev.extend(typed("echo hello world", 1_000, 50));
     let tail = 3_000;
+    let (looks, typing): (Vec<(u32, u32, u32)>, u64) = if cfg!(target_os = "macos") {
+        (vec![DIM, GREY, ROSE], 1_400)
+    } else {
+        ([DIM].into_iter().chain(PORTABLE_LOOKS).collect(), 1_250)
+    };
     let scenes: Vec<(&str, (u32, u32, u32))> = ["phaser", "comet", "laser", "fire"]
         .into_iter()
-        .flat_map(|style| [DIM, GREY, ROSE].map(|look| (style, look)))
+        .flat_map(|style| looks.iter().map(move |&look| (style, look)))
         .collect();
     let plain: Vec<Vec<Frame>> = scenes
         .iter()
@@ -353,7 +385,7 @@ fn a_control_switched_between_two_frames_takes_back_nothing_judged_under_the_oth
     const REST: u64 = 3_500;
     for seam in [Seam::WholeOff, Seam::ShareOverAa, Seam::AaUnrounded] {
         let (mut bites, mut at_rest, mut rest_bites) = (0, 0, 0);
-        for (switch, (s, (&(style, look), plain))) in [1_400, REST]
+        for (switch, (s, (&(style, look), plain))) in [typing, REST]
             .into_iter()
             .flat_map(|at| scenes.iter().zip(&plain).enumerate().map(move |s| (at, s)))
         {
@@ -420,7 +452,12 @@ fn typed_on_a_prompt(text: &str, every: u64) -> Vec<(u64, Ev)> {
 /// two still under that fault: a sweep of 300 scenes a style on Solarized Light moved 3 of
 /// Comet's and 57 of Aurora's, and these are two of those. Each scene's premise is that it moves
 /// under that fault (`set_letter_guard_lowered_kept`), so a scene the guard's later rounds leave
-/// still fails as a premise rather than passing.
+/// still fails as a premise rather than passing. Those three are CoreText's: on the portable
+/// rasterizer, which draws the face off macOS, none of them moves under that fault, so there the
+/// scenes are three of the 8 a sweep of 300 found moving under it (2026-11-13, Linux aarch64;
+/// seeded as `kept_frames_and_verdicts_publish_what_judging_afresh_does` seeds its own, on
+/// Solarized Dark and Light), the kept guard moving none in any of the 8. Under that fault Phaser
+/// on Solarized Dark moved 7 of 163 frames, Phaser on paper 6 of 211, Aurora on paper 2 of 144.
 ///
 /// NEGATIVE CONTROL (2026-11-05): `verify_cuts` writing its lowered share back over the kept
 /// verdict, as it did from 39ba2aa319, fired "the kept guard's streams, of 67 frames" (left 5,
@@ -435,11 +472,20 @@ fn typed_on_a_prompt(text: &str, every: u64) -> Vec<(u64, Ev)> {
 /// and 247.19 G -> 247.42 G and 247.38 G instructions in the test build.
 #[test]
 fn a_share_lowered_on_its_frame_is_that_frame_s_alone() {
-    let scenes = [
-        ("phaser", DIM, "cmqλuж", 33, 312),
-        ("comet", DIM_PAPER, " xtzwßfmftbgnж", 88, 715),
-        ("aurora", DIM_PAPER, "  ibqw", 107, 513),
-    ];
+    on_the_hosts_raster();
+    let scenes = if cfg!(target_os = "macos") {
+        [
+            ("phaser", DIM, "cmqλuж", 33, 312),
+            ("comet", DIM_PAPER, " xtzwßfmftbgnж", 88, 715),
+            ("aurora", DIM_PAPER, "  ibqw", 107, 513),
+        ]
+    } else {
+        [
+            ("phaser", DIM, " j ipftvé kkv sa  nk", 75, 591),
+            ("phaser", DIM_PAPER, "λxlhgynjtxgck doéßl", 104, 904),
+            ("aurora", DIM_PAPER, "hnrqgxvж ", 65, 1186),
+        ]
+    };
     for (style, look, text, every, tail) in scenes {
         let ev = typed_on_a_prompt(text, every);
         let (frames, _) = run(&mut Replay::new(style, look, true), &ev, tail);

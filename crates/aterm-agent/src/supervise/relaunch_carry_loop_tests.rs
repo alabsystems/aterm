@@ -8,8 +8,8 @@
 //! comes back on it, and that row reads as a question.
 
 use super::*;
-use crate::supervise::config::Autopilot;
 use crate::supervise::policy::turn_end::HostTurn;
+use alab_policy::config::Autopilot;
 
 const ESC_WORDS: &str = "a person stopped the turn with Esc";
 
@@ -121,7 +121,7 @@ fn the_cut_call_a_resume_restores_is_no_persons_esc() {
         let mut m = Mock::new(vec![busy_screen()]);
         let (mut s, dir) = policy_session(&mut m, "carry-no-esc");
         let mut opts = hosted(30);
-        opts.policy.autopilot = autopilot;
+        opts.policy.turn_end.autopilot = autopilot;
         opts.idle_host = Some(Carrier::owing(true) as Arc<dyn IdleHost>);
         s.program = Some("claude".to_owned());
         let point = point_at(&s, restored(), 1);
@@ -160,11 +160,7 @@ fn the_cut_call_a_resume_restores_is_no_persons_esc() {
                 !text.to_lowercase().contains("restart"),
                 "the loop's own continue says nothing of a restart: {text}"
             );
-            assert_eq!(
-                rule_id,
-                crate::supervise::policy::turn_end::RULE_CONTINUE,
-                "{text}"
-            );
+            assert_eq!(rule_id, alab_policy::words::RULE_CONTINUE, "{text}");
         }
         other => panic!("past the grace the loop's continue is typed: {other:?}"),
     }
@@ -255,7 +251,7 @@ fn the_loops_own_act_waits_on_an_owed_carry_on_that_stands() {
         let mut m = Mock::new(vec![busy_screen()]);
         let (mut s, dir) = policy_session(&mut m, tag);
         let mut opts = hosted(30);
-        opts.policy.autopilot = autopilot;
+        opts.policy.turn_end.autopilot = autopilot;
         opts.idle_host = Some(Arc::new(Standing {
             word,
             holds: AtomicBool::new(holds),
@@ -290,7 +286,7 @@ fn the_loops_own_act_waits_on_an_owed_carry_on_that_stands() {
         matches!(
             &act,
             Ok(TurnEndAction::Type { rule_id, .. })
-                if *rule_id == crate::supervise::policy::turn_end::RULE_LAND
+                if *rule_id == alab_policy::words::RULE_LAND
         ),
         "past its hold the loop acts: {act:?}"
     );
@@ -313,7 +309,7 @@ fn a_relaunch_that_owes_no_carry_on_goes_on_at_the_loops_first_point() {
         let mut m = Mock::new(vec![busy_screen()]);
         let (mut s, dir) = policy_session(&mut m, tag);
         let mut opts = hosted(30);
-        opts.policy.autopilot = autopilot;
+        opts.policy.turn_end.autopilot = autopilot;
         opts.idle_host = Some(Carrier::owing(false) as Arc<dyn IdleHost>);
         s.program = Some("claude".to_owned());
         let point = point_at(&s, at_rest(), 1);
@@ -333,7 +329,7 @@ fn a_relaunch_that_owes_no_carry_on_goes_on_at_the_loops_first_point() {
         matches!(
             &later,
             Ok(TurnEndAction::Type { rule_id, .. })
-                if *rule_id == crate::supervise::policy::turn_end::RULE_CONTINUE
+                if *rule_id == alab_policy::words::RULE_CONTINUE
         ),
         "Cruise's continue: {later:?}"
     );
@@ -342,7 +338,7 @@ fn a_relaunch_that_owes_no_carry_on_goes_on_at_the_loops_first_point() {
         matches!(
             &first,
             Ok(TurnEndAction::Type { rule_id, .. })
-                if *rule_id == crate::supervise::policy::turn_end::RULE_LAND
+                if *rule_id == alab_policy::words::RULE_LAND
         ),
         "Land's instruction at once: {first:?}"
     );
@@ -358,7 +354,7 @@ fn a_relaunch_that_owes_no_carry_on_goes_on_at_the_loops_first_point() {
 /// does, so nothing stops the loop.
 #[test]
 fn a_held_carry_ons_short_reply_measures_the_back_off_from_the_reply() {
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, RULE_DONE_CHECK};
+    use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK};
     const DONE: &str =
         "All tasks are complete and verified; nothing is left to do.\n\nATERM-TASK-DONE";
     const HALF: &str = "The parser reads the first half.";
@@ -368,7 +364,7 @@ fn a_held_carry_ons_short_reply_measures_the_back_off_from_the_reply() {
         r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         r
     };
-    let backoff = crate::supervise::policy::turn_end::TurnEndTiming::default().short_backoff;
+    let backoff = alab_policy::config::TurnEndTiming::default().short_backoff;
     for (case, kind, before, answer, then) in [
         ("carry-on", HostTurn::CarryOn, HALF, GOES_ON, RULE_CONTINUE),
         ("check, work", HostTurn::Check, DONE, GOES_ON, RULE_CONTINUE),
@@ -377,7 +373,7 @@ fn a_held_carry_ons_short_reply_measures_the_back_off_from_the_reply() {
         let mut m = Mock::new(vec![busy_screen()]);
         let (mut s, dir) = policy_session(&mut m, "held-carry-clock");
         let mut opts = hosted(30);
-        opts.policy.autopilot = Autopilot::Cruise;
+        opts.policy.turn_end.autopilot = Autopilot::Cruise;
         opts.idle_host = Some(Carrier::owing(false) as Arc<dyn IdleHost>);
         s.program = Some("claude".to_owned());
         let point = point_at(&s, at_rest(before), 1);
@@ -422,7 +418,8 @@ fn a_held_carry_ons_short_reply_measures_the_back_off_from_the_reply() {
 /// CONTROL: the same short turn ended by the agent itself, at rest, counts.
 #[test]
 fn a_turn_a_restart_cut_adds_nothing_to_the_short_streak() {
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, TurnEndTiming};
+    use alab_policy::config::TurnEndTiming;
+    use alab_policy::words::RULE_CONTINUE;
     /// Whose turn the restart cuts.
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Turn {
@@ -445,7 +442,7 @@ fn a_turn_a_restart_cut_adds_nothing_to_the_short_streak() {
         let mut m = Mock::new(vec![busy_screen()]);
         let (mut s, dir) = policy_session(&mut m, tag);
         let mut opts = hosted(30);
-        opts.policy.autopilot = Autopilot::Cruise;
+        opts.policy.turn_end.autopilot = Autopilot::Cruise;
         let host = Carrier::owing(false);
         opts.idle_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
         s.program = Some("claude".to_owned());
@@ -630,7 +627,8 @@ fn the_loop_a_relaunch_starts_counts_nothing_for_the_cut_at_its_first_point() {
 #[test]
 fn a_restore_lines_short_reply_measures_the_back_off_from_the_reply() {
     use crate::harness::upgrade_drive::host_turn;
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, TurnEndTiming};
+    use alab_policy::config::TurnEndTiming;
+    use alab_policy::words::RULE_CONTINUE;
     const REPLY: &str = "Restored nothing: no watch, monitor or loop was running.";
     let at_rest = |said: &str| {
         let mut r = rows(&[&format!("⏺ {said}"), ""]);
@@ -642,7 +640,7 @@ fn a_restore_lines_short_reply_measures_the_back_off_from_the_reply() {
         let mut m = Mock::new(vec![busy_screen()]);
         let (mut s, dir) = policy_session(&mut m, "held-restore-clock");
         let mut opts = hosted(30);
-        opts.policy.autopilot = Autopilot::Cruise;
+        opts.policy.turn_end.autopilot = Autopilot::Cruise;
         opts.idle_host = Some(Carrier::owing(false) as Arc<dyn IdleHost>);
         s.program = Some("claude".to_owned());
         let point = point_at(&s, at_rest("The parser reads the first half."), 1);
@@ -697,7 +695,8 @@ fn a_restore_lines_short_reply_measures_the_back_off_from_the_reply() {
 /// prompt's reply, the restart prompt's line not yet drawn.
 #[test]
 fn a_restart_prompts_reply_no_read_saw_run_is_judged_when_the_screen_shows_it() {
-    use crate::supervise::policy::turn_end::{TurnEndTiming, WaitKind};
+    use crate::supervise::policy::turn_end::WaitKind;
+    use alab_policy::config::TurnEndTiming;
     const RESTARTED: &str = "[aterm harness] Restarted: someone asked aterm to restart Claude Code \
         (aterm ctl restart), so this session was ended and restarted on Claude Code 2.1.317 and \
         resumed.";
@@ -732,7 +731,7 @@ fn a_restart_prompts_reply_no_read_saw_run_is_judged_when_the_screen_shows_it() 
         let mut m = Mock::new(vec![busy_screen()]);
         let (mut s, dir) = policy_session(&mut m, "restart-reply-unseen");
         let mut opts = hosted(30);
-        opts.policy.autopilot = Autopilot::Cruise;
+        opts.policy.turn_end.autopilot = Autopilot::Cruise;
         opts.idle_host = Some(Carrier::owing(false) as Arc<dyn IdleHost>);
         s.program = Some("claude".to_owned());
         let point = point_at(&s, screen(&[hi, carried]), 1);

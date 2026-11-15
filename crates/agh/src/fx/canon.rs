@@ -757,7 +757,7 @@ pub(crate) fn git_decode(bytes: &[u8]) -> Result<super::child::ChildOut> {
 #[cfg(any(unix, test))]
 by_slug!(side_effect, SideEffect: None, Unknown, Applied);
 
-/// A git run that ended with no exit to tape: `child::run`'s error, which is could_not_run,
+/// A git run that ended with no exit to tape: `child::run_unless`'s error, which is could_not_run,
 /// `Sub::Local` (the run could not start, could not be waited for, or did not finish in its
 /// budget). `failed {side effect}` (`none`, `unknown` or `applied`), then `why {text}`, the
 /// text through `Redactor::shapes` with a CR or LF written as a space. `git_answer` reads it

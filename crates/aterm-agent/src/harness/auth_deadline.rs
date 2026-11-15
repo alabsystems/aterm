@@ -26,6 +26,8 @@ impl Expired {
 }
 
 /// Copying this value retains the same deadline and clock; it never starts a new budget.
+/// One given a cancellation ([`Deadline::cancelled_by`]) has passed once that says so, so each
+/// wait that reads it (a poll's pause, a socket's read, a CDP reply) ends at its next look.
 #[derive(Clone, Copy)]
 pub struct Deadline<'a> {
     end: Instant,
@@ -33,7 +35,11 @@ pub struct Deadline<'a> {
     continuous_end: Option<u64>,
     continuous: &'a dyn Fn() -> Option<u64>,
     waking: Option<WakeDeadline>,
+    cancel: Option<&'a dyn Fn() -> bool>,
 }
+
+/// How often a wait on a cancellable [`Deadline`] looks at its cancellation.
+const CANCEL_LOOK: Duration = Duration::from_millis(100);
 
 /// Pure endpoints retained by an existing owner without borrowing its clocks.
 #[derive(Clone, Copy, Debug)]
@@ -78,6 +84,7 @@ impl Deadline<'static> {
                 .map(|now| now.saturating_add(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX))),
             continuous: &aterm_uds::process::continuous_ns,
             waking: None,
+            cancel: None,
         }
     }
 }
@@ -101,6 +108,7 @@ impl<'a> Deadline<'a> {
             }),
             continuous,
             waking: None,
+            cancel: None,
         }
     }
 
@@ -118,6 +126,24 @@ impl<'a> Deadline<'a> {
         (self.clock)()
     }
 
+    /// This budget, passed also once `cancelled` says so: an automatic sign-in's account work
+    /// that a quit or an update cancelled. What is already written stays written; a write in
+    /// progress is not preempted (filesystem calls are not), only the next wait is refused.
+    pub(super) fn cancelled_by<'b>(self, cancelled: &'b dyn Fn() -> bool) -> Deadline<'b>
+    where
+        'a: 'b,
+    {
+        Deadline {
+            cancel: Some(cancelled),
+            ..self
+        }
+    }
+
+    /// Whether this budget's cancellation said so ([`Deadline::cancelled_by`]).
+    pub(super) fn cancelled(self) -> bool {
+        self.cancel.is_some_and(|cancelled| cancelled())
+    }
+
     /// Whether either clock has exhausted the original budget.
     #[must_use]
     pub fn expired(self) -> bool {
@@ -128,6 +154,9 @@ impl<'a> Deadline<'a> {
     /// # Errors
     /// Either clock has reached its deadline, including a zero or unrepresentable budget.
     pub fn remaining(self) -> Result<Duration, Expired> {
+        if self.cancelled() {
+            return Err(Expired);
+        }
         let left = self.bounds().remaining(self.now(), (self.continuous)());
         if left.is_zero() {
             Err(Expired)
@@ -158,11 +187,18 @@ impl<'a> Deadline<'a> {
             },
             continuous: self.continuous,
             waking,
+            cancel: self.cancel,
         }
     }
 
     pub(super) fn counts_sleep(self) -> bool {
         self.continuous_end.is_some() || self.waking.is_some_and(WakeDeadline::counts_sleep)
+    }
+
+    /// Whether a wait under this budget must look at it again in slices rather than block for
+    /// all of what is left: it counts the host's sleep, or it can be cancelled.
+    pub(super) fn looks_again(self) -> bool {
+        self.counts_sleep() || self.cancel.is_some()
     }
 
     /// The original transferable parent, retaining its local limits and exact awake ceiling.
@@ -199,10 +235,23 @@ impl<'a> Deadline<'a> {
 
     pub(super) fn pause(self, interval: Duration) -> Result<(), Expired> {
         let pause = self.capped(interval)?;
-        if !pause.is_zero() {
-            std::thread::sleep(pause);
+        if self.cancel.is_none() {
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+            return Ok(());
         }
-        Ok(())
+        let until = Instant::now()
+            .checked_add(pause)
+            .unwrap_or_else(Instant::now);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(());
+            }
+            self.remaining()?;
+            std::thread::sleep(left.min(CANCEL_LOOK));
+        }
     }
 }
 
@@ -303,7 +352,7 @@ pub(super) fn io_with_budget<T>(
     };
     loop {
         let left = deadline.remaining().map_err(Expired::io)?;
-        let tick = if deadline.counts_sleep() {
+        let tick = if deadline.looks_again() {
             left.min(Duration::from_millis(100))
         } else {
             left

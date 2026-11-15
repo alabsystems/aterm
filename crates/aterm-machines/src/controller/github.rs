@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Host GitHub key registration and revocation (the token file [`Paths::github_token`] names,
-//! [`System::github_rest`], [`KEY_SCOPE`]), or, by `[github] keys`,
-//! over agh's library ([`register_via`], [`revoke_via`]: machines 5a and 5b). The machine user's
-//! token is never kept in the login keychain.
+//! Host GitHub key registration and revocation ([`System::github_rest`], [`KEY_SCOPE`]), or, by
+//! `[github] keys = "agh-inline"`, over agh's library ([`register_via`], [`revoke_via`]: machines
+//! 5a). The machine user's token is the vault's `gh:fleet` entry, resolved on the one credential
+//! path ([`super::credential`]); one this Mac lacks is filed with the lab and blocks the call.
 
-use super::inventory::{Github, KeysVia, Paths};
+use super::inventory::{Github, KeysVia};
 use crate::github_pages;
 use crate::port::{GithubResponse, RestMethod, Secret, System};
 use agh::GithubBuilder;
@@ -14,10 +14,9 @@ use agh::identity::{InlineToken, ProcessEnv, Profile};
 use agh::policy::{RouteRequest, RouteTarget, Router, Tier};
 use agh::redact::Redactor;
 use agh::retry::RetryPolicy;
+use aterm_secrets::need::{GhProfile, Purpose, Want};
 use serde::Serialize;
 use std::cell::RefCell;
-use std::io;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -27,9 +26,6 @@ pub const KEY_SCOPE: &str = "admin:public_key";
 /// The key listing, at GitHub's largest page.
 const KEYS: &str = "/user/keys?per_page=100";
 const KEYS_PER_PAGE: usize = 100;
-
-/// The largest token file read.
-const TOKEN_FILE_MAX: usize = 64 * 1024;
 
 /// One key `POST /user/keys` registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,54 +51,30 @@ struct Session {
     token: Secret,
 }
 
-/// `account`'s token, read from `token_file` ([`Paths::github_token`]): one token, in a private
-/// regular file of this account's (0600) that is itself no link. Nothing here asks anyone for
-/// it: a missing or unusable file blocks the key call, which says so.
-fn stored_token(sys: &dyn System, token_file: &Path, account: &str) -> Result<Secret, String> {
+/// The machine user `account`'s token: the vault's `gh:fleet` entry, else a need filed with the
+/// lab and the key call blocked.
+fn fleet_token(sys: &dyn System, account: &str) -> Result<Secret, String> {
     if !valid_login(account) {
         return Err(format!("{account:?} is not a GitHub login"));
     }
-    crate::port::no_core_dumps();
-    let mut bytes = sys
-        .read_owned_file(token_file, sys.euid(), TOKEN_FILE_MAX, true)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                format!(
-                    "no GitHub token for {account} at {}; host key calls are blocked",
-                    token_file.display()
-                )
-            } else {
-                format!(
-                    "{} is not a private regular file of this account's (0600), not a link, at \
-                     most 64 KiB; host key calls are blocked",
-                    token_file.display()
-                )
-            }
-        })?;
-    let token = std::str::from_utf8(&bytes)
-        .ok()
-        .map(str::trim)
-        .filter(|token| !token.is_empty() && !token.contains(char::is_whitespace))
-        .map(|token| Secret::new(token.as_bytes()));
-    aterm_uds::secret::scrub(&mut bytes);
-    match token {
-        Some(Ok(token)) => Ok(token),
-        _ => Err(format!(
-            "{} holds no single GitHub token; host key calls are blocked",
-            token_file.display()
-        )),
-    }
+    super::credential::resolve(
+        sys,
+        &Want::Gh(GhProfile::Fleet),
+        Purpose::MachinesKeys,
+        true,
+    )
+    .map_err(|why| format!("{why}; host key calls are blocked"))
 }
 
 impl Session {
-    /// Read `account`'s token from `token_file` and check that it signs in as `account`.
-    fn open(sys: &dyn System, token_file: &Path, account: &str) -> Result<Self, String> {
-        let token = stored_token(sys, token_file, account)?;
+    /// Resolve `account`'s token and check that it signs in as `account`.
+    fn open(sys: &dyn System, account: &str) -> Result<Self, String> {
+        let token = fleet_token(sys, account)?;
         let session = Self { token };
         let (login, _) = session.login(sys)?;
         if !login.eq_ignore_ascii_case(account) {
             return Err(format!(
-                "the stored GitHub token for {account} signs in as {login:?}; nothing was sent"
+                "the gh:fleet token for {account} signs in as {login:?}; nothing was sent"
             ));
         }
         Ok(session)
@@ -247,24 +219,22 @@ impl Registration {
 }
 
 /// Register each `github.key@<user>` public key in `report` not yet held by `account`, with
-/// the token `token_file` holds.
+/// the vault's `gh:fleet` token.
 ///
 /// # Errors
 /// One line (no token for `account`, the token is for another login, the API refused).
 pub fn register(
     sys: &dyn System,
-    token_file: &Path,
     account: &str,
     host_name: &str,
     keys: &[(String, String)],
 ) -> Result<Vec<Registered>, String> {
-    register_each(sys, token_file, account, host_name, keys).into_result()
+    register_each(sys, account, host_name, keys).into_result()
 }
 
 /// [`register`], each key's outcome kept.
 fn register_each(
     sys: &dyn System,
-    token_file: &Path,
     account: &str,
     host_name: &str,
     keys: &[(String, String)],
@@ -276,7 +246,7 @@ fn register_each(
         Ok(wanted) => wanted,
         Err(why) => return Registration::stopped(why),
     };
-    let opened = Session::open(sys, token_file, account)
+    let opened = Session::open(sys, account)
         .and_then(|session| listed(sys, &session).map(|held| (session, held)));
     let (session, mut held) = match opened {
         Ok(opened) => opened,
@@ -342,22 +312,17 @@ fn dedup_ids(ids: &[u64]) -> Vec<u64> {
     unique
 }
 
-/// Delete each key id from the machine user `account`, with the token `token_file` holds, and
+/// Delete each key id from the machine user `account`, with the vault's `gh:fleet` token, and
 /// read the account's keys back.
 ///
 /// # Errors
 /// One line per key the account still holds, or why the keys could not be listed.
-pub fn revoke(
-    sys: &dyn System,
-    token_file: &Path,
-    account: &str,
-    ids: &[u64],
-) -> Result<Vec<String>, String> {
+pub fn revoke(sys: &dyn System, account: &str, ids: &[u64]) -> Result<Vec<String>, String> {
     let ids = dedup_ids(ids);
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let session = Session::open(sys, token_file, account)?;
+    let session = Session::open(sys, account)?;
     let listing = listed(sys, &session)?;
     let before: Vec<u64> = listing.iter().map(|(id, ..)| *id).collect();
     let deleted: Vec<String> = listing
@@ -415,79 +380,31 @@ fn judged(ids: &[u64], after: &[u64], answers: &[(u64, String)]) -> Result<(), S
     }
 }
 
-/// The name of the profile the agh key path speaks as, inline (5a) or from agh.toml (5b).
+/// The name of the profile the agh key path speaks as.
 const FLEET: &str = "fleet";
 
-/// The single-identity router of the agh key path `github.keys_via()` names (plan §17): the
-/// token file's token inline (`AghInline`), or agh.toml's `fleet` profile (`AghFleet`). Each
-/// refusal of its own ends `nothing was sent`; the token file's read refuses with
-/// `stored_token`'s texts, unchanged (body 3).
-fn agh_router(sys: &dyn System, token_file: &Path, github: &Github) -> Result<Router, String> {
+/// The single-identity router of the agh key path (plan §17): the `gh:fleet` token inline. Each
+/// refusal of its own ends `nothing was sent`.
+fn agh_router(sys: &dyn System, github: &Github) -> Result<Router, String> {
     let account = &github.account;
-    match github.keys_via() {
-        KeysVia::Gh => Err(format!(
+    if github.keys_via() == KeysVia::Gh {
+        return Err(format!(
             "keys = \"gh\" sends {account}'s key calls over the REST path, not agh; nothing was \
              sent"
-        )),
-        KeysVia::AghInline => {
-            let token = stored_token(sys, token_file, account)?;
-            let token =
-                InlineToken::new(aterm_uds::secret::Secret::new(token.bytes())).map_err(|e| {
-                    format!(
-                        "the stored token for {account} cannot be used by agh ({}); nothing was \
-                         sent",
-                        e.slug()
-                    )
-                })?;
-            // agh binds the profile to `account`: its first call is `GET /user`, and a token
-            // that signs in as another login is refused before any key call.
-            let profile = Profile::inline(FLEET, Tier::Dev, account.clone(), token)
-                .map_err(|e| format!("{}; nothing was sent", Redactor::shapes(&e.why)))?;
-            Ok(Router::single_identity(profile))
-        }
-        KeysVia::AghFleet => {
-            if !valid_login(account) {
-                return Err(format!(
-                    "{account:?} is not a GitHub login; nothing was sent"
-                ));
-            }
-            let dirs = sys.agh_dirs().ok_or(
-                "agh's directories cannot be resolved; keys = \"agh-fleet\" reads agh.toml's \
-                 fleet profile; nothing was sent",
-            )?;
-            let validated = agh::config::load(&dirs)
-                .map_err(|e| {
-                    format!(
-                        "agh.toml is invalid: {}; nothing was sent",
-                        Redactor::shapes(&e.why)
-                    )
-                })?
-                .ok_or_else(|| {
-                    format!(
-                        "agh.toml is missing ({}); keys = \"agh-fleet\" reads its fleet profile; \
-                         nothing was sent",
-                        dirs.config_file().display()
-                    )
-                })?;
-            let profile = Router::from_validated(validated)
-                .profile(FLEET)
-                .cloned()
-                .ok_or(
-                    "agh.toml has no fleet profile: agh auth add fleet adds the machine user's \
-                     token; nothing was sent",
-                )?;
-            match profile.login.as_deref() {
-                Some(login) if login.eq_ignore_ascii_case(account) => {}
-                bound => {
-                    return Err(format!(
-                        "agh.toml's fleet profile is bound to {}, not {account}; nothing was sent",
-                        bound.unwrap_or("no login")
-                    ));
-                }
-            }
-            Ok(Router::single_identity(profile))
-        }
+        ));
     }
+    let token = fleet_token(sys, account)?;
+    let token = InlineToken::new(aterm_uds::secret::Secret::new(token.bytes())).map_err(|e| {
+        format!(
+            "the gh:fleet token for {account} cannot be used by agh ({}); nothing was sent",
+            e.slug()
+        )
+    })?;
+    // agh binds the profile to `account`: its first call is `GET /user`, and a token that signs
+    // in as another login is refused before any key call.
+    let profile = Profile::inline(FLEET, Tier::Dev, account.clone(), token)
+        .map_err(|e| format!("{}; nothing was sent", Redactor::shapes(&e.why)))?;
+    Ok(Router::single_identity(profile))
 }
 
 /// One agh client of the key path `github.keys_via()` names, the one identity write permit
@@ -495,17 +412,14 @@ fn agh_router(sys: &dyn System, token_file: &Path, github: &Github) -> Result<Ro
 struct AghKeys {
     gh: agh::Github,
     permit: agh::Permit,
-    /// The account, on the inline path (5a), whose token is the token file's.
-    inline: Option<String>,
+    /// The account whose `gh:fleet` token the client carries inline (5a).
+    account: String,
 }
 
 impl AghKeys {
-    /// Open the client. Under `AghFleet`, `GET /user` checks that the token agh.toml's profile
-    /// reads signs in as `github.account` before any key call, as the REST path's session and
-    /// the inline path's login binding check theirs: agh binds only an inline profile's login
-    /// (plan §17, As built).
-    fn open(sys: &dyn System, token_file: &Path, github: &Github) -> Result<Self, String> {
-        let router = agh_router(sys, token_file, github)?;
+    /// Open the client; agh binds the inline profile to `github.account` (plan §17, As built).
+    fn open(sys: &dyn System, github: &Github) -> Result<Self, String> {
+        let router = agh_router(sys, github)?;
         let (transport, endpoints) = sys.github_transport();
         let gh = GithubBuilder::new(router)
             .transport(transport)
@@ -521,45 +435,31 @@ impl AghKeys {
                     }),
             )
             .build();
-        let account = &github.account;
-        let via = github.keys_via();
-        if via == KeysVia::AghFleet {
-            let me = gh
-                .users()
-                .me(FLEET)
-                .map_err(|e| agh_line(&gh, "GET /user", &e))?;
-            if !me.login.eq_ignore_ascii_case(account) {
-                return Err(gh.redactor().apply(&format!(
-                    "agh.toml's fleet token signs in as {}, not {account}; nothing was sent",
-                    me.login
-                )));
-            }
-        }
         let permit = gh
             .permit(&RouteRequest::write(RouteTarget::Identity))
             .map_err(|e| agh_line(&gh, "route /user/keys", &e))?;
-        let inline = (via == KeysVia::AghInline).then(|| account.clone());
-        Ok(Self { gh, permit, inline })
+        Ok(Self {
+            gh,
+            permit,
+            account: github.account.clone(),
+        })
     }
 
-    /// One line for a key call's failure, as `agh_line`. On the inline path a token agh
-    /// refuses as unauthenticated, or one that lacks [`KEY_SCOPE`], is named as the token
-    /// file's, never agh's own, which cannot see it: another login's token gets the REST path's
-    /// text.
+    /// One line for a key call's failure, as `agh_line`. A token agh refuses as
+    /// unauthenticated, or one that lacks [`KEY_SCOPE`], is named as the `gh:fleet` token, never
+    /// agh's own, which cannot see it: another login's token gets the REST path's text.
     fn line(&self, what: &str, e: &agh::Error) -> String {
-        let Some(account) = self.inline.as_deref() else {
-            return agh_line(&self.gh, what, e);
-        };
+        let account = &self.account;
         let line = match (&e.kind, &e.sub) {
-            (agh::Kind::Unauthenticated, agh::Sub::LoginMismatch { got, .. }) => format!(
-                "the stored GitHub token for {account} signs in as {got:?}; nothing was sent"
-            ),
+            (agh::Kind::Unauthenticated, agh::Sub::LoginMismatch { got, .. }) => {
+                format!("the gh:fleet token for {account} signs in as {got:?}; nothing was sent")
+            }
             (agh::Kind::Unauthenticated, _) => format!(
-                "{what}: {}; GitHub refuses the stored token for {account}",
+                "{what}: {}; GitHub refuses the gh:fleet token for {account}",
                 e.why
             ),
             _ if e.next.contains(KEY_SCOPE) => format!(
-                "{what}: {}; the stored token for {account} lacks the {KEY_SCOPE} scope",
+                "{what}: {}; the gh:fleet token for {account} lacks the {KEY_SCOPE} scope",
                 e.why
             ),
             _ => return agh_line(&self.gh, what, e),
@@ -608,23 +508,20 @@ fn agh_line(gh: &agh::Github, what: &str, e: &agh::Error) -> String {
 /// The key calls of one controller command (plan §17, As built). Over agh it opens one client
 /// and one identity write permit at its first call and shares them with every call after, so
 /// agh paces all of the command's key writes 1 s apart (§4.6.5), a rotation's DELETE after its
-/// POST and the next host's POST included, and binds the inline token's login once. A failed
+/// POST and the next host's POST included, and binds the token's login once. A failed
 /// opening is not kept: the next call opens again. The REST path (`KeysVia::Gh`) opens its
 /// session per call, unchanged.
 pub(crate) struct KeyCalls<'s> {
     sys: &'s dyn System,
-    /// The machine user's token file ([`Paths::github_token`]).
-    token_file: PathBuf,
     /// The client opened for an account and a key path, and its permit.
     agh: RefCell<Option<(String, KeysVia, Rc<AghKeys>)>>,
 }
 
 impl<'s> KeyCalls<'s> {
-    /// No client opened yet; the token from the controller's token file.
-    pub(crate) fn new(sys: &'s dyn System, paths: &Paths) -> Self {
+    /// No client opened yet.
+    pub(crate) fn new(sys: &'s dyn System) -> Self {
         Self {
             sys,
-            token_file: paths.github_token(),
             agh: RefCell::new(None),
         }
     }
@@ -638,13 +535,13 @@ impl<'s> KeyCalls<'s> {
         {
             return Ok(Rc::clone(keys));
         }
-        let keys = Rc::new(AghKeys::open(self.sys, &self.token_file, github)?);
+        let keys = Rc::new(AghKeys::open(self.sys, github)?);
         *self.agh.borrow_mut() = Some((github.account.clone(), via, Rc::clone(&keys)));
         Ok(keys)
     }
 
     /// [`register`] by the path `github.keys_via()` names, each key's outcome kept: `Gh` is
-    /// the REST path, unchanged; `AghInline` and `AghFleet` the agh path (§17).
+    /// the REST path, unchanged; `AghInline` the agh path (§17).
     pub(crate) fn register(
         &self,
         github: &Github,
@@ -652,10 +549,8 @@ impl<'s> KeyCalls<'s> {
         keys: &[(String, String)],
     ) -> Registration {
         match github.keys_via() {
-            KeysVia::Gh => {
-                register_each(self.sys, &self.token_file, &github.account, host_name, keys)
-            }
-            KeysVia::AghInline | KeysVia::AghFleet => self.register_agh(github, host_name, keys),
+            KeysVia::Gh => register_each(self.sys, &github.account, host_name, keys),
+            KeysVia::AghInline => self.register_agh(github, host_name, keys),
         }
     }
 
@@ -666,8 +561,8 @@ impl<'s> KeyCalls<'s> {
     /// As `revoke`, or the agh path's refusal.
     pub(crate) fn revoke(&self, github: &Github, ids: &[u64]) -> Result<Vec<String>, String> {
         match github.keys_via() {
-            KeysVia::Gh => revoke(self.sys, &self.token_file, &github.account, ids),
-            KeysVia::AghInline | KeysVia::AghFleet => self.revoke_agh(github, ids),
+            KeysVia::Gh => revoke(self.sys, &github.account, ids),
+            KeysVia::AghInline => self.revoke_agh(github, ids),
         }
     }
 
@@ -749,21 +644,19 @@ impl<'s> KeyCalls<'s> {
     }
 }
 
-/// [`register`] by the path `github.keys_via()` names, with the token file `paths` names:
-/// `Gh` is `register(sys, &paths.github_token(), &github.account, host_name, keys)`;
-/// `AghInline` and `AghFleet` are the agh path (§17).
+/// [`register`] by the path `github.keys_via()` names: `Gh` is
+/// `register(sys, &github.account, host_name, keys)`; `AghInline` is the agh path (§17).
 ///
 /// # Errors
 ///
 /// As `register`, or the agh path's refusal, one line naming the key call.
 pub fn register_via(
     sys: &dyn System,
-    paths: &Paths,
     github: &Github,
     host_name: &str,
     keys: &[(String, String)],
 ) -> Result<Vec<Registered>, String> {
-    KeyCalls::new(sys, paths)
+    KeyCalls::new(sys)
         .register(github, host_name, keys)
         .into_result()
 }
@@ -773,13 +666,8 @@ pub fn register_via(
 /// # Errors
 ///
 /// As `revoke`, or the agh path's refusal.
-pub fn revoke_via(
-    sys: &dyn System,
-    paths: &Paths,
-    github: &Github,
-    ids: &[u64],
-) -> Result<Vec<String>, String> {
-    KeyCalls::new(sys, paths).revoke(github, ids)
+pub fn revoke_via(sys: &dyn System, github: &Github, ids: &[u64]) -> Result<Vec<String>, String> {
+    KeyCalls::new(sys).revoke(github, ids)
 }
 
 #[cfg(test)]

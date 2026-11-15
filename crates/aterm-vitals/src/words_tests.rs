@@ -971,6 +971,41 @@ fn scope_cells_name_their_unit() {
 }
 
 #[test]
+fn incomplete_scope_figures_keep_the_lower_bound_in_every_form() {
+    for (resource, value) in [(Resource::Cpu, 1.2), (Resource::Memory, 2.0 * GIB)] {
+        let mut figure = fig(value);
+        figure.unread = 1;
+        let bounded = scope_cell(resource, &figure, false);
+        assert!(
+            bounded.forms.iter().all(|form| form.starts_with('≥')),
+            "{bounded:?}"
+        );
+        figure.unread = 0;
+        assert!(
+            scope_cell(resource, &figure, false)
+                .forms
+                .iter()
+                .all(|form| !form.starts_with('≥'))
+        );
+    }
+}
+
+#[test]
+fn a_confirmed_cpu_floor_never_rounds_its_lower_bound_up() {
+    let mut figure = fig(1.19);
+    figure.unread = 1;
+    assert_eq!(
+        scope_cell(Resource::Cpu, &figure, false).forms,
+        strings(&["≥1.1 cores"])
+    );
+    figure.cpu_charge = Some(3.5);
+    assert_eq!(
+        cpu_charge_words(&figure).as_deref(),
+        Some("counter charge 3.50 cores")
+    );
+}
+
+#[test]
 fn rule_s_says_each_state_in_words() {
     let words = |s: &Snapshot, res: Resource| state(res, s, &MAC).expect("a state");
 

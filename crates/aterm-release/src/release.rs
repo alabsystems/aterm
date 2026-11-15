@@ -327,6 +327,25 @@ impl LinuxDecl {
         self.mac_only || self.artifacts.is_some()
     }
 
+    /// The release flags that say it, as given (`nothing` when none was).
+    #[must_use]
+    pub fn words(&self) -> String {
+        let mut words = Vec::new();
+        if self.mac_only {
+            words.push("--mac-only".to_string());
+        }
+        if let Some(dir) = &self.artifacts {
+            words.push(format!("--linux-artifacts {}", dir.display()));
+        }
+        words.extend(self.targets.iter().map(|t| format!("--linux-target {t}")));
+        words.extend(self.workers.iter().map(|w| format!("--linux-worker {w}")));
+        if words.is_empty() {
+            "nothing".to_string()
+        } else {
+            words.join(" ")
+        }
+    }
+
     /// The `ship cut` flags that say it.
     #[must_use]
     pub fn cut_args(&self) -> Vec<String> {
@@ -380,7 +399,7 @@ pub struct ReleaseOptions {
     /// `--windows-sha256 <hex>`: the Windows zip's SHA-256 as `release-build` printed it on the
     /// Windows host, lowercase; journaled like `windows`, so it may come on a later run.
     pub windows_sha256: Option<String>,
-    /// `--release-credentials <path>`; default `~/.aterm/release-ring/release-credentials.toml`.
+    /// `--release-credentials <path>`, an operator's profile file; default the store's ring.
     pub release_credentials: Option<PathBuf>,
     /// `--engine <path>`; default `$PUBLICATION_ENGINE`, else `~/publication`: the engine whose
     /// origin the release's own engine is cloned from ([`aterm_verify::engine::engine_copy`]).
@@ -635,6 +654,34 @@ impl Journal {
         self.line
             .clone()
             .unwrap_or_else(|| crate::line::Line::start(&self.version, &self.commit, self.started))
+    }
+
+    /// This journal, as candidate.toml holds it beside `judged` (release.toml's), is a proposal
+    /// and nothing more: a line selection wrote before the fleet's claim was asked, with
+    /// nothing done on it, no hop, no pushed bump, no ask and no undecided supersession, and no
+    /// judged journal of its version. Dropping it loses nothing a run made.
+    #[must_use]
+    pub fn proposal_only(&self, judged: Option<&Self>) -> bool {
+        self.done.is_empty()
+            && !self.bumped
+            && self.asks.is_empty()
+            && self.reserved.is_none()
+            && self.artifact.is_none()
+            && self.prepared.is_none()
+            && self.supersede.is_none()
+            && self.line().hops.is_empty()
+            && !judged.is_some_and(|judged| !judged.finished() && judged.version == self.version)
+    }
+
+    /// [`Journal::proposal_only`], and the fleet's line of its version (`fleet`, with no
+    /// supersession of that version on main) starts at another commit: a fleet line's base
+    /// changes only by supersession, so this proposal was never the fleet's line and this
+    /// clone never held it.
+    #[must_use]
+    pub fn never_claimed(&self, judged: Option<&Self>, fleet: &crate::line::Line) -> bool {
+        self.proposal_only(judged)
+            && fleet.version == self.version
+            && fleet.base != self.line().base
     }
 
     /// The release reached its check: everything is done for R.
@@ -902,6 +949,17 @@ pub fn fmt_dur(secs: u64) -> String {
     } else {
         format!("{}h{:02}m", secs / 3600, secs % 3600 / 60)
     }
+}
+
+/// The reset `refusal` waits for, where it is agh's rate-limited refusal and no gate's or
+/// build's red ([`crate::allowance::reset_in`] over its reason and its detail).
+fn refusal_reset(refusal: &Refusal) -> Option<u64> {
+    if refusal.failing.is_some() {
+        return None;
+    }
+    crate::allowance::reset_in(
+        std::iter::once(refusal.why.as_str()).chain(refusal.detail.iter().map(String::as_str)),
+    )
 }
 
 fn short(sha: &str) -> &str {
@@ -1577,6 +1635,18 @@ pub trait Backend {
     ) -> Result<crate::line::Line, String> {
         Ok(line.clone())
     }
+    /// Whether another holder keeps `version`'s fleet line from this run now: the
+    /// `CUTTING ELSEWHERE:` line its claim would end with, read from the line's record alone
+    /// ([`crate::line_claim::held`]). Nothing is written.
+    /// # Errors
+    /// The record could not be read; the claim itself then decides.
+    fn fleet_contender_refusal(
+        &mut self,
+        _version: &str,
+        _continued: bool,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     /// Read the existing version line before judging a freshly selected main tip.
     fn fleet_existing(&mut self, _version: &str) -> Result<Option<crate::line::Line>, Refusal> {
         Ok(None)
@@ -1637,6 +1707,11 @@ pub trait Backend {
     fn fleet_audit(&mut self) -> Result<(), String> {
         Ok(())
     }
+    /// Renew the fleet line's lease while the run waits for `what`: a tree that only waits
+    /// shows the heartbeat no work, and a wait is not a stall.
+    fn fleet_wait(&mut self, _what: &str) -> Result<(), String> {
+        Ok(())
+    }
     /// Record bounded operational observations before any release preparation.
     fn observe_operational(&mut self) {}
     fn log_path(&mut self, step: Step) -> PathBuf;
@@ -1653,7 +1728,9 @@ pub trait Backend {
     /// for every later step and child ([`crate::build_inputs::arm`]); never in a dry run.
     fn seal_inputs(&mut self) -> Result<(), String>;
     fn cleared_env(&mut self) -> Vec<String>;
-    fn machine(&mut self, creds: &Path, explicit: bool) -> (String, Vec<Refusal>);
+    /// This machine's signer id and refusals; `creds` is the operator's profile file, `None`
+    /// for the store's release ring.
+    fn machine(&mut self, creds: Option<&Path>) -> (String, Vec<Refusal>);
     fn fetch(&mut self) -> Result<String, Refusal>;
     /// Local safety check before selecting and freezing a candidate. No network or engine
     /// discovery belongs here: the selected cutter performs those judgments at step 1.
@@ -1803,7 +1880,7 @@ pub trait Backend {
     fn cut_gates(
         &mut self,
         c: &Candidate,
-        creds: &Path,
+        creds: Option<&Path>,
         kind: crate::publish::CutKind,
     ) -> Vec<Refusal>;
     /// The cut's pre-claim gates of R's own tree: its handoff fixtures and handoff policy.
@@ -1981,7 +2058,7 @@ struct Run<'b> {
     public: String,
     prover: Option<Prover>,
     machine_id: String,
-    creds: PathBuf,
+    creds: Option<PathBuf>,
     cand: Option<Candidate>,
     tip: String,
     facts: Facts,
@@ -2004,8 +2081,12 @@ struct Run<'b> {
     exported_locally: bool,
     /// Owner asks the checks delivered before this run had a journal (a first run): journaled with the candidate at step 3, so they are not raised again.
     early_asks: Vec<String>,
-    /// Seconds the current step waited for the owner (not its own time).
+    /// Seconds the current step waited, for the owner or for GitHub's allowance (not its own
+    /// time).
     waited: u64,
+    /// The current step waited for GitHub's allowance already ([`Run::past_allowance`]): a
+    /// second refusal for it ends the run.
+    allowance_waited: bool,
     /// A dry run audits once.
     dry_audit: Option<Vec<Finding>>,
     /// This image asked whether the host fits ([`Run::host_fits`]): once is enough.
@@ -2019,12 +2100,9 @@ struct Run<'b> {
 }
 
 /// Run a release with `b`.
-pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outcome {
+pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions) -> Outcome {
     let release_dir = b.release_dir();
-    let creds = opts
-        .release_credentials
-        .clone()
-        .unwrap_or_else(|| home.join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL));
+    let creds = opts.release_credentials.clone();
     let mut run = Run {
         b,
         opts: opts.clone(),
@@ -2061,6 +2139,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         exported_locally: false,
         early_asks: Vec::new(),
         waited: 0,
+        allowance_waited: false,
         dry_audit: None,
         host_judged: false,
         last: String::new(),
@@ -2517,6 +2596,7 @@ impl Run<'_> {
         self.cur = step;
         self.b.entered(step);
         self.waited = 0;
+        self.allowance_waited = false;
         self.cur_t0 = self.b.now();
         self.stage_event("started", "");
         self.halt_if_interrupted()?;
@@ -2943,6 +3023,106 @@ impl Run<'_> {
                 )
                 .could_not_run()
             })
+    }
+
+    /// Remove candidate.toml where it holds only a proposal of `version`
+    /// ([`Journal::proposal_only`]): what was removed, for the line that says so. `None` where
+    /// it holds anything else, or nothing.
+    fn drop_proposal(&mut self, version: &str) -> Option<String> {
+        let release_dir = self.b.release_dir();
+        let selection = release_dir.join(SELECTION_FILE);
+        let proposal = Journal::load(&selection).ok().flatten()?;
+        let judged = Journal::load(&release_dir.join(JOURNAL_FILE)).ok()?;
+        if proposal.version != version || !proposal.proposal_only(judged.as_ref()) {
+            return None;
+        }
+        std::fs::remove_file(&selection).ok()?;
+        // A removal that is not yet durable is removed again by the next run.
+        let _ = crate::durable::sync_dir(&release_dir);
+        Some(format!(
+            "{SELECTION_FILE}'s proposal of v{} at {}, which this clone never held as the \
+             fleet's line, was dropped",
+            proposal.version,
+            short(&proposal.commit)
+        ))
+    }
+
+    /// Before a candidate is chosen: a proposal candidate.toml kept of a version whose fleet
+    /// line is another line ([`Journal::never_claimed`]) is dropped, so the run selects as a
+    /// clone with no journal of that line does. A read that fails drops nothing.
+    fn drop_never_claimed(&mut self) -> Flow {
+        if self.opts.supersede || self.supersede.is_some() || self.opts.qualify {
+            return Ok(());
+        }
+        let release_dir = self.b.release_dir();
+        let Some(proposal) = Journal::load(&release_dir.join(SELECTION_FILE))
+            .ok()
+            .flatten()
+        else {
+            return Ok(());
+        };
+        let Ok(judged) = Journal::load(&release_dir.join(JOURNAL_FILE)) else {
+            return Ok(());
+        };
+        if !proposal.proposal_only(judged.as_ref())
+            || !matches!(self.b.fleet_supersession(&proposal.version), Ok(None))
+        {
+            return Ok(());
+        }
+        let Ok(Some(fleet)) = self.b.fleet_existing(&proposal.version) else {
+            return Ok(());
+        };
+        if !proposal.never_claimed(judged.as_ref(), &fleet) {
+            return Ok(());
+        }
+        if let Some(dropped) = self.drop_proposal(&proposal.version) {
+            self.say(&format!(
+                "release: {dropped}: the fleet's line of v{} starts at {}",
+                fleet.version,
+                short(&fleet.base)
+            ));
+            // What the run read at its start, as a clone without that proposal reads it.
+            self.line_selection = judged
+                .as_ref()
+                .filter(|_| {
+                    !self.claim.as_ref().is_some_and(|claim| claim.continued)
+                        && self.opts.commit.is_none()
+                })
+                .map(|journal| LineSelection {
+                    head: journal.commit.clone(),
+                    source: format!(
+                        "this clone's journal {}",
+                        release_dir.join(JOURNAL_FILE).display()
+                    ),
+                    holder: None,
+                    announced: false,
+                    settled: false,
+                });
+            self.journal = judged;
+        }
+        Ok(())
+    }
+
+    /// Before anything is built, judged or written for the candidate: where another holder
+    /// keeps its version's fleet line from this run now, stop as the claim would (exit 4),
+    /// leaving no proposal of a line this clone does not hold. A record that does not read
+    /// stops nothing; the claim decides.
+    fn stop_if_held(&mut self) -> Flow {
+        if self.opts.supersede || self.supersede.is_some() || self.opts.qualify {
+            return Ok(());
+        }
+        let version = self.version();
+        let continued = self.claim.as_ref().is_some_and(|claim| claim.continued);
+        let Ok(Some(why)) = self.b.fleet_contender_refusal(&version, continued) else {
+            return Ok(());
+        };
+        let message = match self.drop_proposal(&version) {
+            Some(dropped) => format!("{why}; {dropped}"),
+            None => why,
+        };
+        self.say(&message);
+        self.last = message;
+        Err(Halt::Said(4))
     }
 
     /// A fleet selection stop is not a [`Refusal`], but it owns the same pending-checkout
@@ -3904,8 +4084,7 @@ impl Run<'_> {
         }
 
         let creds = self.creds.clone();
-        let explicit = self.opts.release_credentials.is_some();
-        let (machine_id, refusals) = self.b.machine(&creds, explicit);
+        let (machine_id, refusals) = self.b.machine(creds.as_deref());
         self.machine_id = machine_id;
         for r in refusals {
             self.refuse(r)?;
@@ -4009,16 +4188,20 @@ impl Run<'_> {
             ));
         }
 
-        self.linux = self.opts.linux.clone();
         let r = self.commit_r();
-        if !self.linux.declared()
-            && self.linux.targets.is_empty()
-            && self.linux.workers.is_empty()
-            && let Some(j) = self.journal.as_ref().filter(|j| j.commit == r)
-        {
-            self.linux = j.linux.clone();
-        }
-        if self.linux.mac_only && self.linux.artifacts.is_some() {
+        let conflict = match self.line_linux() {
+            Ok(linux) => {
+                self.linux = linux;
+                None
+            }
+            Err(refusal) => {
+                self.linux = self.opts.linux.clone();
+                Some(refusal)
+            }
+        };
+        if let Some(refusal) = conflict {
+            self.refuse(refusal)?;
+        } else if self.linux.mac_only && self.linux.artifacts.is_some() {
             self.refuse(Refusal::new(
                 "--mac-only and --linux-artifacts both given",
                 "pass one: --mac-only ships no Linux, --linux-artifacts <dir> ships it",
@@ -5117,10 +5300,13 @@ impl Run<'_> {
                 };
             }
         };
+        // A proposal the fleet never took is dropped first: it is no line this clone holds.
+        self.drop_never_claimed()?;
         let found = self.journal.clone();
         self.choose_candidate(true)?;
         let held = self.holds_line(found.as_ref());
         self.host_fits(held)?;
+        self.stop_if_held()?;
         let r = self.commit_r();
         let journaled = self
             .journal
@@ -5351,6 +5537,15 @@ impl Run<'_> {
             &mut self.journal,
             self.t_start,
         ) {
+            // Beside another holder a line this run only proposed is no line of this clone.
+            let version = selected.version.clone();
+            let why = match (!established && why.starts_with("CUTTING ELSEWHERE:"))
+                .then(|| self.drop_proposal(&version))
+                .flatten()
+            {
+                Some(dropped) => format!("{why}; {dropped}"),
+                None => why,
+            };
             return self.stop_pending_selection(why, pending.as_ref());
         }
         if selected.commit == self.commit_r() {
@@ -6095,6 +6290,42 @@ impl Run<'_> {
         }
     }
 
+    /// The Linux declaration of the line this run cuts. It belongs to the line, not to one of
+    /// its commits: a hop (`--fix`), a supersede or a resume after a re-exec keeps the one the
+    /// line's journal recorded unless this run declares one, and a run whose declaration differs
+    /// from the line's is refused naming both. The line's journal is the one for R, or the
+    /// unfinished one of R's version (the head a hop or supersede replaces).
+    /// # Errors
+    /// This run declares Linux differently from its line.
+    fn line_linux(&self) -> Result<LinuxDecl, Refusal> {
+        let run = &self.opts.linux;
+        let (r, version) = (self.commit_r(), self.version());
+        let line = self
+            .journal
+            .as_ref()
+            .filter(|j| j.commit == r || (!j.finished() && j.version == version))
+            .map(|j| &j.linux)
+            .filter(|linux| linux.declared());
+        let says = run.declared() || !run.targets.is_empty() || !run.workers.is_empty();
+        match line {
+            Some(line) if says && line != run => Err(Refusal::new(
+                format!(
+                    "this run declares Linux as `{}`, and the line v{version} declares `{}`",
+                    run.words(),
+                    line.words()
+                ),
+                format!(
+                    "drop the Linux words to keep the line's declaration, or give exactly \
+                     `{}`; another declaration needs another line: {RELEASE_COMMAND} --forget, \
+                     then start one with it",
+                    line.words()
+                ),
+            )),
+            Some(line) if !says => Ok(line.clone()),
+            _ => Ok(run.clone()),
+        }
+    }
+
     fn commit(&mut self, selecting: bool) -> Result<String, Halt> {
         let Some(mut cand) = self.cand.clone() else {
             return Ok(String::new());
@@ -6123,6 +6354,12 @@ impl Run<'_> {
             });
         }
         let prover = self.prover.clone().ok_or(Halt::Said(1))?;
+        // Every journal this step writes (a hop's pending candidate, a new head's journal) keeps
+        // the line's Linux declaration; step 1 has not run yet, so resolve it here.
+        match self.line_linux() {
+            Ok(linux) => self.linux = linux,
+            Err(refusal) => self.refuse(refusal)?,
+        }
         let mut bumped = self
             .journal
             .as_ref()
@@ -6805,6 +7042,92 @@ impl Run<'_> {
         self.claim_disk(bytes, basis, covers, "through verify")
     }
 
+    /// `ask`, and where it ended only because agh refused for GitHub's allowance (`reset` reads
+    /// that refusal's reset from its answer, [`crate::allowance`]), `ask` again once the
+    /// allowance is back: the wait of [`Run::await_allowance`], at most once in a step. A
+    /// refusal for any other reason, a reset more than an hour ahead, a second such refusal in
+    /// the step, and a dry run are answered as they were.
+    fn past_allowance<T>(
+        &mut self,
+        mut ask: impl FnMut(&mut Self) -> Result<T, Halt>,
+        reset: impl Fn(&T) -> Option<u64>,
+    ) -> Result<T, Halt> {
+        let answer = ask(self)?;
+        if self.dry || self.allowance_waited {
+            return Ok(answer);
+        }
+        let now = self.b.now();
+        let Some(again) = reset(&answer).and_then(|reset| crate::allowance::again_at(reset, now))
+        else {
+            return Ok(answer);
+        };
+        self.allowance_waited = true;
+        self.await_allowance(again)?;
+        ask(self)
+    }
+
+    /// Wait until `again` for GitHub's allowance, said in one line: the owner wait's own seam
+    /// ([`Backend::sleep`], which a signal ends, its time kept out of the step's), with the
+    /// fleet line's lease renewed every [`crate::allowance::RENEW_SECS`]
+    /// ([`Backend::fleet_wait`]), since nothing else renews it while the tree only waits. A
+    /// signal, or the line lost to another holder, ends the run as at any boundary.
+    fn await_allowance(&mut self, again: u64) -> Flow {
+        let step = self.cur;
+        let at = self.b.hms(again);
+        self.say(&format!(
+            "[{:>2}/{}] {:<15} WAIT   waiting until {at} for GitHub's allowance (agh: \
+             rate_limited); this step then asks again, once",
+            step.number(),
+            Step::ALL.len(),
+            step.name()
+        ));
+        loop {
+            let now = self.b.now();
+            if now >= again {
+                return Ok(());
+            }
+            if !self.opts.qualify
+                && let Err(why) = self.b.fleet_wait("a wait for GitHub's allowance")
+            {
+                return self.refuse(
+                    Refusal::new(why, "resume on the fleet line's current holder").could_not_run(),
+                );
+            }
+            self.b
+                .sleep((again - now).min(crate::allowance::RENEW_SECS));
+            self.waited += self.b.now().saturating_sub(now);
+            self.halt_if_interrupted()?;
+        }
+    }
+
+    /// `ask` of the backend through [`Run::past_allowance`]: a refusal that carries agh's
+    /// rate-limited line and is no gate's red.
+    fn asked_past_allowance<T>(
+        &mut self,
+        mut ask: impl FnMut(&mut dyn Backend) -> Result<T, Refusal>,
+    ) -> Result<Result<T, Refusal>, Halt> {
+        self.past_allowance(
+            |run| Ok(ask(&mut *run.b)),
+            |answer| answer.as_ref().err().and_then(refusal_reset),
+        )
+    }
+
+    /// The stage of R that pushes its snapshot ([`Run::stage_claimed`]), through
+    /// [`Run::past_allowance`]: the engine's child reads GitHub through agh, and its log's tail
+    /// holds agh's refusal.
+    fn stage_remote(&mut self, c: &Candidate, p: &Prover) -> Result<Result<Ran, Refusal>, Halt> {
+        self.past_allowance(
+            |run| run.stage_claimed(|run| run.b.stage(c, p, StageTarget::Remote)),
+            |staged| match staged {
+                Ok(ran) if ran.code != 0 => {
+                    crate::allowance::reset_in(ran.detail.iter().map(String::as_str))
+                }
+                Ok(_) => None,
+                Err(refusal) => refusal_reset(refusal),
+            },
+        )
+    }
+
     /// A stage of R, `stage`, under the release's disk claim where this run holds it (step 4's),
     /// else under a claim of its own for [`crate::release_disk::STAGE`], ended as the stage ends:
     /// a stage compiles in the clone's build, and the claim covers each `verify` it runs, which
@@ -6994,7 +7317,7 @@ impl Run<'_> {
         let mut words = self.qualified(c, graph?, done, plan.export == Some(StageTarget::Local))?;
         if deferred {
             self.halt_if_interrupted()?;
-            let ran = self.stage_claimed(|run| run.b.stage(c, p, StageTarget::Remote))?;
+            let ran = self.stage_remote(c, p)?;
             self.refresh();
             match self.stage_verdict(c, ran) {
                 Ok(note) => words.push(note),
@@ -7484,6 +7807,22 @@ impl Run<'_> {
         }
         let run = self.facts.checks.run(Half::Tree);
         if run.checks.is_empty() {
+            let accepted: Vec<&str> = self
+                .facts
+                .checks
+                .owner_accepted
+                .iter()
+                .map(String::as_str)
+                .filter(|name| Half::Tree.checks().iter().any(|c| c.name() == *name))
+                .collect();
+            if !accepted.is_empty() {
+                return Ok(format!(
+                    "`verify release --tree` did not pass: the owner accepted the FAIL of {} for \
+                     {}, and every other tree check's record is ok under this seal",
+                    accepted.join(", "),
+                    short(&c.commit)
+                ));
+            }
             return Ok(format!(
                 "`verify release --tree` passed: every tree check's record of {} is ok under \
                  this seal",
@@ -7777,7 +8116,7 @@ impl Run<'_> {
             } else {
                 crate::publish::CutKind::Real
             };
-            out.extend(self.b.cut_gates(c, &creds, kind));
+            out.extend(self.b.cut_gates(c, creds.as_deref(), kind));
             // Real preparation has bumped or carried already; the dry plan's private bump or
             // planned head is also constructed before checks, so both ask these gates of the
             // head they would ship.
@@ -7823,7 +8162,7 @@ impl Run<'_> {
     }
 
     fn engine_still_staged(&mut self, c: &Candidate, p: &Prover) -> Flow {
-        if let Err(r) = self.b.sync() {
+        if let Err(r) = self.asked_past_allowance(|b| b.sync())? {
             return self.refuse(r);
         }
         self.refresh();
@@ -7874,7 +8213,7 @@ impl Run<'_> {
             "        {why}: {r} is staged again by the engine as it is now, before the publish"
         ));
         self.restage = Some((old, why));
-        let ran = self.stage_claimed(|run| run.b.stage(c, p, StageTarget::Remote))?;
+        let ran = self.stage_remote(c, p)?;
         self.refresh();
         let note = match self.stage_verdict(c, ran) {
             Ok(note) => note,
@@ -8331,14 +8670,21 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// `--release-credentials <file>` where the operator named one; the cut otherwise reads the
+    /// store's release ring itself.
+    fn creds_args(&self) -> Vec<String> {
+        self.creds.as_ref().map_or_else(Vec::new, |creds| {
+            vec![
+                "--release-credentials".to_string(),
+                creds.display().to_string(),
+            ]
+        })
+    }
+
     /// `cut --sign` with the signing profile: step 7's sign side.
     fn sign_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "cut".to_string(),
-            "--sign".to_string(),
-            "--release-credentials".to_string(),
-            self.creds.display().to_string(),
-        ];
+        let mut args = vec!["cut".to_string(), "--sign".to_string()];
+        args.extend(self.creds_args());
         args.extend(self.linux.cut_args());
         args.extend(self.windows_args());
         args
@@ -8421,14 +8767,14 @@ impl Run<'_> {
                 Refusal::new(why, "resume on the fleet line's current holder").could_not_run(),
             );
         }
-        if source && let Err(r) = self.b.publish_begin(&p) {
+        if source && let Err(r) = self.asked_past_allowance(|b| b.publish_begin(&p))? {
             return self.refuse(r);
         }
         let pending = if source {
             None
         } else {
             let n = self.reservation().map_or(0, |r| r.build);
-            match self.b.source_publication(&c, n) {
+            match self.asked_past_allowance(|b| b.source_publication(&c, n))? {
                 Ok(SourceState::Attested) => None,
                 Ok(SourceState::Pending(why)) => Some(why),
                 Err(r) => return self.refuse(r),
@@ -8699,11 +9045,8 @@ impl Run<'_> {
     }
 
     fn cut_args(&self, mode: &CutMode) -> Vec<String> {
-        let mut args = vec![
-            "cut".to_string(),
-            "--release-credentials".to_string(),
-            self.creds.display().to_string(),
-        ];
+        let mut args = vec!["cut".to_string()];
+        args.extend(self.creds_args());
         match mode {
             CutMode::Resume(_) => args.push("--resume".to_string()),
             _ => {

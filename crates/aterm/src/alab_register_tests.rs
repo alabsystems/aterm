@@ -3,8 +3,10 @@
 
 use super::*;
 
-/// What a shipped build logs: only a pass the owner would want to hear of passes its filter.
-/// NEGATIVE CONTROL: with `speaks` always false, the first assertion fails.
+/// What a shipped build logs: only a pass the owner would want to hear of passes its filter, a
+/// close of a machine row among them.
+/// NEGATIVE CONTROL: with `speaks` always false, the first assertion fails; with it not naming
+/// `Closed`, the close's assertion fails.
 #[test]
 fn a_held_pass_and_an_error_reach_a_shipped_builds_log() {
     let pass = |outcome, findings| {
@@ -16,6 +18,17 @@ fn a_held_pass_and_an_error_reach_a_shipped_builds_log() {
     };
     assert!(speaks(&pass(Outcome::Held, Vec::new())));
     assert!(speaks(&pass(Outcome::QuotaSpent, Vec::new())));
+    assert!(speaks(&pass(
+        Outcome::Closed {
+            mac: "mc-2".into(),
+            into: "mc-1".into(),
+        },
+        Vec::new(),
+    )));
+    assert!(!speaks(&pass(
+        Outcome::Refreshed { mac: "mc-1".into() },
+        Vec::new(),
+    )));
     let refused = aterm_db::alab::register::model_key("no such model!").map(|_| Registered {
         outcome: Outcome::Unchanged,
         findings: Vec::new(),

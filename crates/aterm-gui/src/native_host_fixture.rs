@@ -226,7 +226,10 @@ fn serve_connection_observed(
                 .any(|words| {
                     matches!(
                         words[0],
-                        "codex-renewal" | "codex-rotation" | "codex-exec-handoff"
+                        "codex-renewal"
+                            | "codex-rotation"
+                            | "codex-login-rotation"
+                            | "codex-exec-handoff"
                     ) && words[1] == "prepare"
                 });
         let drop_consume_ack = real_child
@@ -237,7 +240,10 @@ fn serve_connection_observed(
                 .any(|words| {
                     matches!(
                         words[0],
-                        "codex-renewal" | "codex-rotation" | "codex-exec-handoff"
+                        "codex-renewal"
+                            | "codex-rotation"
+                            | "codex-login-rotation"
+                            | "codex-exec-handoff"
                     ) && words[1] == "consume"
                 });
         let drop_signal_ack = real_child

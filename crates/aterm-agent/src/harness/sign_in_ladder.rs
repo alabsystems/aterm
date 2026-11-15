@@ -11,8 +11,17 @@
 //! proven browser profile; and a webmail-only mailbox (the last two beside a headless browser).
 //! While none is ready, the LAN vault is refreshed by a bounded `aterm secrets sync` where this
 //! machine is a member, since it can deliver a newly published `ai-mailbox.toml`, after which
-//! the routes are read again. The line also names what is never a route here: the row's own desk
-//! browser profile, which opens a window and so is never used unattended, and
+//! the routes are read again. Before a ready route opens any browser or window for a row the
+//! lab keys a token entry for, and before a row with none is recorded as such, the vault route
+//! ([`Route::Vault`]) reads whether the row's year token is in use here, refreshing the vault
+//! first (that same bounded sync, on its own clock) once in the row's sign-in workflow, since
+//! another Mac may have minted the token in aterm's window, or verified one, since this one last
+//! applied the vault: where it is in use, the row runs on it, the attempt is recorded `on-token`
+//! by the `vault` route and no browser opens. A token another Mac minted in aterm's window or
+//! headless route serves here from its mint, verified or not; one it minted at a person's
+//! terminal, or by a meta that names no route, serves only that Mac until verified, so the row's
+//! ready route runs as before. The line also names what is never a route here:
+//! the row's own desk browser profile, which opens a window and so is never used unattended, and
 //! `[harness] hosts`, which renew their own logins and none of this machine's. No route copies,
 //! stores or relays a login, and none sends a sign-in, its URL or a code to another machine:
 //! a route that runs makes a fresh login on this machine. One exception stands, and only in
@@ -123,6 +132,12 @@ impl Vault {
         matches!(self, Self::Applied(_) | Self::AppliedPartly(_))
     }
 
+    /// Whether the sync read the whole vault: it applied every file, or found nothing newer. A
+    /// failed, partial or refused sync leaves what the vault holds unknown.
+    pub(super) fn read_whole(&self) -> bool {
+        matches!(self, Self::Applied(_) | Self::Unchanged(_))
+    }
+
     /// A bounded diagnostic and its agreeing exit status, or an older sync's first line.
     /// Legacy applied output uses its failed count when present, because work after the
     /// files can also make the exit non-zero. Malformed versioned output never falls back
@@ -186,17 +201,59 @@ impl Vault {
         })
     }
 
-    /// A sync that did not run to its end, by the error [`super::align::capture_bounded`] gave:
-    /// one that could not be started, one ended at its `budget`, one whose output could not be
-    /// read. The error's own text, which can name a path, is not kept.
+    /// A sync that did not run to its end, by the error [`super::align::capture_bounded`] gave
+    /// ([`Unfinished::of`]): one that could not be started, one ended at its `budget`, one whose
+    /// output could not be read, which every other error of that capture is taken for. The
+    /// error's own text, which can name a path, is not kept.
     pub(super) fn of_run_error(error: &str, budget: Duration) -> Self {
-        Self::Failed(if error.starts_with("it will not run") {
-            "it could not be started".to_owned()
-        } else if error.contains("deadline") {
-            format!("timed out after {} s", budget.as_secs())
-        } else {
-            "its output could not be read".to_owned()
+        Self::Failed(match Unfinished::of(error) {
+            Some(Unfinished::TimedOut) => format!("timed out after {} s", budget.as_secs()),
+            Some(why) => why.words().to_owned(),
+            None => Unfinished::Unread.words().to_owned(),
         })
+    }
+}
+
+/// Why a run aterm started did not run to its end, in closed words: what a record keeps of a
+/// bounded capture's error ([`super::align::capture_bounded`] and its owned kin), whose own text
+/// can name a path and is never kept. One reading for a vault refresh ([`Vault::of_run_error`])
+/// and a sign-in's run ([`super::cli::RenewalObservation`], [`how_it_ended`]'s `cause`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum Unfinished {
+    /// It could not be started: its program did not spawn, or it could not be tied to this
+    /// aterm, whose executable an update replaced (`it will not run…`).
+    NotStarted,
+    /// It ran past its deadline and was ended.
+    TimedOut,
+    /// Its output could not be read.
+    Unread,
+    /// A signal ended it: it gave no exit code.
+    Signal,
+}
+
+impl Unfinished {
+    /// The way the capture's `error` says its run did not finish; `None` for an error that says
+    /// none of them (a stop its watch asked for, a reap that failed), which then gives no cause.
+    pub(super) fn of(error: &str) -> Option<Self> {
+        if error.starts_with("it will not run") {
+            Some(Self::NotStarted)
+        } else if error.contains("deadline") {
+            Some(Self::TimedOut)
+        } else if error.starts_with("its output") || error.starts_with("its stdout") {
+            Some(Self::Unread)
+        } else {
+            None
+        }
+    }
+
+    /// Its words, after `the sign-in did not finish: `.
+    pub(super) const fn words(self) -> &'static str {
+        match self {
+            Self::NotStarted => "it could not be started",
+            Self::TimedOut => "it timed out",
+            Self::Unread => "its output could not be read",
+            Self::Signal => "a signal ended it",
+        }
     }
 }
 
@@ -207,6 +264,10 @@ pub(super) enum Route {
     Mailbox,
     /// The row's own headless browser profile, driven headless.
     Profile,
+    /// The row's year token in the vault, in use here: no browser and no login. Never what
+    /// [`Read::route`] returns: the ladder takes it before a ready route runs, and before a row
+    /// with none is recorded as such ([`on_token_words`]).
+    Vault,
 }
 
 impl Route {
@@ -215,6 +276,7 @@ impl Route {
         match self {
             Self::Mailbox => "mailbox",
             Self::Profile => "profile",
+            Self::Vault => "vault",
         }
     }
 }
@@ -334,72 +396,75 @@ impl Read {
     }
 }
 
-/// How one run of a route ended, in the words its record says: the upkeep's ladder and a
-/// renewal run by hand ([`super::cli`]'s `note_hand_renewal`) both say it here. A run of
-/// `claude auth login` that made no login, or did not finish, is named by how it exited (`code`,
-/// where the run gave one), never read as the vendor's refusal, and then by what its opener's
-/// sign-in met where its outcome file names it (`met`: Cloudflare's bot check or block page, no
-/// callback in time, or a failure with the opener's own reason;
-/// [`super::open_url::Met::words`]), so a bot check is named on record. A run that ended where
-/// only a person goes on is what it met alone, since that may be a missing desktop session,
-/// the consent page's human check, a window a person closed or a consent page that named
-/// another account, and no bot check. What it met never enters the ladder's backoff key,
-/// which is what the ladder read before the run ([`Ladder::failed`]).
+/// How one run of a sign-in ended, in the one wording every place that says it reads: the row's
+/// record from the upkeep's ladder, whichever custody ran it, a renewal run by hand
+/// ([`super::cli`]'s `note_hand_renewal`) and its terminal lines, and a shared-custody run's
+/// diagnostic, which the fact menu's `LoginDiagnostic` shows
+/// ([`super::cli::RenewalObservation::ended`]). The run is `the sign-in`, which is true of every
+/// CLI's. A run that made no login is named by how it exited (`code`, where the run gave one),
+/// never read as the vendor's refusal, and then by what its opener's sign-in met where its
+/// outcome file names it (`met`: Cloudflare's bot check or block page, no callback in time, or a
+/// failure with the opener's own reason; [`super::open_url::Met::words`]), so a bot check is
+/// named on record. A run that did not finish says how it exited where its exit is why (a
+/// signal's 128 + n, or a negative code: not 0, which a check after the run failed), then what
+/// it met, else why it could not be started or read (`cause`: [`Unfinished::words`] on record),
+/// where any is known. A run that ended where only a person goes on (a bot check that did not
+/// clear, or another CLI's stop for a person) is what it met alone, since that may be a missing
+/// desktop session, the consent page's human check, a window a person closed or a consent page
+/// that named another account, and no bot check. A run this Mac deferred for a fresh attempt
+/// says the deferral, then how the run itself ended (its exit, what it met, else its cause),
+/// since the deferral is this Mac's and the rest is the run's. Each says how the run ended once.
+/// What it met never enters the ladder's backoff key, which is what the ladder read before the
+/// run ([`Ladder::failed`]).
 pub(super) fn how_it_ended(
-    renewal: super::cli::Renewal,
-    code: Option<i32>,
-    met: Option<&super::open_url::Met>,
-) -> String {
-    use super::cli::Renewal;
-    match (renewal, met) {
-        (Renewal::AuthFailed, Some(met)) => match code {
-            Some(code) => format!("claude auth login exited {code}; {}", met.words()),
-            None => format!("claude auth login ended; {}", met.words()),
-        },
-        (Renewal::Failed, Some(met)) => format!("{}; {}", run_words(renewal, code), met.words()),
-        (Renewal::BotCheck, Some(met)) => met.words(),
-        _ => run_words(renewal, code),
-    }
-}
-
-/// [`how_it_ended`], then why a run that ended [`Renewal::Failed`] could not be started or read
-/// (`cause`): the words of a failure the run itself gave no exit or page for.
-///
-/// [`Renewal::Failed`]: super::cli::Renewal::Failed
-pub(super) fn how_it_ended_because(
     renewal: super::cli::Renewal,
     code: Option<i32>,
     met: Option<&super::open_url::Met>,
     cause: Option<&str>,
 ) -> String {
-    let words = how_it_ended(renewal, code, met);
-    match cause {
-        Some(why) if renewal == super::cli::Renewal::Failed && met.is_none() => {
-            format!("{words}: {why}")
-        }
-        _ => words,
-    }
-}
-
-/// [`how_it_ended`] without what the page met.
-fn run_words(renewal: super::cli::Renewal, code: Option<i32>) -> String {
     use super::cli::Renewal;
-    match renewal {
-        Renewal::Renewed => "signed in".to_owned(),
-        Renewal::OtherRenewed => "another configured account signed in".to_owned(),
-        Renewal::AuthFailed => match code {
-            Some(code) => format!("claude auth login exited {code} with no login made"),
-            None => "claude auth login ended with no login made".to_owned(),
+    let met = met.map(super::open_url::Met::words);
+    match (renewal, met) {
+        (Renewal::AuthFailed, None) => match code {
+            Some(code) => format!("the sign-in exited {code} with no login made"),
+            None => "the sign-in ended with no login made".to_owned(),
         },
-        Renewal::WrongAccount => "another account signed in".to_owned(),
-        Renewal::Failed => "the sign-in did not finish".to_owned(),
-        Renewal::SigninHeld => "sign-in admission was held, so nothing ran".to_owned(),
-        Renewal::Deferred => {
-            "local sign-in state changed or was unavailable; deferred for a fresh attempt"
-                .to_owned()
+        (Renewal::AuthFailed, Some(met)) => match code {
+            Some(code) => format!("the sign-in exited {code}; {met}"),
+            None => format!("the sign-in ended; {met}"),
+        },
+        (Renewal::Failed, met) => {
+            let code = code.filter(|code| !(0..=127).contains(code));
+            match (code, met, cause) {
+                (Some(code), Some(met), _) => {
+                    format!("the sign-in did not finish: it exited {code}; {met}")
+                }
+                (Some(code), None, _) => format!("the sign-in did not finish: it exited {code}"),
+                (None, Some(met), _) => format!("the sign-in did not finish; {met}"),
+                (None, None, Some(why)) => format!("the sign-in did not finish: {why}"),
+                (None, None, None) => "the sign-in did not finish".to_owned(),
+            }
         }
-        Renewal::NeedsPerson => "its page waited on a person".to_owned(),
-        Renewal::BotCheck => "it met Cloudflare's bot check, which did not clear".to_owned(),
+        (Renewal::BotCheck | Renewal::NeedsPerson, Some(met)) => met,
+        (Renewal::BotCheck, None) => {
+            "it met Cloudflare's bot check, which did not clear".to_owned()
+        }
+        (Renewal::NeedsPerson, None) => "its page waited on a person".to_owned(),
+        (Renewal::Deferred, met) => {
+            let deferred = "deferred: local sign-in state changed or was unavailable";
+            let ran = match (code, met, cause) {
+                (Some(code), Some(met), _) => format!("the sign-in exited {code}; {met}"),
+                (Some(code), None, _) => format!("the sign-in exited {code}"),
+                (None, Some(met), _) => met,
+                (None, None, Some(why)) => format!("the sign-in did not finish: {why}"),
+                (None, None, None) => return deferred.to_owned(),
+            };
+            format!("{deferred}; {ran}")
+        }
+        (Renewal::Renewed, _) => "signed in".to_owned(),
+        (Renewal::OtherRenewed, _) => "another configured account signed in".to_owned(),
+        (Renewal::WrongAccount, _) => "another account signed in".to_owned(),
+        (Renewal::SigninHeld, _) => "sign-in admission was held, so nothing ran".to_owned(),
     }
 }
 
@@ -407,6 +472,21 @@ fn run_words(renewal: super::cli::Renewal, code: Option<i32>) -> String {
 /// ([`how_it_ended`]) and every route the ladder read ([`Read::words`]).
 pub(super) fn failed_words(route: Route, how: &str, read: &Read) -> String {
     format!("{}: {how}; {}", route.as_str(), read.words())
+}
+
+/// What the vault route says where it found the row's year token in use here, ending at `until`
+/// (unix seconds), then every route the ladder read, the vault's refresh among them where one
+/// ran: `vault: its year token is in use here until 2027-11-12; no browser opened; profile(ready)
+/// mailbox(none configured) vault(applied seq 52) …`. The attempt's record is the route's word
+/// alone, as a route that signed the row in records its own.
+pub(super) fn on_token_words(until: u64, read: &Read) -> String {
+    let (y, m, d) =
+        aterm_types::rfc3339::civil_from_days(i64::try_from(until / 86_400).unwrap_or(i64::MAX));
+    format!(
+        "{}: its year token is in use here until {y:04}-{m:02}-{d:02}; no browser opened; {}",
+        Route::Vault.as_str(),
+        read.words()
+    )
 }
 
 /// The first wait before a row whose ladder found no route, or whose route failed, is tried
@@ -458,14 +538,17 @@ struct VaultRun {
 /// An opaque digest of this home's vault source and this Mac's standing with that vault.
 pub(super) type VaultContext = [u8; 32];
 
-/// What the ladder remembers in this process between upkeeps: each failing row's backoff and
-/// the vault refresh's clock.
+/// What the ladder remembers in this process between upkeeps: each failing row's backoff, the
+/// vault refresh's clock, and the sign-in workflow whose vault route each row has refreshed for.
 #[derive(Debug, Default)]
 pub(super) struct Ladder {
     backoff: BTreeMap<String, Backoff>,
     vault: Option<VaultRun>,
     /// Last observed context survives a network move that discards the cached result.
     context: Option<VaultContext>,
+    /// The workflow each row's vault route last refreshed the vault for
+    /// ([`Self::token_refreshed`]).
+    token_refreshed: BTreeMap<String, super::accounts::WorkflowToken>,
 }
 
 /// What [`Ladder::vault_turn`] says of the vault now.
@@ -601,6 +684,26 @@ impl Ladder {
     /// Notes that `label` signed in: its backoff ends.
     pub(super) fn signed_in(&mut self, label: &str) {
         self.backoff.remove(label);
+    }
+
+    /// Whether `label`'s vault route has refreshed the vault in `workflow` already: one refresh
+    /// per sign-in workflow, never one per pass ([`Self::note_token_refreshed`]).
+    pub(super) fn token_refreshed(
+        &self,
+        label: &str,
+        workflow: super::accounts::WorkflowToken,
+    ) -> bool {
+        self.token_refreshed.get(label) == Some(&workflow)
+    }
+
+    /// Notes that `label`'s vault route had the vault's refresh in `workflow`: one that read the
+    /// whole vault ([`Vault::read_whole`]), never one that failed.
+    pub(super) fn note_token_refreshed(
+        &mut self,
+        label: &str,
+        workflow: super::accounts::WorkflowToken,
+    ) {
+        self.token_refreshed.insert(label.to_owned(), workflow);
     }
 
     /// A newly checked preparation replaces the authority behind the prior attempt.
@@ -866,21 +969,26 @@ pub(super) fn last_started(store: &super::accounts::Store) -> std::io::Result<Op
 }
 
 /// The file beside [`SIGNIN_SPACING_FILE`] that names the sign-in this Mac is running now. It is
-/// written at every start, while the sign-in lock is held, and removed when the provider flow
-/// ends ([`RunningMark`]).
+/// written at every start, while the sign-in lock is held, by the process that holds it, and
+/// removed when the provider flow ends ([`RunningMark`]). It names that process by its identity
+/// (its number and birth, and on Apple its pid version), so a record outlives nothing: a
+/// process killed mid sign-in drops the lock with it, and the record then names a process that
+/// is gone, whose number another may take but not its birth.
 pub(super) const SIGNIN_RUNNING_FILE: &str = "signin-running";
 
-/// The first line of [`SIGNIN_RUNNING_FILE`].
-const RUNNING_HEAD: &str = "aterm-signin-running-v1";
+/// The first line of [`SIGNIN_RUNNING_FILE`]. A `v1` record named its process by number alone;
+/// it reads as no record, so a build that writes one and a build that reads this one each see
+/// no sign-in running.
+const RUNNING_HEAD: &str = "aterm-signin-running-v2";
 
 /// The sign-in this Mac is running: its CLI's id, its label, when it started (Unix seconds) and
-/// the process that runs it.
+/// the process that runs it, which holds the sign-in lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Running {
     cli: String,
     label: String,
     at: i64,
-    pid: u32,
+    holder: aterm_uds::process::Identity,
 }
 
 impl Running {
@@ -895,7 +1003,7 @@ impl Running {
             cli: words.next()?.to_owned(),
             label: words.next()?.to_owned(),
             at: words.next()?.parse().ok()?,
-            pid: words.next()?.parse().ok()?,
+            holder: aterm_uds::process::Identity::parse(words.next()?)?,
         };
         (words.next().is_none()
             && lines.next().is_none()
@@ -903,12 +1011,39 @@ impl Running {
         .then_some(running)
     }
 
-    /// The file's text: the head line, then `<cli> <label> <at> <pid>`.
+    /// The file's text: the head line, then `<cli> <label> <at> <holder>`, the holder as its
+    /// identity token ([`aterm_uds::process::Identity::token`]).
     fn text(&self) -> String {
         format!(
             "{RUNNING_HEAD}\n{} {} {} {}\n",
-            self.cli, self.label, self.at, self.pid
+            self.cli,
+            self.label,
+            self.at,
+            self.holder.token()
         )
+    }
+}
+
+/// The identity of the live process `pid` as a record of the sign-in lock's holder names it:
+/// its number, birth and, where the kernel keeps one (Apple), pid version, which an exec moves
+/// (the lock is opened close-on-exec, so a holder that exec'd holds it no more). On Apple and
+/// Linux it is read of a process of this user that is no zombie
+/// ([`aterm_uds::process::read_identity`]); elsewhere of its birth alone
+/// ([`aterm_uds::process::read_birth`]). `None` where none can be read.
+fn holder(pid: u32) -> Option<aterm_uds::process::Identity> {
+    let pid = i32::try_from(pid).ok()?;
+    if cfg!(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android"
+    )) {
+        aterm_uds::process::read_identity(pid)
+    } else {
+        Some(aterm_uds::process::Identity {
+            pid,
+            birth: aterm_uds::process::read_birth(pid)?,
+            idversion: None,
+        })
     }
 }
 
@@ -926,9 +1061,10 @@ struct RunningMark {
 }
 
 impl RunningMark {
-    /// Names `cli`'s `label` as the sign-in this process runs from `at`. The record is a fact
-    /// for readers and no admission, so a record that cannot be written starts the sign-in
-    /// all the same, unnamed.
+    /// Names `cli`'s `label` as the sign-in this process runs from `at`, this process being the
+    /// sign-in lock's holder. The record is a fact for readers and no admission, so a record
+    /// that cannot be written, or whose holder's identity cannot be read, starts the sign-in all
+    /// the same, unnamed.
     fn note(
         store: &super::accounts::Store,
         cli: super::accounts::Cli,
@@ -940,7 +1076,7 @@ impl RunningMark {
             cli: cli.id().to_owned(),
             label: label.to_owned(),
             at,
-            pid: std::process::id(),
+            holder: holder(std::process::id())?,
         }
         .text();
         super::atomic_write::write_atomic(&path, &text).ok()?;
@@ -973,8 +1109,10 @@ pub(super) fn running_fixture(
 }
 
 /// The label of `cli`'s row whose sign-in runs on `store`'s Mac now, in this process or another:
-/// what [`SIGNIN_RUNNING_FILE`] names while the process that wrote it lives. A sign-in killed
-/// mid-run leaves its record, which then names nothing.
+/// what [`SIGNIN_RUNNING_FILE`] names while the process it names, the sign-in lock's holder,
+/// still lives as that same process ([`holder`] reads the identity the record holds). A sign-in
+/// killed mid-run leaves its record, which then names nothing, even once another process takes
+/// its number.
 #[must_use]
 pub(super) fn signing_in(
     store: &super::accounts::Store,
@@ -985,7 +1123,8 @@ pub(super) fn signing_in(
         .flatten()
         .as_deref()
         .and_then(Running::parse)?;
-    (running.cli == cli.id() && aterm_uds::process::pid_alive(running.pid)).then_some(running.label)
+    (running.cli == cli.id() && holder(running.holder.pid.unsigned_abs()) == Some(running.holder))
+        .then_some(running.label)
 }
 
 /// Why this Mac may start one sign-in. There is no other reason to start one.

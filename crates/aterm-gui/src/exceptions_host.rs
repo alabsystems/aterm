@@ -1934,7 +1934,7 @@ fn claim_started_sid(entry: &aterm_messages::DigestEntry) -> Option<&str> {
             if let Some(sid) = word
                 .strip_prefix('@')
                 .map(|s| s.trim_end_matches([',', ';', ':', '.', ')']))
-                .filter(|s| s.starts_with("s-") && s.len() > 2)
+                .filter(|s| aterm_session::is_minted_sid(s))
             {
                 return Some(sid);
             }

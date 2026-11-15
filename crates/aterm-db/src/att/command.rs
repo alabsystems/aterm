@@ -2,9 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm db table …`: the generic verbs for any ATT/1 table this build compiles
-//! (docs/DESIGN-alab-lab-model-2026-11-01.md §8). Every surface masks addresses (`ab…@…`)
-//! unless `--show-addresses` is given, and no refusal quotes a value. JSON output is for
-//! scripts and agents; there is no MCP server.
+//! (docs/DESIGN-alab-lab-model-2026-11-01.md §8). Every surface shows a value as it is stored
+//! (addresses and phone numbers are ordinary data), a secret column's reference as its
+//! secret-store entry's name, and no refusal quotes a value. JSON output is for scripts and
+//! agents; there is no MCP server.
 
 use super::{Capacity, Diff, Entry, Handle, Point, Roll, Saved, TABLES, Usage, View, edit, find};
 use crate::{
@@ -46,8 +47,8 @@ pub const USAGE: &str = "aterm db table — typed ATT/1 tables on Commons (Unix)
   apply <file>                          write an exported file's changed cells\n\
   edit <app>/<role> <collection> [--where col=val]...\n\
                                         edit in amacs's spreadsheet mode, then write\n\
-  Addresses are masked unless --show-addresses is given. A header starting with = is\n\
-  read-only; a conflicted cell shows ⚠ a ‖ b; a new row leaves its pk empty; a deleted row is\n\
+  A secret column shows •••••• where its cell holds the value sealed, else the name of its\n\
+  secret-store entry. A header starting with = is read-only; a conflicted cell shows ⚠ a ‖ b; a new row leaves its pk empty; a deleted row is\n\
   retired. A cell that changed since the export is never overwritten. A point is an\n\
   operation as history prints it: --at reads the table as that operation's causal past holds it.\n";
 
@@ -76,7 +77,7 @@ pub fn main_entry(words: &[String]) -> ExitCode {
     match run(
         &paths,
         words,
-        &mut |file: &Path, line: usize, secret: &[String]| super::amacs(file, line, Some(secret)),
+        &mut |file: &Path, line: usize| super::amacs(file, line, Some(&[])),
         &mut report,
     ) {
         Ok(Output::Json(value)) => match aterm_json::to_string(&value) {
@@ -95,7 +96,6 @@ pub fn main_entry(words: &[String]) -> ExitCode {
 #[derive(Default)]
 struct Args {
     operands: Vec<String>,
-    reveal: bool,
     json: bool,
     tsv: bool,
     publish: bool,
@@ -117,7 +117,6 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 .ok_or_else(|| Error::new(&format!("{name} needs a value")))
         };
         match word.as_str() {
-            "--show-addresses" => args.reveal = true,
             "--json" => args.json = true,
             "--publish" if verb == "schema" => args.publish = true,
             "--tsv" if verb == "export" => {
@@ -245,7 +244,7 @@ pub fn run(
                 .collection(args.operand(1, "<collection>")?)?;
             let pk = args.operand(2, "<pk>")?;
             let view = handle.view_at(args.at.unwrap_or(Point::Head))?;
-            Ok(Output::Json(get(&view, collection, pk, args.reveal)?))
+            Ok(Output::Json(get(&view, collection, pk)?))
         }
         "scan" => {
             args.at_most(2)?;
@@ -255,21 +254,11 @@ pub fn run(
                 .collection(args.operand(1, "<collection>")?)?;
             let view = handle.view_at(args.at.unwrap_or(Point::Head))?;
             if args.tsv && !args.json {
-                let export = view.export_grid(
-                    handle.compiled().table,
-                    collection,
-                    &args.filters,
-                    args.reveal,
-                    None,
-                )?;
+                let export =
+                    view.export_grid(handle.compiled().table, collection, &args.filters)?;
                 return Ok(Output::Text(export.text));
             }
-            Ok(Output::Json(scan(
-                &view,
-                collection,
-                &args.filters,
-                args.reveal,
-            )?))
+            Ok(Output::Json(scan(&view, collection, &args.filters)?))
         }
         "history" => {
             args.at_most(3)?;
@@ -284,7 +273,6 @@ pub fn run(
                 &handle.history()?,
                 collection,
                 pk,
-                args.reveal,
             )))
         }
         "diff" => {
@@ -323,7 +311,6 @@ pub fn run(
                 &handle,
                 &diff,
                 collection.map(|c| c.name),
-                args.reveal,
             )))
         }
         "check" => {
@@ -356,13 +343,7 @@ pub fn run(
                 .ok_or_else(|| Error::new("export needs --tsv <file>"))?;
             let export = handle
                 .view_at(args.at.unwrap_or(Point::Head))?
-                .export_grid(
-                    handle.compiled().table,
-                    collection,
-                    &args.filters,
-                    args.reveal,
-                    None,
-                )?;
+                .export_grid(handle.compiled().table, collection, &args.filters)?;
             save(Path::new(file), &export.text, &export.base)?;
             Ok(Output::Json(
                 json!({"file": file, "baseline": baseline(Path::new(file)),
@@ -379,15 +360,7 @@ pub fn run(
             let collection = handle
                 .compiled()
                 .collection(args.operand(1, "<collection>")?)?;
-            let edited = edit::edit(
-                &handle,
-                collection,
-                &args.filters,
-                args.reveal,
-                None,
-                open,
-                report,
-            )?;
+            let edited = edit::edit(&handle, collection, &args.filters, open, report)?;
             Ok(Output::Json(json!({
                 "rounds": edited.rounds,
                 "records": edited.applied.iter().map(|a| a.records).sum::<usize>(),
@@ -404,12 +377,12 @@ pub fn run(
 
 pub(crate) use crate::typed::keys::safe_key;
 
-/// A field as JSON for scripts: a value (addresses masked unless `reveal`), a conflict's
-/// candidates, or a set's members.
-fn field_json(column: Option<&crate::typed::Column>, field: &Field, reveal: bool) -> Value {
+/// A field as JSON for scripts: a value as its column shows it ([`grid::show`]), a conflict's
+/// candidates, or a set's members; a field of no compiled column raw ([`grid::raw_shown`]).
+fn field_json(column: Option<&crate::typed::Column>, field: &Field) -> Value {
     let one = |x: &Value| match column {
-        Some(column) => grid_value(&column.ty, x, reveal),
-        None => grid::raw_masked(x, reveal),
+        Some(column) => grid_value(&column.ty, x),
+        None => grid::raw_shown(x),
     };
     match field {
         Field::Value(candidate) => one(&candidate.value.x),
@@ -425,9 +398,12 @@ fn field_json(column: Option<&crate::typed::Column>, field: &Field, reveal: bool
                 field
                     .members()
                     .into_iter()
-                    .map(|elem| match inner {
-                        Some(inner) => grid_value(inner, &Value::String(elem.to_owned()), reveal),
-                        None => grid::raw_masked(&Value::String(elem.to_owned()), reveal),
+                    .map(|elem| {
+                        let elem = Value::String(elem.to_owned());
+                        match inner {
+                            Some(inner) => grid_value(inner, &elem),
+                            None => grid::raw_shown(&elem),
+                        }
                     })
                     .collect::<Vec<_>>()
             )
@@ -435,46 +411,41 @@ fn field_json(column: Option<&crate::typed::Column>, field: &Field, reveal: bool
     }
 }
 
-/// A typed value with its addresses masked unless `reveal`.
-fn grid_value(ty: &Ty, x: &Value, reveal: bool) -> Value {
-    let safe = crate::typed::secret::mask_type(ty, x);
-    let x = &safe;
-    if matches!(ty, Ty::Secret) {
-        return if x.is_null() {
-            Value::Null
-        } else {
-            Value::String(crate::typed::secret::MASK.to_owned())
+/// A typed value as JSON: null as null, a secret reference as its entry's name, any other value
+/// of a secret column as the mask, any other value its type admits as stored, and one it does not
+/// raw ([`grid::raw_shown`]).
+fn grid_value(ty: &Ty, x: &Value) -> Value {
+    if x.is_null() {
+        return Value::Null;
+    }
+    if matches!(ty, Ty::Secret) || !crate::typed::cell::admissible(ty, x) {
+        return match ty {
+            Ty::SecretRef | Ty::Secret => Value::String(crate::typed::secret::MASK.to_owned()),
+            _ => grid::raw_shown(x),
         };
     }
-    if !crate::typed::cell::admissible(ty, x) {
-        return grid::raw_masked(x, reveal);
-    }
     match ty {
-        Ty::Email => match x.as_str() {
-            Some(address) if !reveal => Value::String(grid::mask(address)),
-            _ => x.clone(),
-        },
-        _ if ty.pii() && !reveal => grid::raw_masked(x, false),
-        _ => crate::typed::secret::masked(x),
+        Ty::SecretRef => Value::String(grid::show(ty, x)),
+        _ => x.clone(),
     }
 }
 
-fn row_json(
-    collection: &Collection,
-    pk: &str,
-    row: &crate::typed::cell::Row,
-    reveal: bool,
-) -> Value {
+fn row_json(collection: &Collection, pk: &str, row: &crate::typed::cell::Row) -> Value {
     let mut object = Map::new();
     object.insert("pk".into(), Value::String(safe_key(pk).to_owned()));
     for (name, field) in &row.fields {
-        let column = collection.column(name).filter(|_| !row.raw.contains(name));
+        let compiled = collection.column(name);
+        let column = compiled.filter(|_| !row.raw.contains(name));
         let value = match column {
+            // A secret column some candidate of which names no entry of its own cell.
+            None if compiled.is_some_and(|c| matches!(c.ty, Ty::SecretRef | Ty::Secret)) => {
+                Value::String(crate::typed::secret::MASK.to_owned())
+            }
             Some(column) if row.claims.contains_key(name) => row.claims[name]
                 .as_ref()
-                .map_or(Value::Null, |value| grid_value(&column.ty, value, reveal)),
-            Some(column) => field_json(Some(column), field, reveal),
-            None => field_json(None, field, reveal),
+                .map_or(Value::Null, |value| grid_value(&column.ty, value)),
+            Some(column) => field_json(Some(column), field),
+            None => field_json(None, field),
         };
         object.insert(safe_key(name).to_owned(), value);
     }
@@ -491,7 +462,7 @@ fn owned_only(collection: &Collection) -> Result<()> {
     Ok(())
 }
 
-fn get(view: &View, collection: &'static Collection, pk: &str, reveal: bool) -> Result<Value> {
+fn get(view: &View, collection: &'static Collection, pk: &str) -> Result<Value> {
     owned_only(collection)?;
     if collection.kind == Kind::Owned {
         let row = view
@@ -500,7 +471,7 @@ fn get(view: &View, collection: &'static Collection, pk: &str, reveal: bool) -> 
             .and_then(|read| read.rows.get(pk))
             .ok_or_else(|| Error::new(&format!("{}: no row with that key", collection.name)))?;
         return Ok(json!({"collection": collection.name, "pk": safe_key(pk),
-            "machine": keys::uuid32(&row.machine), "row": grid::raw_masked(&row.value, reveal)}));
+            "machine": keys::uuid32(&row.machine), "row": grid::raw_shown(&row.value)}));
     }
     let projection = view.project(collection);
     let row = projection
@@ -519,7 +490,7 @@ fn get(view: &View, collection: &'static Collection, pk: &str, reveal: bool) -> 
         })
         .map(|(name, _)| safe_key(name))
         .collect();
-    let mut shown = json!({"collection": collection.name, "row": row_json(collection, pk, row, reveal),
+    let mut shown = json!({"collection": collection.name, "row": row_json(collection, pk, row),
         "lifecycle": row.lifecycle().unwrap_or("live"), "conflicts": conflicts,
         "raw": row.raw.iter().map(|name| safe_key(name)).collect::<Vec<_>>()});
     if !row.claims.is_empty() {
@@ -530,7 +501,7 @@ fn get(view: &View, collection: &'static Collection, pk: &str, reveal: bool) -> 
                 row.fields.get(name).map(|field| {
                     (
                         safe_key(name).to_owned(),
-                        field_json(collection.column(name), field, reveal),
+                        field_json(collection.column(name), field),
                     )
                 })
             })
@@ -543,12 +514,7 @@ fn get(view: &View, collection: &'static Collection, pk: &str, reveal: bool) -> 
     Ok(shown)
 }
 
-fn scan(
-    view: &View,
-    collection: &'static Collection,
-    filters: &[Where],
-    reveal: bool,
-) -> Result<Value> {
+fn scan(view: &View, collection: &'static Collection, filters: &[Where]) -> Result<Value> {
     owned_only(collection)?;
     if collection.kind == Kind::Owned {
         if !filters.is_empty() {
@@ -565,7 +531,7 @@ fn scan(
                     .iter()
                     .map(|(pk, row)| {
                         json!({"pk": safe_key(pk), "machine": keys::uuid32(&row.machine),
-                        "row": grid::raw_masked(&row.value, reveal)})
+                        "row": grid::raw_shown(&row.value)})
                     })
                     .collect()
             })
@@ -580,7 +546,7 @@ fn scan(
                 continue 'rows;
             }
         }
-        rows.push(row_json(collection, pk, row, reveal));
+        rows.push(row_json(collection, pk, row));
     }
     Ok(json!({"collection": collection.name, "rows": rows, "malformed": projection.malformed}))
 }
@@ -733,10 +699,12 @@ pub(crate) fn capacity_json(table: &Table, found: &Capacity, me: &Actor) -> Valu
                 Roll::Bytes => "bytes",
             }});
             // The registry's roll is its own verb (design §3.8); a table with no later
-            // generation compiled names none.
+            // generation this build rolls to names none.
             if crate::att::TABLES.iter().any(|compiled| {
                 (compiled.table.application, compiled.table.role) == (table.application, table.role)
-                    && compiled.successor.is_some()
+                    && compiled
+                        .successor
+                        .is_some_and(|next| !next.table.names_store())
             }) && let Some(object) = found.as_object_mut()
             {
                 object.insert("verb".to_owned(), json!("aterm db alab roll --apply"));
@@ -782,31 +750,25 @@ fn check(handle: &Handle, view: &View, usage: &Usage) -> Value {
         "malformed": projections.values().map(|p| p.malformed).sum::<usize>()})
 }
 
-/// One change as history shows it: a typed cell's value in its grid spelling (addresses masked
-/// unless `reveal`), a schema row by its version, anything else raw and masked.
-fn change_json(handle: &Handle, change: &crate::database::Change, reveal: bool) -> Value {
+/// One change as history shows it: a typed cell's value in its grid spelling (a secret cell's
+/// reference to an entry not its own as the mask), a schema row by its version, anything else raw
+/// ([`grid::raw_shown`]).
+fn change_json(handle: &Handle, change: &crate::database::Change) -> Value {
     json!({
         "collection": safe_key(&change.collection),
         "key": safe_key(&change.key),
-        "value": stored_json(handle, &change.collection, &change.key, change.value.as_ref(), reveal),
+        "value": stored_json(handle, &change.collection, &change.key, change.value.as_ref()),
     })
 }
 
 /// A stored value of cell `key` in `collection` as history and diff show it: a typed cell's value
-/// in its grid spelling (addresses masked unless `reveal`), a set member's presence, a schema row
-/// by its version, anything else raw and masked.
-fn stored_json(
-    handle: &Handle,
-    collection: &str,
-    key: &str,
-    value: Option<&Value>,
-    reveal: bool,
-) -> Value {
+/// in its grid spelling, a set member's presence, a schema row by its version, anything else raw
+/// ([`grid::raw_shown`]).
+fn stored_json(handle: &Handle, collection: &str, key: &str, value: Option<&Value>) -> Value {
     if collection == SCHEMA {
-        value.and_then(|v| v.get("r")).map_or(
-            Value::Null,
-            |r| json!({"schema": grid::raw_masked(r, reveal)}),
-        )
+        value
+            .and_then(|v| v.get("r"))
+            .map_or(Value::Null, |r| json!({"schema": grid::raw_shown(r)}))
     } else {
         let collection = handle.compiled().table.collection(collection);
         match (collection, value) {
@@ -823,20 +785,20 @@ fn stored_json(
                     {
                         cell.x
                     }
-                    (Some((_, column)), Ok(cell)) => {
-                        Value::String(grid::show(&column.ty, &cell.x, reveal))
+                    (Some((key, column)), Ok(cell)) => {
+                        Value::String(grid::show_at(collection.name, column, key.pk, &cell.x))
                     }
-                    _ => grid::raw_masked(value, reveal),
+                    _ => grid::raw_shown(value),
                 }
             }
-            (_, Some(value)) => grid::raw_masked(value, reveal),
+            (_, Some(value)) => grid::raw_shown(value),
         }
     }
 }
 
 /// `diff`'s answer: each differing cell (or owned row) of `only` (every collection where `None`)
 /// with what it held at each point and the operations, writers and machines that made it.
-fn diff_json(handle: &Handle, diff: &Diff, only: Option<&str>, reveal: bool) -> Value {
+fn diff_json(handle: &Handle, diff: &Diff, only: Option<&str>) -> Value {
     let point = |point: &Point| match point {
         Point::Head => json!("head"),
         Point::At(at) => json!(hex::encode_lower(at)),
@@ -849,9 +811,7 @@ fn diff_json(handle: &Handle, diff: &Diff, only: Option<&str>, reveal: bool) -> 
             let values = |candidates: &[crate::database::Candidate]| {
                 candidates
                     .iter()
-                    .map(|c| {
-                        stored_json(handle, &cell.collection, &cell.key, Some(&c.value), reveal)
-                    })
+                    .map(|c| stored_json(handle, &cell.collection, &cell.key, Some(&c.value)))
                     .collect::<Vec<_>>()
             };
             json!({
@@ -877,7 +837,6 @@ fn history(
     entries: &[Entry],
     collection: Option<&str>,
     pk: Option<&str>,
-    reveal: bool,
 ) -> Value {
     let wanted = |change: &crate::database::Change| {
         collection.is_none_or(|name| change.collection == name)
@@ -901,7 +860,7 @@ fn history(
                 "request": entry.request.as_ref().map(|r| hex::encode_lower(r)),
                 "reverts": entry.reverts.as_ref().map(|r| hex::encode_lower(r)),
                 "changes": entry.changes.iter().filter(|c| wanted(c))
-                    .map(|c| change_json(handle, c, reveal)).collect::<Vec<_>>(),
+                    .map(|c| change_json(handle, c)).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -964,7 +923,7 @@ fn apply(paths: &Paths, file: &Path) -> Result<Output> {
     };
     let fresh = handle
         .view()?
-        .export_grid(compiled.table, collection, &[], base.reveal, None)?;
+        .export_grid(compiled.table, collection, &[])?;
     let reopened = grid::reopen(fresh.base, &applied.stale);
     let rows: std::collections::BTreeSet<&str> =
         base.rows.iter().map(|(pk, _)| pk.as_str()).collect();

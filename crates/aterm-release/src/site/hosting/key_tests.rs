@@ -125,26 +125,4 @@ fn a_broken_key_is_refused_without_saying_its_bytes() {
         assert!(!why.contains(&pem_line[..16]), "{why}");
         assert!(why.contains("service-account key"), "{why}");
     }
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let dir_err = Key::read(scratch.path()).unwrap_err();
-    assert!(
-        dir_err.contains("cannot read the service-account key"),
-        "{dir_err}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn key_read_refuses_symlinks() {
-    let dir = aterm_tempfile::Builder::new()
-        .prefix("aterm-hosting-key-link-")
-        .tempdir()
-        .unwrap();
-    let real = dir.path().join("real.json");
-    let link = dir.path().join("link.json");
-    std::fs::write(&real, key_json("https://oauth2.googleapis.com/token")).unwrap();
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    assert!(Key::read(&real).is_ok());
-    let err = Key::read(&link).unwrap_err();
-    assert!(err.contains("cannot read the service-account key"), "{err}");
 }

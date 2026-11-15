@@ -17,7 +17,7 @@ use crate::error::{Kind, Result};
 use crate::git::credential::{self, Asked, CredentialAnswer, CredentialRequest};
 use crate::git::grant::LiveGrants;
 use crate::identity::vault::{Adoption, Found};
-use crate::identity::{self, EnvSource, Profile, Source, tilde};
+use crate::identity::{self, EnvSource, Profile, source_text};
 use crate::policy::{Access, Presence, RouteRequest, RouteTarget};
 use crate::redact::Redactor;
 
@@ -27,16 +27,6 @@ const fn presence_word(presence: Presence) -> &'static str {
         Presence::Present => "present",
         Presence::Absent => "absent",
         Presence::Unusable(_) => "unusable",
-    }
-}
-
-/// `file:{path, ~ for home}` or `env:{VAR}`, the variable's name as `config::masked` shows
-/// it: a token pasted into `env` is never printed whole, though L1 refuses one.
-fn source_text(source: &Source, home: &Path) -> String {
-    match source {
-        Source::File(path) => format!("file:{}", tilde(path, home)),
-        Source::Env(var) => format!("env:{}", crate::config::masked(var)),
-        Source::Inline(_) => "inline".to_string(),
     }
 }
 
@@ -51,7 +41,6 @@ pub(super) const FROM_JOINED: &str = "agh.toml+vault";
 /// where the profile came from.
 pub(super) fn profile_row(
     profile: &Profile,
-    env: &dyn EnvSource,
     home: &Path,
     redactor: &Redactor,
     from: &str,
@@ -63,7 +52,7 @@ pub(super) fn profile_row(
         .as_deref()
         .map_or(Value::Null, |l| text(&crate::config::masked(l)));
     let source = text(&source_text(&profile.source, home));
-    match identity::load(profile, env) {
+    match identity::load(profile) {
         Ok(cred) => json!({
             "fingerprint": cred.fingerprint(),
             "from": from,
@@ -100,27 +89,18 @@ pub(super) fn ambient_rows(env: &dyn EnvSource, profiles: &[Value]) -> Vec<Value
     identity::ambient(env)
         .into_iter()
         .map(|ambient| {
-            let source = format!("env:{}", ambient.var);
-            let by_source = profiles
-                .iter()
-                .find(|row| field(row, "source") == Some(source.as_str()))
-                .and_then(|row| field(row, "profile"));
             let by_token = profiles
                 .iter()
                 .find(|row| field(row, "fingerprint") == Some(ambient.fingerprint.as_str()))
                 .and_then(|row| field(row, "profile"));
-            let remedy = match (by_source, by_token) {
-                (Some(profile), _) => {
-                    format!("used by profile {profile} (env = \"{}\")", ambient.var)
-                }
-                (None, Some(profile)) => format!(
+            let remedy = match by_token {
+                Some(profile) => format!(
                     "never used: it is profile {profile}'s token, which agh reads from that \
-                     profile's source"
+                     profile's vault entry or file"
                 ),
-                (None, None) => format!(
-                    "never used: name it with env = \"{}\" in a dev or external profile to use it",
-                    ambient.var
-                ),
+                None => "never used: agh reads tokens only from the vault and agh.toml's \
+                         profiles"
+                    .to_string(),
             };
             json!({
                 "fingerprint": ambient.fingerprint.as_str(),
@@ -139,21 +119,16 @@ pub(super) fn ambient_rows(env: &dyn EnvSource, profiles: &[Value]) -> Vec<Value
 }
 
 /// One row per vault token adoption found (design §6.10), `dev` then `release`: an adopted one
-/// as its profile's row, and one that is not adopted with why and what to do. A token with no
-/// file has no row.
-pub(super) fn vault_rows(
-    adoption: &Adoption,
-    env: &dyn EnvSource,
-    home: &Path,
-    redactor: &Redactor,
-) -> Vec<Value> {
+/// as its profile's row, and one that is not adopted with why and what to do. A token the store
+/// does not hold has no row.
+pub(super) fn vault_rows(adoption: &Adoption, home: &Path, redactor: &Redactor) -> Vec<Value> {
     let text = |s: &str| Value::from(redactor.apply(s));
     adoption
         .vaulted()
         .iter()
         .filter_map(|vaulted| {
             let slot = vaulted.slot;
-            let source = text(&format!("file:{}", tilde(&vaulted.token_file, home)));
+            let source = text(&source_text(&slot.source(home), home));
             let row = |fingerprint: Value, kind: Value, login: Value, presence: &str| {
                 json!({
                     "fingerprint": fingerprint,
@@ -179,7 +154,7 @@ pub(super) fn vault_rows(
                 Found::Absent => None,
                 Found::Adopted { .. } => adoption
                     .profile(slot.profile())
-                    .map(|profile| profile_row(profile, env, home, redactor, FROM_VAULT)),
+                    .map(|profile| profile_row(profile, home, redactor, FROM_VAULT)),
                 Found::Unusable { slug, why, remedy } => Some(with(
                     row(Value::Null, Value::Null, Value::Null, "unusable"),
                     format!("{slug}: {why}"),
@@ -320,7 +295,7 @@ pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         } else {
             FROM_CONFIG
         };
-        let mut row = profile_row(profile, &*ctx.env, &home, &ctx.redactor, from);
+        let mut row = profile_row(profile, &home, &ctx.redactor, from);
         let present = row.get("presence").and_then(Value::as_str) == Some("present");
         let chosen = only.is_none_or(|name| name == profile.name);
         if verifying && present && chosen {
@@ -338,7 +313,7 @@ pub(crate) fn whoami(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             })
             .collect();
         rows.extend(
-            vault_rows(adoption, &*ctx.env, &home, &ctx.redactor)
+            vault_rows(adoption, &home, &ctx.redactor)
                 .into_iter()
                 .filter(|row| {
                     row.get("profile")
@@ -406,7 +381,7 @@ fn loopback_request(url: &str) -> Option<(&'static str, String, &str, Option<Str
 
 /// `agh whoami --git URL`: the identity the git helper would answer for `url`, decided as the
 /// helper decides (its directories, its route with vault adoption, and the live grants), with
-/// no token loaded past presence and none printed. Where the helper quits silently on an
+/// the actual credential privately judged and none printed. Where the helper quits silently on an
 /// invalid agh.toml or adoption's refusal, this verb fails with that refusal, as every routed
 /// verb does.
 fn whoami_git(ctx: &mut Ctx, inv: &Invocation, url: &str) -> Result<Outcome> {
@@ -417,7 +392,7 @@ fn whoami_git(ctx: &mut Ctx, inv: &Invocation, url: &str) -> Result<Outcome> {
     };
     let now = ctx.fx.wall_secs()?;
     let env = &*ctx.env;
-    let nonce = credential::var(env, crate::git::GRANT_VAR);
+    let nonce = credential::operation_nonce(env);
     let asked = Asked {
         stdin_is_terminal: false,
         nonce: nonce.as_deref(),
@@ -426,11 +401,15 @@ fn whoami_git(ctx: &mut Ctx, inv: &Invocation, url: &str) -> Result<Outcome> {
     };
     let (answer, granted, router) = match helper_dirs(env, ctx.dirs.as_ref()) {
         Some(dirs) => {
-            let router = credential::helper_route(env, &dirs)?.router;
-            let presence = |name: &str| router.presence(name, env);
-            let (answer, granted) =
-                credential::explained(&req, &asked, &router, &LiveGrants::new(&dirs), &presence);
-            (answer, granted, router)
+            let route = credential::helper_route(env, &dirs)?;
+            let admitted = credential::admitted(
+                &req,
+                &asked,
+                &route.router,
+                &LiveGrants::new(&dirs),
+                &route.pinned,
+            );
+            (admitted.answer, admitted.granted, route.router)
         }
         None => (
             CredentialAnswer::Quit {

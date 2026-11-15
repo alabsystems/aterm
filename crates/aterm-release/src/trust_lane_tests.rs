@@ -1102,7 +1102,7 @@ fn a_feature_rows_obligations_keep_the_cargo_package_and_the_row_filename() {
         check.report = Some(report.clone());
         let raw_path = report.join("report.ndjson");
         let raw = fs::read(&raw_path).unwrap();
-        reduce_report(&check, dir.path());
+        assert_eq!(reduce_report(&check, dir.path()).is_ok(), accepted);
 
         let record = PathBuf::from(format!(
             "{}{}",
@@ -1145,6 +1145,116 @@ fn a_feature_rows_obligations_keep_the_cargo_package_and_the_row_filename() {
             assert_eq!(fs::read(&raw_path).unwrap(), raw);
         }
     }
+}
+
+fn obligation_report(report: &Path) {
+    fs::create_dir_all(report).unwrap();
+    let unit = r#"cargo-target(package="alpha",target="alpha",kind=["lib"])"#;
+    let unit_json = aterm_json::to_string(unit).unwrap();
+    let function = aterm_json::to_string(&format!("{unit}::alpha::work")).unwrap();
+    let schema = crate::trust_oblig::REPORT_SCHEMA;
+    fs::write(report.join("report.ndjson"), format!(concat!(
+        r#"{{"record_type":"header","schema":"{schema}","crate_name":{unit_json},"expected_functions":1}}"#,
+        "\n",
+        r#"{{"record_type":"function","function":{function},"summary":{{"total_obligations":1,"proved":1}},"obligations":[{{"kind":"assertion","description":"checked assertion","outcome":{{"status":"proved"}}}}]}}"#,
+        "\n",
+        r#"{{"record_type":"footer","schema":"{schema}","summary":{{"total_obligations":1,"total_proved":1}},"functions_emitted":1}}"#,
+        "\n"
+    ), schema=schema, unit_json=unit_json, function=function)).unwrap();
+}
+
+#[test]
+fn every_queued_reduction_is_attempted_and_each_failure_keeps_its_raw_report() {
+    let dir = tmp("trust-reduction-errors");
+    let reducer = Reducer::start(dir.path().to_path_buf());
+    let mut raw = Vec::new();
+    for i in 0..3 {
+        let mut check = job("alpha");
+        check.log = dir.path().join(format!("{i}.log"));
+        let report = dir.path().join(format!("{i}.report"));
+        obligation_report(&report);
+        raw.push(fs::read(report.join("report.ndjson")).unwrap());
+        check.report = Some(report);
+        if i < 2 {
+            fs::create_dir(dir.path().join(format!("{i}.log.oblig.tsv"))).unwrap();
+        }
+        if i == 1 {
+            fs::create_dir(dir.path().join("1.log.oblig.err")).unwrap();
+        }
+        reducer.send(&check).unwrap();
+    }
+    let errors = reducer.finish(false);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(matches!(
+        &errors[0],
+        ReductionError::Report {
+            diagnostic: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &errors[1],
+        ReductionError::Report {
+            diagnostic: Some(_),
+            ..
+        }
+    ));
+    for (i, expected) in raw.iter().take(2).enumerate() {
+        assert_eq!(
+            fs::read(dir.path().join(format!("{i}.report/report.ndjson"))).unwrap(),
+            *expected
+        );
+        assert!(dir.path().join(format!("{i}.log.oblig.tsv")).is_dir());
+    }
+    assert!(dir.path().join("1.log.oblig.err").is_dir());
+    let record = crate::trust_oblig::Record::parse(
+        &fs::read_to_string(dir.path().join("2.log.oblig.tsv")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (record.functions, record.total(), record.proved()),
+        (1, 1, 1)
+    );
+    assert!(!dir.path().join("2.report").exists());
+}
+
+#[test]
+fn cancelled_reductions_keep_unstarted_raw_reports() {
+    let dir = tmp("trust-reduction-cancel");
+    let mut check = job("alpha");
+    check.log = dir.path().join("alpha.log");
+    let report = dir.path().join("alpha.report");
+    obligation_report(&report);
+    let raw = fs::read(report.join("report.ndjson")).unwrap();
+    check.report = Some(report.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(check).unwrap();
+    drop(tx);
+    let errors = reduce_reports(rx, dir.path(), &std::sync::atomic::AtomicBool::new(true));
+    assert!(errors.is_empty());
+    assert_eq!(fs::read(report.join("report.ndjson")).unwrap(), raw);
+    assert!(!dir.path().join("alpha.log.oblig.tsv").exists());
+}
+
+#[test]
+fn a_closed_reduction_queue_and_panicked_worker_are_receipt_failures() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(rx);
+    let reducer = Reducer {
+        tx: Some(tx),
+        skip: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        thread: Some(std::thread::spawn(|| {
+            panic!("injected reduction worker failure")
+        })),
+    };
+    assert!(matches!(
+        reducer.send(&job("alpha")),
+        Err(ReductionError::Queue(_))
+    ));
+    assert!(matches!(
+        reducer.finish(false).as_slice(),
+        [ReductionError::Worker]
+    ));
 }
 
 fn fake(takes: &[(&str, u64)]) -> Fake<'static> {
@@ -2294,9 +2404,9 @@ fn a_check_cut_short_keeps_what_it_measured() {
         targo: PathBuf::new(),
         id: P.into(),
     };
-    let cut = |f: &Finished| cost_of(f, &driver).map(|c| c.cut);
+    let cut = |f: &Finished| cost_of(f, &driver).unwrap().map(|c| c.cut);
     let done = finished(d.path(), DONE, 0, false);
-    let c = cost_of(&done, &driver).unwrap();
+    let c = cost_of(&done, &driver).unwrap().unwrap();
     assert_eq!((c.cpu, c.wall, c.maxrss, c.cut), (4, 5, 9, None));
     assert_eq!(c.prover, P);
     assert_eq!(
@@ -2322,9 +2432,87 @@ fn a_check_cut_short_keeps_what_it_measured() {
     let mut quiet = finished(d.path(), DONE, 0, false);
     quiet.ended.maxrss = 0;
     assert_eq!(cut(&quiet), Some(None));
+    fs::remove_file(&done.job.log).unwrap();
+    fs::create_dir(&done.job.log).unwrap();
+    assert!(
+        cost_of(&done, &driver).is_err(),
+        "a log read error is never a completed cost"
+    );
+    let lower = cost_when_cut(&done, &driver, Some(Cut::Failed)).unwrap();
+    assert_eq!(
+        (lower.cpu, lower.wall, lower.maxrss, lower.cut),
+        (4, 5, 9, Some(Cut::Failed))
+    );
 }
 
 const DONE: &str = "Summary: 5 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+
+#[test]
+fn a_receipt_error_keeps_attempting_budget_and_prover_marks() {
+    let d = tmp("trust-lane-record-error");
+    let mut f = finished(d.path(), DONE, 0, true);
+    f.wall = Duration::from_secs(61);
+    f.trustd_lost = true;
+    let beside = |ext: &str| d.path().join(format!("alpha@1.0.0.log.{ext}"));
+    for ext in ["pace", "trustd-lost"] {
+        fs::create_dir(beside(ext)).unwrap();
+    }
+    let error = record(&f, Duration::from_secs(60), 14, &mut || {
+        "ours\tthis build's".into()
+    })
+    .unwrap_err()
+    .to_string();
+    for ext in ["pace", "trustd-lost"] {
+        assert!(
+            error.contains(&beside(ext).display().to_string()),
+            "{error}"
+        );
+    }
+    assert_eq!(fs::read_to_string(beside("rc")).unwrap(), "0\n");
+    assert_eq!(fs::read_to_string(beside("budget")).unwrap(), "60\n");
+}
+
+#[test]
+fn diagnostic_scanning_matches_split_literals_and_requires_clean_eof() {
+    use std::io::Read as _;
+    struct FailedRead;
+    impl std::io::Read for FailedRead {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected diagnostic read failure"))
+        }
+    }
+    let mut text = vec![b'x'; 8192 + trust_facts::TRUSTD_REFUSED.len() - 3];
+    text.extend_from_slice(trust_facts::TRUSTD_REFUSED.as_bytes());
+    text.extend_from_slice(b" tail\n");
+    assert!(log_refused(text.as_slice()).unwrap());
+    assert!(!log_refused(&b"ordinary complete diagnostic\n"[..]).unwrap());
+    for prefix in [text.as_slice(), &b"ordinary diagnostic\n"[..]] {
+        let error = log_refused(prefix.chain(FailedRead)).unwrap_err();
+        assert_eq!(error.to_string(), "injected diagnostic read failure");
+    }
+}
+
+#[test]
+fn a_diagnostic_read_failure_still_attempts_the_other_receipts() {
+    let d = tmp("trust-lane-log-read-error");
+    let mut f = finished(d.path(), DONE, 0, true);
+    f.trustd_lost = true;
+    fs::remove_file(&f.job.log).unwrap();
+    fs::create_dir(&f.job.log).unwrap();
+    let error = record(&f, Duration::from_secs(60), 14, &mut || {
+        "ours\tthis build's".into()
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains(&f.job.log.display().to_string()));
+    let beside = |ext: &str| d.path().join(format!("alpha@1.0.0.log.{ext}"));
+    assert_eq!(fs::read_to_string(beside("rc")).unwrap(), "0\n");
+    assert_eq!(fs::read_to_string(beside("budget")).unwrap(), "60\n");
+    assert_eq!(
+        fs::read_to_string(beside("trustd-lost")).unwrap(),
+        "this build's\n"
+    );
+    assert!(beside("pace").is_file());
+}
 
 /// A check the trustd went away under leaves a `.trustd-lost` mark naming what serves the
 /// socket now, and the judge reads it into the check's facts. NEGATIVE CONTROL: a check it
@@ -2908,6 +3096,8 @@ struct Site {
     /// Each check runs until the run is interrupted at this moment ([`Quick::stop_at`]).
     stop_at: Option<Duration>,
     meanwhile: Option<fn(&Path)>,
+    /// A fault injected after output cleanup, before checks finish and write receipts.
+    before_checks: Option<fn(&Prepared)>,
     /// The stamp each check's dep-info gets ([`Quick`]).
     stamp: Option<SystemTime>,
     /// The host's load while the checks run ([`Checks::load`]).
@@ -2999,6 +3189,9 @@ impl Bench for Site {
         done: &mut dyn FnMut(Finished, &mut dyn Checks),
         out: &mut dyn Write,
     ) -> Result<(), String> {
+        if let Some(before) = self.before_checks.take() {
+            before(prep);
+        }
         let gate = self.gate.as_ref().map(|(machine, ledger)| {
             Admission::new(
                 Some(ledger.clone()),
@@ -3118,6 +3311,8 @@ fn site(scope: Scope) -> Site {
     let home = dir.path().join("cargo-home");
     fs::create_dir_all(&home).unwrap();
     let mut cfg = Config::new(&repo, scope);
+    // These compiler doubles emit summary logs; report-producing controls opt in below.
+    cfg.obligations = false;
     cfg.jobs = Some(1);
     cfg.target_root = Some(slots.path().join("target-trust.noindex"));
     cfg.state = Some(dir.path().join("state"));
@@ -3140,6 +3335,7 @@ fn site(scope: Scope) -> Site {
         interrupt: false,
         stop_at: None,
         meanwhile: None,
+        before_checks: None,
         stamp: None,
         load: None,
         updated: None,
@@ -3419,6 +3615,274 @@ fn a_clean_whole_tree_run_files_its_facts() {
     );
     assert!(plan.contains("\nlane-passed PATH\n"));
     assert!(!root_of(&s).join("j0").exists(), "the slots are scratch");
+}
+
+#[test]
+fn a_receipt_write_error_prevents_conclusion_facts_and_ratchet_updates() {
+    for update in [false, true] {
+        let mut s = site(Scope::WholeTree);
+        s.cfg.update_ratchet = update;
+        s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+        s.before_checks = Some(|prep| {
+            fs::create_dir(prep.logdir.join("alpha@1.0.0.log.pace")).unwrap();
+        });
+        let ratchet = fs::read(s.repo.join(trust_facts::RATCHET)).unwrap();
+        let (outcome, said, filed) = run_site(&mut s);
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why)
+                if why.contains("receipts") && why.contains("alpha@1.0.0.log.pace")),
+            "{outcome:?}: {said}"
+        );
+        assert_eq!(s.started, ["alpha"], "the receipt fault followed a check");
+        assert!(filed.is_empty(), "{filed:?}: {said}");
+        assert!(!said.contains("\nFACTS: "), "{said}");
+        assert_eq!(
+            fs::read(s.repo.join(trust_facts::RATCHET)).unwrap(),
+            ratchet
+        );
+    }
+}
+
+#[test]
+fn requested_reduction_failures_cannot_conclude_file_facts_or_raise_floors() {
+    let faults: [Option<fn(&Prepared)>; 3] = [
+        Some(|prep| {
+            obligation_report(&prep.logdir.join("alpha@1.0.0.log.report"));
+            fs::create_dir(prep.logdir.join("alpha@1.0.0.log.oblig.tsv")).unwrap();
+        }),
+        Some(|prep| {
+            obligation_report(&prep.logdir.join("alpha@1.0.0.log.report"));
+            fs::create_dir(prep.logdir.join("alpha@1.0.0.log.oblig.tsv")).unwrap();
+            fs::create_dir(prep.logdir.join("alpha@1.0.0.log.oblig.err")).unwrap();
+        }),
+        None,
+    ];
+    for (case, fault) in faults.into_iter().enumerate() {
+        for update in [false, true] {
+            let mut s = site(Scope::WholeTree);
+            s.cfg.obligations = true;
+            s.cfg.update_ratchet = update;
+            s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+            s.before_checks = fault;
+            let ratchet = fs::read(s.repo.join(trust_facts::RATCHET)).unwrap();
+            let (outcome, said, filed) = run_site(&mut s);
+            assert!(
+                matches!(&outcome, Outcome::CouldNotRun(why)
+                if why.contains("receipts") && why.contains("alpha@1.0.0.log.report")),
+                "{outcome:?}: {said}"
+            );
+            assert_eq!(s.started, ["alpha"]);
+            assert!(filed.is_empty(), "{filed:?}: {said}");
+            assert!(!said.contains("\nFACTS: "), "{said}");
+            assert_eq!(
+                fs::read(s.repo.join(trust_facts::RATCHET)).unwrap(),
+                ratchet
+            );
+            let logs = root_of(&s).join("logs");
+            if case < 2 {
+                assert!(logs.join("alpha@1.0.0.log.report/report.ndjson").is_file());
+                assert!(logs.join("alpha@1.0.0.log.oblig.tsv").is_dir());
+            }
+            if case == 1 {
+                assert!(logs.join("alpha@1.0.0.log.oblig.err").is_dir());
+                assert!(
+                    matches!(&outcome, Outcome::CouldNotRun(why) if why.contains(".oblig.err"))
+                );
+            } else {
+                assert!(logs.join("alpha@1.0.0.log.oblig.err").is_file());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_clean_requested_reduction_and_an_absent_optional_record_both_conclude() {
+    for requested in [false, true] {
+        let mut s = site(Scope::WholeTree);
+        s.cfg.obligations = requested;
+        if requested {
+            s.before_checks =
+                Some(|prep| obligation_report(&prep.logdir.join("alpha@1.0.0.log.report")));
+        }
+        let (outcome, said, filed) = run_site(&mut s);
+        assert_eq!(outcome, Outcome::Pass, "{said}");
+        assert_eq!(filed.len(), 1, "{said}");
+        let record = root_of(&s).join("logs/alpha@1.0.0.log.oblig.tsv");
+        assert_eq!(record.is_file(), requested);
+        if requested {
+            let record =
+                crate::trust_oblig::Record::parse(&fs::read_to_string(record).unwrap()).unwrap();
+            assert_eq!(
+                (record.functions, record.total(), record.proved()),
+                (1, 1, 1)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_malformed_present_obligation_record_cannot_file_facts_or_raise_floors() {
+    for update in [false, true] {
+        let mut s = site(Scope::WholeTree);
+        s.cfg.update_ratchet = update;
+        s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+        s.meanwhile = Some(|repo| {
+            fs::write(
+                repo.parent()
+                    .unwrap()
+                    .join("target-trust.noindex/logs/alpha@1.0.0.log.oblig.tsv"),
+                format!("{}\npackage\talpha\n", crate::trust_oblig::RECORD_MAGIC),
+            )
+            .unwrap();
+        });
+        let ratchet = fs::read(s.repo.join(trust_facts::RATCHET)).unwrap();
+        let (outcome, said, filed) = run_site(&mut s);
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why)
+            if why.contains("could not be measured") && why.contains("alpha@1.0.0.log.oblig.tsv")),
+            "{outcome:?}: {said}"
+        );
+        assert_eq!(s.started, ["alpha"]);
+        assert!(filed.is_empty(), "{filed:?}: {said}");
+        assert!(!said.contains("\nFACTS: "), "{said}");
+        assert_eq!(
+            fs::read(s.repo.join(trust_facts::RATCHET)).unwrap(),
+            ratchet
+        );
+    }
+}
+
+#[test]
+fn a_log_read_error_after_completed_checks_prevents_conclusion() {
+    for update in [false, true] {
+        let mut s = site(Scope::WholeTree);
+        s.cfg.update_ratchet = update;
+        s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+        s.meanwhile = Some(|repo| {
+            let log = repo
+                .parent()
+                .unwrap()
+                .join("target-trust.noindex/logs/alpha@1.0.0.log");
+            fs::remove_file(&log).unwrap();
+            fs::create_dir(&log).unwrap();
+        });
+        let ratchet = fs::read(s.repo.join(trust_facts::RATCHET)).unwrap();
+        let (outcome, said, filed) = run_site(&mut s);
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why)
+            if why.contains("compiler execution receipts could not be measured") && why.contains("alpha@1.0.0.log")),
+            "{outcome:?}: {said}"
+        );
+        assert_eq!(s.started, ["alpha"]);
+        assert!(filed.is_empty(), "{filed:?}: {said}");
+        assert!(!said.contains("\nFACTS: "), "{said}");
+        assert_eq!(
+            fs::read(s.repo.join(trust_facts::RATCHET)).unwrap(),
+            ratchet
+        );
+    }
+}
+
+#[test]
+fn incomplete_execution_receipts_after_checks_cannot_file_facts_or_raise_floors() {
+    let faults: [(&str, fn(&Path)); 4] = [
+        (".trustd-lost", |repo| {
+            fs::create_dir(
+                repo.parent()
+                    .unwrap()
+                    .join("target-trust.noindex/logs/alpha@1.0.0.log.trustd-lost"),
+            )
+            .unwrap();
+        }),
+        (".rc", |repo| {
+            fs::remove_file(
+                repo.parent()
+                    .unwrap()
+                    .join("target-trust.noindex/logs/alpha@1.0.0.log.rc"),
+            )
+            .unwrap();
+        }),
+        (".rc", |repo| {
+            let path = repo
+                .parent()
+                .unwrap()
+                .join("target-trust.noindex/logs/alpha@1.0.0.log.rc");
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+        }),
+        (".rc", |repo| {
+            fs::write(
+                repo.parent()
+                    .unwrap()
+                    .join("target-trust.noindex/logs/alpha@1.0.0.log.rc"),
+                "?\n",
+            )
+            .unwrap();
+        }),
+    ];
+    for (suffix, fault) in faults {
+        for update in [false, true] {
+            let mut s = site(Scope::WholeTree);
+            s.cfg.update_ratchet = update;
+            s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+            s.meanwhile = Some(fault);
+            let ratchet = fs::read(s.repo.join(trust_facts::RATCHET)).unwrap();
+            let (outcome, said, filed) = run_site(&mut s);
+            assert!(
+                matches!(&outcome, Outcome::CouldNotRun(why)
+                if why.contains("could not be measured") && why.contains(&format!("alpha@1.0.0.log{suffix}"))),
+                "{outcome:?}: {said}"
+            );
+            assert_eq!(s.started, ["alpha"]);
+            assert!(filed.is_empty(), "{filed:?}: {said}");
+            assert!(!said.contains("\nFACTS: "), "{said}");
+            assert_eq!(
+                fs::read(s.repo.join(trust_facts::RATCHET)).unwrap(),
+                ratchet
+            );
+        }
+    }
+}
+
+#[test]
+fn a_blocked_stale_receipt_prevents_checks_and_any_conclusion() {
+    for update in [false, true] {
+        let mut s = site(Scope::WholeTree);
+        s.cfg.update_ratchet = update;
+        s.log = "Summary: 6 proved, 0 failed (20 total); reproducible\nCoverage: 3/3 eligible function bodies verified (complete)\n";
+        let blocked = root_of(&s).join("logs/alpha@1.0.0.log.budget");
+        owner_dirs(&blocked).unwrap();
+        fs::write(blocked.join("keep"), "unowned entry").unwrap();
+        let ratchet = fs::read(s.repo.join(trust_facts::RATCHET)).unwrap();
+        let (outcome, said, filed) = run_site(&mut s);
+        assert!(
+            matches!(&outcome, Outcome::CouldNotRun(why)
+                if why.contains("receipt namespace") && why.contains("alpha@1.0.0.log.budget")),
+            "{outcome:?}: {said}"
+        );
+        assert!(
+            s.started.is_empty(),
+            "no compiler starts with stale inputs: {said}"
+        );
+        assert!(filed.is_empty(), "{filed:?}: {said}");
+        assert!(!said.contains("\nFACTS: "), "{said}");
+        assert_eq!(
+            fs::read(s.repo.join(trust_facts::RATCHET)).unwrap(),
+            ratchet
+        );
+        assert_eq!(
+            fs::read_to_string(blocked.join("keep")).unwrap(),
+            "unowned entry"
+        );
+    }
+    let mut clean = site(Scope::WholeTree);
+    let marker = root_of(&clean).join("logs/alpha@1.0.0.log.budget");
+    owner_dirs(marker.parent().unwrap()).unwrap();
+    fs::write(&marker, "60\n").unwrap();
+    let (outcome, said, filed) = run_site(&mut clean);
+    assert_eq!(outcome, Outcome::Pass, "{said}");
+    assert_eq!(filed.len(), 1, "{said}");
+    assert!(!marker.exists(), "a stale regular marker was cleared");
 }
 
 #[test]

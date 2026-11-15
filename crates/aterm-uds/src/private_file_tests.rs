@@ -1218,10 +1218,16 @@ fn file_at(path: &Path) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
-/// How many descriptors of this process are open on `file` ([`file_at`]): each one `/dev/fd`
-/// lists whose `fstat` names that device and inode. One another thread closes meanwhile names
-/// nothing.
-fn open_on(file: (u64, u64)) -> usize {
+/// How many descriptors of this process are open on `file` ([`file_at`]) of `dir`: each one
+/// `/dev/fd` lists whose `fstat` names that device and inode and, on Linux, whose path is in
+/// `dir` (an unlinked file's ends ` (deleted)`). ext4 gives a freed inode number out again, so a
+/// file another test opens meanwhile can take the number of one a write here unlinked; its path
+/// tells them apart. One another thread closes meanwhile names nothing.
+fn open_on(file: (u64, u64), dir: &Path) -> usize {
+    #[cfg(target_os = "linux")]
+    let dir = std::fs::canonicalize(dir).unwrap();
+    #[cfg(not(target_os = "linux"))]
+    let _ = dir;
     std::fs::read_dir("/dev/fd")
         .unwrap()
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
@@ -1236,6 +1242,10 @@ fn open_on(file: (u64, u64)) -> usize {
                 reason = "st_dev and st_ino are narrower or signed on some systems"
             )]
             let named = (said.st_dev as u64, said.st_ino as u64);
+            #[cfg(target_os = "linux")]
+            let read = read
+                && std::fs::read_link(format!("/proc/self/fd/{fd}"))
+                    .is_ok_and(|path| path.parent() == Some(dir.as_path()));
             read && named == file
         })
         .count()
@@ -1268,7 +1278,7 @@ fn a_kept_parse_holds_its_file_open_for_as_long_as_it_is_kept() {
     settle::after(Duration::from_secs(3600), || {
         assert_eq!(read("book"), b"first");
         assert_eq!(
-            (kept.pinned(), open_on(file_at(&book))),
+            (kept.pinned(), open_on(file_at(&book), &dir)),
             (0, 0),
             "a parse that is not pinned holds nothing open"
         );
@@ -1277,24 +1287,28 @@ fn a_kept_parse_holds_its_file_open_for_as_long_as_it_is_kept() {
         assert_eq!(read("book"), b"first");
         let first = file_at(&book);
         assert_eq!(
-            (kept.pinned(), open_on(first)),
+            (kept.pinned(), open_on(first, &dir)),
             (1, 1),
             "the pinned file is held open"
         );
         assert_eq!(read("book"), b"first");
-        assert_eq!(open_on(first), 1, "by one descriptor, however often read");
+        assert_eq!(
+            open_on(first, &dir),
+            1,
+            "by one descriptor, however often read"
+        );
 
         write_private(&dir, "book", b"again").unwrap();
         let second = file_at(&book);
         assert_eq!(
-            open_on(first),
+            open_on(first, &dir),
             1,
             "the replaced file is held while its replacement is made"
         );
         assert_ne!(second, first, "so the replacement is another inode");
         assert_eq!(read("book"), b"again");
         assert_eq!(
-            (open_on(first), open_on(second)),
+            (open_on(first, &dir), open_on(second, &dir)),
             (0, 1),
             "the read that finds the replacement lets the first go and holds the second"
         );
@@ -1304,8 +1318,8 @@ fn a_kept_parse_holds_its_file_open_for_as_long_as_it_is_kept() {
         assert_eq!(
             (
                 kept.pinned(),
-                open_on(second),
-                open_on(file_at(&dir.join("other")))
+                open_on(second, &dir),
+                open_on(file_at(&dir.join("other")), &dir)
             ),
             (1, 0, 1),
             "a parse the bound pushed out holds nothing open"
@@ -1316,7 +1330,7 @@ fn a_kept_parse_holds_its_file_open_for_as_long_as_it_is_kept() {
             kept.read(&dir, "other", 64, <[u8]>::to_vec),
             Err(PrivateFileError::Missing)
         ));
-        assert_eq!(open_on(other), 0, "a file that is gone is let go");
+        assert_eq!(open_on(other, &dir), 0, "a file that is gone is let go");
     });
 }
 

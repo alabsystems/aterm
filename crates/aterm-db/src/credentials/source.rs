@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Holder sources are an explicit local give, a compiled catalog path, or one
-//! exact component of the authenticated registered mailbox source after custody.
-//! No packet, record, entry name or environment variable chooses a path to read.
+//! Holder sources are an explicit local give or one exact component of the authenticated
+//! registered mailbox source after custody. A value this Mac's verified store holds is the
+//! vault's own, which the custodian copies itself, so no holder sends one. No packet, record,
+//! entry name or environment variable chooses what to read, and no file under `~/.secrets` is
+//! opened.
 
 use super::*;
 use aterm_secrets::{
@@ -139,43 +141,17 @@ pub(super) fn read(
         }
     }
     if let Want::MailboxComponent(component) = &thread.want {
-        let entry = component.entry();
-        let file = paths.home.join(".secrets").join(&entry);
-        let value = fsx::read_private(&file, MAX_VALUE)
+        let value = client::read_mailbox_component(paths, *component)
             .map_err(crate::table::failure)?
-            .filter(|value| value::is_line(value.as_slice()));
-        let value = match value {
-            Some(value) => Some(value),
-            None => client::read_mailbox_component(paths, *component)
-                .map_err(crate::table::failure)?
-                .filter(|value| value::is_line(value.as_slice())),
-        }
-        .ok_or_else(|| Error::new("the registered mailbox component is absent or changed"))?;
-        let values = Values(vec![(entry, value)]);
+            .filter(|value| value::is_line(value.as_slice()))
+            .ok_or_else(|| Error::new("the registered mailbox component is absent or changed"))?;
+        let values = Values(vec![(component.entry(), value)]);
         values.encode().map_err(crate::table::failure)?;
         return Ok(values);
     }
-    let first = thread
-        .want
-        .hold_path(&paths.home)
-        .ok_or_else(|| Error::new("this want has no compiled holder source"))?;
-    let value = fsx::read_private(&first, MAX_VALUE)
-        .map_err(crate::table::failure)?
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Error::new("the holder's compiled source is absent"))?;
-    let mut values = vec![(thread.want.entries()[0].clone(), value)];
-    if let Want::Mailbox(label) = &thread.want {
-        let totp = paths.home.join(".secrets").join(format!("{label}_totp"));
-        if let Some(value) = fsx::read_private(&totp, MAX_VALUE)
-            .map_err(crate::table::failure)?
-            .filter(|value| value::is_line(value.as_slice()))
-        {
-            values.push((format!("{label}_totp"), value));
-        }
-    }
-    let values = Values(values);
-    values.encode().map_err(crate::table::failure)?;
-    Ok(values)
+    Err(Error::new(
+        "this Mac holds no copy of this want to give but an explicit give",
+    ))
 }
 
 /// Remove only the exact program-owned contribution after a proven publication, or after

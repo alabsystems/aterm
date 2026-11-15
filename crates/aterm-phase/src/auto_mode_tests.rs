@@ -4,7 +4,6 @@
 //! Auto-mode environment offer reader tests (`crate::prompt::fixtures::AUTO_MODE_SETUP*`).
 
 use super::*;
-use crate::phase::Phase;
 use crate::prompt::fixtures::{
     AUTO_MODE_SETUP, AUTO_MODE_SETUP_16COL, AUTO_MODE_SETUP_17COL, AUTO_MODE_SETUP_19COL,
     AUTO_MODE_SETUP_20COL, AUTO_MODE_SETUP_22COL, AUTO_MODE_SETUP_23COL, AUTO_MODE_SETUP_26COL,
@@ -17,6 +16,7 @@ use crate::prompt::fixtures::{
     AUTO_MODE_SETUP_FULLSCREEN_SHELL_MODE, screen,
 };
 use crate::prompt::parse_prompt_v2;
+use alab_policy::vocab::Phase;
 
 const ALL: [(&str, &str); 23] = [
     ("inline", AUTO_MODE_SETUP),

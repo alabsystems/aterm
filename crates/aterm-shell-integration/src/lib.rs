@@ -348,6 +348,9 @@ pub const REKEY_PATH_VAR: &str = "ATERM_REKEY_PATH";
 /// Suffix appended to [`REKEY_PATH_VAR`] (`<re-key path>.trap`) for handing over the startup DEBUG trap to the bash integration without a subshell fork (`bash_debug_trap_handover!`).
 pub const DEBUG_TRAP_SUFFIX: &str = ".trap";
 
+/// Suffix appended to [`REKEY_PATH_VAR`] (`<re-key path>.out`) for the file through which the bash integration's hooks read a command's output instead of forking a `$(…)` (`__aterm_out`): emptied after each read, removed by the host with the session.
+pub const OUTPUT_SUFFIX: &str = ".out";
+
 /// Whether `shell` carries the re-key hook (`__aterm_rekey_check`).
 #[must_use]
 #[inline]

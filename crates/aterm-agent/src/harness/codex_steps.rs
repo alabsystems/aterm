@@ -6,8 +6,8 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
+use alab_policy::vocab::WallKind;
 use aterm_json::Value;
-use aterm_phase::WallKind;
 
 use super::codex_rollout::{
     FORK_BURST_MS, Prefix, RolloutRead, Streamed, counts_of, is_thread_id, stamp_ms,
@@ -198,6 +198,9 @@ fn word<'a>(v: Option<&'a Value>, key: &str) -> Option<&'a str> {
 pub struct CodexStepFold {
     /// The process's start (wall ms): older rows are history.
     floor_ms: u64,
+    /// The adoption (wall ms; 0: none): a fresh row of the run's own dated below it is lost
+    /// ([`Self::set_adopted`]).
+    adopted_ms: u64,
     /// The rollout bound: its path's fingerprint and identity.
     bound: Option<(u64, Option<(u64, u64)>)>,
     /// Rows ending at or below this are history.
@@ -244,7 +247,8 @@ pub struct CodexStepFold {
     harness: Option<u64>,
     queue: VecDeque<Step>,
     overflow: u64,
-    lost: u64,
+    /// The facts of the row being folded it could not hand on ([`StepEvent::Lost`]).
+    row_lost: u64,
 }
 
 impl CodexStepFold {
@@ -253,6 +257,7 @@ impl CodexStepFold {
     pub const fn new(floor_ms: u64) -> CodexStepFold {
         CodexStepFold {
             floor_ms,
+            adopted_ms: 0,
             bound: None,
             seed: 0,
             prefix: Prefix::Start,
@@ -274,7 +279,7 @@ impl CodexStepFold {
             harness: None,
             queue: VecDeque::new(),
             overflow: 0,
-            lost: 0,
+            row_lost: 0,
         }
     }
 
@@ -297,7 +302,7 @@ impl CodexStepFold {
         *self = CodexStepFold {
             queue: std::mem::take(&mut self.queue),
             overflow: self.overflow,
-            lost: self.lost,
+            adopted_ms: self.adopted_ms,
             bound: Some((fp, id)),
             seed,
             state: state_for(CODEX_MEASURED_BUILDS, build),
@@ -328,6 +333,14 @@ impl CodexStepFold {
     /// Raise the floor to `floor_ms` (wall ms; it only rises).
     pub fn raise_floor(&mut self, floor_ms: u64) {
         self.floor_ms = self.floor_ms.max(floor_ms);
+    }
+
+    /// THE ADOPTION: a seamless update's successor adopted the run at `adopted_ms` (wall ms; it
+    /// only rises, and a bind keeps it), and its join never places a row older than that. A row
+    /// of the run's own past the seed and dated below it (at or past the floor), written after
+    /// the predecessor's last read, is queued as [`StepEvent::Lost`], never dropped as history.
+    pub fn set_adopted(&mut self, adopted_ms: u64) {
+        self.adopted_ms = self.adopted_ms.max(adopted_ms);
     }
 
     /// Record the `build` that the process writing the rollout runs now (`super::codex_alab::alab_build`;
@@ -364,16 +377,24 @@ impl CodexStepFold {
         StepBatch {
             steps: self.queue.drain(..).collect(),
             overflow: std::mem::take(&mut self.overflow),
-            lost: std::mem::take(&mut self.lost),
             end: End::default(),
         }
     }
 
-    /// A line the reader could not hand on, ending at `end`.
-    pub const fn lost_line(&mut self, end: u64) {
-        if self.bound.is_some() && end > self.seed {
-            self.lost = self.lost.saturating_add(1);
-        }
+    /// A line the reader could not hand on, ending at `end`: lost, at its end, when it is past
+    /// the seed (a line at or below it is history) and the fold reads the rollout (a latched fold
+    /// reads none of it, which its [`StepEvent::Off`] said).
+    pub fn lost_line(&mut self, end: u64) {
+        let Some((fp, id)) = self.bound.filter(|_| end > self.seed && !self.broken) else {
+            return;
+        };
+        let pos = StepPos {
+            fp,
+            id,
+            off: end,
+            at_ms: self.floor_ms,
+        };
+        self.enqueue(pos, StepEvent::Lost { n: 1 });
     }
 
     /// Fold one complete line of the bound rollout, ending at offset `end` (past its newline).
@@ -385,6 +406,7 @@ impl CodexStepFold {
             return;
         }
         let fresh = end > self.seed;
+        self.row_lost = 0;
         let Ok(text) = std::str::from_utf8(line) else {
             self.lost_line(end);
             return;
@@ -412,7 +434,8 @@ impl CodexStepFold {
             return;
         }
         let at_ms = stamp.and_then(|s| u64::try_from(s).ok());
-        let live = fresh && at_ms.is_some_and(|t| t >= self.floor_ms);
+        let live_from = self.floor_ms.max(self.adopted_ms);
+        let live = fresh && at_ms.is_some_and(|t| t >= live_from);
         let mut out: Vec<StepEvent> = Vec::new();
         let bad = self.row(&v, fresh, live, &mut out);
         if !fresh {
@@ -422,11 +445,33 @@ impl CodexStepFold {
             self.latch(fp, id, end);
             return;
         }
-        let Some(at_ms) = at_ms.filter(|&t| t >= self.floor_ms) else {
-            return;
-        };
         let state = self.state();
         let k = out.len() as u64;
+        // THE ROW'S LOSS, at its position: the parts it could not hand on, and the row's facts
+        // when it is the run's own (at or past the floor) but dated below the adoption, written
+        // after the predecessor's last read and never placed by the join: lost, not history. It
+        // goes before the row's steps (`end - k`), else at the row's end.
+        let hidden = at_ms.is_some_and(|t| t >= self.floor_ms && t < self.adopted_ms);
+        let lost =
+            std::mem::take(&mut self.row_lost).saturating_add(u64::from(!out.is_empty() && hidden));
+        let placed = at_ms.filter(|&t| t >= live_from);
+        if lost > 0 {
+            let off = if placed.is_some() {
+                end.saturating_sub(k)
+            } else {
+                end
+            };
+            let pos = StepPos {
+                fp,
+                id,
+                off,
+                at_ms: at_ms.unwrap_or(self.floor_ms),
+            };
+            self.enqueue_as(pos, state, StepEvent::Lost { n: lost });
+        }
+        let Some(at_ms) = placed else {
+            return;
+        };
         for (i, ev) in out.into_iter().enumerate() {
             let off = end.saturating_sub(k - 1 - i as u64);
             self.enqueue_as(StepPos { fp, id, off, at_ms }, state, ev);
@@ -579,7 +624,7 @@ impl CodexStepFold {
                     return true;
                 };
                 let Some(id) = StepId::new(call) else {
-                    self.lost = self.lost.saturating_add(u64::from(fresh));
+                    self.row_lost = self.row_lost.saturating_add(u64::from(fresh));
                     return false;
                 };
                 let name = word(payload, KEY_NAME).unwrap_or("");
@@ -614,7 +659,7 @@ impl CodexStepFold {
                         id,
                         error: failed && self.gate().exit,
                     }),
-                    None => self.lost = self.lost.saturating_add(u64::from(fresh)),
+                    None => self.row_lost = self.row_lost.saturating_add(u64::from(fresh)),
                 }
             }
             (Some(COMPACTED), _) => out.push(StepEvent::Compact),

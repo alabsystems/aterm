@@ -95,12 +95,14 @@ impl LiveShell {
     /// that sleep is its read of the terminal, which a Ctrl-C the terminal sends interrupts. A
     /// Ctrl-C that comes while the line editor is still at work meets bash's own race, with no
     /// integration at all: bash 5.3's readline echoes it and resets the terminal, then reads on
-    /// and acts on it only at the next key; bash 3.2 leaves its redisplay (an extra `\r> ` or
-    /// `\b)` in the echo) by a jump out of its signal handler that keeps a stdio lock held, and
-    /// the next subshell its prompt forks waits on that lock forever (`flockfile`, sampled, under
-    /// a plain `PROMPT_COMMAND` that forks `$(builtin history 1)` as well as under `main`'s
-    /// integration). With this crate's tests run four at once, 13 of 32 runs stalled so, 3 of
-    /// them on bash 3.2.
+    /// and acts on it only at the next key (`PS1='P$ '`, `PROMPT_COMMAND=:`); bash 3.2 leaves its
+    /// redisplay by a jump out of its signal handler that keeps stderr's stdio lock held, and
+    /// every subshell forked after it waits on that lock forever (`flockfile`, sampled). The
+    /// integration's prompt forks none
+    /// ([`a_ctrl_c_in_bash_3_2s_blocked_redisplay_leaves_it_its_next_prompt`]), but a line a
+    /// test types next may (`(exit 5)`), so every bash's Ctrl-C waits for this. With this
+    /// crate's tests run four at once and no wait, 13 of 32 runs stalled so under an
+    /// integration whose prompt forked, 3 of them on bash 3.2.
     fn wait_for_read(&mut self) {
         use aterm_sysprobe::jobs::{JobsReader, ReadReq, RunState};
         let started = std::time::Instant::now();
@@ -438,6 +440,14 @@ fn spawn_pty_shell_unwaited(
         cmd.env_remove("ATERM_UNSET_ZDOTDIR")
             .env("ATERM_ORIGINAL_ZDOTDIR", &fx.home);
     }
+    // The host hands every session it starts a re-key path, and a bash's hooks read a
+    // command's output through the file beside it ([`OUTPUT_SUFFIX`]): a bash here gets one
+    // too, so each test runs the hooks a session runs. A test of a shell with none (an older
+    // host, the file sourced by hand) names it empty, `(REKEY_PATH_VAR, "")`, which the
+    // wrapper and the script read as unset; `extra` comes after, so its value stands.
+    if shell == ShellType::Bash {
+        cmd.env(REKEY_PATH_VAR, fx.rekey_path());
+    }
     for (key, value) in extra {
         cmd.env(key, value);
     }
@@ -668,20 +678,32 @@ fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
         assert_tty_broken(&mut sh, "unfixed, after a raw child's exit 1");
         sh.finish();
 
-        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &ours, &[]);
-        for (end, ixon) in [
-            (RawEnd::Sigkill, true),
-            (RawEnd::Exit1, false),
-            (RawEnd::Exit0Late, false),
+        // With no output file (an empty re-key path reads as none), and with the session's,
+        // which `stty -a` writes through.
+        let rekey = fx.rekey_path();
+        for extra in [
+            &[(REKEY_PATH_VAR, "")][..],
+            &[(REKEY_PATH_VAR, rekey.as_str())][..],
         ] {
-            sh.kill_raw_child(end);
-            assert_tty_usable(&mut sh, &format!("after a raw child's {end:?}"), ixon);
+            let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &ours, extra);
+            for (end, ixon) in [
+                (RawEnd::Sigkill, true),
+                (RawEnd::Exit1, false),
+                (RawEnd::Exit0Late, false),
+            ] {
+                sh.kill_raw_child(end);
+                assert_tty_usable(
+                    &mut sh,
+                    &format!("after a raw child's {end:?} {extra:?}"),
+                    ixon,
+                );
+            }
+            sh.run_line("stty ixon", "0");
+            sh.run_line("stty -ixon", "0");
+            sh.kill_raw_child(RawEnd::Exit1);
+            assert_tty_usable(&mut sh, "stty -ixon, then a raw child's exit 1", false);
+            sh.finish();
         }
-        sh.run_line("stty ixon", "0");
-        sh.run_line("stty -ixon", "0");
-        sh.kill_raw_child(RawEnd::Exit1);
-        assert_tty_usable(&mut sh, "stty -ixon, then a raw child's exit 1", false);
-        sh.finish();
     }
 }
 
@@ -1122,7 +1144,14 @@ fn cut_osc(raw: &str) -> String {
 #[test]
 fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
     let mut shells = ShellLanes::default();
-    for bash in shells.bashes() {
+    // Before 4.4 the read of bash's command number traces in process, through the session's
+    // output file, where there is one.
+    let bashes: Vec<(&str, bool)> = shells
+        .bashes()
+        .into_iter()
+        .flat_map(|bash| [(bash, false), (bash, true)])
+        .collect();
+    for (bash, channel) in bashes {
         let fx = LiveFixture::new();
         let dir = install_script_set(&fx.base).expect("install");
         std::fs::write(
@@ -1130,20 +1159,20 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
             "PS4='+${FUNCNAME[0]-}> '\nset -x\nPROMPT_COMMAND='echo pc$((40+2))'\n",
         )
         .expect(".bashrc");
-        let mut sh = spawn_pty_shell(
-            ShellType::Bash,
-            bash,
-            &fx,
-            &dir,
-            &[("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")],
-        );
+        let rekey = fx.rekey_path();
+        let env = [
+            ("ATERM_SHELL_NONCE", REKEY_OLD),
+            ("ATERM_CHILD", "1"),
+            (REKEY_PATH_VAR, if channel { rekey.as_str() } else { "" }),
+        ];
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &env);
         for (line, status) in [("false", "1"), ("echo traced$((40+2))", "0"), ("cd /", "0")] {
             sh.run_line(line, status);
         }
         let text = cut_osc(&stdout_between(&sh, 0, sh.len()));
         assert!(
             !text.contains(REKEY_OLD),
-            "{bash}: the capability nonce reached the trace\n{text}"
+            "{bash} channel={channel}: the capability nonce reached the trace\n{text}"
         );
         let traced: Vec<(&str, &str)> = text
             .lines()
@@ -1154,7 +1183,7 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
         for line in ["echo traced42", "cd /", "echo pc42"] {
             assert!(
                 traced.iter().any(|(_, traced)| *traced == line),
-                "{bash}: the user's `{line}` is traced\n{text}"
+                "{bash} channel={channel}: the user's `{line}` is traced\n{text}"
             );
         }
         for (frame, line) in &traced {
@@ -1169,7 +1198,7 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
             };
             assert!(
                 users,
-                "{bash}: aterm's code in the trace: +{frame}> {line}\n{text}"
+                "{bash} channel={channel}: aterm's code in the trace: +{frame}> {line}\n{text}"
             );
         }
         sh.finish();
@@ -1308,7 +1337,7 @@ fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
                 let extra: &[(&str, &str)] = if channel {
                     &[(REKEY_PATH_VAR, rekey)]
                 } else {
-                    &[]
+                    &[(REKEY_PATH_VAR, "")]
                 };
                 let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
                 let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
@@ -1392,7 +1421,7 @@ fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
             let extra: &[(&str, &str)] = if channel {
                 &[(REKEY_PATH_VAR, rekey)]
             } else {
-                &[]
+                &[(REKEY_PATH_VAR, "")]
             };
             let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
             let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
@@ -2099,8 +2128,8 @@ esac' DEBUG
                 ),
             ] {
                 let flag = if traced { "set -T\n" } else { "" };
-                // aterm's own prompt runs its segments in `$(…)`, where functrace hands the
-                // trap on too: the array rows draw it.
+                // aterm's own prompt reads its segments from its hooks, and a subshell, where
+                // functrace hands the trap on too, would count: the array rows draw it.
                 let style = if setup == ARRAY { "standard" } else { "none" };
                 let case =
                     format!("{bash} traced={traced} joined={joined} style={style} {setup:?}");
@@ -2146,10 +2175,7 @@ esac' DEBUG
                 if !armed_itself {
                     assert_eq!(read("helper="), 0, "{case}: {out:?}");
                     let sub = std::fs::read(fx.home.join(".rc-sub")).unwrap_or_default();
-                    assert!(
-                        sub.is_empty(),
-                        "{case}: in a `$(…)` of aterm's prompt: {sub:?}"
-                    );
+                    assert!(sub.is_empty(), "{case}: in a subshell of aterm's: {sub:?}");
                 }
                 // With no flag a bare bash runs the trap at the top level of the person's
                 // prompt command: an array's elements run there themselves, and aterm's own entry
@@ -2358,10 +2384,11 @@ enum UnheardEnd {
     /// Enter.
     Enter,
     /// Ctrl-C once the line editor echoed the line and sleeps in its read (sent with it, the
-    /// tty flushes the line along with the signal before readline reads it).
+    /// tty flushes the line along with the signal before readline reads it; sent before that
+    /// read, it meets bash's own race, [`LiveShell::wait_for_read`]).
     Cancel,
     /// Enter, then Ctrl-C once bash drew its continuation prompt (`PS2`, `> `) for the rest
-    /// of a command the line left open and sleeps in its read. History keeps the line, and
+    /// of a command the line left open, as [`Self::Cancel`] waits. History keeps the line, and
     /// nothing ran.
     CancelContinued,
 }
@@ -2575,7 +2602,14 @@ fn bash_level(bash: &str) -> u32 {
 /// shell wrote from its first line editor to its last prompt.
 #[cfg(unix)]
 fn unheard_session(bash: &str, fx: &LiveFixture, dir: &Path) -> (Vec<Vec<String>>, String) {
-    let mut sh = spawn_pty_shell(ShellType::Bash, bash, fx, dir, &[("ATERM_CHILD", "1")]);
+    let rekey = fx.rekey_path();
+    let mut sh = spawn_pty_shell(
+        ShellType::Bash,
+        bash,
+        fx,
+        dir,
+        &[("ATERM_CHILD", "1"), (REKEY_PATH_VAR, rekey.as_str())],
+    );
     sh.wait_for_line_editor();
     // From the first prompt's end, which every session has printed alike by then: the line
     // editor's own word can come before the prompt's text (bash 5.3's `\e[?2004h`).

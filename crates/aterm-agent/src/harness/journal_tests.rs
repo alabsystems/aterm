@@ -788,6 +788,52 @@ fn a_provider_read_is_a_probe_of_its_account_saying_why() {
     );
 }
 
+/// A RESET'S NOTE NAMES THE WINDOWS IT REFILLED: a `reset-used` of the week, of a workspace's
+/// account under its `sub` as its readings are; one note for each window of a full reset (a
+/// model's week under its journal word, once); a refill inside the five-hour window is that
+/// window's; a reset spent with the limit still standing (its row names no window) is one note
+/// of no window, which no fold cuts by.
+/// NEGATIVE CONTROL: with `refills` returning `of_ledger`'s note as it is, no note names a
+/// window or a workspace, and the `shown` assertion fails.
+#[test]
+fn a_resets_note_names_the_windows_it_refilled() {
+    use crate::harness::profile::AccountKey;
+    let codex = AccountKey::codex("acct-1", "user-1").unwrap();
+    let workspace = SubKey::workspace(&codex);
+    let mut state = keyed();
+    state.accounts.get_mut("ann").unwrap().key = Some(codex);
+    let mut events = vec![
+        Event::new(100, Kind::ResetUsed, "ann").refilling([WEEK_LIMIT]),
+        Event::new(110, Kind::ResetUsed, "bob").because("no Fable resets left, still walled"),
+        Event::new(120, Kind::ResetUsed, "bob").refilling([
+            "seven_day_opus",
+            "seven_day_sonnet",
+            SESSION_LIMIT,
+        ]),
+        Event::new(130, Kind::Reset, "bob").refilling([SESSION_LIMIT]),
+    ];
+    let notes = observe(Cli::Codex, &state, &mut state.clone(), &mut events, 200);
+    assert!(notes.iter().all(|n| n.kind == "reset-used"), "{notes:?}");
+    let shown: Vec<(u64, Option<&str>, bool)> = notes
+        .iter()
+        .map(|n| (n.t, n.window, n.sub.is_some()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (100, Some("7d"), true),
+            (110, None, false),
+            (120, Some("7d-model"), false),
+            (120, Some("5h"), false),
+            (130, Some("5h"), false),
+        ]
+    );
+    assert_eq!(notes[0].sub, workspace, "the workspace's own");
+    for note in &notes {
+        assert!(note.window.is_none_or(|w| WINDOWS.contains(&w)));
+    }
+}
+
 /// A reading or a wall of a provider workspace names it, so it folds into that sub-account's own
 /// `use` row (design §4.13): a Codex account's observed key is a workspace, any other provider's
 /// is its one account and names none. A reading or a wall another Mac made is not this Mac's to

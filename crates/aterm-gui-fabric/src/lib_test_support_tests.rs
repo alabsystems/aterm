@@ -244,8 +244,12 @@ pub(crate) struct TestHandle {
 /// A fresh, unregistered session with process-local id `local_id`, on the test timing value
 /// (the fence and notice waits at their test lengths).
 pub(crate) fn test_handle(local_id: u64) -> TestHandle {
+    test_handle_as(local_id, SessionId::generate())
+}
+
+/// [`test_handle`] under the tab ID `sid`.
+pub(crate) fn test_handle_as(local_id: u64, sid: SessionId) -> TestHandle {
     aterm_gui_timing::select_fast();
-    let sid = SessionId::generate();
     TestHandle {
         sid: sid.clone(),
         ctx: Arc::new(SessionCtx {

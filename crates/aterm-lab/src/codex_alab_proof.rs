@@ -8,10 +8,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alab_policy::{
+    land_check::RULE_LAND_CHECK,
+    words::{RULE_LEFT, says_done},
+};
 use aterm_agent::harness::acts::RULE_UPGRADE;
 use aterm_agent::harness::codex_shown;
 use aterm_agent::harness::codex_steps::Gate;
-use aterm_agent::supervise::policy::turn_end::{RULE_LAND_CHECK, RULE_LEFT, says_done};
 use aterm_uds::spawnfd::Stdio;
 
 use crate::bus::Fabric;
@@ -318,6 +321,49 @@ fn tap_said(status: &str) -> Option<TapSaid> {
 
 const FENCE_ASKS: u64 = 2;
 
+/// How long the fence waits for its [`FENCE_ASKS`] asks: a hang detector, not a budget. The tap
+/// reads a tab at rest (its output and screen standing since its last read) once in 15 s while
+/// the tab wrote in the last ten minutes and once in 60 s after that, each at the first sweep at
+/// or past the interval (aterm-gui's `codex_rollout_tap`: `REST_NEAR`, `REST_FAR`), and the
+/// fence's own `status` reads bring those sweeps. Two asks past a look therefore come within
+/// two such intervals: inside a minute for a tab that wrote in the last ten, and inside this
+/// wait, two of the longer interval and half of one more, for a tab silent longer.
+const FENCE_WAIT: Duration = Duration::from_secs(150);
+
+/// How often the fence looks at `status` while it waits.
+const FENCE_STEP: Duration = Duration::from_millis(250);
+
+/// The fence's wait ([`FENCE_WAIT`], a look each [`FENCE_STEP`]) on the clock `now` reads and
+/// `rest` moves: whether `ok` held at a look.
+fn fence_wait(
+    ok: &mut dyn FnMut() -> bool,
+    now: impl Fn() -> Instant,
+    rest: impl Fn(Duration) -> Result<(), Stopped>,
+) -> Result<bool, Stopped> {
+    wait_on(FENCE_WAIT, FENCE_STEP, ok, now, rest)
+}
+
+/// Look with `ok` now and after each `step` that `rest` waits out, until it holds or a look
+/// finds `limit` passed on the clock `now` reads: whether it held.
+fn wait_on(
+    limit: Duration,
+    step: Duration,
+    mut ok: impl FnMut() -> bool,
+    now: impl Fn() -> Instant,
+    rest: impl Fn(Duration) -> Result<(), Stopped>,
+) -> Result<bool, Stopped> {
+    let end = now() + limit;
+    loop {
+        if ok() {
+            return Ok(true);
+        }
+        if now() >= end {
+            return Ok(false);
+        }
+        rest(step)?;
+    }
+}
+
 /// What reading past the fence found ([`past_the_fence`]).
 #[derive(Debug, PartialEq, Eq)]
 enum Fenced<T> {
@@ -325,7 +371,7 @@ enum Fenced<T> {
     Past { from: TapSaid, to: TapSaid, got: T },
     /// No `status` line named a tap answer.
     NoTap,
-    /// The tap answered too few asks past the first look before the hang detector ran out: its answer at that look, and its last.
+    /// The tap answered too few asks past the first look before the hang detector ([`FENCE_WAIT`]) ran out: its answer at that look, and its last.
     Stuck { from: TapSaid, to: TapSaid },
 }
 
@@ -1177,18 +1223,9 @@ impl Proof {
     fn wait_for(
         limit: Duration,
         step: Duration,
-        mut ok: impl FnMut() -> bool,
+        ok: impl FnMut() -> bool,
     ) -> Result<bool, Stopped> {
-        let end = Instant::now() + limit;
-        loop {
-            if ok() {
-                return Ok(true);
-            }
-            if Instant::now() >= end {
-                return Ok(false);
-            }
-            sleep(step)?;
-        }
+        wait_on(limit, step, ok, Instant::now, sleep)
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -2160,7 +2197,7 @@ impl Proof {
                     }
                 },
                 turns,
-                |ok| Self::wait_for(Duration::from_secs(60), Duration::from_millis(250), ok),
+                |ok| fence_wait(ok, Instant::now, sleep),
             )?;
             println!(
                 "  {}: log @{} kinds=turn (its rollout names {}):",
@@ -2234,8 +2271,11 @@ impl Proof {
                     });
                     self.check(
                         &format!(
-                            "{name}: the rollout tap answers two asks past a look within a minute (rollout_asks {} to {}, rollout={}{said}), {want}",
-                            from.asks, to.asks, to.word
+                            "{name}: the rollout tap answers two asks past a look within {} s, two of a resting tab's reads (rollout_asks {} to {}, rollout={}{said}), {want}",
+                            FENCE_WAIT.as_secs(),
+                            from.asks,
+                            to.asks,
+                            to.word
                         ),
                         false,
                     );
@@ -4542,9 +4582,6 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     proof.question_leg(&question)?;
     timed(proof, "question", t);
     let t = Instant::now();
-    proof.rollout_leg(&[&first, &cont, &approval, &question])?;
-    timed(proof, "rollout", t);
-    let t = Instant::now();
     match (bus, manager.as_deref()) {
         (true, Some(manager)) => proof.autopilot_off_leg(&off, manager, off_at)?,
         _ => {
@@ -4581,6 +4618,16 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     let t = Instant::now();
     proof.land_leg(&land)?;
     timed(proof, "land", t);
+    // Each of the rollout leg's four fences waits out two reads of a tab at rest, up to 30 s
+    // where the tab wrote in the last ten minutes and up to two minutes where it did not
+    // ([`FENCE_WAIT`]), so the leg is read here, after the legs whose lab act must land inside a
+    // model's hold: ahead of them its waits would bring the lab to the repo leg's commit that
+    // much later into the model's hold. Its four tabs were driven by the legs above; no leg
+    // between those and here acts on them, and `upgrade_leg`, which re-execs every codex-alab,
+    // comes after.
+    let t = Instant::now();
+    proof.rollout_leg(&[&first, &cont, &approval, &question])?;
+    timed(proof, "rollout", t);
     // The worker's `await task` waits up to 240 s on a worker that never lands (a package's
     // defect), so it is checked here, after the legs whose lab act must land inside a model's
     // hold (the repo leg's commit and push), and that defect reads as the worker's FAILs alone.

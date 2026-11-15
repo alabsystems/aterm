@@ -4,7 +4,8 @@
 //! Wall classification tests across background jobs and `/goal` echoes.
 
 use crate::prompt::fixtures::screen;
-use crate::{Phase, read};
+use crate::read;
+use alab_policy::vocab::Phase;
 
 const RULE: &str = "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────";
 
@@ -364,7 +365,8 @@ fn a_goal_echo_is_read_through_only_to_the_wall_its_reason_can_come_from() {
 /// through to the error row over it: a network wall, whose row is that later error row.
 #[test]
 fn the_owners_goal_outage_reads_through_its_echo_to_the_unreachable_error_row() {
-    use crate::wall::{ApiCause, Placement, WallKind, wall};
+    use crate::wall::{Placement, wall};
+    use alab_policy::vocab::{ApiCause, WallKind};
     let rows = screen(crate::prompt::fixtures::WALL_GOAL_API_UNREACHABLE_2_1_310);
     let w = wall(&rows).expect("the wall");
     assert_eq!(
@@ -442,7 +444,8 @@ fn the_owners_goal_outage_reads_through_its_echo_to_the_unreachable_error_row() 
 /// different reason under the same opening is no wall.
 #[test]
 fn a_goal_echo_that_the_api_was_unavailable_read_alone_is_a_generic_api_error() {
-    use crate::wall::{ApiCause, Placement, WallKind, classify_wall, wall};
+    use crate::wall::{Placement, classify_wall, wall};
+    use alab_policy::vocab::{ApiCause, WallKind};
     let unreachable = WallKind::ApiError {
         code: None,
         retryable: true,

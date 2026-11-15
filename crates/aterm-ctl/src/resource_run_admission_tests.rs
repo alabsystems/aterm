@@ -113,7 +113,7 @@ fn refusing_reply(reply: Option<&str>, expectation: bool, kind: io::ErrorKind, r
         path: path.to_string_lossy().into_owned(),
         origin: crate::TargetOrigin::Pinned,
     };
-    let error = run(&wire, "s-a", &args).unwrap_err();
+    let error = run(&wire, "s-0000000000000000000a", &args).unwrap_err();
     assert_eq!(error.kind(), kind);
     assert!(error.to_string().contains(reason), "{error}");
     drop(write);
@@ -142,7 +142,7 @@ fn accounted_root_requires_new_terminal_and_clean_eof_preserving_observed_zero()
     for (legacy, trailing) in [(true, false), (false, true), (false, false)] {
         let (client, host) = CtlStream::pair().unwrap();
         let binding = Binding {
-            session: "s-a".into(),
+            session: "s-0000000000000000000a".into(),
             attempt: [12; 16],
         };
         let expected = binding.clone();

@@ -1541,7 +1541,8 @@ impl<'a> Session<'a> {
     pub const fn epoch(&self) -> u64 {
         self.access.generation()
     }
-    /// The signed audience observation that identifies a Secret cell's key epoch.
+    /// The signed audience observation that identifies the key epoch a sealed token (`sec1:`)
+    /// was sealed under.
     pub(crate) fn secret_basis(&self) -> Digest {
         *self.access.basis()
     }

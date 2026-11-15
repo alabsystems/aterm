@@ -190,9 +190,16 @@ fn private_latest_release_uses_the_repository_routed_identity() {
         "livecheck-private/pkg",
         agh_fake::ReleaseSpec::published("v3.2", "2026-01-01T00:00:00Z"),
     );
-    let text = "[profiles.reader]\nenv='LIVE_READER'\ntier='dev'\nlogin='reader'\n[[owners]]\nname='livecheck-private'\ntier='dev'\nread=['reader']\n";
     let scratch = aterm_tempfile::tempdir().unwrap();
     let dirs = agh::config::Dirs::under(&scratch.path().canonicalize().unwrap());
+    // The routed token is the vault entry `reader`, read in place from the scratch home's store;
+    // agh.toml names it by its `~/.secrets/reader` spelling and no file there is read.
+    agh::identity::vault::put_entry_for_tests(&dirs.home, "reader", Some(routed.as_bytes()));
+    let token_file = dirs.home.join(".secrets").join("reader");
+    let text = format!(
+        "[profiles.reader]\ntoken_file={:?}\ntier='dev'\nlogin='reader'\n[[owners]]\nname='livecheck-private'\ntier='dev'\nread=['reader']\n",
+        token_file.to_str().unwrap()
+    );
     std::fs::create_dir_all(dirs.config.parent().unwrap()).unwrap();
     aterm_uds::private_file::create_private_dir(&dirs.config).unwrap();
     let mut file = std::fs::OpenOptions::new()
@@ -206,7 +213,6 @@ fn private_latest_release_uses_the_repository_routed_identity() {
     let ports = fake.ports();
     let env = Arc::new(
         agh::identity::MapEnv::new()
-            .with("LIVE_READER", &routed)
             .with("HOMEBREW_GITHUB_API_TOKEN", &agh_fake::token("unrouted")),
     );
     let base = agh::GithubBuilder::new(agh::policy::Router::empty())

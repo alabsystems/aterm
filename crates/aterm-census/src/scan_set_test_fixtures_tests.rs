@@ -7,18 +7,17 @@ use std::path::{Path, PathBuf};
 use super::{ABSORBED_CRATES, AbsorbedCrate, FORK_LEDGER};
 pub(crate) use crate::tree::memory::Tree;
 
-/// Default `(package, path, namespace)` fork tuple used by test fixtures.
-pub(crate) const FIXTURE_FORK: (&str, &str, &str) = ("indexmap", "vendor/indexmap", "indexmap");
+/// Default `(package, path)` fork pair used by test fixtures.
+pub(crate) const FIXTURE_FORK: (&str, &str) = ("indexmap", "vendor/indexmap");
 
 /// Formats a synthetic `vendor/forge.toml` ledger for `forks`.
-pub(crate) fn ledger(forks: &[(&str, &str, &str)]) -> String {
+pub(crate) fn ledger(forks: &[(&str, &str)]) -> String {
     let mut text = String::from("[forge]\nloc_method = \"x\"\n");
-    for (package, path, namespace) in forks {
+    for (package, path) in forks {
         text.push_str(&format!(
-            "\n# census review: a fixture fork\n[[fork]]\nname = \"{package}\"\n\
+            "\n# a fixture fork\n[[fork]]\nname = \"{package}\"\n\
              version = \"1.0.0\"\npath = \"{path}\"\nlicense = \"MIT\"\n\
-             apache_notice = false\ncensus.mode = \"scanned\"\n\
-             census.namespace = \"{namespace}\"\n"
+             apache_notice = false\n"
         ));
     }
     text
@@ -62,7 +61,7 @@ pub(crate) fn member_name(row: &AbsorbedCrate) -> &'static str {
 /// Builds a minimal `[patch.crates-io]` table and vendor stub files for tests.
 pub(crate) fn patch_fixture() -> (String, Vec<(String, String)>) {
     let mut table = String::from("[patch.crates-io]\n");
-    let (package, path, _) = FIXTURE_FORK;
+    let (package, path) = FIXTURE_FORK;
     table.push_str(&format!("{package} = {{ path = \"{path}\" }}\n"));
     let mut stubs = vec![
         (
@@ -81,16 +80,6 @@ pub(crate) fn patch_fixture() -> (String, Vec<(String, String)>) {
         ));
         stubs.push((format!("{}/LICENSE", a.path), "upstream\n".to_string()));
         stubs.push((format!("{}/src/lib.rs", a.path), "// stub\n".to_string()));
-        for slice in a.platform_slices {
-            for p in slice.paths {
-                let rel = if p.ends_with(".rs") {
-                    format!("{}/{p}", a.path)
-                } else {
-                    format!("{}/{p}/stub.rs", a.path)
-                };
-                stubs.push((rel, "// stub\n".to_string()));
-            }
-        }
     }
     stubs.push(("NOTICE".to_string(), notice));
     (table, stubs)

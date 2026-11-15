@@ -1245,7 +1245,7 @@ fn needs_after_handover(
 
 fn typed_ack(act: &TurnEndAction) -> bool {
     matches!(act, TurnEndAction::Type { text, .. }
-        if text.contains(crate::supervise::policy::needs::NEEDS_ACK))
+        if text.contains(alab_policy::needs::NEEDS_ACK))
 }
 
 #[test]
@@ -1368,7 +1368,7 @@ fn fresh_global_needs(global: Autopilot) {
         s.setup.holder()
     ));
     let mut opts = auto(30);
-    opts.policy.autopilot = global;
+    opts.policy.turn_end.autopilot = global;
     s.ctl.autopilot = Some("-");
     let claims = s.ctl.claims.len();
     s.sync_needs(&point, &opts, &mut notes)
@@ -2595,10 +2595,7 @@ fn go_ahead_run_to(
 fn go_aheads_typed(m: &Mock) -> usize {
     m.requests
         .iter()
-        .filter(|r| {
-            r.starts_with("turn ")
-                && r.contains(crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER)
-        })
+        .filter(|r| r.starts_with("turn ") && r.contains(alab_policy::go_ahead::GO_AHEAD_ANSWER))
         .count()
 }
 
@@ -3290,7 +3287,7 @@ fn a_park_above_the_screen_is_bounded_in_the_loop() {
                         and push it to main.";
     const REPORT: &str = "Committed the parser fix on my branch.";
     const LAST: &str = "Fetched main again; nothing moved.";
-    let bound = crate::supervise::policy::turn_end::GO_AHEAD_ACTS as usize;
+    let bound = alab_policy::words::GO_AHEAD_ACTS as usize;
     let (above, shown) = turn_above(&[REPORT, PARK], &[LAST]);
     // Each run's go-aheads and the `turn` requests it made.
     let mut seen = Vec::new();

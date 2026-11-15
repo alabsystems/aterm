@@ -641,25 +641,36 @@ pub fn probe(exe: &Path, holds: &Path) -> Probe {
 
 /// [`probe`] with an explicit bound; with no `holds`, the program is not held.
 pub(super) fn probe_within(exe: &Path, limit: Duration, holds: Option<&Path>) -> Probe {
-    let Ok(crate::harness::first_exec::Prepared {
-        command: mut cmd,
-        mut hold,
-    }) = crate::harness::first_exec::prepare(
+    let prepared = match crate::harness::first_exec::prepare(
         exe,
         holds,
         crate::harness::first_exec::ProbeWord::Help,
-    )
-    else {
-        return Probe::NoExec;
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            aterm_log::info!(
+                "build probe {}: preparation refused: {error}",
+                exe.display()
+            );
+            return Probe::NoExec;
+        }
     };
+    let crate::harness::first_exec::Prepared {
+        command: mut cmd,
+        mut hold,
+    } = prepared;
     cmd.stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
         .stderr(aterm_uds::spawnfd::Stdio::null());
     #[cfg(unix)]
     cmd.process_group(0);
-    let Ok(mut child) = cmd.spawn() else {
-        crate::harness::first_exec::never_started(&mut hold);
-        return Probe::NoExec;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            aterm_log::info!("build probe {}: spawn failed: {error}", exe.display());
+            crate::harness::first_exec::never_started(&mut hold);
+            return Probe::NoExec;
+        }
     };
     // Image custody and immutable wrapper capture precede execution. Their cost
     // cannot consume the build's run allowance before its child has even started.

@@ -458,7 +458,15 @@ fn a_why_is_as_fresh_as_its_split() {
 #[test]
 fn a_why_arms_the_split_while_it_waits() {
     static ARMED: Arming = Arming::new();
-    for (text, armed) in [("why fresh=0", true), ("global fresh=0", false)] {
+    for (text, armed) in [
+        ("why fresh=0", true),
+        ("global fresh=0", true),
+        ("aterm fresh=0", true),
+        ("tab fresh=0", true),
+        ("mem fresh=0", true),
+        ("fresh=0", true),
+        ("procs fresh=0", false),
+    ] {
         let shared = Arc::new(Shared::paced(
             Duration::from_secs(3600),
             Duration::from_secs(60),
@@ -2068,4 +2076,60 @@ fn scope_request_reads_the_request_owning_the_tab() {
         "an unread tree is unread, never 0"
     );
     crate::requests_host::set_dir_for_test(None);
+}
+
+/// A reading whose process sweep stalled is whole for a pull: it carries every machine figure and
+/// names the stall, so `sys` answers it at once as `state=partial`, never waiting out the pull to
+/// call it warming. CONTROLS: the same reading with its sweep answered is fresh, and one with no
+/// aterm figures that names no stall is warming.
+#[test]
+fn a_partial_snapshot_answers_a_pull_without_waiting_it_out() {
+    let shared = Shared::paced(Duration::from_secs(3600), aterm_spec::wait::MUST_HAPPEN);
+    let stall = aterm_vitals::lanes::LaneStall {
+        lane: aterm_vitals::lanes::PROCS,
+        call: "proc_listallpids",
+        pid: None,
+        name: None,
+        since_unix_ms: 1_792_185_500_000,
+        for_ms: 4_000,
+    };
+    shared.publish_for_test(
+        Snapshot {
+            aterm: None,
+            procs_window_ns: None,
+            stalled: vec![stall],
+            ..synthetic(3, 0.1)
+        },
+        Vec::new(),
+    );
+    let (held, state) = shared.fresh(Duration::from_secs(60), false);
+    assert_eq!(state, Freshness::Partial);
+    assert!(held.is_some_and(|h| h.snap.cpu.is_some() && h.snap.mem.is_some()));
+    let reply = ask(&shared, "global");
+    let header = reply.lines().next().unwrap();
+    assert!(header.contains(" state=partial stalled=procs"), "{reply}");
+    assert!(
+        reply
+            .lines()
+            .any(|l| l.starts_with("stalled procs: proc_listallpids since ")),
+        "{reply}"
+    );
+    assert!(!reply.contains("warming"), "{reply}");
+    shared.publish_for_test(synthetic(4, 0.1), Vec::new());
+    assert_eq!(
+        shared.fresh(Duration::from_secs(60), false).1,
+        Freshness::Fresh
+    );
+    shared.publish_for_test(
+        Snapshot {
+            aterm: None,
+            procs_window_ns: None,
+            ..synthetic(5, 0.1)
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        shared.fresh(Duration::from_secs(60), false).1,
+        Freshness::Warming
+    );
 }

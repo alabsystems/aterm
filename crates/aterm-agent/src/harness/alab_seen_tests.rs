@@ -31,6 +31,8 @@ fn seen_account() -> AccountSeen {
                 }),
                 read: Some((1_000 - 1_200, "m3".into(), "statusline".into())),
                 wall_until: None,
+                reader: None,
+                wall_by: None,
             },
             WindowSeen {
                 window: "7d".into(),
@@ -38,6 +40,8 @@ fn seen_account() -> AccountSeen {
                 figure: Some(Figure::ResetUnread { reset: 0 }),
                 read: None,
                 wall_until: Some(None),
+                reader: None,
+                wall_by: None,
             },
         ],
         history: Vec::new(),
@@ -100,6 +104,8 @@ fn cached_quota_reports_expire_together_without_changing_the_reading() {
                     }),
                     read: Some((200, "m17".into(), "statusline".into())),
                     wall_until: Some(Some(300)),
+                    reader: None,
+                    wall_by: None,
                 },
                 WindowSeen {
                     window: "7d".into(),
@@ -107,6 +113,8 @@ fn cached_quota_reports_expire_together_without_changing_the_reading() {
                     figure: None,
                     read: None,
                     wall_until: Some(Some(300)),
+                    reader: None,
+                    wall_by: None,
                 },
             ],
             ..Default::default()
@@ -164,6 +172,8 @@ fn quota_read_provenance_tracks_the_source_clock_without_changing_the_window() {
                 }),
                 read: Some((reading, "m3".into(), "statusline".into())),
                 wall_until: Some(Some(1_300)),
+                reader: None,
+                wall_by: None,
             }],
             ..Default::default()
         },
@@ -216,6 +226,8 @@ fn relative_provenance_keeps_raw_times_when_the_signed_age_cannot_fit() {
             }),
             read: Some((t, "m3".into(), "statusline".into())),
             wall_until: None,
+            reader: None,
+            wall_by: None,
         };
         let shown = rows_json(
             &[(
@@ -321,6 +333,7 @@ fn readonly_journal_attribution_follows_an_externally_replaced_identity() {
         reset: Some(2_000),
     });
     let seen = Seen {
+        me: Default::default(),
         accounts: [(ANN.into(), ann), (BOB.into(), bob.clone())].into(),
         at: 1_000,
     };
@@ -426,6 +439,7 @@ fn unresolved_current_identity_keeps_local_history_without_borrowing_lab_aliases
         ..Lab::default()
     };
     let seen = Seen {
+        me: Default::default(),
         accounts: [(ANN.into(), seen_account())].into(),
         at: 1_000,
     };
@@ -782,4 +796,222 @@ fn journal_tells_off_from_read() {
     let held = with_seen(seen.clone(), journal);
     assert_eq!(held, Journal::Read(Arc::new(seen)));
     assert_eq!(journal(), Journal::Off, "the override ended with its call");
+}
+
+/// THE DISPLAY ADMISSION, ONE FIELD AT A TIME: a peer's week reading of 32% used whose reset is
+/// ahead within a week is admitted as a bound, its time as read; a reading dated up to 900 s
+/// ahead is admitted as of now; each other row differs from the admitted one by one field and
+/// admits nothing (no reset, an unread reset, a workspace's, this Mac's own uuid, dated more than
+/// 900 s ahead, a reset past a week and its slack, a reading with no uuid). A peer's standing
+/// wall is admitted over its figure while its end is ahead within a week and its slack, and a
+/// wall with no end or an end past that is not. The five-hour window holds to its own length: a
+/// reset or a wall's end five hours and the slack out is admitted, one second later is not.
+/// NEGATIVE CONTROLS: with `bound_of` not checking the reader against `me`, this Mac's own row is
+/// admitted: `this Mac's own uuid` fails; with the wall's end not held to a window and its slack,
+/// `a wall's end past a week and its slack` fails; with the five-hour window given the week's
+/// length, `a five-hour reset past its window and slack` fails.
+#[test]
+fn the_display_admission_admits_a_peers_bound_and_nothing_one_field_off() {
+    use std::collections::BTreeSet;
+    const NOW: i64 = 1_794_571_200;
+    const RESET: i64 = 1_794_844_800;
+    const PEER: &str = "13131313131313131313131313131313";
+    const OWN: &str = "02020202020202020202020202020202";
+    let me: BTreeSet<String> = [OWN.to_owned()].into();
+    let admitted = WindowSeen {
+        window: WEEK.into(),
+        sub: None,
+        figure: Some(Figure::Used {
+            pct_x10: 320,
+            reset: Some(RESET),
+        }),
+        read: Some((NOW - 3 * 3_600, "m13".into(), "statusline".into())),
+        reader: Some(PEER.into()),
+        wall_until: None,
+        wall_by: None,
+    };
+    let bound = Bound::Used {
+        pct_x10: 320,
+        reset: RESET,
+        read: NOW - 3 * 3_600,
+        by: "m13".into(),
+        src: "statusline".into(),
+    };
+    assert_eq!(bound_of(&admitted, &me, NOW), Some(bound.clone()));
+    let ahead = WindowSeen {
+        read: Some((NOW + 900, "m13".into(), "statusline".into())),
+        ..admitted.clone()
+    };
+    assert!(
+        matches!(
+            bound_of(&ahead, &me, NOW),
+            Some(Bound::Used { read: NOW, .. })
+        ),
+        "a reading 900 s ahead is as of now"
+    );
+    let excluded = [
+        (
+            "no reset",
+            WindowSeen {
+                figure: Some(Figure::Used {
+                    pct_x10: 320,
+                    reset: None,
+                }),
+                ..admitted.clone()
+            },
+        ),
+        (
+            "an unread reset",
+            WindowSeen {
+                figure: Some(Figure::ResetUnread { reset: RESET }),
+                ..admitted.clone()
+            },
+        ),
+        (
+            "a workspace's",
+            WindowSeen {
+                sub: Some("sa-00000000000000ff".into()),
+                ..admitted.clone()
+            },
+        ),
+        (
+            "this Mac's own uuid",
+            WindowSeen {
+                reader: Some(OWN.into()),
+                ..admitted.clone()
+            },
+        ),
+        (
+            "dated more than 900 s ahead",
+            WindowSeen {
+                read: Some((NOW + 901, "m13".into(), "statusline".into())),
+                ..admitted.clone()
+            },
+        ),
+        (
+            "a reset past a week and its slack",
+            WindowSeen {
+                figure: Some(Figure::Used {
+                    pct_x10: 320,
+                    reset: Some(NOW + 7 * 86_400 + BOUND_RESET_SLACK_S + 1),
+                }),
+                ..admitted.clone()
+            },
+        ),
+        (
+            "a reset passed",
+            WindowSeen {
+                figure: Some(Figure::Used {
+                    pct_x10: 320,
+                    reset: Some(NOW),
+                }),
+                ..admitted.clone()
+            },
+        ),
+        (
+            "no reader's uuid",
+            WindowSeen {
+                reader: None,
+                ..admitted.clone()
+            },
+        ),
+        (
+            "a day's window",
+            WindowSeen {
+                window: "day".into(),
+                ..admitted.clone()
+            },
+        ),
+    ];
+    for (why, window) in &excluded {
+        assert_eq!(bound_of(window, &me, NOW), None, "{why}");
+    }
+    let walled = WindowSeen {
+        wall_until: Some(Some(RESET)),
+        wall_by: Some((NOW - 600, "m13".into(), PEER.into())),
+        ..admitted.clone()
+    };
+    assert_eq!(
+        bound_of(&walled, &me, NOW),
+        Some(Bound::Wall {
+            until: RESET,
+            read: NOW - 600,
+            by: "m13".into(),
+        }),
+        "a peer's standing wall over its figure"
+    );
+    let no_end = WindowSeen {
+        wall_until: Some(None),
+        ..walled.clone()
+    };
+    assert_eq!(
+        bound_of(&no_end, &me, NOW),
+        Some(bound.clone()),
+        "a wall with no end is no bound; the figure stands"
+    );
+    let wall_ending = |until: i64| WindowSeen {
+        wall_until: Some(Some(until)),
+        ..walled.clone()
+    };
+    let week_edge = NOW + 7 * 86_400 + BOUND_RESET_SLACK_S;
+    assert!(
+        matches!(
+            bound_of(&wall_ending(week_edge), &me, NOW),
+            Some(Bound::Wall { until, .. }) if until == week_edge
+        ),
+        "a wall's end a week and its slack out"
+    );
+    assert_eq!(
+        bound_of(&wall_ending(week_edge + 1), &me, NOW),
+        Some(bound.clone()),
+        "a wall's end past a week and its slack is no bound; the figure stands"
+    );
+    let own_wall = WindowSeen {
+        wall_by: Some((NOW - 600, "m2".into(), OWN.into())),
+        ..walled.clone()
+    };
+    assert!(
+        matches!(bound_of(&own_wall, &me, NOW), Some(Bound::Used { .. })),
+        "this Mac's own wall is its records'"
+    );
+    let five = |reset: i64| WindowSeen {
+        window: FIVE.into(),
+        figure: Some(Figure::Used {
+            pct_x10: 320,
+            reset: Some(reset),
+        }),
+        ..admitted.clone()
+    };
+    let five_edge = NOW + 5 * 3_600 + BOUND_RESET_SLACK_S;
+    assert!(
+        matches!(
+            bound_of(&five(five_edge), &me, NOW),
+            Some(Bound::Used { reset, .. }) if reset == five_edge
+        ),
+        "a five-hour reset five hours and its slack out"
+    );
+    assert_eq!(
+        bound_of(&five(five_edge + 1), &me, NOW),
+        None,
+        "a five-hour reset past its window and slack"
+    );
+    let five_wall = |until: i64| WindowSeen {
+        wall_until: Some(Some(until)),
+        wall_by: walled.wall_by.clone(),
+        ..five(NOW + 3_600)
+    };
+    assert!(
+        matches!(
+            bound_of(&five_wall(five_edge), &me, NOW),
+            Some(Bound::Wall { .. })
+        ),
+        "a five-hour wall's end five hours and its slack out"
+    );
+    assert!(
+        matches!(
+            bound_of(&five_wall(five_edge + 1), &me, NOW),
+            Some(Bound::Used { .. })
+        ),
+        "a five-hour wall's end past its window and slack is no bound; the figure stands"
+    );
 }

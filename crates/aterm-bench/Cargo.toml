@@ -63,10 +63,6 @@ aos-gpu = ["dep:aterm-objc", "aterm-gpu/compute", "aterm-effects/int-bag-mlp"]
 [lints]
 workspace = true
 
-[lib]
-# No unit tests in src/; doctests still run.
-test = false
-
 [[example]]
 name = "aos_gpu"
 required-features = ["aos-gpu"]

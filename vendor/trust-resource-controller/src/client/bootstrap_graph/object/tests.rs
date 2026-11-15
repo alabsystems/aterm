@@ -173,7 +173,7 @@ fn actual_socket_source_transfer_streams_distinct_terminal_and_ack_have_one_comp
         channel
             .send(
                 &object::Terminal::Completed {
-                    completion,
+                    completion: Box::new(completion),
                     observation: crate::accounting::Observation::uncollected(),
                     artifact: Some(artifact),
                 }

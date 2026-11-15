@@ -6,13 +6,14 @@
 use crate::anchors::guard_regex;
 use crate::login::LoginScreen;
 use crate::phase::{
-    Phase, busy_signal, composer_draft, context_left, has_composer_frame, has_shell_mode_frame,
+    busy_signal, composer_draft, context_left, has_composer_frame, has_shell_mode_frame,
     prompt_box_holds, worker_phase,
 };
 use crate::prompt::{CancelEffect, PromptKind, PromptV2, parse_prompt_v2};
 use crate::turn::{continuation_suggestion, goal_active, interrupted, said_tail};
 use crate::wall::{Wall, memory_wall, wall};
 use crate::{agy, grok, kimi, muse};
+use alab_policy::vocab::Phase;
 pub use aterm_agent_names::{AGENT_RUNTIMES, may_host_agent};
 use aterm_agent_names::{Agent, agent_of, program_word};
 
@@ -237,16 +238,6 @@ pub struct Reading {
 /// a line of its own all the same.
 pub type Apart = fn(&str, &str) -> bool;
 
-/// What joins a turn's earlier messages into one text ([`ScreenReader::turn_said_before`]): a
-/// blank line, as a message's own paragraphs are joined.
-pub const MESSAGE_GAP: &str = "\n\n";
-
-/// A turn's earlier `messages` as one text ([`MESSAGE_GAP`]).
-#[must_use]
-pub fn join_messages(messages: &[String]) -> String {
-    messages.join(MESSAGE_GAP)
-}
-
 /// Per-program screen grammar.
 pub trait ScreenReader: Sync {
     fn program(&self) -> Program;
@@ -339,7 +330,7 @@ pub trait ScreenReader: Sync {
         !row.is_empty() && !row.starts_with(char::is_whitespace)
     }
     /// Earlier agent messages from the same turn above [`Self::said_tail`], joined by blank lines
-    /// ([`join_messages`]).
+    /// ([`alab_policy::text::join_messages`]).
     fn turn_said_before(&self, _rows: &[String]) -> Option<String> {
         None
     }

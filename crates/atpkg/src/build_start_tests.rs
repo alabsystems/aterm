@@ -3,7 +3,10 @@
 
 use super::*;
 
-/// A session id as aterm mints one, from a number.
+/// A tab ID in the t form, as aterm mints one for every new tab.
+const TAB: &str = "t0qje5bafqr";
+
+/// A session id in the earlier form, from a number.
 fn sid(n: u64) -> String {
     format!("s-{n:020x}")
 }
@@ -70,6 +73,12 @@ fn a_start_reads_back_from_its_line_and_a_line_naming_no_tab_or_no_absolute_path
     let line = unknown.line().unwrap();
     assert!(!line.contains("\"build\""), "{line}");
     assert_eq!(Start::parse(&line), Some(unknown.clone()));
+    // A tab minted since the t form: its session reads back too.
+    let tab = Start {
+        session: TAB.to_owned(),
+        ..plain.clone()
+    };
+    assert_eq!(Start::parse(&tab.line().expect("a t ID's line")), Some(tab));
 
     // What a writer refuses to spell.
     for session in [
@@ -80,6 +89,9 @@ fn a_start_reads_back_from_its_line_and_a_line_naming_no_tab_or_no_absolute_path
         "s-0123456789ABCDEF0123",
         "s-0123456789abcdef01234",
         "t-0123456789abcdef0123",
+        "t0qje5bafq",
+        "t0qje5bafqrr",
+        "T0QJE5BAFQR",
     ] {
         let named = Start {
             session: session.to_owned(),
@@ -172,6 +184,11 @@ fn the_session_is_the_tabs_parent_variable_and_nothing_else() {
     assert_eq!(
         session_of(&env(Some(tab.as_str()))).as_deref(),
         Some(tab.as_str())
+    );
+    assert_eq!(
+        session_of(&env(Some(TAB))).as_deref(),
+        Some(TAB),
+        "a tab minted in the t form"
     );
     assert_eq!(session_of(&env(None)), None, "outside a tab");
     assert_eq!(session_of(&env(Some("x"))), None);

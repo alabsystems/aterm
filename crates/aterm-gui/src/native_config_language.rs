@@ -1654,6 +1654,15 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         ],
         false,
     ),
+    // A rename writes it from this machine's number (`aterm_agent::machine_name::publish`), so
+    // it has no Settings row, which would be a second writer the next rename overwrites.
+    manual(
+        "ai.machine",
+        "The fleet document's [machine.<name>] row for this machine (a rename writes it)",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &["ai", "fleet", "machine", "name", "host"],
+        true,
+    ),
     manual(
         "ai.reviewers",
         "AI CLIs that review, in order (default: every one used here)",

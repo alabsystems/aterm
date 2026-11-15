@@ -22,6 +22,7 @@ description = "amacs's document I/O, shared by both faces: the pure save and dra
 test-support = []
 
 [dependencies]
+aterm-cores = { workspace = true }
 # The document store's ids and snapshots that plans and grants name, and the
 # file-URI codec admission parses with (`amacs::protocol::uri`).
 amacs = { workspace = true }
@@ -31,6 +32,8 @@ aterm-buffer = { path = "../aterm-buffer" }
 aterm-gui-consent = { workspace = true }
 # The journal key's HMAC-SHA256.
 aterm-digest = { workspace = true }
+# The advisory-write-lock naming protocol shared with the primer and config writers.
+aterm-durable = { workspace = true }
 # The content fingerprint (FNV-1a with a length mix).
 aterm-hash = { workspace = true }
 # The draft journal's records are astream step records (`io/journal_steps.rs`), and astream's
@@ -56,8 +59,6 @@ aterm-tempfile = { workspace = true }
 # The tests mint a root authority for the store's write cap; only a test may,
 # below the launchers (the `launcher-mint` guard).
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
-# The counting seam (`aterm_durable::seam`) the flush-tier test reads.
-aterm-durable = { workspace = true }
 # Hang detectors, and the reducers' Tier-1 binds to their derived models.
 aterm-spec = { workspace = true }
 aterm-models-native = { workspace = true }

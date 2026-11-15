@@ -24,11 +24,11 @@ use aterm_uds::stop::Stop;
 
 use super::{
     NodeBoot, NodeMesh, NodeServeConfig, NodeUpdater, NodeUpdates, RETRY_LEFT_AFTER, RelayHeader,
-    WindowLauncher, WindowPresence, WindowRelays, apply_at_node_boot, arm_claims_off_on_quit,
-    claims_off_on_quit, claims_upkeep, has_live_window_relay, keeps_port_after, mind_node_checker,
-    others_beside, own_node_job, query_window_survey_facts, read_line_raw, relay_ask,
-    relay_socket_path, restart_for, run_node_serve_with, serve_window_relay_at, spawn_node_updates,
-    wanted_for_node, why_the_run_ends,
+    WindowLauncher, WindowPresence, WindowRelays, activity_of_windows, apply_at_node_boot,
+    arm_claims_off_on_quit, claims_off_on_quit, claims_upkeep, has_live_window_relay,
+    keeps_port_after, mind_node_checker, others_beside, own_node_job, query_window_survey_facts,
+    read_line_raw, relay_ask, relay_socket_path, relayed_survey, restart_for, run_node_serve_with,
+    serve_window_relay_at, spawn_node_updates, wanted_for_node, why_the_run_ends,
 };
 use aterm_session::SessionId;
 use aterm_types::MutexExt as _;
@@ -376,7 +376,8 @@ fn relay_header_roundtrips_and_rejects_malformed_frames() {
 
 #[test]
 fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines() {
-    use aterm_agent::survey_facts::{ServerHeardFact, SurveyAccountFact};
+    use aterm_agent::survey_facts::{MachineFacts, ServerHeardFact, SurveyAccountFact};
+    use aterm_capacity::machine_look::MachineLook;
     use std::collections::BTreeMap;
 
     let relay_scratch = crate::test_scratch::short_dir("node-serve-large-survey");
@@ -421,12 +422,29 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
             at: 1_793_159_995,
         }],
         home: None,
-        home_free_mb: None,
+        home_dir: None,
+        home_free_mb: Some(900),
+        machine: None,
         repos: None,
         update: None,
     };
+    // The window sends its look at the machine, as a window of an aterm with the look does.
+    let window = SwarmSurveyFacts {
+        machine: Some(MachineFacts {
+            look: MachineLook {
+                at_unix_ms: Some(1_793_159_999_000),
+                cores: Some(8),
+                disk_free_mb: Some(900),
+                ..MachineLook::UNREAD
+            },
+            up_since_ms: Some(1_793_100_000_000),
+            os: Some("macos"),
+            target: None,
+        }),
+        ..expected.clone()
+    };
     let mut reply_lines: Vec<String> = Vec::new();
-    let base_wire = expected.to_survey_reply(
+    let base_wire = window.to_survey_reply(
         pid,
         Some("m22.local"),
         1_793_160_000_000,
@@ -447,6 +465,7 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
         reply_lines.len()
     );
     let full_wire = format!("OK {}\n{}\n", reply_lines.len(), reply_lines.join("\n"));
+    assert!(full_wire.contains(" m_at_ms=1793159999000 "), "{full_wire}");
 
     let dir_clone = relay_dir.clone();
     let stop_clone = Arc::clone(&stop);
@@ -486,10 +505,102 @@ fn query_window_survey_facts_reads_large_account_rosters_beyond_sixty_four_lines
     let parsed = query_window_survey_facts(&windows).expect("full 89-line survey facts");
     assert_eq!(parsed.accounts.len(), 75);
     assert_eq!(parsed.server_heard.len(), 1);
+    // The facts push this read is for carries no look: the window's is dropped, and its free
+    // space and everything else are the window's.
     assert_eq!(parsed, expected);
 
     stop.store(true, Ordering::Release);
     let _ = handle.join();
+}
+
+/// The node job's own reads of its windows (the 3-minute facts push and the 60 s count of agents)
+/// ask each window a survey that names no peer, which a window answers with no look at the
+/// machine; a peer's survey names its peer, and its answer takes the look. A look is taken only
+/// inside a peer's answer, never on the node job's timers.
+#[test]
+fn the_node_jobs_own_survey_reads_ask_the_windows_for_no_look() {
+    use crate::survey::Taking;
+
+    let relay_scratch = crate::test_scratch::short_dir("node-serve-no-look");
+    let relay_dir = relay_scratch.path().to_path_buf();
+    let stop = Arc::new(AtomicBool::new(false));
+    let pid = std::process::id();
+    let asked: Arc<Mutex<Vec<RelayHeader>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let dir_clone = relay_dir.clone();
+    let stop_clone = Arc::clone(&stop);
+    let asked_clone = Arc::clone(&asked);
+    let handle = std::thread::spawn(move || {
+        let _ = serve_window_relay_at(
+            &dir_clone,
+            pid,
+            Some(&stop_clone),
+            hosts_every,
+            move |header, mut s| {
+                asked_clone.lock_or_recover().push(header.clone());
+                std::thread::spawn(move || {
+                    if matches!(header, RelayHeader::Survey { .. })
+                        && let Ok(Some(line)) = read_line_raw(&mut s, 4096)
+                        && line.trim() == "survey"
+                    {
+                        let _ = s.write_all(
+                            format!(
+                                "OK 2\ninstance pid={pid} at_ms=1793160000000 sessions=1 cut=0 \
+                                 instances=1 instances_read=1\nsession sid=s-1 pid=901 \
+                                 program=zsh\n"
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = s.flush();
+                    }
+                });
+                true
+            },
+        );
+    });
+    let sock_path = relay_socket_path(&relay_dir, pid);
+    let wait_until = Instant::now() + DIAL_WITHIN;
+    while !sock_path.exists() {
+        assert!(
+            Instant::now() < wait_until,
+            "window relay socket never bound"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let windows = WindowRelays::new(relay_dir.clone(), idle_launcher());
+    let _ = query_window_survey_facts(&windows);
+    let _ = activity_of_windows(&windows, 1_793_160_000);
+    stop.store(true, Ordering::Release);
+    let _ = handle.join();
+
+    let asked = asked.lock_or_recover().clone();
+    assert_eq!(
+        asked.len(),
+        2,
+        "the push and the count each ask the window: {asked:?}"
+    );
+    for header in &asked {
+        let Some((_, (peer, taking))) = relayed_survey(header) else {
+            panic!("a survey header: {header:?}");
+        };
+        assert_eq!(
+            (peer, taking),
+            (None, Taking::NoLook),
+            "the node job's own read takes no look: {header:?}"
+        );
+    }
+    let peer: SocketAddr = "192.0.2.7:4040".parse().expect("a peer address");
+    let asked_by_peer = RelayHeader::Survey {
+        content: true,
+        drive: false,
+        peer: Some(peer),
+    };
+    assert_eq!(
+        relayed_survey(&asked_by_peer),
+        Some(((true, false), (Some(peer), Taking::Look))),
+        "a peer's survey keeps its scope and its peer and takes the look"
+    );
 }
 
 #[test]
@@ -633,6 +744,24 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
         reply
     };
     let drive_line = |line: &str| drive_as(&Requester::default(), line);
+    for line in ["update status\n", "update holds\n"] {
+        let reply = drive_line(line);
+        assert!(reply.starts_with("OK "), "windowless {line:?}: {reply}");
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+    }
+    for line in [
+        "update\n",
+        "update check\n",
+        "update apply\n",
+        "update retry\n",
+        "update status apply\n",
+        "update holds retry\n",
+        "@s-1 update status\n",
+    ] {
+        let reply = drive_line(line);
+        assert!(reply.starts_with("ERR "), "{line:?}: {reply}");
+        assert_eq!(launcher.launches.load(Ordering::Acquire), 0);
+    }
     let asker = "s-0123456789abcdef0123";
     let session = Requester::of(Some(asker), Some("claude"), None, None);
     launcher.logged_in.store(true, Ordering::Release);
@@ -677,6 +806,10 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     );
     let reply = drive_as(&session, "board\n");
     assert!(reply.starts_with("OK"), "the board is read: {reply}");
+    for line in ["update status\n", "update holds\n"] {
+        let reply = drive_as(&session, line);
+        assert!(reply.starts_with("OK "), "{line:?}: {reply}");
+    }
     //     A fleet service's line is its own client's, whichever connection carries it: it has
     //     no row though a session's drive asked.
     let reply = drive_as(&session, "vault status\n");
@@ -688,7 +821,7 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
     launcher.logged_in.store(false, Ordering::Release);
     //     The fleet activity record of this state folder: the survey a session asked for, one
     //     blocked row for each refused line, with the level in force and the level it needed,
-    //     and one admitted read for the board a session asked for. The reads nobody's session
+    //     and admitted reads for the board and updater a session asked for. The reads nobody's session
     //     asked for (the plain survey and `version`, the plain board) and the machine's own
     //     services (vault, service-repair) have no row.
     {
@@ -715,8 +848,8 @@ fn windowless_node_answers_survey_and_wakes_window_on_spawn_or_refuses_when_logg
             read += row.n;
         }
         assert_eq!(
-            read, 2,
-            "the survey and the board a session asked for: {reads:?}"
+            read, 4,
+            "the survey, board and two updater reads a session asked for: {reads:?}"
         );
         let seen: Vec<(Plain, Outcome, Option<&str>)> = acts
             .iter()
@@ -1412,7 +1545,9 @@ fn custody_move_rejects_an_old_secrets_open_facts_push() {
             moves: None,
             server_heard: Vec::new(),
             home: None,
+            home_dir: None,
             home_free_mb: None,
+            machine: None,
             repos: None,
             update: None,
         }
@@ -1999,6 +2134,9 @@ fn query_window_survey_facts_reads_live_window_session_counts_unlike_zero_fallba
     );
     assert!(live_facts.window);
     assert_eq!(live_facts.label.as_deref(), Some("m7"));
+    // The push takes no look at the machine: its window here is older than the look, and the
+    // node job adds none of its own for it.
+    assert_eq!(live_facts.machine, None, "the facts push carries no look");
 
     relay_stop.store(true, Ordering::Release);
     let sock = relay_socket_path(relay_scratch.path(), std::process::id());
@@ -6363,9 +6501,17 @@ fn a_window_whose_relay_backlog_is_full_holds_the_update_until_the_bound() {
     let own = relay_socket_path(relay.path(), std::process::id());
     let listener = aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(&own))
         .expect("a relay listener that never accepts");
+    // std listens at the system's maximum on Linux (somaxconn, 4096 on many hosts), where the
+    // kernel queues one connect more than the backlog: a queue that long outlasts any count of
+    // connects this test makes. Its queue is lowered to one slot, so a few connects fill it.
+    // SAFETY: `listen` on this test's own live listener; it changes only that socket's backlog.
+    assert_eq!(
+        unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&listener), 1) },
+        0
+    );
     // Fill its listen queue: each connect nobody accepts takes a slot until one is refused.
     let mut queued = Vec::new();
-    let refused = (0..4096).any(|_| {
+    let refused = (0..16).any(|_| {
         match aterm_uds::connect::until(&own, Instant::now() + Duration::from_secs(1)) {
             Ok(stream) => {
                 queued.push(stream);

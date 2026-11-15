@@ -57,6 +57,12 @@ impl<'a> Fence<'a> {
         self
     }
 
+    /// Collect this attempt's observations without inheriting an earlier pass's reports.
+    #[cfg(unix)]
+    pub(super) fn reporting_pass(&self) -> Self {
+        Self::new(self.processes).with_reporting()
+    }
+
     pub(super) fn note(&self, path: &Path, reason: KeepReason) {
         self.note_with(path, || reason);
     }

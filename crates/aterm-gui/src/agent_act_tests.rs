@@ -890,3 +890,121 @@ fn a_handoff_record_carries_the_sessions_confirmation() {
     );
     forget_kept_for_test(&s);
 }
+
+/// A HARNESS-LED CLAUDE TAB IS OBSERVED, SO THE BUILT-IN ENGINE TYPES NOTHING THERE
+/// (`docs/HARNESS-CONTRACT.md` rule 8): where `claude-alab`, claude-code-alab's store build, leads
+/// the tab's foreground group, the tab still reads as Claude Code (`program_of` maps the
+/// harness's name to its vendor, so the vendor's reader keeps reading the screen) and the claim's
+/// image rule takes that build, yet no vendor layout, team or stand-in confirms it as Claude
+/// Code: `status supervisor_act=observe`, the hosted loop's gate is observed, and the one observe
+/// gate withholds the window harness's unexempted writes. That holds under claude-code-alab's
+/// proven claim, whose scope does not decide it: the claim here takes `relaunch,upgrade` and
+/// leaves the engine every typing duty, which it still does not type. CONTROL: the very same
+/// tab whose leader is the vendor's own store build in the same prefix is confirmed (`on`), so
+/// the prefix is read and the observation is the harness image's.
+#[cfg(unix)]
+#[test]
+fn a_harness_led_claude_tab_is_observed() {
+    use aterm_agent::harness::contract;
+    let w = World::new();
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let root = std::fs::canonicalize(dir.path()).expect("canonical scratch");
+    let layout = atpkg::store::Layout {
+        prefix: root.join("pkg"),
+    };
+    let build = |package: &str, id: u64, tool: &str| {
+        let dir = layout.build_dir(package, id);
+        std::fs::create_dir_all(dir.join("bin")).expect("build dir");
+        let exe = dir.join("bin").join(tool);
+        std::fs::copy("/bin/sleep", &exe).expect("a build");
+        atpkg::store::mark_build_ready(&dir).expect("ready");
+        exe
+    };
+    let harness = build("claude-code-alab", 1234, "claude-alab");
+    let vendor = build("claude", 1_000_002_000_001_000_304, "claude");
+    let row = contract::row_named("claude-code-alab").expect("rostered");
+    assert!(
+        crate::harness_claim::image_in(&layout, row, &harness),
+        "the claim's image rule takes the harness's store build"
+    );
+    assert_eq!(
+        aterm_phase::program_of("claude-alab"),
+        Some(Program::Claude)
+    );
+    let roots = Arc::new(ImageRoots::new(&layout));
+    let places = || Where {
+        versions: Some(w.versions.clone()),
+        roots: Some(Arc::clone(&roots)),
+        standins: Vec::new(),
+    };
+    let h = crate::session_store::test_handle(72);
+    let store = crate::session_store::new_store();
+    store
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .register(h.clone());
+    let s = h.ctx.self_id.as_str().to_string();
+    {
+        let mut timeline = h
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        timeline.note_foreground_group(GROUP);
+        timeline.set_program(GROUP, Some("claude-alab".to_string()));
+    }
+    let contract::Words::Scoped(claim) = contract::read(
+        &format!("claude-code-alab@{GROUP}"),
+        &["contract=3", "scope=relaunch,upgrade"],
+    ) else {
+        panic!("the roster admits claude-code-alab's relaunch,upgrade");
+    };
+    crate::session_timeline::claim_supervisor_scoped(
+        &h.ctx,
+        &format!("claude-code-alab@{GROUP}"),
+        Some(73),
+        crate::harness_claim::Scoped {
+            proven: crate::self_claim::Proven {
+                pid: u32::try_from(GROUP).expect("a pid"),
+                start: "fixture-birth".to_string(),
+            },
+            claim,
+        },
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("the proven scoped claim");
+    set(w.running(&harness, 50));
+    let verdict = read_with(&s, Program::Claude, GROUP, &FAKE, &places);
+    assert_eq!(
+        verdict,
+        Verdict {
+            act: Act::Observe,
+            proof: None
+        },
+        "no layout, team or stand-in confirms the harness as Claude Code"
+    );
+    assert_eq!(status_word(&s, Some(Program::Claude), GROUP), "observe");
+    assert_eq!(hosted_with(&store, &s, &FAKE, &places), Act::Observe);
+    assert_eq!(
+        withheld_with(&h.ctx, None, &FAKE, &places).as_deref(),
+        Some(format!("{}\n", agent_image::OBSERVE_REFUSAL).as_str()),
+        "the window harness's writes are withheld there"
+    );
+    set(w.running(&vendor, 50));
+    {
+        let mut timeline = h
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        timeline.set_program(GROUP, Some("claude".to_string()));
+    }
+    assert_eq!(
+        hosted_with(&store, &s, &FAKE, &places),
+        Act::On,
+        "CONTROL: the vendor's own store build in the same prefix is confirmed"
+    );
+    assert_eq!(status_word(&s, Some(Program::Claude), GROUP), "on");
+    assert_eq!(withheld_with(&h.ctx, None, &FAKE, &places), None);
+}

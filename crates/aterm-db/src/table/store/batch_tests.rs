@@ -72,17 +72,16 @@ fn ingest_batch_one_checkpoint_one_witness() {
         let delivered = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
         let seen = Arc::clone(&delivered);
         let table = store.scope.digest();
-        let _listener = listen(store.claim_dir.clone(), move |record| {
+        let hear = move |record: &Appended<'_>| {
             if record.table == table {
                 seen[0].fetch_add(1, Ordering::Relaxed);
                 if record.length != 256 {
                     seen[1].fetch_add(1, Ordering::Relaxed);
                 }
             }
-        })
-        .unwrap();
+        };
         let recording = aterm_durable::seam::Recording::start();
-        let receipts = store.ingest_batch(&session, &borrowed).unwrap();
+        let receipts = with_append_sink(hear, || store.ingest_batch(&session, &borrowed)).unwrap();
         let flushes = recording.take();
         assert_eq!(*commits.borrow(), 1);
         assert_eq!(
@@ -127,24 +126,29 @@ fn ingest_batch_coalesces_proposals_and_exact_retries_without_notifications_or_w
     let notifications = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&notifications);
     let table = store.scope.digest();
-    let _listener = listen(store.claim_dir.clone(), move |record| {
+    let hear = move |record: &Appended<'_>| {
         if record.table == table {
             seen.fetch_add(1, Ordering::Relaxed);
         }
-    })
+    };
+    let hear = Rc::new(hear);
+    let heard = Rc::clone(&hear);
+    let receipts = with_append_sink(
+        move |record: &Appended<'_>| heard(record),
+        || store.ingest_batch(&session, &[&wires[0], &wires[0], &wires[1], &wires[0]]),
+    )
     .unwrap();
-    let receipts = store
-        .ingest_batch(&session, &[&wires[0], &wires[0], &wires[1], &wires[0]])
-        .unwrap();
     assert_eq!(receipts[0], receipts[1]);
     assert_eq!(receipts[0], receipts[3]);
     assert_eq!(store.records.len(), 2);
     assert_eq!(notifications.load(Ordering::Relaxed), 2);
     let recording = aterm_durable::seam::Recording::start();
     store.capacity.operations = 0;
-    let retry = store
-        .ingest_batch(&session, &[&wires[1], &wires[0], &wires[1]])
-        .unwrap();
+    let retry = with_append_sink(
+        move |record: &Appended<'_>| hear(record),
+        || store.ingest_batch(&session, &[&wires[1], &wires[0], &wires[1]]),
+    )
+    .unwrap();
     assert_eq!(retry, [receipts[2], receipts[0], receipts[2]]);
     assert!(recording.take().is_empty());
     assert_eq!(notifications.load(Ordering::Relaxed), 2);

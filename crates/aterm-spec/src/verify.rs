@@ -1294,13 +1294,16 @@ pub(crate) fn ty_states_explored(evidence: &str) -> Option<u64> {
 }
 
 /// The law `ty`'s evidence reports violated. Every failed run exits non-zero, a parse error or an
-/// evaluation error as much as a counterexample, so only this line is a refutation.
+/// evaluation error as much as a counterexample, so only a named invariant violation is a
+/// refutation.
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn ty_violated_law(evidence: &str) -> Option<&str> {
     evidence.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix("Error: Invariant ")?
+        let diagnostic = line.trim().strip_prefix("Error: Invariant ")?;
+        diagnostic
             .strip_suffix(" is violated.")
+            .or_else(|| diagnostic.strip_suffix(" is violated by the initial state:"))
+            .filter(|law| !law.is_empty())
     })
 }
 

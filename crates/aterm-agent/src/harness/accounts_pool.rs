@@ -27,7 +27,9 @@ use crate::ai::connector::Seam;
 #[path = "accounts_execution.rs"]
 mod execution;
 pub use execution::{
-    ExecutionGuard, ExecutionIntent, admit_execution, admit_external_execution, capture_execution,
+    ExecutionGuard, ExecutionIntent, Purpose, Refusal, RefusalKind, Unadmitted, admit_execution,
+    admit_external_execution, capture_execution, execution_admission, execution_readmission,
+    external_admission,
 };
 
 pub use super::codex_grant_owner::{
@@ -2213,7 +2215,9 @@ pub fn launch_now<'a>(
 /// other. It reads no usage, records no claim and prepares no login. Claude Code's is the row of
 /// the account `home`'s login file names (a plain start's [`super::observe::Login`], reconciled:
 /// the row with no directory only while nothing was read of the file or it agrees), unless
-/// [`accounts::claude_worker_move`], the task launcher's own rule, moves the worker. Every other CLI's is [`launch_now`]'s pick, or the row on this machine's own login where that takes no
+/// [`accounts::claude_worker_move`], the task launcher's own rule, moves the worker, under the
+/// same launch-time token guard, `serves` being its judgment ([`token_serves_here`] for a launch
+/// here). Every other CLI's is [`launch_now`]'s pick, or the row on this machine's own login where that takes no
 /// row, and for Codex only if a wall on it can show ([`codex_row_can_show_a_wall`]). `None` where
 /// the launch is refused, runs on a login no row lists, or is Codex's on one no read here can show a
 /// wall on. A launch also reads the row it picks and may leave it for a wall that read finds, which
@@ -2227,11 +2231,13 @@ pub fn unstarted_launch_row<'a>(
     enrolled: &std::collections::BTreeSet<String>,
     (program, home): (Option<&Path>, Option<&Path>),
     now: i64,
+    serves: &mut dyn FnMut(&Row) -> bool,
 ) -> Option<&'a Row> {
     if cli == Cli::Claude {
         let plain = super::observe::Login::claude(&[], home, roster);
         let from = plain.reconciled(roster).row()?;
-        let moved = accounts::claude_worker_move(roster, state, enrolled, &plain, mode, now);
+        let moved =
+            accounts::claude_worker_move(roster, state, enrolled, &plain, (mode, now), serves);
         return Some(moved.map_or(from, |(_, row)| row));
     }
     let row = match launch_now((cli, keyring, mode), roster, state, enrolled, program, now).ok()? {
@@ -2240,6 +2246,25 @@ pub fn unstarted_launch_row<'a>(
     };
     (cli != Cli::Codex || codex_row_can_show_a_wall((keyring, mode), roster, enrolled, row, home))
         .then_some(row)
+}
+
+/// The launch-time token guard's judgment of a launch on this Mac
+/// ([`super::token_route::row_token_serves_at`] under the user's `home`, with this Mac's token
+/// table and accounts state in `store` and the bound `roster`, at `now`), for a surface that says
+/// where a launch would start: it reads the vault only for a row only its vault token puts in
+/// rotation, as the launch does. With no home or store it serves no row, as a launch that cannot
+/// judge the token starts on none.
+pub fn token_serves_here<'a>(
+    home: Option<&'a Path>,
+    store: Option<&'a accounts::Store>,
+    roster: &'a Roster,
+    now: i64,
+) -> impl FnMut(&Row) -> bool + 'a {
+    move |row: &Row| {
+        home.zip(store).is_some_and(|(home, store)| {
+            super::token_route::row_token_serves_at(home, store, roster, row, now)
+        })
+    }
 }
 
 /// The login a survey may read `row`'s own rollouts as, in `home`, and the Codex homes that hold
@@ -2865,7 +2890,7 @@ fn launch_env_reading_capturing(
             cli,
             &snapshot,
             pinned,
-            &Default::default(),
+            (&Default::default(), &Default::default()),
             (configured_mode, unread.is_some()),
             capture,
         )?;
@@ -2915,9 +2940,38 @@ fn launch_env_reading_capturing(
     checked_launch_pin(seat, cli, roster, &state, &enrolled)?;
     let mut excluded = std::collections::BTreeSet::new();
     let mut last_overlay_error = None;
+    // Every pick is under the launch-time token guard ([`accounts::token_guarded`]): a row only
+    // its vault token puts in rotation is taken only where the token judgment would serve the
+    // launch, so a stale reading never starts a session on a lapsed stored login. Each row's
+    // judgment is made once for the launch, before the writer's lock, which holds the pick to
+    // it ([`finish_launch`]).
+    let store = seat.store(cli);
+    let mut token_serves = token_serves_here(Some(seat.home), Some(&store), roster, seat.now);
+    let mut token_judged = std::collections::BTreeMap::<String, bool>::new();
     loop {
         let candidates = without_failed_preparations(&state, &excluded);
-        let picked = pick_row(cli, roster, &candidates, &enrolled, unread, seat.now);
+        let mut refusal = None;
+        let picked = {
+            let mut serves = |row: &Row| {
+                *token_judged
+                    .entry(row.label.clone())
+                    .or_insert_with(|| token_serves(row))
+            };
+            accounts::token_guarded(
+                roster,
+                &candidates,
+                &enrolled,
+                seat.now,
+                &mut serves,
+                None,
+                |current| {
+                    pick_row(cli, roster, current, &enrolled, unread, seat.now)
+                        .map_err(|why| refusal = Some(why))
+                        .ok()
+                },
+            )
+        }
+        .ok_or_else(|| refusal.unwrap_or_else(|| unusable(cli)));
         let row = picked.map_err(|why| last_overlay_error.take().unwrap_or(why))?;
         let why = match prepare(row) {
             Ok(env) => {
@@ -2945,7 +2999,7 @@ fn launch_env_reading_capturing(
                     cli,
                     &snapshot,
                     row,
-                    &excluded,
+                    (&excluded, &token_judged),
                     (configured_mode, unread.is_some()),
                     capture,
                 )?;
@@ -3150,7 +3204,14 @@ pub fn cold_launch_admitted(
             }
             None => input.clone(),
         };
-        intent = Some(execution::capture_held(seat, cli, &effective, current)?);
+        // A cold selection picks its row: the selection policy holds for it.
+        intent = Some(execution::capture_held(
+            seat,
+            cli,
+            &effective,
+            current,
+            Purpose::Select,
+        )?);
         Ok(())
     };
     let pick = cold_launch_who_capturing(
@@ -3308,7 +3369,14 @@ fn cold_launch_who_capturing(
     }
     let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
     let isolated = ran.dir.is_none() || default_only(cli, &snapshot.roster, program).is_none();
-    let serves = |state: &accounts::State| {
+    // The launch-time token guard ([`accounts::token_pick_refused`]): a row only its vault token
+    // keeps running here is kept only where the token judgment would serve the relaunch, which
+    // otherwise starts on the row's lapsed stored login. The vault is read only for such a row,
+    // and only once everything else would keep it.
+    let roster = snapshot.roster.clone();
+    let store = seat.store(cli);
+    let mut token_serves = token_serves_here(Some(seat.home), Some(&store), &roster, seat.now);
+    let mut serves = |state: &accounts::State| {
         isolated
             && ran.held_by.is_none()
             && !matches!(
@@ -3318,6 +3386,13 @@ fn cold_launch_who_capturing(
                     | accounts::Condition::NotEnrolled
             )
             && state.lease_verdict(&ran.label, seat.now).is_ok()
+            && !accounts::token_pick_refused(
+                &ran,
+                state,
+                enrolled.contains(&ran.label),
+                seat.now,
+                &mut token_serves,
+            )
     };
     let mut usable = serves(&snapshot.state);
     if usable
@@ -3803,6 +3878,16 @@ fn finish_cold_login(
         }
     }
     let store = seat.store(cli);
+    // The token judgment of a row only its vault token keeps running here, made before the
+    // writer's lock (it reads the vault, the token table and the accounts state): `None` where
+    // the records before named no such row.
+    let enrolled = accounts::enrolled_in(cli, &before.roster, seat.home);
+    let token_served =
+        (accounts::login_here(row, &before.state, enrolled.contains(&row.label), seat.now)
+            == accounts::LoginHere::OnToken)
+            .then(|| {
+                token_serves_here(Some(seat.home), Some(&store), &before.roster, seat.now)(row)
+            });
     let held = store
         .acquire_within(&accounts::LOCK_LADDER)
         .map_err(|why| why.to_string())?
@@ -3816,17 +3901,21 @@ fn finish_cold_login(
     {
         return Err("account routing or login changed during cold relaunch".into());
     }
-    validate_cold_row(seat, cli, &current, row, mode, program)?;
+    validate_cold_row(seat, cli, &current, row, (mode, token_served), program)?;
     capture(&current, Some(row))?;
     Ok(rebound.then_some(prepared))
 }
 
+/// Whether `row` may take the cold relaunch under the writer's lock, `current` as it reads: a row
+/// only its vault token keeps running here is refused as signed out unless the token judgment
+/// made before the lock served it (`token_served`; `None`: no judgment was made, which serves
+/// nothing).
 fn validate_cold_row(
     seat: &Seat<'_>,
     cli: Cli,
     current: &PoolSnapshot,
     row: &Row,
-    mode: Mode,
+    (mode, token_served): (Mode, Option<bool>),
     program: Option<&Path>,
 ) -> Result<(), String> {
     if row.dir.is_some() && default_only(cli, &current.roster, program).is_some() {
@@ -3840,6 +3929,15 @@ fn validate_cold_row(
         .lease_verdict(&row.label, seat.now)
         .map_err(|why| format!("cold relaunch account {}: {}", row.label, why.as_str()))?;
     let enrolled = accounts::enrolled_in(cli, &current.roster, seat.home);
+    if accounts::token_pick_refused(
+        row,
+        &current.state,
+        enrolled.contains(&row.label),
+        seat.now,
+        &mut |_| token_served == Some(true),
+    ) {
+        return Err("cold relaunch account is not signed in".into());
+    }
     match accounts::condition(row, &current.state, enrolled.contains(&row.label), seat.now) {
         accounts::Condition::NotEnrolled | accounts::Condition::SignedOut => {
             return Err("cold relaunch account is not signed in".into());
@@ -4086,7 +4184,8 @@ pub fn pin_refusal(
 /// # Errors
 ///
 /// The pin names no row of `roster`, or its row is not signed in here (`enrolled` holds the
-/// rows whose login is here) or is known signed out.
+/// rows whose login is here) or is known signed out. Its row held for preparation only, or failed
+/// to prepare in this operation ([`accounts::State::execution_verdict`]), refuses too.
 fn launch_pin<'a>(
     cli: Cli,
     roster: &'a Roster,
@@ -4094,6 +4193,25 @@ fn launch_pin<'a>(
     enrolled: &std::collections::BTreeSet<String>,
     now: i64,
 ) -> Result<Option<&'a Row>, String> {
+    pin_of(cli, roster, state, enrolled, now).map_err(String::from)
+}
+
+/// [`launch_pin`], its refusal typed by what lifts it, so an execution admission's selection
+/// policy ([`capture_execution`]) names the check that refused.
+///
+/// # Errors
+///
+/// [`RefusalKind::Pin`] where the pin names no row of `roster`; [`RefusalKind::Lease`] where its
+/// row is held for preparation only or failed to prepare here; [`RefusalKind::SignedOut`] where
+/// its row is not signed in here (`enrolled` holds the rows whose login is here) or is known
+/// signed out.
+fn pin_of<'a>(
+    cli: Cli,
+    roster: &'a Roster,
+    state: &accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+    now: i64,
+) -> Result<Option<&'a Row>, Refusal> {
     if !state.pinned {
         return Ok(None);
     }
@@ -4101,19 +4219,26 @@ fn launch_pin<'a>(
         .active
         .as_deref()
         .and_then(|label| roster.row(label))
-        .ok_or_else(|| format!("{} account pin names no roster row", cli.id()))?;
-    state
-        .execution_verdict(&pinned.label)
-        .map_err(|why| format!("{} account {}: {}", cli.id(), pinned.label, why.as_str()))?;
+        .ok_or_else(|| {
+            Refusal::new(
+                RefusalKind::Pin,
+                format!("{} account pin names no roster row", cli.id()),
+            )
+        })?;
+    state.execution_verdict(&pinned.label).map_err(|why| {
+        Refusal::new(
+            RefusalKind::Lease,
+            format!("{} account {}: {}", cli.id(), pinned.label, why.as_str()),
+        )
+    })?;
     let cond = accounts::condition(pinned, state, enrolled.contains(&pinned.label), now);
     if matches!(
         cond,
         accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
     ) {
-        return Err(format!(
-            "{} account {} is not signed in",
-            cli.id(),
-            pinned.label
+        return Err(Refusal::new(
+            RefusalKind::SignedOut,
+            format!("{} account {} is not signed in", cli.id(), pinned.label),
         ));
     }
     Ok(Some(pinned))
@@ -4121,7 +4246,10 @@ fn launch_pin<'a>(
 
 /// Observe current admission after preparing an environment, completing any earlier admitted
 /// commit first. This records no new account decision and does not freeze credential contents,
-/// raw roster writers or the caller's later process spawn.
+/// raw roster writers or the caller's later process spawn. The rows whose preparation failed
+/// (`excluded`) stay out, and a row the launch-time token guard refused (`token_judged`: each
+/// row's token judgment, made before the writer's lock; `false` refused) reads as that guard
+/// left it, so the selection made again here is the pick's.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -4135,7 +4263,10 @@ fn finish_launch(
     cli: Cli,
     before: &PoolSnapshot,
     row: &Row,
-    excluded: &std::collections::BTreeSet<String>,
+    (excluded, token_judged): (
+        &std::collections::BTreeSet<String>,
+        &std::collections::BTreeMap<String, bool>,
+    ),
     (configured_mode, default_only): (Mode, bool),
     capture: &mut ColdCapture<'_>,
 ) -> Result<(), String> {
@@ -4169,7 +4300,10 @@ fn finish_launch(
         return Err("active account changed to a failed preparation".into());
     }
     check_failed_preparations(before, &current, excluded)?;
-    let candidates = without_failed_preparations(&current.state, excluded);
+    let mut candidates = without_failed_preparations(&current.state, excluded);
+    for (label, _) in token_judged.iter().filter(|(_, serves)| !**serves) {
+        candidates.refuse_token(label);
+    }
     let enrolled = accounts::enrolled_in(cli, &current.roster, seat.home);
     let pinned = checked_launch_pin(seat, cli, &current.roster, &candidates, &enrolled)?;
     if default_only && pinned.is_some_and(|pinned| pinned.dir.is_some()) {

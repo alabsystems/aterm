@@ -20,7 +20,9 @@
 //!
 //! A person's review of a request (step 5) is kept the same way: `review` (who, when, a note),
 //! `kept` (its tabs and folders are a person's) and `reply` (a mail to its requester, its text in
-//! the content tier).
+//! the content tier); and its cleanup: `clean` (who began it), `archived` (the archive written
+//! first), `gone` (what became of each claimed folder), and `cleaned` or `uncleaned`. Nothing here
+//! deletes: [`claim::clean_verdict`] judges which claimed folders a cleanup may delete.
 
 pub mod claim;
 pub mod id;
@@ -28,14 +30,16 @@ pub mod record;
 pub mod store;
 pub mod why;
 
-pub use claim::{Claim, ClaimSrc, Keep, Measured, TouchWhy};
+pub use claim::{Claim, ClaimSrc, HostFacts, Keep, Measured, TouchWhy, clean_verdict};
 pub use record::{
-    Brief, EndWhy, Form, Out, Rec, Said, SaidBody, Spent, TaskEnd, Verb, Via, WhySrc,
+    Brief, Did, EndWhy, Form, Out, Rec, Said, SaidBody, Spent, TaskEnd, Unclean, Verb, Via, WhySrc,
+    archive_name,
 };
 pub use store::{
-    ActRefusal, Answered, Born, ClaimAsk, ClaimRefusal, Claimed, Ended, From, Gone,
-    InspectionStatus, Intake, KeptRequest, LEASE_IDLE_MS, Left, Look, MAX_REPLIES, Ran, Refusal,
-    Reply, Request, Review, Reviewed, SaidOf, Stage, State, Store, Tab, TabNow, Touch,
+    ActRefusal, Answered, Archive, Born, ClaimAsk, ClaimRefusal, Claimed, CleanBegan, CleanEnd,
+    CleanPlan, CleanStart, CleanedAs, Ended, From, Gone, GoneClaim, InspectionStatus, Intake,
+    KeptRequest, LEASE_IDLE_MS, Left, Look, MAX_REPLIES, Ran, Refusal, Reply, Request, Review,
+    Reviewed, SaidOf, Stage, State, Store, Tab, TabNow, Touch, lines_of,
 };
 pub use why::{Why, why_of};
 

@@ -1088,6 +1088,11 @@ fn mailbox_overrides_preserve_local_path_bytes_and_trim_urls() {
     );
 }
 
+/// A mailbox secret is read whole or not at all: the vault entry `ai_mailbox_password` (and a
+/// `password_file` naming `~/.secrets/ai_mailbox_password`, which names that entry) gives its
+/// value only where it is bounded UTF-8 with a non-blank line; a `password_file` outside the
+/// backup is read only where it is a complete regular file, through a link, never a directory or
+/// a FIFO, and an explicit password outranks a file that cannot be read.
 #[cfg(unix)]
 #[test]
 fn mailbox_secret_files_require_complete_regular_contents() {
@@ -1096,21 +1101,16 @@ fn mailbox_secret_files_require_complete_regular_contents() {
     use std::os::unix::fs::{FileTypeExt as _, symlink};
 
     let home = aterm_tempfile::tempdir().expect("private secret home");
-    let secrets = home.path().join(".secrets");
-    std::fs::create_dir(&secrets).unwrap();
-    let secret = secrets.join("ai_mailbox_password");
     let discovered = || {
         discover_mailbox_config_files(Some(home.path()), None, None).and_then(|cfg| cfg.password)
     };
-    let configured = || {
-        MailboxConfig::from_toml_str(
-            "password_file = '~/.secrets/ai_mailbox_password'\n",
-            Some(home.path()),
-        )
-        .and_then(|cfg| cfg.password)
+    let configured = |path: &str| {
+        MailboxConfig::from_toml_str(&format!("password_file = '{path}'\n"), Some(home.path()))
+            .and_then(|cfg| cfg.password)
     };
+    let entry = "~/.secrets/ai_mailbox_password";
 
-    assert!(discovered().is_none() && configured().is_none());
+    assert!(discovered().is_none() && configured(entry).is_none());
     for (bytes, expected_discovery, expected_config) in [
         (
             b"  complete-secret\r\n".to_vec(),
@@ -1132,21 +1132,22 @@ fn mailbox_secret_files_require_complete_regular_contents() {
             Some("first\nsecond".to_owned()),
         ),
     ] {
-        std::fs::write(&secret, &bytes).unwrap();
+        crate::vault_entry::put(home.path(), "ai_mailbox_password", &bytes);
         assert_eq!(discovered(), expected_discovery);
-        assert_eq!(configured(), expected_config);
-        assert_eq!(std::fs::read(&secret).unwrap(), bytes);
+        assert_eq!(configured(entry), expected_config);
     }
-    std::fs::remove_file(&secret).unwrap();
+
+    let secret = home.path().join("mailbox-secret");
+    let local = "~/mailbox-secret";
     std::fs::create_dir(&secret).unwrap();
-    assert!(discovered().is_none() && configured().is_none());
+    assert!(configured(local).is_none());
     assert!(secret.is_dir());
     std::fs::remove_dir(&secret).unwrap();
 
     let fifo_name = std::ffi::CString::new(secret.as_os_str().as_bytes()).unwrap();
     // SAFETY: one NUL-terminated private path; mkfifo retains no pointer.
     assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
-    assert!(discovered().is_none() && configured().is_none());
+    assert!(configured(local).is_none());
     assert!(
         std::fs::symlink_metadata(&secret)
             .unwrap()
@@ -1155,7 +1156,7 @@ fn mailbox_secret_files_require_complete_regular_contents() {
     );
     assert_eq!(
         MailboxConfig::from_toml_str(
-            "password = 'explicit-secret'\npassword_file = '~/.secrets/ai_mailbox_password'\n",
+            &format!("password = 'explicit-secret'\npassword_file = '{local}'\n"),
             Some(home.path()),
         )
         .and_then(|cfg| cfg.password)
@@ -1167,8 +1168,7 @@ fn mailbox_secret_files_require_complete_regular_contents() {
     let target = home.path().join("regular-secret");
     std::fs::write(&target, "aliased-secret\n").unwrap();
     symlink(&target, &secret).unwrap();
-    assert_eq!(discovered().as_deref(), Some("aliased-secret"));
-    assert_eq!(configured().as_deref(), Some("aliased-secret"));
+    assert_eq!(configured(local).as_deref(), Some("aliased-secret"));
     assert_eq!(std::fs::read_link(&secret).unwrap(), target);
     assert_eq!(std::fs::read(&target).unwrap(), b"aliased-secret\n");
 }
@@ -1178,10 +1178,7 @@ fn flat_webmail_password_aliases_keep_the_requested_account() {
     use super::super::headless_oauth::MailboxConfig;
 
     let home = aterm_tempfile::tempdir().expect("private password alias home");
-    let secrets = home.path().join(".secrets");
-    std::fs::create_dir(&secrets).unwrap();
-    let secret = secrets.join("webmail-password");
-    std::fs::write(&secret, "file-secret\r\n").unwrap();
+    crate::vault_entry::put(home.path(), "webmail-password", "file-secret\r\n");
 
     for (suffix, value, expected) in [
         (
@@ -1230,7 +1227,6 @@ fn flat_webmail_password_aliases_keep_the_requested_account() {
             Some(expected)
         );
     }
-    assert_eq!(std::fs::read(&secret).unwrap(), b"file-secret\r\n");
 }
 
 #[test]
@@ -2370,9 +2366,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
 
         let split_home = tmp.path().join("split_home");
         std::fs::create_dir_all(split_home.join(".config/aterm")).expect("config dir");
-        std::fs::create_dir_all(split_home.join(".secrets")).expect("secrets dir");
-        let pw_file = split_home.join(".secrets/m27.pass");
-        std::fs::write(&pw_file, "file-pass-m27\n").expect("write pw file");
+        crate::vault_entry::put(&split_home, "m27.pass", "file-pass-m27\n");
         std::fs::write(
             split_home.join(".config/aterm/mailbox.toml"),
             r#"
@@ -2383,8 +2377,9 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
 "#,
         )
         .expect("write config mailbox.toml");
-        std::fs::write(
-            split_home.join(".secrets/ai-mailbox.toml"),
+        crate::vault_entry::put(
+            &split_home,
+            "ai-mailbox.toml",
             format!(
                 r#"
 [totp_secrets]
@@ -2394,8 +2389,7 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
 "sol-m27@proton.me" = "second-pw-m27"
 "#
             ),
-        )
-        .expect("write secrets ai-mailbox.toml");
+        );
 
         let merged = discover_mailbox_config_files(Some(&split_home), None, None)
             .expect("merged split mailbox config");
@@ -2518,19 +2512,9 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         );
 
         let label_home = tmp.path().join("label_secrets_home");
-        std::fs::create_dir_all(label_home.join(".secrets")).expect("create .secrets");
-        std::fs::write(label_home.join(".secrets/m27_password"), "m27-file-pw\n")
-            .expect("write m27_password");
-        std::fs::write(
-            label_home.join(".secrets/m27-2_password"),
-            "m27-2-file-pw\n",
-        )
-        .expect("write m27-2_password");
-        std::fs::write(
-            label_home.join(".secrets/m27_totp"),
-            format!("{otpauth_uri}\n"),
-        )
-        .expect("write m27_totp");
+        crate::vault_entry::put(&label_home, "m27_password", "m27-file-pw\n");
+        crate::vault_entry::put(&label_home, "m27-2_password", "m27-2-file-pw\n");
+        crate::vault_entry::put(&label_home, "m27_totp", format!("{otpauth_uri}\n"));
         let label_cfg = discover_mailbox_config_files(Some(&label_home), None, None)
             .expect("discover from single-line secret files");
         assert_eq!(
@@ -2735,14 +2719,8 @@ imap_url = "imap://bridge:secret@127.0.0.1:1143/INBOX" # gitleaks:allow
         );
 
         let us_home = tmp.path().join("underscore_secrets_home");
-        std::fs::create_dir_all(us_home.join(".secrets")).expect("create .secrets");
-        std::fs::write(us_home.join(".secrets/m27_2_pass"), "us-m27-2-pw\n")
-            .expect("write m27_2_pass");
-        std::fs::write(
-            us_home.join(".secrets/m27_2_otpauth"),
-            format!("{otpauth_uri}\n"),
-        )
-        .expect("write m27_2_otpauth");
+        crate::vault_entry::put(&us_home, "m27_2_pass", "us-m27-2-pw\n");
+        crate::vault_entry::put(&us_home, "m27_2_otpauth", format!("{otpauth_uri}\n"));
         let mut us_cfg = discover_mailbox_config_files(Some(&us_home), None, None)
             .expect("discover underscore secret files");
         assert_eq!(
@@ -2819,12 +2797,7 @@ m27_2_pass = "flat-m27-2-pw"
         );
 
         let bare_home = tmp.path().join("bare_label_secrets_home");
-        std::fs::create_dir_all(bare_home.join(".secrets")).expect("create .secrets");
-        std::fs::write(
-            bare_home.join(".secrets/m27"),
-            format!("bare-m27-pw\n{otpauth_uri}\n"),
-        )
-        .expect("write bare m27 secret file");
+        crate::vault_entry::put(&bare_home, "m27", format!("bare-m27-pw\n{otpauth_uri}\n"));
         let bare_cfg = discover_mailbox_config_files(Some(&bare_home), None, None)
             .expect("discover bare label secret file");
         assert_eq!(
@@ -3151,31 +3124,28 @@ m27_2_pass = "flat-m27-2-pw"
         assert!(wm_js.contains("input[name='otc']"));
 
         let home_dir = tmp.path().join("home-fleet");
-        let secrets_dir = home_dir.join(".secrets");
-        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
-        std::fs::write(secrets_dir.join("m27_pw_file"), "file-pw-m27\n").expect("write pw file");
-        std::fs::write(secrets_dir.join("m27_mpw_file"), "file-mpw-m27\n").expect("write mpw file");
-        std::fs::write(secrets_dir.join("m27_totp_file"), "JBSWY3DPEHPK3PXP\n")
-            .expect("write totp file");
-        std::fs::write(
-            secrets_dir.join("ai-mailbox.toml"),
+        crate::vault_entry::put(&home_dir, "m27_pw_file", "file-pw-m27\n");
+        crate::vault_entry::put(&home_dir, "m27_mpw_file", "file-mpw-m27\n");
+        crate::vault_entry::put(&home_dir, "m27_totp_file", "JBSWY3DPEHPK3PXP\n");
+        crate::vault_entry::put(
+            &home_dir,
+            "ai-mailbox.toml",
             "m27_password_file = \"~/.secrets/m27_pw_file\"\n\
              m27_mailbox_password_file = \"~/.secrets/m27_mpw_file\"\n\
              m27_totp_secret_file = \"~/.secrets/m27_totp_file\"\n\n\
              [work]\n\
              email = \"custom-team@fastmail.com\"\n\
              password = \"work-secret\"\n",
-        )
-        .expect("write ai-mailbox.toml");
-        std::fs::write(
-            secrets_dir.join("fleet-accounts.toml"),
+        );
+        crate::vault_entry::put(
+            &home_dir,
+            "fleet-accounts.toml",
             "[[account]]\n\
              label = \"m27\"\n\
              machines = [\"m27\"]\n\
              class = \"dedicated\"\n\
              email = \"opaque-alias@proton.me\"\n",
-        )
-        .expect("write fleet-accounts.toml");
+        );
         let discovered_fleet = super::super::headless_oauth::discover_mailbox_config_files(
             Some(&home_dir),
             None,
@@ -3435,14 +3405,12 @@ fn mailpit_detail_loop_stops_after_200_and_secret_file_extensions_strip_cleanly(
         .prefix("aterm-secret-stems-")
         .tempdir()
         .expect("tempdir");
-    let secrets = tmp.path().join(".secrets");
-    std::fs::create_dir_all(&secrets).unwrap();
-    std::fs::write(
-        secrets.join("m27-2.toml"),
+    crate::vault_entry::put(
+        tmp.path(),
+        "m27-2.toml",
         "password = \"pw-m27-2-toml\"\nmailbox_password = \"mpw-m27-2\"\n",
-    )
-    .unwrap();
-    std::fs::write(secrets.join("sun.m27.3.txt"), "pw-m27-3-txt\n").unwrap();
+    );
+    crate::vault_entry::put(tmp.path(), "sun.m27.3.txt", "pw-m27-3-txt\n");
 
     let cfg = discover_mailbox_config_files(Some(tmp.path()), None, None)
         .expect("discover mailbox config from .toml/.txt secret files");
@@ -5554,6 +5522,7 @@ fn oauth_control_eof_records_a_hostless_outcome_before_the_first_page() {
         super::super::cli::Renewal::Failed,
         None,
         Some(&retained),
+        None,
     );
     assert!(history.ends_with(&met.words()));
 }
@@ -5881,8 +5850,10 @@ fn the_outcome_file_holds_one_closed_word_and_a_host() {
 /// WHAT STOPS A ROW UNTIL SOMETHING CHANGES is what another try by itself does not pass:
 /// Cloudflare's pages, the consent page's human check, another account's consent page, a
 /// session with no desktop and a window a person closed. A sign-in in the window that failed
-/// for any other reason (a page that did not load, a mailbox that did not answer, a deadline)
-/// ended at the window and stops nothing: its row is tried again on the ordinary backoff.
+/// for any other reason (a page that did not load, a mailbox that did not answer, a code page
+/// nobody typed a code on, a deadline) ended at the window and stops nothing: its row is tried
+/// again on the ordinary backoff. A TOKEN STEP is held by every stop, by a code page nobody
+/// typed on and by the deadline, and by nothing else.
 #[test]
 fn only_what_another_try_does_not_pass_stops_a_sign_in() {
     assert!(Met::new(MetWord::BotCheck, Some("claude.ai")).stopped());
@@ -5905,9 +5876,51 @@ fn only_what_another_try_does_not_pass_stops_a_sign_in() {
     assert!(!failed.stopped());
     assert!(failed.ended_at_the_sign_in_window());
     assert!(!failed.takes_a_person());
+    for word in [MetWord::WindowCodeNoMailbox, MetWord::WindowDeadline] {
+        let met = Met::new(word, None).because("where it stood");
+        assert!(
+            !met.stopped() && met.ended_at_the_sign_in_window() && !met.takes_a_person(),
+            "{word:?}: a sign-in takes it as it takes browser-sign-in"
+        );
+        assert_eq!(met.why.as_deref(), Some("where it stood"), "{word:?}");
+    }
     assert!(!Met::new(MetWord::Stall, Some("claude.ai")).stopped());
     assert!(!Met::new(MetWord::BrowserStart, None).stopped());
     assert!(!Met::new(MetWord::BrowserControl, None).stopped());
+    // A token's consent page on the account's headless profile (FL-137): its human check, a
+    // page that did not show the account and one that named another stop it, on the page's
+    // host, and never at the window.
+    for word in [
+        MetWord::HumanCheck,
+        MetWord::ConsentUnproven,
+        MetWord::ConsentWrongAccount,
+    ] {
+        let met = Met::new(word, Some("claude.com"));
+        assert!(
+            met.stopped() && !met.ended_at_the_sign_in_window(),
+            "{word:?}"
+        );
+        assert_eq!(met.host.as_deref(), Some("claude.com"), "{word:?}");
+        assert_eq!(Met::parse(&met.line()), Some(met.clone()), "{word:?}");
+        assert!(
+            !met.words().contains("aterm's sign-in window"),
+            "{}",
+            met.words()
+        );
+    }
+    assert!(Met::new(MetWord::HumanCheck, None).takes_a_person());
+    assert!(!Met::new(MetWord::ConsentUnproven, None).takes_a_person());
+    assert!(!Met::new(MetWord::ConsentWrongAccount, None).takes_a_person());
+    for word in MetWord::ALL {
+        let met = Met::new(word, None);
+        assert_eq!(
+            word.holds_a_token_step(),
+            met.stopped() || matches!(word, MetWord::WindowCodeNoMailbox | MetWord::WindowDeadline),
+            "{word:?}"
+        );
+        assert_eq!(MetWord::parse(word.as_str()), Some(word), "{word:?}");
+    }
+    assert_eq!(MetWord::parse("window-human-check claude.ai"), None);
 }
 
 #[test]
@@ -5916,6 +5929,8 @@ fn local_browser_outcomes_are_hostless_even_with_public_fields() {
         (MetWord::BrowserStart, "browser-start"),
         (MetWord::BrowserControl, "browser-control"),
         (MetWord::BrowserSignIn, "browser-sign-in"),
+        (MetWord::WindowCodeNoMailbox, "window-code-no-mailbox"),
+        (MetWord::WindowDeadline, "window-deadline"),
     ] {
         let expected = Met::new(word, None);
         assert_eq!(Met::parse(&format!("{token}\n")), Some(expected.clone()));
@@ -6150,6 +6165,43 @@ fn a_sign_in_stopped_in_the_sign_in_window_names_what_stopped_it() {
     assert_eq!(met.word, MetWord::BrowserSignIn);
     assert!(!met.stopped() && met.ended_at_the_sign_in_window());
     assert!(met.words().contains("did not load"), "{}", met.words());
+    // A code page nobody typed on where the window read no mailbox, and the window's deadline,
+    // are their own words, each a terminal record that stops no sign-in, with where it stood; a
+    // mailbox the window dropped is an ordinary failure, which says why it went.
+    for (stop, word, says) in [
+        (
+            VisibleStop::CodeNoMailbox(
+                "the window reads no mailbox of the account on this Mac".into(),
+            ),
+            MetWord::WindowCodeNoMailbox,
+            "waited for a login code nobody typed: the window reads no mailbox",
+        ),
+        (
+            VisibleStop::Failed(
+                "nobody typed the login code, and the account's mailbox could not be used (the \
+                 mailbox refused its sign-in)"
+                    .into(),
+            ),
+            MetWord::BrowserSignIn,
+            "the mailbox refused its sign-in",
+        ),
+        (
+            VisibleStop::Deadline("its page had not loaded".into()),
+            MetWord::WindowDeadline,
+            "not completed in time: its page had not loaded",
+        ),
+    ] {
+        assert_eq!(finish_window_sign_in(Err(stop), Some(&path)), 1);
+        let Some(TerminalFailure(Some(met))) = read_terminal_outcome(&path) else {
+            panic!("{word:?}: a terminal record");
+        };
+        assert_eq!(met.word, word);
+        assert!(
+            !met.stopped() && met.ended_at_the_sign_in_window(),
+            "{word:?}"
+        );
+        assert!(met.words().contains(says), "{}", met.words());
+    }
     assert!(WINDOW_NO_DESKTOP.contains("no desktop"));
     assert!(WINDOW_BOT_CHECK.contains("Cloudflare") && WINDOW_BOT_CHECK.contains("never operates"));
     assert!(WINDOW_BLOCK_PAGE.contains("Cloudflare"));
@@ -6297,7 +6349,8 @@ fn a_reason_keeps_no_url_path_address_code_or_token() {
 /// A REASON GOES ONLY WITH A WORD THAT LEAVES IT UNSAID, AND THE FIRST ONE STAYS: Cloudflare's
 /// pages, a missing desktop and a stall are each their whole reason, so they
 /// take none; a browser that could not start or be reached, a window sign-in that returned no
-/// callback and an opener that authorized nothing say why after their words.
+/// callback, a code page nobody typed a code on, the window's deadline and an opener that
+/// authorized nothing say why after their words.
 #[test]
 fn a_reason_goes_with_the_words_that_leave_it_unsaid() {
     let mut took = Vec::new();
@@ -6333,6 +6386,8 @@ fn a_reason_goes_with_the_words_that_leave_it_unsaid() {
             MetWord::BrowserStart,
             MetWord::BrowserControl,
             MetWord::BrowserSignIn,
+            MetWord::WindowCodeNoMailbox,
+            MetWord::WindowDeadline,
             MetWord::NotAuthorized
         ]
     );

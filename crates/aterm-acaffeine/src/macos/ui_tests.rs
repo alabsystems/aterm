@@ -13,6 +13,7 @@ use crate::model::{Choice, Clocks, Mode};
 /// pause.
 fn plain(startup: Startup) -> menu::Shown<'static> {
     menu::Shown {
+        aterm: true,
         startup,
         lid_awake: false,
         paused: None,

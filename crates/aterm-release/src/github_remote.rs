@@ -25,6 +25,10 @@ const STALL_WINDOW: Duration = Duration::from_secs(60);
 // therefore be incomplete and cannot establish that a ref was absent.
 const COMPLETE_LIMIT: usize = 64 * 1024 - 4;
 const ORIGIN_MAIN: &str = "refs/remotes/origin/main";
+/// How many times one refresh reads origin before it refuses ([`Remote::refreshed`]): each
+/// further read is owed to another refresh of this checkout that recorded its own reading
+/// first, and four in a row are no interleaving of the few refreshers a checkout has.
+const REFRESH_READS: usize = 5;
 const NULL_OID: &str = "0000000000000000000000000000000000000000";
 
 pub(crate) struct FetchedOrigin {
@@ -42,6 +46,7 @@ pub(crate) use write::claim_fixture;
 pub(crate) use write::claim_fixture_with_fx;
 #[cfg(test)]
 pub(crate) use write::engine_fixture;
+pub(crate) use write::intent_wait;
 
 pub(crate) struct Remote {
     client: Github,
@@ -49,6 +54,9 @@ pub(crate) struct Remote {
     repo: PathBuf,
     named: Named,
     catalog: Mutex<Option<TagCatalog>>,
+    /// Where a write says the one line of a wait or of a write it settled by reading origin
+    /// (`write::Remote::journaled`): standard error, which a step's log keeps.
+    notice: Box<dyn Fn(&str) + Send + Sync>,
 }
 
 struct TagCatalog {
@@ -59,9 +67,22 @@ struct TagCatalog {
 /// Read recorded vault adoption and explicit agh configuration. No credential
 /// pointer, owner row or publication grant is synthesized by the cutter.
 fn bind_configured(dirs: &agh::config::Dirs, base: &Github) -> Result<Github, String> {
-    agh::routing::view(dirs, base.env())
+    agh::routing::view(dirs)
         .and_then(|routing| routing.bind(base))
         .map_err(|error| base.redactor().apply(&error.why))
+}
+
+/// agh's refusal in this tool's words: its reason, redacted, and for a rate-limited one with a
+/// reset the part of agh's own final line that names it ([`crate::allowance::line`]), so the
+/// run reads its own client's refusal as it reads a child's and waits for the same reset.
+pub(crate) fn words(client: &Github, error: &agh::Error) -> String {
+    let why = client.redactor().apply(&error.why);
+    match (error.kind, error.reset) {
+        (agh::error::Kind::RateLimited, Some(reset)) => {
+            format!("{why} ({})", crate::allowance::line(reset))
+        }
+        _ => why,
+    }
 }
 
 fn configured(dirs: &agh::config::Dirs) -> Result<Github, String> {
@@ -96,7 +117,7 @@ fn repository_file_with(
     client
         .contents(&slug)
         .raw(Some(reference), path, 16 << 20)
-        .map_err(|error| client.redactor().apply(&error.why))
+        .map_err(|error| words(client, &error))
 }
 
 fn lane_record_with(
@@ -114,7 +135,7 @@ fn lane_record_with(
     {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind == agh::error::Kind::NotFound => Ok(None),
-        Err(error) => Err(client.redactor().apply(&error.why)),
+        Err(error) => Err(words(client, &error)),
     }
 }
 
@@ -223,6 +244,7 @@ impl Remote {
             repo: repo.to_path_buf(),
             named,
             catalog: Mutex::new(None),
+            notice: Box::new(|line| eprintln!("{line}")),
         };
         // A listing does not otherwise inspect its caller's checkout. Admit its
         // actual source/config first, just as exact fetch does before importing.
@@ -248,7 +270,7 @@ impl Remote {
         };
         self.client
             .run_git(&run)
-            .map_err(|error| self.client.redactor().apply(&error.why))
+            .map_err(|error| words(&self.client, &error))
     }
 
     fn ensure_origin(&self) -> Result<(), String> {
@@ -283,7 +305,7 @@ impl Remote {
         let objects = objects.into_iter().collect::<BTreeSet<_>>();
         if !objects.is_empty() {
             let batch = FetchBatch::objects(objects.into_iter().collect())
-                .map_err(|error| self.client.redactor().apply(&error.why))?;
+                .map_err(|error| words(&self.client, &error))?;
             self.run(GitRun::fetch_batch(&self.slug, &self.repo, batch, false))?;
         }
         self.ensure_origin()
@@ -391,7 +413,38 @@ impl Remote {
     /// A retried claim must retain every observed forward main, including the
     /// last unsent inventory, before checking supersession on the new snapshot.
     pub(crate) fn refresh_main_after(&self, floor: Option<&str>) -> Result<String, String> {
-        let before = self.tracking_main()?;
+        self.refreshed(|| {
+            let main = self.read_main_after(floor)?;
+            Ok((main.clone(), main))
+        })
+    }
+
+    /// Read origin with `read` (its main, and what the caller wants of the reading) and
+    /// record that main in the tracking ref by compare-and-swap on the value the ref had
+    /// before the read. A checkout has several refreshers: the cut's main thread, its lease
+    /// worker ([`crate::line_claim`]), the pre-freeze observer it starts, another command in
+    /// the same clone. One that recorded its own reading meanwhile does not end this one:
+    /// where the ref now names the main this reading found, the refresh is done; otherwise
+    /// origin is read again from the ref as it now is, at most [`REFRESH_READS`] times.
+    ///
+    /// # Errors
+    /// `read`'s and the tracking ref's own; and, when another refresh moved the ref during
+    /// every read, a refusal that says how many times origin was read.
+    fn refreshed<T>(&self, read: impl Fn() -> Result<(String, T), String>) -> Result<T, String> {
+        for _ in 0..REFRESH_READS {
+            let before = self.tracking_main()?;
+            let (main, value) = read()?;
+            if self.record_main(before.as_deref(), &main)? {
+                return Ok(value);
+            }
+        }
+        Err(format!(
+            "origin/main changed while its native refresh was running: another refresh of this \
+             checkout moved it during each of {REFRESH_READS} reads of origin"
+        ))
+    }
+
+    fn read_main_after(&self, floor: Option<&str>) -> Result<String, String> {
         let main = self
             .get("refs/heads/main")?
             .ok_or("the authenticated origin has no main branch")?;
@@ -408,7 +461,7 @@ impl Remote {
                     descendant: main.clone(),
                 }],
             })
-            .map_err(|error| self.client.redactor().apply(&error.why))?;
+            .map_err(|error| words(&self.client, &error))?;
             let out = self.run(GitRun::commit_read(&self.slug, &self.repo, request, false))?;
             let value: aterm_json::Value = aterm_json::from_str(&out.stdout)
                 .map_err(|error| format!("claim main ancestry: {error}"))?;
@@ -416,7 +469,6 @@ impl Remote {
                 return Err("could_not_run: remote main did not advance fast-forward between claim attempts".into());
             }
         }
-        self.record_main(before.as_deref(), &main)?;
         Ok(main)
     }
 
@@ -498,10 +550,10 @@ impl Remote {
     /// Read main and every tag through the configured native identity, import
     /// that exact commit, then record only the owned remote-tracking ref.
     pub(crate) fn fetch_origin(&self) -> Result<FetchedOrigin, String> {
-        let before = self.tracking_main()?;
-        let observed = self.observe_origin()?;
-        self.record_main(before.as_deref(), &observed.main)?;
-        Ok(observed)
+        self.refreshed(|| {
+            let observed = self.observe_origin()?;
+            Ok((observed.main.clone(), observed))
+        })
     }
 
     /// Import the observed main and tags without changing any local reference.
@@ -742,7 +794,10 @@ impl Remote {
         }
     }
 
-    fn record_main(&self, before: Option<&str>, main: &str) -> Result<(), String> {
+    /// Record `main` in the tracking ref where the ref is still `before`. Whether the ref
+    /// now names `main`: `false` where another refresh moved it elsewhere meanwhile, which
+    /// changed nothing here ([`Self::refreshed`] reads again).
+    fn record_main(&self, before: Option<&str>, main: &str) -> Result<bool, String> {
         if !agh::path::is_sha(main) || before.is_some_and(|oid| !agh::path::is_sha(oid)) {
             return Err("tracking-ref update needs raw object IDs".into());
         }
@@ -750,8 +805,9 @@ impl Remote {
         if origin_slug(&self.repo)?.key() != self.slug.key() {
             return Err("source origin changed while its native refresh was running".into());
         }
-        if self.tracking_main()?.as_deref() != before {
-            return Err("origin/main changed while its native refresh was running".into());
+        let now = self.tracking_main()?;
+        if now.as_deref() != before {
+            return Ok(now.as_deref() == Some(main));
         }
         let out = self.local(&[
             "update-ref",
@@ -761,9 +817,15 @@ impl Remote {
             before.unwrap_or(NULL_OID),
         ])?;
         if !out.status.success() {
-            return Err(self.local_error("record fetched origin/main", &out));
+            // Git's own compare-and-swap lost to a refresh that wrote between the read above
+            // and this write.
+            let now = self.tracking_main()?;
+            if now.as_deref() == before {
+                return Err(self.local_error("record fetched origin/main", &out));
+            }
+            return Ok(now.as_deref() == Some(main));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// List only refs beneath this full namespace, as one admitted snapshot.

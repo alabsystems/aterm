@@ -4,11 +4,11 @@
 //! Supervisor exception policy tests.
 
 use super::*;
-use crate::supervise::phase::Phase;
 use crate::supervise::policy::notice;
 use crate::supervise::policy::turn_end::{
     Composer, RULE_LOGIN, TurnEndAction, TurnEndReading, decide_turn_end,
 };
+use alab_policy::vocab::Phase;
 use aterm_phase::prompt::fixtures::{
     COMPACT_ERROR_500_MEASURED, COMPACT_FAILED_1_MEASURED, COMPACT_FAILED_2_MEASURED,
     COMPACT_FAILED_3_MEASURED, CONTEXT_WALL_MEASURED, END_529, screen,
@@ -79,7 +79,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         seat: Default::default(),
         account: None,
         route: None,
-        autopilot: crate::supervise::Autopilot::Cruise,
+        autopilot: alab_policy::config::Autopilot::Cruise,
         login_label: None,
         autopilot_by_person: false,
         login_superseded: false,
@@ -93,7 +93,8 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
         leftover: crate::harness::leftover::LeftRead::NotAsked,
-        credentials: crate::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: crate::harness::goal::GoalRead::Unread,
         login_screen: None,
         login_interrupted: false,
         login_at_wall: None,
@@ -576,22 +577,98 @@ fn a_codex_sessions_walls_get_words_that_name_no_vendor() {
     }
 }
 
+/// T5: A GOAL CLAUDE CODE CLEARED AFTER AN ERROR IS NO EXCEPTION WHERE THE HARNESS PUTS IT BACK:
+/// under Cruise and Land, for Claude Code, at a point that reads that clear lost, its condition
+/// typed back as it was ([`crate::harness::goal::typable`]) and no restore of it booked
+/// unconfirmed ([`super::super::goal_restore::GoalRestores::restoring`]); the wall is decided as
+/// any other (a lost login is still aterm's `/login` first). Negative controls: the same wall where
+/// the transcript was not read, where the condition cannot be typed back, or where the restore was
+/// typed and a later point still read the clear names the cause and the `/goal` to run; so does
+/// another program's, and the policy's answer under Off (where the live loop computes no
+/// exception at all).
 #[test]
-fn a_cleared_goal_names_its_cause() {
+fn a_cleared_goal_is_an_exception_only_where_the_harness_does_not_restore_it() {
+    use crate::harness::goal::{GoalRead, Lost, Untypable};
+    use crate::supervise::policy::goal_restore;
     let t = t0();
     let st = TurnEndState::default();
-    let r = walled(
-        WallKind::ApiError {
-            code: Some(500),
-            retryable: true,
-            cause: aterm_phase::ApiCause::Server,
-        },
-        "API Error: 500 — Goal cleared after an unrecoverable error (server error): \"x\". Run /goal again to continue.",
+    let lost = |line: Result<String, Untypable>| {
+        GoalRead::Lost(Lost {
+            condition: "x".to_string(),
+            line,
+            label: "server error".to_string(),
+            clear: "c1".to_string(),
+            served: false,
+        })
+    };
+    let server = |autopilot, goal: GoalRead| TurnEndReading {
+        autopilot,
+        goal,
+        ..walled(
+            WallKind::ApiError {
+                code: Some(500),
+                retryable: true,
+                cause: alab_policy::vocab::ApiCause::Server,
+            },
+            "API Error: 500 — Goal cleared after an unrecoverable error (server error): \"x\". Run /goal again to continue.",
+        )
+    };
+    let goal_cleared = |st: &TurnEndState, r: &TurnEndReading| {
+        exception_for(st, r, &cfg(), t).is_some_and(|e| e.kind == ExceptionKind::GoalCleared)
+    };
+    for autopilot in [Autopilot::Cruise, Autopilot::Land] {
+        let r = server(autopilot, lost(Ok("x".to_string())));
+        assert!(
+            !goal_cleared(&st, &r),
+            "{autopilot:?}: the harness puts the goal back"
+        );
+        for (case, goal) in [
+            ("unread", GoalRead::Unread),
+            ("untypable", lost(Err(Untypable::Breaks))),
+        ] {
+            assert!(
+                goal_cleared(&st, &server(autopilot, goal)),
+                "{autopilot:?}, {case}: no restore, so the exception"
+            );
+        }
+    }
+    // The restore typed at an idle point past the error, and a later point still reading the
+    // same clear.
+    let mut unconfirmed = TurnEndState::default();
+    let r = server(Autopilot::Cruise, lost(Ok("x".to_string())));
+    let idle = TurnEndReading {
+        wall: None,
+        wall_message: String::new(),
+        ..r.clone()
+    };
+    unconfirmed.observe(&idle, t);
+    unconfirmed.acted(&goal_restore::restore("x"), &idle, t);
+    let later = TurnEndReading {
+        said_tail: Some("The parser compiles.".to_string()),
+        ..idle.clone()
+    };
+    unconfirmed.observe(&later, t + 3 * MIN);
+    assert!(
+        matches!(
+            unconfirmed.goal_restored(&later.goal),
+            Some(goal_restore::Outcome::Unconfirmed(_))
+        ),
+        "PRECONDITION: the restore went unconfirmed"
     );
-    let e = exception_for(&st, &r, &cfg(), t).expect("an exception");
+    assert!(
+        goal_cleared(&unconfirmed, &r),
+        "an unconfirmed restore is not typed again, so the exception"
+    );
+    let e = exception_for(&st, &server(Autopilot::Off, GoalRead::Unread), &cfg(), t)
+        .expect("an exception");
     assert_eq!(e.kind, ExceptionKind::GoalCleared);
     assert!(e.why.contains("server error"), "{e:?}");
     assert!(e.action.contains("/goal"), "{e:?}");
+    let codex = TurnEndReading {
+        program: aterm_phase::Program::Codex,
+        ..server(Autopilot::Cruise, lost(Ok("x".to_string())))
+    };
+    assert!(goal_cleared(&st, &codex), "no restore for it");
     let login = walled(
         WallKind::Auth,
         "Login expired · Please run /login — Goal cleared after an unrecoverable error (authentication failed): \"x\". Run /goal again to continue.",
@@ -1062,7 +1139,7 @@ fn a_sign_in_over_a_managed_workers_weekly_wall_ends_the_chain_as_on_any_tab() {
         "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
     );
     weekly.reset_at = Some(t + 30 * 60 * MIN);
-    weekly.autopilot = crate::supervise::Autopilot::Land;
+    weekly.autopilot = alab_policy::config::Autopilot::Land;
     let tab = |managed: bool| {
         let mut st = TurnEndState::default();
         st.set_managed(managed);
@@ -1118,7 +1195,7 @@ fn an_api_errors_wall_held_after_its_notice_left_is_told_stalled_not_a_limit() {
     let kind = WallKind::ApiError {
         code: None,
         retryable: true,
-        cause: aterm_phase::ApiCause::CutOff,
+        cause: alab_policy::vocab::ApiCause::CutOff,
     };
     let mut r = walled(
         kind,
@@ -1177,7 +1254,7 @@ fn an_outage_walls_same_answers_raise_nothing_however_long_it_stands() {
     let kind = WallKind::ApiError {
         code: Some(500),
         retryable: true,
-        cause: aterm_phase::ApiCause::Server,
+        cause: alab_policy::vocab::ApiCause::Server,
     };
     let mut r = walled(kind, "API Error: 500 Internal server error");
     let mut st = TurnEndState::default();

@@ -45,10 +45,13 @@ fn transition_with(state: &State, action: &str, mutant: u8) -> State {
         0 => copy.clone(),
         1 => {
             // An externally owned source must not inherit local discovery policy.
-            fs::write(&copy, fleet.to_toml_for(Some(OptIn::Discovered))).unwrap();
+            let text = fleet.to_toml_for(Some(OptIn::Discovered));
+            delivered(&desk.home, &copy, FLEET_ROSTER_FILE, &text);
             copy.clone()
         }
         2 => {
+            // The copy an older aterm left beside its projection: the owner's backup now, which
+            // nothing reads.
             let text = fleet.to_toml_for(Some(OptIn::Discovered));
             fs::write(&copy, &text).unwrap();
             fs::write(desk.fleet_file(), &text).unwrap();
@@ -67,11 +70,12 @@ fn transition_with(state: &State, action: &str, mutant: u8) -> State {
         }
         3 => {
             let sheet = secrets.join(ACCOUNTS_CSV_FILE);
-            fs::write(
+            delivered(
+                &desk.home,
                 &sheet,
+                ACCOUNTS_CSV_FILE,
                 "email,computer,claude\none@example.test,m27,1\ntwo@example.test,m27,1\n",
-            )
-            .unwrap();
+            );
             sheet
         }
         4 => {
@@ -135,7 +139,7 @@ fn transition_with(state: &State, action: &str, mutant: u8) -> State {
             );
         }
         if state["kind"] == 2 {
-            assert!(store.source_policy().unwrap().retired());
+            // The copy is no source, so nothing retires it and no sync is due.
             assert!(!needs_init_accounts_sync(
                 &desk.home,
                 &desk.state,
@@ -186,7 +190,7 @@ fn external_source_formatting_does_not_schedule_another_import() {
     fs::create_dir(&secrets).unwrap();
     let path = secrets.join(FLEET_ROSTER_FILE);
     let text = "# External comments remain intact.\n[[account]]\nlabel='m27'\nemail='one@example.test'\nmachines=['m27']\n";
-    fs::write(&path, text).unwrap();
+    delivered(&desk.home, &path, FLEET_ROSTER_FILE, text);
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).unwrap();
     assert!(!needs_init_accounts_sync(
         &desk.home,
@@ -195,13 +199,18 @@ fn external_source_formatting_does_not_schedule_another_import() {
         NOW
     ));
     assert_eq!(fs::read_to_string(&path).unwrap(), text);
-    fs::write(&path, format!("opt_in='discovered'\n{text}")).unwrap();
+    delivered(
+        &desk.home,
+        &path,
+        FLEET_ROSTER_FILE,
+        &format!("opt_in='discovered'\n{text}"),
+    );
     assert!(
         needs_init_accounts_sync(&desk.home, &desk.state, &desk.roster(), NOW),
         "a policy-only change is a new source decision"
     );
     let changed = text.replace("one@example.test", "replacement@example.test");
-    fs::write(&path, &changed).unwrap();
+    delivered(&desk.home, &path, FLEET_ROSTER_FILE, &changed);
     assert!(needs_init_accounts_sync(
         &desk.home,
         &desk.state,
@@ -227,7 +236,12 @@ fn an_unassigned_sheet_keeps_local_discovery_without_a_legacy_copy() {
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).unwrap();
     assert!(!copy.exists());
     let before = fs::read(desk.roster()).unwrap();
-    fs::write(&sheet, "email,computer,claude\nother@example.test,m28,1\n").unwrap();
+    delivered(
+        &desk.home,
+        &sheet,
+        ACCOUNTS_CSV_FILE,
+        "email,computer,claude\nother@example.test,m28,1\n",
+    );
     assert!(!needs_init_accounts_sync(
         &desk.home,
         &desk.state,
@@ -246,7 +260,12 @@ fn an_unassigned_sheet_keeps_local_discovery_without_a_legacy_copy() {
     assert_eq!(report.rows, 2);
     assert_eq!(fs::read(desk.roster()).unwrap(), before);
     assert!(!copy.exists());
-    fs::write(&sheet, "email,computer,claude\none@example.test,m27,1\n").unwrap();
+    delivered(
+        &desk.home,
+        &sheet,
+        ACCOUNTS_CSV_FILE,
+        "email,computer,claude\none@example.test,m27,1\n",
+    );
     assert!(needs_init_accounts_sync(
         &desk.home,
         &desk.state,
@@ -256,4 +275,11 @@ fn an_unassigned_sheet_keeps_local_discovery_without_a_legacy_copy() {
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).unwrap();
     assert!(desk.store().source_policy().unwrap().retired());
     assert!(!copy.exists());
+}
+
+/// `text` as the vault entry `name`, read in place, beside the file at `path` an older build
+/// wrote it to: the owner's backup, which a sync reads for nothing and must leave as it is.
+fn delivered(home: &Path, path: &Path, name: &str, text: &str) {
+    fs::write(path, text).unwrap();
+    crate::vault_entry::seed(home, &[(name, text.as_bytes())]);
 }

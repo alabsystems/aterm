@@ -256,7 +256,7 @@ fn a_dropped_mac_says_how_it_comes_back_where_a_revoked_one_reads_not_in() {
     assert!(!line.contains("aterm members join"), "{line}");
 }
 
-/// IN A FLEET (`docs/DESIGN-machine-names-2026-11-04.md` §11.85): a vault that took this
+/// IN A FLEET (`docs/DESIGN-machine-names-2026-11-04.md` §5.2): a vault that took this
 /// Mac out outranks the fleet key it still holds, which is a secret it was let go from, not
 /// a membership.
 ///

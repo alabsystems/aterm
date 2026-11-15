@@ -98,6 +98,66 @@ pub(super) fn exited(pid: u32) -> io::Result<bool> {
     observe_exit(pid, false)
 }
 
+/// The actual terminal status of this owned child, without consuming its exit or identity.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+pub(super) fn exit_status_unreaped(pid: u32) -> io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt as _;
+    if !observe_exit(pid, false)? {
+        return Ok(None);
+    }
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: the caller still owns this unreaped child. WNOWAIT preserves that
+        // reservation, and the initialized record is writable for this call alone.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if result == 0 {
+            // SAFETY: waitid initialized this zeroed record on success.
+            let info = unsafe { info.assume_init() };
+            if info.si_signo != libc::SIGCHLD
+                // SAFETY: SIGCHLD selects the initialized pid arm.
+                || u32::try_from(unsafe { info.si_pid() }).ok() != Some(pid)
+            {
+                return Err(io::Error::other(
+                    "owned child lost its terminal exit observation",
+                ));
+            }
+            // SAFETY: SIGCHLD selects the initialized status arm.
+            let status = unsafe { info.si_status() };
+            let raw = match info.si_code {
+                libc::CLD_EXITED if (0..=255).contains(&status) => status << 8,
+                libc::CLD_KILLED if (1..=126).contains(&status) => status,
+                // The Unix wait status's high signal bit records a core dump.
+                libc::CLD_DUMPED if (1..=126).contains(&status) => status | 0x80,
+                _ => {
+                    return Err(io::Error::other(
+                        "owned child reported an invalid terminal status",
+                    ));
+                }
+            };
+            return Ok(Some(std::process::ExitStatus::from_raw(raw)));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub(super) fn exit_status_unreaped(_pid: u32) -> io::Result<Option<std::process::ExitStatus>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "an unreaped exit is read on Darwin and Linux only",
+    ))
+}
+
 /// Observe this owned child's exit while preserving its unreaped identity.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 pub(super) fn observe_exit(pid: u32, block: bool) -> io::Result<bool> {

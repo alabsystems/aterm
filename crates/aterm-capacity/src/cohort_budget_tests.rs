@@ -9,6 +9,7 @@ fn machine() -> Fixed {
     machine.set_procs(Some(Procs::of(vec![Proc {
         pid: std::process::id(),
         ppid: 1,
+        start: 0,
         charged: 30 * crate::floor::GIB,
         footprint: 30 * crate::floor::GIB,
         written: 0,
@@ -46,6 +47,7 @@ fn independent_same_custodian_budgets_reserve_before_arm_and_reopen() {
                 &Procs::of(vec![Proc {
                     pid: std::process::id(),
                     ppid: 1,
+                    start: 0,
                     charged: 30 * crate::floor::GIB,
                     footprint: 30 * crate::floor::GIB,
                     written: 0,

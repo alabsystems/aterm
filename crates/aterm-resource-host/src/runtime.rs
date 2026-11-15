@@ -284,7 +284,7 @@ fn run(control: CtlStream, status: CtlStream) -> io::Result<()> {
         return Err(refused());
     }
     instance.validate()?;
-    wire::write_frame(&control, &[1], deadline)?;
+    wire::write_frame(&control, &gui_ack(&hello), deadline)?;
     drop(status);
     let active = Arc::new(AtomicUsize::new(1));
     let guis = Arc::new(AtomicUsize::new(1));
@@ -393,11 +393,14 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
     let peer = wire::local_peer(stream)?;
     let hello = read_json(stream, deadline)?;
     match hello["role"].as_str() {
+        Some("resource-observer-v1") if hello["version"].as_u64() == Some(3) => {
+            serve_observer_hello(stream, peer, &hello, guis)
+        }
         Some("gui") => {
             let authority = authenticate_gui(stream, program, &hello)?;
             guis.fetch_add(1, Ordering::AcqRel);
             let _gui = Connection(guis);
-            wire::write_frame(stream, &[1], deadline)?;
+            wire::write_frame(stream, &gui_ack(&hello), deadline)?;
             crate::forward::serve(stream, |peer| authority.check(peer))
         }
         Some("native-telemetry") if hello["version"].as_u64() == Some(3) => {
@@ -425,6 +428,11 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
         }
         Some("native-bootstrap-object-compile-v1") if hello["version"].as_u64() == Some(3) => {
             crate::bootstrap_graph_transport::object(stream, peer, &hello, deadline)
+        }
+        Some("native-bootstrap-local-archive-bundle-v1")
+            if hello["version"].as_u64() == Some(3) =>
+        {
+            crate::bootstrap_graph_transport::archive(stream, peer, &hello, deadline)
         }
         Some("native-bootstrap-sdk-query-v1") if hello["version"].as_u64() == Some(3) => {
             crate::bootstrap_graph_transport::query(stream, peer, &hello, deadline)
@@ -645,6 +653,50 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
         }
         _ => Err(refused()),
     }
+}
+
+pub(crate) fn serve_observer_hello(
+    stream: &CtlStream,
+    peer: wire::Peer,
+    hello: &aterm_json::Value,
+    guis: Arc<AtomicUsize>,
+) -> io::Result<()> {
+    if hello["version"].as_u64() != Some(3)
+        || hello["role"].as_str() != Some("resource-observer-v1")
+        || hello.as_object().is_none_or(|fields| fields.len() != 3)
+        || wire::local_peer(stream)? != peer
+    {
+        return Err(refused());
+    }
+    let permit = hello["permit"].as_str().ok_or_else(refused)?;
+    crate::observer_permit::validate(permit.as_bytes())?;
+    let identity = i32::try_from(peer.pid)
+        .ok()
+        .and_then(aterm_uds::process::read_identity)
+        .ok_or_else(refused)?;
+    if identity.birth != Birth(peer.birth) {
+        return Err(refused());
+    }
+    guis.fetch_add(1, Ordering::AcqRel);
+    let _gui = Connection(guis);
+    wire::write_frame(stream, &[1], control_deadline(Instant::now()))?;
+    crate::forward::serve_observer(stream, |now| {
+        if now == peer && aterm_uds::process::read_identity(identity.pid) == Some(identity) {
+            Ok(())
+        } else {
+            Err(refused())
+        }
+    })
+}
+
+fn gui_ack(hello: &aterm_json::Value) -> Vec<u8> {
+    let mut ack = vec![1];
+    if hello["observer_reconnect"].as_str() == Some("permit-v1")
+        && let Ok(permit) = crate::observer_permit::issue()
+    {
+        ack.extend(permit.expose());
+    }
+    ack
 }
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn serve_test(stream: &CtlStream, program: &Program) -> io::Result<()> {

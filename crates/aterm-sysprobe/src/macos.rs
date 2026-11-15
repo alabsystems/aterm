@@ -163,6 +163,7 @@ pub(crate) fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
 pub(crate) fn process_path(pid: u32) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
     let pid = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+    crate::lane::mark("proc_pidpath", u32::try_from(pid).ok());
     let mut buf = [0u8; PATH_CAP];
     let n = path_into(pid, &mut buf)?;
     let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&buf[..n]));
@@ -1702,6 +1703,7 @@ pub(crate) fn workqueue_limits() -> crate::machine::WorkqueueLimits {
 /// ([`crate::machine::pid_room`], [`crate::machine::owned_count`]): [`crate::room::TaskRoom`]'s
 /// `procs` and `user_procs`.
 pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
+    crate::lane::mark("proc_listallpids", None);
     // SAFETY: A null buffer asks for the room only.
     let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     let Some(room) = crate::machine::pid_room(i64::from(estimate)) else {
@@ -1714,6 +1716,7 @@ pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     // SAFETY: `pids` is writable for `bytes` bytes, the size passed; the
     // call returns how many pids it wrote.
     let all = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    crate::lane::mark("proc_listpids RUID", None);
     // SAFETY: As above; this call returns how many bytes it wrote.
     // `errno` is this thread's, cleared first: libproc answers zero for a
     // uid that owns no process and for a failure, and only a failure sets

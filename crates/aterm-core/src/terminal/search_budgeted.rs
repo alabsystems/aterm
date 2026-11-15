@@ -287,6 +287,9 @@ impl Terminal {
                 .saturating_add(row_budget.max(1))
                 .min(state.engine.total_rows())
         };
+        state
+            .engine
+            .skip_unretained_rows(end.saturating_sub(state.engine.rows_fed()));
         self.feed_budgeted_history(&mut state, end);
         while state.engine.rows_fed() < end {
             let i = state.engine.rows_fed();

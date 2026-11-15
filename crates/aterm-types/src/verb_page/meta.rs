@@ -242,7 +242,11 @@ pub(crate) const PAGE: Page = Page {
                      for, whole and in the worker's order, `entry=` being that entry's text as it \
                      set it, or that the entry went: told as aterm's own harness tells its set, so \
                      a set told before its entry stands waits for it and one told for another \
-                     entry's text is never shown.",
+                     entry's text is never shown. A credential is no person's need: aterm takes \
+                     each credential line off the set, puts up the entry for the needs left (or \
+                     takes it down where none is left) and resolves the credential from the \
+                     vault, else files `aterm secrets need`; an entry that leads with a \
+                     credential stands only as its set rebuilds it.",
                 ),
                 para(
                     "While the claim stands the tab's hover gives each need a `Needs you:` line, \

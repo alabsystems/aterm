@@ -11,8 +11,10 @@
 //!   build does not know, then the row's key, `=pk`. A header starting with `=` is read-only:
 //!   the key, bounded JSON, import coordinates and unknown columns.
 //! - **Cells.** A value is shown in its type's plain spelling: a set as its present members, a
-//!   list as `a, b`, a record as JSON. An address is masked (`ab…@…`) unless the owner asks
-//!   for addresses. A conflicted cell shows `⚠ a ‖ b`; editing it to one value resolves it.
+//!   list as `a, b`, a record as JSON, an address and a phone number as they are, and a secret
+//!   cell as the name of the secret-store entry that holds its value, read-only: the value is
+//!   written through the store, never typed into a grid. A conflicted cell shows `⚠ a ‖ b`;
+//!   editing it to one value resolves it.
 //! - **The baseline.** An export remembers what each cell showed and the operations that were
 //!   its candidates ([`Base`]); a save writes a cell only when its text changed, and only while
 //!   its candidates are still the exported ones ([`settle`]). A cell that changed meanwhile is
@@ -49,67 +51,22 @@ pub const FORMAT: &str = "att/1-grid";
 /// The most bytes a grid file holds: amacs's own limit.
 pub const MAX_BYTES: usize = amacs::table::MAX_TABLE_BYTES;
 
-/// An address as every surface shows it unless the owner asks for addresses: the first two
-/// characters of its local part, then `…@…`.
-pub fn mask(address: &str) -> String {
-    let local = address.split('@').next().unwrap_or_default();
-    let mut out = String::with_capacity(13);
-    for ch in local.chars().take(2) {
-        out.push(ch);
-    }
-    out.push_str("…@…");
-    out
-}
-
-/// `value` with every address its type can hold masked, unless `show`.
-fn masked(ty: &Ty, value: &Value, show: bool) -> Value {
-    if matches!(ty, Ty::Secret) {
-        return if value.is_null() {
-            Value::Null
-        } else {
-            Value::String(super::secret::MASK.to_owned())
-        };
-    }
-    if show || !ty.pii() {
-        return super::secret::masked(value);
-    }
-    match (ty, value) {
-        (Ty::Email, Value::String(address)) => Value::String(mask(address)),
-        (Ty::List(inner, _) | Ty::Set(inner), Value::Array(items)) => {
-            Value::Array(items.iter().map(|item| masked(inner, item, show)).collect())
-        }
-        (Ty::Struct(members), Value::Object(object)) => Value::Object(
-            object
-                .iter()
-                .map(|(key, field)| {
-                    let value = members
-                        .iter()
-                        .find(|m| m.name == key)
-                        .map_or_else(|| raw_masked(field, show), |m| masked(&m.ty, field, show));
-                    (key.clone(), value)
-                })
-                .collect(),
-        ),
-        _ => raw_masked(value, show),
-    }
-}
-
 pub use guard::REFUSED;
 
-/// A value of no known type: every string shaped like a secret or a phone number replaced with
-/// [`REFUSED`], and every string holding `@` masked unless `show`.
-pub fn raw_masked(value: &Value, show: bool) -> Value {
+/// A value of no known type as every surface shows it: an earlier build's sealed secret token as
+/// [`super::secret::MASK`], and every string shaped like a credential or naming a secret as
+/// [`REFUSED`].
+pub fn raw_shown(value: &Value) -> Value {
     match value {
         Value::String(text) if super::secret::is_sealed(text) => {
             Value::String(super::secret::MASK.to_owned())
         }
-        Value::String(text) if guard::never_shown(text) => Value::String(REFUSED.to_owned()),
-        Value::String(text) if !show && text.contains('@') => Value::String(mask(text)),
-        Value::Array(items) => Value::Array(items.iter().map(|v| raw_masked(v, show)).collect()),
+        Value::String(text) if guard::withheld(text) => Value::String(REFUSED.to_owned()),
+        Value::Array(items) => Value::Array(items.iter().map(raw_shown).collect()),
         Value::Object(object) => Value::Object(
             object
                 .iter()
-                .map(|(key, field)| (key.clone(), raw_masked(field, show)))
+                .map(|(key, field)| (key.clone(), raw_shown(field)))
                 .collect::<Map>(),
         ),
         other => other.clone(),
@@ -132,7 +89,7 @@ const fn plain(ty: &Ty) -> bool {
             | Ty::Hex(_)
             | Ty::Digits(_)
             | Ty::Email
-            | Ty::Secret
+            | Ty::Phone
             | Ty::Url
             | Ty::Key
             | Ty::Ref(_)
@@ -143,29 +100,31 @@ fn compact(value: &Value) -> String {
     aterm_json::to_string(value).unwrap_or_default()
 }
 
-/// One value as a cell shows it: `""` for null, a plain scalar as itself, a list of plain
-/// scalars as `a, b` (as JSON when an item holds a comma), anything else as JSON. A value that
-/// fails its type or the guards (another writer's build stored it) is shown raw
-/// ([`raw_masked`]): a secret, a phone number or an unasked address never shows.
-pub fn show(ty: &Ty, x: &Value, reveal: bool) -> String {
-    let safe = super::secret::mask_type(ty, x);
-    if !cell::admissible(ty, &safe) {
-        return match raw_masked(&safe, reveal) {
+/// One value as a cell shows it: `""` for null, a plain scalar as itself, a secret reference as
+/// its store entry's name, a list of plain scalars as `a, b` (as JSON when an item holds a
+/// comma), anything else as JSON. A value that fails its type or the guards (another writer's
+/// build stored it) is shown raw ([`raw_shown`]): a sealed token or a credential never shows,
+/// and a secret column shows any value but a reference as [`super::secret::MASK`] (a sealed
+/// column, [`Ty::Secret`], every value).
+pub fn show(ty: &Ty, x: &Value) -> String {
+    if matches!(ty, Ty::Secret) && !x.is_null()
+        || matches!(ty, Ty::SecretRef) && !x.is_null() && !cell::admissible(ty, x)
+    {
+        return super::secret::MASK.to_owned();
+    }
+    if !cell::admissible(ty, x) {
+        return match raw_shown(x) {
             Value::String(text) => text,
             other => compact(&other),
         };
     }
-    let x = if reveal || !ty.pii() {
-        safe
-    } else {
-        masked(ty, &safe, reveal)
-    };
-    match (x, ty) {
+    match (x.clone(), ty) {
         (Value::Null, _) => String::new(),
+        (x, Ty::SecretRef) => super::secret::entry_of(&x).unwrap_or_default().to_owned(),
         (Value::String(text), _) if plain(ty) => text,
         (x @ (Value::Bool(_) | Value::Number(_)), _) if plain(ty) => compact(&x),
         (Value::Array(items), Ty::List(inner, _)) if plain(inner) => {
-            let parts: Vec<String> = items.iter().map(|item| show(inner, item, true)).collect();
+            let parts: Vec<String> = items.iter().map(|item| show(inner, item)).collect();
             if parts.iter().any(|p| p.contains(',') || p.starts_with('[')) {
                 compact(&Value::Array(items))
             } else {
@@ -176,15 +135,25 @@ pub fn show(ty: &Ty, x: &Value, reveal: bool) -> String {
     }
 }
 
+/// The value `x` of row `pk`'s `column` in `collection` as its cell shows it ([`show`]), a
+/// secret reference to an entry not the cell's own ([`cell::owns_entry`]) as the mask.
+pub fn show_at(collection: &str, column: &Column, pk: &str, x: &Value) -> String {
+    if cell::owns_entry(collection, column, pk, x) {
+        show(&column.ty, x)
+    } else {
+        super::secret::MASK.to_owned()
+    }
+}
+
 /// A projected field as its cell shows it.
-pub fn show_field(column: &Column, field: Option<&Field>, reveal: bool) -> String {
+pub fn show_field(column: &Column, field: Option<&Field>) -> String {
     match field {
         None => String::new(),
-        Some(Field::Value(candidate)) => show(&column.ty, &candidate.value.x, reveal),
+        Some(Field::Value(candidate)) => show(&column.ty, &candidate.value.x),
         Some(Field::Conflict { candidates, .. }) => {
             let values: Vec<String> = candidates
                 .iter()
-                .map(|c| show(&column.ty, &c.value.x, reveal))
+                .map(|c| show(&column.ty, &c.value.x))
                 .collect();
             format!("{CONFLICT}{}", values.join(BETWEEN))
         }
@@ -197,8 +166,8 @@ pub fn show_field(column: &Column, field: Option<&Field>, reveal: bool) -> Strin
                 cell::members(column, Some(set))
                     .into_iter()
                     .map(|elem| match inner {
-                        Some(inner) => show(inner, &Value::String(elem.to_owned()), reveal),
-                        None => show_raw_text(elem, reveal),
+                        Some(inner) => show(inner, &Value::String(elem.to_owned())),
+                        None => show_raw_text(elem),
                     })
                     .collect(),
             )
@@ -206,13 +175,28 @@ pub fn show_field(column: &Column, field: Option<&Field>, reveal: bool) -> Strin
     }
 }
 
-fn show_raw_text(text: &str, reveal: bool) -> String {
+/// [`show_field`] for the cell of row `pk` in `collection`: each candidate of a register as
+/// [`show_at`] shows it, so a secret reference to an entry not the cell's own shows as the mask,
+/// never as that entry's name.
+pub fn show_field_at(collection: &str, column: &Column, pk: &str, field: Option<&Field>) -> String {
+    match field {
+        Some(Field::Value(candidate)) => show_at(collection, column, pk, &candidate.value.x),
+        Some(Field::Conflict { candidates, .. }) => {
+            let values: Vec<String> = candidates
+                .iter()
+                .map(|c| show_at(collection, column, pk, &c.value.x))
+                .collect();
+            format!("{CONFLICT}{}", values.join(BETWEEN))
+        }
+        other => show_field(column, other),
+    }
+}
+
+fn show_raw_text(text: &str) -> String {
     if super::secret::is_sealed(text) {
         super::secret::MASK.to_owned()
-    } else if guard::never_shown(text) {
+    } else if guard::withheld(text) {
         REFUSED.to_owned()
-    } else if !reveal && text.contains('@') {
-        mask(text)
     } else {
         text.to_owned()
     }
@@ -234,12 +218,12 @@ fn show_members(parts: Vec<String>) -> String {
     }
 }
 
-/// A cell of a column this reader cannot interpret: each candidate's raw value as JSON, masked.
+/// A cell of a column this reader cannot interpret: each candidate's raw value as JSON
+/// ([`raw_shown`]).
 fn show_raw(
     column: Option<&Column>,
     cell: Option<&crate::database::Cell>,
     field: Option<&Field>,
-    reveal: bool,
 ) -> String {
     let Some(cell) = cell else {
         return match field {
@@ -264,7 +248,7 @@ fn show_raw(
                         .collect(),
                 }
                 .into_iter()
-                .map(|elem| show_raw_text(elem, reveal))
+                .map(show_raw_text)
                 .collect(),
             ),
             _ => String::new(),
@@ -275,7 +259,7 @@ fn show_raw(
         .map(|(_, value)| {
             let decoded = CellValue::decode(value).ok();
             let x = decoded.as_ref().map_or(value, |v| &v.x);
-            compact(&raw_masked(x, reveal))
+            compact(&raw_shown(x))
         })
         .collect();
     match values.len() {
@@ -286,14 +270,18 @@ fn show_raw(
 }
 
 /// Whether the grid shows `column` read-only: bounded JSON and import coordinates are written
-/// by tools, never typed (design §3.3), and a column only its row's own Mac writes
-/// (`Writer::Mine`, a roll's cover row) is that Mac's statement, never the owner's edit.
+/// by tools, never typed (design §3.3), a secret's reference ([`super::secret_named`]) by the
+/// verb that puts its value into the store, a sealed token by the verb that seals it, and a
+/// column only its row's own Mac writes (`Writer::Mine`, a roll's cover row) is that Mac's
+/// statement, never the owner's edit. A reference in any other column (a `vault_ref`) is typed
+/// like any JSON value.
 pub const fn read_only(column: &Column) -> bool {
     if matches!(column.writer, super::Writer::Mine) {
         return true;
     }
     match column.ty {
         Ty::Json(_) | Ty::SrcRef | Ty::Sealed(_) | Ty::Secret => true,
+        Ty::SecretRef => super::secret_named(column.name),
         Ty::List(inner, _) => matches!(inner, Ty::SrcRef),
         _ => false,
     }
@@ -319,6 +307,9 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
         }
         Ty::Hex(_) => Ok(Value::String(text.trim().to_ascii_lowercase())),
         Ty::Digits(_) => Ok(Value::String(text.trim().to_owned())),
+        Ty::Phone => super::cell::typed_phone(text)
+            .map(Value::String)
+            .ok_or("a number is 7 to 15 digits, with an optional leading +"),
         Ty::Bool => match text.trim() {
             "true" => Ok(Value::Bool(true)),
             "false" => Ok(Value::Bool(false)),
@@ -406,44 +397,15 @@ impl GridColumn {
 /// The grid columns of `collection` over `projection`: its live columns, then unknown ones a
 /// newer build wrote, then `=pk`.
 pub fn layout(collection: &'static Collection, projection: &Projection) -> Vec<GridColumn> {
-    layout_with(collection, projection, false)
-}
-
-/// The grid column of schema column `column`, its `Secret` editable where `secrets` (the column
-/// is revealed).
-fn schema_column(column: &'static Column, secrets: bool) -> GridColumn {
-    GridColumn {
-        name: column.name.to_owned(),
-        source: Source::Schema(column),
-        read_only: read_only(column) && !(secrets && matches!(column.ty, Ty::Secret)),
-    }
-}
-
-/// The header of each live `Secret` column of `collection` as its grid writes it, revealed where
-/// `secrets` ([`layout_with`]): the columns a grid's opener names to the window as concealed
-/// (`edit … secret=`), whose cells no reader of the window but the person's eyes gets
-/// (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8).
-#[must_use]
-pub fn secret_headers(collection: &'static Collection, secrets: bool) -> Vec<String> {
-    collection
-        .columns
-        .iter()
-        .filter(|c| c.live_at(collection.version) && matches!(c.ty, Ty::Secret))
-        .map(|c| schema_column(c, secrets).header())
-        .collect()
-}
-
-/// [`layout`], with each `Secret` column editable where `secrets` (the column is revealed).
-fn layout_with(
-    collection: &'static Collection,
-    projection: &Projection,
-    secrets: bool,
-) -> Vec<GridColumn> {
     let mut columns: Vec<GridColumn> = collection
         .columns
         .iter()
         .filter(|c| c.live_at(collection.version))
-        .map(|c| schema_column(c, secrets))
+        .map(|column| GridColumn {
+            name: column.name.to_owned(),
+            source: Source::Schema(column),
+            read_only: read_only(column),
+        })
         .collect();
     let unknown: BTreeSet<&str> = projection
         .rows
@@ -466,7 +428,7 @@ fn layout_with(
 }
 
 /// What one exported cell showed and held.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Seen {
     /// The cell's text in the grid.
     pub shown: String,
@@ -476,36 +438,17 @@ pub struct Seen {
     pub elements: BTreeMap<String, Vec<Digest>>,
     /// The cell holds a value this build cannot read: read-only here.
     pub raw: bool,
-    /// A cell of a revealed `Secret` column ([`export_opened`]): `shown` is plaintext, which
-    /// `Debug` and a stored baseline never show.
-    pub secret: bool,
 }
 
-impl std::fmt::Debug for Seen {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let shown: &str = if self.secret && !self.shown.is_empty() {
-            super::secret::MASK
-        } else {
-            &self.shown
-        };
-        f.debug_struct("Seen")
-            .field("shown", &shown)
-            .field("candidates", &self.candidates.len())
-            .field("elements", &self.elements.len())
-            .field("raw", &self.raw)
-            .field("secret", &self.secret)
-            .finish()
-    }
-}
-
-/// The opened values of a revealed `Secret` column, by row key and column: each candidate's
-/// value, through the audited reveal (`att::open_secrets`), a cleared candidate as an empty
-/// one. A cell absent here (a protected row's, one whose token does not open) shows masked and
-/// read-only.
+/// The opened values of a column that holds ordinary data sealed
+/// ([`super::Column::sealed_ordinary`]: a phone's `number` in a generation builds up to 0.200.0
+/// read), by row key and column: each candidate's value (`att::open_ordinary`), a cleared
+/// candidate as an empty one. A cell absent here (one whose token does not open on this Mac)
+/// shows masked.
 pub type Opened = BTreeMap<(String, String), Vec<super::secret::Secret>>;
 
-/// How a revealed `Secret` cell's opened candidates show: its one value, or `⚠ a ‖ b` sorted and
-/// without repeats, a cleared candidate as an empty one.
+/// How a cell's opened candidates show: its one value, or `⚠ a ‖ b` sorted and without repeats,
+/// a cleared candidate as an empty one.
 pub fn show_opened(values: &[super::secret::Secret]) -> String {
     let mut texts: Vec<&str> = values
         .iter()
@@ -527,8 +470,6 @@ pub struct Base {
     pub collection: String,
     /// The compiled collection version the export was laid out at.
     pub version: u32,
-    /// Addresses were shown unmasked.
-    pub reveal: bool,
     /// The header row, exactly.
     pub header: Vec<String>,
     /// Each exported row's cells by column name, in export order.
@@ -628,25 +569,37 @@ fn registers<'a>(collection: &Collection, cells: &'a Cells) -> Registers<'a> {
     out
 }
 
-/// An export: the TSV the owner edits and the baseline a save is compared against. Its
-/// `Debug` gives the text's length only, since a revealed grid's holds plaintext.
-#[derive(Clone, PartialEq, Eq)]
+/// An export: the TSV the owner edits and the baseline a save is compared against.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Export {
     pub text: String,
     pub base: Base,
 }
 
-impl std::fmt::Debug for Export {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Export")
-            .field("text", &self.text.len())
-            .field("base", &self.base)
-            .finish()
+impl Export {
+    /// This export with each cell `opened` holds showing its opened value ([`show_opened`]) in
+    /// place of the mask: the numbers of a column that holds ordinary data sealed. The column
+    /// stays read-only (its header says so), so a save never reads a shown number back as an
+    /// edit; the baseline remembers the shown text, and a file saved unchanged changes nothing.
+    #[must_use]
+    pub fn showing(mut self, opened: &Opened) -> Self {
+        if opened.is_empty() {
+            return self;
+        }
+        for (pk, seen) in &mut self.base.rows {
+            for (column, cell) in seen.iter_mut() {
+                if let Some(values) = opened.get(&(pk.clone(), column.clone())) {
+                    cell.shown = show_opened(values);
+                }
+            }
+        }
+        self.text = render(&self.base);
+        self
     }
 }
 
-/// Lay out the rows of `collection` that every filter matches as a TSV, addresses masked unless
-/// `reveal`, with the baseline a save is read against.
+/// Lay out the rows of `collection` that every filter matches as a TSV, with the baseline a save
+/// is read against.
 ///
 /// # Errors
 /// The collection is not cells, or a filter names an unknown column or an unreadable value.
@@ -655,25 +608,6 @@ pub fn export(
     collection: &'static Collection,
     cells: &Cells,
     filters: &[Where],
-    reveal: bool,
-) -> Result<Export> {
-    export_opened(table, collection, cells, filters, reveal, None)
-}
-
-/// [`export`], with each `Secret` column revealed and editable where `opened` holds its
-/// cells' values (the owner's `--edit`, design §4.8): a cell shows its value, or its distinct
-/// values as a conflict; a set cell `opened` lacks shows masked and read-only, as does every
-/// `Secret` cell of a protected row. Never stored: such a baseline's [`Base::to_json`] masks it.
-///
-/// # Errors
-/// As [`export`].
-pub fn export_opened(
-    table: &Table,
-    collection: &'static Collection,
-    cells: &Cells,
-    filters: &[Where],
-    reveal: bool,
-    opened: Option<&Opened>,
 ) -> Result<Export> {
     export_projected(
         table,
@@ -681,8 +615,6 @@ pub fn export_opened(
         cells,
         &cell::project(collection, cells),
         filters,
-        reveal,
-        opened,
     )
 }
 
@@ -696,8 +628,6 @@ pub fn export_projected(
     cells: &Cells,
     projection: &Projection,
     filters: &[Where],
-    reveal: bool,
-    opened: Option<&Opened>,
 ) -> Result<Export> {
     if collection.kind != Kind::Cells {
         return Err(Error::new(&format!(
@@ -706,7 +636,7 @@ pub fn export_projected(
         )));
     }
     let mut registers = registers(collection, cells);
-    let columns = layout_with(collection, projection, opened.is_some());
+    let columns = layout(collection, projection);
     let header: Vec<String> = columns.iter().map(GridColumn::header).collect();
     let collection_name = collection.name.to_owned();
     let mut raw_lookup = (collection_name.clone(), String::new());
@@ -718,44 +648,24 @@ pub fn export_projected(
             }
         }
         let mut seen = BTreeMap::new();
-        let row_protected = super::check::protected(row);
         for column in &columns {
             let (candidates, elements) = registers
                 .remove(&(pk.as_str(), column.name.as_str()))
                 .unwrap_or_default();
-            let mut raw = row.raw.contains(&column.name);
-            let secret = opened.is_some()
-                && matches!(column.source, Source::Schema(schema) if matches!(schema.ty, Ty::Secret));
+            let raw = row.raw.contains(&column.name);
             let shown = match column.source {
-                Source::Schema(schema) if secret && !raw => {
-                    let field = row.fields.get(&column.name);
-                    match opened
-                        .filter(|o| !o.is_empty())
-                        .and_then(|o| o.get(&(pk.clone(), column.name.clone())))
-                    {
-                        Some(values) if !row_protected => show_opened(values),
-                        _ => {
-                            // Unopened, or a protected row's: masked, and never typed over.
-                            raw = row_protected
-                                || field.is_some_and(
-                                    |f| !matches!(f, Field::Value(c) if c.value.x.is_null()),
-                                );
-                            show_field(schema, field, reveal)
-                        }
-                    }
-                }
                 Source::Pk => pk.clone(),
                 Source::Unknown => {
                     raw_lookup.1.clear();
                     raw_lookup.1.push_str(pk);
                     raw_lookup.1.push('.');
                     raw_lookup.1.push_str(&column.name);
-                    show_raw(
-                        None,
-                        cells.get(&raw_lookup),
-                        row.fields.get(&column.name),
-                        reveal,
-                    )
+                    show_raw(None, cells.get(&raw_lookup), row.fields.get(&column.name))
+                }
+                Source::Schema(schema)
+                    if raw && matches!(schema.ty, Ty::SecretRef | Ty::Secret) =>
+                {
+                    super::secret::MASK.to_owned()
                 }
                 Source::Schema(schema) if raw => {
                     raw_lookup.1.clear();
@@ -766,16 +676,15 @@ pub fn export_projected(
                         Some(schema),
                         cells.get(&raw_lookup),
                         row.fields.get(&column.name),
-                        reveal,
                     )
                 }
                 Source::Schema(schema) => match row.claims.get(&column.name) {
-                    Some(Some(value)) => show(&schema.ty, value, reveal),
+                    Some(Some(value)) => show(&schema.ty, value),
                     Some(None) => format!(
                         "{CONFLICT}{}",
-                        show_field(schema, row.fields.get(&column.name), reveal)
+                        show_field(schema, row.fields.get(&column.name))
                     ),
-                    None => show_field(schema, row.fields.get(&column.name), reveal),
+                    None => show_field(schema, row.fields.get(&column.name)),
                 },
             };
             seen.insert(
@@ -785,7 +694,6 @@ pub fn export_projected(
                     candidates,
                     elements,
                     raw,
-                    secret,
                 },
             );
         }
@@ -795,7 +703,6 @@ pub fn export_projected(
         table: format!("{}/{}", table.application, table.role),
         collection: collection_name,
         version: collection.version,
-        reveal,
         header,
         rows,
     };
@@ -847,7 +754,7 @@ pub struct Problem {
 }
 
 /// One register the save changes.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Edit {
     pub pk: String,
     pub column: String,
@@ -870,35 +777,6 @@ pub struct Edit {
     pub record: usize,
     /// The 1-based text line that record starts on.
     pub line: usize,
-    /// A revealed `Secret` cell's edit: `x` is the owner's plaintext (or null) until [`seal`]
-    /// seals it in the writing session, and `value` is written there. `Debug` never shows it.
-    pub secret: bool,
-}
-
-impl std::fmt::Debug for Edit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let hidden = |shown: &dyn std::fmt::Debug| -> String {
-            if self.secret {
-                super::secret::MASK.to_owned()
-            } else {
-                format!("{shown:?}")
-            }
-        };
-        f.debug_struct("Edit")
-            .field("pk", &self.pk)
-            .field("column", &self.column)
-            .field("elem", &self.elem)
-            .field("key", &self.key)
-            .field("x", &hidden(&self.x))
-            .field("value", &hidden(&self.value))
-            .field("expected", &self.expected.len())
-            .field("mine", &hidden(&self.mine))
-            .field("at", &self.at)
-            .field("record", &self.record)
-            .field("line", &self.line)
-            .field("secret", &self.secret)
-            .finish()
-    }
 }
 
 /// What an owner's save asks for, read against its baseline.
@@ -972,14 +850,6 @@ impl<'a> Reader<'a> {
     ) {
         let collection = self.collection;
         let line = self.line(record);
-        let key = |elem: Option<&str>| {
-            CellKey {
-                pk,
-                col: column.name,
-                elem,
-            }
-            .encode()
-        };
         if let Ty::Set(_) = column.ty {
             if text.starts_with(CONFLICT) {
                 self.problem(record, at, "keep one set: delete the ⚠ and the other value");
@@ -1048,7 +918,6 @@ impl<'a> Reader<'a> {
                         at,
                         record,
                         line,
-                        secret: false,
                     }),
                     Err(error) => {
                         self.problem(record, at, error.to_string());
@@ -1063,43 +932,6 @@ impl<'a> Reader<'a> {
                 at,
                 "a conflicted cell takes one value: delete the ⚠ and keep one",
             );
-            return;
-        }
-        if matches!(column.ty, Ty::Secret) {
-            // The owner's plaintext, sealed only in the writing session ([`seal`]).
-            let x = if text.is_empty() {
-                Value::Null
-            } else if super::secret::flag_like_str(text) {
-                self.problem(
-                    record,
-                    at,
-                    format!(
-                        "{}.{}: a value shaped like a flag (`1`, `yes`, under six characters) \
-                         is not a secret",
-                        collection.name, column.name
-                    ),
-                );
-                return;
-            } else {
-                Value::String(text.to_owned())
-            };
-            match key(None) {
-                Ok(key) => out.push(Edit {
-                    pk: pk.to_owned(),
-                    column: column.name.to_owned(),
-                    elem: None,
-                    key,
-                    x,
-                    value: Value::Null,
-                    expected: seen.map(|s| s.candidates.clone()).unwrap_or_default(),
-                    mine: text.to_owned(),
-                    at,
-                    record,
-                    line,
-                    secret: true,
-                }),
-                Err(error) => self.problem(record, at, error.to_string()),
-            }
             return;
         }
         let x = match read(&column.ty, text) {
@@ -1136,7 +968,6 @@ impl<'a> Reader<'a> {
                 at,
                 record,
                 line,
-                secret: false,
             }),
             Err(error) => self.problem(record, at, error.to_string()),
         }
@@ -1263,9 +1094,6 @@ pub fn plan(
                         );
                     }
                     (_, true) => {}
-                    // A revealed grid's plaintext, sealed as the save writes it: never read as
-                    // JSON, and never a birth column.
-                    (Ty::Secret, false) => cells.push((at, *schema, text)),
                     (ty, false) => match read(&ty, text) {
                         Ok(x) => {
                             values.insert(name.clone(), x);
@@ -1332,14 +1160,6 @@ pub fn plan(
             }
             if *read_only {
                 reader.problem(record, at, "this column is read-only (=)");
-                continue;
-            }
-            if held.is_some_and(|s| s.raw && s.secret) {
-                reader.problem(
-                    record,
-                    at,
-                    "this row is protected, or its value does not open here: it is read-only",
-                );
                 continue;
             }
             if held.is_some_and(|s| s.raw) {
@@ -1430,80 +1250,12 @@ pub fn cell_edits(
 }
 
 /// A changed cell whose register moved since the export: never overwritten.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stale {
     pub pk: String,
     pub column: String,
-    /// What the owner typed, shown back beside the value that moved; never in `Debug`, since
-    /// a revealed `Secret` cell's is plaintext.
+    /// What the owner typed, shown back beside the value that moved.
     pub mine: String,
-}
-
-impl std::fmt::Debug for Stale {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Stale")
-            .field("pk", &self.pk)
-            .field("column", &self.column)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Seal each revealed `Secret` edit of `plan` in the writing session, with its `sealer`, and
-/// check it against `cells` as they are now: a value on a row stored protected, or one this save
-/// protects, is refused (a row is unprotected in a save of its own first). A null clears the
-/// cell. Afterwards every edit is an ordinary one: its `x` the sealed token,
-/// its `value` the record value [`settle`] writes.
-///
-/// # Errors
-/// A row is protected, sealing fails, or the sealed cell fails its column's checks.
-pub fn seal(
-    collection: &Collection,
-    plan: &mut Plan,
-    sealer: &dyn super::secret::Sealer,
-    cells: &Cells,
-) -> Result<()> {
-    let projection = cell::project(collection, cells);
-    for (pk, edits) in &mut plan.rows {
-        // Protected as stored, or by this save: a save that protects a row and types its password
-        // together seals none, and neither does one that unprotects a row and types it.
-        let protected = projection
-            .rows
-            .get(pk.as_str())
-            .is_some_and(super::check::protected)
-            || edits
-                .iter()
-                .any(|e| e.column == "protected" && e.x == Value::Bool(true));
-        for edit in edits.iter_mut().filter(|e| e.secret && e.value.is_null()) {
-            let x = match &edit.x {
-                Value::String(text) => {
-                    if protected {
-                        return Err(Error::new(&format!(
-                            "{}.{}: row {} is protected and holds no secret (unprotect it in a \
-                             save of its own first)",
-                            collection.name,
-                            edit.column,
-                            super::keys::safe_key(pk)
-                        )));
-                    }
-                    let value = super::secret::Secret::new(text.clone());
-                    Value::String(sealer.seal(collection.name, pk, &edit.column, &value)?)
-                }
-                _ => Value::Null,
-            };
-            let change = cell::change(
-                collection,
-                CellKey {
-                    pk,
-                    col: &edit.column,
-                    elem: None,
-                },
-                &CellValue::owner(collection.version, x.clone()),
-            )?;
-            edit.x = x;
-            edit.value = change.value.unwrap_or_default();
-        }
-    }
-    Ok(())
 }
 
 /// What a save writes once compared with the table as it is now.
@@ -1590,8 +1342,7 @@ pub fn settle(collection: &Collection, plan: &Plan, cells: &Cells) -> Settled {
             let holds = !stopped
                 && match &edit.elem {
                     Some(elem) => column.is_some_and(|c| {
-                        cell::element_present(c, elem, &values, unreadable)
-                            == cell::adds(c, elem, &edit.x)
+                        cell::element_holds(c, elem, &values, unreadable, &edit.x)
                     }),
                     None if values.is_empty() => edit.x.is_null(),
                     None => values.iter().all(|x| *x == edit.x),
@@ -1674,15 +1425,10 @@ impl Base {
                             .iter()
                             .map(|(e, d)| (e.clone(), json!(digests(d))))
                             .collect();
-                        let shown = if s.secret && !s.shown.is_empty() {
-                            super::secret::MASK
-                        } else {
-                            s.shown.as_str()
-                        };
                         (
                             name.clone(),
-                            json!({"shown": shown, "candidates": digests(&s.candidates),
-                                "elements": elements, "raw": s.raw || s.secret}),
+                            json!({"shown": s.shown, "candidates": digests(&s.candidates),
+                                "elements": elements, "raw": s.raw}),
                         )
                     })
                     .collect();
@@ -1690,7 +1436,7 @@ impl Base {
             })
             .collect();
         json!({"format": FORMAT, "table": self.table, "collection": self.collection,
-            "version": self.version, "reveal": self.reveal, "header": self.header, "rows": rows})
+            "version": self.version, "header": self.header, "rows": rows})
     }
 
     /// Read a stored baseline.
@@ -1723,18 +1469,29 @@ impl Base {
             parsed.sort_unstable();
             Ok(parsed)
         };
-        exact(
-            value,
-            &[
-                "format",
-                "table",
-                "collection",
-                "version",
-                "reveal",
-                "header",
-                "rows",
-            ],
-        )?;
+        // A baseline a build before addresses were ordinary data wrote says whether it masked
+        // them (`reveal`): it is read as it is, its cells compared by what they showed.
+        const FIELDS: [&str; 7] = [
+            "format",
+            "table",
+            "collection",
+            "version",
+            "header",
+            "rows",
+            "reveal",
+        ];
+        if value
+            .get("reveal")
+            .is_some_and(|reveal| reveal.as_bool().is_none())
+        {
+            return Err(bad());
+        }
+        let fields = if value.get("reveal").is_some() {
+            &FIELDS[..]
+        } else {
+            &FIELDS[..6]
+        };
+        exact(value, fields)?;
         if value.get("format").and_then(Value::as_str) != Some(FORMAT) {
             return Err(bad());
         }
@@ -1791,7 +1548,6 @@ impl Base {
                         candidates: digests(s.get("candidates"))?,
                         elements,
                         raw: s.get("raw").and_then(Value::as_bool).ok_or_else(bad)?,
-                        secret: false,
                     },
                 );
             }
@@ -1808,10 +1564,6 @@ impl Base {
                 .get("version")
                 .and_then(Value::as_u64)
                 .and_then(|v| u32::try_from(v).ok())
-                .ok_or_else(bad)?,
-            reveal: value
-                .get("reveal")
-                .and_then(Value::as_bool)
                 .ok_or_else(bad)?,
             header,
             rows,

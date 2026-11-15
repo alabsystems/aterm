@@ -4,12 +4,13 @@
 //! The request journal's records, each one line: `t=<unix ms> op=<word> req=<id>` and the op's own
 //! keys in a fixed order, every value percent-encoded ([`aterm_codec::pct`]) and every line at most
 //! [`aterm_slog::MAX_RECORD_BYTES`]. The decoders are strict: a line out of shape (torn, foreign,
-//! too long, a value not in its canonical encoding) is `None`, which a load skips and counts.
+//! too long, a value not in its canonical encoding) is `None`, which a load skips and counts and
+//! a compaction keeps as it was written ([`crate::store::Store`]): it may be a newer build's.
 //!
 //! [`Rec`] is the journal's (wire and host tiers); [`Said`] the content tier's, kept in its own
 //! file so a reader that serves no content never opens it.
 
-use crate::claim::{CLAIM_PATH_BYTES, Claim, ClaimSrc, TouchWhy};
+use crate::claim::{CLAIM_PATH_BYTES, Claim, ClaimSrc, Keep, TouchWhy};
 use aterm_codec::pct;
 use aterm_slog::MAX_RECORD_BYTES;
 use aterm_types::control_verbs::{REQUEST_WHY_BYTES, REQUESTER_ACCOUNT_BYTES, request_id};
@@ -290,6 +291,64 @@ impl EndWhy {
     }
 }
 
+/// What a cleanup did with one claimed folder (`gone did=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Did {
+    /// It is gone: the cleanup deleted it, or found it gone already.
+    Deleted,
+    /// The cleanup kept it, for the reason its row names.
+    Kept,
+    /// Its removal failed part way.
+    Failed,
+}
+
+impl Did {
+    /// Its `did=` word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Deleted => "deleted",
+            Self::Kept => "kept",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn of(word: &str) -> Option<Self> {
+        [Self::Deleted, Self::Kept, Self::Failed]
+            .into_iter()
+            .find(|did| did.word() == word)
+    }
+}
+
+/// Why a cleanup stopped before it deleted anything (`uncleaned why=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unclean {
+    /// A tab of it runs a command, and the cleanup was not asked to stop it (`stop=1`).
+    Busy,
+    /// The main thread did not close every tab of it.
+    Closer,
+    /// The archive or the journal could not be written.
+    Store,
+}
+
+impl Unclean {
+    /// Its `why=` word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Closer => "closer",
+            Self::Store => "store",
+        }
+    }
+
+    fn of(word: &str) -> Option<Self> {
+        [Self::Busy, Self::Closer, Self::Store]
+            .into_iter()
+            .find(|why| why.word() == word)
+    }
+}
+
 /// A worker's brief as a request keeps it: its digest and size (the text stays the worker's).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Brief {
@@ -481,6 +540,56 @@ pub enum Body {
         /// Who replied.
         by: String,
     },
+    /// A person began cleaning it up (`request clean`).
+    Clean {
+        /// Who.
+        by: String,
+        /// Its tabs are closed even where a command runs in one (`stop=1`).
+        stop: bool,
+    },
+    /// The cleanup's archive was written: its folder's name in the archive, and what it holds.
+    Archived {
+        /// The archive's folder name: the request's id, or the id and `-<n>` for a later clean.
+        dir: String,
+        /// The bytes the archive holds.
+        bytes: u64,
+        /// The files the claims' manifest lists.
+        files: u64,
+        /// The claims the manifest lists.
+        listed: u64,
+        /// Whether every claim's listing was whole: written last, so a row cut inside a figure
+        /// lacks it and reads as torn.
+        whole: bool,
+    },
+    /// What the cleanup did with one claimed folder.
+    Gone {
+        /// The bytes it measured, where a measure read them.
+        bytes: Option<u64>,
+        /// Why it was kept ([`Keep`]), for a kept one.
+        why: Option<Keep>,
+        /// The claimed folder.
+        path: String,
+        /// What was done: written last, so a row cut inside the path lacks it and reads as torn.
+        did: Did,
+    },
+    /// The cleanup stopped before it deleted anything; the request may be cleaned again.
+    Uncleaned {
+        /// Why.
+        why: Unclean,
+    },
+    /// The cleanup finished.
+    Cleaned {
+        /// The tabs it closed.
+        tabs: u64,
+        /// The claimed folders it deleted.
+        deleted: u64,
+        /// The claimed folders it kept.
+        kept: u64,
+        /// The claimed folders it failed to delete.
+        failed: u64,
+        /// Who cleaned it: written last, so a row cut inside a figure lacks it and reads as torn.
+        by: String,
+    },
 }
 
 impl Body {
@@ -501,6 +610,11 @@ impl Body {
             Self::Review { .. } => "review",
             Self::Kept { .. } => "kept",
             Self::Reply { .. } => "reply",
+            Self::Clean { .. } => "clean",
+            Self::Archived { .. } => "archived",
+            Self::Gone { .. } => "gone",
+            Self::Uncleaned { .. } => "uncleaned",
+            Self::Cleaned { .. } => "cleaned",
         }
     }
 }
@@ -646,6 +760,37 @@ impl Rec {
             Body::Reply { key, sent, by } => {
                 format!("key={key} sent={} by={by}", if *sent { "1" } else { "0" })
             }
+            Body::Clean { by, stop } => format!("by={by} stop={}", u8::from(*stop)),
+            Body::Archived {
+                dir,
+                bytes,
+                files,
+                listed,
+                whole,
+            } => format!(
+                "dir={dir} bytes={bytes} files={files} listed={listed} whole={}",
+                u8::from(*whole)
+            ),
+            Body::Gone {
+                bytes,
+                why,
+                path,
+                did,
+            } => format!(
+                "bytes={} why={} path={} did={}",
+                num_or_dash(*bytes),
+                why.map_or("-", Keep::word),
+                pct::encode(path),
+                did.word()
+            ),
+            Body::Uncleaned { why } => format!("why={}", why.word()),
+            Body::Cleaned {
+                tabs,
+                deleted,
+                kept,
+                failed,
+                by,
+            } => format!("tabs={tabs} deleted={deleted} kept={kept} failed={failed} by={by}"),
         };
         line.push(' ');
         line.push_str(&rest);
@@ -783,10 +928,71 @@ impl Rec {
                 },
                 by: token(keys.take("by")?)?,
             },
+            "clean" => Body::Clean {
+                by: token(keys.take("by")?)?,
+                stop: flag(keys.take("stop")?)?,
+            },
+            "archived" => Body::Archived {
+                dir: archive_dir(keys.take("dir")?, &id)?,
+                bytes: number(keys.take("bytes")?)?,
+                files: number(keys.take("files")?)?,
+                listed: number(keys.take("listed")?)?,
+                whole: flag(keys.take("whole")?)?,
+            },
+            "gone" => Body::Gone {
+                bytes: maybe_number(keys.take("bytes")?)?,
+                why: match keys.take("why")? {
+                    "-" => None,
+                    word => Some(Keep::of(word)?),
+                },
+                path: path(keys.take("path")?)?,
+                did: Did::of(keys.take("did")?)?,
+            },
+            "uncleaned" => Body::Uncleaned {
+                why: Unclean::of(keys.take("why")?)?,
+            },
+            "cleaned" => Body::Cleaned {
+                tabs: number(keys.take("tabs")?)?,
+                deleted: number(keys.take("deleted")?)?,
+                kept: number(keys.take("kept")?)?,
+                failed: number(keys.take("failed")?)?,
+                by: token(keys.take("by")?)?,
+            },
             _ => return None,
         };
         keys.done()?;
         Some(Self { t_ms, id, body })
+    }
+}
+
+/// `1` or `0`.
+fn flag(value: &str) -> Option<bool> {
+    match value {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// An archive's folder name for request `id`: the id, or the id and `-<n>` for `n` of 2 or more
+/// in its canonical form ([`archive_name`]).
+fn archive_dir(value: &str, id: &str) -> Option<String> {
+    let rest = value.strip_prefix(id)?;
+    let ok = rest.is_empty()
+        || rest
+            .strip_prefix('-')
+            .and_then(number)
+            .is_some_and(|n| n >= 2);
+    ok.then(|| value.to_owned())
+}
+
+/// The name of request `id`'s `n`th archive (from 1): the id, then the id and `-<n>`.
+#[must_use]
+pub fn archive_name(id: &str, n: u64) -> String {
+    if n <= 1 {
+        id.to_owned()
+    } else {
+        format!("{id}-{n}")
     }
 }
 
@@ -929,9 +1135,11 @@ fn token(value: &str) -> Option<String> {
 }
 
 /// Whether `value` is an actor token as every record of a request names one, whole: a session
-/// aterm minted (`s-` and 20 hex digits); a fleet drive's `fleet:<head>:<sid|->`, its head 1 to
-/// 8 bytes of an id; or one of `human`, `ctl`, `harness`, `bridge` and `-`. Holding each to its
-/// whole shape is what refuses a row cut inside it.
+/// aterm minted (a tab ID: `t` and 10 Crockford base32 characters, or the `s-` and 20 hex digits a
+/// tab opened before that form keeps until it closes); a fleet drive's
+/// `fleet:<head>:<sid|->`, its head 1 to 8 bytes of an id; or one of `human`, `ctl`,
+/// `harness`, `bridge` and `-`. Holding each to its whole shape is what refuses a row cut inside
+/// it.
 #[must_use]
 pub fn is_token(value: &str) -> bool {
     use aterm_types::control_verbs::is_minted_sid;

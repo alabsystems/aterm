@@ -22,30 +22,34 @@ fn answer(view: &PresenceView, sid: &str) -> Option<(Vec<String>, u64)> {
 #[test]
 fn the_view_answers_only_while_live() {
     let view = PresenceView::default();
-    assert_eq!(view.snapshot("s-a"), None, "closed");
+    assert_eq!(view.snapshot("ta000000000"), None, "closed");
     let g = view.open();
-    assert!(view.apply(g, "f", 7, &row("n-a", "s-a"), LIVE));
-    assert_eq!(view.snapshot("s-a"), None, "seeding");
+    assert!(view.apply(g, "f", 7, &row("n-a", "ta000000000"), LIVE));
+    assert_eq!(view.snapshot("ta000000000"), None, "seeding");
     assert!(view.mark(g, 7, 7), "a mark AT the highest record applied");
     assert_eq!(view.phase(), Phase::Seeding, "is not past it");
     assert!(view.mark(g, 8, 8));
     assert_eq!(view.phase(), Phase::Live);
     let n_a = vec!["n-a".to_string()];
-    assert_eq!(answer(&view, "s-a"), Some((n_a.clone(), 8)));
-    assert_eq!(answer(&view, "s-b"), Some((vec![], 8)), "a live miss");
+    assert_eq!(answer(&view, "ta000000000"), Some((n_a.clone(), 8)));
+    assert_eq!(
+        answer(&view, "tb000000000"),
+        Some((vec![], 8)),
+        "a live miss"
+    );
     assert!(view.mark(g, 40, 40));
-    assert_eq!(answer(&view, "s-a"), Some((n_a.clone(), 40)));
+    assert_eq!(answer(&view, "ta000000000"), Some((n_a.clone(), 40)));
     assert!(view.apply(g, "f", 41, "/f/f/pub/n-z/node/presence", LIVE));
-    assert_eq!(answer(&view, "s-a"), Some((n_a, 42)));
+    assert_eq!(answer(&view, "ta000000000"), Some((n_a, 42)));
     assert!(view.mark(g, 30, 30), "a mark behind it");
     assert_eq!(
-        view.snapshot("s-a").map(|s| s.exact_to),
+        view.snapshot("ta000000000").map(|s| s.exact_to),
         Some(42),
         "never back"
     );
     view.end(g);
     assert_eq!(view.phase(), Phase::Dead);
-    assert_eq!(view.snapshot("s-a"), None, "dead");
+    assert_eq!(view.snapshot("ta000000000"), None, "dead");
 }
 
 #[test]
@@ -53,19 +57,19 @@ fn a_row_never_loses_to_an_older_one() {
     let view = PresenceView::default();
     let g = view.open();
     for (off, node, body) in [(50, "n-a", EXITED), (30, "n-b", LIVE)] {
-        assert!(view.apply(g, "f", off, &row(node, "s-x"), body));
+        assert!(view.apply(g, "f", off, &row(node, "tx000000000"), body));
     }
     for (off, node, body) in [(45, "n-a", LIVE), (50, "n-a", EXITED), (25, "n-b", EXITED)] {
-        assert!(view.apply(g, "f", off, &row(node, "s-x"), body));
+        assert!(view.apply(g, "f", off, &row(node, "tx000000000"), body));
     }
     assert!(view.mark(g, 51, 51));
-    assert_eq!(nodes(&view, "s-x"), Some(vec!["n-b".to_string()]));
-    assert!(view.apply(g, "f", 60, &row("n-b", "s-x"), EXITED));
-    assert!(view.apply(g, "f", 61, &row("n-c", "s-x"), LIVE));
-    assert_eq!(nodes(&view, "s-x"), Some(vec!["n-c".to_string()]));
-    assert!(view.apply(g, "f", 62, &row("n-d", "s-x"), LIVE));
+    assert_eq!(nodes(&view, "tx000000000"), Some(vec!["n-b".to_string()]));
+    assert!(view.apply(g, "f", 60, &row("n-b", "tx000000000"), EXITED));
+    assert!(view.apply(g, "f", 61, &row("n-c", "tx000000000"), LIVE));
+    assert_eq!(nodes(&view, "tx000000000"), Some(vec!["n-c".to_string()]));
+    assert!(view.apply(g, "f", 62, &row("n-d", "tx000000000"), LIVE));
     assert_eq!(
-        nodes(&view, "s-x"),
+        nodes(&view, "tx000000000"),
         Some(vec!["n-c".to_string(), "n-d".to_string()])
     );
 }
@@ -76,21 +80,21 @@ fn only_a_hosting_nodes_live_row_advertises() {
     let g = view.open();
     let records: [(&str, &[u8]); 7] = [
         (
-            "/f/f/pub/n-a/s-x/presence",
+            "/f/f/pub/n-a/tx000000000/presence",
             b"v=1 t=1 state=live observer=1",
         ),
-        ("/f/f/pub/n-b/s-x/presence", b"v=1 t=1"),
+        ("/f/f/pub/n-b/tx000000000/presence", b"v=1 t=1"),
         ("/f/f/pub/n-c/node/presence", LIVE),
         ("/f/f/pub/p/h-human/presence", LIVE),
-        ("/f/g/pub/n-d/s-x/presence", LIVE),
+        ("/f/g/pub/n-d/tx000000000/presence", LIVE),
         ("/f/f/pub/n-e/s-X!/presence", LIVE),
-        ("/f/f/pub/n-f/s-x/presence", LIVE),
+        ("/f/f/pub/n-f/tx000000000/presence", LIVE),
     ];
     for (off, (subject, body)) in (1u64..).zip(records) {
         assert!(view.apply(g, "f", off, subject, body));
     }
     assert!(view.mark(g, 100, 100));
-    assert_eq!(nodes(&view, "s-x"), Some(vec!["n-f".to_string()]));
+    assert_eq!(nodes(&view, "tx000000000"), Some(vec!["n-f".to_string()]));
 }
 
 #[test]
@@ -98,7 +102,7 @@ fn a_stale_reader_cannot_touch_the_view() {
     let view = PresenceView::default();
     let old = view.open();
     let new = view.open();
-    assert!(!view.apply(old, "f", 1, &row("n-a", "s-x"), LIVE));
+    assert!(!view.apply(old, "f", 1, &row("n-a", "tx000000000"), LIVE));
     assert!(!view.mark(old, 2, 2));
     view.end(old);
     assert_eq!(
@@ -107,9 +111,9 @@ fn a_stale_reader_cannot_touch_the_view() {
         "the old reader's end is not this open's"
     );
     assert!(view.mark(new, 1, 1));
-    assert_eq!(nodes(&view, "s-x"), Some(vec![]));
+    assert_eq!(nodes(&view, "tx000000000"), Some(vec![]));
     view.close();
-    assert!(!view.apply(new, "f", 3, &row("n-a", "s-x"), LIVE));
+    assert!(!view.apply(new, "f", 3, &row("n-a", "tx000000000"), LIVE));
     assert_eq!(view.phase(), Phase::Closed);
 }
 
@@ -220,7 +224,7 @@ fn a_gap_below_the_tail_ends_the_view() {
         mark(9, 10),
         Response::Delivery {
             offset: 9,
-            subject: row("n-a", "s-a"),
+            subject: row("n-a", "ta000000000"),
             body: LIVE.to_vec(),
         },
     ] {
@@ -237,14 +241,14 @@ fn a_gap_below_the_tail_ends_the_view() {
         Phase::Dead,
         "a view that missed records is exact no more"
     );
-    assert_eq!(view.snapshot("s-a"), None);
+    assert_eq!(view.snapshot("ta000000000"), None);
 }
 
 #[test]
 fn a_confirmation_routes_only_through_to_the_head_and_is_a_mark_either_way() {
     let rec = |off: u64, subject: &str| (off, subject.to_string(), LIVE.to_vec());
     let judge = |found: &[astream_broker::Record], next: u64| {
-        confirmation("f", "s-x", 100, found, (next, 200))
+        confirmation("f", "tx000000000", 100, found, (next, 200))
     };
     let routes = |exact_to| Confirmation {
         routes: true,
@@ -258,30 +262,42 @@ fn a_confirmation_routes_only_through_to_the_head_and_is_a_mark_either_way() {
     assert_eq!(
         judge(
             &[
-                rec(150, &row("n-a", "s-y")),
+                rec(150, &row("n-a", "ty000000000")),
                 rec(160, "/f/f/pub/n-a/node/presence")
             ],
             200
         ),
         routes(150)
     );
-    for subject in [row("n-b", "s-x"), "/f/f/pub/N!/s-x/presence".to_string()] {
+    for subject in [
+        row("n-b", "tx000000000"),
+        "/f/f/pub/N!/tx000000000/presence".to_string(),
+    ] {
         assert_eq!(judge(&[rec(170, &subject)], 200), walks(170), "{subject}");
     }
     assert_eq!(
         judge(
-            &[rec(120, &row("n-a", "s-y")), rec(170, &row("n-b", "s-x"))],
+            &[
+                rec(120, &row("n-a", "ty000000000")),
+                rec(170, &row("n-b", "tx000000000"))
+            ],
             200
         ),
         walks(120)
     );
     assert_eq!(judge(&[], 180), walks(180), "cut short by the scan bound");
     assert_eq!(
-        judge(&[rec(110, &row("n-a", "s-y"))], 111),
+        judge(&[rec(110, &row("n-a", "ty000000000"))], 111),
         walks(110),
         "cut short by max"
     );
-    let other_fleet = confirmation("g", "s-x", 100, &[rec(150, &row("n-a", "s-x"))], (200, 200));
+    let other_fleet = confirmation(
+        "g",
+        "tx000000000",
+        100,
+        &[rec(150, &row("n-a", "tx000000000"))],
+        (200, 200),
+    );
     assert_eq!(other_fleet, routes(150));
 
     let view = PresenceView::default();
@@ -289,29 +305,29 @@ fn a_confirmation_routes_only_through_to_the_head_and_is_a_mark_either_way() {
     view.advance(g, 500, 600);
     assert!(view.mark(g, 100, 120));
     assert_eq!(
-        view.snapshot("s-x").map(|s| (s.exact_to, s.head)),
+        view.snapshot("tx000000000").map(|s| (s.exact_to, s.head)),
         Some((100, 120)),
         "a seeding view's first mark is the broker's, not a confirmation's"
     );
     view.advance(g, 200, 250);
     assert_eq!(
-        view.snapshot("s-x").map(|s| (s.exact_to, s.head)),
+        view.snapshot("tx000000000").map(|s| (s.exact_to, s.head)),
         Some((200, 250))
     );
     view.advance(g, 150, 240);
     assert_eq!(
-        view.snapshot("s-x").map(|s| (s.exact_to, s.head)),
+        view.snapshot("tx000000000").map(|s| (s.exact_to, s.head)),
         Some((200, 250)),
         "never back"
     );
     view.advance(g.wrapping_add(1), 900, 900);
-    assert_eq!(view.snapshot("s-x").map(|s| s.exact_to), Some(200));
-    let stale = view.snapshot("s-x").expect("live").generation;
+    assert_eq!(view.snapshot("tx000000000").map(|s| s.exact_to), Some(200));
+    let stale = view.snapshot("tx000000000").expect("live").generation;
     let g2 = view.open();
     assert!(view.mark(g2, 10, 10));
     view.advance(stale, 900, 900);
     assert_eq!(
-        view.snapshot("s-x").map(|s| s.exact_to),
+        view.snapshot("tx000000000").map(|s| s.exact_to),
         Some(10),
         "a confirmation read from another open moves nothing"
     );

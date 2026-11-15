@@ -6,6 +6,7 @@
 use super::*;
 use crate::supervise::policy::exception::{Exception, Urgency, exception_for};
 use crate::supervise::policy::outlook::ExceptionKind;
+use alab_policy::config::{MIN_WORK, TurnEndTiming};
 use aterm_phase::prompt::fixtures::{
     RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300, WALL_FABLE_NO_RESET_2_1_301, WALL_FABLE_RESET_2_1_301,
     WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300, screen,
@@ -111,7 +112,8 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
         leftover: crate::harness::leftover::LeftRead::NotAsked,
-        credentials: crate::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: crate::harness::goal::GoalRead::Unread,
     }
 }
 
@@ -980,7 +982,7 @@ fn a_bucket_waited_on_is_taken_up_by_the_loop_that_follows() {
             reset,
             Duration::ZERO,
             false,
-            ResetClock::of(Some("Oct 17 at 4:20pm")),
+            reset_clock(Some("Oct 17 at 4:20pm")),
             t,
         );
         assert!(st.waits_on_named_reset());

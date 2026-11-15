@@ -31,7 +31,6 @@ impl World {
         let state = scratch.path().join("state");
         let config = scratch.path().join("config/aterm.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::create_dir_all(home.join(".secrets")).unwrap();
         fs::create_dir_all(home.join(".codex")).unwrap();
         aterm_uds::atomic_file::write(&config, b"[fleet]\nmachine='m16'\n", 0o600).unwrap();
         fs::write(
@@ -39,9 +38,9 @@ impl World {
             "cli_auth_credentials_store='file'\n",
         )
         .unwrap();
-        fs::write(home.join(".secrets").join(cli_fleet_file(Cli::Codex)), format!(
+        crate::vault_entry::seed(&home, &[(&cli_fleet_file(Cli::Codex), format!(
             "[[account]]\nlabel='a'\nemail='{A}'\nmachines=['m16']\n\n[[account]]\nlabel='b'\nemail='{B}'\nmachines=['m16']\n"
-        )).unwrap();
+        ).as_bytes())]);
         let roster = accounts::roster_beside_for(&config, Cli::Codex).unwrap();
         let world = Self {
             _scratch: scratch,
@@ -520,6 +519,7 @@ fn the_second_lab_sync_follows_the_native_default_after_the_actual_first_import(
     let lab = Lab {
         me: Some(test_machine("m16")),
         settled: true,
+        bound: Default::default(),
         accounts: [("a", A), ("b", B)]
             .into_iter()
             .enumerate()
@@ -633,11 +633,9 @@ fn codex_reassignment_rechecks_policy_auth_and_record_custody_before_publication
             "config" => {
                 crate::test_config::write(&world.config, "[fleet]\nmachine='m22'\n").unwrap()
             }
-            "source" => fs::write(
-                world.home.join(".secrets").join(cli_fleet_file(Cli::Codex)),
-                "",
-            )
-            .unwrap(),
+            "source" => {
+                crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"\n")])
+            }
             "roster" => {
                 let mut rows = world.rows();
                 rows.rows[1].identity_email = Some("other@example.com".into());
@@ -934,7 +932,7 @@ fn sync_words(world: &World) -> (ExitCode, String, String) {
 #[test]
 fn a_sync_with_no_source_still_follows_the_default_login() {
     let world = World::new("codex-default-no-source-");
-    fs::remove_file(world.home.join(".secrets").join(cli_fleet_file(Cli::Codex))).unwrap();
+    crate::vault_entry::seed(&world.home, &[(&cli_fleet_file(Cli::Codex), b"")]);
     assert_eq!(world.sync(), Ok(CliSync::NoSource), "CONTROL");
     let (code, _, err) = sync_words(&world);
     assert_eq!(code, ExitCode::FAILURE, "CONTROL");

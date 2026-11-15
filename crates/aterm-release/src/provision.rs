@@ -39,7 +39,7 @@ pub fn run_notary_only(check_only: bool) -> crate::ledger::Result<()> {
     #[cfg(unix)]
     {
         let check = notary_only_with(check_only, notary_probe, || {
-            aterm_secrets::client::Paths::live()
+            aterm_secrets::client::Paths::locate()
                 .and_then(|paths| aterm_secrets::client::release::sync_notary(&paths))
                 .map_err(|error| error.to_string())
         });
@@ -128,27 +128,31 @@ pub fn run_roster_only(
     }
 }
 
-/// Read only the canonical key and identity; never resolve a credential profile.
+/// The store's release ring as this signer: its record's id and the key's public key, read as
+/// one set; no file under the home is read and nothing is minted.
 #[cfg(unix)]
-fn existing_signer(repo: &Path, home: &Path, id: &str) -> Result<machines::MachineIdentity> {
+fn existing_signer(home: &Path, id: &str) -> Result<machines::MachineIdentity> {
     atpkg_keys::provision::vet_machine_id(id).map_err(Error::new)?;
     if !home.is_absolute() {
         return Err(Error::new("HOME must be absolute"));
     }
-    let home_text = utf8_path(home)?;
-    let credentials = sign::ReleaseCredentials::resolve_with(None, repo, Some(&home_text))
+    let credentials = sign::ReleaseCredentials::from_store(home)
         .map_err(Error::new)?
         .ok_or_else(|| {
-            Error::new("roster-only requires an existing machine key; it never mints")
+            Error::new(
+                "roster-only requires this Mac's store to hold the release ring; it never mints",
+            )
         })?;
-    let identity = machines::MachineIdentity::read(&machines::identity_path_in(home))?
-        .ok_or_else(|| Error::new("existing machine key has no canonical identity"))?;
-    if identity.id != id || identity.pubkey != credentials.pubkey() {
+    if credentials.machine_id() != Some(id) {
         return Err(Error::new(
-            "existing machine id or derived public key disagrees with canonical identity",
+            "the store's release ring records a different machine id",
         ));
     }
-    Ok(identity)
+    Ok(machines::MachineIdentity {
+        id: id.to_string(),
+        pubkey: credentials.pubkey().to_string(),
+        minted_at: String::new(),
+    })
 }
 
 /// Selection, authorization and publication share the kept pair's transaction lock.
@@ -163,7 +167,7 @@ fn roster_only_in(
     masters: &[&str],
     now: i64,
 ) -> Result<roster::Attribution> {
-    let identity = existing_signer(repo, home, id)?;
+    let identity = existing_signer(home, id)?;
     let kept = home.join(atpkg_keys::provision::RELEASE_ROSTER_REL);
     let lock = if check {
         None
@@ -224,7 +228,7 @@ pub fn run_provision(
     _mint_developer_id: bool,
 ) -> crate::ledger::Result<()> {
     Err(crate::ledger::Error::new(
-        "provision is POSIX-only: the provisioning engine reads the master phrase from /dev/tty",
+        "provision is POSIX-only, like the provisioning engine it drives",
     ))
 }
 
@@ -267,7 +271,7 @@ pub fn run_provision(
     }
     let roster_path = repo.join("dist").join(roster::ROSTER_ASSET);
     let kept_path = kept_roster_path(&home);
-    let paths = aterm_secrets::client::Paths::for_home(Path::new(&home));
+    let paths = aterm_secrets::client::Paths::locate_for_home(Path::new(&home));
     let fetched = fetch_channel_candidate(&slug);
     let channel_unreadable = match &fetched {
         Err(error) if !error.starts_with(NO_CHANNEL_ROSTER) => Some(error.clone()),
@@ -311,53 +315,32 @@ pub fn run_provision(
         floor: observed_floor,
     } = current;
 
+    // A mint's own output path: only its presence is looked at, as the guard that a mint never
+    // writes over a key; the cut and this audit read the store's ring, never these files.
     let key_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_KEY_REL);
-    let identity_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_PUB_REL);
 
     if !check_only {
         require_public_pair(&kept_path, &chosen, pins::PAPER_MASTER_PUBKEYS)?;
     }
-    let resolved = sign::ReleaseCredentials::resolve(None, repo)?;
+    // The store's ring, one set from one verified version: its key, record and profile are one
+    // identity or it does not resolve (`ReleaseCredentials::from_store`).
+    let resolved = sign::ReleaseCredentials::from_store(Path::new(&home)).map_err(Error::new)?;
     let mut attributed: Option<roster::Attribution> = None;
-    let already = if key_path.exists() {
-        let identity = machines::MachineIdentity::read(&identity_path)?.ok_or_else(|| {
-            Error::new(format!(
-                "{} exists but {} is missing — a half-provisioned machine. The pair is \
-                 written together by the join ceremony; restore machine.toml from wherever \
-                 this key came from, or move the key aside and re-run provision to mint a \
-                 fresh identity under a NEW id",
-                key_path.display(),
-                identity_path.display(),
-            ))
-        })?;
-        if identity.id != id {
+    let already = if let Some(credentials) = resolved.as_ref() {
+        let recorded = credentials.machine_id().unwrap_or_default();
+        if recorded != id {
             return Err(Error::new(format!(
-                "this machine is already provisioned as '{}' — run `{SHIP} provision \
-                 --id {}` to audit it. A machine never re-mints under a second id: revoke \
-                 the old id first if it must be replaced (`atpkg-keys machine-revoke`)",
-                identity.id, identity.id,
+                "this Mac's store holds the release ring of '{recorded}' — run `{SHIP} \
+                 provision --id {recorded}` to audit it. A machine never re-mints under a \
+                 second id: revoke the old id first if it must be replaced (`atpkg-keys \
+                 machine-revoke`)",
             )));
         }
-        let derived = resolved
-            .as_ref()
-            .map(sign::ReleaseCredentials::pubkey)
-            .ok_or_else(|| {
-                Error::new(format!(
-                    "{} exists but did not resolve as this machine's signing identity",
-                    key_path.display()
-                ))
-            })?;
-        if derived != identity.pubkey {
-            return Err(Error::new(format!(
-                "the private key at {} derives a DIFFERENT public key than {} records — \
-                 the pair is incoherent (a restored backup? a copied key?). Move both \
-                 aside and provision a fresh id; never sign with a key whose identity \
-                 file lies about it",
-                key_path.display(),
-                identity_path.display(),
-            )));
-        }
-        attributed = Some(authorize(chosen.bytes.clone(), &chosen.sig, derived)?);
+        attributed = Some(authorize(
+            chosen.bytes.clone(),
+            &chosen.sig,
+            credentials.pubkey(),
+        )?);
         true
     } else {
         false
@@ -498,11 +481,14 @@ pub fn run_provision(
     record("notary", notary_acquire(!check_only), &mut checks);
 
     phase(5, "credentials", "the tokens and profile a cut is handed");
-    record(
-        "channel",
-        channel_token_check(!check_only, !check_only),
-        &mut checks,
-    );
+    record("channel", channel_token_check(!check_only), &mut checks);
+    if !already {
+        record(
+            "master phrase",
+            master_phrase_check(&paths, !check_only),
+            &mut checks,
+        );
+    }
 
     let blocking = blockers(&checks);
     let host_cannot_cut = checks.iter().any(|(_, c)| matches!(c, Check::Skip(_)));
@@ -516,16 +502,24 @@ pub fn run_provision(
              minting the same one (a lineage fork). Retry when the channel answers"
         )));
     } else {
+        if key_path.exists() {
+            return Err(Error::new(format!(
+                "a release key is already at {} but this Mac's store holds no release ring: a \
+                 cut reads only the store, and a mint never writes over a key. The ALab admin \
+                 publishes the ring to the store (`aterm secrets status` names its state)",
+                key_path.display()
+            )));
+        }
         band("MINT");
         step(
             "mint",
             &format!(
-                "typing the phrase mints '{id}' an IRREVERSIBLE roster id: an id is never \
-                 re-issued and never re-used, and a machine never re-mints under a second \
-                 one. Ctrl-C now costs nothing — nothing has been written yet."
+                "the vault's master phrase mints '{id}' an IRREVERSIBLE roster id: an id is \
+                 never re-issued and never re-used, and a machine never re-mints under a \
+                 second one."
             ),
         );
-        Some(mint(repo, id, &roster_path, || {
+        Some(mint(repo, id, &paths, &roster_path, || {
             require_public_source(
                 &paths,
                 observed_vault.as_ref(),
@@ -563,24 +557,26 @@ pub fn run_provision(
         chosen = completed;
     }
 
-    let derived_pubkey = if minted {
-        sign::ReleaseCredentials::resolve(None, repo)?.map(|c| c.pubkey().to_string())
-    } else {
-        resolved.as_ref().map(|c| c.pubkey().to_string())
+    // The signer: the store ring's, or the identity this run minted (its report, not a file).
+    let signer = match (resolved.as_ref(), report.as_ref()) {
+        (Some(credentials), _) => Some(machines::MachineIdentity {
+            id: id.to_string(),
+            pubkey: credentials.pubkey().to_string(),
+            minted_at: String::new(),
+        }),
+        (None, Some(report)) => Some(machines::MachineIdentity {
+            id: report.id.clone(),
+            pubkey: report.machine_pubkey.clone(),
+            minted_at: String::new(),
+        }),
+        (None, None) => None,
     };
+    let derived_pubkey = signer.as_ref().map(|signer| signer.pubkey.clone());
 
-    if key_path.exists() {
-        let write_failed = if apple_sha1.is_some() && !check_only {
-            crate::apple::write_credentials_profile(id, &roster_path, apple_sha1.as_deref()).err()
-        } else {
-            None
-        };
-        let check = match write_failed {
-            Some(e) => Check::Fail {
-                what: e,
-                fix: "check ownership of ~/.aterm/release-ring, then re-run".into(),
-            },
-            None => profile_check(
+    if already {
+        checks.push((
+            "profile",
+            profile_check(
                 &home,
                 id,
                 apple_sha1.as_deref(),
@@ -588,10 +584,29 @@ pub fn run_provision(
                 &crate::dev_identity::Bounded,
                 leave(check_only),
             ),
+        ));
+    } else if minted {
+        // A mint is a new identity, not a copy of a store value: its profile is written beside
+        // the minted key, and the cut reads it only once the store holds the ring.
+        let check = match crate::apple::write_credentials_profile(
+            id,
+            &roster_path,
+            apple_sha1.as_deref(),
+        ) {
+            Err(e) => Check::Fail {
+                what: e,
+                fix: "check ownership of ~/.aterm/release-ring, then re-run".into(),
+            },
+            Ok(_) => Check::Todo {
+                what: format!(
+                    "minted '{id}' at ~/.aterm/release-ring; a cut reads only the store's ring"
+                ),
+                next: "the ALab admin publishes the minted ring to the store".into(),
+            },
         };
         checks.push(("profile", check));
     }
-    let authority = if key_path.exists() {
+    let authority = if signer.is_some() {
         let attribution = match attributed {
             Some(a) => a,
             None => {
@@ -610,7 +625,7 @@ pub fn run_provision(
         None
     };
 
-    let roster_kept = if key_path.exists() && !check_only {
+    let roster_kept = if signer.is_some() && !check_only {
         match keep_roster_pair(&roster_path, &kept_path, pins::PAPER_MASTER_PUBKEYS) {
             Ok(true) => Some(format!(
                 "kept at {} — dist/ is sweepable",
@@ -635,11 +650,9 @@ pub fn run_provision(
         pins::PAPER_MASTER_PUBKEYS,
         aterm_secrets::client::current_public_roster,
     )?;
-    if key_path.exists() && !check_only {
+    if let Some(identity) = signer.as_ref().filter(|_| !check_only) {
         require_public_pair(&roster_path, &chosen, pins::PAPER_MASTER_PUBKEYS)?;
         require_public_pair(&kept_path, &chosen, pins::PAPER_MASTER_PUBKEYS)?;
-        let identity = machines::MachineIdentity::read(&identity_path)?
-            .ok_or_else(|| Error::new("canonical signer identity disappeared"))?;
         let who = machines::authorize_cut(
             pins::PAPER_MASTER_PUBKEYS,
             chosen.bytes.clone(),
@@ -658,14 +671,13 @@ pub fn run_provision(
 
     close(Closing {
         id,
-        home: &home,
         check_only,
         report: report.as_ref(),
         profile: checks.iter().find(|(l, _)| *l == "profile").map(|(_, c)| c),
         open: open_labels(&checks),
         authority,
         roster_kept,
-        key_exists: key_path.exists(),
+        key_exists: signer.is_some(),
         fails,
         waiting,
         host_cannot_cut,
@@ -706,7 +718,6 @@ fn seam(home: &Path, report: &mut dyn FnMut(&str)) {
 #[cfg(unix)]
 struct Closing<'a> {
     id: &'a str,
-    home: &'a str,
     check_only: bool,
     /// The mint's own report, when this run minted.
     report: Option<&'a atpkg_keys::provision::Report>,
@@ -803,12 +814,12 @@ pub(crate) fn report_next_after_cut(r: &atpkg_keys::provision::Report) -> Vec<St
 /// The cutter's command in every remedy this audit prints.
 pub(crate) const SHIP: &str = crate::publish::SHIP_COMMAND;
 
-/// The line an operator copies off a READY TO CUT transcript.
-fn cut_dry_run_next(profile_path: &Path) -> String {
+/// The line an operator copies off a READY TO CUT transcript: the cut signs with the store's
+/// release ring, so it names no profile file.
+fn cut_dry_run_next() -> String {
     format!(
-        "{} --dry-run --bump --mac-only --release-credentials {}",
-        crate::release::RELEASE_COMMAND,
-        profile_path.display()
+        "{} --dry-run --bump --mac-only",
+        crate::release::RELEASE_COMMAND
     )
 }
 
@@ -851,9 +862,8 @@ fn close(c: Closing<'_>) -> Result<()> {
     if let Some(r) = c.report {
         next.extend(report_next_before_cut(r));
     }
-    let profile_path = Path::new(c.home).join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL);
     if c.key_exists && !c.host_cannot_cut && c.fails + c.waiting == 0 {
-        next.push(cut_dry_run_next(&profile_path));
+        next.push(cut_dry_run_next());
     }
     if let Some(r) = c.report {
         next.extend(report_next_after_cut(r));
@@ -921,11 +931,12 @@ fn close(c: Closing<'_>) -> Result<()> {
     Ok(())
 }
 
-/// The in-process join ceremony.
+/// The in-process join ceremony, under the vault's master phrase.
 #[cfg(unix)]
 fn mint(
     repo: &Path,
     id: &str,
+    vault: &aterm_secrets::client::Paths,
     roster_path: &Path,
     validate: impl FnOnce() -> Result<()>,
 ) -> Result<(
@@ -944,12 +955,12 @@ fn mint(
         pins_explicit: false,
     };
     let pre = prov::preflight(prov::Verb::Join, id, &paths).map_err(Error::new)?;
-    let phrase = prompt_master_with_retries()?;
-    let seed = phrase.seed();
+    let seed = master::from_vault(vault).map_err(Error::new)?.seed();
     prov::verify_master(&pre, &seed).map_err(|e| {
+        let refused = aterm_secrets::paper_master::refused(vault, "it derives another master");
         Error::new(match seed.fingerprint() {
-            Ok(fp) => format!("the phrase you typed has fingerprint {fp}\n{e}"),
-            Err(_) => e,
+            Ok(fp) => format!("the vault's master phrase has fingerprint {fp}\n{e}\n{refused}"),
+            Err(_) => format!("{e}\n{refused}"),
         })
     })?;
     let planned = prov::plan(pre, &seed, now_unix()?).map_err(Error::new)?;
@@ -970,40 +981,6 @@ fn publish_mint_plan(
     atpkg_keys::provision::write_pins(&planned).map_err(Error::new)?;
     let report = atpkg_keys::provision::write_rest(planned).map_err(Error::new)?;
     Ok((report, public_pair))
-}
-
-/// Ask for the paper master on the transcript's grid, and give a mistype another go.
-#[cfg(unix)]
-fn prompt_master_with_retries() -> Result<atpkg_keys::master::MasterPhrase> {
-    use atpkg_keys::master;
-    const TRIES: usize = 3;
-    let prompt = format!(
-        "\n{}",
-        crate::publish::grid_block(
-            "master",
-            "master phrase (52 characters, echo off; spaces, hyphens, case, and o/i/l are \
-             forgiven): "
-        )
-    );
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    for left in (0..TRIES).rev() {
-        match master::prompt_master_attempt(&prompt).map_err(Error::new)? {
-            Ok(phrase) => return Ok(phrase),
-            Err(typo) if left > 0 => {
-                step("master", &typo.message());
-                step("", &format!("nothing written — try again ({left} left)"));
-            }
-            Err(typo) => {
-                return Err(Error::new(format!(
-                    "{} — {TRIES} attempts, and nothing was written: no key, no roster, no \
-                     roster id spent. Re-run `{SHIP} provision` and it resumes exactly \
-                     here.",
-                    typo.message()
-                )));
-            }
-        }
-    }
-    unreachable!("the loop returns on every arm")
 }
 
 /// Promote verified public evidence before asking whether it authorizes this signer.
@@ -1741,9 +1718,9 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
         found.push((
             "roster",
             Check::Fail {
-                what: "this machine names no roster id (no ~/.aterm/release-ring/machine.toml, \
-                       no machine_id in its credentials profile) — the cut signs only as a \
-                       rostered machine"
+                what: "this machine names no roster id (the store holds no release ring, and \
+                       no profile names a machine_id) — the cut signs only as a rostered \
+                       machine"
                     .into(),
                 fix: RELEASE_MACHINE.into(),
             },
@@ -1775,19 +1752,12 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
         .map_err(|e| Error::new(format!("read {}/Cargo.toml: {e}", repo.display())))
         .and_then(|manifest| channel::update_channel_slug(&manifest))
         .and_then(|slug| slug.ok_or_else(|| Error::new("no update channel is committed")));
-    found.push(("channel", channel_token_check(false, !dry)));
-    let resolved = sign::ReleaseCredentials::resolve(profile, repo)
-        .ok()
-        .flatten();
+    found.push(("channel", channel_token_check(!dry)));
+    let resolved = sign::ReleaseCredentials::resolve(profile).ok().flatten();
     let derived = resolved.as_ref().map(|c| c.pubkey().to_string());
-    let profile_path = profile.map_or_else(
-        || Path::new(&home).join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL),
-        Path::to_path_buf,
-    );
-    found.push((
-        "profile",
-        profile_check_at(
-            &profile_path,
+    let profile_found = match profile {
+        Some(path) => profile_check_at(
+            path,
             &home,
             id,
             apple_sha1.as_deref(),
@@ -1795,12 +1765,21 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
             &crate::dev_identity::Bounded,
             leave(dry),
         ),
-    ));
+        None => profile_check(
+            &home,
+            id,
+            apple_sha1.as_deref(),
+            derived.as_deref(),
+            &crate::dev_identity::Bounded,
+            leave(dry),
+        ),
+    };
+    found.push(("profile", profile_found));
     let roster = slug.and_then(|slug| {
         let roster_path = repo.join("dist").join(roster::ROSTER_ASSET);
         let kept_path = kept_roster_path(&home);
         let mut paths = vec![roster_path.as_path(), kept_path.as_path()];
-        if let Some(named) = resolved
+        if let Some(sign::RosterSource::File(named)) = resolved
             .as_ref()
             .and_then(sign::ReleaseCredentials::machine_roster)
         {
@@ -1808,7 +1787,7 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
         }
         let fetched = fetch_channel_candidate(&slug);
         let pubkey = derived.clone().ok_or_else(|| {
-            Error::new("this machine holds no release key (~/.aterm/release-ring/machine.key)")
+            Error::new("this Mac's store holds no release ring, so no release key")
         })?;
         audit_roster_at(
             Path::new(&home),
@@ -1844,8 +1823,8 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
 /// What `ship release` proves at step 1 of the writes its publish, cut and after-cut steps make
 /// from this Mac ([`layer::distribution`]): the site checkout, the deployer's key and Google's
 /// grant to it, the site checkout's push, and the routed identities' push to the repositories
-/// and the Homebrew tap, each by a read or a dry run. A real run asks the lab's vault for a
-/// deployer key missing where the vault delivers it; a dry run (`dry`) writes nothing.
+/// and the Homebrew tap, each by a read or a dry run. A real run files a deployer key this
+/// Mac's registry does not hold with the lab; a dry run (`dry`) writes nothing.
 #[cfg(unix)]
 #[must_use]
 pub fn distribution(repo: &Path, dry: bool) -> Vec<Finding> {
@@ -2256,7 +2235,9 @@ fn notary_probe_verdict(profile: &str, success: bool, stdout: &str, stderr: &str
     }
 }
 
-/// The credentials profile a Tier APPLE cut names on its command line.
+/// The store's release profile, the one a Tier APPLE cut loads with no `--release-credentials`:
+/// read with its key and record as one set ([`sign::ReleaseCredentials::from_store`]), never a
+/// file under the home.
 #[cfg(unix)]
 fn profile_check(
     home: &str,
@@ -2266,11 +2247,46 @@ fn profile_check(
     run: &dyn crate::dev_identity::Run,
     leave: crate::release_keychain::Leave,
 ) -> Check {
-    let path = Path::new(home).join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL);
-    profile_check_at(&path, home, id, apple_sha1, machine_pubkey, run, leave)
+    if !cfg!(target_os = "macos") {
+        return Check::Skip("cuts run on macOS (Tier APPLE)".into());
+    }
+    let republish = "the ALab admin republishes the release ring to the store".to_string();
+    match sign::ReleaseCredentials::from_store(Path::new(home)) {
+        Err(what) => Check::Fail {
+            what,
+            fix: republish,
+        },
+        Ok(None) if apple_sha1.is_none() => Check::Todo {
+            what: "the store holds no release ring yet: its profile pins the Developer ID \
+                   certificate, and the apple id line above has not produced one"
+                .into(),
+            next: "settle the apple id line; the ALab admin publishes the ring".into(),
+        },
+        Ok(None) => Check::Fail {
+            what: format!(
+                "this Mac's store holds no release ring ({})",
+                sign::STORE_PROFILE
+            ),
+            fix: republish,
+        },
+        Ok(Some(creds)) => profile_verdict(
+            &creds,
+            &creds
+                .profile()
+                .map_or_else(|| sign::STORE_PROFILE.to_string(), ToString::to_string),
+            &republish,
+            home,
+            id,
+            apple_sha1,
+            machine_pubkey,
+            run,
+            leave,
+        ),
+    }
 }
 
-/// Audit exactly the profile the cut will load, including its permissions and identity.
+/// Audit exactly the operator's profile file the cut will load (`--release-credentials`),
+/// including its permissions and identity.
 #[cfg(unix)]
 fn profile_check_at(
     path: &Path,
@@ -2285,23 +2301,13 @@ fn profile_check_at(
         return Check::Skip("cuts run on macOS (Tier APPLE)".into());
     }
     let rewrite = format!(
-        "move {} aside and re-run `{SHIP} provision --id {id}` — provision writes it",
+        "correct {} or cut without --release-credentials",
         path.display()
     );
     if !path.exists() {
-        // Written only when `apple_sha1.is_some()`, so with no certificate a re-run writes
-        // nothing: report the dependency, counted as waiting (it still blocks the mint).
-        if apple_sha1.is_none() {
-            return Check::Todo {
-                what: "not written yet: it pins the Developer ID certificate, and the \
-                       apple id line above has not produced one"
-                    .into(),
-                next: "nothing to do here — settle the apple id line and this writes itself".into(),
-            };
-        }
         return Check::Fail {
             what: format!("no credentials profile at {}", path.display()),
-            fix: format!("re-run `{SHIP} provision --id {id}` — provision writes it"),
+            fix: rewrite,
         };
     }
     let creds = match sign::ReleaseCredentials::load(path, Some(Path::new(home))) {
@@ -2313,36 +2319,65 @@ fn profile_check_at(
             };
         }
     };
+    profile_verdict(
+        &creds,
+        &path.display().to_string(),
+        &rewrite,
+        home,
+        id,
+        apple_sha1,
+        machine_pubkey,
+        run,
+        leave,
+    )
+}
+
+/// What a loaded profile (`label`) answers for this machine; `rewrite` is the fix of a refusal.
+#[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one audit's inputs, named at each call"
+)]
+fn profile_verdict(
+    creds: &sign::ReleaseCredentials,
+    label: &str,
+    rewrite: &str,
+    home: &str,
+    id: &str,
+    apple_sha1: Option<&str>,
+    machine_pubkey: Option<&str>,
+    run: &dyn crate::dev_identity::Run,
+    leave: crate::release_keychain::Leave,
+) -> Check {
+    let rewrite = rewrite.to_string();
     if creds.notary().is_none() {
         return Check::Fail {
-            what: format!("{} names no notarytool credential", path.display()),
+            what: format!("{label} names no notarytool credential"),
             fix: rewrite,
         };
     }
     if let Some(declared) = creds.machine_id().filter(|d| *d != id) {
         return Check::Fail {
-            what: format!(
-                "{} declares machine_id = \"{declared}\", not '{id}'",
-                path.display()
-            ),
+            what: format!("{label} declares machine_id = \"{declared}\", not '{id}'"),
             fix: rewrite,
         };
     }
     if let Some(mine) = machine_pubkey.filter(|m| creds.pubkey() != *m) {
         return Check::Fail {
             what: format!(
-                "{} signs as {}, but this machine's key is {mine}",
-                path.display(),
+                "{label} signs as {}, but this machine's key is {mine}",
                 creds.pubkey()
             ),
             fix: rewrite,
         };
     }
-    if let Some(named) = creds.machine_roster().filter(|r| !r.exists()) {
+    if let Some(sign::RosterSource::File(named)) = creds.machine_roster().filter(|r| match r {
+        sign::RosterSource::File(named) => !named.exists(),
+        sign::RosterSource::Store => false,
+    }) {
         return Check::Fail {
             what: format!(
-                "{} names a machine_roster that is not there: {}",
-                path.display(),
+                "{label} names a machine_roster that is not there: {}",
                 named.display()
             ),
             fix: rewrite,
@@ -2353,43 +2388,38 @@ fn profile_check_at(
             let kc = crate::release_keychain::Keychains::waiting(Path::new(home), run);
             match crate::apple::pinned_identity_proves(&kc, pinned, leave) {
                 Ok(crate::release_keychain::Proof::Signed) => Check::Pass(format!(
-                    "{} pins signing_identity_sha1 {pinned} — installed, valid and proved \
+                    "{label} pins signing_identity_sha1 {pinned} — installed, valid and proved \
                      to sign (this run's first-listed identity was {proved}; both are \
-                     usable)",
-                    path.display()
+                     usable)"
                 )),
                 Ok(crate::release_keychain::Proof::Opened) => Check::Pass(format!(
-                    "{} pins signing_identity_sha1 {pinned} — installed and valid in the \
+                    "{label} pins signing_identity_sha1 {pinned} — installed and valid in the \
                      release keychain, which opens; {} (this run's first-listed identity was \
                      {proved}; both are usable)",
-                    path.display(),
                     crate::release_keychain::OPENED_NOTE
                 )),
                 Err(why) => Check::Fail {
                     what: format!(
-                        "{} pins signing_identity_sha1 {pinned}, which cannot sign here \
-                         ({why}); this machine signs with {proved}",
-                        path.display()
+                        "{label} pins signing_identity_sha1 {pinned}, which cannot sign here \
+                         ({why}); this machine signs with {proved}"
                     ),
                     fix: rewrite,
                 },
             }
         }
-        _ => Check::Pass(format!(
-            "{} loads under the cut's own rules",
-            path.display()
-        )),
+        _ => Check::Pass(format!("{label} loads under the cut's own rules")),
     }
 }
 
-/// The channel token is the cut's GitHub identity: the vault's [`publish::CHANNEL_TOKEN`] entry.
-/// `may_change` tightens an open file; `record` files a missing token with the lab.
+/// The channel token is the cut's GitHub identity: the vault's [`publish::CHANNEL_TOKEN`] entry,
+/// judged by the store's presence of it (read in place, never a file). `record` files a missing
+/// token with the lab.
 #[cfg(unix)]
-fn channel_token_check(may_change: bool, record: bool) -> Check {
-    let path = publish::channel_token_path();
-    channel_token_check_at(may_change, path.as_deref(), crate::github::has_token).unwrap_or_else(
+fn channel_token_check(record: bool) -> Check {
+    channel_token_verdict(
+        publish::channel_token().map(|token| token.is_some()),
         || {
-            let missing = channel_token_missing(path.as_deref());
+            let missing = channel_token_missing();
             if record {
                 filed(
                     missing,
@@ -2404,70 +2434,63 @@ fn channel_token_check(may_change: bool, record: bool) -> Check {
     )
 }
 
-/// The verdict on no channel token at `path`: the want that brings it, never a person's errand.
+/// Whether this Mac holds the vault's master phrase the mint signs with, read by where the
+/// registry lands it, never by its value: a miss is filed (`record`) as the mint would file it.
 #[cfg(unix)]
-fn channel_token_missing(path: Option<&Path>) -> Check {
+fn master_phrase_check(paths: &aterm_secrets::client::Paths, record: bool) -> Check {
+    let what = match aterm_secrets::registry::held(paths, &Want::PaperMaster) {
+        Ok(Some(name)) => return Check::Pass(format!("the vault holds {name}")),
+        Ok(None) => "the vault registry names no release-paper-master".to_owned(),
+        Err(why) => why,
+    };
+    let missing = Check::Fail {
+        what,
+        fix: format!("`aterm secrets need {}`", Want::PaperMaster.key()),
+    };
+    if record {
+        filed(
+            missing,
+            Ok(paths.clone()),
+            Want::PaperMaster,
+            Purpose::ReleaseRoster,
+        )
+    } else {
+        missing
+    }
+}
+
+/// The store's answer on the channel token judged: held passes, unreadable fails as it is, and
+/// absent is `missing`.
+#[cfg(unix)]
+fn channel_token_verdict(
+    held: std::result::Result<bool, String>,
+    missing: impl FnOnce() -> Check,
+) -> Check {
+    match held {
+        Ok(true) => Check::Pass(format!(
+            "the store holds the release-org token (vault entry {})",
+            publish::CHANNEL_TOKEN
+        )),
+        Ok(false) => missing(),
+        Err(error) => Check::Fail {
+            what: error,
+            fix: "`aterm secrets status` names what keeps this Mac's store from being read"
+                .to_string(),
+        },
+    }
+}
+
+/// The verdict on no channel token in the store: the want that brings it, never a person's
+/// errand.
+#[cfg(unix)]
+fn channel_token_missing() -> Check {
     Check::Fail {
-        what: format!(
-            "no channel token at {}",
-            path.map_or_else(publish::channel_token_pointer, |p| p.display().to_string())
-        ),
+        what: publish::no_channel_token(),
         fix: format!(
             "`aterm secrets need {}`",
             Want::Gh(GhProfile::Release).key()
         ),
     }
-}
-
-/// The token file at `path` judged, `None` when it holds no token.
-#[cfg(unix)]
-fn channel_token_check_at(
-    may_change: bool,
-    path: Option<&Path>,
-    present: impl FnOnce() -> bool,
-) -> Option<Check> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = path?;
-    let where_it_lives = path.display();
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() => meta,
-        Ok(_) => {
-            return Some(Check::Fail {
-                what: format!("{where_it_lives} is not a regular token file"),
-                fix: format!(
-                    "restore this machine's private regular token file at {where_it_lives}"
-                ),
-            });
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => {
-            return Some(Check::Fail {
-                what: format!("cannot inspect {where_it_lives}: {error}"),
-                fix: format!(
-                    "make this machine's private regular token file readable at {where_it_lives}"
-                ),
-            });
-        }
-    };
-    if !present() {
-        return None;
-    }
-    let open = meta.permissions().mode() & 0o077 != 0;
-    let tightened = open
-        && may_change
-        && crate::durable::open_regular_file(path)
-            .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(0o600)))
-            .is_ok();
-    Some(if tightened {
-        Check::Pass(format!("{where_it_lives}  tightened to 0600"))
-    } else if open {
-        Check::Fail {
-            what: format!("{where_it_lives} is group/other-accessible"),
-            fix: format!("chmod 600 {where_it_lives}"),
-        }
-    } else {
-        Check::Pass(format!("{where_it_lives}  0600, owner-only"))
-    })
 }
 
 /// Unix seconds, failing rather than guessing.

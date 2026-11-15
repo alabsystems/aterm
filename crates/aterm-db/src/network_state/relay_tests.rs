@@ -93,8 +93,8 @@ fn relayed_current_claim_requires_a_bounded_source_age() {
 }
 
 #[test]
-fn relay_carries_a_measured_contact_lease_within_its_bounds() {
-    // A peer contacted every 24 s, read 40 s after its last contact: inside its 48 s lease.
+fn relay_carries_a_contact_lease_within_its_bounds() {
+    // A peer promised its next round within 48 s, read 40 s after its last contact.
     let mut state = current();
     let observed = state.observed_at_ms;
     state.peers[0].first_seen_ms = observed - 40_000;
@@ -143,11 +143,12 @@ fn relay_carries_a_measured_contact_lease_within_its_bounds() {
         decode_publication(&aterm_json::to_vec(&value).unwrap(), observed, requested)
     };
     assert!(with_lease(json!(48_000)).is_ok());
-    assert!(with_lease(json!(LEASE_MAX.as_millis() as u64)).is_ok());
+    assert!(with_lease(json!(WRITTEN_LEASE.as_millis() as u64)).is_ok());
     for lease in [
-        // Below the floor, past the ceiling, shorter than the contact's age, or no number.
+        // Below the floor, past the ceiling of the version written, shorter than the
+        // contact's age, or no number.
         json!(14_999),
-        json!(LEASE_MAX.as_millis() as u64 + 1),
+        json!(WRITTEN_LEASE.as_millis() as u64 + 1),
         json!(39_999),
         json!(null),
         json!("48000"),
@@ -157,7 +158,7 @@ fn relay_carries_a_measured_contact_lease_within_its_bounds() {
     }
 }
 
-/// A frame from an owner older than the measured lease names none (its rows have no
+/// A frame from an owner older than the contact lease names none (its rows have no
 /// `lease_ms`), and this reader takes it: each contact is read against `REACHABLE`, as that
 /// owner read it. The other direction is not kept: a reader from before the lease refuses this
 /// owner's frame once a Reachable row's contact is older than `REACHABLE`.
@@ -198,6 +199,196 @@ fn a_frame_that_names_no_lease_is_read_against_the_reachable_window() {
     };
     assert_eq!(at(5), Reachability::Reachable);
     assert_eq!(at(6), Reachability::LastSeen, "REACHABLE ends at 15 s");
+}
+
+/// `body`'s result with the mutant `flag`, if any, on for this thread.
+fn under<R>(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+    body: impl FnOnce() -> R,
+) -> R {
+    if let Some(flag) = flag {
+        flag.with(|flag| flag.set(true));
+    }
+    let result = body();
+    if let Some(flag) = flag {
+        flag.with(|flag| flag.set(false));
+    }
+    result
+}
+
+/// A publication whose one peer was contacted `age` ago on a lease of `lease`, when it was
+/// sampled and at what wall time.
+fn leased(age: Duration, lease: Duration) -> (Publication, Instant, u64) {
+    let mut state = current();
+    let observed = state.observed_at_ms;
+    let contact = observed - age.as_millis() as u64;
+    state.peers[0].first_seen_ms = contact;
+    state.peers[0].last_seen_ms = contact;
+    state.peers[0].last_checked_ms = Some(contact);
+    state.peers[0].lease_ms = Some(lease.as_millis() as u64);
+    let slot = state.peers[0].slot;
+    let requested = Instant::now();
+    let mut source = Publication::new(state, requested);
+    source.contact_ages.insert(slot, age);
+    (source, requested, observed)
+}
+
+/// `wire` as a snapshot that says it is `version`.
+fn versioned(wire: &[u8], version: Value) -> Vec<u8> {
+    let mut value: Value = aterm_json::from_slice(wire).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("version".into(), version);
+    aterm_json::to_vec(&value).unwrap()
+}
+
+/// How this reader takes a version-2 snapshot of a peer contacted five minutes ago on an
+/// eleven-minute lease, and the same snapshot saying it is version 1: for each, the lease it
+/// read, or the stage that refused it.
+fn long_lease_read(
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> [std::result::Result<Option<u64>, Option<&'static str>>; 2] {
+    under(flag, || {
+        let (source, requested, observed) =
+            leased(Duration::from_secs(300), Duration::from_secs(660));
+        let wire = live_encode_version(&source, 0, 2).unwrap();
+        [json!(2), json!(1)].map(|version| {
+            decode_publication(&versioned(&wire, version), observed, requested)
+                .map(|received| received.observation.peers[0].lease_ms)
+                .map_err(|error| error_stage(&error))
+        })
+    })
+}
+
+/// A reader takes version 1, which every aterm before it wrote and writes, and version 2, the
+/// same snapshot with leases up to the longest there is. Under version 1 a lease past two
+/// minutes refuses the whole snapshot, as every reader of version 1 always has: no version-1
+/// snapshot holds a peer Reachable for longer. A version it does not know is refused whole.
+/// MUTANT (`ONLY_VERSION_ONE`): version 2 has no reader. MUTANT (`ONE_BOUND`): a version-1
+/// snapshot is read with an eleven-minute lease.
+#[test]
+fn a_reader_takes_versions_one_and_two_each_within_its_lease_bound() {
+    assert_eq!(
+        long_lease_read(None),
+        [Ok(Some(660_000)), Err(Some("peer-lease"))]
+    );
+    assert_eq!(
+        long_lease_read(Some(&ONLY_VERSION_ONE)),
+        [Err(Some("snapshot-version")), Err(Some("peer-lease"))],
+        "MUTANT: version 2 is refused"
+    );
+    assert_eq!(
+        long_lease_read(Some(&ONE_BOUND)),
+        [Ok(Some(660_000)), Ok(Some(660_000))],
+        "MUTANT: version 1 carries an eleven-minute lease"
+    );
+    // The version-2 reading ages the peer by its lease: Reachable until eleven minutes after
+    // its contact, which was ten minutes and fifty seconds before this sample.
+    let (source, requested, observed) = leased(Duration::from_secs(650), Duration::from_secs(660));
+    let received = decode_publication(
+        &live_encode_version(&source, 0, 2).unwrap(),
+        observed,
+        requested,
+    )
+    .unwrap();
+    let at = |seconds: u64| {
+        received
+            .current_at(
+                requested + Duration::from_secs(seconds),
+                Some(observed + seconds * 1000),
+            )
+            .peers[0]
+            .reachability
+    };
+    assert_eq!(at(10), Reachability::Reachable);
+    assert_eq!(at(11), Reachability::LastSeen, "the lease ends at 660 s");
+    // Each version's own ceiling, and the versions this reader does not know.
+    let read = |version: u64, lease: Duration| {
+        let (source, requested, observed) = leased(Duration::from_secs(10), lease);
+        let wire = under(Some(&WRITES_ANY_LEASE), || {
+            live_encode_version(&source, 0, 2).unwrap()
+        });
+        decode_publication(&versioned(&wire, json!(version)), observed, requested)
+            .map(|received| received.observation.peers[0].lease_ms)
+            .map_err(|error| error_stage(&error))
+    };
+    let secs = Duration::from_secs;
+    assert_eq!(read(1, secs(120)), Ok(Some(120_000)));
+    assert_eq!(
+        read(1, secs(120) + Duration::from_millis(1)),
+        Err(Some("peer-lease"))
+    );
+    assert_eq!(read(2, LEASE_MAX), Ok(Some(660_000)));
+    assert_eq!(
+        read(2, LEASE_MAX + Duration::from_millis(1)),
+        Err(Some("peer-lease"))
+    );
+    for version in [0, 3, u64::MAX] {
+        assert_eq!(read(version, secs(48)), Err(Some("snapshot-version")));
+    }
+    let (source, requested, observed) = leased(secs(10), secs(48));
+    let wire = live_encode_publication(&source, 0).unwrap();
+    for version in [json!(null), json!("1"), json!(1.5), json!(-1)] {
+        assert_eq!(
+            decode_publication(&versioned(&wire, version.clone()), observed, requested)
+                .map(|_| ())
+                .map_err(|error| error_stage(&error)),
+            Err(Some("snapshot-version")),
+            "{version:?}"
+        );
+    }
+}
+
+/// What this relay writes of a peer on a lease of `lease`: the version its snapshot says, or
+/// that it wrote none.
+fn written(
+    lease: Duration,
+    flag: Option<&'static std::thread::LocalKey<std::cell::Cell<bool>>>,
+) -> Option<u64> {
+    under(flag, || {
+        let (source, _, _) = leased(Duration::from_secs(10), lease);
+        let wire = live_encode_publication(&source, 0).ok()?;
+        let value: Value = aterm_json::from_slice(&wire).unwrap();
+        value.get("version").and_then(Value::as_u64)
+    })
+}
+
+/// The writer writes version 2, whose leases reach the scheduler's eleven-minute promise. It
+/// writes no snapshot at all where a Reachable peer's lease is past its version's bound: a
+/// reader would refuse it whole, and a lease cut to fit would not be the one the peer's
+/// observer reads it by. Version 1 is still never written with a lease past its two minutes,
+/// which every aterm before version 2 refuses. A peer that is not Reachable carries no lease,
+/// whatever its row holds. MUTANT (`WRITES_ANY_LEASE`): a snapshot carries an hour's lease.
+#[test]
+fn the_writer_writes_version_two_and_no_lease_past_its_bound() {
+    let secs = Duration::from_secs;
+    assert_eq!(WRITTEN_LEASE, secs(660));
+    assert_eq!(written(secs(48), None), Some(2));
+    assert_eq!(written(secs(660), None), Some(2));
+    assert_eq!(written(secs(660) + Duration::from_millis(1), None), None);
+    assert_eq!(written(secs(3600), None), None);
+    assert_eq!(
+        written(secs(3600), Some(&WRITES_ANY_LEASE)),
+        Some(2),
+        "MUTANT: a lease no reader takes"
+    );
+    let (eleven, _, _) = leased(secs(10), secs(660));
+    assert!(
+        live_encode_version(&eleven, 0, 1).is_err(),
+        "no version-1 snapshot carries a lease past two minutes"
+    );
+    let (mut source, requested, observed) = leased(secs(10), secs(660));
+    source.observation.peers[0].reachability = Reachability::LastSeen;
+    let received = decode_publication(
+        &live_encode_publication(&source, 0).unwrap(),
+        observed,
+        requested,
+    )
+    .unwrap();
+    assert_eq!(received.observation.peers[0].lease_ms, None);
+    // No version this relay does not read is written.
+    assert!(live_encode_version(&source, 0, 3).is_err());
 }
 
 #[test]
@@ -318,7 +509,7 @@ fn observer_rollback_history_round_trips_without_replacing_live_inventory_with_d
         assert_eq!(publication.observation, source);
         decoded
     };
-    owner.contact(identity(2), 100_000, at);
+    owner.contact(identity(2), 100_000, at, REACHABLE);
     owner.accounts_exchange(exchange(100_000, at));
     owner.observe(Visibility::Active, 0, "observing", 100_000, at);
 
@@ -341,7 +532,7 @@ fn observer_rollback_history_round_trips_without_replacing_live_inventory_with_d
     // A genuinely new contact can precede its retained first contact on the wall clock.
     for (wall, elapsed) in [(90_001, 2), (90_002, 3)] {
         let sampled_at = at + Duration::from_secs(elapsed);
-        owner.contact(identity(2), wall, sampled_at);
+        owner.contact(identity(2), wall, sampled_at, REACHABLE);
         owner.accounts_exchange(exchange(wall, sampled_at));
         owner.observe(Visibility::Active, 0, "observing", wall, sampled_at);
         let publication = handle.try_publication().unwrap();
@@ -420,6 +611,72 @@ fn current() -> NetworkObservation {
     }
 }
 
+/// A full roster fits the live frame with the kept round over the catalog beside it: every
+/// slot taken, each peer Reachable under a lease with its most samples, its longest endpoint
+/// and a latest round at its longest (a failure with a cause, every count at its most). The
+/// frame carries the same record the history keeps and a row a peer besides, within the same
+/// bound, so it is the tighter of the two.
+#[test]
+fn a_full_roster_and_the_kept_catalog_round_fit_the_live_frame() {
+    use aterm_types::network_state::{
+        AuthenticatedEndpoint, PresenceSample, RepairCause, RepairObservation, RepairOutcome,
+        RepairStage,
+    };
+    let stamp = 1_793_564_553_000;
+    let round = RepairObservation {
+        completed_at_ms: stamp,
+        outbound: false,
+        stage: Some(RepairStage::Application),
+        outcome: RepairOutcome::Failed(RepairCause::LegacyPastCrossing),
+        table: Some([7; 32]),
+        sent: Some(u64::MAX),
+        received: Some(u64::MAX),
+        deferred: Some(u64::MAX),
+    };
+    let identity = |n: u8| MachineIdentity {
+        machine_id: [n; 16],
+        incarnation: [1; 16],
+        label: None,
+    };
+    let state = NetworkObservation {
+        observer: Some(identity(1)),
+        observed_at_ms: stamp,
+        visibility: Visibility::Active,
+        peers: (0..MAX_PEERS)
+            .map(|slot| PeerObservation {
+                slot: u64::try_from(slot).unwrap(),
+                identity: identity(u8::try_from(slot).unwrap()),
+                first_seen_ms: stamp,
+                last_seen_ms: stamp,
+                last_checked_ms: Some(stamp),
+                last_repair: Some(round.clone()),
+                last_authenticated_endpoint: Some(AuthenticatedEndpoint {
+                    address: "[2001:db8:aaaa:bbbb:cccc:dddd:eeee:ffff]:65535"
+                        .parse()
+                        .unwrap(),
+                    observed_at_ms: stamp,
+                }),
+                reachability: Reachability::Reachable,
+                instances: None,
+                samples: vec![
+                    PresenceSample {
+                        at_ms: stamp,
+                        state: Reachability::Reachable
+                    };
+                    MAX_SAMPLES
+                ],
+                lease_ms: Some(120_000),
+            })
+            .collect(),
+        last_catalog_repair: Some(round.clone()),
+        ..Default::default()
+    };
+    let wire = live_encode(&state, 0).unwrap();
+    let decoded = live_decode(&wire, stamp).unwrap();
+    assert_eq!(decoded.peers.len(), MAX_PEERS);
+    assert_eq!(decoded.last_catalog_repair, Some(round));
+}
+
 #[test]
 fn live_relay_preserves_an_old_failed_attempt_without_renewing_its_time() {
     use aterm_types::network_state::{RepairCause, RepairObservation, RepairOutcome, RepairStage};
@@ -434,12 +691,28 @@ fn live_relay_preserves_an_old_failed_attempt_without_renewing_its_time() {
         received: Some(2),
         deferred: Some(0),
     });
+    // The lab's latest round over the catalog rides the same snapshot, apart from a peer's.
+    state.last_catalog_repair = Some(RepairObservation {
+        completed_at_ms: state.observed_at_ms - 240_000,
+        outbound: true,
+        stage: Some(RepairStage::Application),
+        outcome: RepairOutcome::Exchanged,
+        table: Some([8; 32]),
+        sent: Some(0),
+        received: Some(0),
+        deferred: Some(0),
+    });
     let decoded = live_decode(&live_encode(&state, 0).unwrap(), state.observed_at_ms).unwrap();
     assert_eq!(decoded.peers[0].last_repair, state.peers[0].last_repair);
+    assert_eq!(decoded.last_catalog_repair, state.last_catalog_repair);
     assert_eq!(decoded.peers[0].reachability, Reachability::Reachable);
     assert_eq!(
         value(&decoded)["peers"][0]["last_repair"]["completed_at_ms"],
         json!(state.observed_at_ms - 60_000)
+    );
+    assert_eq!(
+        value(&decoded)["last_catalog_repair"]["completed_at_ms"],
+        json!(state.observed_at_ms - 240_000)
     );
 }
 
@@ -812,6 +1085,75 @@ fn live_decoder_rejects_stale_future_and_unconfirmed_current_peers() {
             state.observed_at_ms
         )
         .is_err()
+    );
+}
+
+/// When the producer's observer began listening (`listening_since_ms`, which the account claims'
+/// presence judges an absence over) reaches the reader as the producer published it, and none
+/// where it named none: an older producer's frame, which lacks it, names none, so it gives no
+/// presence. A start after the sample, at zero, or on an observation that is not Active or names
+/// no observer is no producer's, and is refused. An expired publication names none.
+///
+/// Negative control: with the relay leaving it out of the frame, the relayed observation named
+/// no listening (`left: None`, `right: Some(..)`), so a window reading its owner's relay gave no
+/// presence at all.
+#[test]
+fn listening_since_reaches_the_reader_and_a_foreign_one_is_refused() {
+    let mut state = current();
+    let observed = state.observed_at_ms;
+    for since in [Some(observed - 60_000), Some(observed), None] {
+        state.listening_since_ms = since;
+        let received = live_decode(&live_encode(&state, 0).unwrap(), observed).unwrap();
+        assert_eq!(received.listening_since_ms, since);
+    }
+    state.listening_since_ms = Some(observed - 60_000);
+    let mut older: Value = aterm_json::from_slice(&live_encode(&state, 0).unwrap()).unwrap();
+    older.as_object_mut().unwrap().remove("listening_since_ms");
+    let older = live_decode(&aterm_json::to_vec(&older).unwrap(), observed).unwrap();
+    assert_eq!(older.listening_since_ms, None, "an older producer's frame");
+    for since in [observed + 1, 0] {
+        state.listening_since_ms = Some(since);
+        assert!(
+            live_decode(&live_encode(&state, 0).unwrap(), observed).is_err(),
+            "a listening start at {since} on an observation at {observed}"
+        );
+    }
+    state.listening_since_ms = Some(observed - 60_000);
+    let mut unconfirmed = state.clone();
+    unconfirmed.observer = None;
+    assert!(live_decode(&live_encode(&unconfirmed, 0).unwrap(), observed).is_err());
+    unconfirmed.listening_since_ms = None;
+    assert!(
+        live_decode(&live_encode(&unconfirmed, 0).unwrap(), observed).is_ok(),
+        "PRECONDITION: refused only for its listening"
+    );
+    let mut offline = state.clone();
+    offline.visibility = Visibility::Offline;
+    for peer in &mut offline.peers {
+        peer.reachability = Reachability::LastSeen;
+    }
+    assert!(live_decode(&live_encode(&offline, 0).unwrap(), observed).is_err());
+    offline.listening_since_ms = None;
+    assert!(
+        live_decode(&live_encode(&offline, 0).unwrap(), observed).is_ok(),
+        "PRECONDITION: refused only for its listening"
+    );
+    let publication = Publication::new(state, Instant::now());
+    assert_eq!(
+        publication
+            .current_at(publication.sampled_at(), Some(observed))
+            .listening_since_ms,
+        Some(observed - 60_000)
+    );
+    assert_eq!(
+        publication
+            .current_at(
+                publication.sampled_at() + REACHABLE + Duration::from_secs(1),
+                Some(observed)
+            )
+            .listening_since_ms,
+        None,
+        "an expired publication"
     );
 }
 

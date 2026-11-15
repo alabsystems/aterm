@@ -20,6 +20,9 @@ use crate::slug::Slug;
 const DRAFTS: &str = "drafts";
 /// The routing fact `own_login` asks: the profile's login, empty when it has none.
 const LOGIN: &str = "login";
+/// The routing fact `drafts_next` names: how `--file` names the profile's token (a vault entry's
+/// `~/.secrets/NAME`, a file `~/`-relative), empty for an inline one.
+const TOKEN_FILE: &str = "token_file";
 
 /// Repositories.
 pub struct Repos<'a> {
@@ -131,7 +134,13 @@ impl<'a> Repos<'a> {
                 format!("as {profile}: a fine-grained token's drafts are unproven (design §6.4)"),
             )
             .with_sub(Sub::Forbid(Forbid::DraftsUnproven))
-            .with_next(drafts_next(&vault, &profile, tier, slug))
+            .with_next(drafts_next(
+                &vault,
+                &self.token_file(&profile)?,
+                &profile,
+                tier,
+                slug,
+            ))
             .with_repo(slug.to_string()));
         }
         let repo = self.read(slug, &how)?;
@@ -256,6 +265,24 @@ impl<'a> Repos<'a> {
         Ok(Drafts::Unproven { vault })
     }
 
+    /// `profile`'s token file as a step names it, through its routing fact, so a replay, whose
+    /// router holds no row, names the file the recording did.
+    fn token_file(&self, profile: &str) -> Result<String> {
+        self.gh.fx().fact(TOKEN_FILE, profile, &mut || match self
+            .gh
+            .router()
+            .profile(profile)
+            .map(|p| &p.source)
+        {
+            Some(crate::identity::Source::File(path)) => crate::identity::tilde(
+                path,
+                self.gh.dirs().map_or(std::path::Path::new(""), |d| &d.home),
+            ),
+            Some(crate::identity::Source::Entry(entry)) => entry.spelling(),
+            _ => String::new(),
+        })
+    }
+
     /// The profile `owner`'s repositories are listed as through `/user/repos`: the routed
     /// profile whose login is `owner`. The decision comes through the route door and the
     /// profile's login through its facts, so a recording lists as the untaped run does and a
@@ -287,14 +314,11 @@ enum Drafts {
     Unproven { vault: Vec<String> },
 }
 
-/// The profiles of `router` that name one of the vault's token files, sorted, when `profile`
-/// is one of them; else none.
+/// The profiles of `router` that name one of the vault's two GitHub entries, sorted, when
+/// `profile` is one of them; else none.
 fn vault_profiles(router: &crate::policy::Router, profile: &str) -> Vec<String> {
-    use crate::identity::{Source, vault};
-    let names_vault = |p: &crate::identity::Profile| match &p.source {
-        Source::File(path) => vault::names_vault_path(path),
-        Source::Env(_) | Source::Inline(_) => false,
-    };
+    let names_vault =
+        |p: &crate::identity::Profile| crate::identity::vault::is_slot_entry(&p.source);
     if !router.profile(profile).is_some_and(names_vault) {
         return Vec::new();
     }
@@ -308,16 +332,23 @@ fn vault_profiles(router: &crate::policy::Router, profile: &str) -> Vec<String> 
     names
 }
 
-/// The step for `profile`'s unvouched drafts: re-add it from its token file with `--drafts`
-/// (plan §20 item 2). A profile that names one of the vault's token files (`vault`, every
+/// The step for `profile`'s unvouched drafts: re-add it from its token file `file` (`PATH`
+/// when it reads none) with `--drafts` (plan §20 item 2). A profile that names one of the vault's token files (`vault`, every
 /// such profile, empty when `profile` is not one) may be a builder lanes' agh.toml, which
 /// atpkg-publish requires to route alone and refuses once it says `vault = true`, or an
 /// agh.toml written before vault adoption. So the re-add comes first, and removing every such
 /// profile, after which agh.toml says `vault = true` and adoption vouches each rotation's
 /// token (design §6.10), is named only as the step for a file no lane reads.
-fn drafts_next(vault: &[String], profile: &str, tier: crate::policy::Tier, slug: &Slug) -> String {
+fn drafts_next(
+    vault: &[String],
+    file: &str,
+    profile: &str,
+    tier: crate::policy::Tier,
+    slug: &Slug,
+) -> String {
+    let file = if file.is_empty() { "PATH" } else { file };
     let add = format!(
-        "agh auth add {profile} --file PATH --tier {} --owner {} --write --drafts",
+        "agh auth add {profile} --file {file} --tier {} --owner {} --write --drafts",
         tier.slug(),
         slug.owner()
     );

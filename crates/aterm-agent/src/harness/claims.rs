@@ -6,21 +6,43 @@
 //! Each Mac signs one row into the Commons claims table (`aterm_db::accounts::claims`, a ring of
 //! UTC-day tables): its whole claim set. Every
 //! Mac reads every row and settles each account the same way: the senior live claim wins
-//! ([`senior_lease`]), and a junior yields at its next turn end, because [`settle`] records the
+//! ([`senior_claim`]), and a junior yields at its next turn end, because [`settle`] records the
 //! senior as the account's holder and the turn-end advice moves a session off an account another
 //! Mac holds (`accounts::WhyNot::LeasedElsewhere`). Nothing brokers and nothing else is published.
 //!
 //! - **A row** names its Mac (the Commons machine of the binding that signed it, never a body
-//!   field), its label, a counter (its revision: of two rows from one Mac the higher wins) and
-//!   `until`, past which its claims lapse unless the Mac writes the row again.
-//! - **A claim** is an account ([`LeaseKey`]), its kind ([`Kind::Home`] where the account's home
-//!   is this Mac, else [`Kind::Lease`]) and `since`: when its uninterrupted claim began, which
-//!   ranks it. Home use is a claim like any other, so a cold claim elsewhere sees it.
+//!   field), its label, a counter (its revision: of two rows from one Mac the higher wins),
+//!   `until`, past which its claims lapse unless the Mac writes the row again, and whether its
+//!   Mac ranks homes first ([`Row::ranks_homes`]).
+//! - **A claim** is an account ([`LeaseKey`]), its kind and `since`: when its uninterrupted claim
+//!   began. Home use is a claim like any other, so a cold claim elsewhere sees it.
+//! - **Home first** (the owner's ruling of 2026-11-11, "Accounts on their own machine"). An
+//!   account's homes are the Macs the lab registry says prefer it, each of a pool account's
+//!   preferred Macs among them, each named by the Commons machine its facts row binds
+//!   ([`Homes`]). A reader takes a claim's kind from that relation ([`View::kind`]), never from
+//!   the row, which any writer words as it likes: [`Kind::Home`] from an account's home, else
+//!   [`Kind::Lease`]. A home's live claim outranks a borrower's whatever their `since`; among
+//!   homes, and among borrowers, the earlier `since` ranks senior. So once a home claims its
+//!   account, a borrower on it yields at its next turn end, and once the home's claim lapses with
+//!   its use ([`IDLE_S`]) the borrower may claim it again. A home is never refused its account for
+//!   a borrower's claim, whatever that borrower's row says: a home ranks its own accounts home
+//!   first always ([`Book::homes_first`], [`settle`]). A Mac that reads no lab ranks every claim
+//!   as a lease, and for its life alone takes a claim's word as before ([`View::home_use`]).
+//! - **Mixed builds.** A row says whether its Mac ranks homes first ([`Row::ranks_homes`]). A
+//!   borrower ranks an account first-come while a home's row with an unlapsed claim on it ranks
+//!   first-come (a build from before homes ranked first, or a Mac that read no lab), as that home
+//!   does, so it never yields to a home that yields to it. The rows decide it whole, whatever a
+//!   reader hears of their Macs, so every reader that holds them decides alike. A borrower whose
+//!   own row ranks first-come keeps an account it claimed before the home, beside the home, until
+//!   its rows rank homes first; then it yields at its next turn end.
 //! - **Live.** A claim is live while its row's `until` is ahead. A lease also lapses on a Mac whose
-//!   Commons hears its peers and has not heard the lease's Mac within [`PRESENCE_TTL_S`]
-//!   ([`Presence`], the retired broker's lease TTL): a Mac that left the LAN holds no lease there after
-//!   that, and holds again once it is heard. Home use does not lapse so: the account's home Mac
-//!   uses it wherever it is, so a cold claim elsewhere waits for its row's `until`. A Mac's own
+//!   Commons hears its peers and has listened for [`PRESENCE_TTL_S`] without hearing the lease's
+//!   Mac ([`Presence`], the retired broker's lease TTL): a Mac that left the LAN holds no lease
+//!   there after that, and holds again once it is heard. Only time listened counts, so a Mac
+//!   whose Commons has just resumed (a restart, a wake from sleep) judges no peer absent before it
+//!   has had that long to hear it. A home's claim (to a Mac that reads no lab, a claim its row
+//!   words home) does not lapse so: the account's home Mac uses it wherever it is, so a cold
+//!   claim elsewhere waits for its row's `until`. A Mac's own
 //!   claims are live to it until `until`.
 //! - **A split.** Each side settles what it hears, so a split longer than a claim's life can give
 //!   an account one user on each side; at the heal the union holds both claims, every Mac picks
@@ -45,6 +67,14 @@
 //!   sleep or stop may run no later repair round to carry it.
 //! - **Providers.** Claude Code and Codex share the machine claim set. Each provider
 //!   records its own session activity; local activity preserves the other provider's claims.
+//! - **Which Macs claim** ([`Scope`]). A Mac with `ai-pool.toml` claims and settles every account
+//!   its roster names. A Mac with none claims only the accounts its lab names it a home of, while
+//!   it uses them, and settles the others' claims on those, so a borrower elsewhere yields its
+//!   account to it. An account its lab names another Mac a home of it never claims, and yields
+//!   to that home's live claim alone, at its next turn end, as a borrower with a pool file does.
+//!   For every other account it claims, settles and refuses nothing, and a claim it cannot record
+//!   refuses it nothing, as before it claimed any. Once it has kept claim activity, it gives its
+//!   claims up as every Mac does (a look, a quiet, an off), whatever its lab names by then.
 //! - **A wrong clock** (F22). Every row is placed by its writer's clock, so a Mac whose clock is
 //!   a day or more off writes and reads tables its peers never read or write. The table's read
 //!   says what this Mac's peers make of its clock ([`Tabled::clock`]), which peers it reads as
@@ -57,11 +87,12 @@
 //!   its clock runs behind, so it never takes an account the skewed Mac may be using and cannot
 //!   show.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aterm_json::{Map, Value};
 
 use super::accounts::{self, Cli, Roster};
+use super::alab_roster::Lab;
 use crate::ai::connector::Region;
 
 #[path = "claims_activity.rs"]
@@ -74,7 +105,7 @@ pub const HORIZON_S: i64 = 24 * 60 * 60;
 /// A Mac writes its row again when its `until` is less than this far ahead.
 pub const RENEW_WITHIN_S: i64 = 12 * 60 * 60;
 
-/// A claim lapses on a Mac whose Commons last heard the claim's Mac longer ago than this.
+/// A claim lapses on a Mac whose Commons has listened this long without hearing the claim's Mac.
 pub const PRESENCE_TTL_S: i64 = 20 * 60;
 
 /// A presence reading older than this says nothing: the observer stopped looking.
@@ -97,8 +128,12 @@ pub const CLAIMED_CLIS: [Cli; 2] = [Cli::Claude, Cli::Codex];
 /// Canonical byte budget shared with the signed claims-table protocol.
 pub const MAX_CLAIM_BYTES: usize = 60 * 1024;
 
-/// The schema version a row carries.
-const ROW_VERSION: u64 = 1;
+/// The schema version of a row whose Mac ranks claims first-come ([`Row::ranks_homes`] false).
+const FIRST_COME_VERSION: u64 = 1;
+
+/// The schema version of a row whose Mac ranks a home's claim before a borrower's
+/// ([`Row::ranks_homes`]).
+const HOMES_FIRST_VERSION: u64 = 2;
 
 /// Canonical `(provider_realm, email_lower)` identifier for a pooled account a claim names.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -157,10 +192,11 @@ fn canonical_pool_realm(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// What a claim is.
+/// What a claim is. A reader takes it from the lab's homes ([`View::kind`]); the word a row
+/// carries is its writer's, read by no ranking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
-    /// The account's home Mac (`warm[0]` in `ai-pool.toml`) uses it.
+    /// One of the account's homes uses it: a Mac the lab registry says prefers it ([`Homes`]).
     Home,
     /// Any other Mac uses it.
     Lease,
@@ -213,6 +249,10 @@ pub struct Row {
     pub until: i64,
     /// The claims, one per account, in account order.
     pub claims: Vec<Claim>,
+    /// Whether its Mac ranks a home's claim before a borrower's (a row of version 2, written by a
+    /// Mac that reads the lab's homes): while a home's row with an unlapsed claim on an account
+    /// does not, a borrower ranks that account first-come ([`Book::homes_first`]).
+    pub ranks_homes: bool,
 }
 
 impl Row {
@@ -235,7 +275,14 @@ impl Row {
             })
             .collect();
         let mut body = Map::new();
-        body.insert("v".to_owned(), Value::from(ROW_VERSION));
+        body.insert(
+            "v".to_owned(),
+            Value::from(if self.ranks_homes {
+                HOMES_FIRST_VERSION
+            } else {
+                FIRST_COME_VERSION
+            }),
+        );
         body.insert("label".to_owned(), Value::from(self.label.as_str()));
         body.insert("counter".to_owned(), Value::from(self.counter));
         body.insert("until".to_owned(), Value::from(self.until));
@@ -244,7 +291,8 @@ impl Row {
     }
 
     /// Read a row `machine` signed. A claim this build cannot read (an unknown kind or realm, a
-    /// bad email) is left out; the rest of the row still counts.
+    /// bad email) is left out; the rest of the row still counts. A row of version 2 or later
+    /// ranks homes first; one of no version or an earlier one ranks first-come.
     ///
     /// # Errors
     /// The body is not a row: not an object, no counter or `until`, or no claim list.
@@ -274,6 +322,10 @@ impl Row {
             .unwrap_or("")
             .trim_ascii()
             .to_owned();
+        let ranks_homes = object
+            .get("v")
+            .and_then(Value::as_u64)
+            .is_some_and(|v| v >= HOMES_FIRST_VERSION);
         let list = object
             .get("claims")
             .and_then(Value::as_array)
@@ -303,6 +355,7 @@ impl Row {
             counter,
             until,
             claims,
+            ranks_homes,
         })
     }
 
@@ -313,22 +366,105 @@ impl Row {
     }
 }
 
-/// When this Mac's Commons last heard each peer, as its Network State observed it.
+/// When this Mac's Commons last heard each peer, and since when it has listened for them, as its
+/// Network State observed it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Presence {
     /// When the observation was made (Unix seconds).
     pub at: i64,
+    /// Since when this Mac's Commons has listened for its peers without a break (Unix seconds):
+    /// a peer last heard before then has gone unheard only since then.
+    pub listening_since: i64,
     /// Each peer's machine (lowercase hex) and when it was last heard (Unix seconds).
     pub heard: BTreeMap<String, i64>,
 }
 
-/// Who reads the rows: this Mac's machine and what its Commons hears.
+/// Each account's homes as the lab registry names them (the owner's ruling of 2026-11-11,
+/// "Accounts on their own machine"): the Macs that prefer the account, each by the Commons
+/// machine (lowercase hex) whose live facts row binds it. A pool account has a home for each Mac
+/// that prefers it. A Mac whose facts row binds no live machine is no account's home, a Mac that
+/// runs an account it does not prefer (a place row's fill or borrow) is none either, and an
+/// address two accounts answer to names no home.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Homes(BTreeMap<LeaseKey, BTreeSet<String>>);
+
+impl Homes {
+    /// The homes `lab` names: each account's login address and its provider identity, each keyed
+    /// as a claim keys it ([`LeaseKey::for_cli`]), to the Commons machines bound to the Macs that
+    /// prefer it ([`Lab::bound`], `LabAccount::preferred`).
+    #[must_use]
+    pub fn of(lab: &Lab) -> Self {
+        let mut named: BTreeMap<LeaseKey, (&str, BTreeSet<String>)> = BTreeMap::new();
+        let mut shared: BTreeSet<LeaseKey> = BTreeSet::new();
+        for account in &lab.accounts {
+            let homes: BTreeSet<String> = lab
+                .bound
+                .iter()
+                .filter(|(_, machine)| account.preferred_on(machine).is_some())
+                .map(|(commons, _)| commons.clone())
+                .collect();
+            let addresses =
+                std::iter::once(account.email.as_str()).chain(account.identity.as_deref());
+            for address in addresses {
+                let Ok(key) = LeaseKey::for_cli(account.cli, account.vendor.region, address) else {
+                    continue;
+                };
+                match named.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert((account.pk.as_str(), homes.clone()));
+                    }
+                    std::collections::btree_map::Entry::Occupied(slot) => {
+                        if slot.get().0 != account.pk {
+                            shared.insert(slot.key().clone());
+                        }
+                    }
+                }
+            }
+        }
+        Self(
+            named
+                .into_iter()
+                .filter(|(key, (_, homes))| !homes.is_empty() && !shared.contains(key))
+                .map(|(key, (_, homes))| (key, homes))
+                .collect(),
+        )
+    }
+
+    /// The homes `pairs` names: each an account's key and a Commons machine that is its home.
+    #[must_use]
+    pub fn of_machines(pairs: impl IntoIterator<Item = (LeaseKey, String)>) -> Self {
+        let mut homes: BTreeMap<LeaseKey, BTreeSet<String>> = BTreeMap::new();
+        for (key, machine) in pairs {
+            homes.entry(key).or_default().insert(machine);
+        }
+        Self(homes)
+    }
+
+    /// Whether `machine` (a Commons machine, lowercase hex) is a home of `key`'s account.
+    #[must_use]
+    pub fn home(&self, key: &LeaseKey, machine: &str) -> bool {
+        self.0.get(key).is_some_and(|homes| homes.contains(machine))
+    }
+
+    /// Whether the lab names a home of `key`'s account.
+    #[must_use]
+    pub fn homed(&self, key: &LeaseKey) -> bool {
+        self.0.get(key).is_some_and(|homes| !homes.is_empty())
+    }
+}
+
+/// Who reads the rows: this Mac's machine, what its Commons hears and whose accounts its lab
+/// says each Mac's are.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct View {
     /// This Mac's Commons machine (lowercase hex).
     pub me: String,
     /// What this Mac's Commons hears, where it observes its peers.
     pub presence: Option<Presence>,
+    /// Each account's homes, where this Mac reads the lab registry ([`Homes::of`]); `None` where
+    /// it reads none, and then it ranks every claim as a lease, first-come, and takes a claim's
+    /// own word for its life alone ([`Self::home_use`]).
+    pub homes: Option<Homes>,
     /// The home accounts of the peers this Mac holds for ([`Tabled::held`]), each held on its home
     /// Mac's behalf until the hold's `until` ([`holds`], F22): the earliest claim there is, so it
     /// is senior to every other.
@@ -351,25 +487,57 @@ pub struct Skew {
 }
 
 impl View {
-    /// True where this Mac has current evidence that it has not heard `machine` for longer than
-    /// [`PRESENCE_TTL_S`]. No observation, a stale or future one, or a machine it never heard, is no such
-    /// evidence.
+    /// What `machine`'s claim on `key` is as this Mac reads the lab: [`Kind::Home`] where the lab
+    /// names `machine` a home of the account ([`Self::homes`]), else [`Kind::Lease`], whatever
+    /// the claim's row says.
+    #[must_use]
+    pub fn kind(&self, machine: &str, key: &LeaseKey) -> Kind {
+        if self
+            .homes
+            .as_ref()
+            .is_some_and(|homes| homes.home(key, machine))
+        {
+            Kind::Home
+        } else {
+            Kind::Lease
+        }
+    }
+
+    /// Whether `machine`'s `claim` is a home's use, which no silence of its Mac lapses
+    /// ([`Self::live`]): where this Mac reads the lab, whether the lab names `machine` a home of
+    /// the account ([`Self::kind`]), whatever the row says; where it reads none (a registry not
+    /// read yet, or turned off), the row's own word, as before homes ranked first.
+    #[must_use]
+    pub fn home_use(&self, machine: &str, claim: &Claim) -> bool {
+        match &self.homes {
+            Some(homes) => homes.home(&claim.key, machine),
+            None => claim.kind == Kind::Home,
+        }
+    }
+
+    /// True where this Mac has current evidence that it has listened for longer than
+    /// [`PRESENCE_TTL_S`] without hearing `machine`: that long since it last heard it, and since
+    /// it began listening ([`Presence::listening_since`]). No observation, a stale or future one,
+    /// or a machine it never heard, is no such evidence.
     #[must_use]
     pub fn unheard(&self, machine: &str, now: i64) -> bool {
         machine != self.me
             && self.presence.as_ref().is_some_and(|presence| {
                 (0..=PRESENCE_CURRENT_S).contains(&now.saturating_sub(presence.at))
-                    && presence
-                        .heard
-                        .get(machine)
-                        .is_some_and(|last| presence.at.saturating_sub(*last) > PRESENCE_TTL_S)
+                    && presence.heard.get(machine).is_some_and(|last| {
+                        presence
+                            .at
+                            .saturating_sub((*last).max(presence.listening_since))
+                            > PRESENCE_TTL_S
+                    })
             })
     }
 
     /// True while `row`'s `claim` is live to this Mac at `now`: its row has not lapsed on this
     /// Mac's clock (for a peer this Mac holds for, while that hold lasts, its `until` moved
     /// later by as far as this clock runs ahead of the peer's, [`Self::skewed`]), and, for a
-    /// lease, its Mac is not [`unheard`](Self::unheard). A peer whose clock runs ahead, or a
+    /// claim that is no home's use ([`Self::home_use`]), its Mac is not
+    /// [`unheard`](Self::unheard). A peer whose clock runs ahead, or a
     /// skew of minutes, moves it no later than the reading shows: a lease the peer left at its
     /// turn end but could not release (its clock read Off) lapses as it would have.
     #[must_use]
@@ -380,7 +548,7 @@ impl View {
             .filter(|skew| skew.until > now)
             .map_or(0, |skew| skew.ahead_s.max(0));
         row.until.saturating_add(late) > now
-            && (claim.kind == Kind::Home || !self.unheard(&row.machine, now))
+            && (self.home_use(&row.machine, claim) || !self.unheard(&row.machine, now))
     }
 }
 
@@ -391,7 +559,7 @@ pub struct Holder {
     pub machine: String,
     /// Its label as its row names it.
     pub label: String,
-    /// Its claim's kind.
+    /// Its claim's kind, as the reader's lab names it ([`View::kind`]).
     pub kind: Kind,
     /// When its claim began.
     pub since: i64,
@@ -399,15 +567,32 @@ pub struct Holder {
     pub until: i64,
 }
 
-/// Whichever of two live claims on one account is senior: the earlier `since`, then the lower
-/// label, then the lower machine (`DESIGN-alab-swarm` §6.4), so every Mac picks the same one.
+/// Where `held` ranks among live claims on one account, the senior lowest: where `homes_first`,
+/// a home's claim before a borrower's ([`Kind`]); then the earlier `since`, the lower label and
+/// the lower machine (`DESIGN-alab-swarm` §6.4).
+fn rank(held: &Holder, homes_first: bool) -> (bool, i64, &str, &str) {
+    (
+        homes_first && held.kind == Kind::Lease,
+        held.since,
+        &held.label,
+        &held.machine,
+    )
+}
+
+/// Whichever of two live claims on one account is senior ([`rank`]), so every Mac that ranks
+/// them alike picks the same one.
 #[must_use]
-pub fn senior_lease<'a>(a: &'a Holder, b: &'a Holder) -> &'a Holder {
-    if (a.since, &a.label, &a.machine) <= (b.since, &b.label, &b.machine) {
+pub fn senior_claim<'a>(a: &'a Holder, b: &'a Holder, homes_first: bool) -> &'a Holder {
+    if rank(a, homes_first) <= rank(b, homes_first) {
         a
     } else {
         b
     }
+}
+
+/// The senior of `holders`, live claims on one account ([`senior_claim`]).
+fn senior_of(holders: impl Iterator<Item = Holder>, homes_first: bool) -> Option<Holder> {
+    holders.reduce(|held, holder| senior_claim(&held, &holder, homes_first).clone())
 }
 
 /// Every Mac's row as this Mac holds them: the union of what it wrote and what it heard.
@@ -469,7 +654,7 @@ impl Book {
             Some(Holder {
                 machine: row.machine.clone(),
                 label: row.label.clone(),
-                kind: claim.kind,
+                kind: view.kind(&row.machine, key),
                 since: claim.since,
                 until: row.until,
             })
@@ -482,8 +667,40 @@ impl Book {
         rows.chain(held)
     }
 
-    /// The senior live claim on `key` as `view` sees it at `now`: the earliest `since`, then the
-    /// lower label, then the lower machine ([`senior_lease`]). A hold for a skewed peer
+    /// Whether the live claims on `key` rank a home's before a borrower's as `view` reads them at
+    /// `now` ([`senior_claim`]). Always where `view` reads this Mac a home of the account: a
+    /// borrower's claim never refuses a home its account, whatever that borrower's row says, and
+    /// among homes the earlier claim ranks senior either way. Elsewhere, where every row with an
+    /// unlapsed claim on it that `view`'s lab names a home's ranks homes first
+    /// ([`Row::ranks_homes`]); while one does not, first-come, as that home ranks, so a borrower
+    /// never yields to a home that yields to it. Borrowers' rows decide nothing here: a home
+    /// keeps its account against them whatever they say. Each row is read whole, by its own
+    /// `until`, whatever this Mac hears of its Mac or holds for it, so every reader that holds the
+    /// rows decides alike.
+    #[must_use]
+    pub fn homes_first(&self, key: &LeaseKey, view: &View, now: i64) -> bool {
+        view.kind(&view.me, key) == Kind::Home
+            || self.rows.values().all(|row| {
+                row.ranks_homes
+                    || row.until <= now
+                    || row.claim(key).is_none()
+                    || view.kind(&row.machine, key) == Kind::Lease
+            })
+    }
+
+    /// Every live claim on `key` as `view` sees it at `now`, as [`Self::senior`] ranks them: the
+    /// senior first.
+    #[must_use]
+    pub fn ranked(&self, key: &LeaseKey, view: &View, now: i64) -> Vec<Holder> {
+        let homes_first = self.homes_first(key, view, now);
+        let mut holders: Vec<Holder> = self.live_claims(key, view, now).collect();
+        holders.sort_by(|a, b| rank(a, homes_first).cmp(&rank(b, homes_first)));
+        holders
+    }
+
+    /// The senior live claim on `key` as `view` sees it at `now` ([`senior_claim`]): a home's
+    /// before a borrower's where they rank so ([`Self::homes_first`]), else first-come; then the
+    /// earliest `since`, the lower label and the lower machine. A hold for a skewed peer
     /// ([`View::held`]) is the earliest of all.
     #[must_use]
     #[cfg_attr(
@@ -495,8 +712,55 @@ impl Book {
         )
     )]
     pub fn senior(&self, key: &LeaseKey, view: &View, now: i64) -> Option<Holder> {
-        self.live_claims(key, view, now)
-            .reduce(|held, holder| senior_lease(&held, &holder).clone())
+        senior_of(
+            self.live_claims(key, view, now),
+            self.homes_first(key, view, now),
+        )
+    }
+
+    /// The senior of the live claims on `key` that `view`'s lab names a home's, as `view` sees
+    /// them at `now` ([`senior_claim`]): the claim a borrower that claims nothing yields to
+    /// ([`Scope::Homes`]).
+    fn home_senior(&self, key: &LeaseKey, view: &View, now: i64) -> Option<Holder> {
+        senior_of(
+            self.live_claims(key, view, now)
+                .filter(|held| held.kind == Kind::Home),
+            true,
+        )
+    }
+
+    /// [`Self::senior`] with `also` (a claim this Mac would make, [`Mine::home_claim`]) among the
+    /// live claims, where its Mac holds no live claim on `key` already.
+    #[must_use]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountClaimRank",
+            action = "HClaim",
+            project = "aterm_agent::harness::claims::tests::claim_rank_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountClaimRank",
+            action = "BClaim",
+            project = "aterm_agent::harness::claims::tests::claim_rank_transition"
+        )
+    )]
+    pub fn senior_with(
+        &self,
+        key: &LeaseKey,
+        view: &View,
+        now: i64,
+        also: Option<Holder>,
+    ) -> Option<Holder> {
+        let live: Vec<Holder> = self.live_claims(key, view, now).collect();
+        let also = also.filter(|also| !live.iter().any(|held| held.machine == also.machine));
+        senior_of(
+            live.into_iter().chain(also),
+            self.homes_first(key, view, now),
+        )
     }
 }
 
@@ -507,12 +771,31 @@ pub struct Mine {
     pub machine: String,
     /// Its label, or empty.
     pub label: String,
+    /// Whether it ranks homes first: it reads the lab's homes ([`View::homes`]). Its rows say so
+    /// ([`Row::ranks_homes`]).
+    pub ranks_homes: bool,
+}
+
+impl Mine {
+    /// The claim this Mac would make on `key` at `since` where `view` reads it a home of the
+    /// account: one that outranks a borrower's earlier claim. `None` for a Mac that is no home,
+    /// whose claim made then would be the latest of all.
+    #[must_use]
+    pub fn home_claim(&self, view: &View, key: &LeaseKey, since: i64) -> Option<Holder> {
+        (view.kind(&self.machine, key) == Kind::Home).then(|| Holder {
+            machine: self.machine.clone(),
+            label: self.label.clone(),
+            kind: Kind::Home,
+            since,
+            until: since.saturating_add(HORIZON_S),
+        })
+    }
 }
 
 /// The row this Mac writes to claim `key` as `kind` at `now`, keeping each other claim `keep`
-/// passes, or `None` where its row already holds just that and is not due again
-/// ([`RENEW_WITHIN_S`]), or exceeds [`MAX_CLAIM_BYTES`], when its live row does not
-/// hold `key`. A claim the row already holds keeps its `since`; a lapsed row starts every claim
+/// passes, or `None` where its row already holds just that, ranks as this Mac now does
+/// ([`Mine::ranks_homes`]) and is not due again ([`RENEW_WITHIN_S`]), or exceeds
+/// [`MAX_CLAIM_BYTES`], when its live row does not hold `key`. A claim the row already holds keeps its `since`; a lapsed row starts every claim
 /// afresh. A row at counter 0 is one this Mac has not written under its current seat (the
 /// newest row an earlier writer seat of its Commons home signed, as the table read carries it):
 /// it is always written, at counter 1, so the claims it keeps go on with their `since` under the
@@ -552,6 +835,7 @@ pub fn claimed(
         && row.claims == claims
         && row.until.saturating_sub(now) >= RENEW_WITHIN_S
         && row.label == me.label
+        && row.ranks_homes == me.ranks_homes
     {
         return None;
     }
@@ -561,6 +845,7 @@ pub fn claimed(
         counter: current.map_or(1, |row| row.counter.saturating_add(1)),
         until: now.saturating_add(HORIZON_S),
         claims,
+        ranks_homes: me.ranks_homes,
     };
     row.within_budget().then_some(row)
 }
@@ -631,6 +916,22 @@ const fn realms(cli: Cli) -> &'static [&'static str] {
 /// [`SESSION_FRESH_S`]. This store records no use of a claim in another CLI's realm, so that one
 /// lasts [`IDLE_S`] from its `since`. Preparation-only rows supply no execution evidence.
 #[must_use]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountClaimRank",
+        action = "HIdle",
+        project = "aterm_agent::harness::claims::tests::claim_rank_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountClaimRank",
+        action = "BIdle",
+        project = "aterm_agent::harness::claims::tests::claim_rank_transition"
+    )
+)]
 pub fn in_use(
     cli: Cli,
     state: &accounts::State,
@@ -672,7 +973,20 @@ pub fn keys(cli: Cli, roster: &Roster) -> Vec<(String, LeaseKey)> {
 
 /// Record in `state` who holds each of `keys` as `book` reads to `view` at `now`: another Mac's
 /// senior live claim makes the row `LeasedElsewhere` until its row lapses; this Mac's own senior
-/// claim is held here; an account nobody claims holds nothing.
+/// claim is held here; an account nobody claims holds nothing. Where `view` reads this Mac a home
+/// of the account, it ranks home first ([`Book::homes_first`]), and where it holds no claim on
+/// the account, the claim it would make now counts ([`Mine::home_claim`]): a borrower's claim,
+/// whatever its row says, bars nothing here, so the home launches on its account and claims it,
+/// and the borrower yields at its next turn end. Only another home's senior claim holds the
+/// account against it.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountClaimRank",
+        action = "BTurn",
+        project = "aterm_agent::harness::claims::tests::claim_rank_transition"
+    )
+)]
 pub fn settle(
     state: &mut accounts::State,
     keys: &[(String, LeaseKey)],
@@ -684,21 +998,54 @@ pub fn settle(
         .swarm_label
         .clone()
         .unwrap_or_else(|| state.machine.clone());
+    let me = Mine {
+        machine: view.me.clone(),
+        label: state.swarm_label.clone().unwrap_or_default(),
+        ranks_homes: view.homes.is_some(),
+    };
     for (label, key) in keys {
-        match book.senior(key, view, now) {
-            Some(holder) if holder.machine == view.me => {
+        let holds = book
+            .live_claims(key, view, now)
+            .any(|held| held.machine == view.me);
+        match book.senior_with(key, view, now, me.home_claim(view, key, now)) {
+            Some(holder) if holder.machine == view.me && holds => {
                 state.note_lease(label, &mine, holder.until, holder.since);
             }
-            Some(holder) => {
-                // Another Mac's label can be this Mac's own while a label clash settles (§3.2):
-                // its claim is still another Mac's.
-                let named = if holder.label.is_empty() || state.owns_swarm_label(&holder.label) {
-                    format!("claim:{}", holder.machine)
-                } else {
-                    holder.label
-                };
-                state.note_lease(label, &named, holder.until, holder.since);
-            }
+            // A home's claim not made yet: nothing holds the account against it.
+            Some(holder) if holder.machine == view.me => state.clear_lease(label),
+            Some(holder) => note_elsewhere(state, label, holder),
+            None => state.clear_lease(label),
+        }
+    }
+}
+
+/// Record in `state` that another Mac's `holder` holds `label`'s account.
+fn note_elsewhere(state: &mut accounts::State, label: &str, holder: Holder) {
+    // Another Mac's label can be this Mac's own while a label clash settles (§3.2): its claim is
+    // still another Mac's.
+    let named = if holder.label.is_empty() || state.owns_swarm_label(&holder.label) {
+        format!("claim:{}", holder.machine)
+    } else {
+        holder.label
+    };
+    state.note_lease(label, &named, holder.until, holder.since);
+}
+
+/// Record in `state` who holds each of `borrowed` (accounts `view`'s lab names another Mac a home
+/// of, which this Mac never claims, [`Scope::Homes`]) as `book` reads to `view` at `now`: the
+/// senior live claim a home of the account makes holds it, until its row lapses, and a borrower's
+/// holds nothing here. So this Mac yields such an account to its home at its next turn end, as a
+/// borrower with a pool file does, and is refused nothing for a claim it does not make.
+fn settle_borrowed(
+    state: &mut accounts::State,
+    borrowed: &[(String, LeaseKey)],
+    book: &Book,
+    view: &View,
+    now: i64,
+) {
+    for (label, key) in borrowed {
+        match book.home_senior(key, view, now) {
+            Some(holder) => note_elsewhere(state, label, holder),
             None => state.clear_lease(label),
         }
     }
@@ -735,6 +1082,38 @@ pub fn settle(
 )]
 #[doc(hidden)]
 pub fn account_claim_clock_environment() {}
+
+/// A home's session ending (`HStop`), a borrower wording its claim `home` (`Lie`) and a borrower's
+/// row coming to rank first-come or homes first (`Old`): none is code here.
+/// `account_claim_rank_conforms` sets each the way the model does and binds what the code makes of
+/// it.
+#[cfg(any(test, debug_assertions))]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountClaimRank",
+        action = "HStop",
+        reason = "A session on the home Mac ends when its program does: account_claim_rank_conforms builds the home with no session noted on the account."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountClaimRank",
+        action = "Lie",
+        reason = "What a borrower's row says of its claim's kind is that writer's word: account_claim_rank_conforms rewrites the borrower's row to say home in every replica."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountClaimRank",
+        action = "Old",
+        reason = "Whether a borrower's row ranks first-come is its build's and its lab's: account_claim_rank_conforms runs the borrower with no lab, so it writes and ranks as a build from before homes ranked first."
+    )
+)]
+#[doc(hidden)]
+pub fn account_claim_rank_environment() {}
 
 /// How long a clock record a read takes lasts in the accounts store ([`accounts::Clock::until`]):
 /// as long as the reading behind it stays fresh (`aterm_db::clock::FRESH_MS`).
@@ -917,6 +1296,9 @@ pub struct Tabled {
     /// (F22): every peer [`Self::skewed`] names, and every peer an Off Mac counted against itself
     /// (`aterm_db::clock::Judgement::held`).
     pub held: Vec<SkewedPeer>,
+    /// Each account's homes as this Mac's lab registry names them ([`Homes::of`]); `None` where
+    /// this process holds no lab ([`View::homes`]).
+    pub homes: Option<Homes>,
 }
 
 /// What this Mac's peers say of its clock, as a [`Table`] read gives it (F22).
@@ -979,7 +1361,8 @@ pub enum Act<'a> {
 /// What a [`touch`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Touched {
-    /// Claims do not apply here: no `ai-pool.toml`, no table, or the row has no account.
+    /// Claims do not apply here: no table, the row has no account, or no `ai-pool.toml` and the
+    /// row is no home of this Mac's, or is but its claim could not be recorded ([`Scope::Homes`]).
     NotApplicable,
     /// The rows were read and recorded.
     Looked,
@@ -1002,8 +1385,9 @@ pub enum Touched {
 }
 
 /// [`touch`] against `table` under `home` with `presence`, on `state` (`cli`'s store's, inside
-/// its transaction), for the accounts `keys` names. This single-store primitive does not open
-/// the per-home activity ledger; runtime callers use [`touch`], which combines all stores' use.
+/// its transaction), for the accounts `keys` names, as a Mac with a pool file claims them
+/// ([`Scope::Every`]). This single-store primitive does not open the per-home activity ledger;
+/// runtime callers use [`touch`], which combines all stores' use.
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, its home, presence, the store's state, its CLI and keys, the act and now"
@@ -1020,6 +1404,7 @@ pub fn touch_with(
 ) -> Touched {
     touch_using(
         table,
+        Scope::Every,
         home,
         presence,
         state,
@@ -1052,6 +1437,7 @@ pub(crate) fn touch_homes(
     let home = std::path::Path::new("/nonexistent/home");
     touch_using(
         table,
+        Scope::Every,
         home,
         presence,
         state,
@@ -1118,6 +1504,7 @@ pub(crate) fn touch_homes(
 )]
 fn touch_using(
     table: &dyn Table,
+    scope: Scope,
     home: &std::path::Path,
     presence: Option<Presence>,
     state: &mut accounts::State,
@@ -1128,14 +1515,18 @@ fn touch_using(
     now: i64,
     activity: Result<Option<&mut activity::Held>, String>,
 ) -> Touched {
+    // Under `Scope::Homes` the store keeps no mark that refuses a launch: a Mac with no pool file
+    // had none before it claimed its homes, and its other accounts must not gain one.
+    let every = scope == Scope::Every;
     let mut read = match table.read(home) {
         Ok(read) => read,
         Err(why) => {
-            state.unrecorded = true;
+            state.unrecorded |= every;
             return match act {
                 Act::Claim(label) if state.execution_verdict(label).is_err() => {
                     Touched::PreparationOnly
                 }
+                _ if !every => Touched::NotApplicable,
                 _ => Touched::Unrecorded(why),
             };
         }
@@ -1143,26 +1534,29 @@ fn touch_using(
     // What this Mac's peers say of its clock lasts in the store as long as the reading behind it
     // (F22), naming the peers it reads as skewed, and the peers it holds for have their home
     // accounts held for them.
-    state.clock = read.clock.as_ref().map(|clock| accounts::Clock {
-        standing: clock.standing,
-        by_s: clock.by_s,
-        against: clock.against,
-        of: clock.of,
-        peers: read
-            .skewed
-            .iter()
-            .map(|peer| {
-                peer.labels
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| format!("claim:{}", peer.machine))
-            })
-            .collect(),
-        until: now.saturating_add(CLOCK_HOLD_S),
-    });
+    if every {
+        state.clock = read.clock.as_ref().map(|clock| accounts::Clock {
+            standing: clock.standing,
+            by_s: clock.by_s,
+            against: clock.against,
+            of: clock.of,
+            peers: read
+                .skewed
+                .iter()
+                .map(|peer| {
+                    peer.labels
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| format!("claim:{}", peer.machine))
+                })
+                .collect(),
+            until: now.saturating_add(CLOCK_HOLD_S),
+        });
+    }
     let view = View {
         me: read.me.clone(),
         presence,
+        homes: read.homes.clone(),
         held: holds(&read.held, homes),
         skewed: read
             .held
@@ -1173,7 +1567,25 @@ fn touch_using(
     let mine = Mine {
         machine: read.me.clone(),
         label: state.swarm_label.clone().unwrap_or_default(),
+        ranks_homes: view.homes.is_some(),
     };
+    // The accounts this touch claims, releases and settles: under `Scope::Homes`, those the
+    // table's homes name this Mac's. Under `Scope::Homes` it also settles, against their homes'
+    // claims alone, the accounts they name another Mac's (`borrowed`), and claims none of them.
+    let (keys, borrowed): (std::borrow::Cow<'_, [(String, LeaseKey)]>, Vec<_>) = if every {
+        (std::borrow::Cow::Borrowed(keys), Vec::new())
+    } else {
+        let (own, others): (Vec<_>, Vec<_>) = keys
+            .iter()
+            .cloned()
+            .partition(|(_, key)| view.kind(&view.me, key) == Kind::Home);
+        let borrowed = others
+            .into_iter()
+            .filter(|(_, key)| view.homes.as_ref().is_some_and(|homes| homes.homed(key)))
+            .collect();
+        (std::borrow::Cow::Owned(own), borrowed)
+    };
+    let keys = keys.as_ref();
     let key_of = |label: &str| {
         keys.iter()
             .find(|(row, _)| row == label)
@@ -1228,27 +1640,48 @@ fn touch_using(
         }
         // While its peers read its clock as off, this Mac writes no row (its home claims are
         // recorded as activity, and its peers hold its home rows for it); while they are split
-        // over it, it claims its home accounts only.
+        // over it, it claims its home accounts only. Under `Scope::Homes` every account it claims
+        // is a home of its.
         Act::Claim(label)
-            if clock_refusal(&read, state.home_accounts.contains(label)).is_some() =>
+            if clock_refusal(&read, !every || state.home_accounts.contains(label)).is_some() =>
         {
             (
                 Touched::Unrecorded(
-                    clock_refusal(&read, state.home_accounts.contains(label)).unwrap_or_default(),
+                    clock_refusal(&read, !every || state.home_accounts.contains(label))
+                        .unwrap_or_default(),
                 ),
                 None,
             )
         }
         Act::Claim(label) => match key_of(label) {
-            None => (Touched::NotApplicable, None),
+            // An account another Mac is the home of: this Mac never claims it, and only that
+            // home's live claim holds it.
+            None => match borrowed
+                .iter()
+                .find(|(row, _)| row == label)
+                .and_then(|(_, key)| read.book.home_senior(key, &view, observed_now))
+            {
+                Some(holder) => (Touched::HeldElsewhere(holder), None),
+                None => (Touched::NotApplicable, None),
+            },
             Some(key) => {
-                let kind = if state.home_accounts.contains(label) {
+                // The row words its claim as this Mac's lab names it; without a lab, as its pool
+                // file does, for the readers that take the row's word ([`View::home_use`]).
+                let kind = if view.homes.is_some() {
+                    view.kind(&view.me, &key)
+                } else if state.home_accounts.contains(label) {
                     Kind::Home
                 } else {
                     Kind::Lease
                 };
-                // A local clock floor never expires a peer's lease ahead of caller time.
-                match read.book.senior(&key, &view, observed_now) {
+                // A local clock floor never expires a peer's lease ahead of caller time. A home's
+                // claim, made now, outranks a borrower's lease, so that lease refuses it nothing.
+                match read.book.senior_with(
+                    &key,
+                    &view,
+                    observed_now,
+                    mine.home_claim(&view, &key, now),
+                ) {
                     Some(holder) if holder.machine != view.me => {
                         (Touched::HeldElsewhere(holder), None)
                     }
@@ -1333,6 +1766,18 @@ fn touch_using(
         .retain(|_, at| now.saturating_sub(*at) < IDLE_S);
     // Local write failures must not hide a readable senior peer from turn-end advice.
     settle(state, keys, &read.book, &view, observed_now);
+    if !every {
+        settle_borrowed(state, &borrowed, &read.book, &view, observed_now);
+        // Every other account it refuses nothing: a lease it settled while the lab named the
+        // account a home of its, or another Mac's, goes with that naming.
+        state
+            .leases
+            .retain(|label, _| keys.iter().chain(&borrowed).any(|(row, _)| row == label));
+        return match outcome {
+            Touched::Unrecorded(_) => Touched::NotApplicable,
+            outcome => outcome,
+        };
+    }
     state.unrecorded =
         refused.is_some() || read.writable.is_err() || matches!(outcome, Touched::Unrecorded(_));
     outcome
@@ -1420,6 +1865,7 @@ pub fn read_book(home: &std::path::Path) -> Result<Option<(View, Book)>, String>
     let view = View {
         me: read.me,
         presence: presence_now(),
+        homes: read.homes,
         skewed: read
             .held
             .iter()
@@ -1434,8 +1880,9 @@ pub fn read_book(home: &std::path::Path) -> Result<Option<(View, Book)>, String>
 /// store who holds each row's account; either gives up claims whose combined activity across
 /// this home's stores expired. Positive activity is saved before the claim row, under a private
 /// per-home lock. Roster and binding reads share the account state writer lock. Unreadable
-/// records or activity refuse publication. Claims apply to [`CLAIMED_CLIS`] where `ai-pool.toml`
-/// is present and this process has a table ([`install`]).
+/// records or activity refuse publication. Claims apply to [`CLAIMED_CLIS`] where this process
+/// has a table ([`install`]): to every account where `ai-pool.toml` is present, else to the
+/// accounts the lab names this Mac a home of ([`Scope`]).
 pub fn touch(
     home: &std::path::Path,
     state_dir: &std::path::Path,
@@ -1444,20 +1891,72 @@ pub fn touch(
     act: Act<'_>,
     now: i64,
 ) -> Touched {
-    if !applies(home, cli) {
+    let Some(scope) = scope(home, cli, act) else {
         return Touched::NotApplicable;
-    }
-    on_table(|table| touch_on(table, home, state_dir, roster_path, cli, act, now))
+    };
+    on_table(|table| touch_on(table, scope, home, state_dir, roster_path, cli, act, now))
         .unwrap_or(Touched::NotApplicable)
 }
 
-/// Whether claims apply to `cli` under `home`, where `ai-pool.toml` is present.
-fn applies(home: &std::path::Path, cli: Cli) -> bool {
-    CLAIMED_CLIS.contains(&cli)
-        && home
-            .join(".secrets")
-            .join(super::ai_pool::AI_POOL_FILE)
-            .is_file()
+/// Which of a CLI's accounts this Mac's claims cover ([`touch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Every account its roster names: this Mac's store holds a readable `ai-pool.toml`.
+    Every,
+    /// Only the accounts its lab names a home of ([`View::kind`]), on a Mac whose store holds no
+    /// readable `ai-pool.toml` (the owner's ruling of 2026-11-11, "Accounts on their own machine").
+    /// Those it names this Mac a home of, it claims while it uses them and settles the others' claims on, so a borrower
+    /// elsewhere yields its account to it at that borrower's next turn end. Those it names only
+    /// another Mac a home of, it never claims, and settles against those homes' claims alone, so it
+    /// yields such an account to its home at its next turn end. It claims, releases and settles no
+    /// other account, records nothing that refuses one (no clock standing, no unrecorded mark, no
+    /// lease), and a claim it cannot record answers [`Touched::NotApplicable`], as every touch on a
+    /// Mac with no pool entry did before, so no launch is refused for want of one.
+    Homes,
+}
+
+/// Which accounts claims cover for `cli` under `home` for `act` ([`Scope`]): every account where
+/// this Mac's store holds a readable `ai-pool.toml`; else, where the lab this process holds names a home of one of
+/// `cli`'s accounts ([`homes_named`]), those it names this Mac's or another's. A look, a quiet or
+/// an off runs under [`Scope::Homes`] too where this Mac has kept claim activity
+/// ([`activity::kept`]), whatever its lab names now (the lab turned off, not read yet, or no
+/// longer naming this Mac a home): a row it wrote while it named one is given up as every row
+/// is, never left standing to its `until` a day away. Else none.
+fn scope(home: &std::path::Path, cli: Cli, act: Act<'_>) -> Option<Scope> {
+    if !CLAIMED_CLIS.contains(&cli) {
+        return None;
+    }
+    if crate::vault_entry::read_text(
+        home,
+        super::ai_pool::AI_POOL_FILE,
+        super::ai_pool::MAX_POOL_BYTES,
+    )
+    .text()
+    .is_some()
+    {
+        return Some(Scope::Every);
+    }
+    let named = super::alab_roster::current().is_some_and(|lab| homes_named(&lab, cli));
+    let releases = !matches!(act, Act::Claim(_)) && activity::kept(home);
+    (named || releases).then_some(Scope::Homes)
+}
+
+/// Whether `lab` names a home of one of `cli`'s accounts: a Mac that prefers it, this Mac (the
+/// machine its own facts row binds, [`Lab::me`]) or another its facts rows bind ([`Lab::bound`],
+/// as [`Homes::of`] names them). A cheap test of the lab alone, made before any table is read;
+/// [`touch_using`] then keeps just the keys the table's homes name.
+fn homes_named(lab: &Lab, cli: Cli) -> bool {
+    lab.accounts.iter().any(|account| {
+        account.cli == cli
+            && (lab
+                .me
+                .as_ref()
+                .is_some_and(|me| account.preferred_on(&me.key).is_some())
+                || lab
+                    .bound
+                    .values()
+                    .any(|machine| account.preferred_on(machine).is_some()))
+    })
 }
 
 /// What [`touch_pushing`] did: the touch, and the push where its row went to the peers
@@ -1477,19 +1976,32 @@ pub fn touch_pushing(
     now: i64,
     deadline: std::time::Instant,
 ) -> Pushed {
-    if !applies(home, cli) {
+    let Some(scope) = scope(home, cli, act) else {
         return (Touched::NotApplicable, None);
-    }
-    on_table(|table| push_on(table, home, state_dir, roster_path, cli, act, now, deadline))
-        .unwrap_or((Touched::NotApplicable, None))
+    };
+    on_table(|table| {
+        push_on(
+            table,
+            scope,
+            home,
+            state_dir,
+            roster_path,
+            cli,
+            act,
+            now,
+            deadline,
+        )
+    })
+    .unwrap_or((Touched::NotApplicable, None))
 }
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "the table, then touch_pushing's own arguments"
+    reason = "the table and its scope, then touch_pushing's own arguments"
 )]
 fn push_on(
     table: &dyn Table,
+    scope: Scope,
     home: &std::path::Path,
     state_dir: &std::path::Path,
     roster_path: Option<&std::path::Path>,
@@ -1498,13 +2010,18 @@ fn push_on(
     now: i64,
     deadline: std::time::Instant,
 ) -> Pushed {
-    let touched = touch_on(table, home, state_dir, roster_path, cli, act, now);
+    let touched = touch_on(table, scope, home, state_dir, roster_path, cli, act, now);
     let pushed = (touched == Touched::Quieted).then(|| table.push(home, deadline));
     (touched, pushed)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the table and its scope, then touch's own arguments"
+)]
 fn touch_on(
     table: &dyn Table,
+    scope: Scope,
     home: &std::path::Path,
     state_dir: &std::path::Path,
     roster_path: Option<&std::path::Path>,
@@ -1517,13 +2034,18 @@ fn touch_on(
         || home.join(".config/aterm").join(cli.accounts().roster_file),
         std::path::Path::to_path_buf,
     );
-    touch_reading(table, home, &store, cli, act, now, || {
+    touch_reading(table, scope, home, &store, cli, act, now, || {
         Roster::load_for(cli, &path)
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the table and its scope, touch's home, store, CLI, act and now, and the roster read"
+)]
 fn touch_reading(
     table: &dyn Table,
+    scope: Scope,
     home: &std::path::Path,
     store: &accounts::Store,
     cli: Cli,
@@ -1570,7 +2092,7 @@ fn touch_reading(
             home_keys(&pool_homes(home, cli), &keys)
         };
         outcome = touch_using(
-            table, home, presence, state, cli, &keys, &homes, act, now, activity,
+            table, scope, home, presence, state, cli, &keys, &homes, act, now, activity,
         );
         Ok(Vec::new())
     }) {
@@ -1579,6 +2101,9 @@ fn touch_reading(
             Touched::PreparationOnly | Touched::HeldElsewhere(_)
         ) {
             outcome
+        } else if scope == Scope::Homes {
+            // A Mac with no pool file is refused nothing for want of a claim record.
+            Touched::NotApplicable
         } else {
             Touched::Unrecorded(why)
         };

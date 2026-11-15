@@ -400,7 +400,7 @@ impl AghWorld {
         }
     }
 
-    fn id_of(&self, tag: &str) -> u64 {
+    pub(super) fn id_of(&self, tag: &str) -> u64 {
         self.fake
             .releases_of(self.slug)
             .iter()
@@ -409,7 +409,7 @@ impl AghWorld {
             .unwrap_or_else(|| panic!("no release {tag}"))
     }
 
-    fn releases_path(&self) -> String {
+    pub(super) fn releases_path(&self) -> String {
         format!("/repos/{}/releases", self.slug)
     }
 
@@ -1960,8 +1960,11 @@ fn pre_claim_checks_ask_the_host_under_agh() {
     // The `gh` arm's token check, said outright: the rig is built for agh.
     let rig = Rig::new("write-contract-f2-gh");
     let gh = rig.ctx.clone().with_host_choice(HostChoice::Gh);
-    let e = upload::token_preflight(&gh).expect_err("no token file");
-    assert!(e.to_string().contains("~/.secrets/gh_access_token"), "{e}");
+    let e = upload::token_preflight(&gh).expect_err("no vault entry");
+    assert!(
+        e.to_string().contains("the vault entry gh_access_token"),
+        "{e}"
+    );
     assert!(
         !rig.host.calls().iter().any(|c| c.starts_with("preflight ")),
         "{:?}",

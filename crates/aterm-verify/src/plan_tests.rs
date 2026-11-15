@@ -20,10 +20,64 @@ fn ids(ctx: &Ctx) -> Vec<StageId> {
     plan(ctx).into_iter().map(|s| s.id).collect()
 }
 
+#[test]
+fn linux_vm_wait_keeps_no_lab_compiler_reservation() {
+    let c = ctx(&[Check::Linux], Scope::workspace()).with_memory(crate::memory::Book::at(
+        None,
+        Some(32 << 30),
+        Some(28 << 30),
+    ));
+    let stages = plan(&c);
+    let build = stages
+        .iter()
+        .position(|s| s.id == StageId::LinuxLabBuild)
+        .unwrap();
+    let runtime = stages
+        .iter()
+        .position(|s| s.id == StageId::LinuxLane)
+        .unwrap();
+    assert!(stages[build].mem > 0);
+    assert!(!crate::sched::ready(
+        &stages,
+        &[false, false],
+        &[false, false],
+        0,
+        runtime,
+        32 << 30
+    ));
+    assert!(crate::sched::ready(
+        &stages,
+        &[true, false],
+        &[true, false],
+        0,
+        runtime,
+        32 << 30
+    ));
+    let refuse: crate::Admitter =
+        |_, _| panic!("the VM coordinator must leave admission to the VM");
+    assert!(
+        crate::claim_memory(&c, &stages[runtime], refuse)
+            .unwrap()
+            .is_none()
+    );
+
+    // The old monolithic phase held its compiler peak while waiting for VM headroom.
+    let retained = StageSpec {
+        mem: stages[build].mem,
+        ..stages[runtime].clone()
+    };
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = crate::claim_memory(&c, &retained, refuse);
+        }))
+        .is_err()
+    );
+}
+
 /// The run `verify <words>` plans, built from its parse as the CLI builds it.
 fn parsed(words: &[&str]) -> Ctx {
     let a = crate::cli::parse(words.iter().copied()).expect("parses");
-    let checks = a.wanted(|p| Scope::Workspace.includes_crate(p));
+    let checks = a.checks.clone();
     let app = a
         .app
         .as_ref()
@@ -70,7 +124,7 @@ fn a_release_plans_its_tree_half_and_its_bundle_half_together() {
         ids(&release)
     );
 
-    let short = parsed(&["release", "--checks", "fmt,lint,test,doc,census,forge,libc"]);
+    let short = parsed(&["release", "--checks", "fmt,lint,test,census,forge,libc"]);
     assert_ne!(
         set(&release),
         union(&short),
@@ -292,45 +346,20 @@ fn compile_only_measure_builds_its_matrix_without_a_product_or_timing_admission(
     );
 }
 
-/// A release's red `test` or `doc` row prints a command the CLI takes and that runs the check
-/// as the release did: without `--as-release` it enables no checkers and owes no golden test,
-/// so what failed there would pass. CONTROL: a plain run's and another check's name no flag.
+/// A release's red `test` row prints a command the CLI takes and that runs the check as the
+/// release did: without `--as-release` it enables no checkers and owes no golden test, so what
+/// failed there would pass. CONTROL: a plain run's and another check's name no flag.
 #[test]
 fn a_releases_red_test_row_reruns_as_the_release_ran() {
-    let release = ctx(&[Check::Test, Check::Doc, Check::Lint], Scope::Workspace).with_release(true);
-    for check in [Check::Test, Check::Doc] {
-        let printed = release.rerun(check);
-        assert_eq!(
-            printed,
-            format!(
-                "targo --unverified verify {} --all --as-release",
-                check.name()
-            )
-        );
-        let words = printed
-            .strip_prefix("targo --unverified verify ")
-            .expect("the verb")
-            .split(' ');
-        let parsed = crate::cli::parse(words).expect("the CLI takes what the row prints");
-        assert!(parsed.as_release && parsed.all && parsed.checks == [check]);
-        assert_eq!(
-            parsed.wanted(|p| Scope::Workspace.includes_crate(p)),
-            [check],
-            "no release runs what `test` would pull"
-        );
-    }
-    let without = crate::cli::parse(["test", "--all"]).expect("parses");
-    assert_eq!(
-        without.wanted(|p| Scope::Workspace.includes_crate(p)),
-        [Check::Test, Check::WasmSmoke],
-        "a plain `test --all` still pulls it"
-    );
-    let compiled =
-        crate::cli::parse(["test", "--all", "--compile-only", "--as-release"]).expect("parses");
-    assert_eq!(
-        compiled.wanted(|p| Scope::Workspace.includes_crate(p)),
-        [Check::Test]
-    );
+    let release = ctx(&[Check::Test, Check::Lint], Scope::Workspace).with_release(true);
+    let printed = release.rerun(Check::Test);
+    assert_eq!(printed, "targo --unverified verify test --all --as-release");
+    let words = printed
+        .strip_prefix("targo --unverified verify ")
+        .expect("the verb")
+        .split(' ');
+    let parsed = crate::cli::parse(words).expect("the CLI takes what the row prints");
+    assert!(parsed.as_release && parsed.all && parsed.checks == [Check::Test]);
     assert!(!release.rerun(Check::Lint).contains("--as-release"));
     let plain = ctx(&[Check::Test], Scope::Workspace);
     assert_eq!(
@@ -346,20 +375,17 @@ fn a_releases_red_test_row_reruns_as_the_release_ran() {
     );
 }
 
-/// A cone's red `lint` row reruns the cone by its base, which runs the same passes: `-p` over
-/// its crates would lint every target of each, and the crates the cone's lint left out.
-/// CONTROL: `test` and `doc` take every crate of the cone, so theirs name them; `-p` and the
-/// workspace rerun as they ran.
+/// A cone's red `lint` row reruns the cone by its base, which selects the same cone again.
+/// CONTROL: `test` takes every crate of the cone, so its row names them; `-p` and the workspace
+/// rerun as they ran.
 #[test]
 fn a_cones_red_lint_row_reruns_the_cone_by_its_base() {
     let cone = Scope::changed(
         "origin/main",
         vec!["dev".to_string(), "seed".to_string()],
         true,
-    )
-    .with_all_targets(vec!["seed".to_string()])
-    .with_unlinted(vec!["dev".to_string()]);
-    let plain = ctx(&[Check::Lint, Check::Test, Check::Doc], cone);
+    );
+    let plain = ctx(&[Check::Lint, Check::Test], cone);
     let printed = plain.rerun(Check::Lint);
     assert_eq!(printed, "targo --unverified verify lint --base origin/main");
     let words = printed
@@ -370,12 +396,10 @@ fn a_cones_red_lint_row_reruns_the_cone_by_its_base() {
     assert_eq!(parsed.checks, [Check::Lint]);
     assert_eq!(parsed.base.as_deref(), Some("origin/main"));
     assert!(parsed.packages.is_empty() && !parsed.all && parsed.narrows());
-    for (check, name) in [(Check::Test, "test"), (Check::Doc, "doc")] {
-        assert_eq!(
-            plain.rerun(check),
-            format!("targo --unverified verify {name} -p dev -p seed")
-        );
-    }
+    assert_eq!(
+        plain.rerun(Check::Test),
+        "targo --unverified verify test -p dev -p seed"
+    );
     assert_eq!(
         ctx(&[Check::Lint], Scope::crate_only("seed")).rerun(Check::Lint),
         "targo --unverified verify lint -p seed"
@@ -452,8 +476,8 @@ fn a_run_that_measures_memory_plans_each_stages_claim_from_its_book() {
 
 /// A HEAVY TEST COMPILE IS PLANNED AS BOUNDED CALLS, IN ITS PLACE: the same measured S1 graph
 /// plans a package selection and the workspace as two main-lane stages, each below the live
-/// shaping budget, before the test run. The closing call keeps the run's own selection and
-/// the doctests await both calls. NEGATIVE CONTROLS: a run that measures nothing plans one
+/// shaping budget, before the test run on their lane. The closing call keeps the run's own
+/// selection. NEGATIVE CONTROLS: a run that measures nothing plans one
 /// whole call; restoring the workspace exclusion does too.
 #[test]
 fn a_heavy_test_compile_is_planned_as_its_calls_in_its_place() {
@@ -484,7 +508,7 @@ fn a_heavy_test_compile_is_planned_as_its_calls_in_its_place() {
                 .collect(),
         )
     }
-    let checks = [Check::Test, Check::Doc];
+    let checks = [Check::Test];
     for scope in [
         Scope::packages(&crate::shape::tests::s1()),
         Scope::workspace(),
@@ -529,15 +553,6 @@ fn a_heavy_test_compile_is_planned_as_its_calls_in_its_place() {
         assert!(
             compile_indices.iter().all(|compile| *compile < test),
             "the same-lane test runs serially after every compile call"
-        );
-        let doctests = planned
-            .iter()
-            .position(|s| s.id == StageId::Doctests)
-            .expect("doctest stage");
-        assert_eq!(
-            crate::sched::awaited(&planned, doctests).collect::<Vec<_>>(),
-            compile_indices,
-            "doctests must await every shaped call"
         );
         crate::sched::check_waits(&planned).expect("each awaits only earlier stages");
 
@@ -694,14 +709,14 @@ fn a_named_skip_plans_no_memory() {
 /// An empty change cone (a change to documents alone) plans no memory and no compile for the
 /// stages that run over the selection: each only says the cone holds no crate, so none waits
 /// for a claim it never uses (a changelog's lint row waited nine minutes for 24.5 GiB).
-/// NEGATIVE CONTROL: a cone of one crate plans the cold figure for the doctests and the lint,
-/// and compiles.
+/// NEGATIVE CONTROL: a cone of one crate plans the cold figure for the test compile and the
+/// lint, and compiles.
 #[test]
 fn an_empty_cone_plans_no_memory_for_the_stages_over_its_selection() {
     const GIB: u64 = 1 << 30;
     let run = |crates: Vec<String>| {
         ctx(
-            &[Check::Doc, Check::Lint, Check::Fmt],
+            &[Check::Test, Check::Lint, Check::Fmt],
             Scope::changed("origin/main", crates, true),
         )
         .with_memory(crate::memory::Book::at(
@@ -718,14 +733,14 @@ fn an_empty_cone_plans_no_memory_for_the_stages_over_its_selection() {
         [
             (StageId::Formatting, 0),
             (StageId::Tippy, 0),
-            (StageId::Doctests, 0),
+            (StageId::Test, 0),
         ]
     );
     assert!(!has_compiler_stage(&empty));
     let one = run(vec!["seed".to_string()]);
     let over: Vec<(StageId, u64)> = claims(&one)
         .into_iter()
-        .filter(|(id, _)| id.over_selection())
+        .filter(|(id, _)| id.over_selection() && crate::memory::compiles(*id))
         .collect();
     assert!(
         over.len() == 2 && over.iter().all(|(_, mem)| *mem > 0),
@@ -741,16 +756,12 @@ fn a_selection_plans_exactly_its_checks_stages_and_never_deadlocks() {
         [StageId::Formatting]
     );
     assert_eq!(
-        ids(&ctx(&[Check::Test, Check::Doc], Scope::workspace())),
-        [StageId::TestCompile, StageId::Test, StageId::Doctests]
+        ids(&ctx(&[Check::Test], Scope::workspace())),
+        [StageId::TestCompile, StageId::Test]
     );
-    assert_eq!(
-        ids(&ctx(&[Check::Doc], Scope::workspace())),
-        [StageId::Doctests]
-    );
-    let lone_doc = plan(&ctx(&[Check::Doc], Scope::workspace()));
+    let lone_fmt = plan(&ctx(&[Check::Fmt], Scope::workspace()));
     assert!(
-        lone_doc[0].after_stages.is_empty(),
+        lone_fmt[0].after_stages.is_empty(),
         "a stage never waits on one the run does not plan"
     );
     let mut selections: Vec<Vec<Check>> = every_check().into_iter().map(|c| vec![c]).collect();
@@ -784,7 +795,9 @@ fn a_selection_plans_exactly_its_checks_stages_and_never_deadlocks() {
 fn pooled_codegen_waits_for_every_preflight() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 4).unwrap();
-    let c = ctx(&RELEASE, Scope::workspace()).with_pool(Some(pool));
+    let c = ctx(&RELEASE, Scope::workspace())
+        .with_release(true)
+        .with_pool(Some(pool));
     let p = plan(&c);
     let compile = p.iter().position(|s| s.id == StageId::TestCompile).unwrap();
     let mut done = vec![false; p.len()];
@@ -809,14 +822,10 @@ fn pooled_codegen_waits_for_every_preflight() {
 #[test]
 fn source_and_type_preflight_finish_before_test_codegen() {
     use crate::sched::{awaited, ready};
-    let c = ctx(&RELEASE, Scope::workspace());
+    let c = ctx(&RELEASE, Scope::workspace()).with_release(true);
     let p = plan(&c);
     let at = |id| p.iter().position(|s| s.id == id).expect("planned");
-    let (compile, test, doc) = (
-        at(StageId::TestCompile),
-        at(StageId::Test),
-        at(StageId::Doctests),
-    );
+    let (compile, test) = (at(StageId::TestCompile), at(StageId::Test));
     assert_eq!(
         lane_dir(&c, Lane::AfterCompile),
         lane_dir(&c, Lane::MainTarget)
@@ -830,11 +839,8 @@ fn source_and_type_preflight_finish_before_test_codegen() {
     .into_iter()
     .filter_map(|id| p.iter().position(|s| s.id == id))
     .collect();
-    let mut doc_waits = preflight.clone();
-    doc_waits.push(compile);
-    assert_eq!(awaited(&p, doc).collect::<Vec<_>>(), doc_waits);
+    assert_eq!(awaited(&p, test).collect::<Vec<_>>(), preflight);
     let none = vec![false; p.len()];
-    assert!(!ready(&p, &none, &none, 0, doc, u64::MAX));
     assert!(!ready(&p, &none, &none, 0, compile, u64::MAX));
     assert!(
         !ready(&p, &none, &none, 0, test, u64::MAX),
@@ -852,20 +858,22 @@ fn source_and_type_preflight_finish_before_test_codegen() {
         done[i] = true;
     }
     assert!(ready(&p, &done, &done, 0, compile, u64::MAX));
+    assert!(
+        !ready(&p, &done, &done, 0, test, u64::MAX),
+        "the test run shares its compile's lane, so it starts only once the compile is done"
+    );
     done[compile] = true;
-    let mut started = done.clone();
-    assert!(ready(&p, &started, &done, 0, test, u64::MAX));
-    assert!(ready(&p, &started, &done, 0, doc, u64::MAX));
-    started[test] = true;
-    assert!(ready(&p, &started, &done, 1, doc, u64::MAX));
+    assert!(ready(&p, &done, &done, 0, test, u64::MAX));
 }
 
 /// THE GUARDS RUN TOGETHER. In the dev set the released shim, whose build's lane is its own, is
 /// first and alone; formatting, the source guards, the export scan and the lint then wait for it
-/// and for none of each other, so all four start beside one another, and everything after them
-/// waits for all five. NEGATIVE CONTROL: with any one of the five unfinished the test compile
-/// does not start, so no red of the preflight is found after test code generation began; and a
-/// plan without the released shim starts the four at once.
+/// and for none of each other, so all four start beside one another. The test compile and the
+/// test run wait for the shim and the three guards, and the compile starts beside a lint still
+/// running (`docs/DESIGN-landing-economy.md` §2.2b).
+/// NEGATIVE CONTROL: with any one of the shim and the guards unfinished the test compile does not
+/// start, so no source red is found after test code generation began; and a plan without the
+/// released shim starts the four at once.
 #[test]
 fn the_guards_and_the_lint_run_together_once_the_released_shim_is_done() {
     use crate::sched::{awaited, ready};
@@ -883,13 +891,14 @@ fn the_guards_and_the_lint_run_together_once_the_released_shim_is_done() {
     ]
     .map(at);
     let compile = at(StageId::TestCompile);
+    let lint = at(StageId::Tippy);
     assert!(p[shim].after_stages.is_empty());
     for i in together {
         assert_eq!(p[i].after_stages, [StageId::ReleasedShim], "{:?}", p[i].id);
         assert_eq!(awaited(&p, i).collect::<Vec<_>>(), [shim]);
     }
     let mut all = vec![shim];
-    all.extend(together);
+    all.extend(together.into_iter().filter(|&i| i != lint));
     assert_eq!(awaited(&p, compile).collect::<Vec<_>>(), all);
 
     let none = vec![false; p.len()];
@@ -919,7 +928,12 @@ fn the_guards_and_the_lint_run_together_once_the_released_shim_is_done() {
             p[unfinished].id
         );
         done[unfinished] = true;
-        assert!(ready(&p, &done, &done, 0, compile, u64::MAX));
+        let mut started = done.clone();
+        started[lint] = true;
+        assert!(
+            ready(&p, &started, &done, 1, compile, u64::MAX),
+            "the test compile starts beside the running lint"
+        );
     }
 
     let no_shim = plan(&ctx(
@@ -933,6 +947,102 @@ fn the_guards_and_the_lint_run_together_once_the_released_shim_is_done() {
         assert!(ready(&no_shim, &started, &none, i, i, u64::MAX));
         started[i] = true;
     }
+}
+
+/// THE LINT BESIDE THE TEST COMPILE, OUTSIDE A RELEASE ONLY (`docs/DESIGN-landing-economy.md`
+/// §2.2b): in an ordinary plan the test compile, each call of a shaped one, and the test run await
+/// the released shim and the three source guards and not the lint, while the cross cells and the
+/// windowed stages still await the lint. A release's plan is unchanged: every
+/// stage after the preflight awaits all five. NEGATIVE CONTROL: the release plan of the same
+/// checks has the lint in the test compile's waits.
+#[test]
+fn outside_a_release_the_test_compile_runs_beside_the_lint() {
+    let guards = [
+        StageId::ReleasedShim,
+        StageId::Formatting,
+        StageId::Census,
+        StageId::ExportScan,
+    ];
+    let checks = [
+        Check::ReleasedShim,
+        Check::Fmt,
+        Check::Census,
+        Check::ExportScan,
+        Check::Lint,
+        Check::Test,
+        Check::Cells,
+        Check::Appkit,
+    ];
+    let scope = || Scope::changed("origin/main", vec!["seed".into()], true);
+    let ordinary = plan(&with_app(&checks, scope()));
+    let release = plan(&with_app(&checks, scope()).with_release(true));
+    for p in [&ordinary, &release] {
+        crate::sched::check_waits(p).unwrap_or_else(|e| panic!("{e}"));
+    }
+    let waits = |p: &[StageSpec], id: StageId| -> Vec<StageId> {
+        p.iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("{id:?} is planned"))
+            .after_stages
+            .clone()
+    };
+    for id in [StageId::TestCompile, StageId::Test] {
+        let mut got = waits(&ordinary, id);
+        got.retain(|stage| *stage != StageId::TestCompile);
+        assert_eq!(got, guards, "{id:?} awaits the guards and not the lint");
+        assert!(waits(&release, id).contains(&StageId::Tippy), "{id:?}");
+    }
+    for p in [&ordinary, &release] {
+        for id in [
+            StageId::ForeignCells,
+            StageId::RedrawConformance,
+            StageId::ObjcDrives,
+        ] {
+            let w = waits(p, id);
+            assert!(
+                w.contains(&StageId::Tippy) && guards.iter().all(|g| w.contains(g)),
+                "{id:?}: {w:?}"
+            );
+        }
+    }
+    assert_eq!(
+        ordinary.iter().map(|s| (s.id, s.lane)).collect::<Vec<_>>(),
+        release.iter().map(|s| (s.id, s.lane)).collect::<Vec<_>>(),
+        "the overlap changes only what the test compile waits for"
+    );
+    let at = |id| ordinary.iter().position(|s| s.id == id).expect("planned");
+    let (compile, lint) = (at(StageId::TestCompile), at(StageId::Tippy));
+    assert_ne!(ordinary[compile].lane, ordinary[lint].lane);
+    let mut done = vec![false; ordinary.len()];
+    for id in guards {
+        done[at(id)] = true;
+    }
+    let mut started = done.clone();
+    started[lint] = true;
+    assert!(crate::sched::ready(
+        &ordinary,
+        &started,
+        &done,
+        1,
+        compile,
+        u64::MAX
+    ));
+    let at = |id| release.iter().position(|s| s.id == id).expect("planned");
+    let (compile, lint) = (at(StageId::TestCompile), at(StageId::Tippy));
+    let mut done = vec![false; release.len()];
+    for id in guards {
+        done[at(id)] = true;
+    }
+    let mut started = done.clone();
+    started[lint] = true;
+    assert!(!crate::sched::ready(
+        &release,
+        &started,
+        &done,
+        1,
+        compile,
+        u64::MAX
+    ));
 }
 
 /// Export reuses the main target only after the test compile has populated it. An export-only

@@ -42,7 +42,11 @@ pub fn native_update_window_show_model() -> Model {
                     && ((revealed == 1 && (lane == 2 || proof == 1)) || Buggy == 1)
             ) {
                 stacked = 1;
-                keyed = if typed == 1 || Buggy == 1 { 0 } else { 1 };
+                keyed = if Buggy == 1 {
+                    if committed == 1 { 0 } else { 1 }
+                } else {
+                    if committed == 1 { if typed == 1 { 0 } else { 1 } } else { keyed }
+                };
             }
             action Activate when (front == 0) {
                 front = 1;
@@ -50,21 +54,27 @@ pub fn native_update_window_show_model() -> Model {
             action Deactivate when (front == 1) {
                 front = 0;
             }
-            action Steal when (lane == 1 && committed == 0 && stacked == 1 && keyed == 1) {
+            action Steal when (lane > 0 && committed == 0 && stacked == 1) {
                 keyed = 0;
             }
-            action Type when (lane == 1 && committed == 0 && revealed == 1 && keyed == 0) {
+            action Type when (lane > 0 && revealed == 1 && keyed == 0 && typed == 0 && fs == 0) {
                 typed = 1;
             }
             action Commit when (lane == 1 && committed == 0 && proof == 1) {
                 committed = 1;
                 keyed = if stacked == 1 && (typed == 0 || Buggy == 1) { 1 } else { keyed };
             }
+            action ChooseSaved when (lane > 0 && committed == 1 && typed == 1 && fs == 0) {
+                typed = 0;
+                keyed = 1;
+                front = 1;
+            }
             action EnterFullScreen when (
                 stacked == 1
                     && fs == 0
                     && (committed == 1 || Buggy == 1)
                     && (front == 1 || Buggy == 1)
+                    && (typed == 0 || Buggy == 1)
             ) {
                 fs = 1;
                 fsfront = front;
@@ -74,6 +84,8 @@ pub fn native_update_window_show_model() -> Model {
             invariant StackOnlyAtProof: lane == 2 || stacked == 0 || proof == 1;
             invariant FullScreenOnlyAfterCommit: fs == 0 || committed == 1;
             invariant FullScreenOnlyInFront: fs == 0 || fsfront == 1;
+            invariant NoKeyboardBeforeCommit: committed == 1 || keyed == 0;
+            invariant NoStaleSpaceSwitch: typed == 0 || fs == 0;
             invariant KeyWindowAtCommit:
                 committed == 0 || stacked == 0 || typed == 1 || keyed == 1;
             invariant TypingKeepsItsWindow: committed == 0 || typed == 0 || keyed == 0;

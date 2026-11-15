@@ -261,10 +261,12 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
         )
         .as_bytes(),
     );
-    let source = zsh.until("the source agent runs, leading the tab", || {
+    // Up is its own line on the pty, which it prints after its run's log line: a signal sent once
+    // the log line alone is there can end it before the pty sees it start.
+    let source = zsh.until("the source agent is up, leading the tab", || {
         let [pid, ..] = runs(&log).into_iter().next()?;
         let pid: u32 = pid.parse().ok()?;
-        (zsh.front() == Some(pid)).then_some(pid)
+        (zsh.front() == Some(pid) && zsh.said().contains(&format!("{UP} {pid}"))).then_some(pid)
     });
     let start = <Live as AlabKernel>::birth(&Live, source).expect("its kernel start");
     // The renewal's Signal; no successor ever takes the session.

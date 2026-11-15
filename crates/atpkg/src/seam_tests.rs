@@ -1553,6 +1553,39 @@ fn unknown_record_keys_are_ignored_never_acted_on() {
     assert_eq!(recorded_names(&fx.layout), vec!["trust".to_string()]);
 }
 
+/// A build that ships the analyzer and the formatter gets the names rustup's proxies run for them,
+/// so an editor's `rust-analyzer` in a checkout that pins `trust` starts the Trust analyzer; a build
+/// without them gets neither name (the same fixture is the negative control).
+#[cfg(unix)]
+#[test]
+fn the_view_names_the_analyzer_and_formatter_rustups_proxies_run() {
+    let fx = Fixture::new("view-proxies");
+    let build = fx.install_trust(6809);
+    let bin = view_dir(&fx.layout, "trust").join("bin");
+    let r = refresh_view(&fx.layout, "trust").unwrap();
+    assert!(!r.stock.iter().any(|(public, _)| *public == "rust-analyzer"));
+    assert!(!bin.join("rust-analyzer").exists());
+    for tool in ["trust-analyzer", "trustfmt", "targo-fmt"] {
+        std::fs::write(
+            build.join("bin").join(tool),
+            format!("{tool} of build 6809"),
+        )
+        .unwrap();
+    }
+    let r = refresh_view(&fx.layout, "trust").unwrap();
+    for (public, trust) in [
+        ("rust-analyzer", "trust-analyzer"),
+        ("rustfmt", "trustfmt"),
+        ("cargo-fmt", "targo-fmt"),
+    ] {
+        assert!(r.stock.contains(&(public, trust)), "{public} is laid");
+        assert!(
+            cloned(&build.join("bin").join(trust), &bin.join(public)),
+            "{public} is a clone of the store's {trust}"
+        );
+    }
+}
+
 /// The view.
 #[cfg(unix)]
 #[test]
@@ -1572,7 +1605,7 @@ fn the_view_is_a_clone_of_the_build_with_the_stock_names_laid() {
     );
     assert!(r.changed);
     let bin = view_dir(&fx.layout, "trust").join("bin");
-    for (public, trust) in STOCK_NAMES {
+    for (public, trust) in &r.stock {
         assert!(
             cloned(&build.join("bin").join(trust), &bin.join(public)),
             "{public} is a clone of the store's {trust}"

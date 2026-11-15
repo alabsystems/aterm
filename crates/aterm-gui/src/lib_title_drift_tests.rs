@@ -19,6 +19,51 @@ fn timeline_events(app: &App, session: u64) -> Vec<(&'static str, String)> {
 }
 
 #[test]
+fn labeling_joins_current_views_with_current_tab_focuses() {
+    use crate::tab_model::{Tab, TabId, TabPresentation, TabSet, ViewStore};
+
+    let mut views = ViewStore::default();
+    let first = views.insert_terminal(7).unwrap();
+    let alias = views.insert_terminal(7).unwrap();
+    let other = views.insert_terminal(9).unwrap();
+    let make = |focus| {
+        Tab::new(
+            TabId::from_stored(1),
+            focus,
+            TabPresentation::terminal("tab"),
+        )
+    };
+    let mut tabs = TabSet::new(make(first));
+    assert!(tabs_label_session(&tabs, &views, 7));
+    assert!(!tabs_label_session(&tabs, &views, 9));
+    *tabs.tab_at_mut(0).unwrap() = make(alias);
+    views.remove(first).unwrap();
+    assert!(
+        tabs_label_session(&tabs, &views, 7),
+        "the other view still labels"
+    );
+    *tabs.tab_at_mut(0).unwrap() = make(other);
+    assert!(!tabs_label_session(&tabs, &views, 7));
+    assert!(tabs_label_session(&tabs, &views, 9));
+    views.remove(other).unwrap();
+    assert!(
+        !tabs_label_session(&tabs, &views, 9),
+        "a removed view cannot label"
+    );
+
+    tabs = TabSet::new(make(first));
+    let _ = tabs.contains_focused_view(first);
+    views = ViewStore::default();
+    let replaced = views.insert_terminal(99).unwrap();
+    assert_eq!(
+        replaced, first,
+        "the new store can reuse its own identity space"
+    );
+    assert!(!tabs_label_session(&tabs, &views, 7));
+    assert!(tabs_label_session(&tabs, &views, 99));
+}
+
+#[test]
 fn a_contended_terminal_keeps_the_last_title_wake_owed() {
     let mut app = App::headless_for_test();
     let first = Instant::now();

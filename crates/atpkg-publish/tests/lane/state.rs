@@ -237,8 +237,11 @@ fn a_builds_evidence_ages_out_unless_a_latch_still_names_it() {
             "raw\n",
         )
         .expect("a log");
-        std::fs::create_dir_all(s.dir.join("receipts")).expect("receipts");
-        std::fs::write(s.dir.join(format!("receipts/{build}.json")), "{}").expect("a receipt");
+        std::fs::write(
+            s.dir.join(format!("logs/{build}/attempt-1/receipt.json")),
+            "{}",
+        )
+        .expect("a receipt");
         std::fs::create_dir_all(s.dir.join("retired")).expect("retired");
         std::fs::write(
             s.dir.join(format!("retired/{build}.ready.toml.refused")),
@@ -250,10 +253,9 @@ fn a_builds_evidence_ages_out_unless_a_latch_still_names_it() {
     std::fs::write(s.blocked_file("ay", 6), "# latched\n").expect("a latch");
     let all = [
         "logs/ay-5",
-        "receipts/ay-5.json",
         "retired/ay-5.ready.toml.refused",
         "logs/ay-6/attempt-1/unit.stdout",
-        "receipts/ay-6.json",
+        "logs/ay-6/attempt-1/receipt.json",
         "retired/ay-6.ready.toml.refused",
     ];
     let now = i64::try_from(
@@ -270,16 +272,16 @@ fn a_builds_evidence_ages_out_unless_a_latch_still_names_it() {
     }
     // Past it the unlatched build's evidence goes and the latched build's stays.
     s.prune_evidence(now + EVIDENCE_KEEP_SECS + 3600);
-    for rel in &all[..3] {
+    for rel in &all[..2] {
         assert!(!kept(rel), "{rel} outlived its keep");
     }
-    for rel in &all[3..] {
+    for rel in &all[2..] {
         assert!(kept(rel), "{rel} is what a latch points at");
     }
     // The latch deleted, its build's evidence ages out like any other.
     std::fs::remove_file(s.blocked_file("ay", 6)).expect("unlatch");
     s.prune_evidence(now + EVIDENCE_KEEP_SECS + 3600);
-    for rel in &all[3..] {
+    for rel in &all[2..] {
         assert!(!kept(rel), "{rel} outlived its latch");
     }
 }

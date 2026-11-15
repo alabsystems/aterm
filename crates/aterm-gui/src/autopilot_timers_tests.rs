@@ -786,7 +786,7 @@ fn the_fire_says_what_it_found() {
     let clock = glass_of(land_at, wall, &local_offset_at)
         .expect("the zone reads")
         .clock;
-    let land_words = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Land)
+    let land_words = crate::autopilot::mode_words(alab_policy::config::Autopilot::Land)
         .record
         .to_string();
     let turned = format!("at {} Autopilot switched to land; ", clock.as_str());

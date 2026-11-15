@@ -75,104 +75,6 @@ fn later_cuts_offer_ancestor_lint_facts_without_reviving_newer_tombstones() {
     );
 }
 
-/// A tree with no test verdict is offered the binaries its ancestors' runs passed, whatever
-/// hop or cut they belonged to, each under the run that executed it: the verifier recomputes
-/// every offered key, so the offer decides nothing.
-/// NEGATIVE CONTROLS: the nearest ancestor's FAIL of a binary is not passed over for an older
-/// pass of it; a record made only of candidates, which no run keyed on its tree, offers
-/// nothing; and a row the current tree already holds is not offered again.
-#[test]
-fn a_tree_is_offered_the_test_binaries_its_ancestors_passed() {
-    let f = Fixture::new();
-    let repository = f._dir.path().join("repository");
-    std::fs::create_dir_all(&repository).unwrap();
-    let git = crate::ledger::GitCli::new(&repository);
-    let call = |args: &[&str]| {
-        let output = git.git(args).unwrap();
-        assert!(output.success(), "{}", output.stderr_utf8());
-        output.stdout_utf8().trim().to_owned()
-    };
-    call(&["init", "--quiet", "-b", "main"]);
-    call(&["config", "user.name", "Qualification fixture"]);
-    call(&["config", "user.email", "fixture@example.invalid"]);
-    let commit = |text: &str| {
-        std::fs::write(repository.join("source"), text).unwrap();
-        call(&["add", "source"]);
-        call(&["commit", "--quiet", "-m", text]);
-        call(&["rev-parse", "HEAD^{tree}"])
-    };
-    let records = root(&git).unwrap();
-    let old = commit("an earlier cut");
-    let newer = commit("a hop whose run failed one binary");
-    let unkeyed = commit("a hop no run keyed");
-    let tree = commit("the head");
-    let head = call(&["rev-parse", "HEAD"]);
-    let seed = |tree: &str, run: &str, outcome: &str, binaries: Vec<Binary>| {
-        let mut facts = f.facts("prior-seal", "unused");
-        facts.tree = tree;
-        facts.run = run;
-        let mut row = record(&facts, (0, &u(9)), "test", outcome, None);
-        row.binaries = binaries;
-        let at = path(&records, tree, "prior-seal", "test", None);
-        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
-        write(&at, &row).unwrap();
-    };
-    seed(
-        &old,
-        "run-old",
-        OK,
-        vec![
-            bin("-p stable --lib", 1, OK),
-            bin("-p changed --lib", 2, OK),
-            bin("-p held --lib", 3, OK),
-        ],
-    );
-    seed(
-        &newer,
-        "run-newer",
-        FAIL,
-        vec![
-            bin("-p changed --lib", 4, FAIL),
-            bin("-p fresh --lib", 5, OK),
-        ],
-    );
-    seed(
-        &unkeyed,
-        &format!("{CANDIDATE_RUN_PREFIX}abcdef0"),
-        NOT_RUN,
-        vec![bin("-p unkeyed --lib", 6, OK)],
-    );
-    assert_eq!(
-        ancestor_test_candidates(&git, &records, &head, &tree).unwrap(),
-        [
-            ran_in("run-newer", bin("-p fresh --lib", 5, OK)),
-            ran_in("run-old", bin("-p held --lib", 3, OK)),
-            ran_in("run-old", bin("-p stable --lib", 1, OK)),
-        ]
-    );
-    assert!(
-        !has_records(&records, &tree).unwrap(),
-        "offering facts writes no current verdict"
-    );
-
-    let mut facts = f.facts("s1", "unused");
-    facts.tree = &tree;
-    let mut current = record(&facts, (3, &u(9)), "test", NOT_RUN, None);
-    current.binaries = vec![bin("-p held --lib", 7, NOT_RUN)];
-    let at = path(&records, &tree, "s1", "test", None);
-    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
-    write(&at, &current).unwrap();
-    let judged = checks(&git, &head, None, || Ok("s1".into())).unwrap();
-    assert_eq!(
-        judged.run(Half::Tree).passed_binaries,
-        [
-            ran_in("run-newer", bin("-p fresh --lib", 5, OK)),
-            ran_in("run-old", bin("-p stable --lib", 1, OK)),
-        ],
-        "the head's own NOT RUN row of `held` wins over its ancestor's pass"
-    );
-}
-
 /// A record as large as a whole-tree check's (over the old 1 MiB cap) is written and read
 /// back; one over the bound its reader holds is never written.
 ///
@@ -214,26 +116,11 @@ fn finished(check: &str, outcome: &str) -> aterm_json::Value {
         "seconds":2.0,"detail":"d","rows":[{"outcome":outcome,"detail":"row"}]})
 }
 
-fn bin(spec: &str, sha: u8, outcome: &str) -> Binary {
+fn bin(spec: &str, seconds: u8, outcome: &str) -> Binary {
     Binary {
         spec: spec.into(),
-        sha256: u(sha),
         outcome: outcome.into(),
-        content_key: Some(u(sha.wrapping_add(32))),
-        inputs_bounded: true,
-        input_reason: None,
-        json: Some(false),
-        execution_s: f64::from(sha),
-        key_parts: BTreeMap::new(),
-        origin_run: None,
-    }
-}
-
-/// `row` as the record of the run that executed it keeps it.
-fn ran_in(run: &str, row: Binary) -> Binary {
-    Binary {
-        origin_run: Some(run.into()),
-        ..row
+        execution_s: f64::from(seconds),
     }
 }
 
@@ -914,45 +801,6 @@ fn a_tree_passes_only_on_its_own_records_under_its_seal() {
     );
 }
 
-/// A row keeps the release run that executed it: a run stamps what it ran, and a row its
-/// verifier carried keeps the run the event names. The passing answer then says what its
-/// records hold that no run of the tree executed.
-/// NEGATIVE CONTROL: the same run with every binary executed in it says PASSED and no more.
-#[test]
-fn a_passing_answer_names_what_was_carried_and_from_which_run() {
-    let f = Fixture::new();
-    let mut run = all_ok();
-    run.binaries = vec![bin("-p a --lib", 1, OK), bin("-p b --lib", 2, OK)];
-    f.write("s1", &u(1), 0, &run);
-    let own = f.judge("s1", Some(&u(1)));
-    assert!(own.complete(), "{}", own.line());
-    assert!(own.line().ends_with("under this seal"), "{}", own.line());
-    let Read::Record(kept) = read(&path(&f.root, TREE, "s1", "test", None)).unwrap() else {
-        panic!("the run kept no test record");
-    };
-    assert!(
-        kept.binaries
-            .iter()
-            .all(|row| row.origin_run.as_deref() == Some(RUN)),
-        "{:?}",
-        kept.binaries
-    );
-
-    let g = Fixture::new();
-    run.binaries[0].origin_run = Some("20261104T080000-7".into());
-    g.write("s1", &u(1), 0, &run);
-    let carried = g.judge("s1", Some(&u(1)));
-    assert!(carried.complete(), "{}", carried.line());
-    assert!(
-        carried.line().ends_with(
-            "under this seal; carried on equal content, not run on this tree: 1 of 2 binaries \
-             of test from 20261104T080000-7"
-        ),
-        "{}",
-        carried.line()
-    );
-}
-
 /// A tree half judges no executable, so it keeps no record of a bundle check its events
 /// name: measure's record always names the bytes it judged, and the tree's records stand
 /// without one. Negative control: the same events with the executable keep measure under it.
@@ -984,10 +832,9 @@ fn a_tree_half_keeps_no_bundle_record() {
 }
 
 /// A FAIL record refuses the tree under its seal, and a measure FAIL of another build of the
-/// tree refuses it too; NOT RUN and skip are missing, and a resume runs only those, carrying
-/// the test binaries that passed with a known digest. Negative controls: dropping the bundle
-/// scan lets a rebuilt executable re-roll the measure FAIL; dropping the digest filter
-/// carries a binary with none, which `--passed-binaries` refuses.
+/// tree refuses it too; NOT RUN and skip are missing, and a resume runs only those, every test
+/// binary again. Negative control: dropping the bundle scan lets a rebuilt executable re-roll
+/// the measure FAIL.
 #[test]
 fn a_fail_refuses_its_tree_and_a_resume_runs_only_what_is_missing() {
     let f = Fixture::new();
@@ -995,7 +842,7 @@ fn a_fail_refuses_its_tree_and_a_resume_runs_only_what_is_missing() {
     run.finished = vec![
         finished("fmt", OK),
         finished("lint", OK),
-        finished("doc", SKIP),
+        finished("spec", SKIP),
         finished("census", OK),
         finished("measure", FAIL),
         finished("cells", FAIL),
@@ -1003,10 +850,7 @@ fn a_fail_refuses_its_tree_and_a_resume_runs_only_what_is_missing() {
     run.binaries = vec![
         bin("-p a --lib", 1, OK),
         bin("-p b --lib", 2, NOT_RUN),
-        Binary {
-            sha256: String::new(),
-            ..bin("-p c --lib", 3, OK)
-        },
+        bin("-p c --lib", 3, OK),
     ];
     let lines = f.write("s1", &u(1), 1, &run);
     assert_eq!(
@@ -1058,20 +902,13 @@ fn a_fail_refuses_its_tree_and_a_resume_runs_only_what_is_missing() {
         .cloned()
         .collect();
     assert_eq!(resume.checks, tree_missing);
-    assert_eq!(
-        resume.passed_binaries,
-        [ran_in(RUN, bin("-p a --lib", 1, OK))],
-        "a binary whose digest is not known runs again"
-    );
     assert!(resume.strict_subset() && !resume.reads_the_bundle());
     let bundle = judged.run(Half::Bundle);
     assert_eq!(bundle.checks, ["appkit", "measure"]);
     assert!(!bundle.strict_subset() && bundle.reads_the_bundle());
-    assert!(bundle.passed_binaries.is_empty(), "test is the tree's");
     let all = VerifyRun {
         half: Half::Tree,
         checks: RELEASE_TREE.iter().map(|c| c.name().to_owned()).collect(),
-        passed_binaries: Vec::new(),
         passed_lint_packages: Vec::new(),
         passed_appkit_groups: Vec::new(),
     };
@@ -1079,7 +916,6 @@ fn a_fail_refuses_its_tree_and_a_resume_runs_only_what_is_missing() {
     let tree_only = VerifyRun {
         half: Half::Tree,
         checks: vec!["lint".into(), "test".into()],
-        passed_binaries: Vec::new(),
         passed_lint_packages: Vec::new(),
         passed_appkit_groups: Vec::new(),
     };
@@ -1230,10 +1066,6 @@ fn a_fail_that_cannot_be_written_still_refuses_its_tree() {
     f.write("s1", &u(1), -1, &whole);
     let judged = f.judge("s1", Some(&u(1)));
     assert!(judged.failed.is_empty(), "{}", judged.line());
-    assert_eq!(
-        judged.run(Half::Tree).passed_binaries,
-        [ran_in(RUN, bin("-p a --lib", 1, OK))]
-    );
 
     let f = Fixture::new();
     f.begin("s1", &u(1)).unwrap();
@@ -1272,7 +1104,7 @@ fn a_fail_that_cannot_be_written_still_refuses_its_tree() {
 /// OKs. A binary FAIL and a legacy sha-only OK never carry. Evidence already recorded on the
 /// current hop wins over an older candidate, so a second facts pass cannot erase progress.
 #[test]
-fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
+fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_package() {
     const PREVIOUS_TREE: &str = "3333333333333333333333333333333333333333";
     const PREVIOUS_COMMIT: &str = "4444444444444444444444444444444444444444";
     const SEAL: &str = "sealed";
@@ -1352,20 +1184,13 @@ fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
     );
     prior_appkit.appkit_groups = vec![appkit_redraw_group(43, 44)];
     keep_record(&prior_appkit);
-    let prior_ok = bin("-p p --test reader", 1, OK);
-    let prior_drift = bin("-p p --test drifted", 5, OK);
-    let prior_fail = bin("-p p --test failed", 2, FAIL);
-    let mut legacy_ok = bin("-p p --test legacy", 3, OK);
-    legacy_ok.content_key = None;
-    legacy_ok.inputs_bounded = false;
-    legacy_ok.input_reason = None;
     keep_record(&record(
         PREVIOUS_TREE,
         PREVIOUS_COMMIT,
         "test",
-        FAIL,
+        OK,
         old_test_input,
-        vec![prior_ok, prior_drift, prior_fail, legacy_ok],
+        vec![bin("-p p --test reader", 1, OK)],
     ));
     let prior_lint_ok = lint_package("clean@1.0.0", 10, OK);
     let prior_lint_drift = lint_package("drift@1.0.0", 11, OK);
@@ -1390,25 +1215,15 @@ fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
     ];
     keep_record(&prior_lint);
 
-    let mut current_reader = bin("-p p --test reader", 1, OK);
-    current_reader.content_key = Some(u(55));
-    let current_sibling = bin("-p p --test sibling", 4, OK);
-    let mut current_drift = bin("-p p --test drifted", 5, NOT_RUN);
-    current_drift.content_key = None;
-    current_drift.inputs_bounded = false;
-    current_drift.input_reason = Some("runtime inputs changed after carry selection".into());
-    keep_record(&record(
+    let current_test = record(
         TREE,
         COMMIT,
         "test",
         NOT_RUN,
         new_test_input,
-        vec![
-            current_reader.clone(),
-            current_sibling.clone(),
-            current_drift.clone(),
-        ],
-    ));
+        vec![bin("-p p --test sibling", 4, OK)],
+    );
+    keep_record(&current_test);
     let mut current_lint_drift = lint_package("drift@1.0.0", 21, NOT_RUN);
     current_lint_drift.inputs_bounded = false;
     current_lint_drift.content_key = None;
@@ -1457,16 +1272,11 @@ fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
     );
 
     let Read::Record(test) = read(&path(&f.root, TREE, SEAL, "test", None)).unwrap() else {
-        panic!("current test candidate record");
+        panic!("current test record");
     };
     assert_eq!(
-        test.binaries,
-        [
-            current_drift.clone(),
-            current_reader.clone(),
-            current_sibling.clone()
-        ],
-        "current OKs win; current drift tombstones prior OK; FAIL and legacy rows stay absent"
+        *test, current_test,
+        "a changed test tree's prior binaries are never offered: every one runs again"
     );
     let Read::Record(lint) = read(&path(&f.root, TREE, SEAL, "lint", None)).unwrap() else {
         panic!("current lint candidate record");
@@ -1481,9 +1291,8 @@ fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
         "only bounded package OKs carry; current tombstones win over prior OKs"
     );
 
-    // A same-tree resume asks for hop carry again. The persisted NOT RUN row must still win
-    // over the preceding tree's OK; dropping tombstones from the synthetic record resurrects
-    // `prior_drift` here.
+    // A same-tree resume asks for hop carry again. The persisted NOT RUN package must still win
+    // over the preceding tree's OK.
     carry_hop(
         &f.root,
         COMMIT,
@@ -1494,14 +1303,6 @@ fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
         &plan,
     )
     .unwrap();
-    let Read::Record(test) = read(&path(&f.root, TREE, SEAL, "test", None)).unwrap() else {
-        panic!("same-tree resumed test candidate record");
-    };
-    assert_eq!(
-        test.binaries,
-        [current_drift, current_reader, current_sibling],
-        "a current NOT RUN tombstone survives reseeding and blocks the older OK"
-    );
     let Read::Record(lint) = read(&path(&f.root, TREE, SEAL, "lint", None)).unwrap() else {
         panic!("same-tree resumed lint candidate record");
     };
@@ -1513,8 +1314,8 @@ fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
 
     // A later line hop may not relay this synthetic record's rows. None of them was re-keyed
     // on TREE: `carry_hop` merely offered the preceding hop's receipts to a verifier which has
-    // not run. Removing the candidate-run provenance guard lets both test and lint rows cross
-    // this second boundary without ever being judged on TREE.
+    // not run. Removing the candidate-run provenance guard lets lint rows cross this second
+    // boundary without ever being judged on TREE.
     const NEXT_TREE: &str = "5555555555555555555555555555555555555555";
     const NEXT_COMMIT: &str = "6666666666666666666666666666666666666666";
     let next = carry_hop(&f.root, NEXT_COMMIT, NEXT_TREE, COMMIT, TREE, SEAL, &plan).unwrap();
@@ -1529,13 +1330,6 @@ fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
             Read::Absent
         ),
         "an unexecuted AppKit candidate must not relay across two hops"
-    );
-    assert!(
-        matches!(
-            read(&path(&f.root, NEXT_TREE, SEAL, "test", None)).unwrap(),
-            Read::Absent
-        ),
-        "an unexecuted candidate record must not relay binary proofs across two hops"
     );
     assert!(
         matches!(
@@ -1580,7 +1374,9 @@ fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
         "a failed transient gate materializes no synthetic AppKit verdict"
     );
 
-    let mut legacy = record(
+    // A record an older cutter kept, its binaries' carry fields included, still reads whole:
+    // those fields are ignored.
+    let legacy = record(
         PREVIOUS_TREE,
         PREVIOUS_COMMIT,
         "test",
@@ -1588,30 +1384,18 @@ fn a_hop_carries_equal_ok_content_and_never_a_fail_or_unbounded_reader() {
         input(Some(u(60)), "legacy"),
         vec![bin("-p p --lib", 8, FAIL)],
     );
-    legacy.content = None;
     let encoded = aterm_toml::to_string(&legacy).unwrap();
-    let old = encoded
-        .lines()
-        .filter(|line| {
-            ![
-                "content_key",
-                "inputs_bounded",
-                "input_reason",
-                "json",
-                "execution_s",
-            ]
-            .iter()
-            .any(|field| line.starts_with(field))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let decoded: CheckRecord = aterm_toml::from_str(&old).unwrap();
-    assert_eq!(decoded.outcome, FAIL);
-    assert_eq!(decoded.binaries[0].outcome, FAIL);
-    assert!(
-        !decoded.binaries[0].carried(),
-        "legacy evidence fails closed"
+    let old = encoded.replace(
+        "[[binaries]]\n",
+        &format!(
+            "[[binaries]]\nsha256 = \"{}\"\ncontent_key = \"{}\"\ninputs_bounded = true\n",
+            u(8),
+            u(40)
+        ),
     );
+    assert_ne!(old, encoded, "{encoded}");
+    let decoded: CheckRecord = aterm_toml::from_str(&old).unwrap();
+    assert_eq!(decoded, legacy);
 }
 
 #[test]
@@ -1724,7 +1508,7 @@ fn an_accepted_measure_passes_only_beside_every_other_ok() {
         accept_in(
             &f.root,
             (COMMIT, TREE),
-            &u(1),
+            (Check::Measure, Some(&u(1))),
             seal,
             (report, sha),
             "the owner shipped it",
@@ -1762,4 +1546,101 @@ fn an_accepted_measure_passes_only_beside_every_other_ok() {
     let judged = f.judge("s1", Some(&u(1)));
     assert!(judged.complete(), "{}", judged.line());
     assert!(judged.accepted.is_some());
+}
+
+/// An owner's acceptance of a tree check that runs the product's tests rewrites only that
+/// check's FAIL of this tree under this seal, one check per acceptance, and the tree passes once
+/// every other check has its own ok record, in words that name each accepted check and say it
+/// is no full pass. An accepted FAIL is counted apart from the ok records. Negative controls: a
+/// tree check's acceptance that names an executable, and measure's that names none, are
+/// refused; a source-shape check's FAIL is never accepted; and an `accepted` record of one,
+/// written by hand, reads as missing.
+#[test]
+fn an_accepted_test_and_spec_fail_pass_beside_every_other_ok_and_a_source_check_never_is() {
+    let f = Fixture::new();
+    let report = std::fs::canonicalize(&f.log).unwrap();
+    let accept = |seal: &str, check: Check, executable: Option<&str>| {
+        accept_in(
+            &f.root,
+            (COMMIT, TREE),
+            (check, executable),
+            seal,
+            (&report, &u(9)),
+            "main's own tests are red",
+        )
+    };
+    let failing = |reds: &[&str]| {
+        let mut run = all_ok();
+        for red in reds {
+            run.finished.retain(|e| e["check"].as_str() != Some(red));
+            run.finished.push(finished(red, FAIL));
+        }
+        run
+    };
+    f.write("s1", &u(1), 1, &failing(&["test", "spec"]));
+    assert_eq!(names(&f.judge("s1", Some(&u(1))).failed), ["test", "spec"]);
+    assert!(
+        accept("s1", Check::Test, Some(&u(1))).is_err(),
+        "CONTROL: a tree check's acceptance names no executable"
+    );
+    assert!(
+        accept("s1", Check::Measure, None).is_err(),
+        "CONTROL: measure's acceptance names its executable"
+    );
+    assert!(accept("s2", Check::Test, None).is_err(), "another seal");
+    accept("s1", Check::Test, None).unwrap();
+    let judged = f.judge("s1", Some(&u(1)));
+    assert_eq!(
+        names(&judged.failed),
+        ["spec"],
+        "one acceptance accepts one check"
+    );
+    assert!(judged.accepted.is_none());
+    assert!(judged.fail_refusal(COMMIT).is_some());
+    accept("s1", Check::Spec, None).unwrap();
+    let judged = f.judge("s1", Some(&u(1)));
+    assert!(judged.complete(), "{}", judged.line());
+    assert!(judged.fail_refusal(COMMIT).is_none());
+    assert_eq!(judged.owner_accepted, ["test", "spec"]);
+    let words = judged.accepted.as_deref().unwrap();
+    for said in [
+        "OWNER ACCEPTED test failure: main's own tests are red",
+        "OWNER ACCEPTED spec failure: main's own tests are red",
+        "not a full verification pass",
+    ] {
+        assert!(words.contains(said), "{said}: {words}");
+    }
+    // Before the bundle is built its check is missing, and the accepted FAILs are not counted ok.
+    let before_bundle = f.judge("s1", None);
+    assert_eq!(before_bundle.missing, ["measure"]);
+    assert!(before_bundle.accepted.is_none());
+    for said in [
+        "7 of 10 checks recorded ok",
+        "the owner accepted the FAIL of test, spec",
+    ] {
+        assert!(
+            before_bundle.line().contains(said),
+            "{said}: {}",
+            before_bundle.line()
+        );
+    }
+
+    f.write("s2", &u(1), 1, &failing(&["lint"]));
+    assert!(
+        accept("s2", Check::Lint, None).is_err(),
+        "CONTROL: a source-shape check's FAIL is never accepted"
+    );
+    let at = path(&f.root, TREE, "s2", "lint", None);
+    let Read::Record(mut by_hand) = read(&at).unwrap() else {
+        panic!("the lint FAIL is recorded");
+    };
+    by_hand.outcome = ACCEPTED.into();
+    by_hand.acceptance = Some(Acceptance {
+        reason: "written by hand".into(),
+        failed_log_sha256: u(9),
+    });
+    write(&at, &by_hand).unwrap();
+    let judged = f.judge("s2", Some(&u(1)));
+    assert_eq!(judged.missing, ["lint"], "{}", judged.line());
+    assert!(!judged.complete() && judged.accepted.is_none());
 }

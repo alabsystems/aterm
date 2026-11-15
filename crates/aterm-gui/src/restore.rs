@@ -120,6 +120,10 @@ pub(crate) struct TerminalLeafRestore {
     pub land_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autopilot_by: Option<String>,
+    /// The session's pin ([`crate::session_timeline::SessionMeta::pinned`]). A layout from a build
+    /// before the pin has none, and that session was never pinned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -970,7 +974,7 @@ impl TerminalLeafRestore {
         crate::spawn_folder::inherited(self.cwd.clone()?, || self.folder_may_be_remote())
     }
 
-    /// The seven USER fields this leaf carries.
+    /// The seven USER fields this leaf carries, and its pin.
     pub(crate) fn carried_user_meta(&self) -> crate::session_timeline::SessionMeta {
         crate::session_timeline::SessionMeta {
             user_title: self.user_title.clone(),
@@ -982,6 +986,7 @@ impl TerminalLeafRestore {
             autopilot: self.autopilot.clone(),
             land_at: self.carried_land_at(),
             autopilot_set_by: self.carried_set_by(),
+            pinned: self.pinned,
             ..Default::default()
         }
     }
@@ -1000,7 +1005,7 @@ impl TerminalLeafRestore {
             self.autopilot
                 .as_deref()
                 .and_then(crate::session_timeline::normalize_autopilot_value)
-                == Some(aterm_agent::supervise::Autopilot::Cruise.word())
+                == Some(alab_policy::config::Autopilot::Cruise.word())
         })
     }
 
@@ -2038,6 +2043,12 @@ impl WindowLayout {
         }
     }
 
+    /// The tab ID of the pane this window's bootstrap session fills: a cold restore spawns that
+    /// session under it, so the tab keeps its ID ([`crate::tab_ids::keep`]).
+    pub(crate) fn bootstrap_sid(&self) -> Option<&str> {
+        self.bootstrap_terminal_leaf()?.sid.as_deref()
+    }
+
     fn bootstrap_terminal_leaf(&self) -> Option<&TerminalLeafRestore> {
         self.bootstrap_tab()?.root.first_terminal_leaf()
     }
@@ -2228,13 +2239,16 @@ impl WindowLayout {
         }
     }
 
-    fn migrate_legacy_tabs(&mut self) -> Option<()> {
+    pub(crate) fn migrate_legacy_tabs(&mut self) -> Option<()> {
         if !self.restored_tabs.is_empty() {
             return Some(());
         }
         if !self.canonical_order_is_valid() {
             return None;
         }
+        let legacy_active = self.active_item.is_none().then(|| {
+            self.canonical_active(&self.canonical_order().expect("validated legacy order"))
+        });
         self.restored_tabs = if self.tab_order.is_empty() {
             self.tabs
                 .iter()
@@ -2253,6 +2267,11 @@ impl WindowLayout {
                 })
                 .collect::<Option<Vec<_>>>()?
         };
+        if !self.restored_tabs.is_empty()
+            && let Some(active) = legacy_active
+        {
+            self.active_item = Some(active);
+        }
         Some(())
     }
 }
@@ -2291,6 +2310,7 @@ impl RestoredTab {
                         autopilot: None,
                         land_at: None,
                         autopilot_by: None,
+                        pinned: false,
                         theme: None,
                         agent: None,
                         supervised: None,
@@ -2747,6 +2767,31 @@ impl RestoreManifest {
         self.windows.first()?.bootstrap_cwd()
     }
 
+    /// The tab ID of the pane the bootstrap session 0 becomes (the first window's
+    /// [`WindowLayout::bootstrap_sid`]), which its spawn keeps.
+    pub(crate) fn first_leaf_sid(&self) -> Option<&str> {
+        self.windows.first()?.bootstrap_sid()
+    }
+
+    /// Every tab ID a terminal leaf of this layout names: held for their restore, so no tab
+    /// opened meanwhile is minted one.
+    pub(crate) fn leaf_tab_ids(&self) -> Vec<aterm_types::tab_id::TabId> {
+        let mut ids = Vec::new();
+        for window in &self.windows {
+            for tab in &window.restored_tabs {
+                tab.root.visit_terminals(&mut |terminal| {
+                    ids.extend(
+                        terminal
+                            .sid
+                            .as_deref()
+                            .and_then(aterm_types::tab_id::TabId::parse),
+                    );
+                });
+            }
+        }
+        ids
+    }
+
     /// A layout of one window whose one terminal leaf records `log_ep`, as a capture writes it.
     #[cfg(test)]
     pub(crate) fn one_terminal_for_test(log_ep: Option<u32>) -> RestoreManifest {
@@ -2772,6 +2817,7 @@ impl RestoreManifest {
             workers_in_front: false,
             restored_tabs: vec![RestoredTab {
                 root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                    pinned: false,
                     sid: Some("s-0123abcd".into()),
                     lineage: None,
                     log_ep,

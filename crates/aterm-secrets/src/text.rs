@@ -991,14 +991,15 @@ const TEMPLATE: &[&str] = &[
     "#   ...                 with a final newline",
     "#   END",
     "#   name<<END base64    the same lines, decoded from base64 (binary files)",
-    "#   name<<END if-absent (or `base64 if-absent`) written only where no file",
-    "#                       exists yet: fill gaps, never replace a machine's own file",
+    "#   name<<END if-absent (or `base64 if-absent`) a default: a machine's own value,",
+    "#                       where it holds one, stands",
     "#   name<<END if-absent=other",
-    "#                       and only where the if-absent entry `other` is not the",
-    "#                       machine's own: files that belong together fill together",
+    "#                       and only where the if-absent entry `other` is the",
+    "#                       vault's: values that belong together are read together",
     "#",
-    "# A name is a file name (written to ~/.secrets/<name>) or a home path such as",
-    "# ~/.aterm/release-ring/release-credentials.toml (written there). Every file is written 0600.",
+    "# A name is a file name or a home path such as",
+    "# ~/.aterm/release-ring/release-credentials.toml. Nothing is written to a file: each",
+    "# machine reads every value in place from its verified copy of the vault.",
 ];
 
 /// Split a text into lines: LF ends, a trailing CR dropped, a final LF optional.

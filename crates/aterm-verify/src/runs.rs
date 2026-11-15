@@ -224,6 +224,9 @@ pub struct Runs {
     uniqueid: u64,
     /// The canonical roots a survivor's exe must sit under to be ended, the worktree first.
     roots: Vec<PathBuf>,
+    /// The canonical directories the run's builds write: its target directory and what cargo
+    /// names as its build directories ([`build_dirs`]).
+    built: Vec<PathBuf>,
     /// The stage groups swept whose report the leader's reap may change
     /// ([`GroupReport::awaits_reap`]) and whose leaders are not reaped yet, each with how many
     /// `group` lines the record had for its pgid when it was swept, and its sweep's report.
@@ -233,8 +236,8 @@ pub struct Runs {
     /// leader is reaped, when the freed id may lead a group made since, is written only while
     /// no newer `group` line names that id ([`Self::group_reaped`]).
     made: Mutex<BTreeMap<u32, usize>>,
-    /// The lines the receipt carries: each stage's survivors, as their sweeps found them.
-    said: Mutex<Vec<String>>,
+    /// Each stage's report, retaining the observations its sweep already made.
+    said: Mutex<Vec<GroupReport>>,
     /// Only a fresh, admitted run-end sweep with no survivors permits removal.
     may_forget: AtomicBool,
     /// Where the stage and run-end sweeps tell what they ended ([`Inert`] until
@@ -242,15 +245,184 @@ pub struct Runs {
     poster: Box<dyn Poster>,
 }
 
+/// Why a cleanup pass left a candidate. These observations grant no signal authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurvivorReason {
+    /// The sweep did not establish the custody required to attempt an end.
+    CustodyNotProven,
+    /// The settlement's existing lineage read answered nothing.
+    IdentityUnreadable,
+    /// The end attempt returned this exact refusal.
+    EndRefused(EndRefusal),
+    /// The final identity/presence read did not establish departure; it may be unreadable.
+    ExitUnconfirmedAfterEnd(Ended),
+    /// Execution was not established, so no additional identity or executable probe was made.
+    ExecutionUnobserved,
+}
+
+impl SurvivorReason {
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::CustodyNotProven => "custody-not-proven",
+            Self::IdentityUnreadable => "identity-unreadable",
+            Self::EndRefused(EndRefusal::Stale) => "end-refused-stale",
+            Self::EndRefused(EndRefusal::NotProven) => "end-refused-not-proven",
+            Self::EndRefused(EndRefusal::SignalFailed) => "end-refused-signal-failed",
+            Self::ExitUnconfirmedAfterEnd(_) => "exit-unconfirmed-after-end",
+            Self::ExecutionUnobserved => "execution-unobserved",
+        }
+    }
+}
+
+/// A candidate left by a sweep, using only the reads that sweep already made.
+/// Identity and executable labels are observations, never a current custody proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Survivor {
+    /// The candidate's PID, including when no identity read answered.
+    pub pid: i32,
+    /// The lineage already read by settlement, before any end attempt.
+    pub lineage: Option<aterm_uds::process::Lineage>,
+    /// The existing executable path read, observed separately from lineage.
+    pub executable: Option<PathBuf>,
+    /// Why the sweep retained this candidate.
+    pub reason: SurvivorReason,
+    /// When this sweep began, in Unix milliseconds.
+    pub observed_ms: u64,
+}
+
+impl Survivor {
+    fn word(&self) -> Option<String> {
+        self.executable.as_deref().and_then(exe_word)
+    }
+}
+
+/// Where a survivor was observed. A stage observation retains its original sweep time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SurvivorScope {
+    /// A stage group's sweep, whose label and group were held by the caller.
+    Stage { stage: String, pgid: u32 },
+    /// The run's final sweep.
+    Run,
+}
+
+/// Durable diagnostic metadata, separate from the run record's cleanup authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SurvivorObservation {
+    /// The observing run's launcher PID and birth.
+    pub run_id: String,
+    /// The observing run's boot identity; births are meaningful within that boot.
+    pub boot_id: String,
+    /// Which cleanup pass made the observation.
+    pub scope: SurvivorScope,
+    /// The candidate that pass retained.
+    pub survivor: Survivor,
+}
+
+impl SurvivorObservation {
+    /// Unwrapped metadata for the verifier's diagnostic event envelope.
+    #[must_use]
+    pub fn payload(&self) -> aterm_json::Value {
+        let s = &self.survivor;
+        let lineage = s.lineage.map(|l| {
+            aterm_json::json!({
+                "birth": l.identity.birth.0, "idversion": l.identity.idversion,
+                "uniqueid": l.uniqueid, "parent": l.parent, "pgid": l.pgid,
+                "launcher_version": l.launcher_version, "tty": l.tty,
+            })
+        });
+        let (scope, stage, pgid) = match &self.scope {
+            SurvivorScope::Stage { stage, pgid } => ("stage", Some(stage.as_str()), Some(*pgid)),
+            SurvivorScope::Run => ("run", None, None),
+        };
+        let end = match s.reason {
+            SurvivorReason::ExitUnconfirmedAfterEnd(end) => Some(aterm_json::json!({
+                "termed": end.termed, "killed": end.killed, "gone": end.gone,
+            })),
+            _ => None,
+        };
+        let mut payload = aterm_json::json!({
+            "run_id": self.run_id, "boot_id": self.boot_id, "observed_ms": s.observed_ms,
+            "scope": scope, "stage": stage, "group": pgid, "pid": s.pid,
+            "lineage": lineage, "executable": s.executable.as_deref().and_then(Path::to_str),
+            "word": s.word(), "reason": s.reason.word(), "end": end,
+        });
+        if let Some(path) = s.executable.as_deref().filter(|p| p.to_str().is_none()) {
+            payload
+                .as_object_mut()
+                .expect("survivor metadata is an object")
+                .insert("executable_native".into(), native_executable(path));
+        }
+        payload
+    }
+}
+
+/// Lossless native units for a path UTF-8 cannot represent. Other runtime targets have no
+/// native encoding here and retain null; Unix and Windows use their explicit OS encodings.
+fn native_executable(path: &Path) -> aterm_json::Value {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        aterm_json::json!({ "encoding": "unix-bytes", "units": path.as_os_str().as_bytes().to_vec() })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+        aterm_json::json!({ "encoding": "windows-utf16", "units": units })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        aterm_json::Value::Null
+    }
+}
+
+/// The console summaries and the complete observations retained by a run's final sweep.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunEndReport {
+    /// Human summaries, with bounded PID and reason context.
+    pub lines: Vec<String>,
+    /// Every retained candidate, independently of the bounded console context.
+    pub survivors: Vec<SurvivorObservation>,
+}
+
+/// Bounded console context; every observation is retained separately for the durable log.
+fn survivor_context(survivors: &[Survivor]) -> String {
+    const SHOWN: usize = 8;
+    let mut words: Vec<String> = survivors
+        .iter()
+        .take(SHOWN)
+        .map(|s| format!("pid={} {}", s.pid, s.reason.word()))
+        .collect();
+    if survivors.len() > SHOWN {
+        words.push(format!("{} more", survivors.len() - SHOWN));
+    }
+    if words.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", words.join(", "))
+    }
+}
+
+fn survivor_words(survivors: &[Survivor]) -> Vec<String> {
+    survivors
+        .iter()
+        .map(|s| s.word().unwrap_or_else(|| "?".to_owned()))
+        .collect()
+}
+
 /// One stage group's survivors: what verify ended and what it named and left.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GroupReport {
     /// The stage's label.
     pub stage: String,
+    /// The group its caller held while the sweep ran.
+    pub pgid: u32,
     /// The exe words of the members verify ended by pid.
     pub ended: Vec<String>,
-    /// The exe words of the members it named and left: not its to end, or not ended.
-    pub named: Vec<String>,
+    /// The members it named and left: not its to end, or not ended.
+    pub named: Vec<Survivor>,
     /// Whether the group was listed in full (`Some(true)`), in part (`Some(false)`), or not at all.
     /// A group listed in part reads as listed in full once the kernel finds it empty after its
     /// leader is reaped ([`Self::reaped`]).
@@ -289,8 +461,18 @@ impl GroupReport {
     #[must_use]
     pub fn line(&self) -> Option<String> {
         let partial = self.listed == Some(false);
-        (partial || !self.ended.is_empty() || !self.named.is_empty())
-            .then(|| crate::findings::survivor_line(&self.stage, &self.ended, &self.named, partial))
+        (partial || !self.ended.is_empty() || !self.named.is_empty()).then(|| {
+            format!(
+                "{}{}",
+                crate::findings::survivor_line(
+                    &self.stage,
+                    &self.ended,
+                    &survivor_words(&self.named),
+                    partial
+                ),
+                survivor_context(&self.named)
+            )
+        })
     }
 }
 
@@ -300,10 +482,10 @@ pub struct Left {
     /// Ended by pid.
     pub ended: Vec<String>,
     /// Named and left.
-    pub named: Vec<String>,
+    pub named: Vec<Survivor>,
     /// Born in the run's window, running from its roots, with execution unobserved and
     /// no confirmed program-check cause.
-    pub unjudged: usize,
+    pub unjudged: Vec<Survivor>,
     /// The ended, as a poster tells them.
     pub told: Vec<Told>,
 }
@@ -315,7 +497,7 @@ impl Left {
 
     /// Whether the pass leaves a member of the run it could not end, or could not judge.
     const fn leaves_any(&self) -> bool {
-        !self.named.is_empty() || self.unjudged > 0
+        !self.named.is_empty() || !self.unjudged.is_empty()
     }
 
     /// `ended aterm ×2; named ssh-agent ×1; 1 not observed running, program-check cause unconfirmed; not judged`.
@@ -325,20 +507,24 @@ impl Left {
             parts.push(format!("ended {}", tally_words(&self.ended)));
         }
         if !self.named.is_empty() {
-            parts.push(format!("named {}", tally_words(&self.named)));
-        }
-        if self.unjudged > 0 {
             parts.push(format!(
-                "{} not observed running, program-check cause unconfirmed; not judged",
-                self.unjudged
+                "named {}",
+                tally_words(&survivor_words(&self.named))
             ));
         }
-        parts.join("; ")
+        if !self.unjudged.is_empty() {
+            parts.push(format!(
+                "{} not observed running, program-check cause unconfirmed; not judged",
+                self.unjudged.len()
+            ));
+        }
+        let all: Vec<Survivor> = self.named.iter().chain(&self.unjudged).cloned().collect();
+        format!("{}{}", parts.join("; "), survivor_context(&all))
     }
 
     /// `<head> left 3 processes: <words>`, or `<head>: <words>` when it ended and named nothing.
     fn line(&self, head: &str) -> Option<String> {
-        if self.total() == 0 && self.unjudged == 0 {
+        if self.total() == 0 && self.unjudged.is_empty() {
             None
         } else if self.total() == 0 {
             Some(format!("{head}: {}", self.words()))
@@ -362,8 +548,8 @@ enum Fate {
     },
     /// Gone before any signal: it holds nothing.
     Gone,
-    /// Still there and not ended: named.
-    Left,
+    /// Departure was not established: named, including an unreadable final look.
+    Left(SurvivorReason),
 }
 
 /// Name unreadable survivors; only changed birth or confirmed absence establishes departure.
@@ -375,7 +561,7 @@ fn settle(
 ) -> (Fate, Option<aterm_uds::process::Lineage>) {
     let Some(lin) = kernel.lineage(pid) else {
         let fate = if may_match_birth(kernel, pid, |_| true) {
-            Fate::Left
+            Fate::Left(SurvivorReason::IdentityUnreadable)
         } else {
             Fate::Gone
         };
@@ -383,7 +569,11 @@ fn settle(
     };
     let answer = end(lin.identity);
     let fate = if may_match_birth(kernel, pid, |birth| birth == lin.identity.birth) {
-        Fate::Left
+        Fate::Left(match answer {
+            None => SurvivorReason::CustodyNotProven,
+            Some(Err(refusal)) => SurvivorReason::EndRefused(refusal),
+            Some(Ok(end)) => SurvivorReason::ExitUnconfirmedAfterEnd(end),
+        })
     } else if let Some(Ok(e)) = answer
         && (e.termed || e.killed)
     {
@@ -392,15 +582,6 @@ fn settle(
         Fate::Gone
     };
     (fate, Some(lin))
-}
-
-/// `pid`'s exe word, or `?`.
-fn word_of(kernel: &impl Kernel, pid: i32) -> String {
-    kernel
-        .exe(pid)
-        .as_deref()
-        .and_then(exe_word)
-        .unwrap_or_else(|| "?".to_owned())
 }
 
 impl Runs {
@@ -418,12 +599,12 @@ impl Runs {
             birth: read_birth(pid)?,
         };
         let uniqueid = read_lineage(pid).map_or(0, |l| l.uniqueid);
-        let roots = run_roots(
-            &ctx.root,
-            &ctx.scratch,
-            &ctx.target_dir,
-            &build_dirs(ctx, ask),
-        );
+        let built = build_dirs(ctx, ask);
+        let roots = run_roots(&ctx.root, &ctx.scratch, &ctx.target_dir, &built);
+        let built = std::iter::once(ctx.target_dir.as_path())
+            .chain(built.iter().map(PathBuf::as_path))
+            .map(canonical)
+            .collect();
         aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700).ok()?;
         let path = dir.join(format!("{}.run", id.text()));
         let sid = std::env::var(aterm_uds::process::MARKER_VARS[0]).ok();
@@ -444,6 +625,7 @@ impl Runs {
             id,
             uniqueid,
             roots,
+            built,
             swept: Mutex::new(Vec::new()),
             made: Mutex::new(BTreeMap::new()),
             said: Mutex::new(Vec::new()),
@@ -457,6 +639,13 @@ impl Runs {
     pub fn telling(mut self, poster: Box<dyn Poster>) -> Self {
         self.poster = poster;
         self
+    }
+
+    /// The canonical directories the run's builds write, under which a compiler's named stale
+    /// artifact may be removed ([`crate::stale_artifact::Stale::remove`]).
+    #[must_use]
+    pub fn build_roots(&self) -> &[PathBuf] {
+        &self.built
     }
 
     /// Append one line (a newline is added), best-effort.
@@ -478,16 +667,17 @@ impl Runs {
         if report.closed() && may_close {
             self.line(&format!("closed pgid={pgid}"));
         }
-        if let Some(line) = report.line()
+        if report.line().is_some()
             && let Ok(mut said) = self.said.lock()
         {
-            said.push(line);
+            said.push(report.clone());
         }
     }
 
-    /// Sweep remaining run processes and return survivor report lines. A stage group whose
-    /// leader's reap never came is kept as its sweep found it, listed in part, never closed.
-    pub fn end_of_run(&self, kernel: &impl Kernel) -> Vec<String> {
+    /// Sweep remaining run processes and return summaries and diagnostic observations.
+    /// A stage group whose leader's reap never came is kept as its sweep found it,
+    /// listed in part, never closed.
+    pub fn end_of_run(&self, kernel: &impl Kernel) -> RunEndReport {
         let unreaped = self
             .swept
             .lock()
@@ -497,6 +687,24 @@ impl Runs {
             self.settle_group(*pgid, report, false);
         }
         self.may_forget.store(false, Ordering::Relaxed);
+        let groups = self.said.lock().map(|s| s.clone()).unwrap_or_default();
+        let mut report = RunEndReport {
+            lines: groups.iter().filter_map(GroupReport::line).collect(),
+            survivors: groups
+                .iter()
+                .flat_map(|g| {
+                    g.named.iter().cloned().map(|survivor| SurvivorObservation {
+                        run_id: self.id.text(),
+                        boot_id: self.boot.clone(),
+                        scope: SurvivorScope::Stage {
+                            stage: g.stage.clone(),
+                            pgid: g.pgid,
+                        },
+                        survivor,
+                    })
+                })
+                .collect(),
+        };
         let line = match self.run_end_sweep(kernel) {
             Some(left) => {
                 self.may_forget.store(!left.leaves_any(), Ordering::Relaxed);
@@ -506,6 +714,20 @@ impl Runs {
                     .map(|t| t.line("an orphan of its own run"))
                     .collect();
                 self.poster.post(&told);
+                report
+                    .survivors
+                    .extend(
+                        left.named
+                            .iter()
+                            .chain(&left.unjudged)
+                            .cloned()
+                            .map(|survivor| SurvivorObservation {
+                                run_id: self.id.text(),
+                                boot_id: self.boot.clone(),
+                                scope: SurvivorScope::Run,
+                                survivor,
+                            }),
+                    );
                 left.line("the run")
             }
             None => Some(
@@ -514,9 +736,8 @@ impl Runs {
                     .to_owned(),
             ),
         };
-        let mut said = self.said.lock().map(|s| s.clone()).unwrap_or_default();
-        said.extend(line);
-        said
+        report.lines.extend(line);
+        report
     }
 
     /// The W-run sweep.
@@ -646,8 +867,10 @@ pub fn sweep_group(
 ) -> GroupReport {
     let mut report = GroupReport {
         stage: label.to_owned(),
+        pgid,
         ..GroupReport::default()
     };
+    let observed_ms = kernel.now_ms();
     let leader = i32::try_from(pgid).unwrap_or(0);
     let Some(members) = kernel.members(pgid) else {
         return report;
@@ -660,12 +883,16 @@ pub fn sweep_group(
     };
     let mut told = Vec::new();
     for member in members.pids.into_iter().filter(|&m| m != leader) {
-        let word = word_of(kernel, member);
-        let (fate, _) = settle(kernel, member, |token| {
+        let executable = kernel.exe(member);
+        let (fate, lineage) = settle(kernel, member, |token| {
             proven(member).then(|| kernel.end(token, &|id| proven(id.pid)))
         });
         match fate {
             Fate::Ended { killed } => {
+                let word = executable
+                    .as_deref()
+                    .and_then(exe_word)
+                    .unwrap_or_else(|| "?".to_owned());
                 told.push(
                     Told {
                         pid: member,
@@ -677,7 +904,13 @@ pub fn sweep_group(
                 );
                 report.ended.push(word);
             }
-            Fate::Left => report.named.push(word),
+            Fate::Left(reason) => report.named.push(Survivor {
+                pid: member,
+                lineage,
+                executable,
+                reason,
+                observed_ms,
+            }),
             Fate::Gone => {}
         }
     }
@@ -688,17 +921,24 @@ pub fn sweep_group(
 /// Judge each of `pids` for `judge`'s run, end what is proven (judged again before each signal).
 fn pass<K: Kernel>(judge: &Judge<'_, K>, pids: &[i32]) -> Left {
     let mut left = Left::default();
+    let observed_ms = judge.kernel.now_ms();
     for &pid in pids {
         let proven = match judge.judge(pid) {
             Verdict::NotOurs => continue,
             Verdict::Unjudged => {
-                left.unjudged += 1;
+                left.unjudged.push(Survivor {
+                    pid,
+                    lineage: None,
+                    executable: None,
+                    reason: SurvivorReason::ExecutionUnobserved,
+                    observed_ms,
+                });
                 continue;
             }
             Verdict::Named => false,
             Verdict::Proven => true,
         };
-        let word = word_of(judge.kernel, pid);
+        let executable = judge.kernel.exe(pid);
         let (fate, lin) = settle(judge.kernel, pid, |token| {
             proven.then(|| {
                 judge
@@ -708,6 +948,10 @@ fn pass<K: Kernel>(judge: &Judge<'_, K>, pids: &[i32]) -> Left {
         });
         match fate {
             Fate::Ended { killed } => {
+                let word = executable
+                    .as_deref()
+                    .and_then(exe_word)
+                    .unwrap_or_else(|| "?".to_owned());
                 let group = lin.is_some_and(|l| {
                     judge.groups.iter().any(|&(pgid, from)| {
                         pgid == l.pgid && (from..=judge.horizon).contains(&l.uniqueid)
@@ -721,7 +965,13 @@ fn pass<K: Kernel>(judge: &Judge<'_, K>, pids: &[i32]) -> Left {
                 });
                 left.ended.push(word);
             }
-            Fate::Left => left.named.push(word),
+            Fate::Left(reason) => left.named.push(Survivor {
+                pid,
+                lineage: lin,
+                executable,
+                reason,
+                observed_ms,
+            }),
             Fate::Gone => {}
         }
     }

@@ -25,15 +25,16 @@
 //! - `lease`: b2 uses the shared account on a lease when the cut begins. The cut lasts longer than
 //!   a lease outlives its unheard Mac ([`PRESENCE_TTL_S`]), so a2 claims it while cut off, each
 //!   side settling what it hears; the heal must leave one user.
-//! - `home`: b2 uses its home account (`warm[0]`), a claim no silence lapses.
+//! - `home`: b2 uses its home account (the lab names b2 its home on both Macs, and `warm[0]`), a
+//!   claim no silence lapses.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, PoisonError};
 
 use aterm_agent::harness::accounts::{self, Advice, Class, Cli, Me, Mode, Point, Roster, State};
 use aterm_agent::harness::claims::{
-    Act, Book, LeaseKey, PRESENCE_TTL_S, Presence, RECHECK_S, Row, Table, Tabled, Touched, View,
-    keys, touch_with,
+    Act, Book, Homes, LeaseKey, PRESENCE_TTL_S, Presence, RECHECK_S, Row, Table, Tabled, Touched,
+    View, keys, touch_with,
 };
 
 /// One tap a minute.
@@ -252,10 +253,11 @@ pub fn report(ev: &Evidence) -> String {
     out
 }
 
-/// One Mac's replica of the claims table: every row it holds.
+/// One Mac's replica of the claims table: every row it holds, and the homes its lab names.
 struct Replica {
     me: &'static str,
     book: Mutex<Book>,
+    homes: Option<Homes>,
 }
 
 impl Replica {
@@ -285,6 +287,7 @@ impl Table for Replica {
             clock: None,
             skewed: Vec::new(),
             held: Vec::new(),
+            homes: self.homes.clone(),
         })
     }
 
@@ -311,7 +314,14 @@ struct Client {
 }
 
 impl Client {
-    fn new(label: &'static str, machine: &'static str, home: Option<&str>) -> Self {
+    /// The Mac labelled `label` at Commons `machine`, its lab naming `homes`; `home` is the row
+    /// whose home it is, if any.
+    fn new(
+        label: &'static str,
+        machine: &'static str,
+        home: Option<&str>,
+        homes: Option<Homes>,
+    ) -> Self {
         let mut state = State {
             swarm_label: Some(label.to_owned()),
             ..State::default()
@@ -323,6 +333,7 @@ impl Client {
             table: Replica {
                 me: machine,
                 book: Mutex::new(Book::default()),
+                homes,
             },
             state,
             heard: BTreeMap::new(),
@@ -343,6 +354,7 @@ impl Client {
     fn touch(&mut self, act: Act<'_>, now: i64) -> Touched {
         let presence = Presence {
             at: now,
+            listening_since: i64::MIN,
             heard: self.heard.clone(),
         };
         touch_with(
@@ -439,6 +451,7 @@ impl Client {
             me: self.table.me.to_owned(),
             presence: Some(Presence {
                 at: now,
+                listening_since: i64::MIN,
                 heard: self.heard.clone(),
             }),
             ..View::default()
@@ -503,10 +516,12 @@ fn scenario(name: &'static str, row: &str, home: bool) -> Scenario {
 /// [`scenario`] with a2 set up as `a2_setup` says.
 #[must_use]
 pub fn scenario_with(name: &'static str, row: &str, home: bool, a2_setup: &A2Setup) -> Scenario {
-    let mut a2 = Client::new(A2, A2_MACHINE, None);
+    // Both Macs read the same lab: in `home`, it names b2 the account's home.
+    let homes = home.then(|| Homes::of_machines([(key(row), B2_MACHINE.to_owned())]));
+    let mut a2 = Client::new(A2, A2_MACHINE, None, homes.clone());
     a2.mode = a2_setup.mode;
     a2.enrolled = a2_setup.enrolled.iter().map(|l| (*l).to_owned()).collect();
-    let mut b2 = Client::new(B2, B2_MACHINE, home.then_some(row));
+    let mut b2 = Client::new(B2, B2_MACHINE, home.then_some(row), homes);
     let end = CUT_AT + CUT_FOR + AFTER_S;
     let mut out = Scenario {
         name,

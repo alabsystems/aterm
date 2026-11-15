@@ -42,9 +42,9 @@ const ACTIVATION_WAIT: Duration = Duration::from_secs(10);
 
 /// Run the exact-crash child. The caller must isolate this in a watched process: `run_app` has no
 /// in-process deadline because controlling AppKit from a background thread would be a second,
-/// invalid execution path.
+/// invalid execution path. Prohibited activation supplies the native missing-focus control.
 #[must_use]
-pub fn run_rename_reentry_drive() -> i32 {
+pub fn run_rename_reentry_drive(activation: AppActivation) -> i32 {
     eprintln!("rename-reentry child: checking display availability");
     if let Some(why) = crate::driver_display_unavailable() {
         eprintln!("rename-reentry child: NOT RUN — {why}");
@@ -53,7 +53,7 @@ pub fn run_rename_reentry_drive() -> i32 {
     eprintln!("rename-reentry child: launching windowed platform");
     let windowed = Windowed::launch();
     eprintln!("rename-reentry child: windowed platform launched");
-    run(windowed)
+    run(windowed, activation)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -73,6 +73,7 @@ struct Driver {
     window: Option<Window>,
     proxy: EventLoopProxy<Wake>,
     open_sent: bool,
+    missing_focus_control: bool,
     attempted: bool,
     handler_active: bool,
     alert_returned: bool,
@@ -94,6 +95,16 @@ impl Driver {
 
     fn is_window(&self, id: WindowId) -> bool {
         self.window.as_ref().map(Window::id) == Some(id)
+    }
+
+    fn queue_open(&mut self, event_loop: &ActiveEventLoop) {
+        self.activation_deadline = None;
+        event_loop.set_control_flow(ControlFlow::Wait);
+        self.open_sent = true;
+        if self.proxy.send_event(Wake::OpenRename).is_err() {
+            self.unavailable = Some("the fixture event-loop proxy closed".to_owned());
+            event_loop.exit();
+        }
     }
 }
 
@@ -120,6 +131,11 @@ impl ApplicationHandler<Wake> for Driver {
                 eprintln!("rename-reentry child: fixture window shown; requesting focus");
                 window.focus_window();
                 eprintln!("rename-reentry child: fixture focus requested");
+                if self.missing_focus_control {
+                    // A prohibited app cannot become key. Probe that real native state through
+                    // the same user_event path; the positive arm waits for Focused(true).
+                    self.queue_open(event_loop);
+                }
             }
             Err(error) => {
                 self.unavailable = Some(format!("no fixture window could be created: {error}"));
@@ -140,13 +156,7 @@ impl ApplicationHandler<Wake> for Driver {
         match event {
             WindowEvent::Focused(true) if !self.open_sent && !self.attempted => {
                 eprintln!("rename-reentry child: fixture focused; queuing OpenRename");
-                self.activation_deadline = None;
-                event_loop.set_control_flow(ControlFlow::Wait);
-                self.open_sent = true;
-                if self.proxy.send_event(Wake::OpenRename).is_err() {
-                    self.unavailable = Some("the fixture event-loop proxy closed".to_owned());
-                    event_loop.exit();
-                }
+                self.queue_open(event_loop);
             }
             WindowEvent::Focused(false) if self.attempted => {
                 eprintln!("rename-reentry child: received focus loss");
@@ -197,6 +207,29 @@ impl ApplicationHandler<Wake> for Driver {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
         if self.attempted {
+            return;
+        }
+        // A focus request is not an activation grant. Observe existing AppKit objects through
+        // the windowed/main-thread reader instead of waiting forever for Focused(true).
+        let Some(focus) = self
+            .window
+            .as_ref()
+            .and_then(crate::platform::appkit_native_focus)
+        else {
+            self.unavailable = Some("the fixture's native focus could not be read".to_owned());
+            event_loop.exit();
+            return;
+        };
+        let (active, key) = (focus.app_active, focus.window_key);
+        eprintln!(
+            "rename-focus: active={} key={}",
+            u8::from(active),
+            u8::from(key)
+        );
+        if !active || !key {
+            self.unavailable =
+                Some("the fixture has no active key window at its focus probe".to_owned());
+            event_loop.exit();
             return;
         }
         self.attempted = true;
@@ -253,12 +286,12 @@ impl ApplicationHandler<Wake> for Driver {
     }
 }
 
-fn run(windowed: Windowed) -> i32 {
+fn run(windowed: Windowed, activation: AppActivation) -> i32 {
     // Unlike the quiet AppKit gallery, this exact seam requires a key Winit window so the real
     // alert naturally makes it resign focus. Accessory activation avoids a test Dock tile.
     let posture = LaunchPosture {
-        policy: Some(AppActivation::Accessory),
-        activate_on_launch: true,
+        policy: Some(activation),
+        activate_on_launch: activation != AppActivation::Prohibited,
     };
     eprintln!("rename-reentry child: building event loop");
     let mut event_loop = match crate::driver_event_loop_builder::<Wake>(posture).build() {
@@ -278,6 +311,7 @@ fn run(windowed: Windowed) -> i32 {
         window: None,
         proxy,
         open_sent: false,
+        missing_focus_control: activation == AppActivation::Prohibited,
         attempted: false,
         handler_active: false,
         alert_returned: false,

@@ -452,7 +452,7 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
         format!("APPROVED seq=102 {SCRATCH_RM} => /private/tmp/claude-502/x/t5"),
         "{lines:?}"
     );
-    let guard = crate::supervise::policy::row_guard(&format!("   {SCRATCH_RM}"));
+    let guard = alab_policy::guard::row_guard(&format!("   {SCRATCH_RM}"));
     let press = format!("key if-human=7 if-gen=1.102 if={guard} 1");
     assert_eq!(m.presses(), [press.as_str()], "{:?}", m.requests);
     let rows = ledger_rows(&ledger);
@@ -537,7 +537,7 @@ fn the_too_many_breaker_over_a_proven_read_is_ledgered_under_its_rule() {
         lines_out[0].starts_with(&format!("APPROVED seq=102 {} {}", lines[0], lines[1])),
         "{lines_out:?}"
     );
-    let guard = crate::supervise::policy::row_guard(&format!(" \u{2502} {}", lines[0]));
+    let guard = alab_policy::guard::row_guard(&format!(" \u{2502} {}", lines[0]));
     let press = format!("key if-human=7 if-gen=1.102 if={guard} 1");
     assert_eq!(m.presses(), [press.as_str()], "{:?}", m.requests);
     let rows = ledger_rows(&ledger);
@@ -1664,8 +1664,8 @@ fn the_trust_dialog_is_answered_by_a_confirmed_focus_move_then_enter() {
         format!("APPROVED seq=102 {TRUST_FOLDER}"),
         "{lines:?}"
     );
-    let folder = crate::supervise::policy::row_guard(&format!(" {TRUST_FOLDER}"));
-    let yes = crate::supervise::policy::row_guard(" ❯ Yes, I trust this folder");
+    let folder = alab_policy::guard::row_guard(&format!(" {TRUST_FOLDER}"));
+    let yes = alab_policy::guard::row_guard(" ❯ Yes, I trust this folder");
     assert_eq!(
         m.presses(),
         [
@@ -2484,8 +2484,8 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
         format!("APPROVED seq=102 {LIMIT_WAIT}"),
         "{lines:?}"
     );
-    let title = crate::supervise::policy::row_guard("  What do you want to do?");
-    let wait = crate::supervise::policy::row_guard(&format!("  ❯ 2. {LIMIT_WAIT}"));
+    let title = alab_policy::guard::row_guard("  What do you want to do?");
+    let wait = alab_policy::guard::row_guard(&format!("  ❯ 2. {LIMIT_WAIT}"));
     assert_eq!(
         m.presses(),
         [
@@ -3213,7 +3213,7 @@ fn the_hosts_default_presses_a_write_and_ledgers_it_unproven() {
         lines[0].starts_with("APPROVED seq=") && lines[0].ends_with(" touch x"),
         "{lines:?}"
     );
-    let guard = crate::supervise::policy::row_guard("   touch x");
+    let guard = alab_policy::guard::row_guard("   touch x");
     assert_eq!(
         m.presses(),
         [format!("key if-human=7 if-gen=1.101 if={guard} 1").as_str()],
@@ -4614,7 +4614,7 @@ fn the_tasks_end_at_a_withheld_point_is_settled_once_its_done_is_said() {
             );
         }
         let said = if done {
-            crate::supervise::policy::land_check::LANDED
+            alab_policy::land_check::LANDED
         } else {
             "Fixed the parser; the suite is green."
         };
@@ -7102,8 +7102,8 @@ fn a_quiet_move_at_a_held_turn_end_types_the_continuation_once_into_the_resumed_
             ..SuperviseOpts::hosted()
         };
         assert_eq!(
-            opts.policy.autopilot,
-            crate::supervise::config::Autopilot::Cruise
+            opts.policy.turn_end.autopilot,
+            alab_policy::config::Autopilot::Cruise
         );
         let (r, _) = hosted_with_host(
             &mut m,
@@ -7594,7 +7594,7 @@ fn the_host_is_told_a_sign_in_wall_holds_the_session_at_its_turn_break() {
         lasting,
         [
             Some(crate::supervise::Lasting::Wall {
-                wire: aterm_phase::WallKind::Auth.wire()
+                wire: alab_policy::vocab::WallKind::Auth.wire()
             }),
             None
         ],
@@ -7634,7 +7634,7 @@ fn a_wall_the_session_worked_past_and_came_back_to_is_told_again() {
         None,
     );
     let wall = Some(crate::supervise::Lasting::Wall {
-        wire: aterm_phase::WallKind::Auth.wire(),
+        wire: alab_policy::vocab::WallKind::Auth.wire(),
     });
     let lasting = host.lasting.lock().unwrap().clone();
     assert_eq!(
@@ -7657,7 +7657,7 @@ fn a_new_loop_tells_over_the_wall_a_loop_before_it_told() {
         ..SuperviseOpts::hosted()
     };
     let wall = Some(crate::supervise::Lasting::Wall {
-        wire: aterm_phase::WallKind::Auth.wire(),
+        wire: alab_policy::vocab::WallKind::Auth.wire(),
     });
     let run = |next: Vec<String>| {
         let host = Arc::new(TestHost::default());
@@ -7781,7 +7781,7 @@ fn a_turn_the_host_typed_is_no_short_turn_of_the_workers() {
 
 #[test]
 fn the_host_tells_a_carry_on_from_a_notice_and_only_the_carry_on_is_checked() {
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, RULE_DONE_CHECK};
+    use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK};
     let full = SuperviseOpts {
         max: Duration::from_secs(60),
         ..SuperviseOpts::hosted()
@@ -7852,7 +7852,7 @@ fn the_host_tells_a_carry_on_from_a_notice_and_only_the_carry_on_is_checked() {
 
 #[test]
 fn a_release_typed_at_a_break_is_a_carry_on_and_its_done_answer_is_checked() {
-    use crate::supervise::policy::turn_end::{RULE_CONTINUE, RULE_DONE_CHECK};
+    use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK};
     let bg = || {
         let mut r = rows(&[
             "⏺ Waiting for the build.",
@@ -8229,7 +8229,7 @@ fn the_owners_subagent_rm_box_is_pressed_once_by_the_hosts_default() {
         "the fixture's first command row"
     );
     let owner = owner_env;
-    let guard = crate::supervise::policy::row_guard(first_row);
+    let guard = alab_policy::guard::row_guard(first_row);
     let focus = owners_box()
         .iter()
         .position(|r| r == " ❯ 1. Yes")
@@ -8504,7 +8504,7 @@ fn answering(max_s: u64) -> SuperviseOpts {
 }
 
 fn guarded(row: &str) -> String {
-    crate::supervise::policy::row_guard(row)
+    alab_policy::guard::row_guard(row)
 }
 
 fn four_tab_screens() -> Vec<Vec<String>> {
@@ -8669,7 +8669,7 @@ fn the_reset_in_a_description_question_is_answered_under_land_without_the_person
         journal: Some(journal.clone()),
         ..answering(30)
     };
-    opts.policy.autopilot = crate::supervise::config::Autopilot::Land;
+    opts.policy.turn_end.autopilot = alab_policy::config::Autopilot::Land;
     let (out, code) = s.supervise(&opts).expect("supervise");
     assert_eq!(code, 0, "{out}");
     let presses = m.presses();
@@ -10542,7 +10542,7 @@ fn a_decline_is_one_fenced_guarded_keystroke_per_fresh_read() {
         "{:#?}",
         m.requests
     );
-    let g = |row: &str| crate::supervise::policy::row_guard(row);
+    let g = |row: &str| alab_policy::guard::row_guard(row);
     assert_eq!(
         writes(&m),
         [
@@ -10871,7 +10871,7 @@ fn a_box_taller_than_the_screen_is_declined_in_the_loop_and_nobody_is_asked() {
         s.set_approval_env(owner_env());
         s.set_approval_ledger(Some(ledger.clone()));
     });
-    let g = |row: &str| crate::supervise::policy::row_guard(row);
+    let g = |row: &str| alab_policy::guard::row_guard(row);
     let (sent, gens): (Vec<String>, Vec<Option<u64>>) =
         writes(&m).iter().map(|w| unfenced(w)).unzip();
     assert_eq!(
@@ -11965,7 +11965,7 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     };
 
     let host = ResetHost::reading(ResetOutcome::Spent {
-        kind: aterm_phase::ResetKind::Weekly,
+        kind: alab_policy::vocab::ResetKind::Weekly,
         asks: false,
         left: Some(1),
         cleared_at: TEST_NOW,
@@ -12015,7 +12015,7 @@ fn tier1_the_resets_keys_go_only_where_the_model_allows() {
     let host = ResetHost::reading(ResetOutcome::Kept);
     let mut m = early(&host);
     let ask = ResetAsk {
-        kind: aterm_phase::ResetKind::Weekly,
+        kind: alab_policy::vocab::ResetKind::Weekly,
         left: 2,
         day: "Oct 5".to_string(),
         day_start: None,
@@ -12680,8 +12680,8 @@ fn the_autocompact_offer_is_answered_at_400k_without_the_owner() {
             lines[0].starts_with("APPROVED seq=") && lines[0].contains("Autocompact at ‹ 400k ›"),
             "{approve}: {lines:?}"
         );
-        let title = crate::supervise::policy::row_guard(" We recommend compacting earlier");
-        let accept = crate::supervise::policy::row_guard("   ❯ Autocompact at ‹ 400k › tokens");
+        let title = alab_policy::guard::row_guard(" We recommend compacting earlier");
+        let accept = alab_policy::guard::row_guard("   ❯ Autocompact at ‹ 400k › tokens");
         assert_eq!(
             m.presses(),
             [
@@ -12722,7 +12722,7 @@ fn the_autocompact_offer_steps_to_400k_before_its_enter_and_off_is_the_owners() 
         s.set_autocompact_settle(Duration::ZERO);
     });
     let at = |size: &str| {
-        crate::supervise::policy::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
+        alab_policy::guard::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
     };
     assert_eq!(
         m.presses(),
@@ -12777,7 +12777,7 @@ fn the_autocompact_offer_steps_through_a_served_size_off_the_ladder() {
         s.set_autocompact_settle(Duration::ZERO);
     });
     let at = |size: &str| {
-        crate::supervise::policy::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
+        alab_policy::guard::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
     };
     let presses = m.presses();
     assert_eq!(presses.len(), 3, "{:?}", m.requests);
@@ -12820,7 +12820,7 @@ fn a_later_autocompact_offer_is_stepped_afresh_after_an_idle_read() {
         s.set_autocompact_settle(Duration::ZERO);
     });
     let at = |size: &str| {
-        crate::supervise::policy::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
+        alab_policy::guard::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
     };
     let presses = m.presses();
     assert_eq!(presses.len(), 3, "{:?}", m.requests);
@@ -12884,7 +12884,7 @@ fn the_auto_mode_setup_offer_is_put_off_at_every_level_and_the_turn_continued() 
         };
         let (offer, gone) = auto_mode_offer(text);
         let p = aterm_phase::parse_prompt_v2(&offer).expect("the offer");
-        let title = crate::supervise::policy::row_guard(
+        let title = alab_policy::guard::row_guard(
             aterm_phase::prompt::title_row(&p, &offer).expect("the title row"),
         );
         let mut m = fenced(vec![busy_screen(), offer, gone]);
@@ -13052,7 +13052,7 @@ fn the_autocompact_offer_stepper_stops_where_the_target_is_not_offered() {
         ..SuperviseOpts::hosted_with(&crate::supervise::SupervisorConfig::default())
     };
     let at = |size: &str| {
-        crate::supervise::policy::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
+        alab_policy::guard::row_guard(&format!("   ❯ Autocompact at ‹ {size} › tokens"))
     };
     for (screens, why) in [
         (
@@ -13213,7 +13213,7 @@ fn the_chrome_intro_is_confirmed_once_at_safe_and_all() {
         let opts = SuperviseOpts { policy, ..auto(30) };
         let (intro, repl) = intro_then_repl(text);
         let p = aterm_phase::parse_prompt_v2(&intro).expect("the intro");
-        let footer = crate::supervise::policy::row_guard(&intro[p.options[0].row]);
+        let footer = alab_policy::guard::row_guard(&intro[p.options[0].row]);
         // The tail read and the whole read each see the intro, as the trust dialog's tests do.
         let mut m = fenced(vec![intro.clone(), intro, repl]);
         m.human_seq = Some(3);
@@ -13271,7 +13271,7 @@ fn a_chrome_intro_taller_than_the_tail_is_read_whole_and_confirmed() {
         !p.head_off_screen,
         "PRECONDITION: the screen shows it whole"
     );
-    let footer = crate::supervise::policy::row_guard(&tall[p.options[0].row]);
+    let footer = alab_policy::guard::row_guard(&tall[p.options[0].row]);
     let (dir, ledger) = ledger_file("chrome-intro-tall");
     let mut policy = auto(30).policy;
     policy.set("approve", "all").expect("a level");
@@ -14089,7 +14089,7 @@ fn a_retry_mark_with_any_signed_stamp_can_be_taken_up_by_the_session() {
     let path = dir.join("books.jsonl");
     let now_ms = 1_790_000_000_000_i64;
     let origin = Instant::now();
-    let kind = aterm_phase::WallKind::Overloaded;
+    let kind = alab_policy::vocab::WallKind::Overloaded;
     let restore = |since_ms| {
         let carried = Carried {
             short: 2,
@@ -14156,10 +14156,10 @@ fn a_retry_mark_read_measured_down_is_taken_up_and_handed_on_by_the_session() {
     let dir = crate::supervise::ScratchDir::new("retry-mark", "down");
     let path = dir.join("books.jsonl");
     let now_ms = 1_790_000_000_000_i64;
-    let kind = aterm_phase::WallKind::ApiError {
+    let kind = alab_policy::vocab::WallKind::ApiError {
         code: None,
         retryable: true,
-        cause: aterm_phase::ApiCause::CutOff,
+        cause: alab_policy::vocab::ApiCause::CutOff,
     };
     for down in [true, false] {
         let carried = Carried {
@@ -14205,7 +14205,7 @@ fn a_retry_mark_whose_outage_resumed_on_a_witness_is_taken_up_and_handed_on() {
     let dir = crate::supervise::ScratchDir::new("retry-mark", "witnessed");
     let path = dir.join("books.jsonl");
     let now_ms = 1_790_000_000_000_i64;
-    let kind = aterm_phase::WallKind::Overloaded;
+    let kind = alab_policy::vocab::WallKind::Overloaded;
     for witnessed in [true, false] {
         let carried = Carried {
             retry: Some(RetryMark {
@@ -14255,7 +14255,7 @@ fn a_session_that_worked_under_a_loop_before_is_seeded_as_worked() {
     use crate::supervise::approvals::{
         Carried, Outcome, RULE_POINT, RULE_TURN_RAN, Row, TURN_RAN, point_reason,
     };
-    use crate::supervise::policy::turn_end::RULE_CONTINUE;
+    use alab_policy::words::RULE_CONTINUE;
     let dir = crate::supervise::ScratchDir::new("worked-before", "seed");
     let path = dir.join("books.jsonl");
     let now_ms = 1_790_000_000_000_i64;
@@ -14415,7 +14415,7 @@ fn legacy_journal_times_match_only_within_the_recorded_tolerance() {
             now,
         );
         assert_eq!(
-            state.wall_attempts(aterm_phase::WallKind::UsageSession),
+            state.wall_attempts(alab_policy::vocab::WallKind::UsageSession),
             Some(3)
         );
     }
@@ -14492,7 +14492,7 @@ fn the_harness_says_its_decline_enter_denies() {
         "{:#?}",
         m.requests
     );
-    let g = |row: &str| crate::supervise::policy::row_guard(row);
+    let g = |row: &str| alab_policy::guard::row_guard(row);
     assert_eq!(
         writes(&m),
         [

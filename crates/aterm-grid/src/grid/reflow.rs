@@ -321,6 +321,14 @@ impl Grid {
     }
 
     /// [`Grid::resize`] under an explicit [`ResizePolicy`].
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ScrollbackHandoff",
+            action = "OpenRoom",
+            project = "grid::scrollback_offload::tests::handoff_environment_actions_match_grid_and_reject_wrong_rows"
+        )
+    )]
     pub fn resize_with_policy(&mut self, new_rows: u16, new_cols: u16, policy: ResizePolicy) {
         self.resize_with_reflow_mode_and_policy(new_rows, new_cols, ReflowMode::Enabled, policy);
     }

@@ -7,19 +7,15 @@
 //! path inventories no repositories, asks GitHub nothing and stores no credential. A section of
 //! GitHub CLI's helper gives way only where the token is here ([`super::token_here`]).
 
-use super::{
-    Asked, Github, KEYCHAIN_BLOCK, asked, helper, profile, read_token, token_file, token_here,
-};
+use super::{Asked, KEYCHAIN_BLOCK, asked, helper, profile, read_token, token_here};
 use crate::git_credential::{Git, Helper, Lookups};
 use crate::model::User;
 use crate::port::System;
 use crate::sync::GithubRead;
-use std::path::Path;
 
-/// The account this pass reads for, and whether init.toml's `[github]` names a custom token
-/// source. Its settings are this login's alone, and `[github] enabled = false` leaves them to
-/// the person.
-fn prepare(sys: &dyn System) -> Result<(User, bool), GithubRead> {
+/// The account this pass reads for. Its settings are this login's alone, and `[github] enabled
+/// = false` leaves them to the person.
+fn prepare(sys: &dyn System) -> Result<User, GithubRead> {
     let user = sys.identity().map_err(GithubRead::Deferred)?.user;
     if user.uid != sys.euid() || user.uid == 0 {
         return Err(GithubRead::NotApplicable(
@@ -29,21 +25,15 @@ fn prepare(sys: &dyn System) -> Result<(User, bool), GithubRead> {
     let profile = profile(sys, &user)
         .map_err(GithubRead::Deferred)?
         .unwrap_or_default();
-    let custom = match asked(profile.github, &user).map_err(GithubRead::Deferred)? {
-        Asked::Off => {
-            return Err(GithubRead::NotApplicable(
-                "off: [github] enabled = false".into(),
-            ));
-        }
-        Asked::Profile(config) => {
-            config.token_file != token_file(Path::new(&user.home)) || config.token_key.is_some()
-        }
-        Asked::Scoped(_) | Asked::Default => false,
-    };
+    if let Asked::Off = asked(profile.github).map_err(GithubRead::Deferred)? {
+        return Err(GithubRead::NotApplicable(
+            "off: [github] enabled = false".into(),
+        ));
+    }
     if !Git::for_user(sys, &user).installed(sys) {
         return Err(GithubRead::Deferred(super::NEEDS_GIT.into()));
     }
-    Ok((user, custom))
+    Ok(user)
 }
 
 /// Read whether the keychain block an earlier `aterm init` wrote is there to replace (from git's
@@ -55,7 +45,7 @@ fn prepare(sys: &dyn System) -> Result<(User, bool), GithubRead> {
 /// # Errors
 /// git's settings or its credential reply cannot be read completely.
 pub fn vault_git_credentials(sys: &dyn System) -> Result<GithubRead, String> {
-    let (user, custom) = match prepare(sys) {
+    let user = match prepare(sys) {
         Ok(read) => read,
         Err(status) => return Ok(status),
     };
@@ -73,18 +63,7 @@ pub fn vault_git_credentials(sys: &dyn System) -> Result<GithubRead, String> {
             ))
         });
     }
-    if custom {
-        return Ok(GithubRead::NotApplicable(
-            "a custom GitHub token source is left unchanged".into(),
-        ));
-    }
-    let source = Github {
-        account: String::new(),
-        owner: String::new(),
-        token_file: token_file(Path::new(&user.home)),
-        token_key: None,
-    };
-    let token = match read_token(sys, &user, &source) {
+    let token = match read_token(sys, &user) {
         Ok(token) => token,
         Err(unread) => return Ok(GithubRead::Deferred(unread.why)),
     };
@@ -107,8 +86,7 @@ pub fn vault_git_credentials(sys: &dyn System) -> Result<GithubRead, String> {
 /// run failed (output withheld), when the files may hold part of the change, which `journaled`
 /// puts back.
 pub fn sync_vault_git_credentials(sys: &dyn System, journaled: &str) -> Result<String, String> {
-    let (user, _) =
-        prepare(sys).map_err(|status| format!("GitHub settings changed: {status:?}"))?;
+    let user = prepare(sys).map_err(|status| format!("GitHub settings changed: {status:?}"))?;
     let git = Git::for_user(sys, &user);
     let Some(block) = git.keychain_block(sys, &user, &|| token_here(sys, &user))? else {
         return Ok("no keychain GitHub block is left to replace".into());
@@ -118,7 +96,7 @@ pub fn sync_vault_git_credentials(sys: &dyn System, journaled: &str) -> Result<S
     }
     let helper = helper(sys, &user).ok_or_else(|| Helper::unavailable(sys, &user))?;
     git.replace_keychain_block(sys, &user, &block, &helper, &|| {
-        let (current, _) =
+        let current =
             prepare(sys).map_err(|status| format!("GitHub settings changed: {status:?}"))?;
         if current != user || !git.installed(sys) {
             return Err("GitHub login or Git changed during replacement".into());

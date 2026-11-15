@@ -7,8 +7,10 @@ use super::*;
 
 enum Selected {
     Native,
+    /// The vault entry the pool syncs from by default, with the text read when captured.
     Local(Option<LocalCliSource>),
-    Explicit(Option<PathBuf>),
+    /// A named source: where it is a local file or a vault entry, where to read it again.
+    Explicit(Option<SnapshotAt>),
 }
 
 pub(super) struct ProviderSource {
@@ -103,18 +105,21 @@ impl ProviderSource {
         let (selected, raw) = if native.is_some() {
             (Selected::Native, None)
         } else if let Some(named) = named {
-            let path = match fetch_plan(env, named)? {
-                FetchPlan::File(path) => Some(path),
+            let at = match fetch_plan(env, named)? {
+                FetchPlan::File(path) => Some(SnapshotAt::File(path)),
+                FetchPlan::Entry(name) => Some(SnapshotAt::Entry(name)),
                 FetchPlan::Http(_) => None,
             };
-            (Selected::Explicit(path), Some(fetch(env, named)?))
+            (Selected::Explicit(at), Some(fetch(env, named)?))
         } else {
-            let selected = Self::local(cli, home, &policy)?;
+            let selected = Self::local(cli, home, &policy);
             let raw = selected
                 .as_ref()
                 .map(|selected| {
-                    read_local_source_text(&selected.path)
-                        .map_err(|why| format!("{}: {why}", selected.path.display()))
+                    selected
+                        .entry
+                        .text()
+                        .map_err(|why| format!("{}: {why}", selected.entry.source()))
                 })
                 .transpose()?;
             (Selected::Local(selected), raw)
@@ -156,20 +161,14 @@ impl ProviderSource {
         cli: Cli,
         home: &Path,
         policy: &accounts::source_policy::Snapshot,
-    ) -> Result<Option<LocalCliSource>, String> {
-        local_cli_source_observed(cli, home, policy, &mut |path, pool| {
-            if pool {
-                pool_entry_present(path)
-            } else {
-                source_entry_present(path)
-            }
-        })
+    ) -> Option<LocalCliSource> {
+        local_cli_source_observed(cli, home, policy)
     }
 
     fn source_name(&self) -> Option<String> {
         match &self.selected {
             Selected::Native => Some(super::super::alab_roster::SOURCE.to_owned()),
-            Selected::Local(selected) => selected.as_ref().map(|s| s.path.display().to_string()),
+            Selected::Local(selected) => selected.as_ref().map(|s| s.entry.source()),
             Selected::Explicit(_) => self.named.clone(),
         }
     }
@@ -201,41 +200,29 @@ impl ProviderSource {
                 .map_err(|why| SyncError::retry(Retry::Changed, why))?;
         }
         let home = env.home.as_deref().ok_or("no home directory")?;
-        if self.retire_legacy
-            && let Selected::Local(Some(selected)) = &self.selected
-            && accounts::source_policy::aliases(
-                &selected.path,
-                &home.join(".secrets").join(cli_fleet_file(cli)),
-            )?
+        // A default source is a vault entry read by name, with the text it held: the same
+        // selection over a newer read is the same precedence and the same bytes.
+        if let Selected::Local(selected) = &self.selected
+            && Self::local(cli, home, &self.policy) != *selected
         {
-            return Err("provider replacement aliases the legacy source it would retire".into());
+            return Err(SyncError::retry(
+                Retry::Changed,
+                "provider source precedence changed after capture",
+            ));
         }
-        let path = match &self.selected {
-            Selected::Local(selected) => {
-                if Self::local(cli, home, &self.policy)
-                    .map_err(|why| SyncError::retry(Retry::Changed, why))?
-                    != *selected
-                {
-                    return Err(SyncError::retry(
-                        Retry::Changed,
-                        "provider source precedence changed after capture",
-                    ));
+        if let Selected::Explicit(Some(at)) = &self.selected {
+            let current = match at {
+                SnapshotAt::File(path) => {
+                    read_local_source_text_with(path, astream_sys::Links::Follow)
+                        .map(Some)
+                        .map_err(|why| format!("{}: {why}", path.display()))
                 }
-                selected.as_ref().map(|s| (s.path.as_path(), false))
+                SnapshotAt::Entry(_) => snapshot_bytes(Some(home), at)
+                    .map(|bytes| bytes.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+                    .map_err(|why| format!("{at}: {why}")),
             }
-            Selected::Explicit(path) => path.as_deref().map(|path| (path, true)),
-            Selected::Native => None,
-        };
-        if let Some((path, explicit)) = path {
-            let links = if explicit {
-                astream_sys::Links::Follow
-            } else {
-                astream_sys::Links::Refuse
-            };
-            let current = read_local_source_text_with(path, links).map_err(|why| {
-                SyncError::retry(Retry::Unavailable, format!("{}: {why}", path.display()))
-            })?;
-            if Some(current.as_str()) != self.raw.as_deref() {
+            .map_err(|why| SyncError::retry(Retry::Unavailable, why))?;
+            if current.as_deref() != self.raw.as_deref() {
                 return Err(SyncError::retry(
                     Retry::Changed,
                     "provider source bytes changed after capture",
@@ -273,19 +260,13 @@ impl ProviderSource {
         Ok(())
     }
 
-    pub(super) fn protect(&self, cli: Cli, env: &Env, output: &Path) -> Result<(), String> {
+    pub(super) fn protect(&self, env: &Env, output: &Path) -> Result<(), String> {
         let mut protection = SourceProtection {
             home: env.home.clone(),
-            read_only: env
-                .home
-                .iter()
-                .map(|home| home.join(".secrets").join(cli_fleet_file(cli)))
-                .collect(),
+            read_only: Vec::new(),
         };
-        match &self.selected {
-            Selected::Local(Some(selected)) => protection.read_only.push(selected.path.clone()),
-            Selected::Explicit(Some(path)) => protection.read_only.push(path.clone()),
-            _ => {}
+        if let Selected::Explicit(Some(SnapshotAt::File(path))) = &self.selected {
+            protection.read_only.push(path.clone());
         }
         protection.check(&[output])
     }

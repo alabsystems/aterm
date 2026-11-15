@@ -32,9 +32,14 @@ pub const HOST_STORE_TARGET_FD: u32 = 7;
 /// declaration is emitted only by the integrated native entry/client.
 pub const BOOTSTRAP_GRAPH_PROTOCOL_MARKER: [u8; 64] = marker();
 pub mod object;
+pub mod archive;
 pub mod query;
 pub mod source;
 pub use source::{SourceAttachment, SourceRecord, SourceReply};
+pub mod configuration;
+pub use configuration::{ConfigurationAttachment, ConfigurationReply};
+pub mod materialization;
+pub use materialization::{MaterializationPreparation, MaterializationReply};
 const fn marker() -> [u8; 64] {
     let mut bytes = [0; 64];
     let magic = *b"TRUSTBGRAPH00002";

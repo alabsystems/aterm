@@ -150,10 +150,10 @@ pub fn vet_args(
             return Err(fsio::concat(&[
                 "'",
                 tok,
-                "' does not exist: the master phrase is read only from /dev/tty. If you \
-                 typed your real phrase on this command line, TREAT THAT MASTER AS \
-                 COMPROMISED (it may be in shell history and was visible to `ps`): destroy \
-                 the paper and generate a new master on a tree whose anchor is not armed.",
+                "' does not exist: the master phrase is read only from the vault \
+                 (release-paper-master). If you typed your real phrase on this command line, \
+                 TREAT THAT MASTER AS COMPROMISED (it may be in shell history and was visible \
+                 to `ps`): rotate it (docs/RELEASE-KEYS.md, Rotating the master).",
             ]));
         }
         if !allowed.contains(&name) {

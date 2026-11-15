@@ -217,6 +217,35 @@ pub fn processes() -> Option<Sweep> {
     processes_with(SweepOpts::default())
 }
 
+/// One process's identity and usage counters, without reading unrelated processes on macOS.
+/// An owning waiter may read an unreaped zombie's final own and child counters before reaping
+/// it; the returned start must still match that waiter's original child.
+#[must_use]
+pub fn process_usage(pid: u32) -> Option<ProcessReading> {
+    #[cfg(target_os = "macos")]
+    {
+        let signed = i32::try_from(pid).ok().filter(|p| *p > 0)?;
+        // Read state before usage: a zombie cannot run again, so a following rusage read is
+        // final. Reading usage first could label a still-running counter final after exit.
+        let info = crate::jobs::macos_kinfo(signed)?;
+        let usage = imp::rusage(signed)?;
+        let (numer, denom) = imp::timebase();
+        Some(ProcessReading {
+            state: crate::jobs::RunState::from_bsd(info.stat),
+            ppid: info.ppid,
+            uid: Some(info.uid),
+            coalition: crate::coalitions::coalition_of(pid),
+            version: pid_version(pid),
+            reaps_unwaited: Some(info.reaps_unwaited),
+            ..imp::usage_row(pid, Some(&usage), numer, denom)
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        processes()?.procs.into_iter().find(|p| p.pid == pid)
+    }
+}
+
 /// Sweep every process, reading what `opts` asks for too; `None` where the platform has no reader.
 #[must_use]
 pub fn processes_with(opts: SweepOpts) -> Option<Sweep> {
@@ -432,6 +461,7 @@ pub(crate) mod imp {
 
     /// `pid`'s short BSD info (readable for every process), whole or `None`.
     pub(crate) fn short_info(pid: c_int) -> Option<ShortInfo> {
+        crate::lane::mark("proc_pidinfo SHORTBSDINFO", u32::try_from(pid).ok());
         // SAFETY: plain integers and bytes; all-zero is valid.
         let mut info: ShortInfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<ShortInfo>() as c_int;
@@ -454,6 +484,7 @@ pub(crate) mod imp {
     /// `pid`'s `p_name` (`PROC_PIDTBSDINFO`): the name of the file it last exec'd, as `p_comm` is,
     /// cut at 31 bytes rather than 15. Only the process's own user (or root) may read it.
     fn p_name(pid: c_int) -> Option<Vec<u8>> {
+        crate::lane::mark("proc_pidinfo TBSDINFO", u32::try_from(pid).ok());
         // SAFETY: plain integers and bytes; all-zero is valid.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as c_int;
@@ -505,6 +536,7 @@ pub(crate) mod imp {
 
     /// `pid`'s `p_idversion` ([`super::pid_version`]).
     pub(crate) fn pid_version(pid: c_int) -> Option<i32> {
+        crate::lane::mark("proc_pidinfo UNIQIDENTIFIERINFO", u32::try_from(pid).ok());
         // SAFETY: plain integers and bytes; all-zero is valid.
         let mut info: UniqIdentifierInfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<UniqIdentifierInfo>() as c_int;
@@ -531,6 +563,7 @@ pub(crate) mod imp {
     static FLAVOR: Flavor = Flavor::new();
 
     pub(super) fn rusage_result(pid: c_int) -> Result<Usage, i32> {
+        crate::lane::mark("proc_pid_rusage", u32::try_from(pid).ok());
         let mut ri = RusageV6::default();
         let v6 = FLAVOR.read(&mut ri, |flavor, ri| {
             // SAFETY: `ri` is a writable `rusage_info_v6`, which holds either flavor's record
@@ -568,6 +601,7 @@ pub(crate) mod imp {
     }
 
     fn priority(pid: c_int, which: c_int) -> Result<i32, i32> {
+        crate::lane::mark("getpriority", u32::try_from(pid).ok());
         // SAFETY: errno is thread-local; getpriority only reads the named process's policy.
         let (value, errno) = unsafe {
             *libc::__error() = 0;
@@ -656,6 +690,7 @@ pub(crate) mod imp {
         opts: SweepOpts,
         ids: &mut crate::coalitions::CoalitionIds,
     ) -> Option<Sweep> {
+        crate::lane::mark("proc_listallpids", None);
         // SAFETY: a null buffer asks for the count only.
         let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
         let count = usize::try_from(count).ok()?;
@@ -722,6 +757,7 @@ pub(crate) mod imp {
                 _ => continue,
             };
             let read_at = Some(std::time::Instant::now());
+            crate::lane::mark("getsid", u32::try_from(pid).ok());
             // SAFETY: a plain syscall on an integer.
             let sid = unsafe { libc::getsid(pid) };
             let end = info.comm.iter().position(|b| *b == 0).unwrap_or(16);

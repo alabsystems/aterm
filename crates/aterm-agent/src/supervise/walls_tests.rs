@@ -4,9 +4,9 @@
 //! Wall handling tests under forever mode.
 
 use super::*;
-use crate::supervise::config::Autopilot;
 use crate::supervise::policy::turn_end::Seat;
-use aterm_phase::WallKind;
+use alab_policy::config::Autopilot;
+use alab_policy::vocab::WallKind;
 use aterm_phase::prompt::fixtures::screen;
 
 struct P {
@@ -72,7 +72,7 @@ fn run_points_as(
     let mut notes = Vec::new();
     s.ledger = approvals::Ledger::open(Some(&ledger), Some("@s-1"), &mut notes);
     let mut opts = hosted(30);
-    opts.policy.autopilot = autopilot;
+    opts.policy.turn_end.autopilot = autopilot;
     opts.idle_host = relauncher.map(|ours| Arc::new(Relauncher { ours }) as Arc<dyn IdleHost>);
     let mut out = Vec::new();
     let mut clock = Clock::start(&mut s);

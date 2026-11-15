@@ -20,14 +20,16 @@ impl IndexKey {
         )
     }
 
+    /// The index of a move to another account ([`Purpose::moves_account`]): a usage-limit
+    /// handoff's or a lost login's, each under its own name.
     /// # Errors
-    /// The intent cannot be encoded or is not a quota intent.
-    pub fn quota(intent: &Intent, pid: u32, birth: u64, start: &str) -> Result<Self, &'static str> {
-        if intent.purpose != Purpose::WeeklyQuota {
+    /// The intent cannot be encoded or moves no account.
+    pub fn moved(intent: &Intent, pid: u32, birth: u64, start: &str) -> Result<Self, &'static str> {
+        if !intent.purpose.moves_account() {
             return Err("index-purpose");
         }
         let key = aterm_json::to_string(&(intent, pid, birth, start)).map_err(|_| "index-key")?;
-        Ok(Self::new(Purpose::WeeklyQuota, key.as_bytes()))
+        Ok(Self::new(intent.purpose, key.as_bytes()))
     }
 
     fn new(purpose: Purpose, key: &[u8]) -> Self {
@@ -41,6 +43,7 @@ impl IndexKey {
         let prefix = match self.purpose {
             Purpose::Login => "intent",
             Purpose::WeeklyQuota => "quota-intent",
+            Purpose::LoginRotation => "login-rotation-intent",
         };
         Ok(env
             .accounts_store_for(accounts::Cli::Codex)

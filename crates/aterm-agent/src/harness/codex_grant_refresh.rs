@@ -113,9 +113,7 @@ impl Operation {
             && valid_hex(&self.slot, self.slot.len())
             && self.caller.pid > 1
             && self.caller.birth > 0
-            && self.caller.sid.starts_with("s-")
-            && self.caller.sid.len() <= 64
-            && !self.caller.sid.chars().any(char::is_control)
+            && aterm_types::control_verbs::is_minted_sid(&self.caller.sid)
     }
 }
 

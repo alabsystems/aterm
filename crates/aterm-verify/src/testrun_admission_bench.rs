@@ -263,7 +263,7 @@ fn scan(
                 }
                 result
             },
-            false,
+            &|| false,
             &mut core_wait,
         );
         if let Some(result) = outcome {
@@ -343,7 +343,7 @@ pub(crate) fn measure(arm: Arm) -> Result<aterm_json::Value, String> {
         Some(physical),
     ));
     let share = u32::try_from(WORKERS).map_err(|_| "worker count exceeds planner range")?;
-    let mut plan = test_plan::plan(&vec![None; CANDIDATES], share, None, 1 << 30);
+    let mut plan = test_plan::plan(&vec![None; CANDIDATES], &[], share, None, 1 << 30);
     for binary in &mut plan.order {
         binary.peak = 1 << 30;
         binary.charge = 1;

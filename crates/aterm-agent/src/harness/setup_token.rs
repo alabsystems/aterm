@@ -10,13 +10,14 @@
 //!   controlling terminal, so nothing it writes reaches the person's tab. Its environment is
 //!   [`child_env`]: [`super::login_drive::passed_unrouted`], a fixed `PATH`, `TERM=dumb`, both
 //!   Claude homes on a fresh 0700 scratch folder ([`Scratch`]) and the telemetry opt-outs; no
-//!   credential, no route and no aterm session variable. Its page opens in the person's
-//!   default browser (no `BROWSER`), or, where this Mac makes the token by itself, in aterm's
-//!   own sign-in window ([`WindowRoute`], [`window_env`]).
+//!   credential, no route and no aterm session variable. Its page opens through aterm's opener
+//!   and nowhere else ([`OpenerRoute`], [`opener_env`]): in aterm's own sign-in window, or on
+//!   the account's own headless browser profile right after a headless sign-in proved it
+//!   ([`OpenerPage`]). Nobody pastes a code.
 //! - **The default route only.** A verb whose own environment names a route
 //!   ([`super::netwatch::names_a_route`]) is refused before anything is made ([`route_in`]).
-//! - **The authorize URL is never relayed.** The child opens it (by itself, or through
-//!   aterm's opener, which it starts with the URL); the capture checks each
+//! - **The authorize URL is never relayed.** The child opens it through aterm's opener, which
+//!   it starts with the URL; the capture checks each
 //!   authorization request the child shows ([`admit_url`]: claude.com's or claude.ai's authorize
 //!   path, the `user:inference` scope alone, the setup-token lifetime where the URL names one)
 //!   and ends the child at any other.
@@ -24,9 +25,9 @@
 //!   control bytes skipped, an OSC 8 link's address kept as a line of its own) into one buffer
 //!   of [`BUFFER`] bytes, made at that size and wiped when it drops; no `String` of child bytes
 //!   is made, and past [`BUFFER`] without a verdict the capture stops.
-//! - **The grammar is closed** ([`Judge`]): the paste prompt becomes the verb's own hidden prompt
-//!   ([`Person::paste`]), or, in the sign-in window, the code the window's page ended on
-//!   ([`WindowWaiter`]); success is Claude Code's success marker, then a token, then its export
+//! - **The grammar is closed** ([`Judge`]): at Claude Code's paste prompt the capture types the
+//!   code aterm's opener's page ended on, where a hosted flow ended on one ([`SignIn::code`],
+//!   [`OpenerWaiter`]); success is Claude Code's success marker, then a token, then its export
 //!   line, with every token-shaped value the same one; failure is one of [`Failure`]'s
 //!   phrases; any other end is [`Error::NoToken`].
 //! - **Errors carry no child bytes**: each is a fixed sentence ([`Error`]).
@@ -77,13 +78,9 @@ pub const OPT_OUTS: [(&str, &str); 3] = [
 /// 500 ms after it); then its group is killed. Never past the capture's deadline.
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 
-/// How long one wait for the child's output lasts at most, so a stop, a paste and both clocks
-/// are looked at this often.
+/// How long one wait for the child's output lasts at most, so a stop, the opener's code and
+/// both clocks are looked at this often.
 const READ_TICK: Duration = Duration::from_millis(100);
-
-/// What the verb asks the person while Claude Code waits for a pasted code.
-pub const PASTE_PROMPT: &str =
-    "if the browser shows a code to paste, paste it here (it is not shown as you type): ";
 
 /// Why a capture made no token. Each is a fixed sentence: none holds a byte the child wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,15 +110,18 @@ pub enum Error {
     WrongAccount(String),
     /// One of Claude Code's own failures.
     Failed(Failure),
-    /// The sign-in in aterm's own window ended without authorizing: what its opener met, in
-    /// the opener's own closed words ([`super::open_url::Met::words`]).
-    Window(String),
+    /// The sign-in aterm's opener ran (in its window, or on the account's headless profile)
+    /// ended without authorizing: what the opener met, as its closed word
+    /// ([`super::open_url::MetWord`]), never its host or reason; an opener that recorded
+    /// nothing it met is [`super::open_url::MetWord::NotAuthorized`].
+    Opener(super::open_url::MetWord),
 }
 
 /// Claude Code's own failures, as 2.1.318 words them ([`FAILURES`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
-    /// "Invalid code. Please make sure the full code was copied".
+    /// "Invalid code. Please make sure the full code was copied": the code aterm's opener handed
+    /// over was not taken.
     CodeIncomplete,
     /// "Failed to exchange authorization code for access token".
     Exchange,
@@ -159,8 +159,7 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::CodeIncomplete => {
-                "Claude Code did not take the pasted code (it was not the whole code); run it \
-                 again and paste all of it"
+                "Claude Code did not take the code aterm's opener handed over; run it again"
             }
             Self::Exchange => {
                 "claude.com did not turn the sign-in into a token; run it again (nothing was made)"
@@ -214,9 +213,10 @@ impl std::fmt::Display for Error {
                 "Claude Code made a token for another account; sign in as {email}"
             ),
             Self::Failed(failure) => failure.fmt(f),
-            Self::Window(why) => write!(
+            Self::Opener(word) => write!(
                 f,
-                "the sign-in in aterm's sign-in window did not complete: {why}; nothing was made"
+                "the sign-in aterm's opener ran did not complete: {}; nothing was made",
+                word.words()
             ),
         }
     }
@@ -292,36 +292,48 @@ impl Program {
     }
 }
 
-/// The person at the verb's terminal, as the capture talks to them.
-pub trait Person: Sync {
-    /// Shows `line` (never a byte the child wrote).
+/// The sign-in a capture waits on, run by aterm's opener ([`OpenerWaiter`]; a test's stand-in).
+pub trait SignIn: Sync {
+    /// Shows `line` (never a byte the child wrote) to whoever started the run.
     fn say(&self, line: &str);
-    /// Reads the code the browser shows, unshown, after `prompt`: `Ok(None)` once `cancelled`
-    /// is set (the browser's own return came first).
+    /// The code a hosted flow's page ended on, for Claude Code's paste prompt, once there is
+    /// one: `Ok(None)` once `cancelled` is set (the loopback return came first) or the sign-in
+    /// ended without one.
     ///
     /// # Errors
-    /// `Interrupted` at Ctrl-C; any other error ends the asking (the browser's return still
-    /// works).
-    fn paste(
-        &self,
-        prompt: &str,
-        cancelled: &AtomicBool,
-    ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>>;
-    /// Whether the person stopped it (Ctrl-C).
+    /// The code could not be read; the loopback return still works.
+    fn code(&self, cancelled: &AtomicBool) -> std::io::Result<Option<Zeroizing<Vec<u8>>>>;
+    /// Whether the run was stopped (Ctrl-C at the verb's terminal).
     fn stopped(&self) -> bool;
-    /// Why the sign-in this capture waits on ended without authorizing, where something other
-    /// than the child says so (aterm's sign-in window's opener); a person's browser says none.
-    fn failed(&self) -> Option<String> {
-        None
-    }
+    /// What the sign-in met as it ended without authorizing, as the opener recorded it, as its
+    /// closed word.
+    fn failed(&self) -> Option<super::open_url::MetWord>;
 }
 
-/// Aterm's own sign-in window as the place a capture's page opens ([`Capture::window`]): the
-/// opener the child starts with its authorization URL, and the two files of this capture's
-/// own private folder the opener answers in.
-pub struct WindowRoute {
+/// Where aterm's opener opens a capture's page ([`OpenerRoute::page`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenerPage {
+    /// Aterm's own sign-in window ([`super::open_url::WINDOW_ENV`]), which authorizes the
+    /// account by itself.
+    Window,
+    /// The account's own headless browser profile, the one its headless sign-in just proved
+    /// (plan package FL-137, [`super::open_url::TOKEN_ENV`]): the opener serves the token's
+    /// consent page there and presses `Authorize` only where the page shows the account.
+    Headless {
+        /// The account's row label, which finds its profile where its email does not
+        /// ([`super::open_url::ACCOUNT_LABEL_ENV`]).
+        label: Option<String>,
+    },
+}
+
+/// Aterm's opener as what opens a capture's page ([`Capture::opener`]): the opener the child
+/// starts with its authorization URL, where it opens the page, and the two files of this
+/// capture's own private folder the opener answers in.
+pub struct OpenerRoute {
     /// Aterm's opener ([`super::open_url::OPENER`]), the child's `BROWSER`.
     pub opener: PathBuf,
+    /// Where the opener opens the page.
+    pub page: OpenerPage,
     /// Where the opener records a sign-in that ended without authorizing
     /// ([`super::open_url::OUTCOME_ENV`]).
     pub outcome: PathBuf,
@@ -329,56 +341,78 @@ pub struct WindowRoute {
     pub code: PathBuf,
 }
 
-/// What the child's environment holds beside [`child_env`] where its page opens in aterm's
-/// sign-in window: the opener as its `BROWSER`, the window's grant
-/// ([`super::open_url::WINDOW_ENV`]), the account to sign in as, the two files the opener
-/// answers in, and the sign-in's trace file where the verb named one.
+/// What the child's environment holds beside [`child_env`] where its page opens through
+/// aterm's opener: the opener as its `BROWSER`, the grant of where it opens the page (the
+/// window's, [`super::open_url::WINDOW_ENV`], or the headless profile's,
+/// [`super::open_url::TOKEN_ENV`] with the row's label), the account to sign in as, the two
+/// files the opener answers in, and, for the window, the sign-in's trace file where the verb
+/// named one.
 #[must_use]
-pub fn window_env(
-    route: &WindowRoute,
+pub fn opener_env(
+    route: &OpenerRoute,
     sign_in_as: &str,
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Vec<(&'static str, OsString)> {
-    let env = vec![
-        ("BROWSER", route.opener.as_os_str().to_owned()),
-        (super::open_url::WINDOW_ENV, OsString::from("1")),
+    let mut env = vec![("BROWSER", route.opener.as_os_str().to_owned())];
+    match &route.page {
+        OpenerPage::Window => env.push((super::open_url::WINDOW_ENV, OsString::from("1"))),
+        OpenerPage::Headless { label } => {
+            env.push((super::open_url::TOKEN_ENV, OsString::from("1")));
+            if let Some(label) = label {
+                env.push((super::open_url::ACCOUNT_LABEL_ENV, OsString::from(label)));
+            }
+        }
+    }
+    env.extend([
         (super::open_url::EMAIL_ENV, OsString::from(sign_in_as)),
         (
             super::open_url::OUTCOME_ENV,
             route.outcome.as_os_str().to_owned(),
         ),
         (super::open_url::CODE_ENV, route.code.as_os_str().to_owned()),
-    ];
+    ]);
     #[cfg(target_os = "macos")]
-    let env = {
-        let mut env = env;
-        if let Some(trace) = var(super::signin_window::TRACE_ENV).filter(|v| !v.is_empty()) {
-            env.push((super::signin_window::TRACE_ENV, trace));
-        }
-        env
-    };
+    if route.page == OpenerPage::Window
+        && let Some(trace) = var(super::signin_window::TRACE_ENV).filter(|v| !v.is_empty())
+    {
+        env.push((super::signin_window::TRACE_ENV, trace));
+    }
     #[cfg(not(target_os = "macos"))]
     let _ = var;
     env
 }
 
-/// The capture's person where nobody is asked: the sign-in runs in aterm's own window, which
-/// finishes it by itself. A hosted flow's code is the one the window's opener handed over
-/// ([`WindowRoute::code`]), taken once; a sign-in the opener ended without authorizing ends
-/// the capture with what it met ([`Person::failed`]).
-pub struct WindowWaiter<'a> {
-    route: &'a WindowRoute,
+/// The capture's sign-in, which nobody is asked for: aterm's opener finishes it by itself, in
+/// its window or on the account's headless profile. A hosted flow's code is the one the opener
+/// handed over ([`OpenerRoute::code`]), taken once; a sign-in the opener ended without
+/// authorizing ends the capture with what it met ([`SignIn::failed`]).
+pub struct OpenerWaiter<'a> {
+    route: &'a OpenerRoute,
+    ctrl_c: Option<CtrlC>,
 }
 
-impl<'a> WindowWaiter<'a> {
+impl<'a> OpenerWaiter<'a> {
     /// The waiter on `route`'s files.
     #[must_use]
-    pub const fn new(route: &'a WindowRoute) -> Self {
-        Self { route }
+    pub const fn new(route: &'a OpenerRoute) -> Self {
+        Self {
+            route,
+            ctrl_c: None,
+        }
+    }
+
+    /// The waiter on `route`'s files that also takes Ctrl-C at the verb's terminal for its life
+    /// ([`CtrlC`]): the capture ends its child and returns [`Error::Stopped`].
+    #[must_use]
+    pub fn at_terminal(route: &'a OpenerRoute) -> Self {
+        Self {
+            route,
+            ctrl_c: Some(CtrlC::take()),
+        }
     }
 }
 
-impl Person for WindowWaiter<'_> {
+impl SignIn for OpenerWaiter<'_> {
     /// Nobody asked for this run's lines, and its standard error is whatever started it: a
     /// line is written with each address in it as `<address>`.
     fn say(&self, line: &str) {
@@ -386,11 +420,7 @@ impl Person for WindowWaiter<'_> {
         let _ = writeln!(err, "{}", super::open_url::without_addresses(line));
     }
 
-    fn paste(
-        &self,
-        _prompt: &str,
-        cancelled: &AtomicBool,
-    ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+    fn code(&self, cancelled: &AtomicBool) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
         loop {
             if cancelled.load(Ordering::SeqCst) || self.failed().is_some() {
                 return Ok(None);
@@ -408,14 +438,14 @@ impl Person for WindowWaiter<'_> {
     }
 
     fn stopped(&self) -> bool {
-        false
+        self.ctrl_c.is_some() && STOPPED.load(Ordering::SeqCst)
     }
 
-    fn failed(&self) -> Option<String> {
+    fn failed(&self) -> Option<super::open_url::MetWord> {
         super::open_url::read_terminal_outcome(&self.route.outcome).map(|failure| {
             failure
                 .0
-                .map_or_else(|| "its opener stopped".to_owned(), |met| met.words())
+                .map_or(super::open_url::MetWord::NotAuthorized, |met| met.word)
         })
     }
 }
@@ -433,7 +463,8 @@ pub fn route_in(env: &[(OsString, OsString)]) -> Option<String> {
 /// The child's whole environment: [`super::login_drive::passed_unrouted`] from `var` (each one
 /// set and not empty), [`CHILD_PATH`], `TERM=dumb`, both Claude homes
 /// ([`super::accounts::HOME_ENV`], [`super::accounts::LOGIN_ENV`]) on `scratch`, and
-/// [`OPT_OUTS`]. Nothing else crosses: no credential, `BROWSER`, route or aterm variable.
+/// [`OPT_OUTS`]. Nothing else of the verb's crosses: no credential, `BROWSER`, route or aterm
+/// variable ([`opener_env`] adds the opener's own).
 #[must_use]
 pub fn child_env(
     var: &dyn Fn(&str) -> Option<OsString>,
@@ -527,9 +558,8 @@ pub struct Capture<'a> {
     pub sign_in_as: &'a str,
     /// The verb's own environment.
     pub env: &'a [(OsString, OsString)],
-    /// Aterm's own sign-in window, where the child's page opens there; none opens it in the
-    /// person's default browser.
-    pub window: Option<&'a WindowRoute>,
+    /// Aterm's opener, through which the child's page opens.
+    pub opener: &'a OpenerRoute,
     /// The hang detector ([`super::login_drive::HANG`] from the verb's start), on both clocks.
     pub deadline: WakeDeadline,
 }
@@ -538,7 +568,7 @@ pub struct Capture<'a> {
 ///
 /// # Errors
 /// Each [`Error`], none holding a byte the child wrote.
-pub fn capture(run: &Capture<'_>, person: &dyn Person) -> Result<Minted, Error> {
+pub fn capture(run: &Capture<'_>, sign_in: &dyn SignIn) -> Result<Minted, Error> {
     if let Some(name) = route_in(run.env) {
         return Err(Error::Route(name));
     }
@@ -550,12 +580,10 @@ pub fn capture(run: &Capture<'_>, person: &dyn Person) -> Result<Minted, Error> 
             .map(|(_, value)| value.clone())
     };
     let mut env = child_env(&var, scratch.path());
-    if let Some(route) = run.window {
-        env.extend(window_env(route, run.sign_in_as, &var));
-    }
+    env.extend(opener_env(run.opener, run.sign_in_as, &var));
     let mut child = Child::spawn(run.program, &env, scratch.path())?;
     let cancel = AtomicBool::new(false);
-    let minted = std::thread::scope(|scope| drive(run, person, &mut child, &cancel, scope));
+    let minted = std::thread::scope(|scope| drive(run, sign_in, &mut child, &cancel, scope));
     // A token's child is let exit; any other is killed at once. A token is kept even where its
     // child's end could not be confirmed: Claude Code shows it once, and it is already made.
     if minted.is_ok() {
@@ -714,7 +742,7 @@ impl Drop for Child {
     }
 }
 
-/// Sets its flag when it drops, however the scope it guards ends: the paste thread's stop.
+/// Sets its flag when it drops, however the scope it guards ends: the code thread's stop.
 struct CancelOnDrop<'a>(&'a AtomicBool);
 
 impl Drop for CancelOnDrop<'_> {
@@ -723,19 +751,11 @@ impl Drop for CancelOnDrop<'_> {
     }
 }
 
-/// What the paste thread hands back.
-enum Pasted {
-    /// The code, to write to the child's terminal.
-    Code(Zeroizing<Vec<u8>>),
-    /// Ctrl-C at the prompt.
-    Interrupted,
-}
-
-/// Reads the child until a verdict; the paste prompt runs on a thread of `scope`, stopped by
-/// `cancel` as this returns.
+/// Reads the child until a verdict; the wait for the opener's code runs on a thread of `scope`
+/// once Claude Code shows its paste prompt, stopped by `cancel` as this returns.
 fn drive<'scope>(
     run: &Capture<'_>,
-    person: &'scope dyn Person,
+    sign_in: &'scope dyn SignIn,
     child: &mut Child,
     cancel: &'scope AtomicBool,
     scope: &'scope std::thread::Scope<'scope, '_>,
@@ -745,15 +765,15 @@ fn drive<'scope>(
     let mut cleaner = Cleaner::default();
     let mut judge = Judge::new(run.sign_in_as);
     let mut chunk = Zeroizing::new([0u8; 4096]);
-    let (sent, pasted) = mpsc::sync_channel::<Pasted>(1);
+    let (sent, handed) = mpsc::sync_channel::<Zeroizing<Vec<u8>>>(1);
     let mut asked = false;
     let mut told = false;
     loop {
-        if person.stopped() {
+        if sign_in.stopped() {
             return Err(Error::Stopped);
         }
-        if let Some(why) = person.failed() {
-            return Err(Error::Window(why));
+        if let Some(why) = sign_in.failed() {
+            return Err(Error::Opener(why));
         }
         if run.deadline.passed() {
             return Err(Error::Hang);
@@ -792,53 +812,50 @@ fn drive<'scope>(
         }
         if judge.url_ok && !told {
             told = true;
-            person.say(&if run.window.is_some() {
-                format!(
+            sign_in.say(&match run.opener.page {
+                OpenerPage::Window => format!(
                     "aterm's sign-in window opened on {} and authorizes the account by itself",
                     judge.host
-                )
-            } else {
-                format!(
-                    "a browser window opened on {}: sign in as {} there, then come back here \
-                     (Ctrl-C stops)",
-                    judge.host, run.sign_in_as
-                )
+                ),
+                OpenerPage::Headless { .. } => format!(
+                    "the account's headless browser profile opened on {} and authorizes the \
+                     account only where the page shows it",
+                    judge.host
+                ),
             });
         }
         if judge.asks && judge.url_ok && !asked {
             asked = true;
             let sent = sent.clone();
-            scope.spawn(move || ask_paste(person, cancel, &sent));
+            scope.spawn(move || await_code(sign_in, cancel, &sent));
         }
-        match pasted.try_recv() {
-            Ok(Pasted::Code(code)) => {
-                write_code(child, &code, run.deadline)?;
-                person.say("handed the code to Claude Code");
-            }
-            Ok(Pasted::Interrupted) => return Err(Error::Stopped),
-            Err(_) => {}
+        if let Ok(code) = handed.try_recv() {
+            write_code(child, &code, run.deadline)?;
+            sign_in.say("handed the opener's code to Claude Code");
         }
     }
 }
 
-/// The paste thread: asks until a code that can be one comes, the asking is cancelled, or
-/// Ctrl-C.
-fn ask_paste(person: &dyn Person, cancel: &AtomicBool, sent: &mpsc::SyncSender<Pasted>) {
+/// The code thread: waits until the opener hands over a code that can be one, or the wait is
+/// cancelled.
+fn await_code(
+    sign_in: &dyn SignIn,
+    cancel: &AtomicBool,
+    sent: &mpsc::SyncSender<Zeroizing<Vec<u8>>>,
+) {
     loop {
-        match person.paste(PASTE_PROMPT, cancel) {
+        match sign_in.code(cancel) {
             Ok(Some(code)) if code.is_empty() => {}
             Ok(Some(code)) if code.iter().all(|b| (0x21..=0x7e).contains(b)) => {
-                let _ = sent.send(Pasted::Code(code));
+                let _ = sent.send(code);
                 return;
             }
-            Ok(Some(_)) => person.say("that is not a code (it holds a space or a control key)"),
+            Ok(Some(_)) => {
+                sign_in.say("the opener's code holds a space or a control key; it was not typed");
+            }
             Ok(None) => return,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                let _ = sent.send(Pasted::Interrupted);
-                return;
-            }
             Err(_) => {
-                person.say("the code could not be read here; the browser's own return still works");
+                sign_in.say("the opener's code could not be read; its loopback return still works");
                 return;
             }
         }
@@ -1476,25 +1493,24 @@ fn decode(form: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The person at the verb's own terminal: lines go to its stderr, the code is read unshown from
-/// `/dev/tty` ([`crate::fleet_member::read_unshown_secret`]), and Ctrl-C is noted (SIGINT's
-/// disposition replaced while it lives, put back when it drops) for the capture to end its child
-/// and return [`Error::Stopped`].
-pub struct Terminal {
+/// Ctrl-C at the verb's terminal, noted while it lives (SIGINT's disposition replaced, put back
+/// when it drops) for the capture to end its child and return [`Error::Stopped`]
+/// ([`OpenerWaiter::at_terminal`]).
+pub struct CtrlC {
     was: Option<libc::sigaction>,
 }
 
-/// Whether SIGINT came while a [`Terminal`] lived.
+/// Whether SIGINT came while a [`CtrlC`] lived.
 static STOPPED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn note_stop(_signal: libc::c_int) {
     STOPPED.store(true, Ordering::SeqCst);
 }
 
-impl Terminal {
-    /// Takes SIGINT for the capture's life.
+impl CtrlC {
+    /// Takes SIGINT for the guard's life.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn take() -> Self {
         STOPPED.store(false, Ordering::SeqCst);
         // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask,
         // no flags).
@@ -1510,43 +1526,14 @@ impl Terminal {
     }
 }
 
-impl Default for Terminal {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for Terminal {
+impl Drop for CtrlC {
     fn drop(&mut self) {
         if let Some(was) = &self.was {
-            // SAFETY: Puts back the disposition `Terminal::new` replaced.
+            // SAFETY: Puts back the disposition `CtrlC::take` replaced.
             unsafe {
                 libc::sigaction(libc::SIGINT, was, std::ptr::null_mut());
             }
         }
-    }
-}
-
-impl Person for Terminal {
-    fn say(&self, line: &str) {
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "{line}");
-    }
-
-    fn paste(
-        &self,
-        prompt: &str,
-        cancelled: &AtomicBool,
-    ) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
-        crate::fleet_member::read_unshown_secret(prompt, cancelled).inspect_err(|e| {
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                STOPPED.store(true, Ordering::SeqCst);
-            }
-        })
-    }
-
-    fn stopped(&self) -> bool {
-        STOPPED.load(Ordering::SeqCst)
     }
 }
 

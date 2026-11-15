@@ -180,6 +180,70 @@ fn the_context_left_is_counted_as_codexs_footer_counts_it() {
     );
 }
 
+/// A `token_count` with the whole rollout's running total and the newest request's own counts,
+/// as codex writes them.
+fn counts(total: (u64, u64), last: (u64, u64)) -> String {
+    row(
+        "event_msg",
+        &format!(
+            "{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":{},\"cached_input_tokens\":0,\"output_tokens\":{},\"reasoning_output_tokens\":0,\"total_tokens\":{}}},\"last_token_usage\":{{\"input_tokens\":{},\"output_tokens\":{},\"total_tokens\":{}}},\"model_context_window\":258400}},\"rate_limits\":null}}",
+            total.0,
+            total.1,
+            total.0 + total.1,
+            last.0,
+            last.1,
+            last.0 + last.1
+        ),
+    )
+}
+
+/// The survey's token counters are the rollout's own running total
+/// (`info.total_token_usage`), the newest count winning, never the newest request's
+/// (`last_token_usage`); a count that names no total keeps the last, and none read is `None`,
+/// never 0.
+#[test]
+fn codex_facts_keep_the_rollouts_cumulative_tokens() {
+    let none = facts_of(&[turn_context("gpt-5.5", None, "/work/a")]);
+    assert_eq!((none.tok_in, none.tok_out), (None, None), "nothing counted");
+
+    let first = counts((40_000, 1_200), (40_000, 1_200));
+    let second = counts((95_000, 3_100), (55_000, 1_900));
+    let facts = facts_of(&[first.clone(), second.clone()]);
+    assert_eq!(
+        (facts.tok_in, facts.tok_out),
+        (Some(95_000), Some(3_100)),
+        "the newest running total, not its request's 55000 and 1900"
+    );
+    let facts = facts_of(&[second.clone(), first]);
+    assert_eq!(
+        (facts.tok_in, facts.tok_out),
+        (Some(40_000), Some(1_200)),
+        "the newest row wins"
+    );
+
+    let limits_only = row(
+        "event_msg",
+        "{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{\"primary\":{\"used_percent\":4.0}}}",
+    );
+    let facts = facts_of(&[second.clone(), limits_only, tokens(135_200, 258_400)]);
+    assert_eq!(
+        (facts.tok_in, facts.tok_out),
+        (Some(95_000), Some(3_100)),
+        "a count that names no input or output total keeps the last"
+    );
+
+    let input_only = row(
+        "event_msg",
+        "{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":99000},\"last_token_usage\":{\"input_tokens\":4000,\"output_tokens\":7}},\"rate_limits\":null}",
+    );
+    let facts = facts_of(&[second, input_only]);
+    assert_eq!(
+        (facts.tok_in, facts.tok_out),
+        (Some(99_000), None),
+        "an output total the newest count does not say is unread, never 0"
+    );
+}
+
 /// The plan's windows (codex 0.164's `token_count`): each of `primary` and `secondary` names
 /// its window by `window_minutes`, 300 the five-hour one and 10080 the week; a plan with only a
 /// weekly window names it `primary`; a count whose `rate_limits` is `null` keeps the last.

@@ -39,11 +39,9 @@ fn hold_a_port() -> (TcpListener, u16) {
     (holder, port)
 }
 
-/// The handshake a test world's real `aterm` gives one address is the bound the world's seam names,
-/// not the 3 s a person's dial allows: the hang detector its other waits have, or here a tenth of a
-/// second, against a port that takes the connection and never answers, so that the words show it.
+/// A silent issuer gives a handshake cause and next check through the real command.
 #[test]
-fn a_dialers_handshake_at_one_address_is_bound_by_the_worlds_seam() {
+fn a_silent_issuer_explains_its_failed_handshake_and_next_check() {
     let issuer = World(headless_boot::scratch_root("afbi"));
     let (holder, port) = hold_a_port();
     drop(holder);
@@ -74,18 +72,16 @@ fn a_dialers_handshake_at_one_address_is_bound_by_the_worlds_seam() {
     drop(silent);
     let said = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        !refused.status.success() && said.contains("no fleet handshake within 0.1s"),
+        !refused.status.success()
+            && said.contains("no fleet handshake")
+            && said.contains("aterm node status"),
         "{refused:?}"
     );
 }
 
-/// A drive a test world's real `aterm ctl --host` makes is bound by the world's seam, not the 28 s
-/// a person's drive allows, and each leg of an `await task` over one by its wait and that seam,
-/// not the 8 s past it a person's allows: the hang detector its other waits have, or here a tenth
-/// of a second, against a node the book binds at a port that takes the connection and never
-/// answers.
+/// A silent member's drive failure names the member, the cause and the next check.
 #[test]
-fn a_drives_deadline_is_the_worlds_seam() {
+fn a_silent_drive_explains_its_failed_handshake_by_member_name() {
     use aterm_net::fleet_member::{Began, Peer, node_identity, record, write_held};
     let driver = World(headless_boot::scratch_root("afdw"));
     let (holder, port) = hold_a_port();
@@ -127,7 +123,11 @@ fn a_drives_deadline_is_the_worlds_seam() {
         let refused = ctl_with(&driver.0, &args, None, &[(DRIVE_WITHIN_SEAM, "100")]);
         let said = String::from_utf8_lossy(&refused.stderr);
         assert!(
-            !refused.status.success() && said.contains("within 0.1s"),
+            !refused.status.success()
+                && said.contains(other.node())
+                && said.contains("no fleet handshake")
+                && said.contains("aterm node status")
+                && !said.contains(&format!("127.0.0.1:{silent_port}")),
             "{verb:?}: {refused:?}"
         );
     }
@@ -1006,7 +1006,9 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         .unwrap_or_else(|| panic!("the member is listed:\n{issuer_view}"));
     let unreached = check_of(row);
     assert!(
-        unreached.contains(&format!("127.0.0.1:{member_port}")),
+        unreached.contains("refused")
+            && unreached.contains("aterm fleet sync")
+            && !issuer_view.contains(&format!("127.0.0.1:{member_port}")),
         "{issuer_view}"
     );
     let member_view = peers_answered(&member.0);
@@ -1215,7 +1217,7 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
     let refused = reason(&text, closed_port);
     assert!(
         rows.iter()
-            .any(|r| r.starts_with(&format!("== fleet 127.0.0.1:{port} "))
+            .any(|r| r.starts_with(&format!("== fleet node-{issuer_node} "))
                 && r.contains(" pid ")
                 && r.ends_with(" trust=screen")),
         "the issuer's instance answered:\n{text}"
@@ -1225,11 +1227,10 @@ fn fleet_init_and_join_through_the_binary_register_a_member() {
         "the issuer's session is listed:\n{text}"
     );
     assert!(
-        rows.iter().any(
-            |r| r.starts_with(&format!("== fleet 127.0.0.1:{other_port} "))
+        rows.iter()
+            .any(|r| r.starts_with(&format!("== fleet node-{other_node} "))
                 && r.contains(" pid ")
-                && r.ends_with(" trust=screen")
-        ),
+                && r.ends_with(" trust=screen")),
         "the issuer's book led the read to the second member:\n{text}"
     );
     assert!(
@@ -1908,13 +1909,10 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     let record = ctl_ok(&member, &[&at, "task"]);
     assert_eq!(field(&record, "why"), Some("turn"), "{record}");
     let typed = status(&member, &worker);
-    let credit = format!(
-        "127.0.0.1%20(node%20{})%20over%20the%20fleet",
-        &issuer_node[..8]
-    );
+    let credit = format!("node {} over the fleet", &issuer_node[..8]);
     assert_eq!(
-        field(&typed, "typed_by"),
-        Some(credit.as_str()),
+        field(&typed, "typed_by").map(aterm_codec::pct::decode),
+        Some(credit),
         "the member says who typed: {typed}"
     );
     let log = ctl_ok(&member, &["messages"]);
@@ -2002,7 +2000,7 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     );
     let spawned_sid = stdout
         .split_whitespace()
-        .find(|w| w.starts_with("s-"))
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .unwrap_or_else(|| panic!("a sid: {stdout}"))
         .to_owned();
     let record = ctl_ok(&member, &[&format!("@{spawned_sid}"), "task"]);
@@ -2020,14 +2018,8 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     );
     let refused = String::from_utf8_lossy(&grok.stderr);
     assert!(
-        grok.status.code() == Some(1)
-            && refused.contains(
-                "spawn agent=grok: Grok Build is read, not supervised, by the aterm of the Mac \
-                 asked to start it"
-            )
-            && !refused.contains(" here")
-            && !refused.contains("this Mac"),
-        "the driving Mac reads the driven Mac's refusal: {grok:?}"
+        grok.status.code() == Some(1) && refused.contains("; not `agent=grok`"),
+        "the driving Mac reads the driven Mac's refusal of a word no worker row names: {grok:?}"
     );
 
     peers_answered(&stranger.0);
@@ -2103,7 +2095,7 @@ fn a_mac_its_member_lets_drive_it_drives_a_worker_and_no_other_does() {
     fleet_ok(&member.tmp, &["allow", "content"], None);
     let refused = drive_refused(&issuer.tmp, &target, &[&at, "status"]);
     assert!(
-        refused.contains("lets no one drive it"),
+        refused.contains("not served") && refused.contains("grants"),
         "a grant taken back refuses the next drive at once: {refused}"
     );
     unloadable(&cfg, false);
@@ -2305,7 +2297,7 @@ fn a_dispatcher_on_another_mac_resumes_every_worker_from_the_boards_open_rows() 
     let opened = ctl_ok(&issuer, &["spawn"]);
     let dispatcher = opened
         .split_whitespace()
-        .find(|w| w.starts_with("s-"))
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .unwrap_or_else(|| panic!("the dispatcher's tab: {opened}"))
         .to_owned();
     let briefs: [(&str, &[u8]); 2] = [
@@ -2336,7 +2328,7 @@ fn a_dispatcher_on_another_mac_resumes_every_worker_from_the_boards_open_rows() 
         sids.push(
             stdout
                 .split_whitespace()
-                .find(|w| w.starts_with("s-"))
+                .find(|w| aterm_types::tab_id::is_tab_id(w))
                 .unwrap_or_else(|| panic!("a sid: {stdout}"))
                 .to_owned(),
         );
@@ -3340,7 +3332,7 @@ mod any_host_walled {
         let stdout = String::from_utf8_lossy(&placed.stdout);
         let sid = stdout
             .split_whitespace()
-            .find(|word| word.starts_with("s-"))
+            .find(|word| aterm_types::tab_id::is_tab_id(word))
             .unwrap_or_else(|| panic!("a sid: {stdout}"));
         let at = format!("@{sid}");
         let record = ctl_ok(&free, &[&at, "task"]);
@@ -3889,10 +3881,7 @@ fn an_all_member_grant_lets_every_member_drive_and_keeps_the_holds_they_take() {
     assert!(
         local.status.code() == Some(1)
             && said.contains("origin=remote")
-            && said.contains(&format!(
-                "held by 127.0.0.1 (node {}) over the fleet",
-                &third_node[..8]
-            ))
+            && said.contains(&format!("held by node {} over the fleet", &third_node[..8]))
             && said.contains(&format!("`aterm ctl hold {worker} off`")),
         "the third member's remote hold refuses local send and names the holder: {said}"
     );
@@ -4566,11 +4555,11 @@ fn a_granted_member_does_only_what_the_driven_macs_fleet_access_admits() {
     fleet_ok(&held.tmp, &["access", "full"], None);
     header("full");
     let (spawned, _) = drive_ok(&driver.tmp, &target, &spawn);
-    assert!(spawned.starts_with("OK s-"), "{spawned}");
+    let worker = aterm_agent::spawned_tab_id(&spawned)
+        .unwrap_or_else(|| panic!("spawn names a valid tab: {spawned}"));
     assert_eq!(sessions(), before + 1, "the spawn opened one session");
     // And the drop leaves what was started running, and readable.
     fleet_ok(&held.tmp, &["access", "read"], None);
-    let worker = spawned.split_whitespace().nth(1).expect("its sid");
     drive_ok(&driver.tmp, &target, &[&format!("@{worker}"), "status"]);
     assert_eq!(sessions(), before + 1, "a drop closes nothing");
 
@@ -4739,7 +4728,7 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
     });
     assert!(took.is_some(), "the grant never let it hold: {last:?}");
     let at = format!("@{sid}");
-    let by = format!("held by 127.0.0.1 (node {}) over the fleet", &node[..8]);
+    let by = format!("held by node {} over the fleet", &node[..8]);
 
     let local = ctl(&held, &[&at, "send", "x"]);
     let said = String::from_utf8_lossy(&local.stderr);
@@ -4776,10 +4765,9 @@ fn a_local_hold_off_keeps_a_hold_its_node_may_still_drive_and_lifts_one_it_may_n
     );
     std::fs::write(&cfg, unlistened).expect("write the driver's config");
     fleet_reads(&driver, &driver_sid, "off");
-    stands(&format!(
-        "which may still drive this session's Mac: its place did not prove it just now (nothing \
-         listens on 127.0.0.1:{member_port}"
-    ));
+    stands(
+        "which may still drive this session's Mac: its place did not prove it just now (saved route refused",
+    );
     let (off, _) = drive_ok(&driver.tmp, &target, &["hold", &sid, "off"]);
     assert_eq!(
         off.trim(),
@@ -4874,7 +4862,25 @@ fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
 
     fleet_reads(&inst, &sid, "off");
     let head = |listed: String| listed.lines().next().unwrap_or_default().to_owned();
-    let off = head(peers_answered(&inst.tmp));
+    let details = || {
+        let hang = HANG.as_millis().to_string();
+        succeeded(
+            &["peers", "--details"],
+            fleet_with(
+                &inst.tmp,
+                &["peers", "--details"],
+                None,
+                &[(PEER_WITHIN_SEAM, &hang)],
+            ),
+        )
+    };
+    let quiet = head(peers_answered(&inst.tmp));
+    assert!(
+        !quiet.contains(&place),
+        "default diagnostics hide the route: {quiet}"
+    );
+    assert!(quiet.contains("aterm node status"), "{quiet}");
+    let off = head(details());
     assert!(
         off.contains(&format!(
             "([fleet] listen is {place} and allow is facts, but nothing listens on {place} just \
@@ -4892,7 +4898,7 @@ fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
     std::fs::write(inst.tmp.join("cfg-here/aterm/aterm.toml"), &bogus)
         .expect("write the aterm's own config");
     fleet_reads(&inst, &sid, "refused:allow");
-    let refused = head(peers_answered(&inst.tmp));
+    let refused = head(details());
     assert!(
         refused.contains(&format!(
             "([fleet] listen is {place} and allow is facts, but nothing listens on {place} just \
@@ -4907,7 +4913,7 @@ fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
         .expect("write the aterm's own config");
     fleet_reads(&inst, &sid, "listening");
     std::fs::write(&config, &bogus).expect("write the verbs' config");
-    let proved = head(peers_answered(&inst.tmp));
+    let proved = head(details());
     std::fs::write(&config, &valid).expect("write the verbs' config");
     assert!(
         proved.contains(&format!(
@@ -4920,7 +4926,7 @@ fn nothing_listening_here_is_told_as_the_aterm_here_stands() {
 
     stop();
     let rotate = fleet(&inst.tmp, &["init", "--rotate"], None);
-    let stalled = head(fleet_ok(&inst.tmp, &["peers"], None));
+    let stalled = head(fleet_ok(&inst.tmp, &["peers", "--details"], None));
     signal(libc::SIGCONT);
     let said = String::from_utf8_lossy(&rotate.stdout);
     let stopped = format!(

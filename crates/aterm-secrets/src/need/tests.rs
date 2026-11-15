@@ -11,9 +11,9 @@ const HOST: &str = "andrews";
 fn want_of(kind: i64) -> Want {
     match kind {
         0 => Want::SiteDeployerKey,
-        1 => Want::PaperMaster,
         2 => Want::Login("claude/m29".into()),
-        _ => Want::Mailbox("m29".into()),
+        3 => Want::Mailbox("m29".into()),
+        _ => Want::parse("claude-token:ac-00000000000000a1").unwrap(),
     }
 }
 
@@ -76,18 +76,23 @@ fn why_num(reason: Reason) -> i64 {
         .map_or(0, |at| at as i64 + 1)
 }
 
-fn kind_num(class: Class) -> i64 {
-    match class {
+fn kind_num(want: &Want) -> i64 {
+    match want.class() {
         Class::Copyable => 0,
-        Class::Nowhere => 1,
         Class::PerMac => 2,
+        Class::VaultOnly if want.producer().is_some() => 4,
         Class::VaultOnly | Class::AdminAct => 3,
     }
 }
 
 fn facts_of(s: &ModelState) -> Facts {
     let want = want_of(s["kind"]);
-    let held = if s["inv"] == 1 {
+    let held = if s["inv"] == 1 || s["inuse"] == 1 {
+        want.entry().into_iter().collect()
+    } else {
+        BTreeSet::new()
+    };
+    let in_use = if s["inuse"] == 1 {
         want.entry().into_iter().collect()
     } else {
         BTreeSet::new()
@@ -102,6 +107,7 @@ fn facts_of(s: &ModelState) -> Facts {
             alab: true,
             held,
         }),
+        in_use,
         commons: if s["commons"] == 1 {
             Commons::Writer
         } else {
@@ -163,7 +169,7 @@ fn project(s: &ModelState, action: &str, before: Option<&Need>, real: &Need) -> 
         "why",
         real.retired.as_ref().map_or(0, |r| why_num(r.reason)),
     );
-    set(&mut next, "kind", kind_num(real.want.class()));
+    set(&mut next, "kind", kind_num(&real.want));
     set(&mut next, "wait", wait_num(real.wait));
     set(&mut next, "raises", i64::from(real.raises.min(2)));
     set(&mut next, "need", i64::from(real.needed));
@@ -205,9 +211,10 @@ pub(crate) fn request_transition(s: &ModelState, action: &str) -> Option<ModelSt
     };
     let real = match action {
         "Raise" => raise(0),
-        "RaiseNowhere" => raise(1),
         "RaisePerMachine" => raise(2),
         "RaiseVaultOnly" => raise(3),
+        "RaiseProducer" => raise(4),
+        "Arrived" => arrival(before.as_ref()?, &facts),
         "CommonsReady" => {
             if s["commons"] == 1 {
                 return None;
@@ -252,11 +259,12 @@ fn hand_transition(s: &ModelState, action: &str) -> Option<ModelState> {
     Some(project(s, action, Some(&before), &real))
 }
 
-const BOUND: [&str; 12] = [
+const BOUND: [&str; 13] = [
     "Raise",
-    "RaiseNowhere",
     "RaisePerMachine",
     "RaiseVaultOnly",
+    "RaiseProducer",
+    "Arrived",
     "Catalog",
     "Unauthorized",
     "Apply",
@@ -333,6 +341,8 @@ fn the_catalog_answers_what_no_mac_can_give_and_names_every_want_once() {
         "mailbox:m29-2",
         "gh:dev",
         "gh:release",
+        "gh:fleet",
+        "machines-admin",
         "entry:~/company-life/config/local/service-account.alab-site-deployer.json",
         "paper-master",
         "login:claude/m29",
@@ -341,6 +351,8 @@ fn the_catalog_answers_what_no_mac_can_give_and_names_every_want_once() {
         "vault-identity",
         "commons-device-key",
         "commons-control",
+        "azure-signing-principal",
+        "fleet-code",
     ] {
         assert_eq!(Want::parse(word).unwrap().key(), word);
     }
@@ -356,7 +368,13 @@ fn the_catalog_answers_what_no_mac_can_give_and_names_every_want_once() {
     ] {
         assert!(Want::parse(bad).is_err(), "{bad}");
     }
-    assert_eq!(Want::PaperMaster.class(), Class::Nowhere);
+    assert_eq!(Want::PaperMaster.class(), Class::VaultOnly);
+    assert!(Want::PaperMaster.posted() && !Want::PaperMaster.if_absent());
+    assert_eq!(Want::PaperMaster.entries(), [catalog::PAPER_MASTER_ENTRY]);
+    assert_eq!(
+        crate::entry_class::of(catalog::PAPER_MASTER_ENTRY),
+        crate::entry_class::EntryClass::Held(crate::entry_class::Held::Release)
+    );
     assert_eq!(Want::Login("claude/m29".into()).class(), Class::PerMac);
     assert_eq!(Want::SiteDeployerKey.class(), Class::Copyable);
     assert_eq!(Want::Mailbox("m29".into()).class(), Class::VaultOnly);
@@ -378,7 +396,7 @@ fn the_catalog_answers_what_no_mac_can_give_and_names_every_want_once() {
     );
     assert_eq!(Want::CommonsControl.class(), Class::AdminAct);
     assert!(!Want::Entry("notary".into()).posted());
-    assert!(!Want::PaperMaster.posted() && !Want::CommonsControl.posted());
+    assert!(!Want::VaultIdentity.posted() && !Want::CommonsControl.posted());
     // The deployer key's entry is a valid home-path entry; a path into ~/.secrets is not one.
     assert!(crate::text::valid_entry_name(
         catalog::SITE_DEPLOYER_KEY_ENTRY
@@ -412,17 +430,17 @@ fn mailbox_component_wants_are_exact_and_preserve_legacy_requests() {
 }
 
 #[test]
-fn the_hold_probe_names_only_the_catalog_path_whatever_the_environment_says() {
-    let home = std::path::Path::new("/Users//someone");
+fn the_hold_probe_is_the_catalogs_one_entry() {
     assert_eq!(
-        Want::SiteDeployerKey.hold_path(home).unwrap(),
-        home.join("company-life/config/local/service-account.alab-site-deployer.json")
+        Want::SiteDeployerKey.hold_entry().as_deref(),
+        Some(crate::entry_class::SITE_DEPLOYER_KEY)
     );
-    // Nothing in this crate reads FIREBASE_SA_KEY: the probe is the catalog's one path.
-    let source = include_str!("catalog.rs");
-    assert!(!source.contains(&["FIREBASE", "_SA_KEY"].concat()));
-    assert!(Want::Gh(GhProfile::Dev).hold_path(home).is_none());
-    assert!(Want::PaperMaster.hold_path(home).is_none());
+    assert_eq!(
+        Want::Mailbox("m29".into()).hold_entry().as_deref(),
+        Some("m29_password")
+    );
+    assert!(Want::Gh(GhProfile::Dev).hold_entry().is_none());
+    assert!(Want::PaperMaster.hold_entry().is_none());
 }
 
 /// A need no consumer checks for itself (one raised by hand) is fulfilled once the version
@@ -599,6 +617,45 @@ fn an_entry_want_is_never_posted_and_answers_the_same_words_for_elsewhere_and_ab
     );
 }
 
+#[test]
+fn the_fleet_code_is_never_posted_and_is_fulfilled_when_the_envelope_holds_it() {
+    let want = Want::FleetCode;
+    assert_eq!(want.class(), Class::VaultOnly);
+    assert!(!want.posted());
+    assert_eq!(want.entries(), [client::FLEET_CODE_ENTRY]);
+    assert_eq!(Purpose::parse("fleet.join"), Some(Purpose::FleetJoin));
+    // A Commons Writer whose policy lets members have a want by request posts nothing for it.
+    let mut facts = facts_of(&model_state(&[("kind", 3), ("commons", 1), ("auth", 1)]));
+    let need = fresh([6; 16], want, Purpose::FleetJoin, &facts);
+    let waiting = settle(&need, &facts);
+    assert_eq!(
+        (waiting.state, waiting.wait, waiting.posted),
+        (State::Local, Wait::Custodian, false)
+    );
+    assert!(
+        waiting.line.contains("aterm fleet publish"),
+        "{}",
+        waiting.line
+    );
+    assert_eq!(
+        settle(&waiting, &facts),
+        waiting,
+        "a settled need stays as it is"
+    );
+    if let Some(sight) = facts.sight.as_mut() {
+        sight.alab = false;
+    }
+    assert_eq!(settle(&need, &facts).wait, Wait::Requester);
+    if let Some(sight) = facts.sight.as_mut() {
+        sight.alab = true;
+        sight.held.insert(client::FLEET_CODE_ENTRY.into());
+    }
+    let held = settle(&waiting, &facts);
+    assert_eq!((held.state, held.wait), (State::Fulfilled, Wait::Nobody));
+    facts.sight = None;
+    assert_eq!(settle(&need, &facts).wait, Wait::Requester);
+}
+
 fn model_state(overrides: &[(&'static str, i64)]) -> ModelState {
     let model = aterm_models_db::credential_request_model();
     let mut state = model.init_state();
@@ -666,13 +723,13 @@ fn publish(paths: &Paths, edit: impl FnOnce(&mut crate::text::Document)) {
 }
 
 #[test]
-fn a_paper_master_need_posts_nothing_and_retires_never_stored() {
+fn a_per_mac_need_posts_nothing_and_retires_never_copied() {
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(root.path());
-    let need = raise(&paths, Want::PaperMaster, Purpose::ByHand).unwrap();
+    let need = raise(&paths, Want::VaultIdentity, Purpose::ByHand).unwrap();
     assert_eq!(need.state, State::Retired);
-    assert_eq!(need.retired.as_ref().unwrap().reason, Reason::NeverStored);
-    assert!(need.line.contains("on paper") && !need.posted && need.record.is_none());
+    assert_eq!(need.retired.as_ref().unwrap().reason, Reason::NeverCopied);
+    assert!(need.line.contains("own key") && !need.posted && need.record.is_none());
     let ledger = paths.dir.join(ledger::FILE);
     use std::os::unix::fs::PermissionsExt as _;
     assert_eq!(
@@ -680,7 +737,7 @@ fn a_paper_master_need_posts_nothing_and_retires_never_stored() {
         0o600
     );
     // Raised again, the catalog's answer stands.
-    let again = raise(&paths, Want::PaperMaster, Purpose::ByHand).unwrap();
+    let again = raise(&paths, Want::VaultIdentity, Purpose::ByHand).unwrap();
     assert_eq!(
         (again.id, again.state, again.raises),
         (need.id, State::Retired, 1)
@@ -791,10 +848,7 @@ fn notary_requests_use_only_the_release_entry() {
     crate::need::test_alab_policy(&vault.member);
     let want = Want::parse("notary").unwrap();
     assert_eq!(want.entry().as_deref(), Some("release-notary"));
-    assert_eq!(
-        want.hold_path(&vault.member.home),
-        Some(vault.member.home.join(".secrets/release-notary"))
-    );
+    assert_eq!(want.hold_entry().as_deref(), Some("release-notary"));
     raise(&vault.member, want.clone(), Purpose::ReleaseNotary).unwrap();
 
     publish(&vault.admin, |doc| {
@@ -1314,7 +1368,7 @@ fn the_policy_is_the_configured_vaults_and_no_vault_refuses_nothing_yet() {
         "no vault: the need waits on a join"
     );
     assert!(
-        !policy_for(None).allows(&Want::PaperMaster),
+        !policy_for(None).allows(&Want::VaultIdentity),
         "the catalog still decides first"
     );
 }
@@ -1364,5 +1418,278 @@ fn a_stolen_macs_rotation_stays_on_this_mac_and_is_never_posted() {
     assert_eq!(
         Purpose::parse("revoke.stolen"),
         Some(Purpose::StolenRotation)
+    );
+}
+
+/// A Claude Code token is answered once the vault's log gives this Mac a token in use here: the
+/// need ends `not-needed` as the model's `Unneeded` does, resting on the vault seq this Mac reads
+/// it at, from each state it waits in, whatever its purpose (no consumer in this build checks a
+/// token for itself). Until then it waits on this Mac's own reading, posted with its one producer
+/// named, and no silence turns it to the custodian. NEGATIVE CONTROLS: the token's name alone (a
+/// token unreadable here, ended, mismatched, refused here, or unverified and minted elsewhere)
+/// answers nothing; a mailbox the vault gives this Mac is not answered so; and the policy decides
+/// before the arrival is read.
+#[test]
+fn a_claude_token_need_ends_when_a_token_in_use_here_reaches_the_vaults_log() {
+    let facts = facts_of(&model_state(&[("kind", 3), ("commons", 1)]));
+    let want = Want::parse("claude-token:ac-00000000000000a1").unwrap();
+    let entry = want.entry().unwrap();
+    let mut named = facts.clone();
+    if let Some(sight) = named.sight.as_mut() {
+        sight.held.insert(entry.clone());
+        sight.held.insert("m29_password".into());
+    }
+    let mut held = named.clone();
+    held.in_use.insert(entry);
+
+    let local = settle(
+        &fresh([31; 16], want.clone(), Purpose::ByHand, &facts),
+        &facts,
+    );
+    assert_eq!((local.state, local.wait), (State::Local, Wait::Requester));
+    let open = act(&local, &facts, &Act::Flush).unwrap();
+    assert_eq!(
+        (open.state, open.wait),
+        (State::Open, Wait::Requester),
+        "it waits on this Mac's own reading, never on holders"
+    );
+    assert!(
+        open.line.contains(catalog::CLAUDE_TOKEN_PRODUCER),
+        "{}",
+        open.line
+    );
+    assert_eq!(
+        settle(&open, &facts),
+        open,
+        "nothing moves it before it arrives"
+    );
+    assert_eq!(
+        settle(&local, &named),
+        local,
+        "its name alone answers nothing"
+    );
+    assert_eq!(
+        settle(&open, &named),
+        open,
+        "its name alone answers nothing"
+    );
+    assert!(
+        silent(&open, &facts).is_none(),
+        "it never waits on the custodian"
+    );
+    assert!(
+        silent(&open, &held).is_none(),
+        "nor reads as a custodian's delivery"
+    );
+
+    let offered = Need {
+        state: State::Offered,
+        wait: Wait::Custodian,
+        ..open.clone()
+    };
+    for waiting in [&local, &open, &offered] {
+        let answered = settle(waiting, &held);
+        let unneeded = act(waiting, &held, &Act::Unneeded).unwrap();
+        assert_eq!(
+            Need {
+                retired: unneeded.retired.clone(),
+                line: unneeded.line.clone(),
+                seq: unneeded.seq,
+                ..answered.clone()
+            },
+            unneeded,
+            "the arrival is the model's Unneeded from {:?}",
+            waiting.state
+        );
+        assert_eq!(arrival(waiting, &held), Some(answered.clone()));
+        let retired = answered.retired.as_ref().unwrap();
+        assert_eq!(
+            (retired.reason, retired.evidence.as_str()),
+            (Reason::NotNeeded, format!("vault seq {SEQ}").as_str())
+        );
+        assert_eq!(answered.seq, Some(SEQ));
+    }
+
+    let mailbox = settle(
+        &fresh(
+            [32; 16],
+            Want::Mailbox("m29".into()),
+            Purpose::ByHand,
+            &held,
+        ),
+        &held,
+    );
+    assert_eq!(mailbox.state, State::Local, "{}", mailbox.line);
+    assert!(arrival(&mailbox, &held).is_none());
+    let mailbox = act(&mailbox, &facts, &Act::Flush).unwrap();
+    assert_eq!(mailbox.wait, Wait::Holders, "{}", mailbox.line);
+    let mut refused = held.clone();
+    refused.policy = Policy::compiled(false);
+    let unauthorized = settle(&local, &refused);
+    assert_eq!(
+        unauthorized.retired.map(|retired| retired.reason),
+        Some(Reason::NotAuthorized)
+    );
+    let own = settle(&fresh([33; 16], want, Purpose::HarnessSignIn, &held), &held);
+    assert_eq!(
+        own.retired.map(|retired| retired.reason),
+        Some(Reason::NotNeeded),
+        "a purpose whose consumer checks other wants for itself is answered too: {}",
+        own.line
+    );
+}
+
+/// A WITHDRAWAL BY HAND OUTLASTS EVERY OTHER ENDED ROW: past the ledger's bound the oldest ended
+/// rows go first, but a withdrawal, which [`ask_for_tokens`] reads as a person's word, goes only
+/// once no other ended row is left. CONTROL: the oldest row that is not a withdrawal goes, and an
+/// open row is never pruned.
+///
+/// NEGATIVE CONTROL (2026-11-14, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `save` pruning by `updated` alone, `the withdrawal is kept` fails.
+#[test]
+fn a_withdrawal_by_hand_is_pruned_after_every_other_ended_row() {
+    let facts = facts_of(&model_state(&[("kind", 3), ("commons", 1)]));
+    let want = Want::parse("claude-token:ac-00000000000000a1").unwrap();
+    let open = fresh([1; 16], want.clone(), Purpose::HarnessSignIn, &facts);
+    let withdrawn = Need {
+        updated: 1,
+        ..act(&open, &facts, &Act::Withdraw("by hand".into())).unwrap()
+    };
+    assert!(withdrawn.withdrawn_by_hand(), "{}", withdrawn.line);
+    let answered = act(&open, &facts, &Act::Unneeded).unwrap();
+    assert!(!answered.withdrawn_by_hand(), "{}", answered.line);
+    let mut rows = vec![withdrawn.clone()];
+    for at in 2..u64::try_from(ledger::MAX_ROWS).unwrap() + 2 {
+        let mut id = [0; 16];
+        id[..8].copy_from_slice(&at.to_le_bytes());
+        rows.push(Need {
+            id,
+            want: Want::Mailbox(format!("m{at}")),
+            updated: at,
+            ..answered.clone()
+        });
+    }
+    let oldest_other = rows[1].id;
+    rows.push(Need {
+        id: [99; 16],
+        updated: 0,
+        ..open
+    });
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(root.path());
+    ledger::save(&paths, &mut rows).unwrap();
+    let kept = peek(&paths).unwrap();
+    assert_eq!(kept.len(), ledger::MAX_ROWS);
+    assert!(
+        kept.iter().any(|need| need.id == withdrawn.id),
+        "the withdrawal is kept"
+    );
+    assert!(kept.iter().all(|need| need.id != oldest_other), "CONTROL");
+    assert!(kept.iter().any(|need| need.id == [99; 16]), "CONTROL: open");
+}
+
+/// OUTSIDE THE LAB'S POLICY THE HARNESS'S ASK ENDS AT ONCE AND IS NOT REPEATED: in a vault whose
+/// policy gives nothing by request, the raise is retired `not-authorized` as it is made; asked
+/// again under the same policy, it changes and writes nothing.
+#[test]
+fn outside_the_labs_policy_the_harness_ask_ends_not_authorized_and_writes_nothing_more() {
+    let vault = vault();
+    let key = crate::claude_token::Key::parse("ac-00000000000000a1").unwrap();
+    let first = ask_for_tokens(&vault.member, std::slice::from_ref(&key)).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].retired.as_ref().map(|r| r.reason),
+        Some(Reason::NotAuthorized),
+        "{}",
+        first[0].line
+    );
+    let ledger = vault.member.dir.join(LEDGER);
+    let bytes = std::fs::read(&ledger).unwrap();
+    assert!(
+        ask_for_tokens(&vault.member, std::slice::from_ref(&key))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(std::fs::read(&ledger).unwrap(), bytes, "nothing written");
+}
+
+/// THE HARNESS'S ASK FILES A TOKEN'S REQUEST ONCE, AND AGAIN ONLY AFTER A TOKEN ANSWERED IT
+/// (DESIGN-claude-setup-token §5.9): with none on file, [`ask_for_tokens`] raises
+/// `claude-token:<key>` under the sign-in's purpose; asked again while it is under way it raises
+/// nothing and writes nothing; once a token in use here answered it (the ledger's own settle,
+/// retiring it `not-needed` on the vault seq) and has left use, the next ask raises a new request;
+/// a withdrawal by hand stands, writing nothing, until a person raises the want by hand again.
+/// CONTROL: another key with nothing on file is still asked beside the withdrawn one.
+///
+/// NEGATIVE CONTROL (2026-11-14, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `ask_for_tokens` raising only where every need on file is `fulfilled` (the rule a review
+/// found), `after its token answered it` reads `left: 0`, `right: 1`.
+#[test]
+fn the_harness_asks_for_a_token_once_and_again_after_a_token_answered_it() {
+    let vault = vault();
+    crate::need::test_alab_policy(&vault.member);
+    let key = crate::claude_token::Key::parse("ac-00000000000000a1").unwrap();
+    let want = Want::ClaudeToken(key.clone());
+    let entry = want.entry().unwrap();
+    let ask = |keys: &[crate::claude_token::Key]| ask_for_tokens(&vault.member, keys).unwrap();
+    let first = ask(std::slice::from_ref(&key));
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        (&first[0].want, first[0].purpose),
+        (&want, Purpose::HarnessSignIn)
+    );
+    assert!(!first[0].state.ended(), "{}", first[0].line);
+    let ledger = vault.member.dir.join(LEDGER);
+    let bytes = std::fs::read(&ledger).unwrap();
+    assert_eq!(ask(std::slice::from_ref(&key)).len(), 0, "asked again");
+    assert_eq!(std::fs::read(&ledger).unwrap(), bytes, "nothing written");
+
+    // A token in use here arrives: the ledger's settle answers the request.
+    with_ledger(&vault.member, |rows, facts| {
+        let mut arrived = facts.clone();
+        arrived.sight.as_mut().unwrap().held.insert(entry.clone());
+        arrived.in_use.insert(entry.clone());
+        for need in rows.iter_mut() {
+            *need = settle(need, &arrived);
+        }
+        Ok(())
+    })
+    .unwrap();
+    let answered = &peek(&vault.member).unwrap()[0];
+    assert_eq!(
+        answered.retired.as_ref().map(|r| r.reason),
+        Some(Reason::NotNeeded),
+        "{}",
+        answered.line
+    );
+    assert!(!answered.withdrawn_by_hand(), "{}", answered.line);
+
+    // That token has left use (the scratch vault holds none): the harness asks again.
+    let again = ask(std::slice::from_ref(&key));
+    assert_eq!(again.len(), 1, "after its token answered it");
+    assert_ne!(again[0].id, first[0].id, "a new request");
+    assert!(!again[0].state.ended(), "{}", again[0].line);
+
+    retire(&vault.member, &want.key(), "by hand").unwrap();
+    let other = crate::claude_token::Key::parse("ac-00000000000000b2").unwrap();
+    let both = ask(&[key.clone(), other.clone()]);
+    assert_eq!(
+        both.iter().map(|need| &need.want).collect::<Vec<_>>(),
+        vec![&Want::ClaudeToken(other)],
+        "a withdrawal stands; CONTROL: the other key is asked"
+    );
+    let bytes = std::fs::read(&ledger).unwrap();
+    assert!(
+        ask(std::slice::from_ref(&key)).is_empty(),
+        "it still stands"
+    );
+    assert_eq!(std::fs::read(&ledger).unwrap(), bytes, "nothing written");
+
+    // A person raises it by hand again: that request is under way, so the harness adds none.
+    let by_hand = raise(&vault.member, want.clone(), Purpose::ByHand).unwrap();
+    assert!(!by_hand.state.ended(), "{}", by_hand.line);
+    assert!(
+        ask(std::slice::from_ref(&key)).is_empty(),
+        "one is under way"
     );
 }

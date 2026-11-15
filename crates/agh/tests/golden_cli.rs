@@ -90,17 +90,19 @@ fn a_profile_provisioned_from_nothing_reads_as_the_routed_identity() {
     );
     assert!(!agh::config::Dirs::under(root).config_file().exists());
 
+    let home = agh::config::Dirs::under(root).home;
+    common::vault_entry(&home, "dev", &token);
+    let file = home.join(".secrets").join("dev").display().to_string();
     let (ctx, captured) = common::ctx(root, &fake, common::env());
-    let mut ctx = ctx
-        .with_terminals(false, true)
-        .with_stdin(format!("{token}\n").into_bytes());
+    let mut ctx = ctx.with_terminals(false, true);
     let exit = common::run_cli(
         &mut ctx,
         &[
             "auth",
             "add",
             "dev",
-            "--stdin",
+            "--file",
+            &file,
             "--tier",
             "dev",
             "--owner",

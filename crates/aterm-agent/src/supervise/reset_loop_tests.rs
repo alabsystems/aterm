@@ -13,7 +13,7 @@ fn ungen(request: &str) -> String {
 }
 
 fn guard_of(row: &str) -> String {
-    crate::supervise::policy::row_guard(row)
+    alab_policy::guard::row_guard(row)
 }
 
 fn placed(when: &str) -> i64 {
@@ -26,7 +26,7 @@ const RESET_HEAD: &str = "Refills your weekly limit now · your weekly reset day
 
 fn spent() -> ResetOutcome {
     ResetOutcome::Spent {
-        kind: aterm_phase::ResetKind::Weekly,
+        kind: alab_policy::vocab::ResetKind::Weekly,
         asks: false,
         left: Some(1),
         cleared_at: TEST_NOW,
@@ -263,11 +263,11 @@ fn a_gate_of_the_loops_shut_passes_the_reset_over_before_the_host_is_asked() {
 #[test]
 fn a_walled_or_countless_spend_is_said_and_booked_as_used() {
     let walled = ResetOutcome::Walled {
-        kind: aterm_phase::ResetKind::Fable,
+        kind: alab_policy::vocab::ResetKind::Fable,
         left: 0,
     };
     let countless = ResetOutcome::Spent {
-        kind: aterm_phase::ResetKind::Weekly,
+        kind: alab_policy::vocab::ResetKind::Weekly,
         asks: false,
         left: None,
         cleared_at: TEST_NOW,
@@ -504,7 +504,7 @@ fn a_kind_drawn_beside_the_row_as_the_arrow_lands_is_never_entered() {
 
 #[test]
 fn under_the_owners_order_the_press_reads_the_dialog_again_by_that_order() {
-    use aterm_phase::ResetKind::{Full, Weekly};
+    use alab_policy::vocab::ResetKind::{Full, Weekly};
     use aterm_phase::prompt::fixtures::screen;
     use aterm_phase::reset::fixtures as f;
     const FULL: &str = "Use a full reset (1 left, until Oct 5)";
@@ -517,7 +517,7 @@ fn under_the_owners_order_the_press_reads_the_dialog_again_by_that_order() {
         world.drawn_at_arrow = drawn.then(|| (1, RESET_GRANT.to_string()));
         m
     };
-    let listed = |host: &std::sync::Arc<ResetHost>, order: Vec<aterm_phase::ResetKind>| {
+    let listed = |host: &std::sync::Arc<ResetHost>, order: Vec<alab_policy::vocab::ResetKind>| {
         let mut opts = reset_opts(host, true, 120);
         opts.policy.limit_reset_kinds = order;
         opts
@@ -1173,7 +1173,8 @@ fn a_successor_escapes_a_titled_confirmation_with_no_box_until_its_enter_is_writ
 
     let entered_row = |ledger: &Path| {
         taken_row(ledger);
-        let yes = aterm_phase::ResetKind::Weekly.yes();
+        use aterm_phase::ResetDrawn;
+        let yes = alab_policy::vocab::ResetKind::Weekly.yes();
         let row = approvals::Row {
             rule_id: "limit-reset@v1",
             outcome: approvals::Outcome::Approved,

@@ -56,7 +56,8 @@ use aterm_agent::{
         account_sync_error::{Retry, SyncError},
         accounts::{Cli, Vendor},
         alab_roster::{
-            self, Lab, LabAccount, LabMailbox, MachineRef, Part, Placements, SourceSnapshot,
+            self, Lab, LabAccount, LabMailbox, MachineKey, MachineRef, Part, Placements,
+            SourceSnapshot,
         },
     },
     machine_name::RegistryName,
@@ -68,7 +69,7 @@ use aterm_db::alab::{
     journal::place::Places,
     mail,
     registry::AddressIndex,
-    secret::Journal,
+    secret::{self, Journal},
     view::{LabView, MachineNickname},
 };
 use aterm_db::catalog::Policy;
@@ -213,15 +214,23 @@ fn mailbox_logins(addresses: &AddressIndex, logins: &[String]) -> BTreeMap<Strin
         .collect()
 }
 
-/// What this Mac reads to name a mailbox key's login ([`mailbox_logins`]): the logins of
-/// `~/.secrets/ai-mailbox.toml`, the fallback for a mailbox the registry names no login of
-/// (a version-1 row) until B13. Nothing where it is missing or unreadable.
+/// What this Mac reads to name a mailbox key's login ([`mailbox_logins`]): the logins of the
+/// vault's `ai-mailbox.toml` entry, read in place from this Mac's store, the fallback for a
+/// mailbox the registry names no login of (a version-1 row) until B13. Nothing where the store
+/// holds none or cannot be read; no file under `~/.secrets` is opened.
 fn mailbox_names(paths: &Paths) -> Vec<String> {
-    let file = paths
-        .home
-        .join(".secrets")
-        .join(aterm_agent::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE);
-    aterm_agent::harness::mailbox_routes::mailbox_logins(&file)
+    aterm_secrets::client::read_in_place(
+        paths,
+        aterm_agent::harness::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+    )
+    .ok()
+    .flatten()
+    .and_then(|bytes| {
+        bytes
+            .as_str()
+            .map(aterm_agent::harness::mailbox_routes::mailbox_logins)
+    })
+    .unwrap_or_default()
 }
 
 fn to_lab_mailbox(m: &mail::Mailbox) -> LabMailbox {
@@ -364,6 +373,11 @@ fn harness_lab_with_placed(
             .map(|machine| MachineRef::from_registry(machine.pk.clone(), machine.label.clone())),
         machine_name: registry_name(view),
         settled,
+        bound: view
+            .bound
+            .iter()
+            .map(|(commons, machine)| (commons.clone(), MachineKey::from_registry(machine.clone())))
+            .collect(),
         accounts,
         aliases: view.aliases(),
         mailboxes,
@@ -903,6 +917,7 @@ impl alab_roster::Source for &'static Cache {
             .collect();
         let result = mail::reveal_bound(
             &Registry::at(self.paths.clone()),
+            &secret::store(&self.paths),
             &journal,
             &expected.pk,
             &which,
@@ -941,12 +956,20 @@ impl alab_roster::Source for &'static Cache {
             which,
             when_ms: aterm_time::unix_millis().unwrap_or(0),
         };
-        match mail::reveal(&Registry::at(self.paths.clone()), &journal, ask, |value| {
-            consume(value);
-        }) {
+        match mail::reveal(
+            &Registry::at(self.paths.clone()),
+            &secret::store(&self.paths),
+            &journal,
+            ask,
+            |value| {
+                consume(value);
+            },
+        ) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(withheld)) => Err(withheld.words()),
-            Err(_) => Err("the registry's cell did not open or journal here"),
+            Err(_) => Err(
+                "the registry's cell, the secret store or the reveal journal is unavailable here",
+            ),
         }
     }
 }

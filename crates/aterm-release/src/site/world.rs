@@ -23,10 +23,10 @@ impl Real {
     /// The key, site or IAM permission cannot be verified.
     pub fn check_access(
         &self,
-        path: &Path,
+        key: &aterm_uds::secret::Secret,
         site: Option<&str>,
     ) -> Result<hosting::access::Access, String> {
-        let key = hosting::Key::read(path)?;
+        let key = hosting::Key::parse(key)?;
         let site = site
             .or(key.project.as_deref())
             .ok_or("no Hosting site or key project is configured")?;
@@ -45,13 +45,13 @@ impl Real {
         hosting::access::check(&hosting, &iam, &key, site, now).map_err(|why| why.to_string())
     }
 
-    /// Exchanges the configured key for a token and immediately discards it.
+    /// Exchanges the deployer key `key` for a token and immediately discards it.
     ///
     /// # Errors
     /// The key cannot be read or parsed, the endpoint is not admitted, or Google
     /// does not return a usable token. This checks no Hosting permissions.
-    pub fn check_key(&self, path: &Path) -> Result<(), String> {
-        let key = hosting::Key::read(path)?;
+    pub fn check_key(&self, key: &aterm_uds::secret::Secret) -> Result<(), String> {
+        let key = hosting::Key::parse(key)?;
         let client = hosting::Client::new(
             hosting::Origins::google(),
             Arc::clone(&self.curl),
@@ -403,18 +403,11 @@ impl World for Real {
     fn deploy(
         &mut self,
         plan: &hosting::Plan,
-        key: Option<&Path>,
+        key: &aterm_uds::secret::Secret,
         message: &str,
         out: &mut dyn Write,
     ) -> Result<hosting::Released, hosting::Failed> {
-        let key = key.ok_or_else(|| {
-            hosting::Failed::Credential(
-                "no service-account key is named (FIREBASE_SA_KEY, or publish/site.toml's \
-                 firebase_sa_key)"
-                    .into(),
-            )
-        })?;
-        let key = hosting::Key::read(key).map_err(hosting::Failed::Credential)?;
+        let key = hosting::Key::parse(key).map_err(hosting::Failed::Credential)?;
         let client = hosting::Client::new(
             hosting::Origins::google(),
             Arc::clone(&self.curl),

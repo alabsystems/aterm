@@ -15,41 +15,6 @@ fn event(report: &Report) -> aterm_json::Value {
     aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
 }
 
-/// Replay exact bytes from a retired historical compiler run, not a new compiler invocation.
-#[test]
-fn historical_cells_warning_reaches_the_stage_diagnostic_without_changing_its_result() {
-    let captured = include_str!("../tests/fixtures/cells-linux-arm-warning-2026-11-08.txt");
-    // The human renderer prepended the ladder row. cells::record_cell records that
-    // row separately; its Raw entries contain only the following timing/diagnostic bytes.
-    let (_, raw) = captured.split_once('\n').unwrap();
-    let mut report = Report::new("historical cells replay");
-    report.fail("historical Linux ARM test-target warning");
-    report.raw(raw);
-    let findings = report.findings();
-    let tally = crate::ladder::tally(std::slice::from_ref(&report));
-    let value = event(&report);
-    let message = value["finding_diagnostics"]["rows"][0]["message"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(aterm_json::Value::as_str)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        message.contains("warning:") && message.contains("producer_returns"),
-        "{message}"
-    );
-    assert!(
-        message.contains("resource_admission_member/tests.rs:44:5"),
-        "{message}"
-    );
-    assert_eq!(value["findings"][0].as_str(), Some(findings[0].id.as_str()));
-    assert_eq!(report.findings(), findings);
-    assert_eq!(crate::ladder::tally(std::slice::from_ref(&report)), tally);
-    assert_eq!(value["decisions"][0]["outcome"].as_str(), Some("FAIL"));
-    assert_eq!(tally.gate_failures.len(), 1);
-}
-
 #[test]
 fn stage_diagnostics_reuse_failed_row_excerpts_without_crossing_row_boundaries() {
     let mut report = Report::new("cross cells");

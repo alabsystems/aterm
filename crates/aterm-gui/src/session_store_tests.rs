@@ -1634,3 +1634,60 @@ fn exit_reason_and_actor_wire_tokens() {
     assert_eq!(ExitActor::Bridge.as_wire(), "bridge");
     assert_eq!(ExitActor::Unknown.as_wire(), "-");
 }
+
+/// A control selector `@<tab id>` reaches a tab in either form: a `t` tab and an `s-` tab an
+/// earlier build opened. A malformed ID of either form is refused by the parser, and a well-formed
+/// ID no tab holds names nothing.
+#[test]
+#[cfg(unix)]
+fn a_selector_finds_a_tab_by_either_form_of_its_id() {
+    let store = new_store();
+    let at = aterm_slog::Stamp::new(1_792_000_000_000, 1_000);
+    let epochs = Arc::new(crate::session_log::Epochs::new());
+    for (local, sid) in [(1, "tqn5r6e0148"), (2, "s-1a2b3c4d5e6f70819203")] {
+        store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register(test_handle_identified(
+                local,
+                SessionId::parse(sid).expect(sid),
+                aterm_session::LaunchNonce::generate(),
+                Arc::clone(&epochs),
+                at,
+            ));
+    }
+    let found = |line: &str| {
+        let selector = aterm_types::control_request::head(line).selector?;
+        store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_selector(&selector)
+            .map(|h| h.local_id)
+    };
+    assert_eq!(found("@tqn5r6e0148 status"), Some(1));
+    assert_eq!(found("@s-1a2b3c4d5e6f70819203 status"), Some(2));
+    // Negative controls: a malformed ID of each form is no selector at all, so it names nothing.
+    for malformed in [
+        "TQN5R6E0148",
+        "tqn5r6e014",
+        "tqn5r6e014u",
+        "s-1A2B3C4D5E6F70819203",
+        "s-1a2b3c4d5e6f7081920g",
+    ] {
+        let line = format!("@{malformed} status");
+        assert_eq!(
+            aterm_types::control_request::head(&line).selector,
+            Some(aterm_types::control_request::Selector::Invalid(malformed)),
+            "{malformed}"
+        );
+        assert_eq!(found(&line), None, "{malformed}");
+    }
+    // A well-formed ID of each form that no tab holds names nothing either.
+    for absent in ["@t0000000000 status", "@s-00000000000000000000 status"] {
+        assert!(matches!(
+            aterm_types::control_request::head(absent).selector,
+            Some(aterm_types::control_request::Selector::Sid(_))
+        ));
+        assert_eq!(found(absent), None, "{absent}");
+    }
+}

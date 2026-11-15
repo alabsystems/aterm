@@ -338,18 +338,6 @@ unsafe extern "system" {
         lpReturnSize: *mut usize,
     ) -> i32;
     pub(crate) fn DeleteProcThreadAttributeList(lpAttributeList: *mut c_void);
-    pub(crate) fn CreateProcessW(
-        lpApplicationName: *const u16,
-        lpCommandLine: *mut u16,
-        lpProcessAttributes: *mut c_void,
-        lpThreadAttributes: *mut c_void,
-        bInheritHandles: i32,
-        dwCreationFlags: u32,
-        lpEnvironment: *mut c_void,
-        lpCurrentDirectory: *const u16,
-        lpStartupInfo: *const STARTUPINFOW,
-        lpProcessInformation: *mut PROCESS_INFORMATION,
-    ) -> i32;
     pub(crate) fn ResumeThread(hThread: HANDLE) -> u32;
     pub(crate) fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> i32;
     pub(crate) fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
@@ -502,6 +490,79 @@ unsafe extern "system" {
         lpNumberOfCharsWritten: *mut u32,
         lpReserved: *mut c_void,
     ) -> i32;
+}
+
+/// `kernel32`'s process start, reached only through [`CreateProcessW`].
+mod start {
+    use super::{PROCESS_INFORMATION, STARTUPINFOW, c_void};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub(super) fn CreateProcessW(
+            lpApplicationName: *const u16,
+            lpCommandLine: *mut u16,
+            lpProcessAttributes: *mut c_void,
+            lpThreadAttributes: *mut c_void,
+            bInheritHandles: i32,
+            dwCreationFlags: u32,
+            lpEnvironment: *mut c_void,
+            lpCurrentDirectory: *const u16,
+            lpStartupInfo: *const STARTUPINFOW,
+            lpProcessInformation: *mut PROCESS_INFORMATION,
+        ) -> i32;
+        pub(super) fn SetLastError(dwErrCode: u32);
+    }
+}
+
+/// `CreateProcessW`, with the calling thread's system error boxes off for the call
+/// (`aterm_sysprobe::quiet_errors`): a file that is no image for this machine (a script, a
+/// truncated download) fails at once with `ERROR_BAD_EXE_FORMAT` (193) or
+/// `ERROR_EXE_MACHINE_TYPE_MISMATCH` (216) instead of raising "This version of %1 is not
+/// compatible" and waiting, in this thread, for a person to answer it. The guard is the thread's
+/// mode, restored before this returns, with the call's last error kept for the caller's
+/// `GetLastError`; the child inherits the process's mode (or the default one under
+/// `CREATE_DEFAULT_ERROR_MODE`), never a thread's, so its own error mode is untouched. Every
+/// process this crate starts is started here.
+///
+/// # Safety
+/// `CreateProcessW`'s: each pointer is null where the API allows it or valid for the call, the
+/// command line writable and NUL-terminated, and the startup information sized by its `cb`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn CreateProcessW(
+    lpApplicationName: *const u16,
+    lpCommandLine: *mut u16,
+    lpProcessAttributes: *mut c_void,
+    lpThreadAttributes: *mut c_void,
+    bInheritHandles: i32,
+    dwCreationFlags: u32,
+    lpEnvironment: *mut c_void,
+    lpCurrentDirectory: *const u16,
+    lpStartupInfo: *const STARTUPINFOW,
+    lpProcessInformation: *mut PROCESS_INFORMATION,
+) -> i32 {
+    let quiet = aterm_sysprobe::quiet_errors();
+    // SAFETY: the caller's contract, passed through unchanged.
+    let created = unsafe {
+        start::CreateProcessW(
+            lpApplicationName,
+            lpCommandLine,
+            lpProcessAttributes,
+            lpThreadAttributes,
+            bInheritHandles,
+            dwCreationFlags,
+            lpEnvironment,
+            lpCurrentDirectory,
+            lpStartupInfo,
+            lpProcessInformation,
+        )
+    };
+    let error = (created == 0).then(std::io::Error::last_os_error);
+    drop(quiet);
+    if let Some(code) = error.and_then(|e| e.raw_os_error()) {
+        // SAFETY: sets this thread's last-error value; no memory is touched.
+        unsafe { start::SetLastError(code.cast_unsigned()) };
+    }
+    created
 }
 
 #[link(name = "ntdll")]

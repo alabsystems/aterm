@@ -16,7 +16,7 @@ impl Fixture {
         let root = aterm_tempfile::tempdir().unwrap();
         let (paths, server, _) = super::tests::fixture(root.path());
         let config = configured(&paths).unwrap();
-        assert!(files_intact(&paths, &load_state(&paths).unwrap()));
+        assert!(applied_intact(&paths, &load_state(&paths).unwrap()));
         Self {
             server: Some(server),
             _root: root,
@@ -122,12 +122,12 @@ const ADMISSION_ACTIONS: &[&str] = &[
     "WrongSequence",
     "WrongEnvelopeDigest",
     "FailedApply",
-    "PendingApply",
+    "UnselectedApply",
     "NoOwnership",
     "Revoked",
     "CacheMissing",
-    "FileMissing",
-    "FileChanged",
+    "StaleSelection",
+    "CacheChanged",
     "MissingIdentity",
     "PlainSource",
     "UnknownMembership",
@@ -189,21 +189,17 @@ fn admission_transition_with(
         "WrongSequence" => state.seq += 1,
         "WrongEnvelopeDigest" => state.digest = Some([224; 32]),
         "FailedApply" => state.failed = true,
-        "PendingApply" => {
-            state.pending.insert("token".into(), "00".into());
-        }
-        "NoOwnership" => state.own = None,
+        "UnselectedApply" => state.materialization_selection = None,
+        "NoOwnership" => state.held = None,
         "Revoked" => state.membership = Stored::Revoked,
         "CacheMissing" => std::fs::remove_file(f.paths.cache_file()).unwrap(),
-        "FileMissing" => {
-            std::fs::remove_file(materialize::target_path(&f.paths.home, "token").unwrap()).unwrap()
+        "StaleSelection" => {
+            state.materialization_selection =
+                Some(materialization_selection::Meaning::from_digest([224; 32]));
         }
-        "FileChanged" => fsx::write_atomic(
-            &materialize::target_path(&f.paths.home, "token").unwrap(),
-            b"locally-changed",
-            0o600,
-        )
-        .unwrap(),
+        "CacheChanged" => {
+            fsx::write_atomic(&f.paths.cache_file(), b"not the verified envelope", 0o600).unwrap();
+        }
         "MissingIdentity" => std::fs::remove_file(f.paths.identity_file()).unwrap(),
         "PlainSource" => {
             config.source = Source::Path(f.paths.home.join("scratch-vault"));

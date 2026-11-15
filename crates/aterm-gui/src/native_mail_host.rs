@@ -56,8 +56,9 @@ impl crate::App {
 
     pub(crate) fn stage_mail_tab(
         &mut self,
-        wid: crate::WindowId,
+        target: impl Into<crate::app_tabs::NativeInstallTarget>,
     ) -> Result<(crate::tab_model::TabId, crate::tab_model::ViewId), String> {
+        let target = target.into();
         let proxy = self.proxy.clone();
         let presentation = crate::tab_model::TabPresentation {
             title: "Mail".into(),
@@ -70,7 +71,7 @@ impl crate::App {
         let state = crate::native_app::AppViewState::Mail(Box::default());
         let installed = if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::Mail)
         {
-            self.install_native_tab(wid, instance, state, presentation)
+            self.install_native_tab(target, instance, state, presentation)
         } else {
             let model = MailApp::new(move || {
                 if let Some(proxy) = &proxy {
@@ -78,7 +79,7 @@ impl crate::App {
                 }
             })?;
             self.install_new_native_tab(
-                wid,
+                target,
                 crate::native_app::NativeApp::Mail(Box::new(model)),
                 state,
                 presentation,

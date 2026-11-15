@@ -501,9 +501,7 @@ fn noncurrent_states(state: &State) -> Vec<State> {
     let mut failed = state.clone();
     failed.failed = true;
     let mut unapplied = state.clone();
-    unapplied
-        .pending
-        .insert("other".to_owned(), "00".repeat(32));
+    unapplied.failed = true;
     let mut absent = state.clone();
     absent.membership = Stored::None;
     let mut plain = state.clone();

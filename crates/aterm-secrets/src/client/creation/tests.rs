@@ -55,7 +55,7 @@ pub(crate) fn creation_transition(state: &ModelState, action: &str) -> ModelStat
             std::fs::write(import.join("example"), b"changed").unwrap();
             create(&paths, source_text, Some(&import), Some("m1")).unwrap();
             assert_eq!(
-                std::fs::read(paths.home.join(".secrets/example")).unwrap(),
+                crate::client::stored(&paths, "example").unwrap(),
                 b"original"
             );
             2
@@ -314,28 +314,43 @@ fn unpublished_preparation_resumes_from_its_durable_request() {
     );
 }
 
+/// A local step that fails once the vault is published (here the Commons bootstrap, its custody
+/// lock's path held by a folder) leaves the creation unfinished, and a resume finishes it from
+/// the retained, authenticated bytes offline, publishing nothing again.
 #[test]
-fn failed_local_materialization_resumes_without_republishing() {
+fn failed_local_installation_resumes_without_republishing() {
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(&root.path().join("m1"));
     let source = root.path().join("first.vault");
     let import = root.path().join("import");
     std::fs::create_dir(&import).unwrap();
     private_file(&import.join("example"), b"original");
-    let blocked = paths.home.join(".secrets/example");
+    let blocked = paths.dir.join("commons.lock");
     std::fs::create_dir_all(&blocked).unwrap();
     let made = create(&paths, source.to_str().unwrap(), Some(&import), Some("m1")).unwrap();
     assert!(made.local.is_some());
     assert_eq!(load_state(&paths).unwrap().seq, 1);
+    assert!(claim(&paths).unwrap().unwrap().phase != Phase::Complete);
     std::fs::remove_dir(&blocked).unwrap();
     std::fs::remove_file(&source).unwrap();
     resume(&paths).unwrap();
-    assert_eq!(std::fs::read(&blocked).unwrap(), b"original");
+    assert!(claim(&paths).unwrap().unwrap().phase == Phase::Complete);
+    assert_eq!(
+        crate::client::stored(&paths, "example").as_deref(),
+        Some(b"original".as_slice())
+    );
     assert!(
         !source.exists(),
-        "cached authenticated bytes repair the local files offline"
+        "cached authenticated bytes finish the local installation offline"
     );
     assert!(!load_state(&paths).unwrap().failed);
+    assert!(
+        crate::commons::bootstrap::Bootstrap::required(&paths)
+            .unwrap()
+            .access()
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

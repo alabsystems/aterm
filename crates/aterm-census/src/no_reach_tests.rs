@@ -252,6 +252,61 @@ fn a_reader_is_named_by_file_name_directory_or_own_table() {
     }
 }
 
+/// A message's citation of a path, `(docs/RELEASING.md § Resume)` (R35: aterm-release cites
+/// its guide so in every refusal, and each one judged every landing that shared the guide in
+/// full), is a mention, not a read, in a plain or raw literal, across a `\` line continuation,
+/// in a `format!` with arguments, and beside a citation of another file. NEGATIVE CONTROLS: an
+/// include, a `Path::new`, a const later joined into a path, a test that reads the file, prose
+/// that spells it bare, a word whose `(` is further in or that glues more path to it, a literal
+/// with one citation and one bare spelling, a citation of another path with the same file name,
+/// an unknown escape, and a root file's `(AGENTS.md)` (a zsh glob group) each still may read it.
+#[test]
+fn a_cited_path_in_a_message_is_a_mention_and_every_other_spelling_a_read() {
+    let path = "docs/RELEASING.md";
+    let file = "crates/aterm-release/src/release.rs";
+    let mentions = [
+        "fn f() -> String { \"create the handoff directory (docs/RELEASING.md \u{a7} Native \\\n         \
+         Linux release handoff)\".into() }",
+        "fn f() { bail!(\"never re-point it by hand (docs/RELEASING.md, \\\"The cut owns\\\")\"); }",
+        "fn f() { e!(\"used (docs/RELEASING.md, Resume, recut, abandon)\"); }",
+        "fn f() { e!(\"builder with its sysroot (docs/RELEASING.md){note}\"); }",
+        "fn f() { e!(\"see\\n(docs/RELEASING.md). Then (docs/PROCESS.md: Land)\"); }",
+        "const W: &str = r#\"add --windows-artifacts <dir> (docs/RELEASING.md; Windows)\"#;",
+        "fn f() { format!(\"{x} (docs/RELEASING.md \u{a7} {s})\", x = 1, s = 2); }",
+    ];
+    for text in mentions {
+        assert!(!may_read(file, text, path), "{text}");
+        assert!(!names(text, path), "{text}");
+    }
+    let reads = [
+        "const S: &str = include_str!(\"../../../docs/RELEASING.md\");",
+        "fn f() { std::fs::read(std::path::Path::new(\"docs/RELEASING.md\")); }",
+        "const GUIDE: &str = \"docs/RELEASING.md\";\nfn f() { read(root().join(GUIDE)); }",
+        "#[test]\nfn t() { std::fs::read_to_string(root().join(\"docs\").join(\"RELEASING.md\")); }",
+        "fn f() { e!(\"see docs/RELEASING.md for the steps\"); }",
+        "fn f() { sh(\"(cat<docs/RELEASING.md)\"); }",
+        "fn f() { e!(\"x(docs/RELEASING.md)\"); }",
+        "fn f() { e!(\"(docs/RELEASING.md/x)\"); }",
+        "fn f() { e!(\"(docs/RELEASING.mdx)\"); }",
+        "fn f() { e!(\"(docs/RELEASING.md.bak)\"); }",
+        "fn f() { e!(\"(docs/RELEASING.md) and docs/RELEASING.md\"); }",
+        "fn f() { e!(\"(docs/old/RELEASING.md)\"); }",
+        "fn f() { e!(\"(docs/RELEASING.md) \\q\"); }",
+        "fn f() { format!(\"{root}/docs/RELEASING.md\"); }",
+    ];
+    for text in reads {
+        assert!(may_read(file, text, path), "{text}");
+    }
+    assert_eq!(cited("(docs/X.md)", "docs/X.md"), "(         )");
+    assert_eq!(cited("a (docs/X.md", "docs/X.md"), "a (         ");
+    assert_eq!(cited("a(docs/X.md)", "docs/X.md"), "a(docs/X.md)");
+    let root = "fn f() { zsh(\"cat (AGENTS.md)\"); }";
+    assert!(
+        may_read(file, root, "AGENTS.md"),
+        "a root file's is no citation"
+    );
+}
+
 /// [`SOURCE`] is this file's text, which `verify land` compares with the merge's.
 #[test]
 fn the_rule_source_is_this_file() {

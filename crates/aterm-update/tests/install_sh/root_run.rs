@@ -1156,15 +1156,40 @@ fn a_source_build_names_what_it_cannot_change_before_it_starts() {
 #[test]
 fn under_root_the_source_lane_runs_no_aterm_or_toolchain_another_account_can_change() {
     let scratch = Scratch::new();
-    let tmp = scratch.join("tmp");
+    let tmp = scratch.mkdir("tmp");
+    for file in [
+        "bin/aterm",
+        "both/rustup",
+        "both/cargo",
+        "cargo-only/cargo",
+        "store/trust/1/bin/targo",
+    ] {
+        let program = scratch.exe(
+            &format!("tmp/{file}"),
+            &format!("#!/bin/sh\necho \"{file} $*\" >>\"$TMPDIR/ran\"\n"),
+        );
+        if matches!(file, "bin/aterm" | "cargo-only/cargo") {
+            let mut command = aterm_uds::spawnfd::command(&program);
+            command.arg("--fixture-qualification").env("TMPDIR", &tmp);
+            let output = aterm_uds::deadline::output_within(
+                &mut command,
+                aterm_uds::deadline::FIRST_EXEC_HANG,
+            )
+            .expect("the account's private tool shows it ran before discovery");
+            assert!(output.status.success(), "{program:?}: {output:?}");
+            assert_eq!(
+                read(&tmp.join("ran")),
+                format!("{file} --fixture-qualification\n")
+            );
+            std::fs::remove_file(tmp.join("ran")).expect("clear the setup receipt");
+        }
+    }
     let mut lib = Lib::new();
     lib.step(
         "ROOT=\"$TMPDIR/co\"; mkdir -p \"$ROOT\" \"$TMPDIR/bin\" \"$TMPDIR/both\" \"$TMPDIR/cargo-only\" \
          \"$TMPDIR/store/trust/1/bin\" \"$TMPDIR/cargo-home\" && \
          printf '[toolchain]\\nchannel = \"trust\"\\n' >\"$ROOT/rust-toolchain.toml\" && \
-         for f in bin/aterm both/rustup both/cargo cargo-only/cargo store/trust/1/bin/targo; do \
-         printf '#!/bin/sh\\necho \"%s $*\" >>\"$TMPDIR/ran\"\\n' \"$f\" >\"$TMPDIR/$f\" && chmod 755 \"$TMPDIR/$f\"; \
-         done; export CARGO_HOME=\"$TMPDIR/cargo-home\"",
+         export CARGO_HOME=\"$TMPDIR/cargo-home\"",
     );
     let find = |dirs: &str| {
         format!(
@@ -1298,9 +1323,10 @@ fn a_root_runs_bundle_gives_its_folders_group_write_alone() {
 /// included (a test cannot give a file away), in `$FOREIGN_LIST`; `find`'s
 /// `! -user <uid>` asks for those alone, and the rest of each walk is find's.
 /// Under `FAKE_ROOT`, a walk of folders all outside its `$SCRATCH` finds
-/// nothing, as its `ls` shows them root's: a walk from the scratch up to `/`
-/// (each `.cargo/` above a checkout) would otherwise judge the host's own
-/// folders, such as a `~/.cargo` a umask of 002 left group-writable.
+/// nothing, as its `ls` shows them root's and its ACL query with no ACL: a walk
+/// from the scratch up to `/` (each `.cargo/` above a checkout) would otherwise
+/// judge the host's own folders, such as a `~/.cargo` a umask of 002 left
+/// group-writable.
 const FOREIGN_FIND: &str = r#"theirs() { for p; do printf '%s\n' "$p" >>"$FOREIGN_LIST"; done; }
 theirs_at() {
 	local f
@@ -1337,7 +1363,10 @@ find() {
 }"#;
 
 /// Root, over a scratch whose every entry `ls` shows as root's but those
-/// `theirs` marks, uid 424242's, below folders that are plain root ones.
+/// `theirs` marks, uid 424242's, below folders that are plain root ones. Off
+/// macOS its ACL query answers for those folders too, as plain ones with no
+/// ACL, when a getfacl is there to run: the real query of a `~/.cargo` above
+/// the checkout read the host's ACLs, whatever they were, over its whole tree.
 const FAKE_ROOT: &str = r#"id() { if [ "$1" = -u ]; then echo 0; else command id "$@"; fi; }
 SCRATCH="${TMPDIR%/tmp}"
 chmod 755 "$SCRATCH" "$TMPDIR"
@@ -1353,7 +1382,36 @@ ls_entry() {
 		echo "${t}rwxr-xr-x 2 0 0 64 Apr 22 2024 $p"
 		;;
 	esac
+}
+declare -F base_linux_acl_query >/dev/null || eval "base_$(declare -f linux_acl_query)"
+linux_acl_query() {
+	case "${!#}" in
+	"$SCRATCH" | "$SCRATCH"/*) base_linux_acl_query "$@" ;;
+	*) linux_acl_tool >/dev/null && printf '%s\n' user::rwx group::r-x other::r-x ;;
+	esac
 }"#;
+
+/// Private regular tool images qualified before the ownership matrix mutates their trees.
+fn prepare_root_layouts(scratch: &Scratch, names: impl IntoIterator<Item = String>) {
+    for name in names {
+        let tool = scratch.exe(
+            &format!("tmp/{name}/store/trust/1/bin/targo"),
+            "#!/bin/sh\n\
+             if [ \"${1:-}\" = --fixture-qualification ]; then echo layout-tool-ran; exit 0; fi\n\
+             W=${0%/store/trust/1/bin/targo}\n\
+             echo \"$PATH\" >\"$W/build-path\"\n\
+             echo \"${GIT_CONFIG_GLOBAL-unset} ${GIT_CONFIG_NOSYSTEM-unset}\" >\"$W/build-git\"\n\
+             echo \"${DEVELOPER_DIR-unset} ${SDKROOT-unset} ${TOOLCHAINS-unset}\" >\"$W/build-dev\"\n",
+        );
+        let mut command = aterm_uds::spawnfd::command(&tool);
+        command.arg("--fixture-qualification");
+        let output =
+            aterm_uds::deadline::output_within(&mut command, aterm_uds::deadline::FIRST_EXEC_HANG)
+                .expect("the private layout tool qualifies before ownership changes");
+        assert!(output.status.success(), "{tool:?}: {output:?}");
+        assert_eq!(output.stdout, b"layout-tool-ran\n", "{tool:?}");
+    }
+}
 
 /// What a root source build reads, all root's: a checkout with a build in
 /// target/, a `.cargo/config.toml` above it, cargo's home, a developer folder
@@ -1373,8 +1431,7 @@ mk() {
 	printf 'fn main() {}\n' >"$W/co/src/main.rs"
 	: >"$W/co/target/release/deps/libx.rlib"
 	printf '[build]\n' >"$W/.cargo/config.toml"
-	printf '#!/bin/sh\necho "$PATH" >"%s/build-path"\necho "${GIT_CONFIG_GLOBAL-unset} ${GIT_CONFIG_NOSYSTEM-unset}" >"%s/build-git"\necho "${DEVELOPER_DIR-unset} ${SDKROOT-unset} ${TOOLCHAINS-unset}" >"%s/build-dev"\n' \
-		"$W" "$W" "$W" >"$W/store/trust/1/bin/targo"
+	[[ -f "$W/store/trust/1/bin/targo" && ! -L "$W/store/trust/1/bin/targo" ]] || return 1
 	printf '#!/bin/sh\n' >"$W/their-bin/sccache"
 	cp "$W/their-bin/sccache" "$W/their-bin/rustc"
 	cp "$W/their-bin/sccache" "$W/dev/usr/bin/clang"
@@ -1602,6 +1659,12 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
         &[],
     );
     let built_git = lib.call("cat \"$TMPDIR/build/build-git\"", &[]);
+    prepare_root_layouts(
+        &scratch,
+        (0..rows.len())
+            .map(|n| format!("row{n}"))
+            .chain(["build".into(), "account".into()]),
+    );
     let recs = lib.run(&scratch);
     for (n, ((label, _, want), i)) in rows.iter().zip(calls).enumerate() {
         let rec = &recs[i];
@@ -1650,6 +1713,7 @@ fn under_root_a_source_build_reads_and_runs_nothing_another_account_can_change()
 #[test]
 fn under_root_git_over_the_checkout_is_roots_and_reads_no_config_of_homes() {
     let scratch = Scratch::new();
+    prepare_root_layouts(&scratch, ["git".into()]);
     let mut lib = Lib::new();
     lib.step(format!(
         "{FOREIGN_FIND}\n{FAKE_ROOT}\n{ROOT_LAYOUT}\n\
@@ -2690,6 +2754,12 @@ fn under_root_cc_runs_only_from_a_developer_folder_and_sdk_root_alone_can_change
             &[],
         )
     });
+    prepare_root_layouts(
+        &scratch,
+        (0..rows.len())
+            .map(|n| format!("row{n}"))
+            .chain(["by-name", "unjudged", "git"].map(String::from)),
+    );
     let recs = lib.run(&scratch);
     let tmp = scratch.join("tmp");
     for (n, ((label, _, want), call)) in rows.iter().zip(calls).enumerate() {
@@ -2980,6 +3050,7 @@ linux_acl_query() {
     // Rows run side by side: each has its own folder and foreign list (`mk`).
     for platform in ["Darwin", "Linux"] {
         for (label, setup, builds) in rows {
+            prepare_root_layouts(&scratch, [format!("{platform}-{label}")]);
             let call = lib.row(
                 format!(
                     "( mk {platform}-{label}; PLATFORM={platform}; unset ACL_AT ACL_UNREADABLE; \
@@ -3071,6 +3142,18 @@ find_cargo_and_rustup "$ROOT" && [[ "$CARGO_LANE" == rustup &&
     "$RUSTUP_BIN" == "$CARGO_HOME/bin/rustup" && "$CARGO_BIN" == "$CARGO_HOME/bin/cargo" ]] &&
 cd "$ROOT" && [[ -f "$CARGO_BIN" && -f "$RUSTUP_BIN" ]] )"#,
         &[],
+    );
+    prepare_root_layouts(
+        &scratch,
+        [
+            "path",
+            "unknown-acl",
+            "default-acl",
+            "metadata",
+            "functions",
+            "relative-home",
+        ]
+        .map(String::from),
     );
     let recs = lib.run(&scratch);
     for (label, call, builds) in checks {
@@ -3433,23 +3516,31 @@ fn a_ctrl_c_never_cuts_the_cleanup_short() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
-    lib.step(
-        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/rm\" <<'EOF'
-#!/bin/sh
+    let rm = scratch.stand_in(
+        "cleanup-rm",
+        r#"#!/bin/sh
 for last; do :; done
-[ \"$last\" != \"$CUT\" ] || { echo cut >>\"$TMPDIR/cut-$ROW\"; kill -s \"$SIG\" 0; }
-exec /bin/rm \"$@\"
-EOF
-cat >\"$TMPDIR/bin/hdiutil\" <<'EOF'
-#!/bin/sh
-echo \"$3\" >>\"$TMPDIR/hdiutil-$ROW\"
-[ \"$ROW\" != mounted ] || exit 1
-[ \"$3\" = -force ] && exit 0
+[ "$last" != "$CUT" ] || { echo cut >>"$TMPDIR/cut-$ROW"; kill -s "$SIG" 0; }
+exec /bin/rm "$@"
+"#,
+    );
+    let hdiutil = scratch.stand_in(
+        "cleanup-hdiutil",
+        r#"#!/bin/sh
+echo "$3" >>"$TMPDIR/hdiutil-$ROW"
+[ "$ROW" != mounted ] || exit 1
+[ "$3" = -force ] && exit 0
 trap 'exit 1' QUIT
-kill -s \"$SIG\" 0
+kill -s "$SIG" 0
 exec /bin/sleep 30
-EOF
-chmod +x \"$TMPDIR/bin/rm\" \"$TMPDIR/bin/hdiutil\" && cat >\"$TMPDIR/cleanup.bash\" <<'EOF'
+"#,
+    );
+    lib.step(format!(
+        "mkdir -p \"$TMPDIR/bin\" && ln -s {} \"$TMPDIR/bin/rm\" && ln -s {} \"$TMPDIR/bin/hdiutil\"",
+        q(s(&rm)), q(s(&hdiutil))
+    ));
+    lib.step(
+        "cat >\"$TMPDIR/cleanup.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 # A bracket in TMP, as a TMPDIR can have, which a glob would not match.
@@ -3606,36 +3697,46 @@ fn a_term_to_the_shell_alone_never_leaves_a_staging_copy() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
-    lib.step(
-        "mkdir -p \"$TMPDIR/bin\" && cat >\"$TMPDIR/bin/ditto\" <<'EOF'
-#!/bin/sh
-case \"$ROW:$1\" in
-term:* | hup:* | unpack*:-x) kill -s \"$SIG\" \"$PPID\"; /bin/sleep 1; cut=1 ;;
+    let ditto = scratch.stand_in(
+        "place-ditto",
+        r#"#!/bin/sh
+case "$ROW:$1" in
+term:* | hup:* | unpack*:-x) kill -s "$SIG" "$PPID"; /bin/sleep 1; cut=1 ;;
 esac
-if [ \"$1\" = -x ]; then
-\tmkdir -p \"$4/aterm.app/Contents\" && : >\"$4/aterm.app/Contents/new\"
+if [ "$1" = -x ]; then
+    mkdir -p "$4/aterm.app/Contents" && : >"$4/aterm.app/Contents/new"
 else
-\tmkdir -p \"$2\" && cp -R \"$1/.\" \"$2\"
+    mkdir -p "$2" && cp -R "$1/." "$2"
 fi
-[ -z \"${cut:-}\" ] || : >\"$DONE\"
-EOF
-cat >\"$TMPDIR/bin/mv\" <<'EOF'
-#!/bin/sh
-case \"$ROW:$1\" in
-swap*:*/aterm.app) kill -s \"$SIG\" \"$PPID\"; /bin/sleep 1; cut=1 ;;
+[ -z "${cut:-}" ] || : >"$DONE"
+"#,
+    );
+    let mv = scratch.stand_in(
+        "place-mv",
+        r#"#!/bin/sh
+case "$ROW:$1" in
+swap*:*/aterm.app) kill -s "$SIG" "$PPID"; /bin/sleep 1; cut=1 ;;
 esac
-/bin/mv \"$@\"; s=$?
-[ -z \"${cut:-}\" ] || : >\"$DONE\"
+/bin/mv "$@"; s=$?
+[ -z "${cut:-}" ] || : >"$DONE"
 exit $s
-EOF
-cat >\"$TMPDIR/bin/later\" <<'EOF'
-#!/bin/sh
-kill -s \"$SIG\" \"$PPID\"
+"#,
+    );
+    let later = scratch.stand_in(
+        "place-later",
+        r#"#!/bin/sh
+kill -s "$SIG" "$PPID"
 i=0
-while kill -0 \"$PPID\" 2>/dev/null && [ $i -lt 600 ]; do /bin/sleep 0.1; i=$((i + 1)); done
-if kill -0 \"$PPID\" 2>/dev/null; then echo waited >\"$DONE\"; else echo ended >\"$DONE\"; fi
-EOF
-chmod +x \"$TMPDIR/bin/ditto\" \"$TMPDIR/bin/mv\" \"$TMPDIR/bin/later\" && cat >\"$TMPDIR/place.bash\" <<'EOF'
+while kill -0 "$PPID" 2>/dev/null && [ $i -lt 600 ]; do /bin/sleep 0.1; i=$((i + 1)); done
+if kill -0 "$PPID" 2>/dev/null; then echo waited >"$DONE"; else echo ended >"$DONE"; fi
+"#,
+    );
+    lib.step(format!(
+        "mkdir -p \"$TMPDIR/bin\" && ln -s {} \"$TMPDIR/bin/ditto\" && ln -s {} \"$TMPDIR/bin/mv\" && ln -s {} \"$TMPDIR/bin/later\"",
+        q(s(&ditto)), q(s(&mv)), q(s(&later))
+    ));
+    lib.step(
+        "cat >\"$TMPDIR/place.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 DEST=\"$TMPDIR/$1\" TMP=\"$TMPDIR/$1.tmp\" CONTAINER_KIND=zip STAGE=\"\" STAGE_DIR=\"\" OLD=\"\"
@@ -3654,13 +3755,13 @@ swap*) mkdir -p \"$DEST/aterm.app/Contents/MacOS\" && : >\"$DEST/aterm.app/Conte
 esac
 export ROW=\"$1\" SIG=\"$2\" DONE=\"$TMPDIR/done-$1\"
 PATH=\"$TMPDIR/bin:$PATH\"
-trap install_app_cleanup EXIT
+trap 'install_app_cleanup; case \"$ROW\" in later*) echo ended >\"$DONE\" ;; esac' EXIT
 case \"$1\" in
 unpack*) unpack_container \"$TMP/aterm.zip\" \"$MNT\" ;;
 esac
 place_bundle \"$MNT/aterm.app\" \"$DEST\"
 case \"$1\" in
-later*) later ;;
+later*) interruptible later ;;
 esac
 echo went on
 EOF",

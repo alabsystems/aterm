@@ -130,7 +130,10 @@ fn conn_round_trips_against_a_live_headless_instance() {
         .strip_prefix("OK ")
         .expect("spawn replies OK <sid>")
         .to_string();
-    assert!(sid2.starts_with("s-"), "minted sid shape: {sid2}");
+    assert!(
+        aterm_types::tab_id::is_tab_id(&sid2) && sid2.starts_with('t'),
+        "a minted tab ID is the t form: {sid2}"
+    );
     assert_ne!(sid1, sid2);
 
     let refused = run_client(

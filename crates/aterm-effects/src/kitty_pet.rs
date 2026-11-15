@@ -16777,6 +16777,189 @@ const fn first_px_step(
     Some(t)
 }
 
+/// The flying cat's four faces: one glide body each species wears in the air
+/// ([`crate::kitty_cursor::CursorBody::Glide`]), so a reaction swaps face pixels and moves no edge
+/// (`pet_art_quality`'s `glide_faces_share_one_body`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlideFaces {
+    /// The glide, eyes open: the cruise.
+    pub fly: PetGlyphId,
+    /// The lids down: the idle blink.
+    pub blink: PetGlyphId,
+    /// Happy eyes and a smile: a cheer, a song, a goodbye's flourish.
+    pub happy: PetGlyphId,
+    /// Eyes wide: a delete's oops.
+    pub oof: PetGlyphId,
+}
+
+impl GlideFaces {
+    /// The four faces in one array, the cruise first.
+    #[must_use]
+    #[inline]
+    pub const fn all(self) -> [PetGlyphId; 4] {
+        [self.fly, self.blink, self.happy, self.oof]
+    }
+}
+
+/// `species`' glide faces.
+#[must_use]
+#[inline]
+pub const fn glide_faces(species: PetSpecies) -> GlideFaces {
+    match species {
+        PetSpecies::Cat => GlideFaces {
+            fly: PetGlyphId::PetFly,
+            blink: PetGlyphId::PetFlyBlink,
+            happy: PetGlyphId::PetFlyHappy,
+            oof: PetGlyphId::PetFlyOof,
+        },
+        PetSpecies::Dog => GlideFaces {
+            fly: PetGlyphId::PetDogFly,
+            blink: PetGlyphId::PetDogFlyBlink,
+            happy: PetGlyphId::PetDogFlyHappy,
+            oof: PetGlyphId::PetDogFlyOof,
+        },
+    }
+}
+
+/// The species whose glide `face` is one of; `None` for a pose that is no glide face.
+#[must_use]
+#[inline]
+pub const fn glide_species(face: PetGlyphId) -> Option<PetSpecies> {
+    match face {
+        PetGlyphId::PetFly
+        | PetGlyphId::PetFlyBlink
+        | PetGlyphId::PetFlyHappy
+        | PetGlyphId::PetFlyOof => Some(PetSpecies::Cat),
+        PetGlyphId::PetDogFly
+        | PetGlyphId::PetDogFlyBlink
+        | PetGlyphId::PetDogFlyHappy
+        | PetGlyphId::PetDogFlyOof => Some(PetSpecies::Dog),
+        _ => None,
+    }
+}
+
+/// The flier's tile, px, for a `cell_h` cell: two rows tall, as wide as the pose's frame at that
+/// height, no wider than four rows. 86 x 52 at a 26 px cell.
+#[must_use]
+#[inline]
+pub const fn glide_tile_size(cell_h: u16) -> (u16, u16) {
+    let h = 2 * cell_h as u32;
+    let w = (h as f32 * ART_ASPECT + 0.5) as u32;
+    let cap = 4 * cell_h as u32;
+    let w = if w < cap { w } else { cap };
+    (clamp_u16(w), clamp_u16(h))
+}
+
+/// `v`, at most `u16::MAX`.
+const fn clamp_u16(v: u32) -> u16 {
+    if v > u16::MAX as u32 {
+        u16::MAX
+    } else {
+        v as u16
+    }
+}
+
+/// Species index into the per-species glide tables.
+const fn glide_index(species: PetSpecies) -> usize {
+    match species {
+        PetSpecies::Cat => 0,
+        PetSpecies::Dog => 1,
+    }
+}
+
+/// The union of every path's control hull over `faces`' every layer, normalized to the frame
+/// `(x0, y0, x1, y1)`: the whole of what any face of the glide can ink, the halo aside.
+const fn faces_ink(faces: GlideFaces) -> (f32, f32, f32, f32) {
+    let all = faces.all();
+    let (mut x0, mut y0, mut x1, mut y1) = (1.0f32, 1.0f32, 0.0f32, 0.0f32);
+    let mut f = 0;
+    while f < all.len() {
+        let layers = PET_GLYPHS[all[f] as usize].layers;
+        let mut l = 0;
+        while l < layers.len() {
+            let paths = layers[l].paths;
+            let mut p = 0;
+            while p < paths.len() {
+                if let Some((a, b, c, d)) = crate::cat_baker::path_bounds(paths[p]) {
+                    x0 = if a < x0 { a } else { x0 };
+                    y0 = if b < y0 { b } else { y0 };
+                    x1 = if c > x1 { c } else { x1 };
+                    y1 = if d > y1 { d } else { y1 };
+                }
+                p += 1;
+            }
+            l += 1;
+        }
+        f += 1;
+    }
+    if x0 > x1 || y0 > y1 {
+        (0.0, 0.0, 1.0, 1.0)
+    } else {
+        (x0, y0, x1, y1)
+    }
+}
+
+/// Each species' glide ink box ([`faces_ink`] over its four faces), computed from the art so it
+/// cannot drift from it: the flier's footprint, the box every seat and letter law judges.
+pub static GLIDE_INK: [(f32, f32, f32, f32); 2] = [
+    faces_ink(glide_faces(PetSpecies::Cat)),
+    faces_ink(glide_faces(PetSpecies::Dog)),
+];
+
+/// `species`' glide ink box ([`GLIDE_INK`]).
+#[must_use]
+#[inline]
+pub const fn glide_ink(species: PetSpecies) -> (f32, f32, f32, f32) {
+    GLIDE_INK[glide_index(species)]
+}
+
+/// Device pixels the flier's footprint keeps round its ink box: the outline's halo (at most
+/// 1.25 px, `cat_baker::paint_outline_halo`), a widened thin outline (at most 1 px, the same edge
+/// moved, so not added to the halo) and a pixel of antialiasing.
+pub const GLIDE_INK_PAD_PX: i32 = 3;
+
+/// The centre of the mouth's bounds on `faces`' cruise face, normalized: where the song's notes
+/// leave from. The frame's mouth row at its muzzle where the art has no mouth layer.
+const fn glide_mouth_of(faces: GlideFaces) -> (f32, f32) {
+    let layers = PET_GLYPHS[faces.fly as usize].layers;
+    let (mut x0, mut y0, mut x1, mut y1) = (1.0f32, 1.0f32, 0.0f32, 0.0f32);
+    let mut l = 0;
+    while l < layers.len() {
+        if matches!(layers[l].role, crate::cat_glyphs_gen::GlyphRole::Mouth) {
+            let paths = layers[l].paths;
+            let mut p = 0;
+            while p < paths.len() {
+                if let Some((a, b, c, d)) = crate::cat_baker::path_bounds(paths[p]) {
+                    x0 = if a < x0 { a } else { x0 };
+                    y0 = if b < y0 { b } else { y0 };
+                    x1 = if c > x1 { c } else { x1 };
+                    y1 = if d > y1 { d } else { y1 };
+                }
+                p += 1;
+            }
+        }
+        l += 1;
+    }
+    if x0 > x1 || y0 > y1 {
+        (0.82, 0.49)
+    } else {
+        ((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+    }
+}
+
+/// Each species' glide mouth ([`glide_mouth_of`]), normalized to the frame, the art facing right.
+pub static GLIDE_MOUTH: [(f32, f32); 2] = [
+    glide_mouth_of(glide_faces(PetSpecies::Cat)),
+    glide_mouth_of(glide_faces(PetSpecies::Dog)),
+];
+
+/// `species`' glide mouth ([`GLIDE_MOUTH`]).
+#[must_use]
+#[inline]
+pub const fn glide_mouth(species: PetSpecies) -> (f32, f32) {
+    GLIDE_MOUTH[glide_index(species)]
+}
+
 #[cfg(test)]
 #[path = "kitty_pet_tests.rs"]
 mod tests;

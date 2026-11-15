@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use alab_policy::words::RULE_LAND;
 use aterm_agent::harness::acts::{HeldBy, HoldLeg};
 use aterm_agent::harness::footer::text_width;
-use aterm_agent::supervise::policy::turn_end::RULE_LAND;
 
 use crate::codex_alab_proof::{self, Proof};
 use crate::door::Door;

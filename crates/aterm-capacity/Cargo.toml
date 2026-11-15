@@ -53,8 +53,9 @@ aterm-tempfile = { workspace = true }
 aterm-durable = { workspace = true }
 # Each admission decided in this user's ledger is one `kind=admission` row in
 # this Mac's telemetry log (Continuum TM-0): the row schema and the bounded,
-# rotated log. Workspace crate; of its dependencies only aterm-digest (the
-# workspace's first-party SHA-256) is new to this crate's graph.
+# rotated log. The account's admission log (`admission_log`) is that same
+# rotated log in a folder of its own. Workspace crate; of its dependencies only
+# aterm-digest (the workspace's first-party SHA-256) is new to this crate's graph.
 aterm-telemetry = { workspace = true }
 # Every platform: `kept_out` opens the ledger's lock and record files out of a
 # concurrent spawn's inherited descriptors (a no-op wrapper off unix), and on
@@ -76,6 +77,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 aterm-models-capacity = { workspace = true }
+trust-exec-policy = { workspace = true }
 # The one-minute hang detector (`aterm_spec::wait`).
 aterm-spec = { workspace = true }
 
@@ -86,4 +88,9 @@ workspace = true
 [[test]]
 name = "exec_status_bank"
 path = "tests/exec_status_bank.rs"
+harness = false
+
+[[test]]
+name = "forking_group_loan"
+path = "tests/forking_group_loan.rs"
 harness = false

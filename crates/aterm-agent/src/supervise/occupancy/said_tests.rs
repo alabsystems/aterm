@@ -4,8 +4,8 @@
 //! `OccupancySaid`: its change, the Entry it names under `prompt`, and its `why` form, asserted by structure (each line's head, its closed words and its marks), not its prose.
 
 use super::*;
-use crate::supervise::config::Autopilot;
 use crate::supervise::occupancy::SlotsSeen;
+use alab_policy::config::Autopilot;
 
 const MIN: i64 = 60_000;
 const HOUR: i64 = 60 * MIN;

@@ -28,6 +28,34 @@ use amacs::input::{EditorInput, Follow, Reduction};
 #[path = "app_document_watch.rs"]
 mod watch;
 
+#[path = "app_restore_document.rs"]
+mod restore_document;
+pub(crate) use restore_document::{RestoreAdmitted, RestoreDocumentAdmission};
+#[cfg(all(test, unix))]
+pub(crate) use restore_document::{
+    with_headless_restore_admission_for_test, with_restore_read_gate_for_test,
+};
+
+#[path = "app_document_preparation.rs"]
+mod preparation;
+use preparation::DocumentOpening;
+pub(crate) use preparation::PreparedDocument;
+#[cfg(all(test, unix))]
+pub(crate) use preparation::set_initialize_gate_for_test;
+#[cfg(all(test, unix))]
+pub(crate) use preparation::tests::WorkerOpens;
+
+#[cfg(test)]
+std::thread_local! {
+    static DOCUMENT_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DOCUMENT_ADMISSION_DELIVERY: std::cell::RefCell<Option<AdmissionTestDelivery>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_document_requests_for_test() -> usize {
+    DOCUMENT_REQUESTS.replace(0)
+}
+
 #[cfg(test)]
 #[path = "owner_keys_save_tests.rs"]
 mod owner_keys_save_tests;
@@ -35,6 +63,10 @@ mod owner_keys_save_tests;
 #[cfg(all(test, unix))]
 #[path = "app_documents_private_tests.rs"]
 mod private_tests;
+
+#[cfg(test)]
+#[path = "app_documents_failed_open_tests.rs"]
+mod failed_open_tests;
 
 #[cfg(all(test, unix))]
 #[path = "app_documents_conceal_tests.rs"]
@@ -416,8 +448,8 @@ impl JournalRetrySet {
 #[derive(Debug)]
 pub(crate) struct HeldJournalAppend {
     pub(crate) document: DocumentId,
-    path: std::path::PathBuf,
-    key: crate::native_document_io::JournalDocumentKey,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) key: crate::native_document_io::JournalDocumentKey,
     pub(crate) plan: crate::native_document_journal::JournalAppendPlan,
 }
 
@@ -426,8 +458,8 @@ pub(crate) struct HeldJournalAppend {
 #[derive(Debug)]
 pub(crate) struct HeldJournalReseat {
     pub(crate) document: DocumentId,
-    path: std::path::PathBuf,
-    plan: JournalReseatPlan,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) plan: JournalReseatPlan,
 }
 
 const SAVE_UNCONFIRMED: &str = "Save could not be confirmed; choose Save again";
@@ -667,19 +699,28 @@ fn prepare_config_save_observation(
 
 struct JournalSlot {
     settled: std::cell::OnceCell<Result<DocumentJournalStore, String>>,
-    opening: std::cell::Cell<Option<std::thread::JoinHandle<Result<DocumentJournalStore, String>>>>,
-    /// What the first look runs inline when no worker is opening the store
-    /// ([`Self::deferred`]).
+    host: std::sync::Arc<
+        std::sync::OnceLock<Result<crate::native_document_journal::DraftJournalHost, String>>,
+    >,
+    /// A headless runtime need not open journals until a document asks for them.
     deferred: std::cell::Cell<Option<JournalOpener>>,
 }
 
 type JournalOpener = fn() -> Result<DocumentJournalStore, String>;
 
 impl JournalSlot {
+    #[cfg(test)]
     fn open(store: Result<DocumentJournalStore, String>) -> Self {
+        let host = std::sync::OnceLock::new();
+        let _ = host.set(
+            store
+                .as_ref()
+                .map(DocumentJournalStore::admission_host)
+                .map_err(Clone::clone),
+        );
         Self {
             settled: std::cell::OnceCell::from(store),
-            opening: std::cell::Cell::new(None),
+            host: std::sync::Arc::new(host),
             deferred: std::cell::Cell::new(None),
         }
     }
@@ -687,7 +728,7 @@ impl JournalSlot {
     fn deferred(open: JournalOpener) -> Self {
         Self {
             settled: std::cell::OnceCell::new(),
-            opening: std::cell::Cell::new(None),
+            host: std::sync::Arc::new(std::sync::OnceLock::new()),
             deferred: std::cell::Cell::new(Some(open)),
         }
     }
@@ -696,42 +737,75 @@ impl JournalSlot {
     where
         F: FnOnce() -> Result<DocumentJournalStore, String> + Send + 'static,
     {
-        let (open_tx, open_rx) = std::sync::mpsc::sync_channel::<F>(1);
+        let slot = Self {
+            settled: std::cell::OnceCell::new(),
+            host: std::sync::Arc::new(std::sync::OnceLock::new()),
+            deferred: std::cell::Cell::new(None),
+        };
+        slot.start(open);
+        slot
+    }
+
+    fn start<F>(&self, open: F)
+    where
+        F: FnOnce() -> Result<DocumentJournalStore, String> + Send + 'static,
+    {
+        let host = std::sync::Arc::clone(&self.host);
         let spawned = crate::qos::spawn_lane_thread(
             "aterm-journal-open",
             crate::qos::Role::Responsive,
-            move || match open_rx.recv() {
-                Ok(open) => open(),
-                Err(_) => Err("document recovery is unavailable".to_string()),
+            move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open))
+                    .unwrap_or_else(|_| {
+                        Err("document recovery is unavailable: opening its journal panicked".into())
+                    })
+                    .map(|store| store.admission_host());
+                let _ = host.set(result);
             },
         );
-        match spawned {
-            Ok(worker) => {
-                let _ = open_tx.send(open);
-                Self {
-                    settled: std::cell::OnceCell::new(),
-                    opening: std::cell::Cell::new(Some(worker)),
-                    deferred: std::cell::Cell::new(None),
-                }
-            }
-            Err(_) => Self::open(open()),
+        if let Err(error) = spawned {
+            let _ = self.host.set(Err(format!(
+                "could not start document recovery opener: {error}"
+            )));
         }
     }
 
-    fn settle(&self) -> &Result<DocumentJournalStore, String> {
-        self.settled.get_or_init(|| match self.opening.take() {
-            Some(worker) => worker.join().unwrap_or_else(|_| {
-                Err("document recovery is unavailable: opening its journal panicked".to_string())
-            }),
-            None => self.deferred.take().map_or_else(
-                || Err("document recovery is unavailable".to_string()),
-                |open| open(),
-            ),
-        })
+    fn host_for_worker(
+        &self,
+    ) -> std::sync::Arc<
+        std::sync::OnceLock<Result<crate::native_document_journal::DraftJournalHost, String>>,
+    > {
+        if let Some(open) = self.deferred.take() {
+            self.start(open);
+        }
+        std::sync::Arc::clone(&self.host)
+    }
+
+    fn try_settle(&self) -> Option<&Result<DocumentJournalStore, String>> {
+        if self.settled.get().is_none() {
+            let _ = self.host_for_worker();
+            let host = self.host.get()?;
+            let _ = self.settled.set(
+                host.as_ref()
+                    .map(|host| DocumentJournalStore::from_admission_host(host.clone()))
+                    .map_err(Clone::clone),
+            );
+        }
+        self.settled.get()
+    }
+
+    fn settle(&self) -> Option<&Result<DocumentJournalStore, String>> {
+        // Headless tests exercise synchronous host APIs without an event loop. Production
+        // callers only inspect readiness; admission workers own any wait for the opener.
+        #[cfg(test)]
+        {
+            let _ = self.host_for_worker().wait();
+        }
+        self.try_settle()
     }
 
     fn as_ref(&self) -> Option<&DocumentJournalStore> {
-        self.settle().as_ref().ok()
+        self.settle()?.as_ref().ok()
     }
 
     fn as_mut(&mut self) -> Option<&mut DocumentJournalStore> {
@@ -743,12 +817,13 @@ impl JournalSlot {
         match self.settled.get_mut() {
             Some(Ok(store)) => Ok(store),
             Some(Err(reason)) => Err(reason.clone()),
-            None => Err("document recovery is unavailable".to_string()),
+            None => Err("document recovery is opening".to_string()),
         }
     }
 
     fn unavailable(&self) -> Option<&str> {
-        self.settle().as_ref().err().map(String::as_str)
+        self.settle()
+            .and_then(|store| store.as_ref().err().map(String::as_str))
     }
 
     /// A slot settled to a test store at `root`.
@@ -824,12 +899,21 @@ pub(crate) struct DocumentHostRuntime {
     /// Admissions running on an `aterm-document-admit` worker (the two-phase
     /// open; see [`App::begin_document_admission`]).
     admissions: BTreeMap<(WindowId, DocumentAdmissionKey), PendingDocumentAdmission>,
+    preparations: preparation::Preparations,
+    unpublished_attachments:
+        BTreeMap<crate::tab_model::ViewId, crate::document_store::UnpublishedAttachment>,
+    unpublished_preparations: BTreeMap<crate::tab_model::ViewId, preparation::PreparationLease>,
     next_admission: u64,
     /// The location each pending open reveals once its tab is installed
-    /// ([`App::open_document_tab_at`]): keyed like
+    /// ([`App::open_path_for_person`]): keyed like
     /// [`Self::admissions`], the latest request's location winning, and taken by
     /// the install (or dropped with a failed one).
     reveals: BTreeMap<(WindowId, DocumentAdmissionKey), DocumentReveal>,
+    /// Test seam: how many more opens find their file's draft journal rewritten between their
+    /// inspection and their initialization, as another aterm process writing the draft would
+    /// ([`InstallFailure::DraftChanged`]); `App::change_drafts_under_opens_for_test`.
+    #[cfg(test)]
+    drafts_changed_under_opens: u32,
     /// The `edit` verb's tickets ([`crate::app_edit`]).
     pub(crate) edits: crate::app_edit::EditTickets,
     /// A document view closed, or a Suspended document's save or journal write landed, since the last [`App::release_unheld_documents`].
@@ -847,8 +931,9 @@ pub(crate) struct LineReveal {
     pub(crate) col: Option<u32>,
 }
 
+/// Where an open lands once its tab is installed: a line, or a Markdown heading.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum DocumentReveal {
+pub(crate) enum DocumentReveal {
     Line(LineReveal),
     MarkdownFragment(String),
 }
@@ -894,8 +979,13 @@ impl DocumentHostRuntime {
             closes_resume_due: false,
             pending_quit: None,
             admissions: BTreeMap::new(),
+            preparations: preparation::Preparations::new(),
+            unpublished_attachments: BTreeMap::new(),
+            unpublished_preparations: BTreeMap::new(),
             next_admission: 1,
             reveals: BTreeMap::new(),
+            #[cfg(test)]
+            drafts_changed_under_opens: 0,
             edits: crate::app_edit::EditTickets::default(),
             release_due: false,
             release_deadline_ms: None,
@@ -911,6 +1001,7 @@ pub(crate) struct DocumentAdmissionKey {
     pub(crate) kind: AppKind,
     /// The `edit` ticket this admission opens a fresh view for ([`crate::app_edit`]).
     pub(crate) edit: Option<crate::app_edit::EditTicketId>,
+    pub(crate) config: bool,
 }
 
 /// One in-flight admission (see [`DocumentHostRuntime::admissions`]).
@@ -919,10 +1010,48 @@ struct PendingDocumentAdmission {
     ticket: DocumentAdmissionTicket,
     started: std::time::Instant,
     purpose: DocumentAdmissionPurpose,
+    unguarded: bool,
+    preparation: Option<preparation::PreparationLease>,
+    admitted: Option<Box<AdmittedDocument>>,
+    /// What the preparation of `admitted` came to: its document, or why it has none.
+    prepared: Option<Result<preparation::PreparedRequest, InstallFailure>>,
+    continuations: Vec<DocumentContinuation>,
+}
+
+impl PendingDocumentAdmission {
+    fn request_refusal(&self) -> Option<&'static str> {
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.as_ref().ok())
+            .and_then(preparation::PreparedRequest::refusal)
+            .or_else(|| {
+                self.preparation
+                    .as_ref()
+                    .and_then(preparation::PreparationLease::request_refusal)
+            })
+    }
+}
+
+type AfterDocumentOpen =
+    Box<dyn FnOnce(&mut App, Result<InstalledDocument, String>) -> Result<String, String>>;
+
+struct DocumentContinuation {
+    placement: Placement,
+    allow: Box<dyn Fn(&App) -> bool>,
+    after: AfterDocumentOpen,
+}
+
+impl std::fmt::Debug for DocumentContinuation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DocumentContinuation")
+            .field("placement", &self.placement)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DocumentAdmissionPurpose {
+pub(crate) enum DocumentAdmissionPurpose {
     Open,
     /// Follow the selected entry's symlinks in the admission worker.
     DirectoryEntry,
@@ -943,6 +1072,27 @@ pub(crate) struct DocumentAdmissionOutcome {
     pub(crate) wid: WindowId,
     pub(crate) key: DocumentAdmissionKey,
     pub(crate) result: Result<Box<AdmittedDocument>, DocumentOpenFailure>,
+}
+
+#[cfg(test)]
+type AdmissionTestDelivery = std::sync::Arc<dyn Fn(DocumentAdmissionOutcome) + Send + Sync>;
+
+#[derive(Clone)]
+enum DocumentAdmissionDelivery {
+    Proxy(aterm_window::event_loop::EventLoopProxy<crate::Wake>),
+    #[cfg(test)]
+    Test(AdmissionTestDelivery),
+}
+impl DocumentAdmissionDelivery {
+    fn send(self, outcome: DocumentAdmissionOutcome) {
+        match self {
+            Self::Proxy(proxy) => {
+                let _ = proxy.send_event(crate::Wake::DocumentAdmitted(Box::new(outcome)));
+            }
+            #[cfg(test)]
+            Self::Test(deliver) => deliver(outcome),
+        }
+    }
 }
 
 /// Why an admission's read refused.
@@ -990,18 +1140,26 @@ pub(crate) enum DocumentAdmission {
     InFlight(DocumentAdmissionTicket),
     /// The same request was already in flight; this one rides on it.
     Coalesced(DocumentAdmissionTicket),
-    /// No event-loop proxy exists to report back to (the headless test harness).
+    /// No event-loop proxy exists to report back to (the headless test harness): the open
+    /// settled inline, and this is its line (an `edit` ticket's reply, or why it had none).
     Opened(String),
+    /// The open failed before a worker could report back (no event-loop proxy, or no worker
+    /// thread), and its window already shows why on a Recovery tab ([`App::show_failed_open`]):
+    /// the line is the failure's detail.
+    Shown(String),
 }
 
 impl DocumentAdmission {
-    /// One status line for callers that report a string either way.
-    pub(crate) fn message(&self, key: &DocumentAdmissionKey) -> String {
+    /// A person's open of `key` as its caller's line: `Ok` once it opened or while it is
+    /// admitting, `Err` with the failure's detail when it did not open and its window already
+    /// shows why.
+    pub(crate) fn line(self, key: &DocumentAdmissionKey) -> Result<String, String> {
         match self {
-            Self::Opened(line) => line.clone(),
+            Self::Opened(line) => Ok(line),
             Self::InFlight(_) | Self::Coalesced(_) => {
-                format!("admitting {} {}", key.kind.as_str(), key.uri)
+                Ok(format!("admitting {} {}", key.kind.as_str(), key.uri))
             }
+            Self::Shown(detail) => Err(detail),
         }
     }
 }
@@ -1011,9 +1169,181 @@ impl DocumentAdmission {
 pub(crate) enum DocumentAdmissionRejected {
     /// Nothing to tell the user.
     Dropped(String),
-    /// The read or the grant refused.
+    /// The read, the grant or the install refused. A person's open already shows the failure
+    /// on its window's Recovery tab ([`App::show_failed_open`]) and a guarded action's on its own
+    /// surface; either way this detail went to stderr and its record to aterm.log.
     Failed(String),
 }
+
+/// Why [`App::install_admitted_document`] installed no tab, or a worker's preparation
+/// ([`preparation`]) had no document to install.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum InstallFailure {
+    /// Another aterm process held the file's draft journal past the open's patience
+    /// ([`crate::native_document_journal::JournalFault::Busy`]): nothing was written. An
+    /// install that initializes the journal itself meets it at once; a worker-prepared open
+    /// meets it after its preparation owner's second failed attempt, about five seconds, and
+    /// that owner keeps trying for the next open.
+    DraftsBusy,
+    /// The file's draft changed between the open's inspection and its initialization
+    /// ([`crate::native_document_journal::JournalFault::Changed`]): nothing was written. A
+    /// worker-prepared open meets it once its owner's second attempt, which inspects the
+    /// draft afresh, found it changed again.
+    DraftChanged,
+    /// A line for the `edit` verb's caller, said exactly as it stands (`ERR refused open: …`).
+    Reply(String),
+    /// The file host refused the open's grant, in its own typed words.
+    Refused(DocumentHostError),
+    /// Any other failure, in its own words.
+    Failed(String),
+}
+
+impl InstallFailure {
+    /// What [`Self::DraftsBusy`] says on every surface but the `edit` wire.
+    pub(crate) const DRAFTS_BUSY: &'static str =
+        "another aterm process is writing this file's draft; try again once it finishes";
+}
+
+impl From<String> for InstallFailure {
+    fn from(failure: String) -> Self {
+        Self::Failed(failure)
+    }
+}
+
+impl From<&str> for InstallFailure {
+    fn from(failure: &str) -> Self {
+        Self::Failed(failure.to_string())
+    }
+}
+
+impl From<InstallFailure> for String {
+    fn from(failure: InstallFailure) -> Self {
+        match failure {
+            InstallFailure::DraftsBusy => InstallFailure::DRAFTS_BUSY.to_string(),
+            InstallFailure::DraftChanged => {
+                crate::native_document_journal::JournalFault::CHANGED.to_string()
+            }
+            InstallFailure::Refused(error) => DocumentOpenFailure(error).to_string(),
+            InstallFailure::Reply(line) | InstallFailure::Failed(line) => line,
+        }
+    }
+}
+
+/// The URI an install's tab shows, with the one its open asked for when a person's open knows
+/// it: a directory entry's link, whose tab shows the file the link resolved to. Either names the
+/// Recovery tab the document takes the place of ([`App::retire_failed_open_tab`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InstallUri<'a> {
+    shown: &'a str,
+    asked: Option<&'a str>,
+}
+
+impl<'a> From<&'a str> for InstallUri<'a> {
+    fn from(shown: &'a str) -> Self {
+        Self { shown, asked: None }
+    }
+}
+
+impl<'a> From<&'a String> for InstallUri<'a> {
+    fn from(shown: &'a String) -> Self {
+        Self { shown, asked: None }
+    }
+}
+
+/// Whether two file URIs name one path: the same text, or spellings (an escape, say) that
+/// decode to it. No link is followed and no file is read.
+fn same_file_uri(left: &str, right: &str) -> bool {
+    left == right
+        || matches!(
+            (
+                crate::native_document_host::file_uri_path(left),
+                crate::native_document_host::file_uri_path(right),
+            ),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
+/// The grant an install's own `grant_admitted` minted or changed, and what it was before
+/// ([`crate::native_document_host::GrantedDocument::prior`]): what a failed install puts back
+/// ([`App::install_document_opening`]).
+struct OpenedGrant {
+    id: crate::native_document_host::DocumentGrantId,
+    prior: Option<crate::native_document_host::DocumentGrant>,
+}
+
+/// One document open that failed in the window that asked for it ([`App::show_failed_open`]).
+#[derive(Clone, Debug)]
+pub(crate) struct FailedOpen {
+    /// The kind the open asked for.
+    pub(crate) kind: AppKind,
+    /// The URI the open asked for, when the request had one.
+    pub(crate) requested_uri: Option<String>,
+    /// The file's canonical URI, when its read succeeded.
+    pub(crate) canonical_uri: Option<String>,
+    /// The file as the page shows it.
+    pub(crate) path_shown: String,
+    /// What the page says went wrong.
+    pub(crate) problem: String,
+    /// The failure's whole detail, for stderr and the page's diagnostics.
+    pub(crate) detail: String,
+    /// Where the open would have landed its caret.
+    pub(crate) reveal: Option<DocumentReveal>,
+    /// The open was a directory listing's Enter.
+    pub(crate) entry: bool,
+}
+
+/// Which failed open a Recovery tab stands for ([`App::failed_open_tab`]): the URIs an open
+/// asked for and resolved, or for an open no URI names, the path its page shows.
+#[derive(Clone, Copy)]
+enum FailedOpenKey<'a> {
+    Uris(&'a [&'a str]),
+    Path(&'a str),
+}
+
+/// A draft journal's failure at an open, in the words its surfaces carry: stderr gets them whole,
+/// and the open's page, diagnostics and reply say the drafts folder as
+/// [`crate::native_document_journal::DRAFTS_FOLDER_WORD`] ([`DocumentJournalStore::unrooted`]).
+fn journal_words(journals: &DocumentJournalStore, error: &str) -> String {
+    crate::logging::stderr_line!("aterm-gui: a document's draft journal refused its open: {error}");
+    journals.unrooted(error)
+}
+
+/// A draft journal's fault at an open's initialization as the failure that open reports: a
+/// busy or changed draft typed, any other in [`journal_words`]. One mapping for the install
+/// that initializes on the main thread and for a preparation's worker.
+fn journal_failure(
+    journals: Option<&DocumentJournalStore>,
+    fault: crate::native_document_journal::JournalFault,
+) -> InstallFailure {
+    match fault {
+        crate::native_document_journal::JournalFault::Busy => InstallFailure::DraftsBusy,
+        crate::native_document_journal::JournalFault::Changed => InstallFailure::DraftChanged,
+        crate::native_document_journal::JournalFault::Other(error) => {
+            InstallFailure::Failed(format!(
+                "document recovery initialization failed: {}",
+                journals.map_or_else(|| error.clone(), |journals| journal_words(journals, &error))
+            ))
+        }
+    }
+}
+
+/// A failed open's record: its whole detail on stderr, and its length in aterm.log
+/// ([`crate::menu::notify`]).
+fn record_failed_open(detail: &str) {
+    crate::logging::stderr_line!("aterm-gui: document was not opened: {detail}");
+    crate::menu::notify("Couldn’t Open File", detail);
+}
+
+/// What a failed open's tab says when the same file fails again ([`App::show_failed_open`]).
+pub(crate) const STILL_COULD_NOT_OPEN: &str = "Still couldn’t open it";
+
+/// What a failed open's page says for a path no file URI names ([`App::open_path_for_person`]).
+pub(crate) const UNNAMED_PATH_PROBLEM: &str =
+    "Its path is not valid UTF-8, so no file URI can name it.";
+
+/// What a failed open's page says for a busy draft: nothing was written, so the draft is intact.
+pub(crate) const DRAFTS_BUSY_PROBLEM: &str = "Another aterm process is writing this file’s draft. \
+                                               Nothing was changed; its draft opens with the file.";
 
 impl DocumentAdmissionRejected {
     pub(crate) fn detail(&self) -> &str {
@@ -1089,6 +1419,9 @@ impl App {
         target: Option<&crate::native_app::ConfigEditorTarget>,
         placement: Placement,
     ) -> Result<String, String> {
+        if self.proxy.is_some() {
+            return self.request_config_editor_prepared(wid, path, target.cloned(), placement);
+        }
         let logical_path = ensure_config_file(path)?;
         let uri = crate::native_document_host::path_to_file_uri(&logical_path)
             .map_err(|error| format!("could not address aterm.toml: {error}"))?;
@@ -1105,6 +1438,162 @@ impl App {
             .ok_or_else(|| {
                 "native config editor did not retain its canonical document".to_string()
             })?;
+        self.finish_config_editor_open(wid.into(), document, target)?;
+        Ok(uri)
+    }
+
+    fn request_config_editor_prepared(
+        &mut self,
+        wid: WindowId,
+        path: &std::path::Path,
+        target: Option<crate::native_app::ConfigEditorTarget>,
+        placement: Placement,
+    ) -> Result<String, String> {
+        let admission = self.request_config_editor_path_with_guard(
+            wid,
+            path,
+            target,
+            placement,
+            |_| true,
+            |_, installed| installed.map(|installed| installed.canonical_uri),
+        )?;
+        let uri = crate::native_document_host::path_to_file_uri(path)
+            .map_err(|error| error.to_string())?;
+        admission.line(&DocumentAdmissionKey {
+            uri,
+            kind: AppKind::Editor,
+            edit: None,
+            config: true,
+        })
+    }
+
+    pub(crate) fn request_config_editor_with_guard(
+        &mut self,
+        wid: WindowId,
+        target: Option<crate::native_app::ConfigEditorTarget>,
+        placement: Placement,
+        allow: impl Fn(&App) -> bool + 'static,
+        after: impl FnOnce(&mut App, Result<InstalledDocument, String>) -> Result<String, String>
+        + 'static,
+    ) -> Result<DocumentAdmission, String> {
+        #[cfg(test)]
+        DOCUMENT_REQUESTS.set(DOCUMENT_REQUESTS.get() + 1);
+        let Some(path) = crate::app_config::config_path() else {
+            return after(
+                self,
+                Err("could not resolve the config path (HOME/XDG_CONFIG_HOME unset)".into()),
+            )
+            .map(DocumentAdmission::Opened);
+        };
+        self.request_config_editor_path_with_guard(wid, &path, target, placement, allow, after)
+    }
+
+    fn request_config_editor_path_with_guard(
+        &mut self,
+        wid: WindowId,
+        path: &std::path::Path,
+        target: Option<crate::native_app::ConfigEditorTarget>,
+        placement: Placement,
+        allow: impl Fn(&App) -> bool + 'static,
+        after: impl FnOnce(&mut App, Result<InstalledDocument, String>) -> Result<String, String>
+        + 'static,
+    ) -> Result<DocumentAdmission, String> {
+        if !self.windows.contains_key(&wid) {
+            return after(self, Err("requesting window disappeared".into()))
+                .map(DocumentAdmission::Opened);
+        }
+        if self.document_admission_delivery().is_none() {
+            #[cfg(test)]
+            {
+                if !allow(self) {
+                    return after(
+                        self,
+                        Err("document open no longer names its requesting view".into()),
+                    )
+                    .map(DocumentAdmission::Opened);
+                }
+                let installed = ensure_config_file(path).and_then(|path| {
+                    let uri = crate::native_document_host::path_to_file_uri(&path)
+                        .map_err(|error| error.to_string())?;
+                    let admitted = Self::admit_document_now(&uri, true).map_err(String::from)?;
+                    let installed = self.install_admitted_document(
+                        wid,
+                        AppKind::Editor,
+                        &uri,
+                        admitted,
+                        placement,
+                    )?;
+                    self.finish_config_editor_open(
+                        wid.into(),
+                        installed.document,
+                        target.as_ref(),
+                    )?;
+                    Ok(installed)
+                });
+                return after(self, installed).map(DocumentAdmission::Opened);
+            }
+            #[cfg(not(test))]
+            {
+                return after(
+                    self,
+                    Err("config continuation requires an event-loop wake".into()),
+                )
+                .map(DocumentAdmission::Opened);
+            }
+        }
+        let uri = match crate::native_document_host::path_to_file_uri(path) {
+            Ok(uri) => uri,
+            Err(error) => {
+                return after(self, Err(error.to_string())).map(DocumentAdmission::Opened);
+            }
+        };
+        let key = DocumentAdmissionKey {
+            uri: uri.clone(),
+            kind: AppKind::Editor,
+            edit: None,
+            config: true,
+        };
+        let admission = match self.begin_document_admission_request(
+            wid,
+            key.clone(),
+            DocumentAdmissionPurpose::Open,
+            false,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => return after(self, Err(error)).map(DocumentAdmission::Opened),
+        };
+        self.native_documents
+            .admissions
+            .get_mut(&(wid, key.clone()))
+            .expect("config admission owns its continuation")
+            .continuations
+            .push(DocumentContinuation {
+                placement,
+                allow: Box::new(allow),
+                after: Box::new(move |app, installed| {
+                    let installed = installed.and_then(|installed| {
+                        app.finish_config_editor_open(
+                            wid.into(),
+                            installed.document,
+                            target.as_ref(),
+                        )?;
+                        Ok(installed)
+                    });
+                    after(app, installed)
+                }),
+            });
+        Ok(admission)
+    }
+
+    /// Attach the config controller to an admitted document using its in-memory baseline.
+    /// The caller has already admitted and installed the file.
+    fn finish_config_editor_open(
+        &mut self,
+        install: crate::app_tabs::NativeInstallTarget,
+        document: DocumentId,
+        target: Option<&crate::native_app::ConfigEditorTarget>,
+    ) -> Result<(), String> {
+        let wid = install.window();
         let snapshot = self
             .document_store
             .snapshot(document)
@@ -1146,13 +1635,19 @@ impl App {
         if let Some(target) = target {
             self.reveal_config_editor_target(wid, document, target)?;
         }
-        self.request_config_host_diagnostics(document);
-        for (window, instance, view) in self.document_native_views(document) {
-            self.invalidate_native_view_cache(window, view, crate::native_app::DamageRegion::All);
-            self.refresh_native_presentation(window, instance, view);
-            self.request_native_redraw(window);
+        if !install.detached() {
+            self.request_config_host_diagnostics(document);
+            for (window, instance, view) in self.document_native_views(document) {
+                self.invalidate_native_view_cache(
+                    window,
+                    view,
+                    crate::native_app::DamageRegion::All,
+                );
+                self.refresh_native_presentation(window, instance, view);
+                self.request_native_redraw(window);
+            }
         }
-        Ok(uri)
+        Ok(())
     }
 
     fn reveal_config_editor_target(
@@ -1908,7 +2403,7 @@ impl App {
         self.refresh_native_document(document).map(|_| ())
     }
 
-    fn drive_document_journal(&mut self, document: DocumentId) -> Result<(), String> {
+    pub(super) fn drive_document_journal(&mut self, document: DocumentId) -> Result<(), String> {
         self.drive_document_journal_once(document).map(|_| ())
     }
 
@@ -2064,6 +2559,11 @@ impl App {
 
     /// Pump one coalesced journal intent for the one channel slot just released by the worker.
     pub(crate) fn native_document_queue_slot_available(&mut self) {
+        self.pump_document_journal_slot();
+        self.progress_document_preparations();
+    }
+
+    fn pump_document_journal_slot(&mut self) {
         loop {
             let Some(document) = self.native_documents.journal_retries.pop_first() else {
                 return;
@@ -2099,13 +2599,19 @@ impl App {
             }
         }
         if let Some(message) = journal_completion_error(completion) {
-            self.set_document_recovery_status(document, Some(message));
-            self.drive_owed_document_journal_reseat(document);
+            self.set_document_recovery_status(document, Some(message.clone()));
+            if self.document_preparation_owns(document) {
+                self.preparation_journal_failed(document, &message);
+            } else {
+                self.drive_owed_document_journal_reseat(document);
+            }
+            self.progress_document_preparations();
             return;
         }
         if let Err(message) = self.drive_document_journal(document) {
             self.set_document_recovery_status(document, Some(message));
         }
+        self.progress_document_preparations();
     }
 
     fn drive_owed_document_journal_reseat(&mut self, document: DocumentId) {
@@ -2144,10 +2650,9 @@ impl App {
         self.note_document_journal_landing(&completion);
         if matches!(&completion, JournalCompletion::Durable { .. }) {
             aterm_log::info!(
-                "document journal: re-established as this process's own after an update \
-                 rolled back{}",
+                "document journal: re-established as this process's own{}",
                 if preserved {
-                    "; the image a successor left there was preserved aside first"
+                    "; the previous image was preserved aside first"
                 } else {
                     ""
                 }
@@ -2155,12 +2660,15 @@ impl App {
             self.set_document_recovery_status(document, None);
         }
         if let Some(message) = journal_completion_error(completion) {
-            self.set_document_recovery_status(document, Some(message));
+            self.set_document_recovery_status(document, Some(message.clone()));
+            self.preparation_journal_failed(document, &message);
+            self.progress_document_preparations();
             return;
         }
         if let Err(message) = self.drive_document_journal(document) {
             self.set_document_recovery_status(document, Some(message));
         }
+        self.progress_document_preparations();
     }
 
     /// Whether one document's unsaved draft rides an update to the successor.
@@ -2299,10 +2807,11 @@ impl App {
             .collect()
     }
 
-    /// Whether aterm's own document work is under way: a journal write on the worker, a journal
-    /// write waiting for a worker slot, or a checkpoint an open document's close waits on.
+    /// Whether aterm owns document preparation/recovery, a journal write on the
+    /// worker or waiting for a slot, or a checkpoint an open document's close waits on.
     pub(crate) fn own_document_work_pending(&self) -> bool {
-        self.document_journal_writes_in_flight()
+        self.document_preparation_work_pending()
+            || self.document_journal_writes_in_flight()
             || !self.native_documents.journal_retries.is_empty()
             || self.open_native_documents().into_iter().any(|document| {
                 matches!(
@@ -2387,7 +2896,9 @@ impl App {
             })
             .collect::<Vec<_>>();
         for document in owed {
-            if self.native_documents.journal_retries.contains(document) {
+            if self.document_preparation_owns(document)
+                || self.native_documents.journal_retries.contains(document)
+            {
                 continue;
             }
             if let Err(message) = self.drive_document_journal(document) {
@@ -2396,10 +2907,80 @@ impl App {
         }
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn open_document_journals_for_test(
+        &mut self,
+        open: impl FnOnce() -> Result<DocumentJournalStore, String> + Send + 'static,
+    ) {
+        self.native_documents.journals = JournalSlot::opening(open);
+    }
+
+    #[cfg(any(all(test, unix), all(target_os = "macos", debug_assertions)))]
+    pub(crate) fn unpublished_attachment_count_for_test(&self) -> usize {
+        self.native_documents.unpublished_attachments.len()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_missing_restore_attachment_for_test(&mut self, body: impl FnOnce(&mut App)) {
+        let view = *self
+            .native_documents
+            .unpublished_attachments
+            .keys()
+            .next()
+            .expect("staged view");
+        let token = self
+            .native_documents
+            .unpublished_attachments
+            .remove(&view)
+            .expect("staged token");
+        body(self);
+        self.native_documents
+            .unpublished_attachments
+            .insert(view, token);
+    }
+
     /// Point this App's draft journals at `root`.
     #[cfg(all(test, unix))]
     pub(crate) fn use_document_journal_root_for_test(&mut self, root: std::path::PathBuf) {
         self.native_documents.journals = JournalSlot::for_test(root);
+    }
+
+    /// End this App as a crash or exit ends its process: drop it, then wait for the journal
+    /// custody worker of the store it opened to exit
+    /// ([`crate::native_document_journal::CustodyExit`]), so that nothing of it holds a draft
+    /// journal. Dropping an App only asks that worker to release; the worker settles each
+    /// journal under that journal's lock afterwards, which a second App's open (an event-loop
+    /// take with a 25 ms budget) must not meet: no successor process ever meets it, since its
+    /// predecessor is gone first.
+    ///
+    /// # Panics
+    /// If this App has no open journal store (its opener never ran, has not finished, or
+    /// failed): it has no worker to wait for, and a plain drop ends it. Also if its custody
+    /// worker has not exited within [`aterm_spec::wait::MUST_HAPPEN`], or ended without saying
+    /// so ([`crate::native_document_journal::CustodyExit::wait`]).
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn exit_for_test(self) {
+        let Some(Ok(host)) = self.native_documents.journals.host.get() else {
+            panic!("an App with no open journal store has no custody worker to wait for");
+        };
+        let exit = host.custody_exit_for_test();
+        drop(self);
+        exit.wait();
+    }
+
+    /// Run `then` inside the journal lock of the next draft this App's journal custody
+    /// worker settles as it lets the draft go (see [`Self::exit_for_test`]).
+    #[cfg(all(test, any(unix, windows)))]
+    pub(crate) fn inside_next_journal_release_for_test(
+        &self,
+        then: impl FnOnce() + Send + 'static,
+    ) {
+        self.native_documents
+            .journals
+            .as_ref()
+            .expect("test journal store")
+            .inside_next_release_settle_for_test(then);
     }
 
     /// The journal identity this App's store gives `document`'s URI.
@@ -2468,6 +3049,36 @@ impl App {
             .unwrap_or_default()
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn take_held_journal_append_for_test(&mut self) -> Option<HeldJournalAppend> {
+        self.native_documents
+            .held_journal_appends
+            .as_mut()
+            .filter(|held| !held.is_empty())
+            .map(|held| held.remove(0))
+    }
+
+    /// Exercise actual queue rejection and the same admission rollback as production.
+    #[cfg(all(test, unix))]
+    pub(crate) fn defer_held_journal_append_for_test(&mut self) -> bool {
+        let Some(held) = self.take_held_journal_append_for_test() else {
+            return false;
+        };
+        let (sender, _receiver) = std::sync::mpsc::sync_channel::<()>(0);
+        let host = &mut self.native_documents;
+        matches!(
+            try_enqueue_document_journal_job(
+                &sender,
+                (),
+                held.document,
+                JournalAdmissionEffect::Append(held.plan.generation),
+                host.journals.as_mut().expect("held journal"),
+                &mut host.journal_retries,
+            ),
+            Ok(JournalDriveOutcome::Deferred)
+        )
+    }
+
     /// Run the oldest held append exactly as the document worker does.
     #[cfg(all(test, unix))]
     pub(crate) fn run_held_journal_append_for_test(&mut self) -> bool {
@@ -2502,6 +3113,15 @@ impl App {
             .held_journal_reseats
             .as_deref()
             .unwrap_or_default()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn take_held_journal_reseat_for_test(&mut self) -> Option<HeldJournalReseat> {
+        self.native_documents
+            .held_journal_reseats
+            .as_mut()
+            .filter(|held| !held.is_empty())
+            .map(|held| held.remove(0))
     }
 
     /// Run the oldest held re-seat exactly as the document worker does.
@@ -2599,16 +3219,26 @@ impl App {
             }
         }
         if let Some(message) = journal_completion_error(completion) {
-            self.set_document_recovery_status(document, Some(message));
-            self.drive_owed_document_journal_reseat(document);
+            self.set_document_recovery_status(document, Some(message.clone()));
+            if self.document_preparation_owns(document) {
+                self.preparation_journal_failed(document, &message);
+            } else {
+                self.drive_owed_document_journal_reseat(document);
+            }
+            self.progress_document_preparations();
             return;
         }
         if let Err(message) = self.drive_document_journal(document) {
             self.set_document_recovery_status(document, Some(message));
         }
+        self.progress_document_preparations();
     }
 
-    fn set_document_recovery_status(&mut self, document: DocumentId, message: Option<String>) {
+    pub(super) fn set_document_recovery_status(
+        &mut self,
+        document: DocumentId,
+        message: Option<String>,
+    ) {
         let changed = self.native_documents.recovery_status.get(&document) != message.as_ref();
         if let Some(message) = &message {
             self.native_documents
@@ -2686,6 +3316,7 @@ impl App {
                         kind: AppKind::Markdown,
                         uri,
                         edit: None,
+                        config: false,
                     },
                     DocumentAdmissionPurpose::DirectoryEntry,
                 )?;
@@ -2706,6 +3337,7 @@ impl App {
                         uri: uri.to_string(),
                         kind: AppKind::Editor,
                         edit: None,
+                        config: false,
                     },
                     DocumentAdmissionPurpose::DirectoryRefresh(document),
                 )?;
@@ -3041,7 +3673,7 @@ impl App {
     fn refresh_document_file(
         &self,
         document: DocumentId,
-    ) -> Result<crate::native_document_host::GrantedDocument, String> {
+    ) -> Result<crate::native_document_host::ObservedDocument, String> {
         let grant = self
             .native_documents
             .persistence
@@ -4218,6 +4850,9 @@ impl App {
     fn prepare_quit_document_shutdown_inner(&mut self, start_saves: bool) -> Result<bool, String> {
         let plan = self.document_close_plan_for_quit();
         self.native_documents.pending_quit = Some(plan.clone());
+        if self.unpublished_document_preparations() {
+            return Ok(false);
+        }
         let ready = self.drive_document_close_plan(&plan, start_saves)?;
         if ready {
             self.native_documents.pending_quit = None;
@@ -4230,6 +4865,9 @@ impl App {
         &mut self,
     ) -> Result<(bool, Vec<WindowId>), String> {
         if let Some(plan) = self.native_documents.pending_quit.clone() {
+            if self.unpublished_document_preparations() {
+                return Ok((false, Vec::new()));
+            }
             let undriven = self.undriven_documents(&plan);
             if !undriven.documents.is_empty() {
                 // A document the Quit found needing no save may need one now; the
@@ -4526,6 +5164,7 @@ impl App {
                 .document_store
                 .document_ids()
                 .into_iter()
+                .filter(|document| !self.document_preparation_owns(*document))
                 .map(|document| {
                     let views = self.document_store.view_ids(document).unwrap_or_default();
                     let source_view = self.document_native_views(document).first().map_or_else(
@@ -4681,16 +5320,16 @@ impl App {
             if let Some(AppViewState::Editor(state)) = self.native_runtime.view_state_mut(view) {
                 state.status = Some(message.to_string());
             }
-            if let Some(tab) = self.windows.get_mut(&window).and_then(|state| {
+            if let Some(presentation) = self.windows.get_mut(&window).and_then(|state| {
                 let index = state
                     .tab_set
                     .tabs()
                     .iter()
                     .position(|tab| tab.root.contains(view))?;
-                state.tab_set.tab_at_mut(index)
+                state.tab_set.presentation_at_mut(index)
             }) {
-                tab.presentation.indicators.attention = true;
-                tab.presentation.tooltip = Some(message.to_string());
+                presentation.indicators.attention = true;
+                presentation.tooltip = Some(message.to_string());
             }
             self.request_native_redraw(window);
         }
@@ -4709,15 +5348,15 @@ impl App {
                 });
             }
             let edit_mark = self.edit_attention_in_tab_of(window, view);
-            if let Some(tab) = self.windows.get_mut(&window).and_then(|state| {
+            if let Some(presentation) = self.windows.get_mut(&window).and_then(|state| {
                 let index = state
                     .tab_set
                     .tabs()
                     .iter()
                     .position(|tab| tab.root.contains(view))?;
-                state.tab_set.tab_at_mut(index)
+                state.tab_set.presentation_at_mut(index)
             }) {
-                tab.presentation.indicators.attention = edit_mark;
+                presentation.indicators.attention = edit_mark;
             }
             self.request_native_redraw(window);
         }
@@ -4864,7 +5503,9 @@ impl App {
 
     fn document_unheld(&self, document: DocumentId) -> bool {
         let host = &self.native_documents;
-        self.document_store.phase(document) == Some(crate::document_store::DocumentPhase::Suspended)
+        !self.document_preparation_owns(document)
+            && self.document_store.phase(document)
+                == Some(crate::document_store::DocumentPhase::Suspended)
             && self.document_store.dirty(document) == Some(false)
             && !self.native_runtime.holds_document(document)
             && !host.persistence.save_in_flight(document)
@@ -4903,58 +5544,160 @@ impl App {
         }
     }
 
-    /// Open a local document in window `wid` with its caret on `line` (and `col`).
-    pub(crate) fn open_document_tab_at(
+    /// A person's open of `path` in window `wid` (File ▸ Open, a dropped file, a document a
+    /// menu wrote, a clicked citation), landing its caret on `reveal` once its tab is installed.
+    ///
+    /// Whatever stops it shows in `wid` as a failed open ([`Self::show_failed_open`]): a path no
+    /// file URI names (one not UTF-8, or not absolute) on a page whose Retry and Open Original
+    /// are disabled, and every later refusal through [`Self::open_document_tab_revealing`]. `Ok`
+    /// is the open's line once it opened or while it is admitting; `Err` is why it did not open.
+    pub(crate) fn open_path_for_person(
         &mut self,
         wid: WindowId,
         kind: AppKind,
-        uri: &str,
-        line: Option<u32>,
-        col: Option<u32>,
+        path: &std::path::Path,
+        reveal: Option<DocumentReveal>,
     ) -> Result<String, String> {
-        self.open_document_tab_revealing(
-            wid,
-            kind,
-            uri,
-            line.map(|line| DocumentReveal::Line(LineReveal { line, col })),
-        )
+        let uri = match crate::native_document_host::path_to_file_uri(path) {
+            Ok(uri) => uri,
+            Err(error) => {
+                let problem = match error {
+                    DocumentHostError::InvalidEncoding => UNNAMED_PATH_PROBLEM.to_string(),
+                    error => error.to_string(),
+                };
+                let detail = format!("document open failed: {}: {problem}", path.display());
+                self.show_failed_open(
+                    wid,
+                    FailedOpen {
+                        kind,
+                        requested_uri: None,
+                        canonical_uri: None,
+                        path_shown: path.display().to_string(),
+                        problem,
+                        detail: detail.clone(),
+                        reveal,
+                        entry: false,
+                    },
+                );
+                return Err(detail);
+            }
+        };
+        self.open_document_tab_revealing(wid, kind, &uri, reveal, DocumentAdmissionPurpose::Open)
+            .and_then(|admission| {
+                admission.line(&DocumentAdmissionKey {
+                    uri: uri.clone(),
+                    kind,
+                    edit: None,
+                    config: false,
+                })
+            })
     }
 
     /// Resolve only the clicked Markdown document, then use the same bounded
     /// admission path as File Open. A fragment is applied to the live buffer.
+    ///
+    /// A link the reader enables resolves (`MarkdownApp::link_enabled`), but one that no longer
+    /// does by the time it lands here (its source gone, say) shows in `wid` as a failed open no
+    /// URI names ([`Self::show_failed_open`]), as every later refusal does.
     pub(crate) fn open_markdown_link(
         &mut self,
         wid: WindowId,
         source: DocumentId,
         destination: &str,
     ) -> Result<(), String> {
-        let source_uri = self
+        let resolved = self
             .document_store
             .canonical_uri(source)
-            .ok_or_else(|| "the Markdown link's source document is gone".to_string())?;
-        let (uri, fragment) = crate::native_app::resolve_markdown_link(source_uri, destination)?;
+            .ok_or_else(|| "the Markdown link's source document is gone".to_string())
+            .and_then(|source_uri| {
+                crate::native_app::resolve_markdown_link(source_uri, destination)
+            });
+        let (uri, fragment) = match resolved {
+            Ok(resolved) => resolved,
+            Err(problem) => {
+                let target = destination
+                    .split_once('#')
+                    .map_or(destination, |(target, _)| target);
+                let detail = format!("document open failed: {target}: {problem}");
+                self.show_failed_open(
+                    wid,
+                    FailedOpen {
+                        kind: AppKind::Markdown,
+                        requested_uri: None,
+                        canonical_uri: None,
+                        path_shown: target.to_string(),
+                        problem,
+                        detail: detail.clone(),
+                        reveal: None,
+                        entry: false,
+                    },
+                );
+                return Err(detail);
+            }
+        };
         self.open_document_tab_revealing(
             wid,
             AppKind::Markdown,
             &uri,
             fragment.map(DocumentReveal::MarkdownFragment),
+            DocumentAdmissionPurpose::Open,
         )
         .map(|_| ())
     }
 
-    fn open_document_tab_revealing(
+    /// The two-phase open of `uri` in window `wid` that a person asked for, landing its caret on
+    /// `reveal`: [`DocumentAdmissionPurpose::Open`], or a directory listing's Enter
+    /// ([`DocumentAdmissionPurpose::DirectoryEntry`]) when a failed entry's Recovery tab opens it
+    /// again ([`crate::native_app::RecoveryRequest::Reopen`]).
+    ///
+    /// Every failure shows in `wid` ([`Self::show_failed_open`]): the admission's own (its read
+    /// or install, [`DocumentAdmission::Shown`] when it settled inline), and here a refusal
+    /// before admission, which is also the `Err`.
+    pub(crate) fn open_document_tab_revealing(
         &mut self,
         wid: WindowId,
         kind: AppKind,
         uri: &str,
         reveal: Option<DocumentReveal>,
-    ) -> Result<String, String> {
+        purpose: DocumentAdmissionPurpose,
+    ) -> Result<DocumentAdmission, String> {
+        let admission = self.request_document_revealing(wid, kind, uri, reveal.clone(), purpose);
+        if let Err(detail) = &admission {
+            self.show_failed_open(
+                wid,
+                FailedOpen {
+                    kind,
+                    requested_uri: Some(uri.to_string()),
+                    canonical_uri: None,
+                    path_shown: shown_path(uri),
+                    problem: detail.clone(),
+                    detail: detail.clone(),
+                    reveal,
+                    entry: purpose == DocumentAdmissionPurpose::DirectoryEntry,
+                },
+            );
+        }
+        admission
+    }
+
+    /// Two-phase open of one document in `wid` whose install lands its caret on `reveal`:
+    /// [`complete_document_admission`](Self::complete_document_admission) takes the location
+    /// with the install, the latest request's location winning.
+    fn request_document_revealing(
+        &mut self,
+        wid: WindowId,
+        kind: AppKind,
+        uri: &str,
+        reveal: Option<DocumentReveal>,
+        purpose: DocumentAdmissionPurpose,
+    ) -> Result<DocumentAdmission, String> {
         let slot = (
             wid,
             DocumentAdmissionKey {
                 uri: uri.to_string(),
                 kind,
                 edit: None,
+                config: false,
             },
         );
         match reveal {
@@ -4965,19 +5708,11 @@ impl App {
                 self.native_documents.reveals.remove(&slot);
             }
         }
-        let admission = self.request_document_tab_in_window(wid, kind, uri);
-        match &admission {
-            Ok(DocumentAdmission::Opened(_)) => {
-                if let Some(reveal) = self.native_documents.reveals.remove(&slot) {
-                    self.reveal_opened_document(wid, reveal)?;
-                }
-            }
-            Ok(DocumentAdmission::InFlight(_) | DocumentAdmission::Coalesced(_)) => {}
-            Err(_) => {
-                self.native_documents.reveals.remove(&slot);
-            }
+        let admission = self.request_document_admission_in_window(wid, kind, uri, purpose);
+        if admission.is_err() {
+            self.native_documents.reveals.remove(&slot);
         }
-        admission.map(|admission| admission.message(&slot.1))
+        admission
     }
 
     fn reveal_opened_document(
@@ -5105,36 +5840,26 @@ impl App {
         Ok(())
     }
 
-    /// Two-phase open of one local document in the frontmost window.
-    pub(crate) fn request_document_tab(
-        &mut self,
-        kind: AppKind,
-        uri: &str,
-    ) -> Result<DocumentAdmission, String> {
-        let wid = self
-            .frontmost_window
-            .ok_or_else(|| "no requesting window".to_string())?;
-        self.request_document_tab_in_window(wid, kind, uri)
-    }
-
-    /// Two-phase open of one local document in one exact host window, the form every main-thread gesture uses.
-    pub(crate) fn request_document_tab_in_window(
+    fn request_document_admission_in_window(
         &mut self,
         wid: WindowId,
         kind: AppKind,
         uri: &str,
+        purpose: DocumentAdmissionPurpose,
     ) -> Result<DocumentAdmission, String> {
         Self::validate_document_request(kind, false)?;
         if !self.windows.contains_key(&wid) {
             return Err("requesting window disappeared".to_string());
         }
-        self.begin_document_admission(
+        self.begin_document_admission_for(
             wid,
             DocumentAdmissionKey {
                 uri: uri.to_string(),
                 kind,
                 edit: None,
+                config: false,
             },
+            purpose,
         )
     }
 
@@ -5155,6 +5880,7 @@ impl App {
                 uri: uri.to_string(),
                 kind: AppKind::Editor,
                 edit: Some(ticket),
+                config: false,
             },
         )
     }
@@ -5195,9 +5921,59 @@ impl App {
         if !self.windows.contains_key(&wid) {
             return Err("requesting window disappeared".to_string());
         }
+        if self.proxy.is_some() && !allow_config_symlinks {
+            let admission = self.request_document_with_continuation(
+                wid,
+                kind,
+                uri,
+                placement,
+                |_, installed| installed.map(|installed| installed.line()),
+            )?;
+            return admission.line(&DocumentAdmissionKey {
+                uri: uri.to_string(),
+                kind,
+                edit: None,
+                config: false,
+            });
+        }
+        self.open_document_tab_sync_with_options(wid, kind, uri, allow_config_symlinks, placement)
+    }
+
+    /// Synchronous closed-view/tab reconstruction after its caller has waited for
+    /// any in-flight owner of the canonical URI.
+    pub(crate) fn open_document_tab_in_window_sync(
+        &mut self,
+        wid: WindowId,
+        kind: AppKind,
+        uri: &str,
+    ) -> Result<String, String> {
+        self.open_document_tab_sync_with_options(wid, kind, uri, false, Placement::FocusOrNewTab)
+    }
+
+    fn open_document_tab_sync_with_options(
+        &mut self,
+        wid: WindowId,
+        kind: AppKind,
+        uri: &str,
+        allow_config_symlinks: bool,
+        placement: Placement,
+    ) -> Result<String, String> {
+        Self::validate_document_request(kind, allow_config_symlinks)?;
+        if !self.windows.contains_key(&wid) {
+            return Err("requesting window disappeared".into());
+        }
+        if self.document_preparation_pending(uri) {
+            return Err("document reconstruction must await its preparation owner".into());
+        }
         let admitted = Self::admit_document_now(uri, allow_config_symlinks)?;
+        if self.document_preparation_pending(admitted.canonical_uri()) {
+            return Err(
+                "document reconstruction must await its canonical preparation owner".into(),
+            );
+        }
         self.install_admitted_document(wid, kind, uri, admitted, placement)
             .map(|installed| installed.line())
+            .map_err(String::from)
     }
 
     fn validate_document_request(kind: AppKind, allow_config_symlinks: bool) -> Result<(), String> {
@@ -5223,10 +5999,34 @@ impl App {
         )
     }
 
+    fn admit_document_for_worker(
+        uri: &str,
+        allow_config_symlinks: bool,
+    ) -> Result<AdmittedDocument, DocumentOpenFailure> {
+        Self::admit_document_with_worker(
+            uri,
+            crate::native_document_host::AdmitOptions {
+                allow_config_symlinks,
+                ..crate::native_document_host::AdmitOptions::DOCUMENT
+            },
+        )
+    }
+    fn admit_document_with_worker(
+        uri: &str,
+        options: crate::native_document_host::AdmitOptions,
+    ) -> Result<AdmittedDocument, DocumentOpenFailure> {
+        #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+        crate::restore_measurement::wait_for_uri(uri);
+        crate::native_document_host::admit_local_file_prepared_opts(uri, options)
+            .map_err(DocumentOpenFailure)
+    }
+
     fn admit_document_with(
         uri: &str,
         options: crate::native_document_host::AdmitOptions,
     ) -> Result<AdmittedDocument, DocumentOpenFailure> {
+        #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+        crate::restore_measurement::wait_for_uri(uri);
         crate::native_document_host::admit_local_file_opts(uri, options)
             .map_err(DocumentOpenFailure)
     }
@@ -5235,15 +6035,35 @@ impl App {
         key: &DocumentAdmissionKey,
         purpose: DocumentAdmissionPurpose,
         options: crate::native_document_host::AdmitOptions,
+        worker_prepared: bool,
     ) -> Result<AdmittedDocument, DocumentOpenFailure> {
+        let admit = if worker_prepared {
+            Self::admit_document_with_worker
+        } else {
+            Self::admit_document_with
+        };
+        if key.config {
+            let path = crate::native_document_host::file_uri_path(&key.uri)
+                .map_err(DocumentOpenFailure)?;
+            let ensured = ensure_config_file(&path).map_err(|message| {
+                DocumentOpenFailure(DocumentHostError::Io {
+                    stage: crate::native_document_io::AtomicSaveStage::Preflight,
+                    message,
+                    kind: None,
+                })
+            })?;
+            let uri = crate::native_document_host::path_to_file_uri(&ensured)
+                .map_err(DocumentOpenFailure)?;
+            return admit(&uri, options);
+        }
         if purpose == DocumentAdmissionPurpose::DirectoryEntry {
             let path = crate::native_document_host::file_uri_path(&key.uri)
                 .map_err(DocumentOpenFailure)?;
             let (_, uri) =
                 crate::native_document_host::open_path(&path).map_err(DocumentOpenFailure)?;
-            return Self::admit_document_with(&uri, options);
+            return admit(&uri, options);
         }
-        Self::admit_document_with(&key.uri, options)
+        admit(&key.uri, options)
     }
 
     fn admission_options(
@@ -5251,6 +6071,7 @@ impl App {
         key: &DocumentAdmissionKey,
     ) -> crate::native_document_host::AdmitOptions {
         crate::native_document_host::AdmitOptions {
+            allow_config_symlinks: key.config,
             allow_missing: key
                 .edit
                 .is_some_and(|ticket| self.edit_admits_missing(ticket)),
@@ -5261,8 +6082,16 @@ impl App {
     fn replace_directory_listing(
         &mut self,
         document: DocumentId,
-        listing: amacs::store::DirectoryListing,
+        listing: impl Into<std::sync::Arc<amacs::store::DirectoryListing>>,
     ) -> Result<(), String> {
+        let listing = listing.into();
+        if self
+            .document_store
+            .directory(document)
+            .is_some_and(|current| std::ptr::eq(current, listing.as_ref()))
+        {
+            return Ok(());
+        }
         let before = self
             .document_store
             .snapshot(document)
@@ -5310,12 +6139,27 @@ impl App {
         Ok(())
     }
 
+    fn directory_refresh_live(&self, document: DocumentId) -> bool {
+        self.document_store.directory(document).is_some()
+            && self
+                .document_store
+                .view_count(document)
+                .is_some_and(|count| count > 0)
+            && matches!(
+                self.document_store.phase(document),
+                Some(
+                    crate::document_store::DocumentPhase::Active
+                        | crate::document_store::DocumentPhase::Suspended
+                )
+            )
+    }
+
     fn finish_directory_refresh(
         &mut self,
         document: DocumentId,
         admitted: AdmittedDocument,
     ) -> Result<String, String> {
-        if admitted.directory.is_none() {
+        if !admitted.is_directory() {
             return Err("The path is no longer a directory".into());
         }
         if self.document_store.id_for_uri(admitted.canonical_uri()) != Some(document) {
@@ -5328,13 +6172,55 @@ impl App {
             .map_err(|error| error.to_string())?;
         self.replace_directory_listing(
             document,
-            granted.directory.expect("checked directory admission"),
+            granted
+                .prepared_text
+                .take_directory_for_refresh()
+                .ok_or("directory preparation was already consumed")?,
         )?;
+        Ok(self.finish_directory_refresh_status(document))
+    }
+
+    fn finish_prepared_directory_refresh(
+        &mut self,
+        document: DocumentId,
+        prepared: PreparedDocument,
+    ) -> Result<String, String> {
+        if prepared.document != document
+            || !prepared.granted.is_directory()
+            || self
+                .document_store
+                .id_for_uri(&prepared.granted.grant.canonical_uri)
+                != Some(document)
+            || self.native_documents.persistence.grant(document) != Some(prepared.granted.grant.id)
+            || !self.directory_refresh_live(document)
+        {
+            return Err("The directory changed while refreshing".into());
+        }
+        Ok(self.finish_directory_refresh_status(document))
+    }
+
+    fn finish_directory_refresh_status(&mut self, document: DocumentId) -> String {
         for (_, _, view) in self.document_native_views(document) {
             self.set_editor_view_status(view, "Directory refreshed");
         }
         self.repaint_document_views(document);
-        Ok("Directory refreshed".into())
+        "Directory refreshed".into()
+    }
+
+    fn document_admission_delivery(&self) -> Option<DocumentAdmissionDelivery> {
+        if let Some(proxy) = &self.proxy {
+            return Some(DocumentAdmissionDelivery::Proxy(proxy.clone()));
+        }
+        #[cfg(test)]
+        {
+            DOCUMENT_ADMISSION_DELIVERY
+                .with_borrow(|delivery| delivery.clone())
+                .map(DocumentAdmissionDelivery::Test)
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
     }
 
     fn begin_document_admission(
@@ -5345,25 +6231,139 @@ impl App {
         self.begin_document_admission_for(wid, key, DocumentAdmissionPurpose::Open)
     }
 
+    /// Resume a UI action with its exact installed view after asynchronous admission.
+    /// Each coalesced caller retains its own placement and continuation.
+    pub(crate) fn request_document_with_continuation(
+        &mut self,
+        wid: WindowId,
+        kind: AppKind,
+        uri: &str,
+        placement: Placement,
+        after: impl FnOnce(&mut App, Result<InstalledDocument, String>) -> Result<String, String>
+        + 'static,
+    ) -> Result<DocumentAdmission, String> {
+        self.request_document_with_guard(wid, kind, uri, placement, |_| true, after)
+    }
+
+    /// Guard the originating action before canonical refresh and again before installing.
+    pub(crate) fn request_document_with_guard(
+        &mut self,
+        wid: WindowId,
+        kind: AppKind,
+        uri: &str,
+        placement: Placement,
+        allow: impl Fn(&App) -> bool + 'static,
+        after: impl FnOnce(&mut App, Result<InstalledDocument, String>) -> Result<String, String>
+        + 'static,
+    ) -> Result<DocumentAdmission, String> {
+        #[cfg(test)]
+        DOCUMENT_REQUESTS.set(DOCUMENT_REQUESTS.get() + 1);
+        if let Err(error) = Self::validate_document_request(kind, false) {
+            return after(self, Err(error)).map(DocumentAdmission::Opened);
+        }
+        if !self.windows.contains_key(&wid) {
+            return after(self, Err("requesting window disappeared".into()))
+                .map(DocumentAdmission::Opened);
+        }
+        if self.document_admission_delivery().is_none() {
+            #[cfg(test)]
+            {
+                if !allow(self) {
+                    return after(
+                        self,
+                        Err("document open no longer names its requesting view".into()),
+                    )
+                    .map(DocumentAdmission::Opened);
+                }
+                let installed = Self::admit_document_now(uri, false)
+                    .map_err(String::from)
+                    .and_then(|admitted| {
+                        self.install_admitted_document(wid, kind, uri, admitted, placement)
+                            .map_err(String::from)
+                    });
+                return after(self, installed).map(DocumentAdmission::Opened);
+            }
+            #[cfg(not(test))]
+            {
+                return after(
+                    self,
+                    Err("document continuation requires an event-loop wake".into()),
+                )
+                .map(DocumentAdmission::Opened);
+            }
+        }
+        let key = DocumentAdmissionKey {
+            uri: uri.to_string(),
+            kind,
+            edit: None,
+            config: false,
+        };
+        let admission = match self.begin_document_admission_request(
+            wid,
+            key.clone(),
+            DocumentAdmissionPurpose::Open,
+            false,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => return after(self, Err(error)).map(DocumentAdmission::Opened),
+        };
+        self.native_documents
+            .admissions
+            .get_mut(&(wid, key))
+            .expect("asynchronous admission owns its continuation")
+            .continuations
+            .push(DocumentContinuation {
+                placement,
+                allow: Box::new(allow),
+                after: Box::new(after),
+            });
+        Ok(admission)
+    }
+
     fn begin_document_admission_for(
         &mut self,
         wid: WindowId,
         key: DocumentAdmissionKey,
         purpose: DocumentAdmissionPurpose,
     ) -> Result<DocumentAdmission, String> {
+        self.begin_document_admission_request(wid, key, purpose, true)
+    }
+
+    fn begin_document_admission_request(
+        &mut self,
+        wid: WindowId,
+        key: DocumentAdmissionKey,
+        purpose: DocumentAdmissionPurpose,
+        unguarded: bool,
+    ) -> Result<DocumentAdmission, String> {
+        if let Some(refusal) = self
+            .native_documents
+            .admissions
+            .get(&(wid, key.clone()))
+            .and_then(PendingDocumentAdmission::request_refusal)
+        {
+            // Resolve a sealed refused epoch once. A later live request owns a
+            // new read/preparation epoch, including any reentrant continuation.
+            self.retire_refused_document_admission(wid, &key, refusal);
+            return self.begin_document_admission_request(wid, key, purpose, unguarded);
+        }
         // Coalescing is per window: a hit is this live window's own read in
         // flight. Another window's read of the file is a separate entry and
         // installs there (or is dropped if that window closed).
-        if let Some(pending) = self.native_documents.admissions.get(&(wid, key.clone()))
+        if let Some(pending) = self
+            .native_documents
+            .admissions
+            .get_mut(&(wid, key.clone()))
             && pending.started.elapsed() < DOCUMENT_ADMISSION_STALE_AFTER
             && pending.purpose == purpose
         {
+            pending.unguarded |= unguarded;
             return Ok(DocumentAdmission::Coalesced(pending.ticket));
         }
         self.native_documents.admissions.remove(&(wid, key.clone()));
         let options = self.admission_options(&key);
-        let Some(proxy) = self.proxy.clone() else {
-            let admitted = Self::admit_document_request(&key, purpose, options);
+        let Some(delivery) = self.document_admission_delivery() else {
+            let admitted = Self::admit_document_request(&key, purpose, options, false);
             if let DocumentAdmissionPurpose::DirectoryRefresh(document) = purpose {
                 return self
                     .finish_directory_refresh(document, admitted?)
@@ -5373,15 +6373,22 @@ impl App {
                 let reply = self.finish_edit_admission(wid, key, admitted.map(Box::new));
                 return Ok(DocumentAdmission::Opened(reply.unwrap_or_else(|why| why)));
             }
-            let admitted = admitted?;
-            let uri = if purpose == DocumentAdmissionPurpose::DirectoryEntry {
-                admitted.canonical_uri().to_string()
-            } else {
-                key.uri.clone()
-            };
-            return self
-                .install_admitted_document(wid, key.kind, &uri, admitted, Placement::FocusOrNewTab)
-                .map(|installed| DocumentAdmission::Opened(installed.line()));
+            // No worker reports back here: the person's open settles inline, as it would at
+            // its `Wake::DocumentAdmitted`, and its window shows why it did not open.
+            let reveal = self.native_documents.reveals.remove(&(wid, key.clone()));
+            return Ok(
+                match self.finish_person_open(
+                    wid,
+                    &key,
+                    purpose,
+                    reveal,
+                    admitted.map(Box::new),
+                    None,
+                ) {
+                    Ok(line) => DocumentAdmission::Opened(line),
+                    Err(detail) => DocumentAdmission::Shown(detail),
+                },
+            );
         };
         let ticket = self.mint_document_admission(wid, key.clone());
         if let Some(pending) = self
@@ -5390,6 +6397,7 @@ impl App {
             .get_mut(&(wid, key.clone()))
         {
             pending.purpose = purpose;
+            pending.unguarded = unguarded;
         }
         let worker_key = key.clone();
         let spawned = std::thread::Builder::new()
@@ -5407,24 +6415,112 @@ impl App {
                          file will be reported as not downloaded"
                     );
                 }
-                let result =
-                    Self::admit_document_request(&worker_key, purpose, options).map(Box::new);
-                let _ = proxy.send_event(crate::Wake::DocumentAdmitted(Box::new(
-                    DocumentAdmissionOutcome {
-                        ticket,
-                        wid,
-                        key: worker_key,
-                        result,
-                    },
-                )));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::admit_document_request(&worker_key, purpose, options, true).map(Box::new)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(DocumentOpenFailure(DocumentHostError::Io {
+                        stage: crate::native_document_io::AtomicSaveStage::Preflight,
+                        message: "document admission worker panicked".into(),
+                        kind: None,
+                    }))
+                });
+                delivery.send(DocumentAdmissionOutcome {
+                    ticket,
+                    wid,
+                    key: worker_key,
+                    result,
+                });
             });
         if let Err(error) = spawned {
-            self.native_documents.admissions.remove(&(wid, key));
-            return Err(format!(
-                "could not start the document admission worker: {error}"
-            ));
+            self.native_documents.admissions.remove(&(wid, key.clone()));
+            let detail = format!("could not start the document admission worker: {error}");
+            if unguarded
+                && key.edit.is_none()
+                && matches!(
+                    purpose,
+                    DocumentAdmissionPurpose::Open | DocumentAdmissionPurpose::DirectoryEntry
+                )
+            {
+                let reveal = self.native_documents.reveals.remove(&(wid, key.clone()));
+                self.show_failed_open(
+                    wid,
+                    FailedOpen {
+                        kind: key.kind,
+                        path_shown: shown_path(&key.uri),
+                        requested_uri: Some(key.uri),
+                        canonical_uri: None,
+                        problem: detail.clone(),
+                        detail: detail.clone(),
+                        reveal,
+                        entry: purpose == DocumentAdmissionPurpose::DirectoryEntry,
+                    },
+                );
+                return Ok(DocumentAdmission::Shown(detail));
+            }
+            return Err(detail);
         }
         Ok(DocumentAdmission::InFlight(ticket))
+    }
+
+    /// The file the draft journal of the file `canonical_uri` names lives in.
+    #[cfg(test)]
+    pub(crate) fn draft_journal_for_test(&self, canonical_uri: &str) -> std::path::PathBuf {
+        self.native_documents
+            .journals
+            .as_ref()
+            .expect("the test App's draft journals")
+            .path_for_uri(canonical_uri)
+    }
+
+    /// Hold the draft lock of the file `canonical_uri` names while the handle lives, as another
+    /// aterm process writing that file's draft would.
+    #[cfg(test)]
+    pub(crate) fn hold_draft_lock_for_test(
+        &self,
+        canonical_uri: &str,
+    ) -> crate::native_document_host::HeldAdvisoryLock {
+        let path = self
+            .native_documents
+            .journals
+            .as_ref()
+            .expect("the test App's draft journals")
+            .path_for_uri(canonical_uri);
+        crate::native_document_journal::hold_journal_lock_for_test(&path)
+    }
+
+    /// Settle this App's draft journals as unavailable, for `why`.
+    #[cfg(test)]
+    pub(crate) fn document_journals_unavailable_for_test(&mut self, why: &str) {
+        self.native_documents.journals = JournalSlot::open(Err(why.to_string()));
+    }
+
+    /// Rewrite the draft journal of each of the next `opens` opens between its inspection and its
+    /// initialization, each time with an image no earlier one wrote, as another aterm process
+    /// writing that draft would: each of those opens meets [`InstallFailure::DraftChanged`].
+    #[cfg(test)]
+    pub(crate) fn change_drafts_under_opens_for_test(&mut self, opens: u32) {
+        self.native_documents.drafts_changed_under_opens = opens;
+    }
+
+    #[cfg(test)]
+    fn change_draft_under_open_for_test(&mut self, canonical_uri: &str) {
+        let left = &mut self.native_documents.drafts_changed_under_opens;
+        if *left == 0 {
+            return;
+        }
+        *left -= 1;
+        let journal = self
+            .native_documents
+            .journals
+            .as_ref()
+            .expect("an open that inspected its draft has journals")
+            .path_for_uri(canonical_uri);
+        std::fs::write(
+            &journal,
+            format!("another process's draft, {} more to come", *left),
+        )
+        .expect("the test rewrites the draft under the open");
     }
 
     /// Record one admission as pending and mint its ticket.
@@ -5442,15 +6538,108 @@ impl App {
                 ticket,
                 started: std::time::Instant::now(),
                 purpose: DocumentAdmissionPurpose::Open,
+                unguarded: true,
+                preparation: None,
+                admitted: None,
+                prepared: None,
+                continuations: Vec::new(),
             },
         );
         ticket
     }
 
+    fn retire_refused_document_admission(
+        &mut self,
+        wid: WindowId,
+        key: &DocumentAdmissionKey,
+        refusal: &str,
+    ) {
+        let Some(pending) = self.native_documents.admissions.remove(&(wid, key.clone())) else {
+            return;
+        };
+        let continuations = pending.continuations;
+        drop(pending.preparation);
+        drop(pending.prepared);
+        drop(pending.admitted);
+        self.native_documents.reveals.remove(&(wid, key.clone()));
+        if key.edit.is_some() {
+            let _ = self.finish_edit_admission(
+                wid,
+                key.clone(),
+                Err(DocumentOpenFailure(DocumentHostError::Io {
+                    stage: crate::native_document_io::AtomicSaveStage::Preflight,
+                    message: refusal.into(),
+                    kind: None,
+                })),
+            );
+        }
+        for continuation in continuations {
+            let _ = (continuation.after)(self, Err(refusal.into()));
+        }
+    }
+
+    /// Retire only admissions owned by this closed requesting window. Dropping
+    /// their typed preparation leases cancels inspection before canonical adoption;
+    /// independent URI requests and detached restore tickets keep their own leases.
+    pub(crate) fn retire_window_document_admissions(&mut self, wid: WindowId) {
+        let keys: Vec<_> = self
+            .native_documents
+            .admissions
+            .keys()
+            .filter(|(owner, _)| *owner == wid)
+            .map(|(_, key)| key.clone())
+            .collect();
+        let continuations: Vec<_> = keys
+            .iter()
+            .filter_map(|key| self.native_documents.admissions.remove(&(wid, key.clone())))
+            .flat_map(|pending| pending.continuations)
+            .collect();
+        self.native_documents
+            .reveals
+            .retain(|(owner, _), _| *owner != wid);
+        for key in keys.into_iter().filter(|key| key.edit.is_some()) {
+            // Use the edit owner's normal refusal/one-shot reply path. An already
+            // installed or independently moved ticket is not an admitting ticket.
+            let _ = self.finish_edit_admission(
+                wid,
+                key,
+                Err(DocumentOpenFailure(DocumentHostError::Io {
+                    stage: crate::native_document_io::AtomicSaveStage::Preflight,
+                    message: "requesting window closed before admission completed".into(),
+                    kind: None,
+                })),
+            );
+        }
+        for continuation in continuations {
+            let _ = (continuation.after)(
+                self,
+                Err("requesting window closed before admission completed".into()),
+            );
+        }
+    }
+
     /// Phase two of the two-phase open, on the main thread, from `Wake::DocumentAdmitted`.
+    ///
+    /// A person's open (not an `edit` ticket's, a directory refresh, nor a guarded action's
+    /// continuation, which each answer on their own surface) that does not open shows why in
+    /// the window that asked ([`Self::show_failed_open`]).
     pub(crate) fn complete_document_admission(
         &mut self,
         outcome: DocumentAdmissionOutcome,
+    ) -> Result<String, DocumentAdmissionRejected> {
+        let prepared = self
+            .native_documents
+            .admissions
+            .get_mut(&(outcome.wid, outcome.key.clone()))
+            .filter(|pending| pending.ticket == outcome.ticket)
+            .and_then(|pending| pending.prepared.take());
+        self.complete_prepared_document_admission(outcome, prepared)
+    }
+
+    fn complete_prepared_document_admission(
+        &mut self,
+        outcome: DocumentAdmissionOutcome,
+        prepared: Option<Result<preparation::PreparedRequest, InstallFailure>>,
     ) -> Result<String, DocumentAdmissionRejected> {
         let DocumentAdmissionOutcome {
             ticket,
@@ -5468,17 +6657,143 @@ impl App {
                 )));
             }
         }
-        let purpose = self
+        if !self.windows.contains_key(&wid) {
+            self.retire_window_document_admissions(wid);
+            return Err(DocumentAdmissionRejected::Dropped(
+                "requesting window closed before document preparation".into(),
+            ));
+        }
+        let refusal = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.as_ref().ok())
+            .and_then(preparation::PreparedRequest::refusal);
+        let prepared =
+            prepared.map(|prepared| prepared.map(preparation::PreparedRequest::into_readiness));
+        let result = if let Some(refusal) = refusal {
+            Err(DocumentOpenFailure(DocumentHostError::Io {
+                stage: crate::native_document_io::AtomicSaveStage::Preflight,
+                message: refusal.into(),
+                kind: None,
+            }))
+        } else {
+            result
+        };
+        let purpose = self.native_documents.admissions[&slot].purpose;
+        let refresh_target_live = match purpose {
+            DocumentAdmissionPurpose::DirectoryRefresh(document) => {
+                self.windows.contains_key(&wid) && self.directory_refresh_live(document)
+            }
+            _ => true,
+        };
+        if prepared.is_none()
+            && let Ok(admitted) = result.as_ref()
+            && (self.proxy.is_some() || admitted.prepared_text.is_worker_prepared())
+            && refresh_target_live
+        {
+            let access = if slot
+                .1
+                .edit
+                .is_some_and(|ticket| self.native_documents.edits.read_only(ticket))
+            {
+                GrantAccess::ReadOnly
+            } else {
+                GrantAccess::ReadWrite
+            };
+            let required = match purpose {
+                DocumentAdmissionPurpose::DirectoryRefresh(document) => Some(document),
+                _ => None,
+            };
+            let owner_slot = slot.clone();
+            let preparation = self.prepare_document_request(
+                (**admitted).clone(),
+                access,
+                &slot.1.uri,
+                required,
+                move |app| {
+                    app.native_documents
+                        .admissions
+                        .get(&owner_slot)
+                        .is_some_and(|pending| {
+                            pending.ticket == ticket
+                                && app.windows.contains_key(&owner_slot.0)
+                                && owner_slot.1.edit.is_none_or(|edit| {
+                                    app.edit_admission_is_current(owner_slot.0, edit)
+                                })
+                                && (pending.unguarded
+                                    || pending
+                                        .continuations
+                                        .iter()
+                                        .any(|continuation| (continuation.allow)(app)))
+                        })
+                },
+            );
+            let pending = self
+                .native_documents
+                .admissions
+                .get_mut(&slot)
+                .expect("validated admission");
+            pending.preparation = Some(preparation);
+            pending.admitted = result.ok();
+            return Ok(format!("admitting {} {}", slot.1.kind.as_str(), slot.1.uri));
+        }
+        let pending = self
             .native_documents
             .admissions
             .remove(&slot)
-            .map(|pending| pending.purpose)
-            .unwrap_or(DocumentAdmissionPurpose::Open);
+            .expect("validated admission still exists");
+        let purpose = pending.purpose;
         let reveal = self.native_documents.reveals.remove(&slot);
         let (wid, key) = slot;
+        if !pending.continuations.is_empty() {
+            let mut last = Ok(String::new());
+            for continuation in pending.continuations {
+                let installed = if !(continuation.allow)(self) {
+                    Err("document open no longer names its requesting view".into())
+                } else if !self.windows.contains_key(&wid) {
+                    Err("requesting window closed before document preparation completed".into())
+                } else {
+                    match (&result, &prepared) {
+                        (Err(failure), _) => Err(failure.to_string()),
+                        (Ok(_), Some(Err(failure))) => Err(String::from(failure.clone())),
+                        (Ok(_), Some(Ok(prepared))) => self
+                            .install_prepared_document(
+                                wid,
+                                key.kind,
+                                &key.uri,
+                                prepared.clone(),
+                                continuation.placement,
+                            )
+                            .map_err(String::from),
+                        (Ok(admitted), None) => self
+                            .install_admitted_document(
+                                wid,
+                                key.kind,
+                                &key.uri,
+                                (**admitted).clone(),
+                                continuation.placement,
+                            )
+                            .map_err(String::from),
+                    }
+                };
+                last = (continuation.after)(self, installed);
+            }
+            if pending.unguarded {
+                // A coalesced ordinary request owns its default installation
+                // independently of guarded action continuations: the person's open, which
+                // shows its own failure.
+                return self
+                    .finish_person_open(wid, &key, purpose, reveal, result, prepared)
+                    .map_err(DocumentAdmissionRejected::Failed);
+            }
+            // A guarded action answered on its own surface; the record is this one's.
+            if let Err(detail) = &last {
+                record_failed_open(detail);
+            }
+            return last.map_err(DocumentAdmissionRejected::Failed);
+        }
         if key.edit.is_some() {
             return self
-                .finish_edit_admission(wid, key, result)
+                .finish_edit_admission_prepared(wid, key, result, prepared)
                 .map_err(DocumentAdmissionRejected::Dropped);
         }
         if !self.windows.contains_key(&wid) {
@@ -5488,8 +6803,7 @@ impl App {
             )));
         }
         if let DocumentAdmissionPurpose::DirectoryRefresh(document) = purpose
-            && (self.document_store.directory(document).is_none()
-                || self.document_store.view_count(document) == Some(0))
+            && !self.directory_refresh_live(document)
         {
             return Err(DocumentAdmissionRejected::Dropped(
                 "directory view closed before refresh completed".into(),
@@ -5498,7 +6812,13 @@ impl App {
         if let DocumentAdmissionPurpose::DirectoryRefresh(document) = purpose {
             let refreshed = result
                 .map_err(|failure| failure.to_string())
-                .and_then(|admitted| self.finish_directory_refresh(document, *admitted));
+                .and_then(|admitted| match prepared {
+                    Some(Ok(prepared)) => {
+                        self.finish_prepared_directory_refresh(document, prepared)
+                    }
+                    Some(Err(failure)) => Err(String::from(failure)),
+                    None => self.finish_directory_refresh(document, *admitted),
+                });
             return Ok(refreshed.unwrap_or_else(|why| {
                 let status = format!("Directory refresh failed: {why}");
                 for (_, _, view) in self.document_native_views(document) {
@@ -5508,21 +6828,369 @@ impl App {
                 status
             }));
         }
-        let admitted =
-            *result.map_err(|failure| DocumentAdmissionRejected::Failed(failure.to_string()))?;
-        let uri = if purpose == DocumentAdmissionPurpose::DirectoryEntry {
-            admitted.canonical_uri().to_string()
+        self.finish_person_open(wid, &key, purpose, reveal, result, prepared)
+            .map_err(DocumentAdmissionRejected::Failed)
+    }
+
+    /// The tail of a person's open of `key` in window `wid` (a gesture's, not an `edit`
+    /// ticket's nor a directory refresh): install what its admission read (`prepared` when a
+    /// worker prepared its document), land its caret on `reveal`, and answer its line. A
+    /// landing that cannot be found (a heading gone from the file) leaves the document open and
+    /// says so on its status line.
+    ///
+    /// # Errors
+    /// The failure's detail, once the window shows why the file did not open
+    /// ([`Self::show_failed_open`]): the read's refusal, or the install's.
+    fn finish_person_open(
+        &mut self,
+        wid: WindowId,
+        key: &DocumentAdmissionKey,
+        purpose: DocumentAdmissionPurpose,
+        reveal: Option<DocumentReveal>,
+        result: Result<Box<AdmittedDocument>, DocumentOpenFailure>,
+        prepared: Option<Result<PreparedDocument, InstallFailure>>,
+    ) -> Result<String, String> {
+        let entry = purpose == DocumentAdmissionPurpose::DirectoryEntry;
+        let admitted = match result {
+            Ok(admitted) => *admitted,
+            Err(failure) => {
+                // The page says what went wrong; which stage of the read met it is the
+                // detail's, for the diagnostics.
+                let problem = match &failure.0 {
+                    DocumentHostError::Io { message, .. } => message.clone(),
+                    error => error.to_string(),
+                };
+                let detail = failure.to_string();
+                self.show_failed_open(
+                    wid,
+                    FailedOpen {
+                        kind: key.kind,
+                        path_shown: shown_path(&key.uri),
+                        requested_uri: Some(key.uri.clone()),
+                        canonical_uri: None,
+                        problem,
+                        detail: detail.clone(),
+                        reveal,
+                        entry,
+                    },
+                );
+                return Err(detail);
+            }
+        };
+        let canonical = admitted.canonical_uri().to_string();
+        let uri = if entry {
+            canonical.clone()
         } else {
             key.uri.clone()
         };
-        let installed = self
-            .install_admitted_document(wid, key.kind, &uri, admitted, Placement::FocusOrNewTab)
-            .map_err(DocumentAdmissionRejected::Failed)?;
-        if let Some(reveal) = reveal {
-            self.reveal_opened_document(wid, reveal)
-                .map_err(DocumentAdmissionRejected::Failed)?;
+        // The tab shows `uri`; the failure tab of an entry whose link this open resolved names
+        // the entry, which is what the open asked for.
+        let shown = InstallUri {
+            shown: &uri,
+            asked: Some(&key.uri),
+        };
+        let installed = match prepared {
+            Some(Ok(prepared)) => self.install_prepared_document(
+                wid,
+                key.kind,
+                shown,
+                prepared,
+                Placement::FocusOrNewTab,
+            ),
+            Some(Err(failure)) => Err(failure),
+            None => self.install_admitted_document(
+                wid,
+                key.kind,
+                shown,
+                admitted,
+                Placement::FocusOrNewTab,
+            ),
+        };
+        let failure = match installed {
+            Ok(installed) => {
+                if let Some(reveal) = reveal
+                    && let Err(why) = self.reveal_opened_document(wid, reveal)
+                {
+                    self.set_editor_view_status(installed.view, &format!("Opened; {why}"));
+                    self.request_native_redraw(wid);
+                }
+                return Ok(installed.line());
+            }
+            Err(failure) => failure,
+        };
+        let problem = match &failure {
+            InstallFailure::DraftsBusy => DRAFTS_BUSY_PROBLEM.to_string(),
+            InstallFailure::Refused(error) => error.to_string(),
+            InstallFailure::DraftChanged | InstallFailure::Reply(_) | InstallFailure::Failed(_) => {
+                String::from(failure.clone())
+            }
+        };
+        let detail = String::from(failure);
+        self.show_failed_open(
+            wid,
+            FailedOpen {
+                kind: key.kind,
+                path_shown: shown_path(&canonical),
+                requested_uri: Some(key.uri.clone()),
+                canonical_uri: Some(canonical),
+                problem,
+                detail: detail.clone(),
+                reveal,
+                entry,
+            },
+        );
+        Err(detail)
+    }
+
+    /// `words`, a preparation worker's failure in its own, as a surface the person reads
+    /// carries them: the drafts folder said as
+    /// [`crate::native_document_journal::DRAFTS_FOLDER_WORD`]
+    /// ([`DocumentJournalStore::unrooted`]), since that worker inspects the file's draft journal.
+    /// stderr gets words that named the folder whole.
+    fn unrooted_words(&self, words: &str) -> String {
+        let Some(journals) = self.native_documents.journals.as_ref() else {
+            return words.to_string();
+        };
+        let unrooted = journals.unrooted(words);
+        if unrooted != words {
+            crate::logging::stderr_line!(
+                "aterm-gui: a document's draft journal refused its open: {words}"
+            );
         }
-        Ok(installed.line())
+        unrooted
+    }
+
+    /// Show, in window `wid`, that a document the person asked to open there did not open.
+    ///
+    /// The whole detail goes to stderr, and its record to aterm.log by its length
+    /// ([`crate::menu::notify`]). With the window gone nothing more happens. An Open-origin
+    /// Recovery tab already standing for the file (its requested or canonical URI, or for an open
+    /// no URI names, the same path) says why again in place, [`STILL_COULD_NOT_OPEN`], and comes
+    /// to the front; it keeps what its first open asked for (the kind, the caret and whether it
+    /// follows a directory entry's links), so its Retry is still that open whatever failed again,
+    /// its own Open Original included. Otherwise a new Recovery tab opens in front, as a new
+    /// document tab would. Its Retry and Open Original open the file again
+    /// ([`crate::native_app::RecoveryRequest::Reopen`]) when the open had a URI; without one both
+    /// are disabled.
+    pub(crate) fn show_failed_open(&mut self, wid: WindowId, failed: FailedOpen) {
+        record_failed_open(&failed.detail);
+        if !self.windows.contains_key(&wid) {
+            return;
+        }
+        let FailedOpen {
+            kind,
+            requested_uri,
+            canonical_uri,
+            path_shown,
+            problem,
+            detail,
+            reveal,
+            entry,
+        } = failed;
+        // Once the read resolved the file its canonical URI needs no link followed.
+        let unresolved = canonical_uri.is_none();
+        let uri = canonical_uri.clone().or_else(|| requested_uri.clone());
+        // The tab's URI is the canonical one once the read resolved it; the tab keeps the one
+        // the open asked for beside it, so a later open by either spelling finds this tab.
+        let another = |uri: &Option<String>, stood: &String| {
+            !uri.as_deref().is_some_and(|uri| same_file_uri(uri, stood))
+        };
+        let asked = requested_uri
+            .clone()
+            .filter(|requested| another(&uri, requested));
+        let existing = match &uri {
+            Some(_) => {
+                let uris = [canonical_uri.as_deref(), requested_uri.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                self.failed_open_tab(wid, FailedOpenKey::Uris(&uris))
+            }
+            None => self.failed_open_tab(wid, FailedOpenKey::Path(&path_shown)),
+        };
+        if let Some((tab, instance, view)) = existing {
+            self.native_runtime
+                .update_recovery(instance, view, |app, state| {
+                    // `failed_open_tab` found an Open-origin tab: its first open's fields win.
+                    let (first_kind, first_uri) = match &app.capability {
+                        Some(crate::native_app::RecoveryCapability::Document {
+                            kind: first,
+                            uri: first_uri,
+                            ..
+                        }) => (*first, Some(first_uri.clone())),
+                        _ => (kind, None),
+                    };
+                    let (first_asked, first_reveal, first_entry) = match &app.origin {
+                        crate::native_app::RecoveryOrigin::Open {
+                            asked: first_asked,
+                            reveal: first_reveal,
+                            entry: first_entry,
+                            ..
+                        } => (first_asked.clone(), first_reveal.clone(), *first_entry),
+                        crate::native_app::RecoveryOrigin::Restore => (None, reveal, entry),
+                    };
+                    // The tab keeps a second URI it has stood for beside its own: this open's
+                    // request, else one an earlier failure left.
+                    let asked = [asked, first_asked, first_uri]
+                        .into_iter()
+                        .flatten()
+                        .find(|stood| another(&uri, stood));
+                    app.reason = problem;
+                    app.metadata = detail;
+                    app.capability =
+                        uri.map(|uri| crate::native_app::RecoveryCapability::Document {
+                            kind: first_kind,
+                            uri,
+                            config_editor: false,
+                        });
+                    app.origin = crate::native_app::RecoveryOrigin::Open {
+                        path: path_shown,
+                        asked,
+                        reveal: first_reveal,
+                        entry: (first_entry || entry) && unresolved,
+                    };
+                    state.page = 0;
+                    state.notice = Some(STILL_COULD_NOT_OPEN.to_string());
+                });
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.tab_set.switch_to(tab);
+                if let Some(target) = ws.tab_set.active_mut() {
+                    target.set_focus(view);
+                }
+                ws.last_present = None;
+            }
+            self.resync_active_or_window(wid);
+            self.invalidate_native_view_cache(wid, view, crate::native_app::DamageRegion::All);
+            self.refresh_native_presentation(wid, instance, view);
+            self.request_native_redraw(wid);
+            return;
+        }
+        let app = crate::native_app::RecoveryApp {
+            restore_tag: kind.as_str().to_string(),
+            reason: problem,
+            metadata: detail,
+            capability: uri.map(|uri| crate::native_app::RecoveryCapability::Document {
+                kind,
+                uri,
+                config_editor: false,
+            }),
+            origin: crate::native_app::RecoveryOrigin::Open {
+                path: path_shown.clone(),
+                asked,
+                reveal,
+                entry: entry && unresolved,
+            },
+        };
+        let presentation = crate::tab_model::TabPresentation {
+            title: app.opened_name().unwrap_or(&path_shown).to_string(),
+            icon: Some(crate::tab_model::TabIconKind::Recovery),
+            indicators: crate::tab_model::TabIndicators::default(),
+            conn: None,
+            closable: true,
+            tooltip: Some(format!("Couldn’t open · {path_shown}")),
+        };
+        match self.install_new_native_tab(
+            wid,
+            NativeApp::Recovery(app),
+            AppViewState::Recovery(crate::native_app::RecoveryViewState::default()),
+            presentation,
+        ) {
+            Ok((instance, _, view)) => {
+                self.refresh_native_presentation(wid, instance, view);
+                self.request_native_redraw(wid);
+            }
+            Err(error) => {
+                aterm_log::warn!("could not install the failed open's Recovery tab: {error:?}");
+            }
+        }
+    }
+
+    /// The Open-origin Recovery tab in `wid` that stands for `key` ([`Self::show_failed_open`]),
+    /// with its app instance and view.
+    fn failed_open_tab(
+        &self,
+        wid: WindowId,
+        key: FailedOpenKey<'_>,
+    ) -> Option<(
+        crate::tab_model::TabId,
+        crate::tab_model::AppInstanceId,
+        crate::tab_model::ViewId,
+    )> {
+        self.windows
+            .get(&wid)?
+            .tab_set
+            .tabs()
+            .iter()
+            .find_map(|tab| {
+                let mut found = None;
+                tab.root.any_leaf(&mut |&view| {
+                    let Some(crate::tab_model::View::Native(native)) =
+                        self.view_store.get(view).copied()
+                    else {
+                        return false;
+                    };
+                    let Some(NativeApp::Recovery(app)) = self.native_runtime.app(native.instance)
+                    else {
+                        return false;
+                    };
+                    let crate::native_app::RecoveryOrigin::Open { path, asked, .. } = &app.origin
+                    else {
+                        return false;
+                    };
+                    let stands_for = match (key, &app.capability) {
+                        (
+                            FailedOpenKey::Uris(uris),
+                            Some(crate::native_app::RecoveryCapability::Document { uri, .. }),
+                        ) => [Some(uri.as_str()), asked.as_deref()]
+                            .into_iter()
+                            .flatten()
+                            .any(|stood| uris.iter().any(|named| same_file_uri(stood, named))),
+                        (FailedOpenKey::Path(shown), None) => path == shown,
+                        (FailedOpenKey::Uris(_), _) | (FailedOpenKey::Path(_), Some(_)) => false,
+                    };
+                    if stands_for {
+                        found = Some((tab.id, native.instance, view));
+                    }
+                    stands_for
+                });
+                found
+            })
+    }
+
+    /// A document that opened in `wid` takes the place of the Recovery tab that said it had not
+    /// ([`Self::show_failed_open`]) for `uri` (the URI the tab shows and the one the open asked
+    /// for) or its canonical URI: the document's tab moves to that tab's index and the failure
+    /// tab goes. An `edit` view keeps its place beside its caller, and only the failure tab
+    /// goes. Every install in a window calls this once ([`Self::install_document_opening`]).
+    fn retire_failed_open_tab(
+        &mut self,
+        wid: WindowId,
+        uri: InstallUri<'_>,
+        installed: &InstalledDocument,
+        placement: Placement,
+    ) {
+        let names: Vec<&str> = [
+            Some(uri.shown),
+            uri.asked,
+            Some(installed.canonical_uri.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let Some((failure, _, _)) = self.failed_open_tab(wid, FailedOpenKey::Uris(&names)) else {
+            return;
+        };
+        if failure == installed.tab {
+            return;
+        }
+        if !matches!(placement, Placement::NewTabAfter { .. })
+            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(index) = ws.tab_set.tabs().iter().position(|tab| tab.id == failure)
+        {
+            ws.tab_set.place(installed.tab, index);
+        }
+        self.rollback_document_tab(wid, failure);
+        self.request_native_redraw(wid);
     }
 
     /// Whether an admission for exactly this request is still pending (test / diagnostic seam).
@@ -5539,6 +7207,14 @@ impl App {
     }
 
     /// The main-thread tail of every open.
+    ///
+    /// `uri` is the one the tab shows. A document that opens in a window takes the place of the
+    /// Recovery tab that said it had not, for `uri` or its canonical URI
+    /// ([`Self::retire_failed_open_tab`]).
+    ///
+    /// # Errors
+    /// Why no tab was installed ([`InstallFailure`]). The grant this call minted or changed is
+    /// put back unless a document binds it ([`Self::install_document_opening`]).
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -5563,24 +7239,148 @@ impl App {
             project = "aterm_gui::app_edit::edit_ticket_conformance::Rig::project"
         )
     )]
-    pub(crate) fn install_admitted_document(
+    pub(crate) fn install_admitted_document<'uri>(
         &mut self,
-        wid: WindowId,
+        target: impl Into<crate::app_tabs::NativeInstallTarget>,
         kind: AppKind,
-        uri: &str,
+        uri: impl Into<InstallUri<'uri>>,
         admitted: AdmittedDocument,
         placement: Placement,
-    ) -> Result<InstalledDocument, String> {
+    ) -> Result<InstalledDocument, InstallFailure> {
+        let target = target.into();
+        let installed = self.install_document_opening(
+            target,
+            kind,
+            uri,
+            DocumentOpening::Admitted(admitted),
+            placement,
+        );
+        if let Ok(installed) = &installed
+            && !target.detached()
+        {
+            self.mark_document_preparation_published(installed.document);
+        }
+        installed
+    }
+
+    /// [`Self::install_admitted_document`] for a document a worker prepared: its grant and its
+    /// journal are its preparation owner's, which also undoes them.
+    ///
+    /// # Errors
+    /// Why no tab was installed ([`InstallFailure`]).
+    pub(crate) fn install_prepared_document<'uri>(
+        &mut self,
+        target: impl Into<crate::app_tabs::NativeInstallTarget>,
+        kind: AppKind,
+        uri: impl Into<InstallUri<'uri>>,
+        prepared: PreparedDocument,
+        placement: Placement,
+    ) -> Result<InstalledDocument, InstallFailure> {
+        let target = target.into();
+        let document = prepared.document;
+        let retained = prepared.retain_preparation();
+        let installed = self.install_document_opening(
+            target,
+            kind,
+            uri,
+            DocumentOpening::Prepared(Box::new(prepared)),
+            placement,
+        );
+        if let Ok(installed) = &installed {
+            if target.detached() {
+                self.native_documents
+                    .unpublished_preparations
+                    .insert(installed.view, retained);
+            } else {
+                self.mark_document_preparation_published(document);
+            }
+        }
+        installed
+    }
+
+    /// Install `opening` and settle what the install leaves behind. In a window, the document
+    /// takes the place of the Recovery tab that said it had not opened
+    /// ([`Self::retire_failed_open_tab`]). On a failure, the grant this install's own
+    /// `grant_admitted` minted or changed goes back to what it was before this open, unless a
+    /// document binds it: one it minted is forgotten, one it widened or rebound is reinstated.
+    /// One the persistence store binds (a failure after registration) stays with its document
+    /// for the release sweep, which never releases a dirty or recovered document, so no draft
+    /// goes with it. A prepared opening's grant is its preparation owner's to undo.
+    fn install_document_opening<'uri>(
+        &mut self,
+        target: impl Into<crate::app_tabs::NativeInstallTarget>,
+        kind: AppKind,
+        uri: impl Into<InstallUri<'uri>>,
+        opening: DocumentOpening,
+        placement: Placement,
+    ) -> Result<InstalledDocument, InstallFailure> {
+        let target = target.into();
+        let uri = uri.into();
+        let mut opened = None;
+        match self.install_opening(target, kind, uri.shown, opening, placement, &mut opened) {
+            Ok(installed) => {
+                if !target.detached() {
+                    self.retire_failed_open_tab(target.window(), uri, &installed, placement);
+                }
+                Ok(installed)
+            }
+            Err(failure) => {
+                if let Some(OpenedGrant { id, prior }) = opened
+                    && !self.native_documents.persistence.binds(id)
+                {
+                    match prior {
+                        None => self.native_documents.grants.forget(id),
+                        Some(prior) => self.native_documents.grants.reinstate(prior),
+                    }
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    /// [`Self::install_document_opening`]'s install: the grant (named in `opened` once an
+    /// admitted opening took it here), the document, its journal, its registration and its tab.
+    fn install_opening(
+        &mut self,
+        target: crate::app_tabs::NativeInstallTarget,
+        kind: AppKind,
+        uri: &str,
+        opening: DocumentOpening,
+        placement: Placement,
+        opened: &mut Option<OpenedGrant>,
+    ) -> Result<InstalledDocument, InstallFailure> {
+        if let DocumentOpening::Admitted(admitted) = &opening
+            && self.document_preparation_pending(admitted.canonical_uri())
+        {
+            return Err("document open must join its preparation owner".into());
+        }
+        let wid = target.window();
+        if target.detached() {
+            if placement != Placement::NewTab
+                || !self
+                    .restore_leaf_staging
+                    .as_ref()
+                    .is_some_and(|staging| staging.wid == wid)
+            {
+                return Err("document restore has no detached staging owner".into());
+            }
+        } else if !self.windows.contains_key(&wid) {
+            return Err("requesting window disappeared".into());
+        }
         // Markdown is an opening intent, never a second document application.
         // Its Read/Edit/Split views keep the editor's identity, buffer and grant.
         let read_intent = kind == AppKind::Markdown;
         Self::validate_document_request(kind, false)?;
         let kind = AppKind::Editor;
-        let existing = self.document_store.id_for_uri(admitted.canonical_uri());
+        let existing = opening.existing(&self.document_store);
         if let Some(document) = existing
-            && self.document_store.directory(document).is_some() != admitted.directory.is_some()
+            && self.document_store.directory(document).is_some() != opening.directory()
         {
-            return Err("The path changed between a file and a directory; close its existing buffer before reopening it".into());
+            return Err(InstallFailure::Failed(
+                "The path changed between a file and a directory; close its existing buffer before \
+                 reopening it"
+                    .to_string(),
+            ));
         }
         // `edit … ro=1`: a fresh buffer nothing changes or saves. A buffer already open for the
         // file may hold changes and a writable grant, so it is never made read-only in place.
@@ -5589,12 +7389,14 @@ impl App {
             Placement::FocusOrNewTab | Placement::NewTab => false,
         };
         if read_only && existing.is_some() {
-            return Err("ERR refused open: a read-only edit opens a file no buffer holds\n".into());
+            return Err(InstallFailure::Reply(
+                "ERR refused open: a read-only edit opens a file no buffer holds\n".into(),
+            ));
         }
         // `edit … secret=`: the columns of a private grid its readers never get. A private
         // document that names none conceals every cell; any other document takes no `secret=`,
         // since only a private document's text is withheld from every other reader too.
-        let private = crate::native_document_journal::private_uri(admitted.canonical_uri());
+        let private = crate::native_document_journal::private_uri(opening.canonical_uri());
         let secret = match placement {
             Placement::NewTabAfter { ticket } => self
                 .native_documents
@@ -5604,60 +7406,97 @@ impl App {
             Placement::FocusOrNewTab | Placement::NewTab => None,
         };
         if secret.is_some() && !private {
-            return Err("ERR refused open: secret= names the columns of a private grid\n".into());
+            return Err(InstallFailure::Reply(
+                "ERR refused open: secret= names the columns of a private grid\n".into(),
+            ));
         }
         let access = if kind == AppKind::Editor && !read_only {
             GrantAccess::ReadWrite
         } else {
             GrantAccess::ReadOnly
         };
-        let granted = self
-            .native_documents
-            .grants
-            .grant_admitted(admitted, access)
-            .map_err(|error| format!("document open failed: {error}"))?;
-        let mut recovery_notice = None;
-        let document = if let Some(document) = existing {
+        let synchronous_directory_refresh =
+            existing.is_some() && matches!(&opening, DocumentOpening::Admitted(_));
+        let (granted, prepared_document, mut recovery_notice) = match opening {
+            DocumentOpening::Admitted(admitted) => {
+                let mut granted = self
+                    .native_documents
+                    .grants
+                    .grant_admitted(admitted, access)
+                    .map_err(InstallFailure::Refused)?;
+                *opened = Some(OpenedGrant {
+                    id: granted.grant.id,
+                    prior: granted.prior.take(),
+                });
+                (granted, None, None)
+            }
+            DocumentOpening::Prepared(prepared) => {
+                if self
+                    .document_store
+                    .id_for_uri(&prepared.granted.grant.canonical_uri)
+                    != Some(prepared.document)
+                {
+                    return Err("prepared document ownership changed before installation".into());
+                }
+                (
+                    prepared.granted,
+                    Some(prepared.document),
+                    prepared.recovery_notice,
+                )
+            }
+        };
+        // Only a document this install opens is this install's to remove again.
+        let opens_document = prepared_document.or(existing).is_none();
+        let document = if let Some(document) = prepared_document.or(existing) {
             document
         } else if crate::native_document_journal::private_uri(&granted.grant.canonical_uri) {
             // A private edit's document keeps no draft journal: nothing it holds reaches the
             // drafts folder, and what an earlier open left there goes before the buffer opens.
             let document = self
                 .document_store
-                .open(granted.grant.canonical_uri.clone(), granted.text.clone());
+                .open_prepared(
+                    granted.grant.canonical_uri.clone(),
+                    granted.prepared_text.clone(),
+                )
+                .map_err(|error| format!("document preparation: {error:?}"))?;
             if let Some(journals) = self.native_documents.journals.as_mut()
                 && let Err(error) = journals.decline(document, &granted.grant.canonical_uri)
             {
                 let _ = self.document_store.remove_if_unattached(document);
-                return Err(format!(
-                    "a private document's earlier draft could not be removed: {error}"
-                ));
+                return Err(InstallFailure::Failed(format!(
+                    "a private document's earlier draft could not be removed: {}",
+                    journal_words(journals, &error)
+                )));
             }
             document
         } else {
-            let decision = self
-                .native_documents
-                .journals
-                .as_ref()
-                .ok_or_else(|| {
-                    self.native_documents
-                        .journals
-                        .unavailable()
-                        .unwrap_or("document recovery is unavailable")
-                        .to_string()
-                })?
-                .inspect_open(&granted.grant.canonical_uri, granted.text.as_bytes())?;
+            let journals = self.native_documents.journals.as_ref().ok_or_else(|| {
+                self.native_documents
+                    .journals
+                    .unavailable()
+                    .unwrap_or("document recovery is unavailable")
+                    .to_string()
+            })?;
+            let decision = journals
+                .inspect_open(&granted.grant.canonical_uri, granted.text.as_bytes())
+                .map_err(|error| journal_words(journals, &error))?;
+            #[cfg(test)]
+            self.change_draft_under_open_for_test(&granted.grant.canonical_uri);
             let recovered = decision.recovered_text.clone();
             let mut drafted = false;
             let document = self
                 .document_store
-                .open(granted.grant.canonical_uri.clone(), granted.text.clone());
+                .open_prepared(
+                    granted.grant.canonical_uri.clone(),
+                    granted.prepared_text.clone(),
+                )
+                .map_err(|error| format!("document preparation: {error:?}"))?;
             let disk_snapshot = self
                 .document_store
                 .snapshot(document)
                 .ok_or_else(|| "new document baseline disappeared".to_string())?;
             if let Some(recovered) = recovered
-                && recovered.as_str() != disk_snapshot.text.as_ref()
+                && recovered.as_ref() != disk_snapshot.text.as_ref()
             {
                 // A labelled frame, and the floor of the buffer's undo: C-/
                 // stops at it (`RECOVERED_FLOOR`), so the draft never goes
@@ -5671,7 +7510,7 @@ impl App {
                 );
                 if outcome.is_err() {
                     let _ = self.document_store.remove_if_unattached(document);
-                    return Err("recovered draft could not be installed atomically".to_string());
+                    return Err("recovered draft could not be installed atomically".into());
                 }
                 drafted = true;
             }
@@ -5679,17 +7518,17 @@ impl App {
                 .document_store
                 .snapshot(document)
                 .ok_or_else(|| "recovered document disappeared".to_string())?;
-            let initialized = self
+            let journals = self
                 .native_documents
                 .journals
                 .as_mut()
-                .expect("journal availability checked before opening")
-                .initialize(decision, &disk_snapshot, &current);
-            let initialized = match initialized {
+                .expect("journal availability checked before opening");
+            let initialized = match journals.initialize(decision, &disk_snapshot, &current) {
                 Ok(initialized) => initialized,
-                Err(error) => {
+                Err(fault) => {
+                    let failure = journal_failure(Some(journals), fault);
                     let _ = self.document_store.remove_if_unattached(document);
-                    return Err(format!("document recovery initialization failed: {error}"));
+                    return Err(failure);
                 }
             };
             recovery_notice = initialized.notice;
@@ -5702,9 +7541,9 @@ impl App {
         };
         if read_only && let Err(error) = self.document_store.set_read_only(document) {
             let _ = self.document_store.remove_if_unattached(document);
-            return Err(format!(
+            return Err(InstallFailure::Failed(format!(
                 "the read-only document could not be marked: {error:?}"
-            ));
+            )));
         }
         // Concealed for the document's life: an earlier open's concealment stands.
         if private
@@ -5717,23 +7556,42 @@ impl App {
             )
         {
             let _ = self.document_store.remove_if_unattached(document);
-            return Err(format!(
+            return Err(InstallFailure::Failed(format!(
                 "the private document could not be concealed: {error:?}"
-            ));
+            )));
         }
-        if let Some(listing) = granted.directory.clone() {
+        if synchronous_directory_refresh && granted.is_directory() {
+            let listing = granted
+                .prepared_text
+                .take_directory_for_refresh()
+                .ok_or("directory preparation was already consumed")?;
             self.replace_directory_listing(document, listing)?;
         }
-        self.native_documents
+        if let Err(error) = self
+            .native_documents
             .persistence
-            .register(document, granted.grant.id, granted.observed, &granted.text)
-            .map_err(|error| format!("document persistence failed: {error:?}"))?;
-        if granted.directory.is_none() {
+            .register_prepared(document, &granted)
+        {
+            if opens_document {
+                let _ = self.document_store.remove_if_unattached(document);
+            }
+            return Err(InstallFailure::Failed(format!(
+                "document persistence failed: {error:?}"
+            )));
+        }
+        if !granted.is_directory() {
             self.watch_document_file(document);
         }
-        if existing.is_some() && granted.directory.is_none() {
+        if prepared_document.is_none()
+            && existing.is_some()
+            && !granted.is_directory()
+            && !target.detached()
+        {
             let _ = self.refresh_native_document(document)?;
         }
+        // A detached restore shares the current canonical buffer, including edits made
+        // while its worker read the file. Its file watcher owns subsequent observations;
+        // staging another view neither rereads disk nor replays an older admission over it.
 
         if placement == Placement::FocusOrNewTab
             && let Some((tab, view)) = self.document_view_in_window(wid, kind, document)
@@ -5807,7 +7665,7 @@ impl App {
         }
         let state = AppViewState::Editor(Box::new(state));
         let install = if let Some(instance) = instance {
-            self.install_native_tab_keeping(wid, instance, state, presentation, keep)
+            self.install_native_tab_keeping(target, instance, state, presentation, keep)
                 .map(|(tab, view)| (instance, tab, view))
         } else {
             let mut editor =
@@ -5815,16 +7673,18 @@ impl App {
             editor.concealed = self.document_store.concealed(document).cloned();
             editor.read_only = self.document_store.read_only(document);
             let app = NativeApp::Editor(Box::new(editor));
-            self.install_new_native_tab_keeping(wid, app, state, presentation, keep)
+            self.install_new_native_tab_keeping(target, app, state, presentation, keep)
         };
         let (instance, tab, view) = install.map_err(|error| {
             aterm_log::warn!("could not install native document tab: {error:?}");
             "This document could not be reopened".to_string()
         })?;
 
-        if let Err(error) = self.attach_document_view(kind, document, view) {
-            self.rollback_document_tab(wid, tab);
-            return Err(error);
+        if let Err(error) =
+            self.attach_document_view_with_visibility(kind, document, view, target.detached())
+        {
+            self.rollback_document_tab(target, tab);
+            return Err(InstallFailure::Failed(error));
         }
         // Seed derived readers from the canonical buffer before the first paint or
         // semantic action. It may already contain a recovered or unsaved draft.
@@ -5869,13 +7729,15 @@ impl App {
             document,
             self.native_documents.disk_conflicts.contains_key(&document),
         );
-        self.refresh_disambiguated_document_titles();
-        self.refresh_native_presentation(wid, instance, view);
-        if let Placement::NewTabAfter { ticket } = placement {
-            self.place_admitted_view(wid, tab, ticket);
-        } else {
-            self.resync_active_or_window(wid);
-            self.request_native_redraw(wid);
+        if !target.detached() {
+            self.refresh_disambiguated_document_titles();
+            self.refresh_native_presentation(wid, instance, view);
+            if let Placement::NewTabAfter { ticket } = placement {
+                self.place_admitted_view(wid, tab, ticket);
+            } else {
+                self.resync_active_or_window(wid);
+                self.request_native_redraw(wid);
+            }
         }
         Ok(InstalledDocument {
             kind,
@@ -5919,19 +7781,33 @@ impl App {
             })
     }
 
-    pub(crate) fn attach_document_view(
+    pub(crate) fn attach_document_view_with_visibility(
         &mut self,
         kind: AppKind,
         document: DocumentId,
         view: crate::tab_model::ViewId,
+        unpublished: bool,
     ) -> Result<(), String> {
+        if !self.document_preparation_allows_attach(document) {
+            return Err("document journal preparation has not completed".into());
+        }
         let document_view = DocumentViewId(view.get());
         match kind {
             AppKind::Editor => {
-                let buffer = self
-                    .editor_workspace
-                    .attach(&mut self.document_store, document, document_view)
-                    .map_err(|error| format!("could not attach editor view: {error:?}"))?;
+                let buffer = if unpublished {
+                    let (buffer, attachment) = self
+                        .editor_workspace
+                        .attach_unpublished(&mut self.document_store, document, document_view)
+                        .map_err(|error| format!("could not attach editor view: {error:?}"))?;
+                    self.native_documents
+                        .unpublished_attachments
+                        .insert(view, attachment);
+                    buffer
+                } else {
+                    self.editor_workspace
+                        .attach(&mut self.document_store, document, document_view)
+                        .map_err(|error| format!("could not attach editor view: {error:?}"))?
+                };
                 let mut buffer = buffer;
                 // A table opens as a grid; one too large for it stays text and says why.
                 let delimiter = self
@@ -5973,15 +7849,194 @@ impl App {
         }
     }
 
-    fn rollback_document_tab(&mut self, wid: WindowId, tab: crate::tab_model::TabId) {
-        let removed = self
-            .windows
-            .get_mut(&wid)
-            .and_then(|ws| ws.tab_set.remove(tab));
+    pub(crate) fn rollback_document_tab(
+        &mut self,
+        target: impl Into<crate::app_tabs::NativeInstallTarget>,
+        tab: crate::tab_model::TabId,
+    ) {
+        let target = target.into();
+        let wid = target.window();
+        if target.detached()
+            && let Some(tab) = self
+                .restore_leaf_staging
+                .as_ref()
+                .filter(|staging| staging.wid == wid)
+                .and_then(|staging| staging.tab.as_ref())
+                .filter(|held| held.id == tab)
+            && let Err(error) = self.validate_restore_document_rollback(tab)
+        {
+            aterm_log::warn!("refused document staging rollback: {error}");
+            return;
+        }
+        let removed = if target.detached() {
+            self.restore_leaf_staging
+                .as_mut()
+                .filter(|staging| staging.wid == wid)
+                .and_then(|staging| {
+                    staging.tab.as_ref().filter(|held| held.id == tab)?;
+                    staging.tab.take()
+                })
+        } else {
+            self.windows
+                .get_mut(&wid)
+                .and_then(|ws| ws.tab_set.remove(tab))
+        };
         if let Some(tab) = removed {
+            if target.detached() {
+                tab.root.visit(&mut |view| {
+                    self.rollback_restore_document_view(*view)
+                        .expect("exclusive borrow preserves rollback preflight");
+                });
+            }
             self.remove_tab_views(&tab);
         }
-        self.resync_active_or_window(wid);
+        if !target.detached() {
+            self.resync_active_or_window(wid);
+        }
+    }
+
+    pub(crate) fn validate_restore_document_rollback(
+        &self,
+        tab: &crate::tab_model::Tab,
+    ) -> Result<(), String> {
+        let mut result = Ok(());
+        tab.root.visit(&mut |view| {
+            if result.is_ok() {
+                result = self.validate_restore_view_rollback(*view);
+            }
+        });
+        result
+    }
+
+    pub(crate) fn validate_restore_view_rollback(
+        &self,
+        view: crate::tab_model::ViewId,
+    ) -> Result<(), String> {
+        if self.windows.values().any(|window| {
+            window
+                .tab_set
+                .tabs()
+                .iter()
+                .any(|tab| tab.root.contains(view))
+        }) {
+            return Err("document rollback refused a published view".into());
+        }
+        if let Some(attachment) = self.native_documents.unpublished_attachments.get(&view) {
+            if !self.document_store.holds_attachment(attachment) {
+                return Err("document rollback refused a replaced attachment".into());
+            }
+        } else if let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view)
+            && let Some(document) = self.native_runtime.document_id(native.instance)
+            && self
+                .document_store
+                .view_ids(document)
+                .is_some_and(|views| views.contains(&DocumentViewId(view.get())))
+        {
+            return Err("document rollback refused an attachment without custody".into());
+        }
+        Ok(())
+    }
+
+    /// Closed reopen refuses an incomplete or unsettled document instead of consuming
+    /// history with a Recovery placeholder. Every document leaf needs its own live token.
+    pub(crate) fn validate_closed_reopen_documents(
+        &self,
+        tab: &crate::tab_model::Tab,
+    ) -> Result<(), String> {
+        let mut refused = false;
+        tab.root.visit(&mut |view| {
+            if let Some(crate::tab_model::View::Native(native)) = self.view_store.get(*view)
+                && let Some(document) = self.native_runtime.document_id(native.instance)
+            {
+                refused |= !self.document_preparation_allows_attach(document)
+                    || !self
+                        .native_documents
+                        .unpublished_attachments
+                        .get(view)
+                        .is_some_and(|token| self.document_store.holds_attachment(token))
+                    || !self
+                        .document_store
+                        .view_ids(document)
+                        .is_some_and(|views| views.contains(&DocumentViewId(view.get())));
+            }
+        });
+        if refused {
+            Err("closed reopen document is incomplete or its preparation is unsettled".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Commit staged document edges only after every token still proves exclusive custody.
+    pub(crate) fn publish_restore_document_views(
+        &mut self,
+        tab: &crate::tab_model::Tab,
+    ) -> Result<(), String> {
+        let mut views = Vec::new();
+        tab.root.visit(&mut |view| {
+            if self
+                .native_documents
+                .unpublished_attachments
+                .contains_key(view)
+            {
+                views.push(*view);
+            }
+        });
+        if views.iter().any(|view| {
+            !self
+                .document_store
+                .holds_attachment(&self.native_documents.unpublished_attachments[view])
+        }) {
+            return Err("restored document attachment lost unpublished custody".into());
+        }
+        for view in views {
+            if let Some(crate::tab_model::View::Native(native)) = self.view_store.get(view)
+                && let Some(document) = self.native_runtime.document_id(native.instance)
+            {
+                self.mark_document_preparation_published(document);
+            }
+            let attachment = self
+                .native_documents
+                .unpublished_attachments
+                .remove(&view)
+                .expect("preflighted attachment");
+            self.document_store
+                .publish_attachment(attachment)
+                .expect("exclusive borrow preserves preflighted custody");
+            self.native_documents.unpublished_preparations.remove(&view);
+        }
+        Ok(())
+    }
+
+    /// Remove only a document edge whose unconsumed staging token still belongs here.
+    pub(crate) fn rollback_restore_document_view(
+        &mut self,
+        view: crate::tab_model::ViewId,
+    ) -> Result<bool, String> {
+        let Some(attachment) = self.native_documents.unpublished_attachments.get(&view) else {
+            return Ok(false);
+        };
+        if !self.document_store.holds_attachment(attachment)
+            || self.windows.values().any(|window| {
+                window
+                    .tab_set
+                    .tabs()
+                    .iter()
+                    .any(|tab| tab.root.contains(view))
+            })
+        {
+            return Err("document rollback refused a published or replaced attachment".into());
+        }
+        let attachment = self
+            .native_documents
+            .unpublished_attachments
+            .remove(&view)
+            .expect("checked attachment");
+        self.document_store
+            .rollback_attachment(attachment)
+            .map_err(|error| format!("could not roll back unpublished document: {error:?}"))?;
+        self.native_documents.unpublished_preparations.remove(&view);
+        Ok(true)
     }
 
     pub(crate) fn request_native_redraw(&mut self, wid: WindowId) {
@@ -5992,6 +8047,13 @@ impl App {
             window.request_redraw();
         }
     }
+}
+
+/// The file `uri` names as a failed open's page shows it: its path, or the URI itself when it
+/// names none.
+fn shown_path(uri: &str) -> String {
+    crate::native_document_host::file_uri_path(uri)
+        .map_or_else(|_| uri.to_string(), |path| path.display().to_string())
 }
 
 fn refused_config_read(

@@ -100,6 +100,8 @@ pub mod mesh_offer;
 /// Bounded, value-free release preparation observations over authenticated control.
 #[cfg(unix)]
 pub mod operational;
+/// The vault's entries, read in place from this Mac's store: the one read of a vault value here.
+pub mod vault_entry;
 /// `vault-join`: a Mac whose vault key changed proves itself to a member over the fleet.
 #[cfg(unix)]
 pub mod vault_join;
@@ -228,6 +230,15 @@ fn is_ok_reply(header: &str) -> bool {
     header == "OK" || header.starts_with("OK ")
 }
 
+/// The tab named by a successful spawn reply's header, before optional metadata.
+/// The shared tab-ID grammar decides which spellings are valid.
+#[must_use]
+pub fn spawned_tab_id(reply: &str) -> Option<aterm_types::tab_id::TabId> {
+    let header = reply.lines().next()?;
+    let token = header.strip_prefix("OK ")?.split_whitespace().next()?;
+    aterm_types::tab_id::TabId::parse(token)
+}
+
 pub(crate) fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
     let Some(token) = header
         .strip_prefix("OK ")
@@ -252,12 +263,8 @@ pub(crate) fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
     }
 }
 
-#[inline]
-pub(crate) fn parse_uint<T: std::str::FromStr>(s: &str) -> Option<T> {
-    (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| s.parse().ok())
-        .flatten()
-}
+/// [`alab_policy::text::parse_uint`]: the one digits-only parse, the open-work reader's too.
+pub(crate) use alab_policy::text::parse_uint;
 
 #[inline]
 pub(crate) fn parse_int<T: std::str::FromStr>(s: &str) -> Option<T> {

@@ -2919,7 +2919,7 @@ fn a_page_held_open_across_midnight_names_the_faces_day_from_then_on() {
     app.harness = Some(host.clone());
     assert!(app.set_session_autopilot(
         0,
-        Some(aterm_agent::supervise::Autopilot::Land),
+        Some(alab_policy::config::Autopilot::Land),
         crate::autopilot::Surface::Chip
     ));
     let fri = 1_792_177_200_i64;

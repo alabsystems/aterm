@@ -208,7 +208,7 @@ fn scan(
             open,
             closed: t.screen_is_closed_frame(),
             row: rows[zone..].iter().any(|r| busy.is_match(r)),
-            held: runs == Some(true) && reading.phase == aterm_phase::phase::Phase::Busy,
+            held: runs == Some(true) && reading.phase == alab_policy::vocab::Phase::Busy,
             torn: reader.frame_torn(&rows),
             phase: reading.phase.name().to_string(),
             composer: reading.composer.is_some(),

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify land`'s rules over scratch repositories with a bare origin: the inheritance rule, the
-//! compose rule and its re-judge, and the stated receipt, each beside the control that shows
-//! the rule bites.
+//! `verify land`'s rules over scratch repositories with a bare origin: the compose rule and its
+//! re-judge, and the stated receipt, each beside the control that shows the rule bites.
 
 use super::*;
 use aterm_types::land_trailer::{Interrupted, KEYS};
@@ -27,6 +26,152 @@ mod skew;
 
 #[path = "land_resolve_tests.rs"]
 mod resolving;
+#[path = "land_records_tests.rs"]
+mod verdicts;
+
+/// A clone's spool in memory, for the scripted landings: a verdict FAIL already kept at its path
+/// is kept as it was, as [`crate::land_spool::Dir`] keeps it.
+#[derive(Default)]
+struct Memory(RefCell<std::collections::BTreeMap<String, crate::land_record::Signed>>);
+
+impl crate::land_spool::Spool for Memory {
+    fn put(&self, record: &crate::land_record::Signed) -> Result<(), String> {
+        let (_, _, fail) = crate::land_spool::kept_as(&record.path, 0)?;
+        let mut kept = self.0.borrow_mut();
+        if !(fail && kept.contains_key(&record.path)) {
+            kept.insert(record.path.clone(), record.clone());
+        }
+        Ok(())
+    }
+
+    fn pending(&self) -> Result<crate::land_spool::Pending, String> {
+        Ok(crate::land_spool::Pending {
+            records: self.0.borrow().values().cloned().collect(),
+            unreadable: Vec::new(),
+        })
+    }
+
+    fn done(&self, record: &crate::land_record::Signed) -> Result<(), String> {
+        let mut kept = self.0.borrow_mut();
+        if kept
+            .get(&record.path)
+            .is_some_and(|held| held.bytes == record.bytes)
+        {
+            kept.remove(&record.path);
+        }
+        Ok(())
+    }
+}
+
+thread_local! {
+    /// Each run record the [`quiet`] landings of this test's thread kept, by path.
+    static QUIET: RefCell<std::collections::BTreeMap<String, crate::land_record::Signed>> =
+        RefCell::default();
+    /// How many [`quiet`] runs this test's thread began: each its own id.
+    static QUIET_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// [`Memory`], each run record it keeps also kept for [`quietly`] to read back.
+#[derive(Default)]
+struct Observed(Memory);
+
+impl crate::land_spool::Spool for Observed {
+    fn put(&self, record: &crate::land_record::Signed) -> Result<(), String> {
+        if record.path.starts_with(crate::land_run::DIR) {
+            QUIET.with(|kept| {
+                kept.borrow_mut()
+                    .insert(record.path.clone(), record.clone())
+            });
+        }
+        self.0.put(record)
+    }
+
+    fn pending(&self) -> Result<crate::land_spool::Pending, String> {
+        self.0.pending()
+    }
+
+    fn done(&self, record: &crate::land_record::Signed) -> Result<(), String> {
+        self.0.done(record)
+    }
+}
+
+/// The records of a scripted landing that keeps none: every append holds nothing and says so by
+/// succeeding, the spool is [`Memory`] (each run record also kept for [`quietly`]), nothing is
+/// signed, the clock stands at [`crate::land_record::tests::NOW`], no interrupt comes, and each
+/// run of the thread has its own id.
+fn quiet() -> Records<'static> {
+    let n = QUIET_RUNS.with(|runs| {
+        runs.set(runs.get() + 1);
+        runs.get()
+    });
+    Records {
+        append: Box::new(|_: &Path, _: &[crate::land_record::Signed], _: u64| Ok(())),
+        spool: Box::new(Observed::default()),
+        signer: None,
+        host: "scripted".to_owned(),
+        now: Box::new(|| crate::land_record::tests::NOW),
+        run: crate::land_run::Run {
+            id: format!("{n:032x}"),
+            ..crate::land_run::tests::run()
+        },
+        interrupt: Box::new(|| None),
+        tally: records::Tally::default(),
+    }
+}
+
+/// `steps` as [`told`] gives them.
+fn steps(steps: &[(&str, &str, &str)]) -> Vec<Told> {
+    steps
+        .iter()
+        .map(|(kind, result, cause)| {
+            (
+                (*kind).to_owned(),
+                (*result).to_owned(),
+                (*cause).to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// A run [`quietly`] reads: its `steps` and its landing's `kind`, not resumed.
+fn landed(steps: &[(&str, &str, &str)], kind: &str) -> Quiet {
+    (self::steps(steps), Some((kind.to_owned(), false)))
+}
+
+/// One run [`quietly`] reads: its records in order, as its steps ([`told`]), and its landing's
+/// kind and whether it resumed a kept judgment, where it landed.
+type Quiet = (Vec<Told>, Option<(String, bool)>);
+
+/// What the [`quiet`] runs of this test's thread recorded, run by run in the order they began.
+fn quietly() -> Vec<Quiet> {
+    let mut runs: std::collections::BTreeMap<String, Vec<crate::land_run::Record>> =
+        std::collections::BTreeMap::new();
+    QUIET.with(|kept| {
+        for signed in kept.borrow().values() {
+            let entry = crate::land_run::Entry::read(
+                &signed.path,
+                &signed.bytes,
+                crate::land_record::Origin::Spool,
+            );
+            let record = entry.body.expect("a quiet run record reads").record;
+            runs.entry(record.run.id.clone()).or_default().push(record);
+        }
+    });
+    runs.into_values()
+        .map(|mut records| {
+            records.sort_by_key(|record| record.seq);
+            let landing = ends(&records).first().and_then(|end| {
+                end.landing
+                    .as_ref()
+                    .map(|landing| (landing.kind.clone(), landing.resumed))
+            });
+            (told(&records), landing)
+        })
+        .collect()
+}
+
+#[path = "land_issues_tests.rs"]
+mod open_issues;
 
 /// This image's digest in the scripted landings, whose every checkout's verifier is this image,
 /// so nothing hands over.
@@ -378,14 +523,29 @@ fn resource_controls_cannot_replace_the_landing_check_scope() {
         ]
     );
     let words = &words[if cfg!(unix) { 4 } else { 0 }..];
+    // Every judgment of one landing names the landing's own start as when its work was queued,
+    // so a re-judge keeps the landing's place in the judgment turn's queue.
+    let since = words
+        .iter()
+        .position(|word| word == crate::cli::QUEUED_SINCE)
+        .map(|at| words[at + 1].clone())
+        .expect("a judgment names when its landing was queued");
+    let since_ms: u64 = since.parse().expect("unix ms");
+    assert!(
+        since_ms > 0 && since_ms <= aterm_time::unix_millis().unwrap(),
+        "{since_ms}"
+    );
     let expected: Vec<String> = [
         "--base",
         "main-sha",
         "--events",
         "/events",
+        crate::cli::EVENTS_FILE_ONLY,
         "--admit",
         "now",
-        crate::cli::INPUT_DRIFT,
+        crate::cli::QUEUED_SINCE,
+        &since,
+        "--fail-fast",
         "--timeout",
         "off",
         "--test-cores",
@@ -395,6 +555,12 @@ fn resource_controls_cannot_replace_the_landing_check_scope() {
     .map(str::to_owned)
     .collect();
     assert_eq!(words, expected);
+    // A judgment stops at its first red, and keeps its events in its events file alone.
+    let parsed = crate::cli::parse(words).expect("the judgment's command parses");
+    assert!(parsed.fail_fast && parsed.events_file_only);
+    // The round comes later in the landing than its judgment: a stamp of now would not keep the
+    // judgment's place.
+    std::thread::sleep(std::time::Duration::from_millis(2));
     // A round runs the dev set as a judgment does, since the tip it merged, and names the judged
     // commit and the file of its shared paths: the child selects its crates from those alone.
     let cmd = judgment_command(
@@ -404,6 +570,7 @@ fn resource_controls_cannot_replace_the_landing_check_scope() {
         Some(Round {
             judged: "judged-sha",
             shared: Path::new("/shared"),
+            readers: None,
             mechanical: true,
         }),
         Path::new("/events"),
@@ -431,17 +598,27 @@ fn resource_controls_cannot_replace_the_landing_check_scope() {
             "/shared",
             "--events",
             "/events",
+            crate::cli::EVENTS_FILE_ONLY,
             "--admit",
             "wait",
-            crate::cli::INPUT_DRIFT,
+            crate::cli::QUEUED_SINCE,
+            &since,
+            "--fail-fast",
         ]
     );
     let parsed = crate::cli::parse(words).expect("the round's command parses");
+    // A round stops at its first red, as a judgment does.
+    assert!(parsed.fail_fast && parsed.events_file_only);
+    assert_eq!(
+        parsed.queued_since,
+        Some(since_ms),
+        "the round keeps the judgment's place"
+    );
     assert_eq!(
         parsed.checks,
         crate::cli::parse(["--base", "tip-sha"]).unwrap().checks
     );
-    assert!(parsed.checks.contains(&crate::checks::Check::Test) && parsed.input_drift);
+    assert!(parsed.checks.contains(&crate::checks::Check::Test));
     assert_eq!(
         (
             parsed.base.as_deref(),
@@ -465,6 +642,7 @@ fn resource_controls_cannot_replace_the_landing_check_scope() {
         Some(Round {
             judged: "judged-sha",
             shared: Path::new("/shared"),
+            readers: None,
             mechanical: false,
         }),
         Path::new("/events"),
@@ -496,6 +674,102 @@ fn resource_controls_cannot_replace_the_landing_check_scope() {
     assert_eq!(by_hand[7..], words[6..]);
     assert!(!words.iter().any(|word| word == crate::cli::BY_HAND));
     assert!(crate::cli::parse(by_hand).expect("it parses").by_hand);
+    // The round of a merge whose shared Markdown a file may read names the file of those
+    // readers, after its shared paths: the child judges their crates too. NEGATIVE CONTROL:
+    // the first round above, which no file reads, names none.
+    let cmd = judgment_command(
+        Path::new("/verifier"),
+        Path::new("/checkout"),
+        "tip-sha",
+        Some(Round {
+            judged: "judged-sha",
+            shared: Path::new("/shared"),
+            readers: Some(Path::new("/readers")),
+            mechanical: true,
+        }),
+        Path::new("/events"),
+        &LandResources {
+            admit: aterm_capacity::Admit::Wait,
+            timeout: None,
+            test_cores: None,
+        },
+        &crate::EnvSnapshot::default(),
+    )
+    .unwrap();
+    let reading: Vec<_> = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let reading = &reading[if cfg!(unix) { 4 } else { 0 }..];
+    assert_eq!(reading[..6], words[..6]);
+    assert_eq!(reading[6..8], [crate::cli::READERS, "/readers"]);
+    assert_eq!(reading[8..], words[6..]);
+    assert!(!words.iter().any(|word| word == crate::cli::READERS));
+    assert_eq!(
+        crate::cli::parse(reading).expect("it parses").readers,
+        Some(PathBuf::from("/readers"))
+    );
+}
+
+/// A ROUND'S DELTA REACHES ITS CHILD WHOLE: the files [`round_files`] writes, named by the words
+/// [`judgment_command`] gives the child, are read back by the child ([`crate::round_of`]) as
+/// the round the delta is: its judged commit, its shared paths, the files that may read its
+/// shared Markdown, and whether Git made the merge. NEGATIVE CONTROL: a delta no file may read
+/// writes no readers file and names none, and the child reads no reader.
+#[test]
+fn a_rounds_delta_reaches_its_child_as_the_round_it_names() {
+    let reading = vec![
+        "crates/b/tests/rows.rs".to_owned(),
+        "crates/c/src/lib.rs".to_owned(),
+    ];
+    for readers in [reading, Vec::new()] {
+        let delta = Delta {
+            judged: "judged-sha".to_owned(),
+            shared: vec!["crates/b/SPECS.md".to_owned(), "docs/X.md".to_owned()],
+            readers: readers.clone(),
+            mechanical: true,
+        };
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let (shared, read) = round_files(dir.path(), &delta).expect("the round's files");
+        assert_eq!(read.is_some(), !readers.is_empty(), "{readers:?}");
+        let cmd = judgment_command(
+            Path::new("/verifier"),
+            Path::new("/checkout"),
+            "tip-sha",
+            Some(Round {
+                judged: &delta.judged,
+                shared: &shared,
+                readers: read.as_deref(),
+                mechanical: delta.mechanical,
+            }),
+            Path::new("/events"),
+            &LandResources {
+                admit: aterm_capacity::Admit::Wait,
+                timeout: None,
+                test_cores: None,
+            },
+            &crate::EnvSnapshot::default(),
+        )
+        .unwrap();
+        let words: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let words = &words[if cfg!(unix) { 4 } else { 0 }..];
+        let parsed = crate::cli::parse(words).expect("the round's words parse");
+        let round = crate::round_of(&parsed, dir.path())
+            .expect("the round's files read")
+            .expect("a round");
+        assert_eq!(
+            round,
+            crate::changed::Round {
+                judged: delta.judged.clone(),
+                shared: delta.shared.clone(),
+                readers,
+                mechanical: true,
+            }
+        );
+    }
 }
 
 fn git_cmd(dir: &Path) -> Command {
@@ -636,8 +910,7 @@ fn row(check: &str, word: &str) -> CheckRow {
     CheckRow {
         check: check.into(),
         word: word.into(),
-        findings: Vec::new(),
-        findings_total: 0,
+        ..CheckRow::default()
     }
 }
 
@@ -647,7 +920,26 @@ fn red(check: &str, ids: &[&str]) -> CheckRow {
         word: "FAIL".into(),
         findings: ids.iter().map(|id| (*id).to_owned()).collect(),
         findings_total: ids.len(),
+        ..CheckRow::default()
     }
+}
+
+/// A check the run's first red stopped: NOT RUN, by the halt ([`CheckRow::stopped`]).
+fn stopped(check: &str) -> CheckRow {
+    CheckRow {
+        stopped: true,
+        ..row(check, "NOT RUN")
+    }
+}
+
+/// Where a landing's closing verdict ([`verdict`]) begins in what it said: the lines before it,
+/// and the verdict.
+fn split_verdict(said: &[String]) -> (&[String], &[String]) {
+    let at = said
+        .iter()
+        .position(|line| line.starts_with("verify land: VERDICT"))
+        .unwrap_or(said.len());
+    said.split_at(at)
 }
 
 /// A run of `checks` that exited `code` in `secs`, its record whole: its `run-finished` event
@@ -665,6 +957,7 @@ fn ran(code: i32, checks: Vec<CheckRow>, secs: u64) -> Judged {
         checks,
         secs,
         finished: Some(finished),
+        ..Judged::default()
     }
 }
 
@@ -678,87 +971,14 @@ fn green() -> Judged {
 
 const THEIRS: &str = "-p b --lib -- old_red";
 
-#[test]
-fn landing_reads_the_watch_journal_for_its_exact_base_tree() {
-    for state in ["red", "pass"] {
-        let world = world();
-        let base = git(&world.work, &["rev-parse", "origin/main"]);
-        let tree = git(&world.work, &["rev-parse", "origin/main^{tree}"]);
-        git(&world.work, &["config", "user.name", "Andrew Yates"]);
-        git(
-            &world.work,
-            &["config", "user.email", "test@example.invalid"],
-        );
-        assert!(matches!(live_lane(&world.work, &base), Lane::Unjudged(_)));
-        let record = crate::judged::Record {
-            commit: base.clone(),
-            tree,
-            host: "scratch-lane".into(),
-            verifier: base.clone(),
-            controller: String::new(),
-            inputs: "fixture-seal".into(),
-            token: "fixture".into(),
-            state: state.into(),
-            cause: String::new(),
-            started: 1,
-            updated: 2,
-            lease_until: 0,
-            rows: vec![crate::judged::Row {
-                id: "tree".into(),
-                outcome: state.into(),
-                log: String::new(),
-                red_items: if state == "red" {
-                    vec![THEIRS.into()]
-                } else {
-                    vec![]
-                },
-                suspects: vec![],
-                fixed_by: None,
-                decisions: vec![],
-            }],
-        };
-        assert!(
-            crate::judged::append(
-                &world.work,
-                "origin",
-                None,
-                &record,
-                crate::judged::deadline()
-            )
-            .unwrap()
-        );
-        commit(&world.work, "a/x.txt", "branch work\n");
-        // This new tree has no verdict: a mutation that uses HEAD rather than base fails.
-        let head = git(&world.work, &["rev-parse", "HEAD"]);
-        assert!(matches!(live_lane(&world.work, &head), Lane::Unjudged(_)));
-        let lane = live_lane(&world.work, &base);
-        assert!(match (&lane, state) {
-            (Lane::Red(items), "red") => items.contains(THEIRS),
-            (Lane::Pass, "pass") => true,
-            _ => false,
-        });
-        let (code, said, _) = land_with(&world, crates(&["a"]), lane, |_, _| green());
-        assert_eq!(code, 0, "{said:?}");
-        let expected = if state == "pass" {
-            "green"
-        } else {
-            "red (1 items)"
-        };
-        let line = format!("verify land: main's lane judged {base} {expected}");
-        assert!(said.contains(&line), "{said:?}");
-        println!("{line}");
-    }
-}
-
 /// One landing of `world`'s work: the exit, what it said, and each judged base. `judge` sees the
 /// base and how many judgments came before.
 fn land_with(
     world: &World,
-    branch: Branch,
-    lane: Lane,
+    branch: Reach,
     mut judge: impl FnMut(&str, usize) -> Judged,
 ) -> (i32, Vec<String>, Vec<String>) {
-    land_watching(world, branch, lane, |base, n, _| Ran::Ended(judge(base, n)))
+    land_watching(world, branch, |base, n, _| Ran::Ended(judge(base, n)))
 }
 
 /// [`land_with`], whose `judge` also gets the running judgment's poll of main: a call stands
@@ -766,11 +986,10 @@ fn land_with(
 /// ([`Ran::Ended`]) or a `true` interrupted it ([`Ran::Interrupted`]).
 fn land_watching(
     world: &World,
-    branch: Branch,
-    lane: Lane,
+    branch: Reach,
     judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
 ) -> (i32, Vec<String>, Vec<String>) {
-    land_through(world, &git_cmd, branch, lane, judge)
+    land_through(world, &git_cmd, branch, judge)
 }
 
 /// [`land_watching`] through the git seam `git`. A recheck fails the test: these worlds share
@@ -778,11 +997,10 @@ fn land_watching(
 fn land_through(
     world: &World,
     git: &dyn Fn(&Path) -> Command,
-    branch: Branch,
-    lane: Lane,
+    branch: Reach,
     judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
 ) -> (i32, Vec<String>, Vec<String>) {
-    let (code, said, bases, _) = land_rechecking(world, git, branch, lane, judge, |base| {
+    let (code, said, bases, _) = land_rechecking(world, git, branch, judge, |base| {
         panic!("no recheck was expected (base {base})")
     });
     (code, said, bases)
@@ -796,13 +1014,11 @@ type Landed = (i32, Vec<String>, Vec<String>, Vec<(String, String)>);
 const WHOLE: &str = "the scripted reach of a shared path";
 
 /// The reach of a scripted landing whose shared paths reach every crate, so a main that moves
-/// into a file a crate may own dooms the judgment, and the branch's own reach is `branch`'s
-/// crates.
-fn whole_reach(branch: &Branch) -> impl Fn(Option<&[String]>) -> Reach + '_ {
-    move |paths| match (paths, branch) {
-        (Some(_), _) => Reach::Everything(WHOLE.into()),
-        (None, Branch::Crates(crates)) => Reach::Crates(crates.clone()),
-        (None, Branch::Everything(why)) => Reach::Everything(why.clone()),
+/// into a file a crate may own dooms the judgment, and the branch's own reach is `branch`.
+fn whole_reach(branch: &Reach) -> impl Fn(Option<&[String]>) -> Reach + '_ {
+    move |paths| match paths {
+        Some(_) => Reach::Everything(WHOLE.into()),
+        None => branch.clone(),
     }
 }
 
@@ -817,8 +1033,7 @@ fn reaches(names: &[&str]) -> Reach {
 fn land_rechecking(
     world: &World,
     git: &dyn Fn(&Path) -> Command,
-    branch: Branch,
-    lane: Lane,
+    branch: Reach,
     judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
     recheck: impl FnMut(&str) -> Judged,
 ) -> Landed {
@@ -828,7 +1043,6 @@ fn land_rechecking(
         &crate::remote::run,
         &no_retry,
         branch,
-        lane,
         judge,
         recheck,
     )
@@ -840,32 +1054,19 @@ fn no_retry(pause: Duration) {
 }
 
 /// [`land_rechecking`] through the push phase's remote seam `remote` and its `pause`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is one seam of the landing under test"
-)]
 fn land_wired(
     world: &World,
     git: &dyn Fn(&Path) -> Command,
     remote: &RemoteStep<'_>,
     pause: &dyn Fn(Duration),
-    branch: Branch,
-    lane: Lane,
+    branch: Reach,
     judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
     mut recheck: impl FnMut(&str) -> Judged,
 ) -> Landed {
     let reach = whole_reach(&branch);
-    land_seamed(
-        world,
-        git,
-        remote,
-        pause,
-        branch.clone(),
-        lane,
-        &reach,
-        judge,
-        |base, _| recheck(base),
-    )
+    land_seamed(world, git, remote, pause, &reach, judge, |base, _| {
+        recheck(base)
+    })
 }
 
 /// A landing whose shared paths reach what `reach` says (its argument the paths, or `None` for
@@ -873,8 +1074,6 @@ fn land_wired(
 /// and the round's delta.
 fn land_reaching(
     world: &World,
-    branch: Branch,
-    lane: Lane,
     reach: &dyn Fn(Option<&[String]>) -> Reach,
     judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
     recheck: impl FnMut(&str, &Delta) -> Judged,
@@ -884,8 +1083,6 @@ fn land_reaching(
         &git_cmd,
         &crate::remote::run,
         &no_retry,
-        branch,
-        lane,
         reach,
         judge,
         recheck,
@@ -893,17 +1090,11 @@ fn land_reaching(
 }
 
 /// [`land_wired`] with the reach seam `reach` and a `recheck` that sees each round's delta.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is one seam of the landing under test"
-)]
 fn land_seamed(
     world: &World,
     git: &dyn Fn(&Path) -> Command,
     remote: &RemoteStep<'_>,
     pause: &dyn Fn(Duration),
-    branch: Branch,
-    lane: Lane,
     reach: &dyn Fn(Option<&[String]>) -> Reach,
     mut judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
     mut recheck: impl FnMut(&str, &Delta) -> Judged,
@@ -924,8 +1115,7 @@ fn land_seamed(
                 bases.borrow_mut().push(base.to_owned());
                 judge(base, n, poll)
             },
-            branch: &mut |_: &Path, _: &str| branch.clone(),
-            lane: &mut |_: &Path, _: &str| lane.clone(),
+            records: quiet(),
             reach: &|root: &Path, _: &str, paths: Option<&[String]>| {
                 assert_eq!(root, world.work);
                 reach(paths)
@@ -942,8 +1132,15 @@ fn land_seamed(
                 rechecks.borrow_mut().push((base.to_owned(), head));
                 recheck(base, delta)
             },
+            autofix: &mut |_: &Path, _: &[String]| Ok(()),
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
-            say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+            // Printed too: a panic inside the landing (a remote step made again where none may
+            // fail, [`no_retry`]) unwinds past `said`, and what the landing said before it is
+            // the only record of which step failed and why.
+            say: &mut |line: &str| {
+                eprintln!("{line}");
+                said.borrow_mut().push(line.to_owned());
+            },
             remote,
             pause,
         },
@@ -956,67 +1153,16 @@ fn land_seamed(
     )
 }
 
-fn crates(names: &[&str]) -> Branch {
-    Branch::Crates(names.iter().map(|n| (*n).to_owned()).collect())
-}
-
-/// THE INHERITANCE RULE: a red main's lane named red at the merged main commit, in a crate
-/// outside the branch's own, is inherited. NEGATIVE CONTROLS: the same red in one of the
-/// branch's crates counts, as does one the lane does not name, one on an unjudged or green main,
-/// one under a branch that reaches every crate, a check whose findings the event cut short, and
-/// a red no crate can be read from.
-#[test]
-fn a_red_main_already_had_outside_the_branch_is_inherited_and_every_other_counts() {
-    let lane = Lane::Red([THEIRS.to_owned(), "tippy --workspace".to_owned()].into());
-    let run = |rows: Vec<CheckRow>| ran(exit::FAILED, rows, 1);
-    let theirs = run(vec![row("fmt", "ok"), red("test", &[THEIRS])]);
-    assert_eq!(
-        decide(&theirs, &lane, &crates(&["a"])),
-        Decision {
-            inherited: vec![THEIRS.into()],
-            ..Decision::default()
-        }
-    );
-    let counted = |judged: &Judged, lane: &Lane, branch: &Branch| {
-        decide(judged, lane, branch).counted == ["test"]
-    };
-    assert!(
-        counted(&theirs, &lane, &crates(&["a", "b"])),
-        "in the branch's crates"
-    );
-    assert!(counted(
-        &run(vec![red("test", &[THEIRS, "-p b --lib -- new_red"])]),
-        &lane,
-        &crates(&["a"])
-    ));
-    for unnamed in [Lane::Pass, Lane::Unjudged("no verdict".into())] {
-        assert!(counted(&theirs, &unnamed, &crates(&["a"])), "{unnamed:?}");
-    }
-    assert!(counted(
-        &theirs,
-        &lane,
-        &Branch::Everything("Cargo.lock".into())
-    ));
-    let mut cut = red("test", &[THEIRS]);
-    cut.findings_total = 11;
-    assert!(
-        counted(&run(vec![cut]), &lane, &crates(&["a"])),
-        "unseen findings"
-    );
-    assert!(counted(
-        &run(vec![red("test", &["tippy --workspace"])]),
-        &lane,
-        &crates(&["a"])
-    ));
+/// The branch's own reach: the crates `names`.
+fn crates(names: &[&str]) -> Reach {
+    reaches(names)
 }
 
 /// A check that did not run, a run that could not run or ended oddly, and a failed run that
 /// named no failed check are never a pass.
 #[test]
 fn a_run_that_did_not_finish_green_is_never_a_pass() {
-    let named = |code: i32, checks: Vec<CheckRow>| {
-        decide(&ran(code, checks, 1), &Lane::Pass, &crates(&["a"]))
-    };
+    let named = |code: i32, checks: Vec<CheckRow>| decide(&ran(code, checks, 1));
     assert_eq!(named(exit::PASS, green().checks), Decision::default());
     assert_eq!(
         named(exit::COULD_NOT_RUN, vec![row("export-scan", "NOT RUN")]).not_run,
@@ -1028,42 +1174,20 @@ fn a_run_that_did_not_finish_green_is_never_a_pass() {
     assert!(!named(exit::FAILED, green().checks).counted.is_empty());
 }
 
-/// A red item names a test's one crate, through a path spec too. NEGATIVE CONTROLS: a row label,
-/// a lint's label naming packages, a NOT RUN label and an id naming two packages name none.
+/// A RECORD NOT WHOLE IS NEVER A PASS: a run whose `run-finished` event names a check no line
+/// holds (that line lost), or is missing, or names another exit, did not run whole, however its
+/// rows read. CONTROL: the same rows, whole, are a counted red and nothing else.
 #[test]
-fn a_red_item_names_the_crate_of_its_test() {
-    assert_eq!(crate_of("-p agh --lib -- jq_all"), Some("agh"));
-    assert_eq!(
-        crate_of("-p path+file:///w/crates/x#xtra@0.1.0 --test it -- case"),
-        Some("xtra")
-    );
-    for none in [
-        "targo test --workspace --tests",
-        "-- a test named -p q",
-        "tippy -p a -p b --all-targets -- -D warnings",
-        "NOT RUN targo test -p a --tests — -p c --lib: why",
-        "-p a -p b --tests -- case",
-        "-p a --lib -- ",
-    ] {
-        assert_eq!(crate_of(none), None, "{none}");
-    }
-}
-
-/// A RECORD NOT WHOLE IS NEVER A PASS AND INHERITS NOTHING: a run whose `run-finished` event names
-/// a check no line holds (that line lost), or is missing, or names another exit, inherits nothing
-/// and does not pass, however its rows read. CONTROL: the same rows, whole, inherit main's red.
-#[test]
-fn a_record_not_whole_inherits_nothing_and_is_never_a_pass() {
-    let lane = Lane::Red([THEIRS.to_owned()].into());
+fn a_record_not_whole_is_never_a_pass() {
     let whole = ran(
         exit::FAILED,
         vec![row("fmt", "ok"), red("test", &[THEIRS])],
         1,
     );
     assert_eq!(
-        decide(&whole, &lane, &crates(&["a"])),
+        decide(&whole),
         Decision {
-            inherited: vec![THEIRS.into()],
+            counted: vec!["test".into()],
             ..Decision::default()
         }
     );
@@ -1080,11 +1204,8 @@ fn a_record_not_whole_inherits_nothing_and_is_never_a_pass() {
     let mut green_missing = green();
     green_missing.finished = None;
     for judged in [lost, missing, other, green_missing] {
-        let d = decide(&judged, &lane, &crates(&["a"]));
-        assert!(
-            d.inherited.is_empty() && !d.not_run.is_empty(),
-            "{judged:?}: {d:?}"
-        );
+        let d = decide(&judged);
+        assert!(!d.not_run.is_empty(), "{judged:?}: {d:?}");
     }
 }
 
@@ -1108,8 +1229,19 @@ fn a_check_row_reads_verifys_own_check_finished_event() {
     let line = crate::report::check_event(&result, &[]);
     assert_eq!(
         CheckRow::of_event(line.trim_end()),
-        Some(red("test", &[THEIRS]))
+        Some(CheckRow {
+            detail: "1 test failed".into(),
+            took: Some(Duration::from_millis(3500)),
+            ..red("test", &[THEIRS])
+        })
     );
+    // What the halt stopped reads as stopped.
+    let halted = crate::report::CheckResult {
+        stopped: true,
+        ..result.clone()
+    };
+    let line = crate::report::check_event(&halted, &[]);
+    assert!(CheckRow::of_event(line.trim_end()).is_some_and(|row| row.stopped));
     assert_eq!(
         CheckRow::of_event("verify-event: {\"event\":\"stage-finished\"}"),
         None
@@ -1146,29 +1278,22 @@ fn land_requires_a_completed_terminal_line_but_preserves_later_partial_diagnosti
     assert!(baseline.whole());
     assert_eq!(baseline.checks.len(), 1);
     assert_eq!(baseline.secs, 7);
-    assert_eq!(
-        decide(&baseline, &Lane::Pass, &crates(&["a"])),
-        Decision::default()
-    );
+    assert_eq!(decide(&baseline), Decision::default());
 
     let unframed = complete.strip_suffix('\n').unwrap();
     let missing = Judged::from_events(unframed, exit::PASS, 7);
     assert_eq!(missing.checks, baseline.checks);
     assert!(missing.finished.is_none());
     assert!(!missing.whole());
-    let decision = decide(&missing, &Lane::Pass, &crates(&["a"]));
+    let decision = decide(&missing);
     assert!(!decision.not_run.is_empty());
-    assert!(decision.inherited.is_empty());
 
     let crlf = Judged::from_events(&complete.replace('\n', "\r\n"), exit::PASS, 7);
     assert_eq!(crlf, baseline);
     let partial_tail = format!("{complete}verify-event: {{\"schema\":1,\"event\":\"disk\"");
     let with_tail = Judged::from_events(&partial_tail, exit::PASS, 7);
     assert_eq!(with_tail, baseline);
-    assert_eq!(
-        decide(&with_tail, &Lane::Pass, &crates(&["a"])),
-        Decision::default()
-    );
+    assert_eq!(decide(&with_tail), Decision::default());
 }
 
 /// A green branch lands as one merge of main into it, stating its judgment: the tree judged, the
@@ -1179,7 +1304,7 @@ fn a_green_branch_lands_as_one_merge_stating_its_judgment() {
     let world = world();
     let feature = commit(&world.work, "a/x.txt", "a2\n");
     let main = rival_moves(&world, "b/y.txt", "b2\n");
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert_eq!(bases, std::slice::from_ref(&main));
     let landing = origin_main(&world);
@@ -1210,6 +1335,116 @@ fn a_green_branch_lands_as_one_merge_stating_its_judgment() {
     );
 }
 
+/// A landing of `world`'s work whose fixes ([`Seams::autofix`]) turn each doubled space of a
+/// file they are handed into one: the exit, what it said, and what the fixes were handed each
+/// time. Its judgment asserts that it judges `a/x.txt` fixed and committed.
+fn land_fixing(world: &World) -> (i32, Vec<String>, Vec<Vec<String>>) {
+    let said = RefCell::new(Vec::new());
+    let handed = RefCell::new(Vec::new());
+    let code = land(
+        &world.work,
+        &own(),
+        &mut Seams {
+            git: &git_cmd,
+            records: quiet(),
+            verifier: &mut |_: &Path| Ok(own_image()),
+            judge: &mut |root: &Path, _: &Path, _: &str, _: Poll<'_>| {
+                assert_eq!(
+                    std::fs::read_to_string(root.join("a/x.txt")).expect("a/x.txt"),
+                    "a 2\n"
+                );
+                assert_eq!(self::git(root, &["status", "--porcelain"]), "");
+                Ran::Ended(green())
+            },
+            reach: &|_: &Path, _: &str, _: Option<&[String]>| crates(&["a"]),
+            recheck: &mut |_: &Path, _: &Path, base: &str, _: &Delta| {
+                panic!("no recheck was expected (base {base})")
+            },
+            autofix: &mut |root: &Path, files: &[String]| {
+                handed.borrow_mut().push(files.to_vec());
+                for file in files {
+                    let text = std::fs::read_to_string(root.join(file)).expect("a handed file");
+                    std::fs::write(root.join(file), text.replace("  ", " ")).expect("a fix");
+                }
+                Ok(())
+            },
+            hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
+            say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+            remote: &crate::remote::run,
+            pause: &no_retry,
+        },
+    );
+    (code, said.into_inner(), handed.into_inner())
+}
+
+/// THE LANDING'S FIXES ARE COMMITTED INTO ITS MERGE: they are handed what HEAD holds unlike
+/// main, what they write is amended into the landing's merge, which keeps its parents and its
+/// subject, and the judgment judges the fixed tree, which the landing states. CONTROL: a branch
+/// that already holds main's tip merges nothing, so the fix is a commit of its own on the
+/// branch, under the landing's merge.
+#[test]
+fn the_landings_fixes_are_committed_into_its_merge_and_judged() {
+    let world = world();
+    let feature = commit(&world.work, "a/x.txt", "a  2\n");
+    let main = rival_moves(&world, "b/y.txt", "b2\n");
+    let (code, said, handed) = land_fixing(&world);
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    assert_eq!(handed, [vec!["a/x.txt".to_owned()]]);
+    let landing = origin_main(&world);
+    assert_eq!(
+        git(&world.work, &["rev-list", "--parents", "-n", "1", &landing]),
+        format!("{landing} {feature} {main}")
+    );
+    assert_eq!(
+        git(&world.work, &["log", "-1", "--format=%s", &landing]),
+        "Merge origin/main into feature"
+    );
+    assert_eq!(
+        git(&world.work, &["show", &format!("{landing}:a/x.txt")]),
+        "a 2"
+    );
+    let receipt = stated(&world, &landing).expect("the landing states its judgment");
+    assert_eq!(
+        receipt.checked[0].tree,
+        git(&world.work, &["rev-parse", &format!("{landing}^{{tree}}")])
+    );
+    assert!(
+        said.iter()
+            .any(|line| line.ends_with("wrote 1 file(s), committed into the merge: a/x.txt")),
+        "{said:#?}"
+    );
+
+    let control = self::world();
+    let feature = commit(&control.work, "a/x.txt", "a  2\n");
+    let main = origin_main(&control);
+    let (code, said, handed) = land_fixing(&control);
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    assert_eq!(handed, [vec!["a/x.txt".to_owned()]]);
+    let landing = origin_main(&control);
+    assert_eq!(
+        git(&control.work, &["show", &format!("{landing}:a/x.txt")]),
+        "a 2"
+    );
+    let fix = git(&control.work, &["rev-parse", &format!("{landing}^1")]);
+    assert_eq!(
+        git(
+            &control.work,
+            &["rev-list", "--parents", "-n", "1", &landing]
+        ),
+        format!("{landing} {fix} {main}")
+    );
+    assert_eq!(
+        git(&control.work, &["log", "-1", "--format=%P %s", &fix]),
+        format!("{feature} {AUTOFIX_SUBJECT}")
+    );
+    assert!(
+        said.iter()
+            .any(|line| line
+                .ends_with("wrote 1 file(s), committed as a commit of their own: a/x.txt")),
+        "{said:#?}"
+    );
+}
+
 /// With no fetch refspec, Git itself does not update origin/main after a push, as with agh.
 #[test]
 fn a_green_branch_refreshes_main_without_a_fetch_refspec() {
@@ -1219,7 +1454,7 @@ fn a_green_branch_refreshes_main_without_a_fetch_refspec() {
         &world.work,
         &["config", "--unset-all", "remote.origin.fetch"],
     );
-    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
     let landing = origin_main(&world);
     assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landing);
@@ -1258,7 +1493,7 @@ fn a_branch_that_merged_main_by_hand_lands_as_that_merge_restated() {
                 git(&world.work, &["checkout", "-q", "--detach"]);
             }
         }
-        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
         assert_eq!(code, exit::PASS, "{said:#?}");
         assert_eq!(bases, std::slice::from_ref(&main));
         let landing = origin_main(&world);
@@ -1310,7 +1545,7 @@ fn a_checkout_that_moves_or_changes_during_the_run_pushes_nothing() {
     let world = world();
     commit(&world.work, "a/x.txt", "a2\n");
     let before = origin_main(&world);
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| {
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| {
         write(&world.work, "loose.txt", "edited during the run\n");
         green()
     });
@@ -1321,14 +1556,14 @@ fn a_checkout_that_moves_or_changes_during_the_run_pushes_nothing() {
     );
     assert_eq!(origin_main(&world), before);
     std::fs::remove_file(world.work.join("loose.txt")).expect("tidy");
-    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| {
+    let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| {
         commit(&world.work, "a/x.txt", "a3\n");
         green()
     });
     assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
     assert!(said.iter().any(|l| l.contains("HEAD moved")), "{said:#?}");
     assert_eq!(origin_main(&world), before);
-    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert_ne!(origin_main(&world), before);
 }
@@ -1343,7 +1578,7 @@ fn a_push_main_refused_in_place_is_an_error_never_a_retry() {
     let before = origin_main(&world);
     let lock = world.origin.join("refs/heads/main.lock");
     std::fs::write(&lock, "").expect("lock origin's main");
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!((code, bases.len()), (exit::COULD_NOT_RUN, 1), "{said:#?}");
     assert!(
         said.iter().any(|l| l.contains("COULD NOT RUN — git push")),
@@ -1357,7 +1592,7 @@ fn a_push_main_refused_in_place_is_an_error_never_a_retry() {
     );
     assert_eq!(origin_main(&world), before);
     std::fs::remove_file(&lock).expect("unlock");
-    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
 }
 
@@ -1374,7 +1609,7 @@ fn a_push_reported_failed_that_main_took_is_landed() {
         root: &world.work,
         make: &git_cmd,
     };
-    let wire = || Wire::new(&plumbing, &crate::remote::run, &no_retry, &|_| {});
+    let wire = || Wire::new(&plumbing, &crate::remote::run, &no_retry, &|_| {}, &|| None);
     assert_eq!(
         wire().settle(&landing, &onto, "refused"),
         Err("refused".to_owned())
@@ -1558,6 +1793,56 @@ fn a_submodule_pin_main_moved_is_imported_through_its_own_origin() {
     assert_eq!(git(&sub, &["rev-parse", "HEAD"]), first);
 }
 
+/// A LOCAL GIT STEP IS HELD TO ITS OWN PROGRESS, NOT TO THE WALL: a step that works for longer
+/// than its window (a shell spinning for five seconds under a two-second window, as a
+/// `git submodule status` worked past its minute under a whole-workspace judgment's load) ends
+/// with its answer, read for its stdout and read for its status alone. NEGATIVE CONTROL: a step
+/// that sleeps is a hang, ended once the window passed with nothing done and named as one.
+#[cfg(unix)]
+#[test]
+fn a_local_git_step_that_works_outlasts_its_window_and_one_that_sleeps_is_a_named_hang() {
+    const WINDOW: Duration = Duration::from_secs(2);
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let shell = |script: &'static str| {
+        move |root: &Path| {
+            let mut cmd = aterm_uds::spawnfd::command("/bin/bash");
+            cmd.current_dir(root).args(["-c", script, "git"]);
+            cmd
+        }
+    };
+    let works = shell("while [ $SECONDS -lt 5 ]; do :; done; echo answered");
+    let working = Git {
+        root: dir.path(),
+        make: &works,
+    };
+    assert_eq!(
+        working.ok(&["rev-parse", "HEAD"], WINDOW),
+        Ok("answered".to_owned())
+    );
+    let status = working
+        .status(&["merge-base", "--is-ancestor", "a", "b"], WINDOW)
+        .map(|out| out.status.success());
+    assert_eq!(status, Ok(true));
+
+    let sleeps = shell("exec sleep 600");
+    let hung = Git {
+        root: dir.path(),
+        make: &sleeps,
+    };
+    for why in [
+        hung.ok(&["rev-parse", "HEAD"], WINDOW)
+            .expect_err("a sleeping step is a hang"),
+        hung.status(&["merge-base", "--is-ancestor", "a", "b"], WINDOW)
+            .map(|out| out.status.success())
+            .expect_err("a sleeping step is a hang"),
+    ] {
+        assert!(
+            why.contains("made no CPU or I/O progress for 2s while waiting on this git step"),
+            "{why}"
+        );
+    }
+}
+
 /// A SUBMODULE WHOSE ORIGIN IS ON GITHUB is asked through agh alone: one exact fetch of the pin
 /// into the submodule's own repository (never the superproject's), then the checkout. The agh
 /// step here is a stand-in that fetches from the local child, as agh fetches from GitHub.
@@ -1621,7 +1906,7 @@ fn a_github_submodules_pin_is_fetched_by_agh_into_the_submodule() {
 fn a_red_or_a_dirty_checkout_pushes_nothing() {
     let world = world();
     let before = origin_main(&world);
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(
         (code, bases.len()),
         (exit::PASS, 0),
@@ -1629,10 +1914,10 @@ fn a_red_or_a_dirty_checkout_pushes_nothing() {
     );
     commit(&world.work, "a/x.txt", "a2\n");
     write(&world.work, "loose.txt", "not committed\n");
-    let (code, _, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, _, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!((code, bases.len()), (exit::COULD_NOT_RUN, 0));
     std::fs::remove_file(world.work.join("loose.txt")).expect("tidy");
-    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| {
+    let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| {
         ran(exit::FAILED, vec![red("test", &["-p a --lib -- mine"])], 1)
     });
     assert_eq!(code, exit::FAILED, "{said:#?}");
@@ -1645,7 +1930,7 @@ fn a_red_or_a_dirty_checkout_pushes_nothing() {
 fn an_already_landed_checkout_resumes_without_absorbing_main_or_losing_new_work() {
     let world = world();
     commit(&world.work, "a/x.txt", "a2\n");
-    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
     let landed = origin_main(&world);
     assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landed);
@@ -1661,10 +1946,10 @@ fn an_already_landed_checkout_resumes_without_absorbing_main_or_losing_new_work(
                 git: &git_cmd,
                 verifier: &mut |_| panic!("an already-landed checkout builds no verifier"),
                 judge: &mut |_, _, _, _| panic!("an already-landed checkout needs no judgment"),
-                branch: &mut |_, _| panic!("an already-landed checkout needs no branch scope"),
-                lane: &mut |_, _| panic!("an already-landed checkout needs no lane verdict"),
+                records: quiet(),
                 reach: &|_, _, _| panic!("an already-landed checkout needs no reach"),
                 recheck: &mut |_, _, _, _| panic!("an already-landed checkout needs no recheck"),
+                autofix: &mut |_: &Path, _: &[String]| Ok(()),
                 hand_over: &mut |_, _, _| panic!("an already-landed checkout hands nothing over"),
                 say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
                 remote: &crate::remote::run,
@@ -1698,7 +1983,7 @@ fn an_already_landed_checkout_resumes_without_absorbing_main_or_losing_new_work(
 
     std::fs::remove_file(world.work.join("loose.txt")).expect("finish loose work");
     let new_work = commit(&world.work, "a/x.txt", "a3\n");
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert_eq!(
         bases.as_slice(),
@@ -1723,11 +2008,11 @@ fn an_already_landed_checkout_resumes_without_absorbing_main_or_losing_new_work(
     assert!(git(&world.work, &["status", "--porcelain"]).is_empty());
 }
 
-/// An inherited red lands, named in the landing's `Aterm-Inherited`. NEGATIVE CONTROL: the same
-/// red, main's lane naming it just as much, in one of the branch's crates counts and pushes
-/// nothing.
+/// EVERY RED COUNTS: a red in a crate outside the branch's own (one main may already hold)
+/// stops the landing and pushes nothing, as one in the branch's crates does. CONTROL: the same
+/// landing, green, lands.
 #[test]
-fn an_inherited_red_lands_named_and_the_same_red_in_the_branch_counts() {
+fn a_red_outside_the_branchs_crates_counts_as_any_other() {
     let failing = |_: &str, _: usize| {
         ran(
             exit::FAILED,
@@ -1735,74 +2020,18 @@ fn an_inherited_red_lands_named_and_the_same_red_in_the_branch_counts() {
             1,
         )
     };
-    let lane = Lane::Red([THEIRS.to_owned()].into());
-    let world = world();
-    commit(&world.work, "a/x.txt", "a2\n");
-    let (code, said, _) = land_with(&world, crates(&["a"]), lane.clone(), failing);
-    assert_eq!(code, exit::PASS, "{said:#?}");
-    let receipt = stated(&world, &origin_main(&world)).expect("stated");
-    assert_eq!(receipt.inherited, [THEIRS]);
-    assert_eq!(receipt.checked[0].rows[1].word, "FAIL");
-
-    let control = self::world();
-    commit(&control.work, "b/y.txt", "b2\n");
-    let before = origin_main(&control);
-    let (code, _, _) = land_with(&control, crates(&["b"]), lane, failing);
-    assert_eq!(code, exit::FAILED);
-    assert_eq!(origin_main(&control), before);
-}
-
-/// The lane is read once the run ends: main's verdict on the merged commit, given while the run
-/// judged, names the red, so it is inherited. NEGATIVE CONTROL: a lane that still has not judged
-/// that commit when the run ends inherits nothing, and nothing is pushed.
-#[test]
-fn a_lane_verdict_given_during_the_run_is_inherited() {
-    for (judged_meanwhile, want) in [(true, exit::PASS), (false, exit::FAILED)] {
+    for branch in [crates(&["a"]), crates(&["b"])] {
         let world = world();
         commit(&world.work, "a/x.txt", "a2\n");
         let before = origin_main(&world);
-        let run_ended = std::cell::Cell::new(false);
-        let said = RefCell::new(Vec::new());
-        let code = land(
-            &world.work,
-            &own(),
-            &mut Seams {
-                git: &git_cmd,
-                verifier: &mut |_: &Path| Ok(own_image()),
-                judge: &mut |_: &Path, _: &Path, _: &str, _: Poll<'_>| {
-                    run_ended.set(true);
-                    Ran::Ended(ran(
-                        exit::FAILED,
-                        vec![row("fmt", "ok"), red("test", &[THEIRS])],
-                        1,
-                    ))
-                },
-                branch: &mut |_: &Path, _: &str| crates(&["a"]),
-                lane: &mut |_: &Path, _: &str| {
-                    if judged_meanwhile && run_ended.get() {
-                        Lane::Red([THEIRS.to_owned()].into())
-                    } else {
-                        Lane::Unjudged("not yet".into())
-                    }
-                },
-                reach: &|_: &Path, _: &str, _: Option<&[String]>| panic!("no reach was expected"),
-                recheck: &mut |_: &Path, _: &Path, _: &str, _: &Delta| {
-                    panic!("no recheck was expected")
-                },
-                hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
-                say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-                remote: &crate::remote::run,
-                pause: &no_retry,
-            },
-        );
-        assert_eq!(code, want, "{:#?}", said.borrow());
-        if judged_meanwhile {
-            let receipt = stated(&world, &origin_main(&world)).expect("stated");
-            assert_eq!(receipt.inherited, [THEIRS]);
-        } else {
-            assert_eq!(origin_main(&world), before);
-        }
+        let (code, said, _) = land_with(&world, branch.clone(), failing);
+        assert_eq!(code, exit::FAILED, "{branch:?}: {said:#?}");
+        assert_eq!(origin_main(&world), before, "{branch:?}");
     }
+    let control = self::world();
+    commit(&control.work, "a/x.txt", "a2\n");
+    let (code, said, _) = land_with(&control, crates(&["a"]), |_, _| green());
+    assert_eq!(code, exit::PASS, "{said:#?}");
 }
 
 #[test]
@@ -1945,13 +2174,16 @@ fn a_large_git_path_listing_keeps_shared_paths() {
 /// move says so in its refusal; the old line named `Cargo.lock` and stopped, as if no exception
 /// had been tried. Where the exception's evidence could not be read, or has a shape it does not
 /// read, the refusal says it could not be judged and why; the old line claimed the move was
-/// absent even for a version move whose merge tree or child workspace went unread.
+/// absent even for a version move whose merge tree or child workspace went unread. The run
+/// records say which: a compose and a `composed` landing, or the abort that doomed the pass and
+/// the re-judge it caused (cause `doomed`). NEGATIVE CONTROL, run once as a mutant that made
+/// this test fail: the doomed tip leaving the re-judge no cause (it read `first`).
 #[test]
 fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
     let world = world();
     commit(&world.work, "a/x.txt", "a2\n");
     let moved = RefCell::new(None);
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, n| {
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, n| {
         if n == 0 {
             *moved.borrow_mut() = Some(rival_moves(&world, "b/y.txt", "b2\n"));
         }
@@ -1986,7 +2218,7 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
     let control = self::world();
     commit(&control.work, "shared.txt", &SHARED.replacen('1', "one", 1));
     let first_main = origin_main(&control);
-    let (code, said, bases) = land_with(&control, crates(&["a"]), Lane::Pass, |_, n| {
+    let (code, said, bases) = land_with(&control, crates(&["a"]), |_, n| {
         if n == 0 {
             rival_moves(&control, "shared.txt", &SHARED.replacen('8', "eight", 1));
         }
@@ -2029,7 +2261,7 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
         };
         let checked = converge(&world.work, "the branch's convergent change");
         let moved = RefCell::new(None);
-        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, n| {
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |_, n| {
             if n == 0 {
                 git(&world.rival, &["fetch", "-q", "origin"]);
                 git(
@@ -2441,7 +2673,7 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
         );
         commit(&world.work, "Cargo.lock", &own_lock);
         let moved = RefCell::new(None);
-        let (code, said, bases) = land_with(&world, crates(&["agent"]), Lane::Pass, |_, n| {
+        let (code, said, bases) = land_with(&world, crates(&["agent"]), |_, n| {
             if n == 0 {
                 git(&world.rival, &["fetch", "-q", "origin"]);
                 git(
@@ -2666,6 +2898,32 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
         assert!(lock.contains("version = \"0.2.0\""));
         assert_eq!(git(&world.work, &["status", "--porcelain"]), "");
     }
+    // The run records: each composed case its compose and a `composed` landing; each case judged
+    // again the abort that doomed its pass and the re-judge it caused, landed `exact`.
+    let composed = landed(
+        &[
+            ("judgment", "pass", "first"),
+            ("compose", "composed", "disjoint"),
+            ("end", "landed", ""),
+        ],
+        "composed",
+    );
+    let doomed = landed(
+        &[
+            ("judgment", "pass", "first"),
+            ("abort", "doomed", "doomed"),
+            ("judgment", "pass", "doomed"),
+            ("end", "landed", ""),
+        ],
+        "exact",
+    );
+    let told = quietly();
+    assert!(
+        told.contains(&composed)
+            && told.contains(&doomed)
+            && told.iter().all(|run| *run == composed || *run == doomed),
+        "{told:#?}"
+    );
 }
 
 /// A moved main that converges on one shared path and differs on another is judged again, and
@@ -2679,7 +2937,7 @@ fn a_refused_composition_names_only_the_shared_paths_that_still_differ() {
     let world = world();
     write(&world.work, "a/x.txt", "converged\n");
     commit(&world.work, "shared.txt", &SHARED.replacen('1', "one", 1));
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, n| {
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, n| {
         if n == 0 {
             write(&world.rival, "a/x.txt", "converged\n");
             rival_moves(&world, "shared.txt", &SHARED.replacen('8', "eight", 1));
@@ -2750,7 +3008,7 @@ fn a_whitespace_only_conflict_path_is_not_erased() {
         let world = world();
         commit(&world.work, file, "ours\n");
         let moved = rival_moves(&world, file, "theirs\n");
-        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
         assert_eq!(code, exit::CONFLICT, "{said:#?}");
         assert!(bases.is_empty(), "a conflict starts no checks");
         assert!(said.iter().any(|line| line.contains(shown)), "{said:#?}");
@@ -2773,7 +3031,11 @@ fn a_whitespace_only_conflict_path_is_not_erased() {
 /// merged and judged at once and counts as one re-judge. A poll before main moved interrupts
 /// nothing. NEGATIVE CONTROL: a disjoint move mid-run interrupts nothing, a second poll of the
 /// same tip reads main but tests nothing (it makes only the git calls of a poll with nothing
-/// new), and the pass composes onto the moved main after the push, as before.
+/// new), and the pass composes onto the moved main after the push, as before. The run records
+/// say so: the abort of the cut judgment, the re-judge it caused (cause `cut`) and an `exact`
+/// landing; the control's compose and its `composed` landing. NEGATIVE CONTROLS, each run once as
+/// a mutant that made this test fail: the cut leaving the re-judge no cause (it read `first`);
+/// a landing onto another main than its judgment merged named `exact`.
 #[test]
 fn a_main_that_cannot_compose_interrupts_the_judgment_at_its_next_poll() {
     let world = world();
@@ -2781,13 +3043,16 @@ fn a_main_that_cannot_compose_interrupts_the_judgment_at_its_next_poll() {
     let first_main = origin_main(&world);
     let judged_tree = git(&world.work, &["rev-parse", "HEAD^{tree}"]);
     let (mut polls, mut moved) = (Vec::new(), String::new());
-    let (code, said, bases) = land_watching(&world, crates(&["a"]), Lane::Pass, |_, n, poll| {
+    let (code, said, bases) = land_watching(&world, crates(&["a"]), |_, n, poll| {
         if n == 0 {
             polls.push(poll(&mut || false));
             moved = rival_moves(&world, "shared.txt", &SHARED.replacen('8', "eight", 1));
             polls.push(poll(&mut || false));
             if polls == [false, true] {
-                return Ran::Interrupted { secs: 42 };
+                return Ran::Interrupted {
+                    secs: 42,
+                    queued: false,
+                };
             }
         }
         Ran::Ended(green())
@@ -2849,24 +3114,18 @@ fn a_main_that_cannot_compose_interrupts_the_judgment_at_its_next_poll() {
         git_cmd(root)
     };
     let (mut polls, mut costs, mut moved) = (Vec::new(), Vec::new(), String::new());
-    let (code, said, bases) = land_through(
-        &control,
-        &counting,
-        crates(&["a"]),
-        Lane::Pass,
-        |_, n, poll| {
-            assert_eq!(n, 0, "a disjoint move is never judged again");
-            for moves in [false, true, false] {
-                if moves {
-                    moved = rival_moves(&control, "b/y.txt", "b2\n");
-                }
-                let before = calls.get();
-                polls.push(poll(&mut || false));
-                costs.push(calls.get() - before);
+    let (code, said, bases) = land_through(&control, &counting, crates(&["a"]), |_, n, poll| {
+        assert_eq!(n, 0, "a disjoint move is never judged again");
+        for moves in [false, true, false] {
+            if moves {
+                moved = rival_moves(&control, "b/y.txt", "b2\n");
             }
-            Ran::Ended(green())
-        },
-    );
+            let before = calls.get();
+            polls.push(poll(&mut || false));
+            costs.push(calls.get() - before);
+        }
+        Ran::Ended(green())
+    });
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert_eq!(polls, [false, false, false], "{said:#?}");
     assert!(
@@ -2889,20 +3148,22 @@ fn a_main_that_cannot_compose_interrupts_the_judgment_at_its_next_poll() {
     let merged = rival_moves(&rewritten, "b/y.txt", "b2\n");
     commit(&rewritten.work, "a/x.txt", "a2\n");
     let mut moved = String::new();
-    let (code, said, bases) =
-        land_watching(&rewritten, crates(&["a"]), Lane::Pass, |_, n, poll| {
-            if n == 0 {
-                git(&rewritten.rival, &["checkout", "-q", "-B", "main", &seed]);
-                moved = commit(&rewritten.rival, "c/z.txt", "c\n");
-                git(
-                    &rewritten.rival,
-                    &["push", "-q", "--force", "origin", "main"],
-                );
-                assert!(poll(&mut || false), "a tip off the merged main interrupts");
-                return Ran::Interrupted { secs: 3 };
-            }
-            Ran::Ended(green())
-        });
+    let (code, said, bases) = land_watching(&rewritten, crates(&["a"]), |_, n, poll| {
+        if n == 0 {
+            git(&rewritten.rival, &["checkout", "-q", "-B", "main", &seed]);
+            moved = commit(&rewritten.rival, "c/z.txt", "c\n");
+            git(
+                &rewritten.rival,
+                &["push", "-q", "--force", "origin", "main"],
+            );
+            assert!(poll(&mut || false), "a tip off the merged main interrupts");
+            return Ran::Interrupted {
+                secs: 3,
+                queued: false,
+            };
+        }
+        Ran::Ended(green())
+    });
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert_eq!(bases, [merged.clone(), moved.clone()], "{said:#?}");
     assert!(
@@ -2912,13 +3173,33 @@ fn a_main_that_cannot_compose_interrupts_the_judgment_at_its_next_poll() {
             ))),
         "{said:#?}"
     );
+    // The run records: an abort of the cut judgment and the re-judge it caused, landed exactly
+    // onto the tip it merged; the control's pass composed onto the moved main.
+    let cut = landed(
+        &[
+            ("abort", "cut", "cut"),
+            ("judgment", "pass", "cut"),
+            ("end", "landed", ""),
+        ],
+        "exact",
+    );
+    let composed = landed(
+        &[
+            ("judgment", "pass", "first"),
+            ("compose", "composed", "disjoint"),
+            ("end", "landed", ""),
+        ],
+        "composed",
+    );
+    assert_eq!(quietly(), [cut.clone(), composed, cut]);
 }
 
 /// THE CUT RULE: a tip that shares a path with the branch interrupts the running judgment only
 /// where nothing it would produce can stand, that is, where the round of the merge would judge
 /// every crate the branch's change reaches: what main changed (the paths it shares with the
-/// branch and the ones it does not, asked together) reaches all of them, or the branch's change
-/// reaches every crate, whose round is the whole workspace. A narrower reach interrupts
+/// branch and the ones it does not, asked together) reaches all of them, or none of them (a
+/// round that would leave nothing of the branch's cone judges all of it), or the branch's
+/// change reaches every crate, whose round is the whole workspace. A narrower reach interrupts
 /// nothing: the judgment finishes and stands for the tree it ran on, and the merge is judged by
 /// one round. The reach is the cone's crates, dependents included, never its seeds alone: a
 /// change of one seed whose cone holds the branch's every crate cuts. A reach that was not read
@@ -2927,15 +3208,17 @@ fn a_main_that_cannot_compose_interrupts_the_judgment_at_its_next_poll() {
 /// interrupts at the first poll and is judged in full, with no round.
 #[test]
 fn a_tip_whose_shared_paths_reach_less_than_the_branch_does_not_interrupt() {
-    // The branch's seeds; its cone adds their dependent, `lab`.
-    let seeds = ["types", "ctl", "gui"];
+    // The branch's cone: its seeds (types, ctl, gui) and their dependent, `lab`.
     let cone = reaches(&["types", "ctl", "gui", "lab"]);
     let every = Reach::Everything("a root manifest changed".to_owned());
     let unread = Reach::Unread("the cone was not read".to_owned());
     // Main's reach, the branch's, and what the first poll's line says where it interrupts.
-    let cases: [(Reach, Reach, Option<&str>); 8] = [
+    let none = "reaches none of the crates the branch's change reaches (ctl, gui, lab, types), \
+                so a round would judge all of them again";
+    let cases: [(Reach, Reach, Option<&str>); 9] = [
         (reaches(&["gui", "lab"]), cone.clone(), None),
-        (reaches(&[]), cone.clone(), None),
+        (reaches(&[]), cone.clone(), Some(none)),
+        (reaches(&["other"]), cone.clone(), Some(none)),
         (unread.clone(), cone.clone(), None),
         (reaches(&["types", "ctl", "gui", "lab"]), unread, None),
         (
@@ -2982,8 +3265,6 @@ fn a_tip_whose_shared_paths_reach_less_than_the_branch_does_not_interrupt() {
         let moved = RefCell::new(String::new());
         let (code, said, bases, rounds) = land_reaching(
             &world,
-            crates(&seeds),
-            Lane::Pass,
             &reach,
             |_, n, poll| {
                 if n == 0 {
@@ -2994,7 +3275,10 @@ fn a_tip_whose_shared_paths_reach_less_than_the_branch_does_not_interrupt() {
                     polls.push(poll(&mut || false));
                     polls.push(poll(&mut || false));
                     if polls[0] {
-                        return Ran::Interrupted { secs: 1 };
+                        return Ran::Interrupted {
+                            secs: 1,
+                            queued: false,
+                        };
                     }
                 }
                 Ran::Ended(green())
@@ -3097,7 +3381,7 @@ fn a_fourth_tip_that_cannot_compose_is_merged_and_judged() {
     let world = world();
     commit(&world.work, "shared.txt", &SHARED.replacen('1', "one", 1));
     let mut tips = Vec::new();
-    let (code, said, bases) = land_watching(&world, crates(&["a"]), Lane::Pass, |_, n, poll| {
+    let (code, said, bases) = land_watching(&world, crates(&["a"]), |_, n, poll| {
         if n == TIPS {
             return Ran::Ended(green());
         }
@@ -3106,7 +3390,10 @@ fn a_fourth_tip_that_cannot_compose_is_merged_and_judged() {
             poll(&mut || false),
             "judgment {n}: the first poll after the move interrupts"
         );
-        Ran::Interrupted { secs: 1 }
+        Ran::Interrupted {
+            secs: 1,
+            queued: false,
+        }
     });
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert_eq!(bases.len(), TIPS + 1, "{said:#?}");
@@ -3158,7 +3445,7 @@ fn a_poll_that_cannot_read_main_says_so_once_a_run_and_the_judgment_goes_on() {
         std::fs::rename(from, to).expect("origin moves");
     };
     let mut polls = Vec::new();
-    let (code, said, bases) = land_watching(&world, crates(&["a"]), Lane::Pass, |_, n, poll| {
+    let (code, said, bases) = land_watching(&world, crates(&["a"]), |_, n, poll| {
         if n == 0 {
             hide(true);
             polls.push(poll(&mut || false));
@@ -3175,7 +3462,10 @@ fn a_poll_that_cannot_read_main_says_so_once_a_run_and_the_judgment_goes_on() {
             rival_moves(&world, "shared.txt", &SHARED.replacen('8', "eight", 1));
             polls.push(poll(&mut || false));
             if polls[6] {
-                return Ran::Interrupted { secs: 1 };
+                return Ran::Interrupted {
+                    secs: 1,
+                    queued: false,
+                };
             }
         }
         Ran::Ended(green())
@@ -3198,16 +3488,96 @@ fn a_poll_that_cannot_read_main_says_so_once_a_run_and_the_judgment_goes_on() {
     assert_eq!(bases.len(), 2, "{said:#?}");
 }
 
+/// A poll that reads main behind the base it judges over (a sibling worktree's older snapshot
+/// of the shared fetch ref, or a main rewound by force) reads no news: main does not move back
+/// short of a force-push, and merging a commit the branch holds merges nothing. The judgment
+/// goes on, the read is said once as one the poll could not use, and once main reads at its tip
+/// again the pass lands. A main that stays rewound is not swallowed: the push leases the main
+/// the branch merged, so it is refused, though plain git would take it as a fast-forward, and
+/// nothing is pushed. NEGATIVE CONTROL: a tip that does not compose still interrupts
+/// ([`a_main_that_cannot_compose_interrupts_the_judgment_at_its_next_poll`]).
+#[test]
+fn a_poll_that_reads_main_behind_its_base_is_no_news_and_never_interrupts() {
+    for stays_rewound in [false, true] {
+        let world = world();
+        commit(&world.work, "a/x.txt", "a2\n");
+        let seed = origin_main(&world);
+        let base = rival_moves(&world, "b/y.txt", "b2\n");
+        let rewind = |to: &str| git(&world.origin, &["update-ref", "refs/heads/main", to]);
+        let mut polls = Vec::new();
+        let (code, said, bases) = land_watching(&world, crates(&["a"]), |judged, n, poll| {
+            assert_eq!(
+                (judged, n),
+                (base.as_str(), 0),
+                "one judgment, over the base"
+            );
+            rewind(&seed);
+            polls.push(poll(&mut || false));
+            polls.push(poll(&mut || false));
+            if !stays_rewound {
+                rewind(&base);
+                polls.push(poll(&mut || false));
+            }
+            if polls.iter().any(|cut| *cut) {
+                return Ran::Interrupted {
+                    secs: 1,
+                    queued: false,
+                };
+            }
+            Ran::Ended(green())
+        });
+        assert!(polls.iter().all(|cut| !cut), "{polls:?} {said:#?}");
+        assert_eq!(bases, std::slice::from_ref(&base), "{said:#?}");
+        assert!(
+            !said.iter().any(|said| said.contains("INTERRUPTED")),
+            "{said:#?}"
+        );
+        let stale = format!(
+            "verify land: origin/main was not read or tested during the judgment (it read {seed}, \
+             which {base} already holds: a stale read, or main was rewound); it goes on"
+        );
+        assert_eq!(
+            said.iter().filter(|said| **said == stale).count(),
+            1,
+            "{said:#?}"
+        );
+        if stays_rewound {
+            assert_ne!(code, exit::PASS, "{said:#?}");
+            assert_eq!(
+                origin_main(&world),
+                seed,
+                "nothing is pushed over a rewound main"
+            );
+        } else {
+            assert_eq!(code, exit::PASS, "{said:#?}");
+            let landing = origin_main(&world);
+            assert_eq!(
+                git(&world.work, &["rev-parse", &format!("{landing}^2")]),
+                base,
+                "the pass landed with the main it judged over"
+            );
+        }
+    }
+}
+
 /// A run on a scripted clock: its stage boundaries at the offsets given, a red reported and
 /// its exit at the offsets its cells hold (which a poll may set), and each wait
-/// spending all it was given unless the exit comes first.
+/// spending all it was given unless the exit comes first. Where `turn` says so, it says
+/// `judgment-queued` at the first offset and `judgment-turn` at the second, if any.
 struct Scripted {
     clock: std::rc::Rc<std::cell::Cell<Duration>>,
     boundaries: Vec<Duration>,
+    turn: Option<(Duration, Option<Duration>)>,
     unpassed: std::rc::Rc<std::cell::Cell<Option<Duration>>>,
     ends: std::rc::Rc<std::cell::Cell<Option<Duration>>>,
     code: i32,
     interrupted: usize,
+    /// When the landing takes an interrupt of its own ([`Running::stopped`]); none by default.
+    stops: std::rc::Rc<std::cell::Cell<Option<Duration>>>,
+    /// How many times the run was asked to end at once ([`Running::end_now`]).
+    ended_now: usize,
+    /// What its interrupt answers still runs.
+    unended: Vec<Unended>,
 }
 
 impl Scripted {
@@ -3220,10 +3590,14 @@ impl Scripted {
                 .copied()
                 .map(Duration::from_secs)
                 .collect(),
+            turn: None,
             unpassed: std::rc::Rc::default(),
             ends: std::rc::Rc::default(),
             code: exit::PASS,
             interrupted: 0,
+            stops: std::rc::Rc::default(),
+            ended_now: 0,
+            unended: Vec::new(),
         }
     }
 }
@@ -3244,15 +3618,93 @@ impl Running for Scripted {
 
     fn reported(&mut self) -> Report {
         let now = self.clock.get();
+        let said = |at: Option<Duration>| at.filter(|at| *at <= now);
+        let queued = self.turn.and_then(|(queued, _)| said(Some(queued)));
+        let turn = self.turn.and_then(|(_, turn)| said(turn));
         Report {
-            boundaries: self.boundaries.iter().filter(|at| **at <= now).count(),
+            boundaries: self.boundaries.iter().filter(|at| **at <= now).count()
+                + usize::from(turn.is_some()),
             unpassed: self.unpassed.get().is_some_and(|at| at <= now),
+            queued: queued.is_some() && turn.is_none(),
+            waited_ms: turn
+                .zip(queued)
+                .map(|(turn, queued)| u64::try_from((turn - queued).as_millis()).unwrap()),
         }
     }
 
-    fn interrupt(&mut self) {
+    fn interrupt(&mut self) -> Vec<Unended> {
         self.interrupted += 1;
+        self.unended.clone()
     }
+
+    fn stopped(&mut self) -> bool {
+        self.stops.get().is_some_and(|at| at <= self.clock.get())
+    }
+
+    fn end_now(&mut self) {
+        self.ended_now += 1;
+    }
+}
+
+/// THE LANDING'S OWN INTERRUPT ENDS A RUNNING JUDGMENT: read each [`BOUNDARY_TICK`] while it is
+/// polled, while its own end is awaited after a red, and as soon as a poll answers, it asks the
+/// run to end once ([`Running::end_now`]), interrupts nothing and awaits nothing
+/// ([`Ending::Stopped`]); a poll asked meanwhile reads the question moot. NEGATIVE CONTROL: the
+/// same run with no interrupt is decided by its own exit, and a mutant of `supervise` that
+/// does not read the interrupt between polls (run once) waited for that exit instead.
+#[test]
+fn a_judgment_ends_at_the_landings_own_interrupt_within_a_tick() {
+    let secs = Duration::from_secs;
+    let start = Instant::now();
+    let clock = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+    let within = |at: Duration| {
+        let now = clock.get();
+        assert!(now >= at && now < at + BOUNDARY_TICK, "{at:?}: {now:?}");
+    };
+
+    // Between polls.
+    let mut run = Scripted::new(&clock, &[10, 30]);
+    run.ends.set(Some(secs(1000)));
+    run.stops.set(Some(secs(12)));
+    let ending = supervise(&mut run, &mut || start + clock.get(), &mut |_| false).unwrap();
+    assert_eq!(ending, Ending::Stopped);
+    assert_eq!((run.ended_now, run.interrupted), (1, 0));
+    within(secs(12));
+
+    // While its own end is awaited, after a red.
+    let mut run = Scripted::new(&clock, &[10]);
+    run.ends.set(Some(secs(1000)));
+    run.unpassed.set(Some(secs(5)));
+    run.stops.set(Some(secs(40)));
+    let ending = supervise(&mut run, &mut || start + clock.get(), &mut |_| {
+        panic!("a run that reported a red is not polled")
+    })
+    .unwrap();
+    assert_eq!(ending, Ending::Stopped);
+    assert_eq!((run.ended_now, run.interrupted), (1, 0));
+    within(secs(40));
+
+    // During a poll that then answers `true`: the interrupt, not the poll, ends it.
+    let mut run = Scripted::new(&clock, &[10]);
+    run.ends.set(Some(secs(1000)));
+    let stops = run.stops.clone();
+    let ending = supervise(&mut run, &mut || start + clock.get(), &mut |moot| {
+        assert!(!moot(), "nothing answered yet");
+        stops.set(Some(clock.get()));
+        assert!(moot(), "the interrupt ends the poll's read of main");
+        true
+    })
+    .unwrap();
+    assert_eq!(ending, Ending::Stopped);
+    assert_eq!((run.ended_now, run.interrupted), (1, 0));
+
+    // NEGATIVE CONTROL: no interrupt.
+    let mut run = Scripted::new(&clock, &[10, 30]);
+    run.ends.set(Some(secs(1000)));
+    let ending = supervise(&mut run, &mut || start + clock.get(), &mut |_| false).unwrap();
+    assert_eq!(ending, Ending::Exited(exit::PASS));
+    assert_eq!(run.ended_now, 0);
+    assert_eq!(clock.get(), secs(1000));
 }
 
 /// A running judgment asks its poll at each stage boundary its run reports, within one
@@ -3302,12 +3754,69 @@ fn a_running_judgment_polls_at_each_stage_boundary_and_at_least_every_poll_inter
         asked == 2
     })
     .unwrap();
-    assert_eq!(ending, Ending::Interrupted);
+    assert_eq!(
+        ending,
+        Ending::Interrupted {
+            waited: Duration::ZERO,
+            queued: false
+        }
+    );
     assert_eq!((asked, run.interrupted), (2, 1));
     assert!(
         clock.get() >= secs(30) && clock.get() < secs(30) + BOUNDARY_TICK,
         "interrupted at its second boundary's poll: {:?}",
         clock.get()
+    );
+}
+
+/// A judgment cut while still queued for the judgment turn waited from its `judgment-queued`
+/// until the cut, and its cut says it was queued; its `judgment-turn` is a boundary, polled at
+/// once, and a cut after it counts the wait the turn named and is not a queued one. A poll is
+/// never told whether the run is queued: a tip cuts a queued judgment only where it would cut a
+/// running one. NEGATIVE CONTROL: a run that never queued waited nothing (the tests above).
+#[test]
+fn a_cut_of_a_queued_judgment_counts_its_wait() {
+    let secs = Duration::from_secs;
+    let start = Instant::now();
+    let clock = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+    let mut run = Scripted::new(&clock, &[]);
+    run.turn = Some((secs(2), None));
+    let mut polls = 0;
+    let ending = supervise(&mut run, &mut || start + clock.get(), &mut |_| {
+        polls += 1;
+        true
+    })
+    .unwrap();
+    assert_eq!(polls, 1);
+    let Ending::Interrupted { waited, queued } = ending else {
+        panic!("{ending:?}");
+    };
+    assert!(queued);
+    assert!(
+        waited + POLL >= clock.get() && waited <= clock.get(),
+        "{waited:?} at {:?}",
+        clock.get()
+    );
+
+    let mut run = Scripted::new(&clock, &[]);
+    run.turn = Some((Duration::ZERO, Some(secs(60))));
+    let mut polled = Vec::new();
+    let ending = supervise(&mut run, &mut || start + clock.get(), &mut |_| {
+        polled.push(clock.get());
+        true
+    })
+    .unwrap();
+    assert_eq!(polled.len(), 1, "{polled:?}");
+    assert!(
+        polled[0] >= secs(60) && polled[0] < secs(60) + BOUNDARY_TICK,
+        "the turn is a boundary, polled at once: {polled:?}"
+    );
+    assert_eq!(
+        ending,
+        Ending::Interrupted {
+            waited: secs(60),
+            queued: false
+        }
     );
 }
 
@@ -3397,6 +3906,7 @@ fn a_runs_events_report_its_complete_stage_boundaries_and_any_red() {
     let report = |boundaries, unpassed| Report {
         boundaries,
         unpassed,
+        ..Report::default()
     };
     let events = dir.path().join("verify.events");
     let append = |events: &Path, text: &str| {
@@ -3439,6 +3949,59 @@ fn a_runs_events_report_its_complete_stage_boundaries_and_any_red() {
         append(&events, text);
         assert_eq!(tail_of.read(&events), read, "after {text:?}");
     }
+    // The turn's events: queued until the turn, which is a boundary and names the wait.
+    let turn_of = dir.path().join("turn.events");
+    let mut tail_of = EventsTail::default();
+    let prediction = crate::turn::Prediction::default();
+    let heavy = aterm_capacity::Heavy {
+        since_ms: 1,
+        predicted_ms: 600_000,
+    };
+    append(
+        &turn_of,
+        &format!(
+            "{}\n",
+            crate::turn::queued_event(prediction, heavy, "pid 7")
+        ),
+    );
+    assert_eq!(
+        tail_of.read(&turn_of),
+        Report {
+            queued: true,
+            ..report(0, false)
+        }
+    );
+    append(
+        &turn_of,
+        &format!(
+            "{}\n",
+            crate::turn::turn_event(prediction, heavy, Duration::from_secs(90), true)
+        ),
+    );
+    assert_eq!(
+        tail_of.read(&turn_of),
+        Report {
+            waited_ms: Some(90_000),
+            ..report(1, false)
+        }
+    );
+    // A wait that ended without the turn (the ledger unread, its holder stuck) ends the queued
+    // state as the turn does: the run judges from then on, and a cut counts only its wait.
+    let unheld = dir.path().join("unheld.events");
+    let mut tail_of = EventsTail::default();
+    for line in [
+        crate::turn::queued_event(prediction, heavy, "pid 7"),
+        crate::turn::turn_event(prediction, heavy, Duration::from_secs(40), false),
+    ] {
+        append(&unheld, &format!("{line}\n"));
+    }
+    assert_eq!(
+        tail_of.read(&unheld),
+        Report {
+            waited_ms: Some(40_000),
+            ..report(1, false)
+        }
+    );
     let not_run = dir.path().join("not-run.events");
     let mut tail_of = EventsTail::default();
     append(&not_run, &row("NOT RUN"));
@@ -3542,8 +4105,8 @@ impl Running for Written {
         self.tail.read(&self.events)
     }
 
-    fn interrupt(&mut self) {
-        self.run.interrupt();
+    fn interrupt(&mut self) -> Vec<Unended> {
+        self.run.interrupt()
     }
 }
 
@@ -3563,7 +4126,13 @@ fn a_red_test_binary_or_stage_its_check_has_not_yet_rowed_ends_the_polling() {
             deciding_stage(&["ok", "FAIL"]),
             Ending::Exited(exit::FAILED),
         ),
-        (binary_line("ok"), Ending::Interrupted),
+        (
+            binary_line("ok"),
+            Ending::Interrupted {
+                waited: Duration::ZERO,
+                queued: false,
+            },
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -3594,7 +4163,7 @@ fn a_red_test_binary_or_stage_its_check_has_not_yet_rowed_ends_the_polling() {
         .unwrap();
         assert_eq!(got, ending, "case {case}: {polled:?}");
         let interrupted = run.run.interrupted;
-        if ending == Ending::Interrupted {
+        if matches!(ending, Ending::Interrupted { .. }) {
             assert_eq!((polled.len(), interrupted), (2, 1), "{polled:?}");
         } else {
             assert_eq!((polled.len(), interrupted), (1, 0), "{polled:?}");
@@ -3645,7 +4214,7 @@ fn what_a_judgments_group_started_outside_it_is_read_at_any_depth_by_pid_and_bir
         row(400, 8, 1, 1, 400),
         row(401, 9, 1, 400, 400),
     ];
-    let found = beyond(&first, group, &[]);
+    let found = beyond(&first, Some(group), &[]);
     assert_eq!(
         names(&found),
         BTreeSet::from([(102, 4), (200, 5), (300, 6), (301, 7)])
@@ -3663,10 +4232,247 @@ fn what_a_judgments_group_started_outside_it_is_read_at_any_depth_by_pid_and_bir
         row(401, 9, 1, 400, 400),
     ];
     assert_eq!(
-        names(&beyond(&again, group, &found)),
+        names(&beyond(&again, Some(group), &found)),
         BTreeSet::from([(200, 5), (300, 6), (301, 7), (302, 21)])
     );
-    assert!(beyond(&again, group, &[]).is_empty());
+    assert!(beyond(&again, Some(group), &[]).is_empty());
+    // Its leader reaped, the group's id names it no more: a later process that leads a group of
+    // that id, and its child, are nobody's, and what is known is read as before.
+    let reused = [row(100, 30, 1, 1, 100), row(103, 31, 1, 100, 100)];
+    let later: Vec<_> = again.iter().chain(&reused).cloned().collect();
+    assert_eq!(
+        names(&beyond(&later, None, &found)),
+        BTreeSet::from([(200, 5), (300, 6), (301, 7), (302, 21)])
+    );
+    assert!(beyond(&later, None, &[]).is_empty());
+}
+
+/// A process table on a scripted clock ([`Outside`]): each process runs until the offset given
+/// (`None`: it never ends), and one may start another at an offset.
+struct Table {
+    at: Duration,
+    start: Instant,
+    /// (pid, when it ends).
+    ends: Vec<(i32, Option<Duration>)>,
+    /// (the pid that starts it, when, the pid started, when that ends).
+    starts: Vec<(i32, Duration, i32, Option<Duration>)>,
+    named: Vec<(Duration, Vec<i32>, Duration)>,
+}
+
+impl Table {
+    fn new(ends: &[(i32, Option<u64>)]) -> Self {
+        Self {
+            at: Duration::ZERO,
+            start: Instant::now(),
+            ends: ends
+                .iter()
+                .map(|(pid, end)| (*pid, end.map(Duration::from_secs)))
+                .collect(),
+            starts: Vec::new(),
+            named: Vec::new(),
+        }
+    }
+
+    fn started(pid: i32) -> Started {
+        Started {
+            pid,
+            birth: aterm_uds::process::Birth(u64::from(pid.unsigned_abs())),
+        }
+    }
+
+    fn runs(&self, pid: i32) -> bool {
+        self.ends
+            .iter()
+            .any(|(one, end)| *one == pid && end.is_none_or(|end| self.at < end))
+    }
+
+    fn pids(left: &[Started]) -> Vec<i32> {
+        let mut pids: Vec<i32> = left.iter().map(|one| one.pid).collect();
+        pids.sort_unstable();
+        pids
+    }
+}
+
+impl Outside for Table {
+    fn now(&mut self) -> Instant {
+        self.start + self.at
+    }
+
+    fn left(&mut self, known: &[Started]) -> Vec<Started> {
+        let mut left: Vec<Started> = known
+            .iter()
+            .copied()
+            .filter(|one| self.runs(one.pid))
+            .collect();
+        for (parent, at, pid, end) in self.starts.clone() {
+            if at <= self.at && known.contains(&Self::started(parent)) && self.runs(parent) {
+                if !self.ends.iter().any(|(one, _)| *one == pid) {
+                    self.ends.push((pid, end));
+                }
+                if self.runs(pid) && !left.contains(&Self::started(pid)) {
+                    left.push(Self::started(pid));
+                }
+            }
+        }
+        left
+    }
+
+    fn nap(&mut self) {
+        self.at += OUTSIDE_TICK;
+    }
+
+    fn named(&mut self, left: &[Started], bound: Duration) {
+        self.named.push((self.at, Self::pids(left), bound));
+    }
+}
+
+/// The wait for what an interrupted judgment started outside its group ends when all of it is
+/// gone, and says nothing: each end renews the grace, so a chain that ends a step at a time
+/// within it is awaited to its last. What does not end is named once the grace passed with no
+/// end, awaited the bound more in all, and answered as still running: the landing's COULD NOT
+/// RUN. NEGATIVE CONTROLS: one that ends inside the bound answers nothing, though it was named;
+/// and with no bound (a test's hang detector as the grace) nothing is named.
+#[test]
+fn what_an_interrupted_judgment_started_is_awaited_named_and_bounded() {
+    let secs = Duration::from_secs;
+    let (grace, bound) = (secs(20), secs(120));
+    let all = |table: &Table| -> Vec<Started> {
+        table
+            .ends
+            .iter()
+            .map(|(pid, _)| Table::started(*pid))
+            .collect()
+    };
+
+    // A chain: each ends within the grace of the one before, the last 51s in.
+    let mut chain = Table::new(&[(1, Some(15)), (2, Some(33)), (3, Some(51))]);
+    assert!(await_ended(all(&chain), grace, bound, &mut chain).is_empty());
+    assert_eq!(chain.at, secs(51), "it returns as the last one ends");
+    assert!(chain.named.is_empty(), "{:?}", chain.named);
+
+    // A compiler that ignores its end: named when the grace passes, awaited the bound, answered.
+    let mut stuck = Table::new(&[(1, Some(5)), (2, None)]);
+    let left = await_ended(all(&stuck), grace, bound, &mut stuck);
+    assert_eq!(Table::pids(&left), [2]);
+    assert_eq!(stuck.named, [(secs(25), vec![2], bound)]);
+    assert_eq!(stuck.at, secs(25) + bound, "the bound is not renewed");
+
+    // What an awaited process starts meanwhile is awaited too, and renews nothing.
+    let mut spawning = Table::new(&[(1, Some(30)), (2, Some(10))]);
+    spawning.starts = vec![(1, secs(12), 3, None), (3, secs(40), 4, Some(secs(60)))];
+    let left = await_ended(all(&spawning), grace, bound, &mut spawning);
+    assert_eq!(Table::pids(&left), [3]);
+    assert_eq!(spawning.named, [(secs(50), vec![3, 4], bound)]);
+    assert_eq!(spawning.at, secs(50) + bound);
+
+    // NEGATIVE CONTROL: named, and gone inside the bound.
+    let mut slow = Table::new(&[(1, Some(90))]);
+    assert!(await_ended(all(&slow), grace, bound, &mut slow).is_empty());
+    assert_eq!(slow.named, [(secs(20), vec![1], bound)]);
+    assert_eq!(slow.at, secs(90));
+
+    // NEGATIVE CONTROL: no bound names nothing and answers when the grace passes.
+    let mut unbounded = Table::new(&[(1, None)]);
+    let left = await_ended(all(&unbounded), grace, Duration::ZERO, &mut unbounded);
+    assert_eq!(Table::pids(&left), [1]);
+    assert!(unbounded.named.is_empty());
+    assert_eq!(unbounded.at, grace);
+
+    // Nothing started outside the group: no read of the clock is waited on.
+    let mut none = Table::new(&[]);
+    assert!(await_ended(Vec::new(), grace, bound, &mut none).is_empty());
+    assert_eq!(none.at, Duration::ZERO);
+}
+
+/// An interrupted run whose processes did not all end is no plain interruption: the supervision
+/// answers what still runs. NEGATIVE CONTROL: with all of it ended it is [`Ending::Interrupted`].
+#[test]
+fn an_interrupt_that_leaves_processes_running_ends_the_supervision_naming_them() {
+    let start = Instant::now();
+    let clock = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+    let stuck = vec![Unended {
+        pid: 41,
+        word: "trustc".to_owned(),
+    }];
+    for (unended, ending) in [
+        (stuck.clone(), Ending::Unended(stuck)),
+        (
+            Vec::new(),
+            Ending::Interrupted {
+                waited: Duration::ZERO,
+                queued: false,
+            },
+        ),
+    ] {
+        let mut run = Scripted::new(&clock, &[10]);
+        run.unended = unended;
+        let got = supervise(&mut run, &mut || start + clock.get(), &mut |_| true).unwrap();
+        assert_eq!(got, ending);
+        assert_eq!(run.interrupted, 1);
+    }
+}
+
+/// A judgment a moved main interrupted, whose compiler did not end, ends the landing COULD NOT
+/// RUN, naming it: nothing judges the checkout again beside a process that may still write its
+/// build directory, and nothing is pushed. NEGATIVE CONTROL: the same interruption with every
+/// process ended merges the moved main and judges it at once, and lands.
+#[test]
+fn an_interrupted_judgment_that_left_a_process_running_ends_the_landing_could_not_run() {
+    for stuck in [true, false] {
+        let world = world();
+        commit(&world.work, "shared.txt", &SHARED.replacen('1', "one", 1));
+        let judged_tree = git(&world.work, &["rev-parse", "HEAD^{tree}"]);
+        let mut moved = String::new();
+        let (code, said, bases) = land_watching(&world, crates(&["a"]), |_, n, poll| {
+            if n == 0 {
+                moved = rival_moves(&world, "shared.txt", &SHARED.replacen('8', "eight", 1));
+                assert!(poll(&mut || false), "the moved main does not compose");
+                return if stuck {
+                    Ran::Unended {
+                        secs: 42,
+                        left: vec![
+                            Unended {
+                                pid: 41,
+                                word: "trustc".to_owned(),
+                            },
+                            Unended {
+                                pid: 40,
+                                word: "targo".to_owned(),
+                            },
+                        ],
+                    }
+                } else {
+                    Ran::Interrupted {
+                        secs: 42,
+                        queued: false,
+                    }
+                };
+            }
+            Ran::Ended(green())
+        });
+        if !stuck {
+            assert_eq!((code, bases.len()), (exit::PASS, 2), "{said:#?}");
+            assert!(
+                !said.iter().any(|said| said.contains("still running")),
+                "{said:#?}"
+            );
+            continue;
+        }
+        assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
+        assert_eq!(bases.len(), 1, "no judgment follows it: {said:#?}");
+        assert_eq!(origin_main(&world), moved, "nothing was pushed");
+        let line = format!(
+            "verify land: COULD NOT RUN — the interrupted judgment of {judged_tree} left 2 \
+             processes still running, which did not end within 120s of being named: trustc \
+             (pid 41), targo (pid 40); nothing was pushed, and nothing is judged beside what may \
+             still write the build directory. Run verify land again once they are gone"
+        );
+        assert_eq!(
+            said.iter().filter(|said| **said == line).count(),
+            1,
+            "{said:#?}"
+        );
+    }
 }
 
 /// Main's release commit and a peer's changelog entry arrive during the judgment of a branch
@@ -3714,7 +4520,7 @@ fn a_release_commit_and_a_peer_fragment_compose_with_a_branch_fragment() {
             commit(&world.work, "changes/fixed/sb-branch.md", BRANCH);
         }
         let moved = RefCell::new(None);
-        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, n| {
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |_, n| {
             if n == 0 {
                 git(&world.rival, &["fetch", "-q", "origin"]);
                 git(
@@ -3787,14 +4593,14 @@ fn a_refused_merge_commit_aborts_the_merge_cleanly() {
             judge: &mut |_: &Path, _: &Path, _: &str, _: Poll<'_>| {
                 panic!("a refused merge is never judged")
             },
-            branch: &mut |_: &Path, _: &str| crates(&["a"]),
-            lane: &mut |_: &Path, _: &str| Lane::Pass,
+            records: quiet(),
             reach: &|_: &Path, _: &str, _: Option<&[String]>| {
                 panic!("a refused merge reads no reach")
             },
             recheck: &mut |_: &Path, _: &Path, _: &str, _: &Delta| {
                 panic!("a refused merge is never rechecked")
             },
+            autofix: &mut |_: &Path, _: &[String]| Ok(()),
             hand_over: &mut |_: &Image, _: &Path, _: &Path| {
                 panic!("a refused merge hands nothing over")
             },
@@ -3890,7 +4696,7 @@ fn a_fatal_git_merge_leaves_the_branch_tip() {
     let lock = world.work.join(".git/index.lock");
     std::fs::write(&lock, "held by the regression fixture\n").unwrap();
 
-    let (code, said, judged) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| {
+    let (code, said, judged) = land_with(&world, crates(&["a"]), |_, _| {
         panic!("a fatal merge is never judged")
     });
     assert_ne!(code, exit::PASS, "{said:#?}");
@@ -3958,4 +4764,996 @@ fn an_own_merge_the_index_lock_kept_from_aborting_is_forgotten_only_while_nothin
     assert!(said.contains("could not be aborted either"), "{said}");
     assert!(dot_git.join("MERGE_HEAD").exists(), "{said}");
     std::fs::remove_file(&lock).unwrap();
+}
+
+/// [`Memory`] shared between a scripted landing's records and the test that reads them.
+struct Shared(std::rc::Rc<Memory>);
+
+impl crate::land_spool::Spool for Shared {
+    fn put(&self, record: &crate::land_record::Signed) -> Result<(), String> {
+        self.0.put(record)
+    }
+
+    fn pending(&self) -> Result<crate::land_spool::Pending, String> {
+        self.0.pending()
+    }
+
+    fn done(&self, record: &crate::land_record::Signed) -> Result<(), String> {
+        self.0.done(record)
+    }
+}
+
+/// A spool that takes signal 15 for the landing as it keeps its first run record of `kind`, so
+/// the interrupt comes just after that step's record.
+struct Tripwire {
+    spool: Box<dyn crate::land_spool::Spool>,
+    kind: &'static str,
+    signal: std::rc::Rc<std::cell::Cell<Option<i32>>>,
+}
+
+impl crate::land_spool::Spool for Tripwire {
+    fn put(&self, record: &crate::land_record::Signed) -> Result<(), String> {
+        if record.path.starts_with(crate::land_run::DIR)
+            && record.path.contains(&format!(".{}.", self.kind))
+        {
+            self.signal.set(Some(15));
+        }
+        self.spool.put(record)
+    }
+
+    fn pending(&self) -> Result<crate::land_spool::Pending, String> {
+        self.spool.pending()
+    }
+
+    fn done(&self, record: &crate::land_record::Signed) -> Result<(), String> {
+        self.spool.done(record)
+    }
+}
+
+/// Where a scripted landing's records go, read back by the test: a journal in memory (each
+/// append's records, unless `refuse` is set), one clone's spool in memory, and the signal the
+/// landing's interrupt reads (none until a test sets one).
+#[derive(Default)]
+struct Store {
+    journal: std::rc::Rc<RefCell<Vec<crate::land_record::Signed>>>,
+    spool: std::rc::Rc<Memory>,
+    refuse: std::rc::Rc<std::cell::Cell<bool>>,
+    signal: std::rc::Rc<std::cell::Cell<Option<i32>>>,
+}
+
+/// A run's id: 32 of `c`.
+fn run_id(c: char) -> String {
+    std::iter::repeat_n(c, 32).collect()
+}
+
+impl Store {
+    /// The records of run `run` ([`run_id`]), started a minute before
+    /// [`crate::land_record::tests::NOW`], kept here.
+    fn records(&self, run: char) -> Records<'static> {
+        let journal = self.journal.clone();
+        let refuse = self.refuse.clone();
+        let signal = self.signal.clone();
+        Records {
+            append: Box::new(
+                move |_: &Path, records: &[crate::land_record::Signed], _: u64| {
+                    if refuse.get() {
+                        return Err("the scripted journal refuses appends".to_owned());
+                    }
+                    journal.borrow_mut().extend(records.iter().cloned());
+                    Ok(())
+                },
+            ),
+            spool: Box::new(Shared(self.spool.clone())),
+            signer: None,
+            host: "scripted".to_owned(),
+            now: Box::new(|| crate::land_record::tests::NOW),
+            run: crate::land_run::Run {
+                id: run_id(run),
+                started: crate::land_record::tests::NOW - 60,
+                ..crate::land_run::tests::run()
+            },
+            interrupt: Box::new(move || signal.get()),
+            tally: records::Tally::default(),
+        }
+    }
+
+    /// Every run record the journal and the spool hold, read as the census reads them.
+    fn entries(&self) -> Vec<crate::land_run::Entry> {
+        let spooled = crate::land_spool::Spool::pending(&*self.spool)
+            .expect("the spool")
+            .records;
+        let journal = self.journal.borrow();
+        [
+            (journal.as_slice(), crate::land_record::Origin::Journal),
+            (spooled.as_slice(), crate::land_record::Origin::Spool),
+        ]
+        .into_iter()
+        .flat_map(|(signed, origin)| {
+            signed
+                .iter()
+                .filter(|signed| signed.path.starts_with(crate::land_run::DIR))
+                .map(move |signed| {
+                    crate::land_run::Entry::read(&signed.path, &signed.bytes, origin)
+                })
+        })
+        .collect()
+    }
+
+    /// Run `run`'s records the journal holds and those the spool holds, each read and in order.
+    fn runs(&self, run: char) -> [Vec<crate::land_run::Record>; 2] {
+        let read = |signed: &[crate::land_record::Signed]| {
+            let mut records: Vec<crate::land_run::Record> = signed
+                .iter()
+                .filter(|signed| signed.path.starts_with(crate::land_run::DIR))
+                .map(|signed| {
+                    let entry = crate::land_run::Entry::read(
+                        &signed.path,
+                        &signed.bytes,
+                        crate::land_record::Origin::Journal,
+                    );
+                    entry.body.expect("a run record reads").record
+                })
+                .filter(|record| record.run.id == run_id(run))
+                .collect();
+            records.sort_by_key(|record| record.seq);
+            records
+        };
+        let spooled = crate::land_spool::Spool::pending(&*self.spool)
+            .expect("the spool")
+            .records;
+        [read(&self.journal.borrow()), read(&spooled)]
+    }
+}
+
+/// A run record's kind, result and cause word, as [`told`] reads it.
+type Told = (String, String, String);
+
+/// Each record's kind, result and cause word, in order.
+fn told(records: &[crate::land_run::Record]) -> Vec<Told> {
+    records
+        .iter()
+        .map(|record| {
+            (
+                record.kind.clone(),
+                record.result.clone(),
+                record
+                    .cause
+                    .as_ref()
+                    .map_or_else(String::new, |cause| cause.word.clone()),
+            )
+        })
+        .collect()
+}
+
+/// Whether `line` is an INTERRUPTED line naming `signal`: the word and the signal's number, not
+/// the sentence around them.
+fn interrupted_by(line: &str, signal: i32) -> bool {
+    let signal = signal.to_string();
+    line.contains("INTERRUPTED")
+        && line
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == signal)
+}
+
+/// The end records of `records`.
+fn ends(records: &[crate::land_run::Record]) -> Vec<&crate::land_run::Record> {
+    records
+        .iter()
+        .filter(|record| record.kind == "end")
+        .collect()
+}
+
+/// Land `world`'s branch (its crate `a`) with `records`, each judgment run
+/// by `judge` and each remote step by `remote`: its exit and what it said.
+fn land_kept(
+    world: &World,
+    records: Records<'_>,
+    mut judge: impl FnMut(Poll<'_>) -> Ran,
+    remote: &RemoteStep<'_>,
+) -> (i32, Vec<String>) {
+    let said = RefCell::new(Vec::new());
+    let branch = crates(&["a"]);
+    let reach = whole_reach(&branch);
+    let code = land(
+        &world.work,
+        &own(),
+        &mut Seams {
+            git: &git_cmd,
+            autofix: &mut |_: &Path, _: &[String]| Ok(()),
+            verifier: &mut |_: &Path| Ok(own_image()),
+            judge: &mut |_: &Path, _: &Path, _: &str, poll: Poll<'_>| judge(poll),
+            records,
+            reach: &|_: &Path, _: &str, paths: Option<&[String]>| reach(paths),
+            recheck: &mut |_: &Path, _: &Path, base: &str, _: &Delta| {
+                panic!("no round was expected (base {base})")
+            },
+            hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
+            say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+            remote,
+            pause: &no_retry,
+        },
+    );
+    (code, said.into_inner())
+}
+
+/// JM-01's exit (`docs/DESIGN-judged-main-release-pump-2026-11-11.md` §3.1): EVERY RUN END
+/// WRITES ONE RECORD. Over the scripted seams, a run that lands (0), one that goes red (1), one
+/// that could not run (3), one stopped by main's races at the push (75) and one interrupted by a
+/// signal each leave exactly one end record, naming its exit, beside one record for each step
+/// it took: the judgment and its result and red item keys, each compose. The landed one names
+/// its landing commit, the one main holds, and its kind. The interrupted run's end record names
+/// the signal, is written on its way out and kept in the clone, not appended (the run dies of
+/// the signal), and it judged nothing; the next run's one append carries it. A failed append
+/// leaves the exit, and what main holds, as they were without it: the run's records stay
+/// spooled, said, and the next run (which finds nothing to land) appends them. The census of
+/// every record these runs left prints the values they planted.
+///
+/// NEGATIVE CONTROLS, each run as a mutant of the code it guards, which made this test fail:
+/// `land` without its `records::finish` (nothing the run recorded was appended, and it wrote no
+/// end record); `finish` appending an
+/// interrupted run's records (the interrupted run's end record was in the journal before the
+/// next run); a failed append returning [`exit::COULD_NOT_RUN`] from `land` (the refused run's
+/// exit was 3, not 0).
+#[test]
+fn every_run_end_writes_one_record() {
+    use crate::land_record::tests::NOW;
+    let remote: &RemoteStep<'_> = &crate::remote::run;
+    // Every record the runs below leave, journal and spool, for the census.
+    let mut planted = Vec::new();
+
+    // 0: landed.
+    let store = Store::default();
+    let world = world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let (code, said) = land_kept(&world, store.records('1'), |_| Ran::Ended(green()), remote);
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    let [journal, spooled] = store.runs('1');
+    assert!(spooled.is_empty(), "the run's append held its records");
+    assert_eq!(
+        told(&journal),
+        [
+            ("judgment".into(), "pass".into(), "first".into()),
+            ("end".into(), "landed".into(), String::new())
+        ]
+    );
+    let end = ends(&journal)[0];
+    assert_eq!((end.exit, end.signal, end.seq), (Some(exit::PASS), None, 1));
+    let landing = end.landing.as_ref().expect("the landing");
+    assert_eq!(landing.commit, origin_main(&world));
+    assert_eq!((landing.kind.as_str(), landing.resumed), ("exact", false));
+    assert_eq!(end.secs, 60, "from the run's start to its end");
+    let landed_tree = git(
+        &world.work,
+        &["rev-parse", &format!("{}^{{tree}}", landing.commit)],
+    );
+
+    planted.extend(store.entries());
+
+    // 1: red, its item keyed by package, target and test path.
+    let store = Store::default();
+    let world = self::world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let (code, said) = land_kept(
+        &world,
+        store.records('2'),
+        |_| {
+            Ran::Ended(ran(
+                exit::FAILED,
+                vec![row("fmt", "ok"), red("test", &["-p a --lib -- t::one"])],
+                3,
+            ))
+        },
+        remote,
+    );
+    assert_eq!(code, exit::FAILED, "{said:#?}");
+    let [journal, _] = store.runs('2');
+    assert_eq!(
+        told(&journal),
+        [
+            ("judgment".into(), "fail".into(), "first".into()),
+            ("end".into(), "not-landed".into(), String::new())
+        ]
+    );
+    let item = &journal[0].items[0];
+    assert_eq!(
+        (
+            item.check.as_str(),
+            item.package.as_deref(),
+            item.target.as_deref(),
+            item.test.as_deref()
+        ),
+        ("test", Some("a"), Some("lib"), Some("t::one"))
+    );
+    assert_eq!(ends(&journal)[0].exit, Some(exit::FAILED));
+
+    planted.extend(store.entries());
+
+    // 3: could not run.
+    let store = Store::default();
+    let world = self::world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let (code, said) = land_kept(
+        &world,
+        store.records('3'),
+        |_| {
+            Ran::Ended(ran(
+                exit::COULD_NOT_RUN,
+                vec![row("fmt", "ok"), row("test", "NOT RUN")],
+                3,
+            ))
+        },
+        remote,
+    );
+    assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
+    let [journal, _] = store.runs('3');
+    assert_eq!(
+        told(&journal),
+        [
+            ("judgment".into(), "not-run".into(), "first".into()),
+            ("end".into(), "not-landed".into(), String::new())
+        ]
+    );
+    assert_eq!(ends(&journal)[0].exit, Some(exit::COULD_NOT_RUN));
+
+    planted.extend(store.entries());
+
+    // 75: main moves before every push, one race past the bound.
+    let store = Store::default();
+    let world = self::world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let moves = std::cell::Cell::new(0);
+    let racing: &RemoteStep<'_> = &|root, git, tool, args, until| {
+        if args.iter().any(|word| word == "push") {
+            moves.set(moves.get() + 1);
+            rival_moves(&world, "b/y.txt", &format!("b moved {}\n", moves.get()));
+        }
+        crate::remote::run(root, git, tool, args, until)
+    };
+    let (code, said) = land_kept(&world, store.records('4'), |_| Ran::Ended(green()), racing);
+    assert_eq!(code, STOPPED, "{said:#?}");
+    let [journal, _] = store.runs('4');
+    let composes = journal.iter().filter(|r| r.kind == "compose").count();
+    assert_eq!(composes, COMPOSES, "{:#?}", told(&journal));
+    let end = ends(&journal);
+    assert_eq!(end.len(), 1, "{:#?}", told(&journal));
+    assert_eq!((end[0].exit, end[0].kept), (Some(STOPPED), true));
+
+    planted.extend(store.entries());
+
+    // An interrupt: the signal comes while the judgment runs, which ends with no verdict.
+    let store = Store::default();
+    let world = self::world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let signal = store.signal.clone();
+    let (code, said) = land_kept(
+        &world,
+        store.records('5'),
+        |_| {
+            signal.set(Some(15));
+            Ran::Interrupted {
+                secs: 1,
+                queued: false,
+            }
+        },
+        remote,
+    );
+    assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
+    assert!(
+        said.iter().any(|line| interrupted_by(line, 15)),
+        "{said:#?}"
+    );
+    let [journal, spooled] = store.runs('5');
+    assert!(journal.is_empty(), "an interrupted run appends nothing");
+    assert_eq!(
+        told(&spooled),
+        [("end".into(), "not-landed".into(), String::new())],
+        "no verdict, no judgment record: the end alone, kept in the clone"
+    );
+    assert_eq!(
+        (spooled[0].exit, spooled[0].signal),
+        (Some(exit::COULD_NOT_RUN), Some(15))
+    );
+    store.signal.set(None);
+    let (code, said) = land_kept(&world, store.records('6'), |_| Ran::Ended(green()), remote);
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    let [journal, spooled] = store.runs('5');
+    assert_eq!(
+        (ends(&journal).len(), spooled.len()),
+        (1, 0),
+        "the next run appended the interrupted one's end"
+    );
+    assert_eq!(ends(&store.runs('6')[0]).len(), 1);
+
+    planted.extend(store.entries());
+
+    // A failed append changes nothing the landing does.
+    let store = Store::default();
+    let world = self::world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    store.refuse.set(true);
+    let (code, said) = land_kept(&world, store.records('7'), |_| Ran::Ended(green()), remote);
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    assert_eq!(
+        git(
+            &world.work,
+            &["rev-parse", &format!("{}^{{tree}}", origin_main(&world))]
+        ),
+        landed_tree,
+        "main holds the same landing as without the failed append"
+    );
+    assert!(
+        said.iter()
+            .any(|line| line.contains("(the scripted journal refuses appends)")),
+        "the refusal is said: {said:#?}"
+    );
+    let [journal, spooled] = store.runs('7');
+    assert!(journal.is_empty());
+    assert_eq!(ends(&spooled).len(), 1);
+    store.refuse.set(false);
+    let (code, said) = land_kept(&world, store.records('8'), |_| Ran::Ended(green()), remote);
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    let [journal, spooled] = store.runs('7');
+    assert_eq!((told(&journal).len(), spooled.len()), (2, 0));
+    let [journal, _] = store.runs('8');
+    assert_eq!(
+        told(&journal),
+        [("end".into(), "nothing".into(), String::new())],
+        "nothing to land: the end alone"
+    );
+    assert_eq!(journal[0].at, NOW);
+    planted.extend(store.entries());
+
+    // The census of these runs prints what they did: eight runs, one red first judgment of the
+    // five that judged and one that did not run, one race lost at the push bound, four ends
+    // without a landing (the run that found nothing to land is none), three exact landings a
+    // minute each, and the stopped run's composes.
+    let since = NOW - 86_400;
+    assert_eq!(
+        crate::land_census::census(&planted, &[], since),
+        [
+            format!(
+                "verify land census since {} ({since}): 8 runs from 1 hosts; 0 records do not \
+                 read",
+                aterm_types::rfc3339::format_rfc3339(since)
+            ),
+            "  r (first judgments red): 1/5 = 20.0%; 1 did not run".to_owned(),
+            "  runs that lost a race: 1/8 = 12.5%".to_owned(),
+            "  runs that ended without landing: 4 (exit 1: 1, exit 3: 1, exit 75: 1, signal 15: \
+             1)"
+            .to_owned(),
+            "  minutes to main: p50 1.0, p95 1.0 (over 3 landed runs)".to_owned(),
+            "  landings by kind: exact 3 (0 resumed a kept judgment)".to_owned(),
+            "  re-judges by cause: none".to_owned(),
+            "  rounds by cause: none".to_owned(),
+            format!("  composes: {COMPOSES}; aborts: none"),
+            "  main movements with no record: 0 of 0".to_owned(),
+        ]
+    );
+}
+
+/// A landing resumed from another image's handoff goes on as the same run: its records name the
+/// run's id and start and go on from the ordinal the handoff carries, as the sender's would
+/// have. NEGATIVE CONTROL: a handoff of the schema before carries no run, and the receiver's
+/// records are a run of its own, from its first ordinal. Mutant run: `resume` not adopting the
+/// carried run wrote the end under the receiver's own id.
+#[test]
+fn a_resumed_landing_records_as_the_run_that_handed_it_over() {
+    let world = world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let head = git(&world.work, &["rev-parse", "HEAD"]);
+    for carried in [true, false] {
+        let store = Store::default();
+        let handoff = Handoff {
+            root: world.work.clone(),
+            // Handed to another image: the receiver refuses it before anything runs.
+            image: "f".repeat(64),
+            words: Vec::new(),
+            step: aterm_land::Step::Qualify,
+            hop: 1,
+            at: head.clone(),
+            base: head.clone(),
+            composes: 0,
+            cone: head.clone(),
+            branch: None,
+            stated: Stated::default(),
+            run: carried.then(|| handoff::Carried {
+                id: run_id('c'),
+                started: 1_000,
+                seq: 4,
+                cause: Some(crate::land_run::Cause::new("cut", &head, "a tip")),
+            }),
+        };
+        let said = RefCell::new(Vec::new());
+        let code = resume(
+            &world.work,
+            &own(),
+            handoff,
+            &mut Seams {
+                git: &git_cmd,
+                autofix: &mut |_: &Path, _: &[String]| Ok(()),
+                verifier: &mut |_: &Path| Ok(own_image()),
+                judge: &mut |_: &Path, _: &Path, _: &str, _: Poll<'_>| panic!("nothing runs"),
+                records: store.records('d'),
+                reach: &|_: &Path, _: &str, _: Option<&[String]>| reaches(&["a"]),
+                recheck: &mut |_: &Path, _: &Path, _: &str, _: &Delta| panic!("nothing runs"),
+                hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff"),
+                say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+                remote: &crate::remote::run,
+                pause: &no_retry,
+            },
+        );
+        assert_eq!(code, exit::COULD_NOT_RUN, "{:#?}", said.borrow());
+        let (own_run, other) = if carried { ('c', 'd') } else { ('d', 'c') };
+        let [journal, _] = store.runs(own_run);
+        let end = ends(&journal);
+        assert_eq!(end.len(), 1, "{carried}");
+        let expected = if carried {
+            (4, 1_000)
+        } else {
+            (0, NOW_STARTED)
+        };
+        assert_eq!((end[0].seq, end[0].run.started), expected, "{carried}");
+        assert!(store.runs(other)[0].is_empty(), "{carried}");
+    }
+}
+
+/// When [`Store::records`]' runs start.
+const NOW_STARTED: u64 = crate::land_record::tests::NOW - 60;
+
+/// Land `world`'s branch as [`land_kept`] does, its verifier built by `verifier` and each
+/// judgment ending as `judged`: its exit and what it said.
+fn land_built(
+    world: &World,
+    records: Records<'_>,
+    verifier: &mut dyn FnMut(&Path) -> Result<Image, String>,
+    judged: &dyn Fn() -> Judged,
+    remote: &RemoteStep<'_>,
+) -> (i32, Vec<String>) {
+    let said = RefCell::new(Vec::new());
+    let branch = crates(&["a"]);
+    let reach = whole_reach(&branch);
+    let code = land(
+        &world.work,
+        &own(),
+        &mut Seams {
+            git: &git_cmd,
+            autofix: &mut |_: &Path, _: &[String]| Ok(()),
+            verifier,
+            judge: &mut |_: &Path, _: &Path, _: &str, _: Poll<'_>| Ran::Ended(judged()),
+            records,
+            reach: &|_: &Path, _: &str, paths: Option<&[String]>| reach(paths),
+            recheck: &mut |_: &Path, _: &Path, base: &str, _: &Delta| {
+                panic!("no round was expected (base {base})")
+            },
+            hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
+            say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+            remote,
+            pause: &no_retry,
+        },
+    );
+    (code, said.into_inner())
+}
+
+/// The commit the checkout's kept judgment is recorded in ([`KEPT`]), if one is.
+fn kept_record(world: &World) -> Option<String> {
+    let out = git_cmd(&world.work)
+        .args(["rev-parse", "--verify", "--quiet", KEPT])
+        .output()
+        .expect("git runs");
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// AN INTERRUPT STOPS THE LANDING BEFORE IT CHANGES ANYTHING: whichever step's check of it
+/// comes first (the verifier's build, the push, the merge of a main that rejected the push, the
+/// first judgment of a landing that holds an earlier run's kept judgment), the landing says one
+/// INTERRUPTED line naming the signal, pushes nothing, leaves HEAD where it was with no merge
+/// begun and the kept judgment as it was, could not run, and spools exactly one end record
+/// naming the signal, appending nothing.
+///
+/// NEGATIVE CONTROLS, each run once as a mutant of the check it guards, which made this test
+/// fail: `built` saying a stopped build as one that did not build (no INTERRUPTED line);
+/// `publish` without its check (main took the landing); `Host::merge` without its check (HEAD
+/// moved to the merge of the rejecting tip); `Host::qualify` without its check (the earlier
+/// run's kept judgment was dropped).
+#[test]
+fn an_interrupt_stops_the_landing_before_it_changes_anything() {
+    let once = |said: &[String]| {
+        assert_eq!(
+            said.iter().filter(|line| interrupted_by(line, 15)).count(),
+            1,
+            "{said:#?}"
+        );
+    };
+    let ended = |store: &Store, run: char| {
+        let [journal, spooled] = store.runs(run);
+        assert!(journal.is_empty(), "an interrupted run appends nothing");
+        let end = ends(&spooled);
+        assert_eq!(end.len(), 1, "{:#?}", told(&spooled));
+        assert_eq!(
+            (end[0].exit, end[0].signal),
+            (Some(exit::COULD_NOT_RUN), Some(15))
+        );
+        end[0].kept
+    };
+
+    // The verifier's build: the interrupt stops it, and it is said as the interrupt.
+    let store = Store::default();
+    let world = world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let main = origin_main(&world);
+    let signal = store.signal.clone();
+    let (code, said) = land_built(
+        &world,
+        store.records('1'),
+        &mut |_: &Path| {
+            signal.set(Some(15));
+            Err("the landing was interrupted while it built the checkout's verifier".into())
+        },
+        &green,
+        &crate::remote::run,
+    );
+    assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
+    once(&said);
+    assert!(
+        !said.iter().any(|line| line.contains("did not build")),
+        "{said:#?}"
+    );
+    assert_eq!(origin_main(&world), main);
+    assert!(!ended(&store, '1'));
+
+    // The push: a judgment that passed is kept, and nothing is written.
+    let store = Store::default();
+    let world = self::world();
+    let judged = commit(&world.work, "a/x.txt", "a2\n");
+    let main = origin_main(&world);
+    let mut records = store.records('2');
+    records.spool = Box::new(Tripwire {
+        spool: records.spool,
+        kind: "judgment",
+        signal: store.signal.clone(),
+    });
+    let (code, said) = land_built(
+        &world,
+        records,
+        &mut |_: &Path| Ok(own_image()),
+        &green,
+        &crate::remote::run,
+    );
+    assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
+    once(&said);
+    assert_eq!(origin_main(&world), main, "nothing was pushed");
+    assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), judged);
+    let kept = kept_record(&world).expect("the passed judgment is kept");
+    assert!(
+        ended(&store, '2'),
+        "the end record says the judgment is kept"
+    );
+
+    // The first judgment of a later commit: the earlier run's kept judgment is not dropped.
+    let store = Store::default();
+    commit(&world.work, "a/x.txt", "a3\n");
+    store.signal.set(Some(15));
+    let (code, said) = land_built(
+        &world,
+        store.records('3'),
+        &mut |_: &Path| panic!("nothing is built after the interrupt"),
+        &green,
+        &crate::remote::run,
+    );
+    assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
+    once(&said);
+    assert_eq!(kept_record(&world), Some(kept), "the kept judgment stays");
+    ended(&store, '3');
+
+    // The merge of a main that rejected the push and does not compose (it shares a path whose
+    // round would judge every crate): HEAD stays the judged commit, with no merge begun.
+    let store = Store::default();
+    let world = self::world();
+    let shared: String = SHARED.replacen('1', "one", 1);
+    let judged = commit(&world.work, "shared.txt", &shared);
+    let signal = store.signal.clone();
+    let moved = std::cell::Cell::new(false);
+    let racing: &RemoteStep<'_> = &|root, git, tool, args, until| {
+        if args.iter().any(|word| word == "push") && !moved.replace(true) {
+            rival_moves_line(&world, 8, "eight");
+            signal.set(Some(15));
+        }
+        crate::remote::run(root, git, tool, args, until)
+    };
+    let (code, said) = land_built(
+        &world,
+        store.records('4'),
+        &mut |_: &Path| Ok(own_image()),
+        &green,
+        racing,
+    );
+    assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
+    once(&said);
+    assert!(moved.get(), "main rejected the push");
+    assert_eq!(
+        git(&world.work, &["rev-parse", "HEAD"]),
+        judged,
+        "{said:#?}"
+    );
+    assert!(
+        !world.work.join(".git/MERGE_HEAD").exists(),
+        "no merge was begun"
+    );
+    assert!(kept_record(&world).is_some(), "the judgment stays kept");
+    assert!(ended(&store, '4'));
+    let [_, spooled] = store.runs('4');
+    assert_eq!(
+        told(&spooled),
+        [
+            ("judgment".into(), "pass".into(), "first".into()),
+            ("abort".into(), "doomed".into(), "doomed".into()),
+            ("end".into(), "not-landed".into(), String::new())
+        ]
+    );
+}
+
+/// A LANDING THAT PANICS STILL ENDS ITS RUN: its end record, naming [`PANICKED`], is written
+/// (and, with no interrupt, appended) before the panic goes on, so the process dies of it as
+/// without the record. NEGATIVE CONTROL, run once as a mutant: `land` calling `drive` with no
+/// `catch_unwind` left the run with no end record.
+#[test]
+fn a_landing_that_panics_writes_its_end_record() {
+    let store = Store::default();
+    let world = world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        land_kept(
+            &world,
+            store.records('1'),
+            |_| panic!("a scripted fault mid-judgment"),
+            &crate::remote::run,
+        )
+    }));
+    assert!(ran.is_err(), "the panic goes on past the record");
+    let [journal, spooled] = store.runs('1');
+    assert!(spooled.is_empty(), "{:#?}", told(&spooled));
+    let end = ends(&journal);
+    assert_eq!(end.len(), 1, "{:#?}", told(&journal));
+    assert_eq!((end[0].exit, end[0].signal), (Some(PANICKED), None));
+}
+
+/// The record a judgment that stopped at its first red keeps, as the verifier writes it: `fmt`
+/// passed, and the test check failed at `red` (a case of a crate outside the branch's) with the
+/// binaries `unstarted` the stop kept from starting. Its rows come from [`crate::report::judge`]
+/// and the events from [`crate::report::check_event`] and [`crate::report::run_event`], so the
+/// halt's NOT RUN rows sit among the test check's findings as the verifier puts them there.
+fn halted_test_run(red: &str, unstarted: &[&str]) -> Judged {
+    let words = "stopped: the run failed at test";
+    let mut fmt = crate::ladder::Report::new("fmt");
+    fmt.pass("fmt");
+    let mut test = crate::ladder::Report::new("test");
+    test.fail_with_findings(
+        red.split(" -- ").next().unwrap_or(red).to_owned(),
+        vec![crate::ladder::Finding {
+            id: red.to_owned(),
+            rerun: None,
+            message: Vec::new(),
+        }],
+    );
+    for binary in unstarted {
+        test.cannot_run(format!("{binary} — {words}"));
+    }
+    let results = [
+        crate::report::judge(
+            crate::Check::Fmt,
+            &[&fmt],
+            1.0,
+            "",
+            "rerun".into(),
+            Some(words),
+        ),
+        crate::report::judge(
+            crate::Check::Test,
+            &[&test],
+            60.0,
+            "",
+            "rerun".into(),
+            Some(words),
+        ),
+    ];
+    let mut text = crate::report::check_event(&results[0], &[&fmt]);
+    text.push_str(&crate::report::check_event(&results[1], &[&test]));
+    text.push_str(&crate::report::run_event(&results, exit::FAILED));
+    Judged::from_events(&text, exit::FAILED, 61)
+}
+
+/// A RED A STOPPED RUN MET COUNTS: a judgment that stopped at its first red cut short that red's
+/// own binary and kept what had not started from running; its red counts all the same, whether
+/// the stopped binary was the last running (no other row) or others had not started (NOT RUN rows
+/// among its findings), and wherever the red is.
+#[test]
+fn a_red_a_stopped_run_met_counts() {
+    for unstarted in [&[][..], &["-p z --lib", "-p y --test t"][..]] {
+        let judged = halted_test_run(THEIRS, unstarted);
+        assert!(judged.whole(), "{judged:?}");
+        let decision = decide(&judged);
+        assert_eq!(decision.counted, ["test"], "{unstarted:?}: {decision:?}");
+        assert!(decision.not_run.is_empty(), "{unstarted:?}: {decision:?}");
+    }
+}
+
+/// WHAT A COUNTED RED STOPPED DECIDES NOTHING: the checks the stop kept from running beside a
+/// counted red are named as stopped, and the red ends the landing. Beside no counted red they
+/// were never judged, so they did not run. NEGATIVE CONTROL: a NOT RUN the machine made, not the
+/// stop, is not run whatever else failed.
+#[test]
+fn what_a_counted_red_stopped_is_named_and_beside_none_did_not_run() {
+    let judged = ran(
+        exit::FAILED,
+        vec![row("fmt", "ok"), red("test", &[THEIRS]), stopped("doc")],
+        1,
+    );
+    let counted = decide(&judged);
+    assert_eq!(counted.counted, ["test"]);
+    assert_eq!(counted.stopped, ["doc"]);
+    assert!(counted.not_run.is_empty(), "{counted:?}");
+    let uncounted = ran(
+        exit::COULD_NOT_RUN,
+        vec![row("fmt", "ok"), stopped("doc")],
+        1,
+    );
+    let cut = decide(&uncounted);
+    assert!(cut.counted.is_empty() && cut.stopped.is_empty(), "{cut:?}");
+    assert!(
+        cut.not_run.iter().any(|why| why.starts_with("doc (")),
+        "{cut:?}"
+    );
+    let machine = ran(
+        exit::FAILED,
+        vec![red("test", &[THEIRS]), row("doc", "NOT RUN")],
+        1,
+    );
+    let decision = decide(&machine);
+    assert!(decision.stopped.is_empty(), "{decision:?}");
+    assert_eq!(decision.not_run, ["doc"]);
+}
+
+/// A LANDING STOPS AT ITS FIRST RED, whatever main's own state: nothing is pushed, and the
+/// landing says what the stop kept from running, in its lines and in its closing verdict of at
+/// most nine lines.
+#[test]
+fn a_landing_stops_at_its_first_red() {
+    let world = world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let before = origin_main(&world);
+    let said = RefCell::new(Vec::new());
+    let code = land(
+        &world.work,
+        &own(),
+        &mut Seams {
+            git: &git_cmd,
+            records: quiet(),
+            verifier: &mut |_: &Path| Ok(own_image()),
+            judge: &mut |_: &Path, _: &Path, _: &str, _: Poll<'_>| {
+                // The stop keeps what would have come after the red from running.
+                Ran::Ended(ran(
+                    exit::FAILED,
+                    vec![row("fmt", "ok"), red("test", &[THEIRS]), stopped("doc")],
+                    1,
+                ))
+            },
+            reach: &|_: &Path, _: &str, _: Option<&[String]>| panic!("no reach was expected"),
+            recheck: &mut |_: &Path, _: &Path, _: &str, _: &Delta| {
+                panic!("no recheck was expected")
+            },
+            autofix: &mut |_: &Path, _: &[String]| Ok(()),
+            hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
+            say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+            remote: &crate::remote::run,
+            pause: &no_retry,
+        },
+    );
+    let said = said.into_inner();
+    let (before_verdict, verdict) = split_verdict(&said);
+    assert!(
+        (1..=9).contains(&verdict.len()),
+        "one verdict of at most nine lines: {said:#?}"
+    );
+    assert_eq!(code, exit::FAILED, "{said:#?}");
+    assert_eq!(origin_main(&world), before, "nothing was pushed");
+    assert!(
+        before_verdict
+            .iter()
+            .any(|line| line.starts_with("verify land: STOPPED") && line.contains("doc")),
+        "{said:#?}"
+    );
+    assert!(
+        verdict.iter().any(|line| line.contains("doc NOT RUN")),
+        "{said:#?}"
+    );
+}
+
+/// THE VERDICT IS ONE SHORT BLOCK: landed or not with the commit, each check of the last
+/// judgment with its word (and its time where it ran), its first red and where, what the stop
+/// kept from running,
+/// the full log, and the command that reads the run's events. NEGATIVE CONTROL: a landing where
+/// nothing ran or landed here says none (its last line said it all).
+#[test]
+fn the_verdict_names_the_landing_each_check_the_first_counted_red_and_where_the_log_is() {
+    let timed = |row: CheckRow, secs: u64| CheckRow {
+        took: Some(Duration::from_secs(secs)),
+        ..row
+    };
+    let ours = "-p a --lib -- t";
+    let mut judged = ran(
+        exit::FAILED,
+        vec![
+            timed(row("fmt", "ok"), 3),
+            timed(red("test", &[THEIRS, ours]), 95),
+            stopped("doc"),
+        ],
+        98,
+    );
+    let case = |id: &str, at: &str| crate::event_log::Red {
+        what: id.replace(" -- ", ": "),
+        id: Some(id.to_owned()),
+        at: Some(at.to_owned()),
+    };
+    judged.reds = vec![
+        case(THEIRS, "crates/b/src/lib.rs:4"),
+        case(ours, "crates/a/src/lib_tests.rs:9"),
+    ];
+    judged.kept = Some(crate::event_log::Kept {
+        log: PathBuf::from("/logs/run.log"),
+        events: Some(PathBuf::from("/logs/run.log.events")),
+    });
+    let decision = decide(&judged);
+    let last = || Last {
+        round: false,
+        tree: "tree1".into(),
+        base: "base1".into(),
+        judged: judged.clone(),
+        decision: decision.clone(),
+    };
+    let tally = Tally {
+        last: Some(last()),
+        ..Tally::default()
+    };
+    let lines = verdict(exit::FAILED, Some("head1"), &tally);
+    assert!((1..=9).contains(&lines.len()), "{lines:#?}");
+    assert!(
+        lines[0].contains("NOT LANDED")
+            && lines[0].contains("exit 1")
+            && lines[0].contains("head1"),
+        "{lines:#?}"
+    );
+    let line_with = |words: &[&str]| {
+        lines
+            .iter()
+            .filter(|line| words.iter().all(|word| line.contains(word)))
+            .count()
+    };
+    assert_eq!(
+        line_with(&["fmt ok 3.0s", "test FAIL 1m35s", "doc NOT RUN"]),
+        1,
+        "every check on one line: {lines:#?}"
+    );
+    assert_eq!(
+        line_with(&["-p b --lib: old_red", "crates/b/src/lib.rs:4"]),
+        1,
+        "the first red, and where: {lines:#?}"
+    );
+    assert_eq!(
+        line_with(&["crates/a/src/lib_tests.rs:9"]),
+        0,
+        "only the first red: {lines:#?}"
+    );
+    assert_eq!(line_with(&["/logs/run.log"]), 2, "the log, and its events");
+    assert_eq!(
+        line_with(&["verify status --events /logs/run.log.events"]),
+        1
+    );
+    let landed = Tally {
+        last: Some(last()),
+        landed: Some("landing1".into()),
+    };
+    assert!(verdict(exit::PASS, Some("landing1"), &landed)[0].contains("LANDED landing1"));
+    assert!(verdict(exit::COULD_NOT_RUN, None, &Tally::default()).is_empty());
 }

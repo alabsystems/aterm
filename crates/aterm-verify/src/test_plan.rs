@@ -54,10 +54,14 @@
 //! an already isolated binary serial. The prediction assumes parallel cases; measured replay
 //! is still necessary to judge fixed startup costs, contention and cases of unequal lengths.
 //!
-//! Order: unrecorded binaries first at width `min(4, S, ceiling)`, in Cargo's order, with the
+//! Order: the binaries of the crates the change itself touched (the scope's seeds) lead those of
+//! their dependents (`docs/DESIGN-landing-economy.md` §2.2b), so a red of the branch's own shows
+//! first and a land judgment halts at it before its dependents run. Within each class,
+//! unrecorded binaries come first at width `min(4, S, ceiling)`, in Cargo's order, with the
 //! caller's conservative memory bound. Recorded binaries follow by descending recorded wall,
-//! then descending recorded peak, then Cargo index. Failure status does not displace a longer
-//! binary. Admission scans this priority order for the first queued binary whose CPU, memory,
+//! then descending recorded peak, then Cargo index. The classes are taken apart only after every
+//! width and charge is planned over the whole set, so leading changes no binary's width or
+//! charge. Failure status does not displace a longer binary. Admission scans this priority order for the first queued binary whose CPU, memory,
 //! live-rate and external resource checks all fit now. A blocked reservation retains nothing
 //! and cannot strand fitting peers. Each admitted binary holds its actual claims until it ends;
 //! recorded durations determine priority and width, never a completion deadline or verdict.
@@ -200,9 +204,16 @@ impl Plan {
 
 /// Plan binaries whose histories are `seen` (cargo's order) on a share of `share` cores, each
 /// binary's width at most `ceiling` (`--test-threads`, or the caller's `RUST_TEST_THREADS`), a
-/// binary with no history planned to hold `unseen_peak` bytes.
+/// binary with no history planned to hold `unseen_peak` bytes, those `seeds` marks (by index; one
+/// past its end is not) leading the rest, each class in the order the module's head gives.
 #[must_use]
-pub fn plan(seen: &[Option<Seen>], share: u32, ceiling: Option<u32>, unseen_peak: u64) -> Plan {
+pub fn plan(
+    seen: &[Option<Seen>],
+    seeds: &[bool],
+    share: u32,
+    ceiling: Option<u32>,
+    unseen_peak: u64,
+) -> Plan {
     let share = share.max(1);
     let ceiling = ceiling.unwrap_or(u32::MAX).clamp(1, share);
     let mut known: Vec<(usize, Seen)> = seen
@@ -257,6 +268,9 @@ pub fn plan(seen: &[Option<Seen>], share: u32, ceiling: Option<u32>, unseen_peak
         })
         .collect();
     order.extend(seen_order);
+    let seed = |planned: &Planned| seeds.get(planned.index).copied().unwrap_or(false);
+    let (mut order, dependents): (Vec<Planned>, Vec<Planned>) = order.into_iter().partition(seed);
+    order.extend(dependents);
     Plan {
         share,
         target,

@@ -494,12 +494,12 @@ fn kept(text: Option<&str>, now: &Vault) -> Option<String> {
 }
 
 /// The vault a fleet state directory `state` reads its deny list, its membership log and the
-/// vault its grants are of from: a scratch test root holding `.secrets/` or its vault folder
-/// beside `state`, or the live home's when `state` is the live account's state directory.
+/// vault its grants are of from: a scratch test root holding its vault folder beside `state`, or
+/// the live home's when `state` is the live account's state directory.
 pub(crate) fn vault_paths_for(state: &Path) -> Option<Paths> {
     if let Some(root) = state.parent() {
         let candidate = Paths::for_home(root);
-        if root.join(".secrets").is_dir() || candidate.dir.is_dir() {
+        if candidate.dir.is_dir() {
             return Some(candidate);
         }
     }

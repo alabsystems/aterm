@@ -94,7 +94,8 @@ fn kept_with_line(prefix: &str, name: &str, body: &str, line: &str) {
     );
     let ls = stdout(&ctl(&inst, &["ls"]));
     assert!(
-        ls.lines().any(|l| l.contains("s-")),
+        ls.lines()
+            .any(|line| line.split_whitespace().any(aterm_types::tab_id::is_tab_id)),
         "ls still lists the kept session:\n{ls}"
     );
 }

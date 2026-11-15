@@ -33,6 +33,9 @@ name = "aterm-lab-standin"
 path = "src/standin/main.rs"
 
 [dependencies]
+# The turn-end readers and the texts the policy types, which the lab's scenes and proofs read
+# and drive.
+alab-policy = { workspace = true }
 # aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
 aterm-cores = { workspace = true }
 # The in-process control connection (`RelayClient`): the frame stream
@@ -178,6 +181,8 @@ aterm-vz-agent = { workspace = true }
 aterm-lan = { workspace = true }
 
 [dev-dependencies]
+# The production comparison boundary has an interpreter conformance trace and fault controls.
+aterm-models-capacity = { workspace = true }
 # `trail-gallery burst`'s key schedule is checked against the flying kitty's
 # own summon (`kitty_cursor::CursorCat` on the typing momentum): the model the
 # scenario is paced for, not a copy of its constants.

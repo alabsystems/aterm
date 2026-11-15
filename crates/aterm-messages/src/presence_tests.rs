@@ -881,6 +881,20 @@ fn durations_and_short_ids_print_in_their_own_units() {
     assert_eq!(fmt_dur(Duration::from_secs(7_500)), "2h05m");
     assert_eq!(fmt_dur(Duration::from_secs(165_600)), "1d 22h");
     assert_eq!(short_sid("s-1e918c4662a1b7b8bd43"), "s-1e91");
+    assert_eq!(
+        short_sid("ta1b7b8bd43"),
+        "ta1b7",
+        "a tab ID's own short form"
+    );
+    // NEGATIVE CONTROL: a word that is no tab ID, in either form's shape, is only cut.
+    assert_eq!(short_sid("ta1b7b8bd4"), "ta1b7b", "one character short");
+    assert_eq!(short_sid("tA1B7B8BD43"), "tA1B7B", "upper case");
+    assert_eq!(
+        short_sid("s-1e918c4662a1b7b8bd4"),
+        "s-1e91",
+        "an earlier ID one digit short"
+    );
+    assert_eq!(short_sid("ctl"), "ctl");
 }
 
 #[test]

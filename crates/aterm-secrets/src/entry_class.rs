@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! What a vault entry's name makes it (`docs/DESIGN-claude-setup-token-2026-11-05.md` §3.1; part
-//! of one-mesh B13): one compiled classification that the materializer, the CLI and the document
-//! diff ask, and the one definition of every name it classes. The consumers of fleet
+//! of one-mesh B13): one compiled classification that the apply, the store's readers, the CLI and
+//! the document diff ask, and the one definition of every name it classes. The consumers of fleet
 //! configuration and release material import their names from here.
 //!
 //! Entry names are ASCII and macOS's file system matches them without case, so names are compared
@@ -21,8 +21,11 @@ pub use aterm_types::vault_entry::{DEV_GH_TOKEN, RELEASE_GH_TOKEN};
 /// The notary credential the release subscriber consumes.
 pub const NOTARY: &str = "release-notary";
 
-/// The one path `publish/site.toml`'s `firebase_sa_key` resolves to, relative to its `dir`
-/// (`crates/aterm-release/src/site/mod.rs`): the entry the site deployer's key arrives as.
+/// The release roster's paper master phrase ([`crate::paper_master`]).
+pub const PAPER_MASTER: &str = "release-paper-master";
+
+/// The entry the site deployer's key arrives as, and the one key `ship site` deploys with
+/// (`crates/aterm-release/src/site/mod.rs`, `deployer_key`).
 pub const SITE_DEPLOYER_KEY: &str =
     "~/company-life/config/local/service-account.alab-site-deployer.json";
 
@@ -82,6 +85,10 @@ pub const GITHUB_REPOSITORIES: &str = "github-repositories.json";
 /// The mailbox configuration a Mac's sign-in reads after [`AI_MAILBOX`], whose fields fill what
 /// it leaves empty and whose routes it adds.
 pub const MAILBOX: &str = "mailbox.toml";
+
+/// aterm's Google desktop client registration (JSON), which `aterm email connect-gmail` enrolls
+/// with.
+pub const GOOGLE_MAIL_CLIENT: &str = "google-mail-client.json";
 
 /// The sealed per-email sign-in routes and the mailbox URLs warm Macs read.
 pub const AI_SIGNIN: &str = "ai-signin.toml";
@@ -160,14 +167,14 @@ pub const CLAUDE_TOKEN_META: &str = "-meta";
 /// What a vault entry is, by its name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryClass {
-    /// A file members rotate: a credential leaf below `~/.secrets` (a plain name with no
-    /// configuration suffix that this module does not name), gh's hosts file or git's credentials.
+    /// A credential members rotate: a plain name with no configuration suffix that this module
+    /// does not name, gh's hosts file or git's credentials.
     Shared,
-    /// Materialized as today, but out of a member write's reach.
+    /// Read by name as a shared one is, but out of a member write's reach.
     Held(Held),
-    /// Read in place from the encrypted vault cache, never a file.
+    /// Read in place by its typed reader alone, never by name.
     Consumed(Consumed),
-    /// Never written and never taken back.
+    /// Read under no name.
     SetApart(SetApart),
 }
 
@@ -209,9 +216,10 @@ pub enum SetApart {
 }
 
 impl EntryClass {
-    /// Whether the materializer writes the entry as a file.
+    /// Whether a Mac reads the entry by its name from its verified store (`aterm secrets get`,
+    /// `client::read_verified_entry`).
     #[must_use]
-    pub const fn materialized(self) -> bool {
+    pub const fn read_by_name(self) -> bool {
         matches!(self, Self::Shared | Self::Held(_))
     }
 }
@@ -279,6 +287,7 @@ fn spelled(fold: &str) -> Option<EntryClass> {
     }
     if fold == RELEASE_GH_TOKEN
         || fold == NOTARY
+        || fold == PAPER_MASTER
         || fold == SITE_DEPLOYER_KEY
         || RELEASE_RING.contains(&fold)
         || LEGACY_RELEASE_RING.contains(&fold)
@@ -371,7 +380,7 @@ pub fn reserved(name: &str) -> bool {
 pub fn folded_pairs<'a>(names: impl IntoIterator<Item = &'a str>) -> BTreeMap<&'a str, &'a str> {
     let mut by_fold: BTreeMap<String, Vec<&'a str>> = BTreeMap::new();
     for name in names {
-        if of(name).materialized() {
+        if of(name).read_by_name() {
             let spellings = by_fold.entry(fold(name)).or_default();
             if !spellings.contains(&name) {
                 spellings.push(name);
@@ -404,9 +413,8 @@ pub fn set_apart_refusal(name: &str) -> Option<String> {
     Some(match why {
         SetApart::CliLogin => crate::text::cli_login_refusal(name).unwrap_or_default(),
         SetApart::HomePath => format!(
-            "`{name}` is a home path no vault writes: a Mac takes ~/.secrets files from the vault, \
-             and of home paths only gh's hosts.yml, git's config and credentials and the release \
-             material aterm names"
+            "`{name}` is a home path no Mac reads from the vault: of home paths it reads only gh's \
+             hosts.yml, git's config and credentials and the release material aterm names"
         ),
         SetApart::CaseVariant => {
             let fold = fold(name);
@@ -487,6 +495,59 @@ pub enum Mismatch {
     Draft,
     /// A value is not inner-sealed, the token is not a setup-token, or the meta does not parse.
     Value,
+}
+
+/// Which route minted a stored Claude token (its meta's `minted_by`, §4.1): whether the mint
+/// itself proved the token is its row's account's. Declared here, beside [`Mismatch`], so a
+/// surface on any platform can judge a token's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MintedBy {
+    /// aterm's own sign-in window, in the account's own store, which presses `Authorize` only on
+    /// a consent page that names the account's email or in a store recorded as the account's.
+    Window,
+    /// aterm's headless route on the account's own browser profile, which presses only on a
+    /// consent page that shows the account's email.
+    Headless,
+    /// A person at a terminal: the consent page opens in whatever session their browser holds,
+    /// and Claude Code's success names no account.
+    Terminal,
+}
+
+impl MintedBy {
+    /// The word a meta carries.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Window => "window",
+            Self::Headless => "headless",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    /// The route `word` names, where it names one this build knows.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        [Self::Window, Self::Headless, Self::Terminal]
+            .into_iter()
+            .find(|by| by.word() == word)
+    }
+
+    /// Whether this route proved the token is its account's: aterm's window or headless route,
+    /// each of which presses `Authorize` only in the account's own session.
+    #[must_use]
+    pub const fn proves_account(self) -> bool {
+        matches!(self, Self::Window | Self::Headless)
+    }
+
+    /// Whether the vault's records put a token that is not verified in use on a Mac (§4.3), the
+    /// token made by `by` (`None`: its meta names no route, as an earlier build's does, or one an
+    /// earlier build wrote again) and `minted_here` where that Mac minted it: on every member Mac
+    /// where the route proved the account ([`Self::proves_account`]), otherwise on its minting
+    /// Mac only, until it is verified.
+    #[must_use]
+    pub const fn serves_unverified(by: Option<Self>, minted_here: bool) -> bool {
+        minted_here || matches!(by, Some(Self::Window | Self::Headless))
+    }
 }
 
 #[cfg(test)]

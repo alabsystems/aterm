@@ -9,9 +9,9 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::time::Duration;
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::credit_offers::{self, Offer};
 use aterm_agent::harness::profile::NoProfile;
-use aterm_agent::supervise::Autopilot;
 
 use super::*;
 use crate::worker_reaper::tests::{
@@ -473,7 +473,7 @@ fn a_claim_worker_is_claude_code_with_the_browser_and_the_guarded_task() {
     let claude =
         aterm_agent::harness::worker::worker_cli(aterm_phase::Program::Claude).expect("a row");
     let admitted =
-        crate::task_launch::admit_worker(claude, claude.plain(), None, &|_| {}, &|| (), &Present)
+        crate::task_launch::admit_worker(claude, claude.plain(), &|_| {}, &|| (), &Present)
             .expect("admitted");
     use aterm_agent::supervise::config::Approve;
     let line_of = |chrome: bool, approve: Approve| {

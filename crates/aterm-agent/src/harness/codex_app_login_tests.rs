@@ -6094,3 +6094,59 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
 
     server.join().expect("server join");
 }
+
+/// A QUIT ENDS CODEX'S AUTOMATIC SIGN-IN WAIT ON THE PAGE OR THE MAIL: the deadline handed to the
+/// approver has passed once the sign-in's account work is cancelled, so a mail poll or a page
+/// wait bounded by it ends at its next look; and the sign-in then says it was cancelled, never
+/// an outcome of the account. NEGATIVE CONTROL: a handoff deadline without the cancellation has
+/// an hour left after the cancel, and the sign-in goes on to wait on its callback.
+#[test]
+fn a_quit_ends_codexs_approver_waits() {
+    use crate::harness::account_work::{Lifetime, Scope};
+    struct Quits {
+        scope: Scope,
+        before: Option<bool>,
+        after: Option<bool>,
+    }
+    impl Approver for Quits {
+        fn work_scope(&self) -> Option<Scope> {
+            Some(self.scope.clone())
+        }
+        fn approve(&mut self, handoff: &Handoff<'_>) -> Approval {
+            self.before = Some(handoff.deadline.remaining().is_ok());
+            self.scope.cancellation().cancel();
+            self.after = Some(handoff.deadline.remaining().is_ok());
+            Approval::Approved { page: false }
+        }
+    }
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let lifetime = Lifetime::default();
+    let mut approver = Quits {
+        scope: lifetime.enter().unwrap(),
+        before: None,
+        after: None,
+    };
+    let drove = login_with(
+        &tmp.path().join("login"),
+        &Endpoints {
+            issuer: DEFAULT_ISSUER.into(),
+            token_url: "http://127.0.0.1:1/oauth/token".into(),
+            callback_ports: vec![0],
+        },
+        &mut approver,
+        HOSTS,
+        None,
+        WakeDeadline::after(Duration::from_secs(3600)),
+    );
+    assert_eq!(approver.before, Some(true), "the handoff's deadline stood");
+    assert_eq!(
+        approver.after,
+        Some(false),
+        "the cancellation passed the handoff's deadline"
+    );
+    assert!(
+        matches!(&drove.outcome, Outcome::Unverified(why) if why.contains("cancelled")),
+        "{:?}",
+        drove.outcome
+    );
+}

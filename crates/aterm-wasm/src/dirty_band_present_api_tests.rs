@@ -210,3 +210,91 @@ fn selection_change_bands_only_the_selection_rows() {
     );
     assert_eq!(t.rgba, full_expansion(&t));
 }
+
+#[test]
+fn rgba_shift_matches_snapshot_coordinates_and_preserves_unmoved_bytes() {
+    for w in [0usize, 1, 2, 7] {
+        for h in [0usize, 1, 2, 5, 9] {
+            let original: Vec<u8> = (0..w * h * 4 + 3).map(|n| (n % 251) as u8).collect();
+            for y0 in 0..h + 2 {
+                for y1 in 0..h + 2 {
+                    for delta in [i64::MIN, -10, -5, -2, -1, 0, 1, 2, 5, 10, i64::MAX] {
+                        let mut expected = original.clone();
+                        if w != 0 && y0 < y1 && y1 <= h {
+                            for row in y0..y1 {
+                                let source = row as i128 + i128::from(delta);
+                                if source >= y0 as i128 && source < y1 as i128 {
+                                    let stride = w * 4;
+                                    let source = source as usize;
+                                    expected[row * stride..(row + 1) * stride].copy_from_slice(
+                                        &original[source * stride..(source + 1) * stride],
+                                    );
+                                }
+                            }
+                        }
+                        let mut actual = original.clone();
+                        shift_rgba_band(&mut actual, w, y0, y1, delta);
+                        assert_eq!(
+                            actual, expected,
+                            "w={w} h={h} y0={y0} y1={y1} delta={delta}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for w in [usize::MAX, usize::MAX / 4 + 1] {
+        let mut bytes = [1, 2, 3, 4];
+        shift_rgba_band(&mut bytes, w, 0, 1, 1);
+        assert_eq!(bytes, [1, 2, 3, 4]);
+    }
+}
+
+#[test]
+#[ignore = "manual before/after pixel-band shift measurement; run alone"]
+fn rgba_shift_cost() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let case: usize = std::env::var("ATERM_RGBA_SHIFT_CASE")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (w, h, delta) = [
+        (64usize, 32usize, 1i64),
+        (640, 480, 1),
+        (1600, 900, 14),
+        (1600, 900, -14),
+    ][case];
+    let stride = w * 4;
+    let original: Vec<u8> = (0..stride * h).map(|n| (n % 251) as u8).collect();
+    let mut expected = original.clone();
+    let mag = delta.unsigned_abs() as usize;
+    for row in 0..h {
+        let source = if delta > 0 {
+            row + ((h - 1 - row) / mag) * mag
+        } else {
+            row % mag
+        };
+        expected[row * stride..(row + 1) * stride]
+            .copy_from_slice(&original[source * stride..(source + 1) * stride]);
+    }
+    let mut rgba = original;
+    eprintln!("RGBA shift case={case} width={w} height={h} delta={delta} batches=20 shifts_per_batch=128 bytes={}", rgba.len());
+    for batch in 0..20 {
+        let start = Instant::now();
+        for _ in 0..128 {
+            shift_rgba_band(
+                black_box(&mut rgba),
+                black_box(w),
+                black_box(0),
+                black_box(h),
+                black_box(delta),
+            );
+        }
+        eprintln!(
+            "RGBA shift batch={batch} elapsed_ns={}",
+            start.elapsed().as_nanos()
+        );
+    }
+    assert_eq!(black_box(rgba), expected);
+}

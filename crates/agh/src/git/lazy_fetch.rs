@@ -3,9 +3,10 @@
 
 //! How a git keeps a read from fetching an object a partial clone lacks ([`NoLazyFetch`]), told
 //! by what the git does rather than by its version. One answer for every reader that must judge
-//! only the objects a repository has: aterm-machines' checkout and dependency reads and atpkg's
-//! build-cache cleanup each ask it of their own [`Git`], the program, account and environment
-//! they run. This module starts no process itself.
+//! only the objects a repository has: aterm-machines' checkout and dependency reads ask it of
+//! their own [`Git`], the program, account and environment they run, and atpkg's build-cache
+//! cleanup and aterm-release's local reads, which run a git by its path, ask it of atpkg's
+//! `git_lazy_fetch::Hermetic`, once per file in a process. This module starts no process itself.
 
 use std::ffi::OsStr;
 use std::path::Path;

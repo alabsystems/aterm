@@ -604,7 +604,8 @@ impl<'a, 'b> Page<'a, 'b> {
     }
 
     /// [`Self::button`] held to `room`: its face as it is where it fits, else wrapped onto the
-    /// lines it needs, else `short` where that fits one line. With its width and height.
+    /// lines it needs, else `short` on the lines its words need, else breaking a word only
+    /// where it cannot fit a line. With its width and height.
     fn fitted_button(
         key: &str,
         label: String,
@@ -633,6 +634,24 @@ impl<'a, 'b> Page<'a, 'b> {
                 }
                 None if short.is_some_and(|short| Metrics::button_w(short) <= room) => {
                     control.spec.visual_label = short.map(str::to_owned);
+                }
+                None => {
+                    let lines = short
+                        .and_then(|short| {
+                            crate::native_ui::native_button_label_lines(short, words_room)
+                        })
+                        .unwrap_or_else(|| {
+                            crate::native_settings::wrap_to_box(
+                                &face,
+                                words_room,
+                                &crate::native_ui::native_button_label_width,
+                            )
+                        });
+                    height = on_grid(crate::native_ui::native_button_height_for_lines(
+                        lines.len(),
+                        h,
+                    ));
+                    control.spec.visual_label = Some(lines.join("\n"));
                 }
                 _ => {}
             }
@@ -2404,7 +2423,7 @@ impl<'a, 'b> Page<'a, 'b> {
         let (mut button, button_w, button_h) = Self::fitted_button(
             "system-state/row/secrets/disclose",
             "Join a different vault…".to_owned(),
-            Some("Other vault…"),
+            None,
             StyleRef::Plain,
             true,
             m.row_h,

@@ -13,7 +13,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::rules::PRODUCT;
-use super::stock_label::where_cargo_looks;
 use super::{Finding, Reach, Rule, SourceFile, Tree, after_ws, joined};
 use crate::scan_set::ManifestTargets;
 
@@ -200,6 +199,27 @@ pub(super) fn pkg_roots(dir: &str, targets: &ManifestTargets, files: &[&SourceFi
         shipped,
         build,
     }
+}
+
+/// Where Cargo looks, beside the manifest, for the root of a target of `kind` declared with
+/// `name` and no `path`; `own` when that name is the package's, which a binary's
+/// `src/main.rs` carries.
+fn where_cargo_looks(kind: &str, name: Option<&str>, own: bool) -> Vec<String> {
+    let dir = match kind {
+        "bin" => "src/bin",
+        "test" => "tests",
+        "bench" => "benches",
+        "example" => "examples",
+        _ => return vec!["src/lib.rs".to_string()],
+    };
+    let mut out: Vec<String> = name
+        .into_iter()
+        .flat_map(|name| [format!("{dir}/{name}.rs"), format!("{dir}/{name}/main.rs")])
+        .collect();
+    if kind == "bin" && own {
+        out.push("src/main.rs".to_string());
+    }
+    out
 }
 
 /// First 1-based line carrying a `#[test]` attribute in the CODE view (outside strings/comments).

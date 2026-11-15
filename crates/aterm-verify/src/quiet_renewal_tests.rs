@@ -377,7 +377,11 @@ fn a_panicking_timed_stage_lets_the_runs_quiet_claim_go() {
             &appkit,
             crate::plan::StageId::RedrawConformance,
             "AppKit redraw",
-            |need| aterm_capacity::admit::try_admit_with(&window, &machine, need),
+            crate::WindowWait {
+                bound: aterm_spec::wait::MUST_HAPPEN,
+                look: std::time::Duration::from_millis(20),
+            },
+            |need| aterm_capacity::admit::try_admit_observed_with(&window, &machine, need),
             || -> Result<(), String> {
                 excluded.set(listed() == 1);
                 panic!("an AppKit stage's panic")

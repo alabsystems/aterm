@@ -51,6 +51,8 @@ pub mod editor;
 /// The shared input reducer: one key-to-command semantics for every face.
 pub mod input;
 pub mod language;
+mod prepared;
+mod prepared_directory;
 pub mod protocol;
 /// The store of open documents and their views.
 pub mod store;

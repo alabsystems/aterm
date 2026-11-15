@@ -29,8 +29,8 @@ const SERVICE_LIFETIME: Duration = Duration::from_secs(600);
 const QUALIFICATION_LIFETIME: Duration = Duration::from_secs(900);
 const EXACT: &str = "actor::owner::tests::metadata_native::actual_fixed_metadata_owner_preserves_original_resources_and_drains";
 
-// These count only the owned controller's successfully emitted lifecycle
-// bytes. Arbitrary target stdout never renews the native hang detector, and
+// These count the owned controller's emitted lifecycle bytes and completed
+// closed-image qualification stages. Arbitrary target stdout never renews the hang detector, and
 // no progress reading can extend the original service absolute deadline.
 fn capture_progress(path: &std::path::Path) -> u64 {
     fs::read_dir(path)
@@ -38,7 +38,10 @@ fn capture_progress(path: &std::path::Path) -> u64 {
         .flatten()
         .take(256)
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().as_bytes().ends_with(b".events"))
+        .filter(|entry| {
+            entry.file_name().as_bytes().ends_with(b".events")
+                || entry.file_name() == "native-images-qualified"
+        })
         .filter_map(|entry| entry.metadata().ok())
         .map(|meta| meta.len())
         .sum()
@@ -52,6 +55,15 @@ fn store_progress(path: &std::path::Path) -> u64 {
         .filter(|entry| entry.file_name().as_bytes().starts_with(b"owner-engine-"))
         .map(|entry| capture_progress(&entry.path()))
         .sum()
+}
+
+fn image_qualified(world: &World) {
+    let mut completed = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(world.scratch.path.join("native-images-qualified"))
+        .unwrap();
+    completed.write_all(b"qualified\n").unwrap();
 }
 
 /// This fixture's roles in the library's own test image, which is the one
@@ -259,6 +271,10 @@ fn host() {
         program.path().to_path_buf()
     };
     fs::copy(source, &service).unwrap();
+    if !genuine {
+        crate::native_fixture::qualify_image(&service);
+        image_qualified(&world);
+    }
     atpkg::platform::install_shim_to(&layout.bin_dir().join("targo"), &service).unwrap();
     atpkg::store::mark_build_ready(&build).unwrap();
     let target_layout = genuine.then(|| atpkg::store::resolve_configured().unwrap());
@@ -302,6 +318,8 @@ fn host() {
         fs::create_dir_all(target_root.join("lib/rustlib/aarch64-apple-darwin/lib")).unwrap();
         let selected = target_root.join("bin/native-metadata");
         fs::copy(program.path(), &selected).unwrap();
+        crate::native_fixture::qualify_image(&selected);
+        image_qualified(&world);
         selected
     };
     // Diagnostic-only: retain the handshake to isolate the frozen old client's

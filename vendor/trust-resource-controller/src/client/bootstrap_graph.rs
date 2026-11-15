@@ -17,9 +17,13 @@ use crate::bootstrap_graph::{
 };
 use crate::{Channel, ContextReply};
 
+mod archive;
+mod configuration;
+mod materialization;
 mod object;
 mod query;
 mod store;
+pub use archive::{ArchiveFailure, ArchiveObservation, CompletedArchive};
 pub use object::{CompletedObjectCompile, ObjectFailure, ObjectObservation};
 pub use query::{CompletedSdkQuery, QueryFailure, QueryObservation};
 pub use store::{EarlyHostStore, PendingHostStore, capture_host_store, snapshot_host_store};
@@ -100,6 +104,13 @@ impl QueryState {
         Ok(())
     }
     fn completed_object(&mut self, original: &CompletedObjectCompile) -> io::Result<()> {
+        if self.active != Some(original.request().key.sequence) {
+            return Err(crate::wire::invalid());
+        }
+        self.active = None;
+        Ok(())
+    }
+    fn completed_archive(&mut self, original: &CompletedArchive) -> io::Result<()> {
         if self.active != Some(original.request().key.sequence) {
             return Err(crate::wire::invalid());
         }
@@ -206,11 +217,16 @@ pub struct EnrolledBootstrapGraph {
 pub struct SourceBoundBootstrapGraph {
     original: Option<Connection>,
     source: SourceAttachment,
+    configuration: Vec<crate::bootstrap_graph::ConfigurationAttachment>,
+    configuration_budget: crate::bootstrap_graph::configuration::ConfigurationBudget,
+    materialization: Option<materialization::PreparedContents>,
 }
 pub struct OutputBoundBootstrapGraph {
     original: Option<Connection>,
     source: SourceAttachment,
     output: OutputAttachment,
+    configuration: Vec<crate::bootstrap_graph::ConfigurationAttachment>,
+    materialization: Option<materialization::PreparedContents>,
 }
 impl EnrolledBootstrapGraph {
     /// Observation of this actual accepted enrollment, never a constructor.
@@ -507,7 +523,13 @@ impl EnrolledBootstrapGraph {
             original.channel.poison();
             return Err(GraphFailure::retaining(original, Delivery::Unknown, error));
         }
-        let mut owner = SourceBoundBootstrapGraph { original: Some(original), source: request };
+        let mut owner = SourceBoundBootstrapGraph {
+            original: Some(original),
+            source: request,
+            configuration: Vec::new(),
+            configuration_budget: Default::default(),
+            materialization: None,
+        };
         if let Err(error) = time(deadline) {
             return Err(GraphFailure::retaining(
                 owner.original.take().expect("same original graph"),
@@ -541,6 +563,9 @@ impl SourceBoundBootstrapGraph {
             original.queries.enrollment_allowed()?;
             if request.key != original.request.key {
                 return Err(crate::wire::invalid());
+            }
+            if let Some(materialization) = &self.materialization {
+                materialization.check(self.source.source_directory, Some(&request))?;
             }
             transport::check_output(&request, files)?;
             original.check(deadline)
@@ -587,6 +612,8 @@ impl SourceBoundBootstrapGraph {
             original: Some(original),
             source: self.source.clone(),
             output: request,
+            configuration: std::mem::take(&mut self.configuration),
+            materialization: self.materialization.take(),
         };
         if let Err(error) = time(deadline) {
             return Err(GraphFailure::retaining(

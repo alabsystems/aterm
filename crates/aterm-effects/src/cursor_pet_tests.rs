@@ -11,10 +11,17 @@ fn pets_resolve_trimmed_and_case_insensitively_and_off_draws_none() {
     assert_eq!(canonical(" Off "), Some("off"));
     assert_eq!(species("off"), None);
     // A flier keeps no walker, and only a flier flies.
-    assert_eq!((species(FLYING_CAT), flies(" Flying Cat ")), (None, true));
+    assert_eq!(
+        (species(FLYING_CAT), flies(" Flying Cat ")),
+        (None, Some(PetSpecies::Cat))
+    );
     for pet in PETS {
-        assert_eq!(pet.flies, pet.name == FLYING_CAT, "{}", pet.name);
-        assert!(!(pet.flies && pet.species.is_some()), "{}", pet.name);
+        assert_eq!(pet.flies.is_some(), pet.name == FLYING_CAT, "{}", pet.name);
+        assert!(
+            !(pet.flies.is_some() && pet.species.is_some()),
+            "{}",
+            pet.name
+        );
     }
     for unknown in ["", "kitty", "fox", "cat pet", "rainbow dog pet"] {
         assert_eq!(row(unknown), None, "{unknown:?}");

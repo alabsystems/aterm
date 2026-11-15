@@ -12,7 +12,7 @@
 //! a brace inside a string, a comment or a char literal never opens or closes anything.
 //!
 //! An item is test-only when one of its own outer attributes is `#[cfg(P)]` with `P` false whenever
-//! `test` is ([`crate::wasm_cfg::when_test_disabled`]). rustc evaluates every `cfg` and `cfg_attr`
+//! `test` is ([`when_test_disabled`]). rustc evaluates every `cfg` and `cfg_attr`
 //! of an item before any attribute macro on it runs, and a `cfg_attr` can only add attributes, so
 //! nothing else on the item keeps it in a build without tests. Items are read at the top of the
 //! file and inside the inline modules, `impl` and `trait` blocks, each only where every attribute
@@ -38,10 +38,9 @@
 //! What this reader does not see: what a proc macro or a build script generates, which is assumed
 //! not to declare a module from a source file.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::lex::{self, SpanKind};
-use crate::wasm_cfg::{Truth, when_test_disabled};
 
 /// One file, read.
 #[derive(Debug)]
@@ -1315,83 +1314,6 @@ fn item_terminator(src: &str, trees: &[Tree], sig: &[usize], p: usize) -> Option
     None
 }
 
-/// Real body extents for caller-selected item starts. Each pair is the
-/// opening byte and its exclusive header bound. This determines extent only,
-/// not whether the caller's opening is a Rust item or an associated owner.
-/// Const-expression token groups remain opaque while the existing item
-/// terminator walks angle depth; a bodyless alias yields no body. Return the
-/// header with comments, literals and group interiors masked, so their comparisons and
-/// keywords cannot change the caller's lexical owner/type-parameter reading.
-pub(crate) fn item_bodies_at(
-    src: &str,
-    starts: &[(usize, usize)],
-) -> BTreeMap<usize, (String, usize)> {
-    fn visit(
-        src: &str,
-        trees: &[Tree],
-        starts: &BTreeMap<usize, usize>,
-        bodies: &mut BTreeMap<usize, (String, usize)>,
-    ) {
-        let sig = significant(trees);
-        for (p, &index) in sig.iter().enumerate() {
-            let tree = &trees[index];
-            if let Some(&limit) = starts.get(&tree.start()) {
-                let upper = sig.partition_point(|&index| trees[index].start() < limit);
-                if p < upper
-                    && let Some(end) = item_terminator(src, trees, &sig[..upper], p)
-                {
-                    let body = &trees[sig[end]];
-                    if delimiter(src, body) == Some(b'{') {
-                        let start = tree.start();
-                        let mut header = src.as_bytes()[start..body.start()].to_vec();
-                        for part in &trees[index..sig[end]] {
-                            let masked = match part {
-                                Tree::Group { open, close, .. } => Some((open.end, close.start)),
-                                Tree::Leaf(token)
-                                    if matches!(
-                                        token.kind,
-                                        Kind::Comment
-                                            | Kind::OuterDoc
-                                            | Kind::InnerDoc
-                                            | Kind::Str
-                                            | Kind::Char
-                                    ) =>
-                                {
-                                    Some((token.start, token.end))
-                                }
-                                _ => None,
-                            };
-                            if let Some((from, to)) = masked {
-                                header[from - start..to - start].fill(b' ');
-                            }
-                        }
-                        // Whole token/group boundaries are UTF-8 boundaries;
-                        // replacing their bytes with ASCII preserves UTF-8.
-                        let header =
-                            String::from_utf8(header).expect("masked source header is UTF-8");
-                        bodies.insert(start, (header, body.end()));
-                    }
-                }
-            }
-            if let Tree::Group { children, .. } = tree {
-                visit(src, children, starts, bodies);
-            }
-        }
-    }
-    if starts.is_empty() {
-        return BTreeMap::new();
-    }
-    let Some(tokens) = tokenize(src) else {
-        return BTreeMap::new();
-    };
-    let Some(trees) = build(src, tokens) else {
-        return BTreeMap::new();
-    };
-    let mut bodies = BTreeMap::new();
-    visit(src, &trees, &starts.iter().copied().collect(), &mut bodies);
-    bodies
-}
-
 /// Collect, at any depth: module declarations [`items`] did not place (each one this reader cannot
 /// vouch for), `include!`-family invocations, string literals, and what a macro or another front
 /// end may read outside the items [`items`] read.
@@ -1569,6 +1491,433 @@ fn concat_arg(src: &str, args: &[Tree]) -> IncludeArg {
         Some(_) => IncludeArg::ManifestDir(path),
         None => IncludeArg::Relative(path),
     }
+}
+
+/// A `cfg` predicate's value where only some of its atoms are settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Truth {
+    True,
+    False,
+    /// The settled atoms do not decide it.
+    Unknown,
+}
+
+impl Truth {
+    const fn not(self) -> Self {
+        match self {
+            Truth::True => Truth::False,
+            Truth::False => Truth::True,
+            Truth::Unknown => Truth::Unknown,
+        }
+    }
+}
+
+/// `pred`'s value with `test` false, every other cfg atom unsettled.
+pub(crate) fn when_test_disabled(pred: &str) -> Truth {
+    evaluate(pred, &|atom| {
+        if atom == "test" {
+            Truth::False
+        } else {
+            Truth::Unknown
+        }
+    })
+}
+
+/// Parse the complete predicate before accepting even an absorbing boolean result.
+fn evaluate(pred: &str, atom: &dyn Fn(&str) -> Truth) -> Truth {
+    fn parse(input: &str, at: &mut usize, atom: &dyn Fn(&str) -> Truth) -> Option<Truth> {
+        let bytes = input.as_bytes();
+        let space = |at: &mut usize| {
+            while bytes.get(*at).is_some_and(u8::is_ascii_whitespace) {
+                *at += 1;
+            }
+        };
+        space(at);
+        let start = *at;
+        if !bytes
+            .get(*at)
+            .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        {
+            return None;
+        }
+        *at += 1;
+        while bytes
+            .get(*at)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            *at += 1;
+        }
+        let name = &input[start..*at];
+        space(at);
+        if bytes.get(*at) == Some(&b'(') {
+            *at += 1;
+            space(at);
+            let mut values = Vec::new();
+            if bytes.get(*at) != Some(&b')') {
+                loop {
+                    values.push(parse(input, at, atom)?);
+                    space(at);
+                    if bytes.get(*at) != Some(&b',') {
+                        break;
+                    }
+                    *at += 1;
+                    space(at);
+                    if bytes.get(*at) == Some(&b')') {
+                        break;
+                    }
+                }
+            }
+            if bytes.get(*at) != Some(&b')') {
+                return None;
+            }
+            *at += 1;
+            return match name {
+                "not" if values.len() == 1 => Some(values[0].not()),
+                "not" => None,
+                "all" if values.contains(&Truth::False) => Some(Truth::False),
+                "any" if values.contains(&Truth::True) => Some(Truth::True),
+                "all" | "any" if values.contains(&Truth::Unknown) => Some(Truth::Unknown),
+                "all" => Some(Truth::True),
+                "any" => Some(Truth::False),
+                _ => None,
+            };
+        }
+        if bytes.get(*at) == Some(&b'=') {
+            *at += 1;
+            space(at);
+            if bytes.get(*at) != Some(&b'"') {
+                return None;
+            }
+            *at += 1;
+            while let Some(&byte) = bytes.get(*at) {
+                if byte == b'"' {
+                    break;
+                }
+                if byte == b'\\' {
+                    return None;
+                }
+                *at += 1;
+            }
+            if bytes.get(*at) != Some(&b'"') {
+                return None;
+            }
+            *at += 1;
+        }
+        Some(atom(input[start..*at].trim()))
+    }
+    let mut at = 0;
+    let Some(value) = parse(pred, &mut at, atom) else {
+        return Truth::Unknown;
+    };
+    if pred[at..].trim().is_empty() {
+        value
+    } else {
+        Truth::Unknown
+    }
+}
+
+/// `text` with every item whose immediately preceding attribute line `is_gate` holds of (trimmed)
+/// blanked, line for line ([`unmasked_lines`]).
+pub(crate) fn mask_items_where(text: &str, is_gate: &dyn Fn(&str) -> bool) -> String {
+    let keep = unmasked_lines(text, is_gate);
+    let mut out = String::with_capacity(text.len());
+    for (line, keep) in text.lines().zip(keep) {
+        if keep {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Per line of `text`, whether [`mask_items_where`] keeps it. A line that opens inside a literal or
+/// comment carried over from an earlier line ends no item by its indent: its code view starts
+/// wherever the literal happens to end.
+pub(crate) fn unmasked_lines(text: &str, is_gate: &dyn Fn(&str) -> bool) -> Vec<bool> {
+    // Literal/comment state spans physical lines. A fixture's column-zero `}`
+    // or `#[cfg(test)]` is data, never an item boundary or an attribute. Keep
+    // attribute values in the text view for value-aware target predicates.
+    // One lexing serves both views, the attributes and the carried lines.
+    let spans = crate::lex::spans(text);
+    let lexed = lexed_views(text, &spans);
+    let lines: Vec<&str> = lexed.code.lines().collect();
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    // By the line each starts on; of two on one line, the later one.
+    let mut attributes: Vec<Option<(usize, &str, bool)>> = vec![None; line_starts.len()];
+    for (start, end) in outer_attributes_of(&lexed.code) {
+        let first = line_starts.partition_point(|&at| at <= start) - 1;
+        let last = line_starts.partition_point(|&at| at <= end) - 1;
+        let tail = lexed.code[end..]
+            .lines()
+            .next()
+            .is_some_and(|line| !line.trim().is_empty());
+        attributes[first] = Some((last, &lexed.text[start..end], tail));
+    }
+    let attribute_at = |line: usize| attributes.get(line).copied().flatten();
+    let carried = lines_opening_in_a_span(&spans, &line_starts, lines.len());
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let mut keep = vec![true; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        let Some((attr_end, attr, tail)) = attribute_at(i) else {
+            i += 1;
+            continue;
+        };
+        let t = lines[i].trim_start();
+        if !t.starts_with("#[") || tail || !is_gate(attr.trim()) {
+            i += 1;
+            continue;
+        }
+        let indent = lines[i].len() - t.len();
+        let mut j = attr_end + 1;
+        let mut ambiguous_tail = false;
+        while let Some((end, _, tail)) = attribute_at(j) {
+            if tail {
+                ambiguous_tail = true;
+                break;
+            }
+            j = end + 1;
+        }
+        // This line-based mask cannot exclude one item while preserving another on
+        // the same line. Keep that spelling rather than hiding unrelated code.
+        if ambiguous_tail {
+            i = j + 1;
+            continue;
+        }
+        keep[i..j].fill(false);
+        if j >= lines.len() {
+            break;
+        }
+        let mut k = j;
+        let mut opened = false;
+        let mut terminated = false;
+        let mut ambiguous = false;
+        let mut item_delimiters = Vec::new();
+        while k < lines.len() {
+            let item = lines[k];
+            if k > j && !carried[k] && !item.trim().is_empty() && indent_of(lines[k]) < indent {
+                k -= 1;
+                terminated = true;
+                break;
+            }
+            // A gated const/use can end before a different item's brace on this
+            // same line. Inspect the top-level terminator before treating any brace
+            // as belonging to the gated candidate.
+            if item_has_ambiguous_tail(item, &mut item_delimiters) {
+                keep[i..=k].fill(true);
+                ambiguous = true;
+                break;
+            }
+            keep[k] = false;
+            if item.contains('{') {
+                opened = true;
+                terminated = true;
+                break;
+            }
+            let s = item.trim_end();
+            if item_delimiters.is_empty()
+                && (s.ends_with(';')
+                    || (s.ends_with(',') && !carried[k] && indent_of(lines[k]) == indent))
+            {
+                terminated = true;
+                break;
+            }
+            k += 1;
+        }
+        if ambiguous {
+            i = k + 1;
+            continue;
+        }
+        if !terminated {
+            for slot in keep.iter_mut().take(lines.len()).skip(j) {
+                *slot = true;
+            }
+            break;
+        }
+        if opened {
+            let first = lines[k];
+            let single = first.matches('{').count() == first.matches('}').count();
+            if single && !brace_item_ends_line(first) {
+                keep[i..=k].fill(true);
+            } else if !single {
+                let end = (k + 1..lines.len()).find(|m| {
+                    let c = lines[*m];
+                    c.as_bytes().get(indent) == Some(&b'}')
+                        && c.as_bytes()[..indent].iter().all(|&b| b == b' ')
+                        && !c.contains('{')
+                        && item_tail(&c[indent + 1..])
+                });
+                match end {
+                    Some(end) => {
+                        for slot in keep.iter_mut().take(end + 1).skip(k) {
+                            *slot = false;
+                        }
+                        k = end;
+                    }
+                    None => {
+                        for slot in keep.iter_mut().take(k + 1).skip(j) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+        }
+        i = k + 1;
+    }
+    keep
+}
+
+/// A balanced brace item may share its line with another item; that is not an
+/// exclusion this line mask can represent.
+fn brace_item_ends_line(code: &str) -> bool {
+    let mut depth = 0usize;
+    let mut opened = false;
+    for (at, byte) in code.bytes().enumerate() {
+        match byte {
+            b'{' => {
+                opened = true;
+                depth += 1;
+            }
+            b'}' if opened => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return item_tail(&code[at + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A closure/array call may close delimiters after its brace. No named call,
+/// operator or second item can be hidden by accepting only this punctuation.
+fn item_tail(tail: &str) -> bool {
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return true;
+    }
+    let Some(body) = tail.strip_suffix(';').or_else(|| tail.strip_suffix(',')) else {
+        return false;
+    };
+    body.bytes()
+        .all(|byte| byte.is_ascii_whitespace() || matches!(byte, b')' | b']' | b'?'))
+}
+
+/// Array lengths/repetitions and nested expressions contain semicolons without
+/// ending the candidate. A top-level terminator followed by code is a different
+/// item/statement that this line-based mask must preserve.
+fn item_has_ambiguous_tail(code: &str, stack: &mut Vec<u8>) -> bool {
+    for (at, byte) in code.bytes().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => stack.push(byte),
+            b')' | b']' | b'}' => {
+                let wanted = match byte {
+                    b')' => b'(',
+                    b']' => b'[',
+                    _ => b'{',
+                };
+                if stack.pop() != Some(wanted) {
+                    return true;
+                }
+            }
+            b';' if stack.is_empty() => return !code[at + 1..].trim().is_empty(),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Per line (`count` of them, as [`str::lines`] splits the text `line_starts` indexes), whether
+/// the line opens inside one of `spans` that began on an earlier line.
+fn lines_opening_in_a_span(
+    spans: &[crate::lex::Span],
+    line_starts: &[usize],
+    count: usize,
+) -> Vec<bool> {
+    let starts = &line_starts[..count.min(line_starts.len())];
+    let mut carried = vec![false; count];
+    for span in spans {
+        let first = starts.partition_point(|&start| start <= span.start);
+        for (line, &start) in starts.iter().enumerate().skip(first) {
+            if start >= span.end {
+                break;
+            }
+            carried[line] = true;
+        }
+    }
+    carried
+}
+
+/// [`crate::lex::lex`] of `src` from its already-read `spans`.
+fn lexed_views(src: &str, spans: &[crate::lex::Span]) -> crate::lex::Lexed {
+    let blank = |bytes: &mut [u8]| {
+        for b in bytes {
+            if *b != b'\n' {
+                *b = b' ';
+            }
+        }
+    };
+    let utf8 = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    };
+    let mut code = src.as_bytes().to_vec();
+    let mut text = code.clone();
+    for span in spans {
+        blank(&mut code[span.start..span.end]);
+        if span.kind == crate::lex::SpanKind::Comment {
+            blank(&mut text[span.start..span.end]);
+        }
+        if let Some((open, close)) = span.quotes
+            && !src.as_bytes()[span.start..span.end].contains(&b'\n')
+        {
+            code[open] = b'"';
+            code[close] = b'"';
+        }
+    }
+    crate::lex::Lexed {
+        code: utf8(code),
+        text: utf8(text),
+    }
+}
+
+/// [`crate::lex::outer_attributes`] of the source whose code view is `code`.
+fn outer_attributes_of(code: &str) -> Vec<(usize, usize)> {
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        // Only a `#` can open one.
+        match code[at..].find('#') {
+            Some(hash) => at += hash,
+            None => break,
+        }
+        if at + 1 >= bytes.len() {
+            break;
+        }
+        if bytes[at + 1] == b'[' {
+            let start = at;
+            at += 2;
+            let mut depth = 1usize;
+            while at < bytes.len() && depth > 0 {
+                match bytes[at] {
+                    b'[' => depth += 1,
+                    b']' => depth -= 1,
+                    _ => {}
+                }
+                at += 1;
+            }
+            if depth == 0 {
+                out.push((start, at));
+            }
+        } else {
+            at += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]

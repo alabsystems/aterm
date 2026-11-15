@@ -255,7 +255,7 @@ pub(super) fn local_log_under(
     config: &Config,
 ) -> crate::Result<Option<HeldLog>> {
     let state = reads.state()?;
-    if state.membership != super::Stored::In || state.failed || !state.pending.is_empty() {
+    if state.membership != super::Stored::In || state.failed {
         return Ok(None);
     }
     if state.digest.is_none()
@@ -855,8 +855,22 @@ fn observed_roster(
     }
     let result = open()?;
     if let Ok(mut cache) = ROSTERS.lock() {
+        #[cfg(not(test))]
         if cache.len() >= 16 {
             cache.pop_front();
+        }
+        // In this crate's test process the bound is each reader's, as a memo's is each folder's
+        // (`vault_memo`): a law that counts the reads a warm cache saves holds whatever other
+        // tests read meanwhile.
+        #[cfg(test)]
+        if cache
+            .iter()
+            .filter(|((reader, _), _)| *reader == key.0)
+            .count()
+            >= 16
+            && let Some(oldest) = cache.iter().position(|((reader, _), _)| *reader == key.0)
+        {
+            cache.remove(oldest);
         }
         cache.push_back((key, result.clone()));
     }
@@ -2936,7 +2950,7 @@ pub use member::{
     WriteRoute, member_set, member_unset, per_host_shadows, write_route,
 };
 #[cfg(test)]
-pub(super) use member::{BEFORE_OUTCOME, UNSET_UNDER_OLD_EPOCH};
+pub(super) use member::{BEFORE_DRAFT, BEFORE_LAND, BEFORE_OUTCOME, UNSET_UNDER_OLD_EPOCH};
 #[cfg(any(test, debug_assertions))]
 pub use member::{TestPassClaim, test_hold_pass_claim};
 pub(crate) use member::{member_unset_names, member_waits_here, member_write};
@@ -2947,8 +2961,8 @@ pub(super) use waiting::{
     BASES_LOG_ONLY, BASES_WITHOUT_HELD, DRAFT_UNCLAIMED, DRAFTS_AT_ONCE, HELD_UNDEFERRED,
     MOVES_WAIT, NAMES_UNMERGED, OVERTAKEN_UNRECORDED, PASS_COMMITTED, PENDING_BY_COUNT,
     RACE_UNDEFERRED, SETTLE_UNCARRIED, Shapes, TURN_WAITS, UNREAD_AS_NONE, VIEW_WITHOUT_WAITING,
-    Values, base_of, everyone_edit, held_values_or_unread, pending_reach, waiting_and_pending,
-    waiting_file, waiting_shapes, waiting_values, waits_over,
+    Values, WAITING_LOCK_TAKES, base_of, everyone_edit, held_values_or_unread, pending_reach,
+    waiting_and_pending, waiting_drafts, waiting_file, waiting_shapes, waiting_values, waits_over,
 };
 pub use waiting::{Overtaken, Overtaker};
 pub(super) use waiting::{
@@ -4721,11 +4735,25 @@ fn author_snapshot(paths: &Paths, store: Store) -> crate::Result<Store> {
 pub(super) fn author_and_commit_records_until<T>(
     paths: &Paths,
     deadline: Instant,
-    mut draft: impl FnMut(&Store) -> crate::Result<(Vec<Record>, T)>,
+    draft: impl FnMut(&Store) -> crate::Result<(Vec<Record>, T)>,
 ) -> crate::Result<Option<(Vec<Record>, Store, T)>> {
-    let Some(_author) = RecordsAuthorLock::try_take_until(paths, deadline)? else {
+    let Some(author) = RecordsAuthorLock::try_take_until(paths, deadline)? else {
         return Ok(None);
     };
+    author_and_commit_records_held(paths, &author, deadline, draft)
+}
+
+/// [`author_and_commit_records_until`] by an author that holds [`RecordsAuthorLock`] already and
+/// keeps it afterwards: a member write lands what its draft leaves waiting in the same turn of the
+/// lock, so no author that takes the lock signs between its draft and its landing
+/// (`member::member_write`).
+/// `Ok(None)` where another local writer holds [`StateLock`] past `deadline`.
+pub(super) fn author_and_commit_records_held<T>(
+    paths: &Paths,
+    _author: &RecordsAuthorLock,
+    deadline: Instant,
+    mut draft: impl FnMut(&Store) -> crate::Result<(Vec<Record>, T)>,
+) -> crate::Result<Option<(Vec<Record>, Store, T)>> {
     for attempt in 0..4 {
         // Draft authorization reads share one observation. A busy writer yields within
         // the caller's deadline instead of turning its unavailable roster into an error.

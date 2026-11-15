@@ -5,7 +5,7 @@
 //! shows a wall (the tab chip, `status`) both read, so the two cannot
 //! disagree about whether a person is needed.
 
-use aterm_phase::wall::WallKind;
+use alab_policy::vocab::WallKind;
 
 use super::super::config::SupervisorConfig;
 
@@ -29,7 +29,7 @@ pub enum ExceptionKind {
     /// the third `/compact`.
     Context,
     /// A request the API refuses the same way each time it is sent
-    /// ([`aterm_phase::ApiCause::Request`]: a safeguards refusal, a model not
+    /// ([`alab_policy::vocab::ApiCause::Request`]: a safeguards refusal, a model not
     /// found, a tool history it rejects): the supervisor's slow ladder goes
     /// on, and what ends it is a person's change in the tab (`/rewind`,
     /// `/model`, a rephrased message), so the host files it per tab.
@@ -115,7 +115,7 @@ pub const fn outlook(
         WallKind::ModelBucket { .. } if has_reset => Outlook::Resumes,
         WallKind::ModelBucket { .. } => Outlook::ResumesAndAsks(ExceptionKind::Bucket),
         WallKind::ApiError {
-            cause: aterm_phase::ApiCause::Request,
+            cause: alab_policy::vocab::ApiCause::Request,
             ..
         } if cfg.retry_api_errors => Outlook::ResumesAndAsks(ExceptionKind::Refused),
         WallKind::ApiError { .. } | WallKind::Overloaded if cfg.retry_api_errors => {

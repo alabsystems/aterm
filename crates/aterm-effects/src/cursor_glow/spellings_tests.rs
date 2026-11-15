@@ -35,7 +35,7 @@ fn check_vocabulary(rows: &[TrailStyleRow], retired: &[RetiredTrailStyle]) -> Re
         }
         if let Some(pet) = was.pet
             && crate::cursor_pet::species(pet).is_none()
-            && !crate::cursor_pet::flies(pet)
+            && crate::cursor_pet::flies(pet).is_none()
         {
             return Err(format!(
                 "{:?} became the pet {pet:?}, which is no animal",

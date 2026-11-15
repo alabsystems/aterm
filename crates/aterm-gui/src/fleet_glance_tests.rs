@@ -1330,7 +1330,7 @@ fn the_glance_spawns_no_child_process_and_reads_a_fixtures_now_needs_rows() {
         vec![FleetNeed {
             sid: worker.to_string(),
             word: NeedWord::Stalled,
-            who: crate::presence::short_sid(&worker.to_string()),
+            who: crate::presence::short_sid(worker.as_str()),
             age_ms: Some(120_000),
         }]
     );
@@ -2672,6 +2672,492 @@ fn sightings_keep_this_mac_and_every_agent_row_and_parse_is_unchanged() {
     assert!(none.machines.is_empty());
 }
 
+/// The answer a sighted machine gave.
+#[cfg(unix)]
+fn answer_of(seen: &aterm_db::fleet::read::MachineSeen) -> &aterm_db::fleet::read::Answered {
+    match &seen.answer {
+        aterm_db::fleet::read::Answer::Answered(answered) => answered,
+        aterm_db::fleet::read::Answer::Silent { why } => panic!("silent: {why:?}"),
+    }
+}
+
+/// A header of node `node` that carries a whole look, as `MachineFacts::header_tokens` writes
+/// one, answered at `at_ms` on its own clock.
+#[cfg(unix)]
+fn look_header(node: &str, at_ms: u64) -> Vec<(&'static str, String)> {
+    let mut head = header(node);
+    head.extend([
+        ("at_ms", at_ms.to_string()),
+        ("home_free_mb", "51234".to_string()),
+        ("os", "macos".to_string()),
+        ("target", "aarch64-apple-darwin".to_string()),
+        ("m_at_ms", (at_ms - 1_500).to_string()),
+        ("cores", "12".to_string()),
+        ("load1_x100", "1530".to_string()),
+        ("load5_x100", "900".to_string()),
+        ("load15_x100", "700".to_string()),
+        ("cpu_busy_x100", "1140".to_string()),
+        ("rate_win_ms", "61000".to_string()),
+        ("mem_total_mb", "65536".to_string()),
+        ("mem_used_mb", "40000".to_string()),
+        ("mem_avail_mb", "25536".to_string()),
+        ("mem_pressure", "warn".to_string()),
+        ("mem_psi60_x100", "-".to_string()),
+        ("swap_used_mb", "0".to_string()),
+        ("swap_total_mb", "4096".to_string()),
+        ("home_total_mb", "953000".to_string()),
+        ("gpu_cores", "38".to_string()),
+        ("gpu_busy_pct", "97".to_string()),
+        ("net_link_kbps", "10000000".to_string()),
+        ("net_rx_kbps", "81234".to_string()),
+        ("net_tx_kbps", "2345".to_string()),
+        ("net_other_kbps", "12".to_string()),
+        ("up_since_ms", (at_ms - 3_600_000).to_string()),
+        ("cpu_lim", "1".to_string()),
+        ("mem_lim", "1".to_string()),
+        ("disk_lim", "0".to_string()),
+        ("gpu_lim", "1".to_string()),
+        ("load", "88:21".to_string()),
+        ("access", "full".to_string()),
+    ]);
+    head
+}
+
+/// The look [`look_header`] sends, answered at `at_ms`.
+#[cfg(unix)]
+fn whole_look(at_ms: u64) -> aterm_db::fleet::read::Look {
+    use aterm_db::fleet::read::{Limits, Load, Look, Pressure};
+    Look {
+        age_ms: Some(1_500),
+        cores: Some(12),
+        load1_x100: Some(1_530),
+        cpu_busy_x100: Some(1_140),
+        rate_win_ms: Some(61_000),
+        mem_total_mb: Some(65_536),
+        mem_used_mb: Some(40_000),
+        mem_avail_mb: Some(25_536),
+        swap_used_mb: Some(0),
+        swap_total_mb: Some(4_096),
+        disk_total_mb: Some(953_000),
+        gpu_cores: Some(38),
+        gpu_busy_pct: Some(97),
+        net_link_kbps: Some(10_000_000),
+        net_rx_kbps: Some(81_234),
+        net_tx_kbps: Some(2_345),
+        net_other_kbps: Some(12),
+        mem_pressure: Some(Pressure::Warn),
+        limits: Limits {
+            cpu: Some(true),
+            mem: Some(true),
+            disk: Some(false),
+            gpu: Some(true),
+        },
+        load: Some(Load {
+            level_x100: 88,
+            over_x100: Some(21),
+        }),
+        up_since_own_ms: Some(at_ms - 3_600_000),
+        up_for_ms: Some(3_600_000),
+        os: Some("macos"),
+        target: Some("aarch64-apple-darwin".to_owned()),
+    }
+}
+
+/// THE FLEET READ KEEPS EACH MACHINE'S LOOK: every figure its header sends, a read zero as a
+/// zero, and every figure it does not send (an older aterm, a `-`) unread, never 0. This Mac's
+/// windows are one machine with one look: the first reply that carries one.
+#[cfg(unix)]
+#[test]
+fn sightings_keep_a_machines_look_and_an_older_header_reads_unread() {
+    use aterm_db::fleet::read::Look;
+    const AT: u64 = 1_800_000_060_000;
+    let local = |pid: &str, head: &[(&'static str, String)]| {
+        peer(&format!("pid {pid}"), &pairs(head), &[QUIET]).replace("\"fleet\":true,", "")
+    };
+    let whole = look_header("n1", AT);
+    // A newer aterm whose host reads no GPU and no rate yet: those figures are `-`.
+    let mut dashes = look_header("n2", AT);
+    for (key, value) in &mut dashes {
+        if matches!(
+            *key,
+            "gpu_cores"
+                | "gpu_busy_pct"
+                | "cpu_busy_x100"
+                | "rate_win_ms"
+                | "cpu_lim"
+                | "gpu_lim"
+                | "load"
+        ) {
+            *value = "-".to_string();
+        }
+    }
+    let mut older = header("n3");
+    older.extend([
+        ("at_ms", AT.to_string()),
+        ("home_free_mb", "777".to_string()),
+    ]);
+    // A look whose every figure went unread on its machine: each is `-`, and only its age reads.
+    let mut blank = look_header("n4", AT);
+    for (key, value) in &mut blank {
+        if !matches!(
+            *key,
+            "pid" | "host" | "sessions" | "level" | "cut" | "node" | "at_ms" | "m_at_ms" | "access"
+        ) {
+            *value = "-".to_string();
+        }
+    }
+    let json = format!(
+        "[{},{},{},{}]",
+        peer("m1.local", &pairs(&whole), &[QUIET]),
+        peer("m2.local", &pairs(&dashes), &[QUIET]),
+        peer("m3.local", &pairs(&older), &[QUIET]),
+        peer("m4.local", &pairs(&blank), &[QUIET]),
+    );
+    let read = sightings(&json, 9).expect("a survey");
+    let looks: Vec<&Look> = read
+        .machines
+        .iter()
+        .map(|seen| &answer_of(seen).look)
+        .collect();
+    assert_eq!(*looks[0], whole_look(AT));
+    let mut unread_gpu = whole_look(AT);
+    unread_gpu.gpu_cores = None;
+    unread_gpu.gpu_busy_pct = None;
+    unread_gpu.cpu_busy_x100 = None;
+    unread_gpu.rate_win_ms = None;
+    unread_gpu.limits.cpu = None;
+    unread_gpu.limits.gpu = None;
+    unread_gpu.load = None;
+    assert_eq!(*looks[1], unread_gpu, "a `-` is unread, never 0");
+    assert_eq!(*looks[2], Look::UNREAD, "an older aterm sends no look");
+    let older = answer_of(&read.machines[2]);
+    assert_eq!(
+        (older.home_free_mb, older.access, older.drive),
+        (Some(777), None, None),
+        "what it does send still reads"
+    );
+    assert_eq!(
+        *looks[3],
+        Look {
+            age_ms: Some(1_500),
+            ..Look::UNREAD
+        },
+        "every figure unread on its machine is unread here, never 0"
+    );
+
+    // This Mac: an older window first, then two that carry a look. The first look is the
+    // machine's; the one after it is not read over it.
+    let mut second = look_header("own", AT + 20_000);
+    second.retain(|(key, _)| *key != "cores");
+    second.push(("cores", "64".to_string()));
+    let mut own_older = header("own");
+    own_older.push(("at_ms", AT.to_string()));
+    let json = format!(
+        "[{},{},{}]",
+        local("1", &own_older),
+        local("2", &look_header("own", AT)),
+        local("3", &second),
+    );
+    let read = sightings(&json, 9).expect("a survey");
+    assert_eq!(read.machines.len(), 1);
+    assert_eq!(answer_of(&read.machines[0]).look, whole_look(AT));
+}
+
+/// A FIGURE IS A WHOLE NUMBER IN ITS RANGE OR UNREAD: a decimal, a negative, one past `u64`, a
+/// percentage over 100, a word outside its closed set and a verdict other than `0` or `1` each
+/// read as nothing, and every other figure of the same header still reads.
+#[cfg(unix)]
+#[test]
+fn a_decimal_a_negative_or_an_out_of_range_figure_is_unread() {
+    const AT: u64 = 1_800_000_060_000;
+    let bent = |swaps: &[(&'static str, &str)]| {
+        let mut head = look_header("n1", AT);
+        for &(key, value) in swaps {
+            head.retain(|(k, _)| *k != key);
+            head.push((key, value.to_string()));
+        }
+        head
+    };
+    let heads = [
+        bent(&[
+            ("cores", "12.5"),
+            ("load1_x100", "-3"),
+            ("cpu_busy_x100", "1e3"),
+            ("mem_total_mb", "18446744073709551616"),
+            ("gpu_busy_pct", "101"),
+            ("mem_pressure", "high"),
+            ("os", "beos"),
+            ("target", "me@example.com"),
+            ("cpu_lim", "2"),
+            ("mem_lim", "yes"),
+            ("load", "88:101"),
+        ]),
+        // Control: the bounds themselves read.
+        bent(&[
+            ("gpu_busy_pct", "100"),
+            ("mem_total_mb", "18446744073709551615"),
+            ("mem_pressure", "critical"),
+            ("os", "linux"),
+            ("load", "100:100"),
+        ]),
+        bent(&[("gpu_busy_pct", "0"), ("swap_used_mb", "+5")]),
+        // A path and a phrase (as `aterm ctl survey --json` decodes `%2F` and `%20`) are no
+        // triple, whatever the generic word allows.
+        bent(&[("target", "/home/example/work")]),
+        bent(&[("target", "x86_64 is down")]),
+        bent(&[("target", "Aarch64-apple-darwin")]),
+    ];
+    let entries: Vec<String> = heads
+        .iter()
+        .enumerate()
+        .map(|(i, head)| peer(&format!("m{i}.local"), &pairs(head), &[QUIET]))
+        .collect();
+    let read = sightings(&format!("[{}]", entries.join(",")), 9).expect("a survey");
+    let looks: Vec<_> = read
+        .machines
+        .iter()
+        .map(|seen| answer_of(seen).look.clone())
+        .collect();
+
+    let mut want = whole_look(AT);
+    want.cores = None;
+    want.load1_x100 = None;
+    want.cpu_busy_x100 = None;
+    want.mem_total_mb = None;
+    want.gpu_busy_pct = None;
+    want.mem_pressure = None;
+    want.os = None;
+    want.target = None;
+    want.limits.cpu = None;
+    want.limits.mem = None;
+    want.load = None;
+    assert_eq!(looks[0], want);
+
+    let mut bounds = whole_look(AT);
+    bounds.gpu_busy_pct = Some(100);
+    bounds.mem_total_mb = Some(u64::MAX);
+    bounds.mem_pressure = Some(aterm_db::fleet::read::Pressure::Critical);
+    bounds.os = Some("linux");
+    bounds.load = Some(aterm_db::fleet::read::Load {
+        level_x100: 100,
+        over_x100: Some(100),
+    });
+    assert_eq!(looks[1], bounds);
+
+    let mut zero = whole_look(AT);
+    zero.gpu_busy_pct = Some(0);
+    zero.swap_used_mb = None;
+    assert_eq!(looks[2], zero, "a read 0 is 0; a sign is no digit");
+
+    let mut no_target = whole_look(AT);
+    no_target.target = None;
+    for (at, look) in looks.iter().enumerate().skip(3) {
+        assert_eq!(*look, no_target, "head {at}");
+    }
+}
+
+/// THE FLEET READ KEEPS EACH MACHINE'S LOAD SCORE BESIDE ITS VERDICTS: `load=<level>:<over>`
+/// reads as the machine's own dial in hundredths; `load=-` (a dial with no level), an older
+/// header with no `load=` and a malformed one (`x:y`, one part, a part past 100) read as no
+/// score, never 0, while the machine's `cpu_lim` and its other figures still read. A read
+/// `0:0` is a machine at rest; `72:-` a level whose over its machine could not judge.
+/// NEGATIVE CONTROLS (2026-11-13): with the key not read, the sent score reads unread; with a
+/// malformed or unread score read as 0, `load=-` and `x:y` read as a machine at rest.
+#[cfg(unix)]
+#[test]
+fn the_fleet_read_keeps_a_machines_load_score_beside_its_verdicts() {
+    use aterm_db::fleet::read::Load;
+    const AT: u64 = 1_800_000_060_000;
+    let with_load = |node: &str, load: Option<&str>| {
+        let mut head = look_header(node, AT);
+        head.retain(|(key, _)| *key != "load");
+        if let Some(load) = load {
+            head.push(("load", load.to_string()));
+        }
+        head
+    };
+    let heads = [
+        with_load("n0", Some("72:15")),
+        with_load("n1", Some("0:0")),
+        with_load("n2", Some("72:-")),
+        with_load("n3", Some("-")),
+        with_load("n4", None),
+        with_load("n5", Some("x:y")),
+        with_load("n6", Some("72")),
+        with_load("n7", Some("72:15:1")),
+        with_load("n8", Some("101:0")),
+        with_load("n9", Some("-:15")),
+    ];
+    let entries: Vec<String> = heads
+        .iter()
+        .enumerate()
+        .map(|(i, head)| peer(&format!("m{i}.local"), &pairs(head), &[QUIET]))
+        .collect();
+    let read = sightings(&format!("[{}]", entries.join(",")), 9).expect("a survey");
+    let looks: Vec<_> = read
+        .machines
+        .iter()
+        .map(|seen| answer_of(seen).look.clone())
+        .collect();
+    assert_eq!(looks.len(), heads.len());
+    assert_eq!(
+        looks[0].load,
+        Some(Load {
+            level_x100: 72,
+            over_x100: Some(15),
+        })
+    );
+    assert_eq!(
+        looks[1].load,
+        Some(Load {
+            level_x100: 0,
+            over_x100: Some(0),
+        }),
+        "a read 0 is a machine at rest"
+    );
+    assert_eq!(
+        looks[2].load,
+        Some(Load {
+            level_x100: 72,
+            over_x100: None,
+        }),
+        "an over the machine could not judge is unread beside its level, never 0"
+    );
+    for (at, look) in looks.iter().enumerate().skip(3) {
+        assert_eq!(look.load, None, "head {at}: no score, never 0");
+        assert_eq!(
+            look.limits.cpu,
+            Some(true),
+            "head {at}: cpu_lim still reads"
+        );
+        let mut want = whole_look(AT);
+        want.load = None;
+        assert_eq!(*look, want, "head {at}: the rest as it was sent");
+    }
+}
+
+/// A LOOK'S AGE IS TWO TIMES ON THE ANSWERER'S OWN CLOCK: its header's `at_ms=` less its
+/// `m_at_ms=`, and how long it has been up its `at_ms=` less its `up_since_ms=`. This Mac's
+/// clock (the read's time) enters neither, so a peer whose clock is hours off still reads its
+/// true ages; an age that would be negative, or one with either time unread, is unread.
+#[cfg(unix)]
+#[test]
+fn a_looks_age_is_the_answerers_own_clock_difference() {
+    // The answerer's clock is about three hours behind this Mac's.
+    const THEIRS: u64 = 1_800_000_000_000;
+    const OURS: u64 = THEIRS + 3 * 3_600_000 + 17;
+    let set = |head: &mut Vec<(&'static str, String)>, key: &'static str, value: String| {
+        head.retain(|(k, _)| *k != key);
+        head.push((key, value));
+    };
+    let mut ahead = look_header("n2", THEIRS);
+    set(&mut ahead, "m_at_ms", (THEIRS + 1).to_string());
+    set(&mut ahead, "up_since_ms", (THEIRS + 5).to_string());
+    let mut timeless = look_header("n3", THEIRS);
+    timeless.retain(|(key, _)| *key != "at_ms");
+    let mut unbooted = look_header("n4", THEIRS);
+    set(&mut unbooted, "up_since_ms", "0".to_string());
+    let heads = [look_header("n1", THEIRS), ahead, timeless, unbooted];
+    let entries: Vec<String> = heads
+        .iter()
+        .enumerate()
+        .map(|(i, head)| peer(&format!("m{i}.local"), &pairs(head), &[QUIET]))
+        .collect();
+    let read = sightings(&format!("[{}]", entries.join(",")), OURS).expect("a survey");
+    let ages: Vec<(Option<u64>, Option<u64>, Option<u64>)> = read
+        .machines
+        .iter()
+        .map(|seen| {
+            let look = &answer_of(seen).look;
+            (look.age_ms, look.up_for_ms, look.up_since_own_ms)
+        })
+        .collect();
+    assert_eq!(
+        ages,
+        [
+            (Some(1_500), Some(3_600_000), Some(THEIRS - 3_600_000)),
+            // Its look and its wake after its own answer: no age, its own value kept.
+            (None, None, Some(THEIRS + 5)),
+            (None, None, Some(THEIRS - 3_600_000)),
+            // An OS that says it never booted names no stay.
+            (Some(1_500), None, None),
+        ]
+    );
+}
+
+/// THE FLEET READ KEEPS EACH MACHINE'S FLEET ACCESS AND WHETHER IT LETS THIS MAC DRIVE IT: the
+/// header's `access=` word where this build knows it, and `drive=1` as yes, its absence beside
+/// an `access=` as no. A header with no `access=` (an aterm that does not say) has neither, and a
+/// word this build does not know is no level, never the lowest one.
+#[cfg(unix)]
+#[test]
+fn sightings_keep_the_access_word_and_whether_this_mac_may_drive() {
+    use aterm_db::fleet::read::Access;
+    let said = |node: &str, access: Option<&str>, drive: bool| {
+        let mut head = header(node);
+        head.extend(access.map(|word| ("access", word.to_string())));
+        if drive {
+            head.push(("drive", "1".to_string()));
+        }
+        peer(&format!("{node}.local"), &pairs(&head), &[QUIET])
+    };
+    let table = [
+        ((Some("full"), true), (Some(Access::Full), Some(true))),
+        ((Some("write"), false), (Some(Access::Write), Some(false))),
+        ((Some("read"), false), (Some(Access::Read), Some(false))),
+        ((Some("read"), true), (Some(Access::Read), Some(true))),
+        ((None, false), (None, None)),
+        ((Some("wide-open"), true), (None, Some(true))),
+        ((Some("Full"), false), (None, Some(false))),
+    ];
+    let entries: Vec<String> = table
+        .iter()
+        .enumerate()
+        .map(|(i, ((access, drive), _))| said(&format!("n{i}"), *access, *drive))
+        .collect();
+    let read = sightings(&format!("[{}]", entries.join(",")), 9).expect("a survey");
+    assert_eq!(
+        read.machines
+            .iter()
+            .map(|seen| {
+                let answered = answer_of(seen);
+                (answered.access, answered.drive)
+            })
+            .collect::<Vec<_>>(),
+        table.map(|(_, kept)| kept)
+    );
+
+    // This Mac's own windows answer a local read, which asks no grant: their headers say
+    // `access=` without `drive=1`, and that says nothing of whether this Mac may drive itself.
+    // CONTROL: a peer's header with the same words is a peer's refusal of the grant.
+    let mut head = header("n-own");
+    head.push(("access", "full".to_string()));
+    let own = peer("pid 77", &pairs(&head), &[QUIET]).replace("\"fleet\":true,", "");
+    let read =
+        sightings(&format!("[{own},{}]", said("n9", Some("full"), false)), 9).expect("a survey");
+    assert_eq!(read.machines.len(), 2);
+    let (own, other) = (answer_of(&read.machines[0]), answer_of(&read.machines[1]));
+    assert_eq!(
+        (own.access, own.drive),
+        (Some(Access::Full), None),
+        "this Mac's access is as read; no grant was asked of it"
+    );
+    assert_eq!(
+        (other.access, other.drive),
+        (Some(Access::Full), Some(false))
+    );
+    assert_eq!(
+        Access::WORDS,
+        aterm_types::fleet_access::FleetAccess::ALL.map(|level| level.word()),
+        "the words are the fleet access levels', in rank"
+    );
+    assert!(
+        Access::WORDS
+            .iter()
+            .all(|word| Access::of(word).map(Access::word) == Some(*word))
+    );
+}
+
 /// EVERY READ IS HANDED ON FOR THE FLEET TABLES: the answer with the time it came, and a read
 /// that gave none (an empty answer, a child killed at its cap) as none.
 #[cfg(unix)]
@@ -2797,4 +3283,418 @@ fn a_read_handed_on_is_folded_live_held_for_the_fleet_or_held_whole() {
         assert_eq!(failed.sources.read.why(), Some(HELD_READ_FAILED), "{n}");
         assert_eq!(sessions(&failed), [Some(2), Some(1)], "{n}");
     }
+}
+
+/// THE FLEET READ KEEPS EACH AGENT'S PIN as its row says it: `pinned=1` pinned, `pinned=0` not,
+/// and a row with no `pinned=` (an aterm before the pin) or with another word unread, never
+/// unpinned. CONTROL: the key not read leaves the pinned agent unread.
+#[cfg(unix)]
+#[test]
+fn the_fleet_read_keeps_each_agents_pin_and_an_older_row_is_unread() {
+    let agent = |sid: &'static str, pinned: Option<&'static str>| {
+        let mut row = vec![
+            ("sid", sid),
+            ("state", "alive"),
+            ("program", "claude"),
+            ("program_kind", "agent"),
+            ("agent", "busy"),
+            ("needs", "-"),
+        ];
+        if let Some(pinned) = pinned {
+            row.push(("pinned", pinned));
+        }
+        row
+    };
+    let rows = [
+        agent("s-p1", Some("1")),
+        agent("s-p2", Some("0")),
+        agent("s-p3", None),
+        agent("s-p4", Some("yes")),
+    ];
+    let rows: Vec<&[(&str, &str)]> = rows.iter().map(Vec::as_slice).collect();
+    let entry = peer("m1.local", &pairs(&header("n1")), &rows);
+    let read = sightings(&format!("[{entry}]"), 9).expect("a survey");
+    let pins: Vec<(&str, Option<bool>)> = answer_of(&read.machines[0])
+        .agents
+        .iter()
+        .map(|agent| (agent.sid.as_str(), agent.pinned))
+        .collect();
+    assert_eq!(
+        pins,
+        [
+            ("s-p1", Some(true)),
+            ("s-p2", Some(false)),
+            ("s-p3", None),
+            ("s-p4", None)
+        ]
+    );
+}
+
+/// A Claude Code agent's session row, saying `agent=<word>` and `needs=<needs>`, with `extra`.
+#[cfg(unix)]
+fn turn_row<'a>(
+    sid: &'a str,
+    word: &'a str,
+    needs: &'a str,
+    extra: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    let mut row = vec![
+        ("sid", sid),
+        ("state", "alive"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", word),
+        ("needs", needs),
+    ];
+    row.extend_from_slice(extra);
+    row
+}
+
+/// THE FLEET READ KEEPS A ROW'S TURN, OUTPUT AND COUNTERS, AND MARKS AN OLDER ROW: every key a
+/// row sends of its turn (`turn= turn_ms= turn_end_ms= step_ms= out_ms= out_src= bg=`) and its
+/// counters (`tok_in= tok_out= tok_for_ms= turns= tools=`) as numbers and closed words, each
+/// `-` or malformed one unread; a row with no `turn=` is an older aterm's (`older`), whose turn
+/// its agent's own word says (`busy` and a box, `prompt`, open one; `question` closes it); the
+/// agent's work class is decided from them; and the header's `at_ms=` is the answer's own time
+/// and each agent's. CONTROLS: `older` false for a row with no `turn` key is caught; an older
+/// row's agent at a box classed by its state alone (in no turn) is caught.
+#[cfg(unix)]
+#[test]
+fn sightings_keep_a_rows_turn_output_and_counters_and_mark_an_older_row() {
+    use aterm_db::fleet::read::{OutSrc, State, TurnFacts, Work};
+    let whole = turn_row(
+        "s-t1",
+        "busy",
+        "-",
+        &[
+            ("bg", "1"),
+            ("turn", "1"),
+            ("turn_ms", "250000"),
+            ("turn_end_ms", "900000"),
+            ("step_ms", "-"),
+            ("out_ms", "42000"),
+            ("out_src", "transcript"),
+            ("tok_in", "1200000"),
+            ("tok_out", "56000"),
+            ("tok_for_ms", "3600000"),
+            ("turns", "14"),
+            ("tools", "203"),
+        ],
+    );
+    let dashes = turn_row(
+        "s-t2",
+        "idle",
+        "-",
+        &[
+            ("bg", "-"),
+            ("turn", "0"),
+            ("turn_ms", "-"),
+            ("turn_end_ms", "12.5"),
+            ("step_ms", "-3"),
+            ("out_ms", "-"),
+            ("out_src", "pty"),
+            ("tok_in", "-"),
+            ("tok_out", "-"),
+            ("tok_for_ms", "-"),
+            ("turns", "0"),
+            ("tools", "-"),
+        ],
+    );
+    let older = turn_row("s-t3", "busy", "-", &[("bg", "0")]);
+    let at_a_box = turn_row("s-t4", "prompt", "approval", &[]);
+    let ended_asking = turn_row("s-t5", "question", "question", &[]);
+    let rows = [whole, dashes, older, at_a_box, ended_asking];
+    let rows: Vec<&[(&str, &str)]> = rows.iter().map(Vec::as_slice).collect();
+    let mut head = header("n1");
+    head.push(("at_ms", "1800000000123".to_string()));
+    let entry = peer("m1.local", &pairs(&head), &rows);
+    let read = sightings(&format!("[{entry}]"), 9).expect("a survey");
+    let answer = answer_of(&read.machines[0]);
+    assert_eq!(answer.answer_at_ms, Some(1_800_000_000_123));
+    let [whole, dashes, older, at_a_box, ended_asking] = answer.agents.as_slice() else {
+        panic!("five agents: {:?}", answer.agents);
+    };
+    assert!(
+        answer
+            .agents
+            .iter()
+            .all(|agent| agent.answer_at_ms == Some(1_800_000_000_123)),
+        "each agent is timed by the reply that listed it"
+    );
+    assert_eq!(
+        whole.turn,
+        TurnFacts {
+            turn_open: Some(true),
+            turn_age_ms: Some(250_000),
+            turn_end_age_ms: Some(900_000),
+            step_age_ms: None,
+            out_age_ms: Some(42_000),
+            out_src: Some(OutSrc::Transcript),
+            bg: Some(1),
+            older: false,
+            word_turn: true,
+        }
+    );
+    assert_eq!(
+        (
+            whole.tok_in,
+            whole.tok_out,
+            whole.tok_for_ms,
+            whole.turns,
+            whole.tools
+        ),
+        (
+            Some(1_200_000),
+            Some(56_000),
+            Some(3_600_000),
+            Some(14),
+            Some(203)
+        )
+    );
+    assert_eq!((whole.work, whole.rate), (Work::WithOutput, None));
+    assert_eq!(
+        dashes.turn,
+        TurnFacts {
+            turn_open: Some(false),
+            older: false,
+            ..TurnFacts::OLDER
+        },
+        "a `-` or a malformed figure is unread, never 0"
+    );
+    assert_eq!(
+        (
+            dashes.tok_in,
+            dashes.tok_out,
+            dashes.tok_for_ms,
+            dashes.turns,
+            dashes.tools
+        ),
+        (None, None, None, Some(0), None)
+    );
+    assert_eq!(dashes.work, Work::NoTurn);
+    assert_eq!(
+        older.turn,
+        TurnFacts {
+            bg: Some(0),
+            word_turn: true,
+            ..TurnFacts::OLDER
+        },
+        "a row with no `turn=` is an older aterm's"
+    );
+    assert_eq!(
+        older.work,
+        Work::OutputUnread,
+        "an older busy row is in a turn"
+    );
+    assert_eq!(
+        (at_a_box.state, at_a_box.turn.older, at_a_box.work),
+        (State::Waiting, true, Work::Asking),
+        "an older row at a box is asking"
+    );
+    assert_eq!(
+        (ended_asking.state, ended_asking.work),
+        (State::Waiting, Work::NoTurn),
+        "an older row that ended its turn on a question is in none"
+    );
+}
+
+/// AN UNREAD CLOCK IS NO TIME: a reply whose header says `at_ms=0` (its writer's clock unread)
+/// has no answer time, its agents none, and its look no ages, never a time of 1970 that a later
+/// answer's interval would run from. CONTROL: `at_ms=0` read as a time is caught.
+#[cfg(unix)]
+#[test]
+fn an_unread_clock_is_no_answer_time() {
+    let mut head = look_header("n1", 1_800_000_060_000);
+    for (key, value) in &mut head {
+        if *key == "at_ms" {
+            *value = "0".to_string();
+        }
+    }
+    let row = turn_row("s-c1", "busy", "-", &[("turn", "1"), ("tok_in", "5")]);
+    let entry = peer("m1.local", &pairs(&head), &[&row]);
+    let read = sightings(&format!("[{entry}]"), 9).expect("a survey");
+    let answer = answer_of(&read.machines[0]);
+    assert_eq!(answer.answer_at_ms, None);
+    assert_eq!(answer.agents.len(), 1, "{answer:?}");
+    assert_eq!(answer.agents[0].answer_at_ms, None);
+    assert_eq!((answer.look.age_ms, answer.look.up_for_ms), (None, None));
+}
+
+/// EACH OF THIS MAC'S AGENTS IS TIMED BY ITS OWN WINDOW'S REPLY: this Mac's windows answer one
+/// read each, at their own times; the machine's answer time is the first reply's, and each
+/// agent keeps the time of the reply that listed it, where its counters were read. CONTROL:
+/// every agent given the first reply's time is caught.
+#[cfg(unix)]
+#[test]
+fn each_of_this_macs_agents_is_timed_by_its_own_windows_reply() {
+    fn local(pid: &str, header: &[(&str, &str)], rows: &[&[(&str, &str)]]) -> String {
+        peer(&format!("pid {pid}"), header, rows).replace("\"fleet\":true,", "")
+    }
+    let window = |node: &str, at_ms: &str| {
+        let mut head = header(node);
+        head.push(("at_ms", at_ms.to_string()));
+        head
+    };
+    let first = turn_row("s-r1", "busy", "-", &[("turn", "1")]);
+    let second = turn_row("s-r2", "busy", "-", &[("turn", "1")]);
+    let entries = [
+        local("101", &pairs(&window("n1", "1000000")), &[&first]),
+        local("102", &pairs(&window("n1", "1009000")), &[&second]),
+    ];
+    let read = sightings(&format!("[{}]", entries.join(",")), 9).expect("a survey");
+    let answer = answer_of(&read.machines[0]);
+    assert_eq!(answer.answer_at_ms, Some(1_000_000));
+    let times: Vec<(&str, Option<u64>)> = answer
+        .agents
+        .iter()
+        .map(|agent| (agent.sid.as_str(), agent.answer_at_ms))
+        .collect();
+    assert_eq!(
+        times,
+        [("s-r1", Some(1_000_000)), ("s-r2", Some(1_009_000))]
+    );
+}
+
+/// THE WORK TALLY COUNTS AGENTS THE ANSWER DOES NOT LIST: past [`AGENTS_MAX`] listed agents
+/// the rest are counted in `agents_more`, and in the work tally by their class, as in the state
+/// tally; a partial answer and an older aterm's (no `needs`) have none. CONTROL: classes
+/// counted from the listed agents (a lower bound past 128) is caught.
+#[cfg(unix)]
+#[test]
+fn the_work_tally_counts_agents_the_answer_does_not_list() {
+    use aterm_db::fleet::read::{AGENTS_MAX, WorkTally};
+    let sids: Vec<String> = (0..AGENTS_MAX + 3).map(|n| format!("s-w{n:04}")).collect();
+    let writing = [
+        ("bg", "0"),
+        ("turn", "1"),
+        ("out_ms", "30000"),
+        ("out_src", "transcript"),
+    ];
+    let resting = [("bg", "0"), ("turn", "0")];
+    let asking = [("bg", "0"), ("turn", "1"), ("step_ms", "9000")];
+    let mut rows: Vec<Vec<(&str, &str)>> = sids[..AGENTS_MAX]
+        .iter()
+        .map(|sid| turn_row(sid, "busy", "-", &writing))
+        .collect();
+    rows.push(turn_row(&sids[AGENTS_MAX], "idle", "-", &resting));
+    rows.push(turn_row(&sids[AGENTS_MAX + 1], "idle", "-", &resting));
+    rows.push(turn_row(
+        &sids[AGENTS_MAX + 2],
+        "question",
+        "question",
+        &asking,
+    ));
+    let refs: Vec<&[(&str, &str)]> = rows.iter().map(Vec::as_slice).collect();
+    let mut head = header("n1");
+    let count = rows.len().to_string();
+    head[2].1 = count;
+    let entry = peer("m1.local", &pairs(&head), &refs);
+    let read = sightings(&format!("[{entry}]"), 9).expect("a survey");
+    let answer = answer_of(&read.machines[0]);
+    assert_eq!((answer.agents.len(), answer.agents_more), (AGENTS_MAX, 3));
+    assert_eq!(
+        answer.work,
+        Some(WorkTally {
+            with_output: u32::try_from(AGENTS_MAX).expect("128"),
+            no_turn: 2,
+            asking: 1,
+            ..WorkTally::default()
+        })
+    );
+    assert_eq!(answer.tally.map(|tally| tally.agents), Some(131));
+
+    // An older aterm's rows (no `needs`) and a partial answer have no work tally.
+    let older = vec![("sid", "s-o1"), ("state", "alive"), ("program", "claude")];
+    let older = [
+        older,
+        vec![("program_kind", "agent"), ("agent", "busy"), ("turn", "1")],
+    ]
+    .concat();
+    let entry = peer("m2.local", &pairs(&header("n2")), &[&older]);
+    let read = sightings(&format!("[{entry}]"), 9).expect("a survey");
+    assert_eq!(answer_of(&read.machines[0]).work, None);
+    let mut cut = header("n3");
+    cut[2].1 = "5".to_string();
+    let entry = peer("m3.local", &pairs(&cut), &[&rows[0]]);
+    let read = sightings(&format!("[{entry}]"), 9).expect("a survey");
+    assert_eq!(answer_of(&read.machines[0]).work, None);
+}
+
+/// THE FLEET READ COUNTS THE SESSIONS WAITING FOR MEMORY AND THEIR CLAIMS: every counted row,
+/// an agent's or a shell's, that says `wait=memory`, and what its `wait_gib=` claims in MiB;
+/// with none waiting a counted 0. A claim its machine did not read (`wait_gib=-`) or one that
+/// is no `<digits>.<digit>` leaves the sum unread while the waiter still counts; a row with no
+/// `wait=` (an older aterm) and a partial answer have no count. CONTROL: a `-` size summed as
+/// 0 is caught.
+#[cfg(unix)]
+#[test]
+fn sightings_count_the_sessions_waiting_for_memory_and_their_claims() {
+    use aterm_db::fleet::read::WaitTally;
+    let shell = |sid: &'static str, wait: &'static str, gib: &'static str| {
+        vec![
+            ("sid", sid),
+            ("state", "alive"),
+            ("program", "targo"),
+            ("program_kind", "shell"),
+            ("agent", "-"),
+            ("needs", "-"),
+            ("wait", wait),
+            ("wait_gib", gib),
+            ("wait_ahead", "1"),
+        ]
+    };
+    let mut agent = turn_row("s-a1", "busy", "-", &[]);
+    agent.extend([("wait", "-"), ("wait_gib", "-"), ("wait_ahead", "-")]);
+    let wait_of = |rows: &[Vec<(&str, &str)>], sessions: &str| {
+        let mut head = header("n1");
+        head[2].1 = sessions.to_string();
+        let refs: Vec<&[(&str, &str)]> = rows.iter().map(Vec::as_slice).collect();
+        let entry = peer("m1.local", &pairs(&head), &refs);
+        let read = sightings(&format!("[{entry}]"), 9).expect("a survey");
+        answer_of(&read.machines[0]).wait
+    };
+    assert_eq!(
+        wait_of(
+            &[
+                shell("s-b1", "memory", "4.0"),
+                shell("s-b2", "memory", "2.5"),
+                agent.clone(),
+            ],
+            "3"
+        ),
+        Some(WaitTally {
+            waiting: 2,
+            wait_mb: Some(4_096 + 2_560),
+        })
+    );
+    for unread in ["-", "4", "4.25", "-1.0", ".5", "x.y"] {
+        assert_eq!(
+            wait_of(
+                &[
+                    shell("s-b1", "memory", "4.0"),
+                    shell("s-b2", "memory", unread),
+                ],
+                "2"
+            ),
+            Some(WaitTally {
+                waiting: 2,
+                wait_mb: None,
+            }),
+            "{unread}"
+        );
+    }
+    assert_eq!(
+        wait_of(&[shell("s-b1", "-", "-"), agent.clone()], "2"),
+        Some(WaitTally::NONE)
+    );
+    assert_eq!(
+        WaitTally::NONE.wait_mb,
+        Some(0),
+        "none waiting is a counted 0"
+    );
+    // A row with no `wait=` (an older aterm): no count.
+    let older = turn_row("s-o1", "busy", "-", &[]);
+    assert_eq!(wait_of(&[shell("s-b1", "memory", "4.0"), older], "2"), None);
+    // A partial answer: no count.
+    assert_eq!(wait_of(&[shell("s-b1", "memory", "4.0")], "2"), None);
 }

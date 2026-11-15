@@ -38,6 +38,11 @@ pub(crate) fn window_event_origin() -> Option<InputOrigin> {
     DELIVERY.with(Cell::get)
 }
 
+pub(crate) fn window_event_native_input() -> Option<NativeInputEvent> {
+    DELIVERY.with(Cell::get)?;
+    SOURCE.with(Cell::get)?.event
+}
+
 /// Restores a thread-local scope even when its handler unwinds; it cannot leave this thread.
 #[must_use]
 pub(super) struct Scope {

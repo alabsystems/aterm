@@ -587,8 +587,10 @@ impl CommandLineTools {
     /// developer mode ([`crate::root_steps::DeveloperMode`]), puts the rule in place that names
     /// the Mac at an admission that comes later ([`crate::root_steps::NameRule`]), and installs
     /// the root LAN broker ([`crate::items::lan::LanBroker`]) before the tools' download, so the
-    /// root transaction also disables Spotlight data-volume indexing in
-    /// `controller::commands`, so one password does every root step setup has.
+    /// root transaction also stops Spotlight indexing the console account's home folders
+    /// other than Documents and Desktop ([`crate::init_spotlight`], added in
+    /// `controller::commands`), so
+    /// one password does every root step setup has.
     /// [`RootPlan::StepsOnly`] omits CLT
     /// installation and selection while retaining these independent steps.
     /// [`RootPlan::NameRuleOnly`] contains only the naming permission and no OS targets.

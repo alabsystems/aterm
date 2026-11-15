@@ -3,6 +3,39 @@
 
 use super::*;
 
+/// The gather reuses its argument buffer even when a process cannot be read. Count both
+/// the underlying reader's fitted and refused paths and the real gather's refusal path.
+#[cfg(target_os = "macos")]
+#[test]
+fn reused_exec_argument_reads_and_refusals_allocate_nothing() {
+    use aterm_sysprobe::procargs::{read, read_into};
+
+    let pid = std::process::id();
+    let record = read(pid).expect("this process's complete argument record");
+    let mut roomy = vec![0; record.len() + 64];
+    let mut short = vec![0; record.len() / 2];
+    let _ = exec_args(0); // Prepare the gather's thread-local buffer before counting reuse.
+    let (_, control) = aterm_heap_count::allocations_in(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "custom error control")
+    });
+    assert!(control > 0, "the counter observes a heap-backed error");
+    let ((fitted, truncated, empty, invalid, gathered), allocations) =
+        aterm_heap_count::allocations_in(|| {
+            (
+                read_into(pid, &mut roomy),
+                read_into(pid, &mut short),
+                read_into(pid, &mut []),
+                read_into(0, &mut roomy),
+                exec_args(0),
+            )
+        });
+    assert_eq!(allocations, 0, "reused argument reads, including refusal");
+    assert_eq!(fitted.unwrap(), record.len());
+    assert!(truncated.is_err() && empty.is_err() && invalid.is_err());
+    assert!(gathered.env_path.is_none());
+    assert!(gathered.handed.is_empty() && gathered.scripts.is_empty());
+}
+
 fn exec(at_ms: u64, name: &str) -> Exec {
     Exec {
         pid: 7,

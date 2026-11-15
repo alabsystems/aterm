@@ -81,6 +81,7 @@ use std::time::SystemTime;
 use serde::Deserialize;
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
+use super::harness_mark;
 use super::profile::{Address, Leaf, NoProfile, Obj, drain_seq};
 
 /// The path segment Claude Code 2.1.311's `/claim-credit` puts after the flag's `webPath`, a

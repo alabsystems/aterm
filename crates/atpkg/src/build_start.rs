@@ -30,12 +30,14 @@
 //!   reader opens. No lock and no flush:
 //!
 //!   ```text
-//!   {"v":1,"session":"s-0123456789abcdef0123","workspace":"/w","build":"/b","pid":1,"at_ms":1}
+//!   {"v":1,"session":"t0qje5bafqr","workspace":"/w","build":"/b","pid":1,"at_ms":1}
 //!   ```
 //!
 //!   - `v` is 1. A reader skips a line of any other version.
 //!   - `session` is the tab's session: the value of `ATERM_PARENT_SESSION_ID` in the build's
-//!     environment, `s-` and 20 lower-case hex digits ([`session_of`]). A build with no such
+//!     environment: a tab ID in either form, `t` and 10 Crockford base-32 characters
+//!     ([`aterm_types::tab_id::is_tab_id`]), or `s-` and 20 lower-case hex digits for a tab
+//!     older than those ([`aterm_types::tab_id::is_legacy`]; [`session_of`]). A build with no such
 //!     variable was not started in a tab and writes no line. `ATERM_SESSION_ID` is not the tab's
 //!     session: it is a fresh id for an aterm started inside the tab, which no window holds.
 //!   - `workspace` is the absolute path of the Cargo workspace root the build compiles, its links
@@ -112,12 +114,11 @@ pub const KEEP_PAIR_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// The one version of the line this module writes and reads.
 const VERSION: u64 = 1;
 
-/// A session id's length: `s-` and 20 hex digits.
-const SESSION_BYTES: usize = 22;
-
-/// Whether `text` is a session id as aterm mints one: `s-` and 20 lower-case hex digits.
+/// Whether `text` is a tab's session as aterm mints one: a tab ID in either form, `t` and 10
+/// Crockford base-32 characters ([`aterm_types::tab_id::is_tab_id`]), or `s-` and 20 lower-case
+/// hex digits for a tab opened before those ([`aterm_types::tab_id::is_legacy`]).
 fn is_session(text: &str) -> bool {
-    text.len() == SESSION_BYTES && aterm_types::control_request::Sid::parse(text).is_some()
+    aterm_types::tab_id::is_tab_id(text) || aterm_types::tab_id::is_legacy(text)
 }
 
 /// `path` as the line spells it: `None` for a relative path or one that is not UTF-8.

@@ -158,7 +158,7 @@ const WALL_WAIT_ENDS: [&str; 2] = [" resets", " goes on by itself"];
 /// re-read of its own `seq=`, which journals no point of its own, so the wait's `seq=` need not
 /// be the wall's point's.
 pub(super) fn waits_on_the_wall(seen: &Seen) -> bool {
-    seen.acts(turn_end::RULE_LAND)
+    seen.acts(alab_policy::words::RULE_LAND)
         .first()
         .is_some_and(|(t1, _)| !wall_waits(seen, *t1, &WALL_WAIT_ENDS).is_empty())
 }
@@ -428,7 +428,7 @@ fn tap_facts(seen: &Seen, t0: i64) -> Result<(String, Vec<String>), String> {
     let Some(restarted) = driven.restarted_ms else {
         return Err("no new loop was started in the wait".to_string());
     };
-    let timing = turn_end::TurnEndTiming::default();
+    let timing = alab_policy::config::TurnEndTiming::default();
     let ms = |d: std::time::Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
     let (grace, jitter) = (ms(timing.reset_grace), ms(timing.reset_jitter));
     let tap_reset = reset + TAP_LATER_S * 1000;
@@ -673,7 +673,7 @@ fn narrow_facts(seen: &Seen, t0: i64) -> Result<(String, Vec<String>), String> {
     let (Some(narrowed), Some(widened)) = (driven.narrowed_ms, driven.widened_ms) else {
         return Err("the pane was not narrowed and widened again in the wait".to_string());
     };
-    let timing = turn_end::TurnEndTiming::default();
+    let timing = alab_policy::config::TurnEndTiming::default();
     let ms = |d: std::time::Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
     let (grace, jitter, armed) = (
         ms(timing.reset_grace),

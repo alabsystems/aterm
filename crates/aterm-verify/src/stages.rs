@@ -55,10 +55,10 @@ pub(crate) fn run_stage_prepared(
     }
     match spec.id {
         StageId::ReleasedShim => crate::released_shim::run(ctx, &mut r),
+        StageId::CandidateShim => candidate_shim(ctx, &mut r),
         StageId::TestCompile => test_compile(ctx, spec, &mut r),
         StageId::Test => test(ctx, &mut r),
         StageId::MeasuringTests => measuring_tests(ctx, &mut r),
-        StageId::Doctests => doctests(ctx, &mut r),
         StageId::Tippy => tippy(ctx, &mut r),
         StageId::Formatting => crate::fmt::run(ctx, &mut r),
         StageId::Export => export(ctx, &mut r),
@@ -81,11 +81,6 @@ pub(crate) fn run_stage_prepared(
         StageId::RedrawConformance => redraw_conformance(ctx, &mut r),
         StageId::ObjcDrives => objc_drives(ctx, &mut r),
         StageId::ForeignCells => foreign_cells(ctx, &mut r, cells),
-        StageId::WasmSmoke => {
-            if in_checkout(ctx, &mut r, "wasm-smoke") {
-                crate::wasm_smoke::run(ctx, &mut r);
-            }
-        }
         StageId::WasmGlue => {
             if in_checkout(ctx, &mut r, "wasm-glue") {
                 wasm_glue(ctx, &mut r);
@@ -103,6 +98,7 @@ pub(crate) fn run_stage_prepared(
         }
         StageId::Forge => forge_gate(ctx, &mut r),
         StageId::CodexAlabProof => codex_alab_proof(ctx, &mut r),
+        StageId::LinuxLabBuild => linux_lab_build(ctx, &mut r),
         StageId::LinuxLane => linux_lane(ctx, &mut r),
     }
     r
@@ -196,7 +192,7 @@ pub fn unit_graph(
     Ok(crate::unitgraph::Graph::union(graphs))
 }
 
-/// `targo --unverified test <scope> --no-fail-fast --tests`: the second child, run only when the first compiled: every lib, bin and integration test target with `test = true` ([`TEST_TARGETS`], which the first child compiles, beside the measuring benches where it builds them: [`crate::plan::folds_measuring`]), no doctests (the doctests stage runs those) and no examples or benches.
+/// `targo --unverified test <scope> --no-fail-fast --tests`: the second child, run only when the first compiled: every lib, bin and integration test target with `test = true` ([`TEST_TARGETS`], which the first child compiles, beside the measuring benches where it builds them: [`crate::plan::folds_measuring`]), no doctests (the stage runs those after it: [`doctest_args`]) and no examples or benches.
 #[must_use]
 pub fn test_run_args(scope: &Scope) -> Vec<String> {
     let mut a = test_base_args(scope);
@@ -208,9 +204,9 @@ pub fn test_run_args(scope: &Scope) -> Vec<String> {
 pub const TEST_TARGETS: [&str; 1] = ["--tests"];
 
 /// The measuring executables selected by the runner and its content receipts.
-pub const MEASURING_TARGETS: [&str; 4] = ["paint", "spin", "aos", "rewind"];
+pub const MEASURING_TARGETS: [&str; 5] = ["paint", "spin", "aos", "rewind", "size"];
 
-/// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin --bench aos --bench rewind`: the measuring stage's one child, the paint, spin, aos and rewind matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames, idle wakes, repair main-thread time and Rewind step latency on a live instance.
+/// `targo --unverified bench --profile test -p aterm-conformance --no-fail-fast --bench paint --bench spin --bench aos --bench rewind --bench size`: the measuring stage's one child, the paint, spin, aos, rewind and size matrices ([`MEASURING_TARGETS`]) that judge the release bundle's frames, idle wakes, repair main-thread time and Rewind step latency on a live instance, and its executable's slice for this Mac against its ceiling.
 #[must_use]
 pub fn measuring_args() -> Vec<String> {
     measuring_targets_args()
@@ -224,7 +220,7 @@ pub fn measure_prebuild_args() -> Vec<String> {
     a
 }
 
-/// `--bench paint --bench spin --bench aos --bench rewind`: the measuring matrices' targets
+/// `--bench paint --bench spin --bench aos --bench rewind --bench size`: the measuring matrices' targets
 /// ([`MEASURING_TARGETS`]), which the workspace's test compile adds where it builds them
 /// ([`crate::plan::folds_measuring`]).
 #[must_use]
@@ -258,7 +254,7 @@ fn test_base_args(scope: &Scope) -> Vec<String> {
     a
 }
 
-/// `targo --unverified test --doc <scope> --no-fail-fast` — the only doctest runner (the test stage runs no doctests), over the test compile's own selection ([`Scope::args`]), never a narrower one: cargo resolves features over what a command selects, so the doctests then link the very units the test compile built instead of rebuilding their own ([`crate::docdriver`] has the measurement).
+/// `targo --unverified test --doc <scope> --no-fail-fast` — the only doctest runner: the test stage's last child, after its test binaries, over the test compile's own selection ([`Scope::args`]), never a narrower one: cargo resolves features over what a command selects, so the doctests then link the very units the test compile built instead of rebuilding their own.
 #[must_use]
 pub fn doctest_args(scope: &Scope) -> Vec<String> {
     let mut a = vec![
@@ -271,57 +267,9 @@ pub fn doctest_args(scope: &Scope) -> Vec<String> {
     a
 }
 
-/// The scope's libraries by whether rustdoc reads them ([`doctest_split`]), each list by package name, sorted.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DocSplit {
-    /// The libraries whose sources hold a doctest, or that the scan could not read or find ([`crate::docscan`] fails wide).
-    pub run: Vec<String>,
-    /// The libraries whose sources hold none: cargo still builds each (with the features the test compile resolved), and the stand-in skips its pass ([`crate::docdriver`]).
-    pub skip: Vec<String>,
-}
-
-/// The doctests' split of the scope's libraries: each member with a lib whose sources hold a doctest runs, each whose sources the scan proves hold none is skipped.
-#[must_use]
-pub fn doctest_split(ctx: &Ctx) -> Option<DocSplit> {
-    let dirs = workspace_member_dirs(&ctx.root);
-    let mut names: Vec<String> = match &ctx.scope {
-        Scope::Workspace if dirs.is_empty() => return None,
-        Scope::Workspace => dirs.iter().map(|(name, _)| name.clone()).collect(),
-        s => s
-            .crates()
-            .iter()
-            .map(|c| crate::scope::spec_name(c).unwrap_or(c).to_string())
-            .collect(),
-    };
-    names.retain(|name| crate::changed::crate_dir_has_lib(&ctx.root, name));
-    names.sort();
-    names.dedup();
-    let (run, skip) = names.into_iter().partition(|name| {
-        dirs.iter()
-            .find(|(n, _)| n == name)
-            .is_none_or(|(_, dir)| crate::docscan::src_holds_a_doctest(&dir.join("src")))
-    });
-    Some(DocSplit { run, skip })
-}
-
-fn workspace_member_dirs(root: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
-    let mut v: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(root.join("crates"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let text = crate::read_regular_text(e.path().join("Cargo.toml")).ok()?;
-            if text.lines().any(|l| l.trim() == "[workspace]") {
-                return None;
-            }
-            Some((crate::changed::manifest_package_name(&text)?, e.path()))
-        })
-        .collect();
-    v.sort();
-    v
-}
-
-/// `<tippy> <scope> --all-targets --keep-going -- -D warnings` ([`LINT_TAIL`]).
+/// `<tippy> <scope> <LINT_TAIL>`: every target of every selected crate, a cone's dependents
+/// and the crates it holds only by a dev edge included, so a dependent's test target that names
+/// what the change touched is type-checked before the push.
 #[must_use]
 pub fn tippy_args(scope: &Scope) -> Vec<String> {
     let mut a = scope.args();
@@ -329,78 +277,34 @@ pub fn tippy_args(scope: &Scope) -> Vec<String> {
     a
 }
 
-/// The lint's ordinary passes. A cone (no `-p`, no `--all`) has up to two: `--all-targets` for what
-/// the change touched ([`crate::scope::Changed::all_targets`]), and each crate's default targets,
-/// its library and binaries, for the rest that link the change. What the cone holds only by a dev
-/// edge is in neither ([`crate::scope::Changed::unlinted`]), since its library and binaries link
-/// nothing that changed; a root manifest row, a lock row other than a touched member's own entry,
-/// or a fork keeps it in the first pass with the whole cone. `test` compiles the test targets of
-/// all of those, so an error in one still stops the run. The `required-features` targets of what
-/// the change touched and of what depends on it directly have a pass of their own
-/// ([`lint_invocations`]). GAP: the other benches and examples of unchanged dependents (at most the
-/// workspace's 104 targets, 19 of them with macOS arms, on 2026-11-04) have
-/// no compile for this machine in this run, only a pulled cell's type-check on another OS, and a
-/// lint that fires only in one of them or in such a crate's test target waits for `verify lint -p`
-/// or `--all`, though a rustc warning there (a `#[must_use]` newly discarded) reds a pulled cell
-/// that judges test-target warnings ([`crate::cells::leaves_test_warnings`]).
-#[must_use]
-pub fn tippy_passes(scope: &Scope) -> Vec<TippyPass> {
-    let Scope::Changed(cone) = scope else {
-        return vec![TippyPass {
-            label: scope.label(),
-            args: tippy_args(scope),
-        }];
-    };
-    if cone.crates.is_empty() {
-        return vec![TippyPass {
-            label: scope.label(),
-            args: tippy_args(scope),
-        }];
-    }
-    let (every, rest): (Vec<&String>, Vec<&String>) = cone.linted().partition(|spec| {
-        crate::scope::spec_name(spec).is_none_or(|name| cone.all_targets.iter().any(|n| n == name))
-    });
-    let pass = |specs: &[&String], all_targets: bool| {
-        let selection: Vec<String> = specs
-            .iter()
-            .flat_map(|spec| ["-p".to_string(), (*spec).clone()])
-            .collect();
-        let mut args = selection.clone();
-        args.extend(
-            LINT_TAIL
-                .iter()
-                .filter(|flag| all_targets || **flag != "--all-targets")
-                .map(ToString::to_string),
-        );
-        TippyPass {
-            label: format!(
-                "{}{}",
-                selection.join(" "),
-                if all_targets { " --all-targets" } else { "" }
-            ),
-            args,
-        }
-    };
-    let mut passes = Vec::new();
-    if !every.is_empty() {
-        passes.push(pass(&every, true));
-    }
-    if !rest.is_empty() {
-        passes.push(pass(&rest, false));
-    }
-    passes
-}
-
-/// One lint invocation ([`tippy_passes`], [`lint_invocations`]): its arguments and how the report
-/// names its selection.
+/// One lint invocation ([`lint_invocations`]): its arguments and how the report names its
+/// selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TippyPass {
     pub label: String,
     pub args: Vec<String>,
 }
 
-/// What both lint passes end with: cargo's coverage flags, then the lint driver's arguments, which reach workspace members only (targo-tippy hands them to `tippy-driver`, cargo's `RUSTC_WORKSPACE_WRAPPER`), so the dependencies stay fresh.
-pub const LINT_TAIL: [&str; 5] = ["--all-targets", "--keep-going", "--", "-D", "warnings"];
+/// What every lint pass ends with: cargo's coverage flags, then the lint driver's arguments, which reach workspace members only (targo-tippy hands them to `tippy-driver`, cargo's `RUSTC_WORKSPACE_WRAPPER`), so the dependencies stay fresh. The arguments deny every rustc warning and, of clippy, only the `correctness` and `suspicious` groups and the `clippy.toml` bans: `-A clippy::all` silences the style, complexity and perf groups, a later flag overrides an earlier one, and a source `#[expect(clippy::…)]` still sets its own scope's level, so an expectation stays fulfilled where its lint fires and is an error where it does not.
+pub const LINT_TAIL: [&str; 17] = [
+    "--all-targets",
+    "--keep-going",
+    "--",
+    "-D",
+    "warnings",
+    "-A",
+    "clippy::all",
+    "-D",
+    "clippy::correctness",
+    "-D",
+    "clippy::suspicious",
+    "-D",
+    "clippy::disallowed_methods",
+    "-D",
+    "clippy::disallowed_types",
+    "-D",
+    "clippy::disallowed_macros",
+];
 
 /// The workspace's `required-features` targets, as the `(package, feature)` pairs that switch them on, read from the members' manifests (`crates/*/Cargo.toml`), sorted and without repeats.
 #[must_use]
@@ -450,13 +354,13 @@ pub fn manifest_required_features(text: &str) -> Vec<(String, String)> {
     found
 }
 
-/// `<tippy> -p <pkg>… --features <pkg/feat>,… <LINT_TAIL>`: the pass over the targets [`tippy_args`] cannot reach (`gated`, [`gated_lint_features`]), of the packages whose gated targets the selection compiles ([`Scope::gated_spec_of`]). `None` when it holds none.
+/// `<tippy> -p <pkg>… --features <pkg/feat>,… <LINT_TAIL>`: the pass over the targets [`tippy_args`] cannot reach (`gated`, [`gated_lint_features`]), of the selected packages that have such targets ([`Scope::spec_of`]). `None` when it holds none.
 #[must_use]
 pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec<String>> {
     let mut packages: Vec<String> = Vec::new();
     let mut features: Vec<String> = Vec::new();
     for (pkg, feat) in gated {
-        let Some(spec) = scope.gated_spec_of(pkg) else {
+        let Some(spec) = scope.spec_of(pkg) else {
             continue;
         };
         if !packages.contains(&spec) {
@@ -477,20 +381,24 @@ pub fn tippy_gated_args(scope: &Scope, gated: &[(String, String)]) -> Option<Vec
     Some(a)
 }
 
-/// Every lint invocation `scope` runs, in order, each with its row's words: the ordinary passes
-/// ([`tippy_passes`]); the required-features targets of the packages whose gated targets it
-/// compiles ([`tippy_gated_args`] over `gated`, [`gated_lint_features`]), under the same feature
-/// unification ([`lint_unified`]), so it compiles again only what a feature changes; and the
-/// shipped build's ([`tippy_release_args`]).
+/// Every lint invocation `scope` runs, in order, each with its row's words: one pass over every
+/// target of the selection ([`tippy_args`]); then, only where the run judges the whole workspace
+/// (`whole`: `--all`, a run that names no selection, a change cone that widened, and the
+/// release, which lints package by package),
+/// the required-features targets of the packages that have them ([`tippy_gated_args`] over
+/// `gated`, [`gated_lint_features`]), under the same feature unification ([`lint_unified`]), so
+/// it compiles again only what a feature changes, and the shipped build's
+/// ([`tippy_release_args`]). A cone or a `-p` run leaves those two to the release's lint and the
+/// mac-x64 cell, which lints with debug assertions off.
 #[must_use]
-pub fn lint_invocations(scope: &Scope, gated: &[(String, String)]) -> Vec<TippyPass> {
-    let mut runs: Vec<TippyPass> = tippy_passes(scope)
-        .into_iter()
-        .map(|pass| TippyPass {
-            label: pass.label,
-            args: lint_unified(pass.args),
-        })
-        .collect();
+pub fn lint_invocations(scope: &Scope, gated: &[(String, String)], whole: bool) -> Vec<TippyPass> {
+    let mut runs = vec![TippyPass {
+        label: scope.label(),
+        args: lint_unified(tippy_args(scope)),
+    }];
+    if !whole {
+        return runs;
+    }
     if let Some(args) = tippy_gated_args(scope, gated) {
         let sep = args.iter().position(|a| a == "--features").unwrap_or(0);
         runs.push(TippyPass {
@@ -510,21 +418,18 @@ pub fn lint_invocations(scope: &Scope, gated: &[(String, String)]) -> Vec<TippyP
 /// The package of the one shipped executable, which `ship` builds `--release`.
 pub const SHIPPED: &str = "aterm";
 
-/// `<tippy> -p aterm --release --keep-going -- -D warnings`: every selection reaching the
-/// shipped executable also lints the build as `ship` builds it, with debug assertions off.
+/// `<tippy> -p aterm --release <LINT_TAIL less --all-targets>`: a whole-workspace lint
+/// ([`lint_invocations`]) also lints the build as `ship` builds it, with debug assertions off.
 #[must_use]
 pub fn tippy_release_args(scope: &Scope) -> Option<Vec<String>> {
     let spec = scope.spec_of(SHIPPED)?;
-    let a = [
-        "-p",
-        spec.as_str(),
-        "--release",
-        "--keep-going",
-        "--",
-        "-D",
-        "warnings",
-    ];
-    Some(a.map(String::from).into())
+    Some(
+        ["-p", spec.as_str(), "--release"]
+            .into_iter()
+            .chain(LINT_TAIL[1..].iter().copied())
+            .map(String::from)
+            .collect(),
+    )
 }
 
 /// `targo --unverified run -q --profile gate -p aterm-release -- <verb>`: the release tools, built as the `ship` alias builds them.
@@ -889,12 +794,26 @@ fn run_row(ctx: &Ctx, stage: &str, row: &str, cmd: &Cmd) -> exec::Run {
         ctx.events.as_ref(),
         &crate::report::row_event(stage, row, None),
     );
-    let run = exec::run(cmd, ctx.exec_env());
+    let run = crate::stale_artifact::retried(
+        build_roots(ctx),
+        || exec::run(cmd, ctx.exec_env()),
+        |run| run,
+    );
     crate::event_log::emit(
         ctx.events.as_ref(),
         &crate::report::row_event(stage, row, Some((began.elapsed(), run.usage))),
     );
     run
+}
+
+/// The run's build directories ([`crate::runs::Runs::build_roots`]), under which a call that
+/// stopped on a stale artifact may remove the files its compiler named
+/// ([`crate::stale_artifact::retried`]); none where the run keeps no record of them.
+fn build_roots(ctx: &Ctx) -> &[std::path::PathBuf] {
+    ctx.runs
+        .as_ref()
+        .map(crate::runs::Runs::build_roots)
+        .unwrap_or_default()
 }
 
 /// A native step whose child lives across several calls, such as the GUI smoke.
@@ -947,6 +866,7 @@ pub(crate) fn step_of(r: &Report) -> &str {
 
 /// Run `cmd`, a call that compiles and runs nothing it built, with Cargo's messages on a stdout
 /// of its own ([`crate::compile_account::with_message_format`], [`exec::run_machine`]), and
+/// made once more where it stopped on a stale artifact ([`crate::stale_artifact::retried`]), and
 /// account for it ([`crate::compile_account::Account`]) as call `call` of `step`: its
 /// `compile-finished` event goes to stderr at once, its line to its caller for its report. What
 /// it used of the build directory it builds into is noted for the run's record of it
@@ -958,7 +878,11 @@ fn run_compile(ctx: &Ctx, step: &str, call: &str, cmd: &Cmd) -> Compile {
         ctx.events.as_ref(),
         &crate::report::row_event(step, call, None),
     );
-    let exec::MachineRun { run, stdout } = exec::run_machine(&cmd, ctx.exec_env(), Some(step));
+    let exec::MachineRun { run, stdout } = crate::stale_artifact::retried(
+        build_roots(ctx),
+        || exec::run_machine(&cmd, ctx.exec_env(), Some(step)),
+        |machine| &mut machine.run,
+    );
     let ended = std::time::Instant::now();
     crate::disk::note_call(ctx, &cmd, stdout.as_deref().ok(), run.ok);
     crate::event_log::emit(
@@ -981,6 +905,9 @@ fn run_compile(ctx: &Ctx, step: &str, call: &str, cmd: &Cmd) -> Compile {
         .as_ref()
         .and_then(|meter| Some((meter.unix_ms(began)?, meter.unix_ms(ended)?)))
         .and_then(|(from, to)| crate::compile_account::Overlap::of(&spans, from, to));
+    if let (Some(meter), Some(usage)) = (&meter, run.usage) {
+        meter.book_starved(usage.starved);
+    }
     let account = crate::compile_account::Account::of(
         step,
         call,
@@ -1145,7 +1072,7 @@ fn with_ambient_rustdoc(ctx: &Ctx, cmd: Cmd) -> Cmd {
     }
 }
 
-/// Which doc driver a doc-running stage gets.
+/// Which doc driver the test compile and its doctests get.
 #[derive(Debug, PartialEq, Eq)]
 enum DocDriver {
     Stage2,
@@ -1437,15 +1364,20 @@ fn shape_after(
 }
 
 fn test_compile_cmd(ctx: &Ctx, bind: bool, args: Vec<String>) -> Cmd {
-    let cmd = main_targo(ctx, args);
-    let cmd = if bind {
+    let cmd = test_doc_driver(ctx, bind, main_targo(ctx, args));
+    crate::test_env::command(ctx, cmd.demoted())
+}
+
+/// `cmd` with the test compile's doc driver bound ([`test_doc_binding`]): the stage2 trustdoc,
+/// the caller's `RUSTDOC`, or Cargo's own choice.
+fn test_doc_driver(ctx: &Ctx, bind: bool, cmd: Cmd) -> Cmd {
+    if bind {
         with_trustdoc(ctx, cmd)
     } else if matches!(doc_driver(ctx), DocDriver::Ambient) {
         with_ambient_rustdoc(ctx, cmd)
     } else {
         cmd
-    };
-    crate::test_env::command(ctx, cmd.demoted())
+    }
 }
 
 fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
@@ -1538,6 +1470,56 @@ fn test(ctx: &Ctx, r: &mut Report) {
     }
     // The recording Cargo pass checks freshness and supplies its own target metadata.
     crate::testrun::run_tests(ctx, r, &run_label, &run, crate::checks::Check::Test);
+    doctests(ctx, r, &label, bind);
+}
+
+/// The test stage's last child: the selection's doctests ([`doctest_args`]), bound to the test
+/// compile's doc driver ([`test_doc_binding`]) so they link the units it built, under the
+/// stage's hang detector and its first red. A selection with no library has none to run.
+fn doctests(ctx: &Ctx, r: &mut Report, label: &str, bind: bool) {
+    if let Some(red) = ctx.halted() {
+        r.cannot_run(format!("{label} --doc — {red}"));
+        return;
+    }
+    if !scope_compiles_doctests(ctx) {
+        return;
+    }
+    let driver = doc_driver(ctx);
+    let label = match driver {
+        DocDriver::Stage2 => format!("{label} --doc (trustdoc)"),
+        DocDriver::Ambient => format!("{label} --doc (caller's RUSTDOC)"),
+        DocDriver::BarePath => format!("{label} --doc"),
+        DocDriver::Absent => {
+            r.cannot_run(ctx.tools.missing_trustdoc_label());
+            return;
+        }
+    };
+    let threads = if ctx.pool.is_some() {
+        Some(1)
+    } else {
+        ctx.test_thread_override()
+    };
+    run_tests_at_width(ctx, r, &label, &doctest_cmd(ctx, bind), threads);
+}
+
+/// The doctests' command ([`doctests`]): [`doctest_args`] on the main lane, its doc driver bound
+/// as the test compile's, in the test environment with the run's checkers, and ended as hung
+/// after [`exec::TEST_BINARY_HANG`] with no output and no CPU or I/O in its tree, as a test
+/// binary is. Under a pool each Cargo/rustdoc job already owns one token, so the doctests it
+/// runs spend that one job.
+fn doctest_cmd(ctx: &Ctx, bind: bool) -> Cmd {
+    let mut cmd = crate::test_env::command(
+        ctx,
+        with_checkers(
+            test_doc_driver(ctx, bind, main_targo(ctx, doctest_args(&ctx.scope))),
+            ctx.checkers_in_tests,
+        ),
+    );
+    if ctx.pool.is_some() {
+        cmd = cmd.env("RUST_TEST_THREADS", "1");
+    }
+    cmd.hang_after = Some(exec::TEST_BINARY_HANG);
+    cmd
 }
 
 /// Why a `measure` stage handed no bundle ran nothing, and the fix.
@@ -1924,197 +1906,6 @@ fn decide_measuring_child(r: &mut Report, run: &exec::Run, label: &str, subject:
     }
 }
 
-fn doctests(ctx: &Ctx, r: &mut Report) {
-    if !ctx.tools.have_targo() {
-        r.skip("targo test --doc (no targo)");
-        return;
-    }
-    let label = format!("targo test --doc {}", ctx.scope.label());
-    if ctx.scope.selects_nothing() {
-        r.skip(format!("{label} {EMPTY_CONE}"));
-        return;
-    }
-    if !scope_compiles_doctests(ctx) {
-        r.skip(format!(
-            "targo test --doc (no package in scope has a library target: {})",
-            ctx.scope.label()
-        ));
-        return;
-    }
-    let split = doctest_split(ctx);
-    if split.as_ref().is_some_and(|s| s.run.is_empty()) {
-        r.pass(format!(
-            "targo test --doc (no crate in {} has a fenced Rust block in its docs)",
-            ctx.scope.label()
-        ));
-        return;
-    }
-    let skip = split.map(|s| s.skip).unwrap_or_default();
-    let driver = doc_driver(ctx);
-    let label = match driver {
-        DocDriver::Stage2 => format!("{label} (trustdoc)"),
-        DocDriver::Ambient => format!("{label} (caller's RUSTDOC)"),
-        DocDriver::BarePath => label,
-        DocDriver::Absent => {
-            r.cannot_run(ctx.tools.missing_trustdoc_label());
-            return;
-        }
-    };
-    let cmd = match doctest_cmd(ctx, &driver, &skip) {
-        Ok(cmd) => cmd,
-        Err(why) => {
-            r.cannot_run(format!(
-                "{label} — {why}; no doctest binary was run unmonitored"
-            ));
-            return;
-        }
-    };
-    let halt_marker = ctx
-        .halt
-        .armed()
-        .then(|| crate::docdriver::halt_marker(&ctx.scratch));
-    if let Some(path) = &halt_marker
-        && let Err(why) = crate::docdriver::prepare_halt_marker(path)
-    {
-        r.cannot_run(format!(
-            "{label} — cannot prepare its first-red admission: {why}; no doctest binary was run"
-        ));
-        return;
-    }
-    let threads = if ctx.pool.is_some() {
-        Some(1)
-    } else {
-        ctx.test_thread_override()
-    };
-    run_tests_at_width(ctx, r, &label, &cmd, threads);
-    if let Some(path) = halt_marker
-        && let Err(error) = crate::docdriver::remove_halt_marker(&path)
-    {
-        r.raw(format!(
-            "aterm-verify: could not remove doctest first-red protocol {}: {error}",
-            path.display()
-        ));
-    }
-}
-
-fn doctest_cmd(ctx: &Ctx, driver: &DocDriver, skip: &[String]) -> Result<Cmd, String> {
-    let cmd = crate::test_env::command(
-        ctx,
-        with_checkers(
-            main_targo(ctx, doctest_args(&ctx.scope)),
-            ctx.checkers_in_tests,
-        ),
-    );
-    let stand_in = ctx
-        .test_recorder()
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| "cannot resolve verify's absolute doctest runtool".to_owned())?;
-    let real = cargo_doc_driver(ctx, driver).ok_or_else(|| {
-        "cannot resolve Cargo's exact doc driver to interpose the doctest runtool".to_owned()
-    })?;
-    let mut cmd = cmd
-        .remove_env(crate::docdriver::DRIVER_ENV)
-        .remove_env(crate::docdriver::SKIP_ENV)
-        .remove_env(crate::docdriver::RUNTOOL_ENV)
-        .remove_env(crate::docdriver::RUNTOOL_SCRATCH_ENV)
-        .remove_env(crate::docdriver::RUNTOOL_SAMPLES_ENV)
-        .remove_env(crate::docdriver::RUNTOOL_HALT_ENV)
-        .env("RUSTDOC", &stand_in)
-        .env(crate::docdriver::DRIVER_ENV, real)
-        .env(crate::docdriver::RUNTOOL_ENV, &stand_in)
-        .env(crate::docdriver::RUNTOOL_SCRATCH_ENV, &ctx.scratch);
-    if ctx.pool.is_some() {
-        // Each Cargo/rustdoc job already owns one token. Runtime doctests spend that one job.
-        cmd = cmd.env("RUST_TEST_THREADS", "1");
-    }
-    if ctx.halt.armed() {
-        cmd = cmd.env(
-            crate::docdriver::RUNTOOL_HALT_ENV,
-            crate::docdriver::halt_marker(&ctx.scratch),
-        );
-    }
-    if let Some(samples) = &ctx.hang_samples {
-        cmd = cmd.env(crate::docdriver::RUNTOOL_SAMPLES_ENV, samples);
-    }
-    if !skip.is_empty() {
-        cmd = cmd.env(
-            crate::docdriver::SKIP_ENV,
-            crate::docdriver::skip_list(skip),
-        );
-    }
-    Ok(cmd)
-}
-
-fn cargo_doc_driver(ctx: &Ctx, driver: &DocDriver) -> Option<std::path::PathBuf> {
-    use aterm_toolchain::build_cache::{Machine, configs_name, read_config};
-    let on_path = |name: &std::ffi::OsStr| crate::find_on_path(name, &ctx.path_env);
-    let beside_targo_or_on_path = || {
-        let name = crate::toolchain::tool_file("trustdoc");
-        std::fs::canonicalize(&ctx.tools.targo)
-            .ok()
-            .and_then(|targo| Some(targo.parent()?.join(&name)))
-            .filter(|f| {
-                std::fs::symlink_metadata(f).is_ok_and(|m| m.file_type().is_file())
-                    && is_executable_file(f)
-            })
-            .or_else(|| on_path(name.as_ref()))
-    };
-    let config_names_one = || {
-        let lookup = |k: &str| {
-            ctx.env
-                .cargo_layout
-                .iter()
-                .find(|(name, _)| *name == k)
-                .map(|(_, v)| v.clone())
-        };
-        let machine = Machine {
-            home: Some(&ctx.env.home)
-                .filter(|h| !h.as_os_str().is_empty())
-                .map(std::path::PathBuf::as_path),
-            root: None,
-            cwd: Some(&ctx.root),
-            env: &lookup,
-            read: &read_config,
-            read_manifest: &aterm_toolchain::build_cache::read_manifest,
-            writable: &|_| None,
-        };
-        configs_name(&machine, names_rustdoc)
-    };
-    let file = match driver {
-        // The ordinary command binds this path as `RUSTDOC`; the stand-in replaces that binding,
-        // so this is the exact driver it must exec rather than another `trustdoc` on PATH.
-        DocDriver::Stage2 => Some(ctx.tools.trustdoc.clone()),
-        DocDriver::Ambient => match ctx.env.rustdoc_override.as_deref() {
-            Some(value) if !value.is_empty() => {
-                let spelled = value.to_str()?;
-                if spelled.contains(['/', '\\']) {
-                    Some(ctx.root.join(spelled))
-                } else {
-                    on_path(value)
-                }
-            }
-            _ if config_names_one() => None,
-            _ => beside_targo_or_on_path(),
-        },
-        DocDriver::BarePath if config_names_one() => None,
-        DocDriver::BarePath => beside_targo_or_on_path(),
-        DocDriver::Absent => None,
-    };
-    file.filter(|f| f.is_absolute())
-}
-
-fn names_rustdoc(line: &str) -> bool {
-    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
-    line.match_indices("rustdoc").any(|(at, key)| {
-        let rest = &line[at + key.len()..];
-        !line[..at].ends_with(word)
-            && !rest.starts_with(word)
-            && rest
-                .trim_start_matches([' ', '\t', '"', '\''])
-                .starts_with('=')
-    })
-}
-
 /// A lint pass's `args` led by the workspace's feature unification
 /// ([`aterm_toolchain::build_cache::TEST_GRAPH_FLAG`] and
 /// [`aterm_toolchain::build_cache::TEST_GRAPH_CONFIG`]; `targo-tippy` hands them to the `check`
@@ -2201,7 +1992,10 @@ fn tippy_scope(
         return true;
     }
     let mut passed = true;
-    for pass in lint_invocations(scope, &gated_lint_features(&ctx.root)) {
+    // A release judges the whole workspace whatever it selects: where its package carry is
+    // unavailable it lints here, with every pass.
+    let whole = ctx.release || matches!(scope, Scope::Workspace);
+    for pass in lint_invocations(scope, &gated_lint_features(&ctx.root), whole) {
         if !compile_labeled(
             ctx,
             r,
@@ -2218,21 +2012,27 @@ fn tippy_scope(
     passed
 }
 
+/// The release's lint of one package: every pass a whole-workspace lint runs over it
+/// ([`lint_invocations`]), since the release judges the whole workspace package by package.
 fn exact_package_tippy_commands(
     ctx: &Ctx,
     bin: &std::path::Path,
     spec: &str,
 ) -> Result<Vec<Cmd>, String> {
-    lint_invocations(&Scope::crate_only(spec), &gated_lint_features(&ctx.root))
-        .into_iter()
-        .map(|TippyPass { mut args, .. }| {
-            args.insert(0, "--unverified".into());
-            exact_lint_command(
-                ctx,
-                crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args)),
-            )
-        })
-        .collect()
+    lint_invocations(
+        &Scope::crate_only(spec),
+        &gated_lint_features(&ctx.root),
+        true,
+    )
+    .into_iter()
+    .map(|TippyPass { mut args, .. }| {
+        args.insert(0, "--unverified".into());
+        exact_lint_command(
+            ctx,
+            crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args)),
+        )
+    })
+    .collect()
 }
 
 fn exact_lint_command(ctx: &Ctx, mut command: Cmd) -> Result<Cmd, String> {
@@ -2638,10 +2438,8 @@ fn in_checkout(ctx: &Ctx, r: &mut Report, what: &str) -> bool {
 }
 
 /// Every walk of [`aterm_census::CENSUSES`], each once, after Census's shared checkout
-/// prerequisite has passed and holding `capture-privacy` to the baseline of the engine's commit
-/// ([`census_baseline`]). Each guard rule and census reuses the result the checkout's memo
-/// under the state directory kept for it while every question it asked keeps its answer
-/// ([`aterm_census::Memo`]); the transcript says what it reused.
+/// prerequisite has passed and holding `capture-privacy` to the baseline of the run's one read of
+/// the engine ([`census_baseline`]).
 fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
     if ctx.input_paths.is_some() && ctx.carry_context.is_some() {
         preflight_censuses(ctx, r, check);
@@ -2649,11 +2447,8 @@ fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
     }
     let selected: Vec<&aterm_census::Census> = aterm_census::CENSUSES.iter().collect();
     let root = ctx.root.clone();
-    let var = engine_vars(ctx);
-    let memo = aterm_census::Memo::for_root(&ctx.state_dir(), &ctx.root);
-    let (outcomes, report) = match bounded_source(ctx, move || {
-        census_walk(&root, &var, &selected, Some(&memo))
-    }) {
+    let baseline = census_baseline(ctx.engine());
+    let outcomes = match bounded_source(ctx, move || census_walk(&root, &baseline, &selected)) {
         Ok(o) => o,
         Err(why) => {
             r.cannot_run(format!("{check} — the walk {why}"));
@@ -2668,9 +2463,6 @@ fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
             r.fail(outcome.verdict);
             r.raw(outcome.log.trim_end().to_string());
         }
-    }
-    if let Some(report) = report {
-        r.raw(report.line());
     }
 }
 
@@ -2713,7 +2505,7 @@ mod source_worker_tests;
 
 fn preflight_censuses(ctx: &Ctx, r: &mut Report, check: &str) {
     let root = ctx.root.clone();
-    let baseline = census_baseline(&root, &engine_vars(ctx));
+    let baseline = census_baseline(ctx.engine());
     let prior: std::collections::BTreeMap<_, _> = aterm_census::CENSUSES
         .iter()
         .filter_map(|census| {
@@ -2721,26 +2513,24 @@ fn preflight_censuses(ctx: &Ctx, r: &mut Report, check: &str) {
                 .map(|proof| (census.name, proof.clone()))
         })
         .collect();
-    let memo = aterm_census::Memo::for_root(&ctx.state_dir(), &ctx.root);
     let pooled = ctx.pool.is_some();
     let result = bounded_source(ctx, move || {
         let run_one = |census: &aterm_census::Census| {
             let cached = prior.get(census.name).cloned();
             if let Some(proof) = cached {
-                return (census.name, None, None, Some(proof), None);
+                return (census.name, None, None, Some(proof));
             }
-            // Guards include parallel and publication readers; their aggregate stays
-            // unbounded, and this tree's census memo keeps each rule's record
-            // instead. The five lexical graph censuses use the typed tree reader.
+            // The guards read the whole corpus and the publication engine's baseline, so no
+            // input capture bounds them: they run every time. The main-loop census reads
+            // through the typed tree reader, whose reads the capture records.
             if census.name == "guards" {
-                let (mut outcomes, report) =
-                    aterm_census::run_censuses(&root, &[census], &baseline, Some(&memo));
-                return (census.name, outcomes.pop(), None, None, report);
+                let outcome = aterm_census::run_census(&root, census, &baseline);
+                return (census.name, Some(outcome), None, None);
             }
             let (outcome, inputs) = aterm_census::inputs::capture(&root, || {
                 aterm_census::run_census(&root, census, &baseline)
             });
-            (census.name, Some(outcome), inputs, None, None)
+            (census.name, Some(outcome), inputs, None)
         };
         if pooled {
             aterm_census::CENSUSES
@@ -2766,10 +2556,7 @@ fn preflight_censuses(ctx: &Ctx, r: &mut Report, check: &str) {
             return;
         }
     };
-    for (name, outcome, inputs, carried, memo) in outcomes {
-        if let Some(memo) = memo {
-            r.raw(memo.line());
-        }
+    for (name, outcome, inputs, carried) in outcomes {
         if let Some(proof) = carried {
             r.pass(format!("{name}: reused complete package input snapshots"));
             r.raw(crate::input_content::event(ctx, &proof, true));
@@ -2789,51 +2576,29 @@ fn preflight_censuses(ctx: &Ctx, r: &mut Report, check: &str) {
     }
 }
 
-/// The engine checkout and explicit pin variables of `ctx`'s environment ([`crate::EnvSnapshot::engine_var`]),
-/// owned so a walk on another thread reads them.
-fn engine_vars(ctx: &Ctx) -> impl Fn(&str) -> Option<std::ffi::OsString> + Send + 'static {
-    let held = [
-        "PUBLICATION_ENGINE",
-        "HOME",
-        crate::engine::GIT_DIR_ENV,
-        crate::engine::COMMIT_ENV,
-    ]
-    .map(|name| (name, ctx.env.engine_var(name)));
-    move |name| {
-        held.iter()
-            .find(|(held, _)| *held == name)
-            .and_then(|(_, value)| value.clone())
-    }
-}
-
-/// The `selected` censuses over the checkout at `root`, `capture-privacy` held to the baseline
-/// of the engine's commit `var` names ([`census_baseline`]), reusing what `memo` kept.
+/// The `selected` censuses over the checkout at `root`, `capture-privacy` held to `baseline`
+/// ([`census_baseline`]).
 fn census_walk(
     root: &std::path::Path,
-    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    baseline: &aterm_census::EngineBaseline,
     selected: &[&aterm_census::Census],
-    memo: Option<&aterm_census::Memo>,
-) -> (
-    Vec<aterm_census::CensusOutcome>,
-    Option<aterm_census::MemoReport>,
-) {
-    aterm_census::run_censuses(root, selected, &census_baseline(root, var), memo)
+) -> Vec<aterm_census::CensusOutcome> {
+    aterm_census::run_censuses(root, selected, baseline)
 }
 
-/// The forbidden-content baseline of the engine's commit as `var` names the engine for the
-/// checkout at `root` ([`crate::engine::named`]): a named checkout's HEAD, else its origin's main
-/// imported now ([`crate::engine::native`]); never a working tree.
-fn census_baseline(
-    root: &std::path::Path,
-    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
-) -> aterm_census::EngineBaseline {
-    let run = crate::engine::bounded;
-    let commit = crate::engine::named(root, var)
-        .and_then(|named| crate::engine::Commit::read(&named, &run, &crate::engine::native))
-        .map_err(|e| e.why)?;
-    let path = aterm_census::export_scan::rows::BASELINE;
-    let text = commit.text(path, &run).map_err(|e| e.why)?;
-    Ok((format!("{path} on {}", commit.shown()), text))
+/// The forbidden-content baseline of the run's one read of the engine ([`Ctx::engine`]): a named
+/// checkout's HEAD, else its origin's main imported once; never a working tree.
+fn census_baseline(engine: &Result<crate::engine::Files, String>) -> aterm_census::EngineBaseline {
+    let files = engine.as_ref().map_err(Clone::clone)?;
+    let text = files.baseline.clone()?;
+    Ok((
+        format!(
+            "{} on {}",
+            aterm_census::export_scan::rows::BASELINE,
+            files.shown
+        ),
+        text,
+    ))
 }
 
 /// The export check's row.
@@ -2989,46 +2754,7 @@ fn census(ctx: &Ctx, r: &mut Report) {
     if ctx.fix {
         crate::census_fix::run(ctx, r);
     }
-    match crate::changelog_guard::judge(ctx) {
-        Ok(Some(found)) if found.is_empty() => r.pass("changelog structure"),
-        Ok(Some(found)) => {
-            r.fail("changelog structure");
-            r.raw(found.join("\n"));
-            return;
-        }
-        Ok(None) => {}
-        Err(why) => r.cannot_run(format!("changelog structure — {why}")),
-    }
     walks(ctx, r, "census");
-    match crate::harness_debt::judge(
-        &ctx.root,
-        ctx.head_at_start.as_deref().unwrap_or("HEAD"),
-        &ctx.path_env,
-    ) {
-        Ok(crate::harness_debt::Judgement::Clear { version, baseline }) => {
-            r.pass(format!(
-                "harness landing debt since public v{version}: none ({})",
-                &baseline[..12]
-            ));
-        }
-        Ok(crate::harness_debt::Judgement::Owed {
-            version,
-            baseline,
-            debts,
-        }) => {
-            r.fail(format!(
-                "harness landing debt since public v{version}: {} harness version{} owed",
-                debts.len(),
-                if debts.len() == 1 { " is" } else { "s are" }
-            ));
-            r.raw(format!("public baseline: {baseline}"));
-            for debt in debts {
-                r.raw(debt.line());
-            }
-            r.raw("fix: targo --unverified ship harness-bump".to_string());
-        }
-        Err(why) => r.cannot_run(format!("harness landing debt — {why}")),
-    }
 }
 
 /// `targo --unverified run --profile test -q -p aterm-models --bin spec-check`, in the main target once the test compile is done ([`MAIN_PROFILE`]; the bin links every domain's models through `aterm_models::link_all`); under `release` with `-- --full`, which adds the minutes-class `ay` row.
@@ -3087,6 +2813,56 @@ fn spec_check(ctx: &Ctx, r: &mut Report) {
         Some(why) => r.cannot_run(format!("{label} — {why}")),
         None => r.record_child(&out, outcome, label),
     }
+}
+
+/// `targo --unverified build --profile test -q -p atpkg --bin atpkg`, in the main target once the
+/// test compile is done ([`MAIN_PROFILE`]): the helper `candidate-shim` judges this tree by.
+#[must_use]
+pub fn candidate_helper_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        MAIN_PROFILE[0],
+        MAIN_PROFILE[1],
+        "-q",
+        "-p",
+        "atpkg",
+        "--bin",
+        crate::released_shim::CANDIDATE_HELPER_BIN,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn candidate_shim(ctx: &Ctx, r: &mut Report) {
+    if let Some(why) = crate::released_shim::CANDIDATE_ELSEWHERE {
+        r.skip(why);
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("candidate-shim (no targo)");
+        return;
+    }
+    let helper = crate::released_shim::CANDIDATE_HELPER_BIN;
+    if !build_to_drive(
+        ctx,
+        r,
+        candidate_helper_build_args(),
+        format!("targo build --bin {helper}"),
+        "candidate-shim (this tree's shim and atpkg, each placement)",
+    ) {
+        return;
+    }
+    let bin = main_bin(ctx, helper);
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "candidate-shim: just-built helper missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    crate::released_shim::run_candidate(ctx, r, &bin);
 }
 
 /// Runtime selection shared by serial Cargo runs and recorded test executables.
@@ -3387,7 +3163,13 @@ impl Drop for AppkitRuntime {
 }
 
 #[cfg(unix)]
-fn appkit_runtime_parent() -> std::path::PathBuf {
+fn appkit_runtime_parent(ctx: &Ctx) -> std::path::PathBuf {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(parent) = &ctx.appkit_runtime {
+        return parent.clone();
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    let _ = ctx;
     aterm_tempfile::quiet_in(std::path::Path::new("/tmp")).join(format!(
         "aterm-verify-appkit-{}.noindex",
         aterm_uds::peer::our_uid()
@@ -3420,7 +3202,7 @@ fn appkit_group_runtime(
     paths: &[(&str, std::path::PathBuf)],
 ) -> Option<AppkitRuntime> {
     let prepared = (|| -> Result<AppkitRuntime, String> {
-        let parent = appkit_runtime_parent();
+        let parent = appkit_runtime_parent(ctx);
         aterm_uds::private_file::create_private_dir(&parent).map_err(|error| {
             format!(
                 "create stable verifier-private runtime directory {}: {error}",
@@ -3826,23 +3608,29 @@ pub fn linux_lane_outcome(code: Option<i32>, transcript: &str) -> (Outcome, Stri
     )
 }
 
-fn linux_lane(ctx: &Ctx, r: &mut Report) {
+fn linux_lab_build(ctx: &Ctx, r: &mut Report) {
+    build_linux_lab(ctx, r, |ctx, r| {
+        let name = LINUX_LANE;
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            r.cannot_run(format!(
+                "{name} (Apple silicon only: lima's vz VM with Rosetta for the x86_64 cell)"
+            ));
+            return false;
+        }
+        if !ctx.tools.have_targo() {
+            r.cannot_run(format!("{name} — {}", ctx.tools.missing_targo_label()));
+            return false;
+        }
+        compile_labeled(ctx, r, LINUX_LAB_BUILD_LABEL, &linux_lab_build_cmd(ctx))
+    });
+}
+
+fn build_linux_lab(ctx: &Ctx, r: &mut Report, build: impl FnOnce(&Ctx, &mut Report) -> bool) {
+    *ctx.linux_lab_built
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let name = LINUX_LANE;
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        r.cannot_run(format!(
-            "{name} (Apple silicon only: lima's vz VM with Rosetta for the x86_64 cell)"
-        ));
-        return;
-    }
-    if !ctx.tools.have_targo() {
-        r.cannot_run(format!("{name} — {}", ctx.tools.missing_targo_label()));
-        return;
-    }
-    if !compile_labeled(ctx, r, LINUX_LAB_BUILD_LABEL, &linux_lab_build_cmd(ctx)) {
-        r.cannot_run(format!(
-            "{name} — the build above failed, so there is no lab to run the lane{}",
-            NOT_RUN_BEHIND
-        ));
+    if !build(ctx, r) {
         return;
     }
     let lab = main_bin(ctx, "aterm-lab");
@@ -3853,7 +3641,43 @@ fn linux_lane(ctx: &Ctx, r: &mut Report) {
         ));
         return;
     }
-    let out = exec::run(&linux_lane_cmd(ctx), ctx.exec_env());
+    *ctx.linux_lab_built
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lab);
+}
+
+fn prepared_linux_lane(ctx: &Ctx) -> Result<Cmd, String> {
+    let lab = main_bin(ctx, "aterm-lab");
+    if ctx
+        .linux_lab_built
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        != Some(&lab)
+    {
+        return Err(format!(
+            "{LINUX_LANE}: no successful lab build in this run{NOT_RUN_BEHIND}"
+        ));
+    }
+    if !is_executable_file(&lab) {
+        return Err(format!(
+            "{LINUX_LANE}: the just-built {} is missing",
+            lab.display()
+        ));
+    }
+    Ok(linux_lane_cmd(ctx))
+}
+
+fn linux_lane(ctx: &Ctx, r: &mut Report) {
+    let cmd = match prepared_linux_lane(ctx) {
+        Ok(cmd) => cmd,
+        Err(why) => {
+            r.cannot_run(why);
+            return;
+        }
+    };
+    let out = exec::run(&cmd, ctx.exec_env());
+    let name = LINUX_LANE;
     r.record_driven(&out, name, linux_lane_outcome);
 }
 

@@ -32,7 +32,7 @@ fn closed_capture_observations_keep_all_128_prefixes_without_reader_descriptors(
     let mut observations = Vec::new();
     for index in 0..128_u8 {
         let (mut capture, mut writer) = Capture::pipe().unwrap();
-        let fd = capture.reader.as_raw_fd();
+        let fd = capture.reader_descriptor();
         assert!(
             fd < 256,
             "this bounded native control measures the unchanged low table"
@@ -67,7 +67,7 @@ fn actual_child_owning_wait_and_pipe_eof_preserve_bytes_after_reader_close() {
     // This is a real native owning-wait/output control, not an SDK Keeper,
     // NoForkTarget, paid Epoch borrower, Host completion or Ready fixture.
     let (mut capture, writer) = Capture::pipe().unwrap();
-    let fd = capture.reader.as_raw_fd();
+    let fd = capture.reader_descriptor();
     let mut command = aterm_uds::spawnfd::command("/usr/bin/printf");
     command
         .env_clear()

@@ -273,6 +273,214 @@ fn nested_build(hop: bool, verb: &str) {
     );
 }
 
+/// A one-file package `p` in a scratch home with no `Library`, a stand-in `targo` that writes
+/// the words it was handed ([`FallbackRig::run`]), and the real block and hop naming the real
+/// front, as an installed shim is laid.
+struct FallbackRig {
+    _tmp: aterm_tempfile::TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    package: PathBuf,
+    standin: PathBuf,
+    shim: PathBuf,
+}
+
+/// The words a build typed `targo --unverified build` in [`FallbackRig`]'s package.
+const TYPED: [&str; 2] = ["--unverified", "build"];
+
+impl FallbackRig {
+    fn new() -> Self {
+        let tmp = aterm_tempfile::Builder::new()
+            .prefix("atpkg-build-cache-fallback-")
+            .tempdir()
+            .unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = root.join("home");
+        let package = home.join("p");
+        write(
+            &package.join("Cargo.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&package.join("src/lib.rs"), "");
+        let standin = root.join("targo");
+        write(&standin, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BC_RAN\"\n");
+        std::fs::set_permissions(
+            &standin,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let shim = root.join("targo-shim");
+        let block = atpkg::build_cache::shim_block("targo").unwrap();
+        let hop = atpkg::build_cache::registered::shim_hop(
+            &aterm_tempfile::bin_exe("atpkg"),
+            "targo",
+            &format!("'{}'", standin.display()),
+            None,
+        );
+        write(&shim, &format!("#!/bin/sh\n{block}{hop}"));
+        Self {
+            _tmp: tmp,
+            root,
+            home,
+            package,
+            standin,
+            shim,
+        }
+    }
+
+    /// `program args…` from the package, in the rig's home: its status, what it said, and the
+    /// words the stand-in was handed where the build started.
+    fn run(
+        &self,
+        program: &Path,
+        args: &[&str],
+    ) -> (std::process::ExitStatus, String, Option<String>) {
+        let ran = self.root.join("ran");
+        let _ = std::fs::remove_file(&ran);
+        let mut command = aterm_uds::spawnfd::command(program);
+        command
+            .args(args)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &self.home)
+            .env("PWD", &self.package)
+            .env("BC_RAN", &ran)
+            .env(atpkg::build_admit::LEDGER_ENV, self.root.join("ledger"))
+            .env("ATERM_STATE_HOME", self.root.join("state"))
+            .env("ATERM_ADMIT", "now")
+            .current_dir(&self.package);
+        let output = aterm_uds::deadline::output_within(&mut command, HANG).unwrap();
+        (
+            output.status,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            std::fs::read_to_string(&ran).ok(),
+        )
+    }
+
+    /// [`TYPED`] through the shim.
+    fn build(&self) -> (std::process::ExitStatus, String, Option<String>) {
+        let shim = self.shim.to_str().unwrap();
+        self.run(Path::new("/bin/sh"), &[&[shim], &TYPED[..]].concat())
+    }
+
+    /// The front handed the block's fallback claim on [`TYPED`], as a shim that selected the
+    /// fallback hands it.
+    fn claim_fallback(&self) -> (std::process::ExitStatus, String, Option<String>) {
+        let fallback = Self::fallback();
+        let claim = [
+            &["__build_admit", "--shim", "targo", "config"][..],
+            &[self.standin.to_str().unwrap(), "--config", &fallback],
+            &TYPED,
+        ]
+        .concat();
+        self.run(&aterm_tempfile::bin_exe("atpkg"), &claim)
+    }
+
+    /// The `--config` value of the block's in-tree fallback.
+    fn fallback() -> String {
+        format!(
+            "build.build-dir='{}'",
+            atpkg::build_cache::target_build_path(Path::new("{workspace-root}/target")).display()
+        )
+    }
+
+    /// The package's quiet build directory under its own target.
+    fn quiet(&self) -> PathBuf {
+        atpkg::build_cache::target_build_path(&self.package.join("target"))
+    }
+}
+
+/// The two words that place a build's intermediates at `value`, as the stand-in writes them.
+fn config_pair(value: &str) -> String {
+    format!("--config\n{value}\n")
+}
+
+/// A BUILD IN A HOME WITH NO CACHES FOLDER RUNS IN THE SHARED CACHE: the real block, hop and
+/// front, in a home with no `Library`. The home may be written, so the block selects the
+/// shared cache; the front admits that claim, lays the folders the cache is made in and becomes
+/// the build, which is handed the shared cache's `--config` pair, the first time and again
+/// once the folders stand. 0.199 selected the in-tree fallback there and refused every such
+/// build (exit 75, `the selected quiet build target could not be resolved safely`).
+/// NEGATIVE CONTROL: the in-tree fallback claim handed to the front in that home is no
+/// placement the block selects there, and is refused (exit 75) with no build started.
+#[test]
+fn a_build_in_a_home_with_no_caches_folder_runs_in_the_shared_cache() {
+    let rig = FallbackRig::new();
+    assert!(!rig.home.join("Library").exists());
+    let cache = atpkg::build_cache::cache_root(&rig.home);
+    let shared = atpkg::build_cache::config_value(&cache).unwrap();
+    for _ in 0..2 {
+        let (status, said, words) = rig.build();
+        assert!(status.success(), "{status}: {said}");
+        let words = words.expect("the build started");
+        assert!(words.contains(&config_pair(&shared)), "{words}");
+        assert!(
+            cache.parent().unwrap().is_dir(),
+            "admission laid the folder the shared cache is made in"
+        );
+    }
+
+    let (status, said, words) = rig.claim_fallback();
+    assert_eq!(status.code(), Some(75), "{said}");
+    assert!(
+        said.contains("does not match current placement"),
+        "the control's refusal: {said}"
+    );
+    assert_eq!(words, None, "no build started");
+    assert!(!rig.quiet().exists(), "a refused claim prepares nothing");
+}
+
+/// A BUILD IN A HOME WHOSE CACHES FOLDER CANNOT BE WRITTEN RUNS ON THE IN-TREE FALLBACK, OWNED BY
+/// NO RECEIPT: `Library/Caches` stands read-only, so the block selects the in-tree fallback and
+/// the front can lay no index there; it prepares the package's quiet build directory by the
+/// private-parent checks alone and becomes the build, writing nothing under the caches folder.
+/// Before, the front refused every build in such a home (exit 75, `the target's quiet build
+/// directory could not be owned`).
+/// NEGATIVE CONTROL: where the caches folder reaches aterm's own through a link, nothing says
+/// the home can record no owner, and the same build is refused in those words, unstarted.
+#[test]
+fn a_build_in_a_home_whose_caches_folder_cannot_be_written_runs_on_the_in_tree_fallback() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for linked in [false, true] {
+        let rig = FallbackRig::new();
+        let caches = rig.home.join("Library/Caches");
+        std::fs::create_dir_all(&caches).unwrap();
+        if linked {
+            let elsewhere = rig.root.join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, caches.join("aterm")).unwrap();
+        }
+        std::fs::set_permissions(&caches, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (status, said, words) = rig.build();
+        std::fs::set_permissions(&caches, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if linked {
+            assert_eq!(status.code(), Some(75), "{said}");
+            assert!(
+                said.contains("quiet build directory could not be owned"),
+                "the control's refusal: {said}"
+            );
+            assert_eq!(words, None, "no build started");
+            assert!(!rig.quiet().exists());
+            continue;
+        }
+        assert!(status.success(), "{status}: {said}");
+        let words = words.expect("the build started");
+        assert!(
+            words.contains(&config_pair(&FallbackRig::fallback())),
+            "{words}"
+        );
+        assert!(
+            rig.quiet().is_dir(),
+            "the quiet build directory is prepared"
+        );
+        assert_eq!(
+            std::fs::read_dir(&caches).unwrap().count(),
+            0,
+            "nothing was written under the caches folder"
+        );
+    }
+}
+
 fn fake_cargo(dir: &Path, release: &str) -> PathBuf {
     let path = dir.join("cargo");
     let (release, trust) = match release {

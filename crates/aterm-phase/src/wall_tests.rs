@@ -393,13 +393,14 @@ fn a_cloud_gateway_sign_in_is_the_lost_login() {
     );
 }
 
-use crate::phase::{Phase, limit_notice, worker_phase};
+use crate::phase::{limit_notice, worker_phase};
 use crate::prompt::fixtures::{
     API_ERROR_ENOTFOUND_80_MEASURED, API_ERROR_ENOTFOUND_MEASURED, API_ERROR_QUEUED_SENT_MEASURED,
     API_ERROR_TWICE_MEASURED, COMPACT_ERROR_500_MEASURED, COMPACT_FAILED_3_MEASURED,
     COMPACT_FAILED_FIRST_MEASURED, COMPACT_NOT_ENOUGH_MEASURED, COMPACT_SUCCEEDED_MEASURED,
     CONTEXT_WALL_COMPACT_MENU_MEASURED, CONTEXT_WALL_MEASURED, composer, rows, screen,
 };
+use alab_policy::vocab::Phase;
 
 fn framed(body: &[&str], footer: &str) -> Vec<String> {
     let mut r = rows(body);
@@ -790,6 +791,116 @@ fn the_login_expired_error_row_is_the_auth_wall() {
     ] {
         let w = wall(&v).unwrap_or_else(|| panic!("{name}"));
         assert_eq!((w.kind, w.placement), (kind, Placement::ErrorRow), "{name}");
+    }
+}
+
+/// CLOUDFLARE'S BLOCK PAGE IN THE API'S PLACE IS AN API ERROR, NEVER THE LOST LOGIN: Claude Code
+/// 2.1.323 words its bot check as `Please run /login · API Error: 403 Attention Required! |
+/// Cloudflare` (measured on m2, 2026-11-13; the same login served turns 90 minutes later with no
+/// sign-in), and clears its goal `(authentication failed)` after it. Read on the row and through
+/// the goal's echo, and in the text alone, it is a retried API error with its status.
+/// CONTROL: `Not logged in`, an expired or revoked token, a goal cleared after a real lost login,
+/// a 403 with no page of Cloudflare's and a 401 stay the lost login.
+#[test]
+fn cloudflares_block_page_is_an_api_error_never_the_lost_login() {
+    use crate::prompt::fixtures::LOGIN_EXPIRED;
+    let blocked = |code| WallKind::ApiError {
+        code: Some(code),
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    let edge = "Please run /login · API Error: 403 Attention Required! | Cloudflare";
+    assert!(edge_block(edge));
+    assert!(
+        edge_block(&format!("  ⎿  {edge}")),
+        "drawn under its gutter"
+    );
+    assert_eq!(classify_wall(edge), Some(blocked(403)));
+    assert!(
+        !edge_block("The run saw API Error: 403 Attention Required! | Cloudflare earlier"),
+        "CONTROL: a sentence that only names the page is none"
+    );
+    for (text, code) in [
+        ("API Error: 403 Attention Required! | Cloudflare", 403),
+        (
+            "API Error: 403 Access denied | api.anthropic.com used Cloudflare to restrict access",
+            403,
+        ),
+        (
+            "API Error: 503 <!DOCTYPE html><html><head><title>Just a moment...</title>",
+            503,
+        ),
+        ("API Error: 403 Forbidden · Ray ID: 8e2f0c1d2a3b4c5d", 403),
+    ] {
+        assert!(edge_block(text), "{text}");
+        assert_eq!(classify_wall(text), Some(blocked(code)), "{text}");
+        assert!(!named_by_status_alone(text), "{text}");
+    }
+    for (text, kind) in [
+        ("Not logged in · Please run /login", WallKind::Auth),
+        (
+            "Please run /login · API Error: 403 Forbidden",
+            WallKind::Auth,
+        ),
+        (
+            "Please run /login · API Error: 401 Cloudflare",
+            WallKind::Auth,
+        ),
+        ("Login expired · Please run /login", WallKind::Auth),
+        (
+            "Please run /login · API Error: 401 \
+             {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth \
+             token has expired.\"}}",
+            WallKind::Auth,
+        ),
+        ("OAuth token revoked · Please run /login", WallKind::Auth),
+    ] {
+        assert!(!edge_block(text), "CONTROL: {text}");
+        assert_eq!(classify_wall(text), Some(kind), "CONTROL: {text}");
+    }
+    assert!(
+        named_by_status_alone("API Error: 403 Forbidden"),
+        "CONTROL: a 403 with no page of Cloudflare's is named by its status"
+    );
+
+    let r = screen(LOGIN_EXPIRED);
+    let at = wall(&r).expect("the control").row;
+    let with = |tail: &[&str]| {
+        let mut v = r.clone();
+        v.splice(at..=at, tail.iter().map(|s| (*s).to_string()));
+        v
+    };
+    let row = format!("⏺ {edge}");
+    let cleared = "⏺ Goal cleared after an unrecoverable error (authentication failed): \"x\". Run \
+                   /goal again to continue.";
+    for (name, v, kind) in [
+        ("the block page's row", with(&[&row]), blocked(403)),
+        (
+            "its goal cleared under it",
+            with(&[&row, "", cleared]),
+            blocked(403),
+        ),
+        (
+            "CONTROL: the lost login's row",
+            with(&["⏺ Not logged in · Please run /login"]),
+            WallKind::Auth,
+        ),
+        (
+            "CONTROL: a goal cleared under a lost login",
+            with(&["⏺ Login expired · Please run /login", "", cleared]),
+            WallKind::Auth,
+        ),
+        (
+            "CONTROL: a 403 with no page of Cloudflare's",
+            with(&["⏺ Please run /login · API Error: 403 Forbidden"]),
+            WallKind::Auth,
+        ),
+    ] {
+        let w = wall(&v).unwrap_or_else(|| panic!("{name}"));
+        assert_eq!(w.kind, kind, "{name}: {}", w.message);
+        if kind != WallKind::Auth {
+            assert!(w.message.starts_with(edge), "{name}: {}", w.message);
+        }
     }
 }
 

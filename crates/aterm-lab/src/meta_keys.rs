@@ -894,9 +894,7 @@ pub fn cmd_meta_keys(args: &[String]) -> Res {
         .ctl(&["sessions"])
         .stdout
         .split_whitespace()
-        .find(|w| {
-            w.len() == 22 && w.starts_with("s-") && w[2..].chars().all(|c| c.is_ascii_hexdigit())
-        })
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .map(str::to_string);
     let Some(sid) = sid else {
         lane.row(

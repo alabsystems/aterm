@@ -79,16 +79,17 @@
 //!
 //! The lab's table ([`joiner_table`]): once the member is in, the seed founds the lab's
 //! membership log (Genesis v2, through the guest helper's `genesis`, as `lab mesh churn` founds
-//! its lab), whose first `[everyone]` epoch the table's digest is keyed by: `secrets create`
-//! mints none, and a digest on the seed without it said "this Mac holds no [everyone] key" (E3,
-//! 2026-11-05). The seed then imports a one-row synthetic emails sheet ([`TABLE_ADDRESS`]) and
-//! seals a password of random bytes into it with the owner's own verb (`aterm db emails set …
-//! password --stdin`, the value on stdin from a mode-600 file in the guest, never printed)
-//! before the joiner asks, so the table is older than the joiner, as the owner's is older than
-//! any new Mac. Once the joiner reads In, the guest helper's `repair` moves
-//! the seed's Commons tables to it and each look compares the two `aterm db emails --digest`s
-//! ([`table_verdict`]): one `[everyone]` epoch, the row with its password, one keyed digest. The
-//! record shows epochs, counts and digest prefixes, never a value.
+//! its lab), whose first `[everyone]` epoch the table's sealed cells are keyed by: `secrets
+//! create` mints none, and a seed without it "holds no [everyone] key" (E3, 2026-11-05). The
+//! seed then imports a one-row synthetic emails sheet ([`TABLE_ADDRESS`]) whose activation phone
+//! is [`TABLE_NUMBER`], before the joiner asks, so the table is older than the joiner, as the
+//! owner's is older than any new Mac. A registry at the generation a new lab starts at holds a
+//! phone's number as a sealed token (ordinary data in the form builds up to 0.200.0 read), so a
+//! Mac shows the number only where it opens that token under the epoch's key. Once the joiner
+//! reads In, the guest helper's `repair` moves the seed's Commons tables to it and each look
+//! compares what `aterm db emails` and `aterm db phones` show on each ([`table_verdict`]): the
+//! rows, the number read, one digest of the two views ([`crate::util::listing_digest`]). The
+//! record shows counts and digest prefixes, never an address or a number.
 //!
 //! The member's Commons enrolment stays the guest helper's in-process exchange over loopback
 //! (the row's `enrolled by the runtime` cell says NOT MEASURED). The Commons runtime finds its
@@ -394,19 +395,22 @@ pub fn genesis_said(out: &str) -> String {
 /// The one row of the lab's synthetic emails table: an address no mail reaches.
 pub const TABLE_ADDRESS: &str = "nux-proof@example.invalid";
 
+/// The activation phone of the lab's one row, a number no line answers: the importer keeps it in
+/// its stored form, its digits without the leading 1.
+pub const TABLE_NUMBER: &str = "+1 202 555 0149";
+
 /// The rounds of each guest-helper `repair` the joiner's table look runs (`guest::steps`).
 const REPAIR_ROUNDS: usize = 8;
 
-/// The guest commands that write the seed's synthetic emails sheet and a password beside it,
-/// under `seed/sheet` (never `seed/seed`, which `secrets create --import` publishes), mode 600:
-/// the sheet is one row, [`TABLE_ADDRESS`], whose Password column it leaves out (a sheet's is a
-/// has-password flag), and the password is 24 random bytes from the guest's own `/dev/urandom`,
-/// written to its file and never printed.
+/// The guest command that writes the seed's synthetic emails sheet under `seed/sheet` (never
+/// `seed/seed`, which `secrets create --import` publishes), mode 600: one row, [`TABLE_ADDRESS`]
+/// with [`TABLE_NUMBER`] as its activation phone and no Password column (a sheet's is a
+/// has-password flag).
 fn sheet(seed: &str) -> String {
     format!(
         "set -e; umask 077; mkdir -p {seed}/sheet; \
-         printf 'Email Address,Status\\n{TABLE_ADDRESS},active\\n' > {seed}/sheet/emails.csv; \
-         head -c 24 /dev/urandom | base64 | tr -d '\\n' > {seed}/sheet/pw"
+         printf 'Email Address,Status,Activation Phone Number\\n{TABLE_ADDRESS},active,{TABLE_NUMBER}\\n' \
+         > {seed}/sheet/emails.csv"
     )
 }
 
@@ -421,24 +425,13 @@ fn import_table(aterm: &str, seed: &str) -> String {
     )
 }
 
-/// The guest command that seals the seed's password into [`TABLE_ADDRESS`]'s `password` cell
-/// from its file on stdin, as the owner sets one (`aterm db emails set … password --stdin`); what
-/// it printed when it fails (its words, never the value, which is never on argv).
-fn seal(aterm: &str, seed: &str) -> String {
-    format!(
-        "{} db emails set {TABLE_ADDRESS} password --stdin < {seed}/sheet/pw > {seed}/seal.out 2>&1 \
-         || {{ cat {seed}/seal.out; exit 1; }}",
-        as_home(aterm, seed)
-    )
-}
-
 /// The marker between the two outputs [`table_now`] prints.
 const TABLE_MARK: &str = "--nux-table--";
 
 /// The guest command that prints, as `me`, the emails view (whose `complete` [`read_table`]
-/// reads; every password in it masked) and then its keyed digest, a [`TABLE_MARK`] line between.
+/// reads) and then the phones view, a [`TABLE_MARK`] line between.
 fn table_now(me: &str) -> String {
-    format!("{me} db emails 2>&1; echo '{TABLE_MARK}'; {me} db emails --digest 2>&1")
+    format!("{me} db emails 2>&1; echo '{TABLE_MARK}'; {me} db phones 2>&1")
 }
 
 /// The guest command that runs the guest helper's `repair` of the joiner from the seed:
@@ -450,23 +443,23 @@ fn repair(helper: &str, joiner: &str, seed: &str) -> String {
     )
 }
 
-/// One identity's emails table, value-free: whether its history reads complete, and its keyed
-/// digest's epoch (eight hex digits), rows, rows with a password and digest.
+/// One identity's table, value-free: whether its history reads complete, its email rows, the
+/// phone rows whose number it read (digits, where the sealed cell opened here; the mask where it
+/// did not), and the digest of the two views' rows as shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRead {
     pub complete: bool,
-    pub epoch: String,
     pub rows: u64,
-    pub with_password: u64,
+    pub numbers: u64,
     pub digest: String,
 }
 
 /// [`table_now`]'s output read.
 ///
 /// # Errors
-/// No [`TABLE_MARK`], or a side that is no view or digest: what it said instead, shortened.
+/// No [`TABLE_MARK`], or a side that is no view of its table: what it said instead, shortened.
 pub fn read_table(text: &str) -> Result<TableRead, String> {
-    let (view, digest) = text
+    let (emails, phones) = text
         .split_once(&format!("{TABLE_MARK}\n"))
         .or_else(|| text.split_once(TABLE_MARK))
         .ok_or_else(|| format!("no table read ({})", squeeze(text.trim(), 160)))?;
@@ -476,30 +469,39 @@ pub fn read_table(text: &str) -> Result<TableRead, String> {
             .find_map(|l| aterm_json::from_str::<aterm_json::Value>(l.trim()).ok())
             .filter(aterm_json::Value::is_object)
     };
-    let view_said = || squeeze(view.trim(), 160);
-    let complete = json(view)
-        .and_then(|v| v.get("complete").and_then(aterm_json::Value::as_bool))
-        .ok_or_else(|| format!("the emails view said {}", view_said()))?;
-    let d = json(digest)
-        .filter(|d| d.get("digest").is_some())
-        .ok_or_else(|| format!("its digest said {}", squeeze(digest.trim(), 160)))?;
-    let text_of = |key: &str| {
-        d.get(key)
-            .and_then(aterm_json::Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| format!("its digest has no {key}"))
+    // A view whose registry read refused answers no rows and `never`: no table to compare.
+    let view = |side: &str, table: &str| {
+        json(side)
+            .filter(|v| v.get("state").and_then(aterm_json::Value::as_str) != Some("never"))
+            .filter(|v| v.get(table).is_some_and(aterm_json::Value::is_array))
+            .ok_or_else(|| format!("the {table} view said {}", squeeze(side.trim(), 160)))
     };
-    let count = |key: &str| {
-        d.get(key)
-            .and_then(aterm_json::Value::as_u64)
-            .ok_or_else(|| format!("its digest has no {key}"))
+    let emails = view(emails, "emails")?;
+    let phones = view(phones, "phones")?;
+    let complete = emails
+        .get("complete")
+        .and_then(aterm_json::Value::as_bool)
+        .ok_or_else(|| "the emails view names no `complete`".to_owned())?;
+    let rows = |v: &aterm_json::Value, table: &str| -> Vec<aterm_json::Value> {
+        v.get(table)
+            .and_then(aterm_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
     };
+    let (addresses, lines) = (rows(&emails, "emails"), rows(&phones, "phones"));
+    let numbers = lines
+        .iter()
+        .filter(|row| {
+            row.get("number")
+                .and_then(aterm_json::Value::as_str)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .count();
     Ok(TableRead {
         complete,
-        epoch: text_of("epoch")?,
-        rows: count("rows")?,
-        with_password: count("with_password")?,
-        digest: text_of("digest")?,
+        rows: addresses.len() as u64,
+        numbers: numbers as u64,
+        digest: crate::util::listing_digest(addresses.iter().chain(&lines)),
     })
 }
 
@@ -511,10 +513,9 @@ pub struct TableSaw {
     pub joiner: Result<TableRead, String>,
 }
 
-/// Why the joiner does not read the lab's table, each reason once: none when it reads the seed's
-/// table, a password among its rows, under the same epoch's key. Digests compare only under one
-/// epoch, so another epoch is unproven rather than a match; a history that is not complete is
-/// not the table.
+/// Why the joiner does not read the lab's table, each reason once: none when it shows what the
+/// seed shows, a number it opened among its rows. A history that is not complete is not the
+/// table.
 #[must_use]
 pub fn table_verdict(t: &TableSaw) -> Vec<String> {
     let mut why = Vec::new();
@@ -529,9 +530,9 @@ pub fn table_verdict(t: &TableSaw) -> Vec<String> {
         if seed.rows == 0 {
             why.push("the seed's table has no row".to_owned());
         }
-        if seed.with_password == 0 {
+        if seed.numbers == 0 {
             why.push(
-                "the seed's table holds no password, so the joiner opening one is unproven"
+                "the seed's table shows no number, so the joiner opening one is unproven"
                     .to_owned(),
             );
         }
@@ -541,22 +542,18 @@ pub fn table_verdict(t: &TableSaw) -> Vec<String> {
         (Ok(joiner), _) if !joiner.complete => {
             why.push("the joiner's table history is not complete".to_owned());
         }
-        (Ok(joiner), Some(seed)) if joiner.epoch != seed.epoch => why.push(format!(
-            "the joiner digested under epoch {}, the seed under {}, so the tables are unproven",
-            joiner.epoch, seed.epoch
-        )),
         (Ok(joiner), Some(seed))
-            if (joiner.rows, joiner.with_password, &joiner.digest)
-                != (seed.rows, seed.with_password, &seed.digest) =>
+            if (joiner.rows, joiner.numbers, &joiner.digest)
+                != (seed.rows, seed.numbers, &seed.digest) =>
         {
             why.push(format!(
-                "the joiner's table is not the seed's ({} row(s), {} with a password, digest \
+                "the joiner's table is not the seed's ({} row(s), {} number(s) read, digest \
                  {}…; the seed's {}, {}, {}…)",
                 joiner.rows,
-                joiner.with_password,
+                joiner.numbers,
                 prefix(&joiner.digest),
                 seed.rows,
-                seed.with_password,
+                seed.numbers,
                 prefix(&seed.digest)
             ));
         }
@@ -742,9 +739,9 @@ fn setup(
     );
 
     // The lab's founding and its table, before the joiner asks: the seed signs Genesis v2, whose
-    // first `[everyone]` epoch wraps to the seed and the member, then imports the table and seals
-    // its password. A step that fails is the table check's to report, never the rest of the
-    // row's.
+    // first `[everyone]` epoch wraps to the seed and the member, then imports the table, whose
+    // phone number the import seals. A step that fails is the table check's to report, never
+    // the rest of the row's.
     let made = Instant::now();
     let seeded = g
         .sh(&genesis(&helper, seed), STEP)
@@ -753,10 +750,9 @@ fn setup(
             g.sh(&sheet(seed), STEP)
         })
         .and_then(|_| g.sh(&import_table(&g.aterm, seed), STEP))
-        .and_then(|_| g.sh(&seal(&g.aterm, seed), STEP))
         .map_err(|fail| squeeze(fail.msg.as_deref().unwrap_or("a guest step failed"), 300));
     row.cell(
-        "seed: founded, table imported and its password sealed",
+        "seed: founded and its table imported",
         match &seeded {
             Ok(_) => Value::Ms(u64::try_from(made.elapsed().as_millis()).unwrap_or(u64::MAX)),
             Err(why) => Value::Text(format!("failed: {why}")),
@@ -1321,7 +1317,8 @@ pub struct Saw {
 /// Why the run fails the acceptance test, each reason once: none for a pass. It passes only when
 /// the phrase came from [`MEMBER_NAME`] (a member that is no admin, never the seed), every
 /// [`CREDENTIALS`] file is in the joiner's `~/.secrets` with the seed's value, the joiner reads
-/// In, the joiner reads the lab's table with its password ([`table_verdict`]), the joiner's own browse found the member and nothing else ([`browse_verdict`]), and
+/// In, the joiner reads the lab's table with the number sealed in it ([`table_verdict`]), the
+/// joiner's own browse found the member and nothing else ([`browse_verdict`]), and
 /// nothing reached beyond the guest ([`isolation_verdict`]).
 #[must_use]
 pub fn verdict(saw: &Saw) -> Vec<String> {
@@ -1754,7 +1751,7 @@ fn await_lab(
 /// pending), and each look reads both tables ([`table_now`]) until the joiner's is the seed's
 /// ([`table_verdict`]), under the [`HANG`] detector, a repair before each look. Cells: the
 /// joiner's Commons standing, what the repairs moved, the time from In and from the ask to the
-/// table, and the verdict, which shows epochs, counts and digest prefixes, never a value.
+/// table, and the verdict, which shows counts and digest prefixes, never a value.
 ///
 /// # Errors
 /// The guest could not be read, or the run was stopped.
@@ -1853,10 +1850,9 @@ fn joiner_table(
         "joiner reads the lab's table",
         verdict_cell(&table_verdict(&last), || match &last.joiner {
             Ok(t) => format!(
-                "epoch {}, {} row(s), {} with a password, digest {}… equal to the seed's",
-                t.epoch,
+                "{} row(s), {} number(s) read, digest {}… equal to the seed's",
                 t.rows,
-                t.with_password,
+                t.numbers,
                 prefix(&t.digest)
             ),
             Err(_) => String::new(),

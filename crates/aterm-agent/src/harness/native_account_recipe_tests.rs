@@ -15,6 +15,7 @@ fn stored(login: Option<&str>, generation: &str) -> Box<ExecutionIntent> {
         login: login.map(str::to_owned),
         owner: Some("account".into()),
         generation: generation.repeat(32),
+        purpose: crate::harness::accounts_pool::Purpose::Select,
     })
 }
 

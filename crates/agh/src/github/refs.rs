@@ -67,6 +67,8 @@ impl<'a> Refs<'a> {
     ///
     /// Usage for a reference outside `refs/heads/` and `refs/tags/`, or one
     /// `git check-ref-format` would refuse (the reference rule); NotFound.
+    /// Protocol if the answer names another ref, an invalid object ID, or an
+    /// object family that cannot be the requested ref's target.
     pub fn get(&self, reference: &str) -> Result<RefObject> {
         self.check_reference(reference)?;
         let name = reference.strip_prefix("refs/").unwrap_or(reference);
@@ -78,7 +80,26 @@ impl<'a> Refs<'a> {
             .gh
             .call(&call)
             .map_err(|e| e.with_repo(self.slug.to_string()))?;
-        self.ref_of(&answered)
+        let found = self.ref_of(&answered)?;
+        let family_ok = if reference.starts_with("refs/heads/") {
+            found.object.kind == "commit"
+        } else {
+            matches!(
+                found.object.kind.as_str(),
+                "commit" | "tag" | "tree" | "blob"
+            )
+        };
+        if found.reference != reference
+            || !path::is_sha(&found.object.sha)
+            || found.object.sha == "0000000000000000000000000000000000000000"
+            || !family_ok
+        {
+            return Err(
+                Error::protocol("ref response does not name the requested Git ref target")
+                    .with_repo(self.slug.to_string()),
+            );
+        }
+        Ok(found)
     }
 
     /// `POST /repos/{o}/{r}/git/refs {ref, sha}`: OneShot, journaled (`WriteOp::RefCreate`,
@@ -222,6 +243,7 @@ impl<'a> Refs<'a> {
     ///
     /// The push check's: the repository read's error, Forbidden `NoPush` when the writer
     /// lacks push, or Forbidden `other` when the answer carries no permissions block.
+    /// The guard read's, as `get`, NotFound apart, with nothing pushed.
     /// Conflict `GuardFailed { what: "the ref points at {sha}, not {expect}" }` when the lease
     /// is refused; the runner's errors. After a push that succeeded, a failed re-read, or a
     /// ref still there, carries `side_effect` applied.

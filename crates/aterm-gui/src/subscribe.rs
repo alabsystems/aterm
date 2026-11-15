@@ -125,14 +125,26 @@ fn fold_mail_params(s: &str) -> Vec<String> {
     out
 }
 
+/// A `from=` sender: a class word, a tab ID in its `t` form (`tqn5r6e0148`, or
+/// `tqn5r6e0148@n-lab` for one on another node), or an `h-`/`s-`/`a-` principal.
 fn is_sender_selector(v: &str) -> bool {
     if matches!(v, "human" | "agent" | "service" | "other") {
         return true;
     }
-    let shaped = v
-        .strip_prefix("h-")
-        .or_else(|| v.strip_prefix("s-"))
-        .or_else(|| v.strip_prefix("a-"));
+    if let (head, node) = v.split_once('@').map_or((v, None), |(h, n)| (h, Some(n)))
+        && aterm_types::tab_id::is_tab_id(head)
+    {
+        return node.is_none_or(|node| {
+            !node.is_empty()
+                && node
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        });
+    }
+    if aterm_session::is_minted_sid(v) {
+        return true;
+    }
+    let shaped = v.strip_prefix("h-").or_else(|| v.strip_prefix("a-"));
     shaped.is_some_and(|rest| {
         !rest.is_empty()
             && rest

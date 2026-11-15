@@ -14,6 +14,79 @@ use std::{
 
 const MUTATE: &str = ".package-cache-mutate";
 
+#[test]
+fn original_directory_constraint_keeps_the_actual_cache_lock_until_drop() {
+    use std::os::fd::AsFd as _;
+    let home = aterm_tempfile::tempdir().unwrap();
+    let original = File::open(home.path()).unwrap();
+    let guard =
+        SourceCacheGuard::try_acquire_original_directory(home.path(), original.as_fd()).unwrap();
+    guard.check_current().unwrap();
+    assert!(matches!(
+        exclusive(&home.path().join(MUTATE)),
+        Err(TryLockError::WouldBlock)
+    ));
+    drop(guard);
+    exclusive(&home.path().join(MUTATE)).unwrap();
+}
+
+#[test]
+fn foreign_or_alias_directory_constraint_refuses_before_writing_either_cache() {
+    use std::os::fd::AsFd as _;
+    let world = aterm_tempfile::tempdir().unwrap();
+    let home = world.path().join("home");
+    let foreign = world.path().join("foreign");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&foreign).unwrap();
+    let original = File::open(&home).unwrap();
+    assert!(SourceCacheGuard::try_acquire_original_directory(&foreign, original.as_fd()).is_err());
+    let alias = world.path().join("alias");
+    std::os::unix::fs::symlink(&home, &alias).unwrap();
+    assert!(SourceCacheGuard::try_acquire_original_directory(&alias, original.as_fd()).is_err());
+    assert!(!home.join(MUTATE).exists());
+    assert!(!foreign.join(MUTATE).exists());
+    // Ordinary cache acquisition retains its existing alias semantics.
+    SourceCacheGuard::try_acquire(&alias)
+        .unwrap()
+        .check_current()
+        .unwrap();
+}
+
+#[test]
+fn replacement_after_directory_check_cannot_redirect_original_lock_creation() {
+    use std::os::fd::AsFd as _;
+    let world = aterm_tempfile::tempdir().unwrap();
+    let home = world.path().join("home");
+    let retained = world.path().join("original");
+    let foreign = world.path().join("foreign");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&foreign).unwrap();
+    let original = File::open(&home).unwrap();
+    let mut first = true;
+    let result = imp::acquire_with_original(
+        &home,
+        Some(original.as_fd()),
+        |_| {
+            if first {
+                first = false;
+                std::fs::rename(&home, &retained)?;
+                std::os::unix::fs::symlink(&foreign, &home)?;
+            }
+            Ok(())
+        },
+        |_| panic!("drift must refuse before activating the cache lock"),
+    );
+    assert!(result.is_err());
+    assert!(
+        retained.join(MUTATE).exists(),
+        "lock creation did not use the retained original directory"
+    );
+    assert!(
+        !foreign.join(MUTATE).exists(),
+        "lock creation followed the replacement Cargo home"
+    );
+}
+
 /// A lock file this user made owner-only, as the guard makes a missing one, whatever the
 /// process umask (Ubuntu's user-private-group 002 would leave its group the write bit the
 /// guard refuses). Only the controls of that refusal give a file a wider mode.
@@ -100,6 +173,10 @@ fn foreign_cache_guard_neither_claims_current_custody_nor_unlocks_the_original_d
         )]
         file.try_lock_shared().map_err(io::Error::from)
     }).unwrap();
+    let retained = retained
+        .into_inner()
+        .expect("the original owner's descriptor");
+    let inherited = aterm_uds::fork_window::Parked::park();
     let mut guard = SourceCacheGuard(held);
     // Model a foreign process copy without running Rust destructors after a
     // multithreaded fork. The real kernel lock and release path are exercised;
@@ -110,12 +187,23 @@ fn foreign_cache_guard_neither_claims_current_custody_nor_unlocks_the_original_d
     let contender = exclusive(&home.path().join(MUTATE));
     let original_still_held = matches!(&contender, Err(TryLockError::WouldBlock));
     drop(contender);
-    drop(retained.into_inner());
+    // Release the original owner's description explicitly, even while the parked fork
+    // retains a copy. Closing this descriptor alone would leave the shared lock held.
+    let released = retained.unlock();
+    drop(retained);
+    let after = exclusive(&home.path().join(MUTATE));
+    let status = inherited.release();
+    assert!(status.success(), "{status}");
+    released.unwrap();
     assert!(
         foreign_check_refused && original_still_held,
         "foreign check refused={foreign_check_refused}; original open-file-description lock retained={original_still_held}"
     );
-    exclusive(&home.path().join(MUTATE)).unwrap();
+    assert!(
+        after.is_ok(),
+        "the original owner did not release: {:?}",
+        after.err()
+    );
 }
 
 #[test]

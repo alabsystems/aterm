@@ -34,21 +34,24 @@ pub enum Lane {
 /// Verification stage identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StageId {
-    /// Compiles test binaries at `t0` so doctests can run beside [`Self::Test`].
+    /// Compiles test binaries at `t0`, ahead of [`Self::Test`].
     TestCompile,
+    /// Runs the compiled test binaries, then the selection's doctests.
     Test,
-    Doctests,
     Tippy,
     Formatting,
     /// Publication engine export guards (`ship check --export`).
     Export,
     LibcOracle,
-    /// Source guards and L0 censuses ([`aterm_census::CENSUSES`]).
+    /// Source guards and the main-loop census ([`aterm_census::CENSUSES`]).
     Census,
     /// The engine's content guards over the export of the selection ([`crate::export_scan`]).
     ExportScan,
     /// Installed public shim and helper against the candidate bootstrap inputs.
     ReleasedShim,
+    /// This tree's own shim text and helper, under each placement the shim can select
+    /// ([`crate::released_shim`]).
+    CandidateShim,
     /// Trust checkers over registered formal models (`spec-check`).
     SpecCheck,
     /// Reruns compiled tests with external checkers after [`Self::Test`].
@@ -63,8 +66,6 @@ pub enum StageId {
     ObjcDrives,
     /// Cross-target cells linted for their own triples ([`crate::cells`]).
     ForeignCells,
-    /// Web modules' host boundary in headless Chromium ([`crate::wasm_smoke`]).
-    WasmSmoke,
     /// JS glue generator on `aterm-wasm-abi`'s toy module ([`crate::wasm_glue`]).
     WasmGlue,
     /// Web modules in headless Chromium, Firefox, WebKit, and the system Safari (`crate::browser`).
@@ -72,6 +73,8 @@ pub enum StageId {
     Forge,
     /// End-to-end `codex-alab` native harness (`lab codex-alab-proof`), run exclusively.
     CodexAlabProof,
+    /// Builds the lab before the Linux VM takes its own resource claims.
+    LinuxLabBuild,
     /// Linux runtime lane (`lab linux proof`) in a Lima VM, run exclusively.
     LinuxLane,
 }
@@ -97,10 +100,9 @@ pub const TIMED: [StageId; 4] = [
 
 /// Stages that run over the run's crate selection: over an empty one each only says the change
 /// cone holds no crate (`stages::EMPTY_CONE`), so it is a named skip ([`named_skip`]).
-pub const OVER_SELECTION: [StageId; 5] = [
+pub const OVER_SELECTION: [StageId; 4] = [
     StageId::TestCompile,
     StageId::Test,
-    StageId::Doctests,
     StageId::Tippy,
     StageId::SpecCheckers,
 ];
@@ -274,7 +276,7 @@ pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
 /// compiles under `--compile-only`, only the burst under `--cursor-pacing`, no test compile over
 /// an empty selection, and no measuring rows' compile where the test compile builds them or no
 /// matrix will run ([`folds_measuring`], [`named_skip`]).
-fn wanted(ctx: &Ctx) -> Vec<StageId> {
+pub(crate) fn wanted(ctx: &Ctx) -> Vec<StageId> {
     let mut wanted = crate::checks::stages_of(&ctx.checks);
     if ctx.compile_only {
         wanted.retain(|id| matches!(id, StageId::TestCompile | StageId::MeasurePrebuild));
@@ -319,9 +321,9 @@ fn folds(ctx: &Ctx, wanted: &[StageId]) -> bool {
     ctx.checkers_in_tests && ctx.scope.is_workspace() && wanted.contains(&StageId::TestCompile)
 }
 
-/// The source and type preflight: the stages every later stage waits for, so their errors show
-/// before test code generation, including when a shared pool could otherwise give the compile
-/// every CPU token.
+/// The source and type preflight: the stages every later stage waits for ([`preflight_of`]; the
+/// last, the lint, runs beside a test compile outside a release), so their errors show before
+/// later stages start.
 const PREFLIGHT: [StageId; 5] = [
     StageId::ReleasedShim,
     StageId::Formatting,
@@ -330,23 +332,36 @@ const PREFLIGHT: [StageId; 5] = [
     StageId::Tippy,
 ];
 
-/// The preflight stages `id` waits for ([`PREFLIGHT`]). The released shim waits for none and
-/// every other stage waits for it. The three source guards and the lint wait for it alone and
-/// for none of each other: each reads the tree and writes none of it (`--fix` is taken only
-/// with `fmt` or `census` alone), the lint builds in its own lane, and a red in any of them
-/// ends an ordinary run where it is ([`crate::sched::Halt::after_preflight`]), so running them
-/// together loses no red and a run no longer waits for the three guards one after another.
-/// Every stage after them waits for all five.
-fn preflight_of(id: StageId) -> &'static [StageId] {
+/// The preflight stages `id` waits for in a run that is a release or not (`release`,
+/// [`PREFLIGHT`]). The released shim waits for none and every other stage waits for it. The
+/// three source guards and the lint wait for it alone and for none of each other: each reads
+/// the tree and writes none of it (`--fix` is taken only with `fmt` or `census` alone), the lint
+/// builds in its own lane, and a red in any of them ends every run but a release's tree sweep
+/// where it is ([`crate::sched::Halt`]), so running them together loses no red and a run no
+/// longer waits for the three guards one after another.
+///
+/// Outside a release the test compile, each call of a shaped one, and the test run behind it
+/// wait for the shim and the three guards and not for the lint
+/// (`docs/DESIGN-landing-economy.md` §2.2b): the lint builds in its own lane
+/// ([`Lane::TippyTarget`], the compile [`Lane::MainTarget`]), so the two overlap wherever the
+/// run's memory lets them ([`crate::sched::memory_holders`]), and a lint red still halts the run
+/// and ends the running compile. Every other stage after the preflight waits for all five, so
+/// cells and the windowed stages still start only behind a clean lint; a release's
+/// stages all wait for all five, its errors shown before any test code generation even where a
+/// shared pool could give the compile every CPU token. Each awaits only stages declared before
+/// it, so [`crate::sched::check_waits`] holds either way.
+fn preflight_of(id: StageId, release: bool) -> &'static [StageId] {
     match PREFLIGHT.iter().position(|stage| *stage == id) {
         Some(0) => &[],
         Some(_) => &PREFLIGHT[..1],
+        None if !release && matches!(id, StageId::TestCompile | StageId::Test) => &PREFLIGHT[..4],
         None => &PREFLIGHT,
     }
 }
 
 /// Planned stages for `ctx.checks` ([`wanted`]), with source and type preflight first
-/// ([`preflight_of`]), each with the memory it claims
+/// ([`preflight_of`]: the lint beside the test compile outside a release), each with the memory
+/// it claims
 /// by the run's book ([`StageSpec::mem`]): none for a named skip ([`named_skip`]), which starts
 /// nothing.
 #[must_use]
@@ -366,7 +381,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         .map(|b| (b.records(), b.plain_records()));
     let mut planned = Vec::with_capacity(v.len());
     for mut s in v {
-        for prerequisite in preflight_of(s.id) {
+        for prerequisite in preflight_of(s.id, ctx.release) {
             if !s.after_stages.contains(prerequisite) {
                 s.after_stages.push(*prerequisite);
             }
@@ -439,7 +454,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
 /// checkout where that claims less ([`crate::memory::wider_elsewhere`]), where the estimate reads
 /// every checkout's record and the heaviest disjoint narrower records summed. So the lesser of
 /// the lookup's two bounds decides the test compile's claim only where it exceeds that estimate;
-/// the lint's, the doctests' and the pulled cells', which nothing here raises, it always decides.
+/// the lint's and the pulled cells', which nothing here raises, it always decides.
 /// Where the estimate raises its claim, its time line says by what.
 fn at_least(
     selection: &[String],
@@ -523,7 +538,7 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::Tippy,
-            format!("tippy lint ({})", scope.lint_label()),
+            format!("tippy lint ({})", scope.label()),
             Lane::TippyTarget,
         ),
         spec(
@@ -535,16 +550,16 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         StageSpec {
             after_stages: vec![StageId::TestCompile],
             ..spec(
-                StageId::Doctests,
-                format!("doctests ({label})"),
+                StageId::SpecCheck,
+                "spec checkers (spec-check: ty over every registered model, the ay bundles)",
                 Lane::AfterCompile,
             )
         },
         StageSpec {
             after_stages: vec![StageId::TestCompile],
             ..spec(
-                StageId::SpecCheck,
-                "spec checkers (spec-check: ty over every registered model, the ay bundles)",
+                StageId::CandidateShim,
+                "candidate-shim (this tree's shim and atpkg build aterm-time offline, each placement)",
                 Lane::AfterCompile,
             )
         },
@@ -580,11 +595,6 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
             Lane::CellsTarget,
         ),
         spec(
-            StageId::WasmSmoke,
-            "wasm smoke (both web modules' host boundary in a browser)",
-            Lane::CellsTarget,
-        ),
-        spec(
             StageId::WasmGlue,
             "wasm glue (the generator on aterm-wasm-abi's toy, its goldens, in a browser)",
             Lane::CellsTarget,
@@ -596,7 +606,7 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::MeasurePrebuild,
-            "measuring rows' compile (paint, spin, aos and rewind, --no-run, where the release's \
+            "measuring rows' compile (paint, spin, aos, rewind and size, --no-run, where the release's \
              test compile does not build them)",
             Lane::MainTarget,
         ),
@@ -615,7 +625,7 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         exclusive(
             StageId::MeasuringTests,
-            "measuring tests (paint, spin, aos and rewind over the handed bundle; run alone)",
+            "measuring tests (paint, spin, aos, rewind and size over the handed bundle; run alone)",
             Lane::MainTarget,
         ),
         exclusive(StageId::GuiSmoke, "gui typing-pacing smoke", Lane::Pure),
@@ -624,12 +634,20 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
             "codex-alab proof (the native harness end to end on the real package; run alone)",
             Lane::MainTarget,
         ),
-        exclusive(
-            StageId::LinuxLane,
-            "Linux runtime lane (a lima VM: tests on aarch64 and x86_64, aterm-gui under four \
-             display servers; run alone)",
+        spec(
+            StageId::LinuxLabBuild,
+            crate::stages::LINUX_LAB_BUILD_LABEL,
             Lane::MainTarget,
         ),
+        StageSpec {
+            after_stages: vec![StageId::LinuxLabBuild],
+            ..exclusive(
+                StageId::LinuxLane,
+                "Linux runtime lane (a lima VM: tests on aarch64 and x86_64, aterm-gui under four \
+                 display servers; run alone)",
+                Lane::Pure,
+            )
+        },
     ]
 }
 

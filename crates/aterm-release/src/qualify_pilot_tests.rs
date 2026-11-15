@@ -4,6 +4,58 @@
 use super::*;
 
 #[test]
+fn historical_lending_is_a_balanced_pair_and_resume_arguments_survive_freezing() {
+    let opts = parse(
+        [
+            "--verify",
+            "current",
+            "--before-verify",
+            "historical",
+            "--mode",
+            "matched",
+            "--tree-work",
+            "release",
+            "--export-work",
+            "real",
+            "--queued-tree-share",
+            "historical-lend",
+            "--resume",
+            "previous",
+            "--cores",
+            "4",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    )
+    .unwrap();
+    assert_eq!(opts.order(), ["before", "after", "after", "before"]);
+    for mode in opts.order() {
+        let take = opts.take(mode).unwrap();
+        let before = mode == "before";
+        assert_eq!(
+            take.verify,
+            PathBuf::from(if before { "historical" } else { "current" })
+        );
+        assert_eq!(
+            take.queued_tree_share,
+            if before {
+                QueuedTreeShare::Retained
+            } else {
+                QueuedTreeShare::Lend
+            }
+        );
+    }
+    let args = frozen_arguments(&opts, Path::new("current"));
+    let frozen = parse(
+        args.into_iter()
+            .skip(1)
+            .map(|arg| arg.into_string().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(opts, frozen);
+}
+
+#[test]
 fn compiled_slices_without_the_unsigned_build_cannot_complete_a_real_gate() {
     let ended = aterm_json::json!({
         "event":"ended", "slices":[
@@ -1015,27 +1067,25 @@ fn snapshotting_starts_under_a_live_reservation_and_failure_releases_it() {
     assert!(!live.get());
 }
 #[test]
-fn contention_workload_matches_release_checks_without_pulled_cells_or_wasm() {
+fn contention_workload_matches_release_checks_without_pulled_cells() {
     use aterm_verify::checks::Check;
     for (work, expected) in [
         (TreeWork::CompileTests, Check::Test),
         (TreeWork::Lint, Check::Lint),
     ] {
         let parsed = aterm_verify::cli::parse(work.arguments()).unwrap();
-        assert_eq!(parsed.wanted(|_| true), vec![expected]);
+        assert_eq!(parsed.checks, vec![expected]);
         assert_eq!(parsed.compile_only, expected == Check::Test);
         assert!(!aterm_verify::checks::pulls_cells(
-            &parsed.wanted(|_| true),
+            &parsed.checks,
             parsed.release,
             true
         ));
     }
-    // Negative controls: standalone invocations add work no release tree runs.
-    let old_test = aterm_verify::cli::parse(["test", "--all", "--compile-only"]).unwrap();
-    assert!(old_test.wanted(|_| true).contains(&Check::WasmSmoke));
+    // Negative control: a standalone lint adds work no release tree runs.
     let old_lint = aterm_verify::cli::parse(["lint", "--all"]).unwrap();
     assert!(aterm_verify::checks::pulls_cells(
-        &old_lint.wanted(|_| true),
+        &old_lint.checks,
         old_lint.release,
         true
     ));

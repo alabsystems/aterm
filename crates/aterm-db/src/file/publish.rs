@@ -31,6 +31,13 @@
 //!   refuses while a succession fences the home. The outbox is kept once per Mac, under its
 //!   original home, so the intents a fenced Mac accepted are the ones its admitted successor
 //!   signs, with its own actor.
+//! - **An outbox takes its file's class's intents.** Through the outbox, an owner file
+//!   ([`super::Class::Owner`]) takes no Mac's statement of its own row, and a Mac file
+//!   ([`super::Class::Mac`]) no owner's write: the intent is held with the rule
+//!   ([`super::Class::refuses`]), never signed. This is the publisher's rule alone. Code that
+//!   writes the registry itself (a Mac's self-registration, the importer) passes no outbox, and
+//!   its cells project as any other until the materializer judges them by the merge rules
+//!   (`file::admit`, not built yet).
 //! - **Nothing here reads.** A pass opens no reader of a shared file and runs no materializer
 //!   pass; the verb that asked runs one afterwards.
 
@@ -138,7 +145,14 @@ impl Work {
     fn done(&mut self, claim: Option<Claim>, id: &str, mark: &Mark, now_ms: u64) {
         let marked = match claim {
             Some(claim) => claim.mark_done(mark, now_ms),
-            None => self.held.mark_done(id, mark, now_ms),
+            None => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the publisher marks an intent a record carries"
+                )]
+                let marked = self.held.mark_done(id, mark, now_ms);
+                marked
+            }
         };
         match marked {
             Ok(_) => {}
@@ -165,7 +179,12 @@ impl Work {
             );
             return;
         }
-        if let Err(error) = self.held.dequeue(id) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the publisher takes a marked intent out of the outbox"
+        )]
+        let dequeued = self.held.dequeue(id);
+        if let Err(error) = dequeued {
             self.problem(&error);
         }
         self.answer(
@@ -445,7 +464,6 @@ fn plan(
             at: 0,
             record: 0,
             line: 0,
-            secret: false,
         };
         match plan.rows.iter_mut().find(|(row, _)| *row == pk) {
             Some((_, edits)) => edits.push(edit),
@@ -664,7 +682,12 @@ fn family(
                     seam::before_claim();
                     // The claim holds the outbox from here until the marker: a person's drop
                     // is either before it, and nothing is signed, or after the marker.
-                    let claim = match work.held.claim(&intent.id) {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "the publisher claims a queued intent to sign or hold it"
+                    )]
+                    let claimed = work.held.claim(&intent.id);
+                    let claim = match claimed {
                         Ok(Some(claim)) => claim,
                         Ok(None) => {
                             earlier.waiting.retain(|id| *id != intent.id);
@@ -683,7 +706,13 @@ fn family(
                             continue;
                         }
                     };
-                    let step = writer.settle(store, &log, &view, collection, &intent, &earlier)?;
+                    // A file takes only its class's writes: an owner file no Mac's statement,
+                    // a Mac file no owner write. What a record already carries is published,
+                    // and settling finds it.
+                    let step = match work.file.class.refuses(&intent) {
+                        Some(why) if carried.is_none() => Step::Hold(why.to_owned()),
+                        _ => writer.settle(store, &log, &view, collection, &intent, &earlier)?,
+                    };
                     earlier.waiting.retain(|id| *id != intent.id);
                     match step {
                         Step::Signed(op, wrote) => {
@@ -1013,14 +1042,14 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
 pub fn shared_file_environment() {}
 
 /// The `SharedFile` steps of the areas later slices build: authority on merge (SF-07), the face
-/// and its commit (SF-06), and account rotation (SF-08).
+/// and its commit (SF-06), and Mac files and account rotation (SF-08).
 #[cfg(any(test, debug_assertions))]
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "OwnRow",
-        reason = "No shared file of this build holds a Mac's own row yet: SF-07 binds one and anchors its merge."
+        reason = "No shared file of this build holds a Mac's own row yet: the Mac class is declared and checked (file::Type::check, file::Class::refuses), and SF-08 binds the first Mac file and anchors its merge."
     )
 )]
 #[cfg_attr(
@@ -1028,7 +1057,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "ForeignRow",
-        reason = "No shared file of this build holds a Mac's own row yet: SF-07 binds one and anchors its merge."
+        reason = "No shared file of this build holds a Mac's own row yet: the Mac class is declared and checked (file::Type::check, file::Class::refuses), and SF-08 binds the first Mac file and anchors its merge."
     )
 )]
 #[cfg_attr(
@@ -1036,7 +1065,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "OwnEntry",
-        reason = "No shared file of this build is a log yet: SF-07 binds one and anchors its merge."
+        reason = "No shared file of this build is a log yet: a log fits the Mac class (file::Type::check), and SF-08 binds the first and anchors its merge."
     )
 )]
 #[cfg_attr(
@@ -1044,7 +1073,7 @@ pub fn shared_file_environment() {}
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "ForeignEntry",
-        reason = "No shared file of this build is a log yet: SF-07 binds one and anchors its merge."
+        reason = "No shared file of this build is a log yet: a log fits the Mac class (file::Type::check), and SF-08 binds the first and anchors its merge."
     )
 )]
 #[cfg_attr(

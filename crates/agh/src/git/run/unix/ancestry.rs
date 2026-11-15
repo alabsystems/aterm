@@ -6,7 +6,7 @@
 //! treat a shallow boundary, graft, replacement or ref as negative evidence.
 
 use aterm_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -24,6 +24,7 @@ const ACQUIRED_MAX: usize = 4096;
 const WALK_MAX: usize = 1_000_000;
 const WALK_BYTES_MAX: usize = 256 * 1024 * 1024;
 const LOOKAHEAD_MAX: usize = 128;
+const LOOKAHEAD_CACHE_BYTES_MAX: usize = LOOKAHEAD_MAX * BODY_MAX;
 
 #[derive(Clone, Copy)]
 enum Intake {
@@ -392,10 +393,25 @@ impl Reader<'_, '_> {
                 ids.push(id.to_owned());
             }
         }
-        Ok(self
-            .read_commits(&ids, Intake::LocalAdvice, Some(work))?
-            .into_iter()
-            .collect())
+        let bodies = self.read_commits(&ids, Intake::LocalAdvice, Some(work))?;
+        let mut cache = BTreeMap::new();
+        let mut bytes = 0_usize;
+        for (id, body) in bodies {
+            let Some(next) = bytes
+                .checked_add(body.len())
+                .filter(|n| *n <= LOOKAHEAD_CACHE_BYTES_MAX)
+            else {
+                // Optional retention cannot grow beyond one bounded window.
+                // All physical reads above remain charged, even on rejection.
+                return Ok(BTreeMap::new());
+            };
+            if cache.len() == LOOKAHEAD_MAX {
+                return Ok(BTreeMap::new());
+            }
+            bytes = next;
+            cache.insert(id, body);
+        }
+        Ok(cache)
     }
 
     fn contained(&mut self, query: &AncestryQuery) -> Result<bool> {
@@ -406,11 +422,22 @@ impl Reader<'_, '_> {
         // Both answers come only from hashed original bodies. Native Git may
         // follow corrupt object bytes without checking their filename's hash;
         // its local walk is useful only as bounded batching advice.
-        let mut pending = VecDeque::from([query.descendant.clone()]);
+        let mut pending = BTreeSet::from([query.descendant.clone()]);
         let mut seen = BTreeSet::from([query.descendant.clone()]);
         let mut work = WalkWork::default();
         let mut cache = BTreeMap::new();
-        while let Some(id) = pending.pop_front() {
+        while !pending.is_empty() {
+            // Advice does not schedule work: only a hashed original parent
+            // edge can enter `pending`. Prefer those already scheduled bodies
+            // before replacing their bounded window. A FIFO walk can otherwise
+            // discard most of each date-ordered window at every merge branch.
+            let cached = cache.keys().find(|id| pending.contains(*id)).cloned();
+            let id = if let Some(id) = cached {
+                pending.remove(&id);
+                id
+            } else {
+                pending.pop_first().expect("nonempty original frontier")
+            };
             let (body, refill) = if let Some(body) = cache.remove(&id) {
                 (body, false)
             } else {
@@ -438,7 +465,7 @@ impl Reader<'_, '_> {
                         return Ok(true);
                     }
                     added = true;
-                    pending.push_back(parent);
+                    pending.insert(parent);
                 }
             }
             if refill && added {

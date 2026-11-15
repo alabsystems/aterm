@@ -242,8 +242,16 @@ impl GitRunner for Hooked<'_> {
         self.inner.git(args)
     }
 
+    fn git_read(&self, args: &[&str]) -> ledger::Result<RunOut> {
+        self.inner.git_read(args)
+    }
+
     fn git_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
         self.inner.git_input(args, input)
+    }
+
+    fn git_read_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
+        self.inner.git_read_input(args, input)
     }
 }
 

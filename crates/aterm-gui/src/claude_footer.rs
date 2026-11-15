@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,7 +26,10 @@ use aterm_window::event_loop::EventLoopProxy;
 use crate::session_timeline::SessionTimeline;
 use crate::{App, VisibleContentRoute, Wake, WindowId};
 
-/// Interval between background footer-fact refreshes while a session is visible.
+/// The least interval between two footer asks the status sweep sends for a session whose output
+/// moved since its last ask ([`crate::session_status::StatusObserver::request_footer_if_due`]). A
+/// session nothing wrote to is not asked for again: the resolver's own clocks read it
+/// ([`FOLLOW_UPS`], [`IDLE_RECHECK`], [`LONG_IDLE_RECHECK`]).
 pub(crate) const RECHECK: Duration = Duration::from_secs(2);
 
 /// Returns `true` if `program` is a harness-supported agent whose composer footer is rendered.
@@ -291,7 +295,7 @@ struct SeenPane {
     jobs: String,
     switch: Option<crate::autopilot::HarnessSwitch>,
     autopilot: Option<(
-        Option<aterm_agent::supervise::Autopilot>,
+        Option<alab_policy::config::Autopilot>,
         crate::autopilot::AutopilotView,
     )>,
 }
@@ -1702,7 +1706,7 @@ enum Cause {
     Event,
     /// A registry watch was newly placed for the process's Claude dir.
     Placed,
-    /// The idle clock ([`IDLE_RECHECK`], [`WALL_RECHECK`]).
+    /// The idle clock ([`IDLE_RECHECK`], [`LONG_IDLE_RECHECK`]).
     Idle,
 }
 
@@ -1727,9 +1731,9 @@ const PLACE_ROUNDS: usize = 8;
 const IDLE_RECHECK: Duration = Duration::from_secs(15);
 const WATCH_FOR: Duration = Duration::from_secs(10 * 60);
 
-/// How often a session is re-read past [`WATCH_FOR`] while its footer shows a limit wall or weekly
-/// percentage and its Claude Code process lives.
-const WALL_RECHECK: Duration = Duration::from_secs(60);
+/// How often a session is re-read once its last ask is [`WATCH_FOR`] old, while its agent's
+/// process lives ([`Resolver::retain`]).
+const LONG_IDLE_RECHECK: Duration = Duration::from_secs(60);
 
 /// How long the resolver's roster answers from its last read ([`RosterMemo`]).
 const ROSTER_RECHECK: Duration = Duration::from_secs(10);
@@ -1739,17 +1743,18 @@ fn recheck_after(now: std::time::Instant, asked: std::time::Instant) -> Duration
     if now.saturating_duration_since(asked) < WATCH_FOR {
         IDLE_RECHECK
     } else {
-        WALL_RECHECK
+        LONG_IDLE_RECHECK
     }
 }
 
-/// Whether a session last asked for at `asked` is still watched ([`WATCH_FOR`]).
+/// Whether a session last asked for at `asked` is still watched: for [`WATCH_FOR`] after that
+/// ask, and past it while `alive` says its process lives.
 fn still_watched(
     now: std::time::Instant,
     asked: std::time::Instant,
-    walled_alive: impl FnOnce() -> bool,
+    alive: impl FnOnce() -> bool,
 ) -> bool {
-    now.saturating_duration_since(asked) < WATCH_FOR || walled_alive()
+    now.saturating_duration_since(asked) < WATCH_FOR || alive()
 }
 
 /// Coalesced transcript-step wake helper for notifying session watchers.
@@ -1793,10 +1798,13 @@ struct Job {
 
 enum Command {
     Request(Job),
-    /// A `None` pgid retires the session.
+    /// A `None` pgid retires the session. With its `timeline`, the session's transcript reader
+    /// stops reading for good ([`stop_session`]): its run's join says so in the resolver's order,
+    /// after every read before the stop and before any after it.
     Stop {
         session: u64,
         pgid: Option<i32>,
+        timeline: Option<Arc<Mutex<SessionTimeline>>>,
     },
     /// The registry watch saw the Claude dir `dir`'s rows move ([`crate::claude_registry`]).
     RowsMoved {
@@ -1815,19 +1823,125 @@ impl From<crate::claude_registry::Told> for Command {
     }
 }
 
-/// The one background thread footer facts are read on, started on first use and shared by every
-/// asker.
-static RESOLVER: Mutex<Option<Sender<Command>>> = Mutex::new(None);
+/// The footer resolver's thread as its askers hold it: one thread footer facts are read on,
+/// started on first use, shared by every asker, and started again once it has ended.
+struct Lane {
+    /// The sender to the resolver that runs: none before the first ask, and none once a send
+    /// found its resolver ended.
+    tx: Mutex<Option<Sender<Command>>>,
+    /// How many resolvers this lane has let go ([`Ended`]): each one that ended, and each that
+    /// could not start. An ask names the count it was delivered under ([`Lane::deliver`]).
+    ended: AtomicU64,
+}
 
-/// Requests an off-thread footer-fact refresh for `pgid` into `timeline`.
+/// Moves [`Lane::ended`] when dropped. A resolver's thread holds it and drops it after its
+/// receiver, so the count moves only once no send can reach that resolver.
+struct Ended<'a>(&'a AtomicU64);
+
+impl Drop for Ended<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Lane {
+    const fn new() -> Lane {
+        Lane {
+            tx: Mutex::new(None),
+            ended: AtomicU64::new(0),
+        }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.ended.load(Ordering::Acquire)
+    }
+
+    /// Hand `job` to the resolver that runs, starting one with `start` (its receiver, a sender
+    /// to it, and the [`Ended`] its thread drops last) where none runs. A send that finds the
+    /// resolver ended starts another, which takes the job. The epoch the job was delivered
+    /// under, read before the send: a resolver that ends after taking it moves the epoch past
+    /// that. `None` where no resolver took the job.
+    fn deliver<'a>(
+        &'a self,
+        job: Job,
+        start: impl Fn(Receiver<Command>, Sender<Command>, Ended<'a>) -> std::io::Result<()>,
+    ) -> Option<u64> {
+        let mut slot = self.tx.lock().unwrap_or_else(|p| p.into_inner());
+        let mut command = Command::Request(job);
+        // Twice at most: once for the resolver that runs, once for the one started in the place
+        // of a resolver the first send found ended.
+        for _ in 0..2 {
+            let tx = match slot.take() {
+                Some(tx) => tx,
+                None => {
+                    let (tx, rx) = channel::<Command>();
+                    if let Err(e) = start(rx, tx.clone(), Ended(&self.ended)) {
+                        aterm_log::warn!("claude footer: could not start the resolver: {e}");
+                        return None;
+                    }
+                    tx
+                }
+            };
+            let epoch = self.epoch();
+            match tx.send(command) {
+                Ok(()) => {
+                    *slot = Some(tx);
+                    return Some(epoch);
+                }
+                Err(std::sync::mpsc::SendError(unsent)) => command = unsent,
+            }
+        }
+        None
+    }
+}
+
+static RESOLVER: Lane = Lane::new();
+
+/// Start the footer resolver's thread on `rx`, its registry watch telling it through `rows`.
+fn start_resolver(
+    rx: Receiver<Command>,
+    rows: Sender<Command>,
+    ended: Ended<'static>,
+) -> std::io::Result<()> {
+    let sink: crate::claude_registry::Sink =
+        Arc::new(move |told| rows.send(Command::from(told)).is_ok());
+    crate::qos::spawn_lane_thread(
+        "aterm-claude-footer",
+        crate::qos::Role::Responsive,
+        move || {
+            // Declared before the receiver, so dropped after it, also when a read panics.
+            let _ended = ended;
+            let rx = rx;
+            run(
+                &rx,
+                crate::claude_registry::RegistryWatch::new(atpkg::dirwatch::Watcher::new, sink),
+            );
+        },
+    )
+    .map(|_| ())
+}
+
+/// How many footer resolvers have been let go ([`Lane::ended`]). An ask delivered under another
+/// count went to a resolver that has since ended, and its session's watch with it.
+pub(crate) fn resolver_epoch() -> u64 {
+    #[cfg(test)]
+    if CAPTURED_ASKS.with(|captured| captured.borrow().is_some()) {
+        return CAPTURED_RESOLVER.with(std::cell::Cell::get).0;
+    }
+    RESOLVER.epoch()
+}
+
+/// Requests an off-thread footer-fact refresh for `pgid` into `timeline`: the
+/// [`resolver_epoch`] the request was delivered under, or `None` where no resolver took it (no
+/// group, or its thread could not start).
 pub(crate) fn request_footer(
     session: u64,
     timeline: &Arc<Mutex<SessionTimeline>>,
     pgid: i32,
     wake: &LogWake,
-) {
+) -> Option<u64> {
     if pgid <= 0 {
-        return;
+        return None;
     }
     #[cfg(test)]
     if CAPTURED_ASKS.with(|captured| {
@@ -1837,44 +1951,18 @@ pub(crate) fn request_footer(
             .map(|asks| asks.push((session, pgid)))
             .is_some()
     }) {
-        return;
+        let (ended, takes) = CAPTURED_RESOLVER.with(std::cell::Cell::get);
+        return takes.then_some(ended);
     }
-    let mut slot = RESOLVER.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.is_none() {
-        let (tx, rx) = channel::<Command>();
-        let rows = tx.clone();
-        let sink: crate::claude_registry::Sink =
-            Arc::new(move |told| rows.send(Command::from(told)).is_ok());
-        let spawned = crate::qos::spawn_lane_thread(
-            "aterm-claude-footer",
-            crate::qos::Role::Responsive,
-            move || {
-                run(
-                    &rx,
-                    crate::claude_registry::RegistryWatch::new(atpkg::dirwatch::Watcher::new, sink),
-                );
-            },
-        );
-        match spawned {
-            Ok(_) => *slot = Some(tx),
-            Err(e) => {
-                aterm_log::warn!("claude footer: could not start the resolver: {e}");
-                return;
-            }
-        }
-    }
-    let job = Job {
-        session,
-        timeline: Arc::clone(timeline),
-        pgid,
-        wake: wake.clone(),
-    };
-    if slot
-        .as_ref()
-        .is_some_and(|tx| tx.send(Command::Request(job)).is_err())
-    {
-        *slot = None;
-    }
+    RESOLVER.deliver(
+        Job {
+            session,
+            timeline: Arc::clone(timeline),
+            pgid,
+            wake: wake.clone(),
+        },
+        start_resolver,
+    )
 }
 
 /// Stops background footer refreshes for foreground process group `pgid` on `session`.
@@ -1882,33 +1970,58 @@ pub(crate) fn stop(session: u64, pgid: i32) {
     if pgid <= 0 {
         return;
     }
-    send_stop(session, Some(pgid));
+    send(Command::Stop {
+        session,
+        pgid: Some(pgid),
+        timeline: None,
+    });
 }
 
-/// Drops all resolver state, watches, and caches held for a retired `session`.
-pub(crate) fn stop_session(session: u64) {
+/// Drops all resolver state, watches, and caches held for a retired `session`. With its
+/// `timeline` (a session that lives on, its tab status turned off), the agent run its transcript
+/// reader read says that reader stopped (`SessionLog::transcript_stopped`), as a codex-alab's
+/// rollout tap's stop does, until a read of it says it reads again: nothing reads the transcript
+/// now, so what the join holds is no longer the run's whole.
+pub(crate) fn stop_session(session: u64, timeline: Option<&Arc<Mutex<SessionTimeline>>>) {
     #[cfg(test)]
-    STOPPED_SESSIONS.with(|s| s.borrow_mut().push(session));
-    send_stop(session, None);
+    STOPPED_SESSIONS.with(|s| s.borrow_mut().push((session, timeline.is_some())));
+    send(session_stop(session, timeline));
+}
+
+/// The command [`stop_session`] sends.
+fn session_stop(session: u64, timeline: Option<&Arc<Mutex<SessionTimeline>>>) -> Command {
+    Command::Stop {
+        session,
+        pgid: None,
+        timeline: timeline.map(Arc::clone),
+    }
+}
+
+/// [`stop_session`]'s stop of `session` with `timeline`, taken as the resolver takes it.
+#[cfg(test)]
+pub(crate) fn stop_session_taken(session: u64, timeline: &Arc<Mutex<SessionTimeline>>) {
+    let _ = WatchSchedule::default().accept([session_stop(session, Some(timeline))]);
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Thread-local log of sessions passed to [`stop_session`] in tests.
-    pub(crate) static STOPPED_SESSIONS: std::cell::RefCell<Vec<u64>> =
+    /// Thread-local log of sessions passed to [`stop_session`] in tests, each with whether its
+    /// timeline came with it.
+    pub(crate) static STOPPED_SESSIONS: std::cell::RefCell<Vec<(u64, bool)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Thread-local capture buffer for `(session, pgid)` requests passed to [`request_footer`] in
     /// tests.
     pub(crate) static CAPTURED_ASKS: std::cell::RefCell<Option<Vec<(u64, i32)>>> =
         const { std::cell::RefCell::new(None) };
+    /// The resolver captured asks go to in tests: how many of it have ended
+    /// ([`resolver_epoch`]), and whether the one standing takes an ask.
+    pub(crate) static CAPTURED_RESOLVER: std::cell::Cell<(u64, bool)> =
+        const { std::cell::Cell::new((0, true)) };
 }
 
-fn send_stop(session: u64, pgid: Option<i32>) {
-    let mut slot = RESOLVER.lock().unwrap_or_else(|p| p.into_inner());
-    if slot
-        .as_ref()
-        .is_some_and(|tx| tx.send(Command::Stop { session, pgid }).is_err())
-    {
+fn send(command: Command) {
+    let mut slot = RESOLVER.tx.lock().unwrap_or_else(|p| p.into_inner());
+    if slot.as_ref().is_some_and(|tx| tx.send(command).is_err()) {
         *slot = None;
     }
 }
@@ -1940,13 +2053,11 @@ struct Accepted {
 }
 
 impl WatchSchedule {
-    /// Drop the watches whose time is up: [`WATCH_FOR`] after the last ask, unless `walled_alive`
-    /// says the session's footer shows a wall or weekly percentage and its process lives
-    /// ([`still_watched`]).
-    fn prune(&mut self, now: std::time::Instant, mut walled_alive: impl FnMut(u64, &Job) -> bool) {
-        self.watched.retain(|session, watch| {
-            still_watched(now, watch.asked, || walled_alive(*session, &watch.job))
-        });
+    /// Drop the watches whose time is up: [`WATCH_FOR`] after the last ask, unless `alive` says
+    /// the job's process lives ([`still_watched`]).
+    fn prune(&mut self, now: std::time::Instant, mut alive: impl FnMut(&Job) -> bool) {
+        self.watched
+            .retain(|_, watch| still_watched(now, watch.asked, || alive(&watch.job)));
     }
 
     /// When the next read is owed on a clock.
@@ -1975,12 +2086,23 @@ impl WatchSchedule {
                 Command::Request(job) => {
                     latest.insert(job.session, job);
                 }
-                Command::Stop { session, pgid } => {
+                Command::Stop {
+                    session,
+                    pgid,
+                    timeline,
+                } => {
                     if latest
                         .get(&session)
                         .is_some_and(|job| Self::matches(job, session, pgid))
                     {
                         latest.remove(&session);
+                    }
+                    if let Some(timeline) = timeline {
+                        timeline
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .slog_mut()
+                            .transcript_stopped();
                     }
                     if self.stop(session, pgid) {
                         accepted.stopped.push(session);
@@ -2218,8 +2340,6 @@ struct Resolver {
     tails: ProcessTails,
     /// Per watched session: its usage fold.
     folds: HashMap<u64, footer::FooterCache>,
-    /// Sessions whose footer has a wall or weekly percentage to expire on the slow clock.
-    walled: HashSet<u64>,
     /// The accounts roster, for every session's label.
     roster: RosterMemo,
     registry: crate::claude_registry::RegistryWatch,
@@ -2233,28 +2353,26 @@ impl Resolver {
             known: HashMap::new(),
             tails: ProcessTails::default(),
             folds: HashMap::new(),
-            walled: HashSet::new(),
             roster: RosterMemo::default(),
             registry,
             asks,
         }
     }
 
-    /// Before the thread sleeps at `now`: the watches whose time is up go, with what the reads
-    /// hold for their sessions, the tails of processes gone, and the registry watches nothing
-    /// awaits now.
+    /// Before the thread sleeps at `now`: the watches whose time is up go ([`WATCH_FOR`] after
+    /// the last ask, once the job's process no longer lives: a live agent's footer is read on the
+    /// idle clock whatever it shows, since the status sweep asks again only when its tab writes),
+    /// with what the reads hold for their sessions, the tails of processes gone, and the registry
+    /// watches nothing awaits now.
     fn retain(&mut self, now: std::time::Instant) {
-        let walled = &self.walled;
-        self.schedule.prune(now, |session, job| {
-            walled.contains(&session)
-                && u32::try_from(job.pgid).is_ok_and(crate::control_auth::pid_alive)
+        self.schedule.prune(now, |job| {
+            u32::try_from(job.pgid).is_ok_and(crate::control_auth::pid_alive)
         });
         let watched = &self.schedule.watched;
         self.known
             .retain(|session, _| watched.contains_key(session));
         self.folds
             .retain(|session, _| watched.contains_key(session));
-        self.walled.retain(|session| watched.contains_key(session));
         self.tails.retain(
             &self.schedule,
             |pgid, started| birth_seconds(pgid) == Some(started),
@@ -2288,14 +2406,13 @@ impl Resolver {
     ) -> std::time::Instant {
         let accepted = self.schedule.accept(commands);
         for session in accepted.stopped {
-            forget(session, &mut self.known, &mut self.folds, &mut self.walled);
+            forget(session, &mut self.known, &mut self.folds);
         }
         let moved = self.sessions_under(&accepted.moved);
         let mut reads = Reads {
             known: &mut self.known,
             tails: &mut self.tails,
             folds: &mut self.folds,
-            walled: &mut self.walled,
             roster: &mut self.roster,
             asks: self.asks,
         };
@@ -2324,7 +2441,6 @@ impl Resolver {
                 known: &mut self.known,
                 tails: &mut self.tails,
                 folds: &mut self.folds,
-                walled: &mut self.walled,
                 roster: &mut self.roster,
                 asks: self.asks,
             };
@@ -2381,14 +2497,12 @@ struct Reads<'a> {
     known: &'a mut HashMap<u64, Identity>,
     tails: &'a mut ProcessTails,
     folds: &'a mut HashMap<u64, footer::FooterCache>,
-    walled: &'a mut HashSet<u64>,
     roster: &'a mut RosterMemo,
     asks: Asks,
 }
 
 impl Reads<'_> {
-    /// Read `job`'s session for `cause` and keep it in the walled set exactly while its published
-    /// footer has a wall or weekly percentage.
+    /// Read `job`'s session for `cause`, and say whether its process's registry row answered.
     fn resolve(&mut self, job: &Job, cause: Cause, awaited: bool) -> bool {
         let found = resolve_and_post(
             self.known,
@@ -2398,7 +2512,6 @@ impl Reads<'_> {
             job,
             self.asks,
         );
-        note_wall(self.walled, job.session, found.timed);
         if crate::holder_image::DEV_ROWS && awaited {
             let open = self
                 .known
@@ -2534,17 +2647,6 @@ pub(crate) const REGISTRY_READ: &str = "registry-read";
 struct Found {
     /// The process's registry row answered the read ([`footer::read_pid`] gave facts).
     row: bool,
-    /// Its published wall or weekly percentage still needs clock-driven expiry.
-    timed: bool,
-}
-
-/// Keep the slow clock while a footer value needs time-driven expiry.
-fn note_wall(walled: &mut HashSet<u64>, session: u64, timed: bool) {
-    if timed {
-        walled.insert(session);
-    } else {
-        walled.remove(&session);
-    }
 }
 
 /// Forget what the resolver's reads hold for `session` ([`stop_session`], [`stop`]).
@@ -2552,11 +2654,9 @@ fn forget(
     session: u64,
     known: &mut HashMap<u64, Identity>,
     folds: &mut HashMap<u64, footer::FooterCache>,
-    walled: &mut HashSet<u64>,
 ) {
     known.remove(&session);
     folds.remove(&session);
-    walled.remove(&session);
 }
 
 struct FooterUseHost<'a> {
@@ -2970,7 +3070,7 @@ fn resolve_into(
             .slog()
             .transcript_arm(crate::session_log::transcript::Source::Transcript);
         if let Some(arm) = arm {
-            fold.set_floor(arm.floor_ms, arm.given);
+            fold.set_floor(arm.floor_ms, arm.adopted_ms, arm.given);
         }
     }
     let (moved, found) = resolve_facts(timeline, identity, tail, fold, roster, asks);
@@ -3608,13 +3708,7 @@ fn resolve_facts_at_with_cwd(
             kept.plan = plan;
             timeline.set_claude_footer(identity.pid, identity.started, Some(kept))
         });
-        return (
-            moved.then_some(None),
-            Found {
-                row,
-                timed: needs_recheck(&timeline),
-            },
-        );
+        return (moved.then_some(None), Found { row });
     }
     if let Some(f) = facts.as_mut()
         && timeline.claude_footer_identity() == Some((identity.pid, identity.started))
@@ -3632,13 +3726,7 @@ fn resolve_facts_at_with_cwd(
     let moved = timeline
         .set_claude_footer(identity.pid, identity.started, facts)
         .then_some(denied);
-    (
-        moved,
-        Found {
-            row,
-            timed: needs_recheck(&timeline),
-        },
-    )
+    (moved, Found { row })
 }
 
 /// The weekly figure a Claude Code footer shows in `sub`, one age rule for every source
@@ -4013,21 +4101,6 @@ fn muse_weekly_observation<'a>(
     )
 }
 
-/// Whether any currently published footer value still needs local clock checks.
-fn needs_recheck(timeline: &SessionTimeline) -> bool {
-    timeline.claude_footer().is_some_and(|facts| {
-        facts
-            .usage
-            .as_ref()
-            .is_some_and(|usage| usage.wall.is_some())
-            || facts
-                .subscription
-                .as_ref()
-                .is_some_and(|subscription| subscription.weekly.is_some())
-            || facts.plan.is_some()
-    })
-}
-
 /// The model the footer shows for `facts` ([`FooterFacts::filled_model_effort`]).
 fn shown_model(timeline: &SessionTimeline, facts: Option<&FooterFacts>) -> Option<String> {
     let kept = timeline.claude_footer();
@@ -4104,7 +4177,22 @@ pub(crate) fn fingerprint(
     context.hash(&mut h);
     (quota, quota_observed, line_e).hash(&mut h);
     if usage {
-        usage_facts.hash(&mut h);
+        usage_facts
+            .as_ref()
+            .map(
+                |aterm_agent::harness::session_usage::UsageFacts {
+                     models,
+                     more,
+                     unread,
+                     unread_more,
+                     complete,
+                     wall,
+                     runtime,
+                     // The footer draws no served time; a survey row reads it.
+                     served_at: _,
+                 }| (models, more, unread, unread_more, complete, wall, runtime),
+            )
+            .hash(&mut h);
     } else {
         usage_facts
             .as_ref()
@@ -4975,7 +5063,7 @@ impl App {
                 // SessionLights receives these words only when a splice actually runs.
                 let continuation = view
                     .mode()
-                    .filter(|mode| *mode != aterm_agent::supervise::Autopilot::Off)
+                    .filter(|mode| *mode != alab_policy::config::Autopilot::Off)
                     .map_or(0, |_| {
                         use std::hash::{Hash as _, Hasher as _};
                         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -7509,13 +7597,36 @@ pub(crate) fn up_wait(wait: &str) -> &'static str {
         ("draft" | "left-typed", _) => DRAFT_WAIT,
         ("held", _) => HOLD_WAIT,
         ("account", _) => ACCOUNT_WAIT,
-        _ => "",
+        (word, _) => match aterm_agent::harness::accounts_pool::RefusalKind::of_word(word) {
+            Some(kind) => account_wait(kind),
+            None => "",
+        },
     }
 }
 
 /// [`up_wait`]'s words for a relaunch whose account cannot yet be checked at its shell (the
-/// restart then ends nothing: `relaunch::WAIT_ACCOUNT`).
+/// restart then ends nothing: `relaunch::WAIT_ACCOUNT`), or whose check waits on what clears by
+/// itself: a lock, a change under way, records not read yet.
 const ACCOUNT_WAIT: &str = "once its account can be checked";
+
+/// [`up_wait`]'s words for a move whose account admission refused for `kind`: [`ACCOUNT_WAIT`] for
+/// what clears by itself, a login's and a usage limit's own words for those, and none for what
+/// waits on a person's act no word here names (an identity, a new token, a pin, another Mac's
+/// custody).
+const fn account_wait(kind: aterm_agent::harness::accounts_pool::RefusalKind) -> &'static str {
+    use aterm_agent::harness::accounts_pool::RefusalKind;
+    match kind {
+        RefusalKind::Lock | RefusalKind::Changing | RefusalKind::Unread => ACCOUNT_WAIT,
+        RefusalKind::SignedOut => "after login",
+        RefusalKind::Limited => "after the usage limit",
+        RefusalKind::Unattributed
+        | RefusalKind::Integrity
+        | RefusalKind::Token
+        | RefusalKind::Pin
+        | RefusalKind::Lease
+        | RefusalKind::Held => "",
+    }
+}
 
 /// [`up_wait`]'s words for a running turn.
 const TURN_WAIT: &str = "at turn end";

@@ -24,15 +24,15 @@
 //! supervisor's policy. The session picker is the person's own and decides nothing. Other widths
 //! are unmeasured.
 
-use crate::phase::Phase;
 use crate::prompt::{Opt, PromptKind, PromptV2, Role, Select};
-use crate::wall::{Placement, Wall, WallKind};
+use crate::wall::{Placement, Wall};
+use alab_policy::vocab::{Phase, WallKind};
 
 /// The Kimi Code (`kimi`) harness version, `MAJOR.MINOR` with no third part.
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 22, "0.22");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 23, "0.23");
 
 /// The usage limit is spent: the server's quota words 2.3.3's patterns matched, and its code
 /// (lowercase).
@@ -267,7 +267,7 @@ pub fn turn_messages_before(rows: &[String]) -> Option<Vec<String>> {
 /// The last reply's earlier text in the same turn, joined.
 #[must_use]
 pub fn turn_said_before(rows: &[String]) -> Option<String> {
-    turn_messages_before(rows).map(|messages| crate::reader::join_messages(&messages))
+    turn_messages_before(rows).map(|messages| alab_policy::text::join_messages(&messages))
 }
 
 /// Whether this turn used a tool, as Kimi draws command execution.

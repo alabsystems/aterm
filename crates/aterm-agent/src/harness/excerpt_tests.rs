@@ -354,11 +354,11 @@ fn said_drops_the_done_tokens_lines_as_the_result_does() {
 /// Marked Autopilot continuation, done-check, land, and relaunch prompts are excluded from `prompts`, while unmarked user text is kept.
 #[test]
 fn the_harnesss_own_acts_are_no_prompt() {
-    use crate::supervise::policy::turn_end::{DONE_CHECK, LAND, LAND_NUDGE};
+    use alab_policy::words::{DONE_CHECK, LAND, LAND_NUDGE};
     let carry_on =
         crate::harness::relaunch::resumed_prompt("2.1.300", crate::harness::relaunch::CAUSE_HOST);
     for act in [
-        crate::supervise::config::CONTINUE_TEXT,
+        alab_policy::config::CONTINUE_TEXT,
         DONE_CHECK,
         LAND,
         LAND_NUDGE,

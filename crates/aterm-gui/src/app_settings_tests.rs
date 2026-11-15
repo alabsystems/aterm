@@ -736,6 +736,7 @@ fn generic_native_tab_parks_terminal_effect_scheduler() {
             reason: "native cadence regression".to_string(),
             metadata: String::new(),
             capability: None,
+            origin: crate::native_app::RecoveryOrigin::Restore,
         }),
         crate::native_app::AppViewState::Recovery(crate::native_app::RecoveryViewState::default()),
         crate::tab_model::TabPresentation {

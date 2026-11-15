@@ -375,8 +375,8 @@ fn a_kept_config_copied_back_reads_the_vault_this_machine_read_before() {
     let kept_state = std::fs::read(kept.join("state.toml")).unwrap();
 
     join_pinned(&reader, second.to_str().unwrap(), "reader");
-    let token = materialize::target_path(&reader.home, "token").unwrap();
-    assert_eq!(std::fs::read(&token).unwrap(), b"second-token");
+    let token = || stored(&reader, "token");
+    assert_eq!(token().as_deref(), Some(&b"second-token"[..]));
     assert_eq!(
         pinned(&reader).name,
         "second",
@@ -431,7 +431,7 @@ fn a_kept_config_copied_back_reads_the_vault_this_machine_read_before() {
     }
     sync(&reader, None).expect("sync");
     assert_eq!(pinned(&reader).name, "first");
-    assert_eq!(std::fs::read(&token).unwrap(), b"first-token");
+    assert_eq!(token().as_deref(), Some(&b"first-token"[..]));
     assert!(materialization_ready(&reader).unwrap());
 
     let fresh = Paths::for_home(&root.path().join("fresh"));
@@ -504,13 +504,15 @@ fn a_kept_config_copied_back_reads_the_vault_this_machine_read_before() {
                 );
             }
             let bytes = || {
-                [
-                    reader.source_file(),
-                    reader.state_file(),
-                    reader.identity_file(),
-                    materialize::target_path(&reader.home, "token").unwrap(),
-                ]
-                .map(|path| std::fs::read(path).unwrap())
+                (
+                    [
+                        reader.source_file(),
+                        reader.state_file(),
+                        reader.identity_file(),
+                    ]
+                    .map(|path| std::fs::read(path).unwrap()),
+                    stored(&reader, "token"),
+                )
             };
             let terminal = std::cell::RefCell::new(None);
             let refused = join_with(
@@ -779,85 +781,6 @@ fn a_subscriber_that_panics_ends_the_approver_beside_it() {
     }
 }
 
-/// A pass that writes N files flushes each in order before its rename and its directory
-/// once, not each file and its directory durably: 20 entries cost the [pending] record's 2
-/// durable flushes, 20 ordered ones and 1 for `~/.secrets`, where they cost 42 durable
-/// ones. Negative control: `write_atomic` in `place` brings back 2 durable flushes a file.
-#[test]
-fn a_pass_of_many_entries_flushes_each_in_order_and_its_directory_once() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let paths = Paths::for_home(root.path());
-    fsx::ensure_private_dir(&paths.dir).expect("state dir");
-    let entries: Vec<Entry> = (0..20)
-        .map(|n| Entry {
-            name: format!("token{n:02}"),
-            value: SecretBytes::from(format!("inert-{n}").as_bytes()),
-            audience: crate::text::Audience::Everyone,
-            if_absent: false,
-            anchor: None,
-        })
-        .collect();
-    let mut state = State::default();
-    let recording = aterm_durable::seam::Recording::start();
-    let report = apply_entries(&paths, &mut state, &entries).expect("applied");
-    let flushes = recording.take();
-    assert_eq!(report.written.len(), 20, "{report:?}");
-    let durable = flushes.iter().filter(|flush| flush.is_durable()).count();
-    let ordered = flushes.iter().filter(|flush| flush.is_ordered()).count();
-    assert_eq!((durable, ordered), (2 + 1, 20), "{flushes:?}");
-    // What a cut-short pass resumes from is on disk before the first file is written.
-    assert!(state.pending.is_empty(), "every write landed");
-    for entry in &entries {
-        let target = materialize::target_path(&paths.home, &entry.name).expect("target");
-        assert_eq!(
-            std::fs::read(target).expect("written"),
-            entry.value.as_slice()
-        );
-    }
-}
-
-#[test]
-fn a_pass_that_leaves_an_entry_failed_backs_off_and_a_clean_one_starts_again() {
-    let url = Source::Url("http://127.0.0.1:7484/v1/alab".to_string());
-    let applied = |failed: usize| SyncOutcome::Applied {
-        seq: 2,
-        report: crate::materialize::Report {
-            failed: (0..failed)
-                .map(|n| (format!("entry{n}"), "is a symlink".to_string()))
-                .collect(),
-            ..Default::default()
-        },
-    };
-    let mut failing = FIRST_RETRY;
-    let pauses: Vec<u64> = (0..8)
-        .map(|_| pause_after(&url, &applied(1), &mut failing, ANSWERED_AT_ONCE).as_secs())
-        .collect();
-    assert_eq!(pauses, [5, 10, 20, 40, 80, 160, 300, 300]);
-    assert_eq!(
-        pause_after(&url, &applied(0), &mut failing, ANSWERED_AT_ONCE),
-        Duration::ZERO
-    );
-    assert_eq!(
-        pause_after(&url, &applied(2), &mut failing, ANSWERED_AT_ONCE),
-        FIRST_RETRY
-    );
-    pause_after(&url, &applied(2), &mut failing, ANSWERED_AT_ONCE);
-    let unchanged = SyncOutcome::Unchanged { seq: 2 };
-    assert_eq!(
-        pause_after(&url, &unchanged, &mut failing, ANSWERED_AT_ONCE).as_secs(),
-        10
-    );
-    assert_eq!(
-        pause_after(&url, &applied(1), &mut failing, ANSWERED_AT_ONCE),
-        FIRST_RETRY
-    );
-    let path = Source::Path(PathBuf::from("/tmp/vault"));
-    assert_eq!(
-        pause_after(&path, &applied(1), &mut failing, ANSWERED_AT_ONCE).as_secs(),
-        60
-    );
-}
-
 fn bound() -> std::net::TcpListener {
     std::net::TcpListener::bind("127.0.0.1:0").expect("bind")
 }
@@ -1030,18 +953,11 @@ fn materialization_observation_explains_each_guard_without_reading_or_mutating_i
     state = original.clone();
     state.failed = true;
     save_state(&paths, &state).unwrap();
-    blocked(
-        &paths,
-        &configured,
-        MaterializationBlocker::LocalFilesIncomplete,
-    );
+    blocked(&paths, &configured, MaterializationBlocker::ApplyIncomplete);
     save_state(&paths, &original).unwrap();
-    std::fs::remove_file(materialize::target_path(&paths.home, "token").unwrap()).unwrap();
-    blocked(
-        &paths,
-        &configured,
-        MaterializationBlocker::LocalFilesIncomplete,
-    );
+    // The source's entries changed since the apply: the applied selection is not current.
+    fsx::write_atomic(&source, b"token=inert-next-token\n", 0o600).unwrap();
+    blocked(&paths, &configured, MaterializationBlocker::ApplyIncomplete);
 
     let admin = Paths::for_home(&root.path().join("admin"));
     let signed_source = root.path().join("signed.vault");
@@ -1179,38 +1095,8 @@ fn readiness_observation_yields_to_writers_and_coexists_with_shared_readers() {
     assert!(materialization_ready(&reader).unwrap());
 }
 
-/// A file the vault wrote whose directory then became a symlink (a dotfiles setup's
-/// `~/.config/gh`) is held without a look, so readiness does not judge it through the link,
-/// while the same file missing from a real directory is incomplete.
 #[test]
-fn readiness_does_not_judge_a_held_file_behind_a_symlinked_directory() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let source = root.path().join("team.secrets");
-    let text = b"~/.config/gh/hosts.yml<<END if-absent\ngithub.com: {}\nEND\n";
-    fsx::write_atomic(&source, text, 0o600).unwrap();
-    let reader = Paths::for_home(&root.path().join("reader"));
-    join_pinned(&reader, source.to_str().unwrap(), "reader");
-    assert!(materialization_ready(&reader).unwrap(), "filled");
-    let gh = reader.home.join(".config/gh");
-    let dotfiles = root.path().join("dotfiles");
-    std::fs::create_dir(&dotfiles).unwrap();
-    std::fs::remove_dir_all(&gh).unwrap();
-    std::os::unix::fs::symlink(&dotfiles, &gh).unwrap();
-    sync(&reader, None).expect("synced");
-    assert!(
-        materialization_ready(&reader).unwrap(),
-        "held behind the link, not judged through it"
-    );
-    std::fs::remove_file(&gh).unwrap();
-    std::fs::create_dir(&gh).unwrap();
-    assert!(
-        !materialization_ready(&reader).unwrap(),
-        "missing from a real directory"
-    );
-}
-
-#[test]
-fn readiness_refuses_a_changed_source_before_its_file_digests() {
+fn readiness_refuses_a_changed_source_before_it_judges_the_apply() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let first = root.path().join("first.secrets");
     let second = root.path().join("second.secrets");
@@ -1221,15 +1107,15 @@ fn readiness_refuses_a_changed_source_before_its_file_digests() {
     let expected = status(&reader).unwrap().config.unwrap();
     assert!(materialization_ready_for(&reader, &expected).unwrap());
     join_pinned(&reader, second.to_str().unwrap(), "reader");
-    let digests_read = std::cell::Cell::new(false);
+    let apply_judged = std::cell::Cell::new(false);
     assert!(
         !materialization_ready_with(&reader, Some(&expected), |paths, state| {
-            digests_read.set(true);
-            files_intact(paths, state)
+            apply_judged.set(true);
+            applied_intact(paths, state)
         })
         .unwrap()
     );
-    assert!(!digests_read.get());
+    assert!(!apply_judged.get());
     assert!(!materialization_ready_for(&reader, &expected).unwrap());
     assert!(materialization_ready(&reader).unwrap());
     assert!(materialization_ready_for(&reader, &pinned(&reader)).unwrap());
@@ -1354,11 +1240,7 @@ fn a_join_of_a_signed_path_that_now_holds_plain_text_keeps_the_pin_and_writes_no
     assert!(before.signer.is_some());
     // Someone who can write the file puts plain text in the vault's place.
     fsx::write_atomic(&source, b"~/.config/gh/hosts.yml=inert-planted\n", 0o600).unwrap();
-    let planted = |paths: &Paths| {
-        materialize::target_path(&paths.home, "~/.config/gh/hosts.yml")
-            .unwrap()
-            .exists()
-    };
+    let planted = |paths: &Paths| stored(paths, "~/.config/gh/hosts.yml").is_some();
     let join_typed = |paths: &Paths, typed: String| {
         join(
             paths,
@@ -1493,7 +1375,7 @@ fn a_key_the_chain_names_before_a_link_that_does_not_verify_is_no_predecessor() 
 }
 
 #[test]
-fn materialization_readiness_rejects_intact_files_under_retired_authority() {
+fn materialization_readiness_rejects_an_intact_apply_under_retired_authority() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let source = root.path().join("team.vault");
     let admin = Paths::for_home(&root.path().join("admin"));
@@ -1518,7 +1400,7 @@ fn materialization_readiness_rejects_intact_files_under_retired_authority() {
 }
 
 #[test]
-fn plain_source_changes_never_admit_the_previous_sources_intact_files() {
+fn plain_source_changes_never_admit_the_previous_sources_apply() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let first = root.path().join("first.secrets");
     let second = root.path().join("second.secrets");
@@ -1541,8 +1423,10 @@ fn plain_source_changes_never_admit_the_previous_sources_intact_files() {
     assert!(!materialization_ready(&reader).unwrap());
     sync(&reader, None).expect("migrate the old record");
     assert!(materialization_ready(&reader).unwrap());
-    let token = materialize::target_path(&reader.home, "token").unwrap();
-    assert_eq!(std::fs::read(&token).unwrap(), b"second-token");
+    assert_eq!(
+        stored(&reader, "token").as_deref(),
+        Some(&b"second-token"[..])
+    );
 
     let mut state = load_state(&reader).unwrap();
     state.seq = 0;
@@ -1554,11 +1438,17 @@ fn plain_source_changes_never_admit_the_previous_sources_intact_files() {
     std::fs::remove_file(&first).expect("remove only scratch vault");
     assert!(sync(&reader, None).is_err());
     assert!(!materialization_ready(&reader).unwrap());
-    assert_eq!(std::fs::read(&token).unwrap(), b"second-token");
+    assert!(
+        stored(&reader, "token").is_none(),
+        "the interrupted join reads no value"
+    );
     fsx::write_atomic(&first, b"token=first-token\n", 0o600).expect("restore scratch vault");
     sync(&reader, None).expect("finish the interrupted join");
     assert!(materialization_ready(&reader).unwrap());
-    assert_eq!(std::fs::read(token).unwrap(), b"first-token");
+    assert_eq!(
+        stored(&reader, "token").as_deref(),
+        Some(&b"first-token"[..])
+    );
 }
 
 #[test]
@@ -1626,175 +1516,6 @@ fn signed_source_binding_and_applied_digest_are_required_until_sync_repairs_them
 }
 
 #[test]
-fn a_path_subscriber_puts_back_a_rewritten_file_once_per_version() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let replaced = |paths: &Paths| {
-        std::fs::read_dir(paths.home.join(".secrets").join(materialize::REPLACED_DIR))
-            .map_or(0, Iterator::count)
-    };
-    // A signed vault at a path, read by its admin.
-    let source = root.path().join("team.vault");
-    let admin = Paths::for_home(&root.path().join("admin"));
-    create(&admin, source.to_str().unwrap(), None, Some("admin")).unwrap();
-    let opened = admin_open(&admin).unwrap();
-    let mut doc = opened.doc.clone();
-    doc.set_entry(&Audience::Everyone, "token", b"inert-token")
-        .unwrap();
-    admin_publish(&admin, &opened, &doc).unwrap();
-    // A plain file at a path.
-    let text = root.path().join("home.secrets");
-    fsx::write_atomic(&text, b"token=inert-token\n", 0o600).unwrap();
-    let plain = Paths::for_home(&root.path().join("plain"));
-    join_pinned(&plain, text.to_str().unwrap(), "plain");
-
-    let (mut on_admin, mut on_plain) = (None, None);
-    for (paths, repaired) in [(&admin, &mut on_admin), (&plain, &mut on_plain)] {
-        let token = materialize::target_path(&paths.home, "token").unwrap();
-        let mut pass = || subscriber_pass(paths, repaired, &FOUND_NONE).expect("a pass");
-        pass();
-        assert_eq!(std::fs::read(&token).unwrap(), b"inert-token");
-        assert_eq!(replaced(paths), 0);
-        // A program on this Mac rewrites the file: put back once...
-        fsx::write_atomic(&token, b"program-1", 0o600).unwrap();
-        pass();
-        assert_eq!(std::fs::read(&token).unwrap(), b"inert-token");
-        assert_eq!(replaced(paths), 1);
-        pass();
-        // ...not every minute it rewrites it again.
-        fsx::write_atomic(&token, b"program-2", 0o600).unwrap();
-        pass();
-        pass();
-        assert_eq!(std::fs::read(&token).unwrap(), b"program-2");
-        assert_eq!(replaced(paths), 1, "one copy moved aside, not one a minute");
-    }
-    // A new version of the plain file is written whatever was put back before.
-    fsx::write_atomic(&text, b"token=inert-token\nnote=inert-note\n", 0o600).unwrap();
-    subscriber_pass(&plain, &mut on_plain, &FOUND_NONE).expect("a pass");
-    let read = |name: &str| std::fs::read(materialize::target_path(&plain.home, name).unwrap());
-    assert_eq!(read("note").unwrap(), b"inert-note");
-    assert_eq!(read("token").unwrap(), b"inert-token");
-}
-
-#[test]
-fn the_subscriber_repairs_a_changed_file_once_per_version_so_readiness_returns() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let source = root.path().join("team.vault");
-    let admin = Paths::for_home(&root.path().join("admin"));
-    create(&admin, source.to_str().unwrap(), None, Some("admin")).unwrap();
-    let opened = admin_open(&admin).unwrap();
-    let mut doc = opened.doc.clone();
-    doc.set_entry(&Audience::Everyone, "token", b"inert-token")
-        .unwrap();
-    doc.set_entry_with(
-        &Audience::Everyone,
-        "~/.config/git/config",
-        b"[tool]\n",
-        true,
-        None,
-    )
-    .unwrap();
-    admin_publish(&admin, &opened, &doc).unwrap();
-    sync(&admin, None).unwrap();
-    assert!(materialization_ready(&admin).unwrap());
-    let mut repaired = None;
-    assert!(!repair_due(&admin, &mut repaired), "nothing to repair");
-
-    let config = materialize::target_path(&admin.home, "~/.config/git/config").unwrap();
-    fsx::write_atomic(&config, b"[tool]\nhelper = local\n", 0o600).unwrap();
-    let token = materialize::target_path(&admin.home, "token").unwrap();
-    std::fs::remove_file(&token).unwrap();
-    assert!(!materialization_ready(&admin).unwrap());
-    assert!(repair_due(&admin, &mut repaired));
-    assert!(
-        !repair_due(&admin, &mut repaired),
-        "once per version, whatever the files hold"
-    );
-    sync(&admin, None).unwrap();
-    assert!(materialization_ready(&admin).unwrap());
-    assert!(!repair_due(&admin, &mut repaired), "all as written");
-    // Within the same version, a file that changes after the repair is put back again,
-    // once: the same set changing again is not repaired every pass.
-    std::fs::remove_file(&token).unwrap();
-    assert!(repair_due(&admin, &mut repaired), "another set of files");
-    assert!(!repair_due(&admin, &mut repaired), "the same set once");
-    sync(&admin, None).unwrap();
-    assert!(materialization_ready(&admin).unwrap());
-    assert_eq!(std::fs::read(&token).unwrap(), b"inert-token");
-    assert_eq!(
-        std::fs::read(&config).unwrap(),
-        b"[tool]\nhelper = local\n",
-        "the rewritten if-absent file is the machine's own"
-    );
-
-    let first = load_state(&admin).unwrap();
-    let other = root.path().join("other.vault");
-    let admin = Paths::for_home(&root.path().join("admin-other"));
-    let token = materialize::target_path(&admin.home, "token").unwrap();
-    create(&admin, other.to_str().unwrap(), None, Some("admin")).unwrap();
-    let opened = admin_open(&admin).unwrap();
-    let mut doc = opened.doc.clone();
-    doc.set_entry(&Audience::Everyone, "token", b"inert-other")
-        .unwrap();
-    admin_publish(&admin, &opened, &doc).unwrap();
-    let second = load_state(&admin).unwrap();
-    assert_eq!(first.seq, 2);
-    assert_eq!(second.seq, first.seq);
-    assert_ne!(second.source_identity, first.source_identity);
-    assert!(materialization_ready(&admin).unwrap());
-    assert!(!repair_due(&admin, &mut repaired));
-    std::fs::remove_file(&token).unwrap();
-    assert!(repair_due(&admin, &mut repaired));
-    assert!(
-        !repair_due(&admin, &mut repaired),
-        "once for this source too"
-    );
-    sync(&admin, None).unwrap();
-    assert!(materialization_ready(&admin).unwrap());
-    assert_eq!(std::fs::read(&token).unwrap(), b"inert-other");
-
-    std::fs::remove_file(&token).unwrap();
-    let opened = admin_open(&admin).unwrap();
-    let mut doc = opened.doc.clone();
-    doc.set_entry(&Audience::Everyone, "note", b"inert-note")
-        .unwrap();
-    admin_publish(&admin, &opened, &doc).unwrap();
-    std::fs::remove_file(&token).unwrap();
-    assert!(repair_due(&admin, &mut repaired));
-
-    let store = root.path().join("store");
-    let socket = bound();
-    let server = serve(&store, &socket);
-    let url = format!("http://{}/v1/served", server.addr);
-    let admin = Paths::for_home(&root.path().join("admin-served"));
-    let token = materialize::target_path(&admin.home, "token").unwrap();
-    create(&admin, &url, None, Some("admin")).unwrap();
-    let opened = admin_open(&admin).unwrap();
-    let mut doc = opened.doc.clone();
-    doc.set_entry(&Audience::Everyone, "token", b"inert-served")
-        .unwrap();
-    admin_publish(&admin, &opened, &doc).unwrap();
-    assert!(materialization_ready(&admin).unwrap());
-    std::fs::remove_file(&token).unwrap();
-    // With no admissible local cache, a failed fetch must leave the repair
-    // due for when the source returns. An intact cache repairs offline.
-    fsx::write_atomic(&admin.cache_file(), b"damaged cache", 0o600).unwrap();
-    server.stop();
-    let gone = Unserved::at(&socket);
-    assert!(subscriber_pass(&admin, &mut repaired, &FOUND_NONE).is_err());
-    gone.end();
-    let server = serve(&store, &socket);
-    let (_, outcome) =
-        subscriber_pass(&admin, &mut repaired, &FOUND_NONE).expect("the server is back");
-    assert!(
-        matches!(outcome, SyncOutcome::Applied { .. }),
-        "{outcome:?}"
-    );
-    assert!(materialization_ready(&admin).unwrap());
-    assert_eq!(std::fs::read(&token).unwrap(), b"inert-served");
-    server.stop();
-}
-
-#[test]
 fn materialization_capture_holds_local_reads_and_fences_the_version() {
     let root = aterm_tempfile::tempdir().unwrap();
     let source = root.path().join("team.secrets");
@@ -1819,7 +1540,7 @@ fn materialization_capture_holds_local_reads_and_fences_the_version() {
             try_writer(),
             Err(std::fs::TryLockError::WouldBlock)
         ));
-        Ok(fsx::read_private(&paths.home.join(".secrets/token"), 1024)?.unwrap())
+        Ok(stored(&paths, "token").unwrap())
     })
     .unwrap()
     .unwrap();
@@ -1896,7 +1617,7 @@ fn a_version_that_writes_no_file_leaves_a_snapshot_current() {
     let captured = with_materialization_ready(&admin, &configured, || Ok(()))
         .unwrap()
         .unwrap();
-    // A machine let in (what every open-vault join publishes): a new version, no file.
+    // A machine let in (what every open-vault join publishes): a new version, no entry changed.
     publish(&|doc| {
         doc.add_machine("m2", &transport::test_recipient(2))
             .unwrap();
@@ -1904,9 +1625,9 @@ fn a_version_that_writes_no_file_leaves_a_snapshot_current() {
     assert!(load_state(&admin).unwrap().seq > captured.snapshot.seq);
     assert!(
         captured.snapshot.is_current(&admin).unwrap(),
-        "no file it read changed"
+        "no entry it reads changed"
     );
-    // CONTROL: a version that changes a file it wrote is not current.
+    // CONTROL: a version that changes an entry it reads is not current.
     publish(&|doc| {
         doc.set_entry(&Audience::Everyone, "token", b"inert-next")
             .unwrap();
@@ -1955,8 +1676,12 @@ fn materialization_marks_are_local_redacted_and_unknown_while_a_writer_runs() {
     assert_eq!(materialization_mark(&paths).unwrap(), Some(known));
 }
 
+/// Readiness follows the apply: an apply that did not finish (`failed`) is not ready until a
+/// sync of the same source finishes it, and a source whose entries changed since the last
+/// apply is not ready until a sync applies them. A readiness check creates, repairs and
+/// changes no state.
 #[test]
-fn materialization_readiness_tracks_failed_resumed_and_missing_files() {
+fn materialization_readiness_tracks_failed_resumed_and_changed_sources() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let source = root.path().join("team.secrets");
     fsx::write_atomic(
@@ -1968,8 +1693,6 @@ fn materialization_readiness_tracks_failed_resumed_and_missing_files() {
     let reader = Paths::for_home(&root.path().join("reader"));
     assert!(!materialization_ready(&reader).expect("unconfigured"));
     assert!(!reader.dir.exists(), "a readiness check creates no state");
-    let blocked = materialize::target_path(&reader.home, "~/.config/gh/hosts.yml").expect("target");
-    std::fs::create_dir_all(&blocked).expect("directory blocks the file");
     assert!(matches!(
         join_pinned(&reader, source.to_str().expect("utf-8"), "reader"),
         JoinOutcome::Plain { .. }
@@ -1978,24 +1701,31 @@ fn materialization_readiness_tracks_failed_resumed_and_missing_files() {
         status(&reader).expect("status").membership,
         Membership::Plain
     );
-    assert!(load_state(&reader).expect("state").failed);
-    assert!(!materialization_ready(&reader).expect("partial sync"));
+    assert!(materialization_ready(&reader).expect("joined"));
 
-    std::fs::remove_dir(&blocked).expect("remove only the test's empty directory");
+    let mut state = load_state(&reader).expect("state");
+    state.failed = true;
+    save_state(&reader, &state).expect("an unfinished apply");
+    assert!(!materialization_ready(&reader).expect("unfinished apply"));
     sync(&reader, None).expect("retry same source");
+    assert!(!load_state(&reader).expect("state").failed);
     assert!(materialization_ready(&reader).expect("complete sync"));
 
-    let token = materialize::target_path(&reader.home, "token").expect("token path");
-    std::fs::remove_file(&token).expect("remove test token");
+    fsx::write_atomic(
+        &source,
+        b"token=inert-next-token\n~/.config/gh/hosts.yml=inert-value\n",
+        0o600,
+    )
+    .expect("the source changes");
     let state_before = std::fs::read(reader.state_file()).expect("state before check");
-    assert!(!materialization_ready(&reader).expect("missing file"));
-    assert!(!token.exists(), "readiness must not repair the file");
+    assert!(!materialization_ready(&reader).expect("changed source"));
     assert_eq!(std::fs::read(reader.state_file()).unwrap(), state_before);
-    sync(&reader, None).expect("repair missing file");
-    assert!(materialization_ready(&reader).expect("repaired"));
-
-    fsx::write_atomic(&token, b"inert-local-edit", 0o600).expect("edit test token");
-    assert!(!materialization_ready(&reader).expect("changed file"));
+    sync(&reader, None).expect("apply the change");
+    assert!(materialization_ready(&reader).expect("applied"));
+    assert_eq!(
+        stored(&reader, "token").as_deref(),
+        Some(&b"inert-next-token"[..])
+    );
 }
 
 fn approve(admin: &Paths) {
@@ -2825,511 +2555,6 @@ fn an_admin_gives_the_vault_back_to_a_store_the_removed_admin_fed() {
 }
 
 #[test]
-fn a_pass_cut_short_after_its_writes_leaves_its_files_the_vaults() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let paths = Paths::for_home(root.path());
-    let (key, toml, profile) = (
-        "~/.aterm/machine.key",
-        "~/.aterm/machine.toml",
-        "~/.aterm/release-credentials.toml",
-    );
-    let ring = |value: &[u8]| {
-        [(key, toml), (toml, profile), (profile, key)].map(|(name, anchor)| Entry {
-            name: name.to_string(),
-            value: SecretBytes::from(value),
-            audience: Audience::Everyone,
-            if_absent: true,
-            anchor: Some(anchor.to_string()),
-        })
-    };
-    let at = |name: &str| materialize::target_path(root.path(), name).expect("valid");
-    let mut first = State {
-        seq: 1,
-        ..State::default()
-    };
-    let report = apply_entries(&paths, &mut first, &ring(b"v1")).expect("v1");
-    assert_eq!(report.written.len(), 3);
-    drop(first);
-    let mut state = load_state(&paths).expect("state");
-    assert_eq!(
-        state.seq, 0,
-        "the version moves on only with the pass's own save"
-    );
-    let report = apply_entries(&paths, &mut state, &ring(b"v1")).expect("v1 again");
-    assert_eq!(report.unchanged.len(), 3, "{report:?}");
-    state.seq = 1;
-    save_state(&paths, &state).expect("saved");
-    let mut cut = load_state(&paths).expect("state");
-    cut.seq = 2;
-    apply_entries(&paths, &mut cut, &ring(b"v2")).expect("v2");
-    drop(cut);
-    assert_eq!(load_state(&paths).expect("state").seq, 1);
-    let mut next = load_state(&paths).expect("state");
-    let report = apply_entries(&paths, &mut next, &ring(b"v3")).expect("v3");
-    assert_eq!(report.written.len(), 3, "{report:?}");
-    assert!(
-        report.left.is_empty() && report.removed.is_empty(),
-        "{report:?}"
-    );
-    for name in [key, toml, profile] {
-        assert_eq!(std::fs::read(at(name)).expect("read"), b"v3", "{name}");
-        assert_eq!(
-            next.manifest.files[name],
-            materialize::digest_hex(b"v3"),
-            "{name}"
-        );
-    }
-    assert!(next.pending.is_empty());
-}
-
-#[test]
-fn a_pass_cut_short_leaves_no_entry_it_keeps_away_pending() {
-    use std::os::unix::fs::PermissionsExt;
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let paths = Paths::for_home(root.path());
-    let (anchor, gap, changed) = (
-        "~/.config/gh/hosts.yml",
-        "~/.config/git/config",
-        "~/.config/git/credentials",
-    );
-    let entry = |name: &str, anchor: Option<&str>| Entry {
-        name: name.to_string(),
-        value: SecretBytes::from(&b"vault-value"[..]),
-        audience: Audience::Everyone,
-        if_absent: true,
-        anchor: anchor.map(str::to_string),
-    };
-    let entries = [
-        entry(anchor, None),
-        entry(gap, Some(anchor)),
-        entry(changed, Some(anchor)),
-    ];
-    let at = |name: &str| materialize::target_path(root.path(), name).expect("valid");
-    for (name, value) in [
-        (anchor, &b"the machine's own"[..]),
-        (changed, b"vault-value"),
-    ] {
-        std::fs::create_dir_all(at(name).parent().expect("parent")).expect("dir");
-        std::fs::write(at(name), value).expect("written");
-    }
-    let mut state = State {
-        seq: 1,
-        ..State::default()
-    };
-    state.manifest.files.insert(
-        changed.to_string(),
-        materialize::digest_hex(b"vault-before"),
-    );
-    save_state(&paths, &state).expect("saved");
-    let report = apply_entries(&paths, &mut state, &entries).expect("applied");
-    assert!(report.written.is_empty(), "{report:?}");
-    drop(state);
-    let pending = load_state(&paths).expect("state").pending;
-    assert!(pending.is_empty(), "{pending:?}");
-    std::fs::write(at(gap), b"vault-value").expect("written");
-    for name in [gap, changed] {
-        std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(0o600))
-            .expect("private");
-    }
-    let mut next = load_state(&paths).expect("state");
-    let report = apply_entries(&paths, &mut next, &entries).expect("applied again");
-    assert!(report.removed.is_empty(), "{report:?}");
-    for name in [anchor, gap, changed] {
-        assert!(at(name).exists(), "{name} is kept");
-    }
-}
-
-/// `aterm secrets keep` (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.9, step A14; §10
-/// "Release detach"): a kept file survives its entry's `Delete` with its digest unchanged,
-/// a vault-written file that was not kept is removed (the control), a name keep cannot
-/// take changes nothing, and keeping one file of an anchored set withdraws none of the
-/// others while their entries stay.
-#[test]
-fn keep_detaches_each_file_by_digest_and_a_name_it_cannot_keep_changes_nothing() {
-    use std::os::unix::fs::PermissionsExt;
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let paths = Paths::for_home(root.path());
-    let at = |name: &str| materialize::target_path(root.path(), name).expect("valid");
-    let names = |list: &[&str]| {
-        list.iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<_>>()
-    };
-    // No vault state: nothing is kept, and no vault folder is made.
-    let kept = keep(&paths, &names(&["signing"])).expect("kept");
-    assert!(matches!(kept.as_slice(), [(_, Kept::Not(_))]), "{kept:?}");
-    assert!(!paths.dir.exists(), "keep made {}", paths.dir.display());
-    let entry = |name: &str, value: &[u8], anchor: Option<&str>| Entry {
-        name: name.to_string(),
-        value: SecretBytes::from(value),
-        audience: Audience::Everyone,
-        if_absent: anchor.is_some() || name.ends_with(".key"),
-        anchor: anchor.map(str::to_string),
-    };
-    let (key, profile, signing, changed, missing, token) = (
-        "~/.aterm/release-ring/machine.key",
-        "~/.aterm/release-ring/release-credentials.toml",
-        "signing",
-        "notary",
-        "roster",
-        "token",
-    );
-    let release = [
-        entry(key, b"ring key sentinel", None),
-        entry(profile, b"profile sentinel", Some(key)),
-        entry(signing, b"developer id sentinel", None),
-    ];
-    let rest = [
-        entry(changed, b"notary sentinel", None),
-        entry(missing, b"roster sentinel", None),
-        entry(token, b"dev token sentinel", None),
-    ];
-    let entries: Vec<Entry> = release.iter().chain(&rest).cloned().collect();
-    let mut state = State {
-        seq: 1,
-        ..State::default()
-    };
-    save_state(&paths, &state).expect("saved");
-    let report = apply_entries(&paths, &mut state, &entries).expect("applied");
-    assert_eq!(report.written.len(), entries.len(), "{report:?}");
-    save_state(&paths, &state).expect("saved");
-    std::fs::write(at(changed), b"the person's edit").expect("changed");
-    std::fs::set_permissions(at(changed), std::fs::Permissions::from_mode(0o600)).expect("private");
-    std::fs::remove_file(at(missing)).expect("removed");
-    // Names keep cannot take leave the state byte for byte as it was.
-    let saved = std::fs::read(paths.state_file()).expect("state");
-    let refused = keep(
-        &paths,
-        &names(&[changed, missing, "never-written", crate::commons::ENTRY]),
-    )
-    .expect("looked");
-    assert_eq!(refused.len(), 4, "{refused:?}");
-    for (name, kept) in &refused {
-        let Kept::Not(why) = kept else {
-            panic!("{name} was kept");
-        };
-        assert!(why.contains(name.as_str()), "{why}");
-    }
-    assert_eq!(std::fs::read(paths.state_file()).expect("state"), saved);
-    let digests = |list: &[&str]| {
-        list.iter()
-            .map(|name| materialize::digest_hex(&std::fs::read(at(name)).expect("read")))
-            .collect::<Vec<_>>()
-    };
-    let before = digests(&[key, signing]);
-    // The anchor alone of the key's set, and a name twice.
-    let kept = keep(&paths, &names(&[key, signing, key])).expect("kept");
-    assert_eq!(
-        kept,
-        [
-            (key.to_string(), Kept::Kept),
-            (signing.to_string(), Kept::Kept)
-        ]
-    );
-    let shown = format!("{kept:?} {refused:?}");
-    assert!(!shown.contains("sentinel"), "{shown}");
-    let again = keep(&paths, &names(&[signing])).expect("looked");
-    assert_eq!(again, [(signing.to_string(), Kept::Kept)]);
-    // While the entries stay, a pass leaves every file of the set as the vault's.
-    let mut state = load_state(&paths).expect("state");
-    assert_eq!(
-        state.kept,
-        BTreeSet::from([key.to_string(), signing.to_string()])
-    );
-    let report = apply_entries(&paths, &mut state, &entries).expect("still in the vault");
-    assert!(report.removed.is_empty(), "{report:?}");
-    for name in [key, profile, signing] {
-        assert!(
-            state.manifest.files.contains_key(name),
-            "{name}: {report:?}"
-        );
-        assert!(at(name).exists(), "{name}: {report:?}");
-    }
-    save_state(&paths, &state).expect("saved");
-    // The `Delete`s: the kept files stay as they were, and the unkept ones go.
-    let mut state = load_state(&paths).expect("state");
-    let report = apply_entries(&paths, &mut state, &rest).expect("deleted");
-    assert!(
-        report.removed.iter().any(|name| name == profile),
-        "{report:?}"
-    );
-    assert!(
-        !at(profile).exists(),
-        "the unkept file of the set is taken back"
-    );
-    save_state(&paths, &state).expect("saved");
-    let mut state = load_state(&paths).expect("state");
-    assert!(state.kept.is_empty(), "{:?}", state.kept);
-    for name in [key, signing] {
-        assert!(
-            !state.manifest.files.contains_key(name),
-            "{:?}",
-            state.manifest
-        );
-    }
-    let report = apply_entries(&paths, &mut state, &[]).expect("deleted");
-    assert!(
-        report.removed.iter().any(|name| name == token),
-        "{report:?}"
-    );
-    assert!(!at(token).exists(), "the unkept file is taken back");
-    assert_eq!(
-        digests(&[key, signing]),
-        before,
-        "the kept files are unchanged"
-    );
-}
-
-/// A pass cut short after writing a new value leaves the manifest at the old digest and the
-/// new one pending: the file holds what the vault wrote all the same, and keep takes it.
-#[test]
-fn keep_takes_a_file_holding_a_cut_pass_pending_value() {
-    use std::os::unix::fs::PermissionsExt;
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let paths = Paths::for_home(root.path());
-    let target = materialize::target_path(root.path(), "signing").expect("valid");
-    let mut state = State {
-        seq: 1,
-        ..State::default()
-    };
-    state
-        .manifest
-        .files
-        .insert("signing".into(), materialize::digest_hex(b"v1"));
-    state
-        .pending
-        .insert("signing".into(), materialize::digest_hex(b"v2"));
-    save_state(&paths, &state).expect("saved");
-    std::fs::create_dir_all(target.parent().expect("parent")).expect("dir");
-    std::fs::write(&target, b"v2").expect("written");
-    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("private");
-    let kept = keep(&paths, &["signing".to_string()]).expect("kept");
-    assert_eq!(kept, [("signing".to_string(), Kept::Kept)]);
-}
-
-#[test]
-fn a_cut_pass_resumes_as_the_vaults_and_writes_only_what_it_pended() {
-    use std::os::unix::fs::PermissionsExt;
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let paths = Paths::for_home(root.path());
-    let at = |name: &str| materialize::target_path(root.path(), name).expect("valid");
-    let private = |name: &str, value: &[u8]| {
-        std::fs::create_dir_all(at(name).parent().expect("parent")).expect("dir");
-        std::fs::write(at(name), value).expect("written");
-        std::fs::set_permissions(at(name), std::fs::Permissions::from_mode(0o600))
-            .expect("private");
-    };
-    let entry = |name: &str, value: &[u8], if_absent: bool, anchor: Option<&str>| Entry {
-        name: name.to_string(),
-        value: SecretBytes::from(value),
-        audience: Audience::Everyone,
-        if_absent,
-        anchor: anchor.map(str::to_string),
-    };
-    let resume = |pending: &[(&str, &[u8])], manifest: &[(&str, &[u8])]| {
-        let mut state = State {
-            seq: 1,
-            ..State::default()
-        };
-        for (name, value) in pending {
-            state
-                .pending
-                .insert(name.to_string(), materialize::digest_hex(value));
-        }
-        for (name, value) in manifest {
-            state
-                .manifest
-                .files
-                .insert(name.to_string(), materialize::digest_hex(value));
-        }
-        save_state(&paths, &state).expect("saved");
-        load_state(&paths).expect("state")
-    };
-    let (anchor, gap) = ("~/.config/gh/hosts.yml", "~/.config/git/config");
-    private(gap, b"vault-value");
-    private(anchor, b"the machine's own");
-    let mut state = resume(&[(gap, b"vault-value")], &[]);
-    let entries = [
-        entry(anchor, b"vault-value", true, None),
-        entry(gap, b"vault-value", true, Some(anchor)),
-    ];
-    let report = apply_entries(&paths, &mut state, &entries).expect("applied");
-    assert_eq!(report.removed, vec![gap.to_string()], "{report:?}");
-    assert!(!at(gap).exists());
-    assert!(at(anchor).exists(), "the machine's own anchor");
-    let ring = [
-        "~/.aterm/machine.key",
-        "~/.aterm/machine.toml",
-        "~/.aterm/release-credentials.toml",
-    ];
-    for name in ring {
-        private(name, b"v2");
-    }
-    let v1: Vec<(&str, &[u8])> = ring.iter().map(|name| (*name, &b"v1"[..])).collect();
-    let v2: Vec<(&str, &[u8])> = ring.iter().map(|name| (*name, &b"v2"[..])).collect();
-    let mut state = resume(&v2, &v1);
-    let report = apply_entries(&paths, &mut state, &[]).expect("applied");
-    assert_eq!(report.removed.len(), 3, "{report:?}");
-    for name in ring {
-        assert!(!at(name).exists(), "{name}");
-    }
-    assert!(state.manifest.files.is_empty(), "{:?}", state.manifest);
-    let elsewhere = root.path().join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).expect("dir");
-    std::os::unix::fs::symlink(&elsewhere, root.path().join(".aterm/roster")).expect("linked");
-    let linked = "~/.aterm/roster/aterm-machines.toml";
-    private(linked, b"vault-value");
-    let resumed: materialize::Pending =
-        [(linked.to_string(), materialize::digest_hex(b"vault-value"))].into();
-    let mut ahead = None;
-    let (manifest, _) = materialize::apply_resuming(
-        root.path(),
-        &[entry(linked, b"vault-value", false, None)],
-        &materialize::Manifest::default(),
-        &resumed,
-        now(),
-        &mut |held, pending| {
-            ahead = Some((held.clone(), pending.clone()));
-            Ok(())
-        },
-    )
-    .expect("applied");
-    let (resumed_held, pending) = ahead.expect("told ahead");
-    assert!(pending.is_empty(), "{pending:?}");
-    assert!(resumed_held.files.is_empty(), "{resumed_held:?}");
-    assert!(manifest.files.is_empty(), "{manifest:?}");
-    private("~/.aterm/apple/devid-netrc.key", b"the machine's own");
-    let own_anchor = "~/.aterm/apple/devid-own.key";
-    private(own_anchor, b"the machine's own");
-    let entries = [
-        entry("plain_gap", b"vault-value", false, None),
-        entry(
-            "~/.aterm/apple/devid-netrc.key",
-            b"vault-value",
-            false,
-            None,
-        ),
-        entry(
-            "~/.aterm/apple/devid-filled.key",
-            b"vault-value",
-            true,
-            None,
-        ),
-        entry(own_anchor, b"vault-value", true, None),
-        entry(
-            "~/.aterm/apple/devid-kept.key",
-            b"vault-value",
-            true,
-            Some(own_anchor),
-        ),
-        entry(linked, b"vault-value", false, None),
-    ];
-    let mut told = materialize::Pending::new();
-    let (_, report) = materialize::apply_resuming(
-        root.path(),
-        &entries,
-        &materialize::Manifest::default(),
-        &materialize::Pending::new(),
-        now(),
-        &mut |_, pending| {
-            told = pending.clone();
-            Ok(())
-        },
-    )
-    .expect("applied");
-    assert_eq!(report.written.len(), 3, "{report:?}");
-    for name in &report.written {
-        assert!(told.contains_key(name), "{name} written unpended: {told:?}");
-    }
-    assert!(
-        !told.contains_key("~/.aterm/apple/devid-kept.key"),
-        "{told:?}"
-    );
-    assert!(!told.contains_key(linked), "{told:?}");
-}
-
-#[test]
-fn a_pass_cut_short_is_applied_again_at_the_same_version() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let shared = root.path().join("shared").join("team.vault");
-    std::fs::create_dir_all(shared.parent().expect("parent")).expect("dir");
-    let path = shared.to_str().expect("utf-8");
-    let admin = Paths::for_home(&root.path().join("ma"));
-    let created = create(&admin, path, None, Some("ma")).expect("create");
-    let reader = Paths::for_home(&root.path().join("mb"));
-    join_pinned(&reader, &format!("{path}#{}", created.signer), "mb");
-    let recipient = status(&reader)
-        .expect("status")
-        .machine
-        .expect("a key")
-        .0
-        .to_bech32();
-    let (token, gap) = ("token", "~/.config/git/config");
-    {
-        let opened = admin_open(&admin).expect("open");
-        let mut doc = opened.doc.clone();
-        doc.add_machine("mb", &recipient).expect("add");
-        doc.set_entry(&Audience::Everyone, token, b"vault-token")
-            .expect("set");
-        doc.set_entry_with(&Audience::Everyone, gap, b"vault-config\n", true, None)
-            .expect("set");
-        admin_publish(&admin, &opened, &doc).expect("publish");
-    }
-    let at = materialize::target_path(&reader.home, gap).expect("valid");
-    std::fs::create_dir_all(at.parent().expect("parent")).expect("dir");
-    std::fs::write(&at, b"the machine's own\n").expect("written");
-    let first = sync(&reader, None).expect("sync");
-    assert!(matches!(first, SyncOutcome::Applied { .. }), "{first:?}");
-    assert_eq!(std::fs::read(&at).expect("kept"), b"the machine's own\n");
-    std::fs::remove_file(&at).expect("removed");
-    let mut state = load_state(&reader).expect("state");
-    state
-        .pending
-        .insert(gap.to_string(), materialize::digest_hex(b"vault-config\n"));
-    save_state(&reader, &state).expect("saved");
-    assert!(!materialization_ready(&reader).expect("interrupted write"));
-    assert!(matches!(
-        sync(&reader, None).expect("sync again"),
-        SyncOutcome::Applied { .. }
-    ));
-    assert_eq!(std::fs::read(&at).expect("filled"), b"vault-config\n");
-    assert!(load_state(&reader).expect("state").pending.is_empty());
-    assert!(materialization_ready(&reader).expect("resumed write completed"));
-}
-
-#[test]
-fn a_target_that_changed_since_the_look_is_not_written_unannounced() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let name = "~/.config/gh/hosts.yml";
-    let at = materialize::target_path(root.path(), name).expect("valid");
-    std::fs::create_dir_all(&at).expect("a directory in the way");
-    let entries = [Entry {
-        name: name.to_string(),
-        value: SecretBytes::from(&b"vault-value"[..]),
-        audience: Audience::Everyone,
-        if_absent: false,
-        anchor: None,
-    }];
-    let (manifest, report) = materialize::apply_resuming(
-        root.path(),
-        &entries,
-        &materialize::Manifest::default(),
-        &materialize::Pending::new(),
-        now(),
-        &mut |_, pending| {
-            assert!(pending.is_empty(), "{pending:?}");
-            std::fs::remove_dir(&at).expect("the directory goes");
-            Ok(())
-        },
-    )
-    .expect("applied");
-    assert!(report.written.is_empty(), "{report:?}");
-    assert_eq!(report.failed.len(), 1, "{report:?}");
-    assert!(!at.exists());
-    assert!(manifest.files.is_empty(), "{manifest:?}");
-}
-
-#[test]
 fn a_membership_with_no_digest_floors_on_its_cache_unapplied() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let shared = root.path().join("shared").join("team.vault");
@@ -3392,34 +2617,6 @@ fn a_membership_with_no_digest_floors_on_its_cache_unapplied() {
     std::fs::write(admin.cache_file(), &cached).expect("written");
     state.membership = Stored::None;
     assert!(floor(&admin, &state, &config.name, &config).is_some());
-}
-
-#[test]
-fn a_large_manifest_reads_back_and_one_past_the_bound_is_never_written() {
-    let home = aterm_tempfile::tempdir().expect("tempdir");
-    let paths = Paths::for_home(home.path());
-    let digest = materialize::digest_hex(b"v");
-    let names = |count: usize, len: usize| {
-        (0..count)
-            .map(|i| (format!("~/{i:0>len$}"), digest.clone()))
-            .collect::<BTreeMap<_, _>>()
-    };
-    let mut state = State::default();
-    state.manifest.files = names(25_000, 120);
-    state.pending = names(25_000, 120);
-    save_state(&paths, &state).expect("saved");
-    let loaded = load_state(&paths).expect("read back");
-    assert_eq!(loaded.manifest, state.manifest);
-    assert_eq!(loaded.pending, state.pending);
-
-    let mut past = State::default();
-    past.manifest.files = names(MAX_STATE / 1000 + 1, 1000);
-    let error = save_state(&paths, &past).expect_err("past the bound");
-    assert!(error.0.contains("more entries"), "{error}");
-    assert_eq!(
-        load_state(&paths).expect("still reads").manifest,
-        state.manifest
-    );
 }
 
 #[test]
@@ -3524,22 +2721,17 @@ fn a_request_for_a_vault_this_machine_left_leaves_its_state_alone() {
     assert_eq!(second_seq, first_seq);
     assert_eq!(second_approval, Approval::Password);
 
-    let token = materialize::target_path(&admin.home, "token").unwrap();
-    std::fs::remove_file(&token).expect("remove owned token");
-    std::fs::create_dir(&token).expect("block only the owned entry");
-    let SyncOutcome::Applied { report, .. } = sync(&admin, None).expect("partial apply") else {
-        panic!("the blocked entry must be retried");
-    };
-    assert!(!report.failed.is_empty());
+    let mut partial = load_state(&admin).expect("applied state");
+    partial.failed = true;
+    save_state(&admin, &partial).expect("an unfinished apply");
     let partial = load_state(&admin).expect("failed materialization state");
     assert!(partial.failed && source_bound(&current, &partial));
-    assert!(!materialization_ready(&admin).expect("failed files are not ready"));
+    assert!(!materialization_ready(&admin).expect("an unfinished apply is not ready"));
     let mut cold = None;
     let (_, seq, approval) = approval_here(&admin, &mut cold)
-        .expect("verified cache despite failed file")
+        .expect("verified cache despite an unfinished apply")
         .expect("still an admin");
     assert_eq!((seq, approval), (second_seq, Approval::Password));
-    std::fs::remove_dir(&token).expect("remove only the empty owned blocker");
     sync(&admin, None).expect("repair materialization");
     let queued = |config: &Config| {
         requests_for(&admin, config, None)
@@ -3583,11 +2775,7 @@ fn a_request_for_a_vault_this_machine_left_leaves_its_state_alone() {
             sync(machine, None).expect("not admitted"),
             SyncOutcome::NotIn
         );
-        assert!(
-            !materialize::target_path(&machine.home, "token")
-                .unwrap()
-                .exists()
-        );
+        assert!(stored(machine, "token").is_none());
     }
 
     join_pinned(&admin, &sources[0], "admin");
@@ -3601,18 +2789,14 @@ fn a_request_for_a_vault_this_machine_left_leaves_its_state_alone() {
     );
     sync(&from_a, None).expect("first machine syncs");
     assert_eq!(
-        std::fs::read(materialize::target_path(&from_a.home, "token").unwrap()).unwrap(),
-        b"inert-first"
+        stored(&from_a, "token").as_deref(),
+        Some(&b"inert-first"[..])
     );
     assert_eq!(
         sync(&from_b, None).expect("still pending"),
         SyncOutcome::NotIn
     );
-    assert!(
-        !materialize::target_path(&from_b.home, "token")
-            .unwrap()
-            .exists()
-    );
+    assert!(stored(&from_b, "token").is_none());
     assert_eq!(body(&current.source), before_b);
 
     let fresh = admin_open(&admin).expect("capture admitted first vault");
@@ -4517,13 +3701,10 @@ fn a_machine_in_the_vault_puts_back_a_vault_its_server_lost() {
         FIRST_RETRY
     );
 
-    let token = materialize::target_path(&member.home, "token").expect("target");
-    std::fs::remove_file(&token).expect("the token removed");
-    std::fs::create_dir(&token).expect("the entry blocked");
-    let SyncOutcome::Applied { report, .. } = sync(&member, None).expect("a partial apply") else {
-        panic!("the blocked entry is applied again");
-    };
-    assert!(!report.failed.is_empty());
+    // An apply that did not finish leaves the verified copy this Mac puts back.
+    let mut state = load_state(&member).expect("state");
+    state.failed = true;
+    save_state(&member, &state).expect("an unfinished apply");
     let server = lose(server, "again");
     let (_, outcome) = subscriber_pass(&member, &mut None, &FOUND_NONE).expect("a pass");
     assert_eq!(
@@ -4587,15 +3768,6 @@ fn a_put_back_the_source_keeps_no_more_backs_off_and_is_logged_once() {
         line.contains("held no vault named team: put this machine's copy back (seq 2)"),
         "{line}"
     );
-    let failed = SyncOutcome::Applied {
-        seq: 2,
-        report: crate::materialize::Report {
-            failed: vec![("token".to_string(), "is a symlink".to_string())],
-            ..Default::default()
-        },
-    };
-    assert!(pass(&failed).1.is_some());
-    assert_eq!(pass(&failed).1, None);
 }
 
 #[test]
@@ -4848,14 +4020,18 @@ fn a_machine_puts_its_newer_copy_back_over_an_older_one_a_server_took() {
     assert!(served() == newest, "the newest copy is served");
     exact.stop();
 
-    // A pass that does not long-poll (a repair is due) hears an older copy as a signed body,
-    // not a `204` naming its seq: it puts the newest back all the same, and the repair it
-    // was for runs the pass after.
+    // A pass that does not long-poll (a repair is due: no apply of this build recorded what
+    // the Mac reads) hears an older copy as a signed body, not a `204` naming its seq: it puts
+    // the newest back all the same, and the repair it was for runs the pass after.
     server.stop();
     let server = serve(&root.path().join("again"), &socket);
     transport::publish(&source, &stale).expect("the stale copy is taken again");
-    let token = materialize::target_path(&member.home, "token").expect("target");
-    std::fs::remove_file(&token).expect("the token gone");
+    let unrecorded = || {
+        let mut state = load_state(&member).expect("state");
+        state.held = None;
+        save_state(&member, &state).expect("an older build's state");
+    };
+    unrecorded();
     let mut repaired = None;
     let (_, outcome) = subscriber_pass(&member, &mut repaired, &FOUND_NONE).expect("a repair pass");
     assert_eq!(
@@ -4871,7 +4047,10 @@ fn a_machine_puts_its_newer_copy_back_over_an_older_one_a_server_took() {
         matches!(outcome, SyncOutcome::Applied { seq: 3, .. }),
         "{outcome:?}"
     );
-    assert_eq!(std::fs::read(&token).expect("the token"), b"inert-token");
+    assert_eq!(
+        stored(&member, "token").as_deref(),
+        Some(&b"inert-token"[..])
+    );
 
     // An older version signed before a rotation is put back over the same way: its seq is
     // read as a `204`'s is, and what goes back is this Mac's copy under its new pin.
@@ -4889,7 +4068,7 @@ fn a_machine_puts_its_newer_copy_back_over_an_older_one_a_server_took() {
     server.stop();
     let server = serve(&root.path().join("rotated"), &socket);
     transport::publish(&source, &stale).expect("the stale copy, signed before the rotation");
-    std::fs::remove_file(&token).expect("the token gone");
+    unrecorded();
     let mut repaired = None;
     let outcome = sync_with_candidates(&member, None, &[peer_url]).expect("a repair pass");
     assert_eq!(
@@ -4948,8 +4127,8 @@ fn bounded_member_join_and_sync_keep_normal_admission_and_materialization() {
         SyncOutcome::Applied { .. }
     ));
     assert_eq!(
-        std::fs::read(materialize::target_path(&member.home, "token").unwrap()).unwrap(),
-        b"inert-token"
+        stored(&member, "token").as_deref(),
+        Some(&b"inert-token"[..])
     );
     assert_eq!(load_state(&member).unwrap().membership, Stored::In);
     server.stop();
@@ -4985,7 +4164,7 @@ fn a_mirror_serves_a_member_whose_url_is_down_and_never_rolls_it_back() {
     // The url refuses at once: its server and the listener it was handed are gone.
     server.stop();
     drop(socket);
-    let token = || std::fs::read(materialize::target_path(&member.home, "token").unwrap());
+    let token = || stored(&member, "token");
     assert!(sync(&member, None).is_err(), "the url alone is down");
     assert_eq!(load_state(&member).unwrap().seq, 2);
 
@@ -5001,7 +4180,7 @@ fn a_mirror_serves_a_member_whose_url_is_down_and_never_rolls_it_back() {
         matches!(outcome, Ok(SyncOutcome::Applied { seq: 3, .. })),
         "the newer mirror serves the Mac: {outcome:?}"
     );
-    assert_eq!(token().unwrap(), b"new-token");
+    assert_eq!(token().as_deref(), Some(&b"new-token"[..]));
     assert_eq!(
         configured(&member).unwrap().mirrors,
         [older_url.clone(), newer_url],
@@ -5011,7 +4190,7 @@ fn a_mirror_serves_a_member_whose_url_is_down_and_never_rolls_it_back() {
     newer.stop();
     let _ = sync(&member, None);
     assert_eq!(load_state(&member).unwrap().seq, 3, "never rolled back");
-    assert_eq!(token().unwrap(), b"new-token");
+    assert_eq!(token().as_deref(), Some(&b"new-token"[..]));
     assert_eq!(
         served_at(&Source::Url(older_url)).expect("the older mirror"),
         held_two,
@@ -5221,37 +4400,7 @@ fn bounded_member_sync_uses_a_verified_peer_when_the_primary_is_silent() {
         .expect("verified peer answers"),
         SyncOutcome::Applied { seq: 3, .. }
     ));
-    assert_eq!(
-        std::fs::read(materialize::target_path(&member.home, "token").unwrap()).unwrap(),
-        b"new-token"
-    );
-    server.stop();
-}
-
-#[test]
-fn bounded_local_write_failure_still_reads_a_newer_network_version() {
-    let root = aterm_tempfile::tempdir().unwrap();
-    let socket = bound();
-    let (server, _, admin, member) = a_vault_with_a_member(root.path(), &socket);
-    let token = materialize::target_path(&member.home, "token").unwrap();
-    std::fs::remove_file(&token).unwrap();
-    std::fs::create_dir(&token).unwrap();
-    let before = load_state(&member).unwrap();
-    let opened = admin_open(&admin).unwrap();
-    let mut doc = opened.doc.clone();
-    doc.set_entry(&Audience::Everyone, "new-note", b"new-version")
-        .unwrap();
-    let published = admin_publish(&admin, &opened, &doc).unwrap();
-    assert!(published.seq > before.seq);
-    let outcome = sync_reader_until(&member, Instant::now() + HANG_DETECTOR).unwrap();
-    assert!(matches!(outcome, SyncOutcome::Applied { seq, .. } if seq == published.seq));
-    let after = load_state(&member).unwrap();
-    assert_eq!(after.seq, published.seq);
-    assert!(after.failed, "the local obstruction is still reported");
-    assert_eq!(
-        std::fs::read(materialize::target_path(&member.home, "new-note").unwrap()).unwrap(),
-        b"new-version"
-    );
+    assert_eq!(stored(&member, "token").as_deref(), Some(&b"new-token"[..]));
     server.stop();
 }
 
@@ -5354,214 +4503,214 @@ fn a_bounded_wait_ends_at_its_own_time_whatever_the_server_holds() {
     holding.stop();
 }
 
-/// A file an entry left this Mac's own (a plain value adopted, an ` if-absent` file left in
-/// place) is out of the manifest; deleted, it is a gap the vault fills at the version the
-/// Mac holds, by an explicit sync and by the subscriber's repair. A file an anchored entry
-/// left (its anchor this Mac's own) is no gap, so readiness never waits on it.
-#[test]
-fn a_gone_file_an_entry_left_this_macs_own_is_filled_again_at_the_same_version() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let source = root.path().join("team.vault");
-    let admin = Paths::for_home(&root.path().join("admin"));
-    create(&admin, source.to_str().expect("utf-8"), None, Some("admin")).expect("create");
-    let target = |name: &str| materialize::target_path(&admin.home, name).expect("target");
-    let (adopted, hosts) = (target("adopted"), target("~/.config/gh/hosts.yml"));
-    let (anchor, anchored) = (
-        target("~/.config/git/config"),
-        target("~/.config/git/credentials"),
-    );
-    let paired = target("~/.aterm/apple/devid-pair.key");
-    fsx::ensure_private_dir(&admin.home.join(".secrets")).expect("~/.secrets");
-    fsx::write_atomic(&adopted, b"inert-adopted", 0o600).expect("this Mac's value");
-    std::fs::create_dir_all(hosts.parent().expect("parent")).expect("dir");
-    fsx::write_atomic(&hosts, b"mine: {}\n", 0o600).expect("this Mac's hosts");
-    std::fs::create_dir_all(anchor.parent().expect("parent")).expect("dir");
-    fsx::write_atomic(&anchor, b"[mine]\n", 0o600).expect("this Mac's config");
-    std::fs::create_dir_all(paired.parent().expect("parent")).expect("dir");
-    fsx::write_atomic(&paired, b"mine\n", 0o600).expect("this Mac's half of a pair");
-    let opened = admin_open(&admin).expect("open");
-    let mut doc = opened.doc.clone();
-    doc.set_entry(&Audience::Everyone, "adopted", b"inert-adopted")
-        .expect("set");
-    for (name, value, anchored_to) in [
-        ("~/.config/gh/hosts.yml", &b"github.com: {}\n"[..], None),
-        ("~/.config/git/config", b"[tool]\n", None),
-        (
-            "~/.config/git/credentials",
-            b"inert-key",
-            Some("~/.config/git/config"),
-        ),
-        ("~/.aterm/apple/devid-pair.cer", b"inert-a", None),
-        (
-            "~/.aterm/apple/devid-pair.key",
-            b"inert-b",
-            Some("~/.aterm/apple/devid-pair.cer"),
-        ),
-    ] {
-        doc.set_entry_with(&Audience::Everyone, name, value, true, anchored_to)
-            .expect("set");
+/// Every entry under `home` but the vault's own private folder `apart` (its key, state, cache and
+/// records) and the folders on the way to it, each with its mode and, for a file, its bytes, for
+/// a symlink its target: what a pass must leave as it found it.
+fn home_tree(home: &Path, apart: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut tree = BTreeMap::new();
+    let mut walk = vec![home.to_path_buf()];
+    while let Some(dir) = walk.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("an entry").path();
+            if path.starts_with(apart) {
+                continue;
+            }
+            if apart.starts_with(&path) {
+                walk.push(path);
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path).expect("metadata");
+            let bytes = if meta.file_type().is_symlink() {
+                std::fs::read_link(&path)
+                    .expect("a link")
+                    .into_os_string()
+                    .into_encoded_bytes()
+            } else if meta.is_dir() {
+                walk.push(path.clone());
+                Vec::new()
+            } else {
+                std::fs::read(&path).expect("a file")
+            };
+            tree.insert(path, (meta.permissions().mode(), bytes));
+        }
     }
-    admin_publish(&admin, &opened, &doc).expect("publish");
-    sync(&admin, None).expect("sync");
-    let own = load_state(&admin).expect("state").own.expect("recorded");
-    assert_eq!(
-        own,
-        [
-            "adopted",
-            "~/.config/gh/hosts.yml",
-            "~/.aterm/apple/devid-pair.key",
-            "~/.config/git/config"
-        ]
-        .map(String::from)
-        .into(),
-        "an entry anchored to this Mac's own file is not named; one anchored to the vault's is"
-    );
-    assert!(!anchored.exists(), "the anchored entry left no file");
-    assert!(materialization_ready(&admin).expect("ready"));
-    assert_eq!(
-        sync(&admin, None).expect("sync"),
-        SyncOutcome::Unchanged { seq: 2 }
-    );
-    let mut repaired = None;
-    assert!(!repair_due(&admin, &mut repaired), "nothing to repair");
-
-    std::fs::remove_file(&adopted).expect("gone");
-    std::fs::remove_file(&hosts).expect("gone");
-    std::fs::remove_file(&paired).expect("gone");
-    assert!(!materialization_ready(&admin).expect("ready"));
-    assert!(repair_due(&admin, &mut repaired), "the gaps are due");
-    assert!(!repair_due(&admin, &mut repaired), "once per version");
-    let SyncOutcome::Applied { seq: 2, report } = sync(&admin, None).expect("filled") else {
-        panic!("the gaps are filled at the version held");
-    };
-    assert_eq!(
-        report.written,
-        [
-            "adopted",
-            "~/.aterm/apple/devid-pair.key",
-            "~/.config/gh/hosts.yml"
-        ]
-        .map(String::from)
-    );
-    assert_eq!(std::fs::read(&adopted).expect("filled"), b"inert-adopted");
-    assert_eq!(std::fs::read(&paired).expect("filled"), b"inert-b");
-    assert_eq!(std::fs::read(&hosts).expect("filled"), b"github.com: {}\n");
-    let state = load_state(&admin).expect("state");
-    assert!(
-        state.manifest.files.contains_key("adopted"),
-        "the vault's now"
-    );
-    assert_eq!(
-        state.own.expect("recorded"),
-        ["~/.config/git/config".to_string()].into()
-    );
-    assert!(materialization_ready(&admin).expect("ready"));
-    assert_eq!(
-        sync(&admin, None).expect("sync"),
-        SyncOutcome::Unchanged { seq: 2 }
-    );
-
-    // A state an older aterm wrote has no such record: readiness does not wait on one,
-    // and the next sync, or the subscriber's next pass, applies once to write it.
-    let mut state = load_state(&admin).expect("state");
-    state.own = None;
-    save_state(&admin, &state).expect("state.toml");
-    assert!(materialization_ready(&admin).expect("ready"));
-    assert!(repair_due(&admin, &mut None), "applied once");
-    let SyncOutcome::Applied { seq: 2, report } = sync(&admin, None).expect("sync") else {
-        panic!("applied once at the version held");
-    };
-    assert!(quiet(&report), "nothing to write");
-    assert!(load_state(&admin).expect("state").own.is_some());
-    assert_eq!(
-        sync(&admin, None).expect("sync"),
-        SyncOutcome::Unchanged { seq: 2 }
-    );
+    tree
 }
 
-/// A write that failed before it wrote anything keeps nothing pending ([`landed`]), so a file
-/// a person writes with the same value later is theirs: adopted, and left by the vault's
-/// unset.
+/// LT-04A's exit test: a member's join, every sync and subscriber pass, a changed value and a
+/// dropped entry write, move and remove nothing under its home but the vault's own private
+/// folder, the files an older build left there (a `~/.secrets` file, a `.replaced` copy, a
+/// person's own gh hosts file) included, and every entry it holds reads in place from the
+/// verified store, whatever such a file holds.
+///
+/// NEGATIVE CONTROL: with the envelope and log applies writing each held entry's value to
+/// `aterm_types::vault_entry::plain_entry_path` right after `record_applied`, as the deleted
+/// materializer did, the test fails at the first sync: `assertion `left == right` failed: a
+/// pass wrote under the home (first sync)`. The control at its end shows that the same
+/// comparison sees a file written under the home.
 #[test]
-fn a_write_that_failed_before_it_wrote_leaves_a_later_identical_file_the_persons() {
-    use std::os::unix::fs::PermissionsExt;
+fn a_sync_writes_nothing_under_the_home_and_every_entry_reads_in_place() {
+    use crate::entry_class::{GH_HOSTS, GIT_CREDENTIALS};
     let root = aterm_tempfile::tempdir().expect("tempdir");
-    let source = root.path().join("team.vault");
+    let signed = root.path().join("signed.vault");
     let admin = Paths::for_home(&root.path().join("admin"));
-    create(&admin, source.to_str().expect("utf-8"), None, Some("admin")).expect("create");
-    let token = materialize::target_path(&admin.home, "~/.config/gh/hosts.yml").expect("target");
-    let dir = token.parent().expect("parent").to_path_buf();
-    std::fs::create_dir_all(&dir).expect("dir");
-    let mode = |mode| {
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).expect("mode");
-    };
-    let publish = |set: bool| {
-        let opened = admin_open(&admin).expect("open");
+    let created = create(&admin, signed.to_str().unwrap(), None, Some("admin")).expect("create");
+    let publish = |change: &dyn Fn(&mut Document)| {
+        let opened = admin_open(&admin).expect("admin opens");
         let mut doc = opened.doc.clone();
-        if set {
-            doc.set_entry(
-                &Audience::Everyone,
-                "~/.config/gh/hosts.yml",
-                b"inert-token",
-            )
-            .expect("set");
-        } else {
-            doc.unset_entry(&Audience::Everyone, "~/.config/gh/hosts.yml")
-                .expect("unset");
-        }
+        change(&mut doc);
         admin_publish(&admin, &opened, &doc).expect("publish");
     };
-
-    mode(0o500);
-    publish(true);
-    let _ = sync(&admin, None);
-    let state = load_state(&admin).expect("state");
-    assert!(state.failed, "the write failed");
-    assert!(state.pending.is_empty(), "{:?}", state.pending);
-    mode(0o700);
-    fsx::write_atomic(&token, b"inert-token", 0o600).expect("the person's own file");
-    sync(&admin, None).expect("sync");
-    let state = load_state(&admin).expect("state");
-    assert!(!state.failed);
-    assert!(
-        !state.manifest.files.contains_key("~/.config/gh/hosts.yml"),
-        "adopted"
-    );
-    publish(false);
-    sync(&admin, None).expect("sync");
-    assert!(token.exists(), "the vault's unset leaves the person's file");
-}
-
-/// Of the digests a pass pended, those of entries it failed whose file holds the value stay:
-/// a write that landed and then failed its directory's flush. Negative controls: an entry
-/// that did not fail, and a failed one whose file holds another value or none.
-#[test]
-fn a_failed_entry_stays_pending_only_while_its_file_holds_the_value() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let home = root.path();
-    let target = |name: &str| materialize::target_path(home, name).expect("target");
-    fsx::ensure_private_dir(&home.join(".secrets")).expect("~/.secrets");
-    let digest = materialize::digest_hex(b"inert-value");
-    for (name, held) in [
-        ("landed", Some(&b"inert-value"[..])),
-        ("other", Some(b"inert-other")),
-        ("absent", None),
-        ("written", Some(b"inert-value")),
-    ] {
-        if let Some(held) = held {
-            fsx::write_atomic(&target(name), held, 0o600).expect("file");
+    publish(&|doc| {
+        for (name, value) in [
+            ("token", &b"the-vaults-token"[..]),
+            ("dropped", b"a-value-the-vault-drops"),
+            (
+                GH_HOSTS,
+                b"github.com:\n    oauth_token: the-vaults-hosts\n",
+            ),
+            (
+                GIT_CREDENTIALS,
+                b"https://x:the-vaults-credential@github.com\n",
+            ),
+        ] {
+            doc.set_entry(&Audience::Everyone, name, value)
+                .expect("set");
         }
+    });
+    let reader = Paths::for_home(&root.path().join("reader"));
+    // What an older build left in this home, and a person's own gh hosts file.
+    let planted: [(PathBuf, &[u8]); 4] = [
+        (
+            aterm_types::vault_entry::plain_entry_path(&reader.home, "token"),
+            b"an-older-builds-copy",
+        ),
+        (
+            aterm_types::vault_entry::plain_entry_path(&reader.home, ".replaced/token.1"),
+            b"a-copy-an-older-build-moved-aside",
+        ),
+        (
+            reader.home.join(".config/gh/hosts.yml"),
+            b"github.com:\n    oauth_token: the-persons-own\n",
+        ),
+        (
+            reader.home.join(".secrets/.token.tmp.1"),
+            b"a-cut-pass-temp",
+        ),
+    ];
+    for (path, bytes) in &planted {
+        std::fs::create_dir_all(path.parent().unwrap()).expect("folder");
+        fsx::write_atomic(path, bytes, 0o644).expect("planted");
     }
-    let pended: materialize::Pending = ["landed", "other", "absent", "written"]
-        .into_iter()
-        .map(|name| (name.to_string(), digest.clone()))
-        .collect();
-    let failed: Vec<(String, String)> = ["landed", "other", "absent"]
-        .into_iter()
-        .map(|name| (name.to_string(), "a reason".to_string()))
-        .collect();
+    let before = home_tree(&reader.home, &reader.dir);
+    let unchanged = |when: &str| {
+        assert_eq!(
+            home_tree(&reader.home, &reader.dir),
+            before,
+            "a pass wrote under the home ({when})"
+        );
+    };
+
+    let pin = format!("{}#{}", signed.display(), created.signer);
+    assert!(matches!(
+        join_pinned(&reader, &pin, "reader"),
+        JoinOutcome::Pending { .. }
+    ));
+    unchanged("join");
+    let recipient = status(&reader)
+        .expect("status")
+        .machine
+        .expect("a key")
+        .0
+        .to_bech32();
+    publish(&|doc| {
+        doc.add_machine("reader", &recipient).expect("admit");
+        doc.set_entry(
+            &Audience::Hosts(vec!["reader".into()]),
+            "reader-only",
+            b"the-readers-own",
+        )
+        .expect("set");
+    });
+    assert!(matches!(
+        sync(&reader, None).expect("sync"),
+        SyncOutcome::Applied { .. }
+    ));
+    unchanged("first sync");
+    let held = |paths: &Paths, name: &str| stored(paths, name);
     assert_eq!(
-        landed(home, pended, &failed),
-        [("landed".to_string(), digest)].into()
+        held(&reader, "token").as_deref(),
+        Some(&b"the-vaults-token"[..])
     );
+    assert_eq!(
+        held(&reader, GH_HOSTS).as_deref(),
+        Some(&b"github.com:\n    oauth_token: the-vaults-hosts\n"[..])
+    );
+    assert_eq!(
+        held(&reader, GIT_CREDENTIALS).as_deref(),
+        Some(&b"https://x:the-vaults-credential@github.com\n"[..])
+    );
+    assert_eq!(
+        held(&reader, "reader-only").as_deref(),
+        Some(&b"the-readers-own"[..])
+    );
+    assert_eq!(
+        held(&reader, "dropped").as_deref(),
+        Some(&b"a-value-the-vault-drops"[..])
+    );
+    // What the apply recorded is names and digests, never a value.
+    let state = std::fs::read(reader.state_file()).expect("state");
+    for value in [
+        &b"the-vaults-token"[..],
+        b"the-readers-own",
+        b"the-vaults-hosts",
+    ] {
+        assert!(!state.windows(value.len()).any(|w| w == value));
+    }
+    assert_eq!(
+        load_state(&reader)
+            .unwrap()
+            .held
+            .unwrap()
+            .into_keys()
+            .collect::<Vec<_>>(),
+        ["dropped", "reader-only", "token", GH_HOSTS, GIT_CREDENTIALS]
+    );
+
+    // A subscriber pass, a changed value and a dropped entry change nothing under the home.
+    subscriber_pass(&reader, &mut None, &FOUND_NONE).expect("a pass");
+    unchanged("subscriber pass");
+    publish(&|doc| {
+        doc.set_entry(&Audience::Everyone, "token", b"the-vaults-next-token")
+            .expect("set");
+        doc.unset_entry(&Audience::Everyone, "dropped")
+            .expect("unset");
+    });
+    let SyncOutcome::Applied { report, .. } = sync(&reader, None).expect("sync") else {
+        panic!("the new version applies");
+    };
+    assert!(report.changed && !report.held.contains(&"dropped".to_owned()));
+    unchanged("a changed value and a dropped entry");
+    assert_eq!(
+        held(&reader, "token").as_deref(),
+        Some(&b"the-vaults-next-token"[..])
+    );
+    assert_eq!(held(&reader, "dropped"), None);
+    assert!(materialization_ready(&reader).expect("readiness"));
+    for (path, bytes) in &planted {
+        assert_eq!(std::fs::read(path).expect("left as it was"), *bytes);
+    }
+
+    // CONTROL: a file written under the home is a change the comparison sees.
+    fsx::write_atomic(
+        &aterm_types::vault_entry::plain_entry_path(&reader.home, "dropped"),
+        b"a-value-the-vault-drops",
+        0o600,
+    )
+    .expect("a write");
+    assert_ne!(home_tree(&reader.home, &reader.dir), before, "CONTROL");
 }

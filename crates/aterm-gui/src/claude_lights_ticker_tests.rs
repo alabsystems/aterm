@@ -304,7 +304,7 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
     assert!(
         titled.contains(&format!(
             "autopilot: cruise \u{2014} {} \u{b7} last: \u{2713} approved ",
-            crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip
+            crate::autopilot::mode_words(alab_policy::config::Autopilot::Cruise).chip
         )) && titled.contains(&format!("{at} \u{b7} click: land")),
         "the hover's title, not the label: {titled:?}"
     );
@@ -365,7 +365,7 @@ fn a_hovered_chip_names_its_face_clocks_day_where_it_is_not_today() {
         let (mut app, wid, session, host) = ticker_app(200);
         assert!(app.set_session_autopilot(
             session,
-            Some(aterm_agent::supervise::Autopilot::Land),
+            Some(alab_policy::config::Autopilot::Land),
             crate::autopilot::Surface::Chip
         ));
         assert!(crate::harness_glass::on_task(
@@ -489,7 +489,7 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
     use super::gesture_tests::autopilot;
     use crate::a11y_tree::HarnessChip;
     use crate::autopilot::AutopilotView;
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let t0 = Instant::now();
     let (mut app, wid, session, _host) = ticker_app(120);
     let (now, clock) = arrival_now(t0, 0);
@@ -549,7 +549,7 @@ fn a_reader_cannot_press_a_chip_under_painted_chrome() {
     use crate::a11y_tree::HarnessChip;
     use crate::autopilot::AutopilotView;
     use crate::input::{PasteFraming, Source};
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
 
     let (mut app, wid, session, _host) = ticker_app(120);
     app.press_claude_chip_for_reader(wid, session, HarnessChip::Autopilot);
@@ -907,7 +907,7 @@ fn a_hovered_title_gives_up_its_trail_then_its_words() {
     let (act, at) = arrival_now(t0, 0);
     on_act_at(&mut app, session, Act::Approved, act);
     let v1 = &crate::autopilot::AutopilotView::Cruise.title();
-    let cruise = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip;
+    let cruise = crate::autopilot::mode_words(alab_policy::config::Autopilot::Cruise).chip;
     let click = "autopilot: cruise \u{b7} click: land";
     let tail = format!("{at} \u{b7} click: land");
     let mut seen: Vec<(u16, u8)> = Vec::new();

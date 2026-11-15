@@ -6,7 +6,7 @@ use super::{
     apply_meta_value, normalize_autopilot_value, restore_carried_meta, sanitize_metadata_value,
     validated_meta_value,
 };
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 
 #[test]
 fn the_modes_and_the_owners_words_store_the_modes_word() {

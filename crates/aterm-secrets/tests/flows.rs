@@ -131,16 +131,11 @@ fn write_private(path: &Path, value: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 }
 
+/// The value of `name` the Mac at `paths` reads in place from its store.
 fn read(paths: &Paths, name: &str) -> Option<String> {
-    std::fs::read_to_string(paths.home.join(".secrets").join(name)).ok()
-}
-
-fn mode(path: &Path) -> u32 {
-    std::fs::metadata(path)
-        .expect("metadata")
-        .permissions()
-        .mode()
-        & 0o7777
+    client::read_in_place(paths, name)
+        .expect("a store read")
+        .map(|value| String::from_utf8(value.as_slice().to_vec()).expect("utf-8"))
 }
 
 fn join_unattended(paths: &Paths, source: &str, host: &str) -> aterm_secrets::Result<JoinOutcome> {
@@ -198,7 +193,7 @@ fn set(admin_paths: &Paths, audience: &Audience, name: &str, value: &str) -> u64
         .seq
 }
 
-fn applied(outcome: SyncOutcome) -> (u64, aterm_secrets::materialize::Report) {
+fn applied(outcome: SyncOutcome) -> (u64, aterm_secrets::client::Report) {
     match outcome {
         SyncOutcome::Applied { seq, report } => (seq, report),
         other => panic!("expected a new version, got {other:?}"),
@@ -266,8 +261,10 @@ fn a_lan_vault_from_create_to_revoke() {
         read(&machine, "gh_access_token").as_deref(),
         Some(token.as_str())
     );
-    assert_eq!(mode(&machine.home.join(".secrets/gh_access_token")), 0o600);
-    assert_eq!(mode(&machine.home.join(".secrets")), 0o700);
+    assert!(
+        !machine.home.join(".secrets").exists(),
+        "the sync wrote no file"
+    );
     assert!(
         client::requests(&admin, Some(&client::admin_open(&admin).expect("open").doc))
             .expect("requests")
@@ -315,22 +312,21 @@ fn a_lan_vault_from_create_to_revoke() {
         client::admin_publish(&admin, &admin_vault, &doc).expect("publish");
     }
     let (_, report) = applied(client::sync(&machine, None).expect("sync"));
-    assert_eq!(report.removed, ["fresh"]);
+    assert!(!report.held.contains(&"fresh".to_owned()), "{report:?}");
     assert_eq!(read(&machine, "fresh"), None);
+    // A file an older build would have written stays as it is: the store is what is read.
     let by_hand = synthetic("by-hand");
-    write_private(&machine.home.join(".secrets/other"), &by_hand);
+    let file = machine.home.join(".secrets/other");
+    write_private(&file, &by_hand);
     let replacement = synthetic("replacement");
     set(&admin, &Audience::Everyone, "other", &replacement);
-    let (_, report) = applied(client::sync(&machine, None).expect("sync"));
+    applied(client::sync(&machine, None).expect("sync"));
     assert_eq!(
         read(&machine, "other").as_deref(),
         Some(replacement.as_str())
     );
-    let [(name, aside)] = report.moved_aside.as_slice() else {
-        panic!("one file moved aside: {report:?}");
-    };
-    assert_eq!(name, "other");
-    assert_eq!(std::fs::read_to_string(aside).expect("aside"), by_hand);
+    assert_eq!(std::fs::read_to_string(&file).expect("file"), by_hand);
+    assert!(!machine.home.join(".secrets/.replaced").exists());
 
     {
         let admin_vault = client::admin_open(&admin).expect("open");
@@ -594,7 +590,12 @@ fn a_plain_text_file_at_a_path_is_read_as_is() {
         read(&machine, "gh_access_token").as_deref(),
         Some(next.as_str())
     );
-    assert_eq!(report.removed, ["only_mb"]);
+    assert!(!report.held.contains(&"only_mb".to_owned()), "{report:?}");
+    assert_eq!(read(&machine, "only_mb"), None);
+    assert!(
+        !machine.home.join(".secrets").exists(),
+        "nothing was written"
+    );
 
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
     assert!(client::sync(&machine, None).is_err());
@@ -663,16 +664,10 @@ fn a_machine_that_knows_the_join_password_is_let_in_by_the_admins_subscriber() {
     assert!(again.approved.is_empty());
     assert_eq!(again.seq, None);
 
-    let shown = std::fs::read_dir(machine.home.join(".secrets"))
-        .expect("dir")
-        .filter_map(Result::ok)
-        .filter_map(|e| std::fs::read(e.path()).ok())
-        .any(|bytes| {
-            bytes
-                .windows(password.as_slice().len())
-                .any(|w| w == password.as_slice())
-        });
-    assert!(!shown, "a member's files hold the join password");
+    assert!(
+        !machine.home.join(".secrets").exists(),
+        "a member's sync writes no file, the join password's least of all"
+    );
 }
 
 /// `member` lets `joiner` in the way a person does: `joiner` asks its desk, Allow there shows a
@@ -733,9 +728,10 @@ fn allow_through(member: &Paths, joiner: &Paths, host: &str) -> Bundle {
 /// install.sh's windowless lanes run `aterm members join --no-wait` (§3.3.3): it asks every
 /// member it finds at once and returns within install.sh's bound (`VERIFY_WAIT_SECS`, 60 s),
 /// a member that never answers and one that is gone included, leaving its request on the
-/// member's desk. The phrase a person then reads off that member and types gets the new Mac
-/// GitHub, publishing and AI accounts in `~/.secrets` at once, before any admin's approver
-/// runs; the request it posts with its Allowed is admitted when one does.
+/// member's desk. The phrase a person then reads off that member and types configures the new
+/// Mac's vault and keeps none of the bundle's values; the request it posts with its Allowed is
+/// admitted when an admin's approver runs, and the new Mac's first apply of the admitted version
+/// gets it GitHub, publishing and AI accounts, read in place.
 #[test]
 fn the_install_lane_returns_within_its_bound_and_leaves_a_pending_request() {
     let lab = Lab::changing("lane");
@@ -855,12 +851,8 @@ fn the_install_lane_returns_within_its_bound_and_leaves_a_pending_request() {
             "a vault with no log asks its server with the Allowed: {:?}",
             joined.admission
         );
-        for (name, value) in &files {
-            assert_eq!(
-                read(&machine, name).as_deref(),
-                Some(value.as_str()),
-                "{name}"
-            );
+        for (name, _) in &files {
+            assert_eq!(read(&machine, name), None, "{name} before the admission");
         }
         assert!(matches!(
             client::status(&machine).expect("status").membership,
@@ -878,12 +870,19 @@ fn the_install_lane_returns_within_its_bound_and_leaves_a_pending_request() {
         client::status(&machine).expect("status").membership,
         Membership::In { .. }
     ));
+    for (name, value) in &files {
+        assert_eq!(
+            read(&machine, name).as_deref(),
+            Some(value.as_str()),
+            "{name}"
+        );
+    }
 }
 
 /// A member whose vault state a pass holds (a sync, a converge) when the new Mac types the
 /// phrase answers busy before its run touches the phrase: the phrase stays live and the row
 /// stays allowed, and the new Mac asks that member again by itself and gets in once the pass
-/// ends, with the one Allow and the one phrase.
+/// ends, with the one Allow and the one phrase: admitted, it reads the vault's token.
 ///
 /// NEGATIVE CONTROL: leave the state to the handover (no `take_handover_hold` before
 /// `Desk::begin` in `desk::run`): the run takes the phrase, the handover finds the state held,
@@ -997,14 +996,16 @@ fn a_member_busy_with_a_vault_pass_keeps_the_phrase_and_lets_the_new_mac_in_once
         let joined = joined.expect("the phrase let it in once the pass ended");
         assert_eq!((joined.member.as_str(), joined.name.as_str()), ("ma", "mb"));
         assert_eq!(
-            read(&machine, "gh_access_token").as_deref(),
-            Some(token.as_str())
-        );
-        assert_eq!(
             member.lock().unwrap().rows(aterm_time::Instant::now())[0].state,
             desk::RowState::Closed
         );
     });
+    assert_eq!(approved(&admin), ["mb"], "the request carried its Allowed");
+    applied(client::sync(&machine, None).expect("sync"));
+    assert_eq!(
+        read(&machine, "gh_access_token").as_deref(),
+        Some(token.as_str())
+    );
 }
 
 /// A member that stays busy names how long the phrase has left (`left=`): the new Mac says once
@@ -1504,11 +1505,11 @@ fn an_allowed_signed_by_a_key_no_roster_member_binds_is_refused() {
     assert_eq!(approved(&admin), ["mb"]);
 }
 
-/// A Mac a member Allowed while no admin's approver can run writes `~/.secrets` from the
-/// member's bundle at once, stays pending, and the admission it later gets finds those files
-/// already the vault's.
+/// A Mac a member Allowed while no admin's approver can run takes its configuration from the
+/// member's bundle at once and stays pending, keeping none of the bundle's values; the admission
+/// it later gets is what it reads them from, in place.
 #[test]
-fn a_mac_allowed_with_no_admin_reachable_writes_its_secrets_from_the_bundle() {
+fn a_mac_allowed_with_no_admin_reachable_reads_its_secrets_once_admitted() {
     let mut lab = Lab::changing("handover");
     let admin = lab.home("ma");
     let token = synthetic("gh");
@@ -1530,13 +1531,16 @@ fn a_mac_allowed_with_no_admin_reachable_writes_its_secrets_from_the_bundle() {
     let bundle = allow_through(&admin, &machine, "mb");
     lab.stop();
     let report = client::write_from_bundle(&machine, &bundle).expect("written");
-    assert_eq!(report.written, ["gh_access_token"]);
+    assert!(report.held.is_empty(), "{report:?}");
     assert_eq!(
-        read(&machine, "gh_access_token").as_deref(),
-        Some(token.as_str())
+        read(&machine, "gh_access_token"),
+        None,
+        "no value is kept from it"
     );
-    assert_eq!(read(&machine, "only_ma"), None, "only [everyone] files");
-    assert_eq!(mode(&machine.home.join(".secrets/gh_access_token")), 0o600);
+    assert!(
+        !machine.home.join(".secrets").exists(),
+        "nothing was written"
+    );
     assert!(matches!(
         client::status(&machine).expect("status").membership,
         Membership::Pending
@@ -1557,7 +1561,12 @@ fn a_mac_allowed_with_no_admin_reachable_writes_its_secrets_from_the_bundle() {
         Source::Url(lab.url.clone())
     );
     let (_, report) = applied(client::sync(&machine, None).expect("sync"));
-    assert!(report.written.is_empty(), "{:?}", report.written);
+    assert_eq!(report.held, ["gh_access_token"]);
+    assert_eq!(
+        read(&machine, "gh_access_token").as_deref(),
+        Some(token.as_str())
+    );
+    assert_eq!(read(&machine, "only_ma"), None, "only [everyone] values");
     assert!(matches!(
         client::status(&machine).expect("status").membership,
         Membership::In { .. }

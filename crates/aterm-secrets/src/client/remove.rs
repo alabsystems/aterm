@@ -2219,8 +2219,8 @@ fn node_pass_file(paths: &Paths) -> PathBuf {
     paths.dir.join("node-pass")
 }
 
-/// One Mac's node passes: what its repairs held across them ([`repair_due`]), so a file a program
-/// keeps rewriting is put back once, as the subscriber's pass does.
+/// One Mac's node passes: what its repairs held across them ([`repair_due`]), so a version is
+/// repaired once, as the subscriber's pass does.
 #[derive(Default)]
 pub struct NodePass {
     repaired: Repaired,
@@ -2273,15 +2273,14 @@ impl NodePass {
         Some((node_receipt(now_ms, said, signed.len(), applied), first))
     }
 
-    /// Write this Mac's files from the records and the envelope it holds, where its log moved, a
-    /// repair is due ([`repair_due`]), or an apply failed or was cut short: the local half of the
+    /// Record what this Mac reads from the records and the envelope it holds, where its log moved,
+    /// a repair is due ([`repair_due`]), or an apply was cut short: the local half of the
     /// subscriber's sync.
     fn materialize(&mut self, paths: &Paths, deadline: Instant) -> crate::Result<Option<u64>> {
         let config = configured(paths)?;
         let before = load_state(paths)?;
         let kept = self.repaired.clone();
-        let unfinished =
-            before.membership == Stored::In && (before.failed || !before.pending.is_empty());
+        let unfinished = before.membership == Stored::In && before.failed;
         let repair = !unfinished && self.repair_due(paths, &before);
         let moved = log_entries::current_records_digest(paths, &config, &before)
             .is_some_and(|digest| Some(digest) != before.records_digest);
@@ -2298,13 +2297,7 @@ impl NodePass {
             repair,
         );
         match outcome {
-            Ok(SyncOutcome::Applied { seq, report }) => {
-                if apply_failed(&report) {
-                    self.repaired = kept;
-                    return Err(Error::new("a file of this version could not be written"));
-                }
-                Ok(Some(seq))
-            }
+            Ok(SyncOutcome::Applied { seq, .. }) => Ok(Some(seq)),
             Ok(_) => Ok(None),
             Err(error) => {
                 self.repaired = kept;
@@ -2315,7 +2308,7 @@ impl NodePass {
 
     /// [`repair_due`]. A Mac that holds its vault as a log alone keeps no envelope for that rule's
     /// cache check to read, which would call every pass a repair, so its rule is the rest of it:
-    /// once per version and set of files not as written.
+    /// once per version, while no apply of this build recorded what it reads.
     fn repair_due(&mut self, paths: &Paths, state: &State) -> bool {
         if state.digest.is_some() {
             return repair_due(paths, &mut self.repaired);
@@ -2327,14 +2320,9 @@ impl NodePass {
             return false;
         }
         let version = (source, state.seq);
-        let changed = unsettled(paths, state);
-        let due = (!changed.is_empty() || state.own.is_none())
-            && self
-                .repaired
-                .as_ref()
-                .is_none_or(|(last, files)| *last != version || *files != changed);
+        let due = state.held.is_none() && self.repaired != Some(version);
         if due {
-            self.repaired = Some((version, changed));
+            self.repaired = Some(version);
         }
         due
     }

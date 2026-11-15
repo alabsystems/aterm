@@ -74,6 +74,7 @@ fn lab() -> Lab {
     Lab {
         me: Some(test_machine("m3")),
         settled: true,
+        bound: Default::default(),
         accounts: vec![ann, bob, cy, dee],
         aliases: BTreeMap::new(),
         mailboxes: BTreeMap::new(),

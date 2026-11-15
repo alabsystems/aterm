@@ -2,11 +2,13 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The grants (design §6.9): `<state>/agh/grants/<nonce>.json`, 0600, written by the agh
+//! The grants (design §6.9): `<state>/agh/grants-v2/<nonce>.json`, 0600, written by the agh
 //! process that spawns a git child for a release-tier repository, read by the helper,
-//! removed when the child exits.
+//! removed when the child exits. The folder is the version-2 record's own
+//! (`Dirs::grants`): an agh that knows only version 1 sweeps `<state>/agh/grants` and removes
+//! what it cannot read there, so a version-2 grant is never written to it.
 //!
-//! A grant's file name is its nonce, so a process of the same user that lists `grants/`
+//! A grant's file name is its nonce, so a process of the same user that lists `grants-v2/`
 //! learns the live nonces. A hidden name would close nothing: the nonce is also in the git
 //! child's environment (`AGH_GIT_GRANT`), which a process of the same user can read, and the
 //! token files are that user's to read anyway. What bounds a grant is the helper's check,
@@ -41,7 +43,7 @@ const GRANT_SUFFIX: &str = ".json";
 const TMP_SUFFIX: &str = ".tmp";
 
 /// One grant file's contents:
-/// `{"expires_at":N,"pid":N,"profile":"…","slug":"…","start":N,"v":1}`.
+/// `{"expires_at":N,"pid":N,"profile":"…","slug":"…","start":N,"credential_binding":"…","v":2}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Grant {
@@ -52,6 +54,8 @@ pub struct Grant {
     /// The profile it lets the helper answer: a release-tier owner's writer for a release-tier
     /// run, or the owner's writer for a `PushDelete`.
     pub profile: String,
+    /// Full domain-separated commitment to the operation's exact credential bytes.
+    pub(crate) credential_binding: [u8; 32],
     /// The spawner's pid (`std::process::id()`).
     pub pid: u32,
     /// The spawner's start: `boot.0` of `aterm_uds::process::read_process_start`, which takes
@@ -79,7 +83,8 @@ impl Grant {
             "profile": self.profile.as_str(),
             "slug": self.slug.to_string(),
             "start": self.start,
-            "v": 1,
+            "credential_binding": aterm_codec::hex::encode_lower(&self.credential_binding),
+            "v": 2,
         })
         .to_string()
     }
@@ -92,7 +97,15 @@ impl Grant {
         let aterm_json::Value::Object(mut map) = aterm_json::from_slice(bytes).ok()? else {
             return None;
         };
-        if map.get("v")?.as_u64()? != 1 {
+        if map.get("v")?.as_u64()? != 2 {
+            return None;
+        }
+        let binding = map.get("credential_binding")?.as_str()?;
+        if !aterm_codec::hex::is_lower(binding, 64) {
+            return None;
+        }
+        let mut credential_binding = [0; 32];
+        if !aterm_codec::hex::decode_into(binding.as_bytes(), &mut credential_binding) {
             return None;
         }
         let number =
@@ -108,6 +121,7 @@ impl Grant {
             nonce: nonce.to_string(),
             slug,
             profile,
+            credential_binding,
             pid,
             start,
             expires_at,
@@ -120,7 +134,7 @@ fn is_nonce(nonce: &str) -> bool {
     aterm_codec::hex::is_lower(nonce, 32)
 }
 
-/// What the helper reads grants through. The live view reads `<state>/agh/grants` and the
+/// What the helper reads grants through. The live view reads `<state>/agh/grants-v2` and the
 /// process table. A test's view is a map with no file and no process.
 pub trait GrantView {
     /// The grant `nonce` names, when it is live for `slug`: not expired at `now`, its
@@ -171,7 +185,7 @@ fn read_grant(dir: &std::path::Path, nonce: &str) -> Option<Grant> {
     None
 }
 
-/// The grant `nonce`'s file name in `grants/`: `{nonce}.json`.
+/// The grant `nonce`'s file name in `grants-v2/`: `{nonce}.json`.
 #[cfg(any(unix, test, debug_assertions))]
 fn file_name(nonce: &str) -> String {
     format!("{nonce}{GRANT_SUFFIX}")
@@ -270,6 +284,7 @@ pub(crate) fn write(
     dirs: &Dirs,
     slug: &Slug,
     profile: &str,
+    credential_binding: [u8; 32],
     now: u64,
     ttl: std::time::Duration,
 ) -> Result<Grant> {
@@ -286,6 +301,7 @@ pub(crate) fn write(
         nonce,
         slug: slug.clone(),
         profile: profile.to_string(),
+        credential_binding,
         pid,
         start,
         expires_at: now.saturating_add(ttl.min(super::GRANT_MAX).as_secs()),
@@ -326,14 +342,14 @@ pub(crate) fn remove(dirs: &Dirs, grant: &Grant) {
     let _ = aterm_uds::private_file::remove_private(&dirs.grants(), &file_name(&grant.nonce));
 }
 
-/// Remove every grant file whose `expires_at` has passed: the spawner killed before it
-/// removed its own (the model's `Expire`). Each `GitRun` calls it before writing its grant.
+/// Remove canonical grant or staging files only after their understood lifetime envelope
+/// establishes expiry. Version 1 and 2 both declare `expires_at`; recognizing that deadline
+/// grants no credential authority. Equality is live. Unsupported versions and payloads without
+/// an understood unsigned deadline are preserved.
 ///
-/// It reads at most 256 files, each through `read_private`. A file that does not parse is
-/// removed too. A file `read_private` refuses (a symlink, a second link, another owner, a
-/// loose mode, over 4 KiB) is left alone: it is not one agh wrote, and nothing trusts it.
-/// A staging file `.{nonce}.tmp` whose mtime is more than `GRANT_MAX` before `now` is removed:
-/// its writer was killed before it published the grant, which no helper ever found.
+/// Each run reads at most 256 entries through the private reader, at most 4 KiB apiece.
+/// Refused files and incomplete staging payloads are left alone; file age alone cannot
+/// establish expiry or prove that a publisher stopped writing.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -354,46 +370,39 @@ pub(crate) fn sweep(dirs: &Dirs, now: u64) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if is_stale_staging(&entry, name, now) {
-            let _ = aterm_uds::private_file::remove_private(&dir, name);
+        let nonce = name.strip_suffix(GRANT_SUFFIX).or_else(|| {
+            name.strip_prefix('.')
+                .and_then(|rest| rest.strip_suffix(TMP_SUFFIX))
+        });
+        if !nonce.is_some_and(is_nonce) {
             continue;
         }
-        let Some(nonce) = name.strip_suffix(GRANT_SUFFIX) else {
-            continue;
-        };
         let Some(Ok(bytes)) = judged
             .as_ref()
             .map(|judged| judged.read(name, GRANT_FILE_MAX))
         else {
             continue;
         };
-        let stale = Grant::from_json(nonce, &bytes).is_none_or(|grant| grant.expires_at < now);
-        if stale {
+        if expired_lifetime_envelope(&bytes, now) {
             let _ = aterm_uds::private_file::remove_private(&dir, name);
         }
     }
 }
 
-/// Whether `name` is a grant's staging file (`.{nonce}.tmp`, a plain file) whose mtime is more
-/// than `GRANT_MAX` before `now`. A staging file being written now is younger, and is kept.
+/// Retirement uses only the understood lifetime, independently of authorization parsing.
+/// Unsupported versions or unestablished deadlines never authorize removal.
 #[cfg(unix)]
-fn is_stale_staging(entry: &std::fs::DirEntry, name: &str, now: u64) -> bool {
-    let staged = name
-        .strip_prefix('.')
-        .and_then(|rest| rest.strip_suffix(TMP_SUFFIX))
-        .is_some_and(is_nonce);
-    if !staged || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-        return false;
-    }
-    let Ok(meta) = entry.metadata() else {
+fn expired_lifetime_envelope(bytes: &[u8], now: u64) -> bool {
+    let Ok(aterm_json::Value::Object(envelope)) = aterm_json::from_slice(bytes) else {
         return false;
     };
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|at| at.as_secs());
-    meta.is_file() && modified.is_some_and(|at| at.saturating_add(super::GRANT_MAX.as_secs()) < now)
+    matches!(
+        envelope.get("v").and_then(aterm_json::Value::as_u64),
+        Some(1 | 2)
+    ) && envelope
+        .get("expires_at")
+        .and_then(aterm_json::Value::as_u64)
+        .is_some_and(|expiry| expiry < now)
 }
 
 /// The model's `grant` for the grant `nonce` names, read from `dirs.grants()` at `now`: 0 when
@@ -565,6 +574,38 @@ pub fn project_grant_file(dirs: &Dirs, nonce: &str, now: u64) -> i64 {
         machine = "AghGitGrant",
         action = "BuggyReleaseForDev",
         reason = "Buggy=1 negative control only; the helper has no such branch: ReleaseStaysHome is held by Answer"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AghGitGrant",
+        action = "ToggleSupplied",
+        reason = "Bounded environment selection: whether an operation nonce was supplied"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AghGitGrant",
+        action = "ToggleBinding",
+        reason = "Bounded environment selection: credential rotation before final output admission"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AghGitGrant",
+        action = "BuggySuppliedFallback",
+        reason = "Buggy=1 negative control only: an invalid supplied operation grant never falls back to reads"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AghGitGrant",
+        action = "BuggyMismatchedCredential",
+        reason = "Buggy=1 negative control only: Answer compares the full commitment of the credential retained for output"
     )
 )]
 #[doc(hidden)]

@@ -403,7 +403,7 @@ fn every_host_answer_reads_back_as_written() {
     for no in ResetNo::ALL {
         same(ResetWord::No(no));
     }
-    for kind in aterm_phase::ResetKind::ALL {
+    for kind in alab_policy::vocab::ResetKind::ALL {
         same(ResetWord::Take(ResetGo {
             until: 1_789_840_800,
             long: true,
@@ -416,19 +416,19 @@ fn every_host_answer_reads_back_as_written() {
     for outcome in [
         ResetOutcome::Pending,
         ResetOutcome::Spent {
-            kind: aterm_phase::ResetKind::Weekly,
+            kind: alab_policy::vocab::ResetKind::Weekly,
             asks: true,
             left: Some(1),
             cleared_at: 1_789_660_500,
         },
         ResetOutcome::Spent {
-            kind: aterm_phase::ResetKind::Full,
+            kind: alab_policy::vocab::ResetKind::Full,
             asks: false,
             left: None,
             cleared_at: 0,
         },
         ResetOutcome::Walled {
-            kind: aterm_phase::ResetKind::Fable,
+            kind: alab_policy::vocab::ResetKind::Fable,
             left: 0,
         },
         ResetOutcome::Lifted {
@@ -1109,6 +1109,53 @@ fn a_left_read_round_trips_its_tape() {
     );
 }
 
+/// THE GOAL DOOR'S ANSWER ON A TAPE: every answer reads back as itself, a lost goal's line or the
+/// reason it has none among them; an answer no build wrote (one naming both a line and a reason,
+/// or neither) does not read back, and a door newer than the tape reads no goal.
+#[test]
+fn a_goal_read_round_trips_its_tape() {
+    use crate::harness::goal::{GoalRead, Lost, Untypable};
+    let lost = |line| {
+        GoalRead::Lost(Lost {
+            condition: "the registry just works".to_string(),
+            line,
+            label: "authentication failed".to_string(),
+            clear: "00000000-0000-4000-8000-000000000001".to_string(),
+            served: true,
+        })
+    };
+    let reads = [
+        GoalRead::Unread,
+        GoalRead::Off,
+        GoalRead::Active("the registry just works".to_string()),
+        lost(Ok("the registry just works".to_string())),
+    ]
+    .into_iter()
+    .chain(Untypable::ALL.into_iter().map(|u| lost(Err(u))));
+    for read in reads {
+        assert_eq!(
+            <GoalRead as TapeValue>::from_tape(&read.to_tape()).ok(),
+            Some(read.clone()),
+            "{read:?}"
+        );
+    }
+    assert!(<GoalRead as TapeValue>::from_tape(br#"{"lost":{"condition":"c"}}"#).is_err());
+    for (line, untypable) in [
+        (r#""c""#, r#""breaks""#),
+        ("null", "null"),
+        ("null", r#""cut""#),
+    ] {
+        let wire = format!(
+            r#"{{"lost":{{"condition":"c","line":{line},"untypable":{untypable},"label":"l","clear":"c1","served":true}}}}"#
+        );
+        assert!(
+            <GoalRead as TapeValue>::from_tape(wire.as_bytes()).is_err(),
+            "{wire}"
+        );
+    }
+    assert_eq!(<GoalRead as TapeValue>::absent(), Some(GoalRead::Unread));
+}
+
 /// A HOLD NO ROW HELD IS TAPED AS BEFORE THE LEFT LEG: its request names no left count, so a tape
 /// recorded before compares as it was; one rows held names them.
 #[test]
@@ -1660,7 +1707,7 @@ fn the_doors_tell_is_taped() {
         guards: Some(crate::supervise::occupancy::rules::Guards {
             person: true,
             ..crate::supervise::occupancy::rules::Guards::clear(
-                crate::supervise::config::Autopilot::Cruise,
+                alab_policy::config::Autopilot::Cruise,
             )
         }),
         rules: vec![
@@ -2092,13 +2139,14 @@ fn agent_resumed_door_round_trips_and_answers_none_on_older_tapes() {
     use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
 
     for value in [
-        None,
-        Some(AgentResumed {
+        HostAgent::Absent,
+        HostAgent::Unread,
+        HostAgent::Read(AgentResumed {
             pid: 4242,
             started: Some(1_793_000_010),
             resumed: true,
         }),
-        Some(AgentResumed {
+        HostAgent::Read(AgentResumed {
             pid: 99,
             started: None,
             resumed: false,
@@ -2106,9 +2154,24 @@ fn agent_resumed_door_round_trips_and_answers_none_on_older_tapes() {
     ] {
         same(value);
     }
+    // A tape recorded before the unread answer holds an agent or `null`: read as before.
+    assert_eq!(
+        HostAgent::from_tape(b"null").expect("legacy null"),
+        HostAgent::Absent
+    );
+    assert_eq!(
+        HostAgent::from_tape(br#"{"pid":7,"started":null,"resumed":true}"#).expect("legacy agent"),
+        HostAgent::Read(AgentResumed {
+            pid: 7,
+            started: None,
+            resumed: true,
+        })
+    );
+    // NEGATIVE CONTROL: another word is no answer the door writes.
+    assert!(HostAgent::from_tape(br#""stale""#).is_err());
 
     #[derive(Debug)]
-    struct ResumedStub(Mutex<Option<AgentResumed>>);
+    struct ResumedStub(Mutex<HostAgent>);
     impl IdleHost for ResumedStub {
         fn wants(&self) -> bool {
             false
@@ -2119,12 +2182,12 @@ fn agent_resumed_door_round_trips_and_answers_none_on_older_tapes() {
         fn owns_turn_end(&self) -> bool {
             false
         }
-        fn agent_resumed(&self) -> Option<AgentResumed> {
+        fn agent_resumed(&self) -> HostAgent {
             *self.0.lock().expect("stub")
         }
     }
 
-    let stub = Arc::new(ResumedStub(Mutex::new(Some(AgentResumed {
+    let stub = Arc::new(ResumedStub(Mutex::new(HostAgent::Read(AgentResumed {
         pid: 4242,
         started: Some(1_793_000_010),
         resumed: true,
@@ -2132,8 +2195,10 @@ fn agent_resumed_door_round_trips_and_answers_none_on_older_tapes() {
     let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
     let rec = TapedHost::new(Arc::clone(&stub) as Arc<dyn IdleHost>, tape.fx.clone());
     let first = rec.agent_resumed();
-    *stub.0.lock().expect("stub") = None;
+    *stub.0.lock().expect("stub") = HostAgent::Unread;
     let second = rec.agent_resumed();
+    *stub.0.lock().expect("stub") = HostAgent::Absent;
+    let third = rec.agent_resumed();
     let read = tape.finish("done");
     let records: Vec<EffectRecord> = read
         .items
@@ -2145,15 +2210,16 @@ fn agent_resumed_door_round_trips_and_answers_none_on_older_tapes() {
     let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
     assert_eq!(replay.agent_resumed(), first);
     assert_eq!(replay.agent_resumed(), second);
+    assert_eq!(replay.agent_resumed(), third);
     assert_eq!(core.left(), 0);
     assert!(core.diverged().is_none());
 
-    // Older tape whose header lacked `host.agent_resumed` reads `None` without diverging.
+    // Older tape whose header lacked `host.agent_resumed` reads `Absent` without diverging.
     for doors in [vec!["host.wants".to_string()], Vec::new()] {
         let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
         core.recorded_doors(doors);
         let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
-        assert_eq!(replay.agent_resumed(), None);
+        assert_eq!(replay.agent_resumed(), HostAgent::Absent);
         assert!(core.diverged().is_none());
     }
 

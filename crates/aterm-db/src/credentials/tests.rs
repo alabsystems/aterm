@@ -635,7 +635,7 @@ fn one_live_request_per_want_and_the_requesters_own_records_only() {
     let mut feed = Feed::new();
     let first = feed.request(A, 1, "notary");
     let second = feed.request(A, 2, "mailbox:m29");
-    feed.request(A, 3, "paper-master");
+    feed.request(A, 3, "vault-identity");
     // B claims A's request id, read first (the lowest digest), with its own nonce and with
     // A's: neither derives that id from B, so neither is B's.
     let (_, mut claim) = request_body(&B, 7, "notary", "by-hand");
@@ -673,8 +673,8 @@ fn one_live_request_per_want_and_the_requesters_own_records_only() {
             .book(0)
             .threads
             .values()
-            .any(|t| t.want == Want::PaperMaster),
-        "the catalog never posts a paper master"
+            .any(|t| t.want == Want::VaultIdentity),
+        "the catalog never posts a Mac's own key"
     );
     let mut own = Feed::new();
     let id = own.request(A, 1, "notary");
@@ -1210,7 +1210,10 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     assert_eq!(first.sequence(), 0);
     assert!(!recipient.dir.join("vault").exists());
     assert_eq!(
-        std::fs::read(recipient.home.join(".secrets").join(&entry)).unwrap(),
+        client::read_in_place(recipient, &entry)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
         b"first-log-token"
     );
     let delivered = need::peek(recipient).unwrap().remove(0);
@@ -1245,7 +1248,10 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     assert_eq!(newer.sequence(), 0);
     assert!(!recipient.dir.join("vault").exists());
     assert_eq!(
-        std::fs::read(recipient.home.join(".secrets").join(&entry)).unwrap(),
+        client::read_in_place(recipient, &entry)
+            .unwrap()
+            .unwrap()
+            .as_slice(),
         b"newer-log-token"
     );
     let delivered = need::peek(recipient).unwrap().remove(0);
@@ -1332,7 +1338,10 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     );
     assert!(delivered.got && delivered.refused.is_some());
     assert_eq!(
-        std::fs::read(recipient.home.join(".secrets/gh_access_token")).unwrap(),
+        client::read_in_place(recipient, "gh_access_token")
+            .unwrap()
+            .unwrap()
+            .as_slice(),
         b"fixture-development-value"
     );
     // This is the abstract ledger consumer boundary, not a GitHub authentication claim.
@@ -1564,12 +1573,13 @@ fn roster_denied_binding_excluded_from_credential_copy_and_sweep_quorum() {
     assert!(reopened.doc.entry(&m3, "release-notary").is_none());
 }
 
-/// NEGATIVE CONTROL: symlinked or non-private (`0644`) holder files never post an unreadable
-/// offer, while a private (`0600`) mailbox password beside a blank `*_totp` file validates cleanly.
+/// A holder offers neither a file under `~/.secrets`, however private (an older build's copy),
+/// nor a value its own verified store holds, which is the vault's and which the custodian copies
+/// itself; and the holder sends neither from its source.
+/// NEGATIVE CONTROL: with the holder's probe reading its store in place, it holds the stored
+/// password: `assertion failed: !super::holds(&lab.paths[1], &want)`.
 #[test]
-fn unprivate_or_symlinked_holder_files_do_not_offer_and_blank_totp_is_ignored() {
-    use std::os::unix::fs::PermissionsExt as _;
-
+fn no_holder_offers_a_secrets_file_or_a_value_its_store_holds() {
     let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
     for paths in &lab.paths {
         need::test_alab_policy(paths);
@@ -1582,29 +1592,32 @@ fn unprivate_or_symlinked_holder_files_do_not_offer_and_blank_totp_is_ignored() 
 
     let secrets_dir = lab.paths[1].home.join(".secrets");
     aterm_secrets::fsx::ensure_private_dir(&secrets_dir).unwrap();
-    let pw_path = secrets_dir.join("m29_password");
-    let target_file = lab.paths[1].home.join("outside-secret");
-    aterm_secrets::fsx::write_atomic(&target_file, b"fixture-password\n", 0o600).unwrap();
-    std::os::unix::fs::symlink(&target_file, &pw_path).unwrap();
+    aterm_secrets::fsx::write_atomic(
+        &secrets_dir.join("m29_password"),
+        b"fixture-password\n",
+        0o600,
+    )
+    .unwrap();
+    let admin = client::admin_open(&lab.paths[0]).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Hosts(vec!["m2".into()]),
+        "m29_password",
+        b"fixture-password\n",
+    )
+    .unwrap();
+    client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
+    client::sync(&lab.paths[1], None).unwrap();
+    assert!(
+        client::read_in_place(&lab.paths[1], "m29_password")
+            .unwrap()
+            .is_some()
+    );
     assert!(!super::holds(&lab.paths[1], &want));
     assert_eq!(pass_at(&lab.paths[1], now).unwrap().offered, 0);
-
-    std::fs::remove_file(&pw_path).unwrap();
-    std::fs::write(&pw_path, b"fixture-password\n").unwrap();
-    std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(!super::holds(&lab.paths[1], &want));
-
-    std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let totp_path = secrets_dir.join("m29_totp");
-    aterm_secrets::fsx::write_atomic(&totp_path, b"   \n", 0o600).unwrap();
-    assert!(super::holds(&lab.paths[1], &want));
-
     let seen = pass_at(&lab.paths[2], now).unwrap();
     let thread = seen.threads.iter().find(|t| t.want == want).unwrap();
-    let values = super::source::read(&lab.paths[1], [9; 16], thread, now).unwrap();
-    assert_eq!(values.0.len(), 1);
-    assert_eq!(values.0[0].0, "m29_password");
-    assert_eq!(super::value::validate(&want, &values).unwrap(), None);
+    assert!(super::source::read(&lab.paths[1], [9; 16], thread, now).is_err());
 }
 
 /// A pass beside a window whose runtime keeps the control journal's writer (one repair
@@ -2054,11 +2067,11 @@ fn a_lapsed_request_is_raised_again_at_once_while_its_need_holds() {
 /// that read silence before an offer would call the offered request silent.
 #[test]
 fn a_request_no_custodian_answers_waits_on_the_custodian_after_the_silence() {
-    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
     for paths in &lab.paths {
         need::test_alab_policy(paths);
     }
-    let (custodian, requester) = (&lab.paths[0], &lab.paths[1]);
+    let (custodian, requester, holder) = (&lab.paths[0], &lab.paths[1], &lab.paths[2]);
     let mailbox = Want::parse("mailbox:m29").unwrap();
     need::raise(requester, mailbox.clone(), Purpose::HarnessSignIn).unwrap();
     need::raise(requester, Want::Notary, Purpose::ByHand).unwrap();
@@ -2078,11 +2091,14 @@ fn a_request_no_custodian_answers_waits_on_the_custodian_after_the_silence() {
     };
     quiet(before + window - MS);
     quiet(after + window);
-    let held = Want::SiteDeployerKey.hold_path(&custodian.home).unwrap();
-    std::fs::create_dir_all(held.parent().unwrap()).unwrap();
-    aterm_secrets::fsx::write_atomic(&held, b"key", 0o600).unwrap();
     repair_commons(&lab, 3);
-    assert_eq!(pass_at(custodian, before).unwrap().offered, 1);
+    let given = give_from(holder, "mailbox:m29", || {
+        Ok(aterm_secrets::SecretBytes::from(
+            b"fixture-password".as_slice(),
+        ))
+    })
+    .unwrap();
+    assert_eq!((given.retained, given.published), (1, 0));
     repair_commons(&lab, 3);
     pass_at(requester, after + silence).unwrap();
     let needs = need::list(requester).unwrap();
@@ -2093,7 +2109,7 @@ fn a_request_no_custodian_answers_waits_on_the_custodian_after_the_silence() {
             .cloned()
             .unwrap()
     };
-    for want in [&mailbox, &Want::Notary] {
+    for want in [&Want::SiteDeployerKey, &Want::Notary] {
         let silent = find(&needs, want);
         assert_eq!(
             (silent.state, silent.wait, silent.custodian_silent),
@@ -2108,7 +2124,7 @@ fn a_request_no_custodian_answers_waits_on_the_custodian_after_the_silence() {
             assert!(silent.line.contains(words), "{words}: {}", silent.line);
         }
     }
-    let offered = find(&needs, &Want::SiteDeployerKey);
+    let offered = find(&needs, &mailbox);
     assert_eq!(
         (offered.state, offered.custodian_silent),
         (State::Offered, false),
@@ -2158,4 +2174,202 @@ fn a_custodian_that_answers_in_the_window_is_never_called_silent() {
     let decided = &needs[0];
     assert_eq!(decided.state, State::Retired, "{}", decided.line);
     assert!(!decided.custodian_silent, "{}", decided.line);
+}
+
+/// A Claude Code token is asked of the lab and never given or copied. The request is posted. A
+/// `need give` that names it, by its want, by its request id or by a `claude-token:` word whose
+/// key does not parse, is refused with words that name the token's one producer before the
+/// person's input is opened, and retains nothing. No member's sweep covers it. Past the want
+/// window the custodian copies nothing and retires nothing `not-held` (its vault text never holds
+/// a token: the requester ends the request when the token reaches the vault's log), and past the
+/// silence the requester's need still waits on its own reading of the vault's log, its line naming
+/// that producer, not on holders or the custodian. NEGATIVE CONTROL: a mailbox the vault lacks,
+/// asked beside it, is swept by both other members, retires `not-held` in the same pass and is
+/// said silent of no custodian.
+#[test]
+fn a_claude_token_request_is_posted_and_never_given_or_copied() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let (custodian, holder, requester) = (&lab.paths[0], &lab.paths[1], &lab.paths[2]);
+    let token = Want::parse("claude-token:ac-00000000000000a1").unwrap();
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    need::raise(requester, token.clone(), Purpose::ByHand).unwrap();
+    need::raise(requester, mailbox.clone(), Purpose::ByHand).unwrap();
+    let now = aterm_time::unix_millis().unwrap();
+    assert_eq!(pass_at(requester, now).unwrap().posted, 2);
+    repair_commons(&lab, 3);
+    let swept = pass_at(holder, now).unwrap();
+    assert_eq!(
+        swept.swept, 1,
+        "the holder's sweep covers the mailbox alone"
+    );
+    let threads = swept.threads;
+    let id_of = |want: &Want| threads.iter().find(|t| t.want == *want).unwrap().id;
+    let (token_id, mailbox_id) = (id_of(&token), id_of(&mailbox));
+
+    for selector in [
+        token.key(),
+        hex::encode_lower(&token_id),
+        "claude-token:inert@example.invalid".to_owned(),
+    ] {
+        let refused = give_from(holder, &selector, || {
+            panic!("a token's give must not open the person's input")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refused.contains(need::catalog::CLAUDE_TOKEN_PRODUCER),
+            "{selector}: {refused}"
+        );
+    }
+    for paths in &lab.paths {
+        assert!(
+            std::fs::read_dir(&paths.dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("credential-give-")),
+            "no contribution is retained"
+        );
+    }
+
+    assert_eq!(
+        pass_at(custodian, now).unwrap().swept,
+        1,
+        "the custodian's sweep covers the mailbox alone"
+    );
+    repair_commons(&lab, 3);
+    let late = now + (need::WANT_WINDOW_SECS + 1) * MS;
+    let decided = custodian_pass_at(custodian, late).unwrap().unwrap();
+    assert!(decided.published.is_empty(), "{decided:?}");
+    assert_eq!(
+        decided.retired,
+        [(mailbox_id, Reason::NotHeld)],
+        "{decided:?}"
+    );
+    assert!(
+        decided
+            .waiting
+            .iter()
+            .any(|(id, why)| *id == token_id && why.contains(need::catalog::CLAUDE_TOKEN_PRODUCER)),
+        "{decided:?}"
+    );
+
+    repair_commons(&lab, 3);
+    let threads = pass_at(requester, now + need::SILENCE_SECS * MS + MS)
+        .unwrap()
+        .threads;
+    let swept_by = |id: [u8; 16]| &threads.iter().find(|t| t.id == id).unwrap().swept;
+    assert!(swept_by(token_id).is_empty(), "{:?}", swept_by(token_id));
+    assert_eq!(
+        swept_by(mailbox_id).len(),
+        2,
+        "CONTROL: both others swept the mailbox"
+    );
+    let needs = need::list(requester).unwrap();
+    let find = |want: &Want| needs.iter().find(|need| need.want == *want).unwrap();
+    let asked = find(&token);
+    assert_eq!(
+        (asked.state, asked.wait, asked.custodian_silent),
+        (State::Open, Wait::Requester, false),
+        "{}",
+        asked.line
+    );
+    assert!(
+        asked.line.contains(need::catalog::CLAUDE_TOKEN_PRODUCER),
+        "{}",
+        asked.line
+    );
+    assert_eq!(
+        find(&mailbox)
+            .retired
+            .as_ref()
+            .map(|retired| retired.reason),
+        Some(Reason::NotHeld)
+    );
+}
+
+/// A want with a producer takes no offer, and its requests count in a pool of their own. B's offer
+/// on A's Claude Code token request is inert, so no requester reads it as offered and no
+/// custodian's handoff takes it (both read only live offers); A's 16 live token requests leave
+/// its mailbox request live, and only a 17th token request is inert. NEGATIVE CONTROL: B's offer
+/// on A's mailbox request counts, and the mailbox, A's 17th live request, would be inert were the
+/// pools one.
+#[test]
+fn a_want_with_a_producer_takes_no_offer_and_counts_in_its_own_pool() {
+    let mut feed = Feed::new();
+    let token = |n: usize| format!("claude-token:ac-{n:016x}");
+    let tokens: Vec<[u8; 16]> = (0..need::MAX_OPEN)
+        .map(|n| feed.request(A, u8::try_from(n + 1).unwrap(), &token(n)))
+        .collect();
+    let mailbox = feed.request(A, 100, "mailbox:m29");
+    let past = feed.request(A, 101, &token(need::MAX_OPEN));
+    let offer = feed.put(B, Record::new("offer", &tokens[0], Map::new()));
+    feed.put(B, Record::new("offer", &mailbox, Map::new()));
+    let book = feed.book(0);
+    assert!(
+        tokens.iter().all(|id| book.threads.contains_key(id)),
+        "16 live token requests"
+    );
+    assert!(
+        book.threads.contains_key(&mailbox),
+        "the mailbox is live beside them"
+    );
+    assert!(
+        !book.threads.contains_key(&past),
+        "a 17th token request is inert"
+    );
+    assert!(book.threads[&tokens[0]].offers.is_empty());
+    assert!(
+        book.inert.iter().any(|(id, _)| *id == offer),
+        "{:?}",
+        book.inert
+    );
+    assert_eq!(
+        book.threads[&mailbox].offers,
+        [B],
+        "CONTROL: a mailbox's offer counts"
+    );
+}
+
+/// A requester's pass posts its token requests in a pool of their own: 16 waiting tokens leave
+/// room for a mailbox raised after them, and only a 17th token stays in the ledger, unposted.
+/// Nothing it posts is inert on the table. NEGATIVE CONTROL: with one pool, the mailbox would
+/// wait behind the tokens as the 17th mailbox does in
+/// `a_pass_posts_at_most_sixteen_and_keeps_the_rest_in_the_ledger`.
+#[test]
+fn a_pass_posts_waiting_tokens_in_their_own_pool() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let requester = &lab.paths[1];
+    for n in 0..=need::MAX_OPEN {
+        let want = Want::parse(&format!("claude-token:ac-{n:016x}")).unwrap();
+        need::raise(requester, want, Purpose::ByHand).unwrap();
+    }
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    need::raise(requester, mailbox.clone(), Purpose::HarnessSignIn).unwrap();
+    let now = 1_000_000_000;
+    let pass = pass_at(requester, now).unwrap();
+    assert_eq!(pass.posted, need::MAX_OPEN + 1);
+    let again = pass_at(requester, now).unwrap();
+    assert_eq!(again.posted, 0);
+    assert!(again.inert.is_empty(), "{:?}", again.inert);
+    let needs = need::list(requester).unwrap();
+    assert!(
+        needs
+            .iter()
+            .any(|need| need.want == mailbox && need.state == State::Open),
+        "the mailbox is posted beside 16 tokens"
+    );
+    let local: Vec<&need::Need> = needs.iter().filter(|n| n.state == State::Local).collect();
+    assert_eq!(
+        local.len(),
+        1,
+        "a 17th token waits in the ledger: {local:?}"
+    );
+    assert!(local[0].want.producer().is_some(), "{:?}", local[0].want);
 }

@@ -3,9 +3,9 @@
 
 //! Placement and publication of the read-only Allocation application.
 
+use crate::App;
 use crate::native_app::{AppKind, AppViewState, DamageRegion, NativeApp};
 use crate::tab_model::{TabId, View, ViewId};
-use crate::{App, WindowId};
 
 impl App {
     /// Whether an Allocation view is on screen ([`Self::view_on_screen`]).
@@ -91,8 +91,9 @@ impl App {
 
     pub(crate) fn stage_allocation_tab(
         &mut self,
-        wid: WindowId,
+        target: impl Into<crate::app_tabs::NativeInstallTarget>,
     ) -> Result<(TabId, ViewId), crate::app_tabs::NativeTabInstallError> {
+        let target = target.into();
         let state = AppViewState::Allocation(Box::default());
         let presentation = crate::tab_model::TabPresentation {
             title: "Allocation".into(),
@@ -103,10 +104,10 @@ impl App {
             tooltip: Some("Read-only resource allocation observations".into()),
         };
         if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::Allocation) {
-            self.install_native_tab(wid, instance, state, presentation)
+            self.install_native_tab(target, instance, state, presentation)
         } else {
             self.install_new_native_tab(
-                wid,
+                target,
                 NativeApp::Allocation(Box::default()),
                 state,
                 presentation,

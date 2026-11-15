@@ -135,7 +135,9 @@ fn sorted(mut rows: Vec<&JobRow>) -> Vec<&JobRow> {
 /// Why a snapshot carries no jobs view.
 #[must_use]
 pub fn missing_why(s: &Snapshot) -> &'static str {
-    if s.procs_window_ns.is_none() {
+    if crate::lanes::stalls(&s.stalled, "jobs").is_some() {
+        "stalled"
+    } else if s.procs_window_ns.is_none() {
         "warming"
     } else {
         "not_sampled"
@@ -526,6 +528,9 @@ pub fn row_json(r: &JobRow, tab_number: Option<usize>) -> Jv {
         o.set("mu_from", Jv::s(from.word()));
     }
     o.set("verdict", Jv::s(r.verdict.word()));
+    if let Some(limits) = r.progress_limits() {
+        o.set("progress_limits", Jv::s(limits));
+    }
     o.set("no_progress", Jv::Bool(r.no_progress));
     if let Some((pid, start)) = r.working_descendant {
         o.set("working_descendant", Jv::u(u64::from(pid)));

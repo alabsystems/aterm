@@ -92,9 +92,11 @@ fn run_paced(
             let outcome = match answers[&address] {
                 Answer::After(within) => {
                     run.contact.get_or_insert(started + within - start);
-                    // Each run has one peer that answers.
+                    // Each run has one peer that answers, in its first sweep: the scan has
+                    // tables still to take with it, so its rounds follow at the ordinary
+                    // interval rather than rest until an audit.
                     (
-                        Repair::heard_from([1; 48]),
+                        Repair::heard_from([1; 48]).applied(crate::replica::Report::default()),
                         Outcome::Repaired { transferred: false },
                     )
                 }

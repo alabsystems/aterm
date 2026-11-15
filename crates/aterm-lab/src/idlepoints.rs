@@ -6,8 +6,8 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use alab_policy::vocab::Phase;
 use aterm_agent::supervise::tape::show;
-use aterm_phase::phase::Phase;
 use aterm_phase::reader::{Program, ScreenReader};
 
 use crate::halfdraw;
@@ -802,7 +802,8 @@ fn gate_dir(dir: &Path) -> Result<(String, usize), Fail> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("s-") && n.ends_with(".journal.jsonl"))
+                .and_then(|n| n.strip_suffix(".journal.jsonl"))
+                .is_some_and(aterm_types::tab_id::is_tab_id)
         })
         .collect();
     rd.sort();

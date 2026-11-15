@@ -83,6 +83,7 @@ const SCALARS: &[&str] = &[
     "true",
     "false",
     "\"basic\"",
+    "\"\\e\\xE9\"",
     "\"esc \\t \\n \\u00E9 \\\" \\\\\"",
     "'literal \\n not an escape'",
     "\"\"\"multi\nline\"\"\"",
@@ -93,6 +94,8 @@ const SCALARS: &[&str] = &[
     "1979-05-27T07:32:00.999999",
     "1979-05-27",
     "07:32:00",
+    "07:32",
+    "{\n # inline\n value = 1,\n}",
     "00:32:00.999999",
     "[]",
     "[1, 2, 3]",
@@ -318,7 +321,7 @@ fn punctuation_noise_never_panics() {
 
 #[test]
 fn a_multi_byte_character_inside_a_unicode_escape_is_an_error_not_an_abort() {
-    for (marker, digits) in [('u', 4usize), ('U', 8usize)] {
+    for (marker, digits) in [('x', 2usize), ('u', 4usize), ('U', 8usize)] {
         for lead in 0..digits {
             for intruder in ['\u{e9}', '\u{20ac}', '\u{1f600}'] {
                 let mut escape = String::from("\\");

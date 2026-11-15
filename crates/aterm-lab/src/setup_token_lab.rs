@@ -16,8 +16,10 @@
 //!   terminal (`aterm_agent::harness::setup_token::capture`) inside the lab's jail, which allows
 //!   only loopback, its `open` the lab's recorder (which logs the URL's shape and opens nothing)
 //!   and its `security` the keychain tripwire. It must reach an authorize URL the capture admits
-//!   and the paste prompt; the lane's person then stops it at the prompt (no code is entered) and
-//!   records what the child wrote by then in its scratch folder and secure storage.
+//!   and the paste prompt, with its page opened through the window route's `BROWSER` (the
+//!   recorder in place of aterm's opener); the lane's sign-in then stops it at the prompt (no code
+//!   is entered) and records what the child wrote by then in its scratch folder and secure
+//!   storage.
 //! - **B, the stand-in end to end.** `aterm harness accounts token lab-t` runs in a tab of the lab,
 //!   its setup-token the stand-in ([`crate::local_signins::setup_token_main`]) showing 2.1.318's
 //!   frames with the sentinel; then `token-run lab-t` serves the stored token to the stand-in,
@@ -55,7 +57,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use aterm_agent::harness::accounts_tokens::Windows;
-use aterm_agent::harness::setup_token::{self, Capture, Person, Program};
+use aterm_agent::harness::setup_token::{self, Capture, OpenerPage, OpenerRoute, Program, SignIn};
 use aterm_agent::harness::wake_deadline::WakeDeadline;
 
 use crate::codex_proof::Verdict;
@@ -868,32 +870,30 @@ impl Record {
 // ---------------------------------------------------------------------------------------------
 // Lane A: the real build's frames.
 
-/// Lane A's person: it reads what the capture says, and at the paste prompt lists the child's
-/// scratch folder and stops the capture (Ctrl-C), entering no code.
+/// Lane A's sign-in: it reads what the capture says, and at the paste prompt, where the capture
+/// waits for the window's code, lists the child's scratch folder and stops the capture (Ctrl-C),
+/// handing over no code.
 struct StopAtPrompt {
     store: PathBuf,
     said: Mutex<Vec<String>>,
     asked: AtomicBool,
-    prompt_ok: AtomicBool,
+    stop: AtomicBool,
     listing: Mutex<Vec<String>>,
     at: Mutex<Option<Duration>>,
     started: Instant,
 }
 
-impl Person for StopAtPrompt {
+impl SignIn for StopAtPrompt {
     fn say(&self, line: &str) {
         if let Ok(mut said) = self.said.lock() {
             said.push(line.to_string());
         }
     }
 
-    fn paste(
+    fn code(
         &self,
-        prompt: &str,
         _cancelled: &AtomicBool,
     ) -> std::io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
-        self.prompt_ok
-            .store(prompt == setup_token::PASTE_PROMPT, Ordering::SeqCst);
         if let Ok(mut at) = self.at.lock() {
             *at = Some(self.started.elapsed());
         }
@@ -901,11 +901,16 @@ impl Person for StopAtPrompt {
             *listing = scratch_listing(&self.store);
         }
         self.asked.store(true, Ordering::SeqCst);
-        Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        self.stop.store(true, Ordering::SeqCst);
+        Ok(None)
     }
 
     fn stopped(&self) -> bool {
-        false
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn failed(&self) -> Option<aterm_agent::harness::open_url::MetWord> {
+        None
     }
 }
 
@@ -1103,24 +1108,23 @@ pub fn escape_kinds(raw: &[u8]) -> String {
         .join(", ")
 }
 
-/// Lane A's verdict: the capture ended `Stopped` at the paste prompt, having told the person the
-/// sign-in opened on a host it admits; anything else, with why.
+/// Lane A's verdict: the capture ended `Stopped` at the paste prompt, waiting for the window's
+/// code, having said the sign-in window opened on a host it admits; anything else, with why.
 #[must_use]
 pub fn judge_frames(
     result: &Result<setup_token::Minted, setup_token::Error>,
     asked: bool,
-    prompt_ok: bool,
     said: &[String],
 ) -> (Verdict, String) {
     let told = said
         .iter()
-        .find(|l| l.starts_with("a browser window opened on "));
+        .find(|l| l.starts_with("aterm's sign-in window opened on "));
     match result {
         Ok(_) => (
             Verdict::Fail,
             "a token was taken though no code was entered".to_string(),
         ),
-        Err(setup_token::Error::Stopped) if asked && prompt_ok && told.is_some() => (
+        Err(setup_token::Error::Stopped) if asked && told.is_some() => (
             Verdict::Ok,
             format!(
                 "the URL was admitted ({}) and the paste prompt read; stopped there",
@@ -1130,10 +1134,7 @@ pub fn judge_frames(
         ),
         Err(setup_token::Error::Stopped) => (
             Verdict::Fail,
-            format!(
-                "stopped, but asked={asked} prompt={prompt_ok} told={}",
-                told.is_some()
-            ),
+            format!("stopped, but asked={asked} told={}", told.is_some()),
         ),
         Err(e) => (Verdict::Fail, format!("the capture ended: {e:?}")),
     }
@@ -1181,11 +1182,19 @@ fn lane_a(run: &Run, rec: &mut Record) -> Result<(), Fail> {
     .into_iter()
     .map(|(k, v)| (k.into(), v.into()))
     .collect();
+    // The window route as the verb hands it, with the lab's recorder as its opener: it logs the
+    // URL's shape and opens nothing.
+    let route = OpenerRoute {
+        opener: run.run.join("shim/open"),
+        page: OpenerPage::Window,
+        outcome: run.w.join("setup-token-a-outcome"),
+        code: run.w.join("setup-token-a-outcome.code"),
+    };
     let person = StopAtPrompt {
         store: store.clone(),
         said: Mutex::new(Vec::new()),
         asked: AtomicBool::new(false),
-        prompt_ok: AtomicBool::new(false),
+        stop: AtomicBool::new(false),
         listing: Mutex::new(Vec::new()),
         at: Mutex::new(None),
         started: Instant::now(),
@@ -1197,17 +1206,12 @@ fn lane_a(run: &Run, rec: &mut Record) -> Result<(), Fail> {
             sign_in_as: EMAIL,
             env: &env,
             deadline: WakeDeadline::after(HANG),
-            window: None,
+            opener: &route,
         },
         &person,
     );
     let said = person.said.lock().map(|s| s.clone()).unwrap_or_default();
-    let (v, why) = judge_frames(
-        &result,
-        person.asked.load(Ordering::SeqCst),
-        person.prompt_ok.load(Ordering::SeqCst),
-        &said,
-    );
+    let (v, why) = judge_frames(&result, person.asked.load(Ordering::SeqCst), &said);
     rec.saw(format!(
         "A: Claude Code {} ({})",
         run.claude_ver, run.claude_bin
@@ -1658,6 +1662,7 @@ fn ensure_token(world: &World, rec: &mut Record) -> Result<(), Fail> {
             .flatten()
             .unwrap_or_else(|| "lab-mac".to_string()),
         cli: "2.1.318".to_string(),
+        minted_by: None,
         verified: None,
     };
     let written = claude_token::write(
@@ -1750,7 +1755,7 @@ fn claude_pid(run: &Run, bin: &str, seen: &[i32]) -> Option<i32> {
             !seen.contains(pid)
                 && u32::try_from(*pid)
                     .ok()
-                    .and_then(aterm_uds::procargs::read)
+                    .and_then(|pid| aterm_uds::procargs::read(pid).ok())
                     .is_some_and(|buf| {
                         aterm_uds::procargs::parse(&buf)
                             .is_some_and(|p| p.exec_path == bin.as_bytes())
@@ -1762,7 +1767,7 @@ fn claude_pid(run: &Run, bin: &str, seen: &[i32]) -> Option<i32> {
 fn exec_env(pid: i32) -> Vec<String> {
     u32::try_from(pid)
         .ok()
-        .and_then(aterm_uds::procargs::read)
+        .and_then(|pid| aterm_uds::procargs::read(pid).ok())
         .map(|buf| {
             aterm_uds::procargs::parse(&buf)
                 .map(|p| {

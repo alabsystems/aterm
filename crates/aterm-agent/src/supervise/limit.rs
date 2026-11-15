@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use alab_policy::vocab::ResetClock;
+
 /// Parsed reset specification from a usage-limit notice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResetSpec {
@@ -113,50 +115,16 @@ pub fn parse_reset(text: &str) -> Option<ResetSpec> {
     })
 }
 
-/// Wall-clock `(date, hour, minute)` identity of a limit reset notice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResetClock {
-    date: Option<(u32, u32)>,
-    hour: u32,
-    minute: u32,
-}
-
-impl ResetClock {
-    /// Extract a [`ResetClock`] from optional notice text `reset`.
-    #[must_use]
-    pub fn of(reset: Option<&str>) -> Option<Self> {
-        match parse_reset(reset?)? {
-            ResetSpec::At {
-                date, hour, minute, ..
-            } => Some(Self { date, hour, minute }),
-            ResetSpec::In(_) => None,
-        }
-    }
-
-    /// Render the reset clock in human-readable form without its timezone suffix.
-    #[must_use]
-    pub fn words(&self) -> String {
-        const MONTHS: [&str; 12] = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
-        let meridian = if self.hour < 12 { "am" } else { "pm" };
-        let hour = match self.hour % 12 {
-            0 => 12,
-            h => h,
-        };
-        let clock = if self.minute == 0 {
-            format!("{hour}{meridian}")
-        } else {
-            format!("{hour}:{:02}{meridian}", self.minute)
-        };
-        let month = self
-            .date
-            .and_then(|(m, _)| usize::try_from(m).ok()?.checked_sub(1))
-            .and_then(|m| MONTHS.get(m));
-        match (self.date, month) {
-            (Some((_, day)), Some(month)) => format!("on {month} {day} at {clock}"),
-            _ => format!("at {clock}"),
-        }
+/// The clock a limit's notice names its reset at, `reset` its words (`Sep 19 at 11am
+/// (America/Los_Angeles)`): `None` for no words, words [`parse_reset`] cannot read, or a
+/// reset named as a span (`in 3h`).
+#[must_use]
+pub fn reset_clock(reset: Option<&str>) -> Option<ResetClock> {
+    match parse_reset(reset?)? {
+        ResetSpec::At {
+            date, hour, minute, ..
+        } => Some(ResetClock::new(date, hour, minute)),
+        ResetSpec::In(_) => None,
     }
 }
 

@@ -99,11 +99,21 @@ fn this_process_reads_back_as_it_was_exec_d() {
     let read: Vec<Vec<u8>> = p.argv.iter().map(|w| w.to_vec()).collect();
     assert!(p.whole());
     assert_eq!(read, mine);
-    assert_eq!(super::read(0), None, "pid 0");
-    assert_eq!(super::read(99_999_998), None, "no such pid");
+    assert_eq!(
+        super::read(0).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        super::read(u32::MAX).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert!(matches!(
+        super::read(99_999_998).unwrap_err().raw_os_error(),
+        Some(libc::ESRCH | libc::EINVAL)
+    ));
 }
 
-/// `KERN_PROCARGS2` past `kern.argmax` returns `EINVAL` or a tail slice; `read` returns `None`.
+/// `KERN_PROCARGS2` past `kern.argmax` returns `EINVAL` or a tail slice; `read` refuses both.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_record_past_what_the_kernel_hands_over_reads_as_nothing() {
@@ -178,10 +188,8 @@ fn a_record_past_what_the_kernel_hands_over_reads_as_nothing() {
         "the record ({whole} bytes) must be past what the kernel hands over ({argmax} + 4)"
     );
     let got = read(std::process::id());
-    assert_eq!(
-        got.as_deref()
-            .map(|b| parse(b).map(|p| String::from_utf8_lossy(p.exec_path).into_owned())),
-        None,
+    assert!(
+        got.is_err(),
         "{} bytes read of a {whole}-byte record",
         got.as_ref().map_or(0, Vec::len)
     );
@@ -200,17 +208,20 @@ fn a_reused_buffer_reads_a_record_whole_or_not_at_all() {
     let len = read_into(std::process::id(), &mut roomy).expect("it fits");
     assert_eq!(&roomy[..len], whole.as_slice());
     let mut short = vec![0u8; whole.len() / 2];
-    assert_eq!(
-        read_into(std::process::id(), &mut short),
-        None,
+    assert!(
+        read_into(std::process::id(), &mut short).is_err(),
         "a {}-byte record in a {}-byte buffer",
         whole.len(),
         short.len()
     );
     assert_eq!(
-        read_into(std::process::id(), &mut []),
-        None,
+        read_into(std::process::id(), &mut []).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput,
         "no room at all"
     );
-    assert_eq!(read_into(0, &mut roomy), None, "pid 0");
+    assert_eq!(
+        read_into(0, &mut roomy).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput,
+        "pid 0"
+    );
 }

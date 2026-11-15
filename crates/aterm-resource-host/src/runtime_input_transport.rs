@@ -47,7 +47,9 @@ pub(crate) fn support_with(
         return Err(refused());
     }
     let reply = match observe(peer, query.query.clone()) {
-        Ok(context) => wire::SupportReply::Supported { context },
+        Ok(context) => wire::SupportReply::Supported {
+            context: Box::new(context),
+        },
         Err(_) => wire::SupportReply::Refused {
             root_attempt: query.query.binding.root_attempt,
             call_attempt: query.query.call_attempt,

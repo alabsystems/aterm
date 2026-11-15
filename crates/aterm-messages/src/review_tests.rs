@@ -467,16 +467,16 @@ fn a_flood_keeps_every_bound() {
                             c.resolve(*id, Outcome::Ok, at);
                         }
                         1 => {
-                            c.dismiss(*id, at);
+                            c.dismiss(*id, stamp(t), at);
                         }
                         2 => {
-                            c.mark_seen(*id, at);
+                            c.mark_seen(*id, stamp(t), at);
                         }
                         3 => {
-                            c.act(*id, ActionIndex(rng.below(3) as u8), at);
+                            c.act(*id, ActionIndex(rng.below(3) as u8), stamp(t), at);
                         }
                         _ => {
-                            c.act(*id, ActionIndex::DETAILS, at);
+                            c.act(*id, ActionIndex::DETAILS, stamp(t), at);
                         }
                     }
                 }

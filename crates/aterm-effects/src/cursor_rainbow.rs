@@ -53,6 +53,11 @@ const HALO_LAYERS: i32 = 4;
 const HALO_RADIUS_IDLE: f32 = 0.06;
 const HALO_RADIUS_MAX: f32 = 0.22;
 const HALO_BASE_COV: f32 = 28.0;
+/// How long a halo ring keeps the reach it grew to while the caret stays in its cell
+/// ([`RingHold`]), seconds: twice this is the least time between a ring's edge leaving a pixel
+/// and coming back to it, so its shrink and regrowth at one cell lay at most four turns a second
+/// on the pixels its edge crosses.
+const RING_HOLD_S: f32 = 0.5;
 /// Minimum idle halo brightness factor before breath modulation.
 const HALO_IDLE_FLOOR: f32 = 0.30;
 /// Hue spread across the halo rings in turns.
@@ -156,6 +161,20 @@ struct RimMemoKey {
     rings: [(usize, u8, u32, u32); HALO_LAYERS as usize],
 }
 
+/// The reach each halo ring grew to at the caret's cell, and when it last grew: a ring's reach
+/// follows the paint, which a key lifts and the next frames let fall, and a reach truncated to
+/// whole pixels steps back a pixel a frame or two after a key and out again at the next. On a
+/// light page each such step is a turn on the ring's edge pixels beside the block, a pair at every
+/// key of a held Backspace there (Default Light's backspace film, the pixels one cell out from the
+/// caret). Held, a ring shrinks at most once each [`RING_HOLD_S`] while the caret stays put, and
+/// it moves with the caret, so it turns on the caret's own frames.
+#[derive(Clone, Copy)]
+struct RingHold {
+    cell: (u16, u16),
+    gxy: [(i32, i32); HALO_LAYERS as usize],
+    grew_at: [Instant; HALO_LAYERS as usize],
+}
+
 #[derive(Clone, Copy)]
 struct RimMemo {
     key: RimMemoKey,
@@ -236,11 +255,26 @@ pub struct RainbowFrame {
     pub fill: Option<u32>,
     /// Fingerprint of the emitted fill + halo (0 ⇒ nothing to show this frame).
     pub fp: u64,
+    /// The halo's innermost ring's (equalised, premultiplied, additive) colour where this tick
+    /// drew that ring inside the block, for the host's keyline over the caret's fill
+    /// ([`crate::cursor_fx::CursorFxFrame::keyline`]); `None` where it drew none there.
+    ///
+    /// Drawn one pixel out, as a pinned cursor colour keeps it, the ring hugs the block: the
+    /// opaque fill covers all but its outer pixel, a one-pixel outline round the caret that leaves
+    /// its old cell and lights its new one on every move, a flash turn pair on each of its pixels
+    /// on a light page's held Backspace. Where the fill is the rainbow's own, the ring lies inside
+    /// the block instead, under the fill, where it still feeds the bloom; the keyline draws its
+    /// edge over the fill, so it moves with the caret's own pixels.
+    pub inner_ring: Option<u32>,
 }
 
 impl RainbowFrame {
     /// Dormant frame output (`fill: None, fp: 0`).
-    pub const DORMANT: Self = Self { fill: None, fp: 0 };
+    pub const DORMANT: Self = Self {
+        fill: None,
+        fp: 0,
+        inner_ring: None,
+    };
 }
 
 impl Default for RainbowFrame {
@@ -281,6 +315,8 @@ pub struct CursorRainbow {
     rim_scratch: Vec<u32>,
     /// Memoised [`Self::equalise_rim_light`] and no-twinkle [`Self::rim_light_peak`].
     rim_memo: Option<RimMemo>,
+    /// The halo rings' reach at the caret's cell ([`RingHold`]).
+    ring_hold: Option<RingHold>,
     /// Latched inputs from the last real tick for the colour release dry run.
     settle_probe: Option<SettleProbe>,
     /// Memoised dry-run answer for the frame interval.
@@ -329,6 +365,7 @@ impl CursorRainbow {
             fp_prev: 0,
             rim_scratch: Vec::new(),
             rim_memo: None,
+            ring_hold: None,
             settle_probe: None,
             settle_memo: None,
             settle_sink: Vec::new(),
@@ -563,7 +600,7 @@ impl CursorRainbow {
             self.fp_last = 0;
             self.settle_probe = None;
             self.settle_memo = None;
-            return RainbowFrame { fill: None, fp: 0 };
+            return RainbowFrame::DORMANT;
         }
         let emitted_from = out.len();
         let was_active = self.energy > SETTLED_ENERGY;
@@ -741,6 +778,7 @@ impl CursorRainbow {
         let halo_energy = HALO_IDLE_FLOOR * (0.35 + PULSE_DEPTH * breath) + paint;
         let mut flare_pop = 1.0f32;
         let mut rim_key: Option<RimMemoKey> = None;
+        let mut inner_ring = None;
         if let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
@@ -777,8 +815,20 @@ impl CursorRainbow {
                 table, page_rgb.0, page_rgb.1, page_rgb.2,
             );
             let rings_from = out.len();
+            // The innermost ring lies inside the block where the caret wears the rainbow's own
+            // colour ([`RainbowFrame::inner_ring`]); a pinned cursor colour keeps it outside.
+            let inner_ring_inside = cfg.base.is_none() && !crate::cursor_fx::block_rim_outside();
             let mut rings = [(0usize, 0u8, 0u32, 0u32); HALO_LAYERS as usize];
             let mut gxy = [(0i32, 0i32); HALO_LAYERS as usize];
+            let held = match self.ring_hold {
+                Some(h) if h.cell == (cr, cc) && !halo_rings_unheld() => Some(h),
+                _ => None,
+            };
+            let mut hold = RingHold {
+                cell: (cr, cc),
+                gxy: [(0, 0); HALO_LAYERS as usize],
+                grew_at: [now; HALO_LAYERS as usize],
+            };
             let mut n_rings = 0usize;
             let prev_rings = match self.rim_memo {
                 Some(m) if m.key.page == page => Some((
@@ -796,8 +846,35 @@ impl CursorRainbow {
                 if cov == 0 {
                     break;
                 }
-                let gx = (t * radius_x) as i32 + 1;
-                let gy = (t * radius_y) as i32 + 1;
+                let (gx, gy) = if layer == 0 && inner_ring_inside {
+                    (0, 0)
+                } else {
+                    let reach = ((t * radius_x) as i32 + 1, (t * radius_y) as i32 + 1);
+                    let li = layer as usize;
+                    let (gxy_now, grew_at) = match held {
+                        Some(h) if reach.0 >= h.gxy[li].0 && reach.1 >= h.gxy[li].1 => (
+                            reach,
+                            if reach == h.gxy[li] {
+                                h.grew_at[li]
+                            } else {
+                                now
+                            },
+                        ),
+                        Some(h)
+                            if now.saturating_duration_since(h.grew_at[li]).as_secs_f32()
+                                < RING_HOLD_S =>
+                        {
+                            (
+                                (reach.0.max(h.gxy[li].0), reach.1.max(h.gxy[li].1)),
+                                h.grew_at[li],
+                            )
+                        }
+                        _ => (reach, now),
+                    };
+                    hold.gxy[li] = gxy_now;
+                    hold.grew_at[li] = grew_at;
+                    gxy_now
+                };
                 let ring_arc = if layer == 0 {
                     rainbow
                 } else {
@@ -845,6 +922,7 @@ impl CursorRainbow {
                 );
                 layer += 1;
             }
+            self.ring_hold = Some(hold);
             let key = RimMemoKey {
                 cur: (cr, cc),
                 cw: geom.cw,
@@ -874,6 +952,14 @@ impl CursorRainbow {
                     best,
                     peak_dark_no_twinkle,
                 });
+            }
+            let ring_end = if n_rings > 1 {
+                rings_from + rings[1].0
+            } else {
+                out.len()
+            };
+            if inner_ring_inside && n_rings > 0 && ring_end > rings_from {
+                inner_ring = Some(out[rings_from].color);
             }
         }
 
@@ -1018,6 +1104,7 @@ impl CursorRainbow {
         RainbowFrame {
             fill: Some(fill),
             fp,
+            inner_ring,
         }
     }
 
@@ -1740,3 +1827,36 @@ mod state_words;
 #[cfg(test)]
 #[path = "cursor_rainbow_tests.rs"]
 mod tests;
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static HALO_RINGS_UNHELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`with_halo_rings_unheld`] holds on this thread: always `false` in a release build.
+#[inline]
+fn halo_rings_unheld() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        HALO_RINGS_UNHELD.with(std::cell::Cell::get)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// A test's negative control: `f` run with each halo ring's reach following the paint frame by
+/// frame, as it did before [`RingHold`]. Debug and test builds only; the flag is this thread's
+/// and is put back as it was when `f` returns or panics.
+#[cfg(any(test, debug_assertions))]
+pub fn with_halo_rings_unheld<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            HALO_RINGS_UNHELD.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(HALO_RINGS_UNHELD.with(|c| c.replace(true)));
+    f()
+}

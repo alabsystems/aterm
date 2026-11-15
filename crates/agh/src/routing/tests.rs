@@ -35,9 +35,8 @@ impl Fixture {
         fake.add_token(&dev, "fixture-dev");
         fake.add_token(&release, "fixture-release-bot");
         aterm_uds::private_file::create_private_dir(&dirs.home).unwrap();
-        aterm_uds::private_file::create_private_dir(&dirs.home.join(".secrets")).unwrap();
-        setup_file(&Slot::Dev.path(&dirs.home), dev.as_bytes());
-        setup_file(&Slot::Release.path(&dirs.home), release.as_bytes());
+        vault::put_entry_for_tests(&dirs.home, Slot::Dev.entry(), Some(dev.as_bytes()));
+        vault::put_entry_for_tests(&dirs.home, Slot::Release.entry(), Some(release.as_bytes()));
         let env = Arc::new(MapEnv::new());
         let ports = fake.ports();
         let base = crate::GithubBuilder::new(Router::empty())
@@ -102,7 +101,7 @@ fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 fn recorded_view_routes_vault_identities_without_manufacturing_a_grant_or_writing() {
     let fixture = Fixture::new(true);
     let before = snapshot(&fixture.dirs.home);
-    let resolved = view_for_host(&fixture.dirs, fixture.base.env()).unwrap();
+    let resolved = view_for_host(&fixture.dirs).unwrap();
     let client = resolved.bind(&fixture.base).unwrap();
     assert_eq!(client.router().writer_of("fixture-dev"), Some("dev"));
     assert_eq!(client.router().writer_of("alabsystems"), Some("release"));
@@ -124,7 +123,7 @@ fn recorded_view_routes_vault_identities_without_manufacturing_a_grant_or_writin
 fn only_exact_file_grants_survive_composition_with_vault_routes() {
     let fixture = Fixture::new(true);
     write_config(&fixture.dirs, GRANT);
-    let resolved = view_for_host(&fixture.dirs, fixture.base.env()).unwrap();
+    let resolved = view_for_host(&fixture.dirs).unwrap();
     let client = resolved.bind(&fixture.base).unwrap();
     let target = crate::Slug::parse("alabsystems/aterm").unwrap();
     assert!(client.router().grant("atpkg-publish", &target).is_ok());
@@ -152,7 +151,7 @@ fn malformed_explicit_configuration_never_falls_back_to_healthy_vault_tokens() {
     let fixture = Fixture::new(true);
     write_config(&fixture.dirs, "[profiles.invalid\n");
     let before = snapshot(&fixture.dirs.home);
-    assert!(view_for_host(&fixture.dirs, fixture.base.env()).is_err());
+    assert!(view_for_host(&fixture.dirs).is_err());
     assert!(adopt_for_host(&fixture.base, &fixture.dirs).is_err());
     assert!(fixture.fake.seen().is_empty());
     assert_eq!(before, snapshot(&fixture.dirs.home));
@@ -163,7 +162,7 @@ fn malformed_explicit_configuration_never_falls_back_to_healthy_vault_tokens() {
     )
     .unwrap();
     let before = snapshot(&fixture.dirs.home);
-    assert!(view_for_host(&fixture.dirs, fixture.base.env()).is_err());
+    assert!(view_for_host(&fixture.dirs).is_err());
     assert!(adopt_for_host(&fixture.base, &fixture.dirs).is_err());
     assert!(fixture.fake.seen().is_empty());
     assert_eq!(before, snapshot(&fixture.dirs.home));
@@ -173,11 +172,15 @@ fn malformed_explicit_configuration_never_falls_back_to_healthy_vault_tokens() {
 fn unlearned_and_duplicate_tokens_do_not_gain_routes_in_a_view() {
     let fixture = Fixture::new(false);
     let before = snapshot(&fixture.dirs.home);
-    let resolved = view(&fixture.dirs, fixture.base.env()).unwrap();
+    let resolved = view(&fixture.dirs).unwrap();
     assert_eq!(resolved.router().unwrap().writer_of("fixture-dev"), None);
     assert_eq!(before, snapshot(&fixture.dirs.home));
-    std::fs::write(Slot::Release.path(&fixture.dirs.home), &fixture.dev).unwrap();
-    let resolved = view(&fixture.dirs, fixture.base.env()).unwrap();
+    vault::put_entry_for_tests(
+        &fixture.dirs.home,
+        Slot::Release.entry(),
+        Some(fixture.dev.as_bytes()),
+    );
+    let resolved = view(&fixture.dirs).unwrap();
     assert_eq!(resolved.router().unwrap().writer_of("alabsystems"), None);
     assert!(fixture.fake.seen().is_empty());
 }
@@ -193,7 +196,11 @@ fn live_adoption_is_counted_once_and_clients_keep_the_same_judged_tokens() {
     assert_eq!(first.meter().requests, 2);
     let replacement = agh_fake::token("replacement");
     fixture.fake.add_token(&replacement, "unexpected-login");
-    std::fs::write(Slot::Release.path(&fixture.dirs.home), &replacement).unwrap();
+    vault::put_entry_for_tests(
+        &fixture.dirs.home,
+        Slot::Release.entry(),
+        Some(replacement.as_bytes()),
+    );
     assert_eq!(
         first.users().me_once("release").unwrap().login,
         "fixture-release-bot"
@@ -223,7 +230,7 @@ fn live_adoption_is_counted_once_and_clients_keep_the_same_judged_tokens() {
 fn a_bound_vault_dev_identity_cannot_write_the_release_tier() {
     let fixture = Fixture::new(true);
     write_config(&fixture.dirs, GRANT);
-    let client = view_for_host(&fixture.dirs, fixture.base.env())
+    let client = view_for_host(&fixture.dirs)
         .unwrap()
         .bind(&fixture.base)
         .unwrap();
@@ -250,16 +257,13 @@ fn a_vault_join_preserves_only_the_host_admitted_explicit_legacy_profile() {
             path.display()
         ),
     );
-    let host = view_for_host(&fixture.dirs, fixture.base.env())
+    let host = view_for_host(&fixture.dirs)
         .unwrap()
         .bind(&fixture.base)
         .unwrap();
     assert_eq!(host.presence("lanes"), crate::policy::Presence::Present);
     assert!(!host.router().profile("dev").unwrap().legacy_loose());
-    let cli = view(&fixture.dirs, fixture.base.env())
-        .unwrap()
-        .bind(&fixture.base)
-        .unwrap();
+    let cli = view(&fixture.dirs).unwrap().bind(&fixture.base).unwrap();
     assert_ne!(cli.presence("lanes"), crate::policy::Presence::Present);
     assert!(fixture.fake.seen().is_empty());
 }

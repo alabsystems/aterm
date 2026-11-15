@@ -741,6 +741,22 @@ fn every_canonical_phrase_is_the_first_of_its_reading() {
     );
 }
 
+/// Cloudflare's block page in the API's place (Claude Code 2.1.323, m2, 2026-11-13) reads as a
+/// retried network block, so its canonical phrase keeps the page's `| Cloudflare` and drops the
+/// sign-in remedy Claude Code prefixes. CONTROL: a 403 with no page of Cloudflare's keeps the
+/// bare status, which reads as no network block.
+#[test]
+fn cloudflares_block_page_keeps_its_page_in_its_canonical_phrase() {
+    let page = "Please run /login · API Error: 403 Attention Required! | Cloudflare";
+    let phrase = canonical(page, 0, 0, 2026).expect("a phrase");
+    assert_eq!(phrase, "API Error: 403 | Cloudflare");
+    assert_eq!(Reading::of(&phrase), Reading::of(page));
+    assert!(aterm_phase::wall::edge_block(&phrase), "{phrase:?}");
+    let bare = canonical("API Error: 403 Forbidden", 0, 0, 2026).expect("a phrase");
+    assert_eq!(bare, "API Error: 403", "CONTROL");
+    assert_ne!(Reading::of(&bare), Reading::of(page), "CONTROL");
+}
+
 #[test]
 fn a_reset_clause_is_rebased_by_whole_days() {
     let shift = days_from_civil(2000, 1, 1) - days_from_civil(2026, 10, 8);

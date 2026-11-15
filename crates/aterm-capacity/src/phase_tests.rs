@@ -383,6 +383,10 @@ fn schedule(available: u64, jobs: &[Job]) -> Vec<Option<u64>> {
                     used: TreeUse::default(),
                     credited: TreeUse::default(),
                     seen: true,
+                    line: Vec::new(),
+                    sole: true,
+                    inside: None,
+                    reckoned: None,
                 })
                 .collect();
             if decide(&records[i].need, records[i].order(), &reading, &others, t).is_ok() {
@@ -684,6 +688,10 @@ fn others(records: &[Record]) -> Vec<Other<'_>> {
             used: TreeUse::default(),
             credited: TreeUse::default(),
             seen: true,
+            line: Vec::new(),
+            sole: true,
+            inside: None,
+            reckoned: None,
         })
         .collect()
 }
@@ -754,9 +762,9 @@ fn a_waiter_no_claims_end_can_start_holds_back_no_claim_behind_it() {
     let line = short.shorts[0].to_string();
     assert!(
         line.contains(&format!(
-            "; no claim's end can start the claims ahead that ask {} more",
+            "; no end of a claim they can wait for can start the claims ahead that ask {} more",
             crate::admit::gib(20 * GIB)
-        )) && line.ends_with("; no end of a claim it can wait for brings what it lacks (it waits for memory no claim holds)"),
+        )) && line.ends_with("; no end of a claim it can wait for brings what it lacks (it waits for memory no claim holds but the work it runs under)"),
         "{line}"
     );
 

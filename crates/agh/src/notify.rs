@@ -484,7 +484,7 @@ const PHASE_BOUND: Duration = Duration::from_secs(10);
 
 /// The session's own socket (design §21.5): the six steps of `SessionNotifier::post`.
 pub struct SessionNotifier {
-    /// The session, `s-<hex>`; else the skip every post answers (`no-session`, `mux`).
+    /// The session, its tab ID; else the skip every post answers (`no-session`, `mux`).
     sid: Result<String, &'static str>,
     /// The socket, when a test pinned it; else resolved per post.
     sock: Option<std::path::PathBuf>,
@@ -557,16 +557,9 @@ fn mux_nested(env: &dyn EnvSource) -> bool {
         || (tmux.is_some() && var("TERM_PROGRAM").as_deref() == Some("tmux"))
 }
 
-/// `s-` and 1–64 lowercase hex: the shape of an aterm session id.
-fn session_id(text: &str) -> bool {
-    text.strip_prefix("s-").is_some_and(|hex| {
-        (1..=64).contains(&hex.len()) && aterm_codec::hex::is_lower(hex, hex.len())
-    })
-}
-
 impl SessionNotifier {
-    /// The notifier of the session `env` names: `ATERM_PARENT_SESSION_ID` of shape
-    /// `s-<hex>`, unless the shell is inside a multiplexer nested in that session (aterm-ctl's
+    /// The notifier of the session `env` names: `ATERM_PARENT_SESSION_ID`, a tab
+    /// ID, unless the shell is inside a multiplexer nested in that session (aterm-ctl's
     /// rule, `mux_nested`: `Skipped("mux")`, as `aterm ctl @self post` refuses there). No
     /// session: `Skipped("no-session")` on every post.
     #[must_use]
@@ -576,7 +569,9 @@ impl SessionNotifier {
         } else {
             env.var_os("ATERM_PARENT_SESSION_ID")
                 .and_then(|value| value.into_string().ok())
-                .filter(|sid| session_id(sid))
+                .filter(|sid| {
+                    aterm_types::tab_id::is_tab_id(sid) || aterm_types::tab_id::is_legacy(sid)
+                })
                 .ok_or("no-session")
         };
         SessionNotifier {

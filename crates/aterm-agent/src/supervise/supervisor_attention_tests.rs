@@ -447,7 +447,7 @@ fn an_explicitly_unset_mode_resolves_the_global_policy() {
             .expect("set attempted");
         s.ctl.autopilot = Some("-");
         let mut opts = auto(30);
-        opts.policy.autopilot = global;
+        opts.policy.turn_end.autopilot = global;
         let mut deadline = s.fx.mono() + Duration::from_millis(450);
         let _ = s
             .wait_for_next(point, &opts, &[], &mut deadline, &mut Alone)
@@ -463,7 +463,7 @@ fn ordinary_fresh_global_supervisor(global: Autopilot) {
     m.autopilot_at = vec![(3, Some("-"))];
     m.vanish_after = Some(0);
     let mut opts = auto(30);
-    opts.policy.autopilot = global;
+    opts.policy.turn_end.autopilot = global;
     let (lines, code) = watch_lines(&mut m, &opts);
     assert_eq!(code, 1, "{lines:#?}");
     assert!(

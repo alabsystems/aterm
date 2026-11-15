@@ -10,7 +10,8 @@
 //!   ([`Handle::diff`]), apply a grid save with compare-before-write, revert one operation, and
 //!   list history, for any table in [`TABLES`].
 //! - [`command`]: `aterm db table ls|schema|get|scan|history|diff|check|revert|export|apply|edit`,
-//!   addresses masked unless `--show-addresses` is given, and the amacs grid round trip.
+//!   and the amacs grid round trip. A secret cell shows as the name of its secret-store entry
+//!   ([`typed::secret`]); nothing here holds a secret's value.
 
 pub mod command;
 mod diff;
@@ -38,8 +39,7 @@ use std::collections::BTreeMap;
 pub use crate::documents::log::Hlc;
 pub use diff::{CellDiff, Delta, Diff, Maker, Point};
 pub(crate) use edit::edit as edit_grid;
-pub(crate) use edit::show as show_grid;
-pub use edit::{Edited, GridSecrets, Opener, amacs, in_editor_tab, open_secrets};
+pub use edit::{Edited, Opener, amacs, open_every_ordinary, open_ordinary};
 
 /// How a table keys the row a new grid row becomes, from the typed values of its cells and the
 /// table's cells as they are (an account's key needs its login's address).
@@ -49,197 +49,16 @@ pub type Birth = fn(&Collection, &BTreeMap<String, Value>, &Cells) -> Result<Str
 /// table's cells as they are under the writer: it answers the first write the rules stop
 /// ([`Refused`]), and may add to a row's record the cells its rules derive from one the write
 /// changes. It runs through [`Compiled::rules`], before the missing-row rule every table keeps,
-/// on a grid save ([`Handle::apply`]), an owner verb's write
-/// ([`Handle::commit_owner`], [`Handle::commit_owner_sealed`]) and a revert ([`Handle::revert`],
-/// which writes the exact compensation and none of the additions); a plan written through
-/// [`Handle::commit_derived`] or [`Handle::commit_sealed_until`] (the importer's, `adopt`'s,
-/// `prefer`'s) does not pass it.
+/// on a grid save ([`Handle::apply`]), an owner verb's write ([`Handle::commit_owner`]) and a
+/// revert ([`Handle::revert`], which writes the exact compensation and none of the additions); a
+/// plan written through [`Handle::commit_derived`] or [`Handle::commit_sealed_until`] (the
+/// importer's, `adopt`'s, `prefer`'s) does not pass it.
 ///
 /// # Errors
 /// A change is not a typed cell of its collection.
 pub type Guard = fn(&mut [Vec<crate::database::Change>], &Cells) -> Result<Option<Refused>>;
 
 pub use crate::typed::Refused;
-
-/// A keyed comparison of a collection. The epoch is part of the output: digests
-/// from different epochs cannot be called a table mismatch.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct SecretDigest {
-    pub epoch: String,
-    pub rows: usize,
-    pub with_secret: usize,
-    pub digest: String,
-}
-
-/// A key rotation is distinct from a differing table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DigestComparison {
-    Equal,
-    Different,
-    DifferentEpoch,
-}
-
-impl SecretDigest {
-    /// Compare only under the same named digest epoch.
-    pub fn compare(&self, other: &Self) -> DigestComparison {
-        if self.epoch != other.epoch {
-            DigestComparison::DifferentEpoch
-        } else if self == other {
-            DigestComparison::Equal
-        } else {
-            DigestComparison::Different
-        }
-    }
-}
-
-impl std::fmt::Display for SecretDigest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "epoch={} rows={} with_secret={} digest={}",
-            self.epoch, self.rows, self.with_secret, self.digest
-        )
-    }
-}
-
-/// Compare the logical values, not randomized ciphertext, in one collection. `key`
-/// is the current everyone epoch key; `resolve` supplies the table audience key for
-/// each stored cell's epoch, including historical epochs after rotation. Conflicting
-/// secrets are compared as a sorted set of values, independent of operation IDs.
-///
-/// # Errors
-/// A cell's historical key is unavailable, its seal fails, or values cannot encode.
-pub fn secret_digest(
-    table: &str,
-    collection: &Collection,
-    cells: &Cells,
-    epoch: &Digest,
-    key: &[u8; 32],
-    resolve: impl Fn(&Digest) -> Result<zeroize::Zeroizing<[u8; 32]>>,
-) -> Result<SecretDigest> {
-    use crate::typed::{Ty, secret};
-    use ring::hmac;
-    use zeroize::Zeroizing;
-    let prk = Zeroizing::new(aterm_digest::hkdf_extract(
-        b"aterm/att/secret-digest/1\0",
-        key,
-    ));
-    let derived = Zeroizing::new(aterm_digest::hkdf_expand_32(
-        &prk,
-        b"aterm/att/secret-digest/1\0",
-    ));
-    let mut mac = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, &*derived));
-    let mut part = |bytes: &[u8]| {
-        mac.update(&(bytes.len() as u64).to_le_bytes());
-        mac.update(bytes);
-    };
-    part(table.as_bytes());
-    part(collection.name.as_bytes());
-    let projection = cell::project(collection, cells);
-    part(&(projection.rows.len() as u64).to_le_bytes());
-    let mut with_secret = 0;
-    let mut epoch_keys: BTreeMap<Digest, Zeroizing<[u8; 32]>> = BTreeMap::new();
-    for (pk, row) in &projection.rows {
-        part(pk.as_bytes());
-        part(&(row.fields.len() as u64).to_le_bytes());
-        let mut populated = false;
-        for (name, field) in &row.fields {
-            part(name.as_bytes());
-            if collection
-                .column(name)
-                .is_some_and(|c| matches!(c.ty, Ty::Secret))
-            {
-                part(b"secret");
-                let candidates: &[cell::Candidate] = match field {
-                    cell::Field::Value(c) => std::slice::from_ref(c),
-                    cell::Field::Conflict { candidates, .. } => candidates.as_slice(),
-                    cell::Field::Set(_) => return Err(Error::new("a secret is not a set")),
-                };
-                let mut values: Vec<Zeroizing<Vec<u8>>> = Vec::with_capacity(candidates.len());
-                for candidate in candidates {
-                    let value = &candidate.value.x;
-                    if value.is_null() {
-                        values.push(Zeroizing::new(vec![0]));
-                        continue;
-                    }
-                    let token = value
-                        .as_str()
-                        .ok_or_else(|| Error::new("invalid secret cell"))?;
-                    let token_epoch = secret::epoch(token)?;
-                    let old_key = match epoch_keys.entry(token_epoch) {
-                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(resolve(&token_epoch)?)
-                        }
-                    };
-                    let plain = secret::open(
-                        token,
-                        old_key,
-                        secret::Cell {
-                            table,
-                            collection: collection.name,
-                            row: pk,
-                            column: name,
-                        },
-                    )?;
-                    let text = plain.plaintext().as_bytes();
-                    let mut bytes = Zeroizing::new(Vec::with_capacity(1 + text.len()));
-                    bytes.push(1);
-                    bytes.extend_from_slice(text);
-                    values.push(bytes);
-                    populated = true;
-                }
-                values.sort_unstable_by(|a, b| a.as_slice().cmp(b.as_slice()));
-                values.dedup_by(|a, b| a.as_slice() == b.as_slice());
-                part(&(values.len() as u64).to_le_bytes());
-                for value in values.iter() {
-                    part(value);
-                }
-            } else {
-                part(b"value");
-                match field {
-                    cell::Field::Value(c) => {
-                        let bytes = aterm_json::to_vec(&c.value.x)
-                            .map_err(|_| Error::new("cannot encode digest field"))?;
-                        part(&1u64.to_le_bytes());
-                        part(&bytes);
-                    }
-                    cell::Field::Conflict { candidates, .. } => {
-                        let mut encoded: Vec<Vec<u8>> = candidates
-                            .iter()
-                            .map(|c| aterm_json::to_vec(&c.value.x))
-                            .collect::<std::result::Result<_, _>>()
-                            .map_err(|_| Error::new("cannot encode digest field"))?;
-                        encoded.sort_unstable();
-                        encoded.dedup();
-                        part(&(encoded.len() as u64).to_le_bytes());
-                        for value in encoded {
-                            part(&value);
-                        }
-                    }
-                    cell::Field::Set(_) => {
-                        let members: Vec<_> = field.members().into_iter().collect();
-                        let bytes = aterm_json::to_vec(&members)
-                            .map_err(|_| Error::new("cannot encode digest field"))?;
-                        part(&1u64.to_le_bytes());
-                        part(&bytes);
-                    }
-                }
-            }
-        }
-        with_secret += usize::from(populated);
-    }
-    Ok(SecretDigest {
-        epoch: aterm_codec::hex::encode_lower(epoch),
-        rows: projection.rows.len(),
-        with_secret,
-        digest: aterm_codec::hex::encode_lower(mac.sign().as_ref()),
-    })
-}
-
-#[cfg(test)]
-#[path = "att_secret_digest_tests.rs"]
-mod secret_digest_tests;
 
 /// A typed catalog table this build compiles.
 #[derive(Clone, Copy, Debug)]
@@ -357,11 +176,24 @@ pub const REGISTRY_2: Compiled = Compiled {
     guard: registry::guard,
     seeded: crate::alab::seeds::compiled,
     generation: 2,
+    successor: Some(&REGISTRY_3),
+};
+
+/// `alab/registry.3`, the registry's third generation: the first whose history holds no secret.
+/// The roll into it moves each sealed value earlier generations hold into the secret store and
+/// carries only the reference (docs/PLAN.md LT-04, `alab::roll`).
+pub const REGISTRY_3: Compiled = Compiled {
+    table: &registry::REGISTRY_3,
+    version: registry::VERSION,
+    birth: registry::birth,
+    guard: registry::guard,
+    seeded: crate::alab::seeds::compiled,
+    generation: 3,
     successor: None,
 };
 
 /// Every typed catalog table this build compiles.
-pub const TABLES: &[Compiled] = &[REGISTRY, REGISTRY_2];
+pub const TABLES: &[Compiled] = &[REGISTRY, REGISTRY_2, REGISTRY_3];
 
 /// The generation of `chain` (oldest first) readers and writers use in `snapshot`: the oldest
 /// one subscribed here. A roll declares the next generation and restates into it while the old
@@ -401,6 +233,117 @@ pub fn current(paths: &Paths, first: &'static Compiled) -> &'static Compiled {
         .map_or(first, |(trust, snapshot)| {
             current_in(&snapshot, trust, &chain)
         })
+}
+
+/// Whether `first`'s family has one generation that can name a store entry on this Mac, and it is
+/// `at`: the current one ([`current_in`]) is `at`, and every other generation of the family in
+/// this Mac's catalog, one this build compiles or one it does not (a newer build's), is neither
+/// subscribed nor stored here. A roll declares the next generation and carries references into
+/// it while the current one stays subscribed, and a sealed generation keeps its storage, with
+/// records not yet carried, until this Mac releases it; while any such generation is there, the
+/// entries the family names are not all one view shows, and nothing may be collected by that view
+/// ([`crate::typed::secret::retire`], [`crate::typed::secret::sweep`]). Asked after a write to
+/// `at`, a roll declared or sealed since then makes the answer `false`. `false` where the catalog
+/// or its storage cannot be read.
+pub fn sole_generation(paths: &Paths, first: &'static Compiled, at: &'static Compiled) -> bool {
+    let chain = first.chain();
+    let Ok(Some((trust, snapshot))) = application::peek_catalog(paths) else {
+        return chain.len() == 1 && first.generation == at.generation;
+    };
+    if current_in(&snapshot, trust, &chain).generation != at.generation {
+        return false;
+    }
+    let Ok(here) = at.descriptor(trust) else {
+        return false;
+    };
+    let directory = crate::catalog::Directory::new(paths, trust);
+    let family = |descriptor: &Descriptor| {
+        descriptor.application == first.table.application
+            && descriptor
+                .role
+                .strip_prefix(first.table.role)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    };
+    snapshot.entries.iter().all(|(digest, entry)| {
+        *digest == here.scope.digest()
+            || !entry
+                .declarations
+                .iter()
+                .any(|declaration| family(&declaration.descriptor))
+            || (entry.state != crate::catalog::State::Subscribed
+                && directory
+                    .path(entry.scope)
+                    .is_ok_and(|path| path.try_exists().is_ok_and(|stored| !stored)))
+    })
+}
+
+/// `changes`, about to be appended to the generation `table`, as that generation holds them:
+/// each cell change of a cells collection is checked again against `table`'s own collection of
+/// that name ([`cell::change`]), its schema version set to that collection's. A build writes one
+/// collection definition, its newest, while a generation it writes keeps the shape the builds
+/// reading it know: the registry's first two generations type a password and a phone's number
+/// as a sealed token, the shape builds up to 0.200.0 read, so a secret-store reference or a
+/// plain number there is refused here, whatever path wrote it, and only the third generation,
+/// which no older build reads, takes one.
+///
+/// # Errors
+/// A change is no typed cell value, or `table`'s collection refuses it; the error names the
+/// generation and the cell's column, never its value.
+pub fn conform(table: &Table, changes: &mut [Change]) -> Result<()> {
+    for change in changes {
+        let Some(collection) = table.collection(&change.collection) else {
+            continue;
+        };
+        if collection.kind != typed::Kind::Cells {
+            continue;
+        }
+        let Some(value) = change.value.as_ref() else {
+            continue;
+        };
+        let key = cell::CellKey::parse(&change.key)?;
+        // Only a column whose type a generation sets apart (a sealed token before the third, a
+        // reference or a number from it) is re-typed; every other column is the same in each.
+        let Some(column) = collection.column(key.col) else {
+            continue;
+        };
+        if !matches!(
+            column.ty,
+            typed::Ty::Secret | typed::Ty::SecretRef | typed::Ty::Phone
+        ) {
+            continue;
+        }
+        // One candidate as this generation types it; a roll's restatement carries a register's
+        // candidates together ([`cell::carry`]), each checked alike, a revert's bare `null` as it
+        // is.
+        let typed = |value: &Value| -> Result<Value> {
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let mut held = cell::CellValue::decode(value)?;
+            held.r = held.r.min(collection.version);
+            let checked = cell::change(collection, key, &held).map_err(|refused| {
+                Error::new(&format!(
+                    "{}: {refused}; this generation holds the column as builds up to 0.200.0 \
+                     read it",
+                    table.role
+                ))
+            })?;
+            checked
+                .value
+                .ok_or_else(|| Error::new("a typed cell change holds a value"))
+        };
+        change.value = Some(match cell::carried(value) {
+            Some(candidates) => cell::carry(
+                &candidates
+                    .iter()
+                    .map(|(operation, x)| Ok((*operation, typed(x)?)))
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            )
+            .ok_or_else(|| Error::new("a carried register holds its candidates"))?,
+            None => typed(value)?,
+        });
+    }
+    Ok(())
 }
 
 /// [`current`] for a read a person waits on: the generation this Mac's catalog names, read
@@ -802,8 +745,9 @@ pub struct Entry {
     pub changes: Vec<Change>,
 }
 
-/// The Secret-cell sealer of table `name` in `session`: the current audience epoch seals, and a
-/// stored token opens under the epoch it names, through the session's retained handoffs.
+/// The sealer of table `name` in `session` ([`typed::secret::Sealer`]), for a generation that
+/// holds sealed tokens: the current audience epoch seals, and a stored token opens under the
+/// epoch it names, through the session's retained handoffs.
 ///
 /// # Errors
 /// The current audience key is unavailable.
@@ -887,96 +831,10 @@ impl Handle {
         self.compiled
     }
 
-    /// Digest a collection under an explicitly named everyone epoch. Historical
-    /// cell keys stay inside the pinned table session.
-    ///
-    /// # Errors
-    /// The table, collection, historical cell key or authenticated value is unavailable.
-    pub fn secret_digest(
-        &self,
-        collection: &str,
-        epoch: &Digest,
-        everyone_key: &[u8; 32],
-    ) -> Result<SecretDigest> {
-        let collection = self.compiled.collection(collection)?;
-        reopened(crate::admission::deadline(), || {
-            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                let view = View::read(
-                    self.compiled.table,
-                    session,
-                    &Log::read_with(session, store, scope, decode)?,
-                );
-                secret_digest(
-                    &self.compiled.name(),
-                    collection,
-                    &view.cells,
-                    epoch,
-                    everyone_key,
-                    |basis| session.secret_key(scope, basis),
-                )
-            })
-        })
-    }
-
-    /// Seal an authored Secret for this table without exposing its audience key.
-    ///
-    /// # Errors
-    /// The table cannot be observed, the column is not Secret, or sealing fails.
-    pub fn seal_secret(
-        &self,
-        collection: &str,
-        row: &str,
-        column: &str,
-        value: &typed::secret::Secret,
-    ) -> Result<Value> {
-        let schema = self.compiled.collection(collection)?;
-        if !schema
-            .column(column)
-            .is_some_and(|c| matches!(c.ty, typed::Ty::Secret))
-            || !typed::pk_grammar(row)
-        {
-            return Err(Error::new("invalid Secret cell destination"));
-        }
-        application::observe_store(&self.paths, self.descriptor(), |session, _, scope| {
-            let basis = session.secret_basis();
-            let key = session.secret_key(scope, &basis)?;
-            value
-                .seal(
-                    &key,
-                    &basis,
-                    typed::secret::Cell {
-                        table: &self.compiled.name(),
-                        collection,
-                        row,
-                        column,
-                    },
-                )
-                .map(Value::String)
-        })
-    }
-
-    /// Reveal a stored Secret through the single audited plaintext exit.
-    ///
-    /// # Errors
-    /// The table or historical audience key is unavailable, the token does not
-    /// authenticate, or the local reveal journal cannot be committed.
-    pub fn reveal_secret<T>(
-        &self,
-        cell: typed::secret::Cell<'_>,
-        token: &str,
-        journal: &crate::alab::secret::Journal,
-        surface: crate::alab::secret::Surface,
-        when_ms: u64,
-        consume: impl FnOnce(&str) -> T,
-    ) -> Result<T> {
-        if !self.compiled.matches_name(cell.table) {
-            return Err(Error::new("secret cell belongs to another table"));
-        }
-        application::observe_store(&self.paths, self.descriptor(), |session, _, scope| {
-            let basis = typed::secret::epoch(token)?;
-            let key = session.secret_key(scope, &basis)?;
-            crate::alab::secret::reveal(journal, token, &key, cell, surface, when_ms, consume)
-        })
+    /// Whether `first`'s family has one generation here, and it is the one this handle reaches
+    /// ([`sole_generation`]).
+    pub fn sole_generation(&self, first: &'static Compiled) -> bool {
+        sole_generation(&self.paths, first, self.compiled)
     }
 
     fn descriptor(&self) -> impl FnOnce(&Bootstrap) -> Result<Descriptor> + use<> {
@@ -985,6 +843,29 @@ impl Handle {
         move |bootstrap| {
             Descriptor::application(bootstrap.trust(), table.application, table.role, version)
         }
+    }
+
+    /// Read the table with the sealer of its sealed tokens, writing nothing: a sign-in on a
+    /// generation builds up to 0.200.0 read, whose secret cells hold sealed tokens
+    /// ([`typed::Ty::Secret`]) rather than store references, and the importer's dry run, which
+    /// compares a held number and a held secret there by opening its token.
+    ///
+    /// # Errors
+    /// As [`Self::view`], or this Mac holds no key of the table's audience.
+    pub(crate) fn view_sealed<T>(
+        &self,
+        read: impl FnOnce(&View, &dyn typed::secret::Sealer) -> Result<T>,
+    ) -> Result<T> {
+        let compiled = self.compiled;
+        application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+            let view = View::read(
+                compiled.table,
+                session,
+                &Log::read_with(session, store, scope, decode)?,
+            );
+            let name = compiled.name();
+            read(&view, &sealer(&name, session, scope)?)
+        })
     }
 
     /// Read the table this Mac holds, without enrolling it.
@@ -1164,29 +1045,15 @@ impl Handle {
                         "this table's history here is incomplete; a grid save waits for a complete scan",
                     ));
                 }
-                // A revealed `Secret` cell's edit is sealed here, in the writing session, under
-                // its current epoch; nothing else is held plaintext past this point.
-                let sealed;
-                let plan = if plan.rows.iter().flat_map(|(_, e)| e).any(|e| e.secret) {
-                    let mut owned = plan.clone();
-                    let name = self.compiled.name();
-                    grid::seal(
-                        collection,
-                        &mut owned,
-                        &sealer(&name, session, scope)?,
-                        &view.cells,
-                    )?;
-                    sealed = owned;
-                    &sealed
-                } else {
-                    plan
-                };
                 let mut settled = grid::settle(collection, plan, &view.cells);
                 if let Some(refused) = self.compiled.rules(&mut settled.rows, &view.cells)? {
                     return Ok(Applied {
                         refused: Some(refused),
                         ..Applied::default()
                     });
+                }
+                for row in &mut settled.rows {
+                    conform(table, row)?;
                 }
                 let mut applied = Applied {
                     unchanged: settled.unchanged,
@@ -1232,13 +1099,13 @@ impl Handle {
     }
 
     /// [`Self::commit_derived`] held to `deadline`, for a command a person runs and waits on (a
-    /// product open's budget is no measure of a pass that has to happen), whose plan also seals
-    /// and compares the table's Secret cells (`typed::secret::Sealer`): the importer's
-    /// `password` and `number` cells. The audience key stays inside the session that writes the
-    /// plan.
+    /// product open's budget is no measure of a pass that has to happen), whose plan may seal and
+    /// compare the cells a generation holds sealed (`typed::secret::Sealer`): the importer's
+    /// `number` cells in a generation builds up to 0.200.0 read. The audience key stays inside
+    /// the session that writes the plan.
     ///
     /// # Errors
-    /// As [`Self::commit_derived`], a Secret's key is unavailable, or `deadline` passes first.
+    /// As [`Self::commit_derived`], the table's key is unavailable, or `deadline` passes first.
     pub(crate) fn commit_sealed_until<T>(
         &self,
         declare: bool,
@@ -1246,43 +1113,6 @@ impl Handle {
         derive: impl FnOnce(&View, &dyn typed::secret::Sealer) -> Result<(T, Vec<Vec<Change>>)>,
     ) -> Result<(T, Applied)> {
         self.commit_planned(declare, false, deadline, derive)
-    }
-
-    /// Read the table with its Secret cells' sealer, as [`Self::commit_sealed_until`] plans, writing
-    /// nothing: the importer's dry run and comparisons, `check`'s duplicate numbers.
-    ///
-    /// # Errors
-    /// As [`Self::view`], or a Secret's key is unavailable.
-    pub(crate) fn view_sealed<T>(
-        &self,
-        read: impl FnOnce(&View, &dyn typed::secret::Sealer) -> Result<T>,
-    ) -> Result<T> {
-        let compiled = self.compiled;
-        application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-            let view = View::read(
-                compiled.table,
-                session,
-                &Log::read_with(session, store, scope, decode)?,
-            );
-            let name = compiled.name();
-            read(&view, &sealer(&name, session, scope)?)
-        })
-    }
-
-    /// Observe the table's Secret-cell sealer without re-reading or projecting its log, for a
-    /// caller that already holds the projected [`View`] (`check`'s duplicate phone numbers).
-    ///
-    /// # Errors
-    /// As [`Self::view`], or a Secret's key is unavailable.
-    pub(crate) fn with_sealer<T>(
-        &self,
-        read: impl FnOnce(&dyn typed::secret::Sealer) -> Result<T>,
-    ) -> Result<T> {
-        let compiled = self.compiled;
-        application::observe_store(&self.paths, self.descriptor(), |session, _, scope| {
-            let name = compiled.name();
-            read(&sealer(&name, session, scope)?)
-        })
     }
 
     /// [`Self::commit_derived`] for the owner's own word (`aterm db alab add|retire|relabel`): each
@@ -1303,12 +1133,13 @@ impl Handle {
         })
     }
 
-    /// [`Self::commit_owner`] with the table's sealer: the owner's own word that writes a `Secret`
-    /// cell (`aterm db emails set <row> password --stdin`, the grid's revealed column), sealed
-    /// inside the writing session under its current epoch. Each record's request id is random.
+    /// [`Self::commit_owner`] with the table's sealer: the owner's own word that writes a cell a
+    /// generation holds sealed (`aterm db phones set <row> number <value>` in a generation builds
+    /// up to 0.200.0 read), sealed inside the writing session under its current epoch. Each
+    /// record's request id is random.
     ///
     /// # Errors
-    /// As [`Self::commit_owner`], or a Secret's key is unavailable.
+    /// As [`Self::commit_owner`], or the table's key is unavailable.
     pub(crate) fn commit_owner_sealed<T>(
         &self,
         derive: impl FnOnce(&View, &dyn typed::secret::Sealer) -> Result<(T, Vec<Vec<Change>>)>,
@@ -1316,26 +1147,22 @@ impl Handle {
         self.commit_planned(false, true, crate::admission::deadline(), derive)
     }
 
-    /// Reveal each of `cells` (`(collection, row, column, token)`) through the one audited
-    /// plaintext exit, in one store session: each is journaled ([`crate::alab::secret::reveal`])
-    /// before its value is kept, and comes back as a [`typed::secret::Secret`], which prints
-    /// masked and is zeroized on drop. A cell whose epoch this Mac holds no key of, or whose token
-    /// does not open at its coordinates, comes back `None` and is never journaled, so one such
-    /// cell masks itself and no other.
+    /// Open each of `cells` (`(collection, row, column, token)`) in one store session. A cell
+    /// whose epoch this Mac holds no key of, or whose token does not open at its coordinates,
+    /// comes back `None`. Only a column a generation holds sealed though its values are ordinary
+    /// data (a phone's `number`) is opened this way ([`open_ordinary`]): nothing is journaled,
+    /// since no secret is revealed.
     ///
     /// # Errors
-    /// The store cannot be read, or a reveal could not be journaled: nothing is returned then.
-    pub fn reveal_cells(
+    /// The store cannot be read.
+    pub(crate) fn open_cells(
         &self,
         cells: &[(&str, &str, &str, &str)],
-        journal: &crate::alab::secret::Journal,
-        surface: crate::alab::secret::Surface,
-        when_ms: u64,
     ) -> Result<Vec<Option<typed::secret::Secret>>> {
         let table = self.compiled.name();
         application::observe_store(&self.paths, self.descriptor(), |session, _, scope| {
             let mut keys: BTreeMap<Digest, Option<zeroize::Zeroizing<[u8; 32]>>> = BTreeMap::new();
-            cells
+            Ok(cells
                 .iter()
                 .map(|&(collection, row, column, token)| {
                     let cell = typed::secret::Cell {
@@ -1344,23 +1171,14 @@ impl Handle {
                         row,
                         column,
                     };
-                    let Ok(epoch) = typed::secret::epoch(token) else {
-                        return Ok(None);
-                    };
-                    let Some(key) = keys
+                    let epoch = typed::secret::epoch(token).ok()?;
+                    let key = keys
                         .entry(epoch)
                         .or_insert_with(|| session.secret_key(scope, &epoch).ok())
-                        .as_ref()
-                    else {
-                        return Ok(None);
-                    };
-                    let Ok(plain) = typed::secret::open(token, key, cell) else {
-                        return Ok(None);
-                    };
-                    crate::alab::secret::record_reveal(journal, cell, surface, when_ms)?;
-                    Ok(Some(plain))
+                        .as_ref()?;
+                    typed::secret::open(token, key, cell).ok()
                 })
-                .collect()
+                .collect())
         })
     }
 
@@ -1394,6 +1212,9 @@ impl Handle {
                 let (planned, mut rows) = derive(&view, &sealer(&name, session, scope)?)?;
                 if owner && let Some(refused) = self.compiled.rules(&mut rows, &view.cells)? {
                     return Err(refused.into());
+                }
+                for row in &mut rows {
+                    conform(table, row)?;
                 }
                 let mut applied = Applied::default();
                 let mut appended = BTreeMap::new();
@@ -1481,6 +1302,9 @@ impl Handle {
                 }
                 let view = View::read(table, session, &log);
                 let command = log.compensate(request, operation, &view.quota.over)?;
+                if let Some(changes) = command.changes() {
+                    refuse_secret_revert(table, changes)?;
+                }
                 if let Some(changes) = command.changes()
                     && let Some(refused) =
                         self.compiled.rules(&mut [changes.to_vec()], &view.cells)?
@@ -1497,10 +1321,20 @@ impl Handle {
     /// table, never below a version already visible and never a second row at an equal version.
     /// Returns the records written.
     ///
+    /// A table whose secret cells name store entries ([`typed::Table::names_store`]) is refused:
+    /// publishing would declare it, and this build writes no such table outside a test.
+    ///
     /// # Errors
-    /// No Commons writer, or the table cannot be read or written.
+    /// No Commons writer, the table is one this build does not declare, or it cannot be read or
+    /// written.
     pub fn publish_schema(&self) -> Result<usize> {
         let table = self.compiled.table;
+        if table.names_store() {
+            return Err(Error::new(
+                "this build of aterm declares no table whose secret cells name secret-store \
+                 entries; its schema is not published here",
+            ));
+        }
         application::with_store(
             &self.paths,
             true,
@@ -1525,6 +1359,38 @@ impl Handle {
             },
         )
     }
+}
+
+/// Refuse a revert whose compensation writes a secret's `SecretRef` cell (a secret-named column,
+/// [`typed::secret_named`]; a `vault_ref` is an ordinary reference): the write it undoes removed the
+/// entry the preimage names once it landed (`alab::secret::settle_write`) and put its own value
+/// into an entry nothing else owes, so restoring the old reference would name a value that is
+/// gone and leave the newer one in the store with no cell naming it. The owner writes the value
+/// again instead, through the verb that owns the store side.
+///
+/// # Errors
+/// A change names a `SecretRef` cell; the refusal names its column, never a value.
+fn refuse_secret_revert(table: &typed::Table, changes: &[Change]) -> Result<()> {
+    for change in changes {
+        let Ok(key) = typed::cell::CellKey::parse(&change.key) else {
+            continue;
+        };
+        if table
+            .collection(&change.collection)
+            .and_then(|collection| collection.column(key.col))
+            .is_some_and(|column| {
+                column.ty == typed::Ty::SecretRef && typed::secret_named(column.name)
+            })
+        {
+            return Err(Error::new(&format!(
+                "a revert never restores a secret cell ({}.{}): the write it would undo removed \
+                 the store entry the old value names; write the value again with the table's \
+                 own `set <row> {} --stdin`",
+                change.collection, key.col, key.col
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Check whether `command` is an exact retry of an eligible record in `log` or of a record already

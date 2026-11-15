@@ -48,11 +48,7 @@ const MACHINE_ROWS: [&str; 2] = [prefs::EDIT_AI_PREFERRED, prefs::EDIT_AI_ENABLE
 const REVIEW_ROWS: [&str; 2] = [prefs::EDIT_AI_REVIEWS, prefs::EDIT_AI_REVIEW_PERMISSIONS];
 
 /// The FLEET DOCUMENT card's rows.
-const FLEET_ROWS: [&str; 3] = [
-    prefs::EDIT_AI_MACHINE,
-    prefs::EDIT_AI_FLEET,
-    prefs::EDIT_AI_FLEET_KEY,
-];
+const FLEET_ROWS: [&str; 2] = [prefs::EDIT_AI_FLEET, prefs::EDIT_AI_FLEET_KEY];
 
 /// The words a row adds where its value came from the fleet document.
 const FROM_FLEET: &str = "From the fleet document.";

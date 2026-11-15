@@ -11,7 +11,7 @@ use crate::merge::{Counters, OfferError, Offered, Replica, Snapshots, Usage};
 use crate::row::{
     AGENTS_LISTED_MAX, AGY_GROUPS_MAX, ActivityRow, AgentEntry, AgyGroup, AgyRow, HeldEntry, Label,
     ManagerEntry, NEEDS_MAX, NeedEntry, NeedsRow, PCT_MAX, PlaceRow, QuotaRow, REMAINING_MAX, Row,
-    RowError, Sid, SignIn, UNREAD_MAX, UnreadRow, WindowRecord, Word,
+    RowError, SignIn, TabId, UNREAD_MAX, UnreadRow, WindowRecord, Word,
 };
 use crate::rules;
 use crate::subject::{
@@ -31,8 +31,8 @@ fn word(w: &str) -> Word {
     Word::new(w).expect("a word")
 }
 
-fn sid(n: u8) -> Sid {
-    Sid::parse(&format!("s-{n:02x}000000000000000000")).expect("a sid")
+fn sid(n: u8) -> TabId {
+    TabId::from_bits(u64::from(n))
 }
 
 /// Every subject of one Mac this build names, one of each shape.
@@ -599,10 +599,11 @@ fn the_decoder_refuses_everything_the_encoder_does_not_write() {
             "{subject}: trailing"
         );
         let mut version = bytes.clone();
-        version[1] = 2;
+        let later = bytes[1] + 1;
+        version[1] = later;
         assert_eq!(
             Row::decode_at(&subject, &version),
-            Err(RowError::Version(2)),
+            Err(RowError::Version(later)),
             "{subject}"
         );
     }
@@ -776,19 +777,24 @@ fn the_activity_row_counts_and_lists_and_reads_nothing_else() {
     };
     let bytes = row.encode();
     let mut golden = vec![b'T', 1, 0xac, 0x02, 1, 0, 2, 1, 0, 2];
-    golden.push(22);
-    golden.extend_from_slice(b"s-01000000000000000000");
+    golden.push(11);
+    golden.extend_from_slice(b"t0000000001");
     golden.push(4);
     golden.extend_from_slice(b"busy");
     golden.push(0);
-    golden.push(22);
-    golden.extend_from_slice(b"s-02000000000000000000");
+    golden.push(11);
+    golden.extend_from_slice(b"t0000000002");
     golden.push(6);
     golden.extend_from_slice(b"walled");
     golden.extend_from_slice(&[1, 4]);
     golden.extend_from_slice(b"auth");
     assert_eq!(bytes, golden, "the one spelling");
     assert_eq!(ActivityRow::decode(&bytes), Ok(row.clone()));
+    // A row that names a tab by a legacy `s-` ID is no fleet row: no fleet reader takes that form.
+    let mut old = vec![b'T', 1, 0xac, 0x02, 1, 0, 1, 1, 0, 1, 22];
+    old.extend_from_slice(b"s-01000000000000000000");
+    old.extend_from_slice(&[4, b'b', b'u', b's', b'y', 0]);
+    assert!(ActivityRow::decode(&old).is_err());
     assert_eq!(row.agents(), 4);
     let subject = ActivityRow::subject(node(1));
     assert_eq!(
@@ -813,7 +819,7 @@ fn the_activity_row_counts_and_lists_and_reads_nothing_else() {
     assert_eq!(ActivityRow::decode(&overlong), Err(RowError::Varint));
     // The first entry's detail flag follows its sid and its word.
     let mut flag = bytes.clone();
-    let at = 10 + 1 + 22 + 1 + 4;
+    let at = 10 + 1 + 11 + 1 + 4;
     assert_eq!(flag[at], 0, "the first entry's detail flag");
     flag[at] = 2;
     assert_eq!(ActivityRow::decode(&flag), Err(RowError::Tag));
@@ -1023,7 +1029,7 @@ fn no_row_field_can_carry_an_address_a_path_or_a_sentence() {
     ] {
         assert!(Word::new(text).is_none(), "word {text:?}");
         assert!(Label::new(text).is_none(), "label {text:?}");
-        assert!(Sid::parse(text).is_none(), "sid {text:?}");
+        assert!(TabId::parse(text).is_none(), "sid {text:?}");
         assert!(AccountKey::parse(text).is_none(), "account {text:?}");
         assert!(Node::parse(text).is_none(), "node {text:?}");
     }
@@ -1070,12 +1076,8 @@ fn no_row_field_can_carry_an_address_a_path_or_a_sentence() {
         Err(RowError::Text("a need word"))
     );
     assert_eq!(
-        smuggle(
-            &needs,
-            sid(1).to_string().as_bytes(),
-            b"s-0100000000000000000/"
-        ),
-        Err(RowError::Text("a session id"))
+        smuggle(&needs, sid(1).to_string().as_bytes(), b"t000000000/"),
+        Err(RowError::Text("a tab id"))
     );
     assert_eq!(
         smuggle(
@@ -1178,7 +1180,7 @@ fn a_body_that_names_another_subject_is_refused() {
         "a replica never merges what stays on its Mac"
     );
     assert!(matches!(
-        replica.offer("/f/alab/pub/n-0100000000000000/s-x/ev", 1, b""),
+        replica.offer("/f/alab/pub/n-0100000000000000/t000000000x/ev", 1, b""),
         Err(OfferError::Subject(_))
     ));
 }

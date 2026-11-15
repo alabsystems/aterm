@@ -162,3 +162,71 @@ fn expired_missing_and_unsupported_observations_defer_to_fresh_admission() {
     machine.fixed.set(unread);
     assert!(ResourceProbe::capture(&ledger, &machine).unwrap().is_none());
 }
+
+/// THE PROBE ASKS AS A WAITING CLAIM OF ITS PROCESS ([`ResourceProbe::capture_at`]'s stand-in),
+/// which every look of the ledger reads: its process then holds two claims there, so its held
+/// claim's end gives back what it claims and never its whole tree (ATERM-KI-1113-341). On 15 GiB
+/// available this process holds 8 GiB beside a tree of 20 GiB, and another process waits ahead
+/// for 30 GiB with a 1 GiB margin: that end cannot bring the 16 GiB it lacks, so the boot is
+/// stuck, reserves nothing, and a 10 GiB envelope, which fits the room, is possible. NEGATIVE
+/// CONTROL: M-PROBE-ALONE (the probe's look read without its stand-in) gives that end the whole
+/// 20 GiB tree, keeps the boot in its place sparing 4 GiB and blocks the envelope.
+#[test]
+fn the_probe_asks_as_its_process_waiting_claim() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let machine = Counted::new();
+    let _claim = held(&ledger, &machine);
+    let boot = Waiter::enter(
+        &ledger,
+        &machine,
+        Need::new("vm boot").mem_gib(30).margin(1 << 30),
+    )
+    .unwrap();
+    // The boot is another process's: its record, which the waiter keeps locked, names that one.
+    let me = std::process::id();
+    let other = if me == 2 { 3 } else { 2 };
+    let path = std::fs::read_dir(ledger.dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "wait"))
+        .expect("the boot waits");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (head, rest) = text.split_once('\n').expect("a record has a head line");
+    let named = format!("\"pid\":{me}");
+    let at = head.find(&named).expect("the head names its pid");
+    assert!(
+        !head[at + named.len()..].starts_with(|c: char| c.is_ascii_digit()),
+        "{head}"
+    );
+    let head = format!(
+        "{}\"pid\":{other}{}",
+        &head[..at],
+        &head[at + named.len()..]
+    );
+    std::fs::write(&path, format!("{head}\n{rest}")).unwrap();
+    machine.fixed.set(Reading::of_gib(48, 15, 14));
+    machine.fixed.set_procs(Some(Procs::of(vec![
+        Proc {
+            pid: me,
+            charged: 20 << 30,
+            footprint: 20 << 30,
+            ..Proc::default()
+        },
+        Proc {
+            pid: other,
+            charged: 1,
+            footprint: 1,
+            ..Proc::default()
+        },
+    ])));
+    let at = Instant::now();
+    let probe = ResourceProbe::capture_at(&ledger, &machine, at)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        probe.check_at(&Need::new("candidate").mem_gib(10), at),
+        ProbeDecision::Possible
+    );
+    drop(boot);
+}

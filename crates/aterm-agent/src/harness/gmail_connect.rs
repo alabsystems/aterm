@@ -1,18 +1,21 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //! Explicit headless Gmail enrollment. Reading mail never starts this flow implicitly.
+//!
+//! aterm's Google desktop client registration is a vault entry
+//! ([`aterm_secrets::entry_class::GOOGLE_MAIL_CLIENT`]), found through
+//! this Mac's secrets registry and nowhere else; where the registry names none, enrollment files
+//! the want (`entry:google-mail-client.json`, as `aterm secrets need` does) and stops, saying so.
 
 use super::*;
 use aterm_mail::oauth::{self, Error, ErrorKind};
-use std::path::PathBuf;
 
 struct Settings {
     account: String,
-    client_file: PathBuf,
     within: Duration,
 }
 
-fn parse(home: &Path, args: &[String]) -> Result<Settings, Failure> {
+fn parse(args: &[String]) -> Result<Settings, Failure> {
     let account = args
         .first()
         .filter(|account| valid_account(account))
@@ -20,7 +23,6 @@ fn parse(home: &Path, args: &[String]) -> Result<Settings, Failure> {
         .to_ascii_lowercase();
     let mut settings = Settings {
         account,
-        client_file: home.join(".config/aterm/mail/google-client.json"),
         within: Duration::from_secs(180),
     };
     let mut seen = std::collections::BTreeSet::new();
@@ -29,9 +31,6 @@ fn parse(home: &Path, args: &[String]) -> Result<Settings, Failure> {
             return Err("Missing or duplicate Gmail connection option".into());
         }
         match pair[0].as_str() {
-            "--client-file" if !pair[1].is_empty() && !pair[1].chars().any(char::is_control) => {
-                settings.client_file = PathBuf::from(&pair[1])
-            }
             "--timeout" => {
                 let raw = pair[1].as_str();
                 settings.within = Duration::from_secs(
@@ -58,14 +57,39 @@ fn failure(error: Error) -> Failure {
     }
 }
 
+/// The client registration [`aterm_secrets::entry_class::GOOGLE_MAIL_CLIENT`] under `home`, where
+/// read in place from this Mac's store ([`crate::vault_entry`]). Where it names none (or cannot
+/// be read), the want is filed in the need ledger, which asks the lab's Macs for it, and the
+/// enrollment stops naming it.
 #[cfg(unix)]
-fn read_client(path: &Path) -> Result<oauth::enrollment::Client, Failure> {
-    let raw = aterm_secrets::fsx::read_private(path, 65536)
+fn read_client(home: &Path) -> Result<oauth::enrollment::Client, Failure> {
+    use aterm_secrets::entry_class::GOOGLE_MAIL_CLIENT;
+    use aterm_secrets::need::{self, Purpose, Want};
+    let text = crate::vault_entry::read_text(home, GOOGLE_MAIL_CLIENT, 65536)
+        .into_text()
         .map_err(|_| {
             Failure::from("Could not read aterm's private Google desktop client registration")
-        })?
-        .ok_or("Aterm's Google desktop client registration is unavailable")?;
-    oauth::enrollment::Client::decode(raw.as_slice()).map_err(failure)
+        })?;
+    let Some(raw) = text else {
+        let want = Want::Entry(GOOGLE_MAIL_CLIENT.to_owned());
+        let spelled = want.key();
+        return Err(match need::raise(
+            &aterm_secrets::client::Paths::for_home(home),
+            want,
+            Purpose::HarnessSignIn,
+        ) {
+            Ok(_) => format!(
+                "Aterm's Google desktop client registration is not in this Mac's vault; \
+                     filed {spelled}"
+            ),
+            Err(why) => format!(
+                "Aterm's Google desktop client registration is not in this Mac's vault; \
+                     {spelled} could not be filed: {why}"
+            ),
+        }
+        .into());
+    };
+    oauth::enrollment::Client::decode(raw.as_bytes()).map_err(failure)
 }
 
 #[cfg(not(unix))]
@@ -74,7 +98,7 @@ fn read_client(_: &Path) -> Result<oauth::enrollment::Client, Failure> {
 }
 
 pub(super) fn run(home: &Path, args: &[String], output: &mut impl Write) -> Result<(), Failure> {
-    let settings = parse(home, args)?;
+    let settings = parse(args)?;
     connect(home, &settings)?;
     emit(
         output,
@@ -83,7 +107,7 @@ pub(super) fn run(home: &Path, args: &[String], output: &mut impl Write) -> Resu
 }
 
 pub(super) fn connect_default(home: &Path, account: &str, within: Duration) -> Result<(), Failure> {
-    let mut settings = parse(home, &[account.to_owned()])?;
+    let mut settings = parse(&[account.to_owned()])?;
     if within < Duration::from_secs(1) || within > Duration::from_secs(300) {
         return Err("Gmail connection timeout must be 1..300 seconds".into());
     }
@@ -93,7 +117,7 @@ pub(super) fn connect_default(home: &Path, account: &str, within: Duration) -> R
 
 fn connect(home: &Path, settings: &Settings) -> Result<(), Failure> {
     let end = Instant::now() + settings.within;
-    let client = read_client(&settings.client_file)?;
+    let client = read_client(home)?;
     let enrollment =
         oauth::enrollment::Enrollment::bind(client, &settings.account).map_err(failure)?;
     let config = headless_oauth::discover_mailbox_config(Some(home), None)

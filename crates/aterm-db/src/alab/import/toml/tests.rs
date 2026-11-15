@@ -6,14 +6,14 @@
 //! or `example.invalid`, every password `synthetic-pass-<n>`, the TOTP seed RFC 6238's published
 //! example.
 
-use super::super::tests::{SEALER, Stand};
+use super::super::tests::{Stand, put_all, store};
 use super::*;
 use crate::{
     alab::import::{Input, Plan, covered, plan_cells as plan},
     typed::{
         cell::{self, Cells},
         grid::tests::Book,
-        secret::{self, Sealer as _},
+        secret,
     },
 };
 
@@ -54,7 +54,7 @@ fn planned(sheets: &[Sheet], cells: &Cells) -> Plan {
             sheets,
             macs: &[],
             vendors: &Stand,
-            sealer: &SEALER,
+            store: store(),
             now_ms: NOW,
             births: crate::alab::import::Births::Named,
             unread: &[],
@@ -65,6 +65,7 @@ fn planned(sheets: &[Sheet], cells: &Cells) -> Plan {
 }
 
 fn apply(book: &mut Book, plan: &Plan) -> Cells {
+    put_all(plan);
     for changes in &plan.rows {
         book.write(1, &[], changes.clone());
     }
@@ -90,7 +91,8 @@ fn mailbox_of(login: &str) -> String {
     keys::mailbox_pk(&keys::address_pk(login).unwrap()).unwrap()
 }
 
-/// Whether the sealed cell `collection.pk.column` opens to `value`.
+/// Whether the secret cell `collection.pk.column` names its own store entry, and that entry holds
+/// `value`.
 fn holds(
     cells: &Cells,
     collection: &crate::typed::Collection,
@@ -99,21 +101,15 @@ fn holds(
     value: &str,
 ) -> bool {
     let projection = cell::project(collection, cells);
-    let Some(token) = projection.rows[pk].get(column).and_then(Value::as_str) else {
+    let Some(entry) = projection.rows[pk].get(column).and_then(secret::entry_of) else {
         return false;
     };
-    secret::is_sealed(token)
-        && SEALER.holds(
-            collection.name,
-            pk,
-            column,
-            token,
-            &Secret::new(value.to_owned()),
-        )
+    secret::bound(collection.name, column, pk, entry)
+        && store().held(entry).as_deref() == Some(value)
 }
 
 /// Every field of the fixture lands where the module docs say: the login passwords in the login
-/// address rows, the second passwords and TOTP seeds as the mailbox's `Secret`s, the URLs, each
+/// address rows, the second passwords and TOTP seeds in the mailbox's store entries, the URLs, each
 /// exact receive address as a `receives` element and each domain pattern in `receives_domains`,
 /// the top-level mailbox receiving `*`. No plaintext is written, the file is covered, and a
 /// re-run writes nothing.
@@ -438,11 +434,11 @@ fn a_wrapped_file_reads_as_the_harness_reads_it() {
     assert!(!err.to_string().contains("synthetic"));
 }
 
-/// A protected login holds no mailbox, so a file's entry for it seals nothing: each field it gives
+/// A protected login holds no mailbox, so a file's entry for it puts nothing: each field it gives
 /// is refused by name, its login too, and the file stays uncovered, an entry giving only its login
 /// as well.
 /// NEGATIVE CONTROL: with `mailbox_toml` not asking `guarded`, the mailbox's second password is
-/// sealed: `` assertion failed: !plan.rows.iter().flatten().any(… ``. With the guard skipping the
+/// planned: `` assertion failed: !plan.rows.iter().flatten().any(… ``. With the guard skipping the
 /// login: `` left: [Some("mailbox_password"), Some("totp_secret")] ``.
 #[test]
 fn a_protected_login_takes_no_mailbox_from_a_file() {
@@ -479,6 +475,10 @@ fn a_protected_login_takes_no_mailbox_from_a_file() {
     assert_eq!(
         refused,
         vec![Some("mailbox_password"), Some("totp_secret"), Some("user")]
+    );
+    assert!(
+        plan.puts.is_empty(),
+        "a protected login's secret reaches no store entry"
     );
     assert!(!uncovered(&sheets, &book.cells()).is_empty());
     let alone = [sheet("user = \"owner@proton.example\"\n")];

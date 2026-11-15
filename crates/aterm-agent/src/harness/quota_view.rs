@@ -23,7 +23,7 @@ use std::ops::Range;
 use super::accounts::{self, Class};
 use super::outlook::{
     self, Basis, Figure, Knot, Offsets, Outlook, Pass, PassKind, Read, RowOutlook, Stop, StopEnd,
-    Verdict, Window, round_down, round_up, span_dated, spoken_when, when,
+    Verdict, Why, Window, round_down, round_up, span_dated, spoken_when, when,
 };
 
 const DAY: i64 = 86_400;
@@ -38,7 +38,7 @@ pub const NAMED_MAX: usize = 3;
 /// (the roster label where its row has none, [`accounts::Row::shown_name`]), and 32 cells hold
 /// a typical one whole; a longer email gives way to its local part before it is cut ([`cut`]).
 pub const NAME_CELLS: usize = 32;
-/// A name's narrow form ([`short`]) is cut to this many cells: an email's local part, or a
+/// A name's narrow form ([`distinct`]) is cut to this many cells: an email's local part, or a
 /// label, as the glass cut every name before names were emails.
 pub const SHORT_CELLS: usize = 12;
 /// The blanks between the row's groups (§4.3).
@@ -49,9 +49,6 @@ pub const NO_FIGURE: &str = "no week figure yet";
 pub const NO_FIGURE_FULL: &str = "no week figure yet \u{b7} Claude reports it with its next reply";
 /// The name of a login the roster cannot name (§2.5).
 pub const THIS_LOGIN: &str = "this login";
-/// What the glass names a login the account state says is signed out: no email, plan or week is
-/// known true of it any more (`agy`'s footer, [`super::agy_gate`]).
-pub const NOT_SIGNED_IN: &str = "not signed in";
 /// The title's last words: what a click on the row does (§2.6).
 pub const CLICK: &str = "click: accounts";
 
@@ -74,6 +71,10 @@ pub const WAIT_MARK: char = '\u{29d7}';
 /// it to the second, and a renderer `cw` pixels a cell puts it at `place · cw / CELL_PLACES`.
 pub const CELL_PLACES: i64 = DAY;
 
+/// The least cells of a re-cut name's tail ([`distinct`]): one character tells two names apart
+/// but reads as a typo.
+const TAIL_CELLS: usize = 3;
+
 const SEP: &str = " \u{b7} ";
 
 /// The quota view of one pane ([`Outlook::quota`]): what line E draws. It
@@ -86,6 +87,8 @@ pub struct QuotaView {
     pub named: Vec<Named>,
     /// Every other roster row's label, in roster order: folded into `+N`, never dropped.
     pub folded: Vec<String>,
+    /// How the row lays each roster account's name, no two alike ([`Laid`]).
+    pub names: Laid,
     /// Line E's chart.
     pub chart: Chart,
     /// The tail's two phrases.
@@ -107,12 +110,25 @@ pub struct Named {
     pub this_tab: bool,
     /// It carries the work now.
     pub carrier: bool,
-    /// Its week's figure.
+    /// Its week's figure, or its login where it has none here ([`Figure::login`]).
     pub figure: Figure,
+    /// Why its week has no figure, where `figure` is [`Figure::Unread`]
+    /// ([`outlook::RowOutlook::unread`]): the row says it in words, never as a mark. Never
+    /// [`Why::Earlier`], and `None` of a login, which `figure` says.
+    pub unread: Option<Why>,
     /// Its week's vendor reset, where one is ahead.
     pub reset: Option<i64>,
     /// Its plan's title (`Max 20x`), where seen.
     pub plan: Option<String>,
+}
+
+impl Named {
+    /// Whether the row says a figure after its name: not a week with none ([`Self::unread`])
+    /// and not a login ([`Figure::of_login`]), which it says in words in the figure's place.
+    #[must_use]
+    pub const fn has_figure(&self) -> bool {
+        self.unread.is_none() && !self.figure.of_login()
+    }
 }
 
 /// The rolling chart over [now − 1 d, now + 7 d) (§2.2), drawn by [`Chart::cells`].
@@ -136,6 +152,9 @@ pub struct Chart {
     /// Each local midnight inside the span: the instant each local day begins, for the ticks of
     /// line E's chart ([`Chart::midnights_at`]).
     pub midnights: Vec<i64>,
+    /// How the row lays each account's name ([`QuotaView::names`]): a name after a `→` is one of
+    /// that account's two forms, the widest its run holds, whichever form the rung's lead says.
+    pub names: Laid,
 }
 
 /// One account carrying the work over `[from, to]`, its fill of its own week at its knots.
@@ -173,9 +192,11 @@ pub enum Mark {
     Reset,
     /// `→name`: the work moves to this account, as the glass names it ([`Outlook::name_of`]).
     Handoff(String),
-    /// `→name?`: the work moves to this account (its glass name), which aterm cannot read; `┄`
-    /// follows.
-    Lean(String),
+    /// `→name`, then `┄`: the work moves to this account (its glass name), whose week aterm
+    /// holds no exact figure of (why: unread, or a bound read earlier, [`Why::of_lean`]), so
+    /// nothing is projected past it. The tail says why in words (`name not read ~Fri 20:00`);
+    /// the chart lays no mark for it.
+    Lean(String, Why),
 }
 
 /// One cell of a chart.
@@ -258,7 +279,7 @@ pub enum Role {
     Lit,
     /// Other names and figures, times, names inside the chart.
     Value,
-    /// `·`, `+N`, `at`, `▕`, case (d)'s words.
+    /// `·`, `+N`, `left`, `at`, `▕`, case (d)'s words and the words said in a figure's place.
     Quiet,
     /// The measured levels.
     Mark,
@@ -353,14 +374,42 @@ pub struct Own {
 /// Phrase 2 (§2.3).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Phrase {
-    /// The full form (`╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00`).
+    /// The full form (`╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00`), an account it names whole.
     pub full: String,
-    /// The short form (`╳ ~Thu 12 Nov 04:00`).
+    /// The short form (`╳ ~Thu 12 Nov 04:00`), an account it names in its narrow form
+    /// (`tidepool…1.2 not read ~Fri 20:00`): a rung of narrow names lays it, and line D's unit.
     pub short: String,
+    /// The short form a rung of whole names lays (§2.4), an account it names whole
+    /// (`tidepool.m1.2@example.com not read ~Fri 20:00`), so the lead and the tail of one rung
+    /// say an account one way; `short` where it names none.
+    pub short_whole: String,
     /// Its ink: warn for `╳`, `⧗`, `$`.
     pub ink: Role,
     /// A stop, a wall, a lean or credits: it stays, at least short, while any figure shows.
     pub kept: bool,
+}
+
+impl Phrase {
+    /// A phrase that names no account: its short form is one for every rung.
+    #[must_use]
+    pub fn new(full: String, short: String, ink: Role, kept: bool) -> Phrase {
+        Phrase {
+            full,
+            short_whole: short.clone(),
+            short,
+            ink,
+            kept,
+        }
+    }
+
+    /// The short form a rung naming its accounts `form` lays.
+    #[must_use]
+    pub fn short_in(&self, form: Names) -> &str {
+        match form {
+            Names::Whole => &self.short_whole,
+            Names::Local => &self.short,
+        }
+    }
 }
 
 /// One run of a fallback unit's words with its ink ([`QuotaView::fallback`]).
@@ -412,12 +461,12 @@ enum TailForm {
 }
 
 /// How a rung names its accounts (§2.5): each email whole ([`cut`]), or its local part
-/// ([`short`]).
+/// ([`short`]); either way no two accounts of one row alike ([`distinct`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Names {
+pub enum Names {
     /// The email, whole where it fits [`NAME_CELLS`].
     Whole,
-    /// The email's local part.
+    /// The email's local part, in [`SHORT_CELLS`].
     Local,
 }
 
@@ -440,12 +489,69 @@ const LADDER: [(Lead, Names, u8, TailForm); 11] = [
 ];
 
 impl Names {
-    /// `name` as this form lays it.
-    fn lay(self, name: &str) -> String {
+    /// The cells a name of this form takes at most.
+    #[must_use]
+    pub const fn cells(self) -> usize {
         match self {
-            Names::Whole => cut(name),
-            Names::Local => short(name),
+            Names::Whole => NAME_CELLS,
+            Names::Local => SHORT_CELLS,
         }
+    }
+}
+
+/// How one row lays its accounts' names (§2.5): each roster account's whole and narrow forms,
+/// cut once for the whole roster ([`distinct`]) so no two accounts read as one, and so each
+/// form of an account is one string wherever the lead, a name after a `→`, a lean's phrase, a
+/// column's title or line D's unit says it. Which form each says is its own: a rung's lead and
+/// tail say the rung's ([`Names`]), a `→` the widest its run holds ([`Chart::cells`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Laid {
+    /// Each account: its label, its name, its whole form and its narrow form.
+    forms: Vec<[String; 4]>,
+}
+
+impl Laid {
+    /// The forms of `names`, each a `(name, roster label)`.
+    #[must_use]
+    pub fn of(names: &[(&str, &str)]) -> Laid {
+        let whole = distinct(names, Names::Whole);
+        let local = distinct(names, Names::Local);
+        Laid {
+            forms: names
+                .iter()
+                .zip(whole.into_iter().zip(local))
+                .map(|((name, label), (whole, local))| {
+                    [(*label).to_owned(), (*name).to_owned(), whole, local]
+                })
+                .collect(),
+        }
+    }
+
+    /// The account labelled `label` as `form` lays it; an account these forms do not hold is
+    /// cut alone.
+    #[must_use]
+    pub fn of_label(&self, label: &str, name: &str, form: Names) -> String {
+        self.find(|held| held[0] == label && held[1] == name, name, form)
+    }
+
+    /// The account named `name` as `form` lays it (the first of that name); a name these forms
+    /// do not hold is cut alone.
+    #[must_use]
+    pub fn lay(&self, name: &str, form: Names) -> String {
+        self.find(|held| held[1] == name, name, form)
+    }
+
+    fn find(&self, which: impl Fn(&[String; 4]) -> bool, name: &str, form: Names) -> String {
+        self.forms.iter().find(|held| which(held)).map_or_else(
+            || match form {
+                Names::Whole => cut(name),
+                Names::Local => short(name),
+            },
+            |held| match form {
+                Names::Whole => held[2].clone(),
+                Names::Local => held[3].clone(),
+            },
+        )
     }
 }
 
@@ -463,22 +569,136 @@ pub fn level(x10: u16) -> u8 {
     }
 }
 
-/// A name as the glass lays it in at most [`NAME_CELLS`] cells: whole where it fits; an email
-/// that does not gives way to its local part ([`local`]) before anything is cut; what is still
-/// too wide is cut, its last cell an ellipsis.
+/// A name alone as the glass lays it in at most [`NAME_CELLS`] cells: whole where it fits; an
+/// email that does not gives way to its local part ([`local`]) before anything is cut; what is
+/// still too wide is cut, its last cell an ellipsis. Names laid together are cut together
+/// ([`distinct`], of which this is the one-name case).
 #[must_use]
 pub fn cut(name: &str) -> String {
-    if aterm_grapheme::str_grid_columns(name) <= NAME_CELLS {
-        return name.to_owned();
-    }
-    cells(local(name), NAME_CELLS)
+    apart(&[(name, "")], true, NAME_CELLS).swap_remove(0)
 }
 
-/// A name's narrow form (§2.4, §2.5): an email's local part, the words before its `@`, cut to
-/// [`SHORT_CELLS`]; any other name cut so.
+/// A name's narrow form alone (§2.4, §2.5): an email's local part, the words before its `@`,
+/// cut to [`SHORT_CELLS`]; any other name cut so ([`distinct`]'s one-name case).
 #[must_use]
 pub fn short(name: &str) -> String {
-    cells(local(name), SHORT_CELLS)
+    apart(&[(name, "")], false, SHORT_CELLS).swap_remove(0)
+}
+
+/// The names of `names`, each a `(name, roster label)`, as `form` lays them on one row, no two
+/// alike in what the glass shows of them (§2.5; [`shown`]: a character it draws as nothing
+/// tells no two apart): the one function every name on the row, in a column's title and in
+/// line D's unit is cut by. A name alone is cut as [`cut`] and [`short`] say. Names whose cuts
+/// read alike are cut again within the same cells as head, ellipsis and the shortest tail that
+/// tells them apart (`tidepool…1.2`, `tidepool…1.5`). Equal local parts first take the first
+/// label of their domain (`owner@acme`), and names still alike their roster label (`owner
+/// (alt2)`). Names no tail tells apart (they differ only in their middle) take an ordinal
+/// (`owner…#2`), so two accounts never read as one. Two entries of one name and one label are
+/// one account and read alike.
+#[must_use]
+pub fn distinct(names: &[(&str, &str)], form: Names) -> Vec<String> {
+    apart(names, form == Names::Whole, form.cells())
+}
+
+/// [`distinct`] in at most `max` cells, an email `whole` where it fits them. Two names are told
+/// apart by what the glass shows of them ([`shown`]), never by a character it draws as nothing.
+fn apart(names: &[(&str, &str)], whole: bool, max: usize) -> Vec<String> {
+    let n = names.len();
+    let same = |i: usize, j: usize| names[i] == names[j];
+    let alike = |a: &str, b: &str| shown(a).eq(shown(b));
+    let clash = |said: &[String], i: usize| {
+        (0..n).any(|j| j != i && alike(&said[j], &said[i]) && !same(i, j))
+    };
+    let mut base: Vec<String> = names
+        .iter()
+        .map(|(name, _)| {
+            if whole && aterm_grapheme::str_grid_columns(name) <= max {
+                (*name).to_owned()
+            } else {
+                local(name).to_owned()
+            }
+        })
+        .collect();
+    if n < 2 {
+        return base.iter().map(|name| cells(name, max)).collect();
+    }
+    // Equal local parts: the domain's first label, then the roster label.
+    base = (0..n)
+        .map(|i| match domain_label(names[i].0) {
+            Some(label) if base[i] != names[i].0 && clash(&base, i) => {
+                format!("{}@{label}", base[i])
+            }
+            _ => base[i].clone(),
+        })
+        .collect();
+    base = (0..n)
+        .map(|i| {
+            if clash(&base, i) {
+                format!("{} ({})", base[i], names[i].1)
+            } else {
+                base[i].clone()
+            }
+        })
+        .collect();
+    let mut out: Vec<String> = base.iter().map(|name| cells(name, max)).collect();
+    // Equal cuts: the shortest tail that tells the group apart.
+    for i in 0..n {
+        if !clash(&out, i) {
+            continue;
+        }
+        let group: Vec<usize> = (0..n).filter(|&j| alike(&out[j], &out[i])).collect();
+        let recut = (TAIL_CELLS..max.saturating_sub(1))
+            .map(|tail| {
+                group
+                    .iter()
+                    .map(|&j| middle_cut(&base[j], max, tail))
+                    .collect::<Vec<_>>()
+            })
+            .find(|cuts| {
+                (0..group.len()).all(|a| {
+                    (a + 1..group.len())
+                        .all(|b| same(group[a], group[b]) || !alike(&cuts[a], &cuts[b]))
+                })
+            });
+        for (&j, cut) in group.iter().zip(recut.into_iter().flatten()) {
+            out[j] = cut;
+        }
+    }
+    // What is still equal to an earlier name (no tail told them apart, or a re-cut met a name
+    // outside its group) takes an ordinal: after each step the names up to `i` are apart.
+    for i in 1..n {
+        if let Some(j) = (0..i).find(|&j| same(i, j)) {
+            out[i] = out[j].clone();
+            continue;
+        }
+        let mut k = 1;
+        while (0..i).any(|j| alike(&out[j], &out[i])) {
+            k += 1;
+            let mark = format!("\u{2026}#{k}");
+            let room = max.saturating_sub(aterm_grapheme::str_grid_columns(&mark));
+            let head: String = aterm_grapheme::grid_graphemes(&base[i])
+                .take_while(|cluster| cluster.end_col <= room)
+                .map(|cluster| cluster.text)
+                .collect();
+            out[i] = format!("{head}{mark}");
+        }
+    }
+    out
+}
+
+/// What the glass shows of `name`: its characters but each Default_Ignorable_Code_Point, which
+/// the glass draws as nothing (a zero-width space, a joiner, a variation selector, a bidi
+/// control). Names that differ only in those read as one.
+fn shown(name: &str) -> impl Iterator<Item = char> + '_ {
+    name.chars()
+        .filter(|&c| !crate::supervise::occupancy::git_url::default_ignorable(c))
+}
+
+/// The first label of an email's domain (`example` of `owner@example.com`), where it has one.
+fn domain_label(name: &str) -> Option<&str> {
+    let (head, domain) = name.split_once('@')?;
+    let label = domain.split('.').next()?;
+    (!head.is_empty() && !label.is_empty()).then_some(label)
 }
 
 /// An email's local part (`owner` of `owner@example.com`); a name with no `@` past its first
@@ -501,6 +721,33 @@ fn cells(name: &str, max: usize) -> String {
         .map(|cluster| cluster.text)
         .chain(std::iter::once("\u{2026}"))
         .collect()
+}
+
+/// `name` in at most `max` cells as its head, an ellipsis and its last `tail` cells
+/// (`tidepool…1.2`), between whole grapheme clusters; whole where it fits. The tail is the
+/// clusters whose cell starts in its last `tail` columns as the grid lays the whole name
+/// (`GridGrapheme::start_col`): a cluster the grid folds into the cell before it (a wide one
+/// after a joiner that ends a letter's cluster, `x\u{200d}😀`) starts at that cell, and goes
+/// with it.
+fn middle_cut(name: &str, max: usize, tail: usize) -> String {
+    if aterm_grapheme::str_grid_columns(name) <= max {
+        return name.to_owned();
+    }
+    let clusters: Vec<_> = aterm_grapheme::grid_graphemes(name).collect();
+    let width = clusters.last().map_or(0, |c| c.end_col);
+    let from = width.saturating_sub(tail);
+    let end: String = clusters
+        .iter()
+        .filter(|c| c.start_col >= from)
+        .map(|c| c.text)
+        .collect();
+    let head_room = max.saturating_sub(1 + aterm_grapheme::str_grid_columns(&end));
+    let head: String = clusters
+        .iter()
+        .take_while(|c| c.end_col <= head_room)
+        .map(|c| c.text)
+        .collect();
+    format!("{head}\u{2026}{end}")
 }
 
 /// Whole percent used, half up, at most 99: a curve short of a fill is never said out of its
@@ -555,7 +802,7 @@ impl Chart {
     /// `╳` where a stop covers at least half of it (a stop that covers no cell that much takes
     /// the cell that holds its start); `→` where a hand-off falls inside it, moved to the first
     /// cell after a gap that displaces it, the target's name after it in the widest of its forms
-    /// ([`cut`], else [`short`]) the run up to the next mark holds with one cell more; `↺` at a reset; `$` under credits; `┄` past
+    /// ([`Laid`]: whole, else narrow) the run up to the next mark holds with one cell more; `↺` at a reset; `$` under credits; `┄` past
     /// [`Chart::unknown_from`]; else the drawn account's fill at the cell's end.
     pub fn cells(&self, per_day: u8, out: &mut Vec<Cell>) {
         out.clear();
@@ -579,7 +826,7 @@ impl Chart {
         for &(from, to, credits) in &self.stops {
             self.cover(s, from, to, if credits { &mut paid } else { &mut gap });
         }
-        let mut arrow: Vec<Option<(&str, bool)>> = vec![None; n];
+        let mut arrow: Vec<Option<&str>> = vec![None; n];
         let mut reset = vec![false; n];
         for (t, mark) in &self.marks {
             let Some(mut j) = future_index(self.now, s, n, *t) else {
@@ -587,13 +834,13 @@ impl Chart {
             };
             match mark {
                 Mark::Reset => reset[j] = true,
-                Mark::Handoff(name) | Mark::Lean(name) => {
+                Mark::Handoff(name) | Mark::Lean(name, _) => {
                     // A hand-off a gap displaces moves to the first cell after it.
                     while j < n && gap[j] {
                         j += 1;
                     }
                     if j < n {
-                        arrow[j] = Some((name.as_str(), matches!(mark, Mark::Lean(_))));
+                        arrow[j] = Some(name.as_str());
                     }
                 }
             }
@@ -613,7 +860,7 @@ impl Chart {
             };
         }
         for j in 0..n {
-            let Some((name, lean)) = &arrow[j] else {
+            let Some(name) = arrow[j] else {
                 continue;
             };
             let room = future[j + 1..]
@@ -623,10 +870,10 @@ impl Chart {
             // The name whole where it fits, else its narrow form (an email's local part,
             // §2.5): an email seldom fits between two marks, and an arrow with no name says
             // nothing of where the work goes.
-            let fits = |name: &String| room > name.chars().count() + usize::from(*lean);
-            if let Some(name) = [cut(name), short(name)].iter().find(|name| fits(name)) {
-                let tail = lean.then_some('?');
-                for (cell, c) in future[j + 1..].iter_mut().zip(name.chars().chain(tail)) {
+            let fits = |name: &String| room > name.chars().count();
+            let forms = [Names::Whole, Names::Local].map(|form| self.names.lay(name, form));
+            if let Some(name) = forms.iter().find(|name| fits(name)) {
+                for (cell, c) in future[j + 1..].iter_mut().zip(name.chars()) {
                     *cell = Cell::Name(c);
                 }
             }
@@ -861,12 +1108,7 @@ struct StopSaid<'a> {
 /// off at the turn's end.
 fn phrase_of(words: &Words<'_>, verdict: &Verdict, carrier: bool) -> Option<Phrase> {
     let phrase = |full: String, short: String, ink: Role, kept: bool| {
-        Some(Phrase {
-            full,
-            short,
-            ink,
-            kept,
-        })
+        Some(Phrase::new(full, short, ink, kept))
     };
     match verdict {
         Verdict::Walled { to: None, until } => {
@@ -879,16 +1121,23 @@ fn phrase_of(words: &Words<'_>, verdict: &Verdict, carrier: bool) -> Option<Phra
             let (full, short) = words.stop_phrase(*from, *end);
             phrase(full, short, Role::Warn, true)
         }
-        Verdict::Lean { until, row, .. } => phrase(
-            format!(
-                "? {} unread from {}",
-                cut(words.name(row)),
-                words.about(*until)
-            ),
-            format!("? {} {}", cut(words.name(row)), words.about(*until)),
-            Role::Value,
-            true,
-        ),
+        // A lean says in words why the row it leans on holds no exact figure, never as a
+        // mark: its reason's short words (`alt1 not read from ~Fri 20:00`; `alt1 read earlier`
+        // for a bound, a row read before any Mac may have spent it), its short form naming the
+        // row as the rung's lead does.
+        Verdict::Lean {
+            until, row, why, ..
+        } => {
+            let (why, about) = (Why::of_lean(*why).brief(), words.about(*until));
+            let short = |form| format!("{} {why} {about}", words.laid(row, form));
+            Some(Phrase {
+                full: format!("{} {why} from {about}", words.laid(row, Names::Whole)),
+                short: short(Names::Local),
+                short_whole: short(Names::Whole),
+                ink: Role::Value,
+                kept: true,
+            })
+        }
         Verdict::Credits { at } => {
             let words = format!("{CREDITS_MARK} {}", words.about(*at));
             phrase(words.clone(), words, Role::Warn, true)
@@ -910,9 +1159,19 @@ struct Words<'a> {
     /// The lead is a reading this replay has not seen: the replay read nothing of this tab's
     /// row, and the footer holds its figure now (`own`), its first reading having come since.
     unseen: bool,
+    /// How the view lays its accounts' names ([`Laid`]), where the words are a view's.
+    names: Option<&'a Laid>,
 }
 
 impl Words<'_> {
+    /// The row `label`'s name as the view's lead lays it in `form` ([`Laid`]); cut alone,
+    /// whole, where the words are no view's (the CLI names a roster label).
+    fn laid(&self, label: &str, form: Names) -> String {
+        let name = self.name(label);
+        self.names
+            .map_or_else(|| cut(name), |names| names.of_label(label, name, form))
+    }
+
     /// Whether `verdict` is the replay's refusal for want of the reading this view's lead holds
     /// ([`Self::unseen`]): the carrier's `no reading` beside its own figure. Such a refusal is
     /// not said, on the row, in its title or aloud (§2.2: one figure at now); the next replay,
@@ -1125,8 +1384,9 @@ impl Words<'_> {
         }
         if let Some(lean) = &week.lean {
             let lean = format!(
-                "{}, which aterm cannot read, from {}",
+                "{}, {}, from {}",
                 self.name(&lean.row),
+                Why::of_lean(lean.why).which(),
                 self.spoken_about(lean.at)
             );
             if moves.is_empty() {
@@ -1192,22 +1452,26 @@ impl Outlook {
                     this_tab: true,
                     carrier: false,
                     figure: tab_figure,
+                    unread: (tab_figure == Figure::Unread).then_some(Why::NeverRead),
                     reset: None,
                     plan: None,
                 },
                 Some(i) => {
                     let row = &self.rows[*i];
                     let this_tab = Some(*i) == tab_row;
+                    let figure = if this_tab {
+                        tab_figure
+                    } else {
+                        row.figure(as_of)
+                    };
                     Named {
                         label: row.label.clone(),
                         name: row.name.clone(),
                         this_tab,
                         carrier: Some(*i) == carrier_row,
-                        figure: if this_tab {
-                            tab_figure
-                        } else {
-                            row.figure(as_of)
-                        },
+                        figure,
+                        unread: (figure == Figure::Unread)
+                            .then(|| row.unread(as_of).unwrap_or(Why::NeverRead)),
                         reset: reset_ahead(row, as_of),
                         plan: row.plan.title(),
                     }
@@ -1222,9 +1486,22 @@ impl Outlook {
         let tab_reset = tab_row.and_then(|i| reset_ahead(&self.rows[i], as_of));
         let drawn = movable.then_some(self.week.as_ref()).flatten();
         let wait = movable.then(|| self.wait_of(tab_row, tab_reset)).flatten();
-        let chart = self.chart_of(tab, tab_row, tab_figure, tab_reset, drawn, wait);
+        // Every roster account's name, cut together: no two read as one wherever the row, a
+        // column's title or line D's unit says them.
+        let pairs: Vec<(&str, &str)> = order
+            .iter()
+            .map(|o| {
+                o.map_or((THIS_LOGIN, THIS_LOGIN), |i| {
+                    (self.rows[i].name.as_str(), self.rows[i].label.as_str())
+                })
+            })
+            .collect();
+        let names = Laid::of(&pairs);
+        let mut chart = self.chart_of(tab, tab_row, tab_figure, tab_reset, drawn, wait);
+        chart.names = names.clone();
         let words = Words {
             unseen: row_figure == Figure::Unread && tab_figure != Figure::Unread,
+            names: Some(&names),
             ..self.words_for(tab)
         };
         let tail = self.tail_of(&words, tab_row, tab_figure, &chart, movable);
@@ -1232,6 +1509,7 @@ impl Outlook {
             as_of,
             named,
             folded,
+            names: names.clone(),
             chart,
             tail,
             title: String::new(),
@@ -1255,6 +1533,7 @@ impl Outlook {
             tab_reset: None,
             single: self.rows.len() <= 1,
             unseen: false,
+            names: None,
         };
         phrase_of(&words, &self.verdict, true)
     }
@@ -1273,6 +1552,7 @@ impl Outlook {
             tab_reset,
             single: self.rows.len() <= 1,
             unseen: false,
+            names: None,
         }
     }
 
@@ -1452,9 +1732,10 @@ impl Outlook {
             }
         }
         if let Some(lean) = &week.lean {
-            chart
-                .marks
-                .push((lean.at, Mark::Lean(self.name_of(&lean.row).to_owned())));
+            chart.marks.push((
+                lean.at,
+                Mark::Lean(self.name_of(&lean.row).to_owned(), Why::of_lean(lean.why)),
+            ));
         }
         chart.unknown_from = [week.lean.as_ref().map(|l| l.at), week.cut_at]
             .into_iter()
@@ -1508,12 +1789,12 @@ impl Outlook {
         if tab_figure == Figure::Unread {
             return Tail {
                 own: None,
-                verdict: Some(Phrase {
-                    full: NO_FIGURE_FULL.to_owned(),
-                    short: NO_FIGURE.to_owned(),
-                    ink: Role::Quiet,
-                    kept: false,
-                }),
+                verdict: Some(Phrase::new(
+                    NO_FIGURE_FULL.to_owned(),
+                    NO_FIGURE.to_owned(),
+                    Role::Quiet,
+                    false,
+                )),
             };
         }
         let verdict = self.verdict_for(tab_row);
@@ -1616,7 +1897,10 @@ impl Outlook {
             parts.extend(self.pace_title());
         }
         for other in view.named.iter().filter(|n| !n.this_tab) {
-            parts.push(format!("{} {}", other.name, other.figure.words()));
+            parts.push(match other.unread {
+                Some(why) => format!("{}: {}", other.name, why.sentence()),
+                None => format!("{} {}", other.name, other.figure.words()),
+            });
         }
         if !view.folded.is_empty() {
             parts.push(format!("+{} more", view.folded.len()));
@@ -1650,9 +1934,17 @@ impl Outlook {
                 false,
             )),
             Verdict::Lean {
-                until, row, stop, ..
+                until,
+                row,
+                why,
+                stop,
             } => {
-                let mut s = format!("{} unread from {}", words.name(row), words.about(*until));
+                let mut s = format!(
+                    "from {} the work moves to {}, {}",
+                    words.about(*until),
+                    words.name(row),
+                    Why::of_lean(*why).which()
+                );
                 if let Some((from, end)) = stop {
                     s.push_str(&format!(
                         "; if it has nothing, {}",
@@ -1713,6 +2005,8 @@ impl Outlook {
                     s.push_str(&format!(", resets {}", words.spoken_when(reset)));
                 }
                 s.push('.');
+            } else if let Some(why) = n.unread {
+                s.push_str(&format!(" {}: {}.", n.name, why.sentence()));
             } else {
                 s.push_str(&format!(" {} {}.", n.name, n.figure.spoken_short()));
             }
@@ -1827,6 +2121,7 @@ impl QuotaView {
                 this_tab: true,
                 carrier: true,
                 figure: Figure::Exact(630),
+                unread: None,
                 reset: None,
                 plan: Some("Max 20x".into()),
             }],
@@ -1835,12 +2130,12 @@ impl QuotaView {
                     by_reset: Some(99),
                     reset: "Sat 10:00".into(),
                 }),
-                verdict: Some(Phrase {
-                    full: format!("{GAP_MARK} ~Thu 12 Nov 04:00\u{2013}Sat 14 Nov 10:00"),
-                    short: format!("{GAP_MARK} ~Thu 12 Nov 04:00"),
-                    ink: Role::Warn,
-                    kept: true,
-                }),
+                verdict: Some(Phrase::new(
+                    format!("{GAP_MARK} ~Thu 12 Nov 04:00\u{2013}Sat 14 Nov 10:00"),
+                    format!("{GAP_MARK} ~Thu 12 Nov 04:00"),
+                    Role::Warn,
+                    true,
+                )),
             },
             title: format!(
                 "main{SEP}Max 20x{SEP}37% left of its week, read now{SEP}~1% left at its reset Sat \
@@ -1896,7 +2191,7 @@ impl QuotaView {
                 (false, Names::Local),
             ] {
                 out.clear();
-                out.put(&names.lay(&tab.name), Role::Lit, true);
+                out.put(&self.name(tab, names), Role::Lit, true);
                 out.lead = 0..out.cells.len();
                 if let Some(words) = &self.tail.verdict {
                     out.gap();
@@ -1937,7 +2232,7 @@ impl QuotaView {
             if self.tail.own.is_some() || self.tail.verdict.is_some() {
                 out.gap();
                 let from = out.cells.len();
-                self.write_tail(tail, out);
+                self.write_tail(tail, names, out);
                 out.tail = from..out.cells.len();
             }
             if out.cells.len() <= room {
@@ -1948,27 +2243,78 @@ impl QuotaView {
         false
     }
 
+    /// `n`'s name as a rung of `form` lays it: no other account of the row reads so ([`Laid`]).
+    #[must_use]
+    pub fn name(&self, n: &Named, form: Names) -> String {
+        self.names.of_label(&n.label, &n.name, form)
+    }
+
+    /// What a rung of `form` says after `n`'s name: its figure; of a week with none, why in
+    /// words ([`Why::words`], [`Why::brief`] beside a narrow name); of an account with no login
+    /// here, its login at every width ([`Figure::login`]). Never a mark and never a figure
+    /// nothing reported.
+    #[must_use]
+    pub fn said(n: &Named, form: Names) -> String {
+        match (n.unread, form) {
+            (Some(why), Names::Whole) => why.words().to_owned(),
+            (Some(why), Names::Local) => why.brief().to_owned(),
+            (None, _) => n.figure.words(),
+        }
+    }
+
+    /// The accounts a full lead says together, in roster order: each account with a figure
+    /// alone, and the accounts with none under each reason once (`alt1, alt2 not read`,
+    /// `alt3, alt4 signed out`), at the first of them.
+    fn lead_groups(&self, form: Names) -> Vec<(Vec<&Named>, String)> {
+        let mut groups: Vec<(Vec<&Named>, String)> = Vec::new();
+        for n in &self.named {
+            let said = QuotaView::said(n, form);
+            match groups
+                .iter_mut()
+                .find(|(of, words)| !n.has_figure() && !of[0].has_figure() && *words == said)
+            {
+                Some((of, _)) => of.push(n),
+                None => groups.push((vec![n], said)),
+            }
+        }
+        groups
+    }
+
     fn write_lead(&self, lead: Lead, names: Names, out: &mut QuotaLine) {
-        let one = |n: &Named, out: &mut QuotaLine| {
-            let role = if n.this_tab { Role::Lit } else { Role::Value };
-            out.put(&names.lay(&n.name), role, n.this_tab);
+        let one = |of: &[&Named], said: &str, out: &mut QuotaLine| {
+            let tab = of.iter().any(|n| n.this_tab);
+            let role = if tab { Role::Lit } else { Role::Value };
+            for (i, n) in of.iter().enumerate() {
+                if i > 0 {
+                    out.put(", ", Role::Quiet, false);
+                }
+                out.put(&self.name(n, names), role, tab);
+            }
             out.put(" ", Role::Quiet, false);
-            // An account's login is a fact of its row, said quietly in its figure's place; the
-            // narrow form goes with the narrow name.
-            let (words, ink) = match (n.figure.of_login(), names) {
-                (true, Names::Whole) => (n.figure.words(), Role::Quiet),
-                (true, Names::Local) => (n.figure.narrow_words(), Role::Quiet),
-                (false, _) => (n.figure.words(), role),
-            };
-            out.put(&words, ink, n.this_tab && !n.figure.of_login());
+            // Words in a figure's place (why a week has none, or an account's login) are a fact
+            // of the row, said in the quiet ink and never bold: no number is there to read. A
+            // figure is read in its account's ink, and the word after it (`left`) is quiet, as
+            // `·` and `+2` are (§1.3); `out` is a figure with no word after it.
+            if !of[0].has_figure() {
+                out.put(said, Role::Quiet, false);
+            } else if let Some(figure) = said
+                .strip_suffix(super::left::WORD)
+                .and_then(|rest| rest.strip_suffix(' '))
+            {
+                out.put(figure, role, tab);
+                out.put(" ", Role::Quiet, false);
+                out.put(super::left::WORD, Role::Quiet, false);
+            } else {
+                out.put(said, role, tab);
+            }
         };
         match lead {
             Lead::Full => {
-                for (i, n) in self.named.iter().enumerate() {
+                for (i, (of, said)) in self.lead_groups(names).iter().enumerate() {
                     if i > 0 {
                         out.put(SEP, Role::Quiet, false);
                     }
-                    one(n, out);
+                    one(of, said, out);
                 }
                 if !self.folded.is_empty() {
                     out.put(&format!(" +{}", self.folded.len()), Role::Quiet, false);
@@ -1976,7 +2322,7 @@ impl QuotaView {
             }
             Lead::Fold | Lead::Tab => {
                 if let Some(tab) = self.tab() {
-                    one(tab, out);
+                    one(&[tab], &QuotaView::said(tab, names), out);
                 }
                 let others = self.named.len().saturating_sub(1) + self.folded.len();
                 if lead == Lead::Fold && others > 0 {
@@ -1989,14 +2335,12 @@ impl QuotaView {
     fn write_own(own: &Own, full: bool, out: &mut QuotaLine) {
         if let Some(pct) = own.by_reset.filter(|_| full) {
             out.put(
-                &format!(
-                    "~{}% {}",
-                    super::left::of_whole(u32::from(pct)),
-                    super::left::WORD
-                ),
+                &format!("~{}%", super::left::of_whole(u32::from(pct))),
                 Role::Value,
                 false,
             );
+            out.put(" ", Role::Quiet, false);
+            out.put(super::left::WORD, Role::Quiet, false);
             out.put(" at ", Role::Quiet, false);
         }
         out.put(&RESET_MARK.to_string(), Role::Lit, false);
@@ -2004,7 +2348,9 @@ impl QuotaView {
         out.put(&own.reset, Role::Value, false);
     }
 
-    fn write_tail(&self, tail: TailForm, out: &mut QuotaLine) {
+    /// The tail in `tail`'s form, an account phrase 2 names said as the rung's lead says it
+    /// (`names`, [`Phrase::short_in`]).
+    fn write_tail(&self, tail: TailForm, names: Names, out: &mut QuotaLine) {
         let full = tail == TailForm::T0;
         let own = match tail {
             TailForm::T2 if self.tail.verdict.is_some() => None,
@@ -2018,7 +2364,11 @@ impl QuotaView {
                 out.put(SEP, Role::Quiet, false);
             }
             out.put(
-                if full { &verdict.full } else { &verdict.short },
+                if full {
+                    &verdict.full
+                } else {
+                    verdict.short_in(names)
+                },
                 verdict.ink,
                 false,
             );
@@ -2040,6 +2390,8 @@ impl QuotaView {
     pub fn column_title(&self, per_day: u8, cell: usize, offsets: &Offsets) -> Option<String> {
         let chart = &self.chart;
         let (a, b) = chart.span_of(per_day, cell)?;
+        // Each name as the lead lays it whole: no two accounts read as one.
+        let whole = |name: &str| self.names.lay(name, Names::Whole);
         let mut cells = Vec::new();
         chart.cells(per_day, &mut cells);
         let k = usize::from(per_day);
@@ -2055,11 +2407,11 @@ impl QuotaView {
                     let r = chart.past.get(i.checked_sub(1)?)?;
                     format!(
                         "{span}{SEP}{} {} (read on this Mac)",
-                        cut(tab),
+                        whole(tab),
                         super::left::words(u32::from(r.x10))
                     )
                 }
-                Cell::Reset => format!("{span}{SEP}{}'s week reset", cut(tab)),
+                Cell::Reset => format!("{span}{SEP}{}'s week reset", whole(tab)),
                 _ => format!("{span}{SEP}no reading on this Mac"),
             });
         }
@@ -2069,7 +2421,7 @@ impl QuotaView {
             self.named
                 .iter()
                 .find(|n| n.reset.is_some_and(|r| (t - r).rem_euclid(WEEK) == 0))
-                .map(|n| cut(&n.name))
+                .map(|n| whole(&n.name))
         };
         let run_at = |t: i64| {
             chart
@@ -2125,7 +2477,7 @@ impl QuotaView {
                 let (t, mark) = chart
                     .marks
                     .iter()
-                    .filter(|(_, m)| matches!(m, Mark::Handoff(_) | Mark::Lean(_)))
+                    .filter(|(_, m)| matches!(m, Mark::Handoff(_) | Mark::Lean(..)))
                     .rfind(|(t, _)| {
                         future_index(now, s, cells.len() - k - 1, *t).is_some_and(|at| {
                             at <= arrow
@@ -2159,16 +2511,17 @@ impl QuotaView {
                         match from {
                             Some(from) => format!(
                                 "{at}{SEP}the work moves from {}{pct} to {}",
-                                cut(&from.name),
-                                cut(to)
+                                whole(&from.name),
+                                whole(to)
                             ),
-                            None => format!("{at}{SEP}the work moves to {}", cut(to)),
+                            None => format!("{at}{SEP}the work moves to {}", whole(to)),
                         }
                     }
-                    Mark::Lean(to) => format!(
-                        "{}{SEP}the work moves to {}, which aterm has not read",
+                    Mark::Lean(to, why) => format!(
+                        "{}{SEP}the work moves to {}, {}",
                         about(*t),
-                        cut(to)
+                        whole(to),
+                        why.which()
                     ),
                     Mark::Reset => return None,
                 }
@@ -2180,19 +2533,19 @@ impl QuotaView {
                     .find(|(t, m)| matches!(m, Mark::Reset) && (a..b).contains(t))
                     .map_or(a, |(t, _)| *t);
                 let label = reset_of(t)
-                    .or_else(|| run_at(t + 1).map(|r| cut(&r.name)))
-                    .unwrap_or_else(|| cut(tab));
+                    .or_else(|| run_at(t + 1).map(|r| whole(&r.name)))
+                    .unwrap_or_else(|| whole(tab));
                 format!("{}{SEP}{label}'s week resets", when(t, now, offsets))
             }
             Cell::Ahead(_) => {
                 let run = run_at(b)?;
                 match run.at(b.min(run.to)) {
                     Some(x10) if x10 >= 1000 => {
-                        format!("~{span}{SEP}{} out (projected)", cut(&run.name))
+                        format!("~{span}{SEP}{} out (projected)", whole(&run.name))
                     }
                     Some(x10) => format!(
                         "~{span}{SEP}{} ~{}% {} (projected)",
-                        cut(&run.name),
+                        whole(&run.name),
                         super::left::ahead(u32::from(x10)),
                         super::left::WORD
                     ),
@@ -2214,8 +2567,8 @@ impl QuotaView {
         let Some(tab) = self.tab() else {
             return Vec::new();
         };
-        let name = Piece::new(cut(&tab.name), Role::Lit);
-        let local = Piece::new(short(&tab.name), Role::Lit);
+        let name = Piece::new(self.name(tab, Names::Whole), Role::Lit);
+        let local = Piece::new(self.name(tab, Names::Local), Role::Lit);
         if self.waiting() {
             let mut forms = vec![
                 vec![

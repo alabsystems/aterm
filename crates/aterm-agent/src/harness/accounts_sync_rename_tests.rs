@@ -69,7 +69,7 @@ impl Bed {
             (
                 &[],
                 &[FleetSnapshot {
-                    path: source.clone(),
+                    at: SnapshotAt::File(source.clone()),
                     bytes: Some(fs::read(source).unwrap()),
                 }],
             ),
@@ -645,7 +645,7 @@ fn renamed_accounts_refuse_stale_completions_for_the_reused_label() {
             reset.until.unwrap(),
             &reset.sid,
             &accounts::ResetDone::Used {
-                kind: aterm_phase::ResetKind::Full,
+                kind: alab_policy::vocab::ResetKind::Full,
                 left: Some(0)
             },
             NOW

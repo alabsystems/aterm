@@ -5,17 +5,20 @@ use super::*;
 use crate::harness::upgrade_drive::{self, Instances, Opts, Report};
 use crate::supervise::ScratchDir;
 use crate::supervise::approvals::Row;
-use crate::supervise::config::CONTINUE_TEXT;
 use crate::supervise::journal::ATTENTION_KEPT;
 use crate::supervise::policy::approval::{
     RULE_ALLOW_ONCE, RULE_ANSWER_LONG_TERM, RULE_LIMIT_WAIT, RULE_READ_ONLY,
 };
 use crate::supervise::policy::question::RULE_ANSWER_RECOMMENDED;
 use crate::supervise::policy::turn_end::{
-    LAND_ANSWER, LAND_NUDGE_COMMITTED_BEFORE, RULE_ACCOUNT, RULE_ANSWER, RULE_API_BACK,
-    RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT, RULE_CONSENT, RULE_CONTINUE, RULE_DONE_CHECK,
-    RULE_HOST_TURN, RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_LIMIT_RESUME, RULE_LOGIN,
-    RULE_OUTAGE_RESUME, RULE_SUGGESTION, RULE_USAGE_PROBE, WAKE_KEPT,
+    RULE_ACCOUNT, RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT,
+    RULE_CONSENT, RULE_HOST_TURN, RULE_LIMIT_RESUME, RULE_LOGIN, RULE_OUTAGE_RESUME,
+    RULE_SUGGESTION, RULE_USAGE_PROBE,
+};
+use alab_policy::config::CONTINUE_TEXT;
+use alab_policy::words::{
+    LAND_ANSWER, LAND_NUDGE_COMMITTED_BEFORE, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND_ANSWER,
+    RULE_LAND_NUDGE, WAKE_KEPT,
 };
 
 fn row(ts: i64, sid: &str, rule_id: &str, outcome: Outcome, command: &str, reason: &str) -> String {
@@ -2826,7 +2829,7 @@ fn a_need_told_is_counted_apart_from_escalations_and_waits() {
 /// §14.17 item 3): a journal line reads it as Land's act, clipped inside the why or not.
 #[test]
 fn the_switchs_ask_opens_with_lands_words_clipped_or_whole() {
-    use crate::supervise::policy::turn_end::{LAND, switch_why};
+    use alab_policy::words::{LAND, switch_why};
     let mark = crate::harness::harness_mark!();
     let ask = format!(
         "{mark} {}{}",
@@ -3240,7 +3243,7 @@ fn the_task_doors_rows_count_no_line() {
 /// words, which quote the agent's own park.
 #[test]
 fn a_go_ahead_decision_says_the_owners_standing_go_ahead() {
-    let typed = crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    let typed = alab_policy::go_ahead::GO_AHEAD_ANSWER;
     assert_eq!(&*prose_answer_words(RULE_GO_AHEAD, typed), GO_AHEAD_DID);
     assert_eq!(
         crate::harness::acts::self_claim_act(RULE_GO_AHEAD).map(|(word, _)| word),

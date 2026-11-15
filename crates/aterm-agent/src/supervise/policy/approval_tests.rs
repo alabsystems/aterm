@@ -10,7 +10,7 @@ use aterm_phase::prompt::fixtures as phase_fixtures;
 
 use super::super::question::RULE_ANSWER_RECOMMENDED;
 use super::*;
-use crate::supervise::classify::{MEASURED_SUBSTITUTION_BYPASSES, classify_command};
+use alab_policy::classify::{MEASURED_SUBSTITUTION_BYPASSES, classify_command};
 
 const CAP_RM: &str = include_str!("fixtures/cap-rm.txt");
 const CAP_BOX1: &str = include_str!("fixtures/cap-box1.txt");
@@ -1195,7 +1195,7 @@ fn the_limit_options_dialog_chooses_the_wait_row_by_its_label() {
 
 #[test]
 fn the_limit_options_dialog_whose_title_wraps_chooses_the_wait_row() {
-    let guard = crate::supervise::policy::row_guard("  What do you want to");
+    let guard = alab_policy::guard::row_guard("  What do you want to");
     for (text, wait) in [
         (
             phase_fixtures::LIMIT_OPTIONS_26_2_1_300,
@@ -1255,10 +1255,7 @@ fn a_title_whole_on_its_row_leaves_the_box_its_body() {
             ..
         } => {
             assert_eq!(rule_id, RULE_ALLOW_ONCE);
-            assert_eq!(
-                guard,
-                crate::supervise::policy::row_guard(&format!(" {path}"))
-            );
+            assert_eq!(guard, alab_policy::guard::row_guard(&format!(" {path}")));
             assert_eq!(subject, path);
         }
         d => panic!("{d:?}"),
@@ -1314,7 +1311,7 @@ fn the_limit_dialog_in_the_fullscreen_panel_waits_for_its_dated_reset() {
     const UPGRADE: &str = "Upgrade your plan";
     const FUNDS: &str = "Add funds to continue with usage credits";
     let rows = phase_fixtures::screen(phase_fixtures::LIMIT_OPTIONS_PANEL);
-    let guard = crate::supervise::policy::row_guard("   What do you want to do?");
+    let guard = alab_policy::guard::row_guard("   What do you want to do?");
     for screen in [
         rows.clone(),
         phase_fixtures::limit_options_panel(&[STOP, WAIT, CREDITS], 0, false),
@@ -1437,7 +1434,7 @@ fn resetting(ctx: ApprovalCtx) -> ApprovalCtx {
 #[test]
 fn the_grant_row_is_taken_by_its_own_rule_and_only_with_its_key_on() {
     let rows = reset_dialog();
-    let guard = crate::supervise::policy::row_guard("   What do you want to do?");
+    let guard = alab_policy::guard::row_guard("   What do you want to do?");
     let m = aterm_observe::row_matcher(&guard).expect("compiles");
     assert_eq!(
         rows.iter().filter(|r| m.matches(r)).collect::<Vec<_>>(),
@@ -1630,9 +1627,9 @@ fn the_reset_rule_takes_only_the_one_reset_on_offer_and_never_a_fable_row() {
 
 #[test]
 fn under_the_owners_order_the_reset_rule_takes_the_first_listed_kind_on_offer() {
-    use aterm_phase::ResetKind::{Full, Session, Weekly};
+    use alab_policy::vocab::ResetKind::{Full, Session, Weekly};
     use aterm_phase::reset::fixtures as composed;
-    let listed = |on: bool, kinds: Vec<aterm_phase::ResetKind>| ApprovalCtx {
+    let listed = |on: bool, kinds: Vec<alab_policy::vocab::ResetKind>| ApprovalCtx {
         limit_reset: on,
         reset_kinds: kinds,
         ..full()
@@ -7597,8 +7594,8 @@ fn a_dialog_ink_wrapped_is_answered_by_its_own_rule() {
         );
     }
     let own = ApprovalCtx::new(
-        PathBuf::from("/Users//user00/aterm"),
-        Some(PathBuf::from("/Users//user00")),
+        PathBuf::from("/Users/_user0/aterm"),
+        Some(PathBuf::from("/Users/_user0")),
         502,
         None,
         std::sync::Arc::new(crate::supervise::policy::LiveProbe),
@@ -7992,8 +7989,8 @@ fn full_power_trusts_any_folder_and_names_the_backstops_grants() {
 
     let backstop = phase_fixtures::screen(phase_fixtures::TRUST_BACKSTOP);
     let mut own = ApprovalCtx::new(
-        PathBuf::from("/Users//user00/aterm"),
-        Some(PathBuf::from("/Users//user00")),
+        PathBuf::from("/Users/_user0/aterm"),
+        Some(PathBuf::from("/Users/_user0")),
         502,
         None,
         std::sync::Arc::new(crate::supervise::policy::LiveProbe),
@@ -8018,10 +8015,10 @@ fn full_power_trusts_any_folder_and_names_the_backstops_grants() {
     two.insert(at + 1, "   Read(~/secrets/**)".to_string());
     two.insert(at + 2, String::new());
     two.insert(at + 3, " ⚠ This folder adds 1 directory:".to_string());
-    two.insert(at + 4, "   /Users//user00/other".to_string());
+    two.insert(at + 4, "   /Users/_user0/other".to_string());
     let d = on_screen(&two, &own);
     let (_, _, _, subject, _) = approval(&d);
-    for row in ["Bash(git:*)", "Read(~/secrets/**)", "/Users//user00/other"] {
+    for row in ["Bash(git:*)", "Read(~/secrets/**)", "/Users/_user0/other"] {
         assert!(subject.contains(row), "{row}: {subject}");
     }
 }
@@ -8584,7 +8581,7 @@ fn a_box_taller_than_the_pane_is_pressed_by_no_level() {
         (
             "incident",
             tail(&incident, 18),
-            "   │ cd /Users//user00/trust-vc-m1-notes/reader &&",
+            "   │ cd /Users/_user0/trust-vc-m1-notes/reader &&",
         ),
         ("heredoc", heredoc.clone(), "   │ cat > notes.txt <<'EOF'"),
     ] {
@@ -9652,6 +9649,15 @@ fn a_git_read_whose_bash_tool_settings_change_git_escalates() {
             "GIT_CONFIG_GLOBAL",
         ),
         (r#"{"env":{"HOME":"/tmp/elsewhere"}}"#, "HOME"),
+        (r#"{"env":{"LD_PRELOAD":""}}"#, "LD_PRELOAD"),
+        (
+            r#"{"env":{"DYLD_PRINT_TO_FILE":"./loader-trace"}}"#,
+            "DYLD_PRINT_TO_FILE",
+        ),
+        (
+            r#"{"env":{"DYLD_PRINT_LIBRARIES":""}}"#,
+            "DYLD_PRINT_LIBRARIES",
+        ),
     ] {
         std::fs::write(&project, body).expect("settings");
         let why = reason(&on_screen(&status, &c)).to_string();
@@ -10134,7 +10140,7 @@ fn a_box_whose_footer_wraps_is_decided_by_its_whole_footer() {
 
 #[test]
 fn the_autocompact_offer_chooses_the_accept_row_at_400k() {
-    let guard = crate::supervise::policy::row_guard(" We recommend compacting earlier");
+    let guard = alab_policy::guard::row_guard(" We recommend compacting earlier");
     let accept = "Autocompact at ‹ 400k › tokens".to_string();
     for (text, steps) in [
         (phase_fixtures::AUTOCOMPACT_KEEP_FIRST, 1),
@@ -10305,7 +10311,7 @@ fn the_auto_mode_setup_offer_is_put_off_with_not_now_at_every_level() {
             .iter()
             .find(|r| r.trim().starts_with("Teach auto"))
             .expect("the title row");
-        let guard = crate::supervise::policy::row_guard(title);
+        let guard = alab_policy::guard::row_guard(title);
         for c in [ctx(), full(), none(full())] {
             let d = on_screen(&rows, &c);
             let Decision::Approve {
@@ -10410,7 +10416,7 @@ fn the_chrome_intro_is_confirmed_with_its_enter_at_safe_and_all() {
         assert_eq!(p.kind, PromptKind::ChromeIntro);
         let title = &rows[p.span.0];
         assert!(title.trim().starts_with("Claude in"), "{title:?}");
-        let guard = crate::supervise::policy::row_guard(title);
+        let guard = alab_policy::guard::row_guard(title);
         for c in [ctx(), full()] {
             let d = on_screen(&rows, &c);
             let Decision::Approve {
@@ -10536,7 +10542,7 @@ fn a_look_alike_of_the_chrome_intro_is_not_pressed_by_its_rule() {
         (
             "a phase that is no prompt",
             aterm_phase::Reading {
-                phase: aterm_phase::Phase::Idle,
+                phase: alab_policy::vocab::Phase::Idle,
                 ..read.clone()
             },
         ),

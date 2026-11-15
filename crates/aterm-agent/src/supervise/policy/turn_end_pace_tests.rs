@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
+use alab_policy::config::TurnEndTiming;
 
 // THE PACE AROUND A WALL: a wall drawn again after a typed resume, another
 // program in the tab, and the agent's own going on past its limit.
@@ -46,7 +47,7 @@ type NamedAgain<'a> = &'a dyn Fn(Instant) -> Option<Instant>;
 /// The short back-off after `short` short turns in a row.
 fn short_backoff(short: u32) -> Duration {
     let t = TurnEndTiming::default();
-    crate::supervise::ladder::doubling(t.short_backoff, short - 1, t.short_backoff_max)
+    alab_policy::ladder::doubling(t.short_backoff, short - 1, t.short_backoff_max)
 }
 
 /// A WALL DRAWN AGAIN WITH A NEARER RESET IS WAITED OUT TO IT
@@ -83,7 +84,7 @@ fn a_wall_drawn_again_with_a_nearer_reset_is_waited_out_to_it() {
         (Program::Agy, WallKind::Spend, AGY_429),
         (Program::Muse, WallKind::UsageSession, MUSE_LIMIT),
     ] {
-        let grace = timing.grace_for(program);
+        let grace = grace_for(&timing, program);
         let wall =
             |reset: Option<Instant>, jitter: Duration, worked: Option<Duration>| TurnEndReading {
                 program,
@@ -340,7 +341,7 @@ fn the_agents_own_going_on_past_its_limit_is_no_short_turn_again() {
                     },
             )
         } else {
-            let typed_at = reset + timing.grace_for(Program::Claude);
+            let typed_at = reset + grace_for(&timing, Program::Claude);
             let quiet = TurnEndReading {
                 worked: None,
                 ..wall.clone()

@@ -337,7 +337,8 @@ fn folders_that_were_not_found_fold_into_one_row_while_it_is_up() {
     assert_eq!(rows(&app, shut), 1, "a folder not entered: its own row");
 
     let id = app.messages.live_by_key(key).expect("the row").id;
-    assert!(app.messages.dismiss(id, Instant::now()));
+    let wall = app.messages_wall.now();
+    assert!(app.messages.dismiss(id, wall, Instant::now()));
     fell_back("/work/d", Fault::Missing);
     app.drain_message_inbox();
     let fresh = &app
@@ -442,7 +443,8 @@ fn a_repeated_config_warning_is_a_record_once_its_row_left_the_glass() {
     let mut app = App::headless_for_test();
     app.replace_config_messages(typo(3, "windw_padding"));
     let first = app.messages.live_by_key(key).map(|l| l.id).expect("a row");
-    assert!(app.messages.mark_seen(first, Instant::now()));
+    let wall = app.messages_wall.now();
+    assert!(app.messages.mark_seen(first, wall, Instant::now()));
     app.sync_messages();
     assert!(app.messages.live_by_key(key).is_none(), "read, and folded");
     let records = |app: &App| {
@@ -473,7 +475,8 @@ fn a_repeated_config_warning_is_a_record_once_its_row_left_the_glass() {
         .live_by_key(key)
         .map(|l| l.id)
         .expect("a problem that came back after its fix is raised again");
-    assert!(app.messages.mark_seen(again, Instant::now()));
+    let wall = app.messages_wall.now();
+    assert!(app.messages.mark_seen(again, wall, Instant::now()));
     app.sync_messages();
     app.replace_config_messages(typo(5, "colums"));
     assert!(
@@ -818,6 +821,46 @@ fn a_details_press_marks_the_row_seen_and_folds_a_held_one() {
         "a plain open leaves the page as it was"
     );
     assert!(!app.open_messages_entry(WindowId(77), Some(standing)));
+}
+
+/// What a person does to a row after the Mac slept is filed at `messages_wall`, the host's wall
+/// clock at the press, which is the clock a re-post's stamp comes from: a Details press on the
+/// band (`perform_intent`), one on Settings ▸ Messages (`perform_message_act`), a navigation
+/// press, and an answer its reporter confirmed (`answer_message`). The pinned wall moves 30 h
+/// between the posts and the presses while the monotonic clock moves only the milliseconds the
+/// test takes, as a sleep leaves them. NEGATIVE CONTROL: a press filed at the row's own reading
+/// (the post's wall plus the monotonic time since) lands at the post's wall, 30 h before the
+/// press, and one that reads the host's own clock in place of `messages_wall` lands at this
+/// machine's time; either fails the filing's assertion.
+#[test]
+fn a_press_after_a_sleep_is_filed_at_the_hosts_wall_clock() {
+    const POSTED_MS: u64 = 1_790_000_000_000;
+    const PRESSED_MS: u64 = POSTED_MS + 30 * 60 * MIN_MS + MIN_MS;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let packages = Intent::OpenSettings {
+        route: "/packages".into(),
+    };
+    app.messages_wall = pinned_wall(POSTED_MS, 0);
+    let band = app.post_message(warn("read on the band"));
+    let page = app.post_message(warn("read on the page"));
+    let navigated = app.post_message(warn("Packages need attention").action(packages.clone()));
+    let answered = app.post_message(warn("answered by its reporter"));
+    app.messages_wall = pinned_wall(PRESSED_MS, 0);
+    assert!(app.perform_intent(wid, band, Intent::Details));
+    assert!(matches!(
+        app.perform_message_act(wid, page.raw(), ActionIndex::DETAILS.0),
+        MessageActOutcome::Performed { .. }
+    ));
+    assert!(app.perform_intent(wid, navigated, packages));
+    assert!(app.answer_message(answered, "Not now"));
+    for id in [band, page, navigated, answered] {
+        assert_eq!(
+            app.messages.log().get(id).unwrap().retired_unix_ms,
+            Some(PRESSED_MS),
+            "message {id} is filed at the press"
+        );
+    }
 }
 
 #[test]
@@ -2525,7 +2568,8 @@ fn a_health_warning_the_parked_parent_dismissed_is_still_healed_on_record() {
         committed_after_park("parked-dismissal", say_check_warning, |parent| {
             let warning = parent.live_update_health(|_| true);
             assert_eq!(warning.len(), 1, "PRECONDITION: the warning is up");
-            assert!(parent.messages.dismiss(warning[0], Instant::now()));
+            let wall = parent.messages_wall.now();
+            assert!(parent.messages.dismiss(warning[0], wall, Instant::now()));
         });
     assert!(
         successor.live_update_health(|_| true).is_empty(),
@@ -2610,7 +2654,8 @@ fn a_healing_the_parked_parent_recorded_is_on_record_once_whatever_its_row_did()
                 let warning =
                     parent.live_update_health(|kind| kind == update_words::HealthKind::Check);
                 assert_eq!(warning.len(), 1, "PRECONDITION: the warning is up");
-                assert!(parent.messages.dismiss(warning[0], Instant::now()));
+                let wall = parent.messages_wall.now();
+                assert!(parent.messages.dismiss(warning[0], wall, Instant::now()));
             }) as fn(&mut App),
         ),
         (
@@ -4094,7 +4139,8 @@ fn r44_host2_a_reload_that_never_rederived_the_font_family_leaves_its_row() {
         let title = msg.title.clone();
         let id = app.post_message(msg);
         if dismissed {
-            assert!(app.messages.dismiss(id, Instant::now()));
+            let wall = app.messages_wall.now();
+            assert!(app.messages.dismiss(id, wall, Instant::now()));
             app.sync_messages();
         }
         app.replace_config_messages(Vec::new());

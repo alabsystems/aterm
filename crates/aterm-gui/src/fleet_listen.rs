@@ -1918,7 +1918,12 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                     ));
                 };
                 let reader = crate::fleet_activity::Reader::of(served.peer_node());
-                if !crate::control::attach_fleet_connection(near, (content, drive), peer, reader) {
+                if !crate::control::attach_fleet_connection(
+                    near,
+                    (content, drive),
+                    (peer, crate::survey::Taking::Look),
+                    reader,
+                ) {
                     return Err(std::io::Error::other(
                         "this aterm's control server is not serving",
                     ));
@@ -2325,7 +2330,9 @@ fn cut_unserved_with_denied(
 #[cfg(unix)]
 fn driver_name(node: &str, host: Option<&str>, knows: &[String]) -> String {
     let short = aterm_net::fleet_member::node_head(node, knows);
-    match host.filter(|host| aterm_net::fleet_member::is_host(host)) {
+    match host.filter(|host| {
+        aterm_net::fleet_member::is_host(host) && host.parse::<std::net::IpAddr>().is_err()
+    }) {
         Some(host) => format!("{host} (node {short})"),
         None => format!("node {short}"),
     }
@@ -2775,7 +2782,7 @@ fn push_facts_heartbeat(
     let Some(state) = aterm_types::dirs::state_dir() else {
         return;
     };
-    let here = crate::survey::Here::cached_for_listener();
+    let here = crate::survey::Here::cached(crate::survey::Taking::NoLook);
     let Some(mut facts) = here.facts else {
         return;
     };

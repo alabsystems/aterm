@@ -795,7 +795,12 @@ fn write_started(
     // table whose rows lapsed or were carried frees its directory (`catalog::release`). Neither
     // ever fails the write.
     if let Some(snapshot) = &snapshot {
-        crate::alab::roll::endorse(&session, &directory, snapshot);
+        crate::alab::roll::endorse(
+            &session,
+            &directory,
+            snapshot,
+            &crate::alab::secret::store(paths),
+        );
         let _ = directory.release_due(&session, snapshot, now, &crate::alab::roll::covered);
     }
 

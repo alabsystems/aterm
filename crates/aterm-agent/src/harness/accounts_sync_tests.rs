@@ -442,7 +442,7 @@ fn builds_machine_roster_adopting_current_default_profile_email() {
                 until,
                 "s-before-adoption",
                 &accounts::ResetDone::Used {
-                    kind: aterm_phase::ResetKind::Full,
+                    kind: alab_policy::vocab::ResetKind::Full,
                     left: None,
                 },
                 now - 10,
@@ -1919,6 +1919,8 @@ struct Witness {
     logged: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// One run of a route: none unless a test scripts one.
     run_attempt: Option<RunAttempt>,
+    /// Which rows run on their vault token here: unknown unless a test says so.
+    tokens_here: TokensRead,
 }
 
 /// A spawn seam that runs its work at once, on the caller's thread.
@@ -1951,6 +1953,7 @@ impl Witness {
             vault_sync: |_: &Path, _scope| super::super::sign_in_ladder::Vault::NotMember,
             logged: std::sync::Arc::default(),
             run_attempt: None,
+            tokens_here: |_, _, _, _| None,
         }
     }
 
@@ -1974,7 +1977,7 @@ impl Witness {
                 logged.lock().unwrap().push(line.to_owned());
             }),
             run_attempt: self.run_attempt.clone(),
-            save_oauth: |_, _| Ok("inert".into()),
+            tokens_here: self.tokens_here,
             shared: shared_renewal::Effects::default(),
         }
     }
@@ -2728,7 +2731,7 @@ fn sync_accounts_for_init_merges_newly_signed_in_local_accounts() {
             Ok(answer.clone())
         };
         let expected = FleetSnapshot {
-            path: checked_path.to_path_buf(),
+            at: SnapshotAt::File(checked_path.to_path_buf()),
             bytes: expected,
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -2774,22 +2777,19 @@ fn sync_accounts_for_init_merges_newly_signed_in_local_accounts() {
         replacement.as_bytes()
     );
 
-    for (secrets_source, merging) in [(true, false), (true, true), (false, false), (false, true)] {
+    for merging in [false, true] {
         let race = World::new();
         race.write_config("[fleet]\nmachine = \"m27\"\n");
-        let source = if secrets_source {
-            let secrets = race.home.join(".secrets");
-            fs::create_dir(&secrets).unwrap();
-            secrets.join(FLEET_ROSTER_FILE)
-        } else {
-            race.fleet_file()
-        };
         let mut initial =
             FleetRoster::from_toml(std::str::from_utf8(&captured).unwrap(), "initial").unwrap();
         initial.accounts.truncate(2);
         // The list discovery wrote: a named list takes only accounts this Mac shows
         // all of, and here only the first is still shown.
-        fs::write(&source, initial.to_toml_for(Some(OptIn::Discovered))).unwrap();
+        fs::write(
+            race.fleet_file(),
+            initial.to_toml_for(Some(OptIn::Discovered)),
+        )
+        .unwrap();
         fs::write(
             race.home.join(".claude.json"),
             format!(
@@ -2800,7 +2800,6 @@ fn sync_accounts_for_init_merges_newly_signed_in_local_accounts() {
         .unwrap();
         let store = accounts::Store::at(&race.state);
         store.machine_id("0123456789abcdef").unwrap();
-        let source_before = fs::read(&source).unwrap();
         sync_accounts_for_init(&race.home, &race.state, &race.roster(), UPKEEP_NOW + 50).unwrap();
         if merging {
             fs::write(
@@ -2811,7 +2810,6 @@ fn sync_accounts_for_init_merges_newly_signed_in_local_accounts() {
         }
         let checked = store.claim_staging_dir("m27-3").unwrap();
         let paths = [
-            source.clone(),
             race.roster(),
             race.fleet_file(),
             store.state_file(),
@@ -2871,9 +2869,6 @@ fn sync_accounts_for_init_merges_newly_signed_in_local_accounts() {
                         .unwrap()
                         .contains("newer.m27.3@example.test")
                 );
-                if secrets_source {
-                    assert_eq!(fs::read(&source).unwrap(), source_before);
-                }
                 newer = Some(snapshot());
             },
             &fetch_source_text,
@@ -2890,16 +2885,18 @@ fn upkeep_converges_from_secrets_mailbox_and_proactively_renews_due_or_signed_ou
     // than leaving discovery to read the host's own name.
     w.write_config("[fleet]\nmachine = \"m27\"\n");
     let secrets_dir = w.home.join(".secrets");
-    fs::create_dir_all(&secrets_dir).unwrap();
-    fs::write(
-        secrets_dir.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-        concat!(
-            "[passwords]\n",
-            "\"sol-m27@example.test\" = \"pw1\"\n",
-            "\"sun.m27.2@example.test\" = \"pw2\"\n",
-        ),
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &w.home,
+        &[(
+            super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            concat!(
+                "[passwords]\n",
+                "\"sol-m27@example.test\" = \"pw1\"\n",
+                "\"sun.m27.2@example.test\" = \"pw2\"\n",
+            )
+            .as_bytes(),
+        )],
+    );
 
     let wit = Witness::answering("");
     assert!(has_init_accounts_source(
@@ -2920,7 +2917,7 @@ fn upkeep_converges_from_secrets_mailbox_and_proactively_renews_due_or_signed_ou
             roster: true,
             renewal: false,
         },
-        "upkeep auto-discovers accounts from ~/.secrets/ai-mailbox.toml even without .claude.json"
+        "upkeep discovers accounts from the vault's ai-mailbox.toml even without .claude.json"
     );
     let file_roster = Roster::load(&w.roster()).expect("accounts.toml materialized");
     assert_eq!(file_roster.rows.len(), 2);
@@ -2938,16 +2935,19 @@ fn upkeep_converges_from_secrets_mailbox_and_proactively_renews_due_or_signed_ou
     );
 
     // A new mailbox account extends the local discovery projection on upkeep.
-    fs::write(
-        secrets_dir.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-        concat!(
-            "[passwords]\n",
-            "\"sol-m27@example.test\" = \"pw1\"\n",
-            "\"sun.m27.2@example.test\" = \"pw2\"\n",
-            "\"star.m27.3@example.test\" = \"pw3\"\n",
-        ),
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &w.home,
+        &[(
+            super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            concat!(
+                "[passwords]\n",
+                "\"sol-m27@example.test\" = \"pw1\"\n",
+                "\"sun.m27.2@example.test\" = \"pw2\"\n",
+                "\"star.m27.3@example.test\" = \"pw3\"\n",
+            )
+            .as_bytes(),
+        )],
+    );
     assert!(
         needs_init_accounts_sync(&w.home, &w.state, &w.roster(), UPKEEP_NOW),
         "needs_init_accounts_sync detects a new mailbox account"
@@ -3786,7 +3786,7 @@ fn held_account_selections_resume_the_latest_request_without_automatic_source_op
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
-        save_oauth: |_, _| Ok("inert".into()),
+        tokens_here: |_, _, _, _| None,
         shared: shared_renewal::Effects::default(),
     };
     // Historical saved intent remains readable even where new FIFO admission
@@ -5268,13 +5268,13 @@ fn complete_staging_renewal_records_wrong_account_and_auto_renew_advances_past_c
         roster_no_browser_toml.push('\n');
     }
     fs::write(w.roster(), &roster_no_browser_toml).unwrap();
-    let secrets = w.home.join(".secrets");
-    fs::create_dir_all(&secrets).unwrap();
-    fs::write(
-        secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-        "webmail_url = \"https://mail.proton.me/u/0/inbox\"\n[passwords]\nm27-3 = \"secret-pw\"\n",
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &w.home,
+        &[(
+            super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            b"webmail_url = \"https://mail.proton.me/u/0/inbox\"\n[passwords]\nm27-3 = \"secret-pw\"\n",
+        )],
+    );
     let arr_cfg = super::super::headless_oauth::MailboxConfig::from_toml_str(
         r#"
 [[accounts]]
@@ -5413,15 +5413,15 @@ totp = "JBSWY3DPEHPK3PXP"
         "renew --due must skip unconfigured m27-2 and run headless-capable m27-3 with Remote browser"
     );
 
-    let secret_file = w.home.join(".secrets/m27_2_password");
-    fs::write(&secret_file, "secret-m27-2\n").unwrap();
+    let _ = latest_mailbox_mtime(Some(&w.home), &store);
+    let before_secret = std::time::SystemTime::now();
+    crate::vault_entry::seed(&w.home, &[("m27_2_password", b"secret-m27-2\n")]);
     let mtime_with_secret = latest_mailbox_mtime(Some(&w.home), &store).expect("mtime");
-    let secret_meta_mtime = fs::metadata(&secret_file).unwrap().modified().unwrap();
     assert!(
-        mtime_with_secret >= secret_meta_mtime,
-        "latest_mailbox_mtime must include individual secret files under ~/.secrets"
+        mtime_with_secret >= before_secret,
+        "latest_mailbox_mtime must include a per-account secret the vault delivers"
     );
-    let _ = fs::remove_file(&secret_file);
+    crate::vault_entry::seed(&w.home, &[("m27_2_password", b"")]);
 
     let maildir_new = store.dir.join("mailbox/new");
     fs::create_dir_all(&maildir_new).unwrap();
@@ -5632,7 +5632,7 @@ totp = "JBSWY3DPEHPK3PXP"
     assert_eq!(recovered_m27_3.dir.as_deref(), Some(use_staging_text));
     assert_eq!(recovered_m27_3.renewed_at, Some(UPKEEP_NOW + 50));
 
-    // An identified single-account machine with only a per-account `~/.secrets/m27_password` file
+    // An identified single-account machine with only a per-account `m27_password` vault entry
     // (and no `ai-mailbox.toml` or `fleet-accounts.toml`) must be recognized by
     // `has_init_accounts_source` and converged by `sync_accounts_for_init`.
     let single_w = World::new();
@@ -5642,9 +5642,7 @@ totp = "JBSWY3DPEHPK3PXP"
         "{\"oauthAccount\":{\"emailAddress\":\"sol-m27@example.test\"}}\n",
     )
     .unwrap();
-    let single_secrets = single_w.home.join(".secrets");
-    fs::create_dir_all(&single_secrets).unwrap();
-    fs::write(single_secrets.join("m27_password"), "single-secret\n").unwrap();
+    crate::vault_entry::seed(&single_w.home, &[("m27_password", b"single-secret\n")]);
     assert!(has_init_accounts_source(
         &single_w.home,
         &single_w.state,
@@ -5661,18 +5659,20 @@ totp = "JBSWY3DPEHPK3PXP"
     assert_eq!(mach, "m27");
     assert_eq!(rows_n, 1);
 
-    // When `~/.secrets/ai-accounts.csv` gains a new account row, `needs_init_accounts_sync`
+    // When the vault's `ai-accounts.csv` gains a new account row, `needs_init_accounts_sync`
     // must detect the un-converged CSV row.
-    let _ = fs::remove_file(single_secrets.join(FLEET_ROSTER_FILE));
-    fs::write(
-        single_secrets.join("ai-accounts.csv"),
-        concat!(
-            "email,computer,claude\n",
-            "sol-m27@example.test,m27,1\n",
-            "sun.m27.2@example.test,m27.2,1\n",
-        ),
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &single_w.home,
+        &[(
+            "ai-accounts.csv",
+            concat!(
+                "email,computer,claude\n",
+                "sol-m27@example.test,m27,1\n",
+                "sun.m27.2@example.test,m27.2,1\n",
+            )
+            .as_bytes(),
+        )],
+    );
     assert!(needs_init_accounts_sync(
         &single_w.home,
         &single_w.state,
@@ -5903,6 +5903,73 @@ fn a_walled_sessions_used_successor_whose_login_went_is_signed_in_again() {
     );
 }
 
+/// A READING KEPT ACROSS AN UNREAD VAULT HIDES NO ROW A SESSION WAITS ON: `m2-2`'s session met
+/// its lost-login wall, and its account is one this Mac cannot compare with its source
+/// (`others.unread`), so only tier 0 can sign it in. The vault could not be read this pass, so
+/// the live read names no row on its token (renewal goes on) and no launch would start on one,
+/// while the reading the upkeep kept from before still names `m2-2` (it lasts up to an hour).
+/// The ranking judges the row by its stored login, so it is tier 0 still. NEGATIVE CONTROL: where
+/// the live read names `m2-2` on its token, renewal is off for it and it is in no tier. Before the
+/// ranking read the stored login, the kept reading made it usable and it was in no tier until the
+/// reading aged out.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_kept_reading_hides_no_row_a_session_waits_on_while_the_vault_is_unread() {
+    let roster = Roster {
+        rows: vec![accounts::Row {
+            label: "m2-2".to_owned(),
+            email: Some("m2-2@example.test".to_owned()),
+            class: Class::Preferred,
+            ..accounts::Row::default()
+        }],
+    };
+    let now = UPKEEP_NOW;
+    let mut state = accounts::State {
+        active: Some("m2-2".to_owned()),
+        proven: true,
+        ..accounts::State::default()
+    };
+    let _ = accounts::note_session(&mut state, "s-1", "m2-2", None, now - 30);
+    let _ = accounts::note_auth(&mut state, "m2-2", accounts::Auth::SignedOut, now - 20);
+    state.tokens_here = Some(accounts::TokensHere {
+        read_at: now - 600,
+        ends: [("m2-2".to_owned(), now + 86_400)].into(),
+    });
+    assert_eq!(
+        accounts::login_here(&roster.rows[0], &state, true, now),
+        accounts::LoginHere::OnToken,
+        "the kept reading names it"
+    );
+    let logins = accounts::Logins::default();
+    let tiers = |others: &accounts::OtherMacs| -> Vec<String> {
+        auto_renew_candidates_tiered(Cli::Claude, None, &roster, &state, &logins, others, now)
+            .into_iter()
+            .map(|(tier, row)| format!("{tier}:{}", row.label))
+            .collect()
+    };
+    let unread = accounts::OtherMacs {
+        unread: ["m2-2".to_owned()].into(),
+        unread_why: Some(accounts::UnreadWhy::Source),
+        ..accounts::OtherMacs::default()
+    };
+    assert!(
+        accounts::renew_due(&roster, &logins, &state, &unread, now).is_empty(),
+        "only tier 0 can admit it"
+    );
+    assert_eq!(tiers(&unread), ["0:m2-2"]);
+    let live = accounts::OtherMacs {
+        on_token: [("m2-2".to_owned(), u64::try_from(now + 86_400).unwrap())].into(),
+        ..unread.clone()
+    };
+    assert!(
+        tiers(&live).is_empty(),
+        "CONTROL: the live read names it on its token"
+    );
+}
+
 /// A session whose own row signed out waits on that row's sign-in (its lost login follows
 /// only its own row), so the row is signed in, ahead of a due login this Mac uses and even
 /// where another row is ready to run now; a signed-out row no session here runs on or ran on
@@ -6011,6 +6078,20 @@ fn vault_ladder_fixture() -> (World, Row) {
     fs::create_dir_all(source.parent().unwrap()).unwrap();
     fs::write(source, "# vault A\n").unwrap();
     (w, row)
+}
+
+/// [`vault_ladder_fixture`] with a real vault in place of its stand-in `source.toml`: a file vault
+/// the home administers, so what a refresh delivers ([`deliver`]) reads in place from the store.
+fn vault_ladder_fixture_in_store() -> (World, Row) {
+    let (w, row) = vault_ladder_fixture();
+    fs::remove_file(w.home.join(".config/aterm/secrets/source.toml")).unwrap();
+    deliver(&w.home, "vault-fixture", "fixture\n");
+    (w, row)
+}
+
+/// A refresh delivering entry `name` holding `value` to the store under `home`.
+fn deliver(home: &Path, name: &str, value: &str) {
+    crate::vault_entry::seed(home, &[(name, value.as_bytes())]);
 }
 
 #[test]
@@ -6420,6 +6501,273 @@ fn a_failed_vault_refresh_is_asked_again_once_the_vault_answers() {
     assert!(routes.contains("vault(seq 51, nothing new)"), "{routes}");
 }
 
+/// A SIGN-IN TAKES AN UNVERIFIED WINDOW-MINTED VAULT TOKEN ANOTHER MAC MINTED BEFORE OPENING ANY
+/// BROWSER: `w3`, a row a session here runs on signed out, has its headless browser profile ready
+/// beside a browser and a token entry the lab keys, and this Mac is in a vault. m7 minted the
+/// row's year token in aterm's window, which proved the account, and nobody has verified it yet;
+/// this Mac has not applied that version of the vault: before the profile route opens a browser,
+/// the ladder refreshes the vault once (its bounded sync, which delivers the token), reads the
+/// token in use here, keeps that reading for rotation (`tokens_here.json`), records the attempt
+/// `on-token` by the `vault` route, logs it, and opens nothing; the next pass opens nothing and
+/// asks the vault nothing. With no route at all the ladder's own refresh brings a token (here one
+/// m7 made at its terminal and verified), and the row is recorded on it, not as one with no route.
+/// CONTROL: a token m7 minted at its terminal that nobody verified serves only m7, and no token
+/// serves nobody: each leaves the profile route to open its browser as before, after one refresh,
+/// and the vault is refreshed once in the row's sign-in workflow, not once a pass (a move ends
+/// both the row's wait and the vault refresh's, and the next pass still asks the vault nothing). A
+/// refresh that failed (off the LAN) uses up nothing: after a move the next pass refreshes again
+/// and takes the token; NEGATIVE CONTROL: noting the workflow refreshed on a failed sync opened the
+/// browser again there.
+#[cfg(unix)]
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_sign_in_takes_an_unverified_window_minted_vault_token_another_mac_minted_before_opening_any_browser()
+ {
+    use super::ladder_tests::{Bench, attempt_of, hand_roster};
+    use super::login_tests::{Desk, NOW};
+    use crate::harness::cli::Renewal;
+    use crate::harness::sign_in_ladder::Vault;
+    use aterm_secrets::claude_token::{
+        Check, ExpiryFrom, Key, Lookup, Meta, MintedBy, Standing, Verified,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+    const W3: &str = "w3.m30.3@example.test";
+    const KEY: &str = "ac-0123456789abcdef";
+    const YEAR: u64 = 365 * 86_400;
+    // What this Mac's applied vault holds of w3's token, and what the next sync delivers.
+    const NONE: u8 = 0;
+    // Made at m7's terminal and verified there.
+    const VERIFIED: u8 = 1;
+    // Made in m7's aterm window, not verified.
+    const WINDOW: u8 = 2;
+    // Made at m7's terminal, not verified.
+    const TERMINAL: u8 = 3;
+    static HELD: AtomicU8 = AtomicU8::new(NONE);
+    static DELIVERS: AtomicU8 = AtomicU8::new(NONE);
+    static SYNCS: AtomicUsize = AtomicUsize::new(0);
+    // The sync cannot reach the vault (this Mac is off the LAN).
+    static OFF_LAN: AtomicBool = AtomicBool::new(false);
+
+    fn keyer(_realm: &str, email: &str) -> Option<String> {
+        (email == W3).then(|| KEY.to_owned())
+    }
+    fn sync(_home: &Path) -> Vault {
+        SYNCS.fetch_add(1, Ordering::SeqCst);
+        if OFF_LAN.load(Ordering::SeqCst) {
+            return Vault::Failed("request timed out".to_owned());
+        }
+        HELD.store(DELIVERS.load(Ordering::SeqCst), Ordering::SeqCst);
+        Vault::Applied(52)
+    }
+    // The vault route's read over what this Mac's vault holds, judged as the live read judges
+    // it: m7's token, made in its aterm window or at its terminal, verified there by its stored
+    // login's windows or not, minted an hour before `NOW` for a year.
+    fn tokens(
+        home: &Path,
+        store: &accounts::Store,
+        roster: &Roster,
+        now: i64,
+    ) -> Option<BTreeMap<String, u64>> {
+        let at = u64::try_from(NOW).unwrap();
+        let minted = |by: MintedBy, verified: bool| Standing {
+            key: Key::parse(KEY).unwrap(),
+            meta: Some(Meta {
+                email: W3.to_owned(),
+                account_id: "c-0123456789ab".to_owned(),
+                minted_at: at - 3_600,
+                expires_at: at + YEAR,
+                expiry_from: ExpiryFrom::Printed,
+                minted_on: "m7".to_owned(),
+                cli: "2.1.318".to_owned(),
+                minted_by: Some(by),
+                verified: verified.then(|| Verified {
+                    on: "m7".to_owned(),
+                    at: at - 600,
+                    by: aterm_secrets::claude_token::BY_WINDOWS.to_owned(),
+                    seven_day_resets_at: None,
+                    five_hour_resets_at: None,
+                }),
+            }),
+            check: Check::Readable,
+            signer: Some("m7".to_owned()),
+            minted_here: false,
+            exposed: Vec::new(),
+            refused_at: None,
+        };
+        let held = match HELD.load(Ordering::SeqCst) {
+            VERIFIED => vec![minted(MintedBy::Terminal, true)],
+            WINDOW => vec![minted(MintedBy::Window, false)],
+            TERMINAL => vec![minted(MintedBy::Terminal, false)],
+            _ => Vec::new(),
+        };
+        crate::harness::accounts_tokens::rows_on_token_of(
+            &aterm_secrets::client::Paths::for_home(home),
+            Lookup::Found(held),
+            store,
+            roster,
+            now,
+        )
+    }
+    // A file of w3's login, which makes it here.
+    let made = |desk: &Desk| desk.store().logins_dir().join("w3").join("settings.json");
+    let case = |delivers: u8, browser: bool| {
+        OFF_LAN.store(false, Ordering::SeqCst);
+        HELD.store(NONE, Ordering::SeqCst);
+        DELIVERS.store(delivers, Ordering::SeqCst);
+        SYNCS.store(0, Ordering::SeqCst);
+        let desk = Desk::new("m30");
+        hand_roster(&desk, false);
+        // w3's login is made here, and signed out: only such a row runs on its token here.
+        fs::write(made(&desk), "{}").unwrap();
+        fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+            &desk.store().dir,
+            Some("w3"),
+        ))
+        .unwrap();
+        let source = desk.home.join(".config/aterm/secrets/source.toml");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(source, "# vault A\n").unwrap();
+        let mut bench = Bench::ending(Renewal::Failed);
+        bench.browser = browser;
+        bench.vault_sync = |home, _scope| sync(home);
+        bench.tokens_here = tokens;
+        (desk, bench)
+    };
+    let pass = |bench: &Bench, desk: &Desk, at: i64| {
+        crate::harness::journal::with_keyer(keyer, || bench.pass(desk, at))
+    };
+    let syncs = || SYNCS.load(Ordering::SeqCst);
+    let until = crate::harness::accounts_tokens::date(u64::try_from(NOW).unwrap() + YEAR);
+
+    let (desk, bench) = case(WINDOW, true);
+    assert!(!pass(&bench, &desk, NOW), "no sign-in starts");
+    assert!(bench.handed().is_empty(), "no browser was opened");
+    assert_eq!(syncs(), 1, "the vault was refreshed once, first");
+    let attempt = attempt_of(&desk, "w3").expect("the attempt is on record");
+    assert_eq!(
+        (attempt.outcome, attempt.routes.as_str()),
+        (accounts::AttemptOutcome::OnToken, "vault")
+    );
+    let kept = desk
+        .store()
+        .read_tokens_here()
+        .expect("the reading is kept for rotation");
+    assert_eq!(kept.read_at, NOW);
+    assert_eq!(
+        kept.ends.get("w3"),
+        Some(&(NOW + i64::try_from(YEAR).unwrap()))
+    );
+    let said = format!(
+        "account w3: automatic sign-in on-token: vault: its year token is in use here until \
+         {until}; no browser opened; profile(ready) mailbox(none configured) vault(applied seq 52)"
+    );
+    let logged = bench.logged();
+    assert!(
+        logged.iter().any(|line| line.starts_with(&said)),
+        "{logged:?}"
+    );
+    bench.cool();
+    assert!(!pass(&bench, &desk, NOW + 120), "the next pass");
+    assert!(bench.handed().is_empty(), "opens nothing");
+    assert_eq!(syncs(), 1, "and asks the vault nothing");
+
+    // A refresh that failed (off the LAN) is no refresh of the workflow: once a move ends the
+    // row's wait and the vault's clock, the next pass refreshes again, takes the token m7 minted
+    // in its window, and opens no second browser.
+    let (desk, bench) = case(WINDOW, true);
+    OFF_LAN.store(true, Ordering::SeqCst);
+    assert!(pass(&bench, &desk, NOW), "off the LAN the sign-in starts");
+    assert_eq!(bench.handed().len(), 1, "its browser opened");
+    assert_eq!(syncs(), 1, "after one refresh, which failed");
+    OFF_LAN.store(false, Ordering::SeqCst);
+    bench.cool();
+    bench.guard.lock().unwrap().ladder.moved(Instant::now());
+    assert!(!pass(&bench, &desk, NOW + 120), "back on the LAN");
+    assert_eq!(bench.handed().len(), 1, "no second browser opens");
+    assert_eq!(
+        syncs(),
+        2,
+        "the failed refresh did not use up the workflow's one"
+    );
+    assert_eq!(
+        attempt_of(&desk, "w3").map(|attempt| attempt.outcome),
+        Some(accounts::AttemptOutcome::OnToken)
+    );
+
+    let (desk, bench) = case(VERIFIED, false);
+    assert!(!pass(&bench, &desk, NOW), "with no route");
+    assert_eq!(syncs(), 1, "the ladder's own refresh is the vault route's");
+    assert_eq!(
+        attempt_of(&desk, "w3").map(|attempt| attempt.outcome),
+        Some(accounts::AttemptOutcome::OnToken),
+        "recorded on its token, not as a row with no route"
+    );
+
+    for (delivers, why) in [
+        (
+            TERMINAL,
+            "a token m7 minted at its terminal that nobody verified",
+        ),
+        (NONE, "no token"),
+    ] {
+        let (desk, bench) = case(delivers, true);
+        assert!(
+            pass(&bench, &desk, NOW),
+            "CONTROL ({why}): the sign-in starts"
+        );
+        assert_eq!(
+            bench.handed().len(),
+            1,
+            "CONTROL ({why}): its browser opened"
+        );
+        assert_eq!(syncs(), 1, "CONTROL ({why}): after one refresh");
+        assert_eq!(
+            attempt_of(&desk, "w3").map(|attempt| attempt.outcome),
+            Some(accounts::AttemptOutcome::Failed),
+            "CONTROL ({why})"
+        );
+        assert!(
+            desk.store().read_tokens_here().is_none(),
+            "CONTROL ({why}): nothing is kept for rotation"
+        );
+        bench.cool();
+        bench.guard.lock().unwrap().ladder.moved(Instant::now());
+        assert!(
+            pass(&bench, &desk, NOW + 120),
+            "CONTROL ({why}): a move ends the row's wait"
+        );
+        assert_eq!(bench.handed().len(), 2, "CONTROL ({why})");
+        assert_eq!(
+            syncs(),
+            1,
+            "CONTROL ({why}): one refresh in the row's workflow, not one a pass"
+        );
+    }
+
+    // A row whose login is not made here runs on no token here, whatever the vault holds: no
+    // launch here could start on it (it has no login of its own to start in), so its sign-in is
+    // not held for the token. It starts, and makes the login.
+    let (desk, bench) = case(WINDOW, true);
+    fs::remove_file(made(&desk)).unwrap();
+    assert!(
+        pass(&bench, &desk, NOW),
+        "CONTROL (no login made here): the sign-in starts"
+    );
+    assert_eq!(
+        bench.handed().len(),
+        1,
+        "CONTROL (no login made here): its browser opened"
+    );
+    assert!(
+        desk.store().read_tokens_here().is_none(),
+        "CONTROL (no login made here): nothing is kept for rotation"
+    );
+}
+
 #[test]
 fn a_changed_row_does_not_inherit_the_previous_identitys_retry_wait() {
     use super::super::sign_in_ladder::Vault;
@@ -6756,17 +7104,17 @@ fn an_applied_vault_revision_converges_on_the_next_upkeep() {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     fn applied(home: &Path) -> Vault {
         CALLS.fetch_add(1, Ordering::SeqCst);
-        fs::write(
-            home.join(".config/aterm/secrets/state.toml"),
-            "membership = \"in\"\nseq = 83\n",
-        )
-        .unwrap();
         if home.join("bring-mailbox").is_file() {
-            let secrets = home.join(".secrets");
-            fs::create_dir_all(&secrets).unwrap();
-            fs::write(
-                secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
+            // A real store: the version the refresh applies is its own publication.
+            deliver(
+                home,
+                super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
                 "http_url = \"http://127.0.0.1:9/inbox\"\n",
+            );
+        } else {
+            fs::write(
+                home.join(".config/aterm/secrets/state.toml"),
+                "membership = \"in\"\nseq = 83\n",
             )
             .unwrap();
         }
@@ -6774,7 +7122,11 @@ fn an_applied_vault_revision_converges_on_the_next_upkeep() {
     }
     for with_mailbox in [false, true] {
         CALLS.store(0, Ordering::SeqCst);
-        let (w, row) = vault_ladder_fixture();
+        let (w, row) = if with_mailbox {
+            vault_ladder_fixture_in_store()
+        } else {
+            vault_ladder_fixture()
+        };
         if with_mailbox {
             fs::write(w.home.join("bring-mailbox"), "").unwrap();
         }
@@ -6782,32 +7134,38 @@ fn an_applied_vault_revision_converges_on_the_next_upkeep() {
             vault_sync: |home, _scope| applied(home),
             ..Witness::answering("")
         };
-        assert!(matches!(
-            vault_ladder_pass(&w, &witness, &row),
-            LadderStep::Held
-        ));
+        let first = vault_ladder_pass(&w, &witness, &row);
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
-        let next = vault_ladder_pass(&w, &witness, &row);
         if with_mailbox {
-            assert!(matches!(next, LadderStep::Go { .. }));
+            // The store holds what the refresh delivered the moment it applied, so the pass
+            // whose refresh brought the route reads it in place and runs it.
+            assert!(matches!(first, LadderStep::Go { .. }));
+            assert!(matches!(
+                vault_ladder_pass(&w, &witness, &row),
+                LadderStep::Go { .. }
+            ));
             assert_eq!(
                 CALLS.load(Ordering::SeqCst),
                 1,
                 "the delivered route needs no second refresh"
             );
-        } else {
-            assert!(matches!(next, LadderStep::NoRoute));
-            assert_eq!(CALLS.load(Ordering::SeqCst), 2);
-            assert!(matches!(
-                vault_ladder_pass(&w, &witness, &row),
-                LadderStep::Held
-            ));
-            assert_eq!(
-                CALLS.load(Ordering::SeqCst),
-                2,
-                "a stable standing stops the immediate retries"
-            );
+            continue;
         }
+        assert!(matches!(first, LadderStep::Held));
+        assert!(matches!(
+            vault_ladder_pass(&w, &witness, &row),
+            LadderStep::NoRoute
+        ));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            vault_ladder_pass(&w, &witness, &row),
+            LadderStep::Held
+        ));
+        assert_eq!(
+            CALLS.load(Ordering::SeqCst),
+            2,
+            "a stable standing stops the immediate retries"
+        );
     }
     // A member that already held an earlier version: the version the refresh applies is
     // no new context, so that one refresh answers the row.
@@ -6840,21 +7198,19 @@ fn a_partial_vault_apply_backs_off_against_its_delivered_inputs() {
     static CALLS: AtomicUsize = AtomicUsize::new(0);
     fn partial(home: &Path) -> Vault {
         CALLS.fetch_add(1, Ordering::SeqCst);
-        let secrets = home.join(".secrets");
-        fs::create_dir_all(&secrets).unwrap();
-        fs::write(secrets.join("delivered.txt"), "delivered").unwrap();
+        deliver(home, "delivered.txt", "delivered");
         if home.join("bring-mailbox").is_file() {
-            fs::write(
-                secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
+            deliver(
+                home,
+                super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
                 "http_url = \"http://127.0.0.1:9/inbox\"\n",
-            )
-            .unwrap();
+            );
         }
         Vault::AppliedPartly(83)
     }
     for with_mailbox in [false, true] {
         CALLS.store(0, Ordering::SeqCst);
-        let (w, row) = vault_ladder_fixture();
+        let (w, row) = vault_ladder_fixture_in_store();
         if with_mailbox {
             fs::write(w.home.join("bring-mailbox"), "").unwrap();
         }
@@ -6916,13 +7272,11 @@ fn a_vault_refresh_that_brings_a_mailbox_signs_in_the_row_a_walled_session_moves
         Vault::Unchanged(51)
     }
     fn vault_brings_a_mailbox(home: &Path) -> Vault {
-        let secrets = home.join(".secrets");
-        fs::create_dir_all(&secrets).unwrap();
-        fs::write(
-            secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
+        deliver(
+            home,
+            super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
             "http_url = \"http://127.0.0.1:9/inbox\"\n",
-        )
-        .unwrap();
+        );
         // A refresh that wrote the mailbox but failed another file still brings it: the
         // row is read again after a partial apply too (`Vault::wrote_files`).
         Vault::AppliedPartly(52)
@@ -6979,9 +7333,7 @@ fn a_vault_refresh_that_brings_a_mailbox_signs_in_the_row_a_walled_session_moves
             Ok(events)
         })
         .unwrap();
-    let secrets_config = w.home.join(".config/aterm/secrets");
-    fs::create_dir_all(&secrets_config).unwrap();
-    fs::write(secrets_config.join("source.toml"), "# a vault member\n").unwrap();
+    deliver(&w.home, "vault-fixture", "fixture\n");
 
     let wit = Witness {
         vault_sync: |home, _scope| vault_brings_nothing(home),
@@ -7112,13 +7464,11 @@ fn a_vault_refresh_that_brings_a_mailbox_signs_in_the_row_a_walled_session_moves
 fn a_row_with_no_mailbox_asks_the_lab_for_it_and_its_arrival_meets_the_need() {
     use super::super::sign_in_ladder::Vault;
     fn brings(home: &Path, mailbox: &str) -> Vault {
-        let secrets = home.join(".secrets");
-        fs::create_dir_all(&secrets).unwrap();
-        fs::write(
-            secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
+        deliver(
+            home,
+            super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
             mailbox,
-        )
-        .unwrap();
+        );
         Vault::Applied(4)
     }
     fn brings_an_http_mailbox(
@@ -7153,7 +7503,7 @@ fn a_row_with_no_mailbox_asks_the_lab_for_it_and_its_arrival_meets_the_need() {
         _scope: Option<&crate::harness::account_work::Scope>,
     ) -> Vault {
         brings_a_webmail_mailbox_with_no_password(home, None);
-        fs::write(home.join(".secrets/m29_password"), "p\n").unwrap();
+        deliver(home, "m29_password", "p\n");
         Vault::Applied(4)
     }
     for (brought, browser, routed, meets) in [
@@ -7293,7 +7643,7 @@ const WEBMAIL_MAILBOX: &str = "webmail_url = \"https://mail.example.test/inbox\"
 
 /// m15's `mailbox:m15-3` (measured 2026-11-13, aterm 0.199.0): two Claude Code rows signed in
 /// on this Mac, m15-3 and m15-4, each with a session on it and no sign-in due, sharing one
-/// mailbox (`mailbox`, the `~/.secrets` mailbox file; none, no file), which the lab was asked
+/// mailbox (`mailbox`, the vault's mailbox entry; none, no entry), which the lab was asked
 /// for (`asked`) for m15-3 alone while it needed a sign-in. The world and the ledger's paths,
 /// both rows checked to be no renewal candidate, so no ladder of either runs.
 #[cfg(unix)]
@@ -7332,19 +7682,17 @@ fn signed_in_row_asked_for_its_mailbox(
             .unwrap();
     }
     fs::write(w.roster(), roster).unwrap();
-    if let Some(text) = mailbox {
-        let secrets = w.home.join(".secrets");
-        fs::create_dir_all(&secrets).unwrap();
-        fs::write(
-            secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-            text,
-        )
-        .unwrap();
-    }
     let paths = aterm_secrets::client::Paths::for_home(&w.home);
     let source = w.home.join("lab.vault");
     aterm_secrets::client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1"))
         .unwrap();
+    if let Some(text) = mailbox {
+        deliver(
+            &w.home,
+            super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            text,
+        );
+    }
     need::test_alab_policy(&paths);
     if asked {
         let raised = need::raise(

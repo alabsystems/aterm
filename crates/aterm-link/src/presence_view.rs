@@ -296,7 +296,7 @@ fn session_presence<'a>(fleet: &str, subject: &'a str) -> Option<(&'a str, &'a s
     let segs: Vec<&str> = subject.split('/').collect();
     match segs.as_slice() {
         ["", "f", f, "pub", node, sid, "presence"]
-            if *f == fleet && is_principal(node) && is_principal(sid) && sid.starts_with("s-") =>
+            if *f == fleet && is_principal(node) && crate::subject::is_session_id(sid) =>
         {
             Some((node, sid))
         }
@@ -351,10 +351,10 @@ where
                 match why {
                     Ended::Dial(e) => eprintln!(
                         "aterm-link: the presence view could not be opened ({e}); a bare \
-                         @s-<sid> post reads the roster from the bus"
+                         @<tab id> post reads the roster from the bus"
                     ),
                     Ended::Follow(e) => eprintln!(
-                        "aterm-link: the presence view ended ({e}); a bare @s-<sid> post reads \
+                        "aterm-link: the presence view ended ({e}); a bare @<tab id> post reads \
                          the roster from the bus until it is open again"
                     ),
                 }

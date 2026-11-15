@@ -44,8 +44,9 @@ pub enum Finding {
         pk: String,
         column: String,
     },
-    /// A row whose `protected` cell is true holds a `Secret` cell ([`protected`]): a concurrent
-    /// write or an older build put it there; readers never reveal it and the owner clears it.
+    /// A row whose `protected` cell is true holds a secret, sealed in its cell or named in the
+    /// secret store ([`protected`]): a concurrent write or an older build put it there; no table
+    /// view shows it and the owner clears it.
     Protected {
         collection: String,
         pk: String,
@@ -187,7 +188,11 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
         };
         for (pk, row) in &projection.rows {
             if protected(row) {
-                for column in schema.columns.iter().filter(|c| matches!(c.ty, Ty::Secret)) {
+                for column in schema
+                    .columns
+                    .iter()
+                    .filter(|c| matches!(c.ty, Ty::SecretRef | Ty::Secret))
+                {
                     if row
                         .fields
                         .get(column.name)

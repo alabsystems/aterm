@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 
 use super::Rig;
 use super::instance::{
-    Budget, CouldNotRun, Ctl, Instance, Scratch, World, could_not_run, field, uint_field,
+    Budget, CouldNotRun, Ctl, Instance, Scratch, World, could_not_run, field, recording_line,
+    require_recording, uint_field,
 };
 use super::paint::{
-    BUDGET_SECS, Capture, Companion, Expect, Ledger, PLANE_COL, PLANE_ROW, PaintReport, PaintRow,
-    Scene, Split, Style, SubjectGpu, judge,
+    BUDGET_SECS, Capture, Companion, Expect, Hosted, Ledger, PLANE_COL, PLANE_ROW, PaintReport,
+    PaintRow, Scene, Split, Style, SubjectGpu, judge,
 };
 use super::scan::{Cell, RecordingIndex, StatusRow, TakeContext, TypedRow, scan_dir};
 use super::starvation::{DEFAULT_LATE_THRESHOLD_US, Sampler, SchedInputs, classify, paint_verdict};
@@ -61,6 +62,9 @@ const WARM_ROW: PaintRow = PaintRow {
     companion: None,
     split: None,
     reach: None,
+    recording: true,
+    rewound: false,
+    hosted: false,
 };
 
 static WARMED: std::sync::OnceLock<Result<(), CouldNotRun>> = std::sync::OnceLock::new();
@@ -122,12 +126,15 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
         disposition,
         wall_us,
         alt_wait_ms: take.alt_wait_ms,
+        frame_builds: take.frame_builds,
         typed_gap_ms: take.typed_gap_ms,
         driven_ms: take.driven_ms,
         band: take.band,
         bench_band,
         checks: take.checks,
         subject_gpu: take.subject_gpu,
+        view: take.view,
+        hosted_trace: take.hosted_trace,
     })
 }
 
@@ -166,19 +173,34 @@ struct Take {
     ledger: Ledger,
     shape: super::starvation::ShapeVerdict,
     alt_wait_ms: u64,
+    frame_builds: u64,
     typed_gap_ms: Option<(u64, u64)>,
     driven_ms: Option<(i64, i64)>,
     band: super::instance::Band,
     checks: String,
     subject_gpu: SubjectGpu,
+    view: Option<String>,
+    hosted_trace: Option<String>,
 }
 
+/// The glow on for a hosted row, so its typed keys reach the hosted task: the aos matrix's own
+/// lines.
+const HOSTED_GLOW: &str = super::aos::GLOW_ON;
+
+/// A take's config head: the row's style line, its recording ([`recording_line`], written either
+/// way), a hosted row's glow, and last any table the scene opens, so every root key precedes it.
 fn config_head(row: &PaintRow) -> String {
     let mut head = row
         .style
         .config_line()
         .unwrap_or("# cursor trail omitted: the shipped default")
         .to_string();
+    head.push('\n');
+    head.push_str(&recording_line(row.recording));
+    if row.hosted {
+        head.push('\n');
+        head.push_str(HOSTED_GLOW);
+    }
     if row.scene == Scene::ColdStreamer {
         head.push_str("\n[sparkle_words]\nenabled = false");
     }
@@ -200,12 +222,22 @@ fn run_take(
     let launch_s = started.elapsed().as_secs_f64();
     let staged = Instant::now();
     let ctl = &inst.ctl;
+    require_recording(ctl, row.recording)?;
     if let Some(split) = row.split {
         stage_split(ctl, split)?;
     }
     let alt_wait_ms = stage_scene(rig, &inst, row.scene)?;
     if row.companion.is_some() || row.scene == Scene::Plane {
         stage_plane(&inst, &mut timing, Plane::Fresh)?;
+    }
+    if row.rewound {
+        stage_past(&inst)?;
+    }
+    if row.hosted {
+        let attached = ctl.ok(&["aos", "attach", "code=shipped"])?;
+        if field(&attached, "attached") != Some("true") {
+            return could_not_run(format!("aos attach did not attach ({attached})"));
+        }
     }
     let (cell, typed_row) = cell_of(ctl, row)?;
     if row.scene == Scene::ColdStreamer {
@@ -214,6 +246,7 @@ fn run_take(
     if row.capture == Capture::UnpinnedUnfocused {
         fence_focus_out(ctl)?;
     }
+    let warmed = warm_pipelines(ctl)?;
     let staging_s = staged.elapsed().as_secs_f64();
     let captured = Instant::now();
     let capture = match row.capture {
@@ -223,7 +256,26 @@ fn run_take(
         }
     };
     let capture_s = captured.elapsed().as_secs_f64();
+    let frame_builds = warm_standing(ctl)?.1.saturating_sub(warmed);
     let scanned = Instant::now();
+    let view = if row.rewound {
+        let status = ctl.ok(&["rewind", "status"])?;
+        if field(&status, "view") != Some("open") {
+            return could_not_run(format!(
+                "the Rewind view closed during the take, so its frames are not the past's \
+                 ({status})"
+            ));
+        }
+        Some(status)
+    } else {
+        None
+    };
+    let (hosted, hosted_trace) = if row.hosted {
+        let (hosted, line) = hosted_after(ctl)?;
+        (Some(hosted), Some(line))
+    } else {
+        (None, None)
+    };
     let metrics = ctl.ok(&["metrics"])?;
     let backend = field(&metrics, "backend")
         .ok_or_else(|| {
@@ -255,6 +307,7 @@ fn run_take(
         rows: capture.rows,
         final_row: capture.final_row,
         fx_under_frames,
+        hosted,
     };
     let shape = judge(row, &ledger, &scan)?;
     let typed_gap_ms = typed_gaps(&capture.frames_dir, &capture.typed_shots);
@@ -266,11 +319,14 @@ fn run_take(
         ledger,
         shape,
         alt_wait_ms,
+        frame_builds,
         typed_gap_ms,
         driven_ms: capture.driven_ms,
         band: inst.band.clone(),
         checks: super::instance::replay_checks(ctl),
         subject_gpu: SubjectGpu::of_metrics(&metrics),
+        view,
+        hosted_trace,
     };
     let replay_s = replay.elapsed().as_secs_f64();
     let stop = Instant::now();
@@ -289,6 +345,40 @@ fn run_take(
         timing.images,
     );
     Ok(take)
+}
+
+/// A rewound row's past: a line printed at the prompt and recorded, then a Rewind view opened on
+/// the pane, which must answer `view=open`. The take's keys then go through `ctl key` with the
+/// view open over the live shell, and the frames must stay dark of every effect.
+fn stage_past(inst: &Instance) -> Result<(), CouldNotRun> {
+    let ctl = &inst.ctl;
+    ctl.ok(&["send", "printf 'the past screen\\n'"])?;
+    ctl.ok(&["key", "enter"])?;
+    ctl.ok(&["await", "idle", "1000", "timeout=60000"])?;
+    let open = ctl.ok(&["rewind", "open"])?;
+    if field(&open, "view") != Some("open") {
+        return could_not_run(format!("the Rewind view did not open ({open})"));
+    }
+    Ok(())
+}
+
+/// A hosted take's account after its frames: `aos status` names whether the glow is still
+/// attached, and `aos trace` the keys the hosted task took and whether its log broke
+/// ([`Hosted::read`]; [`judge`] holds the row to them). The glow is detached after.
+fn hosted_after(ctl: &Ctl) -> Result<(Hosted, String), CouldNotRun> {
+    let status = ctl.ok(&["aos", "status"])?;
+    let trace = ctl.ok(&["aos", "trace"])?;
+    let _ = ctl.call(&["aos", "detach"]);
+    let hosted = Hosted::read(&status, &trace).ok_or_else(|| {
+        CouldNotRun::Unanswered(format!(
+            "aos status named no attached= or aos trace no keys= or broken= ({status} | {trace})"
+        ))
+    })?;
+    let line = format!(
+        "attached={} keys={} broken={}",
+        hosted.attached, hosted.keys, hosted.broken
+    );
+    Ok((hosted, line))
 }
 
 /// Driver wall spans. Capture subspans are nested inside capture_s, not extra row time;
@@ -310,6 +400,33 @@ fn timed<T>(total: &mut Duration, action: impl FnOnce() -> T) -> T {
     let result = action();
     *total += started.elapsed();
     result
+}
+
+/// `trail warm`'s standing: the builds its warm still owes, and the pipeline states frames built
+/// on the frame thread.
+fn warm_standing(ctl: &Ctl) -> Result<(u64, u64), CouldNotRun> {
+    let line = ctl.ok(&["trail", "warm"])?;
+    let count = |key| {
+        uint_field(&line, key).ok_or_else(|| {
+            CouldNotRun::Unanswered(format!("ctl trail warm reported no {key}= ({line})"))
+        })
+    };
+    Ok((count("owed")?, count("frame_builds")?))
+}
+
+/// Build the trail's pipeline states off the frame path before the take, as the shipped window
+/// does from its renderer's mint, and wait until every one landed: the subject is headless, and a
+/// headless instance warms nothing by itself, so without this its first frames that bind a trail
+/// pipeline compile it on the frame thread, which against a fresh bundle's cold shader cache
+/// stalls the recording for several frame intervals (a capture hole the take cannot see paint
+/// through, `docs/measured/win2-trail-paint-takes-2026-11-06.md`). Returns the frame-thread
+/// builds already made (the staging's own frames), which the take's count starts from.
+fn warm_pipelines(ctl: &Ctl) -> Result<u64, CouldNotRun> {
+    ctl.await_event("the trail's pipeline warm landing", || {
+        warm_standing(ctl)
+            .map(|(owed, built)| (owed == 0).then_some(built))
+            .transpose()
+    })?
 }
 
 /// A kept take's ledger beside its frames, so the take can become a scanner fixture:

@@ -376,6 +376,49 @@ impl Commit {
     }
 }
 
+/// The engine files a verify run's checks read, read once from one commit: `export-scan`'s
+/// baseline and registry ([`crate::export_scan::engine`]) and the census's baseline (its
+/// `capture-privacy`), so every reader of a run reads the same bytes and the run's plan seals
+/// what they read ([`crate::land_seal`]) rather than whatever the engine's origin holds by the
+/// time each check starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Files {
+    /// The commit's full SHA ([`Commit::sha`]).
+    pub sha: String,
+    /// Where it was read ([`Commit::shown`]).
+    pub shown: String,
+    /// [`aterm_census::export_scan::rows::BASELINE`]'s text there, or why it could not be read.
+    pub baseline: Result<String, String>,
+    /// [`crate::export_scan::REGISTRY`]'s text there, or why it could not be read.
+    pub registry: Result<String, String>,
+}
+
+impl Files {
+    /// The engine `var` names for the clone at `repo` ([`named`]), its commit read once
+    /// ([`Commit::read`], each git child run by `run`, an origin's main imported by `import`), and
+    /// the two files read from it.
+    ///
+    /// # Errors
+    /// No engine is named, or its commit could not be read, in [`Error`]'s words.
+    pub fn read(
+        repo: &Path,
+        var: &dyn Fn(&str) -> Option<OsString>,
+        run: RunGit<'_>,
+        import: Import<'_>,
+    ) -> Result<Self, String> {
+        let commit = named(repo, var)
+            .and_then(|named| Commit::read(&named, run, import))
+            .map_err(|e| e.to_string())?;
+        let text = |path: &str| commit.text(path, run).map_err(|e| e.to_string());
+        Ok(Self {
+            sha: commit.sha().to_owned(),
+            shown: commit.shown().to_owned(),
+            baseline: text(aterm_census::export_scan::rows::BASELINE),
+            registry: text(crate::export_scan::REGISTRY),
+        })
+    }
+}
+
 /// The main of a publication engine's `origin`, imported ([`Import`]) into a scratch bare
 /// repository nothing else reads or writes: the engine as its origin holds it now. What a reader
 /// with no synced engine of its own judges (a release before its sync step, a dry run, a cut,

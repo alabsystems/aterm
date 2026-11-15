@@ -16,6 +16,9 @@
 //!   the status row.
 //! - LINE, [`LineTrack`]: the cells typed along the caret's row that have a vivid line under them, a reading and
 //!   not a law (most styles draw no line).
+//! - GLASS, [`GlassRead`]: the frames whose light drew the prism glass, from the status row. `--glass` films in a
+//!   Retina window's lane (its face, padding and light latch), where a light page draws the glass, and a glass
+//!   page there that drew none breaks the run: a lane that silently draws paper cannot pass.
 //!
 //! The scratch probe this grew from (never committed) counted something else: a pixel's rises off its clean twin in
 //! the caret's rows. [`TwinRises`] keeps that count beside the law so its readings can be set against this verb's.
@@ -116,8 +119,9 @@ pub const THEMES: [&str; 6] = [
     "dim-grey",
     "paper-grey",
 ];
-/// The caret shapes: `trail_film::CARETS`.
-pub const CARETS: [&str; 3] = ["block", "bar", "underline"];
+/// The caret shapes: `trail_film::CARETS` (`block-pinned`: the block with a colour the program
+/// pinned).
+pub const CARETS: [&str; 4] = ["block", "bar", "underline", "block-pinned"];
 /// The scenes and what each types: `trail_film::SCENES`. The first [`DEFAULT_SCENES`] are a run's own. The pages
 /// and lines of the resident scenes are `trail_scenes`'s, which the replay mounts too.
 pub const SCENES: [(&str, &str); 25] = [
@@ -253,9 +257,9 @@ pub struct StarRead {
 
 /// The verb's own help (`trail-film --help`).
 pub const HELP: &str = "\
-usage: targo --unverified lab trail-film <out_dir> [style] [--pet off|cat|dog] [--theme NAME[,NAME]...|both]
+usage: targo --unverified lab trail-film <out_dir> [style] [--pet off|cat|dog|\"flying cat\"] [--theme NAME[,NAME]...|both]
          [--caret NAME[,NAME]...|both] [--scene NAME[,NAME]...|--all-scenes] [--no-replay] [--report-only]
-         [--plant-star]
+         [--plant-star] [--glass [--unlatched]]
        targo --unverified lab trail-film --list
 
 A cursor trail judged in motion. Each film is one scene (a scripted line of typing) replayed with no window through
@@ -269,11 +273,26 @@ each frame's bottom-right corner, lit every other eighth of a second (8 turns a 
 on a light one), into the frame the flash law reads and not its clean twin. A STAR line says how many of its 9 px
 the law put over the bound, a film where it missed one breaks (star:), and the flash_* counts include the star's.
 
+--glass films in a Retina window's lane, under <out_dir>/<style>-<pet>-glass/: the window's face at 24 px (12 pt at
+2x; SF Mono's 15 by 28 px cell), its padding (24 px round the grid, 4 over it) and its frame (1128 by 420 px for 14
+rows of 72), the effects laid from the grid's corner as the window lays them, and its light latched as the window
+latches it (on the frame's page, keyed by the configured scheme, at the live level, on an opaque page whose thin ink
+is the face's own), where a light page draws the prism glass. Without it a film is the replay's own lane: 22 px, 14
+by 26 px cells, no padding, and no light latched, so a light page draws main's paper band. Each window-lane film's
+dims say whether its page is one the glass is solved for (glass_page=1: a light page whose palette has the glass's
+headroom, github-light and default-light among the films' themes), and in the glass lane such a page owes the glass
+on every frame (glass:). No glass is asked of another page: the latch never admits a dark scheme, so a dark one
+draws the dark film in the Retina face (light=0); paper-grey latches (light=3) but its grey ink leaves the glass's
+palette no headroom, so it draws main's paper band. --unlatched films the same window with its latch dropped, under
+<out_dir>/<style>-<pet>-glass-unlatched/: the Retina face drawing main's paper band, the glass lane's control, which
+tells a glass film's readings from the face's; no glass is asked of it. LINE does not read a frame that drew the
+glass (line_glass_unread).
+
 The two rows a person types on are the scenes bottom-prompt (a shell prompt on the last row of a full page) and
 composer (Claude Code's input box). jump, enter-long, wall-69 to wall-73, coloured-prompt, verdict and long-build
 are filmed on a shell's full page too; each starts typing at 2 s, once the pet has come to the caret.
 
-Per film, four lines and the laws it breaks:
+Per film, five lines and the laws it breaks:
 FLASH     every pixel of every frame, by WCAG 2.3.1: a flash is a pair of opposing changes in relative luminance
           of 0.10 or more where the darker state is below 0.80. A change is a turn, two turns a flash.
           flash_turns_most is the most turns one pixel makes in any second and flash_most the whole flashes in
@@ -312,14 +331,23 @@ LINE      the cells typed along the caret's row (the caret's steps of one or two
           under the baseline (none in the last 0.12 of the cell in the clean twin): a line parts round a
           descender as a typeset underline does, so g, j, p, q and y are not lit by a line that is whole.
           line_least is the least share of any judged frame, line_mean the mean, line_frames the frames judged.
+          A frame that drew the prism glass is not judged (the glass fills the cells to their foot as vividly as
+          a rail, inside the band): line_glass_unread, where any, counts the frames it left unread.
           A reading, not a law: most styles draw no line.
 PET       trail-companion's reading of every frame: companion_on_letters and companion_on_caret the frames whose
           body or flying head meets a lettered cell or the caret's by a pixel or more; alpha_dip the times the
           pet's alpha fell by a tenth or more and rose again (a leave and return through the window's edge is not
           one); min_pose_dwell_ms the shortest time one pose stayed, poses_under_100ms how many stayed less.
+GLASS     the frames' light, from their status rows: glass_frames the frames whose light arms drew the glass, of all;
+          light the highest light a frame carried (its bits, 3 for ON and GLASS, and its level: glass, lip, marks,
+          vanish; 0;- where none latched, unread for a film from before the lane); admitted_frames those whose light
+          admits the glass, sheer_frames those latched over a page that takes none (the face's thin ink over 0.007,
+          a translucent window, a wallpaper); yield_frames those whose glass yielded to the frame's words; thin_ink
+          the face's thin ink on the page, least..most; first_glass_ms the first frame that drew it.
 
 laws: flash_px_over3 - page_px_over3 = 0; lowered = 0 and caret_floor >= 3.0; companion_on_letters = 0, companion_on_caret = 0,
-alpha_dip = 0, poses_under_100ms = 0 and no frame unread.
+alpha_dip = 0, poses_under_100ms = 0 and no frame unread; under --glass, on a glass page (glass_page=1), glass_frames
+> 0 and admitted_frames = frames with sheer_frames = 0, and every window-lane film's dims name its glass_page.
 exit: 0; 1 a film breaks a law (--report-only: 0); 2 a usage error, or a film that could not be made or read
 ";
 
@@ -914,6 +942,8 @@ pub struct LineRead {
     /// Every judged frame's lit cells and judged cells, summed.
     pub lit: usize,
     pub cells: usize,
+    /// The frames that would have been judged but drew the prism glass ([`LineTrack::frame`]): unread.
+    pub glass_unread: usize,
 }
 
 impl LineRead {
@@ -941,11 +971,23 @@ pub struct LineTrack {
 }
 
 impl LineTrack {
-    /// The film's next frame, at `ms`, its clean twin and its caret's cell.
+    /// The film's next frame, at `ms`, its clean twin and its caret's cell; `glass`: the frame drew the prism
+    /// glass.
     ///
     /// A step of the caret one or two columns on along its row types the cells it leaves (two: a wide glyph);
-    /// any other move of it starts the run again, so a Home, a Backspace, an Enter and a click judge nothing.
-    pub fn frame(&mut self, ms: u64, frame: &Image, clean: &Image, grid: &Grid, caret: (i64, i64)) {
+    /// any other move of it starts the run again, so a Home, a Backspace, an Enter and a click judge nothing. A
+    /// frame that drew the glass is not judged, and is counted unread ([`LineRead::glass_unread`]): the glass's
+    /// body fills the typed cells to their foot with ink as vivid as a rail's, inside the band the line is looked
+    /// for in ([`LINE_BAND_FROM`]), so the band cannot tell a rail under the glass from the glass.
+    pub fn frame(
+        &mut self,
+        ms: u64,
+        frame: &Image,
+        clean: &Image,
+        grid: &Grid,
+        caret: (i64, i64),
+        glass: bool,
+    ) {
         match self.caret {
             Some(last) if last == caret => {}
             Some((row, col)) if row == caret.0 && (1..=2).contains(&(caret.1 - col)) => {
@@ -964,6 +1006,10 @@ impl LineTrack {
             .map(|&(c, _)| c)
             .collect();
         if settled.len() < LINE_CELLS || ms > newest + LINE_LIVE_MS {
+            return;
+        }
+        if glass {
+            self.read.glass_unread += 1;
             return;
         }
         let lined: Vec<i64> = settled
@@ -1118,6 +1164,72 @@ const fn layer_word(layer: Layer) -> &'static str {
     }
 }
 
+/// The light a film's frames carried and the glass it drew, from each frame's status row (`light=`, `live=`,
+/// `sheer=`, `thin_ink=`, `arms=`, as `aterm-render`'s `trail_film::film` writes them).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GlassRead {
+    /// The frames whose status names a light; a film from before the glass lane names none.
+    pub read: usize,
+    /// The frames whose arms name the glass (`glass:`): drawn, not just admitted.
+    pub drew: usize,
+    /// The frames whose light admits the glass (its level at the glass or over, on a page that takes it).
+    pub admitted: usize,
+    /// The frames whose light was latched over a page that takes no glass (sheer).
+    pub sheer: usize,
+    /// The frames whose arms name the yield (`yield:`): the glass cut to the frame's words.
+    pub yielded: usize,
+    /// The highest light a frame carried: its bits and its level's word.
+    pub light: Option<(u8, String)>,
+    /// The face's thin ink, least and most across the frames that read one.
+    pub thin_ink: Option<(f64, f64)>,
+    /// The first frame that drew the glass, ms.
+    pub first_ms: Option<u64>,
+}
+
+impl GlassRead {
+    /// One frame's status row at `ms`.
+    /// # Errors
+    /// A light, sheer or thin-ink field that is not a number.
+    pub fn note(&mut self, ms: u64, status: &str) -> Result<(), String> {
+        let Some(bits) = status_field(status, "light") else {
+            return Ok(());
+        };
+        let bits: u8 = bits
+            .parse()
+            .map_err(|_| format!("light={bits} is not a light's bits"))?;
+        self.read += 1;
+        let arms = status_field(status, "arms").unwrap_or("-");
+        let has = |arm: &str| arms.split(',').any(|a| a.split(':').next() == Some(arm));
+        if has("glass") {
+            self.drew += 1;
+            self.first_ms.get_or_insert(ms);
+        }
+        if has("yield") {
+            self.yielded += 1;
+        }
+        let sheer = status_field(status, "sheer") == Some("1");
+        // ON (1) and GLASS (2), and not SHEER: `Light::glass`.
+        if bits & 0b11 == 0b11 && !sheer {
+            self.admitted += 1;
+        }
+        if sheer {
+            self.sheer += 1;
+        }
+        if self.light.as_ref().is_none_or(|(b, _)| bits > *b) {
+            let word = status_field(status, "live").unwrap_or("-").to_string();
+            self.light = Some((bits, word));
+        }
+        if let Some(t) = status_field(status, "thin_ink").filter(|t| *t != "none") {
+            let t: f64 = t
+                .parse()
+                .map_err(|_| format!("thin_ink={t} is not a share"))?;
+            let (lo, hi) = self.thin_ink.unwrap_or((t, t));
+            self.thin_ink = Some((lo.min(t), hi.max(t)));
+        }
+        Ok(())
+    }
+}
+
 /// One film, read.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Reading {
@@ -1144,6 +1256,17 @@ pub struct Reading {
     pub pet: PetRead,
     /// The planted star's reading, where one was planted ([`plant_star`]).
     pub star: Option<StarRead>,
+    /// The light the frames carried and the glass they drew.
+    pub glass: GlassRead,
+    /// Whether the film's page is one the glass is solved for, as its dims say (`glass_page=`, a light page whose
+    /// palette has the glass's headroom, `prism_glass::headroom`): a fact of the page's colours, apart from the
+    /// films' own reading of their light, so a latch that admits nothing cannot excuse itself. `None` where the
+    /// dims do not say: every paper-lane film, and a window-lane film from before the fact was written.
+    pub glass_page: Option<bool>,
+    /// Whether the film was shot in the glass lane with its light latched (`--glass` without `--unlatched`), where
+    /// a glass page owes the glass on every frame. Set by the run, which knows the lane; [`judge_film`] leaves it
+    /// false.
+    pub glass_lane: bool,
 }
 
 impl Reading {
@@ -1232,6 +1355,35 @@ impl Reading {
             out.push(format!(
                 "pet: {} frames whose letters or caret were not read",
                 p.unread
+            ));
+        }
+        let g = &self.glass;
+        if self.glass_lane && self.glass_page.is_none() {
+            out.push(
+                "glass: the film's dims do not say whether its page takes the glass (no glass_page=): a film from \
+                 before the glass lane wrote it; film it again"
+                    .to_string(),
+            );
+        }
+        let glass_due = self.glass_lane && self.glass_page == Some(true);
+        if glass_due && g.drew == 0 {
+            out.push(format!(
+                "glass: a light page in the glass lane drew no glass in {} frames (light={}, admitted on {}, sheer on {}, \
+                 thin_ink {})",
+                self.frames,
+                g.light
+                    .as_ref()
+                    .map_or_else(|| "unread".to_string(), |(b, w)| format!("{b};{w}")),
+                g.admitted,
+                g.sheer,
+                g.thin_ink
+                    .map_or_else(|| "unread".to_string(), |(lo, hi)| format!("{lo:.4}..{hi:.4}")),
+            ));
+        } else if glass_due && (g.admitted < self.frames || g.sheer > 0) {
+            out.push(format!(
+                "glass: a light page in the glass lane held its light at the glass on {} of {} frames (sheer on {}): \
+                 the latch let go of a page it admits",
+                g.admitted, self.frames, g.sheer,
             ));
         }
         if let Some(star) = self
@@ -1373,6 +1525,9 @@ impl Reading {
             },
             l.frames
         );
+        if l.glass_unread > 0 {
+            let _ = write!(s, " line_glass_unread={}", l.glass_unread);
+        }
         let p = &self.pet;
         let _ = write!(
             s,
@@ -1389,6 +1544,30 @@ impl Reading {
             ),
             p.short_poses,
             p.unread
+        );
+        let g = &self.glass;
+        let _ = write!(
+            s,
+            "\n  GLASS    glass_frames={} of {} light={} admitted_frames={} sheer_frames={} yield_frames={} thin_ink={} \
+             first_glass_ms={}",
+            g.drew,
+            self.frames,
+            g.light
+                .as_ref()
+                .map_or_else(|| "unread".to_string(), |(b, w)| format!("{b};{w}")),
+            g.admitted,
+            g.sheer,
+            g.yielded,
+            g.thin_ink.map_or_else(
+                || "none".to_string(),
+                |(lo, hi)| if (hi - lo).abs() < 5e-5 {
+                    format!("{lo:.4}")
+                } else {
+                    format!("{lo:.4}..{hi:.4}")
+                }
+            ),
+            g.first_ms
+                .map_or_else(|| "none".to_string(), |ms| ms.to_string()),
         );
         if let Some(star) = self.star {
             let _ = write!(
@@ -1423,12 +1602,19 @@ fn pet_shot(png: &Path, ms: u64, grid: &Grid) -> Result<(PetShot, Vec<Span>, Vec
         .map(|p| read_text(&p))
         .transpose()?
         .unwrap_or_default();
-    let alpha = match status_field(&status, "pet_alpha") {
+    // A flier draws no body: its head is the pet, at the head's alpha and face.
+    let flier = read.body.is_none() && read.head.is_some();
+    let (alpha_field, pose_field) = if flier {
+        ("head_alpha", "head_pose")
+    } else {
+        ("pet_alpha", "pet_pose")
+    };
+    let alpha = match status_field(&status, alpha_field) {
         Some(a) => a
             .parse()
-            .map_err(|_| format!("{}: pet_alpha={a} is not 0..=255", png.display()))?,
+            .map_err(|_| format!("{}: {alpha_field}={a} is not 0..=255", png.display()))?,
         // A gallery's status row has no alpha: a body named is a body drawn.
-        None if read.body.is_some() => u8::MAX,
+        None if read.body.is_some() || flier => u8::MAX,
         None => 0,
     };
     let edges = (grid.ox, grid.ox + grid.cols * grid.cw);
@@ -1436,8 +1622,12 @@ fn pet_shot(png: &Path, ms: u64, grid: &Grid) -> Result<(PetShot, Vec<Span>, Vec
     let (body, head) = (met(&read.meets), met(&read.head_meets));
     let shot = PetShot {
         ms,
-        alpha: if read.body.is_some() { alpha } else { 0 },
-        pose: status_field(&status, "pet_pose")
+        alpha: if read.body.is_some() || flier {
+            alpha
+        } else {
+            0
+        },
+        pose: status_field(&status, pose_field)
             .unwrap_or_default()
             .to_string(),
         at_edge: read
@@ -1523,8 +1713,21 @@ pub fn judge_film(dir: &Path, star: bool) -> Result<Reading, String> {
         return Err(format!("{}: no film.<ms>.png frame", dir.display()));
     };
     let dims = frame_dims(first).ok_or_else(|| format!("{}: no film.dims.txt", dir.display()))?;
-    let grid = grid_from_dims(&read_text(&dims)?)?;
+    let dims = read_text(&dims)?;
+    let grid = grid_from_dims(&dims)?;
+    let glass_page = match status_field(&dims, "glass_page") {
+        None => None,
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        Some(v) => {
+            return Err(format!(
+                "{}: film.dims.txt has glass_page={v}, not 0 or 1",
+                dir.display()
+            ));
+        }
+    };
     let mut out = Reading {
+        glass_page,
         frames: frames.len(),
         last_ms: frames.last().map_or(0, |f| f.0),
         step_ms: frames
@@ -1563,8 +1766,16 @@ pub fn judge_film(dir: &Path, star: bool) -> Result<Reading, String> {
         }
         out.width = frame.width;
         flicker.frame(*ms, &frame, clean.zip(caret).map(|(c, at)| (c, &grid, at)))?;
+        let status = sidecar(png, ".status.txt", true)
+            .map(|p| read_text(&p))
+            .transpose()?
+            .unwrap_or_default();
+        let drew = out.glass.drew;
+        out.glass
+            .note(*ms, &status)
+            .map_err(|e| format!("{}: {e}", png.display()))?;
         if let Some((clean, at)) = clean.zip(caret) {
-            line.frame(*ms, &frame, clean, &grid, at);
+            line.frame(*ms, &frame, clean, &grid, at, out.glass.drew > drew);
         }
         let report = crate::trail_contrast::report(&crate::trail_contrast::Args {
             png: png.to_string_lossy().into_owned(),
@@ -1633,6 +1844,11 @@ pub struct Args {
     pub report_only: bool,
     /// `--plant-star`: [`plant_star`] in every frame judged.
     pub plant_star: bool,
+    /// `--glass`: the films are shot in a Retina window's lane (`aterm-render`'s `trail_film::Lane::Glass`).
+    pub glass: bool,
+    /// `--unlatched` (with `--glass`): that lane with its light latch dropped (`Lane::Unlatched`), the glass
+    /// lane's control.
+    pub unlatched: bool,
 }
 
 impl Args {
@@ -1646,10 +1862,35 @@ impl Args {
         }
     }
 
-    /// The run's folder under the output directory: `<style>-<pet>`.
+    /// The run's folder under the output directory: `<style>-<pet>`, `<style>-<pet>-glass` for the glass lane and
+    /// `<style>-<pet>-glass-unlatched` for its control, so no lane's run replaces another's films.
     #[must_use]
     pub fn folder(&self) -> String {
-        format!("{}-{}", style_slug(&self.style), self.pet)
+        format!(
+            "{}-{}{}",
+            style_slug(&self.style),
+            style_slug(&self.pet),
+            self.lane()
+                .map_or(String::new(), |l| format!("-glass{}", l.1))
+        )
+    }
+
+    /// The replay's `TRAIL_FILM_GLASS` and the folder's suffix past `-glass`, for a run in a Retina window's
+    /// lane; `None` for the paper lane.
+    #[must_use]
+    pub const fn lane(&self) -> Option<(&'static str, &'static str)> {
+        match (self.glass, self.unlatched) {
+            (false, _) => None,
+            (true, false) => Some(("1", "")),
+            (true, true) => Some(("unlatched", "-unlatched")),
+        }
+    }
+
+    /// Whether this run films in the glass lane with its light latched, where a glass page owes the glass
+    /// ([`Reading::glass_lane`]).
+    #[must_use]
+    pub const fn glass_lane(&self) -> bool {
+        self.glass && !self.unlatched
     }
 }
 
@@ -1687,13 +1928,11 @@ fn names(
     Ok(out)
 }
 
-/// The pets a film can keep: the walkers and `off`. The replay films the pipeline, which
-/// keeps those; a flier's flight is the app's (`lab trail-gallery --extra
-/// 'cursor_pet = "flying cat"'` photographs it).
+/// The pets a film can keep: every `cursor_pet`, the flier included (the replay's pipeline
+/// flies it as the window's host does).
 fn filmed_pets() -> String {
     aterm_effects::cursor_pet::PETS
         .iter()
-        .filter(|row| !row.flies)
         .map(|row| row.name)
         .collect::<Vec<_>>()
         .join(", ")
@@ -1704,15 +1943,19 @@ fn filmed_pets() -> String {
 pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
     let mut rest = args.to_vec();
     let pet = take_value(&mut rest, "--pet")?.unwrap_or_else(|| FLAGSHIP_PET.to_string());
-    let Some(pet) = aterm_effects::cursor_pet::row(&pet)
-        .filter(|row| !row.flies)
-        .map(|row| row.name)
-    else {
+    let Some(pet) = aterm_effects::cursor_pet::row(&pet).map(|row| row.name) else {
         return Err(Fail::usage(format!(
             "trail-film: --pet takes {}, not {pet:?}",
             filmed_pets()
         )));
     };
+    let glass = take_flag(&mut rest, "--glass");
+    let unlatched = take_flag(&mut rest, "--unlatched");
+    if unlatched && !glass {
+        return Err(Fail::usage(
+            "trail-film: --unlatched drops the glass lane's latch; name --glass with it",
+        ));
+    }
     let themes = names(
         "--theme",
         take_value(&mut rest, "--theme")?,
@@ -1781,6 +2024,8 @@ pub fn parse_args(args: &[String]) -> Result<Args, Fail> {
         replay,
         report_only,
         plant_star,
+        glass,
+        unlatched,
     })
 }
 
@@ -1878,6 +2123,7 @@ fn replay(a: &Args, root: &Path, films: &[(String, String, String, PathBuf)]) ->
     .env("TRAIL_FILM_THEMES", a.themes.join(","))
     .env("TRAIL_FILM_CARETS", a.carets.join(","))
     .env("TRAIL_FILM_SCENES", a.scenes.join(","))
+    .env("TRAIL_FILM_GLASS", a.lane().map_or("0", |l| l.0))
     .current_dir(&paths().repo)
     .stdin(Stdio::null())
     .stderr(Stdio::inherit());
@@ -1940,9 +2186,10 @@ pub fn cmd_trail_film(args: &[String]) -> Res {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut broke = 0;
     for ((theme, caret, scene, dir), read) in films.iter().zip(readings) {
-        let read = read
+        let mut read = read
             .unwrap_or_else(|| Err("its reader stopped".to_string()))
             .map_err(|e| Fail::usage(format!("trail-film: {}: {e}", dir.display())))?;
+        read.glass_lane = a.glass_lane();
         println!(
             "film {:?} pet={} theme={theme} caret={caret} scene={scene} frames={} last_ms={} dir={}",
             a.style,
@@ -1973,3 +2220,7 @@ pub fn cmd_trail_film(args: &[String]) -> Res {
 #[cfg(test)]
 #[path = "trail_film_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "trail_film_flier_tests.rs"]
+mod flier_tests;

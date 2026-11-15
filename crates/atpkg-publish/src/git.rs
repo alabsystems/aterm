@@ -421,6 +421,66 @@ pub fn is_clean(dir: &Path) -> Result<bool> {
     Ok(run(dir, &STATUS)?.is_empty())
 }
 
+/// The first entry of `dir`'s index, or of an active submodule's, that carries a hint to leave
+/// its file unread (`git ls-files -v` lowercases an assume-unchanged entry's flag and prints `S`
+/// for a skip-worktree one), flag and path as git prints them, or `None`. The listing is read
+/// to its end one entry at a time and only a hinted entry is held, so a repository's size is no
+/// part of the answer: a product of 400,000 files lists 38 MB, more than a whole capture holds.
+/// # Errors
+/// A could-not-run when git cannot be started, does not end within [`LOCAL_GIT_BOUND`] or its
+/// listing does not reach its end, or a refusal when git fails.
+pub fn index_hint(dir: &Path) -> Result<Option<String>> {
+    for args in [
+        &["ls-files", "-v", "-z"][..],
+        &["ls-files", "-v", "-z", "--recurse-submodules"][..],
+    ] {
+        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+        cmd.arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let mut found = false;
+        let out = aterm_uds::deadline::output_within_complete_stdout_records(
+            &mut cmd,
+            LOCAL_GIT_BOUND,
+            0,
+            MAX_COMPLETE_STDOUT_BYTES,
+            move |entry| {
+                let hinted = !found
+                    && entry
+                        .first()
+                        .is_some_and(|flag| flag.is_ascii_lowercase() || *flag == b'S');
+                found |= hinted;
+                hinted
+            },
+        )
+        .map_err(|e| match e {
+            CompleteOutputError::Run(RunError::Spawn(e)) => Error::io("spawn git", &e),
+            other => Error::cannot_run(format!(
+                "`git -C {} {}`: {other}",
+                dir.display(),
+                args.join(" ")
+            )),
+        })?;
+        if !out.status.success() {
+            return Err(Error::refused(format!(
+                "`git -C {} {}` failed: {}",
+                dir.display(),
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("(no message)")
+            )));
+        }
+        let entry = out.stdout.strip_suffix(b"\0").unwrap_or(&out.stdout);
+        if !entry.is_empty() {
+            return Ok(Some(String::from_utf8_lossy(entry).into_owned()));
+        }
+    }
+    Ok(None)
+}
+
 /// The first path that keeps `dir` from being a fresh clone's tree, or `None`: a change to a
 /// tracked or untracked file or a submodule ([`is_clean`]), or an ignored file anywhere but the
 /// top-level `target/` (an ignored `.cargo/config.toml`, `build.rs` or source file is read by
@@ -431,21 +491,9 @@ pub fn is_clean(dir: &Path) -> Result<bool> {
 /// When `dir` is not a work tree.
 pub fn is_pristine(dir: &Path) -> Result<Option<String>> {
     run(dir, &["rev-parse", "--is-inside-work-tree"])?;
-    // `-v` lowercases assume-unchanged entries; `S` names skip-worktree entries.
     // A clean status is not evidence about the contents Git was told not to inspect.
-    for args in [
-        &["ls-files", "-v", "-z"][..],
-        &["ls-files", "-v", "-z", "--recurse-submodules"][..],
-    ] {
-        let entries = run(dir, args)?;
-        if let Some(entry) = entries.split('\0').find(|entry| {
-            entry
-                .as_bytes()
-                .first()
-                .is_some_and(|flag| flag.is_ascii_lowercase() || *flag == b'S')
-        }) {
-            return Ok(Some(format!("index hint hides tracked input: {entry:?}")));
-        }
+    if let Some(entry) = index_hint(dir)? {
+        return Ok(Some(format!("index hint hides tracked input: {entry:?}")));
     }
     let mut args = STATUS.to_vec();
     args.push("--ignored=matching");

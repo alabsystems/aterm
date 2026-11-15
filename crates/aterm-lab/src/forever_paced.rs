@@ -7,14 +7,14 @@
 //! Cruise: "Repeated no-work replies permanently stopping Cruise | Use the existing pacing
 //! interval, then request a different approach". So HC no longer wants a hold:
 //!
-//! * the first act is Cruise's done check ([`turn_end::RULE_DONE_CHECK`]) at the done claim;
+//! * the first act is Cruise's done check ([`alab_policy::words::RULE_DONE_CHECK`]) at the done claim;
 //! * EACH GAP AT LEAST THE LADDER'S: act `n` (from 1) comes no sooner than the short back-off
 //!   ladder's step `n` ([`ladder_step_ms`]) after the reply it answers, less [`STEP_SLACK_MS`] —
 //!   every reply of the chain is a short turn, so act `n` closes `n` of them in a row — and
 //!   within the step the loop decided at that reply ([`ladder_steps`]): no sooner than its due,
 //!   no later than [`PERSISTENCE_GRACE_MS`] past it;
 //! * A DIFFERENT APPROACH: the act after the second same answer is the request for one
-//!   ([`turn_end::FORWARD_RECOVERY`] under [`turn_end::RULE_CONTINUE`], [`is_recovery`]), after
+//!   ([`alab_policy::words::FORWARD_RECOVERY`] under [`alab_policy::words::RULE_CONTINUE`], [`is_recovery`]), after
 //!   the loop's wait for it ([`recovery_wait`]);
 //! * NEVER A PERMANENT STOP: no hold (`EXCEPTION … kind=stalled`), no step whose due passed by
 //!   [`PERSISTENCE_GRACE_MS`] with nothing typed after it ([`lost_after`]), and THE REQUEST'S
@@ -30,8 +30,6 @@
 //! A build that types at a constant rate fails the gap and the hour; one that holds fails the
 //! stop, and one that parks after its request fails the next step. The explicit holds keep their
 //! own wants: Land's same reply (HL), a person's hold and a claim's custody.
-
-use aterm_agent::supervise::policy::turn_end;
 
 use super::surfaces::held::{decided_after, is_stall, stall_of};
 use super::{
@@ -55,25 +53,25 @@ pub const HOUR_MS: i64 = 60 * 60 * 1000;
 pub const SHIPPED: f64 = 1.0;
 
 /// The words a request for a different approach carries past the harness mark: the head of
-/// [`turn_end::FORWARD_RECOVERY`], short enough that the journal's line holds it whole.
+/// [`alab_policy::words::FORWARD_RECOVERY`], short enough that the journal's line holds it whole.
 #[must_use]
 pub fn recovery_head() -> &'static str {
-    let rest = turn_end::FORWARD_RECOVERY
+    let rest = alab_policy::words::FORWARD_RECOVERY
         .split_once(']')
-        .map_or(turn_end::FORWARD_RECOVERY, |(_, r)| r)
+        .map_or(alab_policy::words::FORWARD_RECOVERY, |(_, r)| r)
         .trim_start();
     let end = rest.char_indices().nth(48).map_or(rest.len(), |(i, _)| i);
     &rest[..end]
 }
 
 /// Whether `act` (a journal act of `seen`) is the request for a different approach: typed under
-/// [`turn_end::RULE_CONTINUE`], its text (the ledger's command, else the journal's line) holding
+/// [`alab_policy::words::RULE_CONTINUE`], its text (the ledger's command, else the journal's line) holding
 /// [`recovery_head`].
 #[must_use]
 pub fn is_recovery(seen: &Seen, act: &(i64, String)) -> bool {
-    act_rule(&act.1) == Some(turn_end::RULE_CONTINUE)
+    act_rule(&act.1) == Some(alab_policy::words::RULE_CONTINUE)
         && seen
-            .act_text(turn_end::RULE_CONTINUE, act)
+            .act_text(alab_policy::words::RULE_CONTINUE, act)
             .contains(recovery_head())
 }
 
@@ -201,12 +199,12 @@ pub fn judge(seen: &Seen, scale: f64, t0: i64) -> Verdict {
             None => Verdict::Fail(format!("no act typed within {}", at(t0, seen.end_ms))),
         };
     };
-    if act_rule(&first.1) != Some(turn_end::RULE_DONE_CHECK) {
+    if act_rule(&first.1) != Some(alab_policy::words::RULE_DONE_CHECK) {
         return Verdict::Fail(format!(
             "its first act at +{} was {}, not {}",
             at(t0, first.0),
             act_rule(&first.1).unwrap_or("?"),
-            turn_end::RULE_DONE_CHECK
+            alab_policy::words::RULE_DONE_CHECK
         ));
     }
     if let Some((d, l)) = seen.first_after("DONE ", t0) {
@@ -317,7 +315,7 @@ pub fn judge(seen: &Seen, scale: f64, t0: i64) -> Verdict {
                 "the request for a different approach at +{} followed no wait for it (`WAITING … \
                  {}`)",
                 at(t0, rc.0),
-                turn_end::REPEAT_RECOVERY_WAIT
+                alab_policy::words::REPEAT_RECOVERY_WAIT
             ));
         } else {
             said.push(format!("a different approach asked at +{}", at(t0, rc.0)));

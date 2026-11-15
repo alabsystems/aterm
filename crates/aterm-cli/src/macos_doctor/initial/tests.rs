@@ -3128,9 +3128,7 @@ fn native_repositories(tools: bool, token: bool) -> Fake {
         sys.executable(aterm_machines::items::github::CLT_GIT, b"inert git");
     }
     if token {
-        let token = format!("{}/.secrets/gh_access_token", user.home);
-        sys.file(&token, TOKEN.as_bytes())
-            .stat_of(&token, stat(false, TOKEN.len() as u64));
+        sys.vault_set(&user.home, "gh_access_token", TOKEN.as_bytes());
     }
     for _ in 1..=2 {
         sys.fail_github_api(&user, "/user", GithubFailure::Unreached);
@@ -3192,7 +3190,7 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
         "inventory",
         "credential-route",
         "launcher-permission",
-        "profile-path",
+        "profile",
         "inventory-during-accounts",
         "credential-route-during-accounts",
         "launcher-permission-during-accounts",
@@ -3216,7 +3214,6 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
             len,
         };
         let home = user.home.clone();
-        let inventory = format!("{home}/.secrets/github-repositories.json");
         let metadata = |name| {
             aterm_json::to_vec(&aterm_json::json!({
                 "schema":2,"account":"tester","repositories":[{
@@ -3229,8 +3226,7 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
             .unwrap()
         };
         let before = metadata("before");
-        sys.file(&inventory, &before)
-            .stat_of(&inventory, stat(false, before.len() as u64));
+        sys.vault_set(&home, "github-repositories.json", &before);
         let launcher = format!("{home}/.local/bin/aterm");
         sys.executable(&launcher, b"launcher");
         sys.stat_of(&format!("{home}/before"), stat(true, 0));
@@ -3279,24 +3275,6 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
         assert!(!prior.completed);
         assert_ne!(prior.done & Stage::Repositories.bit(), 0);
         let profile = format!("{home}/.config/aterm/init.toml");
-        let custom = |path| format!("[github]\naccount='tester'\ntoken_file='{path}'\n");
-        let old_source = format!("{home}/old/token");
-        let new_source = format!("{home}/new/token");
-        if change == "profile-path" {
-            let (sys, _) = host.native_repositories.as_ref().unwrap();
-            for path in [&old_source, &new_source] {
-                sys.file(path, b"unsafe").stat_of(
-                    path,
-                    Stat {
-                        mode: 0o644,
-                        ..stat(false, 6)
-                    },
-                );
-            }
-            let bytes = custom(&old_source);
-            sys.file(&profile, bytes.as_bytes())
-                .stat_of(&profile, stat(false, bytes.len() as u64));
-        }
         let parked = |host: &Fake| {
             let (sys, _) = host.native_repositories.as_ref().unwrap();
             let calls = sys.calls();
@@ -3319,8 +3297,7 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
             "inventory" => {
                 let after = metadata("after");
                 let (sys, _) = host.native_repositories.as_ref().unwrap();
-                sys.file(&inventory, &after)
-                    .stat_of(&inventory, stat(false, after.len() as u64));
+                sys.vault_set(&home, "github-repositories.json", &after);
             }
             "credential-route" => {
                 let (sys, _) = host.native_repositories.as_ref().unwrap();
@@ -3337,22 +3314,21 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
                     },
                 );
             }
-            "profile-path" => {
+            "profile" => {
+                // A `[github]` table the stage cannot admit (an owner without its account).
                 let (sys, _) = host.native_repositories.as_ref().unwrap();
-                let bytes = custom(&new_source);
-                sys.file(&profile, bytes.as_bytes())
+                let bytes = b"[github]\nowner='team'\n";
+                sys.file(&profile, bytes)
                     .stat_of(&profile, stat(false, bytes.len() as u64));
                 let paths = aterm_machines::init_github::repository_input_watch_paths(sys).unwrap();
-                assert!(paths.contains(&PathBuf::from(&new_source)));
-                assert!(!paths.contains(&PathBuf::from(&old_source)));
+                assert!(paths.contains(&PathBuf::from(&profile)));
             }
             "inventory-during-accounts" => {
-                let inventory = inventory.clone();
+                let home = home.clone();
                 let after = metadata("after");
-                let changed = stat(false, after.len() as u64);
                 host.accounts_end = Some(Box::new(move |host| {
                     let (sys, _) = host.native_repositories.as_ref().unwrap();
-                    sys.file(&inventory, &after).stat_of(&inventory, changed);
+                    sys.vault_set(&home, "github-repositories.json", &after);
                 }));
             }
             "credential-route-during-accounts" => {
@@ -3385,7 +3361,7 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
             after_park.facts_changed_since(&before_park),
             matches!(
                 change,
-                "inventory" | "credential-route" | "launcher-permission" | "profile-path"
+                "inventory" | "credential-route" | "launcher-permission" | "profile"
             ),
             "{change}: actual local input changes must wake the still-pending run"
         );
@@ -3462,8 +3438,7 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
                     },
                 );
             } else {
-                sys.file(&inventory, &before)
-                    .stat_of(&inventory, stat(false, before.len() as u64));
+                sys.vault_set(&home, "github-repositories.json", &before);
                 sys.executable(&launcher, b"launcher");
             }
             host.calls.clear();
@@ -3527,14 +3502,10 @@ fn repositories_recover_after_an_interface_change(with_secrets: bool) {
     sys.stat_of(&user.home, stat(true, 0));
     sys.executable(aterm_machines::items::github::CLT_GIT, b"inert git");
     sys.executable(&format!("{}/.local/bin/aterm", user.home), b"launcher");
-    let token = format!("{}/.secrets/gh_access_token", user.home);
-    sys.file(&token, TOKEN.as_bytes())
-        .stat_of(&token, stat(false, TOKEN.len() as u64));
+    sys.vault_set(&user.home, "gh_access_token", TOKEN.as_bytes());
     // Metadata has not arrived from the private vault on this network yet. Default
     // repository setup waits without enumerating GitHub, then wakes on a new attachment.
     const INVENTORY: &[u8] = b"{\"schema\":2,\"account\":\"tester\",\"repositories\":[]}";
-    let inventory_path = format!("{}/.secrets/github-repositories.json", user.home);
-    let inventory_stat = stat(false, INVENTORY.len() as u64);
     // The local helper already returns this token for all repositories.
     // A complete empty inventory therefore needs no credential writes or clones.
     sys.simulate(|_, command| {
@@ -3599,8 +3570,11 @@ fn repositories_recover_after_an_interface_change(with_secrets: bool) {
     // The new network delivers the vault's complete private inventory. Its local account
     // and repository list suffice; no GitHub identity or inventory request is needed.
     let (sys, _) = host.native_repositories.as_ref().unwrap();
-    sys.file(&inventory_path, INVENTORY)
-        .stat_of(&inventory_path, inventory_stat);
+    sys.vault_set(
+        "/test-repository-home",
+        "github-repositories.json",
+        INVENTORY,
+    );
 
     // A worker woken by the changed local attachment can finish the same
     // admitted run, without repeating Secrets or creating a new revision.

@@ -311,3 +311,41 @@ fn an_owned_hardware_arrival_keeps_a_long_os_queue_wait() {
     assert_eq!(metrics.window.input.input.copy_out().n(), 1);
     assert_eq!(metrics.window.input.input.max(), 730 * MS);
 }
+
+#[test]
+fn a_retained_native_clock_reaches_queue_write_and_present_metrics() {
+    const MS: u64 = 1_000_000;
+    let metrics = Metrics::new();
+    let mut window = WindowPresentState::default();
+    let queue = crate::platform::retained_key_queue_age_ns(Some((10, 1024.0)), || Some(1025.5));
+    assert_eq!(queue, Some(1500 * MS));
+    let dispatch = 2000 * MS;
+    metrics.with_key_arrival_queued_at(queue, dispatch, || {
+        assert_eq!(metrics.key_arrival_ns(), 500 * MS);
+        metrics.note_window_input(&mut window.pending_input, dispatch);
+        let stamp = metrics.take_key_write_stamp();
+        assert_eq!(
+            metrics.record_key_write_at(stamp, dispatch + 2 * MS),
+            Some(1502 * MS)
+        );
+    });
+    let booked = metrics.record_present_at(
+        PresentClock {
+            now: dispatch + 10 * MS,
+            epoch: 0,
+            capture_forced: false,
+            tainted: false,
+        },
+        1,
+        1,
+        Some(&mut window),
+        &mut PresentObserver::default(),
+    );
+    assert_eq!(booked.input_booked, 1);
+    assert_eq!(metrics.window.input.input.max(), 1510 * MS);
+    assert_eq!(metrics.window.input.key_queue.copy_out().n(), 1);
+    assert_eq!(metrics.window.input.key_queue.max(), 1500 * MS);
+    assert_eq!(metrics.window.input.key_write.copy_out().n(), 1);
+    assert_eq!(metrics.window.input.key_queue_unavailable.get(), 0);
+    assert_eq!(metrics.window.input.key_write_unavailable.get(), 0);
+}

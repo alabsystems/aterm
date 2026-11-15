@@ -10,6 +10,14 @@ use std::sync::atomic::AtomicU8;
 mod spawn;
 pub use spawn::{OwnedSpawnFailure, OwnedWorker};
 
+#[path = "codex_source_owned_service.rs"]
+mod service;
+pub use service::{OwnedService, OwnedServiceFailure, PreparedServiceAttachment, ServiceFrontend};
+
+#[path = "codex_source_backend_start.rs"]
+mod backend_start;
+pub use backend_start::{BackendConfiguration, BackendStart, OwnedBackend};
+
 #[path = "codex_source_owned_control.rs"]
 mod control;
 
@@ -68,17 +76,12 @@ impl OwnedLaunchReservation {
         }
     }
 
-    /// Arm only this independently admitted image, retaining its sign-in check.
+    /// Arm only this independently admitted image.
     ///
     /// # Errors
     /// The admission, image or source gate changed, or the constructor was bound.
-    pub fn arm(
-        &self,
-        admitted: worker::Admitted,
-        cli: &worker::WorkerCli,
-        home: Option<&std::path::Path>,
-    ) -> Result<worker::Admitted, Error> {
-        self.inner.arm(admitted, cli, home)
+    pub fn arm(&self, admitted: worker::Admitted) -> Result<worker::Admitted, Error> {
+        self.inner.arm(admitted)
     }
 
     /// Recheck the armed admission immediately before the owned spawn.
@@ -116,27 +119,43 @@ impl OwnedLaunchReservation {
     /// # Errors
     /// The child is reaped, foreign, not group-leading, changed during observation,
     /// or does not match this live admitted constructor and source gate.
-    pub fn bind(&self, child: &aterm_uds::spawnfd::Child) -> Result<(), Error> {
+    #[cfg(test)]
+    fn bind(&self, child: &aterm_uds::spawnfd::Child) -> Result<(), Error> {
+        self.bind_checked(child).map_err(|(reason, _)| reason)
+    }
+
+    fn bind_checked(&self, child: &aterm_uds::spawnfd::Child) -> Result<(), (Error, &'static str)> {
         if !child.owns_unreaped() {
-            return Err(Error::Stale);
+            return Err((Error::Stale, "child custody"));
         }
-        let process = Process::observe(child.id()).ok_or(Error::Unavailable)?;
-        let parent = Process::observe(std::process::id()).ok_or(Error::Unavailable)?;
+        let process =
+            Process::observe(child.id()).ok_or((Error::Unavailable, "child observation"))?;
+        let parent = Process::observe(std::process::id())
+            .ok_or((Error::Unavailable, "parent observation"))?;
         if process.parent != parent.pid
             || process.group != process.pid
             || process.session != parent.session
         {
-            return Err(Error::Denied);
+            return Err((Error::Denied, "child parent/group/session"));
         }
-        let args = atpkg::caller_shell::process_args(process.pid).ok_or(Error::Unavailable)?;
+        let args = atpkg::caller_shell::process_args(process.pid)
+            .ok_or((Error::Unavailable, "child arguments"))?;
         if args.env_var(LAUNCH_ENV) != Some(self.inner.token.as_str()) {
-            return Err(Error::Denied);
+            return Err((Error::Denied, "constructor nonce"));
         }
-        let state = self.inner.state.upgrade().ok_or(Error::Stale)?;
-        let (gate, sid) = {
-            let state = lock(&state)?;
-            let launch = state.launches.get(&self.inner.token).ok_or(Error::Stale)?;
-            check(launch, &process, &self.binding)?;
+        let state = self
+            .inner
+            .state
+            .upgrade()
+            .ok_or((Error::Stale, "registry lifetime"))?;
+        let gate = {
+            let state = lock(&state).map_err(|error| (error, "registry lock"))?;
+            let launch = state
+                .launches
+                .get(&self.inner.token)
+                .ok_or((Error::Stale, "constructor entry"))?;
+            check(launch, &process, &self.binding)
+                .map_err(|error| (error, "constructor admission"))?;
             if launch
                 .expected_env
                 .iter()
@@ -146,35 +165,42 @@ impl OwnedLaunchReservation {
                     .iter()
                     .any(|name| args.env_var(name).is_some())
             {
-                return Err(Error::Denied);
+                return Err((Error::Denied, "admitted environment view"));
             }
-            (
-                launch.gate.as_ref().ok_or(Error::Stale)?.clone(),
-                launch.sid.clone(),
-            )
+            launch
+                .gate
+                .as_ref()
+                .ok_or((Error::Stale, "source gate lifetime"))?
+                .clone()
         };
         // Profile and process observation never run under the registry mutex.
-        self.environment
-            .check_child(&process, &self.inner.token, &sid)?;
-        gate.current().map_err(|_| Error::Stale)?;
+        // Complete environment installation is tied to InstalledSpawn by the
+        // closed native command path. KERN_PROCARGS2 cannot distinguish an
+        // aligned environment tail from Apple startup strings.
+        gate.current().map_err(|_| (Error::Stale, "source gate"))?;
         if !child.owns_unreaped() || Process::observe(child.id()).as_ref() != Some(&process) {
-            return Err(Error::Stale);
+            return Err((Error::Stale, "child observation changed"));
         }
-        let mut state = lock(&state)?;
+        let mut state = lock(&state).map_err(|error| (error, "registry commit lock"))?;
         let launch = state
             .launches
             .get_mut(&self.inner.token)
-            .ok_or(Error::Stale)?;
-        check(launch, &process, &self.binding)?;
+            .ok_or((Error::Stale, "constructor entry changed"))?;
+        check(launch, &process, &self.binding)
+            .map_err(|error| (error, "constructor commit admission"))?;
         if !launch
             .gate
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, &gate))
         {
-            return Err(Error::Stale);
+            return Err((Error::Stale, "source gate changed"));
         }
-        self.binding.bind()?;
-        launch.bind(process)?;
+        self.binding
+            .bind()
+            .map_err(|error| (error, "constructor binding"))?;
+        launch
+            .bind(process)
+            .map_err(|error| (error, "child binding"))?;
         Ok(())
     }
 
@@ -206,13 +232,8 @@ impl OwnedLaunchReservation {
             pid: process.pid,
             birth: process.birth,
         };
-        let actor = state.actors.get(&actor_key(&caller)).ok_or(Error::Stale)?;
-        let issued = actor.issued.get(&member).ok_or(Error::Stale)?;
-        if actor.process != *process
-            || issued.target.is_some()
-            || issued.parent_use.is_some()
-            || !issued.connection.same(&connection)
-        {
+        let issued = state.controllers.get(&member).ok_or(Error::Stale)?;
+        if !issued.bound_to(&caller, process, &connection) {
             return Err(Error::Stale);
         }
         Ok(())
@@ -239,10 +260,17 @@ impl OwnedLaunchReservation {
             let key = format!("{actor_key}:{member}");
             if let Some(current) = state.members.get(&key)
                 && current.process == *process
-                && current.operation == issued.operation
                 && current.connection.same(&issued.connection)
                 && !current.unknown
                 && current.readiness.manager()
+                && state.preload_sequences.get(&key).is_some_and(|ledger| {
+                    ledger.completed_ready(
+                        process,
+                        &current.operation,
+                        &current.registration,
+                        current.readiness.role,
+                    )
+                })
                 && !state.preloads.contains_key(&key)
                 && !reservation::target::normalize::handoff::source_revoked(
                     &state,

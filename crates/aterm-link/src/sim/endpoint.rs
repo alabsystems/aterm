@@ -260,6 +260,12 @@ pub(crate) struct EpState {
     /// (item C14): the post stays unretired and the bridge's pin of it stands, as a power cut
     /// between the pin and the retire leaves it, until the world cuts the power.
     pub(crate) unretired: BTreeSet<String>,
+    /// Senders whose `outbox sent` this aterm answers `ERR busy update-committing`, the post
+    /// untouched (ATERM-KI-1111-3): aterm-gui-fabric's `retire_post` while a seamless update's
+    /// commit fences the session's retirements ([`super::world::run_busy`]).
+    pub(crate) busy: BTreeSet<String>,
+    /// How many `outbox sent` lines this aterm answered busy.
+    pub(crate) answered_busy: u64,
 }
 
 /// What the endpoint keeps of its newest bridge's link for a quit's wait ([`EpState::lands`]).
@@ -982,6 +988,10 @@ impl EpState {
             return "ERR usage: outbox sent\n".to_string();
         };
         let rest: Vec<&str> = words.collect();
+        if self.busy.contains(sid) {
+            self.answered_busy += 1;
+            return "ERR busy update-committing\n".to_string();
+        }
         if self.unretired.contains(sid) {
             return "ERR no such session\n".to_string();
         }

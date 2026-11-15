@@ -5,7 +5,6 @@
 //! publication grants stay separate from synthesized vault profiles and owner rows.
 
 use crate::config::Dirs;
-use crate::identity::EnvSource;
 use crate::identity::vault::{self, Adoption};
 use crate::policy::Router;
 use crate::{Github, Result};
@@ -52,12 +51,7 @@ impl Configured {
     }
 }
 
-fn resolve(
-    dirs: &Dirs,
-    env: &dyn EnvSource,
-    live: Option<&Github>,
-    honour_loose: bool,
-) -> Result<Configured> {
+fn resolve(dirs: &Dirs, live: Option<&Github>, honour_loose: bool) -> Result<Configured> {
     let snapshot = match crate::config::load_routing_snapshot(dirs, honour_loose)
         .map_err(|refusal| refusal.error)?
     {
@@ -69,7 +63,7 @@ fn resolve(
         }
         snapshot => snapshot,
     };
-    let adoption = vault::run_with_rows(dirs, env, live, snapshot.as_ref().map(|(_, rows)| rows));
+    let adoption = vault::run_with_rows(dirs, live, snapshot.as_ref().map(|(_, rows)| rows));
     let router = match &adoption {
         Some(adoption) => adoption.router(),
         None => Ok(snapshot
@@ -89,15 +83,15 @@ fn resolve(
 /// # Errors
 /// Refusal of a malformed, unreadable or unsafe explicit configuration file.
 pub fn adopt(base: &Github, dirs: &Dirs) -> Result<Configured> {
-    resolve(dirs, base.env(), Some(base), false)
+    resolve(dirs, Some(base), false)
 }
 
 /// Resolve standard CLI routing from recorded identities without requests or state writes.
 /// Unrecorded or changed credentials cannot acquire identity or grant authority here.
 /// # Errors
 /// Refusal of a malformed, unreadable or unsafe explicit configuration file.
-pub fn view(dirs: &Dirs, env: &dyn EnvSource) -> Result<Configured> {
-    resolve(dirs, env, None, false)
+pub fn view(dirs: &Dirs) -> Result<Configured> {
+    resolve(dirs, None, false)
 }
 
 /// [`adopt`] for a library host: retain its existing explicit `legacy_loose` file policy.
@@ -105,15 +99,15 @@ pub fn view(dirs: &Dirs, env: &dyn EnvSource) -> Result<Configured> {
 /// # Errors
 /// As [`adopt`].
 pub fn adopt_for_host(base: &Github, dirs: &Dirs) -> Result<Configured> {
-    resolve(dirs, base.env(), Some(base), true)
+    resolve(dirs, Some(base), true)
 }
 
 /// [`view`] with the library host's existing explicit-file policy, still without requests
 /// or state writes.
 /// # Errors
 /// As [`view`].
-pub fn view_for_host(dirs: &Dirs, env: &dyn EnvSource) -> Result<Configured> {
-    resolve(dirs, env, None, true)
+pub fn view_for_host(dirs: &Dirs) -> Result<Configured> {
+    resolve(dirs, None, true)
 }
 
 #[cfg(all(test, unix))]

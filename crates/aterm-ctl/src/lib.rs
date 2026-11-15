@@ -69,9 +69,10 @@ mod verb_first;
 mod vouch;
 pub use survey::{
     AuthenticatedPeer, DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT,
-    FLEET_UNREAD, FLEET_WITHIN, FleetAsk, FleetRead, FleetRefused, FleetSurveyFn, LEFT_OUT_LEAD,
-    NO_ROUTE_NOTE, PeerFault, PeerSurvey, UNANSWERED_REASON_CHARS, UNANSWERED_ROOM,
-    agent_word_shown, survey_rank, survey_urgent,
+    FLEET_UNREAD, FLEET_WITHIN, FleetAsk, FleetRead, FleetRefused, FleetSurveyFn, HostAsk,
+    LEFT_OUT_LEAD, NO_ROUTE_NOTE, PeerFault, PeerSurvey, UNANSWERED_REASON_CHARS, UNANSWERED_ROOM,
+    UPGRADE_HELD_S, agent_word_shown, host_ask as survey_host_ask,
+    host_ask_args as survey_host_ask_args, survey_rank, survey_urgent,
 };
 
 const SYNOPSIS: &str =
@@ -253,7 +254,7 @@ STDIN PAYLOADS:
                   handling (control bytes sanitized; ESC[200~/201~ bracketing
                   when the app enabled DECSET 2004), not as a raw feed.
     paste-bin     the frame `paste -` sends (no inline argument).
-    spawn agent=<a> [model=<m>] [cwd=<path>] [label=<word>] -
+    spawn agent=<a> [model=<m>] [effort=<level>] [cwd=<path>] [label=<word>] -
                   the worker's task (1 byte to 64 KiB); the client writes len=
                   itself, adds cwd=<this directory> when absent, and makes a
                   relative cwd= absolute. With no from=, it adds

@@ -7,15 +7,12 @@ use super::*;
 #[test]
 fn roster_only_requires_existing_authority_and_preserves_newer_state() {
     use ring::signature::KeyPair as _;
-    use std::os::unix::fs::PermissionsExt as _;
     let scratch = aterm_tempfile::tempdir().unwrap();
     let home = scratch.path().join("home");
     let repo = scratch.path().join("repo");
     let input = scratch.path().join("public/aterm-machines.toml");
     let kept = home.join(atpkg_keys::provision::RELEASE_ROSTER_REL);
-    let key = home.join(atpkg_keys::provision::MACHINE_KEY_REL);
-    let identity = machines::identity_path_in(&home);
-    std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
     let pkcs8 =
         ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
@@ -43,10 +40,7 @@ fn roster_only_requires_existing_authority_and_preserves_newer_state() {
     write(&input, roster_with(3, vec![member()], vec![]));
     assert!(run("m3", false).is_err(), "missing key must never mint");
     assert!(!kept.exists());
-    std::fs::write(&key, pkcs8.as_ref()).unwrap();
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let identity_bytes = format!("id = \"m3\"\npubkey = \"{pubkey}\"\n");
-    std::fs::write(&identity, &identity_bytes).unwrap();
+    crate::test_vault::seed_ring_as(&home, "m3", pkcs8.as_ref(), &pubkey);
     assert!(run("m4", false).is_err());
     assert!(!kept.exists());
     assert_eq!(run("m3", true).unwrap().roster_seq, 3);
@@ -56,9 +50,9 @@ fn roster_only_requires_existing_authority_and_preserves_newer_state() {
     );
     assert_eq!(run("m3", false).unwrap().roster_seq, 3);
     let original = machines::RosterDocument::read(&kept).unwrap();
-    std::fs::write(&identity, "id = \"m3\"\npubkey = \"wrong\"\n").unwrap();
+    crate::test_vault::seed_ring_as(&home, "m3", pkcs8.as_ref(), "wrong");
     assert!(run("m3", false).is_err());
-    std::fs::write(&identity, &identity_bytes).unwrap();
+    crate::test_vault::seed_ring_as(&home, "m3", pkcs8.as_ref(), &pubkey);
     std::fs::remove_file(machines::RosterDocument::signature_path(&input)).unwrap();
     assert!(run("m3", false).is_err(), "unsigned input must refuse");
     assert_eq!(machines::RosterDocument::read(&kept).unwrap(), original);
@@ -110,15 +104,15 @@ fn roster_only_requires_existing_authority_and_preserves_newer_state() {
         "newer kept revocation is effective"
     );
     assert_eq!(machines::RosterDocument::read(&kept).unwrap(), revoked);
-    assert_eq!(std::fs::read(&key).unwrap(), pkcs8.as_ref());
-    assert_eq!(std::fs::read_to_string(identity).unwrap(), identity_bytes);
-    assert!(
-        !home
-            .join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL)
-            .exists()
+    let ring = sign::ReleaseCredentials::from_store(&home)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (ring.machine_id(), ring.pubkey()),
+        (Some("m3"), pubkey.as_str()),
+        "the store's ring is read, never rewritten"
     );
     assert!(!repo.join("dist").exists());
-    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1);
 }
 
 /// `--check` and a dry release promise no writes, so they only look at the release
@@ -339,7 +333,7 @@ fn a_missing_credential_is_filed_with_the_lab_not_asked_of_a_person() {
     aterm_secrets::client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1"))
         .unwrap();
     need::test_alab_policy(&paths);
-    let missing = channel_token_missing(Some(Path::new("/nowhere/gh_access_token_alabsystems")));
+    let missing = channel_token_missing();
     let refused = notary_verdict("notary", false, "", "No Keychain password item found");
     for (check, want, purpose) in [
         (missing, Want::Gh(GhProfile::Release), Purpose::AghRelease),
@@ -367,76 +361,66 @@ fn a_missing_credential_is_filed_with_the_lab_not_asked_of_a_person() {
     }
 }
 
+/// The mint's master phrase is a check row: `--check` names a Mac without it and files nothing,
+/// a provisioning run files `paper-master`.
+///
+/// NEGATIVE CONTROL: the check-only run leaves the ledger empty.
 #[test]
-fn channel_token_file_admission_preserves_regular_rules_and_refuses_aliases_before_reading() {
-    use std::cell::Cell;
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let regular = dir.path().join("synthetic-token");
-    let check = |path: Option<&Path>, present, may_change| {
-        channel_token_check_at(may_change, path, || present)
-    };
-    assert!(check(None, false, false).is_none());
-    assert!(check(Some(&regular), false, false).is_none());
-    std::fs::write(&regular, b"synthetic-token-only").unwrap();
-    std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(matches!(
-        check(Some(&regular), true, false),
-        Some(Check::Pass(_))
-    ));
-    assert!(check(Some(&regular), false, false).is_none());
-    std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(
-        matches!(check(Some(&regular), true, false), Some(Check::Fail { .. })),
-        "a file mode is this machine's"
-    );
-    assert!(matches!(
-        check(Some(&regular), true, true),
-        Some(Check::Pass(_))
-    ));
-    assert_eq!(
-        std::fs::metadata(&regular).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o644)).unwrap();
+fn a_mac_without_the_master_phrase_fails_its_row_before_the_mint() {
+    use aterm_secrets::need;
 
-    let alias = dir.path().join("linked-token");
-    std::os::unix::fs::symlink(&regular, &alias).unwrap();
-    assert!(
-        aterm_update_core::github_rest::Token::from_file(&alias)
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let paths = aterm_secrets::client::Paths::for_home(dir.path());
+    let source = dir.path().join("phrase.vault");
+    aterm_secrets::client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1"))
+        .unwrap();
+    need::test_alab_policy(&paths);
+    let filed_master = |paths: &aterm_secrets::client::Paths| {
+        need::peek(paths)
             .unwrap()
-            .is_some(),
-        "the real token reader follows this synthetic fixture alias"
+            .iter()
+            .any(|n| n.want == Want::PaperMaster && n.purpose == Purpose::ReleaseRoster)
+    };
+
+    let check = master_phrase_check(&paths, false);
+    assert!(
+        matches!(&check, Check::Fail { fix, .. } if fix == "`aterm secrets need paper-master`"),
+        "{check:?}"
     );
-    for may_change in [false, true] {
-        let calls = Cell::new(0);
-        let result = channel_token_check_at(may_change, Some(&alias), || {
-            calls.set(calls.get() + 1);
-            aterm_update_core::github_rest::Token::from_file(&alias)
-                .unwrap()
-                .is_some()
-        });
-        assert!(matches!(result, Some(Check::Fail { .. })), "{result:?}");
-        assert_eq!(
-            calls.get(),
-            0,
-            "unadmitted paths must not reach the token reader"
-        );
-        assert_eq!(
-            std::fs::metadata(&regular).unwrap().permissions().mode() & 0o777,
-            0o644
-        );
-    }
-    assert_eq!(std::fs::read(&regular).unwrap(), b"synthetic-token-only");
-    let missing = dir.path().join("missing");
-    let dangling = dir.path().join("dangling-token");
-    std::os::unix::fs::symlink(&missing, &dangling).unwrap();
-    for path in [dangling.as_path(), dir.path()] {
-        let result = channel_token_check_at(false, Some(path), || {
-            panic!("an unadmitted token path must not be read")
-        });
-        assert!(matches!(result, Some(Check::Fail { .. })), "{result:?}");
-    }
+    assert!(!filed_master(&paths), "CONTROL: --check files nothing");
+
+    let check = master_phrase_check(&paths, true);
+    assert!(
+        matches!(&check, Check::Fail { fix, .. }
+            if fix.starts_with("filed `aterm secrets need paper-master` with the lab")),
+        "{check:?}"
+    );
+    assert!(filed_master(&paths));
+}
+
+#[test]
+fn the_channel_token_is_the_stores_entry_and_no_file_is_judged() {
+    let missing = || Check::Fail {
+        what: "missing".into(),
+        fix: "need".into(),
+    };
+    assert!(matches!(
+        channel_token_verdict(Ok(true), || panic!("a held token is not missing")),
+        Check::Pass(line) if line.contains(publish::CHANNEL_TOKEN) && !line.contains(".secrets")
+    ));
+    assert!(matches!(
+        channel_token_verdict(Ok(false), missing),
+        Check::Fail { what, .. } if what == "missing"
+    ));
+    assert!(matches!(
+        channel_token_verdict(Err("unreadable store".into()), || panic!("not missing")),
+        Check::Fail { what, .. } if what == "unreadable store"
+    ));
+    let Check::Fail { what, .. } = channel_token_missing() else {
+        panic!("no token is a failure");
+    };
+    assert!(what.contains(publish::CHANNEL_TOKEN), "{what}");
+    assert!(!what.contains(".secrets"), "{what}");
 }
 
 #[test]
@@ -1171,26 +1155,26 @@ fn an_explicit_profile_is_audited_without_replacing_the_default() {
 #[test]
 fn the_profile_audit_refuses_what_the_cut_refuses() {
     use crate::release_keychain::Leave;
-    use std::os::unix::fs::PermissionsExt as _;
     let scratch = crate::test_scratch_dir("profile");
     let home = scratch.path();
-    std::fs::create_dir_all(home.join(atpkg_keys::provision::RELEASE_RING_REL)).unwrap();
-    let path = home.join(atpkg_keys::provision::RELEASE_CREDENTIALS_REL);
     let home_s = home.to_str().unwrap().to_string();
     let sha1 = "0".repeat(40);
-
-    let write = |body: &str, mode: u32| {
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-    };
-    let refusal = |c: Check| match c {
-        Check::Fail { .. } => {}
-        Check::Pass(msg) => panic!("expected a refusal, got PASS: {msg}"),
-        _ => panic!("expected a refusal"),
-    };
+    #[track_caller]
+    fn refusal(c: Check) {
+        match c {
+            Check::Fail { .. } => {}
+            Check::Pass(msg) => panic!("expected a refusal, got PASS: {msg}"),
+            _ => panic!("expected a refusal"),
+        }
+    }
 
     let (key, pubkey) = signing_key_b64();
     let mine = Some(pubkey.as_str());
+    // The store's ring for `key`, its profile `body`.
+    let pkcs8 = aterm_codec::base64::decode_strict(key.as_bytes()).unwrap();
+    let write = |body: &str| {
+        crate::test_vault::seed_ring_profile(home, "m9", &pkcs8, &pubkey, body);
+    };
     // Keychains modelled in the scratch HOME, holding no identity: no real one is read.
     let fake = crate::release_keychain::fake::Fake::new(crate::release_keychain::fake::World::new(
         &"F".repeat(40),
@@ -1205,10 +1189,9 @@ fn the_profile_audit_refuses_what_the_cut_refuses() {
         Leave::Look,
     ));
 
-    write(
-        &format!("notary_profile = \"notary\"\nsigning_identity_sha1 = \"{sha1}\"\n"),
-        0o600,
-    );
+    write(&format!(
+        "notary_profile = \"notary\"\nsigning_identity_sha1 = \"{sha1}\"\n"
+    ));
     refusal(profile_check(
         &home_s,
         "m9",
@@ -1222,17 +1205,8 @@ fn the_profile_audit_refuses_what_the_cut_refuses() {
         "signing_key = \"{key}\"\nmachine_id = \"m9\"\nnotary_profile = \"notary\"\n\
          signing_identity_sha1 = \"{sha1}\"\n"
     );
-    write(&good, 0o644);
-    refusal(profile_check(
-        &home_s,
-        "m9",
-        Some(&sha1),
-        mine,
-        &fake,
-        Leave::Look,
-    ));
 
-    write(&good, 0o600);
+    write(&good);
     refusal(profile_check(
         &home_s,
         "m9",
@@ -1265,50 +1239,24 @@ fn the_profile_audit_refuses_what_the_cut_refuses() {
         Leave::Look,
     ));
 
-    write(
-        &format!(
-            "{good}machine_roster = \"{}\"\n",
-            home.join("gone/roster.toml").display()
-        ),
-        0o600,
-    );
-    refusal(profile_check(
-        &home_s,
-        "m9",
-        Some(&sha1),
-        mine,
-        &fake,
-        Leave::Look,
+    // The store ring's roster is the store's pair, whatever roster its profile names.
+    write(&format!(
+        "{good}machine_roster = \"{}\"\n",
+        home.join("gone/roster.toml").display()
     ));
-
-    write(
-        &format!("{good}machine_roster = \"~/fleet/roster.toml\"\n"),
-        0o600,
-    );
-    refusal(profile_check(
-        &home_s,
-        "m9",
-        Some(&sha1),
-        mine,
-        &fake,
-        Leave::Look,
-    ));
-    std::fs::create_dir_all(home.join("fleet")).unwrap();
-    std::fs::write(home.join("fleet/roster.toml"), "").unwrap();
     assert!(matches!(
         profile_check(&home_s, "m9", Some(&sha1), mine, &fake, Leave::Look),
         Check::Pass(_)
     ));
 
-    write(&good, 0o600);
+    write(&good);
     assert!(matches!(
         profile_check(&home_s, "m9", Some(&sha1), mine, &fake, Leave::Look),
         Check::Pass(_)
     ));
-    write(
-        &format!("signing_key = \"{key}\"\nnotary_profile = \"notary\"\n"),
-        0o600,
-    );
+    write(&format!(
+        "signing_key = \"{key}\"\nnotary_profile = \"notary\"\n"
+    ));
     assert!(matches!(
         profile_check(&home_s, "m9", Some(&sha1), mine, &fake, Leave::Look),
         Check::Pass(_)

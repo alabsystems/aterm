@@ -7,58 +7,98 @@
 //! read-only cell, a save the table's rules refuse) reopens unchanged with the caret on the
 //! first bad row and nothing written; a cell that changed meanwhile reopens as `⚠ mine ‖
 //! theirs`, the rest written. Closing a reopened file unchanged ends the session. The scratch
-//! folder goes when the session ends, however it ends. [`show`] opens the same grid read-only
-//! and writes nothing back.
+//! folder goes when the session ends, however it ends. No cell shows a secret: a secret column
+//! that holds a reference to a secret-store entry shows its entry name, one that holds a sealed
+//! token (a generation builds up to 0.200.0 read) shows the mask, and both are read-only. A
+//! column such a generation holds sealed though its values are ordinary data (a phone's
+//! `number`) shows each value, opened for the grid ([`open_ordinary`]), read-only too.
 
 use super::{Applied, Handle, Refused};
 use crate::{
     Error, Result,
-    alab::secret::{Journal, Surface},
     typed::{
-        Collection, Ty,
+        Collection,
         cell::{Cells, Field},
         check,
         grid::{self, Base, Opened, Plan, Problem, Where},
+        secret::Secret,
     },
 };
 use std::path::Path;
 
-/// A `Secret` cell [`open_secrets`] asks for, by row key and column, with its candidates: a
+/// A sealed cell [`open_ordinary`] asks for, by row key and column, with its candidates: a
 /// token to open, or `None` for a cleared one.
 type Wanted = ((String, &'static str), Vec<Option<String>>);
 
-/// What a grid with its `Secret` columns revealed and editable needs (the owner's `--edit`,
-/// docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8): the journal each reveal is recorded in first,
-/// and the clock it records.
-pub struct GridSecrets<'a> {
-    pub journal: &'a Journal,
-    pub when_ms: u64,
-}
+/// What opens the cells [`open_with`] asks for: one value per asked
+/// `(collection, row, column, token)`, in order, `None` where it did not open.
+type OpenCells<'a> = &'a mut dyn FnMut(
+    &[(&str, &str, &str, &str)],
+) -> Result<Vec<Option<crate::typed::secret::Secret>>>;
 
-/// Every set `Secret` cell of `collection` in `cells` (of the column `only`, or of each live
-/// `Secret` column), revealed through the audited exit ([`Handle::reveal_cells`]) as `surface`:
-/// by row and column, each candidate of a conflict, a cleared candidate as an empty value beside
-/// the others. A protected row's cell is never asked. A cell any of whose candidates does not
-/// open here (no key of its epoch, a token that does not authenticate, a value that is no token)
-/// is left out, so a grid shows it masked and read-only and a view shows it masked; the
-/// candidates of that cell that did open are still journaled as revealed (the journal may name
-/// more than was shown, never less).
+/// Every set cell of `column` of `collection` in `cells`, a column whose values are ordinary data
+/// that the generation `handle` reaches holds sealed
+/// ([`crate::typed::Column::sealed_ordinary`]: a phone's `number`, which builds up to 0.200.0
+/// read only as a sealed token): opened for every reader of the table, with nothing journaled,
+/// since no secret is revealed. By row and column, each candidate of a conflict, a cleared
+/// candidate as an empty value beside the others. A cell any of whose candidates does not open
+/// here (no key of its epoch, a token that does not authenticate, a value that is no token) is
+/// left out, and so is one any of whose opened values does not read as a phone number
+/// ([`aterm_value_guard::stored_phone`]): what a build up to 0.200.0 sealed there under a
+/// secret's contract is never shown this way, and a view shows either cell masked. A secret's
+/// column (a password, a TOTP seed) opens nothing here, whatever `column` names. No cell asked
+/// asks nothing of the store; a store that is busy, or changed under the read, is observed again
+/// until the admission deadline ([`super::reopened`]: the read writes nothing).
 ///
 /// # Errors
-/// As [`Handle::reveal_cells`].
-pub fn open_secrets(
+/// The store cannot be read.
+pub fn open_ordinary(
     handle: &Handle,
+    collection: &'static Collection,
+    column: &str,
+    cells: &Cells,
+) -> Result<Opened> {
+    open_with(collection, Some(column), cells, &mut |asked| {
+        super::reopened(crate::admission::deadline(), || handle.open_cells(asked))
+    })
+}
+
+/// [`open_ordinary`] for every such column of `collection`: what a grid of the collection shows
+/// in place of the mask. Empty, and no store session opened, for a collection without one (every
+/// collection of a generation whose numbers are plain).
+///
+/// # Errors
+/// The store cannot be read.
+pub fn open_every_ordinary(
+    handle: &Handle,
+    collection: &'static Collection,
+    cells: &Cells,
+) -> Result<Opened> {
+    if !collection
+        .columns
+        .iter()
+        .any(|column| column.sealed_ordinary() && column.live_at(collection.version))
+    {
+        return Ok(Opened::new());
+    }
+    open_with(collection, None, cells, &mut |asked| {
+        super::reopened(crate::admission::deadline(), || handle.open_cells(asked))
+    })
+}
+
+/// The cells [`open_ordinary`] asks for (of the column `only`, or of each such column), opened
+/// by `open`: one value per asked `(collection, row, column, token)`, in order, `None` where it
+/// did not open.
+fn open_with(
     collection: &'static Collection,
     only: Option<&str>,
     cells: &Cells,
-    journal: &Journal,
-    surface: Surface,
-    when_ms: u64,
+    open: OpenCells<'_>,
 ) -> Result<Opened> {
     let projection = crate::typed::cell::project(collection, cells);
     let mut wanted: Vec<Wanted> = Vec::new();
     for column in collection.columns.iter().filter(|c| {
-        matches!(c.ty, Ty::Secret)
+        c.sealed_ordinary()
             && c.live_at(collection.version)
             && only.is_none_or(|only| only == c.name)
     }) {
@@ -99,23 +139,30 @@ pub fn open_secrets(
                 .map(move |token| (collection.name, pk.as_str(), *column, token.as_str()))
         })
         .collect();
-    let mut values = handle
-        .reveal_cells(&asked, journal, surface, when_ms)?
-        .into_iter();
+    if asked.is_empty() {
+        return Ok(Opened::new());
+    }
+    let mut values = open(&asked)?.into_iter();
     let mut opened = Opened::new();
     for ((pk, column), candidates) in wanted {
         let mut shown = Vec::with_capacity(candidates.len());
         let mut whole = true;
         for candidate in &candidates {
             match candidate {
-                None => shown.push(crate::typed::secret::Secret::new(String::new())),
+                None => shown.push(Secret::new(String::new())),
                 Some(_) => match values.next().flatten() {
                     Some(value) => shown.push(value),
                     None => whole = false,
                 },
             }
         }
-        if whole {
+        // What a build up to 0.200.0 sealed here under a secret's contract (any `--stdin` or
+        // grid text) is never shown this way: only what reads as a phone number is kept.
+        let numbers = shown.iter().all(|value| {
+            let text = value.plaintext();
+            text.is_empty() || aterm_value_guard::stored_phone(text)
+        });
+        if whole && numbers {
             opened.insert((pk, column.to_owned()), shown);
         }
     }
@@ -138,16 +185,14 @@ fn scratch() -> Result<aterm_tempfile::TempDir> {
 }
 
 /// Opens a grid file for the owner and returns once they have closed it, the caret on a
-/// 1-based line, the headers of its `Secret` columns named to the window as concealed
-/// ([`grid::secret_headers`]; `edit … secret=`): no reader of the window but the person's eyes
-/// gets their cells (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8).
-pub type Opener<'a> = &'a mut dyn FnMut(&Path, usize, &[String]) -> Result<()>;
+/// 1-based line.
+pub type Opener<'a> = &'a mut dyn FnMut(&Path, usize) -> Result<()>;
 
-/// The production opener: `aterm edit --wait [--secret=…] +<line> <file>` from this same
-/// executable, which inside aterm opens amacs in an Editor tab beside this one (a `.tsv` opens
-/// in its spreadsheet mode) and elsewhere edits in this terminal. `secret`, where given, names
-/// the grid's concealed columns ([`Opener`]); a private file opened with none named conceals
-/// every cell.
+/// `aterm edit --wait [--secret=…] +<line> <file>` from this same executable, which inside
+/// aterm opens amacs in an Editor tab beside this one (a `.tsv` opens in its spreadsheet mode)
+/// and elsewhere edits in this terminal. `secret`, where given, names the columns the window
+/// conceals (`Some(&[])` names none, as a grid's opener does: no grid cell shows a secret); a
+/// private file opened with `None` conceals every cell.
 ///
 /// # Errors
 /// This executable cannot be found or started, or amacs did not open the file.
@@ -171,93 +216,6 @@ pub fn amacs(file: &Path, line: usize, secret: Option<&[String]>) -> Result<()> 
             "amacs did not open the file (it needs a terminal or an aterm window)",
         ))
     }
-}
-
-/// The production opener in a person's aterm tab: `file` in an Editor tab beside session `sid`
-/// (the tab the reveal was allowed in, by the `reveal` answer, never by the environment), through
-/// the window's `edit` verb, read-only with `ro=1`, its `secret` columns concealed
-/// (`secret=`, [`Opener`]); `opened` hears the window's answer once the tab is open, and this
-/// returns once it closes. It never edits in the terminal instead: plaintext
-/// drawn there would stay in that tab's scrollback, blocks, recordings and session log
-/// (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8), so a window that refuses ends the command.
-///
-/// # Errors
-/// The file has no `file://` URI, the window refused or could not be asked, or its close was not
-/// heard.
-pub fn in_editor_tab(
-    sid: &str,
-    file: &Path,
-    line: usize,
-    read_only: bool,
-    secret: &[String],
-    opened: &mut dyn FnMut(&aterm_ctl::edit::EditOk),
-) -> Result<()> {
-    use aterm_ctl::edit::{AwaitKey, EditRequest};
-    let uri = amacs::protocol::uri::path_to_file_uri(file)
-        .map_err(|_| Error::new("the grid file has no file URI"))?;
-    let request = EditRequest {
-        uri,
-        line: Some((u32::try_from(line.max(1)).unwrap_or(1), None)),
-        create: false,
-        for_word: Some(EDIT_FOR.to_owned()),
-        wait: true,
-        read_only,
-        secret: Some(secret.to_vec()),
-    };
-    let ok = aterm_ctl::edit::edit(sid, &request).map_err(|error| {
-        Error::new(&format!(
-            "the Editor tab did not open ({error}); in an aterm tab the grid opens only there, \
-             never in the terminal"
-        ))
-    })?;
-    opened(&ok);
-    aterm_ctl::edit::await_edit(sid, AwaitKey::Ticket(ok.ticket), &ok.uri)
-        .map_err(|error| Error::new(&format!("the Editor tab's close was not heard ({error})")))?;
-    Ok(())
-}
-
-/// The program an Editor tab's header names for a grid (`edit … for=`).
-const EDIT_FOR: &str = "aterm-db";
-
-/// Show `collection` of `handle`'s table read-only: the grid [`edit`] opens, its `Secret` columns
-/// revealed (each reveal journaled first, as [`Surface::Grid`]) and addresses shown, written to a
-/// private scratch folder, opened by `open` (read-only) and removed once `open` returns. Nothing
-/// is read back or written. Returns the rows shown.
-///
-/// # Errors
-/// The table cannot be read, the scratch folder cannot be made, a reveal fails, or `open` fails.
-pub fn show(
-    handle: &Handle,
-    collection: &'static Collection,
-    secrets: &GridSecrets<'_>,
-    open: Opener<'_>,
-) -> Result<usize> {
-    let compiled = handle.compiled();
-    let scratch = scratch()?;
-    let view = handle.view()?;
-    let cells = &view.cells;
-    let opened = open_secrets(
-        handle,
-        collection,
-        None,
-        cells,
-        secrets.journal,
-        Surface::Grid,
-        secrets.when_ms,
-    )?;
-    let exported = view.export_grid(compiled.table, collection, &[], true, Some(&opened))?;
-    let rows = exported.base.rows.len();
-    let text = zeroize::Zeroizing::new(exported.text);
-    let name = format!("{}.tsv", collection.name);
-    aterm_uds::private_file::write_private(scratch.path(), &name, text.as_bytes())
-        .map_err(|_| Error::new("the grid file could not be written"))?;
-    open(
-        &scratch.path().join(&name),
-        1,
-        &grid::secret_headers(collection, true),
-    )?;
-    drop(scratch);
-    Ok(rows)
 }
 
 /// What an edit session did.
@@ -319,48 +277,32 @@ fn read_back(path: &Path) -> Result<String> {
     )
 }
 
-/// Edit `collection` of `handle`'s table in the grid: the rows every filter matches,
-/// addresses masked unless `reveal`, its `Secret` columns revealed and editable where
-/// `secrets` is given (each export journals each reveal first) and masked and read-only where
-/// not. `open` shows the file and returns once it is closed; `report` hears each problem and
-/// stale cell, by row and column, never a value. The file lives in a private folder amacs keeps
+/// Edit `collection` of `handle`'s table in the grid: the rows every filter matches, each value
+/// as it is stored, a secret reference by its entry name, a sealed secret as the mask and a
+/// number a generation holds sealed as it is ([`open_every_ordinary`]), those three read-only.
+/// `open` shows the file and returns once it is closed; `report` hears each problem and stale
+/// cell, by row and column, never a value. The file lives in a private folder amacs keeps
 /// no draft of and serves no `doc read` of ([`aterm_types::private_edit`]), removed when the
 /// session ends; one a killed session left is swept at the next.
 ///
 /// # Errors
-/// The table cannot be read or written, the scratch folder cannot be made, a reveal fails, or
-/// `open` fails.
+/// The table cannot be read or written, the scratch folder cannot be made, or `open` fails.
 pub fn edit(
     handle: &Handle,
     collection: &'static Collection,
     filters: &[Where],
-    reveal: bool,
-    secrets: Option<&GridSecrets<'_>>,
     open: Opener<'_>,
     report: &mut dyn FnMut(&str),
 ) -> Result<Edited> {
     let compiled = handle.compiled();
     let scratch = scratch()?;
     let export = |view: &super::View, filters: &[Where]| -> Result<grid::Export> {
-        let cells = &view.cells;
-        let opened = secrets
-            .map(|secrets| {
-                open_secrets(
-                    handle,
-                    collection,
-                    None,
-                    cells,
-                    secrets.journal,
-                    Surface::Grid,
-                    secrets.when_ms,
-                )
-            })
-            .transpose()?;
-        view.export_grid(compiled.table, collection, filters, reveal, opened.as_ref())
+        Ok(view
+            .export_grid(compiled.table, collection, filters)?
+            .showing(&open_every_ordinary(handle, collection, &view.cells)?))
     };
     let name = format!("{}.tsv", collection.name);
     let path = scratch.path().join(&name);
-    let secret = grid::secret_headers(collection, secrets.is_some());
     let write = |text: &str| {
         aterm_uds::private_file::write_private(scratch.path(), &name, text.as_bytes())
             .map_err(|_| Error::new("the grid file could not be written"))
@@ -371,7 +313,7 @@ pub fn edit(
     let mut line = 1;
     let mut edited = Edited::default();
     loop {
-        open(&path, line, &secret)?;
+        open(&path, line)?;
         edited.rounds += 1;
         let saved = zeroize::Zeroizing::new(read_back(&path)?);
         if *saved == *presented {
@@ -425,8 +367,7 @@ pub fn edit(
                 let fresh = if filters.is_empty() {
                     export(&view, &[])?.base
                 } else {
-                    let matching =
-                        view.export_grid(compiled.table, collection, filters, reveal, None)?;
+                    let matching = export(&view, filters)?;
                     let mut keep: std::collections::BTreeSet<&str> = matching
                         .base
                         .rows

@@ -126,12 +126,12 @@ fn refs(ty: &Ty, out: &mut Vec<&'static str>) {
 /// hold an address is `address.addr`, so no mailbox login, `receives` pattern or other address
 /// rides any other column; mailboxes and phones have random keys; no address kind names a
 /// mailbox login; and each schema row fits one record.
-/// NEGATIVE CONTROL: with a `login` column typed `email` added to `MAILBOX`, the pii assertion
-/// fails: `` left: ["address.addr", "mailbox.login"] ``.
+/// NEGATIVE CONTROL: with a `login` column typed `email` added to `MAILBOX`, the address
+/// assertion fails: `` left: ["address.addr", "mailbox.login"] ``.
 #[test]
 fn registry_schemas_keep_secrets_and_addresses_out() {
     let names: Vec<&str> = COLLECTIONS.iter().map(|c| c.name).collect();
-    let mut pii = Vec::new();
+    let mut addresses = Vec::new();
     for collection in COLLECTIONS {
         assert_eq!(collection.check(), Ok(()), "{}", collection.name);
         for column in collection.columns {
@@ -145,8 +145,8 @@ fn registry_schemas_keep_secrets_and_addresses_out() {
                     column.name
                 );
             }
-            if column.ty.pii() {
-                pii.push(format!("{}.{}", collection.name, column.name));
+            if column.ty.holds_address() {
+                addresses.push(format!("{}.{}", collection.name, column.name));
             }
             if let Ty::Enum(words) = column.ty {
                 assert!(!words.contains(&"mailbox-login"), "{}", collection.name);
@@ -173,7 +173,7 @@ fn registry_schemas_keep_secrets_and_addresses_out() {
                 <= crate::crypto::MAX_BODY
         );
     }
-    assert_eq!(pii, ["address.addr"]);
+    assert_eq!(addresses, ["address.addr"]);
     // A mailbox's key derives from its login's address key (a member-readable row); a phone's
     // stays random, since its number is a low-entropy secret.
     assert_eq!(
@@ -197,14 +197,186 @@ fn registry_schemas_keep_secrets_and_addresses_out() {
         (&ADDRESS, "password"),
         (&MAILBOX, "mailbox_password"),
         (&MAILBOX, "totp"),
-        (&PHONE, "number"),
     ] {
         assert!(
-            matches!(collection.column(column).map(|c| &c.ty), Some(Ty::Secret)),
+            matches!(
+                collection.column(column).map(|c| &c.ty),
+                Some(Ty::SecretRef)
+            ),
             "{}.{column}",
             collection.name
         );
     }
+    assert!(matches!(
+        PHONE.column("number").map(|c| &c.ty),
+        Some(Ty::Phone)
+    ));
+}
+
+/// LT-04's exit test. Every secret column of the registry's third generation names an
+/// `aterm secrets` entry and the value lives only in the store: a password goes into the store
+/// (`secret::store_cell`, under a fresh tagged entry of its cell), the table holds
+/// `{vault, entry}`, and the value reaches no cell, no history entry, no export and no grid
+/// save. An address and a phone number are ordinary data, shown as they are. The generations
+/// builds up to 0.199.0 read keep sealed tokens and hold no reference.
+/// NEGATIVE CONTROLS: the value itself is no `SecretRef` (`cell::change` refuses it), a grid save
+/// that types the value over the reference is refused as read-only, and the value is absent from
+/// every table surface though the store holds it; with `grid::show` showing a reference's JSON
+/// rather than its entry name, the export assertion fails.
+#[test]
+fn registry_secret_cells_name_store_entries_and_contacts_are_plain() {
+    use crate::typed::{grid, secret};
+    // The third generation's secret-named columns are references, exactly these three; the
+    // generations builds up to 0.199.0 read hold sealed tokens there and no reference anywhere.
+    let secret_columns = |table: &crate::typed::Table, ty: &Ty| {
+        let mut found: Vec<String> = table
+            .collections
+            .iter()
+            .flat_map(|collection| {
+                collection
+                    .columns
+                    .iter()
+                    .filter(|column| &column.ty == ty && column.name != "vault_ref")
+                    .map(|column| format!("{}.{}", collection.name, column.name))
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    let three = [
+        "address.password",
+        "mailbox.mailbox_password",
+        "mailbox.totp",
+    ];
+    assert_eq!(secret_columns(&registry::REGISTRY_3, &Ty::SecretRef), three);
+    for table in &registry::GENERATIONS[..2] {
+        assert!(
+            secret_columns(table, &Ty::SecretRef).is_empty(),
+            "{}",
+            table.role
+        );
+        let sealed = secret_columns(table, &Ty::Secret);
+        assert!(
+            three.iter().all(|c| sealed.contains(&(*c).to_owned())),
+            "{sealed:?}"
+        );
+    }
+
+    let lab = Lab::new(&[Role::Writer]);
+    newest(&lab.paths[0], 1_800_000_000_000);
+    let registry = Registry::at(lab.paths[0].clone());
+    assert_eq!(registry.generation().generation, 3);
+    let store = secret::Memory::default();
+    let address = "lt04.fixture@example.invalid";
+    let number = "2025550149";
+    let value = "Synthetic-password-LT04-not-for-tables";
+    let ad = keys::address_pk(address).unwrap();
+    let ph = keys::random_pk(keys::Random::Phone).unwrap();
+    let put = |collection: &crate::typed::Collection, pk: &str, col: &str, x: Value| {
+        cell::change(
+            collection,
+            CellKey {
+                pk,
+                col,
+                elem: None,
+            },
+            &CellValue::owner(collection.version, x),
+        )
+        .unwrap()
+    };
+    let reference = secret::store_cell(
+        &store,
+        ADDRESS.name,
+        "password",
+        &ad,
+        &secret::Secret::new(value.to_owned()),
+    )
+    .unwrap();
+    let entry = secret::entry_of(&reference).unwrap().to_owned();
+    assert!(
+        secret::bound(ADDRESS.name, "password", &ad, &entry),
+        "{entry}"
+    );
+    assert_eq!(store.held(&entry).as_deref(), Some(value));
+    // NEGATIVE CONTROL: the value itself can never be a password cell.
+    assert!(
+        cell::change(
+            &ADDRESS,
+            CellKey {
+                pk: &ad,
+                col: "password",
+                elem: None
+            },
+            &CellValue::owner(ADDRESS.version, json!(value)),
+        )
+        .is_err()
+    );
+    registry
+        .write(vec![
+            vec![
+                put(&ADDRESS, &ad, "addr", json!(address)),
+                put(&ADDRESS, &ad, "domain", json!("example.invalid")),
+                put(&ADDRESS, &ad, "origin", json!("owner")),
+                put(&ADDRESS, &ad, "row", json!("live")),
+                put(&ADDRESS, &ad, "password", reference.clone()),
+            ],
+            vec![
+                put(&PHONE, &ph, "last4", json!("0149")),
+                put(&PHONE, &ph, "number", json!(number)),
+                put(&PHONE, &ph, "row", json!("live")),
+            ],
+        ])
+        .unwrap();
+
+    let handle = crate::att::Handle::at(lab.paths[0].clone(), &crate::att::REGISTRY);
+    let view = handle.view().unwrap();
+    let held = view.project(&ADDRESS).rows[&ad].clone();
+    assert_eq!(held.get("password"), Some(&reference));
+    let table = handle.compiled().table;
+    let emails = grid::export(table, &ADDRESS, &view.cells, &[]).unwrap();
+    let phones = grid::export(table, &PHONE, &view.cells, &[]).unwrap();
+    // The page and the grid show the entry's name, the address and the number as they are.
+    assert!(
+        emails.text.contains(&entry),
+        "the grid names the store entry"
+    );
+    assert!(
+        emails.text.contains(address),
+        "an address is shown as it is"
+    );
+    assert!(
+        phones.text.contains(number),
+        "a phone number is shown as it is"
+    );
+    let history = handle.history().unwrap();
+    let history_json =
+        aterm_json::to_string(&history.iter().map(|e| &e.changes).collect::<Vec<_>>()).unwrap();
+    assert!(history_json.contains(&entry));
+    for surface in [
+        emails.text.as_str(),
+        phones.text.as_str(),
+        &history_json,
+        &aterm_json::to_string(&emails.base.to_json()).unwrap(),
+    ] {
+        assert!(
+            !surface.contains(value),
+            "a secret value reached a table surface"
+        );
+        assert!(
+            !surface.contains(secret::MASK),
+            "nothing is masked any more"
+        );
+    }
+    // NEGATIVE CONTROL: a grid save typing the value over the reference is refused, and writes
+    // nothing.
+    let typed_over = emails.text.replace(&entry, value);
+    assert_ne!(typed_over, emails.text);
+    match handle.save(&ADDRESS, &emails.base, &typed_over).unwrap() {
+        crate::att::Saved::Problems(problems) => assert!(!problems.is_empty()),
+        crate::att::Saved::Written { .. } => panic!("a value was typed into a secret cell"),
+    }
+    assert_eq!(handle.history().unwrap().len(), history.len());
+    assert_eq!(store.every(), [value]);
 }
 
 /// Apply `records` as one writer's chain to `cells`, as the Commons projection does.
@@ -608,6 +780,7 @@ fn schema_rows_are_published_once_and_never_below_a_visible_version() {
             row: ACCOUNT.schema_row()
         }
     );
+    // The first generation's `address`, as builds up to 0.199.0 read it: a sealed password.
     let address = view.schema(ADDRESS.name);
     assert!(matches!(address, SchemaState::One { version: 2, .. }));
     assert_eq!(
@@ -784,4 +957,162 @@ fn a_registry_lab_read_is_partial_while_an_operation_awaits_its_parent() {
     second
         .with_admitted_projection(&config, &lab.paths[1], &vault, None, |_, _| Ok(()))
         .unwrap();
+}
+
+/// Every surface shows a secret column's value only as its own entry's name: a plain value some
+/// writer left, and a reference to an entry not the cell's own (which may be named after a
+/// credential), show as the mask in the grid's cell, the pane and history ([`grid::show_at`]).
+/// NEGATIVE CONTROL: the cell's own reference shows as its entry name, not the mask.
+#[test]
+fn a_secret_column_shows_only_its_own_entrys_name() {
+    use crate::typed::{grid, secret};
+    let ad = keys::address_pk("lt04.show@example.invalid").unwrap();
+    let column = ADDRESS.column("password").unwrap();
+    let own = secret::entry_name(ADDRESS.name, "password", &ad).unwrap();
+    assert_eq!(
+        grid::show_at(ADDRESS.name, column, &ad, &secret::reference("v", &own)),
+        own
+    );
+    for stray in [
+        json!("Plain-password-77"),
+        secret::reference("v", "gh_access_token"),
+        secret::reference(
+            "v",
+            concat!("alab-address-password-", "AKIA", "IOSFODNN7EXAMPLE"),
+        ),
+    ] {
+        assert_eq!(
+            grid::show_at(ADDRESS.name, column, &ad, &stray),
+            secret::MASK
+        );
+    }
+    assert_eq!(
+        grid::show(&column.ty, &json!("Plain-password-77")),
+        secret::MASK
+    );
+}
+
+/// A `vault_ref` points at an entry it does not own, so it never names a secret cell's entry: a
+/// name of that shape, which the credential guard waives for a cell's own bound entry, is
+/// refused there when written and shown as the mask, so no key-shaped run reaches a table.
+/// NEGATIVE CONTROL: a `vault_ref` naming an ordinary vault entry is written and shown as is.
+#[test]
+fn a_vault_ref_never_names_a_secret_cells_entry() {
+    use crate::typed::{grid, secret};
+    let mailbox = &registry::MAILBOX;
+    let mb = keys::mailbox_pk(&keys::address_pk("lt04.vault@example.invalid").unwrap()).unwrap();
+    let column = mailbox.column("vault_ref").unwrap();
+    let key = CellKey {
+        pk: &mb,
+        col: "vault_ref",
+        elem: None,
+    };
+    let at = |entry: &str| CellValue::owner(mailbox.version, secret::reference("v", entry));
+    let shaped = concat!("alab-mailbox-totp-", "JBSWY3DPEHPK", "3PXPJBSWY3DP");
+    for refused in [shaped, "alab-mailbox-totp-mb-0000000000000000"] {
+        assert!(
+            cell::change(mailbox, key, &at(refused)).is_err(),
+            "{refused}"
+        );
+        assert_eq!(
+            grid::show_at(mailbox.name, column, &mb, &secret::reference("v", refused)),
+            secret::MASK
+        );
+    }
+    assert!(cell::change(mailbox, key, &at("ai-mailbox.toml")).is_ok());
+    assert_eq!(
+        grid::show_at(
+            mailbox.name,
+            column,
+            &mb,
+            &secret::reference("v", "ai-mailbox.toml")
+        ),
+        "ai-mailbox.toml"
+    );
+}
+
+/// Start this lab's registry at the newest generation this build compiles, the one whose secret
+/// cells name `aterm secrets` entries and whose phone column takes a number
+/// ([`Registry::open_newest`]): earlier generations are the ones builds up to 0.200.0 read,
+/// which keep sealed tokens, and no roll of this build reaches the newest one. It runs before
+/// anything opens an earlier generation.
+pub(crate) fn newest(paths: &aterm_secrets::client::Paths, now_ms: u64) {
+    let registry = Registry::at(paths.clone());
+    registry.open_newest(now_ms).unwrap();
+    assert!(
+        registry.generation().successor.is_none(),
+        "the lab reads its newest generation"
+    );
+}
+
+/// Each registry generation keeps the shape the builds reading it know ([`crate::att::conform`],
+/// which every write path runs): a store reference or a plain phone number is refused in the
+/// generations builds up to 0.199.0 read, whose secret columns hold sealed tokens, and the
+/// refusal names no value; the third generation takes them and refuses a token.
+/// NEGATIVE CONTROLS: the same reference and number pass into the third generation, and a
+/// sealed token passes into the second; with `conform` skipping `Ty::Secret` columns, the
+/// second generation takes the reference: `` a generation older builds read took a reference ``.
+#[test]
+fn a_reference_or_a_number_never_enters_a_generation_older_builds_read() {
+    use crate::typed::secret::{self, Fixed, Memory, Sealer as _, Secret};
+    let ad = keys::address_pk("ann@example.invalid").unwrap();
+    let ph = keys::random_pk(keys::Random::Phone).unwrap();
+    let entry = secret::test_entry((ADDRESS.name, "password", &ad), 1);
+    let change = |collection: &crate::typed::Collection, pk: &str, col: &str, x: Value| {
+        crate::database::Change {
+            collection: collection.name.to_owned(),
+            key: CellKey {
+                pk,
+                col,
+                elem: None,
+            }
+            .encode()
+            .unwrap(),
+            value: Some(CellValue::owner(collection.version, x).encode()),
+        }
+    };
+    let reference = change(
+        &ADDRESS,
+        &ad,
+        "password",
+        secret::reference(Memory::VAULT, &entry),
+    );
+    let number = change(&PHONE, &ph, "number", json!("2025550149"));
+    let token = Fixed("alab/registry.2")
+        .seal(
+            ADDRESS.name,
+            &ad,
+            "password",
+            &Secret::new("synthetic-pass-9".into()),
+        )
+        .unwrap();
+    let sealed = change(&ADDRESS, &ad, "password", json!(token));
+    for table in &registry::GENERATIONS[..2] {
+        for refused in [&reference, &number] {
+            let error = crate::att::conform(table, &mut [refused.clone()])
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a generation older builds read took a reference ({})",
+                        table.role
+                    )
+                })
+                .to_string();
+            assert!(error.contains("builds up to 0.200.0 read"), "{error}");
+            assert!(
+                !error.contains(&entry) && !error.contains("2025550149"),
+                "{error}"
+            );
+        }
+        crate::att::conform(table, &mut [sealed.clone()]).unwrap();
+    }
+    let mut rows = [reference.clone(), number.clone()];
+    crate::att::conform(&registry::REGISTRY_3, &mut rows).unwrap();
+    // The third generation stores each value as its own collection types it.
+    let held = |change: &crate::database::Change| {
+        CellValue::decode(change.value.as_ref().unwrap()).unwrap().x
+    };
+    assert_eq!(held(&rows[0]), secret::reference(Memory::VAULT, &entry));
+    assert_eq!(held(&rows[1]), json!("2025550149"));
+    assert!(crate::att::conform(&registry::REGISTRY_3, &mut [sealed]).is_err());
 }

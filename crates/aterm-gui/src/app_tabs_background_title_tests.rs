@@ -63,22 +63,67 @@ fn a_console_program_path_falls_through_to_the_cwd() {
     let pwsh =
         "C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\\pwsh.exe";
     assert_eq!(
-        resolved_terminal_title_rung(None, pwsh, Some("/srv/demo-cwd")).as_deref(),
+        resolved_terminal_title_rung(None, pwsh, false, None, Some("/srv/demo-cwd")).as_deref(),
         Some("/srv/demo-cwd")
     );
-    assert_eq!(resolved_terminal_title_rung(None, pwsh, None), None);
+    assert_eq!(
+        resolved_terminal_title_rung(None, pwsh, false, None, None),
+        None
+    );
     assert_eq!(
         resolved_terminal_title_rung(
             None,
             "C:\\Windows\\system32\\cmd.exe - ping build-01",
+            false,
+            None,
             Some("/srv/demo-cwd")
         )
         .as_deref(),
         Some("ping build-01")
     );
     assert_eq!(
-        resolved_terminal_title_rung(None, "~\\aterm", Some("/srv/demo-cwd")).as_deref(),
+        resolved_terminal_title_rung(None, "~\\aterm", false, None, Some("/srv/demo-cwd"))
+            .as_deref(),
         Some("~\\aterm")
+    );
+}
+
+/// THE TASK'S FIRST LINE IS A RUNG BEFORE THE SHELL'S TITLE AND THE FOLDER (tracker ST-02): it
+/// names a terminal its program has not titled, under the person's pin. CONTROLS: a title the
+/// program gave wins over it, a line where the program titled the tab is not read, and with no
+/// line the shell's title and then the folder name it as before.
+#[test]
+fn the_task_line_comes_before_the_shells_title_and_the_folder() {
+    let line = Some("Fix the flaky title test");
+    let cwd = Some("/srv/demo-cwd");
+    assert_eq!(
+        resolved_terminal_title_rung(None, "~/aterm", true, line, cwd).as_deref(),
+        line,
+        "the shell's prompt title is its folder"
+    );
+    assert_eq!(
+        resolved_terminal_title_rung(None, "", true, line, cwd).as_deref(),
+        line
+    );
+    assert_eq!(
+        resolved_terminal_title_rung(Some("release notes"), "~/aterm", true, line, cwd).as_deref(),
+        Some("release notes"),
+        "the pin wins"
+    );
+    assert_eq!(
+        resolved_terminal_title_rung(None, "refactor-titles", false, line, cwd).as_deref(),
+        Some("refactor-titles"),
+        "CONTROL: the program's own title wins"
+    );
+    assert_eq!(
+        resolved_terminal_title_rung(None, "~/aterm", true, None, cwd).as_deref(),
+        Some("~/aterm"),
+        "CONTROL: no line"
+    );
+    assert_eq!(
+        resolved_terminal_title_rung(None, "", true, Some(""), cwd).as_deref(),
+        Some("/srv/demo-cwd"),
+        "CONTROL: an empty line is no rung"
     );
 }
 

@@ -261,7 +261,11 @@ fn an_update_releases_an_abandoned_name_rule_prompt_only_through_its_exact_child
         app.frontmost_window = Some(wid);
         app.machine_sets = 7;
         let origin = app.palette_menu_origin(wid).unwrap();
-        let id = test_support::book_unasked(&mut app, wid, name_rule_tab_then(7, origin));
+        let id = test_support::book_unasked(
+            &mut app,
+            wid,
+            name_rule_tab_then(crate::machine_title::Origin::Panel, 7, origin),
+        );
         let (mut child, input) = registered_piped_session(id);
         child.pid = PID;
         child.shell_identity = aterm_pty::ShellIdentity::from_parts(PID, Some(BIRTH), false);

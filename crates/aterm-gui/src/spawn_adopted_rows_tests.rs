@@ -210,6 +210,7 @@ fn adopt(rows: Rows) -> Seeded {
         None,
         None,
         None,
+        None,
         Some(handed(master, rows)),
     )
     .expect("the handed shell is adopted");

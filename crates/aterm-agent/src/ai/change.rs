@@ -246,7 +246,7 @@ pub fn looks_secret(
         SecretRule::Component(name) => comps.iter().any(|c| c.eq_ignore_ascii_case(name)),
         SecretRule::Basename(glob) => comps
             .last()
-            .is_some_and(|c| crate::supervise::classify::glob_match(&glob.to_ascii_lowercase(), c)),
+            .is_some_and(|c| alab_policy::classify::glob_match(&glob.to_ascii_lowercase(), c)),
         SecretRule::Under(place) => {
             let clean_place = lexical_clean(place);
             (clean_place.starts_with(&clean_root) || !joined.starts_with(&clean_root))

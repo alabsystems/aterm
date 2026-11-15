@@ -5,7 +5,7 @@
 //! its selected credential and default inventory, so unrelated init settings do not stop work.
 //! Readiness observation also tracks the actual admitted Git command and payload.
 
-use super::{Asked, Github, INPUT_MAX, asked, decode, inventory, profile, read_token, token_file};
+use super::{Asked, Github, INPUT_MAX, asked, decode, inventory, profile, read_token};
 use crate::model::User;
 use crate::port::{OwnedFileMetadata, Stat, System};
 use aterm_secrets::converge::{
@@ -319,6 +319,20 @@ impl RepositoryInputMark {
             && self.refresh == other.refresh
     }
 
+    /// What differs between `before` and this later mark, as classes and never a path or a
+    /// name: `source` where anything but the checkouts differs (what [`Self::same_source`]
+    /// compares: the selection, the helper, Git itself), and the class of each kind of checkout
+    /// metadata that moved. It is for a start's note alone and decides nothing.
+    #[must_use]
+    pub fn moved(&self, before: &Self) -> aterm_secrets::converge::MarkMoved {
+        let moved = self.checkouts.moved(&before.checkouts);
+        if self.same_source(before) {
+            moved
+        } else {
+            moved.with(aterm_secrets::converge::MarkMoved::SOURCE)
+        }
+    }
+
     /// Opaque scheduling scope, never permission to use its inputs. It excludes
     /// every checkout field so a refresh cannot request itself through its own fetch.
     pub fn refresh_scope(&self) -> Option<aterm_secrets::converge::RefreshScope> {
@@ -391,8 +405,8 @@ pub fn repository_input_mark(sys: &dyn System) -> Result<RepositoryInputMark, St
     })
 }
 
-/// Files whose parent directories can notify a parked repository stage. Its own selected
-/// token is included; global credential helpers are excluded because every setup Git command
+/// Files whose parent directories can notify a parked repository stage. The store's own files
+/// stand for its selected token and inventory, which are read in place; global credential helpers are excluded because every setup Git command
 /// pins aterm's helper instead. The admitted Git command and payload are included, so a
 /// same-build shim repair is observable. A malformed profile still watches its repair.
 ///
@@ -481,16 +495,15 @@ fn dynamic_paths(sys: &dyn System, user: &User, commands: &[PathBuf]) -> Vec<Pat
 
 fn selected_paths(profile: Result<Option<super::Config>, String>, user: &User) -> Vec<PathBuf> {
     let home = Path::new(&user.home);
-    let mut paths = Vec::new();
-    match profile.and_then(|profile| asked(profile.and_then(|p| p.github), user)) {
-        Ok(Asked::Default) => {
-            paths.push(token_file(home));
-            paths.push(inventory::file(&user.home));
+    // The token and the inventory are store entries read in place: what moves when either
+    // changes is the store's own state (its saved state, identity, source and trusted log),
+    // never a file under `~/.secrets`.
+    match profile.and_then(|profile| asked(profile.and_then(|p| p.github))) {
+        Ok(Asked::Default | Asked::Scoped(_)) => {
+            aterm_secrets::client::Paths::locate_for_home(home).standing_files()
         }
-        Ok(Asked::Scoped(source) | Asked::Profile(source)) => paths.push(source.token_file),
-        Ok(Asked::Off) | Err(_) => {}
+        Ok(Asked::Off) | Err(_) => Vec::new(),
     }
-    paths
 }
 
 fn git_paths(sys: &dyn System) -> Vec<PathBuf> {
@@ -547,10 +560,14 @@ pub(super) fn refresh_scope(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => part(b"no configured vault"),
         Err(_) => return Err("vault source cannot be safely observed".into()),
     }
+    // The store's own files move with every vault version, related or not: the source stamp
+    // above already carries the two entries' values, so their versions are left out.
+    let store =
+        aterm_secrets::client::Paths::locate_for_home(Path::new(&user.home)).standing_files();
     for path in paths {
         part(path.as_os_str().as_encoded_bytes());
         // The profile's unrelated settings do not change refresh scope.
-        if !path.ends_with("init.toml") && path != selected {
+        if !path.ends_with("init.toml") && path != selected && !store.contains(&path) {
             part(format!("{:?}", sys.file_version(&path).map_err(|e| e.kind())).as_bytes());
         }
         for parent in path.ancestors().skip(1) {
@@ -566,21 +583,8 @@ pub(super) fn refresh_scope(
 }
 
 impl Stamp {
-    pub(super) fn matches_config(
-        sys: &dyn System,
-        user: &User,
-        expected: &Github,
-    ) -> Result<bool, String> {
-        Ok(
-            match asked(profile(sys, user)?.and_then(|profile| profile.github), user)? {
-                Asked::Scoped(current) | Asked::Profile(current) => current == *expected,
-                Asked::Default | Asked::Off => false,
-            },
-        )
-    }
-
     pub(super) fn read(sys: &dyn System, user: &User) -> Result<Self, String> {
-        let asked = asked(profile(sys, user)?.and_then(|profile| profile.github), user)?;
+        let asked = asked(profile(sys, user)?.and_then(|profile| profile.github))?;
         let (kind, source, default) = match asked {
             Asked::Off => return Err("repository setup is disabled in init.toml".into()),
             Asked::Default => (
@@ -588,25 +592,20 @@ impl Stamp {
                 Github {
                     account: String::new(),
                     owner: String::new(),
-                    token_file: token_file(Path::new(&user.home)),
-                    token_key: None,
                 },
                 true,
             ),
             Asked::Scoped(source) => (b"scoped".as_slice(), source, false),
-            Asked::Profile(source) => (b"profile".as_slice(), source, false),
         };
-        let token = read_token(sys, user, &source).map_err(|why| why.why)?;
+        let token = read_token(sys, user).map_err(|why| why.why)?;
         let inventory = if default {
-            sys.read_owned_file(
-                &inventory::file(&user.home),
-                user.uid,
-                inventory::MAX_BYTES,
-                true,
-            )
-            .map_err(|_| "the private repository inventory is not ready".to_owned())?
+            sys.vault_entry(Path::new(&user.home), inventory::ENTRY)
+                .ok()
+                .flatten()
+                .filter(|bytes| bytes.len() <= inventory::MAX_BYTES)
+                .ok_or_else(|| "the private repository inventory is not ready".to_owned())?
         } else {
-            Vec::new()
+            aterm_secrets::SecretBytes::default()
         };
         let mut digest = aterm_digest::Sha256::new();
         digest.update(b"aterm repository inputs/1\0");
@@ -616,8 +615,6 @@ impl Stamp {
             kind,
             account.as_bytes(),
             owner.as_bytes(),
-            source.token_file.as_os_str().as_encoded_bytes(),
-            source.token_key.as_deref().unwrap_or("").as_bytes(),
             token.bytes(),
             inventory.as_slice(),
         ] {

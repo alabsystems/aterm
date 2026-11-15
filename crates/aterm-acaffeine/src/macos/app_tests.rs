@@ -433,6 +433,8 @@ fn scratch_mug(dir: &std::path::Path) -> Mug {
             enable: |_| panic!("only a disabled Enable at Startup is enabled"),
         },
         open_login_items: || panic!("only a blocked Enable at Startup opens Login Items"),
+        aterm_app: None,
+        open_app: |_| panic!("only Open aterm opens the app"),
         ui: None,
         watch: None,
         exit: None,
@@ -1252,6 +1254,44 @@ fn enable_at_startup_writes_and_removes_the_login_plist() {
     assert!(!launchd::startup_turned_off(&mug.paths, &mug.label));
     let _ = mug.choose(MenuAction::ToggleStartup, NOW);
     assert!(!checked(&mug), "the control");
+}
+
+#[test]
+fn open_aterm_opens_the_bundle_the_mug_was_started_from() {
+    thread_local! {
+        static OPENED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+    let dir = crate::test_scratch_dir("open");
+    let mut mug = scratch_mug(dir.path());
+    let has_row = |mug: &Mug| {
+        mug.rows(NOW).iter().any(|row| {
+            matches!(
+                row,
+                Row::Action {
+                    action: MenuAction::OpenAterm,
+                    ..
+                }
+            )
+        })
+    };
+    assert!(!has_row(&mug), "a bare build has no app to open");
+
+    let app = dir.path().join("aterm.app");
+    let exe = app.join("Contents/MacOS/aterm");
+    std::fs::create_dir_all(exe.parent().expect("MacOS")).expect("bundle");
+    std::fs::write(&exe, b"").expect("exe");
+    let link = dir.path().join("bin-aterm");
+    std::os::unix::fs::symlink(&exe, &link).expect("link");
+    let found = aterm_app(&link).expect("the bundle through the link");
+    assert_eq!(found, app.canonicalize().expect("canonical"));
+    assert_eq!(aterm_app(&dir.path().join("aterm")), None);
+
+    mug.aterm_app = Some(found.clone());
+    mug.open_app = |app| OPENED.with(|o| o.borrow_mut().push(app.to_path_buf()));
+    assert!(has_row(&mug));
+    assert_eq!(mug.choose(MenuAction::OpenAterm, NOW), Next::Keep);
+    assert_eq!(OPENED.with(|o| o.borrow().clone()), [found]);
+    assert_eq!(saved(&mug), None, "opening aterm leaves the mode alone");
 }
 
 #[test]

@@ -326,6 +326,8 @@ impl<V: Into<Value>> FromIterator<V> for Array {
 pub struct InlineTable {
     pub(crate) items: KeyMap,
     pub(crate) preamble: RawString,
+    pub(crate) trailing: RawString,
+    pub(crate) trailing_comma: bool,
     pub(crate) decor: Decor,
     pub(crate) dotted: bool,
     pub(crate) span: Option<Range<usize>>,

@@ -2,9 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! The Tables page's one reach into the registry: a read of every shown collection as the grid
-//! lays it out (`aterm_db::typed::grid::export`, addresses and secrets masked), at the head or as
-//! of a past operation (`Handle::view_at`) with what changed since (`Handle::diff`), with each
-//! cell's candidates and each operation's author, and a write of the staged cells through
+//! lays it out (`aterm_db::typed::grid::export`: a secret cell names its secret-store entry, and
+//! addresses and phone numbers read as stored), at the head or as of a past operation
+//! (`Handle::view_at`) with what changed since (`Handle::diff`), with each cell's candidates and
+//! each operation's author, and a write of the staged cells through
 //! [`aterm_db::att::Handle::save`], the same save `aterm db table apply` makes. Nothing here
 //! runs on the main thread: [`crate::native_tables`]'s worker calls it.
 
@@ -67,14 +68,19 @@ const fn target(ty: &Ty) -> Option<&'static str> {
 }
 
 #[cfg(unix)]
-/// How a typed value reads in the pane and in history: a secret only as whether it holds one,
-/// everything else as the grid shows it.
-fn shown_value(ty: &Ty, value: Option<&aterm_json::Value>) -> String {
+/// How row `pk`'s `column` of `collection` reads in the pane and in history: as the grid shows
+/// it, so a secret reference reads as its store entry's name, and one to an entry not the cell's
+/// own as the mask ([`grid::show_at`]).
+fn shown_value(
+    collection: &str,
+    column: &aterm_db::typed::Column,
+    pk: &str,
+    value: Option<&aterm_json::Value>,
+) -> String {
     match value {
         None => String::new(),
         Some(value) if value.is_null() => String::new(),
-        Some(_) if matches!(ty, Ty::Secret) => "set".into(),
-        Some(value) => grid::show(ty, value, false),
+        Some(value) => grid::show_at(collection, column, pk, value),
     }
 }
 
@@ -310,9 +316,15 @@ pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, Stri
     for (name, title, singular) in SHOWN {
         let (collection, projection) = &projections[name];
         let collection: &'static Collection = collection;
+        // A phone's number is ordinary data a generation builds up to 0.200.0 read holds sealed:
+        // it shows as it is, opened with nothing recorded, and stays read-only. Where the open
+        // is refused the number shows as the mask and the sheet is still read.
+        let opened = aterm_db::att::open_every_ordinary(&handle, collection, &view.cells)
+            .unwrap_or_default();
         let export = view
-            .export_grid(compiled.table, collection, &[], false, None)
-            .map_err(|e| e.to_string())?;
+            .export_grid(compiled.table, collection, &[])
+            .map_err(|e| e.to_string())?
+            .showing(&opened);
         let base = export.base;
         let mut columns: Vec<SheetColumn> = base
             .header
@@ -330,10 +342,6 @@ pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, Stri
                     group,
                     editable: !read_only && group == Group::Stored,
                     numeric,
-                    secret: collection
-                        .column(name)
-                        .is_some_and(|c| matches!(c.ty, Ty::Secret)),
-                    masked: collection.column(name).is_some_and(|c| c.ty.pii()),
                     links: collection
                         .column(name)
                         .and_then(|c| target(&c.ty))
@@ -381,8 +389,6 @@ pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, Stri
                     group: Group::Linked,
                     editable: false,
                     numeric: true,
-                    secret: false,
-                    masked: false,
                     links: Some(other.to_owned()),
                 });
             }
@@ -420,17 +426,26 @@ pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, Stri
                 let candidates = field
                     .map(aterm_db::typed::cell::Field::candidates)
                     .unwrap_or_default();
+                // A sealed number's candidates as opened, one per candidate in order; none
+                // where the cell did not open here, and its candidates then show masked.
+                let numbers = opened
+                    .get(&(pk.clone(), column.name.clone()))
+                    .filter(|numbers| numbers.len() == candidates.len());
                 let values: Vec<(String, Option<Author>)> = if candidates.len() > 1 {
                     let mut values: Vec<(String, Option<Author>)> = candidates
                         .iter()
-                        .map(|c| {
-                            (
-                                schema.map_or_else(
-                                    || seen.shown.clone(),
-                                    |s| shown_value(&s.ty, Some(&c.value.x)),
-                                ),
-                                by_operation.get(&c.operation).cloned(),
-                            )
+                        .enumerate()
+                        .map(|(at, c)| {
+                            let text = match (numbers, schema) {
+                                (Some(numbers), _) => {
+                                    grid::show_opened(std::slice::from_ref(&numbers[at]))
+                                }
+                                (None, Some(s)) => {
+                                    shown_value(collection.name, s, pk, Some(&c.value.x))
+                                }
+                                (None, None) => seen.shown.clone(),
+                            };
+                            (text, by_operation.get(&c.operation).cloned())
                         })
                         .collect();
                     values.sort_by(|a, b| a.0.cmp(&b.0));
@@ -457,11 +472,14 @@ pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, Stri
                         text: if values.is_empty() {
                             seen.shown.clone()
                         } else {
-                            values
-                                .iter()
-                                .map(|v| v.0.as_str())
-                                .collect::<Vec<_>>()
-                                .join(" / ")
+                            let mut texts: Vec<&str> =
+                                values.iter().map(|v| v.0.as_str()).collect();
+                            // Candidates that open to one number are that number, as `aterm db
+                            // phones` reads them.
+                            if numbers.is_some() {
+                                texts.dedup();
+                            }
+                            texts.join(" / ")
                         },
                         by,
                         values,
@@ -496,13 +514,14 @@ pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, Stri
                             format!("\u{2212} {elem}")
                         }
                     }
-                    (Some(cell), None) => shown_value(&schema.ty, Some(&cell.x)),
+                    (Some(cell), None) => {
+                        shown_value(collection.name, schema, key.pk, Some(&cell.x))
+                    }
                     (None, _) => String::new(),
                 };
                 changed.push(WrittenCell {
                     pk: key.pk.to_owned(),
                     column: key.col.to_owned(),
-                    secret: matches!(schema.ty, Ty::Secret),
                     now,
                 });
             }
@@ -539,7 +558,7 @@ pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, Stri
 
 /// What changed in `collection` since the point a past read is at, by row and column: what the
 /// cell holds now as the pane shows it (a set by the members put in or taken out), and who wrote
-/// that. A secret says only whether it holds one.
+/// that. A secret column shows the name of the entry its cell names.
 #[cfg(unix)]
 fn since_then(
     collection: &'static Collection,
@@ -564,7 +583,7 @@ fn since_then(
                     .after
                     .iter()
                     .filter_map(|c| aterm_db::typed::cell::CellValue::decode(&c.value).ok())
-                    .map(|c| shown_value(&schema.ty, Some(&c.x)))
+                    .map(|c| shown_value(collection.name, schema, key.pk, Some(&c.x)))
                     .filter(|text| !text.is_empty())
                     .collect();
                 values.sort();

@@ -815,6 +815,11 @@ impl Run {
         if out_of_disk(&self.output) {
             return Some(format!("the child ran out of disk ({ENOSPC_SENTENCE})"));
         }
+        // A compiler that found its build directory's artifacts built against different versions
+        // of one another judged the directory, not the tree ([`crate::stale_artifact`]).
+        if let Some(stale) = crate::stale_artifact::find(&self.output) {
+            return Some(stale.reason(self.output.contains(crate::stale_artifact::RETRIED)));
+        }
         crate::libtest::environment_refusals(&self.output)
             .map(|names| crate::libtest::refusal_reason("every failing test", &names, &self.output))
     }
@@ -1001,15 +1006,7 @@ type CaseOpener = dyn Fn(&Path, bool) -> io::Result<test_progress::LiveCases> + 
 /// Spawn, wait, and collect.
 #[must_use]
 pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
-    run_captured(
-        cmd,
-        env,
-        None,
-        None,
-        None,
-        None,
-        &test_progress::LiveCases::open,
-    )
+    run_captured(cmd, env, None, None, &test_progress::LiveCases::open)
 }
 
 /// [`run`], with the local test dispatcher closed synchronously once a hang is reconfirmed and
@@ -1021,8 +1018,6 @@ pub(crate) fn run_test(cmd: &Cmd, env: ExecEnv<'_>, hung_red: &(dyn Fn() + Sync)
         env,
         None,
         Some(hung_red),
-        None,
-        None,
         &test_progress::LiveCases::open,
     )
 }
@@ -1036,31 +1031,7 @@ fn run_test_opening(
     hung_red: &(dyn Fn() + Sync),
     open_cases: &CaseOpener,
 ) -> Run {
-    run_captured(cmd, env, None, Some(hung_red), None, None, open_cases)
-}
-
-/// [`run_test`], with an exclusive cross-process admission lock held by the caller across the
-/// last first-red check and this test binary's actual spawn. The descriptor is explicitly
-/// unlocked immediately after the spawn attempt, and on every earlier return. This closes the
-/// check/start race for rustdoc runtools in separate processes without serializing binaries that
-/// are already running.
-#[must_use]
-pub(crate) fn run_test_admitted(
-    cmd: &Cmd,
-    env: ExecEnv<'_>,
-    hung_red: &(dyn Fn() + Sync),
-    admission: &File,
-    external_stop: &(dyn Fn() -> Option<String> + Sync),
-) -> Run {
-    run_captured(
-        cmd,
-        env,
-        None,
-        Some(hung_red),
-        Some(admission),
-        Some(external_stop),
-        &test_progress::LiveCases::open,
-    )
+    run_captured(cmd, env, None, Some(hung_red), open_cases)
 }
 
 /// One compiler invocation's machine stdout, separate from its diagnostic stderr.
@@ -1080,8 +1051,6 @@ pub(crate) fn run_machine(cmd: &Cmd, env: ExecEnv<'_>, progress: Option<&str>) -
             progress,
         }),
         None,
-        None,
-        None,
         &test_progress::LiveCases::open,
     );
     MachineRun { run, stdout }
@@ -1097,19 +1066,9 @@ fn run_captured(
     env: ExecEnv<'_>,
     machine: Option<MachineCapture<'_>>,
     hung_red: Option<&(dyn Fn() + Sync)>,
-    admission: Option<&File>,
-    external_stop: Option<&(dyn Fn() -> Option<String> + Sync)>,
     open_cases: &CaseOpener,
 ) -> Run {
-    let mut run = run_captured_inner(
-        cmd,
-        env,
-        machine,
-        hung_red,
-        admission,
-        external_stop,
-        open_cases,
-    );
+    let mut run = run_captured_inner(cmd, env, machine, hung_red, open_cases);
     if let Some(watch) = &cmd.test_cases {
         run.case_observations
             .get_or_insert_with(|| test_progress::Observations {
@@ -1363,11 +1322,8 @@ fn run_captured_inner(
     env: ExecEnv<'_>,
     machine: Option<MachineCapture<'_>>,
     hung_red: Option<&(dyn Fn() + Sync)>,
-    admission: Option<&File>,
-    external_stop: Option<&(dyn Fn() -> Option<String> + Sync)>,
     open_cases: &CaseOpener,
 ) -> Run {
-    let mut admission = SpawnAdmission(admission);
     let mut c = spawn_command(cmd, env, Path::new(TASKPOLICY));
     c.current_dir(cmd.cwd.as_deref().unwrap_or(env.cwd));
     if cmd.exact_env {
@@ -1487,8 +1443,6 @@ fn run_captured_inner(
                     stdout_log: None,
                     compiler: None,
                     local_red: hung_red,
-                    admission: &mut admission,
-                    external_stop,
                     open_cases,
                 },
             )
@@ -1542,8 +1496,6 @@ fn run_captured_inner(
                     stdout_log: stdout_log.as_deref(),
                     compiler,
                     local_red: hung_red,
-                    admission: &mut admission,
-                    external_stop,
                     open_cases,
                 },
             );
@@ -1568,30 +1520,6 @@ fn run_captured_inner(
             }
             std::fs::remove_file(&log).ok();
             r
-        }
-    }
-}
-
-/// A caller-held cross-process start admission. The normal path releases it immediately after
-/// `spawn`; every earlier return releases it here. A failed unlock leaves the descriptor here so
-/// dropping it still closes the lock before [`run_captured`] returns.
-struct SpawnAdmission<'a>(Option<&'a File>);
-
-impl SpawnAdmission<'_> {
-    fn release(&mut self) -> io::Result<()> {
-        let Some(file) = self.0 else {
-            return Ok(());
-        };
-        file.unlock()?;
-        self.0 = None;
-        Ok(())
-    }
-}
-
-impl Drop for SpawnAdmission<'_> {
-    fn drop(&mut self) {
-        if let Some(file) = self.0.take() {
-            let _ = file.unlock();
         }
     }
 }
@@ -2675,17 +2603,15 @@ fn discard_sample(sample: &StackSample) {
     }
 }
 
-struct FinishControls<'a, 'lock> {
+struct FinishControls<'a> {
     stdout_log: Option<&'a Path>,
     compiler: Option<compiler_progress::Progress>,
     local_red: Option<&'a (dyn Fn() + Sync)>,
-    admission: &'a mut SpawnAdmission<'lock>,
-    external_stop: Option<&'a (dyn Fn() -> Option<String> + Sync)>,
     open_cases: &'a CaseOpener,
 }
 
-struct ObservedFinish<'a, 'control, 'lock> {
-    controls: FinishControls<'control, 'lock>,
+struct ObservedFinish<'a, 'control> {
+    controls: FinishControls<'control>,
     cases: &'a mut Option<test_progress::LiveCases>,
 }
 
@@ -2696,7 +2622,7 @@ fn finish(
     log: Option<&Path>,
     label: &str,
     marks: Option<&Path>,
-    controls: FinishControls<'_, '_>,
+    controls: FinishControls<'_>,
 ) -> (Run, Option<String>) {
     let mut cases = None;
     let (mut run, logged) = finish_inner(
@@ -2730,15 +2656,13 @@ fn finish_inner(
     log: Option<&Path>,
     label: &str,
     marks: Option<&Path>,
-    observed: ObservedFinish<'_, '_, '_>,
+    observed: ObservedFinish<'_, '_>,
 ) -> (Run, Option<String>) {
     let ObservedFinish { controls, cases } = observed;
     let FinishControls {
         stdout_log,
         mut compiler,
         local_red,
-        admission,
-        external_stop,
         open_cases,
     } = controls;
     let (ceiling, stage_groups) = (env.child_ceiling, env.stage_groups);
@@ -2791,12 +2715,6 @@ fn finish_inner(
         Ok(ch) => ch,
         Err(e) => return (failed_to_wait(&e.to_string()), read_log(log)),
     };
-    if let Err(error) = admission.release() {
-        eprintln!(
-            "verify: {label}: could not release its cross-process start admission after spawn: \
-             {error}; later starts remain closed until this binary ends"
-        );
-    }
     #[cfg(unix)]
     let mut live = group::Live::enter(child.id());
     #[cfg(unix)]
@@ -2869,39 +2787,7 @@ fn finish_inner(
     let mut told = false;
     let mut nap = Duration::from_millis(1);
     let mut pending = VecDeque::new();
-    let mut external_stop_due = Instant::now();
     loop {
-        let now = Instant::now();
-        if now >= external_stop_due {
-            external_stop_due = now + READ_USAGE_EVERY;
-            if let Some(why) = external_stop.and_then(|stop| stop()) {
-                eprintln!("verify: {label}: NOT RUN — {why}");
-                let killed = kill_and_reap(
-                    &mut child,
-                    #[cfg(unix)]
-                    &mut live,
-                    None,
-                    #[cfg(unix)]
-                    REAP_AFTER_KILL,
-                );
-                return (
-                    used(
-                        Run {
-                            case_observations: None,
-                            ok: false,
-                            output: format!("aterm-verify: NOT RUN — {why}\n{killed}"),
-                            code: None,
-                            spawn_error: Some(why),
-                            stopped_at: None,
-                            hung: None,
-                            usage: None,
-                        },
-                        &clock,
-                    ),
-                    read_log(log),
-                );
-            }
-        }
         if let (Some(watch), Some(cases)) = (&cmd.test_cases, cases.as_mut()) {
             pending.extend(cases.poll());
             while let Some(seen) = pending.pop_front() {
@@ -3512,9 +3398,17 @@ pub mod group {
     static PENDING: AtomicI32 = AtomicI32::new(0);
     /// Set as the handler begins ending the stage groups, before [`PENDING`] is.
     static HANDLING: AtomicBool = AtomicBool::new(false);
+    /// The first interrupt the handler took ([`taken`]), set as it begins, before it ends any
+    /// group; 0 while it has taken none.
+    static TAKEN: AtomicI32 = AtomicI32::new(0);
     /// The write end of the pipe [`kill_on_interrupt`]'s watchdog reads ([`REPORT_GRACE`]); -1
     /// where it has none, and the handler then re-raises its signal at once.
     static WATCHDOG: AtomicI32 = AtomicI32::new(-1);
+    /// How many steps that run to their end hold the watchdog now ([`hold`]).
+    static HOLDS: AtomicUsize = AtomicUsize::new(0);
+    /// Set once the watchdog, its grace spent, waited on a hold ([`hold`]).
+    #[cfg(test)]
+    static HOLD_WAITED: AtomicBool = AtomicBool::new(false);
 
     /// How long an interrupted run has, once every stage group is ended, to write its log, its
     /// verdict and its `log:` line and to remove its scratch before its watchdog re-raises the
@@ -3831,6 +3725,17 @@ pub mod group {
         STOPPING.load(Ordering::SeqCst)
     }
 
+    /// The first interrupt [`kill_on_interrupt`]'s handler took, from the moment it took it;
+    /// `None` while it has taken none. A wait's interrupt ([`stop_run`]) and a halt ([`halt`])
+    /// are none: they take no signal.
+    #[must_use]
+    pub fn taken() -> Option<i32> {
+        match TAKEN.load(Ordering::SeqCst) {
+            0 => None,
+            sig => Some(sig),
+        }
+    }
+
     fn sweep(sig: i32) {
         for slot in &LIVE {
             let g = slot.load(Ordering::SeqCst);
@@ -3846,6 +3751,7 @@ pub mod group {
     extern "C" fn on_signal(sig: i32, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
         // SAFETY: the SA_SIGINFO action supplies this live kernel packet.
         unsafe { aterm_uds::signal_origin::capture(sig, info) };
+        let _ = TAKEN.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
         if STOPPING.swap(true, Ordering::SeqCst) {
             if WAIT_STOPPED.load(Ordering::SeqCst) || PENDING.load(Ordering::SeqCst) != 0 {
                 // The run is ending on a wait's interrupt ([`stop_run`]), or reporting after one
@@ -3941,6 +3847,18 @@ pub mod group {
                 let mut sig = [0u8];
                 if read.read_exact(&mut sig).is_ok() {
                     std::thread::sleep(report_grace());
+                    // A step that runs to its end holds the re-raise ([`hold`]): the run has its
+                    // grace again from the moment the last such step ended.
+                    while held() {
+                        #[cfg(test)]
+                        HOLD_WAITED.store(true, Ordering::SeqCst);
+                        while held() {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                NAP_MS.unsigned_abs(),
+                            ));
+                        }
+                        std::thread::sleep(report_grace());
+                    }
                     let sig = PENDING.load(Ordering::SeqCst);
                     // SAFETY: both take integers only.
                     unsafe {
@@ -3954,6 +3872,38 @@ pub mod group {
         }
         WATCHDOG.store(write.into_raw_fd(), Ordering::SeqCst);
         true
+    }
+
+    /// A step of the run that runs to its end whatever interrupt comes (a write whose outcome
+    /// an interrupt would leave unknown), from this call until the answer is dropped: while any
+    /// lives, [`kill_on_interrupt`]'s watchdog does not re-raise an interrupt the run took, and
+    /// once the last is dropped the run has [`REPORT_GRACE`] again to report before it does. Each
+    /// step held is bounded by its own deadline; a second interrupt still ends the run at once.
+    #[must_use = "the step is held only while the answer lives"]
+    pub fn hold() -> Held {
+        HOLDS.fetch_add(1, Ordering::SeqCst);
+        Held(())
+    }
+
+    /// A step [`hold`] holds the watchdog for.
+    pub struct Held(());
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            HOLDS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether a step holds the watchdog now ([`hold`]).
+    #[must_use]
+    pub fn held() -> bool {
+        HOLDS.load(Ordering::SeqCst) > 0
+    }
+
+    /// Whether the watchdog, its grace spent, has waited on a held step ([`hold`]).
+    #[cfg(test)]
+    pub(crate) fn hold_waited() -> bool {
+        HOLD_WAITED.load(Ordering::SeqCst)
     }
 
     /// Re-raise `sig` at its default action.
@@ -4073,8 +4023,12 @@ pub mod group {
         PENDING.load(Ordering::SeqCst)
     }
 
-    /// Whether no child of this run is listed or between its spawn and its listing: none then
-    /// runs, so none holds a token of the release's pool or will give one back.
+    /// Whether no child of this run is listed or between its spawn and its listing: no stage
+    /// leader then runs, so none holds a token of the release's pool or will give one back.
+    /// LIMIT: a group is listed until its leader is reaped, and a member still alive then (the
+    /// sweep at the leader's exit ends only members it proves the run's,
+    /// [`crate::runs::sweep_group`]) may hold a token, which a count asked on this answer
+    /// counts as lost and writes back ([`aterm_capacity::Jobserver::count_alone`]).
     pub(crate) fn idle() -> bool {
         SPAWNING.load(Ordering::SeqCst) == 0
             && LIVE.iter().all(|slot| slot.load(Ordering::SeqCst) == 0)

@@ -354,8 +354,11 @@ fn combined_reports_age_cached_journal_quota_at_the_command_clock() {
         }),
         read: Some((f.env.now, "m17".into(), "statusline".into())),
         wall_until,
+        reader: None,
+        wall_by: None,
     };
     let seen = Seen {
+        me: Default::default(),
         at: f.env.now,
         accounts: [(
             KEY.into(),
@@ -642,14 +645,12 @@ fn the_limits_hint_promises_no_sign_in_of_another_macs_account() {
         ),
     )
     .unwrap();
-    let secrets = home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
     let line_with_sheet_naming = |machine: &str| {
-        std::fs::write(
-            secrets.join(crate::harness::accounts_sync::ACCOUNTS_CSV_FILE),
+        crate::vault_entry::put(
+            home,
+            crate::harness::accounts_sync::ACCOUNTS_CSV_FILE,
             format!("email,computer,claude,notes\nother@example.test,{machine},1,\n"),
-        )
-        .unwrap();
+        );
         limits_accounts_line(&f.env, "@s-test").unwrap()
     };
     let line = line_with_sheet_naming("m16");

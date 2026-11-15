@@ -3,15 +3,15 @@
 
 //! The F10 interim handover (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3.4 step 9): the
 //! Allowing member's `[everyone]` files go to the new Mac inside the CPace channel, and the new
-//! Mac writes its vault configuration and `~/.secrets` from them. It holds a snapshot until an
-//! admin's approver admits the request its stored [`Allowed`] rides on ([`request_join`]).
+//! Mac writes its vault configuration from them and keeps none of their values: it reads them in
+//! place once an admin's approver admits the request its stored [`Allowed`] rides on
+//! ([`request_join`]) and its first apply of the admitted version records them.
 
 use super::{
-    Config, Paths, State, StateLock, Stored, apply_entries, apply_failed, config, load_state,
-    machine_identity, read_identity, save_config, save_state, source_bound, source_identity,
+    Config, Paths, Report, State, StateLock, Stored, config, load_state, machine_identity,
+    read_identity, save_config, save_state, source_bound, source_identity,
 };
 use crate::envelope::{self, Floor, Pin, Verdict};
-use crate::materialize::Report;
 use crate::members::bundle::Handed;
 use crate::members::{Allowed, Bundle};
 use crate::text::{self, Audience, Entry};
@@ -200,7 +200,6 @@ fn handover_bundle_until(
     let state = load_state(paths)?;
     if state.membership != Stored::In
         || state.failed
-        || !state.pending.is_empty()
         || !super::pin_admitted(&config, None)
         || (!source_bound(&config, &state) && !super::log_only_source_bound(&config, &state))
     {
@@ -466,10 +465,11 @@ pub fn ask_allowed(paths: &Paths) -> crate::Result<String> {
     super::request_join(paths, &config, None, super::Asker::Again)
 }
 
-/// Write this Mac's vault configuration and `~/.secrets` from a member's join bundle: the
-/// vault's source, name, pin and the name it was allowed under, and the bundle's files, each
-/// recorded as the vault's so the admission's first apply finds them unchanged. Membership
-/// stays pending, and the bundle's [`Allowed`] is kept for this Mac's join requests.
+/// Write this Mac's vault configuration from a member's join bundle: the vault's source, name,
+/// pin and the name it was allowed under. The bundle's files are checked and none of their values
+/// is kept: a value's only copy on a Mac is its verified store, which the admission's first apply
+/// fills, so nothing is read from the bundle once this returns and the [`Report`] names no entry.
+/// Membership stays pending, and the bundle's [`Allowed`] is kept for this Mac's join requests.
 ///
 /// # Errors
 /// This Mac is already in a vault, its key is not the one the bundle allows, the bundle's files
@@ -481,7 +481,6 @@ pub fn write_from_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report
     let CheckedFiles {
         config,
         mut state,
-        entries,
         afresh,
     } = checked_files_bundle(paths, bundle)?;
     // A bundle of another vault than the one this Mac's state holds (one that let it go) starts
@@ -492,30 +491,32 @@ pub fn write_from_bundle(paths: &Paths, bundle: &Bundle) -> crate::Result<Report
         crate::fsx::wipe_and_remove(&paths.cache_file())?;
     }
     save_config(paths, &config)?;
-    let report = apply_entries(paths, &mut state, &entries)?;
+    // No apply of this vault recorded what this Mac reads: its first apply of the admitted
+    // version does.
+    state.held = None;
+    state.materialization_selection = None;
+    state.failed = false;
     state.membership = Stored::Pending;
-    state.failed = apply_failed(&report);
     state.proof = None;
     state.refused = None;
     state.source_identity = Some(source_identity(&config));
     save_state(paths, &state)?;
     keep_allowed(paths, &bundle.allowed)?;
-    Ok(report)
+    Ok(Report::default())
 }
 
 /// What a files bundle this Mac takes writes ([`checked_files_bundle`]).
 pub(super) struct CheckedFiles {
     config: Config,
     state: State,
-    entries: Vec<Entry>,
     /// The bundle configures another vault than the one this Mac's state holds
     /// (`client::moves_vault`), and its write starts that vault afresh.
     afresh: bool,
 }
 
 /// [`write_from_bundle`]'s checks, writing nothing (`client::accepts_bundle`): the configuration
-/// it would save, this Mac's state, the bundle's files and whether it moves this Mac to another
-/// vault. The history this Mac acknowledged judges the records this Mac holds under the bundle's
+/// it would save, this Mac's state and whether it moves this Mac to another vault; the bundle's
+/// files must be one `[everyone]` locker, though none of their values is kept. The history this Mac acknowledged judges the records this Mac holds under the bundle's
 /// configuration, as the next acknowledgement under it will
 /// (`retained_history::validate_configured`), so a configuration under which that history refuses
 /// them (this Mac's own vault's log under another vault name) is refused before anything is
@@ -585,7 +586,6 @@ pub(super) fn checked_files_bundle(paths: &Paths, bundle: &Bundle) -> crate::Res
     Ok(CheckedFiles {
         config,
         state,
-        entries,
         afresh,
     })
 }

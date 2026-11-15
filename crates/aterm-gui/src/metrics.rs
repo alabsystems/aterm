@@ -277,6 +277,8 @@ window_ledger! {
         pub(crate) overlay_refusals: Counter,
         pub(crate) sync_holds: Counter,
         pub(crate) retry_gated: Counter,
+        /// Redraws of a hidden window parked before any compose (`ATERM_DESIGN.md` §7.4).
+        pub(crate) hidden_parked: Counter,
         pub(crate) refills_scoped: Counter,
         pub(crate) refills_full: Counter,
         pub(crate) refills_skipped: Counter,
@@ -641,6 +643,8 @@ label_enum! {
         CardWash => "card_wash",
         FleetAccess => "fleet_access",
         DiskFacts => "disk_facts",
+        AgentsDiscovery => "agents_discovery",
+        RestoreDrain => "restore_drain",
         RestoreGlass => "restore_glass",
     }
 }
@@ -1695,6 +1699,7 @@ fn emit_input_legs(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
         ],
         &input.rewind_step.copy_out(),
     );
+    let rewind_shown = input.rewind_shown.copy_out();
     emit_quantiles(
         s,
         [
@@ -1703,7 +1708,13 @@ fn emit_input_legs(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
             "rewind_shown_p95_ms",
             "rewind_shown_p99_ms",
         ],
-        &input.rewind_shown.copy_out(),
+        &rewind_shown,
+    );
+    emit_quantile_bounds(
+        s,
+        ["rewind_shown_p99_lower_ns", "rewind_shown_p99_upper_ns"],
+        &rewind_shown,
+        0.99,
     );
     s.count("max_rewind_fold_bytes", input.rewind_folded.get());
     s.count("input_refused", input.refused.get());
@@ -2454,7 +2465,16 @@ impl Metrics {
     }
 
     fn with_key_arrival_queued<R>(&self, queue_ns: Option<u64>, dispatch: impl FnOnce() -> R) -> R {
-        let arrival = now_ns().saturating_sub(queue_ns.unwrap_or(0)).max(1);
+        self.with_key_arrival_queued_at(queue_ns, now_ns(), dispatch)
+    }
+
+    fn with_key_arrival_queued_at<R>(
+        &self,
+        queue_ns: Option<u64>,
+        now: u64,
+        dispatch: impl FnOnce() -> R,
+    ) -> R {
+        let arrival = now.saturating_sub(queue_ns.unwrap_or(0)).max(1);
         if let Some(queue_ns) = queue_ns {
             let _ = self.window.input.key_queue.record(queue_ns);
         } else {
@@ -2765,6 +2785,11 @@ pub(crate) fn note_redraw_sync_hold() {
 
 pub(crate) fn note_redraw_retry_gated() {
     METRICS.window.redraw.retry_gated.inc();
+}
+
+/// A redraw of a hidden window parked before any compose (`docs/ATERM_DESIGN.md` §7.4).
+pub(crate) fn note_redraw_hidden_parked() {
+    METRICS.window.redraw.hidden_parked.inc();
 }
 
 pub(crate) fn note_pre_present(compose_ns: u64) {
@@ -3176,6 +3201,8 @@ fn emit_pty_census(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
 }
 
 pub(crate) fn reset() {
+    #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+    crate::restore_measurement::reset();
     METRICS.reset();
     wakes::WAKES.reset();
     crate::watchdog::reset_turn_census();
@@ -3186,6 +3213,8 @@ pub(crate) fn emit_summary(
     dims: Option<(u32, u32, u64)>,
     s: &mut dyn wire::FieldSink,
 ) {
+    #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+    crate::restore_measurement::emit(s);
     use wire::{ms, ms1};
     let w = &ctx.metrics.window;
     let live = &ctx.metrics.live;
@@ -3292,6 +3321,7 @@ pub(crate) fn emit_summary(
     s.count("redraw_overlay_refusals", w.redraw.overlay_refusals.get());
     s.count("redraw_sync_holds", w.redraw.sync_holds.get());
     s.count("redraw_retry_gated", w.redraw.retry_gated.get());
+    s.count("redraw_hidden_parked", w.redraw.hidden_parked.get());
     s.count("frame_refills_scoped", w.redraw.refills_scoped.get());
     s.count("frame_refills_full", w.redraw.refills_full.get());
     s.count("frame_refills_skipped", w.redraw.refills_skipped.get());
@@ -3471,6 +3501,8 @@ fn emit_commons_cadence(s: &mut dyn wire::FieldSink) {
 }
 
 pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
+    #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+    crate::restore_measurement::emit(s);
     use wire::ms;
     let w = &ctx.metrics.window;
     emit_quantiles(
@@ -3676,6 +3708,19 @@ fn emit_quantiles_ms3(s: &mut dyn wire::FieldSink, keys: [&str; 4], h: &HistCopy
     emit_quantiles_in(s, keys, h, wire::ms3);
 }
 
+/// Exact histogram bounds, using the same snapshot as the displayed percentile and count.
+fn emit_quantile_bounds(
+    s: &mut dyn wire::FieldSink,
+    [lower, upper]: [&str; 2],
+    h: &HistCopy,
+    q: f64,
+) {
+    if let Some(bounds) = h.percentile_bounds(q) {
+        s.count(lower, bounds.lower_ns);
+        s.count(upper, bounds.upper_ns);
+    }
+}
+
 fn emit_quantiles_in(
     s: &mut dyn wire::FieldSink,
     keys: [&str; 4],
@@ -3707,6 +3752,10 @@ fn text_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 #[cfg(test)]
 #[path = "metrics_ledger_tests.rs"]
 mod ledger_tests;
+
+#[cfg(all(test, unix))]
+#[path = "metrics_quantile_bounds_tests.rs"]
+mod quantile_bounds_tests;
 
 #[cfg(test)]
 #[path = "metrics_present_glass_tests.rs"]

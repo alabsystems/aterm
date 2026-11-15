@@ -309,10 +309,9 @@ impl<'a> Targo<'a> {
     }
 
     fn output(&self, verb: &str, args: &[&str], what: &str) -> Result<String, Halt> {
-        let out = self
-            .command(verb)?
-            .args(args)
-            .output()
+        let mut command = self.command(verb)?;
+        command.args(args);
+        let out = super::driver::compiler_output(&mut command)
             .map_err(|e| format!("could not run targo for {what}: {e}"))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);

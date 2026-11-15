@@ -182,7 +182,16 @@ impl JobBinding {
     }
 }
 
+/// A session is aterm's tab ID: `t` and 10 lower-case Crockford base32 characters (`0-9`, `a-z`
+/// without `i`, `l`, `o`, `u`), or the earlier form, `s-` and 1 to 62 lower-case hex digits.
 pub(crate) fn validate_session(value: &str) -> io::Result<()> {
+    if let Some(tab) = value.strip_prefix('t') {
+        let crockford = |c: u8| c.is_ascii_digit() || (c.is_ascii_lowercase() && !b"ilou".contains(&c));
+        if tab.len() == 10 && tab.bytes().all(crockford) {
+            return Ok(());
+        }
+        return Err(invalid());
+    }
     let session = value.strip_prefix("s-").ok_or_else(invalid)?;
     if session.is_empty()
         || session.len() > 62

@@ -116,7 +116,8 @@ impl aterm_uds::lan::direct::Direct for Direct {
     }
 
     fn serve(&self, stream: CtlStream) {
-        connection(self.shared(), &stream);
+        // This runs on the asking thread, not one started for the connection: no CPU is added.
+        connection(self.shared(), &stream, &mut || {});
     }
 }
 

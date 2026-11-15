@@ -33,6 +33,8 @@ pub enum TimingIssue {
     Blind,
     /// The platform did not provide a finite, nonnegative load.
     LoadUnknown,
+    /// Actual process footprints already exhaust the declared comparison peak.
+    Memory,
     /// Actual local admission provenance is missing or weak.
     UnknownAdmission,
     /// Observation retention failed before a measurement could start.
@@ -65,6 +67,7 @@ impl std::fmt::Display for TimingIssue {
                  or changed topology"
             }
             Self::LoadUnknown => "load observation unavailable",
+            Self::Memory => "comparison memory peak is insufficient",
             Self::UnknownAdmission => "timing admission provenance unavailable",
             Self::Persistence => {
                 "measurement-entry observation could not be retained under its claim"
@@ -354,3 +357,17 @@ impl TimingEvidence {
 #[cfg(test)]
 #[path = "timing_tests.rs"]
 mod tests;
+
+/// One fresh comparison boundary sampled under an original budgeted claim. Diagnostic
+/// values alone grant no arm authority; the lab binds them inside its owned arm lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ComparisonObservation {
+    /// Newly sampled CPU interval.
+    pub window: CpuWindow,
+    /// Newly read one-minute load.
+    pub load1: f64,
+    /// Maximum observed GPU utilization over the ordinary probe window.
+    pub gpu_busy: u8,
+    /// Actual summed controller and credited app component footprints at this boundary.
+    pub footprint_bytes: u64,
+}

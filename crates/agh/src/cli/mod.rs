@@ -229,7 +229,7 @@ fn run_verb(
 
 /// What a verb runs in: the environment, the files, the streams, the effect seam and the client.
 pub struct Ctx {
-    /// Environment reads: proxy variables, env profiles, ambient tokens.
+    /// Environment reads: proxy variables, git's, the helper's and ambient tokens.
     pub env: Arc<dyn EnvSource + Send + Sync>,
     /// `None` when the platform names no config, state or home directory.
     pub dirs: Option<Dirs>,
@@ -280,6 +280,9 @@ pub struct Ctx {
     /// because learning a login sends the token.
     anonymous: bool,
     no_anonymous_api: bool,
+    /// The release-line registry a cut's own process tree is proven by
+    /// ([`GithubBuilder::cut_registry`]): this account's, or under `for_tests`' root.
+    cut_registry: Option<std::path::PathBuf>,
 }
 
 /// stdout through the door: each write is written whole and flushed.
@@ -297,9 +300,9 @@ impl std::io::Write for StdoutDoor {
 }
 
 /// stdin past std's buffer. On unix the first read takes a duplicate of fd 0, and every read
-/// goes straight into the caller's buffer, so a token `auth add --stdin` reads is never also
-/// held in std's 8 KiB `Stdin` buffer, which nothing scrubs. Elsewhere (where `auth add`
-/// refuses by name) it is `std::io::stdin()`.
+/// goes straight into the caller's buffer, so what git's credential protocol hands
+/// `auth git-credential` is never also held in std's 8 KiB `Stdin` buffer, which nothing
+/// scrubs. Elsewhere it is `std::io::stdin()`.
 #[derive(Default)]
 struct StdinDoor {
     #[cfg(unix)]
@@ -352,6 +355,7 @@ impl Ctx {
             adoption: None,
             anonymous: false,
             no_anonymous_api: false,
+            cut_registry: aterm_ctl::release_holder::registry(),
         }
     }
 
@@ -388,6 +392,12 @@ impl Ctx {
             adoption: None,
             anonymous: false,
             no_anonymous_api: false,
+            cut_registry: Some(
+                root.join("state")
+                    .join("harness")
+                    .join("claude-harness")
+                    .join(aterm_ctl::release_holder::DIRECTORY),
+            ),
         };
         (ctx, captured)
     }
@@ -471,7 +481,7 @@ impl Ctx {
         let base = self.client(Router::empty());
         let gh = if let Some(dirs) = self.dirs.clone() {
             let resolved = if self.anonymous || recorded {
-                crate::routing::view(&dirs, base.env())?
+                crate::routing::view(&dirs)?
             } else {
                 crate::routing::adopt(&base, &dirs)?
             };
@@ -479,7 +489,7 @@ impl Ctx {
                 && !self.anonymous
                 && let Some(adoption) = resolved.adoption()
             {
-                for line in adoption.note(&dirs.home) {
+                for line in adoption.note() {
                     out::note(self, &line);
                 }
             }
@@ -537,6 +547,7 @@ impl Ctx {
             .redactor(self.redactor.clone())
             .backstop(self.timeout)
             .refuse_anonymous_api(self.no_anonymous_api)
+            .cut_registry(self.cut_registry.clone())
             .notifier(self.notifier.clone());
         if let Some(dirs) = &self.dirs {
             builder = builder.journal(dirs.clone());

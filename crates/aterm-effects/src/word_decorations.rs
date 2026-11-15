@@ -26,7 +26,7 @@ use crate::color_math::relative_luminance;
 use crate::color_math::{hsv2rgb, hue_nudge};
 use crate::effect_util::lerp_rgb as mix_rgb;
 use crate::genome::{
-    self, CatAge, Genome, NovaFeatures, NovaMagic, VoteScratch, accessory_variant_v4, cat_age_v4,
+    self, Genome, NovaFeatures, NovaMagic, VoteScratch, accessory_variant_v4, cat_age_v4,
     cat_fills_v4, cat_magic, cat_variant_v4, mix, nova_duration_ms, nova_features, nova_magic,
     nova_palette, nova_radius, special_variant_v4,
 };
@@ -64,7 +64,12 @@ const SCAN_MEMO_MIN_GEN: usize = 32;
 const SCAN_MEMO_MAX_GEN: usize = 4096;
 const MAX_CATS: usize = 8;
 const CAT_RISE_MS: u64 = 450;
-const CAT_BOUNCE_MS: u64 = 150;
+/// A word icon never moves on the glass (CT-48): from its peek's first frame
+/// to its last it is drawn whole at its rest box, and it comes and goes by its
+/// alpha alone, up from nothing over this many ms of the rise and down by the
+/// descent's ease ([`peek_alpha`]). Art that slides over fixed pixels in
+/// whole-pixel steps turns them faster than three flashes a second.
+const PEEK_FADE_IN_MS: u64 = 140;
 const CAT_MIN_CELL_H: u16 = 14;
 const CAT_MIN_CELL_W: u16 = 7;
 
@@ -290,7 +295,10 @@ pub struct PetCursorFrame {
 pub struct KittyCursorFrame {
     pub geom: EffectGeom,
     pub cursor: (u16, u16),
+    /// The coat and iris the cat wears, and the head's art for [`crate::kitty_cursor::CursorBody::Head`].
     pub look: KittyLook,
+    /// What is drawn: the head, or the flier's glide face ([`crate::kitty_cursor::CursorBody`]).
+    pub body: crate::kitty_cursor::CursorBody,
     pub colors: CatColorKey,
     pub bob: f32,
     /// Whole rows the seat raises the head ([`KittyCursorLayout::lift`]).
@@ -352,6 +360,8 @@ pub struct KittyCursorLayout {
     pub geom: EffectGeom,
     pub cursor: (u16, u16),
     pub look: KittyLook,
+    /// The head or the flier's glide: a glide's footprint is its ink box ([`glide_geometry`]).
+    pub body: crate::kitty_cursor::CursorBody,
     /// The hover bob, in cell heights: drawn as it is, never smoothed.
     pub bob: f32,
     /// Whole rows the companion router's seat raises the head off its rest (the one-row-up seat of `rainbow_kitty::companion::placement`).
@@ -374,11 +384,22 @@ pub struct CatFootprint {
 /// over the caret flies above it instead of perching on its top.
 pub const HEAD_CARET_GAP_DEN: i32 = 2;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 thread_local! {
     /// The negative control of [`KittyCursorPlacement::keep_off_letters`]: the
     /// head is drawn where the follower put it.
     pub static HEAD_KEEPS_OFF_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests' negative control over [`KittyCursorPlacement::keep_off_letters`] on this thread:
+/// `true` draws the head where its seat or follower put it ([`HEAD_KEEPS_OFF_OFF`]).
+#[cfg(any(test, debug_assertions))]
+pub fn set_head_keeps_off_off(off: bool) {
+    HEAD_KEEPS_OFF_OFF.with(|cell| cell.set(off));
+}
+
+#[cfg(test)]
+thread_local! {
     /// The negative control of the caret's ring of air (looks10 round 3): only a
     /// head over the caret's cell itself is kept off, as round 2 kept it, so a
     /// head flush beside the caret stays there and a lifted one sits a pixel
@@ -391,6 +412,9 @@ thread_local! {
     /// The negative control of the head's flight to a far caret ([`HEAD_FLIGHT`]): the head is
     /// placed at the landing on the jump's frame, as before.
     pub static HEAD_FLIGHT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the flier's held tile: a face its bake budget missed draws
+    /// nothing that frame (a dip, which reads as a blink), as a head's cold bake does.
+    pub static GLIDE_HOLD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The negative control of the typed dog's seat ([`WordDecorations::dog_cameo`]): it is drawn
     /// centred on the caret's row behind the caret, over whatever lies there, as before.
     pub static DOG_SEAT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -609,7 +633,7 @@ impl KittyCursorPlacement {
         }) else {
             return;
         };
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         if HEAD_KEEPS_OFF_OFF.with(std::cell::Cell::get) {
             return;
         }
@@ -1812,6 +1836,13 @@ pub struct WordDecorations {
     animal_baker: AnimalBaker,
     pet_baker: crate::pet_baker::PetBaker,
     pet_last_tile: Option<(Arc<FxArt>, crate::pet_glyphs_gen::PetGlyphId, u64, u8, u8)>,
+    /// The flier's last drawn glide tile and its host id: a face the bake budget misses is
+    /// drawn as the last one was, never dropped (a dip reads as a blink).
+    glide_last_tile: Option<(Arc<FxArt>, u64)>,
+    /// A test's negative control of [`crate::kitty_pet::GLIDE_INK_PAD_PX`]: the flier's
+    /// footprint is its bare ink box.
+    #[cfg(test)]
+    glide_pad_off: bool,
     pet_depart_tiles: [Option<(u32, Arc<FxArt>, u64)>; PET_DEPART_HOLDS],
     dog_baker: crate::dog_baker::DogBaker,
     dog_last_tile: Option<(Arc<FxArt>, u64, crate::dog_cameo::DogLook)>,
@@ -2247,6 +2278,7 @@ impl WordDecorations {
         self.pet_baker.clear();
         self.animal_baker.clear();
         self.pet_last_tile = None;
+        self.glide_last_tile = None;
         self.pet_depart_tiles = [const { None }; PET_DEPART_HOLDS];
         self.dog_baker.clear();
         self.dog_last_tile = None;
@@ -2260,6 +2292,7 @@ impl WordDecorations {
         }
         self.held_tile_metric = (cell_w, cell_h);
         self.pet_last_tile = None;
+        self.glide_last_tile = None;
         self.pet_depart_tiles = [const { None }; PET_DEPART_HOLDS];
         self.dog_last_tile = None;
         self.dog_place = None;
@@ -2425,17 +2458,46 @@ impl WordDecorations {
         !self.away
     }
 
+    /// The least share of its `rest` footprint the flier at `layout` is fitted to by the wall
+    /// ([`crate::rainbow_kitty::companion::head_fit_seat`]): the head's
+    /// [`crate::rainbow_kitty::companion::HEAD_FIT_FLOOR`], and for the glide, which is wider
+    /// for its height, the share that is the default head's floor width. So the glide needs no
+    /// more room past the caret than the head did: at the floor's share it ran out of room a
+    /// column sooner, and at a full last row's end it lay on the caret's cell (`lab trail-film
+    /// --scene last-row`: 295 frames to the head's 2).
+    #[must_use]
+    pub fn kitty_cursor_fit_floor(&self, layout: KittyCursorLayout, rest: CatFootprint) -> f32 {
+        use crate::rainbow_kitty::companion::HEAD_FIT_FLOOR;
+        if matches!(layout.body, crate::kitty_cursor::CursorBody::Head) || rest.w == 0 {
+            return HEAD_FIT_FLOOR;
+        }
+        let head = self.kitty_cursor_footprint(KittyCursorLayout {
+            look: KittyLook::DEFAULT,
+            body: crate::kitty_cursor::CursorBody::Head,
+            ..layout
+        });
+        head.map_or(HEAD_FIT_FLOOR, |head| {
+            (HEAD_FIT_FLOOR * f32::from(head.w) / f32::from(rest.w)).min(HEAD_FIT_FLOOR)
+        })
+    }
+
     /// The flying cursor kitty's dest rect for `layout`, from the emitter's own sizing and placement math.
     #[inline]
     #[must_use]
-    pub const fn kitty_cursor_footprint(&self, layout: KittyCursorLayout) -> Option<CatFootprint> {
+    pub fn kitty_cursor_footprint(&self, layout: KittyCursorLayout) -> Option<CatFootprint> {
         let KittyCursorLayout {
             geom,
             cursor: (crow, ccol),
             look,
+            body,
             bob,
             lift,
         } = layout;
+        // A glide's footprint is its ink box, and its tile (the box plus the frame round it)
+        // stays inside the grid: the seat keeps the tile's top on it, and the box keeps the
+        // larger of its side margins from either edge, so either facing fits.
+        let mut glide_top = 0;
+        let mut glide_side = 0;
         if self.kitty_disabled || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
@@ -2472,6 +2534,12 @@ impl WordDecorations {
                     rh
                 }) as u16,
             )
+        } else if let crate::kitty_cursor::CursorBody::Glide(face) = body {
+            let g = glide_geometry(face, geom.cell_h, self.glide_pad_px());
+            glide_top = g.ink.1 + 1;
+            let right = g.tile.0 as i32 - g.ink.2;
+            glide_side = if g.ink.0 > right { g.ink.0 } else { right };
+            g.size()
         } else {
             let look = look.normalized();
             let desired_h = Self::COMPANION_CELL_H * (geom.cell_h as f32) * look.age.scale();
@@ -2481,10 +2549,27 @@ impl WordDecorations {
         let ch_i = geom.cell_h as i32;
         let grid_w = (geom.cols as i32).saturating_mul(cw);
         let cursor_right = (ccol as i32).saturating_add(1).saturating_mul(cw);
+        // The glide moves two cells every other key ([`GLIDE_STRIDE`]): its rest is read off the
+        // caret's column rounded up to the stride, so it is never nearer the caret than the
+        // head's rest and is a cell further at most.
+        let anchor_right = if matches!(body, crate::kitty_cursor::CursorBody::Glide(_)) {
+            let stride = glide_stride();
+            let col = ccol as i32;
+            let rem = col % stride;
+            let col = if rem == 0 { col } else { col + stride - rem };
+            col.saturating_add(1).saturating_mul(cw)
+        } else {
+            cursor_right
+        };
         let lead = Self::kitty_cursor_lead_px(geom.cell_w);
-        let x_cand = cursor_right.saturating_add(lead);
-        let x_max = grid_w.saturating_sub(w as i32);
+        let x_cand = anchor_right.saturating_add(lead);
+        let x_max = grid_w.saturating_sub(w as i32).saturating_sub(glide_side);
         let x = if x_cand < x_max { x_cand } else { x_max };
+        let x = if x < glide_side && glide_side <= x_max {
+            glide_side
+        } else {
+            x
+        };
         if x < 0 {
             return None;
         }
@@ -2505,6 +2590,11 @@ impl WordDecorations {
         // starts above the grid, where a pane divider cuts it and the window pad or the tab strip
         // hides it: the seat stops at the grid top, less the hover bob's reach.
         let headroom = (crate::kitty_cursor::BOB_AMP * ch_i as f32).ceil() as i32;
+        let headroom = if glide_top > headroom {
+            glide_top
+        } else {
+            headroom
+        };
         let seated_raw = rest_top - rise - (lift * ch_i as f32).round() as i32;
         let seated = if seated_raw > headroom {
             seated_raw
@@ -2695,6 +2785,22 @@ impl WordDecorations {
 
     const COMPANION_CELL_H: f32 = 1.70;
 
+    /// The pad the flier's footprint keeps round its ink ([`crate::kitty_pet::GLIDE_INK_PAD_PX`]).
+    #[inline]
+    const fn glide_pad_px(&self) -> i32 {
+        #[cfg(test)]
+        if self.glide_pad_off {
+            return 0;
+        }
+        crate::kitty_pet::GLIDE_INK_PAD_PX
+    }
+
+    /// A test's negative control: the flier's footprint is its bare ink box, no pad.
+    #[cfg(test)]
+    pub(crate) const fn set_glide_pad_off(&mut self, off: bool) {
+        self.glide_pad_off = off;
+    }
+
     const KITTY_LEAD_NUM: i32 = 3;
     const KITTY_LEAD_DEN: i32 = 4;
 
@@ -2721,10 +2827,52 @@ impl WordDecorations {
             geom: frame.geom,
             cursor: frame.cursor,
             look: frame.look,
+            body: frame.body,
             bob: frame.bob,
             lift: frame.lift,
         })?;
         self.kitty_cursor_at_placement(frame, KittyCursorPlacement::settled(footprint), free)
+    }
+
+    /// `frame`'s settled placement kept off the caret's cell and every lettered cell as the
+    /// terminal's flying head is ([`KittyCursorPlacement::keep_off_letters`], or
+    /// [`KittyCursorPlacement::keep_fitted_off_letters`] for a body `fitted` to its row), judged
+    /// on the rectangle drawn at the frame's pose: a stretch grows the body about its centre, so
+    /// a seat chosen for the unposed body can reach back over the caret. `ink` is the seat law's
+    /// probe; [`Self::kitty_cursor_at_placement`] draws it.
+    #[inline]
+    #[must_use]
+    pub fn kitty_cursor_kept_off<F>(
+        &self,
+        frame: &KittyCursorFrame,
+        ink: F,
+        fitted: bool,
+    ) -> Option<KittyCursorPlacement>
+    where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
+        if frame.alpha == 0 || frame.geom.cell_w == 0 || frame.geom.cell_h == 0 {
+            return None;
+        }
+        let footprint = self.kitty_cursor_footprint(KittyCursorLayout {
+            geom: frame.geom,
+            cursor: frame.cursor,
+            look: frame.look,
+            body: frame.body,
+            bob: frame.bob,
+            lift: frame.lift,
+        })?;
+        let mut placement = KittyCursorPlacement::settled(footprint);
+        placement.drawn =
+            Some(self.kitty_cursor_draw_geometry(
+                frame.geom, frame.bob, frame.pose, placement, frame.body,
+            ));
+        if fitted {
+            placement.keep_fitted_off_letters(frame.geom, frame.cursor, ink);
+        } else {
+            placement.keep_off_letters(frame.geom, frame.cursor, ink);
+        }
+        Some(placement)
     }
 
     /// Resolve the body's exact draw rectangle before the word pass, without advancing its follower.
@@ -2737,8 +2885,13 @@ impl WordDecorations {
         pose: crate::kitty_cursor::CatPose,
     ) -> Option<KittyCursorPlacement> {
         let mut placement = self.resolve_kitty_cursor_placement(layout, motion)?;
-        placement.drawn =
-            Some(self.kitty_cursor_draw_geometry(layout.geom, layout.bob, pose, placement));
+        placement.drawn = Some(self.kitty_cursor_draw_geometry(
+            layout.geom,
+            layout.bob,
+            pose,
+            placement,
+            layout.body,
+        ));
         Some(placement)
     }
 
@@ -2749,7 +2902,17 @@ impl WordDecorations {
         bob: f32,
         pose: crate::kitty_cursor::CatPose,
         placement: KittyCursorPlacement,
+        body: crate::kitty_cursor::CursorBody,
     ) -> PreparedKittyCursorDraw {
+        // The glide is drawn at its rest, not eased after it: the follower's steps between two
+        // rests are more looks of each pixel under the art at other columns of it, and through
+        // a burst they turned those pixels up to twelve times a second
+        // (`the_flier_never_flashes`). Its stride ([`GLIDE_STRIDE`]) is its motion.
+        #[cfg(any(test, debug_assertions))]
+        let follows = GLIDE_FOLLOWS.with(std::cell::Cell::get);
+        #[cfg(not(any(test, debug_assertions)))]
+        let follows = false;
+        let glide = matches!(body, crate::kitty_cursor::CursorBody::Glide(_)) && !follows;
         let footprint = placement.sample;
         let (nat_w, nat_h) = (footprint.w, footprint.h);
         let mut settle = self.kitty_cursor_placement.settle;
@@ -2812,7 +2975,7 @@ impl WordDecorations {
                         None
                     };
                     let followed = match followed_cand {
-                        Some(p) if fresh && (rest.1 - p.1).abs() <= 2.0 * ch => Some(p),
+                        Some(p) if !glide && fresh && (rest.1 - p.1).abs() <= 2.0 * ch => Some(p),
                         _ => None,
                     };
                     match followed {
@@ -2911,6 +3074,7 @@ impl WordDecorations {
             geom,
             cursor,
             look,
+            body,
             colors,
             bob,
             lift: seat_lift,
@@ -2932,11 +3096,18 @@ impl WordDecorations {
                 geom,
                 cursor,
                 look,
+                body,
                 bob,
                 lift: seat_lift,
             }),
             "cursor-kitty placement must match the frame it is emitted with"
         );
+        let glide = match body {
+            crate::kitty_cursor::CursorBody::Glide(face) if self.kitty_custom.is_none() => {
+                Some((face, glide_geometry(face, geom.cell_h, self.glide_pad_px())))
+            }
+            _ => None,
+        };
         self.begin_baker_frame(geom, true);
 
         let (w, h) = (footprint.w, footprint.h);
@@ -2968,6 +3139,49 @@ impl WordDecorations {
                 self.cat_baker.host_tile(host, w, h, src)?
             };
             (tile.art, w, h)
+        } else if let Some((face, g)) = glide {
+            // The flier's glide, baked by the walker's own baker in the walker's look: one art,
+            // one baker, so every fix the walker's bake gets reaches the flier too.
+            let (tw, th) = g.tile;
+            self.pet_baker.begin_frame(geom.cell_w, geom.cell_h);
+            let look = look.normalized();
+            let key = crate::pet_baker::PetBakeKey {
+                pose: face,
+                coat: look.coat,
+                iris: look.iris,
+                colors,
+                w: tw,
+                h: th,
+            };
+            let host = key.host_id();
+            let resolved = match self.pet_baker.tile(&key) {
+                Some(rgba) => self.cat_baker.host_tile(host, tw, th, rgba),
+                None => self.cat_baker.host_peek(host),
+            };
+            let art = match resolved {
+                Some(tile) => {
+                    let held = self
+                        .glide_last_tile
+                        .as_ref()
+                        .is_some_and(|(art, id)| *id == host && Arc::ptr_eq(art, &tile.art));
+                    if !held {
+                        self.glide_last_tile = Some((Arc::clone(&tile.art), host));
+                    }
+                    tile.art
+                }
+                None => {
+                    #[cfg(test)]
+                    if GLIDE_HOLD_OFF.with(std::cell::Cell::get) {
+                        return None;
+                    }
+                    // A face the bake budget missed: the last one drawn, never a dropped frame.
+                    match &self.glide_last_tile {
+                        Some((art, _)) => Arc::clone(art),
+                        None => return None,
+                    }
+                }
+            };
+            (art, tw, th)
         } else {
             let look = look.normalized();
             let variant = look.variant;
@@ -3007,14 +3221,37 @@ impl WordDecorations {
         let flip_x = placement.facing_left;
         let draw = match placement.drawn {
             Some(d) => d,
-            None => self.kitty_cursor_draw_geometry(geom, bob, pose, placement),
+            None => self.kitty_cursor_draw_geometry(geom, bob, pose, placement, body),
         };
+        let shown = draw.shown();
+        // A glide's footprint is its ink box: the tile drawn is that box grown back to the
+        // whole frame round it, at the pose's scale, mirrored with the facing.
         let CatFootprint {
             x: sprite_x,
             y: sprite_y,
             w: dest_w,
             h: dest_h,
-        } = draw.shown();
+        } = match glide {
+            Some((_, g)) => {
+                let (ink_w, ink_h) = g.size();
+                let kx = f32::from(shown.w) / f32::from(ink_w);
+                let ky = f32::from(shown.h) / f32::from(ink_h);
+                let (tw, th) = g.tile;
+                let left = if flip_x {
+                    i32::from(tw) - g.ink.2
+                } else {
+                    g.ink.0
+                };
+                let px = |v: f32| (v.round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
+                CatFootprint {
+                    x: shown.x - (left as f32 * kx).round() as i32,
+                    y: shown.y - (g.ink.1 as f32 * ky).round() as i32,
+                    w: px(f32::from(tw) * kx),
+                    h: px(f32::from(th) * ky),
+                }
+            }
+            None => shown,
+        };
         self.kitty_cursor_placement.settle = draw.settle;
         debug_assert_eq!(
             (art.w(), art.h()),
@@ -3035,19 +3272,38 @@ impl WordDecorations {
         };
 
         if let Some(at) = placement.sampled_at {
-            self.kitty_cursor_placement.last_sprite = Some((sprite.x, sprite.y));
+            // Where the footprint was drawn (a glide's ink box, not its tile): a flight or a fold
+            // flies the footprint on from there.
+            self.kitty_cursor_placement.last_sprite = Some((shown.x, shown.y));
             self.kitty_cursor_placement.last_emitted_at = Some(at);
         }
 
         let mut fp = fold_free(FNV64_OFFSET, &sprite);
         if sing > 0.0 {
             let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
-            let mouth_x = if flip_x {
-                sprite.x
-            } else {
-                sprite.x + i32::from(sprite.w)
+            let (mouth_x, mouth_y) = match glide {
+                // The glide sings from its own mouth, mirrored with the facing.
+                Some((face, _)) => {
+                    let species = match crate::kitty_pet::glide_species(face) {
+                        Some(s) => s,
+                        None => crate::kitty_pet::PetSpecies::Cat,
+                    };
+                    let (mx, my) = crate::kitty_pet::glide_mouth(species);
+                    let mx = if flip_x { 1.0 - mx } else { mx };
+                    (
+                        sprite.x + (mx * f32::from(sprite.w)).round() as i32,
+                        sprite.y + (my * f32::from(sprite.h)).round() as i32,
+                    )
+                }
+                None => (
+                    if flip_x {
+                        sprite.x
+                    } else {
+                        sprite.x + i32::from(sprite.w)
+                    },
+                    sprite.y + i32::from(sprite.h) / 2,
+                ),
             };
-            let mouth_y = sprite.y + i32::from(sprite.h) / 2;
             const INV_255: f32 = 1.0 / 255.0;
             let note_dir = if flip_x { -1.0 } else { 1.0 };
             let alpha_scale = f32::from(alpha) * INV_255 * sing;
@@ -7152,6 +7408,95 @@ pub const fn cat_chin(hart: u16) -> u16 {
     (0.15 * (hart as f32)).floor() as u16
 }
 
+/// The flier's glide on a `cell_h` cell: its tile ([`crate::kitty_pet::glide_tile_size`]) and
+/// the ink box in it every law judges, `(x0, y0, x1, y1)` px, end exclusive: the union of what
+/// any of the species' four faces inks ([`crate::kitty_pet::GLIDE_INK`]), `pad` px round it,
+/// within the tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlideGeometry {
+    pub tile: (u16, u16),
+    pub ink: (i32, i32, i32, i32),
+}
+
+impl GlideGeometry {
+    /// The ink box's size: the flier's footprint.
+    #[must_use]
+    #[inline]
+    pub const fn size(self) -> (u16, u16) {
+        let (x0, y0, x1, y1) = self.ink;
+        let w = x1 - x0;
+        let h = y1 - y0;
+        (
+            (if w < 1 { 1 } else { w }) as u16,
+            (if h < 1 { 1 } else { h }) as u16,
+        )
+    }
+}
+
+/// The glide's stride, cells: it moves this many cells every this many keys, not a cell a key.
+/// Its art passes over a pixel of the page as the caret runs, and every key's step is one look
+/// of that pixel at another column of the art: a cell a key turned the pixels under its head
+/// seven and eight times a second through a 20-key-a-second burst, past the flash law with a
+/// blink before it (`the_flier_never_flashes`); a two-cell stride halves the looks.
+pub const GLIDE_STRIDE: i32 = 2;
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The negative control of [`GLIDE_STRIDE`]: the glide moves a cell a key.
+    pub static GLIDE_STRIDE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the glide's placement without the follower: it eases after its
+    /// rest, as the head does ([`WordDecorations::PLACE_TAU`]).
+    pub static GLIDE_FOLLOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`GLIDE_STRIDE`], or a cell under its control.
+#[inline]
+fn glide_stride() -> i32 {
+    #[cfg(any(test, debug_assertions))]
+    if GLIDE_STRIDE_OFF.with(std::cell::Cell::get) {
+        return 1;
+    }
+    GLIDE_STRIDE
+}
+
+/// [`GlideGeometry`] of `face` (a glide face) at `cell_h`, padded by `pad` px.
+#[must_use]
+#[inline]
+pub const fn glide_geometry(
+    face: crate::pet_glyphs_gen::PetGlyphId,
+    cell_h: u16,
+    pad: i32,
+) -> GlideGeometry {
+    let species = match crate::kitty_pet::glide_species(face) {
+        Some(s) => s,
+        None => crate::kitty_pet::PetSpecies::Cat,
+    };
+    let (tw, th) = crate::kitty_pet::glide_tile_size(cell_h);
+    let (x0, y0, x1, y1) = crate::kitty_pet::glide_ink(species);
+    let (twf, thf) = (tw as f32, th as f32);
+    GlideGeometry {
+        tile: (tw, th),
+        ink: (
+            clamp_px((x0 * twf).floor() as i32 - pad, tw as i32),
+            clamp_px((y0 * thf).floor() as i32 - pad, th as i32),
+            clamp_px((x1 * twf).ceil() as i32 + pad, tw as i32),
+            clamp_px((y1 * thf).ceil() as i32 + pad, th as i32),
+        ),
+    }
+}
+
+/// `v` within `0..=hi`.
+#[inline]
+const fn clamp_px(v: i32, hi: i32) -> i32 {
+    if v < 0 {
+        0
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
 #[inline]
 const fn authored_cat_size(variant: CatGlyphId, desired_h: f32, cell_h: u16) -> (u16, u16) {
     let max_w = cell_h.saturating_mul(4).saturating_sub(PATCH_STRIP);
@@ -7171,7 +7516,7 @@ const fn fit_glyph(glyph: &GlyphDef, desired_h: f32, max_w: u16, cell_h: u16) ->
     (w, h)
 }
 
-/// §5.6 rest reveal: full Hart for every identity — bobs and entrances terminate at the same fixed point for everyone.
+/// §5.6 rest reveal: full Hart for every identity, the box a peek is drawn whole in on every frame it shows.
 #[must_use]
 #[inline]
 pub const fn cat_rest_reveal(hart: u16) -> u16 {
@@ -7252,45 +7597,6 @@ const fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyp
     let size = fit_glyph(glyph, cat_hart(geom.cell_h) as f32, max_w, geom.cell_h);
     anchored_geom(occ.start_col, occ.end_col, geom, size, glyph)
 }
-
-#[inline]
-const fn ease_out_back_c(p: f32, c: f32) -> f32 {
-    let u = p - 1.0;
-    1.0 + (c + 1.0) * u * u * u + c * u * u
-}
-
-#[inline]
-const fn overshoot_c(amp: f32) -> f32 {
-    let (mut lo, mut hi) = (0.0f32, 6.0f32);
-    let mut i = 0;
-    while i < 24 {
-        let mid = 0.5 * (lo + hi);
-        let over = 4.0 * mid * mid * mid / (27.0 * (mid + 1.0) * (mid + 1.0));
-        if over < amp {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-        i += 1;
-    }
-    0.5 * (lo + hi)
-}
-
-const PEEK_OVERSHOOT_C: [[f32; 4]; 2] = {
-    let mut table = [[0.0f32; 4]; 2];
-    let mut k = 0;
-    while k < 2 {
-        let mult = if k == 1 { 1.3f32 } else { 1.0f32 };
-        let mut f = 0;
-        while f < 4 {
-            let overshoot = 0.06 + f as f32 * 0.04;
-            table[k][f] = overshoot_c(overshoot * mult);
-            f += 1;
-        }
-        k += 1;
-    }
-    table
-};
 
 #[inline]
 const fn ease_in_out_cubic(p: f32) -> f32 {
@@ -7382,18 +7688,18 @@ fn touch_done(marks: &mut DoneMarkLru, key: u64) -> bool {
     marks.touch(key)
 }
 
+/// The dwell pose a word icon had before it stood still (CT-48): a 1-2 px
+/// bob and sway. Only a test's negative control draws it
+/// ([`with_icons_breathing`]).
+#[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy)]
 struct CatIdlePose {
     bob_px: i32,
     lead_px: i32,
 }
 
+#[cfg(any(test, debug_assertions))]
 impl CatIdlePose {
-    const STILL: Self = Self {
-        bob_px: 0,
-        lead_px: 0,
-    };
-
     #[inline]
     const fn breathing(td_ms: u64, gkey: u64, cell_h: u16) -> Self {
         const INV_63: f32 = 1.0 / 63.0;
@@ -7414,10 +7720,69 @@ impl CatIdlePose {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one cat sprite: its art, its visible rows, the rows its window skips, and the living-cartoon pose"
-)]
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static ICONS_BREATHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's negative control: `f` run with each dwelling word icon drawn in
+/// the breathing pose it had before it stood still ([`CatIdlePose::breathing`]),
+/// its whole art moved by a 1-2 px bob and sway. Debug and test builds only;
+/// the flag is this thread's.
+#[cfg(any(test, debug_assertions))]
+pub fn with_icons_breathing<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            ICONS_BREATHING.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(ICONS_BREATHING.with(|c| c.replace(true)));
+    f()
+}
+
+/// Where a peek's art stands: at `(x, top)`, its rest box, or in a test's
+/// negative control ([`with_icons_breathing`]) moved by the breathing pose
+/// while it dwells.
+#[inline]
+fn peek_origin(x: i32, top: i32, timing: PeekTiming, gkey: u64, cell_h: u16) -> (i32, i32) {
+    #[cfg(any(test, debug_assertions))]
+    if timing.in_dwell && ICONS_BREATHING.with(std::cell::Cell::get) {
+        let pose = CatIdlePose::breathing(timing.t.saturating_sub(CAT_RISE_MS), gkey, cell_h);
+        return (x + pose.lead_px, top + pose.bob_px);
+    }
+    let _ = (timing, gkey, cell_h);
+    (x, top)
+}
+
+/// A word icon's alpha at its peek's clock (CT-48): up from nothing over
+/// [`PEEK_FADE_IN_MS`] of the rise, whole for the rest of the rise, the dwell
+/// and the anticipation, and down by the descent's ease. Each pixel under the
+/// icon thus moves one way as it comes and one way as it goes. Reduced motion
+/// reaches it as a dwell ([`resolve_peek_timing`] latches the clock there), so
+/// its static pose is whole.
+#[inline]
+const fn peek_alpha(timing: PeekTiming) -> u8 {
+    const INV_CAT_DESCEND_MS: f32 = 1.0 / CAT_DESCEND_MS as f32;
+    if timing.in_dwell {
+        u8::MAX
+    } else if timing.in_rise {
+        if timing.t >= PEEK_FADE_IN_MS {
+            u8::MAX
+        } else {
+            (255 * timing.t / PEEK_FADE_IN_MS) as u8
+        }
+    } else {
+        let ta = timing.t.saturating_sub(timing.dwell_end);
+        if ta < timing.antic {
+            u8::MAX
+        } else {
+            let pd = (ta - timing.antic) as f32 * INV_CAT_DESCEND_MS;
+            ((1.0 - ease_in_out_cubic(pd)) * 255.0).round() as u8
+        }
+    }
+}
+
 #[inline]
 fn push_cat_free(
     free: &mut Vec<FreeSprite>,
@@ -7425,26 +7790,23 @@ fn push_cat_free(
     x: i32,
     top: i32,
     bottom: i32,
-    skip: i32,
-    pose: CatIdlePose,
+    alpha: u8,
     fp: &mut u64,
 ) {
     let h = bottom - top;
     if art.w() == 0 || h <= 0 {
         return;
     }
-    // The whole art, lifted by the rows the peek window skips, seen only
-    // through the window: the visible rows are the art's `skip..skip + h`.
-    let (x, top) = (x + pose.lead_px, top + pose.bob_px);
+    // The whole art from its box's top, seen through the box.
     let s = FreeSprite {
         x,
-        y: top - skip.max(0),
+        y: top,
         w: art.w(),
         h: art.h(),
         clip: PxRect::at(x, top, u32::from(art.w()), h as u32),
         art,
         tint: 0x00FF_FFFF,
-        alpha: 255,
+        alpha,
         flip_x: false,
         z: FreeZ::UnderText,
     };
@@ -7606,7 +7968,6 @@ fn emit_cat(
         frame,
         timing,
         g,
-        age == CatAge::Kitten,
         |ctx| {
             let key = BakeKeyV4 {
                 variant,
@@ -7691,7 +8052,6 @@ fn emit_animal(
         frame,
         timing,
         g,
-        false,
         |ctx| {
             let key = AnimalBakeKey {
                 species,
@@ -7725,74 +8085,29 @@ fn emit_peek<'a>(
     frame: u64,
     timing: PeekTiming,
     g: CatGeom,
-    kitten: bool,
     bake: impl FnOnce(&mut CatTick<'a>) -> Option<CatTile>,
     free: &mut Vec<FreeSprite>,
     fp: &mut u64,
     active_until: &mut Option<Instant>,
 ) -> Option<(i32, i32)> {
-    let PeekTiming {
-        t,
-        dwell_end,
-        antic,
-        in_rise,
-        in_dwell,
-    } = timing;
-    let ch = i32::from(geom.cell_h);
-    let rest = i32::from(cat_rest_reveal(g.hart));
-    let td = t.saturating_sub(CAT_RISE_MS);
     if !cfg.reduced_motion {
         *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
     }
-    const INV_CAT_RISE_MS: f32 = 1.0 / CAT_RISE_MS as f32;
-    const INV_CAT_DESCEND_MS: f32 = 1.0 / CAT_DESCEND_MS as f32;
-    const INV_CAT_BOUNCE_MS: f32 = 1.0 / CAT_BOUNCE_MS as f32;
-    let p = if in_rise {
-        t as f32 * INV_CAT_RISE_MS
-    } else {
-        1.0
-    };
-    let mut antic_lift = 0i32;
-    let reveal = if cfg.reduced_motion || in_dwell {
-        rest
-    } else if in_rise {
-        let c = PEEK_OVERSHOOT_C[usize::from(kitten)]
-            [genome::field(occ.genome.gkey, 15, 2) as usize & 3];
-        (ease_out_back_c(p, c) * rest as f32).round() as i32
-    } else {
-        let ta = t - dwell_end;
-        if ta < antic {
-            antic_lift = 2;
-            rest
-        } else {
-            let pd = (ta - antic) as f32 * INV_CAT_DESCEND_MS;
-            ((1.0 - ease_in_out_cubic(pd)) * rest as f32).round() as i32
-        }
-    };
-    if reveal <= 0 {
+    let alpha = peek_alpha(timing);
+    if alpha == 0 {
         return None;
     }
-    let vh = reveal.min(rest);
-    let lift = (reveal - rest)
-        .max(0)
-        .max(antic_lift)
-        .min(2 * ch - (i32::from(g.hart) - i32::from(g.chin)));
-    let in_bounce = kitten && !cfg.reduced_motion && in_dwell && td < CAT_BOUNCE_MS;
-    let bounce = if in_bounce {
-        let q = td as f32 * INV_CAT_BOUNCE_MS;
-        (2.0 * crate::supernova::sin_cos_f32(std::f32::consts::PI * q).0).round() as i32
-    } else {
-        0
-    };
+    // The rest box on every frame (CT-48): the whole art, its chin's rows in
+    // the word's row behind the letters.
+    let ch = i32::from(geom.cell_h);
+    let rest = i32::from(cat_rest_reveal(g.hart));
     let row_top = i32::from(occ.row) * ch;
     let (mut top, mut bottom) = if occ.cat_peek_down {
         let rest_top = row_top + ch - i32::from(g.chin);
-        let top = rest_top + lift - bounce;
-        (top, top + vh)
+        (rest_top, rest_top + rest)
     } else {
         let rest_bottom = row_top + i32::from(g.chin);
-        let bottom = rest_bottom - lift + bounce;
-        (bottom - vh, bottom)
+        (rest_bottom - rest, rest_bottom)
     };
     let grid_h = i32::from(geom.rows) * ch;
     if top < 0 {
@@ -7814,19 +8129,10 @@ fn emit_peek<'a>(
         *fp = fnv_mix_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
         return None;
     };
-    let skip = if occ.cat_peek_down {
-        (rest - vh).max(0)
-    } else {
-        0
-    };
     let n_free = free.len();
-    let pose = if in_dwell && !in_bounce && !cfg.reduced_motion {
-        CatIdlePose::breathing(td, occ.genome.gkey, geom.cell_h)
-    } else {
-        CatIdlePose::STILL
-    };
     debug_assert_eq!(tile.art.w(), g.w, "the peek tile is the design box");
-    push_cat_free(free, tile.art, g.x, top, bottom, skip, pose, fp);
+    let (x, y) = peek_origin(g.x, top, timing, occ.genome.gkey, geom.cell_h);
+    push_cat_free(free, tile.art, x, y, y + (bottom - top), alpha, fp);
     if free.len() > n_free {
         Some((top, bottom))
     } else {
@@ -9141,6 +9447,10 @@ mod dog_cameo_emission_tests;
 #[cfg(test)]
 #[path = "word_decorations_trick_flash_hook_tests.rs"]
 mod trick_flash_hook_tests;
+
+#[cfg(test)]
+#[path = "word_decorations_glide_tests.rs"]
+mod glide_tests;
 
 #[cfg(test)]
 #[path = "nova_host_conformance_tests.rs"]

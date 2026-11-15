@@ -302,6 +302,7 @@ fn pet_mode_summons_exit_plain() {
         bob: 0.0,
         sing: 0.4,
         pose: CatPose::STILL,
+        body: crate::kitty_cursor::CursorBody::Head,
     };
     for rolled in [CatExit::StarWink, CatExit::HeartMeow, CatExit::Plain] {
         let mut f = frame(rolled);

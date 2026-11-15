@@ -188,6 +188,28 @@ impl RepairObservation {
     pub const fn cause(&self) -> Option<RepairCause> {
         self.outcome.cause()
     }
+
+    /// Whether this attempt exchanged its table and brought nothing: it completed, deferred no
+    /// record, and this side took none of the table's from the peer. As the attempt read it,
+    /// the peer then held nothing of that table that this side lacked.
+    #[must_use]
+    pub fn left_nothing(&self) -> bool {
+        self.outcome == RepairOutcome::Exchanged
+            && !self.received.is_some_and(|n| n > 0)
+            && !self.deferred.is_some_and(|n| n > 0)
+    }
+
+    /// Whether this attempt says anything of what the peer held of its table: it exchanged the
+    /// table or deferred, or took or deferred a record before it ended. One that failed or was
+    /// stopped with neither says nothing: what the peer holds is as unknown as before it.
+    #[must_use]
+    pub fn spoke(&self) -> bool {
+        matches!(
+            self.outcome,
+            RepairOutcome::Exchanged | RepairOutcome::Deferred(_)
+        ) || self.received.is_some_and(|n| n > 0)
+            || self.deferred.is_some_and(|n| n > 0)
+    }
 }
 
 /// Closed vocabulary for repair refusals; never contains wire or filesystem data.
@@ -257,9 +279,20 @@ impl RepairCause {
 /// How long a network publication stays current, and the shortest time a contact keeps its
 /// peer Reachable, in milliseconds.
 pub const REACHABLE_MS: u64 = 15_000;
-/// The longest time a contact keeps its peer Reachable, in milliseconds, however slowly its
-/// observer reaches it.
-pub const LEASE_MAX_MS: u64 = 120_000;
+/// The longest time a contact keeps its peer Reachable, in milliseconds, whatever lease its
+/// observer gives it: a ceiling on every reading, which honours no longer one. It is not the
+/// lease an observer gives. That is the time within which its dial scheduler promises the
+/// contact's peer its next round, and an observer's local relay carries a lease only up to the
+/// bound of the version it writes.
+pub const LEASE_MAX_MS: u64 = 660_000;
+/// The most a contact keeps of its lease, in milliseconds, once what promised it no longer
+/// stands. Where its observer's network changed, the Mac woke or its dial scheduler ended with
+/// none to follow it at once, this is counted from the contact: a peer contacted longer ago than
+/// this reads LastSeen from then until it is contacted again, so a reader that waits for a peer
+/// to be heard after this long with none hears a contact made since, never one from before.
+/// Where the scheduler started over at once, it is counted from then, and the new scheduler
+/// reaches every peer again within it.
+pub const CURTAILED_MS: u64 = 120_000;
 
 /// One retained authenticated machine, in stable first-observed slot order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,10 +313,11 @@ pub struct PeerObservation {
     pub last_authenticated_endpoint: Option<AuthenticatedEndpoint>,
     /// Current local evidence, never inferred from replayed contact.
     pub reachability: Reachability,
-    /// How long after its latest contact a Reachable claim holds, in milliseconds, as the
-    /// observer measured this peer's contact period; `None` reads as [`REACHABLE_MS`]
-    /// ([`Self::reachable_for_ms`]). Evidence of the observing process's current lifetime:
-    /// present only on a Reachable peer of a live publication, never stored in history.
+    /// How long after its latest contact a Reachable claim holds, in milliseconds: the time
+    /// within which the observer's dial scheduler promised that contact its next round with this
+    /// peer, less what a departure or a change of network took back; `None` reads as
+    /// [`REACHABLE_MS`] ([`Self::reachable_for_ms`]). Evidence of the observing process's current
+    /// lifetime: present only on a Reachable peer of a live publication, never stored in history.
     pub lease_ms: Option<u64>,
     /// Absent until authenticated per-process descriptors exist.
     pub instances: Option<usize>,
@@ -293,7 +327,7 @@ pub struct PeerObservation {
 
 impl PeerObservation {
     /// How long after its latest contact this peer's Reachable claim holds: the lease its
-    /// observer measured, within [`REACHABLE_MS`] and [`LEASE_MAX_MS`], else [`REACHABLE_MS`].
+    /// observer gave it, within [`REACHABLE_MS`] and [`LEASE_MAX_MS`], else [`REACHABLE_MS`].
     #[must_use]
     pub fn reachable_for_ms(&self) -> u64 {
         self.lease_ms.map_or(REACHABLE_MS, |lease| {
@@ -342,6 +376,14 @@ pub struct NetworkObservation {
     pub via_local_process: Option<u32>,
     /// Local authenticated identity if available.
     pub observer: Option<MachineIdentity>,
+    /// Since when (milliseconds since Unix epoch) this live observation's observer has listened
+    /// for its peers without a break: discovery Active, this Mac's own identity confirmed and
+    /// every authenticated contact taken, each observation following the one before within
+    /// [`REACHABLE_MS`] on both its wall and its monotonic clock. A peer last heard before then
+    /// has been unheard only since then. None where it does not listen, and for every history
+    /// read: a restored history, a wake from sleep and any other break begin it again. Never
+    /// persisted.
+    pub listening_since_ms: Option<u64>,
     /// Discovery availability, independent of history and service access.
     pub visibility: Visibility,
     /// Retained-history read health.
@@ -356,6 +398,15 @@ pub struct NetworkObservation {
     pub retention_limited: bool,
     /// Most recent admitted matching-ID exchange; retained history only.
     pub accounts_exchange: Option<AccountsExchangeObservation>,
+    /// The latest repair attempt over the lab's catalog, with any peer, that said something of
+    /// it ([`RepairObservation::spoke`]): kept through the attempts over other tables, and the
+    /// ones over the catalog that failed with nothing, that follow it. Each attempt repairs one
+    /// table, so a peer's latest ([`PeerObservation::last_repair`]) is seldom over the catalog;
+    /// a reader that asks what the lab last said of the catalog finds it here. One attempt and
+    /// not one a peer: the record and the live frame are bounded, and a full roster of peers
+    /// leaves no room for a second attempt each. Retained metadata with its original
+    /// timestamp; it names no peer and says nothing of reachability.
+    pub last_catalog_repair: Option<RepairObservation>,
 }
 
 /// Local access to one shared service, independent of network reachability.

@@ -86,18 +86,13 @@ fn retained_helper() -> std::result::Result<AghHelper, String> {
     })
 }
 
-/// [`retained_helper`] as [`fetch_source`] asks for it, whatever list it is judged with.
-fn mounted(_removed: &[String]) -> std::result::Result<AghHelper, String> {
-    retained_helper()
-}
-
 /// The staging repository every routing test fetches.
 const STAGING: &str = "fixture-dev/claude-code-alab";
 
 /// A machine under a scratch root, with agh-fake standing in for GitHub behind `base` (the
 /// production client's shape before routing). [`Machine::vault`] is a vault-adopted one: no
-/// agh.toml, and `~/.secrets/gh_access_token` holding a token agh-fake answers `GET /user` for
-/// as `fixture-dev`, whose login no agh call has recorded yet.
+/// agh.toml, and the vault entry `gh_access_token` holding a token agh-fake answers `GET /user`
+/// for as `fixture-dev`, whose login no agh call has recorded yet.
 struct Machine {
     root: aterm_tempfile::TempDir,
     dirs: agh::config::Dirs,
@@ -143,12 +138,11 @@ impl Machine {
         let machine = Self::new();
         let token = agh_fake::token("harness-dev");
         machine.fake.add_token(&token, "fixture-dev");
-        let secrets = machine.dirs.home.join(".secrets");
-        aterm_uds::private_file::create_private_dir(&secrets).expect("the vault");
-        let file = agh::identity::vault::Slot::Dev.path(&machine.dirs.home);
-        let name = file.file_name().expect("the vault file").to_string_lossy();
-        aterm_uds::private_file::write_private(&secrets, &name, token.as_bytes())
-            .expect("the vault token");
+        agh::identity::vault::put_entry_for_tests(
+            &machine.dirs.home,
+            agh::identity::vault::Slot::Dev.entry(),
+            Some(token.as_bytes()),
+        );
         machine
     }
 
@@ -165,32 +159,22 @@ impl Machine {
     }
 
     /// The production wiring under `agh_helper` ([`fetch_helper`]) for [`STAGING`] over this
-    /// machine, in `inner` holding `names` (so a fetch removes [`source_git_removals_from`]
-    /// them), and how often it asked `helper()`.
+    /// machine, and how often it asked `helper()`.
     fn fetch(
         &self,
-        inner: &agh::identity::MapEnv,
-        names: &[&str],
         helper: &dyn Fn() -> std::result::Result<String, String>,
     ) -> (std::result::Result<AghHelper, String>, usize) {
         let slug = agh::Slug::parse(STAGING).expect("the slug");
         let asked = Cell::new(0);
-        let fetched = fetch_helper(
-            &self.dirs,
-            &self.base,
-            inner,
-            &source_git_removals_from(names.iter().map(OsString::from)),
-            &slug,
-            &|| {
-                asked.set(asked.get() + 1);
-                helper()
-            },
-        );
+        let fetched = fetch_helper(&self.dirs, &self.base, &slug, &|| {
+            asked.set(asked.get() + 1);
+            helper()
+        });
         (fetched, asked.get())
     }
 
     /// `routed_helper` for `slug` over this machine with `learn` in place of the production
-    /// learn step, in an empty environment, and how often it asked the helper.
+    /// learn step, and how often it asked the helper.
     fn route_with(
         &self,
         slug: &str,
@@ -198,8 +182,7 @@ impl Machine {
     ) -> (std::result::Result<AghHelper, String>, usize) {
         let slug = agh::Slug::parse(slug).expect("the slug");
         let asked = Cell::new(0);
-        let env = agh::identity::MapEnv::new();
-        let routed = routed_helper(&self.dirs, &env, &slug, learn, &|| {
+        let routed = routed_helper(&self.dirs, &slug, learn, &|| {
             asked.set(asked.get() + 1);
             retained_command()
         });
@@ -236,9 +219,7 @@ impl Machine {
 #[test]
 fn a_vault_login_agh_has_not_recorded_is_learned_before_the_fetch_names_the_helper() {
     let vault = Machine::vault();
-    let (unlearned, _) = vault.route_with(STAGING, &|dirs| {
-        agh::routing::view_for_host(dirs, &agh::identity::MapEnv::new())
-    });
+    let (unlearned, _) = vault.route_with(STAGING, &|dirs| agh::routing::view_for_host(dirs));
     let why = unlearned.expect_err("an unrecorded login refuses");
     assert!(
         why.contains("agh routes fixture-dev/claude-code-alab with no identity"),
@@ -246,8 +227,7 @@ fn a_vault_login_agh_has_not_recorded_is_learned_before_the_fetch_names_the_help
     );
     assert_eq!(vault.user_calls(), 0, "a view learns nothing");
     assert!(!vault.recorded(), "a view records nothing");
-    let none = agh::identity::MapEnv::new();
-    let (learned, asked) = vault.fetch(&none, &[], &retained_command);
+    let (learned, asked) = vault.fetch(&retained_command);
     assert_eq!(
         learned,
         retained_helper(),
@@ -256,11 +236,9 @@ fn a_vault_login_agh_has_not_recorded_is_learned_before_the_fetch_names_the_help
     assert_eq!(asked, 1);
     assert_eq!(vault.user_calls(), 1, "one GET /user learns the login");
     assert!(vault.recorded(), "the learned login is recorded");
-    let (recorded, _) = vault.route_with(STAGING, &|dirs| {
-        agh::routing::view_for_host(dirs, &agh::identity::MapEnv::new())
-    });
+    let (recorded, _) = vault.route_with(STAGING, &|dirs| agh::routing::view_for_host(dirs));
     assert_eq!(recorded, retained_helper(), "the helper reads the record");
-    let (again, _) = vault.fetch(&none, &[], &retained_command);
+    let (again, _) = vault.fetch(&retained_command);
     assert_eq!(again, retained_helper());
     assert_eq!(
         vault.user_calls(),
@@ -305,15 +283,7 @@ fn a_learned_login_the_helper_cannot_read_refuses_with_agh_s_reason() {
 fn a_release_tier_fetch_refuses_before_any_request_or_record() {
     let vault = Machine::vault();
     let slug = agh::Slug::parse("alabsystems/claude-code-alab").expect("the slug");
-    let env = agh::identity::MapEnv::new();
-    let refused = fetch_helper(
-        &vault.dirs,
-        &vault.base,
-        &env,
-        &source_git_removals_from(std::iter::empty()),
-        &slug,
-        &retained_command,
-    );
+    let refused = fetch_helper(&vault.dirs, &vault.base, &slug, &retained_command);
     let why = refused.expect_err("release tier refuses");
     assert!(
         why.contains("alabsystems/claude-code-alab is release tier"),
@@ -333,7 +303,7 @@ fn an_unnamed_helper_refuses_before_any_request_or_record() {
     let unnamed = || -> std::result::Result<String, String> {
         Err("recorded image custody is unavailable".into())
     };
-    let (refused, asked) = vault.fetch(&agh::identity::MapEnv::new(), &[], &unnamed);
+    let (refused, asked) = vault.fetch(&unnamed);
     assert_eq!(
         refused,
         Err("recorded image custody is unavailable".to_string())
@@ -354,7 +324,7 @@ fn a_login_github_cannot_be_reached_for_is_named_in_the_refusal() {
     vault
         .fake
         .fault_always(agh_fake::Match::api("/user"), agh_fake::Fault::Close);
-    let (refused, _) = vault.fetch(&agh::identity::MapEnv::new(), &[], &retained_command);
+    let (refused, _) = vault.fetch(&retained_command);
     let why = refused.expect_err("an unlearned login refuses");
     assert!(
         why.contains("agh routes fixture-dev/claude-code-alab with no identity"),
@@ -364,43 +334,6 @@ fn a_login_github_cannot_be_reached_for_is_named_in_the_refusal() {
     assert!(why.contains("was not adopted"), "{why}");
     assert!(vault.user_calls() >= 1, "GitHub was asked");
     assert!(!vault.recorded(), "nothing was learned to record");
-}
-
-/// The agh.toml rows of an `env` profile, `{var}` its variable, which alone reads the staging
-/// owner.
-const ENV_PROFILE: &str = "[profiles.ci]\nenv = \"{var}\"\ntier = \"dev\"\n\n\
-     [[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = [\"ci\"]\n";
-
-/// An agh.toml profile whose `env` names a variable the fetch removes (`GH_TOKEN` always, a
-/// `GH_*` name the environment holds) is absent to the check, as it is to the helper git
-/// starts, so the fetch refuses; one whose variable the fetch keeps answers. The check judges
-/// the fetch's own environment, the caller's `inner` without the fetch's removals.
-/// NEGATIVE CONTROL: `inner` itself in place of `FetchEnv` (or a `FetchEnv` that removes
-/// nothing) answers the `GH_*` profiles; `ProcessEnv` in place of `inner` refuses the kept one.
-#[cfg(unix)]
-#[test]
-fn an_agh_toml_profile_is_judged_in_the_fetch_s_own_environment() {
-    let token = agh_fake::token("harness-ci");
-    for (var, answers) in [
-        ("GH_TOKEN", false),
-        ("GH_FIXTURE_TOKEN", false),
-        ("HARNESS_FIXTURE_TOKEN", true),
-    ] {
-        let machine = Machine::new();
-        machine.agh_toml(&ENV_PROFILE.replace("{var}", var));
-        let inner = agh::identity::MapEnv::new().with(var, &token);
-        let (fetched, _) = machine.fetch(&inner, &[var], &retained_command);
-        if answers {
-            assert_eq!(fetched, retained_helper(), "{var}");
-        } else {
-            let why = fetched.expect_err("a removed variable reads as absent");
-            assert!(
-                why.contains("no profile in fixture-dev's read chain is present"),
-                "{var}: {why}"
-            );
-        }
-        assert_eq!(machine.user_calls(), 0, "agh.toml alone routes");
-    }
 }
 
 /// The agh.toml of a `legacy_loose` profile (design §6.6, M2 only) whose token file has a
@@ -428,7 +361,7 @@ fn a_legacy_loose_profile_is_routed_and_checked_loose_as_the_host_reads_it() {
     let file = tokens.join("ci.token");
     std::fs::write(&file, agh_fake::token("harness-loose")).expect("the token file");
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-    let (fetched, _) = machine.fetch(&agh::identity::MapEnv::new(), &[], &retained_command);
+    let (fetched, _) = machine.fetch(&retained_command);
     assert_eq!(
         fetched,
         retained_command().map(|command| AghHelper {
@@ -444,11 +377,10 @@ fn a_legacy_loose_profile_is_routed_and_checked_loose_as_the_host_reads_it() {
     );
 }
 
-/// The fetch's environment, as the helper sees it, lacks each name the fetch removes, so a
-/// profile whose `env` names one is absent to the check as it is to the helper; every other
-/// name reads as the caller's environment has it.
+/// The fetch removes each ambient repository, token, TLS and trace selector the environment
+/// holds.
 #[test]
-fn the_fetch_environment_hides_each_removed_name() {
+fn the_fetch_removes_each_ambient_selector() {
     let removed = source_git_removals_from(["GIT_SSL_NO_VERIFY", "GH_FIXTURE"].map(OsString::from));
     for name in [
         "GIT_DIR",
@@ -460,19 +392,6 @@ fn the_fetch_environment_hides_each_removed_name() {
     ] {
         assert!(removed.iter().any(|entry| entry == name), "{name}");
     }
-    let inner = agh::identity::MapEnv::new()
-        .with("PATH", "/fixture/bin")
-        .with("HOME", "/fixture/home");
-    let removed = ["PATH".to_string()];
-    let env = FetchEnv {
-        inner: &inner,
-        removed: &removed,
-    };
-    assert_eq!(agh::identity::EnvSource::var_os(&env, "PATH"), None);
-    assert_eq!(
-        agh::identity::EnvSource::var_os(&env, "HOME"),
-        Some("/fixture/home".into())
-    );
 }
 
 /// The variables the source fetch sets: git and SSH hygiene, nothing else.
@@ -512,7 +431,7 @@ fn https_fetch_mounts_agh_s_helper_alone_and_carries_no_token() {
         &tools,
         &config,
         "https://github.com/fixture/claude-code-alab.git",
-        &mounted,
+        &retained_helper,
     )
     .expect("recorded fetch");
     let calls = tools.calls.borrow();
@@ -576,35 +495,6 @@ fn https_fetch_mounts_agh_s_helper_alone_and_carries_no_token() {
     assert!(run.deadline.is_some());
 }
 
-/// The helper is judged with the very list of names the fetch's git removes: one list, so a
-/// profile whose `env` names a variable the git drops (a `GH_*` name the environment holds,
-/// say) is absent to the check as it is to the helper git starts. NEGATIVE CONTROL: the helper
-/// handed another list (`helper(&[])` in `fetch_source`) fails this test.
-#[test]
-fn the_helper_is_judged_with_the_list_the_fetch_removes() {
-    let dir = aterm_tempfile::TempDir::new().expect("scratch");
-    let config = config(dir.path());
-    let tools = Recording::new(0, "");
-    let judged = RefCell::new(None);
-    fetch_source(
-        &tools,
-        &config,
-        "https://github.com/fixture/claude-code-alab.git",
-        &|removed| {
-            *judged.borrow_mut() = Some(removed.to_vec());
-            retained_helper()
-        },
-    )
-    .expect("recorded fetch");
-    let calls = tools.calls.borrow();
-    let [run] = calls.as_slice() else {
-        panic!("fetch must run exactly once")
-    };
-    let judged = judged.into_inner().expect("the helper was judged");
-    assert!(!judged.is_empty(), "the fetch removes ambient selectors");
-    assert_eq!(judged, run.env_remove);
-}
-
 /// A helper that answers as a `legacy_loose` profile is mounted with `AGH_GIT_LOOSE=1` in the
 /// fetch's environment, set after its removals, so agh's helper reads that profile's token
 /// file loose, as the check judged it; a strict one's fetch sets the hygiene variables alone
@@ -614,7 +504,7 @@ fn a_loose_helper_is_told_so_in_the_fetch_s_environment() {
     let dir = aterm_tempfile::TempDir::new().expect("scratch");
     let config = config(dir.path());
     let tools = Recording::new(0, "");
-    let loose = |_: &[String]| {
+    let loose = || {
         retained_command().map(|command| AghHelper {
             command,
             loose: true,
@@ -645,7 +535,7 @@ fn an_unnamed_helper_starts_no_git_and_fetch_failures_redact_token_shapes() {
     let dir = aterm_tempfile::TempDir::new().expect("scratch");
     let config = config(dir.path());
     let tools = Recording::new(0, "");
-    let unnamed = |_: &[String]| -> std::result::Result<AghHelper, String> {
+    let unnamed = || -> std::result::Result<AghHelper, String> {
         Err("recorded image custody is unavailable".into())
     };
     let refused = fetch_source(
@@ -667,7 +557,7 @@ fn an_unnamed_helper_starts_no_git_and_fetch_failures_redact_token_shapes() {
         &failed,
         &config,
         "https://github.com/fixture/claude-code-alab.git",
-        &mounted,
+        &retained_helper,
     )
     .expect_err("refused fetch")
     .to_string();
@@ -681,7 +571,7 @@ fn ssh_fetch_keeps_batch_mode_and_mounts_no_helper() {
     let dir = aterm_tempfile::TempDir::new().expect("scratch");
     let config = config(dir.path());
     let tools = Recording::new(0, "");
-    let never = |_: &[String]| -> std::result::Result<AghHelper, String> {
+    let never = || -> std::result::Result<AghHelper, String> {
         panic!("an SSH fetch never names a credential helper")
     };
     fetch_source(
@@ -757,7 +647,7 @@ fn the_fetch_pins_tls_over_any_config_that_turns_it_off() {
         ]);
     }
     let tools = Recording::new(0, "");
-    fetch_source(&tools, &config, ORIGIN, &mounted).expect("recorded fetch");
+    fetch_source(&tools, &config, ORIGIN, &retained_helper).expect("recorded fetch");
     let calls = tools.calls.borrow();
     let [run] = calls.as_slice() else {
         panic!("fetch must run exactly once")
@@ -839,7 +729,7 @@ fn a_helper_the_users_config_names_is_never_asked() {
     )
     .expect("the user's config");
     // A stand-in for agh's helper: it answers, and names the path git sent it.
-    let stand_in = |_: &[String]| -> std::result::Result<AghHelper, String> {
+    let stand_in = || -> std::result::Result<AghHelper, String> {
         let command = agh::git::HelperCommand {
             exe: "/bin/sh".into(),
             args: vec![
@@ -1010,7 +900,7 @@ fn the_fetch_never_starts_a_fetch_in_a_populated_submodule() {
         ],
     );
     let tools = Recording::new(0, "");
-    fetch_source(&tools, &config, ORIGIN, &mounted).expect("recorded fetch");
+    fetch_source(&tools, &config, ORIGIN, &retained_helper).expect("recorded fetch");
     let calls = tools.calls.borrow();
     let [run] = calls.as_slice() else {
         panic!("fetch must run exactly once")

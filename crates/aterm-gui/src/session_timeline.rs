@@ -70,7 +70,7 @@ pub(crate) const AUTOPILOT_USAGE: &str =
 /// Normalize an `autopilot` value to its stored word, or `None` when it names no mode.
 #[must_use]
 pub(crate) fn normalize_autopilot_value(value: &str) -> Option<&'static str> {
-    aterm_agent::supervise::Autopilot::parse(value).map(aterm_agent::supervise::Autopilot::word)
+    alab_policy::config::Autopilot::parse(value).map(alab_policy::config::Autopilot::word)
 }
 
 /// True for characters that must never reach chrome from user metadata.
@@ -202,8 +202,8 @@ pub(crate) struct SessionMeta {
     /// Proven scoped actors seen in this session. A later direct peer is recognized only by
     /// its fresh kernel pid AND birth, including after claim release and socket reconnect.
     pub(crate) scoped_input_actors: Vec<crate::self_claim::Proven>,
-    /// The stop a proven self-claim told of its own typing (`meta set harness_held`), with that
-    /// claim's proof: its claimant's own, so it lapses where a wait written under the claim does
+    /// The stop a proven claim told of its own typing (`meta set harness_held`), with that
+    /// claim's act proof ([`SupervisorClaim::act_proof`]): its claimant's own, so it lapses where a wait written under the claim does
     /// ([`Self::set_supervisor`], [`Self::close_connection`]), and at the same proof's next claim
     /// once the claim that told it lapsed by its `ttl=`, and is read only while that claim stands
     /// ([`Self::self_held`]).
@@ -211,15 +211,16 @@ pub(crate) struct SessionMeta {
         crate::self_claim::Proven,
         aterm_agent::harness::acts::HeldBy,
     )>,
-    /// The Land hold a proven self-claim told of its own landing (`meta set harness_land`), on
-    /// the glass with its `since` stamped once, with that claim's proof: kept and lapsing exactly
+    /// The Land hold a proven claim told of its own landing (`meta set harness_land`), on
+    /// the glass with its `since` stamped once, with that claim's act proof: kept and lapsing exactly
     /// as [`Self::claim_held`] is, and read only while that claim stands ([`Self::self_land`]).
     pub(crate) claim_land: Option<(crate::self_claim::Proven, crate::harness_glass::HeldGlass)>,
-    /// The NEEDS YOU sets a proven self-claim told of its own `owner=needs` entry (`meta set
-    /// harness_needs`), told as aterm's own loop's are ([`crate::needs::ToldNeeds::tell`]) but kept
-    /// apart from them, with that claim's proof: kept and lapsing exactly as [`Self::claim_held`]
-    /// is, and read only while that claim stands ([`Self::self_needs`]).
-    pub(crate) claim_needs: Option<(crate::self_claim::Proven, crate::needs::ToldNeeds)>,
+    /// What a proven claim said of its own NEEDS YOU (its `owner=needs` text and its `meta set
+    /// harness_needs` set) and the person's sets told of them as aterm's own loop's are
+    /// ([`crate::needs::ClaimNeeds`]) but kept apart from them, with that claim's act proof: kept
+    /// and lapsing exactly as [`Self::claim_held`] is, and read only while that claim stands
+    /// ([`Self::self_needs`]).
+    pub(crate) claim_needs: Option<(crate::self_claim::Proven, crate::needs::ClaimNeeds)>,
     /// THE FACTS A PROVEN SELF-CLAIM'S ACTS MAY CARRY (`harness fact`, gap 23): which of the
     /// session's measured facts its standing proven codex-alab claim was offered, to which of its
     /// readers, and which it was told. Session-scoped, so it lasts across claims, while each offer
@@ -233,6 +234,13 @@ pub(crate) struct SessionMeta {
     pub(crate) autopilot_set_by: Option<AutopilotSetBy>,
     pub(crate) autopilot_revision: u64,
     pub(crate) driver_writes: u8,
+    /// The session's pin (`pin`, `unpin`): a person's or a lead agent's mark that keeps it first
+    /// among its Mac's agents in the fleet band. A fresh session's is `false`, and a worker's
+    /// stays so whoever spawned it; a restore and an update carry it.
+    pub(crate) pinned: bool,
+    /// Whether `pin` or `unpin` wrote [`Self::pinned`] on this process, so a carried pin grafted
+    /// later does not undo it ([`restore_carried_meta`]).
+    pub(crate) pin_written: bool,
 }
 
 impl PartialEq for SessionMeta {
@@ -264,6 +272,8 @@ impl PartialEq for SessionMeta {
             autopilot_revision: _,
             driver_writes: _,
             continuation_activity: _,
+            pinned,
+            pin_written: _,
         } = self;
         *user_title == other.user_title
             && *description == other.description
@@ -273,6 +283,7 @@ impl PartialEq for SessionMeta {
             && *questions == other.questions
             && *autopilot == other.autopilot
             && *land_at == other.land_at
+            && *pinned == other.pinned
     }
 }
 
@@ -289,12 +300,13 @@ impl SessionMeta {
             || self.attention.is_some()
             || self.questions.is_some()
             || self.autopilot.is_some()
+            || self.pinned
     }
 
     /// The session's Autopilot word, typed ([`Self::autopilot`]).
     #[must_use]
-    pub(crate) fn autopilot_word(&self) -> Option<aterm_agent::supervise::Autopilot> {
-        use aterm_agent::supervise::Autopilot;
+    pub(crate) fn autopilot_word(&self) -> Option<alab_policy::config::Autopilot> {
+        use alab_policy::config::Autopilot;
         let stored = self.autopilot.as_deref()?;
         Autopilot::ALL
             .into_iter()
@@ -398,6 +410,8 @@ impl SessionMeta {
             autopilot_set_by,
             autopilot_revision: 0,
             driver_writes: 0,
+            pinned: self.pinned,
+            pin_written: false,
         }
     }
 
@@ -406,9 +420,8 @@ impl SessionMeta {
     pub(crate) fn carried_autopilot(&self) -> (Option<String>, Option<i64>) {
         (
             self.presentation_value("autopilot"),
-            self.land_at.filter(|_| {
-                self.autopilot_word() == Some(aterm_agent::supervise::Autopilot::Cruise)
-            }),
+            self.land_at
+                .filter(|_| self.autopilot_word() == Some(alab_policy::config::Autopilot::Cruise)),
         )
     }
 
@@ -615,7 +628,9 @@ impl SessionMeta {
     /// [`Self::self_land`], [`Self::self_needs`]), and so does one `claim` does not renew, where
     /// the claim live at `now_us` is not of the proof that told it (its `ttl=` lapsed, the same
     /// process claiming again included, so a stop, a hold or a set its claimant could not lift
-    /// during the lapse never comes back); a proven claim bound to a connection is recorded in
+    /// during the lapse never comes back), each judged by the act proof that told it
+    /// ([`SupervisorClaim::act_proof`]), so a scope that drops `turn-end` lets it go as well; a
+    /// proven claim bound to a connection is recorded in
     /// [`Self::claimant_conn`] until that connection closes, and an unproven claim bound to a
     /// connection clears any earlier proof recorded for that connection. The revision stays where
     /// it was for a renewal in place: `claim` is the claim live at `now_us` again with only its
@@ -760,8 +775,13 @@ impl SessionMeta {
         }
         let keep = claim.as_ref().and_then(SupervisorClaim::identity);
         let lapsed = self.lapse_except(keep);
-        let renewed = self.live_claim(now_us).and_then(SupervisorClaim::identity);
-        let lapses = |told: &crate::self_claim::Proven| Some(told) != keep || Some(told) != renewed;
+        // A stop, a Land hold and a NEEDS YOU set were told under the act proof, so they are kept
+        // only by a claim that writes under that proof again: one whose scope drops `turn-end`
+        // lets them go, and they never come back if it takes `turn-end` again.
+        let keep_acts = claim.as_ref().and_then(SupervisorClaim::act_proof);
+        let renewed = self.live_claim(now_us).and_then(SupervisorClaim::act_proof);
+        let lapses =
+            |told: &crate::self_claim::Proven| Some(told) != keep_acts || Some(told) != renewed;
         let held = self
             .claim_held
             .as_ref()
@@ -829,13 +849,13 @@ impl SessionMeta {
         (self.lapse_under(&proven), held || land || needs)
     }
 
-    /// The stop the proven self-claim live at `now_us` told of its own typing (`meta set
-    /// harness_held`, [`Self::tell_self_held`]): `None` with no such claim, and where the claim
-    /// that told it is not the one standing, whatever is kept.
+    /// The stop the claim live at `now_us` told of its own typing under its act proof (`meta set
+    /// harness_held`, [`Self::tell_self_held`], [`SupervisorClaim::act_proof`]): `None` with no
+    /// such claim, and where the claim that told it is not the one standing, whatever is kept.
     #[must_use]
     pub(crate) fn self_held(&self, now_us: u64) -> Option<aterm_agent::harness::acts::HeldBy> {
         let (told, arm) = self.claim_held.as_ref()?;
-        (self.live_claim(now_us)?.proven.as_ref() == Some(told)).then_some(*arm)
+        (self.live_claim(now_us)?.act_proof() == Some(told)).then_some(*arm)
     }
 
     /// Keep `held` as the stop the proven claim `proven` told (`None`: its typing goes on):
@@ -853,13 +873,13 @@ impl SessionMeta {
         true
     }
 
-    /// The Land hold the proven self-claim live at `now_us` told of its own landing (`meta set
-    /// harness_land`, [`Self::tell_self_land`]): `None` with no such claim, and where the claim
-    /// that told it is not the one standing, whatever is kept.
+    /// The Land hold the claim live at `now_us` told of its own landing under its act proof (`meta
+    /// set harness_land`, [`Self::tell_self_land`], [`SupervisorClaim::act_proof`]): `None` with
+    /// no such claim, and where the claim that told it is not the one standing, whatever is kept.
     #[must_use]
     pub(crate) fn self_land(&self, now_us: u64) -> Option<crate::harness_glass::HeldGlass> {
         let (told, hold) = self.claim_land.as_ref()?;
-        (self.live_claim(now_us)?.proven.as_ref() == Some(told)).then_some(*hold)
+        (self.live_claim(now_us)?.act_proof() == Some(told)).then_some(*hold)
     }
 
     /// Keep `held` as the Land hold the proven claim `proven` told (`None`: it holds no landing),
@@ -891,65 +911,106 @@ impl SessionMeta {
         true
     }
 
-    /// THE NEEDS YOU SETS A PROVEN SELF-CLAIM TOLD OF ITS OWN ENTRY, read only while it stands
-    /// (`meta set harness_needs`, [`Self::tell_self_needs`]): where the claim live at `now_us` is
-    /// a proven self-claim (codex-alab's, which aterm's own harness never holds), what that claim
-    /// told, empty where it told none, so a set aterm's own loop left on the timeline is never
-    /// read in its place; `None` where no such claim stands (none, an unproven or a rostered
-    /// harness's claim, one past its `ttl=`), and a reader then reads aterm's own
-    /// ([`crate::needs::told_of`]).
+    /// THE NEEDS YOU SETS A PROVEN CLAIM TOLD OF ITS OWN ENTRY, read only while it stands (`meta
+    /// set harness_needs`, [`Self::tell_self_needs`]): where the claim live at `now_us` has an act
+    /// proof ([`SupervisorClaim::act_proof`]: a proven codex-alab self-claim, which aterm's own
+    /// harness never holds, or a rostered harness's proven claim whose scope names `turn-end`,
+    /// the duty NEEDS YOU belongs to), what that claim told, empty where it told none, so a set
+    /// aterm's own loop left on the timeline is never read in its place; `None` where no such
+    /// claim stands (none, an unproven claim, a rostered harness's claim without `turn-end`, one
+    /// past its `ttl=`), and a reader then reads aterm's own ([`crate::needs::told_of`]).
     #[must_use]
     pub(crate) fn self_needs(&self, now_us: u64) -> Option<crate::needs::ToldNeeds> {
-        let standing = self.live_claim(now_us)?.proven.as_ref()?;
+        let standing = self.live_claim(now_us)?.act_proof()?;
         Some(
             self.claim_needs
                 .as_ref()
                 .filter(|(told, _)| told == standing)
-                .map(|(_, needs)| needs.clone())
+                .map(|(_, needs)| needs.told.clone())
                 .unwrap_or_default(),
         )
     }
 
+    /// The claim `proven`'s needs record, a new one where it kept none or another proof's.
+    fn claim_needs_of(&mut self, proven: &crate::self_claim::Proven) -> crate::needs::ClaimNeeds {
+        match self.claim_needs.take() {
+            Some((by, needs)) if by == *proven => needs,
+            _ => crate::needs::ClaimNeeds::default(),
+        }
+    }
+
+    /// Keep `needs` as the claim `proven`'s, or nothing where it holds nothing.
+    fn keep_claim_needs(
+        &mut self,
+        proven: &crate::self_claim::Proven,
+        needs: crate::needs::ClaimNeeds,
+    ) {
+        self.claim_needs =
+            (needs != crate::needs::ClaimNeeds::default()).then(|| (proven.clone(), needs));
+    }
+
     /// Tell `told` as the NEEDS YOU set the proven claim `proven` told of its own `owner=needs`
-    /// entry (`None`: it took the entry down), as aterm's own loop's set is told
-    /// ([`crate::needs::ToldNeeds::tell`] beside that entry as stored now: a set told before its
-    /// entry stands waits for it, and the outgoing one keeps describing the entry it was told
-    /// with while that entry stands, [`Self::settle_self_needs`]): whether what a reader reads
-    /// beside the standing entry moved.
+    /// entry (`None`: it took the entry down), its credential lines off and the person's set told
+    /// as aterm's own loop's is ([`crate::needs::ClaimNeeds::tell`]: [`crate::needs::ToldNeeds::tell`]
+    /// beside that entry as stored now, so a set told before its entry stands waits for it, and
+    /// the outgoing one keeps describing the entry it was told with while that entry stands,
+    /// [`Self::settle_self_needs`]): whether what a reader reads beside the standing entry moved,
+    /// the credential lines taken off, and the `owner=needs` entry aterm stands in place of the
+    /// claimant's where it moves (`Some(None)`: taken down).
     pub(crate) fn tell_self_needs(
         &mut self,
         proven: &crate::self_claim::Proven,
-        told: Option<Arc<crate::needs::HarnessNeeds>>,
-    ) -> bool {
-        let mut kept = match self.claim_needs.take() {
-            Some((by, needs)) if by == *proven => needs,
-            _ => crate::needs::ToldNeeds::default(),
-        };
+        told: Option<crate::needs::HarnessNeeds>,
+    ) -> (bool, Vec<String>, Option<Option<String>>) {
+        let mut kept = self.claim_needs_of(proven);
         let standing = self
             .attention_owners
             .get(crate::harness_host::NEEDS_ATTENTION_OWNER);
-        let moved = kept.tell(told, standing);
-        self.claim_needs =
-            (kept != crate::needs::ToldNeeds::default()).then(|| (proven.clone(), kept));
-        moved
+        let told = kept.tell(told, standing);
+        self.keep_claim_needs(proven, kept);
+        told
+    }
+
+    /// THE `owner=needs` TEXT `said` (`None`: taken down), written on connection `conn`: the entry
+    /// that stands for it ([`crate::needs::entry_for`]). Where `conn` is bound to the claim live at
+    /// `now_us` under its act proof ([`SupervisorClaim::act_proof`]), it is that claimant's own words, kept with its set
+    /// ([`crate::needs::ClaimNeeds::say`]) and read against it; any other writer tells no set.
+    pub(crate) fn say_needs_entry(
+        &mut self,
+        conn: Option<u64>,
+        now_us: u64,
+        said: Option<String>,
+    ) -> Option<String> {
+        let live = self.live_claim(now_us).and_then(SupervisorClaim::act_proof);
+        let Some(proven) = self
+            .claimant_on(conn)
+            .filter(|on| Some(*on) == live)
+            .cloned()
+        else {
+            return crate::needs::entry_for(said.as_deref(), None);
+        };
+        let mut kept = self.claim_needs_of(&proven);
+        let shown = kept.say(said);
+        self.keep_claim_needs(&proven, kept);
+        shown
     }
 
     /// THE SELF-CLAIM'S OUTGOING SET GOES WITH THE ENTRY IT DESCRIBED: settle [`Self::claim_needs`]
     /// against the `owner=needs` entry as stored now ([`crate::needs::ToldNeeds::settle`]), so an
     /// entry taken down, or replaced by one the outgoing set does not describe, takes that set,
     /// and the same text set again before the claimant's next tell reads its entry's own words,
-    /// never a set it took down; a set kept for nothing is dropped.
+    /// never a set it took down; a record kept for nothing is dropped.
     fn settle_self_needs(&mut self) {
         let standing = self
             .attention_owners
             .get(crate::harness_host::NEEDS_ATTENTION_OWNER);
         if let Some((_, needs)) = self.claim_needs.as_mut() {
-            needs.settle(standing);
+            needs.told.settle(standing);
         }
         if self
             .claim_needs
             .as_ref()
-            .is_some_and(|(_, needs)| *needs == crate::needs::ToldNeeds::default())
+            .is_some_and(|(_, needs)| *needs == crate::needs::ClaimNeeds::default())
         {
             self.claim_needs = None;
         }
@@ -1106,7 +1167,7 @@ impl SessionMeta {
     pub(crate) fn set_autopilot(&mut self, word: Option<String>, land_at: Option<i64>) -> bool {
         let word = word.and_then(|value| sanitize_metadata_value("autopilot", &value));
         let cruise = word.as_deref().and_then(normalize_autopilot_value)
-            == Some(aterm_agent::supervise::Autopilot::Cruise.word());
+            == Some(alab_policy::config::Autopilot::Cruise.word());
         let land_at = land_at.filter(|_| cruise);
         let changed = self.autopilot != word || self.land_at != land_at;
         self.autopilot = word;
@@ -1935,6 +1996,21 @@ impl SupervisorClaim {
         self.identity().is_some()
     }
 
+    /// THE PROOF UNDER WHICH THIS CLAIM WRITES ITS OWN ACTS, stop, Land hold and NEEDS YOU (`meta
+    /// set harness_act`, `harness_held`, `harness_land`, `harness_needs`, `harness_activity`): a
+    /// proven claim's [`Self::identity`] where it [takes](Self::takes) `turn-end`, the duty those
+    /// writes report on. codex-alab's v2 self-claim takes every duty, so its proof is the one it
+    /// always was; a proven v3 claim's is its scoped proof only where its scope names `turn-end`
+    /// (`relaunch,upgrade` writes none); an unproven claim has none. The writers admit under it
+    /// (`control_session::self_claim_write`, `cmd_meta_harness_act_with_clock`) and the readers
+    /// read what it told ([`SessionMeta::self_held`], [`SessionMeta::self_land`],
+    /// [`SessionMeta::self_needs`]), so a write is read exactly where it was admitted.
+    #[must_use]
+    pub(crate) fn act_proof(&self) -> Option<&crate::self_claim::Proven> {
+        self.identity()
+            .filter(|_| self.takes(aterm_agent::harness::contract::Scope::TurnEnd))
+    }
+
     /// Whether `next` is this claim again with only its `ttl=` lease moved: the same holder,
     /// connection, proof and scoped claim (its scopes and versions), so it names no new authority
     /// ([`SessionMeta::set_supervisor`]).
@@ -2283,7 +2359,7 @@ pub(crate) enum Fired {
 /// The fire is a compare-and-set (§9.3.6, item 5): it lands only while the stored pair is Cruise
 /// at `expected_ms` and the wall has reached it.
 pub(crate) fn fire_land_at(ctx: &crate::SessionCtx, expected_ms: i64, wall_ms: i64) -> Fired {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let ours =
         meta.autopilot_word() == Some(Autopilot::Cruise) && meta.land_at == Some(expected_ms);
@@ -2313,7 +2389,7 @@ pub(crate) fn cancel_land_at(
     ctx: &crate::SessionCtx,
     surface: crate::autopilot::Surface,
 ) -> AutopilotWrite {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let armed = meta.autopilot_word() == Some(Autopilot::Cruise) && meta.land_at.is_some();
     if !armed {
@@ -3367,6 +3443,31 @@ pub(crate) const CWD_CHANGE: &str = "cwd-change";
 /// The supervisor key's wire name, as its `meta-change` names it.
 pub(crate) const SUPERVISOR_FIELD: &str = "supervisor";
 
+/// The pin's wire name, as its `meta-change` names it (`pin`, `unpin`).
+pub(crate) const PINNED_FIELD: &str = "pinned";
+
+/// A pin as its `meta-change` says it: `1` pinned, none unpinned.
+pub(crate) const fn pin_value(pinned: bool) -> Option<&'static str> {
+    if pinned { Some("1") } else { None }
+}
+
+/// Pin (or with `pinned` false, unpin) `ctx`'s session, written by `by`; whether it moved. A pin
+/// on a pinned session, or an unpin on an unpinned one, changes nothing and records nothing.
+pub(crate) fn set_pinned(ctx: &crate::SessionCtx, pinned: bool, by: aterm_slog::Actor) -> bool {
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    meta.pin_written = true;
+    if meta.pinned == pinned {
+        return false;
+    }
+    meta.pinned = pinned;
+    record_meta(
+        ctx,
+        MetaChange::written_by(PINNED_FIELD, pin_value(pinned), by),
+        &meta,
+    );
+    true
+}
+
 /// One `meta-change`'s typed facts as its writer knows them, for the session log's mark
 /// ([`SessionTimeline::record_meta_change`]).
 #[derive(Clone, Copy, Debug)]
@@ -3502,6 +3603,16 @@ pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMet
         }
         moved = true;
         let change = MetaChange::written_by(name, meta.get(name), aterm_slog::Actor::Aterm);
+        record_meta(ctx, change, &meta);
+    }
+    if !meta.pin_written && meta.pinned != carried.pinned {
+        meta.pinned = carried.pinned;
+        moved = true;
+        let change = MetaChange::written_by(
+            PINNED_FIELD,
+            pin_value(meta.pinned),
+            aterm_slog::Actor::Aterm,
+        );
         record_meta(ctx, change, &meta);
     }
     drop(meta);
@@ -3740,6 +3851,9 @@ pub(crate) struct SessionTimeline {
     /// ([`crate::survey::WordsRead`]): what a worker's last topic post is newer than, or not, where
     /// the word's row carries no time ([`crate::survey::last_words`]).
     words_read: crate::survey::WordsRead,
+    /// The conversation whose whole token counters this timeline last sent on a survey row, and
+    /// since when (Unix ms) it has sent them unbroken ([`Self::token_epoch`]).
+    token_epoch: Option<(String, u64)>,
     /// The background terminals codex-alab's own record counts for the codex process in group `.0`
     /// ([`Self::set_codex_terminals`]).
     codex_terminals: Option<(i32, u32)>,
@@ -5093,6 +5207,14 @@ impl SessionTimeline {
         }
     }
 
+    /// Name the task's first line on its record ([`crate::task_record::TaskRecord::line`]), where
+    /// a record exists. Moves no rev: no waiter reads it.
+    pub(crate) fn set_task_line(&mut self, line: Option<String>) {
+        if let Some(task) = self.task.as_mut() {
+            task.line = line;
+        }
+    }
+
     /// The Mac the task's manager runs on, where that is another Mac
     /// ([`crate::task_record::TaskRecord::manager_node`]).
     pub(crate) fn set_task_manager_node(&mut self, node: Option<String>) {
@@ -5979,6 +6101,38 @@ impl SessionTimeline {
         self.words_read
     }
 
+    /// SINCE WHEN THE ROW'S TOKEN COUNTERS HAVE COUNTED `conversation` UNBROKEN (a survey row's
+    /// `tok_for_ms`, as Unix ms): the first `now_ms` this timeline sent whole counters for it.
+    /// Counters that are not whole (`whole == false`) clear it, and another conversation (a new
+    /// one, or the same one in a restarted process: its key names the process) starts it again,
+    /// so an observer never takes a rate across a restart's catch-up or a resumed conversation.
+    /// `None` while not whole. An unread clock (`now_ms == 0`, the survey's word for it) starts
+    /// no epoch: a start of 0 would outlive it, and every later row would say the counters had
+    /// counted since 1970. Its conversation's epoch then starts at the first read clock, which
+    /// is later than the truth and never earlier.
+    pub(crate) fn token_epoch(
+        &mut self,
+        conversation: &str,
+        whole: bool,
+        now_ms: u64,
+    ) -> Option<u64> {
+        if !whole {
+            self.token_epoch = None;
+            return None;
+        }
+        match &self.token_epoch {
+            Some((held, since)) if held == conversation => Some(*since),
+            _ if now_ms == 0 => {
+                self.token_epoch = None;
+                None
+            }
+            _ => {
+                self.token_epoch = Some((conversation.to_owned(), now_ms));
+                Some(now_ms)
+            }
+        }
+    }
+
     /// The survey's excerpts for the current foreground group, or `None` when the program in front
     /// is not the one they were read for.
     pub(crate) fn claude_excerpts(&self) -> Option<&crate::survey::ClaudeExcerpts> {
@@ -6661,20 +6815,28 @@ impl SessionTimeline {
         awake_s: u64,
     ) -> (&'static str, String) {
         let (path, evidence) = path_columns(mark, self.path_reading());
-        let upgrade = self.upgrade.as_ref().map_or_else(
+        (
+            path,
+            format!(
+                "path_evidence={evidence} copy={} upgrade={}",
+                self.copy().unwrap_or("-"),
+                self.upgrade_column(now_s, awake_s)
+            ),
+        )
+    }
+
+    /// The one `upgrade=` word `status`, roster rows and the survey's session rows carry: the
+    /// live-upgrade row the host last sent, judged again at `now_s` against the awake-clock
+    /// reading `awake_s` (`<state>/<to>/<why>/<age>`,
+    /// [`aterm_agent::harness::upgrade_drive::Row::column`]), `-` where it sent none.
+    pub(crate) fn upgrade_column(&self, now_s: u64, awake_s: u64) -> String {
+        self.upgrade.as_ref().map_or_else(
             || "-".to_string(),
             |(row, _)| {
                 let mut row = row.clone();
                 row.reread_with_awake(now_s, awake_s);
                 row.column(now_s)
             },
-        );
-        (
-            path,
-            format!(
-                "path_evidence={evidence} copy={} upgrade={upgrade}",
-                self.copy().unwrap_or("-")
-            ),
         )
     }
 }

@@ -18,7 +18,7 @@ use super::*;
 use crate::supervise::config::Approve;
 use crate::supervise::policy::approval::{ApprovalCtx, decide};
 use crate::supervise::policy::turn_end::TurnEndReading;
-use aterm_phase::wall::WallKind;
+use alab_policy::vocab::WallKind;
 
 /// Every measured picker as it opens, its focus on the subscription's row: 2.1.303's, then
 /// 2.1.310's, the fullscreen renderer's bottom panel last, as it first opens (Claude Code's
@@ -114,7 +114,7 @@ fn the_approval_policy_answers_no_login_picker() {
     let opening_rows = screen(LOGIN_OPENING);
     assert!(dialog_stands(&opening_rows));
     let opening = TurnEndReading {
-        phase: crate::supervise::phase::Phase::Busy,
+        phase: alab_policy::vocab::Phase::Busy,
         ..TurnEndReading::of(
             &aterm_phase::read(Some("claude"), &opening_rows, Some(2)),
             &opening_rows,

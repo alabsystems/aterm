@@ -3165,9 +3165,7 @@ pub enum FleetOrigin {
     /// No fleet file and no source: `accounts.toml` is the list, as it was written.
     Roster,
     /// The local fleet projection beside the roster, which explicit add/adopt may edit.
-    /// A legacy copy in `~/.secrets` may still be selected for reads, but is never
-    /// an edit destination. `opt_in` is the word the selected list records
-    /// (the beside file's where it opts in, else the legacy copy's): [`OptIn::Discovered`]
+    /// `opt_in` is the word the selected list records: [`OptIn::Discovered`]
     /// where the list was found on this Mac, from its own logins, profiles and transcripts;
     /// [`OptIn::Named`] where a sync was handed a source (and where discovery wrote it before it
     /// recorded `discovered`); none for a file that opts nothing in, which a sync from init
@@ -3180,10 +3178,10 @@ pub enum FleetOrigin {
     },
     /// `[fleet] accounts_source`, which this machine reads and does not write.
     Key(String),
-    /// A sheet or fleet in `~/.secrets`, unless a recognized legacy copy directs
-    /// edits to its local projection. This machine reads the input without
-    /// modifying it; row contents alone never make it a local edit destination.
-    Vault(PathBuf),
+    /// The vault's pool, fleet roster or sheet, by its entry's name, read in place from this
+    /// Mac's store. This machine reads the input without modifying it; row contents alone never
+    /// make it a local edit destination.
+    Vault(String),
 }
 
 impl FleetOrigin {
@@ -3216,7 +3214,7 @@ impl FleetOrigin {
             Self::Roster | Self::SourcePending(_) => None,
             Self::Local { files, .. } => files.first().map(|f| f.display().to_string()),
             Self::Key(source) => Some(source.clone()),
-            Self::Vault(path) => Some(path.display().to_string()),
+            Self::Vault(name) => Some(crate::vault_entry::source_name(name)),
         }
     }
 
@@ -3245,7 +3243,11 @@ impl FleetOrigin {
                 format!("{source}, which opts nothing in; a sync from `aterm init` reads it")
             }
             Self::Key(_) => format!("`[fleet] accounts_source` ({source})"),
-            Self::Vault(_) => format!("{source}, which this machine reads and does not write"),
+            Self::Vault(name) => {
+                format!(
+                    "the vault's `{name}` ({source}), which this machine reads and does not write"
+                )
+            }
         }
     }
 }
@@ -3281,81 +3283,91 @@ fn fleet_file_beside(roster: &Path) -> Option<PathBuf> {
     roster.parent().map(|dir| dir.join(FLEET_ROSTER_FILE))
 }
 
-/// Recognize a historical generated copy for source precedence. It has a legacy
-/// header ([`FLEET_HEAD_NAMED`] or [`FLEET_HEAD_FOUND`]), the same parsed accounts
-/// as `beside` (comments and opt-in aside), and a readable vault delivery record
-/// that does not list it. This heuristic authenticates no source and grants no
-/// write authority over the copy. Current syncs do not create these copies.
-fn own_secrets_copy(home: &Path, copy: &Path, beside: &Path) -> bool {
-    let (Ok(text), Ok(kept)) = (read_local_source_text(copy), read_local_source_text(beside))
-    else {
-        return false;
-    };
-    let accounts = |text: &str| {
-        FleetRoster::from_toml(text, FLEET_ROSTER_FILE)
-            .ok()
-            .map(|fleet| fleet.accounts)
-    };
-    text.lines()
-        .next()
-        .is_some_and(|head| [FLEET_HEAD_NAMED, FLEET_HEAD_FOUND].contains(&head))
-        && accounts(&text).is_some_and(|listed| accounts(&kept) == Some(listed))
-        && vault_delivered(home).is_some_and(|delivered| !delivered.contains(copy))
+/// A vault entry an account sync reads, as this Mac's store answered for it when it was read
+/// ([`crate::vault_entry`]): a precedence decides on this answer, and the sync that follows reads
+/// this same text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct VaultSource {
+    pub(super) name: String,
+    pub(super) read: crate::vault_entry::Read,
 }
 
-/// Whether `copy`, `home`'s `~/.secrets/fleet-accounts.toml`, is a copy aterm wrote there that a
-/// later word on this machine's list superseded: aterm wrote it (its first line is
-/// [`FLEET_HEAD_NAMED`] or [`FLEET_HEAD_FOUND`]), the vault did not (its readable record of the
-/// files it wrote does not list it, as for [`own_secrets_copy`]), it lists other accounts than
-/// `beside`, the fleet file beside the roster, and `beside` opts in by file and was written after
-/// it, by a sync a person handed a source or by the person's own edit. A sync from init then
-/// reads `beside` and durably retires the preserved copy; a later modification time
-/// cannot reactivate a source once that retirement was committed.
-fn superseded_secrets_copy(home: &Path, copy: &Path, beside: &Path) -> bool {
-    let written = |path: &Path| fs::metadata(path).and_then(|meta| meta.modified()).ok();
-    let accounts = |path: &Path| {
-        let text = read_local_source_text(path).ok()?;
-        let fleet = FleetRoster::from_toml(&text, FLEET_ROSTER_FILE).ok()?;
-        Some((text, fleet.accounts))
-    };
-    let (Some((text, listed)), Some((_, kept))) = (accounts(copy), accounts(beside)) else {
-        return false;
-    };
-    text.lines()
-        .next()
-        .is_some_and(|head| [FLEET_HEAD_NAMED, FLEET_HEAD_FOUND].contains(&head))
-        && listed != kept
-        && fleet_file_opt_in(beside).is_some_and(OptIn::opts_in_by_file)
-        && written(beside)
-            .zip(written(copy))
-            .is_some_and(|(beside_at, copy_at)| beside_at > copy_at)
-        && vault_delivered(home).is_some_and(|delivered| !delivered.contains(copy))
-}
-
-/// The files the vault wrote under `home` ([`aterm_secrets::client::delivered_files`]), `None`
-/// where its record cannot be read. None where no vault runs: it runs on unix alone.
-fn vault_delivered(home: &Path) -> Option<BTreeSet<PathBuf>> {
-    #[cfg(unix)]
-    {
-        aterm_secrets::client::delivered_files(&aterm_secrets::client::Paths::for_home(home)).ok()
+impl VaultSource {
+    /// The entry `name` under `home`, as the store answers now.
+    pub(super) fn read(home: &Path, name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            read: crate::vault_entry::read_text(home, name, SOURCE_TEXT_MAX_BYTES),
+        }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = home;
-        Some(BTreeSet::new())
+
+    /// Whether the entry holds its place in a precedence: present, usable or not. Source
+    /// selection skips an absent entry, never one this Mac cannot read now.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSourcePresence",
+            action = "Primary",
+            project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSourcePresence",
+            action = "Fallback",
+            project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSourcePresence",
+            action = "PrimaryUnavailable",
+            project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "AccountSourcePresence",
+            action = "FallbackUnavailable",
+            project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
+        )
+    )]
+    pub(super) fn occupies(&self) -> bool {
+        self.read.occupies()
+    }
+
+    /// How it prints where a source is named (`vault:<entry>`).
+    pub(super) fn source(&self) -> String {
+        crate::vault_entry::source_name(&self.name)
+    }
+
+    /// Its text.
+    /// # Errors
+    /// The vault holds no such entry for this Mac, or it cannot be read now.
+    pub(super) fn text(&self) -> Result<String, String> {
+        match &self.read {
+            crate::vault_entry::Read::Present(text) => Ok(text.clone()),
+            crate::vault_entry::Read::Absent => {
+                Err(format!("the vault holds no `{}` for this Mac", self.name))
+            }
+            crate::vault_entry::Read::Unavailable(why) => Err(why.clone()),
+        }
     }
 }
 
-/// Whether the sheet at `sheet` gives this machine rows, the machine a sync from init takes them
+/// Whether the vault's `sheet` gives this machine rows, the machine a sync from init takes them
 /// for ([`machine_for`]: an explicit local configuration, else this host's id). An unreadable
 /// or refused sheet counts as giving them, so the sync that reads it says why. Where the lab
 /// names this Mac the sheet is not read ([`sheet_read_here`]) and gives it nothing.
-fn sheet_names_this_machine(config: Option<&Path>, sheet: &Path) -> bool {
+fn sheet_names_this_machine(config: Option<&Path>, sheet: &VaultSource) -> bool {
     if !sheet_read_here() {
         return false;
     }
-    let Ok(fleet) = read_local_source_text(sheet)
-        .map_err(|why| why.to_string())
+    let Ok(fleet) = sheet
+        .text()
         .and_then(|text| parse_accounting_csv(&text, ACCOUNTS_CSV_FILE))
     else {
         return true;
@@ -3585,7 +3597,7 @@ fn init_accounts_assignment_from(
     env: &Env,
     origin: &FleetOrigin,
 ) -> Result<InitAccountsAssignment, String> {
-    let (Some(_), Some(roster)) = (env.home.as_deref(), env.accounts_roster()) else {
+    let (Some(home), Some(roster)) = (env.home.as_deref(), env.accounts_roster()) else {
         return Ok(InitAccountsAssignment::Required);
     };
     match fs::symlink_metadata(&roster) {
@@ -3596,15 +3608,14 @@ fn init_accounts_assignment_from(
     if read_default_profile_email(env).is_some() {
         return Ok(InitAccountsAssignment::Required);
     }
-    let FleetOrigin::Vault(source) = origin else {
+    let FleetOrigin::Vault(name) = origin else {
         return Ok(InitAccountsAssignment::Required);
     };
-    let raw =
-        read_local_source_text(source).map_err(|why| format!("{}: {why}", source.display()))?;
-    let source = source.to_string_lossy();
+    let raw = VaultSource::read(home, name).text()?;
+    let source = crate::vault_entry::source_name(name);
     // A valid shared sheet can serve other pools without a Claude membership column.
     // Parse a column it does name, so malformed input is still an error rather than absence.
-    let fleet = if source.ends_with(ACCOUNTS_CSV_FILE)
+    let fleet = if name == ACCOUNTS_CSV_FILE
         && !csv_names_column(Cli::Claude, &raw)
         && let Some(cli) = OTHER_CLIS
             .into_iter()
@@ -3718,10 +3729,13 @@ fn load_selected_fleet_source(
     } else {
         Err(sheet_refused(&chosen, Cli::Claude))
     }?;
-    // A discovered fleet stays discovery's through every sync of the local file that holds it.
+    // A discovered fleet stays discovery's through every sync of the file or entry that holds it.
     let opt_in = if opt_in == OptIn::Named
         && toml
-        && matches!(fetch_plan(env, &chosen), Ok(FetchPlan::File(_)))
+        && matches!(
+            fetch_plan(env, &chosen),
+            Ok(FetchPlan::File(_) | FetchPlan::Entry(_))
+        )
         && opt_in_of(&raw) == Some(OptIn::Discovered)
     {
         OptIn::Discovered
@@ -4308,42 +4322,10 @@ fn read_local_text_bounded(
         .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))
 }
 
-// Source selection may skip an absent entry, never an unreadable one. When an
-// ancestor is missing, distinguish a normal absent directory from a dangling
-// link or a non-directory obstruction. This probe grants no read/write authority;
-// the bounded reader and publication snapshots still judge what they open.
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "AccountSourcePresence",
-        action = "Primary",
-        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "AccountSourcePresence",
-        action = "Fallback",
-        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "AccountSourcePresence",
-        action = "PrimaryUnavailable",
-        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "AccountSourcePresence",
-        action = "FallbackUnavailable",
-        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::source_presence::source_transition"
-    )
-)]
+// A local source (the fleet file beside the roster, the vault's own state files) may be skipped
+// when absent, never when unreadable. When an ancestor is missing, distinguish a normal absent
+// directory from a dangling link or a non-directory obstruction. This probe grants no
+// read/write authority; the bounded reader and publication snapshots still judge what they open.
 fn source_entry_present(path: &Path) -> bool {
     let mut at = path;
     loop {
@@ -4361,33 +4343,79 @@ fn source_entry_present(path: &Path) -> bool {
     }
 }
 
-fn pool_entry_present(path: &Path) -> bool {
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    if !fs::metadata(parent).is_ok_and(|meta| meta.is_dir()) {
-        return false;
-    }
-    match fs::symlink_metadata(path) {
-        Ok(_) => true,
-        Err(why) => why.kind() != io::ErrorKind::NotFound,
-    }
-}
-
-fn has_fleet_source(dir: &Path, store: &accounts::Store) -> bool {
+/// Whether the vault holds a source a sync from init reads under `home`: its pool, its fleet
+/// (unless `store`'s policy retired it) or, where this Mac reads it, its sheet, from one version
+/// of the vault; an entry this Mac cannot read now counts, so its sync says why.
+fn has_fleet_source(home: &Path, store: &accounts::Store) -> bool {
     let Ok(policy) = store.source_policy() else {
         // Admit one diagnostic attempt; the ordinary failed-input hold paces it.
         return true;
     };
-    pool_entry_present(&dir.join(super::ai_pool::AI_POOL_FILE))
-        || (!policy.retired() && source_entry_present(&dir.join(FLEET_ROSTER_FILE)))
-        || (sheet_read_here() && source_entry_present(&dir.join(ACCOUNTS_CSV_FILE)))
+    let [pool, fleet, sheet] = source_selection::vault_sources(Some(home));
+    let held = |entry: Option<VaultSource>| entry.is_some_and(|entry| entry.occupies());
+    held(pool) || (!policy.retired() && held(fleet)) || (sheet_read_here() && held(sheet))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FetchPlan {
     Http(String),
     File(PathBuf),
+    /// A vault entry, named `vault:<entry>`, read in place from this Mac's store.
+    Entry(String),
+}
+
+/// Whether `path` lies in `home`'s `~/.secrets`, as spelled or as it resolves through links:
+/// the files older builds wrote there are the owner's backup, which no source reads and no
+/// projection writes. Resolving reads names, never what a file holds.
+fn in_secrets_backup(home: &Path, path: &Path) -> bool {
+    let backups = [
+        Some(home.join(".secrets")),
+        fs::canonicalize(home)
+            .ok()
+            .map(|home| home.join(".secrets")),
+    ];
+    let in_backup = |path: &Path| backups.iter().flatten().any(|b| path.starts_with(b));
+    in_backup(path) || fs::canonicalize(path).is_ok_and(|resolved| in_backup(&resolved))
+}
+
+/// The refusal of a source path in the backup ([`in_secrets_backup`]), naming the vault entry
+/// that stands for it.
+fn secrets_backup_refusal(home: &Path, path: &Path) -> String {
+    let entry = path
+        .strip_prefix(home.join(".secrets"))
+        .ok()
+        .and_then(|rest| rest.to_str())
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or("<entry>");
+    format!(
+        "{}: the files in ~/.secrets are the owner's backup and nothing reads them; name the \
+         vault entry instead (`{}`)",
+        path.display(),
+        crate::vault_entry::source_name(entry)
+    )
+}
+
+/// The refusal of a configured or named `source` whose path lies in `home`'s backup
+/// ([`in_secrets_backup`]), resolved as [`fetch_plan`] resolves it (against `config`'s directory).
+fn refuse_backup_source(home: &Path, config: Option<&Path>, source: &str) -> Result<(), String> {
+    if source.starts_with("http://")
+        || source.starts_with("https://")
+        || crate::vault_entry::source_entry(source).is_some()
+    {
+        return Ok(());
+    }
+    let path = if let Some(relative) = source.strip_prefix("~/") {
+        home.join(relative)
+    } else {
+        let base = config.and_then(Path::parent).unwrap_or(home);
+        std::path::absolute(base)
+            .map_err(|why| why.to_string())?
+            .join(source)
+    };
+    if in_secrets_backup(home, &path) {
+        return Err(secrets_backup_refusal(home, &path));
+    }
+    Ok(())
 }
 
 /// Resolve from captured context only. A drive-relative Windows path must not consult
@@ -4511,6 +4539,12 @@ fn fetch_plan(env: &Env, source: &str) -> Result<FetchPlan, String> {
              {FLEET_ROSTER_FILE} URL or path, or a local CSV file"
         ));
     }
+    if let Some(entry) = crate::vault_entry::source_entry(source) {
+        if entry.starts_with("~/") || !aterm_secrets::text::valid_entry_name(entry) {
+            return Err(format!("{source}: not a vault entry's name"));
+        }
+        return Ok(FetchPlan::Entry(entry.to_owned()));
+    }
     if source.starts_with("http://") || source.starts_with("https://") {
         return Ok(FetchPlan::Http(normalize_google_sheet_url(source)));
     }
@@ -4531,6 +4565,11 @@ fn fetch_plan(env: &Env, source: &str) -> Result<FetchPlan, String> {
     } else {
         source_path(&env.cwd, Path::new(source))?
     };
+    if let Some(home) = env.home.as_deref()
+        && in_secrets_backup(home, &path)
+    {
+        return Err(secrets_backup_refusal(home, &path));
+    }
     Ok(FetchPlan::File(path))
 }
 
@@ -4575,6 +4614,13 @@ fn fetch_source_text_with(env: &Env, source: &str, run: &RunFetcher) -> Result<S
         // prevents a FIFO from waiting for a writer.
         FetchPlan::File(path) => read_local_source_text_with(&path, astream_sys::Links::Follow)
             .map_err(|e| format!("could not read {}: {e}", path.display())),
+        FetchPlan::Entry(name) => VaultSource::read(
+            env.home
+                .as_deref()
+                .ok_or("a vault account source needs a home")?,
+            &name,
+        )
+        .text(),
     }
 }
 
@@ -5268,23 +5314,60 @@ impl RowChanges {
     }
 }
 
+/// Where a captured fleet input was read: a local file, or a vault entry read in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotAt {
+    File(PathBuf),
+    Entry(String),
+}
+
+impl std::fmt::Display for SnapshotAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::Entry(name) => f.write_str(&crate::vault_entry::source_name(name)),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct FleetSnapshot {
-    path: PathBuf,
+    at: SnapshotAt,
     bytes: Option<Vec<u8>>,
 }
 
-fn validate_fleet_snapshots(snapshots: &[FleetSnapshot]) -> Result<(), SyncError> {
+/// What `at` holds now, `None` where it is not there.
+fn snapshot_bytes(home: Option<&Path>, at: &SnapshotAt) -> Result<Option<Vec<u8>>, String> {
+    match at {
+        SnapshotAt::File(path) => match read_local_source_text(path) {
+            Ok(text) => Ok(Some(text.into_bytes())),
+            Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(why) => Err(why.to_string()),
+        },
+        SnapshotAt::Entry(name) => {
+            let home = home.ok_or("a vault account source needs a home")?;
+            Ok(
+                crate::vault_entry::read_text(home, name, SOURCE_TEXT_MAX_BYTES)
+                    .into_text()?
+                    .map(String::into_bytes),
+            )
+        }
+    }
+}
+
+fn validate_fleet_snapshots(
+    home: Option<&Path>,
+    snapshots: &[FleetSnapshot],
+) -> Result<(), SyncError> {
     for expected in snapshots {
-        let current = match read_local_source_text(&expected.path) {
-            Ok(text) => Some(text.into_bytes()),
-            Err(why) if why.kind() == io::ErrorKind::NotFound => None,
+        let current = match snapshot_bytes(home, &expected.at) {
+            Ok(bytes) => bytes,
             Err(why) => {
                 return Err(SyncError::retry(
                     Retry::Unavailable,
                     format!(
                         "could not check captured fleet at {}: {why}; nothing was synced",
-                        expected.path.display()
+                        expected.at
                     ),
                 ));
             }
@@ -5299,7 +5382,10 @@ fn validate_fleet_snapshots(snapshots: &[FleetSnapshot]) -> Result<(), SyncError
     Ok(())
 }
 
-/// Inputs stay separate from generated outputs, even for explicitly requested imports.
+/// Inputs stay separate from generated outputs, even for explicitly requested imports: no
+/// output lies in `home`'s `~/.secrets` (the owner's backup, which nothing writes), and none
+/// aliases a local input the sync read (`read_only`). A vault entry is read by name and no
+/// output can alias it.
 #[derive(Default)]
 struct SourceProtection {
     home: Option<PathBuf>,
@@ -5312,17 +5398,37 @@ impl SourceProtection {
         if SOURCE_WRITES_MUTANT.get() == 3 {
             return Ok(());
         }
-        let defaults = self.home.iter().flat_map(|home| {
-            [
-                FLEET_ROSTER_FILE,
-                ACCOUNTS_CSV_FILE,
-                super::ai_pool::AI_POOL_FILE,
-            ]
-            .map(|name| home.join(".secrets").join(name))
-        });
-        for input in defaults.chain(self.read_only.iter().cloned()) {
+        if let Some(home) = &self.home {
+            // The backup as spelled and as resolved; each output as spelled and as it resolves,
+            // through a link at its leaf where it exists, else through its parent.
+            let backups = [
+                Some(home.join(".secrets")),
+                fs::canonicalize(home)
+                    .ok()
+                    .map(|home| home.join(".secrets")),
+            ];
             for output in outputs {
-                if accounts::source_policy::aliases(output, &input)? {
+                let absolute = std::path::absolute(output).map_err(|why| why.to_string())?;
+                let resolved = fs::canonicalize(&absolute).ok().or_else(|| {
+                    absolute
+                        .parent()
+                        .and_then(|parent| fs::canonicalize(parent).ok())
+                        .zip(absolute.file_name())
+                        .map(|(parent, name)| parent.join(name))
+                });
+                let in_backup = |path: &Path| backups.iter().flatten().any(|b| path.starts_with(b));
+                if in_backup(&absolute) || resolved.as_deref().is_some_and(in_backup) {
+                    return Err(
+                        "an account projection would be written in ~/.secrets, which nothing \
+                         writes"
+                            .into(),
+                    );
+                }
+            }
+        }
+        for input in &self.read_only {
+            for output in outputs {
+                if accounts::source_policy::aliases(output, input)? {
                     return Err("account projection aliases a preserved source input".into());
                 }
             }
@@ -6127,7 +6233,7 @@ fn persist_accounts_sync_with_pool(
     if fleet.alab.is_none() {
         protection.check(&[&fleet_path])?;
     }
-    validate_fleet_snapshots(fleet_snapshots)?;
+    validate_fleet_snapshots(protection.home.as_deref(), fleet_snapshots)?;
     let original_existing = Roster::load(&write_to).map_err(|why| {
         format!(
             "the roster at {} is refused: {why}; the roster is unchanged",
@@ -6449,7 +6555,7 @@ fn persist_accounts_sync_with_pool(
             if let Some(admission) = admission {
                 admission.validate()?;
             }
-            validate_fleet_snapshots(fleet_snapshots)?;
+            validate_fleet_snapshots(protection.home.as_deref(), fleet_snapshots)?;
             let before = (state.clone(), logins.clone());
             let native_pairs: Vec<(&str, &str)> = native_moves.iter()
                 .map(|(from, to)| (from.as_str(), to.as_str())).collect();
@@ -6927,7 +7033,7 @@ fn sync_accounts_with(
             &policy,
         )?
     };
-    let retire = native || selected.retires_legacy(env.home.as_deref(), env.config.as_deref());
+    let retire = native || selected.retires_legacy(env.config.as_deref());
     let admission = admission.with_policy(policy, retire);
     let admission = if native {
         admission
@@ -6965,11 +7071,16 @@ fn sync_accounts_request(
     let reads = std::sync::Mutex::new(Vec::new());
     let capture = |context: &Env, source: &str| {
         let text = (how.fetch)(context, source)?;
-        if let FetchPlan::File(path) = fetch_plan(context, source)? {
+        let at = match fetch_plan(context, source)? {
+            FetchPlan::File(path) => Some(SnapshotAt::File(path)),
+            FetchPlan::Entry(name) => Some(SnapshotAt::Entry(name)),
+            FetchPlan::Http(_) => None,
+        };
+        if let Some(at) = at {
             reads
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((path, text.clone()));
+                .push((at, text.clone()));
         }
         Ok(text)
     };
@@ -6981,23 +7092,26 @@ fn sync_accounts_request(
     };
     let mut snapshots = how.fleet_snapshots.to_vec();
     let local_fleet = fleet_file_beside(&roster_path);
-    for (path, text) in reads
+    for (at, text) in reads
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
     {
-        let generated_here = snapshots
-            .iter()
-            .any(|saved| saved.path == path && saved.bytes.is_none());
-        let mutable_profile = request
-            .admission()
-            .is_some_and(|admission| admission.owns_local_projection(&path));
-        if local_fleet.as_ref() != Some(&path) || !(generated_here || mutable_profile) {
-            protection.read_only.push(path.clone());
+        // A vault entry is read by name: no output can alias it.
+        if let SnapshotAt::File(path) = &at {
+            let generated_here = snapshots
+                .iter()
+                .any(|saved| saved.at == at && saved.bytes.is_none());
+            let mutable_profile = request
+                .admission()
+                .is_some_and(|admission| admission.owns_local_projection(path));
+            if local_fleet.as_ref() != Some(path) || !(generated_here || mutable_profile) {
+                protection.read_only.push(path.clone());
+            }
         }
         // Init may already retain the original bytes while fetching its merged projection.
-        if request.admission().is_some() && !snapshots.iter().any(|saved| saved.path == path) {
+        if request.admission().is_some() && !snapshots.iter().any(|saved| saved.at == at) {
             snapshots.push(FleetSnapshot {
-                path,
+                at,
                 bytes: Some(text.into_bytes()),
             });
         }
@@ -7029,7 +7143,7 @@ fn sync_accounts_request(
             .ok_or_else(|| SyncError::retry(Retry::Busy, accounts::LOCK_HELD))?;
         store.recover_sync_held(&held, &roster_path)?;
         request.validate()?;
-        validate_fleet_snapshots(&snapshots)?;
+        validate_fleet_snapshots(env.home.as_deref(), &snapshots)?;
         let fleet_path = roster_path
             .parent()
             .map(|p| p.join(FLEET_ROSTER_FILE))
@@ -7048,7 +7162,7 @@ fn sync_accounts_request(
                         .is_some_and(AutomaticSource::retires_legacy),
                     |state| {
                         request.validate()?;
-                        validate_fleet_snapshots(&snapshots)?;
+                        validate_fleet_snapshots(env.home.as_deref(), &snapshots)?;
                         if accounts::roster_text(&roster_path)?.is_some() {
                             return Err(SyncError::retry(
                                 Retry::Changed,
@@ -8009,11 +8123,49 @@ struct UpkeepEffects<'a> {
     /// One run of `claude auth login` for a route, where it is not the live one
     /// ([`spawn_row_renewal`]).
     run_attempt: Option<RunAttempt>,
-    save_oauth: fn(&str, &Path) -> Result<String, String>,
     shared: shared_renewal::Effects<'a>,
+    /// Which rows of a roster run on their vault token here, read value-free from the vault
+    /// under `home` ([`rows_on_token_live`]).
+    tokens_here: TokensRead,
 }
 
 type SpawnRenewal<'a> = dyn Fn(Box<dyn FnOnce() + Send>) -> io::Result<()> + Sync + 'a;
+
+/// [`UpkeepEffects::tokens_here`]: the rows of `roster` whose vault token is in use here, each
+/// with its token's end, as [`super::accounts_tokens::rows_on_token_read`] returns them for
+/// `home`, `store` and `now`; `None` where the vault could not be read just now.
+type TokensRead = fn(&Path, &accounts::Store, &Roster, i64) -> Option<BTreeMap<String, u64>>;
+
+/// The live [`UpkeepEffects::tokens_here`]: one value-free read of the vault under `home`
+/// ([`super::accounts_tokens::rows_on_token_read`]). Where no launch starts on a token
+/// ([`super::token_route::LAUNCHES_ON_TOKEN`]: the judgment's platform step), no row runs on its
+/// token here whatever the vault holds, so none is read and the reading names none (which removes
+/// a kept one). No vault runs off Unix, so none is read.
+fn rows_on_token_live(
+    home: &Path,
+    store: &accounts::Store,
+    roster: &Roster,
+    now: i64,
+) -> Option<BTreeMap<String, u64>> {
+    if !super::token_route::LAUNCHES_ON_TOKEN {
+        let _ = (home, store, roster, now);
+        return Some(BTreeMap::new());
+    }
+    #[cfg(unix)]
+    {
+        super::accounts_tokens::rows_on_token_read(
+            &aterm_secrets::client::Paths::for_home(home),
+            store,
+            roster,
+            now,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (home, store, roster, now);
+        None
+    }
+}
 
 /// [`UpkeepEffects::mailbox`]: what the configured mailbox offers `row` for `home` and `store`,
 /// and its masked login where it has one ([`mailbox_offer`]).
@@ -8051,8 +8203,8 @@ fn browser_installed(home: &Path) -> bool {
 const VAULT_SYNC_BUDGET: Duration = Duration::from_secs(45);
 
 /// The live [`UpkeepEffects::vault_sync`]: this program's own `secrets sync`, with no terminal,
-/// its stdin empty, at most [`VAULT_SYNC_BUDGET`] (the LAN vault's fetch, its verification and
-/// the files it delivers, `~/.secrets/ai-mailbox.toml` among them).
+/// its stdin empty, at most [`VAULT_SYNC_BUDGET`] (the LAN vault's fetch and its verification,
+/// which refreshes the verified view the ladder then reads its mailbox entries from).
 fn run_vault_sync(
     home: &Path,
     scope: Option<&super::account_work::Scope>,
@@ -8646,17 +8798,8 @@ fn live_effects<'a>() -> UpkeepEffects<'a> {
         mailbox: &ladder_mailbox_live,
         log: std::sync::Arc::new(log_sign_in),
         run_attempt: None,
-        save_oauth: {
-            #[cfg(unix)]
-            {
-                super::claude_oauth_vault::save
-            }
-            #[cfg(not(unix))]
-            {
-                |_, _| Err("Claude OAuth snapshots require a Unix vault".into())
-            }
-        },
         shared: shared_renewal::Effects::live(),
+        tokens_here: rows_on_token_live,
     }
 }
 
@@ -8705,9 +8848,6 @@ fn upkeep(
         return Upkept::Off;
     }
     let claude = upkeep_claude(home, state_dir, (roster_path, now, step), fx);
-    if step.renews() {
-        save_claude_oauth_snapshots(home, state_dir, roster_path, now, fx);
-    }
     upkeep_pools(home, state_dir, (roster_path, now, step), fx);
     if fx
         .scope
@@ -8728,42 +8868,6 @@ fn upkeep(
         }
     }
     claude
-}
-
-fn save_claude_oauth_snapshots(
-    home: &Path,
-    state_dir: &Path,
-    roster_path: &Path,
-    now: i64,
-    fx: &UpkeepEffects<'_>,
-) {
-    let store = accounts::Store::at_for(state_dir, Cli::Claude, home);
-    let Ok(raw) = store.read_roster(Some(roster_path), now) else {
-        return;
-    };
-    let Ok((logins, _)) = store.load_logins(now) else {
-        return;
-    };
-    for row in accounts::bound(&raw, &logins).rows {
-        let login = row.dir.map(std::path::PathBuf::from).or_else(|| {
-            crate::ai::connector::claude_default_login_in_file()
-                .then(|| store.default_login_home())
-                .flatten()
-        });
-        let Some(login) = login else {
-            continue;
-        };
-        if crate::ai::connector::stored_login_file(Cli::Claude.connector(), &login).is_none() {
-            continue;
-        }
-        if let Err(why) = (fx.save_oauth)(&row.label, &login) {
-            (fx.log)(&format!(
-                "Claude OAuth snapshot {}: {}",
-                row.label,
-                super::one_line(&why, 320)
-            ));
-        }
-    }
 }
 
 /// Both explicit local switches must remain on throughout first adoption.
@@ -8825,6 +8929,11 @@ fn upkeep_claude(
     // arrival to end the lab's ask for it.
     if step.renews() {
         settle_mailbox_needs(home, state_dir, roster_path, now, fx);
+    }
+    // Rotation reads which rows run on their vault token here whether or not the ladder signs
+    // rows in, so every pass that renews keeps that reading fresh.
+    if step.renews() && roster_path.is_file() {
+        note_tokens_here(home, state_dir, roster_path, now, fx.tokens_here);
     }
     // A saved explicit choice is independent of automatic fleet-source admission.
     let pending = step
@@ -8930,7 +9039,7 @@ pub(crate) fn sign_ins_off_for(config: &Path, cli: Cli) -> Option<String> {
 /// THE SHEET'S CONFLICTS THIS MACHINE'S POOLS SKIP ([`SheetConflict`]), for the window's
 /// exceptions digest, the upkeep's log ([`upkeep`]) and `aterm init`'s `base.ai.accounts` row
 /// (none where [`accounts_sync_off`] holds, since no sync reads the sheet):
-/// for each CLI whose fleet the vault's sheet (`~/.secrets/ai-accounts.csv`) is
+/// for each CLI whose fleet the vault's sheet (its entry `ai-accounts.csv`) is
 /// (Claude Code's where [`fleet_origin`] says so; another CLI's where this machine keeps its
 /// roster or the CLI syncs by default ([`syncs_by_default`]), and no `ai-accounts-<cli>.toml`
 /// outranks the sheet),
@@ -8959,17 +9068,26 @@ fn sheet_conflicts_look(home: &Path, state_dir: &Path, config: &Path) -> SheetLo
         conflicts: Vec::new(),
         whole: false,
     };
-    let secrets = home.join(".secrets");
-    let sheet = secrets.join(ACCOUNTS_CSV_FILE);
     // Where the lab registry names this Mac, or may and could not be read yet, the sheet is the
     // importer's input alone ([`sheet_read_here`]): upkeep reads the lab, and no sheet conflict
     // is this Mac's to report.
-    if accounts_sync_off(Some(config)) || !source_entry_present(&sheet) || !sheet_read_here() {
+    if accounts_sync_off(Some(config)) || !sheet_read_here() {
         return unread;
     }
-    let Ok(text) = read_local_source_text(&sheet) else {
+    // The sheet and each CLI's fleet, from one version of the vault.
+    let cli_files = OTHER_CLIS.map(cli_fleet_file);
+    let names = std::iter::once(ACCOUNTS_CSV_FILE)
+        .chain(cli_files.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let mut reads = crate::vault_entry::read_set(home, &names, SOURCE_TEXT_MAX_BYTES).into_iter();
+    let Some(Ok(Some(text))) = reads.next().map(crate::vault_entry::Read::into_text) else {
         return unread;
     };
+    let cli_held = OTHER_CLIS
+        .into_iter()
+        .zip(reads)
+        .map(|(cli, read)| (cli, read.occupies()))
+        .collect::<BTreeMap<_, _>>();
     let reads_sheet = |cli: Cli| {
         let Some(roster) = accounts::roster_beside_for(config, cli) else {
             return false;
@@ -8981,11 +9099,11 @@ fn sheet_conflicts_look(home: &Path, state_dir: &Path, config: &Path) -> SheetLo
                     Some(home),
                     Some(config),
                     &roster,
-                ) == FleetOrigin::Vault(sheet.clone())
+                ) == FleetOrigin::Vault(ACCOUNTS_CSV_FILE.to_owned())
             }
             _ => {
                 (syncs_by_default(cli) || roster.is_file())
-                    && !source_entry_present(&secrets.join(cli_fleet_file(cli)))
+                    && !cli_held.get(&cli).copied().unwrap_or(true)
             }
         }
     };
@@ -9166,7 +9284,7 @@ fn lab_sync_due(cli: Cli, store: &accounts::Store, roster_path: &Path, now: i64)
 
 /// THE ONE RULE OF WHEN A PERIODIC CALLER SYNCS a roster that stands (a window's upkeep, the
 /// setup pass's [`resync_for_setup`]): when its inputs changed or need revalidation. That is
-/// `~/.secrets` holding a fleet, a sheet or a mailbox where no source is configured yet; a vault
+/// the vault holding a fleet, a sheet or a mailbox where no source is configured yet; a vault
 /// fleet or sheet the fleet file does not match, or accounts this machine's own logins show that
 /// a fleet discovery made does not list ([`init_sync_needed`], read every [`REDISCOVER_EVERY`]);
 /// the default login holding an account the roster's default row is not
@@ -9226,7 +9344,6 @@ fn sync_called_for_recording(
             Some(claim),
         );
     }
-    let secrets = home.join(".secrets");
     let configured = configured_source(Some(config), Some(roster_path));
     // A mode change invalidates this process's observation. Returning to the same path
     // must not inherit the timer from a source which stopped being authoritative.
@@ -9244,14 +9361,9 @@ fn sync_called_for_recording(
         false
     };
     let unconfigured_with_secrets = configured.is_none()
-        && (has_fleet_source(&secrets, &accounts::Store::at(state_dir))
-            || [
-                super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
-                super::headless_oauth::MAILBOX_TOML_FILE,
-            ]
-            .into_iter()
-            .any(|name| secrets.join(name).is_file())
-            || (secrets.is_dir()
+        && (has_fleet_source(home, &accounts::Store::at(state_dir))
+            || vault_mailbox_held(home)
+            || (crate::vault_entry::configured(home)
                 && super::headless_oauth::discover_mailbox_config_files(
                     Some(home),
                     None,
@@ -9336,8 +9448,8 @@ fn periodic_sync(
 }
 
 /// One digest of what a sync from init reads that a periodic caller reads cheaply
-/// ([`periodic_sync`]): the fleet, the sheet and the mailbox files in `~/.secrets`, whether the
-/// vault wrote that fleet ([`own_secrets_copy`]), the roster, the fleet file beside it, the
+/// ([`periodic_sync`]): the vault's pool, fleet, sheet and mailbox entries (one in-process
+/// digest of them, [`crate::vault_entry::digest`]), the roster, the fleet file beside it, the
 /// config (`[fleet] machine`, `accounts_source`) and a local file that source names, and the
 /// default login's address. What else discovery reads (logins, transcripts, other mailbox
 /// configurations), a URL and the host's name are left out: [`REDISCOVER_EVERY`] reads them
@@ -9345,9 +9457,8 @@ fn periodic_sync(
 fn sync_inputs(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> [u8; 32] {
     let config = config_beside(roster_path);
     let env = quiet_env(home, state_dir, &config, now);
-    let secrets = home.join(".secrets");
     let mut hash = aterm_digest::Sha256::new();
-    hash.update(b"aterm-accounts-sync-inputs-v1");
+    hash.update(b"aterm-accounts-sync-inputs-v2");
     let mut field = |value: Option<&[u8]>| match value {
         None => hash.update([0]),
         Some(value) => {
@@ -9403,14 +9514,22 @@ fn sync_inputs(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> [
         }
     };
     field(selected.source().as_deref().map(str::as_bytes));
-    let secrets_pool = secrets.join(super::ai_pool::AI_POOL_FILE);
-    let sheet = sheet_read_here().then(|| secrets.join(ACCOUNTS_CSV_FILE));
+    let vault = [
+        Some(super::ai_pool::AI_POOL_FILE),
+        (!policy.retired()).then_some(FLEET_ROSTER_FILE),
+        sheet_read_here().then_some(ACCOUNTS_CSV_FILE),
+        Some(super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
+        Some(super::headless_oauth::MAILBOX_TOML_FILE),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    field(Some(&crate::vault_entry::digest(
+        home,
+        &vault,
+        SOURCE_TEXT_MAX_BYTES,
+    )));
     for path in [
-        Some(secrets_pool.clone()),
-        (!policy.retired()).then(|| secrets.join(FLEET_ROSTER_FILE)),
-        sheet,
-        Some(secrets.join(super::headless_oauth::SECRETS_MAILBOX_TOML_FILE)),
-        Some(secrets.join(super::headless_oauth::MAILBOX_TOML_FILE)),
         Some(roster_path.to_path_buf()),
         fleet_file_beside(roster_path),
         Some(config.clone()),
@@ -9427,15 +9546,6 @@ fn sync_inputs(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> [
             .map(|id| id.map(|id| format!("{}:{}", id.primary, id.aliases.join(",")).into_bytes()))
             .unwrap_or_else(|why| Some(why.into_bytes()));
         field(id_bytes.as_deref());
-    }
-    if !policy.retired() {
-        let delivered = vault_delivered(home)
-            .map(|delivered| delivered.contains(&secrets.join(FLEET_ROSTER_FILE)));
-        field(Some(match delivered {
-            Some(true) => b"vault".as_slice(),
-            Some(false) => b"local".as_slice(),
-            None => b"unread".as_slice(),
-        }));
     }
     field(
         read_default_profile_email(&env)
@@ -9650,17 +9760,10 @@ pub fn has_init_accounts_source(
     if configured {
         return true;
     }
-    let secrets = home.join(".secrets");
-    if [
-        super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
-        super::headless_oauth::MAILBOX_TOML_FILE,
-    ]
-    .into_iter()
-    .any(|name| secrets.join(name).is_file())
-    {
+    if vault_mailbox_held(home) {
         return true;
     }
-    let has_discovered_secrets_mailbox = secrets.is_dir()
+    let has_discovered_secrets_mailbox = crate::vault_entry::configured(home)
         && super::headless_oauth::discover_mailbox_config_files(
             Some(home),
             Some(&accounts::Store::at(state_dir).dir),
@@ -9698,7 +9801,22 @@ pub fn has_init_accounts_source(
     discover_local_fleet_with_min(&env, min_accounts).is_some()
 }
 
-/// Whether `~/.secrets/` holds an updated fleet or accounting sheet not yet converged into
+/// Whether the vault holds either mailbox configuration for this Mac (`ai-mailbox.toml`,
+/// `mailbox.toml`), usable now or not, read from one version of the vault.
+fn vault_mailbox_held(home: &Path) -> bool {
+    crate::vault_entry::read_set(
+        home,
+        &[
+            super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
+            super::headless_oauth::MAILBOX_TOML_FILE,
+        ],
+        super::headless_oauth::MAILBOX_TOML_MAX_BYTES,
+    )
+    .iter()
+    .any(crate::vault_entry::Read::occupies)
+}
+
+/// Whether the vault holds an updated fleet or accounting sheet not yet converged into
 /// `roster_path`, or, for a fleet discovery made ([`fleet_takes_discovered`]), local discovery
 /// (a mailbox file's accounts among what it reads) finds an account the fleet does not list yet.
 /// An unreadable or invalid selected source also needs a sync attempt to report its refusal.
@@ -9733,7 +9851,6 @@ fn init_sync_needed(
             now,
         );
     }
-    let secrets = home.join(".secrets");
     let config_path = config_beside(roster_path);
     let Ok(selected) = source_selection::select_for(
         &accounts::Store::at(state_dir),
@@ -9754,21 +9871,21 @@ fn init_sync_needed(
     if !fleet_file_opt_in(&fb).is_some_and(OptIn::opts_in_by_file) {
         return !matches!(selected, SelectedSource::Beside { .. });
     }
-    if selected.retires_legacy(Some(home), Some(&config_path))
+    if selected.retires_legacy(Some(&config_path))
         && accounts::Store::at(state_dir)
             .source_policy()
             .is_ok_and(|policy| !policy.retired())
     {
         return true;
     }
-    if let SelectedSource::Pool(secrets_pool) = &selected {
+    if let SelectedSource::Pool(vault_pool) = &selected {
         let Ok(existing_text) = read_local_source_text(&fb) else {
             return true;
         };
         let Ok(existing_fleet) = FleetRoster::from_toml(&existing_text, FLEET_ROSTER_FILE) else {
             return true;
         };
-        let Ok(raw) = read_local_source_text(secrets_pool) else {
+        let Ok(raw) = vault_pool.text() else {
             return true;
         };
         let Ok(pool) = super::ai_pool::Pool::from_toml(&raw, super::ai_pool::AI_POOL_FILE) else {
@@ -9824,14 +9941,15 @@ fn init_sync_needed(
         return true;
     };
     let opt_in = opt_in_of(&existing_text);
-    if let SelectedSource::VaultFleet { path } = &selected {
+    if let SelectedSource::VaultFleet { entry } = &selected {
         // A source owned outside the local projection is authoritative for its
         // rows. Compare parsed rows: formatting and the generated opt-in header
         // are not new account data, and local discovery must not extend this input.
-        return read_local_source_text(path)
+        return entry
+            .text()
             .ok()
             .and_then(|text| {
-                let source = FleetRoster::from_toml(&text, &path.display().to_string()).ok()?;
+                let source = FleetRoster::from_toml(&text, &entry.source()).ok()?;
                 let source_opt_in = if opt_in_of(&text) == Some(OptIn::Discovered) {
                     OptIn::Discovered
                 } else {
@@ -9845,8 +9963,8 @@ fn init_sync_needed(
     }
     // A sync from the sheet writes its accounts as they are: any edit (a row added, removed, or
     // moved to another machine) is one the fleet file does not hold yet.
-    if let SelectedSource::Sheet { path, .. } = &selected {
-        let Ok(csv_text) = read_local_source_text(path) else {
+    if let SelectedSource::Sheet { entry } = &selected {
+        let Ok(csv_text) = entry.text() else {
             return true;
         };
         let Ok(csv_fleet) = parse_accounting_csv(&csv_text, ACCOUNTS_CSV_FILE) else {
@@ -9862,13 +9980,8 @@ fn init_sync_needed(
         return false;
     }
     if !discover
-        && ![
-            super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
-            super::headless_oauth::MAILBOX_TOML_FILE,
-        ]
-        .into_iter()
-        .any(|name| secrets.join(name).is_file())
-        && !(secrets.is_dir()
+        && !vault_mailbox_held(home)
+        && !(crate::vault_entry::configured(home)
             && super::headless_oauth::discover_mailbox_config_files(
                 Some(home),
                 None,
@@ -9966,13 +10079,29 @@ fn merge_discovered_accounts(
 /// the captured source remains unchanged.
 fn capture_init_fleet(
     env: &Env,
-    path: &Path,
+    selected: &SelectedSource,
     merge: bool,
 ) -> Result<(String, FleetSnapshot), String> {
-    let text = read_local_source_text(path).map_err(|why| format!("{}: {why}", path.display()))?;
+    let (text, at) = match selected {
+        SelectedSource::Beside { path, .. } => (
+            read_local_source_text(path).map_err(|why| format!("{}: {why}", path.display()))?,
+            SnapshotAt::File(path.clone()),
+        ),
+        SelectedSource::Pool(entry)
+        | SelectedSource::VaultFleet { entry }
+        | SelectedSource::Sheet { entry } => (
+            entry
+                .text()
+                .map_err(|why| format!("{}: {why}", entry.source()))?,
+            SnapshotAt::Entry(entry.name.clone()),
+        ),
+        SelectedSource::Key(_) | SelectedSource::Absent => {
+            return Err("no local account source was selected".to_owned());
+        }
+    };
     let mut answer = text.clone();
     if merge {
-        let mut fleet = FleetRoster::from_toml(&text, &path.display().to_string())?;
+        let mut fleet = FleetRoster::from_toml(&text, &at.to_string())?;
         let opt_in = opt_in_of(&text);
         let mut shown = None;
         if fleet_takes_discovered(opt_in, &fleet, || {
@@ -9991,7 +10120,7 @@ fn capture_init_fleet(
     Ok((
         answer,
         FleetSnapshot {
-            path: path.to_path_buf(),
+            at,
             bytes: Some(text.into_bytes()),
         },
     ))
@@ -10098,8 +10227,7 @@ fn sync_accounts_for_init_with(
     } else {
         SelectedSource::Absent
     };
-    let retire_legacy =
-        native.is_some() || selected.retires_legacy(Some(home), env.config.as_deref());
+    let retire_legacy = native.is_some() || selected.retires_legacy(env.config.as_deref());
     let automatic = automatic.with_policy(policy, retire_legacy);
     let automatic = if native.is_some() {
         automatic
@@ -10149,7 +10277,7 @@ fn sync_accounts_for_init_with(
             to_sign_in: Vec::new(),
         });
     }
-    // Where the lab is the source nothing in `~/.secrets` is captured or read.
+    // Where the lab is the source no vault entry is captured or read.
     if native.is_some() {
         before_sync();
         let report = sync_accounts_request(
@@ -10183,18 +10311,13 @@ fn sync_accounts_for_init_with(
         None
     } else if let Some(source) = selected.source() {
         let merge = matches!(&selected, SelectedSource::Beside { opt_in: Some(opt_in), .. } if opt_in.opts_in_by_file());
-        let (text, snapshot) = capture_init_fleet(&env, Path::new(&source), merge)?;
+        let (text, snapshot) = capture_init_fleet(&env, &selected, merge)?;
         captured_fleet = Some((source.clone(), text));
         fleet_snapshots.push(snapshot);
         Some(source)
     } else {
-        let min_accounts = if [
-            super::headless_oauth::SECRETS_MAILBOX_TOML_FILE,
-            super::headless_oauth::MAILBOX_TOML_FILE,
-        ]
-        .into_iter()
-        .any(|name| home.join(".secrets").join(name).is_file())
-            || (home.join(".secrets").is_dir()
+        let min_accounts = if vault_mailbox_held(home)
+            || (crate::vault_entry::configured(home)
                 && super::headless_oauth::discover_mailbox_config_files(
                     Some(home),
                     Some(&accounts::Store::at(state_dir).dir),
@@ -10210,7 +10333,7 @@ fn sync_accounts_for_init_with(
             let source = fleet_path.to_string_lossy().into_owned();
             captured_fleet = Some((source.clone(), local.to_toml_for(Some(OptIn::Discovered))));
             fleet_snapshots.push(FleetSnapshot {
-                path: fleet_path.clone(),
+                at: SnapshotAt::File(fleet_path.clone()),
                 bytes: None,
             });
             source
@@ -10442,14 +10565,7 @@ pub enum ResyncRead {
 /// before this read; the due rule also reads the configuration beside the roster as usual.
 #[must_use]
 pub fn read_resync(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> ResyncRead {
-    read_resync_with(
-        home,
-        state_dir,
-        roster_path,
-        now,
-        &RESYNC_READ,
-        &read_local_source_text,
-    )
+    read_resync_with(home, state_dir, roster_path, now, &RESYNC_READ)
 }
 
 fn read_resync_with(
@@ -10458,11 +10574,10 @@ fn read_resync_with(
     roster_path: &Path,
     now: i64,
     rediscovery: &std::sync::Mutex<Rediscovery>,
-    read: &LocalSourceRead<'_>,
 ) -> ResyncRead {
     let config = config_beside(roster_path);
     let env = quiet_env(home, state_dir, &config, now);
-    let mut sources = ResyncSources::new(&env, home, read);
+    let mut sources = ResyncSources::new(&env, home);
     let mut pools = Vec::new();
     let mut due_allowed = None;
     let mut available = has_init_accounts_source(home, state_dir, roster_path, now);
@@ -10693,8 +10808,8 @@ fn cli_roster_due<
     Ok(added)
 }
 
-/// The accounting sheet's name in `~/.secrets` (`DESIGN-secrets-2026-10-20.md` §11;
-/// [`aterm_secrets::entry_class::AI_ACCOUNTS_CSV`]).
+/// The vault entry holding the accounting sheet (`DESIGN-secrets-2026-10-20.md` §11;
+/// [`aterm_secrets::entry_class::AI_ACCOUNTS_CSV`]), read in place from this Mac's store.
 pub const ACCOUNTS_CSV_FILE: &str = aterm_secrets::entry_class::AI_ACCOUNTS_CSV;
 
 /// The pooled CLIs other than Claude Code, whose pools [`sync_cli_accounts_for_init`] and the
@@ -10709,9 +10824,9 @@ pub fn syncs_by_default(cli: Cli) -> bool {
     matches!(cli, Cli::Codex | Cli::Grok | Cli::Kimi)
 }
 
-/// The fleet file of `cli`'s pool in `~/.secrets` (`ai-accounts-codex.toml`,
-/// `ai-accounts-grok.toml`, `ai-accounts-kimi.toml`): the vault's subscriber writes it, and
-/// aterm only reads it ([`sync_cli_with`]).
+/// The vault entry holding `cli`'s fleet (`ai-accounts-codex.toml`, `ai-accounts-grok.toml`,
+/// `ai-accounts-kimi.toml`), which aterm reads in place from this Mac's store and never writes
+/// ([`sync_cli_with`]).
 #[must_use]
 pub fn cli_fleet_file(cli: Cli) -> String {
     aterm_secrets::entry_class::cli_accounts(cli.id())
@@ -10831,7 +10946,7 @@ fn quiet_env(home: &Path, state_dir: &Path, config: &Path, now: i64) -> Env {
 
 /// `cli`'s fleet and where it came from: `source` where one is named (a `.toml` read as
 /// [`FleetRoster::from_toml_for`], else a sheet whose `cli` column [`parse_accounting_csv_for`]
-/// reads), else `~/.secrets`' [`cli_fleet_file`], else its [`ACCOUNTS_CSV_FILE`] where the header
+/// reads), else the vault's [`cli_fleet_file`], else its [`ACCOUNTS_CSV_FILE`] where the header
 /// names `cli`'s column ([`csv_names_column`]); `None` where none is there. Nothing is written.
 fn load_cli_fleet(
     cli: Cli,
@@ -10848,67 +10963,55 @@ fn load_cli_fleet(
 type LoadedFleet<P = super::ai_pool::Pool, I = super::ai_pool::LocalPoolIdentity> =
     (CliFleet, Option<PoolSyncCtx<P, I>>, Option<String>);
 
+/// The vault entry `cli`'s pool syncs from by default ([`local_cli_source_observed`]), as this
+/// Mac's store read it when it was selected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocalCliSource {
-    path: PathBuf,
+    entry: VaultSource,
     csv: bool,
 }
 
-fn local_cli_source(
-    cli: Cli,
-    env: &Env,
-    home: &Path,
-    present: &mut dyn FnMut(&Path, bool) -> bool,
-) -> Result<Option<LocalCliSource>, String> {
+fn local_cli_source(cli: Cli, env: &Env, home: &Path) -> Result<Option<LocalCliSource>, String> {
     let policy = accounts::Store::at_for(&env.state, cli, home).source_policy()?;
-    local_cli_source_observed(cli, home, &policy, present)
+    Ok(local_cli_source_observed(cli, home, &policy))
 }
 
+/// `cli`'s default source, in order: the vault's pool, its `ai-accounts-<cli>.toml` (and, for
+/// Claude Code, its fleet roster) unless the retained policy retired them, else its sheet where
+/// this Mac reads it: all from one version of the vault, and an entry this Mac cannot read now
+/// keeps its place, so its sync says why rather than a lower source standing in for it.
 fn local_cli_source_observed(
     cli: Cli,
     home: &Path,
     policy: &accounts::source_policy::Snapshot,
-    present: &mut dyn FnMut(&Path, bool) -> bool,
-) -> Result<Option<LocalCliSource>, String> {
-    let secrets = home.join(".secrets");
-    let pool = secrets.join(super::ai_pool::AI_POOL_FILE);
-    let toml = secrets.join(cli_fleet_file(cli));
-    let claude = (cli == Cli::Claude).then(|| secrets.join(FLEET_ROSTER_FILE));
-    let csv = secrets.join(ACCOUNTS_CSV_FILE);
-    let selected = if present(&pool, true) {
-        LocalCliSource {
-            path: pool,
-            csv: false,
-        }
-    } else if !policy.retired() && present(&toml, false) {
-        LocalCliSource {
-            path: toml.clone(),
-            csv: false,
-        }
-    } else if let Some(path) = claude
-        .as_ref()
-        .filter(|path| !policy.retired() && present(path, false))
-    {
-        LocalCliSource {
-            path: path.clone(),
-            csv: false,
-        }
-    } else if sheet_read_here() && present(&csv, false) {
-        LocalCliSource {
-            path: csv,
-            csv: true,
-        }
+) -> Option<LocalCliSource> {
+    let toml = cli_fleet_file(cli);
+    let names = [
+        super::ai_pool::AI_POOL_FILE,
+        toml.as_str(),
+        FLEET_ROSTER_FILE,
+        ACCOUNTS_CSV_FILE,
+    ];
+    let mut reads = crate::vault_entry::read_set(home, &names, SOURCE_TEXT_MAX_BYTES)
+        .into_iter()
+        .zip(names)
+        .map(|(read, name)| VaultSource {
+            name: name.to_owned(),
+            read,
+        });
+    let (pool, toml, claude, csv) = (reads.next()?, reads.next()?, reads.next()?, reads.next()?);
+    let (entry, csv) = if pool.occupies() {
+        (pool, false)
+    } else if !policy.retired() && toml.occupies() {
+        (toml, false)
+    } else if cli == Cli::Claude && !policy.retired() && claude.occupies() {
+        (claude, false)
+    } else if sheet_read_here() && csv.occupies() {
+        (csv, true)
     } else {
-        return Ok(None);
+        return None;
     };
-    if policy.retired() {
-        for legacy in std::iter::once(&toml).chain(claude.iter()) {
-            if accounts::source_policy::aliases(&selected.path, legacy)? {
-                return Err("retired legacy source cannot be selected through another path".into());
-            }
-        }
-    }
-    Ok(Some(selected))
+    Some(LocalCliSource { entry, csv })
 }
 
 fn cli_lab_source(cli: Cli, env: &Env, named: Option<&str>) -> Result<Option<CliFleet>, String> {
@@ -10953,19 +11056,15 @@ struct CapturedLocalSource {
 struct ResyncSources<'a> {
     env: &'a Env,
     home: &'a Path,
-    read: &'a LocalSourceRead<'a>,
-    presence: BTreeMap<PathBuf, bool>,
-    local: BTreeMap<PathBuf, Result<CapturedLocalSource, String>>,
+    local: BTreeMap<String, Result<CapturedLocalSource, String>>,
     identity: Option<Result<Option<super::ai_pool::LocalPoolIdentity>, String>>,
 }
 
 impl<'a> ResyncSources<'a> {
-    fn new(env: &'a Env, home: &'a Path, read: &'a LocalSourceRead<'a>) -> Self {
+    fn new(env: &'a Env, home: &'a Path) -> Self {
         Self {
             env,
             home,
-            read,
-            presence: BTreeMap::new(),
             local: BTreeMap::new(),
             identity: None,
         }
@@ -10986,24 +11085,20 @@ impl<'a> ResyncSources<'a> {
                 .map(|machine| machine.key.as_str().to_owned());
             return Ok(Some((fleet, None, machine)));
         }
-        let selected = local_cli_source(cli, self.env, self.home, &mut |path, pool| {
-            *self.presence.entry(path.to_owned()).or_insert_with(|| {
-                if pool {
-                    pool_entry_present(path)
-                } else {
-                    source_entry_present(path)
-                }
-            })
-        })?;
-        let Some(selected) = selected else {
+        let Some(selected) = local_cli_source(cli, self.env, self.home)? else {
             return Ok(None);
         };
-        let chosen = selected.path.display().to_string();
-        let captured = self.local.entry(selected.path.clone()).or_insert_with(|| {
-            (self.read)(&selected.path)
-                .map(|raw| CapturedLocalSource { raw, pool: None })
-                .map_err(|why| format!("{}: {why}", selected.path.display()))
-        });
+        let chosen = selected.entry.source();
+        let captured = self
+            .local
+            .entry(selected.entry.name.clone())
+            .or_insert_with(|| {
+                selected
+                    .entry
+                    .text()
+                    .map(|raw| CapturedLocalSource { raw, pool: None })
+                    .map_err(|why| format!("{chosen}: {why}"))
+            });
         let captured = captured.as_mut().map_err(|why| why.clone())?;
         if selected.csv && !csv_names_column(cli, &captured.raw) {
             return Ok(None);
@@ -11068,22 +11163,18 @@ fn load_cli_fleet_source(
     let (chosen, raw) = match source.map(str::trim).filter(|s| !s.is_empty()) {
         Some(named) => (named.to_owned(), fetch(env, named)?),
         None => {
-            let Some(selected) = local_cli_source(cli, env, home, &mut |path, pool| {
-                if pool {
-                    pool_entry_present(path)
-                } else {
-                    source_entry_present(path)
-                }
-            })?
-            else {
+            let Some(selected) = local_cli_source(cli, env, home)? else {
                 return Ok(None);
             };
-            let raw = read_local_source_text(&selected.path)
-                .map_err(|why| format!("{}: {why}", selected.path.display()))?;
+            let chosen = selected.entry.source();
+            let raw = selected
+                .entry
+                .text()
+                .map_err(|why| format!("{chosen}: {why}"))?;
             if selected.csv && !csv_names_column(cli, &raw) {
                 return Ok(None);
             }
-            (selected.path.display().to_string(), raw)
+            (chosen, raw)
         }
     };
     if super::ai_pool::Pool::looks_like_pool(&chosen, &raw) {
@@ -11237,7 +11328,7 @@ fn fleet_matches_identity(cli: Cli, row: &Row, account: &FleetAccount) -> bool {
 /// machine's fleet rows the roster does not list are added to it, each
 /// with a login directory under `~/.aterm/logins/<cli>/` ([`accounts::Store::at_for`]), and a roster
 /// with no rows first gets this machine's own login (`main`, no dir), as `accounts add` gives it.
-/// It writes the roster and the CLI's store alone, never `~/.secrets`; a row the roster has is
+/// It writes the roster and the CLI's store alone, never a vault entry; a row the roster has is
 /// never changed or removed. A no-op requires exactly one identity match with the same label
 /// and vendor settings; conflicting or ambiguous matches are left out ([`CliSynced::kept`]).
 /// Under the CLI's store lock, waited for on `ladder`.
@@ -11376,7 +11467,7 @@ fn sync_cli_in_env(
         recovered_commit |= store.recover_sync_held(&lock, &roster_path)?;
         captured.validate(cli, env)?;
         let (write_to, keep_mode) = super::cli::roster_target(&roster_path)?;
-        captured.protect(cli, env, &write_to)?;
+        captured.protect(env, &write_to)?;
         recovered_commit |= captured.migrate(cli, env, &store, &lock, &roster_path)?;
         let Some((fleet, pool_ctx, machine)) = captured.load(cli, &roster_path)? else {
             drop(lock);
@@ -11569,7 +11660,7 @@ fn sync_cli_in_env(
         // A crash must not leave a new roster paired with the previous machine or warm set.
         roster_wrote = next_image != existing_image;
         captured.validate(cli, env)?;
-        captured.protect(cli, env, &write_to)?;
+        captured.protect(env, &write_to)?;
         let target = accounts::SyncTarget {
             path: &write_to,
             before: existing_image.as_deref(),
@@ -12502,8 +12593,8 @@ pub(super) fn run_cli_accounts_sync_with(
                 err,
                 "aterm harness accounts sync {flag}: nothing was read: this machine keeps no \
                  {product} roster ({file}) and no source was named; name one (`aterm harness \
-                 accounts sync {flag} ~/.secrets/{}`), or list an account (`{}`)",
-                cli_fleet_file(cli),
+                 accounts sync {flag} {}`), or list an account (`{}`)",
+                crate::vault_entry::source_name(&cli_fleet_file(cli)),
                 Step::Add { cli, email: None }
             );
             return ExitCode::FAILURE;
@@ -12722,8 +12813,8 @@ pub(super) fn run_cli_accounts_sync_with(
 /// What a sync of `cli` found no source in, in its error line's words.
 fn nothing_to_read_words(cli: Cli) -> String {
     format!(
-        "nothing to read: neither ~/.secrets/{}, nor ~/.secrets/{}, nor a `{}` column in \
-         ~/.secrets/{ACCOUNTS_CSV_FILE} is there",
+        "nothing to read: the vault holds neither {}, nor {}, nor a `{}` column in \
+         {ACCOUNTS_CSV_FILE} for this Mac",
         super::ai_pool::AI_POOL_FILE,
         cli_fleet_file(cli),
         csv_columns(cli).first().copied().unwrap_or(cli.id())
@@ -12881,7 +12972,7 @@ pub fn cli_pools_due(config: &Path, state_dir: &Path, home: &Path, now: i64) -> 
 
 /// [`sync_accounts_for_init`] for the other pooled CLIs ([`OTHER_CLIS`]), each through
 /// [`sync_cli_with`] with no source: a CLI whose roster this machine keeps beside `roster_path`,
-/// or whose pool syncs by default ([`syncs_by_default`]), syncs from its fleet in `~/.secrets`;
+/// or whose pool syncs by default ([`syncs_by_default`]), syncs from its fleet in the vault;
 /// any other reads nothing ([`CliSync::Off`]), whatever the vault put there. Where
 /// [`accounts_sync_off`] holds, no CLI is synced and the list is empty.
 #[must_use]
@@ -13103,16 +13194,14 @@ fn upkeep_pools(
 }
 
 /// What a sync of `cli`'s pool with no roster here reads that a periodic caller reads cheaply
-/// ([`default_sync_holds`]): its fleet file and the sheet in `~/.secrets` (each as the sync
-/// reads it, never through a link), and `config` (`[fleet] machine`, read through a link as
-/// the sync reads it). The source policy is part of the observation; a retired legacy file is
-/// never read. The host's name and other pool records are left out: [`REDISCOVER_EVERY`]
-/// reads them again.
+/// ([`default_sync_holds`]): the vault entry it selects (its name, and an in-process digest of
+/// what it holds, [`crate::vault_entry::digest`]), and `config` (`[fleet] machine`, read through
+/// a link as the sync reads it). The source policy is part of the observation; a retired legacy
+/// entry is never read. The host's name and other pool records are left out:
+/// [`REDISCOVER_EVERY`] reads them again.
 fn cli_sync_inputs(cli: Cli, home: &Path, state_dir: &Path, config: &Path) -> [u8; 32] {
-    let secrets = home.join(".secrets");
-    let secrets_pool = secrets.join(super::ai_pool::AI_POOL_FILE);
     let mut hash = aterm_digest::Sha256::new();
-    hash.update(b"aterm-cli-sync-inputs-v4");
+    hash.update(b"aterm-cli-sync-inputs-v5");
     hash.update(cli.id().as_bytes());
     let policy = match accounts::Store::at_for(state_dir, cli, home).source_policy() {
         // Eligibility is reflected by selection below. Recording our own retirement
@@ -13140,36 +13229,21 @@ fn cli_sync_inputs(cli: Cli, home: &Path, state_dir: &Path, config: &Path) -> [u
     }
     // The sheet only where the harness may read it ([`sheet_read_here`]): while the lab may name
     // this Mac and could not be read yet, an edit to it calls for no sync.
-    let selected = match local_cli_source_observed(cli, home, &policy, &mut |path, pool| {
-        if pool {
-            pool_entry_present(path)
-        } else {
-            source_entry_present(path)
-        }
-    }) {
-        Ok(selected) => selected,
-        Err(why) => {
-            hash.update([2]);
-            hash.update(why.as_bytes());
-            return hash.finalize();
-        }
-    };
+    let selected = local_cli_source_observed(cli, home, &policy);
     if let Some(selected) = &selected {
-        let bytes = selected.path.as_os_str().as_encoded_bytes();
+        let bytes = selected.entry.name.as_bytes();
         hash.update([1]);
         hash.update((bytes.len() as u64).to_be_bytes());
         hash.update(bytes);
     } else {
         hash.update([0]);
     }
-    let fleet = [selected.as_ref().and_then(|selected| {
-        read_local_source_text(&selected.path)
-            .map(String::into_bytes)
-            .ok()
+    let fleet = [selected.as_ref().map(|selected| {
+        crate::vault_entry::digest(home, &[&selected.entry.name], SOURCE_TEXT_MAX_BYTES).to_vec()
     })];
     let pool_identity = selected
         .as_ref()
-        .is_some_and(|source| source.path == secrets_pool)
+        .is_some_and(|source| source.entry.name == super::ai_pool::AI_POOL_FILE)
         .then(|| {
             super::ai_pool::resolve_local_pool_identity(Some(home), Some(config), None)
                 .map(|id| {
@@ -13631,6 +13705,8 @@ impl LoginActivity {
 pub struct LoginDiagnostic {
     pub completed_at: i64,
     row: accounts::Row,
+    /// How the run ended, which with `observation` says it ([`Self::words`]).
+    renewal: super::cli::Renewal,
     observation: super::cli::RenewalObservation,
 }
 
@@ -13638,6 +13714,7 @@ impl std::fmt::Debug for LoginDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginDiagnostic")
             .field("completed_at", &self.completed_at)
+            .field("renewal", &self.renewal)
             .field("observation", &self.observation)
             .finish_non_exhaustive()
     }
@@ -13647,6 +13724,7 @@ impl std::hash::Hash for LoginDiagnostic {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.completed_at.hash(state);
         self.row.label.hash(state);
+        self.renewal.hash(state);
         self.observation.hash(state);
     }
 }
@@ -13658,9 +13736,11 @@ impl LoginDiagnostic {
         &self.row.label
     }
 
+    /// How the run ended, in the words its row's record says too
+    /// (`cli::RenewalObservation::ended`, the one wording of a run's end).
     #[must_use]
     pub fn words(&self) -> String {
-        self.observation.words()
+        self.observation.ended(self.renewal)
     }
 
     /// A same-label replacement is not the account this invocation observed.
@@ -13680,6 +13760,7 @@ impl LoginDiagnostic {
         Self {
             completed_at,
             row: row.clone(),
+            renewal: super::cli::Renewal::authentication_failed(Some(code)),
             observation: super::cli::RenewalObservation::from_outcome(&Ok(
                 super::cli::RenewalExit { code, met },
             )),
@@ -13840,6 +13921,18 @@ fn login_activity_batch_of(
 pub fn login_activity(store: &accounts::Store, cli: Cli, now: i64) -> Option<Vec<LoginActivity>> {
     let [requested, _] = login_activity_batch([Some(store), None], cli, now)?.scopes;
     requested.map(|scope| scope.rows)
+}
+
+/// [`login_activity`] for a decision off the window's thread: it waits for the observation
+/// lock, which each holder takes for one step on this process's own record and no renewal
+/// holds while it runs, so the rows it answers are the record's and never another thread's
+/// instant on the lock.
+#[must_use]
+pub fn login_activity_waited(store: &accounts::Store, cli: Cli, now: i64) -> Vec<LoginActivity> {
+    let guard = AUTO_RENEW_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    login_activity_of(&guard, store, cli, now, Instant::now())
 }
 
 fn login_activity_of(
@@ -14401,6 +14494,28 @@ fn observe_committed_logins(
     }
 }
 
+/// Holds `label`'s login in `store` active, as a renewal of it under way does, until the value
+/// returned is dropped: how a test lays out a renewal a reader of [`login_activity`] waits for.
+#[cfg(test)]
+#[must_use]
+pub(super) fn hold_login_activity_for_test(
+    store: &accounts::Store,
+    cli: Cli,
+    label: &str,
+) -> impl Sized + use<> {
+    LoginActivityGuard::begin(&AUTO_RENEW_GUARD, store, cli, label, None)
+}
+
+/// Holds the window's observation lock, as any reader or writer of its activity does for an
+/// instant, until the value returned is dropped: how a test lays out a busy lock.
+#[cfg(test)]
+#[must_use]
+pub(super) fn hold_login_observation_for_test() -> impl Sized {
+    AUTO_RENEW_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl LoginActivityGuard {
     #[cfg(test)]
     fn begin(
@@ -14470,7 +14585,7 @@ impl LoginActivityGuard {
         &self,
         row: &accounts::Row,
         completed_at: i64,
-        observation: super::cli::RenewalObservation,
+        (renewal, observation): (super::cli::Renewal, super::cli::RenewalObservation),
     ) {
         let mut state = self
             .guard
@@ -14495,6 +14610,7 @@ impl LoginActivityGuard {
         owner.diagnostic = Some(LoginDiagnostic {
             completed_at,
             row: row.clone(),
+            renewal,
             observation,
         });
     }
@@ -15395,10 +15511,11 @@ fn latest_mailbox_mtime(
     latest_mailbox_mtime_with(&|_| None, home, store)
 }
 
-/// The newest modification time among the files a sign-in reads (each file in `~/.secrets`,
-/// the configuration and roster files, the mailbox configurations, and the messages in the mail
-/// folders, the environment `var` reads naming one): a change
-/// here ends an automatic sign-in's cooldown. Neither the `~/.secrets` folder's own time nor
+/// The newest modification time among what a sign-in reads (the configuration and roster files,
+/// the mailbox configurations, the messages in the mail folders, the environment `var` reads
+/// naming one, and the time this process saw the vault's mailbox entries change,
+/// [`crate::vault_entry::changed_at`]): a change
+/// here ends an automatic sign-in's cooldown. Neither the vault folder's own files nor
 /// the vault's `state.toml`, which its subscriber rewrites about once a minute only to say when
 /// it last heard the vault, is among them, and nor is a mail folder's own time, which the mark a
 /// sign-in leaves in the folder for a message it used (`.clicked`) moves: a sign-in's own reading
@@ -15420,26 +15537,22 @@ fn latest_mailbox_mtime_at(
     at: std::time::SystemTime,
 ) -> Option<std::time::SystemTime> {
     let mut paths = vec![store.dir.join(super::headless_oauth::MAILBOX_TOML_FILE)];
+    let mut vault_changed = None;
     if let Some(h) = home {
-        let secrets_dir = h.join(".secrets");
-        if let Ok(entries) = std::fs::read_dir(&secrets_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|ft| ft.is_file()) {
-                    paths.push(entry.path());
-                }
-            }
-        }
+        let entries = super::headless_oauth::vault_mailbox_entries(h);
+        let names = entries.iter().map(String::as_str).collect::<Vec<_>>();
+        // A change this read is the first to see is stamped as it reads, after `at`: it is a
+        // change as of `at`, never a future timestamp.
+        vault_changed = crate::vault_entry::changed_at(
+            "mailbox",
+            h,
+            &names,
+            super::headless_oauth::MAILBOX_TOML_MAX_BYTES,
+        )
+        .map(|seen| seen.min(at));
         paths.push(h.join(".config/aterm/aterm.toml"));
         paths.push(h.join(".config/aterm/accounts.toml"));
         paths.push(h.join(".config/aterm").join(FLEET_ROSTER_FILE));
-        paths.push(
-            h.join(".secrets")
-                .join(super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-        );
-        paths.push(
-            h.join(".secrets")
-                .join(super::headless_oauth::MAILBOX_TOML_FILE),
-        );
         paths.push(
             h.join(".config/aterm")
                 .join(super::headless_oauth::MAILBOX_TOML_FILE),
@@ -15479,6 +15592,7 @@ fn latest_mailbox_mtime_at(
     paths
         .into_iter()
         .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+        .chain(vault_changed)
         .filter(|mtime| *mtime <= at)
         .max()
 }
@@ -15626,6 +15740,33 @@ fn rows_on_token(cli: Cli, env: &Env, roster: &Roster) -> BTreeMap<String, u64> 
     }
     let _ = (cli, env, roster);
     BTreeMap::new()
+}
+
+/// THE UPKEEP KEEPS WHICH ROWS RUN ON THEIR VAULT TOKEN HERE (`accounts::TokensHere`): one
+/// value-free read of the vault under `home` ([`super::accounts_tokens::rows_on_token_read`])
+/// over Claude Code's roster at `roster_path` as `logins.json` binds it, kept in its store under
+/// `accounts.lock` ([`accounts::Store::note_tokens_here`]), so rotation can pick a row whose
+/// stored login is signed out while its token serves it ([`accounts::LoginHere::OnToken`]). A
+/// vault that could not be read keeps the reading before it, which ages out within the hour.
+/// Every pass that renews makes it, whether or not the ladder signs rows in, since rotation reads
+/// it either way; `read` is the read ([`UpkeepEffects::tokens_here`]). Returns whether the kept
+/// reading changed.
+fn note_tokens_here(
+    home: &Path,
+    state_dir: &Path,
+    roster_path: &Path,
+    now: i64,
+    read: TokensRead,
+) -> bool {
+    let store = accounts::Store::at_for(state_dir, Cli::Claude, home);
+    let Ok(raw) = store.read_roster(Some(roster_path), now) else {
+        return false;
+    };
+    let Ok((logins, _)) = store.load_logins(now) else {
+        return false;
+    };
+    let read = read(home, &store, &accounts::bound(&raw, &logins), now);
+    store.note_tokens_here(read.as_ref(), now).unwrap_or(false)
 }
 
 /// [`rows_of_other_macs`] less the rows on their vault token.
@@ -15910,12 +16051,15 @@ fn rank_renewal_candidates(
             .get(label)
             .is_some_and(|a| a.limited_until(now).is_some())
     };
+    // By the stored login's reading: a row on its vault token is kept out of every tier only by
+    // the live read (`others.on_token`, [`auto_renew_candidates_tiered`]), never by a reading kept
+    // across a vault this pass could not read, which no launch here would start on.
     let wants_sign_in = |row: &accounts::Row| {
         let is_enr = row.dir.is_none() || enrolled.contains(&row.label);
         row.held_by.is_none()
             && (row.email.is_some() || cli == Cli::Kimi)
             && matches!(
-                accounts::condition(row, state, is_enr, now),
+                accounts::stored_login_condition(row, state, is_enr, now),
                 accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
             )
     };
@@ -16336,22 +16480,28 @@ fn upkeep_browser(window: bool, opener: PathBuf) -> super::cli::RenewBrowser {
     }
 }
 
-/// The log's line for the token step after `label`'s sign-in in aterm's window: that the token
-/// was made, or what the token verb `refused`, on one line and with each address in it written
-/// `<address>` (the verb names the account to a person; the log names the row).
-#[cfg_attr(
-    not(unix),
-    allow(
-        dead_code,
-        reason = "only the token step after a sign-in writes it, and that step is Unix's"
-    )
-)]
-fn token_step_line(label: &str, refused: &str) -> String {
+/// The log's line for the token step after `label`'s sign-in, `signed_in` in aterm's window or
+/// headlessly: that the token was made, and where, or what the token verb `refused`, on one line
+/// and with each address in it written `<address>` (the verb names the account to a person; the
+/// log names the row). Only the token step after a sign-in writes it, and that step, like
+/// [`super::accounts_tokens::SignedIn`], is Unix's.
+#[cfg(unix)]
+fn token_step_line(
+    label: &str,
+    signed_in: super::accounts_tokens::SignedIn,
+    refused: &str,
+) -> String {
+    use super::accounts_tokens::SignedIn;
     let refused = refused.trim();
     format!(
         "{label}: token: {}",
         if refused.is_empty() {
-            "made in the sign-in window".to_owned()
+            match signed_in {
+                SignedIn::Window => "made in the sign-in window",
+                SignedIn::Headless => "made on its headless browser profile",
+                SignedIn::Elsewhere => "made",
+            }
+            .to_owned()
         } else {
             super::open_url::without_addresses(&super::one_line(refused, 300))
         }
@@ -18127,6 +18277,8 @@ struct LadderCtx<'a> {
     shared: shared_renewal::Effects<'a>,
     /// How many `[harness] hosts` the config beside the roster names.
     hosts: usize,
+    /// The vault route's read ([`UpkeepEffects::tokens_here`]).
+    tokens_here: TokensRead,
 }
 
 impl<'a> LadderCtx<'a> {
@@ -18146,6 +18298,7 @@ impl<'a> LadderCtx<'a> {
                 .0
                 .hosts
                 .len(),
+            tokens_here: fx.tokens_here,
         }
     }
 }
@@ -18163,6 +18316,9 @@ enum LadderStep {
     Held,
     /// No route: recorded, logged, and the row's backoff set.
     NoRoute,
+    /// The vault route found the row's year token in use here ([`ladder_vault_token`]):
+    /// recorded, logged, and no route runs.
+    OnToken,
 }
 
 /// A read-only cache context, never authority to use a vault or its credentials.
@@ -18197,10 +18353,8 @@ fn vault_state_lines(text: &str) -> impl Iterator<Item = (&str, &str, &str)> {
 /// them. Not the version applied here (`seq`, `digest`): it moves only after this Mac's
 /// subscriber or a sync has applied that version, about once a minute or two on the lab's vault,
 /// most of them writing nothing here, so a refresh it started could only find that version
-/// applied. What a version does bring a route lands in `~/.secrets`, whose files
-/// [`ladder_inputs`] stamps, a file a partial apply left unwritten and a later pass writes at the
-/// same version included (of home paths a vault writes only gh's, git's and the release
-/// material, which no route reads: `aterm_secrets::entry_class::set_apart_refusal`).
+/// applied. What a version does bring a route is in the mailbox entries it reads, which
+/// [`ladder_inputs`] digests by what they hold.
 fn vault_membership_fields(text: &str) -> impl Iterator<Item = &str> {
     vault_state_lines(text).filter_map(|(table, key, line)| {
         (table.is_empty() && matches!(key, "membership" | "source_identity")).then_some(line)
@@ -18292,8 +18446,9 @@ fn vault_input(home: &Path) -> VaultInput {
 }
 
 /// What the files a route reads hold now, as one line a row's backoff is kept by
-/// ([`super::sign_in_ladder::Ladder::held`]): each file in `~/.secrets` (its name, size and
-/// modification time); the vault's membership and identity ([`vault_membership_fields`], never
+/// ([`super::sign_in_ladder::Ladder::held`]): the names the vault holds here and its mailbox
+/// entries (an in-process digest of what they hold, [`crate::vault_entry::digest`]); the vault's
+/// membership and identity ([`vault_membership_fields`], never
 /// the version it applied, nor that file's own time, which the vault's subscriber rewrites about
 /// once a minute only to say when it last heard the vault); the vault's `source.toml`; the
 /// mailbox configurations; and the store's browser profiles. Mail arriving in a mailbox folder is
@@ -18306,19 +18461,17 @@ fn ladder_inputs(home: &Path, store: &accounts::Store) -> String {
             .map(|meta| (meta.len(), meta.modified().ok()))
     };
     let mut line = String::new();
-    let secrets = home.join(".secrets");
-    let mut held: Vec<(std::ffi::OsString, PathBuf)> = fs::read_dir(&secrets)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| (entry.file_name(), entry.path()))
-                .collect()
-        })
-        .unwrap_or_default();
-    held.sort();
-    for (name, path) in held {
-        line.push_str(&format!("{}={:?};", name.to_string_lossy(), stamp(&path)));
+    // Every name the vault holds here (value-free), then what its mailbox entries hold.
+    for name in crate::vault_entry::names(home) {
+        line.push_str(&name);
+        line.push(';');
     }
+    let entries = super::headless_oauth::vault_mailbox_entries(home);
+    let names = entries.iter().map(String::as_str).collect::<Vec<_>>();
+    line.push_str(&aterm_codec::hex::encode_lower(
+        &crate::vault_entry::digest(home, &names, super::headless_oauth::MAILBOX_TOML_MAX_BYTES),
+    ));
+    line.push(';');
     let vault = home.join(".config/aterm/secrets");
     if let Ok(text) = read_vault_state_text(&vault.join("state.toml")) {
         for kept in vault_membership_fields(&text) {
@@ -18413,8 +18566,8 @@ fn ladder_route_with_clock(
 /// or in aterm's sign-in window, a window a person closed, another account's consent) under
 /// [`PERSON_BACKOFF`] ago, with no signed-in `accounts browser` window on record since. A real change of address could change that page's answer sooner too, but nothing here
 /// can tell one from the rest of what counts as a move ([`super::sign_in_ladder::Ladder::moved`]).
-/// This holds across what the ladder's own wait does not: a restart forgets that wait, and a file
-/// changing in `~/.secrets` ends it as a new input, though a check judges neither.
+/// This holds across what the ladder's own wait does not: a restart forgets that wait, and a vault
+/// entry changing ends it as a new input, though a check judges neither.
 fn page_holds(
     store: &accounts::Store,
     raw: &accounts::Row,
@@ -18530,36 +18683,8 @@ fn ladder_route_in_context(
                     VaultTurn::Seen(seen) => seen,
                     VaultTurn::Running | VaultTurn::Unavailable => return LadderStep::Held,
                     VaultTurn::Due => {
-                        let guard = std::sync::Arc::clone(renew_guard);
-                        let mut claim = VaultWorkClaim {
-                            guard: guard.clone(),
-                            context: key,
-                            completed: false,
-                        };
-                        let (sync, home_owned) = (ctx.vault_sync, home.to_path_buf());
-                        let scope = ctx.scope.clone();
-                        let _ = (ctx.spawn_vault)(Box::new(move || {
-                            if scope
-                                .as_ref()
-                                .is_some_and(super::account_work::Scope::cancelled)
-                            {
-                                return;
-                            }
-                            let seen = sync(&home_owned, scope.as_ref());
-                            if scope
-                                .as_ref()
-                                .is_some_and(super::account_work::Scope::cancelled)
-                            {
-                                return;
-                            }
-                            guard
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .ladder
-                                .vault_done(seen);
-                            claim.complete();
-                        }));
-                        let Some(seen) = lock(renew_guard).ladder.vault_result(key, at) else {
+                        let Some(seen) = start_vault_refresh(home, key, at, renew_guard, ctx)
+                        else {
                             return LadderStep::Held;
                         };
                         seen
@@ -18601,6 +18726,22 @@ fn ladder_route_in_context(
         && let Some(line) = mailbox_need(home, &row.label, true)
     {
         (ctx.log)(&format!("{}: its mailbox need: {line}", row.label));
+    }
+    // The vault route comes before any route that opens a browser or a window, and before a
+    // row with none is recorded as such. A shared row's admitted preparation is its authority's
+    // to run or retire, so it never stops here.
+    if preparation.is_none()
+        && let Some(step) = ladder_vault_token(
+            home,
+            store,
+            (&records.roster, &raw, row, logins),
+            now,
+            renew_guard,
+            ctx,
+            (&read, at),
+        )
+    {
+        return step;
     }
     if let Some(route) = read.route() {
         return LadderStep::Go {
@@ -18651,13 +18792,165 @@ fn ladder_route_in_context(
     LadderStep::NoRoute
 }
 
+/// Starts the vault refresh [`super::sign_in_ladder::Ladder::vault_turn`] said is due for the
+/// vault context `key` at `at`: one bounded `aterm secrets sync` for `home`
+/// ([`LadderCtx::vault_sync`]) off this thread ([`LadderCtx::spawn_vault`]), whose end the ladder
+/// records ([`super::sign_in_ladder::Ladder::vault_done`]). What it found where it has ended
+/// already; `None` while it runs.
+fn start_vault_refresh(
+    home: &Path,
+    key: super::sign_in_ladder::VaultContext,
+    at: Instant,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    ctx: &LadderCtx<'_>,
+) -> Option<super::sign_in_ladder::Vault> {
+    let guard = std::sync::Arc::clone(renew_guard);
+    let mut claim = VaultWorkClaim {
+        guard: guard.clone(),
+        context: key,
+        completed: false,
+    };
+    let (sync, home_owned) = (ctx.vault_sync, home.to_path_buf());
+    let scope = ctx.scope.clone();
+    let _ = (ctx.spawn_vault)(Box::new(move || {
+        if scope
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return;
+        }
+        let seen = sync(&home_owned, scope.as_ref());
+        if scope
+            .as_ref()
+            .is_some_and(super::account_work::Scope::cancelled)
+        {
+            return;
+        }
+        guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ladder
+            .vault_done(seen);
+        claim.complete();
+    }));
+    renew_guard
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .ladder
+        .vault_result(key, at)
+}
+
+/// THE VAULT ROUTE, BEFORE ANY BROWSER: where the lab keys a token entry for `row` (`raw` as the
+/// roster file has it, of the bound `roster`), before a ready route opens a browser or a window for
+/// it and before a row with none is recorded as such, read which rows run on their vault token here
+/// ([`LadderCtx::tokens_here`]: value-free, this Mac's applied vault only). Where `row` is not one
+/// of them and its sign-in workflow has not had one yet, refresh the vault first (the ladder's own
+/// bounded `aterm secrets sync`, on its own clock and off this thread: [`Ladder::vault_turn`]),
+/// since another Mac may have minted the row's token in aterm's window, or verified one, since this
+/// one last applied the vault, and read again: once per workflow (a refresh that did not read the
+/// whole vault, [`super::sign_in_ladder::Vault::read_whole`], does not count, so the vault's clock
+/// lets the next pass try again), never once per pass, and never in no vault or one this Mac cannot
+/// read. Off macOS no launch starts on a token, so this reads nothing and refreshes nothing. Where
+/// the token is in use here, the reading is kept for rotation
+/// ([`accounts::Store::note_tokens_here`], waking the sessions that wait on a move), the attempt is
+/// recorded [`accounts::AttemptOutcome::OnToken`] by the `vault` route
+/// ([`super::sign_in_ladder::Route::Vault`]), one `aterm.log` line says so
+/// ([`super::sign_in_ladder::on_token_words`]), and nothing opens ([`LadderStep::OnToken`]).
+/// [`LadderStep::Held`] while the refresh runs. `None`: the ladder goes on as before, as it does
+/// for a token another Mac minted at a person's terminal (or by a meta that names no route) and
+/// nobody verified, which serves only that Mac, and for a row whose login is not made here, which
+/// no reading names whatever its token ([`super::accounts_tokens::rows_on_token_of`]): no launch
+/// starts on such a row here until its sign-in makes its login. Nothing here asks another Mac
+/// anything: the refresh reads the shared vault.
+///
+/// [`Ladder::vault_turn`]: super::sign_in_ladder::Ladder::vault_turn
+fn ladder_vault_token(
+    home: &Path,
+    store: &accounts::Store,
+    (roster, raw, row, logins): (&Roster, &accounts::Row, &accounts::Row, &accounts::Logins),
+    now: i64,
+    renew_guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    ctx: &LadderCtx<'_>,
+    (read, at): (&super::sign_in_ladder::Read, Instant),
+) -> Option<LadderStep> {
+    use super::sign_in_ladder::{Route, VaultTurn};
+    fn lock(
+        guard: &std::sync::Arc<std::sync::Mutex<AutoRenewGuard>>,
+    ) -> std::sync::MutexGuard<'_, AutoRenewGuard> {
+        guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    // No launch here starts on a token off macOS, so no refresh could find one serving.
+    if !super::token_route::LAUNCHES_ON_TOKEN {
+        return None;
+    }
+    accounts::TokenEntry::of_row(row)?;
+    let serving = |reading: Option<&BTreeMap<String, u64>>| {
+        reading.and_then(|rows| rows.get(&row.label).copied())
+    };
+    let mut reading = (ctx.tokens_here)(home, store, roster, now);
+    let mut read = read.clone();
+    if serving(reading.as_ref()).is_none()
+        && let Some(workflow) = accounts::current_workflow(raw, logins)
+        && !lock(renew_guard)
+            .ladder
+            .token_refreshed(&row.label, workflow)
+    {
+        let VaultInput::Read(key) = vault_input(home) else {
+            return None;
+        };
+        let turn = lock(renew_guard).ladder.vault_turn(Some(key), at);
+        let seen = match turn {
+            VaultTurn::Seen(seen) => seen,
+            VaultTurn::Running => return Some(LadderStep::Held),
+            VaultTurn::Unavailable => return None,
+            VaultTurn::Due => match start_vault_refresh(home, key, at, renew_guard, ctx) {
+                Some(seen) => seen,
+                None => return Some(LadderStep::Held),
+            },
+        };
+        // Only a refresh that read the whole vault uses the workflow's one: a failed one (off the
+        // LAN, say) leaves it for the next pass the vault's own clock lets refresh.
+        if seen.read_whole() {
+            lock(renew_guard)
+                .ladder
+                .note_token_refreshed(&row.label, workflow);
+        }
+        reading = (ctx.tokens_here)(home, store, roster, now);
+        read.vault.get_or_insert(seen);
+    }
+    let until = serving(reading.as_ref())?;
+    if store
+        .note_tokens_here(reading.as_ref(), now)
+        .unwrap_or(false)
+    {
+        let _ = store.touch_wake();
+    }
+    if !note_attempt(
+        store,
+        (&ctx.roster_path, row, logins),
+        accounts::AttemptOutcome::OnToken,
+        Route::Vault.as_str(),
+        now,
+    ) {
+        return Some(LadderStep::Held);
+    }
+    (ctx.log)(&super::sign_in_ladder::log_line(
+        &row.label,
+        accounts::AttemptOutcome::OnToken.as_str(),
+        &super::sign_in_ladder::on_token_words(until, &read),
+    ));
+    Some(LadderStep::OnToken)
+}
+
 /// Ask the lab for `label`'s mailbox password, or record that the row's mailbox is now there
 /// (`met`), through this Mac's need ledger (docs/DESIGN-credential-requests-2026-10-27.md
 /// §12.3): the ledger posts the request once this Mac is a Commons Writer and asks a person only
 /// when no Mac the lab reaches holds it. The need's line, for the log; `None` when nothing
 /// moved (`met` with no need on file) or the ledger cannot be used here, as on every system but
 /// unix, where no vault runs and so no ledger is kept.
-fn mailbox_need(home: &Path, label: &str, met: bool) -> Option<String> {
+pub(super) fn mailbox_need(home: &Path, label: &str, met: bool) -> Option<String> {
     #[cfg(unix)]
     {
         use aterm_secrets::need::{self, Purpose, Want};
@@ -19111,7 +19404,9 @@ fn spawn_row_renewal(
                     Some((route, read, inputs, std::sync::Arc::clone(&ctx.log))),
                 )
             }
-            LadderStep::Held => return RenewalDispatch::Held,
+            // A row on its token needs no sign-in now; nothing is started, and the next
+            // candidate is the upkeep's to try.
+            LadderStep::Held | LadderStep::OnToken => return RenewalDispatch::Held,
             LadderStep::NoRoute => return RenewalDispatch::Failed,
         },
         None => {
@@ -19271,14 +19566,15 @@ fn spawn_row_renewal(
                 return;
             }
             let deferred = std::cell::Cell::new(false);
-            // How the last run's `claude auth login` exited, and what its opener's headless
-            // sign-in met (its outcome file), for the words of one that made no login
-            // (`sign_in_ladder::how_it_ended`).
-            let exited: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+            // What the last run's opener's headless sign-in met (its outcome file), which the
+            // backoff below reads.
             let met: std::cell::RefCell<Option<super::open_url::Met>> =
                 std::cell::RefCell::new(None);
-            // Why the last run could not be started or read, where it gave no ending of its own.
-            let cause: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+            // How the last run ended (its exit, what its opener met, why it did not finish), kept
+            // as a shared-custody run keeps its own, so both say a run's end from one input
+            // (`cli::RenewalObservation::ended`, the one wording of a run's end).
+            let ended: std::cell::RefCell<Option<super::cli::RenewalObservation>> =
+                std::cell::RefCell::new(None);
             let attempt_snapshot = std::cell::RefCell::new(None);
             // Diagnostic facts only. Shared custody must not enter the ordinary attempt
             // snapshot or the met cell used by retry/blocked policy below.
@@ -19317,11 +19613,8 @@ fn spawn_row_renewal(
                     (force_headless, mailbox_dir.as_deref(), None),
                     scope.as_ref(),
                 );
-                let ran = match ran {
-                    Ok((ran, seen)) => {
-                        met.replace(seen);
-                        ran
-                    }
+                let (ran, seen) = match ran {
+                    Ok(got) => got,
                     Err(failure) => {
                         if failure.is_deferred() {
                             completion.defer();
@@ -19334,16 +19627,22 @@ fn spawn_row_renewal(
                             let _ = fs::remove_dir_all(&staging);
                             return Renewal::Deferred;
                         }
-                        cause.replace(Some(failure.to_string()));
-                        met.replace(failure.met);
+                        met.replace(failure.met.clone());
+                        ended.replace(Some(super::cli::RenewalObservation::from_outcome(&Err(
+                            failure,
+                        ))));
                         let _ = fs::remove_dir_all(&staging);
                         return Renewal::Failed;
                     }
                 };
-                if ran.code != Some(0) || !accounts::login_made(&staging) {
+                met.replace(seen.clone());
+                let code = ran.code;
+                ended.replace(Some(super::cli::RenewalObservation::from_outcome(
+                    &super::cli::RenewalExit::from_capture((ran, seen)),
+                )));
+                if code != Some(0) || !accounts::login_made(&staging) {
                     let _ = fs::remove_dir_all(&staging);
-                    exited.set(ran.code);
-                    return Renewal::authentication_failed(ran.code);
+                    return Renewal::authentication_failed(code);
                 }
                 if scope
                     .as_ref()
@@ -19475,7 +19774,7 @@ fn spawn_row_renewal(
                                 .as_deref()
                                 .map_or_else(crate::supervise::limit::unix_now, |host| host.now())
                                 .max(now),
-                            observation.clone(),
+                            (result.renewal, observation.clone()),
                         );
                     }
                     shared_observation.replace(result.observation);
@@ -19501,9 +19800,8 @@ fn spawn_row_renewal(
                     return Renewal::Deferred;
                 }
                 *attempt_snapshot.borrow_mut() = Some((*snapshot).clone());
-                exited.set(None);
                 met.replace(None);
-                cause.replace(None);
+                ended.replace(None);
                 let result = {
                     let _activity = LoginActivityGuard::begin_row(
                         &ladder_guard,
@@ -19547,25 +19845,17 @@ fn spawn_row_renewal(
                 }
             };
             let how = |renewal: Renewal| {
-                if renewal != Renewal::Renewed
-                    && let Some(observation) = shared_observation.borrow().as_ref()
-                {
-                    return format!(
-                        "{}; {}",
-                        super::sign_in_ladder::how_it_ended(renewal, None, None),
-                        observation.words()
-                    );
+                let (shared, own) = (shared_observation.borrow(), ended.borrow());
+                match shared.as_ref().or(own.as_ref()) {
+                    Some(observation) if renewal != Renewal::Renewed => observation.ended(renewal),
+                    _ => super::sign_in_ladder::how_it_ended(renewal, None, None, None),
                 }
-                super::sign_in_ladder::how_it_ended_because(
-                    renewal,
-                    exited.get(),
-                    met.borrow().as_ref(),
-                    cause.borrow().as_deref(),
-                )
             };
-            // Whether this run's sign-in was made in aterm's own window, whose store is then the
-            // account's and makes its token.
-            let in_window = std::cell::Cell::new(false);
+            // Where this run's sign-in that stands was made: in aterm's own window, whose store
+            // is then the account's, or by aterm's opener on a headless profile of its own; each
+            // makes its token there.
+            #[cfg(unix)]
+            let signed_in = std::cell::Cell::new(None);
             let ran = (|| -> Result<Renewal, String> {
                 store
                     .check_signin_state(now)
@@ -19590,7 +19880,6 @@ fn spawn_row_renewal(
                 let browser = if has_mailbox || has_headless_profile {
                     // The window where this run opens it ([`upkeep_opens_window`]), decided
                     // before the run started; a scripted run is handed the same choice.
-                    in_window.set(opens_window);
                     upkeep_browser(opens_window, opener.map_err(|error| error.to_string())?)
                 } else {
                     let Some(b) = non_headless_fallback.clone() else {
@@ -19601,6 +19890,8 @@ fn spawn_row_renewal(
                     };
                     b
                 };
+                #[cfg(unix)]
+                signed_in.set(Some(browser.signed_in()));
                 let result = run_attempt(&browser, !has_mailbox && has_headless_profile);
                 if result.published() {
                     return Ok(result);
@@ -19610,6 +19901,8 @@ fn spawn_row_renewal(
                     && has_headless_profile
                     && let Some(fallback) = non_headless_fallback
                 {
+                    #[cfg(unix)]
+                    signed_in.set(Some(fallback.signed_in()));
                     let again = run_attempt(&fallback, false);
                     return if again.published() {
                         Ok(again)
@@ -19734,14 +20027,21 @@ fn spawn_row_renewal(
                     store.complete_requested_pin_at(&roster_owned, &file_roster, request, now_done);
             }
             // A row signed in in aterm's window gets its year-long token in the same store, by
-            // itself (the token design's §4.6), last of all: the renewal is complete, its
-            // requested pin is answered and its sign-in lock is released first, so nothing
-            // that waits on this sign-in waits on a token's window too. What the token verb
-            // refuses is logged with no address in it, and the sign-in stands either way. A
-            // scripted run signed nothing in, so no window's store holds a session to make a
-            // token in.
+            // itself (the token design's §4.6), and one signed in headlessly on the same
+            // headless profile (FL-137), last of all: the renewal is complete, its requested
+            // pin is answered and its sign-in lock is released first, so nothing that waits on
+            // this sign-in waits on a token's page too. What the token verb refuses is logged
+            // with no address in it, and the sign-in stands either way. A scripted run signed
+            // nothing in, so no store or profile holds a session to make a token in, and a
+            // sign-in in a person's browser is offered the step on the row's own surfaces.
             #[cfg(unix)]
-            if renewed && in_window.get() && run_seam.is_none() {
+            if renewed
+                && run_seam.is_none()
+                && let Some(
+                    signed_in @ (super::accounts_tokens::SignedIn::Window
+                    | super::accounts_tokens::SignedIn::Headless),
+                ) = signed_in.get()
+            {
                 drop(_signin);
                 let env = quiet_env(
                     &home_owned,
@@ -19755,6 +20055,7 @@ fn spawn_row_renewal(
                     &env,
                     &host,
                     &next_label,
+                    signed_in,
                     &mut said,
                     &mut refused,
                 )
@@ -19763,6 +20064,7 @@ fn spawn_row_renewal(
                 {
                     log(&token_step_line(
                         &next_label,
+                        signed_in,
                         &String::from_utf8_lossy(&refused),
                     ));
                 }

@@ -155,11 +155,12 @@ impl crate::App {
             task: task.into_bytes(),
             agent: Program::Claude,
             model: None,
+            effort: None,
             caller: None,
             manager_node: None,
             trusted_cwd: Some(trusted),
             fact_line: false,
-            autopilot: aterm_agent::supervise::Autopilot::Land,
+            autopilot: alab_policy::config::Autopilot::Land,
             chrome: false,
             program: None,
         };
@@ -271,7 +272,7 @@ impl crate::App {
             return false;
         };
         self.write_autopilot_batch(
-            &[(local, Some(aterm_agent::supervise::Autopilot::Off), None)],
+            &[(local, Some(alab_policy::config::Autopilot::Off), None)],
             aterm_slog::Actor::Aterm,
             None,
         );
@@ -474,7 +475,7 @@ fn earlier_worker(store: &Store, now_ms: i64) -> Option<(String, String)> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .autopilot_word()
-            == Some(aterm_agent::supervise::Autopilot::Off);
+            == Some(alab_policy::config::Autopilot::Off);
         (!off).then(|| (h.sid.as_str().to_owned(), state))
     })
 }
@@ -1164,7 +1165,7 @@ fn judge(f: &Facts) -> Judged {
 ///   break at one: only a person's browser brings the login back;
 /// - `wall` while its loop held its last turn break at another wall that is no usage limit;
 /// - `limited` while its agent reads a usage-limit wall (a `wall:<kind>` word of a kind
-///   [`aterm_phase::WallKind::reads_limited`]) its loop has open and has not yet taken
+///   [`alab_policy::vocab::WallKind::reads_limited`]) its loop has open and has not yet taken
 ///   as spent (`wall`, [`crate::disk_board::Wall::holds`] at `now_s`: before its reset and the
 ///   loop's grace, when the loop rests there and its line could go);
 /// - `box` while its agent reads a box (`prompt`, `question`) its loop escalated to its owner
@@ -1193,7 +1194,7 @@ fn held_of(
     now_s: i64,
 ) -> Option<ask::HeldBy> {
     use crate::disk_board::Withhold;
-    let sign_in = aterm_phase::WallKind::Auth.wire();
+    let sign_in = alab_policy::vocab::WallKind::Auth.wire();
     if halted {
         return Some(ask::HeldBy::Hold);
     }
@@ -1216,11 +1217,11 @@ fn held_of(
 }
 
 /// Whether `word`, an agent's published word, is a wall of a kind its loop reads as a usage limit
-/// ([`aterm_phase::WallKind::reads_limited`]): the usage windows, a model's bucket, spend, and an
+/// ([`alab_policy::vocab::WallKind::reads_limited`]): the usage windows, a model's bucket, spend, and an
 /// API error, whose rate limit (429) alone does (the word does not say which; the loop's limit
 /// episode, [`crate::disk_board::Board::walls`], does).
 fn limit_word(word: &str) -> bool {
-    use aterm_phase::{ApiCause, WallKind};
+    use alab_policy::vocab::{ApiCause, WallKind};
     [
         WallKind::UsageSession,
         WallKind::UsageWeekly,

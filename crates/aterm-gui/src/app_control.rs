@@ -46,7 +46,7 @@ pub(crate) struct ActRequest {
 /// that does not show the button yet refuses it the same way; every press of a native control
 /// no person is known to stand behind (a control client's key or click, an accessibility
 /// client's request) is refused them as it is dispatched ([`App::person_only_press_refusal`]).
-const PERSON_ONLY_PREFIXES: [(&str, &str); 2] = [
+const PERSON_ONLY_PREFIXES: [(&str, &str); 3] = [
     (
         crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX,
         "Settings ▸ Security's macOS access buttons",
@@ -54,6 +54,11 @@ const PERSON_ONLY_PREFIXES: [(&str, &str); 2] = [
     (
         crate::native_settings::OWNER_RULES_PREFIX,
         "Settings ▸ Harness's Owner rules buttons",
+    ),
+    // Settings ▸ This Mac's writes rename this machine; its field text is not one of them.
+    (
+        crate::native_settings::NAME_PRESS_PREFIX,
+        "Settings' machine-name buttons",
     ),
 ];
 

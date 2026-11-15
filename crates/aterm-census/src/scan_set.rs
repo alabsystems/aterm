@@ -2,27 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Workspace dependency graph and scan-set derivation.
+//! The workspace's `[patch]` targets: the vendored fork ledger, the absorbed crates and the
+//! classification of each target.
 //!
 //! Registry packages and immutable Git packages are external lock-graph nodes,
 //! not local source bodies. Git declarations must match one exact locked source;
 //! their transitive dependency edges still participate in process guards.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::path::Path;
-
-/// Default process root crate (`crates/aterm-gui`).
-pub const GUI_ROOT_CRATE: &str = "crates/aterm-gui";
-
-/// Labeled group of per-platform subtrees not compiled into the macOS binary.
-#[derive(Debug)]
-pub struct PlatformSlice {
-    /// Platform label (`linux`, `windows`, etc.).
-    pub label: &'static str,
-    /// Crate-relative directory or `.rs` file paths in this slice.
-    pub paths: &'static [&'static str],
-}
 
 /// Repo-relative path to the vendored fork ledger (`vendor/forge.toml`).
 pub const FORK_LEDGER: &str = "vendor/forge.toml";
@@ -34,8 +22,6 @@ pub struct ReviewedFork {
     pub package: String,
     /// Repo-relative path to the vendored fork.
     pub path: String,
-    /// Unique census identity namespace prefix (`census.namespace`).
-    pub namespace: &'static str,
 }
 
 /// Parses all `[[fork]]` entries from [`FORK_LEDGER`] under `root`.
@@ -46,25 +32,12 @@ pub fn reviewed_forks(root: &Path) -> Result<Vec<ReviewedFork>, String> {
         Err(e) => return Err(format!("cannot read {FORK_LEDGER}: {e} (fail-closed)")),
     };
     let doc = parse_doc(&text, FORK_LEDGER)?;
-    let mut blocks: Vec<Vec<(String, Value)>> = Vec::new();
-    for (header, entries) in &doc.sections {
-        match header.as_str() {
-            "fork" => blocks.push(entries.clone()),
-            "fork.census" => {
-                let Some(block) = blocks.last_mut() else {
-                    return Err(format!(
-                        "{FORK_LEDGER}: a [fork.census] table before any [[fork]] block"
-                    ));
-                };
-                block.extend(
-                    entries
-                        .iter()
-                        .map(|(k, v)| (format!("census.{k}"), v.clone())),
-                );
-            }
-            _ => {}
-        }
-    }
+    let blocks: Vec<&Vec<(String, Value)>> = doc
+        .sections
+        .iter()
+        .filter(|(header, _)| header == "fork")
+        .map(|(_, entries)| entries)
+        .collect();
     let mut out = Vec::with_capacity(blocks.len());
     for (i, block) in blocks.iter().enumerate() {
         let get = |key: &str| {
@@ -80,24 +53,9 @@ pub fn reviewed_forks(root: &Path) -> Result<Vec<ReviewedFork>, String> {
                  [patch] entry it reviews (fail-closed)"
             ));
         };
-        if get("census.mode") != Some("scanned") {
-            return Err(format!(
-                "{at} (`{package}`) has census.mode {:?}; the census scans every vendored \
-                 fork (`census.mode = \"scanned\"`, fail-closed)",
-                get("census.mode")
-            ));
-        }
-        let namespace = get("census.namespace").unwrap_or("").trim();
-        if namespace.is_empty() {
-            return Err(format!(
-                "{at} (`{package}`) has no census.namespace: a scanned fork's lock \
-                 identities must live in its own namespace (fail-closed)"
-            ));
-        }
         out.push(ReviewedFork {
             package: package.to_string(),
             path: path.to_string(),
-            namespace: intern(namespace),
         });
     }
     Ok(out)
@@ -134,59 +92,23 @@ pub fn fork_packages(root: &Path) -> Result<Vec<String>, String> {
     Ok(packages)
 }
 
-fn intern(s: &str) -> &'static str {
-    static NAMES: std::sync::OnceLock<std::sync::Mutex<BTreeSet<&'static str>>> =
-        std::sync::OnceLock::new();
-    let interned_names = NAMES.get_or_init(Default::default);
-    let mut names = interned_names
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(found) = names.get(s) {
-        return found;
-    }
-    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-    names.insert(leaked);
-    leaked
-}
-
 /// Absorbed upstream crate owned as a workspace member under `crates/`.
 pub struct AbsorbedCrate {
     /// Original upstream package name recorded in `NOTICE`.
     pub upstream: &'static str,
     /// Repo-relative crate directory under `crates/`.
     pub path: &'static str,
-    /// Unique census identity namespace prefix.
-    pub namespace: &'static str,
-    /// Per-platform subtrees not compiled on macOS.
-    pub platform_slices: &'static [PlatformSlice],
     /// Audit note explaining the absorbed crate's status.
     pub audit: &'static str,
 }
 
-/// Registry of absorbed crates scanned in namespaced mode.
+/// Registry of the upstream crates absorbed as workspace members.
 pub const ABSORBED_CRATES: &[AbsorbedCrate] = &[AbsorbedCrate {
     upstream: "winit",
     path: "crates/aterm-window",
-    namespace: "aterm_window",
-    platform_slices: &[
-        PlatformSlice {
-            label: "linux",
-            paths: &[
-                "src/platform_impl/linux",
-                "src/platform/x11.rs",
-                "src/platform/wayland.rs",
-            ],
-        },
-        PlatformSlice {
-            label: "windows",
-            paths: &["src/platform_impl/windows", "src/platform/windows.rs"],
-        },
-    ],
     audit: "winit 0.30.13, absorbed as crates/aterm-window (2026-10-15; vendored as \
             vendor/winit before; the package renamed aterm-window 2026-10-19): runs ON \
-            the main thread of the GUI process; the macOS-compiled surface is graphed \
-            under the `aterm_window::` namespace, the non-macOS backends are labeled \
-            platform slices until the carve; the wasm cells do not compile it",
+            the main thread of the GUI process; the wasm cells do not compile it",
 }];
 
 /// Classification of a `[patch.crates-io]` target directory.
@@ -271,41 +193,6 @@ pub fn classify_patch_target(
         ));
     }
     Ok(PatchTargetKind::FirstParty)
-}
-
-/// Vendored, absorbed, or separately managed workspace library scanned with
-/// its own lock and function identities. This does not exempt internal cycles.
-#[derive(Debug)]
-pub struct ScannedVendored {
-    /// Package name.
-    pub package: String,
-    /// Census identity namespace prefix.
-    pub namespace: &'static str,
-    /// Repo-relative crate directory.
-    pub crate_dir: String,
-    /// Repo-relative `<crate_dir>/src` scan directory.
-    pub scan_dir: String,
-    /// Labeled per-platform subtrees.
-    pub platform_slices: &'static [PlatformSlice],
-    /// A separately managed workspace library, rather than a redistributed fork.
-    pub external_workspace: bool,
-}
-
-/// Derived census scan set and package classifications.
-#[derive(Debug)]
-pub struct ScanSet {
-    /// Sorted repo-relative `<crate_dir>/src` directories to walk.
-    pub scan_dirs: Vec<String>,
-    /// Excluded proc-macro crates as `(package, crate_dir)`.
-    pub proc_macros: Vec<(String, String)>,
-    /// Libraries with independently scoped lock and function identities.
-    pub vendored_scanned: Vec<ScannedVendored>,
-    /// First-party `[patch.*]` redirects as `(package, path)`.
-    pub first_party_patches: Vec<(String, String)>,
-    /// Absorbed crates as `(package, path)`.
-    pub absorbed: Vec<(String, String)>,
-    /// Target-gated dependency edges excluded by [`derive_linked_scan_set`].
-    pub unlinked: Vec<(String, String, String)>,
 }
 
 /// A parsed TOML value from the subset this workspace uses.
@@ -516,10 +403,6 @@ struct DepEdge {
     optional: bool,
     default_features: bool,
     features: Vec<String>,
-    /// The `[target.<key>.dependencies]` table's key (a quoted `cfg(..)`,
-    /// unquoted, or a triple) when the edge is target-gated; `None` in a
-    /// plain `[dependencies]` table.
-    target: Option<String>,
 }
 
 struct Manifest {
@@ -627,7 +510,6 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
                 optional: false,
                 default_features: true,
                 features: Vec::new(),
-                target: None,
             });
         }
         return Err(format!("{file}: `{key}` must be `= true`"));
@@ -647,7 +529,6 @@ fn dep_edge(key: &str, value: &Value, file: &str) -> Result<DepEdge, String> {
         optional: false,
         default_features: true,
         features: Vec::new(),
-        target: None,
     };
     let mut git = None;
     let mut revision = None;
@@ -741,23 +622,15 @@ fn load_manifest(root: &Path, dir: &str) -> Result<Manifest, String> {
         if header.is_empty() {
             continue;
         }
-        let target = split_target(header.trim())
-            .and_then(|(key, _)| key)
-            .map(str::to_string);
         match classify_section(header, &file_rel)? {
             SectionKind::NormalDeps => {
                 for (k, v) in entries {
-                    m.deps.push(DepEdge {
-                        target: target.clone(),
-                        ..dep_edge(k, v, &file_rel)?
-                    });
+                    m.deps.push(dep_edge(k, v, &file_rel)?);
                 }
             }
             SectionKind::NormalDep(name) => {
-                m.deps.push(DepEdge {
-                    target,
-                    ..dep_edge(&name, &Value::Table(entries.clone()), &file_rel)?
-                });
+                m.deps
+                    .push(dep_edge(&name, &Value::Table(entries.clone()), &file_rel)?);
             }
             SectionKind::Package => {
                 for (k, v) in entries {
@@ -847,117 +720,6 @@ fn validate_git_lock(root: &Path, name: &str, pin: &GitPin) -> Result<(), String
         ));
     }
     Ok(())
-}
-
-/// Returns normal external dependency package names declared in `<root>/<dir>/Cargo.toml`.
-pub(crate) fn external_dependency_names(root: &Path, dir: &str) -> Result<Vec<String>, String> {
-    let manifest = load_manifest(root, dir)?;
-    Ok(manifest
-        .deps
-        .into_iter()
-        .filter(|edge| {
-            edge.path.is_none()
-                && !(edge.workspace
-                    && manifest
-                        .ws_deps
-                        .get(&edge.key)
-                        .is_some_and(|ws| ws.dir.is_some()))
-        })
-        .map(|edge| {
-            if edge.workspace
-                && let Some((name, _)) = manifest
-                    .ws_deps
-                    .get(&edge.key)
-                    .and_then(|ws| ws.git.as_ref())
-            {
-                return name.clone();
-            }
-            edge.package.unwrap_or(edge.key)
-        })
-        .collect())
-}
-
-/// Normal dependency aliases with a proved default library source in another workspace member.
-/// Multiple cfg-selected destinations remain a set; callers must not choose one arbitrarily.
-pub(crate) fn member_dependency_aliases(
-    root: &Path,
-    dir: &str,
-) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
-    let manifest = load_manifest(root, dir)?;
-    let mut aliases: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for edge in &manifest.deps {
-        let destinations = aliases.entry(edge.key.replace('-', "_")).or_default();
-        let child = if edge.workspace {
-            manifest
-                .ws_deps
-                .get(&edge.key)
-                .and_then(|dep| dep.dir.clone())
-        } else {
-            edge.path
-                .as_deref()
-                .map(|path| normalize_rel(dir, path))
-                .transpose()?
-        };
-        let Some(child) = child.filter(|path| path.starts_with("crates/")) else {
-            destinations.insert(String::new());
-            continue;
-        };
-        let target = load_manifest(root, &child)?;
-        if target.proc_macro || target.lib_name.is_some() || target.lib_path.is_some() {
-            destinations.insert(String::new());
-            continue;
-        }
-        destinations.insert(child);
-    }
-    Ok(aliases)
-}
-
-/// Library and active build-script roots of a normal process dependency.
-///
-/// # Errors
-/// The manifest is unreadable, an explicit source path is malformed, or it escapes the tree.
-pub(crate) fn dependency_source_roots(root: &Path, dir: &str) -> Result<Vec<String>, String> {
-    let rel = format!("{dir}/Cargo.toml");
-    let text = crate::tree::read_to_string(&root.join(&rel))
-        .map_err(|e| format!("cannot read {rel}: {e}"))?;
-    let doc = parse_doc(&text, &rel)?;
-    let mut library = "src/lib.rs".to_string();
-    let mut build = None;
-    let mut disabled = false;
-    for (header, entries) in doc.sections {
-        for (key, value) in entries {
-            if header == "lib" && key == "path" {
-                let Value::Str(path) = value else {
-                    return Err(format!("{rel}: lib.path must be a string"));
-                };
-                library = path;
-            } else if header == "package" && key == "build" {
-                match value {
-                    Value::Bool(false) => disabled = true,
-                    Value::Bool(true) => {}
-                    Value::Str(path) => build = Some(path),
-                    _ => return Err(format!("{rel}: build must be a string or boolean")),
-                }
-            }
-        }
-    }
-    let source = |path: &str| {
-        if Path::new(path).is_absolute() {
-            return Err(format!(
-                "{rel}: source path `{path}` is not repository-relative"
-            ));
-        }
-        normalize_rel(dir, path)
-    };
-    let mut roots = vec![source(&library)?];
-    if !disabled {
-        if let Some(path) = build {
-            roots.push(source(&path)?);
-        } else if crate::tree::is_file(&root.join(dir).join("build.rs")) {
-            roots.push(source("build.rs")?);
-        }
-    }
-    Ok(roots)
 }
 
 /// One manifest's Cargo targets as its text declares them.
@@ -1076,24 +838,12 @@ pub(crate) fn member_reach(
     Ok(reach)
 }
 
-/// Maps `[patch]` package names to repo-relative paths for workspace-member targets.
-pub(crate) fn member_patch_targets(root: &Path) -> Result<BTreeMap<String, String>, String> {
-    Ok(load_root_tables(root)?
-        .patches
-        .into_values()
-        .filter(|(_, path)| path.starts_with("crates/"))
-        .collect())
-}
-
 /// Single `[[package]]` entry parsed from `Cargo.lock`.
 #[derive(Clone, Debug)]
 pub(crate) struct LockPackage {
     pub(crate) name: String,
-    pub(crate) version: String,
     /// Package `source` (`None` for workspace members and path patches).
     pub(crate) source: Option<String>,
-    /// Dependencies as `(name, optional_version)` pairs.
-    pub(crate) deps: Vec<(String, Option<String>)>,
 }
 
 /// Parses all `[[package]]` entries from `<root>/Cargo.lock`.
@@ -1110,41 +860,14 @@ pub(crate) fn read_lock(root: &Path) -> Result<Vec<LockPackage>, String> {
                 _ => None,
             })
         };
-        let (Some(name), Some(version)) = (get("name"), get("version")) else {
+        let (Some(name), Some(_)) = (get("name"), get("version")) else {
             return Err(format!(
                 "{file}: a [[{header}]] with no name or version (fail-closed)"
             ));
         };
-        let mut deps = Vec::new();
-        match entries
-            .iter()
-            .find(|(k, _)| k == "dependencies")
-            .map(|(_, v)| v)
-        {
-            None => {}
-            Some(Value::Array(items)) => {
-                for item in items {
-                    let Value::Str(spec) = item else {
-                        return Err(format!(
-                            "{file}: `{name}`'s dependencies hold a non-string (fail-closed)"
-                        ));
-                    };
-                    let mut words = spec.split_whitespace();
-                    let dep = words.next().unwrap_or("").to_string();
-                    deps.push((dep, words.next().map(str::to_string)));
-                }
-            }
-            Some(_) => {
-                return Err(format!(
-                    "{file}: `{name}`'s dependencies are not an array (fail-closed)"
-                ));
-            }
-        }
         out.push(LockPackage {
             source: get("source"),
             name,
-            version,
-            deps,
         });
     }
     Ok(out)
@@ -1249,8 +972,6 @@ struct WsSpec {
     /// Repo-relative crate dir, if this is a path dep.
     dir: Option<String>,
     git: Option<(String, GitPin)>,
-    default_features: bool,
-    features: Vec<String>,
 }
 
 struct RootTables {
@@ -1273,10 +994,6 @@ fn patch_row(key: &str, value: &Value) -> (String, Value) {
         }
     }
     (package, Value::Table(rest))
-}
-
-fn load_root_tables(root: &Path) -> Result<RootTables, String> {
-    load_tables(root, "")
 }
 
 /// Cargo inheritance belongs to the package's nearest (or explicitly named)
@@ -1374,8 +1091,6 @@ fn load_tables(root: &Path, base: &str) -> Result<RootTables, String> {
                             git: edge
                                 .git
                                 .map(|pin| (edge.package.unwrap_or_else(|| edge.key.clone()), pin)),
-                            default_features: edge.default_features,
-                            features: edge.features,
                         },
                     );
                 }
@@ -1398,531 +1113,6 @@ fn load_tables(root: &Path, base: &str) -> Result<RootTables, String> {
         }
     }
     Ok(out)
-}
-
-/// What one crate's active features imply.
-#[derive(Default)]
-struct Activation {
-    /// Optional dep keys activated (`dep:x`, implicit `x`, strong `x/f`).
-    active_optional: BTreeSet<String>,
-    /// Per-dep feature requests from `x/f` / `x?/f` items (weak requests are
-    /// consumed only for deps that end up included, as in cargo).
-    dep_requests: BTreeMap<String, BTreeSet<String>>,
-}
-
-fn expand_features(
-    m: &Manifest,
-    dir: &str,
-    defaults: bool,
-    requested: &BTreeSet<String>,
-) -> Result<Activation, String> {
-    let dep_by_key: BTreeMap<&str, &DepEdge> = m.deps.iter().map(|d| (d.key.as_str(), d)).collect();
-    let mut act = Activation::default();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut work: Vec<String> = requested.iter().cloned().collect();
-    if defaults && m.features.contains_key("default") {
-        work.push("default".to_string());
-    }
-    while let Some(item) = work.pop() {
-        if !seen.insert(item.clone()) {
-            continue;
-        }
-        if let Some(rest) = item.strip_prefix("dep:") {
-            if !dep_by_key.contains_key(rest) {
-                return Err(format!(
-                    "{dir}/Cargo.toml: feature item `dep:{rest}` names no dependency \
-                     of `{}` (fail-closed)",
-                    m.name
-                ));
-            }
-            act.active_optional.insert(rest.to_string());
-            continue;
-        }
-        if let Some((dep, feat)) = item.split_once('/') {
-            let (dep, weak) = match dep.strip_suffix('?') {
-                Some(d) => (d, true),
-                None => (dep, false),
-            };
-            let Some(edge) = dep_by_key.get(dep) else {
-                return Err(format!(
-                    "{dir}/Cargo.toml: feature item `{item}` names no dependency \
-                     of `{}` (fail-closed)",
-                    m.name
-                ));
-            };
-            if !weak && edge.optional {
-                act.active_optional.insert(dep.to_string());
-            }
-            act.dep_requests
-                .entry(dep.to_string())
-                .or_default()
-                .insert(feat.to_string());
-            continue;
-        }
-        if m.features.contains_key(&item) {
-            for sub in &m.features[&item] {
-                work.push(sub.clone());
-            }
-            continue;
-        }
-        if let Some(edge) = dep_by_key.get(item.as_str())
-            && edge.optional
-        {
-            act.active_optional.insert(item.clone());
-            continue;
-        }
-        return Err(format!(
-            "{dir}/Cargo.toml: feature item `{item}` of `{}` is neither a feature nor \
-             an optional dependency — the derivation cannot soundly classify it \
-             (fail-closed)",
-            m.name
-        ));
-    }
-    Ok(act)
-}
-
-/// Per-crate unified feature state during the fixpoint.
-#[derive(Default, Clone, PartialEq)]
-struct CrateState {
-    defaults: bool,
-    requested: BTreeSet<String>,
-}
-
-/// Derives the `aterm-gui` process scan set from workspace manifests at `root`.
-pub fn derive_gui_scan_set(root: &Path) -> Result<ScanSet, String> {
-    derive_process_scan_set(root, &[GUI_ROOT_CRATE])
-}
-
-/// Derives the union scan set reachable from `root_crates`.
-pub fn derive_process_scan_set(root: &Path, root_crates: &[&str]) -> Result<ScanSet, String> {
-    derive_linked_scan_set(root, root_crates, &|_| true)
-}
-
-/// Derives the scan set reachable from `root_crates` when linked for `target_arch`.
-pub fn derive_linked_scan_set(
-    root: &Path,
-    root_crates: &[&str],
-    links: &dyn Fn(&str) -> bool,
-) -> Result<ScanSet, String> {
-    let tables = load_root_tables(root)?;
-    let mut unlinked: BTreeSet<(String, String, String)> = BTreeSet::new();
-    let reviewed = reviewed_forks(root)?;
-
-    let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
-    let mut state: BTreeMap<String, CrateState> = BTreeMap::new();
-    for rc in root_crates {
-        state.insert(
-            (*rc).to_string(),
-            CrateState {
-                defaults: true,
-                requested: BTreeSet::new(),
-            },
-        );
-    }
-    let mut rounds = 0usize;
-    loop {
-        rounds += 1;
-        if rounds > 1000 {
-            return Err("feature-resolution fixpoint failed to converge (internal error)".into());
-        }
-        let mut changed = false;
-        let dirs: Vec<String> = state.keys().cloned().collect();
-        for dir in dirs {
-            if !manifests.contains_key(&dir) {
-                manifests.insert(dir.clone(), load_manifest(root, &dir)?);
-            }
-            let m = &manifests[&dir];
-            if m.proc_macro {
-                continue;
-            }
-            let st = state[&dir].clone();
-            let act = expand_features(m, &dir, st.defaults, &st.requested)?;
-            let mut updates: Vec<(String, bool, BTreeSet<String>)> = Vec::new();
-            for edge in &m.deps {
-                let (child_dir, mut defaults, mut feats) = if edge.workspace {
-                    let Some(ws) = m.ws_deps.get(&edge.key) else {
-                        return Err(format!(
-                            "{dir}/Cargo.toml: `{}` says `workspace = true` but its workspace \
-                             [workspace.dependencies] has no such entry (fail-closed)",
-                            edge.key
-                        ));
-                    };
-                    let mut f: BTreeSet<String> = edge.features.iter().cloned().collect();
-                    f.extend(ws.features.iter().cloned());
-                    (
-                        ws.dir.clone(),
-                        edge.default_features && ws.default_features,
-                        f,
-                    )
-                } else {
-                    let d = match &edge.path {
-                        Some(p) => Some(normalize_rel(&dir, p)?),
-                        None => None,
-                    };
-                    (
-                        d,
-                        edge.default_features,
-                        edge.features.iter().cloned().collect(),
-                    )
-                };
-                let included = !edge.optional || act.active_optional.contains(&edge.key);
-                if !included {
-                    continue;
-                }
-                if let Some(key) = &edge.target
-                    && !links(key)
-                {
-                    unlinked.insert((dir.clone(), edge.key.clone(), key.clone()));
-                    continue;
-                }
-                let Some(child_dir) = child_dir else {
-                    continue;
-                };
-                if let Some(req) = act.dep_requests.get(&edge.key) {
-                    feats.extend(req.iter().cloned());
-                }
-                if !defaults && state.get(&child_dir).is_some_and(|s| s.defaults) {
-                    defaults = true;
-                }
-                updates.push((child_dir, defaults, feats));
-            }
-            for (child_dir, defaults, feats) in updates {
-                let entry = state.entry(child_dir.clone()).or_insert_with(|| {
-                    changed = true;
-                    CrateState::default()
-                });
-                if defaults && !entry.defaults {
-                    entry.defaults = true;
-                    changed = true;
-                }
-                for f in feats {
-                    if entry.requested.insert(f) {
-                        changed = true;
-                    }
-                }
-                if !manifests.contains_key(&child_dir) {
-                    manifests.insert(child_dir.clone(), load_manifest(root, &child_dir)?);
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    let mut scan_dirs: Vec<String> = Vec::new();
-    let mut proc_macros: Vec<(String, String)> = Vec::new();
-    let mut names: BTreeMap<String, String> = BTreeMap::new();
-    for dir in state.keys() {
-        let m = &manifests[dir];
-        if let Some(prev) = names.insert(m.name.clone(), dir.clone()) {
-            return Err(format!(
-                "two crates in the closure share the package name `{}`: {prev} and {dir} \
-                 (fail-closed)",
-                m.name
-            ));
-        }
-        if m.proc_macro {
-            proc_macros.push((m.name.clone(), dir.clone()));
-        } else {
-            scan_dirs.push(format!("{dir}/src"));
-        }
-    }
-    scan_dirs.sort();
-    proc_macros.sort();
-
-    for sd in &scan_dirs {
-        if !crate::tree::is_dir(&root.join(sd)) {
-            return Err(format!(
-                "derived closure crate `{sd}` has no src/ directory on disk — the scan \
-                 set and the scannable tree have drifted (fail-closed; fix the crate \
-                 layout or the dependency edge)"
-            ));
-        }
-    }
-
-    let mut vendored_scanned: Vec<ScannedVendored> = Vec::new();
-    let mut first_party_patches: Vec<(String, String)> = Vec::new();
-    let mut absorbed: Vec<(String, String)> = Vec::new();
-    for (pkg, path) in tables.patches.values() {
-        let kind = classify_patch_target(pkg, path, root)?;
-        if kind != PatchTargetKind::Vendored {
-            let what = if kind == PatchTargetKind::Absorbed {
-                "absorbed"
-            } else {
-                "first-party"
-            };
-            if reviewed.iter().any(|r| r.package == *pkg) {
-                return Err(format!(
-                    "[patch] entry `{pkg}` points at {what} `{path}` but ALSO has a \
-                     `[[fork]]` block in {FORK_LEDGER} — the ledger records vendored \
-                     third-party code this repository must keep reviewing, and a \
-                     workspace member is not that. Remove the block (fail-closed: a false \
-                     provenance claim is as wrong as a missing one)"
-                ));
-            }
-            if !crate::tree::is_file(&root.join(path).join("Cargo.toml")) {
-                return Err(format!(
-                    "[patch] entry `{pkg}` points at {what} `{path}`, which has no \
-                     Cargo.toml on disk — cargo cannot resolve this workspace at all \
-                     (fail-closed)"
-                ));
-            }
-            if kind == PatchTargetKind::Absorbed {
-                let Some(row) = ABSORBED_CRATES.iter().find(|a| a.upstream == pkg) else {
-                    return Err(format!(
-                        "[patch] entry `{pkg}` points at absorbed `{path}`, which has no \
-                         ABSORBED_CRATES row — the census must be told how to scan upstream \
-                         code it does not hold to aterm's lock discipline (its identity \
-                         namespace and platform slices): add the row in \
-                         crates/aterm-census/src/scan_set.rs (fail-closed, never silent)"
-                    ));
-                };
-                if row.path != path {
-                    return Err(format!(
-                        "ABSORBED_CRATES entry `{pkg}` is registered at `{}` but the [patch] \
-                         table says `{path}` — the row is STALE; update it",
-                        row.path
-                    ));
-                }
-                vendored_scanned.push(scan_absorbed(root, row, pkg, &mut scan_dirs)?);
-                absorbed.push((pkg.clone(), path.clone()));
-            } else {
-                first_party_patches.push((pkg.clone(), path.clone()));
-            }
-            continue;
-        }
-        let Some(fork) = reviewed.iter().find(|r| r.package == *pkg) else {
-            return Err(format!(
-                "[patch] entry `{pkg}` (path `{path}`) has NO `[[fork]]` block in \
-                 {FORK_LEDGER} — a vendored fork links into the process unreviewed, so a \
-                 human must review it: add its block, the review note in the comment \
-                 above it and `census.mode = \"scanned\"` with its `census.namespace` \
-                 (fail-closed, never silent)"
-            ));
-        };
-        if fork.path != *path {
-            return Err(format!(
-                "{FORK_LEDGER} reviews `{pkg}` at path `{}` but the [patch] table now \
-                 says `{path}` — the review is STALE; re-audit and update the block",
-                fork.path
-            ));
-        }
-        let scan_dir = format!("{path}/src");
-        if !crate::tree::is_dir(&root.join(&scan_dir)) {
-            return Err(format!(
-                "scanned vendored crate `{pkg}` has no `{scan_dir}` directory on disk — \
-                 the review and the tree have drifted (fail-closed)"
-            ));
-        }
-        vendored_scanned.push(ScannedVendored {
-            package: pkg.clone(),
-            namespace: fork.namespace,
-            crate_dir: path.clone(),
-            scan_dir,
-            platform_slices: &[],
-            external_workspace: false,
-        });
-    }
-    for r in &reviewed {
-        if !tables.patches.values().any(|(pkg, _)| *pkg == r.package) {
-            return Err(format!(
-                "{FORK_LEDGER}'s `[[fork]] {}` is no longer in the root [patch] table — a \
-                 STALE review cannot keep describing the tree; remove or update the block \
-                 (fail-closed)",
-                r.package
-            ));
-        }
-        if !crate::tree::is_file(&root.join(&r.path).join("Cargo.toml")) {
-            return Err(format!(
-                "{FORK_LEDGER}'s `[[fork]] {}` points at `{}`, which has no Cargo.toml on \
-                 disk — the review is STALE (fail-closed)",
-                r.package, r.path
-            ));
-        }
-    }
-
-    for row in ABSORBED_CRATES {
-        if absorbed.iter().any(|(_, p)| p == row.path) {
-            continue;
-        }
-        let member = crate::tree::is_file(&root.join(row.path).join("Cargo.toml"));
-        if !(member && retained_license(root, row.path).is_some() && notice_names(root, row.path)) {
-            return Err(format!(
-                "ABSORBED_CRATES entry `{}` (`{}`) is neither an absorbed [patch] target nor an \
-                 absorbed member of this tree (a crate there that retains its upstream license \
-                 file AND that the top-level NOTICE names) — a STALE row cannot keep \
-                 describing it; remove or update the entry (fail-closed)",
-                row.upstream, row.path
-            ));
-        }
-        let package = match manifests.get(row.path) {
-            Some(m) => m.name.clone(),
-            None => load_manifest(root, row.path)?.name,
-        };
-        vendored_scanned.push(scan_absorbed(root, row, &package, &mut scan_dirs)?);
-        absorbed.push((package, row.path.to_string()));
-    }
-    for (dir, manifest) in &manifests {
-        if manifest.workspace_root.is_empty()
-            || manifest.proc_macro
-            || !state.contains_key(dir)
-            || vendored_scanned.iter().any(|entry| entry.crate_dir == *dir)
-        {
-            continue;
-        }
-        vendored_scanned.push(ScannedVendored {
-            package: manifest.name.clone(),
-            namespace: intern(&format!("external::{}", manifest.name)),
-            crate_dir: dir.clone(),
-            scan_dir: format!("{dir}/src"),
-            platform_slices: &[],
-            external_workspace: true,
-        });
-    }
-    {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        for v in &vendored_scanned {
-            if !seen.insert(v.namespace) {
-                return Err(format!(
-                    "two scanned vendored crates share the identity namespace \
-                     `{}` — namespaces must be unique (fail-closed)",
-                    v.namespace
-                ));
-            }
-        }
-    }
-    vendored_scanned.sort_by(|a, b| a.package.cmp(&b.package));
-    first_party_patches.sort();
-    absorbed.sort();
-
-    Ok(ScanSet {
-        scan_dirs,
-        proc_macros,
-        vendored_scanned,
-        first_party_patches,
-        absorbed,
-        unlinked: unlinked.into_iter().collect(),
-    })
-}
-
-fn scan_absorbed(
-    root: &Path,
-    row: &AbsorbedCrate,
-    package: &str,
-    scan_dirs: &mut Vec<String>,
-) -> Result<ScannedVendored, String> {
-    for slice in row.platform_slices {
-        for p in slice.paths {
-            if !crate::tree::exists(&root.join(row.path).join(p)) {
-                return Err(format!(
-                    "ABSORBED_CRATES entry `{}` registers platform slice `{}` path `{p}`, \
-                     which no longer exists under `{}` — the row is STALE (fail-closed)",
-                    row.upstream, slice.label, row.path
-                ));
-            }
-        }
-    }
-    let scan_dir = format!("{}/src", row.path);
-    scan_dirs.retain(|d| *d != scan_dir);
-    Ok(ScannedVendored {
-        package: package.to_string(),
-        namespace: row.namespace,
-        crate_dir: row.path.to_string(),
-        scan_dir,
-        platform_slices: row.platform_slices,
-        external_workspace: false,
-    })
-}
-
-/// Formats the scan-set derivation summary for the census transcript.
-pub fn render_scan_set(set: &ScanSet) -> String {
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "    scan set: DERIVED from the workspace manifests — the Cargo.toml \
-         path-dependency closure of {GUI_ROOT_CRATE} ({} crates; normal deps only, \
-         dev-/build-deps excluded; cfg-target deps included platform-independently; \
-         optional deps feature-resolved for the default build).",
-        set.scan_dirs.len()
-    );
-    if !set.proc_macros.is_empty() {
-        let listed: Vec<String> = set
-            .proc_macros
-            .iter()
-            .map(|(n, d)| format!("{n} ({d})"))
-            .collect();
-        let _ = writeln!(
-            out,
-            "      excluded proc-macro crate(s) (compiler-host code, never loaded into \
-             the GUI process): {}",
-            listed.join(", ")
-        );
-    }
-    if !set.vendored_scanned.is_empty() {
-        let listed: Vec<String> = set
-            .vendored_scanned
-            .iter()
-            .map(|v| {
-                if v.external_workspace {
-                    format!("{} ({}; separate workspace)", v.package, v.crate_dir)
-                } else if v.platform_slices.is_empty() {
-                    format!("{} ({})", v.package, v.crate_dir)
-                } else {
-                    let labels: Vec<&str> = v.platform_slices.iter().map(|s| s.label).collect();
-                    format!(
-                        "{} ({}; per-platform slices labeled, not graphed: {})",
-                        v.package,
-                        v.crate_dir,
-                        labels.join("/")
-                    )
-                }
-            })
-            .collect();
-        let _ = writeln!(
-            out,
-            "      vendored, absorbed, and external-workspace libraries SCANNED in isolated-identity \
-             mode (fork provenance remains checked; external workspaces are derived from manifests) \
-             — process code, each crate's lock identities in its own \
-             `<crate>::…` namespace so foreign receiver names can never merge with \
-             aterm identities or each other: {}",
-            listed.join(", ")
-        );
-    }
-    if !set.first_party_patches.is_empty() {
-        let listed: Vec<String> = set
-            .first_party_patches
-            .iter()
-            .map(|(n, p)| format!("{n} ({p})"))
-            .collect();
-        let _ = writeln!(
-            out,
-            "      FIRST-PARTY [patch] target(s) — workspace members that replace a \
-             crates.io package for every consumer at once, NOT vendored forks: no \
-             review row, no NOTICE line, no provenance obligations; each is scanned \
-             like any other member IF it is in the closure above, and invisible here \
-             if it is not: {}",
-            listed.join(", ")
-        );
-    }
-    if !set.absorbed.is_empty() {
-        let listed: Vec<String> = set
-            .absorbed
-            .iter()
-            .map(|(n, p)| format!("{n} ({p})"))
-            .collect();
-        let _ = writeln!(
-            out,
-            "      ABSORBED crate(s) — upstream source aterm owns as a workspace member \
-             (retained upstream license + NOTICE line; `forge attest` holds its notices), \
-             patched in under the upstream name or renamed and reached by path, no review \
-             row; scanned NAMESPACED with its platform slices (ABSORBED_CRATES) until the \
-             carve, listed with the vendored crates above: {}",
-            listed.join(", ")
-        );
-    }
-    out
 }
 
 #[cfg(test)]

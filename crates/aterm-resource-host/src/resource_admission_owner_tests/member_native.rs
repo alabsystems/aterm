@@ -169,7 +169,9 @@ fn host(unknown: bool) {
     for name in ["targo", "trustc"] {
         let target = sdk.join("bin").join(name);
         fs::copy(program.path(), &target).unwrap();
-        fs::set_permissions(target, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o555)).unwrap();
+        crate::native_fixture::qualify_image(&target);
+        progressed("sdk-image-qualified");
     }
     let subject = atpkg::lease::Subject::build("trust", 1234).unwrap();
     let sdk_lease = std::sync::Arc::new(

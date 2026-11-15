@@ -25,7 +25,7 @@ use crate::{
     typed::grid::tests::put,
 };
 use astream_wire::sync::Digest;
-use aterm_file::{OwnerAct, Why, Word, outbox};
+use aterm_file::{Why, Word, outbox};
 use aterm_json::json;
 use aterm_spec::{interp::State, xref::StepEvidence};
 use std::collections::BTreeMap;
@@ -181,7 +181,7 @@ impl Walk {
                             .and_then(outbox::digest),
                     })
                     .collect();
-                let act = OwnerAct::verb("person", None).unwrap();
+                let act = seam::owner();
                 let intent = self
                     .evidence
                     .step("Accept", || file.write(&act, draft, NOW))

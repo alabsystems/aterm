@@ -15,6 +15,60 @@ fn session_id_shape_validation() {
     assert!(!is_valid_session_id("s-")); // no hex
     assert!(!is_valid_session_id(&format!("s-{}", "g".repeat(20)))); // non-hex
     assert!(!is_valid_session_id(&format!("s-{}", "A".repeat(20)))); // not minted
+    assert!(is_valid_session_id("tqn5r6e0148"), "a t tab ID");
+    for malformed in [
+        "t",
+        "t000000000",
+        "t00000000000",
+        "T0000000000",
+        "tqn5r6e014u",
+    ] {
+        assert!(!is_valid_session_id(malformed), "{malformed}");
+    }
+}
+
+/// A parent's injected identity in either form is adopted, and a malformed `t` one is not.
+#[test]
+fn an_injected_identity_reads_either_form() {
+    let nonce = LaunchNonce::generate();
+    for sid in ["tqn5r6e0148", "s-1a2b3c4d5e6f70819203"] {
+        let got = parse_injected_identity(Some(sid), Some(&nonce.to_hex())).expect(sid);
+        assert_eq!(got.0.as_str(), sid);
+    }
+    for malformed in ["T0000000000", "tqn5r6e014u", "s-1A2B3C4D5E6F70819203"] {
+        assert!(
+            parse_injected_identity(Some(malformed), Some(&nonce.to_hex())).is_none(),
+            "{malformed}"
+        );
+    }
+    let mut edges = EdgeTable::new();
+    let child = SessionId::generate();
+    let hex = aterm_session::EdgeToken::generate().to_hex();
+    assert_eq!(
+        install_parent_edges(
+            &mut edges,
+            &child,
+            &nonce,
+            Some("tqn5r6e0148"),
+            Some(&hex),
+            None,
+            None
+        ),
+        1,
+        "a t parent's edge is installed"
+    );
+    assert_eq!(
+        install_parent_edges(
+            &mut edges,
+            &child,
+            &nonce,
+            Some("T0000000000"),
+            Some(&hex),
+            None,
+            None
+        ),
+        0
+    );
 }
 
 #[test]

@@ -31,7 +31,7 @@ name = "atpkg-abrew"
 path = "src/abrew_main.rs"
 test = false
 
-# Inert development fixture: serves native tether entry without application startup.
+# Development fixture: native tether and captured compiler controls without app startup.
 [[bin]]
 name = "atpkg-status-fixture"
 path = "tests/status_fixture.rs"

@@ -532,6 +532,7 @@ fn the_setter_is_carried_in_one_form_and_dropped_with_its_word() {
     );
 
     let leaf = |autopilot: Option<&str>, by: &str| crate::restore::TerminalLeafRestore {
+        pinned: false,
         sid: None,
         lineage: None,
         log_ep: None,

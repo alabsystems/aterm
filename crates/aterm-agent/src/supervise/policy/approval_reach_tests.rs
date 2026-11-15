@@ -252,7 +252,7 @@ fn a_git_read_of_its_object_store_is_refused_where_no_word_bounds_its_files() {
     // A ref format's `%(…)` is refused before this as a word that may expand to any name, so its
     // `raw` atom is judged here by [`object_read`] alone.
     let judged = |line: &str| {
-        let seg = &crate::supervise::classify::command_words(line).expect(line)[0];
+        let seg = &alab_policy::classify::command_words(line).expect(line)[0];
         object_read(seg, 0)
     };
     for line in [

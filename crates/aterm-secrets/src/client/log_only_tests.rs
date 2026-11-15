@@ -145,37 +145,6 @@ fn configured_log_model_conforms_to_native_selection() {
 }
 
 #[test]
-fn offline_log_only_write_failure_keeps_its_binding_for_retry() {
-    let (_root, paths, config, before) = applied_log();
-    let file = paths.home.join(".secrets/shared");
-    std::fs::remove_file(&file).unwrap();
-    std::fs::create_dir(&file).unwrap();
-    let apply = || {
-        apply_response_until(
-            &paths,
-            config.clone(),
-            load_state(&paths).unwrap(),
-            Err(Error::new("offline")),
-            None,
-            None,
-            true,
-        )
-    };
-    let first = apply().unwrap();
-    assert!(matches!(first, SyncOutcome::Applied { ref report, .. } if apply_failed(report)));
-    let failed = load_state(&paths).unwrap();
-    assert!(failed.failed);
-    assert_eq!(failed.source_identity, before.source_identity);
-    std::fs::remove_dir(&file).unwrap();
-    assert!(matches!(apply().unwrap(), SyncOutcome::Applied { .. }));
-    let repaired = load_state(&paths).unwrap();
-    assert!(!repaired.failed);
-    assert_eq!(repaired.records_digest, before.records_digest);
-    assert_eq!(std::fs::read(&file).unwrap(), b"old");
-    assert!(repaired.network_materialization.is_none());
-}
-
-#[test]
 fn a_nonmember_log_does_not_hide_the_transport_error() {
     let (_root, paths, config, mut before) = applied_log();
     fsx::write_atomic(&paths.identity_file(), &fixture().stranger, 0o600).unwrap();
@@ -254,10 +223,10 @@ fn a_wrap_without_membership_cannot_admit_a_log_only_reader() {
 }
 
 #[test]
-fn missing_log_only_ownership_metadata_requires_local_work() {
+fn a_log_only_state_no_apply_of_this_build_recorded_requires_local_work() {
     let (_root, paths, config, mut before) = applied_log();
-    assert!(before.own.is_some());
-    before.own = None;
+    assert!(before.held.is_some());
+    before.held = None;
     save_state(&paths, &before).unwrap();
     let lock = StateLock::take(&paths).unwrap();
     assert!(peer_selection::configured_log_recovery(&paths, &config, &before).is_some());
@@ -273,5 +242,5 @@ fn missing_log_only_ownership_metadata_requires_local_work() {
     )
     .unwrap();
     assert!(matches!(outcome, SyncOutcome::Applied { .. }));
-    assert!(load_state(&paths).unwrap().own.is_some());
+    assert!(load_state(&paths).unwrap().held.is_some());
 }

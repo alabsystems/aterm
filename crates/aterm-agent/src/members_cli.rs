@@ -770,12 +770,10 @@ fn allowed_words(follows: &Follows) -> String {
 /// [`allowed_words`] where `fix` is what starts the vault subscriber, if one is needed.
 fn allowed_line(fix: Option<&str>) -> String {
     match fix {
-        None => {
-            "allowed: ~/.secrets is written, and this Mac follows vault changes once the vault \
+        None => "allowed: a member let this Mac in, and it follows vault changes once the vault \
                  records it (that finishes by itself)"
-                .to_owned()
-        }
-        Some(fix) => format!("allowed: ~/.secrets is written, but {fix}"),
+            .to_owned(),
+        Some(fix) => format!("allowed: a member let this Mac in, but {fix}"),
     }
 }
 
@@ -1058,7 +1056,7 @@ fn join_tried(
     };
     let dial = reach.dial;
     // A phraseless join proves this Mac only where sharing is on: a proof a member takes writes
-    // this Mac's vault and ~/.secrets, which `[swarm] enabled = false` (or a settings file aterm
+    // this Mac's vault state, which `[swarm] enabled = false` (or a settings file aterm
     // cannot read) keeps from happening by itself, as it keeps the vault half below
     // (`client::prepare_alab_join_retry`) and this Mac's subscriber. The plain ask still goes:
     // it writes nothing here, and only a phrase a person types lets this Mac in from it.
@@ -1484,17 +1482,17 @@ fn said_no_wait(
 /// only a running one follows the vault with no one here and asks the vault's server again.
 fn joined_lines(joined: &join::Joined, follows: &Follows) -> Vec<String> {
     let runs = *follows == Follows::Runs;
-    let files = joined.report.written.len() + joined.report.unchanged.len();
+    let held = joined.report.held.len();
     // Only the log's `Admit` makes this Mac a member at once; F10's interim leaves it pending in
     // the vault until an admin Mac's approver records the member's `Allowed`.
     let mut lines = vec![match &joined.admission {
         join::Admission::Logged => format!(
-            "Joined ALab as {} (let in by {}): {files} file(s) written to ~/.secrets.",
+            "Joined ALab as {} (let in by {}): {held} secret(s) read in place from the store.",
             joined.name, joined.member
         ),
         join::Admission::Asked(_) => format!(
-            "Allowed into ALab as {} by {}: {files} file(s) written to ~/.secrets; the vault \
-             lists this Mac as pending until an admin Mac's approver records it.",
+            "Allowed into ALab as {} by {}: the vault lists this Mac as pending until an admin \
+             Mac's approver records it, and its secrets are read in place once it does.",
             joined.name, joined.member
         ),
     }];
@@ -2147,7 +2145,7 @@ fn phrase_join_as(me: &Me, phrase: &SecretBytes, reach: &Reach<'_>) -> PhraseTry
     }
 }
 
-/// `status`: a member; allowed, with `~/.secrets` written, until the vault records it; asking;
+/// `status`: a member; allowed, by a member's bundle, until the vault records it; asking;
 /// dropped (it says how it comes back); or not in ALab.
 fn status() -> ExitCode {
     let Ok(paths) = Paths::live() else {
@@ -2179,7 +2177,7 @@ pub enum Standing {
     /// no member, and its vault subscriber asks ALab's members for a seat with the same keys
     /// (one-mesh S1, [`client::Seat::Seatless`]).
     Seatless,
-    /// A member let it in and `~/.secrets` is written; the vault records it once this Mac's
+    /// A member let it in with its bundle; the vault records it once this Mac's
     /// vault subscriber follows the vault.
     Allowed {
         /// What starts the subscriber, where none runs ([`Follows::fix`]).

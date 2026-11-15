@@ -18,6 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use aterm_uds::secret::Secret;
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use serde::Deserialize;
 
@@ -26,7 +27,7 @@ pub use world::Real;
 /// Command-line usage string for `ship site`.
 pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-run] [--no-deploy] \
      [--redeploy] [--skip-site] [--site-dir DIR] [--releases FILE]
-       targo --unverified ship site --check-key [--site-dir DIR]
+       targo --unverified ship site --check-key
        targo --unverified ship site --check-access [--site-dir DIR]
   --latest       sync to the public repo's main tip; PUB_PUBLIC_COMMIT, when set, names
                  the commit instead (one of the two is required)
@@ -34,7 +35,8 @@ pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-r
   --no-deploy    commit and push, no deploy, no live check (SITE_NO_DEPLOY=1 too)
   --redeploy     deploy the committed site to Firebase Hosting even when nothing changed
   --skip-site    do nothing, say so, exit 0
-  --check-key    ask Google to authenticate the configured key; build and deploy nothing
+  --check-key    ask Google to authenticate the registry's site-deployer-key; build and
+                 deploy nothing
                  (success does not prove Firebase Hosting deployment permission)
   --check-access read the Hosting site and test its project's update permission;
                  change no site or IAM policy (a point-in-time permission observation)
@@ -129,7 +131,7 @@ pub struct Options {
     pub latest: bool,
     pub dry_run: bool,
     pub no_deploy: bool,
-    /// Authenticate the configured key without synchronizing or deploying the site.
+    /// Authenticate the registry's deployer key without synchronizing or deploying the site.
     pub check_key: bool,
     /// Observe the configured Hosting site's project permission without deployment.
     pub check_access: bool,
@@ -200,8 +202,6 @@ struct Settings {
     /// The Firebase Hosting site deployed to when firebase.json's `hosting.site` names none
     /// (when both do they must agree; else the key's project).
     firebase_site: Option<String>,
-    /// The deployer's service-account key, relative to the site directory.
-    firebase_sa_key: Option<String>,
     author_name: Option<String>,
     author_email: Option<String>,
     subject_prefix: Option<String>,
@@ -233,10 +233,6 @@ pub struct Env {
     /// `FIREBASE_SITE`, else `publish/site.toml`'s `firebase_site`: the Hosting site when
     /// firebase.json's `hosting.site` names none ([`hosting::site`]).
     pub firebase_site: Option<String>,
-    /// `FIREBASE_SA_KEY`: deployer service-account key path.
-    pub firebase_sa_key: Option<PathBuf>,
-    /// Service-account key path from `publish/site.toml`, relative to the site directory.
-    pub firebase_sa_key_in_site: Option<String>,
     /// Site commit author identity, or `None` to use git's default.
     pub author: Option<(String, String)>,
     pub subject_prefix: String,
@@ -307,8 +303,6 @@ impl Env {
             version: var("PUB_VERSION"),
             staging_commit: var("PUB_STAGING_COMMIT"),
             dry_run: flag("PUB_DRY_RUN"),
-            firebase_sa_key: var("FIREBASE_SA_KEY").map(PathBuf::from),
-            firebase_sa_key_in_site: settings.firebase_sa_key,
             site_dir,
             no_deploy: flag("SITE_NO_DEPLOY"),
             site_url: var("SITE_URL")
@@ -338,17 +332,75 @@ impl Env {
             git_env: Vec::new(),
         })
     }
+}
 
-    /// The deployer's service-account key: `FIREBASE_SA_KEY`, else `publish/site.toml`'s
-    /// `firebase_sa_key` under `site_dir`.
-    #[must_use]
-    pub fn sa_key(&self, site_dir: &Path) -> Option<PathBuf> {
-        self.firebase_sa_key.clone().or_else(|| {
-            self.firebase_sa_key_in_site
-                .as_ref()
-                .map(|k| site_dir.join(k))
-        })
+/// THE SITE DEPLOYER'S KEY, FROM THE ONE PLACE A CREDENTIAL IS: the `site-deployer-key` entry
+/// of this Mac's store under `home`, read in place and held as a [`Secret`] (it goes to the
+/// token exchange, never to a file). No variable, setting or file names another.
+///
+/// # Errors
+/// Why this Mac holds none: no home, a store that cannot be read, or one that holds no such
+/// entry.
+#[cfg(unix)]
+pub(crate) fn deployer_key(home: Option<&Path>) -> Result<Secret, String> {
+    let home = home.ok_or("HOME is not set")?;
+    let paths = aterm_secrets::client::Paths::locate_for_home(home);
+    for name in aterm_secrets::need::Want::SiteDeployerKey.entries() {
+        if let Some(value) = aterm_secrets::client::read_in_place(&paths, &name)
+            .map_err(|why| format!("this Mac's store cannot be read: {why}"))?
+        {
+            return Ok(Secret::from_vec(value.as_slice().to_vec()));
+        }
     }
+    Err("this Mac's store holds no site-deployer-key entry".into())
+}
+
+/// [`deployer_key`] where there is no vault: none is held.
+///
+/// # Errors
+/// Always.
+#[cfg(not(unix))]
+pub(crate) fn deployer_key(_home: Option<&Path>) -> Result<Secret, String> {
+    Err("this platform has no vault store".into())
+}
+
+/// File the deployer's key with the lab's Macs under `home`, as `aterm secrets need
+/// site-deployer-key` does: the one place a release raises that want.
+///
+/// # Errors
+/// The need ledger or the vault state cannot be read or written.
+#[cfg(unix)]
+pub(crate) fn raise_deployer_key(home: &Path) -> Result<aterm_secrets::need::Need, String> {
+    use aterm_secrets::need::{Purpose, Want};
+    aterm_secrets::need::raise(
+        &aterm_secrets::client::Paths::for_home(home),
+        Want::SiteDeployerKey,
+        Purpose::ReleaseSiteKey,
+    )
+    .map_err(|why| why.to_string())
+}
+
+/// [`raise_deployer_key`] for a run's report: the line naming the want and its filed request,
+/// or why it could not be filed.
+#[cfg(unix)]
+pub(crate) fn file_deployer_key(home: Option<&Path>) -> String {
+    let key = aterm_secrets::need::Want::SiteDeployerKey.key();
+    let Some(home) = home else {
+        return format!("`aterm secrets need {key}` could not be filed: HOME is not set");
+    };
+    match raise_deployer_key(home) {
+        Ok(need) => format!(
+            "filed `aterm secrets need {key}` with the lab: {}",
+            need.line
+        ),
+        Err(why) => format!("`aterm secrets need {key}` could not be filed: {why}"),
+    }
+}
+
+/// [`file_deployer_key`] where there is no vault: nothing can be filed.
+#[cfg(not(unix))]
+pub(crate) fn file_deployer_key(_home: Option<&Path>) -> String {
+    "`aterm secrets need site-deployer-key` could not be filed: this platform has no vault".into()
 }
 
 /// Exit code and combined output of a finished child process.
@@ -436,16 +488,16 @@ pub trait World {
     /// # Errors
     /// Returns an error if `wasm-opt` fails.
     fn optimise(&mut self, wasm: &Path, out: &mut dyn Write) -> Result<(), String>;
-    /// Deploys `plan` to Firebase Hosting with the service-account key at `key`, released
+    /// Deploys `plan` to Firebase Hosting with the service-account key `key`, released
     /// with `message` ([`hosting::deploy`]).
     ///
     /// # Errors
-    /// [`hosting::Failed`]: no key or a refused one, a step before the release failing (the
-    /// live site untouched), or the release itself.
+    /// [`hosting::Failed`]: an unreadable or refused key, a step before the release failing
+    /// (the live site untouched), or the release itself.
     fn deploy(
         &mut self,
         plan: &hosting::Plan,
-        key: Option<&Path>,
+        key: &Secret,
         message: &str,
         out: &mut dyn Write,
     ) -> Result<hosting::Released, hosting::Failed>;
@@ -2008,9 +2060,15 @@ fn steps(
                 plan.files.len()
             ),
         );
-        let key = env.sa_key(&site_dir);
+        let key = match deployer_key(env.home.as_deref()) {
+            Ok(key) => key,
+            Err(why) => {
+                let filed = file_deployer_key(env.home.as_deref());
+                return not_deployed(out, &hosting::Failed::Credential(format!("{why}; {filed}")));
+            }
+        };
         let message = format!("ship site: {slug} @ {}", short(&commit));
-        match world.deploy(&plan, key.as_deref(), &message, out) {
+        match world.deploy(&plan, &key, &message, out) {
             Ok(released) => {
                 deployed = true;
                 let _ = std::fs::remove_file(&owed_mark);
@@ -2199,7 +2257,7 @@ fn fetch_live(world: &mut dyn World, url: &str) -> Option<BTreeMap<&'static str,
 /// What `--check-access` asks: whether Google accepts the key at `key` and lets its account
 /// update the Hosting site that `site`'s firebase.json and `env` name. A token exchange, a
 /// read of the site and an IAM permission test; nothing is deployed and no policy changes.
-fn access(world: &Real, env: &Env, site: Option<&Path>, key: &Path) -> Result<String, String> {
+fn access(world: &Real, env: &Env, site: Option<&Path>, key: &Secret) -> Result<String, String> {
     let in_config = site.map(hosting::config::read).transpose()?;
     let target = hosting::site(
         in_config.as_ref().and_then(|config| config.site.as_deref()),
@@ -2214,12 +2272,12 @@ fn access(world: &Real, env: &Env, site: Option<&Path>, key: &Path) -> Result<St
     ))
 }
 
-/// [`access`] for the site the clone at `repo` is set to deploy, with the key at `key`: what
+/// [`access`] for the site the clone at `repo` is set to deploy, with the key `key`: what
 /// a release's step 1 asks before it builds anything (`provision::layer`).
 ///
 /// # Errors
 /// The settings cannot be read, or the key, the site or the permission cannot be verified.
-pub(crate) fn access_of(repo: &Path, key: &Path) -> Result<String, String> {
+pub(crate) fn access_of(repo: &Path, key: &Secret) -> Result<String, String> {
     let env = Env::from_process(repo, None)?;
     let world = Real {
         unset: std::env::vars_os()
@@ -2272,18 +2330,14 @@ pub fn run_cli(args: &[String], repo: &Path) -> i32 {
             return 2;
         }
         let site = opts.site_dir.as_deref().or(env.site_dir.as_deref());
-        let key = env
-            .firebase_sa_key
-            .clone()
-            .or_else(|| site.and_then(|site| env.sa_key(site)));
-        let result = key
-            .ok_or_else(|| "no service-account key is configured".to_string())
+        let result = deployer_key(env.home.as_deref())
+            .map_err(|why| format!("{why}; {}", file_deployer_key(env.home.as_deref())))
             .and_then(|key| {
                 if opts.check_access {
                     access(&world, &env, site, &key)
                 } else {
                     world.check_key(&key)?;
-                    Ok("Google accepted the configured key; no site was built or deployed; Hosting deployment permission is untested".into())
+                    Ok("Google accepted the store's site-deployer-key; no site was built or deployed; Hosting deployment permission is untested".into())
                 }
             });
         return match result {
@@ -2324,4 +2378,4 @@ pub fn report(ended: &Result<Outcome, Failure>) -> i32 {
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]
-mod tests;
+pub(crate) mod tests;

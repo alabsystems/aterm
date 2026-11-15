@@ -51,7 +51,7 @@ fn an_iso_stamp_is_read_as_unix_milliseconds() {
 #[test]
 fn the_script_keys_each_conversation_and_the_stub_plays_it() {
     use crate::stub::{ToolTurn, tool_turn};
-    use aterm_agent::supervise::policy::turn_end::clean_defense;
+    use alab_policy::open_work::clean_defense;
     let plan = Plan::new("0badc0de");
     let script = plan.script();
     let req =
@@ -93,13 +93,15 @@ fn the_script_keys_each_conversation_and_the_stub_plays_it() {
             other => panic!("spawn {k}: {other:?}"),
         }
         m.push(used.clone());
-        m.push(result(&format!("OK s-{k}{k}{k}a")));
+        m.push(result(&format!("OK t000000{k}{k}{k}a")));
     }
     match tool_turn(req(&m).as_bytes(), &script) {
         Some(ToolTurn::Call(_, input, 4)) => {
             assert_eq!(
                 input.get("command").and_then(J::as_str),
-                Some("aterm ctl await task @s-000a,@s-111a,@s-222a,@s-333a all since=0")
+                Some(
+                    "aterm ctl await task @t000000000a,@t000000111a,@t000000222a,@t000000333a all since=0"
+                )
             );
             assert!(input.get("run_in_background").is_some_and(J::truthy));
         }
@@ -118,7 +120,7 @@ fn the_script_keys_each_conversation_and_the_stub_plays_it() {
     match tool_turn(req(&m).as_bytes(), &script) {
         Some(ToolTurn::Call(_, input, 6)) => assert_eq!(
             input.get("command").and_then(J::as_str),
-            Some("aterm ctl @s-000a result")
+            Some("aterm ctl @t000000000a result")
         ),
         other => panic!("result: {other:?}"),
     }
@@ -131,7 +133,7 @@ fn the_script_keys_each_conversation_and_the_stub_plays_it() {
         Some(ToolTurn::Say(plan.summary.clone(), 10))
     );
     let w = &plan.workers[1];
-    let task_row = user(&format!("{}\n\n(Started by `s-m` …)", w.task));
+    let task_row = user(&format!("{}\n\n(Started by `t000000000m` …)", w.task));
     assert!(matches!(
         tool_turn(req(std::slice::from_ref(&task_row)).as_bytes(), &script),
         Some(ToolTurn::Call(n, _, 0)) if n == "Bash"
@@ -151,7 +153,10 @@ fn the_script_keys_each_conversation_and_the_stub_plays_it() {
         ),
         Some(ToolTurn::Say(w.defense.clone(), 2))
     );
-    let failing = user(&format!("{}\n\n(Started by `s-m` …)", plan.failing.task));
+    let failing = user(&format!(
+        "{}\n\n(Started by `t000000000m` …)",
+        plan.failing.task
+    ));
     assert_eq!(
         tool_turn(
             req(&[failing, used_call(), result("2 w4.out")]).as_bytes(),
@@ -160,7 +165,7 @@ fn the_script_keys_each_conversation_and_the_stub_plays_it() {
         Some(ToolTurn::Say(plan.failing.report.clone(), 1))
     );
     assert_eq!(
-        aterm_agent::supervise::policy::needs::could_not_finish(&plan.failing.report),
+        alab_policy::needs::could_not_finish(&plan.failing.report),
         plan.failing.report.strip_prefix("Could not finish: ")
     );
     for w in &plan.workers {
@@ -181,11 +186,11 @@ fn the_script_keys_each_conversation_and_the_stub_plays_it() {
 fn transcript_rows_give_the_prompt_the_tool_calls_and_their_results() {
     let text = [
         r#"{"type":"mode"}"#,
-        r#"{"type":"user","timestamp":"2026-10-16T10:24:42.738Z","message":{"role":"user","content":"LABW1-x: go\n\n(Started by `s-m`)"}}"#,
+        r#"{"type":"user","timestamp":"2026-10-16T10:24:42.738Z","message":{"role":"user","content":"LABW1-x: go\n\n(Started by `t000000000m`)"}}"#,
         r#"{"type":"assistant","timestamp":"2026-10-16T10:24:42.836Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#,
-        r#"{"type":"user","timestamp":"2026-10-16T10:24:42.916Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OK s-0f0a"}]}}"#,
-        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OK s-0f0a"}]}}"#,
-        r#"{"type":"api-request-blob","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OK s-0f0a"}]}}"#,
+        r#"{"type":"user","timestamp":"2026-10-16T10:24:42.916Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OK t0000000f0a"}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OK t0000000f0a"}]}}"#,
+        r#"{"type":"api-request-blob","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"OK t0000000f0a"}]}}"#,
         "not json",
         r#"{"type":"assistant","timestamp":"2026-10-16T10:24:42.952Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
     ]
@@ -194,13 +199,13 @@ fn transcript_rows_give_the_prompt_the_tool_calls_and_their_results() {
     assert_eq!(r.len(), 7);
     assert!(r[5].result.is_none() && r[5].kind == "api-request-blob");
     let p = first_prompt(&r).unwrap();
-    assert_eq!(p.text, "LABW1-x: go\n\n(Started by `s-m`)");
+    assert_eq!(p.text, "LABW1-x: go\n\n(Started by `t000000000m`)");
     assert_eq!(p.ts, Some(1_792_146_282_738));
     assert_eq!(
         r[2].tool_use.as_ref().map(|(n, _)| n.as_str()),
         Some("Bash")
     );
-    assert_eq!(spawned(&r), vec!["s-0f0a".to_string()]);
+    assert_eq!(spawned(&r), vec!["t0000000f0a".to_string()]);
     assert_eq!(r[6].text, "done");
     assert!(first_prompt(&r[3..4]).is_none());
 }
@@ -213,30 +218,147 @@ fn a_spawn_result_naming_its_request_still_names_its_sid() {
         )
     };
     let text = [
-        result("t1", "OK s-0f0a req=r-20261109-1411-local-01"),
-        result("t2", r"OK s-0f0b\n"),
+        result("t1", "OK t0000000f0a req=r-20261109-1411-local-01"),
+        result("t2", r"OK t0000000f0b\n"),
+        // A peer on an earlier build answers with its tab's earlier `s-` ID.
+        result("t2e", "OK s-0123456789abcdef0f0c"),
         // NEGATIVE CONTROLS: a refusal, a sid that is not one, and nothing after `OK`.
         result(
             "t3",
             "ERR spawn req=r-20261109-1411-local-01: the request has concluded",
         ),
-        result("t4", "OK s-0f0z req=r-20261109-1411-local-02"),
+        result("t4", "OK t0000000f0u req=r-20261109-1411-local-02"),
         result("t5", "OK "),
+        result("t6", "OK s-0123456789abcdef0f0"),
     ]
     .join("\n");
     assert_eq!(
         spawned(&rows(&text)),
-        vec!["s-0f0a".to_string(), "s-0f0b".to_string()]
+        vec![
+            "t0000000f0a".to_string(),
+            "t0000000f0b".to_string(),
+            "s-0123456789abcdef0f0c".to_string()
+        ]
+    );
+}
+
+#[test]
+fn spawn_timings_use_the_same_receipts_as_worker_identity() {
+    let result = |kind: &str, id: &str, content: &str, stamp: Option<&str>| {
+        J::obj([
+            ("type", J::s(kind)),
+            ("timestamp", stamp.map_or(J::Null, J::s)),
+            (
+                "message",
+                J::obj([(
+                    "content",
+                    J::Arr(vec![J::obj([
+                        ("type", J::s("tool_result")),
+                        ("tool_use_id", J::s(id)),
+                        ("content", J::s(content)),
+                    ])]),
+                )]),
+            ),
+        ])
+        .dump(crate::pyjson::COMPACT)
+    };
+    let current = "OK t0000000f0a req=r-20261109-1411-local-01";
+    let earlier = "OK s-0123456789abcdef0f0c req=r-20261109-1411-local-02";
+    let text = [
+        result("user", "t1", current, Some("2026-10-16T10:24:42.010Z")),
+        result("user", "t1", current, Some("2026-10-16T10:24:42.020Z")),
+        result("user", "t2", earlier, Some("2026-10-16T10:24:42.030Z")),
+        result(
+            "assistant",
+            "t3",
+            "OK t0000000f0b",
+            Some("2026-10-16T10:24:42.040Z"),
+        ),
+        result(
+            "user",
+            "t4",
+            "OK t0000000f0b",
+            Some("2026-10-16T10:24:42.050Z"),
+        ),
+        result("user", "t5", "OK t0000000f0c", None),
+        result(
+            "user",
+            "t6",
+            "OK t0000000f0c",
+            Some("2026-10-16T10:24:42.060Z"),
+        ),
+        result(
+            "api-request-blob",
+            "t7",
+            "OK t0000000f0d",
+            Some("2026-10-16T10:24:42.070Z"),
+        ),
+        result(
+            "user",
+            "t8",
+            "OK t0000000f0u",
+            Some("2026-10-16T10:24:42.080Z"),
+        ),
+        result("user", "t9", "ERR spawn", Some("2026-10-16T10:24:42.090Z")),
+        result("user", "t10", "OK ", Some("2026-10-16T10:24:42.100Z")),
+        result(
+            "user",
+            "t11",
+            "OK t0000000f0d",
+            Some("2026-10-16T10:24:42.110Z"),
+        ),
+        result(
+            "user",
+            "t12",
+            "OK s-0123456789abcdef0f0",
+            Some("2026-10-16T10:24:42.120Z"),
+        ),
+        result(
+            "user",
+            "t13",
+            "OK t0000000f0a-other",
+            Some("2026-10-16T10:24:42.130Z"),
+        ),
+    ]
+    .join("\n");
+    let rows = rows(&text);
+    assert_eq!(
+        spawned(&rows),
+        [
+            "t0000000f0a",
+            "s-0123456789abcdef0f0c",
+            "t0000000f0b",
+            "t0000000f0b",
+            "t0000000f0c",
+            "t0000000f0c",
+            "t0000000f0d",
+        ],
+        "worker identity still deduplicates only repeated tool IDs"
+    );
+    let second = 1_792_146_282_000;
+    assert_eq!(spawn_time(&rows, "t0000000f0a"), Some(second + 10));
+    assert_eq!(
+        spawn_time(&rows, "s-0123456789abcdef0f0c"),
+        Some(second + 30)
+    );
+    assert_eq!(spawn_time(&rows, "t0000000f0b"), Some(second + 50));
+    assert_eq!(spawn_time(&rows, "t0000000f0c"), None);
+    assert_eq!(spawn_time(&rows, "t0000000f0d"), Some(second + 110));
+    assert_eq!(spawn_time(&rows, "t0000000f0e"), None);
+    assert_eq!(
+        spawn_times(&rows),
+        [10, 20, 30, 40, 50, 60, 110].map(|ms| second + ms),
+        "summary timing keeps every stamped receipt, without identity's dedup or kind filter"
     );
 }
 
 #[test]
 fn the_pushes_name_each_session_by_its_ack() {
     let lines: Vec<(f64, String)> = [
-        "sub 0 s-m",
+        "sub 0 t000000000m",
         "EVENT 0 agent idle rev=3",
-        "sub 1 s-w",
-        "EVENT * session-created s-w",
+        "sub 1 t000000000w",
+        "EVENT * session-created t000000000w",
         "EVENT 1 task rev=1 state=working attention=0",
         "EVENT 1 task rev=2 state=done attention=0 why=landed",
         "EVENT 7 task rev=1 state=stalled attention=1 why=shell",
@@ -247,12 +369,12 @@ fn the_pushes_name_each_session_by_its_ack() {
     .map(|(i, l)| (f64::from(u32::try_from(i).unwrap()), (*l).to_string()))
     .collect();
     let p = pushed(&lines);
-    assert_eq!(p.created, vec![("s-w".to_string(), 3.0)]);
+    assert_eq!(p.created, vec![("t000000000w".to_string(), 3.0)]);
     assert_eq!(p.tasks.len(), 3);
     assert_eq!(
         p.tasks[1],
         (
-            "s-w".into(),
+            "t000000000w".into(),
             5.0,
             "rev=2 state=done attention=0 why=landed".into()
         )
@@ -269,11 +391,14 @@ fn the_pushes_name_each_session_by_its_ack() {
 
 #[test]
 fn the_upgrade_column_is_read_off_the_sessions_own_ls_row() {
-    let ls = "0 0 s-m - alive t program=claude upgrade=done/2.1.301/-/40s task=-\n\
-              0 1 s-w s-m alive t program=claude upgrade=pending/2.1.301/settling/5s task=done";
-    assert_eq!(upgrade_of(ls, "s-m"), "done/2.1.301/-/40s");
-    assert_eq!(upgrade_of(ls, "s-w"), "pending/2.1.301/settling/5s");
-    assert_eq!(upgrade_of("0 1 s-w s-m alive upgrade=-", "s-m"), "");
+    let ls = "0 0 t000000000m - alive t program=claude upgrade=done/2.1.301/-/40s task=-\n\
+              0 1 t000000000w t000000000m alive t program=claude upgrade=pending/2.1.301/settling/5s task=done";
+    assert_eq!(upgrade_of(ls, "t000000000m"), "done/2.1.301/-/40s");
+    assert_eq!(upgrade_of(ls, "t000000000w"), "pending/2.1.301/settling/5s");
+    assert_eq!(
+        upgrade_of("0 1 t000000000w t000000000m alive upgrade=-", "t000000000m"),
+        ""
+    );
 }
 
 #[test]
@@ -322,10 +447,10 @@ fn the_await_output_is_read_where_the_managers_conversation_writes_it() {
 fn a_bounded_read_takes_a_short_file_and_refuses_a_long_one() {
     let d = crate::TestScratch::new("workers");
     let f = d.join("b1.output");
-    std::fs::write(&f, "@s-1 rev=2 state=done\n").unwrap();
+    std::fs::write(&f, "@t0000000001 rev=2 state=done\n").unwrap();
     assert_eq!(
         read_bounded(&f, 64).as_deref(),
-        Ok("@s-1 rev=2 state=done\n")
+        Ok("@t0000000001 rev=2 state=done\n")
     );
     assert!(read_bounded(&f, 21).is_err());
     let link = d.join("link.output");
@@ -336,12 +461,12 @@ fn a_bounded_read_takes_a_short_file_and_refuses_a_long_one() {
 #[test]
 fn the_survey_shows_a_session_only_with_what_it_was_asked_and_said() {
     let text = "== host pid 1 0.105.0 · 2 sessions trust=screen\n\
-        s-m claude idle 0s | ✳ Claude Code\n\
+        t000000000m claude idle 0s | ✳ Claude Code\n\
         \x20   asked: LABMGR-x: start three workers\n\
         \x20   said: Summary: all three\n\
-        s-w claude idle 0s task=done/2 | ✳ Claude Code\n\
+        t000000000w claude idle 0s task=done/2 | ✳ Claude Code\n\
         \x20   asked: LABW1-x: write the file\n\
-        s-z bash running sleep\n";
+        t000000000z bash running sleep\n";
     let want = |sid: &str, asked: &str, said: &str| {
         (
             sid.to_string(),
@@ -351,7 +476,7 @@ fn the_survey_shows_a_session_only_with_what_it_was_asked_and_said() {
         )
     };
     assert_eq!(
-        survey_shown(text, &[want("s-m", "LABMGR-x", "Summary: all")]),
+        survey_shown(text, &[want("t000000000m", "LABMGR-x", "Summary: all")]),
         1
     );
     let cut = text.replace(
@@ -359,18 +484,18 @@ fn the_survey_shows_a_session_only_with_what_it_was_asked_and_said() {
         "    said: …and the end of it",
     );
     assert_eq!(
-        survey_shown(&cut, &[want("s-m", "LABMGR-x", "Summary: all")]),
+        survey_shown(&cut, &[want("t000000000m", "LABMGR-x", "Summary: all")]),
         1
     );
     assert_eq!(
-        survey_shown(text, &[want("s-w", "LABW1-x", "Worker one")]),
+        survey_shown(text, &[want("t000000000w", "LABW1-x", "Worker one")]),
         0
     );
     assert_eq!(
-        survey_shown(text, &[want("s-w", "LABW1-x", "Summary: all")]),
+        survey_shown(text, &[want("t000000000w", "LABW1-x", "Summary: all")]),
         0
     );
-    assert_eq!(survey_shown(text, &[want("s-z", "", "")]), 0);
+    assert_eq!(survey_shown(text, &[want("t000000000z", "", "")]), 0);
     assert_eq!(survey_block(text, "s"), "");
     assert_eq!(survey_block(text, ""), "");
 }

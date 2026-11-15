@@ -905,12 +905,12 @@ fn a_keyed_box_with_no_channel_token_signs_nothing() {
     // (`host_choice::linux_preflights_ask_the_host_under_agh`, check 7).
     let mut w = World::new("linux-no-token");
     w.fx.use_gh();
-    std::fs::remove_file(&w.fx.ctx.tokens.channel).expect("rm token");
+    w.fx.ctx.tokens.channel.put_for_tests(None);
     let (r, _) = w.run(false);
     let e = r.expect_err("no token refuses");
     assert!(
         e.to_string()
-            .contains("channel token file missing/empty: ~/.secrets/gh_access_token_alabsystems"),
+            .contains("channel token missing/empty: the vault entry gh_access_token_alabsystems"),
         "{e}"
     );
     assert!(
@@ -929,7 +929,7 @@ fn owed_uploads_with_no_channel_token_say_why_in_ready_md() {
     w.fx.indexer.fail.store(true, Ordering::SeqCst);
     let _ = w.run(false);
     w.fx.indexer.fail.store(false, Ordering::SeqCst);
-    std::fs::remove_file(&w.fx.ctx.tokens.channel).expect("rm token");
+    w.fx.ctx.tokens.channel.put_for_tests(None);
     let (r, tx) = w.run(false);
     let e = r.expect_err("no channel token for the owed uploads");
     assert_eq!(e.exit_code(), 1, "{e}\n{}", tx.text());
@@ -941,7 +941,7 @@ fn owed_uploads_with_no_channel_token_say_why_in_ready_md() {
     );
     assert!(
         ready.contains(
-            "the channel token at ~/.secrets/gh_access_token_alabsystems is missing or empty"
+            "the channel token, the vault entry gh_access_token_alabsystems, is missing or empty"
         ),
         "{ready}"
     );
@@ -1307,13 +1307,13 @@ fn a_real_run_needs_the_staging_token_and_a_dry_run_does_not() {
     // (`host_choice::linux_preflights_ask_the_host_under_agh`, check 6).
     let mut w = World::new("linux-no-staging-token");
     w.fx.use_gh();
-    std::fs::remove_file(&w.fx.ctx.tokens.staging).expect("rm token");
+    w.fx.ctx.tokens.staging.put_for_tests(None);
     let (r, _) = w.run(false);
     let e = r.expect_err("no staging identity");
     assert_eq!(e.exit_code(), 3, "{e}");
     assert!(
         e.to_string()
-            .contains("staging token file missing/empty: ~/.secrets/gh_access_token"),
+            .contains("staging token missing/empty: the vault entry gh_access_token"),
         "{e}"
     );
     assert!(w.fx.calls("clone ").is_empty(), "nothing cloned or latched");
@@ -1737,7 +1737,7 @@ mod host_choice {
             ok(w.run(false));
             (w.ready(), w.fx.ctx.accounts.clone())
         };
-        let channel = "~/.secrets/gh_access_token_alabsystems";
+        let channel = "the vault entry gh_access_token_alabsystems";
 
         let (gh, _) = ceremony(HostChoice::Gh);
         assert!(
@@ -1757,7 +1757,7 @@ mod host_choice {
         );
         assert!(
             staging.contains(&format!(
-                "and agh.toml's writer for {} and the channel token {channel}.",
+                "and agh.toml's writer for {} and the channel token, {channel}.",
                 accounts.staging
             )),
             "{staging}"

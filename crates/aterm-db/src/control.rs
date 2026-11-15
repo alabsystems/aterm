@@ -304,6 +304,33 @@ impl std::fmt::Display for Failure {
     }
 }
 
+/// What a dial scheduler asked of the next round a [`Repair`] authenticates a peer in
+/// ([`Repair::lead`], [`Repair::ask`], [`Repair::audit`], [`Repair::restart_cycle`]). They are kept
+/// apart from the table hints they act on: an endpoint keeps those by authenticated peer and hands
+/// them to a round only once its peer authenticates, in place of whatever the round's caller held
+/// (`peers::Cache`), so what a caller wrote into its own copy before the dial would be lost there.
+/// The requests stay with the caller's state through that, and through a round that fails before
+/// it; a round that takes the hints, of whichever repair protocol, acts on them
+/// ([`Repair::heed`]). An enrolling round leaves them for the round after it.
+#[derive(Clone, Default, Debug)]
+struct Requests {
+    /// Tables to lead with, at most [`crate::replica::MAX_TABLES`].
+    lead: BTreeSet<Digest>,
+    ask: bool,
+    audit: bool,
+    restart: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Mutant (tests): a round takes the hints its endpoint kept of the peer in place of all its
+    /// caller held, what the dial scheduler asked included.
+    pub(crate) static REQUESTS_LEFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a peer's hints name pending table work after a round that completed no
+    /// table exchange.
+    pub(crate) static PENDING_UNEXCHANGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Volatile scheduling hint, never a claim of delivery. Keep one per peer.
 /// Advancing past a deferred node prevents it from starving later restrictions;
 /// wraparound retries it even if the caller does not maintain a timer.
@@ -322,6 +349,8 @@ pub struct Repair {
     cursor: Option<Digest>,
     membership_hint: MembershipHint,
     data: crate::replica::Repair,
+    /// What the dial scheduler asked of the next round ([`Requests`]).
+    requests: Requests,
     application: Option<crate::replica::Report>,
     membership: Option<Report>,
     membership_error: Option<Failure>,
@@ -384,6 +413,38 @@ impl Repair {
     pub(crate) fn disown(&mut self) {
         self.disowned = true;
     }
+    /// This state once its round completed the application exchange `report` tells of (tests).
+    #[cfg(test)]
+    pub(crate) fn applied(mut self, report: crate::replica::Report) -> Self {
+        self.application = Some(report);
+        self
+    }
+    /// This state once its scan took a turn at each of `common` tables both sides list
+    /// ([`Self::cycled`]) (tests).
+    #[cfg(test)]
+    pub(crate) fn swept(mut self, common: usize) -> Self {
+        self.data.swept(common);
+        self
+    }
+    /// Whether the dial scheduler asked this state's next round to ask which tables differ
+    /// ([`Self::ask`]) (tests).
+    #[cfg(test)]
+    pub(crate) const fn asked(&self) -> bool {
+        self.requests.ask
+    }
+    /// This state once its round's hello was taken and went unanswered ([`Self::unanswered`])
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn hello_unanswered(mut self) -> Self {
+        self.unanswered = true;
+        self
+    }
+    /// Whether the dial scheduler asked this state's next round to lead with `table`
+    /// ([`Self::lead`]) (tests).
+    #[cfg(test)]
+    pub(crate) fn leads(&self, table: &Digest) -> bool {
+        self.requests.lead.contains(table)
+    }
     /// A round's state once `actor` authenticated in it, under zero pins (tests).
     #[cfg(test)]
     pub(crate) fn heard_from(actor: Actor) -> Self {
@@ -440,22 +501,6 @@ impl Repair {
     /// What this round's peer said of its version ([`hearing::report`]).
     pub(crate) const fn said(&self) -> Said {
         self.said
-    }
-    /// This side appended to `tables` since this hint's last round
-    /// ([`crate::replica::Repair::announce`]): the endpoint tells each peer's hint
-    /// ([`Endpoint::announce`]).
-    pub(crate) fn announce(&mut self, tables: &std::collections::BTreeSet<Digest>, unnamed: bool) {
-        self.data.announce(tables, unnamed);
-    }
-    /// Whether this hint still names a table for a round this side initiates to take before
-    /// the ordinary interval ([`crate::replica::Repair::owes`]).
-    pub(crate) fn owes(&self) -> bool {
-        self.data.owes()
-    }
-    /// [`crate::replica::Repair::announced`] (tests).
-    #[cfg(test)]
-    pub(crate) fn announced(&self) -> (&std::collections::BTreeSet<Digest>, bool) {
-        self.data.announced()
     }
     /// What this round's application exchange read of this Mac's clock against the peer's
     /// (`crate::clock`, F22), whether or not its table repair then succeeded. None also covers a
@@ -523,6 +568,125 @@ impl Repair {
     /// that acknowledged no incoming operations. Starting another round clears it.
     pub fn application_batch_deferral(&self) -> Option<&crate::replica::BatchDeferral> {
         self.data.batch_deferral.as_ref()
+    }
+    /// Name `table` for the rounds this side initiates from this state: once a round's peer
+    /// authenticates, each repairs the first led table both sides list before its regular turn,
+    /// and the table leaves as a round selects it. One the lists do not share waits one round
+    /// and is then dropped. False where the bound of led tables is reached and this one is not
+    /// kept. A lead is an order among tables and grants nothing: whichever peer authenticates
+    /// next from this state takes it, and the round's own lists and inventories decide what is
+    /// repaired.
+    pub fn lead(&mut self, table: Digest) -> bool {
+        if !self.requests.lead.contains(&table)
+            && self.requests.lead.len() >= crate::replica::MAX_TABLES
+        {
+            return false;
+        }
+        self.requests.lead.insert(table);
+        true
+    }
+    /// Make the next round this side initiates from this state an audit: it asks the peer which
+    /// tables differ whatever either clock says of the last ask, and no saved follow-up or
+    /// backfill hint takes its table.
+    pub fn audit(&mut self) {
+        self.requests.audit = true;
+    }
+    /// Whether the next round this side initiates from this state is asked to be an audit
+    /// ([`Self::audit`]): the request stands until a round's peer authenticates and takes it.
+    pub(crate) const fn audited(&self) -> bool {
+        self.requests.audit
+    }
+    /// Make the next round this side initiates from this state ask the peer which tables differ,
+    /// as a first round does.
+    pub fn ask(&mut self) {
+        self.requests.ask = true;
+    }
+    /// Table work already named for this side's next round with this peer: a lead asked since
+    /// this state's last round, or, in the peer's hints as that round left them, a led table, one
+    /// whose witness differed and is not yet visited, or a follow-up. Hints count only where
+    /// that round completed a table exchange ([`Self::application`]): a round that completed
+    /// none shows no table round to do them in, and what the hints still name waits for one that
+    /// does.
+    pub fn pending(&self) -> bool {
+        #[cfg(test)]
+        let exchanged =
+            self.application.is_some() || PENDING_UNEXCHANGED.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let exchanged = self.application.is_some();
+        !self.requests.lead.is_empty() || (exchanged && self.data.pending())
+    }
+    /// The table scan has taken a regular turn ([`crate::replica::Report::regular`]) for each
+    /// table the last round this side initiated had in common with the peer, counted since
+    /// [`Self::restart_cycle`], a first round, or a change of peer. False before a round this
+    /// side initiated listed tables, so also for an endpoint with no tables and a peer that
+    /// answers no application exchange. It reads the peer's hints as this state's last round
+    /// left them.
+    pub fn cycled(&self) -> bool {
+        !self.requests.restart && self.data.cycled()
+    }
+    /// The peer's last completed table-list exchange as this state's round left it, with the
+    /// time it read the lists; none before one, or since a change of peer.
+    pub(crate) fn listed(&self) -> Option<&crate::replica::Listing> {
+        self.data.listed()
+    }
+    /// This state once a round's lists named `tables` as the ones both sides list
+    /// ([`Self::listed`]) (tests).
+    #[cfg(test)]
+    pub(crate) fn listing(mut self, tables: impl IntoIterator<Item = Digest>) -> Self {
+        self.data.listing(tables);
+        self
+    }
+    /// [`Self::listing`] at an explicit exchange time (tests).
+    #[cfg(test)]
+    pub(crate) fn listing_at(
+        mut self,
+        tables: impl IntoIterator<Item = Digest>,
+        at: Instant,
+    ) -> Self {
+        self.data.listing_at(tables, at);
+        self
+    }
+    /// This state once its round's table exchange broke off having reported `report`
+    /// ([`Self::application_interrupted`]) (tests).
+    #[cfg(test)]
+    pub(crate) fn interrupted(mut self, report: crate::replica::Report) -> Self {
+        self.data.interrupted = Some(report);
+        self
+    }
+    /// Count the table scan's regular turns from none again ([`Self::cycled`]), from the next
+    /// round this state authenticates a peer in, as for a peer first met; the scan keeps its
+    /// place.
+    pub fn restart_cycle(&mut self) {
+        self.requests.restart = true;
+    }
+    /// Act on what the dial scheduler asked ([`Requests`]), on the hints this round's
+    /// authenticated peer has: the round holds them now. A lead past the hints' own bound is not
+    /// kept, and the scan reaches its table at its turn.
+    fn heed(&mut self) {
+        let requests = std::mem::take(&mut self.requests);
+        if requests.restart {
+            self.data.restart_cycle();
+        }
+        for table in requests.lead {
+            self.data.lead(table);
+        }
+        if requests.ask {
+            self.data.ask();
+        }
+        if requests.audit {
+            self.data.audit();
+        }
+    }
+    /// Take up `saved`, the hints an endpoint kept of the peer this round authenticated
+    /// (`peers::Cache`), keeping what the dial scheduler asked of this round ([`Requests`]).
+    fn resume(&mut self, saved: Self) {
+        let requests = std::mem::take(&mut self.requests);
+        *self = saved;
+        #[cfg(test)]
+        if REQUESTS_LEFT.with(std::cell::Cell::get) {
+            return;
+        }
+        self.requests = requests;
     }
     fn prepare(&mut self, trust: Trust, actor: Actor) {
         self.authenticated = Some(Instant::now());
@@ -635,13 +799,14 @@ enum Protocol {
     Legacy,
     Repair,
     Credentials,
-    /// `atdb/4` or `atdb/5`, as the wire names.
+    /// `atdb/4`, `atdb/5` or `atdb/6`, as the wire names.
     Frontier(frontier::Wire),
 }
 
 impl Protocol {
     fn from_alpn(alpn: Option<&[u8]>) -> Self {
         match alpn {
+            Some(fleet::ALPN_DATABASE_DUPLEX) => Self::Frontier(frontier::Wire::Duplex),
             Some(fleet::ALPN_DATABASE_DELTA) => Self::Frontier(frontier::Wire::Delta),
             Some(fleet::ALPN_DATABASE_FRONTIER) => Self::Frontier(frontier::Wire::Whole),
             Some(fleet::ALPN_DATABASE_CREDENTIALS) => Self::Credentials,
@@ -893,13 +1058,13 @@ impl Endpoint {
         self.paths = Some(paths);
         Ok(self)
     }
-    /// This process appended to `tables` (and, where `unnamed`, to one more it could not name):
-    /// the next round this endpoint initiates with each peer it keeps a hint of visits them
-    /// first ([`peers::Cache::announce`]). The hints are the endpoint's, shared by every round
-    /// with a peer in either direction, and each round starts from the endpoint's copy: what a
-    /// caller wrote into the `Repair` it passes to [`Self::exchange`] would be replaced.
-    pub(crate) fn announce(&self, tables: &std::collections::BTreeSet<Digest>, unnamed: bool) {
-        self.peers.announce(tables, unnamed);
+    /// The lab catalog's table, where this endpoint's rounds repair it
+    /// ([`crate::replica::Replica::catalog_table`]); none for an endpoint with no tables, an
+    /// explicit table set, or an enrollment still pending.
+    pub(crate) fn catalog_table(&self) -> Option<Digest> {
+        self.application
+            .as_ref()
+            .and_then(crate::replica::Replica::catalog_table)
     }
 
     /// Make the rounds this endpoint initiates repair `first`'s table first while it names one both
@@ -1520,6 +1685,7 @@ impl Endpoint {
         lease.prepare(self.trust, actor);
         lease.authenticated = Some(authenticated_at);
         lease.clear_application();
+        lease.heed();
         lease.phase = Phase::Membership;
         if side == Side::Responder {
             self.require_legacy_records()?;
@@ -1560,7 +1726,8 @@ impl Endpoint {
                     if common & 4 != 0 {
                         self.require_legacy_records()?;
                         lease.phase = Phase::Credentials;
-                        lease.handoff = self.hand_off_credentials(check()?, actor, side, stream);
+                        lease.handoff =
+                            self.hand_off_credentials(check()?, actor, side, false, stream);
                     }
                     lease.phase = Phase::Complete;
                 } else {
@@ -1624,6 +1791,7 @@ impl Endpoint {
         pass: Pass,
         actor: Actor,
         side: Side,
+        bidirectional: bool,
         stream: &mut (impl Read + Write),
     ) -> Option<std::result::Result<usize, Failure>> {
         pass.spend();
@@ -1639,6 +1807,7 @@ impl Endpoint {
                 self.actor,
                 actor,
                 side,
+                bidirectional,
                 stream,
             )
             .map_err(|error| Failure::new(error.repair_cause(), "credential handoff failed")),

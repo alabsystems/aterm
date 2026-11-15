@@ -15,6 +15,8 @@ mod scope;
 pub use engine::NoJournal;
 pub use engine::{Journal, ReadOnly, Refusal, named_by, order, run, run_scoped, run_with};
 pub use journal::FileJournal;
+#[cfg(unix)]
+pub use journal::HistoryStamp;
 pub use model::{
     Class, Effect, Explain, ItemReport, Laps, Layer, Mode, Outcome, Phases, Probe, Read, Readiness,
     Remedy, Report, ReportMode, Requires, SCHEMA, StoodAside, millis,

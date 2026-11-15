@@ -123,6 +123,30 @@ impl SystemNames for FakeNames<'_> {
 
 fn nothing() {}
 
+/// Why an isolated instance is not its account's own, in `not_own_account`'s words.
+const PRIVATE: &str = "it runs under a private state root, as an isolated aterm instance does";
+
+/// The scope of the account's own shell.
+fn own() -> Scope {
+    Scope {
+        not_own: None,
+        root: false,
+        account_home: None,
+        home: None,
+    }
+}
+
+/// The scope of a process under a private state root whose account's home, and `HOME`, is
+/// `home`.
+fn private_under(home: &Path) -> Scope {
+    Scope {
+        not_own: Some(PRIVATE),
+        root: false,
+        account_home: Some(home.to_path_buf()),
+        home: Some(home.to_path_buf()),
+    }
+}
+
 /// The fleet step for `n`, then a set of `next`: one that lands just after the fleet name is
 /// written.
 fn fleet_then_set(scratch: &Scratch, n: u32, next: u32) -> impl FnOnce() -> Result<(), String> {
@@ -497,6 +521,7 @@ fn a_set_just_after_the_fleet_name_ends_publication_before_macos_is_asked() {
             &scratch.state,
             &scratch.config,
             &policy,
+            &own(),
             None,
             fleet_then_set(&scratch, 59, 60)
         ),
@@ -516,6 +541,7 @@ fn a_set_just_after_the_fleet_name_ends_publication_before_macos_is_asked() {
             &scratch.state,
             &scratch.config,
             &policy,
+            &own(),
             Some(&fake),
             fleet_then_set(&scratch, 60, 61)
         ),
@@ -877,8 +903,380 @@ fn pending_keeps_the_cli_s_words_and_names_its_step() {
             Pending::NameUnread("x".to_owned()),
             "its name could not be read back (x)",
         ),
+        (
+            Pending::NotOwnAccount("x".to_owned()),
+            "this process publishes it nowhere (x)",
+        ),
     ] {
         assert_eq!(pending.why(), "x");
         assert_eq!(pending.phrase(), phrase);
     }
+}
+
+#[test]
+fn a_private_root_never_writes_config_under_the_account_home() {
+    let scratch = fresh();
+    chosen(&scratch.state, 59);
+    let home = aterm_tempfile::tempdir().expect("an account home");
+    let config = home.path().join(".config").join("aterm").join("aterm.toml");
+    std::fs::create_dir_all(config.parent().expect("a folder")).expect("its folder");
+    let kept = "# the account's own settings\n";
+    std::fs::write(&config, kept).expect("the account's aterm.toml");
+    let policy = Policy::read(&config, num(59)).expect("a policy");
+    let fleet = Cell::new(0);
+    let step = || {
+        fleet.set(fleet.get() + 1);
+        Ok(())
+    };
+    let refused = publish_through(
+        &scratch.state,
+        &config,
+        &policy,
+        &private_under(home.path()),
+        None,
+        step,
+    );
+    assert!(
+        matches!(&refused, Err(Pending::NotOwnAccount(why)) if why.contains(PRIVATE)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("reads"),
+        kept,
+        "the account's aterm.toml is left as it was"
+    );
+    assert_eq!(fleet.get(), 0, "no later step runs");
+
+    // Control: the same process writes its own scratch aterm.toml outside the account's home.
+    let policy = Policy::read(&scratch.config, num(59)).expect("a policy");
+    assert_eq!(
+        publish_through(
+            &scratch.state,
+            &scratch.config,
+            &policy,
+            &private_under(home.path()),
+            None,
+            step,
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        config_text(&scratch),
+        Some(policy_text("", "m59").expect("a policy"))
+    );
+    assert_eq!(fleet.get(), 1);
+
+    // Control: the account's own shell writes the aterm.toml under its home, as before.
+    let policy = Policy::read(&config, num(59)).expect("a policy");
+    let own_home = Scope {
+        account_home: Some(home.path().to_path_buf()),
+        ..own()
+    };
+    assert_eq!(
+        publish_through(&scratch.state, &config, &policy, &own_home, None, step),
+        Ok(())
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).ok(),
+        Some(policy_text(kept, "m59").expect("a policy"))
+    );
+}
+
+#[test]
+fn a_link_into_the_account_home_lies_under_it() {
+    let home = aterm_tempfile::tempdir().expect("an account home");
+    let elsewhere = aterm_tempfile::tempdir().expect("a scratch folder");
+    std::fs::create_dir(home.path().join(".config")).expect("the home's config folder");
+    std::os::unix::fs::symlink(home.path().join(".config"), elsewhere.path().join("config"))
+        .expect("a link into the home");
+    let through = elsewhere
+        .path()
+        .join("config")
+        .join("aterm")
+        .join("aterm.toml");
+    assert!(
+        under(&through, home.path()),
+        "through a link, to a file not made yet"
+    );
+    assert!(under(
+        &home.path().join(".config").join("aterm.toml"),
+        home.path()
+    ));
+
+    // Control: neither the link's own folder nor a sibling whose name starts with the home's.
+    assert!(!under(&elsewhere.path().join("aterm.toml"), home.path()));
+    let sibling = PathBuf::from(format!("{}-2", home.path().display()));
+    std::fs::create_dir(&sibling).expect("a sibling folder");
+    let outside = under(&sibling.join("aterm.toml"), home.path());
+    std::fs::remove_dir(&sibling).expect("removes the sibling");
+    assert!(!outside);
+}
+
+#[test]
+fn a_private_root_signs_no_vault_name_under_the_account_home() {
+    // A state whose vault sits beside it (`vault_paths_for` reads the state's parent).
+    let root = aterm_tempfile::tempdir().expect("a home");
+    let state = root.path().join("state");
+    std::fs::create_dir(&state).expect("a state directory");
+    std::fs::create_dir_all(aterm_secrets::client::Paths::for_home(root.path()).dir)
+        .expect("a vault beside it");
+    let refused = publication_vault(&state, &private_under(root.path()));
+    assert!(
+        matches!(&refused, Err(Pending::NotOwnAccount(why)) if why.contains(PRIVATE)),
+        "{refused:?}"
+    );
+
+    // Control: a vault beside a scratch state is returned to the same process, and to the
+    // account's own shell under its home.
+    let account = aterm_tempfile::tempdir().expect("another account home");
+    let vault = Paths::locate_for_home(root.path()).dir;
+    for scope in [
+        private_under(account.path()),
+        Scope {
+            account_home: Some(root.path().to_path_buf()),
+            ..own()
+        },
+    ] {
+        assert_eq!(
+            publication_vault(&state, &scope).map(|paths| paths.map(|paths| paths.dir)),
+            Ok(Some(vault.clone()))
+        );
+    }
+}
+
+/// How many times [`counted_apply`] ran.
+static APPLIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn counted_apply(_: &Path, _: &Path, _: &GeneratedNames) -> Result<(), String> {
+    APPLIED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+fn refusing_apply(_: &Path, _: &Path, _: &GeneratedNames) -> Result<(), String> {
+    panic!("a process that is not its account's own reached the macOS naming operation")
+}
+
+fn no_authorization(_: &Path, _: &Path) -> Result<bool, String> {
+    Ok(false)
+}
+
+#[test]
+fn a_private_root_never_reaches_the_apply() {
+    let scratch = fresh();
+    let names = GeneratedNames::new(num(59), &Nickname::parse("Heron").expect("a nickname"));
+    let refusing = SystemNameOperations {
+        apply: refusing_apply,
+        authorization: no_authorization,
+    };
+    let refused = apply_registered_with(
+        Some(PRIVATE),
+        Some(&refusing),
+        &scratch.state,
+        &scratch.config,
+        &names,
+    );
+    assert!(
+        refused.as_ref().is_err_and(|why| why.contains(PRIVATE)),
+        "{refused:?}"
+    );
+    // A test binary runs under its own private state root: the live gate refuses too.
+    assert!(
+        apply_registered(&scratch.state, &scratch.config, &names)
+            .is_err_and(|why| why.contains("private state root"))
+    );
+
+    // Control: the account's own shell reaches the operation, once.
+    let counting = SystemNameOperations {
+        apply: counted_apply,
+        authorization: no_authorization,
+    };
+    assert_eq!(
+        apply_registered_with(
+            None,
+            Some(&counting),
+            &scratch.state,
+            &scratch.config,
+            &names
+        ),
+        Ok(())
+    );
+    assert_eq!(APPLIED.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        apply_registered_with(None, None, &scratch.state, &scratch.config, &names),
+        Err("macOS naming is unavailable in this process".to_owned())
+    );
+}
+
+#[test]
+fn this_process_s_scope_is_read_live() {
+    let scope = Scope::live();
+    // A test binary runs under its own private state root.
+    assert!(
+        scope
+            .not_own
+            .is_some_and(|why| why.contains("private state root")),
+        "{:?}",
+        scope.not_own
+    );
+    assert_eq!(scope.account_home, aterm_uds::account::home());
+    assert_eq!(scope.home, aterm_types::dirs::home_dir());
+    assert_eq!(scope.root, aterm_uds::peer::our_uid() == 0);
+}
+
+#[test]
+fn a_private_root_publishes_nothing_when_its_vault_is_the_account_s() {
+    // An account home holding the state, with the vault beside it (`vault_paths_for` reads the
+    // state's parent), and an aterm.toml outside that home.
+    let home = aterm_tempfile::tempdir().expect("an account home");
+    let state = home.path().join("state");
+    std::fs::create_dir(&state).expect("a state directory");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))
+        .expect("a private state directory");
+    std::fs::create_dir_all(aterm_secrets::client::Paths::for_home(home.path()).dir)
+        .expect("a vault beside it");
+    let elsewhere = aterm_tempfile::tempdir().expect("a scratch folder");
+    let config = elsewhere.path().join("aterm.toml");
+    let kept = "# a scratch aterm.toml\n";
+    std::fs::write(&config, kept).expect("the scratch aterm.toml");
+    chosen(&state, 59);
+    let policy = Policy::read(&config, num(59)).expect("a policy");
+    let refused = publish_in(&state, &config, &policy, &private_under(home.path()), None);
+    assert!(
+        matches!(&refused, Err(Pending::NotOwnAccount(why))
+            if why.contains("the vault") && why.contains(PRIVATE)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("reads"),
+        kept,
+        "aterm.toml is left as it was"
+    );
+    assert_eq!(
+        read_primary_name(&state),
+        Ok(None),
+        "no fleet name is written"
+    );
+    assert_eq!(
+        std::fs::read_dir(Paths::locate_for_home(home.path()).dir)
+            .expect("the vault folder")
+            .count(),
+        0,
+        "nothing is made in the vault"
+    );
+
+    // Control: the same publication, where the account's home is elsewhere, writes each step.
+    let account = aterm_tempfile::tempdir().expect("another account home");
+    assert_eq!(
+        publish_in(
+            &state,
+            &config,
+            &policy,
+            &private_under(account.path()),
+            None
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).ok(),
+        Some(policy_text(kept, "m59").expect("a policy"))
+    );
+    assert_eq!(read_primary_name(&state), Ok(Some("m59".to_owned())));
+}
+
+/// The scope of a process run as root under `sudo`: the account database names root's own home,
+/// `root_home`, while `HOME` is still the person's, `home`.
+fn root_under(root_home: &Path, home: &Path) -> Scope {
+    Scope {
+        not_own: Some("it runs as root"),
+        root: true,
+        account_home: Some(root_home.to_path_buf()),
+        home: Some(home.to_path_buf()),
+    }
+}
+
+#[test]
+fn root_publishes_nothing_wherever_it_would_write() {
+    let scratch = fresh();
+    chosen(&scratch.state, 59);
+    let root_home = aterm_tempfile::tempdir().expect("root's home");
+    let home = aterm_tempfile::tempdir().expect("the person's HOME, which sudo kept");
+    let as_root = root_under(root_home.path(), home.path());
+    // A scratch aterm.toml, under neither home.
+    let policy = Policy::read(&scratch.config, num(59)).expect("a policy");
+    let refused = publish_in(&scratch.state, &scratch.config, &policy, &as_root, None);
+    assert!(
+        matches!(&refused, Err(Pending::NotOwnAccount(why))
+            if why.contains("run as root") && why.contains("it runs as root")),
+        "{refused:?}"
+    );
+    assert_eq!(config_text(&scratch), None, "no aterm.toml is written");
+    assert_eq!(
+        read_primary_name(&scratch.state),
+        Ok(None),
+        "no fleet name is written"
+    );
+    // The person's own aterm.toml, under the HOME sudo kept and outside root's home.
+    let config = home.path().join(".config").join("aterm").join("aterm.toml");
+    std::fs::create_dir_all(config.parent().expect("a folder")).expect("its folder");
+    let kept = "# the person's own settings\n";
+    std::fs::write(&config, kept).expect("the person's aterm.toml");
+    let policy = Policy::read(&config, num(59)).expect("a policy");
+    assert!(matches!(
+        publish_in(&scratch.state, &config, &policy, &as_root, None),
+        Err(Pending::NotOwnAccount(_))
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("reads"),
+        kept,
+        "the person's aterm.toml is left as it was"
+    );
+
+    // Control: the same process, not run as root, writes the scratch aterm.toml.
+    let policy = Policy::read(&scratch.config, num(59)).expect("a policy");
+    let not_root = Scope {
+        root: false,
+        ..root_under(root_home.path(), home.path())
+    };
+    assert_eq!(
+        publish_in(&scratch.state, &scratch.config, &policy, &not_root, None),
+        Ok(())
+    );
+    assert_eq!(
+        config_text(&scratch),
+        Some(policy_text("", "m59").expect("a policy"))
+    );
+}
+
+#[test]
+fn with_no_account_record_home_stands_for_the_account_s_home() {
+    let home = aterm_tempfile::tempdir().expect("HOME");
+    let elsewhere = aterm_tempfile::tempdir().expect("a scratch folder");
+    let mine = home.path().join(".config").join("aterm").join("aterm.toml");
+    let scratch = elsewhere.path().join("aterm.toml");
+    let unrecorded = Scope {
+        not_own: Some("its HOME is not this account's home"),
+        root: false,
+        account_home: None,
+        home: Some(home.path().to_path_buf()),
+    };
+    let refused = unrecorded.writes("aterm.toml", &mine);
+    assert!(
+        matches!(&refused, Err(Pending::NotOwnAccount(why)) if why.contains("this account's own")),
+        "{refused:?}"
+    );
+    assert_eq!(unrecorded.writes("aterm.toml", &scratch), Ok(()));
+    // Where neither the account database nor `HOME` names a home, nothing is written.
+    let homeless = Scope {
+        home: None,
+        ..unrecorded
+    };
+    let refused = homeless.writes("aterm.toml", &scratch);
+    assert!(
+        matches!(&refused, Err(Pending::NotOwnAccount(why)) if why.contains("no home is known")),
+        "{refused:?}"
+    );
+
+    // Control: the account's own shell writes either, knowing no home at all.
+    assert_eq!(own().writes("aterm.toml", &mine), Ok(()));
+    assert_eq!(own().writes("aterm.toml", &scratch), Ok(()));
 }

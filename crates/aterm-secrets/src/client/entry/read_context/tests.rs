@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::client::entry::admission::tests::writer_is_free;
-use crate::client::entry::tests::Fixture;
+use crate::client::entry::tests::{Fixture, publish_unresolved};
 use aterm_spec::interp::State as ModelState;
 
 struct Restore;
@@ -37,10 +37,10 @@ fn transition_with(state: &ModelState, action: &str, mutant: u8) -> ModelState {
             doc.set_entry(&Audience::Everyone, "token", b"new-token")
                 .unwrap();
         }),
-        6 => std::fs::remove_file(materialize::target_path(&fixture.paths.home, "other").unwrap())
-            .unwrap(),
         _ => {}
     }
+    // Present in the version, its anchor chain unresolved: an unavailable candidate.
+    let _hidden = (scenario == 6).then(|| publish_unresolved(&fixture, "other", b"inert-other"));
     let writer = (scenario == 4).then(|| StateLock::take(&fixture.paths).unwrap());
     let look_paths = foreign.as_ref().map_or(&fixture.paths, |f| &f.paths);
     let look = VaultLook::new(look_paths);
@@ -234,11 +234,24 @@ fn borrowed_entry_admission_checks_selected_source_and_reserved_names() {
             ))
             .is_err()
     );
-    std::fs::remove_file(materialize::target_path(&fixture.paths.home, "token").unwrap()).unwrap();
+    // A file at the entry's old path changes nothing: the admission reads in place.
+    let old = aterm_types::vault_entry::plain_entry_path(&fixture.paths.home, "token");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    crate::fsx::write_atomic(&old, b"a file an older build left", 0o600).unwrap();
+    assert!(matches!(
+        snapshot
+            .admit_in(&fixture.paths, &look, |entry, _| entry.value().as_slice().to_vec())
+            .unwrap(),
+        EntryAdmission::Accepted(value) if value == b"inert-authentic-token"
+    ));
+    // NEGATIVE CONTROL: the entry present with its anchor chain unresolved is unavailable.
+    drop(look);
+    let _hidden = publish_unresolved(&fixture, "token", b"inert-authentic-token");
+    let look = VaultLook::new(&fixture.paths);
     assert!(matches!(
         snapshot
             .admit_in(&fixture.paths, &look, |_, _| panic!(
-                "missing materialization admitted"
+                "an unresolved anchor chain admitted"
             ))
             .unwrap(),
         EntryAdmission::Unavailable

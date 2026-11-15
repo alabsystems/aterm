@@ -74,7 +74,9 @@ impl Asked {
 
     /// [`Self::decided`] with this user's ledger folder `user` (its [`Ledger::dir`]) and the
     /// host's name and facts digest, the row handed to `write`: nothing unless `ledger` is
-    /// `user`'s. The seam through which a caller's test reads the rows its admissions owe.
+    /// `user`'s. The seam through which a caller's test reads the rows its admissions owe. An
+    /// admitted claim's `admitted` row in the admission log goes first, by that log's own rule
+    /// ([`crate::admission_log`]), as [`Self::decided`]'s does.
     pub fn decided_in(
         self,
         ledger: &Ledger,
@@ -84,6 +86,7 @@ impl Asked {
         result: &Result<Claim, Error>,
         write: impl FnOnce(&Row) -> bool,
     ) {
+        crate::admission_log::decided(ledger, result.as_ref());
         decided_in(ledger, user, host, digest, &self, result.as_ref(), write);
     }
 }
@@ -169,8 +172,10 @@ pub fn interval(later: u64, earlier: u64) -> Fig<u64> {
 }
 
 /// Write `result`'s row where `ledger` is this user's own ledger ([`Ledger::user`]): to this
-/// thread's [`capture`] where a test installed one.
+/// thread's [`capture`] where a test installed one. An admitted claim's `admitted` row in the
+/// admission log goes first ([`crate::admission_log`]), under that log's own seam.
 pub(crate) fn decided(ledger: &Ledger, asked: &Asked, result: Result<&Claim, &Error>) {
+    crate::admission_log::decided(ledger, result);
     #[cfg(any(test, debug_assertions))]
     if seam::took(ledger, asked, result) {
         return;

@@ -13,7 +13,7 @@ fn deadline() -> Instant {
 }
 fn binding(attempt: u8) -> admission::Binding {
     admission::Binding {
-        session: "s-ab12".into(),
+        session: "s-0000000000000000ab12".into(),
         attempt: [attempt; 16],
     }
 }

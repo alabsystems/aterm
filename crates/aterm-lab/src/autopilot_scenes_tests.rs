@@ -2,10 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use aterm_agent::supervise::config::CONTINUE_TEXT;
-use aterm_agent::supervise::policy::turn_end::{
-    DONE_CHECK, RULE_SUGGESTION, done_check_words, suggestion_allowed,
-};
+use alab_policy::config::CONTINUE_TEXT;
+use alab_policy::words::{DONE_CHECK, done_check_words};
+use aterm_agent::supervise::policy::turn_end::{RULE_SUGGESTION, suggestion_allowed};
 
 fn reply<'a>(spec: &'a J, users: &[&str]) -> (&'a str, Option<&'a J>) {
     let users: Vec<String> = users.iter().map(|u| (*u).to_string()).collect();
@@ -45,8 +44,7 @@ fn the_placeholder_scene_answers_each_request_as_its_turn_needs() {
     for check in [
         DONE_CHECK.to_string(),
         done_check_words(0),
-        aterm_agent::supervise::policy::go_ahead::unless_held(&done_check_words(0), true)
-            .into_owned(),
+        alab_policy::go_ahead::unless_held(&done_check_words(0), true).into_owned(),
     ] {
         assert_eq!(
             reply(&spec, &[&prompt, CONTINUE_TEXT, &check]).0,
@@ -63,11 +61,10 @@ fn the_placeholder_scene_answers_each_request_as_its_turn_needs() {
 /// go-ahead is no need but not [`GO_AHEAD_DROP`], never draw [`GO_ON`].
 #[test]
 fn the_go_ahead_scene_parks_as_the_incident_did_and_goes_on_after_the_answer() {
-    use aterm_agent::supervise::policy::go_ahead::{parked, unless_held};
-    use aterm_agent::supervise::policy::needs::needs_you;
-    use aterm_agent::supervise::policy::turn_end::{
-        Said, classify_said, go_ahead_answer, says_done,
-    };
+    use alab_policy::go_ahead::{parked, unless_held};
+    use alab_policy::needs::needs_you;
+    use alab_policy::words::{Said, classify_said, says_done};
+    use aterm_agent::supervise::policy::turn_end::go_ahead_answer;
     let spec = Scene::GoAhead.spec(Path::new("/lab/proj/README.md"));
     let prompt = Scene::GoAhead.prompt();
     let park = park_reply();
@@ -148,7 +145,7 @@ fn the_go_ahead_is_one_turn_whole_only_where_the_stub_answered_it_whole() {
     let spec = Scene::GoAhead.spec(Path::new("/lab/proj/README.md"));
     let prompt = Scene::GoAhead.prompt();
     let park = park_reply();
-    let parks = aterm_agent::supervise::policy::go_ahead::parked("", &park).expect("the park");
+    let parks = alab_policy::go_ahead::parked("", &park).expect("the park");
     let typed = aterm_agent::supervise::policy::turn_end::go_ahead_answer(&parks, false, None);
     let users = |u: &[&str]| u.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     let (drop, park_rule) = (spec_rule(GO_AHEAD_DROP), spec_rule(""));
@@ -228,8 +225,7 @@ fn the_go_ahead_is_one_turn_whole_only_where_the_stub_answered_it_whole() {
 fn the_received_go_ahead_keeps_its_middle_as_well_as_its_ends() {
     let spec = go_ahead_spec();
     let prompt = Scene::GoAhead.prompt();
-    let parks = aterm_agent::supervise::policy::go_ahead::parked("", &park_reply())
-        .expect("the incident's park");
+    let parks = alab_policy::go_ahead::parked("", &park_reply()).expect("the incident's park");
     let drop = spec_rule(GO_AHEAD_DROP).expect("the answer's rule");
     let park_rule = spec_rule("").expect("the park's rule");
     let mut accepted = Vec::new();

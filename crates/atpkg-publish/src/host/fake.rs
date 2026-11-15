@@ -66,6 +66,8 @@ pub enum FakeFail {
     LostResponse,
     /// Nothing changes, and the host refuses.
     Refuse,
+    /// Nothing changes, and the host does not answer.
+    Unanswered,
     /// An upload cut short after its first file.
     Partial,
 }
@@ -86,7 +88,7 @@ const fn armable(op: FakeOp, fail: FakeFail) -> bool {
         ) | (
             FakeOp::PublishDraft,
             FakeFail::LostResponse | FakeFail::Refuse
-        ) | (FakeOp::Preflight, FakeFail::Refuse)
+        ) | (FakeOp::Preflight, FakeFail::Refuse | FakeFail::Unanswered)
     )
 }
 
@@ -254,6 +256,18 @@ impl FakeHost {
             .or_default()
             .entry(tag.to_string())
             .or_default() += 1;
+    }
+
+    /// Delete release `tag`, as a person deletes one on the host. Its create's record goes
+    /// with it, as agh's created-intent rule finds no release by the id its intent made.
+    pub fn remove(&self, slug: &Slug, tag: &str) {
+        let mut s = self.state();
+        if let Some(tags) = s.repos.get_mut(slug) {
+            tags.remove(tag);
+        }
+        let key = (slug.clone(), tag.to_string());
+        s.own.remove(&key);
+        s.notes.remove(&key);
     }
 
     /// A keyless builder ([`ReleaseHost::reads_anonymously`]).
@@ -687,13 +701,23 @@ impl ReleaseHost for FakeHost {
         files: &[PathBuf],
     ) -> Result<bool, HostError> {
         self.reachable(slug)?;
-        let owned = {
+        let (owned, same_notes) = {
             let state = self.state();
             let key = (slug.clone(), tag.to_string());
-            state.own.contains(&key) && state.notes.get(&key).map(String::as_str) == Some(notes)
+            (
+                state.own.contains(&key),
+                state.notes.get(&key).map(String::as_str) == Some(notes),
+            )
         };
         if !owned {
             return Ok(false);
+        }
+        // As agh's created-intent rule answers a request that disagrees with the intent
+        // that made the release: a conflict, never a completion with other notes.
+        if !same_notes {
+            return Err(HostError::Refused(format!(
+                "release {tag} on {slug} was made by this host's create with other notes"
+            )));
         }
         self.log(format!("create-recovery {slug} {tag}"));
         self.complete_own(slug, tag, Self::read_files(files)?, true)?;
@@ -843,6 +867,9 @@ impl ReleaseHost for FakeHost {
         self.log(format!("preflight {slug}"));
         match self.armed(FakeOp::Preflight) {
             Some(FakeFail::Refuse) => Err(refused_by_the_test()),
+            Some(FakeFail::Unanswered) => Err(HostError::Unreachable(
+                "the test's host did not answer".into(),
+            )),
             Some(other) => panic!("fail_next: Preflight cannot be armed with {other:?}"),
             None => Ok(()),
         }

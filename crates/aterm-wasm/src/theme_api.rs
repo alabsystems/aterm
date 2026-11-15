@@ -7,8 +7,8 @@ use super::*;
 
 use aterm_types::scheme::{
     builtin_theme, builtin_theme_list, parse_theme_str, validate_user_theme_name, AppearanceSource,
-    CatalogTheme, ColorScheme, SelectorDraw, ThemeMeta, ThemeSelector, MAX_USER_THEME_FILES,
-    MAX_USER_THEME_FILE_BYTES, UNSET_THEME,
+    CatalogTheme, ColorScheme, SelectorDraw, ThemeMeta, ThemeSelector, ThemeWarning,
+    MAX_USER_THEME_FILES, MAX_USER_THEME_FILE_BYTES, UNSET_THEME,
 };
 use aterm_types::Appearance;
 
@@ -68,18 +68,65 @@ const fn source_word(source: AppearanceSource) -> &'static str {
     }
 }
 
-#[inline]
-fn json_opt(s: Option<&str>) -> String {
-    s.map_or_else(|| "null".to_string(), json_string)
+fn write_warnings(out: &mut String, warnings: &[ThemeWarning]) {
+    out.push('[');
+    for (i, warning) in warnings.iter().enumerate() {
+        if i != 0 {
+            out.push(',');
+        }
+        write_json_string(out, &warning.to_string());
+    }
+    out.push(']');
 }
 
-fn json_warnings(meta: &ThemeMeta) -> String {
-    let rows: Vec<String> = meta
-        .warnings
-        .iter()
-        .map(|w| json_string(&w.to_string()))
-        .collect();
-    format!("[{}]", rows.join(","))
+/// Borrow only the identity fields a catalog emits; color palettes stay untouched.
+struct CatalogRow<'a> {
+    id: &'a str,
+    display_name: &'a str,
+    appearance: Appearance,
+    appearance_source: AppearanceSource,
+    pair: Option<&'a str>,
+    description: Option<&'a str>,
+    signature: bool,
+    source: &'static str,
+    warnings: &'a [ThemeWarning],
+}
+
+impl CatalogRow<'_> {
+    fn write_json(&self, out: &mut String) {
+        out.push('{');
+        for (i, (key, value)) in [
+            ("id", Some(self.id)),
+            ("display_name", Some(self.display_name)),
+            ("appearance", Some(appearance_word(self.appearance))),
+            (
+                "appearance_source",
+                Some(source_word(self.appearance_source)),
+            ),
+            ("pair", self.pair),
+            ("description", self.description),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if i != 0 {
+                out.push(',');
+            }
+            write_json_string(out, key);
+            out.push(':');
+            match value {
+                Some(text) => write_json_string(out, text),
+                None => out.push_str("null"),
+            }
+        }
+        out.push_str(",\"signature\":");
+        out.push_str(if self.signature { "true" } else { "false" });
+        out.push_str(",\"source\":");
+        write_json_string(out, self.source);
+        out.push_str(",\"warnings\":");
+        write_warnings(out, self.warnings);
+        out.push('}');
+    }
 }
 
 /// Pack an engine colour as `0x00RRGGBB`.
@@ -230,61 +277,81 @@ impl WebThemeState {
     /// `{"unset", "themes": [...]}`: built-ins in catalog order, then the
     /// registered themes in insertion order.
     pub(crate) fn catalog_json(&self) -> String {
-        let builtins = builtin_theme_list().into_iter().filter_map(|identity| {
-            let theme = CatalogTheme::builtin(identity.name)?;
-            Some((theme, identity.signature, "builtin"))
+        let builtins = builtin_theme_list().into_iter().map(|identity| CatalogRow {
+            id: identity.name,
+            display_name: identity.name,
+            appearance: identity.appearance,
+            appearance_source: AppearanceSource::Declared,
+            pair: identity.pair,
+            description: Some(identity.description),
+            signature: identity.signature,
+            source: "builtin",
+            warnings: &[],
         });
-        let registered = self
-            .registered
-            .iter()
-            .map(|t| (t.clone(), false, "registered"));
-        let rows: Vec<String> = builtins
-            .chain(registered)
-            .map(|(t, signature, source)| {
-                format!(
-                    "{{\"id\":{},\"display_name\":{},\"appearance\":\"{}\",\"appearance_source\":\"{}\",\"pair\":{},\"description\":{},\"signature\":{},\"source\":\"{}\",\"warnings\":{}}}",
-                    json_string(&t.id),
-                    json_string(&t.meta.display_name),
-                    appearance_word(t.meta.appearance),
-                    source_word(t.meta.appearance_source),
-                    json_opt(t.meta.pair.as_deref()),
-                    json_opt(t.meta.description.as_deref()),
-                    signature,
-                    source,
-                    json_warnings(&t.meta),
-                )
-            })
-            .collect();
-        format!(
-            "{{\"unset\":{},\"themes\":[{}]}}",
-            json_string(UNSET_THEME),
-            rows.join(",")
-        )
+        let registered = self.registered.iter().map(|theme| CatalogRow {
+            id: &theme.id,
+            display_name: &theme.meta.display_name,
+            appearance: theme.meta.appearance,
+            appearance_source: theme.meta.appearance_source,
+            pair: theme.meta.pair.as_deref(),
+            description: theme.meta.description.as_deref(),
+            signature: false,
+            source: "registered",
+            warnings: &theme.meta.warnings,
+        });
+        let mut out = String::with_capacity(1024);
+        out.push_str("{\"unset\":");
+        write_json_string(&mut out, UNSET_THEME);
+        out.push_str(",\"themes\":[");
+        for (i, row) in builtins.chain(registered).enumerate() {
+            if i != 0 {
+                out.push(',');
+            }
+            row.write_json(&mut out);
+        }
+        out.push_str("]}");
+        out
     }
 
     /// JSON snapshot `{"selector", "appearance", "id", "side", "reported", "source"}`.
     pub(crate) fn state_json(&self, reported: Appearance) -> String {
         let (id, side, source) = match (&self.installed, self.host_set) {
             (Some(d), _) => (
-                json_string(&d.id),
-                format!("\"{}\"", appearance_word(d.side)),
-                match d.source {
-                    WebThemeSource::Builtin => "\"builtin\"",
-                    WebThemeSource::Registered => "\"registered\"",
-                },
+                Some(d.id.as_str()),
+                Some(appearance_word(d.side)),
+                Some(match d.source {
+                    WebThemeSource::Builtin => "builtin",
+                    WebThemeSource::Registered => "registered",
+                }),
             ),
-            (None, true) => ("null".into(), "null".into(), "\"host\""),
-            (None, false) => ("null".into(), "null".into(), "null"),
+            (None, true) => (None, None, Some("host")),
+            (None, false) => (None, None, None),
         };
-        format!(
-            "{{\"selector\":{},\"appearance\":\"{}\",\"id\":{},\"side\":{},\"reported\":\"{}\",\"source\":{}}}",
-            json_opt(self.selector.as_deref()),
-            appearance_word(self.appearance),
-            id,
-            side,
-            appearance_word(reported),
-            source,
-        )
+        let mut out = String::with_capacity(128);
+        out.push('{');
+        for (i, (key, value)) in [
+            ("selector", self.selector.as_deref()),
+            ("appearance", Some(appearance_word(self.appearance))),
+            ("id", id),
+            ("side", side),
+            ("reported", Some(appearance_word(reported))),
+            ("source", source),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if i != 0 {
+                out.push(',');
+            }
+            write_json_string(&mut out, key);
+            out.push(':');
+            match value {
+                Some(text) => write_json_string(&mut out, text),
+                None => out.push_str("null"),
+            }
+        }
+        out.push('}');
+        out
     }
 }
 
@@ -362,18 +429,24 @@ macro_rules! bind {
 
             /// Register a theme from `.conf` text.
             pub fn register_theme(&mut self, text: &str) -> Result<String, String> {
+                let has_selector = self.web_theme.selector.is_some();
                 let theme = self.web_theme.register(text)?;
-                let out = format!(
-                    "{{\"id\":{},\"appearance\":\"{}\",\"appearance_source\":\"{}\",\"warnings\":{}}}",
-                    json_string(&theme.id),
-                    appearance_word(theme.meta.appearance),
-                    source_word(theme.meta.appearance_source),
-                    json_warnings(&theme.meta),
-                );
-                let id = theme.id.clone();
-                if self.web_theme.selector_names(&id) {
-                    if let Some(raw) = self.web_theme.selector.clone() {
-                        let _ = self.install_selector(raw);
+                let mut out = String::with_capacity(128);
+                out.push_str("{\"id\":");
+                write_json_string(&mut out, &theme.id);
+                out.push_str(",\"appearance\":");
+                write_json_string(&mut out, appearance_word(theme.meta.appearance));
+                out.push_str(",\"appearance_source\":");
+                write_json_string(&mut out, source_word(theme.meta.appearance_source));
+                out.push_str(",\"warnings\":");
+                write_warnings(&mut out, &theme.meta.warnings);
+                out.push('}');
+                if has_selector {
+                    let id = theme.id.clone();
+                    if self.web_theme.selector_names(&id) {
+                        if let Some(raw) = self.web_theme.selector.clone() {
+                            let _ = self.install_selector(raw);
+                        }
                     }
                 }
                 Ok(out)

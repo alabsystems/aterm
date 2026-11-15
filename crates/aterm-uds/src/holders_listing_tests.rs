@@ -290,15 +290,27 @@ fn a_ptys_master_is_held_while_it_is_open() {
     if !runs_alone("holders::listing_tests::a_ptys_master_is_held_while_it_is_open") {
         return;
     }
-    let (_other_master, _other) = a_terminal();
+    let (_other_master, other) = a_terminal();
     let (master, terminal) = a_terminal();
     let number = terminal.metadata().expect("fstat the terminal").rdev() & 0xffff_ffff;
+    let other_number = other.metadata().expect("fstat the other terminal").rdev() & 0xffff_ffff;
+    let terminals = [
+        u32::try_from(number).unwrap(),
+        u32::try_from(other_number).unwrap(),
+    ];
+    assert_eq!(
+        super::pty_masters_held(&terminals),
+        [Some(true), Some(true)]
+    );
     assert_eq!(
         super::pty_master_held(number),
         Some(true),
         "its master is open"
     );
     drop(master);
+    let batch = super::pty_masters_held(&terminals);
+    assert_ne!(batch[0], Some(true), "the closed master's own result");
+    assert_eq!(batch[1], Some(true), "the other master stays held");
     assert_ne!(
         super::pty_master_held(number),
         Some(true),

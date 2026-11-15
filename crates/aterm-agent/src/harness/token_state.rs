@@ -6,19 +6,33 @@
 //! Unix-only and live in `accounts_tokens`; the state itself is declared here so a surface on any
 //! platform compiles against it.
 
-use aterm_secrets::entry_class::Mismatch;
+use aterm_secrets::entry_class::{MintedBy, Mismatch};
 
-/// Why a token this Mac minted is not verified yet (§5.6, §5.1's `unverified (<why>)`); it
-/// serves this Mac meanwhile.
+/// Why a token is not verified yet (§5.6, §5.1's `unverified (<why>)`), as this Mac's own
+/// comparison stands. It serves this Mac meanwhile where its route serves before verification
+/// ([`TokenState::in_use`]), unless its windows differ here or, while this account's stored login
+/// is usable here, it awaits a basis (the route's hold, `token_route::standing_judged`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unverified {
-    /// No served reading carrying rate limits was compared yet, or the row had no stored-login
-    /// reading in a current window to compare it with.
+    /// This Mac's row recorded no basis that names a week still running: no session on the
+    /// account's stored login here has reported its windows since the token was made, or the
+    /// last one's week has ended. A reading of the token now would be compared with nothing, so
+    /// where the stored login is usable here sessions stay on it until one reports.
+    AwaitingBasis,
+    /// The row holds a current basis, and no served reading of the token carrying rate limits
+    /// was compared with it yet.
     NoReadingYet,
-    /// The token session's windows were not the row's stored login's.
+    /// The token session's windows were not the basis this Mac's row recorded: this Mac starts no
+    /// session on the token. Another Mac's comparison is its own.
     WindowsDiffer,
-    /// They were, and another account's current windows on this Mac were too.
+    /// They were, and another account's current windows on this Mac were too, so the comparison
+    /// could not tell the two accounts apart and no verification follows: the token serves where
+    /// its route puts it in use, and one a person's terminal made (or whose meta names no route)
+    /// serves only its minting Mac, whose surfaces offer its replacement.
     WindowsShared,
+    /// They were, and no other account's were: on the Mac that minted the token, its `verified`
+    /// stamp is on its way to the vault.
+    WindowsEqual,
     /// No roster row names the account, so no stored-login reading under a row compares.
     NoRosterRow,
 }
@@ -28,9 +42,11 @@ impl Unverified {
     #[must_use]
     pub const fn words(self) -> &'static str {
         match self {
+            Self::AwaitingBasis => "awaiting a stored-login reading",
             Self::NoReadingYet => "no reading yet",
             Self::WindowsDiffer => "windows differ",
             Self::WindowsShared => "windows shared",
+            Self::WindowsEqual => "windows equal",
             Self::NoRosterRow => "no roster row",
         }
     }
@@ -51,12 +67,23 @@ pub enum TokenState {
     /// Its end has passed.
     Ended,
     /// This Mac saw Claude Code refuse it.
-    Rejected,
-    /// Not verified yet: it serves only the Mac that minted it.
+    Rejected {
+        /// The vault's records put it in use on another Mac
+        /// ([`aterm_secrets::claude_token::Standing::serves_elsewhere`]), so a new token in its
+        /// place replaces theirs too.
+        elsewhere: bool,
+    },
+    /// Not verified yet. A token aterm's window or headless route minted proved its account at
+    /// its mint, so every member Mac starts sessions on it; one minted at a person's terminal, or
+    /// whose meta names no route, only the Mac that minted it. Not a Mac whose own comparison
+    /// found its windows different, nor one that awaits a basis while this account's stored
+    /// login is usable there.
     Unverified {
         /// This Mac minted it.
         minted_here: bool,
-        /// On the minting Mac, why verification has not passed yet.
+        /// The route that minted it, as its meta names it (`None`: no route this build knows).
+        minted_by: Option<MintedBy>,
+        /// Why verification has not passed yet, as this Mac's comparison stands.
         why: Unverified,
         /// The Mac that did, as its meta names it.
         minted_on: String,
@@ -82,17 +109,20 @@ impl TokenState {
             Self::Mismatched(Mismatch::Draft) => "mismatched (draft)".to_owned(),
             Self::Mismatched(Mismatch::Value) => "mismatched (value)".to_owned(),
             Self::Ended => "ended".to_owned(),
-            Self::Rejected => "rejected".to_owned(),
+            Self::Rejected { .. } => "rejected".to_owned(),
             Self::Unverified {
                 minted_here,
+                minted_by,
                 why,
                 minted_on,
                 exposed,
             } => {
                 let mut words = if *minted_here {
                     format!("unverified ({})", why.words())
+                } else if MintedBy::serves_unverified(*minted_by, false) {
+                    format!("unverified (made on {minted_on}; {})", why.words())
                 } else {
-                    format!("unverified (made on {minted_on}; serves that Mac until verified)")
+                    format!("unverified (made on {minted_on}; awaits verification there)")
                 };
                 if !exposed.is_empty() {
                     words.push_str(&format!(", exposed (removed {})", exposed.join(", ")));
@@ -115,7 +145,7 @@ impl TokenState {
             Self::Unreadable => "unreadable",
             Self::Mismatched(_) => "mismatched",
             Self::Ended => "ended",
-            Self::Rejected => "rejected",
+            Self::Rejected { .. } => "rejected",
             Self::Unverified { .. } => "unverified",
             Self::Exposed(_) => "exposed",
             Self::Soon => "soon",
@@ -123,19 +153,35 @@ impl TokenState {
         }
     }
 
-    /// Whether sessions on this Mac start on the token (§5.1's *in use*): `active`, `soon` or
-    /// `exposed` on every Mac, `unverified` on its minting Mac only.
+    /// Whether sessions on this Mac may start on the token (§5.1's *in use*): `active`, `soon` or
+    /// `exposed` on every Mac; `unverified` on every Mac where aterm's window or headless route
+    /// minted it (that mint proved the account), and on its minting Mac only where a person's
+    /// terminal minted it or its meta names no route ([`MintedBy::serves_unverified`]); and
+    /// there only while this Mac's comparison has not found its windows different from its
+    /// row's basis (§5.6): such a token may be another account's, so this Mac starts no session
+    /// on it, and a session running on it here moves back where this Mac holds the account's
+    /// stored login. A token that awaits a basis ([`Unverified::AwaitingBasis`]) is in use here
+    /// by this state; the route's judgment holds it while this account's stored login is usable
+    /// here (`token_route::standing_judged`), which this state does not know.
     #[must_use]
     pub const fn in_use(&self) -> bool {
-        matches!(
-            self,
-            Self::Active
-                | Self::Soon
-                | Self::Exposed(_)
-                | Self::Unverified {
-                    minted_here: true,
-                    ..
-                }
-        )
+        match self {
+            Self::Active | Self::Soon | Self::Exposed(_) => true,
+            Self::Unverified {
+                minted_here,
+                minted_by,
+                why,
+                ..
+            } => {
+                MintedBy::serves_unverified(*minted_by, *minted_here)
+                    && !matches!(why, Unverified::WindowsDiffer)
+            }
+            Self::Unknown
+            | Self::None
+            | Self::Unreadable
+            | Self::Mismatched(_)
+            | Self::Ended
+            | Self::Rejected { .. } => false,
+        }
     }
 }

@@ -178,7 +178,7 @@ fn kept(column: &Column, edit: grid::Edit, born: bool) -> Edit {
         // A set's whole cell, as the owner typed it.
         (Ty::Set(_), Some(_)) => edit.mine.clone(),
         _ if edit.x.is_null() => String::new(),
-        _ => grid::show(&column.ty, &edit.x, true),
+        _ => grid::show(&column.ty, &edit.x),
     };
     Edit {
         key: if born { String::new() } else { edit.pk },
@@ -358,8 +358,20 @@ fn rm(target: &Target, key: &str) -> Result<Vec<Edit>, Refusal> {
 
 /// The held intent's edits against the candidates the snapshot shows now: the owner keeps their
 /// side. A held row to be born or revert would be held again for the same reason (the row its
-/// key derives is there, the reverted operation's cells moved), so neither is queued again.
+/// key derives is there, the reverted operation's cells moved), so neither is queued again, and
+/// a Mac's statement of its own row is no owner's write to keep: only the Mac restates its row.
 fn again(target: &Target, held: &aterm_file::Intent) -> Result<Draft, Refusal> {
+    if held.mine() {
+        let why =
+            target.file.class.refuses(held).unwrap_or(
+                "only the Mac restates its own row, and its next statement replaces this",
+            );
+        return Err(problem(format!(
+            "{}: {} is a Mac's statement of its own row, which no owner's word keeps: {why}; \
+             `resolve {} {} theirs` drops it",
+            target.name, held.id, target.name, held.id
+        )));
+    }
     if held.born {
         return Err(problem(format!(
             "{}: {} is a new row that cannot be born as it was written (its row is there now, \
@@ -530,6 +542,11 @@ pub fn verb(
     words: &[String],
     env: &Env<'_>,
 ) -> Result<(String, u8), Refusal> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the explicit `aterm file` verb: set, add, rm, revert and resolve (this fn's \
+                  own clippy.toml row lets only `aterm file`'s entry run it)"
+    )]
     let act = OwnerAct::verb(env.by, env.session)
         .ok_or_else(|| usage("--by takes one word [a-z][a-z0-9-]{0,19}"))?;
     let word = |at: usize, what: &str| -> Result<&str, Refusal> {
@@ -639,7 +656,7 @@ pub fn verb(
                 return Err(no_such());
             };
             match side {
-                "theirs" => match target.held.drop_intent(id).map_err(problem)? {
+                "theirs" => match target.held.drop_intent(&act, id).map_err(problem)? {
                     Dropped::Dropped => Ok(answer(
                         &target.name,
                         Said::Dropped { id: id.to_owned() },

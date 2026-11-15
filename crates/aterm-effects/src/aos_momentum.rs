@@ -1,31 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The typing-momentum glow as an Aos task.
+//! The typing-momentum glow as an Aos task: [`MomentumEngine`], hosted by the generic
+//! [`crate::aos_effect::Hosted`] as [`MomentumHost`].
 
 use core::fmt;
 use std::time::Duration;
 
-use aterm_aos::checkpoint::CheckpointFault;
 use aterm_aos::contract::{Contract, Verdict};
 use aterm_aos::effects::EffectPort;
-use aterm_aos::log::LogFault;
-use aterm_aos::publish::{
-    Admit, Boundary, Commit, Head, Prepared, PublishRefusal, RETIRED_CAP, Stats,
-};
-use aterm_aos::replay::{FoldedRun, Run, chain_link, empty_chain, replay_fold};
-use aterm_aos::task::{Code, EntryRefusal, PausedClass, Schema, StepRefusal, state_digest};
+use aterm_aos::publish::Stats;
+use aterm_aos::replay::{FoldedRun, Run, replay_fold};
+use aterm_aos::task::{Code, EntryRefusal, PausedClass, StepRefusal, state_digest};
 use aterm_aos::wire::{Dec, Enc, WireFault};
-use aterm_aos::{ArtifactId, ArtifactKind, Digest, TaskIdentity};
+use aterm_aos::{ArtifactId, ArtifactKind, TaskIdentity};
 use aterm_render::GlowQuad;
 use aterm_time::Instant;
 
+use crate::aos_effect::{
+    Attached, EffectCode, EffectSchema, HostMode, Hosted, HostedEngine, identity_of, instant_of,
+    offset_of,
+};
 use crate::cursor_glow::Geom;
 use crate::cursor_momentum::{
     AdmitRefusal, GeometryFault, MOMENTUM_GLOW_SNAPSHOT_SCHEMA, MOMENTUM_PROFILE, MomentumGlow,
-    MomentumGlowConfig, MomentumGlowFrame, MomentumGlowSnapshot, SnapshotRefusal,
+    MomentumGlowConfig, MomentumGlowFrame, MomentumGlowSnapshot, MomentumProfile, SnapshotRefusal,
     admit_frame_interval, admit_tau, admit_tick, admit_time,
 };
+
+pub use crate::aos_effect::{PAST_HORIZON, RAW_KEY, TraceRefusal};
 
 #[cfg(test)]
 mod admission_tests;
@@ -148,42 +151,6 @@ pub const COLD_TICK_CLEARS: &str = "ColdTickClears";
 pub const RUN_MATCHES_INPUTS: &str = "RunMatchesInputs";
 /// The entry law: the state is one the engine can reach (its snapshot validates).
 pub const SNAPSHOT_VALID: &str = "momentum-glow.snapshot-valid";
-
-/// `t − epoch` in signed nanoseconds.
-#[inline]
-fn offset_of(epoch: Instant, t: Instant) -> i128 {
-    if let Some(after) = t.checked_duration_since(epoch) {
-        let n = after.as_nanos();
-        if n <= i128::MAX as u128 {
-            n as i128
-        } else {
-            i128::MAX
-        }
-    } else if let Some(before) = epoch.checked_duration_since(t) {
-        let n = before.as_nanos();
-        if n <= i128::MAX as u128 {
-            -(n as i128)
-        } else {
-            i128::MIN
-        }
-    } else {
-        i128::MIN
-    }
-}
-
-/// `epoch + at` with checked instant arithmetic.
-#[inline]
-fn instant_of(epoch: Instant, at: i128) -> Option<Instant> {
-    let magnitude = at.unsigned_abs();
-    let secs = u64::try_from(magnitude / 1_000_000_000).ok()?;
-    let nanos = u32::try_from(magnitude % 1_000_000_000).ok()?;
-    let span = Duration::new(secs, nanos);
-    if at >= 0 {
-        epoch.checked_add(span)
-    } else {
-        epoch.checked_sub(span)
-    }
-}
 
 /// The task's owned state: the engine, the latest admitted input's time and how many of its
 /// keys aterm could not see echoed.
@@ -547,31 +514,24 @@ fn observe(
     }
 }
 
-/// The task ABI.
-#[derive(Clone, Debug)]
-pub struct MomentumSchema {
-    id: ArtifactId,
-    epoch: Instant,
-}
+/// The task ABI: the generic adapter over [`MomentumEngine`].
+pub type MomentumSchema = EffectSchema<MomentumEngine>;
 
-impl MomentumSchema {
-    /// The schema over the recording epoch `epoch`.
-    #[inline]
-    #[must_use]
-    pub fn new(epoch: Instant) -> Self {
-        MomentumSchema {
-            id: schema_artifact(),
-            epoch,
-        }
-    }
+/// A prebuilt implementation bound to its artifact (which names the build it was compiled into).
+pub type PrebuiltMomentum = EffectCode<MomentumEngine>;
 
-    /// The recording epoch.
-    #[inline]
-    #[must_use]
-    pub const fn epoch(&self) -> Instant {
-        self.epoch
-    }
-}
+/// The momentum glow as the host holds it.
+pub type MomentumHost = Hosted<MomentumEngine>;
+
+/// A paused glow's boundary, copied, with the candidate to prepare against it away from the host's main thread.
+pub type RepairJob = crate::aos_effect::RepairJob<MomentumEngine>;
+
+/// What [`RepairJob::prepare`] made, for [`MomentumHost::aos_commit`].
+pub type PreparedRepair = crate::aos_effect::PreparedRepair<MomentumEngine>;
+
+/// The typing-momentum glow's hosted engine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MomentumEngine;
 
 #[inline]
 const fn snapshot_fault(r: SnapshotRefusal) -> WireFault {
@@ -746,19 +706,98 @@ fn encode_refusal(e: &mut Enc, r: &AdmitRefusal) {
     }
 }
 
-impl Schema for MomentumSchema {
+/// What a momentum tick was drawn at: the cursor cell, geometry, page (`dark_theme`) and caret shape (`block`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MomentumPresentation {
+    pub cur: Option<(u16, u16)>,
+    pub geom: GeomRecord,
+    pub dark: bool,
+    pub block: bool,
+}
+
+/// What the host keeps per momentum attachment beside the boundary.
+#[derive(Debug, Default)]
+pub struct MomentumLive {
+    /// The latest recorded query's time and the wake it was answered with.
+    last_query: Option<(i128, Option<i128>)>,
+    /// The plan-only presentation guard.
+    #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+    guard: Guard,
+}
+
+impl HostedEngine for MomentumEngine {
+    type Engine = MomentumGlow;
     type State = MomentumState;
+    type Snapshot = MomentumGlowSnapshot;
     type Input = MomentumEvent;
-    type Observation = MomentumObservation;
+    type Frame = MomentumObservation;
+    type Profile = MomentumProfile;
+    type Applied = Applied;
+    type Code = Sched;
+    type Prebuilt = MomentumCode;
+    type Contract = NoStrandedLight;
+    type Shown = MomentumGlowFrame;
+    type Presentation = MomentumPresentation;
+    type Counts = EventCounts;
+    type Live = MomentumLive;
+
+    const TASK_NAME: &'static str = TASK_NAME;
+    const SHORT_NAME: &'static str = "momentum";
+    const QUEUE_CAP: usize = MOMENTUM_QUEUE_CAP;
+    const HOST_MAX_EVENTS: usize = MOMENTUM_HOST_MAX_EVENTS;
+    const MAX_EVENTS: usize = MOMENTUM_MAX_EVENTS;
+    const TRACE_MAGIC: [u8; 8] = TRACE_FILE_MAGIC;
+    const TRACE_DOMAIN: &'static [u8] = TRACE_FILE_DOMAIN;
+    const ALL: &'static [MomentumCode] = MomentumCode::ALL;
 
     #[inline]
-    fn id(&self) -> &ArtifactId {
-        &self.id
+    fn profile() -> &'static MomentumProfile {
+        &MOMENTUM_PROFILE
     }
 
     #[inline]
-    fn encode_state(&self, s: &MomentumState, e: &mut Enc) {
-        match s.glow.snapshot(self.epoch) {
+    fn horizon_ns() -> i128 {
+        horizon_ns()
+    }
+
+    #[inline]
+    fn task_artifact() -> ArtifactId {
+        task_artifact()
+    }
+
+    #[inline]
+    fn schema_artifact() -> ArtifactId {
+        schema_artifact()
+    }
+
+    #[inline]
+    fn profile_artifact() -> ArtifactId {
+        profile_artifact()
+    }
+
+    #[inline]
+    fn contract() -> NoStrandedLight {
+        NoStrandedLight::new()
+    }
+
+    #[inline]
+    fn state_of(engine: MomentumGlow) -> MomentumState {
+        MomentumState::new(engine)
+    }
+
+    #[inline]
+    fn engine_of(state: MomentumState) -> MomentumGlow {
+        state.glow
+    }
+
+    #[inline]
+    fn snapshot(state: &MomentumState, epoch: Instant) -> Option<MomentumGlowSnapshot> {
+        state.glow.snapshot(epoch).ok()
+    }
+
+    #[inline]
+    fn encode_state(s: &MomentumState, epoch: Instant, e: &mut Enc) {
+        match s.glow.snapshot(epoch) {
             Ok(snap) => e.raw(&snap.encode()),
             Err(_) => e.raw(&[0u8; MomentumGlowSnapshot::LEN]),
         }
@@ -767,10 +806,10 @@ impl Schema for MomentumSchema {
     }
 
     #[inline]
-    fn decode_state(&self, d: &mut Dec<'_>) -> Result<MomentumState, WireFault> {
+    fn decode_state(epoch: Instant, d: &mut Dec<'_>) -> Result<MomentumState, WireFault> {
         let bytes = d.raw("state.snapshot", MomentumGlowSnapshot::LEN)?;
         let snap = MomentumGlowSnapshot::decode(bytes).map_err(snapshot_fault)?;
-        let glow = MomentumGlow::restore(&snap, self.epoch).map_err(snapshot_fault)?;
+        let glow = MomentumGlow::restore(&snap, epoch).map_err(snapshot_fault)?;
         let clock = d.opt("state.clock", |d| d.offset("state.clock"))?;
         let unseen = d.u32("state.unseen")?;
         Ok(MomentumState {
@@ -781,7 +820,7 @@ impl Schema for MomentumSchema {
     }
 
     #[inline]
-    fn encode_input(&self, i: &MomentumEvent, e: &mut Enc) {
+    fn encode_input(i: &MomentumEvent, e: &mut Enc) {
         match *i {
             MomentumEvent::Key { at, tau_bits, echo } => {
                 e.u8(match echo {
@@ -833,7 +872,7 @@ impl Schema for MomentumSchema {
     }
 
     #[inline]
-    fn decode_input(&self, d: &mut Dec<'_>) -> Result<MomentumEvent, WireFault> {
+    fn decode_input(d: &mut Dec<'_>) -> Result<MomentumEvent, WireFault> {
         match d.u8("event.tag")? {
             tag @ (0 | 4) => Ok(MomentumEvent::Key {
                 at: d.offset("event.key.at")?,
@@ -895,7 +934,7 @@ impl Schema for MomentumSchema {
         }
     }
 
-    fn encode_observation(&self, o: &MomentumObservation, e: &mut Enc) {
+    fn encode_frame(o: &MomentumObservation, e: &mut Enc) {
         match o {
             MomentumObservation::Keyed => e.u8(0),
             MomentumObservation::WasReset => e.u8(1),
@@ -935,11 +974,204 @@ impl Schema for MomentumSchema {
     }
 
     #[inline]
-    fn paused_class(&self, i: &MomentumEvent) -> PausedClass {
+    fn paused_class(i: &MomentumEvent) -> PausedClass {
         match i {
             MomentumEvent::Key { .. } | MomentumEvent::Reset => PausedClass::Queue,
             MomentumEvent::Tick { .. } | MomentumEvent::Query { .. } => PausedClass::Skip,
         }
+    }
+
+    #[inline]
+    fn time_of(ev: &MomentumEvent) -> Option<i128> {
+        time_of(ev)
+    }
+
+    #[inline]
+    fn is_reset(ev: &MomentumEvent) -> bool {
+        matches!(ev, MomentumEvent::Reset)
+    }
+
+    #[inline]
+    fn last_time(state: &MomentumState, epoch: Instant) -> Option<i128> {
+        state.last_time(epoch)
+    }
+
+    #[inline]
+    fn at_rest(state: &MomentumState, _epoch: Instant) -> bool {
+        at_rest(state)
+    }
+
+    #[inline]
+    fn unseen(state: &MomentumState) -> u32 {
+        state.unseen()
+    }
+
+    #[inline]
+    fn unseen_logged(counts: &EventCounts) -> usize {
+        counts.unseen
+    }
+
+    #[inline]
+    fn counts(inputs: &[MomentumEvent]) -> EventCounts {
+        EventCounts::of(inputs)
+    }
+
+    #[inline]
+    fn code_of(p: MomentumCode) -> Sched {
+        Sched::Prebuilt(p)
+    }
+
+    #[inline]
+    fn prebuilt_of(c: Sched) -> Option<MomentumCode> {
+        c.prebuilt()
+    }
+
+    #[inline]
+    fn code_name(c: Sched) -> &'static str {
+        c.name()
+    }
+
+    #[inline]
+    fn prebuilt_name(p: MomentumCode) -> &'static str {
+        p.name()
+    }
+
+    #[inline]
+    fn prebuilt_named(name: &str) -> Option<MomentumCode> {
+        MomentumCode::from_name(name)
+    }
+
+    #[inline]
+    fn code_artifact(c: Sched, build: &str) -> ArtifactId {
+        match c {
+            Sched::Prebuilt(code) => code.artifact(build),
+            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+            Sched::Plan(plan) => plan.artifact(build),
+        }
+    }
+
+    fn entry(_c: Sched, state: &MomentumState, epoch: Instant) -> Result<(), EntryRefusal> {
+        let res = match state.glow.snapshot(epoch) {
+            Ok(s) => s.validate(),
+            Err(r) => Err(r),
+        };
+        res.map_err(|r| EntryRefusal {
+            law: SNAPSHOT_VALID,
+            detail: r.to_string(),
+        })
+    }
+
+    #[inline]
+    fn apply(
+        c: Sched,
+        state: &mut MomentumState,
+        epoch: Instant,
+        input: &MomentumEvent,
+        out: &mut Vec<GlowQuad>,
+        under: &mut Vec<GlowQuad>,
+    ) -> Applied {
+        c.apply(state, epoch, input, out, under)
+    }
+
+    #[inline]
+    fn observe(
+        applied: &Applied,
+        epoch: Instant,
+        out: Vec<GlowQuad>,
+        under: Vec<GlowQuad>,
+    ) -> MomentumObservation {
+        observe_owned(applied, epoch, out, under)
+    }
+
+    #[inline]
+    fn encode_applied(
+        applied: &Applied,
+        epoch: Instant,
+        out: &[GlowQuad],
+        under: &[GlowQuad],
+        e: &mut Enc,
+    ) {
+        match applied {
+            Applied::Frame(frame) => {
+                e.reserve(frame_room(out.len().saturating_add(under.len())));
+                encode_frame(e, frame, out, under);
+            }
+            other => Self::encode_frame(&observe(other, epoch, &[], &[]), e),
+        }
+    }
+
+    #[inline]
+    fn held_of(
+        input: &MomentumEvent,
+        applied: &Applied,
+    ) -> Option<(MomentumGlowFrame, MomentumPresentation)> {
+        let MomentumEvent::Tick { cur, geom, cfg, .. } = *input else {
+            return None;
+        };
+        let frame = match applied {
+            Applied::Frame(f) => *f,
+            _ => MomentumGlowFrame::default(),
+        };
+        Some((
+            frame,
+            MomentumPresentation {
+                cur,
+                geom,
+                dark: cfg.dark_theme,
+                block: cfg.block,
+            },
+        ))
+    }
+
+    #[inline]
+    fn shows(at: &MomentumPresentation, input: &MomentumEvent) -> bool {
+        let MomentumEvent::Tick { cur, geom, cfg, .. } = *input else {
+            return false;
+        };
+        let Some((cr, cc)) = cur else {
+            return false;
+        };
+        let Some((hr, hc)) = at.cur else {
+            return false;
+        };
+        let intensity = f32::from_bits(cfg.intensity);
+        cfg.enabled
+            && intensity.is_finite()
+            && intensity > 0.0
+            && geom.cw != 0
+            && geom.ch != 0
+            && hr == cr
+            && hc == cc
+            && at.geom == geom
+            && at.dark == cfg.dark_theme
+            && at.block == cfg.block
+    }
+
+    #[inline]
+    fn noted(
+        live: &mut MomentumLive,
+        _c: Sched,
+        _state: &MomentumState,
+        input: &MomentumEvent,
+        applied: &Applied,
+        epoch: Instant,
+    ) {
+        #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+        if let MomentumEvent::Tick { cur, geom, cfg, .. } = *input {
+            live.guard.tick(cur, geom, cfg, _c, _state);
+        }
+        if let MomentumEvent::Query { at, .. } = *input {
+            let deadline = match *applied {
+                Applied::Schedule { deadline, .. } => deadline.map(|t| offset_of(epoch, t)),
+                _ => None,
+            };
+            live.last_query = Some((at, deadline));
+        }
+    }
+
+    #[inline]
+    fn before_pause(a: &mut Attached<Self>, now: Instant, frame_interval: Duration) {
+        let _ = a.next_change_deadline(now, frame_interval);
     }
 }
 
@@ -1006,13 +1238,7 @@ pub fn profile_artifact() -> ArtifactId {
 #[inline]
 #[must_use]
 pub fn momentum_identity(code: &PrebuiltMomentum) -> TaskIdentity {
-    TaskIdentity {
-        task: task_artifact(),
-        code: code.id.clone(),
-        contract: NoStrandedLight::artifact(),
-        schema: schema_artifact(),
-        profile: profile_artifact(),
-    }
+    identity_of(code)
 }
 
 /// The prebuilt implementations compiled into this build (design §2 item 1).
@@ -1339,22 +1565,12 @@ impl Sched {
     }
 }
 
-/// A prebuilt implementation bound to its artifact (which names the build it was compiled into).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrebuiltMomentum {
-    sched: Sched,
-    id: ArtifactId,
-}
-
-impl PrebuiltMomentum {
+impl EffectCode<MomentumEngine> {
     /// `code` as compiled into the build `build`.
     #[inline]
     #[must_use]
     pub fn new(code: MomentumCode, build: &str) -> Self {
-        PrebuiltMomentum {
-            sched: Sched::Prebuilt(code),
-            id: code.artifact(build),
-        }
+        Self::prebuilt(code, build)
     }
 
     /// The plan interpreter reading `plan` as compiled into `build` ([`SchedulePlan::artifact`]), which no verb or code name reaches.
@@ -1362,68 +1578,21 @@ impl PrebuiltMomentum {
     #[inline]
     #[must_use]
     pub(crate) fn planned(plan: SchedulePlan, build: &str) -> Self {
-        PrebuiltMomentum {
-            sched: Sched::Plan(plan),
-            id: plan.artifact(build),
-        }
-    }
-
-    /// The code `sched` names, as compiled into the build `build`.
-    #[inline]
-    #[must_use]
-    fn of(sched: Sched, build: &str) -> Self {
-        match sched {
-            Sched::Prebuilt(code) => Self::new(code, build),
-            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-            Sched::Plan(plan) => Self::planned(plan, build),
-        }
+        Self::compiled(Sched::Plan(plan), build)
     }
 
     /// Which prebuilt implementation, or `None` for a planned code.
     #[inline]
     #[must_use]
     pub const fn code(&self) -> Option<MomentumCode> {
-        self.sched.prebuilt()
+        self.code.prebuilt()
     }
 
     /// What answers the scheduler question.
     #[inline]
     #[must_use]
     pub const fn sched(&self) -> Sched {
-        self.sched
-    }
-}
-
-impl Code<MomentumSchema> for PrebuiltMomentum {
-    #[inline]
-    fn id(&self) -> &ArtifactId {
-        &self.id
-    }
-
-    #[inline]
-    fn entry(&self, schema: &MomentumSchema, state: &MomentumState) -> Result<(), EntryRefusal> {
-        let res = match state.glow.snapshot(schema.epoch) {
-            Ok(s) => s.validate(),
-            Err(r) => Err(r),
-        };
-        res.map_err(|r| EntryRefusal {
-            law: SNAPSHOT_VALID,
-            detail: r.to_string(),
-        })
-    }
-
-    fn step(
-        &self,
-        schema: &MomentumSchema,
-        state: &mut MomentumState,
-        input: &MomentumEvent,
-        _port: &mut dyn EffectPort,
-    ) -> Result<MomentumObservation, StepRefusal> {
-        let (mut out, mut under) = (Vec::new(), Vec::new());
-        let applied = self
-            .sched
-            .apply(state, schema.epoch, input, &mut out, &mut under);
-        Ok(observe_owned(&applied, schema.epoch, out, under))
+        self.code
     }
 }
 
@@ -1716,59 +1885,6 @@ impl Contract<MomentumSchema> for NoStrandedLight {
     }
 }
 
-/// The live observation chain since the current ancestor checkpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LiveChain {
-    /// The log epoch and first cursor it folds from.
-    anchor: (u64, u64),
-    chain: Digest,
-    len: u64,
-}
-
-/// The last delivered tick's frame and the quads it appended.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Held {
-    frame: MomentumGlowFrame,
-    out: Vec<GlowQuad>,
-    under: Vec<GlowQuad>,
-    /// The cursor cell, geometry, page (`dark_theme`) and caret shape (`block`) of the tick.
-    cur: Option<(u16, u16)>,
-    geom: GeomRecord,
-    dark: bool,
-    block: bool,
-}
-
-impl Held {
-    /// Whether a paused tick at (`cur`, `geom`, `cfg`) is shown this overlay.
-    #[inline]
-    const fn shows(&self, cur: Option<(u16, u16)>, geom: &Geom, cfg: &MomentumGlowConfig) -> bool {
-        let Some((cr, cc)) = cur else {
-            return false;
-        };
-        let Some((hr, hc)) = self.cur else {
-            return false;
-        };
-        cfg.enabled
-            && cfg.intensity.is_finite()
-            && cfg.intensity > 0.0
-            && geom.cw != 0
-            && geom.ch != 0
-            && hr == cr
-            && hc == cc
-            && self.geom.cw == geom.cw
-            && self.geom.ch == geom.ch
-            && self.geom.rows == geom.rows
-            && self.geom.cols == geom.cols
-            && self.geom.origin_x == geom.origin_x
-            && self.geom.origin_y == geom.origin_y
-            && self.geom.win_w == geom.win_w
-            && self.geom.win_h == geom.win_h
-            && self.geom.head == geom.head
-            && self.dark == cfg.dark_theme
-            && self.block == cfg.block
-    }
-}
-
 /// Whether the glow is at rest.
 #[inline]
 const fn at_rest(s: &MomentumState) -> bool {
@@ -1791,62 +1907,28 @@ struct Guard {
     firings: u64,
 }
 
-struct Hosted {
-    boundary: Boundary<MomentumSchema, PrebuiltMomentum, NoStrandedLight>,
-    build: String,
-    chain: LiveChain,
-    held: Option<Held>,
-    /// The latest recorded query's time and the wake it was answered with.
-    last_query: Option<(i128, Option<i128>)>,
-    /// How many live inputs were recorded at the logical time instead of their own.
-    clamped: u64,
-    /// The latest time among the keys queued in the current pause (within the horizon).
-    queued_at: Option<i128>,
-    /// The one encoder every live observation is encoded into before its chain link.
-    scratch: Enc,
-    /// The plan-only presentation guard.
-    #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-    guard: Guard,
-    /// While a typed key waits for its program's echo ([`MomentumHost::aos_hold`]): the instant
-    /// the host wakes by. No input reaches the boundary meanwhile.
-    awaiting_echo: Option<Instant>,
-}
-
-#[inline]
-fn refill(v: &mut Vec<GlowQuad>, from: &[GlowQuad]) {
-    if from.is_empty() {
-        // Empty presentations release the old allocation rather than retaining it.
-        drop(std::mem::take(v));
-        return;
-    }
-    if v.capacity() < from.len() {
-        let room = from.len().max(v.capacity().saturating_mul(2));
-        drop(std::mem::take(v));
-        v.reserve_exact(room);
-    } else {
-        v.clear();
-    }
-    v.extend_from_slice(from);
-}
-
-/// What a tick that delivers nothing draws: `held`'s frame and quads where it is still shown at
-/// (`cur`, `geom`, `cfg`), else nothing.
-#[inline]
-fn held_frame(
-    held: Option<&Held>,
-    cur: Option<(u16, u16)>,
-    geom: &Geom,
-    cfg: &MomentumGlowConfig,
-    out: &mut Vec<GlowQuad>,
-    under: &mut Vec<GlowQuad>,
-) -> MomentumGlowFrame {
-    match held {
-        Some(held) if held.shows(cur, geom, cfg) => {
-            out.extend_from_slice(&held.out);
-            under.extend_from_slice(&held.under);
-            held.frame
+#[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
+impl Guard {
+    /// Keeps a delivered tick's presentation and whether it moved, counting a firing when that holds the cadence a live plan (`sched`, after the tick at `s`) released.
+    #[inline]
+    fn tick(
+        &mut self,
+        cur: Option<(u16, u16)>,
+        geom: GeomRecord,
+        cfg: ConfigRecord,
+        sched: Sched,
+        s: &MomentumState,
+    ) {
+        let shown = Some((cur, geom, cfg));
+        self.moved = self.last != shown;
+        self.last = shown;
+        if let Sched::Plan(_) = sched
+            && self.moved
+            && s.glow.hot()
+            && !sched.is_active(s)
+        {
+            self.firings = self.firings.saturating_add(1);
         }
-        _ => MomentumGlowFrame::default(),
     }
 }
 
@@ -1866,20 +1948,6 @@ const fn time_of(ev: &MomentumEvent) -> Option<i128> {
         MomentumEvent::Reset => None,
     }
 }
-
-enum HostMode {
-    Direct(MomentumGlow),
-    Hosted(Box<Hosted>),
-}
-
-/// Why the host stopped recording by itself: live time passed the hosted horizon.
-pub const PAST_HORIZON: &str = "past the hosted horizon";
-
-/// Why a key stopped the recording: a program reads it raw (or the tty's mode is unreadable),
-/// no prompt of aterm's own integrated shell is open for it, and its own echo was not proven in
-/// place, so it may be a password. The host stops for it by itself when a key or a reset arrives
-/// while a key is held.
-pub const RAW_KEY: &str = "raw key";
 
 #[cfg(test)]
 thread_local! {
@@ -1901,56 +1969,11 @@ fn held_tick_delivers() -> bool {
     }
 }
 
-/// The momentum glow as the host holds it.
-pub struct MomentumHost {
-    mode: HostMode,
-    /// Retired segments of the recordings the host dropped (a detach or a re-attach), oldest first, at most [`RETIRED_CAP`].
-    left: Vec<Segment>,
-    /// Why the host last stopped recording by itself, until [`Self::aos_take_detached`] takes it.
-    detached: Option<&'static str>,
-    /// Whether the live glow took a key no recording logged since it last started from rest:
-    /// the next new recording starts it from rest, so its checkpoint holds no such key's instant.
-    tainted: bool,
-}
-
-impl Default for MomentumHost {
+impl Attached<MomentumEngine> {
+    /// What answers the live code's scheduler question.
     #[inline]
-    fn default() -> Self {
-        MomentumHost {
-            mode: HostMode::Direct(MomentumGlow::default()),
-            left: Vec::new(),
-            detached: None,
-            tainted: false,
-        }
-    }
-}
-
-impl fmt::Debug for MomentumHost {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.mode {
-            HostMode::Direct(g) => f.debug_tuple("MomentumHost::Direct").field(g).finish(),
-            HostMode::Hosted(h) => f
-                .debug_struct("MomentumHost::Hosted")
-                .field("boundary", &h.boundary)
-                .finish_non_exhaustive(),
-        }
-    }
-}
-
-impl Hosted {
-    #[inline]
-    const fn epoch(&self) -> Instant {
-        self.boundary.schema().epoch
-    }
-
-    #[inline]
-    const fn state(&self) -> &MomentumState {
-        &self.boundary.pair().state
-    }
-
-    #[inline]
-    const fn sched(&self) -> Sched {
-        self.boundary.pair().code.sched
+    pub(crate) const fn sched(&self) -> Sched {
+        self.code()
     }
 
     /// Frame cadence as the running host reads it: `code.is_active ∨ (hot ∧ moved)` for a plan (design §10.1), the code's own answer otherwise.
@@ -1960,248 +1983,26 @@ impl Hosted {
         match sched {
             Sched::Prebuilt(code) => code.is_active(s),
             #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-            Sched::Plan(_) => sched.is_active(s) || (s.glow.hot() && self.guard.moved),
+            Sched::Plan(_) => sched.is_active(s) || (s.glow.hot() && self.live.guard.moved),
         }
     }
 
-    /// Settling as the running host reads it: `code.settling ∧ ¬moved` for a plan, the code's own answer otherwise (disjoint from [`Hosted::is_active`], their union hot).
+    /// Settling as the running host reads it: `code.settling ∧ ¬moved` for a plan, the code's own answer otherwise (disjoint from [`Attached::is_active`], their union hot).
     #[inline]
     fn settling(&self) -> bool {
         let (sched, s) = (self.sched(), self.state());
         match sched {
             Sched::Prebuilt(code) => code.settling(s),
             #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-            Sched::Plan(_) => sched.settling(s) && !self.guard.moved,
+            Sched::Plan(_) => sched.settling(s) && !self.live.guard.moved,
         }
     }
 
-    /// Keeps a delivered tick's presentation and whether it moved, counting a firing when that holds the cadence a live plan released.
+    /// The presentation guard's firings so far.
     #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
     #[inline]
-    fn guard_tick(&mut self, cur: Option<(u16, u16)>, geom: GeomRecord, cfg: ConfigRecord) {
-        let shown = Some((cur, geom, cfg));
-        self.guard.moved = self.guard.last != shown;
-        self.guard.last = shown;
-        let (sched, s) = (self.sched(), self.state());
-        if let Sched::Plan(_) = sched
-            && self.guard.moved
-            && s.glow.hot()
-            && !sched.is_active(s)
-        {
-            self.guard.firings = self.guard.firings.saturating_add(1);
-        }
-    }
-
-    #[inline]
-    const fn cursor(&self) -> u64 {
-        self.boundary.pair().head.input_cursor
-    }
-
-    /// What a tick draws while a key is held: the code's own frame for the tick's caret, geometry
-    /// and config at the latest instant the boundary admitted, drawn on a copy of its state, so
-    /// nothing reaches the boundary, the glow holds still, and it stays on the caret the held
-    /// key's echo moved (the last delivered frame stays on the cell that echo printed into).
-    #[inline]
-    fn held_still(
-        &self,
-        cur: Option<(u16, u16)>,
-        geom: &Geom,
-        cfg: &MomentumGlowConfig,
-        out: &mut Vec<GlowQuad>,
-        under: &mut Vec<GlowQuad>,
-    ) -> MomentumGlowFrame {
-        let epoch = self.epoch();
-        let mut state = *self.state();
-        let ev = MomentumEvent::Tick {
-            cur,
-            at: state.last_time(epoch).unwrap_or(0).max(0),
-            geom: GeomRecord::from(geom),
-            cfg: ConfigRecord::from(cfg),
-        };
-        match self.sched().apply(&mut state, epoch, &ev, out, under) {
-            Applied::Frame(frame) => frame,
-            _ => MomentumGlowFrame::default(),
-        }
-    }
-
-    /// The logical time of a live call the host stamped `now`.
-    #[inline]
-    fn logical(&self, now: Instant) -> (i128, bool) {
-        let at = offset_of(self.epoch(), now);
-        let mut floor = self.state().last_time(self.epoch()).unwrap_or(0).max(0);
-        if self.boundary.is_paused()
-            && let Some(queued) = self.queued_at
-        {
-            floor = floor.max(queued);
-        }
-        if at < floor {
-            (floor, true)
-        } else {
-            (at, false)
-        }
-    }
-
-    #[inline]
-    fn fold(&mut self, cursor: u64, obs: &MomentumObservation) {
-        self.link(cursor, |schema, e| schema.encode_observation(obs, e));
-    }
-
-    #[inline]
-    fn link(&mut self, cursor: u64, encode: impl FnOnce(&MomentumSchema, &mut Enc)) {
-        let Some(log) = self.boundary.log() else {
-            return;
-        };
-        let anchor = (log.header().log_epoch, log.header().first_cursor);
-        if self.chain.anchor != anchor {
-            self.chain = LiveChain {
-                anchor,
-                chain: empty_chain(),
-                len: 0,
-            };
-        }
-        if cursor < anchor.1 {
-            return;
-        }
-        self.scratch.clear();
-        encode(self.boundary.schema(), &mut self.scratch);
-        self.chain.chain = chain_link(&self.chain.chain, cursor, self.scratch.as_bytes());
-        self.chain.len = self.chain.len.saturating_add(1);
-    }
-
-    #[inline]
-    fn live_chain(&self) -> Digest {
-        match self.boundary.log() {
-            Some(log)
-                if self.chain.anchor == (log.header().log_epoch, log.header().first_cursor) =>
-            {
-                self.chain.chain
-            }
-            _ => empty_chain(),
-        }
-    }
-
-    #[inline]
-    fn fold_delivered(
-        &mut self,
-        first: u64,
-        delivered: &[Result<MomentumObservation, StepRefusal>],
-    ) {
-        let mut cursor = first;
-        let mut di = 0;
-        while di < delivered.len() {
-            if let Ok(obs) = &delivered[di] {
-                self.fold(cursor, obs);
-                cursor = cursor.saturating_add(1);
-            }
-            di += 1;
-        }
-    }
-
-    #[inline]
-    fn deliver(
-        &mut self,
-        ev: &MomentumEvent,
-        moved: bool,
-        out: &mut Vec<GlowQuad>,
-        under: &mut Vec<GlowQuad>,
-    ) -> Option<Applied> {
-        let first = self.cursor();
-        let admitted = self.boundary.admit(ev);
-        if moved && admitted != Admit::Skipped {
-            self.clamped = self.clamped.saturating_add(1);
-        }
-        match admitted {
-            Admit::Run => {}
-            Admit::Queued => {
-                // A queued time past the horizon is refused on delivery; it raises no floor.
-                if let Some(at) = time_of(ev)
-                    && at <= horizon_ns()
-                {
-                    self.queued_at = Some(match self.queued_at {
-                        Some(q) => q.max(at),
-                        None => at,
-                    });
-                }
-                return None;
-            }
-            Admit::Skipped => return None,
-            Admit::Rejected { .. } => {
-                let delivered = self.boundary.take_delivered();
-                self.fold_delivered(first, &delivered);
-                return None;
-            }
-        }
-        let (epoch, sched) = (self.epoch(), self.sched());
-        let (out_from, under_from) = (out.len(), under.len());
-        let (_, state) = self.boundary.pair_mut();
-        let applied = sched.apply(state, epoch, ev, out, under);
-        self.boundary.advance();
-        #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-        if let MomentumEvent::Tick { cur, geom, cfg, .. } = *ev {
-            self.guard_tick(cur, geom, cfg);
-        }
-        let drawn = out.get(out_from..).unwrap_or(&[]);
-        let drawn_under = under.get(under_from..).unwrap_or(&[]);
-        if let (MomentumEvent::Tick { cur, geom, cfg, .. }, Applied::Frame(frame)) = (ev, applied) {
-            self.link(first, |_, e| {
-                e.reserve(frame_room(drawn.len().saturating_add(drawn_under.len())));
-                encode_frame(e, &frame, drawn, drawn_under);
-            });
-            let (mut held_out, mut held_under) = match self.held.take() {
-                Some(h) => (h.out, h.under),
-                None => (Vec::new(), Vec::new()),
-            };
-            refill(&mut held_out, drawn);
-            refill(&mut held_under, drawn_under);
-            if drawn.is_empty() && drawn_under.is_empty() {
-                self.scratch = Enc::new();
-            }
-            self.held = Some(Held {
-                frame,
-                out: held_out,
-                under: held_under,
-                cur: *cur,
-                geom: *geom,
-                dark: cfg.dark_theme,
-                block: cfg.block,
-            });
-            return Some(applied);
-        }
-        let obs = observe(&applied, epoch, drawn, drawn_under);
-        self.fold(first, &obs);
-        match (ev, obs) {
-            (MomentumEvent::Tick { cur, geom, cfg, .. }, _) => {
-                self.scratch = Enc::new();
-                self.held = Some(Held {
-                    frame: MomentumGlowFrame::default(),
-                    out: Vec::new(),
-                    under: Vec::new(),
-                    cur: *cur,
-                    geom: *geom,
-                    dark: cfg.dark_theme,
-                    block: cfg.block,
-                });
-            }
-            (MomentumEvent::Query { at, .. }, MomentumObservation::Schedule { deadline, .. }) => {
-                self.last_query = Some((*at, deadline));
-            }
-            (MomentumEvent::Query { at, .. }, _) => self.last_query = Some((*at, None)),
-            _ => {}
-        }
-        Some(applied)
-    }
-
-    #[inline]
-    fn reset_changes_nothing(&self) -> bool {
-        if self.boundary.is_paused() {
-            match self.boundary.last_queued() {
-                Some(MomentumEvent::Reset) => true,
-                Some(_) => false,
-                None => at_rest(self.state()),
-            }
-        } else {
-            at_rest(self.state())
-        }
+    pub(crate) const fn guard_firings(&self) -> u64 {
+        self.live.guard.firings
     }
 
     #[inline]
@@ -2222,35 +2023,7 @@ impl Hosted {
     }
 }
 
-impl MomentumHost {
-    /// A running attach whose live time at `now` is past the hosted horizon can admit no timed
-    /// input again (logical time never goes back, and every such input is refused `Horizon`).
-    #[inline]
-    fn expire_past_horizon(&mut self, now: Instant) {
-        if let HostMode::Hosted(h) = &self.mode
-            && !h.boundary.is_paused()
-            && h.logical(now).0 > horizon_ns()
-        {
-            self.detach_by_itself(PAST_HORIZON);
-        }
-    }
-
-    /// Stops recording for the reason `why`, keeping the recording's retired segments for the watcher.
-    #[inline]
-    fn detach_by_itself(&mut self, why: &'static str) {
-        self.aos_detach();
-        self.detached = Some(why);
-    }
-
-    /// Moves the recording's undrained retired segments into the ones kept for [`Self::aos_take_retired`], the oldest dropped past [`RETIRED_CAP`].
-    #[inline]
-    fn keep_retired(&mut self) {
-        let retired = self.aos_take_retired();
-        self.left = retired;
-        let over = self.left.len().saturating_sub(RETIRED_CAP);
-        self.left.drain(..over);
-    }
-
+impl Hosted<MomentumEngine> {
     /// One printable key (`MomentumGlow::on_key`). A key while a key is held stops the recording
     /// first ([`RAW_KEY`]): only [`Self::aos_release`] logs a held run.
     #[cfg_attr(
@@ -2304,12 +2077,6 @@ impl MomentumHost {
         }
     }
 
-    /// Why the host stopped recording by itself since the last call ([`PAST_HORIZON`]), taken.
-    #[inline]
-    pub const fn aos_take_detached(&mut self) -> Option<&'static str> {
-        self.detached.take()
-    }
-
     /// One frame (`MomentumGlow::tick`). While a key is held nothing is delivered: the frame is the
     /// code's own for this caret, geometry and config at the latest admitted instant, drawn on a
     /// copy of the state, so the glow holds still on the caret. While paused it is the last
@@ -2336,7 +2103,18 @@ impl MomentumHost {
         match &mut self.mode {
             HostMode::Direct(g) => g.tick(cur, now, geom, cfg, out, under),
             HostMode::Hosted(h) if h.awaiting_echo.is_some() && !held_tick_delivers() => {
-                h.held_still(cur, &geom, cfg, out, under)
+                // The glow holds still on the tick's caret: the code's own frame at the latest
+                // admitted instant, drawn on a copy of the state.
+                let ev = MomentumEvent::Tick {
+                    cur,
+                    at: h.last_admitted(),
+                    geom: GeomRecord::from(&geom),
+                    cfg: ConfigRecord::from(cfg),
+                };
+                match h.still(&ev, out, under) {
+                    Applied::Frame(frame) => frame,
+                    _ => MomentumGlowFrame::default(),
+                }
             }
             HostMode::Hosted(h) => {
                 let (at, moved) = h.logical(now);
@@ -2349,7 +2127,14 @@ impl MomentumHost {
                 match h.deliver(&ev, moved, out, under) {
                     Some(Applied::Frame(frame)) => frame,
                     Some(_) => MomentumGlowFrame::default(),
-                    None => held_frame(h.held.as_ref(), cur, &geom, cfg, out, under),
+                    None => match h.shown(&ev) {
+                        Some(held) => {
+                            out.extend_from_slice(&held.out);
+                            under.extend_from_slice(&held.under);
+                            held.frame
+                        }
+                        None => MomentumGlowFrame::default(),
+                    },
                 }
             }
         }
@@ -2423,28 +2208,6 @@ impl MomentumHost {
         }
     }
 
-    /// Holds the recording while a typed key waits for its program's echo: until
-    /// [`Self::aos_release`] or a detach no input reaches the boundary (a tick draws the glow as it
-    /// stood at the latest admitted instant, on the tick's caret; [`Self::next_change_deadline`]
-    /// names `deadline`), and a key or a reset stops the recording ([`RAW_KEY`]). Unattached or
-    /// paused it does nothing.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AosKeyHold",
-            action = "Hold",
-            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
-        )
-    )]
-    #[inline]
-    pub fn aos_hold(&mut self, deadline: Instant) {
-        if let HostMode::Hosted(h) = &mut self.mode
-            && !h.boundary.is_paused()
-        {
-            h.awaiting_echo = Some(deadline);
-        }
-    }
-
     /// Ends a hold: the `keys` oldest held keys, their echo proven, are logged as `Key` inputs at
     /// `now`, then the hold opens again until `rest` if keys still wait. With no hold open the keys
     /// reach only the glow, a recording stopped first ([`RAW_KEY`]).
@@ -2478,7 +2241,7 @@ impl MomentumHost {
     #[inline]
     pub fn aos_release_unseen(&mut self, now: Instant, keys: u32, tau_s: f32) {
         self.release_held(now, keys, tau_s, KeyEcho::Unseen, None);
-        self.tainted = true;
+        self.taint();
     }
 
     /// [`Self::aos_release`]'s and [`Self::aos_release_unseen`]'s body: `keys` held keys logged at
@@ -2517,60 +2280,6 @@ impl MomentumHost {
         }
     }
 
-    /// Whether a typed key holds the recording ([`Self::aos_hold`]).
-    #[inline]
-    #[must_use]
-    pub const fn aos_holding(&self) -> bool {
-        matches!(&self.mode, HostMode::Hosted(h) if h.awaiting_echo.is_some())
-    }
-
-    /// Notes that the live glow takes a key the recording may not hold: the next new recording
-    /// starts it from rest.
-    #[inline]
-    pub const fn taint(&mut self) {
-        self.tainted = true;
-    }
-
-    /// Whether the live glow took a key no recording logged since it last started from rest.
-    #[inline]
-    #[must_use]
-    pub const fn aos_tainted(&self) -> bool {
-        self.tainted
-    }
-
-    /// Starts hosting.
-    #[inline]
-    pub fn aos_attach(&mut self, epoch: Instant, code: MomentumCode, build: &str, log_epoch: u64) {
-        self.attach_with(
-            epoch,
-            code,
-            build,
-            log_epoch,
-            MOMENTUM_QUEUE_CAP,
-            MOMENTUM_HOST_MAX_EVENTS,
-        );
-    }
-
-    #[inline]
-    fn attach_with(
-        &mut self,
-        epoch: Instant,
-        code: MomentumCode,
-        build: &str,
-        log_epoch: u64,
-        queue_cap: usize,
-        max_events: usize,
-    ) {
-        self.attach_sched(
-            epoch,
-            Sched::Prebuilt(code),
-            build,
-            log_epoch,
-            queue_cap,
-            max_events,
-        );
-    }
-
     /// Attaches as [`Self::aos_attach`] does with `plan` as the live code ([`PrebuiltMomentum::planned`]) and log epochs of `max_events` inputs, for the candidate evaluator.
     #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
     #[inline]
@@ -2582,7 +2291,7 @@ impl MomentumHost {
         log_epoch: u64,
         max_events: usize,
     ) {
-        self.attach_sched(
+        self.attach_code(
             epoch,
             Sched::Plan(plan),
             build,
@@ -2590,253 +2299,6 @@ impl MomentumHost {
             MOMENTUM_QUEUE_CAP,
             max_events,
         );
-    }
-
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AosKeyHold",
-            action = "Attach",
-            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
-        )
-    )]
-    #[inline]
-    fn attach_sched(
-        &mut self,
-        epoch: Instant,
-        sched: Sched,
-        build: &str,
-        log_epoch: u64,
-        queue_cap: usize,
-        max_events: usize,
-    ) {
-        if let HostMode::Hosted(h) = &mut self.mode
-            && h.epoch() == epoch
-            && h.sched() == sched
-            && h.build == build
-            && h.awaiting_echo.is_none()
-            && !self.tainted
-        {
-            let first = h.cursor();
-            if h.boundary.attach(log_epoch, max_events).is_ok() {
-                let delivered = h.boundary.take_delivered();
-                h.fold_delivered(first, &delivered);
-            }
-            return;
-        }
-        let mut glow = self.take_glow();
-        if core::mem::take(&mut self.tainted) {
-            glow = MomentumGlow::default();
-        }
-        let prebuilt = PrebuiltMomentum::of(sched, build);
-        let identity = momentum_identity(&prebuilt);
-        let mut boundary = Boundary::new(
-            MomentumSchema::new(epoch),
-            identity,
-            prebuilt,
-            NoStrandedLight::new(),
-            MomentumState::new(glow),
-            queue_cap,
-        );
-        if boundary.attach(log_epoch, max_events).is_err() {
-            self.mode = HostMode::Direct(boundary.pair().state.glow);
-            return;
-        }
-        let chain = LiveChain {
-            anchor: match boundary.log() {
-                Some(l) => (l.header().log_epoch, l.header().first_cursor),
-                None => (log_epoch, 0),
-            },
-            chain: empty_chain(),
-            len: 0,
-        };
-        self.mode = HostMode::Hosted(Box::new(Hosted {
-            boundary,
-            build: build.to_owned(),
-            chain,
-            held: None,
-            last_query: None,
-            clamped: 0,
-            queued_at: None,
-            scratch: Enc::new(),
-            #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
-            guard: Guard::default(),
-            awaiting_echo: None,
-        }));
-    }
-
-    /// The glow out of the host, any recording dropped with its undrained retired segments kept for the watcher; a hold dropped taints the glow, whose held keys the caller hands it unrecorded.
-    #[inline]
-    fn take_glow(&mut self) -> MomentumGlow {
-        self.keep_retired();
-        match core::mem::replace(&mut self.mode, HostMode::Direct(MomentumGlow::default())) {
-            HostMode::Direct(g) => g,
-            HostMode::Hosted(mut h) => {
-                if h.awaiting_echo.is_some() {
-                    self.tainted = true;
-                }
-                h.boundary.detach();
-                h.boundary.pair().state.glow
-            }
-        }
-    }
-
-    /// Stops hosting; the glow draws on from its live state. A hold it drops taints the glow.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "AosKeyHold",
-            action = "Detach",
-            project = "aterm_effects::aos_momentum::hold_conformance_tests::Real::project"
-        )
-    )]
-    #[inline]
-    pub fn aos_detach(&mut self) {
-        let glow = self.take_glow();
-        self.mode = HostMode::Direct(glow);
-    }
-
-    /// Pauses at this step boundary.
-    /// # Errors
-    /// [`PublishRefusal::NotAttached`], [`PublishRefusal::AlreadyPaused`], or
-    /// [`PublishRefusal::MidStep`] while a key is held (a step the host has not taken); nothing is
-    /// recorded then.
-    #[inline]
-    pub fn aos_pause(
-        &mut self,
-        now: Instant,
-        frame_interval: Duration,
-    ) -> Result<Head, PublishRefusal> {
-        let HostMode::Hosted(h) = &mut self.mode else {
-            return Err(PublishRefusal::NotAttached);
-        };
-        if h.boundary.is_paused() {
-            return Err(PublishRefusal::AlreadyPaused);
-        }
-        if h.awaiting_echo.is_some() {
-            return Err(PublishRefusal::MidStep);
-        }
-        let _ = h.next_change_deadline(now, frame_interval);
-        h.queued_at = None;
-        h.boundary.pause()
-    }
-
-    /// Prepares `candidate` against the paused head (shadow replay of the live code and the
-    /// candidate from the ancestor checkpoint, judged by [`NoStrandedLight`]) and commits it.
-    /// # Errors
-    /// Any [`PublishRefusal`] `prepare` or `commit` returns (`NotAttached`, `NotPaused`,
-    /// `CandidateFailed`, …).
-    #[inline]
-    pub fn aos_repair(
-        &mut self,
-        candidate: MomentumCode,
-    ) -> Result<Commit<MomentumSchema>, PublishRefusal> {
-        let HostMode::Hosted(h) = &mut self.mode else {
-            return Err(PublishRefusal::NotAttached);
-        };
-        let prebuilt = PrebuiltMomentum::new(candidate, &h.build);
-        let prepared = h.boundary.prepare(prebuilt)?;
-        let first = h.cursor();
-        let commit = h.boundary.commit(prepared)?;
-        h.fold_delivered(first, &commit.delivered);
-        Ok(commit)
-    }
-
-    /// A copy of the paused glow's boundary and `candidate`, for [`RepairJob::prepare`] on another thread.
-    /// # Errors
-    /// [`PublishRefusal::NotAttached`] or [`PublishRefusal::NotPaused`].
-    #[inline]
-    pub fn aos_repair_job(&self, candidate: MomentumCode) -> Result<RepairJob, PublishRefusal> {
-        let HostMode::Hosted(h) = &self.mode else {
-            return Err(PublishRefusal::NotAttached);
-        };
-        if !h.boundary.is_paused() {
-            return Err(PublishRefusal::NotPaused);
-        }
-        Ok(RepairJob {
-            boundary: Box::new(h.boundary.clone()),
-            candidate: PrebuiltMomentum::new(candidate, &h.build),
-        })
-    }
-
-    /// Commits a prepare made on a copy of this glow's boundary, with every check `commit` makes, and folds what the queue returned.
-    /// # Errors
-    /// The prepare's refusal, then [`PublishRefusal::NotAttached`] or any refusal `commit` returns (`NotPaused`, `StaleHead`, `WitnessMismatch`, …).
-    #[inline]
-    pub fn aos_commit(
-        &mut self,
-        prepared: PreparedRepair,
-    ) -> Result<Commit<MomentumSchema>, PublishRefusal> {
-        let prepared = prepared.prepared?;
-        let HostMode::Hosted(h) = &mut self.mode else {
-            return Err(PublishRefusal::NotAttached);
-        };
-        let first = h.cursor();
-        let commit = h.boundary.commit(prepared)?;
-        h.fold_delivered(first, &commit.delivered);
-        Ok(commit)
-    }
-
-    /// How many retired log epochs wait for [`Self::aos_take_retired`].
-    #[inline]
-    #[must_use]
-    pub fn aos_retired_waiting(&self) -> usize {
-        self.left.len()
-            + match &self.mode {
-                HostMode::Direct(_) => 0,
-                HostMode::Hosted(h) => h.boundary.retired_len(),
-            }
-    }
-
-    /// Takes the retired log epochs, oldest first, for the online watcher ([`Segment::judge`]), with those of the recordings the host dropped kept.
-    #[inline]
-    pub fn aos_take_retired(&mut self) -> Vec<Segment> {
-        let mut out = core::mem::take(&mut self.left);
-        if let HostMode::Hosted(h) = &mut self.mode {
-            let schema = h.boundary.schema().clone();
-            let drained = h.boundary.drain_retired();
-            out.reserve(drained.len());
-            for retired in drained {
-                out.push(Segment::new(schema.clone(), retired));
-            }
-        }
-        out
-    }
-
-    /// Rejects the pending update.
-    #[inline]
-    pub fn aos_resume(&mut self) -> Vec<Result<MomentumObservation, StepRefusal>> {
-        let HostMode::Hosted(h) = &mut self.mode else {
-            return Vec::new();
-        };
-        let first = h.cursor();
-        let delivered = h.boundary.reject();
-        h.fold_delivered(first, &delivered);
-        delivered
-    }
-
-    /// Whether the glow is attached.
-    #[inline]
-    #[must_use]
-    pub const fn aos_attached(&self) -> bool {
-        matches!(self.mode, HostMode::Hosted(_))
-    }
-
-    /// Whether the attached glow is paused.
-    #[inline]
-    #[must_use]
-    pub const fn aos_paused(&self) -> bool {
-        matches!(&self.mode, HostMode::Hosted(h) if h.boundary.is_paused())
-    }
-
-    /// The head the attached glow is paused at, if it is.
-    #[inline]
-    #[must_use]
-    pub const fn aos_paused_head(&self) -> Option<&Head> {
-        match &self.mode {
-            HostMode::Direct(_) => None,
-            HostMode::Hosted(h) => h.boundary.paused_head(),
-        }
     }
 
     /// The prebuilt code running the glow (always [`MomentumCode::Shipped`] unattached), or `None` while the live code is a schedule plan.
@@ -2888,7 +2350,7 @@ impl MomentumHost {
             Some(l) => (l.header().log_epoch, l.len(), l.broken()),
             None => (0, 0, None),
         };
-        let (last_query_at, next_deadline) = match h.last_query {
+        let (last_query_at, next_deadline) = match h.live.last_query {
             Some((at, d)) => (Some(at), d),
             None => (None, None),
         };
@@ -2896,7 +2358,7 @@ impl MomentumHost {
         let (is_active, settling) = (h.is_active(), h.settling());
         #[cfg(any(test, debug_assertions, feature = "aos-candidates"))]
         let (guard_moved, guard_firings) = match code {
-            Sched::Plan(_) => (Some(h.guard.moved), Some(h.guard.firings)),
+            Sched::Plan(_) => (Some(h.live.guard.moved), Some(h.live.guard.firings)),
             Sched::Prebuilt(_) => (None, None),
         };
         #[cfg(not(any(test, debug_assertions, feature = "aos-candidates")))]
@@ -2922,7 +2384,7 @@ impl MomentumHost {
         MomentumAosStatus {
             attached: true,
             code: code.name(),
-            code_digest: Some(b.pair().code.id.digest.short()),
+            code_digest: Some(b.pair().code.id().digest.short()),
             build: Some(h.build.clone()),
             revision: b.pair().head.revision.0,
             branch: b.pair().head.branch.0,
@@ -2951,91 +2413,6 @@ impl MomentumHost {
             last_frame,
             stats: b.stats(),
             clamped: h.clamped,
-        }
-    }
-
-    /// The ancestor checkpoint and the log since it.
-    /// # Errors
-    /// [`TraceRefusal::NotAttached`], or an encoder's `TooLarge`.
-    #[inline]
-    pub fn aos_trace(&self) -> Result<MomentumTrace, TraceRefusal> {
-        let HostMode::Hosted(h) = &self.mode else {
-            return Err(TraceRefusal::NotAttached);
-        };
-        let b = &h.boundary;
-        let (Some(checkpoint), Some(log)) = (b.checkpoint(), b.log()) else {
-            return Err(TraceRefusal::NotAttached);
-        };
-        Ok(MomentumTrace {
-            identity: b.identity().clone(),
-            checkpoint: checkpoint.encode().map_err(TraceRefusal::Checkpoint)?,
-            log: log.encode(b.schema()).map_err(TraceRefusal::Log)?,
-            head_state: state_digest(b.schema(), h.state()),
-            head_chain: h.live_chain(),
-        })
-    }
-}
-
-/// A paused glow's boundary, copied, with the candidate to prepare against it away from the host's main thread.
-pub struct RepairJob {
-    boundary: Box<Boundary<MomentumSchema, PrebuiltMomentum, NoStrandedLight>>,
-    candidate: PrebuiltMomentum,
-}
-
-impl fmt::Debug for RepairJob {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RepairJob")
-            .field("boundary", &self.boundary)
-            .field("candidate", &self.candidate.id)
-            .finish()
-    }
-}
-
-impl RepairJob {
-    /// Shadow-replays the copy's live code and the candidate from the ancestor checkpoint ([`Boundary::prepare`]).
-    #[inline]
-    #[must_use]
-    pub fn prepare(self) -> PreparedRepair {
-        let mut boundary = self.boundary;
-        let before = boundary.stats().replays;
-        let prepared = boundary.prepare(self.candidate);
-        PreparedRepair {
-            replays: boundary.stats().replays.saturating_sub(before),
-            prepared,
-        }
-    }
-}
-
-/// What [`RepairJob::prepare`] made, for [`MomentumHost::aos_commit`].
-pub struct PreparedRepair {
-    prepared: Result<Prepared<MomentumSchema, PrebuiltMomentum>, PublishRefusal>,
-    replays: u64,
-}
-
-impl fmt::Debug for PreparedRepair {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PreparedRepair")
-            .field("prepared", &self.prepared)
-            .field("replays", &self.replays)
-            .finish()
-    }
-}
-
-impl PreparedRepair {
-    /// How many replays the prepare ran (on the copy, never on the live boundary).
-    #[inline]
-    #[must_use]
-    pub const fn replays(&self) -> u64 {
-        self.replays
-    }
-
-    /// The prepare's refusal, if it refused.
-    #[inline]
-    #[must_use]
-    pub const fn refusal(&self) -> Option<&PublishRefusal> {
-        match &self.prepared {
-            Ok(_) => None,
-            Err(r) => Some(r),
         }
     }
 }
@@ -3170,30 +2547,3 @@ impl fmt::Display for MomentumAosStatus {
         )
     }
 }
-
-/// Why [`MomentumHost::aos_trace`] exported nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TraceRefusal {
-    /// The glow is not attached: there is no checkpoint or log.
-    NotAttached,
-    /// The checkpoint does not encode.
-    Checkpoint(CheckpointFault),
-    /// The log does not encode.
-    Log(LogFault),
-}
-
-impl fmt::Display for TraceRefusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TraceRefusal::NotAttached => {
-                f.write_str("the momentum glow is not attached: there is no trace")
-            }
-            TraceRefusal::Checkpoint(c) => {
-                write!(f, "the ancestor checkpoint does not encode: {c}")
-            }
-            TraceRefusal::Log(l) => write!(f, "the log does not encode: {l}"),
-        }
-    }
-}
-
-impl std::error::Error for TraceRefusal {}

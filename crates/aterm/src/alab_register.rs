@@ -15,11 +15,16 @@ use aterm_secrets::client::Paths;
 use std::path::PathBuf;
 
 /// Whether a pass's result is worth a line a shipped build keeps: its log filter stops at `Info`.
-/// A pass that wrote or had nothing to do stays at debug, and `aterm db alab check` answers why at
-/// any time.
+/// A pass that closed a machine row of this Mac's chain into the one it is speaks, since it ended a
+/// row the owner sees; any other pass that wrote or had nothing to do stays at debug, and
+/// `aterm db alab check` answers why at any time.
 fn speaks(pass: &aterm_db::Result<Registered>) -> bool {
     pass.as_ref().map_or(true, |done| {
-        !done.findings.is_empty() || matches!(done.outcome, Outcome::Held | Outcome::QuotaSpent)
+        !done.findings.is_empty()
+            || matches!(
+                done.outcome,
+                Outcome::Held | Outcome::QuotaSpent | Outcome::Closed { .. }
+            )
     })
 }
 

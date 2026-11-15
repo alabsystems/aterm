@@ -5,6 +5,8 @@ use super::*;
 
 fn receipt(route: Route) -> Receipt {
     let world = PathBuf::from("/private/tmp/.ubd/custody-test.noindex");
+    let generation = (route == Route::AppBand)
+        .then(|| crate::band::Generation::parse("11111111111111111111111111111111").unwrap());
     Receipt {
         socket: world.join("run/a.sock"),
         owner: Identity::parse("1001@100:1").unwrap(),
@@ -21,9 +23,37 @@ fn receipt(route: Route) -> Receipt {
             sequence: 5,
         },
         route,
-        job: (route == Route::AppBand).then(|| crate::band::label_for(&world, 1001)),
+        job: generation
+            .as_ref()
+            .map(|generation| crate::band::label_for(&world, 1001, generation)),
+        generation,
         world,
     }
+}
+
+#[test]
+fn a_consistent_foreign_generation_cannot_replace_the_controllers_original_job() {
+    let original = receipt(Route::AppBand);
+    let owned = OwnedJob {
+        world: original.world.clone(),
+        owner: 1001,
+        generation: original.generation.clone().unwrap(),
+        label: original.job.clone().unwrap(),
+    };
+    assert!(owned.matches(&original));
+    let mut foreign = receipt(Route::AppBand);
+    foreign.generation =
+        Some(crate::band::Generation::parse("22222222222222222222222222222222").unwrap());
+    foreign.job = Some(crate::band::label_for(
+        &foreign.world,
+        1001,
+        foreign.generation.as_ref().unwrap(),
+    ));
+    let parsed = Receipt::parse(foreign.text().as_bytes()).unwrap();
+    assert!(
+        !owned.matches(&parsed),
+        "matching forged generation and label are still not the controller's launch"
+    );
 }
 
 #[test]

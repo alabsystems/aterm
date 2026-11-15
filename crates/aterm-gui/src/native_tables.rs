@@ -20,8 +20,8 @@
 //!   none names shows the start of its machine id, dimmed.
 //! - **A conflict** shows every value, sorted by its words, and the pane lists each with its
 //!   writer and a Keep; no clock picks one.
-//! - **Secrets** never reach the page: a secret cell shows the grid's mask, and the pane and
-//!   history say only whether it holds one.
+//! - **Secrets** never reach the page: a secret cell names its secret-store entry, read-only here.
+//!   Addresses and phone numbers are ordinary data and read as stored.
 //! - **As of.** Each history entry offers the table as that operation's causal past holds it
 //!   (`aterm db table get|scan|export --at`, the same projection), read only, each cell changed
 //!   since marked in the grid and listed in the pane with what it holds now and who wrote that
@@ -172,9 +172,6 @@ pub(crate) struct SheetColumn {
     pub(crate) group: Group,
     pub(crate) editable: bool,
     pub(crate) numeric: bool,
-    pub(crate) secret: bool,
-    /// The grid masks this column's values (addresses): an edit starts empty.
-    pub(crate) masked: bool,
     /// The table a reference or a linked count names.
     pub(crate) links: Option<String>,
 }
@@ -190,7 +187,6 @@ pub(crate) struct SheetRow {
 pub(crate) struct WrittenCell {
     pub(crate) pk: String,
     pub(crate) column: String,
-    pub(crate) secret: bool,
     /// The value it set, as the grid shows it; empty for a cleared cell.
     pub(crate) now: String,
 }
@@ -636,7 +632,7 @@ impl TablesApp {
             .columns
             .iter()
             .find(|c| c.name == column)
-            .is_some_and(|c| c.editable && !c.secret && !c.masked)
+            .is_some_and(|c| c.editable)
             && sheet
                 .rows
                 .iter()
@@ -801,8 +797,7 @@ impl TablesViewState {
                         .keys()
                         .any(|(c, p, _)| c == sheet.name && *p == row.pk)
                     || sheet.columns.iter().any(|column| {
-                        !column.secret
-                            && column.group != Group::Linked
+                        column.group != Group::Linked
                             && row
                                 .cells
                                 .get(&column.name)
@@ -845,7 +840,7 @@ impl TablesViewState {
         }
         let at = (self.sheet.to_owned(), pk.to_owned(), column.to_owned());
         let seed = app.staged.get(&at).cloned().unwrap_or_else(|| {
-            if col.masked || col.secret || shown.is_some_and(|c| !c.values.is_empty()) {
+            if shown.is_some_and(|c| !c.values.is_empty()) {
                 String::new()
             } else {
                 shown.map(|c| c.text.clone()).unwrap_or_default()
@@ -1393,13 +1388,7 @@ fn press(key: &str, spoken: String) -> UiNode {
     )
 }
 
-fn field(
-    key: &str,
-    label: &str,
-    input: &TextInputState,
-    view: &TablesViewState,
-    secret: bool,
-) -> UiNode {
+fn field(key: &str, label: &str, input: &TextInputState, view: &TablesViewState) -> UiNode {
     UiNode::new(
         key.to_owned(),
         UiContent::TextField(
@@ -1407,7 +1396,7 @@ fn field(
                 TextFieldSpec {
                     label: label.into(),
                     placeholder: Some(label.into()),
-                    secret,
+                    secret: false,
                     visual_value: None,
                     input: Some(input.projection()),
                     swatch: None,
@@ -1418,11 +1407,7 @@ fn field(
                 },
                 ActionId::new(key.to_owned()),
             )
-            .value(SemanticValue::Text(if secret {
-                String::new()
-            } else {
-                input.value().into()
-            }))
+            .value(SemanticValue::Text(input.value().into()))
             .state(ControlState {
                 enabled: true,
                 focused: view
@@ -1758,7 +1743,7 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             let mut seat = Vec::new();
             if let Some(editing) = editing {
                 seat.push(
-                    field(EDIT, &column.label, &editing.input, view, false).layout(
+                    field(EDIT, &column.label, &editing.input, view).layout(
                         Layout::default()
                             .width(Length::Fixed(*w))
                             .height(Length::Fixed(line)),
@@ -1999,12 +1984,10 @@ fn writer(key: &str, by: &Author, when: &str, style: StyleRef, width: f32) -> [U
     ]
 }
 
-/// The pane's word for a value: `empty`, a secret only as `set`.
-fn value_words(column: &SheetColumn, text: &str) -> String {
+/// The pane's word for a value: `empty`, or the value as the grid shows it.
+fn value_words(text: &str) -> String {
     if text.is_empty() {
         "empty".into()
-    } else if column.secret {
-        "set".into()
     } else {
         text.to_owned()
     }
@@ -2108,11 +2091,7 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 button(
                     &format!("{KEEP}{}/{n}", column.name),
                     "Keep",
-                    &format!(
-                        "Keep {} for {}",
-                        value_words(column, value),
-                        field_words(column)
-                    ),
+                    &format!("Keep {} for {}", value_words(value), field_words(column)),
                     StyleRef::Secondary,
                     true,
                 )
@@ -2121,7 +2100,7 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             let half = (inner - 36.0 - keep_w) * 0.5;
             let mut parts = vec![fitted(
                 format!("{key}/{n}/value"),
-                &value_words(column, value),
+                &value_words(value),
                 StyleRef::Plain,
                 half,
             )];
@@ -2207,7 +2186,7 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 ),
                 fitted(
                     format!("{key}/value"),
-                    &value_words(column, &text),
+                    &value_words(&text),
                     value_style,
                     value_w,
                 ),
@@ -2242,7 +2221,7 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                     &mut children,
                     fitted(
                         format!("tables/pane/since/{}", column.name),
-                        &format!("Written elsewhere since: {}", value_words(column, &now)),
+                        &format!("Written elsewhere since: {}", value_words(&now)),
                         StyleRef::Note,
                         inner,
                     ),
@@ -2301,19 +2280,12 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             let then = row.cells.get(&column.name).map_or("", |c| c.text.as_str());
             let words = if since.members {
                 format!("{}: {}", field_words(column), since.now)
-            } else if column.secret {
-                let word = match (then.is_empty(), since.now.is_empty()) {
-                    (true, false) => "set",
-                    (false, true) => "cleared",
-                    _ => "changed",
-                };
-                format!("{}: {word}", field_words(column))
             } else {
                 format!(
                     "{}: {} \u{2192} {}",
                     field_words(column),
-                    value_words(column, then),
-                    value_words(column, &since.now)
+                    value_words(then),
+                    value_words(&since.now)
                 )
             };
             let who = since
@@ -2424,22 +2396,14 @@ fn row_history(sheet: &Sheet, pk: &str) -> Vec<([u8; 32], Author, Vec<String>)> 
                 continue;
             };
             let was = last.get(cell.column.as_str()).copied().unwrap_or("");
-            let line = if column.secret {
-                let word = match (was.is_empty(), cell.now.is_empty()) {
-                    (true, false) => "set",
-                    (false, true) => "cleared",
-                    (false, false) => "changed",
-                    (true, true) => continue,
-                };
-                format!("{}: {word}", field_words(column))
-            } else if cell.now.starts_with("+ ") || cell.now.starts_with('\u{2212}') {
+            let line = if cell.now.starts_with("+ ") || cell.now.starts_with('\u{2212}') {
                 format!("{}: {}", field_words(column), cell.now)
             } else {
                 format!(
                     "{}: {} \u{2192} {}",
                     field_words(column),
-                    value_words(column, was),
-                    value_words(column, &cell.now)
+                    value_words(was),
+                    value_words(&cell.now)
                 )
             };
             lines.push(line);
@@ -2523,7 +2487,7 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
     );
     let find_w = 220.0 * scale().max(1.0);
     let mut tools = vec![
-        field(FIND, "Find", &view.find, view, false)
+        field(FIND, "Find", &view.find, view)
             .layout(Layout::default().width(Length::Fixed(find_w))),
     ];
     // A past table: which point, how much changed since, and the way back to now.

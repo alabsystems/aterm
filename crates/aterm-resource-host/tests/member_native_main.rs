@@ -43,6 +43,9 @@ mod metadata_prelude;
 #[path = "../src/metadata_transport.rs"]
 mod metadata_transport;
 #[cfg(unix)]
+#[path = "../src/observer_permit.rs"]
+mod observer_permit;
+#[cfg(unix)]
 #[path = "../src/resolver_transport.rs"]
 mod resolver_transport;
 #[cfg(unix)]
@@ -57,6 +60,9 @@ mod resource_machine;
 #[cfg(unix)]
 #[path = "../src/resource_memory.rs"]
 mod resource_memory;
+#[cfg(unix)]
+#[path = "../src/resource_observation.rs"]
+mod resource_observation;
 #[cfg(unix)]
 #[path = "../src/resource_producer.rs"]
 mod resource_producer;

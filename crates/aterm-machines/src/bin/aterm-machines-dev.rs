@@ -350,6 +350,13 @@ fn enroll_through(words: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let password = match enroll::admin_password(&sys) {
+        Ok(password) => password,
+        Err(why) => {
+            eprintln!("enroll-through: not run: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut out = std::io::stdout().lock();
     let done = enroll::host_key_through(&sys, &master, scratch.path()).and_then(|key| {
         enroll::check_host_key(&key, &req.trust)?;
@@ -361,6 +368,7 @@ fn enroll_through(words: &[String]) -> ExitCode {
             &master,
             &key,
             scratch.path(),
+            &password,
             &mut out,
         )
     });

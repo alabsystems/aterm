@@ -163,7 +163,7 @@ fn partial_history_does_not_claim_absence() {
 /// two labels, so the page's fact keys stay apart.
 #[test]
 fn the_done_check_row_reads_its_counts_alone() {
-    use aterm_agent::supervise::policy::turn_end::{RULE_CONTINUE, RULE_DONE_CHECK};
+    use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK};
     let mut today = HarnessStats::new(0);
     today.continued = 5;
     today.approved = 31;

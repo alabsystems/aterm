@@ -11,6 +11,7 @@ fn cached_journal_policy_refusal_hides_but_preserves_history_until_recovery() {
     let history = Arc::new(alab_seen::Seen {
         accounts: [("ac-fixture".into(), AccountSeen::default())].into(),
         at: 42,
+        me: Default::default(),
     });
     // Exercise the actual Source getter without starting its registry worker.
     let cache: &'static Cache = Box::leak(Box::new(Cache {
@@ -20,6 +21,7 @@ fn cached_journal_policy_refusal_hides_but_preserves_history_until_recovery() {
         held: Mutex::new(Some(Arc::clone(&history))),
         lab: Mutex::new(None),
         reader: OnceLock::from(()),
+        label: || None,
     }));
     let active = || alab_seen::Source::seen(&cache, false);
     assert!(
@@ -68,11 +70,12 @@ fn cached_journal_policy_refusal_hides_but_preserves_history_until_recovery() {
 #[test]
 fn an_unbound_mac_is_named_by_its_uuid() {
     let view = LabView::default();
+    let names = Names::of(&view, &Seen::empty(5), || None);
     assert_eq!(
-        mac(&view, "00112233445566778899aabbccddeeff"),
+        names.mac("00112233445566778899aabbccddeeff"),
         "uuid:00112233"
     );
-    let empty = harness_seen(&view, &Seen::empty(5));
+    let empty = harness_seen(&names, &Seen::empty(5));
     assert!(empty.accounts.is_empty());
     assert_eq!(empty.at, 5);
 }
@@ -200,6 +203,7 @@ fn the_reader_offers_the_fleet_tables_its_policy_refusal_its_off_and_its_absence
         held: Mutex::new(None),
         lab: Mutex::new(None),
         reader: OnceLock::from(()),
+        label: || None,
     };
     let write =
         |text: &str| aterm_uds::atomic_file::write(&config, text.as_bytes(), 0o600).unwrap();
@@ -291,7 +295,7 @@ fn a_history_line_carries_its_events_window_figure_and_reset() {
             ..quota(30, None)
         },
     ];
-    let held = harness_seen(&LabView::default(), &seen);
+    let held = harness_seen(&Names::of(&LabView::default(), &seen, || None), &seen);
     let lines = &held.accounts[pk].history;
     assert_eq!(
         lines
@@ -317,4 +321,225 @@ fn a_history_line_carries_its_events_window_figure_and_reset() {
         [(10, 370, 900)],
         "the account's own week, not its workspace's"
     );
+}
+
+/// This Mac's own seat, at 2026-11-16T16:00:00Z's week: the uuid it writes the journal as.
+const OWN: &str = "855f12c0000000000000000000000001";
+/// A peer's seat.
+const PEER: &str = "13000000000000000000000000000013";
+/// 2026-11-16T16:00:00Z.
+const RESET: u64 = 1_794_844_800;
+
+fn week_quota(t: u64, reset: Option<u64>) -> aterm_db::alab::journal::Event {
+    use aterm_db::alab::journal::event::{Event, Kind, Pk, Source, Window, Word};
+    Event {
+        t,
+        kind: Kind::Quota,
+        account: Pk::new("ac-00000000000000a2"),
+        cli: Word::new("claude").expect("a CLI word"),
+        sub: None,
+        window: Some(Window::Week),
+        pct_x10: Some(320),
+        reset,
+        res: None,
+        until: None,
+        plan: None,
+        src: Source::Statusline,
+        why: None,
+        to: None,
+        tab: None,
+        harness: None,
+    }
+}
+
+/// A HISTORY LINE SAYS THE RESET ITS READING NAMES: a quota event's `r=` in RFC 3339, so `accounts
+/// history` (its text and its `--json` lines, both `history_line`) shows which window a figure is
+/// of; a wall's too, the reset it stands until.
+/// NEGATIVE CONTROL: a reading that names no reset prints no `r=`, and with `detail` not
+/// printing the reset the first assertion fails (`… "7d 32.0%"`).
+#[test]
+fn a_history_line_says_the_reset_its_reading_names() {
+    use aterm_db::alab::journal::event::Kind;
+    let view = LabView::default();
+    let read = detail(&view, &week_quota(100, Some(RESET)));
+    assert!(read.contains("r=2026-11-16T16:00:00Z"), "{read}");
+    assert_eq!(read, "7d 32.0% r=2026-11-16T16:00:00Z");
+    let wall = aterm_db::alab::journal::Event {
+        kind: Kind::Wall,
+        pct_x10: None,
+        until: Some(RESET),
+        ..week_quota(100, None)
+    };
+    assert_eq!(
+        detail(&view, &wall),
+        "7d r=2026-11-16T16:00:00Z",
+        "a wall's end"
+    );
+    let none = detail(&view, &week_quota(100, None));
+    assert!(!none.contains("r="), "CONTROL: {none}");
+}
+
+/// THIS MAC IS NEVER A PEER: a record its own seat wrote (a seat the registry binds to no live
+/// machine, as one that followed a writer succession is) is named by this Mac's own label, and
+/// the harness's snapshot carries the uuid as this Mac's own, so no surface takes its reading as
+/// another Mac's; a peer's stays the peer's.
+/// NEGATIVE CONTROL: with `mac` naming by the registry alone (the `me` check removed), this Mac's
+/// reading is `uuid:855f12c0` (`left: "uuid:855f12c0" right: "m2"`).
+#[test]
+fn this_macs_own_seat_is_named_as_this_mac_not_a_peer() {
+    use aterm_db::alab::journal::seen::Logged;
+    let mut seen = Seen::empty(RESET - 3 * 86_400);
+    seen.me = [OWN.to_owned()].into();
+    seen.last_use.insert(
+        "ac-00000000000000a2".into(),
+        (PEER.into(), RESET - 4 * 86_400),
+    );
+    seen.events = vec![
+        Logged {
+            uuid: OWN.into(),
+            n: 1,
+            event: week_quota(RESET - 4 * 86_400, Some(RESET)),
+            heard: false,
+        },
+        Logged {
+            uuid: PEER.into(),
+            n: 2,
+            event: week_quota(RESET - 4 * 86_400 + 60, Some(RESET)),
+            heard: false,
+        },
+    ];
+    let view = LabView::default();
+    let names = Names::of(&view, &seen, || Some("m2".to_owned()));
+    assert_eq!(names.mac(OWN), "m2");
+    assert_eq!(names.mac(PEER), "uuid:13000000", "a peer stays a peer");
+    let held = harness_seen(&names, &seen);
+    assert!(held.me.contains(OWN) && !held.me.contains(PEER));
+    let by: Vec<&str> = held.accounts["ac-00000000000000a2"]
+        .history
+        .iter()
+        .map(|line| line.by.as_str())
+        .collect();
+    assert_eq!(by, ["m2", "uuid:13000000"]);
+    // The registry's own binding of this machine names it too.
+    let mut bound = LabView::default();
+    bound.me = Some("pk-m2".into());
+    bound.bound.insert(PEER.into(), "pk-m2".into());
+    let names = Names::of(&bound, &Seen::empty(0), || None);
+    assert!(
+        names.me.contains(PEER),
+        "a seat the registry binds to this machine"
+    );
+}
+
+/// A REGISTRY THAT CANNOT BE READ DOES NOT HIDE THE JOURNAL: the journal window is read all the
+/// same, its Macs named by uuid with no projection held (this Mac by its own seat), and the
+/// fleet tables hold the registry while they read the journal; once a projection that names the
+/// peer was read, a registry that cannot be read names the journal's Macs by it.
+/// NEGATIVE CONTROLS: with `read_with` returning on the registry's error before the journal is
+/// read (as it once did), nothing is held: `the journal is held` fails; with the error naming by
+/// an empty view (`Arc::default()`) whatever projection is held, the peer is `uuid:13000000`:
+/// `named by the projection held` fails.
+#[test]
+fn a_registry_that_cannot_be_read_does_not_hide_the_journal() {
+    use aterm_db::alab::journal::seen::Logged;
+    use aterm_db::fleet::{Folder, HELD_UNREADABLE};
+
+    let home = aterm_tempfile::tempdir().unwrap();
+    let cache = Cache {
+        paths: Paths::for_home(home.path()),
+        config: home.path().join("aterm.toml"),
+        spool: None,
+        held: Mutex::new(None),
+        lab: Mutex::new(None),
+        reader: OnceLock::from(()),
+        label: || Some("m2".to_owned()),
+    };
+    let folder = Folder::new();
+    let now = RESET - 3 * 86_400;
+    let journal = |at: u64| {
+        let mut seen = Seen::empty(at);
+        seen.me = [OWN.to_owned()].into();
+        seen.last_use
+            .insert("ac-00000000000000a2".into(), (PEER.into(), at - 3_600));
+        seen.events = vec![Logged {
+            uuid: PEER.into(),
+            n: 1,
+            event: week_quota(at - 3_600, Some(RESET)),
+            heard: false,
+        }];
+        Ok(Some(seen))
+    };
+    cache.read_with(
+        &folder,
+        now * 1000,
+        |_| Err(aterm_db::Error::from(std::io::Error::other("registry"))),
+        journal,
+    );
+    let held = cache
+        .held
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the journal is held");
+    assert_eq!(held.at, i64::try_from(now).unwrap());
+    assert!(held.me.contains(OWN));
+    assert_eq!(
+        held.accounts["ac-00000000000000a2"].history[0].by, "uuid:13000000",
+        "named by uuid with no projection held"
+    );
+    folder.fold_now(now * 1000);
+    let sources = folder.tables().value.sources;
+    assert_eq!(
+        aterm_db::fleet::command::sources_line(&sources),
+        format!("registry=held({HELD_UNREADABLE}) journal=live network=never fleet_read=never")
+    );
+
+    // A projection that binds the peer to m13 is read, then the registry cannot be read.
+    let mut named = LabView::default();
+    named.bound.insert(PEER.into(), "pk-m13".into());
+    named.machines.insert(
+        "pk-m13".into(),
+        aterm_db::alab::view::Machine {
+            pk: "pk-m13".into(),
+            label: Some("m13".into()),
+            nickname: aterm_db::alab::view::MachineNickname::Unset,
+            aliases: Vec::new(),
+            status: None,
+            os: None,
+            chip: None,
+            ram_gb: None,
+            live: true,
+        },
+    );
+    cache.read_with(
+        &folder,
+        now * 1000,
+        |_| {
+            Ok(Some(LabRead::Projected(
+                Box::new(named),
+                Inventory([1; 32]),
+            )))
+        },
+        journal,
+    );
+    let by = |cache: &Cache| {
+        cache
+            .held
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the journal is held")
+            .accounts["ac-00000000000000a2"]
+            .history[0]
+            .by
+            .clone()
+    };
+    assert_eq!(by(&cache), "m13", "CONTROL: the projection names the peer");
+    cache.read_with(
+        &folder,
+        now * 1000,
+        |_| Err(aterm_db::Error::from(std::io::Error::other("registry"))),
+        journal,
+    );
+    assert_eq!(by(&cache), "m13", "named by the projection held");
 }

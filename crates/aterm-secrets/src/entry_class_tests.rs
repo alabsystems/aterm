@@ -8,7 +8,7 @@ const TOKEN: &str = "aterm-claude-token-ac-0123456789abcdef";
 #[test]
 fn each_name_a_consumer_imports_is_classed_as_its_role_needs() {
     let release = EntryClass::Held(Held::Release);
-    for name in [RELEASE_GH_TOKEN, NOTARY, SITE_DEPLOYER_KEY]
+    for name in [RELEASE_GH_TOKEN, NOTARY, PAPER_MASTER, SITE_DEPLOYER_KEY]
         .into_iter()
         .chain(RELEASE_RING)
         .chain(LEGACY_RELEASE_RING)
@@ -78,9 +78,9 @@ fn each_name_a_consumer_imports_is_classed_as_its_role_needs() {
         EntryClass::Consumed(Consumed::Control),
         EntryClass::Consumed(Consumed::ClaudeToken),
     ] {
-        assert!(!consumed.materialized());
+        assert!(!consumed.read_by_name());
     }
-    assert!(release.materialized() && fleet.materialized() && EntryClass::Shared.materialized());
+    assert!(release.read_by_name() && fleet.read_by_name() && EntryClass::Shared.read_by_name());
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn case_variants_and_other_home_paths_are_set_apart() {
         let words = set_apart_refusal(name).expect("refused");
         assert!(words.contains(&name.to_ascii_lowercase()), "{words}");
         assert!(
-            reserved(name) == !of(&name.to_ascii_lowercase()).materialized(),
+            reserved(name) == !of(&name.to_ascii_lowercase()).read_by_name(),
             "{name}"
         );
     }
@@ -156,7 +156,7 @@ fn a_suffix_held_name_is_held_in_every_spelling() {
     let fleet = EntryClass::Held(Held::FleetConfiguration);
     for name in ["Notes.json", "notes.json", "App-Info.plist", "Config.TOML"] {
         assert_eq!(of(name), fleet, "{name}");
-        assert!(of(name).materialized(), "{name}");
+        assert!(of(name).read_by_name(), "{name}");
         assert!(text_refusal(name).is_none(), "{name}: an admin sets it");
         assert!(member_refusal(name).is_some(), "{name}: a member does not");
     }

@@ -198,7 +198,7 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
 /// run that does not stop, leaves a fresh dispatcher live.
 #[test]
 fn a_decisive_red_stops_queued_binaries_before_its_event_is_written() {
-    let plan = test_plan::plan(&[None], 1, None, 1);
+    let plan = test_plan::plan(&[None], &[], 1, None, 1);
     let state = Mutex::new(Dispatcher::new(&plan, Some(1)));
     let turn = Condvar::new();
     let (stop_read, read_stop) = std::sync::mpsc::channel();
@@ -289,7 +289,6 @@ fn binaries_without_a_measured_peak_get_a_positive_plan_and_claim() {
                 &binary.spec,
                 crate::test_history::Sample {
                     partition: None,
-                    exe_sha256: None,
                     at_ms: 1,
                     outcome: "ok".to_owned(),
                     wall_ms: 1000,
@@ -304,7 +303,14 @@ fn binaries_without_a_measured_peak_get_a_positive_plan_and_claim() {
         }
         let fallback = fallback_peak(&history, &[], physical);
         assert!(fallback > 0);
-        let plan = plan_from_history(&history, std::slice::from_ref(&binary), 4, None, fallback);
+        let plan = plan_from_history(
+            &history,
+            std::slice::from_ref(&binary),
+            &crate::scope::Scope::Workspace,
+            4,
+            None,
+            fallback,
+        );
         assert_eq!(plan.order[0].peak, fallback, "{plan:?}");
         assert!(plan_claim(&plan).is_some(), "{plan:?}");
         assert!(
@@ -312,6 +318,41 @@ fn binaries_without_a_measured_peak_get_a_positive_plan_and_claim() {
             "an unseen binary's fallback peak is positive"
         );
     }
+}
+
+/// THE CHANGE'S OWN CRATES FIRST: the binaries of a cone's seeds lead the dispatch, read from
+/// each binary's `-p` spec, a path spec too. NEGATIVE CONTROL: a workspace scope, every crate of
+/// which the selection names, keeps Cargo's order.
+#[test]
+fn a_cones_seeds_binaries_lead_its_dispatch() {
+    let binary = |spec: &str| Binary {
+        harness: false,
+        header: String::new(),
+        spec: spec.into(),
+        record: Record {
+            cwd: PathBuf::new(),
+            argv: Vec::new(),
+            env: Vec::new(),
+        },
+    };
+    let bins = [
+        binary("-p dep --lib"),
+        binary("-p path+file:///w/crates/seed#seed@0.1.0 --test it"),
+        binary("-p dep --test other"),
+        binary("-p seed --lib"),
+    ];
+    let history = crate::test_history::History::default();
+    let order = |scope: &crate::Scope| -> Vec<usize> {
+        plan_from_history(&history, &bins, scope, 4, None, 1)
+            .order
+            .iter()
+            .map(|b| b.index)
+            .collect()
+    };
+    let cone = crate::Scope::changed("origin/main", vec!["dep".into(), "seed".into()], true)
+        .with_seeds(vec!["seed".into()]);
+    assert_eq!(order(&cone), [1, 3, 0, 2]);
+    assert_eq!(order(&crate::Scope::workspace()), [0, 1, 2, 3]);
 }
 
 /// The actual admission asks for the record's bytes, without a stage envelope or a GiB
@@ -353,7 +394,6 @@ fn measured_binary_reservations_release_individually_and_unrecorded_keeps_its_bo
     let bytes = 64 << 20;
     let sample = crate::test_history::Sample {
         partition: None,
-        exe_sha256: None,
         at_ms: 1,
         outcome: "ok".into(),
         wall_ms: 1000,
@@ -378,7 +418,14 @@ fn measured_binary_reservations_release_individually_and_unrecorded_keeps_its_bo
         16 << 30,
         "the heaviest recorded selection bounds unrecorded work"
     );
-    let plan = plan_from_history(&history, &[known, unknown], 4, None, fallback);
+    let plan = plan_from_history(
+        &history,
+        &[known, unknown],
+        &crate::scope::Scope::Workspace,
+        4,
+        None,
+        fallback,
+    );
     let attempt = &mut |need, mode: Option<aterm_capacity::Admit>| {
         scratch_admit(need, mode.unwrap_or(aterm_capacity::Admit::Wait)).map(Some)
     };
@@ -598,7 +645,6 @@ fn one_core_history(bins: &[Binary]) -> crate::test_history::History {
             &binary.spec,
             crate::test_history::Sample {
                 partition: None,
-                exe_sha256: None,
                 at_ms: 1,
                 outcome: "ok".into(),
                 wall_ms: 1000,
@@ -670,7 +716,14 @@ fn a_runs_binaries_together_hold_the_share_one_claim_would_be_granted() {
         .collect();
     let history = one_core_history(&bins);
     let fallback = fallback_peak(&history, &[], Some(48 << 30));
-    let plan = dispatch_plan(&history, &bins, cores, None, fallback);
+    let plan = dispatch_plan(
+        &history,
+        &bins,
+        &crate::scope::Scope::Workspace,
+        cores,
+        None,
+        fallback,
+    );
     assert_eq!(plan.share, 12, "dispatched within the cores asked");
     assert!(plan.order.iter().all(|b| b.charge == 1), "{plan:?}");
     let machine = aterm_capacity::Fixed::new(after_its_compile());
@@ -815,7 +868,6 @@ fn a_runs_plan_keeps_the_recording_grants_widths_within_the_share_asked() {
         "-p x --test t",
         crate::test_history::Sample {
             partition: None,
-            exe_sha256: None,
             at_ms: 1,
             outcome: "ok".into(),
             wall_ms: 12_000,
@@ -838,21 +890,42 @@ fn a_runs_plan_keeps_the_recording_grants_widths_within_the_share_asked() {
         subprocess_slots_for_cores(12),
         "the pool is made for the cores asked"
     );
-    let plan = dispatch_plan(&history, &bins, cores, None, 1 << 30);
+    let plan = dispatch_plan(
+        &history,
+        &bins,
+        &crate::scope::Scope::Workspace,
+        cores,
+        None,
+        1 << 30,
+    );
     assert_eq!(plan.share, 12);
     assert_eq!(
         (plan.order[0].width, plan.order[0].charge),
         (4, 4),
         "{plan:?}"
     );
-    let on_the_ask = plan_from_history(&history, &bins, cores.dispatch_share(), None, 1 << 30);
+    let on_the_ask = plan_from_history(
+        &history,
+        &bins,
+        &crate::scope::Scope::Workspace,
+        cores.dispatch_share(),
+        None,
+        1 << 30,
+    );
     assert_eq!(on_the_ask.order[0].width, 12, "{on_the_ask:?}");
     let alone = Cores {
         asked: 12,
         granted: 12,
     };
     assert_eq!(
-        dispatch_plan(&history, &bins, alone, None, 1 << 30),
+        dispatch_plan(
+            &history,
+            &bins,
+            &crate::scope::Scope::Workspace,
+            alone,
+            None,
+            1 << 30
+        ),
         on_the_ask,
         "granted all it asked, a run plans as it always did"
     );
@@ -860,8 +933,8 @@ fn a_runs_plan_keeps_the_recording_grants_widths_within_the_share_asked() {
 
 /// A FAILED TEST'S RERUN NAMES THE WIDTH AND CHARGE ITS BINARY RAN AT. A binary planned four
 /// threads wide on 8 cores whose claim was granted 2 ran two threads wide on 2, and its rerun
-/// says so; one the run never started, and every binary of a run that keys content on the
-/// planned command, has the plan's. NEGATIVE CONTROL: the plan's own width for the first.
+/// says so; one the run never started has the plan's. NEGATIVE CONTROL: the plan's own width for
+/// the first.
 #[test]
 fn a_rerun_names_the_width_and_charge_a_binary_ran_at() {
     let bins: Vec<Binary> = ["a", "b"]
@@ -900,19 +973,11 @@ fn a_rerun_names_the_width_and_charge_a_binary_ran_at() {
     };
     let ran = [Some(granted), Some(left)];
     assert_eq!(
-        ran_widths(&bins, &plan, &ran, false),
+        ran_widths(&bins, &plan, &ran),
         [
             ("-p x --test a".to_owned(), 2, 2),
             ("-p x --test b".to_owned(), 4, 8)
         ]
-    );
-    assert_eq!(
-        ran_widths(&bins, &plan, &ran, true),
-        [
-            ("-p x --test a".to_owned(), 4, 8),
-            ("-p x --test b".to_owned(), 4, 8)
-        ],
-        "a content-keyed command keeps the plan's width whatever was granted"
     );
 }
 
@@ -932,6 +997,7 @@ fn a_core_grant_event_names_the_ask_the_grant_and_the_load() {
                 in_load: 1.5,
                 waiting: 1,
                 reserved: 0,
+                turn: false,
             },
         }),
         own_load: 0.25,
@@ -1283,7 +1349,7 @@ fn failed_binary_is_reported_while_another_binary_is_still_running() {
         .collect();
     let released = (Mutex::new(false), std::sync::Condvar::new());
     let reported = Mutex::new(Vec::new());
-    let plan = test_plan::plan(&[None, None], 2, Some(1), 0);
+    let plan = test_plan::plan(&[None, None], &[], 2, Some(1), 0);
     let runs = dispatch(
         &bins,
         &plan,
@@ -1353,7 +1419,6 @@ fn a_passing_binary_cannot_forge_a_failure_event_in_its_output() {
             &binary,
             &Ran::of(run.clone(), Duration::ZERO, Duration::ZERO),
             true,
-            None,
             false,
         );
         aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
@@ -1384,7 +1449,6 @@ fn binary_events_report_completed_counts_without_inventing_them() {
             &binary,
             &Ran::of(run, Duration::ZERO, Duration::ZERO),
             true,
-            None,
             false,
         );
         aterm_json::from_str::<aterm_json::Value>(line.strip_prefix("verify-event: ").unwrap())
@@ -1409,36 +1473,6 @@ fn binary_events_report_completed_counts_without_inventing_them() {
         event(true, failed)["test_counts"].is_null(),
         "a passing child cannot invent a failed count"
     );
-    let carried = CarriedBinary {
-        binary,
-        evidence: Evidence {
-            exe_sha256: Some("aa".repeat(32)),
-            content_key: Some("11".repeat(32)),
-            reason: None,
-            parts: crate::test_content::KeyParts::new(),
-        },
-        json: false,
-        prior_execution_s: 0.01,
-        origin_run: None,
-    };
-    let changed = Evidence {
-        exe_sha256: carried.evidence.exe_sha256.clone(),
-        content_key: None,
-        reason: Some("runtime inputs changed".into()),
-        parts: crate::test_content::KeyParts::new(),
-    };
-    for line in [
-        carried_event(&carried),
-        unstable_carried_event(&carried, &changed),
-    ] {
-        let event: aterm_json::Value =
-            aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
-        assert_eq!(
-            event.get("test_counts"),
-            Some(&aterm_json::Value::Null),
-            "a retained candidate ran no tests now"
-        );
-    }
 }
 
 /// A proven hang is a bounded structured FAIL, even when the sampler's error contains the
@@ -1487,7 +1521,6 @@ fn a_hung_binary_is_a_bounded_named_gate_failure() {
         &binary,
         &Ran::of(run.clone(), Duration::ZERO, Duration::ZERO),
         true,
-        None,
         true,
     );
     assert_eq!(outcome, Outcome::Fail(Severity::GateFailed));
@@ -1552,270 +1585,6 @@ fn artifact(exe: &str, kind: &str, name: &str, test: bool) -> String {
     )
 }
 
-/// A resume carries a binary only when the prior ok names both its current executable and
-/// complete bounded content key, and never GOLDEN's package. Evidence is computed for every
-/// binary, including the first run and binaries absent from the prior proof. Negative
-/// controls: a changed content key and GOLDEN's exact match both run.
-#[test]
-fn a_resume_carries_only_unchanged_binaries_that_passed_and_never_the_golden_package() {
-    let bin = |exe: &str, pkg: &str| Binary {
-        harness: false,
-        header: format!("     Running unittests src/lib.rs ({exe})"),
-        spec: format!("-p {pkg} --lib"),
-        record: rec(exe, pkg),
-    };
-    let bins = vec![
-        bin("/t/deps/aterm_db-1", "aterm-db"),
-        bin("/t/deps/aterm_grid-2", "aterm-grid"),
-        bin("/t/deps/aterm_gpu-3", crate::checks::GOLDEN.0),
-        bin("/t/deps/aterm_core-4", "aterm-core"),
-    ];
-    let evidence = |b: &Binary| Evidence {
-        exe_sha256: Some(match b.record.exe().to_str() {
-            Some("/t/deps/aterm_db-1") => "aa".repeat(32),
-            Some("/t/deps/aterm_grid-2") => "bb".repeat(32),
-            Some("/t/deps/aterm_gpu-3") => "cc".repeat(32),
-            _ => "dd".repeat(32),
-        }),
-        content_key: Some(match b.record.exe().to_str() {
-            Some("/t/deps/aterm_db-1") => "11".repeat(32),
-            Some("/t/deps/aterm_grid-2") => "22".repeat(32),
-            Some("/t/deps/aterm_gpu-3") => "33".repeat(32),
-            _ => "44".repeat(32),
-        }),
-        reason: None,
-        parts: [("env:MAKEFLAGS".to_owned(), "current".to_owned())].into(),
-    };
-    let mut passed = Passed::new();
-    for (index, binary) in bins.iter().take(3).enumerate() {
-        let mut prior = CarryProof::passed(&binary.spec, &evidence(binary), 1.25 + index as f64);
-        if index == 1 {
-            prior.content_key = Some("ee".repeat(32));
-            prior
-                .key_parts
-                .insert("env:MAKEFLAGS".into(), "prior".into());
-        }
-        passed.insert(binary.spec.clone(), prior);
-    }
-    let mut failed = CarryProof::passed(&bins[3].spec, &evidence(&bins[3]), 2.0);
-    failed.outcome = "FAIL".into();
-    passed.insert(bins[3].spec.clone(), failed);
-    let evidenced = Mutex::new(Vec::new());
-    let Carried {
-        run,
-        carried,
-        known,
-        refused,
-    } = carry(
-        &passed,
-        bins,
-        |b, _| {
-            evidenced.lock().unwrap().push(b.spec.clone());
-            evidence(b)
-        },
-        2,
-    );
-    assert_eq!(
-        refused,
-        [
-            (
-                "-p aterm-grid --lib".to_owned(),
-                "content key moved in env:MAKEFLAGS".to_owned()
-            ),
-            (
-                format!("-p {} --lib", crate::checks::GOLDEN.0),
-                format!("{} always runs", crate::checks::GOLDEN.0)
-            ),
-        ],
-        "each offered ok proof that runs again says what differs; a prior FAIL was no offer"
-    );
-    assert_eq!(
-        refused_lines(&refused),
-        [
-            format!(
-                "  offered and run again: 1 ({0} always runs), as -p {0} --lib",
-                crate::checks::GOLDEN.0
-            ),
-            "  offered and run again: 1 (content key moved in env:MAKEFLAGS), as -p aterm-grid --lib"
-                .to_owned(),
-        ]
-    );
-    let specs = |v: &[Binary]| v.iter().map(|b| b.spec.clone()).collect::<Vec<_>>();
-    assert_eq!(
-        carried
-            .iter()
-            .map(|carried| carried.binary.spec.as_str())
-            .collect::<Vec<_>>(),
-        ["-p aterm-db --lib"],
-        "only the exact bounded prior ok"
-    );
-    assert_eq!(
-        specs(&run),
-        [
-            "-p aterm-grid --lib",
-            "-p aterm-gpu --lib",
-            "-p aterm-core --lib"
-        ],
-        "a changed key runs, GOLDEN's package always runs, and a direct prior FAIL runs"
-    );
-    let mut evidenced = evidenced.into_inner().unwrap();
-    evidenced.sort();
-    assert_eq!(
-        evidenced,
-        [
-            "-p aterm-core --lib",
-            "-p aterm-db --lib",
-            "-p aterm-gpu --lib",
-            "-p aterm-grid --lib",
-        ],
-        "every release binary gets evidence on its first run too"
-    );
-    assert_eq!(
-        known
-            .get("-p aterm-grid --lib")
-            .and_then(|evidence| evidence.content_key.as_deref()),
-        Some("22".repeat(32).as_str())
-    );
-    let event: aterm_json::Value = aterm_json::from_str(
-        carried_event(&carried[0])
-            .strip_prefix("verify-event: ")
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(event["outcome"].as_str(), Some("ok"));
-    assert_eq!(event["carried"].as_bool(), Some(true));
-    assert_eq!(event["execution_s"].as_f64(), Some(0.0));
-    assert_eq!(event["recorded_execution_s"].as_f64(), Some(1.25));
-    assert_eq!(event["exe_sha256"].as_str(), Some("aa".repeat(32).as_str()));
-    assert_eq!(
-        event["content_key"].as_str(),
-        Some("11".repeat(32).as_str())
-    );
-}
-
-/// Deterministic release-line timeline for A19. A cfg(test) edit changes the edited target
-/// and one dependent executable; a fixture changes only its declared reader; a harness or
-/// verifier context change changes every complete key. The fixture scheduler has one
-/// execution slot, so the sum is its modeled wall, not a production latency claim. NEGATIVE
-/// CONTROL: an otherwise equal undeclared reader still runs.
-#[test]
-fn fix_hop_line_timeline_runs_only_changed_complete_inputs() {
-    let binary = |name: &str| Binary {
-        harness: false,
-        header: String::new(),
-        spec: format!("-p {name} --lib"),
-        record: rec(&format!("/t/deps/{name}-0000000000000000"), name),
-    };
-    let bins = vec![
-        binary("edited"),
-        binary("dependent"),
-        binary("fixture-reader"),
-        binary("fixture-sibling"),
-    ];
-    let mut base = BTreeMap::new();
-    for (index, binary) in bins.iter().enumerate() {
-        base.insert(
-            binary.spec.clone(),
-            Evidence {
-                exe_sha256: Some(format!("{:02x}", index + 1).repeat(32)),
-                content_key: Some(format!("{:02x}", index + 17).repeat(32)),
-                reason: None,
-                parts: crate::test_content::KeyParts::new(),
-            },
-        );
-    }
-    let mut prior = Passed::new();
-    for binary in &bins {
-        prior.insert(
-            binary.spec.clone(),
-            CarryProof::passed(&binary.spec, &base[&binary.spec], 1.0),
-        );
-    }
-    let walls = BTreeMap::from([
-        ("-p edited --lib", 12_u64),
-        ("-p dependent --lib", 8),
-        ("-p fixture-reader --lib", 4),
-        ("-p fixture-sibling --lib", 2),
-    ]);
-    let scenario = |evidence: BTreeMap<String, Evidence>| {
-        let result = carry(
-            &prior,
-            bins.clone(),
-            |binary, _| evidence[&binary.spec].clone(),
-            2,
-        );
-        let run = result
-            .run
-            .iter()
-            .map(|binary| binary.spec.clone())
-            .collect::<Vec<_>>();
-        let carried = result
-            .carried
-            .iter()
-            .map(|binary| binary.binary.spec.clone())
-            .collect::<Vec<_>>();
-        let single_slot_wall_s = run.iter().map(|spec| walls[spec.as_str()]).sum::<u64>();
-        (run, carried, single_slot_wall_s)
-    };
-
-    let mut cfg_test = base.clone();
-    for (spec, byte) in [("-p edited --lib", "a1"), ("-p dependent --lib", "a2")] {
-        let evidence = cfg_test.get_mut(spec).unwrap();
-        evidence.exe_sha256 = Some(byte.repeat(32));
-        evidence.content_key = Some(byte.repeat(32));
-    }
-    let (run, carried, wall) = scenario(cfg_test);
-    assert_eq!(run, ["-p edited --lib", "-p dependent --lib"]);
-    assert_eq!(
-        carried,
-        ["-p fixture-reader --lib", "-p fixture-sibling --lib"]
-    );
-    assert_eq!(wall, 20);
-
-    let mut fixture = base.clone();
-    fixture
-        .get_mut("-p fixture-reader --lib")
-        .unwrap()
-        .content_key = Some("b1".repeat(32));
-    let (run, carried, wall) = scenario(fixture);
-    assert_eq!(run, ["-p fixture-reader --lib"]);
-    assert_eq!(
-        carried,
-        [
-            "-p edited --lib",
-            "-p dependent --lib",
-            "-p fixture-sibling --lib"
-        ]
-    );
-    assert_eq!(wall, 4);
-
-    let harness = base
-        .iter()
-        .map(|(spec, evidence)| {
-            let mut evidence = evidence.clone();
-            evidence.content_key = Some("c1".repeat(32));
-            (spec.clone(), evidence)
-        })
-        .collect();
-    let (run, carried, wall) = scenario(harness);
-    assert_eq!(run.len(), 4);
-    assert!(carried.is_empty());
-    assert_eq!(wall, 26);
-
-    let mut unbounded = base.clone();
-    unbounded.insert(
-        "-p fixture-sibling --lib".into(),
-        Evidence {
-            exe_sha256: base["-p fixture-sibling --lib"].exe_sha256.clone(),
-            content_key: None,
-            reason: Some("runtime inputs are undeclared".into()),
-            parts: crate::test_content::KeyParts::new(),
-        },
-    );
-    let (run, _, _) = scenario(unbounded);
-    assert_eq!(run, ["-p fixture-sibling --lib"]);
-}
-
 /// A test binary's event lands in a release's events file whole, as its cutter reads it, beside
 /// stderr. Negative control: an `emit` that writes stderr alone leaves the file empty.
 #[test]
@@ -1839,19 +1608,17 @@ fn a_binarys_event_reaches_the_release_events_file_whole() {
             env: Vec::new(),
         },
     };
-    let evidence = Evidence {
-        exe_sha256: Some("aa".repeat(32)),
-        content_key: Some("11".repeat(32)),
-        reason: None,
-        parts: crate::test_content::KeyParts::new(),
+    let run = Run {
+        ok: true,
+        code: Some(0),
+        ..Run::default()
     };
-    let event = carried_event(&CarriedBinary {
-        binary,
-        evidence,
-        json: false,
-        prior_execution_s: 1.0,
-        origin_run: None,
-    });
+    let (_, event, _) = binary_event(
+        &binary,
+        &Ran::of(run, Duration::ZERO, Duration::from_secs(1)),
+        true,
+        false,
+    );
     let initial = std::fs::read_to_string(&at).unwrap();
     let prepared = ctx.events.as_ref().unwrap().prepare(&event);
     emit(&ctx, &event);
@@ -2308,7 +2075,7 @@ fn a_run_that_panics_gives_its_charge_back_and_halts_the_dispatch() {
         })
         .collect();
     // Three binaries two wide on two cores: one at a time, on two workers.
-    let plan = test_plan::plan(&[None, None, None], 2, None, 0);
+    let plan = test_plan::plan(&[None, None, None], &[], 2, None, 0);
     let go = |panics: bool| {
         let (bins, plan) = (bins.clone(), plan.clone());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2462,7 +2229,7 @@ fn a_spent_ceiling_starts_nothing_more() {
             record: rec(&format!("/r/t{i}"), "x"),
         })
         .collect();
-    let plan = test_plan::plan(&[None, None, None, None], 1, None, 0);
+    let plan = test_plan::plan(&[None, None, None, None], &[], 1, None, 0);
     let done = AtomicUsize::new(0);
     let ok = || {
         Some(Run {
@@ -2694,6 +2461,79 @@ fn a_pooled_binary_holds_its_charge_in_the_releases_tokens_while_it_runs() {
     assert_eq!(back.len(), 4, "every token came back");
 }
 
+/// A fixture can retain one token while the recording pass sees three of a four-core
+/// release. Its return must let two recorded two-core binaries run together, without
+/// changing either binary's recorded width or memory envelope.
+/// NEGATIVE CONTROL: the recording share leaves the peer queued after the fixture returns.
+#[cfg(unix)]
+#[test]
+fn a_returned_fixture_token_widens_dispatch_without_replanning_binaries() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let pool = aterm_capacity::Jobserver::new(&tmp.path().join("jobs"), 4).unwrap();
+    let fixture = Mutex::new(Some(pool.try_acquire().unwrap().unwrap()));
+    let (bins, recorded) = charged(&[2, 2], 3);
+    let capped = pool_dispatch_plan(recorded.clone(), Some(&pool), Some(3));
+    assert_eq!(
+        capped, recorded,
+        "an explicit core cap still bounds dispatch"
+    );
+    assert_eq!(pool_dispatch_plan(recorded.clone(), None, None), recorded);
+    let plan = pool_dispatch_plan(recorded.clone(), Some(&pool), None);
+    assert_eq!(
+        plan.order, recorded.order,
+        "the recorded binary budgets stay fixed"
+    );
+    let (sent, received) = std::sync::mpsc::channel();
+    let received = Mutex::new(received);
+    let active = AtomicUsize::new(0);
+    let most = AtomicUsize::new(0);
+    let ran = dispatch_pooled(
+        &bins,
+        &plan,
+        None,
+        Some(&pool),
+        &|| 0.0,
+        &|| false,
+        |binary, planned, _| {
+            assert_eq!((planned.width, planned.charge), (2, 2));
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            if binary.spec == bins[0].spec {
+                let held = fixture.lock().unwrap().take().unwrap();
+                assert_eq!(now, 1, "three available tokens cannot admit both charges");
+                drop(held);
+                received
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect(
+                        "the peer must start on the returned fixture token before this binary ends",
+                    );
+            } else {
+                assert!(pool.try_acquire().unwrap().is_none());
+                sent.send(()).unwrap();
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            Some(Run {
+                case_observations: None,
+                ok: true,
+                code: Some(0),
+                ..Run::default()
+            })
+        },
+        |_, _, _| {},
+    );
+    assert!(ran.iter().all(Option::is_some));
+    assert_eq!(most.load(Ordering::SeqCst), 2, "both binaries overlap");
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    let returned: Vec<_> = std::iter::from_fn(|| pool.try_acquire().unwrap()).collect();
+    assert_eq!(
+        returned.len(),
+        4,
+        "the fixture and binaries returned every token"
+    );
+}
+
 /// An incomplete pool attempt returns its memory and partial tokens before trying a
 /// smaller peer. The peer runs while the earlier binary stays queued; once the build
 /// returns its token the larger binary acquires its exact recorded memory and all slots.
@@ -2885,7 +2725,8 @@ fn a_lone_binary_starts_on_the_tokens_a_pool_that_lost_some_still_holds() {
     assert_eq!(back.len(), 4, "every token is in the pool again");
 }
 
-/// The permit of a lone binary on a pool that holds none of its tokens is still a wait: with
+/// The permit of a lone binary on a pool that holds none of its tokens, and that no count can
+/// judge (the pool is this process's own, not an adopted branch FIFO), is still a wait: with
 /// nothing to run on it starts nothing, and one that holds its whole charge runs as planned.
 #[cfg(unix)]
 #[test]
@@ -2897,19 +2738,120 @@ fn a_lone_binary_with_no_token_waits_and_a_whole_charge_runs_as_planned() {
     let attempt = &mut |_, _| -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error> {
         unreachable!("no run, so no memory claim")
     };
-    let whole = binary_permit_noting(None, Some(&pool), &b, attempt, true, &mut None)
+    let whole = binary_permit_noting(None, Some(&pool), &b, attempt, &|| true, &mut None)
         .expect("admitted")
         .expect("no FIFO error");
     assert_eq!(whole.granted(b), b, "its whole charge: as planned");
     let mut waiting = None;
     assert!(
-        binary_permit_noting(None, Some(&pool), &b, attempt, true, &mut waiting).is_none(),
+        binary_permit_noting(None, Some(&pool), &b, attempt, &|| true, &mut waiting).is_none(),
         "no token is left to start on"
     );
     assert!(waiting.is_some(), "and the wait names the pool");
     drop(whole);
     let back: Vec<_> = std::iter::from_fn(|| pool.try_acquire().expect("reads")).collect();
     assert_eq!(back.len(), 2);
+}
+
+/// LOST TOKENS, COUNTED. The tree FIFO of a release's branch shares, adopted as a verifier
+/// adopts it, lost every token of its allocation of two to a client that died holding them. A
+/// lone binary charged two, with no child of the run alive, has the pool counted: both tokens
+/// are written back and it takes its whole charge, then gives both back, and the pool holds
+/// its allocation and no more. NEGATIVE CONTROL: while a child of the run may be alive the same
+/// permit is a wait and nothing is minted.
+#[cfg(unix)]
+#[test]
+fn a_lone_binary_on_a_pool_that_lost_every_token_has_it_counted_whole_and_runs_whole() {
+    let tmp = aterm_tempfile::tempdir().expect("scratch");
+    let shares = aterm_capacity::BranchShares::new(&tmp.path().join("jobs"), 2, 0, [false, true])
+        .expect("branch shares");
+    let pool = aterm_capacity::Jobserver::adopt(&shares.pool(true).handed()).expect("adopted");
+    for _ in 0..2 {
+        // The dead client's: read out of the FIFO and never written back.
+        std::mem::forget(
+            shares
+                .pool(true)
+                .try_acquire()
+                .expect("reads")
+                .expect("a token"),
+        );
+    }
+    let (_, plan) = charged(&[2], 2);
+    let b = plan.order[0];
+    let attempt = &mut |_, _| -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error> {
+        unreachable!("no run, so no memory claim")
+    };
+    let mut waiting = None;
+    assert!(
+        binary_permit_noting(None, Some(&pool), &b, attempt, &|| false, &mut waiting).is_none(),
+        "a child may hold them: it waits"
+    );
+    assert!(waiting.is_some());
+    assert!(
+        pool.try_acquire().expect("reads").is_none(),
+        "nothing was minted"
+    );
+    let whole = binary_permit_noting(None, Some(&pool), &b, attempt, &|| true, &mut None)
+        .expect("admitted")
+        .expect("no FIFO error");
+    assert_eq!(whole.granted(b), b, "its whole charge, counted back");
+    drop(whole);
+    let back: Vec<_> = std::iter::from_fn(|| pool.try_acquire().expect("reads")).collect();
+    assert_eq!(back.len(), 2, "the allocation, and no more");
+}
+
+/// A binary's end is a reap point. The tree FIFO of a release's branch shares, adopted as a
+/// verifier adopts it, loses a token while a binary charged one runs (a client of it died
+/// holding one); once it ends, with no binary left running and no child of the run alive, the
+/// pool is counted and the lost token written back, so the FIFO holds its allocation again.
+/// NEGATIVE CONTROL: while a child of the run may be alive, the same end counts nothing and the
+/// FIFO stays one short.
+#[cfg(unix)]
+#[test]
+fn a_binarys_end_counts_the_pool_and_writes_back_a_token_lost_while_it_ran() {
+    for quiet in [true, false] {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let shares =
+            aterm_capacity::BranchShares::new(&tmp.path().join("jobs"), 3, 0, [false, true])
+                .expect("branch shares");
+        let pool = aterm_capacity::Jobserver::adopt(&shares.pool(true).handed()).expect("adopted");
+        let (bins, plan) = charged(&[1], 1);
+        let ran = dispatch_resources(
+            &bins,
+            &plan,
+            None,
+            Some(&pool),
+            None,
+            None,
+            &|| 0.0,
+            &|| false,
+            &|| quiet,
+            |_, _, _| {
+                // The dead client's: read out of the FIFO and never written back.
+                std::mem::forget(
+                    shares
+                        .pool(true)
+                        .try_acquire()
+                        .expect("reads")
+                        .expect("a token"),
+                );
+                Some(Run {
+                    case_observations: None,
+                    ok: true,
+                    code: Some(0),
+                    ..Run::default()
+                })
+            },
+            |_, _, _| {},
+        );
+        assert!(ran[0].is_some(), "it ran");
+        let back: Vec<_> = std::iter::from_fn(|| pool.try_acquire().expect("reads")).collect();
+        assert_eq!(
+            back.len(),
+            if quiet { 3 } else { 2 },
+            "counted at its end only when nothing else runs"
+        );
+    }
 }
 
 /// A binary whose tokens the stop ends the wait for never runs and is left unstarted, as the
@@ -3091,7 +3033,6 @@ fn the_combined_log_reads_as_cargos_to_every_reader_of_cargos() {
         &bins[1],
         &Ran::of(runs[1].clone(), Duration::ZERO, Duration::ZERO),
         true,
-        None,
         false,
     );
     assert_eq!(outcome, Outcome::Fail(Severity::GateFailed), "a proven red");
@@ -3555,170 +3496,6 @@ fn the_replayed_command_is_the_record_with_its_thread_count() {
     );
 }
 
-/// Content evidence is made from the command after the full-set plan and JSON probe have
-/// fixed it. NEGATIVE CONTROLS: changing either the actual planned width or the probe's final
-/// JSON mode changes the key; hard-coding a width or keying the pre-probe command fails this.
-#[test]
-fn planned_width_and_final_json_mode_are_content_key_inputs() {
-    let dir = aterm_tempfile::tempdir().expect("scratch");
-    let root = dir.path().join("workspace");
-    let package = root.join("crates/p");
-    let scratch = root.join("scratch");
-    let executable = root.join("target/debug/deps/p-0000000000000000");
-    std::fs::create_dir_all(package.join("src")).unwrap();
-    std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(&scratch).unwrap();
-    std::fs::write(
-        root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
-    )
-    .unwrap();
-    std::fs::write(root.join("trust.lock"), "build = 1\n").unwrap();
-    std::fs::write(
-        package.join("Cargo.toml"),
-        "[package]\nname = \"p\"\nversion = \"0.0.0\"\n\
-         [package.metadata.aterm.test-inputs]\n\
-         bounded = true\ncontent-only = true\nread-only = true\npaths = []\nvolatile-environment = []\n",
-    )
-    .unwrap();
-    std::fs::write(package.join("src/lib.rs"), "pub fn answer() -> u8 { 1 }\n").unwrap();
-    std::fs::write(&executable, b"test executable").unwrap();
-    let binary = Binary {
-        header: format!(
-            "     Running unittests src/lib.rs ({})",
-            executable.display()
-        ),
-        spec: "-p p --lib".into(),
-        record: Record {
-            cwd: package.clone(),
-            argv: vec![executable.into_os_string()],
-            env: vec![
-                ("CARGO_PKG_NAME".into(), "p".into()),
-                ("CARGO_MANIFEST_DIR".into(), package.into_os_string()),
-                ("PATH".into(), "/usr/bin:/bin".into()),
-            ],
-        },
-        harness: true,
-    };
-    let ctx = crate::Ctx::new(
-        root,
-        crate::Scope::workspace(),
-        crate::EnvSnapshot::default(),
-        scratch.clone(),
-    );
-    let builder = crate::test_content::EvidenceBuilder::new(
-        Some("11".repeat(32)),
-        Some("22".repeat(32)),
-        scratch,
-    );
-    let keyed = |width, json, seed| {
-        let command = final_binary_cmd(
-            &ctx,
-            &binary,
-            width,
-            width,
-            false,
-            Watch {
-                json,
-                stop_at_red: false,
-                seed,
-            },
-        );
-        let command = exec::finalize_exact_command(command, ctx.exec_env())
-            .expect("a replayed test command is exact");
-        (builder.evidence(&binary, &command), command)
-    };
-    let (narrow, narrow_command) = keyed(2, false, None);
-    let (wide, _) = keyed(7, false, None);
-    let (json, json_command) = keyed(2, true, None);
-    let (seeded, seeded_command) = keyed(2, false, Some(17));
-    assert!(narrow.bounded(), "{narrow:?}");
-    assert_ne!(narrow.content_key, wide.content_key, "planned width");
-    assert_ne!(narrow.content_key, json.content_key, "final JSON mode");
-    assert_ne!(narrow.content_key, seeded.content_key, "shuffle seed");
-    assert!(
-        narrow_command
-            .argv()
-            .iter()
-            .all(|argument| argument != "json")
-            && json_command
-                .argv()
-                .iter()
-                .any(|argument| argument == "json")
-    );
-    assert!(
-        seeded_command
-            .argv()
-            .iter()
-            .any(|argument| argument == "--shuffle-seed=17")
-    );
-}
-
-/// Carry projects the already-claimed full plan; it never widens or reorders the misses.
-/// NEGATIVE CONTROL: asking the planner again after removing the middle binary would not
-/// preserve these deliberately distinct widths, charges and predictions.
-#[test]
-fn carry_projects_the_fixed_full_plan_without_replanning() {
-    let binary = |name: &str| Binary {
-        header: String::new(),
-        spec: format!("-p {name} --lib"),
-        record: rec(&format!("/r/target/debug/deps/{name}-1"), name),
-        harness: true,
-    };
-    let full = vec![binary("a"), binary("carried"), binary("b")];
-    let plan = Plan {
-        share: 8,
-        target: Duration::from_secs(9),
-        order: vec![
-            Planned {
-                index: 2,
-                width: 7,
-                charge: 8,
-                peak: 700,
-                predicted: Some(Duration::from_secs(3)),
-            },
-            Planned {
-                index: 1,
-                width: 5,
-                charge: 6,
-                peak: 500,
-                predicted: Some(Duration::from_secs(5)),
-            },
-            Planned {
-                index: 0,
-                width: 2,
-                charge: 3,
-                peak: 200,
-                predicted: Some(Duration::from_secs(7)),
-            },
-        ],
-    };
-    let kept = vec![full[0].clone(), full[2].clone()];
-    assert_eq!(
-        project_plan(&plan, &full, &kept),
-        Plan {
-            share: 8,
-            target: Duration::from_secs(9),
-            order: vec![
-                Planned {
-                    index: 1,
-                    width: 7,
-                    charge: 8,
-                    peak: 700,
-                    predicted: Some(Duration::from_secs(3)),
-                },
-                Planned {
-                    index: 0,
-                    width: 2,
-                    charge: 3,
-                    peak: 200,
-                    predicted: Some(Duration::from_secs(7)),
-                },
-            ],
-        }
-    );
-}
-
 #[test]
 fn plan_prefers_exact_exe_match_before_file_name_fallback() {
     let records = vec![rec("/r/target/debug/deps/a-1", "x")];
@@ -3825,4 +3602,16 @@ fn subprocess_pool_protocol_matches_aterm_spec_lane() {
         h_a.join().expect("join a");
         h_b.join().expect("join b");
     });
+}
+
+/// A measured wall rounds up to whole milliseconds, so a binary that ran in under one keeps a
+/// wall and is planned by it: a wall of 0 is a stopped run's. NEGATIVE CONTROL: truncating
+/// (`as_millis`) reads 970 us as 0, and the history forgets the binary.
+#[test]
+fn a_run_under_a_millisecond_keeps_a_wall() {
+    assert_eq!(wall_ms(Duration::from_micros(970)), 1);
+    assert_eq!(wall_ms(Duration::from_micros(1)), 1);
+    assert_eq!(wall_ms(Duration::ZERO), 1);
+    assert_eq!(wall_ms(Duration::from_micros(1_000)), 1);
+    assert_eq!(wall_ms(Duration::from_micros(1_001)), 2);
 }

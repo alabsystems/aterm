@@ -17,7 +17,8 @@ use crate::prompt::fixtures::{
     WALL_NOT_LOGGED_IN_2_1_310, WALL_NOT_LOGGED_IN_NO_LOGIN_2_1_310, WALL_OAUTH_REVOKED_2_1_310,
     WALL_SUBSCRIPTION_DISABLED_2_1_310, login_over_weekly_limit, screen,
 };
-use crate::wall::{Placement, WallKind};
+use crate::wall::Placement;
+use alab_policy::vocab::WallKind;
 
 const NOT_LOGGED_IN: &str = "Not logged in · Please run /login";
 const INVALID_KEY: &str = "Invalid API key · Fix external API key";
@@ -234,7 +235,7 @@ fn every_measured_picker_is_read_as_a_prompt_focused_as_drawn() {
             let r = crate::read(Some("claude"), &screen(text), None);
             assert_eq!(
                 r.phase,
-                crate::phase::Phase::Prompt,
+                alab_policy::vocab::Phase::Prompt,
                 "{}: {text}",
                 b.version
             );
@@ -484,7 +485,7 @@ fn every_measured_lost_login_is_read_as_its_wall() {
     assert_eq!(crate::wall::wall(&retrying), None);
     assert_eq!(
         crate::read(Some("claude"), &retrying, None).phase,
-        crate::phase::Phase::Busy
+        alab_policy::vocab::Phase::Busy
     );
 }
 
@@ -507,7 +508,10 @@ fn a_hand_off_left_over_a_weekly_limit_reads_as_the_browser_state() {
         "the measured premise"
     );
     assert_eq!(crate::phase::busy_signal(&over), None);
-    assert_eq!(crate::phase::worker_phase(&over), crate::phase::Phase::Idle);
+    assert_eq!(
+        crate::phase::worker_phase(&over),
+        alab_policy::vocab::Phase::Idle
+    );
     let rule = over
         .iter()
         .rposition(|r| r.starts_with('▔'))

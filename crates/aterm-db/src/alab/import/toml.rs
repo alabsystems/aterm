@@ -18,9 +18,9 @@
 //!
 //! - `login` (`user`, `username`, `imap_user`): the mailbox's `login`, an address row; the
 //!   mailbox's key derives from it (`keys::mailbox_pk`).
-//! - `password`: the login address's own `password`, a `Secret` (one fact, one cell, as A9
-//!   reads it).
-//! - `mailbox_password` and `totp_secret`: the mailbox's `Secret`s.
+//! - `password`: the login address's own `password`, a secret cell naming its store entry (one
+//!   fact, one cell, as A9 reads it).
+//! - `mailbox_password` and `totp_secret`: the mailbox's secret cells, each naming its entry.
 //! - `webmail_url`, `imap_url`, `http_url`: `webmail`, `imap` and `http`; `url` only where its
 //!   scheme says which (`imap://`, `imaps://`), since the harness tells a webmail page from a
 //!   mail API by a guess this build does not repeat.

@@ -78,6 +78,13 @@ mod fx_raster;
 pub mod glow_ramps;
 pub mod glyph_ink;
 pub mod hdr;
+mod keyline;
+#[cfg(any(test, debug_assertions))]
+pub use keyline::with_keyline_as_tinted;
+pub use keyline::{
+    CARET_PAGE_MIN_CONTRAST, KEYLINE_FILL_MIN_CONTRAST, KEYLINE_GLASS_MIN_CONTRAST,
+    block_keyline_colour, block_keyline_rects,
+};
 #[cfg(any(
     all(unix, not(target_os = "macos")),
     windows,
@@ -5593,6 +5600,16 @@ pub fn pad_split(win_px: usize, pad: usize, cell_px: usize) -> PadSplit {
         pad_hi: pad + (rem - rem / 2),
     }
 }
+
+/// A window's face size on macOS at a scale of 1, logical px: `aterm-gui`'s default `FONT_PX`
+/// there, and the size a trail film's Retina lane lays its face at, twice over.
+pub const WINDOW_FONT_PX_MACOS: f32 = 12.0;
+/// A window's padding between its edge and its grid at a scale of 1, logical px (`aterm-gui`
+/// scales it by the display's factor, rounded) ...
+pub const WINDOW_PAD_LOGICAL_PX: f32 = 12.0;
+/// ... and over the grid, small because the chrome's `head` band already parts the grid from
+/// the window's top edge.
+pub const WINDOW_PAD_TOP_LOGICAL_PX: f32 = 2.0;
 
 /// Raw framebuffer extent.
 #[inline]
@@ -14903,12 +14920,28 @@ impl Renderer {
             };
             let cursor_fill = floor_cursor_fill(base_fill, cursor_cell_bg, min_contrast);
             let cursor_cov = (self.cursor_opacity * 255.0).round() as u8;
+            // A block caret's keyline lies over its fill and its letter, at the block's opacity,
+            // in a colour worked from the fill drawn and the ground under it.
+            let keyline = input
+                .cursor_keyline_tint
+                .filter(|_| is_block)
+                .and_then(|tint| {
+                    let line = block_keyline_colour(cursor_fill, tint, cursor_cell_bg);
+                    Some((line, block_keyline_rects(x0, y0, cur_w, self.cell_h)?))
+                });
             if cursor_cov < 255 {
                 for_each_cursor_rect(style, x0, y0, cur_w, self.cell_h, |[rx, ry, rw, rh]| {
                     if let Some((fx, fw)) = clip_span_to_run(rx, rw, run_lo, run_hi) {
                         self.blend_rect(pixels, w, h, fx, ry, fw, rh, cursor_fill, cursor_cov);
                     }
                 });
+                if let Some((line, rects)) = keyline {
+                    for [rx, ry, rw, rh] in rects {
+                        if let Some((fx, fw)) = clip_span_to_run(rx, rw, run_lo, run_hi) {
+                            self.blend_rect(pixels, w, h, fx, ry, fw, rh, line, cursor_cov);
+                        }
+                    }
+                }
                 return;
             }
             for_each_cursor_rect(style, x0, y0, cur_w, self.cell_h, |[rx, ry, rw, rh]| {
@@ -14988,6 +15021,13 @@ impl Renderer {
                 }
                 self.glyph_plan_scratch = plan;
                 self.glyph_plan_row = Some(cr);
+            }
+            if let Some((line, rects)) = keyline {
+                for [rx, ry, rw, rh] in rects {
+                    if let Some((fx, fw)) = clip_span_to_run(rx, rw, run_lo, run_hi) {
+                        self.fill_rect(pixels, w, h, fx, ry, fw, rh, line);
+                    }
+                }
             }
         }
     }
@@ -16219,6 +16259,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
         cursor_effect_style_override,
         cursor_color,
         cursor_fill_override,
+        cursor_keyline_tint,
         bloom_gate,
         selection,
         selection_clip,
@@ -16309,6 +16350,7 @@ fn clone_input_stamped_inner(dst: &mut RenderInput, src: &RenderInput, drop_effe
     dst.cursor_effect_style_override = *cursor_effect_style_override;
     dst.cursor_color = *cursor_color;
     dst.cursor_fill_override = *cursor_fill_override;
+    dst.cursor_keyline_tint = *cursor_keyline_tint;
     dst.bloom_gate = *bloom_gate;
     dst.selection.clone_from(selection);
     dst.selection_clip = *selection_clip;
@@ -17000,6 +17042,7 @@ pub fn scroll_shift_plan(
             && prev_style == cur_style
             && prev.cursor_color == input.cursor_color
             && prev.cursor_fill_override == input.cursor_fill_override
+            && prev.cursor_keyline_tint == input.cursor_keyline_tint
             && prev_blink_phase == cur_blink_phase)
     {
         return None;
@@ -17218,7 +17261,8 @@ pub fn compute_dirty_rows(
                 || prev_input.cursor_col != input.cursor_col
                 || prev_style != cur_style
                 || prev_input.cursor_color != input.cursor_color
-                || prev_input.cursor_fill_override != input.cursor_fill_override));
+                || prev_input.cursor_fill_override != input.cursor_fill_override
+                || prev_input.cursor_keyline_tint != input.cursor_keyline_tint));
     let blink_or_override_changed = prev_blink_phase != cur_blink_phase
         || prev_cursor_style_override != cur_cursor_style_override
         || prev_input.cursor_effect_style_override != input.cursor_effect_style_override;

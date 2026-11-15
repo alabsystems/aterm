@@ -15,6 +15,7 @@ pub mod heat;
 pub mod history;
 pub mod ink;
 pub mod jobs;
+pub mod lanes;
 pub mod left;
 pub mod model;
 pub mod peaks;

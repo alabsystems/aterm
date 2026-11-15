@@ -16,8 +16,8 @@
 
 use super::fold::{Inputs, Source};
 use super::read::{
-    AccountWord, AgentSeen, Answer, Answered, Harness, Latest, MachineSeen, Read, State, Tally,
-    Task,
+    Access, AccountWord, AgentSeen, Answer, Answered, Harness, Latest, Limits, Load, Look,
+    MachineSeen, OutSrc, Pressure, Read, State, Tally, Task, TurnFacts, WaitTally, Work, WorkTally,
 };
 use crate::alab::journal::event::{Event, SIGNIN_IN};
 use crate::alab::journal::seen::{Claimed, Seen, SignedIn};
@@ -117,6 +117,110 @@ struct Bound {
     label: String,
     uuid: [u8; 16],
     hex: String,
+}
+
+/// What agent `g` in `state` says of its turn; `older` for an aterm before the turn, which says
+/// nothing of it but its agent's own word: `busy` for a busy or stalled agent, a box (`prompt`)
+/// for every other waiting one.
+fn turn_of(g: usize, state: State, older: bool) -> TurnFacts {
+    let word_turn = matches!(state, State::Busy | State::Waiting | State::Stuck);
+    if older {
+        return TurnFacts {
+            word_turn,
+            ..TurnFacts::OLDER
+        };
+    }
+    let open = word_turn;
+    let ms = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    let transcript = !matches!(g % 8, 6 | 7);
+    TurnFacts {
+        turn_open: Some(open),
+        turn_age_ms: open.then(|| ms(g % 17) * 41_000),
+        turn_end_age_ms: (g % 9 != 0).then(|| ms(g % 23) * 97_000 + 5_000),
+        step_age_ms: (open && g % 3 == 0).then(|| ms(g % 29) * 61_000),
+        out_age_ms: (g % 11 != 5).then(|| ms(g % 19) * 53_000),
+        out_src: Some(if transcript {
+            OutSrc::Transcript
+        } else {
+            OutSrc::Screen
+        }),
+        bg: Some(u32::try_from(g % 3).unwrap_or(u32::MAX)),
+        older: false,
+        word_turn,
+    }
+}
+
+/// The look the fixture's `b`th bound machine sends, answering at about `now_ms`: a Mac or a
+/// Linux box of 8 to 24 cores, some of them at a limit, a few with figures their host does not
+/// read (no GPU, no link rate, no rate on a first look).
+fn look_of(b: u64, now_ms: u64) -> Look {
+    let linux = b % 9 == 4;
+    let cores = 8 + (b % 3) * 8;
+    let mem_total_mb = 16_384 << (b % 3);
+    let mem_used_mb = mem_total_mb * (40 + b * 7 % 55) / 100;
+    let busy = b * 13 % 100;
+    let rated = b % 11 != 10;
+    let up_for_ms = 3_600_000 * (b % 40 + 1);
+    Look {
+        age_ms: Some(b * 37 % 9_000),
+        cores: Some(cores),
+        load1_x100: Some(cores * busy * 6 / 5),
+        cpu_busy_x100: rated.then_some(cores * busy),
+        rate_win_ms: rated.then_some(60_000 + b * 101 % 9_000),
+        mem_total_mb: Some(mem_total_mb),
+        mem_used_mb: Some(mem_used_mb),
+        mem_avail_mb: Some(mem_total_mb - mem_used_mb),
+        // A Linux box here allocates no swap, so it has none in use.
+        swap_used_mb: Some(if linux { 0 } else { b * 97 % 2_048 }),
+        swap_total_mb: Some(if linux { 0 } else { 4_096 }),
+        disk_total_mb: Some(476_000 << (b % 2)),
+        gpu_cores: (!linux).then_some(10 + (b % 3) * 10),
+        gpu_busy_pct: (!linux).then_some(b * 29 % 101),
+        net_link_kbps: (b % 7 != 6).then_some(if b % 2 == 0 { 1_000_000 } else { 10_000_000 }),
+        net_rx_kbps: rated.then_some(b * 3_109 % 400_000),
+        net_tx_kbps: rated.then_some(b * 1_777 % 200_000),
+        net_other_kbps: rated.then_some(b * 31 % 900),
+        mem_pressure: Some(match b % 10 {
+            8 => Pressure::Warn,
+            9 => Pressure::Critical,
+            _ => Pressure::Normal,
+        }),
+        limits: Limits {
+            cpu: rated.then_some(busy >= 95 && cores * busy * 6 / 5 > cores * 100),
+            mem: Some(b % 10 >= 8),
+            disk: Some(b % 23 == 4),
+            gpu: (!linux).then_some(b * 29 % 101 >= 95),
+        },
+        // The dial's level is the busier engine, lifted by pressure; its over here is the
+        // floor, where the CPU is past its cores (at most 1.2 of them) or memory is critical.
+        load: rated.then(|| Load {
+            level_x100: busy
+                .max(if linux { 0 } else { b * 29 % 101 })
+                .max(match b % 10 {
+                    8 => 88,
+                    9 => 100,
+                    _ => 0,
+                }),
+            over_x100: Some(
+                if (busy >= 95 && cores * busy * 6 / 5 > cores * 100) || b % 10 == 9 {
+                    12
+                } else {
+                    0
+                },
+            ),
+        }),
+        up_since_own_ms: now_ms.checked_sub(up_for_ms),
+        up_for_ms: Some(up_for_ms),
+        os: Some(if linux { "linux" } else { "macos" }),
+        target: Some(
+            if linux {
+                "x86_64-unknown-linux-gnu"
+            } else {
+                "aarch64-apple-darwin"
+            }
+            .to_owned(),
+        ),
+    }
 }
 
 /// The fixture's inputs as of `now_ms` (Unix milliseconds).
@@ -378,6 +482,7 @@ pub fn inputs(now_ms: u64) -> Inputs {
         };
         answering += 1;
         let mut tally = Tally::default();
+        let mut work = WorkTally::default();
         let mut agents: Vec<AgentSeen> = Vec::new();
         for _ in 0..count {
             let g = session;
@@ -393,7 +498,11 @@ pub fn inputs(now_ms: u64) -> Inputs {
                 _ => State::Unknown,
             };
             tally.add(state);
+            let turn = turn_of(g, state, b % 6 == 5);
+            work.add(Work::of(state, &turn));
             let percent = |of: usize| u8::try_from(of % 101).ok();
+            // Counters only where its row sends a whole conversation's: one agent in five, none.
+            let tokens = (!turn.older && g % 5 != 2).then(|| span(g) * 41_000);
             agents.push(AgentSeen {
                 sid: format!("s{:06x}", 0x51_0000 + g * 0x1f3),
                 harness,
@@ -419,16 +528,54 @@ pub fn inputs(now_ms: u64) -> Inputs {
                     AccountWord::new(&account.address)
                 },
                 model: Some(model.to_owned()),
+                // One agent in nine is pinned; on an aterm before the pin nobody says.
+                pinned: (b % 6 != 5).then_some(g % 9 == 4),
+                turn,
+                tok_in: tokens,
+                tok_out: tokens.map(|tokens| tokens / 23),
+                tok_for_ms: tokens.map(|_| span(g) * 60_000),
+                turns: (!turn.older).then(|| u32::try_from(g % 40).unwrap_or(u32::MAX)),
+                tools: (!turn.older && harness != Harness::Agy && harness != Harness::Muse)
+                    .then(|| u32::try_from(g * 3 % 400).unwrap_or(u32::MAX)),
+                work: Work::of(state, &turn),
+                answer_at_ms: (b % 6 != 5).then(|| now_ms - 1_000 - span(b) * 7),
+                rate: None,
             });
         }
-        let answer = Answer::Answered(Answered {
+        // One machine in six runs an aterm before the look: it says nothing of its resources
+        // and nothing of its fleet access.
+        let older = b % 6 == 5;
+        let answer = Answer::Answered(Box::new(Answered {
             build: Some(if b % 3 == 0 { "0.141.0" } else { "0.140.0" }.to_owned()),
-            home_free_mb: (b % 6 != 5).then(|| 40_000 + span(b) * 9_000),
+            answer_at_ms: (!older).then(|| now_ms - 1_000 - span(b) * 7),
+            home_free_mb: (!older).then(|| 40_000 + span(b) * 9_000),
+            look: if older {
+                Look::UNREAD
+            } else {
+                look_of(span(b), now_ms)
+            },
+            access: (!older).then_some(match b % 4 {
+                0 => Access::Read,
+                1 => Access::Write,
+                _ => Access::Full,
+            }),
+            // This Mac's own answer reads no grant (`Answered::drive`).
+            drive: (!older && b != 0).then_some(b % 4 != 0),
             sessions: u32::try_from(count + b % 3).ok(),
             tally: (b % 10 != 9).then_some(tally),
+            work: (b % 10 != 9).then_some(work),
+            // One machine in seven has a build waiting for memory; one in fourteen of those
+            // did not read its claim.
+            wait: (!older).then(|| {
+                let mut wait = WaitTally::NONE;
+                if b % 7 == 2 {
+                    wait.add((b % 14 != 2).then(|| 6_144 + span(b) * 512));
+                }
+                wait
+            }),
             agents,
             agents_more: 0,
-        });
+        }));
         machines.push(if b == 0 {
             MachineSeen::own(header, answer)
         } else {
@@ -439,14 +586,20 @@ pub fn inputs(now_ms: u64) -> Inputs {
         "m300-spare.local",
         "m300-spare",
         Some(UNREGISTERED_LABEL),
-        Answer::Answered(Answered {
+        Answer::Answered(Box::new(Answered {
             build: Some("0.139.0".to_owned()),
+            answer_at_ms: None,
             home_free_mb: None,
+            look: Look::UNREAD,
+            access: None,
+            drive: None,
             sessions: Some(1),
             tally: Some(Tally::default()),
+            work: Some(WorkTally::default()),
+            wait: None,
             agents: Vec::new(),
             agents_more: 0,
-        }),
+        })),
     ));
     let latest = Latest::default().with(Read {
         read_at_ms,

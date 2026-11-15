@@ -485,6 +485,59 @@ fn automatic_failure_guidance_does_not_invent_a_human_step_or_expose_routes() {
     }
 }
 
+/// A ROW ON ITS VAULT TOKEN HAS NO RECOVERY STEP ON THE LAB PAGE: its stored login is signed out
+/// on record, and its automatic sign-in met its page, which left a renewal task; then the upkeep
+/// read its year token in use here. It runs on that token, and renewal is off for it, so the page
+/// names no recovery or renewal step and says what it runs on, as the report and the account card
+/// do. NEGATIVE CONTROL: with no reading the task's step stands. Before the page read the reading,
+/// it said both that the row needed `accounts renew` and that its token was in use.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_row_on_its_vault_token_has_no_recovery_step() {
+    let mut records = records();
+    records.state.accounts.insert(
+        "one".into(),
+        accounts::Account {
+            auth: Auth::SignedOut,
+            auth_at: Some(100),
+            ..Default::default()
+        },
+    );
+    admitted_observation(&mut records, |logins| {
+        accounts::note_sign_in_task(logins, "one", SignInAction::Renew, 110);
+        accounts::note_sign_in_attempt(logins, "one", AttemptOutcome::Blocked, "profile", 120)
+    });
+    let now_ms = 200_000;
+    let view = project(&records, now_ms);
+    assert_eq!(
+        fact(&view, "Next step"),
+        SignInAction::Renew.next_step(Cli::Claude, "one"),
+        "CONTROL: with no reading, the task's step"
+    );
+    assert!(view.rows[0].facts.iter().all(|(key, _)| key != "Runs on"));
+
+    let until = 200 + 86_400;
+    records.state.tokens_here = Some(accounts::TokensHere {
+        read_at: 150,
+        ends: [("one".to_owned(), until)].into(),
+    });
+    let view = project(&records, now_ms);
+    assert!(
+        view.rows[0].facts.iter().all(|(key, _)| key != "Next step"),
+        "{view:?}"
+    );
+    assert_eq!(
+        fact(&view, "Runs on"),
+        format!(
+            "Its vault year token here until {}; renewal is off for it",
+            recorded_time(Some(until))
+        )
+    );
+}
+
 #[test]
 fn a_successful_past_attempt_is_not_a_current_login_or_quota_reading() {
     let mut records = records();
@@ -791,6 +844,8 @@ fn a_row_shows_what_the_lab_journal_says_of_its_account() {
                 }),
                 read: Some((140, "m17".into(), "statusline".into())),
                 wall_until: None,
+                reader: None,
+                wall_by: None,
             }],
             history: Vec::new(),
         },
@@ -869,10 +924,13 @@ fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
         }),
         read: Some((200, "m17".into(), "statusline".into())),
         wall_until,
+        reader: None,
+        wall_by: None,
     };
     let mut future_read = window("credits", None, Some(None));
     future_read.read = Some((350, "m17".into(), "statusline".into()));
     let seen = alab_seen::Seen {
+        me: Default::default(),
         at: 200,
         accounts: [(
             JOURNAL_ACCOUNT.into(),

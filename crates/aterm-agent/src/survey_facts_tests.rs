@@ -74,7 +74,9 @@ fn sample_facts() -> SwarmSurveyFacts {
             at: 1_793_159_995,
         }],
         home: Some("/Users//a yates".to_owned()),
+        home_dir: None,
         home_free_mb: Some(812_345),
+        machine: Some(sample_machine()),
         repos: Some(HomeRepos {
             read_ms: 1_793_159_000_000,
             repos: vec![
@@ -103,6 +105,627 @@ fn sample_facts() -> SwarmSurveyFacts {
         }),
         update: None,
     }
+}
+
+/// A machine that read every figure, each a different value, so a key read into another's
+/// field shows; its free space is [`sample_facts`]' `home_free_mb`.
+fn sample_machine() -> MachineFacts {
+    MachineFacts {
+        look: MachineLook {
+            at_unix_ms: Some(1_793_159_998_500),
+            cores: Some(12),
+            load_x100: Some([345, 280, 199]),
+            cpu_busy_x100: Some(1130),
+            rate_win_ms: Some(60_250),
+            mem_total_mb: Some(65_536),
+            mem_used_mb: Some(40_100),
+            mem_avail_mb: Some(21_900),
+            mem_pressure: Some(MemoryLevel::Warn),
+            mem_psi60_x100: Some(1234),
+            swap_used_mb: Some(2048),
+            swap_total_mb: Some(4096),
+            disk_total_mb: Some(1_907_000),
+            disk_free_mb: Some(812_345),
+            gpu_cores: Some(30),
+            gpu_busy_pct: Some(97),
+            net_link_kbps: Some(1_000_000),
+            net_rx_kbps: Some(5120),
+            net_tx_kbps: Some(640),
+            net_other_kbps: Some(17),
+            limits: Limits {
+                cpu: Some(false),
+                mem: Some(true),
+                disk: Some(false),
+                gpu: Some(true),
+            },
+            load: Some(LoadScore {
+                level_x100: 88,
+                over_x100: Some(21),
+            }),
+        },
+        up_since_ms: Some(1_793_100_000_000),
+        os: Some("macos"),
+        target: Some("aarch64-apple-darwin".to_owned()),
+    }
+}
+
+/// [`sample_machine`]'s header tokens, in wire order.
+const SAMPLE_MACHINE_TOKENS: &str = " os=macos target=aarch64-apple-darwin \
+     m_at_ms=1793159998500 cores=12 load1_x100=345 load5_x100=280 load15_x100=199 \
+     cpu_busy_x100=1130 rate_win_ms=60250 mem_total_mb=65536 mem_used_mb=40100 \
+     mem_avail_mb=21900 mem_pressure=warn mem_psi60_x100=1234 swap_used_mb=2048 \
+     swap_total_mb=4096 home_total_mb=1907000 gpu_cores=30 gpu_busy_pct=97 \
+     net_link_kbps=1000000 net_rx_kbps=5120 net_tx_kbps=640 net_other_kbps=17 \
+     up_since_ms=1793100000000 cpu_lim=0 mem_lim=1 disk_lim=0 gpu_lim=1 load=88:21";
+
+/// What a machine's facts read with one key of the look unsent or unreadable: that figure
+/// unread and every other as it was. `m_at_ms` is not among them: its absence is an older
+/// member's header, its damage a look with no time.
+type Unread = fn(&mut MachineFacts);
+const LOOK_KEYS: [(&str, Unread); 28] = [
+    ("os", |m| m.os = None),
+    ("target", |m| m.target = None),
+    ("cores", |m| m.look.cores = None),
+    ("load1_x100", |m| m.look.load_x100 = None),
+    ("load5_x100", |m| m.look.load_x100 = None),
+    ("load15_x100", |m| m.look.load_x100 = None),
+    ("cpu_busy_x100", |m| m.look.cpu_busy_x100 = None),
+    ("rate_win_ms", |m| m.look.rate_win_ms = None),
+    ("mem_total_mb", |m| m.look.mem_total_mb = None),
+    ("mem_used_mb", |m| m.look.mem_used_mb = None),
+    ("mem_avail_mb", |m| m.look.mem_avail_mb = None),
+    ("mem_pressure", |m| m.look.mem_pressure = None),
+    ("mem_psi60_x100", |m| m.look.mem_psi60_x100 = None),
+    ("swap_used_mb", |m| m.look.swap_used_mb = None),
+    ("swap_total_mb", |m| m.look.swap_total_mb = None),
+    ("home_total_mb", |m| m.look.disk_total_mb = None),
+    ("gpu_cores", |m| m.look.gpu_cores = None),
+    ("gpu_busy_pct", |m| m.look.gpu_busy_pct = None),
+    ("net_link_kbps", |m| m.look.net_link_kbps = None),
+    ("net_rx_kbps", |m| m.look.net_rx_kbps = None),
+    ("net_tx_kbps", |m| m.look.net_tx_kbps = None),
+    ("net_other_kbps", |m| m.look.net_other_kbps = None),
+    ("up_since_ms", |m| m.up_since_ms = None),
+    ("cpu_lim", |m| m.look.limits.cpu = None),
+    ("mem_lim", |m| m.look.limits.mem = None),
+    ("disk_lim", |m| m.look.limits.disk = None),
+    ("gpu_lim", |m| m.look.limits.gpu = None),
+    ("load", |m| m.look.load = None),
+];
+
+/// The sample's facts reply and, of its header, the token that carries `key`.
+fn sample_wire() -> String {
+    sample_facts().to_survey_reply(
+        4242,
+        Some("m22.local"),
+        1_793_160_000_000,
+        1,
+        (aterm_types::fleet_access::FleetAccess::Full, true),
+    )
+}
+
+fn sample_token(key: &str) -> String {
+    SAMPLE_MACHINE_TOKENS
+        .split(' ')
+        .find(|token| token.split_once('=').is_some_and(|(k, _)| k == key))
+        .map(|token| format!(" {token}"))
+        .unwrap_or_else(|| panic!("the sample sends {key}"))
+}
+
+/// A MACHINE'S LOOK CROSSES THE WIRE: the header carries every key after `home_free_mb=`, at
+/// facts as at content (a resource is no location), still ends with its access and drive words,
+/// and reads back figure for figure. An older member's header, which has none of the keys,
+/// reads as no look at all, and one key left out reads as that figure unread with the rest as
+/// they were.
+/// NEGATIVE CONTROL (2026-11-12): with a missing key read as 0, the older member's look reads
+/// as a machine with no cores and no memory, and each one-key case fails on its figure.
+#[test]
+fn a_machines_look_crosses_the_wire_and_an_older_member_sends_none() {
+    let facts = sample_facts();
+    let machine = facts.machine.clone().expect("the sample carries a look");
+    assert_eq!(machine.header_tokens(), SAMPLE_MACHINE_TOKENS);
+    assert_eq!(facts.machine_tokens(), SAMPLE_MACHINE_TOKENS);
+    let wire = sample_wire();
+    let head = wire.lines().nth(1).expect("the instance line");
+    assert!(
+        head.contains(&format!(
+            " home_free_mb=812345{SAMPLE_MACHINE_TOKENS} accounts=3 "
+        )),
+        "{head}"
+    );
+    assert!(
+        head.ends_with(" roster_unread=0 access=full drive=1"),
+        "{head}"
+    );
+    let parsed = SwarmSurveyFacts::from_survey_reply(&wire).expect("valid");
+    assert_eq!(parsed.machine.as_ref(), Some(&machine));
+    assert_eq!(parsed.home_free_mb, Some(812_345));
+
+    let content = facts.to_survey_reply_at(
+        true,
+        4242,
+        None,
+        1_793_160_000_000,
+        1,
+        (aterm_types::fleet_access::FleetAccess::ReadOnly, false),
+    );
+    let head = content.lines().nth(1).expect("the instance line");
+    assert!(
+        head.contains(&format!(
+            " home_free_mb=812345{SAMPLE_MACHINE_TOKENS} home=/Users//a%20yates "
+        )),
+        "{head}"
+    );
+    assert!(head.ends_with(" access=read"), "{head}");
+
+    let older = wire.replacen(SAMPLE_MACHINE_TOKENS, "", 1);
+    assert_ne!(older, wire);
+    let parsed = SwarmSurveyFacts::from_survey_reply(&older).expect("an older aterm's");
+    assert_eq!(parsed.machine, None, "no look, never a look of zeros");
+    assert_eq!(
+        parsed,
+        SwarmSurveyFacts {
+            machine: None,
+            home: None,
+            repos: None,
+            ..facts.clone()
+        },
+        "and the rest as it sent it, its free space among it"
+    );
+    let no_look = SwarmSurveyFacts {
+        machine: None,
+        ..facts.clone()
+    };
+    assert_eq!(no_look.machine_tokens(), "");
+    assert_eq!(
+        no_look.to_survey_reply(
+            4242,
+            Some("m22.local"),
+            1_793_160_000_000,
+            1,
+            (aterm_types::fleet_access::FleetAccess::Full, true),
+        ),
+        older,
+        "facts with no look say none of its keys"
+    );
+
+    for (key, unread) in LOOK_KEYS {
+        let without = wire.replacen(&sample_token(key), "", 1);
+        assert_ne!(without, wire, "{key}");
+        let mut expected = machine.clone();
+        unread(&mut expected);
+        assert_ne!(expected, machine, "{key}: the sample reads it");
+        assert_eq!(
+            SwarmSurveyFacts::from_survey_reply(&without)
+                .unwrap_or_else(|why| panic!("{key}: {why}"))
+                .machine,
+            Some(expected),
+            "{key}"
+        );
+    }
+    // The free space is the header's own older key: without it the look has none.
+    let parsed = SwarmSurveyFacts::from_survey_reply(&wire.replacen(" home_free_mb=812345", "", 1))
+        .expect("valid");
+    assert_eq!(
+        parsed.machine,
+        Some(MachineFacts {
+            look: MachineLook {
+                disk_free_mb: None,
+                ..machine.look.clone()
+            },
+            ..machine.clone()
+        })
+    );
+}
+
+/// AN UNREAD FIGURE IS A DASH ON THE WIRE: a look that read nothing says `-` under every key
+/// and reads back as a look that read nothing, and a verdict of "within its limit" (`0`) is
+/// not that dash. The up-since instant of an OS that says none is unread, never the epoch.
+/// NEGATIVE CONTROL (2026-11-12): with a token written through `unwrap_or(0)`, its key says
+/// `=0` here.
+#[test]
+fn an_unread_figure_is_a_dash_on_the_wire() {
+    let unread = MachineFacts {
+        look: MachineLook::UNREAD,
+        up_since_ms: None,
+        os: None,
+        target: None,
+    };
+    let tokens = unread.header_tokens();
+    let said: Vec<(&str, &str)> = tokens
+        .split(' ')
+        .filter_map(|token| token.split_once('='))
+        .collect();
+    assert_eq!(
+        said.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+        SAMPLE_MACHINE_TOKENS
+            .split(' ')
+            .filter_map(|token| Some(token.split_once('=')?.0))
+            .collect::<Vec<_>>(),
+        "every key, in the sample's order"
+    );
+    for (key, value) in said {
+        assert_eq!(value, "-", "{key}");
+    }
+    let facts = SwarmSurveyFacts {
+        machine: Some(unread.clone()),
+        home_free_mb: None,
+        ..sample_facts()
+    };
+    let wire = facts.to_survey_reply(
+        1,
+        None,
+        0,
+        1,
+        (aterm_types::fleet_access::FleetAccess::ReadOnly, false),
+    );
+    assert!(wire.contains(" home_free_mb=- os=- "), "{wire}");
+    assert_eq!(
+        SwarmSurveyFacts::from_survey_reply(&wire)
+            .expect("valid")
+            .machine,
+        Some(unread),
+        "a look that read nothing, not no look"
+    );
+
+    let within = MachineFacts {
+        look: MachineLook {
+            limits: Limits {
+                cpu: Some(false),
+                mem: Some(false),
+                disk: Some(false),
+                gpu: Some(false),
+            },
+            gpu_busy_pct: Some(0),
+            net_other_kbps: Some(0),
+            ..MachineLook::UNREAD
+        },
+        up_since_ms: None,
+        os: None,
+        target: None,
+    };
+    let tokens = within.header_tokens();
+    for token in [
+        " cpu_lim=0 mem_lim=0 disk_lim=0 gpu_lim=0",
+        " gpu_busy_pct=0 ",
+        " net_other_kbps=0 ",
+    ] {
+        assert!(tokens.contains(token), "a read zero is said: {tokens}");
+    }
+    assert_eq!(up_since_ms(0), None);
+    assert_eq!(up_since_ms(1_793_100_000), Some(1_793_100_000_000));
+    assert_eq!(up_since_ms(u64::MAX), None, "no wrapped instant");
+}
+
+/// A MALFORMED MACHINE FIGURE IS UNREAD AND THE REPLY STILL PARSES: a key whose value is not a
+/// whole number in its range, or not a word of its closed set, reads as that one figure unread;
+/// the look's other figures, the accounts and the rest of the reply read as they were sent. A
+/// reader that uses none of these figures does not lose the machine to one of them.
+/// CONTROL: the same damage to `home_free_mb`, an older key, still refuses the reply.
+/// NEGATIVE CONTROL (2026-11-12): with a new key parsed by `?`, each case is an `Err`.
+#[test]
+fn a_malformed_machine_figure_is_unread_and_the_reply_still_parses() {
+    let facts = sample_facts();
+    let machine = facts.machine.clone().expect("the sample carries a look");
+    let wire = sample_wire();
+    let read = |wire: &str, why: &str| {
+        SwarmSurveyFacts::from_survey_reply(wire).unwrap_or_else(|err| panic!("{why}: {err}"))
+    };
+    let rest = SwarmSurveyFacts {
+        home: None,
+        repos: None,
+        ..facts.clone()
+    };
+    for (key, unread) in LOOK_KEYS {
+        let mut expected = machine.clone();
+        unread(&mut expected);
+        for bad in [
+            "x",
+            "",
+            "-1",
+            "+3",
+            "1.5",
+            "0x10",
+            "1e3",
+            "99999999999999999999999",
+            "%20",
+        ] {
+            if (key, bad) == ("target", "x") {
+                // One lowercase word has a target's shape; the cases below damage it.
+                continue;
+            }
+            let broken = wire.replacen(&sample_token(key), &format!(" {key}={bad}"), 1);
+            assert_ne!(broken, wire, "{key}={bad}");
+            assert_eq!(
+                read(&broken, &format!("{key}={bad}")),
+                SwarmSurveyFacts {
+                    machine: Some(expected.clone()),
+                    ..rest.clone()
+                },
+                "{key}={bad}"
+            );
+        }
+    }
+    // Its own time damaged: a look with no time, never no look and never time 0.
+    let timeless = wire.replacen(&sample_token("m_at_ms"), " m_at_ms=soon", 1);
+    assert_eq!(
+        read(&timeless, "m_at_ms").machine,
+        Some(MachineFacts {
+            look: MachineLook {
+                at_unix_ms: None,
+                ..machine.look.clone()
+            },
+            ..machine.clone()
+        })
+    );
+    // In range for a number and out of range for its figure.
+    let long_target = format!("a{}", "b".repeat(48));
+    let ranged: [(&str, &str, Unread); 12] = [
+        ("cores", "0", |m| m.look.cores = None),
+        ("cores", "4294967296", |m| m.look.cores = None),
+        ("mem_total_mb", "0", |m| m.look.mem_total_mb = None),
+        ("home_total_mb", "0", |m| m.look.disk_total_mb = None),
+        ("gpu_busy_pct", "101", |m| m.look.gpu_busy_pct = None),
+        ("gpu_busy_pct", "256", |m| m.look.gpu_busy_pct = None),
+        ("mem_pressure", "urgent", |m| m.look.mem_pressure = None),
+        ("cpu_lim", "2", |m| m.look.limits.cpu = None),
+        ("up_since_ms", "0", |m| m.up_since_ms = None),
+        ("os", "plan9", |m| m.os = None),
+        ("target", &long_target, |m| m.target = None),
+        ("load", "101:0", |m| m.look.load = None),
+    ];
+    for (key, bad, unread) in ranged {
+        let mut expected = machine.clone();
+        unread(&mut expected);
+        let broken = wire.replacen(&sample_token(key), &format!(" {key}={bad}"), 1);
+        assert_eq!(read(&broken, key).machine, Some(expected), "{key}={bad}");
+    }
+    for words in ["a%20b", "Aarch64-apple-darwin", "9front", "a/b"] {
+        let broken = wire.replacen(&sample_token("target"), &format!(" target={words}"), 1);
+        assert_eq!(
+            read(&broken, words).machine.and_then(|m| m.target),
+            None,
+            "{words}"
+        );
+    }
+    // A target this build does not know is a newer aterm's, and reads.
+    let newer = wire.replacen(
+        &sample_token("target"),
+        " target=riscv64gc-unknown-linux-gnu",
+        1,
+    );
+    assert_eq!(
+        read(&newer, "a newer target")
+            .machine
+            .and_then(|m| m.target)
+            .as_deref(),
+        Some("riscv64gc-unknown-linux-gnu")
+    );
+    assert!(
+        SwarmSurveyFacts::from_survey_reply(&wire.replacen(
+            " home_free_mb=812345",
+            " home_free_mb=x",
+            1
+        ))
+        .is_err(),
+        "CONTROL: an older key keeps its rule"
+    );
+}
+
+/// THE LOAD SCORE CROSSES THE WIRE: the deck dial's level and over, in hundredths, go as one
+/// `load=<level>:<over>` with the machine's other keys, after its four verdicts and before the
+/// header's `access=`, and read back equal: the sample's, both ends of the range, a machine at
+/// rest (a read `0:0`) and one whose over is unread (`<level>:-`, never `<level>:0`).
+/// NEGATIVE CONTROL (2026-11-13): with the two parts read back in each other's place, or the
+/// key left unread by the parser, the score does not read back equal.
+#[test]
+fn the_load_score_crosses_the_wire_and_reads_back_equal() {
+    let wire = sample_wire();
+    let head = wire.lines().nth(1).expect("the instance line");
+    assert!(head.contains(" gpu_lim=1 load=88:21 accounts=3 "), "{head}");
+    assert!(head.ends_with(" access=full drive=1"), "{head}");
+    for (level_x100, over_x100, said) in [
+        (88, Some(21), "88:21"),
+        (0, Some(0), "0:0"),
+        (100, Some(100), "100:100"),
+        (100, Some(12), "100:12"),
+        (7, Some(0), "7:0"),
+        (100, None, "100:-"),
+    ] {
+        let load = Some(LoadScore {
+            level_x100,
+            over_x100,
+        });
+        let mut facts = sample_facts();
+        facts.machine.as_mut().expect("a look").look.load = load;
+        let wire = facts.to_survey_reply(
+            4242,
+            Some("m22.local"),
+            1_793_160_000_000,
+            1,
+            (aterm_types::fleet_access::FleetAccess::ReadOnly, false),
+        );
+        assert!(wire.contains(&format!(" load={said} ")), "{wire}");
+        let parsed = SwarmSurveyFacts::from_survey_reply(&wire).expect("valid");
+        assert_eq!(parsed.machine.map(|m| m.look.load), Some(load));
+    }
+}
+
+/// AN UNREAD LOAD LEVEL IS A DASH AND READS BACK UNREAD: a machine whose dial has no level (its
+/// CPU's busy share unread) says `load=-`, never `load=0:0`, and a reader reads it as no score,
+/// beside the figures that were read. CONTROL: a machine at rest says `load=0:0`, a score.
+/// NEGATIVE CONTROL (2026-11-13): with a writer that prints `0:0` for an unread score, the
+/// header says `load=0:0` and reads back as a machine at rest.
+#[test]
+fn an_unread_load_level_is_a_dash_and_reads_back_unread() {
+    let mut facts = sample_facts();
+    facts.machine.as_mut().expect("a look").look.load = None;
+    let wire = facts.to_survey_reply(
+        4242,
+        Some("m22.local"),
+        1_793_160_000_000,
+        1,
+        (aterm_types::fleet_access::FleetAccess::Full, true),
+    );
+    let head = wire.lines().nth(1).expect("the instance line");
+    assert!(head.contains(" gpu_lim=1 load=- accounts=3 "), "{head}");
+    let parsed = SwarmSurveyFacts::from_survey_reply(&wire).expect("valid");
+    let machine = parsed.machine.expect("a look");
+    assert_eq!(machine.look.load, None, "unread, never 0");
+    assert_eq!(machine, facts.machine.clone().expect("a look"));
+
+    let at_rest = Some(LoadScore {
+        level_x100: 0,
+        over_x100: Some(0),
+    });
+    facts.machine.as_mut().expect("a look").look.load = at_rest;
+    let tokens = facts.machine_tokens();
+    assert!(tokens.ends_with(" load=0:0"), "CONTROL: {tokens}");
+}
+
+/// A MALFORMED LOAD READS UNREAD AND THE REST STILL READS: `load=x:y`, one part alone, a third
+/// part, a part past 100, a sign or a decimal is no score, while the machine's verdicts (its
+/// `cpu_lim` among them), its other figures and the rest of the reply read as they were sent.
+/// NEGATIVE CONTROLS (2026-11-13): with a malformed part read as 0 the score reads; with a
+/// malformed score failing the machine's look, `cpu_lim` reads nothing.
+#[test]
+fn a_malformed_load_reads_unread_while_cpu_lim_still_reads() {
+    let facts = sample_facts();
+    let mut expected = facts.machine.clone().expect("a look");
+    expected.look.load = None;
+    let wire = sample_wire();
+    for bad in [
+        "x:y", "x:21", "88:y", "88", "88:", ":21", ":", "88:21:3", "101:21", "88:101", "-:21",
+        "-:-", "88:--", "+8:21", "8.5:21", "300:0",
+    ] {
+        let broken = wire.replacen(" load=88:21", &format!(" load={bad}"), 1);
+        assert_ne!(broken, wire, "{bad}");
+        let parsed = SwarmSurveyFacts::from_survey_reply(&broken)
+            .unwrap_or_else(|why| panic!("{bad}: {why}"));
+        let machine = parsed.machine.as_ref().expect("a look");
+        assert_eq!(machine.look.load, None, "{bad}");
+        assert_eq!(machine.look.limits.cpu, Some(false), "{bad}: cpu_lim reads");
+        assert_eq!(machine, &expected, "{bad}");
+        assert_eq!(parsed.accounts, facts.accounts, "{bad}");
+    }
+}
+
+/// THIS MACHINE SAYS ITS OWN LOOK, AND ONLY IN AN ANSWER: the look carries the OS, the target
+/// atpkg selects by and the up-since instant. Collected facts carry none (the 3-minute facts
+/// push sends them as collected, and a look is taken only inside an answer), with the one
+/// volume read they always made; an answer takes the look, and the free space is then the
+/// look's own, of the volume holding the home the facts were collected for, read from its path
+/// even where the path is no UTF-8 that `home` could spell. Facts a listener kept take the look
+/// again. CONTROL: facts with no home read no volume.
+#[test]
+fn only_an_answer_takes_this_machines_look_and_it_reads_the_homes_volume() {
+    let now = MachineFacts::now(None);
+    assert_eq!(now.os, aterm_types::look_words::os_of(std::env::consts::OS));
+    if cfg!(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows"
+    )) {
+        assert!(now.os.is_some());
+        let target = now.target.as_deref().expect("a target atpkg knows");
+        assert!(atpkg::TARGETS.contains(&target), "{target}");
+    }
+    assert!(now.look.cores.is_some(), "{now:?}");
+    assert_eq!(
+        (now.look.disk_total_mb, now.look.disk_free_mb),
+        (None, None),
+        "no home, no volume read"
+    );
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        let up = now.up_since_ms.expect("the OS says since when it is up");
+        let at = now.look.at_unix_ms.expect("a clock after the epoch");
+        assert!(up < at, "up since {up}, looked at {at}");
+    }
+
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let facts =
+        SwarmSurveyFacts::collect_at(&state, Some(&home), None, 0, false, None, 1_793_160_000);
+    assert_eq!(facts.machine, None, "collected facts take no look");
+    assert!(
+        facts.home_free_mb.is_some(),
+        "the one volume read collected facts make"
+    );
+    assert_eq!(facts.home_dir.as_deref(), Some(home.as_path()));
+    assert!(
+        !facts
+            .to_survey_reply(
+                1,
+                Some("m22.local"),
+                1_793_160_000_000,
+                1,
+                (aterm_types::fleet_access::FleetAccess::ReadOnly, false)
+            )
+            .contains(" m_at_ms="),
+        "the push sends no look"
+    );
+    let mut answered = facts.clone();
+    answered.take_latest_look();
+    let machine = answered.machine.clone().expect("an answer takes a look");
+    assert!(machine.look.disk_total_mb.is_some(), "{machine:?}");
+    assert_eq!(answered.home_free_mb, machine.look.disk_free_mb);
+
+    let mut kept = SwarmSurveyFacts {
+        machine: Some(MachineFacts {
+            look: MachineLook {
+                at_unix_ms: Some(1),
+                cores: Some(4096),
+                ..MachineLook::UNREAD
+            },
+            ..sample_machine()
+        }),
+        home_free_mb: Some(7),
+        ..facts.clone()
+    };
+    kept.take_latest_look();
+    let taken = kept.machine.clone().expect("a look");
+    assert!(
+        taken.look.at_unix_ms >= machine.look.at_unix_ms,
+        "{taken:?}"
+    );
+    assert_eq!(taken.look.cores, machine.look.cores);
+    assert_eq!(taken.target, machine.target);
+    assert_eq!(kept.home_free_mb, taken.look.disk_free_mb);
+    assert!(taken.look.disk_total_mb.is_some(), "the kept home's volume");
+
+    // A home whose path is no UTF-8 has no `home` words; its volume is read from its path.
+    let mut unspelled = SwarmSurveyFacts {
+        home: None,
+        home_free_mb: Some(7),
+        ..facts.clone()
+    };
+    unspelled.take_latest_look();
+    let look = unspelled.machine.clone().expect("a look").look;
+    assert!(look.disk_total_mb.is_some(), "{look:?}");
+    assert_eq!(unspelled.home_free_mb, look.disk_free_mb);
+    unspelled.take_latest_look();
+    assert_eq!(
+        unspelled.machine.map(|m| m.look),
+        Some(look),
+        "asked again within the keep, the one kept look"
+    );
+
+    let mut homeless = SwarmSurveyFacts {
+        home: None,
+        home_dir: None,
+        home_free_mb: Some(7),
+        ..facts
+    };
+    homeless.take_latest_look();
+    let look = homeless.machine.expect("a look").look;
+    assert_eq!(
+        (look.disk_total_mb, homeless.home_free_mb),
+        (None, None),
+        "CONTROL: no home, no volume"
+    );
 }
 
 /// THE HOME'S CHECKOUTS CROSS THE WIRE AT CONTENT AND ARE READ BACK: `home=`,
@@ -268,6 +891,19 @@ fn facts_round_trip_and_missing_field_negative_controls() {
     );
     let parsed = SwarmSurveyFacts::from_survey_reply(&content).expect("valid C16 wire reply");
     assert_eq!(parsed, expected);
+    // Every key the look writes is read back into its own figure: the sample leaves none
+    // unread and no two alike, so a key written and not read (or read into another's field)
+    // differs here.
+    let machine = expected
+        .machine
+        .as_ref()
+        .expect("the sample carries a look");
+    assert_eq!(parsed.machine.as_ref(), Some(machine));
+    for (key, forget) in LOOK_KEYS {
+        let mut without = machine.clone();
+        forget(&mut without);
+        assert_ne!(&without, machine, "{key}: the sample holds a figure for it");
+    }
     let wire = expected.to_survey_reply(
         4242,
         Some("m22.local"),
@@ -930,6 +1566,23 @@ fn resolve_machine_label_enforces_roster_deny_lists_and_rejects_non_canonical_va
         1_793_160_000,
     );
     assert_eq!(facts_denied.label, None);
+    // R38: the release lease's checked form refuses an unnamed Mac at once, saying why.
+    let at_once = std::time::Instant::now();
+    let unnamed = super::machine_label_within(
+        &super::env_at(&state, Some(&home), Some(&config), 1_793_160_000),
+        super::RELEASE_ROSTER_WAIT,
+    );
+    assert!(
+        matches!(
+            unnamed,
+            Err(super::NoLabel::Denied | super::NoLabel::Unnamed)
+        ),
+        "{unnamed:?}"
+    );
+    assert!(
+        at_once.elapsed() < std::time::Duration::from_secs(5),
+        "no wait for an answer"
+    );
 
     // 2. When this recipient IS in the roster with a denied node_key, even a valid `[swarm] label = "m100"`
     //    in `aterm.toml` is rejected.
@@ -971,6 +1624,24 @@ fn resolve_machine_label_enforces_roster_deny_lists_and_rejects_non_canonical_va
         1_793_160_000,
     );
     assert_eq!(facts_denied_node.label, None);
+    // R38 NEGATIVE CONTROL: a denied recipient is still refused at once under the release's wait.
+    let at_once = std::time::Instant::now();
+    let denied = super::machine_label_within(
+        &super::env_at(&state, Some(&home), Some(&config), 1_793_160_000),
+        super::RELEASE_ROSTER_WAIT,
+    );
+    assert_eq!(denied, Err(super::NoLabel::Denied));
+    assert!(
+        at_once.elapsed() < std::time::Duration::from_secs(5),
+        "no wait for a denial"
+    );
+    assert!(
+        denied
+            .unwrap_err()
+            .to_string()
+            .contains("denies this Mac's vault recipient"),
+        "the lease says why"
+    );
 
     // 3. Once the node_key is not denied, `m100` resolves cleanly even without `aterm.toml`.
     let _ = std::fs::remove_file(&config);
@@ -1009,7 +1680,28 @@ fn resolve_machine_label_enforces_roster_deny_lists_and_rejects_non_canonical_va
             .unwrap()
             .roster_unread
     );
-    drop(writer);
+    // R38: a writer held past a wait reads as unread with its reason and the wait, never as "no
+    // label"; under the release's wait the same writer, released after 800 ms, is waited out.
+    // Before, the lease read through the survey's 250 ms and ended the release on this writer.
+    let env = super::env_at(&state, Some(&home), None, 1_793_160_000);
+    let short = std::time::Duration::from_millis(300);
+    match super::machine_label_within(&env, short) {
+        Err(super::NoLabel::Unread { why, waited }) => {
+            assert_eq!(waited, short);
+            assert!(why.contains("busy"), "{why}");
+        }
+        other => panic!("a writer held past the wait is an unread roster, not {other:?}"),
+    }
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        drop(writer);
+    });
+    assert_eq!(
+        super::machine_label_within(&env, super::RELEASE_ROSTER_WAIT).as_deref(),
+        Ok("m100"),
+        "the release waits a vault writer out"
+    );
+    release.join().unwrap();
     let parsed = SwarmSurveyFacts::from_survey_reply(
         "OK 1\ninstance version=0.148.0 sessions=0 window=0 window_last=- label=- ssh_host_key=- accounts_unread=claude,%20codex%20,\n",
     )

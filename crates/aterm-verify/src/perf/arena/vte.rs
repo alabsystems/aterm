@@ -332,12 +332,12 @@ pub(crate) fn build_vtebench(vte_dir: &Path) -> Result<PathBuf, Halt> {
         "--message-format=json-render-diagnostics",
     ];
     eprintln!("  building pinned vtebench in {}", vte_dir.display());
-    let built = driver
-        .command("build")
+    let mut build_command = driver.command("build");
+    build_command
         .args(build_args)
         .current_dir(vte_dir)
-        .stderr(Stdio::inherit())
-        .output()
+        .stderr(Stdio::inherit());
+    let built = crate::perf::driver::compiler_output(&mut build_command)
         .map_err(|e| format!("could not build vtebench: {e}"))?;
     if !built.status.success() {
         return Err(Halt::Fail(format!(

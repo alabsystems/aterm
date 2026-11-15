@@ -4,8 +4,6 @@
 //! The deployer's service-account key and the OAuth2 JWT-bearer assertion (RFC 7523) it
 //! signs: RS256 over the key's PKCS#8 RSA private key, with ring.
 
-use std::path::Path;
-
 use aterm_uds::secret::Secret;
 use serde::Deserialize;
 
@@ -71,25 +69,10 @@ fn base64url(bytes: &[u8]) -> Result<String, String> {
 }
 
 impl Key {
-    /// The key at `path`: its bytes read once, held as a [`Secret`], and parsed.
-    /// # Errors
-    /// A file that cannot be read, or one that is not a service-account key with an RSA
-    /// PKCS#8 private key; each said by the path and the field, never by a byte of the key.
-    pub fn read(path: &Path) -> Result<Key, String> {
-        let bytes = crate::durable::read_regular_bytes(path, 256 * 1024)
-            .map(Secret::from_vec)
-            .map_err(|e| {
-                format!(
-                    "cannot read the service-account key {}: {e}",
-                    path.display()
-                )
-            })?;
-        Self::parse(&bytes).map_err(|why| format!("{}: {why}", path.display()))
-    }
-
     /// `bytes`, a service-account JSON key.
     /// # Errors
-    /// As [`Key::read`].
+    /// Bytes that are not a service-account key with an RSA PKCS#8 private key; each said by
+    /// the field, never by a byte of the key.
     pub fn parse(bytes: &Secret) -> Result<Key, String> {
         let fields: Fields = aterm_json::from_slice(bytes.expose())
             .map_err(|_| "not a service-account key (it is not JSON of the expected shape)")?;

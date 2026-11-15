@@ -20,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use alab_policy::words::RULE_CONTINUE;
 use aterm_agent::harness::align::Captured;
 #[cfg(unix)]
 use aterm_agent::harness::cli::{AccountsCmd, Env, run_accounts};
@@ -37,8 +38,8 @@ use aterm_agent::supervise::policy::login::{
 use aterm_agent::supervise::policy::notice::LOGIN_BACK_DIALOG;
 use aterm_agent::supervise::policy::outlook::ExceptionKind;
 use aterm_agent::supervise::policy::turn_end::{
-    AccountAdvice, AccountAt, Composer, RULE_CONTINUE, RULE_LOGIN, RULE_LOGIN_BACK, Restart,
-    TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end,
+    AccountAdvice, AccountAt, Composer, RULE_LOGIN, RULE_LOGIN_BACK, Restart, TurnEndAction,
+    TurnEndReading, TurnEndState, decide_turn_end,
 };
 use aterm_json::Value;
 use aterm_models_harness::harness_login_wall_model;
@@ -427,7 +428,7 @@ const PEER: &str = "@2";
 
 fn hosted(s: &S, st: &TurnEndState, renewed: bool, r: TurnEndReading) -> TurnEndReading {
     let by = PEER.to_string();
-    let asked = r.wall == Some(aterm_phase::WallKind::Auth)
+    let asked = r.wall == Some(alab_policy::vocab::WallKind::Auth)
         || (st.login_track().is_some() && (r.login_screen.is_some() || r.login_interrupted));
     let login_shared = match s["elsewhere"] {
         _ if !asked => None,

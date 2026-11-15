@@ -670,6 +670,7 @@ fn a_fork_of_a_bounded_restore_folds_the_rest_as_the_straight_fold_does() {
     let fx = long();
     let mut evicted = bounded(&fx, 300);
     fx.apply(&mut evicted, fixture_epoch(), 0);
+    assert_eq!(evicted.main_grid_mut().drain_lazy_bounded(usize::MAX), 0);
     assert!(
         evicted.grid().scrollback_lines() < 1440 - 12,
         "premise: the small store evicted"
@@ -694,6 +695,7 @@ fn bounded_against_unbounded(fx: &Fixture, store_lines: usize) -> Vec<(Terminal,
         for t in [&mut unbounded, &mut kept] {
             fx.configure(t);
             fx.apply(t, epoch, k + 1);
+            assert_eq!(t.main_grid_mut().drain_lazy_bounded(usize::MAX), 0);
         }
         out.push((kept, unbounded));
     }
@@ -718,26 +720,13 @@ fn a_bounded_restore_folds_the_rest_as_the_unbounded_restore_does() {
     }
     let fx = long();
     let small = bounded_against_unbounded(&fx, 300);
-    let mut renumbered = 0;
     for (k, (kept, unbounded)) in small.iter().enumerate() {
-        let (Some(mut kept), Some(unbounded)) =
-            (kept.checkpoint_visible(), unbounded.checkpoint_visible())
-        else {
-            panic!("long: at ground at boundary {k}");
-        };
-        if kept.absolute_row_counter != unbounded.absolute_row_counter {
-            renumbered += 1;
-            kept.absolute_row_counter = unbounded.absolute_row_counter;
-        }
         assert_eq!(
-            kept, unbounded,
-            "long: what a witness compares but the row counter, restored at boundary {k}"
+            kept.checkpoint_visible().expect("long: ground"),
+            unbounded.checkpoint_visible().expect("long: ground"),
+            "long: exact visible state, restored at boundary {k}"
         );
     }
-    assert!(
-        renumbered > 0,
-        "the known gap: a narrowing raises the row counter over the history each store keeps, so a small store renumbers differently"
-    );
     assert!(
         small
             .iter()

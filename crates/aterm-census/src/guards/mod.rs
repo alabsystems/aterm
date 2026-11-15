@@ -8,29 +8,21 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::Arc;
 
-use crate::memo::{self, Kept, Rejudged, Verdict};
-use crate::{CensusOutcome, Floor, Walk};
+use crate::{CensusOutcome, Floor};
 
 mod corpus;
 pub(crate) use corpus::{
-    Corpus, Line, LoadKind, Reach, Script, SourceFile, Tree, brace_close, joined, named_for_tests,
+    Corpus, Line, Reach, Script, SourceFile, Tree, brace_close, joined, named_for_tests,
 };
 
 mod agent_gate;
-mod aos_step;
 mod bridge_fx;
 mod build_path;
 mod captures;
-mod census_thread;
-mod changelog_repeat;
 mod clippy_mirror;
-mod closure_anchor;
-mod conflict_marker;
-mod credential_claim;
+pub(crate) mod conflict_marker;
 mod debug_seam;
-mod doc_sentence;
 mod doors;
 mod eager_drop;
 mod export_includes;
@@ -38,31 +30,16 @@ mod generated;
 mod github;
 mod grants;
 mod graph;
-mod identity_read;
 pub(crate) mod inline_test_module;
 mod installer;
-mod issue_id;
-mod keeper_native;
 mod keys;
-mod lifeline;
-mod m6_names;
 mod machines;
 mod mint;
-mod mirror_rows;
 mod mktemp;
 mod no_reach_read;
-mod release_test_state;
 mod rules;
-mod rustup_keg;
 mod seam_caller;
-mod seam_reset;
-mod shown_term;
-mod slog_inert;
-mod stock_label;
-mod term_write;
 pub(crate) mod unmounted_test;
-mod usage_read;
-mod win_resources;
 
 /// One violation: where, which rule, and what the rule saw there.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,29 +68,15 @@ pub struct Rule {
 /// Every guard, in the order findings print.
 pub const GUARDS: &[Rule] = &[
     rules::ENGINE_PLATFORM,
-    rules::RENDERER_TERMINAL,
     rules::DEV_READ,
     debug_seam::DEBUG_SEAM,
     seam_caller::SEAM_CALLER,
-    census_thread::CENSUS_THREAD,
-    rules::INPUT_PROBE,
     graph::TEST_APPKIT_DOOR,
-    graph::SHARED_APPLICATION,
-    rules::PROTECTED_FOLDER,
-    rules::RUNLOOP_TIMER,
-    rules::KEEPER_GUI,
-    rules::KEEPER_GUI_DEPS,
     rules::KEEPER_NO_MMAP,
     rules::RESTORE_STAYS_LOCAL,
-    lifeline::HEADLESS_LIFELINE,
-    rules::STD_COMMAND,
-    rules::FLOCK_DOOR,
     clippy_mirror::CLIPPY_MIRROR,
     rules::SUPERVISE_FX,
     bridge_fx::BRIDGE_FX,
-    aos_step::AOS_STEP_CLOCK,
-    m6_names::M6_NAMES,
-    rules::STORE_CURRENT,
     keys::KEY_MATERIAL,
     captures::CAPTURE_PRIVACY,
     export_includes::EXPORT_INCLUDES,
@@ -121,47 +84,29 @@ pub const GUARDS: &[Rule] = &[
     doors::DEVTOOLS_DOOR,
     machines::MACHINES_ROOT_DOOR,
     doors::FFI_DOOR,
-    doors::BOOT_ID_DOOR,
-    doors::HANDOFF_NAME,
     doors::CORE_SIGNAL,
     mint::LAUNCHER_MINT,
     grants::PROMPT_GRANT,
     mktemp::CHECKED_MKTEMP,
-    rustup_keg::RUSTUP_KEG,
     installer::INSTALLER_NETWORK,
     agent_gate::AGENT_GATE,
-    term_write::TERM_WRITE,
-    usage_read::USAGE_READ_ON_TIMER,
-    shown_term::SHOWN_TERM,
-    slog_inert::SLOG_INERT,
     eager_drop::EAGER_DROP,
-    seam_reset::SEAM_RESET,
-    doc_sentence::DOC_SENTENCE,
-    stock_label::STOCK_LABEL,
     github::GITHUB_AUTH_DOOR,
     github::GH_SPAWN,
     github::AGH_FX,
-    closure_anchor::CLOSURE_ANCHOR,
     rules::LICENCE_HEADER,
     generated::GENERATED_SEAL,
-    identity_read::IDENTITY_READ,
     conflict_marker::CONFLICT_MARKER,
-    changelog_repeat::CHANGELOG_REPEAT,
-    issue_id::ISSUE_ID,
-    credential_claim::CREDENTIAL_CLAIM,
-    mirror_rows::MIRROR_ROWS,
     no_reach_read::NO_REACH_READ,
     unmounted_test::UNMOUNTED_TEST,
     inline_test_module::INLINE_TEST_MODULE,
-    release_test_state::RELEASE_TEST_STATE,
-    win_resources::WIN_RESOURCES,
 ];
 
 /// The guards' outcome over one tree.
 pub struct GuardReport {
     /// The `.rs` files read.
     pub files: usize,
-    /// The scripts read ([`Script`]).
+    /// The scripts read ([`corpus::Script`]).
     pub scripts: usize,
     /// Every finding, in [`GUARDS`] order, then by path and line.
     pub findings: Vec<Finding>,
@@ -172,44 +117,15 @@ pub struct GuardReport {
 /// # Errors
 /// The checkout's source cannot be walked or read.
 pub fn run_guards(root: &Path, engine: &crate::EngineBaseline) -> Result<GuardReport, String> {
-    guard_report(&Walk {
-        root,
-        engine,
-        source: &std::sync::OnceLock::new(),
-        run: None,
-    })
-}
-
-/// Every guard over `walk`'s checkout: each rule a memo unit when a memo run keeps a record.
-fn guard_report(walk: &Walk<'_>) -> Result<GuardReport, String> {
-    let corpus = read_corpus(walk)?;
-    let tree = Tree::new(walk.root, &corpus, walk.engine);
+    let corpus = Corpus::at(root)?;
+    let tree = Tree::new(root, &corpus, engine);
     let mut findings = scope_findings(&corpus, GUARDS);
-    findings.extend(run_rules(&tree, GUARDS, walk));
+    findings.extend(run_rules(&tree, GUARDS));
     Ok(GuardReport {
         files: corpus.len(),
         scripts: corpus.scripts().len(),
         findings,
     })
-}
-
-/// The corpus of `walk`'s snapshot. With a memo run, its accessors record their questions in
-/// the run's units, and the run judges those questions by this corpus's answers.
-pub(crate) fn read_corpus(walk: &Walk<'_>) -> Result<Arc<Corpus>, String> {
-    let owner = walk.run.map(|run| Arc::clone(&run.shared));
-    let corpus = Arc::new(Corpus::read(walk.root, walk.snapshot(), owner)?);
-    if let Some(run) = walk.run {
-        let [paths, scripts, manifests] = corpus.facts();
-        let shared = Arc::clone(&run.shared);
-        let held = Arc::clone(&corpus);
-        run.set_corpus(memo::CorpusNow {
-            globals: [paths, scripts, manifests, memo::engine_digest(walk.engine)],
-            test_code: Box::new(move |rel| {
-                memo::loader(&shared, || held.test_code_now().holds(rel))
-            }),
-        });
-    }
-    Ok(corpus)
 }
 
 /// One finding per scope prefix of `rules` that no file of `corpus` lies under.
@@ -233,15 +149,16 @@ fn scope_findings(corpus: &Corpus, rules: &[Rule]) -> Vec<Finding> {
 }
 
 /// `rules` over `tree`, each on its own thread (they share only the corpus,
-/// whose lexing is computed once per file whichever rule asks first), each one unit of `walk`'s
-/// memo run when one keeps a record ([`judge`]).
-fn run_rules(tree: &Tree<'_>, rules: &[Rule], walk: &Walk<'_>) -> Vec<Finding> {
-    memo::threads(|scope| {
+/// whose lexing is computed once per file whichever rule asks first).
+fn run_rules(tree: &Tree<'_>, rules: &[Rule]) -> Vec<Finding> {
+    crate::workers::threads(|scope| {
         let running: Vec<_> = rules
             .iter()
             .map(|rule| {
                 scope.spawn_named(format!("guard-{}", rule.id), 8 << 20, move || {
-                    judge(rule, tree, walk)
+                    let mut found = Vec::new();
+                    (rule.check)(tree, &mut found);
+                    found
                 })
             })
             .collect();
@@ -267,68 +184,9 @@ fn run_rules(tree: &Tree<'_>, rules: &[Rule], walk: &Walk<'_>) -> Vec<Finding> {
     })
 }
 
-/// `rule`'s findings over `tree`: the ones `walk`'s memo run kept for it while every question it
-/// asked keeps its answer, else judged now as one unit of the run and kept. A rule that panics
-/// keeps nothing, and one whose findings carry another rule's id is judged again every run.
-fn judge(rule: &Rule, tree: &Tree<'_>, walk: &Walk<'_>) -> Vec<Finding> {
-    let check = || {
-        let mut found = Vec::new();
-        (rule.check)(tree, &mut found);
-        found
-    };
-    let Some(run) = walk.run else {
-        return check();
-    };
-    let id = format!("guard:{}", rule.id);
-    let why = match run.reusable(&id, walk.snapshot()) {
-        Ok(record) => match &record.result {
-            Verdict::Findings(kept) => {
-                let found = kept
-                    .iter()
-                    .map(|k| Finding {
-                        rule: rule.id,
-                        path: k.path.clone(),
-                        line: k.line,
-                        detail: k.detail.clone(),
-                    })
-                    .collect();
-                run.keep_reused(record);
-                return found;
-            }
-            Verdict::Outcome(_) => Rejudged::Changed("its record is a census's".into()),
-        },
-        Err(why) => why,
-    };
-    let (judged, trace) = memo::unit(&run.shared, || {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(check))
-    });
-    match judged {
-        Ok(found) => {
-            let kept = found.iter().all(|f| f.rule == rule.id).then(|| {
-                let kept = found
-                    .iter()
-                    .map(|f| Kept {
-                        path: f.path.clone(),
-                        line: f.line,
-                        detail: f.detail.clone(),
-                    })
-                    .collect();
-                (trace, Verdict::Findings(kept))
-            });
-            run.keep_judged(&id, why, kept);
-            found
-        }
-        Err(panic) => {
-            run.keep_judged(&id, why, None);
-            std::panic::resume_unwind(panic)
-        }
-    }
-}
-
 /// The guards as a census: the transcript `aterm-census --guards` prints.
-pub(crate) fn run_guard_census(walk: &Walk<'_>) -> CensusOutcome {
+pub(crate) fn run_guard_census(root: &Path, engine: &crate::EngineBaseline) -> CensusOutcome {
     const TITLE: &str = "guards";
-    let (root, engine) = (walk.root, walk.engine);
     let ids: Vec<&str> = GUARDS.iter().map(|r| r.id).collect();
     let mut log = format!(
         "=== guards (source rules over crates/, apps/) ===\n    root: {}\n    \
@@ -336,7 +194,7 @@ pub(crate) fn run_guard_census(walk: &Walk<'_>) -> CensusOutcome {
         root.display(),
         ids.join(", ")
     );
-    let report = match guard_report(walk) {
+    let report = match run_guards(root, engine) {
         Ok(report) => report,
         Err(why) => {
             return CensusOutcome::red(TITLE, log, format!("the tree could not be read: {why}"));

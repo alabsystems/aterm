@@ -166,3 +166,43 @@ fn a_real_rate_limited_broker_fills_more_than_one_window_exactly_once() {
     assert!(rows.windows(2).all(|rows| rows[0].0 < rows[1].0));
     assert_eq!(client.owed_acks(), 0);
 }
+
+/// The fabric-counts lane's floor on a refill's pages passed (F11c, ATERM-KI-1111-9) counts in
+/// astream's pages, [`crate::spec::TIER_PAGE_RECORDS`] records each, which astream keeps
+/// crate-private: a filtered `Fetch` that wants none of a real broker's records passes them a
+/// page at a time, as many pages as that constant says, give or take the one the fetch's ends
+/// cut. A pin that moves astream's page fails here, and one that loses the skip passes none.
+#[test]
+fn a_fetch_that_wants_nothing_passes_the_backlog_a_tier_page_at_a_time() {
+    use super::*;
+    use crate::spec::TIER_PAGE_RECORDS;
+    use astream_broker::{Broker, Durability, OpenOptions, Prepared};
+
+    const PAGES: usize = 20;
+    let scratch = crate::harness::sock_dir("pagepass");
+    let opts = OpenOptions::new(Durability::Relaxed);
+    let broker =
+        Broker::open_opts(scratch.path().join("b.log"), opts, || Ok(Prepared::Nothing)).unwrap();
+    let sock = scratch.path().join("b.sock");
+    let _server = broker.serve(&sock).unwrap();
+    let mut client = crate::harness::broker_client(&sock);
+    fill_records(
+        &mut client,
+        FILL_PRODUCER,
+        "/bench/fill",
+        PAGES * TIER_PAGE_RECORDS,
+    )
+    .unwrap();
+    let before = broker.tier_tally();
+    let (rows, (next, head)) = client.fetch(0, "/bench/nothing", 1).unwrap();
+    assert!(
+        rows.is_empty() && next >= head,
+        "{rows:?} next {next} head {head}"
+    );
+    let passed = broker.tier_tally().since(before).passed_pages;
+    let pages = PAGES as u64;
+    assert!(
+        (pages - 1..=pages + 1).contains(&passed),
+        "{passed} pages passed over {PAGES} pages of {TIER_PAGE_RECORDS} records"
+    );
+}

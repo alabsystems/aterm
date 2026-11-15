@@ -45,7 +45,11 @@ pub fn fabric_exactly_once_model() -> Model {
             action Reuse when (occ == 0 && lost == 1 && nr2 == 0) {
                 occ = 2;
             }
-            action Deliver when (alive == 1 && (told == 1 || occ == 1) && occ > 0 && O + 1 > c && pend == 0 && MaxRows > nr + nr2) {
+            // A second occupant is delivered on the log the GUI was told (`told`), or where
+            // every move since that tell kept every record (`mv == 2`): the told log still
+            // holds it at the offset, and the next tell leaves `dd` as it is (ATERM-KI-1114-479,
+            // a move that kept the record between its pump and its delivery).
+            action Deliver when (alive == 1 && (told == 1 || occ == 1 || mv == 2) && occ > 0 && O + 1 > c && pend == 0 && MaxRows > nr + nr2) {
                 nr = if occ == 1 && (dd == 0 || Buggy == 1) { nr + 1 } else { nr };
                 nr2 = if occ == 2 && (dd == 0 || Buggy == 1) { nr2 + 1 } else { nr2 };
                 dd = 1;

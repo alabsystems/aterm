@@ -1224,6 +1224,65 @@ fn history_below_the_floor_or_the_seed_queues_nothing() {
     }
 }
 
+/// A ROW BELOW THE ADOPTION IS LOST, NEVER HISTORY: a seamless update's successor arms its fold
+/// with the join's watermark, the process's floor and the adoption. A tool row written after the
+/// predecessor's last read and dated below the adoption is the run's own, yet the join never
+/// places it: it is queued as one lost row at its end, so the watermark passes it. A row dated
+/// below the floor is history still, and a row past the adoption is placed.
+/// CONTROL: the adoption taken as the floor (`set_adopted` raising the floor, as the arm had it
+/// before) is caught: nothing lost.
+#[test]
+fn a_row_below_the_adoption_is_lost_never_history() {
+    let rows = [
+        prompt("v1", 1_000, "go"),
+        calls("m0", 500, &[("toolu_old", "Bash")]),
+        calls("m1", 2_000, &[("toolu_a", "Bash"), ("toolu_b", "Bash")]),
+        calls("m2", 4_000, &[("toolu_c", "Bash")]),
+    ];
+    let ends: Vec<u64> = rows
+        .iter()
+        .scan(0, |o, r| {
+            *o += r.len() as u64 + 1;
+            Some(*o)
+        })
+        .collect();
+    let given = StepMark {
+        fp: FP,
+        id: ID,
+        off: ends[0],
+    };
+    let mut fold = StepFold::new(T0 + 800, Some(given));
+    fold.set_adopted(T0 + 3_000);
+    fold.read_at(FP, ID, ends[3], false);
+    for (r, e) in rows.iter().zip(&ends) {
+        fold.push(r.as_bytes(), *e);
+    }
+    let batch = fold.take();
+    let got: Vec<(u64, StepEvent)> = batch
+        .steps
+        .iter()
+        .filter(|s| !matches!(s.ev, StepEvent::Bind { .. } | StepEvent::Model { .. }))
+        .map(|s| (s.pos.off, s.ev))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (ends[2], StepEvent::Lost { n: 1 }),
+            (
+                ends[3],
+                StepEvent::ToolUse {
+                    id: id("toolu_c"),
+                    tool: ToolName::new("Bash"),
+                    cls: "shell",
+                    subagent: false,
+                }
+            ),
+        ],
+        "the hidden row is lost at its end; the older one is history"
+    );
+    assert_eq!(batch.lost(), 1);
+}
+
 /// The model is said from the first row past the seed, even when the history's rows named the same one.
 #[test]
 fn a_fresh_row_names_the_model_the_history_had() {
@@ -1306,12 +1365,12 @@ fn a_full_queue_drops_its_oldest_and_unread_rows_are_counted() {
     );
     f.push("{\"type\":\"user\",").push("not json \"user\"");
     f.fold.long_line(f.off + 10);
-    assert_eq!(f.fold.take().lost, 3);
+    assert_eq!(f.fold.take().lost(), 3);
     let mut fold = StepFold::new(0, None);
     fold.read_at(FP, ID, 1_000, false);
     fold.push(b"{\"type\":\"user\",", 20);
     fold.long_line(40);
-    assert_eq!(fold.take().lost, 0);
+    assert_eq!(fold.take().lost(), 0);
 }
 
 /// A build the measured set names is exact, and any other is partial.
@@ -1359,8 +1418,9 @@ fn measured_builds_hold(dir: &std::path::Path, builds: &[&str]) -> Result<(), St
             fold.push(line.as_bytes(), end);
         }
         let (first, second) = (fold.take(), fold.take());
+        let lost = first.lost() + second.lost() + first.overflow + second.overflow;
         let steps: Vec<Step> = first.steps.into_iter().chain(second.steps).collect();
-        if first.lost + second.lost + first.overflow + second.overflow != 0 {
+        if lost != 0 {
             return Err(format!("{b}: the reduction folds with loss"));
         }
         let want = state_for(builds, Some(b));
@@ -1582,12 +1642,12 @@ const SCREENS: &[WallKind] = &[
     WallKind::ApiError {
         code: Some(500),
         retryable: true,
-        cause: aterm_phase::ApiCause::Server,
+        cause: alab_policy::vocab::ApiCause::Server,
     },
     WallKind::ApiError {
         code: Some(429),
         retryable: true,
-        cause: aterm_phase::ApiCause::Server,
+        cause: alab_policy::vocab::ApiCause::Server,
     },
     WallKind::Memory,
 ];
@@ -1927,7 +1987,7 @@ fn the_footer_cache_keys_a_vacancy_to_its_session() {
     append(&d, &[prompt("v1", 100, "d's history")]);
     let none = |_: Option<&str>, _: i64| -> Option<i64> { None };
     let mut cache = FooterCache::default();
-    cache.set_floor(0, None);
+    cache.set_floor(0, 0, None);
     cache.note_entry(None, "a", Some((&a, true)));
     let _ = cache.usage(Some(a.clone()), 0, &none);
     cache.note_entry(None, "x", None);
@@ -1967,7 +2027,7 @@ fn the_footer_cache_taps_only_once_armed() {
     let none = |_: Option<&str>, _: i64| -> Option<i64> { None };
     let _ = cache.usage(Some(path.clone()), 0, &none);
     assert!(cache.take_steps().steps.is_empty(), "not armed");
-    cache.set_floor(0, None);
+    cache.set_floor(0, 0, None);
     append(&path, &[prompt("v1", 10, "new")]);
     let _ = cache.usage(Some(path.clone()), 0, &none);
     let evs: Vec<StepEvent> = cache.take_steps().steps.into_iter().map(|s| s.ev).collect();

@@ -719,7 +719,7 @@ pub(super) fn receive_marked(
             let length = (*header).cmsg_len as usize;
             let payload = length.min(remaining) - base;
             if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                valid &= payload % size_of::<libc::c_int>() == 0;
+                valid &= payload.is_multiple_of(size_of::<libc::c_int>());
                 let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
                 for index in 0..payload / size_of::<libc::c_int>() {
                     fds.push(OwnedFd::from_raw_fd(data.add(index).read_unaligned()));

@@ -350,6 +350,103 @@ fn push_batch(rows: &[(&str, &str, &str)]) -> agh::github::refs::AtomicRefBatch 
 const ABSENT: &str = "0000000000000000000000000000000000000000";
 
 #[test]
+fn native_writes_keep_the_credential_that_the_parent_journaled() {
+    use agh::git::{ControlRefChange, ControlRefTransaction, RELEASE_LEASE_REF};
+    use agh::journal::JournalRecord;
+    use agh::policy::{Presence, RouteRequest, RouteTarget};
+    use agh_fake::git_backend::GitHttpBackend;
+
+    for rotated in [false, true] {
+        let world = reader_world("native-operation-credential");
+        let source = bare_repo(world.path(), "source");
+        host_git(
+            &source,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/fixture-dev/app.git",
+            ],
+        );
+        let sha = host_git(&source, &["rev-parse", "main"]);
+        let backend = GitHttpBackend::start(
+            "fixture-dev/app",
+            &source,
+            &agh_fake::token("reader"),
+            &agh_fake::token(if rotated { "rotated" } else { "dev" }),
+        )
+        .unwrap();
+        let ports = world.fake.ports();
+        let gh = git_builder(
+            world.router.clone(),
+            Endpoints::loopback(ports.api, ports.uploads, backend.port(), ports.cdn),
+            &world.dirs,
+            git_env(),
+            live_start(),
+        )
+        .build();
+        let slug = common::slug("fixture-dev/app");
+        assert_eq!(gh.presence("dev"), Presence::Present);
+        let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+        let journal = gh.journal(&slug).unwrap();
+        if rotated {
+            std::fs::write(
+                world.path().join("tokens/dev.token"),
+                agh_fake::token("rotated"),
+            )
+            .unwrap();
+        }
+        let before = host_git(backend.repository(), &["show-ref"]);
+        let batch = push_batch(&[("refs/tags/credential-bound", ABSENT, &sha)]);
+        let claim = ControlRefTransaction::new(
+            &sha,
+            vec![ControlRefChange {
+                reference: RELEASE_LEASE_REF.into(),
+                before: None,
+                after: Some(sha.clone()),
+            }],
+        )
+        .unwrap();
+        let pushed = gh
+            .refs(&slug)
+            .push_atomic(&permit, &source, &batch, &journal)
+            .and_then(agh::write::Outcome::into_result);
+        let claimed = gh
+            .refs(&slug)
+            .push_control(&permit, &source, &claim, &journal, Duration::from_secs(60))
+            .and_then(agh::write::Outcome::into_result);
+        if rotated {
+            for error in [pushed.unwrap_err(), claimed.unwrap_err()] {
+                assert_eq!(error.kind, Kind::Unauthenticated, "{error:?}");
+                assert_eq!(error.side_effect, SideEffect::None);
+            }
+            assert_eq!(host_git(backend.repository(), &["show-ref"]), before);
+        } else {
+            pushed.unwrap();
+            claimed.unwrap();
+            assert_eq!(
+                host_git(
+                    backend.repository(),
+                    &["rev-parse", "refs/tags/credential-bound"]
+                ),
+                sha
+            );
+        }
+        let (records, _) = journal.read().unwrap();
+        let fingerprints = records
+            .iter()
+            .filter_map(|(_, record)| match record {
+                JournalRecord::Intent(intent) => Some(intent.fingerprint.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fingerprints.len(), 2);
+        let expected = agh::identity::fingerprint(agh_fake::token("dev").as_bytes());
+        assert!(fingerprints.iter().all(|fp| *fp == expected.as_str()));
+    }
+}
+
+#[test]
 fn native_writes_survive_exhausted_core_and_still_require_git_write_authority() {
     use agh::git::{ControlRefChange, ControlRefTransaction, RELEASE_LEASE_REF};
     use agh::policy::{RouteRequest, RouteTarget};
@@ -4286,32 +4383,49 @@ fn a_leased_delete_of_a_local_repository_is_guarded() {
     assert!(files(&world.dirs.grants()).is_empty());
 }
 
+/// An inline token, which only its process holds, never answers git: git's credential helper
+/// is another process and reads only token files. A read routed through
+/// `Router::default_reader` (the only router whose inline profile reaches a repository) is
+/// refused before any child, grant or request; recorded, the refusal replays from its tape.
 #[test]
-fn a_profile_without_a_token_file_is_refused_for_git() {
-    let text = |_: &Path| {
-        "[profiles.envdev]\nenv = \"AGH_TEST_TOKEN\"\ntier = \"dev\"\nlogin = \"fixture-dev-bot\"\n\n\
-         [[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = [\"envdev\"]\nwrite = \"envdev\"\n"
-            .to_string()
-    };
-    let world = world("git-env-profile", text);
+fn an_inline_profile_is_refused_for_git() {
+    let token = agh::identity::InlineToken::new(aterm_uds::secret::Secret::new(
+        agh_fake::token("dev").as_bytes(),
+    ))
+    .expect("an inline token");
+    let mut world = World::canonical("git-inline-profile");
     common::canonical_repos(&world.fake);
-    let env = git_env().with("AGH_TEST_TOKEN", &agh_fake::token("dev"));
-    let gh = world.client(env).build();
+    world.router = Router::default_reader("reader", token);
     let slug = common::slug("fixture-dev/app");
-    for run in [
-        GitRun::push_delete(&slug, "refs/tags/v1", common::MAIN_SHA),
-        GitRun::ls_remote(&slug, None),
-    ] {
-        let err = gh
-            .run_git(&run)
-            .expect_err("an env profile cannot answer git")
-            .into_data();
-        assert_eq!(err.kind, Kind::Refused, "{:?}: {}", run.op, err.why);
-        assert!(err.why.contains("envdev"), "{}", err.why);
-        assert!(err.why.contains("env:AGH_TEST_TOKEN"), "{}", err.why);
-    }
+    let run = GitRun::ls_remote(&slug, None);
+    let gh = world.client(git_env()).build();
+    let err = gh
+        .run_git(&run)
+        .expect_err("an inline profile cannot answer git")
+        .into_data();
+    assert_eq!(err.kind, Kind::Refused, "{}", err.why);
+    assert!(err.why.contains("reader"), "{}", err.why);
+    assert!(err.why.contains("(inline)"), "{}", err.why);
     assert!(!world.dirs.grants().exists());
     assert!(gh.fx().children_run().is_empty());
+
+    let tape = common::tape_path(world.path(), "inline-git");
+    let header = agh::fx::tape::TapeHeader::for_run(
+        &["ls-remote".to_string()],
+        &common::endpoints(&world.fake),
+    );
+    let answer = |fx: Fx| {
+        let fx = Arc::new(fx);
+        let gh = world.client(git_env()).fx(Arc::clone(&fx)).build();
+        let err = gh.run_git(&run).expect_err("refused").into_data();
+        fx.finish(1)
+            .unwrap_or_else(|e| panic!("the tape's end: {}", e.why));
+        (err.kind, err.why)
+    };
+    let recorded = answer(Fx::record_for_tests(&tape, &header).expect("a recording"));
+    assert_eq!(recorded, (err.kind, err.why.clone()));
+    let (replaying, _) = Fx::replay_for_tests(&tape).expect("a replay");
+    assert_eq!(answer(replaying), recorded);
     assert!(
         world
             .fake
@@ -5562,13 +5676,7 @@ fn a_vault_routed_run_reads_and_pushes_as_the_vault_token() {
     let dirs = Dirs::under(root.path());
     let token = agh_fake::token("vault-dev");
     fake.add_token(&token, "fixture-dev");
-    let path = agh::identity::vault::Slot::Dev.path(&dirs.home);
-    std::fs::create_dir_all(&dirs.home).expect("the home");
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("the vault file's name");
-    common::write_token(path.parent().expect("the vault directory"), name, &token);
+    common::vault_entry(&dirs.home, agh::identity::vault::Slot::Dev.entry(), &token);
     fake.add_repo("fixture-dev/app", RepoSpec::private().push("fixture-dev"));
     fake.set_branch("fixture-dev/app", "main", common::MAIN_SHA);
     fake.set_tag("fixture-dev/app", "v1", common::MAIN_SHA);
@@ -5612,13 +5720,7 @@ fn vault_dev_world(root: &Path, fake: &FakeGithub) -> (Dirs, String) {
     let dirs = Dirs::under(root);
     let token = agh_fake::token("vault-dev");
     fake.add_token(&token, "fixture-dev");
-    let path = agh::identity::vault::Slot::Dev.path(&dirs.home);
-    std::fs::create_dir_all(&dirs.home).expect("the home");
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("the vault file's name");
-    common::write_token(path.parent().expect("the vault directory"), name, &token);
+    common::vault_entry(&dirs.home, agh::identity::vault::Slot::Dev.entry(), &token);
     fake.add_repo("fixture-dev/app", RepoSpec::private().push("fixture-dev"));
     fake.set_tag("fixture-dev/app", "v1", common::MAIN_SHA);
     (dirs, token)

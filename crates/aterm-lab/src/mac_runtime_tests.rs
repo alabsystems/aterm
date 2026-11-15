@@ -4,6 +4,235 @@
 use super::*;
 
 #[test]
+fn collection_observes_retained_raw_streams_and_cannot_erase_a_red_execution() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    for (phase, code, prior_codes, expected_refusal) in [
+        ("red", 1, vec![Some(0)], 1),
+        ("later-green", 0, vec![Some(1), Some(0)], 1),
+        ("green", 0, vec![Some(0)], crate::mac::NOT_RUN),
+    ] {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"original\0stdout\xff\n".to_vec(),
+            stderr: b"original\0stderr\xfe\nreal 2\nuser 1\nsys 0.5\n".to_vec(),
+        };
+        let receipt = CaptureReceipt {
+            schema: "aterm-runtime-capture-v1".into(),
+            complete: true,
+            exit: Some(code),
+            signal: None,
+            stdout_bytes: output.stdout.len(),
+            stderr_bytes: output.stderr.len(),
+            error: None,
+        };
+        let execution = tmp.path().join(format!("{phase}.execution.json"));
+        let expected_output = output.clone();
+        let refused = retain_phase(
+            tmp.path(),
+            phase,
+            "the measured command",
+            output,
+            Ok(receipt),
+            |_| {
+                assert_eq!(
+                    std::fs::read(tmp.path().join(format!("{phase}.stdout"))).unwrap(),
+                    expected_output.stdout,
+                    "collection must begin after the complete original stdout was retained"
+                );
+                assert_eq!(
+                    std::fs::read(tmp.path().join(format!("{phase}.stderr"))).unwrap(),
+                    expected_output.stderr,
+                    "binary stderr is independent of text in the row log"
+                );
+                let row: Value =
+                    aterm_json::from_slice(&std::fs::read(&execution).unwrap()).unwrap();
+                assert_eq!(row["exit"].as_i64(), Some(i64::from(code)));
+                assert_eq!(row["success"].as_bool(), Some(code == 0));
+                assert_eq!(row["output_complete"].as_bool(), Some(true));
+                assert_eq!(row["usage"]["real"].as_f64(), Some(2.));
+                Err::<(), _>(not_run("injected artifact transport refusal"))
+            },
+        )
+        .map_err(|error| preserve_failure(&prior_codes, error))
+        .unwrap_err();
+        assert_eq!(refused.code, expected_refusal);
+        assert!(refused.msg.unwrap().contains("artifact transport refusal"));
+        assert!(
+            execution.is_file(),
+            "the refusal must keep the execution record"
+        );
+        assert!(
+            !tmp.path().join(format!("{phase}.json")).exists(),
+            "a refused collection cannot publish a completed measurement row"
+        );
+    }
+}
+
+#[test]
+fn invalid_or_incomplete_capture_retains_raw_bytes_without_claiming_completion() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    for (phase, defect, producer_exit, transport_exit, expected) in [
+        ("malformed", "json", 0, 0, crate::mac::NOT_RUN),
+        ("capped", "cap", 0, 0, crate::mac::NOT_RUN),
+        ("late-capped-red", "cap-red", 1, 0, 1),
+        ("wrong-length", "length", 1, 0, 1),
+        ("failed-transfer", "transport", 1, 7, 1),
+    ] {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(transport_exit << 8),
+            stdout: b"raw\0stdout\xff".to_vec(),
+            stderr: b"raw\0stderr\xfe".to_vec(),
+        };
+        let mut wire = json!({"schema":"aterm-runtime-capture-v1", "complete":true,
+            "exit":producer_exit, "signal":null, "stdout_bytes":output.stdout.len(),
+            "stderr_bytes":output.stderr.len(), "error":null});
+        let fields = wire.as_object_mut().unwrap();
+        match defect {
+            "cap" | "cap-red" => {
+                fields.insert("complete".into(), json!(false));
+                if defect == "cap" {
+                    fields.insert("exit".into(), Value::Null);
+                }
+                fields.insert(
+                    "error".into(),
+                    json!("stdout exceeds its complete-output bound"),
+                );
+            }
+            "length" => {
+                fields.insert("stdout_bytes".into(), json!(output.stdout.len() + 1));
+            }
+            _ => {}
+        }
+        let bytes = if defect == "json" {
+            b"{".to_vec()
+        } else {
+            aterm_json::to_string(&wire).unwrap().into_bytes()
+        };
+        let expected_output = output.clone();
+        let error = retain_phase(
+            tmp.path(),
+            phase,
+            "producer",
+            output,
+            CaptureReceipt::parse(&bytes),
+            |_| -> Result<(), Fail> {
+                panic!("optional collection cannot start without complete producer output")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, expected);
+        assert_eq!(
+            std::fs::read(tmp.path().join(format!("{phase}.stdout"))).unwrap(),
+            expected_output.stdout
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join(format!("{phase}.stderr"))).unwrap(),
+            expected_output.stderr
+        );
+        let execution: Value = aterm_json::from_slice(
+            &std::fs::read(tmp.path().join(format!("{phase}.execution.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(execution["output_complete"].as_bool(), Some(false));
+    }
+}
+
+#[test]
+fn sealed_direct_signal_survives_collection_failure() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let output = std::process::Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: b"before signal\n".to_vec(),
+        stderr: Vec::new(),
+    };
+    let receipt = CaptureReceipt {
+        schema: "aterm-runtime-capture-v1".into(),
+        complete: true,
+        exit: None,
+        signal: Some(libc::SIGKILL),
+        stdout_bytes: output.stdout.len(),
+        stderr_bytes: 0,
+        error: None,
+    };
+    let error = retain_phase(
+        tmp.path(),
+        "signalled",
+        "producer",
+        output,
+        Ok(receipt),
+        |output| {
+            assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+            Err::<(), _>(not_run("optional collector unavailable"))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code, 1);
+    let execution: Value = aterm_json::from_slice(
+        &std::fs::read(tmp.path().join("signalled.execution.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(execution["exit"].is_null());
+    assert_eq!(execution["signal"].as_i64(), Some(i64::from(libc::SIGKILL)));
+    assert_eq!(execution["success"].as_bool(), Some(false));
+    assert_eq!(execution["output_complete"].as_bool(), Some(true));
+}
+
+#[test]
+fn an_existing_phase_directory_cannot_launch_or_supply_stale_completion() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let root = tmp.path().join("a driver's files");
+    let directory = root.join("take-1");
+    std::fs::create_dir_all(&directory).unwrap();
+    let stale = aterm_json::to_string(&json!({"schema":"aterm-runtime-capture-v1",
+        "complete":true, "exit":0, "signal":null, "stdout_bytes":0,
+        "stderr_bytes":0, "error":null}))
+    .unwrap()
+    .into_bytes();
+    assert!(
+        CaptureReceipt::parse(&stale)
+            .unwrap()
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(directory.join("capture.json"), &stale).unwrap();
+    let marker = tmp.path().join("producer-ran");
+    let run = |reservation: String| {
+        aterm_uds::deadline::output_until(
+            command(aterm_uds::deadline::stand_in(Path::new("/bin/sh"))).args([
+                "-c",
+                &format!(
+                    "set -eu; {reservation}; printf invoked > {}",
+                    q(&marker.display().to_string())
+                ),
+            ]),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        )
+        .unwrap()
+    };
+    assert!(!run(reserve_phase(&root, "take-1")).status.success());
+    assert!(!marker.exists());
+    assert_eq!(
+        std::fs::read(directory.join("capture.json")).unwrap(),
+        stale
+    );
+    // Negative control: accepting this existing namespace permits the launch that
+    // would then consume the already-present success receipt.
+    assert!(
+        run(format!("mkdir -p {}", q(&directory.display().to_string())))
+            .status
+            .success()
+    );
+    assert_eq!(std::fs::read(marker).unwrap(), b"invoked");
+}
+
+#[test]
 fn paired_takes_counterbalance_order_and_drive_distinct_supplied_images() {
     let order = take_order(true);
     assert_eq!(
@@ -107,9 +336,12 @@ fn runtime_role_probe() {
     let Some(record) = std::env::var_os("ATERM_Q4_ROLE_RECORD") else {
         return;
     };
+    let record = PathBuf::from(record);
     let promoted = crate::sys::set_darwin_role(0, 1).is_ok();
     let role = crate::sys::darwin_role(0).unwrap();
-    std::fs::write(record, format!("{promoted} {role}\n")).unwrap();
+    let temporary = record.with_extension("tmp");
+    std::fs::write(&temporary, format!("{promoted} {role}\n")).unwrap();
+    std::fs::rename(temporary, record).unwrap();
 }
 
 /// Exercise the generated job through launchd. A plist string alone cannot establish the
@@ -140,7 +372,7 @@ fn timing_children_can_take_the_app_role_but_interactive_daemons_cannot() {
             q(&record.display().to_string()),
             q(&exe.display().to_string())
         );
-        let mut job = app_job(tmp.path(), &phase, &script);
+        let mut job = app_job(tmp.path(), &phase, &["/bin/sh".into(), "-c".into(), script]);
         if let Some(kind) = mutation {
             job.as_object_mut()
                 .unwrap()
@@ -171,28 +403,36 @@ fn timing_children_can_take_the_app_role_but_interactive_daemons_cannot() {
         .unwrap();
         assert!(loaded.status.success(), "{loaded:?}");
         let _loaded = Loaded(target);
-        while !dir.join("exit").is_file() {
+        while !record.is_file() {
             assert!(
                 Instant::now() < until,
                 "the native role probe did not finish"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert_eq!(std::fs::read_to_string(dir.join("exit")).unwrap(), "0\n");
         assert_eq!(std::fs::read_to_string(&record).unwrap(), expected);
     }
 }
 
 #[test]
-fn timing_job_preserves_arguments_and_separate_results() {
+fn timing_job_preserves_argument_boundaries_and_separate_driver_diagnostics() {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let root = tmp.path().join("a driver's files");
     let dir = root.join("take-2");
     std::fs::create_dir_all(&dir).unwrap();
     let command = "printf '%s' '<&>\\\"'; printf failure >&2; exit 17";
-    let job = app_job(&root, "take-2", command);
+    let job = app_job(
+        &root,
+        "take-2",
+        &[
+            aterm_uds::deadline::stand_in(Path::new("/bin/sh"))
+                .display()
+                .to_string(),
+            "-c".into(),
+            command.into(),
+        ],
+    );
     assert_eq!(job["RunAtLoad"].as_bool(), Some(true));
-    assert_eq!(job["ProgramArguments"][0].as_str(), Some("/bin/sh"));
     assert_eq!(job["ProgramArguments"][1].as_str(), Some("-c"));
     assert_ne!(job["StandardOutPath"], job["StandardErrorPath"]);
     let bytes = aterm_json::to_string(&job).unwrap();
@@ -204,12 +444,9 @@ fn timing_job_preserves_arguments_and_separate_results() {
         std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
     )
     .unwrap();
-    assert!(result.status.success());
+    assert_eq!(result.status.code(), Some(17));
     assert_eq!(result.stdout, b"<&>\\\"");
     assert_eq!(result.stderr, b"failure");
-    // A wrapper that loses the child's nonzero status fails this negative control.
-    assert_eq!(std::fs::read_to_string(dir.join("exit")).unwrap(), "17\n");
-    assert!(!dir.join("exit.tmp").exists());
 }
 
 #[test]

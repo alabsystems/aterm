@@ -276,11 +276,26 @@ fn err_reply_selects_terminal_face() {
         "ERR unknown verb (try: help)",
         "ERR auth; the server refused the token in /run/x.token; re-run",
         "ERR control server busy; retry",
+        "ERR busy sink",
+        "ERR busy draftsman",
     ] {
         let err = edit_reply(refused).expect_err(refused);
         assert!(matches!(err, EditErr::Refused(_)), "{refused}: {err:?}");
         assert!(err.falls_back_to_terminal(), "{refused}");
         assert_eq!(err.to_string(), refused);
+    }
+    for busy in [
+        "ERR busy drafts (x)",
+        "ERR busy drafts (another aterm process is writing this file's draft)",
+        "ERR busy drafts",
+    ] {
+        let err = edit_reply(busy).expect_err(busy);
+        assert!(matches!(err, EditErr::Busy(_)), "{busy}: {err:?}");
+        assert!(
+            !err.falls_back_to_terminal(),
+            "{busy}: never split the draft"
+        );
+        assert_eq!(err.to_string(), busy);
     }
     let timed_out = edit_reply("ERR timeout ticket=12").expect_err("timeout");
     assert!(matches!(timed_out, EditErr::TimedOut(_)), "{timed_out:?}");
@@ -466,5 +481,21 @@ fn await_over_rejects_unsendable_uri_up_front_and_does_not_spin_on_post_cut_scop
             "must stop on the successor's refusal"
         );
         assert_eq!(wire.sent.len(), 2);
+    }
+}
+
+/// `edit` names a tab by its ID in either form, and its refusal of a malformed ID of either form
+/// names both forms, so a person holding a `t` ID is not told it is refused.
+#[test]
+fn an_edit_names_a_tab_by_either_form_and_its_refusal_says_so() {
+    for sid in ["s-0123456789abcdef0123", "tqn5r6e0148"] {
+        assert_eq!(edit_selector(sid), Ok(format!("@{sid}")));
+    }
+    for malformed in ["s-0123456789ABCDEF0123", "tqn5r6e014i", "tqn5r6e01"] {
+        let refusal = edit_selector(malformed).expect_err(malformed);
+        assert!(
+            refusal.contains("tqn5r6e0148") && refusal.contains("s-<hex>"),
+            "{malformed}: {refusal}"
+        );
     }
 }

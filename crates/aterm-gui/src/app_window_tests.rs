@@ -885,6 +885,42 @@ fn window_title_cwd_fallback_never_waits_for_the_terminal_parser() {
     );
 }
 
+/// A TASKED SESSION WITH NO TITLE TITLES ITS WINDOW BY ITS TASK'S LINE, BUSY OR NOT (tracker
+/// ST-02): the busy arm reads what the strip resolved, which is the line before the folder, so
+/// the free arm names the line too and the window title does not flip between the line and the
+/// folder as the reader thread takes and gives back the terminal. CONTROL: with no line the free
+/// arm reads the folder, as before.
+#[test]
+fn a_tasked_session_titles_its_window_by_its_line_busy_or_not() {
+    use crate::task_record::{FROM_CTL, TaskMark, TaskState, mark_session_task, task_line};
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.pool.get(0).expect("session 0");
+    let (ctx, term) = (session.ctx.clone(), session.term.clone());
+    crate::term_lock(&term).process(b"\x1b]7;file://localhost/aterm-proof/tasked\x07");
+    let mut slot = String::new();
+    app.window_title_identity(wid, "", &mut slot);
+    assert_eq!(slot, "/aterm-proof/tasked", "CONTROL: no task, the folder");
+
+    let mut mark = TaskMark::new(TaskState::Working);
+    mark.from = Some(FROM_CTL.to_owned());
+    mark_session_task(&ctx, 0, &mark).expect("unfenced");
+    {
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.set_task_worker(aterm_phase::Program::Claude, None);
+        timeline.set_task_line(task_line(b"Fix the flaky title test"));
+    }
+    app.on_task_changed(0);
+    let _ = app.tab_titles(wid);
+    app.window_title_identity(wid, "", &mut slot);
+    assert_eq!(slot, "Fix the flaky title test", "the terminal free");
+    {
+        let _reading = crate::term_lock(&term);
+        app.window_title_identity(wid, "", &mut slot);
+        assert_eq!(slot, "Fix the flaky title test", "the terminal busy");
+    }
+}
+
 #[test]
 fn spinner_phase_only_store_titles_are_coalesced() {
     let mut app = App::headless_for_test();

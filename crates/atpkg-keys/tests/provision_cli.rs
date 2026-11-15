@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Subprocess CLI tests for `atpkg-keys` provisioning with and without a controlling terminal.
+//! Subprocess CLI tests for `atpkg-keys` provisioning: the master phrase comes from the vault
+//! alone, and a Mac without it files `aterm secrets need paper-master`.
 
 #![cfg(unix)]
 #![allow(
@@ -16,10 +17,6 @@ use atpkg_keys::roster_ops::{add, empty};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-
-use crate::pty::Pty;
-
-use aterm_spec::wait::MUST_HAPPEN;
 
 /// An obviously synthetic master.
 const PAPER: &str = "0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0";
@@ -145,58 +142,10 @@ fn armed_tree(dir: &Path) -> String {
     master_pub
 }
 
-/// What a pty-driven run produced.
-struct TtyRun {
-    status: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
-    terminal: String,
-}
-
-/// Run the binary on a real terminal.
-fn run_on_a_terminal(dir: &Path, args: &[&str], reply: Option<(&str, &str)>) -> TtyRun {
-    let mut pty = Pty::open();
-    let mut child = pty.spawn(base_command(dir, args));
-    let mut terminal = String::new();
-
-    let deadline = std::time::Instant::now() + MUST_HAPPEN;
-    let mut replied = reply.is_none();
-    loop {
-        pty.drain(&mut terminal);
-        if let Some((marker, phrase)) = reply
-            && !replied
-            && terminal.contains(marker)
-        {
-            pty.type_line(phrase);
-            replied = true;
-        }
-        match child.try_wait().expect("wait on the child") {
-            Some(_) => break,
-            None => {
-                if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("the child never exited; terminal so far:\n{terminal}");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-    }
-    pty.drain(&mut terminal);
-    let out = child
-        .wait_with_output()
-        .expect("collect the child's output");
-    TtyRun {
-        status: out.status,
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        terminal,
-    }
-}
-
-/// The phrase line currently on the terminal.
-fn phrase_on(terminal: &str) -> Option<String> {
+/// The first phrase-shaped line of `text`: 52 symbols, spaces allowed.
+fn phrase_on(text: &str) -> Option<String> {
     const ALPHABET: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
-    terminal.lines().map(str::trim).find_map(|l| {
+    text.lines().map(str::trim).find_map(|l| {
         (!l.is_empty()
             && l.bytes().all(|b| b == b' ' || ALPHABET.contains(&b))
             && l.bytes().filter(|b| *b != b' ').count() == 52)
@@ -204,44 +153,50 @@ fn phrase_on(terminal: &str) -> Option<String> {
     })
 }
 
-/// Like [`run_on_a_terminal`], but types back the phrase on the terminal at `setup`'s retype
-/// prompt.
-fn run_on_a_terminal_retyping_phrase(dir: &Path, args: &[&str]) -> TtyRun {
-    let mut pty = Pty::open();
-    let mut child = pty.spawn(base_command(dir, args));
-    let mut terminal = String::new();
-
-    let deadline = std::time::Instant::now() + MUST_HAPPEN;
-    let mut replied = false;
-    loop {
-        pty.drain(&mut terminal);
-        if !replied && terminal.contains("retype the phrase FROM YOUR PAPER") {
-            let phrase = phrase_on(&terminal).expect("the phrase precedes the retype prompt");
-            pty.type_line(&phrase);
-            replied = true;
-        }
-        match child.try_wait().expect("wait on the child") {
-            Some(_) => break,
-            None => {
-                if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("the child never exited; terminal so far:\n{terminal}");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-    }
-    pty.drain(&mut terminal);
-    let out = child
-        .wait_with_output()
-        .expect("collect the child's output");
-    TtyRun {
-        status: out.status,
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        terminal,
-    }
+/// This home's vault paths.
+fn vault_paths(dir: &Path) -> aterm_secrets::client::Paths {
+    aterm_secrets::client::Paths::locate_for_home(dir)
 }
+
+/// This home's vault holding `phrase` in its store (replacing what it held), read in place as a
+/// member's sync leaves it: the vault is made here, with this Mac its admin, where the home has
+/// none yet.
+fn registry_holding(dir: &Path, phrase: &str) {
+    use aterm_secrets::{client, text::Audience};
+    let paths = vault_paths(dir);
+    if client::config(&paths).unwrap().is_none() {
+        admin_vault(dir);
+    }
+    let admin = client::admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Everyone,
+        aterm_secrets::paper_master::ENTRY,
+        phrase.as_bytes(),
+    )
+    .unwrap();
+    client::admin_publish(&paths, &admin, &doc).unwrap();
+}
+
+/// A vault at a local source with this home's Mac as its admin.
+fn admin_vault(dir: &Path) -> aterm_secrets::client::Paths {
+    let paths = vault_paths(dir);
+    let source = dir.join("test.vault");
+    aterm_secrets::client::create(&paths, source.to_str().unwrap(), None, Some("admin"))
+        .expect("a scratch vault");
+    paths
+}
+
+/// Whether this home's need ledger filed the paper master.
+fn filed_paper_master(dir: &Path) -> bool {
+    aterm_secrets::need::list(&vault_paths(dir)).is_ok_and(|needs| {
+        needs
+            .iter()
+            .any(|need| need.want == aterm_secrets::need::Want::PaperMaster)
+    })
+}
+
+const NEED: &str = "`aterm secrets need paper-master`";
 
 /// Every file under `dir`, scanned for `needle` and for any 16-character run of it.
 fn assert_nothing_on_disk_holds(dir: &Path, needle: &str) -> usize {
@@ -269,8 +224,10 @@ fn assert_nothing_on_disk_holds(dir: &Path, needle: &str) -> usize {
     checked
 }
 
+/// The phrase is never taken from the environment, stdin or a file: with none in the vault,
+/// `join` files `paper-master`, names that request and writes nothing.
 #[test]
-fn join_refuses_the_phrase_from_env_stdin_or_a_file() {
+fn join_without_the_phrase_in_the_vault_files_paper_master_and_writes_nothing() {
     let tmp = scratch("join-leak-vectors");
     let dir = tmp.path().to_path_buf();
     armed_tree(&dir);
@@ -299,14 +256,14 @@ fn join_refuses_the_phrase_from_env_stdin_or_a_file() {
     assert!(!out.status.success(), "join must refuse: {out:?}");
     let err = stderr_of(&out);
     assert!(
-        err.contains("/dev/tty"),
-        "the refusal must name where the master actually comes from: {err}"
+        err.contains(NEED),
+        "the refusal names the request it filed: {err}"
     );
+    assert!(filed_paper_master(&dir), "the need ledger holds it");
     assert!(
         !stdout_of(&out).contains(PAPER) && !err.contains(PAPER),
         "a refusal must never echo the phrase back"
     );
-
     assert!(
         !Path::new(&p(&dir, "m11.key")).exists(),
         "a refused join must mint no key"
@@ -316,25 +273,6 @@ fn join_refuses_the_phrase_from_env_stdin_or_a_file() {
         std::fs::read(p(&dir, "roster.toml")).unwrap(),
         before_roster
     );
-
-    let out = run(
-        &dir,
-        None,
-        &[
-            "join",
-            "--id",
-            "m11",
-            "--pins",
-            &p(&dir, "pins.rs"),
-            "--roster",
-            &p(&dir, "roster.toml"),
-            "--key",
-            &p(&dir, "m11.key"),
-        ],
-    );
-    assert!(!out.status.success());
-    assert!(stderr_of(&out).contains("/dev/tty"), "{}", stderr_of(&out));
-    assert!(!Path::new(&p(&dir, "m11.key")).exists());
 }
 
 #[test]
@@ -367,7 +305,7 @@ fn a_flag_that_would_carry_the_master_is_refused_and_calls_it_compromised() {
             err.contains("COMPROMISED"),
             "the refusal must say what the operator has to do about it: {err}"
         );
-        assert!(err.contains("/dev/tty"), "{err}");
+        assert!(err.contains("the vault"), "{err}");
         assert!(
             !err.contains(PAPER),
             "the refusal must not echo the value: {err}"
@@ -378,6 +316,7 @@ fn a_flag_that_would_carry_the_master_is_refused_and_calls_it_compromised() {
         before,
         "a refused run writes nothing"
     );
+    assert!(!filed_paper_master(&dir), "a refused flag reads no vault");
 
     let out = run(
         &dir,
@@ -397,12 +336,14 @@ fn a_flag_that_would_carry_the_master_is_refused_and_calls_it_compromised() {
         "{}",
         stderr_of(&out)
     );
-    assert!(stderr_of(&out).contains("/dev/tty"), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains(NEED), "{}", stderr_of(&out));
 }
 
+/// A Mac that cannot publish to a vault as its admin mints no master: nothing is written and no
+/// phrase appears anywhere.
 #[test]
-fn setup_without_a_terminal_refuses_and_writes_nothing() {
-    let tmp = scratch("setup-headless");
+fn setup_on_a_mac_that_cannot_write_the_vault_writes_nothing() {
+    let tmp = scratch("setup-no-vault");
     let dir = tmp.path().to_path_buf();
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");
     let before = std::fs::read(p(&dir, "pins.rs")).unwrap();
@@ -423,14 +364,11 @@ fn setup_without_a_terminal_refuses_and_writes_nothing() {
         ],
     );
 
-    assert!(
-        !out.status.success(),
-        "setup must refuse without a terminal"
-    );
+    assert!(!out.status.success(), "setup must refuse without a vault");
     let err = stderr_of(&out);
-    assert!(err.contains("/dev/tty"), "{err}");
+    assert!(err.contains("the vault did not take"), "{err}");
     assert!(
-        err.contains("no phrase was shown — no master exists"),
+        err.contains("no master exists as a result of this run"),
         "the refusal must state that no master exists: {err}"
     );
     assert_eq!(
@@ -440,12 +378,9 @@ fn setup_without_a_terminal_refuses_and_writes_nothing() {
     );
     assert!(!Path::new(&p(&dir, "m3.key")).exists());
     assert!(!Path::new(&p(&dir, "roster.toml")).exists());
-
-    let stdout = stdout_of(&out);
-    assert!(
-        phrase_on(&stdout).is_none(),
-        "no phrase-shaped line anywhere on stdout: {stdout}"
-    );
+    for text in [stdout_of(&out), err] {
+        assert!(phrase_on(&text).is_none(), "no phrase-shaped line: {text}");
+    }
 }
 
 #[test]
@@ -501,7 +436,11 @@ fn an_unread_flag_spelling_is_refused_rather_than_silently_replaced_by_a_default
         "{}",
         stderr_of(&out)
     );
-    assert!(stderr_of(&out).contains("/dev/tty"), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("no master exists as a result of this run"),
+        "{}",
+        stderr_of(&out)
+    );
 }
 
 #[test]
@@ -635,7 +574,7 @@ fn sign_and_verify_signed_take_the_same_files() {
 }
 
 #[test]
-fn machine_revoke_with_no_roster_refuses_before_asking_for_the_phrase() {
+fn machine_revoke_with_no_roster_refuses_before_reading_the_vault() {
     let tmp = scratch("revoke-no-roster");
     let dir = tmp.path().to_path_buf();
     let roster = p(&dir, "dist/aterm-machines.toml");
@@ -648,8 +587,8 @@ fn machine_revoke_with_no_roster_refuses_before_asking_for_the_phrase() {
     let err = stderr_of(&out);
     assert!(err.contains("no roster at "), "{err}");
     assert!(
-        !err.contains("/dev/tty"),
-        "refused before the phrase is asked for: {err}"
+        !err.contains("paper-master") && !filed_paper_master(&dir),
+        "refused before the vault is read: {err}"
     );
     assert!(
         !dir.join("dist").exists(),
@@ -670,14 +609,41 @@ fn machine_revoke_with_no_roster_refuses_before_asking_for_the_phrase() {
     );
     let err = stderr_of(&out);
     assert!(!err.contains("no roster at "), "{err}");
-    assert!(err.contains("/dev/tty"), "{err}");
+    assert!(err.contains(NEED), "{err}");
+}
+
+/// `machine-revoke` signs with the vault's phrase.
+#[test]
+fn machine_revoke_signs_with_the_vaults_phrase() {
+    let tmp = scratch("revoke-vault");
+    let dir = tmp.path().to_path_buf();
+    let master_pub = armed_tree(&dir);
+    registry_holding(&dir, PAPER);
+    let out = run(
+        &dir,
+        None,
+        &[
+            "machine-revoke",
+            "--id",
+            "m3",
+            "--roster",
+            &p(&dir, "roster.toml"),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let bytes = std::fs::read(p(&dir, "roster.toml")).unwrap();
+    let sig = std::fs::read(p(&dir, "roster.toml.sig")).unwrap();
+    let roster = Roster::parse(&verify_roster(&[&master_pub], bytes, &sig).expect("verifies"))
+        .expect("parses");
+    assert_eq!(roster.revoked, ["m3"]);
+    assert!(!stdout_of(&out).contains(PAPER) && !stderr_of(&out).contains(PAPER));
 }
 
 #[test]
 fn join_without_a_roster_refuses_instead_of_forking_one() {
     let tmp = scratch("join-no-roster");
     let dir = tmp.path().to_path_buf();
-    let master_pub = armed_tree(&dir);
+    armed_tree(&dir);
     std::fs::remove_file(p(&dir, "roster.toml")).unwrap();
     std::fs::remove_file(p(&dir, "roster.toml.sig")).unwrap();
 
@@ -707,7 +673,7 @@ fn join_without_a_roster_refuses_instead_of_forking_one() {
         err.contains("will not start a second roster"),
         "and why it will not do it for you: {err}"
     );
-    assert!(!err.contains("/dev/tty"), "{err}");
+    assert!(!err.contains("paper-master"), "{err}");
     assert!(
         !Path::new(&p(&dir, "roster.toml")).exists(),
         "no roster was created"
@@ -736,21 +702,21 @@ fn join_without_a_roster_refuses_instead_of_forking_one() {
     );
     let err = stderr_of(&out);
     assert!(!err.contains("no roster at"), "{err}");
-    assert!(
-        err.contains("/dev/tty"),
-        "it got as far as the prompt: {err}"
-    );
-    let _ = master_pub;
+    assert!(err.contains(NEED), "it got as far as the vault: {err}");
 }
 
+/// `setup` mints the master into the vault, the phrase's one store, and arms the anchor with
+/// it; the phrase is on no output and in no file but the vault's own.
 #[test]
-fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
-    let tmp = scratch("setup-tty");
+fn setup_mints_the_master_into_the_vault_and_shows_it_nowhere() {
+    let tmp = scratch("setup-vault");
     let dir = tmp.path().to_path_buf();
+    let vault = admin_vault(&dir);
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");
 
-    let run = run_on_a_terminal_retyping_phrase(
+    let out = run(
         &dir,
+        None,
         &[
             "setup",
             "--id",
@@ -764,46 +730,32 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
         ],
     );
     assert!(
-        run.status.success(),
-        "setup must succeed on a terminal.\nstderr: {}\nterminal: {}",
-        run.stderr,
-        run.terminal
+        out.status.success(),
+        "setup must succeed on the vault's admin Mac.\nstderr: {}",
+        stderr_of(&out)
     );
 
-    let phrase = phrase_on(&run.terminal).expect("the phrase on the terminal");
-    assert_eq!(
-        run.terminal.matches(phrase.as_str()).count(),
-        1,
-        "shown once and never repeated"
-    );
-    assert!(
-        run.terminal.contains("MASTER PHRASE — write it on paper"),
-        "the heading shares the surface with the line it is about: {}",
-        run.terminal
-    );
-    assert!(
-        run.terminal.contains("paper proven"),
-        "the transcription gate must confirm the paper before arming: {}",
-        run.terminal
-    );
-
-    assert!(!run.stdout.contains(&phrase), "stdout: {}", run.stdout);
-    assert!(!run.stderr.contains(&phrase), "stderr: {}", run.stderr);
-    for start in 0..48 {
-        assert!(!run.stdout.contains(&phrase[start..start + 16]));
-        assert!(!run.stderr.contains(&phrase[start..start + 16]));
+    let stored = aterm_secrets::paper_master::read(&vault).expect("the vault holds the phrase");
+    let phrase = std::str::from_utf8(stored.as_slice()).unwrap().to_owned();
+    assert!(aterm_secrets::paper_master::well_formed(phrase.as_bytes()));
+    for text in [stdout_of(&out), stderr_of(&out)] {
+        assert!(!text.contains(&phrase), "{text}");
+        for start in 0..36 {
+            assert!(!text.contains(&phrase[start..start + 16]), "{text}");
+        }
+        assert!(phrase_on(&text).is_none(), "{text}");
     }
 
     let src = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
     let master_pub = parse_master(&phrase)
-        .expect("the shown phrase parses")
+        .expect("the stored phrase parses")
         .seed()
         .pubkey_b64()
         .unwrap();
     assert_eq!(
         read_anchor(&src, MASTER_ANCHOR).unwrap().members,
         vec![master_pub.clone()],
-        "the tool wrote the anchor the operator would otherwise have pasted"
+        "the tool wrote the anchor of the vault's master"
     );
 
     let bytes = std::fs::read(p(&dir, "roster.toml")).unwrap();
@@ -827,29 +779,26 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
     let record = std::fs::read_to_string(dir.join(".aterm/release-ring/machine.toml")).unwrap();
     assert!(record.contains("id = \"m3\""), "{record}");
     assert!(
-        !dir.join(".aterm/machine.toml").exists(),
-        "provisioning writes the release ring record, never ~/.aterm/machine.toml"
+        stdout_of(&out).contains("the ONLY roster this master signs"),
+        "{}",
+        stdout_of(&out)
     );
 
-    assert!(
-        run.stdout.contains("a commit makes it durable"),
-        "{}",
-        run.stdout
-    );
-    assert!(
-        run.stdout.contains("the ONLY roster this master signs"),
-        "{}",
-        run.stdout
-    );
-
+    let kept = dir
+        .join(".secrets")
+        .join(aterm_secrets::paper_master::ENTRY);
+    let saved = std::fs::read(&kept).unwrap();
+    std::fs::remove_file(&kept).unwrap();
     let checked = assert_nothing_on_disk_holds(&dir, &phrase);
+    std::fs::write(&kept, saved).unwrap();
     assert!(
         checked >= 5,
         "the run must have written five files; saw {checked}"
     );
 
-    let again = run_on_a_terminal(
+    let again = run(
         &dir,
+        None,
         &[
             "setup",
             "--id",
@@ -861,13 +810,12 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
             "--key",
             &p(&dir, "m11.key"),
         ],
-        None,
     );
     assert!(!again.status.success());
     assert!(
-        again.stderr.contains("ALREADY committed"),
+        stderr_of(&again).contains("ALREADY committed"),
         "{}",
-        again.stderr
+        stderr_of(&again)
     );
     assert_eq!(
         std::fs::read_to_string(p(&dir, "pins.rs")).unwrap(),
@@ -876,16 +824,18 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
     );
 }
 
+/// A vault that already holds a phrase keeps it: `setup` on an unarmed tree mints nothing.
 #[test]
-fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
-    const RETYPE_PROMPT: &str = "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; an empty line or Ctrl-C aborts, nothing is armed): ";
-    let tmp = scratch("setup-retype-mismatch");
+fn setup_never_replaces_the_vaults_phrase() {
+    let tmp = scratch("setup-vault-held");
     let dir = tmp.path().to_path_buf();
+    let vault = admin_vault(&dir);
+    aterm_secrets::paper_master::store(&vault, PAPER.as_bytes()).unwrap();
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");
 
-    let mut pty = Pty::open();
-    let mut child = pty.spawn(base_command(
+    let out = run(
         &dir,
+        None,
         &[
             "setup",
             "--id",
@@ -897,156 +847,42 @@ fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
             "--key",
             &p(&dir, "m3.key"),
         ],
-    ));
-    let mut terminal = String::new();
-    let deadline = std::time::Instant::now() + MUST_HAPPEN;
-    let mut typed_wrong = false;
-    let mut typed_right = false;
-    loop {
-        pty.drain(&mut terminal);
-        if !typed_wrong && terminal.contains(RETYPE_PROMPT) {
-            let wrong = "7".repeat(51) + "0";
-            pty.type_line(&wrong);
-            typed_wrong = true;
-        }
-        if typed_wrong
-            && !typed_right
-            && let Some((_, retry)) = terminal.split_once("NO MATCH")
-            && retry.contains(RETYPE_PROMPT)
-        {
-            let phrase = phrase_on(retry).expect("the phrase is re-shown after NO MATCH");
-            let unarmed = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
-            assert!(
-                read_anchor(&unarmed, MASTER_ANCHOR)
-                    .unwrap()
-                    .members
-                    .is_empty(),
-                "a wrong retype must leave the master anchor unarmed"
-            );
-            pty.type_line(&phrase);
-            typed_right = true;
-        }
-        match child.try_wait().expect("wait on the child") {
-            Some(_) => break,
-            None => {
-                if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("the child never exited; terminal so far:\n{terminal}");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-    }
-    pty.drain(&mut terminal);
-    let out = child
-        .wait_with_output()
-        .expect("collect the child's output");
-
-    assert!(
-        out.status.success(),
-        "a corrected retype must arm: {terminal}"
     );
-    assert!(terminal.contains("NO MATCH"), "{terminal}");
-    let phrase = phrase_on(&terminal).expect("phrase shown");
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(err.contains("already holds"), "{err}");
     assert!(
-        terminal.matches(phrase.as_str()).count() >= 2,
-        "the phrase is re-shown after a mismatch: {terminal}"
+        err.contains("no master exists as a result of this run"),
+        "{err}"
     );
-    let src = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
-    let master_pub = parse_master(&phrase)
-        .expect("parses")
-        .seed()
-        .pubkey_b64()
-        .unwrap();
     assert_eq!(
-        read_anchor(&src, MASTER_ANCHOR).unwrap().members,
-        vec![master_pub]
+        std::fs::read_to_string(p(&dir, "pins.rs")).unwrap(),
+        pins_fixture("")
+    );
+    assert!(!Path::new(&p(&dir, "m3.key")).exists());
+    assert_eq!(
+        aterm_secrets::paper_master::read(&vault)
+            .unwrap()
+            .as_slice(),
+        PAPER.as_bytes()
     );
 }
 
+/// `join` takes the vault's phrase: a phrase that derives another master writes nothing, and the
+/// committed one extends the roster.
 #[test]
-fn overlong_and_split_utf8_retypes_reprompt_cleanly() {
-    const RETYPE_PROMPT: &str = "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; an empty line or Ctrl-C aborts, nothing is armed): ";
-    let tmp = scratch("setup-retype-overlong");
-    let dir = tmp.path().to_path_buf();
-    std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");
-
-    let mut pty = Pty::open();
-    let mut child = pty.spawn(base_command(
-        &dir,
-        &[
-            "setup",
-            "--id",
-            "m3",
-            "--pins",
-            &p(&dir, "pins.rs"),
-            "--roster",
-            &p(&dir, "roster.toml"),
-            "--key",
-            &p(&dir, "m3.key"),
-        ],
-    ));
-    let mut terminal = String::new();
-    let deadline = std::time::Instant::now() + MUST_HAPPEN;
-    let mut step = 0u8;
-    loop {
-        pty.drain(&mut terminal);
-        if step == 0 && terminal.contains(RETYPE_PROMPT) {
-            // 255 spaces + 2-byte UTF-8 'é' crosses the 256-byte read chunk mid-codepoint;
-            // it must report BadChar at position 1 rather than aborting as empty input.
-            let split_utf8 = format!("{}\u{e9}", " ".repeat(255));
-            pty.type_line(&split_utf8);
-            step = 1;
-        } else if step == 1
-            && terminal.contains("character 1 of the master phrase")
-            && terminal.matches(RETYPE_PROMPT).count() >= 2
-        {
-            // Overlong (> 256 byte) input must drain through '\n' and report the full count.
-            pty.type_line(&"7".repeat(300));
-            step = 2;
-        } else if step == 2
-            && terminal.contains("this one has 300")
-            && terminal.matches(RETYPE_PROMPT).count() >= 3
-        {
-            let phrase = phrase_on(&terminal).expect("phrase shown before retype");
-            pty.type_line(&phrase);
-            step = 3;
-        }
-        match child.try_wait().expect("wait on the child") {
-            Some(_) => break,
-            None => {
-                if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    panic!("the child never exited at step {step}; terminal so far:\n{terminal}");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-    }
-    pty.drain(&mut terminal);
-    let out = child
-        .wait_with_output()
-        .expect("collect the child's output");
-    assert!(
-        out.status.success(),
-        "setup must recover and arm after overlong/split-utf8 typos.\nstderr: {}\nterminal: {}",
-        String::from_utf8_lossy(&out.stderr),
-        terminal
-    );
-    assert!(terminal.contains("paper proven"), "{terminal}");
-}
-
-#[test]
-fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
-    let tmp = scratch("join-tty");
+fn join_reads_the_phrase_from_the_vault_and_extends_the_roster() {
+    let tmp = scratch("join-vault");
     let dir = tmp.path().to_path_buf();
     let master_pub = armed_tree(&dir);
     let before_pins = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
 
     let mut wrong = String::from(PAPER);
     wrong.replace_range(0..1, "f");
-    let bad = run_on_a_terminal(
+    registry_holding(&dir, &wrong);
+    let bad = run(
         &dir,
+        None,
         &[
             "join",
             "--id",
@@ -1058,14 +894,12 @@ fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
             "--key",
             &p(&dir, "m11.key"),
         ],
-        Some(("master phrase", &wrong)),
     );
-    assert!(!bad.status.success(), "a wrong phrase must be refused");
+    assert!(!bad.status.success(), "another master must be refused");
     assert!(
-        bad.stderr.contains("is NOT the master committed"),
-        "stderr: {}\nterminal: {}",
-        bad.stderr,
-        bad.terminal
+        stderr_of(&bad).contains("is NOT the master committed"),
+        "stderr: {}",
+        stderr_of(&bad)
     );
     assert_eq!(
         std::fs::read_to_string(p(&dir, "pins.rs")).unwrap(),
@@ -1073,14 +907,12 @@ fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
         "a refused join writes nothing"
     );
     assert!(!Path::new(&p(&dir, "m11.key")).exists());
-    assert!(
-        !bad.terminal.contains(&wrong),
-        "the phrase was echoed: {}",
-        bad.terminal
-    );
+    assert!(!stderr_of(&bad).contains(&wrong) && !stdout_of(&bad).contains(&wrong));
 
-    let good = run_on_a_terminal(
+    registry_holding(&dir, PAPER);
+    let good = run(
         &dir,
+        None,
         &[
             "join",
             "--id",
@@ -1092,19 +924,9 @@ fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
             "--key",
             &p(&dir, "m11.key"),
         ],
-        Some(("master phrase", PAPER)),
     );
-    assert!(
-        good.status.success(),
-        "stderr: {}\nterminal: {}",
-        good.stderr,
-        good.terminal
-    );
-    assert!(
-        !good.terminal.contains(PAPER),
-        "echo stays off on the happy path too"
-    );
-    assert!(!good.stdout.contains(PAPER), "{}", good.stdout);
+    assert!(good.status.success(), "stderr: {}", stderr_of(&good));
+    assert!(!stdout_of(&good).contains(PAPER) && !stderr_of(&good).contains(PAPER));
 
     let src = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
     assert_eq!(
@@ -1123,18 +945,44 @@ fn join_over_a_real_terminal_reads_the_phrase_and_extends_the_roster() {
         "the sequence advanced rather than restarting"
     );
     assert!(
-        !good.stdout.contains("the ONLY roster this master signs"),
+        !stdout_of(&good).contains("the ONLY roster this master signs"),
         "join extended a roster; it must not claim to have created one: {}",
-        good.stdout
+        stdout_of(&good)
     );
-
-    assert_nothing_on_disk_holds(&dir, PAPER);
 }
 
+/// `master-check` derives the vault's master and refuses one this build does not pin; without a
+/// phrase it files `paper-master`.
+#[test]
+fn master_check_reads_the_vault_and_holds_it_to_the_compiled_anchor() {
+    let tmp = scratch("master-check");
+    let dir = tmp.path().to_path_buf();
+    let out = run(&dir, None, &["master-check"]);
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains(NEED), "{}", stderr_of(&out));
+
+    registry_holding(&dir, PAPER);
+    let out = run(&dir, None, &["master-check"]);
+    assert!(
+        !out.status.success(),
+        "a synthetic master is pinned by no build"
+    );
+    assert!(
+        stdout_of(&out).contains("master fingerprint: "),
+        "{}",
+        stdout_of(&out)
+    );
+    assert!(stderr_of(&out).contains("derives no master this build pins"));
+    assert!(!stdout_of(&out).contains(PAPER) && !stderr_of(&out).contains(PAPER));
+}
+
+/// The vault took the phrase but the anchor could not be written: nothing else is written, and
+/// the refusal says how to clear the vault's orphan before a new run.
 #[test]
 fn a_setup_that_cannot_write_the_anchor_leaves_it_unarmed_and_says_so() {
     let tmp = scratch("setup-unwritable");
     let dir = tmp.path().to_path_buf();
+    admin_vault(&dir);
     let anchor_dir = dir.join("anchor");
     std::fs::create_dir_all(&anchor_dir).unwrap();
     let pins = anchor_dir.join("pins.rs").to_str().unwrap().to_string();
@@ -1143,8 +991,9 @@ fn a_setup_that_cannot_write_the_anchor_leaves_it_unarmed_and_says_so() {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(&anchor_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-    let run = run_on_a_terminal_retyping_phrase(
+    let out = run(
         &dir,
+        None,
         &[
             "setup",
             "--id",
@@ -1159,29 +1008,24 @@ fn a_setup_that_cannot_write_the_anchor_leaves_it_unarmed_and_says_so() {
     );
     std::fs::set_permissions(&anchor_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    assert!(!run.status.success(), "the run must fail: {}", run.terminal);
+    assert!(!out.status.success(), "the run must fail");
+    let err = stderr_of(&out);
+    assert!(err.contains("arms nothing"), "stderr: {err}");
     assert!(
-        run.stderr.contains("THE PHRASE ABOVE ARMS NOTHING"),
-        "stderr: {}",
-        run.stderr
+        err.contains("aterm secrets unset release-paper-master"),
+        "{err}"
     );
-    assert!(run.stderr.contains("DESTROY"), "{}", run.stderr);
     assert_eq!(
         std::fs::read_to_string(&pins).unwrap(),
         pins_fixture(""),
-        "THE ANCHOR IS UNARMED — this is the whole point of the ordering"
+        "THE ANCHOR IS UNARMED"
     );
     assert!(!Path::new(&p(&dir, "roster.toml")).exists());
     assert!(!Path::new(&p(&dir, "m3.key")).exists());
-    assert!(
-        phrase_on(&run.terminal).is_some(),
-        "terminal: {}",
-        run.terminal
-    );
 }
 
 #[test]
-fn join_on_an_unarmed_tree_refuses_before_the_prompt() {
+fn join_on_an_unarmed_tree_refuses_before_the_vault() {
     let tmp = scratch("join-unarmed");
     let dir = tmp.path().to_path_buf();
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).unwrap();
@@ -1204,7 +1048,10 @@ fn join_on_an_unarmed_tree_refuses_before_the_prompt() {
     let err = stderr_of(&out);
     assert!(err.contains("no paper master is committed"), "{err}");
     assert!(err.contains("setup"), "{err}");
-    assert!(!err.contains("/dev/tty"), "{err}");
+    assert!(
+        !err.contains("paper-master") && !filed_paper_master(&dir),
+        "{err}"
+    );
 }
 
 #[test]

@@ -12,14 +12,16 @@ use atpkg_publish::artifact::package::{
     self, PackageOutcome, PackageRequest, binaries_sha256, compiler_id, dev_version, names_repo,
 };
 use atpkg_publish::channel::Log;
-use atpkg_publish::channel::index::{parse_delta, publish_with};
+use atpkg_publish::channel::index::{
+    PreparedPublication, PublicationObserver, parse_delta, publish_with,
+};
 use atpkg_publish::channel::mirror::{self, MirrorOptions};
 use atpkg_publish::ctx::{Ctx, HostChoice};
 use atpkg_publish::error::Error;
 use atpkg_publish::host::Slug;
 use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::quad::{self, QUAD_FILES};
-use atpkg_publish::testkit::Keys;
+use atpkg_publish::testkit::{FAR_FUTURE, Keys};
 
 use super::super::shared::{Made, made_once};
 use super::fixture::{
@@ -99,20 +101,8 @@ fn a_regular_release_binds_explicit_atpkg_ownership_to_committed_version_and_bas
 #[test]
 fn a_campaign_retains_exact_signed_inputs_before_publication_and_reopens_without_the_working_output()
  {
-    use atpkg_publish::channel::index::{
-        PreparedPublication, PublicationObserver, publish_with_observer,
-    };
-    use atpkg_publish::package_campaign::{Campaign, Intent, Observation, Retention};
-
-    struct StopAfterRetention<'a>(Retention<'a>);
-    impl PublicationObserver for StopAfterRetention<'_> {
-        fn before_publish(&mut self, prepared: &PreparedPublication<'_>) -> Result<(), Error> {
-            self.0.before_publish(prepared)?;
-            Err(Error::cannot_run(
-                "fixture lost the caller after durable retention",
-            ))
-        }
-    }
+    use atpkg_publish::channel::index::publish_with_observer;
+    use atpkg_publish::package_campaign::{Campaign, Intent, Observation, Outcome};
 
     let w = world("pkg-campaign-signed-inputs");
     let root = regular_campaign_package(&w);
@@ -226,10 +216,17 @@ fn a_campaign_retains_exact_signed_inputs_before_publication_and_reopens_without
             &w.tools,
             &inputs,
             &signed_root,
+            None,
             &mut Log::capture("resume"),
         )
         .unwrap();
-    assert_eq!(published.published.index_build, 72);
+    assert_eq!(
+        published,
+        Outcome {
+            index_build: 72,
+            published_now: true
+        }
+    );
     assert_eq!(
         atpkg_publish::channel::index::quad_digests(resumed.candidate()).unwrap(),
         original
@@ -247,10 +244,17 @@ fn a_campaign_retains_exact_signed_inputs_before_publication_and_reopens_without
             &w.tools,
             &inputs,
             &signed_root,
+            None,
             &mut Log::capture("repeat"),
         )
         .unwrap();
-    assert_eq!(repeated.published.index_build, 72);
+    assert_eq!(
+        repeated,
+        Outcome {
+            index_build: 72,
+            published_now: false
+        }
+    );
     assert_eq!(
         w.host
             .calls()
@@ -279,20 +283,57 @@ fn a_campaign_retains_exact_signed_inputs_before_publication_and_reopens_without
         73
     );
     let before = w.host.calls();
+    // A newer head over the campaign's own public index finishes nothing new:
+    // the campaign reads its index back and reports it, and never repins.
+    let superseded = reopened
+        .publish_package(
+            &w.ctx,
+            &package_request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            None,
+            &mut Log::capture("superseded campaign"),
+        )
+        .unwrap();
+    assert_eq!(
+        superseded,
+        Outcome {
+            index_build: 72,
+            published_now: false
+        }
+    );
     let error = reopened
         .resume_index(&w.ctx, &mut Log::capture("superseded"))
         .unwrap_err();
     assert!(error.to_string().contains("refusing to repin"), "{error}");
-    let writes = |calls: &[String]| {
-        calls
-            .iter()
-            .filter(|call| {
-                call.starts_with("create")
-                    || call.starts_with("upload")
-                    || call.starts_with("publish-draft")
-            })
-            .count()
-    };
+    // A crash between the public index and its receipt loses only the receipt: the
+    // channel still serves the campaign's index, so it is recorded again, never repinned.
+    drop(reopened);
+    lose_the_last_receipt(&journal, "index-published");
+    let mut reopened = Campaign::open(&journal, &frozen).unwrap();
+    assert_eq!(
+        reopened
+            .publish_package(
+                &w.ctx,
+                &package_request,
+                &w.tools,
+                &inputs,
+                &signed_root,
+                None,
+                &mut Log::capture("receipt lost"),
+            )
+            .unwrap(),
+        Outcome {
+            index_build: 72,
+            published_now: false
+        }
+    );
+    assert!(
+        reopened
+            .observations()
+            .any(|event| matches!(event, Observation::IndexPublished { build: 72, .. }))
+    );
     assert_eq!(writes(&w.host.calls()), writes(&before));
     std::fs::write(resumed.candidate().file(QUAD_FILES[0]), b"truncated").unwrap();
     assert!(reopened.retained_index(&w.ctx).is_err());
@@ -300,7 +341,7 @@ fn a_campaign_retains_exact_signed_inputs_before_publication_and_reopens_without
 
 #[test]
 fn a_package_campaign_publishes_from_native_qualification_and_repeats_the_same_index() {
-    use atpkg_publish::package_campaign::{Campaign, Intent, Observation};
+    use atpkg_publish::package_campaign::{Campaign, Intent, Observation, Outcome};
     let w = world("pkg-campaign-complete-publication");
     let root = regular_campaign_package(&w);
     let pkg =
@@ -328,10 +369,17 @@ fn a_package_campaign_publishes_from_native_qualification_and_repeats_the_same_i
             &w.tools,
             &inputs,
             &signed_root,
+            None,
             &mut Log::capture("publish"),
         )
         .unwrap();
-    assert_eq!(published.published.index_build, 72);
+    assert_eq!(
+        published,
+        Outcome {
+            index_build: 72,
+            published_now: true
+        }
+    );
     assert!(
         campaign
             .observations()
@@ -353,12 +401,14 @@ fn a_package_campaign_publishes_from_native_qualification_and_repeats_the_same_i
                 &w.tools,
                 &inputs,
                 &signed_root,
+                None,
                 &mut Log::capture("repeat"),
             )
-            .unwrap()
-            .published
-            .index_build,
-        72
+            .unwrap(),
+        Outcome {
+            index_build: 72,
+            published_now: false
+        }
     );
     assert_eq!(
         w.host
@@ -368,6 +418,872 @@ fn a_package_campaign_publishes_from_native_qualification_and_repeats_the_same_i
             .count(),
         creates
     );
+}
+
+#[test]
+fn a_campaign_that_loses_its_index_race_retires_the_attempt_and_plans_over_the_winner() {
+    use atpkg_publish::package_campaign::{Campaign, Observation, Outcome};
+
+    let w = world("pkg-campaign-lost-race");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let slug = w.ctx.index_slug();
+    let winner = w
+        .keys
+        .index_toml(72, &[("codex", "aterm")], &[("codex", LIVE_CODEX)]);
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    lose_the_race_for_72(&w, &mut campaign, &request, &inputs, &signed_root, &winner);
+
+    let published = campaign
+        .publish_package(
+            &w.ctx,
+            &request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            None,
+            &mut Log::capture("after the lost race"),
+        )
+        .unwrap();
+    assert_eq!(
+        published,
+        Outcome {
+            index_build: 73,
+            published_now: true
+        }
+    );
+    assert!(campaign.observations().any(|event| matches!(
+        event,
+        Observation::IndexRetired {
+            build: 72,
+            head_build: 72,
+            ..
+        }
+    )));
+    assert!(
+        campaign
+            .observations()
+            .any(|event| matches!(event, Observation::IndexPublished { build: 73, .. }))
+    );
+    assert_eq!(
+        w.host
+            .asset(&slug, "atpkg-index-72", QUAD_FILES[0])
+            .as_deref(),
+        Some(winner.as_bytes()),
+        "the winner's index is never clobbered"
+    );
+    let head = String::from_utf8(
+        w.host
+            .asset(&slug, "atpkg-index-73", QUAD_FILES[0])
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(head.contains(&format!("codex = {ALAB}")), "{head}");
+
+    let before = writes(&w.host.calls());
+    assert_eq!(
+        campaign
+            .publish_package(
+                &w.ctx,
+                &request,
+                &w.tools,
+                &inputs,
+                &signed_root,
+                None,
+                &mut Log::capture("repeat"),
+            )
+            .unwrap(),
+        Outcome {
+            index_build: 73,
+            published_now: false
+        }
+    );
+    assert_eq!(writes(&w.host.calls()), before);
+}
+
+#[test]
+fn a_campaign_that_loses_its_race_to_a_yank_never_repins_the_yanked_build() {
+    use atpkg_publish::package_campaign::{Campaign, Observation, Outcome};
+
+    let w = world("pkg-campaign-lost-to-a-yank");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let slug = w.ctx.index_slug();
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    // The winner of index 72 yanks the very build this campaign pins: no client
+    // installs a yanked ALab pin, so an index pinning it would reach nobody.
+    lose_the_race_for_72(
+        &w,
+        &mut campaign,
+        &request,
+        &inputs,
+        &signed_root,
+        &yanking_index(&w, 72),
+    );
+    let publish = |campaign: &mut Campaign, label: &'static str| {
+        campaign.publish_package(
+            &w.ctx,
+            &request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            None,
+            &mut Log::capture(label),
+        )
+    };
+    let before = writes(&w.host.calls());
+    for label in ["after the lost race", "again"] {
+        let refused = publish(&mut campaign, label).unwrap_err();
+        let why = refused.to_string();
+        assert!(matches!(refused, Error::Refused(_)), "{why}");
+        assert!(
+            why.contains(&format!("atpkg-index-72 yanks codex@{ALAB}")),
+            "{why}"
+        );
+        assert!(why.contains(&format!("--unyank codex@{ALAB}")), "{why}");
+    }
+    // The retirement closes the attempt for good: the second run judged no retained
+    // candidate, and the retired snapshot is no custody any run reads again.
+    let retired: Vec<_> = campaign
+        .observations()
+        .filter(|event| matches!(event, Observation::IndexRetired { .. }))
+        .collect();
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert!(matches!(
+        retired[0],
+        Observation::IndexRetired {
+            build: 72,
+            head_build: 72,
+            ..
+        }
+    ));
+    assert!(campaign.retained_index(&w.ctx).unwrap().is_none());
+    let snapshots: Vec<PathBuf> = std::fs::read_dir(w.root.join("campaign"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("index-72-"))
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    std::fs::remove_dir_all(&snapshots[0]).unwrap();
+    assert_eq!(
+        writes(&w.host.calls()),
+        before,
+        "nothing pins the yanked build"
+    );
+    assert!(
+        w.host
+            .asset(&slug, "atpkg-index-73", QUAD_FILES[0])
+            .is_none()
+    );
+
+    // The act the refusal names clears it: an index that lifts the yank.
+    w.keys.publish_quad(
+        &w.host,
+        &slug,
+        73,
+        &w.keys
+            .index_toml(73, &[("codex", "aterm")], &[("codex", LIVE_CODEX)]),
+    );
+    assert_eq!(
+        publish(&mut campaign, "after the unyank").unwrap(),
+        Outcome {
+            index_build: 74,
+            published_now: true
+        }
+    );
+    let head = String::from_utf8(
+        w.host
+            .asset(&slug, "atpkg-index-74", QUAD_FILES[0])
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(head.contains(&format!("codex = {ALAB}")), "{head}");
+    assert!(!head.contains("yanked"), "{head}");
+}
+
+#[test]
+fn a_campaign_that_loses_its_race_to_an_index_pinning_its_build_publishes_its_own() {
+    use atpkg_publish::package_campaign::{Campaign, Outcome};
+
+    // A head that already pins exactly the frozen build admits it: the plan moves
+    // no pin, as the native publish of the same pin over that head would.
+    let w = world("pkg-campaign-lost-to-the-same-pin");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let slug = w.ctx.index_slug();
+    let winner = w
+        .keys
+        .index_toml(72, &[("codex", "codex-alab")], &[("codex", ALAB)])
+        .replace("min_build = 0\n", "min_build = 1\n");
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    lose_the_race_for_72(&w, &mut campaign, &request, &inputs, &signed_root, &winner);
+    assert_eq!(
+        campaign
+            .publish_package(
+                &w.ctx,
+                &request,
+                &w.tools,
+                &inputs,
+                &signed_root,
+                None,
+                &mut Log::capture("over the same pin"),
+            )
+            .unwrap(),
+        Outcome {
+            index_build: 73,
+            published_now: true
+        }
+    );
+    let head = String::from_utf8(
+        w.host
+            .asset(&slug, "atpkg-index-73", QUAD_FILES[0])
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(head.contains(&format!("codex = {ALAB}")), "{head}");
+    assert!(head.contains("min_build = 1\n"), "{head}");
+}
+
+#[test]
+fn a_campaign_refuses_a_head_that_supersedes_or_floors_its_build_before_staging() {
+    use atpkg_publish::package_campaign::{Campaign, Observation};
+
+    let w = world("pkg-campaign-withdrawn-build");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let slug = w.ctx.index_slug();
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    let mut refused = || {
+        campaign
+            .publish_package(
+                &w.ctx,
+                &request,
+                &w.tools,
+                &inputs,
+                &signed_root,
+                None,
+                &mut Log::capture("withdrawn"),
+            )
+            .unwrap_err()
+            .to_string()
+    };
+    let before = writes(&w.host.calls());
+    // Another publisher pins a newer codex, and an index never lowers a pin.
+    w.keys.publish_quad(
+        &w.host,
+        &slug,
+        72,
+        &w.keys
+            .index_toml(72, &[("codex", "codex-alab")], &[("codex", ALAB + 1)]),
+    );
+    let superseded = refused();
+    assert!(
+        superseded.contains(&format!(
+            "atpkg-index-72 pins codex {}, above this campaign's frozen {ALAB}",
+            ALAB + 1
+        )),
+        "{superseded}"
+    );
+    assert!(superseded.contains("new --state"), "{superseded}");
+    // A floor above the frozen build: no client installs an ALab pin below it.
+    w.keys.publish_quad(
+        &w.host,
+        &slug,
+        73,
+        &w.keys
+            .index_toml(73, &[("codex", "aterm")], &[("codex", LIVE_CODEX)])
+            .replace("min_build = 0\n", &format!("min_build = {}\n", ALAB + 1)),
+    );
+    let floored = refused();
+    assert!(
+        floored.contains(&format!(
+            "atpkg-index-73 holds codex at a floor of {}",
+            ALAB + 1
+        )),
+        "{floored}"
+    );
+    assert_eq!(
+        writes(&w.host.calls()),
+        before,
+        "nothing is staged for a build the channel can never pin"
+    );
+    assert!(
+        !campaign
+            .observations()
+            .any(|event| matches!(event, Observation::Staged { .. }))
+    );
+}
+
+#[test]
+fn a_campaign_never_retains_an_index_over_a_head_that_yanks_its_build() {
+    use atpkg_publish::channel::index::publish_with_observer;
+    use atpkg_publish::package_campaign::{Campaign, Observation};
+
+    // The native plan only warns about pinning a yanked build. The campaign's
+    // retention refuses it before any public write, so a head that moved after
+    // the campaign judged the channel never carries the pin either.
+    let w = world("pkg-campaign-retention-over-a-yank");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let slug = w.ctx.index_slug();
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    campaign
+        .stage_package(&w.ctx, &request, &w.tools, &inputs, &signed_root)
+        .unwrap();
+    w.keys
+        .publish_quad(&w.host, &slug, 72, &yanking_index(&w, 72));
+    let before = writes(&w.host.calls());
+    let error = publish_with_observer(
+        &w.ctx,
+        &campaign_index(&w),
+        &mut Log::capture("over a yank"),
+        &mut campaign.retention(&w.ctx),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("atpkg-index-72 yanks codex@{ALAB}")),
+        "{error}"
+    );
+    assert_eq!(writes(&w.host.calls()), before);
+    assert!(
+        w.host
+            .asset(&slug, "atpkg-index-73", QUAD_FILES[0])
+            .is_none()
+    );
+    assert!(
+        !campaign
+            .observations()
+            .any(|event| matches!(event, Observation::IndexPrepared { .. }))
+    );
+}
+
+#[test]
+fn a_lapsed_retained_candidate_is_retired_and_a_lapsed_publication_still_reads_back_done() {
+    use atpkg_publish::channel::index::publish_with_observer;
+    use atpkg_publish::package_campaign::{Campaign, Observation, Outcome};
+
+    const NEAR: &str = "2026-12-01T00:00:00Z";
+    const LATER: &str = "2027-06-01T00:00:00Z";
+    let w = world("pkg-campaign-lapsed");
+    let root = regular_campaign_package(&w);
+    let slug = w.ctx.index_slug();
+    // A campaign's candidate carries the head's horizon.
+    w.keys.publish_quad(
+        &w.host,
+        &slug,
+        71,
+        &w.keys
+            .index_toml(71, &[("codex", "aterm")], &[("codex", LIVE_CODEX)])
+            .replace(FAR_FUTURE, NEAR),
+    );
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    campaign
+        .stage_package(&w.ctx, &request, &w.tools, &inputs, &signed_root)
+        .unwrap();
+    let mut observer = StopAfterRetention(campaign.retention(&w.ctx));
+    publish_with_observer(
+        &w.ctx,
+        &campaign_index(&w),
+        &mut Log::capture("retained"),
+        &mut observer,
+    )
+    .unwrap_err();
+    let retained = observer.0.into_retained().unwrap();
+    assert_eq!(retained.candidate().index.index_build, 72);
+    assert_eq!(retained.candidate().index.valid_until, NEAR);
+
+    // 2026-12-02: the head and the retained candidate signed over it have lapsed.
+    let mut lapsed = w.ctx.clone();
+    lapsed.now_unix = 1_796_169_600;
+    let publish = |campaign: &mut Campaign, ctx: &Ctx, valid_until: Option<&str>| {
+        campaign.publish_package(
+            ctx,
+            &request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            valid_until,
+            &mut Log::capture("lapsed"),
+        )
+    };
+    let error = publish(&mut campaign, &lapsed, None).unwrap_err();
+    assert!(error.to_string().contains("--valid-until"), "{error}");
+    assert!(campaign.observations().any(|event| matches!(
+        event,
+        Observation::IndexRetired {
+            build: 72,
+            head_build: 71,
+            ..
+        }
+    )));
+    assert!(
+        w.host
+            .asset(&slug, "atpkg-index-72", QUAD_FILES[0])
+            .is_none()
+    );
+
+    assert_eq!(
+        publish(&mut campaign, &lapsed, Some(LATER)).unwrap(),
+        Outcome {
+            index_build: 72,
+            published_now: true
+        }
+    );
+    let index = String::from_utf8(
+        w.host
+            .asset(&slug, "atpkg-index-72", QUAD_FILES[0])
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        index.contains(&format!("valid_until = \"{LATER}\"")),
+        "{index}"
+    );
+    assert!(index.contains(&format!("codex = {ALAB}")), "{index}");
+
+    // 2027-06-02: the campaign's own public index has lapsed as well. Its public
+    // readback still matches the receipt, so the campaign reports it and writes nothing.
+    let mut later = w.ctx.clone();
+    later.now_unix = 1_811_894_400;
+    let before = writes(&w.host.calls());
+    assert_eq!(
+        publish(&mut campaign, &later, None).unwrap(),
+        Outcome {
+            index_build: 72,
+            published_now: false
+        }
+    );
+    assert_eq!(writes(&w.host.calls()), before);
+}
+
+#[test]
+fn a_campaign_whose_head_skipped_its_number_retires_the_attempt_and_plans_over_the_head() {
+    use atpkg_publish::package_campaign::{Campaign, Observation, Outcome};
+
+    let w = world("pkg-campaign-head-skipped");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let slug = w.ctx.index_slug();
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    retain_72_unpublished(&w, &mut campaign, &request, &inputs, &signed_root);
+    // Another publisher's 73 heads the channel, and nothing holds 72.
+    w.keys.publish_quad(
+        &w.host,
+        &slug,
+        73,
+        &w.keys
+            .index_toml(73, &[("codex", "aterm")], &[("codex", LIVE_CODEX)]),
+    );
+    assert_eq!(
+        campaign
+            .publish_package(
+                &w.ctx,
+                &request,
+                &w.tools,
+                &inputs,
+                &signed_root,
+                None,
+                &mut Log::capture("past the head"),
+            )
+            .unwrap(),
+        Outcome {
+            index_build: 74,
+            published_now: true
+        }
+    );
+    assert!(campaign.observations().any(|event| matches!(
+        event,
+        Observation::IndexRetired {
+            build: 72,
+            head_build: 73,
+            ..
+        }
+    )));
+    assert!(
+        w.host
+            .asset(&slug, "atpkg-index-72", QUAD_FILES[0])
+            .is_none(),
+        "the retired candidate is never published"
+    );
+    let head = String::from_utf8(
+        w.host
+            .asset(&slug, "atpkg-index-74", QUAD_FILES[0])
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(head.contains(&format!("codex = {ALAB}")), "{head}");
+}
+
+#[test]
+fn a_campaign_whose_index_the_route_serves_in_part_waits_then_reads_it_back_as_published() {
+    use atpkg_publish::package_campaign::{Campaign, Observation, Outcome};
+
+    let w = world("pkg-campaign-partial-route");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let slug = w.ctx.index_slug();
+    let journal = w.root.join("campaign");
+    let publish = |campaign: &mut Campaign, label: &'static str| {
+        campaign.publish_package(
+            &w.ctx,
+            &request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            None,
+            &mut Log::capture(label),
+        )
+    };
+    let mut campaign = Campaign::open(&journal, &intent).unwrap();
+    assert_eq!(
+        publish(&mut campaign, "publish").unwrap(),
+        Outcome {
+            index_build: 72,
+            published_now: true
+        }
+    );
+    // A crash lost the publication's receipt, and the download route has caught up
+    // with index.toml alone.
+    drop(campaign);
+    lose_the_last_receipt(&journal, "index-published");
+    for name in &QUAD_FILES[1..] {
+        w.host.lag_public(&slug, "atpkg-index-72", name, 1);
+    }
+    let mut campaign = Campaign::open(&journal, &intent).unwrap();
+    let before = writes(&w.host.calls());
+    let error = publish(&mut campaign, "in part").unwrap_err();
+    let why = error.to_string();
+    assert!(matches!(error, Error::CannotRun(_)), "{why}");
+    assert!(
+        why.contains("serves only part of atpkg-index-72") && why.contains("re-run once"),
+        "{why}"
+    );
+    assert!(!campaign.observations().any(|event| matches!(
+        event,
+        Observation::IndexRetired { .. } | Observation::IndexPublished { .. }
+    )));
+    assert_eq!(
+        publish(&mut campaign, "caught up").unwrap(),
+        Outcome {
+            index_build: 72,
+            published_now: false
+        }
+    );
+    assert!(
+        campaign
+            .observations()
+            .any(|event| matches!(event, Observation::IndexPublished { build: 72, .. }))
+    );
+    assert_eq!(writes(&w.host.calls()), before);
+}
+
+#[test]
+fn a_campaign_whose_predecessor_the_channel_replaced_retires_the_attempt() {
+    use atpkg_publish::package_campaign::{Campaign, Observation, Outcome};
+
+    const REPLACED: &str = "2027-03-01T00:00:00Z";
+    let w = world("pkg-campaign-replaced-predecessor");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let slug = w.ctx.index_slug();
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    retain_72_unpublished(&w, &mut campaign, &request, &inputs, &signed_root);
+    // The channel replaces 71, over which the retained 72 was signed, with other bytes.
+    w.keys.publish_quad(
+        &w.host,
+        &slug,
+        71,
+        &w.keys
+            .index_toml(71, &[("codex", "aterm")], &[("codex", LIVE_CODEX)])
+            .replace(FAR_FUTURE, REPLACED),
+    );
+    assert_eq!(
+        campaign
+            .publish_package(
+                &w.ctx,
+                &request,
+                &w.tools,
+                &inputs,
+                &signed_root,
+                None,
+                &mut Log::capture("replaced predecessor"),
+            )
+            .unwrap(),
+        Outcome {
+            index_build: 72,
+            published_now: true
+        }
+    );
+    assert!(campaign.observations().any(|event| matches!(
+        event,
+        Observation::IndexRetired {
+            build: 72,
+            head_build: 71,
+            ..
+        }
+    )));
+    let index = String::from_utf8(
+        w.host
+            .asset(&slug, "atpkg-index-72", QUAD_FILES[0])
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        index.contains(&format!("valid_until = \"{REPLACED}\"")),
+        "planned over the replaced head: {index}"
+    );
+    assert!(index.contains(&format!("codex = {ALAB}")), "{index}");
+}
+
+#[test]
+fn a_published_campaign_whose_index_the_channel_replaced_is_refused_not_reported_done() {
+    use atpkg_publish::package_campaign::{Campaign, Outcome};
+
+    let w = world("pkg-campaign-published-replaced");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let slug = w.ctx.index_slug();
+    let publish = |campaign: &mut Campaign, label: &'static str| {
+        campaign.publish_package(
+            &w.ctx,
+            &request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            None,
+            &mut Log::capture(label),
+        )
+    };
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    assert_eq!(
+        publish(&mut campaign, "publish").unwrap(),
+        Outcome {
+            index_build: 72,
+            published_now: true
+        }
+    );
+    // The channel now serves other bytes at the campaign's recorded 72.
+    let mut other = w
+        .host
+        .asset(&slug, "atpkg-index-72", QUAD_FILES[0])
+        .unwrap();
+    other[0] ^= 1;
+    w.host
+        .put_asset(&slug, "atpkg-index-72", QUAD_FILES[0], other);
+    let before = writes(&w.host.calls());
+    let error = publish(&mut campaign, "replaced").unwrap_err();
+    let why = error.to_string();
+    assert!(matches!(error, Error::Refused(_)), "{why}");
+    assert!(
+        why.contains("no longer serves this campaign's published atpkg-index-72"),
+        "{why}"
+    );
+    assert!(why.contains("new campaign under a new --state"), "{why}");
+    assert_eq!(writes(&w.host.calls()), before);
+}
+
+#[test]
+fn a_lapsed_attempts_leftover_draft_is_named_and_the_next_candidate_resumes_as_signed() {
+    use atpkg_publish::host::ReleaseHost as _;
+    use atpkg_publish::host::fake::{FakeFail, FakeOp};
+    use atpkg_publish::package_campaign::{Campaign, Observation, Outcome};
+
+    const NEAR: &str = "2026-12-01T00:00:00Z";
+    const LATER: &str = "2027-06-01T00:00:00Z";
+    const OTHER: &str = "2027-05-01T00:00:00Z";
+    let w = world("pkg-campaign-leftover-draft");
+    let root = regular_campaign_package(&w);
+    let slug = w.ctx.index_slug();
+    w.keys.publish_quad(
+        &w.host,
+        &slug,
+        71,
+        &w.keys
+            .index_toml(71, &[("codex", "aterm")], &[("codex", LIVE_CODEX)])
+            .replace(FAR_FUTURE, NEAR),
+    );
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let publish = |campaign: &mut Campaign, ctx: &Ctx, valid_until: Option<&str>| {
+        campaign.publish_package(
+            ctx,
+            &request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            valid_until,
+            &mut Log::capture("leftover draft"),
+        )
+    };
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &intent).unwrap();
+    retain_72_unpublished(&w, &mut campaign, &request, &inputs, &signed_root);
+    // That candidate's compare-and-swap was killed right after its create: an empty
+    // draft this host's create made holds atpkg-index-72 (stand-in notes for the
+    // candidate's own, which differ from any later candidate's).
+    w.host
+        .fail_next(FakeOp::Create, FakeFail::KilledBeforeUpload);
+    w.host
+        .create(
+            &slug,
+            "atpkg-index-72",
+            "atpkg index 72",
+            "the first candidate's notes",
+            &[],
+        )
+        .unwrap_err();
+    let draft = w.host.release_of(&slug, "atpkg-index-72").unwrap();
+    assert!(draft.draft && draft.assets.is_empty());
+
+    // 2026-12-02: the head and that candidate lapsed, so it is retired.
+    let mut lapsed = w.ctx.clone();
+    lapsed.now_unix = 1_796_169_600;
+    let error = publish(&mut campaign, &lapsed, None).unwrap_err();
+    assert!(error.to_string().contains("--valid-until"), "{error}");
+    assert!(campaign.observations().any(|event| matches!(
+        event,
+        Observation::IndexRetired {
+            build: 72,
+            head_build: 71,
+            ..
+        }
+    )));
+
+    // The next candidate takes 72 again and meets the draft the first one's create made
+    // for other notes: the refusal names it and the act that clears it.
+    let refused = publish(&mut campaign, &lapsed, Some(LATER)).unwrap_err();
+    let why = refused.to_string();
+    assert!(matches!(refused, Error::Refused(_)), "{why}");
+    assert!(
+        why.contains("atpkg-index-72 exists on") && why.contains("orphaned DRAFT"),
+        "{why}"
+    );
+    assert!(why.contains("inspect it, delete it, then re-run"), "{why}");
+    assert_eq!(w.host.release_of(&slug, "atpkg-index-72").unwrap(), draft);
+
+    // That candidate is retained: it resumes only as signed.
+    let before = writes(&w.host.calls());
+    let other = publish(&mut campaign, &lapsed, Some(OTHER))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        other.contains(&format!(
+            "resumes exactly as signed, valid until {LATER}; re-run without --valid-until \
+             {OTHER}"
+        )),
+        "{other}"
+    );
+    assert_eq!(writes(&w.host.calls()), before);
+
+    w.host.remove(&slug, "atpkg-index-72");
+    assert_eq!(
+        publish(&mut campaign, &lapsed, Some(LATER)).unwrap(),
+        Outcome {
+            index_build: 72,
+            published_now: true
+        }
+    );
+    let index = String::from_utf8(
+        w.host
+            .asset(&slug, "atpkg-index-72", QUAD_FILES[0])
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        index.contains(&format!("valid_until = \"{LATER}\"")),
+        "{index}"
+    );
+    assert!(!w.host.release_of(&slug, "atpkg-index-72").unwrap().draft);
+}
+
+#[test]
+fn the_package_campaign_cli_hands_valid_until_to_a_resumed_candidate() {
+    use atpkg_publish::package_campaign::Campaign;
+
+    const OTHER: &str = "2027-05-01T00:00:00Z";
+    let w = world("pkg-campaign-cli-valid-until");
+    let root = regular_campaign_package(&w);
+    let (intent, request, inputs) = campaign_inputs(&w, &root);
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let state = w.root.join("campaign");
+    let mut campaign = Campaign::open(&state, &intent).unwrap();
+    retain_72_unpublished(&w, &mut campaign, &request, &inputs, &signed_root);
+    drop(campaign);
+    let before = writes(&w.host.calls());
+    let args = vec![
+        root.to_string_lossy().into_owned(),
+        "--build".into(),
+        ALAB.to_string(),
+        "--source-repo".into(),
+        w.source.to_string_lossy().into_owned(),
+        "--state".into(),
+        state.to_string_lossy().into_owned(),
+        "--valid-until".into(),
+        OTHER.into(),
+    ];
+    let error = atpkg_publish::package_campaign::run(&w.ctx, &args).unwrap_err();
+    let why = error.to_string();
+    assert!(matches!(error, Error::Refused(_)), "{why}");
+    assert!(
+        why.contains(&format!(
+            "the retained atpkg-index-72 resumes exactly as signed, valid until {FAR_FUTURE}; \
+             re-run without --valid-until {OTHER}"
+        )),
+        "{why}"
+    );
+    assert_eq!(writes(&w.host.calls()), before);
 }
 
 #[test]
@@ -395,8 +1311,180 @@ fn the_package_campaign_cli_refuses_overrides_and_non_agh_hosts_before_creating_
             Err(Error::Usage(_))
         ));
     }
+    let mut twice = args.clone();
+    for _ in 0..2 {
+        twice.extend(["--valid-until".into(), FAR_FUTURE.into()]);
+    }
+    assert!(matches!(
+        atpkg_publish::package_campaign::run(&gh, &twice),
+        Err(Error::Usage(why)) if why.contains("--valid-until once")
+    ));
     assert!(!state.exists());
     assert_eq!(w.host.changes(), 0);
+}
+
+/// Retains the candidate durably, then loses the caller before any public write.
+struct StopAfterRetention<'a>(atpkg_publish::package_campaign::Retention<'a>);
+
+impl PublicationObserver for StopAfterRetention<'_> {
+    fn before_publish(&mut self, prepared: &PreparedPublication<'_>) -> Result<(), Error> {
+        self.0.before_publish(prepared)?;
+        Err(Error::cannot_run(
+            "fixture lost the caller after durable retention",
+        ))
+    }
+}
+
+/// Another publisher, baselined on the same head, creates atpkg-index-72 after the
+/// campaign retained its own 72 and before its compare-and-swap.
+struct Rival<'a> {
+    retention: atpkg_publish::package_campaign::Retention<'a>,
+    publish: &'a dyn Fn(),
+}
+
+impl PublicationObserver for Rival<'_> {
+    fn before_publish(&mut self, prepared: &PreparedPublication<'_>) -> Result<(), Error> {
+        self.retention.before_publish(prepared)?;
+        (self.publish)();
+        Ok(())
+    }
+}
+
+/// Stage the campaign's package, retain its index 72 and lose the compare-and-swap
+/// to `winner`.
+fn lose_the_race_for_72(
+    w: &World,
+    campaign: &mut atpkg_publish::package_campaign::Campaign,
+    request: &PackageRequest,
+    inputs: &atpkg_publish::project_toolchain::Inputs,
+    signed_root: &dyn Fn(u64) -> Result<String, String>,
+    winner: &str,
+) {
+    campaign
+        .stage_package(&w.ctx, request, &w.tools, inputs, signed_root)
+        .unwrap();
+    let slug = w.ctx.index_slug();
+    let publish = || w.keys.publish_quad(&w.host, &slug, 72, winner);
+    let mut observer = Rival {
+        retention: campaign.retention(&w.ctx),
+        publish: &publish,
+    };
+    let lost = atpkg_publish::channel::index::publish_with_observer(
+        &w.ctx,
+        &campaign_index(w),
+        &mut Log::capture("lost race"),
+        &mut observer,
+    )
+    .unwrap_err();
+    assert!(
+        lost.to_string().contains("another publisher took index 72"),
+        "{lost}"
+    );
+}
+
+/// A codex-only index `n` that pins the live vendor build and yanks the campaign's.
+fn yanking_index(w: &World, n: u64) -> String {
+    w.keys
+        .index_toml(n, &[("codex", "aterm")], &[("codex", LIVE_CODEX)])
+        .replace(
+            "min_build = 0\n",
+            &format!("min_build = 0\nyanked = [\"codex@{ALAB}\"]\n"),
+        )
+}
+
+/// Stage the campaign's package and retain its index 72 over the head 71, losing the
+/// caller before any public write.
+fn retain_72_unpublished(
+    w: &World,
+    campaign: &mut atpkg_publish::package_campaign::Campaign,
+    request: &PackageRequest,
+    inputs: &atpkg_publish::project_toolchain::Inputs,
+    signed_root: &dyn Fn(u64) -> Result<String, String>,
+) {
+    campaign
+        .stage_package(&w.ctx, request, &w.tools, inputs, signed_root)
+        .unwrap();
+    let mut observer = StopAfterRetention(campaign.retention(&w.ctx));
+    atpkg_publish::channel::index::publish_with_observer(
+        &w.ctx,
+        &campaign_index(w),
+        &mut Log::capture("retained"),
+        &mut observer,
+    )
+    .unwrap_err();
+    let retained = observer.0.into_retained().unwrap();
+    assert_eq!(retained.candidate().index.index_build, 72);
+}
+
+/// Remove the campaign's newest receipt, which records `kind`: a crash between a public
+/// write and its receipt.
+fn lose_the_last_receipt(journal: &Path, kind: &str) {
+    let mut receipts: Vec<PathBuf> = std::fs::read_dir(journal)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("receipt-"))
+        })
+        .collect();
+    receipts.sort();
+    let lost = receipts.pop().unwrap();
+    let text = String::from_utf8(read(&lost)).unwrap();
+    assert!(
+        text.contains(&format!("\"{kind}\"")),
+        "{}: {text}",
+        lost.display()
+    );
+    std::fs::remove_file(&lost).unwrap();
+}
+
+/// The campaign's frozen intent, its native package request and its toolchain inputs.
+fn campaign_inputs(
+    w: &World,
+    root: &Path,
+) -> (
+    atpkg_publish::package_campaign::Intent,
+    PackageRequest,
+    atpkg_publish::project_toolchain::Inputs,
+) {
+    let pkg =
+        package::read_package(root, "codex", atpkg_publish::triple::AARCH64_APPLE_DARWIN).unwrap();
+    let intent =
+        atpkg_publish::package_campaign::Intent::from_package(&w.ctx, "codex", ALAB, &pkg).unwrap();
+    let mut request = w.request(root, ALAB);
+    request.toolchain = None;
+    let inputs = atpkg_publish::project_toolchain::Inputs {
+        prefix: w.ctx.pkg_prefix.clone(),
+        repo: w.source.clone(),
+        path: "/usr/bin:/bin".into(),
+        cargo_home: w.root.join("fixture cargo home"),
+        overrides: vec![],
+    };
+    (intent, request, inputs)
+}
+
+/// The index publication a campaign makes over the channel head.
+fn campaign_index(w: &World) -> IndexRequest {
+    IndexRequest {
+        baseline: Baseline::ChannelHead,
+        delta: parse_delta(&["--pin".into(), format!("codex={ALAB}")]).unwrap(),
+        out: w.root.join("index-working-output"),
+        upload: true,
+        pack_dir: None,
+    }
+}
+
+/// The release writes among `calls`.
+fn writes(calls: &[String]) -> usize {
+    calls
+        .iter()
+        .filter(|call| {
+            call.starts_with("create")
+                || call.starts_with("upload")
+                || call.starts_with("publish-draft")
+        })
+        .count()
 }
 
 fn regular_campaign_package(w: &World) -> PathBuf {

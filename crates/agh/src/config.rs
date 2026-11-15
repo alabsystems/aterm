@@ -25,7 +25,7 @@ pub const CONFIG_FILE: &str = "agh.toml";
 /// Where agh's files are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dirs {
-    /// `<aterm config dir>/agh`: agh.toml and the token files.
+    /// `<aterm config dir>/agh`: agh.toml and the adoption record.
     pub config: PathBuf,
     /// `<state dir>/agh`: the rate book.
     pub state: PathBuf,
@@ -64,13 +64,6 @@ impl Dirs {
             state: root.join("state").join("agh"),
             home: root.join("home"),
         }
-    }
-
-    /// `<config>/tokens`.
-    #[inline]
-    #[must_use]
-    pub fn tokens(&self) -> PathBuf {
-        self.config.join("tokens")
     }
 
     /// `<state>/rate`.
@@ -123,10 +116,15 @@ impl Dirs {
         self.state.join("journal")
     }
 
-    /// `<state>/grants`: the git grants.
+    /// `<state>/grants-v2`: the git grants, whose records are version 2. The folder belongs to
+    /// the record's version. An agh from before that record (aterm 0.201.0 and earlier) keeps
+    /// its grants in `<state>/grants`, and before each of its git runs removes every
+    /// `{nonce}.json` there that it does not read as a version-1 record, a live version-2 grant
+    /// among them, whose push then ends `told us to quit`. So no later record is written to
+    /// that folder, and a record that changes again takes a folder of its own.
     #[must_use]
     pub fn grants(&self) -> PathBuf {
-        self.state.join("grants")
+        self.state.join("grants-v2")
     }
 
     /// `<state>/needs`: the need files.
@@ -183,10 +181,10 @@ pub struct WriterRow {
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ProfileRow {
-    /// `token_file`: an absolute or `~/` path.
+    /// `token_file`: `~/.secrets/NAME`, the vault entry NAME read in place from this Mac's
+    /// store (no file there is opened), else an absolute or `~/` path to a private token file of
+    /// the person's own (`config::token_source`).
     pub token_file: Option<String>,
-    /// `env`: a variable's name.
-    pub env: Option<String>,
     /// `tier`: `dev`, `release` or `external`.
     pub tier: String,
     /// `login`: the login the token is bound to.
@@ -198,6 +196,15 @@ pub struct ProfileRow {
     /// Accept this profile's token file when it is group- or world-readable. Honoured only by
     /// `load_for_host`, in M2 only (design §6.6); `load` reads the key and ignores it.
     pub legacy_loose: bool,
+    /// The row names the retired `env` key: agh reads no token from the environment, and L1
+    /// refuses the row with the vault entry that replaces it.
+    #[serde(rename = "env", deserialize_with = "present")]
+    pub retired_env: bool,
+}
+
+/// `true` for a key that is there, whatever its value.
+fn present<'de, D: serde::Deserializer<'de>>(de: D) -> std::result::Result<bool, D::Error> {
+    <serde::de::IgnoredAny as serde::Deserialize>::deserialize(de).map(|_| true)
 }
 
 /// One `[[owners]]` row.
@@ -609,18 +616,6 @@ pub(crate) fn masked(text: &str) -> String {
     }
 }
 
-/// `[A-Za-z_][A-Za-z0-9_]{0,63}` with no all-hex run of `TOKEN_FLOOR` bytes or more: what a
-/// profile's `env` may name (L1).
-fn is_env_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    (1..=64).contains(&bytes.len())
-        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
-        && bytes
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        && !has_hex_run(name)
-}
-
 /// An owner name or a login, as a fault shows it.
 fn as_owner(value: &str) -> Shown<'_> {
     Shown {
@@ -680,20 +675,33 @@ impl Rows<'_> {
                     ),
                 );
             }
-            match (&row.token_file, &row.env) {
-                (Some(_), Some(_)) | (None, None) => faults.push(
+            match &row.token_file {
+                None if row.retired_env => faults.push(
                     "L1",
-                    format!("profile {name}: name exactly one of token_file and env"),
+                    format!(
+                        "profile {name}: agh reads no token from env; replace env with \
+                         token_file = \"~/.secrets/{name}\", which names the vault entry {name} \
+                         (aterm secrets need entry:{name} asks the lab's Macs for it), or delete \
+                         the profile"
+                    ),
                 ),
-                (Some(path), None) if expand(path, self.home).is_none() => faults.push(
+                _ if row.retired_env => faults.push(
+                    "L1",
+                    format!("profile {name}: agh reads no token from env; delete env"),
+                ),
+                None => faults.push("L1", format!("profile {name}: name its token_file")),
+                Some(path) if expand(path, self.home).is_none() => faults.push(
                     "L1",
                     format!("profile {name}: token_file must be absolute or start with ~/"),
                 ),
-                (None, Some(var)) if !is_env_name(var) => faults.push(
+                Some(path) if token_source(path, self.home).is_none() => faults.push(
                     "L1",
-                    format!("profile {name}: env must name an environment variable"),
+                    format!(
+                        "profile {name}: token_file names a path inside ~/.secrets, which holds \
+                         only vault entries: name one as ~/.secrets/NAME"
+                    ),
                 ),
-                _ => {}
+                Some(_) => {}
             }
             if row
                 .drafts_fp
@@ -824,18 +832,6 @@ impl Rows<'_> {
         }
     }
 
-    fn l5(&self, faults: &mut Faults) {
-        for (name, row) in &self.config.profiles {
-            if Tier::parse(&row.tier) == Some(Tier::Release) && row.env.is_some() {
-                let name = as_name(name);
-                faults.push(
-                    "L5",
-                    format!("profile {name}: a release-tier profile reads a token file, never env"),
-                );
-            }
-        }
-    }
-
     fn l6(&self, faults: &mut Faults) {
         let is_release = |name: &str| self.profile_tier(name) == Some(Tier::Release);
         for row in &self.config.owners {
@@ -891,17 +887,34 @@ impl Rows<'_> {
     }
 
     fn l7(&self, faults: &mut Faults, file_id: &dyn Fn(&Path) -> Option<FileId>) {
-        let files: Vec<(&str, PathBuf, Option<FileId>)> = self
-            .config
-            .profiles
-            .iter()
-            .filter(|(_, row)| row.env.is_none())
-            .filter_map(|(name, row)| {
-                let path = expand(row.token_file.as_deref()?, self.home)?;
-                let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                Some((name.as_str(), canonical, file_id(&path)))
-            })
-            .collect();
+        let mut entries: Vec<(&str, String)> = Vec::new();
+        let mut files: Vec<(&str, PathBuf, Option<FileId>)> = Vec::new();
+        for (name, row) in &self.config.profiles {
+            match row
+                .token_file
+                .as_deref()
+                .and_then(|text| token_source(text, self.home))
+            {
+                Some(Source::Entry(entry)) => entries.push((name.as_str(), entry.name().into())),
+                Some(Source::File(path)) => {
+                    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    let id = file_id(&path);
+                    files.push((name.as_str(), canonical, id));
+                }
+                _ => {}
+            }
+        }
+        for (i, (a, entry_a)) in entries.iter().enumerate() {
+            for (b, entry_b) in &entries[i + 1..] {
+                if entry_a == entry_b {
+                    let (a, b) = (as_name(a), as_name(b));
+                    faults.push(
+                        "L7",
+                        format!("profiles {a} and {b} name the same vault entry"),
+                    );
+                }
+            }
+        }
         for (i, (a, path_a, id_a)) in files.iter().enumerate() {
             for (b, path_b, id_b) in &files[i + 1..] {
                 if path_a == path_b || (id_a.is_some() && id_a == id_b) {
@@ -1080,11 +1093,7 @@ impl Rows<'_> {
     fn build(&self) -> Option<Validated> {
         let mut profiles = BTreeMap::new();
         for (name, row) in &self.config.profiles {
-            let source = match (&row.token_file, &row.env) {
-                (Some(path), None) => Source::File(expand(path, self.home)?),
-                (None, Some(var)) => Source::Env(var.clone()),
-                _ => return None,
-            };
+            let source = token_source(row.token_file.as_deref()?, self.home)?;
             let mut profile = Profile::new(name.clone(), source, Tier::parse(&row.tier)?)
                 .with_covers_all_repos(row.covers_all_repos);
             if let Some(login) = &row.login {
@@ -1163,7 +1172,6 @@ pub fn validate(
     rows.l2(&mut faults);
     rows.l3(&mut faults);
     rows.l4(&mut faults);
-    rows.l5(&mut faults);
     rows.l6(&mut faults);
     rows.l7(&mut faults, file_id);
     rows.l8(&mut faults);
@@ -1193,6 +1201,31 @@ pub fn file_id(path: &Path) -> Option<(u64, u64)> {
     {
         let _ = path;
         None
+    }
+}
+
+/// What a `token_file` names (design §6.10, LT-04A): `~/.secrets/NAME` (or the same path spelled
+/// absolute) is the vault entry NAME, read in place from the store under `home` and never
+/// opened as a file, since the files older builds wrote there are the owner's backup and no
+/// code reads them; any other absolute or `~/` path is a token file of the person's own, read
+/// in place. `None` for a path that is neither absolute nor `~/`, and for one deeper inside
+/// `~/.secrets`, which holds no file agh reads. Judged from the text alone: nothing is statted.
+#[must_use]
+pub fn token_source(text: &str, home: &Path) -> Option<Source> {
+    let path = expand(text, home)?;
+    let vault = home.join(aterm_types::vault_entry::SECRETS_DIR);
+    if home.as_os_str().is_empty() {
+        return Some(Source::File(path));
+    }
+    let Ok(rest) = path.strip_prefix(&vault) else {
+        return Some(Source::File(path));
+    };
+    let mut parts = rest.components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(name)), None) => name
+            .to_str()
+            .map(|name| Source::Entry(crate::identity::VaultEntry::new(name, home))),
+        _ => None,
     }
 }
 

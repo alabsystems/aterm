@@ -41,6 +41,24 @@ pub const fn backlog_max(populations: usize) -> usize {
     EV_RULE_BYTES / (FILL_RECORD_BYTES * if populations == 0 { 1 } else { populations })
 }
 
+/// The records one page of astream's residency tier holds (its crate-private `PAGE`, `1 <<
+/// PAGE_SHIFT`): the unit a filtered read passes whole (`Tier::passing`, F11c). The bench's
+/// backlog tests hold it to a real broker's tally, so a pin that moves astream's page fails
+/// there before the fabric-counts lane's floor reads it.
+pub const TIER_PAGE_RECORDS: usize = 256;
+
+/// Filler records before each wanted note ([`Spec::wanted`]): more than two of astream's pages
+/// ([`TIER_PAGE_RECORDS`]), so no two wanted notes share a page and at least one page between
+/// two of them holds none. The fill waits for each note to be listed before it writes the next
+/// filler, so the notes' offsets are that far apart under any load, and the bench asserts it on
+/// the offsets the inboxes report.
+pub const WANTED_GAP: usize = 600;
+
+/// The wanted notes ([`Spec::wanted`]) lie among the backlog's oldest 1/this of its records:
+/// what is past them outgrows the broker's 16 MiB resident budget at the fabric-counts lane's
+/// backlog, so the notes are cold when the restarts read them.
+pub const WANTED_SHARE: usize = 5;
+
 /// The seeded records each cold-read pass of a broker in a process of its own fetches (F09,
 /// `run::seeded`): a seed of fewer, `backlog` times the attach populations, is refused
 /// ([`outside_refusal`]), since a pass would run short only after the whole timed world.
@@ -117,6 +135,12 @@ pub struct Spec {
     /// floor span (4,096 records) below the head, among the seed's newest
     /// records while the head is within that span of the seed's end.
     pub backlog: usize,
+    /// Wanted mail among the attach world's backlog (F11c, ATERM-KI-1111-9): this many notes to
+    /// every session, posted among the backlog's oldest records, [`WANTED_GAP`] filler records
+    /// apart, so they are cold when each restart's refill reads its pages record by record
+    /// among the filler pages it passes whole. 0 (the default) is none. It takes a backlog, and
+    /// the in-process broker.
+    pub wanted: usize,
     /// The ask world's asked table pre-filled to this many rows before its
     /// legs (C04): written as a build before the asks journal wrote the table,
     /// and taken in by a restarted bridge, as a node that upgraded with a full
@@ -377,6 +401,9 @@ impl Spec {
         if self.backlog > 0 {
             words.push_str(&format!(" backlog={}", self.backlog));
         }
+        if self.wanted > 0 {
+            words.push_str(&format!(" wanted={}", self.wanted));
+        }
         if self.asked_prefill > 0 {
             words.push_str(&format!(" asked_prefill={}", self.asked_prefill));
         }
@@ -415,7 +442,8 @@ impl Spec {
 /// retention interval on a broker that does not retain, a burst past
 /// [`BURST_MAX`], an attach list that does not rise or passes [`ATTACH_MAX`],
 /// a bystander count past [`ATTACH_MAX`], a backlog past [`backlog_max`] for
-/// its attach sizes or on a run that measures no attach, an asked prefill past
+/// its attach sizes or on a run that measures no attach, wanted notes that do not fit
+/// the backlog's oldest 1/[`WANTED_SHARE`] or with an outside broker, an asked prefill past
 /// [`ASKED_PREFILL_MAX`] or on a run that measures no ask, paced notes past
 /// [`PACED_NOTES_MAX`] or on a run that measures no messaging, `tally=on` on a run that measures
 /// only the ping-pong world (which counts with both tallies anyway), a broker in a process of its
@@ -446,6 +474,7 @@ pub fn parse(raw: &str, out: &Path) -> Result<Spec, String> {
         asks: DEFAULT_ASKS,
         mix_every: DEFAULT_MIX_EVERY,
         backlog: 0,
+        wanted: 0,
         asked_prefill: 0,
         paced_notes: 0,
         tally: false,
@@ -476,6 +505,7 @@ pub fn parse(raw: &str, out: &Path) -> Result<Spec, String> {
             "asks" => spec.asks = count(key, v, false)?,
             "mix_every" => spec.mix_every = count(key, v, false)?,
             "backlog" => spec.backlog = count(key, v, true)?,
+            "wanted" => spec.wanted = count(key, v, true)?,
             "asked_prefill" => spec.asked_prefill = count(key, v, true)?,
             "paced_notes" => spec.paced_notes = count(key, v, true)?,
             "durability" => spec.durability = Tier::parse(v)?,
@@ -551,6 +581,24 @@ pub fn parse(raw: &str, out: &Path) -> Result<Spec, String> {
             "{ENV}: backlog= is the attach world's, and this run measures {}",
             spec.scenario.word()
         ));
+    }
+    if spec.wanted > 0 {
+        let notes = spec
+            .wanted
+            .saturating_mul(spec.attach.last().copied().unwrap_or(0));
+        let span = notes.saturating_mul(WANTED_GAP);
+        if spec.backlog == 0 || span.saturating_mul(WANTED_SHARE) > spec.backlog {
+            return Err(format!(
+                "{ENV}: wanted= puts {notes} notes {WANTED_GAP} filler records apart among the \
+                 backlog's oldest 1/{WANTED_SHARE}, and backlog={} is too small for them",
+                spec.backlog
+            ));
+        }
+        if spec.broker_process.outside() {
+            return Err(format!(
+                "{ENV}: wanted= posts its notes among the in-process broker's fill"
+            ));
+        }
     }
     if spec.asked_prefill > ASKED_PREFILL_MAX {
         return Err(format!(

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Reader and canonical TOML representation for `~/.secrets/ai-pool.toml`
-//! (`docs/DESIGN-alab-swarm-2026-10-27.md` §4.1, §6.3, §6.5, §12.3 C14).
+//! Reader and canonical TOML representation for the vault entry `ai-pool.toml`, read in place
+//! from this Mac's store (`docs/DESIGN-alab-swarm-2026-10-27.md` §4.1, §6.3, §6.5, §12.3 C14).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -12,7 +12,7 @@ use std::time::Duration;
 use super::accounts::{self, Class, Cli, Vendor};
 use crate::ai::connector::{Flow, Region, RowKeys};
 
-/// Vault-delivered account pool file in `~/.secrets/` ([`aterm_secrets::entry_class::AI_POOL`]).
+/// The vault entry holding the account pool ([`aterm_secrets::entry_class::AI_POOL`]).
 pub const AI_POOL_FILE: &str = aterm_secrets::entry_class::AI_POOL;
 
 /// Maximum warm Macs per account in `ai-pool.toml` (`DESIGN-alab-swarm` §6.3).
@@ -414,16 +414,17 @@ pub(crate) fn read_bounded_text(path: &Path, max_bytes: u64) -> Option<String> {
 }
 
 /// The most of `ai-pool.toml` a reader takes.
-const MAX_POOL_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_POOL_BYTES: usize = 4 * 1024 * 1024;
 
-/// The pool file under `home` (`~/.secrets/ai-pool.toml`) as it parses now; `None` where it is
-/// absent, cannot be read, is larger than a pool file is, or is not one. It reads a file, so it
-/// runs off a window's thread.
+/// The vault's pool entry for `home`'s store ([`crate::vault_entry`]) as it parses now; `None`
+/// where it is absent, cannot be read, is larger than a pool is, or is not one. It reads the
+/// vault's verified view, so it runs off a window's thread.
 #[must_use]
 pub fn read_under(home: &Path) -> Option<Pool> {
-    let path = home.join(".secrets").join(AI_POOL_FILE);
-    let text = read_bounded_text(&path, MAX_POOL_BYTES)?;
-    Pool::from_toml(&text, &path.display().to_string()).ok()
+    let text = crate::vault_entry::read_text(home, AI_POOL_FILE, MAX_POOL_BYTES)
+        .into_text()
+        .ok()??;
+    Pool::from_toml(&text, &crate::vault_entry::source_name(AI_POOL_FILE)).ok()
 }
 
 fn read_config_machine_raw(config: Option<&Path>) -> Option<String> {
@@ -578,10 +579,12 @@ impl Pool {
     /// `fleet-accounts.toml` or CSV sheet.
     #[must_use]
     pub fn looks_like_pool(chosen: &str, raw: &str) -> bool {
-        if Path::new(chosen)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name == AI_POOL_FILE)
+        // The vault's pool entry (`vault:ai-pool.toml`), or a file of that name.
+        if crate::vault_entry::source_entry(chosen) == Some(AI_POOL_FILE)
+            || Path::new(chosen)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name == AI_POOL_FILE)
         {
             return true;
         }

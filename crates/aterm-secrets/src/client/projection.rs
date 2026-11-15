@@ -4,7 +4,9 @@
 //! One subscriber's ordinary converge job, shared by HTTP rounds and local member progress.
 
 use super::{Converging, SourceSaid, SyncOutcome, converge_after_pass};
-use crate::converge::{Due, Last, RefreshObservation, RepositoryRequest, RepositoryWork};
+use crate::converge::{
+    Causes, Due, Last, MarkMoved, RefreshObservation, RepositoryRequest, RepositoryWork, noting,
+};
 use aterm_uds::ready::Doorbell;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,6 +36,9 @@ pub struct ConvergenceSnapshot {
     pub refresh: RefreshObservation,
     pub repositories: Option<RepositoryRequest>,
     pub identity: IdentityDebt,
+    /// What moved the repository input mark in the looks that called for work since the last
+    /// snapshot, as classes, and how many such looks there were: for a start's note alone.
+    pub moved: (MarkMoved, u32),
 }
 
 struct IdentitySignal {
@@ -88,6 +93,7 @@ pub struct ConvergenceInputs {
     maintenance: Option<Box<dyn FnMut() -> Option<Instant> + Send>>,
     next_look: Box<dyn FnMut() -> Option<Instant> + Send>,
     identity: Box<dyn FnMut() -> IdentityDebt + Send>,
+    moved: Box<dyn FnMut() -> (MarkMoved, u32) + Send>,
 }
 
 impl ConvergenceInputs {
@@ -101,6 +107,7 @@ impl ConvergenceInputs {
             maintenance: None,
             next_look: Box::new(|| None),
             identity: Box::new(|| IdentityDebt::None),
+            moved: Box::new(|| (MarkMoved::default(), 0)),
         }
     }
 
@@ -108,6 +115,14 @@ impl ConvergenceInputs {
     /// requests; the runner independently admits its source and every effect.
     pub fn with_refresh(mut self, refresh: Box<dyn FnMut() -> RefreshObservation + Send>) -> Self {
         self.refresh = refresh;
+        self
+    }
+
+    /// Say what moved the repository input mark in the looks the observer made since this was
+    /// last asked, as classes, and in how many of them it called for work. It is asked once per
+    /// snapshot, after the observation, and paces nothing.
+    pub fn with_moved(mut self, moved: Box<dyn FnMut() -> (MarkMoved, u32) + Send>) -> Self {
+        self.moved = moved;
         self
     }
 
@@ -135,6 +150,8 @@ impl ConvergenceInputs {
             refresh,
             repositories: (self.observe)(refresh),
             identity: (self.identity)(),
+            // After the observation, so what its look found moved is taken with its request.
+            moved: (self.moved)(),
         }
     }
 
@@ -204,11 +221,17 @@ impl Running {
         (self.exit.as_ref().map(Arc::as_ptr), self.due.next_at())
     }
 
-    /// Take the runner's outcome, and its exit's descriptor with it once it has ended.
+    /// Take the runner's outcome, and its exit's descriptor with it once it has ended. A
+    /// runner that found the lock held adds the CPU its reap measured to the next start's note.
     fn last(&mut self) -> Last {
-        let last = Last::of(&mut self.child);
+        let (last, cpu) = crate::converge::reap(&mut self.child);
         if self.child.is_none() {
             self.exit = None;
+        }
+        if last == Last::Held
+            && let Some(cpu) = cpu
+        {
+            self.due.held_spent(cpu);
         }
         last
     }
@@ -320,7 +343,14 @@ impl<'a> Projection<'a> {
         self.changing(&mut running, |running| {
             let last = running.last();
             running.due.observe(snapshot.refresh);
+            running
+                .due
+                .because_moved(snapshot.moved.0, snapshot.moved.1);
             if let Some(request) = snapshot.repositories {
+                running.due.because(match request.work() {
+                    RepositoryWork::Repair => Causes::INPUT_REPAIR,
+                    RepositoryWork::Refresh => Causes::INPUT_REFRESH,
+                });
                 running.due.request(request);
             }
             if snapshot.identity == IdentityDebt::Changed {
@@ -331,7 +361,9 @@ impl<'a> Projection<'a> {
                 && !self.replaced()
                 && let Some(exe) = self.program.path()
             {
-                running.child = (self.ports.start)(exe, running.due.repository_request());
+                running.child = noting(&running.due.note(), || {
+                    (self.ports.start)(exe, running.due.repository_request())
+                });
                 running.exit = running
                     .child
                     .as_ref()

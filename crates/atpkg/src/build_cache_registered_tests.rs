@@ -711,6 +711,8 @@ fn cli_config_selected_targets_bind_provenance_to_receipts() {
     for moved in [false, true] {
         for order in [
             "inline",
+            "toml11-inline",
+            "toml11-file",
             "file",
             "nested",
             "file-last",
@@ -728,6 +730,9 @@ fn cli_config_selected_targets_bind_provenance_to_receipts() {
                 "build.target-dir='file.noindex'",
             )
             .unwrap();
+            let toml11 =
+                "build = {\n \"target\\x2Ddir\" = \"toml\\x31\\x31.noindex\", # target\n}\n";
+            std::fs::write(world.owner.join("settings11.toml"), toml11).unwrap();
             std::fs::create_dir(world.owner.join("nested")).unwrap();
             std::fs::write(
                 world.owner.join("nested/settings.toml"),
@@ -736,6 +741,8 @@ fn cli_config_selected_targets_bind_provenance_to_receipts() {
             .unwrap();
             let configs = match order {
                 "inline" => vec!["build.target-dir='inline.noindex'"],
+                "toml11-inline" => vec!["build.\"target\\x2Ddir\" = \"toml\\x31\\x31.noindex\""],
+                "toml11-file" => vec!["settings11.toml"],
                 "file" => vec!["settings.toml"],
                 "nested" => vec!["nested/settings.toml"],
                 "file-last" => vec!["build.target-dir='unused.noindex'", "settings.toml"],
@@ -744,6 +751,8 @@ fn cli_config_selected_targets_bind_provenance_to_receipts() {
             };
             let expected = match order {
                 "inline" | "inline-last" => world.owner.join("inline.noindex"),
+                "toml11-inline" => world.owner.join("toml11.noindex"),
+                "toml11-file" => world.home.join("toml11.noindex"),
                 "nested" => world.owner.join("nested.noindex"),
                 _ => world.home.join("file.noindex"),
             };
@@ -1117,6 +1126,246 @@ fn configured_nested_outputs_respect_every_existing_custody_boundary() {
     }
 }
 
+/// `world`'s target built, and its quiet build directory (`<target>/.ubd/build.noindex`) once
+/// registered as a root of its own and then gone from there, its ordinary record left on record
+/// naming the folder that went, its owners unknown (as an unresolved producer leaves every
+/// record: [`suppress_configured`]). The quiet build directory and its record's path.
+///
+/// The folder that went is moved out of home, not removed, and stands there as long as `world`
+/// does, so no folder made at its old path later can be given its inode number back (ext4 hands
+/// a freed one out again at once; APFS never does): the record would name such a folder, and so
+/// be no stale record at all, on one filesystem and not another.
+fn stale_quiet_record(world: &World) -> (PathBuf, PathBuf) {
+    world.build();
+    let build = super::super::target_build_path(&world.target);
+    assert!(create_checked(&world.home, &build, &world.owner).unwrap());
+    let path = producer_record(&world.home, &build).unwrap();
+    let mut receipt = read(&path).unwrap();
+    receipt.owners_unknown = true;
+    write(&path, &receipt).unwrap();
+    std::fs::rename(&build, world.home.with_file_name("gone.noindex")).unwrap();
+    (build, path)
+}
+
+/// Whether the record at `path` names the folder standing at `build` now: never, for a record
+/// [`stale_quiet_record`] left, whatever folder is made there.
+fn names_folder_there(path: &Path, build: &Path) -> bool {
+    read(path)
+        .zip(identity(build))
+        .is_some_and(|(receipt, now)| receipt.identity.names(&now))
+}
+
+/// A STALE RECORD OF A MANAGED TARGET'S QUIET BUILD DIRECTORY BINDS NOTHING THERE (seen on a Mac
+/// 2026-11-13, every build into the target refused): the folder it named gone from there, and the
+/// quiet build directory either made again empty and unmarked (as a refused preparation left it)
+/// or still gone. Preparing it, directly or through the front a build takes, treats it as the
+/// target's own descendant: it stands empty with no marker, still not the folder the record
+/// names, no record changes and the target is the one root registered. Without the rule the
+/// descendant was a custody boundary its record could never satisfy.
+#[test]
+fn a_stale_record_of_a_quiet_build_directory_no_longer_there_binds_nothing() {
+    for shape in ["recreated", "gone", "front"] {
+        let world = World::new();
+        let (build, path) = stale_quiet_record(&world);
+        if shape != "gone" {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&build)
+                .unwrap();
+            assert!(!names_folder_there(&path, &build), "{shape}");
+        }
+        let before = receipts(&world.home);
+        if shape == "front" {
+            let value = format!("build.build-dir='{}'", build.display());
+            let environment = |name: &str| match name {
+                "CARGO_TARGET_DIR" => Some(world.target.clone().into_os_string()),
+                super::super::BUILD_DIR_ENV => Some(build.clone().into_os_string()),
+                _ => None,
+            };
+            let machine = super::super::Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&world.owner),
+                env: &environment,
+                read: &super::super::read_config,
+                read_manifest: &super::super::read_manifest,
+                writable: &|_| Some(true),
+            };
+            let args = vec![
+                "--config".into(),
+                value,
+                "--unverified".into(),
+                "check".into(),
+            ];
+            assert!(
+                observe_for_producer(
+                    &args,
+                    super::super::Tool::Targo,
+                    &world.home,
+                    &machine,
+                    true
+                )
+                .unwrap()
+            );
+        } else {
+            prepare_intermediates(&world.home, &world.target, &world.owner, &|| true).unwrap();
+        }
+        assert!(build.is_dir(), "{shape}");
+        assert!(!names_folder_there(&path, &build), "{shape}");
+        assert_eq!(std::fs::read_dir(&build).unwrap().count(), 0, "{shape}");
+        assert_eq!(receipts(&world.home), before, "{shape}");
+        let registered = roots(&world.home);
+        assert_eq!(registered.len(), 1, "{shape}");
+        assert_eq!(registered[0].root, world.target, "{shape}");
+    }
+}
+
+/// WHAT STILL BINDS A QUIET BUILD DIRECTORY KEEPS IT A CUSTODY BOUNDARY: a record that names the
+/// folder there but does not admit this producer (its marker gone, as an adoption interrupted
+/// before its marker binds leaves it, or another workspace's), a record of the folder that went
+/// that is pending, a package's, a keep or a creation, one unreadable, one of another root, and a
+/// stale record beside a marker in the folder each stop the preparation, no record changed and
+/// no marker added.
+#[test]
+fn a_quiet_build_directory_its_record_still_binds_stays_a_custody_boundary() {
+    for shape in [
+        "unmarked",
+        "other-owner",
+        "pending",
+        "package",
+        "retained",
+        "creating",
+        "unreadable",
+        "other-root",
+        "marked",
+    ] {
+        let world = World::new();
+        let build = super::super::target_build_path(&world.target);
+        if matches!(shape, "unmarked" | "other-owner") {
+            world.build();
+            let owner = if shape == "other-owner" {
+                world.another_owner()
+            } else {
+                world.owner.clone()
+            };
+            assert!(create_checked(&world.home, &build, &owner).unwrap());
+            if shape == "unmarked" {
+                std::fs::remove_file(build.join(MARKER)).unwrap();
+            }
+        } else {
+            let (_, path) = stale_quiet_record(&world);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&build)
+                .unwrap();
+            assert!(!names_folder_there(&path, &build), "{shape}");
+            let mut receipt = read(&path).unwrap();
+            match shape {
+                "pending" => {
+                    let stage = world.home.join("stage.noindex");
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&stage)
+                        .unwrap();
+                    receipt.pending = Some(Pending {
+                        identity: identity(&stage).unwrap(),
+                        directory: stage,
+                        authorized: false,
+                    });
+                }
+                "package" => {
+                    let policy = format!(
+                        r#"{{"declaration":{{"cache":{cache},"cache_identity":{identity},
+                        "lock_identity":{identity},"minimum_bytes":1}},"learned_budget":null,
+                        "active":null,"last_settled":null}}"#,
+                        cache = aterm_json::to_string(&world.home).unwrap(),
+                        identity = aterm_json::to_string(&receipt.identity).unwrap(),
+                    );
+                    receipt.package = Some(aterm_json::from_str(&policy).unwrap());
+                    receipt.schema = 2;
+                    receipt.owners_unknown = false;
+                }
+                "retained" => {
+                    receipt.schema = 4;
+                    receipt.retained = true;
+                }
+                "creating" => {
+                    receipt.schema = 5;
+                    receipt.creating = Some(creation::Creating {
+                        directory: world.home.join("creating.noindex"),
+                    });
+                }
+                "other-root" => receipt.root = world.home.join("elsewhere.noindex"),
+                "marked" => std::fs::write(build.join(MARKER), "unknown custody").unwrap(),
+                _ => {}
+            }
+            if shape == "unreadable" {
+                std::fs::write(&path, b"{\"schema\":99}").unwrap();
+            } else {
+                let bytes = aterm_json::to_vec(&receipt).unwrap();
+                assert_eq!(decode(&bytes), Some(receipt.clone()), "{shape}");
+                write(&path, &receipt).unwrap();
+            }
+        }
+        let marked = build.join(MARKER).exists();
+        let before = receipts(&world.home);
+        assert!(
+            prepare_intermediates(&world.home, &world.target, &world.owner, &|| true).is_err(),
+            "{shape}"
+        );
+        assert_eq!(receipts(&world.home), before, "{shape}");
+        assert_eq!(build.join(MARKER).exists(), marked, "{shape}");
+    }
+}
+
+/// A STALE RECORD THAT CHANGES WHILE A PREPARATION HOLDS IT STOPS THAT PREPARATION: rewritten once
+/// the walk has read it (as the quiet build directory's first step ends), whether still of the
+/// folder that went or naming the folder there now (as an adoption's receipt does before its
+/// marker binds), the record stays as rewritten and no marker is added. The first shape passes
+/// the walk's second read and is stopped only by the final recheck of what it read first.
+#[test]
+fn a_stale_quiet_record_rewritten_during_preparation_stops_it() {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            creation::faults::clear();
+        }
+    }
+    for shape in ["rewritten", "adopted"] {
+        let world = World::new();
+        let (build, path) = stale_quiet_record(&world);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&build)
+            .unwrap();
+        assert!(!names_folder_there(&path, &build), "{shape}");
+        let mut changed = read(&path).unwrap();
+        changed.owners_unknown = false;
+        if shape == "adopted" {
+            changed.identity = identity(&build).unwrap();
+        }
+        let (record, rewritten) = (path.clone(), changed.clone());
+        let mut steps = 0;
+        creation::faults::set(move |point| {
+            if point == creation::Point::Parent {
+                steps += 1;
+                // The quiet build directory is the walk's second component.
+                if steps == 2 {
+                    write(&record, &rewritten).unwrap();
+                }
+            }
+            Some(())
+        });
+        let _clear = Clear;
+        assert!(
+            prepare_intermediates(&world.home, &world.target, &world.owner, &|| true).is_err(),
+            "{shape}"
+        );
+        assert_eq!(read(&path), Some(changed), "{shape}");
+        assert!(!build.join(MARKER).exists(), "{shape}");
+    }
+}
+
 impl World {
     fn new() -> Self {
         let directory = aterm_tempfile::tempdir().unwrap();
@@ -1248,6 +1497,110 @@ fn explicit_retirement_refuses_unregistered_retained_and_unknown_custody() {
 }
 
 #[test]
+fn explicit_retirement_reports_the_guard_that_keeps_an_unbuilt_cache() {
+    let world = World::new();
+    assert!(create_checked(&world.home, &world.target, &world.owner).unwrap());
+    let marker = std::fs::read(world.target.join(MARKER)).unwrap();
+    let receipt = std::fs::read(world.path()).unwrap();
+    let original = identity(&world.target).unwrap();
+    let reason = super::super::KeepReason::NoCargoLocks;
+    let error = retire(&world.home, &world.target, &mut |_, _| {
+        panic!("an unbuilt cache grants no removal intent")
+    })
+    .unwrap_err();
+    assert!(error.contains(&reason.to_string()), "{error}");
+    assert!(
+        error.contains(&world.target.display().to_string()),
+        "{error}"
+    );
+    assert_eq!(identity(&world.target).as_ref(), Some(&original));
+    assert_eq!(std::fs::read(world.target.join(MARKER)).unwrap(), marker);
+    assert_eq!(std::fs::read(world.path()).unwrap(), receipt);
+
+    world.build();
+    let removed = retire(&world.home, &world.target, &mut |_, _| true).unwrap();
+    assert!(matches!(
+        removed.as_slice(),
+        [(root, super::super::Unused::Requested)] if root == &world.target
+    ));
+    assert!(!world.target.exists());
+}
+
+#[test]
+fn explicit_retirement_uses_only_this_attempts_observations() {
+    let world = World::new();
+    assert!(create_checked(&world.home, &world.target, &world.owner).unwrap());
+    let clear = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+    let reporting = super::super::fence::Fence::new(&clear).with_reporting();
+    let previous = super::super::KeepReason::ProcessUnavailable;
+    reporting.note(&world.target, previous.clone());
+    let unbuilt = retire_on(
+        &world.home,
+        &world.target,
+        &mut |_, _| panic!("an unbuilt cache grants no removal intent"),
+        &reporting,
+    )
+    .unwrap_err();
+    let missing_locks = super::super::KeepReason::NoCargoLocks;
+    assert!(unbuilt.contains(&missing_locks.to_string()), "{unbuilt}");
+    assert!(!unbuilt.contains(&previous.to_string()), "{unbuilt}");
+    assert!(reporting.retained().contains(&super::super::RetainedCheck {
+        path: world.target.clone(),
+        reason: missing_locks.clone(),
+    }));
+    let repeated = retire_on(
+        &world.home,
+        &world.target,
+        &mut |_, _| panic!("an unbuilt cache still grants no removal intent"),
+        &reporting,
+    )
+    .unwrap_err();
+    assert_eq!(unbuilt, repeated);
+
+    world.build();
+    let original = identity(&world.target).unwrap();
+    let marker = std::fs::read(world.target.join(MARKER)).unwrap();
+    let receipt = std::fs::read(world.path()).unwrap();
+    let mut asked = 0;
+    let mut decline = |_: &Path, _: super::super::Unused| {
+        asked += 1;
+        false
+    };
+    let reused_error = retire_on(&world.home, &world.target, &mut decline, &reporting).unwrap_err();
+    let fresh_error = retire_on(
+        &world.home,
+        &world.target,
+        &mut decline,
+        &super::super::fence::Fence::new(&clear),
+    )
+    .unwrap_err();
+    assert_eq!(asked, 2);
+    assert_eq!(reused_error, fresh_error);
+    assert!(!reused_error.is_empty());
+    assert!(
+        !reused_error.contains(&previous.to_string()),
+        "{reused_error}"
+    );
+    assert!(
+        !reused_error.contains(&missing_locks.to_string()),
+        "{reused_error}"
+    );
+    assert_eq!(identity(&world.target).as_ref(), Some(&original));
+    assert_eq!(std::fs::read(world.target.join(MARKER)).unwrap(), marker);
+    assert_eq!(std::fs::read(world.path()).unwrap(), receipt);
+    assert_eq!(
+        std::fs::read(world.target.join("debug/deps/keep")).unwrap(),
+        b"reusable output"
+    );
+    let removed = retire_on(&world.home, &world.target, &mut |_, _| true, &reporting).unwrap();
+    assert!(matches!(
+        removed.as_slice(),
+        [(root, super::super::Unused::Requested)] if root == &world.target
+    ));
+    assert!(!world.target.exists());
+}
+
+#[test]
 fn explicit_retirement_keeps_cargo_locks_and_unknown_or_live_processes_authoritative() {
     let world = World::new();
     world.build();
@@ -1260,15 +1613,20 @@ fn explicit_retirement_keeps_cargo_locks_and_unknown_or_live_processes_authorita
     let held =
         crate::lock::Flock::try_lock(std::fs::File::open(deep.join(".cargo-build-lock")).unwrap())
             .unwrap();
-    assert!(
-        retire_on(
-            &world.home,
-            &world.target,
-            &mut |_, _| true,
-            &super::super::fence::Fence::new(&clear)
-        )
-        .is_err()
-    );
+    let reporting = super::super::fence::Fence::new(&clear).with_reporting();
+    let error = retire_on(
+        &world.home,
+        &world.target,
+        &mut |_, _| panic!("a held Cargo lock grants no removal intent"),
+        &reporting,
+    )
+    .unwrap_err();
+    let reason = super::super::KeepReason::CargoLocks;
+    assert!(error.contains(&reason.to_string()), "{error}");
+    assert!(reporting.retained().contains(&super::super::RetainedCheck {
+        path: world.target.clone(),
+        reason,
+    }));
     drop(held);
     for unknown in [false, true] {
         let processes = |_: &[PathBuf], _: &[u32]| {
@@ -1284,15 +1642,28 @@ fn explicit_retirement_keeps_cargo_locks_and_unknown_or_live_processes_authorita
                 ..Default::default()
             })
         };
-        assert!(
-            retire_on(
-                &world.home,
-                &world.target,
-                &mut |_, _| true,
-                &super::super::fence::Fence::new(&processes)
-            )
-            .is_err()
-        );
+        let reporting = super::super::fence::Fence::new(&processes).with_reporting();
+        let error = retire_on(
+            &world.home,
+            &world.target,
+            &mut |_, _| panic!("an uncertain process scan grants no removal intent"),
+            &reporting,
+        )
+        .unwrap_err();
+        let reason = if unknown {
+            super::super::KeepReason::ProcessUnavailable
+        } else {
+            super::super::KeepReason::ProcessUsed {
+                pid: 42,
+                how: "executable",
+                observed: world.target.join("debug/deps/keep"),
+            }
+        };
+        assert!(error.contains(&reason.to_string()), "{error}");
+        assert!(reporting.retained().contains(&super::super::RetainedCheck {
+            path: world.target.clone(),
+            reason,
+        }));
         assert_eq!(
             std::fs::read(world.target.join("debug/deps/keep")).unwrap(),
             b"reusable output"
@@ -5451,9 +5822,8 @@ fn the_front_judges_each_word_where_targo_reads_it() {
     assert_eq!(produce(&world, &notes, false, &[], &args), (Some(false), 1));
     assert!(super::read(&world.path()).unwrap().owners_unknown);
 
-    // A config's escapes are decoded only where one may spell a key's character: TOML 1.1's
-    // `\e` spells none, so its file is read line by line; its `\x` may, which the TOML 1.0
-    // reader cannot decode.
+    // TOML 1.1 escapes decode in values and keys: `\e` in an unrelated environment value
+    // leaves the default target selected, and `\x2d` spells the target key's hyphen.
     let built = words(&["--unverified", "build"]);
     let world = World::new();
     config(&world.owner, "config.toml", "[env]\nBOLD = \"\\e[1m\"\n");
@@ -5467,7 +5837,10 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         "config.toml",
         "[build]\n\"target\\x2ddir\" = \"t\"\n",
     );
-    assert_eq!(produce(&world, &world.owner, true, &[], &built), (None, 0));
+    assert_eq!(
+        produce(&world, &world.owner, true, &[], &built),
+        (Some(true), 1)
+    );
 
     // An alias config's optional include of a link that names nothing is skipped, as Targo
     // skips it, through the front's own reader, which refuses a link.
@@ -8466,7 +8839,14 @@ fn ordinary_update_reaches_the_real_driver_without_building_or_changing_cache_cu
 #[cfg(target_os = "macos")]
 #[test]
 fn a_real_compiler_writes_both_configured_outputs_under_recorded_custody() {
-    for source in ["cli", "discovered", "nested", "legacy"] {
+    for source in [
+        "cli",
+        "toml11-cli",
+        "discovered",
+        "toml11-discovered",
+        "nested",
+        "legacy",
+    ] {
         let world = World::new();
         std::fs::write(
         world.owner.join("Cargo.toml"),
@@ -8480,7 +8860,7 @@ fn a_real_compiler_writes_both_configured_outputs_under_recorded_custody() {
         )
         .unwrap();
         let intermediates = match source {
-            "cli" => world.home.join("intermediates.noindex"),
+            "cli" | "toml11-cli" => world.home.join("intermediates.noindex"),
             "nested" => world.owner.join(".cargo/intermediates.noindex"),
             _ => world.owner.join("intermediates.noindex"),
         };
@@ -8490,12 +8870,16 @@ fn a_real_compiler_writes_both_configured_outputs_under_recorded_custody() {
             "--offline".into(),
             "-j1".into(),
         ];
-        if source == "cli" {
+        if matches!(source, "cli" | "toml11-cli") {
             args.extend([
                 "--target-dir".into(),
                 world.target.display().to_string(),
                 "--config".into(),
-                format!("build.build-dir='{}'", intermediates.display()),
+                if source == "toml11-cli" {
+                    format!("build.\"build\\x2Ddir\"='{}'", intermediates.display())
+                } else {
+                    format!("build.build-dir='{}'", intermediates.display())
+                },
             ]);
         } else {
             let config = world.owner.join(".cargo");
@@ -8513,10 +8897,14 @@ fn a_real_compiler_writes_both_configured_outputs_under_recorded_custody() {
             std::fs::write(config.join(root), format!("include=['{leaf}']")).unwrap();
             std::fs::write(
                 config.join(leaf),
-                format!(
-                    "build.target-dir='{}'\nbuild.build-dir='intermediates.noindex'",
-                    world.target.display()
-                ),
+                if source == "toml11-discovered" {
+                    format!("build = {{\n target-dir = '{}',\n \"build\\x2Ddir\" = 'intermediates.noindex',\n}}\n", world.target.display())
+                } else {
+                    format!(
+                        "build.target-dir='{}'\nbuild.build-dir='intermediates.noindex'",
+                        world.target.display()
+                    )
+                },
             )
             .unwrap();
             if source == "legacy" {
@@ -9019,6 +9407,15 @@ fn cold_home_keeps_the_selected_cache_and_rechecks_configuration() {
                 } else {
                     observe_placed_command_with(&args, &placed, super::super::Tool::Targo, &machine)
                 };
+                if !shim && !cfg!(target_os = "macos") {
+                    // A native reroute's admission claims nothing outside macOS: no cache laid,
+                    // so no configuration read again. The shim's front (only macOS's shims call
+                    // it) is the same code on every platform.
+                    result.unwrap();
+                    assert!(!world.home.join("Library").exists());
+                    assert!(!inserted.get());
+                    return;
+                }
                 assert!(world.home.join("Library/Caches/aterm/.ubd").is_dir());
                 if changed_config {
                     assert!(inserted.get());
@@ -9265,6 +9662,161 @@ fn quiet_claim_recomputation_requires_the_matching_environment_and_resolvable_ma
                 }
             }
         }
+    }
+}
+
+/// A NEW HOME'S FIRST BUILD IS ADMITTED IN THE SHARED CACHE: in a home with no `Library`, read
+/// with the real writability probe, the block selects the shared cache (the home itself may be
+/// written, so the cache's folders can be made); the front admits that claim and lays the
+/// cache's folders, and the same claim is admitted again once they stand. 0.199 selected the
+/// in-tree fallback there and refused every build (`the selected quiet build target could not
+/// be resolved safely`): admission's own write of those folders made the plan it read again the
+/// shared cache. The selector now reads the folder admission writes in, so the plan cannot move.
+/// NEGATIVE CONTROL: the in-tree fallback claimed in the same home is no placement the block
+/// selects there and is refused as a mismatched claim, with nothing prepared. A native
+/// reroute's selected argv is admitted on the same reading, twice.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_homes_first_build_is_admitted_in_the_shared_cache() {
+    let world = World::new();
+    assert!(!world.home.join("Library").exists());
+    let machine = super::super::Machine {
+        home: Some(&world.home),
+        root: None,
+        cwd: Some(&world.owner),
+        env: &|_| None,
+        read: &super::super::read_config,
+        writable: &super::super::writable,
+        read_manifest: &|p| Ok(std::fs::read_to_string(p).ok()),
+    };
+    let typed = vec!["--unverified".to_owned(), "build".to_owned()];
+    let tool = super::super::Tool::Targo;
+    let Some(super::super::BuildDir::Cache(claim)) = super::super::decide(&typed, tool, &machine)
+    else {
+        panic!("the block selects the shared cache in a new home");
+    };
+    let handed = [vec!["--config".to_owned(), claim], typed.clone()].concat();
+    for call in ["first", "second"] {
+        let owned = observe_shim_on(&handed, tool, "config", &world.home, &machine, true);
+        assert!(
+            !owned.unwrap(),
+            "{call}: admitted, the shared cache owned by no receipt"
+        );
+        assert!(
+            world.home.join(CACHES).is_dir(),
+            "{call}: its folders stand"
+        );
+    }
+
+    let fallback = super::super::target_build_path(Path::new("{workspace-root}/target"));
+    let fallback = format!("build.build-dir='{}'", fallback.display());
+    let quiet = super::super::target_build_path(&world.owner.join("target"));
+    let other = World::new();
+    for home in [&other, &world] {
+        let machine = super::super::Machine {
+            home: Some(&home.home),
+            cwd: Some(&home.owner),
+            ..machine
+        };
+        let handed = [vec!["--config".to_owned(), fallback.clone()], typed.clone()].concat();
+        let stale = observe_shim_on(&handed, tool, "config", &home.home, &machine, true);
+        assert_eq!(
+            stale.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput,
+            "a fallback claim where the cache may be written is mismatched"
+        );
+        assert!(
+            !super::super::target_build_path(&home.owner.join("target")).exists(),
+            "a refused claim prepares nothing"
+        );
+    }
+    assert!(!quiet.exists());
+
+    let world = World::new();
+    let machine = super::super::Machine {
+        home: Some(&world.home),
+        cwd: Some(&world.owner),
+        ..machine
+    };
+    let (selected, placed) = super::super::placed_build_dir(&typed, tool, &machine).unwrap();
+    assert!(matches!(selected, super::super::BuildDir::Cache(_)));
+    observe_placed_command_with(&typed, &placed, tool, &machine).unwrap();
+    observe_placed_command_with(&typed, &placed, tool, &machine).unwrap();
+}
+
+/// THE SHIM'S NO-CACHE FALLBACK OWES NO RECEIPT IN A HOME THAT CAN RECORD NONE: where
+/// `Library/Caches` stands and may not be written (`read-only`), the block selects the in-tree
+/// fallback and no index can be laid; the front admits the claim unowned, prepares the
+/// workspace's quiet build directory and writes nothing under the caches folder. Before, it
+/// refused every build there (`the target's quiet build directory could not be owned`).
+/// NEGATIVE CONTROLS, each refused in those words with the directory left as it stood: the same
+/// home whose caches folder reaches aterm's own through a link (`linked`), which says nothing
+/// of what the home can record; and a home that records owners (`foreign`), where the trust
+/// lane's fallback names a directory somebody else already filled.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_shims_no_cache_fallback_owes_no_receipt_in_a_home_that_can_record_none() {
+    let fallback = super::super::target_build_path(Path::new("{workspace-root}/target"));
+    let fallback = fallback.to_str().unwrap();
+    for shape in ["read-only", "linked", "foreign"] {
+        let world = World::new();
+        let caches = world.home.join(CACHES);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&caches)
+            .unwrap();
+        let quiet = super::super::target_build_path(&world.owner.join("target"));
+        match shape {
+            "linked" => {
+                let elsewhere = world.home.join("elsewhere");
+                std::fs::create_dir(&elsewhere).unwrap();
+                std::os::unix::fs::symlink(&elsewhere, caches.join("aterm")).unwrap();
+            }
+            "foreign" => {
+                std::fs::create_dir_all(&quiet).unwrap();
+                std::fs::write(quiet.join("keep"), b"somebody's").unwrap();
+            }
+            _ => {}
+        }
+        let (typed, placed): (&[&str], _) = if shape == "foreign" {
+            (&["trust", "check"], "env")
+        } else {
+            std::fs::set_permissions(&caches, std::fs::Permissions::from_mode(0o500)).unwrap();
+            (&["--unverified", "build"], "config")
+        };
+        let typed: Vec<String> = typed.iter().map(|word| (*word).to_owned()).collect();
+        let environment = |name: &str| {
+            (placed == "env" && name == super::super::BUILD_DIR_ENV).then(|| fallback.into())
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &environment,
+            read: &super::super::read_config,
+            writable: &super::super::writable,
+            read_manifest: &|p| Ok(std::fs::read_to_string(p).ok()),
+        };
+        let handed = if placed == "env" {
+            typed
+        } else {
+            let claim = format!("build.build-dir='{fallback}'");
+            [vec!["--config".to_owned(), claim], typed].concat()
+        };
+        let tool = super::super::Tool::Targo;
+        let result = observe_shim_on(&handed, tool, placed, &world.home, &machine, true);
+        std::fs::set_permissions(&caches, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if shape == "read-only" {
+            assert!(!result.unwrap(), "admitted, and owned by no receipt");
+            assert!(quiet.is_dir(), "its quiet build directory is prepared");
+            assert_eq!(std::fs::read_dir(&caches).unwrap().count(), 0);
+            continue;
+        }
+        let refusal = result.unwrap_err().to_string();
+        assert!(refusal.contains("could not be owned"), "{shape}: {refusal}");
+        assert_eq!(quiet.is_dir(), shape == "foreign", "{shape}");
+        assert_eq!(roots(&world.home).len(), 0, "{shape}");
     }
 }
 

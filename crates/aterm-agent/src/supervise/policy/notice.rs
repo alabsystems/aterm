@@ -67,7 +67,7 @@ pub const LABEL: &str = "{label}";
 /// The placeholder a short clause of the policy's fills.
 pub const WHY: &str = "{why}";
 
-/// The placeholder a usage limit's reset fills, as its notice says it (`on Oct 23 at 9am`: [`crate::supervise::limit::ResetClock::words`]).
+/// The placeholder a usage limit's reset fills, as its notice says it (`on Oct 23 at 9am`: [`alab_policy::vocab::ResetClock::words`]).
 pub const RESET: &str = "{reset}";
 
 /// What opens a command a step runs: its label is never cut.

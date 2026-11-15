@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use crate::harness::repo_work::RepoWork;
+use alab_policy::config::TurnEndTiming;
 
 const OTHER_DEFENSE: &str = "Merged the docs and pushed main.\nNothing left: all of it is merged into the remote main branch.";
 
@@ -608,141 +609,6 @@ fn a_report_read_in_part_or_a_need_said_earlier_lands_nothing() {
     assert!(lands(plain), "an earlier message with no need");
 }
 
-const FIRST_LAND_ROWS: &[&str] = &[
-    "not landed",
-    "unlanded",
-    "not pushed",
-    "unpushed",
-    "not merged",
-    "unmerged",
-    "not committed",
-    "uncommitted",
-    "not on main",
-    "not on origin",
-    "not on the remote main",
-    "parked",
-    "wip",
-    "work in progress",
-    "left on a branch",
-    "on its own branch",
-    "for later",
-    "later",
-    "except",
-    "blocked",
-    "pending",
-    "awaiting",
-    "in review",
-    "under review",
-    "for review",
-    "for your review",
-    "for you to review",
-    "to review",
-    "still needs",
-    "still need",
-    "still has to",
-    "still have to",
-    "did not get to",
-    "red",
-    "separate task",
-    "known issue",
-    "known issues",
-    "next session",
-];
-
-#[test]
-fn every_land_status_row_is_open_under_land_and_not_under_cruise() {
-    let said = |row: &str| -> String {
-        match row {
-            "except" => "all of it is merged except the docs".to_string(),
-            "later" => "the docs come later".to_string(),
-            "red" => "the e2e suite is red on main".to_string(),
-            "separate task" => "the docs are a separate task".to_string(),
-            "known issue" | "known issues" => format!("the flaky lexer test is a {row}"),
-            "next session" => "the docs wait for the next session".to_string(),
-            "still needs" | "still has to" => format!("the docs {row} be written"),
-            "still need" | "still have to" => format!("the docs {row} be written"),
-            "did not get to" => "I did not get to the docs".to_string(),
-            "to review" => "the docs are up to review".to_string(),
-            "awaiting" => "the docs are awaiting a reviewer".to_string(),
-            "pending" => "the docs are pending".to_string(),
-            "blocked" => "the docs are blocked on the nod".to_string(),
-            "wip" => "the WIP docs sit on a branch".to_string(),
-            "parked" | "unlanded" | "unpushed" | "unmerged" | "uncommitted" => {
-                format!("the docs are {row}")
-            }
-            "work in progress" => "the docs are a work in progress".to_string(),
-            _ => format!("the docs are {row}"),
-        }
-    };
-    let mut missed = Vec::new();
-    for row in LAND_STATUS.iter().chain(FIRST_LAND_ROWS) {
-        let reply = format!("Merged the parser.\nNothing left: {}.", said(row));
-        let body = needs::defense_body(&reply);
-        let strict = open_work_strict(Some(&body));
-        if strict.is_empty() || clean_defense(Some(&reply)) {
-            missed.push(format!("{row}: {reply}"));
-        }
-        if OPEN_STATUS.contains(row) {
-            continue;
-        }
-        assert!(
-            open_work(Some(&body)).is_empty(),
-            "{row}: Cruise's reading found {:?} in {body}",
-            open_work(Some(&body))
-        );
-    }
-    assert!(missed.is_empty(), "{missed:#?}");
-    for reply in [
-        "Merged the parser.\nNothing left: nothing is parked or pending or left for later.",
-        "Merged the parser.\nNothing left: no branch is unmerged and none is blocked.",
-    ] {
-        assert!(clean_defense(Some(reply)), "{reply}");
-    }
-}
-
-#[test]
-fn land_reads_a_reason_as_no_excuse_and_a_landed_thing_as_landed() {
-    for body in [
-        "the docs branch is not merged, because no reviewer was available",
-        "there is no reviewer so the docs branch is not merged",
-        "the docs are not pushed: no remote is set",
-        "the docs are blocked on the signing nod",
-        "the docs are pending a review",
-        "the docs are awaiting a reviewer",
-        "the docs still has to be written",
-        "I didn't get to the docs",
-        "the lexer's e2e suite is skipped",
-        "CI is red on main",
-        "the docs are a separate task",
-        "the docs are left for a follow-up session",
-    ] {
-        let reply = format!("Merged the parser.\nNothing left: {body}.");
-        assert!(
-            !open_work_strict(Some(&needs::defense_body(&reply))).is_empty(),
-            "{body}"
-        );
-        assert!(!clean_defense(Some(&reply)), "{body}");
-    }
-    for body in [
-        "the earlier WIP branch was merged and deleted",
-        "the parked lexer branch is now merged",
-    ] {
-        let reply = format!("Merged the parser.\nNothing left: {body}.");
-        assert!(
-            clean_defense(Some(&reply)),
-            "{body}: {:?}",
-            land_open_words(Some(&reply))
-        );
-    }
-    assert!(
-        !open_work_strict(Some(
-            "the WIP branch was merged, but the docs are not merged"
-        ))
-        .is_empty()
-    );
-    assert!(!open_work_strict(Some("the WIP branch is not merged")).is_empty());
-}
-
 #[test]
 fn every_act_fits_the_verbatim_bound_with_all_its_suffixes() {
     let repo = RepoWork {
@@ -766,7 +632,7 @@ fn every_act_fits_the_verbatim_bound_with_all_its_suffixes() {
     let rules = rules.trim_end();
     // Under Cruise the check's reversible clause and NEEDS YOU's acknowledgment leave the
     // repository's ask no room beside the go-ahead's word: the ask outranks it ([`fitted_check`]).
-    let cut_check = super::super::go_ahead::unless_held(&done_check_words(0), true).into_owned();
+    let cut_check = alab_policy::go_ahead::unless_held(&done_check_words(0), true).into_owned();
     for (mode, base, ask) in [
         (
             Autopilot::Cruise,

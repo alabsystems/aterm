@@ -34,48 +34,55 @@ fn configured(paths: &Paths) -> Config {
     config
 }
 
-/// The release ring every vault member holds (`~/.aterm/release-ring/`, m22's `machine.toml`
-/// and profile) alongside a separate host-owned `~/.aterm/machine.toml`, and a roster that names
-/// `listed` and revokes `revoked`.
-fn ring(paths: &Paths, listed: &[&str], revoked: &[&str]) {
-    let _ = ring_with_master(paths, listed, revoked);
+/// One release ring and the roster that names `listed` and revokes `revoked`, as bytes: m22's
+/// key, record and profile, the signed roster pair, and the master that signed it.
+struct Ring {
+    key: Vec<u8>,
+    record: Vec<u8>,
+    profile: Vec<u8>,
+    roster: Vec<u8>,
+    signature: Vec<u8>,
+    master: ring::signature::Ed25519KeyPair,
 }
 
-fn ring_with_master(
-    paths: &Paths,
-    listed: &[&str],
-    revoked: &[&str],
-) -> ring::signature::Ed25519KeyPair {
-    use aterm_update_core::roster::{Machine, Roster, SUPPORTED_SCHEMA};
-    use ring::signature::{Ed25519KeyPair, KeyPair as _};
-
+fn make_ring(listed: &[&str], revoked: &[&str]) -> Ring {
+    use ring::signature::Ed25519KeyPair;
     let rng = ring::rand::SystemRandom::new();
-    let key = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
     let master_der = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
     let master = Ed25519KeyPair::from_pkcs8(master_der.as_ref()).unwrap();
-    let aterm = paths.home.join(".aterm");
-    let release_ring = aterm.join("release-ring");
-    std::fs::create_dir_all(release_ring.join("roster")).unwrap();
-    fsx::write_atomic(
-        &release_ring.join("release-credentials.toml"),
-        format!("signing_key = \"{}\"\nmachine_id = \"m22\"\nmachine_roster = \"~/.aterm/release-ring/roster/aterm-machines.toml\"\n", crate::b64::encode_padded(key.as_ref())).as_bytes(),
-        0o600,
-    )
-    .unwrap();
-    fsx::write_atomic(&release_ring.join("machine.key"), key.as_ref(), 0o600).unwrap();
-    fsx::write_atomic(
-        &aterm.join("test-master"),
-        crate::b64::encode_padded(master.public_key().as_ref()).as_bytes(),
-        0o600,
-    )
-    .unwrap();
-    fsx::write_atomic(&release_ring.join("machine.toml"), b"id = \"m22\"\n", 0o600).unwrap();
-    fsx::write_atomic(&aterm.join("machine.toml"), b"id = \"m99\"\n", 0o600).unwrap();
-    let roster = Roster {
+    let key = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+    let roster = signed_roster(&pair, listed, revoked, 1, "9999-12-31T00:00:00Z");
+    Ring {
+        key: key.as_ref().to_vec(),
+        record: b"id = \"m22\"\n".to_vec(),
+        profile: format!(
+            "signing_key = \"{}\"\nmachine_id = \"m22\"\nmachine_roster = \"~/.aterm/release-ring/roster/aterm-machines.toml\"\n",
+            crate::b64::encode_padded(key.as_ref())
+        )
+        .into_bytes(),
+        signature: master.sign(roster.as_bytes()).as_ref().to_vec(),
+        roster: roster.into_bytes(),
+        master,
+    }
+}
+
+/// A roster naming `listed` (m22 under `pair`'s key, the others under fresh ones) and revoking
+/// `revoked`, unsigned.
+fn signed_roster(
+    pair: &ring::signature::Ed25519KeyPair,
+    listed: &[&str],
+    revoked: &[&str],
+    seq: u64,
+    valid_until: &str,
+) -> String {
+    use aterm_update_core::roster::{Machine, Roster, SUPPORTED_SCHEMA};
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    let rng = ring::rand::SystemRandom::new();
+    Roster {
         schema: SUPPORTED_SCHEMA,
-        roster_seq: 1,
-        valid_until: "9999-12-31T00:00:00Z".into(),
+        roster_seq: seq,
+        valid_until: valid_until.into(),
         revoked: revoked.iter().map(|id| (*id).to_owned()).collect(),
         machines: listed
             .iter()
@@ -96,72 +103,94 @@ fn ring_with_master(
             .collect(),
     }
     .to_toml()
-    .unwrap();
-    fsx::write_atomic(
-        &release_ring.join("roster/aterm-machines.toml"),
-        roster.as_bytes(),
-        0o644,
-    )
-    .unwrap();
-    fsx::write_atomic(
-        &release_ring.join("roster/aterm-machines.toml.sig"),
-        master.sign(roster.as_bytes()).as_ref(),
-        0o644,
-    )
-    .unwrap();
-    master
+    .unwrap()
 }
 
+/// Publish `ring` into the store: the three identity entries and the roster pair, `[everyone]`.
+/// The master's public key is kept as the test's own anchor (`.aterm/test-master`).
+fn publish_ring(paths: &Paths, ring: &Ring) {
+    let admin = admin_open(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    let [key, record, profile] = crate::entry_class::RELEASE_RING;
+    let [roster, signature] = crate::entry_class::PUBLIC_ROSTER;
+    for (name, value) in [
+        (key, &ring.key),
+        (record, &ring.record),
+        (profile, &ring.profile),
+        (roster, &ring.roster),
+        (signature, &ring.signature),
+    ] {
+        doc.set_entry(&Audience::Everyone, name, value).unwrap();
+    }
+    admin_publish(paths, &admin, &doc).unwrap();
+    anchor_master(paths, &ring.master);
+}
+
+fn anchor_master(paths: &Paths, master: &ring::signature::Ed25519KeyPair) {
+    use ring::signature::KeyPair as _;
+    let aterm = paths.home.join(".aterm");
+    fsx::ensure_private_dir(&aterm).unwrap();
+    fsx::write_atomic(
+        &aterm.join("test-master"),
+        crate::b64::encode_padded(master.public_key().as_ref()).as_bytes(),
+        0o600,
+    )
+    .unwrap();
+}
+
+/// Publish the entries of `ring` that `edit` leaves, after `edit` changed them.
+fn republish(paths: &Paths, edit: impl FnOnce(&mut crate::text::Document)) {
+    let admin = admin_open(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    edit(&mut doc);
+    admin_publish(paths, &admin, &doc).unwrap();
+}
+
+/// The release ring every vault member's store holds (m22's), and a roster that names `listed`
+/// and revokes `revoked`.
+fn ring(paths: &Paths, listed: &[&str], revoked: &[&str]) {
+    publish_ring(paths, &make_ring(listed, revoked));
+}
+
+/// The store's roster decides, by its signed generation and grants; no roster file is read, so a
+/// granting pair at the old path never masks the store's revocation or expiry.
 #[test]
-fn the_newest_signed_roster_wins_over_path_order_and_old_grants() {
-    use aterm_update_core::roster::{Roster, verify_roster};
+fn the_stores_newest_signed_roster_decides_and_no_roster_file_is_read() {
     let (_root, paths) = lab(&[]);
-    let master = ring_with_master(&paths, &["m22"], &[]);
-    let canonical = paths.home.join(VAULT_ROSTER);
-    // A roster the profile names, at the 0.145 path: profile data, read because it is named.
-    let legacy = paths.home.join(".aterm/roster/aterm-machines.toml");
-    let raw = std::fs::read(&canonical).unwrap();
-    let signature = std::fs::read(canonical.with_extension("toml.sig")).unwrap();
-    fsx::ensure_private_dir(legacy.parent().unwrap()).unwrap();
-    fsx::write_atomic(&legacy, &raw, 0o600).unwrap();
-    fsx::write_atomic(&legacy.with_extension("toml.sig"), &signature, 0o600).unwrap();
-    let profile = std::fs::read_to_string(paths.home.join(RELEASE_PROFILE))
-        .unwrap()
-        .replace(".aterm/release-ring/roster", ".aterm/roster");
-    fsx::write_atomic(&paths.home.join(RELEASE_PROFILE), profile.as_bytes(), 0o600).unwrap();
-    let anchor = std::fs::read_to_string(paths.home.join(".aterm/test-master")).unwrap();
-    let verified = verify_roster(&[&anchor], raw, &signature).unwrap();
-    let mut roster = Roster::parse(&verified).unwrap();
-    let write = |path: &Path, roster: &Roster| {
-        let raw = roster.to_toml().unwrap();
-        fsx::write_atomic(path, raw.as_bytes(), 0o600).unwrap();
-        fsx::write_atomic(
-            &path.with_extension("toml.sig"),
-            master.sign(raw.as_bytes()).as_ref(),
-            0o600,
-        )
-        .unwrap();
+    let ring = make_ring(&["m22"], &[]);
+    publish_ring(&paths, &ring);
+    assert!(test_authorized_ring(&paths), "CONTROL: the store's ring");
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&ring.key).unwrap();
+    let roster_entry = |seq: u64, revoked: &[&str], valid_until: &str| {
+        let raw = signed_roster(&pair, &["m22"], revoked, seq, valid_until);
+        let signature = ring.master.sign(raw.as_bytes()).as_ref().to_vec();
+        (raw.into_bytes(), signature)
     };
-    roster.roster_seq = 2;
-    write(&canonical, &roster);
+    let publish_roster = |(raw, signature): (Vec<u8>, Vec<u8>)| {
+        republish(&paths, |doc| {
+            let [roster, sig] = crate::entry_class::PUBLIC_ROSTER;
+            doc.set_entry(&Audience::Everyone, roster, &raw).unwrap();
+            doc.set_entry(&Audience::Everyone, sig, &signature).unwrap();
+        });
+    };
+    let granting = roster_entry(2, &[], "9999-12-31T00:00:00Z");
+    publish_roster(granting.clone());
     fsx::write_atomic(&paths.dir.join("release-ring-roster-floor"), b"2\n", 0o600).unwrap();
-    assert!(
-        test_authorized_ring(&paths),
-        "the named old roster must not mask the current canonical authority"
-    );
-    roster.roster_seq = 3;
-    roster.revoked.push("m22".into());
-    write(&legacy, &roster);
-    assert!(
-        !test_authorized_ring(&paths),
-        "a newer signed revocation must not fall back to the canonical old grant"
-    );
-    roster.revoked.clear();
-    roster.valid_until = "1970-01-01T00:00:01Z".into();
-    write(&legacy, &roster);
+    assert!(test_authorized_ring(&paths), "the store's newer grant");
+    publish_roster(roster_entry(3, &["m22"], "9999-12-31T00:00:00Z"));
+    // A granting pair at the old file path, written after the store's revocation, is not read.
+    let old = paths.home.join(".aterm/release-ring/roster");
+    fsx::ensure_private_dir(&old).unwrap();
+    fsx::write_atomic(&old.join("aterm-machines.toml"), &granting.0, 0o600).unwrap();
+    fsx::write_atomic(&old.join("aterm-machines.toml.sig"), &granting.1, 0o600).unwrap();
     assert!(
         !test_authorized_ring(&paths),
-        "a newer signed expiry must not fall back to an old grant"
+        "a newer signed revocation in the store is not masked by an old grant on disk"
+    );
+    publish_roster(roster_entry(4, &[], "1970-01-01T00:00:01Z"));
+    assert!(
+        !test_authorized_ring(&paths),
+        "a newer signed expiry is not masked by an old grant"
     );
 }
 
@@ -317,7 +346,8 @@ fn a_saved_digest_does_not_hide_a_missing_profile_after_restart() {
     // A marker retained from an older build is evidence of a past success only.
     fsx::write_atomic(
         &paths.dir.join("release-notary.applied"),
-        materialize::digest_hex(ENTRY_TEXT.as_bytes()).as_bytes(),
+        aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(ENTRY_TEXT.as_bytes()))
+            .as_bytes(),
         0o600,
     )
     .unwrap();
@@ -414,9 +444,32 @@ fn explicit_notary_sync_uses_only_an_authorized_verified_entry() {
     );
     assert_eq!(available.stored.borrow().len(), 1);
 
+    // An untrusted file at the entry's old path changes nothing: the sync reads the vault's
+    // entry in place and stores its password, never the file's.
+    fsx::ensure_private_dir(&paths.home.join(".secrets")).unwrap();
     fsx::write_atomic(
         &paths.home.join(".secrets/release-notary"),
         b"untrusted",
+        0o600,
+    )
+    .unwrap();
+    let in_place = Script::answering(vec![Ok(false), Ok(true)]);
+    assert!(
+        in_place
+            .with_tools(&clt, |tools| sync_notary_with(&paths, tools))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(*in_place.stored.borrow(), ["fake-app-specific-password"]);
+
+    // NEGATIVE CONTROL: with the entry gone from the vault, the file does not stand in for it.
+    let admin = admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    assert!(doc.unset_entry(&Audience::Everyone, ENTRY).unwrap());
+    admin_publish(&paths, &admin, &doc).unwrap();
+    fsx::write_atomic(
+        &paths.home.join(".secrets/release-notary"),
+        ENTRY_TEXT.as_bytes(),
         0o600,
     )
     .unwrap();
@@ -794,10 +847,11 @@ fn the_developer_directory_is_the_one_xcrun_selects() {
     );
 }
 
-/// The roster is the one the profile names (a leading `~/` under the home), else the one the
-/// vault puts beside it.
+/// The profile's `machine_roster` is parsed fail closed (a malformed, relative or duplicated one
+/// authorizes nothing), and whatever it names, the roster is the store's pair: no roster file is
+/// read.
 #[test]
-fn the_roster_is_the_one_the_profile_names_else_the_vaults() {
+fn the_roster_is_the_stores_whatever_the_profile_names() {
     let home = Path::new("/Users//someone");
     assert_eq!(
         named_roster(
@@ -834,129 +888,114 @@ fn the_roster_is_the_one_the_profile_names_else_the_vaults() {
     }
 
     let (_root, paths) = lab(&[]);
-    ring(&paths, &["m22"], &[]);
+    let ring = make_ring(&["m22"], &[]);
+    publish_ring(&paths, &ring);
+    let original = String::from_utf8(ring.profile.clone()).unwrap();
     let elsewhere = paths.home.join("dist");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let original = std::fs::read_to_string(paths.home.join(RELEASE_PROFILE)).unwrap();
-    for name in ["aterm-machines.toml", "aterm-machines.toml.sig"] {
-        std::fs::copy(
-            paths.home.join(".aterm/release-ring/roster").join(name),
-            elsewhere.join(name),
-        )
-        .unwrap();
-    }
-    let profile = |roster: &Path| {
+    // An invalid pair where the profile points: it is not read.
+    std::fs::write(elsewhere.join("aterm-machines.toml"), b"not a roster").unwrap();
+    std::fs::write(elsewhere.join("aterm-machines.toml.sig"), [0; 64]).unwrap();
+    let profile = |line: &str| {
         let text = original
             .lines()
-            .map(|line| {
-                if line.starts_with("machine_roster") {
-                    format!("machine_roster = \"{}\"", roster.display())
-                } else {
+            .map(|old| {
+                if old.starts_with("machine_roster") {
                     line.to_owned()
+                } else {
+                    old.to_owned()
                 }
             })
             .collect::<Vec<_>>()
             .join("\n");
-        fsx::write_atomic(&paths.home.join(RELEASE_PROFILE), text.as_bytes(), 0o600).unwrap();
+        republish(&paths, |doc| {
+            doc.set_entry(
+                &Audience::Everyone,
+                crate::entry_class::RELEASE_RING[2],
+                text.as_bytes(),
+            )
+            .unwrap();
+        });
     };
-    profile(&elsewhere.join("aterm-machines.toml"));
-    assert!(test_authorized_ring(&paths), "the profile's signed roster");
-    profile(&elsewhere.join("missing.toml"));
-    assert!(test_authorized_ring(&paths), "the vault's signed roster");
-    profile(&elsewhere.join("aterm-machines.toml"));
-    std::fs::write(elsewhere.join("aterm-machines.toml.sig"), [0; 64]).unwrap();
-    assert!(
-        !test_authorized_ring(&paths),
-        "no fallback from an invalid named roster"
-    );
-
-    let commented = original
-        .lines()
-        .map(|line| {
-            if line.starts_with("machine_roster") {
-                format!(
-                    "machine_roster = '{}' # inline comment",
-                    elsewhere.join("aterm-machines.toml").display()
-                )
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    fsx::write_atomic(
-        &paths.home.join(RELEASE_PROFILE),
-        commented.as_bytes(),
-        0o600,
-    )
-    .unwrap();
-    assert!(
-        !test_authorized_ring(&paths),
-        "single-quoted or commented machine_roster must not drop the invalid named roster"
-    );
-
-    let relative = original
-        .lines()
-        .map(|line| {
-            if line.starts_with("machine_roster") {
-                "machine_roster = \"relative/aterm-machines.toml\"".to_owned()
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    fsx::write_atomic(
-        &paths.home.join(RELEASE_PROFILE),
-        relative.as_bytes(),
-        0o600,
-    )
-    .unwrap();
-    assert!(
-        !test_authorized_ring(&paths),
-        "relative machine_roster fails closed instead of falling back to canonical roster"
-    );
-}
-
-/// THE 0.145 COPIES UNDER `~/.aterm/` ARE NEVER READ: duplicates of the release ring, recorded for
-/// retirement (ATERM-KI-1112-980). With only them on disk this Mac holds no ring; the canonical
-/// copies alone authorize it (the control).
-#[cfg(unix)]
-#[test]
-fn the_legacy_ring_copies_are_never_read() {
-    let (_root, paths) = lab(&[]);
-    ring(&paths, &["m22"], &[]);
+    profile(&format!(
+        "machine_roster = \"{}\"",
+        elsewhere.join("aterm-machines.toml").display()
+    ));
+    assert!(test_authorized_ring(&paths), "the store's signed roster");
+    profile(&format!(
+        "machine_roster = \"{}\"",
+        elsewhere.join("missing.toml").display()
+    ));
     assert!(
         test_authorized_ring(&paths),
-        "CONTROL: the canonical ring authorizes"
+        "a missing named file is not read"
     );
-    let aterm = paths.home.join(".aterm");
-    std::fs::create_dir_all(aterm.join("roster")).unwrap();
-    let profile = std::fs::read_to_string(paths.home.join(RELEASE_PROFILE))
-        .unwrap()
-        .replace(".aterm/release-ring/roster", ".aterm/roster");
+    profile("machine_roster = \"relative/aterm-machines.toml\"");
+    assert!(
+        !test_authorized_ring(&paths),
+        "a relative machine_roster fails closed"
+    );
+    // NEGATIVE CONTROL: without the store's pair nothing authorizes, whatever the files hold.
+    republish(&paths, |doc| {
+        for name in crate::entry_class::PUBLIC_ROSTER {
+            doc.unset_entry(&Audience::Everyone, name).unwrap();
+        }
+        doc.set_entry(
+            &Audience::Everyone,
+            crate::entry_class::RELEASE_RING[2],
+            &ring.profile,
+        )
+        .unwrap();
+    });
+    let canonical = paths.home.join(".aterm/release-ring/roster");
+    fsx::ensure_private_dir(&canonical).unwrap();
+    fsx::write_atomic(&canonical.join("aterm-machines.toml"), &ring.roster, 0o600).unwrap();
     fsx::write_atomic(
-        &aterm.join("release-credentials.toml"),
-        profile.as_bytes(),
+        &canonical.join("aterm-machines.toml.sig"),
+        &ring.signature,
         0o600,
     )
     .unwrap();
-    std::fs::copy(
-        aterm.join("release-ring/machine.key"),
-        aterm.join("machine.key"),
-    )
-    .unwrap();
-    for name in ["aterm-machines.toml", "aterm-machines.toml.sig"] {
-        std::fs::copy(
-            aterm.join("release-ring/roster").join(name),
-            aterm.join("roster").join(name),
+    assert!(!test_authorized_ring(&paths), "a roster file is never read");
+}
+
+/// THE RING IS THE STORE'S: ring files on disk, at the 0.146 paths or the 0.145 copies under
+/// `~/.aterm/` (recorded for retirement, ATERM-KI-1112-980), authorize nothing while the store
+/// holds no ring; the store's ring alone authorizes (the control).
+#[cfg(unix)]
+#[test]
+fn ring_files_on_disk_are_never_read() {
+    let (_root, paths) = lab(&[]);
+    let ring = make_ring(&["m22"], &[]);
+    anchor_master(&paths, &ring.master);
+    let aterm = paths.home.join(".aterm");
+    for (dir, roster) in [
+        (
+            aterm.join("release-ring"),
+            aterm.join("release-ring/roster"),
+        ),
+        (aterm.clone(), aterm.join("roster")),
+    ] {
+        fsx::ensure_private_dir(&roster).unwrap();
+        fsx::write_atomic(&dir.join("machine.key"), &ring.key, 0o600).unwrap();
+        fsx::write_atomic(&dir.join("machine.toml"), &ring.record, 0o600).unwrap();
+        fsx::write_atomic(&dir.join("release-credentials.toml"), &ring.profile, 0o600).unwrap();
+        fsx::write_atomic(&roster.join("aterm-machines.toml"), &ring.roster, 0o600).unwrap();
+        fsx::write_atomic(
+            &roster.join("aterm-machines.toml.sig"),
+            &ring.signature,
+            0o600,
         )
         .unwrap();
     }
-    std::fs::remove_dir_all(aterm.join("release-ring")).unwrap();
     assert!(
         !test_authorized_ring(&paths),
-        "the 0.145 copies alone authorize nothing"
+        "ring files alone authorize nothing"
+    );
+    publish_ring(&paths, &ring);
+    assert!(
+        test_authorized_ring(&paths),
+        "CONTROL: the store's ring authorizes"
     );
 }
 

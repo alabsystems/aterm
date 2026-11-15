@@ -3472,6 +3472,7 @@ fn renderer_native_button_icons_emit_no_font_dependent_text() {
         ButtonIcon::Themes,
         ButtonIcon::Spark,
         ButtonIcon::Tabs,
+        ButtonIcon::Computer,
         ButtonIcon::Trash,
         ButtonIcon::Reset,
         ButtonIcon::Clear,

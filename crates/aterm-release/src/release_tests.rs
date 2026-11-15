@@ -218,7 +218,6 @@ fn an_all_fresh_bundle_releases_the_tree_and_preserves_the_fixture_handoff() {
         tree: Some(crate::check_record::VerifyRun {
             half: crate::check_record::Half::Tree,
             checks: vec!["test".into()],
-            passed_binaries: Vec::new(),
             passed_lint_packages: Vec::new(),
             passed_appkit_groups: Vec::new(),
         }),

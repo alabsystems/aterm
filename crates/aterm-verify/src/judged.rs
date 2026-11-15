@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The main lane's append-only, compare-and-swap Git journal. No verdict is a gate.
+//! The main lane's append-only, compare-and-swap Git journal, which also files `verify land`'s
+//! records under [`LAND`]: its per-check verdict records ([`crate::land_record`]) and, under
+//! [`RUNS`], its run records ([`crate::land_run`]), one store with a retention per kind. No
+//! verdict is a gate: nothing reads a land record to decide a landing yet, and nothing refuses a
+//! push made without `verify land`.
 
 use aterm_uds::spawnfd::Command;
 use serde::{Deserialize, Serialize};
@@ -9,15 +13,25 @@ use std::path::Path;
 
 pub const REF: &str = "refs/aterm/judged";
 pub const RETENTION: u64 = 14 * 86400;
-pub const LEASE: u64 = 120;
+/// Seconds a claim holds its tree after the renewal that last reached the journal. A controller
+/// renews at each stage end and at least every [`RENEW_EVERY`] seconds, so one renewal that fails
+/// does not lapse the lease. A lapsed lease ends no judgment: it only lets another host claim
+/// the tree. The lapsed attempt's last record is then filed beside the slot while that host's
+/// live claim or its pass or red holds it, and otherwise at the slot, in place of what that
+/// host left there ([`Place`]).
+pub const LEASE: u64 = 20 * 60;
+/// The longest a controller leaves its claim unrenewed, in seconds.
+pub const RENEW_EVERY: u64 = 10 * 60;
+// One renewal may fail, and its retries with it, before the lease lapses.
+const _: () = assert!(LEASE >= 2 * RENEW_EVERY);
 
 #[cfg(unix)]
 thread_local! {
     static INTERRUPTIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// A lease renewal may use its whole remaining ownership budget because its child I/O can
-/// stop on the controller's interrupt. Leave the interrupt for that controller to report;
+/// A lease renewal runs while its sample does, so its child I/O stops on the controller's
+/// interrupt. Leave the interrupt for that controller to report;
 /// terminal publication outside this scope must still run while the interrupt is pending.
 #[cfg(unix)]
 pub fn interruptible<T>(work: impl FnOnce() -> T) -> T {
@@ -75,6 +89,26 @@ impl Record {
     pub fn occupied(&self, now: u64) -> bool {
         matches!(self.state.as_str(), "pass" | "red")
             || (self.state == "judging" && self.lease_until > now)
+    }
+}
+
+/// Where a record is filed under `verdicts/`. A reader of a tree's verdict asks its slot alone;
+/// [`records`] and [`history`] read both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// `verdicts/<tree>.toml`: the tree's claim, and then the record that attempt ended with.
+    Slot,
+    /// `verdicts/<tree>/<token>.toml`: the last record of an attempt whose lease lapsed, where
+    /// another attempt's live claim or verdict holds the slot. Filing it there replaces neither.
+    Beside,
+}
+
+impl Place {
+    fn path(self, record: &Record) -> String {
+        match self {
+            Self::Slot => format!("verdicts/{}.toml", record.tree),
+            Self::Beside => format!("verdicts/{}/{}.toml", record.tree, record.token),
+        }
     }
 }
 
@@ -165,23 +199,110 @@ pub fn records(
     head: Option<&str>,
     until: std::time::Instant,
 ) -> Result<Vec<Record>, String> {
+    Ok(filed(root, head, "verdicts/", until)?
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect())
+}
+
+/// The records filed beside `tree`'s slot at `head` ([`Place::Beside`]).
+pub fn beside(
+    root: &Path,
+    head: Option<&str>,
+    tree: &str,
+    until: std::time::Instant,
+) -> Result<Vec<Record>, String> {
+    Ok(filed(root, head, &format!("verdicts/{tree}/"), until)?
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect())
+}
+
+/// Each record under the directory `under` at `head`, with the path it is filed at.
+fn filed(
+    root: &Path,
+    head: Option<&str>,
+    under: &str,
+    until: std::time::Instant,
+) -> Result<Vec<(String, Record)>, String> {
     let git = |root: &Path, args: &[&str]| git_until(root, args, until);
     let output = |cmd: &mut Command, input: Option<&[u8]>| output_until(cmd, input, until);
     let Some(head) = head else {
         return Ok(Vec::new());
     };
-    let names = git(
+    let listing = git(
         root,
-        &["ls-tree", "-r", "--format=%(objectname)", head, "verdicts/"],
+        &[
+            "ls-tree",
+            "-r",
+            "--format=%(objectname) %(path)",
+            head,
+            under,
+        ],
     )?;
-    if names.is_empty() {
+    if listing.is_empty() {
         return Ok(Vec::new());
     }
+    let entries = listing
+        .lines()
+        .map(|line| line.split_once(' '))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("invalid journal listing")?;
+    let names: String = entries
+        .iter()
+        .map(|(object, _)| format!("{object}\n"))
+        .collect();
     let objects = output(
         &mut command(root, &["cat-file", "--batch"]),
-        Some(format!("{names}\n").as_bytes()),
+        Some(names.as_bytes()),
     )?;
-    decode_objects(objects.as_bytes())
+    let records = decode_objects(objects.as_bytes())?;
+    if records.len() != entries.len() {
+        return Err("the journal's listing and its objects disagree".into());
+    }
+    Ok(entries
+        .into_iter()
+        .map(|(_, path)| path.to_owned())
+        .zip(records)
+        .collect())
+}
+
+/// Whether the journal has held exactly `record`, at its tree's slot or beside it, at `head` or
+/// in any commit before it. A record a later claim replaced is still one the journal took, so a
+/// caller that asks before it appends never files one record twice.
+pub fn published(
+    root: &Path,
+    head: Option<&str>,
+    record: &Record,
+    until: std::time::Instant,
+) -> Result<bool, String> {
+    let Some(head) = head else {
+        return Ok(false);
+    };
+    let text = aterm_toml::to_string(record).map_err(|e| e.to_string())?;
+    let blob = output_until(
+        &mut command(root, &["hash-object", "--stdin"]),
+        Some(text.as_bytes()),
+        until,
+    )?;
+    let changes = git_until(
+        root,
+        &[
+            "log",
+            "--format=",
+            "--raw",
+            "--no-abbrev",
+            head,
+            "--",
+            &Place::Slot.path(record),
+            &Place::Beside.path(record),
+        ],
+        until,
+    )?;
+    Ok(changes
+        .lines()
+        .filter(|line| line.starts_with(':'))
+        .any(|line| line.split_whitespace().nth(3) == Some(blob.trim())))
 }
 
 pub fn record(
@@ -259,8 +380,16 @@ pub fn history(root: &Path, head: &str, since: u64) -> Result<Vec<Record>, Strin
         .collect())
 }
 
-fn decode_objects(mut bytes: &[u8]) -> Result<Vec<Record>, String> {
-    let mut records = Vec::new();
+fn decode_objects(bytes: &[u8]) -> Result<Vec<Record>, String> {
+    blobs(bytes)?
+        .into_iter()
+        .map(|text| aterm_toml::from_str(text).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// The text of each blob in a `git cat-file --batch` answer, in the order asked.
+pub(crate) fn blobs(mut bytes: &[u8]) -> Result<Vec<&str>, String> {
+    let mut blobs = Vec::new();
     while !bytes.is_empty() {
         let end = bytes
             .iter()
@@ -269,19 +398,24 @@ fn decode_objects(mut bytes: &[u8]) -> Result<Vec<Record>, String> {
         let header = std::str::from_utf8(&bytes[..end]).map_err(|e| e.to_string())?;
         let fields: Vec<_> = header.split_whitespace().collect();
         if fields.len() != 3 || fields[1] != "blob" {
-            return Err(format!("invalid journal object: {header}"));
+            return Err(format!("invalid object in a git batch answer: {header}"));
         }
         let length = fields[2].parse::<usize>().map_err(|e| e.to_string())?;
         bytes = &bytes[end + 1..];
-        let text = std::str::from_utf8(bytes.get(..length).ok_or("truncated journal blob")?)
-            .map_err(|e| e.to_string())?;
-        records.push(aterm_toml::from_str(text).map_err(|e| e.to_string())?);
+        blobs.push(
+            std::str::from_utf8(
+                bytes
+                    .get(..length)
+                    .ok_or("truncated blob in a git batch answer")?,
+            )
+            .map_err(|e| e.to_string())?,
+        );
         bytes = bytes
             .get(length..)
             .and_then(|b| b.strip_prefix(b"\n"))
             .ok_or("missing object terminator")?;
     }
-    Ok(records)
+    Ok(blobs)
 }
 
 /// One change to the journal's tree, by a `/`-separated path from its root.
@@ -454,6 +588,27 @@ fn edit_tree_with(
     edits: &[Edit],
     trees: &mut Trees<'_>,
 ) -> Result<String, String> {
+    let (entries, _) = edited(base, &node_of(edits)?, trees)?;
+    (trees.make)(&entries)
+}
+
+/// [`edit_tree_with`], `None` where no entry differs from `base`'s.
+/// # Errors
+/// As [`edit_tree_with`].
+fn edit_tree_if_changed(
+    base: Option<&str>,
+    edits: &[Edit],
+    trees: &mut Trees<'_>,
+) -> Result<Option<String>, String> {
+    let (entries, changed) = edited(base, &node_of(edits)?, trees)?;
+    if !changed && base.is_some() {
+        return Ok(None);
+    }
+    (trees.make)(&entries).map(Some)
+}
+
+/// `edits` by directory, in order.
+fn node_of(edits: &[Edit]) -> Result<Node, String> {
     let mut node = Node::default();
     for edit in edits {
         match edit {
@@ -464,8 +619,7 @@ fn edit_tree_with(
             Edit::Remove { path } => node.add(path, Change::Remove)?,
         }
     }
-    let (entries, _) = edited(base, &node, trees)?;
-    (trees.make)(&entries)
+    Ok(node)
 }
 
 /// The entries of the tree `id` names (a commit names its own tree).
@@ -510,7 +664,7 @@ fn mktree(root: &Path, entries: &Entries, until: std::time::Instant) -> Result<S
 /// A normal fast-forward push is the CAS: a competing append rejects this parent.
 /// The caller rereads and redecides; it never force-pushes a stale decision. The new tree is
 /// `parent`'s with only the paths the append changes edited (`edit_tree_with`): the root and
-/// `verdicts/`, whatever else the journal holds.
+/// `verdicts/`, whatever else the journal holds. The record is filed at its tree's slot.
 pub fn append(
     root: &Path,
     remote: &str,
@@ -518,11 +672,24 @@ pub fn append(
     record: &Record,
     until: std::time::Instant,
 ) -> Result<bool, String> {
+    append_at(root, remote, parent, record, Place::Slot, until)
+}
+
+/// [`append`], with the record filed at `place`.
+pub fn append_at(
+    root: &Path,
+    remote: &str,
+    parent: Option<&str>,
+    record: &Record,
+    place: Place,
+    until: std::time::Instant,
+) -> Result<bool, String> {
     append_with(
         root,
         remote,
         parent,
         record,
+        place,
         until,
         &mut Trees {
             list: &mut |id| ls_tree(root, id, until),
@@ -531,29 +698,36 @@ pub fn append(
     )
 }
 
-/// [`append`], its tree objects read and written through `trees`.
+/// [`append_at`], its tree objects read and written through `trees`.
 fn append_with(
     root: &Path,
     remote: &str,
     parent: Option<&str>,
     record: &Record,
+    place: Place,
     until: std::time::Instant,
     trees: &mut Trees<'_>,
 ) -> Result<bool, String> {
     // One absolute deadline bounds the whole append, including CAS races and pruning.
     let git = |root: &Path, args: &[&str]| git_until(root, args, until);
     let output = |cmd: &mut Command, input: Option<&[u8]>| output_until(cmd, input, until);
-    let capture = |cmd: &mut Command, input: Option<&[u8]>| capture_until(cmd, input, until);
     let last_pruned = parent
         .and_then(|p| git(root, &["show", &format!("{p}:pruned-at")]).ok())
         .and_then(|s| s.parse::<u64>().ok());
     let prune = last_pruned.is_none_or(|day| day < record.updated / 86400);
     let mut edits = Vec::new();
     if prune {
-        for old in records(root, parent, until)? {
+        for (path, old) in filed(root, parent, "verdicts/", until)? {
             if old.updated.saturating_add(RETENTION) < record.updated {
+                // A record beside its tree's slot goes by its own path, and leaves the slot's
+                // record to its own age. Any other goes by the slot its tree names.
+                let beside = Place::Beside.path(&old);
                 edits.push(Edit::Remove {
-                    path: format!("verdicts/{}.toml", old.tree),
+                    path: if path == beside {
+                        beside
+                    } else {
+                        Place::Slot.path(&old)
+                    },
                 });
             }
         }
@@ -572,44 +746,509 @@ fn append_with(
         Some(text.as_bytes()),
     )?;
     edits.push(Edit::Put {
-        path: format!("verdicts/{}.toml", record.tree),
+        path: place.path(record),
         blob: blob.trim().to_owned(),
     });
     let tree = edit_tree_with(parent, &edits, trees)?;
-    let mut commit = command(
-        root,
-        &[
-            "commit-tree",
-            &tree,
-            "-m",
-            &format!("verify watch: {} {}", record.state, record.commit),
-        ],
-    );
+    let message = format!("verify watch: {} {}", record.state, record.commit);
+    publish(root, remote, parent, &tree, &message, until).map(|pushed| pushed.is_some())
+}
+
+/// Commit `tree` over `parent` (none: the journal's first commit) and push it as the journal's
+/// head, a normal fast-forward that is the compare-and-swap: the commit, or `None` where a
+/// competing append moved the journal first.
+/// # Errors
+/// A git step failed, or the push was refused while the journal stayed at `parent`.
+fn publish(
+    root: &Path,
+    remote: &str,
+    parent: Option<&str>,
+    tree: &str,
+    message: &str,
+    until: std::time::Instant,
+) -> Result<Option<String>, String> {
+    let mut commit = command(root, &["commit-tree", tree, "-m", message]);
     if let Some(parent) = parent {
         commit.args(["-p", parent]);
     }
-    let sha = output(&mut commit, None)?;
-    let pushed = capture(
+    let sha = output_until(&mut commit, None, until)?.trim().to_owned();
+    let pushed = capture_until(
         &mut command(
             root,
-            &[
-                "push",
-                "--porcelain",
-                remote,
-                &format!("{}:{REF}", sha.trim()),
-            ],
+            &["push", "--porcelain", remote, &format!("{sha}:{REF}")],
         ),
         None,
+        until,
     )?;
     if pushed.status.success() {
-        return Ok(true);
+        return Ok(Some(sha));
     }
     // A race is retryable only when the remote actually moved. Authentication/network failures
     // remain errors, rather than turning into a tight retry loop.
     if head(root, remote, until)?.as_deref() != parent {
-        return Ok(false);
+        return Ok(None);
     }
     Err(String::from_utf8_lossy(&pushed.stderr).into_owned())
+}
+
+/// The directory of `verify land`'s verdict records ([`crate::land_record`]), beside `verdicts/`:
+/// `land/<utc-day>/<T>/<check>.<key>.<word>.toml`.
+pub const LAND: &str = crate::land_record::DIR;
+
+/// The UTC day [`LAND`]'s last prune went by. Only writers that know `land/` read or write it, so
+/// an older writer's append, which writes the lane's `pruned-at`, never takes the day's land prune
+/// away.
+pub const LAND_PRUNED_AT: &str = "land/pruned-at";
+
+/// The directory of `verify land`'s run records ([`crate::land_run`]) inside [`LAND`]:
+/// `land/runs/<utc-day>/<run>.<seq>.<kind>.toml`.
+pub const RUNS: &str = crate::land_run::DIR;
+
+/// How long a verdict record's day directory stays at least once the day has ended
+/// ([`expired`]); longer where the lane's clock is behind the appender's ([`land_append`]).
+pub const LAND_RETENTION: u64 = 2 * 86_400;
+
+/// How long a run record's day directory stays at least once the day has ended: the census's
+/// window ([`crate::land_census`]).
+pub const RUN_RETENTION: u64 = 14 * 86_400;
+
+/// Which kind of land record a day directory holds, by which its retention goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// A verdict record's, [`LAND_RETENTION`].
+    Verdict,
+    /// A run record's, [`RUN_RETENTION`].
+    Run,
+}
+
+impl Kept {
+    /// How long its day directory stays at least.
+    #[must_use]
+    pub const fn retention(self) -> u64 {
+        match self {
+            Self::Verdict => LAND_RETENTION,
+            Self::Run => RUN_RETENTION,
+        }
+    }
+}
+
+/// Whether the land prune by UTC day `today` drops the day directory `day` of records of `kind`:
+/// at least its retention has passed since that day ended, so every record in it ended that
+/// long ago.
+#[must_use]
+pub fn expired(kind: Kept, day: u64, today: u64) -> bool {
+    day.saturating_add(1 + kind.retention() / 86_400) <= today
+}
+
+/// Every verdict record filed on the journal's `head` under one of `trees`, in every day
+/// directory (so no writer's clock skew hides one), each held to
+/// [`crate::land_record::Entry::read`]'s checks; and each entry of `land/` that is no day
+/// directory, but the run records' [`RUNS`] ([`run_records`]), named as unreadable. Only those
+/// trees' directories are listed. One bad entry never fails the read: one that is no file, or is
+/// longer than [`crate::land_record::MAX_BYTES`], is unreadable, and is not read.
+/// # Errors
+/// A git read failed.
+pub fn land_records(
+    root: &Path,
+    head: Option<&str>,
+    trees: &[&str],
+    until: std::time::Instant,
+) -> Result<Vec<crate::land_record::Entry>, String> {
+    use crate::land_record::{Entry, Origin};
+    let Some(head) = head else {
+        return Ok(Vec::new());
+    };
+    let top = ls_tree(root, head, until)?;
+    let Some(land) = top.get(LAND) else {
+        return Ok(Vec::new());
+    };
+    if !land.is_tree() {
+        return Ok(vec![Entry::unread(
+            LAND,
+            Origin::Journal,
+            "it is no directory".into(),
+        )]);
+    }
+    let wanted: std::collections::BTreeSet<&str> = trees
+        .iter()
+        .copied()
+        .filter(|tree| crate::land_record::tree_id(tree))
+        .collect();
+    let mut entries = Vec::new();
+    let mut dirs = Vec::new();
+    for (name, entry) in ls_tree(root, &land.id, until)? {
+        let path = format!("{LAND}/{name}");
+        if (path == LAND_PRUNED_AT && !entry.is_tree()) || (path == RUNS && entry.is_tree()) {
+            continue;
+        }
+        if !entry.is_tree() || crate::land_record::day_of(&name).is_none() {
+            entries.push(Entry::unread(
+                &path,
+                Origin::Journal,
+                "it is no day directory".into(),
+            ));
+            continue;
+        }
+        dirs.extend(wanted.iter().map(|tree| format!("{path}/{tree}/")));
+    }
+    if dirs.is_empty() {
+        return Ok(entries);
+    }
+    let (read, unread) = blobs_under(root, head, &dirs, until)?;
+    entries.extend(
+        unread
+            .into_iter()
+            .map(|(path, why)| Entry::unread(&path, Origin::Journal, why)),
+    );
+    entries.extend(
+        read.iter()
+            .map(|(path, bytes)| Entry::read(path, bytes, Origin::Journal)),
+    );
+    Ok(entries)
+}
+
+/// Every run record filed on the journal's `head` in a day directory of [`RUNS`] from UTC day
+/// `since` on, each held to [`crate::land_run::Entry::read`]'s checks; and each entry of
+/// [`RUNS`] that is no day directory, named as unreadable. One bad entry never fails the read.
+/// # Errors
+/// A git read failed.
+pub fn run_records(
+    root: &Path,
+    head: Option<&str>,
+    since: u64,
+    until: std::time::Instant,
+) -> Result<Vec<crate::land_run::Entry>, String> {
+    use crate::land_record::Origin;
+    use crate::land_run::Entry;
+    let Some(head) = head else {
+        return Ok(Vec::new());
+    };
+    let top = ls_tree(root, head, until)?;
+    let Some(land) = top.get(LAND).filter(|land| land.is_tree()) else {
+        return Ok(Vec::new());
+    };
+    let Some(runs) = ls_tree(root, &land.id, until)?
+        .get(&RUNS[LAND.len() + 1..])
+        .cloned()
+    else {
+        return Ok(Vec::new());
+    };
+    if !runs.is_tree() {
+        return Ok(vec![Entry::unread(
+            RUNS,
+            Origin::Journal,
+            "it is no directory".into(),
+        )]);
+    }
+    let mut entries = Vec::new();
+    let mut dirs = Vec::new();
+    for (name, entry) in ls_tree(root, &runs.id, until)? {
+        let path = format!("{RUNS}/{name}");
+        match crate::land_record::day_of(&name) {
+            Some(day) if entry.is_tree() => {
+                if day >= since {
+                    dirs.push(format!("{path}/"));
+                }
+            }
+            _ => entries.push(Entry::unread(
+                &path,
+                Origin::Journal,
+                "it is no day directory".into(),
+            )),
+        }
+    }
+    if dirs.is_empty() {
+        return Ok(entries);
+    }
+    let (read, unread) = blobs_under(root, head, &dirs, until)?;
+    entries.extend(
+        unread
+            .into_iter()
+            .map(|(path, why)| Entry::unread(&path, Origin::Journal, why)),
+    );
+    entries.extend(
+        read.iter()
+            .map(|(path, bytes)| Entry::read(path, bytes, Origin::Journal)),
+    );
+    Ok(entries)
+}
+
+/// Each file under the directories `dirs` (each ending in `/`) of the journal's `head`, by one
+/// listing and one batch read: those read, with their bytes, and those not read, with why (one
+/// that is no file, longer than [`crate::land_record::MAX_BYTES`], or whose object is missing).
+/// # Errors
+/// A git read failed, or its output did not parse.
+fn blobs_under(
+    root: &Path,
+    head: &str,
+    dirs: &[String],
+    until: std::time::Instant,
+) -> Result<ReadBlobs, String> {
+    let mut args = vec![
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        "--format=%(objecttype) %(objectname) %(objectsize)%x09%(path)",
+        head,
+        "--",
+    ];
+    args.extend(dirs.iter().map(String::as_str));
+    let listing = capture_until(&mut command(root, &args), None, until)?;
+    if !listing.status.success() {
+        return Err(String::from_utf8_lossy(&listing.stderr).into_owned());
+    }
+    let mut unread = Vec::new();
+    let mut blobs = Vec::new();
+    for item in listing.stdout.split(|b| *b == 0).filter(|i| !i.is_empty()) {
+        let item = String::from_utf8_lossy(item);
+        let invalid = || format!("invalid journal tree entry: {item:?}");
+        let (fields, path) = item.split_once('\t').ok_or_else(invalid)?;
+        let mut fields = fields.split(' ');
+        let (Some(kind), Some(id), Some(size), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(invalid());
+        };
+        if kind != "blob" {
+            unread.push((path.to_owned(), "it is no file".to_owned()));
+        } else if size
+            .parse::<u64>()
+            .is_ok_and(|size| size <= crate::land_record::MAX_BYTES)
+        {
+            blobs.push((path.to_owned(), id.to_owned()));
+        } else {
+            unread.push((
+                path.to_owned(),
+                format!("it is longer than {} bytes", crate::land_record::MAX_BYTES),
+            ));
+        }
+    }
+    let mut read = Vec::new();
+    if blobs.is_empty() {
+        return Ok((read, unread));
+    }
+    let input: String = blobs.iter().map(|(_, id)| format!("{id}\n")).collect();
+    let objects = capture_until(
+        &mut command(root, &["cat-file", "--batch"]),
+        Some(input.as_bytes()),
+        until,
+    )?;
+    if !objects.status.success() {
+        return Err(String::from_utf8_lossy(&objects.stderr).into_owned());
+    }
+    let mut bytes = objects.stdout.as_slice();
+    for (path, _) in blobs {
+        let end = bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or("truncated object header")?;
+        let header = String::from_utf8_lossy(&bytes[..end]).into_owned();
+        bytes = &bytes[end + 1..];
+        let fields: Vec<&str> = header.split(' ').collect();
+        match fields[..] {
+            [_, "blob", size] => {
+                let size = size.parse::<usize>().map_err(|e| e.to_string())?;
+                let body = bytes.get(..size).ok_or("truncated journal blob")?;
+                read.push((path, body.to_vec()));
+                bytes = bytes
+                    .get(size..)
+                    .and_then(|b| b.strip_prefix(b"\n"))
+                    .ok_or("missing object terminator")?;
+            }
+            [_, "missing"] => unread.push((path, "its object is missing".to_owned())),
+            _ => return Err(format!("invalid journal object: {header}")),
+        }
+    }
+    Ok((read, unread))
+}
+
+/// What [`blobs_under`] read: each file's path and bytes, and each it did not read, with why.
+type ReadBlobs = (Vec<(String, Vec<u8>)>, Vec<(String, String)>);
+
+/// What one land append attempt came to ([`land_append`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Appended {
+    /// The journal's head, which holds a record at each path given, but those a prune drops.
+    Holds(String),
+    /// A competing append moved the journal first: read its head again and retry.
+    Raced,
+}
+
+/// Append land `records` (verdict records and run records) over the journal's `parent` at Unix
+/// time `now`: one compare-and-swap attempt, whose new tree edits only the root, `land/`, each
+/// `land/<day>/` and each `<T>/` it writes, `land/runs/` and each `land/runs/<day>/` it writes
+/// (and the day directories it prunes). A verdict FAIL's path keeps the first record filed there:
+/// a FAIL already on `parent`, or earlier in `records`, is not replaced, while an `ok`, `skip` or
+/// `NOT RUN` record, and a run record, replaces the one at its path. The prune goes by the
+/// earlier of `now`'s UTC day and the lane's own day (its `pruned-at`, the clock of the Mac that
+/// judges main, which no land writes), so no one Mac's clock drops a record early: a land Mac
+/// whose clock runs ahead prunes no further than the lane's day, and with no lane day in the
+/// journal nothing is pruned. On the first land append past [`LAND_PRUNED_AT`]'s day by that
+/// bound, the day directories [`expired`] drops by it go, each kind by its own retention
+/// ([`LAND_RETENTION`] for `land/<day>/`, [`RUN_RETENTION`] for `land/runs/<day>/`), no blob
+/// read, and [`LAND_PRUNED_AT`] takes that day, so it never moves back nor past the lane's. A
+/// record filed under a day its kind's retention has expired by `now` is not appended. With
+/// nothing to change, nothing is pushed.
+/// # Errors
+/// A record's path does not parse, a git step failed, or the push was refused while the
+/// journal stayed at `parent`.
+pub fn land_append(
+    root: &Path,
+    remote: &str,
+    parent: Option<&str>,
+    records: &[crate::land_record::Signed],
+    now: u64,
+    until: std::time::Instant,
+) -> Result<Appended, String> {
+    land_append_with(
+        root,
+        remote,
+        parent,
+        records,
+        now,
+        until,
+        &mut Trees {
+            list: &mut |id| ls_tree(root, id, until),
+            make: &mut |entries| mktree(root, entries, until),
+        },
+    )
+}
+
+/// [`land_append`], its tree objects read and written through `trees`.
+fn land_append_with(
+    root: &Path,
+    remote: &str,
+    parent: Option<&str>,
+    records: &[crate::land_record::Signed],
+    now: u64,
+    until: std::time::Instant,
+    trees: &mut Trees<'_>,
+) -> Result<Appended, String> {
+    let today = now / 86_400;
+    let blob = |bytes: &[u8]| {
+        output_until(
+            &mut command(root, &["hash-object", "-w", "--stdin"]),
+            Some(bytes),
+            until,
+        )
+        .map(|id| id.trim().to_owned())
+    };
+    let mut edits = Vec::new();
+    let day_at = |path: &str| {
+        parent
+            .and_then(|p| git_until(root, &["show", &format!("{p}:{path}")], until).ok())
+            .and_then(|day| day.parse::<u64>().ok())
+    };
+    let pruned = day_at(LAND_PRUNED_AT);
+    // Read the lane's day only where this Mac's would prune: the bound is never past it.
+    let by = if pruned.is_none_or(|day| day < today) {
+        day_at("pruned-at")
+            .map(|lane| lane.min(today))
+            .filter(|by| pruned.is_none_or(|day| day < *by))
+    } else {
+        None
+    };
+    if let Some(by) = by {
+        if let Some(parent) = parent
+            && let Some(land) = (trees.list)(parent)?.get(LAND).filter(|e| e.is_tree())
+        {
+            let listed = (trees.list)(&land.id)?;
+            let days = |dir: &str, entries: &Entries, kind: Kept| -> Vec<Edit> {
+                entries
+                    .iter()
+                    .filter(|(name, entry)| {
+                        entry.is_tree()
+                            && crate::land_record::day_of(name)
+                                .is_some_and(|day| expired(kind, day, by))
+                    })
+                    .map(|(name, _)| Edit::Remove {
+                        path: format!("{dir}/{name}"),
+                    })
+                    .collect()
+            };
+            edits.extend(days(LAND, &listed, Kept::Verdict));
+            if let Some(runs) = listed.get(&RUNS[LAND.len() + 1..]).filter(|e| e.is_tree()) {
+                edits.extend(days(RUNS, &(trees.list)(&runs.id)?, Kept::Run));
+            }
+        }
+        edits.push(Edit::Put {
+            path: LAND_PRUNED_AT.into(),
+            blob: blob(by.to_string().as_bytes())?,
+        });
+    }
+    let mut fails = Vec::new();
+    let mut appended = Vec::new();
+    for record in records {
+        let (_, expired, fail) = crate::land_spool::kept_as(&record.path, today)?;
+        if expired {
+            continue;
+        }
+        if fail {
+            if fails.contains(&record.path.as_str()) {
+                continue;
+            }
+            fails.push(record.path.as_str());
+        }
+        appended.push(record);
+    }
+    let kept: std::collections::BTreeSet<String> = match parent {
+        Some(parent) if !fails.is_empty() => {
+            let mut args = vec!["ls-tree", "-z", "--full-tree", "--name-only", parent, "--"];
+            args.extend(fails.iter().copied());
+            output_until(&mut command(root, &args), None, until)?
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect()
+        }
+        _ => std::collections::BTreeSet::new(),
+    };
+    for record in appended {
+        if kept.contains(&record.path) {
+            continue;
+        }
+        edits.push(Edit::Put {
+            path: record.path.clone(),
+            blob: blob(&record.bytes)?,
+        });
+    }
+    let Some(tree) = edit_tree_if_changed(parent, &edits, trees)? else {
+        return parent
+            .map(|head| Appended::Holds(head.to_owned()))
+            .ok_or_else(|| "an empty journal holds nothing".to_owned());
+    };
+    let message = format!("verify land: {} records", records.len());
+    Ok(
+        match publish(root, remote, parent, &tree, &message, until)? {
+            Some(head) => Appended::Holds(head),
+            None => Appended::Raced,
+        },
+    )
+}
+
+/// Append `records` until an append holds them ([`land_append`]): each race reads the journal's
+/// head again and decides again over it, all within `until`. The head that holds them (`None`:
+/// no records, and no journal).
+/// # Errors
+/// As [`land_append`], or the deadline passed.
+pub fn append_land(
+    root: &Path,
+    remote: &str,
+    records: &[crate::land_record::Signed],
+    now: u64,
+    until: std::time::Instant,
+) -> Result<Option<String>, String> {
+    loop {
+        let parent = head(root, remote, until)?;
+        if records.is_empty() {
+            return Ok(parent);
+        }
+        match land_append(root, remote, parent.as_deref(), records, now, until)? {
+            Appended::Holds(head) => return Ok(Some(head)),
+            Appended::Raced => {}
+        }
+    }
 }
 
 #[cfg(test)]

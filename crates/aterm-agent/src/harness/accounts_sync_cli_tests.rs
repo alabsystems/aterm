@@ -55,14 +55,10 @@ fn refused_empty_pool_fleet_publication_preserves_account_state() {
     ];
     let image = || paths.iter().map(|p| fs::read(p).ok()).collect::<Vec<_>>();
     let before = image();
-    let pool = bed.secrets().join(super::super::ai_pool::AI_POOL_FILE);
-    let fetch = |_: &Env, source: &str| -> Result<String, String> {
-        assert_eq!(
-            Path::new(source),
-            pool.as_path(),
-            "only the fixture pool may be read"
-        );
-        fs::read_to_string(source).map_err(|why| why.to_string())
+    let pool = crate::vault_entry::source_name(super::super::ai_pool::AI_POOL_FILE);
+    let fetch = |env: &Env, source: &str| -> Result<String, String> {
+        assert_eq!(source, pool, "only the fixture pool may be read");
+        fetch_source_text(env, source)
     };
     let how = SyncHow {
         fetch: &fetch,
@@ -73,7 +69,7 @@ fn refused_empty_pool_fleet_publication_preserves_account_state() {
     };
     let error = sync_accounts_request(
         &env,
-        SourceRequest::Requested(pool.to_str()),
+        SourceRequest::Requested(Some(pool.as_str())),
         Some("m16"),
         &how,
     )
@@ -323,9 +319,17 @@ fn a_conflict_naming_only_other_machines_drops_the_row_as_one_such_row_does() {
         );
         bed.secret(ACCOUNTS_CSV_FILE, &format!("{head}{later}"));
         let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW + 60);
-        let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
+        let sheet = crate::vault_entry::source_name(ACCOUNTS_CSV_FILE);
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_accounts_sync(&env, None, sheet.to_str(), None, false, &mut out, &mut err);
+        let code = run_accounts_sync(
+            &env,
+            None,
+            Some(sheet.as_str()),
+            None,
+            false,
+            &mut out,
+            &mut err,
+        );
         let err = String::from_utf8(err).unwrap();
         assert_eq!(code, ExitCode::SUCCESS, "{later}: {err}");
         assert_eq!(alt(&bed), None, "{later}: the row drops");
@@ -448,12 +452,20 @@ fn a_sync_that_syncs_nothing_names_the_sheets_conflicts() {
                     bed.keep_roster(cli);
                 }
                 let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
-                let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
+                let sheet = crate::vault_entry::source_name(ACCOUNTS_CSV_FILE);
                 let (mut out, mut err) = (Vec::new(), Vec::new());
                 let code = if cli == Cli::Claude {
-                    run_accounts_sync(&env, None, sheet.to_str(), None, false, &mut out, &mut err)
+                    run_accounts_sync(
+                        &env,
+                        None,
+                        Some(sheet.as_str()),
+                        None,
+                        false,
+                        &mut out,
+                        &mut err,
+                    )
                 } else {
-                    let source = named.then(|| sheet.to_str()).flatten();
+                    let source = named.then_some(sheet.as_str());
                     run_cli_accounts_sync(
                         cli,
                         (&env, None),
@@ -511,10 +523,18 @@ fn an_accounts_sync_names_the_sheets_conflicting_rows() {
                 bed.keep_roster(cli);
             }
             let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
-            let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
+            let sheet = crate::vault_entry::source_name(ACCOUNTS_CSV_FILE);
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let code = if cli == Cli::Claude {
-                run_accounts_sync(&env, None, sheet.to_str(), None, json, &mut out, &mut err)
+                run_accounts_sync(
+                    &env,
+                    None,
+                    Some(sheet.as_str()),
+                    None,
+                    json,
+                    &mut out,
+                    &mut err,
+                )
             } else {
                 run_cli_accounts_sync(cli, (&env, None), (None, None, json), &mut out, &mut err)
             };
@@ -653,7 +673,6 @@ fn the_upkeep_tells_an_unread_sheet_from_rows_that_agree() {
             .collect();
         said
     };
-    let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
     for unread in [
         None,
         Some("email,computer,kimi,notes\n\"broken@example.test,m16,global,\n"),
@@ -665,7 +684,7 @@ fn the_upkeep_tells_an_unread_sheet_from_rows_that_agree() {
             "{unread:?}: {said:?}"
         );
         match unread {
-            None => fs::remove_file(&sheet).unwrap(),
+            None => bed.secret(ACCOUNTS_CSV_FILE, ""),
             Some(text) => bed.secret(ACCOUNTS_CSV_FILE, text),
         }
         let said = upkeep_once();
@@ -690,7 +709,7 @@ fn a_look_at_the_sheet_asks_the_host_its_name_once() {
         ACCOUNTS_CSV_FILE,
         "email,computer,claude,notes\nnew@example.test,m16,1,\n",
     );
-    let sheet = bed.secrets().join(ACCOUNTS_CSV_FILE);
+    let sheet = VaultSource::read(&bed.home, ACCOUNTS_CSV_FILE);
     let config = bed.aterm_toml();
     let _ = sheet_names_this_machine(Some(&config), &sheet);
     let asked = HOST_ASKED.with(std::cell::Cell::get);
@@ -807,9 +826,9 @@ impl Bed {
         self.home.join(".secrets")
     }
 
+    /// Publishes `text` as the vault entry `name` this Mac reads; empty text removes it.
     fn secret(&self, name: &str, text: &str) {
-        aterm_types::fs_restricted::ensure_private_dir(&self.secrets()).unwrap();
-        fs::write(self.secrets().join(name), text).unwrap();
+        crate::vault_entry::seed(&self.home, &[(name, text.as_bytes())]);
     }
 
     /// Keeps a roster of `cli`'s pool beside `aterm.toml`.
@@ -1392,16 +1411,7 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
         let bed = Bed::new("resync-pool-source");
         let roster = bed.config.join(accounts::ACCOUNTS_FILE);
         let read = Mutex::new(Rediscovery::default());
-        let probe = || {
-            read_resync_with(
-                &bed.home,
-                &bed.state,
-                &roster,
-                NOW,
-                &read,
-                &read_local_source_text,
-            )
-        };
+        let probe = || read_resync_with(&bed.home, &bed.state, &roster, NOW, &read);
         assert_eq!(probe(), ResyncRead::NoSource);
         let region = if cli == Cli::Kimi {
             "region = 'global'\n"
@@ -1412,7 +1422,6 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
             "[[account]]\nlabel='source-one'\nemail='source-one@example.com'\n\
              machines=['m16']\n{region}"
         );
-        let source = bed.secrets().join(cli_fleet_file(cli));
         bed.secret(&cli_fleet_file(cli), &fleet);
         assert!(
             matches!(probe(), ResyncRead::Due(_)),
@@ -1423,7 +1432,6 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
             matches!(probe(), ResyncRead::Due(_)),
             "{cli:?}: a kept roster still has its source"
         );
-        assert_eq!(fs::read_to_string(&source).unwrap(), fleet);
         assert!(fs::read(bed.roster(cli)).unwrap().is_empty());
         assert!(!bed.state.exists(), "a source read writes no account state");
 
@@ -1434,7 +1442,7 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
             "{cli:?}: the actual sync settled its pool"
         );
 
-        fs::write(&source, "[[account]\n").unwrap();
+        bed.secret(&cli_fleet_file(cli), "[[account]\n");
         assert!(
             matches!(probe(), ResyncRead::Due(_)),
             "{cli:?}: a refused source must be reported"
@@ -1446,7 +1454,10 @@ fn the_resync_source_check_keeps_each_pools_policy_and_reports_refused_sources()
             before,
             "a refused source changes no account records"
         );
-        assert_eq!(fs::read_to_string(&source).unwrap(), "[[account]\n");
+        assert_eq!(
+            crate::vault_entry::read_text(&bed.home, &cli_fleet_file(cli), 1 << 20).text(),
+            Some("[[account]\n")
+        );
         fs::remove_file(bed.roster(cli)).unwrap();
         assert!(
             matches!(probe(), ResyncRead::Due(_)),
@@ -1485,7 +1496,6 @@ fn a_pools_converge_read_names_what_its_sync_adds_and_nothing_once_it_ran() {
             &bed.config.join(accounts::ACCOUNTS_FILE),
             NOW,
             &read,
-            &read_local_source_text,
         )
     };
     assert!(matches!(probe(), ResyncRead::Due(why) if why.contains("kimi-1")));
@@ -1593,7 +1603,6 @@ fn a_default_pools_converge_read_matches_the_syncs_admission() {
             &claude_roster(&bed),
             NOW,
             &Mutex::new(Rediscovery::default()),
-            &read_local_source_text,
         );
         assert!(
             if admitted {
@@ -1618,7 +1627,6 @@ fn a_default_pools_converge_read_matches_the_syncs_admission() {
                         &claude_roster(&bed),
                         NOW,
                         &Mutex::new(Rediscovery::default()),
-                        &read_local_source_text
                     ),
                     ResyncRead::Current,
                     "{tag}: the applied rows are no longer due"
@@ -1656,7 +1664,6 @@ fn a_default_pools_converge_read_reports_recovery_before_its_source_gate() {
             &claude_roster(&bed),
             NOW,
             &Mutex::new(Rediscovery::default()),
-            &|_| panic!("pending recovery is observed before any source is opened"),
         ),
         ResyncRead::Due(_)
     ));
@@ -1749,7 +1756,7 @@ fn with_logged_effects<R>(
         mailbox: &ladder_mailbox_files,
         log,
         run_attempt: None,
-        save_oauth: |_, _| Ok("inert".into()),
+        tokens_here: |_, _, _, _| None,
         shared: shared_renewal::Effects::default(),
     };
     run(&fx)
@@ -2427,7 +2434,7 @@ fn retired_provider_sources_do_not_lift_retry_holds() {
         note_default_sync(&rediscovery, cli, Some(retired));
         bed.secret(&legacy, "unparseable retired bytes");
         assert!(default_sync_holds(&rediscovery, cli, &inputs()));
-        fs::remove_file(bed.secrets().join(&legacy)).unwrap();
+        bed.secret(&legacy, "");
         assert!(default_sync_holds(&rediscovery, cli, &inputs()));
 
         let member = csv_columns(cli)[0];
@@ -2994,15 +3001,8 @@ region = \"global\"
     .unwrap()
         - 1_000;
     assert!(matches!(bed.sync(Cli::Kimi, None), Ok(CliSync::Synced(_))));
-    // Initial input precedes both wrong-account marks; only the later mailbox is new.
-    let initial_time =
-        std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(now - 180).unwrap());
-    fs::File::options()
-        .write(true)
-        .open(bed.secrets().join(cli_fleet_file(Cli::Kimi)))
-        .unwrap()
-        .set_times(std::fs::FileTimes::new().set_modified(initial_time))
-        .unwrap();
+    // The vault's fleet entry is no mailbox input, so nothing precedes the wrong-account marks
+    // but what this test writes: only the later mailbox is new.
     let roster = Roster::load_for(Cli::Kimi, &bed.roster(Cli::Kimi)).unwrap();
     let store = accounts::Store::at_for(&bed.state, Cli::Kimi, &bed.home);
 
@@ -3143,7 +3143,7 @@ region = \"global\"
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
-        save_oauth: |_, _| Ok("inert".into()),
+        tokens_here: |_, _, _, _| None,
         shared: shared_renewal::Effects::default(),
     };
     assert!(renew_pool_due(
@@ -3226,7 +3226,7 @@ region = \"global\"
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_: &str| {}),
             run_attempt: None,
-            save_oauth: |_, _| Ok("inert".into()),
+            tokens_here: |_, _, _, _| None,
             shared: shared_renewal::Effects::default(),
         };
         assert_eq!(
@@ -3276,7 +3276,7 @@ fn kimi_pool_upkeep(bed: &Bed, guard: &Arc<Mutex<AutoRenewGuard>>, now: i64) -> 
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
-        save_oauth: |_, _| Ok("inert".into()),
+        tokens_here: |_, _, _, _| None,
         shared: shared_renewal::Effects::default(),
     };
     renew_pool_due(
@@ -3791,7 +3791,7 @@ region = \"global\"
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
-        save_oauth: |_, _| Ok("inert".into()),
+        tokens_here: |_, _, _, _| None,
         shared: shared_renewal::Effects::default(),
     };
     assert!(renew_pool_due(
@@ -4030,7 +4030,7 @@ region = \"global\"
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
-        save_oauth: |_, _| Ok("inert".into()),
+        tokens_here: |_, _, _, _| None,
         shared: shared_renewal::Effects::default(),
     };
     assert!(
@@ -4104,7 +4104,7 @@ region = \"global\"
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
-        save_oauth: |_, _| Ok("inert".into()),
+        tokens_here: |_, _, _, _| None,
         shared: shared_renewal::Effects::default(),
     };
     assert!(
@@ -4371,7 +4371,7 @@ fn explicit_vendor_account_selection_holds_wakes_and_resumes_to_completion() {
         mailbox: &ladder_mailbox_files,
         log: std::sync::Arc::new(|_: &str| {}),
         run_attempt: None,
-        save_oauth: |_, _| Ok("inert".into()),
+        tokens_here: |_, _, _, _| None,
         shared: shared_renewal::Effects::default(),
     };
     let _ = upkeep(
@@ -4453,7 +4453,7 @@ fn harness_accounts_off_stops_window_upkeep_sign_ins_as_well_as_sync() {
             mailbox: &ladder_mailbox_files,
             log: std::sync::Arc::new(|_: &str| {}),
             run_attempt: None,
-            save_oauth: |_, _| Ok("inert".into()),
+            tokens_here: |_, _, _, _| None,
             shared: shared_renewal::Effects::default(),
         };
         let upkept = upkeep(
@@ -5027,9 +5027,9 @@ fn a_configured_source_says_whose_an_account_is() {
 }
 
 /// A POOL THAT REFUSES THIS MAC'S NAME LEAVES ITS ROWS UNREAD: where the swarm roster denies
-/// `m100`, the name `aterm.toml` gives this Mac, the pool gives this Mac no identity, and no other
-/// name stands in for it, so a row the pool keeps warm on `m100` is not read as this Mac's
-/// ([`accounts::UnreadWhy::NoName`]). CONTROL: with nothing denied, the pool names this Mac and
+/// `m100`, the name `aterm.toml` gives this Mac, the store verifies no view for it, so the pool
+/// is not read and a row it keeps warm on `m100` is not read as this Mac's
+/// ([`accounts::UnreadWhy::Source`]). CONTROL: with nothing denied, the pool names this Mac and
 /// the row is its own.
 #[cfg(unix)]
 #[test]
@@ -5052,7 +5052,7 @@ fn a_pool_that_refuses_this_macs_name_leaves_its_rows_unread() {
         let others = other_macs_of(&bed, cli);
         if denied {
             assert!(others.unread.contains("other"), "{others:?}");
-            assert_eq!(others.unread_why, Some(accounts::UnreadWhy::NoName));
+            assert_eq!(others.unread_why, Some(accounts::UnreadWhy::Source));
         } else {
             assert_eq!(others, accounts::OtherMacs::NONE, "CONTROL");
         }

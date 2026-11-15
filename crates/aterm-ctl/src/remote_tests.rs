@@ -8,6 +8,25 @@ use super::*;
 
 const OWN: Within = Within::Drive(DRIVE_WITHIN);
 
+#[test]
+fn an_answered_ls_refusal_proves_reachability_and_keeps_the_denial() {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn denied(_: &str) -> String {
+        "ERR denied grant=none: no drive grant\n".into()
+    }
+    let (result, told) =
+        crate::stderr_lines_of(|| exchange(link(denied, &SEEN), "ls\n", "ls", OWN));
+    assert!(matches!(result.unwrap(), Exchange::Completed(code) if code == ExitCode::FAILURE));
+    assert_eq!(told[0], "ERR denied grant=none: no drive grant");
+    assert!(
+        told.iter().any(|line| line.contains("reachable")
+            && line.contains("survey")
+            && line.contains("version")),
+        "{told:?}"
+    );
+    assert_eq!(SEEN.lock().unwrap().as_slice(), ["ls"]);
+}
+
 fn words(line: &str) -> Vec<String> {
     line.split_whitespace().map(String::from).collect()
 }
@@ -68,6 +87,32 @@ fn a_drive_names_each_session_by_its_sid() {
             .expect_err(local)
             .to_string();
         assert!(refusal.contains("by its sid"), "{local}: {refusal}");
+    }
+}
+
+/// Over the fleet a session is named by its tab ID in either form: a tab opened before the
+/// tab-ID update keeps its `s-` ID until it closes, and a peer's spawn answer may name either.
+/// NEGATIVE CONTROLS: a malformed ID of either form is refused, and named by no answer.
+#[test]
+fn a_drive_names_a_tab_by_its_id_in_either_form() {
+    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        assert!(refuse_local_selector(&words(&format!("@{sid} status"))).is_ok());
+        assert_eq!(
+            spawned_sid_from_answer(&format!("OK spawned @{sid}")).as_deref(),
+            Some(sid)
+        );
+    }
+    for bad in [
+        "tqn5r6e014",
+        "tqn5r6e014i",
+        "Tqn5r6e0148",
+        "s-0123456789abcdeg0123",
+    ] {
+        let refusal = refuse_local_selector(&words(&format!("@{bad} status")))
+            .expect_err(bad)
+            .to_string();
+        assert!(refusal.contains("by its sid"), "{bad}: {refusal}");
+        assert_eq!(spawned_sid_from_answer(&format!("OK spawned @{bad}")), None);
     }
 }
 

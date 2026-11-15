@@ -19,6 +19,7 @@ fn entry(name: &str, value: &[u8]) -> MemberEntry {
         if_absent: false,
         anchor: Anchor::Keep,
         fleet_reads_anchors: false,
+        read_as: None,
     }
 }
 
@@ -52,7 +53,7 @@ fn a_seated_mac_without_the_admin_key_sets_a_shared_name_another_mac_reads() {
     assert_eq!(written, MemberWritten::Posted);
     sync(m22, None).expect("m22 syncs");
     assert_eq!(
-        std::fs::read(m22.home.join(".secrets/gh_access_token")).unwrap(),
+        crate::client::stored(&m22, "gh_access_token").unwrap(),
         b"token-v2",
         "m22 writes m7's value"
     );
@@ -234,6 +235,174 @@ fn an_overtaken_write_reports_overtaken() {
     lab.macs.server.stop();
 }
 
+/// What [`dropped_with_its_draft`] saw: the lab, m22, its write's outcome and m7's `Put` of
+/// `token-meta` = M2.
+struct DroppedWith {
+    lab: convergence::Six,
+    m22: Paths,
+    written: MemberWritten,
+    put: RecordId,
+}
+
+/// m22 sets `token` = T0 and `token-meta` = M0, and m7 takes them; m22's replacement of both
+/// (T1, M1), one draft, then waits for the rotation; m7, which holds the rotation, sets
+/// `token-meta` = M2 alone, and `token` stays T0, m22's own `Put`. m22 takes m7's records and its
+/// passes run before the write's outcome is read, `unrecorded` setting
+/// [`log_entries::OVERTAKEN_UNRECORDED`] for them.
+fn dropped_with_its_draft(unrecorded: bool) -> DroppedWith {
+    let lab = convergence::six();
+    let (m22, m7) = (lab.all[0].clone(), lab.all[1].clone());
+    for (name, value) in [("token", b"T0"), ("token-meta", b"M0")] {
+        assert_eq!(
+            member_set(&m22, &entry(name, value), refuse()).unwrap(),
+            MemberWritten::Posted,
+            "{name}"
+        );
+    }
+    save_records(&m7, &load_records(&m22).unwrap().encode()).unwrap();
+    let _ = held_remove(&lab);
+    let put = std::rc::Rc::new(std::cell::Cell::new(None));
+    let hook = {
+        let (m22, m7, put) = (m22.clone(), m7.clone(), put.clone());
+        move || {
+            let base = convergence::ids(&m7);
+            test_put_everyone(&m7, "token-meta", b"M2").expect("m7 sets token-meta = M2");
+            put.set(
+                convergence::signed_since(&m7, &base)
+                    .iter()
+                    .find(|record| matches!(record.body(), Body::Put { .. }))
+                    .map(|record| *record.id()),
+            );
+            save_records(&m22, &load_records(&m7).unwrap().encode()).unwrap();
+            log_entries::OVERTAKEN_UNRECORDED.with(|cell| cell.set(unrecorded));
+            let _ = two_passes(&m22);
+            log_entries::OVERTAKEN_UNRECORDED.with(|cell| cell.set(false));
+        }
+    };
+    log_entries::BEFORE_OUTCOME.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let written = log_entries::member_write(
+        &m22,
+        &[entry("token", b"T1"), entry("token-meta", b"M1")],
+        refuse(),
+    );
+    log_entries::BEFORE_OUTCOME.with(|slot| *slot.borrow_mut() = None);
+    let put = put.get().expect("CONTROL: m7 signs its write at once");
+    assert_eq!(reads(&m22, true, "token"), Some(b"T0".to_vec()));
+    assert_eq!(reads(&m22, true, "token-meta"), Some(b"M2".to_vec()));
+    assert!(!log_entries::waiting_file(&m22).exists(), "nothing waits");
+    DroppedWith {
+        lab,
+        m22,
+        written: written.unwrap(),
+        put,
+    }
+}
+
+/// An entry a pass drops only with its draft names the write that overtook the draft, never its
+/// own name's holder ([`dropped_with_its_draft`]): the pass on m22 finds `token-meta` overtaken
+/// and drops `token` with it: the journal records `token-meta` as overtaken by m7's `Put`, and
+/// `token` as dropped with its draft, by that same `Put`, its line saying so and never that
+/// signing `token` would have reverted anything; the write's outcome names m7's `Put`, though
+/// `token` is the draft's first entry.
+///
+/// NEGATIVE CONTROL (by hand, then restored): with the pass recording each entry's own name's
+/// holder (`overtaker(&log, &opened, name)`, as before), `token`'s record names m22's `Put` of
+/// T0, and so does the outcome.
+#[test]
+fn an_entry_dropped_with_its_draft_names_the_write_that_overtook_the_draft() {
+    let DroppedWith {
+        lab,
+        m22,
+        written,
+        put,
+    } = dropped_with_its_draft(false);
+    let MemberWritten::Overtaken(Some(by)) = written else {
+        panic!("an overtaken write: {written:?}");
+    };
+    assert_eq!(
+        (by.record, by.label.as_str()),
+        (put, "m7"),
+        "the outcome names m7's Put"
+    );
+    let journal = log_entries::read_overtaken(&m22).unwrap();
+    let record = |name: &str| {
+        journal
+            .iter()
+            .find(|record| record.name == name)
+            .unwrap_or_else(|| panic!("{name} is journalled: {journal:?}"))
+    };
+    assert_eq!(journal.len(), 2, "the draft, overtaken: {journal:?}");
+    for name in ["token-meta", "token"] {
+        let by = record(name)
+            .by
+            .as_ref()
+            .expect("the record names the change");
+        assert_eq!(
+            (by.record, by.label.as_str(), by.deleted),
+            (put, "m7", false),
+            "{name}: the record names m7's Put"
+        );
+    }
+    assert_eq!(record("token-meta").with, None, "overtaken itself");
+    assert_eq!(
+        record("token").with.as_deref(),
+        Some("token-meta"),
+        "dropped with its draft"
+    );
+    let when = |ms: u64| format!("at {ms}");
+    let line = record("token").line(when);
+    assert!(
+        line.contains("token-meta") && line.contains("m7"),
+        "the line names the entry overtaken and its change: {line}"
+    );
+    let as_own = Overtaken {
+        with: None,
+        ..record("token").clone()
+    };
+    assert_ne!(
+        line,
+        as_own.line(when),
+        "never the line of a write that would have reverted its own name's value"
+    );
+    for value in ["T0", "T1", "M0", "M1", "M2"] {
+        assert!(!line.contains(value), "never a value: {line}");
+    }
+    lab.macs.server.stop();
+}
+
+/// [`dropped_with_its_draft`] with no journal record of the drop
+/// ([`log_entries::OVERTAKEN_UNRECORDED`]: the pass's journal write failed, or the process ended
+/// after it rewrote the waiting file): the outcome, read from the log alone, still names m7's
+/// `Put`, never m22's own `Put` of T0, which `token`'s write stands over, though `token` is the
+/// draft's first entry.
+///
+/// NEGATIVE CONTROLS (by hand, then restored): with `outcome` naming each entry's own name's
+/// holder whatever its write stands over (as before), the outcome names m22's `Put`; with
+/// `least_settled` taking the first overtaken entry whether or not it names a change, it names
+/// none.
+#[test]
+fn an_unjournalled_drop_with_its_draft_names_the_write_that_overtook_the_draft() {
+    let DroppedWith {
+        lab,
+        m22,
+        written,
+        put,
+    } = dropped_with_its_draft(true);
+    assert!(
+        log_entries::read_overtaken(&m22).unwrap().is_empty(),
+        "CONTROL: the pass journalled nothing"
+    );
+    let MemberWritten::Overtaken(Some(by)) = written else {
+        panic!("an overtaken write that names its change: {written:?}");
+    };
+    assert_eq!(
+        (by.record, by.label.as_str()),
+        (put, "m7"),
+        "the outcome names m7's Put"
+    );
+    lab.macs.server.stop();
+}
+
 /// A vault pass that holds this Mac's state past the deadline makes a person's write `Busy`,
 /// never the admin route's fallback, and nothing waits. With `Wait`, a draft claim a pass holds
 /// past the deadline lands the write in `everyone.waiting` instead (`LockDeadline`), and the next
@@ -264,6 +433,335 @@ fn a_busy_vault_refuses_a_person_and_keeps_a_waiting_write() {
     assert!(log_entries::waiting_file(m7).exists(), "it waits");
     let _ = vault_pass_at(m7, aterm_time::unix_millis().unwrap_or(0)).unwrap();
     assert_eq!(reads(m7, true, "busy"), Some(b"b2".to_vec()));
+}
+
+/// A member's `set` of `name` to `value` that stands on `read`, the value it read there
+/// ([`MemberEntry::read_as`], as a verification writes its token and meta).
+fn over(name: &str, read: &[u8], value: &[u8]) -> MemberEntry {
+    MemberEntry {
+        read_as: Some(SecretBytes::from(read.to_vec())),
+        ..entry(name, value)
+    }
+}
+
+/// Whether `written` is the refusal of a write that stands on a value its name no longer holds.
+fn changed(written: &MemberWritten) -> bool {
+    matches!(written, MemberWritten::Refused(why) if why.contains("changed since this write read it"))
+}
+
+/// An entry that stands on the value it read is written only over that value, whatever value it
+/// writes (a verification writes its token as it read it, and its meta amended). Read as another
+/// value than the log's, the write is refused, signs nothing and waits nowhere. Read as the log's
+/// value while a later write of this Mac's of the name waits with another value, it is refused,
+/// that write still waits as it was, and the next pass signs it. CONTROL: read as the log's value
+/// with nothing waiting, the same value is posted signing nothing new, and an amended value is
+/// posted and read.
+///
+/// NEGATIVE CONTROL (by hand, then restored): with `planned`'s check of the log's value cut, the
+/// first write is posted; with `land_member_writes`'s check of the writes still to be signed cut,
+/// the second answers `Waiting(PendingOfThisMac)`.
+#[test]
+fn an_entry_that_stands_on_its_read_is_written_only_over_that_value() {
+    let macs = two_macs(&[(Audience::Everyone, "held", b"h1".as_slice())]);
+    let m7 = &macs.m7;
+    sync(m7, None).expect("m7 syncs");
+    let before = convergence::ids(m7);
+    let written = member_set(m7, &over("held", b"h0", b"h0-amended"), refuse()).unwrap();
+    assert!(changed(&written), "read as another value: {written:?}");
+    assert_eq!(convergence::ids(m7), before, "nothing signed");
+    assert!(!log_entries::waiting_file(m7).exists(), "nothing waits");
+    assert_eq!(
+        member_set(m7, &over("held", b"h1", b"h1"), refuse()).unwrap(),
+        MemberWritten::Posted,
+        "CONTROL: read as the log's value"
+    );
+    assert_eq!(
+        convergence::ids(m7),
+        before,
+        "CONTROL: it signs nothing new"
+    );
+
+    let claim = log_entries::pass_claim(m7)
+        .unwrap()
+        .expect("a pass's claim");
+    let later = member_set(
+        m7,
+        &entry("held", b"h2"),
+        OnBusy::Wait(std::time::Instant::now()),
+    )
+    .unwrap();
+    drop(claim);
+    assert_eq!(later, MemberWritten::Waiting(WaitFor::LockDeadline));
+    let waiting = std::fs::read(log_entries::waiting_file(m7)).unwrap();
+    let written = member_set(m7, &over("held", b"h1", b"h1-amended"), refuse()).unwrap();
+    assert!(changed(&written), "over a later write: {written:?}");
+    assert_eq!(
+        std::fs::read(log_entries::waiting_file(m7)).unwrap(),
+        waiting,
+        "the later write waits as it was"
+    );
+    let _ = vault_pass_at(m7, aterm_time::unix_millis().unwrap_or(0)).unwrap();
+    assert_eq!(reads(m7, true, "held"), Some(b"h2".to_vec()));
+    assert_eq!(
+        member_set(m7, &over("held", b"h2", b"h2-amended"), refuse()).unwrap(),
+        MemberWritten::Posted,
+        "CONTROL: an amended value over the value read"
+    );
+    assert_eq!(reads(m7, true, "held"), Some(b"h2-amended".to_vec()));
+    macs.server.stop();
+}
+
+/// An entry that stands on the value it read settles no conflict: where another Mac's value
+/// stands beside the one it read, it is refused, signs nothing, and both values stay. m7 and
+/// m22, with no server between them, each set `pair`; m7 then takes in m22's records, so the name
+/// holds two concurrent values, and writes over the one that wins there (so only the conflict
+/// can refuse it). CONTROL: a person's write over the same conflict settles it.
+///
+/// NEGATIVE CONTROL (by hand, then restored): with `planned`'s refusal of a conflicted name cut,
+/// the write is signed with a `Delete` ahead of its `Put`, and the conflict is gone.
+#[test]
+fn an_entry_that_stands_on_its_read_settles_no_conflict() {
+    let macs = two_macs(&[]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    macs.server.stop();
+    for (paths, value) in [(m7, b"from m7".as_slice()), (m22, b"from m22")] {
+        assert_eq!(
+            member_set(paths, &entry("pair", value), refuse()).unwrap(),
+            MemberWritten::SignedHere
+        );
+    }
+    save_records(m7, &load_records(m22).unwrap().encode()).unwrap();
+    let identity = read_identity(m7).unwrap().unwrap();
+    let conflicted = || {
+        log_of(m7)
+            .open_audience_entries(&identity)
+            .unwrap()
+            .expect("an opened log")
+            .conflicts
+            .contains(&(Audience::Everyone, "pair".to_owned()))
+    };
+    assert!(conflicted(), "CONTROL: the name holds two values");
+    let winner = reads(m7, true, "pair").expect("a winning value");
+    let before = convergence::ids(m7);
+    let written = member_set(m7, &over("pair", &winner, b"amended"), refuse()).unwrap();
+    assert!(changed(&written), "over a conflict: {written:?}");
+    assert_eq!(convergence::ids(m7), before, "nothing signed");
+    assert!(conflicted(), "both values stay");
+    assert!(!log_entries::waiting_file(m7).exists(), "nothing waits");
+    assert_eq!(
+        member_set(m7, &entry("pair", b"settled"), refuse()).unwrap(),
+        MemberWritten::SignedHere,
+        "CONTROL: a person's write"
+    );
+    assert!(!conflicted(), "CONTROL: it settles the conflict");
+    assert_eq!(reads(m7, true, "pair"), Some(b"settled".to_vec()));
+}
+
+/// What a draft that stands on what it read writes at `pair`, the name a conflict then reaches
+/// ([`waits_over_its_read_into_a_conflict`]).
+#[derive(Clone, Copy, Debug)]
+enum OverRead {
+    /// An amended value, as a verification writes its meta.
+    Amends,
+    /// The value it read again, as a verification writes its token, beside an amended value of
+    /// `note`, a name no conflict reaches.
+    KeepsBeside,
+}
+
+/// m7 and m22, with no server between them, each set `pair` to a value of its own; each then
+/// writes a draft that stands on its own value there (`over_read`), which waits for the vault
+/// pass (`Waiting(LockDeadline)`, a pass holding the claim). Each Mac then takes in the other's
+/// records, so `pair` holds two concurrent values on both, one Mac's winning there; each Mac's
+/// pass then signs no part of its draft, `pair` keeps both values, `note` the value read, and
+/// the draft is journalled overtaken and waits no more.
+fn waits_over_its_read_into_a_conflict(over_read: OverRead) {
+    let macs = two_macs(&[(Audience::Everyone, "note", b"n1".as_slice())]);
+    let (m22, m7) = (&macs.m22, &macs.m7);
+    for paths in [m22, m7] {
+        sync(paths, None).expect("syncs");
+    }
+    macs.server.stop();
+    let own = [(m7, b"from m7".as_slice()), (m22, b"from m22".as_slice())];
+    for (paths, value) in own {
+        assert_eq!(
+            member_set(paths, &entry("pair", value), refuse()).unwrap(),
+            MemberWritten::SignedHere
+        );
+    }
+    for (paths, value) in own {
+        let draft = match over_read {
+            OverRead::Amends => vec![over("pair", value, b"amended")],
+            OverRead::KeepsBeside => vec![
+                over("pair", value, value),
+                over("note", b"n1", b"n1-amended"),
+            ],
+        };
+        let claim = log_entries::pass_claim(paths)
+            .unwrap()
+            .expect("a pass's claim");
+        let written =
+            log_entries::member_write(paths, &draft, OnBusy::Wait(std::time::Instant::now()))
+                .unwrap();
+        drop(claim);
+        assert_eq!(
+            written,
+            MemberWritten::Waiting(WaitFor::LockDeadline),
+            "{over_read:?}"
+        );
+    }
+    let (from_m7, from_m22) = (
+        load_records(m7).unwrap().encode(),
+        load_records(m22).unwrap().encode(),
+    );
+    save_records(m7, &from_m22).unwrap();
+    save_records(m22, &from_m7).unwrap();
+    let conflicted = |paths: &Paths| {
+        log_of(paths)
+            .open_audience_entries(&read_identity(paths).unwrap().unwrap())
+            .unwrap()
+            .expect("an opened log")
+            .conflicts
+            .contains(&(Audience::Everyone, "pair".to_owned()))
+    };
+    for (paths, _) in own {
+        assert!(conflicted(paths), "{over_read:?}: CONTROL: two values");
+        let signed = vault_pass_at(paths, aterm_time::unix_millis().unwrap()).unwrap();
+        assert_eq!(
+            puts(&signed),
+            0,
+            "{over_read:?}: no part of the draft signed"
+        );
+        assert!(conflicted(paths), "{over_read:?}: both values stay");
+        assert_eq!(reads(paths, true, "note"), Some(b"n1".to_vec()));
+        assert!(
+            !log_entries::waiting_file(paths).exists(),
+            "{over_read:?}: nothing waits"
+        );
+        let mut journalled: Vec<String> = log_entries::read_overtaken(paths)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.name)
+            .collect();
+        journalled.sort();
+        let want: &[&str] = match over_read {
+            OverRead::Amends => &["pair"],
+            OverRead::KeepsBeside => &["note", "pair"],
+        };
+        assert_eq!(journalled, want, "{over_read:?}: the draft, overtaken");
+    }
+}
+
+/// An entry that stands on the value it read settles no conflict that reaches its name while it
+/// waits for the vault pass, whichever Mac's value wins there and whether it amends that value
+/// or writes it again beside an amended one ([`waits_over_its_read_into_a_conflict`]).
+///
+/// NEGATIVE CONTROL (by hand, then restored): with `WaitingWrite::stands_over` not reading the
+/// guard, `Amends` fails on the Mac whose value wins `pair`: its pass signs the amended value,
+/// which settles the conflict; with `WaitingWrite::done` not reading it, `KeepsBeside` fails
+/// there: its pass signs `pair` again and `note` amended beside the conflict.
+#[test]
+fn a_waiting_entry_that_stands_on_its_read_settles_no_conflict_that_reaches_it() {
+    for over_read in [OverRead::Amends, OverRead::KeepsBeside] {
+        waits_over_its_read_into_a_conflict(over_read);
+    }
+}
+
+/// A write whose vault was busy past its deadline (`OnBusy::Wait`, as `store_patiently` writes
+/// once its patience ends, or at Ctrl-C) still reads the log and lands under this Mac's author
+/// lock, so while another author of this Mac's records holds it, the write waits for it (up to a
+/// minute) and lands once it is let go. A vault pass holds m7's claim, so no draft runs; another
+/// thread holds the author lock from before the write starts; the write lands
+/// (`Waiting(LockDeadline)`) only after that thread lets go, and the next pass signs it.
+///
+/// NEGATIVE CONTROL (by hand, then restored): with the author lock tried once there, the write
+/// fails ("still wrote after a minute"); with none taken there, it lands while the other author
+/// holds the lock.
+#[test]
+fn a_busy_write_waits_for_this_macs_other_author_and_then_lands() {
+    let macs = two_macs(&[]);
+    let m7 = &macs.m7;
+    let (held, holds) = std::sync::mpsc::channel();
+    let author = {
+        let m7 = m7.clone();
+        std::thread::spawn(move || {
+            let author = log_entries::RecordsAuthorLock::take(&m7).unwrap();
+            held.send(()).unwrap();
+            // Held past the write's start: the write's own steps before its wait take no lock
+            // this one holds.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let let_go = std::time::Instant::now();
+            drop(author);
+            let_go
+        })
+    };
+    holds
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the other author holds the lock");
+    let claim = log_entries::pass_claim(m7)
+        .unwrap()
+        .expect("a pass's claim");
+    let written = member_set(
+        m7,
+        &entry("busy", b"b1"),
+        OnBusy::Wait(std::time::Instant::now()),
+    );
+    let landed = std::time::Instant::now();
+    drop(claim);
+    let let_go = author.join().expect("the other author");
+    assert_eq!(
+        written.unwrap(),
+        MemberWritten::Waiting(WaitFor::LockDeadline)
+    );
+    assert!(landed >= let_go, "it landed once the other author let go");
+    assert!(log_entries::waiting_file(m7).exists(), "it waits");
+    let _ = vault_pass_at(m7, aterm_time::unix_millis().unwrap_or(0)).unwrap();
+    assert_eq!(reads(m7, true, "busy"), Some(b"b1".to_vec()));
+}
+
+/// Two member writes that wait at once are two drafts: each lands under a number of its own, so a
+/// pass that finds one overtaken drops it alone and signs the other. m22, with a removal's
+/// rotation due, sets `shared-a` and then `shared-b` (each `Waiting(RotationDue)`); m7, which
+/// holds the rotation, sets `shared-a` meanwhile. Once the rotation reaches m22, its pass signs
+/// `shared-b` and journals `shared-a` alone as overtaken.
+///
+/// NEGATIVE CONTROL (by hand, then restored): with every member write landed under one number
+/// (`land_member_writes`'s `draft` a constant 0), the numbers are the same; with that assertion
+/// cut too, the pass drops `shared-b` with `shared-a`, and m22 reads no `shared-b`.
+#[test]
+fn two_member_writes_that_wait_at_once_are_two_drafts() {
+    let lab = convergence::six();
+    let _ = held_remove(&lab);
+    let (m22, m7) = (&lab.all[0], &lab.all[1]);
+    for name in ["shared-a", "shared-b"] {
+        assert_eq!(
+            member_set(m22, &entry(name, b"from m22"), refuse()).unwrap(),
+            MemberWritten::Waiting(WaitFor::RotationDue),
+            "{name} waits"
+        );
+    }
+    let identity = read_identity(m22).unwrap().unwrap();
+    let drafts = log_entries::waiting_drafts(m22, &identity);
+    assert!(
+        drafts["shared-a"].is_some() && drafts["shared-a"] != drafts["shared-b"],
+        "two drafts: {drafts:?}"
+    );
+    test_put_everyone(m7, "shared-a", b"from m7").expect("m7 sets shared-a");
+    save_records(m22, &load_records(m7).unwrap().encode()).unwrap();
+    let _ = two_passes(m22);
+    assert_eq!(
+        reads(m22, true, "shared-b"),
+        Some(b"from m22".to_vec()),
+        "the other draft is signed"
+    );
+    assert_eq!(reads(m22, true, "shared-a"), Some(b"from m7".to_vec()));
+    let journalled: Vec<String> = log_entries::read_overtaken(m22)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.name)
+        .collect();
+    assert_eq!(journalled, ["shared-a"], "the overtaken draft alone");
+    assert!(!log_entries::waiting_file(m22).exists(), "nothing waits");
+    lab.macs.server.stop();
 }
 
 /// A log vault that seats no device key of this Mac's writes nothing: `NotSeated`, signing
@@ -343,14 +841,6 @@ fn holds_key(paths: &Paths, epoch: &RecordId) -> bool {
     opened.unwrapped_keys.contains_key(epoch) || opened.keyed_keys.contains_key(epoch)
 }
 
-/// Where the materializer writes the entry `name` on the Mac at `paths`.
-fn file_of(paths: &Paths, name: &str) -> std::path::PathBuf {
-    name.strip_prefix("~/").map_or_else(
-        || paths.home.join(".secrets").join(name),
-        |rel| paths.home.join(rel),
-    )
-}
-
 /// What [`unset_then_admit`] saw.
 struct Admitted {
     unset: MemberUnset,
@@ -382,7 +872,7 @@ fn unset_then_admit(old_epoch: bool) -> Admitted {
     let signed = convergence::signed_since(m7, &before);
     sync(m22, None).expect("m22 syncs");
     assert!(
-        !m22.home.join(".secrets/secret").exists(),
+        crate::client::stored(&m22, "secret").is_none(),
         "m22 takes it back"
     );
     let (m40, _, _) = let_in_by(&macs, m7, "m40", "m40");
@@ -390,8 +880,8 @@ fn unset_then_admit(old_epoch: bool) -> Admitted {
         unset,
         signed,
         holds_removed_key: holds_key(&m40, &sealed),
-        stays: std::fs::read(m40.home.join(".secrets/shared")).unwrap(),
-        removed_file: m40.home.join(".secrets/secret").exists(),
+        stays: crate::client::stored(&m40, "shared").unwrap(),
+        removed_file: crate::client::stored(&m40, "secret").is_some(),
     };
     macs.server.stop();
     admitted
@@ -514,8 +1004,8 @@ fn first_set_then(unset: bool) -> (Option<Vec<u8>>, Option<MemberUnset>) {
 /// without the unset, the pass after the rotation signs it.
 ///
 /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
-/// `member_unset` taking nothing back (`take_back_member_write` replaced by `Ok(false)`) fails
-/// "nothing waits".
+/// `member_unset` taking nothing back (the take-back, then `take_back_member_write`, replaced by
+/// `Ok(false)`) fails "nothing waits".
 #[test]
 fn a_waiting_first_set_then_unset_leaves_nothing_to_come_back() {
     let (read, said) = first_set_then(true);
@@ -562,10 +1052,10 @@ fn an_unset_with_a_rotation_due_signs_at_once_without_the_removed_mac() {
 
 /// Unsetting a held name (release material, the release ring, the site deployer key, fleet
 /// configuration, git's config), a control record, or a case variant of release material signs
-/// nothing, and the release Mac (m22, which holds every such file) keeps each file as it was.
+/// nothing, and the release Mac (m22, which holds every such entry) keeps reading each as it was.
 /// CONTROL: a shared name, unset the same way, is removed there.
 #[test]
-fn unsetting_held_names_signs_nothing_and_the_release_macs_files_stay() {
+fn unsetting_held_names_signs_nothing_and_the_release_mac_keeps_them() {
     let held = [
         crate::entry_class::RELEASE_GH_TOKEN,
         crate::entry_class::NOTARY,
@@ -584,7 +1074,7 @@ fn unsetting_held_names_signs_nothing_and_the_release_macs_files_stay() {
     sync(m7, None).expect("m7 syncs");
     for name in held {
         assert_eq!(
-            std::fs::read(file_of(m22, name)).ok().as_deref(),
+            crate::client::stored(m22, name).as_deref(),
             Some(b"release-fixture".as_slice()),
             "CONTROL: m22 holds {name}"
         );
@@ -611,12 +1101,19 @@ fn unsetting_held_names_signs_nothing_and_the_release_macs_files_stay() {
     sync(m22, None).expect("m22 syncs");
     for name in held {
         assert_eq!(
-            std::fs::read(file_of(m22, name)).ok().as_deref(),
+            crate::client::stored(m22, name).as_deref(),
             Some(b"release-fixture".as_slice()),
             "{name} stays on the release Mac"
         );
     }
-    assert!(!file_of(m22, "shared-control").exists(), "CONTROL: removed");
+    assert!(
+        crate::client::stored(m22, "shared-control").is_none(),
+        "CONTROL: removed"
+    );
+    assert!(
+        crate::client::stored(m7, "shared-control").is_none(),
+        "CONTROL: removed"
+    );
     macs.server.stop();
 }
 

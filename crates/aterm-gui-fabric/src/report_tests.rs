@@ -10,8 +10,8 @@ fn a_report_to_a_session_here_is_queued_on_the_bus_only_where_a_bridge_runs() {
         let worker = test_handle(1);
         let manager = test_handle(2);
         let to = To::Here(manager.sid.as_str());
-        let line = "finished | sid=s-1 state=done";
-        let absent = post(&*worker.ctx, to, "s-1.end.1", line);
+        let line = "finished | sid=t0000000001 state=done";
+        let absent = post(&*worker.ctx, to, "t0000000001.end.1", line);
         assert_eq!(
             absent,
             Err(Unsent::NoBridge(crate::fabric_state().to_owned())),
@@ -24,7 +24,7 @@ fn a_report_to_a_session_here_is_queued_on_the_bus_only_where_a_bridge_runs() {
 
         crate::note_bridge_supervised();
         assert_eq!(
-            post(&*worker.ctx, to, "s-1.end.1", line),
+            post(&*worker.ctx, to, "t0000000001.end.1", line),
             Ok("OK 1".to_owned())
         );
         let inbox = worker.ctx.fabric.lock();
@@ -45,7 +45,7 @@ fn a_report_to_a_session_here_is_queued_on_the_bus_only_where_a_bridge_runs() {
             [(
                 crate::pct_encode(&format!("@{}", manager.sid.as_str())),
                 "report",
-                Some("s-1.end.1"),
+                Some("t0000000001.end.1"),
                 line
             )],
             "one report on the bus, to the manager, under its key"
@@ -60,14 +60,14 @@ fn a_malformed_report_is_refused_before_any_transport() {
         let worker = test_handle(1);
         let node = format!("n-{}", "b".repeat(16));
         for (to, key, text) in [
-            (To::Here("s-2"), "k", "two\nlines"),
-            (To::Here("s-2"), "k", ""),
-            (To::Here("s-2"), "k", &"x".repeat(REPORT_MAX + 1)),
-            (To::Here("s-2"), "a key", "text"),
+            (To::Here("t0000000002"), "k", "two\nlines"),
+            (To::Here("t0000000002"), "k", ""),
+            (To::Here("t0000000002"), "k", &"x".repeat(REPORT_MAX + 1)),
+            (To::Here("t0000000002"), "a key", "text"),
             (To::Here("not a sid"), "k", "text"),
             (
                 To::There {
-                    sid: "s-2",
+                    sid: "t0000000002",
                     node: "beta",
                 },
                 "k",
@@ -82,11 +82,11 @@ fn a_malformed_report_is_refused_before_any_transport() {
         assert!(worker.ctx.fabric.lock().posts.is_empty());
         // Control: the same report, well formed, is queued; one for another Mac is never put
         // on this Mac's bus, and with no fleet drive here nothing takes it.
-        assert!(post(&*worker.ctx, To::Here("s-2"), "k", "text").is_ok());
+        assert!(post(&*worker.ctx, To::Here("t0000000002"), "k", "text").is_ok());
         let there = post(
             &*worker.ctx,
             To::There {
-                sid: "s-2",
+                sid: "t0000000002",
                 node: &node,
             },
             "k",
@@ -111,14 +111,14 @@ fn a_report_from_a_session_leaving_goes_by_direct_fleet_mail_alone() {
         let worker = test_handle(1);
         let node = format!("n-{}", "b".repeat(16));
         assert_eq!(
-            post_leaving(&*worker.ctx, To::Here("s-2"), "k", "text"),
+            post_leaving(&*worker.ctx, To::Here("t0000000002"), "k", "text"),
             Err(Unsent::Leaving)
         );
         assert!(worker.ctx.fabric.lock().posts.is_empty(), "nothing queued");
         let there = post_leaving(
             &*worker.ctx,
             To::There {
-                sid: "s-2",
+                sid: "t0000000002",
                 node: &node,
             },
             "k",
@@ -130,7 +130,7 @@ fn a_report_from_a_session_leaving_goes_by_direct_fleet_mail_alone() {
         );
         assert!(worker.ctx.fabric.lock().posts.is_empty(), "nothing queued");
         // Control: the same report from a session that stays is queued on the bus.
-        assert!(post(&*worker.ctx, To::Here("s-2"), "k", "text").is_ok());
+        assert!(post(&*worker.ctx, To::Here("t0000000002"), "k", "text").is_ok());
         assert_eq!(worker.ctx.fabric.lock().posts.len(), 1);
     });
 }

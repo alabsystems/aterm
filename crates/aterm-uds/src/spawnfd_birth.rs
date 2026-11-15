@@ -185,6 +185,18 @@ pub struct Spawned {
 }
 
 impl Spawned {
+    pub(super) fn entry_custody(&self) -> std::sync::Arc<()> {
+        std::sync::Arc::clone(&self.observed.custody)
+    }
+
+    pub(super) fn admits_entry(&self, key: &BirthKey, custody: &std::sync::Arc<()>) -> bool {
+        self.key() == key
+            && key.is_current()
+            && self.is_original_child()
+            && self.observed.child.owns_unreaped()
+            && std::sync::Arc::ptr_eq(&self.observed.custody, custody)
+    }
+
     /// Whether this receipt still holds the original native child handle without
     /// a kernel-reported loss of wait custody.
     #[must_use]
@@ -390,29 +402,54 @@ pub(super) fn observe_cohort(
     observe_as(attempt, spawn, |observed| Spawned { observed })
 }
 
+pub(super) fn prepare_cohort(
+    attempt: BirthAttempt,
+    spawn: impl FnOnce() -> io::Result<(super::no_fork::PendingChild, super::entry_barrier::Parent)>,
+) -> Result<super::PreparedCohort, SpawnFailure> {
+    let (key, (pending, barrier)) = begin(attempt, spawn)?;
+    pending.prepare(
+        |child| Spawned {
+            observed: ObservedSpawned {
+                custody: child.custody_key(),
+                key,
+                child,
+            },
+        },
+        barrier,
+    )
+}
+
 fn observe_as<R>(
     attempt: BirthAttempt,
     spawn: impl FnOnce() -> io::Result<super::no_fork::PendingChild>,
     seal: impl FnOnce(ObservedSpawned) -> R,
 ) -> Result<R, SpawnFailure<R>> {
+    let (key, pending) = begin(attempt, spawn)?;
+    pending
+        .observe(|child| {
+            seal(ObservedSpawned {
+                custody: child.custody_key(),
+                key,
+                child,
+            })
+        })
+        .map_err(|(spawned, error)| SpawnFailure::Unbound {
+            spawned: Box::new(spawned),
+            error,
+        })
+}
+
+fn begin<R, T>(
+    attempt: BirthAttempt,
+    spawn: impl FnOnce() -> io::Result<T>,
+) -> Result<(BirthKey, T), SpawnFailure<R>> {
     if !attempt.key.is_current() {
         return Err(SpawnFailure::Refused(io::Error::other(
             "spawn attempt belongs to another process or kernel scope",
         )));
     }
     match spawn() {
-        Ok(pending) => pending
-            .observe(|child| {
-                seal(ObservedSpawned {
-                    custody: child.custody_key(),
-                    key: attempt.key,
-                    child,
-                })
-            })
-            .map_err(|(spawned, error)| SpawnFailure::Unbound {
-                spawned: Box::new(spawned),
-                error,
-            }),
+        Ok(pending) => Ok((attempt.key, pending)),
         Err(error) if attempt.key.is_current() => {
             Err(SpawnFailure::NotSpawned(Box::new(NotSpawned {
                 key: attempt.key,

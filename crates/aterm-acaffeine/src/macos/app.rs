@@ -160,6 +160,11 @@ struct Mug {
     doors: StartupDoors,
     /// Open System Settings at Login Items ([`login_items::open_settings`]).
     open_login_items: fn(),
+    /// The aterm app the mug was started from, which Open aterm opens: the bundle `origin` is
+    /// the executable of ([`aterm_app`]), none for a bare build.
+    aterm_app: Option<PathBuf>,
+    /// The one door that opens it ([`open_app`]).
+    open_app: fn(&Path),
     /// The item in the menu bar.
     ui: Option<StatusUi>,
     /// The origin's code, watched when the mug restarts on an update.
@@ -292,6 +297,12 @@ impl Mug {
     fn choose(&mut self, action: MenuAction, now: Clocks) -> Next {
         match action {
             MenuAction::Activate(choice) => self.set(Mode::chosen(choice, now), now),
+            MenuAction::OpenAterm => {
+                if let Some(app) = &self.aterm_app {
+                    (self.open_app)(app);
+                }
+                Next::Keep
+            }
             MenuAction::ToggleLid => self.set_lid(!self.lid_awake, now),
             MenuAction::ToggleStartup => {
                 let shown = self.startup() == Startup::On;
@@ -511,6 +522,7 @@ impl Mug {
     /// The menu's rows at `now`.
     fn rows(&self, now: Clocks) -> Vec<Row> {
         let shown = Shown {
+            aterm: self.aterm_app.is_some(),
             startup: self.startup(),
             lid_awake: self.lid_awake,
             paused: match self.hold {
@@ -1117,6 +1129,7 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
     let watch = restart_on_update.then(|| Watch::start(origin.clone(), &running));
     let ending = paths.clone();
     let job = restart_on_update.then(|| label.clone());
+    let app = aterm_app(&origin);
     let mug = Mug {
         mode: Mode::Off,
         paths,
@@ -1137,6 +1150,8 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         bridge_start: bridge::start,
         doors: super::STARTUP_DOORS,
         open_login_items: login_items::open_settings,
+        aterm_app: app,
+        open_app,
         ui: None,
         watch,
         exit: None,
@@ -1148,6 +1163,46 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         Err(unstarted) => return unstarted.exit(&ending),
     };
     let_go(code, job.as_deref(), quit_off, instance, &ending, now)
+}
+
+/// The aterm app whose executable is `origin`, the path it was started as resolved through links
+/// (`~/.local/bin/aterm` is one into the bundle): none for a build outside an `.app`.
+fn aterm_app(origin: &Path) -> Option<PathBuf> {
+    let exe = origin
+        .canonicalize()
+        .unwrap_or_else(|_| origin.to_path_buf());
+    crate::code::own_bundle(&exe)
+}
+
+/// How long `open -a` may take before Open aterm gives up on its answer.
+const OPEN_CEILING: Duration = Duration::from_secs(30);
+
+/// Open the app `bundle` as LaunchServices does (`open -a`): it starts it, or brings a running one
+/// forward, which opens a window if it has none. On a thread of its own, so the menu's click
+/// returns at once; a failure is logged.
+fn open_app(bundle: &Path) {
+    let bundle = bundle.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("acaffeine-open-aterm".into())
+        .spawn(move || {
+            let mut open = aterm_uds::spawnfd::command("/usr/bin/open");
+            open.arg("-a").arg(&bundle);
+            match aterm_uds::deadline::output_within(&mut open, OPEN_CEILING) {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => aterm_log::warn!(
+                    "acaffeine: could not open {}: open exited {}: {}",
+                    bundle.display(),
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(err) => {
+                    aterm_log::warn!("acaffeine: could not open {}: {err}", bundle.display());
+                }
+            }
+        });
+    if let Err(err) = spawned {
+        aterm_log::warn!("acaffeine: could not start opening aterm: {err}");
+    }
 }
 
 /// How the mug that ended its run with `code` lets go of its lock (`instance`), and the code it

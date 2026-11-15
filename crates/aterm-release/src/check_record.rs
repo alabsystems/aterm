@@ -25,11 +25,12 @@
 //! cutter keeps one record per check from the events ([`write_run`]); a run that no longer judged
 //! R's tree under that seal keeps nothing ([`abandon_run`]).
 //!
-//! The judge ([`checks`]) reads them back: an `ok` (or an owner's `accepted` measure) passes, a
+//! The judge ([`checks`]) reads them back: an `ok` (or an owner's `accepted` FAIL of a check that
+//! runs the product's tests, [`acceptable`]) passes, a
 //! `FAIL` refuses the tree under that seal until a new hop changes the tree, and `NOT RUN`,
-//! `skip` and an absent record are missing, which a resume runs again, alone, carrying the test
-//! binaries, lint packages and AppKit executable groups a missing record lists as passed with
-//! their complete bounded content proofs ([`VerifyRun`]). A record that does not parse, or whose
+//! `skip` and an absent record are missing, which a resume runs again, alone, carrying the lint
+//! packages and AppKit executable groups a missing record lists as passed with their complete
+//! bounded content proofs ([`VerifyRun`]); every test binary runs again. A record that does not parse, or whose
 //! key is not this tree's and seal's, is missing; one that cannot be read leaves the judge without
 //! an answer.
 
@@ -79,88 +80,43 @@ fn bundle(check: Check) -> bool {
     check == Check::Measure
 }
 
+/// Whether an owner may accept `check`'s recorded FAIL ([`accept`]): the checks that run the
+/// product's tests and measurements, whose FAIL can be a test that is wrong, timing-dependent
+/// or failing on a loaded machine. The other checks judge the source's shape (the candidate
+/// shim, fmt, lint, census, forge, libc): their fix lands in the source, and no acceptance of
+/// theirs is read.
+#[must_use]
+pub const fn acceptable(check: Check) -> bool {
+    matches!(
+        check,
+        Check::Test | Check::Spec | Check::Appkit | Check::Measure
+    )
+}
+
+/// The names of the checks whose FAIL an owner may accept, in [`RELEASE`] order.
+#[must_use]
+pub fn acceptable_names() -> Vec<&'static str> {
+    RELEASE
+        .into_iter()
+        .filter(|check| acceptable(*check))
+        .map(Check::name)
+        .collect()
+}
+
 /// Tree-local verdicts eligible for adjacent-hop content carry. AppKit is invoked with the
 /// bundle half's canonical CLI context, but its debug examples read the tree rather than `--app`.
 fn hop_checks() -> impl Iterator<Item = Check> {
     RELEASE.into_iter().filter(|check| !bundle(*check))
 }
 
-/// One test binary a test record lists: its outcome and the complete content proof verify
-/// observed. Legacy records had only `spec`, `sha256` and `outcome`; serde defaults make those
-/// rows readable (especially a standing FAIL) but unbounded, so they can never cross a hop.
+/// One test binary a test record lists: its outcome and how long it ran. A test binary is never
+/// carried: a resume runs every one again. Fields older records hold are ignored.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Binary {
     pub spec: String,
-    #[serde(default)]
-    pub sha256: String,
     pub outcome: String,
     #[serde(default)]
-    pub content_key: Option<String>,
-    #[serde(default)]
-    pub inputs_bounded: bool,
-    #[serde(default)]
-    pub input_reason: Option<String>,
-    /// The prior run's global libtest JSON decision. Legacy rows omit it and fail closed.
-    #[serde(default)]
-    pub json: Option<bool>,
-    #[serde(default)]
     pub execution_s: f64,
-    /// The content key's named parts ([`aterm_verify::test_content::KeyParts`]): what a later
-    /// hop that refuses this row names as moved. Diagnostic; never compared for a carry.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub key_parts: BTreeMap<String, String>,
-    /// The release run whose execution this row is: this record's own run unless the row was
-    /// carried, and then the run it was carried from, however many hops it crossed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_run: Option<String>,
-}
-
-impl Binary {
-    /// Whether a resume may offer it as a candidate. Verify still recomputes its current proof.
-    fn carried(&self) -> bool {
-        self.outcome == OK
-            && self.inputs_bounded
-            && aterm_codec::hex::is_lower(&self.sha256, 64)
-            && self
-                .content_key
-                .as_deref()
-                .is_some_and(|key| aterm_codec::hex::is_lower(key, 64))
-            && self.input_reason.is_none()
-            && self.json.is_some()
-            && self.execution_s.is_finite()
-            && self.execution_s >= 0.0
-    }
-
-    /// The verifier's versioned JSONL proof for this candidate.
-    pub(crate) fn proof(&self) -> Option<aterm_verify::testrun::CarryProof> {
-        self.carried().then(|| aterm_verify::testrun::CarryProof {
-            schema: aterm_verify::test_content::SCHEMA,
-            spec: self.spec.clone(),
-            outcome: OK.into(),
-            exe_sha256: Some(self.sha256.clone()),
-            content_key: self.content_key.clone(),
-            inputs_bounded: true,
-            input_reason: None,
-            json: self.json.expect("a carried binary has its JSON decision"),
-            execution_s: self.execution_s,
-            key_parts: self.key_parts.clone(),
-            origin_run: self.origin_run.clone(),
-        })
-    }
-}
-
-/// `rows` as a record of `run` keeps them: a row that ran and names no origin executed in
-/// that run. A carried row keeps the run it names, and a row that did not run names none.
-fn executed_in(rows: &[Binary], run: &str) -> Vec<Binary> {
-    rows.iter()
-        .cloned()
-        .map(|mut row| {
-            if row.outcome != NOT_RUN {
-                row.origin_run.get_or_insert_with(|| run.to_owned());
-            }
-            row
-        })
-        .collect()
 }
 
 /// One workspace package's lint outcome and complete compile-time content proof. Legacy records
@@ -243,7 +199,7 @@ fn appkit_group_candidates(
     groups.into_values().flatten().collect()
 }
 
-/// An owner's acceptance of a measure FAIL ([`crate::accepted_measure::record`]).
+/// An owner's acceptance of a check's FAIL ([`crate::accepted_measure::record`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Acceptance {
     pub reason: String,
@@ -570,13 +526,12 @@ impl Half {
 }
 
 /// What one `verify release` of a [`Half`] runs: its checks the records lack, in [`RELEASE`]
-/// order, plus the test binaries and lint packages whose prior bounded OKs are candidates. The
+/// order, plus the lint packages and AppKit groups whose prior bounded OKs are candidates. The
 /// verifier recomputes every candidate's complete key before skipping it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifyRun {
     pub half: Half,
     pub checks: Vec<String>,
-    pub passed_binaries: Vec<Binary>,
     pub passed_lint_packages: Vec<LintPackage>,
     pub passed_appkit_groups: Vec<aterm_verify::appkit_content::GroupProof>,
 }
@@ -611,15 +566,6 @@ pub fn release_names() -> Vec<String> {
     RELEASE.iter().map(|c| c.name().to_owned()).collect()
 }
 
-/// `n` binaries, in words.
-fn binaries(n: usize) -> String {
-    if n == 1 {
-        "1 binary".to_owned()
-    } else {
-        format!("{n} binaries")
-    }
-}
-
 fn lint_packages(n: usize) -> String {
     if n == 1 {
         "1 lint package".to_owned()
@@ -637,11 +583,12 @@ pub struct Checks {
     pub missing: Vec<String>,
     /// The checks whose record says FAIL, the run-level record's included.
     pub failed: Vec<Failed>,
-    /// An owner's acceptance the measure record holds, in words.
+    /// The owner's acceptances the records hold, in words, once nothing else is missing or
+    /// failed: each accepted check, its reason and its failed report.
     pub accepted: Option<String>,
-    /// The test binaries the test record lists as passed, with known digests, when test did not
-    /// pass.
-    pub resume: Vec<Binary>,
+    /// The checks whose FAIL record holds the owner's acceptance, in [`RELEASE`] order: neither
+    /// missing nor failed, and no ok record either.
+    pub owner_accepted: Vec<String>,
     /// Bounded lint-package OKs which the verifier must re-key before carrying.
     pub lint_resume: Vec<LintPackage>,
     /// AppKit executable groups which the current verifier must rebuild and re-key before reuse.
@@ -662,7 +609,6 @@ pub enum State {
     /// No passing record (NOT RUN, skip, absent, unusable), and its fine-grained successful
     /// candidates.
     Missing {
-        resume: Vec<Binary>,
         lint_resume: Vec<LintPackage>,
         appkit_resume: Vec<aterm_verify::appkit_content::GroupProof>,
     },
@@ -719,6 +665,8 @@ impl Checks {
             .collect();
         self.missing = missing;
         self.accepted = None;
+        self.owner_accepted
+            .retain(|name| !RELEASE.iter().any(|c| bundle(*c) && c.name() == name));
         self.answer = Answer::no(words);
         self
     }
@@ -738,24 +686,20 @@ impl Checks {
             tree: tree.to_owned(),
             ..Self::default()
         };
-        let mut accepted = None;
+        let mut accepted: Vec<(&'static str, String, String)> = Vec::new();
         for check in RELEASE {
             match state(check) {
                 State::Passed => {}
-                State::Accepted { reason, log } => accepted = Some((reason, log)),
+                State::Accepted { reason, log } => accepted.push((check.name(), reason, log)),
                 State::Failed { log } => checks.failed.push(Failed {
                     check: check.name().to_owned(),
                     log,
                     unrecorded: false,
                 }),
                 State::Missing {
-                    resume,
                     lint_resume,
                     appkit_resume,
                 } => {
-                    if check == Check::Test {
-                        checks.resume = resume;
-                    }
                     if check == Check::Lint {
                         checks.lint_resume = lint_resume;
                     }
@@ -781,23 +725,25 @@ impl Checks {
                 first.log
             )
         } else if !checks.missing.is_empty() {
-            let ok = RELEASE.len() - checks.missing.len();
+            // An accepted FAIL is no ok record: it is counted apart and named.
+            let ok = RELEASE.len() - checks.missing.len() - accepted.len();
             let mut words = format!(
                 "`verify release` has no passing record of {} for {at} under this seal ({ok} of \
                  {} checks recorded ok)",
                 checks.missing.join(", "),
                 RELEASE.len()
             );
-            if executable.is_none() && checks.missing.iter().any(|m| m == "measure") {
-                words.push_str("; measure judges the bundle, not built yet (step 5)");
-            }
-            if !checks.resume.is_empty() {
+            if !accepted.is_empty() {
                 use std::fmt::Write as _;
+                let names: Vec<&str> = accepted.iter().map(|(check, ..)| *check).collect();
                 let _ = write!(
                     words,
-                    "; test's record carries {} that passed",
-                    binaries(checks.resume.len())
+                    "; the owner accepted the FAIL of {}",
+                    names.join(", ")
                 );
+            }
+            if executable.is_none() && checks.missing.iter().any(|m| m == "measure") {
+                words.push_str("; measure judges the bundle, not built yet (step 5)");
             }
             if !checks.lint_resume.is_empty() {
                 use std::fmt::Write as _;
@@ -816,10 +762,16 @@ impl Checks {
                 );
             }
             words
-        } else if let Some((reason, log)) = &accepted {
+        } else if !accepted.is_empty() {
+            let each: Vec<String> = accepted
+                .iter()
+                .map(|(check, reason, log)| {
+                    format!("OWNER ACCEPTED {check} failure: {reason}; report {log}")
+                })
+                .collect();
             format!(
-                "OWNER ACCEPTED measure failure: {reason}; all other release checks passed; \
-                 report {log} (not a full verification pass)"
+                "{}; all other release checks passed (not a full verification pass)",
+                each.join("; ")
             )
         } else {
             format!(
@@ -828,9 +780,13 @@ impl Checks {
                 executable.map_or("?", short)
             )
         };
-        checks.accepted = accepted
-            .filter(|_| checks.failed.is_empty() && checks.missing.is_empty())
-            .map(|_| words.clone());
+        checks.accepted =
+            (!accepted.is_empty() && checks.failed.is_empty() && checks.missing.is_empty())
+                .then(|| words.clone());
+        checks.owner_accepted = accepted
+            .iter()
+            .map(|(check, ..)| (*check).to_owned())
+            .collect();
         checks.answer = if checks.failed.is_empty() && checks.missing.is_empty() {
             Answer::yes(words)
         } else {
@@ -857,7 +813,7 @@ impl Checks {
         &self.answer.words
     }
 
-    /// What a run of `half` runs: its missing checks, with the test binaries and lint packages
+    /// What a run of `half` runs: its missing checks, with the lint packages and AppKit groups
     /// eligible to be re-keyed. Empty when every check of `half` has a passing record.
     #[must_use]
     pub fn run(&self, half: Half) -> VerifyRun {
@@ -877,16 +833,10 @@ impl Checks {
             })
             .cloned()
             .collect();
-        let test = checks.iter().any(|m| m == "test");
         let appkit = checks.iter().any(|m| m == "appkit");
         VerifyRun {
             half,
             checks,
-            passed_binaries: if test {
-                self.resume.clone()
-            } else {
-                Vec::new()
-            },
             passed_lint_packages: if self.missing.iter().any(|m| m == "lint") && half == Half::Tree
             {
                 self.lint_resume.clone()
@@ -1015,25 +965,6 @@ pub fn checks(
             );
         }
     }
-    if checks.missing.iter().any(|check| check == "test") {
-        // As for lint: candidates only, and every row this tree already has wins, a FAIL, a
-        // NOT RUN and an unbounded row included. The verifier recomputes each offered row's
-        // whole content key on this tree before it carries one.
-        if let Ok(candidates) = ancestor_test_candidates(git, &root, commit, &tree) {
-            let mut current: BTreeSet<_> = checks.resume.iter().map(|b| b.spec.clone()).collect();
-            if let Some(seal) = current_seal.as_deref()
-                && let Read::Record(record) = read(&path(&root, &tree, seal, "test", None))?
-                && answers(&record, "test", &tree, seal, None)
-            {
-                current.extend(record.binaries.iter().map(|b| b.spec.clone()));
-            }
-            checks.resume.extend(
-                candidates
-                    .into_iter()
-                    .filter(|b| !current.contains(&b.spec)),
-            );
-        }
-    }
     Ok(checks)
 }
 
@@ -1113,24 +1044,6 @@ fn ancestor_lint_candidates(
         .collect())
 }
 
-/// The test binaries an ancestor's run passed, each under the run that executed it. The nearest
-/// ancestor's row owns its spec, so a newer FAIL or unbounded row is never passed over for an
-/// older success.
-fn ancestor_test_candidates(
-    git: &dyn GitRunner,
-    root: &Path,
-    commit: &str,
-    current_tree: &str,
-) -> Result<Vec<Binary>, String> {
-    let mut candidates = BTreeMap::new();
-    for record in ancestor_records(git, root, commit, current_tree, "test")? {
-        for binary in executed_in(&record.binaries, &record.run) {
-            candidates.entry(binary.spec.clone()).or_insert(binary);
-        }
-    }
-    Ok(candidates.into_values().filter(Binary::carried).collect())
-}
-
 /// [`checks`] over the records under `root`.
 ///
 /// # Errors
@@ -1143,7 +1056,6 @@ pub fn checks_in(
     seal: impl FnOnce() -> Result<String, String>,
 ) -> Result<Checks, String> {
     let missing = |_: Check| State::Missing {
-        resume: Vec::new(),
         lint_resume: Vec::new(),
         appkit_resume: Vec::new(),
     };
@@ -1170,7 +1082,7 @@ pub fn checks_in(
                 carried.extend(carried_note(&record));
                 State::Passed
             }
-            ACCEPTED if bundle(check) => match record.acceptance {
+            ACCEPTED if acceptable(check) => match record.acceptance {
                 Some(a) => State::Accepted {
                     reason: a.reason,
                     log: record.log,
@@ -1179,10 +1091,6 @@ pub fn checks_in(
             },
             FAIL => State::Failed { log: record.log },
             _ => State::Missing {
-                resume: executed_in(&record.binaries, &record.run)
-                    .into_iter()
-                    .filter(Binary::carried)
-                    .collect(),
                 lint_resume: record
                     .lint_packages
                     .into_iter()
@@ -1232,7 +1140,6 @@ pub fn checks_in(
         executable,
         |check| {
             states.remove(check.name()).unwrap_or(State::Missing {
-                resume: Vec::new(),
                 lint_resume: Vec::new(),
                 appkit_resume: Vec::new(),
             })
@@ -1243,27 +1150,11 @@ pub fn checks_in(
 }
 
 /// What of an `ok` record no run of its own tree executed: the whole check where the hop
-/// carry copied it ([`carry_hop`]), the test binaries another run executed, the lint packages
-/// reused. `None` for a record whose every row ran in its own run.
+/// carry copied it ([`carry_hop`]), the lint packages reused. `None` for a record whose every
+/// row ran in its own run.
 fn carried_note(record: &CheckRecord) -> Option<String> {
     if let Some(head) = record.run.strip_prefix(CARRIED_RUN_PREFIX) {
         return Some(format!("{} whole from line head {head}", record.check));
-    }
-    let elsewhere: Vec<&str> = record
-        .binaries
-        .iter()
-        .filter(|row| row.outcome == OK)
-        .filter_map(|row| row.origin_run.as_deref())
-        .filter(|run| *run != record.run)
-        .collect();
-    if !elsewhere.is_empty() {
-        let runs: std::collections::BTreeSet<&str> = elsewhere.iter().copied().collect();
-        return Some(format!(
-            "{} of {} of test from {}",
-            elsewhere.len(),
-            binaries(record.binaries.len()),
-            runs.into_iter().collect::<Vec<_>>().join(", ")
-        ));
     }
     let reused = record.lint_packages.iter().filter(|row| row.reused).count();
     (reused != 0).then(|| {
@@ -1465,64 +1356,6 @@ pub fn carry_hop(
             }
         }
 
-        // The check itself is not carried. Keep successful binary candidates plus any current
-        // tombstones under a NOT RUN current-tree record. The ordinary resume wire supplies only
-        // the successes, whose executable, environment and runtime-input keys verify recomputes.
-        if check == Check::Test
-            && let Some(previous) = previous.clone()
-        {
-            let rows_rekeyed_here = !previous.run.starts_with(CANDIDATE_RUN_PREFIX);
-            let previous_candidates = executed_in(&previous.binaries, &previous.run)
-                .into_iter()
-                .filter(move |binary| rows_rekeyed_here && binary.carried());
-            let current_binaries = current
-                .clone()
-                .into_iter()
-                .flat_map(|record| record.binaries);
-            let mut rows: BTreeMap<String, Binary> = previous_candidates
-                .map(|binary| (binary.spec.clone(), binary))
-                .collect();
-            // A prior facts pass may already have judged binaries on this hop. Every current row
-            // wins. Keep NOT RUN, FAIL and unbounded rows as tombstones: the ordinary resume wire
-            // filters them, while a second facts pass still sees them and cannot resurrect an
-            // older preceding-hop OK for the same spec.
-            for binary in current_binaries {
-                rows.insert(binary.spec.clone(), binary);
-            }
-            let candidate_count = rows.values().filter(|binary| binary.carried()).count();
-            if candidate_count != 0 {
-                let candidates: Vec<Binary> = rows.into_values().collect();
-                let mut candidate = CheckRecord {
-                    schema: SCHEMA,
-                    check: name.to_owned(),
-                    key: key(name, tree, seal, None),
-                    tree: tree.to_owned(),
-                    commit: commit.to_owned(),
-                    seal: seal.to_owned(),
-                    content: Some(input.clone()),
-                    executable: None,
-                    outcome: NOT_RUN.into(),
-                    seconds: 0.0,
-                    detail: format!(
-                        "{} successful binaries from {} are candidates; each full content key is recomputed",
-                        candidate_count,
-                        short(previous_commit)
-                    ),
-                    rows: Vec::new(),
-                    log: previous.log,
-                    log_sha256: previous.log_sha256,
-                    run: format!("{CANDIDATE_RUN_PREFIX}{}", short(previous_commit)),
-                    exit: 3,
-                    acceptance: None,
-                    binaries: candidates,
-                    lint_packages: Vec::new(),
-                    appkit_groups: Vec::new(),
-                    input_items: Vec::new(),
-                };
-                candidate.binaries.sort_by(|a, b| a.spec.cmp(&b.spec));
-                let _ = keep(&current_at, &candidate)?;
-            }
-        }
         // Lint's aggregate verdict is deliberately not carried: its compiler closure is split
         // per workspace package. Offer only bounded package OKs to the next hop. Current rows,
         // including FAIL and unbounded rows, replace older candidates as tombstones so repeated
@@ -1619,28 +1452,23 @@ pub fn accepted(
     )
 }
 
-/// Rewrite `commit`'s measure FAIL on `executable` as the owner's acceptance of it: the FAIL's
-/// key must be this tree's and `seal`'s, its log `report` and that log's SHA-256 `report_sha256`.
+/// Rewrite `commit`'s FAIL of `check` (a bundle check's on `executable`, a tree check's with
+/// none) as the owner's acceptance of it: the check must be one whose FAIL is accepted
+/// ([`acceptable`]), the FAIL's key this tree's and `seal`'s, its log `report` and that log's
+/// SHA-256 `report_sha256`.
 ///
 /// # Errors
-/// No such FAIL record, any mismatch, or the write.
+/// A check whose FAIL is never accepted, no such FAIL record, any mismatch, or the write.
 pub fn accept(
     git: &dyn GitRunner,
     commit: &str,
-    executable: &str,
+    check: (Check, Option<&str>),
     seal: &str,
     report: (&Path, &str),
     reason: &str,
 ) -> Result<PathBuf, String> {
     let tree = tree_of(git, commit)?;
-    accept_in(
-        &root(git)?,
-        (commit, &tree),
-        executable,
-        seal,
-        report,
-        reason,
-    )
+    accept_in(&root(git)?, (commit, &tree), check, seal, report, reason)
 }
 
 /// [`accept`] over the records under `root`.
@@ -1650,39 +1478,56 @@ pub fn accept(
 pub fn accept_in(
     root: &Path,
     (commit, tree): (&str, &str),
-    executable: &str,
+    (check, executable): (Check, Option<&str>),
     seal: &str,
     (report, report_sha256): (&Path, &str),
     reason: &str,
 ) -> Result<PathBuf, String> {
-    let at = path(root, tree, seal, "measure", Some(executable));
+    let name = check.name();
+    if !acceptable(check) || !RELEASE.contains(&check) {
+        return Err(format!(
+            "a {name} FAIL is never accepted: only a FAIL of {} is; the fix for {name} lands in \
+             the source",
+            acceptable_names().join(", ")
+        ));
+    }
+    if bundle(check) != executable.is_some() {
+        return Err(format!(
+            "{name} judges the {}: its acceptance names {}",
+            if bundle(check) { "bundle" } else { "tree" },
+            if bundle(check) {
+                "the built executable"
+            } else {
+                "no executable"
+            }
+        ));
+    }
+    let at = path(root, tree, seal, name, executable);
     let Read::Record(mut record) = read(&at)? else {
         return Err(format!(
-            "{} holds no measure record of this tree under the current build-inputs seal to \
+            "{} holds no {name} record of this tree under the current build-inputs seal to \
              accept; rerun verification",
             at.display()
         ));
     };
     if record.outcome != FAIL {
         return Err(format!(
-            "the measure record of {}'s tree on {} is {}, not FAIL: only a measure FAIL is \
-             accepted",
+            "the {name} record of {}'s tree{} is {}, not FAIL: only a FAIL is accepted",
             short(commit),
-            short(executable),
+            executable.map_or_else(String::new, |u| format!(" on {}", short(u))),
             record.outcome
         ));
     }
-    if !answers(&record, "measure", tree, seal, Some(executable)) {
-        return Err(
-            "the measure FAIL is not this tree's under the current build-inputs seal; rerun \
+    if !answers(&record, name, tree, seal, executable) {
+        return Err(format!(
+            "the {name} FAIL is not this tree's under the current build-inputs seal; rerun \
              verification"
-                .into(),
-        );
+        ));
     }
     let logged = std::fs::canonicalize(&record.log).ok();
     if logged.as_deref() != Some(report) || record.log_sha256 != report_sha256 {
         return Err(format!(
-            "the measure FAIL was read from {} (sha256 {}), not {} as it is now",
+            "the {name} FAIL was read from {} (sha256 {}), not {} as it is now",
             record.log,
             short(&record.log_sha256),
             report.display()
@@ -1842,34 +1687,13 @@ pub fn events(at: &Path) -> std::io::Result<RunEvents> {
                 else {
                     return;
                 };
-                let sha256 = event["exe_sha256"]
-                    .as_str()
-                    .filter(|s| aterm_codec::hex::is_lower(s, 64))
-                    .unwrap_or_default();
                 let binary = Binary {
                     spec: spec.to_owned(),
-                    sha256: sha256.to_owned(),
                     outcome: outcome.to_owned(),
-                    content_key: event["content_key"].as_str().map(str::to_owned),
-                    inputs_bounded: event["inputs_bounded"].as_bool().unwrap_or(false),
-                    input_reason: event["input_reason"].as_str().map(str::to_owned),
-                    json: event["json"].as_bool(),
                     execution_s: event["recorded_execution_s"]
                         .as_f64()
                         .or_else(|| event["execution_s"].as_f64())
                         .unwrap_or(0.0),
-                    key_parts: event["key_parts"]
-                        .as_object()
-                        .map(|parts| {
-                            parts
-                                .iter()
-                                .filter_map(|(name, digest)| {
-                                    Some((name.clone(), digest.as_str()?.to_owned()))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    origin_run: event["carried_from"].as_str().map(str::to_owned),
                 };
                 if let Some(pos) = binaries.iter().position(|b| b.spec == spec) {
                     binaries.remove(pos);
@@ -1982,7 +1806,7 @@ pub fn keep_harnesses(
     Ok(())
 }
 
-/// The receipt namespace is H(U, four linked benches, verifier executable, seal). No tree check
+/// The receipt namespace is H(U, the linked measuring benches, verifier executable, seal). No tree check
 /// crosses trees, and historical check records and release journals retain their format.
 pub fn product_key(
     root: &Path,
@@ -2267,7 +2091,7 @@ pub fn write_run(
                 .unwrap_or_default();
             if check == Check::Test {
                 test_finished = true;
-                r.binaries = executed_in(&events.binaries, facts.run);
+                r.binaries.clone_from(&events.binaries);
             }
             if check == Check::Lint {
                 lint_finished = true;
@@ -2313,7 +2137,7 @@ pub fn write_run(
                 events.binaries.len(),
                 if fail { ", and one failed" } else { "" }
             );
-            r.binaries = executed_in(&events.binaries, facts.run);
+            r.binaries.clone_from(&events.binaries);
             let said = format!("test {} (from its binaries)", r.outcome);
             records.push((path_in_seal_dir(&seal_path, "test", None), r, said));
         }

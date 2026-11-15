@@ -14,6 +14,16 @@ use crate::session_store::{SessionHandle, Store};
 
 mod redaction;
 
+pub(crate) use redaction::is_token_break;
+
+// A fleet digest counts a row's `pending`, `announced` or `held` upgrade word held once its age
+// (the time behind) reaches the ladder's last rung: aterm-ctl sits below aterm-agent and cannot
+// name it, so the word's producer holds the two equal.
+const _: () = assert!(
+    aterm_ctl::UPGRADE_HELD_S == aterm_agent::harness::upgrade::RUNG_LAND_S,
+    "a fleet digest counts an upgrade held once behind past the ladder's last rung"
+);
+
 /// The excerpts the footer resolver publishes for a Claude Code process
 /// (`SessionTimeline::set_claude_excerpts`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -39,6 +49,10 @@ pub(crate) struct CodexSurvey {
     pub(crate) task: Option<String>,
     /// The thread's active goal, from codex-alab's live session record ([`aterm_agent::harness::self_claimed::read_record_facts`]).
     pub(crate) goal: Option<String>,
+    /// The thread the rollout is (its id, as the claim names it): the conversation its token
+    /// counters ([`aterm_agent::harness::codex_facts::CodexFacts::tok_in`]) count. Kept in memory
+    /// only; no row sends it.
+    pub(crate) thread: String,
 }
 
 impl CodexSurvey {
@@ -134,7 +148,8 @@ fn task_prompt_at(path: &Path, tasks: &Path) -> Option<String> {
 
 const REDACTED_WORD: &str = "[redacted]";
 
-const REDACTED_LINE: &str = "[redacted: sensitive]";
+/// What [`redact`] makes of a whole line that holds a sensitive phrase.
+pub(crate) const REDACTED_LINE: &str = "[redacted: sensitive]";
 
 const FLEET_CODE: &str = "atf1-";
 
@@ -483,11 +498,21 @@ pub(crate) struct Here {
 }
 
 impl Here {
-    /// Snapshot [`Here`] for a non-driving local reader. Its facts carry the home's checkouts as
-    /// their last read found them, and a read older than
+    /// Snapshot [`Here`] for a non-driving local reader, with the machine's look this answer
+    /// takes ([`Self::unlooked`]'s facts, and the look).
+    pub(crate) fn now() -> Here {
+        let mut here = Self::unlooked();
+        if let Some(facts) = here.facts.as_mut() {
+            facts.take_latest_look();
+        }
+        here
+    }
+
+    /// This Mac's facts with no look at the machine, which only an answer takes. They carry the
+    /// home's checkouts as their last read found them, and a read older than
     /// [`aterm_agent::harness::repo_work::home::REFRESH`] starts again beside this one, so the
     /// survey never waits on git ([`refresh_home_repos`]).
-    pub(crate) fn now() -> Here {
+    fn unlooked() -> Here {
         refresh_home_repos();
         let node = node_id_opt();
         let mut facts = aterm_agent::survey_facts::SwarmSurveyFacts::collect(0, true, node);
@@ -501,42 +526,69 @@ impl Here {
         }
     }
 
-    /// Snapshot [`Here`] from the 1-minute listener cache (refreshed once per [`FACTS_CACHE_TTL`],
-    /// immediately if `<state>/fleet-node` changed, and at the next survey after one whose swarm
-    /// roster was unread, [`serves_cached`]), with the home's checkouts as their latest read
-    /// found them.
+    /// Snapshot [`Here`] from the 1-minute listener cache (refreshed once per
+    /// [`FACTS_CACHE_TTL`], immediately if `<state>/fleet-node` changed, and at the next survey
+    /// after one whose swarm roster was unread, [`serves_cached`]), with the home's checkouts as
+    /// their latest read found them and, where `taking` says a peer's answer, the machine's look
+    /// as it is at this reply ([`take_latest`]). The cache holds no look.
     #[cfg(any(unix, test))]
-    pub(crate) fn cached_for_listener() -> Here {
+    pub(crate) fn cached(taking: Taking) -> Here {
         static CACHE: std::sync::Mutex<Option<(std::time::Instant, Here)>> =
             std::sync::Mutex::new(None);
         let now = std::time::Instant::now();
         let live_node = node_id_opt();
-        {
+        let cached = {
             let guard = CACHE
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some((at, cached)) = guard.as_ref()
-                && serves_cached(*at, cached, now, live_node.as_deref())
-            {
-                // The checkouts' read runs on its own clock ([`refresh_home_repos`]), so a cached
-                // snapshot says the latest one, never one a minute behind it.
-                let mut here = cached.clone();
-                drop(guard);
-                // The level is a toggle: the one stored now, whatever the snapshot held.
-                here.access = crate::control::fleet_access_now();
-                refresh_home_repos();
-                if let Some(facts) = here.facts.as_mut() {
-                    facts.take_latest_repos();
-                }
-                return here;
-            }
+            guard
+                .as_ref()
+                .filter(|(at, cached)| serves_cached(*at, cached, now, live_node.as_deref()))
+                .map(|(_, cached)| cached.clone())
+        };
+        let mut here = if let Some(mut here) = cached {
+            // The level is a toggle: the one stored now, whatever the snapshot held.
+            here.access = crate::control::fleet_access_now();
+            refresh_home_repos();
+            here
+        } else {
+            let fresh = Self::unlooked();
+            let mut guard = CACHE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some((now, fresh.clone()));
+            fresh
+        };
+        if let Some(facts) = here.facts.as_mut() {
+            take_latest(facts, taking);
         }
-        let fresh = Self::now();
-        let mut guard = CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some((now, fresh.clone()));
-        fresh
+        here
+    }
+}
+
+/// Whether facts taken from the listener cache take the machine's look: only a peer's answer
+/// does, so a look happens only where a reader asked for one, never on a timer.
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Taking {
+    /// A peer's survey answer: the look as it is at this reply.
+    Look,
+    /// This Mac's own reads on their timers, which no reader of a look waits on: the window's
+    /// 3-minute facts push, and the node job's facts push and 60 s count of agents, which ask
+    /// the window a survey that names no peer (`node_serve::relayed_survey`). No look.
+    NoLook,
+}
+
+/// What facts the listener kept take afresh at every use. The checkouts' read runs on its own
+/// clock ([`refresh_home_repos`]), so a cached snapshot says the latest one, never one a minute
+/// behind it; and for an answer the machine's look is the one kept for this moment
+/// (`aterm_capacity::machine_look::LOOK_KEEP`), so its figures are never a minute older than
+/// the reply's `at_ms` and two readers a minute apart never read one sample.
+#[cfg(any(unix, test))]
+fn take_latest(facts: &mut aterm_agent::survey_facts::SwarmSurveyFacts, taking: Taking) {
+    facts.take_latest_repos();
+    if taking == Taking::Look {
+        facts.take_latest_look();
     }
 }
 
@@ -631,10 +683,17 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
     let snapshot = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
     let now_us = crate::metrics::now_us();
     let now_unix_ms = aterm_time::unix_millis().unwrap_or(0);
+    // The awake clock each row's `upgrade=` word is judged against, read once, as `status` reads
+    // it for its own (`SessionTimeline::owner_columns`).
+    let clocks = (
+        now_us,
+        now_unix_ms,
+        aterm_agent::harness::upgrade_drive::awake_since(),
+    );
     let facts = here.facts.as_ref();
     let mut rows: Vec<Option<Row>> = snapshot
         .iter()
-        .map(|h| Some(session_row(h, level, facts, (now_us, now_unix_ms))))
+        .map(|h| Some(session_row(h, level, facts, clocks)))
         .collect();
     let host = word_token(here.host.as_deref());
     let version = pct_encode(
@@ -697,7 +756,7 @@ pub(crate) fn survey_rows(store: &Store, level: SurveyLevel, max: usize, here: &
                 &snapshot[at],
                 SurveyLevel::Facts,
                 here.facts.as_ref(),
-                (now_us, now_unix_ms),
+                clocks,
             );
             facts.cut = true;
             total = total - rows[at].as_ref().map_or(0, |row| row.text.len()) + facts.text.len();
@@ -837,11 +896,271 @@ pub(crate) fn auth_fields(
     }
 }
 
+/// What a row takes of its session log under the timeline lock ([`Progress`]): the open turn and
+/// step and the newest closed ones, as wall-clock Unix ms (`None`: none, or a stamp with no wall
+/// time), the session's turn count and the agent run in front's tool count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Logged {
+    /// A turn is open ([`aterm_slog::SessionState::turn`]).
+    turn_open: bool,
+    /// When the open turn opened.
+    turn_at: Option<u64>,
+    /// When the newest closed turn closed.
+    turn_end_at: Option<u64>,
+    /// When the open step opened, where it is one of the agent's own ([`agents_step`]).
+    step_at: Option<u64>,
+    /// When the newest closed step closed, where it is one of the agent's own.
+    step_end_at: Option<u64>,
+    /// Turns opened this session.
+    turns: u32,
+    /// Tool steps the agent run in front opened, every class
+    /// ([`crate::session_log::SessionLog::run_tools`]); `None` unless its transcript join holds
+    /// that run's tool steps whole: bound, still reading and short of no row, as only it puts
+    /// tool steps in the log.
+    tools: Option<u32>,
+}
+
+impl Logged {
+    /// What `log` says, with `tools` the run in front's tool count where it is whole.
+    fn of(log: &aterm_slog::SessionState, tools: Option<u32>) -> Logged {
+        let wall = |t: u64| (t > 0).then_some(t);
+        Logged {
+            turn_open: log.turn().is_some(),
+            turn_at: log.turn().and_then(|turn| wall(turn.t)),
+            turn_end_at: log.last[1].as_ref().and_then(|turn| wall(turn.t)),
+            step_at: log
+                .step()
+                .filter(|step| agents_step(step.kind))
+                .and_then(|step| wall(step.t)),
+            step_end_at: log.last[2]
+                .as_ref()
+                .filter(|step| agents_step(step.kind))
+                .and_then(|step| wall(step.t)),
+            turns: log.totals.turns,
+            tools,
+        }
+    }
+}
+
+/// Whether a step of `kind` is the agent's own act: a tool call (a subagent's and a compaction
+/// included), an approval or a question it put. A limit wall, a screen stall or a vendor's survey
+/// box is something aterm reads of the session, not a step the agent is in.
+const fn agents_step(kind: aterm_slog::Kind) -> bool {
+    use aterm_slog::Kind;
+    matches!(
+        kind,
+        Kind::Tool | Kind::Subagent | Kind::Compact | Kind::Approval | Kind::Question
+    )
+}
+
+/// A conversation's whole token counters ([`whole_tokens`]).
+struct Whole {
+    /// The conversation they count, in the process that counts it: the key of
+    /// [`crate::session_timeline::SessionTimeline::token_epoch`].
+    conversation: String,
+    tok_in: Option<u64>,
+    tok_out: Option<u64>,
+}
+
+/// THE TOKEN COUNTERS A ROW MAY SEND, only where they are the whole conversation's: Claude Code's
+/// usage totals once the refresh that folded them read every file of the session, its subagents'
+/// included ([`aterm_agent::harness::session_usage::UsageFacts::complete`], no file unread, no
+/// walk cut short), and codex-alab's rollout's own running total; none for any other program.
+/// A prefix of the totals sent as counts would book a restart's catch-up as one minute's burst.
+fn whole_tokens(
+    reader: Option<aterm_phase::Program>,
+    pgid: i32,
+    claude: Option<(
+        &aterm_agent::harness::session_usage::UsageFacts,
+        &aterm_agent::harness::footer::FactsOwner,
+    )>,
+    codex: Option<&CodexSurvey>,
+) -> Option<Whole> {
+    use aterm_phase::Program;
+    match reader? {
+        Program::Claude => {
+            let (usage, owner) = claude?;
+            (usage.complete
+                && usage.unread == 0
+                && !usage.unread_more
+                && !owner.session_id.is_empty())
+            .then(|| Whole {
+                conversation: format!("claude {pgid} {}", owner.session_id),
+                tok_in: Some(usage.input_total()),
+                tok_out: Some(usage.output_total()),
+            })
+        }
+        Program::Codex => {
+            let codex = codex?;
+            let (tok_in, tok_out) = (codex.facts.tok_in, codex.facts.tok_out);
+            (!codex.thread.is_empty() && (tok_in.is_some() || tok_out.is_some())).then(|| Whole {
+                conversation: format!("codex {pgid} {}", codex.thread),
+                tok_in,
+                tok_out,
+            })
+        }
+        Program::Grok | Program::Kimi | Program::Agy | Program::Muse | Program::Generic => None,
+    }
+}
+
+/// The whole counters a row sends and since when they have counted their conversation unbroken
+/// (Unix ms; `None` where no epoch started: the clock unread when the conversation came).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Tokens {
+    tok_in: Option<u64>,
+    tok_out: Option<u64>,
+    since_ms: Option<u64>,
+}
+
+/// What a row reads, beside its session log, of when its agent last put something out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Evidence {
+    /// Claude Code's newest API-served row, Unix seconds
+    /// ([`aterm_agent::harness::session_usage::UsageFacts::served_at`]).
+    served_at: Option<i64>,
+    /// When the agent's newest text row was written, Unix ms ([`Excerpts::said_at_ms`]).
+    said_at_ms: Option<i64>,
+    /// When a feed last moved the screen, Unix ms (`0`: never).
+    screen_moved_ms: u64,
+}
+
+/// Whether `program`'s footer read carries the time of its newest API-served row
+/// ([`Evidence::served_at`]): Claude Code's alone.
+const fn footer_serves_usage(program: aterm_phase::Program) -> bool {
+    use aterm_phase::Program;
+    match program {
+        Program::Claude => true,
+        Program::Codex
+        | Program::Agy
+        | Program::Muse
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic => false,
+    }
+}
+
+/// A SESSION ROW'S TURN, STEP, OUTPUT AND TOKENS (`turn= turn_ms= turn_end_ms= step_ms= out_ms=
+/// out_src= tok_in= tok_out= tok_for_ms= turns= tools=`), every one `-` on a row that is no
+/// agent's and each `-` where it is unread, never `0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Progress {
+    turn: Option<bool>,
+    turn_ms: Option<u64>,
+    turn_end_ms: Option<u64>,
+    step_ms: Option<u64>,
+    out_ms: Option<u64>,
+    out_src: Option<&'static str>,
+    tok_in: Option<u64>,
+    tok_out: Option<u64>,
+    tok_for_ms: Option<u64>,
+    turns: Option<u32>,
+    tools: Option<u32>,
+}
+
+impl Progress {
+    /// A row no agent reads.
+    const NONE: Progress = Progress {
+        turn: None,
+        turn_ms: None,
+        turn_end_ms: None,
+        step_ms: None,
+        out_ms: None,
+        out_src: None,
+        tok_in: None,
+        tok_out: None,
+        tok_for_ms: None,
+        turns: None,
+        tools: None,
+    };
+
+    /// The row of an agent `reader` reads at `now` (Unix ms; `0`: the clock unread, and every age
+    /// with it). Its last output is its transcript's where its reader joins one (Claude Code's,
+    /// codex-alab's rollout) and it holds a time: the newest of the API's last served row, the
+    /// agent's newest text row and its newest step. A spinner keeps the screen moving, so the
+    /// screen's last move is the evidence only for a harness with no transcript, or one whose
+    /// transcript holds no time yet.
+    fn of(
+        reader: Option<aterm_phase::Program>,
+        logged: &Logged,
+        heard: Evidence,
+        tokens: Option<Tokens>,
+        now: u64,
+    ) -> Progress {
+        use aterm_phase::Program;
+        let Some(reader) = reader else {
+            return Progress::NONE;
+        };
+        let age = |at: Option<u64>| at.filter(|_| now > 0).map(|at| now.saturating_sub(at));
+        let transcript = match reader {
+            Program::Claude | Program::Codex => true,
+            Program::Agy | Program::Muse | Program::Grok | Program::Kimi | Program::Generic => {
+                false
+            }
+        };
+        let written = transcript
+            .then(|| {
+                [
+                    heard
+                        .served_at
+                        .and_then(|s| u64::try_from(s).ok()?.checked_mul(1000)),
+                    heard.said_at_ms.and_then(|ms| u64::try_from(ms).ok()),
+                    logged.step_at,
+                    logged.step_end_at,
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|&at| at > 0)
+                .max()
+            })
+            .flatten();
+        let out = written
+            .map(|at| (at, "transcript"))
+            .or_else(|| (heard.screen_moved_ms > 0).then_some((heard.screen_moved_ms, "screen")));
+        Progress {
+            turn: Some(logged.turn_open),
+            turn_ms: age(logged.turn_at),
+            turn_end_ms: age(logged.turn_end_at),
+            step_ms: age(logged.step_at),
+            out_ms: age(out.map(|(at, _)| at)),
+            out_src: out.map(|(_, src)| src),
+            tok_in: tokens.and_then(|t| t.tok_in),
+            tok_out: tokens.and_then(|t| t.tok_out),
+            tok_for_ms: age(tokens.and_then(|t| t.since_ms)),
+            turns: Some(logged.turns),
+            tools: logged.tools.filter(|_| transcript),
+        }
+    }
+
+    /// The row's fields, in wire order.
+    fn fields(&self) -> String {
+        let count = |n: Option<u32>| number_token(n.map(u64::from));
+        format!(
+            "turn={} turn_ms={} turn_end_ms={} step_ms={} out_ms={} out_src={} tok_in={} \
+             tok_out={} tok_for_ms={} turns={} tools={}",
+            match self.turn {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "-",
+            },
+            number_token(self.turn_ms),
+            number_token(self.turn_end_ms),
+            number_token(self.step_ms),
+            number_token(self.out_ms),
+            self.out_src.unwrap_or("-"),
+            number_token(self.tok_in),
+            number_token(self.tok_out),
+            number_token(self.tok_for_ms),
+            count(self.turns),
+            count(self.tools),
+        )
+    }
+}
+
 fn session_row(
     h: &SessionHandle,
     level: SurveyLevel,
     facts: Option<&aterm_agent::survey_facts::SwarmSurveyFacts>,
-    (now_us, now_unix_ms): (u64, u64),
+    (now_us, now_unix_ms, awake_s): (u64, u64, u64),
 ) -> Row {
     let (
         agent,
@@ -860,8 +1179,33 @@ fn session_row(
         build_wait,
         work,
         lineage,
+        logged,
+        tokens,
+        upgrade,
     ) = {
-        let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let mut timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let tools = timeline
+            .agent()
+            .reader
+            .and_then(|who| timeline.slog().run_tools(who));
+        let logged = Logged::of(timeline.slog().log().state(), tools);
+        let whole = whole_tokens(
+            timeline.agent().reader,
+            timeline.agent().program_pgid,
+            timeline
+                .claude_footer()
+                .and_then(|f| Some((f.usage.as_ref()?, f.owner.as_ref()?))),
+            timeline.codex_survey(),
+        );
+        let since = match &whole {
+            Some(whole) => timeline.token_epoch(&whole.conversation, true, now_unix_ms),
+            None => timeline.token_epoch("", false, now_unix_ms),
+        };
+        let tokens = whole.map(|whole| Tokens {
+            tok_in: whole.tok_in,
+            tok_out: whole.tok_out,
+            since_ms: since,
+        });
         let need = timeline.need();
         (
             timeline.agent().clone(),
@@ -895,9 +1239,13 @@ fn session_row(
                 .then(|| timeline.work().cloned())
                 .flatten(),
             timeline.slog().lineage().map(|id| id.as_str().to_owned()),
+            logged,
+            tokens,
+            // The harness upgrade word as `status` prints it, so a fleet read sees a held one.
+            timeline.upgrade_column(now_unix_ms / 1000, awake_s),
         )
     };
-    let (user_title, role, supervisor, attention) = {
+    let (user_title, role, supervisor, attention, pinned) = {
         let meta = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         let asked = ask.and_then(|key| {
             meta.attention_owners
@@ -908,6 +1256,7 @@ fn session_row(
             meta.role.clone(),
             meta.live_supervisor(now_us).map(str::to_owned),
             asked.map(str::to_owned).or_else(|| meta.attention.clone()),
+            crate::session_pin::field(&meta),
         )
     };
     let is_agent = agent.reader.is_some();
@@ -958,6 +1307,20 @@ fn session_row(
     let tapped = claude.and_then(|(pgid, started)| claude_tap(h.sid.as_str(), pgid, started?));
     let usage = Usage::of(gauges.ctx_pct, tapped.as_ref(), codex_facts);
     let excerpts = excerpts.or_else(|| codex.as_ref().map(CodexSurvey::excerpts));
+    let progress = Progress::of(
+        agent.reader,
+        &logged,
+        Evidence {
+            served_at: footer
+                .as_ref()
+                .and_then(|f| f.usage.as_ref()?.served_at)
+                .filter(|_| agent.reader.is_some_and(footer_serves_usage)),
+            said_at_ms: excerpts.as_ref().and_then(|e| e.excerpts.said_at_ms),
+            screen_moved_ms: h.ctx.screen_moves.moved_ms(),
+        },
+        tokens,
+        now_unix_ms,
+    );
     let engine = engine_read(h, level == SurveyLevel::Content && excerpts.is_none());
     let human = h.ctx.human_input.age_ms(now_us);
     let task_ms = task
@@ -996,10 +1359,10 @@ fn session_row(
          agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} \
          task_conclusion={} model={} \
          effort={} ctx_left_pct={} usage_5h_pct={} usage_7d_pct={} account={} auth={auth} \
-         token={token} detail={} \
+         token={token} upgrade={} detail={} \
          doing={} role={} supervisor={} \
          attention={attention} goal={goal} needs={needs} needs_by={needs_by} hold_by={hold_by} \
-         held_from={} typed_by={} typed_ms={} {request} {}",
+         held_from={} typed_by={} typed_ms={} {request} {} {} pinned={pinned}",
         h.local_id,
         h.sid.as_str(),
         h.state.as_str(),
@@ -1034,6 +1397,7 @@ fn session_row(
         number_token(usage.five_hour.map(u64::from)),
         number_token(usage.seven_day.map(u64::from)),
         word_token(account.as_deref()),
+        word_token(Some(upgrade.as_str())),
         word_token(engine.detail.as_deref()),
         word_token(doing),
         role_token(role.as_deref(), level),
@@ -1042,6 +1406,7 @@ fn session_row(
         role_token(typed_by.as_deref(), level),
         number_token(typed.map(|t| now_unix_ms.saturating_sub(t.at_unix_ms))),
         h.ctx.bells.wire(now_unix_ms),
+        progress.fields(),
     );
     if level == SurveyLevel::Content {
         let cwd = footer

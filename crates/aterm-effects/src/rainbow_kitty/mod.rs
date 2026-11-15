@@ -1140,6 +1140,7 @@ impl Engine {
             return;
         }
         let tail_start = self.unechoed_tail_start();
+        let erase_tail_start = self.erase_tail_start();
         let soft = if let Some((sw, key_at)) = self.soft_wrap.take() {
             let mut at_move = None;
             let mut i = 0;
@@ -1247,6 +1248,9 @@ impl Engine {
         }
         let mut held_cells: u16 = 0;
         let mut soft_held: u16 = 0;
+        // The erases replayed before the tick's first move, each at the caret the ones before it
+        // left: their echoes' retreats have not landed yet when each comes.
+        let mut erased_before: u16 = 0;
         let events = self.events.as_slice();
         let mut index = 0;
         while index < events.len() {
@@ -1263,7 +1267,37 @@ impl Engine {
                         self.ribbon.reflow_move(&ev, at, ctx, sw);
                     }
                     (_, _, _, Some((_, at_sweep))) if at_sweep == index => {}
-                    _ => self.ribbon.on_event(&ev, at, ctx),
+                    _ => match pre_move {
+                        // An erase before the tick's first move acts where the caret stood when it
+                        // came, as it does when its echo's retreat lands on a later tick: the
+                        // caret before the retreat, less a cell for each erase before it in the
+                        // tick, never past the frame's. On the frame's caret, already moved back,
+                        // it retracted the cell the caret retreats onto as well as the one it
+                        // leaves. A kill is not split from its retreat (the seam hands both in one
+                        // call), so it keeps the frame's caret.
+                        Some((first_move, Some(caret)))
+                            if index < first_move
+                                && matches!(ev, Event::Erase)
+                                && !same_tick_erase_as_was() =>
+                        {
+                            let col = caret.1.saturating_sub(erased_before);
+                            let col = if caret.0 == ctx.caret.0 {
+                                col.max(ctx.caret.1)
+                            } else {
+                                col
+                            };
+                            erased_before = erased_before.saturating_add(1);
+                            self.ribbon.on_event(
+                                &ev,
+                                at,
+                                &Ctx {
+                                    caret: (caret.0, col),
+                                    ..*ctx
+                                },
+                            );
+                        }
+                        _ => self.ribbon.on_event(&ev, at, ctx),
+                    },
                 }
                 if matches!(ev, Event::Sweep { .. })
                     && let Some((row, col)) = swept_space_cell(events, index)
@@ -1273,7 +1307,7 @@ impl Engine {
                 index += 1;
                 continue;
             };
-            if index >= tail_start {
+            if index >= tail_start || erase_tail_start.is_some_and(|from| index >= from) {
                 let cell = if self.caret_known {
                     Some((self.caret.0, self.caret.1.saturating_add(held_cells)))
                 } else {
@@ -1325,6 +1359,42 @@ impl Engine {
             }
         }
         0
+    }
+
+    /// Where the keys typed after this tick's first erase start, when every move after that erase
+    /// is an erase's retreat: those keys are no move's cause, so their echoes have not landed and
+    /// they are held as the unechoed tail's are ([`Self::unechoed_tail_start`]). A Backspace and a
+    /// key that follows it before either echo lands are the same events whether the erase's echo
+    /// shares the key's tick or lands on the next; split across ticks the key is in its tick's
+    /// unechoed tail, and so is it here, however many Backspaces share the tick. Replayed at the
+    /// caret before the retreat instead ([`Self::record_pre_move`]), the key laid a fresh cell on
+    /// the column the caret moved back onto, its attack starting from nothing: the light under the
+    /// new caret dropped to the page for a frame and came back, a flash pair on every such
+    /// Backspace. A kill ends the walk: the seam hands a kill and its retreat together, so they
+    /// never split, and the keys before it replay as they always have.
+    #[inline]
+    fn erase_tail_start(&self) -> Option<usize> {
+        if same_tick_erase_as_was() {
+            return None;
+        }
+        let events = self.events.as_slice();
+        let mut from = None;
+        let mut i = events.len();
+        while i > 0 {
+            i -= 1;
+            match events[i].0 {
+                Event::Erase => from = Some(i + 1),
+                Event::Move {
+                    from: was,
+                    to,
+                    licence: Licence::Typed,
+                    ..
+                } if was.0 == to.0 && to.1 < was.1 => {}
+                Event::Move { .. } | Event::Rewrite { .. } | Event::Kill { .. } => break,
+                _ => {}
+            }
+        }
+        from
     }
 
     #[inline]
@@ -3185,9 +3255,49 @@ const fn swept_space_cell(events: &[(Event, Instant)], index: usize) -> Option<(
     }
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static SAME_TICK_ERASE_AS_WAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`with_same_tick_erase_as_was`] holds on this thread: always `false` in a
+/// release build.
+#[inline]
+fn same_tick_erase_as_was() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        SAME_TICK_ERASE_AS_WAS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// A test's negative control: `f` run with a Backspace whose echo's retreat shares its tick
+/// replayed as it was: the erase on the frame's caret, already moved back, and the key noted with
+/// it laid at the caret before the retreat ([`Engine`]'s `erase_tail_start`), a fresh cell on the
+/// erased column. Debug and test builds only; the flag is this thread's and is put back as it was
+/// when `f` returns or panics.
+#[cfg(any(test, debug_assertions))]
+pub fn with_same_tick_erase_as_was<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            SAME_TICK_ERASE_AS_WAS.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(SAME_TICK_ERASE_AS_WAS.with(|c| c.replace(true)));
+    f()
+}
+
 #[cfg(test)]
 #[path = "mod_swept_space_tests.rs"]
 mod swept_space_tests;
+
+#[cfg(test)]
+#[path = "mod_erase_split_tests.rs"]
+mod erase_split_tests;
 
 #[inline]
 const fn sub_floor_hop(from: (u16, u16), to: (u16, u16), licence: Licence) -> bool {

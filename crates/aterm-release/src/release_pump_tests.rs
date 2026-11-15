@@ -381,12 +381,63 @@ fn a_verb_runs_in_the_clone_as_the_pumps_child_and_its_end_is_read() {
             repo.canonicalize().unwrap().display()
         )
     );
-    // A resume carries no declaration: the journal keeps its own.
+    // A resumed line whose journal holds no declaration is handed the pump's (0.200.0: a
+    // start refused at its first step, and an adoption inside a resume, both leave a journal
+    // with none, which `release --prepare` alone refuses "the cut must declare Linux").
+    let kept = host.release.join(JOURNAL_FILE);
+    let journal = |linux: crate::release::LinuxDecl| {
+        Journal {
+            version: "0.6.0".into(),
+            commit: "c".repeat(40),
+            linux,
+            ..Journal::default()
+        }
+        .save(&kept)
+        .unwrap();
+    };
+    journal(crate::release::LinuxDecl::default());
+    for (verb, spelled) in [
+        (
+            Verb::Prepare,
+            "release --prepare --mac-only --verbose pump=1",
+        ),
+        (
+            Verb::Fix("abc".into()),
+            "release --prepare --fix abc --mac-only --verbose pump=1",
+        ),
+        (Verb::Finish, "release --mac-only --verbose pump=1"),
+    ] {
+        let ran = host.run(&verb);
+        assert!(ran.last.starts_with(spelled), "{verb:?}: {}", ran.last);
+    }
+    // NEGATIVE CONTROL: a journal that holds a declaration keeps its own, and a flag, which
+    // would replace it, is not handed.
+    journal(crate::release::LinuxDecl {
+        artifacts: Some("/handoff".into()),
+        ..Default::default()
+    });
+    for (verb, spelled) in [
+        (Verb::Prepare, "release --prepare --verbose pump=1"),
+        (Verb::Finish, "release --verbose pump=1"),
+    ] {
+        let ran = host.run(&verb);
+        assert!(ran.last.starts_with(spelled), "{verb:?}: {}", ran.last);
+    }
+    // A start still carries the pump's own, whatever an older journal says.
     assert!(
-        host.run(&Verb::Prepare)
+        host.run(&Verb::Start("abc".into()))
             .last
-            .starts_with("release --prepare --verbose pump=1")
+            .starts_with("release --prepare --commit abc --mac-only --verbose pump=1")
     );
+    // With no declaration anywhere, a line that has none is not prepared at all: the run could
+    // only be refused, after its first step's checks.
+    journal(crate::release::LinuxDecl::default());
+    let mut bare = self::host(&repo, &[], "");
+    bare.exe = root.path().join("never-run");
+    let ran = bare.run(&Verb::Prepare);
+    assert_eq!(ran.code, 2);
+    assert!(ran.last.contains(pump::LINUX_KEY), "{}", ran.last);
+    std::fs::remove_file(&kept).unwrap();
 
     // With no declaration anywhere, a verb that starts a line is not run at all.
     let mut undeclared = self::host(&repo, &[], "");

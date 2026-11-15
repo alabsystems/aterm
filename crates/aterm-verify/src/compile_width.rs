@@ -306,7 +306,7 @@ pub(crate) fn claim(
         aterm_capacity::Rank::Ordinary
     };
     if spec.id == crate::plan::StageId::Tippy {
-        let need = book.need(
+        let (need, keyed_jobs) = book.need_keyed(
             spec,
             &<crate::memory::Key as crate::memory::StageKey>::of_stage(spec, ctx),
             jobs_for(ctx, spec.id),
@@ -337,6 +337,14 @@ pub(crate) fn claim(
                 }
             ),
             units: None,
+            basis: if lint.measured {
+                crate::admission_rows::Basis {
+                    word: crate::admission_rows::how_word(&need.how),
+                    keyed_jobs,
+                }
+            } else {
+                crate::admission_rows::Basis::word("cold")
+            },
         }));
     }
     if spec.id != crate::plan::StageId::TestCompile {
@@ -416,6 +424,7 @@ pub(crate) fn claim(
             },
         ),
         units,
+        basis: crate::admission_rows::Basis::word(if measured { "units" } else { "cold" }),
     }))
 }
 

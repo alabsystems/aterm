@@ -1754,12 +1754,11 @@ fn base_clt_recovers_after_a_killed_compile_without_planning_an_install() {
 
     let root = aterm_tempfile::tempdir().unwrap();
     let cc = root.path().join("cc");
-    std::fs::write(
+    aterm_tempfile::stand_in(
         &cc,
         "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nif [ ! -f \"$0.recovered\" ]; then\n  printf yes > \"$0.recovered\"\n  kill -KILL $$\nfi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n",
     )
     .unwrap();
-    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
     let host = CcHost {
         shim_dir: None,
         tmp_root: root.path().to_owned(),
@@ -1799,18 +1798,16 @@ fn base_clt_recovers_after_a_killed_compile_without_planning_an_install() {
 #[cfg(target_os = "macos")]
 #[test]
 fn base_clt_waits_out_a_first_compile_slower_than_a_status_read() {
-    use std::os::unix::fs::PermissionsExt as _;
     let root = aterm_tempfile::tempdir().unwrap();
     let cc = root.path().join("cc");
-    std::fs::write(
+    aterm_tempfile::stand_in(
         &cc,
-        format!(
+        &format!(
             "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo cc; exit 0; }}\n/bin/sleep {}\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n",
             atpkg::prereq::PROBE_TIMEOUT.as_secs() + 1
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
         super::base_clt_probe(Some(root.path().as_os_str())),
         atpkg::prereq::CcVerdict::Ready { driver: cc }
@@ -1821,7 +1818,6 @@ fn base_clt_waits_out_a_first_compile_slower_than_a_status_read() {
 #[test]
 fn base_clt_has_private_probe_space_despite_a_missing_project_tmpdir() {
     use atpkg::prereq::{CcHost, CcVerdict};
-    use std::os::unix::fs::PermissionsExt as _;
     const CHILD: &str = "ATERM_BASE_CLT_TEMP_CHILD";
     if let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) {
         let path = Some(root.as_os_str());
@@ -1840,8 +1836,7 @@ fn base_clt_has_private_probe_space_despite_a_missing_project_tmpdir() {
     }
     let root = aterm_tempfile::tempdir().unwrap();
     let cc = root.path().join("cc");
-    std::fs::write(&cc, "#!/bin/sh\n[ \"$1\" = --version ] && { echo cc; exit 0; }\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n").unwrap();
-    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    aterm_tempfile::stand_in(&cc, "#!/bin/sh\n[ \"$1\" = --version ] && { echo cc; exit 0; }\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n").unwrap();
     let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
     cmd.args([
         "--exact",
@@ -1878,11 +1873,13 @@ fn base_clt_checks_the_system_selection_despite_a_builds_developer_override() {
     std::fs::create_dir_all(&shim).unwrap();
     for (name, body) in [
         ("cc", "printf x > \"$2\"\n/bin/chmod +x \"$2\"\n".to_owned()),
-        ("xcrun", format!("printf '%s\\n' '{}'\n", clang.display())),
+        (
+            "xcrun",
+            "printf '%s\\n' \"${0%/shim/xcrun}/system developer/usr/bin/clang\"\n".to_owned(),
+        ),
     ] {
         let file = shim.join(name);
-        std::fs::write(&file, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        aterm_tempfile::stand_in(&file, &format!("#!/bin/sh\n{body}")).unwrap();
     }
     let host = CcHost {
         shim_dir: Some(shim.clone()),
@@ -1911,14 +1908,12 @@ fn base_clt_checks_the_system_selection_despite_a_builds_developer_override() {
 #[test]
 fn base_clt_checks_the_installed_sdk_without_a_builds_sdkroot_override() {
     use atpkg::prereq::{CcHost, CcVerdict};
-    use std::os::unix::fs::PermissionsExt as _;
     let root = aterm_tempfile::tempdir().unwrap();
     let cc = root.path().join("cc");
-    std::fs::write(
+    aterm_tempfile::stand_in(
         &cc,
         "#!/bin/sh\n[ \"$1\" = --version ] && { echo cc; exit 0; }\nif [ -n \"$SDKROOT\" ]; then echo 'build SDK unavailable' >&2; exit 1; fi\nif [ -n \"$MACOSX_DEPLOYMENT_TARGET\" ]; then echo 'build target unavailable' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n",
     ).unwrap();
-    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
     let host = CcHost {
         shim_dir: None,
         xcode_select_link: root.path().join("no-selection"),
@@ -2462,10 +2457,7 @@ fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
     let scratch = Scratch::new("unassigned-claude");
     let home = scratch.home();
     let config = home.join(".config/aterm");
-    let secrets = home.join(".secrets");
-    for dir in [&config, &secrets] {
-        aterm_types::fs_restricted::ensure_private_dir(dir).unwrap();
-    }
+    aterm_types::fs_restricted::ensure_private_dir(&config).unwrap();
     aterm_uds::atomic_file::write(
         &config.join("aterm.toml"),
         b"[fleet]\nmachine = 'm183'\n",
@@ -2496,9 +2488,8 @@ fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
         claude_tmp: None,
         claude_running: None,
     };
-    let sheet = secrets.join(accounts_sync::ACCOUNTS_CSV_FILE);
     let write_sheet = |contents: &str| {
-        aterm_uds::atomic_file::write(&sheet, contents.as_bytes(), 0o600).unwrap();
+        aterm_agent::vault_entry::put(&home, accounts_sync::ACCOUNTS_CSV_FILE, contents);
     };
     write_sheet(
         "email,computer,claude,Open AI\ncode@example.test,m183,0,1\nclaude@example.test,m22,1,0\n",
@@ -2686,17 +2677,15 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
 
     // Codex's pool syncs by default: the vault's Codex fleet listing a row of m16's with no
     // roster here is a change `aterm init` applies. CONTROL: one listing m9's alone is not.
-    let secrets = home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
     let codex_fleet = |machine: &str| {
-        std::fs::write(
-            secrets.join("ai-accounts-codex.toml"),
+        aterm_agent::vault_entry::put(
+            &home,
+            "ai-accounts-codex.toml",
             format!(
                 "[[account]]\nlabel = \"codex-{machine}\"\nemail = \"codex@example.com\"\n\
                  machines = [\"{machine}\"]\n"
             ),
-        )
-        .unwrap();
+        );
     };
     codex_fleet("m9");
     assert_eq!(
@@ -2796,22 +2785,21 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
     // conflicting rows nothing is said.
     let before = format!("{:?}", super::ai_accounts_rows_probe(&env));
     assert!(!before.contains("conflicting"), "{before}");
-    let sheet = secrets.join("ai-accounts.csv");
-    std::fs::write(
-        &sheet,
+    aterm_agent::vault_entry::put(
+        &home,
+        "ai-accounts.csv",
         "email,computer,kimi,notes
 new@example.com,m16,global,
 NEW@example.com,m22,global,
 ",
-    )
-    .unwrap();
+    );
     let said = format!("{:?}", super::ai_accounts_rows_probe(&env));
     assert!(
         said.contains("conflicting assignments (kimi rows 2, 3)")
             && !said.to_ascii_lowercase().contains("new@example.com"),
         "{said}"
     );
-    std::fs::remove_file(&sheet).unwrap();
+    aterm_agent::vault_entry::put(&home, "ai-accounts.csv", "");
     // `[harness] accounts = "off"` turns the accounts' sync off, so the item has nothing to
     // apply (its apply would refuse) where the line above read the pools it would sync.
     std::fs::write(

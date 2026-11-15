@@ -4,13 +4,13 @@
 //! Carries lost logins through Claude Code's `/login` dialog ([`super::turn_end`], [`aterm_phase::login`]).
 use std::time::{Duration, Instant};
 
-use aterm_phase::wall::WallKind;
+use alab_policy::vocab::WallKind;
 use aterm_phase::{LoginMethod, LoginPicker, LoginScreen, Program, PromptV2};
 
 use super::super::config::SupervisorConfig;
 use super::approval::{Choice, Decision};
-use super::guard::row_guard;
 use super::turn_end::{TurnEndAction, TurnEndReading, TurnEndState, WaitKind};
+use alab_policy::guard::row_guard;
 
 /// Rule ID the loop once selected the session's login method in `/login` under. It selects none
 /// now ([`pick_method`]: the pick opens the browser, which aterm never brings forward by itself);

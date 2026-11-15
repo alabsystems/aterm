@@ -203,7 +203,7 @@ impl LandingOs for ActiveEventLoop {
     }
 
     fn attach(&self, app: &mut App, wid: WindowId) -> bool {
-        app.headless || app.attach_os_window(self, wid)
+        app.headless || app.attach_foreground_os_window(self, wid)
     }
 }
 
@@ -1135,6 +1135,7 @@ fn run(job: TabSpawnJob, park_wait: Duration) {
                     cwd.as_deref(),
                     observe.as_ref(),
                     task.as_ref(),
+                    None,
                     None,
                 )
             })

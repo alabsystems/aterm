@@ -69,6 +69,138 @@ const SIZES: &[(usize, usize)] = &[
     (20, 8),
 ];
 
+#[test]
+fn rectangles_fill_exactly_the_clipped_half_open_region() {
+    for (w, h) in [(0, 0), (0, 3), (3, 0), (1, 1), (2, 3), (5, 4)] {
+        for x0 in [0, w / 2, w, w + 1] {
+            for x1 in [0, w / 2, w, w + 1] {
+                for y0 in [0, h / 2, h, h + 1] {
+                    for y1 in [0, h / 2, h, h + 1] {
+                        let mut canvas = Canvas::new(w, h);
+                        for (index, pixel) in canvas.buf.iter_mut().enumerate() {
+                            *pixel = (index % 251) as u8;
+                        }
+                        canvas.rect(x0, y0, x1, y1);
+                        for y in 0..h {
+                            for x in 0..w {
+                                let expected = if (x0..x1).contains(&x) && (y0..y1).contains(&y) {
+                                    255
+                                } else {
+                                    ((y * w + x) % 251) as u8
+                                };
+                                assert_eq!(
+                                    canvas.buf[y * w + x],
+                                    expected,
+                                    "canvas {w}x{h}, rect ({x0},{y0})..({x1},{y1}), pixel ({x},{y})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn double_line_pixels(w: usize, h: usize, canvas_w: usize, canvas_h: usize) -> Vec<u8> {
+    let metrics = Metrics::new(w, h);
+    let mut pixels = Vec::new();
+    for cp in 0x2550..=0x256C {
+        let mut canvas = Canvas::new(canvas_w, canvas_h);
+        for (index, pixel) in canvas.buf.iter_mut().enumerate() {
+            *pixel = ((index * 17 + cp as usize) % 251) as u8;
+        }
+        draw_double(&mut canvas, &metrics, cp);
+        pixels.extend_from_slice(&canvas.buf);
+    }
+    pixels
+}
+
+#[test]
+fn double_line_pixels_match_the_pre_dedup_oracle() {
+    // Captured from the ordered rect-call implementation at 705e51e0d5c1.
+    // Each digest covers all 29 glyphs over patterned, non-opaque backgrounds.
+    let cases: &[(usize, usize, u128, u128)] = &[
+        (
+            1,
+            1,
+            0x292633cda49a3287bb8af5e83af777ba,
+            0x292633cda49a3287bb8af5e83af777ba,
+        ),
+        (
+            2,
+            2,
+            0x8100ecf1661ef68a7541bf0ff771d276,
+            0x827c32b91b7e091fd0f7749073a69502,
+        ),
+        (
+            3,
+            7,
+            0x86efde2a9b74a1adab8865c378f454e6,
+            0x9e187aae30f2d36b00996bc2d69c19e5,
+        ),
+        (
+            7,
+            15,
+            0xca9ee8f5577421ff6a8b96648f965a95,
+            0xa9b3667b422fe8b490ac4ff481dcd265,
+        ),
+        (
+            8,
+            16,
+            0xed2550aef0572a3cf0a6c5268c07f05d,
+            0x164b8c1217cd38169c8516d8da790429,
+        ),
+        (
+            9,
+            19,
+            0x3c293423f7e00e51c14e3cc1f6bc28aa,
+            0xdb8436a778846fb983ed1945f72ed771,
+        ),
+        (
+            10,
+            20,
+            0x09e61df99b4ea279d918cd86dd77fc30,
+            0x83b23a09d9a296fd6a6e3bc2bde5afb4,
+        ),
+        (
+            11,
+            21,
+            0x05ed41c84b5e8cf116ad7cca0dc8ee4a,
+            0xe3c41cb3873d346fdc708e7937379526,
+        ),
+        (
+            12,
+            22,
+            0x88a03e6b5c2ae79cba0975eb624a6e35,
+            0x129a2e452079d126083dcaa6f6e43362,
+        ),
+        (
+            20,
+            8,
+            0xbba7de30b07a08ae94d994f40a9260a4,
+            0x98876f07bc82973920ae03e90ea9bbbb,
+        ),
+    ];
+    for &(w, h, full_hash, clipped_hash) in cases {
+        let mut full = double_line_pixels(w, h, w, h);
+        let clipped = double_line_pixels(w, h, w.saturating_sub(1).max(1), h / 2 + 1);
+        assert_eq!(aterm_hash::fnv1a_128(&full), full_hash, "full {w}x{h}");
+        assert_eq!(
+            aterm_hash::fnv1a_128(&clipped),
+            clipped_hash,
+            "clipped {w}x{h}"
+        );
+        let drawn = full.iter().position(|&pixel| pixel == 255).unwrap();
+        full[drawn] = 0;
+        assert_ne!(
+            aterm_hash::fnv1a_128(&full),
+            full_hash,
+            "the oracle must reject a missing painted pixel at {w}x{h}"
+        );
+    }
+}
+
 fn all_procedural_chars() -> impl Iterator<Item = char> {
     (0x2500u32..=0x259F)
         .chain(0x2800..=0x28FF)

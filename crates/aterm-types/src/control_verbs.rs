@@ -130,17 +130,14 @@ pub const REQUESTER_ACCOUNT_BYTES: usize = 64;
 /// keys at their longest fit with room to spare.
 pub const REQUESTER_LINE_MAX: usize = 256;
 
-/// Whether `s` has the shape aterm mints a session id in: `s-` and 20 lowercase hex digits. The
-/// same check as `aterm_session::is_minted_sid`, which this crate cannot reach; a test holds the
-/// two to one answer.
+/// Whether `s` is a session ID aterm minted, in either form: a tab ID
+/// ([`crate::tab_id::is_tab_id`], `t` and 10 Crockford base32 characters), or a legacy tab's `s-`
+/// and 20 lowercase hex digits ([`crate::tab_id::is_legacy`]), which a shell opened before the `t`
+/// form still holds until aterm restores or closes its tab. The same answer as
+/// `aterm_session::is_minted_sid`.
 #[must_use]
 pub fn is_minted_sid(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() == 22
-        && b.starts_with(b"s-")
-        && b[2..]
-            .iter()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+    crate::tab_id::is_tab_id(s) || crate::tab_id::is_legacy(s)
 }
 
 /// `raw` (a program, or a model as a footer shows it: `Opus 5.5`) as a requester names it: trimmed,
@@ -802,7 +799,7 @@ macro_rules! turn_submit_busy_reply {
         "ERR key delivery failed sink=busy"
     };
 }
-/// A guarded `turn`'s answer when its text is typed and the sink took none of its first Enter before the submit window ended: the text stands in the composer unsent. Never an `ERR busy…` head, which says nothing was written and gives an `id=` back. A re-press the sink takes none of answers no such thing: it stops the re-presses, and the verdict's `pressed=<n>` counts the Enters that went.
+/// A fenced `turn`'s answer (`submit=guarded:` or `if-human=`, whose submit key the turn writes under the terminal lock that judges it) when its text is typed and the sink took none of its first submit key before the submit window ended: the text stands in the composer unsent. Never an `ERR busy…` head, which says nothing was written and gives an `id=` back. A re-press the sink takes none of answers no such thing: it stops the re-presses, and the verdict's `pressed=<n>` counts the Enters that went.
 pub const TURN_SUBMIT_BUSY_REPLY: &str = turn_submit_busy_reply!();
 /// [`TURN_SUBMIT_BUSY_REPLY`] framed as the wire carries it.
 pub const TURN_SUBMIT_BUSY_LINE: &str = concat!(turn_submit_busy_reply!(), "\n");
@@ -1064,7 +1061,7 @@ const fn bytes_eq(a: &[u8], b: &[u8], len: usize) -> bool {
 }
 
 /// The budget for the short catalog's rows put together (every [`catalog_lines`] row, `\n`-terminated).
-pub const SHORT_CATALOG_MAX_BYTES: usize = 16 * 1024;
+pub const SHORT_CATALOG_MAX_BYTES: usize = 17 * 1024;
 
 /// The `subscribe` stream vocabulary: frame sources, then the two modifiers.
 pub const SUBSCRIBE_STREAMS: &[&str] = &[
@@ -1362,7 +1359,7 @@ pub const VERBS: &[VerbSpec] = &[
          `aterm fleet allow drive --from`, or under `--all` any member the issuer's book binds, \
          proved by its key, also runs, as Owner, `@<sid> \
          status|text|screen|result|turn|key|send` on a hosted session, `hold <sid> on|off`, \
-         `spawn agent=<claude|codex|agy|muse|grok>` with its task, `await task`, `board`, and \
+         `spawn agent=<claude|codex|agy|muse>` with its task, `await task`, `board`, and \
          `@<sid> close` on a worker it spawned, each as far as that Mac's fleet access admits \
          it (`aterm fleet access`: Read Only, the default, admits the reads; `write` also the \
          acts on a session already there; `full` also `spawn`); an act above it answers `ERR \
@@ -2553,7 +2550,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "harness policy | recovery | fact [told]: supervisor policy, account recovery, an act's fact",
+        "harness policy | recovery | fact [told] | probe repo: policy, recovery, a fact, the repository",
         "",
     )
     .page(&crate::verb_page::harness::PAGE)
@@ -2561,6 +2558,7 @@ pub const VERBS: &[VerbSpec] = &[
         form(Word("recovery")).owner_only(),
         form(Flag(&["told"])).op(Write).owner_only(),
         form(Word("fact")).owner_only(),
+        form(Word("probe")).owner_only(),
     ]),
     v(
         "resources", Read, Lines, Session,
@@ -2643,7 +2641,9 @@ pub const VERBS: &[VerbSpec] = &[
          then older detail, and last the session down to one line; a budget below that \
          one-line floor gets the floor, and `used=` says its size, over the budget. Confidence \
          suffixes: `!` exact, `+` strong, `~` heuristic, `?` claim. `since=` and `ep=` page as `log`'s do, and `base=<b>` (`status \
-         log_base=`) names the log the cursor is of, so another log's is reset. `brief all \
+         log_base=`) names the log the cursor is of, so another log's is reset. `brief prev` \
+         (`prev=<k>`: <k> logs back) is the brief of the log the tab kept before aterm last \
+         started it, from the journal, for the owner only (`help log closed`). `brief all \
          [budget=]` (Owner-only, default budget 1000) summarizes \
          all sessions (`OK <n> brief all sessions=<k> v=2 budget=<b> used=<u>`, \
          `more=sessions:<k>`).",
@@ -2668,6 +2668,29 @@ pub const VERBS: &[VerbSpec] = &[
          reply's `node=` names it). Never writes to a PTY or mutates \
          state (`by=ctl|harness|bridge|<sid>|-`). Rate-limited to 1/s burst 20 (`ERR busy \
          retry_ms=<ms>`), capped at 1/4 of the log ring.",
+    )
+    .input(Input::NONE),
+    v(
+        "pin",
+        Write,
+        Status,
+        Session,
+        "pin: list the session first in the fleet band",
+        "— takes no argument and replies `OK pinned=1`: its Mac's agents in the fleet band show \
+         the session first. A pin is a person's or a lead agent's mark: a worker the session \
+         spawns starts unpinned. Pinning a pinned session answers the same and changes nothing. \
+         The pin stays with the session across a restart and an update; `status` and the survey \
+         row say `pinned=0|1`. A fleet drive does not serve it: pin a session on the Mac it runs \
+         on.",
+    )
+    .input(Input::NONE),
+    v(
+        "unpin",
+        Write,
+        Status,
+        Session,
+        "unpin: lift the session's pin",
+        "— takes no argument and replies `OK pinned=0`, whether or not the session was pinned.",
     )
     .input(Input::NONE),
     v(
@@ -2864,6 +2887,19 @@ pub const VERBS: &[VerbSpec] = &[
     .forms(&[form(Word("name")).framing(Status)])
     .lane(Wait)
     .json(Json::Emits),
+    v(
+        "agent",
+        Write,
+        Lines,
+        Session,
+        "agent set [model=<id>] [effort=<level>]: submit a native session-only agent setting",
+        "Codex-alab only. Requires an idle session with the standard empty one-line native composer and refuses other programs. The reply records \
+         submission, not application; read survey model/effort or the agent's native acknowledgement. \
+         Changes select subsequent-turn defaults, not the current turn or an in-flight request.",
+    )
+    .forms(&[form(Args).owner_only()])
+    .input(Input::NONE)
+    .lane(Wait),
     v(
         "turn",
         Write,
@@ -3209,6 +3245,14 @@ pub const VERBS: &[VerbSpec] = &[
         "A kernel-authenticated completed quota wall may select a fresh pooled account through a sealed native restart. No caller paths, commands or credentials are accepted.",
     ).input(Input::NONE),
     v(
+        "codex-login-rotation",
+        Signal,
+        Status,
+        Session,
+        "native Codex move at a lost login",
+        "A kernel-authenticated login wall whose refresh token was refused as expired, settled and signed out on record, may move to another account already signed in here through a sealed native restart, under that account's own login file. Every other loss stays a stop for a person. No caller paths, commands or credentials are accepted, and nobody is signed in.",
+    ).input(Input::NONE),
+    v(
         "codex-accounts",
         Read,
         Status,
@@ -3462,6 +3506,8 @@ pub const VERBS: &[VerbSpec] = &[
          resolves; `wait=0` skips the hold. Errors: `ERR unsupported headless`, `ERR no-window`, \
          `ERR refused \
          <not-regular|too-large|invalid-utf8|symlink|file-provider|missing|bad-uri|unreadable>`, \
+         `ERR busy drafts (<why>)` (another aterm process is writing the file's draft: the \
+         window tried for about five seconds and opened nothing; run it again), \
          `ERR timeout ticket=<t>` (30 s).",
     )
     .lane(Wait)
@@ -3667,14 +3713,24 @@ pub const VERBS: &[VerbSpec] = &[
          kitty owns the frame appends `v2_quads= v2_halos= v2_stars= v2_meteors= v2_bridged= \
          ribbon_retired= ribbon_followed= ribbon_follow_missed=`. The standing row then appends \
          `word_icons=` (the word icons on glass, window px `x0,x1,y0,y1` joined by `;`, or \
-         `none`), `selection=front window= view= session=` for its actual current target, and \
+         `none`), `selection=front window= view= session=` for its actual current target, \
          `resting=true|false` (whether that window rests: untouched and showing no new output \
-         for `idle_rest_secs`, so it runs no blink and its deck draws still). \
+         for `idle_rest_secs`, so it runs no blink and its deck draws still), and \
+         `sight=visible|covered|off-glass` (where that window's frames can be seen: `visible`, \
+         some of it on screen; `covered`, fully covered, on another Space or on a sleeping \
+         display, drawing at most a frame every 5 s; `off-glass`, minimised or its app hidden, \
+         drawing none; a hidden window still draws a frame a capture, a recording or an \
+         assistive client waits on). \
          `trail light` prints one row, the front window's light latch as its last frame left \
          it and its light read now: `trail-light window= on= scheme_changed= fell= session= \
          fg= bg= raw= live= light= window_light= front_session= front_scheme_light=` \
          (`session= fg= bg= raw=` are `-` before the window's first frame). \
-         In `--headless`, ticks advance \
+         `trail warm` builds the trail's GPU pipeline states off the frame path, as a window \
+         does when its renderer starts (a `--headless` instance builds none until asked), and \
+         prints `trail-warm owed= frame_builds=`: the builds that warm has not handed over yet, \
+         and the states frames built on the frame thread because no warm had (each a shader \
+         compile on the frame path). It fills a cache and changes nothing a session shows; a \
+         state held or owed is not asked for again. In `--headless`, ticks advance \
          only when a capture (`image` or `video`) drives the clock, and row 0 has no sky band \
          above it (`v2_stars=0` on row 0). Read-only; typed text is never reported.",
     ),
@@ -3715,7 +3771,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "request claim|show|review|keep|reply …: name a request's folder, read one, or act on it",
+        "request claim|show|review|keep|reply|clean …: name a request's folder, read one, or act \
+         on it",
         "— a request is one thing another Mac or an agent here asked this Mac to do \
          (ATERM-KI-1109-3). `request claim path=<abs|~/…> [req=<id>]` records the folder as one \
          the request claims, which a later cleanup may delete once the request is reviewed, \
@@ -3749,9 +3806,29 @@ pub const VERBS: &[VerbSpec] = &[
          wherever it runs, a `kind=report` line `reply to request <id> from <host>: <text>`, and \
          records it (`OK replied req=<id> to=@<sid>[@<node>] <answer>`, or `ERR request reply: \
          <why>` with the reply recorded unsent). A note or reply is one visible line of at most \
-         200 characters with no double quote, and a note is not `-`. Review, keep and reply \
-         are a person's: this Mac's person through aterm's own window, an `aterm ctl` in no \
-         tab, or a shell tab a person opened where no agent runs and no control client typed; \
+         200 characters with no double quote, and a note is not `-`. `request clean <id> \
+         [stop=1]` cleans a concluded request up (a running one only with `stop=1`, which \
+         closes its tabs even with a command running): it writes the request's archive first \
+         (`<state>/requests/archive/<id>`: its records, each standing tab's last 2000 screen \
+         rows, a worker's result and brief, and a `manifest.tsv` of every file of each claimed \
+         folder it may delete, path, size and SHA-256, small text files kept whole), then closes \
+         its tabs, ends what their process trees still run (by identity, `SIGTERM` then \
+         `SIGKILL`), and deletes each claimed folder only where nothing keeps it: a folder born \
+         outside the request or contested, one a person worked in, one holding a repo with work \
+         no remote has or that could not be read, one a standing tab works in, one whose birth \
+         moved or reached through a link, one its manifest could not list whole, and one that \
+         changed after it was listed are kept and named (`gone … why=`); each is judged again \
+         immediately before its removal. Replies `OK cleaned req=<id> tabs=<n> deleted=<n> kept=<n> failed=<n> \
+         archive=<state-relative path>`, `OK cleaning req=<id>` while it runs past two minutes \
+         (`request show` follows it), `OK already req=<id>`, or `ERR request clean: req=<id> was \
+         not cleaned (why=busy|closer|store): …` with nothing deleted (a tab that did not close keeps \
+         every folder and what it runs); a cleanup a \
+         quit cut short reads `stage=cleaning` and a second `request clean` resumes it. A \
+         person's cleanup counts as their review; a kept request is never cleaned. `request \
+         show` then prints `clean`, an `archive` row per archive, `gone path= \
+         did=deleted|kept|failed why=` and `cleaned` rows. Review, keep, reply and clean are a person's: this Mac's person through aterm's own window, an `aterm ctl` in no \
+         tab whose line of parents launchd did not cut (a command backgrounded in a subshell \
+         that exited is refused), or a shell tab a person opened where no agent runs and no control client typed; \
          an agent's tab (its requester's included), a tab a request owns or `ctl spawn` \
          started, one an update carried over or under the remote hold, aterm's harness and a \
          fleet drive are refused. A drive reads `request show` of its own requests only, \
@@ -3760,6 +3837,7 @@ pub const VERBS: &[VerbSpec] = &[
     .forms(&[
         form(Word("show")).op(Read).framing(Lines),
         form(Word("reply")).lane(Wait),
+        form(Word("clean")).lane(Wait),
     ])
     .input(Input::NONE),
     v(
@@ -4331,10 +4409,11 @@ pub const VERBS: &[VerbSpec] = &[
          through `--host`), `carried` (an aterm update carried the session over, with no record \
          of who started or drove it), `held` (under the `origin=remote` hold), `driven` (a control \
          client other than aterm's own was admitted to type into it), `agent` (an agent runs in its process tree), \
-         else `allowed`. `aterm db emails --show-passwords`, `phones --show-numbers` and `--edit` \
-         show plaintext only on `allowed`. `fleet=yes` where another Mac is behind the question \
-         (the bridge or a fleet driver asked, or a fleet driver was admitted to type into that \
-         session): a sign-in started there opens nothing on this Mac's desk.",
+         else `allowed`. fleet_db's `aterm db … --show-passwords` and `dump <file>` show \
+         plaintext only on `allowed`; no view of the owner's tables shows a secret. \
+         `fleet=yes` where another Mac is behind the question (the bridge or a fleet driver \
+         asked, or a fleet driver was admitted to type into that session): a sign-in started \
+         there opens nothing on this Mac's desk.",
     ),
     va(
         "survey",
@@ -4360,19 +4439,19 @@ pub const VERBS: &[VerbSpec] = &[
          row per request, newest first by opening time, then id, at most `n=` (default 50, at \
          most 512) and those older than `before=` (a `next=` a page ended at; one this reader \
          sees no request by is refused): `request id= opened_ms= stage=<open|running|concluded|\
-         reviewed> out=<done|failed|abandoned|released|-> end_why= via=<fleet-shell|\
+         reviewed|cleaning|cleaned> out=<done|failed|abandoned|released|-> end_why= via=<fleet-shell|\
          fleet-worker|ctl-spawn> form= node= host= by= program= model= tabs= open_tabs= claims= \
          bytes=<n|->[+] reviewed_by= kept=0|1 why_src=<given|brief|goal|asked|none> why=`, \
          values percent-encoded, `-` for none (`why=` a fallback's text only to this Mac's \
          owner, `1` to a drive; `bytes=` the claimed folders' last measured size, `+` where a \
          read was cut short). `state=` filters by stage: `open`, `running`, `concluded` (any \
-         concluded request), `unreviewed` (concluded, not reviewed), `reviewed`, `kept`, or \
-         `all` (the default). `from=` names a requester: its whole node, its node head, its \
+         concluded request), `unreviewed` (concluded, not reviewed), `reviewed`, `cleaning` (a \
+         cleanup runs, or a quit cut one short), `cleaned`, `kept`, or `all` (the default). `from=` names a requester: its whole node, its node head, its \
          actor token (`fleet:<head>:<sid>`, a local tab's sid) or the sid it names. \
          `skipped=` counts journal rows no record could be read from, and `window_complete=0` \
          says the journal outgrew what one read takes, so older requests are missing. A \
          journal this Mac cannot read refuses the read rather than answer from an older one. \
-         `request show|review|keep|reply` read and act on one.",
+         `request show|review|keep|reply|clean` read and act on one.",
     )
     .json(Json::Emits),
     va(

@@ -541,6 +541,7 @@ fn proc(pid: u32, ppid: u32) -> Proc {
     Proc {
         pid,
         ppid,
+        start: 0,
         charged: 0,
         footprint: 0,
         written: 0,
@@ -601,7 +602,7 @@ fn hosted_cargo_uses_its_grant_without_replacing_launch_configuration() {
         .args(["--unverified", "build", "-j99"])
         .env("PROBE", "kept")
         .current_dir("/");
-    limit_command(&mut command, 3);
+    limit_command(&mut command, 3, None);
     assert!(command.get_args().eq(["--unverified", "build", "-j3"]));
     assert_eq!(command.get_current_dir(), Some(Path::new("/")));
     assert!(
@@ -1596,13 +1597,60 @@ fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
 /// the build's group (`setsid`) before it touches 256 MiB, so the tree's meter, which reads that
 /// group, never sees it. The kept peak is the build's own 256 MiB and more, never the earlier
 /// child's 512 MiB, so a wrong unit (KiB read as bytes, bytes as KiB) fails too.
+/// The front is a fresh run of this binary ([`standin_front_keeps_the_builds_own_peak`]), whose
+/// own peak it checks is under 256 MiB on Linux: there an exec folds the memory it replaces into
+/// the new program's peak, so the root also reads what the fork that launched it copied of its
+/// front, and this binary running every test at once can hold more than 512 MiB itself.
 /// NEGATIVE CONTROL (by hand: the floor read from the front's `RUSAGE_CHILDREN` and counted only
 /// where it rose while the build ran, as before): the earlier child's peak is already the
 /// front's most, no rise is seen, and the build keeps the meter's few MiB alone.
 #[cfg(unix)]
 #[test]
 fn a_builds_own_peak_is_its_floor_whatever_an_earlier_child_peaked() {
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
+    cmd.args([
+        "--exact",
+        "build_admit::tests::standin_front_keeps_the_builds_own_peak",
+        "--test-threads=1",
+        "--nocapture",
+    ])
+    .env(FRONT_STANDIN, "1");
+    let out = aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
+        .expect("the front's outcome within the hang detector");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && said.contains("KEPT ITS OWN PEAK"),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(unix)]
+const FRONT_STANDIN: &str = "ATPKG_BUILD_ADMIT_FRONT_STANDIN";
+
+/// This process's resident peak (`VmHWM`), in bytes: at least what a fork of it copies.
+#[cfg(target_os = "linux")]
+fn own_peak() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("this process's status");
+    let kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|value| value.trim().strip_suffix("kB"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .expect("VmHWM in KiB");
+    kib << 10
+}
+
+/// The front of [`a_builds_own_peak_is_its_floor_whatever_an_earlier_child_peaked`], with
+/// `FRONT_STANDIN` set: it says `KEPT ITS OWN PEAK` once the build kept its own. Run alone, it
+/// does nothing.
+#[cfg(unix)]
+#[test]
+fn standin_front_keeps_the_builds_own_peak() {
     const MIB: u64 = 1 << 20;
+    if std::env::var_os(FRONT_STANDIN).is_none() {
+        return;
+    }
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let m = machine();
     let s = seat(dir.path(), &m, std::process::id().wrapping_add(19));
@@ -1616,6 +1664,13 @@ fn a_builds_own_peak_is_its_floor_whatever_an_earlier_child_peaked() {
     let Admission::Claimed(held) = admit(&test_build(), dir.path(), &s, &mut |_| {}) else {
         panic!("expected a claim");
     };
+    // On Linux the fork that launches the root copies this front into the root's peak.
+    #[cfg(target_os = "linux")]
+    assert!(
+        own_peak() < 256 * MIB,
+        "the front's own peak, which a fork copies into the root's: {} MiB",
+        own_peak() / MIB
+    );
     let exe = std::env::current_exe().expect("test binary");
     let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
     cmd.args([
@@ -1644,6 +1699,7 @@ fn a_builds_own_peak_is_its_floor_whatever_an_earlier_child_peaked() {
         "never the earlier child's: {} MiB",
         kept / MIB
     );
+    println!("KEPT ITS OWN PEAK");
 }
 
 /// The descriptor that holds `path` open in this process, found by what it opens (`fstat`'s
@@ -2128,10 +2184,10 @@ fn a_root_reaped_already_reaps_to_its_status() {
     }
 }
 
-/// The stand-in of [`a_builds_own_peak_is_its_floor_whatever_an_earlier_child_peaked`]: with
-/// `TOUCH_STANDIN` set to `touch:<MiB>`, touch that many MiB and end; set to `away:<MiB>`, first
-/// leave its parent's group and session (`setsid`), so that a meter of that group never reads it.
-/// Run alone, it does nothing.
+/// The children of [`standin_front_keeps_the_builds_own_peak`]: with `TOUCH_STANDIN` set to
+/// `touch:<MiB>`, touch that many MiB and end; set to `away:<MiB>`, first leave its parent's
+/// group and session (`setsid`), so that a meter of that group never reads it. Run alone, it
+/// does nothing.
 #[cfg(unix)]
 #[test]
 fn standin_touches() {

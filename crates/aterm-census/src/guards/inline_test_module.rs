@@ -141,7 +141,7 @@ pub(crate) fn unread(tree: &Tree<'_>) -> Vec<Result<Unread, Unreadable>> {
     out
 }
 
-/// [`unread`] over the checkout at `root`, read with no memo run: what `verify census --fix`
+/// [`unread`] over the checkout at `root`: what `verify census --fix`
 /// moves.
 ///
 /// # Errors

@@ -149,8 +149,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let history_path = output.join(format!("{name}.history.json"));
         std::fs::write(&history_path, &history)?;
         let pool = aterm_capacity::Jobserver::new(&output.join(format!("{name}.jobs")), granted)?;
-        // Each runner's census memo binds its own code fingerprint. Warm it with the matching
-        // runner before every take; no source-check verdict is supplied to the timed child.
+        // Warm the source checks with the matching runner before every take; no source-check
+        // verdict is supplied to the timed child.
         prime_source_checks(
             driver,
             &root,

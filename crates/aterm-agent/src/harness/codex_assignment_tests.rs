@@ -8,7 +8,7 @@ fn zero_assignment_is_an_explicit_startup_mode_with_no_boundary() {
     // Signed-book data validation only; no observed peer, native permit or
     // admitted grant is fabricated by deserializing these fixture values.
     let caller = Caller {
-        sid: "s-startup-fixture".into(),
+        sid: "ttvpfjxtvre".into(),
         pid: 42,
         birth: 123,
     };

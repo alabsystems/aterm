@@ -1683,3 +1683,104 @@ fn derived_session_log_mail_link_proves_and_catches_each_law() {
     let s = after(&["TaskMail", "OpenPersonTurn"]);
     assert_eq!((s["lk"], s["th"], s["hm"]), (0, 1, 1));
 }
+
+#[test]
+fn closed_reopen_registered_spec_is_exhaustive_under_ty_and_catches_duplicate_custody() {
+    registered_episode_external_check(
+        aterm_models_native::closed_reopen_publication_model(),
+        6,
+        "OneShotCustody",
+    );
+}
+
+#[test]
+fn output_cadence_registered_spec_is_exhaustive_under_ty_and_catches_missing_enrollment() {
+    registered_episode_external_check(
+        aterm_models_session::output_cadence_frontier_model(),
+        1,
+        "HeldHasFrontier",
+    );
+}
+
+fn registered_episode_external_check(
+    authored: aterm_spec::derive::Model,
+    negative: i64,
+    law: &str,
+) {
+    let _domains = aterm_models::link_all();
+    let registered = aterm_spec::xref::model_configurations();
+    let configs = registered
+        .iter()
+        .find(|configs| configs[0].name == authored.name)
+        .expect("the authored episode must participate in the registry's full audit");
+    let model = &configs[0];
+    let name = model.name;
+    assert_eq!(model.to_tla(), authored.to_tla());
+    assert_eq!(model.to_cfg(), authored.to_cfg());
+    let Some(ty) = verify::find_ty() else {
+        eprintln!(
+            "{name}: registered input checked; external ty not requested, no external proof claimed"
+        );
+        return;
+    };
+    eprintln!("{}", verify::ty_evidence_header(&ty));
+    let scratch = aterm_tempfile::tempdir().expect("private model scratch");
+    // The full mutant audit belongs to non_vacuity.rs. One independent negative
+    // establishes this external checker path alongside its exhaustive default.
+    for (dial, law) in [(0, None), (negative, Some(law))] {
+        let checked = aterm_spec::interp::with_buggy(model, dial);
+        let directory = scratch.path().join(format!("dial-{dial}"));
+        std::fs::create_dir(&directory).unwrap();
+        let spec = directory.join(format!("{name}.tla"));
+        let cfg = directory.join(format!("{name}.cfg"));
+        let source = checked.to_tla();
+        let config = checked.to_cfg();
+        std::fs::write(&spec, &source).unwrap();
+        std::fs::write(&cfg, &config).unwrap();
+        eprintln!(
+            "--- {name} Buggy={dial} generated source ---
+{source}
+--- generated config ---
+{config}"
+        );
+        let out = verify::TyCommand::check(&ty, &spec, &cfg)
+            .arg("--strict-vacuity")
+            .output()
+            .expect("external ty must finish without a resource stop");
+        let evidence = format!(
+            "--- stdout ---
+{}
+--- stderr ---
+{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!(
+            "--- {name} Buggy={dial} exit {:?} ---
+{evidence}",
+            out.status.code()
+        );
+        match law {
+            None => {
+                assert!(
+                    out.status.success(),
+                    "default model must hold under external ty:
+{evidence}"
+                );
+                verify::assert_ty_saw_whole_space(
+                    &checked,
+                    &evidence,
+                    &format!("{name} external default"),
+                );
+            }
+            Some(law) => {
+                assert!(!out.status.success(), "external ty accepted mutant {dial}");
+                assert!(
+                    evidence.contains(law),
+                    "mutant {dial} must violate {law}, not fail for an unrelated reason:
+{evidence}"
+                );
+            }
+        }
+    }
+}

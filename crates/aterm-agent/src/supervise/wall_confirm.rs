@@ -3,8 +3,8 @@
 
 //! Transcript-backed confirmation of screen-detected Claude Code usage, context, and login walls.
 
+use alab_policy::vocab::{ApiCause, WallKind};
 use aterm_json::Value;
-use aterm_phase::{ApiCause, WallKind};
 
 use super::super::policy::turn_end::{Conversation, LeftAnswer, WaitedLimit, ended_under};
 use super::super::report::{Offscreen, parse_offscreen};
@@ -192,6 +192,38 @@ pub(super) fn served_since_notice(jsonl: &str, notice: &str) -> bool {
             served = false;
         } else if !synthetic {
             served = true;
+        }
+    }
+    served
+}
+
+/// WHEN THE API LAST ANSWERED THE AGENT WITH THE MODEL'S OWN REPLY, AT OR AFTER `since` (unix
+/// seconds): the stamp of the newest main-chain assistant row of `jsonl`, where that row is no API
+/// error's notice and no `<synthetic>` row and was written at or after `since`; `None` otherwise.
+/// Positive evidence the process's login served a turn then, read where no point reads it (a
+/// break of the agent's own background work), with `since` no earlier than the process's start: a
+/// reply before it is another process's, perhaps on another login, and one before the turn opened
+/// is no news of that turn. The stamp dates the evidence, so a strike recorded after the reply
+/// and before the break was read is no strike the reply speaks for.
+pub(super) fn served_since(jsonl: &str, since: i64) -> Option<i64> {
+    let mut served = None;
+    for line in jsonl.lines() {
+        let Ok(v) = crate::harness::transcript::conversation(line) else {
+            continue;
+        };
+        let flag = |key: &str| v.get(key).and_then(Value::as_bool) == Some(true);
+        if flag("isSidechain") || v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let synthetic = v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            == Some("<synthetic>");
+        if flag("isApiErrorMessage") {
+            served = None;
+        } else if !synthetic {
+            served = row_time(&v).filter(|at| *at >= since);
         }
     }
     served
@@ -445,6 +477,11 @@ pub(crate) const fn class(kind: WallKind) -> Class {
     }
 }
 
+/// The class Claude Code's `error` word names, where its text named none. Its
+/// `authentication_failed` is the word for any 401 or 403 it is answered with, Cloudflare's block
+/// page among them (2.1.323): that page's text is named first ([`aterm_phase::classify_wall`],
+/// [`aterm_phase::wall::edge_block`]: an API error), so the word reads a lost login only where the
+/// text names no wall of its own or names it by its status alone.
 fn error_class(error: &str) -> Option<Class> {
     match error {
         "authentication_failed" => Some(Class::Auth),
@@ -1165,7 +1202,7 @@ impl<C: Ctl> Session<'_, C> {
                 ended_under(
                     aterm_phase::since_limit(&screen.rows).as_ref(),
                     f.wall.kind,
-                    limit::ResetClock::of(f.wall.reset.as_deref()),
+                    limit::reset_clock(f.wall.reset.as_deref()),
                 )
             })
         {

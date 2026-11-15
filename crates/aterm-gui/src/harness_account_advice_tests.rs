@@ -136,6 +136,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
             .collect(),
         series: &series,
         renewals: &BTreeMap::new(),
+        lab: &BTreeMap::new(),
         mode: accounts::Mode::Wall,
         credits: false,
         now,

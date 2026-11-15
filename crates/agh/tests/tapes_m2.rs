@@ -122,7 +122,15 @@ fn provision_and_git_verbs_are_refused() {
     let t = common::tape_path(dir.path(), "t");
     let t_arg = arg(&t);
     for line in [
-        &["auth", "import", "dev2", "--from-gh", "--tier", "dev"][..],
+        &[
+            "auth",
+            "add",
+            "dev2",
+            "--file",
+            "/agh-tapes/dev2",
+            "--tier",
+            "dev",
+        ][..],
         &["auth", "git-credential", "get"][..],
         &["repo", "clone", APP, "d"][..],
         &["repo", "fetch-main", APP, "d"][..],
@@ -687,14 +695,9 @@ fn notify_is_taped_as_an_emit() {
     w.fake.assert_clean();
 }
 
-/// `token` written as the vault writes `slot`'s file, under `root`'s scratch home: 0600 in a
-/// 0700 `~/.secrets`.
+/// `token` published as `slot`'s vault entry in the store under `root`'s scratch home.
 fn vault_file(root: &Path, slot: agh::identity::vault::Slot, token: &str) {
-    let path = slot.path(&Dirs::under(root).home);
-    let dir = path.parent().expect("the vault directory");
-    std::fs::create_dir_all(dir.parent().expect("the home")).expect("the home");
-    let name = path.file_name().and_then(|n| n.to_str()).expect("a name");
-    common::write_token(dir, name, token);
+    common::vault_entry(&Dirs::under(root).home, slot.entry(), token);
 }
 
 #[test]
@@ -1123,17 +1126,17 @@ fn foreign_drafts_unproven_round_trips() {
 
 /// A profile that names a vault token file is told to re-add it with `--drafts`, or, where no
 /// lane reads agh.toml, to remove it (design §6.10); its replay, whose router is empty, gives
-/// the recording's step, read off the drafts fact.
+/// the recording's step, read off the drafts and token_file facts.
 #[test]
 fn a_vault_profiles_drafts_step_round_trips() {
     let w = world_with(
         "tapes-m2-drafts-vault",
-        &|config| config.replace("/tokens/dev.token\"", "/.secrets/gh_access_token\""),
+        &|config| config.replace("/tokens/dev.token\"", "/home/.secrets/gh_access_token\""),
         false,
     );
     let token = agh_fake::fine_grained_token("dev");
     w.fake.add_token(&token, "fixture-dev-bot");
-    common::write_token(&w.root.path().join(".secrets"), "gh_access_token", &token);
+    common::vault_entry(&Dirs::under(w.root.path()).home, "gh_access_token", &token);
     let t = w.tape("t");
     let recorded = w.live(&[
         "--record",
@@ -1163,61 +1166,13 @@ fn a_vault_profiles_drafts_step_round_trips() {
     // removal is the alternative for a file no lane reads, its names off the tape.
     let step = next(&recorded.stderr);
     assert!(
-        step.starts_with("agh auth add dev --file PATH ") && step.contains(" --drafts;"),
+        step.starts_with("agh auth add dev --file ")
+            && step.contains("/.secrets/gh_access_token --tier dev ")
+            && step.contains(" --drafts;"),
         "{step}"
     );
     assert!(step.contains("agh auth remove dev"), "{step}");
     round_trips(&w, &recorded, &t);
     let replayed = w.offline(&["--replay", arg(&t)]);
     assert_eq!(next(&replayed.stderr), next(&recorded.stderr));
-}
-
-#[test]
-fn foreign_an_env_profiles_git_run_round_trips() {
-    let w = world_with(
-        "tapes-m2-env-git",
-        &|config| {
-            config
-                .lines()
-                .map(|line| {
-                    if line.starts_with("token_file") && line.ends_with("/tokens/dev.token\"") {
-                        "env = \"AGH_TAPES_DEV\"".to_string()
-                    } else {
-                        line.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        },
-        false,
-    );
-    w.fake.set_tag(APP, "v1", MAIN_SHA);
-    let t = w.tape("t");
-    let mut args = vec!["--record", arg(&t)];
-    args.extend([
-        "ref",
-        "delete",
-        APP,
-        "refs/tags/v1",
-        "--expect",
-        MAIN_SHA,
-        "--confirm",
-        "refs/tags/v1",
-    ]);
-    let env = crate::git_runner::git_env().with("AGH_TAPES_DEV", &agh_fake::token("dev"));
-    let (ctx, captured) = common::ctx(w.root.path(), &w.fake, env);
-    let mut ctx = ctx.with_git_helper(common::helper());
-    let exit = run_cli(&mut ctx, &args);
-    let recorded = Ran {
-        exit,
-        stdout: captured.stdout(),
-        stderr: captured.stderr_text(),
-    };
-    assert_eq!(recorded.exit, 1, "{}", recorded.stderr);
-    assert!(
-        why(&recorded.stderr).contains("token file"),
-        "{}",
-        recorded.stderr
-    );
-    round_trips(&w, &recorded, &t);
 }

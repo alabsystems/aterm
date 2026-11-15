@@ -6,10 +6,10 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::footer::FooterFacts;
 use aterm_agent::harness::lights::Light;
 use aterm_agent::harness::permission_click::{Look, Wait};
-use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::RenderCell;
 use aterm_session::sink::SinkWriter;
 use aterm_window::event::{ElementState, MouseButton};

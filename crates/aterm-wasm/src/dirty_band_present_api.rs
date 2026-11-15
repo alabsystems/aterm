@@ -44,19 +44,17 @@ pub(crate) fn shift_rgba_band(rgba: &mut [u8], w: usize, y0: usize, y1: usize, f
     let band_h = y1 - y0;
     let mag = usize::try_from(frac_px.unsigned_abs()).unwrap_or(usize::MAX);
     let moved = band_h.saturating_sub(mag);
-    if frac_px > 0 {
-        for i in 0..moved {
-            let dst = y0 + i;
-            let src = dst + mag;
-            rgba.copy_within(src * stride..src * stride + stride, dst * stride);
-        }
-    } else {
-        for i in 0..moved {
-            let dst = y1 - 1 - i;
-            let src = dst - mag;
-            rgba.copy_within(src * stride..src * stride + stride, dst * stride);
-        }
+    if moved == 0 {
+        return;
     }
+    let (src, dst) = if frac_px > 0 {
+        (y0 + mag, y0)
+    } else {
+        (y0, y0 + mag)
+    };
+    // The whole band is contiguous; copy_within preserves the source under
+    // overlap in either direction and leaves the newly exposed strip intact.
+    rgba.copy_within(src * stride..(src + moved) * stride, dst * stride);
 }
 
 /// Full-frame expansion plus the single full band; also sizes the RGBA buffer.

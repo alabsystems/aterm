@@ -171,7 +171,7 @@ fn a_closed_or_dropped_session_is_no_longer_heard() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let (receiver, _peer) = written(scratch.path());
     let other = Arc::new(Session {
-        sid: SessionId::new("s-87654321"),
+        sid: SessionId::new("t0087654321"),
         ..session(&scratch.path().join("private/other.toml"))
     });
     let arms = Recorded::default();

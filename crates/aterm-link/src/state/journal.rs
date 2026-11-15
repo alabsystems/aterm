@@ -322,6 +322,8 @@ pub(crate) struct Index {
     pub(crate) reserved: BTreeMap<String, BTreeMap<u64, PublishPin>>,
     /// By sequence.
     pub(crate) in_flight: BTreeMap<u64, InFlight>,
+    /// The journal order of the current publications, independent of their dedup sequences.
+    pub(super) in_flight_order: Vec<u64>,
     /// The newest incarnation an attach of this build took ([`Frame::Attached`]); `None` in a
     /// journal no attach named.
     pub(crate) attached: Option<u64>,
@@ -332,6 +334,7 @@ impl Index {
     pub(crate) const EMPTY: Self = Self {
         reserved: BTreeMap::new(),
         in_flight: BTreeMap::new(),
+        in_flight_order: Vec::new(),
         attached: None,
     };
 
@@ -352,6 +355,14 @@ impl Index {
             .flat_map(|(sid, posts)| posts.iter().map(move |(id, pin)| (sid.as_str(), *id, pin)))
     }
 
+    /// Records in the order their current publications were first journaled. Updating a head,
+    /// log or retry timestamp keeps that order; a new identity at a reused key goes last.
+    pub(crate) fn in_publication_order(&self) -> impl Iterator<Item = (u64, &InFlight)> {
+        self.in_flight_order
+            .iter()
+            .map(|seq| (*seq, &self.in_flight[seq]))
+    }
+
     /// The index after `frame`.
     pub(crate) fn apply(&mut self, frame: Frame) {
         match frame {
@@ -367,10 +378,22 @@ impl Index {
                 }
             }
             Frame::InFlight(entry) => {
-                self.in_flight.insert(entry.pin.seq, entry);
+                let seq = entry.pin.seq;
+                let same = self.in_flight.get(&seq).is_some_and(|was| {
+                    match (&was.pin.identity, &entry.pin.identity) {
+                        (Some(was), Some(now)) => was == now,
+                        _ => was.subject == entry.subject && was.body == entry.body,
+                    }
+                });
+                if !same {
+                    self.in_flight_order.retain(|held| *held != seq);
+                    self.in_flight_order.push(seq);
+                }
+                self.in_flight.insert(seq, entry);
             }
             Frame::Landed(seq) | Frame::Dropped(seq) => {
                 self.in_flight.remove(&seq);
+                self.in_flight_order.retain(|held| *held != seq);
             }
             Frame::Attached(inc) => {
                 self.attached = Some(self.attached.map_or(inc, |was| was.max(inc)));
@@ -392,7 +415,9 @@ impl Index {
             id,
             pin: pin.clone(),
         });
-        let in_flight = self.in_flight.values().cloned().map(Frame::InFlight);
+        let in_flight = self
+            .in_publication_order()
+            .map(|(_, entry)| Frame::InFlight(entry.clone()));
         for frame in attached.into_iter().chain(reserved).chain(in_flight) {
             bytes.extend_from_slice(&encode(step, &frame)?);
             step += 1;

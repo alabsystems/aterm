@@ -40,7 +40,8 @@ impl ReleaseHalf {
 }
 
 /// Whether the canonical verifier invocation uses its ordinary waiting admission or the early
-/// AppKit gate's non-waiting admission. Admission changes observable execution and therefore the
+/// AppKit gate's `--admit now` admission (no resource wait; a bounded wait for another run's
+/// window claim). Admission changes observable execution and therefore the
 /// context of every proof made under it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admission {
@@ -344,9 +345,6 @@ fn declaration(check: Check) -> Declaration {
         Check::Lint => Declaration::Undeclared(
             "lint has no one whole-tree key; bounded workspace packages carry through their own compiler/dependency content receipts",
         ),
-        Check::Doc => Declaration::Undeclared(
-            "doc's compiler, dependency and build-script input closure is not declared",
-        ),
         Check::Census => Declaration::Undeclared(
             "census reads publication history and baselines outside the candidate tree",
         ),
@@ -358,6 +356,9 @@ fn declaration(check: Check) -> Declaration {
         ),
         Check::Spec => Declaration::Undeclared(
             "spec's executable, proof bundle and resolved ty/ay tools are not declared",
+        ),
+        Check::CandidateShim => Declaration::Undeclared(
+            "candidate-shim runs this machine's toolchain store and the atpkg this tree builds, whose compiler and dependency closure is not declared",
         ),
         _ => Declaration::Undeclared("the check has no bounded content declaration"),
     }

@@ -372,6 +372,7 @@ impl Walk {
         let lab = Lab {
             me: Some(test_machine("m16")),
             settled: true,
+            bound: Default::default(),
             accounts,
             aliases: BTreeMap::new(),
             mailboxes: BTreeMap::new(),

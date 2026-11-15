@@ -2233,17 +2233,6 @@ pub(crate) fn integration_rekey_waits(place: &str, sid: &str) -> Message {
     .key(&format!("{KEY_INTEGRATION_LOST}.{sid}"))
 }
 
-/// Builds the error message when a restored tab fails to start its shell.
-pub(crate) fn restored_tab_failed(error: &str) -> Message {
-    gesture_failure(
-        tags::SESSION,
-        Severity::Error,
-        "Couldn't restore a tab",
-        &format!("shell did not start: {error}"),
-        Then::step("Open the tab again"),
-    )
-}
-
 pub(crate) const KEY_FOLDER_NOT_FOUND: &str = "spawn.folder-not-found";
 
 pub(crate) const KEY_FOLDER_NOT_OPENED: &str = "spawn.folder-not-opened";
@@ -2613,7 +2602,7 @@ pub(crate) fn autopilot_set(
     set_by: Option<&str>,
 ) -> Message {
     use crate::autopilot::{AutopilotView, mode_words};
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let agent_off;
     let (title, what): (&str, &str) = match view {
         AutopilotView::Cruise => (
@@ -2731,7 +2720,7 @@ pub(crate) fn autopilot_timer_ended(
             );
             let then = match over {
                 FireOver::Work => {
-                    crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Land)
+                    crate::autopilot::mode_words(alab_policy::config::Autopilot::Land)
                         .record
                         .to_string()
                 }

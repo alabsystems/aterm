@@ -155,7 +155,11 @@ fn a_login_moved_off_the_limits_account_resumes_it_at_once_and_once() {
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = logged(&mut m, Some(ledger.clone()));
     let (r, a) = decide(&mut s, weekly_wall(), &opts);
-    assert_eq!(r.wall, Some(aterm_phase::WallKind::UsageWeekly), "{r:#?}");
+    assert_eq!(
+        r.wall,
+        Some(alab_policy::vocab::WallKind::UsageWeekly),
+        "{r:#?}"
+    );
     assert!(!r.login_moved);
     assert!(waits(&a), "the notice's reset first: {a:?}");
     let (r, a) = decide(&mut s, weekly_wall(), &opts);
@@ -369,7 +373,7 @@ fn a_replay_without_the_door_reads_no_account() {
     s.seed_login(Some(key("u-second")));
     assert!(!s.login_moved_at(
         opts.idle_host.as_ref(),
-        Some(aterm_phase::WallKind::UsageWeekly),
+        Some(alab_policy::vocab::WallKind::UsageWeekly),
         Program::Claude,
         super::super::wall_confirm::Check::Decide,
     ));

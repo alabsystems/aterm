@@ -61,6 +61,7 @@ fn line_of(kind: DriveKind) -> Option<String> {
         K::Post => Some(format!("@{W} post key=k kind=note -- hi")),
         K::MailSeen => Some(format!("@{W} inbox seen f1")),
         K::Turn => Some(format!("@{W} turn hi")),
+        K::Configure => Some(format!("@{W} agent set effort=ultra")),
         K::Key => Some(format!("@{W} key Enter")),
         K::Send => Some(format!("@{W} send hi")),
         K::Hold => Some(format!("hold {W} on")),

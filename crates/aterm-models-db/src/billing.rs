@@ -4,15 +4,18 @@
 use aterm_spec::derive::Model;
 
 /// Current account pins, current authenticated credentials and retained vault
-/// observations compose a request-count billing preparation. This models local
-/// observations, not unseen offline revocations or provider charging behavior.
+/// observations compose a request-count billing preparation. A file at an entry's
+/// old `~/.secrets` path changes nothing (`LocalEdit`, DESIGN-secrets §7): the
+/// preparation is bound to the vault's bytes (`file == 0`), never the file's. This
+/// models local observations, not unseen offline revocations or provider charging
+/// behavior.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn billing_model() -> Model {
     aterm_spec::ty_model! {
         DbBillingPreparation {
             const Buggy = 0;
-            var scenario = 0; var accepted = 0;
+            var scenario = 0; var accepted = 0; var file = 0;
             action Valid when (scenario == 0) {
                 scenario = 1; accepted = if Buggy == 10 {0} else {1};
             }
@@ -29,7 +32,7 @@ pub fn billing_model() -> Model {
                 scenario = 5; accepted = if Buggy == 4 {1} else {0};
             }
             action LocalEdit when (scenario == 0) {
-                scenario = 6; accepted = if Buggy == 5 {1} else {0};
+                scenario = 6; accepted = if Buggy == 5 {0} else {1}; file = if Buggy == 11 {1} else {0};
             }
             action Rollback when (scenario == 0) {
                 scenario = 7; accepted = if Buggy == 6 {1} else {0};
@@ -44,8 +47,10 @@ pub fn billing_model() -> Model {
                 scenario = 10; accepted = if Buggy == 9 {1} else {0};
             }
             invariant LocalProgress: 1 > scenario || scenario > 1 || accepted == 1;
+            invariant FileIgnored: 6 > scenario || scenario > 6 || accepted == 1;
+            invariant VaultBytes: file == 0;
             invariant UnrelatedProgress: 9 > scenario || scenario > 9 || accepted == 1;
-            invariant NoUnboundPreparation: scenario == 0 || scenario == 1 || scenario == 9 || accepted == 0;
+            invariant NoUnboundPreparation: scenario == 0 || scenario == 1 || scenario == 6 || scenario == 9 || accepted == 0;
         }
     }
 }

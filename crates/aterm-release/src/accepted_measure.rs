@@ -1,22 +1,28 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Explicit owner acceptance of a measured release defect, separate from a passing check.
+//! Explicit owner acceptance of a recorded release-check FAIL, separate from a passing check.
 
 use std::path::Path;
 
+use aterm_verify::checks::Check;
+
 use crate::ledger::GitCli;
 
-/// Record an explicit instruction to ship despite the measure FAIL in `report`: the journal's
-/// bundle's measure record, a FAIL under the current build-inputs seal read from `report`
-/// (its SHA-256 unchanged), is rewritten as accepted ([`crate::check_record::accept`]). The
-/// other checks are judged when the records are read: the release proceeds only once each of
-/// them has its own ok record ([`crate::check_record::checks`]).
+/// Record an explicit instruction to ship despite the FAIL of `check` in `report`: the journaled
+/// release's record of `check` (the bundle's for measure, the tree's for a check that reads no
+/// bundle), a FAIL under the current build-inputs seal read from `report` (its SHA-256
+/// unchanged), is rewritten as accepted ([`crate::check_record::accept`]). Only a check that
+/// runs the product's tests or measurements is accepted
+/// ([`crate::check_record::acceptable`]). The other checks are judged when the records are
+/// read: the release proceeds only once each of them has its own ok record or its own
+/// acceptance ([`crate::check_record::checks`]).
 ///
 /// # Errors
-/// Refuses a missing reason, journal or artifact, a changed executable, a report that is not the
-/// measure FAIL's log as it was, and any failure reading or writing the record.
-pub fn record(repo: &Path, report: &Path, reason: &str) -> Result<(), String> {
+/// Refuses a missing reason or journal, a check whose FAIL is never accepted, for measure a
+/// missing artifact or a changed executable, a report that is not the FAIL's log as it was, and
+/// any failure reading or writing the record.
+pub fn record(repo: &Path, check: Check, report: &Path, reason: &str) -> Result<(), String> {
     if reason.trim().is_empty() {
         return Err("owner acceptance requires its reason".into());
     }
@@ -25,23 +31,32 @@ pub fn record(repo: &Path, report: &Path, reason: &str) -> Result<(), String> {
         &crate::release::release_dir(&git)?.join(crate::release::JOURNAL_FILE),
     )?
     .ok_or("no release journal")?;
-    let artifact = journal.artifact.ok_or("no built release artifact")?;
+    let executable = if check == Check::Measure {
+        let artifact = journal
+            .artifact
+            .as_ref()
+            .ok_or("no built release artifact")?;
+        if crate::artifact::macho_sha256(&artifact.app)? != artifact.macho_sha256 {
+            return Err("the built executable changed since measurement".into());
+        }
+        Some(artifact.macho_sha256.clone())
+    } else {
+        None
+    };
     let report = std::fs::canonicalize(report).map_err(|e| e.to_string())?;
-    if crate::artifact::macho_sha256(&artifact.app)? != artifact.macho_sha256 {
-        return Err("the built executable changed since measurement".into());
-    }
     let report_sha256 = crate::artifact::file_sha256(&report)?;
     let at = crate::check_record::accept(
         &git,
         &journal.commit,
-        &artifact.macho_sha256,
+        (check, executable.as_deref()),
         &crate::build_inputs::current()?,
         (&report, &report_sha256),
         reason.trim(),
     )?;
     println!(
-        "OWNER ACCEPTED measure failure for {}: {}; report {} (not a passing verification; \
+        "OWNER ACCEPTED {} failure for {}: {}; report {} (not a passing verification; \
          record {})",
+        check.name(),
         journal.commit,
         reason.trim(),
         report.display(),

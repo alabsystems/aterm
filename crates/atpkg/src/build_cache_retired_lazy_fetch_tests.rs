@@ -6,11 +6,7 @@
 use super::super::Git;
 #[cfg(unix)]
 use super::super::GitProgram;
-#[cfg(unix)]
-use super::super::lazy_fetch::{Hermetic, guard};
 use super::{GitCli, for_git, git};
-#[cfg(unix)]
-use agh::git::lazy_fetch::NoLazyFetch;
 use std::path::{Path, PathBuf};
 
 /// A bare partial repository whose promisor, a local bare repository beside it, holds the one
@@ -135,49 +131,33 @@ fn cleanup_git_never_fetches_promised_objects() {
 }
 
 /// A stand-in for a git before 2.45 over `native`: `--no-lazy-fetch` refused as unknown (129),
-/// every other run written to `log` and handed to `native` after `prelude`.
+/// every other run handed to `native` after `prelude`.
 #[cfg(unix)]
-fn before_the_option(dir: &Path, name: &str, prelude: &str) -> (PathBuf, PathBuf) {
+fn before_the_option(dir: &Path, name: &str, prelude: &str) -> PathBuf {
     let path = dir.join(name);
-    let log = dir.join(format!("{name}.log"));
     aterm_tempfile::stand_in(
         &path,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nfor arg in \"$@\"; do\n  if [ \
-             \"$arg\" = --no-lazy-fetch ]; then\n    echo 'unknown option: --no-lazy-fetch' \
-             >&2\n    exit 129\n  fi\ndone\n{prelude}exec '{native}' \"$@\"\n",
-            log = log.display(),
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = --no-lazy-fetch ]; then\n    \
+             echo 'unknown option: --no-lazy-fetch' >&2\n    exit 129\n  fi\ndone\n{prelude}exec \
+             '{native}' \"$@\"\n",
             native = native().display(),
         ),
     )
     .expect("stand-in");
-    (path, log)
+    path
 }
 
 /// A git that refuses `--no-lazy-fetch` and obeys the variable is run with the variable alone,
-/// and its reads leave a promised object missing; it is asked once in the process, however many
-/// runs follow. NEGATIVE CONTROL: the same stand-in run with the option is refused as unknown,
-/// so a run carrying it, as every read did before, never reaches git's read.
+/// and its reads leave a promised object missing (atpkg's `git_lazy_fetch::guard` asks it once
+/// in the process: that module's tests). NEGATIVE CONTROL: the same stand-in run with the option is refused as unknown, so
+/// a run carrying it, as every read did before, never reaches git's read.
 #[cfg(unix)]
 #[test]
 fn a_git_before_the_option_runs_where_it_was_seen_to_obey_the_variable() {
     let dir = aterm_tempfile::tempdir().expect("stand-in folder");
-    let (older, log) = before_the_option(dir.path(), "older-git", "");
-    assert_eq!(
-        guard(&older),
-        Ok(NoLazyFetch::Variable),
-        "this host's git obeys the variable"
-    );
+    let older = before_the_option(dir.path(), "older-git", "");
     never_fetches(&GitProgram(&older));
-    let asked = std::fs::read_to_string(&log).expect("stand-in log");
-    assert_eq!(
-        asked
-            .lines()
-            .filter(|run| *run == "--no-lazy-fetch --version")
-            .count(),
-        1,
-        "asked once: {asked}"
-    );
     let refused = aterm_uds::spawnfd::command(&older)
         .args(["--no-lazy-fetch", "--version"])
         .output()
@@ -189,29 +169,6 @@ fn a_git_before_the_option_runs_where_it_was_seen_to_obey_the_variable() {
     );
 }
 
-/// A git replaced at the path an answer was asked of is asked again: a stand-in that obeys the
-/// variable answers [`NoLazyFetch::Variable`], and one that ignores it, put at the same path, is
-/// refused. NEGATIVE CONTROL: an answer remembered by the path alone gives the second git the
-/// first one's `Variable`, and its reads would run unguarded.
-#[cfg(unix)]
-#[test]
-fn a_git_replaced_at_its_path_is_asked_again() {
-    let dir = aterm_tempfile::tempdir().expect("stand-in folder");
-    let (git, _) = before_the_option(dir.path(), "replaced-git", "");
-    assert_eq!(guard(&git), Ok(NoLazyFetch::Variable), "the first git");
-    let next = dir.path().join("next");
-    std::fs::create_dir(&next).expect("next folder");
-    let (ignoring, _) = before_the_option(&next, "replaced-git", "unset GIT_NO_LAZY_FETCH\n");
-    std::fs::rename(&ignoring, &git).expect("replaced");
-    let answer = guard(&git);
-    assert!(
-        answer
-            .as_ref()
-            .is_err_and(|why| why.contains("nor obeys GIT_NO_LAZY_FETCH")),
-        "the replacement is asked again: {answer:?}"
-    );
-}
-
 /// A git that refuses `--no-lazy-fetch` and ignores the variable starts no retirement run: its
 /// reads are refused unrun, and the promised object stays missing. NEGATIVE CONTROL: that git,
 /// run directly under the variable, fetches the object, so the refusal rests on what its read
@@ -220,15 +177,17 @@ fn a_git_replaced_at_its_path_is_asked_again() {
 #[test]
 fn a_git_that_ignores_the_variable_runs_no_read() {
     let dir = aterm_tempfile::tempdir().expect("stand-in folder");
-    let (ignoring, _) = before_the_option(dir.path(), "ignoring-git", "unset GIT_NO_LAZY_FETCH\n");
-    assert_eq!(
-        NoLazyFetch::of(&Hermetic(&ignoring)),
-        Ok(None),
-        "its answer: it fetched"
-    );
+    let ignoring = before_the_option(dir.path(), "ignoring-git", "unset GIT_NO_LAZY_FETCH\n");
     let promised = Promised::new();
     let refused = GitProgram(&ignoring).run(&promised.partial, &promised.read());
     assert_eq!(refused.code, None, "{}", refused.err);
+    assert!(
+        refused
+            .err
+            .contains("neither takes --no-lazy-fetch (git 2.45 and later)"),
+        "refused by name: {}",
+        refused.err
+    );
     assert_eq!(promised.packs(), 0, "a refused read fetches nothing");
 
     let fetched = promised.unguarded(&ignoring, "1");

@@ -2,11 +2,12 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Vault adoption (design §6.10): with no agh.toml, the vault's two token files route as if
-//! provisioned, each login learned once from agh-fake's loopback GitHub. Every file is under a
-//! scratch root (its `home/.secrets` and `config/aterm/agh`), never the real ones.
+//! Vault adoption (design §6.10): with no agh.toml, the vault's two GitHub entries, read in place
+//! from the store, route as if provisioned, each login learned once from agh-fake's loopback
+//! GitHub. Every store and file is under a scratch root (its home's vault and
+//! `config/aterm/agh`), never the real ones.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use agh::cli::{Captured, Ctx};
 use agh::config::Dirs;
@@ -25,29 +26,19 @@ fn dirs(root: &Path) -> Dirs {
     Dirs::under(root)
 }
 
-/// `token` written as the vault writes `slot`'s file: 0600 in a 0700 `~/.secrets`.
-fn vault_file(root: &Path, slot: vault::Slot, token: &str) -> PathBuf {
-    let path = slot.path(&dirs(root).home);
-    let dir = path.parent().expect("the vault directory");
-    std::fs::create_dir_all(dir.parent().expect("the home")).expect("the home");
-    let name = path.file_name().and_then(|n| n.to_str()).expect("a name");
-    if dir.exists() {
-        aterm_uds::private_file::write_private(dir, name, format!("{token}\n").as_bytes())
-            .expect("the vault file");
-        path
-    } else {
-        common::write_token(dir, name, token)
-    }
+/// `token` published as `slot`'s vault entry in the scratch home's store.
+fn vault_entry(root: &Path, slot: vault::Slot, token: &str) {
+    common::vault_entry(&dirs(root).home, slot.entry(), token);
 }
 
-/// Both vault files, their tokens registered with `fake` as `DEV_LOGIN` and `RELEASE_LOGIN`.
+/// Both vault entries, their tokens registered with `fake` as `DEV_LOGIN` and `RELEASE_LOGIN`.
 fn both(root: &Path, fake: &FakeGithub) -> (String, String) {
     let dev = agh_fake::token("vault-dev");
     let release = agh_fake::token("vault-release");
     fake.add_token(&dev, DEV_LOGIN);
     fake.add_token(&release, RELEASE_LOGIN);
-    vault_file(root, vault::Slot::Dev, &dev);
-    vault_file(root, vault::Slot::Release, &release);
+    vault_entry(root, vault::Slot::Dev, &dev);
+    vault_entry(root, vault::Slot::Release, &release);
     (dev, release)
 }
 
@@ -139,10 +130,7 @@ fn a_first_call_adopts_both_tokens_learning_each_login_once() {
     assert_eq!(dev_row["login"], Value::from(DEV_LOGIN));
     assert_eq!(dev_row["tier"], Value::from("dev"));
     assert_eq!(dev_row["presence"], Value::from("present"));
-    assert_eq!(
-        dev_row["source"],
-        Value::from("file:~/.secrets/gh_access_token")
-    );
+    assert_eq!(dev_row["source"], Value::from("vault:gh_access_token"));
     assert_eq!(
         dev_row["fingerprint"],
         Value::from(identity::fingerprint(dev.as_bytes()))
@@ -263,14 +251,14 @@ fn a_rotation_to_the_same_login_relearns_and_refreshes_the_fingerprint() {
     let fake = FakeGithub::start();
     let first = agh_fake::fine_grained_token("rotate-first");
     fake.add_token(&first, DEV_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &first);
+    vault_entry(root.path(), vault::Slot::Dev, &first);
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     let gh = ctx.github().expect("the client");
     assert!(gh.drafts_vouched("dev"), "{}", captured.stderr_text());
 
     let second = agh_fake::fine_grained_token("rotate-second");
     fake.add_token(&second, DEV_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &second);
+    vault_entry(root.path(), vault::Slot::Dev, &second);
     fake.clear_seen();
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     assert_eq!(run(&mut ctx, &["whoami"]), 0, "{}", captured.stderr_text());
@@ -315,7 +303,7 @@ fn a_rotation_to_another_login_is_refused_until_forgotten() {
 
     let other = agh_fake::token("vault-other");
     fake.add_token(&other, "fixture-other");
-    vault_file(root.path(), vault::Slot::Dev, &other);
+    vault_entry(root.path(), vault::Slot::Dev, &other);
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     assert_eq!(run(&mut ctx, &["whoami"]), 1);
     let error = common::error_json(&captured.stderr_text());
@@ -503,7 +491,7 @@ fn a_taped_call_adopts_nothing() {
 fn a_token_github_refuses_is_not_adopted_and_is_asked_again() {
     let root = common::scratch("vault-401");
     let fake = FakeGithub::start();
-    vault_file(
+    vault_entry(
         root.path(),
         vault::Slot::Dev,
         &agh_fake::token("vault-unknown"),
@@ -560,78 +548,51 @@ fn a_401_for_an_adopted_token_names_its_one_path() {
     );
 }
 
+/// The files older builds wrote under `~/.secrets` are never read: a dev file holding another
+/// token, loose, routes nothing (the store's dev token is the one sent), and a release file
+/// whose entry the store does not hold adopts nothing (the negative control).
 #[test]
-fn a_loose_vault_file_is_reported_with_its_remedy_and_never_used() {
-    let root = common::scratch("vault-loose");
+fn an_old_builds_file_under_secrets_is_never_read() {
+    let root = common::scratch("vault-old-file");
     let fake = FakeGithub::start();
-    both(root.path(), &fake);
-    let dev = vault::Slot::Dev.path(&dirs(root.path()).home);
-    common::chmod(&dev, 0o644);
+    let dev = agh_fake::token("vault-dev");
+    let stale = agh_fake::token("vault-stale");
+    let release = agh_fake::token("vault-release");
+    fake.add_token(&dev, DEV_LOGIN);
+    fake.add_token(&stale, "fixture-stale");
+    fake.add_token(&release, RELEASE_LOGIN);
+    vault_entry(root.path(), vault::Slot::Dev, &dev);
+    let home = dirs(root.path()).home;
+    let secrets = vault::Slot::Dev.path(&home);
+    let folder = secrets.parent().expect("the folder");
+    std::fs::create_dir_all(folder).expect("the folder");
+    for (slot, token) in [(vault::Slot::Dev, &stale), (vault::Slot::Release, &release)] {
+        std::fs::write(slot.path(&home), format!("{token}\n")).expect("an old build's file");
+        common::chmod(&slot.path(&home), 0o644);
+    }
     fake.add_repo("fixture-dev/app", RepoSpec::public());
 
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
+    assert_eq!(run(&mut ctx, &["whoami"]), 0, "{}", captured.stderr_text());
+    let listed = rows(&captured);
+    let dev_row = row(&listed, "dev");
+    assert_eq!(dev_row["presence"], Value::from("present"));
+    assert_eq!(dev_row["login"], Value::from(DEV_LOGIN));
     assert_eq!(
-        run(&mut ctx, &["auth", "status"]),
-        4,
-        "{}",
-        captured.stderr_text()
-    );
-    let report = common::stdout_json(&captured);
-    assert_eq!(report["routing"], Value::from("vault"));
-    assert_eq!(report["present"], Value::from(false));
-    let profiles = report["profiles"].as_array().expect("profiles");
-    let dev_row = row(profiles, "dev");
-    assert_eq!(dev_row["presence"], Value::from("unusable"));
-    assert_eq!(dev_row["from"], Value::from("vault"));
-    let remedy = dev_row["remedy"].as_str().expect("a remedy");
-    assert!(
-        remedy.contains("chmod 600 ~/.secrets/gh_access_token"),
-        "{remedy}"
-    );
-    assert!(!remedy.contains("agh auth add"), "{remedy}");
-    assert_eq!(row(profiles, "release")["presence"], Value::from("present"));
-    assert_eq!(
-        common::error_json(&captured.stderr_text())["kind"],
-        Value::from("unauthenticated")
-    );
-
-    let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
-    assert_eq!(
-        run(&mut ctx, &["repo", "view", "fixture-dev/app"]),
-        0,
-        "{}",
-        captured.stderr_text()
+        dev_row["fingerprint"],
+        Value::from(identity::fingerprint(dev.as_bytes()))
     );
     assert!(
-        fake.seen()
+        listed
             .iter()
-            .all(|s| s.as_login.as_deref() != Some(DEV_LOGIN)),
-        "a loose token is never sent"
+            .all(|r| r["profile"] != Value::from("release")),
+        "a release file the store does not hold adopts nothing: {listed:?}"
     );
-    let stderr = captured.stderr_text();
-    let lines: Vec<&str> = stderr.lines().collect();
-    assert_eq!(lines.len(), 1, "one note for the loose token: {stderr}");
-    assert!(lines[0].starts_with("agh: note vault=dev why="), "{stderr}");
+    let logins: Vec<Option<String>> = fake.seen().iter().map(|s| s.as_login.clone()).collect();
     assert!(
-        lines[0].contains("next=\"chmod 600 ~/.secrets/gh_access_token"),
-        "{stderr}"
-    );
-
-    let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
-    assert_ne!(
-        run(&mut ctx, &["policy", "check"]),
-        0,
-        "a loose vault token is a fault, never ok"
-    );
-    let report = common::stdout_json(&captured);
-    assert_eq!(report["ok"], Value::from(false));
-    let faults = report["faults"].as_array().expect("faults");
-    assert!(
-        faults.iter().any(|f| f["rule"] == Value::from("file")
-            && f["what"]
-                .as_str()
-                .is_some_and(|w| w.contains("chmod 600 ~/.secrets/gh_access_token"))),
-        "{faults:?}"
+        !logins.contains(&Some("fixture-stale".to_string()))
+            && !logins.contains(&Some(RELEASE_LOGIN.to_string())),
+        "no token under ~/.secrets is sent: {logins:?}"
     );
 }
 
@@ -678,7 +639,7 @@ fn only_the_release_file_adopts_release_alone() {
     let fake = FakeGithub::start();
     let release = agh_fake::token("vault-release-only");
     fake.add_token(&release, RELEASE_LOGIN);
-    vault_file(root.path(), vault::Slot::Release, &release);
+    vault_entry(root.path(), vault::Slot::Release, &release);
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     assert_eq!(run(&mut ctx, &["whoami"]), 0, "{}", captured.stderr_text());
     let rows = rows(&captured);
@@ -719,7 +680,7 @@ fn only_the_dev_file_adopts_dev_alone() {
     let fake = FakeGithub::start();
     let dev = agh_fake::token("vault-dev-only");
     fake.add_token(&dev, DEV_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &dev);
+    vault_entry(root.path(), vault::Slot::Dev, &dev);
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     assert_eq!(run(&mut ctx, &["whoami"]), 0, "{}", captured.stderr_text());
     let rows = rows(&captured);
@@ -746,12 +707,12 @@ fn only_the_dev_file_adopts_dev_alone() {
     };
     let public = next("alabsystems/aterm");
     assert!(
-        public.contains(&vault::Slot::Release.pointer()),
-        "the public owner's writer is the vault's release file: {public}"
+        public.contains(vault::Slot::Release.entry()),
+        "the public owner's writer is the vault's release entry: {public}"
     );
     let other = next("fixture-ext/lib");
     assert!(
-        other.contains("fixture-ext") && !other.contains(&vault::Slot::Dev.pointer()),
+        other.contains("fixture-ext") && !other.contains(vault::Slot::Dev.entry()),
         "another owner's writer is a profile of its own, never a vault file: {other}"
     );
 }
@@ -792,10 +753,7 @@ fn policy_check_shows_the_adopted_rows_and_asks_github_nothing() {
     let adopted = after["adopted"].as_array().expect("adopted");
     assert_eq!(adopted[0]["state"], Value::from("adopted"));
     assert_eq!(adopted[0]["owner"], Value::from(DEV_LOGIN));
-    assert_eq!(
-        adopted[0]["token_file"],
-        Value::from("~/.secrets/gh_access_token")
-    );
+    assert_eq!(adopted[0]["entry"], Value::from("gh_access_token"));
     assert_eq!(adopted[1]["owner"], Value::from("alabsystems"));
     assert_eq!(adopted[1]["login"], Value::from(RELEASE_LOGIN));
     assert_eq!(adopted[1]["tier"], Value::from("release"));
@@ -810,10 +768,10 @@ fn auth_add_with_no_agh_toml_keeps_the_vault_joining_through_rotations() {
     let fake = FakeGithub::start();
     let first = agh_fake::fine_grained_token("seed-first");
     fake.add_token(&first, DEV_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &first);
+    vault_entry(root.path(), vault::Slot::Dev, &first);
     let release = agh_fake::token("seed-release");
     fake.add_token(&release, RELEASE_LOGIN);
-    vault_file(root.path(), vault::Slot::Release, &release);
+    vault_entry(root.path(), vault::Slot::Release, &release);
     let ext = agh_fake::token("vault-ext");
     fake.add_token(&ext, "fixture-ext-bot");
     let dirs = dirs(root.path());
@@ -871,7 +829,7 @@ fn auth_add_with_no_agh_toml_keeps_the_vault_joining_through_rotations() {
 
     let second = agh_fake::fine_grained_token("seed-second");
     fake.add_token(&second, DEV_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &second);
+    vault_entry(root.path(), vault::Slot::Dev, &second);
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     let gh = ctx.github().expect("the client");
     assert!(
@@ -891,7 +849,7 @@ fn auth_add_with_no_agh_toml_keeps_the_vault_joining_through_rotations() {
 
     let other = agh_fake::token("seed-other");
     fake.add_token(&other, "fixture-other");
-    vault_file(root.path(), vault::Slot::Dev, &other);
+    vault_entry(root.path(), vault::Slot::Dev, &other);
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     assert_eq!(run(&mut ctx, &["repo", "view", "fixture-dev/app"]), 1);
     let error = common::error_json(&captured.stderr_text());
@@ -927,8 +885,8 @@ fn two_vault_tokens_of_one_login_route_neither() {
     let release = agh_fake::token("one-login-release");
     fake.add_token(&dev, DEV_LOGIN);
     fake.add_token(&release, DEV_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &dev);
-    vault_file(root.path(), vault::Slot::Release, &release);
+    vault_entry(root.path(), vault::Slot::Dev, &dev);
+    vault_entry(root.path(), vault::Slot::Release, &release);
     fake.add_repo("fixture-ext/lib", RepoSpec::public());
     left_out_both(root.path(), &fake, "both speak as");
 
@@ -956,8 +914,8 @@ fn one_token_in_both_vault_files_routes_neither() {
     let fake = FakeGithub::start();
     let token = agh_fake::token("one-token");
     fake.add_token(&token, RELEASE_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &token);
-    vault_file(root.path(), vault::Slot::Release, &token);
+    vault_entry(root.path(), vault::Slot::Dev, &token);
+    vault_entry(root.path(), vault::Slot::Release, &token);
     fake.add_repo("fixture-ext/lib", RepoSpec::public());
     left_out_both(root.path(), &fake, "hold one token");
     assert_eq!(user_gets(&fake), 0, "no login is learned for it");
@@ -1064,7 +1022,7 @@ fn a_file_rotated_after_adoption_never_reroutes_the_call() {
     assert_eq!(captured.stderr_text(), "");
     let other = agh_fake::token("pinned-other");
     fake.add_token(&other, "fixture-other");
-    vault_file(root.path(), vault::Slot::Dev, &other);
+    vault_entry(root.path(), vault::Slot::Dev, &other);
     fake.clear_seen();
     let me = gh.users().me("dev").expect("GET /user as dev");
     assert_eq!(me.login, DEV_LOGIN);
@@ -1142,7 +1100,7 @@ fn auth_add_of_a_vault_profile_with_no_agh_toml_routes_alone() {
     assert!(
         error["why"]
             .as_str()
-            .is_some_and(|w| w.contains("~/.secrets/gh_access_token")),
+            .is_some_and(|w| w.contains("the vault entry gh_access_token")),
         "{error}"
     );
     assert!(fake.seen().is_empty(), "a refused add sends nothing");
@@ -1198,7 +1156,7 @@ fn auth_add_works_while_adoption_refuses() {
     assert_eq!(run(&mut ctx, &["whoami"]), 0, "{}", captured.stderr_text());
     let other = agh_fake::token("add-refused-other");
     fake.add_token(&other, "fixture-other");
-    vault_file(root.path(), vault::Slot::Dev, &other);
+    vault_entry(root.path(), vault::Slot::Dev, &other);
     let (mut ctx, _) = common::ctx(root.path(), &fake, common::env());
     assert_eq!(run(&mut ctx, &["whoami"]), 1, "adoption refuses");
 
@@ -1461,7 +1419,7 @@ fn the_release_token_in_the_dev_file_routes_neither() {
         &[(vault::Slot::Release, fingerprint.as_str(), RELEASE_LOGIN)],
     )
     .expect("the record");
-    vault_file(root.path(), vault::Slot::Dev, &release);
+    vault_entry(root.path(), vault::Slot::Dev, &release);
     crossed(root.path(), &fake, "dev", true);
     assert_eq!(user_gets(&fake), 0, "the crossed token is never sent");
 }
@@ -1480,7 +1438,7 @@ fn the_dev_token_in_the_release_file_routes_neither() {
         &[(vault::Slot::Dev, fingerprint.as_str(), DEV_LOGIN)],
     )
     .expect("the record");
-    vault_file(root.path(), vault::Slot::Release, &dev);
+    vault_entry(root.path(), vault::Slot::Release, &dev);
     crossed(root.path(), &fake, "release", true);
     assert_eq!(user_gets(&fake), 0, "the crossed token is never sent");
 }
@@ -1500,8 +1458,8 @@ fn a_dev_token_of_the_recorded_release_login_routes_neither_while_release_is_ref
     .expect("the record");
     let second = agh_fake::token("crossed-second-release");
     fake.add_token(&second, RELEASE_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &second);
-    vault_file(
+    vault_entry(root.path(), vault::Slot::Dev, &second);
+    vault_entry(
         root.path(),
         vault::Slot::Release,
         &agh_fake::token("crossed-refused"),
@@ -1524,7 +1482,7 @@ fn a_record_agh_cannot_parse_routes_neither_and_is_never_rewritten() {
     assert_eq!(run(&mut ctx, &["whoami"]), 0, "{}", captured.stderr_text());
     let other = agh_fake::token("damaged-other");
     fake.add_token(&other, "fixture-other");
-    vault_file(root.path(), vault::Slot::Dev, &other);
+    vault_entry(root.path(), vault::Slot::Dev, &other);
     let dirs = dirs(root.path());
     let damaged = "[dev\n";
     aterm_uds::private_file::write_private(&dirs.config, vault::RECORD_FILE, damaged.as_bytes())
@@ -1600,7 +1558,7 @@ fn a_record_agh_cannot_parse_routes_neither_and_is_never_rewritten() {
 fn a_malformed_vault_file_names_the_vaults_rewrite() {
     let root = common::scratch("vault-malformed");
     let fake = FakeGithub::start();
-    vault_file(root.path(), vault::Slot::Dev, "not a token at all");
+    vault_entry(root.path(), vault::Slot::Dev, "not a token at all");
     let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
     assert_eq!(run(&mut ctx, &["auth", "status"]), 4);
     let report = common::stdout_json(&captured);
@@ -1631,8 +1589,8 @@ fn an_agh_toml_naming_the_vault_files_comes_to_adoption_by_its_drafts_step() {
     let release = agh_fake::fine_grained_token("migrate-release");
     fake.add_token(&dev, DEV_LOGIN);
     fake.add_token(&release, RELEASE_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &dev);
-    vault_file(root.path(), vault::Slot::Release, &release);
+    vault_entry(root.path(), vault::Slot::Dev, &dev);
+    vault_entry(root.path(), vault::Slot::Release, &release);
     fake.add_repo(
         "fixture-dev/app",
         RepoSpec::private().pull(DEV_LOGIN).push(DEV_LOGIN),
@@ -1686,7 +1644,7 @@ fn an_agh_toml_naming_the_vault_files_comes_to_adoption_by_its_drafts_step() {
 
     let rotated = agh_fake::fine_grained_token("migrate-dev-2");
     fake.add_token(&rotated, DEV_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &rotated);
+    vault_entry(root.path(), vault::Slot::Dev, &rotated);
     let (code, captured) = drafts(root.path());
     assert_ne!(code, 0);
     let error = common::error_json(&captured.stderr_text());
@@ -1741,7 +1699,7 @@ fn an_agh_toml_naming_the_vault_files_comes_to_adoption_by_its_drafts_step() {
     );
     let again = agh_fake::fine_grained_token("migrate-dev-3");
     fake.add_token(&again, DEV_LOGIN);
-    vault_file(root.path(), vault::Slot::Dev, &again);
+    vault_entry(root.path(), vault::Slot::Dev, &again);
     let (code, captured) = drafts(root.path());
     assert_eq!(
         code,

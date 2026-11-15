@@ -7,7 +7,7 @@ fn session() -> Operation {
     Operation {
         id: "a".repeat(32),
         caller: slot::Caller {
-            sid: "s-wire-fixture".into(),
+            sid: "tjrefjxtvre".into(),
             pid: 123,
             birth: 456,
         },

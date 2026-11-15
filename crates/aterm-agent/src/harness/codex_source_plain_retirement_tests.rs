@@ -9,7 +9,7 @@ fn dedicated_cleanup_retires_only_exact_empty_or_unrelated_occurrence() {
     // no supported image, source admission or credential proof is fabricated.
     let process = Process::observe(std::process::id()).unwrap();
     let caller = slot::Caller {
-        sid: "s-plain-cleanup".into(),
+        sid: "tajnc1eanvp".into(),
         pid: process.pid,
         birth: process.birth,
     };

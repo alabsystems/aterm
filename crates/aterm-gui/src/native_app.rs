@@ -523,23 +523,70 @@ pub(crate) enum RecoveryCapability {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryRequest {
     Retry(RecoveryCapability),
-    OpenOriginal { uri: String },
+    OpenOriginal {
+        uri: String,
+    },
+    /// Open a document an Open-origin Recovery tab stands for again, through the same two-phase
+    /// admission the person's first open took ([`RecoveryOrigin::Open`]).
+    Reopen {
+        kind: AppKind,
+        uri: String,
+        reveal: Option<crate::app_documents::DocumentReveal>,
+        /// The first open was a directory listing's Enter, which follows the entry's links.
+        entry: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryOutcome {
-    Opened { message: String },
-    Denied { message: String },
-    Failed { message: String },
+    Opened {
+        message: String,
+    },
+    Denied {
+        message: String,
+    },
+    Failed {
+        message: String,
+    },
+    /// A [`RecoveryRequest::Reopen`] is admitting the file; the document takes this tab's place
+    /// when it opens, and the tab says why again when it does not.
+    Started {
+        message: String,
+    },
 }
 
-/// Read-only, capability-free presentation for an unavailable or corrupt restored leaf.
+/// What a Recovery tab stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryOrigin {
+    /// A restored leaf that could not be rebuilt.
+    Restore,
+    /// A document the person asked to open in this window that did not open. It carries no
+    /// attention mark: the person is looking at the window that asked.
+    Open {
+        /// The file as the page shows it: the path the person chose, or the URI's path.
+        path: String,
+        /// The URI the open asked for, when the tab's own (its capability's) is the canonical
+        /// one the open's read resolved: an open by either spelling finds this tab.
+        asked: Option<String>,
+        /// Where the open would have landed its caret, which Retry asks for again.
+        reveal: Option<crate::app_documents::DocumentReveal>,
+        /// The tab's URI is a directory listing's entry its open never resolved: Retry and Open
+        /// Original follow its links ([`RecoveryRequest::Reopen`]'s `entry`), and no restore
+        /// capture names it, since a plain open refuses a link.
+        entry: bool,
+    },
+}
+
+/// Read-only, capability-free presentation for an unavailable or corrupt restored leaf, or for
+/// a document open that failed ([`RecoveryOrigin`]).
 pub(crate) struct RecoveryApp {
     pub(crate) restore_tag: String,
     pub(crate) reason: String,
     pub(crate) metadata: String,
-    /// Structured authority retained from a validated restore descriptor.
+    /// Structured authority retained from a validated restore descriptor, or the URI a failed
+    /// open asked for; `None` disables Retry and Open Original.
     pub(crate) capability: Option<RecoveryCapability>,
+    pub(crate) origin: RecoveryOrigin,
 }
 
 pub(crate) enum NativeApp {
@@ -898,19 +945,32 @@ fn recovery_page_projection_at_scale(
     );
     recovery_push_wrapped(
         &mut all,
-        &format!("Restore type: {}", app.restore_tag),
+        &match &app.origin {
+            RecoveryOrigin::Restore => format!("Restore type: {}", app.restore_tag),
+            RecoveryOrigin::Open { path, .. } => format!("File: {path}"),
+        },
         RecoveryLineStyle::Secondary,
         text_width,
         scale,
     );
-    let capability = match &app.capability {
-        Some(RecoveryCapability::About) => "Retry reopens About aterm.",
-        Some(RecoveryCapability::SystemState) => "Retry reopens System State.",
-        Some(RecoveryCapability::Settings { .. }) => "Retry reopens this Settings page.",
-        Some(RecoveryCapability::Document { .. }) => {
+    let capability = match (&app.origin, &app.capability) {
+        (RecoveryOrigin::Open { .. }, Some(RecoveryCapability::Document { .. })) => {
+            "Retry opens it again; Open Original opens the file in the editor."
+        }
+        (RecoveryOrigin::Open { .. }, _) => {
+            "Its location could not be read, so it cannot be opened again from here."
+        }
+        (RecoveryOrigin::Restore, Some(RecoveryCapability::About)) => "Retry reopens About aterm.",
+        (RecoveryOrigin::Restore, Some(RecoveryCapability::SystemState)) => {
+            "Retry reopens System State."
+        }
+        (RecoveryOrigin::Restore, Some(RecoveryCapability::Settings { .. })) => {
+            "Retry reopens this Settings page."
+        }
+        (RecoveryOrigin::Restore, Some(RecoveryCapability::Document { .. })) => {
             "Retry reopens the document; Open Original opens the file in the editor."
         }
-        None => "This view cannot be reopened.",
+        (RecoveryOrigin::Restore, None) => "This view cannot be reopened.",
     };
     recovery_push_wrapped(
         &mut all,
@@ -1107,12 +1167,31 @@ impl NativeAppModel for RecoveryApp {
                 if view.pending.is_none()
                     && let Some(capability) = self.capability.clone()
                 {
-                    let operation = cx.recovery(RecoveryRequest::Retry(capability));
+                    let (request, notice) = match (&self.origin, capability) {
+                        (
+                            RecoveryOrigin::Open { reveal, entry, .. },
+                            RecoveryCapability::Document { kind, uri, .. },
+                        ) => (
+                            RecoveryRequest::Reopen {
+                                kind,
+                                uri,
+                                reveal: reveal.clone(),
+                                entry: *entry,
+                            },
+                            "Opening…",
+                        ),
+                        // A failed open stands for a document or for nothing
+                        // (`App::show_failed_open`), so every other capability is a restore's.
+                        (_, capability) => {
+                            (RecoveryRequest::Retry(capability), "Retrying restore…")
+                        }
+                    };
+                    let operation = cx.recovery(request);
                     view.pending = Some(RecoveryPending {
                         operation,
                         action: RecoveryPendingAction::Retry,
                     });
-                    view.notice = Some("Retrying restore…".to_string());
+                    view.notice = Some(notice.to_string());
                     view.common.presentation_revision =
                         view.common.presentation_revision.saturating_add(1);
                 }
@@ -1122,7 +1201,19 @@ impl NativeAppModel for RecoveryApp {
                 if view.pending.is_none()
                     && let Some(RecoveryCapability::Document { uri, .. }) = &self.capability
                 {
-                    let operation = cx.recovery(RecoveryRequest::OpenOriginal { uri: uri.clone() });
+                    let request = match &self.origin {
+                        RecoveryOrigin::Restore => {
+                            RecoveryRequest::OpenOriginal { uri: uri.clone() }
+                        }
+                        // Only the kind changes: an entry's link is followed as Retry follows it.
+                        RecoveryOrigin::Open { entry, .. } => RecoveryRequest::Reopen {
+                            kind: AppKind::Editor,
+                            uri: uri.clone(),
+                            reveal: None,
+                            entry: *entry,
+                        },
+                    };
+                    let operation = cx.recovery(request);
                     view.pending = Some(RecoveryPending {
                         operation,
                         action: RecoveryPendingAction::OpenOriginal,
@@ -1161,7 +1252,8 @@ impl NativeAppModel for RecoveryApp {
                 view.notice = Some(match outcome {
                     RecoveryOutcome::Opened { message }
                     | RecoveryOutcome::Denied { message }
-                    | RecoveryOutcome::Failed { message } => message,
+                    | RecoveryOutcome::Failed { message }
+                    | RecoveryOutcome::Started { message } => message,
                 });
                 view.common.presentation_revision =
                     view.common.presentation_revision.saturating_add(1);
@@ -1230,15 +1322,18 @@ impl NativeAppModel for RecoveryApp {
             .layout(Layout::default().width(Length::Fill).height(Length::Fill))
         };
 
+        let opening = matches!(self.origin, RecoveryOrigin::Open { .. });
         let retry = || {
             button(
                 "recovery/retry",
                 "Retry",
-                if self.capability.is_some() {
-                    "Retry: reopen this view".to_string()
-                } else {
-                    "Retry: this view cannot be reopened".to_string()
-                },
+                match (opening, self.capability.is_some()) {
+                    (false, true) => "Retry: reopen this view",
+                    (false, false) => "Retry: this view cannot be reopened",
+                    (true, true) => "Retry: open the file again",
+                    (true, false) => "Retry: the file's location could not be read",
+                }
+                .to_string(),
                 "recovery/retry".to_string(),
                 retry_enabled,
             )
@@ -1384,7 +1479,10 @@ impl NativeAppModel for RecoveryApp {
                 UiNode::new(
                     "recovery/title",
                     UiContent::Text(TextSpec {
-                        text: "This view needs recovery".to_string(),
+                        text: match self.opened_name() {
+                            Some(name) => format!("Couldn’t open {name}"),
+                            None => "This view needs recovery".to_string(),
+                        },
                         role: SemanticRole::Heading,
                         style: StyleRef::Hero,
                     }),
@@ -1425,11 +1523,17 @@ impl NativeAppModel for RecoveryApp {
         out.extend([
             Command {
                 id: ActionId::new("recovery/retry"),
-                title: if self.capability.is_some() {
-                    "Retry Restore".to_string()
-                } else {
-                    "Retry Restore — unavailable without a retained capability".to_string()
-                },
+                title: match (&self.origin, self.capability.is_some()) {
+                    (RecoveryOrigin::Restore, true) => "Retry Restore",
+                    (RecoveryOrigin::Restore, false) => {
+                        "Retry Restore — unavailable without a retained capability"
+                    }
+                    (RecoveryOrigin::Open { .. }, true) => "Retry Open",
+                    (RecoveryOrigin::Open { .. }, false) => {
+                        "Retry Open — unavailable without the file's location"
+                    }
+                }
+                .to_string(),
                 shortcut: None,
                 enabled: idle && self.capability.is_some(),
             },
@@ -1454,16 +1558,28 @@ impl NativeAppModel for RecoveryApp {
     }
 
     fn presentation(&self, view: &Self::ViewState) -> AppPresentation {
+        let (title, attention, tooltip) = match &self.origin {
+            RecoveryOrigin::Restore => (
+                "Recovery".to_string(),
+                true,
+                format!("{} · {}", self.restore_tag, self.reason),
+            ),
+            RecoveryOrigin::Open { path, .. } => (
+                self.opened_name().unwrap_or(path).to_string(),
+                false,
+                format!("Couldn’t open · {path}"),
+            ),
+        };
         AppPresentation {
-            title: "Recovery".to_string(),
+            title,
             icon: AppIcon::Recovery,
             indicators: AppIndicators {
-                attention: true,
+                attention,
                 busy: view.pending.is_some(),
                 ..AppIndicators::default()
             },
             closable: true,
-            tooltip: Some(format!("{} · {}", self.restore_tag, self.reason)),
+            tooltip: Some(tooltip),
         }
     }
 
@@ -1473,7 +1589,41 @@ impl NativeAppModel for RecoveryApp {
 }
 
 impl RecoveryApp {
+    /// The file name an Open-origin page and tab name (the whole path when it has none), or
+    /// `None` for a restored leaf.
+    pub(crate) fn opened_name(&self) -> Option<&str> {
+        let RecoveryOrigin::Open { path, .. } = &self.origin else {
+            return None;
+        };
+        Some(
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(path),
+        )
+    }
+
     fn diagnostics_text(&self) -> String {
+        if let RecoveryOrigin::Open { .. } = &self.origin {
+            // The open's kind, URI and full detail. A draft journal's failure says the drafts
+            // folder as `<drafts>` (`DocumentJournalStore::unrooted`), never its path.
+            let document = match &self.capability {
+                Some(RecoveryCapability::Document { kind, uri, .. }) => {
+                    format!("document-kind={}\noriginal={uri}", kind.as_str())
+                }
+                _ => "capability=none".to_string(),
+            };
+            return format!(
+                "aterm Recovery\norigin=open\nreason={}\n{document}\ndetail:\n{}",
+                self.reason,
+                if self.metadata.is_empty() {
+                    "(none)"
+                } else {
+                    &self.metadata
+                }
+            );
+        }
         let capability = match &self.capability {
             Some(RecoveryCapability::About) => "about".to_string(),
             Some(RecoveryCapability::SystemState) => "system-state".to_string(),
@@ -1585,6 +1735,11 @@ pub(crate) enum AppEvent {
     },
     /// The Settings ▸ Harness projection advanced; every Settings view repaints from the shared controller snapshot.
     HarnessChanged {
+        revision: u64,
+    },
+    /// The Settings ▸ This Mac projection advanced: a read landed or a write's outcome came back,
+    /// and each view's untouched fields follow the read.
+    MachineChanged {
         revision: u64,
     },
     DocumentChanged {
@@ -1882,7 +2037,7 @@ pub(crate) enum HarnessRequest {
     /// Write session `session`'s own Autopilot word (a press on its row's Cruise, Land or Off).
     Autopilot {
         session: u64,
-        word: aterm_agent::supervise::Autopilot,
+        word: alab_policy::config::Autopilot,
     },
     /// Look at the AI CLIs again, off the event loop, and republish (Settings ▸ Harness ▸ AI CLIs' Refresh, and the route's arrival).
     AiLook,
@@ -1897,6 +2052,41 @@ pub(crate) enum HarnessRequest {
     Show { session: u64 },
     /// A press on SESSIONS' `Every session` row.
     Every(crate::harness_screen::EveryPress),
+}
+
+/// What Settings ▸ This Mac asks of the host (`AppEffect::Machine`): a read on the window's name
+/// writer, or a write resolved there against the page read `rev` names
+/// (`docs/DESIGN-machine-names-2026-11-04.md` §5.6). Each write button's action carries the read
+/// it was drawn over, so a pointer's press made over a frame drawn before a newer read landed no
+/// longer matches the live tree and is dropped at dispatch; a keyboard press or a palette command
+/// names the read shown when it runs. The host refuses a write whose `rev` is not the read it
+/// holds. The writes are macOS's alone: only there does the page draw an editor that makes them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MachineRequest {
+    /// Read the name again, after every change queued before it (the page's Refresh, and the
+    /// route's arrival).
+    Read,
+    /// Save: what each field holds where the person typed into it (`None` for a field left
+    /// alone), judged as Rename This Mac… judges its fields.
+    #[cfg(target_os = "macos")]
+    Save {
+        rev: u64,
+        number: Option<String>,
+        nick: Option<String>,
+    },
+    /// New Random Name: a nickname drawn from the noun list, the number kept.
+    #[cfg(target_os = "macos")]
+    Random { rev: u64 },
+    /// Retry Sync: publish the saved number again without choosing it again.
+    #[cfg(target_os = "macos")]
+    Sync { rev: u64 },
+    /// Authorize Naming: the naming rule only, in a tab of its own.
+    #[cfg(target_os = "macos")]
+    Authorize { rev: u64 },
+    /// Undo Last Rename: take back the last change the read showed, judged as any rename, and
+    /// only that change (the writer refuses one that is no longer History's newest).
+    #[cfg(target_os = "macos")]
+    Undo { rev: u64 },
 }
 
 /// Settings ▸ Harness's TIMER press (`AppEffect::HarnessTimer`): session `session`'s timed Cruise.
@@ -2116,6 +2306,9 @@ pub(crate) enum AppEffect {
     Harness(HarnessRequest),
     /// Settings ▸ Harness's timer press ([`HarnessTimerRequest`]): performed by the host, answered by the republished projection.
     HarnessTimer(HarnessTimerRequest),
+    /// A Settings ▸ This Mac request ([`MachineRequest`]): performed on the window's name writer,
+    /// answered by the republished projection.
+    Machine(MachineRequest),
     /// Settings' theme picker asks the host for a [`ThemesRequest`]: a theme by catalog id, never a path (the `OpenConfigEditor` rule).
     Themes {
         request: ThemesRequest,
@@ -2359,6 +2552,22 @@ impl UpdateCx<'_> {
     /// Ask the host for a Settings ▸ Harness act ([`AppEffect::Harness`]).
     pub(crate) fn harness(&mut self, request: HarnessRequest) {
         self.effects.push(AppEffect::Harness(request));
+    }
+
+    /// Ask the host for a Settings ▸ This Mac read or write ([`AppEffect::Machine`]). One read
+    /// per update answers every reason for one in it: the route's own action and the view's
+    /// arrival at the route both ask.
+    pub(crate) fn machine(&mut self, request: MachineRequest) {
+        let read = request == MachineRequest::Read;
+        if read
+            && self
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, AppEffect::Machine(MachineRequest::Read)))
+        {
+            return;
+        }
+        self.effects.push(AppEffect::Machine(request));
     }
 
     /// Ask the host for a session's timed Cruise or its cancel ([`AppEffect::HarnessTimer`]).
@@ -2619,6 +2828,31 @@ impl NativeRuntime {
 
     pub(crate) fn app(&self, instance: AppInstanceId) -> Option<&NativeApp> {
         self.instances.get(&instance)
+    }
+
+    /// Change the Recovery app `instance` and its view `view` in place (a failed open's tab
+    /// saying why again, `App::show_failed_open`), then mark the view to recompile. Whether both
+    /// were Recovery's.
+    pub(crate) fn update_recovery(
+        &mut self,
+        instance: AppInstanceId,
+        view: ViewId,
+        update: impl FnOnce(&mut RecoveryApp, &mut RecoveryViewState),
+    ) -> bool {
+        let Some(NativeApp::Recovery(app)) = self.instances.get_mut(&instance) else {
+            return false;
+        };
+        let Some(state) = self.views.get_mut(&view) else {
+            return false;
+        };
+        let AppViewState::Recovery(recovery) = &mut *state else {
+            return false;
+        };
+        update(app, recovery);
+        state.touch();
+        let common = state.common_mut();
+        common.presentation_revision = common.presentation_revision.wrapping_add(1);
+        true
     }
 
     pub(crate) fn instance_by_kind(&self, kind: AppKind) -> Option<AppInstanceId> {
@@ -3050,6 +3284,24 @@ impl NativeRuntime {
             return false;
         };
         settings.replace_lab(lab, revision);
+        self.touch_settings_views();
+        true
+    }
+
+    /// Replace the process-global Settings ▸ This Mac projection (the machine name's analogue of
+    /// [`Self::replace_settings_lab`]).
+    pub(crate) fn replace_settings_machine(
+        &mut self,
+        machine: crate::native_settings::MachinePageState,
+        revision: u64,
+    ) -> bool {
+        let Some(settings) = self.instances.values_mut().find_map(|app| match app {
+            NativeApp::Settings(settings) => Some(settings),
+            _ => None,
+        }) else {
+            return false;
+        };
+        settings.replace_machine(machine, revision);
         self.touch_settings_views();
         true
     }

@@ -57,7 +57,7 @@ fn filter_metadata_does_not_admit_any_other_guarded_configuration() {
     for (key, class) in [
         ("remote.origin.uploadpack", "Remote"),
         ("remote.origin.proxy", "Remote"),
-        ("core.hookspath", "Core"),
+        ("hook.x.command", "Hook"),
         ("core.alternaterefscommand", "Core"),
         ("http.sslverify", "Http"),
         ("url.https://github.com/.insteadof", "Url"),
@@ -90,4 +90,30 @@ fn truncated_or_oversized_value_inventory_never_becomes_admission() {
     );
     let input = vec![b'x'; SCREEN_MAX + 1];
     assert_eq!(verdict(&input), json!({"TooLong":{"bytes":input.len()}}));
+}
+
+#[test]
+fn hook_directory_is_ignored_only_by_the_immutable_commit_projection() {
+    for key in ["core.hookspath", "core.hooksPath", "Core.HooksPath"] {
+        for value in ["/fixture/hooks with spaces", "", "../private-directory"] {
+            let input = format!("core.bare\ntrue\0{key}\n{value}\0");
+            assert_eq!(verdict(input.as_bytes()), json!({"Allowed":{"keys":2}}));
+            let names = format!("core.bare\0{key}\0");
+            for read_only in [false, true] {
+                assert_eq!(
+                    aterm_json::from_slice::<Value>(&project_config_names(
+                        names.as_bytes(),
+                        read_only
+                    ))
+                    .unwrap(),
+                    json!({"Refused":{"class":"Core"}})
+                );
+            }
+            let command = format!("{input}hook.x.command\nprivate-command\0");
+            assert_eq!(
+                verdict(command.as_bytes()),
+                json!({"Refused":{"class":"Hook"}})
+            );
+        }
+    }
 }

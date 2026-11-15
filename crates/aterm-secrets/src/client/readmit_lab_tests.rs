@@ -218,10 +218,7 @@ fn a_lab_vault_that_names_its_home_lan_lets_a_mac_on_it_in_by_its_proof() {
         Some(macs.signer.clone()),
         "the pinned signer"
     );
-    assert_eq!(
-        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
-        b"lab-v1"
-    );
+    assert_eq!(crate::client::stored(&fresh, "shared").unwrap(), b"lab-v1");
     assert!(records() > before, "m7 signed the Mac's Admit");
     macs.server.stop();
     drop(macs.root);

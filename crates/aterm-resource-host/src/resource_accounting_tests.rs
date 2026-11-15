@@ -53,3 +53,58 @@ fn original_owning_wait_preserves_success_failure_and_cancel_accounting() {
         assert_eq!(observed.scope, AccountingScope::ChildAndWaitedDescendantsV1);
     }
 }
+
+#[test]
+fn an_original_wait_preserves_tab_origin_and_final_split_without_a_monitor_sweep() {
+    for accounted in [false, true] {
+        let binding = aterm_types::resource_admission::Binding {
+            session: "tacde112200".into(),
+            attempt: [71; 16],
+        };
+        // The waited descendant spins long enough to show in Linux's descendant time, which
+        // `/proc/<pid>/stat` counts in whole clock ticks (10 ms at 100 Hz): a `/usr/bin/true`
+        // reads as none.
+        let mut child = spawnfd::command("/bin/sh")
+            .args([
+                "-c",
+                "/bin/sh -c 'i=0; while [ $i -lt 30000 ]; do i=$((i+1)); done'; /usr/bin/true",
+            ])
+            .spawn()
+            .unwrap();
+        crate::resource_observation::born(&binding, child.id());
+        let before = crate::resource_observation::native_observation_guard().next_cursor();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !child.exited().unwrap() {
+            assert!(Instant::now() < deadline, "original child never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before_wait = aterm_uds::process::continuous_ns().unwrap();
+        let (_, observed) = try_reap(&mut child, accounted).unwrap().unwrap();
+        let after_wait = aterm_uds::process::continuous_ns().unwrap();
+        let ledger = crate::resource_observation::native_observation_guard();
+        let terminal = ledger
+            .terminals_since(before)
+            .find(|t| t.process.pid == child.id())
+            .unwrap();
+        assert_eq!(terminal.session, binding.session);
+        assert!(
+            terminal
+                .exit_cut_ns
+                .is_some_and(|cut| cut >= before_wait && cut <= after_wait),
+            "the exit proof must carry the original owning wait's source cut"
+        );
+        assert!(
+            terminal.cpu_ns.is_some(),
+            "the original unreaped child's own time was not read"
+        );
+        assert!(
+            terminal.child_cpu_ns.is_some_and(|ns| ns > 0),
+            "the original child's waited descendant was not read"
+        );
+        assert_eq!(
+            terminal.wait_cpu_ns,
+            observed.cpu_times.map(|cpu| cpu.user_ns + cpu.system_ns)
+        );
+        assert!(terminal.wait_cpu_ns.unwrap() > 0);
+    }
+}

@@ -104,14 +104,14 @@ fn an_unusable_file_is_read_only_and_says_why() {
     for mode in [0o644, 0o620, 0o602] {
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
         let open = read(&state);
-        assert_eq!(open.level, FleetAccess::ReadOnly, "{mode:o}");
+        assert_eq!(open.level, FleetAccess::ReadOnly, "mode {mode:o}");
         assert!(
             matches!(open.unread, Some(Unread::NotPrivate(_))),
-            "{mode:o}: {open:?}"
+            "mode {mode:o}: {open:?}"
         );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read(&state).level, FleetAccess::Full, "control");
     }
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(read(&state).level, FleetAccess::Full, "control");
 
     let mut large = b"level=full\n".to_vec();
     large.resize(MAX + 1, b'\n');
@@ -252,13 +252,27 @@ fn a_raise_is_refused_while_a_writer_of_the_book_holds_its_lock() {
 #[test]
 fn a_fleet_started_worker_is_one_with_a_record() {
     let (_tmp, state) = scratch();
-    let sid = "s-00000000000000aa";
+    let sid = "t00000000aa";
     assert!(!fleet_started(&state, sid));
     let dir = state.join(aterm_types::fleet_access::DRIVE_WORKERS);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(sid), "node").unwrap();
     assert!(fleet_started(&state, sid));
-    assert!(!fleet_started(&state, "s-00000000000000ab"));
+    assert!(!fleet_started(&state, "t00000000ab"));
     assert!(!fleet_started(&state, "../fleet-access"), "no sid, no look");
     assert!(!fleet_started(&state, ""));
+    // A tab opened before the `t` form keeps its `s-` ID until it closes, and its record is read
+    // as one. NEGATIVE CONTROLS: a malformed ID of either form is no sid, though a record bears it.
+    let earlier = "s-0123456789abcdef00aa";
+    std::fs::write(dir.join(earlier), "node").unwrap();
+    assert!(fleet_started(&state, earlier));
+    for bad in [
+        "t00000000a",
+        "T00000000AA",
+        "s-00000000000000aa",
+        "s-0123456789ABCDEF00AA",
+    ] {
+        std::fs::write(dir.join(bad), "node").unwrap();
+        assert!(!fleet_started(&state, bad), "NEGATIVE CONTROL: {bad}");
+    }
 }

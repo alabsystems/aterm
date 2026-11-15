@@ -748,7 +748,7 @@ fn a_proven_self_claim_with_resume_limits_reads_a_usage_wall_as_note() {
             matches!(
                 facts.agent.as_ref().map(|a| &a.phase),
                 Some(presence::AgentPhase::Wall {
-                    kind: aterm_phase::WallKind::UsageSession,
+                    kind: alab_policy::vocab::WallKind::UsageSession,
                     ..
                 })
             ),
@@ -928,7 +928,7 @@ fn under_the_host_a_grok_limit_wall_is_nobodys_and_claudes_resumes() {
                 aterm_phase::prompt::fixtures::SESSION_LIMIT_THEN_LOCAL_COMMANDS_MEASURED,
             ),
             (
-                Some(aterm_phase::WallKind::UsageSession),
+                Some(alab_policy::vocab::WallKind::UsageSession),
                 presence::WallAnswer::Harness
             ),
             "Claude Code's usage wall under the host's claim resumes"
@@ -943,7 +943,7 @@ fn under_the_host_a_grok_limit_wall_is_nobodys_and_claudes_resumes() {
             matches!(
                 facts.agent.as_ref().map(|a| &a.phase),
                 Some(presence::AgentPhase::Wall {
-                    kind: aterm_phase::WallKind::UsageSession,
+                    kind: alab_policy::vocab::WallKind::UsageSession,
                     ..
                 })
             ),
@@ -966,17 +966,17 @@ fn under_the_host_a_grok_limit_wall_is_nobodys_and_claudes_resumes() {
         );
         let host = app.harness.take().expect("the host");
         for kind in [
-            aterm_phase::WallKind::UsageSession,
-            aterm_phase::WallKind::UsageWeekly,
-            aterm_phase::WallKind::Spend,
-            aterm_phase::WallKind::Overloaded,
-            aterm_phase::WallKind::Auth,
+            alab_policy::vocab::WallKind::UsageSession,
+            alab_policy::vocab::WallKind::UsageWeekly,
+            alab_policy::vocab::WallKind::Spend,
+            alab_policy::vocab::WallKind::Overloaded,
+            alab_policy::vocab::WallKind::Auth,
         ] {
             for (agent, expected) in [
                 (aterm_phase::Program::Grok, presence::WallAnswer::Nobody),
                 (
                     aterm_phase::Program::Kimi,
-                    if kind == aterm_phase::WallKind::Auth {
+                    if kind == alab_policy::vocab::WallKind::Auth {
                         presence::WallAnswer::Nobody
                     } else {
                         presence::WallAnswer::Harness
@@ -994,7 +994,7 @@ fn under_the_host_a_grok_limit_wall_is_nobodys_and_claudes_resumes() {
         assert_eq!(
             host.wall_answer(
                 aterm_phase::Program::Claude,
-                aterm_phase::WallKind::UsageWeekly,
+                alab_policy::vocab::WallKind::UsageWeekly,
                 true
             ),
             presence::WallAnswer::Harness
@@ -1002,7 +1002,7 @@ fn under_the_host_a_grok_limit_wall_is_nobodys_and_claudes_resumes() {
         assert_eq!(
             host.wall_answer(
                 aterm_phase::Program::Claude,
-                aterm_phase::WallKind::Auth,
+                alab_policy::vocab::WallKind::Auth,
                 false
             ),
             presence::WallAnswer::Harness,
@@ -1011,7 +1011,7 @@ fn under_the_host_a_grok_limit_wall_is_nobodys_and_claudes_resumes() {
         assert_eq!(
             host.wall_answer(
                 aterm_phase::Program::Agy,
-                aterm_phase::WallKind::Auth,
+                alab_policy::vocab::WallKind::Auth,
                 false
             ),
             presence::WallAnswer::Nobody,

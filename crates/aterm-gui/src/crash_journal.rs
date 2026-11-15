@@ -2588,6 +2588,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             log_ep: a_log_ep,
             land_at: a_land_at,
             autopilot_by: a_autopilot_by,
+            pinned: a_pinned,
             theme: a_theme,
             lost: a_lost,
             task: a_task,
@@ -2616,6 +2617,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             log_ep: b_log_ep,
             land_at: b_land_at,
             autopilot_by: b_autopilot_by,
+            pinned: b_pinned,
             theme: b_theme,
             lost: b_lost,
             task: b_task,
@@ -2643,6 +2645,7 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             && a_log_ep == b_log_ep
             && a_land_at == b_land_at
             && a_autopilot_by == b_autopilot_by
+            && a_pinned == b_pinned
             && a_theme == b_theme
             && a_lost == b_lost
     }

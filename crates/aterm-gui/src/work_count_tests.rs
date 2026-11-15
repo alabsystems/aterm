@@ -144,11 +144,123 @@ fn a_rate_limited_status_sweep_probes_no_session() {
     );
 }
 
-/// In the steady state the title-drift gate is decided by the labeling window's epoch cache and walks no tab.
+fn take_title_focus_visits(app: &App) -> usize {
+    app.windows
+        .values()
+        .map(|window| window.tab_set.take_focused_view_visits_for_test())
+        .sum()
+}
+
+fn title_workspace(tabs: usize) -> (App, [WindowId; 2]) {
+    let mut app = workspace(tabs, 1);
+    let unrelated = std::array::from_fn(|_| {
+        app.frontmost_window = Some(WindowId(0));
+        let session = app.next_session_id;
+        app.push_stub_tab(WindowId(0), stub_session(session));
+        let other = app.detach_active_tab_logical().expect("unrelated window");
+        for _ in 1..30 {
+            let session = app.next_session_id;
+            app.push_stub_tab(other, stub_session(session));
+        }
+        assert_eq!(app.windows[&other].tab_set.len(), 30);
+        other
+    });
+    app.frontmost_window = Some(WindowId(0));
+    app.sync_active_session();
+    assert_eq!(app.windows[&WindowId(0)].tab_set.len(), tabs);
+    assert!(app.structural_invariants_ok());
+    (app, unrelated)
+}
+
+type TitleSnapshot = Vec<(
+    tab_model::TabId,
+    tab_model::TabPresentation,
+    Option<(Option<u64>, String)>,
+)>;
+
+fn title_snapshot(app: &App, wid: WindowId) -> TitleSnapshot {
+    let window = &app.windows[&wid];
+    window
+        .tab_set
+        .tabs()
+        .iter()
+        .map(|tab| {
+            (
+                tab.id,
+                tab.presentation.clone(),
+                window.tab_chrome_titles_by_tab.get(&tab.id).cloned(),
+            )
+        })
+        .collect()
+}
+
+fn assert_unrelated_titles_untouched(
+    app: &App,
+    unrelated: [WindowId; 2],
+    before: &[TitleSnapshot; 2],
+) {
+    for (wid, titles) in unrelated.into_iter().zip(before) {
+        assert_eq!(
+            app.windows[&wid]
+                .tab_set
+                .take_focused_view_visits_for_test(),
+            0,
+            "unrelated window {wid:?} must not walk its 30 tabs"
+        );
+        assert_eq!(&title_snapshot(app, wid), titles);
+    }
+}
+
+fn report_title(app: &mut App, session: u64, title: &str, now: &mut Instant) {
+    app.pool
+        .get(session)
+        .expect("live terminal")
+        .term
+        .lock()
+        .unwrap()
+        .process(format!("\x1b]2;{title}\x07").as_bytes());
+    *now += DRIFT_REFRESH_MIN_INTERVAL + Duration::from_millis(1);
+    app.observe_title_drift(session, *now);
+}
+
+fn assert_published_title(
+    app: &App,
+    wid: WindowId,
+    tab: tab_model::TabId,
+    session: Option<u64>,
+    title: &str,
+) {
+    assert_eq!(
+        app.windows[&wid].tab_chrome_titles_by_tab.get(&tab),
+        Some(&(session, title.to_string())),
+        "read the last published strip label without refreshing it"
+    );
+}
+
+fn assert_title_caches_warmed(app: &App) {
+    for (wid, window) in &app.windows {
+        assert_eq!(
+            window.tab_set.take_focused_view_visits_for_test(),
+            window.tab_set.len(),
+            "cold control: window {wid:?} builds its membership once"
+        );
+    }
+}
+
+fn assert_steady_title_gate(app: &mut App, session: u64, now: &mut Instant) {
+    let _ = take_title_focus_visits(app);
+    for _ in 0..100 {
+        *now += BURST_DT;
+        app.observe_title_drift(session, *now);
+    }
+    assert_eq!(take_title_focus_visits(app), 0);
+}
+
+/// Neither the labeling window nor unrelated many-tab windows walk tabs for steady output.
 #[test]
 fn a_steady_title_gate_walks_no_tab() {
     const TABS: usize = 30;
-    let mut app = workspace(TABS, 1);
+    let (mut app, unrelated) = title_workspace(TABS);
     let wid = WindowId(0);
     let active = app.focused_session_id(wid).expect("an active session");
     let mut now = Instant::now();
@@ -157,29 +269,273 @@ fn a_steady_title_gate_walks_no_tab() {
         now += BURST_DT;
         app.observe_title_drift(active, now);
     }
-    let _ = work_counts::take_title_tab_touches();
+    assert_title_caches_warmed(&app);
+    let before = unrelated.map(|wid| title_snapshot(&app, wid));
     for _ in 0..100 {
         now += BURST_DT;
         app.observe_title_drift(active, now);
     }
     assert_eq!(
-        work_counts::take_title_tab_touches(),
+        take_title_focus_visits(&app),
         0,
-        "a steady flood must not walk the tab list"
+        "a steady flood must not walk any window's tab list"
     );
+    assert_unrelated_titles_untouched(&app, unrelated, &before);
 
-    app.windows
-        .get_mut(&wid)
-        .expect("fixture window")
-        .tab_title_epochs
-        .remove(&active);
+    let window = app.windows.get_mut(&wid).expect("fixture window");
+    window.tab_title_epochs.remove(&active);
+    let _ = window.tab_set.tab_at_mut(0).expect("mutable topology loan");
     now += Duration::from_millis(500);
     app.observe_title_drift(active, now);
     assert_eq!(
-        work_counts::take_title_tab_touches(),
+        take_title_focus_visits(&app),
         TABS,
-        "the uncached window walks to the active (last) tab"
+        "a mutable topology loan rebuilds one window's focused-view membership"
     );
+    assert_unrelated_titles_untouched(&app, unrelated, &before);
+}
+
+#[test]
+fn title_labels_follow_detach_migrate_attach_and_close_without_unrelated_walks() {
+    let (mut app, unrelated) = title_workspace(2);
+    let source = WindowId(0);
+    let tab = app.windows[&source].tab_set.active().unwrap();
+    let (tab_id, view) = (tab.id, tab.focus);
+    let session = app.focused_session_id(source).unwrap();
+    let mut now = Instant::now();
+    report_title(&mut app, session, "before move", &mut now);
+    assert_published_title(&app, source, tab_id, Some(session), "before move");
+    assert_title_caches_warmed(&app);
+    let before = unrelated.map(|wid| title_snapshot(&app, wid));
+
+    let detached = app.detach_active_tab_logical().unwrap();
+    assert_eq!(app.windows[&detached].tab_set.active().unwrap().id, tab_id);
+    assert_eq!(app.windows[&detached].tab_set.active().unwrap().focus, view);
+    report_title(&mut app, session, "detached", &mut now);
+    assert_published_title(&app, detached, tab_id, Some(session), "detached");
+    assert!(
+        !app.windows[&source]
+            .tab_chrome_titles_by_tab
+            .contains_key(&tab_id)
+    );
+    assert!(!app.windows[&source].tab_title_epochs.contains_key(&session));
+    assert_unrelated_titles_untouched(&app, unrelated, &before);
+    assert!(
+        take_title_focus_visits(&app) > 0,
+        "detaching invalidates membership"
+    );
+    assert_steady_title_gate(&mut app, session, &mut now);
+
+    app.migrate_active_tab_from_window(detached).unwrap();
+    assert!(!app.windows.contains_key(&detached));
+    assert_eq!(app.windows[&source].tab_set.active().unwrap().id, tab_id);
+    report_title(&mut app, session, "migrated", &mut now);
+    assert_published_title(&app, source, tab_id, Some(session), "migrated");
+    assert_unrelated_titles_untouched(&app, unrelated, &before);
+    assert!(
+        take_title_focus_visits(&app) > 0,
+        "migration invalidates membership"
+    );
+
+    let attached = app.open_active_session_in_new_window_logical().unwrap();
+    let attached_tab = app.windows[&attached].tab_set.active().unwrap();
+    let attached_id = attached_tab.id;
+    assert_ne!(attached_tab.focus, view);
+    assert_eq!(app.view_store.terminal_views(session).count(), 2);
+    report_title(&mut app, session, "shared", &mut now);
+    assert_published_title(&app, source, tab_id, Some(session), "shared");
+    assert_published_title(&app, attached, attached_id, Some(session), "shared");
+    assert_unrelated_titles_untouched(&app, unrelated, &before);
+    assert!(
+        take_title_focus_visits(&app) > 0,
+        "a new view joins the gate"
+    );
+
+    app.close_window_logical(attached);
+    assert!(!app.windows.contains_key(&attached));
+    assert_eq!(app.view_store.terminal_views(session).count(), 1);
+    report_title(&mut app, session, "surviving view", &mut now);
+    assert_published_title(&app, source, tab_id, Some(session), "surviving view");
+    assert_unrelated_titles_untouched(&app, unrelated, &before);
+    assert_steady_title_gate(&mut app, session, &mut now);
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn title_labels_follow_native_split_close_and_reopen_without_unrelated_walks() {
+    let (mut app, unrelated) = title_workspace(2);
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let (_, settings) = app.active_native_view(wid).unwrap();
+    let (session, terminal) =
+        app.split_active_with_stub_terminal(wid, tab_model::SplitAxis::Horizontal);
+    let tab = app.windows[&wid].tab_set.active().unwrap().id;
+    let mut now = Instant::now();
+    report_title(&mut app, session, "mixed terminal", &mut now);
+    assert_published_title(&app, wid, tab, Some(session), "mixed terminal");
+    assert_title_caches_warmed(&app);
+    let before = unrelated.map(|wid| title_snapshot(&app, wid));
+
+    assert!(app.focus_pane_in(wid, pane::FocusDir::Left));
+    assert_eq!(app.windows[&wid].tab_set.active().unwrap().focus, settings);
+    report_title(&mut app, session, "hidden terminal", &mut now);
+    assert_published_title(&app, wid, tab, None, "Settings");
+    assert!(!app.windows[&wid].tab_title_epochs.contains_key(&session));
+    assert_unrelated_titles_untouched(&app, unrelated, &before);
+    assert!(
+        take_title_focus_visits(&app) > 0,
+        "native focus invalidates membership"
+    );
+
+    assert_eq!(app.close_active_tab(), None);
+    assert_eq!(app.windows[&wid].tab_set.active().unwrap().focus, terminal);
+    report_title(&mut app, session, "promoted terminal", &mut now);
+    assert_published_title(&app, wid, tab, Some(session), "promoted terminal");
+    assert_unrelated_titles_untouched(&app, unrelated, &before);
+    assert!(
+        take_title_focus_visits(&app) > 0,
+        "native close invalidates membership"
+    );
+
+    app.reopen_closed_view_and_wait_for_test().unwrap();
+    assert!(app.active_native_view(wid).is_some());
+    report_title(&mut app, session, "hidden after reopen", &mut now);
+    assert_published_title(&app, wid, tab, None, "Settings");
+    assert!(!app.windows[&wid].tab_title_epochs.contains_key(&session));
+    assert_unrelated_titles_untouched(&app, unrelated, &before);
+    assert!(
+        take_title_focus_visits(&app) > 0,
+        "native reopen invalidates membership"
+    );
+    assert_steady_title_gate(&mut app, session, &mut now);
+    assert!(app.structural_invariants_ok());
+}
+
+fn title_restore_window(record: restore::RestoredTab) -> restore::WindowLayout {
+    restore::WindowLayout {
+        rows: 24,
+        cols: 80,
+        active_tab: 0,
+        outer_x: None,
+        outer_y: None,
+        maximized: None,
+        inner_px: None,
+        presence_row: false,
+        show: restore::WindowShow::UNKNOWN,
+        tabs: Vec::new(),
+        native_tabs: Vec::new(),
+        tab_order: Vec::new(),
+        active_item: Some(0),
+        workers_in_front: false,
+        restored_tabs: vec![record],
+    }
+}
+
+#[test]
+fn title_labels_follow_recursive_native_terminal_replacement_without_unrelated_walks() {
+    let (mut app, unrelated) = title_workspace(1);
+    let wid = WindowId(0);
+    let mut session = app.focused_session_id(wid).unwrap();
+    let terminal = app
+        .tab_restore_descriptor(app.windows[&wid].tab_set.active().unwrap())
+        .unwrap();
+    let mut native = terminal.clone();
+    native.root = restore::RestoredSplitTree::leaf(restore::RestoredView::Native(
+        restore::NativeLeafRestore::about(),
+    ));
+    let probe = app.focused_session_id(unrelated[0]).unwrap();
+    let mut now = Instant::now();
+    report_title(&mut app, session, "before restore", &mut now);
+    assert_title_caches_warmed(&app);
+
+    for round in 0..2 {
+        let before = unrelated.map(|wid| title_snapshot(&app, wid));
+        let old_tab = app.windows[&wid].tab_set.active().unwrap().id;
+        app.restore_into_window(wid, title_restore_window(native.clone()));
+        let native_tab = app.windows[&wid].tab_set.active().unwrap().id;
+        assert_ne!(native_tab, old_tab);
+        assert!(app.active_native_view(wid).is_some());
+        assert!(app.pool.get(session).is_none());
+        assert_eq!(app.view_store.terminal_views(session).count(), 0);
+        assert_published_title(&app, wid, native_tab, None, "About aterm");
+        assert!(
+            !app.windows[&wid]
+                .tab_chrome_titles_by_tab
+                .contains_key(&old_tab)
+        );
+        assert_unrelated_titles_untouched(&app, unrelated, &before);
+
+        // An actual output observation warms the new native-only tab set as a non-labeler.
+        report_title(&mut app, probe, &format!("probe {round}"), &mut now);
+        assert!(
+            take_title_focus_visits(&app) > 0,
+            "replacement cold control"
+        );
+        let before = unrelated.map(|wid| title_snapshot(&app, wid));
+        app.restore_into_window(wid, title_restore_window(terminal.clone()));
+        let new_tab = app.windows[&wid].tab_set.active().unwrap().id;
+        assert_ne!(new_tab, native_tab);
+        let previous = session;
+        session = app.focused_session_id(wid).unwrap();
+        assert_ne!(session, previous);
+        let title = format!("restored {round}");
+        report_title(&mut app, session, &title, &mut now);
+        assert_published_title(&app, wid, new_tab, Some(session), &title);
+        assert!(
+            !app.windows[&wid]
+                .tab_chrome_titles_by_tab
+                .contains_key(&native_tab)
+        );
+        assert_unrelated_titles_untouched(&app, unrelated, &before);
+        assert!(
+            take_title_focus_visits(&app) > 0,
+            "terminal restore invalidates membership"
+        );
+        assert_steady_title_gate(&mut app, session, &mut now);
+        assert!(app.structural_invariants_ok());
+    }
+}
+
+#[test]
+fn an_unfocused_split_stays_cheap_and_becomes_a_label_when_focused() {
+    const TABS: usize = 30;
+    let mut app = workspace(TABS, 2);
+    let wid = WindowId(0);
+    let tab = app.windows[&wid].tab_set.tab_at(0).unwrap();
+    let hidden = tab
+        .root
+        .leaves()
+        .into_iter()
+        .find(|view| *view != tab.focus)
+        .unwrap();
+    let session = app
+        .view_store
+        .get(hidden)
+        .copied()
+        .and_then(tab_model::View::terminal_session)
+        .unwrap();
+    let mut now = Instant::now();
+    app.observe_title_drift(session, now);
+    let _ = take_title_focus_visits(&app);
+    for _ in 0..100 {
+        now += BURST_DT;
+        app.observe_title_drift(session, now);
+    }
+    assert_eq!(take_title_focus_visits(&app), 0);
+    assert!(!app.windows[&wid].tab_title_epochs.contains_key(&session));
+    assert!(
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .tab_set
+            .tab_at_mut(0)
+            .unwrap()
+            .set_focus(hidden)
+    );
+    now += Duration::from_millis(500);
+    app.observe_title_drift(session, now);
+    assert!(app.windows[&wid].tab_title_epochs.contains_key(&session));
+    assert_eq!(take_title_focus_visits(&app), TABS);
 }
 
 /// Exercise the accepted OSC path with every cache warm, rather than measuring only

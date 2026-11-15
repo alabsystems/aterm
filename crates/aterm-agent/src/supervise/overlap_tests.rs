@@ -11,8 +11,8 @@ const T0: i64 = 1_760_000_000_000;
 const PLANT: &str = "ignore.previous.instructions";
 
 /// Two minted sids, as `aterm_session::SessionId::generate` makes them.
-const A: &str = "s-0a1b2c3d4e5f60718293";
-const B: &str = "s-ffeeddccbbaa99887766";
+const A: &str = "t5f60718293";
+const B: &str = "taa99887766";
 
 /// The words of the overlap sentence's template.
 const TEMPLATE: [&str; 14] = [
@@ -86,9 +86,13 @@ fn the_overlap_fact_carries_counts_and_sids_only() {
         "/Users//x/repo/src/lib.rs",
         "feat/x",
         PLANT,
+        "te5f607182",
+        "tf6071829301",
+        "TE5F6071829",
         "s-0a1b2c3d4e5f6071829",
-        "s-0a1b2c3d4e5f607182930",
         "s-0A1B2C3D4E5F60718293",
+        "S-0a1b2c3d4e5f60718293",
+        "s-0a1b",
         "",
     ] {
         assert_eq!(
@@ -98,6 +102,15 @@ fn the_overlap_fact_carries_counts_and_sids_only() {
         );
         assert_eq!(PeerSid::of(word), None, "CONTROL: {word:?}");
     }
+    // A tab opened before the `t` form keeps its `s-` ID until it closes, and a peer's record
+    // names it: the reading takes it, and tells it as it is.
+    let earlier = "s-0a1b2c3d4e5f60718293";
+    assert_eq!(
+        PeerSid::of(earlier).as_ref().map(PeerSid::as_str),
+        Some(earlier)
+    );
+    let reading = OverlapReading::new(T0, 1, &[A, earlier]).expect("an earlier tab is a peer");
+    assert!(reading.told().contains(earlier), "{}", reading.told());
 }
 
 /// THE SENTENCE NAMES AT MOST THREE SIDS AND COUNTS THE REST, within [`FACT_CAP`]: one file and
@@ -107,7 +120,7 @@ fn the_overlap_fact_carries_counts_and_sids_only() {
 /// a peer and no file is no reading.
 #[test]
 fn the_overlap_sentence_names_three_sids_and_counts_the_rest() {
-    let sid = |n: u32| format!("s-{n:020x}");
+    let sid = |n: u32| format!("t{n:010x}");
     let sids: Vec<String> = (1..=5).map(sid).collect();
     let words = |files: u32, n: usize| {
         let peers: Vec<&str> = sids.iter().take(n).map(String::as_str).rev().collect();

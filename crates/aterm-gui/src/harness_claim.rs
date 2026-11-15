@@ -15,9 +15,11 @@
 //!
 //! A proven scoped claim is never a v2 self-claim: it sits in
 //! [`crate::session_timeline::SupervisorClaim::scoped`], never in `proven`, so nothing that acts
-//! for codex-alab's self-claim (its record copies, its crash rule, its wall answer, its acts)
+//! for codex-alab's self-claim (its record copies, its crash rule, its wall answer, its facts)
 //! acts for it. What it changes is what its scope says: `status supervisor_proven=1` (the
-//! claimant's own confirmation), and a claim the window's host holds replaced, as a proof does.
+//! claimant's own confirmation), a claim the window's host holds replaced, as a proof does, and,
+//! where its scope names `turn-end`, its own acts, stop, Land hold and NEEDS YOU admitted under
+//! its proof ([`crate::session_timeline::SupervisorClaim::act_proof`]).
 
 use std::path::Path;
 

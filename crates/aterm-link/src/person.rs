@@ -211,9 +211,7 @@ fn parse_post(words: &[String], literal_at: Option<usize>) -> Result<Act, String
     let (sid, node) = to
         .strip_prefix('@')
         .and_then(|r| r.split_once('@'))
-        .filter(|(sid, node)| {
-            sid.starts_with("s-") && crate::subject::is_principal(sid) && is_node_id(node)
-        })
+        .filter(|(sid, node)| crate::subject::is_session_id(sid) && is_node_id(node))
         .ok_or_else(|| {
             format!(
                 "to={} is not @<sid>@<node> (a person has no bridge to resolve a bare sid, so \

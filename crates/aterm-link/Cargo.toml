@@ -125,6 +125,8 @@ libc = { workspace = true }
 aterm-sysprobe = { workspace = true }
 
 [dev-dependencies]
+# Allocation budgets for cached journal point reads; no shipped allocator change.
+aterm-heap-count = { path = "../aterm-heap-count" }
 # The unit tests' derived models and hang detectors.
 aterm-spec = { workspace = true }
 # `fabric brief --json`'s schema and tier tests read its object back with the

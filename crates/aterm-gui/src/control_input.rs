@@ -730,7 +730,7 @@ pub(crate) struct InputFence<'a> {
     /// The worker's initial command still targets an input-ready shell block.
     pub entering_command: bool,
     /// The writer's own standing, judged under the lock of its write after the person's (a
-    /// turn's guarded Enter: the turn still holds its slot). Its loss writes nothing and
+    /// turn's fenced submit: the turn still holds its slot). Its loss writes nothing and
     /// answers [`GuardedInput::Skipped`]; the writer, which knows what it judged, says why.
     pub standing: Option<&'a (dyn Fn() -> bool + Sync)>,
 }

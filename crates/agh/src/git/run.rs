@@ -425,8 +425,9 @@ impl GitRun {
     }
 }
 
-/// What a run printed, redacted, and who it spoke as. Ordinary streams keep
-/// their last 64 KiB; commit-only observations are complete within 256 KiB.
+/// What a run printed, redacted, who it spoke as, and the commit a fetch into one cache ref
+/// wrote. Ordinary streams keep their last 64 KiB; commit-only observations are complete
+/// within 256 KiB.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct GitOut {
@@ -439,6 +440,11 @@ pub struct GitOut {
     pub as_: Option<String>,
     /// The grant's nonce, for a release-tier read or either push operation.
     pub grant: Option<String>,
+    /// The commit a `FetchMain` or `FetchRef` run wrote into its `into` ref: this run's own
+    /// observation, `None` for every other operation. The ref lives in the repository's
+    /// common directory, which every worktree of it shares, so a later read of the ref can
+    /// name another run's commit, an older one included.
+    pub fetched: Option<String>,
 }
 
 /// The credential callback grammar implemented by this executable's front door.
@@ -555,13 +561,22 @@ impl HelperCommand {
 ///
 /// The refusals of each step; off unix `write::unix_only()`.
 pub(crate) fn run(gh: &Github, run: &GitRun) -> Result<GitOut> {
+    run_with_credential(gh, run, None)
+}
+
+/// Journaled operations pass the same credential Arc that named their durable intent.
+pub(crate) fn run_with_credential(
+    gh: &Github,
+    run: &GitRun,
+    credential: Option<std::sync::Arc<crate::identity::Credential>>,
+) -> Result<GitOut> {
     #[cfg(unix)]
     {
-        unix::run(gh, run)
+        unix::run(gh, run, credential)
     }
     #[cfg(not(unix))]
     {
-        let _ = (gh, run);
+        let _ = (gh, run, credential);
         Err(crate::write::unix_only())
     }
 }
@@ -846,17 +861,16 @@ mod unix {
     }
 
     /// Refused: the profile the run would speak as keeps its token somewhere git's helper,
-    /// another process that reads only token files, cannot read it. Where the token lives is a
-    /// routing fact (`Fx::fact`), so a replay, whose router holds no row, refuses as the
-    /// recording did.
+    /// another process that reads only vault entries and token files, cannot read it. Where the
+    /// token lives is a routing fact (`Fx::fact`), so a replay, whose router holds no row,
+    /// refuses as the recording did.
     fn not_a_token_file(gh: &Github, profile: &str, slug: &Slug) -> Result<Option<Error>> {
         let router = gh.router();
         let source = gh.fx().fact(SOURCE, profile, &mut || match router
             .profile(profile)
             .map(|row| &row.source)
         {
-            None | Some(Source::File(_)) => String::new(),
-            Some(Source::Env(var)) => format!("env:{}", crate::config::masked(var)),
+            None | Some(Source::File(_) | Source::Entry(_)) => String::new(),
             Some(Source::Inline(_)) => "inline".to_string(),
         })?;
         if source.is_empty() {
@@ -864,7 +878,8 @@ mod unix {
         }
         Ok(Some(
             Error::refused(format!(
-                "{profile}'s token is not in a token file ({source}), and git's credential helper reads only token files"
+                "{profile}'s token is not in a vault entry or token file ({source}), and git's \
+                 credential helper reads only those"
             ))
             .with_next(format!("route {slug} to a token_file profile in agh.toml"))
             .with_repo(slug.to_string()),
@@ -1945,18 +1960,21 @@ mod unix {
     /// (agh.toml changed since the client read it, or a library client built its router
     /// elsewhere).
     fn helper_answers(
-        gh: &Github,
         dirs: &Dirs,
         profile: &str,
         granted: bool,
         loose: bool,
         slug: &Slug,
     ) -> Result<()> {
-        credential::require_answer(gh.env(), dirs, slug, profile, granted, loose)
+        credential::require_answer(dirs, slug, profile, granted, loose)
     }
 
     /// The run on unix: steps 1 to 9 of the runner (plan §4.6.13).
-    pub(super) fn run(gh: &Github, run: &GitRun) -> Result<GitOut> {
+    pub(super) fn run(
+        gh: &Github,
+        run: &GitRun,
+        credential: Option<std::sync::Arc<crate::identity::Credential>>,
+    ) -> Result<GitOut> {
         check_op(run)?;
         let slug = &run.slug;
         let router = gh.router();
@@ -2050,6 +2068,29 @@ mod unix {
             return finish(&children, run, &remote, profile, None)
                 .map_err(|error| name_routed_authentication(error, routed.as_deref()));
         }
+        // Replay returned above: no live credential or grant is resolved there.
+        // A journaled caller supplies its original Arc, never a later cache lookup.
+        let credential = if needs_grant {
+            let selected = profile
+                .as_deref()
+                .ok_or_else(|| Error::refused("a Git operation grant needs a routed credential"))?;
+            let credential = match credential {
+                Some(credential) => credential,
+                None => gh.git_credential_snapshot(selected)?,
+            };
+            if credential.profile() != selected
+                || router
+                    .profile(selected)
+                    .is_none_or(|row| row.tier != credential.tier())
+            {
+                return Err(Error::refused(
+                    "Git operation credential differs from its routed profile",
+                ));
+            }
+            Some(credential)
+        } else {
+            None
+        };
         let dirs = match (needs_grant, gh.dirs()) {
             (false, _) => None,
             (true, Some(dirs)) => Some(dirs),
@@ -2071,7 +2112,7 @@ mod unix {
                 ))
                 .with_repo(slug.to_string()));
             };
-            helper_answers(gh, helper_dirs, name, needs_grant, loose, slug)?;
+            helper_answers(helper_dirs, name, needs_grant, loose, slug)?;
         }
         if let (Some(dirs), Some(now)) = (dirs, now) {
             grant::sweep(dirs, now);
@@ -2090,7 +2131,11 @@ mod unix {
         let guard = match (dirs, now, &profile) {
             (Some(dirs), Some(now), Some(writer)) => {
                 let ttl = run.budget.min(GRANT_MAX);
-                let grant = grant::write(dirs, slug, writer, now, ttl)?;
+                let credential = credential.as_ref().ok_or_else(|| {
+                    Error::refused("a Git operation grant has no original credential")
+                })?;
+                let grant =
+                    grant::write(dirs, slug, writer, credential.git_grant_binding(), now, ttl)?;
                 Some(GrantGuard { dirs, grant })
             }
             _ => None,
@@ -2459,6 +2504,112 @@ mod unix {
         Ok(())
     }
 
+    /// Main borrows objects through its own immutable, fully checked snapshot only.
+    /// Unrelated metadata refs neither force a cold fetch nor become advertised haves.
+    fn lend_main_snapshot(
+        children: &Children<'_>,
+        run: &GitRun,
+        scratch: Option<&Path>,
+        common: &str,
+        shallow: bool,
+        into: &str,
+    ) -> Result<()> {
+        let cold = |why: &str| {
+            children
+                .gh
+                .fx()
+                .note_round(&format!("fetch-main starts cold: snapshot {into} {why}"))
+        };
+        if shallow {
+            return cold("has shallow ancestry");
+        }
+        let mut original = children.clone();
+        original.env.push((os("GIT_GRAFT_FILE"), os("/dev/null")));
+        let local = |name: &str, args: &[OsString], cwd: Option<&Path>| {
+            let key = [
+                crate::fx::canon::git_request(run),
+                format!("\nstep main-have-{name}").into_bytes(),
+            ]
+            .concat();
+            original.git(args, cwd, &key).map_err(unsent)
+        };
+        let tip = local(
+            "tip",
+            &[
+                os("--git-dir"),
+                os(common),
+                os("rev-parse"),
+                os("--verify"),
+                os("--quiet"),
+                os(format!("{into}^{{commit}}")),
+            ],
+            None,
+        )?;
+        if tip.code == Some(1) && tip.stdout.is_empty() {
+            return cold("has no commit");
+        }
+        if tip.code != Some(0) {
+            return Err(failed(
+                &run.op,
+                &tip,
+                children.gh.redactor(),
+                &run.slug,
+                false,
+            ));
+        }
+        let oid = std::str::from_utf8(&tip.stdout)
+            .ok()
+            .and_then(|s| s.strip_suffix('\n'))
+            .filter(|s| crate::path::is_sha(s))
+            .ok_or_else(|| Error::local("invalid main snapshot identity"))?;
+        let closure = local(
+            "closure",
+            &[
+                os("--git-dir"),
+                os(common),
+                os("-c"),
+                os("core.commitGraph=false"),
+                os("rev-list"),
+                os("--objects"),
+                os("--quiet"),
+                os("--missing=print"),
+                os(oid),
+            ],
+            None,
+        )?;
+        if closure.code != Some(0) {
+            return Err(
+                failed(&run.op, &closure, children.gh.redactor(), &run.slug, false)
+                    .with_next("fetch step: main-have-closure"),
+            );
+        }
+        if !closure.stdout.is_empty() || closure.stdout_may_be_truncated() {
+            return cold("is incomplete");
+        }
+        lend_objects(children, run, scratch, common, false)?;
+        // The borrowed object directory may hold incomplete refs, and may acquire
+        // more while this fetch runs. Advertise only our pinned scratch ref.
+        for (name, args) in [
+            (
+                "exclude-alternate-refs",
+                vec![os("config"), os("core.alternateRefsCommand"), os("exit 0;")],
+            ),
+            ("pin", vec![os("update-ref"), os("refs/agh/have"), os(oid)]),
+        ] {
+            let out = local(name, &args, scratch)?;
+            if out.code != Some(0) {
+                return Err(failed(
+                    &run.op,
+                    &out,
+                    children.gh.redactor(),
+                    &run.slug,
+                    false,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn intake_file_stamp(metadata: &std::fs::Metadata) -> impl Eq {
         (
             metadata.dev(),
@@ -2739,7 +2890,8 @@ mod unix {
     }
 
     /// Fetch into private scratch first, then import objects with no destination
-    /// ref. Only the final no-deref update can change the caller's cache ref.
+    /// ref. Only the final no-deref update can change the caller's cache ref. The update's
+    /// output, and the commit it wrote ([`GitOut::fetched`]).
     fn fetch_exact(
         children: &Children<'_>,
         run: &GitRun,
@@ -2747,7 +2899,7 @@ mod unix {
         dir: &Path,
         reference: &str,
         into: &str,
-    ) -> Result<ChildOut> {
+    ) -> Result<(ChildOut, String)> {
         let dir = screened(children, run, dir)?;
         let canonical = crate::fx::canon::git_request(run);
         let step = |name: &str, args: Vec<OsString>, cwd: Option<&Path>| -> Result<ChildOut> {
@@ -2792,7 +2944,11 @@ mod unix {
             init.push(path.as_os_str().to_os_string());
         }
         step("init", init, None)?;
-        lend_complete_objects(children, run, scratch, common, shallow)?;
+        if matches!(run.op, GitOp::FetchMain { .. }) {
+            lend_main_snapshot(children, run, scratch, common, shallow, into)?;
+        } else {
+            lend_complete_objects(children, run, scratch, common, shallow)?;
+        }
         step(
             "fetch",
             vec![
@@ -2818,7 +2974,7 @@ mod unix {
             .ok_or_else(|| Error::local("git returned an invalid fetched object id"))?;
         import_fetched_objects(children, run, common, &[oid])?;
         check_parents()?;
-        step(
+        let updated = step(
             "update",
             vec![
                 os("-C"),
@@ -2830,7 +2986,8 @@ mod unix {
                 os(oid),
             ],
             None,
-        )
+        )?;
+        Ok((updated, oid.to_owned()))
     }
 
     /// Cache ownership is DATA only. Retain its physical namespace while native Git
@@ -3407,6 +3564,7 @@ mod unix {
     /// for checkout closure, only the immutable selected tree's blob bodies.
     /// Metadata-only requests retain their explicit commit/tree contract. A source
     /// cache request instead hydrates and validates the COMPLETE reachable closure.
+    /// The final ref update's output, and the commit it wrote ([`GitOut::fetched`]).
     fn fetch_tree_scope(
         children: &Children<'_>,
         run: &GitRun,
@@ -3415,7 +3573,7 @@ mod unix {
         into: &str,
         scope: &super::FetchScope,
         reference: Option<&str>,
-    ) -> Result<ChildOut> {
+    ) -> Result<(ChildOut, String)> {
         let source_cache = match scope {
             super::FetchScope::FullSource { cache } => Some((
                 reference
@@ -3878,7 +4036,7 @@ mod unix {
                 None,
             )?;
             source_stores_disjoint(&pinned, &cache_store)?;
-            return Ok(updated);
+            return Ok((updated, oid.to_owned()));
         }
         let key = [canonical.as_slice(), b"\nstep metadata-pack"].concat();
         let packed = children
@@ -4147,7 +4305,7 @@ mod unix {
             }
         }
         check_current()?;
-        step(
+        let updated = step(
             "update",
             vec![
                 os("-C"),
@@ -4159,7 +4317,8 @@ mod unix {
                 os(oid),
             ],
             None,
-        )
+        )?;
+        Ok((updated, oid.to_owned()))
     }
 
     /// Fetch one explicit snapshot into scratch; validate every raw OID before importing
@@ -5409,6 +5568,7 @@ mod unix {
                     stderr: kept(&out.stderr, redactor),
                     as_: profile,
                     grant,
+                    fetched: None,
                 });
             }
             GitOp::Mirror { dest } => {
@@ -5473,7 +5633,7 @@ mod unix {
                 into,
                 blobless,
             } => {
-                let out = if *blobless {
+                let (out, oid) = if *blobless {
                     fetch_tree_scope(
                         children,
                         run,
@@ -5491,6 +5651,7 @@ mod unix {
                     stderr: kept(&out.stderr, redactor),
                     as_: profile,
                     grant,
+                    fetched: Some(oid),
                 });
             }
             GitOp::FetchRef {
@@ -5500,7 +5661,7 @@ mod unix {
                 scope,
                 ..
             } => {
-                let out = match scope {
+                let (out, oid) = match scope {
                     super::FetchScope::NativeExact => {
                         fetch_exact(children, run, remote, dir, reference, into)?
                     }
@@ -5513,6 +5674,7 @@ mod unix {
                     stderr: kept(&out.stderr, redactor),
                     as_: profile,
                     grant,
+                    fetched: Some(oid),
                 });
             }
             GitOp::PushRefs {
@@ -5526,6 +5688,7 @@ mod unix {
                     stderr: kept(&out.stderr, redactor),
                     as_: profile,
                     grant,
+                    fetched: None,
                 });
             }
             GitOp::PushControl {
@@ -5539,6 +5702,7 @@ mod unix {
                     stderr: kept(&out.stderr, redactor),
                     as_: profile,
                     grant,
+                    fetched: None,
                 });
             }
             GitOp::FetchBatch { dir, batch, .. } => {
@@ -5548,6 +5712,7 @@ mod unix {
                     stderr: kept(&out.stderr, redactor),
                     as_: profile,
                     grant,
+                    fetched: None,
                 });
             }
             GitOp::LsRemote {
@@ -5697,6 +5862,7 @@ mod unix {
             stderr: kept(&out.stderr, redactor),
             as_: profile,
             grant,
+            fetched: None,
         })
     }
 

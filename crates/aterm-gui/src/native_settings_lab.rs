@@ -87,7 +87,28 @@ fn currency(service: &ServiceState) -> String {
     }
 }
 
-fn button(key: &str, label: &str, action: ActionId, width: f32, enabled: bool) -> (UiNode, f32) {
+/// A full-width Secondary button whose words wrap to `width`, and its height.
+pub(super) fn button(
+    key: &str,
+    label: &str,
+    action: ActionId,
+    width: f32,
+    enabled: bool,
+) -> (UiNode, f32) {
+    styled_button(key, label, action, width, enabled, StyleRef::Secondary)
+}
+
+/// [`button`] in `style`. A page's one default button is [`StyleRef::Primary`]: drawn in the
+/// accent, and pressed by Return where the keyboard is in no control (the compiled tree's
+/// `default_action`, its first enabled Primary button).
+pub(super) fn styled_button(
+    key: &str,
+    label: &str,
+    action: ActionId,
+    width: f32,
+    enabled: bool,
+    style: StyleRef,
+) -> (UiNode, f32) {
     let (words, lines) = button_words(label, &[], width);
     let height = crate::native_ui::native_button_height_for_lines(lines, scaled_control_height());
     (
@@ -99,7 +120,7 @@ fn button(key: &str, label: &str, action: ActionId, width: f32, enabled: bool) -
                         enabled,
                         ..ControlState::default()
                     })
-                    .style(StyleRef::Secondary),
+                    .style(style),
             ),
         )
         .layout(

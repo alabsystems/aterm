@@ -254,7 +254,6 @@ fn tracking_after_a_push_preserves_a_newer_tip_and_tolerates_a_locked_ref() {
             step,
             &|_| {},
             crates(&["a"]),
-            Lane::Pass,
             |_, _, _| Ran::Ended(green()),
             |_| panic!("no recheck"),
         );
@@ -336,7 +335,6 @@ fn racing(world: &World, moves: usize) -> Raced {
         step,
         &no_retry,
         crates(&["a"]),
-        Lane::Pass,
         |_, _, _| Ran::Ended(green()),
         |base| panic!("no recheck was expected (base {base})"),
     );
@@ -445,7 +443,9 @@ enum Rerun {
 /// while HEAD is the judged commit nothing is judged again, the moved main is composed onto by
 /// the same rule, and the landing states the judgment the earlier run made. NEGATIVE CONTROLS:
 /// a head reworded since (the same tree under another commit) is judged again, and so is the
-/// same head once its record is gone: the record alone carries the pass.
+/// same head once its record is gone: the record alone carries the pass. The run records name
+/// the rerun's landing resumed. NEGATIVE CONTROL, run once as a mutant that made this test fail:
+/// the landing record leaving out that it resumed.
 #[test]
 fn a_stopped_landing_resumes_at_the_push_and_judges_nothing_while_head_is_the_judged_commit() {
     for rerun in [Rerun::Same, Rerun::Reworded, Rerun::Forgotten] {
@@ -471,7 +471,7 @@ fn a_stopped_landing_resumes_at_the_push_and_judges_nothing_while_head_is_the_ju
             }
         }
         if rerun != Rerun::Same {
-            let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+            let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
             assert_eq!((code, bases.len()), (exit::PASS, 1), "{rerun:?} {said:#?}");
             assert_eq!(
                 said.iter()
@@ -488,7 +488,7 @@ fn a_stopped_landing_resumes_at_the_push_and_judges_nothing_while_head_is_the_ju
             continue;
         }
         let tip = rival_moves(&world, "b/y.txt", "b between the runs\n");
-        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |base, _| {
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |base, _| {
             panic!("a kept judgment is not made again (base {base})")
         });
         assert_eq!(code, exit::PASS, "{said:#?}");
@@ -535,6 +535,16 @@ fn a_stopped_landing_resumes_at_the_push_and_judges_nothing_while_head_is_the_ju
         assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landing);
         assert_eq!(kept_record(&world), None);
     }
+    // The run records: the rerun judged nothing, composed and landed `composed`, resumed.
+    let told = super::quietly();
+    assert_eq!(
+        told.get(1),
+        Some(&(
+            super::steps(&[("compose", "composed", "disjoint"), ("end", "landed", "")]),
+            Some(("composed".to_owned(), true))
+        )),
+        "{told:#?}"
+    );
 }
 
 /// A KEPT JUDGMENT IS NEVER CARRIED TO ANOTHER TREE, NOR PAST A MAIN THAT DOES NOT COMPOSE.
@@ -568,7 +578,7 @@ fn a_kept_judgment_is_never_carried_to_another_tree_or_past_a_main_that_does_not
             );
             git(&world.work, &["update-ref", KEPT, &moved]);
         }
-        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
         assert_eq!(code, exit::PASS, "{said:#?}");
         assert_eq!(bases.len(), 1, "judged: {said:#?}");
         assert!(
@@ -585,7 +595,7 @@ fn a_kept_judgment_is_never_carried_to_another_tree_or_past_a_main_that_does_not
     commit(&world.work, "shared.txt", &SHARED.replacen('1', "one", 1));
     let (_, tree, merged) = stopped(&world);
     let tip = rival_moves(&world, "shared.txt", &SHARED.replacen('8', "eight", 1));
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
     assert_eq!(bases, std::slice::from_ref(&tip), "judged again: {said:#?}");
     assert!(
@@ -639,7 +649,6 @@ fn a_read_of_main_that_times_out_after_the_pass_is_made_again_and_the_landing_la
             step,
             &|pause| pauses.borrow_mut().push(pause),
             crates(&["a"]),
-            Lane::Pass,
             |_, _, _| Ran::Ended(green()),
             |base| panic!("no recheck was expected (base {base})"),
         );
@@ -653,14 +662,14 @@ fn a_read_of_main_that_times_out_after_the_pass_is_made_again_and_the_landing_la
         } else {
             assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
             assert_eq!(origin_main(&world), tip, "nothing was pushed");
-            let last = said.last().expect("said");
+            let last = split_verdict(&said).0.last().expect("said");
             assert!(
                 last.contains(TIMED_OUT)
                     && last.contains(&format!("stopped after {RETRIES} failures"))
                     && last.contains("is kept: run it again"),
                 "{said:#?}"
             );
-            let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |base, _| {
+            let (code, said, bases) = land_with(&world, crates(&["a"]), |base, _| {
                 panic!("a kept judgment is not made again (base {base})")
             });
             assert_eq!(code, exit::PASS, "{said:#?}");
@@ -707,7 +716,6 @@ fn a_push_that_timed_out_is_landed_where_main_took_it_and_never_made_again() {
             step,
             &no_retry,
             crates(&["a"]),
-            Lane::Pass,
             |_, _, _| Ran::Ended(green()),
             |base| panic!("no recheck was expected (base {base})"),
         );
@@ -722,7 +730,7 @@ fn a_push_that_timed_out_is_landed_where_main_took_it_and_never_made_again() {
         } else {
             assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
             assert_eq!(origin_main(&world), before, "nothing was pushed");
-            let last = said.last().expect("said");
+            let last = split_verdict(&said).0.last().expect("said");
             assert!(
                 last.contains(TIMED_OUT)
                     && last.contains("a push whose outcome is unknown is not made again")
@@ -730,7 +738,7 @@ fn a_push_that_timed_out_is_landed_where_main_took_it_and_never_made_again() {
                     && last.contains("settle that before running it again"),
                 "{said:#?}"
             );
-            let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |base, _| {
+            let (code, said, bases) = land_with(&world, crates(&["a"]), |base, _| {
                 panic!("a kept judgment is not made again (base {base})")
             });
             assert_eq!(code, exit::PASS, "{said:#?}");
@@ -748,7 +756,7 @@ fn a_push_that_timed_out_is_landed_where_main_took_it_and_never_made_again() {
 /// The reach of a landing whose shared paths reach less than the branch's change does: a tip
 /// that shares a path a crate may own is answered by a round, and one that conflicts in such a
 /// path keeps the judgment.
-fn narrow(paths: Option<&[String]>) -> Reach {
+pub(super) fn narrow(paths: Option<&[String]>) -> Reach {
     match paths {
         None => reaches(&["a", "b"]),
         Some(_) => reaches(&["b"]),
@@ -762,7 +770,7 @@ type Reaching<'a> = &'a dyn Fn(Option<&[String]>) -> Reach;
 type Resolved<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a [&'a str]);
 
 /// A round that ran the source readers and its cone's tests, all passing.
-fn round_green() -> Judged {
+pub(super) fn round_green() -> Judged {
     ran(
         exit::PASS,
         vec![
@@ -780,7 +788,7 @@ fn round_green() -> Judged {
 /// where `polls`, and not interrupted), the landing stops on the conflict with nothing pushed,
 /// and the judgment is kept for the merge the person commits. The judged commit, the main it
 /// merged and main's conflicting tip.
-fn stopped_on_conflict(
+pub(super) fn stopped_on_conflict(
     world: &World,
     polls: bool,
     rival: &dyn Fn(&Path),
@@ -800,8 +808,6 @@ fn stopped_on_conflict_saying(
     let tip = RefCell::new(String::new());
     let (code, said, bases, _) = land_reaching(
         world,
-        crates(&["a"]),
-        Lane::Pass,
         &narrow,
         |_, _, poll| {
             *tip.borrow_mut() = rival_does(world, rival);
@@ -838,7 +844,7 @@ fn stopped_on_conflict_saying(
 
 /// Commit the merge a landing left conflicted in `world`'s work checkout, with each of `files`
 /// holding its text: the merge commit.
-fn resolve(world: &World, files: &[(&str, &str)]) -> String {
+pub(super) fn resolve(world: &World, files: &[(&str, &str)]) -> String {
     for (file, text) in files {
         write(&world.work, file, text);
     }
@@ -943,13 +949,14 @@ fn a_conflicting_main_keeps_the_judgment_and_stops_on_the_conflict() {
         let tip = RefCell::new(String::new());
         let (code, said, bases, _) = land_reaching(
             &world,
-            crates(&["a"]),
-            Lane::Pass,
             reach,
             |_, _, poll| {
                 *tip.borrow_mut() = rival_does(&world, |rival| side(rival, theirs));
                 assert!(poll(&mut || false), "{file}: nothing of the run stands");
-                Ran::Interrupted { secs: 1 }
+                Ran::Interrupted {
+                    secs: 1,
+                    queued: false,
+                }
             },
             |base, _| panic!("{file}: no round (base {base})"),
         );
@@ -987,7 +994,9 @@ fn a_conflicting_main_keeps_the_judgment_and_stops_on_the_conflict() {
 /// dropped (a conflict resolved as the branch had it: the file is the judged commit's own, and
 /// only [`Delta::mechanical`] says its dependents must be judged); a change of the branch's it
 /// dropped; and an edit neither side made. NEGATIVE CONTROL: with the kept record gone the same
-/// merge is judged in full.
+/// merge is judged in full. The run records name the rerun's round's cause `kept-merge`.
+/// NEGATIVE CONTROL, run once as a mutant that made this test fail: `resume_merged` leaving the
+/// round no cause (it read `handed`).
 #[test]
 fn a_hand_merge_of_the_kept_judgment_is_judged_over_what_it_changed() {
     let mine = SHARED.replacen('4', "mine", 1);
@@ -1032,8 +1041,6 @@ fn a_hand_merge_of_the_kept_judgment_is_judged_over_what_it_changed() {
         let deltas = RefCell::new(Vec::new());
         let (code, said, bases, rounds) = land_reaching(
             &world,
-            crates(&["a"]),
-            Lane::Pass,
             &narrow,
             |_, _, _| {
                 assert!(
@@ -1069,6 +1076,7 @@ fn a_hand_merge_of_the_kept_judgment_is_judged_over_what_it_changed() {
             [Delta {
                 judged: judged.clone(),
                 shared: shared.iter().map(|path| (*path).to_owned()).collect(),
+                readers: Vec::new(),
                 mechanical: false,
             }],
             "{case}"
@@ -1122,6 +1130,16 @@ fn a_hand_merge_of_the_kept_judgment_is_judged_over_what_it_changed() {
         assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landing, "{case}");
         assert_eq!(kept_record(&world), None, "{case}");
     }
+    // The run records: the rerun's round of the person's merge, of cause `kept-merge`.
+    let told = super::quietly();
+    assert_eq!(
+        told.get(1),
+        Some(&super::landed(
+            &[("round", "pass", "kept-merge"), ("end", "landed", "")],
+            "rechecked"
+        )),
+        "{told:#?}"
+    );
 }
 
 /// A KEPT JUDGMENT STANDS ONLY FOR THE FIRST PARENT OF A MERGE OF MAIN INTO ITS OWN COMMIT.
@@ -1183,8 +1201,6 @@ fn a_merge_that_is_not_of_main_into_the_kept_commit_is_judged_in_full() {
         }
         let (code, said, bases, rounds) = land_reaching(
             &world,
-            crates(&["a"]),
-            Lane::Pass,
             &narrow,
             |_, _, _| Ran::Ended(green()),
             |base, _| panic!("{case}: judged in full, never by a round (base {base})"),
@@ -1211,13 +1227,34 @@ fn a_merge_that_is_not_of_main_into_the_kept_commit_is_judged_in_full() {
 /// the kept judgment and that judgment both stated. A lock both sides changed, resolved as the
 /// branch had it, is the judged commit's own file: a round compares it with that commit and
 /// finds no change, though main's manifests no longer agree with it. And Markdown a file may
-/// read is in no cone, so a round's source readers alone would answer for a conflict in it.
+/// read is in no cone: the round over its readers answers for the Markdown Git merged, not for
+/// text a person wrote into a conflict, whether a workspace member owns the reader (a crate's
+/// test that reads its own spec table) or none does.
 /// NEGATIVE CONTROL: the same conflict in Markdown no code names is judged by a round, which
-/// asks no reach.
+/// asks no reach. The run records name the full judgment's cause `no-round`, and the control's
+/// landing `markdown`. NEGATIVE CONTROL, run once as a mutant that made this test fail: a merge
+/// no round answers for leaving its judgment no cause (it read `first`).
 #[test]
 fn a_hand_merge_of_a_lock_or_of_markdown_a_file_reads_is_judged_in_full() {
     let named = "pub const NAMED: &str = \"docs/NAMED.md\";\n";
-    let cases: [(&str, Vec<markdown::File<'_>>, Option<&str>); 3] = [
+    let cases: [(&str, Vec<markdown::File<'_>>, Option<&str>); 4] = [
+        (
+            markdown::SPEC,
+            vec![
+                ("Cargo.toml", Some(markdown::WORKSPACE), false),
+                (
+                    "crates/b/Cargo.toml",
+                    Some("[package]\nname = \"b\"\n"),
+                    false,
+                ),
+                (markdown::SPEC, None, false),
+                (markdown::ROWS, Some(markdown::READS_SPEC), false),
+            ],
+            Some(
+                "crates/b/SPECS.md is named in crates/b/tests/rows.rs's code, so a build or test \
+                 may read it, and the merge was resolved or edited by hand",
+            ),
+        ),
         (
             "Cargo.lock",
             vec![("Cargo.lock", None, false)],
@@ -1253,8 +1290,6 @@ fn a_hand_merge_of_a_lock_or_of_markdown_a_file_reads_is_judged_in_full() {
         let merge = resolve(&world, &[(file, &resolved)]);
         let (code, said, bases, rounds) = land_reaching(
             &world,
-            crates(&["a"]),
-            Lane::Pass,
             &|paths| match paths {
                 None => reaches(&["a", "b"]),
                 Some(paths) => panic!("{file}: no reach is asked ({paths:?})"),
@@ -1326,6 +1361,25 @@ fn a_hand_merge_of_a_lock_or_of_markdown_a_file_reads_is_judged_in_full() {
         );
         assert_eq!(kept_record(&world), None, "{file}");
     }
+    // The run records: a hand merge no round answers for is judged in full (cause `no-round`);
+    // the control's round of Markdown no code names lands `markdown`.
+    let told = super::quietly();
+    assert_eq!(
+        told.get(1),
+        Some(&super::landed(
+            &[("judgment", "pass", "no-round"), ("end", "landed", "")],
+            "exact"
+        )),
+        "{told:#?}"
+    );
+    assert_eq!(
+        told.last(),
+        Some(&super::landed(
+            &[("round", "pass", "kept-merge"), ("end", "landed", "")],
+            "markdown"
+        )),
+        "{told:#?}"
+    );
 }
 
 /// A hand merge that shares a submodule's entry is judged in full: here both sides moved the
@@ -1392,13 +1446,15 @@ fn a_hand_merge_that_shares_a_submodule_entry_is_judged_in_full() {
                     "{why}"
                 );
             }
-            Rounded::Round(delta) => {
+            Rounded::Round { delta, markdown } => {
                 assert!(!whole, "{mode}: {delta:?}");
+                assert!(!markdown, "{mode}: a submodule entry is no Markdown");
                 assert_eq!(
                     delta,
                     Delta {
                         judged: judged.clone(),
                         shared: vec!["vendor/x".into()],
+                        readers: Vec::new(),
                         mechanical: false,
                     }
                 );
@@ -1420,8 +1476,6 @@ fn a_round_that_went_red_is_run_again_from_the_kept_judgment() {
     let tip = RefCell::new(String::new());
     let (code, said, bases, rounds) = land_reaching(
         &world,
-        crates(&["a"]),
-        Lane::Pass,
         &narrow,
         |_, _, _| {
             *tip.borrow_mut() =
@@ -1452,7 +1506,7 @@ fn a_round_that_went_red_is_run_again_from_the_kept_judgment() {
     assert_eq!(rounds[0], (tip.clone(), merge.clone()));
     let judged_tree = git(&world.work, &["rev-parse", &format!("{judged}^{{tree}}")]);
     assert_eq!(
-        said.last().map(String::as_str),
+        split_verdict(&said).0.last().map(String::as_str),
         Some(
             format!(
                 "verify land: the judgment of {judged_tree}, the merge's first parent, is kept: \
@@ -1466,8 +1520,6 @@ fn a_round_that_went_red_is_run_again_from_the_kept_judgment() {
 
     let (code, said, bases, rounds) = land_reaching(
         &world,
-        crates(&["a"]),
-        Lane::Pass,
         &narrow,
         |base, _, _| panic!("the kept judgment is not made again (base {base})"),
         |_, delta| {
@@ -1476,6 +1528,7 @@ fn a_round_that_went_red_is_run_again_from_the_kept_judgment() {
                 Delta {
                     judged: judged.clone(),
                     shared: vec!["shared.txt".into()],
+                    readers: Vec::new(),
                     mechanical: true,
                 }
             );
@@ -1516,8 +1569,6 @@ fn a_whole_judgment_of_the_merge_that_went_red_is_never_followed_by_a_round() {
     let kept = RefCell::new(Vec::new());
     let (code, said, bases, rounds) = land_reaching(
         &world,
-        crates(&["a"]),
-        Lane::Pass,
         &whole,
         |_, n, _| {
             kept.borrow_mut().push(kept_record(&world).is_some());
@@ -1555,8 +1606,6 @@ fn a_whole_judgment_of_the_merge_that_went_red_is_never_followed_by_a_round() {
 
     let (code, said, bases, rounds) = land_reaching(
         &world,
-        crates(&["a"]),
-        Lane::Pass,
         &whole,
         |_, _, _| Ran::Ended(green()),
         |base, _| panic!("the red judgment is made again in full, never as a round (base {base})"),

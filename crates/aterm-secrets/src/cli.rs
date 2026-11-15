@@ -43,22 +43,16 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          state, where it was minted and when it ends
   aterm secrets get <name>               print one value to stdout (never a Claude Code
                                          token, which aterm hands only to Claude Code)
-  aterm secrets keep <name>...           make each file the vault wrote here this Mac's own
-                                         (confirmed by digest), so the removal of its entry
-                                         leaves the file; prints kept, or why not, per
-                                         name, never a value
   aterm secrets need ls [--all] [--json] this machine's needs (a credential it lacks, asked
                                          of the lab's Macs), --all every request in the
                                          lab's table; need <want> raises one by hand,
                                          need retire <want|id> [--note <text>] withdraws
                                          one, need pass runs this machine's pass now
                                          (aterm secrets need --help)
-  aterm secrets git-credential [--dev-user <login>] [--token-file <path> [--token-key <name>]] [<op>]
+  aterm secrets git-credential [--dev-user <login>] [<op>]
                                          git's credential helper over the registry's gh:dev
-                                         and gh:release entries (or, for the dev token, the
-                                         file --token-file names and, in it, the <name>= line
-                                         --token-key names); one this Mac lacks is filed as a
-                                         need and git's request fails
+                                         and gh:release entries; one this Mac lacks is filed
+                                         as a need and git's request fails
   aterm secrets git-setup [--apply]    plan a local migration of known vault/native Git helpers
                                          to this protected development executable; --apply keeps
                                          exact private rollback files and refuses custom helpers
@@ -270,13 +264,8 @@ enum Command {
         json: bool,
     },
     Get(String),
-    Keep(Vec<String>),
     GitCredential {
         dev_user: Option<String>,
-        /// The dev token's file in place of the secrets registry's gh:dev entry (absolute).
-        token_file: Option<std::path::PathBuf>,
-        /// The `<name>=` line of `token_file` that holds the token.
-        token_key: Option<String>,
         operation: Option<String>,
     },
     GitSetup {
@@ -1196,13 +1185,6 @@ fn parse(words: &[String]) -> Result<Command, String> {
                 _ => Err("get takes one name".into()),
             }
         }
-        "keep" => {
-            let f = flags(rest, &[], &[])?;
-            if f.operands.is_empty() {
-                return Err("keep takes one or more names".into());
-            }
-            Ok(Command::Keep(f.operands))
-        }
         "git-setup" => {
             let f = flags(rest, &[], &["--apply"])?;
             no_operands(&f, "git-setup")?;
@@ -1211,14 +1193,12 @@ fn parse(words: &[String]) -> Result<Command, String> {
             })
         }
         "git-credential" => {
-            let f = flags(rest, &["--dev-user", "--token-file", "--token-key"], &[])?;
+            let f = flags(rest, &["--dev-user"], &[])?;
             if f.operands.len() > 1 {
                 return Err("git-credential takes at most one operation".into());
             }
-            for flag in ["--dev-user", "--token-file", "--token-key"] {
-                if f.all(flag).len() > 1 {
-                    return Err(format!("git-credential takes at most one {flag}"));
-                }
+            if f.all("--dev-user").len() > 1 {
+                return Err("git-credential takes at most one --dev-user".into());
             }
             let dev_user = f.one("--dev-user");
             if dev_user
@@ -1227,26 +1207,8 @@ fn parse(words: &[String]) -> Result<Command, String> {
             {
                 return Err("git-credential --dev-user takes a GitHub login".into());
             }
-            let token_file = f.one("--token-file").map(std::path::PathBuf::from);
-            if token_file
-                .as_deref()
-                .is_some_and(|file| !file.is_absolute())
-            {
-                return Err("git-credential --token-file takes an absolute path".into());
-            }
-            let token_key = f.one("--token-key");
-            if let Some(key) = &token_key {
-                if token_file.is_none() {
-                    return Err("git-credential --token-key reads the --token-file it names".into());
-                }
-                if !crate::token_line::assignable(key) {
-                    return Err("git-credential --token-key takes an assignment name".into());
-                }
-            }
             Ok(Command::GitCredential {
                 dev_user,
-                token_file,
-                token_key,
                 operation: f.operands.first().cloned(),
             })
         }
@@ -1597,19 +1559,10 @@ mod unix {
         }
         if let Command::GitCredential {
             dev_user,
-            token_file,
-            token_key,
             operation,
         } = command
         {
-            let dev = match &token_file {
-                Some(file) => DevToken::File {
-                    file,
-                    key: token_key.as_deref(),
-                },
-                None => DevToken::Vault,
-            };
-            return git_credential(dev_user.as_deref(), &dev, operation.as_deref());
+            return git_credential(dev_user.as_deref(), operation.as_deref());
         }
         let paths = Paths::live()?;
         let state = || service::state(&paths.home, Job::Subscriber);
@@ -1673,7 +1626,6 @@ mod unix {
                 Ok(ExitCode::SUCCESS)
             }
             Command::Get(name) => get(&paths, &name),
-            Command::Keep(names) => keep(&paths, &names),
             Command::GitCredential { .. } => unreachable!(),
             Command::GitSetup { .. } => unreachable!(),
             Command::Create {
@@ -2774,6 +2726,7 @@ mod unix {
             );
         }
         if status.config.is_some() {
+            println!("{STORE_LINE}");
             for line in writes_lines(paths) {
                 println!("{line}");
             }
@@ -2800,7 +2753,7 @@ mod unix {
                 let (plain, tokens) = client::Conflict::split(&conflicts);
                 if !plain.is_empty() {
                     println!(
-                        "conflict: {} (saved with different values while apart; every Mac writes the same one, and {})",
+                        "conflict: {} (saved with different values while apart; every Mac reads the same one, and {})",
                         plain.join(", "),
                         client::CONFLICT_PICK
                     );
@@ -3000,7 +2953,7 @@ mod unix {
         }
         match &outcome {
             JoinOutcome::Joined { seq, names } => {
-                println!("joined: seq {seq}, {} secrets in ~/.secrets", names.len());
+                println!("joined: seq {seq}, {} secrets read in place", names.len());
             }
             JoinOutcome::Pending { code, host } => {
                 let hint = if given.get() {
@@ -3019,7 +2972,7 @@ mod unix {
             }
             JoinOutcome::Plain { names } => {
                 println!(
-                    "reading a plain text file: {} secrets in ~/.secrets",
+                    "reading a plain text file: {} secrets read in place",
                     names.len()
                 );
             }
@@ -3035,10 +2988,8 @@ mod unix {
     pub(super) fn sync_diagnostic(paths: &Paths) -> crate::sync_diagnostic::SyncDiagnostic {
         use crate::sync_diagnostic::SyncDiagnostic;
         match sync_outcome(paths) {
-            Ok((SyncOutcome::Applied { seq, report }, _)) => SyncDiagnostic::Applied {
-                seq,
-                failed: report.failed.len() as u64,
-            },
+            // An apply writes no file, so none fails.
+            Ok((SyncOutcome::Applied { seq, .. }, _)) => SyncDiagnostic::Applied { seq, failed: 0 },
             Ok((SyncOutcome::Unchanged { seq }, _)) => SyncDiagnostic::Unchanged(seq),
             Ok((SyncOutcome::PutBack { seq, .. }, _)) => SyncDiagnostic::PutBack(seq),
             Ok((SyncOutcome::NotIn, _)) => SyncDiagnostic::NotIn,
@@ -3163,31 +3114,17 @@ mod unix {
         };
         match outcome {
             SyncOutcome::Applied { seq, report } => {
-                // The harness reads this line's seq and its failed count (`Vault::of_sync`).
+                // The harness reads this line's seq and its failed count (`Vault::of_sync`). An
+                // apply writes no file, so none fails.
                 println!(
-                    "applied seq {seq}: {} written, {} unchanged, {} removed, {} left in place, {} moved aside, {} failed",
-                    report.written.len(),
-                    report.unchanged.len(),
-                    report.removed.len(),
-                    report.left.len(),
-                    report.moved_aside.len(),
-                    report.failed.len()
+                    "applied seq {seq}: {} read in place, 0 failed",
+                    report.held.len()
                 );
                 first_put_back();
-                for (name, to) in &report.moved_aside {
-                    println!("  {name}: the previous file was moved to {}", to.display());
-                }
-                for (name, why) in &report.failed {
-                    println!("  {name}: failed: {why}");
-                }
                 for (name, why) in &report.refused {
-                    println!("  {name}: not written: {why}");
+                    println!("  {name}: not read: {why}");
                 }
-                Ok(if report.failed.is_empty() {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                })
+                Ok(ExitCode::SUCCESS)
             }
             SyncOutcome::Unchanged { seq } => {
                 println!("up to date at seq {seq}");
@@ -3208,24 +3145,6 @@ mod unix {
         }
     }
 
-    fn keep(paths: &Paths, names: &[String]) -> crate::Result<ExitCode> {
-        let mut all = true;
-        for (name, kept) in client::keep(paths, names)? {
-            match kept {
-                client::Kept::Kept => println!("kept {name}"),
-                client::Kept::Not(why) => {
-                    all = false;
-                    println!("not kept: {why}");
-                }
-            }
-        }
-        Ok(if all {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        })
-    }
-
     fn get(paths: &Paths, name: &str) -> crate::Result<ExitCode> {
         let value = get_value(paths, name)?;
         let mut out = std::io::stdout().lock();
@@ -3240,35 +3159,28 @@ mod unix {
         }
         let expected = client::config(paths)?
             .ok_or_else(|| Error::new("no vault configured; run aterm secrets join"))?;
-        if expected.signer.is_some() {
-            return client::read_verified_entry(paths, &expected, name)?
-                .map(|entry| entry.into_parts().0)
-                .ok_or_else(|| {
-                    Error::new("no verified materialized entry; run aterm secrets sync")
-                });
+        if expected.signer.is_none() {
+            let status = client::status(paths)?;
+            if status.config.as_ref() != Some(&expected)
+                || !matches!(status.membership, client::Membership::Plain)
+            {
+                return Err(Error::new(
+                    "no applied plaintext source; run aterm secrets sync",
+                ));
+            }
         }
-        let status = client::status(paths)?;
-        if status.config.as_ref() != Some(&expected)
-            || !matches!(status.membership, client::Membership::Plain)
-        {
-            return Err(Error::new(
-                "no applied plaintext source; run aterm secrets sync",
-            ));
-        }
-        if !status.names.iter().any(|n| n == name) {
-            return Err(Error::new(format!(
-                "{name} is not among this machine's secrets (aterm secrets ls)"
-            )));
-        }
-        let path = crate::materialize::target_path(&paths.home, name)?;
-        let value = fsx::read_private(&path, text::MAX_VALUE)?.ok_or_else(|| {
+        client::read_in_place(paths, name)?.ok_or_else(|| {
             Error::new(format!(
-                "{}: missing; run aterm secrets sync",
-                path.display()
+                "{name} is not among this machine's verified secrets (aterm secrets ls); run aterm secrets sync"
             ))
-        })?;
-        Ok(value)
+        })
     }
+
+    /// What `secrets status` says of where this Mac's values are, once a vault is configured: the
+    /// verified store is the only copy, and no apply writes a file
+    /// (`docs/DESIGN-secrets-2026-10-20.md` §4).
+    pub(super) const STORE_LINE: &str =
+        "store: this Mac reads the store in place and writes no file";
 
     /// Why `secrets get` refuses a Claude Code token entry (DESIGN-claude-setup-token §4.2).
     pub(super) const CLAUDE_TOKEN_GET: &str = "a Claude Code token, which aterm hands only to Claude Code and never prints; aterm secrets ls --describe shows its state";
@@ -3277,18 +3189,6 @@ mod unix {
     const CREDENTIAL_INPUT_MAX: usize = 64 * 1024;
     const CREDENTIAL_TOKEN_MAX: usize = 4 * 1024;
     const INIT_TOML_MAX: usize = 64 * 1024;
-
-    /// Where `aterm secrets git-credential` reads the dev token.
-    #[derive(Debug, Clone, Copy)]
-    pub(super) enum DevToken<'a> {
-        /// The secrets registry's `gh:dev` entry ([`registry_token`]).
-        Vault,
-        /// `--token-file`, the whole file or (`--token-key`) its `<key>=` line.
-        File {
-            file: &'a Path,
-            key: Option<&'a str>,
-        },
-    }
 
     /// What [`git_credential_reply`] answers: the stdout bytes git reads, and the GitHub profile
     /// the secrets registry could not give, which [`git_credential`] files in the need ledger.
@@ -3321,23 +3221,17 @@ mod unix {
         }
     }
 
-    /// `aterm secrets git-credential [--dev-user <login>] [--token-file <path> [--token-key
-    /// <name>]] [<op>]`: git's credential helper over the secrets registry's GitHub tokens, the
-    /// dev token read from `dev`. Answers on `get` only; `store`, `erase` and unknown operations
+    /// `aterm secrets git-credential [--dev-user <login>] [<op>]`: git's credential helper over
+    /// the secrets registry's GitHub tokens. Answers on `get` only; `store`, `erase` and unknown operations
     /// write nothing and exit 0. A token this Mac's registry does not give is filed in the need
     /// ledger (`aterm secrets need gh:<profile>`) and git's request fails.
-    fn git_credential(
-        dev_user: Option<&str>,
-        dev: &DevToken<'_>,
-        operation: Option<&str>,
-    ) -> crate::Result<ExitCode> {
+    fn git_credential(dev_user: Option<&str>, operation: Option<&str>) -> crate::Result<ExitCode> {
         let stdin = std::io::stdin();
         let is_terminal = stdin.is_terminal();
         let paths = Paths::locate().ok();
         let answer = git_credential_reply(
             paths.as_ref(),
             dev_user,
-            dev,
             operation,
             is_terminal,
             &mut stdin.lock(),
@@ -3360,6 +3254,7 @@ mod unix {
         let purpose = match profile {
             GhProfile::Dev => crate::need::Purpose::AghDev,
             GhProfile::Release => crate::need::Purpose::AghRelease,
+            GhProfile::Fleet => crate::need::Purpose::MachinesKeys,
         };
         let want = Want::Gh(profile);
         let key = want.key();
@@ -3381,7 +3276,6 @@ mod unix {
     pub(super) fn git_credential_reply(
         paths: Option<&Paths>,
         dev_user: Option<&str>,
-        dev: &DevToken<'_>,
         operation: Option<&str>,
         is_terminal: bool,
         input: &mut dyn Read,
@@ -3428,8 +3322,9 @@ mod unix {
         let public = aterm_types::channel::PUBLIC_OWNER;
         if username.is_some_and(|u| u.eq_ignore_ascii_case(public)) {
             return match registry_token(paths, GhProfile::Release) {
-                Some(token) => CredentialAnswer::token(public, &token),
-                None => CredentialAnswer::missing(GhProfile::Release),
+                Ok(Some(token)) => CredentialAnswer::token(public, &token),
+                Ok(None) => CredentialAnswer::missing(GhProfile::Release),
+                Err(()) => CredentialAnswer::reply(CREDENTIAL_QUIT),
             };
         }
         let unnamed =
@@ -3451,10 +3346,10 @@ mod unix {
             }
             requested.to_owned()
         };
-        match read_dev_token(paths, dev) {
-            Some(token) => CredentialAnswer::token(&out_user, &token),
-            None if matches!(dev, DevToken::Vault) => CredentialAnswer::missing(GhProfile::Dev),
-            None => CredentialAnswer::reply(CREDENTIAL_QUIT),
+        match registry_token(paths, GhProfile::Dev) {
+            Ok(Some(token)) => CredentialAnswer::token(&out_user, &token),
+            Ok(None) => CredentialAnswer::missing(GhProfile::Dev),
+            Err(()) => CredentialAnswer::reply(CREDENTIAL_QUIT),
         }
     }
 
@@ -3518,45 +3413,22 @@ mod unix {
         host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("gist.github.com")
     }
 
-    fn read_credential_token(path: &Path) -> Option<SecretBytes> {
-        let raw = fsx::read_private(path, CREDENTIAL_TOKEN_MAX)
-            .ok()
-            .flatten()?;
-        graphic_token(raw.as_slice())
-    }
-
-    /// The `profile` token through the one resolution path: the secrets registry this Mac
-    /// applied names the entry ([`Want::entries`], [`crate::registry::read`]) and its file
-    /// lands where the registry's pointer says ([`crate::materialize::target_path`]). `None`
-    /// where the registry is unread, does not name it, or its file is missing, loose,
-    /// symlinked or not one graphic token.
-    fn registry_token(paths: &Paths, profile: GhProfile) -> Option<SecretBytes> {
-        let names = Want::Gh(profile).entries();
-        let registry = crate::registry::read(paths).ok()?;
-        let entry = registry.iter().find(|entry| names.contains(&entry.name))?;
-        let file = crate::materialize::target_path(&paths.home, &entry.name).ok()?;
-        read_credential_token(&file)
-    }
-
-    /// The dev token `dev` names: the registry's `gh:dev` entry ([`registry_token`]), or the
-    /// `--token-file`, whole or its `--token-key` line ([`crate::token_line::assigned`]); `None`
-    /// where it is missing, loose, symlinked, not one graphic token, or (a key) assigned other
-    /// than once.
-    fn read_dev_token(paths: &Paths, dev: &DevToken<'_>) -> Option<SecretBytes> {
-        match dev {
-            DevToken::Vault => registry_token(paths, GhProfile::Dev),
-            DevToken::File { file, key: None } => read_credential_token(file),
-            DevToken::File {
-                file,
-                key: Some(key),
-            } => {
-                let raw = fsx::read_private(file, CREDENTIAL_INPUT_MAX)
-                    .ok()
-                    .flatten()?;
-                let text = std::str::from_utf8(raw.as_slice()).ok()?;
-                graphic_token(crate::token_line::assigned(text, key).ok()?.as_bytes())
+    /// The `profile` token through the one resolution path: the entry [`Want::entries`] names,
+    /// read in place from this Mac's verified store ([`client::read_in_place`]). `Ok(None)` where
+    /// the store does not hold it or it is not one graphic token of at most
+    /// [`CREDENTIAL_TOKEN_MAX`] bytes; `Err` where the store could not answer (its state stayed
+    /// busy, or could not be read), which is no missing token.
+    fn registry_token(paths: &Paths, profile: GhProfile) -> Result<Option<SecretBytes>, ()> {
+        for name in Want::Gh(profile).entries() {
+            let Some(raw) = client::read_in_place(paths, &name).map_err(|_| ())? else {
+                continue;
+            };
+            if raw.as_slice().len() > CREDENTIAL_TOKEN_MAX {
+                return Ok(None);
             }
+            return Ok(graphic_token(raw.as_slice()));
         }
+        Ok(None)
     }
 
     /// `raw`, trimmed, when it is one token of graphic ASCII.
@@ -4179,6 +4051,7 @@ mod unix {
             if_absent: fill.if_absent,
             anchor,
             fleet_reads_anchors: fill.fleet_reads_anchors,
+            read_as: None,
         };
         let by = std::time::Instant::now() + PERSON_WAIT;
         let written = client::member_set(paths, &entry, client::OnBusy::Refuse(by))?;

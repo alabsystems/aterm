@@ -364,6 +364,56 @@ fn a_session_sums_its_subagent_transcripts_and_nothing_else() {
     assert_eq!(total.assistant_rows, 4);
 }
 
+/// A served row at `stamp` (RFC 3339), as Claude Code writes an API response.
+fn served_row(id: &str, stamp: &str) -> String {
+    format!(
+        "{{\"type\":\"assistant\",\"timestamp\":\"{stamp}\",\"isSidechain\":false,\"message\":{{\"id\":\"{id}\",\"model\":\"claude-opus-5-5\",\"role\":\"assistant\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":20}}}}}}\n"
+    )
+}
+
+/// The footer's facts say when the API last served this session a row, in any of its files: a
+/// subagent's newer row moves it, and the main transcript's older one does not take it back.
+#[test]
+fn usage_facts_say_when_the_api_last_served_a_row_subagents_included() {
+    let dir = TestDir::new("served");
+    let main = dir.join("abc-123.jsonl");
+    let early = "2026-09-27T11:00:00Z";
+    let late = "2026-09-27T13:00:00Z";
+    let at =
+        |stamp: &str| super::super::unix_time::parse_utc(stamp).and_then(|t| i64::try_from(t).ok());
+    append(&main, &served_row("m1", early));
+    let place = |_: Option<&str>, _: i64| None;
+    let mut cache = super::super::footer::FooterCache::default();
+    let now = at(late).expect("a time") + 60;
+    let facts = cache
+        .usage(Some(main.clone()), now, &place)
+        .expect("tokens");
+    assert_eq!(
+        facts.served_at,
+        at(early),
+        "CONTROL: the main transcript's row"
+    );
+
+    let subs = dir.join("abc-123").join("subagents");
+    fs::create_dir_all(&subs).expect("dirs");
+    append(&subs.join("agent-a1.jsonl"), &served_row("s1", late));
+    let facts = cache
+        .usage(Some(main.clone()), now, &place)
+        .expect("tokens");
+    assert_eq!(
+        facts.served_at,
+        at(late),
+        "a subagent's newer row is the session's last served"
+    );
+    append(&main, &served_row("m2", "2026-09-27T12:00:00Z"));
+    let facts = cache.usage(Some(main), now, &place).expect("tokens");
+    assert_eq!(
+        facts.served_at,
+        at(late),
+        "an older main row does not take it back"
+    );
+}
+
 #[test]
 fn the_traffic_view_is_the_whole_sessions() {
     let dir = TestDir::new("traffic");

@@ -1067,6 +1067,7 @@ impl App {
         self.sync_settings_consent_posture();
         self.sync_settings_session_runtime();
         self.sync_active_session();
+        self.note_restore_focus_intent(wid);
         if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             window.focus_window();
             window.request_redraw();

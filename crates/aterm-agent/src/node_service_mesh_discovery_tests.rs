@@ -65,12 +65,36 @@ fn address_changes_follow_one_injected_period_and_unproved_hints_never_enter_cac
     restarted.restore(scratch.path());
     assert_eq!(restarted.addresses, service.addresses);
     let mut legacy = MeshDiscovery::new(false);
-    assert!(!legacy.refresh(
-        now,
-        || panic!("legacy resolves no mesh hints"),
-        |_| panic!("legacy proves no mesh hints")
-    ));
+    assert!(!legacy.refresh(now, hints, |_| None));
     assert!(legacy.addresses.is_empty());
+}
+
+#[test]
+fn legacy_routes_survive_a_restart_and_follow_a_new_port_without_enabling_mesh() {
+    let mut service = MeshDiscovery::new(false);
+    let node = "0123456789abcdef0123456789abcdef";
+    let now = Instant::now();
+    let first = "127.0.0.1:7100".parse().unwrap();
+    let moved = "127.0.0.2:7200".parse().unwrap();
+    assert!(service.refresh(
+        now,
+        || vec![hint("member.local")],
+        |_| Some((node.into(), first))
+    ));
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    aterm_uds::private_file::ensure_private_dir(scratch.path()).unwrap();
+    service.save(scratch.path()).unwrap();
+    let mut restarted = MeshDiscovery::new(false);
+    restarted.restore(scratch.path());
+    assert_eq!(mesh_addresses(scratch.path()), vec![(node.into(), first)]);
+    assert_eq!(restarted.addresses, service.addresses);
+    assert!(restarted.refresh(
+        now + DISCOVERY_PERIOD,
+        || vec![hint("member.local")],
+        |_| Some((node.into(), moved))
+    ));
+    restarted.save(scratch.path()).unwrap();
+    assert_eq!(mesh_addresses(scratch.path()), vec![(node.into(), moved)]);
 }
 
 #[test]

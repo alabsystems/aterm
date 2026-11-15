@@ -147,13 +147,17 @@ fn project_with(
         let configured = records.raw_roster.row(&row.label);
         let current_task = configured.and_then(|raw| accounts::current_sign_in_task(raw, &records.logins));
         let current_attempt = configured.and_then(|raw| accounts::current_sign_in_attempt(raw, &records.logins));
+        // A row on its vault token here runs on it, and renewal is off for it: no recovery or
+        // renewal is its next step, as the report and the account card say.
+        let on_token = accounts::on_token_here(row, &records.state, now);
         let next_step = current_task
             .map(|task| task.action.next_step(Cli::Claude, &row.label))
             .or_else(|| {
                 (account.current_auth(row) == Auth::SignedOut
                     || current_attempt.is_some_and(|attempt| attempt.outcome.failing()))
                     .then(|| "Run aterm harness accounts to inspect recovery details".into())
-            });
+            })
+            .filter(|_| on_token.is_none());
         let auth = match account.auth {
             Auth::Unseen => "Unknown; no sign-in observation",
             Auth::Ok => "Signed in on record; not checked now",
@@ -185,6 +189,12 @@ fn project_with(
             }.into()),
             ("Renewal binding".into(), if binding.is_some() { "Recorded" } else { "No binding recorded" }.into()),
         ];
+        if let Some(until) = on_token {
+            facts.push(("Runs on".into(), format!(
+                "Its vault year token here until {}; renewal is off for it",
+                recorded_time(Some(until))
+            )));
+        }
         if row.held_by.is_some() {
             facts.push(("Pool assignment".into(), "Assignment on record; owner not checked here".into()));
         }
@@ -220,6 +230,7 @@ fn project_with(
                     AttemptOutcome::Failed => "The sign-in attempt failed",
                     AttemptOutcome::Blocked => "The sign-in page stopped the attempt",
                     AttemptOutcome::SignedIn => "Succeeded on record; current sign-in is unverified",
+                    AttemptOutcome::OnToken => "Its vault year token was in use here; no browser opened",
                 }.into()));
                 facts.push(("Attempt observed".into(), observation_time(Some(attempt.since), now)));
                 facts.push(("Attempt applicability".into(), if current_attempt.is_some() {

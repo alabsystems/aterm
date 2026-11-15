@@ -3,7 +3,9 @@
 
 use aterm_spec::derive::Model;
 
-/// Manual account metadata and its local fleet share one recoverable intent.
+/// Manual account metadata and its local fleet share one recoverable intent. `legacy` is the copy
+/// of the fleet an earlier build left in `~/.secrets`, which nothing reads: a commit retires no
+/// source for it and leaves it as it was.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn account_manual_receipt_model() -> Model {
@@ -24,14 +26,13 @@ pub fn account_manual_receipt_model() -> Model {
                 inputs = if Buggy == 5 {0} else {1};
                 records = if Buggy == 3 {0} else {1};
                 complete = if cut > 0 {if Buggy == 4 {0} else {1}} else {0};
-                retired = if legacy == 1 && cut > 0 {if Buggy == 2 {0} else {1}} else {0};
+                retired = if legacy == 1 && cut > 0 && Buggy == 2 {1} else {0};
             }
             invariant BeforeIntentIsClean: durable == 1 || intact == 1;
             invariant InputsPreserved: inputs == 1;
             invariant AccountRecordsPreserved: records == 1;
             invariant AdmittedCompletes: done == 0 || durable == 0 || complete == 1;
-            invariant RetirementFollowsIntent: (legacy == 1 && durable == 1 && retired == 1)
-                || ((legacy == 0 || durable == 0) && retired == 0);
+            invariant NoCopyRetires: retired == 0;
             bound ManualDomain: operation <= 1 && legacy <= 1 && cut <= 3 && done <= 1
                 && durable <= 1 && pending <= 1 && complete <= 1 && intact <= 1
                 && inputs <= 1 && records <= 1 && retired <= 1;

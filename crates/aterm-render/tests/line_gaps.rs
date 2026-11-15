@@ -20,7 +20,7 @@
 //! tests do not name cannot fill a gap unseen. It was written when one did: the rail was
 //! parted and the underline's body, a band in the same pixel rows, was not.
 
-use crate::trail_film::{Take, film_replay};
+use crate::trail_film::{Lane, Take, film_replay};
 use crate::trail_letters_read::*;
 use aterm_effects::rainbow_kitty::ribbon::ROW_RAIL_CH;
 use std::collections::HashMap;
@@ -77,7 +77,7 @@ fn gaps(style: &str, look: Look, caret: &[u8]) -> Gaps {
         .max()
         .expect("the scene types");
     let first = (last_key + 100).div_ceil(16);
-    let mut r = film_replay(style, look, rows, cols);
+    let mut r = film_replay(style, look, rows, cols, Lane::Paper);
     r.keep = (first..first + 19).map(|k| k * 16).collect();
     let _ = r.run(&ev, tail);
     let mut out = Gaps::default();

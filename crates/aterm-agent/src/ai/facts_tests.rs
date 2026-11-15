@@ -580,6 +580,185 @@ fn claude_accounts_surfaces_next_sign_in_and_prefers_ready_enrolled_row() {
     );
 }
 
+/// A ROW ON ITS VAULT YEAR TOKEN SERVES NO REVIEW, AND THE AI ROW SAYS WHAT THE REPORT SAYS: a
+/// review runs `claude -p --output-format text`, no session-starting shape, so the token never
+/// serves it (`token_route::shape_refusal`) and it would run on the row's lapsed stored login.
+/// `tok`, active, signed out on record, whose token the upkeep read in use here, is one rotation
+/// picks (`accounts::condition` reads it usable), but a review takes the ready row `spare`
+/// instead, and with no ready row it refuses rather than run on `tok`'s dead login. The AI row
+/// then serves `tok` and says `on-token`, the report's word for its login, with its token's end,
+/// never that its login ended, and offers no sign-in (renewal is off for it); `aterm ai review`
+/// skips it in those words. NEGATIVE CONTROL: with the review judging rows by
+/// `accounts::condition`, `tok` was the review's serving row and `aterm ai review` ran `claude -p`
+/// on its lapsed login; with the AI row reading the record's sign-out, it said "its login has
+/// ended" beside the report's `on-token`.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "a launch starts on a vault token only on macOS"
+)]
+fn a_row_on_its_vault_token_serves_no_review_and_the_ai_row_says_on_token() {
+    use crate::ai::state::{Mark, State, assess};
+    use crate::harness::accounts;
+    const YEAR: i64 = 365 * 86_400;
+    let b = machine(&["claude"]);
+    let now = 1_800_000_000_i64;
+    let h_state = b.dir.path().join("harness-state");
+    let store = accounts::Store::at(&h_state);
+    let made = |label: &str| {
+        let dir = store.login_dir(label).expect("login dir");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(".credentials.json"), "{}").expect("enroll");
+        dir.display().to_string()
+    };
+    let roster_path = b.dir.path().join("accounts.toml");
+    std::fs::write(
+        &roster_path,
+        format!(
+            "[[account]]\nlabel = \"tok\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"tok@example.test\"\n\n\
+             [[account]]\nlabel = \"spare\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"spare@example.test\"\n",
+            made("tok"),
+            made("spare"),
+        ),
+    )
+    .expect("roster");
+    let mut note = None;
+    store
+        .transact_logins(now - 120, &mut note, |state, _| {
+            state.active = Some("tok".to_owned());
+            let mut events =
+                accounts::note_auth(state, "tok", accounts::Auth::SignedOut, now - 120);
+            events.extend(accounts::note_auth(
+                state,
+                "spare",
+                accounts::Auth::Ok,
+                now - 120,
+            ));
+            Ok(events)
+        })
+        .expect("records");
+    store
+        .note_tokens_here(
+            Some(&[("tok".to_owned(), u64::try_from(now + YEAR).unwrap())].into()),
+            now - 60,
+        )
+        .expect("the upkeep's reading");
+    let home_str = b.home.display().to_string();
+    let var = |k: &str| (k == "HOME").then(|| home_str.clone());
+    let m = Machine {
+        now,
+        home: Some(b.home.clone()),
+        var: &var,
+        pkg: Some(b.pkg.clone()),
+        exclude: Vec::new(),
+        records: Records::default(),
+        harness_state: Some(h_state.clone()),
+        roster: Some(roster_path.clone()),
+        accounts_mode: None,
+        config: None,
+    };
+    let records = store
+        .read_account_records(Some(&roster_path), now)
+        .expect("records");
+    let enrolled = accounts::enrolled(&records.roster);
+    let tok = records.roster.row("tok").expect("tok");
+    assert_eq!(
+        accounts::login_here(tok, &records.state, true, now),
+        accounts::LoginHere::OnToken
+    );
+    assert_eq!(
+        accounts::condition(tok, &records.state, true, now),
+        accounts::Condition::Usable,
+        "rotation picks it"
+    );
+    let serving = |records: &accounts::AccountRecords| {
+        select_claude_serving_row(&records.roster, &records.state, &enrolled, now)
+            .map(|(row, ready)| (row.label.clone(), ready))
+    };
+    assert_eq!(
+        serving(&records),
+        Some(("spare".to_owned(), true)),
+        "a review takes the ready row, never the one only its token runs"
+    );
+    let review = |records_now: i64| {
+        crate::harness::accounts_sync::capture_current_review(
+            &store,
+            accounts::Cli::Claude,
+            Some(&roster_path),
+            accounts::Mode::Wall,
+            None,
+            records_now,
+        )
+        .map(|capture| capture.witness.row().map(|row| row.label.clone()))
+    };
+    assert_eq!(review(now), Ok(Some("spare".to_owned())));
+    assert_eq!(gather(&m, &CLAUDE).accounts.expect("view").label, "spare");
+
+    // No row but `tok` could run a review: none runs, rather than one on its dead login.
+    store
+        .transact_logins(now - 30, &mut note, |state, _| {
+            Ok(accounts::note_auth(
+                state,
+                "spare",
+                accounts::Auth::SignedOut,
+                now - 30,
+            ))
+        })
+        .expect("spare signed out");
+    let records = store
+        .read_account_records(Some(&roster_path), now)
+        .expect("records");
+    assert_eq!(serving(&records), Some(("tok".to_owned(), false)));
+    assert_eq!(
+        review(now),
+        Err("no Claude account can serve a review now".to_owned())
+    );
+    let f = gather(&m, &CLAUDE);
+    let view = f.accounts.clone().expect("view");
+    assert_eq!(view.label, "tok");
+    assert_eq!(view.state, Some(accounts::LoginHere::ON_TOKEN));
+    assert_eq!(view.on_token_until, Some(now + YEAR));
+    assert_eq!(
+        view.signed_out_at, None,
+        "its login is on its token, not ended"
+    );
+    let row = assess(&f, true, now);
+    assert_eq!(row.state, State::OnToken(now + YEAR));
+    assert_eq!(
+        row.state.word(),
+        accounts::LoginState::OnToken { until: now + YEAR }.as_str(),
+        "the AI row's word is the report's"
+    );
+    assert_eq!(row.mark, Mark::Note);
+    assert!(!row.state.usable() && !row.state.needs_act(true), "{row:?}");
+    assert!(row.fact.contains("vault year token"), "{}", row.fact);
+    assert!(!row.fact.contains("has ended"), "{}", row.fact);
+    assert_eq!(
+        (row.fix.as_deref(), row.mend.as_deref()),
+        (None, None),
+        "renewal is off for it"
+    );
+    let rows = [row];
+    let skipped = crate::ai::review::candidates(&[&CLAUDE], None, "codex", &rows, now);
+    assert!(
+        skipped[0]
+            .1
+            .as_deref()
+            .is_some_and(|why| why.starts_with("on-token (")),
+        "{skipped:?}"
+    );
+
+    // CONTROL: with no reading, the same row is signed out in every place.
+    store
+        .note_tokens_here(Some(&std::collections::BTreeMap::new()), now)
+        .expect("no reading");
+    let f = gather(&m, &CLAUDE);
+    let view = f.accounts.clone().expect("view");
+    assert_eq!(view.state, Some("expired"));
+    assert!(view.signed_out_at.is_some());
+    assert_eq!(assess(&f, true, now).state, State::SignedOut);
+}
+
 #[test]
 fn a_clis_own_roster_beside_accounts_toml_is_its_pool_and_names_the_row_to_sign_in() {
     use crate::ai::connector::KIMI;
@@ -2217,16 +2396,14 @@ fn held_by_rows_are_excluded_from_due_next_and_next_sign_in() {
 fn the_next_sign_in_is_never_another_macs_account() {
     use crate::harness::accounts;
     let sheet = |home: &Path, computer: &str, cells: &str| {
-        let secrets = home.join(".secrets");
-        aterm_types::fs_restricted::ensure_private_dir(&secrets).expect("secrets");
-        std::fs::write(
-            secrets.join(crate::harness::accounts_sync::ACCOUNTS_CSV_FILE),
+        crate::vault_entry::put(
+            home,
+            crate::harness::accounts_sync::ACCOUNTS_CSV_FILE,
             format!(
                 "m,email,computer,,claude,Open AI,xai,kimi,google,meta,Payment,notes\n\
                  ,other@example.test,{computer},,{cells},,,,\n"
             ),
-        )
-        .expect("sheet");
+        );
     };
 
     let pool = DoctorPool::new(true, None);
@@ -2355,16 +2532,14 @@ fn another_macs_refusal_names_each_clis_own_sign_in() {
 fn a_serving_row_of_another_macs_is_refused_unless_a_person_pinned_it() {
     use crate::harness::accounts;
     let sheet = |home: &Path, computer: &str, cells: &str| {
-        let secrets = home.join(".secrets");
-        aterm_types::fs_restricted::ensure_private_dir(&secrets).expect("secrets");
-        std::fs::write(
-            secrets.join(crate::harness::accounts_sync::ACCOUNTS_CSV_FILE),
+        crate::vault_entry::put(
+            home,
+            crate::harness::accounts_sync::ACCOUNTS_CSV_FILE,
             format!(
                 "m,email,computer,,claude,Open AI,xai,kimi,google,meta,Payment,notes\n\
                  ,other@example.test,{computer},,{cells},,,,\n"
             ),
-        )
-        .expect("sheet");
+        );
     };
 
     let b = machine(&["claude"]);

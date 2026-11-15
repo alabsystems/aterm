@@ -324,10 +324,10 @@ fn wall_name(point: AccountPoint) -> Option<&'static str> {
         return None;
     };
     kind.reads_limited().then_some(match kind {
-        aterm_phase::WallKind::UsageWeekly => "weekly",
-        aterm_phase::WallKind::UsageSession => "session",
-        aterm_phase::WallKind::ModelBucket { .. } => "model",
-        aterm_phase::WallKind::Spend => "spend",
+        alab_policy::vocab::WallKind::UsageWeekly => "weekly",
+        alab_policy::vocab::WallKind::UsageSession => "session",
+        alab_policy::vocab::WallKind::ModelBucket { .. } => "model",
+        alab_policy::vocab::WallKind::Spend => "spend",
         _ => "rate",
     })
 }

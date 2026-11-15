@@ -4,8 +4,8 @@
 //! Tests for the journal reader's view over simulated writer chains.
 
 use aterm_slog::journal::{
-    ChainRead, EndWhy, FORMAT, Frame, Inst, Liveness, SegmentRead, View, ViewRules, complete_lines,
-    decode_line, encode_frame, take, take_frames, view_of,
+    ChainRead, EndWhy, FORMAT, Frame, Inst, Liveness, Pick, SegmentRead, View, ViewRules,
+    complete_lines, decode_line, encode_frame, take, take_frames, view_of, view_picked,
 };
 use aterm_slog::{
     Actor, CarryAdopt, CarryBudget, Close, Conf, Cursor, Fields, GapWhy, IdCounters, Key, Kind,
@@ -603,6 +603,161 @@ fn the_journal_shows_the_relaunchs_own_open() {
     assert!(
         !own(&merged),
         "NEGATIVE CONTROL: the merged view is the relaunch's: {merged:?}"
+    );
+}
+
+/// A tab keeps its ID across a cold restore (LT-01), so its sid names the log it kept before
+/// the relaunch as well as the relaunch's own: a pick counted back from the relaunch's log, or
+/// from the newest, answers the earlier one whole, and a pick past the oldest answers none.
+#[test]
+fn a_pick_before_the_relaunchs_log_answers_the_one_it_followed() {
+    let s = 1_792_100_000;
+    let (a, b) = (relaunched(s, 0, 6), relaunched(s + 1, 1000, 10));
+    let mut wa = Writer::new("p1-aaaa", 0);
+    wa.pass(&a, 512);
+    wa.fin(EndWhy::Quit);
+    let mut wb = Writer::new("p2-bbbb", 100);
+    wb.pass(&b, 512);
+    let chains = [wa.read(Liveness::Dead), wb.read(Liveness::Live)];
+    let pick = |pick: Pick| view_picked(&sid(), &chains, false, ViewRules::READER, pick);
+    let earlier = |recs: &[Rec]| {
+        recs.len() == 7
+            && recs.first().map(|r| r.k) == Some(Kind::Spawn)
+            && recs.iter().all(|r| r.t < at(1000).wall_ms)
+    };
+    let newest = pick(Pick::Newest).expect("the relaunch's log");
+    assert_eq!(newest.log.base_ep(), s + 1);
+    assert!(
+        !earlier(&all(&newest.log)),
+        "PRECONDITION: the newest is the relaunch's"
+    );
+    for from in [Some(s + 1), None] {
+        let v = pick(Pick::Before {
+            below: from,
+            back: 1,
+        })
+        .unwrap_or_else(|| panic!("the log before {from:?}"));
+        assert_eq!(v.log.base_ep(), s, "from {from:?}");
+        let recs = all(&v.log);
+        assert!(earlier(&recs), "from {from:?}: {recs:?}");
+        assert!(!v.crashed, "a quit's chain reads no crash");
+    }
+    for (pick, why) in [
+        (
+            Pick::Before {
+                below: Some(s),
+                back: 1,
+            },
+            "no log before the first",
+        ),
+        (
+            Pick::Before {
+                below: Some(s + 1),
+                back: 2,
+            },
+            "two back from the relaunch's is past the first",
+        ),
+        (
+            Pick::Before {
+                below: None,
+                back: 0,
+            },
+            "zero back picks none",
+        ),
+    ] {
+        assert!(
+            view_picked(&sid(), &chains, false, ViewRules::READER, pick).is_none(),
+            "{why}"
+        );
+    }
+}
+
+/// A kill ends its process's chain with no `#fin`, so the log a tab kept in that process, once a
+/// relaunch restores the tab under its ID (LT-01) and starts it a new log, is an earlier log whose
+/// chain is dead: a pick of it reads it crashed, judged by the chain that wrote that log and not
+/// by the newest one, with the crash's closes derived (`gap why=crash`, the session `out=gone`
+/// by aterm), as a read of the newest would. NEGATIVE CONTROL: the log before it, which a quit
+/// ended, reads no crash.
+#[test]
+fn a_pick_of_a_log_its_process_was_killed_under_reads_the_crash() {
+    let s = 1_792_200_000;
+    let (quit, killed, live) = (
+        relaunched(s, 0, 6),
+        relaunched(s + 1, 1000, 4),
+        relaunched(s + 2, 2000, 2),
+    );
+    let mut wa = Writer::new("p1-aaaa", 0);
+    wa.pass(&quit, 512);
+    wa.fin(EndWhy::Quit);
+    let mut wb = Writer::new("p2-bbbb", 100);
+    wb.pass(&killed, 512);
+    let mut wc = Writer::new("p3-cccc", 200);
+    wc.pass(&live, 512);
+    let chains = [
+        wa.read(Liveness::Dead),
+        wb.read(Liveness::Dead),
+        wc.read(Liveness::Live),
+    ];
+    assert!(
+        chains[0].ended && !chains[1].ended,
+        "PRECONDITION: the quit's chain ends, the kill's does not"
+    );
+    let pick = |pick: Pick| view_picked(&sid(), &chains, false, ViewRules::READER, pick);
+    let newest = pick(Pick::Newest).expect("the kill's relaunch's log");
+    assert_eq!(newest.log.base_ep(), s + 2);
+    assert!(!newest.crashed, "a live chain reads no crash");
+    let head = killed.last_seq();
+    for below in [Some(s + 2), None] {
+        let v = pick(Pick::Before { below, back: 1 })
+            .unwrap_or_else(|| panic!("the killed log, before {below:?}"));
+        assert_eq!(v.log.base_ep(), s + 1, "from {below:?}");
+        assert!(v.crashed, "from {below:?}: the killed log reads crashed");
+        assert_eq!(v.head, head, "from {below:?}");
+        let recs = all(&v.log);
+        assert!(
+            recs[..head as usize]
+                .iter()
+                .all(|r| (at(1000).wall_ms..at(2000).wall_ms).contains(&r.t)),
+            "from {below:?}: the killed process's own records: {recs:?}"
+        );
+        let tail: Vec<String> = recs[head as usize..]
+            .iter()
+            .map(|r| aterm_slog::encode(r, aterm_slog::Tier::Host).expect("fits"))
+            .collect();
+        assert_eq!(
+            tail.len(),
+            2,
+            "from {below:?}: the gap and the close: {tail:?}"
+        );
+        assert!(
+            tail[0].starts_with(&format!("{} gap - gap why=crash after={head}", head + 1)),
+            "from {below:?}: {tail:?}"
+        );
+        assert!(
+            tail[1].starts_with(&format!("{} close - spawn out=gone ", head + 2))
+                && tail[1].contains(" by=aterm "),
+            "from {below:?}: {tail:?}"
+        );
+        assert!(!v.log.is_open(Node::SESSION), "from {below:?}");
+    }
+    let before = pick(Pick::Before {
+        below: Some(s + 2),
+        back: 2,
+    })
+    .expect("the quit's log, two back");
+    assert_eq!(before.log.base_ep(), s);
+    assert!(
+        !before.crashed,
+        "NEGATIVE CONTROL: the log a quit ended reads no crash"
+    );
+    assert_eq!(all(&before.log).len(), 7, "the quit's log whole");
+    assert!(
+        pick(Pick::Before {
+            below: Some(s + 2),
+            back: 3,
+        })
+        .is_none(),
+        "no log before the quit's"
     );
 }
 

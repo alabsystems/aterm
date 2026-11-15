@@ -28,12 +28,14 @@ struct Truth {
     vouched: i64,
     terms: i64,
     above: i64,
+    /// Tab cause eligibility: 1 below its actual-CPU floor threshold, 2 above it.
     tab: i64,
     young: i64,
     bycpu: i64,
     bycount: i64,
     swept: i64,
     live: i64,
+    /// Possible role after all unresolved app and global CPU is assigned to the caller.
     bound: i64,
     /// The birth of the lowest pid above 1, unix ms.
     lowpid_ms: i64,
@@ -176,7 +178,13 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
             "a coalition reaped after 1.50 cores on the calm Mac",
             window(reaped_1510()),
             1,
-            Truth { lost: 1, ..T1510 },
+            Truth {
+                lost: 1,
+                // The tab's 120mc is minor in 1900mc, but the unresolved 1500mc could
+                // make it the main owner. Ignoring the residual must not hide that bound.
+                bound: 3,
+                ..T1510
+            },
         ),
         (
             "a build that finished between sweeps",
@@ -199,8 +207,11 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
             window(claude_reaped_1032()),
             1,
             Truth {
-                tab: 2,
-                live: 3,
+                tab: 1,
+                // The 3200mc counter charge includes 3000mc of ambiguous inherited
+                // time. Its independent 200mc floor is minor; the unresolved work
+                // could still make this tab the main owner.
+                live: 1,
                 bound: 3,
                 ..T1032
             },
@@ -259,7 +270,9 @@ fn role(r: Role) -> i64 {
         Role::Part => 2,
         Role::Main => 3,
         Role::Unavailable("truncated") => 4,
-        Role::Unavailable("not_sampled") => 5,
+        // Both reasons leave more than one possible role. The projection checks
+        // ambiguous-reap evidence separately before using this abstract bound class.
+        Role::Unavailable("not_sampled" | "ambiguous_reap") => 5,
         Role::Unavailable(_) => 6,
     }
 }
@@ -303,6 +316,37 @@ fn project(m: &Model, t: Truth, snap: &Snapshot, tab: u64) -> [S; 3] {
         ("fresh", 0),
     ]);
     let cpu = account(WhySubject::Cpu, Some(tab), snap);
+    if cpu.you.role == Role::Unavailable("ambiguous_reap") {
+        assert!(facts.split.ambiguous_tabs.contains(&tab));
+        let floor = facts
+            .split
+            .tab_floors
+            .iter()
+            .filter(|(key, _)| *key == tab)
+            .map(|(_, cpu)| *cpu)
+            .sum();
+        assert_eq!(
+            cpu.you.figure,
+            Some(floor),
+            "ambiguous charge exposes only its independent floor"
+        );
+        assert_ne!(
+            t.live, t.bound,
+            "the model's unavailable bound needs distinct possible roles"
+        );
+        assert!(cpu.you.share_pm.is_none());
+        let above = aterm_vitals::explain::detect::above_floor(floor, facts.split.global_mc);
+        assert_eq!(
+            t.tab,
+            if above { 2 } else { 1 },
+            "tab cause eligibility follows the actual floor, not its inherited counter charge"
+        );
+        assert_eq!(
+            tab_work.is_some(),
+            above,
+            "ambiguous inherited charge cannot promote a below-threshold floor to TabWork"
+        );
+    }
     let mut mid = pre.clone();
     mid.extend([
         ("shown", flag(spotlight.is_some())),
@@ -384,8 +428,21 @@ fn a_residual_left_uncovered_is_caught_by_lost_work_never_nothing_needed() {
         .find(|c| c.0.starts_with("a coalition reaped"))
         .expect("the reaped coalition");
     let model = explain_honesty_model();
+    let reference = read(&samples, None);
     let snap = read(&samples, Some(Fault::IgnoreUnaccounted));
     let healthy = interp::with_buggy(&model, 0);
+    let reference_states = project(&healthy, truth, &reference, tab);
+    assert!(
+        replay(&healthy, &reference_states, &["Detect", "Attach"])
+            .expect("the healthy model admits the residual and its role bound")
+            .is_empty()
+    );
+    let reference_account = account(WhySubject::Cpu, Some(tab), &reference);
+    let faulty_account = account(WhySubject::Cpu, Some(tab), &snap);
+    assert_eq!(reference_account.you.role, Role::Unavailable("not_sampled"));
+    assert_eq!(faulty_account.you.role, reference_account.you.role);
+    assert!(!reference_account.nothing_needed);
+    assert!(faulty_account.nothing_needed);
     let states = project(&healthy, truth, &snap, tab);
     assert!(
         replay(&healthy, &states, &["Detect", "Attach"]).is_err(),

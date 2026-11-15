@@ -146,6 +146,23 @@ fn readable_live(
 
 impl Activity {
     pub(super) fn read(collection: &Collection, operations: &[&Op], index: &Index) -> Self {
+        Self::read_inner::<true>(collection, operations, index)
+    }
+
+    #[cfg(test)]
+    pub(super) fn read_reference(
+        collection: &Collection,
+        operations: &[&Op],
+        index: &Index,
+    ) -> Self {
+        Self::read_inner::<false>(collection, operations, index)
+    }
+
+    fn read_inner<const COLLAPSE_INITIAL: bool>(
+        collection: &Collection,
+        operations: &[&Op],
+        index: &Index,
+    ) -> Self {
         let mut out = Self {
             default: State::default(),
             rows: BTreeMap::new(),
@@ -184,6 +201,32 @@ impl Activity {
         }
         let ordered = index.project().ordered;
         for (pk, writes) in rows {
+            // Equal native assertions cannot conflict on any causal frontier, and no
+            // inactive period exists between them. Keep their source identities for
+            // lifecycle carries without retaining one frame per unrelated operation.
+            let first = &writes.first_key_value().unwrap().1.0;
+            if COLLAPSE_INITIAL
+                && cell::carried_refs(first).is_none()
+                && writes
+                    .values()
+                    .all(|(value, reverted)| !reverted && value == first)
+                && readable_live(
+                    collection,
+                    &pk,
+                    std::iter::once((*writes.first_key_value().unwrap().0, first.clone())),
+                ) == (true, true)
+            {
+                out.rows.insert(
+                    pk,
+                    Row {
+                        frames: BTreeMap::new(),
+                        current: out.default.clone(),
+                        #[cfg(any(unix, test))]
+                        writes: writes.into_keys().collect(),
+                    },
+                );
+                continue;
+            }
             let empty = Arc::new(Frame {
                 frontier: BTreeSet::new(),
                 state: out.default.clone(),

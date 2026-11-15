@@ -252,6 +252,7 @@ pub(super) fn actor(world: &Path, mode: &str) {
                 live: Some(live),
                 cancelled: false,
             }),
+            None,
         )
     } else {
         supervise_terminal_controlled(

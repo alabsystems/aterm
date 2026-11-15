@@ -62,6 +62,7 @@ use serde::{Deserialize, Serialize};
 use super::super::truncate_bytes;
 use super::super::usage::rfc3339_utc;
 use super::fill::Projection;
+use super::harness_mark;
 use super::{Hog, Level, ROW_TEXT_CAP, human_bytes};
 
 /// The rule's name: its line, its ledger rows and the log say it.

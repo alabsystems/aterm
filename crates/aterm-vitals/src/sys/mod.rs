@@ -39,9 +39,12 @@ pub const UNAVAILABLE_WORDS: &[&str] = &[
     "refused",
     "gone",
     "warming",
+    "stalled",
     "asleep",
     "truncated",
     "not_sampled",
+    "ambiguous_reap",
+    "mixed_ownership",
     "no_counter_delta",
     "hung",
     "protected",
@@ -92,6 +95,9 @@ pub enum Freshness {
     Stale,
     /// The first sample of a cold instance: rates are not known yet.
     Warming,
+    /// A reading as fresh as asked whose stalled lanes' figures are unknown
+    /// ([`crate::lanes`]): every other figure is fresh.
+    Partial,
 }
 
 impl Freshness {
@@ -102,6 +108,7 @@ impl Freshness {
             Self::Fresh => "fresh",
             Self::Stale => "stale",
             Self::Warming => "warming",
+            Self::Partial => "partial",
         }
     }
 }
@@ -132,7 +139,7 @@ impl Machine {
 pub struct TabFact {
     /// The host's key for it (its local session id; the snapshot's tab key).
     pub key: u64,
-    /// Its stable session id (`s-…`).
+    /// Its stable session id, a tab ID (`tqn5r6e0148`).
     pub sid: String,
     /// Its window's stable id (`sessions`' `window=`); `None` for a session no window shows.
     pub window: Option<usize>,

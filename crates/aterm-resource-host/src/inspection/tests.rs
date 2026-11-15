@@ -10,7 +10,7 @@ fn observation() -> Value {
     let kind = "macos_wall_microseconds";
     #[cfg(not(target_os = "macos"))]
     let kind = "linux_start_ticks";
-    aterm_json::json!({"version":3,"ready":true,"session":"s-a","attempt":"ab".repeat(16),
+    aterm_json::json!({"version":3,"ready":true,"session":"s-0000000000000000000a","attempt":"ab".repeat(16),
         "host":"fixture","boot":"cd".repeat(16),"root_pid":7,"root_birth":8,"root_birth_kind":kind,
         "subject":{"mode":"root","pid":7,"birth":8},
         "cpu":{"mode":"retained_fixed","units":1,"native_manifest":{"device":1,"inode":2}},
@@ -20,14 +20,14 @@ fn observation() -> Value {
 #[test]
 fn malformed_custody_and_oversized_prefix_are_rejected() {
     let good = observation();
-    validate(&good, "s-a").unwrap();
+    validate(&good, "s-0000000000000000000a").unwrap();
     let mut shared = good.clone();
     shared.as_object_mut().unwrap().insert(
         "cpu".into(),
         aterm_json::json!({
         "mode":"cooperative_shared","ceiling":4,"native_manifest":{"device":1,"inode":2}}),
     );
-    validate(&shared, "s-a").unwrap();
+    validate(&shared, "s-0000000000000000000a").unwrap();
     shared
         .as_object_mut()
         .unwrap()
@@ -36,7 +36,7 @@ fn malformed_custody_and_oversized_prefix_are_rejected() {
         .as_object_mut()
         .unwrap()
         .insert("ceiling".into(), 0.into());
-    assert!(validate(&shared, "s-a").is_err());
+    assert!(validate(&shared, "s-0000000000000000000a").is_err());
     let mut bad = good.clone();
     bad.as_object_mut()
         .unwrap()
@@ -45,7 +45,7 @@ fn malformed_custody_and_oversized_prefix_are_rejected() {
         .as_object_mut()
         .unwrap()
         .insert("ceiling".into(), 4.into());
-    assert!(validate(&bad, "s-a").is_err());
+    assert!(validate(&bad, "s-0000000000000000000a").is_err());
     for (field, value) in [
         ("ready", Value::Bool(false)),
         ("root_birth", 0.into()),
@@ -53,9 +53,9 @@ fn malformed_custody_and_oversized_prefix_are_rejected() {
     ] {
         let mut bad = good.clone();
         bad.as_object_mut().unwrap().insert(field.into(), value);
-        assert!(validate(&bad, "s-a").is_err());
+        assert!(validate(&bad, "s-0000000000000000000a").is_err());
     }
-    assert!(validate(&good, "s-b").is_err());
+    assert!(validate(&good, "s-0000000000000000000b").is_err());
     for bytes in [
         ((MAX_REPLY + 1) as u32).to_be_bytes().to_vec(),
         vec![0, 0, 0, 4, 1],
@@ -70,7 +70,31 @@ fn malformed_custody_and_oversized_prefix_are_rejected() {
 fn missing_store_lookup_creates_nothing() {
     let root = aterm_tempfile::tempdir().unwrap();
     let missing = root.path().join("absent");
-    assert!(lookup_at(&missing, "s-a").is_err());
+    assert!(lookup_at(&missing, "s-0000000000000000000a").is_err());
+    assert!(!missing.exists());
+}
+#[test]
+fn a_lookup_names_a_tab_id_or_is_refused() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let missing = root.path().join("absent");
+    for session in [
+        "t000000000",
+        "T000000000A",
+        "t00000000il",
+        "s-0123456789abcdef012",
+        "S-0123456789ABCDEF0123",
+    ] {
+        let error = lookup_at(&missing, session).expect_err(session);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{session}");
+    }
+    let control = lookup_at(&missing, "tqn5r6e0148").expect_err("CONTROL: no store");
+    assert_ne!(control.kind(), io::ErrorKind::InvalidData, "CONTROL");
+    let earlier = lookup_at(&missing, "s-0123456789abcdef0123").expect_err("no store");
+    assert_ne!(
+        earlier.kind(),
+        io::ErrorKind::InvalidData,
+        "a tab opened before the update is looked up by its earlier ID"
+    );
     assert!(!missing.exists());
 }
 
@@ -83,7 +107,7 @@ fn cached_inspector_helper() {
     };
     let result = lookup_started(
         Path::new(&path),
-        "s-a",
+        "s-0000000000000000000a",
         Instant::now() - Duration::from_secs(5),
     );
     assert_eq!(result.unwrap(), observation());
@@ -117,7 +141,7 @@ fn cached_custodian_helper() {
                 aterm_json::from_slice(&wire::read_frame(&stream, deadline).unwrap()).unwrap();
             assert_eq!(
                 request,
-                aterm_json::json!({"version":3,"role":"inspect","session":"s-a"})
+                aterm_json::json!({"version":3,"role":"inspect","session":"s-0000000000000000000a"})
             );
             wire::write_frame(
                 &stream,

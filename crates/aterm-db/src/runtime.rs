@@ -6,7 +6,7 @@
 //! One local owner serves native LAN attachments; other sessions take over
 //! after it exits. Offline operation needs no peer or central service.
 
-use crate::network_state::{ObservationHandle, Observer};
+use crate::network_state::{ObservationHandle, Observer, Since};
 use crate::{Result, control::Endpoint};
 use aterm_secrets::{
     client::{self, Paths},
@@ -28,12 +28,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod announce;
 pub(crate) mod census;
 mod custody;
 mod discovery;
 #[cfg(any(test, debug_assertions))]
 mod isolation;
+mod moved;
 mod owner;
 mod place;
 mod report;
@@ -55,7 +55,23 @@ pub use vault::Passes;
 #[derive(Clone)]
 pub(crate) struct CredentialOwner {
     lease: Arc<owner::Lease>,
-    attempted: Arc<Mutex<std::collections::BTreeMap<astream_wire::sync::Digest, Instant>>>,
+    in_flight: Arc<Mutex<std::collections::BTreeSet<astream_wire::sync::Digest>>>,
+}
+
+/// Excludes concurrent exchanges for one offer, releasing it on every exit path.
+pub(crate) struct CredentialOffer<'a> {
+    owner: &'a CredentialOwner,
+    offer: astream_wire::sync::Digest,
+}
+
+impl Drop for CredentialOffer<'_> {
+    fn drop(&mut self) {
+        self.owner
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.offer);
+    }
 }
 
 impl CredentialOwner {
@@ -63,25 +79,22 @@ impl CredentialOwner {
         self.lease.recheck()
     }
 
-    pub(crate) fn try_offer(&self, offer: astream_wire::sync::Digest) -> bool {
-        let mut attempted = self.attempted.lock().unwrap_or_else(|p| p.into_inner());
-        attempted.retain(|_, at| at.elapsed() < aterm_secrets::need::transfer::LIFETIME);
-        if attempted.len() >= crate::database::MAX_RECORDS {
-            return false;
+    pub(crate) fn try_offer(
+        &self,
+        offer: astream_wire::sync::Digest,
+    ) -> Option<CredentialOffer<'_>> {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if in_flight.len() >= crate::database::MAX_RECORDS || !in_flight.insert(offer) {
+            return None;
         }
-        if attempted.contains_key(&offer) {
-            return false;
-        }
-        attempted.insert(offer, Instant::now());
-        true
+        Some(CredentialOffer { owner: self, offer })
     }
 
-    pub(crate) fn offered_before(&self, offer: &astream_wire::sync::Digest) -> bool {
-        self.attempted
+    pub(crate) fn offer_in_flight(&self, offer: &astream_wire::sync::Digest) -> bool {
+        self.in_flight
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(offer)
-            .is_some_and(|at| at.elapsed() < aterm_secrets::need::transfer::LIFETIME)
+            .contains(offer)
     }
 
     #[cfg(test)]
@@ -92,7 +105,7 @@ impl CredentialOwner {
                     .unwrap()
                     .unwrap(),
             ),
-            attempted: Arc::default(),
+            in_flight: Arc::default(),
         }
     }
 }
@@ -113,7 +126,7 @@ pub fn private_attachment_port() -> Result<u16> {
 }
 
 #[cfg(any(test, debug_assertions))]
-pub use discovery::db_discovery_replacement_environment;
+pub use discovery::{db_dial_cadence_environment, db_discovery_replacement_environment};
 
 /// How often a serving loop runs its polled checks ([`serve_paced`]), and how long a background
 /// owner or a contended one waits between tries.
@@ -137,24 +150,22 @@ enum Flow {
 
 /// A serving loop: `tick(state, now, round)` until `stopped`, ending at the first tick that ends
 /// it ([`Flow::End`]) or fails. Between ticks it waits (`wait(state, floor, until)`) for what its
-/// state waits on to happen ([`rest`]: a connection, a round's end, a push, an append this
-/// process made to a table of the custody it serves), for its stop, or for
-/// `until`: the earlier of the deadline the tick returned ([`Flow::Serve`]) and the next round;
+/// state waits on to happen ([`rest`]: a connection, a round's end, a push, a change to this
+/// Mac's Commons state the transport's watch heard), for its stop, or for `until`: the earlier of the deadline the tick returned ([`Flow::Serve`]) and the next round;
 /// never sooner than `floor`, one [`TICK`] after the tick began. An idle loop so wakes once a
 /// [`POLL`], not ten times a second. A peer's beacon wakes nothing: the transport reads the
 /// beacons that came since at each round ([`transport::Transport::turn`]).
 ///
 /// `round` says that the loop's polled checks (the generation, lease, custody, configuration and
-/// vault rechecks, the address refresh, the transport's read of its peers' beacons) are due in
-/// this tick: the first [`POLL`] after the loop starts, then [`POLL`] after the last tick that
-/// ran them returned, by `clock`, not after it
-/// started. A round slower than the interval (a busy vault waited for, a slow interface read) so
-/// still leaves the loop that long at rest before the next, instead of running round after round
-/// with no rest between. The rest belongs to the loop, not to the round: no path through a tick
-/// can leave it out. What nothing can wait on is read at each tick, and so at each round at the
-/// latest: whether a window claims Commons (a lock, which raises no event), the remembered
-/// endpoints' and the hearing and clock ledgers' keeping (minutes apart), and the lab journal's
-/// flush (a minute apart).
+/// vault rechecks, the address refresh, the transport's read of its peers' beacons, the look at
+/// what moved here) are due in this tick: the first [`POLL`] after the loop starts, then [`POLL`]
+/// after the last tick that ran them returned, by `clock`, not after it started. A round slower
+/// than the interval (a busy vault waited for, a slow interface read) so still leaves the loop
+/// that long at rest before the next, instead of running round after round with no rest between.
+/// The rest belongs to the loop, not to the round: no path through a tick can leave it out. What
+/// nothing can wait on is read at each tick, and so at each round at the latest: whether a window
+/// claims Commons (a lock, which raises no event), the remembered endpoints' and the hearing and
+/// clock ledgers' keeping (minutes apart), and the lab journal's flush (a minute apart).
 fn serve_paced<S, E>(
     state: &mut S,
     clock: impl Fn() -> Instant,
@@ -196,7 +207,7 @@ fn serve_turn(
 /// never sooner than `floor`. A descriptor already ready (what the last tick left, or a ring
 /// during it) waits for `floor` alone, as does a transport without a doorbell, which nothing
 /// would wake for a round's end; a wait that fails rests a [`TICK`], so none spins. The doorbell
-/// is cleared before the tick it wakes reads what it announced.
+/// is cleared before the tick it wakes reads what rang it.
 fn rest(stop: &Stop, transport: &transport::Transport, floor: Instant, until: Instant) {
     match transport.waits_on() {
         Some(fds) => rest_ready(
@@ -240,6 +251,73 @@ fn rest_ready(
 }
 /// How often the contact ledger is kept, and a steward refreshes the roster from it.
 const KEEP: Duration = Duration::from_secs(600);
+
+/// How far the wall clock may outrun the steady one between two ticks of a serving loop before
+/// the loop reads it as a sleep this Mac woke from ([`Wake`]).
+const WOKE: Duration = Duration::from_secs(10);
+
+/// Tells a serving loop that this Mac slept between two of its ticks: the wall clock moved on
+/// by more than [`WOKE`] over what the steady clock counted, which stops while macOS sleeps
+/// ([`Instant`]). A wall clock set forward that far reads the same, and costs one audit of each
+/// peer; one set back, or a loop that was only slow (both clocks ran), reads as no sleep. On a
+/// platform whose steady clock runs through a sleep none is told, and every lease that sleep
+/// outlasted has run out by that clock.
+#[derive(Default)]
+struct Wake {
+    /// The last tick's steady and wall (unix ms) clocks.
+    last: Option<(Instant, u64)>,
+}
+impl Wake {
+    /// How long this Mac slept between the last tick and this one, if it did, at `now` and
+    /// `now_ms` (unix ms; none where the wall clock cannot be read, which tells nothing and
+    /// forgets the last tick's): what the wall clock counted over the steady one.
+    fn woke(&mut self, now: Instant, now_ms: Option<u64>) -> Option<Duration> {
+        let last = std::mem::replace(&mut self.last, now_ms.map(|now_ms| (now, now_ms)));
+        let (Some((then, then_ms)), Some(now_ms)) = (last, now_ms) else {
+            return None;
+        };
+        let wall = Duration::from_millis(now_ms.saturating_sub(then_ms));
+        Some(wall.saturating_sub(now.saturating_duration_since(then))).filter(|slept| *slept > WOKE)
+    }
+}
+
+/// What the promises `transport`'s scheduler made stood on moved at `now`: a link of this Mac's
+/// opened, or it woke from a sleep of `slept` ([`Wake`]; zero for a link), so a peer contacted
+/// before then may be on a network this Mac left. The scheduler looks at every established peer
+/// again ([`transport::Transport::unsettle`]), and each contact made by then keeps at most two
+/// minutes of its lease, counted from the contact ([`Observer::curtail`]): a peer that is gone
+/// reads Reachable no longer than that, and one still there that was reached within the last
+/// minute is reached again before it reads LastSeen.
+fn unsettle(
+    transport: &mut transport::Transport,
+    history: &mut Observer,
+    now: Instant,
+    slept: Duration,
+) {
+    transport.unsettle(now, slept);
+    history.curtail(now, Since::Contact);
+}
+
+/// The dial scheduler that promised `history`'s contacts their next rounds ended at `now` with
+/// none to follow it at once: the serving generation failed, or this Mac serves presence only,
+/// with no rounds. Each contact made by then keeps at most two minutes of its lease, counted
+/// from the contact ([`Observer::curtail`]), so a peer reads Reachable through a gap with no
+/// scheduler no longer than one whose network changed, and a scheduler that starts after the gap
+/// finds every contact from before it already counted from the contact.
+fn unscheduled(history: &mut Observer, now: Instant) {
+    #[cfg(test)]
+    if UNSCHEDULED_KEEPS.with(std::cell::Cell::get) {
+        return;
+    }
+    history.curtail(now, Since::Contact);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// MUTANT of [`unscheduled`], on for one test thread: a scheduler that ended with none to
+    /// follow leaves its contacts what it promised them.
+    static UNSCHEDULED_KEEPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// What a transport open fails with where its network fails every open (tests).
 #[cfg(test)]
@@ -367,9 +445,14 @@ impl Network {
         }
     }
 
-    /// Refresh `transport` on `candidates`.
-    fn refresh(&self, transport: &mut transport::Transport, candidates: &[std::net::SocketAddr]) {
-        transport.refresh(candidates);
+    /// Refresh `transport` on `candidates`; whether a link opened
+    /// ([`transport::Transport::refresh`]).
+    fn refresh(
+        &self,
+        transport: &mut transport::Transport,
+        candidates: &[std::net::SocketAddr],
+    ) -> bool {
+        transport.refresh(candidates)
     }
 
     fn addresses(&self) -> std::result::Result<Vec<std::net::SocketAddr>, Status> {
@@ -1415,33 +1498,42 @@ fn serve_mode_with_recovery(
     reports: &impl Fn(RepairRound),
     board: &Board,
 ) -> std::result::Result<(), Status> {
-    // A background owner yields to a window's claim before it reads its configuration, so one
-    // its configuration refuses still yields.
-    if window_config.is_some_and(owner::window_claimed) {
-        return Err(Status::Waiting);
+    let served = (|| {
+        // A background owner yields to a window's claim before it reads its configuration, so
+        // one its configuration refuses still yields.
+        if window_config.is_some_and(owner::window_claimed) {
+            return Err(Status::Waiting);
+        }
+        if !enabled(config).map_err(refusal("configuration"))? {
+            return Err(Status::Disabled);
+        }
+        let paths = if recover_writer {
+            crate::generation::advance_while(paths, config, &|| stop.is_set())
+                .map_err(refusal("writer recovery"))?
+        } else {
+            paths.clone()
+        };
+        if stop.is_set() {
+            return Ok(());
+        }
+        serve_selected(
+            (&paths, config),
+            window_config,
+            stop,
+            report,
+            history,
+            network,
+            reports,
+            board,
+        )
+    })();
+    // A generation that failed leaves no scheduler until its owner tries again, however long
+    // it waits first ([`unscheduled`]); one that ended for a rebuild is followed at once, and the
+    // next generation counts from then ([`serve_selected`]).
+    if served.is_err() {
+        unscheduled(history, Instant::now());
     }
-    if !enabled(config).map_err(refusal("configuration"))? {
-        return Err(Status::Disabled);
-    }
-    let paths = if recover_writer {
-        crate::generation::advance_while(paths, config, &|| stop.is_set())
-            .map_err(refusal("writer recovery"))?
-    } else {
-        paths.clone()
-    };
-    if stop.is_set() {
-        return Ok(());
-    }
-    serve_selected(
-        (&paths, config),
-        window_config,
-        stop,
-        report,
-        history,
-        network,
-        reports,
-        board,
-    )
+    served
 }
 
 #[expect(
@@ -1503,7 +1595,7 @@ fn serve_selected(
         .with_credential_owner(
             CredentialOwner {
                 lease: lease.clone(),
-                attempted: Arc::default(),
+                in_flight: Arc::default(),
             },
             config.to_owned(),
         );
@@ -1532,6 +1624,19 @@ fn serve_selected(
     let mut transport = network
         .open(Some(endpoint), &candidates)
         .map_err(refusal("transport"))?;
+    // The scheduler that promised this observer's contacts their next rounds ended with its
+    // transport. This one starts over and reaches every peer again from here.
+    history.curtail(Instant::now(), Since::Now);
+    // What moves in this Mac's Commons state is offered to its peers as it is seen
+    // (`moved::Moves`); an enrolling owner holds none of it yet.
+    if !pending {
+        transport.watching(moved::Moves::start(
+            paths,
+            bootstrap.journal_dir(),
+            bootstrap.trust(),
+            transport.doorbell(),
+        ));
+    }
     // Created after the lease, dropped before it: only the actual transport owner
     // publishes at the shared vault address, even with distinct GUI configurations.
     let mut owner_relay = history.transport_relay(&commons_dir).ok();
@@ -1552,26 +1657,22 @@ fn serve_selected(
     // serving loop's: it passes in the states this function never reaches.)
     let mut lab = (!pending).then(|| crate::alab::upkeep::Upkeep::new(Instant::now()));
     let mut refresh = Instant::now() + Duration::from_secs(30);
-    // While it serves, each append this process makes to a table of this custody rings the owner,
-    // which dials every established peer for that table rather than leaving the record to each
-    // pair's turn. An enrolling owner has no tables. Where no listener can be had, and for what
-    // another process appends, the record goes at each pair's turn, as it did.
-    let _announcing = (!pending)
-        .then(|| crate::table::store::claim_dir_of(&bootstrap).ok())
-        .flatten()
-        .and_then(|claims| crate::table::store::listen(claims, transport.announcer()));
     let result = {
         let _serving = board.serving(transport.doorbell());
         let mut pushing: Option<Ask> = None;
+        let mut wake = Wake::default();
         serve_paced(
             &mut transport,
             Instant::now,
             || stop.is_set(),
             |transport, floor, until| rest(stop, transport, floor, until),
             |transport, now, round| {
+                // Read with `now`, before anything this tick waits for.
+                let woke = wake.woke(now, aterm_time::unix_millis());
                 if window_config.is_some_and(owner::window_claimed) {
                     return Err(Status::Waiting);
                 }
+                let mut opened = false;
                 #[cfg(test)]
                 let round = round && !network.unpolled;
                 if round {
@@ -1610,7 +1711,11 @@ fn serve_selected(
                     }
                     let candidates = network.addresses()?;
                     network.may_use(&candidates)?;
-                    network.refresh(transport, &candidates);
+                    opened = network.refresh(transport, &candidates);
+                    transport.look_soon();
+                }
+                if opened || woke.is_some() {
+                    unsettle(transport, history, now, woke.unwrap_or_default());
                 }
                 if let Some(ask) = board.take() {
                     pushing = Some(ask);
@@ -1659,12 +1764,15 @@ fn serve_selected(
                     history,
                     contacts
                         .into_iter()
-                        .map(|contact| (contact.actor, contact.at))
+                        .map(|contact| (contact.actor, contact.at, contact.lease))
                         .collect(),
                     &completed,
                     &network.place,
                     || (aterm_time::unix_millis().unwrap_or(0), Instant::now()),
                 );
+                // After this tick's contacts: a departure ends a lease only where the observer
+                // holds the contact it is later than.
+                observe_departures(&bootstrap, &resolved, history, transport.take_departures());
                 for completed in completed {
                     reports(completed);
                 }
@@ -1898,13 +2006,14 @@ fn refresh(paths: &Paths, bootstrap: &Bootstrap, ledger: &mut Ledger, now_ms: u6
 }
 
 /// Resolve authenticated contacts, their socket paths and successful outbound endpoints
-/// through current membership before publishing identity. Clock reads keep freshness tests
-/// independent of speed.
+/// through current membership before publishing identity. Each contact is an actor, when it
+/// authenticated and the lease its transport's scheduler promised it
+/// ([`transport::Contact::lease`]). Clock reads keep freshness tests independent of speed.
 fn observe_contacts(
     bootstrap: &Bootstrap,
     resolved: &std::cell::OnceCell<Option<Resolved>>,
     history: &mut Observer,
-    contacts: Vec<(astream_wire::sync::Actor, Instant)>,
+    contacts: Vec<(astream_wire::sync::Actor, Instant, Duration)>,
     completed: &[RepairRound],
     place: &place::Publisher,
     clock: impl Fn() -> (u64, Instant),
@@ -1928,7 +2037,7 @@ fn observe_contacts(
     if let Some(Resolved { journal, access }) =
         resolved.get_or_init(|| Resolved::read(bootstrap)).as_ref()
     {
-        for (actor, authenticated_at) in contacts {
+        for (actor, authenticated_at, lease) in contacts {
             if let Some(member) = access
                 .members()
                 .iter()
@@ -1939,6 +2048,7 @@ fn observe_contacts(
                     machine_identity(member.binding()),
                     contact_time(now_ms, now, authenticated_at),
                     authenticated_at,
+                    lease,
                 );
             }
         }
@@ -1979,6 +2089,35 @@ fn observe_contacts(
         }
     }
     place.note(answers);
+}
+
+/// Tell the observer each seat the transport's dials found gone, with when the dial that found
+/// it so began ([`transport::Transport::take_departures`]), resolved through current membership
+/// as [`observe_contacts`] resolves a contact: the seat's exact installation reads Reachable no
+/// longer on a contact older than that dial ([`Observer::left`]). A seat that is no member any
+/// more, or a journal that cannot be read, tells nothing, and the lease runs out by itself.
+fn observe_departures(
+    bootstrap: &Bootstrap,
+    resolved: &std::cell::OnceCell<Option<Resolved>>,
+    history: &mut Observer,
+    departures: Vec<(astream_wire::sync::Actor, Instant)>,
+) {
+    if departures.is_empty() {
+        return;
+    }
+    let Some(Resolved { access, .. }) = resolved.get_or_init(|| Resolved::read(bootstrap)).as_ref()
+    else {
+        return;
+    };
+    for (actor, at) in departures {
+        if let Some(member) = access
+            .members()
+            .iter()
+            .find(|member| member.binding().actor() == actor)
+        {
+            history.left(&machine_identity(member.binding()), at);
+        }
+    }
 }
 
 /// Remap a completed immutable witness through this custody's current Commons binding.
@@ -2164,6 +2303,9 @@ fn serve_presence(
     if window_config.is_some_and(owner::window_claimed) {
         return Err(Status::Waiting);
     }
+    // No scheduler keeps what an earlier one promised this observer's contacts, and nothing
+    // here dials, so nothing reports a departure either.
+    unscheduled(history, Instant::now());
     let candidates = network.addresses()?;
     network.may_use(&candidates)?;
     let mut transport = network

@@ -569,3 +569,164 @@ fn the_longest_review_and_reply_lines_fit_the_cap() {
     .line();
     assert_eq!(Rec::parse(&over), None);
 }
+
+#[test]
+fn clean_archived_gone_uncleaned_cleaned_lines_round_trip() {
+    use crate::claim::Keep;
+    let recs = [
+        rec(Body::Clean {
+            by: "human".to_owned(),
+            stop: false,
+        }),
+        rec(Body::Clean {
+            by: SID.to_owned(),
+            stop: true,
+        }),
+        rec(Body::Archived {
+            dir: ID.to_owned(),
+            bytes: 4096,
+            files: 12,
+            listed: 2,
+            whole: true,
+        }),
+        rec(Body::Archived {
+            dir: format!("{ID}-2"),
+            bytes: 0,
+            files: 0,
+            listed: 0,
+            whole: false,
+        }),
+        rec(Body::Gone {
+            bytes: Some(312_000_000),
+            why: None,
+            path: "/Users//a/scratch".to_owned(),
+            did: Did::Deleted,
+        }),
+        rec(Body::Gone {
+            bytes: None,
+            why: Some(Keep::Unpushed),
+            path: "/Users//a/repo".to_owned(),
+            did: Did::Kept,
+        }),
+        rec(Body::Gone {
+            bytes: Some(1),
+            why: None,
+            path: "/Users//a/half".to_owned(),
+            did: Did::Failed,
+        }),
+        rec(Body::Uncleaned { why: Unclean::Busy }),
+        rec(Body::Uncleaned {
+            why: Unclean::Closer,
+        }),
+        rec(Body::Cleaned {
+            tabs: 3,
+            deleted: 1,
+            kept: 1,
+            failed: 0,
+            by: "ctl".to_owned(),
+        }),
+    ];
+    for rec in recs {
+        let line = rec.line();
+        assert_eq!(Rec::parse(&line), Some(rec), "{line}");
+    }
+    // NEGATIVE: a row cut inside its path or a figure lacks the key after it.
+    let gone = rec(Body::Gone {
+        bytes: Some(10),
+        why: None,
+        path: "/Users//a/scratch".to_owned(),
+        did: Did::Deleted,
+    })
+    .line();
+    let cut = &gone[..gone.find(" did=").unwrap() - 2];
+    assert_eq!(Rec::parse(cut), None, "{cut}");
+    let cleaned = rec(Body::Cleaned {
+        tabs: 3,
+        deleted: 12,
+        kept: 1,
+        failed: 0,
+        by: "human".to_owned(),
+    })
+    .line();
+    let cut = &cleaned[..cleaned.find(" kept=").unwrap() - 1];
+    assert_eq!(Rec::parse(cut), None, "{cut}");
+    let cut = &cleaned[..cleaned.len() - 2];
+    assert_eq!(Rec::parse(cut), None, "{cut}");
+    // NEGATIVE: an archive named for another request, a `-1` or a non-canonical `-02`, a flag
+    // past 1 and an unknown word are refused.
+    let archived = rec(Body::Archived {
+        dir: ID.to_owned(),
+        bytes: 1,
+        files: 1,
+        listed: 1,
+        whole: true,
+    })
+    .line();
+    for bad in [
+        "r-20261109-1411-87be5228-02",
+        &format!("{ID}-1"),
+        &format!("{ID}-02"),
+    ] {
+        let line = archived.replace(&format!("dir={ID}"), &format!("dir={bad}"));
+        assert_eq!(Rec::parse(&line), None, "{line}");
+    }
+    assert_eq!(Rec::parse(&archived.replace("whole=1", "whole=2")), None);
+    assert_eq!(Rec::parse(&gone.replace("did=deleted", "did=gone")), None);
+    assert_eq!(Rec::parse(&gone.replace("why=-", "why=whim")), None);
+    assert_eq!(archive_name(ID, 1), ID);
+    assert_eq!(archive_name(ID, 3), format!("{ID}-3"));
+}
+
+#[test]
+fn the_longest_gone_line_fits_the_record_cap() {
+    use crate::claim::{CLAIM_PATH_BYTES, Keep};
+    let longest_id = format!("r-20261109-1411-{}-{}", "a".repeat(8), u32::MAX);
+    let path = format!("/{}", "\u{7f}".repeat((CLAIM_PATH_BYTES - 1) / 3));
+    let gone = Rec {
+        t_ms: u64::MAX,
+        id: longest_id,
+        body: Body::Gone {
+            bytes: Some(u64::MAX),
+            why: Some(Keep::Unattributed),
+            path,
+            did: Did::Deleted,
+        },
+    };
+    let line = gone.line();
+    assert!(line.len() <= MAX_RECORD_BYTES, "{} bytes", line.len());
+    assert_eq!(Rec::parse(&line), Some(gone));
+}
+
+/// A record names a tab, and an actor token a requester, by its tab ID in either form: `t` and
+/// 10 Crockford base32 characters, or the `s-` and 20 hex digits a tab opened before that form
+/// keeps until it closes. NEGATIVE CONTROL: a malformed ID of each form is refused, whole and
+/// inside a fleet drive's token.
+#[test]
+fn a_tab_and_a_token_name_a_tab_id_in_either_form() {
+    for tab in ["tqn5r6e0148", SID] {
+        let keep = rec(Body::Keep {
+            tab: tab.to_owned(),
+            by: format!("fleet:87be5228:{tab}"),
+        });
+        assert_eq!(Rec::parse(&keep.line()), Some(keep.clone()), "{tab}");
+        assert!(is_token(tab), "{tab}");
+        assert!(is_token(&format!("fleet:87be5228:{tab}")), "{tab}");
+    }
+    for bad in [
+        "tqn5r6e014",
+        "tqn5r6e014u",
+        "TQN5R6E0148",
+        "s-0123456789abcdef012",
+        "s-0123456789ABCDEF0123",
+    ] {
+        assert!(!is_token(bad), "CONTROL: {bad}");
+        assert!(
+            !is_token(&format!("fleet:87be5228:{bad}")),
+            "CONTROL: {bad}"
+        );
+        assert!(
+            Rec::parse(&format!("t=1 op=keep req={ID} tab={bad} by=human")).is_none(),
+            "CONTROL: {bad}"
+        );
+    }
+}

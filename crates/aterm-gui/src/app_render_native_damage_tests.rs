@@ -404,28 +404,53 @@ fn a_surface_that_answers_unpresentable_sends_the_tree_its_frame_staged() {
 #[cfg(a11y_tree)]
 #[test]
 fn a_page_that_moves_in_a_parked_window_reaches_its_client() {
-    let mut page = ReloadedPage::presented();
-    page.stage_a_frame();
-    page.app
-        .rearm_dropped_present(page.wid, crate::metrics::PresentDropReason::GpuOccluded);
-    assert_eq!(page.read(), "before");
-    page.app
-        .windows
-        .get_mut(&page.wid)
-        .unwrap()
-        .a11y_sent
-        .clear();
+    for redraw_at_deadline in [false, true] {
+        let mut page = ReloadedPage::presented();
+        page.stage_a_frame();
+        page.app
+            .rearm_dropped_present(page.wid, crate::metrics::PresentDropReason::GpuOccluded);
+        assert!(page.app.windows[&page.wid].present_retry.parked);
+        assert_eq!(page.read(), "before");
+        page.app
+            .windows
+            .get_mut(&page.wid)
+            .unwrap()
+            .a11y_sent
+            .clear();
 
-    page.reload();
-    page.app.redraw_window(page.wid);
-    assert_eq!(page.sent(), 0, "held to the parked window's pace");
-    let due = page.app.windows[&page.wid].a11y_parked_due;
+        page.reload();
+        assert_eq!(page.sent(), 0, "the reload awaits a parked redraw");
+        // Wall time has reached this deadline. Only the supplied clock is before it,
+        // so falling back to Instant::now() must fail without a sleep or time budget.
+        let due = std::time::Instant::now();
+        let before = due
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("the test clock precedes its deadline");
+        page.app
+            .windows
+            .get_mut(&page.wid)
+            .unwrap()
+            .a11y_parked_next = Some(due);
 
-    page.app
-        .serve_parked_tells(due.expect("and due at its end"));
+        page.app.redraw_window_at(page.wid, before);
 
-    assert_eq!(page.read(), "after");
-    assert_eq!(page.sent(), 1);
+        assert_eq!(page.sent(), 0, "held to the parked window's pace");
+        assert_eq!(page.app.windows[&page.wid].a11y_parked_due, Some(due));
+        page.app.serve_parked_tells(before);
+        assert_eq!(page.sent(), 0, "not before its deadline");
+
+        if redraw_at_deadline {
+            page.app.redraw_window_at(page.wid, due);
+        } else {
+            page.app.serve_parked_tells(due);
+        }
+
+        assert_eq!(page.read(), "after");
+        assert_eq!(page.sent(), 1, "redraw_at_deadline={redraw_at_deadline}");
+        assert_eq!(page.app.windows[&page.wid].a11y_parked_due, None);
+        page.app.serve_parked_tells(due);
+        assert_eq!(page.sent(), 1, "a served deadline owes no duplicate tell");
+    }
 }
 
 /// A window waiting on a retry has a frame coming, so neither the drop nor a redraw it gates sends

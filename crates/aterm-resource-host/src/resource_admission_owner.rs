@@ -28,8 +28,14 @@ use std::{
 #[path = "resource_admission_bootstrap_graph.rs"]
 pub(super) mod bootstrap_graph;
 
+#[path = "resource_admission_bootstrap_capture.rs"]
+mod bootstrap_capture;
+
 #[path = "resource_admission_bootstrap_object.rs"]
 pub(super) mod bootstrap_object;
+
+#[path = "resource_admission_bootstrap_archive.rs"]
+pub(super) mod bootstrap_archive;
 
 #[path = "resource_admission_ay.rs"]
 mod ay;
@@ -374,7 +380,7 @@ impl Owner {
         let ready = !self.faulted
             && self.fence.check_current().is_ok()
             && self.ledger.cohort_aware().is_ok_and(|ready| ready);
-        aterm_json::json!({"version":3,"ready":ready,"recipes":["ay-campaign-v3","targo-native-v3"],"unqualified":"refused","inspection":"resource-inspect-v3","status":"json-lines-v3","timeout":"actual-start","accounting":crate::resource_accounting::supported().then_some(trust_resource_controller::accounting::CAPABILITY),"root_store_expectation":crate::runtime::store_expectation_supported().then_some(aterm_ctl::resource_admission_transport::store_expectation::CAPABILITY),"native_job_root_store_expectation":crate::runtime::store_expectation_supported().then_some(aterm_ctl::resource_admission_transport::native_store::CAPABILITY)})
+        aterm_json::json!({"version":3,"ready":ready,"resource_observation":"origin-wait-v1","resource_observer_reconnect":"permit-v1","recipes":["ay-campaign-v3","targo-native-v3"],"unqualified":"refused","inspection":"resource-inspect-v3","status":"json-lines-v3","timeout":"actual-start","accounting":crate::resource_accounting::supported().then_some(trust_resource_controller::accounting::CAPABILITY),"root_store_expectation":crate::runtime::store_expectation_supported().then_some(aterm_ctl::resource_admission_transport::store_expectation::CAPABILITY),"native_job_root_store_expectation":crate::runtime::store_expectation_supported().then_some(aterm_ctl::resource_admission_transport::native_store::CAPABILITY)})
     }
     pub(super) fn accepts(&self, binding: &Binding) -> bool {
         self.accepts_with_queued(binding, 0)
@@ -397,10 +403,29 @@ impl Owner {
         self.submit_mode(submission, false);
     }
     pub(super) fn submit_mode(&mut self, submission: AuthorizedSubmission, accounted: bool) {
+        let binding = submission.request.binding.clone();
         if let Err(failure) = self.enqueue(submission, accounted) {
             let (submission, _) = *failure;
             super::refuse_mode(submission, accounted);
         }
+        self.publish_resource_work(Some(&binding));
+    }
+    fn publish_resource_work(&self, processed: Option<&Binding>) {
+        let sessions = self
+            .jobs
+            .keys()
+            .map(|(session, _)| session.clone())
+            .chain(
+                self.pending
+                    .iter()
+                    .map(|pending| pending.submission.request.binding.session.clone()),
+            )
+            .chain(
+                self.failed
+                    .iter()
+                    .map(|failed| failed.binding.session.clone()),
+            );
+        crate::resource_observation::native_observation_guard().owner_state(processed, sessions);
     }
     pub(super) fn tick(&mut self) {
         if let Err(error) = self.fence.check_current() {
@@ -442,6 +467,7 @@ impl Owner {
         // Paid preparation must still join on a failed owner. This branch can
         // only cancel; it never admits another job or releases uncertain debt.
         self.tick_queue();
+        self.publish_resource_work(None);
     }
     pub(super) fn inspect(&mut self, peer: Peer, session: &str) -> io::Result<Inspection> {
         self.inspect_at(peer, session, Instant::now())

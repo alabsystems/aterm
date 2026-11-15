@@ -391,6 +391,20 @@ struct Receipt {
     package: Option<package::Policy>,
 }
 
+impl Receipt {
+    /// Whether this is ordinary settled custody: no keep and no removal's fence, no creation or
+    /// retirement under way, and no package policy, as a plain creation or an adoption records
+    /// once it is done.
+    #[cfg(unix)]
+    const fn ordinary_settled(&self) -> bool {
+        !self.retained
+            && self.removal_fence.is_none()
+            && self.creating.is_none()
+            && self.pending.is_none()
+            && self.package.is_none()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Pending {
     directory: PathBuf,
@@ -547,6 +561,27 @@ fn private_child(
         return None;
     }
     Some(child)
+}
+
+/// WHETHER THIS HOME CAN RECORD NO BUILD'S OWNER: the deepest folder standing on the index's path
+/// ([`INDEX`], then its gates) is one this user may not write, so no missing folder, receipt or
+/// gate can be made there, as in a home whose `Library/Caches` is another user's or read-only.
+/// The shim's block and [`super::decide`] place a build in its own target there (the shared
+/// cache sits in the same folders), and that placement owes no receipt
+/// ([`observe_with_placement`]). A path that reaches anything but a folder (a link, a file)
+/// says nothing of the kind: a build there is refused as before.
+fn unrecordable(home: &Path) -> bool {
+    let mut standing = home.to_path_buf();
+    let gates = std::path::Component::Normal(std::ffi::OsStr::new("locks.noindex"));
+    for component in Path::new(INDEX).components().chain([gates]) {
+        let next = standing.join(component);
+        match std::fs::symlink_metadata(&next) {
+            Ok(metadata) if metadata.is_dir() => standing = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            _ => return false,
+        }
+    }
+    !crate::platform::dir_writable_by_caller(&standing)
 }
 
 /// The person's caches folder under a home, in which the index and the shared build cache sit:
@@ -759,14 +794,7 @@ fn witness(home: &Path, path: &Path, receipt: &mut Receipt) -> bool {
     if receipt.identity.volume.is_some() {
         return true;
     }
-    if receipt.retained
-        || receipt.removal_fence.is_some()
-        || receipt.creating.is_some()
-        || receipt.pending.is_some()
-        || receipt.package.is_some()
-        || !same(home, receipt)
-        || read(path).as_ref() != Some(receipt)
-    {
+    if !receipt.ordinary_settled() || !same(home, receipt) || read(path).as_ref() != Some(receipt) {
         return false;
     }
     let Some(held) = creation::pin(&receipt.root) else {
@@ -1015,8 +1043,40 @@ fn prepare_intermediates(
     )
 }
 
+/// WHETHER `receipt`, ON RECORD FOR THE FOLDER `path` (A DESCENDANT THAT CARRIES NO MARKER),
+/// BINDS NOTHING THERE: ordinary settled custody ([`Receipt::ordinary_settled`]) of `path` whose
+/// identity names another folder than the one read there now as `now`, the folder it bound no
+/// longer standing there. As [`create_with_policy`] holds, an ordinary receipt of a folder no
+/// longer here binds nothing here: no reclaimer acts on it ([`roots`] lists an ordinary settled
+/// receipt only where [`same`] binds it) and no marker stands for it. A receipt that names the
+/// folder (an adoption puts its receipt on record before its marker binds it), or any other kind
+/// (pending, being created, a keep or a package's), binds custody still.
+///
+/// A folder made again at `path` is another folder only where it got another inode number. APFS,
+/// the format of a Mac's own volumes, never hands a freed one out again, and a build prepares a
+/// managed target's descendants on macOS alone (each build front that reaches
+/// [`prepare_owned_descendants`] returns before it elsewhere, as [`observation_with`] does).
+/// Where a filesystem does reuse one (ext4), a record of the folder that went names one made
+/// again that took its number back, so that folder stays a boundary its record cannot satisfy,
+/// refused as before.
+#[cfg(unix)]
+fn binds_nothing(path: &Path, receipt: &Receipt, now: &Identity) -> bool {
+    receipt.root == path && receipt.ordinary_settled() && !receipt.identity.names(now)
+}
+
 /// Extend one admitted root under its shared retirement gate, without adopting existing
 /// descendants or following a link. The root's receipt covers the prepared output paths.
+///
+/// Each descendant that carries a marker or is on record in the index is a custody boundary:
+/// its receipt must admit this producer and name the folder held there, its gate held shared
+/// until preparation ends, or preparation stops. The one exception is a descendant that carries
+/// no marker and whose receipt [`binds_nothing`] there (a folder removed and made again under
+/// this root, its old registration left on record): it is no boundary, and the root's receipt
+/// covers it as any other descendant; its receipt's gate is held shared too, and preparation
+/// stops if, at its end, the receipt changed, the folder carries a marker or that receipt names
+/// it. Every writer of a receipt holds its gate exclusively and every publication holds the
+/// admission lock exclusively, both held shared here, so no writer that keeps to them changes
+/// either kind of receipt meanwhile, and the recheck sees one that does not.
 #[cfg(unix)]
 fn prepare_owned_descendants(
     home: &Path,
@@ -1047,6 +1107,7 @@ fn prepare_owned_descendants(
         return Err(stop());
     }
     let mut boundaries = Vec::new();
+    let mut unbound = Vec::new();
     prepare_private_descendants(
         root,
         held,
@@ -1072,18 +1133,25 @@ fn prepare_owned_descendants(
             if marked || indexed {
                 let gate = crate::metadata_io::open_regular(&gate_path(&record).ok_or_else(stop)?)?;
                 let gate = crate::lock::Flock::try_lock_shared(gate).map_err(|_| stop())?;
-                let boundary = read(&record)
-                    .filter(|receipt| {
-                        producer_matches(home, path, workspace, receipt)
-                            && Identity::held(held)
-                                .is_some_and(|identity| receipt.identity.names(&identity))
-                    })
-                    .ok_or_else(stop)?;
-                boundaries.push((record, boundary, gate));
+                let on_record = read(&record).ok_or_else(stop)?;
+                let now = Identity::held(held).ok_or_else(stop)?;
+                if !marked && binds_nothing(path, &on_record, &now) {
+                    unbound.push((record, on_record, gate));
+                } else if producer_matches(home, path, workspace, &on_record)
+                    && on_record.identity.names(&now)
+                {
+                    boundaries.push((record, on_record, gate));
+                } else {
+                    return Err(stop());
+                }
             }
             Ok(())
         },
     )?;
+    let unmarked = |path: &Path| {
+        std::fs::symlink_metadata(path.join(MARKER))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    };
     if !still()
         || !creation::named(&parent, name, &receipt.identity)
         || !retention::private_directory(&parent)
@@ -1092,6 +1160,12 @@ fn prepare_owned_descendants(
         || boundaries.iter().any(|(record, receipt, _gate)| {
             read(record).as_ref() != Some(receipt)
                 || !producer_matches(home, &receipt.root, workspace, receipt)
+        })
+        || unbound.iter().any(|(record, receipt, _gate)| {
+            read(record).as_ref() != Some(receipt)
+                || !unmarked(&receipt.root)
+                || !identity(&receipt.root)
+                    .is_some_and(|now| binds_nothing(&receipt.root, receipt, &now))
         })
     {
         return Err(stop());
@@ -3034,7 +3108,9 @@ fn observe_with_placement(
                 return Ok(Observation::IntermediatesOwned);
             }
         }
-        if scope(home, &target) {
+        // The producer's own fallback in a home that can record nothing owes no receipt: its
+        // caller prepares the same directory receiptless, by the same private-parent checks.
+        if scope(home, &target) && !(local_fallback && unrecordable(home)) {
             return Err(std::io::Error::other(
                 "the target's quiet build directory could not be owned; no build started",
             ));
@@ -3191,7 +3267,8 @@ pub fn observe_command_with(
 
 /// Validate the complete argv a native reroute actually selected, then observe ownership
 /// and prepare its generated intermediates. Caller layouts and unsupported upstream versions
-/// use [`observe_command_with`] without selecting a placement.
+/// use [`observe_command_with`] without selecting a placement. Outside macOS no managed
+/// ownership is claimed, as there.
 ///
 /// # Errors
 /// The selected arguments no longer match placement policy, or directory safety or existing
@@ -4342,16 +4419,28 @@ fn retire_on(
     if receipt.package.is_some() || receipt.owners_unknown {
         return Err("package or unknown owner custody cannot be retired by this request".into());
     }
+    let reporting = fence.reporting_pass();
     let removed = reclaim_selected_on(
         home,
         std::time::SystemTime::now(),
         super::ReclaimAfter::CALM,
         None,
         record,
-        fence,
+        &reporting,
         Selection::Requested(&cache),
     );
+    let retained = reporting.retained();
+    for check in &retained {
+        fence.note(&check.path, check.reason.clone());
+    }
     if removed.is_empty() {
+        if !retained.is_empty() {
+            return Err(retained
+                .iter()
+                .map(|check| check.words())
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
         return Err(
             "cache is active, changed, or could not admit retirement; nothing removed".into(),
         );

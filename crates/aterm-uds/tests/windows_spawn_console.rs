@@ -9,18 +9,15 @@
 //! Windows lane's guest pins its version: `aterm-lab/src/windows_guest.rs`).
 
 #![cfg(windows)]
-#![allow(
-    clippy::disallowed_types,
-    reason = "test code: the plain std Command a reviewed raw site builds is what is measured"
-)]
 
 use std::io::Read as _;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use std::path::Path;
 
 use aterm_uds::spawn::{self, Console};
+use aterm_uds::spawnfd::Command;
 
 const ROLE_ENV: &str = "ATERM_UDS_SPAWN_CONSOLE_ROLE";
 const REPORT_FILE_ENV: &str = "ATERM_UDS_SPAWN_CONSOLE_REPORT_FILE";

@@ -119,6 +119,8 @@ pub(crate) fn from_json(body: &str) -> Option<Leftovers> {
         return None;
     }
     let procs = doc.get("procs")?.as_array()?;
+    let more = doc.get("more")?.as_u64()?;
+    let links = doc.get("links")?.as_array()?.len();
     let reading = |key: &str| {
         doc.get("left")
             .and_then(|l| l.get(key))
@@ -128,14 +130,10 @@ pub(crate) fn from_json(body: &str) -> Option<Leftovers> {
     let mut left = Leftovers {
         from_instance: true,
         rows: 0,
-        more: !whole
-            || doc
-                .get("more")
-                .and_then(Value::as_u64)
-                .is_some_and(|n| n > 0),
+        more: !whole || more > 0,
         oldest_ms: None,
         eligible: false,
-        links: doc.get("links").and_then(Value::as_array).map(Vec::len),
+        links: Some(links),
     };
     for process in procs {
         // Missing or non-string classification fields cannot prove that a row is unrelated.

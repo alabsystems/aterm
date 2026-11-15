@@ -212,116 +212,47 @@ fn announce_master(seed: &atpkg_keys::master::MasterSeed) -> Result<(), String> 
     Ok(())
 }
 
-/// The heading that must land on the same surface as the phrase itself.
+/// This Mac's vault paths, where the master phrase is kept.
 #[cfg(unix)]
-const PHRASE_HEADING: &str = "atpkg-keys: MASTER PHRASE — write it on paper, twice, in two \
-     places. Shown only in this run. Stored nowhere. Unrecoverable.";
-
-/// The rule that isolates the two lines the paper must carry from everything else on the screen.
-#[cfg(unix)]
-const PHRASE_RULE: &str = "----------------------------------------------------------------";
-
-/// Show the phrase on the terminal only.
-#[cfg(unix)]
-fn show_phrase(
-    tty: &mut atpkg_keys::master::Tty,
-    phrase: &atpkg_keys::master::MasterPhrase,
-) -> Result<(), String> {
-    tty.write_line("")?;
-    tty.write_line(PHRASE_HEADING)?;
-    tty.write_line(PHRASE_RULE)?;
-    tty.write_phrase(phrase)
+fn vault() -> Result<aterm_secrets::client::Paths, String> {
+    aterm_secrets::client::Paths::locate().map_err(|e| e.to_string())
 }
 
-/// Close the phrase block with the fingerprint the paper carries beside the phrase.
-#[cfg(unix)]
-fn show_fingerprint(
-    tty: &mut atpkg_keys::master::Tty,
-    seed: &atpkg_keys::master::MasterSeed,
-) -> Result<(), String> {
-    tty.write_line(&concat(&[
-        "fingerprint: ",
-        &seed.fingerprint()?,
-        "  (write it beside the phrase)",
-    ]))?;
-    tty.write_line(PHRASE_RULE)
-}
-
-/// The transcription gate: ask until the retyped paper derives the master just shown.
-#[cfg(unix)]
-fn confirm_transcription(
-    tty: &mut atpkg_keys::master::Tty,
-    phrase: &atpkg_keys::master::MasterPhrase,
-    seed: &atpkg_keys::master::MasterSeed,
-) -> Result<(), String> {
-    let want = seed.pubkey_b64()?;
-    loop {
-        let typed = match atpkg_keys::master::prompt_master_attempt(
-            "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; an empty line or \
-             Ctrl-C aborts, nothing is armed): ",
-        )? {
-            Ok(typed) => typed,
-            Err(atpkg_keys::master::PhraseError::Length { got: 0 }) => {
-                return Err("nothing was typed at the transcription gate".to_string());
-            }
-            Err(e) => {
-                tty.write_line(&concat(&["atpkg-keys: ", &e.message(), " — try again."]))?;
-                continue;
-            }
-        };
-        let typed_seed = typed.seed();
-        if typed_seed.pubkey_b64()? == want {
-            return tty.write_line(
-                "atpkg-keys: paper proven. Clear this terminal's scrollback when done.",
-            );
-        }
-        tty.write_line(&concat(&[
-            "atpkg-keys: NO MATCH — your paper derives fingerprint ",
-            &typed_seed.fingerprint()?,
-            ", the master is ",
-            &seed.fingerprint()?,
-            ". Fix the paper from the line below, then retype.",
-        ]))?;
-        tty.write_line(PHRASE_RULE)?;
-        tty.write_phrase(phrase)?;
-        tty.write_line(PHRASE_RULE)?;
-    }
-}
-
-/// `master-check`: type the phrase back and see the fingerprint again.
+/// `master-check`: the vault's phrase derives a master this build pins.
 #[cfg(unix)]
 fn master_check() -> Result<(), String> {
     atpkg_keys::master::forbid_core_dumps();
-    let phrase = atpkg_keys::master::prompt_for_master(
-        "master phrase (52 characters, echo off; spaces, case, and o/i/l are forgiven): ",
-    )?;
-    announce_master(&phrase.seed())?;
-    eprint_line(
-        "atpkg-keys: compare that fingerprint with the one on your paper. If they \
-         differ, a character is wrong in what you typed or on the paper.",
-    );
-    Ok(())
+    let vault = vault()?;
+    let seed = atpkg_keys::master::from_vault(&vault)?.seed();
+    announce_master(&seed)?;
+    if aterm_update_core::pins::PAPER_MASTER_PUBKEYS.contains(&seed.pubkey_b64()?.as_str()) {
+        Ok(())
+    } else {
+        Err(aterm_secrets::paper_master::refused(
+            &vault,
+            "it derives no master this build pins (aterm_update_core::pins::PAPER_MASTER_PUBKEYS)",
+        ))
+    }
 }
 
 /// The flags `setup` and `join` read.
 #[cfg(unix)]
 const PROVISION_FLAGS: &[&str] = &["id", "pins", "roster", "key"];
 
-/// What `setup` says when it fails before showing a phrase: no master exists, so try again.
+/// What `setup` says when it fails before the vault took a phrase: no master exists.
 #[cfg(unix)]
-const SETUP_ARMED_NOTHING: &str = "atpkg-keys: no file was written and no phrase was \
-     shown — no master exists as a result of this run. Fix the problem above and run \
+const SETUP_ARMED_NOTHING: &str = "atpkg-keys: no file was written and the vault holds no \
+     new phrase: no master exists as a result of this run. Fix the problem above and run \
      `atpkg-keys setup` again.";
 
-/// What `setup` says when the phrase was shown but this run did not write the anchor.
+/// What `setup` says when the vault took the phrase but this run did not write the anchor; the
+/// recovery, [`atpkg_keys::provision::SETUP_START_OVER`], follows it.
 #[cfg(unix)]
-const SETUP_PAPER_ARMS_NOTHING: &str = "atpkg-keys: THE PHRASE ABOVE ARMS NOTHING. The \
-     anchor file was not written, so the master you just saw is not referenced by anything \
-     and never will be. DESTROY that paper, fix the problem above, and run `atpkg-keys \
-     setup` again — it will generate a different master.";
+const SETUP_VAULT_ARMS_NOTHING: &str = "atpkg-keys: the vault's new release-paper-master arms \
+     nothing: the anchor file was not written. ";
 
-/// `setup` mints the paper master and `join` checks it; both mint this machine's signing key
-/// and add it to the roster.
+/// `setup` mints the paper master into the vault and `join` checks the vault's; both mint this
+/// machine's signing key and add it to the roster.
 #[cfg(unix)]
 fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), String> {
     use atpkg_keys::provision as prov;
@@ -364,43 +295,47 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
 
     let report = match verb {
         prov::Verb::Setup => {
-            let mut tty = atpkg_keys::master::Tty::open()
-                .map_err(|e| concat(&[&e, "\n", SETUP_ARMED_NOTHING]))?;
-            let phrase = atpkg_keys::master::generate_master()
-                .map_err(|e| concat(&[&e, "\n", SETUP_ARMED_NOTHING]))?;
+            let unarmed = |e: String| concat(&[&e, "\n", SETUP_ARMED_NOTHING]);
+            let vault = vault().map_err(unarmed)?;
+            let phrase = atpkg_keys::master::generate_master().map_err(unarmed)?;
             let seed = phrase.seed();
-            let planned = prov::plan(pre, &seed, now)
-                .map_err(|e| concat(&[&e, "\n", SETUP_ARMED_NOTHING]))?;
-
-            show_phrase(&mut tty, &phrase).map_err(|e| concat(&[&e, "\n", SETUP_ARMED_NOTHING]))?;
-            show_fingerprint(&mut tty, &seed)
-                .and_then(|()| confirm_transcription(&mut tty, &phrase, &seed))
-                .map_err(|e| concat(&[&e, "\n", SETUP_PAPER_ARMS_NOTHING]))?;
+            let planned = prov::plan(pre, &seed, now).map_err(unarmed)?;
+            phrase.store_in_vault(&vault).map_err(unarmed)?;
 
             prov::write_pins(&planned).map_err(|e| {
                 if e.landed {
                     concat(&[
                         &e.message,
-                        "\natpkg-keys: the anchor file may now name the master above, but \
-                         nothing else was written. `git checkout -- ",
+                        "\natpkg-keys: the anchor file may now name the vault's new master: \
+                         `git checkout -- ",
                         &paths.pins,
-                        "`, DESTROY that paper, fix the problem above, and run `atpkg-keys \
-                         setup` again — it will generate a different master.",
+                        "` first.\n",
+                        SETUP_VAULT_ARMS_NOTHING,
+                        prov::SETUP_START_OVER,
                     ])
                 } else {
-                    concat(&[&e.message, "\n", SETUP_PAPER_ARMS_NOTHING])
+                    concat(&[
+                        &e.message,
+                        "\n",
+                        SETUP_VAULT_ARMS_NOTHING,
+                        prov::SETUP_START_OVER,
+                    ])
                 }
             })?;
             announce_master(&seed)?;
             prov::write_rest(planned)?
         }
         prov::Verb::Join => {
-            let phrase = atpkg_keys::master::prompt_for_master(
-                "master phrase (52 characters, echo off; spaces, case, and o/i/l are forgiven): ",
-            )?;
-            let seed = phrase.seed();
+            let vault = vault()?;
+            let seed = atpkg_keys::master::from_vault(&vault)?.seed();
             announce_master(&seed)?;
-            prov::verify_master(&pre, &seed)?;
+            prov::verify_master(&pre, &seed).map_err(|e| {
+                concat(&[
+                    &e,
+                    "\n",
+                    &aterm_secrets::paper_master::refused(&vault, "it derives another master"),
+                ])
+            })?;
             let planned = prov::plan(pre, &seed, now)?;
             prov::write_pins(&planned)?;
             prov::write_rest(planned)?
@@ -496,10 +431,7 @@ fn machine_revoke(argv: &Argv) -> Result<(), String> {
         ]));
     }
 
-    let phrase = atpkg_keys::master::prompt_for_master(
-        "master phrase (52 characters, echo off; spaces, case, and o/i/l are forgiven): ",
-    )?;
-    let seed = phrase.seed();
+    let seed = atpkg_keys::master::from_vault(&vault()?)?.seed();
     announce_master(&seed)?;
     let roster_lock = atpkg_keys::provision::lock_roster(roster_path)?;
     let (roster, snapshot) = load_roster(roster_path, &seed.pubkey_b64()?, now)?;

@@ -237,7 +237,7 @@ fn every_kind_is_drawn_by_its_own_words() {
         ),
     ] {
         assert_eq!(
-            [none, one, many].map(|t| kind.resets_of(t)),
+            [none, one, many].map(|t| resets_of(kind, t)),
             [Some(0), Some(1), Some(12)],
             "{kind:?}"
         );
@@ -259,11 +259,11 @@ fn every_kind_is_drawn_by_its_own_words() {
         "two weekly resets",
         "2 weekly resets left",
     ] {
-        assert_eq!(ResetKind::Weekly.resets_of(wrong), None, "{wrong}");
+        assert_eq!(resets_of(ResetKind::Weekly, wrong), None, "{wrong}");
     }
     assert_eq!(ResetKind::of_word("5-hour"), None);
-    assert_eq!(ResetKind::Session.resets_of("2 5-hour resets"), None);
-    assert_eq!(ResetKind::Weekly.resets_of("2 five-hour resets"), None);
+    assert_eq!(resets_of(ResetKind::Session, "2 5-hour resets"), None);
+    assert_eq!(resets_of(ResetKind::Weekly, "2 five-hour resets"), None);
     for title in [
         "Use your reset?",
         "Use a reset?",
@@ -1526,7 +1526,7 @@ fn a_pending_line_is_read_under_its_own_title_and_nowhere_else() {
                 reading.composer.is_some(),
                 reading.prompt.is_some()
             ),
-            (crate::Phase::Idle, false, false, false)
+            (alab_policy::vocab::Phase::Idle, false, false, false)
         );
     }
 
@@ -1966,7 +1966,8 @@ fn a_spent_line_is_read_by_its_kinds_head() {
 
 #[test]
 fn no_line_of_the_reset_program_is_a_wall() {
-    use crate::wall::{WallKind, classify_wall};
+    use crate::wall::classify_wall;
+    use alab_policy::vocab::WallKind;
     let fixed = [
         SPENT,
         "Weekly limits reset · no weekly resets left",
@@ -2079,8 +2080,10 @@ fn no_line_of_the_reset_program_is_a_wall() {
 
 #[test]
 fn claude_2_1_312s_reset_answers_are_no_wall_and_its_wall_still_is() {
-    use crate::phase::{Phase, worker_phase};
-    use crate::wall::{WallKind, wall};
+    use crate::phase::worker_phase;
+    use crate::wall::wall;
+    use alab_policy::vocab::Phase;
+    use alab_policy::vocab::WallKind;
     let session = ResetLine::Spent {
         kind: ResetKind::Session,
         left: Some(1),

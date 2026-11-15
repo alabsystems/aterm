@@ -6,14 +6,15 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use aterm_agent::supervise::phase::Phase;
+use alab_policy::config::{Autopilot, TurnEndTiming};
+use alab_policy::vocab::{Phase, WallKind};
+use alab_policy::words::RULE_CONTINUE;
+use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::turn_end::{
-    Cleared, Clearing, Composer, RULE_CONTINUE, RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading,
-    TurnEndState, TurnEndTiming, cleared_text, decide_turn_end,
+    Cleared, Clearing, Composer, RULE_LIMIT_RESUME, TurnEndAction, TurnEndReading, TurnEndState,
+    cleared_text, decide_turn_end,
 };
-use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_condition_resume_model;
-use aterm_phase::wall::WallKind;
 use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
@@ -110,7 +111,8 @@ fn point(reset_at: Option<Instant>, person: bool) -> TurnEndReading {
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(None),
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
-        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: aterm_agent::harness::goal::GoalRead::Unread,
         fact: None,
         wake: None,
     }

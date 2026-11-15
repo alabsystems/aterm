@@ -6,6 +6,29 @@ use super::*;
 use crate::runtime_input_retention::{CHUNK_INPUTS, RIGHTS_MARKER};
 
 impl Channel {
+    pub(crate) fn send_bootstrap_configuration_description(
+        &mut self,
+        file: BorrowedFd<'_>,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.send_named_descriptions(
+            &[file],
+            crate::bootstrap_graph::configuration::RIGHTS_MARKER,
+            1,
+            deadline,
+        )
+    }
+    pub(crate) fn receive_bootstrap_configuration_description(
+        &mut self,
+        deadline: Instant,
+    ) -> io::Result<Vec<OwnedFd>> {
+        self.receive_named_descriptions(
+            1,
+            crate::bootstrap_graph::configuration::RIGHTS_MARKER,
+            1,
+            deadline,
+        )
+    }
     pub(crate) fn send_bootstrap_source_descriptions(
         &mut self,
         fds: &[BorrowedFd<'_>; 4],

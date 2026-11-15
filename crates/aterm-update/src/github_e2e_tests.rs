@@ -76,7 +76,6 @@ fn probe_one_check_over_real_curl_if_asked() -> bool {
     let pending = dir.join("said.pending");
     std::fs::write(&pending, said).unwrap();
     std::fs::rename(pending, dir.join("said")).unwrap();
-    std::thread::sleep(HANG);
     true
 }
 
@@ -373,30 +372,34 @@ fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent(
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    command
         .args(["--exact", "--nocapture", PROBE])
         .process_group(0)
         .env(PROBE_DIR, &world)
         .env(aterm_update_core::CURL_SEAM, &wrapper)
         .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .spawn()
-        .unwrap();
-    let start = std::time::Instant::now();
-    let said = loop {
-        if let Ok(said) = std::fs::read_to_string(world.join("said")) {
-            break said;
-        }
-        if start.elapsed() > HANG || !matches!(child.try_wait(), Ok(None)) {
-            break String::new();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
-    let pid = i32::try_from(child.id()).unwrap();
-    // SAFETY: process_group(0) made this unreaped child its group's leader.
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
-    let _ = child.wait();
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .stderr(aterm_uds::spawnfd::Stdio::piped());
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        HANG,
+        "checking and staging the loopback curl release",
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "the check helper stopped: {error}; host saw {:?}",
+            seen.lock().unwrap()
+        )
+    });
+    assert!(
+        output.status.success(),
+        "check helper {:?}; stdout: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let said = std::fs::read_to_string(world.join("said")).unwrap_or_default();
     let seen = seen.lock().unwrap().clone();
     assert_eq!(
         said,

@@ -27,49 +27,28 @@ pub struct MachineIdentity {
 }
 
 impl MachineIdentity {
-    /// Read the identity from `path`.
+    /// Read the identity from `path`: a record `atpkg-keys setup`/`join` just minted.
     pub fn read(path: &Path) -> Result<Option<Self>> {
         let text = match crate::durable::read_regular_text(path, 64 * 1024) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(Error::new(format!("read {}: {e}", path.display()))),
         };
-        let identity: Self = aterm_toml::from_str(&text)
-            .map_err(|e| Error::new(format!("parse {}: {e}", path.display())))?;
+        Self::parse(&text, &path.display().to_string()).map(Some)
+    }
+
+    /// The identity `text` records, `what` naming it in an error.
+    pub fn parse(text: &str, what: &str) -> Result<Self> {
+        let identity: Self =
+            aterm_toml::from_str(text).map_err(|e| Error::new(format!("parse {what}: {e}")))?;
         if identity.id.is_empty() || identity.pubkey.is_empty() {
             return Err(Error::new(format!(
-                "{} names no machine id or no public key; re-mint with `atpkg-keys \
-                 join --id <id>`",
-                path.display()
+                "{what} names no machine id or no public key; re-mint with `atpkg-keys \
+                 join --id <id>`"
             )));
         }
-        Ok(Some(identity))
+        Ok(identity)
     }
-}
-
-/// `home/.aterm/release-ring/machine.toml`, beside the key `atpkg-keys setup`/`join` wrote.
-#[must_use]
-pub fn identity_path_in(home: &Path) -> PathBuf {
-    home.join(atpkg_keys::provision::MACHINE_PUB_REL)
-}
-
-/// `~/.aterm/release-ring/machine.toml`, beside the key `atpkg-keys setup`/`join` wrote.
-pub fn conventional_identity_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| identity_path_in(Path::new(&home)))
-}
-
-/// What this machine claims its id is: the release-credentials profile's `machine_id` when set (it is part of the command that ran), else `~/.aterm/release-ring/machine.toml`.
-pub fn declared_machine_id(
-    profile_machine_id: Option<&str>,
-    identity_path: Option<&Path>,
-) -> Result<Option<String>> {
-    if let Some(id) = profile_machine_id {
-        return Ok(Some(id.to_string()));
-    }
-    let Some(path) = identity_path else {
-        return Ok(None);
-    };
-    Ok(MachineIdentity::read(path)?.map(|identity| identity.id))
 }
 
 /// The master-signed roster and its detached signature, read once.

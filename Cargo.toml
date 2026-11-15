@@ -11,7 +11,7 @@ members = ["crates/*"]
 # they are publication tools or check runners.
 default-members = [
     "crates/aterm-repository-progress",
-    "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-protocol", "crates/amacs-term",
+    "crates/agh", "crates/alab-policy", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-protocol", "crates/amacs-term",
     "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-agent-names", "crates/aterm-alloc", "crates/aterm-aos", "crates/aterm-aos-pane",
     "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-bootstrap-verify", "crates/aterm-brotli", "crates/aterm-buffer",
     "crates/aterm-acaffeine", "crates/aterm-cap", "crates/aterm-capacity", "crates/aterm-resource-host",
@@ -83,15 +83,17 @@ update_channel = "alabsystems/aterm"
 # `version` is the product version: `pub bump` moves it and the publication engine reads it. Only
 # the `aterm` bin package inherits it, and its build script writes it into the binary's identity
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
-# constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
+# constant `0.0.0`, so a bump is an input of no library unit.
 [workspace.package]
-version = "0.201.0"
+version = "0.202.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
 authors = ["Andrew Yates"]
 
 [workspace.dependencies]
+# The turn-end readers, std only: aterm's engine and claude-code-alab read the same decisions.
+alab-policy = { path = "crates/alab-policy" }
 aterm-mail = { path = "crates/aterm-mail" }
 aterm-mail-bigint = { path = "crates/aterm-mail-bigint" }
 # First-party serde (`crates/aterm-serde` + `crates/aterm-serde-derive`) exposed

@@ -63,6 +63,7 @@ fn the_tabs_program_waits_for_its_go_line_and_its_exit_status_is_read() {
             None,
             None,
             None,
+            None,
         )
         .expect("the tab's program starts");
         let identity = session.shell_identity;

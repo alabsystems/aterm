@@ -446,7 +446,6 @@ fn a_restart_holds_a_told_held_episode_until_it_clears() {
 /// hold's kind-wide seed, holds #2 told as well.
 #[test]
 fn a_seed_holds_a_typed_wake_by_its_own_episode() {
-    use crate::supervise::Autopilot;
     use crate::supervise::occupancy::OccupancyReading;
     use crate::supervise::occupancy::door;
     use crate::supervise::occupancy::fault::{self, Fault};
@@ -456,6 +455,7 @@ fn a_seed_holds_a_typed_wake_by_its_own_episode() {
     use crate::supervise::occupancy::wakes_seen::{
         AtomKind, Declarer, Prio, WakeSeen, WakeState, WakesSeen, wake_episode,
     };
+    use alab_policy::config::Autopilot;
     let wake = |ord: u16| WakeSeen {
         ord,
         class: Declarer::Agent,

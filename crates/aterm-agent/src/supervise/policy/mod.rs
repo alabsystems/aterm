@@ -9,16 +9,18 @@ pub mod box_call;
 pub mod box_command;
 pub mod box_facts;
 pub mod claude_settings;
-pub mod cruise_carry;
 pub mod exception;
 pub mod git_config;
-pub mod go_ahead;
-pub mod guard;
+/// The go-ahead reader over a screen this crate's readers draw.
 #[cfg(test)]
-mod guard_base_tests;
-pub mod land_check;
+#[path = "go_ahead_screen_tests.rs"]
+mod go_ahead_screen_tests;
+pub mod goal_restore;
+/// The press guards alab-policy writes, held to the server's own matcher.
+#[cfg(test)]
+#[path = "guard_tests.rs"]
+mod guard_tests;
 pub mod login;
-pub mod needs;
 pub mod notice;
 pub mod outlook;
 pub mod probe;
@@ -26,7 +28,6 @@ mod probe_live;
 /// The live probe's test gate, for the loop's tests of a look that does not answer.
 #[cfg(test)]
 pub(crate) use probe_live::tests as probe_live_tests;
-pub mod credential_need;
 pub mod question;
 pub mod reset;
 pub mod rm_breaker;
@@ -49,9 +50,6 @@ pub use approval::{
 };
 pub use claude_settings::{AskKind, OwnerAsk};
 pub use git_config::{GitView, WorkerEnv};
-pub use guard::{
-    KeyAct, key_args, row_guard, server_fences_gen, server_fences_send, server_takes_act,
-};
 pub use probe::{Below, LiveProbe, OnDisk, PolicyProbe, WorkerWrites};
 pub use question::{
     LONG_TERM_TEXT, MAX_QUESTION_FOCUS_STEPS, RULE_ANSWER_RECOMMENDED, SHORT_TERM_TEXT,

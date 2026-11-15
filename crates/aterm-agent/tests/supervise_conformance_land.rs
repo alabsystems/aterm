@@ -7,21 +7,25 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use alab_policy::config::Autopilot;
+use alab_policy::land_check::listed_suffix;
+use alab_policy::land_check::{LAND_CHECK_HEAD, RULE_LAND_CHECK};
+use alab_policy::open_work::{clean_defense, open_work_strict};
+use alab_policy::vocab::{Phase, WallKind};
+use alab_policy::words::{
+    GaveUp, LAND, LAND_ANSWER, LAND_CONTRADICTED_HEAD, LAND_NUDGE, RULE_LAND, RULE_LAND_ANSWER,
+    RULE_LAND_NUDGE, VERBATIM_UNITS, says_done,
+};
 use aterm_agent::harness::acts::{HoldLeg, LandHeld, TaskFace};
 use aterm_agent::harness::leftover::{LeftRead, LeftWord, token_of};
 use aterm_agent::harness::repo_work::{RepoRead, RepoWork};
-use aterm_agent::supervise::phase::Phase;
-use aterm_agent::supervise::policy::land_check::listed_suffix;
+use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, GaveUp, LAND, LAND_ANSWER, LAND_CHECK_HEAD, LAND_CONTRADICTED_HEAD, LAND_NUDGE,
-    LEFT_HOLDS, Outage, RULE_API_CUTOFF, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_CHECK,
-    RULE_LAND_NUDGE, Reach, TurnEndAction, TurnEndReading, TurnEndState, UNREACHABLE_HOLD,
-    VERBATIM_UNITS, WaitKind, clean_defense, decide_turn_end, land_contradicted, left_suffix,
-    left_suffix_short, open_work_strict, repo_work_suffix, says_done,
+    Composer, LEFT_HOLDS, Outage, RULE_API_CUTOFF, Reach, TurnEndAction, TurnEndReading,
+    TurnEndState, UNREACHABLE_HOLD, WaitKind, decide_turn_end, land_contradicted, left_suffix,
+    left_suffix_short, repo_work_suffix,
 };
-use aterm_agent::supervise::{Autopilot, SupervisorConfig};
 use aterm_models_harness::supervisor_land_model;
-use aterm_phase::wall::WallKind;
 use aterm_spec::derive::Model;
 use aterm_uds::process::Identity;
 
@@ -33,7 +37,7 @@ type State = BTreeMap<&'static str, i64>;
 const OVERLONG: WallKind = WallKind::ApiError {
     code: None,
     retryable: true,
-    cause: aterm_phase::ApiCause::Overlong,
+    cause: alab_policy::vocab::ApiCause::Overlong,
 };
 const OVERLONG_MESSAGE: &str = "API Error: Claude's response exceeded the 32000 output token \
                                 maximum. To configure this behavior, set the \
@@ -56,7 +60,7 @@ const NEEDS: &str = "Nothing left: the parser and its tests are on origin/main.\
 const OPEN_DEFENSE: &str = "Nothing left: the parser is pushed.\n- Its branch is not merged yet.";
 const ANSWERED: &str = "Yes: the old syntax still parses.";
 /// The land check's answers: its one landing word, a list, and a need alone.
-const CHECKED: &str = aterm_agent::supervise::policy::land_check::LANDED;
+const CHECKED: &str = alab_policy::land_check::LANDED;
 const LIST: &str = "The parser's branch is not merged yet.";
 const NEED_ONLY: &str = "NEEDS YOU: the release permission, to sign the build";
 /// A managed worker's own failed conclusion.
@@ -177,7 +181,8 @@ fn point(
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(at.dirty.then(finding)),
         leftover: LeftRead::Rows(left.to_vec()),
-        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: aterm_agent::harness::goal::GoalRead::Unread,
         fact: None,
         wake: None,
     }
@@ -475,7 +480,7 @@ impl Real {
     }
 
     /// The measured outage's cap passes (`OutageCapDue`): the clock moves to when the hold of
-    /// the outage standing ends (`TurnEndTiming::outage_holds_until`), the reach still Down.
+    /// the outage standing ends (`turn_end::outage_holds_until`), the reach still Down.
     fn outage_cap_passes(&mut self) {
         let since = self.down.expect("an outage stands");
         self.now = self.now.max(since + self.st.timing.outage_cap);
@@ -1025,7 +1030,7 @@ fn tier1_the_buggy_model_and_three_tellers_are_refuted() {
     assert_eq!(verdict(&a), Verdict::Check, "a need never bars the check");
     assert!(
         matches!(&a, TurnEndAction::Type { text, .. }
-            if text.contains(aterm_agent::supervise::policy::needs::NEEDS_ACK)),
+            if text.contains(alab_policy::needs::NEEDS_ACK)),
         "{a:?}"
     );
 

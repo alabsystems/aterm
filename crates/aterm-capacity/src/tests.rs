@@ -18,6 +18,74 @@ use crate::{
     Waiter, admit_until, admit_with, never,
 };
 
+/// A waiting claim of the process `pid` asking nothing, asked last: what a test's look reads of its
+/// own claim beside the claims it names, as [`crate::ResourceProbe`]'s stand-in is read.
+pub(crate) fn asking(pid: u32) -> Record {
+    Record {
+        timing: crate::TimingEvidence::default(),
+        accounting: crate::Accounting::Holder,
+        pid,
+        start_ms: u64::MAX,
+        seq: u64::MAX,
+        checkout: String::new(),
+        need: Need::new("asker"),
+        held: None,
+        credit: Vec::new(),
+        wrote: None,
+        next_ms: None,
+    }
+}
+
+/// The reading [`reckoned_by`] and [`counted_by`] look on: `available` on 18 cores.
+fn reading_of(available: Option<u64>) -> crate::Reading {
+    crate::Reading {
+        available,
+        cores: 18,
+        ..crate::Reading::default()
+    }
+}
+
+/// What the look of `own` reckons of `records`, every other claim, with `own` among them, on
+/// `available` ([`crate::admit::ledgerwide`], over its trees, [`crate::admit::process_use`]).
+fn reckoned_by(
+    own: &Record,
+    records: &[&Record],
+    procs: Option<&Procs>,
+    available: Option<u64>,
+) -> crate::admit::Ledgerwide {
+    let read: Vec<&Record> = records
+        .iter()
+        .copied()
+        .chain(std::iter::once(own))
+        .collect();
+    let trees = crate::admit::process_use(&read, own.pid, procs).trees;
+    crate::admit::ledgerwide(&read, &trees, procs, &reading_of(available))
+}
+
+/// [`counted`] as the look of a waiter of `pid` reads `records`, every other claim, each reckoned
+/// as that look reckons it beside its own claim ([`asking`], [`reckoned_by`]).
+pub(crate) fn counted_by<'r>(
+    records: Vec<&'r Record>,
+    pid: u32,
+    procs: Option<&Procs>,
+    available: Option<u64>,
+) -> Vec<&'r Record> {
+    let wide = reckoned_by(&asking(pid), &records, procs, available);
+    counted(records, pid, procs, &wide.reckoned, &reading_of(available))
+}
+
+/// [`funded_lead_reservation`] as the look of `lead` reads `records`, every other claim, each
+/// reckoned as that look reckons it ([`reckoned_by`]).
+fn funded_by(
+    lead: &Record,
+    records: &[&Record],
+    procs: &Procs,
+    available: Option<u64>,
+) -> Option<crate::LeadReservation> {
+    let wide = reckoned_by(lead, records, Some(procs), available);
+    funded_lead_reservation(lead, records, procs, &wide, available)
+}
+
 /// A scratch ledger, removed when the test ends.
 struct Scratch {
     ledger: Ledger,
@@ -1583,6 +1651,10 @@ fn release_rank_orders_memory_waiters_and_reserves_cores_without_preempting_ordi
         used: TreeUse::default(),
         credited: TreeUse::default(),
         seen: true,
+        line: Vec::new(),
+        sole: true,
+        inside: None,
+        reckoned: None,
     };
     let release = Need::new("release")
         .rank(Rank::Release)
@@ -1699,6 +1771,10 @@ fn a_waiting_ordinary_disk_claim_cannot_deadlock_its_background_disk_holder() {
         used: TreeUse::default(),
         credited: TreeUse::default(),
         seen: true,
+        line: Vec::new(),
+        sole: true,
+        inside: None,
+        reckoned: None,
     };
     assert_eq!(
         decide(
@@ -2440,6 +2516,10 @@ fn a_holders_own_use_is_not_reserved_twice() {
             },
             credited: TreeUse::default(),
             seen: true,
+            line: Vec::new(),
+            sole: true,
+            inside: None,
+            reckoned: None,
         }]
     };
     assert!(decide(&b, (1, 1, 0), &m, &using(0), 1).is_err());
@@ -2473,6 +2553,7 @@ fn one_holders_tree_is_credited_once_across_its_claims() {
     m.set_procs(Some(Procs::of(vec![Proc {
         pid: std::process::id(),
         ppid: 1,
+        start: 0,
         charged: 20 * GIB,
         footprint: 20 * GIB,
         written: 0,
@@ -2514,6 +2595,7 @@ fn a_child_claimants_use_is_credited_to_it_alone() {
     let p = |pid, ppid, gib: u64| Proc {
         pid,
         ppid,
+        start: 0,
         charged: gib * GIB,
         footprint: gib * GIB,
         written: 0,
@@ -2587,6 +2669,7 @@ fn a_claim_inside_held_work_is_held_to_the_other_held_claims_only() {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        start: 0,
         charged: 0,
         footprint: 0,
         written: 0,
@@ -2596,19 +2679,19 @@ fn a_claim_inside_held_work_is_held_to_the_other_held_claims_only() {
     let started_by_verify = Procs::of(vec![p(1, 0), p(10, 1), p(9, 10), p(20, 9), p(11, 1)]);
     assert_eq!(started_by_verify.ancestors(20), [9, 10, 1, 0]);
     assert_eq!(
-        pids(counted(all(), 20, Some(&started_by_verify), None)),
+        pids(counted_by(all(), 20, Some(&started_by_verify), None)),
         [11],
         "the trust run alone"
     );
     let unrelated = Procs::of(vec![p(1, 0), p(10, 1), p(20, 1)]);
     assert_eq!(
-        pids(counted(all(), 20, Some(&unrelated), None)),
+        pids(counted_by(all(), 20, Some(&unrelated), None)),
         [10, 11, 12]
     );
-    assert_eq!(pids(counted(all(), 20, None, None)), [10, 11, 12]);
+    assert_eq!(pids(counted_by(all(), 20, None, None)), [10, 11, 12]);
     let waiting = record(10, 0, Need::new("verify").disk(27 * GIB, "/vol"), None);
     assert_eq!(
-        pids(counted(
+        pids(counted_by(
             vec![&waiting, &trust, &boot],
             20,
             Some(&started_by_verify),
@@ -2640,12 +2723,12 @@ fn a_process_that_holds_the_quiet_machine_waits_behind_no_waiter() {
         decide(&stage.need, stage.order(), &m, &ahead, 30)
     };
     let held = quiet(Some(0));
-    let measuring = counted(vec![&disk, &held, &lab, &b12, &b13], 10, None, None);
+    let measuring = counted_by(vec![&disk, &held, &lab, &b12, &b13], 10, None, None);
     assert_eq!(pids(&measuring), [10, 10, 11], "the held claims alone");
     assert!(look(&measuring).is_ok(), "admitted beside the lab");
 
     let waiting = quiet(None);
-    let queued = counted(vec![&disk, &waiting, &lab, &b12, &b13], 10, None, None);
+    let queued = counted_by(vec![&disk, &waiting, &lab, &b12, &b13], 10, None, None);
     assert_eq!(pids(&queued), [10, 10, 11, 12, 13]);
     let short = look(&queued).expect_err("behind the builds");
     assert_eq!(
@@ -2660,7 +2743,7 @@ fn a_process_that_holds_the_quiet_machine_waits_behind_no_waiter() {
             stuck: false,
         }]
     );
-    let plain_run = counted(vec![&disk, &lab, &b12, &b13], 10, None, None);
+    let plain_run = counted_by(vec![&disk, &lab, &b12, &b13], 10, None, None);
     assert_eq!(pids(&plain_run), [10, 11, 12, 13]);
     assert!(
         look(&plain_run).is_err(),
@@ -2683,6 +2766,7 @@ fn a_holders_child_is_admitted_beside_its_ancestors_claim() {
     let p = |pid, ppid| Proc {
         pid,
         ppid,
+        start: 0,
         charged: 0,
         footprint: 0,
         written: 0,
@@ -2722,6 +2806,7 @@ fn a_tree_sums_its_descendants() {
     let p = |pid, ppid, mib: u64| Proc {
         pid,
         ppid,
+        start: 0,
         charged: mib << 20,
         footprint: mib << 20,
         written: mib,
@@ -2778,6 +2863,10 @@ fn disk_is_held_above_the_floor() {
         },
         credited: TreeUse::default(),
         seen: true,
+        line: Vec::new(),
+        sole: true,
+        inside: None,
+        reckoned: None,
     };
     assert!(decide(&need, (1, 1, 0), &r, &[other(&there, 0)], 1).is_ok());
     let short = decide(&need, (1, 1, 0), &r, &[other(&here, 0)], 1).expect_err("68 less 50");
@@ -2830,6 +2919,10 @@ fn plain(record: &Record) -> Other<'_> {
         used: TreeUse::default(),
         credited: TreeUse::default(),
         seen: true,
+        line: Vec::new(),
+        sole: true,
+        inside: None,
+        reckoned: None,
     }
 }
 
@@ -3113,7 +3206,16 @@ fn the_listed_reservations_are_what_a_later_look_holds_its_need_to() {
     let refs: Vec<&Record> = records.iter().collect();
     let later = 99;
     let taken = records.iter().map(|r| r.pid).chain([later]).collect();
-    let others = crate::admit::others(&refs, taken, &trees);
+    let others = crate::admit::others(
+        &refs,
+        taken,
+        &trees,
+        &std::collections::HashMap::new(),
+        &crate::admit::Ledgerwide {
+            holders: crate::admit::claims_by_holder(refs.iter().copied()),
+            ..crate::admit::Ledgerwide::default()
+        },
+    );
     for (read, on, need) in [
         (
             &data_read,
@@ -3958,6 +4060,10 @@ fn a_quiet_claim_is_alone_on_a_quiet_machine() {
         used: TreeUse::default(),
         credited: TreeUse::default(),
         seen: true,
+        line: Vec::new(),
+        sole: true,
+        inside: None,
+        reckoned: None,
     }];
     let short = decide(&need, (1, 1, 0), &r, &o, 1).expect_err("one quiet claim at a time");
     assert_eq!(
@@ -4736,6 +4842,10 @@ fn a_grant_is_a_share_of_the_room_the_held_claims_leave() {
         used: TreeUse::default(),
         credited: TreeUse::default(),
         seen: true,
+        line: Vec::new(),
+        sole: true,
+        inside: None,
+        reckoned: None,
     };
     let want = |n| Need::new("guest").cores(n);
     let held = [other(&lima)];
@@ -4876,6 +4986,7 @@ fn a_vms_own_processes_are_credited_against_its_claim() {
     m.set_procs(Some(Procs::of(vec![Proc {
         pid: VM,
         ppid: 1,
+        start: 0,
         charged: 14 * GIB,
         footprint: 14 * GIB,
         written: 0,
@@ -6914,6 +7025,10 @@ fn a_claim_that_can_never_fit_runs_alone_and_keeps_every_other_memory_claim_wait
             },
             credited: TreeUse::default(),
             seen: true,
+            line: Vec::new(),
+            sole: true,
+            inside: None,
+            reckoned: None,
         }
     }
     for f in [0, 5, 20] {
@@ -6983,6 +7098,10 @@ fn an_isolation_wait_names_its_holders_instead_of_zero_memory_shortfall() {
             used: TreeUse::default(),
             credited: TreeUse::default(),
             seen: true,
+            line: Vec::new(),
+            sole: true,
+            inside: None,
+            reckoned: None,
         }],
         1,
     )
@@ -7007,6 +7126,10 @@ fn an_isolation_wait_names_its_holders_instead_of_zero_memory_shortfall() {
             used: TreeUse::default(),
             credited: TreeUse::default(),
             seen: true,
+            line: Vec::new(),
+            sole: true,
+            inside: None,
+            reckoned: None,
         }],
         1,
     )
@@ -7112,12 +7235,20 @@ fn saturating_reservations_and_wrote_bounds_never_wrap_or_pass_record_max() {
             used: TreeUse::default(),
             credited: TreeUse::default(),
             seen: true,
+            line: Vec::new(),
+            sole: true,
+            inside: None,
+            reckoned: None,
         },
         Other {
             record: &b,
             used: TreeUse::default(),
             credited: TreeUse::default(),
             seen: true,
+            line: Vec::new(),
+            sole: true,
+            inside: None,
+            reckoned: None,
         },
     ];
     let short = decide(
@@ -8114,6 +8245,7 @@ fn an_inside_waiter_counts_a_lead_only_where_it_is_sure() {
     let p = |pid, ppid, footprint| Proc {
         pid,
         ppid,
+        start: 0,
         charged: footprint,
         footprint,
         written: 0,
@@ -8139,7 +8271,7 @@ fn an_inside_waiter_counts_a_lead_only_where_it_is_sure() {
     let counts = |extra: &[Record], available: u64, procs: Option<&Procs>| {
         let mut records = vec![held(20, 2, 2), lead(21, 3, 30), lead(22, 4, 10)];
         records.extend_from_slice(extra);
-        let mut pids: Vec<u32> = counted(records.iter().collect(), 11, procs, Some(available))
+        let mut pids: Vec<u32> = counted_by(records.iter().collect(), 11, procs, Some(available))
             .into_iter()
             .map(|r| r.pid)
             .collect();
@@ -8195,7 +8327,10 @@ fn an_inside_waiter_counts_a_lead_only_where_it_is_sure() {
         [20]
     );
     let records = [held(10, 1, 4), held(20, 2, 2), lead(21, 3, 30)];
-    assert_eq!(counted(records.iter().collect(), 11, sweep, None).len(), 1);
+    assert_eq!(
+        counted_by(records.iter().collect(), 11, sweep, None).len(),
+        1
+    );
     assert_eq!(
         counts(&[held(10, 1, 4)], 64 * GIB, None),
         [10, 20, 21, 22],
@@ -8271,6 +8406,7 @@ fn retained_holdback_cannot_be_spent_as_release_overshoot() {
         sponsors: vec![crate::LeadSponsor {
             order: (0, 99, 0),
             bytes: 1,
+            start: 0,
         }],
     });
     let small = Need::new("inside hidden parent").mem_gib(6);
@@ -8330,10 +8466,17 @@ fn a_sponsor_descendant_passes_the_retained_lead_without_exempting_other_work() 
         sponsors: vec![crate::LeadSponsor {
             order: sponsor.order(),
             bytes: sponsor.need.mem,
+            start: 0,
         }],
     });
     let other_parent = record(40, 3, Need::new("other parent").mem_gib(1), Some(0));
     let procs = Procs::of(vec![
+        Proc {
+            pid: 30,
+            charged: 20 * GIB,
+            footprint: 20 * GIB,
+            ..Proc::default()
+        },
         Proc {
             pid: 31,
             ppid: 30,
@@ -8346,12 +8489,12 @@ fn a_sponsor_descendant_passes_the_retained_lead_without_exempting_other_work() 
         },
     ]);
     let rows = vec![&sponsor, &lead, &other_parent];
-    let child = counted(rows.clone(), 31, Some(&procs), Some(30 * GIB));
+    let child = counted_by(rows.clone(), 31, Some(&procs), Some(30 * GIB));
     assert!(
         !child.iter().any(|record| record.order() == lead.order()),
         "the sponsor's child does not wait for what waits for its parent"
     );
-    let unrelated = counted(rows, 41, Some(&procs), Some(30 * GIB));
+    let unrelated = counted_by(rows, 41, Some(&procs), Some(30 * GIB));
     assert!(
         unrelated
             .iter()
@@ -8364,7 +8507,7 @@ fn a_sponsor_descendant_passes_the_retained_lead_without_exempting_other_work() 
         Need::new("later claim at old pid").mem_gib(1),
         Some(0),
     );
-    let after_sponsor = counted(vec![&lead, &reused_pid], 31, Some(&procs), Some(30 * GIB));
+    let after_sponsor = counted_by(vec![&lead, &reused_pid], 31, Some(&procs), Some(30 * GIB));
     assert!(
         after_sponsor
             .iter()
@@ -8394,7 +8537,7 @@ fn an_ordinary_lead_does_not_count_its_same_pid_parent_as_independent_room() {
             ..Proc::default()
         },
     ]);
-    let counted = counted(
+    let counted = counted_by(
         vec![&parent, &lead, &other_parent],
         41,
         Some(&procs),
@@ -8406,78 +8549,179 @@ fn an_ordinary_lead_does_not_count_its_same_pid_parent_as_independent_room() {
     );
 }
 
-/// A FINAL LINK RETAINS THE ROOM ANOTHER FINAL LINK FUNDS. The 30 GiB critical link, with 4 GiB
-/// spare, is 8 GiB short beside the 4 GiB tree driver. The held 20 GiB compat link is a terminal
-/// critical sponsor in the same release checkout. Its append-only proof keeps a lagged 30 GiB
-/// available reading from being refilled after the compat record disappears: all 64 temporal
-/// tree units wait. Without the proof each is admitted, reproducing the old starvation stream.
-/// At the first 38 GiB reading the critical link starts; at 46 GiB a 4 GiB unit is provably safe
-/// beside its full envelope and conservative 6 GiB holdback. Once the finite link ends, small
-/// work starts again.
-#[test]
-fn a_terminal_link_funds_a_retained_critical_turn_without_starving_small_work() {
-    let p = |pid, ppid, charged| Proc {
+/// A process of a retained-lead test's sweep, by its pid, its parent and what it is charged, with
+/// the kernel start `1000 + pid` ([`Proc::start`]).
+fn proc_at(pid: u32, ppid: u32, charged: u64) -> Proc {
+    Proc {
         pid,
         ppid,
+        start: 1000 + u64::from(pid),
         charged,
         footprint: charged,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
-    };
+    }
+}
+
+/// A Release need of `gib` GiB.
+fn release_need(what: &str, gib: u64) -> Need {
+    Need::new(what).rank(crate::Rank::Release).mem_gib(gib)
+}
+
+/// Whether `counted`, what a look counts, holds `lead`.
+fn counts(counted: &[&Record], lead: &Record) -> bool {
+    counted.iter().any(|r| r.order() == lead.order())
+}
+
+/// THE TERMINAL-LINK LEDGER: a release's slice driver (20) holds 2 GiB and its tree driver (10)
+/// 4 GiB, each of no use; its compat final link (30, under 1) holds a terminal critical 20 GiB its
+/// own process uses; and its native final link (21, under the slice driver) waits for a critical
+/// 30 GiB with a 4 GiB margin. Under the tree driver sit 64 tree units (100..164) and 11.
+struct TerminalLink {
+    slice: Record,
+    tree: Record,
+    sponsor: Record,
+    lead: Record,
+}
+
+fn terminal_link() -> TerminalLink {
+    TerminalLink {
+        slice: record(20, 1, release_need("slice driver", 2), Some(0)),
+        tree: record(10, 2, release_need("tree driver", 4), Some(0)),
+        sponsor: record(
+            30,
+            3,
+            release_need("compat final link", 20).critical_path(),
+            Some(0),
+        ),
+        lead: record(
+            21,
+            4,
+            release_need("native final link", 30)
+                .margin(4 * GIB)
+                .critical_path(),
+            None,
+        ),
+    }
+}
+
+/// The terminal-link ledger's sweep, with `link` the compat link's process where the sweep holds
+/// it, and `extra` beside.
+fn link_procs(link: Option<Proc>, extra: &[Proc]) -> Procs {
+    link_sweep(0, link, extra)
+}
+
+/// [`link_procs`] with the slice driver's own process charged `slice_gib` GiB.
+fn link_sweep(slice_gib: u64, link: Option<Proc>, extra: &[Proc]) -> Procs {
     let mut processes = vec![
-        p(1, 0, 0),
-        p(10, 1, 0),
-        p(11, 10, 0),
-        p(20, 1, 0),
-        p(21, 20, 0),
-        p(30, 1, 20 * GIB),
+        proc_at(1, 0, 0),
+        proc_at(10, 1, 0),
+        proc_at(11, 10, 0),
+        proc_at(20, 1, slice_gib * GIB),
+        proc_at(21, 20, 0),
     ];
-    processes.extend((0..64).map(|i| p(100 + i, 10, 0)));
-    let procs = Procs::of(processes);
-    let release = |what: &str, gib| Need::new(what).rank(crate::Rank::Release).mem_gib(gib);
-    let slice_driver = record(20, 1, release("slice driver", 2), Some(0));
-    let tree_driver = record(10, 2, release("tree driver", 4), Some(0));
-    let sponsor = record(
-        30,
-        3,
-        release("compat final link", 20).critical_path(),
-        Some(0),
-    );
-    let mut lead = record(
-        21,
-        4,
-        release("native final link", 30)
-            .margin(4 * GIB)
-            .critical_path(),
-        None,
-    );
+    processes.extend(link);
+    processes.extend((0..64).map(|i| proc_at(100 + i, 10, 0)));
+    processes.extend_from_slice(extra);
+    Procs::of(processes)
+}
+
+/// Whether a waiter of the process `asker`'s look decides `need` (its claim of `order`) beside
+/// `records`, every other claim, on `procs` and `available` ([`counted_by`], [`decide`]).
+fn asks_beside(
+    records: &[&Record],
+    asker: &Record,
+    procs: &Procs,
+    available: u64,
+) -> Result<crate::admit::Grant, crate::Shortfall> {
+    let counted = counted_by(records.to_vec(), asker.pid, Some(procs), Some(available));
+    let others: Vec<Other<'_>> = counted.into_iter().map(plain).collect();
+    decide(
+        &asker.need,
+        asker.order(),
+        &Reading::of_gib(64, available / GIB, 14),
+        &others,
+        20,
+    )
+}
+
+/// A FINAL LINK RETAINS THE ROOM ANOTHER FINAL LINK FUNDS. The 30 GiB critical link, with 4 GiB
+/// spare, is 8 GiB short beside the 4 GiB tree driver. The held 20 GiB compat link is a terminal
+/// critical sponsor in the same release checkout, and the proof records its process's start. Once
+/// its record has gone while its process still holds its 20 GiB and the available reading still
+/// reads 30 GiB, the lead's fit counts those 20 GiB (REMAINS: 30 + 20 - 4 = 46 GiB), so all 64
+/// temporal tree units wait. Without the proof each is admitted, reproducing the old starvation
+/// stream. At the first 38 GiB reading the critical link starts; at 46 GiB a 4 GiB unit is
+/// provably safe beside its full envelope and conservative 6 GiB holdback. Once the finite link
+/// ends, small work starts again. SHOWN: once the sweep no longer holds the link's process and the
+/// reading shows its 20 GiB (38 GiB), the fit is 34 GiB, the lead's own, and the unit waits for it
+/// (its turn is 4 GiB short and no end brings that); at 46 GiB a unit backfills. LAGGED: where the
+/// process has left the sweep but the reading still shows 30 GiB, the fit is 26 GiB and a unit is
+/// admitted: that is the window REMAINS cannot see. Inside it the lead is sure for no waiter, so
+/// small work may take all the room its own looks see, not only the 20 GiB the lag hides: seven
+/// 4 GiB units, 28 GiB beside the slice driver's 2, and the eighth waits for their ends. A refill,
+/// never a cycle. KIN: beside a 13 GiB slice driver, the lead's parent, the proof
+/// funds the same 8 GiB from the same link (the lead's kin are never what it owes; its holdback,
+/// every held claim's but the link's, is 17 GiB), and the lead is sure for a unit beside that
+/// driver. NEGATIVE CONTROLS: M-REMAINS-OFF (no REMAINS) admits the 64 units; M-ENDED-SURE (a
+/// retained lead with an ended sponsor sure without its fit) has a unit wait LAGGED; M-FUND-START
+/// (the proof records start 0) admits the 64 units.
+#[test]
+fn a_terminal_link_funds_a_retained_critical_turn_without_starving_small_work() {
+    let TerminalLink {
+        slice: slice_driver,
+        tree: tree_driver,
+        sponsor,
+        mut lead,
+    } = terminal_link();
+    let procs = link_procs(Some(proc_at(30, 1, 20 * GIB)), &[]);
     let proving = [&slice_driver, &tree_driver, &sponsor];
-    let reservation = funded_lead_reservation(&lead, &proving, &procs, Some(30 * GIB))
+    let reservation = funded_by(&lead, &proving, &procs, Some(30 * GIB))
         .expect("the terminal compat link funds the critical native link");
     assert_eq!(reservation.needed, 8 * GIB);
     assert_eq!(reservation.holdback, 6 * GIB);
     assert_eq!(reservation.sponsors.len(), 1);
     assert_eq!(reservation.sponsors[0].order, sponsor.order());
     assert_eq!(reservation.sponsors[0].bytes, 20 * GIB);
+    assert_eq!(reservation.sponsors[0].start, 1030);
     lead.need.lead_reservation = Some(reservation);
 
-    let asks = |records: &[Record], asker: &Record, available: u64| {
-        let records: Vec<&Record> = records.iter().collect();
-        let counted = counted(records, asker.pid, Some(&procs), Some(available));
-        let others: Vec<Other<'_>> = counted.into_iter().map(plain).collect();
-        decide(
-            &asker.need,
-            asker.order(),
-            &Reading::of_gib(64, available / GIB, 14),
-            &others,
-            20,
-        )
-    };
-    let after_sponsor = [slice_driver.clone(), tree_driver.clone(), lead.clone()];
+    let big_slice = record(20, 1, release_need("slice driver", 13), Some(0));
+    let mut kin_lead = terminal_link().lead;
+    let kin_proof = funded_by(
+        &kin_lead,
+        &[&big_slice, &tree_driver, &sponsor],
+        &procs,
+        Some(30 * GIB),
+    )
+    .expect("the compat link funds the lead beside its own large driver");
+    assert_eq!(kin_proof.needed, 8 * GIB);
+    let first = lead
+        .need
+        .lead_reservation
+        .as_ref()
+        .expect("the first proof");
+    assert_eq!(kin_proof.sponsors, first.sponsors);
+    assert_eq!(kin_proof.holdback, 17 * GIB);
+    kin_lead.need.lead_reservation = Some(kin_proof);
+    assert!(
+        counts(
+            &counted_by(
+                vec![&big_slice, &tree_driver, &kin_lead],
+                100,
+                Some(&procs),
+                Some(30 * GIB),
+            ),
+            &kin_lead
+        ),
+        "KIN: the lead's own driver is no parent of its fit"
+    );
+
+    let after_sponsor = [&slice_driver, &tree_driver, &lead];
     let mut legacy = lead.clone();
     legacy.need.lead_reservation = None;
-    let legacy_records = [slice_driver.clone(), tree_driver.clone(), legacy];
+    let legacy_records = [&slice_driver, &tree_driver, &legacy];
     for i in 0..64 {
         let small = record(
             100 + i,
@@ -8486,22 +8730,22 @@ fn a_terminal_link_funds_a_retained_critical_turn_without_starving_small_work() 
             None,
         );
         assert!(
-            asks(&legacy_records, &small, 30 * GIB).is_ok(),
+            asks_beside(&legacy_records, &small, &procs, 30 * GIB).is_ok(),
             "NEGATIVE CONTROL: the snapshot-only rule admits temporal unit {i}"
         );
         assert!(
-            asks(&after_sponsor, &small, 30 * GIB).is_err(),
+            asks_beside(&after_sponsor, &small, &procs, 30 * GIB).is_err(),
             "the retained turn stops temporal unit {i} from refilling sponsor memory"
         );
     }
 
     assert!(
-        asks(&after_sponsor[..2], &lead, 38 * GIB).is_ok(),
+        asks_beside(&after_sponsor[..2], &lead, &procs, 38 * GIB).is_ok(),
         "the lead starts at the first reading that covers its real envelope"
     );
     let small = record(11, 80, Need::new("bounded backfill").mem_gib(4), None);
     assert!(
-        asks(&after_sponsor, &small, 46 * GIB).is_ok(),
+        asks_beside(&after_sponsor, &small, &procs, 46 * GIB).is_ok(),
         "a unit beyond the full envelope and holdback backfills"
     );
     let mut held_small = small.clone();
@@ -8511,18 +8755,431 @@ fn a_terminal_link_funds_a_retained_critical_turn_without_starving_small_work() 
         alone: false,
     });
     assert!(
-        asks(
-            &[slice_driver.clone(), tree_driver.clone(), held_small],
+        asks_beside(
+            &[&slice_driver, &tree_driver, &held_small],
             &lead,
+            &procs,
             46 * GIB,
         )
         .is_ok(),
         "the bounded backfill cannot move the lead's turn"
     );
     assert!(
-        asks(&[slice_driver, tree_driver], &small, 30 * GIB).is_ok(),
+        asks_beside(&[&slice_driver, &tree_driver], &small, &procs, 30 * GIB).is_ok(),
         "small work resumes after the finite critical unit ends"
     );
+
+    let gone = link_procs(None, &[]);
+    let unit = record(100, 10, Need::new("tree unit").mem_gib(4), None);
+    assert!(
+        counts(
+            &counted_by(after_sponsor.to_vec(), 100, Some(&gone), Some(38 * GIB)),
+            &lead
+        ),
+        "SHOWN: the link's 20 GiB show as available, and the lead fits"
+    );
+    assert!(
+        asks_beside(&after_sponsor, &unit, &gone, 38 * GIB).is_err(),
+        "SHOWN: the unit waits for the lead it counts"
+    );
+    assert!(
+        asks_beside(&after_sponsor, &unit, &gone, 46 * GIB).is_ok(),
+        "SHOWN: a unit beyond the lead's envelope and holdback backfills"
+    );
+    assert!(
+        !counts(
+            &counted_by(after_sponsor.to_vec(), 100, Some(&gone), Some(30 * GIB)),
+            &lead
+        ),
+        "LAGGED: the process has left the sweep before its pages show, and the lead does not fit"
+    );
+    assert!(
+        asks_beside(&after_sponsor, &unit, &gone, 30 * GIB).is_ok(),
+        "LAGGED: a unit is admitted while the lag hides the link's pages"
+    );
+    let mut held_units: Vec<Record> = Vec::new();
+    for i in 0..8 {
+        let mut unit = record(
+            100 + i,
+            10 + u64::from(i),
+            Need::new(format!("tree unit {i}")).mem_gib(4),
+            None,
+        );
+        let mut records = after_sponsor.to_vec();
+        records.extend(held_units.iter());
+        assert_eq!(
+            asks_beside(&records, &unit, &gone, 30 * GIB).is_ok(),
+            i < 7,
+            "LAGGED: unit {i} beside {i} held units on 30 GiB, the lead's 20 GiB unseen"
+        );
+        unit.held = Some(crate::Held {
+            admitted_ms: 10 + u64::from(i),
+            cores: 0,
+            alone: false,
+        });
+        held_units.push(unit);
+    }
+}
+
+/// A RETAINED LEAD READS WHAT IS AVAILABLE ONCE ITS SPONSOR HAS ENDED (ATERM-KI-1114-994's second
+/// ledger). On 30 GiB a 30 GiB lead with a 4 GiB margin, under its release's 13 GiB slice driver
+/// (its kin, which its fit leaves out), is funded by the 20 GiB compat link beside the held 4 GiB
+/// tree driver: 8 GiB needed, 17 GiB held back. The link's record goes and the slice driver's own
+/// use grows to 13 GiB inside its claim. With the link's process still holding its 20 GiB, 17 GiB
+/// is available: a unit under the tree driver reads 17 + 20 - 4 = 33 GiB of the 34 the lead asks,
+/// does not count it, and is admitted beside the driver, which reserves nothing more. With the
+/// process gone and its pages shown, 37 GiB: 37 - 4 = 33 again, and the unit is admitted. Before
+/// this rule the lead was sure for the unit while it waited for the tree driver's end, which
+/// waited for the unit. CONTROL: with the driver using nothing the lead fits by 46 GiB either way
+/// (30 GiB beside the link's process, 50 without it), and the unit waits for it on the critical
+/// turn. NEGATIVE CONTROL: M-ENDED-SURE (a retained lead with an ended sponsor sure without its
+/// fit) has the unit wait.
+#[test]
+fn a_retained_lead_reads_what_is_available_once_its_sponsor_has_ended() {
+    let TerminalLink {
+        tree: tree_driver,
+        sponsor,
+        mut lead,
+        ..
+    } = terminal_link();
+    let slice_driver = record(20, 1, release_need("slice driver", 13), Some(0));
+    let proving = link_procs(Some(proc_at(30, 1, 20 * GIB)), &[]);
+    let proof = funded_by(
+        &lead,
+        &[&slice_driver, &tree_driver, &sponsor],
+        &proving,
+        Some(30 * GIB),
+    )
+    .expect("the compat link funds the lead beside its own driver");
+    assert_eq!((proof.needed, proof.holdback), (8 * GIB, 17 * GIB));
+    lead.need.lead_reservation = Some(proof);
+    let records = [&slice_driver, &tree_driver, &lead];
+    let unit = record(100, 10, Need::new("tree unit").mem_gib(4), None);
+    for (driver_gib, link, available, sure) in [
+        (13, true, 17, false),
+        (13, false, 37, false),
+        (0, true, 30, true),
+        (0, false, 50, true),
+    ] {
+        let procs = link_sweep(driver_gib, link.then(|| proc_at(30, 1, 20 * GIB)), &[]);
+        let at = format!(
+            "the driver at {driver_gib} GiB, the link's process held: {link}, on {available} GiB"
+        );
+        assert_eq!(
+            counts(
+                &counted_by(records.to_vec(), 100, Some(&procs), Some(available * GIB)),
+                &lead
+            ),
+            sure,
+            "{at}"
+        );
+        assert_eq!(
+            asks_beside(&records, &unit, &procs, available * GIB).is_err(),
+            sure,
+            "{at}: the unit waits only for a lead that fits"
+        );
+    }
+}
+
+/// AN ENDED SPONSOR LEAVES REMAINS ONLY OF ITS OWN UNCLAIMED PROCESSES. On the terminal-link
+/// ledger, once the compat link's record has gone while its process (30) still holds 20 GiB on a 30
+/// GiB reading, the lead fits by 30 + 20 - 4 = 46 GiB for a unit under the tree driver. Not where a
+/// claimant may hold that process up, nor where it is another process: PARENT, a 1 GiB waiter of
+/// its child (31) makes the lead's room 26 GiB (the child may be work the process must join, and
+/// waits on the lead); REUSED, pid 30 reads another start, 26; CLAIMANT, pid 30 holds a new 1 GiB
+/// claim, whose tree is its: 30 + 1 - 4 = 27; CREDIT, its
+/// child (32) holds a 2 GiB claim crediting a waiter elsewhere (70), which waits for 4 GiB beside
+/// the unit: that claim may wait for the waiter, the process for its child, and the lead would wait
+/// for the process: 30 - 4 - 2 = 24 for either waiter. CREDITED, a 1 GiB claim elsewhere (50) is
+/// credited with its child (31): 26, and 46 where it is credited with a process elsewhere (70). Its
+/// use counts at most its pledge: CAP, the process uses 25 GiB on 16 GiB: 16 + 20 - 4 = 32. An
+/// unread start names none: UNREAD, a proof made where its start was not read, 26. Its tree is its
+/// own in every look: UNDER, beneath a 25 GiB claim of its parent (40), whose tree then holds none
+/// of its pages, on 10 GiB: 10 + 20 - 4 = 26, its 20 GiB counted once; UNDER-DRIVER, beneath a 2
+/// GiB claim of the compat slice's driver (25), which the proof (10 GiB needed, 8 held back) owed
+/// in full: 30 + 20 - 4 = 46 once the link's record has gone, as it was while the link held.
+/// NESTED, two links fund the lead (12 GiB needed), a 10 GiB one (30) using 2 GiB and a 6 GiB one
+/// (33) its child's 6 GiB, and both records have gone: each tree is its own, 2 + 6 counted once
+/// each, so the lead fits on 30 GiB (30 + 8 - 4 = 34) and not on 28 (32). NEGATIVE CONTROLS:
+/// M-REMAINS-PARENT (a waiting claim's process no claimant) has the lead sure in PARENT, and
+/// M-REMAINS-SUBTREE (a claimant under the holder ignored) in PARENT and CREDIT; M-REMAINS-IDENTITY
+/// (the start unread) in REUSED; M-REMAINS-CLAIMANT (the holder's own claim ignored) in CLAIMANT;
+/// M-REMAINS-CAP (no cap) in CAP; M-REMAINS-UNREAD (a start of 0 matching any) in UNREAD;
+/// M-REMAINS-ROOTS (no lingering holder rooted, so no tree of it read) in the base;
+/// M-REMAINS-ANCESTOR (a claimant above the holder counted too) in UNDER and UNDER-DRIVER;
+/// M-REMAINS-UNCARVED (neither rooted nor carved, its whole tree read) in UNDER; M-REMAINS-ROOTED
+/// (rooted, yet its whole tree read) and M-REMAINS-PLEDGE (counted at its pledge) in NESTED;
+/// M-REMAINS-CREDITED (a credited process no claimant) in CREDITED; M-REMAINS-HELDCLAIM (a held
+/// claim's process no claimant) in CLAIMANT and CREDIT.
+#[test]
+fn an_ended_sponsor_leaves_remains_only_of_its_own_unclaimed_processes() {
+    let TerminalLink {
+        slice,
+        tree,
+        sponsor,
+        mut lead,
+    } = terminal_link();
+    let link = |ppid, gib: u64| proc_at(30, ppid, gib * GIB);
+    let proof = |procs: &Procs, beside: &[&Record]| {
+        let mut proving = vec![&slice, &tree, &sponsor];
+        proving.extend_from_slice(beside);
+        funded_by(&terminal_link().lead, &proving, procs, Some(30 * GIB))
+            .expect("the compat link funds the lead")
+    };
+    lead.need.lead_reservation = Some(proof(&link_procs(Some(link(1, 20)), &[]), &[]));
+    let sure = |beside: &[&Record], lead: &Record, asker: u32, procs: &Procs, gib: u64| {
+        let mut records = vec![&slice, &tree, lead];
+        records.extend_from_slice(beside);
+        counts(
+            &counted_by(records, asker, Some(procs), Some(gib * GIB)),
+            lead,
+        )
+    };
+    let base = link_procs(Some(link(1, 20)), &[]);
+    assert!(sure(&[], &lead, 100, &base, 30), "the base fits by 46 GiB");
+
+    let child = link_procs(Some(link(1, 20)), &[proc_at(31, 30, 0)]);
+    let under = record(31, 6, Need::new("work under the link").mem_gib(1), None);
+    assert!(sure(&[], &lead, 100, &child, 30), "PARENT control");
+    assert!(!sure(&[&under], &lead, 100, &child, 30), "PARENT");
+
+    let mut reused = link(1, 20);
+    reused.start += 1;
+    assert!(
+        !sure(&[], &lead, 100, &link_procs(Some(reused), &[]), 30),
+        "REUSED"
+    );
+
+    let own = record(30, 9, Need::new("a new claim").mem_gib(1), Some(0));
+    assert!(!sure(&[&own], &lead, 100, &base, 30), "CLAIMANT");
+
+    let credit = link_procs(Some(link(1, 20)), &[proc_at(32, 30, 0), proc_at(70, 1, 0)]);
+    let mut crediting = record(32, 9, Need::new("held vm").mem_gib(2), Some(0));
+    crediting.credit = vec![70];
+    let elsewhere = record(70, 10, Need::new("waiter elsewhere").mem_gib(4), None);
+    let unit = record(100, 11, Need::new("tree unit").mem_gib(4), None);
+    assert!(
+        !sure(&[&crediting, &unit], &lead, 70, &credit, 30),
+        "CREDIT, for the credited waiter"
+    );
+    assert!(
+        !sure(&[&crediting, &elsewhere], &lead, 100, &credit, 30),
+        "CREDIT, for the unit"
+    );
+
+    let into = link_procs(
+        Some(link(1, 20)),
+        &[proc_at(31, 30, 0), proc_at(50, 1, 0), proc_at(70, 1, 0)],
+    );
+    let mut credits_in = record(50, 9, Need::new("held elsewhere").mem_gib(1), Some(0));
+    credits_in.credit = vec![70];
+    assert!(
+        sure(&[&credits_in], &lead, 100, &into, 30),
+        "CREDITED control: a credit outside the process"
+    );
+    credits_in.credit = vec![31];
+    assert!(!sure(&[&credits_in], &lead, 100, &into, 30), "CREDITED");
+
+    let big = link_procs(Some(link(1, 25)), &[]);
+    assert!(!sure(&[], &lead, 100, &big, 16), "CAP");
+    assert!(
+        sure(&[], &lead, 100, &big, 18),
+        "CAP: 18 + 20 - 4 = 34 fits"
+    );
+
+    let mut unread = terminal_link().lead;
+    let mut blind = link(1, 20);
+    blind.start = 0;
+    unread.need.lead_reservation = Some(proof(&link_procs(Some(blind), &[]), &[]));
+    assert_eq!(
+        unread
+            .need
+            .lead_reservation
+            .as_ref()
+            .map(|p| p.sponsors[0].start),
+        Some(0)
+    );
+    assert!(!sure(&[], &unread, 100, &base, 30), "UNREAD");
+
+    let beneath = link_procs(Some(link(40, 20)), &[proc_at(40, 1, 0)]);
+    let parent = record(40, 9, Need::new("held parent").mem_gib(25), Some(0));
+    assert!(!sure(&[&parent], &lead, 100, &beneath, 10), "UNDER");
+    assert!(
+        sure(&[&parent], &lead, 100, &beneath, 18),
+        "UNDER: 18 + 20 - 4 = 34 fits"
+    );
+
+    let driven = link_procs(Some(link(25, 20)), &[proc_at(25, 1, 0)]);
+    let compat_driver = record(25, 1, release_need("compat slice driver", 2), Some(0));
+    let mut driven_lead = terminal_link().lead;
+    let driven_proof = {
+        let proving = [&slice, &tree, &compat_driver, &sponsor];
+        funded_by(&driven_lead, &proving, &driven, Some(30 * GIB))
+            .expect("the compat link funds the lead beside its driver")
+    };
+    assert_eq!(
+        (driven_proof.needed, driven_proof.holdback),
+        (10 * GIB, 8 * GIB)
+    );
+    driven_lead.need.lead_reservation = Some(driven_proof);
+    assert!(
+        sure(&[&compat_driver, &sponsor], &driven_lead, 100, &driven, 30),
+        "UNDER-DRIVER while the link holds"
+    );
+    assert!(
+        sure(&[&compat_driver], &driven_lead, 100, &driven, 30),
+        "UNDER-DRIVER once the link's record has gone"
+    );
+
+    let outer = record(
+        30,
+        3,
+        release_need("compat final link", 10).critical_path(),
+        Some(0),
+    );
+    let inner = record(
+        33,
+        5,
+        release_need("inner final link", 6).critical_path(),
+        Some(0),
+    );
+    let nested = link_procs(Some(link(1, 2)), &[proc_at(33, 30, 6 * GIB)]);
+    let mut nested_lead = terminal_link().lead;
+    let nested_proof = funded_by(
+        &nested_lead,
+        &[&slice, &tree, &outer, &inner],
+        &nested,
+        Some(34 * GIB),
+    )
+    .expect("the two links fund the lead");
+    assert_eq!(
+        (nested_proof.needed, nested_proof.sponsors.len()),
+        (12 * GIB, 2)
+    );
+    nested_lead.need.lead_reservation = Some(nested_proof);
+    assert!(
+        sure(&[], &nested_lead, 100, &nested, 30),
+        "NESTED: 30 + 2 + 6 - 4 = 34 fits"
+    );
+    assert!(!sure(&[], &nested_lead, 100, &nested, 28), "NESTED");
+}
+
+/// A SET OF STARTERS KEEPS AN ENDED SPONSOR'S REMAINS (`Sweep::reckoned`). On the terminal-link
+/// ledger two 10 GiB links fund the lead (11 GiB needed): one (30) still held, its tree using
+/// nothing, and one (33) whose record has gone while its process still holds its 10 GiB. Under the
+/// held link a 1 GiB waiter (31) starts now and another (32) waits behind it, so that link stays a
+/// parent once the first has started; a 1 GiB unit (102) under the tree driver waits between them.
+/// On 38 GiB the lead fits for the unit by 38 + 10 - 4 - 10 = 34 GiB, also in the turn in which the
+/// first waiter has started, and the unit spares 4 GiB, as `aterm pkg capacity` lists it (`spared`,
+/// over [`crate::tree_roots`]' trees). CONTROL: with the ended link's process gone the lead is not
+/// sure for the unit, which then waits for nothing. NEGATIVE CONTROLS: M-REMAINS-STARTED (a set of
+/// starters' turn reckons no REMAINS) has the unit spare 5 GiB, and M-REMAINS-OFF (no REMAINS) has
+/// it wait for nothing.
+#[test]
+fn a_set_of_starters_keeps_what_an_ended_sponsor_still_holds() {
+    let TerminalLink { slice, tree, .. } = terminal_link();
+    let held = record(
+        30,
+        3,
+        release_need("held final link", 10).critical_path(),
+        Some(0),
+    );
+    let ended = record(
+        33,
+        5,
+        release_need("ended final link", 10).critical_path(),
+        Some(0),
+    );
+    let proving = link_procs(Some(proc_at(30, 1, 0)), &[proc_at(33, 1, 10 * GIB)]);
+    let proof = funded_by(
+        &terminal_link().lead,
+        &[&slice, &tree, &held, &ended],
+        &proving,
+        Some(37 * GIB),
+    )
+    .expect("the two links fund the lead");
+    assert_eq!((proof.needed, proof.sponsors.len()), (11 * GIB, 2));
+    let mut lead = terminal_link().lead;
+    lead.need.lead_reservation = Some(proof);
+    let ledger = [
+        slice,
+        tree,
+        held,
+        lead,
+        record(31, 50, Need::new("starts under the link").mem_gib(1), None),
+        record(102, 55, Need::new("tree unit").mem_gib(1), None),
+        record(32, 60, Need::new("waits under the link").mem_gib(1), None),
+    ];
+    let unit_spares = |lingers: bool| {
+        let mut extra = vec![proc_at(31, 30, 0), proc_at(32, 30, 0)];
+        extra.extend(lingers.then(|| proc_at(33, 1, 10 * GIB)));
+        let procs = link_procs(Some(proc_at(30, 1, 0)), &extra);
+        let trees = procs.trees(&crate::tree_roots(&ledger, &procs));
+        crate::spared(
+            &ledger,
+            Some(&trees),
+            Some(&procs),
+            &Reading::of_gib(64, 38, 14),
+        )[5]
+    };
+    assert_eq!(unit_spares(true), Some(crate::Spared::Within(4 * GIB)));
+    assert_eq!(unit_spares(false), None, "CONTROL");
+}
+
+/// A BUDGET-DOMAIN LEAD IS JUDGED BY ITS EXACT FIT AFTER ITS SPONSOR ENDS. A release's slice ledger
+/// reads a constant budget and charges every process nothing (`aterm-release`'s `BudgetMachine`),
+/// so REMAINS is 0 there and the plain fit is exact. On a 34 GiB budget, beside a 2 GiB slice
+/// driver (the lead's kin) and a 4 GiB tree driver, a 20 GiB compat link funds a 30 GiB critical
+/// link with no margin: 20 GiB needed, 6 GiB held back. Once the link has ended, its process still
+/// in the sweep, a unit under the tree driver counts the lead (34 - 4 = 30) and waits for it.
+/// Beside a held 3 GiB claim (12) with a waiter (13) under it, a parent, the lead's room is 27
+/// GiB: it is not sure, and the unit is admitted beside the held claims. NEGATIVE CONTROL:
+/// M-REMAINS-PLEDGE (a live ex-sponsor counted at its pledge) has the unit wait beside the parent.
+#[test]
+fn a_budget_domain_lead_is_judged_by_its_exact_fit_after_its_sponsor_ends() {
+    let slice = record(20, 1, release_need("slice driver", 2), Some(0));
+    let tree = record(10, 2, release_need("tree driver", 4), Some(0));
+    let sponsor = record(
+        30,
+        3,
+        release_need("compat final link", 20).critical_path(),
+        Some(0),
+    );
+    let mut lead = record(
+        21,
+        4,
+        release_need("native final link", 30).critical_path(),
+        None,
+    );
+    let procs = Procs::of(vec![
+        proc_at(1, 0, 0),
+        proc_at(10, 1, 0),
+        proc_at(20, 1, 0),
+        proc_at(21, 20, 0),
+        proc_at(30, 1, 0),
+        proc_at(100, 10, 0),
+        proc_at(12, 1, 0),
+        proc_at(13, 12, 0),
+    ]);
+    let proof = funded_by(&lead, &[&slice, &tree, &sponsor], &procs, Some(34 * GIB))
+        .expect("the link funds the lead in the budget");
+    assert_eq!((proof.needed, proof.holdback), (20 * GIB, 6 * GIB));
+    lead.need.lead_reservation = Some(proof);
+    let unit = record(100, 10, Need::new("tree unit").mem_gib(4), None);
+    let records = [&slice, &tree, &lead];
+    assert!(counts(
+        &counted_by(records.to_vec(), 100, Some(&procs), Some(34 * GIB)),
+        &lead
+    ));
+    assert!(asks_beside(&records, &unit, &procs, 34 * GIB).is_err());
+    let parent = record(12, 5, Need::new("held parent").mem_gib(3), Some(0));
+    let waiter = record(13, 6, Need::new("waiter under it").mem_gib(1), None);
+    let records = [&slice, &tree, &lead, &parent, &waiter];
+    assert!(!counts(
+        &counted_by(records.to_vec(), 100, Some(&procs), Some(34 * GIB)),
+        &lead
+    ));
+    assert!(asks_beside(&records, &unit, &procs, 34 * GIB).is_ok());
 }
 
 #[cfg(unix)]
@@ -8823,21 +9480,277 @@ fn critical_path_qualify_replay_walls() {
     }
 }
 
-/// RETAINED FUNDING HAS A NARROW AUTHORITY: only one already-held, memory-only, non-phased,
-/// non-alone terminal critical Release claim from the same checkout can sponsor. An absent
-/// available-memory reading never falls back to physical memory. A nonselected phased claim is
-/// budgeted at its immutable peak, not its stepped current claim.
+/// RETAINED FUNDING OWES EACH HELD CLAIM WHAT ITS LOOK RESERVES: the proof reads the lead's look's
+/// own trees ([`crate::admit::process_use`]), rooted at every claimant, so a waiting process's use
+/// is its own, never its parent's. On 10 GiB a release's terminal link (50) holds 30 GiB its tree
+/// uses, a process (3) holds 20 GiB its own tree leaves unused, and an 8 GiB build under it, whose
+/// process uses 10 GiB, waits: a 24 GiB critical lead lacks 34 GiB once the link has ended, more
+/// than the link pledges, and is not funded. CONTROL: where that process waits for nothing, its
+/// use is the held claim's, which then leaves 10 GiB unused, and the link's 30 GiB funds the 24 GiB
+/// the lead lacks. KIN: on 10 GiB beside a link's held 16 GiB, a process (9) whose tree uses
+/// 10 GiB holds a 10 GiB claim crediting the lead's parent, which takes that tree, and another
+/// 10 GiB claim, which reserves all of it, while a 2 GiB unit waits under 9. A 24 GiB lead lacks
+/// 24 GiB once the link has ended, more than its 16 GiB, and is not funded: funded, it would wait
+/// for the second claim's end, which waits for the unit, which counts the lead as sure. SOLE: a
+/// link whose holder holds a 1 GiB claim crediting the lead's parent beside it sponsors nothing,
+/// as its end would leave its tree to that claim; alone it funds the 14 GiB the lead lacks.
+/// NEGATIVE CONTROLS: M-FUND-ROOTS (the proof's trees rooted at the held claims alone) funds the
+/// lead beside the waiting build too, a lead the build counts as sure while that lead waits for
+/// the end of the build's own parent's claim; M-FUND-HOLDER (each holder's tree credited across
+/// the claims the proof budgets alone) funds the KIN lead on 14 GiB; M-FUND-SOLE (a sponsor's
+/// holder's claims counted among those the proof budgets) lets the SOLE link sponsor.
 #[test]
-fn only_same_release_terminal_claims_can_fund_a_critical_turn() {
-    let p = |pid, charged| Proc {
+fn a_funded_lead_owes_each_held_claim_what_its_own_look_reserves() {
+    let p = |pid, ppid, charged| Proc {
         pid,
-        ppid: 1,
+        ppid,
+        start: 0,
         charged,
         footprint: charged,
         written: 0,
         cpu_ns: 0,
         runnable_ns: 0,
     };
+    let procs = Procs::of(vec![
+        p(50, 2, 30 * GIB),
+        p(3, 2, 0),
+        p(7, 3, 10 * GIB),
+        p(60, 2, 0),
+        p(2, 0, 0),
+    ]);
+    let terminal = |what: &str, gib| {
+        Need::new(what)
+            .rank(crate::Rank::Release)
+            .mem_gib(gib)
+            .critical_path()
+    };
+    let link = record(50, 1, terminal("compat final link", 30), Some(0));
+    let parent = record(3, 2, Need::new("held build").mem_gib(20), Some(0));
+    let build = record(7, 3, Need::new("waiting build").mem_gib(8), None);
+    let lead = record(60, 4, terminal("native final link", 24), None);
+    assert!(funded_by(&lead, &[&link, &parent, &build], &procs, Some(10 * GIB)).is_none());
+    let proof = funded_by(&lead, &[&link, &parent], &procs, Some(10 * GIB))
+        .expect("the link funds the lead where the build's process is the held claim's use");
+    assert_eq!(proof.needed, 24 * GIB);
+
+    let procs = Procs::of(vec![
+        p(50, 2, 16 * GIB),
+        p(9, 2, 10 * GIB),
+        p(7, 9, 0),
+        p(40, 2, 0),
+        p(60, 40, 0),
+        p(2, 0, 0),
+    ]);
+    let link = record(50, 1, terminal("compat final link", 16), Some(0));
+    let mut kin = record(9, 2, Need::new("held vm").mem_gib(10), Some(0));
+    kin.credit = vec![40];
+    let other = record(9, 3, Need::new("held build").mem_gib(10), Some(0));
+    let unit = record(7, 4, Need::new("compile unit").mem_gib(2), None);
+    let lead = record(60, 5, terminal("native final link", 24), None);
+    assert!(funded_by(&lead, &[&link, &kin, &other, &unit], &procs, Some(10 * GIB)).is_none());
+
+    let mut beside = record(50, 2, Need::new("held vm").mem_gib(1), Some(0));
+    beside.credit = vec![40];
+    assert!(funded_by(&lead, &[&link, &beside], &procs, Some(10 * GIB)).is_none());
+    let proof = funded_by(&lead, &[&link], &procs, Some(10 * GIB))
+        .expect("a link whose holder holds nothing else funds the lead");
+    assert_eq!(proof.needed, 14 * GIB);
+}
+
+/// A RETAINED LEAD IS JUDGED BY ITS FIT AND WHAT ITS ENDED SPONSORS STILL HOLD (ATERM-KI-1114-993,
+/// ATERM-KI-1114-994). On 10 GiB a release's terminal link (50) holds 30 GiB its tree uses and a
+/// process (3) holds 20 GiB, of which its child (7) uses 10 GiB: the proof owes the held 20 GiB
+/// the 10 GiB it leaves unused, and the link's 30 GiB funds the 24 GiB a critical lead lacks. Then
+/// the child waits, a process of its own from then on: the held claim owes all 20 GiB. While the
+/// link holds, the lead's fit has 10 + 30 - 20 = 20 GiB once the link has ended, and the 24 it asks
+/// only by the held claim's end, which waits for the child: the lead is not sure for the child,
+/// which goes first past it beside the held claims. ENDED: once the link's record has gone while
+/// its process still holds its 30 GiB, the fit counts them (REMAINS) and reads the same 20 GiB.
+/// CONTROL: on 14 GiB the fit leaves the lead its 24 GiB exactly, and the lead is sure either way.
+/// GROWTH: there, the child's use grows to 11 GiB before it waits: what is available falls to 13
+/// GiB and the fit leaves the lead 23 GiB: it is not sure. KI LEDGER 1: the same growth once the
+/// link has ended, its process alive on 13 GiB (13 + 30 - 20 = 23), gone with its pages shown on
+/// 43 GiB (23), or gone with its pages not yet shown on 13 GiB: never sure; with the child at 10
+/// GiB, sure on 14 GiB beside the link's process and on 44 GiB without it, and not on 14 GiB
+/// without it. LINK ALONE: a proof made before the 20 GiB was held reads the same. SPONSOR PARENT:
+/// on 30 GiB two 16 GiB links fund a 30 GiB lead beside the held 20 GiB, under which the child
+/// waited before the proof; once the first link's record has gone, its process still holding its
+/// 16 GiB, the lead fits by 30 + 16 + 16 - 20 = 42 GiB, but work waiting under the second makes it
+/// a parent, whose end may wait for that work: 26 GiB, not sure. SIBLING: a sibling of the child
+/// (9) waits while the child runs: its look still credits the held claim with the child's 10 GiB,
+/// and the lead is sure for it either way. UNSEEN: on 30 GiB once the link's process has gone, the
+/// child holds 12 GiB its tree uses 10 GiB of, its parent's own use grows to 10 GiB inside the held
+/// claim, and a grandchild (8) waits: the lead has 30 - 10 - 2 = 18 GiB and is not sure. ALONE: on
+/// 14 GiB the child's parent holds a claim ALONE: the lead has no room until its end, and is not
+/// sure. NEGATIVE CONTROLS: M-REMAINS-OFF (no REMAINS) has the child not count the lead ENDED on
+/// 14 GiB; M-ENDED-SURE (a retained lead with an ended sponsor sure without its fit) has it count
+/// the lead in KI LEDGER 1.
+#[test]
+fn a_retained_lead_is_judged_by_its_fit_and_what_its_ended_sponsors_still_hold() {
+    let p = proc_at;
+    let sweep = |child, link: bool| {
+        let mut processes = vec![
+            p(3, 2, 0),
+            p(7, 3, child),
+            p(9, 3, 0),
+            p(60, 2, 0),
+            p(2, 0, 0),
+        ];
+        if link {
+            processes.push(p(50, 2, 30 * GIB));
+        }
+        Procs::of(processes)
+    };
+    let procs = |child| sweep(child, true);
+    let terminal = |what: &str, gib| release_need(what, gib).critical_path();
+    let link = record(50, 1, terminal("compat final link", 30), Some(0));
+    let parent = record(3, 2, Need::new("held build").mem_gib(20), Some(0));
+    let sure_for = |asker, lead: &Record, link_held: bool, procs: &Procs, available| {
+        let mut rows = vec![&parent, lead];
+        if link_held {
+            rows.push(&link);
+        }
+        counts(&counted_by(rows, asker, Some(procs), Some(available)), lead)
+    };
+    let sure_for_child = |lead: &Record, link_held, procs: &Procs, available| {
+        sure_for(7, lead, link_held, procs, available)
+    };
+    let at_proof = procs(10 * GIB);
+    for (available, sure) in [(10 * GIB, false), (14 * GIB, true)] {
+        let mut lead = record(60, 4, terminal("native final link", 24), None);
+        let proof = funded_by(&lead, &[&link, &parent], &at_proof, Some(available))
+            .expect("the link funds the lead while the child is the held claim's use");
+        assert_eq!(proof.sponsors[0].start, 1050);
+        lead.need.lead_reservation = Some(proof);
+        for link_held in [true, false] {
+            assert_eq!(
+                sure_for_child(&lead, link_held, &at_proof, available),
+                sure,
+                "on {} GiB, the link held: {link_held}",
+                available / GIB
+            );
+        }
+        for link_held in [true, false] {
+            assert!(
+                sure_for(9, &lead, link_held, &at_proof, available),
+                "SIBLING on {} GiB, the link held: {link_held}",
+                available / GIB
+            );
+        }
+        if sure {
+            let grown = procs(11 * GIB);
+            assert!(
+                !sure_for_child(&lead, true, &grown, available - GIB),
+                "GROWTH"
+            );
+            for (link_alive, gib) in [(true, 13), (false, 43), (false, 13)] {
+                assert!(
+                    !sure_for_child(&lead, false, &sweep(11 * GIB, link_alive), gib * GIB),
+                    "KI LEDGER 1 on {gib} GiB, the link's process alive: {link_alive}"
+                );
+            }
+            for (link_alive, gib, sure) in [(true, 14, true), (false, 44, true), (false, 14, false)]
+            {
+                assert_eq!(
+                    sure_for_child(&lead, false, &sweep(10 * GIB, link_alive), gib * GIB),
+                    sure,
+                    "KI LEDGER 1 CONTROL on {gib} GiB, the link's process alive: {link_alive}"
+                );
+            }
+            let mut alone = record(3, 6, Need::new("alone step").alone(), Some(0));
+            alone.held = Some(crate::Held {
+                admitted_ms: 6,
+                cores: 0,
+                alone: true,
+            });
+            assert!(
+                !counts(
+                    &counted_by(
+                        vec![&parent, &alone, &lead],
+                        7,
+                        Some(&at_proof),
+                        Some(available),
+                    ),
+                    &lead
+                ),
+                "ALONE: the lead waits for the parent's ALONE claim to end"
+            );
+        } else {
+            let later = Procs::of(vec![
+                p(3, 2, 10 * GIB),
+                p(7, 3, 10 * GIB),
+                p(8, 7, 0),
+                p(60, 2, 0),
+                p(2, 0, 0),
+            ]);
+            let child = record(7, 5, Need::new("child build").mem_gib(12), Some(0));
+            assert!(
+                !counts(
+                    &counted_by(
+                        vec![&parent, &child, &lead],
+                        8,
+                        Some(&later),
+                        Some(30 * GIB),
+                    ),
+                    &lead
+                ),
+                "UNSEEN: the lead has 18 GiB of 24"
+            );
+        }
+
+        let mut lead = record(60, 4, terminal("native final link", 24), None);
+        let proof = funded_by(&lead, &[&link], &at_proof, Some(available))
+            .expect("the link funds the lead alone");
+        lead.need.lead_reservation = Some(proof);
+        assert_eq!(
+            sure_for_child(&lead, false, &at_proof, available),
+            sure,
+            "LINK ALONE on {} GiB",
+            available / GIB
+        );
+    }
+
+    let two = Procs::of(vec![
+        p(50, 2, 16 * GIB),
+        p(51, 2, 16 * GIB),
+        p(52, 51, 0),
+        p(3, 2, 0),
+        p(7, 3, 0),
+        p(60, 2, 0),
+        p(2, 0, 0),
+    ]);
+    let first = record(50, 1, terminal("compat final link", 16), Some(0));
+    let second = record(51, 1, terminal("compat final link", 16), Some(0));
+    let child = record(7, 3, Need::new("waiting build").mem_gib(8), None);
+    let mut lead = record(60, 4, terminal("native final link", 30), None);
+    let proof = funded_by(
+        &lead,
+        &[&first, &second, &parent, &child],
+        &two,
+        Some(30 * GIB),
+    )
+    .expect("both links fund the lead");
+    assert_eq!(proof.sponsors.len(), 2);
+    lead.need.lead_reservation = Some(proof);
+    let under = record(52, 5, Need::new("work under the link").mem_gib(1), None);
+    for (rows, sure) in [
+        (vec![&second, &parent, &lead], true),
+        (vec![&second, &parent, &lead, &under], false),
+    ] {
+        let counted = counted_by(rows, 7, Some(&two), Some(30 * GIB));
+        assert_eq!(counts(&counted, &lead), sure, "SPONSOR PARENT");
+    }
+}
+
+/// RETAINED FUNDING HAS A NARROW AUTHORITY: only one already-held, memory-only, non-phased,
+/// non-alone terminal critical Release claim from the same checkout can sponsor. An absent
+/// available-memory reading never falls back to physical memory. A nonselected phased claim is
+/// owed at its immutable peak, not its stepped current claim. The proof records the sponsor's
+/// holder's start as the sweep read it, and 0 where it read none. NEGATIVE CONTROL: M-FUND-START
+/// (the proof records 0) records 0 for the read start.
+#[test]
+fn only_same_release_terminal_claims_can_fund_a_critical_turn() {
+    let p = |pid, charged| proc_at(pid, 1, charged);
     let procs = Procs::of(vec![p(21, 0), p(30, 20 * GIB), p(40, 10 * GIB)]);
     let terminal = |what: &str, gib| {
         Need::new(what)
@@ -8852,9 +9765,24 @@ fn only_same_release_terminal_claims_can_fund_a_critical_turn() {
         None,
     );
     let sponsor = record(30, 2, terminal("compat final link", 20), Some(0));
-    let proves =
-        |candidate: &Record| funded_lead_reservation(&lead, &[candidate], &procs, Some(20 * GIB));
-    assert!(proves(&sponsor).is_some());
+    let proves = |candidate: &Record| funded_by(&lead, &[candidate], &procs, Some(20 * GIB));
+    assert_eq!(
+        proves(&sponsor).map(|proof| proof.sponsors[0].start),
+        Some(1030),
+        "the proof records the start the sweep read"
+    );
+    let unread = Procs::of(vec![
+        p(21, 0),
+        Proc {
+            start: 0,
+            ..p(30, 20 * GIB)
+        },
+    ]);
+    assert_eq!(
+        funded_by(&lead, &[&sponsor], &unread, Some(20 * GIB)).map(|proof| proof.sponsors[0].start),
+        Some(0),
+        "an unread start is recorded as 0"
+    );
 
     let mut changed = sponsor.clone();
     changed.need.critical = false;
@@ -8900,32 +9828,37 @@ fn only_same_release_terminal_claims_can_fund_a_critical_turn() {
         Some(0),
     );
     assert!(
-        funded_lead_reservation(&lead, &[&sponsor, &second], &procs, Some(20 * GIB)).is_none(),
+        funded_by(&lead, &[&sponsor, &second], &procs, Some(20 * GIB)).is_none(),
         "a multi-claim holder is not a terminal sponsor"
     );
     let same_pid_parent = record(21, 4, Need::new("same-pid parent").mem_gib(10), Some(0));
     assert!(
-        funded_lead_reservation(&lead, &[&sponsor, &same_pid_parent], &procs, Some(20 * GIB),)
-            .is_none(),
-        "a same-PID parent is budgeted but cannot sponsor its own waiter"
+        funded_by(&lead, &[&sponsor, &same_pid_parent], &procs, Some(20 * GIB),).is_none(),
+        "a same-PID parent is owed but cannot sponsor its own waiter"
     );
     assert!(
-        funded_lead_reservation(&lead, &[&sponsor], &procs, None).is_none(),
+        funded_by(&lead, &[&sponsor], &procs, None).is_none(),
         "physical memory is not an available-memory reading"
     );
 
     let mut phased = record(40, 4, Need::new("non-sponsor phased").mem_gib(20), Some(0));
     phased.need.run_mem = Some(10 * GIB);
     phased.need.stepped = Some(10 * GIB);
-    let proof = funded_lead_reservation(&lead, &[&sponsor, &phased], &procs, Some(40 * GIB))
+    let proof = funded_by(&lead, &[&sponsor, &phased], &procs, Some(40 * GIB))
         .expect("the terminal sponsor covers the immutable-peak shortage");
     assert_eq!(proof.needed, 4 * GIB, "20 GiB peak, not 10 GiB current");
     assert_eq!(proof.holdback, 20 * GIB);
 }
 
-/// A retained proof round-trips only on its waiting critical record. A caller cannot forge one
-/// into a new wait; held records discard it. Duplicate, redundant and overlong sponsor evidence
-/// is malformed and therefore grants no priority.
+/// A retained proof round-trips only on its waiting critical record, under `lead_retention`, each
+/// sponsor's start with it, 0 included. A caller cannot forge one into a new wait; held records
+/// discard it. Duplicate, redundant and overlong sponsor evidence is malformed and therefore grants
+/// no priority, as is a sponsor row without its start or with one that is not a u64. Lines an
+/// earlier build wrote are never read: the `lead_reservation` line of the build before (a
+/// `budgeted` budget, no start) and of main's build before that (neither). A stray key, a leftover
+/// `budgeted` among them, is ignored. NEGATIVE CONTROLS: M-DECODE-START (the start read as 0) and
+/// M-DECODE-STARTLESS (a row without its start read) each read the proof wrongly; M-DECODE-KEY (a
+/// line under `lead_reservation` read too) reads one with a start under that key.
 #[test]
 fn a_critical_reservation_round_trips_but_malformed_or_forged_evidence_does_not() {
     let reservation = crate::LeadReservation {
@@ -8934,6 +9867,7 @@ fn a_critical_reservation_round_trips_but_malformed_or_forged_evidence_does_not(
         sponsors: vec![crate::LeadSponsor {
             order: (3, 30, 0),
             bytes: 20 * GIB,
+            start: 1030,
         }],
     };
     let head = aterm_json::json!({
@@ -8956,8 +9890,101 @@ fn a_critical_reservation_round_trips_but_malformed_or_forged_evidence_does_not(
     let encoded = |proof: &crate::LeadReservation| {
         format!("{head}\n{}", Record::lead_reservation_line(proof))
     };
-    let decoded = Record::decode(&encoded(&reservation), false).expect("complete proof");
-    assert_eq!(decoded.need.lead_reservation, Some(reservation.clone()));
+    let proof_of = |text: &str| {
+        Record::decode(text, false)
+            .expect("the record remains readable")
+            .need
+            .lead_reservation
+    };
+    assert_eq!(proof_of(&encoded(&reservation)), Some(reservation.clone()));
+    let unread = crate::LeadReservation {
+        sponsors: vec![crate::LeadSponsor {
+            start: 0,
+            ..reservation.sponsors[0].clone()
+        }],
+        ..reservation.clone()
+    };
+    assert_eq!(
+        proof_of(&encoded(&unread)),
+        Some(unread.clone()),
+        "an unread start round-trips as 0"
+    );
+    let line = |sponsor: aterm_json::Value| {
+        format!(
+            "{head}\n{}\n",
+            aterm_json::json!({"lead_retention": {
+                "needed": 8 * GIB,
+                "holdback": 6 * GIB,
+                "sponsors": [sponsor],
+            }})
+        )
+    };
+    let row = |start: Option<aterm_json::Value>| {
+        let mut row = aterm_json::json!({"bytes": 20 * GIB, "order": [3, 30, 0]});
+        if let Some(start) = start {
+            row.as_object_mut().unwrap().insert("start".into(), start);
+        }
+        row
+    };
+    assert_eq!(
+        proof_of(&line(row(Some(aterm_json::json!(1030))))),
+        Some(reservation.clone())
+    );
+    for (start, why) in [
+        (None, "a row without its start"),
+        (Some(aterm_json::json!("1030")), "a start that is a string"),
+        (Some(aterm_json::json!(-1)), "a negative start"),
+    ] {
+        assert_eq!(proof_of(&line(row(start))), None, "{why} is malformed");
+    }
+    let earlier = |proof: aterm_json::Value| {
+        format!(
+            "{head}\n{}\n",
+            aterm_json::json!({ "lead_reservation": proof })
+        )
+    };
+    let main_line = earlier(aterm_json::json!({
+        "needed": 8 * GIB,
+        "holdback": 6 * GIB,
+        "sponsors": [{"bytes": 20 * GIB, "order": [3, 30, 0]}],
+    }));
+    assert_eq!(proof_of(&main_line), None, "main's line, neither key");
+    let budgeted_line = earlier(aterm_json::json!({
+        "needed": 8 * GIB,
+        "holdback": 6 * GIB,
+        "sponsors": [{"bytes": 20 * GIB, "order": [3, 30, 0]}],
+        "budgeted": [],
+    }));
+    assert_eq!(
+        proof_of(&budgeted_line),
+        None,
+        "the build before's line, a budgeted one"
+    );
+    let started_earlier = earlier(aterm_json::json!({
+        "needed": 8 * GIB,
+        "holdback": 6 * GIB,
+        "sponsors": [{"bytes": 20 * GIB, "order": [3, 30, 0], "start": 1030}],
+    }));
+    assert_eq!(
+        proof_of(&started_earlier),
+        None,
+        "no line under the earlier key is read"
+    );
+    let stray = format!(
+        "{head}\n{}\n",
+        aterm_json::json!({"lead_retention": {
+            "needed": 8 * GIB,
+            "holdback": 6 * GIB,
+            "sponsors": [{"bytes": 20 * GIB, "order": [3, 30, 0], "start": 1030}],
+            "budgeted": [{"bytes": GIB, "order": [2, 40, 0]}],
+        }})
+    );
+    assert_eq!(
+        proof_of(&stray),
+        Some(reservation.clone()),
+        "a stray budget is ignored"
+    );
+
     let mut ordinary_rank = head.clone();
     ordinary_rank
         .as_object_mut()
@@ -8981,10 +10008,7 @@ fn a_critical_reservation_round_trips_but_malformed_or_forged_evidence_does_not(
         Record::lead_reservation_line(&reservation)
     );
     assert_eq!(
-        Record::decode(&broad, false)
-            .expect("ordinary lead record")
-            .need
-            .lead_reservation,
+        proof_of(&broad),
         None,
         "a broad lead cannot inherit critical reservation authority"
     );
@@ -9004,13 +10028,7 @@ fn a_critical_reservation_round_trips_but_malformed_or_forged_evidence_does_not(
         ],
         ..reservation.clone()
     };
-    assert_eq!(
-        Record::decode(&encoded(&duplicate), false)
-            .expect("the record remains readable")
-            .need
-            .lead_reservation,
-        None
-    );
+    assert_eq!(proof_of(&encoded(&duplicate)), None);
     let redundant = crate::LeadReservation {
         needed: GIB,
         sponsors: vec![
@@ -9018,17 +10036,12 @@ fn a_critical_reservation_round_trips_but_malformed_or_forged_evidence_does_not(
             crate::LeadSponsor {
                 order: (4, 31, 0),
                 bytes: 20 * GIB,
+                start: 1031,
             },
         ],
         ..reservation.clone()
     };
-    assert_eq!(
-        Record::decode(&encoded(&redundant), false)
-            .expect("the record remains readable")
-            .need
-            .lead_reservation,
-        None
-    );
+    assert_eq!(proof_of(&encoded(&redundant)), None);
     let overlong = crate::LeadReservation {
         needed: u64::MAX,
         sponsors: (0..=crate::LEAD_SPONSORS_MAX)
@@ -9039,17 +10052,12 @@ fn a_critical_reservation_round_trips_but_malformed_or_forged_evidence_does_not(
                     0,
                 ),
                 bytes: u64::MAX,
+                start: 0,
             })
             .collect(),
         ..reservation.clone()
     };
-    assert_eq!(
-        Record::decode(&encoded(&overlong), false)
-            .expect("the record remains readable")
-            .need
-            .lead_reservation,
-        None
-    );
+    assert_eq!(proof_of(&encoded(&overlong)), None);
 
     let s = scratch("caller-critical-proof");
     let m = mac48();
@@ -9060,6 +10068,45 @@ fn a_critical_reservation_round_trips_but_malformed_or_forged_evidence_does_not(
     need.lead_reservation = Some(reservation);
     let waiter = Waiter::enter(&s.ledger, &m, need).expect("entered");
     assert_eq!(waiter.record().need.lead_reservation, None);
+}
+
+/// ONE READ PROCESS HAS A START ([`Procs::start_of`]): a unique row with a start it read; none for
+/// a pid the sweep lacks, a start of 0 (unread) or a pid with two rows. A sweep's row carries the
+/// start the kernel gave it, 0 where unread ([`Proc::of_reading`]). NEGATIVE CONTROLS:
+/// M-STARTOF-TWO (a pid with two rows read) and M-STARTOF-UNREAD (a start of 0 read) each name a
+/// start, and M-READ-START (a sweep's start unread) reads 0.
+#[test]
+fn procs_start_of_names_one_read_process() {
+    let procs = Procs::of(vec![
+        proc_at(30, 1, 0),
+        Proc {
+            start: 0,
+            ..proc_at(31, 1, 0)
+        },
+        proc_at(32, 1, 0),
+        Proc {
+            start: 2032,
+            ..proc_at(32, 1, 0)
+        },
+    ]);
+    assert_eq!(procs.start_of(30), Some(1030));
+    assert_eq!(procs.start_of(31), None, "an unread start");
+    assert_eq!(procs.start_of(32), None, "two rows of one pid");
+    assert_eq!(procs.start_of(33), None, "a pid the sweep lacks");
+    let read = |start| {
+        Proc::of_reading(&aterm_sysprobe::ProcessReading {
+            pid: 30,
+            ppid: 1,
+            start,
+            ..aterm_sysprobe::ProcessReading::default()
+        })
+        .start
+    };
+    assert_eq!(
+        (read(Some(1030)), read(None)),
+        (1030, 0),
+        "a sweep's start, 0 where unread"
+    );
 }
 
 /// A CRITICAL SPONSOR'S CUSTODY EDGES ARE IMMUTABLE. Numeric credit could add a foreign waiter
@@ -9104,7 +10151,10 @@ fn a_critical_claim_cannot_add_credit_or_detach_after_sponsoring() {
 
 /// A CLAIM THAT LEADS SAYS SO IN ITS RECORD: admitted with `leads`, the ledger lists it so.
 /// NEGATIVE CONTROL: an ordinary claim's record says nothing of it and reads as not leading,
-/// as a record of a build that predates the key does.
+/// as a record of a build that predates the key does. A background need never leads (it yields to
+/// every release claim): entered with `leads` its record reads as not leading, and so does a
+/// record another build wrote of one. NEGATIVE CONTROL M-LEAD-BACKGROUND (a background need
+/// entered and read as it asks) lists it leading.
 #[test]
 fn a_claim_that_leads_says_so_in_its_record() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -9121,6 +10171,16 @@ fn a_claim_that_leads_says_so_in_its_record() {
     let plain = crate::admit::try_admit_with(&ledger, &machine, Need::new("plain").mem_gib(1))
         .unwrap()
         .expect("admitted");
+    let background = ledger
+        .lay(
+            &Need::new("background")
+                .rank(crate::Rank::Background)
+                .mem_gib(1)
+                .leads(),
+            1,
+        )
+        .unwrap();
+    assert!(!background.0.need.leads, "{:?}", background.0.need);
     let listed = ledger.list().unwrap();
     let leads = |what: &str| {
         listed
@@ -9128,11 +10188,32 @@ fn a_claim_that_leads_says_so_in_its_record() {
             .find(|r| r.need.what == what)
             .map(|r| r.need.leads)
     };
-    assert_eq!((leads("lead"), leads("plain")), (Some(true), Some(false)));
+    assert_eq!(
+        (leads("lead"), leads("plain"), leads("background")),
+        (Some(true), Some(false), Some(false))
+    );
     let phased = listed.iter().find(|r| r.need.what == "lead").unwrap();
     assert_eq!(phased.need.run_mem, Some(GIB / 2));
     assert_eq!(phased.need.mem_now(), GIB / 2);
-    drop((lead, plain));
+    drop((lead, plain, background));
+    let written = aterm_json::json!({
+        "v": 1,
+        "pid": 21,
+        "start_ms": 4,
+        "seq": 0,
+        "checkout": "/ck",
+        "what": "background lead",
+        "mem": GIB,
+        "margin": 0,
+        "cores": 0,
+        "rank": "background",
+        "disk": 0,
+        "quiet": null,
+        "leads": true,
+        "volume": null
+    });
+    let read = Record::decode(&written.to_string(), false).expect("a waiting record");
+    assert!(!read.need.leads, "{:?}", read.need);
 }
 
 #[test]

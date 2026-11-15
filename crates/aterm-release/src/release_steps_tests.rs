@@ -1283,6 +1283,89 @@ fn public_state_stop_is_decided_by_the_competing_record() {
     ));
 }
 
+/// A SUPERSESSION KEEPS, HANDS BACK OR LETS GO THE CLAIM IT TOOK BY HOW IT ENDED. A durable one
+/// keeps it and asks no hand-back. One that ended with nothing of its own on main (refused,
+/// unable to tell, or finding the same supersession durable after a stop) hands the line back
+/// and says what became of it. One whose own record write has an unknown outcome hands nothing
+/// back: that record may retire the displaced holder's line.
+/// NEGATIVE CONTROLS: a durable or unknown end never asks a hand-back, and each of a hand-back's
+/// three outcomes is named in the result it joins.
+#[test]
+fn a_supersession_keeps_hands_back_or_lets_go_its_claim_by_how_it_ended() {
+    use super::*;
+
+    let asked = std::cell::Cell::new(0);
+    let hand_back = |outcome: Result<Option<String>, String>| {
+        let asked = &asked;
+        move |claim: &str| {
+            assert_eq!(claim, "the claim");
+            asked.set(asked.get() + 1);
+            outcome
+        }
+    };
+    let refused = || SupersedeResult::Refused {
+        why: "the line has a release object".into(),
+        retry: false,
+        winner: None,
+    };
+    let unexpected =
+        |_: &str| -> Result<Option<String>, String> { panic!("no hand-back is asked of this end") };
+
+    assert_eq!(
+        settle_supersession("the claim", Held::Durable("SUPERSEDED".into()), unexpected),
+        (
+            SupersedeResult::Committed("SUPERSEDED".into()),
+            Some("the claim")
+        )
+    );
+    assert_eq!(
+        settle_supersession(
+            "the claim",
+            Held::Unknown("push timed out".into()),
+            unexpected
+        ),
+        (SupersedeResult::Unknown("push timed out".into()), None)
+    );
+
+    let (result, kept) = settle_supersession(
+        "the claim",
+        Held::Undone(refused()),
+        hand_back(Ok(Some("m9".into()))),
+    );
+    assert_eq!(kept, None);
+    assert!(
+        matches!(&result, SupersedeResult::Refused { why, retry: false, winner: None }
+            if why == "the line has a release object; the line was handed back to its holder m9"),
+        "{result:?}"
+    );
+    let (result, _) = settle_supersession(
+        "the claim",
+        Held::Undone(SupersedeResult::Unknown("reread unavailable".into())),
+        hand_back(Ok(None)),
+    );
+    assert_eq!(
+        result,
+        SupersedeResult::Unknown(
+            "reread unavailable; another holder took the line from this run since, and keeps it"
+                .into()
+        )
+    );
+    let (result, _) = settle_supersession(
+        "the claim",
+        Held::Undone(SupersedeResult::Committed(
+            "the exact earlier supersession".into(),
+        )),
+        hand_back(Err("offline".into())),
+    );
+    assert!(
+        matches!(&result, SupersedeResult::Committed(note)
+            if note.starts_with("the exact earlier supersession; handing the line back to its \
+                                 holder failed (offline)")),
+        "{result:?}"
+    );
+    assert_eq!(asked.get(), 3);
+}
+
 /// A competing record cannot move local state unless its replacement is itself a verified
 /// release line. NEGATIVE CONTROL: the same structured winner with a nonexistent base is
 /// classified as unknown instead of being handed to the transaction's adoption path.
@@ -1480,6 +1563,76 @@ fn diagnostic_fixture_layout_matches_the_inherited_verifier_layout() {
     assert_eq!(layout.target(), ctx.target_dir);
     assert_eq!(layout.build_dir(), ctx.main_build_dir.as_deref());
     assert_ne!(layout.target(), super::verify_plan(&repo).unwrap().target());
+}
+
+#[test]
+fn disk_forecast_follows_the_managed_verification_target() {
+    use super::*;
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let repo = aterm_verify::physical(scratch.path());
+    let plan = verify_plan(&repo).expect("the release child's layout");
+    assert_eq!(
+        plan.target(),
+        repo.join(aterm_toolchain::build_cache::DEFAULT_TARGET)
+    );
+    let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+    let legacy = repo.join("target/debug");
+    std::fs::create_dir_all(&legacy).unwrap();
+    assert!(
+        !Backend::disk(&mut real).1,
+        "legacy outputs are not in the selected verification target"
+    );
+
+    let debug = plan.target().join("debug");
+    std::fs::create_dir_all(&debug).unwrap();
+    assert!(
+        Backend::disk(&mut real).1,
+        "the managed target verification actually uses is warm"
+    );
+    std::fs::remove_dir(&debug).unwrap();
+    std::fs::write(&debug, b"not a directory").unwrap();
+    assert!(
+        !Backend::disk(&mut real).1,
+        "a non-directory target cannot establish warmth"
+    );
+    std::fs::remove_file(&debug).unwrap();
+    assert!(!Backend::disk(&mut real).1, "a missing target stays cold");
+    assert!(legacy.is_dir(), "the legacy decoy remains throughout");
+}
+
+#[test]
+fn disk_forecast_follows_configured_targets_and_refuses_unresolved_layouts() {
+    use super::*;
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let repo = aterm_verify::physical(scratch.path());
+    let default = verify_plan(&repo).unwrap().target().to_path_buf();
+    std::fs::create_dir_all(default.join("debug")).unwrap();
+    std::fs::create_dir(repo.join(".cargo")).unwrap();
+    let config = repo.join(".cargo/config.toml");
+    std::fs::write(&config, "[build]\ntarget-dir='configured.noindex'\n").unwrap();
+    let selected = verify_plan(&repo).expect("the configured final target");
+    assert_eq!(selected.target(), repo.join("configured.noindex"));
+    let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+    assert!(
+        !Backend::disk(&mut real).1,
+        "a warm default cannot stand in for the selected cold target"
+    );
+    std::fs::create_dir_all(selected.target().join("debug")).unwrap();
+    assert!(Backend::disk(&mut real).1, "the configured target is warm");
+
+    for invalid in ["[build\n", "include=['unknown.toml']\n"] {
+        std::fs::write(&config, invalid).unwrap();
+        assert!(
+            verify_plan(&repo).is_err(),
+            "the native plan refuses {invalid}"
+        );
+        assert!(
+            !Backend::disk(&mut real).1,
+            "unresolved configuration stays cold despite both output trees"
+        );
+    }
 }
 
 fn witnessed_fixture_wait(
@@ -1693,7 +1846,6 @@ fn production_build_and_tree_wiring_owns_the_fixture_handoff() {
     let run = crate::check_record::VerifyRun {
         half: crate::check_record::Half::Tree,
         checks: vec!["test".into()],
-        passed_binaries: Vec::new(),
         passed_lint_packages: Vec::new(),
         passed_appkit_groups: Vec::new(),
     };
@@ -6631,7 +6783,7 @@ fn dry_run_machine_checks_refuse_an_incomplete_source_signing_ring() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let mut real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
     real.home = dir.path().join("empty-home");
-    let (_, refusals) = real.machine(&real.home.join("profile.toml"), false);
+    let (_, refusals) = real.machine(None);
     assert!(
         refusals
             .iter()
@@ -8444,7 +8596,7 @@ fn the_early_released_shim_ask_is_owed_until_the_trees_test_record_passes() {
     assert!(!super::shim_owed(&Ok(Checks::default())));
     let mut other = Checks::default();
     other.missing.push("measure".to_owned());
-    other.failed.push(failed("doc"));
+    other.failed.push(failed("census"));
     assert!(!super::shim_owed(&Ok(other)));
 }
 

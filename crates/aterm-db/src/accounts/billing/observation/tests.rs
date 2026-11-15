@@ -406,18 +406,20 @@ fn policy_changes_require_a_new_root_account_decision() {
     );
 }
 
+/// A file at the policy's old `~/.secrets` path changes nothing: the preparation stays bound
+/// to the vault's policy. A changed credential and a root stop never prepare billing.
 #[test]
-fn local_edits_changed_credentials_and_root_stops_never_prepare_billing() {
+fn local_files_change_nothing_and_changed_credentials_and_root_stops_never_prepare_billing() {
     let f = Fixture::new(1);
     let policy = f.policy("example-v1");
-    let decision = f.issue(31, 0, policy.reference([41; 32]).unwrap(), vec![]);
+    let reference = policy.reference([41; 32]).unwrap();
+    let decision = f.issue(31, 0, reference, vec![]);
     let source = f.source(31, 0);
     source.prepare_until(deadline()).unwrap();
     let file = f.lab.paths[0].home.join(".secrets").join(ENTRY);
     std::fs::write(&file, f.policy("example-v2").text()).unwrap();
-    assert!(source.prepare_until(deadline()).is_err());
-    std::fs::write(&file, policy.text()).unwrap();
-    source.prepare_until(deadline()).unwrap();
+    let prepared = source.prepare_until(deadline()).unwrap();
+    assert_eq!(prepared.binding().policy, reference.policy);
     f.publish(|doc| {
         doc.set_entry(&Audience::Everyone, "key", b"changed-key")
             .unwrap();
@@ -507,6 +509,7 @@ fn transition_with(
     let reference = (action != "MissingPin").then(|| policy.reference([41; 32]).unwrap());
     let decision = f.issue_optional(31, 0, reference, vec![]);
     let source = f.source(31, 0);
+    let mut file = false;
     let accepted = match action {
         "Valid" | "MissingPin" | "ForeignRoot" => source.prepare_until(deadline()).is_ok(),
         "ChangedPolicy" => {
@@ -553,7 +556,12 @@ fn transition_with(
                 f.policy("example-v2").text(),
             )
             .unwrap();
-            source.prepare_until(deadline()).is_ok()
+            let prepared = source.prepare_until(deadline());
+            // Bound to the vault's policy bytes, never the edited file's.
+            file = prepared.as_ref().is_ok_and(|prepared| {
+                reference.is_none_or(|reference| prepared.binding().policy != reference.policy)
+            });
+            prepared.is_ok()
         }
         "Unrelated" | "Rollback" => {
             let files: Vec<_> = ["state.toml", "vault"]
@@ -586,6 +594,7 @@ fn transition_with(
     let mut next = before.clone();
     next.insert("scenario", scenario as i64);
     next.insert("accepted", i64::from(accepted));
+    next.insert("file", i64::from(file));
     next
 }
 

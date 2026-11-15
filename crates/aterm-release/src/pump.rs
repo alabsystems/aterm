@@ -14,8 +14,11 @@
 //! What it never does, by construction ([`Verb`] has no such arm): `--forget`, `--bump`,
 //! `--supersede`, `--abandon`. It starts a line only for a version that has no fleet line, at
 //! one frozen commit. A fleet line this clone holds no journal of is another holder's: the pump
-//! waits and names that holder, and takes the line over (through the release's own selection,
-//! which exits 4 beside a live holder) only when it was started with `--adopt`. A red is never
+//! waits and names that holder, and takes the line over (through the release's own selection)
+//! only when it was started with `--adopt`, and then only once the line's record says it can be
+//! taken: the holder's lease has ended unrenewed, or its Mac proves its process dead
+//! ([`Main::held`]). A run that still ends beside a holder (exit 4) is not run again while the
+//! record says the line is held. A red is never
 //! run again: only a commit its repair worker names and the line admits moves a red line, as a
 //! hop. A verb's run that completes no row for longer than the fleet claim's own progress bound
 //! while its processes do nothing is stalled: it is said, and a run that prepares is
@@ -29,8 +32,9 @@ use serde::{Deserialize, Serialize};
 pub const POLL_SECS: u64 = 60;
 /// The longest wait between two tries of a resumable stop (exit 3).
 pub const RESUME_CAP_SECS: u64 = 30 * 60;
-/// The wait between two tries beside another live holder of the line (exit 4): each try costs
-/// a launch, and a holder is adoptable only once its progress has expired.
+/// The longest wait between two tries after a run ended beside another holder of the line
+/// (exit 4) whose record no longer keeps a contender off: the run and the record disagreed, so
+/// the tries back off. While the record says the line is held nothing is tried at all.
 pub const HOLDER_SECS: u64 = 10 * 60;
 /// The longest wait between two tries of a refusal no repair worker is on, once the journal or
 /// main has changed.
@@ -98,6 +102,32 @@ pub struct Main {
     pub line: Option<String>,
     /// Who holds that line, as its claim names them.
     pub holder: Option<String>,
+    /// That holder keeps a contender on this Mac off the line now: its lease is unexpired and
+    /// its Mac does not prove its process dead. `None` once the line can be taken.
+    pub held: Option<Held>,
+}
+
+/// Why a release started here would end beside the line's holder (exit 4), read from the line's
+/// record alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    /// Epoch seconds the holder's lease runs until, unless it renews it first.
+    pub until: u64,
+    /// What a contender is told now: the line a run would end with.
+    pub refusal: String,
+}
+
+impl Held {
+    /// What a wait on this holder says once, beside its reason.
+    fn note(&self, now: u64) -> String {
+        format!(
+            "its lease runs until {} unless it renews it, {} s from now; a run started now \
+             would end: {}",
+            self.until,
+            self.until.saturating_sub(now),
+            self.refusal
+        )
+    }
 }
 
 /// This clone's release journal, as far as the pump reads it.
@@ -206,8 +236,8 @@ pub enum Verb {
 }
 
 impl Verb {
-    /// The `aterm-release` arguments that run it; `linux` is the cut's Linux declaration, which
-    /// only a verb that can start a line carries (a journal keeps its own).
+    /// The `aterm-release` arguments that run it; `linux` is the Linux declaration this run is
+    /// handed ([`declaration`]), which every verb of a line takes and `--open-next` does not.
     #[must_use]
     pub fn args(&self, linux: &[String]) -> Vec<String> {
         let mut args = vec!["release".to_string()];
@@ -222,7 +252,7 @@ impl Verb {
             Self::Fix(fix) => args.extend(["--fix".to_string(), fix.clone()]),
             _ => {}
         }
-        if matches!(self, Self::Start(_) | Self::Adopt) {
+        if !matches!(self, Self::OpenNext) {
             args.extend(linux.iter().cloned());
         }
         args
@@ -245,6 +275,30 @@ impl Verb {
             args.push("--verbose".into());
         }
         args
+    }
+}
+
+/// The Linux declaration `verb`'s run is handed, of the pump's own (`pump`: its flags, else
+/// main's `PUMP_LINUX_DEFAULT`, else why it has none). A verb that starts or adopts a line
+/// always carries it. A verb that resumes this clone's line carries it only where the journal
+/// holds none (`journal_declares`): a journal's own declaration wins, and a flag would replace
+/// it. A journal can hold none where the line was adopted inside a resume, whose run was handed
+/// nothing to record (0.200.0, 2026-11-12: refused "the cut must declare Linux" each cycle).
+/// # Errors
+/// The pump has no declaration for a run that starts, adopts or prepares a line that has none:
+/// such a run can only be refused, after its first step's checks. The bare run of a journal
+/// with none goes on without one, and the release says what it needs.
+pub fn declaration(
+    verb: &Verb,
+    journal_declares: bool,
+    pump: Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
+    match verb {
+        Verb::OpenNext => Ok(Vec::new()),
+        Verb::Start(_) | Verb::Adopt => pump,
+        Verb::Prepare | Verb::Fix(_) | Verb::Finish if journal_declares => Ok(Vec::new()),
+        Verb::Prepare | Verb::Fix(_) => pump,
+        Verb::Finish => Ok(pump.unwrap_or_default()),
     }
 }
 
@@ -288,6 +342,25 @@ pub struct Attempt {
     pub repeats: u32,
 }
 
+impl Attempt {
+    /// Whether this run already tried what `verb` under `key` would now do, with this clone's
+    /// journal reading `journal`: it was run for the same thing, or it is the same verb, was
+    /// refused, and left the journal exactly as it reads now. A refused resume that moved the
+    /// journal's head (it adopted the fleet's line, 0.200.0) left another key behind it, and
+    /// the same command on the journal it left can only be refused the same way. A run that
+    /// ended any other way is of its own key alone: one that ended 0 and left work for the same
+    /// verb (the publish, then the after-cut) is followed at once.
+    #[must_use]
+    pub fn tried(&self, verb: &Verb, key: &str, journal: Option<&Journal>) -> bool {
+        let refused = !matches!(self.code, 0 | 3 | 4 | 130);
+        self.key == key
+            || (refused
+                && self.verb == *verb
+                && journal.is_some()
+                && self.journal.as_ref() == journal)
+    }
+}
+
 /// A repair worker whose report could not be read, and since when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unread {
@@ -315,7 +388,11 @@ pub enum Decision {
         why: String,
     },
     Wait {
+        /// The reason, said when it changes.
         why: String,
+        /// What goes with the reason where it is said and is no reason to say it again: a
+        /// countdown, a lease's end. Empty for none.
+        note: String,
         secs: u64,
     },
 }
@@ -330,6 +407,9 @@ enum Wanted {
     },
     /// Nothing to run whatever was tried.
     Hold(String),
+    /// Nothing to run whatever was tried, with what is said beside the reason
+    /// ([`Decision::Wait`]'s note).
+    Held(String, String),
 }
 
 fn short(sha: &str) -> &str {
@@ -542,6 +622,24 @@ fn wanted(seen: &Seen, memory: &Memory) -> Wanted {
                     .unwrap_or("a holder its claim does not name")
             ));
         }
+        // §3.5: whether the holder is dead or stalled is read from the line's record before
+        // anything is run. A run beside a live holder ends exit 4 and holds nothing.
+        if let Some(held) = &main.held {
+            return Wanted::Held(
+                format!(
+                    "v{} has a fleet line at {} held by {}, and this clone holds no journal of \
+                     it: the pump runs nothing beside a holder whose lease is live, and takes \
+                     the line over once that lease ends unrenewed or its Mac proves its \
+                     process dead",
+                    main.version,
+                    short(head),
+                    main.holder
+                        .as_deref()
+                        .unwrap_or("a holder its claim does not name")
+                ),
+                held.note(seen.now),
+            );
+        }
         return Wanted::Run {
             verb: Verb::Adopt,
             key: format!("adopt {}", main.version),
@@ -613,6 +711,7 @@ pub fn decide(seen: &Seen, memory: &Memory) -> Decision {
     if let Some(holder) = &seen.holder {
         return Decision::Wait {
             why: format!("another release run holds this clone ({holder})"),
+            note: String::new(),
             secs: POLL_SECS,
         };
     }
@@ -620,12 +719,24 @@ pub fn decide(seen: &Seen, memory: &Memory) -> Decision {
         Wanted::Hold(why) => {
             return Decision::Wait {
                 why,
+                note: String::new(),
+                secs: POLL_SECS,
+            };
+        }
+        Wanted::Held(why, note) => {
+            return Decision::Wait {
+                why,
+                note,
                 secs: POLL_SECS,
             };
         }
         Wanted::Run { verb, key, why } => (verb, key, why),
     };
-    let Some(last) = memory.last.as_ref().filter(|last| last.key == key) else {
+    let Some(last) = memory
+        .last
+        .as_ref()
+        .filter(|last| last.tried(&verb, &key, seen.journal.as_ref()))
+    else {
         return Decision::Run { verb, key, why };
     };
     let since = seen.now.saturating_sub(last.at);
@@ -638,7 +749,8 @@ pub fn decide(seen: &Seen, memory: &Memory) -> Decision {
             }
         } else {
             Decision::Wait {
-                why: format!("{what}; trying again in {} s", secs - since),
+                why: what,
+                note: format!("trying again in {} s", secs - since),
                 secs: (secs - since).min(POLL_SECS),
             }
         }
@@ -651,6 +763,7 @@ pub fn decide(seen: &Seen, memory: &Memory) -> Decision {
                 "the last run for this ended 0 ({}) and nothing it changed is read yet",
                 last.last
             ),
+            note: String::new(),
             secs: POLL_SECS,
         },
         3 | 130 => after(
@@ -660,10 +773,25 @@ pub fn decide(seen: &Seen, memory: &Memory) -> Decision {
                 last.code
             ),
         ),
-        4 => after(
-            HOLDER_SECS,
-            "another live holder cuts this line (exit 4); no second line is started".to_string(),
-        ),
+        // The run was told who holds the line and until when. Nothing is run again while the
+        // line's record, read each cycle, still keeps a contender off: a run beside a live
+        // holder only ends exit 4 again.
+        4 => match &seen.main.held {
+            Some(held) => Decision::Wait {
+                why: "the last run ended beside another holder of this line (exit 4), which \
+                      still holds it: nothing is run again until its lease ends unrenewed, its \
+                      Mac proves its process dead or the line changes hands"
+                    .to_string(),
+                note: held.note(seen.now),
+                secs: POLL_SECS,
+            },
+            None => after(
+                doubling(POLL_SECS, last.repeats, HOLDER_SECS),
+                "the last run ended beside another holder of this line (exit 4), and the \
+                 line's record no longer keeps a contender off"
+                    .to_string(),
+            ),
+        },
         _ => {
             let changed = last.tip != seen.main.tip || last.journal != seen.journal;
             if changed {
@@ -682,6 +810,7 @@ pub fn decide(seen: &Seen, memory: &Memory) -> Decision {
                          {}: {}); nothing starts until the journal or main changes",
                         last.code, last.last
                     ),
+                    note: String::new(),
                     secs: POLL_SECS,
                 }
             }
@@ -805,6 +934,7 @@ pub fn cycle(world: &mut dyn World, memory: &mut Memory, said: &mut String) -> u
                 world,
                 said,
                 &format!("pump: cannot read the world ({why}); looking again"),
+                "",
             );
             return POLL_SECS;
         }
@@ -830,8 +960,8 @@ pub fn cycle(world: &mut dyn World, memory: &mut Memory, said: &mut String) -> u
         world.remember(memory);
     }
     match decide(&seen, memory) {
-        Decision::Wait { why, secs } => {
-            say_once(world, said, &format!("pump: waiting — {why}"));
+        Decision::Wait { why, note, secs } => {
+            say_once(world, said, &format!("pump: waiting — {why}"), &note);
             secs
         }
         Decision::Run { verb, key, why } => {
@@ -846,7 +976,9 @@ pub fn cycle(world: &mut dyn World, memory: &mut Memory, said: &mut String) -> u
             let repeats = memory
                 .last
                 .as_ref()
-                .filter(|last| last.key == key && last.code == ran.code)
+                .filter(|last| {
+                    last.code == ran.code && last.tried(&verb, &key, seen.journal.as_ref())
+                })
                 .map_or(0, |last| last.repeats + 1);
             // The run's own view of main and the journal is what a later change is measured
             // against; a read that fails keeps what was seen before it ran.
@@ -868,10 +1000,15 @@ pub fn cycle(world: &mut dyn World, memory: &mut Memory, said: &mut String) -> u
     }
 }
 
-/// A wait is said when its reason changes, not once a minute.
-fn say_once(world: &mut dyn World, said: &mut String, line: &str) {
+/// A wait is said when its reason changes, not once a minute; `note` is said with it and is
+/// no reason to say it again.
+fn say_once(world: &mut dyn World, said: &mut String, line: &str, note: &str) {
     if said != line {
-        world.say(line);
+        if note.is_empty() {
+            world.say(line);
+        } else {
+            world.say(&format!("{line} ({note})"));
+        }
         line.clone_into(said);
     }
 }

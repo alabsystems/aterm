@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Publishing a chosen machine number (`docs/DECISION-name-publication-2026-11-06.md`): once
-//! [`super::set_name`] has committed a number, [`publish`] makes every other reader of this
-//! machine's name read it too, in order: aterm.toml's three naming keys ([`Policy`]), the checked
-//! fleet name, and on macOS the Mac's three system names ([`SystemNames`]), each only while the
-//! name file still holds that number. [`publication`] says, writing nothing, which of those a
-//! chosen number still owes. `aterm name set` is its caller.
+//! Publishing a chosen machine number (§5.3 of `docs/DESIGN-machine-names-2026-11-04.md`): once
+//! [`super::set_name`] has committed a number, or [`super::undo_last`] has taken one back as a
+//! chosen claim, [`publish`] makes every other reader of this machine's name read it too, in
+//! order: aterm.toml's three naming keys ([`Policy`]), the checked fleet name, and on macOS the
+//! Mac's three system names ([`SystemNames`]), each only while the name file still holds that
+//! number. [`publication`] says, writing nothing, which of those a chosen number still owes.
+//! `aterm name set`, `aterm name nick`, `aterm name undo` and Rename This Mac… call [`publish`].
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
+use aterm_secrets::client::Paths;
 use aterm_toml::edit::{DocumentMut, Item, Table, Value};
 use aterm_types::machine_name::{Class, GeneratedNames, Number, OsSlot};
 use aterm_uds::atomic_file::ConfigFile;
@@ -46,6 +48,8 @@ const POLICY_KEYS: [(&str, &str, &str); 3] = [
 /// [`publish`] writes it only over the bytes read here.
 pub struct Policy {
     number: Number,
+    /// The aterm.toml path it was read from, which [`publish`] writes.
+    path: PathBuf,
     snapshot: ConfigFile,
     text: String,
 }
@@ -66,6 +70,7 @@ impl Policy {
         )?;
         Ok(Self {
             number,
+            path: config.to_path_buf(),
             snapshot,
             text,
         })
@@ -126,6 +131,113 @@ fn write_policy(state: &Path, policy: &Policy) -> io::Result<()> {
         Ok(())
     })
     .map(|_| ())
+}
+
+/// Where this process's publication may write. A process that is not a shell of its account's
+/// own ([`aterm_types::dirs::not_own_account`]: a private state root, root, or another `HOME`)
+/// can still reach that account's real aterm.toml and vault, which `$XDG_CONFIG_HOME` and
+/// `$HOME` resolve while only its state is scratch (a debug build run by path with
+/// `ATERM_STATE_HOME` alone); it writes nothing under the account's home ([`Scope::writes`]),
+/// and nothing at all where it runs as root or no home is known for its account. An isolated
+/// instance's own files, a lab world's or a test's, lie outside that home and are written as
+/// before.
+struct Scope {
+    /// Why this process is not its account's own shell, or `None` when it is.
+    not_own: Option<&'static str>,
+    /// Whether it runs as root (effective uid 0). The account database then names root's own
+    /// home while `sudo` may keep the person's `HOME`, so no one home is the one to leave alone:
+    /// root writes nothing.
+    root: bool,
+    /// The home the account database names for this process's real user, `None` where it names
+    /// none.
+    account_home: Option<PathBuf>,
+    /// `$HOME` ([`aterm_types::dirs::home_dir`]), which stands for the account's home where the
+    /// account database names none.
+    home: Option<PathBuf>,
+}
+
+impl Scope {
+    /// This process's scope.
+    fn live() -> Self {
+        Self {
+            not_own: aterm_types::dirs::not_own_account(),
+            root: aterm_uds::peer::our_uid() == 0,
+            account_home: aterm_uds::account::home(),
+            home: aterm_types::dirs::home_dir(),
+        }
+    }
+
+    /// `Ok` where this process may write `what` at `path`: always as its account's own shell,
+    /// and otherwise only where it does not run as root and `path` lies outside the account's
+    /// home ([`under`]), which is `$HOME` where the account database names none.
+    ///
+    /// # Errors
+    /// [`Pending::NotOwnAccount`] where this process is not its account's own and runs as root,
+    /// or `path` lies under the account's home, or neither the account database nor `$HOME`
+    /// names a home.
+    fn writes(&self, what: &str, path: &Path) -> Result<(), Pending> {
+        let Some(why) = self.not_own else {
+            return Ok(());
+        };
+        let refused = |rule: &str| {
+            Err(Pending::NotOwnAccount(format!(
+                "{what} at {} {rule}: {why}",
+                path.display()
+            )))
+        };
+        if self.root {
+            return refused("is left as it is, since a process run as root publishes nothing");
+        }
+        match self.account_home.as_deref().or(self.home.as_deref()) {
+            Some(home) if under(path, home) => {
+                refused("is this account's own, which this process leaves as it is")
+            }
+            Some(_) => Ok(()),
+            None => refused("is left as it is, since no home is known for this account"),
+        }
+    }
+}
+
+/// Whether `path` lies under `home`: by its spelling, or once the part of it that exists is
+/// resolved (so a link into `home` counts), where one of its folders is `home`
+/// ([`aterm_types::dirs::same_directory`]).
+fn under(path: &Path, home: &Path) -> bool {
+    path.starts_with(home)
+        || resolved(path)
+            .ancestors()
+            .any(|dir| aterm_types::dirs::same_directory(dir, home))
+}
+
+/// `path` with its longest existing leading part resolved ([`std::fs::canonicalize`]) and the
+/// rest as spelled; `path` itself where no leading part resolves.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            return rest.iter().rev().fold(real, |real, part| real.join(part));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(part)) => {
+                rest.push(part);
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// The vault [`publish`] signs this machine's chosen membership Name into: the one its fleet
+/// state reads ([`crate::fleet_vault::vault_paths_for`]), `None` where it reads none.
+///
+/// # Errors
+/// [`Pending::NotOwnAccount`] where this process may not write that vault ([`Scope::writes`]).
+fn publication_vault(state: &Path, scope: &Scope) -> Result<Option<Paths>, Pending> {
+    let Some(paths) = crate::fleet_vault::vault_paths_for(state) else {
+        return Ok(None);
+    };
+    scope.writes("the vault", &paths.dir)?;
+    Ok(Some(paths))
 }
 
 /// Whether the name file in `state` holds `number`.
@@ -289,14 +401,53 @@ pub fn on_system_name_apply(
     });
 }
 
-/// Apply through the application's existing naming authorization.
+/// Apply through the application's existing naming authorization, only as this account's own
+/// shell ([`admitted`]). Every caller of the registered operation comes through here, so this
+/// is the one gate before macOS's names are set.
 /// # Errors
-/// The operation is unavailable, its current intent moved, or its rule could not apply.
+/// This process is not its account's own, the operation is unavailable, its current intent
+/// moved, or its rule could not apply.
 pub fn apply_registered(state: &Path, config: &Path, names: &GeneratedNames) -> Result<(), String> {
-    let operations = SYSTEM_NAME_APPLY
-        .get()
-        .ok_or("macOS naming is unavailable in this process")?;
+    apply_registered_with(
+        aterm_types::dirs::not_own_account(),
+        SYSTEM_NAME_APPLY.get(),
+        state,
+        config,
+        names,
+    )
+}
+
+/// [`apply_registered`] with why this process is not its account's own (`not_own`) and the
+/// registered operation (`operations`) given: `not_own` refuses before `operations` is touched.
+///
+/// # Errors
+/// As [`apply_registered`].
+fn apply_registered_with(
+    not_own: Option<&str>,
+    operations: Option<&SystemNameOperations>,
+    state: &Path,
+    config: &Path,
+    names: &GeneratedNames,
+) -> Result<(), String> {
+    admitted(not_own)?;
+    let operations = operations.ok_or("macOS naming is unavailable in this process")?;
     (operations.apply)(state, config, names)
+}
+
+/// `Ok` where this process may set macOS's names: only a shell of its account's own, that is
+/// one for which `not_own` ([`aterm_types::dirs::not_own_account`]) gives no reason. macOS's
+/// names are the Mac's, and the naming rule sets them for this user with no password, so a
+/// process under a private state root, root, or another `HOME`, whose name file is not the
+/// account's, never sets them.
+///
+/// # Errors
+/// Why this process is not its account's own.
+fn admitted(not_own: Option<&str>) -> Result<(), String> {
+    not_own.map_or(Ok(()), |why| {
+        Err(format!(
+            "macOS naming is left to this account's own aterm: {why}"
+        ))
+    })
 }
 
 /// Read the existing rule for an explicit name-menu presentation, without a setter or prompt.
@@ -341,6 +492,10 @@ pub enum Pending {
     /// The name file holds another number (or none): a newer set replaced this one, which owes
     /// nothing more. The words are those of the step that found it.
     Superseded(String),
+    /// A process that is not its account's own would write under the account's home, or
+    /// would write at all while it runs as root or knows no home for its account
+    /// ([`Scope::writes`]), so nothing was published.
+    NotOwnAccount(String),
 }
 
 impl Pending {
@@ -353,7 +508,8 @@ impl Pending {
             | Self::FleetName(why)
             | Self::SystemNames(why)
             | Self::NameUnread(why)
-            | Self::Superseded(why) => why,
+            | Self::Superseded(why)
+            | Self::NotOwnAccount(why) => why,
         }
     }
 
@@ -368,13 +524,14 @@ impl Pending {
             }
             Self::NameUnread(why) => format!("its name could not be read back ({why})"),
             Self::Superseded(_) => "a newer machine name replaced it".to_owned(),
+            Self::NotOwnAccount(why) => format!("this process publishes it nowhere ({why})"),
         }
     }
 }
 
 /// Publish `policy`'s number, which [`super::set_name`] has committed in `state`, in order:
 /// 1. aterm.toml's policy ([`Policy`]), under the name file's lock while it holds the number;
-/// 2. the fleet name in `state`, through `aterm fleet name set`'s checked writer
+/// 2. the fleet name in `state`, through the checked writer the fleet name's follow uses too
 ///    ([`crate::fleet_member::choose_machine_name_at`]), which reads the `[[fleet.peers]]` of
 ///    the aterm.toml at `config` among the machines that may already answer to it and checks
 ///    the committed policy and number again under the fleet writer's lock; then the holder's
@@ -388,19 +545,43 @@ impl Pending {
 /// step, before an OS apply and before success; a changed naming key or hold retires this work
 /// without undoing an earlier step or overwriting the newer configuration.
 ///
+/// A process that is not its account's own ([`Scope`]) publishes nothing where `policy`'s
+/// aterm.toml or the membership Name's vault lies under the account's home, and nothing at all
+/// where it runs as root or knows no home for its account; the registered macOS naming
+/// operation refuses it ([`apply_registered`]).
+///
 /// # Errors
 /// The first step that did not finish; later steps do not run. A step that failed while the
 /// name file no longer holds the number is [`Pending::Superseded`], in that step's words; a name
-/// file that cannot be read at one of those checks is [`Pending::NameUnread`].
+/// file that cannot be read at one of those checks is [`Pending::NameUnread`]; an aterm.toml or
+/// vault this process may not write ([`Scope::writes`]) refuses every step as
+/// [`Pending::NotOwnAccount`].
 pub fn publish(
     state: &Path,
     config: &Path,
     policy: &Policy,
     system: Option<&dyn SystemNames>,
 ) -> Result<(), Pending> {
-    publish_through(state, config, policy, system, || {
+    publish_in(state, config, policy, &Scope::live(), system)
+}
+
+/// [`publish`] where this process may write as `scope` says: the vault it signs into is judged
+/// first ([`publication_vault`]), so a refused vault refuses the whole publication before any
+/// step writes.
+///
+/// # Errors
+/// As [`publish`].
+fn publish_in(
+    state: &Path,
+    config: &Path,
+    policy: &Policy,
+    scope: &Scope,
+    system: Option<&dyn SystemNames>,
+) -> Result<(), Pending> {
+    let vault = publication_vault(state, scope)?;
+    publish_through(state, config, policy, scope, system, || {
         crate::fleet_member::choose_machine_name_at(state, config, policy.number)?;
-        if let Some(paths) = crate::fleet_vault::vault_paths_for(state) {
+        if let Some(paths) = vault {
             publish_log_label(state, config, policy.number, || {
                 aterm_secrets::client::publish_local_chosen_name(&paths, policy.number)
                     .map(|_| ())
@@ -426,8 +607,8 @@ fn publish_log_label(
     .map_err(|error| error.to_string())?
 }
 
-/// [`publish`] with its fleet step given as `fleet`: the fleet name's checked write of
-/// `policy`'s number, answering why it did not finish.
+/// [`publish`] with where it may write given as `scope` and its fleet step as `fleet`: the fleet
+/// name's checked write of `policy`'s number, answering why it did not finish.
 ///
 /// # Errors
 /// As [`publish`], with `fleet`'s words for the fleet step.
@@ -435,9 +616,11 @@ fn publish_through(
     state: &Path,
     config: &Path,
     policy: &Policy,
+    scope: &Scope,
     system: Option<&dyn SystemNames>,
     fleet: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), Pending> {
+    scope.writes("aterm.toml", &policy.path)?;
     let number = policy.number;
     let expected = system_names(state, number)?;
     write_policy(state, policy)

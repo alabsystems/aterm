@@ -241,7 +241,9 @@ pub(super) fn named_row_parts(
         row_parts(
             row.clone(),
             (limit - less).max(1.0),
-            (most - less).max(1.0),
+            // A row's trailing gap may fall outside the screen. Fit its painted control and
+            // caption against the actual room, while retaining the ordinary split limit.
+            (most.max(room) - less).max(1.0),
             gap,
         )
     };
@@ -7501,10 +7503,46 @@ fn draws_nothing(node: &UiNode, height: f32) -> bool {
     drawn_bands_in(node, height).is_empty() && ink_extent(node, height).is_none()
 }
 
+/// A multiline text button, including its single-child wrappers, with spare vertical space
+/// removed where that lets it fit `limit`. Custom visuals and the minimum control height stay.
+fn lean_text_button(node: &mut UiNode, height: f32, limit: f32) -> Option<f32> {
+    let fitted = match &node.content {
+        UiContent::Button(control)
+            if node.children.is_empty()
+                && control.spec.visual_icon.is_none()
+                && control.spec.chevron_row.is_none()
+                && control.spec.swatches.is_empty()
+                && control.spec.chip.is_none() =>
+        {
+            let label = control.spec.visual_label.as_deref()?;
+            if !label.contains('\n') {
+                return None;
+            }
+            let least =
+                crate::native_ui::native_button_height_for_lines(label.split('\n').count(), 0.0)
+                    .max(super::scaled_control_height());
+            if least > limit + 0.01 || least > height + 0.01 {
+                return None;
+            }
+            height.min(limit.max(least))
+        }
+        UiContent::Group(_) if node.layout.offset == 0.0 && node.children.len() == 1 => {
+            let padding = node.layout.padding.top + node.layout.padding.bottom;
+            let inner = column_heights(node, height).into_iter().next()?;
+            let child = lean_text_button(&mut node.children[0], inner, limit - padding)?;
+            child + padding
+        }
+        _ => return None,
+    };
+    node.layout.height = Length::Fixed(fitted);
+    Some(fitted)
+}
+
 /// Split a row taller than `limit`, where it is a column of children, into parts listed one at
-/// a time.
+/// a time. A multiline text button yields spare vertical padding where that lets it fit,
+/// retaining its text lines and the minimum control height.
 pub(super) fn row_parts(
-    (node, height): (UiNode, f32),
+    (mut node, mut height): (UiNode, f32),
     limit: f32,
     most: f32,
     gap: f32,
@@ -7514,6 +7552,11 @@ pub(super) fn row_parts(
     } else {
         limit
     };
+    if height > limit + 0.01
+        && let Some(fitted) = lean_text_button(&mut node, height, limit)
+    {
+        height = fitted;
+    }
     if height <= limit + 0.01 || !splittable(&node) {
         return vec![(node, height)];
     }

@@ -149,11 +149,9 @@ fn class_a_fork_ran_at() -> u32 {
             Ok(())
         });
     }
-    // Held across the spawn's fork alone: the write end the forked child keeps loses its
-    // close-on-fork mark (`aterm_uds::pipe`) for this fork, or the probe writes nowhere.
-    let handing = aterm_uds::spawn_lock::handing(&[probe_fd]);
-    let spawned = command.spawn();
-    drop(handing);
+    // The write end the forked child keeps loses its close-on-fork mark (`aterm_uds::pipe`) for
+    // this fork alone, or the probe writes nowhere.
+    let spawned = aterm_uds::spawn_lock::spawn_std(&mut command, &[probe_fd]);
     let status = spawned.unwrap().wait().unwrap();
     assert!(status.success(), "{status}");
     let mut class = [0; 4];

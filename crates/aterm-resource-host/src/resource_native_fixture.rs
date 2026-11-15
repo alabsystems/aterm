@@ -26,10 +26,37 @@ const SCOPED_CPU_PROOF: &str = "actual-scoped-cpu-recovered";
 const RECOVERY_REFUSED: u8 = 78;
 const MEMBER_FAILED: u8 = 79;
 const HANG: Duration = Duration::from_secs(60);
+const QUALIFY_IMAGE: &str = "--aterm-resource-fixture-qualified";
+const QUALIFIED_IMAGE: &[u8] = b"actual resource fixture image ran\n";
+
+pub(crate) fn qualify_image(path: &Path) {
+    let mut command = spawnfd::command(path);
+    command.arg(QUALIFY_IMAGE).env_clear();
+    let output = aterm_uds::deadline::output_until(&mut command, Instant::now() + HANG)
+        .unwrap_or_else(|error| panic!("qualifying {}: {error}", path.display()));
+    assert!(
+        output.status.success() && output.stdout == QUALIFIED_IMAGE,
+        "qualifying {}: {output:?}",
+        path.display()
+    );
+}
+
+pub(crate) fn qualification(args: &[OsString]) -> Option<ExitCode> {
+    if !matches!(args, [argument] if argument == QUALIFY_IMAGE) {
+        return None;
+    }
+    let mut stdout = io::stdout();
+    stdout.write_all(QUALIFIED_IMAGE).unwrap();
+    stdout.flush().unwrap();
+    Some(ExitCode::SUCCESS)
+}
 
 /// Dispatch the standalone native fixture before any libtest argument parser.
 /// This exists only on the currently implemented host-member platform in tests.
 pub fn entry(args: &[OsString]) -> ExitCode {
+    if let Some(code) = qualification(args) {
+        return code;
+    }
     // Exercise the actual production original-store helper path. The legacy
     // private fixture below intentionally remains separate from this route.
     if args
@@ -151,7 +178,7 @@ fn pool(root: &Path) -> (Pool, ExternalDebt, Retired) {
 
 fn request() -> Request {
     let job = Binding {
-        session: "s-ab12".into(),
+        session: "s-0000000000000000ab12".into(),
         attempt: [1; 16],
     };
     Request {

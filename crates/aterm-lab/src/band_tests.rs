@@ -58,8 +58,10 @@ fn an_instance_defaults_to_the_app_band_and_takes_either_band_by_name() {
 #[test]
 fn qualification_cleanup_binds_the_original_owner_and_world() {
     let world = Path::new("/private/tmp/.ubd/at_original.noindex");
-    let label = label_for(world, 42);
-    assert!(checked_owned_label(world, 42, &label).is_ok());
+    let generation = Generation::parse("11111111111111111111111111111111").unwrap();
+    let other = Generation::parse("22222222222222222222222222222222").unwrap();
+    let label = label_for(world, 42, &generation);
+    assert!(checked_owned_label(world, 42, &generation, &label).is_ok());
     for (dir, owner, label) in [
         (world, 43, label.as_str()),
         (
@@ -70,11 +72,88 @@ fn qualification_cleanup_binds_the_original_owner_and_world() {
         (world, 42, "other-job"),
         (world, 0, label.as_str()),
     ] {
-        assert!(checked_owned_label(dir, owner, label).is_err());
+        assert!(checked_owned_label(dir, owner, &generation, label).is_err());
         // Refusal happens before filesystem or launchd access, even for a nonexistent
         // path; an arbitrary label never supplies permission to remove a job.
-        assert!(remove_owned_for_qualification(dir, owner, label).is_err());
+        assert!(remove_owned_for_qualification(dir, owner, &generation, label).is_err());
     }
+    assert!(checked_owned_label(world, 42, &other, &label).is_err());
+    assert!(remove_owned_for_qualification(world, 42, &other, &label).is_err());
+}
+
+#[test]
+fn job_cleanup_refuses_a_substituted_generation_before_native_access() {
+    let world = PathBuf::from("/private/tmp/.ubd/at_original.noindex");
+    let generation = Generation::parse("11111111111111111111111111111111").unwrap();
+    let foreign = Generation::parse("22222222222222222222222222222222").unwrap();
+    let job = Job {
+        label: label_for(&world, 42, &foreign),
+        generation,
+        world,
+        owner: 42,
+        pid: 43,
+        held: None,
+    };
+    let error = job
+        .remove_until(Instant::now() + Duration::from_secs(60))
+        .expect_err("a foreign generation cannot be removed");
+    assert_eq!(error.kind, cleanup::CleanupFailure::Unknown);
+}
+
+#[test]
+fn generations_have_disjoint_state_and_cannot_rearm_an_existing_launch() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let first = Generation::fresh().unwrap();
+    let second = Generation::fresh().unwrap();
+    assert_ne!(first, second);
+    assert_ne!(
+        label_for(world.path(), 42, &first),
+        label_for(world.path(), 42, &second)
+    );
+    let dir = first.create_directory(world.path()).unwrap();
+    let marker = dir.join("already-ran");
+    std::fs::write(&marker, b"first launch").unwrap();
+    assert!(first.create_directory(world.path()).is_err());
+    assert_eq!(std::fs::read(&marker).unwrap(), b"first launch");
+    let next = second.create_directory(world.path()).unwrap();
+    assert_ne!(dir, next);
+    for name in [ENV_FILE, LIFELINE, PID_FILE, PLIST, guard::SOCKET] {
+        assert_ne!(dir.join(name), next.join(name));
+    }
+    for invalid in [
+        "",
+        "../a",
+        "1111111111111111111111111111111G",
+        "111111111111111111111111111111111",
+    ] {
+        assert!(Generation::parse(invalid).is_err());
+    }
+}
+
+#[test]
+fn a_generation_guard_binds_at_the_native_socket_path_boundary() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let root = aterm_uds::test_binary::short_root().expect("Cargo test short root");
+    let generation = Generation::fresh().unwrap();
+    // macOS sockaddr_un has 104 bytes, including the final NUL.
+    let suffix = 1 + 33 + 1 + guard::SOCKET.len();
+    let fill = 103_usize
+        .checked_sub(root.as_os_str().as_bytes().len() + 1 + suffix)
+        .expect("test root leaves room for a world and generation");
+    assert!(fill > 0);
+    let name: String = generation.word().chars().cycle().take(fill).collect();
+    let world = root.join(name);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&world)
+        .unwrap();
+    let dir = generation.create_directory(&world).unwrap();
+    let socket = dir.join(guard::SOCKET);
+    assert_eq!(socket.as_os_str().as_bytes().len(), 103);
+    let listener = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&socket)).unwrap();
+    drop(listener);
+    let too_long = dir.join("gg");
+    assert!(aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&too_long)).is_err());
 }
 
 #[test]

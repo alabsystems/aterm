@@ -4,7 +4,7 @@
 //! `aterm secrets` ([`text`], [`age`], [`x25519`], [`envelope`], [`transport`], [`server`]), the
 //! join phrase and its CPace ([`phrase`], [`pake`]), and the membership log ([`membership_log`])
 //! with the line old builds cannot follow it past ([`crossing`]).
-//! Client and service flows ([`materialize`], [`client`], [`service`], [`cli`]).
+//! Client and service flows ([`client`], [`service`], [`cli`]).
 
 #![forbid(unsafe_code)]
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
@@ -15,6 +15,7 @@ aterm_durable::plain_durable_flushes_in_tests!();
 pub mod age;
 pub mod alab_join;
 pub mod api_key;
+pub mod azure_principal;
 pub mod b64;
 pub mod bech32;
 pub mod commons;
@@ -25,11 +26,11 @@ pub mod join;
 pub mod mailbox_component;
 pub mod membership_log;
 pub mod pake;
+pub mod paper_master;
 pub mod phrase;
 pub mod swarm;
 pub mod swarm_roster;
 pub mod text;
-pub mod token_line;
 pub mod transport;
 pub mod x25519;
 
@@ -52,8 +53,6 @@ pub mod heard;
 pub mod home_lan;
 pub mod keychain_tools;
 #[cfg(unix)]
-pub mod materialize;
-#[cfg(unix)]
 pub mod members;
 #[cfg(unix)]
 pub mod need;
@@ -72,6 +71,8 @@ pub mod release_keychain;
 #[cfg(unix)]
 pub(crate) mod release_ring;
 #[cfg(unix)]
+mod serve_counts;
+#[cfg(unix)]
 pub mod server;
 #[cfg(unix)]
 pub mod service;
@@ -86,6 +87,8 @@ pub mod sync_diagnostic;
 pub mod wake;
 
 mod ed25519;
+#[cfg(unix)]
+mod pass_counts;
 mod secret;
 pub use secret::SecretBytes;
 
@@ -127,11 +130,49 @@ pub const SWARM_POLICY_ENTRY: &str = swarm_roster::POLICY_ENTRY;
 /// Reserved admin vault entry carrying the active steward lease (`holder`, `epoch`, `until`).
 pub const SWARM_LEASE_ENTRY: &str = swarm_roster::LEASE_ENTRY;
 
+/// Lowercase hex SHA-256 of `bytes`. It opens no file.
+#[must_use]
+pub fn digest_hex(bytes: &[u8]) -> String {
+    aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(bytes))
+}
+
 /// Whether an entry is consumed in place and must never become a secret file, in any spelling
 /// ([`entry_class::reserved`]): a control record or a Claude Code token.
 #[must_use]
 pub fn reserved_name(name: &str) -> bool {
     entry_class::reserved(name)
+}
+
+/// ONE ENTRY'S VALUE FROM THIS MAC'S SECRET STORE, read in place (`client::read_in_place`): the
+/// one read every consumer in process makes. No file under `~/.secrets` is read; the files older
+/// builds wrote there are the owner's backup and nothing reads them.
+///
+/// # Errors
+/// The name is invalid or reserved, there is no home directory, or local state cannot be read.
+#[cfg(unix)]
+pub fn read(name: &str) -> Result<Option<SecretBytes>> {
+    client::read_in_place(&client::Paths::locate()?, name)
+}
+
+/// Every entry of `names` from one verified version of this Mac's store, or none of them
+/// (`client::read_verified_set`).
+///
+/// # Errors
+/// A name is invalid or reserved, there is no home directory, or local state cannot be read.
+#[cfg(unix)]
+pub fn read_set(names: &[&str]) -> Result<Option<Vec<SecretBytes>>> {
+    let paths = client::Paths::locate()?;
+    let Some(expected) = client::config(&paths)? else {
+        return Ok(None);
+    };
+    Ok(
+        client::read_verified_set(&paths, &expected, names)?.map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| entry.into_parts().0)
+                .collect()
+        }),
+    )
 }
 
 /// Why a vault identity is a lab identity: one that founds its own lab and never joins the live

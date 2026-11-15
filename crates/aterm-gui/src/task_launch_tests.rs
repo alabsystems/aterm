@@ -103,10 +103,16 @@ fn a_task_frame_is_at_most_64_kib() {
             "{bad:?}"
         );
     }
-    for word in ["claude", "codex", "agy", "muse", "grok"] {
+    for word in ["claude", "codex", "agy", "muse"] {
         assert_eq!(worker_word(Some(word)), word);
     }
-    for none in [Some("codex-old"), Some("bash"), Some(""), None] {
+    for none in [
+        Some("codex-old"),
+        Some("grok"),
+        Some("bash"),
+        Some(""),
+        None,
+    ] {
         assert_eq!(worker_word(none), "claude", "CONTROL: {none:?}");
     }
 }
@@ -243,7 +249,7 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
     );
     for fact in [&fact, &cruise] {
         assert!(
-            !fact.contains(aterm_agent::supervise::policy::turn_end::FINISHED),
+            !fact.contains(alab_policy::words::FINISHED),
             "requires no output marker: {fact}"
         );
     }
@@ -317,7 +323,7 @@ fn a_line_that_draws_as_a_blank_row_is_dropped_from_an_agy_task() {
 
 #[test]
 fn an_agy_workers_first_prompt_holds_no_blank_line() {
-    use aterm_agent::supervise::policy::needs::needs_you;
+    use alab_policy::needs::needs_you;
     use aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT;
     use aterm_phase::agy::{said_tail, turn_opened_by};
     let text = |task: &[u8], from, agent| {
@@ -826,7 +832,6 @@ fn a_pooled_worker_runs_on_its_rows_login_alone() {
         admit(
             cli,
             onto.clone(),
-            Some(home),
             |_| true,
             |_| panic!("a present program is never held"),
             |_| panic!("a present program is never installed"),
@@ -934,39 +939,6 @@ fn a_pooled_worker_runs_on_its_rows_login_alone() {
         pool_onto(grok(&[("GROK_HOME", "rel")]), Cli::Grok, &work, home).is_err(),
         "a relative GROK_HOME"
     );
-
-    // A GROK BUILD WORKER'S LINE RUNS ON ITS ROW'S LOGIN ALONE: the pooled auth file, the row's
-    // own leader socket, the starter's inline login and socket variable removed, its own updater
-    // off; and the sign-in it is admitted on is that row's file, not the home's.
-    let onto = pool_onto(grok(&[]), Cli::Grok, &work, home).expect("grok row");
-    let cli = worker_cli(Program::Grok).expect("grok worker row");
-    let refused = admitted(cli, &onto).expect_err("no such row file here");
-    assert!(
-        matches!(&refused, Refused::SignedOut(why) if why.contains("/g/work/auth.json")),
-        "{refused:?}"
-    );
-    let tmp = aterm_tempfile::tempdir().expect("tempdir");
-    let row_login = tmp.path().join("work").join("auth.json");
-    std::fs::create_dir_all(row_login.parent().expect("its folder")).expect("row folder");
-    std::fs::write(&row_login, "{\"token\":\"w\"}").expect("the row's sign-in");
-    let row_login = row_login.to_str().expect("UTF-8").to_string();
-    let signed = LoginEnv {
-        value: Some(row_login.clone()),
-        ..work.clone()
-    };
-    let onto = pool_onto(grok(&[]), Cli::Grok, &signed, home).expect("grok row");
-    let socket =
-        aterm_agent::harness::relaunch::grok_leader_socket(&home.join(".grok"), "work", &row_login)
-            .expect("the row's socket");
-    assert_eq!(
-        line(cli, &onto, &Fresh::default()).expect("grok line"),
-        format!(
-            " '/usr/bin/env' -u 'GROK_AUTH' -u 'GROK_LEADER_SOCKET' 'GROK_AUTH_PATH={row_login}' \
-             'GROK_DISABLE_AUTOUPDATER=1' '/opt/grok/bin/grok' '-m' 'grok-4' '--leader-socket' \
-             '{}' -- \"$(command cat -- \"$ATERM_TASK_FILE\")\"",
-            socket.display()
-        )
-    );
 }
 
 /// A fake store of worker programs: what it holds, holds back, and was asked, in order.
@@ -991,42 +963,31 @@ impl ProgramStore for FakeStore {
     fn install(&self, program: &str) -> Result<(), String> {
         self.asked.borrow_mut().push(format!("install {program}"));
         if !self.lays {
-            return Err("atpkg: grok: vendor head unreachable".to_string());
+            return Err(format!("atpkg: {program}: vendor head unreachable"));
         }
         self.present.set(true);
         Ok(())
     }
 }
 
-/// A WORKER'S LAUNCHER ASKS THE SIGN-IN BEFORE IT INSTALLS, AND SAYS WHAT IT DOES.
-/// - Signed out, a Grok worker is refused with `why=signin` and the store is never asked.
-///   Installing `grok` would lay `agents/grok` on every shell's `PATH`, signed out.
-/// - Signed in, an absent `grok` is installed once by atpkg's verified install, as an absent
-///   program of any row atpkg ships is (a fresh Mac before atpkg's update pass lands it). The
-///   launch record says it is installing, then installed, and the installing mark stands exactly
-///   while the install runs.
+/// A WORKER'S LAUNCHER INSTALLS AN ABSENT PROGRAM AND SAYS WHAT IT DOES.
+/// - An absent `agy` is installed once by atpkg's verified install, as an absent program of any
+///   row atpkg ships is (a fresh Mac before atpkg's update pass lands it). The launch record says
+///   it is installing, then installed, and the installing mark stands exactly while the install
+///   runs.
 /// - CONTROLS: a present program installs nothing and says nothing; a held one (`[packages]
 ///   exclude`, a removal, a no to installs) installs nothing and is admitted carrying the hold's
-///   words; a failed
-///   install is `why=install` carrying atpkg's words.
+///   words; a failed install is `why=install` carrying atpkg's words.
 /// - The install is atpkg's `install <program>` verb, waiting its turn behind a running pass.
 #[test]
-fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
-    use aterm_agent::harness::worker::Refused;
-    let cli = aterm_agent::harness::worker::worker_cli(Program::Grok).expect("grok row");
+fn a_workers_launcher_installs_an_absent_program_and_says_so() {
+    let cli = aterm_agent::harness::worker::worker_cli(Program::Agy).expect("agy row");
     let store = |present, held, lays| FakeStore {
         present: std::cell::Cell::new(present),
         held,
         lays,
         asked: std::cell::RefCell::new(Vec::new()),
     };
-    let d = aterm_tempfile::Builder::new()
-        .prefix("aterm-grok-launch")
-        .tempdir()
-        .expect("scratch dir");
-    let user = d.path().join("home");
-    let grok_home = user.join(".grok");
-    std::fs::create_dir_all(&grok_home).expect("~/.grok");
     let notes = std::cell::RefCell::new(Vec::<String>::new());
     let note = |n: String| notes.borrow_mut().push(n);
     let marks = std::cell::Cell::new(0_u32);
@@ -1040,7 +1001,6 @@ fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
         admit_worker(
             cli,
             cli.plain(),
-            Some(&user),
             &note,
             &|| {
                 marks.set(marks.get() + 1);
@@ -1051,23 +1011,11 @@ fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
     };
     let admit = |store: &FakeStore| admit_on(cli, store);
 
-    let signed_out = store(false, None, true);
-    let refused = admit(&signed_out).expect_err("signed out");
-    assert!(matches!(&refused, Refused::SignedOut(_)), "{refused:?}");
-    assert_eq!(refused_why(&refused), crate::task_record::WHY_SIGNIN);
-    assert!(
-        signed_out.asked.borrow().is_empty(),
-        "nothing looked for or installed: {:?}",
-        signed_out.asked.borrow()
-    );
-    assert!(notes.take().is_empty() && marks.get() == 0);
-
-    std::fs::write(grok_home.join("auth.json"), "{\"token\":\"t\"}").expect("a sign-in");
     let absent = store(false, None, true);
     let admitted = admit(&absent).expect("installed");
     assert_eq!(
         *absent.asked.borrow(),
-        ["present", "held", "install grok", "mark dropped", "present"],
+        ["present", "held", "install agy", "mark dropped", "present"],
         "installed once, under the installing mark"
     );
     assert_eq!(marks.get(), 1);
@@ -1077,7 +1025,7 @@ fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
     );
     let said = notes.take();
     assert_eq!(said.len(), 2, "installing, then installed: {said:?}");
-    assert!(said.iter().all(|n| n.contains("grok")), "{said:?}");
+    assert!(said.iter().all(|n| n.contains("agy")), "{said:?}");
 
     let there = store(true, None, true);
     assert_eq!(admit(&there).expect("present").kept_off(), None, "CONTROL");
@@ -1126,11 +1074,11 @@ fn a_grok_workers_launcher_asks_the_sign_in_before_it_installs() {
     let layout = atpkg::store::Layout {
         prefix: PathBuf::from("/p/pkg"),
     };
-    let argv: Vec<String> = install_argv("grok", Some(&layout))
+    let argv: Vec<String> = install_argv("agy", Some(&layout))
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    assert_eq!(&argv[..2], ["install", "grok"]);
+    assert_eq!(&argv[..2], ["install", "agy"]);
     assert_eq!(
         &argv[2..4],
         [
@@ -1211,7 +1159,7 @@ fn a_spawn_installs_no_agent_where_a_person_said_no_to_installs() {
             layout: &layout,
             installs: std::cell::Cell::new(0),
         };
-        let admitted = admit_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store)
+        let admitted = admit_worker(cli, cli.plain(), &|_| {}, &|| (), &store)
             .unwrap_or_else(|refused| panic!("{case}: {refused:?}"));
         (admitted, store.installs.get(), store.present(program))
     };
@@ -1330,13 +1278,13 @@ fn a_dev_linked_program_is_one_a_worker_can_run() {
         layout: &layout,
         installs: std::cell::Cell::new(0),
     };
-    let admitted = admit_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store).unwrap();
+    let admitted = admit_worker(cli, cli.plain(), &|_| {}, &|| (), &store).unwrap();
     assert_eq!(admitted.readiness(), &Readiness::Present);
     assert_eq!(store.installs.get(), 0, "a link needs no install");
 
     std::fs::remove_file(&tool).unwrap();
     assert!(!runnable_in(&layout, program), "its tool is gone");
-    let refused = admit_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store)
+    let refused = admit_worker(cli, cli.plain(), &|_| {}, &|| (), &store)
         .map(|_| ())
         .expect_err("atpkg's install left nothing to run");
     assert_eq!(store.installs.get(), 1, "it asked atpkg: {refused:?}");
@@ -1373,7 +1321,7 @@ fn a_spawn_installs_nothing_when_removal_evidence_is_unreadable() {
         layout: &layout,
         installs: std::cell::Cell::new(0),
     };
-    let admitted = admit_worker(cli, cli.plain(), None, &|_| {}, &|| (), &store).unwrap();
+    let admitted = admit_worker(cli, cli.plain(), &|_| {}, &|| (), &store).unwrap();
     assert_ne!(admitted.readiness(), &Readiness::Installed);
     assert!(
         admitted
@@ -1553,7 +1501,10 @@ fn a_launchers_install_names_its_child_on_the_timeline() {
             &h.ctx,
             _mark.mark,
             _mark.task_entered,
-            &std::cell::Cell::new(false),
+            InstallStop {
+                cancelled: &std::cell::Cell::new(false),
+                account: None,
+            },
         )
         .expect("the stub exits clean");
         let pid = std::fs::read_to_string(&said).expect("the stub ran");
@@ -1561,7 +1512,7 @@ fn a_launchers_install_names_its_child_on_the_timeline() {
     }
     assert_eq!(child(), None, "gone with its mark");
     std::fs::remove_file(&said).unwrap();
-    let store = AtpkgStore::new(&h.ctx);
+    let store = AtpkgStore::new(&h.ctx, None);
     let old = store.installing();
     let newer = InstallingMark::of(&h.ctx);
     let mark = store.install_mark.get().unwrap();
@@ -1574,7 +1525,10 @@ fn a_launchers_install_names_its_child_on_the_timeline() {
             &h.ctx,
             mark,
             store.install_entered.get(),
-            &store.cancelled
+            InstallStop {
+                cancelled: &store.cancelled,
+                account: None,
+            },
         )
         .is_err()
     );
@@ -1660,7 +1614,10 @@ fn an_obsolete_install_closes_its_pipe_and_waits_for_cooperative_retirement() {
             &h.ctx,
             mark.mark,
             mark.task_entered,
-            &cancelled,
+            InstallStop {
+                cancelled: &cancelled,
+                account: None,
+            },
         );
         controller.join().unwrap();
         assert!(cancelled.get());
@@ -1694,6 +1651,112 @@ fn an_obsolete_install_closes_its_pipe_and_waits_for_cooperative_retirement() {
             );
         }
     }
+}
+
+/// A QUIT ENDS A LAUNCHER'S INSTALL: the install child (a stand-in atpkg that waits on its
+/// cancellation pipe, as atpkg's store-lock wait and transfer do) keeps going while the launch's
+/// account scope stands, and a quit's pause of that scope closes the pipe, so the child retires
+/// within the hang detector and the install answers the shutdown's words, not a moved launch's
+/// (the pass itself calls any closed pipe a launch that moved on).
+/// NEGATIVE CONTROL: without the scope's read in `requested`, the child waits on its pipe for
+/// good and the hang detector fails the test.
+#[cfg(unix)]
+#[test]
+fn a_quit_ends_a_launchers_install_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let witness = dir.path().join("pid");
+    let retired = dir.path().join("retired");
+    let stub = dir.path().join("atpkg-fake");
+    let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+    std::fs::write(&stub, format!("#!/bin/sh\necho $$ > '{}'\n[ $# -eq 0 ] && exit 0\n'{}' >/dev/null\necho retired > '{}'\nexit 0\n", witness.display(), cat.display(), retired.display())).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    aterm_uds::deadline::output_until(
+        &mut crate::qos::atpkg_command(&stub),
+        Instant::now() + aterm_spec::wait::FIRST_EXEC,
+    )
+    .unwrap();
+    std::fs::remove_file(&witness).unwrap();
+    let layout = atpkg::store::Layout {
+        prefix: dir.path().to_path_buf(),
+    };
+    let h = crate::stub_session(1);
+    h.ctx.timeline.lock().unwrap().mark_task(
+        &TaskMark::new(TaskState::Working),
+        &Default::default(),
+        Instant::now(),
+        0,
+    );
+    let lifetime = aterm_agent::harness::account_work::Lifetime::default();
+    let scope = lifetime.enter().expect("admitted");
+    let mark = InstallingMark::of(&h.ctx);
+    let path = witness.clone();
+    let quit = std::thread::spawn(move || {
+        let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        while !path.is_file() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(path.is_file(), "install execution hang detector");
+        lifetime.pause().expect("the quit's pause")
+    });
+    let (done, finished) = std::sync::mpsc::channel();
+    let stalled = witness.clone();
+    // The hang detector: an install still out after it is ended by force, so the test fails
+    // rather than hangs.
+    let hang = std::thread::spawn(move || {
+        let ended = finished.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok();
+        if !ended
+            && let Some(pid) = std::fs::read_to_string(&stalled)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            // SAFETY: a plain signal to the stand-in's pid, which this test spawned and the
+            // install has not reaped while it is still out.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        ended
+    });
+    let cancelled = std::cell::Cell::new(false);
+    let result = install_with(
+        &stub,
+        &layout,
+        "codex",
+        &h.ctx,
+        mark.mark,
+        mark.task_entered,
+        InstallStop {
+            cancelled: &cancelled,
+            account: Some(&scope),
+        },
+    );
+    let _ = done.send(());
+    assert!(
+        hang.join().unwrap(),
+        "the cancelled install ended within the hang detector"
+    );
+    let pause = quit.join().unwrap();
+    assert_eq!(
+        result,
+        Err(PREPARATION_CANCELLED.to_owned()),
+        "a cancelled install admits no worker, and says a quit stopped it"
+    );
+    assert!(!cancelled.get(), "a quit is no launch that moved on");
+    assert!(
+        retired.is_file(),
+        "the child finished its own boundary after its pipe closed"
+    );
+    let pid = std::fs::read_to_string(&witness)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        aterm_uds::process::process_presence(pid),
+        aterm_uds::process::ProcessPresence::Absent
+    );
+    drop(scope);
+    assert!(pause.try_wait().is_ok(), "the quit's drain retires");
+    drop(mark);
 }
 
 #[test]
@@ -3214,26 +3277,18 @@ fn native_google_worker_installs_before_preparing_its_guard() {
         expected.env = vec![("HOME".into(), "/verified/native/home".into())];
         expected.args = Ok(vec!["--gemini_dir=/verified/native/home/.gemini".into()]);
         expected.unset = vec!["GEMINI_API_KEY"];
-        let result = admit_prepared_worker(
-            cli,
-            cli.plain(),
-            None,
-            &|_| {},
-            &|| (),
-            &store,
-            |admitted| {
-                admitted.prepare(cli, None, |_| {
-                    assert!(
-                        store.present.get(),
-                        "preparation ran before native installation"
-                    );
-                    store.asked.borrow_mut().push("prepare".into());
-                    prepared.set(true);
-                    alive.set(true);
-                    Ok((expected.clone(), Guard(&alive)))
-                })
-            },
-        );
+        let result = admit_prepared_worker(cli, cli.plain(), &|_| {}, &|| (), &store, |admitted| {
+            admitted.prepare(|_| {
+                assert!(
+                    store.present.get(),
+                    "preparation ran before native installation"
+                );
+                store.asked.borrow_mut().push("prepare".into());
+                prepared.set(true);
+                alive.set(true);
+                Ok((expected.clone(), Guard(&alive)))
+            })
+        });
         if !lays {
             assert!(matches!(result, Err(Refused::Program(_))));
             assert!(!prepared.get());
@@ -3335,7 +3390,7 @@ fn an_admissions_kept_off_reason_reaches_the_timeline() {
             &h.ctx,
             3,
             Program::Agy,
-            admit_prepared_worker(agy, agy.plain(), None, &|_| {}, &|| (), store, |starter| {
+            admit_prepared_worker(agy, agy.plain(), &|_| {}, &|| (), store, |starter| {
                 Ok((starter, ()))
             }),
             None,
@@ -3376,7 +3431,7 @@ fn a_preparation_that_is_no_sign_out_does_not_read_as_one() {
         asked: std::cell::RefCell::new(Vec::new()),
     };
     let prepared = |refused: Refused| {
-        admit_prepared_worker(agy, agy.plain(), None, &|_| {}, &|| (), &store, |_| {
+        admit_prepared_worker(agy, agy.plain(), &|_| {}, &|| (), &store, |_| {
             Err::<(_, ()), _>(refused)
         })
         .expect_err("its preparation refused")
@@ -3398,8 +3453,7 @@ fn a_preparation_that_is_no_sign_out_does_not_read_as_one() {
 }
 
 #[test]
-fn prepared_worker_retains_holds_and_rechecks_replacement_sign_in() {
-    use aterm_agent::harness::worker::Refused;
+fn prepared_worker_retains_holds() {
     let agy = aterm_agent::harness::worker::worker_cli(Program::Agy).unwrap();
     let held = FakeStore {
         present: std::cell::Cell::new(false),
@@ -3408,8 +3462,8 @@ fn prepared_worker_retains_holds_and_rechecks_replacement_sign_in() {
         asked: std::cell::RefCell::new(Vec::new()),
     };
     let (admitted, ()) =
-        admit_prepared_worker(agy, agy.plain(), None, &|_| {}, &|| (), &held, |admitted| {
-            admitted.prepare(agy, None, |starter| Ok((starter, ())))
+        admit_prepared_worker(agy, agy.plain(), &|_| {}, &|| (), &held, |admitted| {
+            admitted.prepare(|starter| Ok((starter, ())))
         })
         .unwrap();
     assert!(
@@ -3419,55 +3473,6 @@ fn prepared_worker_retains_holds_and_rechecks_replacement_sign_in() {
             .contains("explicit package hold")
     );
     assert_eq!(*held.asked.borrow(), ["present", "held"]);
-
-    let grok = aterm_agent::harness::worker::worker_cli(Program::Grok).unwrap();
-    let root = aterm_tempfile::tempdir().unwrap();
-    let auth = root.path().join(".grok/auth.json");
-    std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
-    let store = FakeStore {
-        present: std::cell::Cell::new(true),
-        held: None,
-        lays: true,
-        asked: std::cell::RefCell::new(Vec::new()),
-    };
-    let result = admit_prepared_worker(
-        grok,
-        grok.plain(),
-        Some(root.path()),
-        &|_| {},
-        &|| (),
-        &store,
-        |_| -> Result<(_, ()), Refused> { panic!("signed-out starter reached preparation") },
-    );
-    assert!(matches!(result, Err(Refused::SignedOut(_))));
-    assert!(store.asked.borrow().is_empty());
-    std::fs::write(&auth, r#"{"token":"synthetic"}"#).unwrap();
-    let dropped = std::cell::Cell::new(false);
-    struct Guard<'a>(&'a std::cell::Cell<bool>);
-    impl Drop for Guard<'_> {
-        fn drop(&mut self) {
-            self.0.set(true);
-        }
-    }
-    let result = admit_prepared_worker(
-        grok,
-        grok.plain(),
-        Some(root.path()),
-        &|_| {},
-        &|| (),
-        &store,
-        |admitted| {
-            admitted.prepare(grok, Some(root.path()), |starter| {
-                std::fs::remove_file(&auth).unwrap();
-                Ok((starter, Guard(&dropped)))
-            })
-        },
-    );
-    assert!(matches!(result, Err(Refused::SignedOut(_))));
-    assert!(
-        dropped.get(),
-        "refused replacement retained its authentication guard"
-    );
 }
 
 /// [`remove_in`] of `which` of `sids`' files alone: nothing by its own path, nothing kept.

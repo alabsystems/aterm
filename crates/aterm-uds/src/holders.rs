@@ -73,6 +73,36 @@ pub fn pty_master_held(slave: u64) -> Option<bool> {
     master_held_by(&scan_rdev_holders(pty_master_rdev(slave)?, &[]).ok()?)
 }
 
+/// Read several terminals' masters in one walk of this uid's descriptor tables. Results
+/// retain the input order; an unreadable device or table remains unknown.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn pty_masters_held(slaves: &[u32]) -> Vec<Option<bool>> {
+    let masters: Vec<_> = slaves
+        .iter()
+        .map(|dev| pty_master_rdev(u64::from(*dev)))
+        .collect();
+    let wanted: Vec<_> = masters.iter().flatten().copied().collect();
+    let Ok(scans) = scan_holders_of(&wanted, &[]) else {
+        return vec![None; slaves.len()];
+    };
+    let mut scans = scans.iter();
+    masters
+        .iter()
+        .map(|master| master.and_then(|_| scans.next().and_then(master_held_by)))
+        .collect()
+}
+
+/// See the macOS twin; other platforms retain their native terminal reader.
+#[cfg(not(target_vendor = "apple"))]
+#[must_use]
+pub fn pty_masters_held(slaves: &[u32]) -> Vec<Option<bool>> {
+    slaves
+        .iter()
+        .map(|dev| pty_master_held(u64::from(*dev)))
+        .collect()
+}
+
 /// What a scan for a PTY's master says of it: held once a table holds it, and free only once
 /// every table read and none did.
 #[cfg(any(target_vendor = "apple", test))]

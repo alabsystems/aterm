@@ -3,6 +3,36 @@
 
 //! Compile-fail doctests for what the spec macros refuse.
 //!
+//! Model declarations share the generated TLA module's namespace.
+//!
+//! Rust raw-identifier escapes cannot be emitted as TLA names.
+//!
+//! ```compile_fail
+//! let _ = aterm_spec::ty_model! {
+//!     r#EscapedModel { var n = 0; }
+//! };
+//! ```
+//!
+//! ```compile_fail
+//! let _ = aterm_spec::ty_model! {
+//!     EscapedDeclaration {
+//!         var r#vars = 0;
+//!         action Step { r#vars = 1; }
+//!     }
+//! };
+//! ```
+//!
+//! ```compile_fail
+//! let _ = aterm_spec::ty_model! {
+//!     CrossCategoryCollision {
+//!         const Buggy = 0;
+//!         var n = 0;
+//!         action Step { n = 1; }
+//!         invariant Step: n <= 1;
+//!     }
+//! };
+//! ```
+//!
 //! ```
 //! let m = aterm_spec::ty_model! {
 //!     Twin {

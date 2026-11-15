@@ -193,6 +193,67 @@ fn idle_rss_reads_at_the_quiet_fence_and_busy_rss_keeps_its_delay() {
     assert!(unready.is_err());
 }
 
+/// An instance that exited before its reading has no size to judge. The measure holds each
+/// instance as its child, so one that died stays an unreaped pid the kernel still answers
+/// for, with a zero footprint (macOS 27.0, 2026-11-13) and a zero `ps` resident size; zero
+/// is under every ceiling the rows hold, so each read refuses it.
+#[cfg(unix)]
+#[test]
+fn an_exited_unreaped_instance_gives_no_memory_reading() {
+    let program = aterm_uds::deadline::stand_in(Path::new("/usr/bin/true"));
+    let mut child = aterm_uds::spawnfd::command(&program)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("the stand-in starts");
+    let pid = child.id();
+    let hang = std::time::Instant::now() + super::super::instance::MUST_HAPPEN;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `info` is a zeroed `siginfo_t` the kernel fills, or leaves zeroed while the
+        // child runs (`WNOHANG`); `WNOWAIT` leaves the exited child unreaped, so `pid` stays
+        // this test's own until `wait` below.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: `siginfo_t` is plain C data, valid all zero and as the kernel wrote it.
+            if unsafe { info.assume_init() }.si_signo == libc::SIGCHLD {
+                break;
+            }
+        } else {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted,
+                "waitid: {error}"
+            );
+        }
+        if std::time::Instant::now() >= hang {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the stand-in did not exit within the one-minute hang detector");
+        }
+        aterm_uds::deadline::poll_yield();
+    }
+    let budget = Budget::from_now(60);
+    let settled = Settled::read(pid, budget).map(|took| (took.rss, took.app));
+    let resident = rss_from_ps(pid, budget);
+    child.wait().expect("the stand-in is reaped");
+    assert!(
+        matches!(settled, Err(CouldNotRun::Refused(_))),
+        "an exited instance's sizes were read: {settled:?}"
+    );
+    assert!(
+        matches!(resident, Err(CouldNotRun::Refused(_))),
+        "an exited instance's `ps` resident size was read: {resident:?}"
+    );
+}
+
 #[test]
 fn the_portable_resident_probe_obeys_the_take_budget() {
     let pid = std::process::id();

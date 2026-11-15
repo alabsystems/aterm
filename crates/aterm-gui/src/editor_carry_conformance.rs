@@ -41,14 +41,34 @@ fn wid() -> WindowId {
 
 impl Rig {
     fn new(name: &str) -> Self {
+        Self::with_format(name, false)
+    }
+
+    fn with_format(name: &str, format_one: bool) -> Self {
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("aterm-editor-carry-{name}-"))
             .tempdir()
             .unwrap();
         let file = dir.path().join("draft.md");
         std::fs::write(&file, DISK).unwrap();
-        let uri = crate::native_document_host::path_to_file_uri(&file).unwrap();
+        let canonical = file.canonicalize().unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&canonical).unwrap();
         let journals = dir.path().join("drafts");
+        if format_one {
+            let host =
+                crate::native_document_journal::DocumentJournalStore::for_test(journals.clone())
+                    .unwrap();
+            let mut documents = crate::test_document_store();
+            let document = documents.open(uri.clone(), DISK.into());
+            let bytes = crate::native_document_io::encode_journal_v1(&[
+                crate::native_document_io::JournalRecord::snapshot_for(
+                    host.key_for(&uri),
+                    &documents.snapshot(document).unwrap(),
+                ),
+            ])
+            .unwrap();
+            std::fs::write(host.path_for_uri(&uri), bytes).unwrap();
+        }
         let mut parent = App::headless_for_test();
         parent.use_document_journal_root_for_test(journals.clone());
         parent.carry_drafts_as_windowed_for_test();
@@ -234,7 +254,9 @@ impl Rig {
 
     fn rollback(&mut self, label: &str, actions: &[&str]) {
         self.step(label, actions, |rig| {
-            rig.successor = None;
+            if let Some(successor) = rig.successor.take() {
+                successor.exit_for_test();
+            }
             assert!(
                 rig.parent
                     .reduce_returned_handoff_completion(rejected(FORKED))
@@ -502,7 +524,9 @@ fn a_crash_between_the_journal_and_the_commit_keeps_the_draft() {
     assert!(rig.start("start"));
     rig.successor_restores("restore", "Restore");
     assert_eq!(rig.successor_editor().0, rig.texts[1]);
-    rig.successor = None;
+    if let Some(successor) = rig.successor.take() {
+        successor.exit_for_test();
+    }
     assert_eq!(
         &*rig
             .parent
@@ -705,7 +729,9 @@ fn the_launched_lane_journals_through_the_hold_and_reseats_after_its_stand_down(
     });
     rig.successor_restores("restore", "Restore");
     rig.step("stood down after the park", &["Rollback"], |rig| {
-        rig.successor = None;
+        if let Some(successor) = rig.successor.take() {
+            successor.exit_for_test();
+        }
         rig.parent.answer_prelaunched_stand_down(PRELAUNCHED);
         rig.phase = 0;
         rig.restored = 0;
@@ -840,69 +866,106 @@ fn a_clean_documents_stalled_journal_write_stops_holding_at_the_backstop() {
 }
 
 #[test]
-fn a_journal_that_keeps_refusing_holds_the_update_out_loud() {
+fn automatic_reconciliation_preserves_drafts_but_cannot_invent_a_file_baseline() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    let mut rig = Rig::new("refusing-journal");
+    let mut rig = Rig::new("unsafe-baseline-reconciliation");
     rig.parent.hold_journal_appends_for_test();
     rig.parent
         .dispatch_native_event(
             wid(),
-            AppEvent::TextInput(TextInputEvent::Commit("a".to_string())),
+            AppEvent::TextInput(TextInputEvent::Commit("a".into())),
         )
         .unwrap();
+    let head = rig.parent.document_store.snapshot(rig.document).unwrap();
     let path = rig
         .parent
         .document_journal_path_for_test(rig.document)
         .unwrap();
-    let ours = std::fs::read(&path).unwrap();
+    let snapshot = |seq, text: &str| crate::document_store::DocumentSnapshot {
+        id: rig.document,
+        seq: aterm_buffer::Seq(seq),
+        text: std::sync::Arc::from(text),
+    };
     let foreign = crate::native_document_io::encode_journal(&[
         crate::native_document_io::JournalRecord::snapshot_for(
             rig.key(),
-            &crate::document_store::DocumentSnapshot {
-                id: rig.document,
-                seq: aterm_buffer::Seq(1),
-                text: std::sync::Arc::from("another writer\n"),
-            },
+            &snapshot(0, "another file's baseline\n"),
+        ),
+        crate::native_document_io::JournalRecord::snapshot_for(
+            rig.key(),
+            &snapshot(1, "another writer's draft\n"),
         ),
     ])
     .unwrap();
     std::fs::write(&path, &foreign).unwrap();
-    for probe in 0..3 {
-        assert!(
-            rig.parent.run_held_journal_append_for_test(),
-            "probe {probe}: an append was on the worker"
-        );
-        assert!(
-            rig.parent.held_journal_appends_for_test().is_empty(),
-            "probe {probe}: and it failed, with nothing behind it"
-        );
-        let crate::native_app::UpdateOutcome::Blocked { reasons } =
-            rig.parent.apply_debug_seamless_update()
-        else {
-            panic!("probe {probe}: a draft its journal refuses is never carried");
-        };
-        assert_eq!(
-            App::update_blocker_for_person(&reasons),
-            Some(App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY),
-            "probe {probe}: a journal that keeps refusing must be said, not waited on: \
-             {reasons:?}"
-        );
-        assert!(
-            reasons
-                .iter()
-                .any(|reason| reason.starts_with("Checkpoint Drafts:")
-                    && reason.contains("could not be written")),
-            "probe {probe}: {reasons:?}"
-        );
-    }
-    std::fs::write(&path, &ours).unwrap();
     assert!(rig.parent.run_held_journal_append_for_test());
-    let token = rig
-        .parent
-        .revalidate_native_update_safety()
-        .expect("the retry landed: carried");
-    assert_eq!(token.carried_drafts(), 1);
+    assert!(rig.parent.held_journal_appends_for_test().is_empty());
+    assert_eq!(
+        rig.parent
+            .document_journal_durable_seq_for_test(rig.document),
+        Some(head.seq)
+    );
+    let recovered = recover_journal_for(rig.key(), &std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(recovered.text, head.text.as_ref());
+    assert!(
+        recovered.record_count > 1,
+        "the unproved baseline must not make this a clean image"
+    );
+    assert_ne!(
+        recovered.base_content,
+        ContentFingerprint::of(DISK.as_bytes())
+    );
+    assert_eq!(
+        rig.parent
+            .document_store
+            .snapshot(rig.document)
+            .unwrap()
+            .text,
+        head.text
+    );
+    assert_eq!(rig.parent.document_store.dirty(rig.document), Some(true));
+    assert!(
+        std::fs::read_dir(&rig.journals)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_name().to_string_lossy().contains(".preserved-")
+                    && std::fs::read(entry.path()).is_ok_and(|bytes| bytes == foreign)
+            }),
+        "the foreign dirty image remains exact"
+    );
     rig.assert_file_untouched();
+    assert!(matches!(
+        rig.parent.draft_carry(rig.document),
+        DraftCarry::Refused(_)
+    ));
+    let crate::native_app::UpdateOutcome::Blocked { reasons } =
+        rig.parent.apply_debug_seamless_update()
+    else {
+        panic!("durable journal text is not proof of a file baseline");
+    };
+    assert_eq!(
+        App::update_blocker_for_person(&reasons),
+        Some(App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY)
+    );
+    assert!(rig.parent.revalidate_native_update_safety().is_err());
+    rig.assert_file_untouched();
+    let (_, view) = rig.parent.active_native_view(wid()).unwrap();
+    rig.parent
+        .save_document_checkpoint(rig.document, view)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&rig.file).unwrap(),
+        head.text.as_ref()
+    );
+    assert_eq!(rig.parent.document_store.dirty(rig.document), Some(false));
+    assert_eq!(
+        rig.parent
+            .revalidate_native_update_safety()
+            .unwrap()
+            .carried_drafts(),
+        0
+    );
 }
 
 #[test]
@@ -1062,4 +1125,248 @@ fn a_carried_draft_never_rides_the_cold_lane() {
         App::update_blocker_for_person(&[refusal]),
         Some(App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY)
     );
+}
+
+fn worker_result<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::sync::mpsc::Receiver<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = work();
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn background_append(rig: &mut Rig) {
+    let held = rig.parent.take_held_journal_append_for_test().unwrap();
+    let reply = worker_result(move || {
+        let result = crate::native_document_journal::execute_journal_append(
+            &held.path,
+            held.key,
+            &held.plan,
+            crate::native_document_journal::JournalLockPatience::Worker,
+        );
+        (held.document, held.plan.generation, result)
+    });
+    let (document, generation, result) = reply.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+    rig.parent
+        .finish_native_document_journal(document, generation, result);
+}
+
+fn background_reseat(rig: &mut Rig) {
+    let held = rig.parent.take_held_journal_reseat_for_test().unwrap();
+    let reply = worker_result(move || {
+        let result = crate::native_document_journal::execute_journal_reseat(
+            &held.path,
+            &held.plan,
+            crate::native_document_journal::JournalLockPatience::Worker,
+        );
+        (held.document, held.plan.generation, result)
+    });
+    let (document, generation, result) = reply.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+    rig.parent
+        .finish_native_document_journal_reseat(document, generation, result);
+}
+
+fn checked_transition(model: &Model, before: &State, after: &State, action: &str, expected: bool) {
+    let (actual, why) = aterm_spec::verify::validate_transition_tiered(
+        model,
+        &[],
+        before,
+        after,
+        Some(action),
+        "editor carry admission/reconciliation",
+    );
+    assert_eq!(actual, expected, "{action}: {why}");
+    eprintln!("editor carry {action}, expected={expected}: {why}");
+}
+
+#[test]
+fn queue_deferral_preserves_durability_without_owing_reconciliation() {
+    let mut rig = Rig::new("queue-deferred");
+    rig.parent.hold_journal_appends_for_test();
+    rig.type_key("plan", "a", &["Type", "Plan"]);
+    let before = rig.project();
+    let image = rig.image();
+    rig.step("queue did not admit the plan", &["Defer"], |rig| {
+        assert!(rig.parent.defer_held_journal_append_for_test());
+    });
+    let after = rig.project();
+    checked_transition(&rig.model, &before, &after, "Defer", true);
+    assert_eq!(rig.image(), image);
+    assert_eq!(
+        (after["mem"], after["journal"], after["reseat"]),
+        (before["mem"], before["journal"], before["reseat"])
+    );
+    let mut falsely_owed = after.clone();
+    falsely_owed.insert("reseat", 1);
+    checked_transition(&rig.model, &before, &falsely_owed, "Defer", false);
+    rig.step("released queue slot", &["Plan"], |rig| {
+        rig.parent.native_document_queue_slot_available()
+    });
+    rig.step("admitted append", &["Land"], background_append);
+    assert!(rig.start("only the real append made the draft carryable"));
+    rig.assert_file_untouched();
+}
+
+#[test]
+fn an_owned_admitted_failure_reconciles_without_acknowledging_the_failed_write() {
+    let mut rig = Rig::new("owned-failure");
+    rig.parent.hold_journal_appends_for_test();
+    rig.parent.hold_journal_reseats_for_test();
+    rig.type_key("plan", "a", &["Type", "Plan"]);
+    let before = rig.project();
+    let path = rig
+        .parent
+        .document_journal_path_for_test(rig.document)
+        .unwrap();
+    let held_name = rig.journals.join("pinned-image.atdj");
+    rig.step("admitted no-follow refusal", &["FailOwned"], |rig| {
+        std::fs::rename(&path, &held_name).unwrap();
+        std::os::unix::fs::symlink(&held_name, &path).unwrap();
+        let held = rig.parent.take_held_journal_append_for_test().unwrap();
+        let reply = worker_result(move || {
+            let result = crate::native_document_journal::execute_journal_append(
+                &held.path,
+                held.key,
+                &held.plan,
+                crate::native_document_journal::JournalLockPatience::Worker,
+            );
+            (held.document, held.plan.generation, result)
+        });
+        let (document, generation, result) =
+            reply.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+        assert!(matches!(
+            &result,
+            crate::native_document_io::JournalAppendResult::Failed { .. }
+        ));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&held_name, &path).unwrap();
+        rig.parent
+            .finish_native_document_journal(document, generation, result);
+    });
+    let failed = rig.project();
+    checked_transition(&rig.model, &before, &failed, "FailOwned", true);
+    let mut falsely_durable = failed.clone();
+    falsely_durable.insert("mem", failed["head"]);
+    checked_transition(&rig.model, &before, &falsely_durable, "FailOwned", false);
+    assert!(!rig.start("failed acknowledgement cannot carry the draft"));
+    rig.step(
+        "same old image verified",
+        &["ReseatUnchanged", "Plan"],
+        background_reseat,
+    );
+    rig.step("the actual retry lands", &["Land"], background_append);
+    assert!(rig.start("verified retry"));
+    rig.assert_file_untouched();
+}
+
+#[test]
+fn an_unacknowledged_publication_owes_reconciliation_without_promoting_memory() {
+    let mut rig = Rig::with_format("unacknowledged-publication", true);
+    rig.parent.hold_journal_appends_for_test();
+    rig.parent.hold_journal_reseats_for_test();
+    rig.type_key("H1 plan", "a", &["Type", "Plan"]);
+    let before = rig.project();
+    let path = rig
+        .parent
+        .document_journal_path_for_test(rig.document)
+        .unwrap();
+    assert!(crate::native_document_io::journal_is_format_1(&rig.image()));
+    let (published, published_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let _gate = crate::native_document_journal::DocumentJournalStore::after_replacement_for_test(
+        path,
+        move || {
+            published.send(()).unwrap();
+            release_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap();
+            Err(std::io::Error::other(
+                "unacknowledged directory publication",
+            ))
+        },
+    );
+    // Type changes memory only. Publication can be linearized at its failed reply
+    // while the inflight guard prevents Start/Commit throughout this whole window.
+    rig.step(
+        "H2 typed before the failed H1 reply",
+        &["Type", "FailPublished"],
+        |rig| {
+            let held = rig.parent.take_held_journal_append_for_test().unwrap();
+            let reply = worker_result(move || {
+                let result = crate::native_document_journal::execute_journal_append(
+                    &held.path,
+                    held.key,
+                    &held.plan,
+                    crate::native_document_journal::JournalLockPatience::Worker,
+                );
+                (held.document, held.plan.generation, result)
+            });
+            published_rx
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .unwrap();
+            rig.parent
+                .dispatch_native_event(
+                    wid(),
+                    AppEvent::TextInput(TextInputEvent::Commit("b".into())),
+                )
+                .unwrap();
+            let head = rig.parent.document_store.snapshot(rig.document).unwrap();
+            rig.texts.push(head.text.to_string());
+            rig.seqs.push(head.seq);
+            assert!(rig.parent.revalidate_native_update_safety().is_err());
+            release.send(()).unwrap();
+            let (document, generation, result) =
+                reply.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+            assert!(matches!(
+                &result,
+                crate::native_document_io::JournalAppendResult::Failed { .. }
+            ));
+            rig.parent
+                .finish_native_document_journal(document, generation, result);
+        },
+    );
+    let failed = rig.project();
+    let mut before_failure = before;
+    assert!(rig.model.fire("Type", &mut before_failure));
+    checked_transition(&rig.model, &before_failure, &failed, "FailPublished", true);
+    assert_eq!(
+        (failed["mem"], failed["journal"], failed["head"]),
+        (0, 1, 2)
+    );
+    let mut falsely_acknowledged = failed.clone();
+    falsely_acknowledged.insert("mem", 1);
+    checked_transition(
+        &rig.model,
+        &before_failure,
+        &falsely_acknowledged,
+        "FailPublished",
+        false,
+    );
+    let mut forgotten = failed.clone();
+    forgotten.insert("reseat", 0);
+    checked_transition(
+        &rig.model,
+        &before_failure,
+        &forgotten,
+        "FailPublished",
+        false,
+    );
+    assert!(!rig.start("visible H1 is not acknowledged H2"));
+    rig.step("worker reconciles H2", &["Reseat"], background_reseat);
+    assert!(rig.start("only successful reconciliation makes H2 carryable"));
+    rig.assert_file_untouched();
+}
+
+#[test]
+fn derived_editor_carry_model_proves_and_catches_unsafe_commit() {
+    // Local default/counterexample validation; the registry non_vacuity runner
+    // owns the full per-law sweep across every mutant dial.
+    let covered = aterm_spec::verify::prove_and_catch_scalar(
+        &native_update_editor_carry_model(),
+        "editor carry admitted failures",
+    );
+    eprintln!("editor carry derived model: {covered:?}");
 }

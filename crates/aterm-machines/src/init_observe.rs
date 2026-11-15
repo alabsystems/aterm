@@ -86,10 +86,10 @@ pub enum Wait {
     GitReadiness,
     /// aterm's GitHub settings (`~/.config/aterm/init.toml`) cannot be used.
     Settings,
-    /// The GitHub token file the vault syncs is not on this Mac yet.
+    /// The vault's GitHub token is not in this Mac's vault copy yet.
     Token,
-    /// The GitHub token file is there but cannot be used: not this account's own private
-    /// file, or not one literal token.
+    /// The vault's GitHub token cannot be used here: the store's local state cannot be read, or
+    /// the entry is not one literal token.
     TokenUnusable,
     /// GitHub reached no answer: the network, a proxy or a deadline.
     Unreached,
@@ -171,7 +171,7 @@ impl Wait {
             Self::GitReadiness => "Waiting for Git to finish installing",
             Self::Settings => "Fix aterm's GitHub settings; aterm doctor says how",
             Self::Token => "Waits for the GitHub token from the Secrets vault",
-            Self::TokenUnusable => "GitHub token file is unusable",
+            Self::TokenUnusable => "GitHub token in the Secrets vault is unusable",
             Self::Unreached => "GitHub can't be reached",
             Self::TokenRefused => "Token refused by GitHub; waits for a new one",
             Self::OtherAccount => "GitHub account setting differs from the token's",

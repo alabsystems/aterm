@@ -311,3 +311,25 @@ fn op_and_event_keep_their_slot_sizes() {
     assert_eq!(std::mem::size_of::<Op>(), 16);
     assert_eq!(std::mem::size_of::<Event>(), 32);
 }
+
+#[test]
+fn shared_line_adoption_keeps_backing_and_refuses_a_stale_head() {
+    let cap = write_cap();
+    let mut surface = Surface::new();
+    let first = Arc::new("é\r\n".repeat(131_072));
+    let base = surface.append_shared_line(&cap, first.clone());
+    assert!(Arc::ptr_eq(&surface.lines[0].1, &first));
+    let frozen = surface.snapshot(&read_cap());
+    let next = Arc::new("new".repeat(131_072));
+    assert_eq!(
+        surface.set_shared_line(&cap, base, LineId(0), next.clone()),
+        TxnOutcome::Committed(Seq(base.0 + 1))
+    );
+    assert!(Arc::ptr_eq(&surface.lines[0].1, &next));
+    assert!(Arc::ptr_eq(&frozen.surface.lines[0].1, &first));
+    assert_eq!(
+        surface.set_shared_line(&cap, base, LineId(0), first),
+        TxnOutcome::Conflict
+    );
+    assert!(Arc::ptr_eq(&surface.lines[0].1, &next));
+}

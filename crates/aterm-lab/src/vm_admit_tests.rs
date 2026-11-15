@@ -163,6 +163,7 @@ fn an_interrupt_ends_the_wait_and_a_credited_vm_is_not_reserved_twice() {
     machine.set_procs(Some(Procs::of(vec![Proc {
         pid: vm.id(),
         ppid: 1,
+        start: 0,
         charged: 14 << 30,
         footprint: 14 << 30,
         written: 0,

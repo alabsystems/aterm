@@ -275,7 +275,7 @@ fn event_pair() -> (Events, aterm_uds::CtlStream) {
 }
 fn binding() -> Binding {
     Binding {
-        session: "s-a".into(),
+        session: "s-0000000000000000000a".into(),
         attempt: [1; 16],
     }
 }

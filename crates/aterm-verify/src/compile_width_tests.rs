@@ -121,7 +121,6 @@ fn lint_without_per_unit_memory_claims_still_borrows_from_the_release_fifo() {
     let pool = aterm_capacity::Jobserver::new(&dir.path().join("jobs"), 4).unwrap();
     for (stage, width) in [
         (StageId::Tippy, 3),
-        (StageId::Doctests, 3),
         (StageId::SpecCheck, 3),
         (StageId::TestCompile, 3),
         (StageId::ExportScan, 1),

@@ -147,6 +147,19 @@ impl Tools {
             if who.machine_id != identity.id {
                 return Err("source signing ring identity disagrees with its signed roster".into());
             }
+            // The cut signs with the store's ring where the store holds one; the engine signs the
+            // source with the ring files `atpkg-keys` minted. One release has one signer, so the
+            // two must be one key.
+            if let Some(store) = crate::sign::ReleaseCredentials::from_store(home)?
+                && store.pubkey() != identity.pubkey
+            {
+                return Err(format!(
+                    "the store's release ring and the ring files the engine signs the source with \
+                     ({}) are not one key: one release has one signer, so the vault admin \
+                     republishes the ring this Mac signs with",
+                    record.display()
+                ));
+            }
             Ok((key, identity))
         }
     }

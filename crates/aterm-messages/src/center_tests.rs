@@ -1178,7 +1178,7 @@ fn act_returns_the_intent_and_details_marks_seen() {
     let mut c = fresh(now);
     let id = c.post(ask("File access not confirmed"), stamp(1), now).id;
     c.commit_rows(now, 3);
-    let intent = c.act(id, ActionIndex(0), now + ms(1));
+    let intent = c.act(id, ActionIndex(0), stamp(2), now + ms(1));
     assert_eq!(
         intent,
         Some(Intent::OpenSystemPane {
@@ -1189,12 +1189,16 @@ fn act_returns_the_intent_and_details_marks_seen() {
     assert!(
         matches!(c.log().pending_lines().last(), Some(LogLine::Acted { label, .. }) if label == "Open Settings")
     );
-    assert_eq!(c.act(id, ActionIndex(5), now), None, "no such action");
+    assert_eq!(
+        c.act(id, ActionIndex(5), stamp(1), now),
+        None,
+        "no such action"
+    );
     let held = c.post(info("read me"), stamp(2), now).id;
     c.commit_rows(now, 3);
     for (row, folds) in [(held, true), (id, false)] {
         assert_eq!(
-            c.act(row, ActionIndex::DETAILS, now + ms(4)),
+            c.act(row, ActionIndex::DETAILS, stamp(6), now + ms(4)),
             Some(Intent::Details)
         );
         assert_eq!(c.live(row).is_none(), folds, "{row}");
@@ -1571,8 +1575,9 @@ fn a_problem_folded_before_its_fix_still_closes_as_fixed() {
         4,
     );
     c.commit_rows(now, 3);
+    let read = stamp(5);
     for id in [folded, no_words, elsewhere, taken_over] {
-        assert!(c.mark_seen(id, now + ms(1)), "the press folds it");
+        assert!(c.mark_seen(id, read, now + ms(1)), "the press folds it");
         assert_eq!(
             c.log().get(id).unwrap().state,
             LogState::Retired(Retired::Folded)
@@ -1679,7 +1684,7 @@ fn a_record_is_reworded_in_place_and_replays_so() {
     assert!(!c.reword_record(live, &info("Rebuilt")));
     assert_eq!(c.live(live).unwrap().msg.title, "Rebuilding");
     c.commit_rows(now, 3);
-    assert!(c.dismiss(live, now + ms(1)));
+    assert!(c.dismiss(live, stamp(3), now + ms(1)));
     assert!(!c.reword_record(live, &info("Rebuilt")));
     assert_eq!(c.log().get(live).unwrap().title, "Rebuilding");
     let unknown = c.log().next_id();
@@ -1824,7 +1829,7 @@ fn a_row_or_a_read_record_is_told_on_under_another_key_and_an_ended_story_is_not
         Some(&Retired::Superseded { by: ca })
     );
     assert!(c.live(ca).is_some());
-    assert!(c.mark_seen(ca, now + ms(2)));
+    assert!(c.mark_seen(ca, stamp(4), now + ms(2)));
     assert_eq!(c.log().get(ca).unwrap().retired(), Some(&Retired::Folded));
     let nr = c.post(warn("Login expired", "n.s-1.nr"), stamp(3), now).id;
     assert!(c.supersede_record(ca, nr, now + ms(3)), "a read record");
@@ -1839,7 +1844,7 @@ fn a_row_or_a_read_record_is_told_on_under_another_key_and_an_ended_story_is_not
         "a story its reporter resolved"
     );
     let asked = c.post(ask("Allow access?"), stamp(5), now).id;
-    assert!(c.answer(asked, "Not now", now + ms(5)));
+    assert!(c.answer(asked, "Not now", stamp(10), now + ms(5)));
     assert!(!c.supersede_record(asked, next, now), "the owner's answer");
     let entry = c
         .post(
@@ -1897,7 +1902,7 @@ fn a_record_fixed_by_name_reads_fixed_and_ends_its_quiet() {
     );
     let read = c.post(warn("n.s-1.si"), stamp(10_000), now).id;
     c.commit_rows(now, 3);
-    assert!(c.mark_seen(read, now + ms(3)));
+    assert!(c.mark_seen(read, stamp(10_003), now + ms(3)));
     assert_eq!(
         c.post(warn("n.s-1.si"), stamp(11_000), now).outcome,
         PostOutcome::Suppressed,

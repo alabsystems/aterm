@@ -108,8 +108,7 @@ impl Status {
         }
         if !self.valid()
             || session.process_pid <= 1
-            || !safe(&session.sid, 64)
-            || !session.sid.starts_with("s-")
+            || !aterm_types::control_verbs::is_minted_sid(&session.sid)
             || !safe(&session.process_birth, 128)
             || !safe(&session.epoch, 128)
         {

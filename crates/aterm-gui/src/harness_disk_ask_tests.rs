@@ -450,7 +450,7 @@ fn a_session_its_loop_holds_for_credits_or_a_sign_in_is_held_until_it_is_past() 
         "lifted: its loop types at the next turn break"
     );
     let auth = Withhold::Wall {
-        wire: aterm_phase::WallKind::Auth.wire(),
+        wire: alab_policy::vocab::WallKind::Auth.wire(),
     };
     assert_eq!(held("idle", Some(&auth)), Some(ask::HeldBy::SignIn));
     assert_eq!(
@@ -1680,7 +1680,7 @@ fn a_look_and_a_turn_break_bar_a_done_an_exited_and_an_unfit_session_alike() {
 #[test]
 fn an_earlier_disk_worker_that_still_runs_keeps_the_next_from_starting() {
     use crate::task_record::{TaskMark, mark_session_task};
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let worker_folder = format!(
         "/state/{}/{}",
         aterm_agent::harness::cli::HARNESS,

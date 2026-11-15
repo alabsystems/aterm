@@ -15,7 +15,7 @@ fn a_valid_owner_reply_survives_scheduling_delay() {
 }
 #[test]
 fn accounted_routing_is_exact_and_does_not_relax_legacy_handshake() {
-    let hello = aterm_json::json!({"version":3,"role":trust_resource_controller::accounting::PROXY_ROLE,"session":"s-a","attempt":"12121212121212121212121212121212","accounting":trust_resource_controller::accounting::CAPABILITY});
+    let hello = aterm_json::json!({"version":3,"role":trust_resource_controller::accounting::PROXY_ROLE,"session":"s-0000000000000000000a","attempt":"12121212121212121212121212121212","accounting":trust_resource_controller::accounting::CAPABILITY});
     assert!(proxy_binding_accounted(&hello).is_ok());
     assert!(proxy_binding(&hello).is_err());
     for key in ["version", "role", "session", "attempt", "accounting"] {

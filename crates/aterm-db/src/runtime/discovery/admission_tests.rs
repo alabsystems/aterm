@@ -17,10 +17,10 @@ fn peer(state: i64, seen: Instant) -> Peer {
         failures: 0,
         deferring: false,
         pulled: false,
-        told: false,
-        resting: false,
-        held: false,
+        dialled: None,
+        led: None,
         repair: Repair::default(),
+        ..Peer::candidate(seen, Lead::None)
     }
 }
 

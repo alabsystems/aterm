@@ -6,9 +6,9 @@ use super::*;
 use crate::supervise::approvals::Ledger;
 use std::fmt::Write as _;
 
-const SID: &str = "@s-1";
+const SID: &str = "@t0000000001";
 
-const WAS: &str = "s-a0";
+const WAS: &str = "t00000000a0";
 
 #[derive(Clone, Debug)]
 enum Ev {
@@ -308,6 +308,11 @@ impl Loop<'_> {
         }
     }
 
+    /// Moves the wall clock to `to` as awake time. The awake clock stands still here, so every
+    /// instant the loop holds moves back by the step instead: the person's stamps, the policy's
+    /// ([`TurnEndState::slept`]) and the wake's settle. If the settle stood, a settle 60 s or
+    /// less ahead fell only at a second step, and two loops that placed one settle in different
+    /// seconds typed apart.
     fn advance(&mut self, to: i64) {
         let from_ms = self.s.now_unix_ms();
         if to * 1000 <= from_ms {
@@ -326,6 +331,9 @@ impl Loop<'_> {
         }
         if let Some((_, p, _)) = self.s.draft_seen.as_mut() {
             back(p);
+        }
+        if let Some((settle, _)) = self.s.wake_settle.as_mut() {
+            back(&mut settle.at);
         }
         self.s.clock_marks = Some((self.s.fx.mono(), self.s.now_unix_ms()));
     }
@@ -371,7 +379,7 @@ impl Loop<'_> {
                     .to_string()
             };
             let rule = field("rule_id");
-            if rule == crate::supervise::policy::turn_end::RULE_GO_AHEAD_HOUR {
+            if rule == alab_policy::words::RULE_GO_AHEAD_HOUR {
                 // A time a row carries is on the clock the row is stamped by, which a follower's
                 // seed reads it by: a person's hour starts no later than its own row, which this
                 // loop stamps by its second.
@@ -1847,9 +1855,9 @@ fn taken(k: usize, h: &[String], prompt: &str) -> Beat {
 }
 
 /// THE LAND CHECK LAND TYPES AT A CLEAN DEFENSE (act `k`, over `defended`): its turn runs and
-/// ends `LANDED`, the answer that lands ([`crate::supervise::policy::land_check`]).
+/// ends `LANDED`, the answer that lands ([`alab_policy::land_check`]).
 fn land_checked(k: usize, defended: &[String]) -> [Beat; 2] {
-    let check = crate::supervise::policy::turn_end::LAND_CHECK;
+    let check = alab_policy::land_check::LAND_CHECK;
     let landed = with(defended, &turn(Some(check), &["⏺ LANDED"], 20, 0));
     [
         taken(k, defended, check),
@@ -2111,7 +2119,7 @@ fn scenarios() -> Vec<Scenario> {
                     let h4 = with(
                         &h3,
                         &turn(
-                            Some(crate::supervise::policy::turn_end::DONE_CHECK),
+                            Some(alab_policy::words::DONE_CHECK),
                             &[
                                 "⏺ All done: verified again, every suite passes.\n\n  ATERM-TASK-DONE",
                             ],
@@ -2807,7 +2815,7 @@ fn more_scenarios() -> Vec<Scenario> {
             "the try's work ends in a done report",
             Ev::Point(cc(&h3, &[], "")),
         ));
-        let check = crate::supervise::policy::turn_end::DONE_CHECK;
+        let check = alab_policy::words::DONE_CHECK;
         let h4 = with(&h3, &turn(Some(check), &[weekly_notice], 0, 0));
         beats.push(beat(
             At::Act(1, 3),
@@ -2992,7 +3000,10 @@ fn weekly_wall(history: &[String], reset: i64, at: i64, armed: bool) -> (Vec<Str
 
 fn land_policy() -> SupervisorConfig {
     SupervisorConfig {
-        autopilot: crate::supervise::config::Autopilot::Land,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot: alab_policy::config::Autopilot::Land,
+            ..default_policy().turn_end.clone()
+        },
         ..default_policy()
     }
 }
@@ -3428,7 +3439,7 @@ fn grown_scenarios() -> Vec<Scenario> {
             &[],
             "",
         );
-        let land = crate::supervise::policy::turn_end::LAND;
+        let land = alab_policy::words::LAND;
         let defended = with(&w0, &turn(Some(land), &defense, 10 * MIN, 0));
         let [check_runs, check_lands] = land_checked(1, &defended);
         let beats = vec![
@@ -4171,7 +4182,7 @@ fn round8_scenarios() -> Vec<Scenario> {
     }
     {
         let mut beats = Vec::new();
-        short_yields(crate::supervise::policy::turn_end::NO_WORK_ACTS, &mut beats);
+        short_yields(alab_policy::words::NO_WORK_ACTS, &mut beats);
         out.push(sc(
             "RS8-F3 short turns in new words each, held after the run's bound".to_string(),
             default_policy(),
@@ -4413,7 +4424,7 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 person_on_screen: false,
             });
         }
-        let land = crate::supervise::policy::turn_end::LAND;
+        let land = alab_policy::words::LAND;
         // A 529 is an outage: its resume is the one line (v6 §14.17.5.2).
         let retry = crate::supervise::policy::turn_end::cleared_text(
             crate::supervise::policy::turn_end::Cleared::Outage(
@@ -4472,11 +4483,7 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 ),
             ]);
             if person {
-                beats.push(taken(
-                    2,
-                    &answered,
-                    crate::supervise::policy::turn_end::LAND_NUDGE,
-                ));
+                beats.push(taken(2, &answered, alab_policy::words::LAND_NUDGE));
             } else {
                 beats.extend(land_checked(2, &answered));
                 beats.push(beat(At::Act(2, MIN + 90), "(a handoff instant)", Ev::Mark));
@@ -4497,7 +4504,7 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 person_on_screen: false,
             });
         }
-        let check = crate::supervise::policy::turn_end::DONE_CHECK;
+        let check = alab_policy::words::DONE_CHECK;
         let claim = "⏺ All done: committed and pushed. Should I delete the old release branch?\n\n  ATERM-TASK-DONE";
         let h1 = with(&w0, &turn(None, &[claim], 0, T0 + 2 * MIN));
         let after = compacted("⏺ Running the suite.");
@@ -4607,7 +4614,7 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 person_on_screen: false,
             });
         }
-        let answer = crate::supervise::policy::turn_end::LAND_ANSWER;
+        let answer = alab_policy::words::LAND_ANSWER;
         for (api, twice, asked) in [
             (false, false, false),
             (true, false, false),
@@ -5038,7 +5045,7 @@ fn unlike_in(a: &Followed, b: &Followed) -> String {
 
 #[test]
 fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follows() {
-    use crate::supervise::config::Autopilot;
+    use alab_policy::config::Autopilot;
     let dir = crate::supervise::test_scratch_path("seed-matrix", "land-over");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
@@ -5084,7 +5091,10 @@ fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follow
     }
     let under = |autopilot: Autopilot| SuperviseOpts {
         policy: SupervisorConfig {
-            autopilot,
+            turn_end: alab_policy::config::PolicyConfig {
+                autopilot,
+                ..land_policy().turn_end.clone()
+            },
             ..land_policy()
         },
         ..auto(30)
@@ -5102,11 +5112,7 @@ fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follow
         });
         s.set_clock(T0 + 2 * MIN, PDT);
         let rule = decide(&mut s, &progress, 101, 120, &under(Autopilot::Land));
-        assert_eq!(
-            rule,
-            Some(crate::supervise::policy::turn_end::RULE_LAND),
-            "the instruction"
-        );
+        assert_eq!(rule, Some(alab_policy::words::RULE_LAND), "the instruction");
         s.set_clock(T0 + 2 * MIN + 20, PDT);
         let rule = decide(&mut s, &yielded, 102, 20, &under(mode));
         assert_eq!(rule, None, "{mode:?}: the short yield is backed off");
@@ -5119,8 +5125,8 @@ fn a_land_episode_a_reading_in_another_mode_ended_is_over_for_a_loop_that_follow
 
 #[test]
 fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
-    use crate::supervise::config::Autopilot;
-    use crate::supervise::policy::turn_end::{RULE_LAND, RULE_LAND_NUDGE};
+    use alab_policy::config::Autopilot;
+    use alab_policy::words::{RULE_LAND, RULE_LAND_NUDGE};
     let dir = crate::supervise::test_scratch_path("seed-matrix", "land-since");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
@@ -5135,7 +5141,10 @@ fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
     );
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
-            autopilot: Autopilot::Land,
+            turn_end: alab_policy::config::PolicyConfig {
+                autopilot: Autopilot::Land,
+                ..land_policy().turn_end.clone()
+            },
             ..land_policy()
         },
         ..auto(30)
@@ -5246,8 +5255,8 @@ fn a_land_holds_since_its_instruction_row_for_this_loop_and_the_next() {
 fn off_stands_at_every_park_the_journal_says() {
     use crate::supervise::approvals::{self, Outcome, Row};
     use crate::supervise::journal::JournalRecord;
-    use crate::supervise::policy::turn_end::RULE_LAND;
     use crate::supervise::run::{lifecycle::parked_off_note, with_parks_journaled};
+    use alab_policy::words::RULE_LAND;
     let row = |rule: &str, outcome: Outcome, reason: &str, at: i64| {
         Row {
             rule_id: rule,
@@ -5340,7 +5349,8 @@ fn off_stands_at_every_park_the_journal_says() {
 #[test]
 fn a_try_a_seed_found_aged_out_is_over_and_ends_no_wall() {
     use crate::supervise::approvals::{self, Outcome, Row};
-    use crate::supervise::policy::turn_end::{LimitTry, RULE_DONE_CHECK};
+    use crate::supervise::policy::turn_end::LimitTry;
+    use alab_policy::words::RULE_DONE_CHECK;
     let dir = crate::supervise::test_scratch_path("seed-matrix", "try-over");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
@@ -5357,7 +5367,7 @@ fn a_try_a_seed_found_aged_out_is_over_and_ends_no_wall() {
         let wall = approvals::wall_wait_reason(
             None,
             None,
-            aterm_phase::WallKind::Spend,
+            alab_policy::vocab::WallKind::Spend,
             "You've hit your monthly spend limit.",
         );
         let check = approvals::act_reason(Some(limit));
@@ -6540,7 +6550,8 @@ fn a_tries_answer_dated_by(done: bool, transcript: bool, held: bool) {
 #[test]
 fn a_ledger_no_loop_recorded_points_in_seeds_no_yield() {
     use crate::supervise::approvals::{self, Outcome, Row};
-    use crate::supervise::policy::turn_end::{RULE_API_RETRY, RULE_CONTINUE};
+    use crate::supervise::policy::turn_end::RULE_API_RETRY;
+    use alab_policy::words::RULE_CONTINUE;
     let dir = crate::supervise::test_scratch_path("seed-matrix", "unrecorded");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
@@ -6634,7 +6645,7 @@ fn a_ledger_no_loop_recorded_points_in_seeds_no_yield() {
 #[test]
 fn a_successor_counts_the_act_a_wall_cut_as_the_loop_before_would() {
     use crate::supervise::approvals::{self, Outcome, Row};
-    use crate::supervise::policy::turn_end::RULE_CONTINUE;
+    use alab_policy::words::RULE_CONTINUE;
     let dir = crate::supervise::test_scratch_path("seed-matrix", "wall-cut-streak");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
@@ -7130,7 +7141,7 @@ fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
         RULE_TASK_DONE, RULE_TRY_OVER, RULE_TURN_RAN, RULE_WALL_WAIT, RULE_WALL_WAIT_END,
         WALL_TAKEN,
     };
-    use crate::supervise::policy::turn_end::RULE_LEFT;
+    use alab_policy::words::RULE_LEFT;
     const WALL_LEFT: &str = "the wall left the screen or the worker worked";
     // 0.106 wrote none of these; the done checks' note is v6's 5a (§14.5).
     const MARKS: [&str; 6] = [

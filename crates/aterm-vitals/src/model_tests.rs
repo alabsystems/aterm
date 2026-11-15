@@ -3,6 +3,474 @@
 
 use super::*;
 
+#[test]
+fn service_cpu_is_an_observed_floor_and_unknown_uid_work_stays_unassigned() {
+    let reading = |second: u64| {
+        let mut service = proc(900, 1, second * 200, 1, "service");
+        service.uid = Some(0);
+        let mut unknown = proc(901, 1, second * 400, 1, "unread-owner");
+        unknown.uid = None;
+        let mut sample = sample(second, &[second * 100; 4], vec![service, unknown]);
+        sample.self_uid = Some(501);
+        sample
+    };
+    let mut vitals = Vitals::new();
+    vitals.absorb(&reading(10));
+    let snapshot = vitals.absorb(&reading(11));
+    let split = snapshot
+        .split
+        .expect("unknown ownership must not discard known CPU");
+    assert!((split.services - 0.2).abs() < 0.000_001, "{split:?}");
+    assert!(
+        (split.global - split.aterm - split.others - split.services - split.unaccounted).abs()
+            < 0.000_001
+    );
+    assert!(
+        split.unaccounted > 0.4,
+        "unobserved and unknown-owner work remains unassigned: {split:?}"
+    );
+}
+
+#[test]
+fn resource_cpu_rows_keep_child_charges_separate_from_actual_cpu_without_coalitions() {
+    let reading = |second: u64, children_ms: u64| {
+        let mut shell = proc(200, 100, second * 10, 1, "shell");
+        shell.uid = Some(501);
+        shell.child_cpu_ns = Some(children_ms * 1_000_000);
+        shell.reaps_unwaited = Some(false);
+        let mut s = sample(second, &[second * 100; 4], vec![shell]);
+        s.at_unix_ms = second as i64 * 1000;
+        s.mono_ms = second * 1000;
+        s.self_uid = Some(501);
+        s.cadence_ms = 1000;
+        s
+    };
+    let mut vitals = Vitals::new();
+    vitals.absorb(&reading(10, 0));
+    let snapshot = vitals.absorb(&reading(11, 800));
+    let cpu = snapshot.resource(Resource::Cpu, &[7]);
+    assert!((cpu.tab.now.unwrap() - 0.01).abs() < 0.001, "{cpu:?}");
+    assert!((cpu.aterm.now.unwrap() - 0.01).abs() < 0.001, "{cpu:?}");
+    assert!(
+        (cpu.tab.cpu_charge.unwrap() - 0.81).abs() < 0.001,
+        "{cpu:?}"
+    );
+    assert!(
+        cpu.tab.unread > 0,
+        "unseen descendant charges cannot prove actual CPU"
+    );
+    assert!(
+        (snapshot.tabs[0].scope.cores.raw - 0.01).abs() < 0.001,
+        "process rates still report only live process CPU"
+    );
+    let saved = vitals.saved_strip(true);
+    let mut restored = Vitals::new();
+    restored.restore_strip_history(saved, 12_000);
+    let restored = restored
+        .absorb(&reading(12, 800))
+        .resource(Resource::Cpu, &[7]);
+    assert!(
+        restored.aterm.unread > 0,
+        "a restored floor must remain a floor throughout its window"
+    );
+    assert_eq!(
+        restored.aterm.cpu_charge, cpu.aterm.cpu_charge,
+        "raw charge survives independently of actual CPU"
+    );
+}
+
+#[test]
+fn mixed_live_and_finished_cpu_credit_keeps_the_app_above_its_tabs() {
+    let reading = |second: u64| {
+        let mut first = proc(200, 100, if second == 11 { 500 } else { 0 }, 1, "worker");
+        first.at_ns = Some(if second == 11 {
+            10_500_000_000
+        } else {
+            10_000_000_000
+        });
+        first.uid = Some(501);
+        first.child_cpu_ns = Some(0);
+        let mut second_tab = proc(300, 100, 0, 1, "shell");
+        second_tab.uid = Some(501);
+        second_tab.child_cpu_ns = Some(if second == 11 { 800_000_000 } else { 0 });
+        let mut s = sample(second, &[second * 100; 4], vec![first, second_tab]);
+        s.tabs.push(tab(8, 300, "Tab 2", "shell"));
+        s.at_unix_ms = second as i64 * 1000;
+        s.mono_ms = second * 1000;
+        s.self_uid = Some(501);
+        s.cadence_ms = 1000;
+        s
+    };
+    let mut vitals = Vitals::new();
+    vitals.absorb(&reading(10));
+    let snapshot = vitals.absorb(&reading(11));
+    let cpu = snapshot.resource(Resource::Cpu, &[7]);
+    let sum: f64 = cpu.tabs.iter().filter_map(|(_, fig)| fig.now).sum();
+    assert!((sum - 0.5).abs() < 0.001, "{cpu:?}");
+    assert!(
+        (cpu.aterm.cpu_charge.unwrap() - 1.3).abs() < 0.001,
+        "counter charges use the common one-second window: {cpu:?}"
+    );
+    assert!((cpu.aterm.now.unwrap() - sum).abs() < 0.001, "{cpu:?}");
+}
+
+#[test]
+fn final_native_own_cpu_reaches_resource_rows_when_the_coalition_lane_is_off() {
+    let reading = |second: u64| {
+        let mut shell = proc(200, 100, second * 10, 1, "shell");
+        shell.uid = Some(501);
+        shell.child_cpu_ns = Some(0);
+        let mut s = sample(second, &[second * 100; 4], vec![shell]);
+        s.at_unix_ms = second as i64 * 1000;
+        s.mono_ms = second * 1000;
+        s.self_uid = Some(501);
+        s.cadence_ms = 1000;
+        s.native_cpu_cut = NativeCpuCut {
+            continuous_ns: Some(second * 1_000_000_000),
+            boot: Some(if second == 10 { 500 } else { 1500 }),
+        };
+        s
+    };
+    let mut vitals = Vitals::new();
+    vitals.absorb(&reading(10));
+    let mut end = reading(11);
+    end.native_terminals.push(NativeTerminal {
+        timing: NativeCpuWindow {
+            previous: reading(10).native_cpu_cut,
+            current: end.native_cpu_cut,
+            exited_ns: Some(10_500_000_000),
+        },
+        host: crate::delegated::ProcessKey { pid: 100, start: 1 },
+        seq: 1,
+        tab: Some(7),
+        process: ProcSample {
+            pid: 300,
+            ppid: 100,
+            start: Some(1000),
+            uid: Some(501),
+            cpu_ns: Some(200_000_000),
+            child_cpu_ns: Some(0),
+            reaps_unwaited: Some(false),
+            state: ProcState::Zombie,
+            ..ProcSample::default()
+        },
+        wait_cpu_ns: Some(200_000_000),
+    });
+    let snapshot = vitals.absorb(&end);
+    let cpu = snapshot.resource(Resource::Cpu, &[7]);
+    assert!((cpu.tab.now.unwrap() - 0.21).abs() < 0.001, "{cpu:?}");
+    assert!((snapshot.scoped_cpu.unwrap().all_actual() - 0.21).abs() < 0.001);
+}
+
+#[test]
+fn current_app_coalition_cpu_reaches_the_resource_bar_while_tab_charge_stays_separate() {
+    let mut scene = crate::explain::fixtures::claude_reaped_1032();
+    scene.unanswered = 0;
+    let mut vitals = Vitals::new();
+    vitals.absorb(&scene.reading(0, true));
+    let snapshot = vitals.absorb(&scene.reading(1_000, true));
+    let measured = snapshot.scoped_cpu.as_ref().unwrap();
+    assert_eq!(measured.app_measured, Some(3.4));
+    assert!(
+        !measured.app_incomplete,
+        "tab attribution ambiguity does not erase proved app ownership: {measured:?}"
+    );
+    let cpu = snapshot.resource(Resource::Cpu, &[1]);
+    assert!((cpu.aterm.now.unwrap() - 3.4).abs() < 0.001, "{cpu:?}");
+    assert_eq!(
+        cpu.aterm.unread, 0,
+        "the coalition measured all app CPU despite the unknown tab split"
+    );
+    assert!(
+        (cpu.tab.now.unwrap() - 0.2).abs() < 0.001,
+        "the tab retains independently proved work: {cpu:?}"
+    );
+    assert!(
+        (cpu.tab.cpu_charge.unwrap() - 3.2).abs() < 0.001,
+        "inherited charge remains an explicit diagnostic"
+    );
+    assert!(cpu.tab.unread > 0);
+
+    let later = vitals.absorb(&scene.reading(2_000, false));
+    let current = later.scoped_cpu.as_ref().unwrap();
+    assert_eq!(
+        current.app_measured, None,
+        "carried explanation facts cannot masquerade as a new app measurement"
+    );
+    assert!((current.all_actual() - 0.4).abs() < 0.001, "{current:?}");
+}
+
+#[test]
+fn app_measurements_must_match_the_resource_rows_whole_window() {
+    let mut scene = crate::explain::fixtures::claude_reaped_1032();
+    scene.unanswered = 0;
+    let mut vitals = Vitals::new();
+    vitals.absorb(&scene.reading(0, true));
+    vitals.absorb(&scene.reading(4_000, false));
+    let snapshot = vitals.absorb(&scene.reading(5_000, true));
+    assert_eq!(snapshot.why.as_ref().unwrap().window_ns, 5_000_000_000);
+    let current = snapshot.scoped_cpu.as_ref().unwrap();
+    assert_eq!(current.window_ns, 1_000_000_000);
+    assert_eq!(
+        current.app_measured, None,
+        "a five-second coalition average cannot replace a one-second bar reading"
+    );
+    assert!((current.all_actual() - 0.4).abs() < 0.001, "{current:?}");
+}
+
+#[test]
+fn current_app_coalition_footprint_reaches_the_bar_and_scope_despite_unread_process_memory() {
+    let mut scene = crate::explain::fixtures::claude_reaped_1032();
+    scene.coalitions.retain(|coalition| coalition.id == 1342);
+    scene.coalitions[0].footprint = Some(256 << 20);
+    scene.procs.retain(|process| process.coalition == 1342);
+    scene.unanswered = 0;
+    let reading = |at, coalitions| {
+        let mut sample = scene.reading(at, coalitions);
+        sample
+            .procs
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|process| process.pid == scene.self_pid)
+            .unwrap()
+            .footprint = None;
+        sample
+    };
+    let mut vitals = Vitals::new();
+    vitals.absorb(&reading(0, true));
+    let snapshot = vitals.absorb(&reading(1_000, true));
+    let app = snapshot.aterm.as_ref().unwrap();
+    assert_eq!(app.footprint, Some(256 << 20));
+    assert_eq!(
+        app.footprint_unread, 0,
+        "the complete kernel charge covers unread process charges"
+    );
+    assert_eq!(
+        snapshot.memory_owners.unwrap().aterm.bytes,
+        48 << 20,
+        "the independent swept process inventory stays available"
+    );
+    let memory = snapshot.resource(Resource::Memory, &[1]);
+    assert_eq!(memory.aterm.now, Some((256 << 20) as f64));
+    assert_eq!(memory.aterm.unread, 0);
+    assert_eq!(memory.tab.now, Some((32 << 20) as f64));
+    let later = vitals.absorb(&reading(2_000, false));
+    assert_eq!(
+        later.aterm.as_ref().unwrap().footprint,
+        Some(48 << 20),
+        "an old coalition footprint cannot masquerade as a new measurement"
+    );
+    assert!(later.aterm.as_ref().unwrap().footprint_unread > 0);
+}
+
+#[test]
+fn a_smaller_coalition_footprint_does_not_erase_independently_observed_app_memory() {
+    let mut scene = crate::explain::fixtures::claude_reaped_1032();
+    scene.coalitions.retain(|coalition| coalition.id == 1342);
+    scene.coalitions[0].footprint = Some(16 << 20);
+    scene.procs.retain(|process| process.coalition == 1342);
+    scene.unanswered = 0;
+    let mut vitals = Vitals::new();
+    vitals.absorb(&scene.reading(0, true));
+    let snapshot = vitals.absorb(&scene.reading(1_000, true));
+    assert_eq!(snapshot.aterm.as_ref().unwrap().footprint, Some(64 << 20));
+    assert!(snapshot.aterm.as_ref().unwrap().footprint_unread > 0);
+    let memory = snapshot.resource(Resource::Memory, &[1]);
+    assert_eq!(memory.aterm.now, Some((64 << 20) as f64));
+    assert!(
+        memory.aterm.unread > 0,
+        "different kernel read cuts cannot support an exact reconciled total"
+    );
+}
+
+#[test]
+fn current_foreign_memory_ownership_does_not_inherit_cpu_window_uncertainty() {
+    use crate::explain::{CoalRow, CoalSplit, Part};
+    let mut split = CoalSplit {
+        ownership_incomplete: true,
+        listed: 2,
+        rows: vec![
+            CoalRow {
+                footprint: Some(64),
+                footprint_aterm: true,
+                ..CoalRow::default()
+            },
+            CoalRow {
+                part: Part::Others,
+                ownership_mixed: true,
+                footprint: Some(128),
+                footprint_outside: Some(Part::Services),
+                live: 2,
+                ..CoalRow::default()
+            },
+        ],
+        ..CoalSplit::default()
+    };
+    let owners = MemoryOwners::of_coalitions(&split, false);
+    assert_eq!(
+        (
+            owners.aterm.bytes,
+            owners.others.bytes,
+            owners.services.bytes,
+            owners.unknown.bytes
+        ),
+        (64, 0, 128, 0)
+    );
+    assert!(
+        !owners.ownership_incomplete,
+        "unmapped past CPU cannot erase a complete current footprint ownership proof"
+    );
+    split.rows[1].footprint_outside = None;
+    let unknown = MemoryOwners::of_coalitions(&split, false);
+    assert_eq!((unknown.services.bytes, unknown.unknown.bytes), (0, 128));
+    assert!(
+        unknown.ownership_incomplete,
+        "a missing current owner proof still stays unknown"
+    );
+    split.rows[1].footprint_outside = Some(Part::Services);
+    split.rows[1].owned_footprint = MemoryCharge {
+        bytes: 32,
+        members: 1,
+        unread: 1,
+    };
+    let unread = MemoryOwners::of_coalitions(&split, false);
+    assert_eq!(
+        (
+            unread.aterm.bytes,
+            unread.services.bytes,
+            unread.unknown.bytes
+        ),
+        (64, 0, 128),
+        "a current foreign part does not permit subtracting unread app members"
+    );
+    split.rows[1].footprint = Some(0);
+    split.rows[1].footprint_ownership_incomplete = true;
+    let empty = MemoryOwners::of_coalitions(&split, false);
+    assert_eq!(empty.aterm.bytes, 64);
+    assert_eq!(empty.unknown.bytes, 0);
+    assert!(
+        !empty.ownership_incomplete,
+        "a known zero charge cannot hide any owner's memory even when its former owner is unknown"
+    );
+}
+
+#[test]
+fn historical_native_source_loss_bounds_cpu_without_tainting_current_memory() {
+    let mut scene = crate::explain::fixtures::spotlight_1032();
+    scene.coalitions.retain(|coalition| coalition.id == 1342);
+    scene.coalitions[0].footprint = Some(128 << 20);
+    scene.procs.retain(|process| process.coalition == 1342);
+    scene.unanswered = 0;
+    for lane in [crate::explain::CoalLane::On, crate::explain::CoalLane::Off] {
+        for lost in [false, true] {
+            let mut vitals = Vitals::new();
+            let mut first = scene.reading(0, lane.on());
+            first.coal_lane = lane;
+            vitals.absorb(&first);
+            let mut next = scene.reading(1_000, lane.on());
+            next.coal_lane = lane;
+            next.native_source_lost = lost;
+            let snapshot = vitals.absorb(&next);
+            assert_eq!(
+                snapshot.resource(Cpu, &[1]).aterm.unread > 0,
+                lost,
+                "{lane:?}"
+            );
+            assert_eq!(
+                snapshot.resource(Cpu, &[1]).tab.unread > 0,
+                lost,
+                "{lane:?}: logical tab coverage"
+            );
+            assert_eq!(snapshot.aterm.as_ref().unwrap().footprint_unread, 0);
+            assert_eq!(snapshot.resource(Memory, &[1]).aterm.unread, 0);
+            assert_eq!(snapshot.resource(Memory, &[1]).tab.unread, 0);
+            assert!(!snapshot.memory_owners.unwrap().ownership_incomplete);
+            let facts = snapshot.why.as_ref().unwrap();
+            assert_eq!(facts.provenance_incomplete, lost);
+            assert!(!facts.memory_provenance_incomplete);
+        }
+    }
+}
+
+#[test]
+fn a_closed_panes_orphan_stays_in_its_logical_tab_without_becoming_another_panes_cpu() {
+    let reading = |second: u64| {
+        let mut processes = vec![
+            proc(200, 100, 0, 1, "shell"),
+            proc(
+                301,
+                if second < 12 { 300 } else { 1 },
+                second.saturating_sub(10) * 200,
+                1,
+                "worker",
+            ),
+        ];
+        if second < 12 {
+            processes.push(proc(300, 100, 0, 1, "shell"));
+        }
+        for p in &mut processes {
+            p.uid = Some(501);
+            p.child_cpu_ns = Some(0);
+        }
+        let mut s = sample(second, &[second * 100; 4], processes);
+        if second < 12 {
+            s.tabs.push(TabRoot {
+                tab: 7,
+                tab_id: Some(7),
+                ..tab(8, 300, "Tab 1", "")
+            });
+        }
+        s.at_unix_ms = second as i64 * 1000;
+        s.mono_ms = second * 1000;
+        s.self_uid = Some(501);
+        s.cadence_ms = 1000;
+        s
+    };
+    let mut vitals = Vitals::new();
+    vitals.absorb(&reading(10));
+    vitals.absorb(&reading(11));
+    let snapshot = vitals.absorb(&reading(12));
+    let cpu = snapshot.scoped_cpu.as_ref().unwrap();
+    assert!((cpu.tabs[0].actual() - 0.2).abs() < 0.001, "{cpu:?}");
+    assert_eq!(cpu.panes.len(), 1);
+    assert_eq!(
+        cpu.panes[0].floor, 0.0,
+        "the surviving pane did none of that work"
+    );
+    assert!(
+        snapshot
+            .resource(Resource::Cpu, &[7])
+            .tab
+            .now
+            .is_some_and(|cpu| cpu > 0.19)
+    );
+    assert_eq!(
+        snapshot.resources[Resource::Cpu.index()].tabs[0].1.now,
+        Some(0.0)
+    );
+}
+
+#[test]
+fn a_prior_tail_without_scope_coverage_cannot_restore_an_exact_reading() {
+    let mut saved = SavedStrip::default();
+    let mut sample = Agg::default();
+    sample.add(0.4, 1000, false);
+    assert!(saved.replay(StripLine {
+        k: 10,
+        wall_ms: 100_000,
+        caps: [None; 7],
+        rings: vec![(9, sample), (11, sample)],
+        proc_starts: None,
+        time_gaps: Vec::new(),
+        strip_events: Vec::new()
+    }));
+    assert_eq!(saved.aterm[0].buckets[0].1.mean, 0.4);
+    assert_eq!(saved.aterm_unread[0].buckets[0].1.mean, 1.0);
+    assert_eq!(saved.aterm_unread[1].buckets[0].1.mean, 1.0);
+    assert!(saved.aterm_cpu_charge.is_empty());
+}
+
 /// The live box (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3): its tick is the largest
 /// reading of the last 10 s and its cap the share of their read time over, the larger
 /// series' on a two-series row; a reading older than the window or ahead of now counts for
@@ -168,6 +636,429 @@ fn tab(key: u64, shell: u32, label: &str, program: &str) -> TabRoot {
         tab_id: Some(key),
         agent_leader: None,
     }
+}
+
+#[test]
+fn reparented_processes_and_their_new_children_keep_the_proved_tab_origin() {
+    let mut vitals = Vitals::new();
+    let sample = Sample {
+        self_pid: 100,
+        tabs: vec![tab(7, 200, "Tab 1", "codex")],
+        ..Sample::default()
+    };
+    let shell = ProcSample {
+        pid: 200,
+        ppid: 100,
+        start: Some(200),
+        ..ProcSample::default()
+    };
+    let child = ProcSample {
+        pid: 201,
+        ppid: 200,
+        start: Some(201),
+        ..ProcSample::default()
+    };
+    let (first, _) = vitals.attribute_owned(&sample, &[shell.clone(), child.clone()]);
+    assert_eq!(first[1].tab, Some(0));
+    let orphan = ProcSample { ppid: 1, ..child };
+    let grandchild = ProcSample {
+        pid: 202,
+        ppid: 201,
+        start: Some(202),
+        ..ProcSample::default()
+    };
+    let (next, _) = vitals.attribute_owned(&sample, &[shell, orphan.clone(), grandchild]);
+    assert!(next.iter().all(|m| m.tab == Some(0) && !m.shared));
+    let reused = ProcSample {
+        start: Some(999),
+        ..orphan
+    };
+    let (last, _) = vitals.attribute_owned(&sample, &[reused]);
+    assert_eq!(
+        last[0],
+        Membership::default(),
+        "a reused PID inherits no origin"
+    );
+}
+
+#[test]
+fn natural_origin_handoff_keeps_dormant_proofs_until_generation_can_be_checked() {
+    let sample = Sample {
+        self_pid: 100,
+        tabs: vec![tab(7, 200, "Tab 1", "codex")],
+        ..Sample::default()
+    };
+    let child = ProcSample {
+        pid: 201,
+        ppid: 200,
+        start: Some(201),
+        ..ProcSample::default()
+    };
+    let mut previous = Vitals::new();
+    previous.attribute_owned(&sample, std::slice::from_ref(&child));
+    let (origins, truncated) = previous.process_origins();
+    assert!(!truncated);
+    let orphan = ProcSample { ppid: 1, ..child };
+    let mut restarted = Vitals::new();
+    restarted.restore_process_origins(&origins);
+    restarted.attribute_owned(
+        &Sample {
+            procs_truncated: true,
+            ..sample.clone()
+        },
+        &[],
+    );
+    let unread = ProcSample {
+        start: None,
+        ..orphan.clone()
+    };
+    let (unproved, _) = restarted.attribute_owned(&sample, &[unread]);
+    assert_eq!(
+        unproved,
+        [Membership::default()],
+        "PID alone cannot use a restored proof"
+    );
+    assert_eq!(
+        restarted.process_origins().0,
+        origins,
+        "an unread generation does not disprove custody"
+    );
+    let (proved, _) = restarted.attribute_owned(&sample, std::slice::from_ref(&orphan));
+    assert_eq!(proved[0].tab, Some(0));
+    let mut control = Vitals::new();
+    assert_eq!(
+        control
+            .attribute_owned(&sample, std::slice::from_ref(&orphan))
+            .0,
+        [Membership::default()]
+    );
+    let reused = ProcSample {
+        start: Some(999),
+        ..orphan
+    };
+    assert_eq!(
+        restarted.attribute_owned(&sample, &[reused]).0,
+        [Membership::default()]
+    );
+    assert!(
+        restarted.process_origins().0.is_empty(),
+        "a proved new generation retires the old proof"
+    );
+    restarted.restore_process_origins(&origins);
+    restarted.attribute_owned(&sample, &[]);
+    assert!(
+        restarted.process_origins().0.is_empty(),
+        "a complete census proves an absent process ended"
+    );
+}
+
+#[test]
+fn unread_restored_origin_marks_cpu_memory_and_explanation_coverage_partial() {
+    let mut vitals = Vitals::new();
+    vitals.restore_process_origins(&[ProcessOrigin {
+        process: crate::delegated::ProcessKey {
+            pid: 201,
+            start: 201,
+        },
+        tab: Some(7),
+        shared: false,
+    }]);
+    let mut sample = Sample {
+        at_ns: 1_000_000_000,
+        at_unix_ms: 1_000,
+        mono_ms: 1_000,
+        cadence_ms: 1_000,
+        self_pid: 100,
+        self_uid: Some(501),
+        tabs: vec![tab(7, 200, "Tab 1", "codex")],
+        cores: Some(vec![Ticks {
+            busy: 10,
+            total: 100,
+        }]),
+        procs: Some(vec![ProcSample {
+            pid: 201,
+            ppid: 1,
+            start: Some(201),
+            uid: Some(501),
+            cpu_ns: Some(10),
+            child_cpu_ns: Some(0),
+            reaps_unwaited: Some(false),
+            footprint: Some(32),
+            ..ProcSample::default()
+        }]),
+        ..Sample::default()
+    };
+    vitals.absorb(&sample);
+    sample.at_ns += 1_000_000_000;
+    sample.at_unix_ms += 1_000;
+    sample.mono_ms += 1_000;
+    sample.cores = Some(vec![Ticks {
+        busy: 20,
+        total: 200,
+    }]);
+    sample.procs.as_mut().unwrap()[0].start = None;
+    let partial = vitals.absorb(&sample);
+    assert!(partial.aterm.as_ref().unwrap().footprint_unread > 0);
+    assert!(partial.tabs[0].scope.footprint_unread > 0);
+    assert!(partial.memory_owners.unwrap().ownership_incomplete);
+    let cpu = partial.scoped_cpu.unwrap();
+    assert_eq!(cpu.window_ns, 1_000_000_000);
+    assert!(cpu.missed);
+    let why = partial.why.unwrap();
+    assert_eq!(why.window_ns, cpu.window_ns);
+    assert!(why.provenance_incomplete);
+    assert_eq!(vitals.process_origins().0.len(), 1);
+    sample.at_ns += 1_000_000_000;
+    sample.at_unix_ms += 1_000;
+    sample.mono_ms += 1_000;
+    sample.cores = Some(vec![Ticks {
+        busy: 30,
+        total: 300,
+    }]);
+    sample.procs.as_mut().unwrap()[0].start = Some(201);
+    let proved = vitals.absorb(&sample);
+    assert_eq!(proved.tabs[0].scope.procs, 1);
+    assert_eq!(proved.tabs[0].scope.footprint_unread, 0);
+    assert!(!proved.memory_owners.unwrap().ownership_incomplete);
+}
+
+#[test]
+fn conflicting_restored_process_origins_do_not_choose_a_scope() {
+    let claim = ProcessOrigin {
+        process: crate::delegated::ProcessKey {
+            pid: 201,
+            start: 201,
+        },
+        tab: Some(7),
+        shared: false,
+    };
+    let mut same = Vitals::new();
+    same.restore_process_origins(&[claim, claim]);
+    assert_eq!(same.process_origins(), (vec![claim], false));
+    let mut conflicting = Vitals::new();
+    conflicting.restore_process_origins(&[
+        claim,
+        ProcessOrigin {
+            tab: Some(8),
+            ..claim
+        },
+        claim,
+    ]);
+    assert!(conflicting.process_origins().0.is_empty());
+    assert!(conflicting.process_origins().1);
+    let sample = Sample {
+        self_pid: 100,
+        tabs: vec![tab(7, 200, "Tab 1", "sh"), tab(8, 300, "Tab 2", "sh")],
+        ..Sample::default()
+    };
+    let (membership, _) = conflicting.attribute_owned(
+        &sample,
+        &[ProcSample {
+            pid: 201,
+            ppid: 1,
+            start: Some(201),
+            ..ProcSample::default()
+        }],
+    );
+    assert_eq!(membership, [Membership::default()]);
+}
+
+#[test]
+fn shared_roots_include_descendants_but_current_tabs_take_priority() {
+    let mut vitals = Vitals::new();
+    let mut sample = Sample {
+        self_pid: 100,
+        tabs: vec![tab(7, 200, "Tab 1", "codex")],
+        shared_roots: vec![
+            SharedRoot {
+                pid: 300,
+                start: Some(300),
+                version: None,
+            },
+            SharedRoot {
+                pid: 201,
+                start: Some(201),
+                version: None,
+            },
+        ],
+        ..Sample::default()
+    };
+    let processes = [
+        ProcSample {
+            pid: 300,
+            ppid: 1,
+            start: Some(300),
+            ..ProcSample::default()
+        },
+        ProcSample {
+            pid: 301,
+            ppid: 300,
+            start: Some(301),
+            ..ProcSample::default()
+        },
+        ProcSample {
+            pid: 201,
+            ppid: 200,
+            start: Some(201),
+            ..ProcSample::default()
+        },
+    ];
+    let (members, _) = vitals.attribute_owned(&sample, &processes);
+    assert!(
+        members[..2]
+            .iter()
+            .all(|m| m.aterm && m.shared && m.tab.is_none())
+    );
+    assert_eq!(members[2].tab, Some(0));
+    assert!(!members[2].shared);
+    sample.shared_roots[0].start = Some(999);
+    let mut fresh = Vitals::new();
+    let (members, _) = fresh.attribute_owned(&sample, &processes);
+    assert_eq!(members[0], Membership::default());
+    assert_eq!(members[1], Membership::default());
+}
+
+#[test]
+fn shared_root_pid_version_proves_a_system_process_with_no_resource_start() {
+    let mut vitals = Vitals::new();
+    let sample = Sample {
+        shared_roots: vec![SharedRoot {
+            pid: 900,
+            start: None,
+            version: Some(12),
+        }],
+        ..Sample::default()
+    };
+    let mut p = ProcSample {
+        pid: 900,
+        version: Some(12),
+        ..ProcSample::default()
+    };
+    let (m, _) = vitals.attribute_owned(&sample, &[p.clone()]);
+    assert!(m[0].aterm && m[0].shared);
+    p.version = Some(13);
+    let (m, _) = vitals.attribute_owned(&sample, &[p]);
+    assert_eq!(m[0], Membership::default());
+}
+
+#[test]
+fn an_unproved_shell_root_cannot_report_exact_zero_cpu_or_memory() {
+    let mut vitals = Vitals::new();
+    let mut first = sample(10, &[0, 0, 0, 0], Vec::new());
+    first.self_uid = Some(501);
+    first.cadence_ms = 1000;
+    first.tabs[0].shell_pid = 0;
+    first.unproved_tabs.push(first.tabs[0].key);
+    let _ = vitals.absorb(&first);
+    let mut second = first;
+    second.at_ns += 1_000_000_000;
+    second.at_unix_ms += 1000;
+    second.mono_ms += 1000;
+    let snap = vitals.absorb(&second);
+    let tab = &snap.tabs[0].scope;
+    assert_eq!(tab.refused, 0, "no actual process CPU read was refused");
+    assert_eq!(tab.footprint_unread, 1);
+    let figure = snap.resource(Resource::Cpu, &[7]).tab;
+    assert!(figure.now.is_none() || figure.unread > 0);
+    assert!(
+        snap.scoped_cpu.is_some(),
+        "exercise the logical-tab account as well as live scope coverage"
+    );
+}
+
+#[test]
+fn native_original_roots_prove_natural_tab_custody_before_shared_app_overhead() {
+    use crate::delegated::ProcessKey;
+    let mut sample = Sample {
+        self_pid: 100,
+        tabs: vec![tab(7, 200, "Tab 1", "codex")],
+        shared_roots: vec![SharedRoot {
+            pid: 300,
+            start: Some(300),
+            version: None,
+        }],
+        native_roots: vec![NativeRoot {
+            process: ProcessKey {
+                pid: 300,
+                start: 300,
+            },
+            tab: Some(7),
+        }],
+        ..Sample::default()
+    };
+    let processes = [
+        ProcSample {
+            pid: 300,
+            ppid: 1,
+            start: Some(300),
+            ..ProcSample::default()
+        },
+        ProcSample {
+            pid: 301,
+            ppid: 300,
+            start: Some(301),
+            ..ProcSample::default()
+        },
+    ];
+    let mut vitals = Vitals::new();
+    let (membership, jobs) = vitals.attribute_owned(&sample, &processes);
+    assert!(
+        membership
+            .iter()
+            .all(|m| m.aterm && !m.shared && m.tab == Some(0))
+    );
+    assert!(
+        jobs.iter().all(Option::is_none),
+        "natural counters participate in reap credit"
+    );
+    sample.shared_roots.clear();
+    sample.native_roots[0].process.start = 999;
+    let mut fresh = Vitals::new();
+    let (membership, _) = fresh.attribute_owned(&sample, &processes);
+    assert!(
+        membership.iter().all(|m| *m == Membership::default()),
+        "a reused PID inherits no actor root"
+    );
+    sample.native_roots[0].process.start = 300;
+    sample.native_roots.push(NativeRoot {
+        process: ProcessKey {
+            pid: 300,
+            start: 300,
+        },
+        tab: Some(8),
+    });
+    let (membership, _) = fresh.attribute_owned(&sample, &processes);
+    assert!(
+        membership.iter().all(|m| *m == Membership::default()),
+        "conflicting source sessions prove no tab"
+    );
+}
+
+#[test]
+fn an_old_parent_pid_cannot_link_a_child_to_a_newer_tab_process() {
+    let tabs = [tab(7, 200, "Tab 1", "codex")];
+    let mut procs = [
+        ProcSample {
+            pid: 200,
+            start: Some(200),
+            ..ProcSample::default()
+        },
+        ProcSample {
+            pid: 300,
+            ppid: 200,
+            start: Some(300),
+            ..ProcSample::default()
+        },
+        ProcSample {
+            pid: 301,
+            ppid: 300,
+            start: Some(100),
+            ..ProcSample::default()
+        },
+    ];
+    assert_eq!(attribute(&procs, 1, &tabs)[2], Membership::default());
+    procs[2].start = Some(301);
+    assert_eq!(attribute(&procs, 1, &tabs)[2].tab, Some(0));
 }
 
 #[test]
@@ -348,7 +1239,9 @@ fn conflicting_explicit_claims_are_not_counted_twice() {
             members: vec![key],
         },
     ];
-    let (membership, jobs) = attribute_delegated(&[process], 100, &[], &jobs);
+    let processes = std::slice::from_ref(&process);
+    let (membership, jobs) =
+        attribute_delegated(processes, &[], &jobs, attribute(processes, 100, &[]));
     assert_eq!(membership, vec![Membership::default()]);
     assert_eq!(jobs, vec![None]);
 }
@@ -380,6 +1273,7 @@ fn attribution_follows_parent_chains_to_aterm_and_the_nearest_tab() {
         by_pid[&100],
         Membership {
             aterm: true,
+            shared: false,
             tab: None
         }
     );
@@ -387,6 +1281,7 @@ fn attribution_follows_parent_chains_to_aterm_and_the_nearest_tab() {
         by_pid[&202],
         Membership {
             aterm: true,
+            shared: false,
             tab: Some(0)
         }
     );
@@ -394,6 +1289,7 @@ fn attribution_follows_parent_chains_to_aterm_and_the_nearest_tab() {
         by_pid[&301],
         Membership {
             aterm: true,
+            shared: false,
             tab: Some(1)
         }
     );
@@ -401,6 +1297,7 @@ fn attribution_follows_parent_chains_to_aterm_and_the_nearest_tab() {
         by_pid[&400],
         Membership {
             aterm: true,
+            shared: false,
             tab: Some(2)
         }
     );
@@ -563,7 +1460,12 @@ fn the_busiest_program_counts_every_process_of_its_name() {
     assert!((b.cores - 5.4).abs() < 1e-4, "{b:?}");
     let mut mixed = procs(1_200, 4_000);
     mixed[3].ppid = 1;
-    let s = v.absorb(&sample(12, &[0, 0, 200, 200], mixed));
+    mixed[3].start = Some(999);
+    let _ = v.absorb(&sample(12, &[0, 0, 200, 200], mixed));
+    let mut mixed = procs(1_800, 6_000);
+    mixed[3].ppid = 1;
+    mixed[3].start = Some(999);
+    let s = v.absorb(&sample(13, &[0, 0, 300, 300], mixed));
     let b = s.facts.busiest.expect("a busy program");
     assert_eq!((b.n, b.scope), (9, None));
 }
@@ -689,6 +1591,7 @@ fn the_programs_kept_are_every_aterm_group_and_the_machines_busiest_and_largest(
         n: 1,
         cores,
         footprint: Some(footprint as u64),
+        footprint_unread: 0,
         born_ms: None,
         unborn: 1,
     };
@@ -721,6 +1624,37 @@ fn the_programs_kept_are_every_aterm_group_and_the_machines_busiest_and_largest(
     assert!(
         !others.contains(&neither.as_str()),
         "neither busy nor large"
+    );
+}
+
+#[test]
+fn a_large_idle_tab_worker_survives_the_process_and_program_display_caps() {
+    let workers = |cpu_ms| {
+        (0..=ATERM_ROWS)
+            .map(|i| {
+                let idle = i == ATERM_ROWS;
+                proc(
+                    1000 + i as u32,
+                    200,
+                    if idle { 0 } else { cpu_ms },
+                    if idle { 8192 } else { 1 },
+                    &format!("worker{i}"),
+                )
+            })
+            .collect()
+    };
+    let mut vitals = Vitals::new();
+    vitals.absorb(&sample(10, &[100; 4], workers(0)));
+    let snapshot = vitals.absorb(&sample(11, &[200; 4], workers(1)));
+    let largest = format!("worker{ATERM_ROWS}");
+    assert!(snapshot.procs.iter().any(|p| p.name == largest));
+    assert!(snapshot.programs.iter().any(|p| p.name == largest));
+    assert!(snapshot.top.iter().all(|p| p.name != largest));
+    assert_eq!(snapshot.procs.len(), ATERM_ROWS);
+    assert_eq!(snapshot.programs.len(), ATERM_ROWS);
+    assert_eq!(
+        snapshot.aterm.unwrap().footprint,
+        Some((8192 + ATERM_ROWS as u64) << 20)
     );
 }
 
@@ -2083,7 +3017,7 @@ fn a_closed_tab_takes_its_run_with_it() {
 }
 
 /// Tab 1 split in two panes, one opened 200 s in, with a 50 s gap in the sweeps: "this tab"
-/// is both panes summed cell by cell, hollow only where no pane read, never past all tabs.
+/// is both panes summed cell by cell, hollow only where no pane read.
 #[test]
 fn a_split_tab_reads_its_panes_summed() {
     let split = |i: u64| {
@@ -2217,6 +3151,68 @@ fn a_split_tab_reads_its_panes_summed() {
         "the focused pane names it"
     );
     assert_eq!(s.tab_of(&[99]), None);
+}
+
+#[test]
+fn a_new_large_memory_pane_keeps_its_figure_when_the_app_has_a_longer_read_history() {
+    let mut vitals = Vitals::new();
+    let mut snapshot = Snapshot::default();
+    for second in 0..=9 {
+        let mut sample = at(second * 1_000, 1_000);
+        let procs = sample.procs.as_mut().expect("swept");
+        procs.retain(|process| process.pid != 201);
+        for process in procs.iter_mut() {
+            process.footprint = Some(if process.pid == 100 {
+                1 << 20
+            } else if second < 5 {
+                100 << 20
+            } else {
+                10 << 20
+            });
+        }
+        if second == 9 {
+            sample.tabs.push(TabRoot {
+                tab: 7,
+                ..tab(8, 300, "Tab 1", "worker")
+            });
+            procs.push(ProcSample {
+                uid: Some(501),
+                ..proc(300, 100, 0, 10 * 1024, "worker")
+            });
+        }
+        snapshot = vitals.absorb(&sample);
+    }
+    let older = snapshot.resource(Memory, &[7]).tab;
+    let newer = snapshot.resource(Memory, &[8]).tab;
+    let combined = snapshot.resource(Memory, &[7, 8]);
+    let sum = older.now.unwrap() + newer.now.unwrap();
+    assert!(
+        sum > combined.aterm.now.unwrap(),
+        "the new pane's mean covers less time than the app's"
+    );
+    assert!(
+        close(combined.tab.now, sum),
+        "each independently measured pane figure must survive the tab sum"
+    );
+    assert_eq!(snapshot.resource(Memory, &[8, 7]).tab, combined.tab);
+    let last = |fig: &ScopeFig| *fig.run.last().expect("the current history cell");
+    let (older, newer, tab, app) = (
+        last(&older),
+        last(&newer),
+        last(&combined.tab),
+        last(&combined.aterm),
+    );
+    let mean = older.mean.unwrap() + newer.mean.unwrap();
+    let max = older.max.unwrap() + newer.max.unwrap();
+    assert!(
+        mean > app.mean.unwrap() && max > app.max.unwrap(),
+        "different coverage and noncoincident peaks must exercise both former caps"
+    );
+    assert!(close(tab.mean, mean));
+    assert!(
+        close(tab.max, max),
+        "the sum of pane peaks remains an upper bound"
+    );
 }
 
 /// Two panes at 10% each, each within the Mac's 12%, sum past it, so the split tab's GPU

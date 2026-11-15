@@ -2,9 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 use crate::supervise::journal::{AGAIN_ADOPTED, AGAIN_RETRY, AGAIN_UNPARKED};
-use crate::supervise::policy::turn_end::{
-    DONE_CHECK, LAND, LAND_CHECK, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_CHECK,
-    RULE_LAND_NUDGE, RULE_LEFT,
+use alab_policy::{
+    land_check::{LAND_CHECK, RULE_LAND_CHECK},
+    words::{
+        DONE_CHECK, LAND, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE, RULE_LEFT,
+    },
 };
 
 fn worked(said: &str) -> Vec<String> {
@@ -783,7 +785,10 @@ const MIN_LOOP: Duration = Duration::from_secs(60);
 #[test]
 fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() {
     let land = SupervisorConfig {
-        autopilot: Autopilot::Land,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot: Autopilot::Land,
+            ..owners_policy().turn_end.clone()
+        },
         ..owners_policy()
     };
     let mut m = Mock::new(vec![
@@ -802,7 +807,10 @@ fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() 
     assert_eq!(count(&m, "meta"), 1, "{:#?}", m.requests);
 
     let off = SupervisorConfig {
-        autopilot: Autopilot::Off,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot: Autopilot::Off,
+            ..owners_policy().turn_end.clone()
+        },
         ..owners_policy()
     };
     let mut m = Mock::new(vec![
@@ -825,7 +833,10 @@ fn the_table_decides_a_session_with_no_word_and_a_word_decides_over_the_table() 
 #[test]
 fn the_autopilot_word_is_read_past_who_set_it() {
     let land = SupervisorConfig {
-        autopilot: Autopilot::Land,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot: Autopilot::Land,
+            ..alab_policy::config::PolicyConfig::default()
+        },
         ..SupervisorConfig::default()
     };
     let opts = under(land);
@@ -940,7 +951,10 @@ fn an_autopilot_off_parks_the_loop_until_the_word_changes() {
     assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
 
     let off = SupervisorConfig {
-        autopilot: Autopilot::Off,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot: Autopilot::Off,
+            ..owners_policy().turn_end.clone()
+        },
         ..owners_policy()
     };
     let mut m = Mock::new(script());
@@ -1783,7 +1797,7 @@ fn a_limit_badge_is_a_wait_only_where_the_loop_waits_it_out() {
 #[test]
 fn the_taps_reset_retimes_the_limit_episode_and_its_raised_badge() {
     let message = "You've hit your session limit";
-    let kind = aterm_phase::WallKind::UsageSession;
+    let kind = alab_policy::vocab::WallKind::UsageSession;
     let key = crate::supervise::approvals::wall_reset_key(kind, None);
     let run = |held: Option<i64>, tap: i64, raised: bool| {
         let mut m = Mock::new(vec![limited_screen()]);
@@ -2142,7 +2156,10 @@ fn a_loop_behind_another_holder_reads_the_word_and_its_park_ends_on_it() {
         let opts = SuperviseOpts {
             journal: Some(journal.clone()),
             ..under(SupervisorConfig {
-                autopilot: Autopilot::Off,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Off,
+                    ..owners_policy().turn_end.clone()
+                },
                 ..owners_policy()
             })
         };

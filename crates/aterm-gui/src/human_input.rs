@@ -671,8 +671,7 @@ impl crate::session_log::KeyClass {
     /// The class of `ev`, a person's gesture or a control verb's event (fix E8): a plain press of
     /// Enter, Escape or a digit `1`-`9` (Caps or Num Lock aside), one character of text, or the
     /// bytes [`Self::of_bytes`] places; anything else is [`Self::Other`]. It lives on the input
-    /// side, so the session log takes a key's class and never names an event (census
-    /// `slog-inert`).
+    /// side, so the session log takes a key's class and never names an event.
     pub(crate) fn of_event(ev: &InputEvent) -> Self {
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
         match ev {

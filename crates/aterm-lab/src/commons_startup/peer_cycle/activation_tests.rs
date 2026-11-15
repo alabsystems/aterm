@@ -42,15 +42,15 @@ fn activation_keeps_the_owned_kernel_birth_parent_and_image() {
 
 #[test]
 fn activation_uses_the_unique_live_session_in_the_verified_logical_window() {
-    let row = "0 s-ab12 - alive shell nonce=0123456789abcdef0123456789abcdef window=0 active=1 wfocus=0\n";
+    let row = "0 t000000ab12 - alive shell nonce=0123456789abcdef0123456789abcdef window=0 active=1 wfocus=0\n";
     let selected = session(row, 0).unwrap();
-    assert_eq!(selected.sid, "s-ab12");
+    assert_eq!(selected.sid, "t000000ab12");
     assert_ne!(selected, session(&row.replace("0123", "4321"), 0).unwrap());
     for wrong in [
         row.replace("window=0", "window=42"),
         row.replace("active=1", "active=0"),
         row.replace("alive", "exited"),
-        row.replace("s-ab12", "guessed-session"),
+        row.replace("t000000ab12", "guessed-session"),
         row.replace("0123456789abcdef0123456789abcdef", "missing"),
         format!("{row}{row}"),
         row.replace("window=0", "window=0 window=42"),

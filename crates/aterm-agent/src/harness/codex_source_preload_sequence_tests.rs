@@ -235,3 +235,30 @@ fn bounded_resample_receipts_never_reexecute_evicted_predecessors() {
         Ok(ResampleAdmission::Read)
     ));
 }
+
+#[test]
+fn sdk_construction_requires_the_exact_completed_ready_report() {
+    // Ledger DATA fixture only; this issues no native member or Source grant.
+    let process = Process::observe(std::process::id()).unwrap();
+    let preload = attempt(1);
+    let registration = "a".repeat(32);
+    let role = ReadyRole::PolicyUnavailable;
+    let mut ledger = Ledger::new(process.clone(), preload.clone());
+    ledger
+        .loaded(&preload, &registration, 1, &"b".repeat(64))
+        .unwrap();
+    assert!(!ledger.completed_ready(&process, &preload.operation, &registration, Some(role)));
+    ledger.accept_ready(&preload, &registration, role).unwrap();
+    assert!(!ledger.completed_ready(&process, &preload.operation, &registration, Some(role)));
+    ledger.complete(&preload, &registration).unwrap();
+    assert!(ledger.completed_ready(&process, &preload.operation, &registration, Some(role)));
+    // A member-open nonce cannot replace the accepted preload operation.
+    assert!(!ledger.completed_ready(&process, &"f".repeat(32), &registration, Some(role)));
+    assert!(!ledger.completed_ready(&process, &preload.operation, &"c".repeat(32), Some(role)));
+    assert!(!ledger.completed_ready(&process, &preload.operation, &registration, None));
+    let mut foreign = process.clone();
+    foreign.birth += 1;
+    assert!(!ledger.completed_ready(&foreign, &preload.operation, &registration, Some(role)));
+    ledger.fence(&process, retirement(&preload)).unwrap();
+    assert!(!ledger.completed_ready(&process, &preload.operation, &registration, Some(role)));
+}

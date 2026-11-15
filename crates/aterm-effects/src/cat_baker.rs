@@ -1665,6 +1665,14 @@ impl BakeKeyV4 {
     #[inline]
     #[must_use]
     pub fn bake(&self) -> Tile {
+        if let Some(glide) = self.glide() {
+            let mut tile = Tile::new(
+                u32::from(self.w) + u32::from(PATCH_STRIP),
+                u32::from(self.h),
+            );
+            paint_glide_onto(&mut tile, &glide);
+            return tile;
+        }
         bake_variant_with(
             self.variant,
             self.accessory,
@@ -1675,6 +1683,31 @@ impl BakeKeyV4 {
         )
     }
 
+    /// The flying cat's collectible, `spec_stretch`, is the pet's glide (its art is `pet_fly`'s
+    /// twin): it is baked by the pet's own baker in the face its eyes name, so the Kitty Log's
+    /// hello and the word peek draw the cat that flies, at the pet's level of detail. A head
+    /// accessory has no anchor on a body, so none is drawn. `None` for every other glyph.
+    #[inline]
+    #[must_use]
+    pub const fn glide(&self) -> Option<crate::pet_baker::PetBakeKey> {
+        if !matches!(self.variant, CatGlyphId::SpecStretch) {
+            return None;
+        }
+        let faces = crate::kitty_pet::glide_faces(crate::kitty_pet::PetSpecies::Cat);
+        Some(crate::pet_baker::PetBakeKey {
+            pose: match self.eyes {
+                EyesFrame::Open => faces.fly,
+                EyesFrame::Happy => faces.happy,
+                EyesFrame::Blink => faces.blink,
+            },
+            coat: self.coat,
+            iris: self.iris,
+            colors: self.colors,
+            w: self.w,
+            h: self.h,
+        })
+    }
+
     #[inline]
     fn bake_scratch<'a>(
         &self,
@@ -1683,6 +1716,11 @@ impl BakeKeyV4 {
     ) -> &'a Tile {
         let w = u32::from(self.w);
         let h = u32::from(self.h);
+        if let Some(glide) = self.glide() {
+            let tile = prepare_scratch_tile(scratch, w + u32::from(PATCH_STRIP), h);
+            paint_glide_onto(tile, &glide);
+            return tile;
+        }
         let tile = prepare_scratch_tile(scratch, w, h);
         paint_variant_onto(
             tile,
@@ -1694,6 +1732,28 @@ impl BakeKeyV4 {
             mask_scratch,
         );
         tile
+    }
+}
+
+/// Paint `glide` (the pet's own bake, [`crate::pet_baker::PetBakeKey::bake`]) into `tile`'s art
+/// box, its top-left, and the patch strip's catch light beside it as every variant tile has.
+#[inline]
+fn paint_glide_onto(tile: &mut Tile, glide: &crate::pet_baker::PetBakeKey) {
+    let art = glide.bake();
+    let (w, h) = (art.width() as usize, art.height() as usize);
+    let stride = tile.width() as usize * 4;
+    let rows = h.min(tile.height() as usize);
+    let src = art.pixels();
+    let dst = tile.pixels_mut();
+    let mut y = 0;
+    while y < rows {
+        let row = w * 4;
+        dst[y * stride..y * stride + row].copy_from_slice(&src[y * row..(y + 1) * row]);
+        y += 1;
+    }
+    if tile.width() as usize > w {
+        let r = f32::from(PATCH_STRIP) * 0.5;
+        tile.disc(w as f32 + r, r, r.max(1.0), CATCH_LIGHT_RGB, 1.0);
     }
 }
 

@@ -12,6 +12,10 @@ use crate::{Channel, FileIdentity};
 
 mod source;
 pub use source::{check_source, receive_source, send_source};
+mod configuration;
+pub use configuration::{
+    check_configuration, receive_configuration_description, send_configuration_description,
+};
 
 fn time(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline { Err(io::ErrorKind::TimedOut.into()) } else { Ok(()) }

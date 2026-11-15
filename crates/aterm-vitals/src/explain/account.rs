@@ -30,7 +30,7 @@ pub enum WhySubject {
 pub enum Bare {
     /// A subject's full reply.
     Subject(WhySubject),
-    /// Calm: a sentence and the `you` line.
+    /// Calm: a sentence, the `you` line and the attribution limits.
     Calm,
 }
 
@@ -63,7 +63,7 @@ impl Role {
     }
 }
 
-/// The caller tab's share of the figure.
+/// The caller tab's CPU contribution or memory footprint prominence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct You {
     /// The tab, by the host's key; `None` for a caller in no tab.
@@ -75,7 +75,8 @@ pub struct You {
     /// Its figure: CPU millicores (its split figure, reaped work included where read), or
     /// footprint bytes; `None` where unread.
     pub figure: Option<i64>,
-    /// That of the subject's figure, per mille.
+    /// Share of the CPU busy account, per mille. Memory footprint is a different charge
+    /// account from physical used RAM, so memory has no percentage here.
     pub share_pm: Option<u16>,
     /// On the CPU, for a caller in a tab, while its figure is a lower bound ([`Self::figure`]):
     /// while there is any, or while the reap credit's ledger knows it missed some of the tab's
@@ -99,7 +100,7 @@ impl You {
         }
     }
 
-    /// The tab clause beside a sentence that names no cause: [`Self::clause`] in words of the
+    /// The CPU tab clause beside a sentence that names no cause: [`Self::clause`] in words of the
     /// figure alone, since "part of the cause" beside "no cause open" says two things at once.
     #[must_use]
     pub fn share_clause(&self) -> &'static str {
@@ -157,7 +158,13 @@ impl Account {
     #[must_use]
     pub fn bounded(&self, snap: &Snapshot) -> bool {
         let cut = snap.procs_truncated || self.facts.as_deref().is_some_and(|f| f.procs_truncated);
-        cut || self.you.unattributed_mc.is_some() || self.parts.is_none()
+        cut || self.you.unattributed_mc.is_some()
+            || self.parts.is_none()
+            || self.facts.as_deref().is_some_and(|f| {
+                f.split.via == super::Via::Subtraction
+                    || f.split.ownership_incomplete
+                    || f.provenance_incomplete
+            })
     }
 
     /// Returns whether the CPU's tab figure is a lower bound (`tab_mc=≥`).
@@ -218,6 +225,13 @@ pub fn account_of(subject: WhySubject, panes: &[u64], snap: &Snapshot) -> Accoun
     {
         cannot.push(("finished_tab_work", "not_sampled"));
     }
+    // The process sweep cannot witness every lifetime or a delegation over a socket.
+    // These limits hold even when the sampled coalition counters partition CPU exactly.
+    if subject == WhySubject::Cpu && facts.is_some() {
+        cannot.push(("every_process_start", "not_sampled"));
+        cannot.push(("between_sweep_orphans", "not_sampled"));
+        cannot.push(("socket_delegation", "unsupported"));
+    }
     let open = facts.as_ref().map_or(&[][..], |f| f.open.as_slice());
     let held = match facts.as_deref() {
         Some(f) if subject == WhySubject::Cpu => detect::with_machine(f.causes.clone(), snap),
@@ -260,7 +274,15 @@ pub fn account_of(subject: WhySubject, panes: &[u64], snap: &Snapshot) -> Accoun
         .is_some_and(|m| m.sample.pressure.rank().is_some());
     let read = match subject {
         WhySubject::Cpu => {
-            pressure_read && snap.thermal.is_some() && (facts.is_some() || !lane.on())
+            pressure_read
+                && snap.thermal.is_some()
+                && (facts.is_some() || !lane.on())
+                && (facts.is_some()
+                    || snap
+                        .cpu
+                        .as_ref()
+                        .and_then(crate::model::CpuView::current_busy)
+                        .is_some())
         }
         WhySubject::Mem => pressure_read,
     };
@@ -311,6 +333,11 @@ fn memory_pressed(snap: &Snapshot) -> bool {
             .is_some_and(|r| r.swap_bps() >= crate::events::SWAP_ACTIVE_BPS)
 }
 
+/// Whether the sweep that feeds the tab's share stalled at `snap` ([`crate::lanes`]).
+fn sweep_stalled(snap: &Snapshot) -> bool {
+    crate::lanes::stalls(&snap.stalled, "why").is_some()
+}
+
 fn cpu_you(
     facts: Option<&WhyFacts>,
     lane: CoalLane,
@@ -326,8 +353,11 @@ fn cpu_you(
         share_pm: None,
         unattributed_mc: None,
     };
+    let stalled = sweep_stalled(snap);
     let Some(f) = facts else {
-        let word = if lane.on() || snap.procs_window_ns.is_none() {
+        let word = if stalled {
+            "stalled"
+        } else if lane.on() || snap.procs_window_ns.is_none() {
             "warming"
         } else {
             "not_sampled"
@@ -337,15 +367,24 @@ fn cpu_you(
     let split = &f.split;
     let cut = f.procs_truncated || snap.procs_truncated || snap.aterm.is_none();
     if !panes.is_empty() && !split.tabs.iter().any(|t| panes.contains(&t.0)) {
-        return (None, unread(if cut { "truncated" } else { "warming" }));
+        let word = match (stalled, cut) {
+            (true, _) => "stalled",
+            (false, true) => "truncated",
+            (false, false) => "warming",
+        };
+        return (None, unread(word));
     }
-    let parts = split.parts_of(panes);
+    let parts = split.parts_of_coverage(panes, f.provenance_incomplete);
     if cut {
-        return (Some(parts), unread("truncated"));
+        return (
+            Some(parts),
+            unread(if stalled { "stalled" } else { "truncated" }),
+        );
     }
     let whole = split.global_mc;
     let unattributed = split.unattributed_mc;
     let short = split.short_tabs.iter().any(|k| panes.contains(k));
+    let ambiguous = split.ambiguous_tabs.iter().any(|k| panes.contains(k));
     let role_at = |extra: i64| {
         let fig = parts.tab + extra;
         let others = [
@@ -360,27 +399,50 @@ fn cpu_you(
     let (role, calm) = role_at(0);
     // What the tab may hold past its figure: the work in no figure, or, where the ledger knows it
     // missed some of the tab's of a size it cannot tell, all the rest of aterm's side.
-    let extra = if short {
+    let mut extra = if short || ambiguous {
         unattributed.max(parts.aterm_rest)
     } else {
         unattributed
     };
+    // Unknown CPU outside the measured app account could also belong to this tab.
+    extra = extra.saturating_add(parts.unaccounted.max(0));
     let bound = role_at(extra).0;
     let mut you = You {
         tab,
         role,
         calm,
         figure: Some(parts.tab),
-        share_pm: per_mille(parts.tab, whole),
-        unattributed_mc: (tab.is_some() && (unattributed > 0 || short)).then_some(unattributed),
+        share_pm: (!ambiguous
+            && !split.ownership_incomplete
+            && !f.provenance_incomplete
+            && parts.unaccounted <= 0
+            && split.via == super::Via::Coalitions)
+            .then(|| per_mille(parts.tab, whole))
+            .flatten(),
+        unattributed_mc: (tab.is_some()
+            && (unattributed > 0
+                || short
+                || ambiguous
+                || split.ownership_incomplete
+                || parts.unaccounted > 0
+                || f.provenance_incomplete))
+            .then_some(unattributed),
     };
     if tab.is_some() && bound != role {
-        you.role = Role::Unavailable("not_sampled");
+        you.role = Role::Unavailable(if ambiguous {
+            "ambiguous_reap"
+        } else {
+            "not_sampled"
+        });
         you.calm = false;
+        you.unattributed_mc.get_or_insert(unattributed);
+        you.share_pm = None;
     }
     (Some(parts), you)
 }
 
+/// Physical used RAM supplies footprint prominence thresholds only. These unlike
+/// accounts do not form a physical partition or a percentage of RAM attributable to a tab.
 fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
     let tab = panes.first().copied();
     let unread = |word| You {
@@ -391,6 +453,9 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
         share_pm: None,
         unattributed_mc: None,
     };
+    if sweep_stalled(snap) {
+        return unread("stalled");
+    }
     if snap.procs_truncated || snap.aterm.is_none() {
         return unread("truncated");
     }
@@ -400,6 +465,9 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
     let whole = i64::try_from(used).unwrap_or(i64::MAX);
     let mut fig = 0i64;
     for &k in panes {
+        if snap.tab(k).is_some_and(|t| t.scope.footprint_unread > 0) {
+            return unread("refused");
+        }
         match snap.tab(k).map(|t| t.scope.footprint) {
             Some(Some(fp)) => fig = fig.saturating_add(i64::try_from(fp).unwrap_or(i64::MAX)),
             Some(None) => return unread("not_sampled"),
@@ -410,16 +478,24 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
     let rest = snap
         .aterm
         .as_ref()
+        .filter(|a| a.footprint_unread == 0)
         .and_then(|a| a.footprint)
         .map(|b| bytes(b) - fig);
-    let outside: Vec<Option<i64>> = match snap.why.as_deref().filter(|f| f.lane == CoalLane::On) {
-        Some(f) => f
-            .split
-            .rows
-            .iter()
-            .filter(|r| r.part != super::Part::Aterm)
-            .map(|r| r.footprint.map(bytes))
-            .collect(),
+    let outside: Vec<Option<i64>> = match snap.why.as_deref().filter(|f| {
+        f.lane == CoalLane::On && f.at_ns == snap.at_ns && !f.memory_provenance_incomplete
+    }) {
+        Some(f) => {
+            let mut outside: Vec<_> = f
+                .split
+                .rows
+                .iter()
+                .map(|r| r.footprint_account().outside_bytes().map(bytes))
+                .collect();
+            if f.split.list_truncated || f.split.rows.len() < f.split.listed as usize {
+                outside.push(None);
+            }
+            outside
+        }
         None => vec![None],
     };
     let beside: Vec<Option<i64>> = std::iter::once(rest).chain(outside).collect();
@@ -445,7 +521,7 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
         role,
         calm,
         figure: Some(fig),
-        share_pm: per_mille(fig, whole),
+        share_pm: None,
         unattributed_mc: None,
     }
 }

@@ -4,8 +4,10 @@
 //! SHARED FILES, aterm-db's side (docs/DESIGN-shared-files-2026-11-11.md): which files this
 //! build compiles and the collections they project ([`types`]), the materializer that writes
 //! their snapshots and faces from this Mac's replica ([`materialize`]), the publisher that
-//! signs the writes this Mac queued ([`publish`]), the write verbs that queue them ([`write`]),
-//! and `aterm file` ([`command`]).
+//! signs the writes this Mac queued ([`publish`]), the write verbs that queue them (`write`,
+//! private to this module, and clippy.toml lets only [`command::main_entry`] run them, so an
+//! owner act is made only by a verb a person or a program ran by name), and `aterm file`
+//! ([`command`]).
 //!
 //! Reading a shared file is `aterm_file::File::read`, in a crate that cannot reach this one: it
 //! answers from the snapshot whatever this Mac's custody is doing. Only the materializer here
@@ -15,9 +17,9 @@ pub mod command;
 pub mod materialize;
 pub mod publish;
 pub mod types;
-pub mod write;
+mod write;
 
-pub use types::{ACCOUNTS, Derived, FILES, LINKS, MACHINES, Type, find};
+pub use types::{ACCOUNTS, Class, Computed, FILES, LINKS, MACHINES, Type, find};
 
 use aterm_secrets::client::Paths;
 
@@ -61,8 +63,9 @@ pub(crate) fn growth() -> u64 {
 }
 
 /// Seams of this crate's tests: how often this thread reached for custody, a step run between
-/// a pass's first look at its home's standing and its open of custody, and one run between a
-/// pass's read and its record.
+/// a pass's first look at its home's standing and its open of custody, one run between a pass's
+/// read and its record, and the owner act and `set` draft a test outside this module writes
+/// with.
 #[cfg(test)]
 #[path = "file_seam_tests.rs"]
 pub(crate) mod seam;

@@ -109,7 +109,7 @@ fn a_new_foreign_base_route_is_refused_at_the_next_admission() {
 /// the one thing on either network command, and no URL override and no keychain helper are.
 #[test]
 fn an_ssh_rewrite_clones_with_the_persons_own_url() {
-    let (sys, who, _) = fixture();
+    let (sys, who) = fixture();
     let current = || Ok(());
     let (repo, _, _) = script_clone_named_route(&sys, &who, "new", 0, false, true);
     clone_one_guarded(&sys, &who, &repo, &current).unwrap();
@@ -133,7 +133,7 @@ fn an_ssh_rewrite_clones_with_the_persons_own_url() {
 #[test]
 fn the_current_check_precedes_each_final_route_admission() {
     for changed_before_first in [false, true] {
-        let (sys, who, _) = fixture();
+        let (sys, who) = fixture();
         let current = || {
             if changed_before_first || sys.calls().iter().any(|call| call.contains("--symref")) {
                 Err("fixture approval withdrawn".into())
@@ -158,7 +158,7 @@ fn the_current_check_precedes_each_final_route_admission() {
 
 #[test]
 fn a_route_changed_after_listing_is_refused_before_the_clone() {
-    let (sys, who, _) = fixture();
+    let (sys, who) = fixture();
     let base = git(&sys, &who, None)
         .args(["ls-remote", "--get-url", "--", URL])
         .display();

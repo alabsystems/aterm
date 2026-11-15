@@ -14,11 +14,18 @@
 //! No record waits behind another, and none waits for ever. A publish the publisher refuses
 //! with the head where it was is retried with each of its records alone, so the others are
 //! pinned; a record refused [`SET_ASIDE_AFTER`] times is set aside and its build latched. A
-//! record whose staged bytes are no longer the qualified ones (re-staged by hand, deleted, no
-//! longer verifying) is set aside at once, and the tip lane qualifies that build again. A
-//! record of a build the head yanked or floored out is set aside for good. Only a hold that a
-//! decision elsewhere lifts (the lifecycle registry, a first pin, another target's machine)
-//! leaves its record queued, and its line says what lifts it and how to drop it.
+//! publish that could not run, and one refused while the channel cannot be written from this
+//! Mac (no paper anchor, no usable release token, or where agh serves the channel a release
+//! writer without push on the index repository, or one whose check the public owner did not
+//! answer), asked before each publish and again after a refusal, is counted against no
+//! record, and its records stay queued. A refusal the publisher's upload step makes for a
+//! cause no record holds is still counted against the records it carried
+//! (`docs/KNOWN_ISSUES.md` ATERM-KI-1114-140). A record whose staged bytes are no longer the
+//! qualified ones (re-staged by hand, deleted, no longer verifying) is set aside at once, and
+//! the tip lane qualifies that build again. A record of a build the head yanked or floored
+//! out is set aside for good. A record a decision elsewhere holds (the lifecycle registry, a
+//! first pin, another target's machine) stays queued, and its line says what lifts the hold
+//! and how to drop it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -33,7 +40,7 @@ use crate::artifact::qualify;
 use crate::artifact::upload;
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::Slug;
+use crate::host::{HostError, HostRole, Slug, gh_serves};
 use crate::programs::{self, ProgramDef};
 use crate::quad::{self, VerifiedQuad};
 use crate::triple::Triple;
@@ -314,17 +321,35 @@ pub fn queueable(name: &str) -> std::result::Result<&'static ProgramDef, String>
 
 /// Move a record out of the queue into `<lane dir>/retired/`, keeping it as the receipt of what
 /// became of it (`why` is its new suffix: `published`, `covered`, `superseded`, `invalid`,
-/// `restaged`, `withdrawn`, `refused`).
-fn retire(state: &LaneState, path: &Path, why: &str) -> Result<()> {
+/// `restaged`, `withdrawn`, `refused`), and return the name it is kept under. A receipt is
+/// never replaced: a build whose record is retired the same way again (re-staged, qualified
+/// anew, re-staged again) keeps every earlier one, the first as `<name>.<why>` and the later
+/// ones as `<name>.<why>.2`, `.3`, …, each moved by a rename that refuses an existing name.
+fn retire(state: &LaneState, path: &Path, why: &str) -> Result<String> {
     let keep = state.dir.join("retired");
     std::fs::create_dir_all(&keep)
         .map_err(|e| Error::io(format!("mkdir {}", keep.display()), &e))?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    std::fs::rename(path, keep.join(format!("{name}.{why}")))
-        .map_err(|e| Error::io(format!("retire {}", path.display()), &e))
+    let name = file_name(path);
+    let mut nth: u32 = 1;
+    loop {
+        let kept = if nth == 1 {
+            format!("{name}.{why}")
+        } else {
+            format!("{name}.{why}.{nth}")
+        };
+        match crate::identity::rename_noreplace(path, &keep.join(&kept)) {
+            Ok(()) => return Ok(kept),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                nth = nth.checked_add(1).ok_or_else(|| {
+                    Error::refused(format!(
+                        "{} holds every name {name}.{why} could be kept under",
+                        keep.display()
+                    ))
+                })?;
+            }
+            Err(e) => return Err(Error::io(format!("retire {}", path.display()), &e)),
+        }
+    }
 }
 
 /// How one pass is told to behave.
@@ -720,21 +745,78 @@ pub fn dispatch(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, tx: &Transcript) -> 
 }
 
 fn preflight(ctx: &Ctx, head: &VerifiedQuad) -> Result<()> {
-    for (what, path) in [
-        ("machine key", &ctx.identity.key),
-        ("machine record", &ctx.identity.record),
-    ] {
-        if !path.is_file() {
-            return Err(Error::cannot_run(format!(
-                "no {what} at {} — the dispatcher SIGNS the index; provision this Mac \
-                 (`atpkg-keys join --id <id>`) or run it on a rostered one",
-                ctx.shown(path)
-            )));
-        }
+    if let Some(what) = crate::identity::missing(ctx)? {
+        let path = if what == "machine key" {
+            &ctx.identity.key
+        } else {
+            &ctx.identity.record
+        };
+        return Err(Error::cannot_run(format!(
+            "no {what}: the store holds no release ring and there is none at {} — the dispatcher SIGNS the index; \
+             provision this Mac (`atpkg-keys join --id <id>`) or run it on a rostered one",
+            ctx.shown(path)
+        )));
     }
     crate::identity::signer_for(ctx, &head.roster)?;
     crate::artifact::sign::elect_from_head(ctx, head);
     Ok(())
+}
+
+/// Whether this Mac can write the channel at all: a paper anchor its index verifies under, and
+/// a release credential (where `gh` serves the channel, a usable release token, the vault's
+/// entry read in place and not sent; where agh serves it, agh.toml's release writer with push
+/// on the index repository, which the public owner is asked). It judges no record's bytes. `Err` names
+/// what is missing and what clears it: no release credential on this Mac, or a writer check
+/// the public owner did not answer, is the channel's state, never a fault of a queued build.
+fn channel_writable(ctx: &Ctx) -> std::result::Result<(), String> {
+    if ctx.anchor.is_empty() {
+        return Err(
+            "pins::PAPER_MASTER_PUBKEYS is EMPTY: this build trusts no paper master, so no \
+             index it signs verifies — publish from a build armed with `atpkg-keys setup --id \
+             <id>`"
+                .into(),
+        );
+    }
+    let slug = ctx.index_slug();
+    if gh_serves(ctx, HostRole::Channel) {
+        let token = ctx.shown_token(&ctx.tokens.channel);
+        return match ctx.usable_token(&ctx.tokens.channel) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!(
+                "this Mac holds no release credential: the release token, {token}, is missing \
+                 or empty — `aterm secrets sync` applies the vault's entries, else `aterm \
+                 secrets need gh:release` asks the lab's Macs for it; the queue publishes on \
+                 the first pass after"
+            )),
+            Err(why) => Err(format!(
+                "the release token, {token}, cannot be used ({why}) — `aterm secrets sync` \
+                 applies the vault's entries, else `aterm secrets need gh:release` asks the \
+                 lab's Macs for it; the queue publishes on the first pass after"
+            )),
+        };
+    }
+    match ctx.hosts.channel.write_preflight(&slug) {
+        Ok(()) => Ok(()),
+        Err(HostError::Unreachable(why)) => Err(format!(
+            "the public owner did not answer the release writer's check on {slug} ({why}) — \
+             the next pass asks again"
+        )),
+        Err(e) => Err(format!(
+            "the release writer agh routes cannot write {slug} ({e}) — `atpkg-publish hosts \
+             check --host agh` names what is missing (a release token: `aterm secrets sync` \
+             writes it from the vault, else `aterm secrets need gh:release` asks the lab's \
+             Macs for it); the queue publishes on the first pass after"
+        )),
+    }
+}
+
+/// The could-not-run of a publish the channel itself stopped: every record stays queued and
+/// none is counted.
+fn channel_refusal(next: u64, why: &str) -> Error {
+    Error::cannot_run(format!(
+        "index {next} was not published: {why}. That is the channel's state, not a fault of \
+         any queued build: the ready records stay queued and nothing is counted against them"
+    ))
 }
 
 /// Which queued records one publish may carry.
@@ -831,6 +913,10 @@ impl Desk<'_> {
                 return Ok(Round::Nothing);
             }
             preflight(ctx, &plan.head)?;
+            let next = plan.n.saturating_add(1);
+            // A channel this Mac cannot write refuses every index alike: no record is tried,
+            // so none is counted for it.
+            channel_writable(ctx).map_err(|why| channel_refusal(next, &why))?;
             // A target pin for each record: the channel's `pin` and every other target's
             // overlay are not in the delta, so the index carries them as the head has them.
             let mut delta = Delta::default();
@@ -886,7 +972,6 @@ impl Desk<'_> {
                     // Another publisher's index is the one refusal a pure pin advance re-plans
                     // over: it is told by the head having moved, never by the refusal's wording.
                     let moved_to = quad::head_build(ctx, &ctx.index_slug()).ok().flatten();
-                    let next = plan.n.saturating_add(1);
                     if moved_to.is_some_and(|now| now > plan.n) {
                         if attempt < PUBLISH_ATTEMPTS {
                             tx.warn(format!(
@@ -910,6 +995,15 @@ impl Desk<'_> {
                              queued for the next pass"
                         )));
                     }
+                    // The publisher's own preflight refuses a channel it cannot write, and
+                    // calls that a refusal: the channel is asked again, so a refusal it
+                    // explains is told by the channel's state, never by the refusal's words.
+                    if let Err(why) = channel_writable(ctx) {
+                        return Err(channel_refusal(
+                            next,
+                            &format!("{why} (the publisher: {e})"),
+                        ));
+                    }
                     settle(state, &plan, None, outcome, tx)?;
                     return Ok(Round::Refused(plan.ready, e));
                 }
@@ -929,7 +1023,7 @@ impl Desk<'_> {
                  {SET_ASIDE_AFTER}; it stays queued and is published alone"
             )
         } else {
-            retire(state, path, "refused")?;
+            let kept = retire(state, path, "refused")?;
             latch(
                 state,
                 program,
@@ -939,9 +1033,8 @@ impl Desk<'_> {
             );
             format!(
                 "{program}={build}: the publisher refused it {n} times ({why}) — set aside as \
-                 retired/{}.refused and latched by {}: fix what the refusal names, then delete \
+                 retired/{kept} and latched by {}: fix what the refusal names, then delete \
                  the latch to requalify the build; a newer main retries by itself",
-                file_name(path),
                 self.ctx.shown(&state.blocked_file(program, build))
             )
         };

@@ -101,10 +101,19 @@ impl Grid {
         new_cols: u16,
         staged_before: usize,
     ) {
+        let overflow = self.storage.lazy_buffer.len().saturating_sub(staged_before);
+        if overflow > 0 {
+            lines.extend(self.storage.lazy_buffer.drain_back(overflow));
+        }
         if self.storage.store_retains_lines() {
-            if lines.is_empty() {
-                return;
-            }
+            // Reflow removed the old ring history. Refill its available share
+            // with the newest rows before applying the store's separate limit.
+            // Visible-reflow overflow follows the old history in `lines`.
+            let room = self
+                .storage
+                .max_scrollback
+                .saturating_sub(self.storage.ring_buffer_scrollback());
+            let ring = lines.split_off(lines.len().saturating_sub(room));
             if let Some(scrollback) = self.storage.scrollback.as_mut() {
                 for line in lines {
                     if let Err(error) = scrollback.push_line(line) {
@@ -112,19 +121,16 @@ impl Grid {
                     }
                 }
             }
+            if !ring.is_empty() {
+                self.prepend_ring_scrollback_lines(ring, new_cols);
+            }
             if self.storage.lazy_buffer.is_empty() {
                 self.enforce_scrollback_budget_and_clamp();
             } else {
                 self.drain_lazy_buffer();
             }
-        } else {
-            let overflow = self.storage.lazy_buffer.len().saturating_sub(staged_before);
-            if overflow > 0 {
-                lines.extend(self.storage.lazy_buffer.drain_back(overflow));
-            }
-            if !lines.is_empty() {
-                self.prepend_ring_scrollback_lines(lines, new_cols);
-            }
+        } else if !lines.is_empty() {
+            self.prepend_ring_scrollback_lines(lines, new_cols);
         }
     }
 

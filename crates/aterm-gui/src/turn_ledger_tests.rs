@@ -29,6 +29,7 @@ fn by_words_round_trip_and_anything_else_is_unknown() {
         TurnBy::Ctl,
         TurnBy::Bridge,
         TurnBy::Sid(sid.as_str().to_string()),
+        TurnBy::Sid("tqn5r6e0148".to_string()),
         TurnBy::fleet(&"87be5228".repeat(4), None),
         TurnBy::fleet(&"87be5228".repeat(4), Some(sid.as_str())),
         TurnBy::Unknown,
@@ -59,6 +60,9 @@ fn by_words_round_trip_and_anything_else_is_unknown() {
         "s-",
         "s-xyz",
         "s-1 text=x",
+        "t000000000",
+        "T0000000000",
+        "tqn5r6e014u",
     ] {
         assert_eq!(TurnBy::from_wire(word), TurnBy::Unknown, "{word:?}");
     }

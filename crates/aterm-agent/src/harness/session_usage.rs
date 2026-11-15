@@ -1191,6 +1191,11 @@ pub struct UsageFacts {
     pub wall: Option<Wall>,
     /// Seconds Claude was working in this conversation: the union of its main transcript's finished turns ([`TranscriptUsage::busy_ms`]).
     pub runtime: Option<u64>,
+    /// Unix seconds of the newest response the API served in any of the session's files,
+    /// subagents' included ([`SessionUsage::served_at`]): `None` until a refresh that caught up
+    /// folded one, so it moves only when the totals do. The footer draws none of it; a survey
+    /// row reads it as the transcript's last output.
+    pub served_at: Option<i64>,
 }
 
 impl UsageFacts {
@@ -1211,6 +1216,7 @@ impl UsageFacts {
             complete: left_out.is_some_and(Refresh::complete),
             wall,
             runtime: None,
+            served_at: None,
         })
     }
 

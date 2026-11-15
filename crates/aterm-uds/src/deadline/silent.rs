@@ -404,13 +404,20 @@ fn prints_judged(
             Some(status) => refused(child, line, &format!("its output ended first ({status})")),
             None => refused(child, line, "its output ended first, and it ran on"),
         },
-        Err(RecvTimeoutError::Timeout) => match held_words(child.id(), hang, held(child.id())) {
-            Some(words) => {
-                end(child);
-                could_not_run(words)
+        Err(RecvTimeoutError::Timeout) => {
+            let held = held(child.id());
+            match held_words(child.id(), hang, held) {
+                Some(words) => {
+                    end(child);
+                    could_not_run(words)
+                }
+                None => refused(
+                    child,
+                    line,
+                    &format!("not within {hang:?}; program_check={held:?}"),
+                ),
             }
-            None => refused(child, line, &format!("not within {hang:?}")),
-        },
+        }
     }
 }
 
@@ -572,14 +579,20 @@ fn end(child: &mut crate::spawnfd::Child) {
 }
 
 /// [`prints`]' and [`cat_echoes`]' end without their proof: `child` [`end`]ed, the panic naming
-/// the line and why.
+/// the line, its observed state before cleanup, and why. A cleanup signal is never
+/// presented as the child's original exit status.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(unix)]
 #[track_caller]
 fn refused(child: &mut crate::spawnfd::Child, line: &str, why: &str) -> ! {
+    let before = match child.try_wait() {
+        Ok(Some(status)) => format!("exited ({status})"),
+        Ok(None) => "running".to_owned(),
+        Err(error) => format!("wait failed ({error})"),
+    };
     end(child);
     panic!(
-        "the copied program (pid {}) never wrote {line:?}: {why}",
+        "the copied program (pid {}) never wrote {line:?}; before cleanup: {before}: {why}",
         child.id()
     );
 }

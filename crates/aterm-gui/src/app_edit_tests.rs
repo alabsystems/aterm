@@ -254,6 +254,7 @@ fn edit_admission_never_coalesces_with_a_gesture_open() {
         uri: f.uri.clone(),
         kind: AppKind::Editor,
         edit: None,
+        config: false,
     };
     let pending = app.mint_document_admission(wid, gesture.clone());
 
@@ -1931,4 +1932,191 @@ fn a_mapped_documents_draft_is_carried() {
             "{name}"
         );
     }
+}
+
+/// The file `f` names, as the window keys its draft.
+fn canonical(f: &Fixture) -> String {
+    crate::native_document_host::path_to_file_uri(&std::fs::canonicalize(&f.path).unwrap()).unwrap()
+}
+
+fn admitting(app: &App, ticket: Ticket) -> bool {
+    app.native_documents
+        .edits
+        .open
+        .get(&ticket)
+        .is_some_and(|entry| matches!(entry.phase, Phase::Admitting { .. }))
+}
+
+/// An `edit` whose file's draft another aterm process is writing answers `ERR busy drafts (…)`
+/// exactly once and opens nothing: amacs ends on it rather than split the draft into a terminal.
+/// CONTROL: once the holder lets go, the same edit opens beside its caller. NEGATIVE CONTROLS:
+/// with the draft journals unavailable the edit answers `ERR refused unreadable (…)`; so does a
+/// draft lock no process can take, whose words name no drafts path; (scratch) a busy draft
+/// answered as `Failed` answers `ERR refused unreadable` and fails the first.
+#[test]
+fn a_busy_edit_answers_busy_drafts_once_and_opens_nothing() {
+    let f = fixture("busy-drafts", b"draft\n");
+    let mut app = app();
+    let wid = WindowId(0);
+    let sid = caller(&mut app, wid);
+    let caller_tab = active_tab(&app, wid);
+    let tabs = tab_ids(&app, wid);
+    let held = app.hold_draft_lock_for_test(&canonical(&f));
+
+    let ticket = crate::control_edit::mint_ticket();
+    let (reply, answer) = std::sync::mpsc::channel();
+    app.begin_edit(call(ticket, sid, request(&f.uri, None), reply));
+    assert_eq!(
+        answer.try_recv().unwrap(),
+        format!(
+            "ERR busy drafts ({})\n",
+            crate::native_document_journal::JournalFault::BUSY
+        )
+    );
+    assert_eq!(
+        answer.try_recv(),
+        Err(TryRecvError::Disconnected),
+        "one answer"
+    );
+    assert!(!admitting(&app, ticket));
+    assert!(app.native_documents.edits.open.is_empty());
+    assert_eq!(
+        tab_ids(&app, wid),
+        tabs,
+        "nothing opened, not even a Recovery tab"
+    );
+
+    drop(held);
+    let ticket = crate::control_edit::mint_ticket();
+    let (reply, answer) = std::sync::mpsc::channel();
+    app.begin_edit(call(ticket, sid, request(&f.uri, None), reply));
+    let ok = ok(&answer.try_recv().unwrap());
+    assert_eq!(ok.ticket, ticket, "CONTROL");
+    assert_eq!(ok.uri, canonical(&f), "CONTROL");
+    let tabs = tab_ids(&app, wid);
+    let at = tabs.iter().position(|tab| *tab == caller_tab).unwrap();
+    assert_eq!(
+        tab_of(&app, wid, view(&ok)),
+        tabs[at + 1],
+        "CONTROL: beside its caller"
+    );
+
+    let mut app = self::app();
+    let sid = caller(&mut app, wid);
+    app.document_journals_unavailable_for_test("document recovery is unavailable: QZPJ");
+    let (_, line) = edit(&mut app, sid, request(&f.uri, None));
+    assert_eq!(
+        line,
+        "ERR refused unreadable (document recovery is unavailable: QZPJ)\n"
+    );
+
+    let mut app = self::app();
+    let sid = caller(&mut app, wid);
+    let journal = app.draft_journal_for_test(&canonical(&f));
+    let drafts_root = journal.parent().unwrap().to_string_lossy().into_owned();
+    std::fs::create_dir_all(journal.with_file_name(format!(
+        ".{}.lock",
+        journal.file_name().unwrap().to_str().unwrap()
+    )))
+    .unwrap();
+    let (_, line) = edit(&mut app, sid, request(&f.uri, None));
+    assert!(line.starts_with("ERR refused unreadable ("), "{line}");
+    assert!(!line.contains(&drafts_root), "{line}");
+    assert!(
+        line.contains(crate::native_document_journal::DRAFTS_FOLDER_WORD),
+        "{line}"
+    );
+}
+
+/// An `edit` whose file's draft another process rewrote between the open's look at it and its
+/// taking it answers `ERR busy drafts (…)` once: a draft that changes under an open is one
+/// another aterm process is writing, and amacs ends on it as on a held lock. CONTROL: the next
+/// edit, under which nothing changes, opens.
+#[test]
+fn a_changed_draft_edit_answers_busy_drafts() {
+    let f = fixture("changed-drafts", b"draft\n");
+    let mut app = app();
+    let wid = WindowId(0);
+    let sid = caller(&mut app, wid);
+    app.change_drafts_under_opens_for_test(1);
+    let ticket = crate::control_edit::mint_ticket();
+    let (reply, answer) = std::sync::mpsc::channel();
+    app.begin_edit(call(ticket, sid, request(&f.uri, None), reply));
+    assert_eq!(
+        answer.try_recv().unwrap(),
+        format!(
+            "ERR busy drafts ({})\n",
+            crate::native_document_journal::JournalFault::CHANGED
+        )
+    );
+    assert_eq!(
+        answer.try_recv(),
+        Err(TryRecvError::Disconnected),
+        "one answer"
+    );
+    assert!(app.native_documents.edits.open.is_empty());
+
+    let ticket = crate::control_edit::mint_ticket();
+    let (reply, answer) = std::sync::mpsc::channel();
+    app.begin_edit(call(ticket, sid, request(&f.uri, None), reply));
+    assert_eq!(ok(&answer.try_recv().unwrap()).ticket, ticket, "CONTROL");
+}
+
+/// The route a real window takes (a worker reads the file and a worker prepares its draft): an
+/// `edit` whose file's draft another aterm process holds answers `ERR busy drafts (…)` exactly
+/// once, after the draft stayed busy through two attempts and long before the verb's admission
+/// deadline, and opens nothing. CONTROL: once the holder lets go, the same edit opens beside its
+/// caller. NEGATIVE CONTROL (scratch): a request never refused leaves the wait for the answer to
+/// its hang detector.
+#[cfg(unix)]
+#[test]
+fn a_busy_edit_under_preparation_answers_busy_drafts_once() {
+    let f = fixture("prepared-busy-drafts", b"draft\n");
+    let mut app = app();
+    let wid = WindowId(0);
+    let sid = caller(&mut app, wid);
+    let tabs = tab_ids(&app, wid);
+    let opens = crate::app_documents::WorkerOpens::start();
+    let held = app.hold_draft_lock_for_test(&canonical(&f));
+
+    let ticket = crate::control_edit::mint_ticket();
+    let (reply, answer) = std::sync::mpsc::channel();
+    app.begin_edit(call(ticket, sid, request(&f.uri, None), reply));
+    assert_eq!(
+        answer.try_recv(),
+        Err(TryRecvError::Empty),
+        "a worker reads the file first"
+    );
+    let line = opens.until(&mut app, |_| answer.try_recv().ok());
+    assert_eq!(
+        line,
+        format!(
+            "ERR busy drafts ({})\n",
+            crate::native_document_journal::JournalFault::BUSY
+        )
+    );
+    assert_eq!(
+        crate::app_documents::WorkerOpens::failed_attempts(&app, &canonical(&f)),
+        2
+    );
+    assert_eq!(
+        answer.try_recv(),
+        Err(TryRecvError::Disconnected),
+        "one answer"
+    );
+    assert!(!admitting(&app, ticket));
+    assert!(app.native_documents.edits.open.is_empty());
+    assert_eq!(
+        tab_ids(&app, wid),
+        tabs,
+        "nothing opened, not even a Recovery tab"
+    );
+
+    drop(held);
+    let ticket = crate::control_edit::mint_ticket();
+    let (reply, answer) = std::sync::mpsc::channel();
+    app.begin_edit(call(ticket, sid, request(&f.uri, None), reply));
+    let ok = ok(&opens.until(&mut app, |_| answer.try_recv().ok()));
+    assert_eq!(ok.ticket, ticket, "CONTROL");
+    assert_eq!(ok.uri, canonical(&f), "CONTROL");
 }

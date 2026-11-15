@@ -33,6 +33,21 @@ fn run(tool: &Path, artifact: &Path, bound: Duration) -> Result<(), String> {
     )
 }
 
+/// [`run`] on a clock that stands still, so the attempts' own bound ends a recovery whatever the
+/// host's pace (the deadline's is hostile_clock_advance_at_accepted_response_refuses'): on the
+/// wall clock a loaded host's 60 s held fewer than the 160 calls these tests count.
+fn run_still(tool: &Path, artifact: &Path) -> Result<(), String> {
+    let start = Instant::now();
+    notary_accept_with_clock(
+        artifact,
+        &NotaryAuth::keychain_profile("fake"),
+        tool.to_str().unwrap(),
+        Duration::from_secs(60),
+        Duration::ZERO,
+        move || start,
+    )
+}
+
 const RECOVER: &str = r#"
 case "$2" in
 submit) basename -- "$3" > name; echo 'Error: gatewayTimeout(statusCode: Optional(504))' >&2; exit 1;;
@@ -97,7 +112,7 @@ fn hostile_log_evidence_must_agree_and_remain_bounded() {
     let (dir, tool, artifact) =
         fixture(&RECOVER.replace("log) printf", "log) echo 'HTTP 504' >&2; exit 1; printf"));
     assert!(
-        run(&tool, &artifact, Duration::from_secs(60))
+        run_still(&tool, &artifact)
             .unwrap_err()
             .contains("exhausted")
     );
@@ -325,7 +340,7 @@ fn notary_unknown_upload_exhausts_bound_without_resubmit() {
     let (dir, tool, artifact) = fixture(
         "case \"$2\" in submit) echo 'HTTP 504' >&2; exit 1;; history) echo '{\"history\":[]}' ;; esac",
     );
-    let error = run(&tool, &artifact, Duration::from_secs(60)).unwrap_err();
+    let error = run_still(&tool, &artifact).unwrap_err();
     assert!(error.contains("exhausted"), "{error}");
     let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
     assert_eq!(calls.lines().count(), 160);

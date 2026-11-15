@@ -595,16 +595,16 @@ impl Run<'_> {
                 Ok(true) => {}
                 Ok(false) => {
                     return Err(Error::cannot_run(format!(
-                        "staging token file missing/empty: {} — the lane reads the private staging \
+                        "staging token missing/empty: {} — the lane reads the private staging \
                          repos as that identity, never anonymously",
-                        ctx.shown(&ctx.tokens.staging)
+                        ctx.shown_token(&ctx.tokens.staging)
                     )));
                 }
                 Err(why) => {
                     return Err(Error::cannot_run(format!(
-                        "staging token file invalid/unreadable: {} ({why}) — the lane reads the \
+                        "staging token invalid/unreadable: {} ({why}) — the lane reads the \
                          private staging repos as that identity, never anonymously",
-                        ctx.shown(&ctx.tokens.staging)
+                        ctx.shown_token(&ctx.tokens.staging)
                     )));
                 }
             }
@@ -959,7 +959,7 @@ impl Run<'_> {
             return Ok(outcome);
         }
 
-        let have_key = ctx.identity.key.is_file();
+        let have_key = crate::identity::keyed(ctx)?;
         let ceremony = ctx.shown(&staged_dir.join("READY.md"));
         let mut ready_md = Ready {
             ctx,
@@ -1021,19 +1021,19 @@ impl Run<'_> {
                     );
                 }
             } else {
-                let token = ctx.shown(&ctx.tokens.channel);
+                let token = ctx.shown_token(&ctx.tokens.channel);
                 match ctx.usable_token(&ctx.tokens.channel) {
                     Ok(true) => {}
                     Ok(false) => {
                         return refuse_unsigned(
                             &mut ready_md,
                             format!(
-                                "the channel token at {token} is missing or empty, and the \
-                                 public uploads need it.\nPut it there, then run the ceremony \
-                                 below."
+                                "the channel token, {token}, is missing or empty, and the \
+                                 public uploads need it.\naterm secrets need gh:release asks \
+                                 the lab's Macs for it; then run the ceremony below."
                             ),
                             &format!(
-                                "channel token file missing/empty: {token} (the public uploads \
+                                "channel token missing/empty: {token} (the public uploads \
                                  need it)"
                             ),
                             &ceremony,
@@ -1043,10 +1043,10 @@ impl Run<'_> {
                         return refuse_unsigned(
                             &mut ready_md,
                             format!(
-                                "the channel token at {token} cannot be used ({why}), and the \
+                                "the channel token, {token}, cannot be used ({why}), and the \
                                  public uploads need it.\nFix it, then run the ceremony below."
                             ),
-                            &format!("channel token file invalid/unreadable: {token} ({why})"),
+                            &format!("channel token invalid/unreadable: {token} ({why})"),
                             &ceremony,
                         );
                     }
@@ -1124,7 +1124,8 @@ impl Run<'_> {
             ready_md.write(Phase::Staged)?;
             if !ready.is_empty() {
                 self.tx.say(format!(
-                    "no machine key at {} — staged UNSIGNED under {} (ceremony: {ceremony})",
+                    "no machine key (the store holds no release ring, and none is at {}) — staged \
+                     UNSIGNED under {} (ceremony: {ceremony})",
                     ctx.shown(&ctx.identity.key),
                     ctx.shown(&staged_dir),
                 ));
@@ -1404,6 +1405,7 @@ impl Run<'_> {
                             upload: false,
                             env,
                             build_within: None,
+                            build_queue: None,
                         },
                     )
                     .map(|outcome| (outcome.build, outcome.asset, outcome.manifest))
@@ -1926,7 +1928,7 @@ impl Ready<'_> {
     fn render(&self, phase: Phase) -> String {
         let ctx = self.ctx;
         let (n, next) = (self.n, self.n.saturating_add(1));
-        let key = ctx.shown(&ctx.identity.key);
+        let key = crate::identity::key_shown(ctx);
         let ready = list(self.ready.iter().map(|(p, _)| p.name.as_str()));
         let mut s = format!(
             "# READY — staged Linux artifacts for atpkg-index-{n}\n\n\
@@ -2036,11 +2038,14 @@ impl Ready<'_> {
             gh_serves(ctx, HostRole::Channel),
         );
         let credentials = match (staging_gh, channel_gh) {
-            (true, true) => format!("owner tokens including {}", ctx.shown(&ctx.tokens.channel)),
+            (true, true) => format!(
+                "owner tokens including {}",
+                ctx.shown_token(&ctx.tokens.channel)
+            ),
             (false, true) => format!(
-                "agh.toml's writer for {} and the channel token {}",
+                "agh.toml's writer for {} and the channel token, {}",
                 ctx.accounts.staging,
-                ctx.shown(&ctx.tokens.channel)
+                ctx.shown_token(&ctx.tokens.channel)
             ),
             _ if ctx
                 .accounts

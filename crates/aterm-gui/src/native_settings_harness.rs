@@ -11,7 +11,7 @@ use crate::harness_screen::{
     parse_autopilot_action, parse_every_action,
 };
 use crate::native_app::{HarnessRequest, HarnessTimerRequest};
-use aterm_agent::supervise::Autopilot;
+use alab_policy::config::Autopilot;
 
 /// Every action the page mints starts with this.
 pub(super) const HARNESS_ACTION_PREFIX: &str = "harness/";

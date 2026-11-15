@@ -53,6 +53,65 @@ pub fn exit_code(rows: &[Row]) -> i32 {
     }
 }
 
+fn gui_admission<T>(
+    rows: &mut Vec<Row>,
+    tag: &str,
+    admit: impl FnOnce() -> Result<T, Fail>,
+) -> Result<T, Fail> {
+    let started = Instant::now();
+    admit().inspect_err(|failure| {
+        rows.push(Row {
+            name: format!("{tag} GUI admission"),
+            verdict: if failure.code == linux::NOT_RUN || failure.stopped.is_some() {
+                Verdict::NotRun
+            } else {
+                Verdict::Fail
+            },
+            secs: started.elapsed().as_secs_f64(),
+            detail: failure.msg.clone().unwrap_or_else(|| {
+                failure.stopped.map_or_else(
+                    || format!("admission ended with status {}", failure.code),
+                    |signal| format!("admission interrupted by signal {signal}"),
+                )
+            }),
+        });
+    })
+}
+
+fn report_publication(
+    rows: &mut Vec<Row>,
+    path: &Path,
+    publish: impl FnOnce() -> std::io::Result<()>,
+) -> bool {
+    let started = Instant::now();
+    if let Err(error) = publish() {
+        rows.push(Row {
+            name: "report publication".into(),
+            verdict: Verdict::NotRun,
+            secs: started.elapsed().as_secs_f64(),
+            detail: format!("{}: {error}", path.display()),
+        });
+        false
+    } else {
+        true
+    }
+}
+
+/// Publish a lane's report exclusively; a publication error adds unavailable evidence.
+pub(crate) fn publish_report(
+    title: &str,
+    rows: &mut Vec<Row>,
+    disk: &[String],
+    total_secs: f64,
+    path: &Path,
+) -> bool {
+    use std::io::Write as _;
+    let report = render_as(title, rows, disk, total_secs);
+    report_publication(rows, path, || {
+        crate::util::create_new_regular_file(path, 0o600)?.write_all(report.as_bytes())
+    })
+}
+
 /// What `proof` (or `gone`) was asked.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProofArgs {
@@ -254,10 +313,11 @@ pub fn no_skips(mut row: Row, text: &str) -> Row {
 /// The prefix of the line a test prints for what it cannot decide under a binary translator, the translator's name and the test's own words after it (aterm-uds's `spawnfd` tests: `NOT RUN under Rosetta: <test>: <why>`).
 pub const TRANSLATOR_NOT_RUN: &str = "NOT RUN under ";
 
-/// `row`, judged on what `text` (its tests' uncaptured output) says they could not decide under a binary translator ([`TRANSLATOR_NOT_RUN`]).
+/// Project named, well-formed Rosetta omissions to NOT RUN, retaining an existing failure.
+/// Omission evidence for another cell, translator or malformed scope/reason is a failure.
 #[must_use]
 pub fn translator_not_runs(mut row: Row, text: &str, arch: Arch) -> Row {
-    let rosetta = format!("{TRANSLATOR_NOT_RUN}Rosetta:");
+    let rosetta = format!("{TRANSLATOR_NOT_RUN}Rosetta: ");
     let lines: Vec<&str> = text
         .lines()
         .filter_map(|l| l.get(l.find(TRANSLATOR_NOT_RUN)?..).map(str::trim_end))
@@ -272,17 +332,27 @@ pub fn translator_not_runs(mut row: Row, text: &str, arch: Arch) -> Row {
     let misread: Vec<&str> = lines
         .iter()
         .copied()
-        .filter(|l| arch != Arch::X86_64 || !l.starts_with(&rosetta))
+        .filter(|line| {
+            arch != Arch::X86_64
+                || !line.strip_prefix(&rosetta).is_some_and(|evidence| {
+                    evidence.split_once(": ").is_some_and(|(scope, why)| {
+                        !scope.trim().is_empty() && !why.trim().is_empty()
+                    })
+                })
+        })
         .collect();
     if !misread.is_empty() {
         row.verdict = Verdict::Fail;
         row.detail = format!(
-            "{}; {} said not run under a translator this cell does not run under:\n{}",
+            "{}; {} malformed or inapplicable translator omissions:\n{}",
             row.detail,
             misread.len(),
             list(&misread)
         );
     } else if !lines.is_empty() {
+        if row.verdict == Verdict::Pass {
+            row.verdict = Verdict::NotRun;
+        }
         row.detail = format!(
             "{}; {} not runnable under Rosetta, which a real x86_64 CPU decides:\n{}",
             row.detail,
@@ -2280,13 +2350,6 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         // The GUI rows that follow are timed: they run on the quiet machine, from here to the
         // end of this arch ([`crate::admission`]), sharing the native-window lane
         // with both Timing and functional Instances in other lab runs.
-        let quiet = if built {
-            crate::admission::window_lane()
-                .and_then(|()| crate::admission::quiet(&format!("{tag} GUI rows")))
-                .map(Some)
-        } else {
-            Ok(None)
-        };
         rows.push(Row {
             name: format!("{tag} build aterm-gui"),
             verdict: if built { Verdict::Pass } else { Verdict::Fail },
@@ -2297,9 +2360,17 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 tally(&out.text).error.unwrap_or_else(|| out.tail(5))
             },
         });
-        // An interrupt that ended its wait is the run's ([`crate::stop::note`]): no GUI row
-        // starts, and the run ends NOT RUN.
-        let _quiet = match quiet {
+        // Every admission refusal is a report row, including one with no interrupt.
+        // No GUI row starts; the existing stop and failure precedence is preserved.
+        let _quiet = match gui_admission(&mut rows, &tag, || {
+            if built {
+                crate::admission::window_lane()
+                    .and_then(|()| crate::admission::quiet(&format!("{tag} GUI rows")))
+                    .map(Some)
+            } else {
+                Ok(None)
+            }
+        }) {
             Ok(quiet) => quiet,
             Err(f) => {
                 if let Some(m) = f.msg {
@@ -2618,12 +2689,11 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
         ));
     }
     up.end(ask.keep_up);
-    let report = render(&rows, &disk, t0.elapsed().as_secs_f64());
-    print!("\n{report}");
     let path = results.join("report.txt");
-    if let Err(e) = crate::util::write_fresh(&path, &report) {
-        eprintln!("aterm-lab: linux: {}: {e}", path.display());
-    } else {
+    let total_secs = t0.elapsed().as_secs_f64();
+    let published = publish_report("LINUX LANE PROOF", &mut rows, &disk, total_secs, &path);
+    print!("\n{}", render(&rows, &disk, total_secs));
+    if published {
         println!("report and frames: {}", results.display());
     }
     if let Some(s) = stopped {

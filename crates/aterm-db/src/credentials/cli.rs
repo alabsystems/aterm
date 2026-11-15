@@ -21,12 +21,13 @@ pub const USAGE: &str = "usage:
   aterm secrets need [ls] [--all] [--json]        this Mac's needs; --all adds every request in the lab's table
   aterm secrets need peek [--all] [--json]        read retained state only; never posts, sweeps or advances needs
                                                   JSON identifies the observer, requester and delivery origin; never credential values
-  aterm secrets need <want> [--purpose <id>]       raise a need by hand (want: site-deployer-key, notary, developer-id:<stem>, mailbox:<label>, gh:dev, gh:release, entry:<name>, ...)
+  aterm secrets need <want> [--purpose <id>]       raise a need by hand (want: site-deployer-key, notary, developer-id:<stem>, mailbox:<label>, gh:dev, gh:release, gh:fleet, machines-admin, claude-token:<ac-key>, entry:<name>, ...)
   aterm secrets need retire <want|id> [--note <text>]
                                                    withdraw a need
   aterm secrets need pass                          run this Mac's pass over credentials/requests/1 now (and the custodian's, on the vault's admin Mac)
   aterm secrets need give <want|id> [--file <path>]
                                                    offer a value from a file or piped stdin; an admin publishes it now
+                                                   (never claude-token:, whose one producer is aterm harness accounts token <label|email>)
 ";
 
 fn say(text: &str) -> ExitCode {

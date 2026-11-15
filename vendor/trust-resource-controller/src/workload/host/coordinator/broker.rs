@@ -156,43 +156,6 @@ impl PublicationSelection {
     }
 }
 
-#[cfg(test)]
-mod publication_tests {
-    use super::*;
-    #[test]
-    fn unit_publication_codec_binds_complete_unique_destination_set() {
-        let selection = PublicationSelection {
-            unit_sha256: "a".repeat(64),
-            unit_id: "actual-unit-naming-data".into(),
-            destinations: vec![
-                b"/selected/debug/bin".to_vec(),
-                b"/selected/export/bin".to_vec(),
-            ],
-        };
-        let request = BrokerRequest::Publish {
-            sequence: 1,
-            selection: selection.clone(),
-        };
-        let encoded = request.encode().unwrap();
-        assert!(
-            matches!(BrokerRequest::decode(&encoded).unwrap(),BrokerRequest::Publish{sequence:1,selection:actual}if actual==selection)
-        );
-        for length in 0..encoded.len() {
-            assert!(BrokerRequest::decode(&encoded[..length]).is_err());
-        }
-        let mut duplicated = selection.clone();
-        duplicated
-            .destinations
-            .push(duplicated.destinations[0].clone());
-        assert!(duplicated.validate().is_err());
-        let mut reordered = selection.clone();
-        reordered.destinations.reverse();
-        assert!(reordered.validate().is_err());
-        let mut escaped = selection;
-        escaped.destinations[0] = b"/selected/../foreign/bin".to_vec();
-        assert!(escaped.validate().is_err());
-    }
-}
 pub enum BrokerRequest {
     FinishGraph {
         sequence: u64,
@@ -609,5 +572,35 @@ impl BrokerEvent {
         d.done()?;
         value.encode()?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    #[test]
+    fn unit_publication_codec_binds_complete_unique_destination_set() {
+        let selection = PublicationSelection {
+            unit_sha256: "a".repeat(64),
+            unit_id: "actual-unit-naming-data".into(),
+            destinations: vec![b"/selected/debug/bin".to_vec(), b"/selected/export/bin".to_vec()],
+        };
+        let request = BrokerRequest::Publish { sequence: 1, selection: selection.clone() };
+        let encoded = request.encode().unwrap();
+        assert!(
+            matches!(BrokerRequest::decode(&encoded).unwrap(),BrokerRequest::Publish{sequence:1,selection:actual}if actual==selection)
+        );
+        for length in 0..encoded.len() {
+            assert!(BrokerRequest::decode(&encoded[..length]).is_err());
+        }
+        let mut duplicated = selection.clone();
+        duplicated.destinations.push(duplicated.destinations[0].clone());
+        assert!(duplicated.validate().is_err());
+        let mut reordered = selection.clone();
+        reordered.destinations.reverse();
+        assert!(reordered.validate().is_err());
+        let mut escaped = selection;
+        escaped.destinations[0] = b"/selected/../foreign/bin".to_vec();
+        assert!(escaped.validate().is_err());
     }
 }

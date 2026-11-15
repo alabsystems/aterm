@@ -340,9 +340,9 @@ fn secret_blocker(reason: client::MaterializationBlocker, now_ms: u64) -> Servic
             ServiceAvailability::Unknown,
             "Local vault state does not match the configured source; awaiting a successful sync of that source",
         ),
-        MaterializationBlocker::LocalFilesIncomplete => (
+        MaterializationBlocker::ApplyIncomplete => (
             ServiceAvailability::Unknown,
-            "Local vault cache or delivered files are incomplete or no longer match; awaiting a successful sync",
+            "The local vault cache is not whole, or its apply has not finished; awaiting a successful sync",
         ),
     };
     state(availability, now_ms, detail)

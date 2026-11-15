@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(unix)]
+const DIR: &str = "claim-activity";
+#[cfg(unix)]
 const FILE: &str = "activity.json";
 #[cfg(unix)]
 const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -129,6 +131,19 @@ impl Book {
     }
 }
 
+/// Whether this home keeps claim activity: a touch under its lock saved it ([`Held::save`]), as
+/// every touch that may write a claim row does first. Off Unix none is kept, and no claim row is
+/// written there for want of it.
+#[cfg(unix)]
+pub(super) fn kept(home: &Path) -> bool {
+    home.join(".aterm").join(DIR).join(FILE).is_file()
+}
+
+#[cfg(not(unix))]
+pub(super) fn kept(_: &Path) -> bool {
+    false
+}
+
 /// The lock spans the activity snapshot, its durable save, and Commons publication.
 pub(super) struct Held {
     #[cfg(unix)]
@@ -143,7 +158,7 @@ impl Held {
     pub(super) fn take(home: &Path) -> Result<Self, String> {
         let parent = home.join(".aterm");
         let _ = private_file::ensure_private_dir(&parent).map_err(|e| e.to_string())?;
-        let dir = parent.join("claim-activity");
+        let dir = parent.join(DIR);
         private_file::create_private_dir(&dir).map_err(|e| e.to_string())?;
         let lock = PrivateLock::take(
             &dir,

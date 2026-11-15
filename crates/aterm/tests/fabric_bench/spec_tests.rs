@@ -552,3 +552,30 @@ fn the_broker_process_is_named_only_out_of_process_and_refuses_what_its_argv_can
     }
     assert!(parse("broker_process=launchd", out).is_err());
 }
+
+/// F11c's wanted mail among the backlog (ATERM-KI-1111-9): named only when it is there, it
+/// round-trips, and it is refused without a backlog whose oldest 1/`WANTED_SHARE` holds every
+/// note `WANTED_GAP` filler records apart, or with the broker in a process of its own.
+#[test]
+fn wanted_mail_among_the_backlog_fits_its_oldest_share() {
+    let bare = parse("", Path::new("/tmp/x")).expect("bare");
+    assert_eq!(bare.wanted, 0);
+    assert!(!bare.words().contains("wanted"), "{}", bare.words());
+    let fits = WANTED_GAP * 32 * WANTED_SHARE;
+    let words = format!("scenario=attach attach=8,32 backlog={fits} wanted=1");
+    let spec = parse(&words, Path::new("/tmp/x")).expect("fits");
+    assert_eq!(spec.wanted, 1);
+    assert!(spec.words().contains(" wanted=1"), "{}", spec.words());
+    assert_eq!(
+        parse(&spec.words(), Path::new("/tmp/x")).expect("round trip"),
+        spec
+    );
+    for bad in [
+        "scenario=attach attach=8,32 wanted=1".to_string(),
+        format!("scenario=attach attach=8,32 backlog={} wanted=1", fits - 1),
+        format!("scenario=attach attach=8,32 backlog={fits} wanted=2"),
+        "wanted=many".to_string(),
+    ] {
+        assert!(parse(&bad, Path::new("/tmp/x")).is_err(), "{bad}");
+    }
+}

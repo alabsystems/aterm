@@ -3,7 +3,7 @@
 
 //! Complete bounded child output with an exact stdin request, without staging input.
 
-use super::{Cmd, Live, Ran, RunFailed, System, fixed_command};
+use super::{Cmd, Live, Ran, RunFailed, System};
 use aterm_uds::deadline::{CompleteOutputError, RunError};
 use aterm_uds::spawnfd::Stdio;
 use std::io::{self, Write as _};
@@ -34,7 +34,7 @@ pub(super) fn run(live: &Live, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed
     admit(cmd)?;
     live.capture_current()?;
     let (program, args) = live.argv(cmd)?;
-    let command = fixed_command(&program, &args, &live.child_env(cmd), cmd.cwd.as_deref());
+    let command = live.command(cmd, &program, &args);
     let (reader, writer) =
         aterm_uds::pipe().map_err(|_| RunFailed::Spawn("input pipe creation failed".into()))?;
     nonblocking(&writer).map_err(|_| RunFailed::Spawn("input pipe configuration failed".into()))?;

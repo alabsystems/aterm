@@ -75,6 +75,13 @@ pub fn window_granted_by(var: &dyn Fn(&str) -> Option<OsString>) -> bool {
 /// Default mailbox subdirectory under `<accounts store>` when [`MAILBOX_ENV`] is unset.
 pub const DEFAULT_MAILBOX_DIR: &str = "mailbox";
 
+/// Set to `1` by an account's token capture whose page opens on the account's own headless
+/// browser profile (plan package FL-137; `setup_token::OpenerPage::Headless`): the opener
+/// serves the token's consent page there and nowhere else
+/// ([`super::headless_oauth::authorize_token_consent`]), pressing `Authorize` only where the
+/// page shows the account's email, and opens no window and no other browser after it.
+pub const TOKEN_ENV: &str = "ATERM_OPEN_URL_TOKEN";
+
 /// Environment variable naming the file a renewal reads what its opener's headless sign-in met
 /// from ([`Met`]): an absolute path in a private directory the renewal made for its one run.
 /// The opener writes one closed word and, for a page outcome, its host. Browser-start and
@@ -99,9 +106,19 @@ pub enum MetWord {
     BrowserControl,
     /// The sign-in in aterm's own window returned no validated callback, for a reason none of
     /// the other words names and another try may not meet: a page that did not load, a
-    /// mailbox that did not answer, a deadline
+    /// mailbox that did not answer
     /// ([`super::headless_oauth::BROWSER_SIGN_IN_FAILED`]).
     BrowserSignIn,
+    /// The code page in aterm's sign-in window asked for a login code until the sign-in's
+    /// deadline and nobody typed one, where the window reads no mailbox of the account on this
+    /// Mac (its reason says so). A mailbox the window read and then stopped reading, after reads
+    /// that failed or an answer it could not use, is [`Self::BrowserSignIn`]: another try may
+    /// read it. A sign-in takes it as it takes [`Self::BrowserSignIn`].
+    WindowCodeNoMailbox,
+    /// The sign-in's deadline came in aterm's sign-in window where it stood on no check and no
+    /// code page (its reason says where it stood). A sign-in takes it as it takes
+    /// [`Self::BrowserSignIn`].
+    WindowDeadline,
     /// The sign-in had no desktop session to open aterm's window on
     /// ([`super::headless_oauth::WINDOW_NO_DESKTOP`]).
     WindowNoDesktop,
@@ -126,6 +143,18 @@ pub enum MetWord {
     BotCheck,
     /// Cloudflare's block page ([`super::headless_oauth::BLOCK_PAGE_MET`]).
     BlockPage,
+    /// A token's consent page on the account's headless profile carried a human check's widget
+    /// (hCaptcha, reCAPTCHA or Turnstile) until the drive's deadline, so nothing was pressed
+    /// ([`super::headless_oauth::TOKEN_HUMAN_CHECK`]).
+    HumanCheck,
+    /// A token's consent page on the account's headless profile did not show the account's
+    /// email as the one signed in, or reached its callback with nothing pressed, so nothing was
+    /// pressed or handed over ([`super::headless_oauth::TOKEN_CONSENT_UNPROVEN`]).
+    ConsentUnproven,
+    /// A token's consent page on the account's headless profile named another account as the
+    /// one signed in, so nothing was pressed
+    /// ([`super::headless_oauth::token_consent::WRONG_ACCOUNT`]).
+    ConsentWrongAccount,
     /// No callback in time, on a page that was neither.
     Stall,
     /// The opener did not authorize the sign-in and met none of the above: its reason says why
@@ -141,6 +170,8 @@ impl MetWord {
             MetWord::BrowserStart => "browser-start",
             MetWord::BrowserControl => "browser-control",
             MetWord::BrowserSignIn => "browser-sign-in",
+            MetWord::WindowCodeNoMailbox => "window-code-no-mailbox",
+            MetWord::WindowDeadline => "window-deadline",
             MetWord::WindowNoDesktop => "window-no-desktop",
             MetWord::WindowBotCheck => "window-bot-check",
             MetWord::WindowBlockPage => "window-block-page",
@@ -149,9 +180,53 @@ impl MetWord {
             MetWord::WindowWrongAccount => "window-wrong-account",
             MetWord::BotCheck => "bot-check",
             MetWord::BlockPage => "block-page",
+            MetWord::HumanCheck => "human-check",
+            MetWord::ConsentUnproven => "consent-unproven",
+            MetWord::ConsentWrongAccount => "consent-wrong-account",
             MetWord::Stall => "stall",
             MetWord::NotAuthorized => "not-authorized",
         }
+    }
+
+    /// The word `word` is, as [`Self::as_str`] writes it.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<MetWord> {
+        Self::ALL.into_iter().find(|w| w.as_str() == word)
+    }
+
+    /// Its words alone, with no host and no reason ([`Met::words`]): what a closed record of it
+    /// says.
+    #[must_use]
+    pub fn words(self) -> String {
+        Met::new(self, None).words()
+    }
+
+    /// Whether a token step that ended on it is held until something changes
+    /// (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3 and S1; plan package FL-136): a
+    /// check or a block page, in the headless page or in aterm's window, the consent page's
+    /// human check in either, a consent page that named another account in either or did not
+    /// show the account's own on the headless profile, a window a person closed, no desktop, a
+    /// code page nobody typed a code on where the window read no mailbox, and the window's
+    /// deadline. Nothing re-attempts any of them on a clock. A page that did not load, a mailbox
+    /// that did not answer, a stall, and a browser that did not start or answer hold nothing.
+    #[must_use]
+    pub const fn holds_a_token_step(self) -> bool {
+        matches!(
+            self,
+            Self::BotCheck
+                | Self::BlockPage
+                | Self::HumanCheck
+                | Self::ConsentUnproven
+                | Self::ConsentWrongAccount
+                | Self::WindowNoDesktop
+                | Self::WindowBotCheck
+                | Self::WindowBlockPage
+                | Self::WindowHumanCheck
+                | Self::WindowClosed
+                | Self::WindowWrongAccount
+                | Self::WindowCodeNoMailbox
+                | Self::WindowDeadline
+        )
     }
 
     /// Whether the word leaves the reason unsaid, so the opener's own reason goes with it
@@ -160,7 +235,12 @@ impl MetWord {
     const fn takes_reason(self) -> bool {
         matches!(
             self,
-            Self::BrowserStart | Self::BrowserControl | Self::BrowserSignIn | Self::NotAuthorized
+            Self::BrowserStart
+                | Self::BrowserControl
+                | Self::BrowserSignIn
+                | Self::WindowCodeNoMailbox
+                | Self::WindowDeadline
+                | Self::NotAuthorized
         )
     }
 
@@ -169,6 +249,9 @@ impl MetWord {
             self,
             Self::BotCheck
                 | Self::BlockPage
+                | Self::HumanCheck
+                | Self::ConsentUnproven
+                | Self::ConsentWrongAccount
                 | Self::Stall
                 | Self::WindowBotCheck
                 | Self::WindowBlockPage
@@ -177,10 +260,12 @@ impl MetWord {
     }
 
     /// Every word, in the order the outcome file's reader tries them.
-    const ALL: [MetWord; 13] = [
+    const ALL: [MetWord; 18] = [
         MetWord::BrowserStart,
         MetWord::BrowserControl,
         MetWord::BrowserSignIn,
+        MetWord::WindowCodeNoMailbox,
+        MetWord::WindowDeadline,
         MetWord::WindowNoDesktop,
         MetWord::WindowBotCheck,
         MetWord::WindowBlockPage,
@@ -189,6 +274,9 @@ impl MetWord {
         MetWord::WindowWrongAccount,
         MetWord::BotCheck,
         MetWord::BlockPage,
+        MetWord::HumanCheck,
+        MetWord::ConsentUnproven,
+        MetWord::ConsentWrongAccount,
         MetWord::Stall,
         MetWord::NotAuthorized,
     ];
@@ -369,24 +457,28 @@ impl Met {
             Some((word, host)) => (word, Some(host)),
             None => (line, None),
         };
-        let word = MetWord::ALL.into_iter().find(|w| w.as_str() == word)?;
+        let word = MetWord::parse(word)?;
         let met = Met::new(word, host);
         (met.host.as_deref() == host).then_some(met)
     }
 
-    /// Whether what the sign-in met stops it until something changes that another try does
-    /// not change: Cloudflare's bot check or block page, in the headless page or in aterm's
-    /// own window; the consent page's human check; a consent page that named another account;
-    /// a session with no desktop; a window a person closed. No retry by itself passes one,
-    /// where a stall may clear and a sign-in in the window that failed for any other reason
-    /// ([`MetWord::BrowserSignIn`]: a page that did not load, a mailbox that did not answer,
-    /// a deadline) may not fail the next time.
+    /// Whether what the sign-in met stops it until something changes that another try does not
+    /// change: Cloudflare's bot check or block page, in the headless page or in aterm's own window;
+    /// the consent page's human check, in either; a consent page that named another account, in the
+    /// window or on the account's headless profile, or did not show the account's own there; a
+    /// session with no desktop; a window a person closed. No retry by itself passes one, where a
+    /// stall may clear and a sign-in in the window that failed for any other reason
+    /// ([`MetWord::BrowserSignIn`]: a page that did not load, a mailbox that did not answer;
+    /// [`MetWord::WindowCodeNoMailbox`]; [`MetWord::WindowDeadline`]) may not fail the next time.
     #[must_use]
     pub const fn stopped(&self) -> bool {
         matches!(
             self.word,
             MetWord::BotCheck
                 | MetWord::BlockPage
+                | MetWord::HumanCheck
+                | MetWord::ConsentUnproven
+                | MetWord::ConsentWrongAccount
                 | MetWord::WindowNoDesktop
                 | MetWord::WindowBotCheck
                 | MetWord::WindowBlockPage
@@ -403,6 +495,8 @@ impl Met {
         matches!(
             self.word,
             MetWord::BrowserSignIn
+                | MetWord::WindowCodeNoMailbox
+                | MetWord::WindowDeadline
                 | MetWord::WindowNoDesktop
                 | MetWord::WindowBotCheck
                 | MetWord::WindowBlockPage
@@ -414,14 +508,15 @@ impl Met {
 
     /// Whether a person at this Mac's desk can clear what the sign-in met: Cloudflare's
     /// check, in the headless page or in aterm's window (where they may complete it), the
-    /// consent page's human check in that window, or a session with no desktop (theirs has
-    /// one). The renewal records the row's sign-in as theirs to run
+    /// consent page's human check, in that window or on the headless profile (they may complete
+    /// it in the window), or a session with no desktop (theirs has one). The renewal records the row's sign-in as theirs to run
     /// (`accounts::SignInAction::Renew`).
     #[must_use]
     pub const fn takes_a_person(&self) -> bool {
         matches!(
             self.word,
             MetWord::BotCheck
+                | MetWord::HumanCheck
                 | MetWord::WindowNoDesktop
                 | MetWord::WindowBotCheck
                 | MetWord::WindowHumanCheck
@@ -451,6 +546,13 @@ impl Met {
                 "its sign-in in aterm's sign-in window did not return a validated callback"
                     .to_owned()
             }
+            MetWord::WindowCodeNoMailbox => {
+                "the code page in aterm's sign-in window waited for a login code nobody typed"
+                    .to_owned()
+            }
+            MetWord::WindowDeadline => {
+                "its sign-in in aterm's sign-in window was not completed in time".to_owned()
+            }
             MetWord::WindowNoDesktop => super::headless_oauth::WINDOW_NO_DESKTOP.to_owned(),
             MetWord::WindowClosed => super::headless_oauth::WINDOW_CLOSED.to_owned(),
             MetWord::WindowWrongAccount => super::headless_oauth::WINDOW_WRONG_ACCOUNT.to_owned(),
@@ -473,6 +575,19 @@ impl Met {
                 format!("it met Cloudflare's bot check{on}, which aterm never tries to pass")
             }
             MetWord::BlockPage => format!("it met Cloudflare's block page{on}"),
+            MetWord::HumanCheck => format!(
+                "the token's consent page{on} carried a human check (hCaptcha, reCAPTCHA or \
+                 Turnstile) on the account's headless browser profile; aterm never operates one, \
+                 and pressed nothing there"
+            ),
+            MetWord::ConsentUnproven => format!(
+                "the token's consent page{on} did not show the account as the one signed in, so \
+                 aterm pressed nothing"
+            ),
+            MetWord::ConsentWrongAccount => format!(
+                "the token's consent page{on} named another account as the one signed in on the \
+                 account's headless browser profile, so aterm pressed nothing"
+            ),
             MetWord::Stall => {
                 if self.host.is_some() {
                     format!("its page{on} reached no callback in time")
@@ -3981,8 +4096,8 @@ fn curl_config(options: &[(&'static str, &str)]) -> std::io::Result<String> {
 
 /// The variables of the opener's environment that a curl or headless browser it starts keeps:
 /// where the child runs and how it speaks, and the proxies and certificate stores a request must
-/// honour. Nothing else of the opener's environment reaches the child, the mailbox's credentials
-/// ([`super::headless_oauth::IMAP_PASS_ENV`] and its kin) least of all.
+/// honour. Nothing else of the opener's environment reaches the child, a mailbox URL
+/// ([`MAILBOX_ENV`]) least of all.
 pub(super) const CHILD_ENV_KEPT: &[&str] = &[
     "PATH",
     "HOME",
@@ -4435,7 +4550,7 @@ impl MailboxFlow {
     }
 
     /// The port of the waiting sign-in's loopback listener; none for a hosted flow.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(test, target_os = "macos"))]
     pub(super) fn loopback_port(&self) -> Option<u16> {
         (!self.hosted && self.callback_port != 0).then_some(self.callback_port)
     }
@@ -5199,6 +5314,31 @@ fn finish_window_sign_in(
     1
 }
 
+/// Whether the capture that started this opener serves its token's consent page on the
+/// account's headless profile: `var` holds [`TOKEN_ENV`] as `1`.
+#[must_use]
+pub fn token_consent_granted_by(var: &dyn Fn(&str) -> Option<OsString>) -> bool {
+    var(TOKEN_ENV).is_some_and(|value| value == "1")
+}
+
+/// The opener's exit for a token's consent page served on the account's headless profile
+/// ([`TOKEN_ENV`]): 0 where the page's callback was handed to the waiting `setup-token`; else 1,
+/// with what the page met and why as the record at `outcome_path` ([`note_refused`]) and its
+/// words on standard error. Nothing else opens after it.
+pub(super) fn finish_token_consent(
+    served: Result<(), &'static str>,
+    outcome_path: Option<&Path>,
+) -> u8 {
+    match served {
+        Ok(()) => 0,
+        Err(why) => {
+            note_refused(outcome_path, why);
+            eprintln!("{OPENER}: not authorized: {}", without_addresses(why));
+            1
+        }
+    }
+}
+
 /// What this thread's sign-in met ([`super::headless_oauth::take_met`]), or that the opener did
 /// not authorize it where it met nothing, with the opener's reason `why` where the word leaves
 /// it unsaid ([`Met::because`]): the terminal record a renewal reads, so the reason it prints
@@ -5235,6 +5375,19 @@ fn open_reporting_to(args: Vec<OsString>, outcome_path: Option<&Path>) -> u8 {
     let email = std::env::var(EMAIL_ENV).ok();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let note_failed = |why: &str| note_refused(outcome_path, why);
+    if token_consent_granted_by(&|name| std::env::var_os(name)) {
+        let served = match args.as_slice() {
+            [url] => super::headless_oauth::authorize_token_consent(
+                url,
+                discover_store_dir().as_deref(),
+                super::headless_oauth::infer_account_label_from_env().as_deref(),
+                email.as_deref(),
+                AUTHORIZE_TIMEOUT,
+            ),
+            _ => Err("a token's consent page takes one authorization URL"),
+        };
+        return finish_token_consent(served, outcome_path);
+    }
     let mut continuing_met = None;
     if let Some(path) = std::env::var_os(INPUT_ENV) {
         let result = match args.as_slice() {

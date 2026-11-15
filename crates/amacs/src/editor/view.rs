@@ -98,7 +98,138 @@ pub struct EditorBufferView {
     pub face: Face,
 }
 
+/// Immutable scalar coordinates for a directory refresh; no view authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryCoordinates {
+    // Complete overwritten selection state, containing only scalar positions.
+    selections: Vec<Selection>,
+    primary: usize,
+    desired_column: Option<usize>,
+    point: usize,
+    viewport: usize,
+    seq: Seq,
+    minibuffer: Option<(bool, usize)>,
+    grid: Option<(usize, usize, usize, bool)>,
+}
+impl DirectoryCoordinates {
+    pub(crate) fn anchored_at(&self, seq: Seq) -> bool {
+        self.seq == seq
+    }
+    pub fn point(&self) -> usize {
+        self.point
+    }
+    pub fn prepare(self, deltas: &[EditDelta], point: usize) -> PreparedDirectoryCoordinates {
+        let minibuffer = self
+            .minibuffer
+            .map(|(kind, origin)| (kind, rebase_position(origin, deltas)));
+        let grid = self.grid.map(|(column, start, end, moved)| {
+            let touched = deltas
+                .iter()
+                .any(|delta| delta.old.start <= end && start <= delta.old.end);
+            let next_start = rebase_position(start, deltas);
+            let next_end = rebase_position(end, deltas).max(next_start);
+            (column, next_start, next_end, moved || touched)
+        });
+        PreparedDirectoryCoordinates {
+            source: self,
+            point,
+            minibuffer,
+            grid,
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct PreparedDirectoryCoordinates {
+    source: DirectoryCoordinates,
+    point: usize,
+    minibuffer: Option<(bool, usize)>,
+    grid: Option<(usize, usize, usize, bool)>,
+}
+impl PreparedDirectoryCoordinates {
+    pub fn source(&self) -> &DirectoryCoordinates {
+        &self.source
+    }
+}
+
 impl EditorBufferView {
+    fn directory_minibuffer_origin(&self) -> Option<(bool, usize)> {
+        match self.minibuffer {
+            Minibuffer::Search { origin, .. } => Some((false, origin)),
+            Minibuffer::GotoLine { origin, .. } => Some((true, origin)),
+            _ => None,
+        }
+    }
+    fn directory_grid_coordinates(&self) -> Option<(usize, usize, usize, bool)> {
+        match &self.face {
+            Face::Grid(grid) => grid.draft.as_ref().map(|draft| {
+                (
+                    draft.column,
+                    draft.record.start,
+                    draft.record.end,
+                    draft.moved,
+                )
+            }),
+            _ => None,
+        }
+    }
+    /// Capture complete overwritten scalar state. Work follows the view's
+    /// selection count, never document bytes, entries or text fragments.
+    pub fn directory_coordinates(&self) -> DirectoryCoordinates {
+        DirectoryCoordinates {
+            selections: self.selections.clone(),
+            primary: self.primary,
+            desired_column: self.desired_column,
+            point: self.primary_selection().head,
+            viewport: self.viewport_anchor,
+            seq: self.anchor_seq,
+            minibuffer: self.directory_minibuffer_origin(),
+            grid: self.directory_grid_coordinates(),
+        }
+    }
+    /// Validate the entire captured state without cloning selections or text.
+    pub fn matches_directory_coordinates(&self, source: &DirectoryCoordinates) -> bool {
+        self.selections == source.selections
+            && self.primary == source.primary
+            && self.desired_column == source.desired_column
+            && self.primary_selection().head == source.point
+            && self.viewport_anchor == source.viewport
+            && self.anchor_seq == source.seq
+            && self.directory_minibuffer_origin() == source.minibuffer
+            && self.directory_grid_coordinates() == source.grid
+    }
+    /// Validate and transfer scalar coordinates. Text and draft strings stay on UI.
+    pub fn adopt_directory_coordinates(
+        &mut self,
+        prepared: PreparedDirectoryCoordinates,
+        seq: Seq,
+    ) -> bool {
+        if !self.matches_directory_coordinates(&prepared.source) {
+            return false;
+        }
+        if let Some((_, next)) = prepared.minibuffer {
+            match &mut self.minibuffer {
+                Minibuffer::Search { origin, .. } | Minibuffer::GotoLine { origin, .. } => {
+                    *origin = next
+                }
+                _ => unreachable!("validated directory minibuffer"),
+            }
+        }
+        if let Some((_, start, end, moved)) = prepared.grid
+            && let Face::Grid(grid) = &mut self.face
+            && let Some(draft) = grid.draft.as_mut()
+        {
+            draft.record = start..end;
+            draft.moved = moved;
+        }
+        self.selections.clear();
+        self.selections.push(Selection::caret(prepared.point));
+        self.primary = 0;
+        self.viewport_anchor = prepared.point;
+        self.anchor_seq = seq;
+        self.desired_column = None;
+        true
+    }
+
     pub fn new(document: DocumentId, document_view: DocumentViewId, anchor_seq: Seq) -> Self {
         Self {
             document,

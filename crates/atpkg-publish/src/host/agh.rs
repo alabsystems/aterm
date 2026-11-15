@@ -104,7 +104,7 @@ impl AghHost {
         let resolved = if learn {
             agh::routing::adopt_for_host(&base, dirs)
         } else {
-            agh::routing::view_for_host(dirs, base.env())
+            agh::routing::view_for_host(dirs)
         };
         let refused = |error: &agh::Error, next: bool| {
             let why = if next {

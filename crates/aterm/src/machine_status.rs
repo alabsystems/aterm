@@ -579,7 +579,7 @@ pub(crate) fn membership_area(standing: &Standing, setup: &Setup) -> Area {
         Standing::Allowed { held: true, .. } => Area::off(NAME, says),
         Standing::Allowed { fix: Some(fix), .. } => Area::due(
             NAME,
-            "allowed: ~/.secrets is written",
+            "allowed: this Mac reads the vault",
             Who::Agent,
             fix.clone(),
         ),
@@ -766,7 +766,7 @@ pub(crate) fn name_area(name: &Result<crate::converge::MacName, String>) -> Area
                 NAME,
                 format!("{target}; fleet name left as it is: {other} answers to {target}"),
                 Who::Agent,
-                "name this Mac another way in the fleet (`aterm fleet name set <name>`)",
+                "choose this Mac another number (`aterm name set <mN|N>`)",
             );
         }
         FleetName::Current | FleetName::Kept(_) | FleetName::NotApplicable(_) => {}
@@ -1394,9 +1394,13 @@ fn read_areas() -> Vec<Area> {
     let token = {
         let home = aterm_types::dirs::home_dir();
         bounded(move || {
+            // The store holds the development token (read in place; no file is consulted).
             home.is_some_and(|home| {
-                std::fs::symlink_metadata(agh::identity::vault::Slot::Dev.path(&home))
-                    .is_ok_and(|meta| meta.is_file())
+                aterm_secrets::client::read_in_place(
+                    &aterm_secrets::client::Paths::locate_for_home(&home),
+                    aterm_secrets::entry_class::DEV_GH_TOKEN,
+                )
+                .is_ok_and(|token| token.is_some())
             })
         })
     };

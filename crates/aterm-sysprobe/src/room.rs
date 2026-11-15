@@ -44,9 +44,46 @@ pub struct TaskRoom {
 /// The machine's [`TaskRoom`], its per-user pair for real user `uid`.
 #[must_use]
 pub fn task_room(uid: u32) -> TaskRoom {
+    let (procs, user_procs) = pid_counts(uid);
+    task_tables(uid).with_pids(procs, user_procs)
+}
+
+/// Every process on the machine and those real user `uid` runs where the counts come from the
+/// pid lists, which a process in the middle of an exec can hold (macOS); `(None, None)` where
+/// [`task_tables`] reads them with the rest.
+#[must_use]
+pub fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     #[cfg(target_os = "macos")]
     {
-        imp::task_room(uid)
+        crate::macos::pid_counts(uid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = uid;
+        (None, None)
+    }
+}
+
+impl TaskRoom {
+    /// This room with the pid lists' counts ([`pid_counts`]) where it has none of its own.
+    #[must_use]
+    pub fn with_pids(self, procs: Option<u64>, user_procs: Option<u64>) -> Self {
+        Self {
+            procs: self.procs.or(procs),
+            user_procs: self.user_procs.or(user_procs),
+            ..self
+        }
+    }
+}
+
+/// The machine's [`TaskRoom`] but the counts that read the pid lists ([`pid_counts`]): what a
+/// reading reads on its own thread, the pid lists on a lane of their own.
+#[must_use]
+pub fn task_tables(uid: u32) -> TaskRoom {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = uid;
+        imp::task_room()
     }
     #[cfg(target_os = "linux")]
     {
@@ -215,18 +252,17 @@ mod imp {
         of_load_info(info, cores())
     }
 
-    pub(super) fn task_room(uid: u32) -> TaskRoom {
+    pub(super) fn task_room() -> TaskRoom {
         let positive = |name: &CStr| {
             crate::macos::sysctl_int(name)
                 .and_then(|v| u64::try_from(v).ok())
                 .filter(|v| *v > 0)
         };
-        let (procs, user_procs) = crate::macos::pid_counts(uid);
         let (threads, run_queue) = threads_and_queue();
         TaskRoom {
-            procs,
+            procs: None,
             procs_max: positive(c"kern.maxproc"),
-            user_procs,
+            user_procs: None,
             user_procs_max: crate::machine::smaller(
                 positive(c"kern.maxprocperuid"),
                 crate::machine::nproc_rlimit(),

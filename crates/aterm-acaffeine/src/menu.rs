@@ -10,6 +10,8 @@ use crate::model::{Choice, Clocks, Mode, Pause, describe_left};
 /// One user action from the menu, carried by the item's tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuAction {
+    /// Open aterm: open the aterm app the mug was started from ([`Shown::aterm`]).
+    OpenAterm,
     /// Activate for a span, or forever.
     Activate(Choice),
     /// Keep Awake with Lid Closed: turn the person's opt-in on or off.
@@ -22,7 +24,8 @@ pub enum MenuAction {
 
 impl MenuAction {
     /// Every action, in menu order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
+        Self::OpenAterm,
         Self::Activate(Choice::Hours1),
         Self::Activate(Choice::Hours8),
         Self::Activate(Choice::Hours24),
@@ -44,6 +47,7 @@ impl MenuAction {
             Self::ToggleStartup => 5,
             Self::Quit => 6,
             Self::ToggleLid => 7,
+            Self::OpenAterm => 8,
         }
     }
 
@@ -59,6 +63,7 @@ impl MenuAction {
             5 => Some(Self::ToggleStartup),
             6 => Some(Self::Quit),
             7 => Some(Self::ToggleLid),
+            8 => Some(Self::OpenAterm),
             _ => None,
         }
     }
@@ -91,6 +96,8 @@ pub fn about_line(version: &str) -> String {
     )
 }
 
+/// The title of Open aterm.
+pub const OPEN_ATERM_LABEL: &str = "Open aterm";
 /// The title of Quit.
 pub const QUIT_LABEL: &str = "Quit aCaffeine";
 /// The title of Keep Awake with Lid Closed: macOS honours the assertion it holds only on AC
@@ -110,11 +117,14 @@ pub const fn pause_line(pause: Pause) -> &'static str {
     }
 }
 
-/// What the menu shows besides the mode: Enable at Startup (`startup`), Keep Awake with Lid
-/// Closed (`lid_awake`), the pause the mug is in, if any, and the `version` the about line
-/// names.
+/// What the menu shows besides the mode: Open aterm (`aterm`), Enable at Startup (`startup`),
+/// Keep Awake with Lid Closed (`lid_awake`), the pause the mug is in, if any, and the `version`
+/// the about line names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shown<'a> {
+    /// Open aterm: there is an aterm app to open, the bundle the mug was started from. A mug
+    /// started from a bare build has none, and its menu has no such row.
+    pub aterm: bool,
     /// Enable at Startup.
     pub startup: Startup,
     /// Keep Awake with Lid Closed.
@@ -129,6 +139,7 @@ pub struct Shown<'a> {
 #[must_use]
 pub fn compose(mode: Mode, now: Clocks, shown: Shown<'_>) -> Vec<Row> {
     let Shown {
+        aterm,
         startup,
         lid_awake,
         paused,
@@ -141,6 +152,14 @@ pub fn compose(mode: Mode, now: Clocks, shown: Shown<'_>) -> Vec<Row> {
         rows.push(Row::Info(pause_line(pause).to_string()));
     }
     rows.push(Row::Separator);
+    if aterm {
+        rows.push(Row::Action {
+            label: OPEN_ATERM_LABEL.to_string(),
+            action: MenuAction::OpenAterm,
+            checked: false,
+        });
+        rows.push(Row::Separator);
+    }
     for choice in Choice::ALL {
         let checked = current == Some(choice);
         let label = match (checked, left) {

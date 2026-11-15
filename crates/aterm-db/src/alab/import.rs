@@ -5,7 +5,9 @@
 //! docs/DESIGN-alab-one-mesh-2026-11-05.md §4.7, §8): the owner's sheets, the harness's files,
 //! the machines this Mac knows of and fleet_db replicas' dumps, planned as typed registry
 //! writes. Pure: the caller hands in the parsed sources, the registry's cells as they are, the
-//! table's Secret sealer and the harness's reading of a provider cell; nothing here does I/O.
+//! secret store's reading of the entries its secret cells name, and the harness's reading of a
+//! provider cell; nothing here writes. The plan lists the store entries to put beside the rows
+//! (`Plan::puts`); the caller puts them as it commits the rows.
 //!
 //! - **Never over the owner, and a sheet only fills.** Each source is read in a [`Mode`]. An
 //!   [`Mode::Authoritative`] source (the one replica that holds the corrected rows, imported on
@@ -17,12 +19,21 @@
 //!   (`source.differs`), never with a value. A cell the owner set, cleared or resolved since,
 //!   or a conflicted one, is left as it is and becomes a finding. A row the owner retired is
 //!   left whole. An unchanged cell costs nothing, so a re-run writes nothing.
-//! - **Passwords and phone numbers are `Secret` cells.** A dump's password and a full phone
-//!   number are sealed at their cell's coordinates through the table's [`Sealer`], compared by
-//!   opening the stored token (never by its randomized bytes), so a re-run writes nothing. A
-//!   sheet's `Password` column is a has-password flag and never becomes a `Secret`; any `Secret`
-//!   value that reads as a flag (`1`, `yes`, under six characters) is refused with a finding. A
-//!   protected address holds no password ([`crate::typed::check::protected`]).
+//! - **Passwords are named secret-store entries.** A dump's or a mailbox file's password goes
+//!   into a fresh store entry of its cell ([`secret::fresh_entry`]: its own name tagged with
+//!   fresh randomness), and the cell holds only that reference
+//!   ([`secret::reference`]); the entry a replaced value named is removed once the write lands. A held password is compared by reading the entry
+//!   the cell names ([`Secret::same`]), so a re-run writes nothing. A sheet's `Password` column is
+//!   a has-password flag and never becomes a secret; any secret value that reads as a flag (`1`,
+//!   `yes`, under six characters) is refused with a finding. A protected address holds no password
+//!   ([`crate::typed::check::protected`]). A phone number is ordinary data: its digits are the
+//!   `number` cell's plain text.
+//! - **A generation older builds read keeps its form** ([`Sealed`], [`plan_sealed`]). The
+//!   registry generations builds up to 0.200.0 read hold a password, a TOTP seed and a phone's
+//!   number as sealed tokens. A plan against one compares a held number by opening it and seals
+//!   the number it writes; it compares a held secret by opening it too, in memory only, so a
+//!   re-run writes nothing, and seals a secret it writes at its cell's coordinates, the form
+//!   those builds read. No such plan asks the store or names an entry.
 //! - **What the sheets stop saying is retracted, three-way too.** A cell an earlier import of
 //!   a source kind read now wrote, and that source no longer states, is withdrawn: a set element
 //!   (a service, an alias) becomes `false`, a region, flow, mailbox link, alias link, note or rank
@@ -60,7 +71,7 @@
 //! - **A mailbox is its login's** (one-mesh design §4.7): a receiving mailbox becomes a row keyed
 //!   from its login address's key ([`keys::mailbox_pk`]), with a plain label, a service and its
 //!   `login`, that member-readable address row. A phone's key is random; the importer finds an
-//!   existing phone by opening its `number`. No phone row is made from free text.
+//!   existing phone by its plain `number`. No phone row is made from free text.
 //! - **Labels** go through the one parser (`machines::Reading`): `M109` is `m109`, `m27-2` is
 //!   number 2 on m27, `m3.2` number 2 on m3, a bare `m3` number 1. A machine matches a row by
 //!   fleet node, host, then label or alias ([`names`]), before a placeholder is minted, so a
@@ -85,10 +96,10 @@ use crate::{
     database::Change,
     machines::{Label, Reading},
     typed::{
-        Collection,
-        cell::{self, CellKey, CellValue, Cells, Field, ImportStep, Projection},
+        Collection, Table,
+        cell::{self, CellKey, CellValue, Cells, Field, ImportStep, Projection, phone_digits},
         check, guard, keys,
-        secret::{MASK, Sealer, Secret, cell_claims, flag_like},
+        secret::{self, Sealer, Secret, Store, cell_claims, flag_like},
     },
 };
 use aterm_codec::hex;
@@ -402,7 +413,8 @@ impl Sheet {
     }
 
     /// A harness file as a sheet: one row per [`Stated`] row, so its coordinates, source row and
-    /// review work as a sheet's do. The file is read from `~/.secrets`, so its source key and
+    /// review work as a sheet's do. The file is a vault entry (read in place from this Mac's store,
+    /// or a file the person named in its place), so its source key and
     /// `sha256` are its keyed digest under `everyone_key` ([`keyed_source`]), never a plain hash
     /// of a secrets file, tokens or not.
     ///
@@ -679,7 +691,7 @@ pub enum Kind {
     /// A fill-only source states this cell differently from what another source or the owner
     /// wrote: left as it is, recorded by key and column in the source's row.
     Differs,
-    /// A `Secret` value that reads as a flag (`1`, `yes`, under six characters): never written.
+    /// A secret value that reads as a flag (`1`, `yes`, under six characters): never written.
     SecretFlagLike,
     /// A dump made without `--show-passwords` (`<redacted>`): never written.
     SecretRedacted,
@@ -779,6 +791,12 @@ pub struct Planned {
 pub struct Plan {
     /// One row's changes per entry, source rows first; pack them into records.
     pub rows: Vec<Vec<Change>>,
+    /// The secret-store entries the rows' secret cells name, each with the value to put there:
+    /// put as the rows commit, never on a dry run.
+    pub puts: Vec<(String, Arc<Secret>)>,
+    /// The secret-store entries the values the rows replace named: removed once the rows land,
+    /// never on a dry run.
+    pub removes: Vec<String>,
     pub findings: Vec<Finding>,
     pub counts: BTreeMap<&'static str, Count>,
     pub planned: Vec<Planned>,
@@ -804,13 +822,24 @@ pub enum Births {
     Listed,
 }
 
+/// A registry generation that holds a password, a TOTP seed and a phone's number as sealed
+/// tokens, the form builds up to 0.200.0 read, with the sealer of its tokens: what a plan
+/// against such a generation needs beside its [`Input`] ([`plan_sealed`]).
+#[derive(Clone, Copy)]
+pub struct Sealed<'a> {
+    /// The generation's own table, whose collections type those columns as sealed.
+    pub table: &'a Table,
+    pub sealer: &'a dyn Sealer,
+}
+
 /// Everything one import reads.
 pub struct Input<'a> {
     pub sheets: &'a [Sheet],
     pub macs: &'a [KnownMac],
     pub vendors: &'a dyn Vendors,
-    /// The registry's Secret cells: sealing an imported value and opening a held one.
-    pub sealer: &'a dyn Sealer,
+    /// The secret store the registry's secret cells name entries of: read to compare a wanted
+    /// value with the entry a cell already names, never written here.
+    pub store: &'a dyn Store,
     /// The importing Mac's clock, for the source rows' `at` (a claim, never an ordering input).
     pub now_ms: u64,
     /// Which machines with no row this run births one for.
@@ -1147,7 +1176,7 @@ struct Want {
     at: Coord,
 }
 
-/// One wanted `Secret` cell: the plaintext stays in its zeroizing type.
+/// One wanted secret cell: the plaintext stays in its zeroizing type.
 #[derive(Clone, Debug)]
 struct SecretWant {
     value: Arc<Secret>,
@@ -1167,12 +1196,17 @@ struct RowWant {
 
 struct Planner<'a> {
     input: &'a Input<'a>,
+    /// The generation planned against, where it holds its secrets and numbers sealed.
+    sealed: Option<Sealed<'a>>,
+    /// Whether a phone row's sealed number did not open here ([`lifted`]): whether the registry
+    /// already holds a number no opened row holds is then unknown.
+    unopened_numbers: bool,
     current: BTreeMap<&'static str, Projection>,
     /// `current`'s address rows by what each row's `addr` says now.
     address_index: AddressIndex,
     rows: BTreeMap<&'static str, BTreeMap<String, RowWant>>,
     findings: BTreeSet<Finding>,
-    /// Phone keys by their number's digits, found or minted this run, so every source naming
+    /// Phone keys by their plain number, found or minted this run, so every source naming
     /// one number names one row.
     phones: BTreeMap<String, String>,
     /// Address keys a source read now marks protected.
@@ -1225,14 +1259,49 @@ struct Planner<'a> {
     joined: BTreeSet<String>,
 }
 
-/// The digits of a phone number as the registry keeps them: ASCII digits only, a US number's
-/// leading country `1` dropped, as fleet_db normalized it. `None` below four digits.
-fn phone_digits(raw: &str) -> Option<String> {
-    let mut digits: String = raw.chars().filter(char::is_ascii_digit).collect();
-    if digits.len() == 11 && digits.starts_with('1') {
-        digits.remove(0);
+/// The store entries the candidates of a secret cell (`collection.column` of row `pk`) name,
+/// those bound to the cell only ([`secret::bound`]).
+fn held_entries(
+    field: Option<&Field>,
+    collection: &str,
+    column: &str,
+    pk: &str,
+) -> BTreeSet<String> {
+    field
+        .map(|field| {
+            field
+                .candidates()
+                .iter()
+                .filter_map(|c| secret::entry_of(&c.value.x))
+                .filter(|entry| secret::bound(collection, column, pk, entry))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the value `held` of the secret cell `collection.column` of row `pk` names an entry of
+/// this store's vault bound to the cell ([`secret::bound`]) that holds `wanted`. A reference to
+/// another vault or another cell's entry is never read: it is no value of the cell, so the
+/// import writes the cell's own.
+///
+/// # Errors
+/// The store cannot name its vault or read the entry the reference names.
+fn store_holds(
+    store: &dyn Store,
+    (collection, column, pk): (&str, &str, &str),
+    held: &Value,
+    wanted: &Secret,
+) -> Result<bool> {
+    let Some(entry) = secret::entry_of(held) else {
+        return Ok(false);
+    };
+    if held.get("vault").and_then(Value::as_str) != Some(store.vault()?.as_str())
+        || !secret::bound(collection, column, pk, entry)
+    {
+        return Ok(false);
     }
-    (digits.len() >= 4).then_some(digits)
+    Ok(store.get(entry)?.is_some_and(|value| value.same(wanted)))
 }
 
 /// Every address the sheets list as an AI login (their email column), credential-shaped cells
@@ -1260,7 +1329,7 @@ fn listed_logins(sheets: &[Sheet]) -> BTreeSet<String> {
 /// The label a harness file's keyed source digest derives its key under ([`Sheet::stated`]).
 const HARNESS_SOURCE_DIGEST: &[u8] = b"aterm/alab/harness-source-digest/1\0";
 
-/// A source read from secrets (a fleet_db dump, a `~/.secrets` harness file) as its source key
+/// A source read from secrets (a fleet_db dump, a harness entry of the vault) as its source key
 /// and `sha256`: HMAC-SHA256 of `bytes` under a key HKDF derives from `everyone_key` (the newest
 /// `[everyone]` epoch's) for `label` alone, as [`covered::replica_digest`] derives its own. Every
 /// member holds that key, so every Mac names one source alike and a changed byte (one password)
@@ -1314,21 +1383,149 @@ fn roster_source(macs: &[KnownMac]) -> (String, String) {
 /// A value the importer built breaks its column's type, which is a bug, not a sheet problem
 /// (sheet problems are findings).
 pub fn plan(input: &Input<'_>, view: &crate::att::View) -> Result<Plan> {
-    plan_with(input, |collection| view.project(collection))
+    plan_with(input, None, false, |collection| view.project(collection))
 }
 
-/// Plan a diagnostic preview where no registry is held; this never authorizes a write.
-pub(crate) fn plan_unheld(input: &Input<'_>) -> Result<Plan> {
-    plan_with(input, |collection| cell::project(collection, &Cells::new()))
+/// [`plan`] over a generation that holds its secrets and phone numbers as sealed tokens
+/// ([`Sealed`]). A held number is opened in memory to be compared ([`lifted`]) and a number the
+/// plan writes is sealed as that generation holds it ([`lower`]); a held secret is compared by
+/// opening its token, in memory only, and a secret the plan writes is sealed at its cell's
+/// coordinates. The store is never asked.
+///
+/// # Errors
+/// As [`plan`]; a source states a number no opened phone row holds while another row's number
+/// does not open with the key this Mac holds; or a number cannot be sealed.
+pub fn plan_sealed(input: &Input<'_>, view: &crate::att::View, sealed: Sealed<'_>) -> Result<Plan> {
+    let (phones, unopened) = lifted(&view.cells, sealed);
+    let mut plan = plan_with(input, Some(sealed), unopened, |collection| {
+        if collection.name == PHONE.name {
+            cell::project(collection, &phones)
+        } else {
+            view.project(collection)
+        }
+    })?;
+    lower(&mut plan, sealed)?;
+    Ok(plan)
+}
+
+/// The phone rows of `cells`, a sealed generation's, as the planner reads them: each `number`
+/// candidate the generation holds as a token opened to its plain digits, in memory only, and
+/// whether any did not open. One that does not open (no key of its epoch here, a token that does
+/// not authenticate) stays a token, which is no number.
+fn lifted(cells: &Cells, sealed: Sealed<'_>) -> (Cells, bool) {
+    let mut unopened = false;
+    let lifted = cells
+        .range((PHONE.name.to_owned(), String::new())..)
+        .take_while(|((name, _), _)| name == PHONE.name)
+        .map(|(at, held)| {
+            let mut held = held.clone();
+            let Ok(key) = CellKey::parse(&at.1) else {
+                return (at.clone(), held);
+            };
+            if key.col != "number" || key.elem.is_some() {
+                return (at.clone(), held);
+            }
+            let mut open = |value: &Value| -> Option<Value> {
+                let mut value = CellValue::decode(value).ok()?;
+                let token = value.x.as_str().filter(|text| secret::is_sealed(text))?;
+                match sealed.sealer.open(PHONE.name, key.pk, "number", token) {
+                    Ok(number) => {
+                        value.x = Value::String(number.plaintext().to_owned());
+                        Some(value.encode())
+                    }
+                    Err(_) => {
+                        unopened = true;
+                        None
+                    }
+                }
+            };
+            for candidate in &mut held.candidates {
+                let opened = match cell::carried(&candidate.value) {
+                    Some(items) => cell::carry(
+                        &items
+                            .into_iter()
+                            .map(|(operation, value)| {
+                                let value = open(&value).unwrap_or(value);
+                                (operation, value)
+                            })
+                            .collect(),
+                    ),
+                    None => open(&candidate.value),
+                };
+                if let Some(opened) = opened {
+                    candidate.value = opened;
+                }
+            }
+            (at.clone(), held)
+        })
+        .collect();
+    (lifted, unopened)
+}
+
+/// `plan`'s rows as a sealed generation holds them: each value the plan writes into a column
+/// that generation holds sealed though it is ordinary data
+/// ([`crate::typed::Column::sealed_ordinary`]: a phone's `number`) sealed under the generation's
+/// key at its coordinates, and checked as that generation's own cell. The review
+/// ([`Plan::planned`]) keeps the plain number, which is ordinary data.
+fn lower(plan: &mut Plan, sealed: Sealed<'_>) -> Result<()> {
+    for change in plan.rows.iter_mut().flatten() {
+        let Some(collection) = sealed.table.collection(&change.collection) else {
+            continue;
+        };
+        let lowered = {
+            let key = CellKey::parse(&change.key)?;
+            let Some(value) = change.value.as_ref() else {
+                continue;
+            };
+            if key.elem.is_some()
+                || !collection
+                    .column(key.col)
+                    .is_some_and(crate::typed::Column::sealed_ordinary)
+            {
+                continue;
+            }
+            let mut value = CellValue::decode(value)?;
+            let Some(plain) = value.x.as_str().filter(|text| !secret::is_sealed(text)) else {
+                continue;
+            };
+            value.x = Value::String(sealed.sealer.seal(
+                collection.name,
+                key.pk,
+                key.col,
+                &Secret::new(plain.to_owned()),
+            )?);
+            value.r = value.r.min(collection.version);
+            cell::change(collection, key, &value)?
+        };
+        *change = lowered;
+    }
+    Ok(())
+}
+
+/// Plan a diagnostic preview where no registry is held; this never authorizes a write. `sealed`
+/// is the generation the plan would be written into where that one holds sealed tokens, with a
+/// sealer that seals nothing; `None` plans against the store.
+pub(crate) fn plan_unheld(input: &Input<'_>, sealed: Option<Sealed<'_>>) -> Result<Plan> {
+    let mut plan = plan_with(input, sealed, false, |collection| {
+        cell::project(collection, &Cells::new())
+    })?;
+    if let Some(sealed) = sealed {
+        lower(&mut plan, sealed)?;
+    }
+    Ok(plan)
 }
 
 #[cfg(test)]
 pub(crate) fn plan_cells(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
-    plan_with(input, |collection| cell::project(collection, cells))
+    plan_with(input, None, false, |collection| {
+        cell::project(collection, cells)
+    })
 }
 
 fn plan_with(
     input: &Input<'_>,
+    sealed: Option<Sealed<'_>>,
+    unopened_numbers: bool,
     mut project: impl FnMut(&'static Collection) -> Projection,
 ) -> Result<Plan> {
     let current: BTreeMap<&'static str, Projection> = [
@@ -1346,6 +1543,8 @@ fn plan_with(
     let mut names_reached = BTreeMap::new();
     loop {
         let mut planner = Planner::new(input, current.clone(), names_reached);
+        planner.sealed = sealed;
+        planner.unopened_numbers = unopened_numbers;
         let mut order: Vec<usize> = (0..input.sheets.len()).collect();
         order.sort_by_key(|&n| (input.sheets[n].mode, input.sheets[n].kind));
         planner.dump_marks();
@@ -1375,6 +1574,8 @@ impl<'a> Planner<'a> {
         let address_index = AddressIndex::of(&current[ADDRESS.name]);
         Self {
             input,
+            sealed: None,
+            unopened_numbers: false,
             current,
             address_index,
             rows: BTreeMap::new(),
@@ -1524,7 +1725,7 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// Want `value` in the `Secret` cell `collection.pk.col` from `at`: refused when it reads as
+    /// Want `value` in the secret cell `collection.pk.col` from `at`: refused when it reads as
     /// a flag or a redaction, and kept to the first source that states it, a different value
     /// from a lower one being a disagreement by coordinates only.
     fn want_secret(
@@ -2568,43 +2769,35 @@ impl Planner<'_> {
         Ok(Some(pk))
     }
 
-    /// The phone row of a number (`raw`, at least four digits once read by [`phone_digits`]):
-    /// the row this run already named for it, else the live row whose sealed `number` opens to
-    /// it (the smallest key, with a finding, where several do), else a fresh random key and
-    /// label (`label` where it names one no row holds). Its `number` is wanted as a `Secret`
-    /// and its `last4` beside it.
+    /// The phone row of a number (`raw`, a stored phone number once read by [`phone_digits`]):
+    /// the row this run already named for it, else the live row whose plain `number` says it
+    /// (the smallest key, with a finding, where several do), else a fresh random key and label
+    /// (`label` where it names one no row holds). Its `number` and its `last4` are wanted beside it.
     fn phone(&mut self, raw: &str, label: Option<&str>, at: &Coord) -> Result<Option<String>> {
         let Some(digits) = phone_digits(raw) else {
             return Ok(None);
         };
         let last4 = digits[digits.len() - 4..].to_owned();
-        let number = Arc::new(Secret::new(digits.clone()));
         let pk = if let Some(pk) = self.phones.get(&digits) {
             pk.clone()
         } else {
-            let sealer = self.input.sealer;
             // Every row holding the number, live ones first: a retired row is found and left as
             // it is, as a retired address is, never minted again.
-            let mut held: Vec<(bool, String)> = Vec::new();
-            let mut unopened = false;
-            for (pk, row) in &self.current[PHONE.name].rows {
-                let tokens: Vec<&Value> = row
-                    .fields
-                    .get("number")
-                    .map(Field::candidates_x)
-                    .unwrap_or_default();
-                let mut holds = false;
-                for token in tokens.into_iter().filter_map(Value::as_str) {
-                    match sealer.open(PHONE.name, pk, "number", token) {
-                        Ok(opened) if opened.same(&number) => holds = true,
-                        Ok(_) => {}
-                        Err(_) => unopened = true,
-                    }
-                }
-                if holds {
-                    held.push((!row.live(), pk.clone()));
-                }
-            }
+            let mut held: Vec<(bool, String)> = self.current[PHONE.name]
+                .rows
+                .iter()
+                .filter(|(_, row)| {
+                    row.fields
+                        .get("number")
+                        .map(Field::candidates_x)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(Value::as_str)
+                        .filter(|held| !secret::is_sealed(held))
+                        .any(|held| phone_digits(held).as_deref() == Some(digits.as_str()))
+                })
+                .map(|(pk, row)| (!row.live(), pk.clone()))
+                .collect();
             held.sort_unstable();
             let live = held.iter().filter(|(retired, _)| !retired).count();
             if live > 1 {
@@ -2616,7 +2809,7 @@ impl Planner<'_> {
                     at: vec![at.clone()],
                 });
             }
-            if held.is_empty() && unopened {
+            if held.is_empty() && self.unopened_numbers {
                 return Err(Error::new(
                     "a phone row's number does not open with the key this Mac holds, so whether \
                      the registry already holds a number is unknown: import where every number opens",
@@ -2651,11 +2844,11 @@ impl Planner<'_> {
                     pk
                 }
             };
-            self.phones.insert(digits, pk.clone());
+            self.phones.insert(digits.clone(), pk.clone());
             pk
         };
         self.want(&PHONE, &pk, "last4", json!(last4), at);
-        self.want_secret(&PHONE, &pk, "number", number, at);
+        self.want(&PHONE, &pk, "number", json!(digits), at);
         Ok(Some(pk))
     }
 
@@ -3031,6 +3224,7 @@ impl Planner<'_> {
     fn finish(self) -> Result<Plan> {
         let Self {
             input,
+            sealed,
             current,
             mut rows,
             findings,
@@ -3329,7 +3523,8 @@ impl Planner<'_> {
                         )?;
                     }
                 }
-                // Secret cells: sealed to this cell's coordinates, compared by opening, never shown.
+                // Secret cells: each names the store entry of its coordinates, compared by reading
+                // the entry the held reference names, the value never in a change or a review.
                 let guarded = (name == ADDRESS.name && protected.contains(pk))
                     || current_row.is_some_and(check::protected);
                 // Merged once `step` is done with them.
@@ -3349,25 +3544,80 @@ impl Planner<'_> {
                         });
                         continue;
                     }
-                    let holds = |held: &Value| {
-                        held.as_str().is_some_and(|token| {
-                            input.sealer.holds(name, pk, column, token, &wanted.value)
-                        })
+                    // What the review shows for the cell: the reference it holds, or the one the
+                    // write gives it.
+                    let mut shown = field.and_then(Field::value).cloned().unwrap_or(Value::Null);
+                    // `decide` asks only of a held value; the store is read once, before it. A
+                    // sealed generation's token is opened instead, and the store never asked.
+                    let holds = match (field, sealed) {
+                        (Some(Field::Value(candidate)), Some(sealed)) => {
+                            candidate.value.x.as_str().is_some_and(|token| {
+                                sealed.sealer.holds(name, pk, column, token, &wanted.value)
+                            })
+                        }
+                        (Some(Field::Value(candidate)), None) => store_holds(
+                            input.store,
+                            (name, column, pk),
+                            &candidate.value.x,
+                            &wanted.value,
+                        )?,
+                        _ => false,
                     };
+                    if sealed.is_some() {
+                        // What the review shows for a sealed cell is that it is set, never its
+                        // token.
+                        shown = if shown.is_null() {
+                            Value::Null
+                        } else {
+                            Value::String(secret::MASK.to_owned())
+                        };
+                    }
                     let decided = decide(
                         field,
-                        holds,
+                        |_| holds,
                         mode_of(wanted.at.sheet),
                         own(field, wanted.at.sheet),
                     );
-                    let outcome = match decided {
-                        Decided::Write => {
-                            let token = input.sealer.seal(name, pk, column, &wanted.value)?;
+                    let outcome = match (decided, sealed) {
+                        // A generation older builds read takes a secret in the one form they
+                        // read: a token sealed at the cell's coordinates under its key, checked
+                        // as that generation's own cell.
+                        (Decided::Write, Some(sealed)) => {
                             count.cells += 1;
                             secret_touched.push(wanted.at.sheet);
+                            let token = sealed.sealer.seal(name, pk, column, &wanted.value)?;
+                            let held_as = sealed.table.collection(name).unwrap_or(collection);
+                            let value = CellValue::imported(
+                                held_as.version.min(collection.version),
+                                Value::String(token),
+                                &wanted.at.source,
+                            );
+                            changes.push(cell::change(
+                                held_as,
+                                CellKey {
+                                    pk,
+                                    col: column,
+                                    elem: None,
+                                },
+                                &value,
+                            )?);
+                            shown = Value::String(secret::MASK.to_owned());
+                            Step::Write
+                        }
+                        (Decided::Write, None) => {
+                            count.cells += 1;
+                            secret_touched.push(wanted.at.sheet);
+                            // A fresh entry of the cell, no other run's; the held value's entry
+                            // goes once the write that replaces it lands.
+                            let held = held_entries(field, name, column, pk);
+                            let entry = secret::fresh_entry(input.store, (name, column, pk))?;
+                            let reference = secret::reference(&input.store.vault()?, &entry);
+                            shown.clone_from(&reference);
+                            plan.puts.push((entry, Arc::clone(&wanted.value)));
+                            plan.removes.extend(held);
                             let value = CellValue::imported(
                                 collection.version,
-                                json!(token),
+                                reference.clone(),
                                 &wanted.at.source,
                             );
                             changes.push(cell::change(
@@ -3381,11 +3631,11 @@ impl Planner<'_> {
                             )?);
                             Step::Write
                         }
-                        Decided::Unchanged => {
+                        (Decided::Unchanged, _) => {
                             count.unchanged += 1;
                             Step::Unchanged
                         }
-                        Decided::Owner | Decided::Conflicted | Decided::Differs => {
+                        (Decided::Owner | Decided::Conflicted | Decided::Differs, _) => {
                             count.kept += 1;
                             let kind = match decided {
                                 Decided::Conflicted => Kind::Conflicted,
@@ -3409,7 +3659,7 @@ impl Planner<'_> {
                         collection: name,
                         pk: pk.clone(),
                         column: (*column).to_owned(),
-                        x: json!(MASK),
+                        x: shown,
                         step: outcome,
                     });
                 }

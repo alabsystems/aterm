@@ -770,9 +770,7 @@ fn github(home: &Path, token: bool) -> (aterm_machines::port::Fake, aterm_machin
     sys.executable(aterm_machines::items::github::CLT_GIT, b"inert git");
     sys.executable(&format!("{}/.local/bin/aterm", user.home), b"launcher");
     if token {
-        let token = format!("{}/.secrets/gh_access_token", user.home);
-        sys.file(&token, TOKEN.as_bytes())
-            .stat_of(&token, stat(false, TOKEN.len() as u64));
+        sys.vault_set(&user.home, "gh_access_token", TOKEN.as_bytes());
     }
     let profile = home.join(".config/aterm/init.toml");
     let contents = b"[github]\naccount='tester'\nowner='tester'\n";

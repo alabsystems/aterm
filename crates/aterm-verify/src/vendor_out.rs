@@ -1,0 +1,848 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! `verify vendor-out --into <dir> [--check]`: byte-identical copies of the crates another
+//! repository builds from aterm's sources ([`CRATES`]), written under `<dir>/vendor/`.
+//!
+//! Each crate's copy is `vendor/<crate>/`:
+//! - the files its library's build reads with debug assertions on and without `cfg(test)`, byte
+//!   for byte: each module file it compiles and each file an `include_str!` or `include_bytes!`
+//!   there embeds, as the census reader follows them ([`crate::own_tests::closure`]), so no
+//!   `*_tests.rs` file and nothing only a test reads;
+//! - a `Cargo.toml` that builds it alone: the workspace keys it inherits spelled out, the
+//!   workspace's lints inlined, each dependency a path to another copy, and the library its one
+//!   target, whose tests and doctests stay in aterm beside the files they read.
+//!
+//! A crate whose build depends on a crate outside the set is refused, as is one whose manifest
+//! says something this writer does not carry over (a build script, features, a registry or git
+//! dependency) and one whose build reads a file outside its own folder.
+//!
+//! `vendor/VENDORED` lists every other file under `vendor/` as `<fnv1a64> <path>` (the FNV-1a 64
+//! digest of its bytes in 16 lowercase hex digits, then its path from `vendor/`), in path order,
+//! and carries an [`aterm_census::seal`] of itself: the receiving repository's check finds a hand
+//! edit of a copy, or of the list, without aterm.
+//!
+//! Writing replaces whatever is at a path it writes, and removes a file under `vendor/` only where
+//! the sealed list there names it, as one an earlier run wrote; any other file it would not write
+//! (a stray) stops the run before anything changes. `--check` writes nothing and names each file
+//! under `vendor/` that differs from what a write would leave, is missing, is extra or is a stray.
+//! The aterm commit a copy is made from belongs in the receiving repository's commit message,
+//! never in a file here.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::path::Path;
+
+use aterm_census::seal;
+use aterm_toml::{Table, Value};
+
+use crate::exit;
+use crate::own_tests;
+
+/// The crates vendor-out copies, for claude-code-alab to build from: the turn-end readers, the
+/// screen reader and the agent name table it names agents by.
+pub const CRATES: [&str; 3] = ["alab-policy", "aterm-agent-names", "aterm-phase"];
+
+/// The folder of `--into` the copies go in.
+pub const VENDOR: &str = "vendor";
+
+/// The list of the copies' digests, in [`VENDOR`].
+pub const MANIFEST: &str = "VENDORED";
+
+/// The command its seal line names.
+const GENERATOR: &str = "targo --unverified verify vendor-out";
+
+/// `verify vendor-out`'s usage.
+pub const USAGE: &str = "targo --unverified verify vendor-out --into <dir> [--check]
+
+Write byte-identical copies of alab-policy, aterm-agent-names and aterm-phase into
+<dir>/vendor/<crate>/ for another repository to build from: the files each library's
+build reads with debug assertions on (no test file, nothing only a test reads), a
+standalone Cargo.toml (edition and lints spelled out, path dependencies between the
+copies, no tests), and vendor/VENDORED, each file's FNV-1a 64 digest, sealed. A crate
+that depends on one outside the set is refused. A write replaces each file at a path
+it writes, whoever made it, and removes a file it no longer writes only where the
+sealed list there names it; any other file under vendor/ (a stray) stops the write
+before anything changes.
+
+  --check   write nothing; name each file that differs, is missing, is extra (a
+            write removes it) or is a stray (a write refuses until it is moved)
+
+Name the aterm commit in the receiving repository's commit message.
+
+Exit: 0 written (--check: the copy matches), 1 refused (--check: it does not),
+2 usage, 3 could not run.
+";
+
+/// What vendor-out writes: each file's bytes, by its path from `vendor/`.
+pub type Copy = BTreeMap<String, Vec<u8>>;
+
+/// How a file under `vendor/` stands against what vendor-out would write ([`drift`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Drift {
+    /// It is there, and its bytes (or its kind: not a regular file) are not what vendor-out
+    /// writes.
+    Differs(String),
+    /// Vendor-out writes it, and it is not there.
+    Missing(String),
+    /// It is there, vendor-out does not write it, and the sealed [`MANIFEST`] there names it as
+    /// one an earlier run wrote: a write removes it.
+    Extra(String),
+    /// It is there, vendor-out does not write it, and no sealed [`MANIFEST`] there names it: a
+    /// write refuses, changing nothing, until it is moved out.
+    Stray(String),
+}
+
+impl Drift {
+    /// The path from `vendor/` it names.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Differs(path) | Self::Missing(path) | Self::Extra(path) | Self::Stray(path) => {
+                path
+            }
+        }
+    }
+
+    /// The word a report leads it with.
+    #[must_use]
+    pub const fn word(&self) -> &'static str {
+        match self {
+            Self::Differs(_) => "differs",
+            Self::Missing(_) => "missing",
+            Self::Extra(_) => "extra",
+            Self::Stray(_) => "stray",
+        }
+    }
+}
+
+/// Run `verify vendor-out` with the arguments after `vendor-out`, for the aterm checkout `cwd` is
+/// in.
+#[must_use]
+pub fn run(args: &[String], cwd: &Path) -> i32 {
+    let mut into: Option<&str> = None;
+    let mut check = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return exit::PASS;
+            }
+            "--check" => check = true,
+            "--into" => match it.next() {
+                Some(dir) if !dir.is_empty() && !dir.starts_with('-') => into = Some(dir),
+                _ => return usage("--into needs a directory"),
+            },
+            other => match other.strip_prefix("--into=") {
+                Some(dir) if !dir.is_empty() => into = Some(dir),
+                _ => return usage(&format!("unknown argument `{other}`")),
+            },
+        }
+    }
+    let Some(into) = into else {
+        return usage("--into <dir> is required: the receiving repository's checkout");
+    };
+    let into = cwd.join(into);
+    if !into.is_dir() {
+        return usage(&format!("--into {}: no such directory", into.display()));
+    }
+    let Some(root) = crate::checkout_root(cwd) else {
+        eprintln!(
+            "verify vendor-out: COULD NOT RUN — {} is not inside a git checkout. Fix: run it \
+             from the aterm checkout",
+            cwd.display()
+        );
+        return exit::COULD_NOT_RUN;
+    };
+    if same_dir(&into, &root) {
+        return usage(&format!(
+            "--into {} is the aterm checkout itself; name the receiving repository's checkout",
+            into.display()
+        ));
+    }
+    let want = match vendored(&root, &CRATES) {
+        Ok(want) => want,
+        Err(why) => {
+            eprintln!("verify vendor-out: REFUSED — {why}");
+            return exit::FAILED;
+        }
+    };
+    let shown = into.join(VENDOR);
+    if check {
+        let found = match drift(&shown, &want) {
+            Ok(found) => found,
+            Err(why) => {
+                eprintln!("verify vendor-out: COULD NOT RUN — {why}");
+                return exit::COULD_NOT_RUN;
+            }
+        };
+        for item in &found {
+            println!("{} {VENDOR}/{}", item.word(), item.path());
+        }
+        println!("{}", verdict(&shown, &found, want.len()));
+        if found.is_empty() {
+            exit::PASS
+        } else {
+            exit::FAILED
+        }
+    } else {
+        match write(&shown, &want) {
+            Ok(changed) => {
+                println!(
+                    "verify vendor-out: {} holds {} files ({} written, {} removed)",
+                    shown.display(),
+                    want.len(),
+                    changed.written,
+                    changed.removed
+                );
+                exit::PASS
+            }
+            Err(why) => {
+                eprintln!("verify vendor-out: REFUSED — {why}");
+                exit::FAILED
+            }
+        }
+    }
+}
+
+fn usage(why: &str) -> i32 {
+    eprintln!("verify vendor-out: {why} (verify vendor-out --help)");
+    exit::USAGE
+}
+
+/// `--check`'s last line for the copy in `shown`, of which [`drift`] found `found`, where a write
+/// leaves `files` files: that it matches, or how many files the lines above name and what makes it
+/// current, the strays a write refuses over first.
+#[must_use]
+pub fn verdict(shown: &Path, found: &[Drift], files: usize) -> String {
+    let count = |n: usize| {
+        if n == 1 {
+            "1 file".to_string()
+        } else {
+            format!("{n} files")
+        }
+    };
+    let shown = shown.display();
+    if found.is_empty() {
+        return format!("verify vendor-out: {shown} matches ({})", count(files));
+    }
+    let first = if found.iter().any(|item| matches!(item, Drift::Stray(_))) {
+        format!(
+            "move each file named stray out of {VENDOR}/ (no earlier run wrote it, so a write \
+             refuses while it is there), then "
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "verify vendor-out: {shown} does not match: {} named above; {first}rerun without --check \
+         to rewrite it",
+        count(found.len())
+    )
+}
+
+/// Whether `a` and `b` name one directory.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The copy of `crates` (each at `crates/<name>` of the checkout at `root`) that vendor-out
+/// writes, [`MANIFEST`] included.
+///
+/// # Errors
+/// A crate this writer refuses (the module's rules), or a file that does not read.
+pub fn vendored(root: &Path, crates: &[&str]) -> Result<Copy, String> {
+    let workspace = toml_table(root, "Cargo.toml")?;
+    let mut copy = Copy::new();
+    for &name in crates {
+        let dir = format!("crates/{name}");
+        let manifest = toml_table(root, &format!("{dir}/Cargo.toml"))?;
+        let cargo = standalone(name, &manifest, &workspace, crates)?;
+        let lib = lib_path(name, &manifest)?;
+        if root.join(&dir).join("build.rs").exists() {
+            return Err(format!(
+                "{name} has a build script ({dir}/build.rs), which a copy cannot carry"
+            ));
+        }
+        copy.insert(format!("{name}/Cargo.toml"), cargo.into_bytes());
+        for (path, bytes) in built_files(root, name, &dir, &lib)? {
+            copy.insert(format!("{name}/{path}"), bytes);
+        }
+    }
+    let list = manifest_text(&copy)?;
+    copy.insert(MANIFEST.to_string(), list.into_bytes());
+    Ok(copy)
+}
+
+/// `relative` under `root`, read as a TOML table.
+fn toml_table(root: &Path, relative: &str) -> Result<Table, String> {
+    let text =
+        crate::read_regular_text(root.join(relative)).map_err(|e| format!("{relative}: {e}"))?;
+    match aterm_toml::from_str::<Value>(&text) {
+        Ok(Value::Table(table)) => Ok(table),
+        Ok(_) => Err(format!("{relative} is not a TOML table")),
+        Err(e) => Err(format!("{relative}: {e}")),
+    }
+}
+
+/// The files of the crate in `dir` that its library's build reads (the module's rules), by path
+/// from `dir`.
+fn built_files(
+    root: &Path,
+    name: &str,
+    dir: &str,
+    lib: &str,
+) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let text = |path: &str| crate::read_regular_text(root.join(path)).ok();
+    let read = own_tests::closure(&text, &format!("{dir}/{lib}"), dir, false).ok_or_else(|| {
+        format!(
+            "the census reader cannot settle what {name}'s library reads (a module path a \
+             `cfg_attr` or a macro sets, an include whose path is no literal, or a file that \
+             does not read): no copy is made of it"
+        )
+    })?;
+    let prefix = format!("{dir}/");
+    let mut files = BTreeMap::new();
+    for path in read.compiled.keys().chain(&read.embedded) {
+        let Some(within) = path.strip_prefix(&prefix) else {
+            return Err(format!(
+                "{name}'s library reads {path}, outside {dir}: a copy of the folder would not \
+                 build"
+            ));
+        };
+        let bytes = crate::read_regular(root.join(path)).map_err(|e| format!("{path}: {e}"))?;
+        files.insert(within.to_string(), bytes);
+    }
+    Ok(files)
+}
+
+/// The library's root file, from the package's folder.
+fn lib_path(name: &str, manifest: &Table) -> Result<String, String> {
+    let lib = manifest.get("lib").and_then(Value::as_table);
+    match lib.and_then(|lib| lib.get("path")) {
+        None => Ok("src/lib.rs".to_string()),
+        Some(Value::String(path)) => Ok(path.clone()),
+        Some(_) => Err(format!("{name}'s [lib] path is not a string")),
+    }
+}
+
+/// The keys of `[package]` a copy writes, in its order, each as the crate resolves it.
+const PACKAGE_KEYS: [&str; 6] = [
+    "name",
+    "version",
+    "edition",
+    "license",
+    "authors",
+    "description",
+];
+
+/// The keys of `[package]` a copy leaves out: what only aterm's own tools, its own test targets or
+/// publishing read. `repository` names the private development repository, which a copy that is
+/// published must not.
+const PACKAGE_DROPPED: [&str; 12] = [
+    "repository",
+    "metadata",
+    "publish",
+    "autotests",
+    "autobins",
+    "autoexamples",
+    "autobenches",
+    "readme",
+    "homepage",
+    "documentation",
+    "keywords",
+    "categories",
+];
+
+/// The top-level tables a copy leaves out: targets other than the library (the tests, benches,
+/// binaries and examples stay in aterm) and what only they build with.
+const TOP_DROPPED: [&str; 6] = [
+    "dev-dependencies",
+    "test",
+    "bench",
+    "bin",
+    "example",
+    "badges",
+];
+
+/// The crate `name`'s standalone `Cargo.toml`, from its own `manifest` and the root's
+/// `workspace` table; `set` is every crate vendored with it.
+///
+/// # Errors
+/// Anything a copy cannot carry over (the module's rules).
+fn standalone(
+    name: &str,
+    manifest: &Table,
+    workspace: &Table,
+    set: &[&str],
+) -> Result<String, String> {
+    let shared = workspace.get("workspace").and_then(Value::as_table);
+    let refuse = |what: String| Err(format!("{name}: {what}, which a copy does not carry"));
+    for key in manifest.keys() {
+        let carried = matches!(
+            key.as_str(),
+            "package" | "lib" | "lints" | "dependencies" | "target"
+        );
+        if !carried && !TOP_DROPPED.contains(&key.as_str()) {
+            let empty = manifest
+                .get(key)
+                .and_then(Value::as_table)
+                .is_some_and(Table::is_empty);
+            if !(empty && matches!(key.as_str(), "features" | "build-dependencies")) {
+                return refuse(format!("[{key}]"));
+            }
+        }
+    }
+    let Some(package) = manifest.get("package").and_then(Value::as_table) else {
+        return Err(format!("{name}'s Cargo.toml has no [package]"));
+    };
+    if package.get("name").and_then(Value::as_str) != Some(name) {
+        return Err(format!(
+            "crates/{name}/Cargo.toml names another package; the set names crates by folder"
+        ));
+    }
+    for key in package.keys() {
+        if !PACKAGE_KEYS.contains(&key.as_str()) && !PACKAGE_DROPPED.contains(&key.as_str()) {
+            return refuse(format!("package.{key}"));
+        }
+    }
+    let inherited = shared
+        .and_then(|w| w.get("package"))
+        .and_then(Value::as_table);
+    let mut out = format!(
+        "# SPDX-License-Identifier: Apache-2.0\n\
+         # Copyright 2026 Andrew Yates\n\
+         # Written by `{GENERATOR}` from aterm's crates/{name}/Cargo.toml: rerun it there, never\n\
+         # edit this copy (../{MANIFEST} holds each file's digest).\n\
+         \n[package]\n"
+    );
+    for key in PACKAGE_KEYS {
+        let value = match package.get(key) {
+            None => continue,
+            Some(Value::Table(spec)) if spec.get("workspace") == Some(&Value::Boolean(true)) => {
+                inherited.and_then(|p| p.get(key)).ok_or_else(|| {
+                    format!("{name}: {key}.workspace = true, and the workspace sets no {key}")
+                })?
+            }
+            Some(value) => value,
+        };
+        let _ = writeln!(out, "{key} = {}", inline(value)?);
+    }
+    if package.get("edition").is_none() {
+        return Err(format!(
+            "{name} names no edition; a copy spells its edition out"
+        ));
+    }
+    out.push_str(
+        "publish = false\nautobins = false\nautoexamples = false\nautotests = false\n\
+         autobenches = false\n",
+    );
+    let lib = manifest.get("lib").and_then(Value::as_table);
+    if let Some(lib) = lib {
+        for key in lib.keys() {
+            if !matches!(
+                key.as_str(),
+                "path" | "name" | "test" | "doctest" | "bench" | "harness"
+            ) {
+                return refuse(format!("lib.{key}"));
+            }
+        }
+    }
+    out.push_str("\n# The copy's one target. Its tests and doctests run in aterm, beside the files\n# they read.\n[lib]\n");
+    if let Some(lib_name) = lib.and_then(|lib| lib.get("name")) {
+        let _ = writeln!(out, "name = {}", inline(lib_name)?);
+    }
+    let _ = writeln!(
+        out,
+        "path = {}\ntest = false\ndoctest = false\nbench = false",
+        quoted(&lib_path(name, manifest)?)
+    );
+    let lints = match manifest.get("lints") {
+        None => None,
+        Some(Value::Table(lints)) if lints.get("workspace") == Some(&Value::Boolean(true)) => {
+            if lints.len() > 1 {
+                return refuse("[lints] beside workspace = true".to_string());
+            }
+            Some(
+                shared
+                    .and_then(|w| w.get("lints"))
+                    .and_then(Value::as_table)
+                    .ok_or_else(|| {
+                        format!("{name}: lints.workspace = true, and the workspace has no [workspace.lints]")
+                    })?,
+            )
+        }
+        Some(Value::Table(lints)) => Some(lints),
+        Some(_) => return Err(format!("{name}'s [lints] is not a table")),
+    };
+    for (tool, levels) in lints.into_iter().flatten() {
+        let Some(levels) = levels.as_table() else {
+            return Err(format!("{name}'s lints.{tool} is not a table"));
+        };
+        let _ = writeln!(out, "\n[lints.{}]", key(tool));
+        for (lint, level) in levels {
+            let _ = writeln!(out, "{} = {}", key(lint), inline(level)?);
+        }
+    }
+    let deps = |table: Option<&Value>, title: &str, out: &mut String| -> Result<(), String> {
+        let Some(table) = table else {
+            return Ok(());
+        };
+        let Some(table) = table.as_table() else {
+            return Err(format!("{name}'s [{title}] is not a table"));
+        };
+        let _ = writeln!(out, "\n[{title}]");
+        for (dep, spec) in table {
+            let _ = writeln!(
+                out,
+                "{} = {}",
+                key(dep),
+                dependency(name, dep, spec, shared, set)?
+            );
+        }
+        Ok(())
+    };
+    deps(manifest.get("dependencies"), "dependencies", &mut out)?;
+    if let Some(targets) = manifest.get("target") {
+        let Some(targets) = targets.as_table() else {
+            return Err(format!("{name}'s [target] is not a table"));
+        };
+        for (cfg, tables) in targets {
+            let Some(tables) = tables.as_table() else {
+                return Err(format!("{name}'s target.{cfg} is not a table"));
+            };
+            for kind in tables.keys() {
+                if kind != "dependencies" && kind != "dev-dependencies" {
+                    return refuse(format!("target.{cfg}.{kind}"));
+                }
+            }
+            let title = format!("target.{}.dependencies", key(cfg));
+            deps(tables.get("dependencies"), &title, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+/// The copy's spelling of the dependency `dep` of `name` (`spec`, under the root's `shared`
+/// `[workspace]` where it says `workspace = true`): a path to the copy of a crate in `set`.
+///
+/// # Errors
+/// It is no crate of `set`, or no path dependency: a copy depends only on copies beside it.
+fn dependency(
+    name: &str,
+    dep: &str,
+    spec: &Value,
+    shared: Option<&Table>,
+    set: &[&str],
+) -> Result<String, String> {
+    let outside = |package: &str| {
+        Err(format!(
+            "{name} depends on {package}, which is not one of the crates vendored with it ({}): \
+             a copy builds only from the copies beside it",
+            set.join(", ")
+        ))
+    };
+    let Some(own) = spec.as_table() else {
+        return outside(dep);
+    };
+    let mut merged = Table::new();
+    if own.get("workspace") == Some(&Value::Boolean(true)) {
+        match shared
+            .and_then(|w| w.get("dependencies"))
+            .and_then(|d| d.get(dep))
+        {
+            Some(Value::Table(from)) => {
+                for (k, v) in from {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            Some(_) => return outside(dep),
+            None => {
+                return Err(format!(
+                    "{name}: {dep}.workspace = true, and [workspace.dependencies] has no {dep}"
+                ));
+            }
+        }
+    }
+    for (k, v) in own {
+        match (k.as_str(), merged.get(k.as_str())) {
+            ("workspace", _) => {}
+            ("features", Some(Value::Array(from))) => {
+                let mut all = from.clone();
+                all.extend(v.as_array().cloned().unwrap_or_default());
+                merged.insert(k.clone(), Value::Array(all));
+            }
+            _ => {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let package = match merged.get("package") {
+        None => dep,
+        Some(Value::String(package)) => package.as_str(),
+        Some(_) => return Err(format!("{name}'s dependency {dep} names no package")),
+    };
+    if merged.get("path").is_none() || !set.contains(&package) {
+        return outside(package);
+    }
+    let mut out = format!("{{ path = {}", quoted(&format!("../{package}")));
+    if package != dep {
+        let _ = write!(out, ", package = {}", quoted(package));
+    }
+    for (k, v) in &merged {
+        match k.as_str() {
+            "path" | "package" | "version" => {}
+            "features" | "default-features" => {
+                let _ = write!(out, ", {} = {}", key(k), inline(v)?);
+            }
+            other => {
+                return Err(format!(
+                    "{name}'s dependency {dep} sets {other}, which a copy does not carry"
+                ));
+            }
+        }
+    }
+    out.push_str(" }");
+    Ok(out)
+}
+
+/// `value` as one line of TOML.
+fn inline(value: &Value) -> Result<String, String> {
+    Ok(match value {
+        Value::String(text) => quoted(text),
+        Value::Integer(n) => n.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Array(items) => {
+            let items: Result<Vec<String>, String> = items.iter().map(inline).collect();
+            format!("[{}]", items?.join(", "))
+        }
+        Value::Table(table) => {
+            let mut pairs = Vec::new();
+            for (k, v) in table {
+                pairs.push(format!("{} = {}", key(k), inline(v)?));
+            }
+            format!("{{ {} }}", pairs.join(", "))
+        }
+        Value::Float(_) | Value::Datetime(_) => {
+            return Err(format!(
+                "a manifest value this writer does not spell: {value:?}"
+            ));
+        }
+    })
+}
+
+/// `text` as a TOML basic string.
+fn quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04X}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `name` as a TOML key: bare where it may be, else quoted.
+fn key(name: &str) -> String {
+    if !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        name.to_string()
+    } else {
+        quoted(name)
+    }
+}
+
+/// [`MANIFEST`]'s text for `copy` (which does not hold it yet): its seal line, a line on what
+/// each line says, and `<fnv1a64> <path>` per file in path order, sealed.
+///
+/// # Errors
+/// A path that would break a line of the list (a newline in it).
+fn manifest_text(copy: &Copy) -> Result<String, String> {
+    let mut text = seal::line("#", GENERATOR);
+    text.push_str(
+        "\n# One line per file under this folder: the FNV-1a 64 digest of its bytes, then its \
+         path from here.\n",
+    );
+    for (path, bytes) in copy {
+        if path.contains(['\n', '\r']) {
+            return Err(format!("a vendored path holds a line break: {path:?}"));
+        }
+        let _ = writeln!(text, "{:016x} {path}", aterm_hash::fnv1a_64(bytes));
+    }
+    seal::stamp(&text)
+}
+
+/// The paths a sealed [`MANIFEST`] in `vendor` lists (itself among them): the files an earlier
+/// run wrote. Empty where the list is missing or its seal does not hold.
+fn written_before(vendor: &Path) -> BTreeSet<String> {
+    let Ok(text) = crate::read_regular_text(vendor.join(MANIFEST)) else {
+        return BTreeSet::new();
+    };
+    if !matches!(seal::check(&text), seal::Seal::Holds { .. }) {
+        return BTreeSet::new();
+    }
+    text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once(' ').map(|(_, path)| path.to_string()))
+        .chain(std::iter::once(MANIFEST.to_string()))
+        .collect()
+}
+
+/// Every entry under `vendor` but its folders, by path from it, each with whether it is a regular
+/// file; empty where `vendor` does not exist.
+///
+/// # Errors
+/// A folder that does not list.
+fn entries(vendor: &Path) -> Result<BTreeMap<String, bool>, String> {
+    let mut found = BTreeMap::new();
+    if std::fs::symlink_metadata(vendor).is_err() {
+        return Ok(found);
+    }
+    let mut folders = vec![(vendor.to_path_buf(), String::new())];
+    while let Some((folder, prefix)) = folders.pop() {
+        let listed =
+            std::fs::read_dir(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+        for entry in listed {
+            let entry = entry.map_err(|e| format!("{}: {e}", folder.display()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = format!("{prefix}{name}");
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+            if kind.is_dir() {
+                folders.push((entry.path(), format!("{path}/")));
+            } else {
+                found.insert(path, kind.is_file());
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Each file under `vendor` that differs from `want`, is missing from it, is extra (the sealed
+/// [`MANIFEST`] there names it) or is a stray (none names it), in path order.
+///
+/// # Errors
+/// A folder or file under `vendor` that does not read.
+pub fn drift(vendor: &Path, want: &Copy) -> Result<Vec<Drift>, String> {
+    let have = entries(vendor)?;
+    let ours = written_before(vendor);
+    let mut found = Vec::new();
+    for (path, bytes) in want {
+        match have.get(path) {
+            None => found.push(Drift::Missing(path.clone())),
+            Some(false) => found.push(Drift::Differs(path.clone())),
+            Some(true) => {
+                let now = crate::read_regular(vendor.join(path))
+                    .map_err(|e| format!("{VENDOR}/{path}: {e}"))?;
+                if now != *bytes {
+                    found.push(Drift::Differs(path.clone()));
+                }
+            }
+        }
+    }
+    found.extend(
+        have.keys()
+            .filter(|path| !want.contains_key(*path))
+            .map(|path| {
+                if ours.contains(path) {
+                    Drift::Extra(path.clone())
+                } else {
+                    Drift::Stray(path.clone())
+                }
+            }),
+    );
+    found.sort_by(|a, b| a.path().cmp(b.path()));
+    Ok(found)
+}
+
+/// What [`write`] changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Written {
+    /// Files written: missing, or not as vendor-out writes them.
+    pub written: usize,
+    /// Files removed: ones an earlier run wrote that this one does not.
+    pub removed: usize,
+}
+
+/// Make `vendor` hold exactly `want`: remove the files an earlier run wrote that `want` does not
+/// hold ([`Drift::Extra`]), then write each file that is missing or differs, replacing whatever
+/// is at that path.
+///
+/// # Errors
+/// A [`Drift::Stray`], a file under `vendor` that `want` does not hold and the sealed list there
+/// does not name, with nothing changed; or a write or removal that failed, which leaves the copy
+/// part written.
+pub fn write(vendor: &Path, want: &Copy) -> Result<Written, String> {
+    let found = drift(vendor, want)?;
+    let strangers: Vec<&str> = found
+        .iter()
+        .filter_map(|item| match item {
+            Drift::Stray(path) => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !strangers.is_empty() {
+        return Err(format!(
+            "{} holds {} that no earlier run wrote (the sealed {MANIFEST} there names none of \
+             them); move them out of {VENDOR}/ or remove them, then rerun. Nothing was written",
+            vendor.display(),
+            strangers.join(", ")
+        ));
+    }
+    let mut changed = Written {
+        written: 0,
+        removed: 0,
+    };
+    for item in &found {
+        if let Drift::Extra(path) = item {
+            let at = vendor.join(path);
+            std::fs::remove_file(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+            changed.removed += 1;
+            let mut folder = at.parent();
+            while let Some(dir) = folder.filter(|dir| *dir != vendor) {
+                if std::fs::remove_dir(dir).is_err() {
+                    break;
+                }
+                folder = dir.parent();
+            }
+        }
+    }
+    for item in &found {
+        let (Drift::Differs(path) | Drift::Missing(path)) = item else {
+            continue;
+        };
+        let at = vendor.join(path);
+        if let Some(dir) = at.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        if matches!(std::fs::symlink_metadata(&at), Ok(meta) if !meta.is_file()) {
+            std::fs::remove_file(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+        }
+        aterm_uds::atomic_file::write_flushed(&at, &want[path], 0o644, None)
+            .map_err(|e| format!("{}: {e}", at.display()))?;
+        changed.written += 1;
+    }
+    Ok(changed)
+}
+
+#[cfg(test)]
+#[path = "vendor_out_tests.rs"]
+mod tests;

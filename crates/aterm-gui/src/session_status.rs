@@ -1354,6 +1354,16 @@ const DEFINERS: [&str; 2] = ["function", "filter"];
 /// fish's blocks, each closed by an `end` of its own: what a fish `function` definition's body
 /// nests until the `end` that closes it ([`fish_end`]).
 const FISH_BLOCKS: [&str; 6] = ["begin", "if", "while", "for", "switch", "function"];
+/// The most function definitions a line is read past ([`undefined`]): each shell's reading of
+/// where one ends reads on to the line's end ([`sh_close`], [`pwsh_close`], [`fish_end`]), so a
+/// line's cost is its length times this count, never its length squared. A `filter` word whose
+/// script block pwsh's reading finds no definition's counts too, since that reading may read as
+/// far. The definition after them takes the rest of the line unread.
+const MAX_DEFINITIONS: usize = 8;
+/// How deep the parts of a word may nest ([`sh_part`]: a `$(…)` in a `"…"` in a `${…}`) for a
+/// reading to read past them: a part nested deeper is [`Close::Unread`], so the stack a reading
+/// takes is bounded whatever the line holds.
+const MAX_NESTING: usize = 16;
 /// The commands with no letter or digit in their name that people know by sight: the null
 /// command, sourcing a file (`source`'s other spelling, so the file is its argument, as
 /// `bash run.sh` reads `bash`) and `test`. A detail names the word itself, never a word after it.
@@ -2289,7 +2299,8 @@ fn joined(cmdline: &str) -> std::borrow::Cow<'_, str> {
 /// The text reader: the program word of `cmdline`'s running command, the wrappers before it and
 /// its allowlisted subcommand, or `None` when no word in its first place names a program. A
 /// function's definition runs nothing where it is typed, so the line is read without it
-/// ([`undefined`]): no word of its body is ever the candidate.
+/// ([`undefined`]): no word of its body is ever the candidate, and where the shells with its form
+/// read its end apart, no word after it either.
 pub(crate) fn candidate(cmdline: &str) -> Option<ProgramCandidate> {
     let whole = joined(cmdline);
     let bare = undefined(&whole);
@@ -2529,49 +2540,99 @@ fn offset(line: &str, part: &str) -> usize {
     part.as_ptr() as usize - line.as_ptr() as usize
 }
 
-/// `cmdline` with each function definition in a command's first place blanked out: bash's and
-/// zsh's `name() body` (`name ()`, `name ( )`), and `function name …` (bash, zsh, fish, pwsh) or
-/// pwsh's `filter name …`. A definition runs nothing where it is typed, so no word of its body is
-/// a command of the line, and the line reads as it would without it: `qzf() { true; }` reads
-/// nothing in every shell, and `qzf() { true; }; qzf` reads `qzf`. A body in braces ends at the
-/// brace that closes it ([`group_end`]: bash, zsh and pwsh, a brace right after the name and its
-/// parameter list, on the definition's own line: [`keyword_brace`]); fish's `function name …`,
-/// whose name its options or its list's end follow, ends at the `end` that closes it
-/// ([`fish_end`]). One whose end is not found, and a `name()` body of any other form (a
-/// subshell, zsh's one-command body), runs to the end of the line: nothing after it is read.
-/// A definition is still an element of the line's list, where it was typed ([`line_shape`]), so
-/// the line comes with where each blank stands in it ([`Undefined`]).
+/// `cmdline` with each function definition blanked out where a command may start (each list
+/// segment's and each pipeline stage's or job's first place, past a [`STEPPED_OVER`] word or a
+/// subshell's `(` typed against it: [`stages`], [`definition`]): bash's and zsh's `name() body`
+/// (`name ()`, `name ( )`), `function name …` (bash, zsh, fish, pwsh) and pwsh's
+/// `filter name { … }`. A definition runs nothing where it is typed, so no word of its body is a
+/// command of the line, and the line reads as it would without it: `qzf() { true; }` reads
+/// nothing in every shell, and `qzf() { true; }; qzf` reads `qzf`. Its end is where every shell
+/// that has its form ends it ([`agreed`]): a brace body as bash, zsh and (for `function` and
+/// `filter`) pwsh close it ([`sh_close`], [`pwsh_close`]), each reading the rest of the line on
+/// for a brace that shell refuses; a subshell body at its `)` ([`subshell_close`]); and fish's
+/// `function name …`, whose body is the list after its head, at the `end` that closes it
+/// ([`fish_end`]). Where those shells end it at different places, where none does on this line,
+/// where the end lies past what the reader reads (a here-document's text), for a `name()` body of
+/// any other form (zsh's one-command body) and for a definition past [`MAX_DEFINITIONS`], the
+/// definition runs to the end of the line: nothing after it is read, and no word of its body is
+/// ever read. A definition is still an element of the line's list, where it was typed
+/// ([`line_shape`]), so the line comes with where each blank stands in it ([`Undefined`]). One
+/// that starts a pipeline takes the pipe after it into its blank, so the stage after it starts
+/// the pipeline (`qzf() { true; } | make` reads `make`).
 fn undefined(cmdline: &str) -> Undefined<'_> {
     let segments = split_list(cmdline);
-    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let bytes = cmdline.as_bytes();
+    // Each definition's span, and whether it is a job of its own: no stage of a pipeline beside
+    // others ([`Undefined::blanks`]).
+    let mut spans: Vec<(usize, usize, bool)> = Vec::new();
+    // How many definitions' ends were looked for, a `filter` that proved a program's included
+    // ([`MAX_DEFINITIONS`]).
+    let mut readings = 0;
     let mut read_from = 0;
     let mut unclosed = false;
     for (at, &(_, text)) in segments.iter().enumerate() {
-        let start = offset(cmdline, text);
-        if start < read_from {
-            continue;
-        }
-        let Some((head, body)) = definition(text) else {
-            continue;
-        };
-        let found = match body {
-            Body::After(from) => {
-                let rest = &cmdline[start + from..];
-                let open = start + from + (rest.len() - rest.trim_start().len());
-                (cmdline.as_bytes().get(open) == Some(&b'{'))
-                    .then(|| group_end(cmdline, open))
-                    .flatten()
+        for (place, stage) in stages(text, &mut 0).into_iter().enumerate() {
+            let start = offset(cmdline, stage);
+            if start < read_from {
+                continue;
             }
-            Body::Keyword(from) => match keyword_brace(cmdline, start + from) {
-                Some(open) => group_end(cmdline, open),
-                None => fish_end(cmdline, &segments[at + 1..]),
-            },
-        };
-        // One whose end is not found takes the rest of the line, so it is the last.
-        unclosed = found.is_none();
-        let end = found.unwrap_or(cmdline.len());
-        spans.push((start + head, end));
-        read_from = end;
+            let Some((head, body)) = definition(stage) else {
+                continue;
+            };
+            let found = match body {
+                // Every reading of an end reads on to the line's end, so past the cap the rest of
+                // the line is this definition's.
+                _ if readings == MAX_DEFINITIONS => None,
+                Body::After(from) => {
+                    let rest = &cmdline[start + from..];
+                    let open = start + from + (rest.len() - rest.trim_start().len());
+                    if bytes.get(open) == Some(&b')') {
+                        // No body opens at a `)`: pwsh's `(Get-Date())` calls a command.
+                        continue;
+                    }
+                    readings += 1;
+                    agreed(body_closes(cmdline, open, false))
+                }
+                Body::Keyword(definer, from) => {
+                    let open = keyword_body(cmdline, start + from);
+                    if definer == "filter" {
+                        // pwsh's alone, and only with its script block in a line pwsh takes:
+                        // elsewhere `filter` is a program.
+                        let Some(open) = open.filter(|&open| bytes[open] == b'{') else {
+                            continue;
+                        };
+                        // Counted even where it proves a program's: pwsh's reading of it may read
+                        // on to the line's end, as a definition's does.
+                        readings += 1;
+                        match pwsh_close(cmdline, open) {
+                            Close::Open => continue,
+                            close => agreed([close]),
+                        }
+                    } else {
+                        readings += 1;
+                        let braces = open.map(|open| body_closes(cmdline, open, true));
+                        let fish = fish_end(cmdline, &segments[at + 1..]);
+                        agreed(braces.into_iter().flatten().chain([fish]))
+                    }
+                }
+            };
+            // One whose end the shells do not agree on takes the rest of the line, so it is the
+            // last.
+            unclosed = found.is_none();
+            let end = found.unwrap_or(cmdline.len());
+            // `stages` keeps every stage of a segment it starts outside parentheses, so a stage
+            // after the first starts right after the `|` or `&` that cut it, unless the blank of
+            // the definition before it took that pipe.
+            let took = spans.last().is_some_and(|&(_, before, _)| before == start);
+            let piped = place > 0 && piped_into(bytes, start) && !took;
+            let pipe = pipe_after(bytes, end);
+            let end = match pipe {
+                Some(past) if !piped => past,
+                _ => end,
+            };
+            spans.push((start + head, end, !piped && pipe.is_none()));
+            read_from = end;
+        }
     }
     if spans.is_empty() {
         return Undefined {
@@ -2583,9 +2644,11 @@ fn undefined(cmdline: &str) -> Undefined<'_> {
     let mut out = String::with_capacity(cmdline.len());
     let mut blanks = Vec::with_capacity(spans.len());
     let mut from = 0;
-    for (start, end) in spans {
+    for (start, end, job) in spans {
         out.push_str(&cmdline[from..start]);
-        blanks.push(out.len());
+        if job {
+            blanks.push(out.len());
+        }
         out.push(' ');
         from = end;
     }
@@ -2601,33 +2664,120 @@ fn undefined(cmdline: &str) -> Undefined<'_> {
 struct Undefined<'a> {
     /// The line, a blank where each definition stood.
     line: std::borrow::Cow<'a, str>,
-    /// Where each of those blanks stands in [`Self::line`], in the line's order.
+    /// Where the blank of each definition that is a job of its own stands in [`Self::line`], in
+    /// the line's order: each is an element of the line's list ([`line_shape`]). A definition
+    /// that is a stage of a pipeline beside others (`make | qzf() { …; }`, `qzf() { …; } | make`)
+    /// is a part of that pipeline, which is one element, so it has none here.
     blanks: Vec<usize>,
-    /// Whether the last definition's end was not found: it took the rest of the line, which
-    /// nothing read, and which may hold commands of its own.
+    /// Whether the last definition's end was not agreed ([`agreed`]): it took the rest of the
+    /// line, which nothing read, and which may hold commands of its own.
     unclosed: bool,
 }
 
-/// Where a definition's body is looked for ([`definition`]), from the start of its segment.
+/// Whether the stage that starts at `bytes[start]`, just after the cut [`stages`] made before it,
+/// is piped into: that cut is a `|` (or bash's and zsh's `|&`), not a job's `&` (or zsh's `&|`).
+fn piped_into(bytes: &[u8], start: usize) -> bool {
+    let cut = &bytes[..start];
+    !cut.ends_with(b"&|") && (cut.ends_with(b"|") || cut.ends_with(b"|&"))
+}
+
+/// Where the pipe after the definition that ends just before `bytes[end]` ends, where one follows
+/// it: a `|` past its blanks that is no `||`, with the `&` of bash's and zsh's `|&`.
+fn pipe_after(bytes: &[u8], end: usize) -> Option<usize> {
+    let at = past_blanks(bytes, end);
+    if bytes.get(at) != Some(&b'|') || bytes.get(at + 1) == Some(&b'|') {
+        return None;
+    }
+    Some(at + 1 + usize::from(bytes.get(at + 1) == Some(&b'&')))
+}
+
+/// The first byte from `bytes[at]` on that is no blank (a space or a tab).
+fn past_blanks(bytes: &[u8], mut at: usize) -> usize {
+    while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+        at += 1;
+    }
+    at
+}
+
+/// Where a definition's body is looked for ([`definition`]), from the start of its stage.
 enum Body {
     /// `name()`'s: the first word after this byte.
     After(usize),
-    /// A [`DEFINERS`] word's, which ends at this byte: a brace after the name
-    /// ([`keyword_brace`]), else fish's `end`.
-    Keyword(usize),
+    /// A [`DEFINERS`] word's, which ends at this byte: a body after the name ([`keyword_body`]),
+    /// else fish's list to its `end`.
+    Keyword(&'static str, usize),
 }
 
-/// Whether `segment` opens a function definition in its first place: where in it the definition
-/// starts and where its body is looked for.
-fn definition(segment: &str) -> Option<(usize, Body)> {
-    let mut words = shell_words(segment);
+/// How one shell reads where a definition's body ends.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Close {
+    /// Just before this byte.
+    At(usize),
+    /// Not in a line that shell takes: it would wait for more of the line (the body, a quote or a
+    /// group never closes on it) or refuse it (a `}` that closes nothing), so the line is not
+    /// that shell's.
+    Open,
+    /// Past what the reader reads: a here-document's text, a `case` list's patterns, or parts
+    /// nested deeper than [`MAX_NESTING`].
+    Unread,
+}
+
+/// Where a definition ends: where every shell's reading that ends it on this line ends it, or
+/// `None` when two of them end it at different places, one ends where the reader does not read,
+/// or none ends it on this line.
+fn agreed(closes: impl IntoIterator<Item = Close>) -> Option<usize> {
+    let mut end = None;
+    for close in closes {
+        match close {
+            Close::Unread => return None,
+            Close::Open => {}
+            Close::At(at) if end.is_none_or(|end| end == at) => end = Some(at),
+            Close::At(_) => return None,
+        }
+    }
+    end
+}
+
+/// The readings of a body that opens at `cmdline[open]`: a brace group's by bash and zsh, and by
+/// pwsh as well for a `function` (`pwsh`), or a subshell's. Any other body is one the reader does
+/// not read (zsh's one-command body).
+fn body_closes(cmdline: &str, open: usize, pwsh: bool) -> Vec<Close> {
+    match cmdline.as_bytes().get(open) {
+        Some(b'{') => {
+            let mut closes = vec![
+                sh_close(cmdline, open, false),
+                sh_close(cmdline, open, true),
+            ];
+            if pwsh {
+                closes.push(pwsh_close(cmdline, open));
+            }
+            closes
+        }
+        Some(b'(') => vec![subshell_close(cmdline, open, MAX_NESTING)],
+        _ => vec![Close::Unread],
+    }
+}
+
+/// Whether `stage` opens a function definition in its first place, past a [`STEPPED_OVER`] word
+/// or a subshell's `(` typed against it (`(qzf() { …; })`): where in it the definition starts and
+/// where its body is looked for. A `name()` is bash's and zsh's: a name with no quote, expansion
+/// or operator in it that is no pwsh type literal (`[Console]::Clear()` calls a method, where
+/// bash's `[() { …; }` defines `[`).
+fn definition(stage: &str) -> Option<(usize, Body)> {
+    let mut words = shell_words(stage).skip_while(|word| STEPPED_OVER.contains(word));
     let first = words.next()?;
-    let head = offset(segment, first);
-    if DEFINERS.contains(&first) {
-        return Some((head, Body::Keyword(head + first.len())));
+    // An arithmetic command's `((` opens no subshell.
+    let first = match first.strip_prefix('(') {
+        Some(rest) if !rest.starts_with('(') => rest,
+        _ => first,
+    };
+    let head = offset(stage, first);
+    if let Some(&definer) = DEFINERS.iter().find(|definer| **definer == first) {
+        return Some((head, Body::Keyword(definer, head + first.len())));
     }
     let name = |word: &str| {
         !word.is_empty()
+            && !(word.starts_with('[') && word.contains(']'))
             && !word.contains([
                 '\'', '"', '`', '\\', '$', '=', '(', ')', '{', '}', '<', '>', '|', '&', ';',
             ])
@@ -2639,55 +2789,428 @@ fn definition(segment: &str) -> Option<(usize, Body)> {
         return None;
     }
     let second = words.next()?;
-    let after = offset(segment, second);
+    let after = offset(stage, second);
     if second.starts_with("()") {
         return Some((head, Body::After(after + 2)));
     }
     let third = words
         .next()
         .filter(|word| second == "(" && word.starts_with(')'))?;
-    Some((head, Body::After(offset(segment, third) + 1)))
+    Some((head, Body::After(offset(stage, third) + 1)))
 }
 
-/// Where the `{` that opens the body of the [`DEFINERS`] definition whose word ends at
-/// `cmdline[from]` is: after the blanks, the name (up to a blank or one of `(){};&|<>`), and a
-/// parameter list in parentheses (bash's and zsh's `()`, pwsh's `($a, $b)`: [`group_end`]), each
-/// with the blanks before it, on the definition's own line. `None` when the name is followed by
-/// anything else: fish's options (`function f -d '{x}'`) or its list's end, so a brace in a
-/// fish definition's head is never taken for a body.
-fn keyword_brace(cmdline: &str, from: usize) -> Option<usize> {
+/// Where the body of the [`DEFINERS`] definition whose word ends at `cmdline[from]` opens: the
+/// `{` or `(` after the blanks, the name (up to a blank or one of `(){};&|<>`, on the definer's
+/// own line) and a parameter list in parentheses (bash's and zsh's `()`, pwsh's `($a, $b)`), each
+/// after blanks or line ends (bash, zsh and pwsh take the body's brace on a line of its own).
+/// `None` when the name is followed by anything else: fish's options (`function f -d '{x}'`) or
+/// its list's end, so a brace in a fish definition's head is never taken for a body.
+fn keyword_body(cmdline: &str, from: usize) -> Option<usize> {
     let bytes = cmdline.as_bytes();
-    let blanks = |mut at: usize| {
-        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+    let blanks = |mut at: usize, lines: bool| {
+        while bytes
+            .get(at)
+            .is_some_and(|c| matches!(c, b' ' | b'\t') || (lines && matches!(c, b'\n' | b'\r')))
+        {
             at += 1;
         }
         at
     };
-    let mut at = blanks(from);
+    let name = blanks(from, false);
+    let mut at = name;
     while bytes
         .get(at)
         .is_some_and(|c| !c.is_ascii_whitespace() && !b"(){};&|<>".contains(c))
     {
         at += 1;
     }
-    at = blanks(at);
-    if bytes.get(at) == Some(&b'(') {
-        at = blanks(group_end(cmdline, at)?);
+    if at == name {
+        return None;
     }
-    (bytes.get(at) == Some(&b'{')).then_some(at)
+    at = blanks(at, true);
+    if bytes.get(at) == Some(&b'(') {
+        let Close::At(end) = paren_close(cmdline, at) else {
+            return None;
+        };
+        at = blanks(end, true);
+    }
+    matches!(bytes.get(at), Some(b'{' | b'(')).then_some(at)
 }
 
-/// Where the group opened at `cmdline[open]` (a `{` or a `(`) ends: the byte after the brace or
-/// parenthesis that closes it, counting the ones nested in it outside quotes and comments (read
-/// as [`cut_list`] reads them). `None` when it never closes, or when a here-document comes first,
-/// whose text no count may read.
-fn group_end(cmdline: &str, open: usize) -> Option<usize> {
+/// The reserved words after which bash and zsh read the next word in a command's first place,
+/// where a `{` opens a group and bash's `}` closes one (`{ if true; then :; fi }`).
+const BEFORE_COMMAND: [&str; 14] = [
+    "{", "}", "!", "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "esac",
+    "time",
+];
+
+/// Where bash (`zsh` false) or zsh ends the brace group that opens at `cmdline[open]`. Both take
+/// a `{` for a group only as a word of its own in a command's first place (`echo {` and `a{b}`
+/// open none). bash takes `}` the same way, so `{ echo }` runs on to a `}` in a command's first
+/// place; zsh closes at a `}` that ends a word wherever it stands, unless it closes a `{` of the
+/// same word (`{ echo }`, `{ echo c}` and `{ { echo; }}` close; `{a,b}`, `${x}` and `}c` are
+/// words). A word's parts ([`sh_part`]), its `name=(…)` value ([`subshell_close`]) and a comment
+/// are read past. The rest of the line is read on in the same way, since that shell refuses a
+/// line with a `}` that closes no group and waits for more of one with a group still open at its
+/// end: a body this reading closes early, at the `}` of a group it does not know (zsh's
+/// `if [[ … ]] { … }`), leaves its own `}` closing nothing. Nothing is read past the line of a
+/// here-document that opens after the group's end, since its text starts there.
+/// [`Close::Open`] when the line is not that shell's: the group is no brace of its own, it never
+/// closes, or the rest of the line holds a `}` or a group as above.
+fn sh_close(cmdline: &str, open: usize, zsh: bool) -> Close {
     let bytes = cmdline.as_bytes();
-    let (opener, closer) = match bytes.get(open)? {
-        b'{' => (b'{', b'}'),
-        b'(' => (b'(', b')'),
-        _ => return None,
+    let mut depth = 0usize;
+    let mut command = true;
+    // A `function` word's next word is its name, after which its body's `{` opens a group.
+    let mut named = false;
+    // Where the group closed, once it has: the rest of the line is then read for a `}` that
+    // closes nothing.
+    let mut closed: Option<usize> = None;
+    // Whether a here-document opened after the group closed: its text starts on the next line.
+    let mut heredoc = false;
+    let mut i = open;
+    loop {
+        while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+            i += 1;
+        }
+        let Some(&c) = bytes.get(i) else { break };
+        match c {
+            b'\n' if heredoc => break,
+            b'\n' | b';' | b'&' | b'|' | b'(' | b')' => {
+                command = true;
+                i += 1;
+                continue;
+            }
+            b'#' => {
+                i = cmdline[i..].find('\n').map_or(bytes.len(), |n| i + n);
+                continue;
+            }
+            _ => {}
+        }
+        let start = i;
+        let mut braces = 0usize;
+        let mut closer = false;
+        while let Some(&c) = bytes.get(i) {
+            let part = match c {
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')' => break,
+                b'<' if closed.is_some()
+                    && bytes.get(i + 1) == Some(&b'<')
+                    && bytes.get(i + 2) != Some(&b'<') =>
+                {
+                    heredoc = true;
+                    Close::At(i + 2)
+                }
+                b'=' if bytes.get(i + 1) == Some(&b'(') && compound_opens(&cmdline[start..=i]) => {
+                    subshell_close(cmdline, i + 1, MAX_NESTING)
+                }
+                b'{' => {
+                    braces += 1;
+                    Close::At(i + 1)
+                }
+                b'}' if braces > 0 => {
+                    braces -= 1;
+                    Close::At(i + 1)
+                }
+                b'}' if zsh
+                    && bytes.get(i + 1).is_none_or(|next| {
+                        matches!(
+                            next,
+                            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b')' | b'}'
+                        )
+                    }) =>
+                {
+                    closer = true;
+                    break;
+                }
+                _ => sh_part(cmdline, i, false, MAX_NESTING),
+            };
+            match part {
+                Close::At(next) => i = next,
+                other => return other,
+            }
+        }
+        let word = &cmdline[start..i.min(bytes.len())];
+        if !word.is_empty() {
+            if command && word == "{" {
+                depth += 1;
+            } else if command && word == "}" {
+                // bash's closing brace: one that closes no group is one bash refuses.
+                let Some(inner) = depth.checked_sub(1) else {
+                    return Close::Open;
+                };
+                depth = inner;
+                if depth == 0 && closed.is_none() {
+                    closed = Some(i);
+                }
+            } else if depth == 0 && closed.is_none() {
+                // The group opens with a brace of its own, or is none of bash's or zsh's.
+                return Close::Open;
+            }
+            let definer = command && word == "function";
+            command = named || (command && BEFORE_COMMAND.contains(&word));
+            named = definer;
+        }
+        if closer {
+            // zsh's closing brace, refused as bash's is where it closes no group.
+            let Some(inner) = depth.checked_sub(1) else {
+                return Close::Open;
+            };
+            depth = inner;
+            i += 1;
+            if depth == 0 && closed.is_none() {
+                closed = Some(i);
+            }
+            command = true;
+        }
+    }
+    match closed {
+        Some(end) if depth == 0 || heredoc => Close::At(end),
+        _ => Close::Open,
+    }
+}
+
+/// Where bash and zsh end the part of a word that starts at `cmdline[at]`: past a backslash and
+/// the character it escapes; a quote, `'…'`, `$'…'` (whose backslash escapes), a backquote's or
+/// `"…"` ([`dquote_end`]); a `${…}` ([`expansion_end`]); a `$(…)`, `<(…)` or `>(…)`
+/// ([`subshell_close`]); else past that byte alone. In double quotes (`quoted`) a `'` is a byte
+/// like any other, and so are a `<(`, a `>(` and a `<<`. [`Close::Open`] when the part never
+/// closes; [`Close::Unread`] for a here-document, whose text the lines after this one hold, and
+/// for parts nested deeper than `nest` allows ([`MAX_NESTING`]).
+fn sh_part(cmdline: &str, at: usize, quoted: bool, nest: usize) -> Close {
+    let bytes = cmdline.as_bytes();
+    let quote = |end: Option<usize>| end.map_or(Close::Open, Close::At);
+    match (bytes[at], bytes.get(at + 1)) {
+        (b'\\', _) => {
+            let escaped = cmdline[at + 1..].chars().next().map_or(0, char::len_utf8);
+            Close::At(at + 1 + escaped)
+        }
+        (b'\'', _) if !quoted => quote(quoted_end(bytes, at, false)),
+        (b'$', Some(b'\'')) if !quoted => quote(quoted_end(bytes, at + 1, true)),
+        (b'`', _) => quote(quoted_end(bytes, at, false)),
+        (b'"', _) => dquote_end(cmdline, at, nest),
+        (b'$', Some(b'{')) => expansion_end(cmdline, at + 1, quoted, nest),
+        (b'$', Some(b'(')) => subshell_close(cmdline, at + 1, nest),
+        (b'<' | b'>', Some(b'(')) if !quoted => subshell_close(cmdline, at + 1, nest),
+        (b'<', Some(b'<')) if !quoted => match bytes.get(at + 2) {
+            Some(b'<') => Close::At(at + 3),
+            _ => Close::Unread,
+        },
+        _ => Close::At(at + 1),
+    }
+}
+
+/// Where the double quote that opens at `cmdline[at]` ends: the byte after the `"` that closes
+/// it, read past the parts it holds ([`sh_part`]: an escape, a backquote's, a `${…}` and a
+/// `$(…)`, whose own quotes nest in it, as `"$(echo ")")"` is one word). [`Close::Open`] when it
+/// never closes.
+fn dquote_end(cmdline: &str, at: usize, nest: usize) -> Close {
+    let Some(nest) = nest.checked_sub(1) else {
+        return Close::Unread;
     };
+    let bytes = cmdline.as_bytes();
+    let mut i = at + 1;
+    while let Some(&c) = bytes.get(i) {
+        if c == b'"' {
+            return Close::At(i + 1);
+        }
+        match sh_part(cmdline, i, true, nest) {
+            Close::At(next) => i = next,
+            other => return other,
+        }
+    }
+    Close::Open
+}
+
+/// Where the parameter expansion whose `{` is `cmdline[open]` (`${x:- }`, a word with its blanks)
+/// ends: the byte after the `}` that closes it, counting the braces nested in it outside its
+/// parts ([`sh_part`], read as in double quotes where it stands in them: `quoted`).
+/// [`Close::Open`] when it never closes.
+fn expansion_end(cmdline: &str, open: usize, quoted: bool, nest: usize) -> Close {
+    let Some(nest) = nest.checked_sub(1) else {
+        return Close::Unread;
+    };
+    let bytes = cmdline.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while let Some(&c) = bytes.get(i) {
+        i = match c {
+            b'{' => {
+                depth += 1;
+                i + 1
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Close::At(i + 1);
+                }
+                i + 1
+            }
+            _ => match sh_part(cmdline, i, quoted, nest) {
+                Close::At(next) => next,
+                other => return other,
+            },
+        };
+    }
+    Close::Open
+}
+
+/// Where the quote opened at `bytes[at]` (`'` or a backquote) ends: the byte after the one that
+/// closes it, a backslash escaping the next byte except in single quotes (in `$'…'`, `ansi`, it
+/// escapes there too). `None` when it never closes. A `"` holds parts of its own
+/// ([`dquote_end`]).
+fn quoted_end(bytes: &[u8], at: usize, ansi: bool) -> Option<usize> {
+    let quote = bytes[at];
+    let mut i = at + 1;
+    while let Some(&c) = bytes.get(i) {
+        if c == b'\\' && (quote != b'\'' || ansi) {
+            i += 2;
+            continue;
+        }
+        if c == quote {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Where pwsh ends the script block that opens at `cmdline[open]`: at the `}` that closes it,
+/// counting every `{` and `}` outside its strings (`'…'`, and `"…"` with its backquote escapes),
+/// its comments (`#` to the line's end where a token starts, `<# … #>`) and a backquote's escape.
+/// A definition's block ends its statement, so the statement's end must follow it
+/// ([`statement_ends`]), and the rest of the line is read on in the same way, since pwsh refuses
+/// a line with a `}` that closes no block and waits for more of one with a block still open at
+/// its end: [`Close::Open`] where the line is not pwsh's, as where the block never closes. A
+/// here-string (`@'` or `@"` ending its line) is [`Close::Unread`].
+fn pwsh_close(cmdline: &str, open: usize) -> Close {
+    let bytes = cmdline.as_bytes();
+    let mut depth = 0usize;
+    // Where the block closed, once it has: the rest of the line is then read for a `}` that
+    // closes nothing.
+    let mut closed: Option<usize> = None;
+    let mut i = open;
+    while let Some(&c) = bytes.get(i) {
+        match c {
+            b'`' => i += 1,
+            b'@' if matches!(bytes.get(i + 1), Some(b'\'' | b'"'))
+                && matches!(bytes.get(i + 2), None | Some(b'\n' | b'\r')) =>
+            {
+                return Close::Unread;
+            }
+            b'\'' | b'"' => {
+                let mut end = i + 1;
+                while let Some(&s) = bytes.get(end) {
+                    if s == b'`' && c == b'"' {
+                        end += 1;
+                    } else if s == c {
+                        break;
+                    }
+                    end += 1;
+                }
+                if end >= bytes.len() {
+                    return Close::Open;
+                }
+                i = end;
+            }
+            b'<' if bytes.get(i + 1) == Some(&b'#') => match cmdline[i + 2..].find("#>") {
+                Some(n) => i += n + 3,
+                None => return Close::Open,
+            },
+            b'#' if opens_comment(bytes, i) || matches!(bytes[i - 1], b'{' | b'}') => {
+                i = cmdline[i..].find('\n').map_or(bytes.len(), |n| i + n);
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                let Some(inner) = depth.checked_sub(1) else {
+                    return Close::Open;
+                };
+                depth = inner;
+                if depth == 0 && closed.is_none() {
+                    if !statement_ends(bytes, i + 1) {
+                        return Close::Open;
+                    }
+                    closed = Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    match closed {
+        Some(end) if depth == 0 => Close::At(end),
+        _ => Close::Open,
+    }
+}
+
+/// Whether a pwsh statement may end just before `bytes[at]`: past blanks, the text ends there or
+/// a newline, a `;`, a comment (`#`, `<#`), or the `}` or `)` of a block or a subexpression it
+/// stands in comes next. pwsh refuses a function definition followed by anything else
+/// (`filter out {a,b}.log`'s `.log`, a `|`).
+fn statement_ends(bytes: &[u8], at: usize) -> bool {
+    let at = past_blanks(bytes, at);
+    match bytes.get(at) {
+        None | Some(b'\n' | b'\r' | b';' | b'#' | b'}' | b')') => true,
+        Some(b'<') => bytes.get(at + 1) == Some(&b'#'),
+        Some(_) => false,
+    }
+}
+
+/// Where bash and zsh end the parenthesis that opens at `cmdline[open]` (a subshell's body, a
+/// `$(…)`, `<(…)` or `>(…)`, a `name=(…)` value): the byte after the `)` that closes it, counting
+/// each `(` and `)` outside its words' parts ([`sh_part`]: `${x:-)}`, `$'\')'` and `"$(echo ")")"`
+/// hold none) and its comments. A `case` word in its own text, outside those parts and wherever
+/// it stands (`( case`, `(case`, `x;case`, an argument), is [`Close::Unread`]: a `case` list's
+/// patterns end at a `)` of their own, so the count may close it early, and looking for the word
+/// wherever it stands reads nothing after more bodies than need it, never fewer. A part nested in
+/// it is read by its own count, so a `case` there is found where it stands. [`Close::Open`] when
+/// it never closes.
+fn subshell_close(cmdline: &str, open: usize, nest: usize) -> Close {
+    let Some(nest) = nest.checked_sub(1) else {
+        return Close::Unread;
+    };
+    let bytes = cmdline.as_bytes();
+    let name = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_';
+    let mut depth = 0usize;
+    let mut i = open;
+    while let Some(&c) = bytes.get(i) {
+        i = match c {
+            b'(' => {
+                depth += 1;
+                i + 1
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Close::At(i + 1);
+                }
+                i + 1
+            }
+            b'#' if opens_comment(bytes, i) => {
+                cmdline[i..].find('\n').map_or(bytes.len(), |n| i + n)
+            }
+            b'c' if !name(&bytes[i - 1])
+                && bytes[i..].starts_with(b"case")
+                && !bytes.get(i + 4).is_some_and(name) =>
+            {
+                return Close::Unread;
+            }
+            _ => match sh_part(cmdline, i, false, nest) {
+                Close::At(next) => next,
+                other => return other,
+            },
+        };
+    }
+    Close::Open
+}
+
+/// Where the parenthesis at `cmdline[open]` closes, read as no one shell reads it (a
+/// [`DEFINERS`] definition's parameter list, bash's and zsh's `()` or pwsh's `($a, $b)`:
+/// [`keyword_body`]): the byte after the `)` that closes it, counting the ones nested in it
+/// outside quotes and comments (read as [`cut_list`] reads them). [`Close::Open`] when it never
+/// closes, [`Close::Unread`] when a here-document comes first, whose text no count may read.
+fn paren_close(cmdline: &str, open: usize) -> Close {
+    let bytes = cmdline.as_bytes();
     let mut depth = 0usize;
     let mut quote: Option<u8> = None;
     let mut i = open;
@@ -2709,41 +3232,103 @@ fn group_end(cmdline: &str, open: usize) -> Option<usize> {
                 i = cmdline[i..].find('\n').map_or(bytes.len(), |n| i + n);
             }
             b'<' if bytes.get(i + 1) == Some(&b'<') && bytes.get(i + 2) != Some(&b'<') => {
-                return None;
+                return Close::Unread;
             }
             b'<' if bytes.get(i + 1) == Some(&b'<') => i += 2,
-            c if c == opener => depth += 1,
-            c if c == closer => {
-                depth -= 1;
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some(i + 1);
+                    return Close::At(i + 1);
                 }
             }
             _ => {}
         }
         i += 1;
     }
-    None
+    Close::Open
 }
 
-/// Where a fish `function` definition whose head's list ends just before `rest` ends: the end of
-/// the segment whose `end` closes it, counting the [`FISH_BLOCKS`] its body opens, each read in
-/// a segment's first place (past a [`NEGATIONS`] word). `None` when no `end` closes it.
-fn fish_end(cmdline: &str, rest: &[(ListOp, &str)]) -> Option<usize> {
-    let mut depth = 1usize;
-    for &(_, text) in rest {
-        match shell_words(text).find(|word| !NEGATIONS.contains(word)) {
-            Some(word) if FISH_BLOCKS.contains(&word) => depth += 1,
-            Some("end") => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(offset(cmdline, text) + text.len());
+/// `segment`'s pipeline stages and jobs, each a place a command starts: the text before and after
+/// each `|` and each `&` that ends a job (not a redirection's: `2>&1`, `&>`), outside quotes and
+/// parentheses. `nested` carries the parentheses (a command substitution, a subshell) still open
+/// from the segment before, since [`cut_list`] cuts their lists too; a stage that starts inside
+/// one is no stage of the line's own.
+fn stages<'a>(segment: &'a str, nested: &mut usize) -> Vec<&'a str> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut own = *nested == 0;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' && q != b'\'' {
+                i += 1;
+            } else if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\\' => i += 1,
+            b'\'' | b'"' | b'`' => quote = Some(c),
+            b'(' => *nested += 1,
+            b')' => *nested = nested.saturating_sub(1),
+            b'|' | b'&'
+                if *nested == 0
+                    && !(c == b'&'
+                        && ((i > 0 && matches!(bytes[i - 1], b'>' | b'<'))
+                            || bytes.get(i + 1) == Some(&b'>'))) =>
+            {
+                if own {
+                    out.push(&segment[start..i]);
                 }
+                start = i + 1;
+                own = true;
             }
             _ => {}
         }
+        i += 1;
     }
-    None
+    if own {
+        out.push(&segment[start.min(segment.len())..]);
+    }
+    out
+}
+
+/// Where a fish `function` definition whose head's list ends just before `rest` ends: the end of
+/// the segment whose `end` closes it, counting the [`FISH_BLOCKS`] its body opens, each read where
+/// a command starts (each segment's and each pipeline stage's first place: `… | while read x; …;
+/// end`), past fish's negations and `time`, and past an `else` to the word after it, which opens a
+/// block where it is one of them and no `if` (an `else if` goes on in the `if` already open).
+/// [`Close::Open`] when no `end` closes it.
+fn fish_end(cmdline: &str, rest: &[(ListOp, &str)]) -> Close {
+    let mut depth = 1usize;
+    let mut nested = 0;
+    for &(_, text) in rest {
+        for stage in stages(text, &mut nested) {
+            let mut words = shell_words(stage);
+            let mut lead = || words.find(|word| !NEGATIONS.contains(word) && *word != "time");
+            let word = match lead() {
+                Some("else") => lead().filter(|word| *word != "if"),
+                word => word,
+            };
+            match word {
+                Some("end") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Close::At(offset(cmdline, text) + text.len());
+                    }
+                }
+                Some(word) if FISH_BLOCKS.contains(&word) => depth += 1,
+                _ => {}
+            }
+        }
+    }
+    Close::Open
 }
 
 /// The index of the segment of `segments` whose command the line runs last: the last one that
@@ -2780,8 +3365,9 @@ fn running_segment(segments: &[(ListOp, &str)]) -> Option<usize> {
 pub(crate) struct LineShape {
     /// How many elements its top-level list holds: the parts `;`, a newline, `&&` and `||` (and
     /// fish's `and` and `or`) cut it into that hold a command ([`holds_command`]), and each
-    /// function definition, whose body's parts count for none, with one more for the rest of the
-    /// line a definition with no end found took ([`line_shape`]).
+    /// function definition that is a job of its own (one that is a stage of a pipeline beside
+    /// others is a part of that pipeline's element), whose body's parts count for none, with one
+    /// more for the rest of the line a definition with no agreed end took ([`line_shape`]).
     pub(crate) elements: u16,
     /// Which of them, counted from 1, the detail's program word is read from (`0`: none, the reader
     /// read nothing).
@@ -2816,23 +3402,24 @@ impl LineShape {
 
 /// `cmdline`'s [`LineShape`], read off the list [`candidate`] reads: the line less its function
 /// definitions ([`undefined`]), cut by [`split_list`]. A definition runs nothing, so no part of
-/// its body is an element and it is never the one read, but it is an element of the list where it
-/// was typed, whose status the shell reports when it is the last (`make; qzf() { true; }` ends
-/// with the definition's status, not `make`'s): each counts as one. One whose end the reader did
-/// not find took the rest of the line unread ([`Undefined::unclosed`]), which may hold elements
-/// of its own (zsh's `qzf() true; make`), so that rest counts as one more: nothing read before
-/// it is the last, and the line is never one element.
+/// its body is an element and it is never the one read, but where it is a job of its own it is an
+/// element of the list where it was typed, whose status the shell reports when it is the last
+/// (`make; qzf() { true; }` and `make & qzf() { true; }` end with the definition's status, not
+/// `make`'s): each counts as one, before the element read where it stands before the read
+/// command ([`command_start`]: `qzf() { true; } & make` reads its second element), else after
+/// it. One that is a stage of a pipeline beside others (`make | qzf() { true; }`) is a part of
+/// that pipeline's one element ([`Undefined::blanks`]). One whose end the shells do not agree on
+/// took the rest of the line unread ([`Undefined::unclosed`]), which may hold elements of its own
+/// (zsh's `qzf() true; make`), so that rest counts as one more: nothing read before it is the
+/// last, and the line is never one element.
 pub(crate) fn line_shape(cmdline: &str) -> LineShape {
     let whole = joined(cmdline);
     let bare = undefined(&whole);
     let cmdline: &str = &bare.line;
     let segments = split_list(cmdline);
-    // The elements before segment `upto`: the segments that hold a command, and the definitions
-    // typed before it.
-    let count = |upto: usize| {
-        let before = segments
-            .get(upto)
-            .map_or(cmdline.len(), |(_, text)| offset(cmdline, text));
+    // The elements up to byte `before`: the segments of `..upto` that hold a command, and the
+    // definitions whose blank stands before that byte.
+    let count = |upto: usize, before: usize| {
         let commands = segments[..upto]
             .iter()
             .filter(|(_, text)| holds_command(text))
@@ -2848,15 +3435,32 @@ pub(crate) fn line_shape(cmdline: &str) -> LineShape {
                 && segments[..at]
                     .iter()
                     .any(|(_, text)| holds_command(text) && program(text) == own);
-            (count(at + 1), shared)
+            (
+                count(at + 1, command_start(cmdline, segments[at].1)),
+                shared,
+            )
         }
         Some(_) | None => (0, false),
     };
     LineShape {
-        elements: count(segments.len()).saturating_add(u16::from(bare.unclosed)),
+        elements: count(segments.len(), cmdline.len()).saturating_add(u16::from(bare.unclosed)),
         read,
         shared,
     }
+}
+
+/// Where in `line` the command the reader reads in `segment`, a segment of it, starts: the first
+/// of its stages ([`stages`]) with a word in it that is no [`STEPPED_OVER`] one, as the reader
+/// steps over those to the command after them (`!`, pwsh's `&`), else where `segment` ends. A
+/// definition's blank before it (`qzf() { …; } & make`) is an element of the line before the one
+/// read, and one after it (`make & qzf() { …; }`) an element after it ([`line_shape`]).
+fn command_start(line: &str, segment: &str) -> usize {
+    stages(segment, &mut 0)
+        .into_iter()
+        .find(|stage| shell_words(stage).any(|word| !STEPPED_OVER.contains(&word)))
+        .map_or(offset(line, segment) + segment.len(), |stage| {
+            offset(line, stage)
+        })
 }
 
 const SUBCOMMANDS: &[(&str, &[&str])] = &[
@@ -3238,12 +3842,20 @@ pub(crate) struct StatusObserver {
     program_states: std::collections::HashMap<u64, crate::program_state::ProgramStateGate>,
 }
 
+/// The last footer ask the sweep sent for a session, or the stop that followed it
+/// ([`StatusObserver::request_footer_if_due`]).
 #[derive(Clone, Copy, Debug)]
 struct FooterAsk {
     at: Instant,
     pgid: i32,
     stopped: bool,
     image: Option<u64>,
+    /// The session's output instant (`latest_output_activity_ns`) as the sweep saw it then.
+    output: u64,
+    /// The footer resolver the ask was delivered to ([`crate::claude_footer::resolver_epoch`] as
+    /// [`crate::claude_footer::request_footer`] answered it); `None` for a stop, and for an ask
+    /// no resolver took.
+    resolver: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -3333,7 +3945,14 @@ impl StatusObserver {
         }
     }
 
-    /// Schedules an off-thread Claude footer refresh for `session` when due.
+    /// Schedules an off-thread Claude footer refresh for `session` when due: at its first visit
+    /// with a drawn agent in front, after a stop, when another group took the front, when an
+    /// edged visit finds a new drawer image, and when the session wrote since its last ask
+    /// (`output`, its `latest_output_activity_ns` at this visit, differs from the ask's), no
+    /// sooner than [`crate::claude_footer::RECHECK`] after that ask. A session that wrote nothing
+    /// since its ask is not asked for again while the resolver that took the ask runs: that
+    /// resolver's own clocks read it. An ask no resolver took, and one whose resolver has since
+    /// ended (its watches ended with it), is sent again at that same pace.
     #[expect(
         clippy::too_many_arguments,
         reason = "the sweep's one call site hands over what it already sampled"
@@ -3344,7 +3963,7 @@ impl StatusObserver {
         timeline: &std::sync::Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
         program: Option<&str>,
         pgid: i32,
-        now: Instant,
+        (now, output): (Instant, u64),
         wake: &crate::claude_footer::LogWake,
         edged: bool,
     ) {
@@ -3374,6 +3993,8 @@ impl StatusObserver {
                         pgid: old,
                         stopped: true,
                         image: None,
+                        output,
+                        resolver: None,
                     },
                 );
                 crate::claude_footer::stop(session, old);
@@ -3389,10 +4010,12 @@ impl StatusObserver {
             None
         };
         let prior = self.footer_asked.get(&session).copied();
+        let resolver = crate::claude_footer::resolver_epoch();
         let due = prior.is_none_or(|ask| {
             ask.stopped
                 || ask.pgid != pgid
-                || now.saturating_duration_since(ask.at) >= crate::claude_footer::RECHECK
+                || ((ask.output != output || ask.resolver != Some(resolver))
+                    && now.saturating_duration_since(ask.at) >= crate::claude_footer::RECHECK)
                 || image.is_some_and(|token| ask.image != Some(token))
         });
         if due {
@@ -3407,6 +4030,7 @@ impl StatusObserver {
                     .filter(|ask| ask.pgid == pgid && !ask.stopped)
                     .and_then(|ask| ask.image)
             });
+            let resolver = crate::claude_footer::request_footer(session, timeline, pgid, wake);
             self.footer_asked.insert(
                 session,
                 FooterAsk {
@@ -3414,9 +4038,10 @@ impl StatusObserver {
                     pgid,
                     stopped: false,
                     image,
+                    output,
+                    resolver,
                 },
             );
-            crate::claude_footer::request_footer(session, timeline, pgid, wake);
         }
     }
 
@@ -4332,7 +4957,7 @@ impl StatusObserver {
         self.program_states.remove(&session);
         let _ = self.inputs.forget(session);
         self.programs.retire(session);
-        crate::claude_footer::stop_session(session);
+        crate::claude_footer::stop_session(session, None);
         self.footer_asked.remove(&session);
         crate::codex_rollout_tap::retire_session(session);
         self.rollout_asked.remove(&session);
@@ -4754,7 +5379,7 @@ impl crate::App {
                     program.as_deref()
                 },
                 pgid,
-                now,
+                (now, latest_output_ns),
                 &footer_wake,
                 edged_visit,
             );
@@ -5059,7 +5684,7 @@ impl crate::App {
             let cleared = self.session_status.clear();
             let mut footers = false;
             for session in self.pool.iter() {
-                crate::claude_footer::stop_session(session.id);
+                crate::claude_footer::stop_session(session.id, Some(&session.ctx.timeline));
                 crate::codex_rollout_tap::stop_session(session.id, &session.ctx.timeline);
                 footers |= session
                     .ctx
@@ -5361,7 +5986,7 @@ impl crate::App {
         );
         let appearance = format!("{appearance} {}", self.session_theme_fields(session));
         let conpty = conpty_status_field(cfg!(windows), aterm_pty::conpty_host(pooled.master));
-        let (supervisor, authority, word, land_at, claimed_here, proven) = {
+        let (supervisor, authority, word, land_at, claimed_here, proven, pinned) = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let now = crate::metrics::now_us();
             let live = meta.live_supervisor(now);
@@ -5374,6 +5999,7 @@ impl crate::App {
                 meta.land_at,
                 live == Some(crate::autopilot::own_holder()),
                 proven,
+                crate::session_pin::field(&meta),
             )
         };
         let input = crate::input_stall::status_input(
@@ -5559,7 +6185,7 @@ impl crate::App {
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
                  fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} {net} \
                  {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} composer={composer} {program_state} last_act={last_act} {auth} {appearance}{conpty} integration={integration} \
-                 {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
+                 {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} pinned={pinned} human_ms={human_ms} \
                  human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
                  land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} editor={editor} {bells} gen={generation} seq={seq} hash={hash}",
@@ -5593,7 +6219,7 @@ impl crate::App {
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
              fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} {net} \
              {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} composer={composer} {program_state} last_act={last_act} {auth} {appearance}{conpty} integration={integration} \
-             {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
+             {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} pinned={pinned} human_ms={human_ms} \
              human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
              land_at={land_at} task={task} pause={pause}{land}{end} goal={goal} {task_record} {slog} editing={editing} editor={editor} {bells} gen={generation} seq={seq} hash={hash}",

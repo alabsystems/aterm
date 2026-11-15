@@ -157,6 +157,14 @@ impl std::fmt::Display for ContainedProducedError {
 }
 impl std::error::Error for ContainedProducedError {}
 
+/// Borrowed originals of the same parent coordinator. This bundle does not
+/// authenticate them; `workload_coordinator` retains all existing checks.
+pub struct CoordinatorDescriptors<'a> {
+    pub primary: std::os::fd::BorrowedFd<'a>,
+    pub broker: std::os::fd::BorrowedFd<'a>,
+    pub outputs: &'a [std::os::fd::BorrowedFd<'a>],
+}
+
 impl Client {
     /// Execute only an actually registered produced coordinator with the SAME
     /// parent-bank primary and parent-prepared Layout originals.
@@ -169,12 +177,11 @@ impl Client {
         &self,
         registered: &RegisteredOutput,
         request: &crate::workload::host::coordinator::Request,
-        primary: std::os::fd::BorrowedFd<'_>,
-        broker: std::os::fd::BorrowedFd<'_>,
-        outputs: &[std::os::fd::BorrowedFd<'_>],
+        descriptors: CoordinatorDescriptors<'_>,
         io: MetadataIo,
         deadline: Instant,
     ) -> Result<ContainedProducedMember, ContainedProducedError> {
+        let CoordinatorDescriptors { primary, broker, outputs } = descriptors;
         let prepare = || -> io::Result<_> {
             request.validate()?;
             request.contained.produced.validate_registered(registered.registration())?;

@@ -98,17 +98,17 @@ fn a_refused_preferred_token_falls_back_to_the_one_beside_the_socket() {
         seen
     });
     let mut c = RelayCtl::preferring(Endpoint::Socket(path.clone()), "memory-tok".to_string());
-    let first = c.call(&["@s-1", "send", "x"]).expect("send");
+    let first = c.call(&["@t1000000000", "send", "x"]).expect("send");
     assert_eq!(
         (first.code, first.stdout.as_str()),
         (0, "OK\n"),
         "{first:?}"
     );
-    let second = c.call(&["@s-1", "send", "y"]).expect("send");
+    let second = c.call(&["@t1000000000", "send", "y"]).expect("send");
     assert_eq!(second.code, 0, "{second:?}");
     drop(c);
     let mut plain = RelayCtl::new(Endpoint::Socket(path), Some("memory-tok".to_string()));
-    let refused = plain.call(&["@s-1", "send", "z"]).expect("send");
+    let refused = plain.call(&["@t1000000000", "send", "z"]).expect("send");
     assert!(
         refused.code == 1 && refused.stderr.contains("ERR auth"),
         "{refused:?}"
@@ -119,10 +119,10 @@ fn a_refused_preferred_token_falls_back_to_the_one_beside_the_socket() {
     assert_eq!(
         seen,
         vec![
-            ("memory-tok".to_string(), "@s-1 send x".to_string()),
-            ("beside-tok".to_string(), "@s-1 send x".to_string()),
-            ("beside-tok".to_string(), "@s-1 send y".to_string()),
-            ("memory-tok".to_string(), "@s-1 send z".to_string()),
+            ("memory-tok".to_string(), "@t1000000000 send x".to_string()),
+            ("beside-tok".to_string(), "@t1000000000 send x".to_string()),
+            ("beside-tok".to_string(), "@t1000000000 send y".to_string()),
+            ("memory-tok".to_string(), "@t1000000000 send z".to_string()),
         ]
     );
 }
@@ -146,39 +146,47 @@ fn replies_render_as_aterm_ctl_prints_them() {
     );
     let mut c = RelayCtl::new(Endpoint::Socket(sock), Some("tok".to_string()));
     let text = c
-        .call(&["@s-1", "text", "--json", "tail=40"])
+        .call(&["@t1000000000", "text", "--json", "tail=40"])
         .expect("text");
     assert_eq!(
         (text.code, text.stdout.as_str()),
         (0, "{\"rows\":[]}\nsecond\n")
     );
     let wait = c
-        .call(&["@s-1", "await", "gone", "x", "timeout", "20"])
+        .call(&["@t1000000000", "await", "gone", "x", "timeout", "20"])
         .expect("await");
     assert!(
         wait.timed_out() && wait.stdout == "OK timeout\n",
         "{wait:?}"
     );
-    let halted = c.call(&["@s-1", "key", "if=^x$", "1"]).expect("key");
+    let halted = c
+        .call(&["@t1000000000", "key", "if=^x$", "1"])
+        .expect("key");
     assert!(halted.is_err("halted") && !halted.lost(), "{halted:?}");
-    let skipped = c.call(&["@s-1", "key", "if=^x$", "1"]).expect("key");
+    let skipped = c
+        .call(&["@t1000000000", "key", "if=^x$", "1"])
+        .expect("key");
     assert!(skipped.skipped() && skipped.seq() == Some(7), "{skipped:?}");
     let turn = c
-        .call(&["@s-1", "turn", "idle=600", "hello"])
+        .call(&["@t1000000000", "turn", "idle=600", "hello"])
         .expect("turn");
     assert_eq!(turn.stdout, "row\n");
     assert!(turn.submitted() && turn.turn_seq() == Some(9), "{turn:?}");
-    let body = c.call(&["@s-1", "inbox", "get", "3"]).expect("inbox get");
+    let body = c
+        .call(&["@t1000000000", "inbox", "get", "3"])
+        .expect("inbox get");
     assert_eq!(body.stdout, "hello");
-    let search = c.call(&["@s-1", "search", "x"]).expect("search");
+    let search = c.call(&["@t1000000000", "search", "x"]).expect("search");
     assert_eq!(search.stdout, "10 0 1\n");
     assert_eq!(
         search.stderr,
         "aterm-ctl: results stop at 100000 matches\naterm-ctl: OK 1 incomplete capped\n"
     );
-    let meta = c.call(&["@s-1", "meta"]).expect("meta");
+    let meta = c.call(&["@t1000000000", "meta"]).expect("meta");
     assert_eq!(meta.stdout, "OK title=- attention=-\n");
-    let search = c.call(&["@s-1", "search", "^›", "regex"]).expect("search");
+    let search = c
+        .call(&["@t1000000000", "search", "^›", "regex"])
+        .expect("search");
     assert_eq!(
         (search.stdout.as_str(), search.stderr.as_str()),
         (
@@ -187,7 +195,7 @@ fn replies_render_as_aterm_ctl_prints_them() {
              1 incomplete older\n"
         )
     );
-    let text = c.call(&["@s-1", "text"]).expect("text");
+    let text = c.call(&["@t1000000000", "text"]).expect("text");
     assert_eq!(
         (text.stdout.as_str(), text.stderr.as_str()),
         (
@@ -198,7 +206,7 @@ fn replies_render_as_aterm_ctl_prints_them() {
     drop(c);
     let seen = h.join().expect("server");
     assert_eq!(seen[0], "AUTH");
-    assert_eq!(seen[1], "@s-1 text --json tail=40");
+    assert_eq!(seen[1], "@t1000000000 text --json tail=40");
     assert_eq!(seen.len(), 11, "one connection, one AUTH: {seen:?}");
 }
 
@@ -441,7 +449,7 @@ fn a_worker_on_another_instance_gets_its_own_connection() {
         dir.join("aterm-1.sock"),
         Stand {
             name: "endpoint",
-            relays: Some("s-ab"),
+            relays: Some("tab00000000"),
             answers: usize::MAX,
         },
     );
@@ -454,22 +462,27 @@ fn a_worker_on_another_instance_gets_its_own_connection() {
         },
     );
     std::fs::write(dir.join("aterm-2.token"), "hosttok\n").expect("token");
-    publish(&dir, "s-ab", &host.sock);
+    publish(&dir, "tab00000000", &host.sock);
     let mut c = RelayCtl::new(
         Endpoint::Socket(endpoint.sock.clone()),
         Some("tok".to_string()),
     )
     .in_rendezvous(&dir);
-    assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK host\n");
+    assert_eq!(stdout(c.call(&["@tab00000000", "meta"])), "OK host\n");
     assert_eq!(stdout(c.call(&["meta"])), "OK endpoint\n");
-    assert_eq!(stdout(c.call_at_host_of("s-ab", &["who"])), "host\n");
-    assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK host\n");
+    assert_eq!(stdout(c.call_at_host_of("tab00000000", &["who"])), "host\n");
+    assert_eq!(stdout(c.call(&["@tab00000000", "meta"])), "OK host\n");
     assert_eq!(stdout(c.call(&["who"])), "endpoint\n");
     drop(c);
     assert_eq!(endpoint.finish(), [vec!["AUTH tok", "meta", "who"]]);
     assert_eq!(
         host.finish(),
-        [vec!["AUTH hosttok", "@s-ab meta", "who", "@s-ab meta"]]
+        [vec![
+            "AUTH hosttok",
+            "@tab00000000 meta",
+            "who",
+            "@tab00000000 meta"
+        ]]
     );
 }
 
@@ -493,14 +506,17 @@ fn a_session_the_endpoint_hosts_under_another_spelling_rides_the_endpoints_token
         },
     );
     std::fs::write(real.join("aterm-1.token"), "besidetok\n").expect("token");
-    publish(&real, "s-ab", &endpoint.sock);
+    publish(&real, "tab00000000", &endpoint.sock);
     let given = alias.join("aterm-1.sock").to_string_lossy().into_owned();
     let mut c =
         RelayCtl::new(Endpoint::Socket(given), Some("tok".to_string())).in_rendezvous(&real);
-    assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK endpoint\n");
+    assert_eq!(stdout(c.call(&["@tab00000000", "meta"])), "OK endpoint\n");
     assert_eq!(stdout(c.call(&["meta"])), "OK endpoint\n");
     drop(c);
-    assert_eq!(endpoint.finish(), [vec!["AUTH tok", "@s-ab meta", "meta"]]);
+    assert_eq!(
+        endpoint.finish(),
+        [vec!["AUTH tok", "@tab00000000 meta", "meta"]]
+    );
 }
 
 #[test]
@@ -510,33 +526,46 @@ fn a_session_no_host_answers_for_rides_a_connection_of_its_own() {
         dir.join("aterm-1.sock"),
         Stand {
             name: "endpoint",
-            relays: Some("s-cd"),
+            relays: Some("tcd00000000"),
             answers: usize::MAX,
         },
     );
     let crashed = dir.join("aterm-3.sock");
     drop(UnixListener::bind(&crashed).expect("bind"));
-    publish(&dir, "s-cd", &crashed.to_string_lossy());
-    publish(&dir, "s-ce", &dir.join("aterm-4.sock").to_string_lossy());
+    publish(&dir, "tcd00000000", &crashed.to_string_lossy());
+    publish(
+        &dir,
+        "tce00000000",
+        &dir.join("aterm-4.sock").to_string_lossy(),
+    );
     let mut c = RelayCtl::new(
         Endpoint::Socket(endpoint.sock.clone()),
         Some("tok".to_string()),
     )
     .in_rendezvous(&dir);
-    assert_eq!(stdout(c.call(&["@s-cd", "meta"])), "OK s-cd-host\n");
+    assert_eq!(
+        stdout(c.call(&["@tcd00000000", "meta"])),
+        "OK tcd00000000-host\n"
+    );
     assert_eq!(stdout(c.call(&["meta"])), "OK endpoint\n");
-    assert_eq!(stdout(c.call(&["@s-cd", "meta"])), "OK s-cd-host\n");
-    assert_eq!(stdout(c.call_at_host_of("s-cd", &["who"])), "s-cd-host\n");
-    assert_eq!(stdout(c.call(&["@s-ce", "meta"])), "OK endpoint\n");
-    assert_eq!(stdout(c.call(&["@s-cf", "meta"])), "OK endpoint\n");
+    assert_eq!(
+        stdout(c.call(&["@tcd00000000", "meta"])),
+        "OK tcd00000000-host\n"
+    );
+    assert_eq!(
+        stdout(c.call_at_host_of("tcd00000000", &["who"])),
+        "tcd00000000-host\n"
+    );
+    assert_eq!(stdout(c.call(&["@tce00000000", "meta"])), "OK endpoint\n");
+    assert_eq!(stdout(c.call(&["@tcf00000000", "meta"])), "OK endpoint\n");
     drop(c);
     assert_eq!(
         endpoint.finish(),
         [
-            vec!["AUTH tok", "@s-cd meta", "@s-cd meta", "who"],
+            vec!["AUTH tok", "@tcd00000000 meta", "@tcd00000000 meta", "who"],
             vec!["AUTH tok", "meta"],
-            vec!["AUTH tok", "@s-ce meta"],
-            vec!["AUTH tok", "@s-cf meta"],
+            vec!["AUTH tok", "@tce00000000 meta"],
+            vec!["AUTH tok", "@tcf00000000 meta"],
         ]
     );
 }
@@ -554,20 +583,24 @@ fn a_host_that_hangs_up_is_found_again_by_its_graph_entry() {
     let new = instance(dir.join("aterm-5.sock"), stand("new", usize::MAX));
     std::fs::write(dir.join("aterm-2.token"), "oldtok\n").expect("token");
     std::fs::write(dir.join("aterm-5.token"), "newtok\n").expect("token");
-    publish(&dir, "s-ab", &old.sock);
+    publish(&dir, "tab00000000", &old.sock);
     let mut c = RelayCtl::new(Endpoint::Socket(endpoint.sock.clone()), None).in_rendezvous(&dir);
-    assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK old\n");
-    publish(&dir, "s-ab", &new.sock);
-    let dropped = c.call(&["@s-ab", "meta"]).expect("reply");
+    assert_eq!(stdout(c.call(&["@tab00000000", "meta"])), "OK old\n");
+    publish(&dir, "tab00000000", &new.sock);
+    let dropped = c.call(&["@tab00000000", "meta"]).expect("reply");
     assert!(dropped.lost(), "{dropped:?}");
-    assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK new\n");
+    assert_eq!(stdout(c.call(&["@tab00000000", "meta"])), "OK new\n");
     drop(c);
     assert_eq!(endpoint.finish(), Vec::<Vec<String>>::new());
     assert_eq!(
         old.finish(),
-        [vec!["AUTH oldtok", "@s-ab meta", "@s-ab meta"]]
+        [vec![
+            "AUTH oldtok",
+            "@tab00000000 meta",
+            "@tab00000000 meta"
+        ]]
     );
-    assert_eq!(new.finish(), [vec!["AUTH newtok", "@s-ab meta"]]);
+    assert_eq!(new.finish(), [vec!["AUTH newtok", "@tab00000000 meta"]]);
 }
 
 #[test]
@@ -581,14 +614,14 @@ fn the_interrupter_hangs_up_every_connection() {
     let endpoint = instance(dir.join("aterm-1.sock"), stand("endpoint"));
     let host = instance(dir.join("aterm-2.sock"), stand("host"));
     std::fs::write(dir.join("aterm-2.token"), "hosttok\n").expect("token");
-    publish(&dir, "s-ab", &host.sock);
+    publish(&dir, "tab00000000", &host.sock);
     let mut c = RelayCtl::new(
         Endpoint::Socket(endpoint.sock.clone()),
         Some("tok".to_string()),
     )
     .in_rendezvous(&dir);
     assert_eq!(stdout(c.call(&["meta"])), "OK endpoint\n");
-    assert_eq!(stdout(c.call(&["@s-ab", "meta"])), "OK host\n");
+    assert_eq!(stdout(c.call(&["@tab00000000", "meta"])), "OK host\n");
     let cut = c.interrupter().expect("interrupter");
     cut();
     for (name, at) in [("endpoint", &endpoint), ("host", &host)] {
@@ -597,10 +630,10 @@ fn the_interrupter_hangs_up_every_connection() {
             .unwrap_or_else(|e| panic!("the {name} read no end of the cut connection: {e}"));
     }
     assert!(c.call(&["meta"]).is_err(), "after the cut");
-    assert!(c.call(&["@s-ab", "meta"]).is_err(), "after the cut");
+    assert!(c.call(&["@tab00000000", "meta"]).is_err(), "after the cut");
     drop(c);
     assert_eq!(endpoint.finish(), [vec!["AUTH tok", "meta"]]);
-    assert_eq!(host.finish(), [vec!["AUTH hosttok", "@s-ab meta"]]);
+    assert_eq!(host.finish(), [vec!["AUTH hosttok", "@tab00000000 meta"]]);
 }
 
 #[test]

@@ -459,7 +459,7 @@ fn each_guard_holds_a_due_wake_and_nothing_is_written() {
             ..Script::new(&tag, Occupancy::Prompt, &[0, 5 * 60])
         };
         if let Some(autopilot) = case.autopilot {
-            script.policy.autopilot = autopilot;
+            script.policy.turn_end.autopilot = autopilot;
         }
         let ran = script.run(&mut |s, i| {
             utc(s, i);
@@ -519,7 +519,7 @@ fn a_land_worker_and_an_upgrade_due_type_the_wake() {
             host: ready_host(),
             ..Script::new("wake-write-land", Occupancy::Prompt, &[0, 5 * 60])
         };
-        script.policy.autopilot = Autopilot::Land;
+        script.policy.turn_end.autopilot = Autopilot::Land;
         script.run(&mut utc)
     };
     assert_eq!(rule_said(&land, WAKE), ["typed"], "{:#?}", land.noted);
@@ -1068,8 +1068,11 @@ fn a_due_wakes_line_leaves_the_breaks_needs_raised() {
         host.wants.store(wants, Ordering::SeqCst);
         Script {
             policy: SupervisorConfig {
-                autopilot: Autopilot::Cruise,
                 continue_policy: true,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Cruise,
+                    ..policy(Occupancy::Prompt).turn_end.clone()
+                },
                 ..policy(Occupancy::Prompt)
             },
             host,

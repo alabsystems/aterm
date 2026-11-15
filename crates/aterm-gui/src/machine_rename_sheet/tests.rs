@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aterm_agent::machine_name::{ensure, rename_preview};
 use aterm_net::fleet_member::name_record::FLOOR_MS;
@@ -68,6 +68,28 @@ fn the_numeric_id_field_distinguishes_zero_from_no_assignment() {
         Ok(nick("blue HERON"))
     );
     assert!(rename_to(&typed("-1"), &left("Heron"), &zero).is_err());
+}
+
+#[test]
+fn invalid_pastes_keep_the_draft_without_copying_it_into_the_error() {
+    let held = read("m184", "Linnet");
+    for size in [1024, 65_536] {
+        for (input, is_number) in [("9".repeat(size), true), ("界".repeat(size), false)] {
+            let draft = typed(&input);
+            let result = if is_number {
+                rename_to(&draft, &left("Linnet"), &held)
+            } else {
+                rename_to(&left("184"), &draft, &held)
+            };
+            let error = result.expect_err("invalid paste");
+            assert!(
+                error.len() <= 256,
+                "error copied a large draft: {} bytes",
+                error.len()
+            );
+            assert_eq!(draft.typed(), Some(input.as_str()));
+        }
+    }
 }
 
 #[test]
@@ -416,11 +438,14 @@ fn rename_is_unavailable_only_while_the_fields_or_the_read_refuse() {
     let Snapshot::Read(preview) = &read else {
         unreachable!("a read")
     };
-    let why = preview
+    let refused = preview
         .preview
         .judge(num(20))
         .expect_err("the vault holds m20");
-    assert!(held_by_vault.text.starts_with(&why), "{held_by_vault:?}");
+    assert!(
+        held_by_vault.text.starts_with(&refused.why),
+        "{held_by_vault:?}"
+    );
     assert!(line(&reading, &stale, &typed("m20"), &left(&word)).renames);
     assert!(line(&unread, &stale, &typed("m20"), &left(&word)).renames);
     assert_eq!(
@@ -475,6 +500,115 @@ fn rename_is_unavailable_only_while_the_fields_or_the_read_refuse() {
         pending.text.contains("fixture labels unavailable"),
         "{pending:?}"
     );
+}
+
+/// A number another Mac holds names the next free numbers above it, the ones the read finds
+/// ([`RenamePreview::next_free`]), each of which the set takes; the panel's line and the page's
+/// verdict say the same, and the held number's refusal leads. Typing another held number names
+/// its own, and typing the first again the first's: what the read remembers changes no line.
+/// NEGATIVE CONTROLS: a refusal of every number (the policy's server name) names none, and a
+/// read whose labels failed leaves the number unchecked, naming none.
+#[test]
+fn a_held_number_names_the_next_free_numbers_the_set_takes() {
+    use aterm_agent::machine_name::{Cause, set_name};
+    use aterm_net::fleet_member::name_record::ByKind;
+    let root = aterm_tempfile::tempdir().expect("a state folder");
+    let now = FLOOR_MS + 300 * 86_400_000;
+    ensure(root.path(), || Ok(Some("m7".to_owned())), |_| false, now).expect("a name");
+    let held_for = |held: &[u32]| LabLabels {
+        held: held.iter().map(|n| (num(*n), LabelHold::Label)).collect(),
+        ..LabLabels::default()
+    };
+    let preview =
+        rename_preview(root.path(), || Ok(held_for(&[20, 22])), || Ok(None), now).expect("a read");
+    let held = Held::of_read(&preview);
+    let word = held.word.clone();
+    let named_for = |n: u32| {
+        let refused = preview.judge(num(n)).expect_err("the vault holds it");
+        let free = preview.next_free(num(n), &refused);
+        assert_eq!(free.len(), aterm_agent::machine_name::FREE_SHOWN, "m{n}");
+        for taken in &free {
+            set_name(
+                root.path(),
+                &NameTo {
+                    num: *taken,
+                    nick: None,
+                },
+                || Ok(held_for(&[20, 22])),
+                ByKind::Person,
+                || Ok(None),
+                now,
+                true,
+            )
+            .unwrap_or_else(|why| panic!("{taken} is free: {why}"));
+        }
+        let named = sentence(&next_free_words(&free).expect("words for the free numbers"));
+        (format!("{} {named}", sentence(&refused.why)), named)
+    };
+    let (twenty, twenty_two) = (named_for(20), named_for(22));
+    assert_ne!(twenty.1, twenty_two.1, "each held number names its own");
+    let snapshot = Snapshot::read(preview);
+    for (typed_number, text) in [
+        ("m20", &twenty.0),
+        ("m22", &twenty_two.0),
+        ("m20", &twenty.0),
+    ] {
+        let shown = line(&snapshot, &held, &typed(typed_number), &left(&word));
+        assert_eq!(
+            shown,
+            Line {
+                text: text.clone(),
+                renames: false
+            },
+            "{typed_number}"
+        );
+        assert_eq!(
+            verdict(&snapshot, &held, &typed(typed_number), &left(&word)),
+            shown
+        );
+    }
+
+    let served = rename_preview(
+        root.path(),
+        || {
+            Ok(LabLabels {
+                own: BTreeSet::from([num(7)]),
+                label: Some(num(7)),
+                servers: BTreeSet::from([num(7)]),
+                ..held_for(&[20])
+            })
+        },
+        || Ok(None),
+        now,
+    )
+    .expect("a read");
+    let refused = served
+        .judge(num(20))
+        .expect_err("m20 leaves the server's name");
+    assert_eq!(refused.cause, Cause::Server(num(7)));
+    let shown = line(&Snapshot::read(served), &held, &typed("m20"), &left(&word));
+    assert_eq!(
+        shown,
+        Line {
+            text: sentence(&refused.why),
+            renames: false
+        },
+        "control: a refusal of every number names none"
+    );
+
+    let unread = rename_preview(
+        root.path(),
+        || Err(std::io::Error::other("the vault is busy")),
+        || Ok(None),
+        now,
+    )
+    .expect("a read");
+    let shown = line(&Snapshot::read(unread), &held, &typed("m20"), &left(&word));
+    assert!(
+        shown.renames,
+        "control: an unread number is left to the set"
+    );
+    assert!(!shown.text.contains(&twenty.1), "{shown:?}");
 }
 
 /// A read whose vault labels failed leaves a moving number unchecked, not refused: the set reads

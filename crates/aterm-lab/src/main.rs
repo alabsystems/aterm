@@ -15,6 +15,8 @@ mod artifact_serve;
 mod abrew_admission;
 #[cfg(target_os = "macos")]
 mod admission;
+#[cfg(target_os = "macos")]
+mod admission_log;
 #[cfg(all(target_os = "macos", debug_assertions))]
 mod window_custody;
 #[cfg(target_os = "macos")]
@@ -63,6 +65,10 @@ mod band;
 mod bench_stats;
 #[cfg(all(target_os = "macos", debug_assertions))]
 mod build_admit;
+#[cfg(target_os = "macos")]
+mod timing_comparison;
+#[cfg(target_os = "macos")]
+mod title_drift;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 mod build_admit {
     pub fn cmd(_: &[String]) -> crate::Res {
@@ -77,7 +83,7 @@ mod reveal_tab;
 mod reveal_tab {
     pub fn cmd(_: &[String]) -> crate::Res {
         Err(crate::Fail::die(
-            "reveal-tab needs a debug lab image for its scratch-registry seams",
+            "reveal-tab needs a debug lab image for its negative-control seam",
         ))
     }
 }
@@ -214,6 +220,8 @@ mod local_signins;
 mod machine_labels;
 #[cfg(all(target_os = "macos", debug_assertions))]
 mod tables_page;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod this_mac_page;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 mod local_signins {
     pub fn cmd(_: &[String]) -> crate::Res {
@@ -334,6 +342,8 @@ mod restart_jobs;
 #[cfg(target_os = "macos")]
 mod restore;
 #[cfg(target_os = "macos")]
+mod restore_native;
+#[cfg(target_os = "macos")]
 mod run;
 #[cfg(target_os = "macos")]
 mod runtime_dirs;
@@ -378,6 +388,8 @@ mod setup_token_lab {
 }
 #[cfg(target_os = "macos")]
 mod fsevents;
+#[cfg(target_os = "macos")]
+mod music_render;
 #[cfg(target_os = "macos")]
 mod settings_witness;
 #[cfg(target_os = "macos")]
@@ -568,13 +580,15 @@ usage: targo --unverified lab <command> [tag] [args]
   kimi [tag] [-e K=V]... [--no-wait] [-- kimi args]
                                  launch Kimi Code in tab 1 with a scratch HOME and KIMI_CODE_HOME whose config.toml names
                                  one openai-type provider at the stub's Chat Completions routes and the lab's fake key
-  outlook-captures --out DIR [--aterm ATERM] [--tag NAME] [--scenes ABCDEFGHIJKLM] [--look day|night|both] [--scale 1|2|both]
+  outlook-captures --out DIR [--aterm ATERM] [--tag NAME] [--scenes ABCDEFGHIJKLMNO] [--look day|night|both] [--scale 1|2|both]
                                  the accounts outlook's footer at three widths and Account card at 60 and 44 cells, one
-                                 headless instance per scene, look and scale, seeded with synthetic identities only; I, J
-                                 and K: line E's quota row over the fixture's usage-tap statusLine, under Cruise; the card
-                                 of A, B, C, E, H and J (case (c), Cruise: the one whose Forecast row holds a projection),
-                                 and of L (a login outside the pool, at home on another Mac) and M (a pool account with a
-                                 vault token), each with a pool file and a scratch vault served on loopback
+                                 headless instance per scene, look and scale, seeded with synthetic identities only; I, J,
+                                 K, N and O: line E's quota row over the fixture's usage-tap statusLine, under Cruise; the
+                                 card of A, B, C, E, H and J (case (c), Cruise: the one whose Forecast row holds a
+                                 projection), of L (a login outside the pool, at home on another Mac) and M (a pool account
+                                 with a vault token), each with a pool file and a scratch vault served on loopback, and of
+                                 N and O (the logins: signed out though read, signing in, never signed in here; O's tab
+                                 runs on the one signing in)
   outlook-perf --main ATERM --out DIR [--aterm ATERM] [--pairs N]
                                  the outlook against another build on scene A: paired typing and idle takes, and the
                                  resolver's own read and replay cost
@@ -826,14 +840,17 @@ Outside any lab (no jail, no stub):
                                  only, no --aterm or LAB_ATERM fallback; no LAN proof)
   instance compare --before LAB --after LAB --aterm PATH --output DIR [--samples N]
                                  compare capture validity and runner wall time against another lab build, in private worlds
+  admission [--since DURATION] [--json]
+                                 read this account's admission log (24h unless --since N(s|m|h|d)): the landing
+                                 economy's exit tests E1-E4, §4 row 2's figures and the log's coverage; reads only
   abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
                                  evaluate abrew admission of Homebrew's formula.json and cask.json (fetched from
                                  formulae.brew.sh unless --indexes DIR holds them) on the newest Mac, that Mac with the
                                  named facts replaced, or this one (--this-machine)
   reveal-tab [--json] [--ax-helper HELPER] [--plain-publication] [ATERM]
-                                 one-mesh A17 on a private window: synthetic logins sealed in a scratch Commons;
-                                 `aterm db emails --show-passwords` prints outside aterm and, in a tab, opens a
-                                 read-only Editor tab that `text|screen|image|window|video|key|doc read` refuse,
+                                 one-mesh A17 on a private window: a private grid of synthetic logins that
+                                 `aterm edit --wait --secret=password`, in a tab, opens in an Editor tab
+                                 that `text|screen|image|window|video|key|doc read` refuse,
                                  leaving no value in the tab's text, blocks or log, and the window's accessibility
                                  tree carries the grid and every login and no value (read here, or with --ax-helper
                                  by the guest helper's ax-texts, as `mac nux --scenario reveal-tab` runs it in a
@@ -851,8 +868,7 @@ Outside any lab (no jail, no stub):
                                  proof (debug image); members: `aterm members join --at <ip:port>...`, no phrase
                                  emails-fixture|emails-set|emails-wait: the owner's emails table across the
                                  profiles (seeded fleet_db replica and flag-only sheet, stdin-only edits,
-                                 keyed-digest waits); no value crosses Macs or reaches a report
-                                 emails-reveal: A17 on that table in a windowed instance of the profile (debug image)
+                                 waits on a digest of the rows shown); no value crosses Macs or reaches a report
                                  db: run the shipped proposal/data CLI in that profile, online or offline
                                  secrets: an admin's approval of a key, a join of a lab profile's vault file or of the
                                  lab URL it follows, status
@@ -887,6 +903,10 @@ Outside any lab (no jail, no stub):
   tables-page [--out DIR] [ATERM]
                                  the Tables page on a private instance with a scratch registry: frames of
                                  its read, a conflict, staged edits and their write (debug lab image)
+  this-mac-page [--out DIR] [ATERM]
+                                 Settings ▸ This Mac on a private instance: frames of its read and a typed
+                                 nickname, act's refusal of Save with the scratch name unmoved, and this
+                                 Mac's own names read (never set) before and after (debug lab image)
   machine-labels                  two private members: rename onto a sheet number, merge its rows, and check fleet,
                                  membership, --host and survey (debug lab image; no system-name writes)
   swarm rotate [--aterm PATH] [--keep]
@@ -895,8 +915,8 @@ Outside any lab (no jail, no stub):
   swarm mailbox-signin [--live] [--email EMAIL] [--label LABEL] [--mailbox PATH] [--aterm PATH] [--keep]
                                  verify an unenrolled Claude row records `no-route` while mailbox config is withheld, then
                                  signs in through `ai-mailbox.toml`, ends enrolled, and serves a proven turn (--live: run
-                                 against a real Claude account and ~/.secrets/ai-mailbox.toml; a pass's record goes to
-                                 $LAB_STATE/results/)
+                                 against a real Claude account and the vault's ai-mailbox.toml entry, read in place;
+                                 a pass's record goes to $LAB_STATE/results/)
   swarm partition [--one-url] [--writers both|a] [--minter-away] [--hold SECS] [--aterm PATH] [--keep] [--label WORD]
                                  split seven private headless aterms and a vault-only Mac on loopback into two islands
                                  (the ATERM_DEBUG_PARTITION cut), publish and admit on each side, heal, and report what
@@ -961,6 +981,9 @@ Outside any lab (no jail, no stub):
   trail-contrast <png> [--find TEXT]... [--cells ROW:COL[-COL]]... [--row N]... [--newest N] [--min X]
                  [--newest-min X] [--caret-min X] [--dims FILE|--origin X,Y --cell WxH] [--no-clean] ...
                                  compute WCAG contrast JSON from trail-gallery frames and sidecars (`--help` for details)
+  music-render [--text TEXT | --text-file FILE] [--voice NAME[,NAME]...] [--seed N] [--wpm N] [<out_dir>]
+                                 type a text with a seeded timing model and render it through the trail synth to one WAV per voice,
+                                 matched on energy, with each 512-frame block's render time (`--help` for details)
   video-sheet INDEX --dims FILE --rows A:B --cols C:D --before-us US --out NEWDIR [--expect-text TEXT]
                                  offline native-pixel atlas of every indexed frame; coverage report, no visual verdict
   system-state-gallery [--aterm PATH] [--fixtures NAME,...] [--quick] [--looks LOOK,...] [--sizes SIZE,...]
@@ -1006,6 +1029,11 @@ Outside any lab (no jail, no stub):
                                  OPENS A WINDOW: verify Aos M2 live repair of a stranded momentum glow, or publish an Aos M4 plan against a control (~25 s; `--help` for details)
   aos-cadence --a PATH --b PATH [--no-attach] [--silent] [--keep]
                                  OPENS A WINDOW, four in turn: typing latency to the glass with a recording holding each key for its echo, builds A B B A (~3 min plus each window's wait for a quiet Mac; `--help` for details)
+  title-drift-memory <same frozen builds/workload> --calibration-memory-mib N --bound-growth-mib N --bound-reason TEXT --out DIR
+                                 OPENS PRIVATE WINDOWS: functional memory sizing only; no timing qualification (`--help` for required bounds)
+  title-drift --a PATH --a-source SHA --a-sha256 SHA --b PATH --b-source SHA --b-sha256 SHA --out DIR
+  restore-native --a PATH --a-source SHA --a-sha256 SHA --a-build-record JSONL --b PATH --b-source SHA --b-sha256 SHA --b-build-record JSONL --out DIR
+                                 OPENS PRIVATE WINDOWS: unchanged-title output and native typing, in ABBA order, with strict timing evidence (`--help` for profiles and quick validation)
   aos-search [--grid] [--plans FILE] --out DIR [--toolchain LINE] | aos-search --verify FILE
                                  run Aos M4's candidate search under the pinned policy, or verify a bundle FILE offline (`--help` for details)
   aos-gpu-bench --harness PATH --out DIR [--rounds N]
@@ -1297,6 +1325,8 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "machine-labels" => machine_labels::cmd(args),
         #[cfg(debug_assertions)]
         "tables-page" => tables_page::cmd(args),
+        #[cfg(debug_assertions)]
+        "this-mac-page" => this_mac_page::cmd(args),
         "service-acceptance" => service_acceptance::cmd(args),
         "artifact-serve" => artifact_serve::cmd(args),
         "local-signins" => local_signins::cmd(args),
@@ -1333,6 +1363,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "phase" => verbs::cmd_phase(args),
         "prices" => prices::cmd_prices(args),
         "abrew-admission" => abrew_admission::cmd_abrew_admission(args),
+        "admission" => admission_log::cmd(args),
         "stublog" => verbs::cmd_stublog(args),
         "security" => verbs::cmd_security(args),
         "egress" => verbs::cmd_egress(args),
@@ -1377,6 +1408,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "deck-motion" => deck_motion::cmd_deck_motion(args),
         "__trail-redraw-fixture" => trail_gallery::cmd_redraw_fixture(args),
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
+        "music-render" => music_render::cmd(args),
         "video-sheet" => video_sheet::cmd(args),
         "system-state-gallery" => system_state_gallery::cmd_system_state_gallery(args),
         "fsevents" => fsevents::cmd(args),
@@ -1394,6 +1426,9 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "first-key" => first_key::cmd_first_key(args),
         "aos-repair" => aos_repair::cmd_aos_repair(args),
         "aos-cadence" => aos_cadence::cmd_aos_cadence(args),
+        "title-drift" => title_drift::cmd(args),
+        "title-drift-memory" => title_drift::memory_cmd(args),
+        "restore-native" => restore_native::run(args),
         "aos-search" => aos_search::cmd_aos_search(args),
         "aos-gpu-bench" => aos_gpu_bench::cmd_aos_gpu_bench(args),
         "aos-learn" => aos_learn::cmd_aos_learn(args),
@@ -1513,6 +1548,7 @@ fn main() -> std::process::ExitCode {
             let cmd = args.first().cloned().unwrap_or_default();
             let rest = args.get(1..).unwrap_or_default();
             match cmd.as_str() {
+                "__title-drift-producer" => title_drift::producer_main(rest),
                 #[cfg(debug_assertions)]
                 "__handoff-stream" => installer_handoff::stream_fixture_main(rest),
                 #[cfg(debug_assertions)]
@@ -1536,6 +1572,8 @@ fn main() -> std::process::ExitCode {
                 "keeper" => instance::keeper_main(rest),
                 "band" => band::band_main(rest),
                 "band-launch" => band::launch_main(rest),
+                #[cfg(any(test, debug_assertions))]
+                "band-sequence" => band::sequence_main(rest),
                 "band-standin" => band::standin_main(rest),
                 "presence-standin" => presence::standin_main(rest),
                 slot_lane::HOLD_VERB => slot_lane::hold_main(rest),
@@ -1580,12 +1618,14 @@ fn main() -> std::process::ExitCode {
                                 | "mesh"
                                 | "reduce"
                                 | "trail-contrast"
+                                | "music-render"
                                 | "video-sheet"
                                 | "trail-census"
                                 | "trail-companion"
                                 | "trail-hue"
                                 | "trail-film"
                                 | "abrew-admission"
+                                | "admission"
                                 | "build-admit"
                                 | "recording-cpu"
                                 | "git-starts"

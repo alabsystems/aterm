@@ -512,6 +512,7 @@ fn relaunch_held(
     let (line, dialect) = match self_claimed_plan(opts, st, shell, k) {
         Ok(p) => (p.line, p.dialect),
         Err(NoPlan::Wait(why)) => return said(r, format!("wait:{why}")),
+        Err(NoPlan::Account(refusal)) => return said(r, format!("wait:{}", refusal.kind.word())),
         Err(NoPlan::Refused { why, detail, .. }) => return fail(opts, r, st, &why, &detail),
     };
     if let Some(layout) = atpkg::store::resolve_configured()

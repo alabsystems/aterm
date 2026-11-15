@@ -315,7 +315,8 @@ pub(crate) struct Observed {
     shown: ShownMarks,
 }
 
-const META_FIELDS_MAX: usize = crate::session_timeline::MetaField::ALL.len() + 1;
+/// The meta fields a log keeps a value of: the user fields, the supervisor claim and the pin.
+const META_FIELDS_MAX: usize = crate::session_timeline::MetaField::ALL.len() + 2;
 
 const FINGERPRINTED_META: &[&str] = &["attention"];
 

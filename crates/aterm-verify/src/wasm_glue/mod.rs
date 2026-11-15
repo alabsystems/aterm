@@ -70,8 +70,7 @@ pub(crate) fn bind(input: &Path, out_dir: &Path) -> Result<Vec<PathBuf>, String>
 }
 
 const USAGE: &str = "usage: targo --unverified verify glue <in.wasm> <out-dir> [--flavor web]\n\
-       targo --unverified verify glue --record-toy      (re-record the toy's goldens and fixture)\n\
-       targo --unverified verify glue --record-replay   (re-record the CPU module's boundary answers)";
+       targo --unverified verify glue --record-toy      (re-record the toy's goldens and fixture)";
 
 /// `verify glue …`, answering its exit code.
 #[must_use]
@@ -80,14 +79,10 @@ pub fn run(args: &[String]) -> i32 {
         println!("{USAGE}");
         return crate::exit::PASS;
     }
-    if args == ["--record-toy"] || args == ["--record-replay"] {
+    if args == ["--record-toy"] {
         let root = crate::perf::workspace_root();
         let mut log = String::new();
-        let run = if args == ["--record-toy"] {
-            toy::gate(&root, &root.join("target/wasm-glue-toy"), true, &mut log)
-        } else {
-            crate::perf::wasm::record_replay(&mut log)
-        };
+        let run = toy::gate(&root, &root.join("target/wasm-glue-toy"), true, &mut log);
         eprint!("{log}");
         return match run.status {
             crate::perf::Status::Pass => crate::exit::PASS,

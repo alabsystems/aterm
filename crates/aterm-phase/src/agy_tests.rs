@@ -7,7 +7,7 @@ use super::fixtures::*;
 use super::*;
 use crate::prompt::fixtures::{cursor, provenance, rows, screen};
 use crate::reader::{AgyReader, ClaudeReader, CodexReader, Program, ScreenReader, identify, read};
-use crate::wall::WallKind;
+use alab_policy::vocab::WallKind;
 
 fn agy(text: &str) -> crate::reader::Reading {
     read(Some("agy"), &screen(text), None)

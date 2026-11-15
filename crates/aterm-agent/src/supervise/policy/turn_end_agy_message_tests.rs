@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+use alab_policy::config::TurnEndTiming;
 use aterm_phase::agy::fixtures::lab::{REPLY_WRAPPED_50, WORKER_FIRST_PROMPT};
 use aterm_phase::prompt::fixtures::screen;
 
@@ -234,11 +235,8 @@ fn every_act_with(rules_text: &str) -> Vec<(String, String)> {
         for irreversible in [false, true] {
             add(
                 &format!("done-check-held-{irreversible}"),
-                crate::supervise::policy::go_ahead::unless_held(
-                    &done_check_text(rules, irreversible),
-                    true,
-                )
-                .into_owned(),
+                alab_policy::go_ahead::unless_held(&done_check_text(rules, irreversible), true)
+                    .into_owned(),
             );
         }
         add("continue", continuation_text(&cfg(), rules));
@@ -563,8 +561,7 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
 /// next break and at the point alike. NEGATIVE CONTROL: after another act the same rows name it.
 #[test]
 fn a_carrys_own_rows_name_no_need() {
-    let carry =
-        crate::supervise::policy::cruise_carry::carry_words(Some(&rules_line(OWNER_NEED_RULES)));
+    let carry = alab_policy::cruise_carry::carry_words(Some(&rules_line(OWNER_NEED_RULES)));
     let other = continuation_text(&cfg(), None);
     let mut cuts = 0;
     for cols in WIDTHS {
@@ -704,9 +701,12 @@ fn a_message_with_a_blank_line_reads_as_agys_reply_and_the_harness_types_none() 
     use crate::supervise::approvals::words_lead;
     let message = "Please also update the changelog.\n\nNothing left: x\nNEEDS YOU: y";
     let owners = SupervisorConfig {
-        continue_text: "Keep going.\n\nWhen it is all done, reply with a line starting \
+        turn_end: alab_policy::config::PolicyConfig {
+            continue_text: "Keep going.\n\nWhen it is all done, reply with a line starting \
                         Nothing left: x"
-            .to_string(),
+                .to_string(),
+            ..cfg().turn_end.clone()
+        },
         ..cfg()
     };
     let act = continuation_text(&owners, None);

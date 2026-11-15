@@ -113,13 +113,37 @@ pub(crate) enum Provenance {
     Known(BTreeMap<Digest, BTreeSet<Digest>>),
 }
 
+enum ProvenanceKind {
+    Unknown,
+    Invalid,
+    Known,
+}
+
 impl Provenance {
     pub(crate) fn decode(value: &Value) -> Option<Self> {
+        let mut starts = BTreeMap::<Digest, BTreeSet<Digest>>::new();
+        let kind = Self::scan(value, |start, before| {
+            let past = starts.entry(start).or_default();
+            if let Some(before) = before {
+                past.insert(before);
+            }
+        })?;
+        Some(match kind {
+            ProvenanceKind::Unknown => Self::Unknown,
+            ProvenanceKind::Invalid => Self::Invalid,
+            ProvenanceKind::Known => Self::Known(starts),
+        })
+    }
+
+    /// Validate every fact once; only an owning reader builds an ancestry index.
+    /// `None` begins a tenure; `Some` emits its ancestor. Legacy facts are checked without
+    /// emitting evidence, since their decoded meaning remains unknown.
+    fn scan(value: &Value, mut fact: impl FnMut(Digest, Option<Digest>)) -> Option<ProvenanceKind> {
         if value.is_null() {
-            return Some(Self::Unknown);
+            return Some(ProvenanceKind::Unknown);
         }
         if value == &Value::Bool(false) {
-            return Some(Self::Invalid);
+            return Some(ProvenanceKind::Invalid);
         }
         // Earlier arrays prove scalar continuity but do not identify an activity period.
         // Retain them as unknown evidence rather than assigning them fresh authority.
@@ -133,10 +157,10 @@ impl Provenance {
             let epochs = activity::decode_epochs(object.get("e")?)?;
             let starts = object.get("s")?;
             if starts.is_null() {
-                return Some(Self::Unknown);
+                return Some(ProvenanceKind::Unknown);
             }
             if starts == &Value::Bool(false) {
-                return Some(Self::Invalid);
+                return Some(ProvenanceKind::Invalid);
             }
             (starts.as_array()?, false, epochs.len())
         };
@@ -144,7 +168,6 @@ impl Provenance {
             return None;
         }
         let mut facts = items.len().checked_add(epoch_facts)?;
-        let mut starts = BTreeMap::new();
         let mut last = None;
         for item in items {
             let item = item.as_object()?;
@@ -161,20 +184,25 @@ impl Provenance {
             if facts > crate::database::MAX_RECORDS {
                 return None;
             }
-            let mut past = BTreeSet::new();
+            if !legacy {
+                fact(start, None);
+            }
+            let mut previous = None;
             for value in observed {
                 let before = digest(value)?;
-                if before == start || past.last().is_some_and(|last| *last >= before) {
+                if before == start || previous.is_some_and(|last| last >= before) {
                     return None;
                 }
-                past.insert(before);
+                previous = Some(before);
+                if !legacy {
+                    fact(start, Some(before));
+                }
             }
-            starts.insert(start, past);
         }
         Some(if legacy {
-            Self::Unknown
+            ProvenanceKind::Unknown
         } else {
-            Self::Known(starts)
+            ProvenanceKind::Known
         })
     }
 
@@ -189,7 +217,7 @@ impl Provenance {
             })).collect()),
         };
         let value = json!({"v": 2, "s": starts, "e": activity::encode_epochs(epochs)});
-        if Self::decode(&value).is_none() {
+        if Self::scan(&value, |_, _| {}).is_none() {
             return Err(crate::Error::new(
                 "claim provenance exceeds the retained evidence bound; the source generation remains held",
             ));
@@ -213,11 +241,11 @@ impl Provenance {
 }
 
 pub(crate) fn valid_context(value: &Value) -> bool {
-    Provenance::decode(value).is_some() || activity::Proof::decode(value).is_some()
+    Provenance::scan(value, |_, _| {}).is_some() || activity::Proof::decode(value).is_some()
 }
 
 fn context_epochs(value: &Value) -> Option<activity::Epochs> {
-    Provenance::decode(value)?;
+    Provenance::scan(value, |_, _| {})?;
     activity::decode_epochs(value.as_object()?.get("e")?)
 }
 
@@ -790,18 +818,17 @@ pub(crate) fn project(
             {
                 starts = None;
             }
+            if starts.as_ref().is_some_and(BTreeSet::is_empty) {
+                row.claims.insert(column.name.into(), None);
+                continue;
+            }
             groups
                 .entry(value.to_owned())
                 .or_default()
                 .push((pk.clone(), starts));
         }
         for (value, contenders) in groups {
-            if contenders.len() < 2
-                && contenders[0]
-                    .1
-                    .as_ref()
-                    .is_none_or(|starts| !starts.is_empty())
-            {
+            if contenders.len() < 2 {
                 continue;
             }
             let winner = winner(&contenders, &causal);

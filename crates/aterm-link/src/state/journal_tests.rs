@@ -90,7 +90,7 @@ fn every_record_round_trips_and_a_rewrite_holds_the_same_index() {
         id: 2,
         pin: pin(8),
     });
-    expected.in_flight.insert(8, entry(8));
+    expected.apply(Frame::InFlight(entry(8)));
     expected.attached = Some(13);
     assert_eq!(read.index, expected);
     let (rewritten, steps) = read.index.encode().expect("rewrite");
@@ -296,7 +296,8 @@ fn a_salvage_keeps_every_whole_record_after_damage() {
         "the read stops at the damage, before the retirement after it"
     );
     let mut expected = whole.clone();
-    expected.in_flight.insert(7, entry(7));
+    expected.apply(Frame::InFlight(entry(7)));
+    expected.in_flight_order = vec![7, 8];
     assert_eq!(salvage(&damaged), expected);
     let mut first = bytes.clone();
     first[20] ^= 0x40;
@@ -357,4 +358,46 @@ fn a_salvage_search_past_damage_is_bounded() {
         prefix,
         "the budget spent, what came before the damage kept"
     );
+}
+
+#[test]
+fn publication_order_survives_replacement_removal_and_compaction() {
+    let mut index = Index::default();
+    index.apply(Frame::InFlight(entry(90)));
+    index.apply(Frame::InFlight(entry(2)));
+    index.apply(Frame::InFlight(InFlight {
+        at: Some(100),
+        body: b"v=1 t=99 text=hello".to_vec(),
+        ..entry(90)
+    }));
+    let sequences = |index: &Index| {
+        index
+            .in_publication_order()
+            .map(|(seq, _)| seq)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sequences(&index),
+        [90, 2],
+        "a head and timestamp update keeps publication order"
+    );
+    let compacted = read(&index.encode_from(0).unwrap().0).index;
+    assert_eq!(
+        sequences(&compacted),
+        [90, 2],
+        "compaction keeps publication order"
+    );
+    let mut replacement = entry(90);
+    replacement.body = b"a later keyed post".to_vec();
+    replacement.pin.identity.as_mut().unwrap().digest = "b".repeat(64);
+    index.apply(Frame::InFlight(replacement));
+    assert_eq!(
+        sequences(&index),
+        [2, 90],
+        "new words are a new publication"
+    );
+    index.apply(Frame::Landed(2));
+    index.apply(Frame::InFlight(entry(1)));
+    assert_eq!(sequences(&index), [90, 1]);
+    assert_eq!(read(&index.encode_from(0).unwrap().0).index, index);
 }

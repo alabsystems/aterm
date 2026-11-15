@@ -50,7 +50,7 @@ const TABLE_BURST: usize = 4;
 /// An initiator asks for the peer's table witnesses ([`witness`]) on its first round with a peer,
 /// and again on the first round after one this long without a table list traded with it: a peer
 /// that restarted, slept or was cut off has its moved tables repaired before the regular turn.
-const WITNESS_GAP_MS: u64 = 120_000;
+pub(crate) const WITNESS_GAP_MS: u64 = 120_000;
 /// How long one side spends reading its tables' content for witnesses in a round, checked before
 /// each table's read; a table left unread reads as differing ([`witness::UNKNOWN`]). Tests read
 /// every table: there it is a hang detector, never a latency budget that decides an order.
@@ -422,6 +422,11 @@ pub struct Report {
     pub table_deferred: bool,
     /// This side initiated the round and asked the peer which tables differ (`witness`).
     pub witnesses_asked: bool,
+    /// This side initiated the round and its table came from the scan over the tables both sides
+    /// list: not a push or a lead, a follow-up, a backfill hint, or a table whose witness
+    /// differed. Once the scan has taken one such turn with a peer, only such a round moves its
+    /// place ([`crate::control::Repair::cycled`]).
+    pub regular: bool,
     /// Encrypted historical handoffs written to the peer in this
     /// round. This is not a separate durable key-receipt acknowledgement.
     pub keys_sent: usize,
@@ -470,6 +475,32 @@ impl BatchDeferral {
     }
 }
 
+/// One completed table-list exchange, timed where the lists were read rather than where a
+/// runtime later joins the round. Clones keep that time, so an older round cannot make its
+/// cached lists newer by returning after another round.
+#[derive(Clone, Debug)]
+pub(crate) struct Listing {
+    at: Instant,
+    tables: BTreeSet<Digest>,
+}
+impl Listing {
+    pub(crate) fn contains(&self, table: &Digest) -> bool {
+        self.tables.contains(table)
+    }
+
+    pub(crate) fn newer_than(&self, earlier: &Self) -> bool {
+        self.at > earlier.at
+    }
+
+    pub(crate) fn same_time(&self, other: &Self) -> bool {
+        self.at == other.at
+    }
+
+    pub(crate) fn same_tables(&self, other: &Self) -> bool {
+        self.tables == other.tables
+    }
+}
+
 /// Volatile fairness hints. Inventory and durable receipts decide what is missing.
 #[derive(Clone, Default, Debug)]
 pub struct Repair {
@@ -494,65 +525,156 @@ pub struct Repair {
     /// [`WITNESS_GAP_MS`] of it answers this side's own, and is not echoed back.
     asked_ms: Option<u64>,
     /// The common tables whose witnesses differed when this side last asked ([`witness`]): the
-    /// regular turn visits these alone while any remain; a table leaves as it is selected.
+    /// regular turn visits these alone while any remain; a table leaves as it is selected. A
+    /// peer's answer replaces the set, so nothing that must outlive an ask is kept here
+    /// ([`Self::lead`]).
     differing: BTreeSet<Digest>,
-    /// The tables this side appended to since a round it initiated with this peer last took
-    /// each ([`Self::announce`]), and those an ask an announce called for found differing: at
-    /// most [`MAX_TABLES`]. A round this side initiates takes one ahead of the regular turn, as
-    /// a preferred table, and the regular scan keeps its place ([`Self::table`]); a table
-    /// leaves as any turn selects it. Apart from [`Self::differing`], which the regular turn
-    /// visits and a witness answer replaces.
-    announced: BTreeSet<Digest>,
-    /// The announced table last taken as one: the next is the one after it, so a table
-    /// announced again each round does not keep the other announced tables waiting.
-    announced_after: Option<Digest>,
-    /// How many rounds in a row took an announced table: the [`TABLE_BURST`]th yields the next
-    /// round to the regular turn, so tables announced round after round do not keep the scan
-    /// from the rest.
-    announced_run: usize,
-    /// An announce called for the next round's ask ([`Self::announce`]): what that ask finds
-    /// differing joins [`Self::announced`].
-    announce_asks: bool,
+    /// The tables this side's scheduler named for this peer ([`Self::lead`]), at most
+    /// [`MAX_TABLES`]: each with whether a round this side initiated has already found it
+    /// outside the tables both sides list ([`Self::led`]).
+    lead: BTreeMap<Digest, bool>,
+    /// The led table a round last took: the next is the first led one after it, so a table led
+    /// again each round does not keep the other led tables waiting.
+    lead_after: Option<Digest>,
+    /// How many rounds in a row took a led table: the [`TABLE_BURST`]th yields the next round
+    /// to the regular turn ([`Self::lead_yield`]), so tables led round after round (a table
+    /// appended to without end) do not keep the scan from the rest.
+    lead_run: usize,
+    /// The last round ended a run of [`TABLE_BURST`] led rounds: the next takes no led table.
+    lead_yield: bool,
+    /// The regular turns ([`Report::regular`]) completed since [`Self::restart_cycle`].
+    turns: usize,
+    /// How many tables both sides listed in the last round this side initiated since
+    /// [`Self::restart_cycle`]; none before one.
+    common: Option<usize>,
+    /// The tables both sides listed in the last round with this peer that traded table lists,
+    /// whichever side began it ([`Self::listed`]); none before one. At most [`MAX_TABLES`].
+    listed: Option<Listing>,
 }
 
 impl Repair {
-    /// This side appended to `tables` (`crate::control::Endpoint::announce`): the rounds it
-    /// initiates with this peer take them ahead of the regular scan's turn, which keeps its
-    /// place. Past [`MAX_TABLES`] of those, or where `unnamed` says an append's table went
-    /// unnamed, the next round asks the peer which tables differ instead ([`witness`]), and
-    /// those are taken the same way.
-    pub(crate) fn announce(&mut self, tables: &BTreeSet<Digest>, unnamed: bool) {
-        let mut ask = unnamed;
-        for table in tables {
-            if self.announced.len() >= MAX_TABLES && !self.announced.contains(table) {
-                ask = true;
-                break;
+    /// Name `table` for the rounds this side initiates with this peer: each repairs a led table
+    /// both sides list, after a push's table and a follow-up and before any backfill hint or
+    /// regular turn, and a table leaves as a round this side initiated selects it, however it
+    /// was chosen. Led tables are taken in turn, each after the one last taken, and the
+    /// [`TABLE_BURST`]th led round in a row yields the next round to the regular turn, so the
+    /// scan's place stays its own and it still gets one round in `TABLE_BURST + 1`. A led table the lists do not share waits one such round, in which the peer
+    /// can take it up (a ring table it lacked), and is dropped by the next that still lacks it,
+    /// so a lead is never owed for longer than that. False where [`MAX_TABLES`] other tables are
+    /// already led: the lead is not kept, and the scan reaches the table at its turn.
+    ///
+    /// A lead is a volatile order hint as the rest of this state is: it grants nothing, and the
+    /// round's own lists and inventories still decide what is repaired.
+    pub(crate) fn lead(&mut self, table: Digest) -> bool {
+        #[cfg(test)]
+        if LEAD_IN_DIFFERING.with(std::cell::Cell::get) {
+            self.differing.insert(table);
+            return true;
+        }
+        if !self.lead.contains_key(&table) && self.lead.len() >= MAX_TABLES {
+            return false;
+        }
+        self.lead.entry(table).or_insert(false);
+        true
+    }
+
+    /// The led table of `common` a round this side initiates takes next: the first after the
+    /// one last taken. A led table outside `common` stays for one such round and goes in the
+    /// next that still lacks it.
+    fn led(&mut self, common: &BTreeSet<Digest>) -> Option<Digest> {
+        #[cfg(test)]
+        let waits = !LEAD_NEEDS_COMMON.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let waits = true;
+        self.lead.retain(|table, absent| {
+            if common.contains(table) {
+                *absent = false;
+                true
+            } else {
+                waits && !std::mem::replace(absent, true)
             }
-            self.announced.insert(*table);
-        }
-        if ask {
-            self.listed_ms = None;
-            self.announce_asks = true;
-        }
-    }
-    /// Whether this hint still names a table for a round this side initiates to take before
-    /// the ordinary interval: one announced, or one whose witness differed. The schedule does
-    /// not rest an endpoint whose hint does (`crate::runtime`'s `Hints::finish`).
-    pub(crate) fn owes(&self) -> bool {
-        !self.announced.is_empty() || !self.differing.is_empty()
-    }
-    /// The announced table a round takes next: the first after the one last taken, among
-    /// those the peer holds too.
-    fn next_announced(&self, common: &BTreeSet<Digest>) -> Option<Digest> {
-        cycle(&self.announced, self.announced_after)
-            .find(|id| common.contains(*id))
+        });
+        let led: BTreeSet<Digest> = self.lead.keys().copied().collect();
+        cycle(&led, self.lead_after)
+            .find(|table| common.contains(*table))
             .copied()
     }
-    /// The tables announced and not yet taken, and whether its next round asks for witnesses
-    /// whatever the gap (tests).
+
+    /// Make the next round this side initiates with this peer an audit: it asks which tables
+    /// differ whatever either clock says of the last ask ([`Self::ask`]), and no follow-up or
+    /// backfill hint saved by an earlier round takes its table, so it visits a table whose
+    /// witness differs, else takes the scan's regular turn. A push's table or a lead still
+    /// comes first.
+    pub(crate) fn audit(&mut self) {
+        self.ask();
+        #[cfg(test)]
+        if AUDIT_FOLLOWS.with(std::cell::Cell::get) {
+            return;
+        }
+        self.table_yield = true;
+    }
+
+    /// Make the next round this side initiates with this peer ask which tables differ
+    /// (`witness`), as a first round does. The ask otherwise waits for [`WITNESS_GAP_MS`] of wall
+    /// time since the last table list traded, which a clock set back never reaches.
+    pub(crate) fn ask(&mut self) {
+        #[cfg(test)]
+        if ASK_BY_CLOCK.with(std::cell::Cell::get) {
+            self.listed_ms = self.listed_ms.map(|at| at.saturating_sub(WITNESS_GAP_MS));
+            return;
+        }
+        self.listed_ms = None;
+    }
+
+    /// Work this state already names for this side's next round with this peer: a led table, a
+    /// table whose witness differed and is not yet visited, or a follow-up.
+    pub(crate) fn pending(&self) -> bool {
+        !self.lead.is_empty() || !self.differing.is_empty() || self.table_follow_up.is_some()
+    }
+
+    /// The scan has taken as many regular turns ([`Report::regular`]) since
+    /// [`Self::restart_cycle`] as the last round this side initiated had tables in common with
+    /// the peer: one turn for each, in the scan's order. False before such a round. This counts
+    /// turns, not tables: a round that failed after choosing its table moved the scan on and
+    /// counts no turn, and a deferred table's turn counts.
+    pub(crate) fn cycled(&self) -> bool {
+        self.common.is_some_and(|common| self.turns >= common)
+    }
+
+    /// Count the scan's regular turns from none again ([`Self::cycled`]), as for a peer first
+    /// met. The scan keeps its place, which a visit to a table whose witness differs moves again
+    /// until the next regular turn.
+    pub(crate) fn restart_cycle(&mut self) {
+        self.turns = 0;
+        self.common = None;
+    }
+
+    /// The last completed exchange's common tables and when it read them, whichever side began
+    /// it; none before one. A cached copy keeps that exchange time.
+    pub(crate) fn listed(&self) -> Option<&Listing> {
+        self.listed.as_ref()
+    }
+
+    /// This state once a round's lists named `tables` as the ones both sides list (tests).
     #[cfg(test)]
-    pub(crate) fn announced(&self) -> (&BTreeSet<Digest>, bool) {
-        (&self.announced, self.listed_ms.is_none())
+    pub(crate) fn listing(&mut self, tables: impl IntoIterator<Item = Digest>) {
+        self.listing_at(tables, Instant::now());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn listing_at(&mut self, tables: impl IntoIterator<Item = Digest>, at: Instant) {
+        self.listed = Some(Listing {
+            at,
+            tables: tables.into_iter().collect(),
+        });
+    }
+
+    /// This state once its scan took a turn at each of `common` tables both sides list
+    /// ([`Self::cycled`]) (tests).
+    #[cfg(test)]
+    pub(crate) fn swept(&mut self, common: usize) {
+        self.common = Some(common);
+        self.turns = common;
     }
 }
 
@@ -820,6 +942,15 @@ impl Replica {
     }
     pub(crate) fn matches(&self, trust: Trust, actor: Actor) -> bool {
         self.trust == trust && self.actor == actor
+    }
+
+    /// The lab catalog's table, where this replica takes the lab's Commons tables: the one
+    /// table every such replica lists while its policy admits it
+    /// (`crate::catalog::Directory::subscriptions`). None for an explicit table set.
+    pub(crate) fn catalog_table(&self) -> Option<Digest> {
+        self.commons
+            .as_ref()
+            .map(|(directory, _)| directory.catalog_scope().digest())
     }
 
     pub(crate) fn share_backfill(&mut self, backfill: &Arc<Mutex<Backfill>>) {
@@ -2692,11 +2823,14 @@ impl Round<'_> {
             };
         }
         let common: BTreeSet<_> = local.intersection(&remote).copied().collect();
+        // Control's per-actor lease spans its call here, including local enumeration above:
+        // another control round with this actor cannot read newer lists before this point.
+        // Its worker can still be joined first, so this time travels with the snapshot.
+        repair.listed = Some(Listing {
+            at: Instant::now(),
+            tables: common.clone(),
+        });
         if side == Side::Initiator {
-            // What an ask an announce called for finds joins the announced tables, which the
-            // regular scan's place does not follow; any other ask's answer is the regular
-            // turn's, as before.
-            let announce_asked = std::mem::take(&mut repair.announce_asks);
             if let Some(salt) = salt
                 && !answered.chunks.is_empty()
                 && let Some(differing) = witness::differing(
@@ -2705,11 +2839,7 @@ impl Round<'_> {
                     &answered,
                 )
             {
-                if announce_asked {
-                    repair.announced.extend(differing);
-                } else {
-                    repair.differing = differing;
-                }
+                repair.differing = differing;
             }
             if salt.is_some() {
                 repair.asked_ms = listed_ms;
@@ -2717,8 +2847,15 @@ impl Round<'_> {
             }
             repair.listed_ms = listed_ms;
             repair.differing.retain(|id| common.contains(id));
-            repair.announced.retain(|id| common.contains(id));
+            repair.common = Some(common.len());
         }
+        // Before anything is chosen, so that a led table the lists do not share ages in every
+        // round this side initiates, whatever that round then repairs.
+        let led = if side == Side::Initiator {
+            repair.led(&common)
+        } else {
+            None
+        };
         let force_regular = side == Side::Initiator && std::mem::take(&mut repair.table_yield);
         let follow_up = if side == Side::Initiator {
             let saved = repair.table_follow_up.take();
@@ -2731,8 +2868,8 @@ impl Round<'_> {
             None
         };
         // While a push names a table the peer holds too, each round this side initiates repairs
-        // it first (`crate::runtime::Pusher`); a follow-up of another table waits, and no backfill
-        // hint is spent meanwhile. The turns below resume once the push ends.
+        // it first (`crate::runtime::Pusher`); a follow-up of another table is dropped, and no
+        // backfill hint is spent meanwhile. The turns below resume once the push ends.
         let pushed = if side == Side::Initiator {
             (*self
                 .first
@@ -2743,16 +2880,25 @@ impl Round<'_> {
             None
         };
         let follow_up = follow_up.filter(|(id, _)| pushed.is_none_or(|first| first == *id));
-        let preferring =
-            side == Side::Initiator && !force_regular && follow_up.is_none() && pushed.is_none();
-        // A table this side appended to (`Repair::announce`) goes before a backfill hint, which
-        // is not spent meanwhile, and before the regular turn, whose place it leaves alone.
-        let announced = if preferring {
-            repair.next_announced(&common)
-        } else {
-            None
-        };
-        let hinted = if preferring && announced.is_none() {
+        // A led table ([`Repair::lead`]) comes after a follow-up, which ends by itself within
+        // `TABLE_BURST` rounds and would be dropped, not delayed, by a table chosen over it; the
+        // lead stays until a round selects it. It is no witness answer's to erase (`differing`).
+        // An audit's yield ([`Repair::audit`]) does not hold it back: what moved goes in the
+        // audit's round, and the regular turn in the round after. Only the yield that ends a run
+        // of led rounds does ([`Repair::lead_yield`]).
+        #[cfg(test)]
+        let unfair = LEADS_UNYIELDING.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let unfair = false;
+        let lead_yield = side == Side::Initiator && std::mem::take(&mut repair.lead_yield);
+        let led =
+            led.filter(|_| pushed.is_none() && follow_up.is_none() && (unfair || !lead_yield));
+        let hinted = if side == Side::Initiator
+            && !force_regular
+            && follow_up.is_none()
+            && pushed.is_none()
+            && led.is_none()
+        {
             self.backfill
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
@@ -2760,21 +2906,19 @@ impl Round<'_> {
         } else {
             None
         };
-        let priority = pushed
-            .or(follow_up.map(|(id, _)| id))
-            .or(announced)
-            .or(hinted);
+        let priority = pushed.or(follow_up.map(|(id, _)| id)).or(led).or(hinted);
         // While tables whose witnesses differed remain, the regular turn visits only those, in the
-        // scan's own order (fresh peers still start apart); the scan goes on from the last.
+        // scan's own order (fresh peers still start apart). Before the scan's first regular turn
+        // with a peer (one first met, or a restarted cycle) the scan goes on from the last of
+        // them; after it such a visit leaves the scan's place where it was, and only a turn over
+        // the common tables moves it (`Report::regular`), or a table whose witness differs at
+        // every ask would bring each ask's scan back to the table after it.
         #[cfg(test)]
         let unwitnessed = UNWITNESSED.with(std::cell::Cell::get);
         #[cfg(not(test))]
         let unwitnessed = false;
-        let turn = if unwitnessed || repair.differing.is_empty() {
-            &common
-        } else {
-            &repair.differing
-        };
+        let scans = unwitnessed || repair.differing.is_empty();
+        let turn = if scans { &common } else { &repair.differing };
         let selected = match side {
             Side::Initiator => {
                 let chosen = priority.or_else(|| {
@@ -2785,7 +2929,7 @@ impl Round<'_> {
                 });
                 if let Some(id) = chosen {
                     repair.differing.remove(&id);
-                    repair.announced.remove(&id);
+                    repair.lead.remove(&id);
                 }
                 self.local(peer, |_| Ok(()))?;
                 control::send_frame(stream, chosen.as_ref().map_or(&[][..], |id| id.as_slice()))?;
@@ -2833,40 +2977,49 @@ impl Round<'_> {
         }
         // A peer chooses inbound tables. Preserve our outgoing scan so its
         // restarted scan cannot keep rewinding ours to the first table.
-        if side == Side::Initiator && priority.is_none() {
+        let regular = side == Side::Initiator && priority.is_none() && scans;
+        let differed = side == Side::Initiator && priority.is_none() && !scans;
+        #[cfg(test)]
+        let places = repair.turns == 0 || DIFFERING_MOVES_CURSOR.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let places = repair.turns == 0;
+        if regular || (differed && places) {
             repair.table = Some(id);
-            repair.announced_run = 0;
+            repair.lead_run = 0;
         }
         if priority.is_some() {
             // A failed or empty preferred round also yields. A permanently
             // unavailable history must not replace the ordinary table scan.
             repair.table_yield = true;
         }
-        // An announced table's round yields only as the `TABLE_BURST`th in a row: a few tables
-        // announced together go round after round, and tables announced without end still
-        // leave the regular turn one round in `TABLE_BURST + 1`.
-        let took_announced = announced == Some(id);
-        if took_announced {
-            repair.announced_after = Some(id);
-            repair.announced_run += 1;
-            if repair.announced_run < TABLE_BURST {
-                repair.table_yield = false;
-            } else {
-                repair.announced_run = 0;
+        // A led round ends a run only as the `TABLE_BURST`th in a row: a few tables led together
+        // go round after round, and tables led without end still leave the regular turn one
+        // round in `TABLE_BURST + 1`.
+        let took_led = led == Some(id);
+        if took_led {
+            repair.lead_after = Some(id);
+            repair.lead_run += 1;
+            if repair.lead_run >= TABLE_BURST {
+                repair.lead_run = 0;
+                repair.lead_yield = true;
             }
         }
         report.table = Some(id);
         report.scope = self.tables.get(&id).map(|(scope, _)| *scope);
+        report.regular = regular;
         let deferred = report.deferred;
         self.table(stream, peer, side, id, repair, report)?;
         report.table_deferred = report.deferred > deferred;
+        if regular {
+            repair.turns = repair.turns.saturating_add(1);
+        }
         #[cfg(test)]
         let retried = !DEFERRAL_PASSES.with(std::cell::Cell::get);
         #[cfg(not(test))]
         let retried = true;
         if retried
             && side == Side::Initiator
-            && (priority.is_none() || took_announced)
+            && (priority.is_none() || took_led)
             && report.table_deferred
             && repair.table_follow_up.is_none()
         {
@@ -3662,6 +3815,21 @@ thread_local! {
     pub(crate) static UNWITNESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Mutant (tests): a deferred table is passed over until the scan comes round again.
     pub(crate) static DEFERRAL_PASSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a lead is kept among the tables whose witnesses differed, which a peer's
+    /// answer replaces.
+    pub(crate) static LEAD_IN_DIFFERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a led table the lists do not share is dropped in that round.
+    pub(crate) static LEAD_NEEDS_COMMON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): a run of led rounds never yields to the regular turn.
+    pub(crate) static LEADS_UNYIELDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): every visit to a table whose witness differed moves the scan's place, as
+    /// CR1 first had it.
+    pub(crate) static DIFFERING_MOVES_CURSOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): an ask is brought forward by the gap on the wall clock, not made
+    /// unconditional.
+    pub(crate) static ASK_BY_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Mutant (tests): an audit asks and leaves a saved follow-up its table.
+    pub(crate) static AUDIT_FOLLOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// `local` with the clock mark of `wall` (ms) where one is given and the list has room for it

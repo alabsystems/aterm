@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Windows console creation flags (`dwCreationFlags`) for child processes ([`Console`](crate::spawn::Console), [`set_flags`](crate::spawn::set_flags), [`set_gui_image_flags`](crate::spawn::set_gui_image_flags)).
-use crate::spawnfd::StdCommand;
 
 /// `DETACHED_PROCESS` (`WinBase.h`): spawns the child without a console ([`Console::Detached`]).
 pub const DETACHED_PROCESS: u32 = 0x0000_0008;
@@ -62,27 +61,59 @@ pub fn have_console() -> bool {
     false
 }
 
+/// A child builder whose creation flags [`set_flags`] and [`set_gui_image_flags`] write: std's
+/// `Command` at a reviewed raw site and, off Unix, [`crate::spawnfd::Command`]. Sealed: the write
+/// is this module's alone.
+pub trait Flagged: sealed::Flags {}
+
+impl<C: sealed::Flags + ?Sized> Flagged for C {}
+
+mod sealed {
+    use crate::spawnfd::StdCommand;
+
+    /// The one creation-flags write, `word` being [`super::creation_flags`]'s.
+    pub trait Flags {
+        fn write_creation_flags(&mut self, word: u32);
+    }
+
+    impl Flags for StdCommand {
+        fn write_creation_flags(&mut self, word: u32) {
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt as _;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the one creation-flags setter (module docs)"
+                )]
+                self.creation_flags(word);
+            }
+            #[cfg(not(windows))]
+            let _ = word;
+        }
+    }
+
+    #[cfg(not(unix))]
+    impl Flags for crate::spawnfd::Command {
+        fn write_creation_flags(&mut self, word: u32) {
+            self.std_mut().write_creation_flags(word);
+        }
+    }
+}
+
 /// Sets `cmd`'s creation flags for [`Console::Quiet`] plus `extra` ([`creation_flags`], [`have_console`]).
-pub fn set_flags(cmd: &mut StdCommand, extra: u32) -> &mut StdCommand {
+pub fn set_flags<C: Flagged + ?Sized>(cmd: &mut C, extra: u32) -> &mut C {
     set_console(cmd, Console::Quiet, extra)
 }
 
 /// Sets `cmd`'s creation flags for a GUI image ([`Console::Detached`]).
-pub fn set_gui_image_flags(cmd: &mut StdCommand) -> &mut StdCommand {
+pub fn set_gui_image_flags<C: Flagged + ?Sized>(cmd: &mut C) -> &mut C {
     set_console(cmd, Console::Detached, 0)
 }
 
 /// The only creation-flags write: `console` plus `extra`, decided now.
-fn set_console(cmd: &mut StdCommand, console: Console, extra: u32) -> &mut StdCommand {
+fn set_console<C: Flagged + ?Sized>(cmd: &mut C, console: Console, extra: u32) -> &mut C {
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the one creation-flags setter (module docs)"
-        )]
-        cmd.creation_flags(creation_flags(console, extra, have_console()));
-    }
+    cmd.write_creation_flags(creation_flags(console, extra, have_console()));
     #[cfg(not(windows))]
     let _ = (console, extra);
     cmd

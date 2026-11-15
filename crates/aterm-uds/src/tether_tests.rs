@@ -89,6 +89,87 @@ fn an_own_tether_record_requires_the_loaded_image() {
     assert_eq!(Through::own(link).unchanged(), None);
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn an_own_tether_record_keeps_its_file_above_closed_stdio() {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    const STAGE: &str = "ATERM_TETHER_CLOSED_STDIO_RETENTION";
+    const NAME: &str = "tether::tests::an_own_tether_record_keeps_its_file_above_closed_stdio";
+    if std::env::var(STAGE).as_deref() != Ok("1") {
+        let exe = std::env::current_exe().expect("this test binary");
+        let mut command = crate::spawnfd::command(exe);
+        command
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(STAGE, "1");
+        let output = crate::deadline::output_while_process_progressing_complete_stdout_with_limit(
+            &mut command,
+            std::time::Duration::from_secs(60),
+            "the retained-image descriptor fixture",
+            4096,
+        )
+        .expect("capture the isolated descriptor fixture");
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("TETHER_HELD_ABOVE_STDIO"),
+            "{output:?}"
+        );
+        return;
+    }
+
+    struct Restore([OwnedFd; 3]);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (target, saved) in self.0.iter().enumerate() {
+                let target = i32::try_from(target).expect("a stdio number");
+                // SAFETY: this isolated fixture owns these stdio slots. Each saved
+                // description stays open above them until all three are restored.
+                assert_eq!(unsafe { libc::dup2(saved.as_raw_fd(), target) }, target);
+            }
+        }
+    }
+
+    let exe = std::env::current_exe().expect("this test binary");
+    let saved = std::array::from_fn(|target| {
+        let target = i32::try_from(target).expect("a stdio number");
+        // SAFETY: duplicate this isolated fixture's live stdio above every stdio slot.
+        let fd = unsafe { libc::fcntl(target, libc::F_DUPFD_CLOEXEC, 3) };
+        assert!(fd >= 3, "save stdio {target}");
+        // SAFETY: fcntl returned this fresh descriptor, owned by nothing else.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    });
+    let restore = Restore(saved);
+    for target in 0..3 {
+        // SAFETY: only this isolated fixture uses its stdio slots until Restore runs.
+        assert_eq!(unsafe { libc::close(target) }, 0);
+    }
+    let recorded = Through::own(exe);
+    let held = recorded
+        .held
+        .as_ref()
+        .expect("retain the loaded executable");
+    let number = held.as_raw_fd();
+    assert!(
+        number >= 3,
+        "the private executable occupied stdio {number}"
+    );
+    // SAFETY: F_GETFD reads only this live owned descriptor's flags.
+    let flags = unsafe { libc::fcntl(number, libc::F_GETFD) };
+    assert!(flags >= 0, "the private executable remains open");
+    assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    for target in 0..3 {
+        // SAFETY: F_GETFD observes a slot without opening it.
+        assert_eq!(unsafe { libc::fcntl(target, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+    drop(recorded);
+    drop(restore);
+    println!("TETHER_HELD_ABOVE_STDIO {number}");
+}
+
 /// The tie is lost once the file recorded to run through was replaced, or none read when it
 /// was recorded, and never where nothing was recorded: a test binary's own spawns, which were
 /// never tied there.
@@ -263,8 +344,11 @@ fn a_group_is_signalled_by_its_leaders_pidfd_after_the_leader_is_reaped() {
 /// A group left with an exited leader alone, a zombie its parent has not reaped, holds a
 /// process the kernel counts (signal `0` by its pidfd answers), which can fork nothing: where a
 /// listing can be whole, the census reads it empty by two listings, which pass zombies by, so a
-/// watcher waits for no reap. Negative control: drop the listings from `GroupPidfd::census`,
-/// and the zombie keeps it `Unknown`.
+/// watcher waits for no reap. A listing that other processes' forks keep from settling is not
+/// whole (`procfs::chased_group_of`), so the census says `Unknown` and is read again, as a
+/// watcher reads it, until it says otherwise within a minute; one that names a member fails at
+/// once. Negative control: drop the listings from `GroupPidfd::census`, and the zombie keeps it
+/// `Unknown` past the minute.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_group_left_with_a_zombie_alone_reads_empty_by_its_listings() {
@@ -299,8 +383,16 @@ fn a_group_left_with_a_zombie_alone_reads_empty_by_its_listings() {
         pgid,
         whole,
     };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let read = loop {
+        let read = group.census(pgid);
+        if !whole || read != Live::Unknown || std::time::Instant::now() >= until {
+            break read;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     assert_eq!(
-        group.census(pgid),
+        read,
         if whole { Live::Empty } else { Live::Unknown },
         "a zombie alone, where a listing can be whole: {whole}"
     );

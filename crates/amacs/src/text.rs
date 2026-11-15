@@ -30,6 +30,16 @@ enum Node {
     },
 }
 
+#[cfg(any(test, debug_assertions))]
+impl Drop for Node {
+    fn drop(&mut self) {
+        crate::store::record_preparation_work(crate::store::PreparationWork {
+            retired_rope_nodes: 1,
+            ..Default::default()
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextRopeError {
     InvalidRange,
@@ -45,6 +55,11 @@ impl Default for TextRope {
 
 impl From<&str> for TextRope {
     fn from(text: &str) -> Self {
+        #[cfg(any(test, debug_assertions))]
+        crate::store::record_preparation_work(crate::store::PreparationWork {
+            rope_input_bytes: text.len(),
+            ..Default::default()
+        });
         if text.is_empty() {
             return Self::default();
         }
@@ -168,6 +183,11 @@ fn empty() -> Arc<Node> {
 }
 
 fn leaf(text: &str) -> Arc<Node> {
+    #[cfg(any(test, debug_assertions))]
+    crate::store::record_preparation_work(crate::store::PreparationWork {
+        rope_leaf_input_bytes: text.len(),
+        ..Default::default()
+    });
     if text.is_empty() {
         return empty();
     }

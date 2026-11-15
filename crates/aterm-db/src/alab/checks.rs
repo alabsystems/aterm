@@ -8,11 +8,11 @@
 //! columns, never a value.
 
 use super::registry::{
-    ACCOUNT, ACCOUNT_OBS, ADDRESS, COLLECTIONS, MACHINE, MACHINE_FACTS, MAILBOX, MAILBOX_OBS,
-    PREFERENCE, bound_machine, held_machines,
+    ACCOUNT, ACCOUNT_OBS, ADDRESS, MACHINE, MACHINE_FACTS, MAILBOX, MAILBOX_OBS, PREFERENCE,
+    bound_machine, held_machines,
 };
 use crate::typed::{
-    Kind,
+    Kind, Table,
     cell::{self, Cells, Projection},
     check, keys,
     owned::OwnedRead,
@@ -282,7 +282,8 @@ pub fn account_obs(read: &OwnedRead, accounts: &Projection) -> Vec<Finding> {
     found
 }
 
-/// The lab rules over `cells`, then every generic finding.
+/// The lab rules over `cells` of the registry generation `table`, then every generic finding,
+/// each column read as that generation types it.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -291,14 +292,15 @@ pub fn account_obs(read: &OwnedRead, accounts: &Projection) -> Vec<Finding> {
         project = "aterm_db::alab::view::tests::follow_transition"
     )
 )]
-pub fn lab(cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
-    let projections: BTreeMap<&str, Projection> = COLLECTIONS
+pub fn lab(table: &Table, cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) {
+    let projections: BTreeMap<&str, Projection> = table
+        .collections
         .iter()
         .filter(|c| c.kind == Kind::Cells)
         .map(|c| (c.name, cell::project(c, cells)))
         .collect();
     let generic = check::findings(
-        &COLLECTIONS,
+        table.collections,
         &projections.iter().map(|(name, p)| (*name, p)).collect(),
     );
     let mut found = Vec::new();

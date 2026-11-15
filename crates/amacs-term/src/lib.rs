@@ -54,7 +54,7 @@ use std::io::{IsTerminal as _, Write as _};
 use std::process::ExitCode;
 
 /// The environment variable naming the aterm session that hosts this
-/// terminal (`s-<hex>`), which every session's shell is given.
+/// terminal (its tab ID, `tqn5r6e0148`), which every session's shell is given.
 const PARENT_SESSION_ENV: &str = "ATERM_PARENT_SESSION_ID";
 
 /// `amacs [ARGS]` / `aterm edit [ARGS]` (`args` past the program name or verb): the whole program,

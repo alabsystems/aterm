@@ -294,8 +294,11 @@ impl<'a> Remote<'a> {
         agh::git::require_complete_source(&stdout).map_err(|error| error.to_string())
     }
 
-    /// Refresh ordinary live main through agh's incremental snapshot operation.
-    /// Pinned provenance reads still use [`Self::fetch`]. A failed refresh never
+    /// Refresh ordinary live main through agh's incremental snapshot operation: the commit
+    /// this refresh's own fetch wrote, which agh prints. Its ref, `refs/agh/fetched-main`, is
+    /// never read back: every worktree of the clone shares it, and a sibling's fetch that read
+    /// an older main can overwrite it after this one's write, so a read of it can see main go
+    /// backwards. Pinned provenance reads still use [`Self::fetch`]. A failed refresh never
     /// turns a previous local snapshot into a successful current observation.
     pub(crate) fn refresh_main(&self) -> Result<String, String> {
         let Kind::Github(slug) = &self.kind else {
@@ -304,22 +307,17 @@ impl<'a> Remote<'a> {
                 .ok_or_else(|| "remote main is absent".into());
         };
         const INTO: &str = "refs/agh/fetched-main";
-        let direct = (self.run)(Tool::Git, &words(&["symbolic-ref", "--quiet", INTO]))?;
-        match direct.status.code() {
-            Some(1) => {}
-            Some(0) => return Err("agh's main snapshot ref is symbolic".into()),
-            _ => return Err("cannot inspect agh's main snapshot ref".into()),
-        }
         let mut args = words(&["repo", "fetch-main", slug]);
         args.push(self.root.as_os_str().to_owned());
-        success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
-        let out = success(
-            Tool::Git,
-            (self.run)(Tool::Git, &words(&["rev-parse", "--verify", INTO]))?,
-        )?;
-        let tip = std::str::from_utf8(&out)
-            .map_err(|_| "agh's main snapshot is not UTF-8")?
-            .trim();
+        let out = success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
+        let value: Value =
+            aterm_json::from_slice(&out).map_err(|e| format!("agh fetch-main: {e}"))?;
+        if value["ref"].as_str() != Some(INTO) {
+            return Err("agh's main snapshot names another ref".into());
+        }
+        let tip = value["oid"]
+            .as_str()
+            .ok_or("agh's main snapshot names no commit")?;
         if !aterm_types::land_trailer::object_id(tip) {
             return Err("agh's main snapshot is not one exact object ID".into());
         }
@@ -463,69 +461,12 @@ impl<'a> Remote<'a> {
         }
     }
 
-    /// Import exact raw objects (a partial clone's missing blobs), publishing no ref: the
-    /// explicit, bounded counterpart of the lazy fetch every local read here forbids. A local
-    /// remote is asked as git's own lazy fetch asks it (no negotiation, no tags, no
-    /// `FETCH_HEAD`). GitHub goes through agh's routed object import, into a scratch bare
-    /// repository: agh refuses to run git in a partial clone, whose promisor keys sit outside
-    /// its transport policy, so the objects then cross from the scratch over the file transport.
-    pub(crate) fn import(&self, objects: &[String]) -> Result<(), String> {
-        if objects.is_empty() {
-            return Ok(());
-        }
-        if objects.len() > agh::git::FETCH_ROWS_MAX
-            || !objects
-                .iter()
-                .all(|oid| aterm_types::land_trailer::object_id(oid))
-        {
-            return Err("an object import needs 1–2048 exact object IDs".into());
-        }
-        match &self.kind {
-            Kind::Local(_) => self.objects_from(self.name.as_ref(), objects),
-            Kind::Github(slug) => {
-                let dir = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
-                let input = dir.path().join("objects.json");
-                std::fs::write(&input, json!(objects).to_string()).map_err(|e| e.to_string())?;
-                let scratch = dir.path().join("objects.git");
-                let mut init = words(&["init", "--quiet", "--bare"]);
-                init.push(scratch.clone().into_os_string());
-                success(Tool::Git, (self.run)(Tool::Git, &init)?)?;
-                let mut config = vec![OsString::from("--git-dir"), scratch.clone().into()];
-                config.extend(words(&["config", "uploadpack.allowAnySHA1InWant", "true"]));
-                success(Tool::Git, (self.run)(Tool::Git, &config)?)?;
-                let mut args = words(&["repo", "fetch", slug]);
-                args.extend([
-                    scratch.clone().into_os_string(),
-                    "--objects".into(),
-                    input.into_os_string(),
-                ]);
-                success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
-                self.objects_from(scratch.as_os_str(), objects)
-            }
-        }
-    }
-
-    /// Fetch exact `objects` from the local repository `source` (a remote's name or a path)
-    /// into this checkout, over the file transport only and with no ref, tag or `FETCH_HEAD`.
-    fn objects_from(&self, source: &std::ffi::OsStr, objects: &[String]) -> Result<(), String> {
-        let mut args = local_words(&[
-            "-c",
-            "fetch.negotiationAlgorithm=noop",
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--recurse-submodules=no",
-        ]);
-        args.push(source.to_owned());
-        args.extend(objects.iter().map(OsString::from));
-        success(Tool::Git, (self.run)(Tool::Git, &args)?).map(drop)
-    }
-
     /// Publish exact local objects, expected ref included, as one write. agh's write makes
     /// every check its dry run makes (routing, the source graph, the expected ref) before it
     /// sends, so no rehearsal comes first: each one would repeat agh's strict re-verification of
-    /// the pushed history while the expected ref is free to move. An unknown outcome stops the
+    /// the pushed history while the expected ref is free to move. A local repository's push
+    /// leases the expected ref too, so a ref moved anywhere else, back to an ancestor of `after`
+    /// included (a fast-forward plain git would take), refuses it. An unknown outcome stops the
     /// caller; only a typed refusal which sent nothing permits observation of the blocking
     /// intent ([`Pushed::Blocked`]) or the same write again ([`Pushed::Unsent`]).
     pub(crate) fn push(
@@ -537,9 +478,10 @@ impl<'a> Remote<'a> {
         match &self.kind {
             Kind::Local(_) => {
                 let destination = format!("{after}:{reference}");
+                let lease = format!("--force-with-lease={reference}:{}", before.unwrap_or(""));
                 let out = (self.run)(
                     Tool::Git,
-                    &local_words(&["push", "--porcelain", self.name, &destination]),
+                    &local_words(&["push", "--porcelain", &lease, self.name, &destination]),
                 )?;
                 Ok(if out.status.success() {
                     Pushed::Done

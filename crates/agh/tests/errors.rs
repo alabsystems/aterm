@@ -656,3 +656,83 @@ fn stream_digest_is_a_replay() {
     assert_eq!(error.sub.slug().as_deref(), Some("replay.stream_digest"));
     assert_eq!((error.kind, error.exit()), (Kind::CouldNotRun, 3));
 }
+
+fn next_advice(error: &Error) -> String {
+    error.to_json(&Redactor::new())["error"]["next"]
+        .as_str()
+        .expect("text next action")
+        .to_owned()
+}
+
+#[test]
+fn rate_limit_snapshot_supplies_actionable_reset_without_changing_outcome() {
+    let error = Error::new(Kind::RateLimited, "protected core reserve")
+        .with_sub(Sub::PreRefused)
+        .with_rate(RateSnapshot {
+            resource: "core".into(),
+            limit: 5000,
+            remaining: 999,
+            reset: 1_794_634_431,
+            used: 4001,
+        });
+    let advice = next_advice(&error);
+    assert!(advice.contains("2026-11-14T05:33:51Z"), "{advice}");
+    assert!(advice.contains("reset=1794634431"), "{advice}");
+    let json = error.to_json(&Redactor::new());
+    assert_eq!(json["error"]["reset"], aterm_json::json!(1_794_634_431_u64));
+    let line = error.line("repo.refs", &Redactor::new());
+    assert!(line.contains(" reset=1794634431 "), "{line}");
+    assert!(line.ends_with(&format!("next=\"{advice}\"")), "{line}");
+    assert_eq!(error.exit(), 11);
+    assert!(error.retriable());
+    assert_eq!(error.side_effect, SideEffect::None);
+}
+
+#[test]
+fn rate_limit_explicit_reset_and_retry_delay_both_constrain_advice() {
+    let error = Error::new(Kind::RateLimited, "primary and retry-after")
+        .with_rate(RateSnapshot {
+            resource: "core".into(),
+            limit: 5000,
+            remaining: 0,
+            reset: 1_794_634_431,
+            used: 5000,
+        })
+        .with_reset(1_794_638_034)
+        .with_retry_after(45);
+    let advice = next_advice(&error);
+    assert!(advice.contains("reset=1794638034"), "{advice}");
+    assert!(advice.contains("45 seconds"), "{advice}");
+    assert!(!advice.contains("reset=1794634431"), "{advice}");
+    assert_eq!(
+        error.to_json(&Redactor::new())["error"]["reset"],
+        aterm_json::json!(1_794_638_034_u64)
+    );
+}
+
+#[test]
+fn rate_limit_retry_after_without_reset_names_the_delay() {
+    let error = Error::new(Kind::RateLimited, "secondary").with_retry_after(30);
+    let advice = next_advice(&error);
+    assert!(advice.contains("30 seconds"), "{advice}");
+    assert!(error.to_json(&Redactor::new())["error"]["reset"].is_null());
+}
+
+#[test]
+fn rate_limit_custom_advice_survives_and_missing_times_have_no_placeholders() {
+    let error = Error::new(Kind::RateLimited, "reserved")
+        .with_reset(1_794_634_431)
+        .with_next("inspect the route's quota policy");
+    assert_eq!(next_advice(&error), "inspect the route's quota policy");
+    let unknown = next_advice(&Error::new(Kind::RateLimited, "missing headers"));
+    assert!(!unknown.contains("reset="), "{unknown}");
+    assert!(!unknown.contains("retry_after="), "{unknown}");
+}
+
+#[test]
+fn rate_limit_out_of_calendar_reset_keeps_exact_numeric_guidance() {
+    let error = Error::new(Kind::RateLimited, "far future").with_reset(u64::MAX);
+    let advice = next_advice(&error);
+    assert!(advice.contains(&format!("reset={}", u64::MAX)), "{advice}");
+    assert!(!advice.contains('Z'), "{advice}");
+}

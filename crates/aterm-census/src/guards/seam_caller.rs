@@ -32,8 +32,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::debug_seam::{crate_of, is_ident, module_of, names, release_never_compiles};
 use super::rules::CENSUS_CRATE;
 use super::{Finding, Rule, SourceFile, Tree};
+use crate::items::unmasked_lines;
 use crate::lex::Lexed;
-use crate::lock_order::unmasked_lines;
 
 /// The crates the rule reads.
 const SOURCE: &[&str] = &["crates/"];

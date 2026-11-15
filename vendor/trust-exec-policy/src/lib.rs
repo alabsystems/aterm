@@ -12,6 +12,18 @@ use std::num::NonZeroU32;
 mod seal;
 #[cfg(target_os = "macos")]
 pub use seal::{ExecutionSeal, fork_denied};
+#[cfg(target_os = "macos")]
+mod forking_group;
+#[cfg(target_os = "macos")]
+pub use forking_group::ForkingGroupRestriction;
+#[cfg(target_os = "macos")]
+mod readonly_image;
+#[cfg(target_os = "macos")]
+pub use readonly_image::{RestrictedNativeImage, restrict_current_to_readonly_image};
+#[cfg(target_os = "macos")]
+mod native_entry;
+#[cfg(target_os = "macos")]
+pub use native_entry::{RestrictedNativeEntry, restrict_current_native_entry};
 
 /// Apple's `spawn.h` defines the initialized attribute handle as `void *`.
 /// Its storage is owned by the native initializer, not by this library.

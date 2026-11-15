@@ -454,6 +454,10 @@ fn a_copied_program_that_ends_first_is_named_with_how_it_ended() {
             words.ends_with(&format!("its output ended first {said}")),
             "{script}: {words}"
         );
+        assert!(
+            words.contains(&format!("before cleanup: exited {said}")),
+            "{words}"
+        );
     }
 }
 
@@ -703,6 +707,8 @@ fn a_child_held_at_the_program_check_ends_could_not_run_and_others_still_hang() 
             why.starts_with(&format!("the copied program (pid {pid}) never wrote")),
             "{held:?}: {why}"
         );
+        assert!(why.contains("before cleanup: running"), "{why}");
+        assert!(why.contains(&format!("program_check={held:?}")), "{why}");
     }
 }
 

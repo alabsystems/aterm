@@ -13,9 +13,10 @@
 //! What a sign-in reads of a mailbox (one-mesh design §4.7, §4.8, step A9): [`mailboxes`] names
 //! each live mailbox's login (its `login` row's address), its webmail, its `receives` patterns and
 //! which of its credentials are set, never a value; [`reveal`] hands one credential to the
-//! harness's sign-in through [`super::secret::reveal_sealed`], journalled as `SignIn`. The login
-//! password is the login address's own `password` cell, so the emails table and the mailbox
-//! never hold one fact twice.
+//! harness's sign-in, read where its generation holds it (the sealed token in its cell, opened in
+//! place, in the generations builds up to 0.200.0 read; after them the secret-store entry its
+//! `SecretRef` cell names, [`crate::typed::secret::Store`]) and journalled as `SignIn`. The login password is the login
+//! address's own `password` cell, so the emails table and the mailbox never hold one fact twice.
 
 #[cfg(unix)]
 use super::Registry;
@@ -28,7 +29,7 @@ use crate::{
     typed::{
         cell::{Projection, Row},
         keys,
-        secret::{Cell, Sealer},
+        secret::{Cell, Secret, Store, entry_of},
     },
 };
 use aterm_json::Value;
@@ -299,27 +300,37 @@ pub struct Mailbox {
     /// What it receives, as `ai-mailbox.toml`'s `receives` spelled it: each exact address
     /// (lower-case), then each `*@<domain>`, then `*`.
     pub receives: Vec<String>,
-    /// The credentials whose cells hold a value, each in one candidate or several.
+    /// The credentials whose cells hold a value a sign-in reaches, in one candidate or several:
+    /// a secret-store entry's name, or a sealed token below the third generation.
     pub held: Vec<Credential>,
 }
 
-fn token_candidates<'a>(row: &'a Row, column: &str) -> Vec<&'a str> {
-    row.fields
+/// The distinct non-null values of `row`'s `column`: one, or several where Macs wrote it
+/// concurrently. Each is a `SecretRef` value naming a store entry, never the secret.
+fn references<'a>(row: &'a Row, column: &str) -> Vec<&'a Value> {
+    let mut out: Vec<&Value> = Vec::new();
+    for value in row
+        .fields
         .get(column)
         .map_or(&[][..], crate::typed::cell::Field::candidates)
         .iter()
-        .filter_map(|c| c.value.x.as_str())
-        .filter(|token| !token.is_empty())
-        .collect()
+        .map(|c| &c.value.x)
+        .filter(|x| !x.is_null())
+    {
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
 }
 
-fn has_token_candidate(row: &Row, column: &str) -> bool {
-    row.fields
-        .get(column)
-        .map_or(&[][..], crate::typed::cell::Field::candidates)
-        .iter()
-        .filter_map(|c| c.value.x.as_str())
-        .any(|token| !token.is_empty())
+/// Whether `row`'s `column` holds a value a sign-in reaches: a reference to a store entry (the
+/// registry's third generation on), or an earlier build's sealed token (the generations builds up
+/// to 0.200.0 read, which a sign-in opens in place until the roll moves it).
+fn holds_credential(row: &Row, column: &str) -> bool {
+    references(row, column).into_iter().any(|value| {
+        entry_of(value).is_some() || value.as_str().is_some_and(crate::typed::secret::is_sealed)
+    })
 }
 
 fn text_ref<'a>(row: &'a Row, column: &str) -> Option<&'a str> {
@@ -377,7 +388,7 @@ fn mailbox_of(addresses: &Projection, pk: &str, row: &Row) -> Option<Mailbox> {
                 Credential::Password => login_row,
                 _ => row,
             };
-            has_token_candidate(holder, which.column())
+            holds_credential(holder, which.column())
         })
         .collect();
     Some(Mailbox {
@@ -410,9 +421,14 @@ pub enum Withheld {
     NoMailbox,
     /// The cell is empty.
     NotSet,
-    /// The cell holds two different values; the owner picks one (§4.8, "Conflicts").
+    /// The cell's candidates hold two different values; the owner picks one (§4.8, "Conflicts").
     TwoValues,
-    /// A candidate does not open here.
+    /// This Mac's secret store holds no entry the cell names.
+    NotInStore,
+    /// The cell names an entry of another vault, or one that is not its own cell's
+    /// ([`crate::typed::secret::bound_entry`]): a sign-in never reads it.
+    NotOwnEntry,
+    /// A sealed token, in a generation builds up to 0.200.0 read, does not open on this Mac.
     Unopened,
 }
 
@@ -423,6 +439,8 @@ impl Withheld {
             Self::NoMailbox => "no live mailbox with a live login has that key",
             Self::NotSet => "not set in the registry",
             Self::TwoValues => "two values in the registry: the owner picks one",
+            Self::NotInStore => "this Mac's secret store holds no entry the registry names",
+            Self::NotOwnEntry => "the registry names a store entry that is not this cell's own",
             Self::Unopened => "a value in the registry does not open on this Mac",
         }
     }
@@ -436,70 +454,163 @@ pub struct Ask<'a> {
     pub when_ms: u64,
 }
 
+/// Where a sign-in reads a credential's value: the store entry a cell's reference names (the
+/// registry's third generation on), or the sealed token a cell holds, opened under its
+/// generation's key (the generations builds up to 0.200.0 read, until a roll moves them).
+#[derive(Clone, Copy)]
+enum Values<'a> {
+    Store(&'a dyn Store),
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only a unix build reads a registry with its keys")
+    )]
+    Sealed(&'a dyn crate::typed::secret::Sealer),
+}
+
+/// Whether `table`'s secret cells hold sealed tokens ([`crate::typed::Ty::Secret`]), as the
+/// generations builds up to 0.200.0 read do, rather than store references.
+#[cfg(unix)]
+fn holds_tokens(table: &crate::typed::Table) -> bool {
+    table
+        .collection(ADDRESS.name)
+        .and_then(|c| c.column("password"))
+        .is_some_and(|c| c.ty == crate::typed::Ty::Secret)
+}
+
+/// Read `handle`'s registry with the values its generation's secret cells reach ([`Values`]),
+/// projecting `address` and `mailbox` by that generation's own collections.
+#[cfg(unix)]
+fn read_with<T>(
+    handle: &crate::att::Handle,
+    store: &dyn Store,
+    read: impl FnOnce(&Projection, &Projection, Values<'_>) -> Result<T>,
+) -> Result<T> {
+    let table = handle.compiled().table;
+    let project = |view: &crate::att::View| {
+        (
+            view.project(table.collection(ADDRESS.name).unwrap_or(&ADDRESS)),
+            view.project(table.collection(MAILBOX.name).unwrap_or(&MAILBOX)),
+        )
+    };
+    if holds_tokens(table) {
+        handle.view_sealed(|view, opener| {
+            let (addresses, mailboxes) = project(view);
+            read(&addresses, &mailboxes, Values::Sealed(opener))
+        })
+    } else {
+        let (addresses, mailboxes) = project(&handle.view()?);
+        read(&addresses, &mailboxes, Values::Store(store))
+    }
+}
+
+/// Read `ask`'s credential from the store entry its cell names, or open the sealed token it
+/// holds ([`Values`]): `Ok(Err(_))` names why it is withheld, value-free; nothing is journalled
+/// here.
 fn open_credential<'a>(
     addresses: &'a Projection,
     mailboxes: &'a Projection,
-    sealer: &'a dyn Sealer,
+    table: &'a str,
+    values: Values<'_>,
     ask: Ask<'a>,
-) -> std::result::Result<(Cell<'a>, crate::typed::secret::Secret), Withheld> {
+) -> Result<std::result::Result<(Cell<'a>, Secret), Withheld>> {
     let Some(mb_row) = mailboxes.rows.get(ask.mailbox).filter(|r| r.live()) else {
-        return Err(Withheld::NoMailbox);
+        return Ok(Err(Withheld::NoMailbox));
     };
     let Some(login_pk) = text_ref(mb_row, "login") else {
-        return Err(Withheld::NoMailbox);
+        return Ok(Err(Withheld::NoMailbox));
     };
     let Some(login_row) = addresses.rows.get(login_pk).filter(|r| r.live()) else {
-        return Err(Withheld::NoMailbox);
+        return Ok(Err(Withheld::NoMailbox));
     };
     if text_ref(login_row, "addr").is_none() {
-        return Err(Withheld::NoMailbox);
+        return Ok(Err(Withheld::NoMailbox));
     }
     let column = ask.which.column();
     let (collection, row_pk, row) = match ask.which {
         Credential::Password => (ADDRESS.name, login_pk, login_row),
         Credential::MailboxPassword | Credential::Totp => (MAILBOX.name, ask.mailbox, mb_row),
     };
-    let tokens = token_candidates(row, column);
-    let Some((first, rest)) = tokens.split_first() else {
-        return Err(Withheld::NotSet);
-    };
-    let Ok(held) = sealer.open(collection, row_pk, column, first) else {
-        return Err(Withheld::Unopened);
-    };
-    for token in rest {
-        match sealer.open(collection, row_pk, column, token) {
-            Ok(other) if other.same(&held) => {}
-            Ok(_) => return Err(Withheld::TwoValues),
-            Err(_) => return Err(Withheld::Unopened),
-        }
-    }
+    let candidates = references(row, column);
     let cell = Cell {
-        table: sealer.table(),
+        table,
         collection,
         row: row_pk,
         column,
     };
-    Ok((cell, held))
+    let store = match values {
+        Values::Store(store) => store,
+        Values::Sealed(opener) => {
+            // Candidates that open to one value are one value.
+            let Some((first, rest)) = candidates.split_first() else {
+                return Ok(Err(Withheld::NotSet));
+            };
+            let open = |token: &Value| {
+                token
+                    .as_str()
+                    .filter(|t| crate::typed::secret::is_sealed(t))
+                    .and_then(|t| opener.open(collection, row_pk, column, t).ok())
+            };
+            let Some(held) = open(first) else {
+                return Ok(Err(Withheld::Unopened));
+            };
+            for token in rest {
+                match open(token) {
+                    Some(other) if other.same(&held) => {}
+                    Some(_) => return Ok(Err(Withheld::TwoValues)),
+                    None => return Ok(Err(Withheld::Unopened)),
+                }
+            }
+            return Ok(Ok((cell, held)));
+        }
+    };
+    // Candidates whose entries hold one value are one value, whichever entries they name: two
+    // Macs that rolled one value from different candidates put it into two entries.
+    // A cell that holds nothing asks nothing of the store.
+    let Some((first, rest)) = candidates.split_first() else {
+        return Ok(Err(Withheld::NotSet));
+    };
+    let vault = store.vault()?;
+    let read = |reference: &Value| -> Result<std::result::Result<Secret, Withheld>> {
+        let Ok(entry) = crate::typed::secret::bound_entry(reference, cell, &vault) else {
+            return Ok(Err(Withheld::NotOwnEntry));
+        };
+        Ok(store.get(entry)?.ok_or(Withheld::NotInStore))
+    };
+    let held = match read(first)? {
+        Ok(held) => held,
+        Err(why) => return Ok(Err(why)),
+    };
+    for reference in rest {
+        match read(reference)? {
+            Ok(other) if other.same(&held) => {}
+            Ok(_) => return Ok(Err(Withheld::TwoValues)),
+            Err(why) => return Ok(Err(why)),
+        }
+    }
+    Ok(Ok((cell, held)))
 }
 
-/// Hand `ask`'s credential to `consume`, journalled once as a sign-in's reveal. Candidates that
-/// open to one value are one value; two different values are withheld until the owner picks
-/// one, so a sign-in never guesses between them.
+/// Hand `ask`'s credential, read from `store`, to `consume`, journalled once as a sign-in's
+/// reveal in `table`. Candidates whose entries hold one value are one value, whichever entries
+/// they name; two different values are withheld until the owner picks one, so a sign-in never
+/// guesses between them. Nothing withheld is journalled.
 ///
 /// # Errors
-/// Journalling fails ([`super::secret::reveal_sealed`]).
+/// The store cannot be read or journalling fails ([`super::secret::record_reveal`]).
 pub fn reveal_in<T>(
     addresses: &Projection,
     mailboxes: &Projection,
-    sealer: &dyn Sealer,
+    table: &str,
+    store: &dyn Store,
     journal: &Journal,
     ask: Ask<'_>,
     consume: impl FnOnce(&str) -> T,
 ) -> Result<std::result::Result<T, Withheld>> {
-    let (cell, held) = match open_credential(addresses, mailboxes, sealer, ask) {
-        Ok(opened) => opened,
-        Err(why) => return Ok(Err(why)),
-    };
+    let (cell, held) =
+        match open_credential(addresses, mailboxes, table, Values::Store(store), ask)? {
+            Ok(opened) => opened,
+            Err(why) => return Ok(Err(why)),
+        };
     super::secret::record_reveal(journal, cell, Surface::SignIn, ask.when_ms)?;
     Ok(Ok(consume(held.plaintext())))
 }
@@ -544,41 +655,47 @@ pub fn login_mailbox(index: &AddressIndex, login: &str) -> Option<String> {
     }
 }
 
-/// [`reveal_in`] over this Mac's registry, its Secret keys resolved inside the table session.
+/// [`reveal_in`] over this Mac's registry, its value read from `store`
+/// ([`super::secret::store`]) where the generation's cells name store entries.
 ///
 /// # Errors
-/// The registry is not declared here, its log does not read, a key is unavailable, or the
+/// The registry is not declared here, its log does not read, the store cannot be read, or the
 /// journal fails.
 #[cfg(unix)]
 pub fn reveal<T>(
     registry: &Registry,
+    store: &dyn Store,
     journal: &Journal,
     ask: Ask<'_>,
     consume: impl FnOnce(&str) -> T,
 ) -> Result<std::result::Result<T, Withheld>> {
-    crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY).view_sealed(
-        |view, sealer| {
-            reveal_in(
-                &view.project(&ADDRESS),
-                &view.project(&MAILBOX),
-                sealer,
-                journal,
-                ask,
-                consume,
-            )
-        },
-    )
+    let handle = crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY);
+    let table = handle.compiled().name();
+    read_with(&handle, store, |addresses, mailboxes, values| {
+        let (cell, held) = match open_credential(addresses, mailboxes, &table, values, ask)? {
+            Ok(opened) => opened,
+            Err(why) => return Ok(Err(why)),
+        };
+        super::secret::record_reveal(journal, cell, Surface::SignIn, ask.when_ms)?;
+        Ok(Ok(consume(held.plaintext())))
+    })
 }
 
-/// Reveal a complete credential bundle from one sealed registry observation.
-/// The admitted metadata is checked before any Secret cell opens; all requested parts
-/// must succeed before the consumer receives any plaintext. Epoch keys stay in this module.
+/// Reveal a complete credential bundle from one registry observation, each value read from
+/// `store`. The admitted metadata is checked before any entry is read; every requested part must
+/// be read before any is journalled or the consumer receives any plaintext.
 ///
 /// # Errors
-/// The registry, key or journal is unavailable. Withholds incomplete or changed bindings.
+/// The registry, the store or the journal is unavailable. Withholds incomplete or changed
+/// bindings.
 #[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one bundle's coordinates, its store, journal and both callbacks"
+)]
 pub fn reveal_bound<T>(
     registry: &Registry,
+    store: &dyn Store,
     journal: &Journal,
     mailbox: &str,
     parts: &[Credential],
@@ -586,46 +703,40 @@ pub fn reveal_bound<T>(
     accept: impl FnOnce(&Mailbox) -> bool,
     consume: impl FnOnce(&[aterm_secrets::SecretBytes]) -> T,
 ) -> Result<std::result::Result<T, Withheld>> {
-    crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY).view_sealed(
-        |view, sealer| {
-            let addresses = view.project(&ADDRESS);
-            let mailboxes = view.project(&MAILBOX);
-            let Some(found) = mailboxes
-                .rows
-                .get(mailbox)
-                .and_then(|row| mailbox_of(&addresses, mailbox, row))
-            else {
-                return Ok(Err(Withheld::NoMailbox));
+    let handle = crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY);
+    let table = handle.compiled().name();
+    read_with(&handle, store, |addresses, mailboxes, values| {
+        let Some(found) = mailboxes
+            .rows
+            .get(mailbox)
+            .and_then(|row| mailbox_of(addresses, mailbox, row))
+        else {
+            return Ok(Err(Withheld::NoMailbox));
+        };
+        if !accept(&found) {
+            return Ok(Err(Withheld::NoMailbox));
+        }
+        let mut opened = Vec::with_capacity(parts.len());
+        for part in parts {
+            let ask = Ask {
+                mailbox,
+                which: *part,
+                when_ms,
             };
-            if !accept(&found) {
-                return Ok(Err(Withheld::NoMailbox));
+            match open_credential(addresses, mailboxes, &table, values, ask)? {
+                Ok(item) => opened.push(item),
+                Err(why) => return Ok(Err(why)),
             }
-            let mut opened = Vec::with_capacity(parts.len());
-            for part in parts {
-                match open_credential(
-                    &addresses,
-                    &mailboxes,
-                    sealer,
-                    Ask {
-                        mailbox,
-                        which: *part,
-                        when_ms,
-                    },
-                ) {
-                    Ok(item) => opened.push(item),
-                    Err(why) => return Ok(Err(why)),
-                }
-            }
-            let mut values = Vec::with_capacity(opened.len());
-            for (cell, held) in opened {
-                super::secret::record_reveal(journal, cell, Surface::SignIn, when_ms)?;
-                values.push(aterm_secrets::SecretBytes::from(
-                    held.plaintext().as_bytes(),
-                ));
-            }
-            Ok(Ok(consume(&values)))
-        },
-    )
+        }
+        let mut plain = Vec::with_capacity(opened.len());
+        for (cell, held) in opened {
+            super::secret::record_reveal(journal, cell, Surface::SignIn, when_ms)?;
+            plain.push(aterm_secrets::SecretBytes::from(
+                held.plaintext().as_bytes(),
+            ));
+        }
+        Ok(Ok(consume(&plain)))
+    })
 }
 
 #[cfg(test)]

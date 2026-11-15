@@ -5,11 +5,17 @@
 use std::path::Path;
 use std::time::Duration;
 
-use super::{
-    ChildOut, ChildSpec, RunError, ScriptedChild, classify_failure, classify_progress_failure, run,
-};
+#[cfg(unix)]
+use super::run_unless;
+use super::{ChildOut, ChildSpec, RunError, classify_failure, classify_progress_failure};
 use crate::error::{Kind, SideEffect, Sub};
 use crate::fx::Fx;
+
+/// `spec` run with no cancellation request.
+#[cfg(unix)]
+fn run(spec: &ChildSpec) -> crate::error::Result<ChildOut> {
+    run_unless(spec, &mut || false)
+}
 
 #[cfg(unix)]
 const ROUTED_ENV_CASE: &str = "AGH_ROUTED_CHILD_ENV_CASE";
@@ -21,7 +27,7 @@ const ROUTED_ENV_TEST: &str =
 
 /// A child with routed Git's explicit authentication environment is actually re-executed
 /// beneath a parent holding both ambient token variables. It sees neither, and it sees
-/// prompting disabled. NEGATIVE CONTROL: removing `run`'s `env_clear` makes the probe
+/// prompting disabled. NEGATIVE CONTROL: removing `run_unless`'s `env_clear` makes the probe
 /// inherit the planted variables and fail.
 #[cfg(unix)]
 #[test]
@@ -348,7 +354,7 @@ fn explicit_git_stop_retires_wall_and_progress_children_without_touching_a_bysta
     }
 }
 
-/// A child's `Debug` never holds its streams: `gh auth token`'s stdout is a token.
+/// A child's `Debug` never holds its streams, which may carry a credential.
 #[test]
 fn a_childs_debug_names_its_stream_lengths_not_their_bytes() {
     let out = ChildOut {
@@ -440,23 +446,6 @@ fn git_child_observation_preserves_config_input_exits_and_errors() {
     assert_eq!(spans.lock().unwrap().len(), 4);
     assert_eq!(fx.children_run().len(), 4);
     let root = aterm_tempfile::tempdir().unwrap();
-    let generic = ChildSpec::new(&root.path().join("scripted-child"));
-    let fx = fx.with_children(vec![ScriptedChild {
-        program: generic.program.clone(),
-        args: Vec::new(),
-        out: ChildOut {
-            code: Some(0),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        },
-    }]);
-    fx.child(&generic).unwrap();
-    assert_eq!(
-        spans.lock().unwrap().len(),
-        4,
-        "other child door is not observed"
-    );
-    assert_eq!(fx.children_run().len(), 5);
     let absent = ChildSpec::new(&root.path().join("absent-git"));
     let live = Fx::live().git(&absent, b"").unwrap_err().into_data();
     let observed = fx.git(&absent, b"").unwrap_err().into_data();
@@ -465,7 +454,7 @@ fn git_child_observation_preserves_config_input_exits_and_errors() {
     assert_eq!(spans.len(), 5);
     assert_eq!(
         (spans[4].ordinal, spans[4].code, spans[4].error),
-        (5, None, Some(Kind::CouldNotRun))
+        (4, None, Some(Kind::CouldNotRun))
     );
     assert!(spans.windows(2).all(|p| p[0].finished <= p[1].started));
 }
@@ -501,34 +490,6 @@ fn git_child_observation_refuses_other_modes_and_replacement() {
             .0,
     );
     reject(Fx::simulated(1).with_git_child_observer_for_tests(|_| {}));
-}
-
-#[test]
-fn a_relative_program_is_refused_under_simulation_as_it_is_live() {
-    let spec = ChildSpec::new(Path::new("gh")).arg("auth");
-    let fx = Fx::simulated(1_760_000_000).with_children(vec![ScriptedChild {
-        program: Path::new("gh").to_path_buf(),
-        args: vec!["auth".to_string()],
-        out: ChildOut {
-            code: Some(0),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        },
-    }]);
-    let simulated = fx.child(&spec).expect_err("refused").into_data();
-    let live = run(&spec).expect_err("refused").into_data();
-    assert_eq!(simulated, live);
-    assert_eq!(
-        (live.kind, live.sub, live.side_effect),
-        (Kind::CouldNotRun, Sub::Local, SideEffect::None)
-    );
-    assert!(fx.children_run().is_empty());
-}
-
-#[test]
-#[should_panic(expected = "Fx::with_children scripts only a simulated Fx")]
-fn scripting_children_on_a_live_fx_panics() {
-    let _ = Fx::live().with_children(Vec::new());
 }
 
 #[cfg(unix)]

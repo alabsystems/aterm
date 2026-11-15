@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Worker launch (`spawn agent=<claude|codex|agy|muse|grok>`) across harnesses, and a program
+//! Worker launch (`spawn agent=<claude|codex|agy|muse>`) across harnesses, and a program
 //! worker's (`spawn program=<p>`, [`crate::program_worker`]).
 
 use std::cell::RefCell;
@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::upgrade::Dialect;
-use aterm_agent::supervise::Autopilot;
 use aterm_core::terminal::Terminal;
 use aterm_session::SessionId;
 
@@ -138,6 +138,8 @@ pub(crate) struct TaskOrder {
     pub(crate) agent: aterm_phase::Program,
     /// `model=`: the worker's `--model`.
     pub(crate) model: Option<String>,
+    /// The requested Codex reasoning selection, retained through launch.
+    pub(crate) effort: Option<String>,
     /// `from=`, the session that starts the worker.
     pub(crate) caller: Option<SessionId>,
     /// The Mac [`Self::caller`] runs on where the spawn came over a fleet drive: the driver's node
@@ -185,6 +187,7 @@ impl TaskOrder {
             task,
             agent,
             model,
+            effort: None,
             caller,
             manager_node: None,
             trusted_cwd,
@@ -210,6 +213,7 @@ impl TaskOrder {
             task,
             agent: aterm_phase::Program::Generic,
             model: None,
+            effort: None,
             caller,
             manager_node: None,
             trusted_cwd,
@@ -324,7 +328,8 @@ fn without_blank_lines(task: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-fn draws_nothing(c: char) -> bool {
+/// Whether `c` draws nothing: blank, a control character, or an invisible format character.
+pub(crate) fn draws_nothing(c: char) -> bool {
     c.is_whitespace()
         || c.is_control()
         || matches!(
@@ -434,6 +439,12 @@ fn task_file_name(sid: &SessionId) -> String {
     format!("{}-1.txt", sid.as_str())
 }
 
+/// Session `sid`'s task file (its worker's brief), where this Mac keeps a tasks folder; it is
+/// there only while the session stands.
+pub(crate) fn task_file_of(sid: &SessionId) -> Option<PathBuf> {
+    Some(crate::task_record::tasks_dir()?.join(task_file_name(sid)))
+}
+
 /// The trusted-folders sidecar an older aterm wrote beside a Gemini CLI worker's task file; a
 /// session handed across the upgrade can still have one, removed with its task file.
 fn trust_file_name(sid: &SessionId) -> String {
@@ -459,11 +470,11 @@ fn is_file_of(name: &str, sid: &SessionId) -> bool {
 }
 
 /// The session ID a snapshot's name is written under (`<sid>-<rev>.result.md`), `None` for a
-/// name no done edge writes. The ID is one [`SessionId::generate`] mints
-/// ([`aterm_session::is_minted_sid`]: lower-case hex of one length) and the rev a `u64`'s digits,
-/// so the name is bounded and spelled one way: on a case-insensitive volume (macOS's default) a
-/// name differing from a snapshot's only in case is the same file, and removed by that name it
-/// would take another record's snapshot past every check that compares names.
+/// name no done edge writes. The ID is a tab ID ([`aterm_session::is_minted_sid`]: lower case, of
+/// one length per form) and the rev a `u64`'s digits, so the name is bounded and spelled one way:
+/// on a case-insensitive volume (macOS's default) a name differing from a snapshot's only in case
+/// is the same file, and removed by that name it would take another record's snapshot past every
+/// check that compares names.
 pub(crate) fn snapshot_sid(name: &str) -> Option<&str> {
     let (sid, rev) = name.strip_suffix(".result.md")?.rsplit_once('-')?;
     (!rev.is_empty()
@@ -933,6 +944,8 @@ pub(crate) struct Launch {
     pub(crate) agent: aterm_phase::Program,
     /// `model=`.
     pub(crate) model: Option<String>,
+    /// The requested Codex reasoning selection, retained through launch.
+    pub(crate) effort: Option<String>,
     /// The one folder the worker's starter trusted for it (the spawn's canonical `cwd=`).
     pub(crate) trusted_cwd: Option<String>,
     /// The starter's session, whose agent of the worker's kind the line follows.
@@ -1274,23 +1287,20 @@ fn run_worker_launch(work: &Launch) {
             return;
         }
     };
-    let store = AtpkgStore::new(&work.ctx);
+    let store = AtpkgStore::new(&work.ctx, work.account_scope.clone());
     let admission = admit_prepared_worker(
         cli,
         caller,
-        aterm_types::dirs::home_dir().as_deref(),
         &|note| note_launch(&work.ctx, note),
         &|| store.installing(),
         &store,
         |admitted| {
             #[cfg(unix)]
             let admitted = match codex_source.as_mut() {
-                Some(source) => source
-                    .arm(admitted, cli)
-                    .map_err(aterm_agent::harness::worker::Refused::SignedOut)?,
+                Some(source) => source.arm(admitted)?,
                 None => admitted,
             };
-            admitted.prepare(cli, aterm_types::dirs::home_dir().as_deref(), |starter| {
+            admitted.prepare(|starter| {
                 let _google_mark = native_google_agent(work.agent).then(|| store.installing());
                 if account_preparation_cancelled(work) {
                     return Err(PREPARATION_CANCELLED.into());
@@ -1366,6 +1376,7 @@ fn run_worker_launch(work: &Launch) {
     let config = crate::app_config::config_path();
     let mut fresh = worker_fresh(model, here, work.chrome, work.approve);
     fresh.config = config.as_deref();
+    fresh.reasoning_effort = work.effort.as_deref();
     let line = aterm_agent::harness::worker::line(cli, work.dialect, &admitted, &fresh);
     match line {
         Ok(line) => {
@@ -1503,6 +1514,7 @@ pub(crate) fn worker_fresh(
     aterm_agent::harness::worker::Fresh {
         config: None,
         model,
+        reasoning_effort: None,
         trusted_here: here,
         permission_mode: chrome.then(|| claim_worker_mode(approve)),
         chrome,
@@ -1549,15 +1561,22 @@ pub(crate) struct AtpkgStore<'a> {
     install_mark: std::cell::Cell<Option<u64>>,
     install_entered: std::cell::Cell<Option<u64>>,
     cancelled: std::cell::Cell<bool>,
+    /// The launch's account work: a quit or an update that cancels it ends the install as a
+    /// launch that moved on does.
+    account: Option<aterm_agent::harness::account_work::Scope>,
 }
 
 impl<'a> AtpkgStore<'a> {
-    fn new(ctx: &'a SessionCtx) -> Self {
+    fn new(
+        ctx: &'a SessionCtx,
+        account: Option<aterm_agent::harness::account_work::Scope>,
+    ) -> Self {
         Self {
             ctx,
             install_mark: std::cell::Cell::new(None),
             install_entered: std::cell::Cell::new(None),
             cancelled: std::cell::Cell::new(false),
+            account,
         }
     }
 
@@ -1610,7 +1629,10 @@ impl ProgramStore for AtpkgStore<'_> {
             self.ctx,
             mark,
             self.install_entered.get(),
-            &self.cancelled,
+            InstallStop {
+                cancelled: &self.cancelled,
+                account: self.account.as_ref(),
+            },
         )
     }
 }
@@ -1628,9 +1650,20 @@ pub(crate) fn runnable_in(layout: &atpkg::store::Layout, program: &str) -> bool 
                 .is_some_and(|tools| tools.iter().any(|tool| tool == program)))
 }
 
+/// What ends an install: its launch moving on (`cancelled`, which the install also sets when it
+/// finds that) and its `account` scope's cancellation (a quit, an update).
+#[derive(Clone, Copy)]
+pub(crate) struct InstallStop<'a> {
+    pub(crate) cancelled: &'a std::cell::Cell<bool>,
+    pub(crate) account: Option<&'a aterm_agent::harness::account_work::Scope>,
+}
+
 /// Run `atpkg`'s verified install of `program` on `layout` for the launcher of `ctx`, whose timeline
 /// hears the child's pid as soon as it runs: what a store shared with every other pass says of this
-/// install is what that process writes (`crate::harness_host::InstallWork`).
+/// install is what that process writes (`crate::harness_host::InstallWork`). Its launch moving on
+/// (`cancelled` is then set) or its `account` scope's cancellation (a quit, an update) closes the
+/// child's cancellation pipe, and atpkg retires at its next boundary, the store lock's wait
+/// included, leaving no half-made build.
 fn install_with(
     atpkg: &Path,
     layout: &atpkg::store::Layout,
@@ -1638,11 +1671,17 @@ fn install_with(
     ctx: &SessionCtx,
     mark: u64,
     entered: Option<u64>,
-    cancelled: &std::cell::Cell<bool>,
+    stop: InstallStop<'_>,
 ) -> Result<(), String> {
+    let InstallStop { cancelled, account } = stop;
+    let account_cancelled =
+        || account.is_some_and(aterm_agent::harness::account_work::Scope::cancelled);
     if !install_wanted(ctx, mark, entered) {
         cancelled.set(true);
         return Err("the install episode no longer owns this launch".into());
+    }
+    if account_cancelled() {
+        return Err(PREPARATION_CANCELLED.into());
     }
     let mut cmd = crate::qos::atpkg_command(atpkg);
     cmd.args(crate::pass_lead(
@@ -1672,9 +1711,9 @@ fn install_with(
                     reader,
                     writer,
                     requested: &|| {
-                        let stop = cancelled.get() || !install_wanted(ctx, mark, entered);
-                        cancelled.set(stop);
-                        stop
+                        let moved = cancelled.get() || !install_wanted(ctx, mark, entered);
+                        cancelled.set(moved);
+                        moved || account_cancelled()
                     },
                 }),
             },
@@ -1693,6 +1732,11 @@ fn install_with(
     let run = run.map_err(|e| format!("it could not run: {e}"))?;
     if run.clean() {
         return Ok(());
+    }
+    if !cancelled.get() && account_cancelled() {
+        // The pass marks any closed cancellation pipe as a launch that moved on; this one a
+        // quit or an update closed.
+        return Err(PREPARATION_CANCELLED.into());
     }
     let why = run.why();
     Err(if why.is_empty() {
@@ -1833,14 +1877,12 @@ pub(crate) fn install_argv(
     argv
 }
 
-/// ADMIT A WORKER BEFORE ITS FIRST PROMPT IS AWAITED: its sign-in first, then its program
-/// ([`aterm_agent::harness::worker::admit`]). A signed-out CLI that would open a sign-in page by
-/// itself (Grok Build) is refused before `store` is read or anything is installed. A program
-/// atpkg ships that `store` holds no build of (a fresh Mac before atpkg's update pass lands it,
-/// or one whose install failed) is installed by atpkg's verified install, with each step told to
-/// the launch record by `note`; where a person keeps it off ([`held_in`]: an exclude, a removal,
-/// or a no to unattended installs), or no atpkg here can install it, nothing is installed and
-/// the launch line says so
+/// ADMIT A WORKER BEFORE ITS FIRST PROMPT IS AWAITED: its program
+/// ([`aterm_agent::harness::worker::admit`]). A program atpkg ships that `store` holds no build
+/// of (a fresh Mac before atpkg's update pass lands it, or one whose install failed) is installed
+/// by atpkg's verified install, with each step told to the launch record by `note`; where a person
+/// keeps it off ([`held_in`]: an exclude, a removal, or a no to unattended installs), or no atpkg
+/// here can install it, nothing is installed and the launch line says so
 /// ([`aterm_agent::harness::worker::Admitted::kept_off`]). While the install runs, the session
 /// carries the mark `installing` makes ([`InstallingMark`]), so the startup deadline does not
 /// count the install as a start that never came until no work has moved in it for
@@ -1853,7 +1895,6 @@ pub(crate) fn install_argv(
 pub(crate) fn admit_worker<M>(
     cli: &aterm_agent::harness::worker::WorkerCli,
     starter: aterm_agent::harness::worker::Starter,
-    user: Option<&Path>,
     note: &dyn Fn(String),
     installing: &dyn Fn() -> M,
     store: &dyn ProgramStore,
@@ -1862,7 +1903,6 @@ pub(crate) fn admit_worker<M>(
     let admitted = admit(
         cli,
         starter,
-        user,
         |program| store.present(program),
         |program| store.held(program),
         |program| {
@@ -1888,7 +1928,6 @@ pub(crate) fn admit_worker<M>(
 fn admit_prepared_worker<M, T>(
     cli: &aterm_agent::harness::worker::WorkerCli,
     starter: aterm_agent::harness::worker::Starter,
-    user: Option<&Path>,
     note: &dyn Fn(String),
     installing: &dyn Fn() -> M,
     store: &dyn ProgramStore,
@@ -1899,7 +1938,7 @@ fn admit_prepared_worker<M, T>(
         aterm_agent::harness::worker::Refused,
     >,
 ) -> Result<(aterm_agent::harness::worker::Admitted, T), aterm_agent::harness::worker::Refused> {
-    prepare(admit_worker(cli, starter, user, note, installing, store)?)
+    prepare(admit_worker(cli, starter, note, installing, store)?)
 }
 
 /// The task record's `why=` for a worker its launcher refused before its line
@@ -2899,11 +2938,25 @@ fn claude_pick(
     if !roster.several() || login.reconciled(&roster).row().is_none() {
         return Ok(None);
     }
-    let (state, _) = seat.store(cli).load_judged(seat.now, &roster)?;
+    let store = seat.store(cli);
+    let (state, _) = store.load_judged(seat.now, &roster)?;
     let enrolled = accounts::enrolled_for(cli, &roster);
-    let Some((from, row)) =
-        accounts::claude_worker_move(&roster, &state, &enrolled, &login, mode, seat.now)
-    else {
+    // A row only its vault token puts in rotation takes the worker only where the token would
+    // serve its line, and a starter's row only its token keeps running is left where it would
+    // not (`accounts::token_guarded`), so the worker never starts on a lapsed stored login.
+    let mut serves = |row: &accounts::Row| {
+        aterm_agent::harness::token_route::row_token_serves_at(
+            seat.home, &store, &roster, row, seat.now,
+        )
+    };
+    let Some((from, row)) = accounts::claude_worker_move(
+        &roster,
+        &state,
+        &enrolled,
+        &login,
+        (mode, seat.now),
+        &mut serves,
+    ) else {
         return Ok(None);
     };
     let env = accounts_pool::login_env(cli, row, seat.home).map_err(|why| why.to_string())?;

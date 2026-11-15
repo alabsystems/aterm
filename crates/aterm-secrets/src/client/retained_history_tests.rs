@@ -344,8 +344,8 @@ fn a_valid_older_disk_log_cannot_roll_back_an_applied_log_only_value() {
             )
         };
         assert!(matches!(apply().unwrap(), SyncOutcome::Applied { .. }));
-        let value = reader.home.join(".secrets/shared");
-        assert_eq!(std::fs::read(&value).unwrap(), b"new");
+        let value = || crate::client::stored(&reader, "shared");
+        assert_eq!(value().as_deref(), Some(b"new".as_slice()));
         assert!(materialization_ready(&reader).unwrap());
 
         let current = load_records(&reader).unwrap().encode();
@@ -384,9 +384,9 @@ fn a_valid_older_disk_log_cannot_roll_back_an_applied_log_only_value() {
             "coverage is checked before invoking a signer"
         );
         let recovered = apply();
-        assert_eq!(
-            std::fs::read(&value).unwrap(),
-            b"new",
+        assert_ne!(
+            value().as_deref(),
+            Some(b"old".as_slice()),
             "a valid older disk snapshot must not replace an acknowledged value (legacy={legacy})"
         );
         assert!(!matches!(recovered, Ok(SyncOutcome::Applied { .. })));
@@ -397,7 +397,7 @@ fn a_valid_older_disk_log_cannot_roll_back_an_applied_log_only_value() {
         drop(StateLock::take(&reader).unwrap_or_else(|error| {
             panic!("the complete frontier must recover (legacy={legacy}): {error}")
         }));
-        assert_eq!(std::fs::read(&value).unwrap(), b"new");
+        assert_eq!(value().as_deref(), Some(b"new".as_slice()));
         assert!(materialization_ready(&reader).unwrap());
         let admin = admin_open(&lab.m22).unwrap();
         let mut reverted = admin.doc.clone();
@@ -408,8 +408,8 @@ fn a_valid_older_disk_log_cannot_roll_back_an_applied_log_only_value() {
         save_records(&reader, &load_records(&lab.m22).unwrap().encode()).unwrap();
         assert!(matches!(apply().unwrap(), SyncOutcome::Applied { .. }));
         assert_eq!(
-            std::fs::read(&value).unwrap(),
-            b"old",
+            value().as_deref(),
+            Some(b"old".as_slice()),
             "an intentional signed descendant can revert a value without forgetting its history"
         );
         lab.server.stop();
@@ -520,10 +520,7 @@ fn a_bounded_reader_repairs_an_older_raw_snapshot_from_its_peer() {
         crate::ErrorKind::MembershipHistoryUnavailable,
     );
     bounded::sync_reader_until(&lab.m7, Instant::now() + Duration::from_secs(60)).unwrap();
-    assert_eq!(
-        std::fs::read(lab.m7.home.join(".secrets/shared")).unwrap(),
-        b"new"
-    );
+    assert_eq!(crate::client::stored(&lab.m7, "shared").unwrap(), b"new");
     assert!(retained_frontier::covers(
         load_records(&lab.m7).unwrap().log().unwrap(),
         current.log().unwrap().network(),

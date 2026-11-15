@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--cpu-accounting") {
+        cpu_accounting_check();
+        return;
+    }
     if args.iter().any(|a| a == "--cpu-hardware") {
         let mut hardware = aterm_sysprobe::cpu_hardware::Probe::default();
         let gap = Duration::from_millis(2_500);
@@ -133,6 +137,100 @@ fn main() {
 
     if args.iter().any(|a| a == "--qos-check") {
         qos_check(&layout);
+    }
+}
+
+/// Compare the kernel's three CPU accounts over one window, including exited children in
+/// their reaper's counter. This is an on-demand diagnostic, without starting a workload.
+fn cpu_accounting_check() {
+    use aterm_sysprobe::coalitions;
+    use std::collections::BTreeMap;
+    let mut probe = aterm_sysprobe::Probe::new();
+    let read = |probe: &mut aterm_sysprobe::Probe| {
+        let cores = probe.core_ticks().expect("core counters");
+        let at = Instant::now();
+        let coalitions = coalitions::coalitions().expect("coalition counters (macOS)");
+        let procs = aterm_sysprobe::processes_with(aterm_sysprobe::SweepOpts {
+            coalitions: true,
+            ..Default::default()
+        })
+        .expect("process counters");
+        (at, cores, coalitions, procs)
+    };
+    let (start, cores0, coal0, procs0) = read(&mut probe);
+    std::thread::sleep(Duration::from_secs(3));
+    let (end, cores1, coal1, procs1) = read(&mut probe);
+    let window = end.duration_since(start).as_nanos() as f64;
+    let rate = |ns: u64| ns as f64 * 1000.0 / window;
+    let mut live = BTreeMap::<u64, (u64, u64)>::new();
+    let mut members = Vec::new();
+    for p in &procs1.procs {
+        let Some(base) = procs0
+            .procs
+            .iter()
+            .find(|b| b.pid == p.pid && b.start == p.start && p.start.is_some())
+        else {
+            continue;
+        };
+        let Some((cpu, before, coalition)) = p
+            .cpu_ns
+            .zip(base.cpu_ns)
+            .zip(p.coalition)
+            .map(|((a, b), c)| (a, b, c))
+        else {
+            continue;
+        };
+        let cpu = cpu.saturating_sub(before);
+        let child = p
+            .child_cpu_ns
+            .zip(base.child_cpu_ns)
+            .map_or(0, |(a, b)| a.saturating_sub(b));
+        let sum = live.entry(coalition).or_default();
+        sum.0 = sum.0.saturating_add(cpu);
+        sum.1 = sum.1.saturating_add(child);
+        members.push((cpu, child, p.pid, coalition, &p.name));
+    }
+    let mut rows = Vec::new();
+    let mut all = 0u64;
+    for c in &coal1.rows {
+        let Some(base) = coal0.rows.iter().find(|b| b.id == c.id) else {
+            continue;
+        };
+        let cpu = c.cpu_ns.saturating_sub(base.cpu_ns);
+        all = all.saturating_add(cpu);
+        rows.push((cpu, c.id, live.get(&c.id).copied().unwrap_or_default()));
+    }
+    let (mut busy, mut total) = (0u64, 0u64);
+    for (a, b) in cores1.iter().zip(&cores0) {
+        busy += a.busy().saturating_sub(b.busy());
+        total += a.total().saturating_sub(b.total());
+    }
+    let host_mc = busy as f64 / total.max(1) as f64 * cores1.len() as f64 * 1000.0;
+    println!(
+        "cpu window_ms={:.0} host_mc={host_mc:.1} coalition_mc={:.1} residual_mc={:.1} listed={} answered={} truncated={}",
+        window / 1e6,
+        rate(all),
+        host_mc - rate(all),
+        coal1.listed,
+        coal1.rows.len(),
+        coal1.truncated
+    );
+    rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
+    for (cpu, coalition, (own, child)) in rows.into_iter().take(12) {
+        println!(
+            "coalition id={coalition} cpu_mc={:.1} live_mc={:.1} reaped_mc={:.1}",
+            rate(cpu),
+            rate(own),
+            rate(child)
+        );
+    }
+    members.sort_unstable_by_key(|r| std::cmp::Reverse(r.0.saturating_add(r.1)));
+    for (cpu, child, pid, coalition, name) in members.into_iter().take(12) {
+        println!(
+            "member pid={pid} coalition={coalition} exe={name:?} cpu_mc={:.1} reaped_mc={:.1}",
+            rate(cpu),
+            rate(child)
+        );
     }
 }
 

@@ -1590,6 +1590,8 @@ mod pet {
             match p.eyes {
                 "closed" => vec![lid(near, rn, 1.0), lid(far, rfx, 1.0)],
                 "happy" => vec![arc_eye(near, rn), arc_eye(far, rfx)],
+                "glide_closed" => vec![glide_lid(near, rn), glide_lid(far, rfx)],
+                "glide_happy" => vec![glide_arc(near, rn), glide_arc(far, rfx)],
                 "squint" => vec![lid(near, rn, 0.55), lid(far, rfx, 0.55)],
                 "halflid" => vec![half(near, rn, 1.0), half(far, rfx, -1.0)],
                 "wink" => vec![
@@ -1655,8 +1657,46 @@ mod pet {
             )
         }
 
+        /// The glide's blink: a thin ‿ lid low across the eye, so where the pet baker grows a
+        /// shallow eye to its dash height at the flier's ship sizes it stays a curve with coat
+        /// over its middle, an eye shut, not the dark slab a walker's full lid becomes there (a
+        /// scowl), and the other way up from the glide's happy ^.
+        fn glide_lid((x, y): Pt, r: f64) -> String {
+            let w = r * 1.15;
+            let t = 3.6;
+            catmull_closed(
+                &[
+                    (x - w, y),
+                    (x, y + r * 0.50),
+                    (x + w, y),
+                    (x, y + r * 0.50 - t),
+                ],
+                0.16,
+            )
+        }
+
+        /// The glide's delight: a thin ^, shallow enough that the pet baker grows it as a lid
+        /// (not as an open eye's round dot), so at ship size it is a chevron with coat under
+        /// its peak, the other way up from the blink's ‿.
+        fn glide_arc((x, y): Pt, r: f64) -> String {
+            let w = r * 1.25;
+            let t = 4.8;
+            catmull_closed(
+                &[
+                    (x - w, y + r * 0.50),
+                    (x, y - r * 0.55),
+                    (x + w, y + r * 0.50),
+                    (x, y - r * 0.55 + t),
+                ],
+                0.10,
+            )
+        }
+
         fn lids_down(p: &Pose) -> bool {
-            matches!(p.eyes, "closed" | "happy" | "squint" | "halflid")
+            matches!(
+                p.eyes,
+                "closed" | "happy" | "squint" | "halflid" | "glide_closed" | "glide_happy"
+            )
         }
 
         fn iris_paths(p: &Pose) -> Vec<String> {
@@ -1774,6 +1814,25 @@ mod pet {
             }
         }
 
+        /// The glide's startle: a round O twice the oof's under the nose, in the nose's layer,
+        /// which the pet baker draws at every size: the mouth layer is dropped below its detail
+        /// height, which is every glide tile at a 16 px cell, and there the oof's O was no
+        /// face at all (`pet_art_quality`'s `the_glide_faces_read_apart_at_ship_size`).
+        fn gasp(cx: f64, cy: f64) -> String {
+            blob0(
+                cx,
+                cy + 10.6,
+                &[
+                    (0.0, 6.4),
+                    (60.0, 6.6),
+                    (120.0, 6.6),
+                    (180.0, 6.4),
+                    (240.0, 6.6),
+                    (300.0, 6.6),
+                ],
+            )
+        }
+
         fn nose_paths(p: &Pose) -> Vec<String> {
             if dog(p) {
                 let (cx, cy) = dog_nose(p);
@@ -1781,6 +1840,10 @@ mod pet {
                 if p.mouth == "yawn" {
                     let (mcx, mcy) = dog_mouth(p);
                     out.push(gape(mcx, mcy));
+                }
+                if p.mouth == "gasp" {
+                    let (mcx, mcy) = dog_mouth(p);
+                    out.push(gasp(mcx, mcy));
                 }
                 out.push(blob0(
                     cx,
@@ -1800,6 +1863,10 @@ mod pet {
             if p.mouth == "yawn" {
                 let (mcx, mcy) = face_anchor(p, muzzle_dx(p), 0.38);
                 out.push(gape(mcx, mcy));
+            }
+            if p.mouth == "gasp" {
+                let (mcx, mcy) = face_anchor(p, muzzle_dx(p), 0.38);
+                out.push(gasp(mcx, mcy));
             }
             let (cx, cy) = face_anchor(
                 p,
@@ -1834,6 +1901,8 @@ mod pet {
                     ],
                 )],
                 "yawn" => vec![gape(cx, cy)],
+                // The glide's gasp is drawn with the nose ([`gasp`]), as a yawn's gape is.
+                "gasp" => Vec::new(),
                 "oof" => vec![blob0(
                     cx,
                     cy + 7.4,
@@ -3467,6 +3536,84 @@ mod pet {
             ]
         }
 
+        const FLY_AIR: f64 = 21.0;
+        const FLN: (f64, f64) = (66.0, 92.0);
+        const FLF: (f64, f64) = (58.0, 88.0);
+        const HLN: (f64, f64) = (-70.0, -84.0);
+        const HLF: (f64, f64) = (-62.0, -78.0);
+        const TAIL: [f64; 4] = [-98.0, -104.0, -118.0, -138.0];
+
+        /// The flier: the brand cat gliding at the head of the rainbow, one body in four
+        /// faces. Every face shares the glide's body, ears and legs, so a face swap moves no
+        /// edge (`pet_art_quality`'s `glide_faces_share_one_body`).
+        fn fly() -> Vec<Pose> {
+            let glide = |ident: &str, note: &str| Pose {
+                yaw: 1.0,
+                airborne: FLY_AIR,
+                bx: 92.0,
+                by: 62.0,
+                brx: 42.0,
+                bry: 23.0,
+                brot: -4.0,
+                hx: 155.0,
+                hy: 45.0,
+                hrot: -6.0,
+                ear_flat: 0.2,
+                gaze: (1.5, 0.0),
+                fl_near: leg4(FLN.0, FLN.1, 20.0, 20.0),
+                fl_far: leg4(FLF.0, FLF.1, 20.0, 20.0),
+                hl_near: leg4(HLN.0, HLN.1, 19.0, 15.0),
+                hl_far: leg4(HLF.0, HLF.1, 19.0, 15.0),
+                tail: TAIL,
+                tail_len: 15.0,
+                // The far fan sits inside the cheek in this profile: two bent strokes that
+                // read as a scribble beside the muzzle, and a smear under the eye at ship size.
+                whisker_far: false,
+                ..d(ident, note)
+            };
+            vec![
+                glide(
+                    "pet_fly",
+                    "Glide: level and streamlined at the head of the rainbow, forepaws reaching, hind legs and tail streaming back along the trail.",
+                ),
+                Pose {
+                    eyes: "glide_closed",
+                    ..glide(
+                        "pet_fly_blink",
+                        "Glide, blink: the glide with the lids down.",
+                    )
+                },
+                Pose {
+                    eyes: "glide_happy",
+                    mouth: "smile",
+                    ..glide(
+                        "pet_fly_happy",
+                        "Glide, delight: the glide with happy eyes and a smile.",
+                    )
+                },
+                Pose {
+                    eyes: "wide",
+                    mouth: "gasp",
+                    blush: false,
+                    ..glide(
+                        "pet_fly_oof",
+                        "Glide, oops: the glide startled, eyes wide; the body and ears stay the glide's, so a face swap moves no edge.",
+                    )
+                },
+            ]
+        }
+
+        /// The collectible `spec_stretch` (`../glyphs/spec_stretch.toml`): the flier's
+        /// glide, `pet_fly`, under the roster id the Kitty Log already holds.
+        fn spec_stretch() -> String {
+            let fly = &fly()[0];
+            let text = emit(&Pose {
+                note: "The flying cat: the brand pet in its glide pose (art_rig pet, `pet_fly`), the Kitty Log sighting of the flier.".to_string(),
+                ..fly.clone()
+            });
+            text.replacen("id = \"pet_fly\"", "id = \"spec_stretch\"", 1)
+        }
+
         fn cat_poses() -> Vec<Pose> {
             [
                 vec![stand()],
@@ -3477,6 +3624,7 @@ mod pet {
                 reactive(),
                 address(),
                 flight(),
+                fly(),
                 low(),
                 roll(),
                 lwalk(),
@@ -3523,6 +3671,7 @@ mod pet {
                     text.matches("[[layer]]").count(),
                 );
             }
+            super::super::write(&out.join("spec_stretch.toml"), &spec_stretch())?;
             super::super::write(&out.join("sheet.toml"), &sheet(&cats, 5, "pet_sheet"))?;
             super::super::write(
                 &out.join("dog_sheet.toml"),

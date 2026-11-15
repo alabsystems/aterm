@@ -216,7 +216,7 @@ fn spawn(inst: &Instance, args: &[&str]) -> String {
     let reply = ctl_ok(inst, &all);
     reply
         .split_whitespace()
-        .find(|t| t.starts_with("s-"))
+        .find(|t| aterm_types::tab_id::is_tab_id(t))
         .unwrap_or_else(|| panic!("spawn names its sid: {reply}"))
         .to_owned()
 }

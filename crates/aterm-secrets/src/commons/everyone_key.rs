@@ -2,10 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! The newest `[everyone]` epoch this Mac holds: its id and key, and nothing else
-//! (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8, §11 A7). A keyed digest of a lab table
-//! (`aterm db emails --digest`) and of a fleet_db replica is keyed by it, so two members compare
-//! a table under one epoch without a value leaving either Mac, and anyone without the key (a
-//! model provider reading an agent's transcript included) cannot test a guess against a digest.
+//! (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.8, §11 A7). A keyed digest of a fleet_db replica
+//! is keyed by it, so two members compare a table under one epoch without a value leaving either
+//! Mac, and anyone without the key (a model provider reading an agent's transcript included)
+//! cannot test a guess against a digest.
 //!
 //! The rule is M6's tie-break: the lowest id among the causally newest counting `[everyone]`
 //! epochs, when this Mac holds its key. No older epoch stands in, so members with one log name one

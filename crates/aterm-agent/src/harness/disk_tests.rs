@@ -469,7 +469,12 @@ fn report_only_is_the_default_and_apply_without_a_class_does_nothing() {
     let rep = report(&survey, Config::default());
     assert!(!rep.config.apply, "disk.apply defaults to false");
     assert_eq!(rep.rows_of(Class::CargoTargets).len(), 1, "still REPORTED");
-    assert!(rep.headline().contains("apply=off"), "{}", rep.headline());
+    assert!(
+        rep.headline()
+            .contains("manual_apply=off automatic_grant=on"),
+        "{}",
+        rep.headline()
+    );
 
     assert!(matches!(
         plan(&rep, None),
@@ -961,6 +966,30 @@ fn the_purge_row_is_surfaced_and_never_run_from_here() {
 }
 
 #[test]
+fn manual_and_automatic_grants_are_reported_independently() {
+    for (manual, automatic) in [(false, true), (true, false), (false, false)] {
+        let config = Config {
+            apply: manual,
+            auto_free_gib: if automatic { DEFAULT_AUTO_FREE_GIB } else { 0 },
+            ..Config::default()
+        };
+        let rep = report(&Survey::new(NOW), config);
+        let json: Value = aterm_json::from_str(&rep.to_json()).unwrap();
+        assert_eq!(json["apply_allowed"].as_bool(), Some(manual));
+        assert_eq!(json["automatic_grant"].as_bool(), Some(automatic));
+        assert!(
+            rep.headline().contains(&format!(
+                "manual_apply={} automatic_grant={}",
+                if manual { "allowed" } else { "off" },
+                if automatic { "on" } else { "off" }
+            )),
+            "{}",
+            rep.headline()
+        );
+    }
+}
+
+#[test]
 fn the_report_json_carries_every_row_with_its_witness() {
     let mut survey = Survey::new(NOW);
     survey.free_bytes = Some(12 * GIB);
@@ -978,6 +1007,7 @@ fn the_report_json_carries_every_row_with_its_witness() {
     assert!(json.contains("\"trigger\":\"on-demand\""), "{json}");
     assert!(json.contains("\"warn\":true"), "{json}");
     assert!(json.contains("\"apply_allowed\":false"), "{json}");
+    assert!(json.contains("\"automatic_grant\":true"), "{json}");
     assert!(json.contains("\"witness\":\"not-link-target\""), "{json}");
     assert!(json.contains("\"bytes_partial\":true"), "{json}");
     assert!(!json.contains('\n'), "one object, one line");

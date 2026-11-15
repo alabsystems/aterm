@@ -15,12 +15,15 @@
 //! name alone keeps the number, an unnumbered Mac's included
 //! ([`RenameTo`]). A number a migration still waits on holds no claim:
 //! the Numeric ID field opens empty, and typing that number claims it. Rename is unavailable while
-//! the line refuses what is typed. The set reads again under its locks, so a number the
+//! the line refuses what is typed; where another Mac holds the typed number, the line names the
+//! next free ones above it. The set reads again under its locks, so a number the
 //! line passed can still be refused, and that refusal leads the alert at the next press, its
 //! fields holding what that press typed ([`crate::machine_title::NameUnset`]).
 
+use std::sync::Mutex;
+
 use aterm_agent::machine_name::file::MachineName;
-use aterm_agent::machine_name::{NameTo, RenamePreview};
+use aterm_agent::machine_name::{NameTo, Refused, RenamePreview, next_free_words};
 use aterm_types::machine_name::{Nickname, Number, Refusal, Verdict};
 
 use crate::machine_title::MachineView;
@@ -161,6 +164,41 @@ pub(crate) const AUTHORIZE_NAMING: &str = "Authorize Naming\u{2026}";
 pub(crate) struct PanelRead {
     preview: RenamePreview,
     naming: Option<NamingStatus>,
+    /// The next free numbers above the held number the line last named them for: a one-entry
+    /// memo, since the read never changes and so neither does its answer for a number, while
+    /// the line is judged at every draw and press, and finding them judges one number after
+    /// another ([`RenamePreview::free_after`]). Typing another held number replaces it.
+    free: Mutex<Option<(Number, Vec<Number>)>>,
+}
+
+impl PanelRead {
+    fn of(preview: RenamePreview, naming: Option<NamingStatus>) -> Self {
+        Self {
+            preview,
+            naming,
+            free: Mutex::new(None),
+        }
+    }
+
+    /// [`RenamePreview::next_free`], remembered for the last held number asked about. A refusal
+    /// that is no other Mac's hold names none and leaves the memo alone; a poisoned memo
+    /// answers from the read again without keeping it.
+    fn next_free(&self, num: Number, refused: &Refused) -> Vec<Number> {
+        if !refused.held_by_another() {
+            return Vec::new();
+        }
+        let Ok(mut memo) = self.free.lock() else {
+            return self.preview.next_free(num, refused);
+        };
+        match &*memo {
+            Some((at, free)) if *at == num => free.clone(),
+            _ => {
+                let free = self.preview.next_free(num, refused);
+                *memo = Some((num, free.clone()));
+                free
+            }
+        }
+    }
 }
 
 /// What the live line judges a number from.
@@ -191,23 +229,42 @@ impl Snapshot {
                 .is_some_and(NamingStatus::authorization_unknown)
     }
 
-    fn authorize_saved(&self, held: &Held, number: &Field, nick: &Field) -> Option<RenameTo> {
+    /// Authorize Naming…'s request where it applies: the saved choice's permission unread and
+    /// neither field typed into.
+    pub(crate) fn authorize_saved(
+        &self,
+        held: &Held,
+        number: &Field,
+        nick: &Field,
+    ) -> Option<RenameTo> {
         (self.authorization_unknown(held) && number.typed().is_none() && nick.typed().is_none())
             .then_some(RenameTo::Authorize)
     }
 
     pub(crate) fn named(preview: RenamePreview, naming: NamingStatus) -> Self {
-        Self::Read(Box::new(PanelRead {
-            preview,
-            naming: Some(naming),
-        }))
+        Self::Read(Box::new(PanelRead::of(preview, Some(naming))))
     }
 
     pub(crate) fn read(preview: RenamePreview) -> Self {
-        Self::Read(Box::new(PanelRead {
-            preview,
-            naming: None,
-        }))
+        Self::Read(Box::new(PanelRead::of(preview, None)))
+    }
+
+    /// The numbers to take instead of `num`, which `refused` refuses, from this read: the next
+    /// free ones above it where another Mac holds it ([`RenamePreview::next_free`]), found once
+    /// per read and number; none before the read lands or after it failed.
+    pub(crate) fn next_free(&self, num: Number, refused: &Refused) -> Vec<Number> {
+        match self {
+            Self::Read(read) => read.next_free(num, refused),
+            Self::Reading | Self::Unread(_) => Vec::new(),
+        }
+    }
+
+    /// The books and vault labels the read found, once it has landed.
+    pub(crate) fn preview(&self) -> Option<&RenamePreview> {
+        match self {
+            Self::Read(read) => Some(&read.preview),
+            Self::Reading | Self::Unread(_) => None,
+        }
     }
 
     fn unchanged_request(&self, held: &Held) -> Option<RenameTo> {
@@ -270,10 +327,7 @@ pub(crate) fn rename_to(number: &Field, nick: &Field, held: &Held) -> Result<Ren
     let nick = match nick.typed().map(str::trim) {
         None | Some("") => None,
         Some(word) if held.read && word == held.word => None,
-        Some(word) => Some(
-            Nickname::parse(word)
-                .map_err(|why| format!("\u{201c}{word}\u{201d} is no name: {why}."))?,
-        ),
+        Some(word) => Some(Nickname::parse(word).map_err(|why| format!("Name: {why}."))?),
     };
     let num = match number.typed().map(str::trim) {
         None => None,
@@ -283,9 +337,7 @@ pub(crate) fn rename_to(number: &Field, nick: &Field, held: &Held) -> Result<Ren
             // An emptied field keeps the current ID, including an unassigned one.
             Err(Refusal::Empty) => None,
             Err(why) => {
-                return Err(format!(
-                    "\u{201c}{typed}\u{201d} is no machine number: {why}."
-                ));
+                return Err(format!("Numeric ID: {why}."));
             }
         },
     };
@@ -298,28 +350,47 @@ pub(crate) fn rename_to(number: &Field, nick: &Field, held: &Held) -> Result<Ren
 
 /// Judge the fields `number` and `nick` against `held` and `snapshot`: field refusals,
 /// the number's verdict from [`RenamePreview::judge`], and a requested nickname already held
-/// by another node. An unread snapshot leaves Save available; the canonical writer rechecks
+/// by another node. A number another Mac holds, or the vault keeps, is refused with the next
+/// free numbers above it ([`Snapshot::next_free`]), the ones `aterm name set`'s refusal names.
+/// An unread snapshot leaves Save available; the canonical writer rechecks
 /// both fields. The text uses no window state that the snapshot may have outdated.
 pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Field) -> Line {
+    judged(snapshot, held, number, nick, true)
+}
+
+/// [`line`]'s verdict on the fields alone, without the naming status above it (the OS names
+/// expected and observed, synchronization and fleet discovery): for Settings ▸ This Mac, whose
+/// reads observe none of those, so their words would wait on reads it never makes.
+pub(crate) fn verdict(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Field) -> Line {
+    judged(snapshot, held, number, nick, false)
+}
+
+fn judged(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Field, names: bool) -> Line {
     // Keep the observed names visible while an edit is incomplete or refused. Only a
     // valid edit changes the generated preview; invalid text keeps the saved target.
     let present =
         |text: String, renames, expected: Option<&aterm_types::machine_name::GeneratedNames>| {
+            let draft = snapshot.authorization_unknown(held)
+                && (number.typed().is_some() || nick.typed().is_some());
+            let draft = if draft {
+                "Save or revert your edits before authorizing naming."
+            } else {
+                ""
+            };
             let text = match snapshot {
-                Snapshot::Read(read) if let Some(status) = &read.naming => {
+                Snapshot::Read(read) if names && let Some(status) = &read.naming => {
                     let names = match expected {
                         Some(expected) => status.text_for(Some(expected), &held.name),
                         None => status.text(&held.name),
                     };
-                    let draft = if snapshot.authorization_unknown(held)
-                        && (number.typed().is_some() || nick.typed().is_some())
-                    {
-                        "\nSave or revert your edits before authorizing naming."
+                    let draft = if draft.is_empty() {
+                        String::new()
                     } else {
-                        ""
+                        format!("\n{draft}")
                     };
                     format!("{names}{draft}\n\n{text}")
                 }
+                _ if !names && !draft.is_empty() => format!("{draft} {text}"),
                 _ => text,
             };
             Line { text, renames }
@@ -435,7 +506,14 @@ pub(crate) fn line(snapshot: &Snapshot, held: &Held, number: &Field, nick: &Fiel
                         true,
                     ),
                     Ok(_) => (format!("{num} is free."), true),
-                    Err(why) => (sentence(&why), false),
+                    Err(refused) => {
+                        let mut text = sentence(&refused.why);
+                        if let Some(free) = next_free_words(&snapshot.next_free(num, &refused)) {
+                            text.push(' ');
+                            text.push_str(&sentence(&free));
+                        }
+                        (text, false)
+                    }
                 },
             };
             (text, renames)
@@ -467,7 +545,7 @@ pub(crate) fn request(
 
 /// `why` as a sentence: a capital first letter unless it opens with a machine number (`m20 is…`),
 /// and a full stop.
-fn sentence(why: &str) -> String {
+pub(crate) fn sentence(why: &str) -> String {
     let mut chars = why.chars();
     let opens_with_number = Number::leading(why).is_some();
     let mut text = match chars.next() {
@@ -608,8 +686,9 @@ mod macos {
         static PRESSES: Cell<u64> = const { Cell::new(0) };
         /// The newest press's snapshot, kept while its alert reopens after a refusal.
         static SNAPSHOT: RefCell<Option<(u64, Snapshot)>> = const { RefCell::new(None) };
-        /// The alert on screen, while one is.
-        static OPEN: RefCell<Option<Open>> = const { RefCell::new(None) };
+        /// The alert on screen, while one is. Boxed: inline it was 240 bytes of every thread's
+        /// thread-local template (`tests/thread_local_template.rs`).
+        static OPEN: RefCell<Option<Box<Open>>> = const { RefCell::new(None) };
     }
 
     /// Start a press: its read's snapshot is [`Snapshot::Reading`] until [`deliver`] brings it.
@@ -1082,7 +1161,7 @@ mod macos {
                 );
             }
             let _opened = accept.as_ref().map(|accept| {
-                OPEN.set(Some(Open {
+                OPEN.set(Some(Box::new(Open {
                     press,
                     held: held.clone(),
                     number: number_field.clone_retained(),
@@ -1098,7 +1177,7 @@ mod macos {
                     line_height: Cell::new(LINE_MIN),
                     rename: accept.clone_retained(),
                     authorize: authorize.clone_retained(),
-                }));
+                })));
                 Opened
             });
             refresh();

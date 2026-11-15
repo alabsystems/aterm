@@ -238,3 +238,49 @@ fn named_and_known_candidates_share_the_actual_final_url_budget() {
         assert_eq!(reached, expected, "known={known_count}, names={name_count}");
     }
 }
+
+/// The names a plan hands its resolver are counted for the pass its thread works for
+/// (`names_resolved`), through the production [`Plan::finish`] and a resolver that counts what
+/// it was handed: the two agree, and a plan with no name, or with too little time to resolve
+/// one, hands none and counts none.
+///
+/// Negative control: delete the `add_n(Count::NamesResolved, ..)` in `Plan::finish`
+/// (`names_resolved` reads 0, the resolver was handed 15).
+#[test]
+fn the_names_a_pass_resolves_are_counted_as_its_resolver_is_handed_them() {
+    use crate::pass_counts::{Count, PassCounts, metered};
+    const PRIMARY: &str = "http://primary.local:7484/v1/alab";
+    let counts = Arc::new(PassCounts::default());
+    let _metered = metered(&counts);
+    let handed = AtomicUsize::new(0);
+    let plan = |names: Vec<String>, memory: &AtomicUsize| {
+        Plan::new(
+            "alab",
+            PRIMARY,
+            &["http://default.local:7484/v1/alab"],
+            &[],
+            &[],
+            Pool::Names(names),
+            Cursor {
+                memory,
+                saved: None,
+            },
+        )
+    };
+    let resolve = |selected: &[String], _: Duration| {
+        handed.fetch_add(selected.len(), Ordering::Relaxed);
+        Vec::new()
+    };
+    let memory = AtomicUsize::new(0);
+    let names: Vec<_> = (0..35).map(|n| format!("node-{n:02}")).collect();
+    // One default address leaves 15 of the 16 candidates to the names heard.
+    plan(names.clone(), &memory).finish("alab", PRIMARY, Duration::from_secs(1), resolve);
+    assert_eq!(handed.load(Ordering::Relaxed), MAX_CANDIDATES - 1);
+    assert_eq!(counts.get(Count::NamesResolved), 15);
+    // Too little time to resolve a name: none is handed over and none is counted.
+    plan(names, &memory).finish("alab", PRIMARY, Duration::from_millis(39), resolve);
+    // No name heard.
+    plan(Vec::new(), &memory).finish("alab", PRIMARY, Duration::from_secs(1), resolve);
+    assert_eq!(handed.load(Ordering::Relaxed), 15);
+    assert_eq!(counts.get(Count::NamesResolved), 15);
+}

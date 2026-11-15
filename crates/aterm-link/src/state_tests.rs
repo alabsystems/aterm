@@ -430,7 +430,7 @@ fn every_file_the_state_directory_holds_is_the_owners_alone() {
     st.set_seen_off("s-x", 9).expect("seen");
     st.set_halt_acked(4).expect("halt-acked");
     st.set_inbox_owed("n-a", 5).expect("inbox-owed");
-    st.set_self_acked(&std::collections::BTreeSet::from([1, 2]), 0, 8)
+    st.set_self_acked(&std::collections::BTreeSet::from([1, 2]), 0, 8, None)
         .expect("acked");
     st.append_self_acked(None, &[3]).expect("acked, appended");
     st.raise_logfloor(11).expect("logfloor");
@@ -531,7 +531,7 @@ fn the_self_acked_set_is_a_set_and_is_bounded() {
     let mut set = std::collections::BTreeSet::new();
     for off in [10u64, 30, 20] {
         set.insert(off);
-        st.set_self_acked(&set, 0, 3).expect("write");
+        st.set_self_acked(&set, 0, 3, None).expect("write");
     }
     assert_eq!(st.self_acked(), [10, 20, 30].into_iter().collect());
     assert_eq!(st.halt_acked(), None);
@@ -541,7 +541,7 @@ fn the_self_acked_set_is_a_set_and_is_bounded() {
     st.set_halt_acked(92).expect("write");
     assert_eq!(st.halt_acked(), Some(92));
     set.insert(40);
-    st.set_self_acked(&set, 0, 3).expect("write");
+    st.set_self_acked(&set, 0, 3, None).expect("write");
     assert_eq!(
         st.self_acked(),
         [20, 30, 40].into_iter().collect(),
@@ -1968,6 +1968,7 @@ fn the_acked_log_is_appended_reads_an_older_file_and_never_takes_a_torn_tail() {
         AckedLog {
             offsets: set(&[5, 7, 9]),
             floor: Some(0),
+            log: None,
             entries: 4,
             appendable: true,
         }
@@ -1981,6 +1982,7 @@ fn the_acked_log_is_appended_reads_an_older_file_and_never_takes_a_torn_tail() {
         AckedLog {
             offsets: set(&[1, 2, 3]),
             floor: None,
+            log: None,
             entries: 3,
             appendable: false,
         },
@@ -1991,6 +1993,7 @@ fn the_acked_log_is_appended_reads_an_older_file_and_never_takes_a_torn_tail() {
         AckedLog {
             offsets: set(&[5, 7]),
             floor: None,
+            log: None,
             entries: 2,
             appendable: false,
         },
@@ -2002,12 +2005,13 @@ fn the_acked_log_is_appended_reads_an_older_file_and_never_takes_a_torn_tail() {
         AckedLog {
             offsets: set(&[4, 5]),
             floor: Some(3),
+            log: None,
             entries: 2,
             appendable: true,
         },
         "the floor entry is no offset and no entry"
     );
-    st.set_self_acked(&set(&[20, 30, 40]), 10, 2).unwrap();
+    st.set_self_acked(&set(&[20, 30, 40]), 10, 2, None).unwrap();
     let text = std::fs::read_to_string(dir.join("acked")).unwrap();
     assert_eq!(
         text, "floor=30,30,40,",
@@ -2024,6 +2028,26 @@ fn the_acked_log_is_appended_reads_an_older_file_and_never_takes_a_torn_tail() {
         "an older bridge reads the same set"
     );
     assert!(st.self_acked_log().appendable);
+    let bound = astream_broker::LogIdentity {
+        id: [7; 16],
+        generation: 3,
+    };
+    st.set_self_acked(&set(&[50]), 50, 8, Some(bound)).unwrap();
+    let text = std::fs::read_to_string(dir.join("acked")).unwrap();
+    assert_eq!(
+        text,
+        format!("log={bound},floor=50,50,"),
+        "a replace names the log the window is kept on, ahead of its floor"
+    );
+    assert_eq!(st.self_acked_log().log, Some(bound));
+    for cut in 1..=text.find(',').unwrap() {
+        assert_eq!(
+            older(&text[..cut]).log,
+            None,
+            "a cut inside the log entry leaves none, never a shorter identity: {:?}",
+            &text[..cut]
+        );
+    }
     std::fs::remove_file(dir.join("acked")).unwrap();
     let elsewhere = dir.join("elsewhere");
     std::fs::write(&elsewhere, "").unwrap();
@@ -2095,7 +2119,8 @@ fn an_ack_appended_after_a_replace_lands_in_the_file_acked_names() {
             "keeps={keeps}: three appends, one open"
         );
         st.keep_acked_across_its_replace(keeps);
-        st.set_self_acked(&set(&[2, 3]), 0, 8).expect("replace");
+        st.set_self_acked(&set(&[2, 3]), 0, 8, None)
+            .expect("replace");
         let before = st.ops();
         st.append_self_acked(None, &[4])
             .expect("the append after the replace");
@@ -2118,7 +2143,7 @@ fn an_ack_appended_after_a_replace_lands_in_the_file_acked_names() {
             "floor=0,2,3,4,"
         );
 
-        st.set_self_acked(&set(&[4]), 0, 8)
+        st.set_self_acked(&set(&[4]), 0, 8, None)
             .expect("a second replace");
         let other = root.join("other-owned-file");
         const SENTINEL: &[u8] = b"the other file owns these bytes\n";
@@ -2346,7 +2371,7 @@ fn a_moved_generation_clamps_the_offsets_it_continues_and_forgets_the_rest() {
         st.set_key_pin("s-x", "high", &pin(Some(6))).unwrap();
         st.set_in_flight(&in_flight(1, 2)).unwrap();
         st.set_in_flight(&in_flight(2, 7)).unwrap();
-        st.set_self_acked(&[1, 6].into_iter().collect(), 0, 8)
+        st.set_self_acked(&[1, 6].into_iter().collect(), 0, 8, None)
             .unwrap();
     };
     let answer = |seq: u64| (seq, "/f/f/in/n-a/s-b/n-a/answer".to_string());
@@ -4433,6 +4458,41 @@ fn in_flight_entry(seq: u64) -> InFlight {
         body: b"v=1 t=5 text=hello".to_vec(),
         log: astream_broker::LogIdentity::parse(&format!("{}.3", "5a".repeat(16))),
         at: None,
+    }
+}
+
+#[test]
+fn a_clean_handoff_preserves_matching_publication_order_across_sequence_reuse() {
+    for changed in [false, true] {
+        let dir = scratch("inflight-handoff-order");
+        let st = StateDir::open(&dir).unwrap();
+        st.take_incarnation(0).unwrap();
+        let mut first = in_flight_entry(90);
+        let mut second = in_flight_entry(7);
+        second.pin.via_key = true;
+        st.set_in_flight(&first).unwrap();
+        st.set_in_flight(&second).unwrap();
+        assert_eq!(
+            st.replay_entries().unwrap(),
+            vec![(90, first.clone()), (7, second.clone())]
+        );
+        st.hand_posts_to_files().unwrap();
+        assert!(
+            !dir.join(journal::FILE).exists(),
+            "the clean handoff removed its live journal"
+        );
+        let expected = if changed {
+            first.body = b"v=1 t=5 text=a-new-publication".to_vec();
+            st.write("inflight/90", &first.render()).unwrap();
+            vec![(7, second), (90, first)]
+        } else {
+            vec![(90, first), (7, second)]
+        };
+        assert_eq!(
+            StateDir::open(&dir).unwrap().replay_entries().unwrap(),
+            expected,
+            "changed={changed}: preserve only a matching handoff entry's publication order"
+        );
     }
 }
 
@@ -6554,4 +6614,76 @@ fn the_mirrors_copies_read_back_and_the_floor_is_only_raised() {
         st.reconcile_logpin().expect("the reconcile"),
         Reconciled::SetAside(_)
     ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cached_in_flight_metadata_reads_do_not_clone_payloads() {
+    let dir = scratch("inflight-point-read");
+    let st = StateDir::open(&dir).unwrap();
+    for seq in 1..=64 {
+        let mut entry = in_flight_entry(seq);
+        entry.body = vec![b'x'; 32 * 1024];
+        st.set_in_flight(&entry).unwrap();
+    }
+    assert_eq!(
+        st.in_flight().unwrap().len(),
+        64,
+        "warm the journal index outside the allocation budget"
+    );
+    let (found, hit_allocations) = aterm_heap_count::allocations_in(|| {
+        st.in_flight_at(32, |entry| {
+            (entry.pin.seq, entry.body.len(), entry.log, entry.at)
+        })
+        .unwrap()
+    });
+    let found = found.unwrap();
+    assert_eq!(found.0, 32);
+    assert_eq!(found.1, 32 * 1024);
+    assert!(st
+        .in_flight_at(32, |entry| entry.body.iter().all(|&byte| byte == b'x'))
+        .unwrap()
+        .unwrap());
+    let (missing, miss_allocations) =
+        aterm_heap_count::allocations_in(|| st.in_flight_at(65, |entry| entry.pin.seq).unwrap());
+    assert!(missing.is_none());
+    eprintln!("cached in-flight lookup: entries=64 payload_bytes=32768 hit_allocations={hit_allocations} miss_allocations={miss_allocations}");
+    assert_eq!(
+        hit_allocations, 0,
+        "reading metadata must not copy payloads"
+    );
+    assert_eq!(miss_allocations, 0, "a cached miss has no payload to clone");
+}
+
+#[test]
+fn in_flight_point_reads_preserve_reopen_removal_and_uncertain_journal_errors() {
+    let dir = scratch("inflight-point-errors");
+    let entry = in_flight_entry(7);
+    let st = StateDir::open(&dir).unwrap();
+    st.set_in_flight(&entry).unwrap();
+    let st = StateDir::open(&dir).unwrap();
+    assert_eq!(st.in_flight_at(7, Clone::clone).unwrap(), Some(entry));
+    assert!(st.in_flight_at(8, Clone::clone).unwrap().is_none());
+    st.clear_in_flight(7).unwrap();
+    assert!(st.in_flight_at(7, Clone::clone).unwrap().is_none());
+    st.write("inflight/8", "damaged entry").unwrap();
+    let held = StateDir::open(&dir).unwrap();
+    for seq in [7, 8] {
+        assert_eq!(
+            held.in_flight_at(seq, Clone::clone).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "an uncertain legacy entry refuses both hits and misses"
+        );
+    }
+    std::fs::remove_file(dir.join("inflight/8")).unwrap();
+    assert!(held.in_flight_at(8, Clone::clone).unwrap().is_none());
+    std::fs::write(dir.join(journal::FILE), b"damaged journal").unwrap();
+    let damaged = StateDir::open(&dir).unwrap();
+    for seq in [7, 8] {
+        assert_eq!(
+            damaged.in_flight_at(seq, Clone::clone).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "a damaged journal is not an absent entry"
+        );
+    }
 }

@@ -38,6 +38,9 @@ atpkg = { workspace = true }
 # (docs/DESIGN-agh-2026-10-19.md §16); and agh's CLI, which "atpkg-publish agh" forwards to for
 # the lanes' git credential helper.
 agh = { workspace = true }
+# The verified secret store: this Mac's release ring (machine.key and machine.toml) and the signed
+# roster pair, read in place.
+aterm-secrets = { workspace = true }
 # The signer as a library: `sign`/`pubkey_b64` over the machine key, `verify_signed` for
 # an ALab release's SHA256SUMS, and (tests) `generate` + `roster_ops`.
 atpkg-keys = { workspace = true }

@@ -719,6 +719,21 @@ fn refuse_and_cancel() {
     assert_eq!(rig.state["view"], 0);
 }
 
+/// An install that meets a draft another aterm process is writing opens no view and answers
+/// once (`ERR busy drafts`): the model's Refuse out of Admitting.
+fn a_busy_draft_refuses() {
+    let mut rig = Rig::new("busy");
+    let canonical =
+        crate::native_document_host::path_to_file_uri(&std::fs::canonicalize(&rig.path).unwrap())
+            .unwrap();
+    let held = rig.app.hold_draft_lock_for_test(&canonical);
+    let admission = rig.edit_in_flight();
+    rig.app.complete_document_admission(admission).unwrap_err();
+    rig.step("the busy draft refuses", &["Refuse"]);
+    assert_eq!(rig.state["view"], 0);
+    drop(held);
+}
+
 fn cancel_after_the_view_opened() {
     let mut rig = Rig::new("cancel-open");
     let admission = rig.edit_in_flight();
@@ -1127,6 +1142,7 @@ fn refines_amacs_edit_ticket() {
     orphan_and_adopt();
     the_persons_view_never_answers();
     refuse_and_cancel();
+    a_busy_draft_refuses();
     cancel_after_the_view_opened();
     finish_waits_for_its_save();
     abort_discards_and_writes_nothing();

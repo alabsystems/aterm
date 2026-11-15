@@ -488,6 +488,7 @@ impl Query {
         match result {
             Ok(mut child) => {
                 let pid = child.child_mut().id();
+                crate::resource_observation::born(&self.binding(), pid);
                 // Retain actual child before fallible identity/watch reads.
                 self.state = State::Bound(Box::new(Bound {
                     child,
@@ -525,7 +526,8 @@ impl Query {
                     "native query target did not start: {why}"
                 )))
             }
-            Err(LaunchError::Unbound { spawned, error }) => {
+            Err(LaunchError::Unbound { mut spawned, error }) => {
+                crate::resource_observation::born(&self.binding(), spawned.child_mut().id());
                 self.state = State::Unbound(Some(spawned));
                 Err(error)
             }

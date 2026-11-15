@@ -1399,14 +1399,40 @@ fn is_password_flag(cell: &str) -> bool {
     crate::typed::secret::flag_says_str(cell).is_some()
 }
 
+/// Where `bootstrap` reads its sheets: a folder the person names, or this Mac's verified store,
+/// whose entries are read in place (no file under `~/.secrets` is opened).
+#[derive(Clone, Copy)]
+pub enum Sheets<'a> {
+    /// The CSVs (and optional email workbooks) in this folder.
+    Dir(&'a Path),
+    /// The store's entries of the same names; the store holds no workbook.
+    Store(&'a aterm_secrets::client::Paths),
+}
+
+impl Sheets<'_> {
+    /// The sheet `name`, which must be there.
+    fn csv(self, name: &str) -> Result<Zeroizing<Vec<u8>>> {
+        match self {
+            Sheets::Dir(dir) => crate::import::read_bounded(&dir.join(name)).map(Zeroizing::new),
+            Sheets::Store(paths) => aterm_secrets::client::read_in_place(paths, name)
+                .map_err(|e| Error::new(&format!("the vault entry {name}: {e}")))?
+                .map(|bytes| Zeroizing::new(bytes.as_slice().to_vec()))
+                .ok_or_else(|| Error::new(&format!("this Mac's vault holds no {name} entry"))),
+        }
+    }
+}
+
 /// Read non-flag email passwords from an optional workbook (`alab-emails.xlsx` or
-/// `AI Email Accounting.xlsx`) in `secrets_dir` (`Emails` tab, column C), so `bootstrap`
+/// `AI Email Accounting.xlsx`) in a named sheets folder (`Emails` tab, column C), so `bootstrap`
 /// populates real passwords even when `alab-emails.csv` only carries has-password flags (`1`).
 /// Returns them with the workbooks that are there and could not be read: a file that holds them
-/// and fails to open must not read as one that holds none.
+/// and fails to open must not read as one that holds none. The store holds no workbook.
 fn read_xlsx_email_passwords(
-    secrets_dir: &Path,
+    sheets: Sheets<'_>,
 ) -> (BTreeMap<String, Zeroizing<String>>, Vec<&'static str>) {
+    let Sheets::Dir(secrets_dir) = sheets else {
+        return (BTreeMap::new(), Vec::new());
+    };
     let mut out = BTreeMap::new();
     let mut unread = Vec::new();
     for filename in ["alab-emails.xlsx", "AI Email Accounting.xlsx"] {
@@ -1451,11 +1477,10 @@ fn default_webmail_url(provider: &str) -> &'static str {
 }
 
 /// Bootstrap the 4 canonical tables (`computers`, `emails`, `phones`, `ai_accounts`) from
-/// legacy CSV files in `secrets_dir` and enrich with the live fleet roster. A key the database
+/// the legacy CSV sheets of `sheets` and enrich with the live fleet roster. A key the database
 /// has already used is left alone, so running it again changes nothing: edits and deletions stand.
-pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<Value> {
-    let phones_bytes =
-        crate::import::read_bounded(&secrets_dir.join(aterm_secrets::entry_class::ALAB_PHONES))?;
+pub fn bootstrap_from_secrets(db: &mut Database, sheets: Sheets<'_>) -> Result<Value> {
+    let phones_bytes = sheets.csv(aterm_secrets::entry_class::ALAB_PHONES)?;
     let phones_records = crate::import::parse(&phones_bytes)?;
     let mut phones_map: BTreeMap<String, Map> = BTreeMap::new();
     let mut digits_to_phone: BTreeMap<String, String> = BTreeMap::new();
@@ -1486,8 +1511,7 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
         phones_map.insert(phone, obj);
     }
 
-    let comp_bytes =
-        crate::import::read_bounded(&secrets_dir.join(aterm_secrets::entry_class::ALAB_COMPUTERS))?;
+    let comp_bytes = sheets.csv(aterm_secrets::entry_class::ALAB_COMPUTERS)?;
     let comp_records = crate::import::parse(&comp_bytes)?;
     let mut roster_by_label: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
     if let Ok(paths) = aterm_secrets::client::Paths::live()
@@ -1605,10 +1629,9 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
         computers_map.insert(label, obj);
     }
 
-    let (xlsx_passwords, unread_workbooks) = read_xlsx_email_passwords(secrets_dir);
+    let (xlsx_passwords, unread_workbooks) = read_xlsx_email_passwords(sheets);
     let no_passwords = xlsx_passwords.is_empty();
-    let emails_bytes =
-        crate::import::read_bounded(&secrets_dir.join(aterm_secrets::entry_class::ALAB_EMAILS))?;
+    let emails_bytes = sheets.csv(aterm_secrets::entry_class::ALAB_EMAILS)?;
     let emails_records = crate::import::parse(&emails_bytes)?;
     let mut emails_map: BTreeMap<String, Map> = BTreeMap::new();
     for row in emails_records.iter().skip(1) {
@@ -1678,9 +1701,7 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
         emails_map.insert(email, obj);
     }
 
-    let acc_bytes = crate::import::read_bounded(
-        &secrets_dir.join(aterm_secrets::entry_class::AI_ACCOUNTS_CSV),
-    )?;
+    let acc_bytes = sheets.csv(aterm_secrets::entry_class::AI_ACCOUNTS_CSV)?;
     let acc_records = crate::import::parse(&acc_bytes)?;
     let mut ai_accounts_map: BTreeMap<String, Map> = BTreeMap::new();
     let mut comp_accounts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -2252,17 +2273,22 @@ pub(crate) fn try_run_with(
         }
         "bootstrap" => {
             if args.len() > 1 || args.first().is_some_and(|a| a.starts_with("--")) {
-                return Err(Error::new("usage: aterm db bootstrap [<secrets-dir>]"));
+                return Err(Error::new("usage: aterm db bootstrap [<sheets-dir>]"));
             }
-            let secrets_dir = if let Some(s) = args.first() {
-                PathBuf::from(s)
-            } else {
-                let home = aterm_types::dirs::home_dir()
-                    .ok_or_else(|| Error::new("HOME directory unavailable"))?;
-                home.join(".secrets")
-            };
+            // A named folder is read as it is; with none, the sheets are this Mac's store's
+            // entries, read in place.
             let mut db = open_at(&dir)?;
-            Ok(Some(bootstrap_from_secrets(&mut db, &secrets_dir)?))
+            if let Some(named) = args.first() {
+                return Ok(Some(bootstrap_from_secrets(
+                    &mut db,
+                    Sheets::Dir(Path::new(named)),
+                )?));
+            }
+            let paths = aterm_secrets::client::Paths::locate().map_err(crate::table::failure)?;
+            Ok(Some(bootstrap_from_secrets(
+                &mut db,
+                Sheets::Store(&paths),
+            )?))
         }
         "rekey" => {
             if !args.is_empty() {

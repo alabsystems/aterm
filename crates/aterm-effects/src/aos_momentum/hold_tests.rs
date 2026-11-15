@@ -287,7 +287,7 @@ fn a_hold_names_its_deadline_unlogged_and_never_at_or_before_now() {
     let mut host = attached(t0, MomentumCode::Shipped);
     host.on_key(t0 + ms(5), TAU);
     let _ = host.next_change_deadline(t0 + ms(6), LANE);
-    let (n, query) = (log(&host).len(), hosted(&host).last_query);
+    let (n, query) = (log(&host).len(), hosted(&host).live.last_query);
     let deadline = t0 + ms(1_005);
     host.aos_hold(deadline);
     assert_eq!(host.next_change_deadline(t0 + ms(10), LANE), Some(deadline));
@@ -298,7 +298,7 @@ fn a_hold_names_its_deadline_unlogged_and_never_at_or_before_now() {
         "past the deadline: a frame on, never now"
     );
     assert_eq!(log(&host).len(), n, "no query was recorded");
-    assert_eq!(hosted(&host).last_query, query);
+    assert_eq!(hosted(&host).live.last_query, query);
 }
 
 #[test]

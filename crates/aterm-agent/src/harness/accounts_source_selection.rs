@@ -17,12 +17,15 @@ pub(super) enum Scope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Selection {
     Key(String),
-    Pool(PathBuf),
+    /// The vault's pool, as this Mac's store read it when it was selected.
+    Pool(VaultSource),
+    /// The vault's fleet roster.
     VaultFleet {
-        path: PathBuf,
+        entry: VaultSource,
     },
+    /// The vault's accounting sheet.
     Sheet {
-        path: PathBuf,
+        entry: VaultSource,
     },
     Beside {
         path: PathBuf,
@@ -33,30 +36,23 @@ pub(super) enum Selection {
 
 impl Selection {
     /// Local discovery retires a slot only when it replaces an existing input.
-    /// A pool or explicit source establishes authority even before that input arrives.
-    pub(super) fn retires_legacy(&self, home: Option<&Path>, config: Option<&Path>) -> bool {
+    /// A pool or explicit source establishes authority even before that input arrives, and a
+    /// sheet that gives this machine rows replaces the vault's fleet as its list.
+    pub(super) fn retires_legacy(&self, config: Option<&Path>) -> bool {
         match self {
             Self::Pool(_) | Self::Key(_) => true,
-            Self::Sheet { path } => sheet_names_this_machine(config, path),
-            Self::Beside { path, opt_in } => {
-                opt_in.is_some_and(OptIn::opts_in_by_file)
-                    && home.is_some_and(|home| {
-                        let legacy = home.join(".secrets").join(FLEET_ROSTER_FILE);
-                        own_secrets_copy(home, &legacy, path)
-                            || superseded_secrets_copy(home, &legacy, path)
-                    })
-            }
-            Self::VaultFleet { .. } | Self::Absent => false,
+            Self::Sheet { entry } => sheet_names_this_machine(config, entry),
+            Self::VaultFleet { .. } | Self::Beside { .. } | Self::Absent => false,
         }
     }
 
     pub(super) fn source(&self) -> Option<String> {
         match self {
             Self::Key(source) => Some(source.clone()),
-            Self::Pool(path)
-            | Self::VaultFleet { path, .. }
-            | Self::Sheet { path, .. }
-            | Self::Beside { path, .. } => Some(path.to_string_lossy().into_owned()),
+            Self::Pool(entry) | Self::VaultFleet { entry } | Self::Sheet { entry } => {
+                Some(entry.source())
+            }
+            Self::Beside { path, .. } => Some(path.to_string_lossy().into_owned()),
             Self::Absent => None,
         }
     }
@@ -64,8 +60,8 @@ impl Selection {
     pub(super) fn origin(&self) -> FleetOrigin {
         match self {
             Self::Key(source) => FleetOrigin::Key(source.clone()),
-            Self::Pool(path) | Self::Sheet { path, .. } | Self::VaultFleet { path } => {
-                FleetOrigin::Vault(path.clone())
+            Self::Pool(entry) | Self::Sheet { entry } | Self::VaultFleet { entry } => {
+                FleetOrigin::Vault(entry.name.clone())
             }
             Self::Beside { path, opt_in } => FleetOrigin::Local {
                 files: vec![path.clone()],
@@ -85,7 +81,9 @@ impl Selection {
 
 /// A present but unusable selected entry stays selected, so its read reports the failure.
 /// A configured key disables the default pool even when a named beside file outranks the
-/// key. Explicit requests are resolved by the caller, before this automatic policy.
+/// key. Explicit requests are resolved by the caller, before this automatic policy. The vault's
+/// pool, fleet and sheet are read from one version of the vault ([`vault_sources`]), and an
+/// entry this Mac cannot read holds its place: it never lets a lower source stand in for it.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -108,60 +106,22 @@ fn select_inner(
     if !named && let Some(key) = &key {
         return Selection::Key(key.clone());
     }
-    let secrets = home.map(|home| home.join(".secrets"));
+    let [pool, fleet, sheet] = vault_sources(home);
     if key.is_none()
-        && let Some(pool) = secrets
-            .as_ref()
-            .map(|dir| dir.join(super::super::ai_pool::AI_POOL_FILE))
-            .filter(|path| pool_entry_present(path))
+        && let Some(pool) = pool.filter(VaultSource::occupies)
     {
         return Selection::Pool(pool);
     }
     if scope == Scope::Init {
-        let sheet = secrets
-            .as_ref()
-            .map(|dir| dir.join(ACCOUNTS_CSV_FILE))
-            .filter(|path| sheet_read_here() && source_entry_present(path));
-        if let Some((home, vault)) = home
-            .zip(
-                secrets
-                    .as_ref()
-                    .map(|dir| dir.join(FLEET_ROSTER_FILE))
-                    .filter(|path| source_entry_present(path)),
-            )
-            .filter(|(home, vault)| {
-                !retired
-                    && !beside
-                        .as_deref()
-                        .is_some_and(|beside| superseded_secrets_copy(home, vault, beside))
-            })
-        {
-            let own = beside
-                .as_deref()
-                .is_some_and(|beside| own_secrets_copy(home, &vault, beside));
-            if own
-                && let Some(sheet) = &sheet
-                && sheet_names_this_machine(config, sheet)
-            {
-                return Selection::Sheet {
-                    path: sheet.clone(),
-                };
-            }
-            if own
-                && named
-                && let Some(path) = &beside
-            {
-                // Retire an equal legacy copy before discovery extends the
-                // projection, independently of filesystem timestamp precision.
-                return Selection::Beside {
-                    path: path.clone(),
-                    opt_in: beside_opt_in,
-                };
-            }
-            return Selection::VaultFleet { path: vault };
+        if !retired && let Some(entry) = fleet.filter(VaultSource::occupies) {
+            return Selection::VaultFleet { entry };
         }
-        if let Some(path) = sheet.filter(|path| !named || sheet_names_this_machine(config, path)) {
-            return Selection::Sheet { path };
+        if let Some(entry) = sheet.filter(|sheet| {
+            sheet_read_here()
+                && sheet.occupies()
+                && (!named || sheet_names_this_machine(config, sheet))
+        }) {
+            return Selection::Sheet { entry };
         }
     }
     if let Some(path) =
@@ -175,6 +135,26 @@ fn select_inner(
     Selection::Absent
 }
 
+/// The vault's pool, fleet roster and accounting sheet under `home`, read from one version of
+/// the vault ([`crate::vault_entry::read_set`]); none without a home.
+pub(super) fn vault_sources(home: Option<&Path>) -> [Option<VaultSource>; 3] {
+    let names = [
+        super::super::ai_pool::AI_POOL_FILE,
+        FLEET_ROSTER_FILE,
+        ACCOUNTS_CSV_FILE,
+    ];
+    let Some(home) = home else {
+        return [None, None, None];
+    };
+    let mut reads = crate::vault_entry::read_set(home, &names, SOURCE_TEXT_MAX_BYTES).into_iter();
+    names.map(|name| {
+        Some(VaultSource {
+            name: name.to_owned(),
+            read: reads.next()?,
+        })
+    })
+}
+
 pub(super) fn select_for(
     store: &accounts::Store,
     home: Option<&Path>,
@@ -185,6 +165,8 @@ pub(super) fn select_for(
     select_observed(home, config, roster, scope, &store.source_policy()?)
 }
 
+/// [`select_inner`] under the retained source `policy`: a retired vault fleet is never
+/// selected, which no path can alias, since the vault's entries are read only by name.
 pub(super) fn select_observed(
     home: Option<&Path>,
     config: Option<&Path>,
@@ -193,36 +175,10 @@ pub(super) fn select_observed(
     policy: &accounts::source_policy::Snapshot,
 ) -> Result<Selection, String> {
     let selected = select_inner(home, config, roster, scope, policy.retired());
-    if (policy.retired() || selected.retires_legacy(home, config))
+    if let Selection::Key(source) = &selected
         && let Some(home) = home
     {
-        let path = match &selected {
-            Selection::Pool(path)
-            | Selection::VaultFleet { path, .. }
-            | Selection::Sheet { path }
-            | Selection::Beside { path, .. } => Some(path.clone()),
-            Selection::Key(source)
-                if !source.starts_with("http://") && !source.starts_with("https://") =>
-            {
-                let path = if let Some(relative) = source.strip_prefix("~/") {
-                    source_path(home, Path::new(relative))?
-                } else {
-                    let base = config.and_then(Path::parent).unwrap_or(home);
-                    let base = std::path::absolute(base).map_err(|why| why.to_string())?;
-                    source_path(&base, Path::new(source))?
-                };
-                Some(path)
-            }
-            _ => None,
-        };
-        if let Some(path) = path
-            && accounts::source_policy::aliases(
-                &path,
-                &home.join(".secrets").join(FLEET_ROSTER_FILE),
-            )?
-        {
-            return Err("retired legacy source cannot be selected through another path".into());
-        }
+        refuse_backup_source(home, config, source)?;
     }
     Ok(selected)
 }

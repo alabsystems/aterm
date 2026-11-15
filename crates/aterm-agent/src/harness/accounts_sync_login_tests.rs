@@ -1313,7 +1313,7 @@ pub(super) fn upkeep_effects<'a>(
         mailbox: &ladder_mailbox_files,
         log: Arc::new(|_: &str| {}),
         run_attempt: None,
-        save_oauth: |_, _| Ok("inert".into()),
+        tokens_here: |_, _, _, _| None,
         shared: shared_renewal::Effects::default(),
     }
 }
@@ -1738,23 +1738,25 @@ fn a_label_the_fleet_gives_another_account_takes_none_of_the_default_logins_reco
     assert!(displaced(&store).is_empty(), "{:?}", displaced(&store));
 }
 
-/// A window's upkeep over a fleet a vault delivered (`~/.secrets/fleet-accounts.toml`, rows of
+/// A window's upkeep over a fleet a vault delivered (the store's `fleet-accounts.toml`, rows of
 /// several machines): an account found in this machine's transcripts is not added to it, and
-/// the vault's file is left as it was; a default login it does not list is still the default
+/// the vault's entry is left as it was; a default login it does not list is still the default
 /// row of this machine's roster alone.
 #[test]
 fn a_fleet_a_vault_delivered_is_never_added_to() {
     let desk = Desk::new("m27");
     desk.default_login("sol-m27@example.test");
-    let secrets = desk.home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
     let vault = concat!(
         "[[account]]\nlabel = \"m27\"\nmachines = [\"m27\"]\nemail = \"sol-m27@example.test\"\n\n",
         "[[account]]\nlabel = \"m27-2\"\nmachines = [\"m27\"]\nemail = \"sun.m27.2@example.test\"\n\n",
         "[[account]]\nlabel = \"m28\"\nmachines = [\"m28\"]\nemail = \"m28@example.test\"\n",
     );
-    let vault_path = secrets.join(FLEET_ROSTER_FILE);
-    fs::write(&vault_path, vault).unwrap();
+    crate::vault_entry::seed(&desk.home, &[(FLEET_ROSTER_FILE, vault.as_bytes())]);
+    let delivered = || {
+        crate::vault_entry::read_text(&desk.home, FLEET_ROSTER_FILE, SOURCE_TEXT_MAX_BYTES)
+            .text()
+            .map(str::to_owned)
+    };
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("vault fleet");
     assert_eq!(desk.rows().rows.len(), 2);
 
@@ -1772,7 +1774,7 @@ fn a_fleet_a_vault_delivered_is_never_added_to() {
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let fx = upkeep_effects(&fetch, &spawn, &cooldown, &rediscovery, &guard);
     sync_pass(&desk, &fx, NOW + 60);
-    assert_eq!(fs::read_to_string(&vault_path).unwrap(), vault);
+    assert_eq!(delivered().as_deref(), Some(vault));
     assert!(
         !fs::read_to_string(desk.fleet_file())
             .unwrap()
@@ -1791,7 +1793,7 @@ fn a_fleet_a_vault_delivered_is_never_added_to() {
     let own = roster.row_for_login(None).unwrap();
     assert_eq!(own.email.as_deref(), Some("visitor@example.test"));
     assert_eq!(own.label, "m27-3");
-    assert_eq!(fs::read_to_string(&vault_path).unwrap(), vault);
+    assert_eq!(delivered().as_deref(), Some(vault));
     assert_eq!(displaced(&desk.store()).len(), 1);
 }
 

@@ -243,12 +243,7 @@ fn a_seatless_recipient_asks_once_and_takes_a_seat_with_the_same_key() {
         "the envelope let s in with no seat"
     );
     let recipient = read_identity(s).unwrap().unwrap().recipient();
-    let held = [
-        s.source_file(),
-        s.state_file(),
-        s.identity_file(),
-        s.home.join(".secrets/shared"),
-    ];
+    let held = [s.source_file(), s.state_file(), s.identity_file()];
     let before_files = held.each_ref().map(|path| std::fs::read(path).unwrap());
     let before = log_of(m22);
     assert!(before.wraps_maximal_audience_to(&EpochAudience::Everyone, &recipient));
@@ -270,6 +265,10 @@ fn a_seatless_recipient_asks_once_and_takes_a_seat_with_the_same_key() {
     assert_eq!(
         held.each_ref().map(|path| std::fs::read(path).unwrap()),
         before_files
+    );
+    assert_eq!(
+        crate::client::stored(s, "shared").as_deref(),
+        Some(b"everyone-v1".as_slice())
     );
     assert_eq!(
         read_identity(s).unwrap().unwrap().recipient(),
@@ -368,7 +367,6 @@ fn a_seat_proof_rechecks_stop_before_merging_without_rewriting_the_existing_vaul
         s.source_file(),
         s.state_file(),
         s.identity_file(),
-        s.home.join(".secrets/shared"),
     ];
     let before = held.each_ref().map(|path| std::fs::read(path).unwrap());
     let stopped = AtomicBool::new(false);
@@ -405,6 +403,10 @@ fn a_seat_proof_rechecks_stop_before_merging_without_rewriting_the_existing_vaul
     assert_eq!(
         held.each_ref().map(|path| std::fs::read(path).unwrap()),
         before
+    );
+    assert_eq!(
+        crate::client::stored(s, "shared").as_deref(),
+        Some(b"everyone-v1".as_slice())
     );
     drop(ask);
     world.macs.server.stop();
@@ -806,9 +808,6 @@ fn a_persons_allow_seats_a_seatless_recipient_off_the_lan() {
         source,
         "its configuration is kept"
     );
-    assert_eq!(
-        std::fs::read(s.home.join(".secrets/shared")).unwrap(),
-        b"everyone-v1"
-    );
+    assert_eq!(crate::client::stored(&s, "shared").unwrap(), b"everyone-v1");
     world.macs.server.stop();
 }

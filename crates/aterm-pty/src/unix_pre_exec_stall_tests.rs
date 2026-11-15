@@ -10,11 +10,15 @@ std::thread_local! {
 /// Stall the child of each spawn this thread makes by `ms` before its exec (0: none).
 pub(crate) fn set(ms: u64) {
     MS.with(|m| m.set(ms));
+    // A Linux spawn's child is a clone that stalls itself by its spawning thread's word.
+    #[cfg(target_os = "linux")]
+    aterm_uds::spawnfd::terminal::stall_children(u32::try_from(ms).unwrap_or(u32::MAX));
 }
 
 /// In the child, between fork and exec: a const thread-local read (the
 /// child's one thread is the copy of the thread that forked it, so it
 /// reads that thread's value, with no allocation or lock) and `nanosleep`.
+#[cfg(not(target_os = "linux"))]
 pub(super) fn in_child() {
     let ms = MS.with(Cell::get);
     if ms == 0 {

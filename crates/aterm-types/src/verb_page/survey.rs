@@ -97,7 +97,8 @@ pub(crate) const PAGE: Page = Page {
                      <n>`, an `instance pid= host=<pct> \
                      version= sessions=<n> level=<facts|content> cut=<n> at_ms=<unix ms> \
                      node=<32 hex|-> instances=<n> label=<pct|-> window=<0|1> window_last=<unix \
-                     s|-> ssh_host_key=<pct|-> accounts=<n> accounts_unread=<cli>[,…]|-> \
+                     s|-> ssh_host_key=<pct|-> home_free_mb=<MiB|-> accounts=<n> \
+                     accounts_unread=<cli>[,…]|-> \
                      moves_7d=<n|-> move_tries_7d=<n|-> last_move=<unix s|-> roster_unread=<0|1> \
                      [update=<word> update_at=<unix s|-> update_to=<version|build n|-> \
                      update_until=<unix s|-> update_why=<word|-> update_tries=<n|-> \
@@ -115,10 +116,12 @@ pub(crate) const PAGE: Page = Page {
                      the updater's own text, and none at all from an aterm older than these \
                      words; `access=`: this machine's \
                      fleet access, what a driver may do here, `aterm fleet access`; `drive=1`: a \
-                     fleet reader this machine lets drive it, as far as `access=` admits; at \
-                     `content`, `home= home_free_mb= repos= repos_at= repos_cut=` before \
+                     fleet reader this machine lets drive it, as far as `access=` admits; \
+                     `home_free_mb=`: the free space on its home's volume, followed by the \
+                     machine's look, below; at \
+                     `content`, `home= repos= repos_at= repos_cut=` before \
                      `accounts=`: the \
-                     home, its volume's free space, and how many checkouts the last read of it \
+                     home, and how many checkouts the last read of it \
                      found, when, and how many it left out; `roster_unread=1` where this Mac's \
                      label could not be read), one `session` row per \
                      session, then one `account` row per row of each pooled CLI's pool as `aterm \
@@ -126,6 +129,42 @@ pub(crate) const PAGE: Page = Page {
                      `accounts_unread=` names each pool that could not be read, whose rows are \
                      unknown; `moves_7d=` and `last_move=` are the rotations a session proved on \
                      its ledgers, `move_tries_7d=` those it tried, `-` where it cannot say).",
+                ),
+                para(
+                    "The machine's look follows `home_free_mb=` on every header, at `facts` as \
+                     at `content`: `os=<macos|linux|windows|-> target=<triple|-> m_at_ms=<unix \
+                     ms|-> cores= load1_x100= load5_x100= load15_x100= cpu_busy_x100= \
+                     rate_win_ms= mem_total_mb= mem_used_mb= mem_avail_mb= \
+                     mem_pressure=<normal|warn|critical|-> mem_psi60_x100= swap_used_mb= \
+                     swap_total_mb= home_total_mb= gpu_cores= gpu_busy_pct= net_link_kbps= \
+                     net_rx_kbps= net_tx_kbps= net_other_kbps= up_since_ms=<unix ms|-> \
+                     cpu_lim=<0|1|-> mem_lim= disk_lim= gpu_lim= load=<level>:<over|->|-`. Each \
+                     figure is a whole number \
+                     in the unit its key names, capacity beside use, and `-` where the machine \
+                     did not read it: none is 0 for unread, and a header with none of them is an \
+                     aterm before the look. `m_at_ms`: when the look was taken, on its own clock \
+                     (one look is kept 10 s); `target`: the triple its packages are built for; \
+                     `cpu_busy_x100`: cores busy times 100, and `net_rx_kbps`, `net_tx_kbps`: \
+                     its fastest link's traffic against that link's rate `net_link_kbps` (with \
+                     no link rate, every link's), each the mean over the `rate_win_ms` before \
+                     the look (45 to 90 s; `-` where no survey read this machine in that time); \
+                     `net_other_kbps`: its other links' traffic; `mem_psi60_x100`: on Linux, the \
+                     share of the last minute some task stalled on memory, times 100; \
+                     `home_total_mb`: the size of the volume `home_free_mb` is free on; \
+                     `up_since_ms`: the later of its boot and its last wake. The four `_lim` \
+                     words are the machine's own verdicts that a resource is at its limit: the \
+                     CPU with its 1-minute load over its cores and 95% of them busy, memory \
+                     under pressure (`warn` or `critical`; on Linux a tenth of the last minute \
+                     stalled with under a tenth of memory available), the home's volume below \
+                     the free space aterm starts reclaiming at, the GPU 95% busy; `-` where an \
+                     input was unread. `load` is the system-load score its own Stats Deck dial \
+                     reads, in hundredths: the level (the busier of its CPU and GPU over the rate \
+                     window, lifted by memory pressure) and how far past capacity (0 within it; \
+                     from 12 for work waiting on busy cores, swapping or critical pressure), `-` \
+                     where its CPU's busy share is unread, and the over `-` where its load \
+                     average, its swap traffic or (with neither over) its memory pressure is. A \
+                     node service answering for a window \
+                     older than the look adds its own.",
                 ),
                 para(
                     "`account pool=<cli> id=<pct> email=<pct|-> condition=<word> enrolled=<0|1> \
@@ -177,12 +216,62 @@ pub(crate) const PAGE: Page = Page {
                      task_ms=<ms|-> task_conclusion=<finished|failed|-> model=<pct|-> \
                      effort=<pct|-> ctx_left_pct=<n|-> usage_5h_pct=<n|-> usage_7d_pct=<n|-> \
                      account=<pct|-> auth=<stored|token|outside|-> token=<ac key|-> \
+                     upgrade=<-|<state>/<to>/<why>/<age>> \
                      detail=<pct|-> doing=<pct|-> role=<pct|-> supervisor=<pct|-> \
                      attention=<1|pct|-> goal=<1|pct|-> needs=<word|-> \
                      needs_by=<program|harness|-> hold_by=<word|-> held_from=<32 hex|-> \
                      typed_by=<pct|-> typed_ms=<ms|-> request=<id|-> request_from=<pct|-> \
                      request_why=<1|pct|-> bells=<n> bells_sounded=<n> \
-                     last_bell=<ms>/<sound>/<program|->[,…]|->`.",
+                     last_bell=<ms>/<sound>/<program|->[,…]|-> turn=<1|0|-> turn_ms=<ms|-> \
+                     turn_end_ms=<ms|-> step_ms=<ms|-> out_ms=<ms|-> \
+                     out_src=<transcript|screen|-> tok_in=<n|-> tok_out=<n|-> \
+                     tok_for_ms=<ms|-> turns=<n|-> tools=<n|-> pinned=<0|1>`.",
+                ),
+                para(
+                    "A row is read at its header's `at_ms=`, but for one the node service of a \
+                     Mac with several windows sent under a header of another time (the first \
+                     window's, or the machine's look, where that is later): that row ends with \
+                     its own window's `at_ms=<unix ms|->`, when its ages and counters were read \
+                     (`-` where that window's clock was unread).",
+                ),
+                para(
+                    "`turn=` says whether the session log holds a turn open, `turn_ms=` how long \
+                     ago it opened, `turn_end_ms=` how long ago the newest closed turn closed and \
+                     `step_ms=` how long ago the agent's open step (a tool call, an approval or a \
+                     question) opened. `out_ms=` is the age of the agent's last output: for Claude \
+                     Code and codex-alab (`out_src=transcript`) the newest of the API's last served \
+                     row, its newest text row and its newest step, which a spinner never moves; \
+                     for every other harness, or a transcript with no time yet, the screen's last \
+                     move (`out_src=screen`). `tok_in=` and `tok_out=` are the conversation's \
+                     cumulative tokens, sent only while they are the whole conversation's (Claude \
+                     Code's once its usage read reached every file, its subagents' included; \
+                     codex-alab's rollout's own running total), and `tok_for_ms=` how long they \
+                     have counted that conversation unbroken (`-` where it started with the \
+                     clock unread): a new or resumed conversation, a restart or a read that is \
+                     not whole starts it again, so take a rate only between two rows inside it. \
+                     `turns=` counts the turns the session opened and `tools=` the tool steps \
+                     of this run, the agent run in front, which a new run counts from 0 (`-` \
+                     for a harness with no transcript, where no agent run is open, while this \
+                     run's transcript join binds no file or its reader stopped, and for the \
+                     rest of this run once its join loses a row, as its count is then short). \
+                     A row no agent reads \
+                     says `-` for each; an older aterm sends none of them.",
+                ),
+                para(
+                    "`pinned=1` marks a session a person or a lead agent pinned (`aterm ctl \
+                     @<sid> pin`), which the fleet band shows first among its Mac's agents; a \
+                     worker it spawns says `0`. An older aterm sends no `pinned=`, which reads as \
+                     unread, not as unpinned.",
+                ),
+                para(
+                    "`upgrade=` is the harness upgrade word `aterm ctl @<sid> status` prints for \
+                     the tab, `<state>/<to>/<why>/<age>` (`pending/2.1.325/account/2h`: the \
+                     session has been behind 2.1.325 for two hours and its move now waits on its \
+                     account; `<age>` is how long the session has been behind in every state but \
+                     `done`), `done/<to>/-/<age>` for ten minutes after a move lands (`<age>` \
+                     since it landed), `-` where the host sent no row, at `facts` and `content` \
+                     alike; a row from an aterm too old to say has no field, which a reader takes \
+                     as unknown, never as current.",
                 ),
                 para(
                     "`request=` names the request that owns the tab (another Mac's drive, or an \
@@ -272,7 +361,10 @@ pub(crate) const PAGE: Page = Page {
                      reads; then, where they apply, `attention`, `task=<state>/<rev>`, `bg=<n>` \
                      (its background processes), `bells=<n> (…)`, `ctx_left=<n>%`, `5h_left=<n>%` \
                      and `7d_left=<n>%` (what is left of the plan's windows: 100 − the row's \
-                     `usage_5h_pct=` and `usage_7d_pct=`, which keep the use), `human=<age>` and `typed by <who> <age> \
+                     `usage_5h_pct=` and `usage_7d_pct=`, which keep the use), \
+                     `upgrade=<state>/<to>/<why>/<age>` while a harness upgrade is pending (any \
+                     state but `done`), \
+                     `human=<age>` and `typed by <who> <age> \
                      ago` within 15 minutes (another Mac's drive until a person types after it), \
                      and `| <title> | <folder> <branch> | <model>`.",
                 ),
@@ -281,6 +373,18 @@ pub(crate) const PAGE: Page = Page {
                      typed to it), `said:` (its agent's last words) and `work:` (`<branch> · <n> \
                      files · <n> behind <main> · <age> ago`). `--budget` folds what does not fit \
                      into `+<n>` counts; `--sid <s-…>` shows one session whole.",
+                ),
+                para(
+                    "A `--fleet` digest leads, under the `#` line, with `upgrades held (stalled \
+                     or 2 h+ behind): <n> sessions on <m> Macs (<wait> <n>, …)` counting the \
+                     sessions whose upgrade word reads `stalled` (the harness's own word for a \
+                     move refused, failed, held back, stuck, unwatched or overdue), or reads \
+                     `pending`, `announced` or `held` with the session behind two hours or more \
+                     (past the ladder's last rung), grouped by its wait word; a person's \
+                     `deferred` or `skipped` and a `restarting` move are never counted. It adds `unknown on <k> Macs (an aterm before the \
+                     field)` where an agent's row says nothing of its upgrade, and is kept only \
+                     where every block still shows with it; a current fleet's digest has no such \
+                     line.",
                 ),
             ],
         },

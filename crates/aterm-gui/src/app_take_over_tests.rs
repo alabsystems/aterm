@@ -1749,3 +1749,245 @@ fn the_cards_go_to_manager_row_raises_the_manager() {
         "the manager's tab is in front"
     );
 }
+
+/// The task tracker package ST-02's spawns give: a blank first line, the line, then more.
+const TASK_TEXT: &[u8] = b"\n  Fix the flaky title test\nthen run verify\n";
+
+/// [`TASK_TEXT`]'s first line that draws something.
+const TASK_LINE: &str = "Fix the flaky title test";
+
+/// Give `session` a worker's task record whose agent is Claude Code and whose first line is the
+/// one `task` gives (none for `None`), as a spawn does.
+fn tasked(app: &mut App, session: u64, task: Option<&[u8]>) {
+    use crate::task_record::{FROM_CTL, TaskMark, TaskState, mark_session_task, task_line};
+    let ctx = app.pool.get(session).expect("pooled").ctx.clone();
+    let mut mark = TaskMark::new(TaskState::Working);
+    mark.from = Some(FROM_CTL.to_owned());
+    mark_session_task(&ctx, session, &mark).expect("unfenced");
+    {
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.set_task_worker(aterm_phase::Program::Claude, None);
+        timeline.set_task_line(task.and_then(task_line));
+    }
+    app.on_task_changed(session);
+}
+
+/// Feed `bytes` to `session`'s terminal, as its program writes them.
+fn typed(app: &App, session: u64, bytes: &[u8]) {
+    let term = app.pool.get(session).expect("pooled").term.clone();
+    crate::term_lock(&term).process(bytes);
+}
+
+/// `session`'s label on the strip of window 0.
+fn strip_title(app: &mut App, session: u64) -> String {
+    let at = app.tab_position_of_session(session).expect("on the strip") - 1;
+    app.tab_titles(WindowId(0))[at].clone()
+}
+
+/// Forget what the strip last read of `session`, so only the drift path can write it again.
+fn forget_strip_reads(app: &mut App, session: u64) {
+    let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+    ws.tab_title_cache.remove(&session);
+    ws.tab_chrome_titles.remove(&session);
+    ws.tab_title_epochs.remove(&session);
+}
+
+/// The drift path resolves `session`'s label to `shown`, the strip's: once the strip has read
+/// the tab through it, the shell titles its next prompt by another folder, a new title epoch
+/// whose shell title would change the label, and the drift path, resolving `shown` again,
+/// reads the strip no more. A drift path that resolved the shell's title would read it again.
+fn assert_drift_keeps(app: &mut App, session: u64, shown: &str) {
+    forget_strip_reads(app, session);
+    app.flush_title_drift(session, Instant::now());
+    assert_eq!(strip_title(app, session), shown, "the strip's label");
+    typed(
+        app,
+        session,
+        &crate::app_workers_tests::prompt_in("~/other"),
+    );
+    let _ = crate::work_counts::take_title_refresh();
+    app.flush_title_drift(session, Instant::now());
+    assert_eq!(
+        crate::work_counts::take_title_refresh().reads,
+        0,
+        "the drift path resolves {shown:?} as the strip does, so the strip is not read again"
+    );
+    assert_eq!(strip_title(app, session), shown, "and the strip keeps it");
+}
+
+/// A SESSION WITH A TASK IS TITLED BY ITS FIRST LINE BEFORE ITS FOLDER (tracker ST-02,
+/// `docs/DESIGN-streams-2026-11-12.md` §3, §6). At a prompt every shell aterm integrates titles
+/// its tab by its folder, so the 11 parked tabs of m11 on 2026-11-12 each read `↳ ~/aterm`, and a
+/// parked worker whose agent had left read its agent's name. A session whose record carries its
+/// task's first line is named by that line, on the strip, through the drift path that keeps a
+/// busy terminal's title, on every Agents row, and while its terminal is busy. CONTROLS: the
+/// agent's own terminal title still comes first, a tab with no task still reads its folder, and
+/// a worker whose record has no line still reads its agent's name.
+#[test]
+fn a_session_with_a_task_is_titled_by_its_first_line_before_its_folder() {
+    let mut app = App::headless_for_test();
+    let kept = crate::app_workers_tests::person_tab(&mut app);
+    let parked = crate::app_workers_tests::land_worker(&mut app);
+    let bare = crate::app_workers_tests::land_worker(&mut app);
+    let plain = crate::app_workers_tests::person_tab(&mut app);
+    tasked(&mut app, kept, Some(TASK_TEXT));
+    tasked(&mut app, parked, Some(TASK_TEXT));
+    tasked(&mut app, bare, None);
+    for session in [kept, parked, bare, plain] {
+        typed(
+            &app,
+            session,
+            &crate::app_workers_tests::prompt_in("~/demo-aterm"),
+        );
+    }
+    let line = |app: &App, session: u64| {
+        app.pool
+            .get(session)
+            .expect("pooled")
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .task()
+            .and_then(|task| task.line.clone())
+    };
+    assert_eq!(
+        line(&app, kept).as_deref(),
+        Some(TASK_LINE),
+        "the record keeps the task's first line that draws, trimmed, without the rest"
+    );
+
+    for session in [kept, parked] {
+        assert_eq!(
+            app.tab_label_of_session(session),
+            TASK_LINE,
+            "an Agents row names it by its line, not its folder or its agent"
+        );
+    }
+    assert_eq!(strip_title(&mut app, kept), TASK_LINE, "the strip too");
+
+    assert_drift_keeps(&mut app, kept, TASK_LINE);
+
+    // A busy terminal's name comes from what the strip last read of it; a parked worker's tab is
+    // among its window's tabs, so the strip read it too. Settings ▸ Harness reads the same, not
+    // the store's stale copy of the title.
+    for session in [kept, parked] {
+        let busy = app.pool.get(session).expect("pooled").term.clone();
+        let _reading = crate::term_lock(&busy);
+        assert_eq!(
+            app.tab_label_of_session(session),
+            TASK_LINE,
+            "a busy terminal's session is named by its line"
+        );
+        assert_eq!(
+            app.harness_session_name(session, None, "~/stale")
+                .as_deref(),
+            Some(TASK_LINE),
+            "and in Settings ▸ Harness"
+        );
+    }
+
+    // CONTROL: the program's own title wins. Claude Code runs and titles its tab by its topic.
+    for session in [kept, parked] {
+        typed(
+            &app,
+            session,
+            &crate::app_workers_tests::line_starts("claude"),
+        );
+        typed(
+            &app,
+            session,
+            "\x1b]2;\u{2733} refactor-titles\x07".as_bytes(),
+        );
+        assert_eq!(
+            app.tab_label_of_session(session),
+            "refactor-titles",
+            "CONTROL: the agent's own title comes first"
+        );
+    }
+    assert_eq!(
+        strip_title(&mut app, kept),
+        "\u{2733} refactor-titles",
+        "CONTROL: the strip shows the agent's own title, its glyph kept"
+    );
+
+    // CONTROL: the folder stays below the line.
+    assert_eq!(
+        strip_title(&mut app, plain),
+        "~/demo-aterm",
+        "CONTROL: no task"
+    );
+    assert_eq!(app.tab_label_of_session(plain), "~/demo-aterm", "CONTROL");
+    assert_eq!(
+        app.tab_label_of_session(bare),
+        "Claude Code",
+        "CONTROL: a worker whose record has no line is named by its agent"
+    );
+}
+
+/// A RENAME AND A ROLE WIN OVER THE TASK LINE (tracker ST-02): the person's pin names the tab on
+/// the strip, through the drift path and on every Agents row, and a role names it on the Agents
+/// rows, ahead of the pin. The strip has no role rung, before this package or after it, so the
+/// role is asserted on the Agents rows alone. With both gone the line names the tab again: it is
+/// a rung under them, not a value they overwrote.
+#[test]
+fn a_rename_and_a_role_win_over_the_task_line() {
+    let mut app = App::headless_for_test();
+    let kept = crate::app_workers_tests::person_tab(&mut app);
+    let parked = crate::app_workers_tests::land_worker(&mut app);
+    for session in [kept, parked] {
+        tasked(&mut app, session, Some(TASK_TEXT));
+        typed(
+            &app,
+            session,
+            &crate::app_workers_tests::prompt_in("~/demo-aterm"),
+        );
+    }
+    let meta =
+        |app: &App, session: u64, edit: &dyn Fn(&mut crate::session_timeline::SessionMeta)| {
+            let ctx = app.pool.get(session).expect("pooled").ctx.clone();
+            edit(&mut ctx.meta.lock().unwrap_or_else(|p| p.into_inner()));
+        };
+
+    for session in [kept, parked] {
+        meta(&app, session, &|m| {
+            m.user_title = Some("release notes".to_owned())
+        });
+        app.on_meta_changed(session);
+        assert_eq!(
+            app.tab_label_of_session(session),
+            "release notes",
+            "a person's rename names it on the Agents rows"
+        );
+    }
+    assert_eq!(
+        strip_title(&mut app, kept),
+        "release notes",
+        "and on the strip"
+    );
+    assert_drift_keeps(&mut app, kept, "release notes");
+
+    for session in [kept, parked] {
+        meta(&app, session, &|m| {
+            m.user_title = None;
+            m.role = Some("fmt".to_owned());
+        });
+        app.on_meta_changed(session);
+        assert_eq!(
+            app.tab_label_of_session(session),
+            "fmt",
+            "a role names it on the Agents rows"
+        );
+    }
+
+    for session in [kept, parked] {
+        meta(&app, session, &|m| m.role = None);
+        app.on_meta_changed(session);
+        assert_eq!(
+            app.tab_label_of_session(session),
+            TASK_LINE,
+            "with neither, the line names it again"
+        );
+    }
+    assert_eq!(strip_title(&mut app, kept), TASK_LINE, "on the strip too");
+}

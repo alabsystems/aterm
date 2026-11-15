@@ -624,7 +624,7 @@ fn failed_cleanup_ends_a_surviving_member_before_reaping_its_exited_leader() {
     let mut admission = held(world.path(), &seat);
     let mut command = spawnfd::command("/bin/cat");
     command.stdin(Stdio::piped()).stdout(Stdio::piped());
-    let (owned, error) = launch_held(Some(&mut admission), &mut command).unwrap();
+    let (owned, error) = launch_held(Some(&mut admission), &mut command, None).unwrap();
     assert!(error.is_none());
     let mut root = Root(owned);
     let input = aterm_uds::deadline::cat_echoes(root.0.child_mut());

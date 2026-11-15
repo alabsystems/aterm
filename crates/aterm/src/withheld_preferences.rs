@@ -49,6 +49,18 @@ pub(super) fn request() {
     REQUESTS.request();
 }
 
+/// What a [`Coordinator`] next does, and when ([`Coordinator::owed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Owed {
+    /// No follow-up is wanted.
+    Idle,
+    /// An attempt runs. Nothing tells its end: a round finds it ended.
+    Running,
+    /// A wanted follow-up starts no sooner than this long from now: at once for a request no
+    /// round has seen, else after its put-off and its retry pause.
+    In(Duration),
+}
+
 #[derive(Default)]
 pub(super) struct Coordinator {
     seen: u64,
@@ -61,12 +73,42 @@ pub(super) struct Coordinator {
 }
 
 impl Coordinator {
+    /// A coordinator that has seen every request made so far, and wants nothing.
+    #[cfg(test)]
+    pub(super) fn caught_up() -> Self {
+        Self {
+            seen: REQUESTS.current(),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn round(&mut self, now: u64) -> Result<(), String> {
         self.round_with(REQUESTS.current(), now, || {
             std::thread::Builder::new()
                 .name("aterm-setup-follow-up".into())
                 .spawn(super::finish_withheld_preferences)
         })
+    }
+
+    /// What the next [`Self::round`] is owed for, with `now` on the keeper's clock.
+    pub(super) fn owed(&self, now: u64) -> Owed {
+        self.owed_with(REQUESTS.current(), now)
+    }
+
+    fn owed_with(&self, requests: u64, now: u64) -> Owed {
+        if self.worker.is_some() {
+            return Owed::Running;
+        }
+        if self.seen != requests {
+            return Owed::In(Duration::ZERO);
+        }
+        if self.wanted.is_none() {
+            return Owed::Idle;
+        }
+        let put_off = self.put_off_until.map_or(Duration::ZERO, |until| {
+            Duration::from_millis(until.saturating_sub(now))
+        });
+        Owed::In(put_off.max(self.retry.remaining(now).unwrap_or_default()))
     }
 
     fn round_with(

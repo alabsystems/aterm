@@ -32,6 +32,7 @@ fn vocabulary() -> Vec<String> {
             "</local-command-stderr>",
             "API Error: ",
             " can't help with this",
+            " | Cloudflare",
         ]
         .iter()
         .map(|s| (*s).to_string()),

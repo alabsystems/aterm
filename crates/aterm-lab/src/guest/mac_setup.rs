@@ -61,9 +61,7 @@ impl Binding {
             return None;
         }
         let sid = lines.next()?;
-        if sid.len() > 64 || aterm_types::control_request::Sid::parse(sid).is_none() {
-            return None;
-        }
+        aterm_types::tab_id::TabId::parse(sid)?;
         let pid: i32 = lines.next()?.parse().ok()?;
         let birth: u64 = lines.next()?.parse().ok()?;
         let claim = lines.next()?.strip_prefix("claimed ")?;

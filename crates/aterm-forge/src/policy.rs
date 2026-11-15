@@ -16,26 +16,6 @@ pub const LOC_METHOD: &str = "rs-physical-all-files-v1";
 /// The one graph method forge implements.
 pub const GRAPH_METHOD: &str = "cargo-tree-normal-no-dedupe-locked-offline-v1";
 
-/// How `aterm-census`'s lock-order census classifies a vendored fork.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CensusMode {
-    /// Links into the shipped GUI process.
-    Scanned,
-}
-
-impl CensusMode {
-    fn parse(s: &str, ctx: &str) -> Result<Self, String> {
-        match s {
-            "scanned" => Ok(Self::Scanned),
-            other => Err(format!(
-                "{POLICY_PATH}: {ctx} census.mode = \"{other}\" is not a mode — write \
-                 \"scanned\" (the crate links into the shipped process; then census.namespace \
-                 is required)"
-            )),
-        }
-    }
-}
-
 /// One vendored, `[patch.crates-io]`-redirected upstream crate that aterm now maintains.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fork {
@@ -49,10 +29,6 @@ pub struct Fork {
     pub license: String,
     /// `true` when this fork's license leaves no non-Apache option.
     pub apache_notice: bool,
-    /// The lock-order census's classification.
-    pub census_mode: CensusMode,
-    /// The identity namespace (`indexmap` ⇒ `indexmap::…`).
-    pub census_namespace: Option<String>,
 }
 
 /// The `[forge]` header: the methods every number in a report was produced by.
@@ -169,14 +145,7 @@ fn fork_block(t: &dyn TableLike, n: usize) -> Result<Fork, String> {
     let ctx = format!("[[fork]] `{name}`");
     check_keys(
         t,
-        &[
-            "name",
-            "version",
-            "path",
-            "license",
-            "apache_notice",
-            "census",
-        ],
+        &["name", "version", "path", "license", "apache_notice"],
         &ctx,
     )?;
 
@@ -201,39 +170,12 @@ fn fork_block(t: &dyn TableLike, n: usize) -> Result<Fork, String> {
         })?,
     };
 
-    let census = t.get("census").ok_or_else(|| {
-        format!(
-            "{POLICY_PATH}: {ctx} has no `census` — every fork must say how the lock-order \
-             census treats it. Add `census.mode = \"scanned\"` plus `census.namespace = \
-             \"{name}\"`"
-        )
-    })?;
-    let ct = census.as_table_like().ok_or_else(|| {
-        format!(
-            "{POLICY_PATH}: {ctx} census must be a table — write `census.mode = \"…\"` or a \
-             `[fork.census]` block"
-        )
-    })?;
-    check_keys(ct, &["mode", "namespace"], &format!("{ctx} census"))?;
-    let census_mode = CensusMode::parse(&req_str(ct, "mode", &ctx)?, &ctx)?;
-    let census_namespace = opt_str(ct, "namespace", &ctx)?;
-    if census_namespace.is_none() {
-        return Err(format!(
-            "{POLICY_PATH}: {ctx} is census.mode = \"scanned\" but has no \
-             census.namespace — a scanned fork's lock identities MUST live in a \
-             per-crate namespace or a foreign receiver name can merge with an aterm \
-             one. Add `census.namespace = \"{name}\"`"
-        ));
-    }
-
     Ok(Fork {
         name,
         version,
         path,
         license,
         apache_notice,
-        census_mode,
-        census_namespace,
     })
 }
 

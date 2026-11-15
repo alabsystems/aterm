@@ -36,8 +36,8 @@ fn owned_mac_setup_password_requires_current_receipt_child_and_fenced_prompt() {
     std::fs::create_dir(&directory).unwrap();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     let exe = root.path().join("aterm");
-    let name = "s-0123456789abcdef0123-42-700";
-    let text = b"v2\ns-0123456789abcdef0123\n42\n700\nclaimed 1.0.0+gfixture\n";
+    let name = "tabcdef0123-42-700";
+    let text = b"v2\ntabcdef0123\n42\n700\nclaimed 1.0.0+gfixture\n";
     aterm_uds::private_file::write_private(
         root.path(),
         aterm_types::clt_mark::FILE,
@@ -92,7 +92,7 @@ fn owned_mac_setup_password_requires_current_receipt_child_and_fenced_prompt() {
     aterm_uds::private_file::write_private(
         &directory,
         name,
-        b"v2\ns-different\n42\n700\nclaimed 1.0.0+gfixture\n",
+        b"v2\nt0000000001\n42\n700\nclaimed 1.0.0+gfixture\n",
     )
     .unwrap();
     assert!(
@@ -100,6 +100,35 @@ fn owned_mac_setup_password_requires_current_receipt_child_and_fenced_prompt() {
         "the file name binds the whole SID/child record"
     );
     aterm_uds::private_file::write_private(&directory, name, text).unwrap();
+    // A tab opened before the update keeps its earlier `s-` ID, and its receipt is read by it.
+    let earlier = "s-0123456789abcdef0123-42-700";
+    aterm_uds::private_file::write_private(
+        &directory,
+        earlier,
+        b"v2\ns-0123456789abcdef0123\n42\n700\nclaimed 1.0.0+gfixture\n",
+    )
+    .unwrap();
+    assert!(
+        Binding::read(&mark, earlier, &exe, &|pid| {
+            (pid == child.identity.pid).then(|| child.clone())
+        })
+        .is_some(),
+        "an earlier tab's receipt"
+    );
+    let malformed = "s-0123456789abcdef012-42-700";
+    aterm_uds::private_file::write_private(
+        &directory,
+        malformed,
+        b"v2\ns-0123456789abcdef012\n42\n700\nclaimed 1.0.0+gfixture\n",
+    )
+    .unwrap();
+    assert!(
+        Binding::read(&mark, malformed, &exe, &|_| Some(child.clone())).is_none(),
+        "CONTROL: a malformed earlier ID"
+    );
+    for extra in [earlier, malformed] {
+        std::fs::remove_file(directory.join(extra)).unwrap();
+    }
 
     const STATUS: &str = "OK gen=1.2 hash=0123456789abcdef human_seq=7\n";
     let run = |after: &str, ack: &str, current: &dyn Fn() -> bool| {

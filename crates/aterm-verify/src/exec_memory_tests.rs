@@ -123,8 +123,8 @@ fn a_stages_live_trees_are_held_together_until_each_ends() {
     assert_eq!(apart.peak(), Some(4 * GIB));
 }
 
-/// A stage that started no child held nothing, and keeps that: a doctest stage over crates with
-/// no fenced Rust block keeps 0, so its next run claims the 1 GiB margin, not the cold 12 GiB of
+/// A stage that started no child held nothing, and keeps that: a lint stage that started no child
+/// keeps 0, so its next run claims the 1 GiB margin, not the cold 12 GiB of
 /// a 24 GiB Mac. A stage whose children started and were never read holds no figure, and one
 /// read holds what was read. NEGATIVE CONTROL: a clock that does not mark its child started
 /// leaves the unread stage reading 0, as if it had started none.
@@ -149,27 +149,20 @@ fn a_stage_that_started_no_child_keeps_that_it_held_nothing() {
         Some(24 * GIB),
         Some(21 * GIB),
     );
-    let doctests = crate::plan::StageSpec {
-        id: crate::plan::StageId::Doctests,
-        title: "doctests".to_owned(),
-        lane: crate::plan::Lane::AfterCompile,
+    let lint = crate::plan::StageSpec {
+        id: crate::plan::StageId::Tippy,
+        title: "lint".to_owned(),
+        lane: crate::plan::Lane::TippyTarget,
         exclusive: false,
         after_stages: Vec::new(),
         mem: 0,
         part: None,
     };
-    let key = crate::memory::Key::of(
-        doctests.id,
-        &crate::scope::Scope::crate_only("aterm-capacity"),
-    );
-    assert_eq!(book.need(&doctests, &key, None).bytes, 12 * GIB, "cold");
-    book.keep(&doctests, &key, none.held().expect("held nothing"))
+    let key = crate::memory::Key::of(lint.id, &crate::scope::Scope::crate_only("aterm-capacity"));
+    assert_eq!(book.need(&lint, &key, None).bytes, 12 * GIB, "cold");
+    book.keep(&lint, &key, none.held().expect("held nothing"))
         .expect("kept");
-    assert_eq!(
-        book.need(&doctests, &key, None).bytes,
-        GIB,
-        "the margin alone"
-    );
+    assert_eq!(book.need(&lint, &key, None).bytes, GIB, "the margin alone");
 }
 
 /// One member read at `cpu_ms` of CPU, twice that runnable, holding `held` GiB.

@@ -4,12 +4,26 @@
 //! Isolated qualify branches under one Release allocation.
 
 use crate::Jobserver;
+use crate::jobserver::Moving;
 use std::io;
 use std::path::Path;
 use std::sync::Mutex;
 
 /// Two isolated GNU jobservers and an in-process export reservation. A branch must be fully
 /// drained before `finish` is called: tokens in its FIFO then cease to represent live work.
+///
+/// COUNTED AT EACH REAP. Each point the caller says a branch's clients are all reaped that
+/// recovers the branch's allocation (`finish`; `build_compilers_drained` once no admission
+/// barrier stands, or else the [`InitialReservation`]'s drop after it; `serial_bundle_drained`
+/// while the serial escape still holds tree's share; a [`FixtureShare`]'s drop) drains the
+/// branch's FIFO, counts what it held against the branch's allocation, and re-mints the
+/// allocation where it goes. A count that is not whole is recorded (a `qualify-pool count`
+/// line, a `capacity-event:` line, and the first shortfall in the `.allocation` record) with
+/// the clients the caller reaped since the branch's last whole count ([`Self::reaped`]); a
+/// whole one records nothing and forgets them. Every move of an allocation holds both FIFOs'
+/// transfer locks ([`Jobserver::moving`]): its publish, re-mint and takes each ask for the
+/// held guard, so a sole adopter's own count ([`Jobserver::count_alone`]) never sees one half
+/// done.
 #[derive(Debug)]
 pub struct BranchShares {
     pools: [Jobserver; 2],
@@ -25,8 +39,15 @@ struct State {
     initial_reserved: bool,
     serial_build: bool,
     build_phase: BuildPhase,
+    /// What the latest recovery found ([`BranchShares::recover`]).
     last_recovery: Option<Recovery>,
+    /// The first recovery that found a branch's FIFO short, and the clients noted on that FIFO
+    /// since its last whole count when it did ([`BranchShares::reaped`]).
     first_shortfall: Option<Recovery>,
+    first_shortfall_reaped: Vec<String>,
+    /// How many recoveries found a FIFO short, and how many found it over-full.
+    shortfalls: u32,
+    surpluses: u32,
 }
 
 /// Observations at an already-drained branch boundary, never permission to recover a live one.
@@ -48,6 +69,15 @@ impl Recovery {
         }
         self.returned
             .map(|returned| u64::from(self.assigned).saturating_sub(returned))
+    }
+
+    /// The bytes found beyond the allocation, judged as [`Self::shortfall`] is.
+    fn surplus(self) -> Option<u64> {
+        if self.read_error.is_some() {
+            return None;
+        }
+        self.returned
+            .map(|returned| returned.saturating_sub(u64::from(self.assigned)))
     }
 }
 
@@ -107,6 +137,9 @@ pub struct FixtureShare<'a> {
 pub struct InitialReservation<'a> {
     shares: &'a BranchShares,
     tokens: Vec<crate::Token<'a>>,
+    /// Both FIFOs' transfer locks, held while these tokens are out of their FIFOs; declared
+    /// after `tokens`, so they are let go only after every token is back or transferred.
+    moving: [Moving<'a>; 2],
 }
 
 impl BranchShares {
@@ -148,6 +181,9 @@ impl BranchShares {
                 build_phase: BuildPhase::Compilers,
                 last_recovery: None,
                 first_shortfall: None,
+                first_shortfall_reaped: Vec::new(),
+                shortfalls: 0,
+                surpluses: 0,
             }),
         };
         shares.describe(
@@ -155,6 +191,7 @@ impl BranchShares {
                 .qualify_allocations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &shares.moving(),
         );
         Ok(shares)
     }
@@ -189,9 +226,10 @@ impl BranchShares {
         }
         let expected = usize::try_from(self.initial.iter().copied().sum::<u32>())
             .expect("qualify core grant fits usize");
+        let moving = self.moving();
         let mut held = Vec::with_capacity(expected);
-        for pool in &self.pools {
-            while let Some(token) = pool.try_acquire()? {
+        for (pool, moving) in self.pools.iter().zip(&moving) {
+            while let Some(token) = pool.try_acquire_moving(moving)? {
                 held.push(token);
             }
         }
@@ -205,10 +243,11 @@ impl BranchShares {
             ));
         }
         state.initial_reserved = true;
-        self.describe(&state);
+        self.describe(&state, &moving);
         Ok(InitialReservation {
             shares: self,
             tokens: held,
+            moving,
         })
     }
 
@@ -245,8 +284,10 @@ impl BranchShares {
         self.pools[i].hand_share_to(command, width)
     }
 
-    /// Recover the whole allocation of a drained branch, even when its clients lost tokens.
-    /// Repeated completion is inert. The last allocation goes to the post-qualify tree FIFO.
+    /// Recover the whole allocation of a drained branch, even when its clients lost tokens:
+    /// its FIFO is counted against the allocation first, and a count that is not whole is
+    /// recorded (COUNTED AT EACH REAP). Repeated completion is inert. The last allocation goes
+    /// to the post-qualify tree FIFO.
     /// # Panics
     /// `branch` is outside 0 (build), 1 (tree), 2 (export), the admission reservation still
     /// stands, or build finishes before its fixture share has been returned.
@@ -266,6 +307,7 @@ impl BranchShares {
             branch != 0 || state.build_phase != BuildPhase::Fixture,
             "reap the fixture producer before finishing build"
         );
+        let moving = self.moving();
         state.ended[branch] = true;
         if branch == 0 {
             state.serial_build = false;
@@ -277,7 +319,7 @@ impl BranchShares {
         } else {
             (0..2).find(|&i| !state.ended[i]).unwrap_or(1)
         };
-        let tokens = self.recover(&mut state, branch, recipient);
+        let tokens = self.recover(&mut state, branch, recipient, &moving);
         eprintln!(
             "qualify-pool ended={branch} reminted={tokens} recipient={recipient} shares={:?} ended_shares={:?} fifos=[{},{}]",
             state.allocated,
@@ -311,15 +353,16 @@ impl BranchShares {
         if !state.serial_tree_waiting() || state.allocated[0] <= 1 {
             return Ok(false);
         }
-        let Some(token) = self.pools[0].try_acquire()? else {
+        let moving = self.moving();
+        let Some(token) = self.pools[0].try_acquire_moving(&moving[0])? else {
             return Ok(false);
         };
         std::mem::forget(token);
         state.allocated[0] -= 1;
         state.allocated[1] += 1;
         state.serial_build = false;
-        self.describe(&state);
-        self.pools[1].remint(1);
+        self.describe(&state, &moving);
+        self.pools[1].remint(1, &moving[1]);
         eprintln!(
             "qualify-pool resumed_admitted_tree transferred=1 shares={:?}",
             state.allocated
@@ -344,6 +387,9 @@ impl BranchShares {
     /// # Errors
     /// Reading the build FIFO fails; tokens already read are returned before any state changes.
     pub fn lend_free_build_to_admitted_tree(&self) -> io::Result<u32> {
+        // Made before the allocation lock is taken (the lock-order census reads a `new` under
+        // that lock as `BranchShares::new`, which takes it); every byte it holds is forgotten
+        // or explicitly returned while both transfer locks are still held.
         let mut held = Vec::new();
         let mut state = self
             .qualify_allocations
@@ -352,10 +398,13 @@ impl BranchShares {
         if !state.can_exchange_compiler_tokens() {
             return Ok(0);
         }
+        // Both transfer locks, from the first byte read to the last written, so no adopter's
+        // count sees the loan half made.
+        let moving = self.moving();
         let build_floor = (state.allocated[0] + state.allocated[1]).div_ceil(2).max(1);
         let limit = state.allocated[0].saturating_sub(build_floor);
         while held.len() < limit as usize {
-            match self.pools[0].try_acquire() {
+            match self.pools[0].try_acquire_moving(&moving[0]) {
                 Ok(Some(token)) => held.push(token),
                 Ok(None) => break,
                 Err(error) => {
@@ -375,8 +424,8 @@ impl BranchShares {
         state.allocated[0] -= moved;
         state.allocated[1] += moved;
         state.serial_build = false;
-        self.describe(&state);
-        self.pools[1].remint(moved);
+        self.describe(&state, &moving);
+        self.pools[1].remint(moved, &moving[1]);
         eprintln!(
             "qualify-pool lent_free_build transferred={moved} build_floor={build_floor} shares={:?}",
             state.allocated
@@ -391,9 +440,10 @@ impl BranchShares {
             .qualify_allocations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.serial_build && !state.ended[1] {
+        if state.serial_build && !state.ended[1] && !state.initial_reserved {
+            let moving = self.moving();
             state.serial_build = false;
-            let tokens = self.recover(&mut state, 0, 1);
+            let tokens = self.recover(&mut state, 0, 1, &moving);
             eprintln!(
                 "qualify-pool serial_bundle_drained reminted={tokens} recipient=1 shares={:?}",
                 state.allocated
@@ -414,11 +464,13 @@ impl BranchShares {
             return;
         }
         state.build_phase = BuildPhase::Drained;
+        // Under the admission barrier this nests in the reservation's own hold.
+        let moving = self.moving();
         if state.initial_reserved {
-            self.describe(&state);
+            self.describe(&state, &moving);
         } else {
             state.serial_build = false;
-            self.recover(&mut state, 0, 1);
+            self.recover(&mut state, 0, 1, &moving);
         }
     }
 
@@ -450,8 +502,9 @@ impl BranchShares {
                         "fixture share requires drained build compilers and an open barrier",
                     ));
                 }
-                if state.build_phase == BuildPhase::Drained
-                    && let Some(token) = self.pools[1].try_acquire()?
+                let moving = (state.build_phase == BuildPhase::Drained).then(|| self.moving());
+                if let Some(moving) = &moving
+                    && let Some(token) = self.pools[1].try_acquire_moving(&moving[1])?
                 {
                     let Some(remaining) = state.allocated[1].checked_sub(1) else {
                         return Err(io::Error::other("free tree token has no allocation"));
@@ -460,8 +513,8 @@ impl BranchShares {
                     state.allocated[1] = remaining;
                     state.allocated[0] += 1;
                     state.build_phase = BuildPhase::Fixture;
-                    self.describe(&state);
-                    self.pools[0].remint(1);
+                    self.describe(&state, moving);
+                    self.pools[0].remint(1, &moving[0]);
                     return Ok(FixtureShare { shares: self });
                 }
             }
@@ -469,15 +522,54 @@ impl BranchShares {
         }
     }
 
-    fn recover(&self, state: &mut State, branch: usize, recipient: usize) -> u32 {
+    /// Note a client of a branch FIFO that the caller has reaped: `command` was handed the FIFO
+    /// ([`Self::hand_to`]; its [`crate::POOL_ENV`] names which), `pid` was its process, and
+    /// `status` how it ended. That FIFO's next count names it if that count is not whole (a
+    /// whole one forgets it), among the latest of its notes ([`Jobserver::note_reaped`]). A
+    /// command handed neither FIFO is not noted.
+    pub fn reaped(
+        &self,
+        command: &aterm_uds::spawnfd::Command,
+        pid: u32,
+        status: Option<std::process::ExitStatus>,
+    ) {
+        let Some(fifo) = command
+            .get_envs()
+            .find(|(name, _)| *name == crate::POOL_ENV)
+            .and_then(|(_, value)| value?.to_str()?.split_once(':'))
+            .map(|(_, fifo)| fifo)
+        else {
+            return;
+        };
+        let Some(pool) = self
+            .pools
+            .iter()
+            .find(|pool| pool.path() == Path::new(fifo))
+        else {
+            return;
+        };
+        let program = Path::new(command.get_program())
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let ended = status.map_or_else(|| "unknown".to_owned(), exit_words);
+        pool.note_reaped(format!("pid={pid} program={program} ended={ended}"));
+    }
+
+    fn recover(
+        &self,
+        state: &mut State,
+        branch: usize,
+        recipient: usize,
+        moving: &[Moving<'_>; 2],
+    ) -> u32 {
         let tokens = std::mem::take(&mut state.allocated[branch]);
         // If the last branch is tree, its surviving bytes already back the bundle allocation.
         // Drain those bytes first: its clients may have returned any subset of the allocation.
         let mut returned = self.pools.get(branch).map(|_| 0_u64);
         let mut read_error = None;
-        if let Some(pool) = self.pools.get(branch) {
+        if let Some((pool, moving)) = self.pools.get(branch).zip(moving.get(branch)) {
             loop {
-                match pool.try_acquire() {
+                match pool.try_acquire_moving(moving) {
                     Ok(Some(token)) => {
                         returned = returned.map(|count| count.saturating_add(1));
                         std::mem::forget(token);
@@ -498,20 +590,84 @@ impl BranchShares {
             read_error,
         };
         state.last_recovery = Some(recovery);
-        if state.first_shortfall.is_none()
-            && recovery.shortfall().is_some_and(|missing| missing > 0)
-        {
-            state.first_shortfall = Some(recovery);
+        if recovery.returned.is_some() {
+            self.judge(state, recovery);
         }
         state.allocated[recipient] += tokens;
         // Publish the wider dispatch share before a reminted byte can wake a child. The child
         // replans from this record immediately after acquiring that byte.
-        self.describe(state);
-        self.pools[recipient].remint(tokens);
+        self.describe(state, moving);
+        self.pools[recipient].remint(tokens, &moving[recipient]);
         tokens
     }
 
-    fn describe(&self, state: &State) {
+    /// Judge a reap count: the bytes `recovery` drained from its branch's FIFO (`returned`)
+    /// against the allocation assigned it, which the caller re-mints where it goes. The coordinator holds none of a branch's tokens
+    /// at its reap points: the admission reservation is back or transferred first, and a
+    /// fixture loan's byte is the build FIFO's. A whole count forgets the clients noted since
+    /// the last; any other is recorded with them. A shortfall is made good by the re-mint, a
+    /// surplus (a token returned after its branch was drained and re-minted) is not re-minted,
+    /// so it leaves circulation: keeping it would let the release run more jobs than its cores.
+    /// The evidence is the caller's: it reaped its direct children (`adopters` says whether any
+    /// handle that adopted the FIFO is still alive); a token held by a descendant that outlived
+    /// them is counted as lost, and the one it returns later is the next count's surplus. A
+    /// drain a read error cut short judges nothing and keeps the notes for the next count.
+    fn judge(&self, state: &mut State, recovery: Recovery) {
+        let Recovery {
+            branch,
+            assigned: allocated,
+            ..
+        } = recovery;
+        let pool = &self.pools[branch];
+        let (Some(short), Some(over)) = (recovery.shortfall(), recovery.surplus()) else {
+            eprintln!("qualify-pool count branch={branch} outcome=unjudged recovery=[{recovery}]");
+            return;
+        };
+        let outcome = match (short, over) {
+            (0, 0) => {
+                drop(pool.take_reaped());
+                return;
+            }
+            (0, _) => "over",
+            _ => "short",
+        };
+        let drained = u32::try_from(recovery.returned.unwrap_or(0)).unwrap_or(u32::MAX);
+        let adopters = match pool.adopters_gone() {
+            Some(true) => "none",
+            Some(false) => "alive",
+            None => "unknown",
+        };
+        let reaped = pool.count_event(
+            outcome,
+            allocated,
+            drained,
+            0,
+            allocated.abs_diff(drained),
+            &format!("the coordinator's reap point; adopters={adopters}"),
+        );
+        eprintln!(
+            "qualify-pool count branch={branch} outcome={outcome} allocated={allocated} found={drained} adopters={adopters} reaped={reaped:?}"
+        );
+        if outcome == "short" {
+            state.shortfalls += 1;
+            if state.first_shortfall.is_none() {
+                state.first_shortfall = Some(recovery);
+                state.first_shortfall_reaped = reaped;
+            }
+        } else {
+            state.surpluses += 1;
+        }
+    }
+
+    /// Hold both FIFOs' transfer locks ([`Jobserver::moving`]), build's first.
+    fn moving(&self) -> [Moving<'_>; 2] {
+        [self.pools[0].moving(), self.pools[1].moving()]
+    }
+
+    /// Publish each branch's allocation beside its FIFO (`.slots`) and the record of every
+    /// share (`.allocation`), under both transfer locks (`_moving`), so no adopter's count reads
+    /// an allocation whose bytes are not yet in, or out of, its FIFO.
+    fn describe(&self, state: &State, _moving: &[Moving<'_>; 2]) {
         let recovery = state
             .last_recovery
             .map_or_else(|| "none".to_string(), |r| r.to_string());
@@ -519,7 +675,7 @@ impl BranchShares {
             .first_shortfall
             .map_or_else(|| "none".to_string(), |r| r.to_string());
         let record = format!(
-            "coordinator_pid={} assigned_holders=[build,tree,export] shares={:?} ended={:?} initial_reserved={} serial_build={} build_phase={:?} fifos=[{},{}] last_recovery=[{}] first_shortfall=[{}] unreturned_token_holders=unobservable-in-GNU-protocol",
+            "coordinator_pid={} assigned_holders=[build,tree,export] shares={:?} ended={:?} initial_reserved={} serial_build={} build_phase={:?} fifos=[{},{}] last_recovery=[{}] first_shortfall=[{}] first_shortfall_reaped={:?} token_counts=at-each-reap shortfalls={} surpluses={}",
             std::process::id(),
             state.allocated,
             state.ended,
@@ -529,7 +685,10 @@ impl BranchShares {
             self.pools[0].path().display(),
             self.pools[1].path().display(),
             recovery,
-            first_shortfall
+            first_shortfall,
+            state.first_shortfall_reaped,
+            state.shortfalls,
+            state.surpluses,
         );
         for (i, pool) in self.pools.iter().enumerate() {
             if let Err(error) = crate::book::write_staged(
@@ -606,9 +765,9 @@ impl InitialReservation<'_> {
         state.serial_build = !drained;
         // A blocked build child reads its dispatch width as soon as the first byte wakes it.
         // Publish the transferred width before making any byte runnable.
-        self.shares.describe(&state);
+        self.shares.describe(&state, &self.moving);
         let recipient = usize::from(drained);
-        self.shares.pools[recipient].remint(expected);
+        self.shares.pools[recipient].remint(expected, &self.moving[recipient]);
         eprintln!(
             "qualify-pool serial_escape recipient={recipient} reminted={expected} shares={:?} fifos=[{},{}]",
             state.allocated,
@@ -633,9 +792,9 @@ impl Drop for InitialReservation<'_> {
             state.initial_reserved = false;
             if state.build_phase.compilers_drained() {
                 state.serial_build = false;
-                self.shares.recover(&mut state, 0, 1);
+                self.shares.recover(&mut state, 0, 1, &self.moving);
             } else {
-                self.shares.describe(&state);
+                self.shares.describe(&state, &self.moving);
             }
         }
     }
@@ -649,9 +808,24 @@ impl Drop for FixtureShare<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(state.build_phase, BuildPhase::Fixture);
+        let moving = self.shares.moving();
         state.build_phase = BuildPhase::Drained;
-        self.shares.recover(&mut state, 0, 1);
+        self.shares.recover(&mut state, 0, 1, &moving);
     }
+}
+
+/// How a reaped client ended, in words: `exit=<code>` or `signal=<number>`.
+fn exit_words(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return format!("signal={signal}");
+        }
+    }
+    status
+        .code()
+        .map_or_else(|| "unknown".to_owned(), |code| format!("exit={code}"))
 }
 
 impl Drop for BranchShares {

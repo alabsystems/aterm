@@ -19,16 +19,16 @@ fn followed_links_cannot_hide_inputs_outside_the_package() {
     });
     assert!(proof.is_some());
     std::fs::remove_file(&target).unwrap();
-    let (_, proof) = capture(root.path(), || crate::tree::exists(&link));
+    let (_, proof) = capture(root.path(), || crate::tree::is_file(&link));
     assert!(
         proof.is_none(),
         "a dangling link can acquire an external target"
     );
 }
 
-/// A read on a thread the census started is one of its inputs: the lazy-init, lock-order and
-/// main-loop censuses read on worker threads.
-/// NEGATIVE CONTROL: a thread started outside `memo::threads` records nothing, so its
+/// A read on a thread the census started is one of its inputs: the main-loop census reads on
+/// worker threads.
+/// NEGATIVE CONTROL: a thread started outside `workers::threads` records nothing, so its
 /// package is missing from the evidence.
 #[test]
 fn a_census_threads_reads_are_its_inputs() {
@@ -44,15 +44,17 @@ fn a_census_threads_reads_are_its_inputs() {
             .collect()
     };
     let (_, carried) = capture(root.path(), || {
-        crate::memo::threads(|s| s.spawn(|| crate::tree::read_to_string(&file)).join())
+        crate::workers::threads(|s| s.spawn(|| crate::tree::read_to_string(&file)).join())
             .unwrap()
             .unwrap()
     });
     for own_worker in [false, true] {
         let read = || {
-            crate::memo::threads(|scope| scope.spawn(|| crate::tree::read_to_string(&file)).join())
-                .unwrap()
-                .unwrap()
+            crate::workers::threads(|scope| {
+                scope.spawn(|| crate::tree::read_to_string(&file)).join()
+            })
+            .unwrap()
+            .unwrap()
         };
         let (text, serial) = capture(root.path(), || {
             if own_worker {

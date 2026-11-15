@@ -288,10 +288,11 @@ fn restored_gui_requires_retained_contact_and_absent_lifetime_check() {
     }
 }
 
-/// A Reachable row is current by the lease its observer measured for that peer: a peer reached
-/// every 24 s is Reachable 20 s after its contact, where one with no measured lease is not.
+/// A Reachable row is current by the lease its observer gave that peer's contact: a peer
+/// promised its next round within 48 s is Reachable 20 s after its contact, where one whose row
+/// names no lease is not.
 #[test]
-fn a_reachable_row_is_current_within_its_measured_lease() {
+fn a_reachable_row_is_current_within_its_lease() {
     let mut backend = backend();
     backend.network.peers[0].last_seen_ms = 80_000;
     backend.network.peers[0].last_checked_ms = Some(80_000);

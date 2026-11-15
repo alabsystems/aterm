@@ -321,6 +321,37 @@ pub fn output_while_process_progressing_complete_stdout_unless(
     capture_progress(cmd, window, waiting_on.into(), drain_stdout, Some(stopped))
 }
 
+/// As [`output_while_process_progressing_complete_stdout`], with the explicit inclusive stdout
+/// limit [`output_until_complete_stdout_with_limit`] takes: a reader of whole stdout past
+/// [`OUTPUT_KEEP`] whose child may take as long as a loaded machine makes it, and is ended
+/// only once its output and its process tree's CPU and I/O stay still for `window`.
+///
+/// # Errors
+/// An `InvalidInput` spawn refusal before dispatch for a limit past
+/// [`MAX_COMPLETE_STDOUT_BYTES`]; otherwise as
+/// [`output_while_process_progressing_complete_stdout`].
+pub fn output_while_process_progressing_complete_stdout_with_limit(
+    cmd: &mut Command,
+    window: Duration,
+    waiting_on: impl Into<String>,
+    limit: usize,
+) -> Result<Output, CompleteProgressError> {
+    if limit > MAX_COMPLETE_STDOUT_BYTES {
+        return Err(CompleteOutputError::Run(RunError::Spawn(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "complete stdout limit exceeds hard maximum",
+        )))
+        .into());
+    }
+    capture_progress(
+        cmd,
+        window,
+        waiting_on.into(),
+        move |pipe, stream| drain_stdout_with_limit(pipe, stream, limit),
+        None,
+    )
+}
+
 /// Capture complete stdout with an explicit inclusive limit no larger than
 /// [`MAX_COMPLETE_STDOUT_BYTES`]. Stderr retains the existing bounded-tail policy.
 /// A zero limit accepts only empty stdout with proven EOF.

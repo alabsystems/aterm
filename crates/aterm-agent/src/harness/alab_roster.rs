@@ -166,6 +166,11 @@ pub struct Lab {
     /// This Mac's registry inventory has equalled an authenticated peer's: until then the
     /// registry here may be a part of the lab's, so the lab adds rows and renames none.
     pub settled: bool,
+    /// Each Commons machine (32 lower-case hex) whose live facts row binds a live registry
+    /// machine, to that machine: the one way a row another Mac signed, which names only its
+    /// Commons machine, names a registry machine (the account claims' homes,
+    /// `claims::Homes::of`).
+    pub bound: std::collections::BTreeMap<String, MachineKey>,
     /// Every account of a pooled CLI, live or not.
     pub accounts: Vec<LabAccount>,
     /// Each address with an `alias_of` link, lower-cased, to the live addresses its auth codes

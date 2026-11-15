@@ -15,7 +15,7 @@ use crate::harness::upgrade::Request;
 use crate::harness::upgrade_drive::load;
 use crate::supervise::ScratchDir;
 
-const TAB: &str = "s-c0dec0dec0dec0dec0de";
+const TAB: &str = "tdec0dec0de";
 const TOKEN: &str = "0badf00d0badf00d";
 const T1: &str = "01a0dc36-1dc1-7ee2-be91-11bc323e377c";
 const T2: &str = "01a0dc3a-5c71-7143-bcee-58def0a15dfd";
@@ -1905,8 +1905,8 @@ fn collection_conforms(
 #[test]
 #[allow(clippy::too_many_lines)]
 fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
-    const HERE: &str = "s-0a0a0a0a0a0a";
-    const THERE: &str = "s-0b0b0b0b0b0b";
+    const HERE: &str = "t0a0a0a0a0a";
+    const THERE: &str = "t0b0b0b0b0b";
     let old = super::super::STATE_KEEP_S + 3_600;
     let model = aterm_models_harness::harness_upgrade_state_collection_model();
     let dir = scratch("codex-prune");
@@ -1919,16 +1919,16 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
     let none = || Request::None;
     #[rustfmt::skip]
     let cases: Vec<(&str, bool, Phase, Request, bool, bool)> = vec![
-        ("s-dead00000001", false, Phase::Done,                         none(), true,  true),
-        ("s-dead00000002", false, failed("unanswered"),                none(), true,  true),
-        ("s-dead00000003", false, Phase::Pending,                      none(), true,  true),
+        ("tad00000001", false, Phase::Done,                         none(), true,  true),
+        ("tad00000002", false, failed("unanswered"),                none(), true,  true),
+        ("tad00000003", false, Phase::Pending,                      none(), true,  true),
         (HERE,             true,  Phase::Done,                         none(), true,  false),
         (THERE,            true,  failed("no-resume"),                 none(), true,  false),
-        ("s-dead00000004", false, Phase::Exiting { at_s: 5 },          none(), true,  false),
-        ("s-dead00000005", false, Phase::Relaunched { at_s: 5 },       none(), true,  false),
-        ("s-dead00000006", false, Phase::Announced { at_s: 5, asks: 1 }, none(), true, false),
-        ("s-dead00000007", false, Phase::Pending,                      skip(), true,  false),
-        ("s-dead00000008", false, Phase::Done,                         none(), false, false),
+        ("tad00000004", false, Phase::Exiting { at_s: 5 },          none(), true,  false),
+        ("tad00000005", false, Phase::Relaunched { at_s: 5 },       none(), true,  false),
+        ("tad00000006", false, Phase::Announced { at_s: 5, asks: 1 }, none(), true, false),
+        ("tad00000007", false, Phase::Pending,                      skip(), true,  false),
+        ("tad00000008", false, Phase::Done,                         none(), false, false),
     ];
     let paths: Vec<PathBuf> = cases
         .iter()
@@ -1946,14 +1946,14 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
     let strangers = [
         filed_as(
             &opts,
-            &key("s-dead00000009"),
-            &done(Agent::Claude, "s-dead00000009"),
+            &key("tad00000009"),
+            &done(Agent::Claude, "tad00000009"),
             old,
         ),
         filed_as(
             &opts,
-            &key("s-dead0000000a"),
-            &done(Agent::Codex, "s-dead0000000b"),
+            &key("tad0000000a"),
+            &done(Agent::Codex, "tad0000000b"),
             old,
         ),
         filed_as(
@@ -1967,7 +1967,7 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
     std::fs::write(&document, "{}").expect("document");
     let now = now_s();
 
-    let unvouched = ["s-0c0c0c0c0c0c".to_string()];
+    let unvouched = ["t0c0c0c0c0c".to_string()];
     prune(&opts, now, registry_life(Some(&graph), &[]));
     prune(&opts, now, registry_life(Some(&graph), &unvouched));
     prune(&opts, now, registry_life(None, &known_live));
@@ -1990,12 +1990,39 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
     let life = registry_life(Some(&graph), &known_live);
     assert_eq!(life(HERE), TabLife::Live, "the pass saw it live");
     assert_eq!(life(THERE), TabLife::Live, "the registry names it");
-    assert_eq!(life("s-dead00000001"), TabLife::Gone);
-    for odd in ["s-../../etc", "s-", "t-0a0a", "s-dead/0a0a"] {
+    assert_eq!(life("tad00000001"), TabLife::Gone);
+    for odd in [
+        "t../../etc",
+        "t",
+        "t-0a0a",
+        "t000000dead/0a0a",
+        "s-0a0a",
+        "s-0A0A0A0A0A0A0A0A0A0A",
+        "s-0a0a0a0a0a0a0a0a0a0a/x",
+    ] {
         assert_eq!(life(odd), TabLife::Unknown, "{odd} is no tab id");
     }
+    // A tab opened before the `t` form keeps its `s-` ID until it closes: the registry vouches
+    // for it either way.
+    let earlier = "s-0a0a0a0a0a0a0a0a0a0a";
     assert_eq!(
-        registry_life(Some(&graph), &unvouched)("s-dead00000001"),
+        life(earlier),
+        TabLife::Gone,
+        "an earlier tab the registry lacks"
+    );
+    std::fs::write(
+        graph.join(earlier),
+        "sock /x/aterm-1.sock\nnonce 00\npid 1\n",
+    )
+    .expect("earlier entry");
+    assert_eq!(
+        life(earlier),
+        TabLife::Live,
+        "an earlier tab the registry names"
+    );
+    std::fs::remove_file(graph.join(earlier)).expect("earlier entry removed");
+    assert_eq!(
+        registry_life(Some(&graph), &unvouched)("tad00000001"),
         TabLife::Unknown,
         "a registry that misses a live tab vouches for nothing"
     );
@@ -2010,8 +2037,8 @@ fn the_prune_collects_a_closed_tabs_settled_codex_record_and_nothing_else() {
     assert!(!strangers[0].exists() && !strangers[2].exists());
     let claude_under_codex = filed_as(
         &opts,
-        &key("s-dead0000000c"),
-        &done(Agent::Claude, "s-dead0000000c"),
+        &key("tad0000000c"),
+        &done(Agent::Claude, "tad0000000c"),
         old,
     );
 
@@ -2102,7 +2129,7 @@ fn the_retired_lanes_pin_stamps_and_goal_records_go_once_a_week_old() {
     let old_pin = aged(&pins.join("default-pin.json"), week);
     let old_goal = aged(&drive.join(format!("{TAB}.goal-hold.json")), week);
     let new_pin = aged(&pins.join("other-pin.json"), 86_400);
-    let new_goal = aged(&drive.join("s-0a0a.goal-hold.json"), 86_400);
+    let new_goal = aged(&drive.join("t0000000a0a.goal-hold.json"), 86_400);
     let ledger_file = aged(&ledger, week);
     let now = now_s();
     for quiet in [

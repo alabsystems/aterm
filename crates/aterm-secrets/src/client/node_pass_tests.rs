@@ -42,6 +42,22 @@ fn a_gap_on_m22() -> (TwoMacs, Recipient) {
     (macs, m40)
 }
 
+/// Whether the last apply recorded `name` among what this Mac reads ([`State::held`]): the
+/// records alone hold a value before any pass applied it, so a read in place proves no pass ran.
+fn applied(paths: &Paths, name: &str) -> bool {
+    load_state(paths)
+        .ok()
+        .and_then(|state| state.held)
+        .is_some_and(|held| held.contains_key(name))
+}
+
+/// Forget what this Mac's last apply recorded, as a state an older aterm wrote holds it.
+fn forget_held(paths: &Paths) {
+    let mut state = load_state(paths).unwrap();
+    state.held = None;
+    save_state(paths, &state).unwrap();
+}
+
 fn wrapped(paths: &Paths, recipient: &Recipient) -> bool {
     load_records(paths)
         .unwrap()
@@ -116,7 +132,7 @@ fn a_pass_ran_after(paths: &Paths, after_ms: u64) {
 }
 
 #[test]
-fn a_mac_with_no_subscriber_heals_a_gap_and_materializes_a_new_record() {
+fn a_mac_with_no_subscriber_heals_a_gap_and_applies_a_new_record() {
     let (macs, m40) = a_gap_on_m22();
     let (m22, m7) = (&macs.m22, &macs.m7);
     let start = aterm_time::unix_millis().unwrap();
@@ -136,16 +152,19 @@ fn a_mac_with_no_subscriber_heals_a_gap_and_materializes_a_new_record() {
         );
 
         // A record arrives by no path the pass knows of. The clock does not move, so only the
-        // record makes a pass run, and it writes the file from what m7 holds, with no network.
+        // record makes a pass run, and it applies the entry from what m7 holds, with no network.
         a_pass_ran_after(m7, start);
         macs.server.stop();
         test_put_everyone(m22, "later", b"later-v1").expect("m22 signs an entry");
         save_records(m7, &load_records(m22).unwrap().encode()).expect("the record reaches m7");
-        let later = m7.home.join(".secrets/later");
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
-            "m7's pass materializes the entry its log just took",
-            || (std::fs::read(&later).ok()? == b"later-v1").then_some(()),
+            "m7's pass applies the entry its log just took",
+            || applied(m7, "later").then_some(()),
+        );
+        assert_eq!(
+            crate::client::stored(m7, "later").as_deref(),
+            Some(b"later-v1".as_slice())
         );
         assert_eq!(
             clock7.load(Ordering::Acquire),
@@ -156,9 +175,9 @@ fn a_mac_with_no_subscriber_heals_a_gap_and_materializes_a_new_record() {
 }
 
 /// The negative control: the same gap, clock and record with the pass held, as `[swarm]` holds it
-/// or `MESH` off never starts it, and the gap and the missing file stay.
+/// or `MESH` off never starts it, and the gap stays and the new entry is not applied.
 #[test]
-fn a_held_pass_leaves_the_gap_and_writes_no_file() {
+fn a_held_pass_leaves_the_gap_and_applies_nothing() {
     let (macs, m40) = a_gap_on_m22();
     let (m22, m7) = (&macs.m22, &macs.m7);
     let start = aterm_time::unix_millis().unwrap();
@@ -181,7 +200,11 @@ fn a_held_pass_leaves_the_gap_and_writes_no_file() {
         );
     });
     assert!(!wrapped(m22, &m40));
-    assert!(!m7.home.join(".secrets/later").exists());
+    assert!(!applied(m7, "later"));
+    assert!(
+        applied(m7, "shared"),
+        "CONTROL: the fixture's apply recorded its entry"
+    );
     assert_eq!(node_pass_receipt(m22), None);
     assert_eq!(node_pass_receipt(m7), None);
 }
@@ -348,84 +371,79 @@ fn a_passs_timer_counts_from_the_look_that_read_the_clock() {
     );
 }
 
+/// A state no apply of this build recorded ([`State::held`] unset, as an older aterm wrote it) is
+/// applied again by the next pass, once per version: a pass that met it already does not loop.
 #[test]
-fn a_file_a_program_keeps_rewriting_is_put_back_once() {
+fn an_older_aterms_state_is_applied_again_once() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let m7 = &macs.m7;
-    let file = m7.home.join(".secrets/shared");
     let now = aterm_time::unix_millis().unwrap();
     let mut pass = NodePass::default();
     let _ = pass.once(m7, now, QUICK.lock_wait, &|| false).unwrap();
+    let seq = load_state(m7).unwrap().seq;
 
-    std::fs::write(&file, b"a program's").unwrap();
+    forget_held(m7);
     let (receipt, error) = pass.once(m7, now, QUICK.lock_wait, &|| false).unwrap();
     assert_eq!(receipt.said, NodePassSaid::Done, "{error:?}");
-    assert_eq!(std::fs::read(&file).unwrap(), b"everyone-v1");
+    assert_eq!(receipt.applied, Some(seq));
+    assert!(applied(m7, "shared"));
 
-    std::fs::write(&file, b"a program's").unwrap();
+    forget_held(m7);
     let (receipt, error) = pass.once(m7, now, QUICK.lock_wait, &|| false).unwrap();
     assert_eq!(receipt.said, NodePassSaid::Done, "{error:?}");
-    assert_eq!(std::fs::read(&file).unwrap(), b"a program's", "only once");
+    assert_eq!(receipt.applied, None, "only once");
+    assert!(!applied(m7, "shared"));
 }
 
-/// A file its apply could not write stays due: the next pass writes it once it can, and a pass
-/// says nothing finished until then. The subscriber's sync does the same through `failed`.
+/// An apply cut short (its state still `failed`) is finished by the next pass, with no new record.
+/// The subscriber's sync does the same through `failed`.
 #[test]
-fn a_failed_apply_is_tried_again_with_no_new_record() {
-    use std::os::unix::fs::PermissionsExt as _;
+fn an_apply_cut_short_is_finished_with_no_new_record() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
-    let (m22, m7) = (&macs.m22, &macs.m7);
+    let m7 = &macs.m7;
     let now = aterm_time::unix_millis().unwrap();
     let mut pass = NodePass::default();
-    let parent = m7.home.join(".config/gh");
-    std::fs::create_dir_all(&parent).unwrap();
-    let mode = |bits| {
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(bits)).unwrap();
-    };
-    mode(0o500);
-    test_put_everyone(m22, "~/.config/gh/hosts.yml", b"token-v1").unwrap();
-    save_records(m7, &load_records(m22).unwrap().encode()).unwrap();
-    let (receipt, _) = pass.once(m7, now, QUICK.lock_wait, &|| false).unwrap();
-    assert_eq!(receipt.said, NodePassSaid::Failed);
-    let (receipt, _) = pass.once(m7, now, QUICK.lock_wait, &|| false).unwrap();
-    assert_eq!(
-        receipt.said,
-        NodePassSaid::Failed,
-        "no pass reads this as done"
-    );
+    let _ = pass.once(m7, now, QUICK.lock_wait, &|| false).unwrap();
+    let records = load_records(m7).unwrap().encode();
+    let mut state = load_state(m7).unwrap();
+    let seq = state.seq;
+    state.failed = true;
+    save_state(m7, &state).unwrap();
+    assert!(!materialization_ready(m7).unwrap(), "CONTROL: cut short");
 
-    mode(0o700);
     let (receipt, error) = pass.once(m7, now, QUICK.lock_wait, &|| false).unwrap();
     assert_eq!(receipt.said, NodePassSaid::Done, "{error:?}");
-    assert_eq!(
-        std::fs::read(parent.join("hosts.yml")).unwrap(),
-        b"token-v1"
-    );
+    assert_eq!(receipt.applied, Some(seq));
+    assert!(!load_state(m7).unwrap().failed);
+    assert!(materialization_ready(m7).unwrap());
+    assert_eq!(load_records(m7).unwrap().encode(), records, "no new record");
 }
 
 /// A Mac that holds its vault as a log alone keeps the rule too, with no envelope to read.
 #[test]
-fn a_log_only_mac_puts_a_rewritten_file_back_once() {
+fn a_log_only_mac_applies_an_older_aterms_state_again_once() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let m7 = &macs.m7;
     let (m40, request, allowed) = newcomer(macs.root.path(), m7, "m40");
     let (bundle, _) = hand(m7, &request, &allowed, true);
     write_from_log_bundle(&m40, &bundle).unwrap();
     assert!(load_state(&m40).unwrap().digest.is_none(), "log-only");
-    let file = m40.home.join(".secrets/shared");
     let now = aterm_time::unix_millis().unwrap();
     let mut pass = NodePass::default();
     let _ = pass.once(&m40, now, QUICK.lock_wait, &|| false).unwrap();
+    let seq = load_state(&m40).unwrap().seq;
 
-    std::fs::write(&file, b"a program's").unwrap();
+    forget_held(&m40);
     let (receipt, error) = pass.once(&m40, now, QUICK.lock_wait, &|| false).unwrap();
     assert_eq!(receipt.said, NodePassSaid::Done, "{error:?}");
-    assert_eq!(std::fs::read(&file).unwrap(), b"everyone-v1");
+    assert_eq!(receipt.applied, Some(seq));
+    assert!(applied(&m40, "shared"));
 
-    std::fs::write(&file, b"a program's").unwrap();
+    forget_held(&m40);
     let (receipt, error) = pass.once(&m40, now, QUICK.lock_wait, &|| false).unwrap();
     assert_eq!(receipt.said, NodePassSaid::Done, "{error:?}");
-    assert_eq!(std::fs::read(&file).unwrap(), b"a program's", "only once");
+    assert_eq!(receipt.applied, None, "only once");
+    assert!(!applied(&m40, "shared"));
 }
 
 /// A writer on the author's lock, which no look at the state sees, makes a due heal busy within
@@ -634,9 +652,8 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
         lan.store(false, Ordering::Release);
         test_put_everyone(m22, "later", b"later-v1").unwrap();
         save_records(m7, &load_records(m22).unwrap().encode()).unwrap();
-        let later = m7.home.join(".secrets/later");
         aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the apply", || {
-            std::fs::read(&later).ok().map(|_| ())
+            applied(m7, "later").then_some(())
         });
         looks_past(5);
         assert_eq!(runners.load(Ordering::Acquire), 1, "the LAN is closed");
@@ -987,11 +1004,10 @@ fn a_ringing_loop_hears_a_new_records_file() {
         ringing.quiet(&[OFF_WATCH]);
         test_put_everyone(m22, "later", b"later-v1").expect("m22 signs an entry");
         save_records(m7, &load_records(m22).unwrap().encode()).expect("the record reaches m7");
-        let later = m7.home.join(".secrets/later");
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,
-            "the pass the new records file rang materializes its entry",
-            || (std::fs::read(&later).ok()? == b"later-v1").then_some(()),
+            "the pass the new records file rang applies its entry",
+            || applied(m7, "later").then_some(()),
         );
     });
 }

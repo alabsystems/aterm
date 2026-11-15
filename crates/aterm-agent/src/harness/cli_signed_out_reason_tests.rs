@@ -42,18 +42,17 @@ fn pool(tag: &str, default_names: &str) -> (Tmp, Env) {
     let tmp = tmp_dir(tag);
     let env = env_at(&tmp);
     let home = env.home.clone().expect("a home");
-    std::fs::create_dir_all(home.join(".secrets")).expect("mkdir");
     aterm_uds::atomic_file::write(
         env.config.as_ref().expect("a config"),
         b"[fleet]\nmachine = \"m16\"\n",
         0o600,
     )
     .expect("config");
-    std::fs::write(
-        home.join(".secrets/ai-accounts.csv"),
+    crate::vault_entry::put(
+        &home,
+        "ai-accounts.csv",
         "email,computer,codex\nelsewhere@example.test,m22,1\n",
-    )
-    .expect("source table");
+    );
     let login = |dir: &Path, names: &str, refresh: &str| {
         let access = codex_app_login::tests::make_chatgpt_jwt(Some(names), "pro", env.now + 3600);
         std::fs::create_dir_all(dir).expect("mkdir");

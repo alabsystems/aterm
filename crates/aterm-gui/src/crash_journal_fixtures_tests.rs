@@ -6,6 +6,7 @@ use crate::restore::{self, RestoreManifest};
 fn leaf(local: u64, cwd: Option<&str>, title: &str) -> restore::RestoredSplitTree {
     restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
         restore::TerminalLeafRestore {
+            pinned: false,
             sid: None,
             lineage: None,
             log_ep: None,

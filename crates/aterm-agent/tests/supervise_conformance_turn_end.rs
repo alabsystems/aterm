@@ -6,20 +6,20 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use alab_policy::config::TurnEndTiming;
+use alab_policy::needs::NEEDS_ACK;
+use alab_policy::vocab::{Phase, WallKind};
+use alab_policy::words::{DONE_CHECK, NO_WORK_ACTS, RULE_CONTINUE, RULE_DONE_CHECK};
 use aterm_agent::harness::acts::TaskFace;
 use aterm_agent::harness::upgrade::transcript_tasked;
 use aterm_agent::supervise::approvals::Typed;
-use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::exception::FUTILE_AFTER_TRIES;
-use aterm_agent::supervise::policy::needs::NEEDS_ACK;
 use aterm_agent::supervise::policy::turn_end::{
-    CommandEnter, Composer, DONE_CHECK, HostTurn, NO_WORK_ACTS, RULE_API_RETRY, RULE_CONTINUE,
-    RULE_DONE_CHECK, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, WaitKind,
-    decide_turn_end,
+    CommandEnter, Composer, HostTurn, RULE_API_RETRY, TurnEndAction, TurnEndReading, TurnEndState,
+    WaitKind, decide_turn_end,
 };
 use aterm_agent::supervise::{PriorityWord, SupervisorConfig};
 use aterm_models_harness::supervisor_turn_end_model;
-use aterm_phase::WallKind;
 use aterm_spec::derive::Model;
 
 use crate::common::cnst;
@@ -32,7 +32,7 @@ type State = BTreeMap<&'static str, i64>;
 const REFUSED: WallKind = WallKind::ApiError {
     code: Some(400),
     retryable: false,
-    cause: aterm_phase::ApiCause::Request,
+    cause: alab_policy::vocab::ApiCause::Request,
 };
 const REFUSED_MESSAGE: &str = "API Error: 400 bad request";
 
@@ -102,7 +102,7 @@ fn ours() -> Vec<Typed> {
     vec![Typed {
         at_ms: 1_000,
         text: "keep going".to_string(),
-        rule: aterm_agent::supervise::policy::turn_end::RULE_CONTINUE.to_string(),
+        rule: alab_policy::words::RULE_CONTINUE.to_string(),
     }]
 }
 
@@ -191,7 +191,7 @@ fn reading(
         seat: Default::default(),
         account: None,
         route: None,
-        autopilot: aterm_agent::supervise::Autopilot::Cruise,
+        autopilot: alab_policy::config::Autopilot::Cruise,
         login_label: None,
         autopilot_by_person: false,
         login_superseded: false,
@@ -214,7 +214,8 @@ fn reading(
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
-        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: aterm_agent::harness::goal::GoalRead::Unread,
         fact: None,
         wake: None,
     }
@@ -299,9 +300,7 @@ fn verdict(a: &TurnEndAction, st: &State) -> Verdict {
 /// [`verdict`] at a point the harness's own stop ended where `stopped` ([`Real::stopped`]).
 fn verdict_at(a: &TurnEndAction, st: &State, stopped: bool) -> Verdict {
     match a {
-        TurnEndAction::Type { text, .. }
-            if text == aterm_agent::supervise::policy::turn_end::FORWARD_RECOVERY =>
-        {
+        TurnEndAction::Type { text, .. } if text == alab_policy::words::FORWARD_RECOVERY => {
             Verdict::Recover
         }
         TurnEndAction::Type { rule_id, text } if *rule_id == continue_rule(st, stopped) => {

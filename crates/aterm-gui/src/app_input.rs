@@ -119,12 +119,41 @@ const ORDERED_EGRESS_WITNESS_GRACE: std::time::Duration = std::time::Duration::f
 #[derive(Default)]
 pub(crate) struct OutputEchoTracker {
     active_writes: AtomicUsize,
+    /// Data-capable FIFO jobs still owned by this session. They must get a chance
+    /// to settle before a cold native restore can discard its temporary shell.
+    pending_input: AtomicUsize,
     /// Every attempt to write input to the session.
     sent: AtomicU64,
     published: Mutex<OutputEchoPublished>,
     /// The Enters among those writes that submitted something composed since the last
     /// ([`crate::submit_count`], [`Self::submits`]).
     submit: crate::submit_count::SubmitCount,
+}
+
+/// One queued data-capable event, bound to its original session tracker rather
+/// than a reusable numeric session id. Rejection and cancellation drop it too.
+struct PendingInput(Arc<OutputEchoTracker>);
+
+impl Drop for PendingInput {
+    fn drop(&mut self) {
+        let prior = self.0.pending_input.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prior != 0, "one pending input token retires once");
+    }
+}
+
+fn retains_session_input(event: &InputEvent) -> bool {
+    match event {
+        InputEvent::Key { event_type, .. } => {
+            *event_type != aterm_types::keyboard::KeyEventType::Release
+                && !classify_press(event).inert_modifier
+        }
+        InputEvent::Text(text) => !text.is_empty(),
+        InputEvent::KeySequence(bytes) => !bytes.is_empty(),
+        // Framing alone is not authored input. Inspect the formatter's whole
+        // bounded payload, including a kept character after a long control prefix.
+        InputEvent::Paste(text, _) => Terminal::paste_sends_bytes(text, false),
+        _ => false,
+    }
 }
 
 /// How a paste's insert is priced for the cursor engine ([`DeliveryTicket::insert`]).
@@ -200,6 +229,8 @@ impl Deliveries {
 /// Acceptance-ordered echo evidence.
 struct OutputEchoPublished {
     order: Option<AcceptedOrder>,
+    /// Eligible data has reached the sink, even if only a prefix was accepted.
+    retained_input: bool,
     last_accepted_us: u64,
     last_boundary_us: u64,
     spill_debt: Option<bool>,
@@ -212,6 +243,7 @@ impl Default for OutputEchoPublished {
     fn default() -> Self {
         Self {
             order: None,
+            retained_input: false,
             last_accepted_us: 0,
             last_boundary_us: 0,
             spill_debt: None,
@@ -269,6 +301,7 @@ pub(crate) struct OutputEchoWrite<'a> {
     tracker: &'a OutputEchoTracker,
     counted: bool,
     kind: OutputEchoInput,
+    retain_input: bool,
     /// The queued write's [`DeliveryTicket`], published on acceptance.
     ticket: Option<DeliveryTicket>,
     /// What the write means for the session's submission count
@@ -313,6 +346,31 @@ impl OutputEchoInput {
 }
 
 impl OutputEchoTracker {
+    /// Whether replacing this session could erase accepted data or abandon an
+    /// owned FIFO input. A pending event conservatively retains the shell; a
+    /// rejected queue admission retires its token before returning to the UI.
+    /// Eligible-input acceptance never resets when transient echo timing expires.
+    pub(crate) fn retains_input(&self) -> bool {
+        self.pending_input.load(Ordering::Acquire) != 0
+            || self
+                .published
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retained_input
+    }
+
+    fn hold_input(self: &Arc<Self>, event: &InputEvent) -> Result<Option<PendingInput>, ()> {
+        if !retains_session_input(event) {
+            return Ok(None);
+        }
+        self.pending_input
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending.checked_add(1)
+            })
+            .map_err(|_| ())?;
+        Ok(Some(PendingInput(Arc::clone(self))))
+    }
+
     /// Begin immediately before the real PTY seam (never at FIFO admission).
     fn begin(&self, kind: OutputEchoInput) -> OutputEchoWrite<'_> {
         let counted = kind != OutputEchoInput::Ignored
@@ -329,6 +387,7 @@ impl OutputEchoTracker {
             tracker: self,
             counted,
             kind,
+            retain_input: false,
             ticket: None,
             submit: crate::submit_count::SubmitInput::Neither,
         }
@@ -373,6 +432,7 @@ impl OutputEchoTracker {
     pub(crate) fn begin_event(&self, ev: &InputEvent) -> OutputEchoWrite<'_> {
         let mut write = self.begin(OutputEchoInput::of(ev));
         write.submit = crate::submit_count::SubmitInput::of(ev);
+        write.retain_input = retains_session_input(ev);
         write
     }
 
@@ -480,10 +540,15 @@ impl OutputEchoTracker {
     }
 
     /// Publish one state-affecting acceptance in sink order.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one accepted receipt carries its input eligibility with the existing echo publication"
+    )]
     fn publish(
         &self,
         order: AcceptedOrder,
         kind: OutputEchoInput,
+        retain_input: bool,
         stamp: u64,
         direct: bool,
         ticket: Option<DeliveryTicket>,
@@ -496,6 +561,7 @@ impl OutputEchoTracker {
             .published
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        published.retained_input |= retain_input;
         if !published.order.is_some_and(|current| current >= order) {
             published.order = Some(order);
             match kind {
@@ -566,8 +632,15 @@ impl OutputEchoWrite<'_> {
         {
             let stamp = crate::metrics::now_us().max(1);
             let ticket = self.ticket.take();
-            self.tracker
-                .publish(order, self.kind, stamp, receipt.is_direct(), ticket, sink);
+            self.tracker.publish(
+                order,
+                self.kind,
+                self.retain_input,
+                stamp,
+                receipt.is_direct(),
+                ticket,
+                sink,
+            );
         } else if receipt.egress == input::Egress::Reported(input::Delivery::Failed)
             && let Some(ticket) = self.ticket.take()
         {
@@ -639,6 +712,7 @@ pub(crate) fn tracked_egress_metered(
 ) -> input::EgressReceipt {
     let mut write = tracker.begin_ticketed(OutputEchoInput::of(ev), ticket);
     write.submit = crate::submit_count::SubmitInput::of(ev);
+    write.retain_input = retains_session_input(ev);
     let receipt = input::seam_egress_receipt_metered(term, modes, sink, ev, mode, meter);
     write.finish(receipt, sink);
     receipt
@@ -653,6 +727,10 @@ impl Drop for OutputEchoWrite<'_> {
 #[cfg(test)]
 #[path = "app_input_output_echo_tracker_tests.rs"]
 mod output_echo_tracker_tests;
+
+#[cfg(all(test, unix))]
+#[path = "app_input_retention_tests.rs"]
+mod retention_tests;
 
 /// The IME composition clock's transition on one preedit event (`WindowState::ime_compose`).
 fn ime_compose_on_preedit(
@@ -1013,7 +1091,7 @@ pub(crate) mod paste_order {
     use std::time::Duration;
 
     use super::{
-        DeliveryTicket, InputEvent, OutputEchoTracker, SinkWriter, Terminal, Wake,
+        DeliveryTicket, InputEvent, OutputEchoTracker, PendingInput, SinkWriter, Terminal, Wake,
         tracked_egress_metered, tracked_egress_ticketed,
     };
     use aterm_core::terminal::ModeMirror;
@@ -1208,6 +1286,10 @@ pub(crate) mod paste_order {
         written: Option<SyncSender<crate::input::EgressReceipt>>,
         /// Where the writer notes the sink's input epoch once it wrote this job ([`WrittenEpoch`]).
         epoch: Option<WrittenEpoch>,
+        /// Kept through the actual write receipt, including partial acceptance.
+        _pending_input: Option<PendingInput>,
+        #[cfg(test)]
+        before_write: Option<Box<dyn FnOnce() + Send>>,
         /// Last field: payloads above are dropped before capacity is returned.
         _reservation: Reservation,
     }
@@ -1298,6 +1380,25 @@ pub(crate) mod paste_order {
     #[cfg(test)]
     thread_local! {
         static SUBMITTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static BEFORE_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Capture a gate in the next job submitted on this test thread, before it
+    /// reaches the actual worker seam. No other App or writer consumes it.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_write_gate_for_test<R>(
+        gate: impl FnOnce() + Send + 'static,
+        body: impl FnOnce() -> R,
+    ) -> R {
+        struct Reset(Option<Box<dyn FnOnce() + Send>>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_WRITE.set(self.0.take());
+            }
+        }
+        let _reset = Reset(BEFORE_WRITE.replace(Some(Box::new(gate))));
+        body()
     }
 
     /// Test-only: how many jobs this thread has handed to an ordered writer.
@@ -1343,6 +1444,10 @@ pub(crate) mod paste_order {
     }
 
     fn run_one(mut job: Job) {
+        #[cfg(test)]
+        if let Some(gate) = job.before_write.take() {
+            gate();
+        }
         crate::echo_rtt::forget_write_start();
         let supervised = job
             .completion
@@ -1576,6 +1681,11 @@ pub(crate) mod paste_order {
         epoch: Option<WrittenEpoch>,
     ) -> Result<(), Rejected> {
         let bytes = retained_bytes(&ev).ok_or(Rejected::TooLarge)?;
+        let pending_input = echo
+            .map(|echo| echo.hold_input(&ev))
+            .transpose()
+            .map_err(|()| Rejected::Unavailable)?
+            .flatten();
         let paste = matches!(ev, InputEvent::Paste(..)) || echo.is_none();
         let master = sink.master();
         let (tx, budget) = {
@@ -1613,6 +1723,9 @@ pub(crate) mod paste_order {
             control_vim,
             written,
             epoch,
+            _pending_input: pending_input,
+            #[cfg(test)]
+            before_write: BEFORE_WRITE.take(),
             _reservation: Reservation {
                 budget,
                 sink: Arc::clone(sink),
@@ -4591,6 +4704,7 @@ impl App {
                         ambiguous_width_double,
                         shell_executing,
                         front_prompt,
+                        prompt_command,
                         echo_press,
                     ) = {
                         let site = crate::metrics::TermWaitSite::Press;
@@ -4644,6 +4758,14 @@ impl App {
                         let shell_executing =
                             typed_enter && crate::quit_safety::shell_executing(&t);
                         let front_prompt = t.prompt_in_front();
+                        // Enter on an empty prompt line runs nothing, so no result follows it. Where the
+                        // shell did not say where its input starts, the line counts as typed on.
+                        let prompt_command = typed_enter
+                            && front_prompt.is_some()
+                            && t.input_region_start().is_none_or(|start| {
+                                let at = t.cursor();
+                                (at.row, at.col) != (start.row, start.col)
+                            });
                         if crate::app_render::trace_spawn_enabled() && typed_forward.is_some() {
                             crate::logging::stderr_line!(
                                 "PRESS fwd={typed_forward:?} typed={typed:?} gen={}",
@@ -4660,6 +4782,7 @@ impl App {
                             ambiguous_width_double,
                             shell_executing,
                             front_prompt,
+                            prompt_command,
                             echo_press,
                         )
                     };
@@ -4885,6 +5008,7 @@ impl App {
                             }
                         }
                         if typed_enter && !shift_enter_insert {
+                            ws.prompt_enter = prompt_command.then_some(session);
                             if shell_executing || is_alt {
                                 ws.fx.cursor_mut().glow.note_return_keeping_hand(input_now);
                             } else {
@@ -5169,6 +5293,8 @@ impl App {
                             pan_from: 0.0,
                             block_lead_s: 0.0,
                             flow: ws.fx.cursor().glow.flow_status().heat,
+                            session: aterm_effects::trail_sound::EventMeta::session_of(session),
+                            prompt: false,
                         },
                     );
                 }
@@ -9430,19 +9556,22 @@ impl App {
         }
     }
 
-    /// Hand one picker-approved path to the capability-bounded document opener.
-    fn open_local_document_path(&mut self, path: &std::path::Path) -> Result<String, String> {
-        let uri = crate::native_document_host::path_to_file_uri(path)
-            .map_err(|error| format!("document open failed: {error}"))?;
-        let kind = crate::native_app::AppKind::Markdown;
-        let admission = self.request_document_tab(kind, &uri)?;
-        Ok(
-            admission.message(&crate::app_documents::DocumentAdmissionKey {
-                uri,
-                kind,
-                edit: None,
-            }),
-        )
+    /// Hand one picker-approved path to the person's document open in the front window, which
+    /// shows there why it did not open ([`Self::open_path_for_person`]).
+    pub(crate) fn open_local_document_path(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<String, String> {
+        let Some(wid) = self.frontmost_window else {
+            let why = format!(
+                "document open failed: {}: there is no window to open it in",
+                path.display()
+            );
+            crate::logging::stderr_line!("aterm-gui: document was not opened: {why}");
+            menu::notify("Couldn’t Open File", &why);
+            return Err(why);
+        };
+        self.open_path_for_person(wid, crate::native_app::AppKind::Markdown, path, None)
     }
 
     fn choose_and_open_document(&mut self) {
@@ -9456,10 +9585,8 @@ impl App {
         let Some(path) = menu::choose_local_file(title, prompt) else {
             return;
         };
-        if let Err(error) = self.open_local_document_path(&path) {
-            crate::logging::stderr_line!("aterm-gui: selected document was not opened: {error}");
-            menu::notify("Couldn’t Open File", &error);
-        }
+        // The front window says why it did not open, or with none, stderr and aterm.log.
+        let _ = self.open_local_document_path(&path);
     }
 
     /// The window whose find field owns text input, if any.

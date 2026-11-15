@@ -836,3 +836,82 @@ fn get_v4_reuses_scratch_tiles_and_matches_direct_bake() {
     baker.clear();
     assert!(baker.scratch.is_none() && baker.eye_mask_scratch.is_none());
 }
+
+/// The flying cat's collectible bakes as the pet's glide: `spec_stretch`'s art box is
+/// `PetBakeKey::bake` of the glide face its eyes name, byte for byte, in the key's coat, iris and
+/// palette, by either bake path; the patch strip keeps its catch light. Control: a head glyph
+/// (S103) names no glide, and its art box is not the glide's.
+#[test]
+fn spec_stretch_bakes_as_the_glide() {
+    let faces = crate::kitty_pet::glide_faces(crate::kitty_pet::PetSpecies::Cat);
+    let key = |variant: CatGlyphId, eyes: EyesFrame| BakeKeyV4 {
+        variant,
+        accessory: None,
+        coat: 7,
+        iris: 2,
+        colors: CatColorKey {
+            accent: 12,
+            background: 4,
+        },
+        w: 86,
+        h: 52,
+        eyes,
+    };
+    let art_box = |tile: &Tile, w: usize| -> Vec<u8> {
+        let stride = tile.width() as usize * 4;
+        tile.pixels()
+            .chunks(stride)
+            .flat_map(|row| row[..w * 4].iter().copied())
+            .collect()
+    };
+    for (eyes, face) in [
+        (EyesFrame::Open, faces.fly),
+        (EyesFrame::Happy, faces.happy),
+        (EyesFrame::Blink, faces.blink),
+    ] {
+        let k = key(CatGlyphId::SpecStretch, eyes);
+        let glide = k.glide().expect("spec_stretch is the glide");
+        assert_eq!(glide.pose, face, "{eyes:?} names {face:?}");
+        assert_eq!((glide.coat, glide.iris, glide.colors), (7, 2, k.colors));
+        let pet = glide.bake();
+        let tile = k.bake();
+        assert_eq!(
+            tile.width(),
+            86 + u32::from(PATCH_STRIP),
+            "art + patch strip wide"
+        );
+        assert_eq!(
+            art_box(&tile, 86),
+            pet.pixels(),
+            "{eyes:?}: the art box is the pet's bake"
+        );
+        let mut scratch = None;
+        let mut eye_mask_scratch = None;
+        let scratched = k.bake_scratch(&mut scratch, &mut eye_mask_scratch);
+        assert_eq!(
+            scratched.pixels(),
+            tile.pixels(),
+            "{eyes:?}: both bake paths agree"
+        );
+        let strip = tile
+            .pixels()
+            .chunks(tile.width() as usize * 4)
+            .flat_map(|row| row[86 * 4..].iter().copied())
+            .collect::<Vec<u8>>();
+        assert!(
+            strip.iter().any(|&b| b != 0),
+            "the patch strip's catch light"
+        );
+    }
+    let head = key(CatGlyphId::S103, EyesFrame::Open);
+    assert!(head.glide().is_none(), "control: a head names no glide");
+    let pet = key(CatGlyphId::SpecStretch, EyesFrame::Open)
+        .glide()
+        .expect("glide")
+        .bake();
+    assert_ne!(
+        art_box(&head.bake(), 86),
+        pet.pixels(),
+        "control: a head's art box is not the glide"
+    );
+}

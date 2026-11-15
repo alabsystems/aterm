@@ -84,7 +84,7 @@ pub(super) const VIEW_ROWS: &[(&str, &str)] = &[
     ("tab", "this tab across every resource"),
     (
         "aterm",
-        "this aterm instance across every resource, with its parts (owner)",
+        "aterm and its proved shared app work across every resource, with parts (owner)",
     ),
     (
         "global",
@@ -176,7 +176,7 @@ const PAGE_HEAD: &str = r#"sys — what this machine, aterm and this tab use now
 USAGE
   aterm ctl @self sys [<view>] [<option>…] [--json]
   aterm ctl @self await sys <condition> [for=<dur>] [scope=tab|aterm] [timeout=<ms>]
-  @self is your own session, @<sid> another's (`aterm ctl ls` lists the s-… sids). `tab <n>` in a
+  @self is your own session, @<sid> another's (`aterm ctl ls` lists the tab IDs). `tab <n>` in a
   reply is that tab's place in its window's tab bar, from 1, never a sid.
 "#;
 
@@ -192,13 +192,13 @@ OPTIONS
 
 OUTPUT
   stderr  aterm-ctl: OK <n> sys v=1 view=<v> [scope=] [subject=] as_of=<hh:mm:ss.mmm UTC>
-          age_ms=<n> window_ms=<n> next=<cursor> [state=stale|warming] [delta=1]
+          age_ms=<n> window_ms=<n> next=<cursor> [state=…] [stalled=<lanes>] [delta=1]
   stdout  <n> lines: words for a person first (2.3c is 2.3 cores' worth of CPU per second;
           memory in GiB, disk and network in GB, MB/s), then `<kind> key=value …` records in
           base units: _mc millicores (1000 = one core), _pm per mille, _bytes, _bps bytes/s, _ms
   ≥ ≤ mark a bound (a read was refused); unavailable(<why>) is never zero; withheld=<n> counts
-  rows you may not see; state=stale: no new reading came in time. A refusal is one
-  `aterm-ctl: ERR …` line on stderr, exit 1.
+  rows you may not see; state=stale: no new reading came in time; state=partial: stalled= names
+  a held reader (aterm help sys output). A refusal is one `aterm-ctl: ERR …` line, exit 1.
 
 WAITING — aterm ctl @self await sys <condition> [timeout=<ms>]
   quiet                      cpu<25% wait<0.25 gpu<10% swap<1MB/s, and no thermal throttling
@@ -226,9 +226,10 @@ const OPTIONS_BODY: &str = r#"  aterm ctl @self sys [<view>] [scope=] [top=] [fr
   scope=pane|tab|window|request|aterm|global
       whose rows jobs, procs and disk read: pane is the target session alone, tab its split
       panes (the default), then its window, every tab of the request the target's tab is one
-      of, this aterm instance, or the machine. left takes pane, tab or aterm. cores, gpu, mem
-      and net take it and print the same rows; overview, tab, aterm, global, why and report
-      refuse it. Beyond the target's tab (disk: beyond its window) a scope is the owner's.
+      of, aterm including proved shared app work, or the machine. left takes pane, tab or
+      aterm. cores, gpu, mem and net take it and print the same rows; overview, tab, aterm,
+      global, why and report refuse it. Beyond the target's tab (disk: beyond its window) a
+      scope is the owner's.
       scope=request adds a line request=<id> tabs=<n> cpu_s= peak_mb= disk_written_mb=
       claims=<n> claimed_mb=: what its tabs' process trees spent (those that left as recorded,
       the live ones as read now; a floor, since a process that ended between reads is missed)
@@ -290,7 +291,7 @@ const OUTPUT_HEAD: &str = r#"STREAMS
 
 HEADER (stderr)
   aterm-ctl: OK <n> sys v=1 view=<v> [scope=<s>] [subject=<s>] as_of=<t> age_ms=<n>
-     window_ms=<n> next=<cursor> [state=stale|warming] [delta=1]
+     window_ms=<n> next=<cursor> [state=stale|warming|partial] [stalled=<lanes>] [delta=1]
   <n>          the lines that follow on stdout (1 with --json)
   scope=       the scope read, on the views that take one
   subject=     why's subject: global.cpu or global.mem
@@ -302,6 +303,17 @@ HEADER (stderr)
   state=stale    no new reading came within the wait: the last reading's values, with its age;
                  the first line then says when they were read and how long ago
   state=warming  the first reading of a cold instance: rates are not known yet
+  state=partial  a fresh reading in which a reader of other processes is stalled: the kernel
+                 holds its call (a process in the middle of an exec holds every read of the
+                 process table), so the figures it feeds read unavailable(stalled) while every
+                 other figure (CPU, memory, swap, disk, GPU, network) is fresh
+  stalled=     the stalled lanes: procs (the process sweep and pid counts: aterm, tab, procs,
+               wait, writes, split, top, why, jobs, left), kproc_table (the kernel's process
+               table: ages, reaping). Each view opens with one line per
+               lane: `stalled <lane>: <call> [pid=<n> (<name>)] since <t> for <span> · figures
+               <list>`; --json carries "lanes":[{"lane","state","call","pid","name","since",
+               "since_unix_ms","for_ms","figures"}] and each figure it leaves unknown as
+               {"why":"stalled","lane"}
   delta=1      a since= reply
 
 LINES (stdout)
@@ -327,11 +339,12 @@ THE OVERVIEW'S LINES
            users' threads are not read, hence ≥); GPU <n>% busy device-wide · its name · its
            cores · renderer and tiler busy percents; memory (used is app, wired and compressed
            memory), swap, disk and network
-  aterm    this instance's CPU, its share of the busy CPU, its footprint and processes
+  aterm    aterm's CPU, its share of busy CPU, footprint and processes, shared app work included
   tab <n>  this tab (its place in its window's tab bar, from 1): its program, CPU, footprint,
            and, from 25%, the share of its demand spent waiting for a core
   rest     the machine's CPU in parts: this tab, the rest of aterm, others (your other
-           processes), macOS services (by subtraction: ≈, work no other part reads included)
+           processes), measured services and a signed unaccounted remainder. Without coalition
+           counters, services includes only independently observed other-user process CPU
   more=    the other views, and where this help is
   A footprint is the sum of what macOS charges each process: shares, not a split of RAM, so
   aterm's or a tab's can pass the machine's used memory (`sys mem` names the processes).
@@ -339,11 +352,15 @@ THE OVERVIEW'S LINES
   sessions`' window=, not a place.
 
 FIGURES
-  ≥ and ≤ (JSON {"v","bound":"at_least|at_most","cause"}) mark a bound: a process refused a
-  read, so the true figure is at least or at most the one printed.
+  ≥ and ≤ (JSON {"v","bound":"at_least|at_most","cause"}) mark a bound: unread counters or
+  unresolved ownership leave the true figure at least or at most the one printed.
+  CPU includes finished work where the source proves it. cpu_charge_mc retains attributed
+  counter charge, which may repeat or miss inherited work; cpu_floor_mc is independently
+  observed own CPU. Ambiguous inherited charge leaves actual CPU at its proved floor.
   unavailable(<why>) (JSON {"why"}) is not measured here, and never zero. unsupported: no
   reader on this OS; not_sampled: this build does not read it; refused: the OS refused the
-  read; warming: one reading has no interval yet; no_counter_delta: the counters did not move;
+  read; warming: one reading has no interval yet; stalled: the reader that feeds it is held in
+  the kernel (state=partial); no_counter_delta: the counters did not move;
   walking: a folder walk is under way; lane_off:<lane>, not_enabled:<setting> and
   needs_privilege:<what>: a reader that is off, or needs what aterm never asks for. Every word:
 "#;
@@ -429,7 +446,9 @@ REPLIES (stdout; an ERR on stderr after `aterm-ctl: `)
   OK sys <metric>=<value> … [skipped=…] held_ms=<n> as_of=<hh:mm:ss UTC> next=<cursor>
   OK timeout    exit 124: not met within timeout= (default 30000 ms; a larger timeout= reads as
                 600000; timeout=0 tests one fresh reading, if one comes within its 1 s wait).
-                It names no term and no value: read `sys` to see which term fails.
+                A pending owner free-space demand also reports free_bytes, need_bytes,
+                demand and pass_in_flight; timeout does not mean its cleanup pass ended.
+                Observation-only waits name no term or value: read `sys` for that state.
   ERR unavailable <m> why=<why>, ERR gone job=<id>, ERR usage: …   exit 1
   ERR exited    the session ended
 
@@ -569,15 +588,19 @@ const WHY_BODY: &str = r#"  aterm ctl @self sys why [cpu|mem] [top=<n>] [fresh=<
 
 LINES
   why      the sentence: what is busy, mostly whose, the cause aterm names (or "no cause
-           open"), and this tab's place: its part in that cause ("this tab is the main cause",
-           "part of", "not"), or with no cause named its share of the figure ("uses most of
-           it", "a large part of it", "little of it")
+           open"), and this tab's CPU contribution: its part in that cause
+           ("this tab is the main cause", "part of", "not"), or with no cause named its share
+           of the figure ("uses most of it", "a large part of it", "little of it"). Memory
+           names charged footprint prominence, never a percentage or additive share of physical RAM
   split    (cpu) tab_mc= aterm_rest_mc= others_mc= services_mc= unaccounted_mc=, per resource
-           coalition on macOS (via=coalitions), else by subtraction
+           coalition on macOS (via=coalitions), else process and reaper evidence
+           (via=subtraction). Unknown ownership remains unaccounted; services is never guessed
+           from the positive remainder
   classes  (mem) total_bytes= app_bytes= wired_bytes= compressed_bytes= used_bytes=
            cache_bytes= free_bytes=, and a derived class
   you      this tab's role= main (at least half, the largest part), part (a fifth, or the
-           largest), minor, none or unavailable(<why>), and its share
+           largest), minor, none or unavailable(<why>). CPU includes its share_pm; memory
+           includes fp_bytes only, because footprint and physical used RAM are different accounts
   owners   (mem) fp_bytes= coalitions= live_only=1: the ranked coalitions' footprint summed
            over their live processes, and their count
   who      a coalition, busiest first (memory: by footprint), named by its lead process, which
@@ -588,7 +611,13 @@ LINES
            user) and part=others|services; then (cpu) cpu_mc= [delegated_mc=] [read_bps=
            deferred_pm=] [finished_included=1: work of members now gone is counted] cause=<id|->,
            or (mem) fp_bytes= live=<n> (its live processes). `more` and `withheld` sum the rows
-           left out
+           left out. ownership=mixed marks a coalition shared by proved app and outside work:
+           cpu_mc is its whole counter, delegated_mc its independently attributed app CPU,
+           outside_floor_mc its independently observed outside CPU. Such raw rows do not
+           form an owner partition. Memory uses current ownership proofs independently of CPU
+           history: scope=mixed keeps fp_bytes as the whole coalition charge and exposes
+           app_fp_bytes, outside_fp_bytes and outside_part; unread or unassigned charges stay
+           explicit, with scope=unknown when no current owner is proved
   cause    id= spotlight, tab-work, aterm-work, app-work, unexplained or service-memory, or a
            context: startup, wake, pressure or throttled. covers_mc= the busy figure it covers;
            since= the earliest birth of the processes that lead its coalitions; opened= when its
@@ -600,7 +629,7 @@ LINES
            may=person destructive=1: only a person can do it (`aterm help sys privacy`)
   cannot   what= a limit, never a zero: index_progress, index_folder, wired_by_process,
            uncharged_memory, coalitions (no coalition lane: Linux, Windows, or macOS's
-           self-check missed; the split is then by subtraction and no who row prints),
+           self-check missed; the split then uses process evidence and no who row prints),
            coalition_list (truncated), finished_tab_work, remedy
   CPU hardware: …  the sample, as in `sys cores`, or `not in this reading` where it took none
            (`sys cores` or `sys why fresh=0` takes one)
@@ -612,9 +641,11 @@ LINES
   A caller that is not owner-class sees only the coalitions wholly in its target's tab, never
   aterm's; the rest sum on withheld. Past 2,048 bytes a text reply moves rows into more unless
   top= is given (--json is cut by top= alone; the events a since= reply carries never are).
-  `sys global`, `sys aterm` and the overview's rest line split by subtraction over each
-  reading's own window (1 s while a focused window shows the Deck), not why's, so their parts
-  can differ from why's.
+  `sys global`, `sys aterm`, `sys tab` and the overview use why's matched coalition window
+  when available. CPU reading time and window are printed separately from the latest live
+  memory reading. Without coalition evidence, CPU uses the current common process window
+  and keeps finished native work with its authenticated submitting tab. A control client
+  launched from another terminal cannot transfer that terminal's whole coalition CPU to aterm.
 "#;
 
 const DISK_BODY: &str = r#"  aterm ctl @self sys disk [scope=pane|tab|window|request|aterm|global] [depth=<1-8>]
@@ -932,9 +963,9 @@ WHAT IT CANNOT MEASURE HERE
     scope's share of a cluster (split_mc=) reads unavailable(not_sampled).
   - CPU frequency (delivered or requested): read as unavailable.
   - GPU use per core: one device-wide figure.
-  - other users' processes one by one: "services" is the machine's CPU minus what aterm reads
-    (by subtraction), and a negative residual is printed signed; `sys why` reads them per
-    coalition.
+  - counters the OS refuses for another user's process. Coalition counters still provide
+    measured totals where available; otherwise services is an observed own-CPU floor and
+    unknown work remains in the signed unaccounted remainder.
   - the size of a folder it does not walk (protected, another user's, remote, removable, too
     broad): unavailable(<why>), never zero.
   - which program macOS's program check holds, or stranded when syspolicyd crashed and

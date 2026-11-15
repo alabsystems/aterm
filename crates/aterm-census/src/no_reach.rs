@@ -9,8 +9,7 @@
 //!
 //! A path is in the class when it is one of:
 //! - **root Markdown**: a `*.md` file at the repository root (`CHANGELOG.md` included: changelog
-//!   fragments, §2.1b, retired the test that read it, and verify's changelog guard, which the
-//!   census check runs, judges its structure on every merge `verify land` rechecks);
+//!   fragments, §2.1b, retired the test that read it, and only the release reads it);
 //! - **docs Markdown**: `docs/**/*.md` with no `Cargo.toml` in `docs/` or any directory between it
 //!   and the file, so no package (member, fork or path dependency) owns it;
 //! - **a member's spec table**: `<dir>/SPECS.md` where `<dir>/Cargo.toml` exists and `<dir>` is a
@@ -126,17 +125,67 @@ pub const SOURCE: &str = include_str!("no_reach.rs");
 /// Whether Rust source `text` names `path` in code: a string literal or an include argument
 /// holds it, or a code token does, in the file or in a Rust code block of its doc comments (a
 /// doctest, which `targo test --doc` builds and runs: [`doctests`]). A comment that names it
-/// elsewhere does not; text that does not lex names it (nothing can say where it sits).
+/// elsewhere does not, nor does a string's [`cited`] mention of it; text that does not lex
+/// names it (nothing can say where it sits).
 #[must_use]
 pub fn names(text: &str, path: &str) -> bool {
-    if !text.contains(path) {
+    names_within(text, path, path)
+}
+
+/// [`names`] of `needle`, a [`needles`] entry of no-reach `path`: a string's [`cited`] mention
+/// of `path` holds none of the needles it spells.
+fn names_within(text: &str, needle: &str, path: &str) -> bool {
+    if !text.contains(needle) {
         return false;
     }
-    if names_code(text, path) {
+    if names_code(text, needle, path) {
         return true;
     }
     let doctests = doctests(text);
-    doctests.contains(path) && names_code(&doctests, path)
+    doctests.contains(needle) && names_code(&doctests, needle, path)
+}
+
+/// `value`, a string literal's value, with each citation of no-reach `path` blanked where
+/// `path` holds a `/` (a root file's is never one): `path` spelled whole right after a `(` that starts a whitespace-separated word of `value` (the
+/// value's start, or after a blank), and right before the word's end, a blank, or one of
+/// `)`, `,`, `;`, `:`, or a `.` that ends the word: the prose form a message uses to point a
+/// person at a section, `(docs/RELEASING.md § Resume)`.
+///
+/// Such a word reads nothing. As a path, from any directory or joined under one, it names a
+/// directory `(docs`, not the file. A shell reads `(` as opening a subshell whose first word,
+/// the path, it would run rather than read (and the land requires the file to be no executable:
+/// mode 100644 on every side); zsh reads a `(…)` argument as a glob group, which may hold no
+/// `/`, so `cat (AGENTS.md)` would read a root file and is no citation. A program that cut the path out of its own message would read
+/// it; none does, and that is this rule's one assumption. Every other spelling stays a read:
+/// a bare or quoted path, `see docs/X.md`, `{root}/docs/X.md`, `--file=docs/X.md`, a word
+/// that only holds a `(` further in (`(cat<docs/X.md)`), a citation glued to more path
+/// (`(docs/X.md/y`, `(docs/X.mdx`), and a literal whose value has an escape Rust lacks.
+#[must_use]
+pub fn cited<'a>(value: &'a str, path: &str) -> std::borrow::Cow<'a, str> {
+    let mut out: Option<String> = None;
+    if !path.contains('/') {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let opener = format!("({path}");
+    for (at, _) in value.match_indices(&opener) {
+        let starts_word = value[..at]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+        let rest = &value[at + opener.len()..];
+        let mut after = rest.chars();
+        let ends_word = match after.next() {
+            None => true,
+            Some(c) if c.is_whitespace() || matches!(c, ')' | ',' | ';' | ':') => true,
+            Some('.') => after.next().is_none_or(char::is_whitespace),
+            Some(_) => false,
+        };
+        if starts_word && ends_word {
+            let blanked = out.get_or_insert_with(|| value.to_owned());
+            blanked.replace_range(at + 1..at + opener.len(), &" ".repeat(path.len()));
+        }
+    }
+    out.map_or(std::borrow::Cow::Borrowed(value), std::borrow::Cow::Owned)
 }
 
 /// The text `verify land` searches the merge for, for each shared no-reach `path`: its file name
@@ -191,9 +240,9 @@ pub fn may_read(file: &str, text: &str, path: &str) -> bool {
     let blocks = if rust { String::new() } else { fenced(text) };
     let named = |needle: &str| {
         if rust {
-            names(text, needle)
+            names_within(text, needle, path)
         } else {
-            blocks.contains(needle) && names_code(&blocks, needle)
+            blocks.contains(needle) && names_code(&blocks, needle, path)
         }
     };
     match spec_dir {
@@ -384,25 +433,43 @@ fn rust_info(info: &str) -> bool {
         })
 }
 
-/// [`names`] of `text` itself, its doctests apart.
-fn names_code(text: &str, path: &str) -> bool {
+/// [`names_within`] of `text` itself, its doctests apart: a string literal [`Source::strings`]
+/// reads is judged by its value with `path`'s [`cited`] mentions blanked, and is passed over as
+/// a code token; every other token (an include's or `#[path]`'s literal among them) by its text.
+///
+/// [`Source::strings`]: crate::items::Source::strings
+fn names_code(text: &str, needle: &str, path: &str) -> bool {
     let Some(source) = crate::items::Source::read(text.to_owned()) else {
         return true;
     };
-    source
-        .strings()
-        .any(|(value, _)| value.is_none_or(|value| value.contains(path)))
-        || source.includes().iter().any(|include| match &include.arg {
-            crate::items::IncludeArg::Relative(arg) | crate::items::IncludeArg::ManifestDir(arg) => {
-                arg.contains(path)
+    let mut strings = BTreeSet::new();
+    for (value, at) in source.strings() {
+        match value {
+            None => return true,
+            Some(value) if cited(value, path).contains(needle) => return true,
+            Some(_) => {
+                strings.insert(at);
             }
-            crate::items::IncludeArg::OutDir | crate::items::IncludeArg::Unknown => false,
-        })
-        || source.code().iter().any(|token| token.text.contains(path))
+        }
+    }
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    let offset =
+        |token: &crate::items::Shipped<'_>| line_starts[token.line - 1] + token.before.len();
+    source.includes().iter().any(|include| match &include.arg {
+        crate::items::IncludeArg::Relative(arg) | crate::items::IncludeArg::ManifestDir(arg) => {
+            arg.contains(needle)
+        }
+        crate::items::IncludeArg::OutDir | crate::items::IncludeArg::Unknown => false,
+    }) || source
+        .code()
+        .iter()
+        .any(|token| token.text.contains(needle) && !strings.contains(&offset(token)))
         || source
             .mounts()
             .iter()
-            .any(|mount| matches!(&mount.path, crate::items::MountPath::Literal(at) if at.contains(path)))
+            .any(|mount| matches!(&mount.path, crate::items::MountPath::Literal(at) if at.contains(needle)))
 }
 
 fn has_glob(pattern: &str) -> bool {

@@ -114,7 +114,7 @@ fn sizes(cpu: u64, gpu: u64) -> Value {
 
 /// WITHOUT A RUSTUP THE WASM BUILDS END COULD NOT RUN NAMING THE WORKSPACE PROVIDER: where
 /// the `rustup` row finds none (no stamped copy, nothing on PATH), the lanes that build
-/// the web modules (wasm-smoke among them) refuse the machine, saying where the row looked
+/// the web modules (`browser` and the replay among them) refuse the machine, saying where the row looked
 /// and naming `verify provision` (its provider) once, never Homebrew, even with a keg on
 /// disk. Negative control: a rustup that is found gets past this refusal to the next
 /// question (here, a stand-in with no wasm32 std).
@@ -165,23 +165,25 @@ fn with_no_rustup_the_wasm_builds_could_not_run_naming_verify_provision() {
 
 #[test]
 fn the_wasm_module_ceilings_hold_absolutely() {
-    assert!(wasm_module_fences(&sizes(4_703_802, 4_901_631)).is_empty());
-    assert!(wasm_module_fences(&sizes(5_886_685, 6_133_315)).is_empty());
-    let cpu_over = wasm_module_fences(&sizes(5_886_686, 6_133_315));
+    let cpu_cap = WASM_CPU_MODULE_BYTES_CAP as u64;
+    let gpu_cap = WASM_GPU_MODULE_BYTES_CAP as u64;
+    assert!(wasm_module_fences(&sizes(cpu_cap, gpu_cap)).is_empty());
+    let cpu_over = wasm_module_fences(&sizes(cpu_cap + 1, gpu_cap));
     assert_eq!(cpu_over.len(), 1);
-    assert!(cpu_over[0].starts_with("wasm_cpu_module_bytes 5886686 B > ceiling"));
-    let gpu_over = wasm_module_fences(&sizes(5_886_685, 6_133_316));
+    assert!(cpu_over[0].starts_with("wasm_cpu_module_bytes "));
+    let gpu_over = wasm_module_fences(&sizes(cpu_cap, gpu_cap + 1));
     assert_eq!(gpu_over.len(), 1);
-    assert!(gpu_over[0].starts_with("wasm_gpu_module_bytes 6133316 B > ceiling"));
-    assert_eq!(wasm_module_fences(&sizes(5_886_686, 6_133_316)).len(), 2);
+    assert!(gpu_over[0].starts_with("wasm_gpu_module_bytes "));
     assert_eq!(
-        wasm_module_fences(&json("{\"wasm_cpu_module_bytes\":1}")),
-        ["wasm_gpu_module_bytes missing from the bench report"]
+        wasm_module_fences(&sizes(cpu_cap + 1, gpu_cap + 1)).len(),
+        2
     );
-    assert_eq!(
-        wasm_module_fences(&json("{\"wasm_gpu_module_bytes\":1}")),
-        ["wasm_cpu_module_bytes missing from the bench report"]
-    );
+    let missing_gpu = wasm_module_fences(&json("{\"wasm_cpu_module_bytes\":1}"));
+    assert_eq!(missing_gpu.len(), 1);
+    assert!(missing_gpu[0].starts_with("wasm_gpu_module_bytes "));
+    let missing_cpu = wasm_module_fences(&json("{\"wasm_gpu_module_bytes\":1}"));
+    assert_eq!(missing_cpu.len(), 1);
+    assert!(missing_cpu[0].starts_with("wasm_cpu_module_bytes "));
 }
 
 /// The floors are judged and recorded only in the pinned shell: another
@@ -212,26 +214,101 @@ fn the_floors_are_judged_only_in_the_pinned_shell() {
 #[test]
 fn each_gated_keys_samples_print_in_lane_order() {
     let report = json(
-        "{\"samples\":{\"wasm_gpu_frame_build_fps\":[3,4.5],\
+        "{\"samples\":{\"wasm_gpu_typing_render_fps\":[3,4.5],\
          \"wasm_cpu_ingest_mixed_mbps\":[1,2],\"ungated\":[9]}}",
     );
     assert_eq!(
         sample_lines(&report),
         [
             "wasm_cpu_ingest_mixed_mbps: n=2 [1 2]",
-            "wasm_gpu_frame_build_fps: n=2 [3 4.5]"
+            "wasm_gpu_typing_render_fps: n=2 [3 4.5]"
         ]
     );
     assert!(sample_lines(&json("{}")).is_empty());
 }
 
+/// Compare already built modules under the same real browser driver and fresh timing admission.
+#[cfg(unix)]
 #[test]
-fn a_planted_frame_hash_changes_one_digit_of_the_first_frame() {
-    let a = "0".repeat(64);
-    let b = "f".repeat(64);
-    let text = format!("[\"x\",{{\"rgba\":\"{a}\"}}],\n[\"y\",{{\"rgba\":\"{b}\"}}]");
-    let (planted, hash) = plant_frame_hash(&text).expect("a frame to plant");
-    assert_eq!(hash, format!("1{}", &a[1..]));
-    assert_eq!(planted, text.replacen(&a, &hash, 1));
-    assert!(plant_frame_hash("{\"answers\": []}").is_none());
+#[ignore = "manual paired browser measurement; requires ATERM_WASM_BASE_SITE, ATERM_WASM_AFTER_SITE and ATERM_WASM_PAIR_REPORT"]
+fn paired_prebuilt_browser_costs() {
+    let path = |key| std::path::PathBuf::from(std::env::var_os(key).expect(key));
+    let base = path("ATERM_WASM_BASE_SITE");
+    let after = path("ATERM_WASM_AFTER_SITE");
+    let report = path("ATERM_WASM_PAIR_REPORT");
+    assert!(
+        !report.exists(),
+        "use a fresh report path to retain each cohort"
+    );
+    assert_ne!(base.canonicalize().unwrap(), after.canonicalize().unwrap());
+    let assets = ["cpu/aterm_wasm_bg.wasm", "gpu/aterm_gpu_web_bg.wasm"];
+    let before: Vec<_> = [&base, &after]
+        .into_iter()
+        .map(|site| assets.map(|name| std::fs::read(site.join(name)).unwrap()))
+        .collect();
+    assert!(before[0] != before[1], "both WASM modules are identical");
+    let browser = wasm_page::browser().expect("provision the pinned browser with verify provision");
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let root = workspace_root();
+    let mut records = Vec::new();
+    for pair in 0..4 {
+        let order = if pair % 2 == 0 {
+            [("base", &base), ("after", &after)]
+        } else {
+            [("after", &after), ("base", &base)]
+        };
+        for (side, site) in order {
+            wasm_page::lay_drivers(&root, site).unwrap();
+            let mut page = Page::start(&browser, site, scratch.path()).unwrap();
+            let entry = super::super::measurement_entry().unwrap();
+            let ran = page
+                .run(
+                    &format!("{}/bench.mjs", wasm_page::DRIVERS),
+                    &json!({"cpu":"../cpu/aterm_wasm.js", "gpu":"../gpu/aterm_gpu_web.js",
+                        "font":format!("../{}", wasm_page::FONT)}),
+                )
+                .unwrap();
+            let qualified = entry.timing_admission();
+            eprintln!(
+                "paired wasm: pair={pair} side={side} browser={}",
+                page.product()
+            );
+            records.push(json!({"pair":pair,"side":side,"browser":page.product(),
+                                "timing_qualified":qualified.is_ok(),
+                                "report":ran.value.clone(),"console":ran.console.clone()}));
+            super::super::publication::publish(&report, &json!({"records":records}).to_string())
+                .unwrap();
+            qualified.unwrap();
+            for key in WASM_LANE.keys {
+                assert!(
+                    ran.value
+                        .get(*key)
+                        .and_then(Value::as_f64)
+                        .is_some_and(|v| v.is_finite() && v > 0.0),
+                    "{key}"
+                );
+                assert_eq!(
+                    ran.value
+                        .get("samples")
+                        .unwrap()
+                        .get(*key)
+                        .unwrap()
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    5,
+                    "{key}"
+                );
+            }
+        }
+    }
+    for (i, site) in [&base, &after].into_iter().enumerate() {
+        for (j, name) in assets.into_iter().enumerate() {
+            assert_eq!(
+                std::fs::read(site.join(name)).unwrap(),
+                before[i][j],
+                "asset changed during measurement: {name}"
+            );
+        }
+    }
 }

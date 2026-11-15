@@ -50,7 +50,7 @@ impl Keychain {
 
 impl Item for Keychain {
     fn id(&self) -> String {
-        format!("init.github.keychain@{}", self.user.name)
+        format!("{}.keychain@{}", super::ID, self.user.name)
     }
     fn family(&self) -> &'static str {
         "github"

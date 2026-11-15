@@ -129,8 +129,8 @@ fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
 
     for (dial, laws) in [
         (1, &["PartsSumToWhole", "ResidualIsShown"][..]),
-        (2, &["DelegatedCountedOnce", "PartsSumToWhole"]),
-        (3, &["PartsNeverNegative"]),
+        (2, &["DelegatedCountedOnce"]),
+        (3, &["DelegatedCountedOnce", "PartsNeverNegative"]),
         (4, &["ResidualIsShown"]),
         (5, &["MatchedWindowsOnly"]),
         (6, &["ExitedWorkStaysCounted"]),
@@ -146,8 +146,33 @@ fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
     assert_eq!((s["g"], s["l"], s["d"]), (1, 1, 2));
     assert_eq!(
         (s["moved"], s["others"], s["tab"], s["rest"], s["residual"]),
-        (1, 0, 2, 0, -1)
+        (2, 0, 2, 0, -1)
     );
+
+    let mut s = model.init_state();
+    for action in [
+        "DelegatedWork",
+        "DelegatedAhead",
+        "ForeignAhead",
+        "Move",
+        "Close",
+    ] {
+        assert!(model.fire(action, &mut s), "{action}");
+    }
+    assert_eq!((s["l"], s["d"], s["f"]), (1, 2, 1));
+    assert_eq!(
+        (s["moved"], s["others"], s["tab"], s["residual"]),
+        (2, 1, 2, -2),
+        "delegated and foreign own floors survive independently of the lower raw coalition counter"
+    );
+    for law in [
+        "PartsSumToWhole",
+        "PartsNeverNegative",
+        "ResidualIsShown",
+        "DelegatedCountedOnce",
+    ] {
+        assert!(model.check_invariant(law, &s), "{law}");
+    }
 
     let run = [
         "ExitedWork",

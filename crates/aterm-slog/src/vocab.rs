@@ -603,7 +603,7 @@ impl Actor {
     /// The session `sid` of node `node` driving this Mac over the fleet, as every record of a
     /// drive names it: `fleet:<head>:<sid>`, `<head>` the node id's first [`FLEET_NODE_HEAD`]
     /// characters (each outside the id alphabet as `-`) and `<sid>` `-` where the drive names no
-    /// session aterm minted ([`aterm_types::control_verbs::is_minted_sid`]), so a whole sid always
+    /// session aterm minted ([`aterm_types::tab_id::is_tab_id`]), so a whole sid always
     /// fits [`ShortId::MAX`]; [`Actor::Nobody`] for a node with nothing to name. The sid is the
     /// driving Mac's claim, scoped by the node its handshake proved.
     #[must_use]
@@ -624,7 +624,7 @@ impl Actor {
             return Actor::Nobody;
         }
         let sid = sid
-            .filter(|sid| aterm_types::control_verbs::is_minted_sid(sid))
+            .filter(|sid| aterm_types::tab_id::is_tab_id(sid))
             .unwrap_or("-");
         ShortId::new(&format!("{FLEET_ACTOR_PREFIX}{head}:{sid}"))
             .map_or(Actor::Nobody, Actor::Fleet)

@@ -23,14 +23,14 @@ mod network_place;
 /// Command help. Mutation request IDs are caller-held, so lost replies are safely retried.
 pub const USAGE: &str = "aterm db — encrypted embedded application databases (Unix)\n\
   The owner's tables, read from the registry and never from the fleet tables below:\n\
-  emails|computers|phones|ai-accounts [--show-addresses] | --digest | --edit\n\
-                    | set <row> <column> [<value> | --stdin]\n\
+  emails|computers|phones|ai-accounts [--edit | set <row> <column> [<value> | --stdin]]\n\
                                        each answer says its `state` (live, held, never or off);\n\
                                        ai-accounts and computers are the shared files\n\
                                        ai/accounts and lab/machines, read from this Mac's\n\
-                                       snapshot whatever its Commons is doing (`aterm file`)\n\
-  emails --show-passwords | phones --show-numbers\n\
-                                       plaintext only in a person's own tab, at a terminal\n\
+                                       snapshot whatever its Commons is doing (`aterm file`);\n\
+                                       a password never shows: its cell names its `aterm\n\
+                                       secrets` entry (or shows •••••• where the registry still\n\
+                                       holds it sealed), and it is set only from --stdin\n\
   Fleet relational tables (backed by astream + aterm-net at ~/.aterm/lab-db, no --dir needed):\n\
   tables                               summary, row counts and foreign-key integrity\n\
   scan [<table>] [--show-passwords]    every row of computers|emails|phones|ai_accounts\n\
@@ -41,7 +41,8 @@ pub const USAGE: &str = "aterm db — encrypted embedded application databases (
   dump [<file>] [--show-passwords]     export all 4 tables as JSON; only a dump to <file> can be\n\
                                        loaded back, because stdout redacts passwords\n\
   load <file>                          write the rows of a dump that differ from what is stored\n\
-  bootstrap [<secrets-dir>]            add rows from the legacy CSVs; a key already used is left alone\n\
+  bootstrap [<sheets-dir>]             add rows from the legacy CSVs (the vault's entries, or a\n\
+                                       folder's files); a key already used is left alone\n\
   rekey                                move this database's rows onto the current fleet key after a\n\
                                        rotation or a new fleet, keeping the old folder beside it;\n\
                                        run it again to finish a move cut short\n\

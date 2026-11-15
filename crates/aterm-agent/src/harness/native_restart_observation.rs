@@ -37,17 +37,17 @@ fn existing_owned_plain_dir(dir: &std::path::Path) -> std::io::Result<bool> {
     }
 }
 
-fn ensure_observation_dir(opts: &Opts) -> std::io::Result<std::path::PathBuf> {
-    if !existing_owned_plain_dir(&opts.state)? {
-        std::fs::create_dir_all(&opts.state)?;
-        if !existing_owned_plain_dir(&opts.state)? {
+fn ensure_observation_dir(state: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    if !existing_owned_plain_dir(state)? {
+        std::fs::create_dir_all(state)?;
+        if !existing_owned_plain_dir(state)? {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("{}: not this user's plain directory", opts.state.display()),
+                format!("{}: not this user's plain directory", state.display()),
             ));
         }
     }
-    let dir = opts.state.join("native-observations");
+    let dir = state.join("native-observations");
     if !existing_owned_plain_dir(&dir)? {
         std::fs::create_dir_all(&dir)?;
         if !existing_owned_plain_dir(&dir)? {
@@ -60,20 +60,59 @@ fn ensure_observation_dir(opts: &Opts) -> std::io::Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-fn path(opts: &Opts, tab: &str) -> std::path::PathBuf {
-    opts.state
+fn path(state: &std::path::Path, tab: &str) -> std::path::PathBuf {
+    state
         .join("native-observations")
         .join(aterm_codec::hex::encode_lower(tab.as_bytes()))
 }
 
-pub(super) fn read(opts: &Opts, tab: &str) -> Option<Observed> {
-    if !existing_owned_plain_dir(&opts.state).ok()?
-        || !existing_owned_plain_dir(&opts.state.join("native-observations")).ok()?
+/// The records whose observers are at work in this process ([`Turn`]).
+static OBSERVING: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// One observer's turn at a tab's record: from its read of the record to its last save of it
+/// ([`observe_live`]), no other observer of this process reads it to change it or saves it
+/// ([`save`] takes the turn). Several threads observe one tab (the snapshot read that lands
+/// late, the record follow, the worker), and a save is a temporary flushed durably and then
+/// renamed: without the turn, an observer whose flush is slow renames the state it read before
+/// over the binding another observer had acknowledged since. Once the vendor is dead nothing
+/// writes the record again, so its crash has no proof and its relaunch waits on one for good
+/// (measured 2026-11-13 on a loaded Mac: a record renamed 0.76 s after its temporary was
+/// written, over an acknowledged binding, 0.1 s after the restart that ended the vendor).
+pub(super) struct Turn(std::path::PathBuf);
+
+impl Turn {
+    /// The turn at `tab`'s record under `state`, or `None` while another observer has it: that
+    /// one's result stands, and the next observation takes its own turn.
+    pub(super) fn take(state: &std::path::Path, tab: &str) -> Option<Self> {
+        let record = path(state, tab);
+        // The lock is given back before a turn exists: a turn made and dropped under it (the
+        // refused one) would take the lock again in its drop, and end the other observer's turn.
+        let taken = OBSERVING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(record.clone());
+        taken.then(|| Self(record))
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        OBSERVING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+pub(super) fn read(state: &std::path::Path, tab: &str) -> Option<Observed> {
+    if !existing_owned_plain_dir(state).ok()?
+        || !existing_owned_plain_dir(&state.join("native-observations")).ok()?
     {
         return None;
     }
     let bytes = aterm_uds::runs::read_bounded_regular_text(
-        &path(opts, tab),
+        &path(state, tab),
         (native_observe::MAX_REQUEST * 2) as u64,
     )
     .ok()?;
@@ -102,7 +141,8 @@ pub(super) fn read(opts: &Opts, tab: &str) -> Option<Observed> {
     })
 }
 
-pub(super) fn save(opts: &Opts, tab: &str, observed: &Observed) -> std::io::Result<()> {
+/// Save `observed` as the record `turn` is the turn at.
+pub(super) fn save(turn: &Turn, observed: &Observed) -> std::io::Result<()> {
     let request = native_observe::Request::Register(observed.registration.clone())
         .encode()
         .ok_or_else(|| std::io::Error::other("invalid passive registration"))?;
@@ -112,16 +152,20 @@ pub(super) fn save(opts: &Opts, tab: &str, observed: &Observed) -> std::io::Resu
             .encode()
             .ok_or_else(|| std::io::Error::other("invalid passive binding"))?,
     };
-    let dir = ensure_observation_dir(opts)?;
-    let path = dir.join(aterm_codec::hex::encode_lower(tab.as_bytes()));
+    let path = &turn.0;
+    let state = path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| std::io::Error::other("a record outside its directory"))?;
+    ensure_observation_dir(state)?;
     let body = format!("{request}\n{binding}\n");
     #[cfg(unix)]
     {
-        aterm_uds::atomic_file::write(&path, body.as_bytes(), 0o600)
+        aterm_uds::atomic_file::write(path, body.as_bytes(), 0o600)
     }
     #[cfg(not(unix))]
     {
-        super::super::atomic_write::write_atomic(&path, &body)
+        super::super::atomic_write::write_atomic(path, &body)
     }
 }
 
@@ -166,7 +210,11 @@ pub(crate) fn observe_live(opts: &Opts, snap: &super::super::relaunch::Snapshot)
     else {
         return;
     };
-    let mut observed = match read(opts, &snap.tab) {
+    // Taken before the record is read and held to the last save: see [`Turn`].
+    let Some(turn) = Turn::take(&opts.state, &snap.tab) else {
+        return;
+    };
+    let mut observed = match read(&opts.state, &snap.tab) {
         Some(previous)
             if previous.registration.vendor == process
                 && previous.registration.shell == shell
@@ -194,14 +242,14 @@ pub(crate) fn observe_live(opts: &Opts, snap: &super::super::relaunch::Snapshot)
         native_observe::Request::Refresh,
     );
     // Preserve the exact id/facts before dispatch; a lost registration ACK replays those facts.
-    if observed.binding.is_none() && save(opts, &snap.tab, &observed).is_err() {
+    if observed.binding.is_none() && save(&turn, &observed).is_err() {
         return;
     }
     match native_observe::exchange(&mut client, &snap.tab, &request) {
         Ok(native_observe::Reply::Registered(binding)) => {
             if observed.binding.as_ref() != Some(&binding) {
                 observed.binding = Some(binding);
-                let _saved = save(opts, &snap.tab, &observed);
+                let _saved = save(&turn, &observed);
             }
         }
         Ok(native_observe::Reply::Unknown)
@@ -215,7 +263,7 @@ pub(crate) fn observe_live(opts: &Opts, snap: &super::super::relaunch::Snapshot)
             if let Ok(id) = native_act::operation_id() {
                 observed.registration.id = id;
                 observed.binding = None;
-                let _saved = save(opts, &snap.tab, &observed);
+                let _saved = save(&turn, &observed);
             }
         }
         _ => {}
@@ -244,7 +292,7 @@ pub(super) fn captured(
             registration: saved.registration,
             binding: Some(saved.binding),
         })
-        .or_else(|| read(opts, &snap.tab))?;
+        .or_else(|| read(&opts.state, &snap.tab))?;
     let binding = observed.binding?;
     let process = &observed.registration.vendor;
     (process.pid == snap.pid
@@ -256,3 +304,7 @@ pub(super) fn captured(
 #[cfg(test)]
 #[path = "native_restart_observation_constructor_tests.rs"]
 mod constructor_tests;
+
+#[cfg(test)]
+#[path = "native_restart_observation_turn_tests.rs"]
+mod turn_tests;

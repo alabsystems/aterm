@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Init disables data-volume indexing in its root transaction. Cache placement also keeps
-//! Rust docs and build output out of Spotlight if indexing is enabled outside setup.
+//! Init stops Spotlight indexing the home folders a person does not search, in its root
+//! transaction ([`Scope`]).
+//! Cache placement also keeps Rust docs and build output out of Spotlight.
 
 use crate::init_observe::{LastReading, Reading, TOOLCHAIN_NOTE};
 use crate::items::{Ctx, Item};
-use crate::model::{Probe, User};
+use crate::model::{PValue, Probe, User};
 use crate::port::{Cmd, System};
 use aterm_toolchain::layout;
+use aterm_types::macos_setup::spotlight_scope::{self, State as Standing};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -18,77 +20,360 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// The group's id, as `aterm init --only` and every remedy that names it spell it.
 pub const ID: &str = "init.spotlight";
 
-/// Apple's indexing manager and the writable macOS data volume.
-const MDUTIL: &str = "/usr/bin/mdutil";
-const DATA_VOLUME: &str = "/System/Volumes/Data";
+/// The root step's id ([`Scope`]).
+pub const SCOPE_ID: &str = "init.spotlight.scope";
 
-/// Read the data volume's indexing state. Unknown or failed output never means disabled.
-///
-/// # Errors
-/// The command failed or did not report exactly one recognized state.
-pub(crate) fn indexing(sys: &dyn System) -> Result<bool, String> {
-    let ran = sys
-        .run_complete_output(&Cmd::new(MDUTIL).args(["-s", DATA_VOLUME]))
-        .map_err(|error| error.to_string())?;
-    if !ran.success() {
-        return Err(format!("Spotlight status: {}", ran.describe()));
+/// Apple's indexing manager and the writable macOS data volume, as the shared reading names
+/// them.
+const MDUTIL: &str = spotlight_scope::MDUTIL;
+const DATA_VOLUME: &str = spotlight_scope::DATA_VOLUME;
+
+/// Apple's property-list editor: each value is its own argument, so a folder's name needs no
+/// quoting, and an edit keeps the file's format.
+const PLUTIL: &str = "/usr/bin/plutil";
+
+/// `killall`, which ends `mds` so launchd starts one that reads the new list.
+const KILLALL: &str = "/usr/bin/killall";
+
+/// The data volume's Spotlight configuration, which only root reads or writes. Its
+/// [`EXCLUSIONS`] array is the list of folders Spotlight leaves out.
+const VOLUME_CONFIG: &str = "/System/Volumes/Data/.Spotlight-V100/VolumeConfiguration.plist";
+
+/// The key of the excluded folders in [`VOLUME_CONFIG`]: an array of path strings.
+const EXCLUSIONS: &str = "Exclusions";
+
+/// The receipt [`Scope`]'s apply leaves, which every reading goes by
+/// ([`spotlight_scope::RECEIPT`]).
+pub const SCOPE_RECEIPT: &str = spotlight_scope::RECEIPT;
+
+/// The folders a failed apply could not exclude ([`spotlight_scope::REFUSED`]).
+pub const SCOPE_REFUSED: &str = spotlight_scope::REFUSED;
+
+/// `sys` as the shared reading's port ([`spotlight_scope::Reads`]): the reading itself is
+/// `aterm-types`' so the window, which does not link this crate outside its tests, makes the
+/// same one from its own file reads.
+struct Port<'a>(&'a dyn System);
+
+impl spotlight_scope::Reads for Port<'_> {
+    fn macos(&self) -> bool {
+        self.0.macos()
     }
-    let text = std::str::from_utf8(&ran.stdout).map_err(|error| error.to_string())?;
-    match (
-        text.lines().any(|line| line.trim() == "Indexing enabled."),
-        text.lines().any(|line| line.trim() == "Indexing disabled."),
-    ) {
-        (true, false) => Ok(true),
-        (false, true) => Ok(false),
-        _ => Err("Spotlight indexing status is unrecognized".into()),
+
+    fn euid(&self) -> u32 {
+        self.0.euid()
+    }
+
+    fn home(&self) -> Option<PathBuf> {
+        self.0.account_home()
+    }
+
+    fn entry(&self, path: &Path) -> io::Result<spotlight_scope::Entry> {
+        self.0.stat(path).map(|stat| spotlight_scope::Entry {
+            uid: stat.uid,
+            dir: stat.dir,
+            symlink: stat.symlink,
+        })
+    }
+
+    fn names(&self, dir: &Path) -> io::Result<Vec<String>> {
+        self.0.list_dir(dir)
+    }
+
+    fn root_file(&self, path: &Path, max: usize) -> io::Result<Vec<u8>> {
+        self.0.read_owned_file(path, 0, max, false)
+    }
+
+    fn volume_status(&self) -> Result<Vec<u8>, String> {
+        let ran = self
+            .0
+            .run_complete_output(&Cmd::new(MDUTIL).args(["-s", DATA_VOLUME]))
+            .map_err(|error| error.to_string())?;
+        if ran.success() {
+            Ok(ran.stdout)
+        } else {
+            Err(format!("Spotlight status: {}", ran.describe()))
+        }
     }
 }
 
-/// Disable indexing in setup's existing root transaction, without moving any user files.
-pub(crate) struct Indexing;
+/// The folders of `home` Spotlight should leave out ([`spotlight_scope::wanted`]).
+///
+/// # Errors
+/// The home folder could not be listed.
+fn wanted(sys: &dyn System, home: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    spotlight_scope::wanted(&Port(sys), home)
+}
 
-impl Item for Indexing {
+/// The paths root's file at `file` lists ([`spotlight_scope::listed`]).
+///
+/// # Errors
+/// A file stands there that is not root's own regular file, or it could not be read.
+fn listed(sys: &dyn System, file: &str) -> Result<BTreeSet<PathBuf>, String> {
+    spotlight_scope::listed(&Port(sys), file)
+}
+
+/// Write `paths`, one a line, as root's file at `file`, readable by every account.
+fn list(sys: &dyn System, file: &str, paths: &BTreeSet<PathBuf>) -> Result<(), String> {
+    let text: String = paths
+        .iter()
+        .map(|path| format!("{}\n", path.display()))
+        .collect();
+    let file = Path::new(file);
+    if let Some(dir) = file.parent() {
+        sys.create_dir_all(dir, 0o755)
+            .map_err(|error| format!("{}: {error}", dir.display()))?;
+    }
+    sys.write_file(file, text.as_bytes(), 0o644)
+        .map_err(|error| format!("{}: {error}", file.display()))
+}
+
+/// `plutil <args> <config>`.
+fn config_cmd(args: &[&str], config: &Path) -> Cmd {
+    Cmd::new(PLUTIL).args(args).arg(config)
+}
+
+/// The folders the configuration at `config` excludes, as root reads it: every string of its
+/// [`EXCLUSIONS`] array, a person's own choices in System Settings included.
+///
+/// # Errors
+/// The configuration could not be read (only root reads it), has no such array, or the array
+/// is no property list this crate reads.
+fn excluded(sys: &dyn System, config: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let cmd = config_cmd(&["-extract", EXCLUSIONS, "xml1", "-o", "-"], config);
+    let ran = sys
+        .run_complete_output(&cmd)
+        .map_err(|error| format!("{}: {error}", cmd.display()))?;
+    if !ran.success() {
+        return Err(format!("{}: {}", cmd.display(), ran.describe()));
+    }
+    match crate::plist::parse(&ran.stdout)? {
+        PValue::Array(entries) => Ok(entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                PValue::Str(path) => Some(PathBuf::from(path)),
+                _ => None,
+            })
+            .collect()),
+        _ => Err(format!(
+            "{}: {EXCLUSIONS} is not an array",
+            config.display()
+        )),
+    }
+}
+
+/// Run `cmd` to a zero exit.
+fn ran_ok(sys: &dyn System, cmd: &Cmd) -> Result<(), String> {
+    let ran = sys
+        .run(cmd)
+        .map_err(|error| format!("{}: {error}", cmd.display()))?;
+    if ran.success() {
+        Ok(())
+    } else {
+        Err(format!("{}: {}", cmd.display(), ran.describe()))
+    }
+}
+
+/// Read how Spotlight stands for `home`, by the receipt alone
+/// ([`spotlight_scope::state`]).
+///
+/// # Errors
+/// The indexing state, the home folder, or an ordinary account's receipt could not be read.
+fn scope(sys: &dyn System, home: &Path) -> Result<Standing, String> {
+    spotlight_scope::state(&Port(sys), home)
+}
+
+/// Whether setup's administrator step owes this account's home folder its Spotlight scope
+/// ([`Scope`]), as the account reads it with no prompt ([`spotlight_scope::owed`]): the one
+/// reading `aterm init` ([`crate::root_steps::owed`]) and the window
+/// ([`spotlight_scope::owed_here`]) share.
+#[must_use]
+pub fn scope_owed(sys: &dyn System) -> bool {
+    spotlight_scope::owed(&Port(sys))
+}
+
+/// `paths`' last components, comma-separated.
+fn folder_names(paths: &BTreeSet<PathBuf>) -> String {
+    paths
+        .iter()
+        .filter_map(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Stop Spotlight indexing the console account's home folders other than Documents and
+/// Desktop, in setup's existing root transaction: every other top-level folder there
+/// ([`wanted`]; [`spotlight_scope::INDEXED`] names what stays) joins the data volume's
+/// excluded folders.
+/// Nothing of the person's is moved, renamed or marked, and what Spotlight already indexed of
+/// a folder is kept, so removing its entry makes it searchable again; the step adds a folder
+/// once and never again ([`SCOPE_RECEIPT`]).
+///
+/// The home is the console account's whoever's password runs the transaction, as its other
+/// steps are that account's (developer mode's group, the name rule): the root run is told of
+/// no other account.
+///
+/// An ordinary account cannot do this: without root a `.metadata_never_index` file in an
+/// ordinary folder is not honoured, and only root reads the configuration. macOS reads the
+/// list when `mds` starts, and SIP refuses `launchctl kickstart` of it, so apply ends `mds`
+/// with SIGKILL and launchd starts another (measured on macOS 27.0.1).
+pub(crate) struct Scope;
+
+impl Scope {
+    /// The home folder the step scopes: the console account's.
+    fn home(ctx: &Ctx) -> Option<PathBuf> {
+        ctx.console.as_ref().map(|user| PathBuf::from(&user.home))
+    }
+
+    /// Put `add` on the configuration's excluded folders, keeping every entry already there,
+    /// and restart `mds`. The configuration is never edited where it stands: a copy beside it
+    /// takes every insert, is checked, and replaces it in one rename, so a run cut short
+    /// leaves the list as it was. A configuration `mds` rewrote meanwhile is left alone, and
+    /// the step fails. With nothing to add, nothing is written and `mds` is left running.
+    fn exclude(sys: &dyn System, add: &BTreeSet<PathBuf>) -> Result<(), String> {
+        let config = Path::new(VOLUME_CONFIG);
+        if add.is_empty() || excluded(sys, config).is_ok_and(|now| add.is_subset(&now)) {
+            return Ok(());
+        }
+        let dir = config.parent().ok_or("the configuration has no folder")?;
+        let scratch = crate::port::Scratch::new_in(sys, dir, "spotlight")
+            .map_err(|error| format!("{}: {error}", dir.display()))?;
+        let staged = scratch.path().join("VolumeConfiguration.plist");
+        sys.copy_file(config, &staged, 0o600)
+            .map_err(|error| format!("{VOLUME_CONFIG}: {error}"))?;
+        let copied = sys
+            .sha256(&staged)
+            .map_err(|error| format!("{}: {error}", staged.display()))?;
+        // A configuration with no list yet gets an empty one; where that fails too (the key
+        // holds something else), the first reading's refusal is the reason.
+        let before = match excluded(sys, &staged) {
+            Ok(excluded) => excluded,
+            Err(why) => {
+                ran_ok(
+                    sys,
+                    &config_cmd(&["-insert", EXCLUSIONS, "-array"], &staged),
+                )
+                .map_err(|_| why)?;
+                excluded(sys, &staged)?
+            }
+        };
+        for path in add.difference(&before) {
+            ran_ok(
+                sys,
+                &config_cmd(
+                    &[
+                        "-insert",
+                        &format!("{EXCLUSIONS}.0"),
+                        "-string",
+                        &path.to_string_lossy(),
+                    ],
+                    &staged,
+                ),
+            )?;
+        }
+        ran_ok(sys, &config_cmd(&["-lint"], &staged))?;
+        let after = excluded(sys, &staged)?;
+        if let Some(lost) = add
+            .difference(&after)
+            .chain(before.difference(&after))
+            .next()
+        {
+            return Err(format!(
+                "{VOLUME_CONFIG} would not list {} after the edit",
+                lost.display()
+            ));
+        }
+        let was = sys
+            .stat(config)
+            .map_err(|error| format!("{VOLUME_CONFIG}: {error}"))?;
+        sys.set_owner_and_mode(&staged, was.uid, was.gid, was.mode)
+            .map_err(|error| format!("{}: {error}", staged.display()))?;
+        if sys.sha256(config).ok().as_ref() != Some(&copied) {
+            return Err(format!("{VOLUME_CONFIG} changed while it was being edited"));
+        }
+        sys.rename(&staged, config)
+            .map_err(|error| format!("{VOLUME_CONFIG}: {error}"))?;
+        let kill = Cmd::new(KILLALL).args(["-9", "mds"]);
+        let ran = sys
+            .run(&kill)
+            .map_err(|error| format!("{}: {error}", kill.display()))?;
+        // With no mds running there is none to end: launchd's next one reads the list.
+        if !ran.success() && !ran.err().contains("No matching processes") {
+            return Err(format!("{}: {}", kill.display(), ran.describe()));
+        }
+        Ok(())
+    }
+}
+
+impl Item for Scope {
     fn id(&self) -> String {
-        "init.spotlight.indexing".into()
+        SCOPE_ID.into()
     }
     fn family(&self) -> &'static str {
         "spotlight"
     }
     fn title(&self) -> String {
-        "Spotlight indexing of the data volume is disabled".into()
+        "Spotlight leaves out the home folder's folders other than Documents and Desktop".into()
     }
-    fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+    fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
         if !sys.macos() {
             return Probe::NotApplicable {
                 why: "Spotlight is macOS's".into(),
             };
         }
-        match indexing(sys) {
-            Ok(true) => Probe::Change {
-                from: "data-volume indexing enabled".into(),
-                to: "data-volume indexing disabled".into(),
+        let Some(home) = Self::home(ctx) else {
+            return Probe::NotApplicable {
+                why: "no one is logged in at this Mac's console".into(),
+            };
+        };
+        match scope(sys, &home) {
+            Ok(Standing::Disabled) => Probe::Ok {
+                now: "indexing disabled".into(),
             },
-            Ok(false) => Probe::Ok {
-                now: "data-volume indexing disabled".into(),
+            Ok(Standing::Scoped(folders)) => Probe::Ok {
+                now: format!("setup has excluded each of {folders} home folders"),
+            },
+            Ok(Standing::Indexed(folders)) => Probe::Change {
+                from: format!("indexed: {}", folder_names(&folders)),
+                to: "excluded; Documents and Desktop stay indexed".into(),
             },
             Err(why) => Probe::Unusable { why },
         }
     }
-    fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+    /// Exclude each folder no receipt names yet ([`Scope::exclude`]), then write the receipt.
+    /// A folder the receipt names is never added again: where the configuration lacks it, a
+    /// person took it out. The receipt comes last, so a run that stopped before it is still
+    /// owed; the next one finds the folders excluded already and only writes the receipt. A
+    /// failure leaves [`SCOPE_REFUSED`] naming the folders it could not exclude.
+    fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         if !sys.macos() {
             return Err("Spotlight is macOS's".into());
         }
         if sys.euid() != 0 {
-            return Err("disabling Spotlight belongs to setup's administrator step".into());
+            return Err("Spotlight's excluded folders belong to setup's administrator step".into());
         }
-        let ran = sys
-            .run(&Cmd::new(MDUTIL).args(["-i", "off", DATA_VOLUME]))
-            .map_err(|error| error.to_string())?;
-        if ran.success() {
-            Ok(())
-        } else {
-            Err(ran.describe())
+        let home = Self::home(ctx).ok_or("no one is logged in at this Mac's console")?;
+        let wanted = wanted(sys, &home)?;
+        let mut noted = listed(sys, SCOPE_RECEIPT).unwrap_or_default();
+        let add: BTreeSet<PathBuf> = wanted.difference(&noted).cloned().collect();
+        noted.extend(wanted);
+        let done = Self::exclude(sys, &add).and_then(|()| list(sys, SCOPE_RECEIPT, &noted));
+        match &done {
+            Ok(()) => {
+                if sys.stat(Path::new(SCOPE_REFUSED)).is_ok() {
+                    let _ = sys.remove(Path::new(SCOPE_REFUSED));
+                }
+            }
+            // Best effort: without it the step is only asked for again.
+            Err(_) => drop(list(sys, SCOPE_REFUSED, &add)),
         }
+        done
+    }
+    fn revert(&self) -> Option<String> {
+        Some(format!(
+            "as root, remove the folder's entry from {EXCLUSIONS} in {VOLUME_CONFIG}, then \
+             {KILLALL} -9 mds; setup does not add it again"
+        ))
     }
 }
 
@@ -939,4 +1224,4 @@ impl Item for NoDocs {
 
 #[cfg(test)]
 #[path = "init_spotlight_tests.rs"]
-mod tests;
+pub(crate) mod tests;

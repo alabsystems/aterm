@@ -51,14 +51,18 @@ pub fn live_start_s(pid: u32) -> Option<u64> {
 /// `pid`'s record, distinguishing a definite absence from a failed read.
 /// # Errors
 /// An invalid pid, an unavailable platform reader, a kernel read error other than `ESRCH`,
-/// or a short or malformed record. A successful empty read and `ESRCH` mean no such process.
+/// a short or malformed record, or (`ResourceBusy`, nothing read) an exec of this process that
+/// has its gate closed ([`crate::exec_gate`]). A successful empty read and `ESRCH` mean no such
+/// process.
 pub fn record_read(pid: u32) -> std::io::Result<Option<Record>> {
     imp::record_read(pid)
 }
 
 /// Every process's record; `None` where the table cannot be read, or where the kernel did not
 /// answer within a bound (macOS: a process in the middle of an exec holds every read of the
-/// table until that exec finishes).
+/// table until that exec finishes). The read that outlasts the bound stays in the kernel, on a
+/// thread of this process: a process that then replaces itself does so through
+/// [`crate::exec_gate::close`], never a bare exec, which would wait on that thread for good.
 #[must_use]
 pub fn records() -> Option<Vec<Record>> {
     imp::records()
@@ -74,7 +78,7 @@ pub fn ignored_signals(pid: u32) -> Option<u32> {
 /// `pid`'s argument words (`argv`, `argv[0]` first, never its environment), as `ps` reads them.
 #[must_use]
 pub fn argv(pid: u32) -> Option<Vec<Vec<u8>>> {
-    let buf = crate::procargs::read(pid)?;
+    let buf = crate::procargs::read(pid).ok()?;
     let words = crate::procargs::parse(&buf)?.argv;
     (!words.is_empty()).then(|| words.into_iter().map(<[u8]>::to_vec).collect())
 }
@@ -205,8 +209,8 @@ pub(crate) use imp::reaps_unwaited_all;
 #[cfg(target_os = "macos")]
 mod imp {
     use std::ffi::{CString, c_char, c_int, c_void};
-    use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
-    use std::time::{Duration, Instant};
+    use std::sync::OnceLock;
+    use std::time::Duration;
 
     use crate::jobs::darwin::{
         KERN_PROC, KERN_PROC_PID, KINFO_COMM_AT, KINFO_FLAG_AT, KINFO_PGID_AT, KINFO_PID_AT,
@@ -215,6 +219,7 @@ mod imp {
     };
 
     use super::{Locale, Record};
+    use crate::exec_gate::{ExecGate, Reading};
 
     unsafe extern "C" {
         fn strnvis(dst: *mut c_char, dlen: usize, src: *const c_char, flag: c_int) -> c_int;
@@ -344,8 +349,14 @@ mod imp {
         })
     }
 
-    /// One `sysctl` read of `mib` into `buf`; the bytes it wrote.
-    fn sysctl_into(mib: &mut [c_int], buf: &mut [u8]) -> std::io::Result<usize> {
+    /// One `sysctl` read of `mib`, a `kern.proc` name, into `buf`; the bytes it wrote. Its
+    /// caller reads inside this process's exec gate ([`crate::exec_gate`]) and shows the
+    /// [`Reading`] that says so: one read, however many `sysctl`s it takes, counts once there.
+    fn sysctl_into(
+        _in_kernel: &Reading,
+        mib: &mut [c_int],
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
         let mut len: libc::size_t = buf.len();
         let n = libc::c_uint::try_from(mib.len()).map_err(|_| std::io::ErrorKind::InvalidInput)?;
         // SAFETY: `mib` holds `n` ints; `buf` is writable for `len` bytes and
@@ -367,8 +378,9 @@ mod imp {
         }
     }
 
-    /// The size `mib` would answer (`sysctl` with no buffer).
-    fn sysctl_len(mib: &mut [c_int]) -> Option<usize> {
+    /// The size `mib`, a `kern.proc` name, would answer (`sysctl` with no buffer), asked inside
+    /// the exec gate as [`sysctl_into`] reads.
+    fn sysctl_len(_in_kernel: &Reading, mib: &mut [c_int]) -> Option<usize> {
         let mut len: libc::size_t = 0;
         let n = libc::c_uint::try_from(mib.len()).ok()?;
         // SAFETY: A null `oldp` asks only for the size, written to `len`.
@@ -385,12 +397,22 @@ mod imp {
         (rc == 0).then_some(len)
     }
 
-    /// `pid`'s whole `kinfo_proc`, about that pid; `None` when no process has it.
+    /// `pid`'s whole `kinfo_proc`, about that pid; `None` when no process has it. Read on the
+    /// caller's thread: a process held in the middle of an exec holds a read of its own record
+    /// alone, so a lane shared by every pid would let one held process fail the reads of all.
+    /// Read inside this process's exec gate ([`crate::exec_gate`]): `ResourceBusy`, with nothing
+    /// read, while an exec of this process has it closed.
     fn kinfo(pid: u32) -> std::io::Result<Option<[u8; KINFO_SIZE]>> {
         let native_pid = c_int::try_from(pid).map_err(|_| std::io::ErrorKind::InvalidInput)?;
         let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_PID, native_pid];
         let mut buf = [0u8; KINFO_SIZE];
-        let n = match sysctl_into(&mut mib, &mut buf) {
+        let Some(in_kernel) = crate::exec_gate::reading() else {
+            return Err(std::io::ErrorKind::ResourceBusy.into());
+        };
+        // Marked once the gate lets the read be made: a lane's crumb names a call its reader
+        // is in, never one a closed gate refused.
+        crate::lane::mark("sysctl KERN_PROC_PID", Some(pid));
+        let n = match sysctl_into(&in_kernel, &mut mib, &mut buf) {
             Ok(n) => n,
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
             Err(error) => return Err(error),
@@ -441,129 +463,66 @@ mod imp {
     /// while libproc read the same process at once.
     const TABLE_WAIT: Duration = Duration::from_secs(1);
 
-    /// This process's read of the table, while one is in the kernel ([`Bounded`]).
-    static TABLE: Bounded = Bounded::new();
+    /// This process's reads of the table, one at a time on a worker of their own
+    /// ([`crate::lane`]): a read the kernel holds holds that worker alone, names the lane
+    /// stalled, and every later read gives up at once until it returns. The worker reads inside
+    /// this process's exec gate ([`inside`]): the read its asker gave up on is still in the
+    /// kernel, on a thread of this process, and an exec made over it would stay in exec for as
+    /// long as the kernel holds that read.
+    static TABLE: crate::lane::Lane<(), Option<Vec<u8>>> =
+        crate::lane::Lane::new("kproc_table", |()| {
+            inside(crate::exec_gate::process(), table_now)
+        })
+        .registered();
 
     /// The whole table's `kinfo_proc` records (`KERN_PROC_ALL`), a whole number of them; `None`
-    /// also where the kernel did not answer within [`TABLE_WAIT`].
+    /// also where the kernel did not answer within [`table_wait`] or holds an earlier read (the
+    /// lane is then stalled), and while an exec of this process has its gate closed
+    /// ([`crate::exec_gate`]), which stalls nothing.
     fn table() -> Option<Vec<u8>> {
-        TABLE.read(TABLE_WAIT, table_now)
+        TABLE.ask_within((), table_wait()).answer().flatten()
     }
 
-    /// A read the kernel may hold for as long as something else takes, made on a thread of its
-    /// own and waited for a bounded time. While one is still in the kernel no other starts, so a
-    /// read the kernel never answers holds one thread, not one for each call.
-    pub(super) struct Bounded {
-        in_flight: Mutex<bool>,
-        finished: Condvar,
+    /// How long [`table`] waits: [`TABLE_WAIT`], or, in a Cargo test binary's debug build
+    /// ([`crate::test_binary::this_is_a_test_binary`]), [`TEST_TABLE_WAIT`]. A test that reads the
+    /// real table needs its answer: the read must happen, and a loaded machine may answer it past
+    /// the production bound, so there it waits as a hang detector, and a read the kernel holds
+    /// still fails it, by name, after a minute. The lane's stall is proved over its own stand-in
+    /// readers (`lane_tests.rs`).
+    pub(super) fn table_wait() -> Duration {
+        #[cfg(debug_assertions)]
+        if crate::test_binary::this_is_a_test_binary() {
+            return TEST_TABLE_WAIT;
+        }
+        TABLE_WAIT
     }
 
-    impl Bounded {
-        pub(super) const fn new() -> Self {
-            Self {
-                in_flight: Mutex::new(false),
-                finished: Condvar::new(),
-            }
-        }
+    /// [`table_wait`] in a test binary: the tests' hang detector (`aterm_spec::wait::MUST_HAPPEN`,
+    /// which this crate's library cannot name).
+    #[cfg(debug_assertions)]
+    const TEST_TABLE_WAIT: Duration = Duration::from_secs(60);
 
-        /// Wait for any earlier read, then take a fresh snapshot, within one total deadline.
-        /// An unreadable or overdue answer, or a thread that cannot start, returns `None`.
-        pub(super) fn read<T: Send + 'static>(
-            &'static self,
-            within: Duration,
-            read: fn() -> Option<T>,
-        ) -> Option<T> {
-            self.read_inner(within, read, || {})
-        }
-
-        fn read_inner<T: Send + 'static>(
-            &'static self,
-            within: Duration,
-            read: fn() -> Option<T>,
-            mut waiting: impl FnMut(),
-        ) -> Option<T> {
-            let deadline = Instant::now().checked_add(within)?;
-            let mut busy = self
-                .in_flight
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            while *busy {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return None;
-                }
-                waiting();
-                let (next, _) = self
-                    .finished
-                    .wait_timeout(busy, left)
-                    .unwrap_or_else(PoisonError::into_inner);
-                busy = next;
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            *busy = true;
-            drop(busy);
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            let spawned = std::thread::Builder::new()
-                .name("kproc-table".into())
-                .spawn(move || {
-                    let answer = {
-                        let _done = Done(self);
-                        read()
-                    };
-                    let _ = tx.send(answer);
-                });
-            if spawned.is_err() {
-                drop(Done(self));
-                return None;
-            }
-            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .ok()
-                .flatten()
-        }
-
-        #[cfg(test)]
-        pub(super) fn read_observing_wait<T: Send + 'static>(
-            &'static self,
-            within: Duration,
-            read: fn() -> Option<T>,
-            waiting: impl FnMut(),
-        ) -> Option<T> {
-            self.read_inner(within, read, waiting)
-        }
-
-        /// Whether a read is in the kernel now.
-        #[cfg(test)]
-        pub(super) fn in_flight(&self) -> bool {
-            *self
-                .in_flight
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-        }
+    /// A lane's read of the process table, made inside `gate`: `read` gets the [`Reading`] this
+    /// thread, the lane's worker, holds from before its first `sysctl` until `read` returns,
+    /// however long the kernel holds it and whether or not its asker still waits, so an exec
+    /// through `gate` waits for it and is refused while it is still there
+    /// ([`crate::exec_gate`]). `None`, with `read` not called, while an exec has `gate` closed:
+    /// the worker answers its asker at once, with nothing in the kernel, so the lane is not
+    /// stalled.
+    pub(super) fn inside<T>(gate: &'static ExecGate, read: fn(&Reading) -> Option<T>) -> Option<T> {
+        let in_kernel = gate.reading()?;
+        read(&in_kernel)
     }
 
-    /// Clears its flag when the read ends, a panicking one included.
-    struct Done(&'static Bounded);
-
-    impl Drop for Done {
-        fn drop(&mut self) {
-            *self
-                .0
-                .in_flight
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = false;
-            self.0.finished.notify_all();
-        }
-    }
-
-    /// [`table`]'s read itself, unbounded.
-    fn table_now() -> Option<Vec<u8>> {
+    /// [`table`]'s read itself, unbounded: one read inside the exec gate, whichever of its
+    /// `sysctl`s the kernel holds.
+    fn table_now(in_kernel: &Reading) -> Option<Vec<u8>> {
+        crate::lane::mark("sysctl KERN_PROC_ALL", None);
         let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0];
         for _ in 0..4 {
-            let len = sysctl_len(&mut mib[..3])?;
+            let len = sysctl_len(in_kernel, &mut mib[..3])?;
             let mut buf = vec![0u8; len + len / 8 + KINFO_SIZE * 16];
-            match sysctl_into(&mut mib[..3], &mut buf) {
+            match sysctl_into(in_kernel, &mut mib[..3], &mut buf) {
                 Ok(n) if n % KINFO_SIZE == 0 => {
                     buf.truncate(n);
                     return Some(buf);

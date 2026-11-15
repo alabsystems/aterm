@@ -358,7 +358,7 @@ impl Event {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Terminal {
     Completed {
-        completion: MetadataCompletion,
+        completion: Box<MetadataCompletion>,
         observation: crate::accounting::Observation,
         artifact: Option<MetadataFile>,
     },
@@ -417,11 +417,11 @@ impl Terminal {
         }
         let value = match d.number()? {
             0 => Self::Completed {
-                completion: MetadataCompletion::decode(
+                completion: Box::new(MetadataCompletion::decode(
                     &d.frame_bytes()?,
                     request.key.graph.query.binding.root_attempt,
                     request.key.operation,
-                )?,
+                )?),
                 observation: crate::accounting::Observation::decode(&d.frame_bytes()?)?,
                 artifact: match d.number()? {
                     0 => None,

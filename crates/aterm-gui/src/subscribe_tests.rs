@@ -529,10 +529,22 @@ fn the_mail_streams_filter_parses_and_fails_closed() {
         "mail:from=andrew",
         "mail:from=h-",
         "mail:from=h-a b",
+        "mail:from=T0000000000",
+        "mail:from=t000000000",
+        "mail:from=tqn5r6e014u",
+        "mail:from=tqn5r6e0148@",
+        "mail:from=tqn5r6e0148@n lab",
     ] {
         assert_eq!(Requested::parse(bad), None, "{bad} must fail closed");
     }
-    for good in ["service", "other", "s-w1@n-lab", "a-svc"] {
+    for good in [
+        "service",
+        "other",
+        "s-w1@n-lab",
+        "a-svc",
+        "tqn5r6e0148",
+        "tqn5r6e0148@n-lab",
+    ] {
         assert_eq!(
             got(&format!("mail:from={good}")).mail,
             mail(&[], Some(good)),

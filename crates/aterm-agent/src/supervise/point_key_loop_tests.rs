@@ -528,8 +528,7 @@ fn a_due_at_a_limit_wall_falling_on_another_model_is_decided_once_at_its_own_poi
         let held = lines
             .iter()
             .position(|l| {
-                l.starts_with("WAITING ")
-                    && l.ends_with(crate::supervise::policy::turn_end::PERSON_TYPING)
+                l.starts_with("WAITING ") && l.ends_with(alab_policy::words::PERSON_TYPING)
             })
             .expect("the person's hold");
         let after: Vec<&String> = lines[held + 1..]

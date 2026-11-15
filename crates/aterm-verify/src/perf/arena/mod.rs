@@ -178,7 +178,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::exec::check_command as command;
-use aterm_uds::spawnfd::Command;
+use aterm_uds::spawnfd::{Command, Stdio};
 
 use crate::perf::LaneRun;
 use crate::perf::workspace_root;
@@ -724,12 +724,16 @@ pub(crate) fn build_aterm() -> Result<Aterm, String> {
     let driver = crate::perf::driver::cargo_driver()?;
     let args = ["--release", "-q", "-p", "aterm"];
     eprintln!("$ {}", driver.display_workspace("build", &args));
-    let status = driver
-        .workspace_command("build")?
+    let mut build_command = driver.workspace_command("build")?;
+    build_command
         .args(args)
         .current_dir(workspace_root())
-        .status()
-        .map_err(|e| format!("could not run targo: {e}"))?;
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = crate::perf::driver::compiler_output(&mut build_command)
+        .map_err(|e| format!("could not run targo: {e}"))?
+        .status;
     if !status.success() {
         return Err(format!(
             "the aterm release build exited {:?}",

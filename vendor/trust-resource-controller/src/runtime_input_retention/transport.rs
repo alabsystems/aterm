@@ -41,7 +41,7 @@ fn check(input: &Input, fd: BorrowedFd<'_>) -> io::Result<()> {
         || inherited & libc::FD_CLOEXEC == 0
         || stat.st_mode & libc::S_IFMT != file_type
         || stat.st_dev as u64 != input.backing.device
-        || stat.st_ino as u64 != input.backing.inode
+        || stat.st_ino != input.backing.inode
         || stat.st_size < 0
         || input.size.is_some_and(|size| stat.st_size as u64 != size)
         || (!input.kind.directory() && stat.st_mode & 0o111 != 0) != input.executable

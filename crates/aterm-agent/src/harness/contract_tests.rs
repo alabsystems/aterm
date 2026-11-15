@@ -21,9 +21,9 @@ fn the_served_contracts_are_two_and_three() {
     assert!(SERVED.contains(&SCOPED));
 }
 
-/// grok-alab, muse-alab, kimi-alab and claude-code-alab may relaunch and upgrade. Nothing else is
-/// a rostered holder, codex-alab included (its v2 rule stays its own), and neither is
-/// claude-code-alab's tool name or its vendor's.
+/// grok-alab, muse-alab and kimi-alab may relaunch and upgrade; claude-code-alab may claim every
+/// duty. Nothing else is a rostered holder, codex-alab included (its v2 rule stays its own), and
+/// neither is claude-code-alab's tool name or its vendor's.
 #[test]
 fn the_roster_names_each_harness_and_the_duties_it_may_claim() {
     let (row, pid) = holder("grok-alab@4242").expect("rostered");
@@ -61,7 +61,7 @@ fn the_roster_names_each_harness_and_the_duties_it_may_claim() {
             4245
         )
     );
-    assert_eq!(row.allows, &[Scope::Relaunch, Scope::Upgrade]);
+    assert_eq!(row.allows, &Scope::ALL);
     assert_eq!(
         row_for(Program::Claude).map(|r| r.id),
         Some("claude-code-alab")
@@ -177,12 +177,12 @@ fn the_scope_parser_refuses_whole_and_admits_only_the_rows_words() {
 }
 
 /// claude-code-alab's claim, as its launch makes it and as it widens (§11 D53): `scope=upgrade`,
-/// then `relaunch,upgrade`, each with the versions it announces. Now it is rostered it never
-/// claims under v2 (no `contract=`, with or without a lease), and a duty outside its row
-/// (`turn-end` and the rest stay the built-in engine's) refuses the claim whole. Its tool's name
-/// is no holder: `claude-alab@<pid>` stays an ordinary foreign claim.
+/// then `relaunch,upgrade`, each with the versions it announces, then the typing duties, one or
+/// all of them. Now it is rostered it never claims under v2 (no `contract=`, with or without a
+/// lease), and a word that names no duty refuses the claim whole. Its tool's name is no holder:
+/// `claude-alab@<pid>` stays an ordinary foreign claim.
 #[test]
-fn claude_code_alab_claims_under_contract_three_alone_and_only_relaunch_and_upgrade() {
+fn claude_code_alab_claims_under_contract_three_alone_and_any_duty() {
     let me = "claude-code-alab@500";
     let launch = scoped(
         me,
@@ -203,16 +203,39 @@ fn claude_code_alab_claims_under_contract_three_alone_and_only_relaunch_and_upgr
     );
     let widened = scoped(me, &["contract=3", "scope=upgrade,relaunch"]).expect("the widened claim");
     assert_eq!(widened.scopes.words(), "relaunch,upgrade");
+    for duty in [
+        Scope::TurnEnd,
+        Scope::Approvals,
+        Scope::Questions,
+        Scope::Walls,
+    ] {
+        let scope = format!("scope=upgrade,{}", duty.word());
+        let typing = scoped(me, &["contract=3", &scope]).expect("a typing duty");
+        assert!(typing.scopes.contains(duty), "{scope}");
+    }
+    let every = scoped(
+        me,
+        &[
+            "contract=3",
+            "scope=walls,questions,approvals,turn-end,upgrade,relaunch",
+            "version=0.3.0",
+        ],
+    )
+    .expect("every duty");
+    assert_eq!(
+        every.scopes.words(),
+        "relaunch,upgrade,turn-end,approvals,questions,walls"
+    );
     for words in [
         &[][..],
         &["ttl=5000"],
         &["scope=upgrade"],
         &["contract=2", "scope=upgrade"],
         &["contract=3"],
-        &["contract=3", "scope=upgrade,turn-end"],
-        &["contract=3", "scope=approvals"],
-        &["contract=3", "scope=questions"],
-        &["contract=3", "scope=walls"],
+        &["contract=3", "scope=turn-end,bogus"],
+        &["contract=3", "scope=Turn-End"],
+        &["contract=3", "scope=turn_end"],
+        &["contract=3", "scope=turn-end,turn-end"],
         &["contract=3", "scope=upgrade", "ttl=5000"],
     ] {
         assert!(refused(me, words), "{words:?}");

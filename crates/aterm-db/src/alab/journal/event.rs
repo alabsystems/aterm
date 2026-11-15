@@ -70,6 +70,7 @@ words!(
         TokenFallback = "token-fallback",
         TokenOffered = "token-offered",
         TokenRemoved = "token-removed",
+        TokenStopped = "token-stopped",
         // What a tab's CLI really runs on, read from its login file
         // (`docs/DESIGN-account-discovery-2026-11-09.md`): the observed account, the tab and the
         // harness that runs it.

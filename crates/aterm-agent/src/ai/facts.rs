@@ -216,6 +216,9 @@ pub struct ClaudeAccounts {
     pub state: Option<&'static str>,
     /// The forecast end, when due.
     pub renew_by: Option<i64>,
+    /// When its vault year token ends, where it runs on that token here while its stored login is
+    /// signed out (`state` is `on-token`: `accounts::LoginState::OnToken`).
+    pub on_token_until: Option<i64>,
     /// The usage limit's end, when limited.
     pub limited_until: Option<i64>,
     /// The newest turn served under it.
@@ -223,7 +226,8 @@ pub struct ClaudeAccounts {
     /// When a renewal last bound it, in unix seconds.
     pub renewed_at: Option<i64>,
     /// When accounts v2 recorded it signed out, where it is: a login wall, a displacement by the
-    /// vendor's own sign-in, or a check that found no login all write the same word.
+    /// vendor's own sign-in, or a check that found no login all write the same word. Unset for a
+    /// row on its vault token here (`on_token_until`), whose login the report reads `on-token`.
     pub signed_out_at: Option<i64>,
     /// The next not-enrolled or signed-out row to sign into when the serving row is limited,
     /// when that row has an email, never one its source gives other Macs alone
@@ -798,6 +802,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             made: false,
             state: None,
             renew_by: None,
+            on_token_until: None,
             limited_until: None,
             served_at: None,
             renewed_at: None,
@@ -828,6 +833,7 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
             made: false,
             state: None,
             renew_by: None,
+            on_token_until: None,
             limited_until: None,
             served_at: None,
             renewed_at: None,
@@ -909,18 +915,23 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     let target = next_sign_in.as_deref().unwrap_or(&row.label);
     let target_email = bound.row(target).and_then(|r| r.email.as_deref());
     let renews_target = target_email.is_some() && bound.row(target).is_some_and(local);
-    let (login_state, renew_by) = if renews {
+    let (login_state, renew_by, on_token_until) = if renews {
         let login = accounts::login_state(&row, &logins, &state, m.now);
-        let by = match login {
-            accounts::LoginState::Due { by } => Some(by),
-            _ => None,
+        let (by, until) = match login {
+            accounts::LoginState::Due { by } => (Some(by), None),
+            accounts::LoginState::OnToken { until } => (None, Some(until)),
+            _ => (None, None),
         };
-        (Some(login.as_str()), by)
+        (Some(login.as_str()), by, until)
     } else if cond == accounts::Condition::SignedOut {
-        (Some("expired"), None)
+        (Some("expired"), None, None)
     } else {
-        (None, None)
+        (None, None, None)
     };
+    // A row on its vault token reads `on-token`, as the report says it: its stored login's
+    // sign-out on record is not this row's word for its login.
+    let on_token =
+        accounts::login_here(&row, &state, row_enrolled, m.now) == accounts::LoginHere::OnToken;
     Some(ClaudeAccounts {
         label: row.label.clone(),
         listed: true,
@@ -937,13 +948,14 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         made,
         state: login_state,
         renew_by,
+        on_token_until,
         limited_until,
         served_at: binding.and_then(|b| b.served_at),
         renewed_at: binding.and_then(|b| b.renewed_at),
         signed_out_at: state
             .accounts
             .get(&row.label)
-            .filter(|a| a.current_auth(&row) == accounts::Auth::SignedOut)
+            .filter(|a| !on_token && a.current_auth(&row) == accounts::Auth::SignedOut)
             .and_then(|a| a.auth_at),
         tried: raw_roster
             .row(target)
@@ -1004,12 +1016,15 @@ pub(crate) fn select_claude_serving_row<'a>(
                 .find(|r| r.was.iter().any(Option::is_none))
         })
         .or_else(|| bound.rows.first())?;
+    // A review's `claude -p --output-format text` is no session-starting shape, so the vault
+    // token never serves it (`token_route::shape_refusal`): a row is ready by its stored login,
+    // and one only its token keeps running is not (`accounts::stored_login_condition`).
     let ready = |row: &accounts::Row| {
         row.held_by.is_none()
             && state.execution_verdict(&row.label).is_ok()
             && (row.dir.is_none() || enrolled.contains(&row.label))
             && matches!(
-                accounts::condition(row, state, true, now),
+                accounts::stored_login_condition(row, state, true, now),
                 accounts::Condition::Usable
                     | accounts::Condition::Low
                     | accounts::Condition::Unseen

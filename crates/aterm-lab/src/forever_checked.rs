@@ -20,7 +20,6 @@
 use aterm_agent::harness::acts::{LandReceipt, ReceiptLeg};
 use aterm_agent::harness::land_receipt::{HEAD_DIGITS, RECEIPT};
 use aterm_agent::supervise::mode_words;
-use aterm_agent::supervise::policy::turn_end;
 
 use super::{Chain, Repo, Scenario, Seen, Verdict, at, pct_decode, receipt, word};
 use crate::util::one_line;
@@ -390,7 +389,8 @@ pub fn as_built(chain: Chain, seen: &Seen, t0: i64) -> Seen {
                 .split(' ')
                 .find_map(|w| w.strip_prefix("seq="))
                 .filter(|_| {
-                    l.starts_with("DONE ") && l.contains(&format!(" rule={} ", turn_end::RULE_LAND))
+                    l.starts_with("DONE ")
+                        && l.contains(&format!(" rule={} ", alab_policy::words::RULE_LAND))
                 });
             let told = lines
                 .get(i + 1)
@@ -475,7 +475,7 @@ pub fn judge_landing(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verd
         at(t0, *d),
         one_line(line, 90)
     );
-    if !line.contains(&format!("rule={}", turn_end::RULE_LAND)) {
+    if !line.contains(&format!("rule={}", alab_policy::words::RULE_LAND)) {
         return Verdict::Fail(format!("{said}: the DONE names another rule"));
     }
     if !seen.status_said("task", "landed", d - 5000) {

@@ -23,14 +23,14 @@ pub const NOTARY_SUBMIT_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 /// Bound for `stapler staple` / `stapler validate`: a ticket fetch and a local check.
 const STAPLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// The owner's signing material.
+/// The owner's signing material: the store's release ring, or a profile file the operator names.
 ///
 /// ```toml
 /// signing_key = "<base64 PKCS#8 Ed25519 private key>"
 /// # Tier APPLE only (ignored while pins::APPLE_TEAM_ID is empty):
 /// notary_profile = "notary"  # set by ship provision from the vault's release-notary entry (aterm secrets need notary)
 /// # Machine-roster tier only (ignored while pins::PAPER_MASTER_PUBKEYS is empty):
-/// machine_roster = "<path to the master-signed aterm-machines.toml; a leading ~/ is HOME>"
+/// machine_roster = "<the roster: the store entry ~/.aterm/release-ring/roster/aterm-machines.toml, or a file's path; a leading ~/ is HOME>"
 /// machine_id     = "<this machine's id, e.g. the one `join --id` was given>"
 /// ```
 #[derive(Clone)]
@@ -39,17 +39,55 @@ pub struct ReleaseCredentials {
     pkcs8: Vec<u8>,
     /// The derived public identity.
     pubkey_b64: String,
-    /// This machine's public id as the profile declares it.
+    /// This machine's public id as the profile (or the store's record) declares it.
     machine_id: Option<String>,
-    /// Path to the master-signed machine roster.
-    machine_roster: Option<PathBuf>,
+    /// Where the master-signed machine roster comes from.
+    machine_roster: Option<RosterSource>,
     /// Notarytool auth, if the profile names one.
     notary: Option<NotaryAuth>,
     /// Optional keychain disambiguator (`signing_identity_sha1`).
     identity_sha1: Option<String>,
     /// The profile these credentials were loaded from.
-    profile: Option<PathBuf>,
+    profile: Option<ProfileSource>,
 }
+
+/// Where a release profile came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProfileSource {
+    /// The store's release ring (`machine.key`, `machine.toml` and `release-credentials.toml`),
+    /// read in place as one set from one verified version (DESIGN-secrets §11).
+    Store,
+    /// A profile file the operator named with `--release-credentials`: the person's own file,
+    /// read where it lies.
+    File(PathBuf),
+}
+
+impl std::fmt::Display for ProfileSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store => write!(f, "the store's release profile ({STORE_PROFILE})"),
+            Self::File(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+/// Where the master-signed roster a cut is authorized by comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RosterSource {
+    /// The store's public roster pair (`aterm_secrets::client::current_public_roster`): the
+    /// roster of the store's profile, and of any profile that names its entry
+    /// ([`STORE_ROSTER`]).
+    Store,
+    /// A roster file an operator's own profile names, its `.sig` beside it.
+    File(PathBuf),
+}
+
+/// The store entry of the release profile.
+pub const STORE_PROFILE: &str = aterm_secrets::entry_class::RELEASE_RING[2];
+
+/// The store entry of the signed roster: a profile's `machine_roster` that names it names the
+/// store's pair, never a file.
+pub const STORE_ROSTER: &str = aterm_secrets::entry_class::PUBLIC_ROSTER[0];
 
 impl std::fmt::Debug for ReleaseCredentials {
     /// Hand-written so the private key never reaches a log through a derive.
@@ -64,122 +102,181 @@ impl std::fmt::Debug for ReleaseCredentials {
 }
 
 impl ReleaseCredentials {
-    /// Resolve signing material.
-    pub fn resolve(explicit: Option<&Path>, repo: &Path) -> Result<Option<Self>, String> {
-        Self::resolve_with(explicit, repo, std::env::var("HOME").ok().as_deref())
+    /// Resolve signing material: the profile file `explicit` names, else the store's release
+    /// ring ([`Self::from_store`]) under `$HOME`.
+    pub fn resolve(explicit: Option<&Path>) -> Result<Option<Self>, String> {
+        Self::resolve_with(explicit, std::env::var("HOME").ok().as_deref())
     }
 
     /// [`Self::resolve`] with the home directory injected.
     pub(crate) fn resolve_with(
         explicit: Option<&Path>,
-        repo: &Path,
         home: Option<&str>,
     ) -> Result<Option<Self>, String> {
         if let Some(path) = explicit {
             return Self::load(path, home.map(Path::new)).map(Some);
         }
-        let Some(home) = home else {
+        let Some(home) = home.map(Path::new).filter(|home| home.is_absolute()) else {
             return Ok(None);
         };
-        let key_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_KEY_REL);
-        let meta = match std::fs::symlink_metadata(&key_path) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("read {}: {error}", key_path.display())),
-        };
-        if !meta.file_type().is_file() {
-            return Err(format!(
-                "REFUSING {} — not a regular file",
-                key_path.display()
-            ));
-        }
-        let pkcs8 = read_credentials_bytes(&key_path, 4 * 1024)?;
-        let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| {
-            format!(
-                "{}: not a PKCS#8 Ed25519 key — re-mint with `atpkg-keys join --id <id>`",
-                key_path.display()
-            )
-        })?;
-        let pubkey_b64 = {
-            use ring::signature::KeyPair as _;
-            aterm_codec::base64::encode(keypair.public_key().as_ref())
-                .map_err(|_| "public key too large to encode".to_string())?
-        };
-        let staged = repo.join("dist/aterm-machines.toml");
-        Ok(Some(Self {
-            pkcs8,
-            pubkey_b64,
-            machine_id: None,
-            machine_roster: staged.exists().then_some(staged),
-            notary: None,
-            identity_sha1: None,
-            profile: None,
-        }))
+        Self::from_store(home)
     }
 
-    /// Load and validate the profile at `path`, reading a `~/` `machine_roster` under `home`
-    /// ([`roster_path`]).
-    pub fn load(path: &Path, home: Option<&Path>) -> Result<Self, String> {
-        Self::load_with_identity(path, home, |home, profile| {
+    /// THE STORE'S RELEASE RING under `home`: its key, record and profile read in place as one
+    /// set from one verified version, never a file under the home and never written anywhere.
+    /// `None` where no vault is configured or the store holds no complete ring. The three must be
+    /// one identity: the profile's `signing_key` and `machine.key` derive the public key
+    /// `machine.toml` records, and the profile's `machine_id`, where it names one, is the
+    /// record's. The roster is the store's pair, whatever roster the profile names: a profile minted
+    /// beside a file roster stays readable.
+    ///
+    /// # Errors
+    /// The store cannot be read, or its ring is malformed or not one identity.
+    pub fn from_store(home: &Path) -> Result<Option<Self>, String> {
+        Self::from_store_with(home, |paths| {
             #[cfg(unix)]
             {
-                let paths = aterm_secrets::client::Paths::for_home(home);
-                aterm_secrets::client::release::effective_signing_identity(&paths, profile)
+                aterm_secrets::client::release::effective_signing_identity(paths)
                     .ok()
                     .flatten()
             }
             #[cfg(not(unix))]
             {
-                let _ = (home, profile);
+                let _ = paths;
                 None
             }
         })
     }
 
-    fn load_with_identity(
-        path: &Path,
-        home: Option<&Path>,
-        shared_identity: impl FnOnce(&Path, &Path) -> Option<String>,
-    ) -> Result<Self, String> {
+    /// [`Self::from_store`], taking the shared Apple identity from `shared_identity`.
+    #[cfg(unix)]
+    pub(crate) fn from_store_with(
+        home: &Path,
+        shared_identity: impl FnOnce(&aterm_secrets::client::Paths) -> Option<String>,
+    ) -> Result<Option<Self>, String> {
+        let paths = aterm_secrets::client::Paths::locate_for_home(home);
+        let read = |error: aterm_secrets::Error| format!("read the store's release ring: {error}");
+        let Some(expected) = aterm_secrets::client::config(&paths).map_err(read)? else {
+            return Ok(None);
+        };
+        let Some(ring) = aterm_secrets::client::read_verified_set(
+            &paths,
+            &expected,
+            &aterm_secrets::entry_class::RELEASE_RING,
+        )
+        .map_err(read)?
+        else {
+            return Ok(None);
+        };
+        let mut ring = ring.into_iter().map(|entry| entry.into_parts().0);
+        let (Some(key), Some(record), Some(profile)) = (ring.next(), ring.next(), ring.next())
+        else {
+            return Err("the store's release ring is incomplete".into());
+        };
+        let source = ProfileSource::Store;
+        let text = profile
+            .as_str()
+            .ok_or_else(|| format!("{source}: not UTF-8"))?;
+        let mut creds = Self::from_profile(text, source.clone(), Some(home), None)?;
+        let ring_key = public_key(key.as_slice())
+            .map_err(|_| format!("the store's {}: not a PKCS#8 Ed25519 key", RING_KEY))?;
+        let identity = record
+            .as_str()
+            .ok_or_else(|| "the store's machine.toml is not UTF-8".to_string())
+            .and_then(|text| {
+                crate::machines::MachineIdentity::parse(text, "the store's machine.toml")
+                    .map_err(|error| error.to_string())
+            })?;
+        if ring_key != creds.pubkey_b64 || identity.pubkey != creds.pubkey_b64 {
+            return Err(format!(
+                "the store's release ring is not one identity: {source}'s signing_key, \
+                 {RING_KEY} and machine.toml's pubkey must all be one key; the vault admin \
+                 republishes the three together"
+            ));
+        }
+        if let Some(declared) = creds.machine_id.as_deref()
+            && declared != identity.id
+        {
+            return Err(format!(
+                "{source} declares machine_id = \"{declared}\", but the store's machine.toml \
+                 records \"{}\"",
+                identity.id
+            ));
+        }
+        creds.machine_id = Some(identity.id);
+        creds.machine_roster = Some(RosterSource::Store);
+        if let Some(shared) = shared_identity(&paths) {
+            creds.identity_sha1 = Some(shared);
+        }
+        Ok(Some(creds))
+    }
+
+    /// [`Self::from_store`] off unix, where there is no store: none.
+    #[cfg(not(unix))]
+    pub(crate) fn from_store_with(
+        _home: &Path,
+        _shared_identity: impl FnOnce(&()) -> Option<String>,
+    ) -> Result<Option<Self>, String> {
+        Ok(None)
+    }
+
+    /// Load and validate the profile file at `path`, the operator's own (`--release-credentials`):
+    /// read where it lies, its `machine_roster` a leading `~/` under `home` ([`roster_path`]),
+    /// or the store's pair where it names [`STORE_ROSTER`]. A profile that declares no
+    /// `machine_id` claims the store ring's recorded id where that ring is this same key; the
+    /// claim is only checked against the signed roster, so a store that cannot be read just now
+    /// leaves the profile claiming none.
+    pub fn load(path: &Path, home: Option<&Path>) -> Result<Self, String> {
         let bytes = read_credentials_bytes(path, 64 * 1024)?;
         let text = String::from_utf8(bytes)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
-        let encoded = credentials_signing_key(&text)?;
+        let mut creds =
+            Self::from_profile(&text, ProfileSource::File(path.to_path_buf()), home, None)?;
+        if creds.machine_id.is_none()
+            && let Some(home) = home.filter(|home| home.is_absolute())
+            && let Ok(Some(ring)) = Self::from_store(home)
+            && ring.pubkey_b64 == creds.pubkey_b64
+        {
+            creds.machine_id = ring.machine_id;
+        }
+        Ok(creds)
+    }
+
+    fn from_profile(
+        text: &str,
+        source: ProfileSource,
+        home: Option<&Path>,
+        shared_identity: Option<String>,
+    ) -> Result<Self, String> {
+        let encoded = credentials_signing_key(text).map_err(|e| format!("{source}: {e}"))?;
         let pkcs8 =
             aterm_codec::base64::decode_strict(encoded.trim().as_bytes()).map_err(|_| {
                 format!(
-                    "{}: signing_key is not valid base64. Minted machine keys are BINARY \
-                     PKCS#8 — base64-encode those bytes rather than pasting them",
-                    path.display()
+                    "{source}: signing_key is not valid base64. Minted machine keys are BINARY \
+                     PKCS#8 — base64-encode those bytes rather than pasting them"
                 )
             })?;
-        let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).map_err(|_| {
-            format!(
-                "{}: signing_key is not a PKCS#8 Ed25519 key",
-                path.display()
-            )
-        })?;
-        let pubkey_b64 = {
-            use ring::signature::KeyPair as _;
-            aterm_codec::base64::encode(keypair.public_key().as_ref())
-                .map_err(|_| "public key too large to encode".to_string())?
-        };
-        let notary =
-            credentials_notary_auth(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let identity_sha1 = credentials_value(&text, "signing_identity_sha1")
-            .map_err(|e| format!("{}: {e}", path.display()))?
+        let pubkey_b64 = public_key(&pkcs8)
+            .map_err(|_| format!("{source}: signing_key is not a PKCS#8 Ed25519 key"))?;
+        let notary = credentials_notary_auth(text).map_err(|e| format!("{source}: {e}"))?;
+        let identity_sha1 = credentials_value(text, "signing_identity_sha1")
+            .map_err(|e| format!("{source}: {e}"))?
             .map(str::to_string);
-        let identity_sha1 = home
-            .and_then(|home| shared_identity(home, path))
-            .or(identity_sha1);
-        let machine_id = credentials_value(&text, "machine_id")
-            .map_err(|e| format!("{}: {e}", path.display()))?
+        let identity_sha1 = shared_identity.or(identity_sha1);
+        let machine_id = credentials_value(text, "machine_id")
+            .map_err(|e| format!("{source}: {e}"))?
             .map(str::to_string);
-        let machine_roster = credentials_value(&text, "machine_roster")
-            .map_err(|e| format!("{}: {e}", path.display()))?
-            .map(|named| roster_path(named, home))
+        let machine_roster = credentials_value(text, "machine_roster")
+            .map_err(|e| format!("{source}: {e}"))?
+            .map(|named| {
+                if named == STORE_ROSTER {
+                    Ok(RosterSource::Store)
+                } else {
+                    roster_path(named, home).map(RosterSource::File)
+                }
+            })
             .transpose()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+            .map_err(|e| format!("{source}: {e}"))?;
         Ok(Self {
             pkcs8,
             pubkey_b64,
@@ -187,7 +284,7 @@ impl ReleaseCredentials {
             machine_roster,
             notary,
             identity_sha1,
-            profile: Some(path.to_path_buf()),
+            profile: Some(source),
         })
     }
 
@@ -209,22 +306,23 @@ impl ReleaseCredentials {
         &self.pubkey_b64
     }
 
-    /// This machine's public id as the profile declares it, if present.
+    /// This machine's public id as the profile (or the store's record) declares it, if present.
     #[must_use]
     pub fn machine_id(&self) -> Option<&str> {
         self.machine_id.as_deref()
     }
 
-    /// The master-signed roster this cut must be authorized by, if the profile names one.
+    /// Where the master-signed roster this cut must be authorized by comes from, if the profile
+    /// names one.
     #[must_use]
-    pub fn machine_roster(&self) -> Option<&Path> {
-        self.machine_roster.as_deref()
+    pub fn machine_roster(&self) -> Option<&RosterSource> {
+        self.machine_roster.as_ref()
     }
 
-    /// The `--release-credentials` profile these were loaded from.
+    /// Where these credentials were loaded from.
     #[must_use]
-    pub fn profile(&self) -> Option<&Path> {
-        self.profile.as_deref()
+    pub fn profile(&self) -> Option<&ProfileSource> {
+        self.profile.as_ref()
     }
 
     /// Detached Ed25519 signature over `msg`.
@@ -235,9 +333,17 @@ impl ReleaseCredentials {
     }
 }
 
-/// A profile's `machine_roster`, a leading `~/` read under `home`: the secrets vault hands
-/// every Mac one profile, which names the roster where the vault puts it
-/// (`~/.aterm/release-ring/roster/aterm-machines.toml`) whoever's home that is. A home that is missing or
+/// The store entry of the release key, as messages name it.
+const RING_KEY: &str = aterm_secrets::entry_class::RELEASE_RING[0];
+
+/// The base64 public key `pkcs8` derives.
+fn public_key(pkcs8: &[u8]) -> Result<String, ()> {
+    use ring::signature::KeyPair as _;
+    let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|_| ())?;
+    aterm_codec::base64::encode(keypair.public_key().as_ref()).map_err(|_| ())
+}
+
+/// A profile file's `machine_roster`, a leading `~/` read under `home`. A home that is missing or
 /// not absolute refuses, so the roster is never looked for under the working directory. Any
 /// other value is the path as written.
 fn roster_path(named: &str, home: Option<&Path>) -> Result<PathBuf, String> {
@@ -569,10 +675,10 @@ fn resolve_apple_tier_with(
         credentials.and_then(|c| c.profile().map(|profile| (c, profile)))
     else {
         return Err(format!(
-            "no --release-credentials profile was given, and pins::APPLE_TEAM_ID ({team_id}) \
-             notarizes every artifact, which needs the profile's notary credential. Cut with `--release-credentials ~/.aterm/release-ring/release-credentials.toml` (`{} provision \
-             --id <machine-id>` writes it)",
-            crate::publish::SHIP_COMMAND
+            "this Mac's store holds no release ring and no --release-credentials profile was \
+             given, and pins::APPLE_TEAM_ID ({team_id}) notarizes every artifact, which needs \
+             the profile's notary credential: the store's {STORE_PROFILE} entry, read with the \
+             ring as one set"
         ));
     };
     let auth = credentials.notary().ok_or_else(|| {
@@ -580,7 +686,7 @@ fn resolve_apple_tier_with(
             "pins::APPLE_TEAM_ID is set to {team_id}, but {} names no notarytool credential: \
              `{} provision --id <machine-id>` writes `notary_profile = \"{}\"`, which the \
              vault's {} entry sets (`aterm secrets need notary`)",
-            profile.display(),
+            profile,
             crate::publish::SHIP_COMMAND,
             crate::apple::NOTARY_PROFILE,
             aterm_secrets::need::catalog::NOTARY_ENTRY

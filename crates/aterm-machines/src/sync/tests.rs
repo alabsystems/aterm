@@ -191,6 +191,12 @@ pub(crate) struct Inert {
     locked_at_reads: Mutex<Vec<bool>>,
     sleeps: Mutex<Vec<Duration>>,
     fixed_wait_ms: Option<u64>,
+    /// The note this runner's starter gave it ([`Ports::start_note`]).
+    start_note: Option<String>,
+    /// What each [`Ports::spent`] reads, in order (nothing once they run out), and how often
+    /// it was read.
+    spent: Mutex<std::collections::VecDeque<Spent>>,
+    spent_reads: AtomicU32,
 }
 
 impl Inert {
@@ -280,6 +286,9 @@ impl Inert {
             locked_at_reads: Mutex::new(Vec::new()),
             sleeps: Mutex::new(Vec::new()),
             fixed_wait_ms: Some(0),
+            start_note: None,
+            spent: Mutex::new(std::collections::VecDeque::new()),
+            spent_reads: AtomicU32::new(0),
         }
     }
 
@@ -667,6 +676,13 @@ impl Ports for Inert {
     }
     fn log(&self, line: &str) {
         self.logged.lock().unwrap().push(line.to_owned());
+    }
+    fn start_note(&self) -> Option<String> {
+        self.start_note.clone()
+    }
+    fn spent(&self) -> Spent {
+        self.spent_reads.fetch_add(1, Ordering::SeqCst);
+        self.spent.lock().unwrap().pop_front().unwrap_or_default()
     }
     fn installed_release_elsewhere(&self) -> Option<PathBuf> {
         self.elsewhere.clone()
@@ -1433,8 +1449,8 @@ fn the_pass_holds_its_lock_from_its_first_read_to_its_record() {
 }
 
 /// A refused pass writes one aterm.log line naming its build, trigger and why (a runner's
-/// stderr goes nowhere), and a plan that is refused writes none; a pass that ran writes its one
-/// ledger line.
+/// stderr goes nowhere), and a plan that is refused writes none; a pass that ran writes its
+/// ledger line and its cost line.
 /// NEGATIVE CONTROL: a refusal that returns without logging leaves no line.
 #[test]
 fn a_refused_pass_writes_its_own_log_line() {
@@ -1461,8 +1477,9 @@ fn a_refused_pass_writes_its_own_log_line() {
     let ran_here = Inert::new(scratch.path());
     ran(ran_here.pass(Trigger::Window, Mode::Apply));
     let logged = ran_here.logged();
-    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(logged.len(), 2, "{logged:?}");
     assert!(logged[0].starts_with("converge build=0.145.0+gabc trigger=window/new-build"));
+    assert!(logged[1].starts_with("converge cost build=0.145.0+gabc trigger=window/new-build"));
 }
 
 /// The base layer is laid on a build the installed release app laid none on, from that app
@@ -1898,7 +1915,7 @@ fn a_pass_keeps_its_trigger_in_its_ledger_line() {
             ran(ports.pass(trigger, mode));
             if mode == Mode::Apply && trigger == Trigger::Subscriber {
                 let logged = ports.logged();
-                assert_eq!(logged.len(), 1, "one pass ledger line");
+                assert_eq!(logged.len(), 2, "one pass ledger line and its cost line");
                 assert!(
                     logged[0].contains("trigger=subscriber/"),
                     "the handoff keeps its subscriber trigger: {logged:?}"
@@ -2200,6 +2217,40 @@ fn outside_the_accounts_own_login_a_pass_refuses_and_reads_nothing() {
     assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
 
+/// The lane's own ids ([`own_item`]) are its kinds' rows and no others: every item a pass
+/// composes of a [`Kind`] carries one, and the base layer's stand-in row, the repository
+/// prerequisite's row beside them, the family and an id of the same spelling do not.
+/// NEGATIVE CONTROL: with `own_item` passing any id that starts `sync.`, the prerequisite's
+/// row and `sync.dock` are passed.
+#[test]
+fn the_lanes_own_ids_are_its_kinds_rows_and_no_others() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let mut ports = Inert::new(scratch.path());
+    let packages = repository_prerequisites::Packages::default();
+    ports.prerequisites = Some(Arc::new(packages));
+    let items = sync_items(
+        &ports,
+        Trigger::Subscriber,
+        Mode::Plan,
+        aterm_secrets::converge::RepositoryWork::Refresh,
+        None,
+    );
+    let ids: Vec<String> = items.iter().map(|item| item.id()).collect();
+    let (own, others): (Vec<&String>, Vec<&String>) = ids.iter().partition(|id| own_item(id));
+    assert_eq!(own.len(), Kind::ALL.len(), "{ids:?}");
+    assert_eq!(others, ["sync.repository-prerequisites"], "{ids:?}");
+    for id in [
+        BASE,
+        FAMILY,
+        "sync.",
+        "sync.dock",
+        "sync.requests@alice",
+        "",
+    ] {
+        assert!(!own_item(id), "{id:?}");
+    }
+}
+
 /// The subscriber's pass, which runs with no window (after a restart, say), starts the mug when
 /// none runs, and reads it back held; a mug that runs and asks
 /// macOS again itself is left to it, a failed start fails the row for the next pass, and a Mac
@@ -2377,6 +2428,381 @@ fn the_ledger_line_names_the_build_the_trigger_a_tally_and_what_is_left() {
         line.contains("base.person: "),
         "a planned row is named: {line}"
     );
+}
+
+/// A row as the engine reports it, for [`cost::line`]'s own laws: `id` ended `outcome` after
+/// `elapsed_ms`.
+fn timed_row(id: &str, outcome: Outcome, elapsed_ms: u64, why: Option<&str>) -> ItemReport {
+    ItemReport {
+        id: id.to_owned(),
+        family: "test".to_owned(),
+        title: id.to_owned(),
+        outcome,
+        from: None,
+        to: None,
+        why: why.map(str::to_owned),
+        revert: None,
+        effect: aterm_converge::Effect::Now,
+        detail: None,
+        layer: None,
+        class: None,
+        explain: None,
+        stood_aside: None,
+        waits_on: None,
+        essential: false,
+        elapsed_ms: Some(elapsed_ms),
+    }
+}
+
+/// THE COST LINE SAYS WHAT THE PASS SPENT, THE NOTE OF ITS START AND EVERY CHANGED ROW: under a
+/// head of its own (`converge cost build=… trigger=…/…`) it carries `ms=`, `spawns=`, `git=`,
+/// `child_cpu_ms=`, `cpu_ms=`, `note=`, `changed_rows=` (every Changed row's id, in run order)
+/// and `slow=` (each row the engine spent at least [`cost::SLOW_MS`] on, longest first, then
+/// the rest summed), and nothing a row read: a row id that is not plain is written as its
+/// index, and no why reaches the line.
+/// NEGATIVE CONTROL: a `changed_rows` that names only the first Changed row reads `sync.fleet`
+/// alone.
+#[test]
+fn the_cost_line_says_what_the_pass_spent_its_note_and_every_changed_row() {
+    let rows = [
+        timed_row("sync.fleet", Outcome::Changed, 400, None),
+        timed_row("sync.vault", Outcome::Ok, 100, None),
+        timed_row(
+            "sync.identity",
+            Outcome::Failed,
+            2000,
+            Some("x ms=9 spawns=9 [y]"),
+        ),
+        timed_row("sync.clone", Outcome::Changed, 1840, None),
+        timed_row("sync.requests", Outcome::Changed, 20, None),
+        timed_row("keyboard.caps@Alice Smith", Outcome::Changed, 250, None),
+    ];
+    let spent = Spent {
+        mono_ms: 1200,
+        spawns: 3,
+        gits: 2,
+        child_cpu_ms: 240,
+        cpu_ms: 25,
+    };
+    let line = cost::line(
+        "0.145.0+gabc",
+        Trigger::Subscriber,
+        Due::Recheck,
+        spent,
+        Some("c=recheck+retry-held,h=11,w=52000"),
+        &rows,
+    );
+    assert_eq!(
+        line,
+        "converge cost build=0.145.0+gabc trigger=subscriber/recheck ms=1200 spawns=3 git=2 \
+         child_cpu_ms=240 cpu_ms=25 note=c=recheck+retry-held,h=11,w=52000 \
+         changed_rows=sync.fleet,sync.clone,sync.requests,#5 \
+         slow=sync.identity:2000,sync.clone:1840,sync.fleet:400,#5:250,rest:120"
+    );
+    assert!(!line.contains("Alice"), "no name reaches the line: {line}");
+    assert!(
+        !line.contains("converge build="),
+        "a tally of pass lines does not count it"
+    );
+
+    // More slow rows than the line names: the eight longest, run order between equals, and the
+    // rest summed; a pass with nothing changed or slow, and a start with no note, write `-`.
+    let many: Vec<ItemReport> = (0..10)
+        .map(|n| timed_row(&format!("sync.r{n}"), Outcome::Ok, 300, None))
+        .collect();
+    let line = cost::line(
+        "b",
+        Trigger::Window,
+        Due::Recheck,
+        Spent::default(),
+        None,
+        &many,
+    );
+    assert!(
+        line.ends_with(
+            " note=- changed_rows=- slow=sync.r0:300,sync.r1:300,sync.r2:300,sync.r3:300,\
+             sync.r4:300,sync.r5:300,sync.r6:300,sync.r7:300,rest:600"
+        ),
+        "{line}"
+    );
+    let quiet = cost::line(
+        "b",
+        Trigger::Window,
+        Due::Recheck,
+        Spent::default(),
+        None,
+        &[timed_row("sync.vault", Outcome::Ok, 0, None)],
+    );
+    assert_eq!(
+        quiet,
+        "converge cost build=b trigger=window/recheck ms=0 spawns=0 git=0 child_cpu_ms=0 \
+         cpu_ms=0 note=- changed_rows=- slow=-"
+    );
+}
+
+/// A COST LINE IS ONE LOG RECORD, WHOLE: aterm.log keeps at most [`aterm_log::MAX_RECORD_BYTES`]
+/// of an INFO record, so where the whole line would be longer, `changed_rows` names the first
+/// Changed rows that fit and then `+<n>` for the rest, the most that fit and in run order; where
+/// naming none still does not fit, `slow` gives up its shortest rows to `rest`. The head, every
+/// number and the note stay whole, and at their largest are 438 bytes beside the build's name.
+/// NEGATIVE CONTROL: a line whose lists are never cut is 1204 bytes, which the log would cut
+/// inside `changed_rows`.
+#[test]
+fn a_cost_line_fits_one_log_record_cutting_its_lists_from_their_ends() {
+    const CAP: usize = aterm_log::MAX_RECORD_BYTES;
+    let note = format!("c={}", "a".repeat(238));
+    let largest = Spent {
+        mono_ms: u64::MAX,
+        spawns: u64::MAX,
+        gits: u64::MAX,
+        child_cpu_ms: u64::MAX,
+        cpu_ms: u64::MAX,
+    };
+    let bare = cost::line(
+        "",
+        Trigger::Subscriber,
+        Due::NetworkMoved,
+        largest,
+        Some(&note),
+        &[],
+    );
+    assert_eq!(
+        bare.len() - " changed_rows=- slow=-".len(),
+        438,
+        "the head, the numbers and the note at their largest: {bare}"
+    );
+
+    // Forty Changed rows, each slow: the ids are cut from the end, the slow rows kept.
+    let rows: Vec<ItemReport> = (0..40)
+        .map(|n| {
+            timed_row(
+                &format!("sync.changed-row-{n:02}"),
+                Outcome::Changed,
+                300 + n,
+                None,
+            )
+        })
+        .collect();
+    let spent = Spent {
+        mono_ms: 61_000,
+        spawns: 120,
+        gits: 97,
+        child_cpu_ms: 9_000,
+        cpu_ms: 800,
+    };
+    let note = "c=input-repair+retry-held,h=1,hc=35,w=5000,m=git-dir+index,n=1";
+    let line = cost::line(
+        "0.201.0+g9c554c6",
+        Trigger::Window,
+        Due::NotDue,
+        spent,
+        Some(note),
+        &rows,
+    );
+    assert!(line.len() <= CAP, "{} bytes: {line}", line.len());
+    let head = format!(
+        "converge cost build=0.201.0+g9c554c6 trigger=window/not-due ms=61000 spawns=120 git=97 \
+         child_cpu_ms=9000 cpu_ms=800 note={note} changed_rows="
+    );
+    assert!(line.starts_with(&head), "{line}");
+    let (changed, slow) = line[head.len()..].split_once(" slow=").unwrap();
+    let changed: Vec<&str> = changed.split(',').collect();
+    let (left, named) = changed.split_last().unwrap();
+    let left: usize = left.strip_prefix('+').unwrap().parse().unwrap();
+    assert!(!named.is_empty(), "{line}");
+    assert_eq!(named.len() + left, rows.len());
+    for (word, row) in named.iter().zip(&rows) {
+        assert_eq!(*word, row.id, "the first rows, in run order");
+    }
+    // The most that fit: one more id (and one fewer left out) passes the cap.
+    let one_more = if left > 1 {
+        format!(",{},+{}", rows[named.len()].id, left - 1)
+    } else {
+        format!(",{}", rows[named.len()].id)
+    };
+    let more = line.replacen(&format!(",+{left}"), &one_more, 1);
+    assert!(more.len() > CAP, "{} bytes: {more}", more.len());
+    let slowest: Vec<String> = (32..40)
+        .rev()
+        .map(|n| format!("{}:{}", rows[n].id, 300 + n))
+        .collect();
+    let rest: u64 = (0..32).map(|n| 300 + n).sum();
+    assert_eq!(slow, format!("{},rest:{rest}", slowest.join(",")));
+
+    // Longer ids: naming none of the Changed rows still does not fit, so `slow` gives up its
+    // shortest rows to `rest` until the line does.
+    let long: Vec<ItemReport> = (0..40)
+        .map(|n| {
+            timed_row(
+                &format!("sync.a-changed-row-with-a-long-id-{n:02}"),
+                Outcome::Changed,
+                300 + n,
+                None,
+            )
+        })
+        .collect();
+    let note = format!("c={}", "a".repeat(238));
+    let line = cost::line(
+        "0.201.0+g9c554c6",
+        Trigger::Subscriber,
+        Due::NetworkMoved,
+        spent,
+        Some(&note),
+        &long,
+    );
+    assert!(line.len() <= CAP, "{} bytes: {line}", line.len());
+    let (before, slow) = line.split_once(" slow=").unwrap();
+    assert!(
+        before.ends_with(&format!(" note={note} changed_rows=+40")),
+        "{line}"
+    );
+    let slow: Vec<&str> = slow.split(',').collect();
+    let (rest, kept) = slow.split_last().unwrap();
+    assert!(!kept.is_empty() && kept.len() < cost::SLOW_ROWS, "{line}");
+    for (word, n) in kept.iter().zip((32..40).rev()) {
+        assert_eq!(*word, format!("{}:{}", long[n].id, 300 + n), "the longest");
+    }
+    let named: u64 = (0..kept.len()).map(|k| 300 + 39 - k as u64).sum();
+    let total: u64 = (0..40).map(|n| 300 + n).sum();
+    assert_eq!(*rest, format!("rest:{}", total - named));
+}
+
+/// A PASS'S LEDGER LINE IS THE BYTES IT WAS, AND ITS COST HAS A LINE OF ITS OWN THAT SAYS WHAT
+/// WAS SPENT BETWEEN ITS TWO READINGS: a pass that ran logs its ledger line ([`ledger`]: the
+/// head, the tally and the whys, nothing more), then its cost line ([`cost::line`]), which
+/// carries the difference of the [`Ports::spent`] read once it holds the lock and once as it
+/// ends, and the rows it reported Changed. A pass that finds the lock held, and a plan, read
+/// nothing and log no ledger or cost line.
+/// NEGATIVE CONTROLS: the cost fields written on the ledger line, before its whys (as they
+/// first were), make the first line `… failed=1 ms=1200 spawns=3 … slow=rest:7 [base.person: …`
+/// where [`ledger`]'s has no field between `failed=1` and the bracket; a pass that logs its
+/// second reading whole reads `spawns=4`.
+#[test]
+fn a_pass_logs_its_ledger_line_as_it_was_and_what_it_spent_in_a_line_of_its_own() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.fleet_done.lock().unwrap() = Err("the issuer did not answer".to_owned());
+    *ports.spent.lock().unwrap() = [
+        Spent {
+            mono_ms: 100,
+            spawns: 1,
+            gits: 1,
+            child_cpu_ms: 10,
+            cpu_ms: 5,
+        },
+        Spent {
+            mono_ms: 1300,
+            spawns: 4,
+            gits: 3,
+            child_cpu_ms: 250,
+            cpu_ms: 30,
+        },
+    ]
+    .into();
+    let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    assert_eq!(ports.spent_reads.load(Ordering::SeqCst), 2);
+    let logged = ports.logged();
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    assert_eq!(
+        logged[0],
+        ledger(
+            "0.145.0+gabc",
+            Trigger::Subscriber,
+            pass.due,
+            &pass.rows,
+            None
+        )
+    );
+    assert!(
+        logged[0].ends_with(" | sync.fleet: the issuer did not answer; the next pass tries again]"),
+        "the whys end the ledger line: {logged:?}"
+    );
+    let changed: Vec<&str> = pass
+        .rows
+        .iter()
+        .filter(|row| row.outcome == Outcome::Changed)
+        .map(|row| row.id.as_str())
+        .collect();
+    assert!(changed.len() > 1, "more than one row changed: {changed:?}");
+    assert!(
+        logged[1].starts_with(&format!(
+            "converge cost build=0.145.0+gabc trigger=subscriber/{} ms=1200 spawns=3 git=2 \
+             child_cpu_ms=240 cpu_ms=25 note=- changed_rows={} slow=",
+            pass.due.word(),
+            changed.join(",")
+        )),
+        "{logged:?}"
+    );
+
+    let held = Inert::new(scratch.path());
+    let lock = try_lock(scratch.path()).unwrap().expect("the lock is free");
+    assert!(matches!(
+        held.pass(Trigger::Window, Mode::Apply),
+        Err(Stop::Held)
+    ));
+    drop(lock);
+    ran(held.pass(Trigger::Window, Mode::Plan));
+    assert_eq!(
+        held.spent_reads.load(Ordering::SeqCst),
+        0,
+        "a held pass and a plan read nothing"
+    );
+    assert_eq!(held.logged().len(), 1, "the held start's own line alone");
+}
+
+/// EACH START SAYS WHAT CAUSED IT, AND A START THAT FOUND THE LOCK HELD IS NOT COUNTED AS A
+/// PASS: a pass that ran carries its starter's note as its cost line's `note=` (`-` with none);
+/// a pass that found the lock held writes one line of its own, whose head is `converge held`
+/// and never a pass line's `converge build=`, with the same note; a plan writes none.
+/// NEGATIVE CONTROL: a held start logged under the pass line's head (`converge build=… held`)
+/// is counted by the tally of pass lines below: 3 where 1 is wanted.
+#[test]
+fn a_start_says_its_note_and_a_held_start_has_a_line_of_its_own() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert {
+        start_note: Some("c=recheck+retry-held,h=2,w=10000".to_owned()),
+        ..Inert::new(scratch.path())
+    };
+    let lock = try_lock(scratch.path()).unwrap().expect("the lock is free");
+    for _ in 0..2 {
+        assert!(matches!(
+            ports.pass(Trigger::Subscriber, Mode::Apply),
+            Err(Stop::Held)
+        ));
+    }
+    assert!(ports.pass(Trigger::Subscriber, Mode::Plan).is_ok());
+    drop(lock);
+    ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+    let logged = ports.logged();
+    let held = "converge held build=0.145.0+gabc trigger=subscriber \
+                note=c=recheck+retry-held,h=2,w=10000";
+    let passes = logged
+        .iter()
+        .filter(|line| line.contains("converge build="))
+        .count();
+    assert_eq!(passes, 1, "a tally of pass lines counts no held start");
+    assert_eq!(logged.len(), 4, "{logged:?}");
+    assert_eq!(logged[..2], [held, held]);
+    assert!(logged[2].starts_with("converge build="), "{logged:?}");
+    assert!(
+        logged[3].contains(" note=c=recheck+retry-held,h=2,w=10000 changed_rows="),
+        "{logged:?}"
+    );
+
+    let unnoted = Inert::new(scratch.path());
+    let lock = try_lock(scratch.path()).unwrap().expect("the lock is free");
+    assert!(matches!(
+        unnoted.pass(Trigger::Window, Mode::Apply),
+        Err(Stop::Held)
+    ));
+    drop(lock);
+    ran(unnoted.pass(Trigger::Window, Mode::Apply));
+    let logged = unnoted.logged();
+    assert_eq!(
+        logged[0],
+        "converge held build=0.145.0+gabc trigger=window note=-"
+    );
+    assert!(logged[2].contains(" note=- changed_rows="), "{logged:?}");
 }
 
 /// The 0.144 → 0.145 update measured on m22: the broker renewal failed, and the log line cut its
@@ -3609,16 +4035,10 @@ pub(crate) mod owed_clone {
                 len: profile_bytes.len() as u64,
             },
         );
-        sys.file(OWED_TOKEN, b"fixture_token_only").stat_of(
-            OWED_TOKEN,
-            crate::port::Stat {
-                uid: 501,
-                gid: 20,
-                mode: 0o600,
-                dir: false,
-                symlink: false,
-                len: 18,
-            },
+        sys.vault_set(
+            "/Users//alice",
+            crate::init_github::TOKEN_ENTRY,
+            b"fixture_token_only",
         );
         match user {
             Ok(answer) => sys.on_github_api(&alice, "/user", Ok(answer)),
@@ -3626,9 +4046,6 @@ pub(crate) mod owed_clone {
         };
         sys
     }
-
-    /// The vault's token file [`profiled`] writes.
-    const OWED_TOKEN: &str = "/Users//alice/.secrets/gh_access_token";
 
     /// `n` subscriber passes over an owed clone: each one's clone row, and how many times the
     /// GitHub step asked `GET /user` in all.
@@ -3709,7 +4126,11 @@ pub(crate) mod owed_clone {
             "{said:?}"
         );
         // A new token from the vault is a new chance: the next pass runs the step again.
-        sys.file(OWED_TOKEN, b"fixture_token_next");
+        sys.vault_set(
+            "/Users//alice",
+            crate::init_github::TOKEN_ENTRY,
+            b"fixture_token_next",
+        );
         let (_, asked) = owed_passes(&sys, scratch.path(), 1);
         assert_eq!(asked, 2, "a new token runs the step again");
     }
@@ -3738,7 +4159,11 @@ pub(crate) mod owed_clone {
                 .is_some_and(|why| !why.contains("Only you can fix this")),
             "{said:?}"
         );
-        sys.file(OWED_TOKEN, b"fixture_token_next");
+        sys.vault_set(
+            "/Users//alice",
+            crate::init_github::TOKEN_ENTRY,
+            b"fixture_token_next",
+        );
         let (_, asked) = owed_passes(&sys, scratch.path(), 1);
         assert_eq!(asked, 2, "a new token runs the step again");
     }
@@ -3836,17 +4261,10 @@ pub(crate) mod owed_clone {
         ] {
             let scratch = aterm_tempfile::tempdir().unwrap();
             let (sys, _alice) = alice();
-            let token = "/Users//alice/.secrets/gh_access_token";
-            sys.file(token, b"fixture_token_only").stat_of(
-                token,
-                crate::port::Stat {
-                    uid: 501,
-                    gid: 20,
-                    mode: 0o600,
-                    dir: false,
-                    symlink: false,
-                    len: 18,
-                },
+            sys.vault_set(
+                "/Users//alice",
+                crate::init_github::TOKEN_ENTRY,
+                b"fixture_token_only",
             );
             crate::init::owe_clone(scratch.path(), &start).unwrap();
             let state = scratch.path().to_path_buf();
@@ -4270,9 +4688,7 @@ pub(crate) mod owed_clone {
                     read(Some(proof), &stopped),
                     Ok(OwedClone::Verified { .. })
                 ));
-                let token = crate::init_github::token_file(home);
-                let token_stat = sys.stat(&token).unwrap();
-                System::remove(&sys, &token).unwrap();
+                sys.vault_remove(home, crate::init_github::TOKEN_ENTRY);
                 assert!(
                     !matches!(
                         read(Some(proof), &crate::init::Holds::NONE),
@@ -4281,7 +4697,6 @@ pub(crate) mod owed_clone {
                     "an empty-remote proof cannot supply missing source authority"
                 );
                 crate::init_github::scripted::owned_source(&sys, &repos.who);
-                assert_eq!(sys.stat(&token).unwrap(), token_stat);
                 repos.g(
                     &work,
                     &[
@@ -4565,35 +4980,28 @@ pub(crate) mod owed_clone {
         );
     }
 
-    /// A token file that is on this Mac but that aterm may not use (here readable by others)
-    /// leaves the owed clone waiting with what is wrong with that file, never as if no token had
-    /// landed. CONTROL: the same file readable by its owner alone is due.
+    /// A store whose local state cannot be read leaves the owed clone waiting with what is
+    /// wrong, never as if no token had landed. CONTROL: the same store read is due.
     #[test]
-    fn a_token_file_aterm_cannot_use_says_what_is_wrong() {
+    fn a_vault_aterm_cannot_read_says_what_is_wrong() {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let state = scratch.path().to_path_buf();
         crate::init::owe_clone(&state, &crate::init::Holds::NONE).unwrap();
         let (sys, _alice) = alice_with(true);
-        let token = "/Users//alice/.secrets/gh_access_token";
-        let stat = |mode| crate::port::Stat {
-            uid: 501,
-            gid: 20,
-            mode,
-            dir: false,
-            symlink: false,
-            len: 18,
-        };
-        sys.file(token, b"fixture_token_only")
-            .stat_of(token, stat(0o644));
+        sys.vault_set(
+            "/Users//alice",
+            crate::init_github::TOKEN_ENTRY,
+            b"fixture_token_only",
+        );
+        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, None).unwrap();
+        assert!(matches!(read, crate::init::OwedClone::Due(_)), "{read:?}");
+        sys.vault_unreadable(std::io::ErrorKind::PermissionDenied);
         let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, None).unwrap();
         assert!(
             matches!(&read, crate::init::OwedClone::Waiting(why)
-                if why.contains(token) && why.contains("cannot be used")),
+                if why.contains("gh_access_token") && why.contains("cannot be read")),
             "{read:?}"
         );
-        sys.stat_of(token, stat(0o600));
-        let read = crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, None).unwrap();
-        assert!(matches!(read, crate::init::OwedClone::Due(_)), "{read:?}");
     }
 
     /// A Stop pressed once `sync.clone` has read what is owed (its clone may take half an hour)

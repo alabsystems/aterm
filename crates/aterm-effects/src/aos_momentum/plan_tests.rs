@@ -678,7 +678,7 @@ fn a_presentation_change_holds_cadence_for_a_plan() {
             now = t0 + ms(60 * k);
             host.on_key(now, c.tau_s);
         }
-        let firings = |h: &MomentumHost| hosted(h).guard.firings;
+        let firings = |h: &MomentumHost| hosted(h).live.guard.firings;
         let tick = |h: &mut MomentumHost,
                     now: Instant,
                     cell: (u16, u16),
@@ -837,8 +837,8 @@ fn the_fallback_never_fires_for_prebuilt_codes() {
                 let s = h.state();
                 assert_eq!(host.is_active(), code.is_active(s), "{code:?} seed {seed}");
                 assert_eq!(host.settling(), code.settling(s), "{code:?} seed {seed}");
-                assert_eq!(h.guard.firings, 0, "{code:?} seed {seed}");
-                moved += usize::from(h.guard.moved && s.glow.hot());
+                assert_eq!(h.live.guard.firings, 0, "{code:?} seed {seed}");
+                moved += usize::from(h.live.guard.moved && s.glow.hot());
             }
         }
         assert!(
@@ -847,13 +847,13 @@ fn the_fallback_never_fires_for_prebuilt_codes() {
         );
     }
     let (host, _, _) = strand(attached(t0, MomentumCode::DemoStrandedSettle), t0, true);
-    assert_eq!(hosted(&host).guard.firings, 0);
+    assert_eq!(hosted(&host).live.guard.firings, 0);
     let mut host = attached(t0, MomentumCode::Shipped);
     let c = cfg(true);
     let mut seen = Vec::new();
     let (last, cell) = burst(&mut host, t0, 12, &c, &mut seen);
     let _ = run_lane(&mut host, last, LANE, cell, &c, &mut seen);
-    assert_eq!(hosted(&host).guard.firings, 0);
+    assert_eq!(hosted(&host).live.guard.firings, 0);
 }
 
 #[test]

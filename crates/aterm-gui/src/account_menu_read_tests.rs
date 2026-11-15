@@ -874,6 +874,7 @@ fn a_failed_pool_read_keeps_the_card() {
 /// file; with the roster unreadable the card still names that home as this Mac, from the
 /// store's own state, and where that cannot be read either, from what the last read that
 /// worked left. Negative control: with neither, the home is a Mac the card cannot call its own.
+#[cfg(unix)] // seeds its pool entry through `vault_entry::put`, a unix-only seam
 #[test]
 fn a_failed_pool_read_still_knows_this_mac() {
     let scratch = scratch();
@@ -882,13 +883,12 @@ fn a_failed_pool_read_still_knows_this_mac() {
         scratch.key.state.as_deref().unwrap(),
         scratch.key.home.as_deref().unwrap(),
     );
-    std::fs::create_dir_all(home.join(".secrets")).unwrap();
-    std::fs::write(
-        home.join(".secrets").join("ai-pool.toml"),
+    aterm_agent::vault_entry::put(
+        home,
+        "ai-pool.toml",
         "version = 1\n[[account]]\nprovider = \"claude\"\nemail = \"work@example.com\"\n\
          warm = [\"m16\"]\n",
-    )
-    .unwrap();
+    );
     let store = accounts::Store::at_for(state_dir, accounts::Cli::Claude, home);
     let (mut state, _) = store.load(NOON).unwrap();
     state.swarm_label = Some("m16".into());
@@ -914,4 +914,44 @@ fn a_failed_pool_read_still_knows_this_mac() {
     assert!(ours(&failed), "the memo still says which Mac this is");
     let unknown = read_account_at(&scratch.key, &Mutex::default(), NOON);
     assert!(!ours(&unknown), "CONTROL: nothing names this Mac");
+}
+
+/// THE CARD SAYS `signing in` OF THE SIGN-IN ITS POOL READ NAMES: a card the account reader
+/// builds while this Mac's running record names the session's account, whose login was never
+/// made here (its row names a directory that holds none), says it (`AccountCard::signing_in`,
+/// from `PoolRead::signing_in`, which its Login line says), and stops once that sign-in ends.
+/// NEGATIVE CONTROL: the same read with none running.
+#[test]
+fn a_cards_signing_in_is_the_sign_in_its_pool_read_names() {
+    let scratch = scratch();
+    let config = scratch.key.config.as_deref().unwrap().parent().unwrap();
+    let never_made = config.with_file_name("logins").join("work");
+    std::fs::write(
+        config.join("accounts.toml"),
+        format!(
+            "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \"work@example.com\"\n\
+             dir = {}\n",
+            crate::test_host::toml(&never_made)
+        ),
+    )
+    .unwrap();
+    let signing_in = || {
+        read_account_at(&scratch.key, &Mutex::default(), NOON)
+            .card
+            .expect("a card")
+            .signing_in
+    };
+    assert!(!signing_in(), "NEGATIVE CONTROL: no sign-in runs");
+    let store = accounts::Store::at_for(
+        scratch.key.state.as_deref().unwrap(),
+        accounts::Cli::Claude,
+        scratch.key.home.as_deref().unwrap(),
+    );
+    std::fs::create_dir_all(store.shared_dir()).unwrap();
+    let running = store
+        .signing_in_fixture("work", NOON)
+        .expect("the running record is written");
+    assert!(signing_in(), "the running sign-in is the card's");
+    drop(running);
+    assert!(!signing_in(), "its end ends it");
 }

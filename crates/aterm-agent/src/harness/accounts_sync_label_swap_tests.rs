@@ -54,8 +54,9 @@ fn account(label: &str, email: &str) -> FleetAccount {
 
 /// m3 as it stood: the default login signed in as Ann, whose row is `m3-2` (signed in, a session
 /// on it), Bea's row `m3` and Cid's `m3-3` each an empty login directory with a sign-in that found
-/// no route; the fleet file beside the roster and aterm's own copy of it in `~/.secrets` (found on
-/// this Mac) pair the same labels; and the vault's sheet beside that copy.
+/// no route; the fleet file beside the roster and the copy of it an older aterm left in
+/// `~/.secrets` (the owner's backup now, which nothing reads) pair the same labels; and the
+/// vault's sheet, read in place from the store.
 fn m3() -> Desk {
     let desk = Desk::new("m3");
     desk.default_login(ANN);
@@ -87,7 +88,7 @@ fn m3() -> Desk {
     let secrets = desk.home.join(".secrets");
     aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
     fs::write(secrets.join(FLEET_ROSTER_FILE), &fleet).unwrap();
-    fs::write(secrets.join(ACCOUNTS_CSV_FILE), SHEET).unwrap();
+    crate::vault_entry::seed(&desk.home, &[(ACCOUNTS_CSV_FILE, SHEET.as_bytes())]);
     store
         .transact_logins(NOW, &mut None, |state, logins| {
             state.accounts.insert(
@@ -145,12 +146,10 @@ fn init_item_complete(desk: &Desk, now: i64) -> bool {
 /// Every file the sync reads or writes, and which login directories exist.
 fn records(desk: &Desk) -> Vec<Option<Vec<u8>>> {
     let store = desk.store();
-    let secrets = desk.home.join(".secrets");
     let mut files: Vec<Option<Vec<u8>>> = [
         desk.roster(),
         desk.fleet_file(),
-        secrets.join(FLEET_ROSTER_FILE),
-        secrets.join(ACCOUNTS_CSV_FILE),
+        desk.home.join(".secrets").join(FLEET_ROSTER_FILE),
         store.state_file(),
         store.logins_file(),
         store.ledger_path(),
@@ -175,8 +174,8 @@ fn records(desk: &Desk) -> Vec<Option<Vec<u8>>> {
 /// The m3 case: the sheet swaps the default login's label (`m3-2`) with the label of a row not
 /// signed in here (`m3`). The sync publishes: Ann's row is `m3`, the default login's, with her
 /// auth word, served login and session; Bea's is `m3-2` with her sign-in record and its own empty
-/// login directory (`logins/m3`, which nothing names now, is gone); Cid's is unchanged; aterm's
-/// copy in `~/.secrets` yields to the sheet; and `base.ai.accounts` reads complete. A second sync
+/// login directory (`logins/m3`, which nothing names now, is gone); Cid's is unchanged; the old
+/// copy in `~/.secrets` is left as it was; and `base.ai.accounts` reads complete. A second sync
 /// writes nothing. CONTROL: before the sync the item is open.
 #[test]
 fn a_sheet_that_swaps_the_default_logins_label_publishes_and_the_init_item_completes() {

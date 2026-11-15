@@ -5,19 +5,20 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_phase::wall::WallKind;
+use alab_policy::vocab::WallKind;
 use aterm_phase::{LoginScreen, Program};
 
-use super::super::config::{Autopilot, SupervisorConfig};
+use super::super::config::SupervisorConfig;
 use super::notice::{self, Notice, NoticeText};
 use super::outlook::ExceptionKind;
 use super::turn_end::{
-    Composer, ContextFill, Diversion, GO_AHEAD_REFUSED, RULE_LOGIN, RosterWord, SAME_REPLY,
-    TurnEndAction, TurnEndReading, TurnEndState, Unmade, bucket_model, decide_turn_end,
-    decide_turn_end_traced, login_wall_moves, login_wall_waits, renewed_draft_holds, sign_in_how,
-    waited_login,
+    Composer, ContextFill, Diversion, RULE_LOGIN, RosterWord, TurnEndAction, TurnEndReading,
+    TurnEndState, Unmade, bucket_model, decide_turn_end, decide_turn_end_traced, login_wall_moves,
+    login_wall_waits, renewed_draft_holds, sign_in_how, waited_login,
 };
 use crate::harness::acts::HeldBy;
+use alab_policy::config::Autopilot;
+use alab_policy::words::{GO_AHEAD_REFUSED, SAME_REPLY};
 
 /// Whether the person is needed now or only when they next look.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +267,7 @@ impl Exception {
     /// ([`Self::refuses_go_ahead`]) at such a break. There, where the carry can go (Cruise, the
     /// continuation on, an unattended run, a window host), answers are on and no continuation a
     /// `/compact` owes goes first, a park still spent records the refusal
-    /// (`recovering:go-ahead-refused`, [`super::turn_end::GO_AHEAD_REFUSED`];
+    /// (`recovering:go-ahead-refused`, [`alab_policy::words::GO_AHEAD_REFUSED`];
     /// `Session::break_go_ahead`) unless the window's host withholds the session's decisions,
     /// where no refusal is recorded and nothing is typed; the carry's change of approach goes in
     /// the go-ahead's place where its ladder, its budget and the write's guards let it
@@ -525,15 +526,6 @@ pub fn refused_action(typed: Option<&str>, message: &str) -> &'static str {
                 .find(|(_, needles, _)| needles.iter().any(|n| lower.contains(n)))
         })
         .map_or(REFUSED_ACTIONS[REFUSED_ACTIONS.len() - 1].2, |row| row.2)
-}
-
-/// `Goal cleared after an unrecoverable error (<label>)`'s label, from a wall's message.
-#[must_use]
-pub fn goal_cleared_label(message: &str) -> Option<&str> {
-    let head = aterm_phase::anchor!("wall.goal_cleared");
-    let at = message.find(head)? + head.len();
-    let rest = message[at..].trim_start().strip_prefix('(')?;
-    rest.split(')').next().filter(|l| !l.is_empty())
 }
 
 /// Tries at a wall after its reset that the wall answered before it is called futile.
@@ -1097,7 +1089,14 @@ pub fn exception_for(
         });
     };
     let attempts = state.wall_attempts(kind).unwrap_or(0);
-    if let Some(label) = goal_cleared_label(&reading.wall_message) {
+    // A GOAL CLAUDE CODE CLEARED AFTER AN UNRECOVERABLE ERROR is the harness's to put back where
+    // the point reads that clear and its restore is owed or typed and not booked unconfirmed
+    // ([`TurnEndState::goal_restoring`], [`super::goal_restore`]); the wall itself is decided
+    // below as any other. Where the transcript is unread, the condition cannot be typed back or
+    // its restore was not followed by a goal, the exception names the cause.
+    if let Some(label) = crate::harness::goal::cleared_label(&reading.wall_message)
+        && !state.goal_restoring(reading)
+    {
         return Some(Exception {
             kind: ExceptionKind::GoalCleared,
             when: Urgency::Later,
@@ -1203,7 +1202,7 @@ pub fn exception_for(
             ))
         }
         WallKind::ApiError {
-            cause: aterm_phase::ApiCause::Request,
+            cause: alab_policy::vocab::ApiCause::Request,
             ..
         } if cfg.retry_api_errors && attempts >= FUTILE_AFTER_TRIES => Some(Exception::refused_by(
             reading.program,

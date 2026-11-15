@@ -374,6 +374,7 @@ fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_prof
     let zsh = aterm_spec::host::need_tool("zsh");
     let fish = aterm_spec::host::need_tool("fish");
     for shell in [zsh.as_path(), Path::new("/bin/bash"), fish.as_path()] {
+        aterm_spec::wait::first_exec(shell, &["--version"]);
         let is_fish = shell.file_name().is_some_and(|name| name == "fish");
         let mut account = Account::new("selected-cli");
         account.places.bin_dir = account.home().join("CLI $selected `app` 'links'");
@@ -460,7 +461,7 @@ fn shell_setup_selects_the_cli_before_an_inherited_bundle_and_preserves_the_prof
             &mut command,
             Instant::now() + Duration::from_secs(60),
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("{} shell setup: {error}", shell.display()));
         assert!(
             output.status.success(),
             "{}",

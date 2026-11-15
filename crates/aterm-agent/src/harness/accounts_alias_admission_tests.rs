@@ -251,11 +251,7 @@ fn represented_sync(
         _ => None,
     };
     let published = Roster::load_for(Cli::Codex, &roster_path).ok();
-    let source_name = bed
-        .secrets()
-        .join(cli_fleet_file(Cli::Codex))
-        .display()
-        .to_string();
+    let source_name = crate::vault_entry::source_name(&cli_fleet_file(Cli::Codex));
     let valid_report = |report: &CliSynced| {
         let additions: BTreeSet<_> = report.added.iter().collect();
         let kept: BTreeSet<_> = report.kept.iter().collect();

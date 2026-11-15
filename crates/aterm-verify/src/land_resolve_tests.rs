@@ -6,36 +6,6 @@
 //! conflict no rule resolves from a red.
 
 use super::*;
-use crate::changelog_fragments::{Fragment, fragment_findings};
-
-/// The changelog the merge base holds: one entry under `[Unreleased]`.
-const BASE_LOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- Old entry one.\n\n\
-                        ## [0.1.0] - 2026-01-01\n\n### Added\n\n- First release.\n";
-
-/// The branch's changelog, written before entries moved to `changes/`: an entry of a new kind
-/// and one more of the base's kind, under `[Unreleased]`.
-const BRANCH_LOG: &str = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Adds the widget.\n\n\
-                          ### Fixed\n\n- Old entry one.\n\n- Fixes the gadget.\n\n\
-                          ## [0.1.0] - 2026-01-01\n\n### Added\n\n- First release.\n";
-
-/// Main's changelog once its `[Unreleased]` entries were drained into `changes/` files.
-const MAIN_LOG: &str =
-    "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\n### Added\n\n- First release.\n";
-
-/// The file main's drain wrote for the base's entry.
-const OLD_ENTRY: (&str, &str) = ("changes/fixed/old-entry-one.md", "- Old entry one.\n");
-
-/// The files the changelog rule writes for the branch's two entries, and their text.
-const BRANCH_ENTRIES: [(&str, &str); 2] = [
-    (
-        "changes/added/land-adds-the-widget.md",
-        "- Adds the widget.\n",
-    ),
-    (
-        "changes/fixed/land-fixes-the-gadget.md",
-        "- Fixes the gadget.\n",
-    ),
-];
 
 /// The line `goals.py repo-docs` heads `docs/PLAN.md` and `docs/STATUS.md` with on main.
 const GENERATED_LINE: &str = "Generated from the lab tracker (the publication repo, goals/data) \
@@ -76,108 +46,9 @@ fn commit_files(world: &World, files: &[(&str, &str)]) -> String {
     git(&world.work, &["rev-parse", "HEAD"])
 }
 
-/// A world whose branch added two `[Unreleased]` entries to `CHANGELOG.md` (with `branch`'s
-/// further files) while main drained `[Unreleased]` into `changes/` (with `main`'s): git's merge
-/// conflicts in `CHANGELOG.md`. The world and main's new tip.
-fn changelog_world(
-    branch_log: &str,
-    branch: &[(&str, &str)],
-    main: &[(&str, &str)],
-) -> (World, String) {
-    let world = world();
-    seed_main(&world, &[("CHANGELOG.md", BASE_LOG)]);
-    let mut ours = vec![("CHANGELOG.md", branch_log)];
-    ours.extend_from_slice(branch);
-    commit_files(&world, &ours);
-    let mut theirs = vec![("CHANGELOG.md", MAIN_LOG), OLD_ENTRY];
-    theirs.extend_from_slice(main);
-    let moved = rival_moves_files(&world, &theirs);
-    (world, moved)
-}
-
 /// The message of commit `at`.
 fn message(world: &World, at: &str) -> String {
     git(&world.work, &["log", "-1", "--format=%B", at])
-}
-
-/// A CHANGELOG CONFLICT IS RESOLVED INTO `changes/` FILES AND JUDGED: a branch written before
-/// entries moved to `changes/` conflicts with main's drain of `[Unreleased]`. `CHANGELOG.md`
-/// takes main's file, each entry the branch added becomes its own file the checker accepts, the
-/// merge is committed with both parents, judged once, and lands with its receipt; the merge and
-/// the landing message name the rule. Where main moves again during the judgment and the pass
-/// composes onto it, the composed landing names the rule too ([`Git::resolutions`]).
-/// CONTROL: a branch that also changed a released entry is refused by the rule (main's file
-/// would drop that change), and the merge is left for the person with no file written.
-/// NEGATIVE CONTROL: with no rule the landing exits [`exit::CONFLICT`], not [`exit::PASS`].
-#[test]
-fn a_changelog_conflict_is_resolved_into_changes_files_and_judged() {
-    let (world, moved) = changelog_world(BRANCH_LOG, &[], &[]);
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| {
-        let parents = git(&world.work, &["rev-list", "--parents", "-n", "1", "HEAD"]);
-        assert_eq!(parents.split_whitespace().count(), 3, "a merge: {parents}");
-        assert_eq!(git(&world.work, &["status", "--porcelain"]), "");
-        for (file, _) in BRANCH_ENTRIES {
-            let text = std::fs::read_to_string(world.work.join(file))
-                .unwrap_or_else(|e| panic!("{file}: {e}"));
-            assert!(
-                fragment_findings(file, &text).is_empty(),
-                "{file}: {:?}",
-                fragment_findings(file, &text)
-            );
-        }
-        green()
-    });
-    assert_eq!(code, exit::PASS, "{said:#?}");
-    assert_eq!(
-        bases,
-        std::slice::from_ref(&moved),
-        "the resolved merge was judged: {said:#?}"
-    );
-    assert!(
-        said.iter()
-            .any(|line| line.contains("resolved by rule: changelog-to-changes")),
-        "git conflicted and the rule resolved it: {said:#?}"
-    );
-    let landing = origin_main(&world);
-    let show = |file: &str| git(&world.work, &["show", &format!("{landing}:{file}")]);
-    assert_eq!(show("CHANGELOG.md"), MAIN_LOG.trim_end());
-    for (file, text) in BRANCH_ENTRIES.into_iter().chain([OLD_ENTRY]) {
-        assert_eq!(show(file), text.trim_end(), "{file}");
-    }
-    let landed = message(&world, &landing);
-    assert!(
-        landed.contains("Resolved by rule:") && landed.contains("changelog-to-changes"),
-        "{landed}"
-    );
-    assert!(stated(&world, &landing).is_some(), "{landed}");
-
-    let (composed, _) = changelog_world(BRANCH_LOG, &[], &[]);
-    let (code, said, bases) = land_with(&composed, crates(&["a"]), Lane::Pass, |_, n| {
-        if n == 0 {
-            rival_moves(&composed, "b/y.txt", "b2\n");
-        }
-        green()
-    });
-    assert_eq!((code, bases.len()), (exit::PASS, 1), "{said:#?}");
-    let landing = origin_main(&composed);
-    let receipt = stated(&composed, &landing).expect("stated");
-    assert!(receipt.composed_onto.is_some(), "{said:#?}");
-    let landed = message(&composed, &landing);
-    assert!(landed.contains("changelog-to-changes"), "{landed}");
-
-    let released = BRANCH_LOG.replace("- First release.", "- First release, corrected.");
-    let (refused, moved) = changelog_world(&released, &[], &[]);
-    let (code, said, bases) = land_with(&refused, crates(&["a"]), Lane::Pass, |_, _| green());
-    assert_eq!((code, bases.len()), (exit::CONFLICT, 0), "{said:#?}");
-    assert_eq!(origin_main(&refused), moved, "a conflict pushes nothing");
-    let status = git(&refused.work, &["status", "--porcelain"]);
-    assert!(status.contains("UU CHANGELOG.md"), "{status}");
-    assert!(!status.contains("land-"), "no file was written: {status}");
-    assert!(
-        said.iter()
-            .any(|line| line.contains("changelog-to-changes refused")),
-        "{said:#?}"
-    );
 }
 
 /// A tracker document's text: its heading, main's generated line where `generated`, and one
@@ -207,27 +78,43 @@ fn borrowed<'a>(files: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a s
         .collect()
 }
 
+/// A world whose branch and main each changed the package row of `docs/PLAN.md` and
+/// `docs/STATUS.md` (with `branch`'s and `main`'s further files): git's merge conflicts in both.
+/// The world and main's new tip.
+fn tracker_world(branch: &[(&str, &str)], main: &[(&str, &str)]) -> (World, String) {
+    let world = world();
+    seed_main(&world, &borrowed(&tracker_docs("ready")));
+    let ours = tracker_docs("running");
+    let mut mine: Vec<(&str, &str)> = borrowed(&ours);
+    mine.extend_from_slice(branch);
+    commit_files(&world, &mine);
+    let theirs = tracker_docs("done");
+    let mut moving: Vec<(&str, &str)> = borrowed(&theirs);
+    moving.extend_from_slice(main);
+    let moved = rival_moves_files(&world, &moving);
+    (world, moved)
+}
+
 /// A CONFLICT IN A TRACKER-GENERATED DOCUMENT TAKES MAIN'S SIDE: `docs/PLAN.md` and
 /// `docs/STATUS.md`, which `goals.py repo-docs` regenerates, conflict and land as main's
-/// copies, judged, the landing naming the rule. CONTROLS: the same conflict in
-/// `docs/PLANS.md`, which no rule covers, and in a `docs/PLAN.md` whose main copy does not say
-/// it is generated, each stop with [`exit::CONFLICT`] and push nothing.
+/// copies, judged, the landing naming the rule. Where main moves again during the judgment and
+/// the pass composes onto it, the composed landing names the rule too ([`Git::resolutions`]).
+/// CONTROLS: the same conflict in `docs/PLANS.md`, which no rule covers, and in a
+/// `docs/PLAN.md` whose main copy does not say it is generated, each stop with
+/// [`exit::CONFLICT`] and push nothing.
 /// NEGATIVE CONTROL: with no rule the first landing exits [`exit::CONFLICT`].
 #[test]
 fn a_conflict_in_a_tracker_generated_document_takes_mains_side() {
-    let world = world();
-    let (base, ours, theirs) = (
-        tracker_docs("ready"),
-        tracker_docs("running"),
-        tracker_docs("done"),
-    );
-    seed_main(&world, &borrowed(&base));
-    commit_files(&world, &borrowed(&ours));
-    rival_moves_files(&world, &borrowed(&theirs));
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (world, moved) = tracker_world(&[], &[]);
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!((code, bases.len()), (exit::PASS, 1), "{said:#?}");
+    assert_eq!(
+        bases,
+        std::slice::from_ref(&moved),
+        "the resolved merge was judged: {said:#?}"
+    );
     let landing = origin_main(&world);
-    for (file, text) in &theirs {
+    for (file, text) in &tracker_docs("done") {
         assert_eq!(
             git(&world.work, &["show", &format!("{landing}:{file}")]),
             text.trim_end(),
@@ -236,6 +123,21 @@ fn a_conflict_in_a_tracker_generated_document_takes_mains_side() {
     }
     let landed = message(&world, &landing);
     assert!(landed.contains("tracker-docs-take-main"), "{landed}");
+    assert!(stated(&world, &landing).is_some(), "{landed}");
+
+    let (composed, _) = tracker_world(&[], &[]);
+    let (code, said, bases) = land_with(&composed, crates(&["a"]), |_, n| {
+        if n == 0 {
+            rival_moves(&composed, "b/y.txt", "b2\n");
+        }
+        green()
+    });
+    assert_eq!((code, bases.len()), (exit::PASS, 1), "{said:#?}");
+    let landing = origin_main(&composed);
+    let receipt = stated(&composed, &landing).expect("stated");
+    assert!(receipt.composed_onto.is_some(), "{said:#?}");
+    let landed = message(&composed, &landing);
+    assert!(landed.contains("tracker-docs-take-main"), "{landed}");
 
     for (file, generated) in [("docs/PLANS.md", true), ("docs/PLAN.md", false)] {
         let world = self::world();
@@ -243,7 +145,7 @@ fn a_conflict_in_a_tracker_generated_document_takes_mains_side() {
         seed_main(&world, &[(file, doc("ready").as_str())]);
         commit(&world.work, file, &doc("running"));
         let moved = rival_moves(&world, file, &doc("done"));
-        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
         assert_eq!(
             (code, bases.len()),
             (exit::CONFLICT, 0),
@@ -261,48 +163,40 @@ fn a_conflict_in_a_tracker_generated_document_takes_mains_side() {
     }
 }
 
-/// A CONFLICT WITH ONE UNCOVERED PATH RESOLVES NO PATH: main's drain of `[Unreleased]` and its
-/// edit of `shared.txt`, in one commit, conflict with the branch's entries and its own edit of
-/// `shared.txt`. The changelog rule would resolve `CHANGELOG.md`, but no rule covers
+/// A CONFLICT WITH ONE UNCOVERED PATH RESOLVES NO PATH: main's tracker documents and its edit
+/// of `shared.txt`, in one commit, conflict with the branch's tracker documents and its own edit
+/// of `shared.txt`. The tracker rule would resolve `docs/PLAN.md`, but no rule covers
 /// `shared.txt`, so nothing is written: both paths stay conflicted as git left them, with the
-/// markers, and no `changes/` file of the rule's exists; nothing is judged or pushed.
+/// markers; nothing is judged or pushed.
 /// CONTROL: the same world without the `shared.txt` conflict lands.
-/// NEGATIVE CONTROL: a `plan` that wrote path by path would leave `CHANGELOG.md` resolved here.
+/// NEGATIVE CONTROL: a `plan` that wrote path by path would leave `docs/PLAN.md` resolved here.
 #[test]
 fn a_conflict_with_one_uncovered_path_resolves_no_path() {
     let mine = SHARED.replacen('4', "mine", 1);
     let theirs = SHARED.replacen('4', "theirs", 1);
-    let (world, moved) = changelog_world(
-        BRANCH_LOG,
+    let (world, moved) = tracker_world(
         &[("shared.txt", mine.as_str())],
         &[("shared.txt", theirs.as_str())],
     );
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::CONFLICT, "{said:#?}");
     assert!(bases.is_empty(), "nothing is judged: {said:#?}");
     assert_eq!(origin_main(&world), moved, "a conflict pushes nothing");
     let status = git(&world.work, &["status", "--porcelain"]);
     assert!(
-        status.contains("UU CHANGELOG.md") && status.contains("UU shared.txt"),
+        status.contains("UU docs/PLAN.md") && status.contains("UU shared.txt"),
         "{status}"
     );
-    assert!(!status.contains("land-"), "no file of the rule's: {status}");
-    for (file, _) in BRANCH_ENTRIES {
-        assert!(!world.work.join(file).exists(), "{file}");
-    }
-    let changelog = std::fs::read_to_string(world.work.join("CHANGELOG.md")).expect("read");
-    assert!(
-        changelog.contains("<<<<<<<"),
-        "git's markers stay: {changelog}"
-    );
+    let plan = std::fs::read_to_string(world.work.join("docs/PLAN.md")).expect("read");
+    assert!(plan.contains("<<<<<<<"), "git's markers stay: {plan}");
     assert!(
         said.iter()
             .any(|line| line.contains("\"shared.txt\": no rule")),
         "{said:#?}"
     );
 
-    let (lands, _) = changelog_world(BRANCH_LOG, &[("shared.txt", mine.as_str())], &[]);
-    let (code, said, _) = land_with(&lands, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (lands, _) = tracker_world(&[("shared.txt", mine.as_str())], &[]);
+    let (code, said, _) = land_with(&lands, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
 }
 
@@ -325,7 +219,7 @@ fn a_conflict_no_rule_covers_stops_with_the_conflict_code_and_pushes_nothing() {
     let world = world();
     commit(&world.work, "shared.txt", &SHARED.replacen('4', "mine", 1));
     let moved = rival_moves(&world, "shared.txt", &SHARED.replacen('4', "theirs", 1));
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::CONFLICT, "{said:#?}");
     assert!(bases.is_empty(), "a conflict starts no checks: {said:#?}");
     assert_eq!(origin_main(&world), moved, "a conflict pushes nothing");
@@ -343,197 +237,10 @@ fn a_conflict_no_rule_covers_stops_with_the_conflict_code_and_pushes_nothing() {
     let red_world = self::world();
     commit(&red_world.work, "a/x.txt", "a2\n");
     rival_moves(&red_world, "b/y.txt", "b2\n");
-    let (code, said, bases) = land_with(&red_world, crates(&["a"]), Lane::Pass, |_, _| {
+    let (code, said, bases) = land_with(&red_world, crates(&["a"]), |_, _| {
         ran(exit::FAILED, vec![red("test", &["-p a --lib -- mine"])], 1)
     });
     assert_eq!((code, bases.len()), (exit::FAILED, 1), "a red: {said:#?}");
-}
-
-/// THE CHANGELOG RULE REFUSES WHATEVER MAIN'S FILE WOULD DROP, and drops only an entry main's
-/// `[Unreleased]` already carries. Against a base holding an HTML comment and one entry, a
-/// branch that changed the comment, moved the entry to another kind, removed it, added an entry
-/// under no `### <kind>` heading, or added one whose words only main's released notes hold is
-/// each refused, naming why. CONTROL: a branch that only added an entry gets its file; one
-/// whose added entry main's `[Unreleased]` holds gets no file for it, and the rule says so.
-#[test]
-fn the_changelog_rule_refuses_whatever_mains_file_would_drop() {
-    let log = |body: &str| {
-        format!(
-            "# Changelog\n\n## [Unreleased]\n\n{body}## [0.1.0] - 2026-01-01\n\n### Added\n\n\
-             - First release.\n"
-        )
-    };
-    let base = log("<!-- keep -->\n\n### Fixed\n\n- Old entry one.\n\n");
-    let free = |_: &str| false;
-    let rule = |ours: &str, theirs: &str| resolve::changelog(&base, ours, theirs, &free);
-    let added = log(
-        "<!-- keep -->\n\n### Added\n\n- Adds the widget.\n\n### Fixed\n\n- Old entry one.\n\n\
-         - Fixes the gadget.\n\n",
-    );
-    let paths = |written: &[Fragment]| -> Vec<String> {
-        written
-            .iter()
-            .map(|fragment| fragment.path.clone())
-            .collect()
-    };
-
-    let Ok((written, detail)) = rule(&added, &log("")) else {
-        panic!("added entries are carried");
-    };
-    assert_eq!(
-        paths(&written),
-        BRANCH_ENTRIES.map(|(file, _)| file),
-        "{detail}"
-    );
-
-    let carried = log("### Fixed\n\n- Fixes the gadget.\n\n");
-    let Ok((written, detail)) = rule(&added, &carried) else {
-        panic!("an entry main's [Unreleased] holds is not refused");
-    };
-    assert_eq!(paths(&written), [BRANCH_ENTRIES[0].0], "{detail}");
-    assert!(
-        detail.contains("1 entry the branch added main's file already holds"),
-        "{detail}"
-    );
-
-    for (ours, why) in [
-        (
-            "<!-- changed -->\n\n### Fixed\n\n- Old entry one.\n\n",
-            "HTML comment",
-        ),
-        (
-            "<!-- keep -->\n\n### Added\n\n- Old entry one.\n\n",
-            "to another kind",
-        ),
-        (
-            "<!-- keep -->\n\n### Added\n\n- New one.\n\n",
-            "removed or reworded",
-        ),
-        (
-            "<!-- keep -->\n\n- Loose entry.\n\n### Fixed\n\n- Old entry one.\n\n",
-            "under no ### <kind> heading",
-        ),
-        (
-            "<!-- keep -->\n\n### Fixed\n\n- Old entry one.\n\n- First release.\n\n",
-            "already released",
-        ),
-    ] {
-        let Err(refused) = rule(&log(ours), &log("")) else {
-            panic!("{ours:?} was carried");
-        };
-        assert!(refused.contains(why), "{ours:?}: {refused}");
-    }
-}
-
-/// A RESOLUTION THROUGH A SYMBOLIC LINK IS REFUSED BEFORE ANYTHING IS WRITTEN: main tracks
-/// `changes/fixed` as a link to a directory outside the checkout, so the changelog rule's file
-/// for the branch's `Fixed` entry would land outside it. That is the rule's refusal, read before
-/// any write: the landing exits [`exit::CONFLICT`] with the merge left as git left it, no file
-/// of the rule's in the checkout and none outside it. NEGATIVE CONTROL: a check made only when
-/// the file is written aborts the merge and exits [`exit::COULD_NOT_RUN`] instead.
-#[cfg(unix)]
-#[test]
-fn a_resolution_through_a_symbolic_link_is_refused_before_anything_is_written() {
-    let world = world();
-    seed_main(&world, &[("CHANGELOG.md", BASE_LOG)]);
-    commit_files(&world, &[("CHANGELOG.md", BRANCH_LOG)]);
-    let outside = world
-        .work
-        .parent()
-        .expect("the scratch root")
-        .join("outside");
-    std::fs::create_dir_all(&outside).expect("outside");
-    git(&world.rival, &["fetch", "-q", "origin"]);
-    git(
-        &world.rival,
-        &["checkout", "-q", "-B", "main", "origin/main"],
-    );
-    write(&world.rival, "CHANGELOG.md", MAIN_LOG);
-    std::fs::create_dir_all(world.rival.join("changes")).expect("changes");
-    std::os::unix::fs::symlink(&outside, world.rival.join("changes/fixed")).expect("link");
-    git(&world.rival, &["add", "-A"]);
-    git(
-        &world.rival,
-        &["commit", "-q", "-m", "main links changes/fixed"],
-    );
-    git(&world.rival, &["push", "-q", "origin", "main"]);
-    let moved = git(&world.rival, &["rev-parse", "HEAD"]);
-
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
-    assert_eq!((code, bases.len()), (exit::CONFLICT, 0), "{said:#?}");
-    assert_eq!(origin_main(&world), moved, "a conflict pushes nothing");
-    let status = git(&world.work, &["status", "--porcelain"]);
-    assert!(status.contains("UU CHANGELOG.md"), "{status}");
-    assert!(
-        said.iter()
-            .any(|line| line.contains("changelog-to-changes refused")
-                && line.contains("is a symbolic link")),
-        "{said:#?}"
-    );
-    assert!(
-        !world.work.join(BRANCH_ENTRIES[0].0).exists(),
-        "no file of the rule's was written"
-    );
-    let escaped: Vec<_> = std::fs::read_dir(&outside)
-        .expect("outside")
-        .map(|entry| entry.expect("an entry").file_name())
-        .collect();
-    assert!(
-        escaped.is_empty(),
-        "written outside the checkout: {escaped:?}"
-    );
-}
-
-/// A FAILED WRITE OF THE RULES REMOVES THEIR FILES AND RESTORES THE BRANCH TIP: git refuses to
-/// stage the changelog rule's second file (its name is ignored here), after the first was
-/// written and staged. The landing could not run: every file the rules created is gone, the
-/// merge is aborted to the branch tip with nothing left staged, and nothing is judged or
-/// pushed. NEGATIVE CONTROL: without the removal the unstaged file, which the merge's abort
-/// does not touch, stays in the checkout.
-#[test]
-fn a_failed_write_of_the_rules_removes_their_files_and_restores_the_branch_tip() {
-    let (world, moved) = changelog_world(BRANCH_LOG, &[], &[]);
-    let tip = git(&world.work, &["rev-parse", "HEAD"]);
-    let ignore = world
-        .work
-        .parent()
-        .expect("the scratch root")
-        .join("ignore");
-    std::fs::write(&ignore, "land-fixes-the-gadget.md\n").expect("ignore");
-    let excludes = format!("core.excludesFile={}", ignore.display());
-    let ignoring = |dir: &Path| {
-        let mut command = git_cmd(dir);
-        command.args(["-c", excludes.as_str()]);
-        command
-    };
-    let (code, said, bases) =
-        land_through(&world, &ignoring, crates(&["a"]), Lane::Pass, |_, _, _| {
-            panic!("a merge the rules could not write is never judged")
-        });
-    assert_eq!((code, bases.len()), (exit::COULD_NOT_RUN, 0), "{said:#?}");
-    assert!(
-        said.iter().any(|line| line.contains("COULD NOT RUN")
-            && line.contains("land-fixes-the-gadget.md")),
-        "{said:#?}"
-    );
-    assert_eq!(origin_main(&world), moved, "nothing was pushed");
-    assert_eq!(
-        git(&world.work, &["rev-parse", "HEAD"]),
-        tip,
-        "the tip stands"
-    );
-    assert_eq!(
-        git(&world.work, &["status", "--porcelain"]),
-        "",
-        "nothing staged"
-    );
-    assert!(
-        !world.work.join(".git/MERGE_HEAD").exists(),
-        "the merge was aborted"
-    );
-    for (file, _) in BRANCH_ENTRIES {
-        assert!(!world.work.join(file).exists(), "{file} was left behind");
-    }
 }
 
 /// ONLY THE TOOL'S OWN RESOLVED MERGES NAME RULES IN A LANDING: the branch holds a commit and a
@@ -571,7 +278,7 @@ fn only_the_tools_own_resolved_merges_name_rules_in_a_landing() {
         ],
     );
     rival_moves(&world, "b/y.txt", "b2\n");
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!((code, bases.len()), (exit::PASS, 1), "{said:#?}");
     let landed = message(&world, &origin_main(&world));
     assert!(
@@ -588,8 +295,8 @@ fn only_the_tools_own_resolved_merges_name_rules_in_a_landing() {
 /// rule lines.
 #[test]
 fn a_landing_after_a_restated_resolution_names_no_rule_that_did_not_run_for_it() {
-    let (world, _) = changelog_world(BRANCH_LOG, &[], &[]);
-    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (world, _) = tracker_world(&[], &[]);
+    let (code, said, _) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!(code, exit::PASS, "{said:#?}");
     let first = origin_main(&world);
     let resolved = git(&world.work, &["rev-parse", "HEAD@{1}"]);
@@ -598,11 +305,11 @@ fn a_landing_after_a_restated_resolution_names_no_rule_that_did_not_run_for_it()
         resolved != first && tree(&resolved) == tree(&first),
         "the first landing restated the resolved merge {resolved}"
     );
-    assert!(message(&world, &resolved).contains("changelog-to-changes"));
+    assert!(message(&world, &resolved).contains("tracker-docs-take-main"));
     git(&world.work, &["reset", "-q", "--hard", &resolved]);
     commit(&world.work, "a/x.txt", "a3\n");
 
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!((code, bases.len()), (exit::PASS, 1), "{said:#?}");
     let landed = message(&world, &origin_main(&world));
     assert!(!landed.contains("Resolved by rule"), "{landed}");
@@ -678,7 +385,7 @@ fn spec_world(notes: bool, branch_r1: &str, main_r1: &str) -> (World, String) {
 fn a_spec_table_conflict_takes_each_rows_changed_side_and_recounts() {
     for notes in [false, true] {
         let (world, _) = spec_world(notes, "r1\tfn\tbranch one", "r1\tfn\tbase one");
-        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+        let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
         assert_eq!((code, bases.len()), (exit::PASS, 1), "{said:#?}");
         assert!(
             said.iter()
@@ -720,7 +427,7 @@ fn a_spec_table_conflict_takes_each_rows_changed_side_and_recounts() {
 #[test]
 fn a_spec_row_both_sides_changed_differently_resolves_nothing() {
     let (world, moved) = spec_world(false, "r1\tfn\tbranch one", "r1\tfn\tmain one");
-    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    let (code, said, bases) = land_with(&world, crates(&["a"]), |_, _| green());
     assert_eq!((code, bases.len()), (exit::CONFLICT, 0), "{said:#?}");
     assert_eq!(origin_main(&world), moved, "a conflict pushes nothing");
     assert!(
@@ -779,4 +486,30 @@ fn a_spec_key_of_one_or_two_columns_must_be_unique() {
     )
     .unwrap_err();
     assert!(refused.contains("reordered"), "{refused}");
+}
+
+/// THE SPEC-TABLE RULE READS NO CRATE'S SPEC TABLE: `verify land`'s backstop
+/// ([`aterm_census::no_reach::may_read`]) does not count the rule's own source as reading a
+/// member's `SPECS.md`, so a landing whose branch and moved main both changed one is judged by a
+/// round, not interrupted and judged again in full. NEGATIVE CONTROL: the same source with the
+/// rule's suffix written without its separator, a bare table name, reads as a walk of every
+/// crate's table.
+#[test]
+fn the_spec_table_rule_reads_no_members_spec_table() {
+    const FILE: &str = "crates/aterm-verify/src/land_resolve.rs";
+    let source = include_str!("land_resolve.rs");
+    for table in ["crates/aterm-gui/SPECS.md", "crates/atpkg/SPECS.md"] {
+        assert!(
+            !aterm_census::no_reach::may_read(FILE, source, table),
+            "{table}"
+        );
+    }
+    let suffix = "\"/SPECS.md\"";
+    let bare = source.replacen(suffix, &suffix.replacen('/', "", 1), 1);
+    assert_ne!(bare, source, "the rule's suffix is in its source");
+    assert!(aterm_census::no_reach::may_read(
+        FILE,
+        &bare,
+        "crates/aterm-gui/SPECS.md"
+    ));
 }

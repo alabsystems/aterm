@@ -13,7 +13,7 @@
 //! the removed value is neither newest nor winning and no Mac admitted afterwards is handed its
 //! key ([`member_unset`]).
 //!
-//! The write never judges a stale store: it drafts under [`author_and_commit_records_until`],
+//! The write never judges a stale store: it drafts under [`author_and_commit_records_held`],
 //! whose draft re-runs where the records moved before the commit, and it signs nothing where a
 //! writer here waits (one-mesh M4): a removal's rotation not here yet, a newest epoch this Mac
 //! does not open, or an earlier write of this Mac's of the name. Such a write waits in
@@ -21,11 +21,13 @@
 //! recipient, and reads "not yet in vault" until it is signed and a server took it. The draft
 //! claim ([`claim_draft`]) keeps a pass's signing of waiting writes out from before the draft
 //! until the write waits; it does not hold back applies, syncs or a rotation arriving, which the
-//! draft's own checks judge.
+//! draft's own checks judge. The author lock ([`RecordsAuthorLock`]) is held from the draft to
+//! the landing of what waits, so no other member write, unset or vault pass of this Mac's signs
+//! between them.
 
 use super::waiting::{
-    WaitingWrite, everyone_fresh_to, everyone_seal, held_defers, land_member_write,
-    overtaken_since, overtaker, sign_everyone, still_waits, take_back_member_write, waits_here,
+    Landed, WaitingWrite, everyone_fresh_to, everyone_seal, held_defers, land_member_writes,
+    overtaken_since, overtaker, sign_everyone, still_waits, take_back_member_writes, waits_here,
 };
 use super::*;
 
@@ -49,7 +51,10 @@ pub enum WriteRoute {
 pub enum OnBusy {
     /// Refuse ([`MemberWritten::Busy`]): the value is still the person's, so nothing is lost.
     Refuse(std::time::Instant),
-    /// Wait in `everyone.waiting` for the next vault pass ([`WaitFor::LockDeadline`]).
+    /// Wait in `everyone.waiting` for the next vault pass ([`WaitFor::LockDeadline`]). The write
+    /// still reads the log and lands under the lock this Mac's other authors of its vault records
+    /// hold, and then under its state lock, each waited for up to a minute past the deadline;
+    /// held longer, the write fails ([`member_set`]'s errors) and nothing waits.
     Wait(std::time::Instant),
 }
 
@@ -89,7 +94,10 @@ pub enum MemberWritten {
     SignedHere,
     /// Not signed yet: it waits in `everyone.waiting` for this Mac's vault pass. Not yet in vault.
     Waiting(WaitFor),
-    /// Another write took the name first: the op that holds it now, where the log names one.
+    /// Another write took a name of it first: the op that holds that name now, where the log
+    /// names one that overtook this write. Of a draft a pass dropped whole, that is the change
+    /// that overtook an entry's own write, never the holder of an entry dropped only with the
+    /// draft ([`Overtaken::with`]), a value that entry's write stands over.
     Overtaken(Option<Overtaker>),
     /// Refused, signing nothing and writing no waiting file: why.
     Refused(String),
@@ -126,6 +134,38 @@ pub struct MemberEntry {
     /// `--fleet-reads-anchors`: every Mac reads anchors, so the vault's first anchored entry may
     /// go in.
     pub fleet_reads_anchors: bool,
+    /// The value the writer read at the name, where the write stands on that read: a
+    /// verification reads a token and its record, and writes the token again beside the record
+    /// with its evidence (`claude_token::verify`), each entry over the value it read. The write
+    /// is refused where the name holds anything but the entry this write makes, with this value
+    /// ([`MemberEntry::read_entry`]): in the log as the draft reads it, concurrent values there
+    /// included, or in a write of this Mac's still to be signed ([`changed_refusal`]). Where the
+    /// write waits for the vault pass, the pass drops it as overtaken where another write changed
+    /// the name by then, a concurrent value beside the one read included. So it never reverts or
+    /// replaces a newer value, and settles no conflict. `None`: a person's write, which stands
+    /// over whatever it replaces.
+    pub read_as: Option<SecretBytes>,
+}
+
+impl MemberEntry {
+    /// The entry this write stands on ([`MemberEntry::read_as`]): `to`, the entry it makes, with
+    /// the value it read; `None` for a person's write.
+    pub(super) fn read_entry(&self, to: &Entry) -> Option<Entry> {
+        self.read_as.as_ref().map(|value| Entry {
+            value: value.clone(),
+            ..to.clone()
+        })
+    }
+}
+
+/// Why a member write whose entry of `name` stands on the value it read ([`MemberEntry::read_as`])
+/// is refused: the log, or a write of this Mac's still to be signed, leaves the name otherwise.
+fn changed_refusal(name: &str) -> String {
+    format!(
+        "`{name}` changed since this write read it (in the vault, or in a write of this Mac's \
+         still to be signed): the write is of the value it read, so nothing is written and the \
+         newer value stands"
+    )
 }
 
 /// Why the vault's first anchored entry waits for the fleet: no machine tells the vault which
@@ -167,7 +207,8 @@ pub fn write_route(paths: &Paths, by: std::time::Instant) -> crate::Result<Write
 }
 
 /// The log's `[everyone]` value of `name` as this Mac opens it now, and whether concurrent values
-/// stand beside it: what a write that waits because the draft never ran is signed over.
+/// stand beside it: what a write that waits because the draft never ran is signed over, read
+/// under the author lock it lands under ([`member_write`]).
 fn viewed(paths: &Paths, identity: &Identity, name: &str) -> (Option<Entry>, bool) {
     let opened = super::super::remove::trusted_store(paths)
         .ok()
@@ -263,7 +304,7 @@ fn draft_member_set(
     let Some(opened) = log.open_audience_entries(identity)? else {
         let mut writes = Vec::new();
         for entry in entries {
-            match planned(entry, None) {
+            match planned(entry, None, false) {
                 Ok(to) => writes.push(WaitingWrite::member(to, None, false)),
                 Err(why) => return nothing(Drafted::Refused(why.to_string())),
             }
@@ -303,7 +344,10 @@ fn draft_member_set(
     let mut conflicted = Vec::with_capacity(entries.len());
     for entry in entries {
         let read = everyone.and_then(|held| held.get(&entry.name));
-        let to = match planned(entry, read) {
+        let concurrent = opened
+            .conflicts
+            .contains(&(Audience::Everyone, entry.name.clone()));
+        let to = match planned(entry, read, concurrent) {
             Ok(to) => to,
             Err(why) => return nothing(Drafted::Refused(why.to_string())),
         };
@@ -312,11 +356,7 @@ fn draft_member_set(
                 "{FIRST_ANCHOR}, then pass --fleet-reads-anchors"
             )));
         }
-        conflicted.push(
-            opened
-                .conflicts
-                .contains(&(Audience::Everyone, entry.name.clone())),
-        );
+        conflicted.push(concurrent);
         tos.push(to);
         reads.push(read);
     }
@@ -406,9 +446,11 @@ fn draft_member_set(
 /// and keeps its anchor unless `--no-with` drops it.
 ///
 /// # Errors
-/// `was` fills gaps and `entry` does not say `--if-absent`, or the entry is invalid (an anchor
-/// without if-absent, or one that names the entry itself).
-fn planned(entry: &MemberEntry, was: Option<&Entry>) -> crate::Result<Entry> {
+/// `was` fills gaps and `entry` does not say `--if-absent`, the entry is invalid (an anchor
+/// without if-absent, or one that names the entry itself), or it stands on the value it read
+/// ([`MemberEntry::read_as`]) and `was` is not the entry it read, or concurrent values stand
+/// beside it (`conflicted`, [`changed_refusal`]).
+fn planned(entry: &MemberEntry, was: Option<&Entry>, conflicted: bool) -> crate::Result<Entry> {
     let name = &entry.name;
     if !entry.if_absent
         && let Some(was) = was.filter(|was| was.if_absent)
@@ -433,13 +475,20 @@ fn planned(entry: &MemberEntry, was: Option<&Entry>) -> crate::Result<Entry> {
             "an anchor goes with if-absent and names another entry (letters, digits, . _ -; or ~/a/b)",
         ));
     }
-    Ok(Entry {
+    let to = Entry {
         name: name.clone(),
         value: entry.value.clone(),
         audience: Audience::Everyone,
         if_absent: entry.if_absent,
         anchor,
-    })
+    };
+    // A conflict is a change too: the writer read one value, so another has come beside it since.
+    if let Some(read) = entry.read_entry(&to)
+        && (conflicted || !was.is_some_and(|was| same_entry(was, &read)))
+    {
+        return Err(Error::new(changed_refusal(name)));
+    }
+    Ok(to)
 }
 
 /// Whether a member write of this Mac's of `name` is still to be signed: it waits in
@@ -477,11 +526,20 @@ thread_local! {
     /// write, or a vault pass, landing there.
     pub(in super::super) static BEFORE_OUTCOME: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
+    /// A test's action, run once, between a member write's read of the log and the landing of
+    /// what waits: another writer of this Mac's, a verification, trying to come between them.
+    pub(in super::super) static BEFORE_LAND: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// A test's action, run once, between a member write's caller's read and the write's draft,
+    /// before it takes the draft claim or the author lock: another write committing there, as a
+    /// replacement does between a verification's read of the pair and its write.
+    pub(in super::super) static BEFORE_DRAFT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Write `entry` into `[everyone]` as this Mac, a seated member (§3.5), with no admin key and no
 /// envelope; only a `Shared` name ([`crate::entry_class::member_refusal`]). Under `on_busy`'s
-/// deadline it takes the draft claim, drafts under [`author_and_commit_records_until`] (signing,
+/// deadline it takes the draft claim, drafts under [`author_and_commit_records_held`] (signing,
 /// or waiting, or refusing, [`draft_member_set`]), lands a write that waits in `everyone.waiting`,
 /// lets the claim go, posts what it signed to every server this Mac reaches, and decides the
 /// outcome by reading the log and the waiting file again. A refusal signs nothing and writes no
@@ -489,7 +547,8 @@ thread_local! {
 ///
 /// # Errors
 /// This Mac's state or records cannot be read or written, a record fails to sign or keep, or the
-/// waiting write cannot be landed.
+/// waiting write cannot be landed (where a busy vault left no draft, the author lock not taken
+/// within a minute included).
 pub fn member_set(
     paths: &Paths,
     entry: &MemberEntry,
@@ -503,9 +562,13 @@ pub fn member_set(
 
 /// [`member_set`] of `entries`, whose names the caller judged ([`crate::entry_class`]), in one
 /// draft: one actor, one `authored_ms` and one epoch (`claude_token::write`'s pair). An empty or
-/// oversized value is refused. Where the writes wait, each waits in `everyone.waiting`, and the
-/// vault pass signs them together. The outcome is the least settled of the entries': overtaken,
-/// then waiting, then signed here, then posted.
+/// oversized value is refused, and so is an entry that stands on the value it read
+/// ([`MemberEntry::read_as`]) whose name changed since. The draft, or the read of the log where
+/// a busy vault leaves no draft ([`WaitFor::LockDeadline`]), and the landing of what waits run in
+/// one turn of the author lock. Where the writes wait, they land in `everyone.waiting` at once,
+/// as one draft, and the vault pass signs them in one draft or none of them, an entry the log
+/// holds already signed again beside the rest (`waiting::draft_verdicts`). The outcome is the
+/// least settled of the entries': overtaken, then waiting, then signed here, then posted.
 ///
 /// # Errors
 /// As [`member_set`].
@@ -541,27 +604,54 @@ pub(crate) fn member_write(
     let identity = super::super::read_identity(paths)?
         .ok_or_else(|| Error::new("this Mac has no secrets identity"))?;
     let started_ms = aterm_time::unix_millis().unwrap_or(0);
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_DRAFT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     let claim = match claim_draft(paths, Some(by)) {
         Ok(claim) => Some(claim),
         Err(_) if std::time::Instant::now() >= by => None,
         Err(error) => return Err(error),
     };
-    let drafted = match (&claim, lock_deadline) {
-        (Some(_), None) => author_and_commit_records_until(paths, by, |store| {
+    // The write reads the log and takes effect, signing or landing what waits, in one turn of the
+    // author lock, which every other member write, unset and vault pass of this Mac's holds from
+    // its draft to its commit ([`author_and_commit_records_held`]); they are a Claude Code
+    // token's only writers here, an admin's text refusing the class. None of them signs in
+    // between: a verification signed between a `--replace`'s read and its landing would leave the
+    // replacement waiting over values the log no longer holds, for the pass to drop as
+    // overtaken, and one drafted before a replacement landed and committed after it would put
+    // back the token the replacement replaces.
+    let mut author = match (&claim, lock_deadline) {
+        (Some(_), None) => RecordsAuthorLock::try_take_until(paths, by)?,
+        _ => None,
+    };
+    let drafted = match &author {
+        Some(author) => author_and_commit_records_held(paths, author, by, |store| {
             draft_member_set(paths, store, &identity, entries, started_ms)
         })?
         .map(|(_, _, drafted)| drafted),
-        _ => None,
+        None => None,
     };
     let drafted = match drafted {
         Some(drafted) => drafted,
         None => match busy() {
             None => return Ok(MemberWritten::Busy),
             Some(why) => {
+                if author.is_none() {
+                    let land_by = std::time::Instant::now() + AUTHOR_OBSERVE;
+                    author = Some(
+                        RecordsAuthorLock::try_take_until(paths, land_by)?.ok_or_else(|| {
+                            Error::new(
+                                "another author of this Mac's vault records still wrote after a \
+                                 minute: run it again",
+                            )
+                        })?,
+                    );
+                }
                 let mut writes = Vec::with_capacity(entries.len());
                 for entry in entries {
                     let (read, conflicted) = viewed(paths, &identity, &entry.name);
-                    let to = match planned(entry, read.as_ref()) {
+                    let to = match planned(entry, read.as_ref(), conflicted) {
                         Ok(to) => to,
                         Err(why) => return Ok(MemberWritten::Refused(why.to_string())),
                     };
@@ -576,22 +666,24 @@ pub(crate) fn member_write(
         Drafted::NotSeated => return Ok(MemberWritten::NotSeated),
         Drafted::Signed(puts) => puts.into_iter().map(Err).collect(),
         Drafted::Waits(why, writes) => {
-            let mut landed = Vec::with_capacity(writes.len());
-            for (entry, write) in entries.iter().zip(writes) {
-                landed.push(Ok((
-                    why,
-                    land_member_write(
-                        paths,
-                        &identity,
-                        &entry.name,
-                        write,
-                        Some(std::time::Instant::now() + AUTHOR_OBSERVE),
-                    )?,
-                )));
+            #[cfg(test)]
+            if let Some(hook) = BEFORE_LAND.with(|hook| hook.borrow_mut().take()) {
+                hook();
             }
-            landed
+            match land_member_writes(
+                paths,
+                &identity,
+                entries.iter().zip(writes).collect(),
+                Some(std::time::Instant::now() + AUTHOR_OBSERVE),
+            )? {
+                Landed::Waits(landed) => landed.into_iter().map(|write| Ok((why, write))).collect(),
+                Landed::Changed(name) => {
+                    return Ok(MemberWritten::Refused(changed_refusal(&name)));
+                }
+            }
         }
     };
+    drop(author);
     drop(claim);
     let signed = waited.iter().all(Result::is_err);
     let posted = signed && post_records_to_servers(paths).is_ok_and(|n| n > 0);
@@ -609,14 +701,16 @@ pub(crate) fn member_write(
     Ok(least_settled(outcomes))
 }
 
-/// The least settled of one draft's per-entry outcomes: an overtaken entry first, then one that
-/// waits, then one signed here; posted only where every entry is.
+/// The least settled of one draft's per-entry outcomes: an overtaken entry first, one that names
+/// the change that overtook it before one that names none, then one that waits, then one signed
+/// here; posted only where every entry is.
 fn least_settled(outcomes: Vec<MemberWritten>) -> MemberWritten {
     let rank = |written: &MemberWritten| match written {
-        MemberWritten::Overtaken(_) => 0,
-        MemberWritten::Waiting(_) => 1,
-        MemberWritten::SignedHere => 2,
-        _ => 3,
+        MemberWritten::Overtaken(Some(_)) => 0,
+        MemberWritten::Overtaken(None) => 1,
+        MemberWritten::Waiting(_) => 2,
+        MemberWritten::SignedHere => 3,
+        _ => 4,
     };
     outcomes
         .into_iter()
@@ -671,6 +765,9 @@ fn outcome(
             let read = opened
                 .as_ref()
                 .and_then(|(_, opened)| opened.by_audience.get(&Audience::Everyone)?.get(name));
+            let conflicted = opened
+                .as_ref()
+                .is_some_and(|(_, opened)| opened.conflicts.contains(&key));
             match (read, write.entry()) {
                 // A pass signed it since: what it signed goes to the servers now.
                 (Some(read), Some(to)) if same_entry(read, to) => {
@@ -680,6 +777,11 @@ fn outcome(
                         MemberWritten::SignedHere
                     }
                 }
+                // Its write stands over what the name holds, so no change overtook it there (a
+                // pass that left no journal record dropped it only with its draft, say): that
+                // holder is a value it would not have reverted, so it names none, and an entry of
+                // the draft overtaken itself names the change ([`least_settled`]).
+                _ if write.stands_over(read, conflicted) => MemberWritten::Overtaken(None),
                 _ => MemberWritten::Overtaken(overtaken_by()),
             }
         }
@@ -967,9 +1069,10 @@ pub fn member_unset(
 }
 
 /// [`member_unset`] of `names`, whose names the caller judged ([`crate::entry_class`]), in one
-/// draft under one fresh epoch (`claude_token::remove`'s pair). It is [`MemberUnset::Absent`]
-/// only where the log and this Mac's waiting writes hold none of them, and overtaken where the
-/// log holds any again afterwards.
+/// draft under one fresh epoch (`claude_token::remove`'s pair), this Mac's own writes of all of
+/// them still to be signed taken back at once. It is [`MemberUnset::Absent`] only where the log
+/// and this Mac's waiting writes hold none of them, and overtaken where the log holds any again
+/// afterwards.
 ///
 /// # Errors
 /// As [`member_unset`].
@@ -1012,13 +1115,12 @@ pub(crate) fn member_unset_names(
     if let Some(why) = anchored_refusal(&opened, names) {
         return Ok(MemberUnset::Refused(why));
     }
-    let mut took_back = false;
-    for name in names {
-        match take_back_member_write(paths, &identity, name, Some(by)) {
-            Ok(took) => took_back |= took,
-            Err(error) => return past(error),
-        }
-    }
+    // Every name at once: a member write's entries wait as one draft, and a take-back of part of
+    // it would leave the rest for the next pass to sign alone.
+    let took_back = match take_back_member_writes(paths, &identity, names, Some(by)) {
+        Ok(took) => took,
+        Err(error) => return past(error),
+    };
     let started_ms = aterm_time::unix_millis().unwrap_or(0);
     let drafted = author_and_commit_records_until(paths, by, |store| {
         draft_member_unset(paths, store, &identity, names, started_ms)

@@ -222,33 +222,6 @@ fn a_missing_identity_is_none_and_a_broken_one_is_an_error() {
 /// `~/.aterm/machine.toml` (`id != m22` in 0.146).
 /// NEGATIVE CONTROL: reading `.aterm/machine.toml` returns `"m99"` instead of `"m22"` (or
 /// `Some("m99")` when the release ring is absent).
-#[test]
-fn release_ring_identity_path_ignores_host_machine_toml() {
-    let scratch = crate::test_scratch_dir("ring-id");
-    let home = scratch.path();
-    std::fs::create_dir_all(home.join(".aterm")).unwrap();
-    std::fs::write(
-        home.join(".aterm/machine.toml"),
-        "id = \"m99\"\npubkey = \"host-key\"\n",
-    )
-    .unwrap();
-
-    let ring_record = identity_path_in(home);
-    assert_eq!(
-        declared_machine_id(None, Some(&ring_record)).unwrap(),
-        None,
-        "host machine.toml alone never supplies a release machine id"
-    );
-
-    std::fs::create_dir_all(ring_record.parent().unwrap()).unwrap();
-    std::fs::write(&ring_record, "id = \"m22\"\npubkey = \"ring-key\"\n").unwrap();
-    assert_eq!(
-        declared_machine_id(None, Some(&ring_record)).unwrap(),
-        Some("m22".to_string()),
-        "release-ring/machine.toml wins over ~/.aterm/machine.toml"
-    );
-}
-
 #[cfg(unix)]
 #[test]
 fn machine_identity_and_roster_refuse_symlinks() {

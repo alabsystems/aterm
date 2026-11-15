@@ -32,6 +32,24 @@ fn status() -> aterm_update::UpdateStatus {
     }
 }
 
+#[test]
+fn a_windowless_status_reports_the_receipt_without_claiming_live_policy() {
+    let mut st = status();
+    let without = super::update_status_reply(st.clone(), None, None);
+    assert!(!without.contains(" checked_at="), "{without}");
+    st.updated_at = "2026-11-13T21:19:56Z".into();
+    let reply = super::update_status_reply(st, None, None);
+    for field in [
+        " enabled=unknown",
+        " auto_apply=unknown",
+        " apply_posture=unknown",
+        " checked_at=2026-11-13T21:19:56Z",
+    ] {
+        assert!(reply.contains(field), "missing {field:?}: {reply}");
+    }
+    assert!(!reply.contains(" stale_check="), "{reply}");
+}
+
 /// `update status` CARRIES THE RECORD: the newer offer, `behind=true`, and the hold's version,
 /// build, cause word, lapse time, try count, whether it holds now, and its reason pct-encoded.
 /// NEGATIVE CONTROL: a copy with no offer and no hold adds nothing to the line.

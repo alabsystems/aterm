@@ -19,7 +19,6 @@ fn sample(at_ms: u64) -> Sample {
         cores: None,
         tests: Some(133),
         partition: None,
-        exe_sha256: None,
     }
 }
 
@@ -95,21 +94,16 @@ fn a_history_reads_back_what_it_wrote_and_nothing_from_what_it_cannot_read() {
         "-p c --lib",
         Sample {
             cores: Some(3),
-            exe_sha256: Some("ab".repeat(32)),
             ..sample(3)
         },
     );
     let text = h.encode();
     assert_eq!(History::decode(&text), h);
     assert!(text.contains("\"cores\":3"), "{text}");
-    assert!(text.contains(&"ab".repeat(32)), "{text}");
-    // Not held at 3 cores (0.4 per thread), so its row settled there, as that executable.
+    // Not held at 3 cores (0.4 per thread), so its row settled there.
     assert_eq!(
         h.row("-p c --lib").unwrap().settled,
-        Some(Settled {
-            cores: 3,
-            exe_sha256: Some("ab".repeat(32)),
-        })
+        Some(Settled { cores: 3 })
     );
     // A row kept before settled grants has no `settled`: read as none, the rest whole.
     let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
@@ -134,7 +128,6 @@ fn a_history_reads_back_what_it_wrote_and_nothing_from_what_it_cannot_read() {
     for (key, torn) in [
         (None, aterm_json::Value::from(3)),
         (Some("cores"), aterm_json::Value::from("3")),
-        (Some("exe_sha256"), aterm_json::Value::from(3)),
     ] {
         let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
         let mut settled = settled_row(&mut fields);
@@ -165,19 +158,6 @@ fn a_history_reads_back_what_it_wrote_and_nothing_from_what_it_cannot_read() {
         History::decode(&fields.to_string()),
         History::default(),
         "a grant it cannot read is a torn sample"
-    );
-    let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
-    first_sample_fields(&mut fields).insert("exe_sha256".into(), aterm_json::Value::from(1));
-    assert_eq!(
-        History::decode(&fields.to_string()),
-        History::default(),
-        "an executable it cannot read is a torn sample"
-    );
-    first_sample_fields(&mut fields).remove("exe_sha256");
-    assert_eq!(
-        History::decode(&fields.to_string()),
-        h,
-        "a sample kept before it"
     );
     let mut fields: aterm_json::Value = aterm_json::from_str(&text).unwrap();
     first_sample_fields(&mut fields).insert("partition".into(), aterm_json::Value::Bool(false));
@@ -418,7 +398,6 @@ fn a_stopped_red_keeps_the_prior_timing_and_marks_the_binary_failed() {
             cores: None,
             tests: Some(3),
             partition: None,
-            exe_sha256: None,
         },
     );
 
@@ -564,54 +543,6 @@ fn a_settled_grant_outlives_the_samples_that_showed_it() {
         h.row("b").unwrap().settled,
         None,
         "CONTROL: unheld at 2 under a hold at 4"
-    );
-}
-
-/// A settled grant is the executable's that showed it: a binary held at one core long after it
-/// settled at two is re-probed at two once a run of another executable is kept, because a
-/// changed binary that now needs more looks, at one core, as it did. NEGATIVE CONTROL: a held run
-/// of the same executable, and one whose executable was not read (a libtest JSON probe's run),
-/// keep it settled; an unheld run of the new executable settles it again, as that executable.
-#[test]
-fn a_changed_executable_unsettles_its_binary() {
-    let exe = |b: &str| Some(b.repeat(32));
-    let at = |at_ms, cpu_ms, cores, exe_sha256| {
-        Sample {
-            cores,
-            exe_sha256,
-            ..run(10_000, cpu_ms, 1, Some(1), "ok")
-        }
-        .clone_at(at_ms)
-    };
-    let mut h = History::default();
-    h.push("b", at(1, 9_950, Some(1), exe("aa")));
-    h.push("b", at(2, 9_950, Some(2), exe("aa")));
-    for n in 3..3 + SAMPLES_KEPT as u64 {
-        h.push("b", at(n, 9_950, Some(1), exe("aa")));
-    }
-    let settled = |h: &History| h.row("b").unwrap().settled.clone();
-    let as_aa = Some(Settled {
-        cores: 2,
-        exe_sha256: exe("aa"),
-    });
-    assert_eq!(settled(&h), as_aa);
-    h.push("b", at(20, 9_950, Some(1), None));
-    assert_eq!(settled(&h), as_aa, "CONTROL: an unread executable");
-    assert!((h.seen("b").unwrap().per_thread - 0.995).abs() < 1e-9);
-    h.push("b", at(21, 9_950, Some(1), exe("bb")));
-    assert_eq!(settled(&h), None, "another executable unsettles it");
-    assert!(
-        (h.seen("b").unwrap().per_thread - 2.0).abs() < 1e-9,
-        "the changed binary is probed at two"
-    );
-    h.push("b", at(22, 9_950, Some(2), exe("bb")));
-    assert_eq!(
-        settled(&h),
-        Some(Settled {
-            cores: 2,
-            exe_sha256: exe("bb"),
-        }),
-        "CONTROL: unheld at two, it settles again as the new executable"
     );
 }
 

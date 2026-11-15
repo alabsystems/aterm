@@ -47,7 +47,8 @@ pub use complete::{
     output_until_complete_stdout_with_limit_unless,
     output_while_process_progressing_complete_stdout,
     output_while_process_progressing_complete_stdout_records_unless,
-    output_while_process_progressing_complete_stdout_unless, output_within_complete_listing,
+    output_while_process_progressing_complete_stdout_unless,
+    output_while_process_progressing_complete_stdout_with_limit, output_within_complete_listing,
     output_within_complete_stdout_records, output_within_complete_stdout_records_from,
     output_within_complete_stdout_records_from_unless,
 };
@@ -708,6 +709,162 @@ pub fn stream_until_stopped(
     input_unix::stream_until_stopped(cmd, deadline, spawned, output, stopped)
 }
 
+/// As [`stream_until_stopped`], also retaining a naturally exited direct child's actual status
+/// when a later output error, deadline or cancellation prevents complete EOF. The status is
+/// observed while the child is unreaped, before cleanup closes pipes or requests termination.
+/// The callback may run at that observation or after a positive owning wait during retirement.
+/// A status caused by capture cleanup is never reported as a producer result.
+/// The callback grants no output-completion claim; only `Some(status)` in the successful result
+/// establishes both EOFs. All callbacks run on the owning waiter and must return promptly.
+///
+/// # Errors
+/// As [`stream_until_stopped`].
+#[cfg(unix)]
+pub fn stream_until_stopped_observing_exit(
+    cmd: &mut Command,
+    deadline: Option<Instant>,
+    spawned: impl FnOnce(u32),
+    output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
+    stopped: impl FnMut() -> bool,
+    observed_exit: impl FnMut(std::process::ExitStatus),
+) -> io::Result<Option<std::process::ExitStatus>> {
+    input_unix::stream_until_stopped_observing_exit(
+        cmd,
+        deadline,
+        spawned,
+        output,
+        stopped,
+        observed_exit,
+    )
+}
+
+/// Capture both streams completely, each at most `limit` bytes, while output or the owned
+/// producer tree progresses. After direct exit, only output advances the inactivity window.
+/// A known overflow is refused immediately, independently of further producer progress.
+/// Successful output requires direct status and actual EOF on both pipes.
+///
+/// # Errors
+/// An excessive limit or spawn refusal, stream/capture failure, or inactivity for `window`.
+/// Retirement follows [`stream_until_stopped_observing_exit`] and may outlive the work window.
+#[cfg(unix)]
+pub fn output_while_process_progressing_complete_with_limit(
+    cmd: &mut Command,
+    window: Duration,
+    waiting_on: impl Into<String>,
+    limit: usize,
+) -> Result<Output, CompleteProgressError> {
+    let mut probe = ProcessProgressProbe::default();
+    progress_complete_with(
+        cmd,
+        window,
+        waiting_on.into(),
+        limit,
+        &mut deadline_now,
+        &mut |pid| probe.read(pid),
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn progress_complete_with(
+    cmd: &mut Command,
+    window: Duration,
+    waiting_on: String,
+    limit: usize,
+    now: &mut dyn FnMut() -> Instant,
+    work: &mut dyn FnMut(u32) -> Option<u64>,
+    mut stopped: Option<&mut dyn FnMut() -> bool>,
+) -> Result<Output, CompleteProgressError> {
+    use std::cell::Cell;
+    if limit > MAX_COMPLETE_STDOUT_BYTES {
+        return Err(CompleteOutputError::Run(RunError::Spawn(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "complete output limit exceeds hard maximum",
+        )))
+        .into());
+    }
+    let started = Cell::new(false);
+    let pid = Cell::new(None);
+    let bytes = Cell::new(0_u64);
+    let overflow = Cell::new(None);
+    let stalled = Cell::new(false);
+    let mut progress = ProgressWindow::new(window, now());
+    let mut streams = [Vec::new(), Vec::new()];
+    let result = stream_until_stopped_observing_exit(
+        cmd,
+        None,
+        |born| {
+            started.set(true);
+            pid.set(Some(born));
+        },
+        |stream, chunk| {
+            let index = match stream {
+                ChildOutput::Stdout => 0,
+                ChildOutput::Stderr => 1,
+            };
+            if chunk.len() > limit.saturating_sub(streams[index].len()) {
+                overflow.set(Some(stream));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "complete output exceeds its limit",
+                ));
+            }
+            streams[index].extend_from_slice(chunk);
+            bytes.set(
+                bytes
+                    .get()
+                    .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX)),
+            );
+            Ok(())
+        },
+        || {
+            if stopped.as_mut().is_some_and(|stop| stop()) {
+                return true;
+            }
+            if !started.get() {
+                return false;
+            }
+            let left =
+                progress.observe(now(), bytes.get(), || pid.get().map_or(Some(0), &mut *work));
+            if left.is_zero() {
+                stalled.set(true);
+                true
+            } else {
+                false
+            }
+        },
+        |_| pid.set(None),
+    );
+    match result {
+        Ok(Some(status)) => {
+            let [stdout, stderr] = streams;
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        Ok(None) if stalled.get() => Err(CompleteProgressError::Stalled { window, waiting_on }),
+        Ok(None) => Err(CompleteOutputError::Run(RunError::TimedOut).into()),
+        Err(error) => Err(match overflow.get() {
+            Some(ChildOutput::Stdout) => CompleteOutputError::StdoutTooLarge { limit },
+            Some(ChildOutput::Stderr) => {
+                CompleteOutputError::Run(RunError::Capture(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("stderr exceeds the complete-capture limit of {limit} bytes"),
+                )))
+            }
+            None if started.get() => CompleteOutputError::Run(RunError::Capture(error)),
+            None => CompleteOutputError::Run(RunError::Spawn(error)),
+        }
+        .into()),
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "deadline/progress_complete_tests.rs"]
+mod progress_complete_tests;
+
 /// Streaming with explicit stdin custody, for a cooperative operation's cancellation pipe.
 /// The caller owns the writer's lifetime. Output completion and retirement follow
 /// [`stream_until_stopped`]; this runner neither writes to nor replaces the supplied input.
@@ -973,6 +1130,35 @@ impl ProcessProgressProbe {
             self.generation = self.generation.saturating_add(1);
         }
         Some(self.generation)
+    }
+}
+
+/// A progress reading for [`output_while_progressing`] that counts what this process's
+/// descendants do: it advances whenever their CPU time or I/O did since the last reading
+/// ([`ProcessProgressProbe::read_descendants`]), and at a reading that does not compare, which
+/// is no evidence of a stall. The process table is read at most once every
+/// [`PROCESS_PROGRESS_TICK`]. A caller adds it to its own count of progress, so that a child
+/// a loaded machine starves is not named stalled while it works: a step of its own may take
+/// any wall-clock time there, and its CPU time still advances.
+pub fn descendants_work() -> impl FnMut() -> u64 {
+    let own = std::process::id();
+    let mut probe = ProcessProgressProbe::default();
+    let mut count = 0_u64;
+    let mut seen = None;
+    let mut read_at: Option<Instant> = None;
+    move || {
+        let now = deadline_now();
+        if read_at.is_none_or(|at| now.saturating_duration_since(at) >= PROCESS_PROGRESS_TICK) {
+            read_at = Some(now);
+            match probe.read_descendants(own) {
+                Some(generation) if seen == Some(generation) => {}
+                reading => {
+                    seen = reading;
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        count
     }
 }
 

@@ -11,7 +11,7 @@ fn want() -> Vec<WantInstance> {
             port: 7100,
             local: true,
             sessions: vec![WantSession {
-                sid: "s-aaa".into(),
+                sid: "t0000000aaa".into(),
                 program: "zsh".into(),
                 agent: "-".into(),
             }],
@@ -23,12 +23,12 @@ fn want() -> Vec<WantInstance> {
             local: false,
             sessions: vec![
                 WantSession {
-                    sid: "s-bbb".into(),
+                    sid: "t0000000bbb".into(),
                     program: "claude".into(),
                     agent: "busy".into(),
                 },
                 WantSession {
-                    sid: "s-ccc".into(),
+                    sid: "t0000000ccc".into(),
                     program: "build-loop".into(),
                     agent: "-".into(),
                 },
@@ -38,9 +38,9 @@ fn want() -> Vec<WantInstance> {
 }
 
 /// The client's ranks of the Claude sessions the tests make, read from
-/// their agent words: busy `s-bbb`, asking `s-ddd`.
+/// their agent words: busy `t0000000bbb`, asking `t0000000ddd`.
 fn ranked() -> BTreeMap<String, u8> {
-    [("s-bbb", "busy"), ("s-ddd", "prompt")]
+    [("t0000000bbb", "busy"), ("t0000000ddd", "prompt")]
         .into_iter()
         .map(|(sid, agent)| (sid.to_owned(), aterm_ctl::survey_rank([("agent", agent)])))
         .collect()
@@ -48,12 +48,12 @@ fn ranked() -> BTreeMap<String, u8> {
 
 const GOOD: &str = "\
 == mac pid 100 0.105.0 · 1 sessions trust=screen
-s-aaa (you) zsh idle | /tmp/af.x/m00/home
+t0000000aaa (you) zsh idle | /tmp/af.x/m00/home
 == fleet 127.0.0.1:7101 (host mac) pid 101 0.105.0 · 2 sessions (1 busy) trust=screen
-s-bbb claude busy 4s Bash | /tmp/af.x/m01/home
+t0000000bbb claude busy 4s Bash | /tmp/af.x/m01/home
     asked: Fix the flaky test
     said: Found it
-s-ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
+t0000000ccc running build-loop | build-loop 1 | /tmp/af.x/m01/home
 ";
 
 #[test]
@@ -65,7 +65,7 @@ fn a_healthy_read_passes_every_check() {
 #[test]
 fn a_missing_block_a_wrong_program_and_a_lost_excerpt_are_each_named() {
     let bad = GOOD
-        .replace("s-ccc running build-loop", "s-ccc zsh idle")
+        .replace("t0000000ccc running build-loop", "t0000000ccc zsh idle")
         .replace("    said: Found it\n", "");
     let checks = judge_text(&bad, &want(), 24_000, "mac", true, &ranked());
     let failed: Vec<&str> = checks
@@ -118,27 +118,30 @@ fn a_missing_block_a_wrong_program_and_a_lost_excerpt_are_each_named() {
 fn a_cut_read_is_held_to_the_order_the_client_fills_in() {
     let mut want = want();
     want[1].sessions.push(WantSession {
-        sid: "s-ddd".into(),
+        sid: "t0000000ddd".into(),
         program: "claude".into(),
         agent: "prompt".into(),
     });
     want[1].sessions.push(WantSession {
-        sid: "s-eee".into(),
+        sid: "t0000000eee".into(),
         program: "claude".into(),
         agent: "idle".into(),
     });
     let mut ranks = ranked();
-    ranks.insert("s-eee".into(), aterm_ctl::survey_rank([("agent", "idle")]));
+    ranks.insert(
+        "t0000000eee".into(),
+        aterm_ctl::survey_rank([("agent", "idle")]),
+    );
     let both = GOOD
         .replace(
             "· 2 sessions (1 busy) trust=screen",
             "· 4 sessions (1 asking, 1 busy) trust=screen",
         )
         .replace(
-            "s-ccc running build-loop",
-            "s-ddd claude asking 9s Bash | /tmp/af.x/m01/home\n    asked: Delete it?\n    \
-             said: Shall I?\ns-eee claude idle 9s | /tmp/af.x/m01/home\n    asked: Sum it\n    \
-             said: It is 42\ns-ccc running build-loop",
+            "t0000000ccc running build-loop",
+            "t0000000ddd claude asking 9s Bash | /tmp/af.x/m01/home\n    asked: Delete it?\n    \
+             said: Shall I?\nt0000000eee claude idle 9s | /tmp/af.x/m01/home\n    asked: Sum it\n    \
+             said: It is 42\nt0000000ccc running build-loop",
         );
     let mark = |text: &str, sid: &str| {
         text.lines()
@@ -181,7 +184,10 @@ fn a_cut_read_is_held_to_the_order_the_client_fills_in() {
         "every cut is marked, and the closing line counts the marks and the +N lines";
     let none: Vec<String> = Vec::new();
     assert_eq!(failed(&both, &ranks, 0), none, "whole: every excerpt");
-    let idle_short = cut(&mark(&both.replace("    asked: Sum it\n", ""), "s-eee"), 1);
+    let idle_short = cut(
+        &mark(&both.replace("    asked: Sum it\n", ""), "t0000000eee"),
+        1,
+    );
     assert_eq!(failed(&idle_short, &ranks, 10), none, "{idle_short}");
     let asking_kept = cut(
         &mark(
@@ -189,9 +195,9 @@ fn a_cut_read_is_held_to_the_order_the_client_fills_in() {
                 &both
                     .replace("    asked: Fix the flaky test\n    said: Found it\n", "")
                     .replace("    asked: Sum it\n    said: It is 42\n", ""),
-                "s-bbb",
+                "t0000000bbb",
             ),
-            "s-eee",
+            "t0000000eee",
         ),
         2,
     );
@@ -206,7 +212,7 @@ fn a_cut_read_is_held_to_the_order_the_client_fills_in() {
     let reverse = cut(
         &mark(
             &both.replace("    asked: Delete it?\n    said: Shall I?\n", ""),
-            "s-ddd",
+            "t0000000ddd",
         ),
         1,
     );
@@ -214,7 +220,7 @@ fn a_cut_read_is_held_to_the_order_the_client_fills_in() {
     let second_first = cut(
         &mark(
             &both.replace("    asked: Fix the flaky test\n", ""),
-            "s-bbb",
+            "t0000000bbb",
         ),
         1,
     );
@@ -323,7 +329,7 @@ fn the_narrowing_is_held_to_the_widest_width_that_fits() {
     let at = |width: usize| {
         format!(
             "== mac pid 100 · 1 sessions trust=screen
-s-bbb claude busy 4s
+t0000000bbb claude busy 4s
 {}
 {}
                      said: whole
@@ -374,10 +380,16 @@ fn a_finished_turns_cut_said_keeps_its_end() {
     assert!(!named(&busy_end, &want()).ok);
     let mut idle = want();
     idle[1].sessions[0].agent = "idle".into();
-    let idle_end = busy_end.replace("s-bbb claude busy 4s Bash", "s-bbb claude idle 4s");
+    let idle_end = busy_end.replace(
+        "t0000000bbb claude busy 4s Bash",
+        "t0000000bbb claude idle 4s",
+    );
     let check = named(&idle_end, &idle);
     assert!(check.ok && check.detail.starts_with('1'), "{check:?}");
-    let idle_head = busy_head.replace("s-bbb claude busy 4s Bash", "s-bbb claude idle 4s");
+    let idle_head = busy_head.replace(
+        "t0000000bbb claude busy 4s Bash",
+        "t0000000bbb claude idle 4s",
+    );
     assert!(!named(&idle_head, &idle).ok);
 }
 
@@ -386,7 +398,7 @@ fn a_peers_block_is_found_by_its_pid() {
     let block = block_text(GOOD, 101).expect("m01's block");
     assert!(block.starts_with("== fleet 127.0.0.1:7101 "), "{block}");
     assert!(block.contains("    said: Found it\n"), "{block}");
-    assert!(!block.contains("s-aaa"), "{block}");
+    assert!(!block.contains("t0000000aaa"), "{block}");
     assert_eq!(block_text(GOOD, 102), None);
 }
 
@@ -407,7 +419,7 @@ fn a_raw_escape_or_a_forged_label_fails_the_escaping() {
 fn the_fault_rows_are_one_each_with_their_reasons() {
     let text = "\
 == mac pid 100 0.105.0 · 1 sessions trust=screen
-s-aaa zsh idle | ~
+t0000000aaa zsh idle | ~
 == 127.0.0.1:7102 did not answer: connected, but no fleet handshake within 3.0s: an aterm stopped trust=screen
 == 127.0.0.1:7103 did not answer: nothing listens on 127.0.0.1:7103: no aterm running there trust=screen
 ";
@@ -422,7 +434,7 @@ s-aaa zsh idle | ~
 
 #[test]
 fn a_facts_reply_with_a_content_field_or_a_typed_title_fails() {
-    let facts = r#"[{"label":"x","fleet":true,"instance":{"pid":"7","level":"facts"},"sessions":[{"sid":"s-1","program":"zsh","attention":"-"}]}]"#;
+    let facts = r#"[{"label":"x","fleet":true,"instance":{"pid":"7","level":"facts"},"sessions":[{"sid":"t0000000001","program":"zsh","attention":"-"}]}]"#;
     assert!(judge_facts_only(facts, 7, &["my secret title"]).ok);
     let leak = facts.replace(r#""attention":"-""#, r#""attention":"-","title":"t""#);
     assert!(!judge_facts_only(&leak, 7, &[]).ok);
@@ -433,12 +445,14 @@ fn a_facts_reply_with_a_content_field_or_a_typed_title_fails() {
 
 #[test]
 fn the_json_judge_finds_each_session_and_its_excerpt() {
-    let json = r#"[{"label":"pid 100","instance":{"pid":"100","level":"content"},"sessions":[{"sid":"s-aaa","program":"zsh","program_kind":"shell","agent":"-","cwd":"~"}]},{"label":"127.0.0.1:7101","fleet":true,"instance":{"pid":"101","level":"content"},"sessions":[{"sid":"s-bbb","program":"claude","agent":"busy","prompt":"p","said":"s"},{"sid":"s-ccc","program":"build-loop","agent":"-","cwd":"~"}]}]"#;
+    let json = r#"[{"label":"pid 100","instance":{"pid":"100","level":"content"},"sessions":[{"sid":"t0000000aaa","program":"zsh","program_kind":"shell","agent":"-","cwd":"~"}]},{"label":"127.0.0.1:7101","fleet":true,"instance":{"pid":"101","level":"content"},"sessions":[{"sid":"t0000000bbb","program":"claude","agent":"busy","prompt":"p","said":"s"},{"sid":"t0000000ccc","program":"build-loop","agent":"-","cwd":"~"}]}]"#;
     let checks = judge_json(json, &want());
     assert!(checks.iter().all(|c| c.ok), "{checks:#?}");
     let checks = judge_json(&json.replace(r#""said":"s""#, r#""said":"-""#), &want());
     assert!(checks.iter().any(|c| !c.ok), "{checks:#?}");
     let ranks = ranks(json);
-    assert_eq!(ranks.get("s-bbb"), ranked().get("s-bbb"));
-    assert!(ranks["s-bbb"] < ranks["s-ccc"] && ranks["s-ccc"] < ranks["s-aaa"]);
+    assert_eq!(ranks.get("t0000000bbb"), ranked().get("t0000000bbb"));
+    assert!(
+        ranks["t0000000bbb"] < ranks["t0000000ccc"] && ranks["t0000000ccc"] < ranks["t0000000aaa"]
+    );
 }

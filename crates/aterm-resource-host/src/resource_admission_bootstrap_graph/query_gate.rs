@@ -15,6 +15,9 @@ use wire::query;
 #[path = "object_gate.rs"]
 mod object_gate;
 pub(in crate::actor::owner) use object_gate::ObjectOperation;
+#[path = "archive_gate.rs"]
+mod archive_gate;
+pub(in crate::actor::owner) use archive_gate::ArchiveOperation;
 const MAX_QUERIES: u64 = 128;
 enum ClosedQuery {
     Complete(bootstrap_query::Completed),
@@ -37,6 +40,9 @@ pub(super) struct State {
     object_active: Option<wire::object::Request>,
     object_running: Option<Box<super::super::bootstrap_object::Object>>,
     object_retained: Vec<super::super::bootstrap_object::Retained>,
+    archive_active: Option<wire::archive::Request>,
+    archive_running: Option<Box<super::super::bootstrap_archive::Archive>>,
+    archive_retained: Vec<super::super::bootstrap_archive::Retained>,
 }
 impl State {
     pub(super) fn new(command: &mut spawnfd::Command) -> io::Result<Self> {
@@ -100,6 +106,9 @@ impl State {
             object_active: None,
             object_running: None,
             object_retained: Vec::new(),
+            archive_active: None,
+            archive_running: None,
+            archive_retained: Vec::new(),
         })
     }
     pub(super) fn check_key(&self, key: &wire::Key) -> io::Result<()> {
@@ -112,7 +121,7 @@ impl State {
     }
     pub(super) fn enrollment_allowed(&self, key: &wire::Key) -> io::Result<()> {
         self.check_key(key)?;
-        if self.active.is_some() || self.object_active.is_some() {
+        if self.active.is_some() || self.object_active.is_some() || self.archive_active.is_some() {
             return Err(refused("Bootstrap SDK operation is still unresolved"));
         }
         Ok(())
@@ -123,9 +132,15 @@ impl State {
         Ok(())
     }
     pub(super) fn native_queries_drained(&self) -> bool {
-        self.running.is_none() && self.object_running.is_none() && self.preparation_finished()
+        self.running.is_none()
+            && self.object_running.is_none()
+            && self.archive_running.is_none()
+            && self.preparation_finished()
     }
     pub(super) fn sampling_group(&self) -> io::Result<Option<i32>> {
+        if let Some(archive) = &self.archive_running {
+            return archive.sampling_group();
+        }
         if let Some(object) = &self.object_running {
             return object.sampling_group();
         }
@@ -147,6 +162,7 @@ impl State {
         }
         self.retained.clear();
         self.object_retained.clear();
+        self.archive_retained.clear();
         Ok(())
     }
     fn directory_current(&self) -> io::Result<()> {
@@ -226,16 +242,18 @@ impl Owner {
             .bootstrap_graph
             .as_mut()
             .ok_or_else(|| refused("original Bootstrap query Root unavailable"))?;
+        let root_deadline = root.deadline();
         let state = &mut root.queries;
         state.check_key(&request.key.graph)?;
         state.directory_current()?;
         let deadline = started
             .checked_add(Duration::from_nanos(request.timeout_ns))
             .ok_or_else(|| refused("Bootstrap query original clock overflow"))?
-            .min(root.deadline);
+            .min(root_deadline);
         time(deadline)?;
         if state.active.is_some()
             || state.object_active.is_some()
+            || state.archive_active.is_some()
             || request.key.sequence != state.next
             || state.next > MAX_QUERIES
             || state.operations.contains(&request.key.operation)
@@ -453,6 +471,7 @@ impl Owner {
     }
     pub(in crate::actor::owner) fn tick_bootstrap_queries(&mut self) {
         self.tick_bootstrap_objects();
+        self.tick_bootstrap_archives();
         let mut closed = Vec::new();
         for job in self.jobs.values_mut() {
             if let Some(token) = Self::poll_bootstrap_query(&self.fence, &self.journal, job) {
@@ -481,6 +500,7 @@ impl Owner {
     ) -> io::Result<()> {
         self.bootstrap_graph_context(peer, key)?;
         self.refresh_bootstrap_object(peer, key)?;
+        self.refresh_bootstrap_archive(peer, key)?;
         let job_key = (
             key.query.binding.session.clone(),
             key.query.binding.root_attempt,

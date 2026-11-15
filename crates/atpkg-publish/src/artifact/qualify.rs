@@ -42,7 +42,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use super::tools::{HostTools, Ran, Run, RunError};
+use super::tools::{HostTools, Queue, Ran, Run, RunError};
 use crate::error::{Error, Result};
 use crate::triple::Triple;
 
@@ -432,8 +432,12 @@ pub struct Receipt {
     pub argv: Vec<String>,
     /// Its exit code; `None` when it did not run to an exit.
     pub exit: Option<i32>,
-    /// How long it took.
+    /// How long it took: its own time, which its bound judges. The time its builds waited to
+    /// be admitted is [`Receipt::queued_millis`] and no part of this.
     pub millis: u64,
+    /// How long its builds waited for this machine to admit them ([`Queue`]): a source step's
+    /// and the build's; a packed step builds nothing.
+    pub queued_millis: u64,
     /// Its committed bound.
     pub within_secs: u64,
     /// SHA-256 of its kept stdout: the bytes in its `.stdout` log (the runner keeps each
@@ -455,15 +459,22 @@ impl Receipt {
     }
 
     /// The build's record: the pack is the lane's own call, so its exit is 0 when it returned
-    /// a package and 1 when it refused.
+    /// a package and 1 when it refused. `elapsed` is the whole pack and `queued` the part of it
+    /// the build waited to be admitted, which its bound does not judge.
     #[must_use]
-    pub fn build(step: &Step, elapsed: Duration, outcome: std::result::Result<(), String>) -> Self {
+    pub fn build(
+        step: &Step,
+        elapsed: Duration,
+        queued: Duration,
+        outcome: std::result::Result<(), String>,
+    ) -> Self {
+        let own = elapsed.saturating_sub(queued);
         let mut verdict = match &outcome {
             Ok(()) => Verdict::Passed,
             Err(why) => Verdict::Failed(why.clone()),
         };
-        if outcome.is_ok() && elapsed > step.within {
-            verdict = Verdict::Failed(over(step, elapsed));
+        if outcome.is_ok() && own > step.within {
+            verdict = Verdict::Failed(over(step, own));
         }
         Self {
             name: step.name.clone(),
@@ -471,7 +482,8 @@ impl Receipt {
             target: None,
             argv: Vec::new(),
             exit: Some(i32::from(outcome.is_err())),
-            millis: millis(elapsed),
+            millis: millis(own),
+            queued_millis: millis(queued),
             within_secs: step.within.as_secs(),
             stdout_sha256: atpkg::tree::sha256_bytes(b""),
             stderr_sha256: atpkg::tree::sha256_bytes(b""),
@@ -480,7 +492,8 @@ impl Receipt {
         }
     }
 
-    /// One line: `PASS unit 12.3 s exit 0 (41 tests)` or `FAIL unit …: why`.
+    /// One line: `PASS unit 12.3 s exit 0 (41 tests)` or `FAIL unit …: why`, the time its
+    /// builds waited to be admitted named after its own.
     #[must_use]
     pub fn line(&self) -> String {
         let on = self.target.map(|t| format!(" on {t}")).unwrap_or_default();
@@ -491,8 +504,12 @@ impl Receipt {
             .tests
             .map(|t| format!(" ({} tests ran, {} passed)", t.ran(), t.passed))
             .unwrap_or_default();
+        let queued = match self.queued_millis / 1000 {
+            0 => String::new(),
+            secs => format!(" (after {secs} s queued for admission)"),
+        };
         let head = format!(
-            "{} {}{on} {}.{:03} s {exit}{tests}",
+            "{} {}{on} {}.{:03} s{queued} {exit}{tests}",
             self.stage.as_str(),
             self.name,
             self.millis / 1000,
@@ -571,7 +588,9 @@ fn judge(step: &Step, ran: &Ran, elapsed: Duration) -> (Option<Tests>, Verdict) 
 }
 
 /// Run one source or packed step at `site` and judge it. The raw output is written under
-/// `site.logs` whatever the verdict, and its digests are in the receipt.
+/// `site.logs` whatever the verdict, and its digests are in the receipt. A source step's bound
+/// judges its own time: the run carries the [`Queue`] of the checkout it builds in, so the time
+/// its builds wait to be admitted neither ends it nor counts against it.
 /// # Errors
 /// A could-not-run when the output cannot be kept; a usage error for a build step, which is the
 /// pack's own call ([`Receipt::build`]) or a packed step given no tree.
@@ -600,9 +619,12 @@ pub fn run_step(runner: &dyn Runner, step: &Step, site: &Site<'_>) -> Result<Rec
         .map(|name| (*name).to_string())
         .collect();
     run.deadline = Some(step.within);
+    let queue = (step.stage == Stage::Source).then(|| Queue::of(site.cwd));
+    run.queue.clone_from(&queue);
     let started = Instant::now();
     let answer = runner.run(&run);
-    let elapsed = started.elapsed();
+    let queued = queue.as_ref().map_or(Duration::ZERO, Queue::waited);
+    let elapsed = started.elapsed().saturating_sub(queued);
     let (ran, tests, verdict) = match answer {
         Ok(ran) => {
             let (tests, verdict) = judge(step, &ran, elapsed);
@@ -612,8 +634,12 @@ pub fn run_step(runner: &dyn Runner, step: &Step, site: &Site<'_>) -> Result<Rec
             Ran::default(),
             None,
             Verdict::Failed(format!(
-                "did not finish within its committed bound of {} s",
-                step.within.as_secs()
+                "did not finish within its committed bound of {} s{}",
+                step.within.as_secs(),
+                match queued.as_secs() {
+                    0 => String::new(),
+                    secs => format!(", the {secs} s it queued for admission not counted"),
+                }
             )),
         ),
         Err(e) => (Ran::default(), None, Verdict::Failed(e.to_string())),
@@ -635,6 +661,7 @@ pub fn run_step(runner: &dyn Runner, step: &Step, site: &Site<'_>) -> Result<Rec
         argv,
         exit: ran.code,
         millis: millis(elapsed),
+        queued_millis: millis(queued),
         within_secs: step.within.as_secs(),
         stdout_sha256: atpkg::tree::sha256_bytes(&ran.stdout),
         stderr_sha256: atpkg::tree::sha256_bytes(&ran.stderr),

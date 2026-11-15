@@ -520,6 +520,12 @@ fn wildcard_heartbeats_keep_the_automatic_joins_lan_address() {
         own_host_from("0.0.0.0:7100".parse().unwrap(), || routes).as_deref(),
         Some("192.168.1.102")
     );
+    let moved = [routes[1], routes[0], routes[2]];
+    assert_eq!(
+        own_host_from("0.0.0.0:7100".parse().unwrap(), || moved).as_deref(),
+        Some("10.0.0.2"),
+        "a heartbeat reads the current multicast route rather than caching the first interface"
+    );
     assert_eq!(
         own_host_from("0.0.0.0:7100".parse().unwrap(), || [None; 3]),
         None
@@ -872,7 +878,14 @@ fn a_drive_is_named_by_the_node_it_proved() {
         driver_name(&m, Some("mac-11.local"), &knows),
         "a node that names itself as another Mac reads as itself"
     );
-    for unshown in [None, Some("the message bus"), Some("")] {
+    for unshown in [
+        None,
+        Some("the message bus"),
+        Some(""),
+        Some("127.0.0.1"),
+        Some("192.168.1.127"),
+        Some("fd12:3456::1"),
+    ] {
         assert_eq!(
             driver_name(&n, unshown, &knows),
             "node 1a2b3c4d",
@@ -887,7 +900,7 @@ fn a_drive_is_named_by_the_node_it_proved() {
     );
     assert_eq!(
         driver_name(&holder, Some("127.0.0.1"), &[holder.clone(), reader]),
-        "127.0.0.1 (node c0ffee34a1)",
+        "node c0ffee34a1",
         "a head another node this Mac knows shares is never the name"
     );
 }
@@ -1488,7 +1501,9 @@ fn facts_push_stores_locally_or_over_fleet_and_rejects_forged_node() {
         moves: None,
         server_heard: Vec::new(),
         home: None,
+        home_dir: None,
         home_free_mb: None,
+        machine: None,
         repos: None,
         update: None,
     };
@@ -1587,7 +1602,9 @@ fn facts_push_stores_locally_or_over_fleet_and_rejects_forged_node() {
         moves: None,
         server_heard: Vec::new(),
         home: None,
+        home_dir: None,
         home_free_mb: None,
+        machine: None,
         repos: None,
         update: None,
     };

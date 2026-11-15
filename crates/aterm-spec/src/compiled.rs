@@ -282,13 +282,28 @@ enum Rhs {
     Det(Num),
     /// `var' \in lo..hi`.
     Range(Num, Num),
+    /// A further relation on an already-chosen next-state value.
+    Constrain(Box<Rhs>),
+}
+
+impl Rhs {
+    fn bounds(&self, state: &[i64], locals: &mut [i64]) -> (i64, i64) {
+        match self {
+            Self::Det(expr) => {
+                let value = expr.value(state, locals);
+                (value, value)
+            }
+            Self::Range(low, high) => (low.value(state, locals), high.value(state, locals)),
+            Self::Constrain(rhs) => rhs.bounds(state, locals),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct CAction {
     guard: Option<Test>,
-    /// `(slot, rhs, repeated_target)` in declaration order; repeat flags are resolved once.
-    updates: Vec<(usize, Rhs, bool)>,
+    /// `(slot, rhs)` in declaration order; repeated targets use constraint opcodes.
+    updates: Vec<(usize, Rhs)>,
 }
 
 /// A model resolved for the walks in [`crate::interp`].
@@ -526,14 +541,19 @@ impl Compiled {
             let mut updates = Vec::with_capacity(a.updates.len());
             for u in &a.updates {
                 let slot = *slots.get(u.var)?;
+                let repeated = updates.iter().any(|(previous, _)| *previous == slot);
                 let rhs = match &u.expr {
                     Expr::InRange(lo, hi) => {
                         Rhs::Range(scope.num(lo, &mut bound), scope.num(hi, &mut bound))
                     }
                     e => Rhs::Det(scope.num(e, &mut bound)),
                 };
-                let repeated = updates.iter().any(|(previous, _, _)| *previous == slot);
-                updates.push((slot, rhs, repeated));
+                let rhs = if repeated {
+                    Rhs::Constrain(Box::new(rhs))
+                } else {
+                    rhs
+                };
+                updates.push((slot, rhs));
             }
             actions.push(CAction {
                 guard: a.guard.as_ref().map(|g| scope.test(g, &mut bound)),
@@ -668,28 +688,12 @@ impl Compiled {
         let width = s.len();
         rows.extend_from_slice(s);
         let mut made = 1;
-        for (slot, rhs, repeated) in &act.updates {
-            if *repeated {
-                let (low, high) = match rhs {
-                    Rhs::Det(e) => {
-                        let value = e.value(s, locals);
-                        (value, value)
-                    }
-                    Rhs::Range(lo, hi) => (lo.value(s, locals), hi.value(s, locals)),
-                };
-                let mut kept = 0;
-                for row in 0..made {
-                    let value = rows[row * width + slot];
-                    if low <= value && value <= high {
-                        rows.copy_within(row * width..(row + 1) * width, kept * width);
-                        kept += 1;
-                    }
-                }
-                rows.truncate(kept * width);
-                made = kept;
-                continue;
-            }
+        for (slot, rhs) in &act.updates {
             match rhs {
+                Rhs::Constrain(rhs) => {
+                    let (low, high) = rhs.bounds(s, locals);
+                    made = constrain_rows(rows, width, *slot, made, low, high);
+                }
                 Rhs::Det(e) => {
                     let v = e.value(s, locals);
                     write_slot(rows, width, *slot, v);
@@ -723,6 +727,28 @@ impl Compiled {
         }
         made
     }
+}
+
+/// Keep the already-chosen rows whose `slot` satisfies the next constraint.
+#[inline]
+fn constrain_rows(
+    rows: &mut Vec<i64>,
+    width: usize,
+    slot: usize,
+    made: usize,
+    low: i64,
+    high: i64,
+) -> usize {
+    let mut kept = 0;
+    for row in 0..made {
+        let value = rows[row * width + slot];
+        if low <= value && value <= high {
+            rows.copy_within(row * width..(row + 1) * width, kept * width);
+            kept += 1;
+        }
+    }
+    rows.truncate(kept * width);
+    kept
 }
 
 /// Write `v` at `slot` of every `width`-long row in `rows`.

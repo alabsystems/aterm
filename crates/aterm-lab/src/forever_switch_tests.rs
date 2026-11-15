@@ -87,7 +87,7 @@ fn at_rest(land_at: i64) -> Seen {
         ],
         ledger: vec![
             row(REST_AT, RULE_POINT, "waited"),
-            row(land_at, turn_end::RULE_LAND, "typed"),
+            row(land_at, alab_policy::words::RULE_LAND, "typed"),
         ],
         end_ms: T0 + 190_000,
         cover: Cover {
@@ -224,7 +224,7 @@ fn land_at_once_wants_the_instruction_within_ten_seconds_of_the_first_point() {
 /// read.
 fn held_seen(tape: bool) -> Seen {
     let typed = Typed {
-        rule: Some(turn_end::RULE_LAND.to_string()),
+        rule: Some(alab_policy::words::RULE_LAND.to_string()),
         seq: 868,
         decided_ms: Some(T0 + 24_000),
         sent_ms: T0 + 24_070,
@@ -250,7 +250,7 @@ fn held_seen(tape: bool) -> Seen {
         ],
         ledger: vec![
             row(24_000, RULE_POINT, "waiting"),
-            row(49_470, turn_end::RULE_LAND, "typed"),
+            row(49_470, alab_policy::words::RULE_LAND, "typed"),
         ],
         end_ms: T0 + 960_000,
         cover: Cover {
@@ -371,7 +371,7 @@ fn a_late_decision_fails_land_at_once_by_aterms_own_act() {
     let late = |decided: i64, sent: i64| {
         let mut seen = at_rest(sent + 400);
         seen.cover.typed = Some(vec![Typed {
-            rule: Some(turn_end::RULE_LAND.to_string()),
+            rule: Some(alab_policy::words::RULE_LAND.to_string()),
             seq: 1791,
             decided_ms: Some(T0 + decided),
             sent_ms: T0 + sent,
@@ -402,7 +402,7 @@ fn a_late_decision_fails_land_at_once_by_aterms_own_act() {
     ));
     let mut other = late(REST_AT, REST_AT + 100);
     if let Some(a) = other.cover.typed.as_mut().and_then(|t| t.first_mut()) {
-        a.rule = Some(turn_end::RULE_CONTINUE.to_string());
+        a.rule = Some(alab_policy::words::RULE_CONTINUE.to_string());
     }
     let v = land_at_once(&other, T0);
     assert!(
@@ -784,14 +784,16 @@ const ASK_AFTER: i64 = 1_300;
 /// How long after the ask its answer held the tab again.
 const AGAIN_AFTER: i64 = 16_000;
 
-/// Land's one ask as the loop types it at the switch (`turn_end::switch_why` before [`LAND`]'s own
+/// Land's one ask as the loop types it at the switch (`alab_policy::words::switch_why` before [`LAND`]'s own
 /// words).
 fn asked_text() -> String {
     let mark = "[aterm harness]";
     format!(
         "{mark} {}{}",
-        turn_end::switch_why(&turn_end::held_quote(HELD_REPLY)),
-        turn_end::LAND.strip_prefix(mark).unwrap_or(turn_end::LAND)
+        alab_policy::words::switch_why(&alab_policy::words::held_quote(HELD_REPLY)),
+        alab_policy::words::LAND
+            .strip_prefix(mark)
+            .unwrap_or(alab_policy::words::LAND)
     )
 }
 
@@ -824,7 +826,7 @@ fn over_held() -> Seen {
         ],
         ledger: vec![Row {
             command: asked_text(),
-            ..row(ask, turn_end::RULE_LAND, "typed")
+            ..row(ask, alab_policy::words::RULE_LAND, "typed")
         }],
         status: vec![
             (
@@ -875,7 +877,7 @@ fn a_held_tab_switched_to_land_asks_once_and_is_held_again_at_the_same_answer() 
     };
     assert!(why.contains("NO ASK"), "{why}");
     let mut plain = over_held();
-    plain.ledger[0].command = turn_end::LAND.into();
+    plain.ledger[0].command = alab_policy::words::LAND.into();
     let Verdict::Fail(why) = judge_over_held(&plain, T0) else {
         panic!("Land's plain instruction passed");
     };
@@ -957,7 +959,7 @@ fn over_repeated() -> Seen {
             &format!(
                 "WAITING seq=2681 until={} {}",
                 until(HELD_AT + 240_000),
-                turn_end::REPEAT_RECOVERY_WAIT
+                alab_policy::words::REPEAT_RECOVERY_WAIT
             ),
         )
     };
@@ -998,7 +1000,10 @@ fn a_repeated_cruise_tab_switched_to_land_asks_once_and_land_holds() {
         .iter()
         .position(|(t, _)| *t > T0 + at)
         .unwrap();
-    let text: String = turn_end::FORWARD_RECOVERY.chars().take(120).collect();
+    let text: String = alab_policy::words::FORWARD_RECOVERY
+        .chars()
+        .take(120)
+        .collect();
     requested.journal.insert(
         k,
         j(at, &format!("CONTINUED seq=2681 rule=continue@v1 {text}")),
@@ -1095,7 +1100,7 @@ fn busy(land_at: i64, wake_at: i64) -> Seen {
             j(land_at, LAND),
             j(land_at + 4_000, "DONE seq=1791 landed"),
         ],
-        ledger: vec![row(land_at, turn_end::RULE_LAND, "typed")],
+        ledger: vec![row(land_at, alab_policy::words::RULE_LAND, "typed")],
         end_ms: T0 + 120_000,
         cover: Cover {
             words: vec![Switched {
@@ -1371,7 +1376,7 @@ fn the_repeat_is_read_off_the_journal_file() {
             T0 + 1,
             &format!(
                 "WAITING seq=3 until=2026-10-25T10:15:44Z {}",
-                turn_end::REPEAT_RECOVERY_WAIT
+                alab_policy::words::REPEAT_RECOVERY_WAIT
             )
         )
     );

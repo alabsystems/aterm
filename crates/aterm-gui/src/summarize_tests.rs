@@ -21,7 +21,7 @@ fn the_briefs_read_the_survey_once_and_end() {
         assert!(!order.fact_line);
         assert_eq!(
             order.autopilot,
-            aterm_agent::supervise::Autopilot::Land,
+            alab_policy::config::Autopilot::Land,
             "spawned under Land: its end is its landing"
         );
     }
@@ -97,6 +97,7 @@ fn this_macs_brief_reads_the_survey_then_the_local_brief() {
 
 #[test]
 fn a_press_names_the_fabric_where_this_aterms_fabric_is_on() {
+    FLEET_FOR_TEST.set(Some(Some(false)));
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let folder = summary_folder_under(root.path()).expect("made");
     let mut app = App::headless_for_test();
@@ -230,7 +231,7 @@ fn summarize_with_no_folder_of_its_own_refuses_in_plain_words() {
         Some(canonical),
         "trusted there"
     );
-    assert_eq!(order.autopilot, aterm_agent::supervise::Autopilot::Land);
+    assert_eq!(order.autopilot, alab_policy::config::Autopilot::Land);
 }
 
 #[test]
@@ -242,7 +243,8 @@ fn summarize_refuses_with_the_block_before_booking_anything() {
 }
 
 fn workers_app() -> App {
-    CLAUDE_ON_PATH_FOR_TEST.set(Some(true));
+    CLAUDE_ON_PATH_FOR_TEST.set(Some(Some(true)));
+    FLEET_FOR_TEST.set(Some(Some(false)));
     let mut app = App::headless_for_test();
     app.harness = Some(crate::harness_host::HostHandle::for_supervised_test(
         Vec::new(),
@@ -323,7 +325,7 @@ fn summarize_is_grey_for_what_its_spawn_would_refuse() {
             |b| matches!(b, StartBlock::Worker(WorkerBlock::Shell(_))),
         ),
         (
-            |_| CLAUDE_ON_PATH_FOR_TEST.set(Some(false)),
+            |_| CLAUDE_ON_PATH_FOR_TEST.set(Some(Some(false))),
             |b| *b == StartBlock::NoClaude,
         ),
     ];
@@ -405,54 +407,234 @@ fn a_fish_known_older_than_3_4_greys_summarize() {
 }
 
 #[test]
-fn a_stale_look_is_looked_at_again_off_the_asking_thread() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Condvar, PoisonError};
-    static LOOK: Look = Look::new();
-    static LOOKS: AtomicUsize = AtomicUsize::new(0);
-    static ANSWER: AtomicBool = AtomicBool::new(false);
-    static GATE: (Mutex<bool>, Condvar) = (Mutex::new(true), Condvar::new());
-    fn look() -> bool {
-        LOOKS.fetch_add(1, Ordering::SeqCst);
-        let (open, bell) = &GATE;
-        let open = open.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = bell
-            .wait_timeout_while(open, Duration::from_secs(60), |open| !*open)
-            .unwrap_or_else(PoisonError::into_inner);
-        ANSWER.load(Ordering::SeqCst)
-    }
+fn cold_and_stale_discovery_return_without_waiting_and_wake_after_publication() {
+    use std::sync::mpsc;
+
+    let look: &'static Look = Box::leak(Box::new(Look::new()));
+    let caller = std::thread::current().id();
     let ttl = Duration::from_secs(2);
-    let t0 = Instant::now();
-    assert!(
-        !LOOK.answer(ttl, "aterm-test-look", look, t0),
-        "the first, here"
-    );
-    assert_eq!(LOOKS.load(Ordering::SeqCst), 1);
-    assert!(!LOOK.answer(ttl, "aterm-test-look", look, t0 + Duration::from_secs(1)));
-    assert_eq!(LOOKS.load(Ordering::SeqCst), 1, "fresh: no look");
-    *GATE.0.lock().unwrap_or_else(PoisonError::into_inner) = false;
-    ANSWER.store(true, Ordering::SeqCst);
-    let stale = t0 + ttl * 2;
-    assert!(
-        !LOOK.answer(ttl, "aterm-test-look", look, stale),
-        "stale: the last answer, at once"
-    );
-    let began = Instant::now();
-    while LOOKS.load(Ordering::SeqCst) < 2 {
-        assert!(began.elapsed() < Duration::from_secs(60), "no look started");
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(!LOOK.answer(ttl, "aterm-test-look", look, stale));
-    assert_eq!(LOOKS.load(Ordering::SeqCst), 2, "one look out at a time");
-    *GATE.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
-    GATE.1.notify_all();
-    let began = Instant::now();
-    while !LOOK.answer(ttl, "aterm-test-look", look, t0) {
-        assert!(
-            began.elapsed() < Duration::from_secs(60),
-            "the look never ended"
+    let mut previous = None;
+    for answer in [false, true] {
+        let (started, begin) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let (wake, woke) = mpsc::channel();
+        let now = Instant::now() + ttl * 2;
+        assert_eq!(
+            look.answer(
+                ttl,
+                "aterm-test-look",
+                move || {
+                    started.send(std::thread::current().id()).unwrap();
+                    held.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+                    answer
+                },
+                now,
+                move || wake.send(()).unwrap(),
+            ),
+            previous,
+            "cold returns unknown; a refresh returns the last completed answer"
         );
-        std::thread::sleep(Duration::from_millis(1));
+        assert_ne!(
+            begin.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap(),
+            caller,
+            "the file lookup runs off the asking thread"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                look.answer(
+                    ttl,
+                    "aterm-test-look",
+                    || panic!("only one lookup may run"),
+                    now,
+                    || panic!("an inflight lookup owns the only completion wake"),
+                ),
+                previous
+            );
+        }
+        assert!(woke.try_recv().is_err(), "a blocked read has no answer");
+        release.send(()).unwrap();
+        woke.recv_timeout(aterm_spec::wait::MUST_HAPPEN).unwrap();
+        assert_eq!(
+            look.answer(
+                ttl,
+                "aterm-test-look",
+                || panic!("a fresh answer needs no read"),
+                Instant::now(),
+                || panic!("a fresh answer needs no wake"),
+            ),
+            Some(answer),
+            "the answer is published before the completion wake"
+        );
+        previous = Some(answer);
     }
-    assert_eq!(LOOKS.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn refused_discovery_worker_keeps_unknown_or_stale_answer_and_bounds_retry() {
+    for previous in [None, Some(false), Some(true)] {
+        let look: &'static Look = Box::leak(Box::new(Look::new()));
+        look.state.lock().unwrap().last = previous;
+        let ttl = Duration::from_secs(2);
+        let now = Instant::now();
+        let starts = std::cell::Cell::new(0);
+        let read = |at| {
+            look.answer_with_spawn(
+                ttl,
+                || panic!("a refused worker cannot read"),
+                at,
+                || panic!("a refused worker cannot publish"),
+                |_| {
+                    starts.set(starts.get() + 1);
+                    false
+                },
+            )
+        };
+        assert_eq!(read(now), previous);
+        for _ in 0..3 {
+            assert_eq!(read(now + ttl / 2), previous);
+        }
+        assert_eq!(starts.get(), 1, "no per-turn spawn loop after refusal");
+        assert_eq!(read(now + ttl), previous);
+        assert_eq!(starts.get(), 2, "the retry is admitted at the TTL");
+    }
+}
+
+#[test]
+fn failed_discovery_deadline_rearms_and_retires_without_a_menu_read() {
+    let look: &'static Look = Box::leak(Box::new(Look::new()));
+    let ttl = Duration::from_secs(2);
+    let now = Instant::now();
+    assert_eq!(look.retry_deadline(), None);
+    assert_eq!(
+        look.answer_with_spawn(ttl, || false, now, || {}, |_| false),
+        None,
+    );
+    assert_eq!(look.retry_deadline(), Some(now + ttl));
+    assert_eq!(
+        look.retry_if_due(now + ttl / 2, || panic!("the retry is not due")),
+        Some(now + ttl),
+    );
+    assert_eq!(
+        look.retry_if_due(now + ttl, || {
+            assert_eq!(
+                look.answer_with_spawn(ttl, || false, now + ttl, || {}, |_| false),
+                None,
+            );
+        }),
+        Some(now + ttl * 2),
+        "another refusal replaces the expired deadline"
+    );
+    let job = std::cell::RefCell::new(None);
+    assert_eq!(
+        look.retry_if_due(now + ttl * 2, || {
+            let _ = look.answer_with_spawn(
+                ttl,
+                || false,
+                now + ttl * 2,
+                || {},
+                |work| {
+                    *job.borrow_mut() = Some(work);
+                    true
+                },
+            );
+        }),
+        None,
+        "an accepted worker owns progress; no expired timer remains"
+    );
+    assert_eq!(
+        look.retry_if_due(now + ttl * 3, || panic!("the worker is still inflight")),
+        None,
+    );
+    job.take().expect("accepted worker")();
+    assert_eq!(look.state.lock().unwrap().last, Some(false));
+    assert_eq!(
+        look.retry_if_due(now + ttl * 4, || panic!("a settled answer needs no timer")),
+        None,
+    );
+}
+
+#[test]
+fn unchanged_discovery_refresh_adds_no_menu_wake() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let look: &'static Look = Box::leak(Box::new(Look::new()));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let ttl = Duration::from_secs(2);
+    for (expected, answer) in [(None, true), (Some(true), true), (Some(true), false)] {
+        let woke = Arc::clone(&wakes);
+        assert_eq!(
+            look.answer_with_spawn(
+                ttl,
+                move || answer,
+                Instant::now() + ttl * 2,
+                move || {
+                    woke.fetch_add(1, Ordering::Relaxed);
+                },
+                |work| {
+                    work();
+                    true
+                },
+            ),
+            expected,
+        );
+        let expected_wakes = if answer { 1 } else { 2 };
+        assert_eq!(wakes.load(Ordering::Relaxed), expected_wakes);
+    }
+}
+
+#[test]
+fn discovery_completion_republishes_the_menu_inside_its_ttl() {
+    let before = crate::menu::agents_live();
+    let mut app = workers_app();
+    let now = Instant::now();
+    app.publish_agents_live(false, now);
+    assert!(crate::menu::agents_live().summarize_ready());
+    CLAUDE_ON_PATH_FOR_TEST.set(Some(Some(false)));
+    app.publish_agents_live(false, now);
+    assert!(
+        crate::menu::agents_live().summarize_ready(),
+        "the TTL holds"
+    );
+    app.on_agents_discovery_ready();
+    assert!(!crate::menu::agents_live().summarize_ready());
+    assert_eq!(
+        crate::menu::agents_live().summarize_block,
+        Some(StartBlock::NoClaude.hint()),
+        "the completion publishes without another input or TTL expiry"
+    );
+    assert!(crate::Wake::AgentsDiscoveryReady.only_observes());
+    crate::menu::set_agents_live(before);
+}
+
+#[test]
+fn pending_discovery_is_not_absence_and_cannot_book_a_mac_only_summary() {
+    let mut app = workers_app();
+    for (claude, fleet) in [(None, Some(false)), (Some(true), None)] {
+        CLAUDE_ON_PATH_FOR_TEST.set(Some(claude));
+        FLEET_FOR_TEST.set(Some(fleet));
+        assert_eq!(
+            app.summarize_start_block(),
+            Some(StartBlock::DiscoveryPending)
+        );
+        assert_eq!(
+            app.summarize_in_new_tab(),
+            Err(StartBlock::DiscoveryPending.hint())
+        );
+        assert!(!app.tab_spawns.summary_pending());
+    }
+    assert_eq!(
+        app.summary_spawn_in(None).map(|_| ()),
+        Err(StartBlock::DiscoveryPending.hint()),
+        "unknown membership cannot choose the local-only brief"
+    );
+    CLAUDE_ON_PATH_FOR_TEST.set(Some(Some(false)));
+    FLEET_FOR_TEST.set(Some(Some(false)));
+    assert_eq!(app.summarize_start_block(), Some(StartBlock::NoClaude));
+    CLAUDE_ON_PATH_FOR_TEST.set(Some(Some(true)));
+    assert_eq!(
+        app.summarize_start_block(),
+        None,
+        "known local membership is ready"
+    );
 }

@@ -8,8 +8,9 @@ use crate::harness::disk::pressure_tests::last_used;
 use crate::harness::disk::target::{Build, Judge};
 use crate::harness::disk::tests::{Tmp, lay_target, now_after_write};
 use crate::harness::disk::{
-    Class, Config, Removed, Report, Roots as SurveyRoots, Row, Step, StopBy, Survey, TargetDir,
-    Tier, Trigger, Witness, apply_auto, pass_plan, remover, remover_among, report, scan,
+    Class, Config, PRESSURE_MIN_IDLE_S, Removed, Report, Roots as SurveyRoots, Row, Step, StopBy,
+    Survey, TargetDir, Tier, Trigger, Witness, apply_auto, pass_plan, remover, remover_among,
+    report, scan,
 };
 use aterm_spec::wait::{MUST_HAPPEN, within};
 use aterm_uds::holders::{PathScan, scan_path_users_of};
@@ -194,6 +195,157 @@ fn every_root_kind_is_found_and_each_build_directory_once() {
             assert_eq!(session, DEAD);
         }
     }
+}
+
+#[test]
+fn scratch_worktrees_and_checkout_local_scratch_targets_keep_their_checkout_origin() {
+    let tmp = Tmp::new("discover-ubd-checkouts");
+    let home = mkdirs(&tmp.path().join("home"));
+    let independent = mkdirs(&home.join(".ubd/independent.noindex"));
+    mkdirs(&independent.join(".git"));
+    let independent_target = canon(&lay_target(&independent.join("target")));
+    let nested_target = canon(&lay_target(&independent.join(".ubd/check.noindex")));
+    let checkout = mkdirs(&home.join("checkout"));
+    mkdirs(&checkout.join(".git"));
+    let local_target = canon(&lay_target(&checkout.join(".ubd/local.noindex")));
+    std::fs::write(independent.join("source.rs"), b"source is not a cache\n").unwrap();
+    lay_target(&home.join(".other/worktree/target"));
+    lay_target(&independent.join(".other/target"));
+    let found = discover(&roots_at(&tmp), Budget::SHIPPED);
+    assert!(found.cut.is_none(), "{found:?}");
+    let mut got: Vec<_> = found
+        .found
+        .iter()
+        .map(|f| match &f.origin {
+            Origin::Checkout { root } => (f.path.clone(), root.clone()),
+            other => panic!("scratch checkout has the wrong origin: {other:?}"),
+        })
+        .collect();
+    got.sort();
+    let mut want = vec![
+        (independent_target, canon(&independent)),
+        (nested_target, canon(&independent)),
+        (local_target, canon(&checkout)),
+    ];
+    want.sort();
+    assert_eq!(got, want);
+    assert_eq!(
+        std::fs::read(independent.join("source.rs")).unwrap(),
+        b"source is not a cache\n"
+    );
+    let skipped = discover(
+        &Roots {
+            skip_home_children: true,
+            ..roots_at(&tmp)
+        },
+        Budget::SHIPPED,
+    );
+    assert!(skipped.found.is_empty(), "home traversal remains optional");
+}
+
+#[test]
+fn hidden_external_targo_targets_reclaim_only_incremental_under_pressure() {
+    let tmp = Tmp::new("discover-ubd-external-targets");
+    let controls = mkdirs(&tmp.path().join("home/.ubd/integration-controls"));
+    std::fs::write(controls.join("source.rs"), b"retained source\n").unwrap();
+    std::fs::write(controls.join("report.json"), b"{\"retained\":true}\n").unwrap();
+    let now = now_after_write(0);
+    let mut targets = Vec::new();
+    for name in ["target-ring-scalar-463f-1", "target-463f-coherent-3"] {
+        let target = canon(&lay_target(&controls.join(name)));
+        let profile = target.join("debug");
+        for legacy in ["deps", ".fingerprint"] {
+            let path = profile.join(legacy);
+            if path.exists() {
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
+        for lock in CARGO_LOCKS {
+            std::fs::write(profile.join(lock), b"").unwrap();
+        }
+        std::fs::write(profile.join("build/retain"), b"compiled build output\n").unwrap();
+        std::fs::write(profile.join("ty"), b"retained executable\n").unwrap();
+        last_used(&profile, now - PRESSURE_MIN_IDLE_S + 1);
+        targets.push(target);
+    }
+    let config = Config::default();
+    assert!(
+        !config.apply,
+        "the manual switch is not the automatic grant"
+    );
+    let (_, young) = survey_at(&tmp, &roots_at(&tmp), now, GIB, config);
+    assert!(
+        young.rows.is_empty(),
+        "emergency discovery does not waive the ten-minute idle guard: {young:?}"
+    );
+    let eligible_at = now + 1;
+    let (survey, rep) = survey_at(&tmp, &roots_at(&tmp), eligible_at, GIB, config);
+    assert_eq!(survey.targets.len(), 2, "{survey:?}");
+    assert_eq!(rep.rows.len(), 2, "{rep:?}");
+    assert!(
+        rep.rows
+            .iter()
+            .all(|row| row.tier() == Some(Tier::RecentIncremental)),
+        "{rep:?}"
+    );
+    let mut reads = 0;
+    let done = apply_auto(
+        &rep,
+        survey.transcripts_root.as_deref(),
+        &mut real(eligible_at),
+        &mut scripted(vec![GIB, GIB, config.pressure_target_bytes()], &mut reads),
+        &mut |_| true,
+    )
+    .expect("the default automatic grant admits emergency cache reclamation");
+    assert_eq!(done.removed.len(), 2, "{done:?}");
+    assert!(done.denials.is_empty(), "{done:?}");
+    for target in targets {
+        let profile = target.join("debug");
+        assert!(!profile.join("incremental").exists());
+        assert_eq!(
+            std::fs::read(profile.join("build/retain")).unwrap(),
+            b"compiled build output\n"
+        );
+        assert_eq!(
+            std::fs::read(profile.join("ty")).unwrap(),
+            b"retained executable\n"
+        );
+        for lock in CARGO_LOCKS {
+            assert!(profile.join(lock).is_file());
+        }
+    }
+    assert_eq!(
+        std::fs::read(controls.join("source.rs")).unwrap(),
+        b"retained source\n"
+    );
+    assert_eq!(
+        std::fs::read(controls.join("report.json")).unwrap(),
+        b"{\"retained\":true}\n"
+    );
+}
+
+#[test]
+fn scratch_discovery_does_not_follow_container_links_or_cross_mounts() {
+    let tmp = Tmp::new("discover-ubd-fences");
+    let home = mkdirs(&tmp.path().join("home"));
+    let elsewhere = mkdirs(&tmp.path().join("elsewhere"));
+    lay_target(&elsewhere.join("worktree/target"));
+    symlink(&elsewhere, home.join(".ubd")).unwrap();
+    let linked = discover(&roots_at(&tmp), Budget::SHIPPED);
+    assert!(linked.found.is_empty(), "{linked:?}");
+    std::fs::remove_file(home.join(".ubd")).unwrap();
+    let scratch = mkdirs(&home.join(".ubd"));
+    symlink(&elsewhere, scratch.join("linked.noindex")).unwrap();
+    let mounted = mkdirs(&scratch.join("mounted.noindex"));
+    lay_target(&mounted.join("target"));
+    let fenced = discover(
+        &Roots {
+            mounts: vec![canon(&mounted)],
+            ..roots_at(&tmp)
+        },
+        Budget::SHIPPED,
+    );
+    assert!(fenced.found.is_empty(), "{fenced:?}");
 }
 
 #[test]

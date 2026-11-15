@@ -39,7 +39,9 @@ pub(crate) struct Acting {
 }
 
 thread_local! {
-    static ACTING: RefCell<Option<Acting>> = const { RefCell::new(None) };
+    // Boxed: inline it was 112 bytes of every thread's thread-local template
+    // (`tests/thread_local_template.rs`). The box is made on a thread's first act or read.
+    static ACTING: Box<RefCell<Option<Acting>>> = Box::new(RefCell::new(None));
 }
 
 /// RAII scope naming the act under way on this thread; the outermost scope wins.

@@ -7,10 +7,15 @@ use crate::harness::login_latch::LoginLatches;
 use crate::harness::repo_work::{RepoRead, RepoWork};
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::turn_end::{
-    Cleared, Clearing, DONE_CHECK, FINISHED, LAND, LAND_CHECK, LAND_CHECK_HEAD, LAND_NUDGE, Outage,
-    REPO_UNREAD_OWN, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT, RULE_LOGIN,
-    RULE_LOGIN_BACK, RULE_OUTAGE_RESUME, RULE_SUGGESTION, cleared_text, done_check_words,
-    own_repo_work_suffix, repo_work_suffix,
+    Cleared, Clearing, Outage, REPO_UNREAD_OWN, RULE_LOGIN, RULE_LOGIN_BACK, RULE_OUTAGE_RESUME,
+    RULE_SUGGESTION, cleared_text, own_repo_work_suffix, repo_work_suffix,
+};
+use alab_policy::{
+    land_check::{LAND_CHECK, LAND_CHECK_HEAD},
+    words::{
+        DONE_CHECK, FINISHED, LAND, LAND_NUDGE, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND,
+        RULE_LEFT, done_check_words,
+    },
 };
 use std::sync::PoisonError;
 
@@ -2030,7 +2035,7 @@ fn a_question_in_prose_is_answered_by_the_sessions_priority_word() {
     .into_iter()
     .enumerate()
     {
-        let text = format!("{text} {}", crate::supervise::policy::needs::NEEDS_HINT);
+        let text = format!("{text} {}", alab_policy::needs::NEEDS_HINT);
         let (dir, ledger) = ledger_at(&format!("prose-{word}-{k}"));
         let mut m = Mock::new(vec![busy_screen(), ended(PROSE_ASK)]);
         m.turn_releases = Some(1);
@@ -2192,7 +2197,7 @@ fn the_auto_mode_setup_offer_over_a_continuation_is_answered_and_the_continuatio
         .filter(|r| r.starts_with("send ") || r.starts_with("key "))
         .collect();
     let sent = |at: u64| format!("send if-human=3 if-gen=1.{at} if=^❯\\s*$ -- keep going");
-    let title = crate::supervise::policy::row_guard("  Teach auto mode about your environment?");
+    let title = alab_policy::guard::row_guard("  Teach auto mode about your environment?");
     assert_eq!(
         writes,
         [
@@ -2959,7 +2964,7 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
     assert!(
         t.enters()[0].contains(&format!(
             "if={}",
-            super::super::super::policy::row_guard(&format!("❯ {CLEARED}"))
+            alab_policy::guard::row_guard(&format!("❯ {CLEARED}"))
         )),
         "fenced on the read that showed it whole: {}",
         t.evidence()
@@ -4423,8 +4428,9 @@ fn land_held_unread_past_the_echo_hang_is_submitted_once_when_it_draws() {
         h.noted
     );
     assert!(
-        !h.noted.iter().any(|l| l.starts_with("WAITING ")
-            && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
+        !h.noted
+            .iter()
+            .any(|l| l.starts_with("WAITING ") && l.contains(alab_policy::words::PERSON_TYPING)),
         "no person's grace on aterm's own line: {:#?}",
         h.noted
     );
@@ -5572,10 +5578,9 @@ fn a_long_texts_guard_never_matches_a_shells_row() {
     );
     for text in [&answer, &rules] {
         for caret in ['❯', '›'] {
-            let guard = aterm_observe::row_matcher(
-                &crate::supervise::run::turn_end_loop::composer_guard(caret, text),
-            )
-            .expect("a pattern");
+            let guard =
+                aterm_observe::row_matcher(&alab_policy::guard::composer_guard(caret, text))
+                    .expect("a pattern");
             for shell in [
                 "user@host ~ % Nobody is here to answer. Decide for yourself with your best \
                  judgment: take the option you would recommend, prefer reversible steps, and \
@@ -5606,7 +5611,7 @@ fn a_long_texts_guard_never_matches_a_shells_row() {
 
 #[test]
 fn a_composer_guard_escapes_its_caret_and_holds_its_column() {
-    use crate::supervise::run::turn_end_loop::{composer_guard, composer_guard_at};
+    use alab_policy::guard::{composer_guard, composer_guard_at};
     let text = "hello in yolo";
     let guard = composer_guard_at('*', 1, text);
     assert!(guard.starts_with("^\\s\\*\\s"), "{guard}");
@@ -5636,7 +5641,7 @@ fn a_composer_guard_escapes_its_caret_and_holds_its_column() {
 
 #[test]
 fn muse_codes_measured_drafts_take_the_composer_guard() {
-    use crate::supervise::run::turn_end_loop::composer_guard;
+    use alab_policy::guard::composer_guard;
     use aterm_phase::muse::fixtures as u;
     use aterm_phase::prompt::fixtures::screen;
     let matcher = |caret: char, text: &str| {
@@ -6106,7 +6111,7 @@ fn an_agy_session_is_supervised_end_to_end() {
         .cloned()
         .unwrap_or_else(|| panic!("the box answered: {lines:#?} {:#?}", m.requests));
     assert!(
-        press.contains(&crate::supervise::policy::row_guard(&command_row)),
+        press.contains(&alab_policy::guard::row_guard(&command_row)),
         "guarded on the command's row: {press}"
     );
     let turn = m
@@ -6556,7 +6561,7 @@ fn an_owners_act_in_two_paragraphs_is_typed_as_one_line() {
     let run = |m: &mut Mock| {
         let mut opts = hosted(3);
         opts.policy.human_grace_s = 0;
-        opts.policy.continue_text = OWNERS.to_string();
+        opts.policy.turn_end.continue_text = OWNERS.to_string();
         let (lines, _) = watch_lines_with(m, &opts, |s| {
             s.set_turn_end_timing(TurnEndTiming {
                 min_work: Duration::ZERO,
@@ -6700,8 +6705,7 @@ fn a_muse_code_session_is_supervised_end_to_end() {
         .cloned()
         .unwrap_or_else(|| panic!("the box answered: {lines:#?} {:#?}", m.requests));
     assert!(
-        press.contains(" if-gen=")
-            && press.contains(&crate::supervise::policy::row_guard(&once_row)),
+        press.contains(" if-gen=") && press.contains(&alab_policy::guard::row_guard(&once_row)),
         "Enter on the focused one-shot allow: {press}"
     );
     assert!(
@@ -6992,7 +6996,7 @@ fn a_muse_code_question_is_answered_by_the_cursor_and_enter() {
                 presses[0].contains(" if-gen=")
                     && presses[0].ends_with(&format!(
                         " if={} enter",
-                        crate::supervise::policy::row_guard(&red)
+                        alab_policy::guard::row_guard(&red)
                     )),
                 "{}",
                 presses[0]
@@ -8609,7 +8613,7 @@ fn a_wall_at_a_carried_break_of_the_agents_own_background_work_stands_across_its
     assert_eq!(
         lasting,
         [Some(crate::supervise::Lasting::Wall {
-            wire: aterm_phase::WallKind::Overloaded.wire(),
+            wire: alab_policy::vocab::WallKind::Overloaded.wire(),
         })],
         "told once, never told over while the break stands at it: {why}"
     );
@@ -9735,7 +9739,7 @@ fn a_hidden_wall_its_predecessor_waited_on_is_seeded_only_while_it_stands() {
             &approvals::wall_wait_reason(
                 Some(reset),
                 Some("in 3s"),
-                aterm_phase::WallKind::UsageWeekly,
+                alab_policy::vocab::WallKind::UsageWeekly,
                 &notice,
             ),
             ts_back_ms,
@@ -10663,7 +10667,7 @@ fn a_reprinted_wall_is_not_sent_to_tomorrow_at_once() {
         s.set_clock(at(h, mi), PDT);
         let _ = s.wall_reset_at(
             Some(text),
-            aterm_phase::WallKind::UsageWeekly,
+            alab_policy::vocab::WallKind::UsageWeekly,
             false,
             true,
             false,
@@ -10724,7 +10728,7 @@ fn a_bare_footer_does_not_bridge_different_named_reset_zones() {
         let place = |s: &mut Session<'_, Mock>, text: &str| {
             let _ = s.wall_reset_at(
                 Some(text),
-                aterm_phase::WallKind::UsageWeekly,
+                alab_policy::vocab::WallKind::UsageWeekly,
                 false,
                 reprinted,
                 false,
@@ -11682,12 +11686,15 @@ fn the_quiet_upgrades_line_at_a_break_is_a_fact_its_guards_hold() {
 /// with no policy to read the mode by, says nothing of it.
 #[test]
 fn a_break_tells_its_host_a_task_landed_under_land() {
-    use crate::supervise::config::Autopilot;
+    use alab_policy::config::Autopilot;
     let mut m = Mock::new(vec![ended("All landed.")]);
     let mut s = session(&mut m, Some("@s-1".to_string()));
     s.set_clock(TEST_NOW, PDT);
     let under = |autopilot| SupervisorConfig {
-        autopilot,
+        turn_end: alab_policy::config::PolicyConfig {
+            autopilot,
+            ..owners_policy().turn_end.clone()
+        },
         ..owners_policy()
     };
     let (land, cruise) = (under(Autopilot::Land), under(Autopilot::Cruise));
@@ -11828,7 +11835,7 @@ fn a_tape_from_a_build_with_no_guarded_break_door_replays_the_old_door() {
 
 #[test]
 fn a_point_after_a_sleep_a_request_saw_is_held_only_until_the_wakes_settle() {
-    use crate::supervise::policy::turn_end::RULE_CONTINUE;
+    use alab_policy::words::RULE_CONTINUE;
     let run = |slept: bool, outlasted: bool| {
         let mut m = Mock::new(vec![ended("Stage done.")]);
         let opts = hosted(30);
@@ -11945,7 +11952,7 @@ fn an_undated_cancelled_limit_is_placed_within_a_session_window() {
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = session(&mut m, None);
     s.set_zone_lookup(test_zones);
-    let kind = aterm_phase::WallKind::UsageSession;
+    let kind = alab_policy::vocab::WallKind::UsageSession;
     let rows = auto_continue_cancelled();
     let mut placed = |text: &str, undated: bool| -> i64 {
         s.set_clock(TEST_NOW, PDT);
@@ -12630,7 +12637,7 @@ fn an_undated_clock_folded_across_a_change_is_the_morning_it_names() {
     let mut m = Mock::new(vec![busy_screen()]);
     let mut s = session(&mut m, None);
     s.set_zone_lookup(test_zones);
-    let kind = aterm_phase::WallKind::UsageSession;
+    let kind = alab_policy::vocab::WallKind::UsageSession;
     for (text, now, want) in [
         ("12:30am", CLOCKS_BACK + 2 * 3600, CLOCKS_BACK - 90 * 60),
         ("1:30am", CLOCKS_ON + 3600, CLOCKS_ON - 30 * 60),
@@ -13589,7 +13596,10 @@ fn the_shell_a_turn_left_under_an_idle_compaction_is_told_as_the_agents_own_work
             journal: Some(path.clone()),
             idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
             policy: SupervisorConfig {
-                autopilot: crate::supervise::config::Autopilot::Land,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: alab_policy::config::Autopilot::Land,
+                    ..hosted(60).policy.turn_end.clone()
+                },
                 ..hosted(60).policy
             },
             ..hosted(60)
@@ -13666,7 +13676,10 @@ fn the_monitor_a_turn_left_under_an_outlived_progress_row_is_told_as_the_agents_
         journal: Some(path.clone()),
         idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
         policy: SupervisorConfig {
-            autopilot: crate::supervise::config::Autopilot::Land,
+            turn_end: alab_policy::config::PolicyConfig {
+                autopilot: alab_policy::config::Autopilot::Land,
+                ..hosted(60).policy.turn_end.clone()
+            },
             ..hosted(60).policy
         },
         ..hosted(60)
@@ -14516,7 +14529,10 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
         policy: SupervisorConfig {
             human_grace_s: 0,
             // The person's own exchange is Land's to leave where it opens the session.
-            autopilot: Autopilot::Land,
+            turn_end: alab_policy::config::PolicyConfig {
+                autopilot: Autopilot::Land,
+                ..owners_policy().turn_end
+            },
             ..owners_policy()
         },
         ..auto(1)
@@ -14614,7 +14630,10 @@ fn a_persons_greeting_left_to_them_stays_theirs_in_the_next_loop() {
     std::fs::write(&ledger, "").expect("ledger");
     let cruise = SuperviseOpts {
         policy: SupervisorConfig {
-            autopilot: Autopilot::Cruise,
+            turn_end: alab_policy::config::PolicyConfig {
+                autopilot: Autopilot::Cruise,
+                ..opts.policy.clone().turn_end.clone()
+            },
             ..opts.policy.clone()
         },
         ..opts.clone()
@@ -14682,7 +14701,10 @@ fn a_persons_exchange_is_left_under_its_prompts_key() {
             policy: SupervisorConfig {
                 human_grace_s: 0,
                 // The person's own exchange is Land's to leave where it opens the session.
-                autopilot: Autopilot::Land,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Land,
+                    ..owners_policy().turn_end
+                },
                 ..owners_policy()
             },
             idle_host: Some(Arc::new(host) as Arc<dyn IdleHost>),
@@ -14805,7 +14827,10 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
             policy: SupervisorConfig {
                 human_grace_s: 0,
                 // The person's own exchange is Land's to leave where it opens the session.
-                autopilot: Autopilot::Land,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Land,
+                    ..owners_policy().turn_end
+                },
                 ..owners_policy()
             },
             idle_host: Some(Arc::new(LagHost {
@@ -14891,7 +14916,7 @@ fn a_persons_exchange_an_older_build_noted_left_stays_theirs_in_the_next_loop() 
 #[test]
 fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
     // Land answers the person's question with its own words (`land-answer@v1`).
-    use crate::supervise::policy::turn_end::RULE_LAND_ANSWER as RULE_ANSWER;
+    use alab_policy::words::RULE_LAND_ANSWER as RULE_ANSWER;
     let tail = include_str!("fixtures/claude-2.1.294-transcript-529.jsonl");
     let greeting = "Hello! How can I help?";
     let answer = format!(
@@ -14921,7 +14946,10 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_the_next_loop() {
             policy: SupervisorConfig {
                 human_grace_s: 0,
                 // The person's own exchange is Land's to leave where it opens the session.
-                autopilot: Autopilot::Land,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Land,
+                    ..owners_policy().turn_end
+                },
                 ..owners_policy()
             },
             idle_host: Some(Arc::new(LagHost {
@@ -15020,7 +15048,10 @@ fn a_persons_exchange_retried_at_a_wall_stays_theirs_in_the_next_loop() {
             policy: SupervisorConfig {
                 human_grace_s: 0,
                 // The person's own exchange is Land's to leave where it opens the session.
-                autopilot: Autopilot::Land,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Land,
+                    ..owners_policy().turn_end
+                },
                 ..owners_policy()
             },
             idle_host: Some(Arc::new(LagHost {
@@ -15151,7 +15182,10 @@ fn a_persons_question_answered_at_length_is_left_to_them() {
             policy: SupervisorConfig {
                 human_grace_s: 0,
                 // The person's own exchange is Land's to leave where it opens the session.
-                autopilot: Autopilot::Land,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Land,
+                    ..owners_policy().turn_end
+                },
                 ..owners_policy()
             },
             journal: Some(journal.clone()),
@@ -15288,7 +15322,10 @@ fn claude_codes_idle_compaction_is_no_turn() {
             policy: SupervisorConfig {
                 human_grace_s: 0,
                 answer_questions: answers,
-                autopilot,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot,
+                    ..owners_policy().turn_end.clone()
+                },
                 ..owners_policy()
             },
             ..auto(max)
@@ -15402,7 +15439,10 @@ fn a_persons_exchange_stays_theirs_under_an_idle_compaction() {
             policy: SupervisorConfig {
                 human_grace_s: 0,
                 // The person's own exchange is Land's to leave where it opens the session.
-                autopilot: Autopilot::Land,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Land,
+                    ..owners_policy().turn_end
+                },
                 ..owners_policy()
             },
             journal: Some(journal.clone()),
@@ -15772,12 +15812,14 @@ impl IdleHost for AccountHost {
     }
     /// [`Self::late_agent`], read now; with none set, no snapshot is read here (the trait's own
     /// answer).
-    fn agent_resumed(&self) -> Option<AgentResumed> {
-        let (pid, started, conversation) = self.late_agent.lock().unwrap().take()?;
+    fn agent_resumed(&self) -> HostAgent {
+        let Some((pid, started, conversation)) = self.late_agent.lock().unwrap().take() else {
+            return HostAgent::Absent;
+        };
         *self.pid.lock().unwrap() = Some(pid);
         *self.started.lock().unwrap() = Some(started);
         *self.conversation.lock().unwrap() = conversation.map(str::to_string);
-        Some(AgentResumed {
+        HostAgent::Read(AgentResumed {
             pid,
             started: Some(started),
             resumed: false,
@@ -17680,7 +17722,7 @@ fn a_persons_login_over_a_weekly_limit_is_waited_out_then_closed_with_one_fenced
         reason: &approvals::wall_wait_reason(
             Some(RESET),
             Some("Oct 31 at 12am (America/Los_Angeles)"),
-            aterm_phase::WallKind::UsageWeekly,
+            alab_policy::vocab::WallKind::UsageWeekly,
             NOTICE,
         ),
         box_seq: 100,
@@ -17780,7 +17822,7 @@ fn over_weekly_limit(
         reason: &approvals::wall_wait_reason(
             Some(RESET),
             Some("Oct 31 at 12am (America/Los_Angeles)"),
-            aterm_phase::WallKind::UsageWeekly,
+            alab_policy::vocab::WallKind::UsageWeekly,
             NOTICE,
         ),
         box_seq: 100,
@@ -18175,7 +18217,7 @@ fn a_loop_started_33_hours_after_the_reset_still_closes_a_login_over_a_limit() {
         reason: &approvals::wall_wait_reason(
             Some(RESET),
             Some("Oct 31 at 12am (America/Los_Angeles)"),
-            aterm_phase::WallKind::UsageWeekly,
+            alab_policy::vocab::WallKind::UsageWeekly,
             "You've hit your weekly limit · resets Oct 31 at 12am (America/Los_Angeles)",
         ),
         box_seq: 100,
@@ -18970,7 +19012,7 @@ fn the_rosters_word_is_asked_at_a_weekly_limit_alone() {
     let mut s = session(&mut m, None);
     let mut weekly =
         walled("You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)");
-    assert_eq!(weekly.wall, Some(aterm_phase::WallKind::UsageWeekly));
+    assert_eq!(weekly.wall, Some(alab_policy::vocab::WallKind::UsageWeekly));
     s.account_advise(&mut weekly, 7, &opts);
     assert_eq!(weekly.roster, Some(RosterWord::Unread));
     assert_eq!(host.roster_asked.load(Ordering::SeqCst), 1);
@@ -18981,7 +19023,7 @@ fn the_rosters_word_is_asked_at_a_weekly_limit_alone() {
         let mut r = walled(message);
         assert_ne!(
             r.wall,
-            Some(aterm_phase::WallKind::UsageWeekly),
+            Some(alab_policy::vocab::WallKind::UsageWeekly),
             "{message}"
         );
         s.account_advise(&mut r, 8, &opts);
@@ -19037,7 +19079,7 @@ fn a_login_left_at_a_weekly_limit_asks_the_rosters_word() {
         let mut s = session(&mut m, None);
         let t = Instant::now();
         let mut weekly = read(&with_tail(&[weekly_row]), Some(Duration::from_secs(180)));
-        assert_eq!(weekly.wall, Some(aterm_phase::WallKind::UsageWeekly));
+        assert_eq!(weekly.wall, Some(alab_policy::vocab::WallKind::UsageWeekly));
         s.turn_end.observe(&weekly, t);
         s.account_advise(&mut weekly, 7, &opts);
         let asked = host.roster_asked.load(Ordering::SeqCst);
@@ -19109,7 +19151,7 @@ fn a_relaunch_the_host_switched_off_is_named_at_a_weekly_limit() {
             "You've hit your weekly limit · resets Oct 23 at 8am (America/Los_Angeles)",
             &host,
         );
-        assert_eq!(weekly.wall, Some(aterm_phase::WallKind::UsageWeekly));
+        assert_eq!(weekly.wall, Some(alab_policy::vocab::WallKind::UsageWeekly));
         weekly.reset_at = Some(t + Duration::from_secs(6 * 24 * 3600));
         s.turn_end.observe(&weekly, t);
         s.account_advise(&mut weekly, 7, &opts);
@@ -19526,6 +19568,115 @@ fn the_host_is_told_the_logins_own_end_and_return_once_with_accounts_off() {
         s.fold_point(&mut r, t, back.seq, &opts);
         assert_eq!(told(), [LoginSeen::Lost, LoginSeen::Served], "look {seq}");
     }
+}
+
+/// CLOUDFLARE'S BLOCK PAGE IS NO LOST LOGIN: Claude Code 2.1.323 words the page Cloudflare's edge
+/// answers in the API's place as `Please run /login · API Error: 403 Attention Required! |
+/// Cloudflare` and clears a goal `(authentication failed)` under it (m2, 2026-11-13: the same
+/// login served turns 90 minutes later with no sign-in). A point that shows it, with the measured
+/// transcript under it, tells the host no lost login, with the accounts on or off.
+/// CONTROL: the lost login's own row, with 2.1.294's transcript of it, is told lost.
+#[test]
+fn cloudflares_block_page_tells_the_host_no_lost_login() {
+    use crate::supervise::policy::turn_end::LoginSeen;
+    let edge = "  ⎿  Please run /login · API Error: 403 Attention Required! | Cloudflare";
+    let echo = "⏺ Goal cleared after an unrecoverable error (authentication failed): \"stage 3\". \
+                Run /goal again to continue.";
+    let edge_tail = include_str!("fixtures/claude-2.1.323-transcript-cloudflare-403.jsonl");
+    let lost_tail = include_str!("fixtures/claude-2.1.294-transcript-not-logged-in.jsonl");
+    let screen_of = |said: &[&str]| {
+        let mut said: Vec<&str> = said.to_vec();
+        said.insert(0, "⏺ Carrying on.");
+        said.push("");
+        let mut v = rows(&said);
+        v.extend(composer("  ? for shortcuts"));
+        v
+    };
+    let run = |shown: &[String], tail: &str, accounts: bool| {
+        let host = AccountHost::scripted(&[None], &[]);
+        *host.tail.lock().unwrap() = Some(tail.to_string());
+        let mut opts = account_opts(&host);
+        if !accounts {
+            opts.policy.accounts = crate::harness::accounts::Mode::Off;
+            opts.policy.logins = false;
+        }
+        let mut m = Mock::new(vec![shown.to_vec()]);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.set_clock(ACCOUNT_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        let point = Screen {
+            rows: shown.to_vec(),
+            seq: 102,
+            cursor_col: 2,
+            ..Screen::default()
+        };
+        let mut r = s.turn_end_reading(&point, Some(Duration::from_secs(180)), &opts);
+        s.fold_point(&mut r, Instant::now(), point.seq, &opts);
+        let facts = host.login_facts.lock().unwrap().clone();
+        drop(s);
+        facts
+    };
+    for accounts in [true, false] {
+        for (name, shown) in [
+            ("the block page's row", screen_of(&[edge])),
+            ("its goal cleared under it", screen_of(&[edge, "", echo])),
+        ] {
+            let facts = run(&shown, edge_tail, accounts);
+            assert!(
+                !facts.contains(&LoginSeen::Lost),
+                "{name}, accounts {accounts}: {facts:?}"
+            );
+        }
+        let lost = screen_of(&["  ⎿  Not logged in · Please run /login"]);
+        let facts = run(&lost, lost_tail, accounts);
+        assert_eq!(facts, [LoginSeen::Lost], "CONTROL, accounts {accounts}");
+    }
+}
+
+/// EACH POINT A TURN WORKED TO TELLS ITS LOGIN SERVED, THOUGH NO LIVE READ OF THE TURN RAN: a
+/// cruise break's turn read only under a background wait or a carried transcript is no live
+/// read ([`Session::took`]), and its point, decided with the turn's work
+/// ([`Session::turn_end_at_point`]), tells the host served again, so a strike another tab made
+/// since the last served point meets this one's evidence. A point no turn worked to tells
+/// nothing more. Negative control: forgotten only at a live read, the second served point tells
+/// nothing.
+#[test]
+fn each_point_a_turn_worked_to_tells_its_login_served_with_no_live_read_between() {
+    use crate::supervise::policy::turn_end::LoginSeen;
+    let host = AccountHost::scripted(&[None], &[]);
+    let mut opts = account_opts(&host);
+    opts.policy.accounts = crate::harness::accounts::Mode::Off;
+    opts.policy.logins = false;
+    let first = ended("Stage 2 is done.");
+    let mut m = Mock::new(vec![first.clone()]);
+    let mut s = session(&mut m, Some("@s-1".to_string()));
+    s.set_clock(ACCOUNT_NOW, PDT);
+    let told = || host.login_facts.lock().unwrap().clone();
+    let point = point_at(&s, first, 100);
+    let _ = s
+        .turn_end_at_point(&point, Some(Duration::from_secs(180)), &opts)
+        .expect("a decision");
+    assert_eq!(
+        told(),
+        [LoginSeen::Served],
+        "PRECONDITION: the first served point"
+    );
+    let again = point_at(&s, ended("Stage 3 is done."), 104);
+    let _ = s
+        .turn_end_at_point(&again, Some(Duration::from_secs(240)), &opts)
+        .expect("a decision");
+    assert_eq!(
+        told(),
+        [LoginSeen::Served, LoginSeen::Served],
+        "a turn worked to a new point with no live read between"
+    );
+    let idle = point_at(&s, ended("Stage 3 is done."), 106);
+    let _ = s.turn_end_at_point(&idle, None, &opts).expect("a decision");
+    assert_eq!(
+        told(),
+        [LoginSeen::Served, LoginSeen::Served],
+        "no turn worked to this point"
+    );
 }
 
 #[test]
@@ -20378,7 +20529,7 @@ fn a_finished_task_opened_again_is_asked_about_at_the_limit_its_turn_ends_on() {
     let run = |worked: Option<Duration>| {
         let host = AccountHost::moving("work-2", "wait:changed");
         let mut opts = account_opts(&host);
-        opts.policy.autopilot = crate::supervise::config::Autopilot::Land;
+        opts.policy.turn_end.autopilot = alab_policy::config::Autopilot::Land;
         let mut m = Mock::new(vec![limited_screen()]);
         let mut s = session(&mut m, Some("@s-1".to_string()));
         s.set_clock(ACCOUNT_NOW, PDT);
@@ -20788,7 +20939,7 @@ fn a_limit_only_the_transcript_shows_is_the_wall_and_holds_the_carry_on() {
     assert!(!episode);
     assert!(
         matches!(&action, TurnEndAction::Type { rule_id, .. }
-            if *rule_id == crate::supervise::policy::turn_end::RULE_CONTINUE),
+            if *rule_id == alab_policy::words::RULE_CONTINUE),
         "the carry-on answered, the continue policy's point: {action:?}"
     );
     let spent = ACCOUNT_NOW
@@ -21500,7 +21651,7 @@ fn a_try_met_again_is_read_from_the_walls_row_after_it() {
             ts,
         )
     };
-    let wall_named = |kind: aterm_phase::WallKind, message: &str, ts: i64| {
+    let wall_named = |kind: alab_policy::vocab::WallKind, message: &str, ts: i64| {
         row(
             RULE_WALL_WAIT,
             Outcome::Waiting,
@@ -21513,7 +21664,7 @@ fn a_try_met_again_is_read_from_the_walls_row_after_it() {
         "{generic} \u{2014} seven_day_opus \u{2014} \u{26a0} Usage limit reached \u{b7} limit resets \
          4pm \u{2014} Continuing automatically at 4pm \u{b7} esc to cancel"
     );
-    let bucket_kind = aterm_phase::WallKind::ModelBucket { consent: false };
+    let bucket_kind = alab_policy::vocab::WallKind::ModelBucket { consent: false };
     let spend = |ts: i64| wall("You've hit your monthly spend limit.", ts);
     let sonnet = |ts: i64| {
         wall(
@@ -21584,7 +21735,7 @@ fn a_try_met_again_is_read_from_the_walls_row_after_it() {
             "control: a window the row names, a bucket's try",
             vec![
                 try_at(at_bucket, 1_000),
-                wall_named(aterm_phase::WallKind::UsageSession, generic, 2_000),
+                wall_named(alab_policy::vocab::WallKind::UsageSession, generic, 2_000),
             ],
             Some((1_000, false)),
         ),
@@ -21656,7 +21807,7 @@ fn a_try_met_again_is_seeded_from_the_wall_that_met_it() {
         wall_wait_reason,
     };
     use crate::supervise::policy::turn_end::{LimitTry, RULE_LIMIT_RESUME};
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let (dir, ledger) = ledger_at("try-met-by");
     let window = LimitTry {
         bucket: false,
@@ -21828,10 +21979,8 @@ fn the_done_check_the_ledger_says_is_owed_its_answer() {
         RULE_TASK_DONE, RULE_WALL_WAIT, RULE_WALL_WAIT_END, Row, TASK_DONE, WALL_TAKEN, act_reason,
         done_check_owed, point_reason, wall_wait_reason,
     };
-    use crate::supervise::policy::turn_end::{
-        LimitTry, RULE_CONTINUE, RULE_DONE_CHECK, RULE_LIMIT_RESUME, RULE_OPEN_ITEMS,
-        RULE_USAGE_PROBE,
-    };
+    use crate::supervise::policy::turn_end::{LimitTry, RULE_LIMIT_RESUME, RULE_USAGE_PROBE};
+    use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK, RULE_OPEN_ITEMS};
     let (dir, ledger) = ledger_at("check-owed");
     let row = |rule: &str, outcome: Outcome, reason: &str, ts: i64| {
         Row {
@@ -21864,7 +22013,7 @@ fn the_done_check_the_ledger_says_is_owed_its_answer() {
             &wall_wait_reason(
                 None,
                 None,
-                aterm_phase::WallKind::UsageWeekly,
+                alab_policy::vocab::WallKind::UsageWeekly,
                 "You've hit your weekly limit · resets Sep 19 at 11am (America/Los_Angeles)",
             ),
             ts,
@@ -22090,7 +22239,7 @@ fn the_done_check_the_ledger_says_is_owed_its_answer() {
 fn a_bucket_its_rate_limit_type_named_is_that_bucket_in_the_ledgers_wall() {
     use crate::supervise::approvals::OpenWall;
     use crate::supervise::run::wall_confirm::{limit_named, limit_words, words_kind};
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     const RESET: i64 = 1_792_279_200;
     let bucket = WallKind::ModelBucket { consent: false };
     let text = "You've hit your limit · resets 4pm (America/Los_Angeles)";
@@ -22329,7 +22478,7 @@ fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
             .unwrap_or_else(|e| panic!("{e:?}"));
         let attempts = s
             .turn_end
-            .wall_attempts(aterm_phase::WallKind::UsageSession);
+            .wall_attempts(alab_policy::vocab::WallKind::UsageSession);
         let place = s.turn_end.acted_in_limits_place();
         let reason = typed_rows(&ledger)
             .last()
@@ -22392,7 +22541,7 @@ fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
             after,
             next,
             s.turn_end
-                .wall_attempts(aterm_phase::WallKind::UsageSession),
+                .wall_attempts(alab_policy::vocab::WallKind::UsageSession),
             backoff,
         )
     };
@@ -22558,7 +22707,7 @@ fn a_done_check_at_an_ordinary_turn_end_is_no_limits_try_whatever_was_seeded() {
         );
         let attempts = s
             .turn_end
-            .wall_attempts(aterm_phase::WallKind::UsageSession);
+            .wall_attempts(alab_policy::vocab::WallKind::UsageSession);
         let point = point_at(&s, screen, 101);
         let first = s
             .turn_end_at_point(&point, None, &opts)
@@ -22593,7 +22742,7 @@ fn a_done_check_at_an_ordinary_turn_end_is_no_limits_try_whatever_was_seeded() {
             (
                 attempts,
                 s.turn_end
-                    .wall_attempts(aterm_phase::WallKind::UsageSession),
+                    .wall_attempts(alab_policy::vocab::WallKind::UsageSession),
             ),
             usage_attempt(&ledger, Some("@s-1")).map(|a| a.at_ms),
         ));
@@ -22637,10 +22786,9 @@ fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
         Carried, Ledger, Outcome, RULE_WALL_WAIT, Row, act_reason, act_reason_after, open_wall,
         typed_texts, usage_attempt, wall_wait_reason,
     };
-    use crate::supervise::config::Autopilot;
-    use crate::supervise::policy::turn_end::{
-        LimitTry, RULE_LAND, RULE_LAND_ANSWER, RULE_LIMIT_RESUME, decide_turn_end,
-    };
+    use crate::supervise::policy::turn_end::{LimitTry, RULE_LIMIT_RESUME, decide_turn_end};
+    use alab_policy::config::Autopilot;
+    use alab_policy::words::{RULE_LAND, RULE_LAND_ANSWER};
     use aterm_phase::prompt::fixtures as fx;
     const RESET: i64 = TEST_NOW + 6 * 3600 + 40 * 60;
     let now = RESET + 20 * 60;
@@ -22649,7 +22797,10 @@ fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     let force = "Shall I force-push the rewritten history over main?";
     let opts = |mode: Autopilot| SuperviseOpts {
         policy: SupervisorConfig {
-            autopilot: mode,
+            turn_end: alab_policy::config::PolicyConfig {
+                autopilot: mode,
+                ..owners_policy().turn_end.clone()
+            },
             ..owners_policy()
         },
         ..auto(30)
@@ -22741,7 +22892,7 @@ fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
         );
         let before = s
             .turn_end
-            .wall_attempts(aterm_phase::WallKind::UsageSession);
+            .wall_attempts(alab_policy::vocab::WallKind::UsageSession);
         s.seed_wall_memory(open_wall(&ledger, s.setup.sid.as_deref()));
         let point = point_at(&s, screen, 101);
         let first = s
@@ -22759,7 +22910,7 @@ fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
             .unwrap_or_else(|e| panic!("{e:?}"));
         let after = s
             .turn_end
-            .wall_attempts(aterm_phase::WallKind::UsageSession);
+            .wall_attempts(alab_policy::vocab::WallKind::UsageSession);
         let place = s.turn_end.acted_in_limits_place();
         drop(s);
         (dir, ledger, (action.rule_id(), place, (before, after)))
@@ -22796,7 +22947,7 @@ fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
             after,
             next,
             s.turn_end
-                .wall_attempts(aterm_phase::WallKind::UsageSession),
+                .wall_attempts(alab_policy::vocab::WallKind::UsageSession),
         )
     };
     let in_place = LimitTry {
@@ -23264,7 +23415,7 @@ fn a_buckets_notice_cancelled_before_the_loops_first_read_answers_its_try() {
     ]);
     assert!(
         aterm_phase::left_wall(&answered).is_some_and(|w| w.kind
-            == aterm_phase::WallKind::ModelBucket { consent: false }
+            == alab_policy::vocab::WallKind::ModelBucket { consent: false }
             && w.reset.is_some()),
         "the screen draws the bucket a cancel left: {answered:#?}"
     );
@@ -23282,7 +23433,7 @@ fn a_buckets_notice_cancelled_before_the_loops_first_read_answers_its_try() {
     ]);
     assert!(
         aterm_phase::left_wall(&generic).is_some_and(|w| w.kind
-            == aterm_phase::WallKind::ModelBucket { consent: false }
+            == alab_policy::vocab::WallKind::ModelBucket { consent: false }
             && w.reset.is_some()
             && w.message.contains("Sonnet")),
         "the generic row's cancel left the bucket: {:#?}",
@@ -24171,7 +24322,7 @@ fn a_wall_read_inside_a_tries_take_window_is_no_try_met_again_where_it_is_taken(
 fn a_limits_try_at_a_bucket_is_the_try_a_successor_backs_off_from() {
     use crate::supervise::approvals::{Ledger, OpenWall, Outcome, Row};
     use crate::supervise::policy::turn_end::{RULE_LIMIT_RESUME, decide_turn_end};
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     use aterm_phase::prompt::fixtures as fx;
     const RESET: i64 = 1_792_279_200;
     let now = RESET + 20 * 60;
@@ -24466,7 +24617,7 @@ fn the_owners_clearing_continues_a_session_at_its_wall_once() {
             (
                 first,
                 s.turn_end
-                    .wall_attempts(aterm_phase::WallKind::UsageSession),
+                    .wall_attempts(alab_policy::vocab::WallKind::UsageSession),
             )
         };
         let typed = m.requests.iter().filter(|r| r.contains(CLEARED));
@@ -25014,7 +25165,8 @@ fn a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it() {
 /// named no reset (`back_at_unix` `None`) or one that did, and a turn asked on it since.
 fn seed_awaiting_switch(ledger: &Path, back_at_unix: Option<i64>) {
     use crate::supervise::approvals::{Outcome, Row, model_switch_reason};
-    use crate::supervise::policy::turn_end::{FABLE_FALLBACK, RULE_CONTINUE, RULE_MODEL_FALLBACK};
+    use crate::supervise::policy::turn_end::{FABLE_FALLBACK, RULE_MODEL_FALLBACK};
+    use alab_policy::words::RULE_CONTINUE;
     let now = PROBE_NOW * 1000;
     let reason = model_switch_reason(Some("fable"), None, back_at_unix, PROBE_NOW - 31 * 60);
     let command = format!("relaunch --model {FABLE_FALLBACK}");
@@ -26565,7 +26717,7 @@ fn usage_left_typed_is_sent_as_the_probes_own_and_its_panel_is_closed() {
         );
         assert!(
             !journal.iter().any(|l| l.starts_with("WAITING ")
-                && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
+                && l.contains(alab_policy::words::PERSON_TYPING)),
             "{grace}: no person's grace on the probe's own line: {journal:#?}"
         );
         assert_eq!(
@@ -26895,8 +27047,9 @@ fn the_probe_is_not_typed_again_over_its_own_text_left_typed() {
         "{journal:#?}"
     );
     assert!(
-        !journal.iter().any(|l| l.starts_with("WAITING ")
-            && l.contains(crate::supervise::policy::turn_end::PERSON_TYPING)),
+        !journal
+            .iter()
+            .any(|l| l.starts_with("WAITING ") && l.contains(alab_policy::words::PERSON_TYPING)),
         "{journal:#?}"
     );
 
@@ -27142,7 +27295,7 @@ fn landed_result() -> String {
 }
 
 /// The land check's one landing answer.
-const CHECK_LANDED: &str = crate::supervise::policy::land_check::LANDED;
+const CHECK_LANDED: &str = alab_policy::land_check::LANDED;
 
 /// A landing's transcript: the task, its work, the land instruction and `reply` (its defense),
 /// then the land check answered `LANDED`.
@@ -27563,14 +27716,14 @@ const NEED_ONLY: &str = "NEEDS YOU: the signing permission";
 fn rested(lines: &[String]) -> bool {
     lines.iter().any(|l| {
         l.starts_with("WAITING ")
-            && l.contains(crate::supervise::policy::land_check::WAITS_ON_YOU)
+            && l.contains(alab_policy::land_check::WAITS_ON_YOU)
             && l.contains("the signing permission")
     })
 }
 
 /// Whether one check was typed, with no needs' ack (none stands to be acked).
 fn checked_once(checks: &[String], ack: bool) -> bool {
-    checks.len() == 1 && checks[0].contains(crate::supervise::policy::needs::NEEDS_ACK) == ack
+    checks.len() == 1 && checks[0].contains(alab_policy::needs::NEEDS_ACK) == ack
 }
 
 /// LANDED READS THE PROBE AGAIN AT ITS YIELD: the defense's probe read the repository clean, the
@@ -27942,12 +28095,9 @@ fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
             .any(|l| l.starts_with("DONE ") && l.contains(&format!(" rule={RULE_LAND} ")))
     };
     let nudged = |lines: &[String]| {
-        lines.iter().any(|l| {
-            l.contains(&format!(
-                " rule={} ",
-                crate::supervise::policy::turn_end::RULE_LAND_NUDGE
-            ))
-        })
+        lines
+            .iter()
+            .any(|l| l.contains(&format!(" rule={} ", alab_policy::words::RULE_LAND_NUDGE)))
     };
     for (program, mock, busy, work, turn) in harnesses {
         let (busy, work) = (screen(busy), screen(work));
@@ -30484,7 +30634,10 @@ fn paste_person_run(text: &str, shown: &str, setup: impl FnOnce(&mut Mock)) -> (
     setup(&mut m);
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
-            continue_text: text.to_string(),
+            turn_end: alab_policy::config::PolicyConfig {
+                continue_text: text.to_string(),
+                ..owners_policy().turn_end.clone()
+            },
             ..owners_policy()
         },
         ..auto(30)
@@ -33818,8 +33971,8 @@ fn fold_point_asks_host_agent_resumed_so_an_external_resume_banner_stays_in_sess
         fn owns_turn_end(&self) -> bool {
             false
         }
-        fn agent_resumed(&self) -> Option<AgentResumed> {
-            Some(self.0)
+        fn agent_resumed(&self) -> HostAgent {
+            HostAgent::Read(self.0)
         }
     }
 
@@ -33833,7 +33986,10 @@ fn fold_point_asks_host_agent_resumed_so_an_external_resume_banner_stays_in_sess
         let opts = SuperviseOpts {
             idle_host: Some(host),
             policy: SupervisorConfig {
-                autopilot: Autopilot::Land,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Land,
+                    ..alab_policy::config::PolicyConfig::default()
+                },
                 ..SupervisorConfig::default()
             },
             ..hosted(30)
@@ -33858,6 +34014,163 @@ fn fold_point_asks_host_agent_resumed_so_an_external_resume_banner_stays_in_sess
     );
 }
 
+/// A `LEFT` ROW WRITTEN WITH THE HOST'S READ OUT IS CORRECTED WHEN A READ TAKES THE EXCHANGE BACK
+/// (LS-15): within the loop's own restart's grace the host's read had not answered, so the person's
+/// exchange was left to them and its `LEFT` row says so ([`approvals::LEFT_UNREAD`]) and that it
+/// opened the session ([`approvals::LEFT_OPENS`]). The next read names the resumed session: the
+/// exchange is taken back, and the loop writes its row again for the same exchange and screen,
+/// closed by [`approvals::LEFT_TAKEN_BACK`] and not by [`approvals::LEFT_OPENS`], so a loop that
+/// seeds from the ledger reads it as left after work, as this one took it. NEGATIVE CONTROL: the
+/// ledger without that row still says the session's opening message was left, and the seeding
+/// reader keeps it the person's. CONTROL: a read naming a fresh program takes nothing back and
+/// writes no second row.
+#[test]
+fn a_left_row_written_with_the_read_out_is_corrected_when_the_resume_takes_it_back() {
+    #[derive(Debug)]
+    struct AnsweredHost(AgentResumed);
+    impl IdleHost for AnsweredHost {
+        fn wants(&self) -> bool {
+            false
+        }
+        fn at_idle(&self) -> Option<HostStep> {
+            None
+        }
+        fn owns_turn_end(&self) -> bool {
+            false
+        }
+        fn agent_resumed(&self) -> HostAgent {
+            HostAgent::Read(self.0)
+        }
+    }
+
+    let run = |resumed: bool, tag: &str| {
+        let mut said = rows(&["⏺ The test still passes.", ""]);
+        said.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        let mut m = Mock::new(vec![said]);
+        let host: Arc<dyn IdleHost> = Arc::new(AnsweredHost(AgentResumed {
+            pid: 600,
+            started: Some(1_793_005_000),
+            resumed,
+        }));
+        let opts = SuperviseOpts {
+            idle_host: Some(host),
+            policy: SupervisorConfig {
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Land,
+                    ..alab_policy::config::PolicyConfig::default()
+                },
+                ..SupervisorConfig::default()
+            },
+            ..hosted(30)
+        };
+        let (dir, ledger) = ledger_at(tag);
+        let mut s = session(&mut m, Some("@s-1".to_string()));
+        s.ledger = Ledger::open(Some(&ledger), Some("@s-1"), &mut Vec::new());
+        let screen = s.screen().expect("point");
+        let reading = |s: &mut Session<'_, Mock>, worked: Option<Duration>| {
+            let mut r = s.turn_end_reading(&screen, worked, &opts);
+            r.autopilot = Autopilot::Land;
+            r
+        };
+        let work = reading(&mut s, Some(20 * 60 * Duration::from_secs(1)));
+        let mut banner = reading(&mut s, None);
+        banner.taskless = true;
+        let mut asked = reading(&mut s, Some(Duration::from_secs(30)));
+        asked.person = Some(Duration::from_secs(30));
+        asked.key = Some(Duration::from_secs(30));
+        let now = s.fx.mono();
+        let relaunch = now + 21 * 60 * Duration::from_secs(1);
+        s.turn_end.seed_worked();
+        s.turn_end.observe(&work, now);
+        s.turn_end
+            .restarted(&Restart::Memory, true, &work, relaunch);
+        s.turn_end.host_agent_resumed(HostAgent::Unread);
+        s.turn_end
+            .observe(&banner, relaunch + Duration::from_secs(10));
+        s.turn_end.host_agent_resumed(HostAgent::Unread);
+        s.turn_end
+            .observe(&asked, relaunch + Duration::from_secs(40));
+        assert!(s.turn_end.exchange_unread(), "judged with the read out");
+        assert!(s.turn_end.left_to_person(), "left to the person");
+        s.ledger_left(&screen, &opts, screen.seq);
+        let mut after = reading(&mut s, None);
+        s.fold_point(
+            &mut after,
+            relaunch + Duration::from_secs(50),
+            screen.seq,
+            &opts,
+        );
+        let body = std::fs::read_to_string(&ledger).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        body
+    };
+
+    let left_rows = |body: &str| -> Vec<String> {
+        body.lines()
+            .filter(|l| l.contains(&format!("\"rule_id\":\"{RULE_LEFT}\"")))
+            .map(str::to_string)
+            .collect()
+    };
+    let field = |row: &str, key: &str| -> String {
+        aterm_json::from_str::<aterm_json::Value>(row)
+            .ok()
+            .and_then(|v| {
+                v.get(key)
+                    .and_then(aterm_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    };
+    let reason_of = |row: &str| field(row, "reason");
+    // An act a loop typed before the exchange: the books hold work.
+    let earlier = approvals::Row {
+        rule_id: RULE_CONTINUE,
+        outcome: approvals::Outcome::Typed,
+        command: "keep going",
+        reason: "the turn-end policy",
+        box_seq: 0,
+    }
+    .to_json(1, Some("@s-1"));
+
+    let body = run(true, "left-taken-back");
+    let left = left_rows(&body);
+    assert_eq!(left.len(), 2, "the row and its correction: {body}");
+    let first = reason_of(&left[0]);
+    assert!(
+        first.contains(approvals::LEFT_UNREAD) && first.ends_with(approvals::LEFT_OPENS),
+        "the row as left: {first}"
+    );
+    let last = reason_of(&left[1]);
+    assert!(
+        last.ends_with(approvals::LEFT_TAKEN_BACK) && !last.contains(approvals::LEFT_OPENS),
+        "the correction: {last}"
+    );
+    assert_eq!(
+        (field(&left[0], "command"), left[0].contains("\"box_seq\"")),
+        (field(&left[1], "command"), left[1].contains("\"box_seq\"")),
+        "the same exchange"
+    );
+    assert!(!field(&left[0], "command").is_empty(), "{body}");
+    assert!(
+        approvals::left_after_work_in(&format!("{earlier}\n{body}"), Some("@s-1")),
+        "a loop that seeds from the corrected ledger takes the exchange back: {body}"
+    );
+    // NEGATIVE CONTROL: without the correction the ledger says the opening message was left.
+    assert!(
+        !approvals::left_after_work_in(&format!("{earlier}\n{}", left[0]), Some("@s-1")),
+        "the uncorrected row reads as the session's opening message"
+    );
+
+    // CONTROL: a read naming a fresh program keeps the exchange the person's.
+    let body = run(false, "left-kept-fresh");
+    let left = left_rows(&body);
+    assert_eq!(left.len(), 1, "nothing taken back: {body}");
+    assert!(
+        reason_of(&left[0]).ends_with(approvals::LEFT_OPENS),
+        "{body}"
+    );
+}
+
 /// A PROGRAM BEGUN IN THE TURN IS KNOWN AT ITS FIRST POINT THOUGH ITS START IS READ THERE (D2-9):
 /// the host forgets an exited agent's snapshot, so the reading at a new program's first point may
 /// name no start (`IdleHost::agent_started`), and `IdleHost::agent_resumed` reads the new process
@@ -33879,8 +34192,8 @@ fn a_program_begun_in_the_turn_opens_its_session_when_its_start_is_read_at_the_p
         fn owns_turn_end(&self) -> bool {
             false
         }
-        fn agent_resumed(&self) -> Option<AgentResumed> {
-            Some(self.0)
+        fn agent_resumed(&self) -> HostAgent {
+            HostAgent::Read(self.0)
         }
     }
 
@@ -33903,7 +34216,10 @@ fn a_program_begun_in_the_turn_opens_its_session_when_its_start_is_read_at_the_p
         let opts = SuperviseOpts {
             idle_host: Some(host),
             policy: SupervisorConfig {
-                autopilot: Autopilot::Land,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Land,
+                    ..alab_policy::config::PolicyConfig::default()
+                },
                 ..SupervisorConfig::default()
             },
             ..hosted(30)
@@ -34630,4 +34946,72 @@ fn a_usage_limit_past_the_upgrades_bound_is_offered_to_the_upgrade_alone() {
     let (stepped, points, withheld) = standing(false);
     assert!(!stepped && points.is_empty(), "{points:?}");
     assert_eq!(withheld, Some(Guard::LimitEpisode));
+}
+
+/// The loop that noticed a wake and a loop that follows across it, which dates it by the
+/// system's record ([`Session::look_at_sleep`]), place one settle: the first noticed it 10 s
+/// after the record says the Mac woke, across a minute's turn, so a settle dated by the moment
+/// noticed differs from the follower's by the lag and by the minute's share. Twenty sessions,
+/// so no one id's share decides it.
+#[test]
+fn a_wake_noticed_late_and_a_follower_place_one_settle() {
+    let woke = (TEST_NOW + 4 * 3600).div_euclid(60) * 60 - 5;
+    let noticed = woke + 10;
+    assert_ne!(
+        woke.div_euclid(60),
+        noticed.div_euclid(60),
+        "a minute turns"
+    );
+    let record = Some(((TEST_NOW + 60) * 1000, woke * 1000));
+    let first = |sid: &str, recorded: bool| {
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut m, Some(sid.to_string()));
+        s.set_clock(TEST_NOW, PDT);
+        s.watch_sleep();
+        s.set_clock_jump(noticed - TEST_NOW);
+        s.set_last_sleep(record.filter(|_| recorded));
+        while s.slept_at.is_none() {
+            s.watch_sleep();
+        }
+        assert_eq!(
+            s.slept_at,
+            Some(noticed),
+            "{sid}: noticed when the clock says"
+        );
+        s.wake_settle
+            .as_ref()
+            .expect("the first loop's settle")
+            .0
+            .unix_ms
+    };
+    let follower = |sid: &str| {
+        let mut m = Mock::new(vec![busy_screen()]);
+        let mut s = session(&mut m, Some(sid.to_string()));
+        s.set_clock(noticed, PDT);
+        s.set_last_sleep(record);
+        s.look_at_sleep(noticed * 1000);
+        s.wake_settle
+            .as_ref()
+            .expect("the follower's settle")
+            .0
+            .unix_ms
+    };
+    let mut differs_unrecorded = 0;
+    for k in 0..20 {
+        let sid = format!("t{k:010}");
+        let theirs = follower(&sid);
+        let mine = first(&sid, true);
+        assert!(
+            mine.abs_diff(theirs) < 500,
+            "{sid}: the first loop's settle {mine} and the follower's {theirs}"
+        );
+        if first(&sid, false).abs_diff(theirs) >= 1000 {
+            differs_unrecorded += 1;
+        }
+    }
+    assert!(
+        differs_unrecorded >= 15,
+        "CONTROL: dated by the moment noticed, the settles agreed for {} of 20",
+        20 - differs_unrecorded
+    );
 }

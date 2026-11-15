@@ -9,7 +9,7 @@ use aterm_spec::interp::State;
 
 use super::super::mirror_run::{MirrorRun, Outcome};
 
-const SID: &str = "s-a";
+const SID: &str = "ta000000000";
 
 /// The ring: eight records, so an append past it evicts exactly the oldest
 /// one it can (the low water is an eighth under).
@@ -1345,7 +1345,7 @@ fn the_nodes_total_rides_the_pin_and_the_cap_stops_the_mirror() {
 /// Publish `n` records of another writer on this node's `ev` faces: what the
 /// broker's window holds below the mirror's own.
 fn fill(w: &World, n: u64) -> Vec<u64> {
-    let face = subject::session_face("f", &w.bridge.node, "s-old", "ev");
+    let face = subject::session_face("f", &w.bridge.node, "tpmd0000000", "ev");
     let mut god = w.client();
     (1..=n)
         .map(|seq| god.publish(93, seq, &face, b"v=1 t=1 ev=old").unwrap().0)
@@ -1500,7 +1500,7 @@ fn a_closed_sessions_face_is_retired_after_the_brokers_own_cut() {
         );
         let past = w.broker.head();
         let mut god = w.client();
-        let filler = "/f/f/pub/n-fill/s-fill/ev";
+        let filler = "/f/f/pub/n-fill/tf111000000/ev";
         for seq in 1..=64 {
             god.publish(93, seq, filler, &[b'e'; BODY])
                 .unwrap_or_else(|error| panic!("filler {seq} (retained={retained}): {error}"));
@@ -1657,8 +1657,8 @@ fn an_auto_mirror_a_broker_stops_retaining_is_withdrawn_before_it_says_so() {
 fn no_parent_sid_and_no_opener_reach_a_mirrored_body() {
     use aterm_slog::{Actor, Close, Fields, Key, Open, Out, ShortId, Tier, TurnOut};
     let mut w = World::new();
-    let (parent, prev) = ("s-parentqzp6", "s-prevqzp6");
-    let edge = ShortId::new("s-edgeqzp6").expect("a sid");
+    let (parent, prev) = ("tparentqzp6", "tprevqzp600");
+    let edge = ShortId::new("tedgeqzp600").expect("a sid");
     let mut log = Log::with_limits(1, limits());
     let f = Fields::new()
         .id(Key::Parent, parent)
@@ -1700,7 +1700,7 @@ fn no_parent_sid_and_no_opener_reach_a_mirrored_body() {
     assert!(
         host.iter()
             .any(|l| l.contains(&format!(" parent={parent} ")))
-            && host.iter().any(|l| l.contains(" op_by=s-edgeqzp6 ")),
+            && host.iter().any(|l| l.contains(" op_by=tedgeqzp600 ")),
         "PRECONDITION: the log holds both locally: {host:#?}"
     );
     let head = log.ms_head();
@@ -1734,7 +1734,7 @@ fn no_parent_sid_and_no_opener_reach_a_mirrored_body() {
         .filter(|b| b.starts_with("v=2 "))
         .collect();
     for b in &bodies {
-        for leak in ["parent=", parent, "op_by=", "s-edgeqzp6"] {
+        for leak in ["parent=", parent, "op_by=", "tedgeqzp600"] {
             assert!(!b.contains(leak), "{leak} crossed: {b}");
         }
     }
@@ -2147,7 +2147,7 @@ fn the_faces_one_pass_opens_are_counted_against_the_reserve_together() {
     let reserve = max / 4;
     let (_broker, _server) = seeded_broker(&lane, &mut bridge, &[], &[], max - reserve - 1);
     bridge.mirror = Some(MirrorRun::acked_for_tests(&bridge.state, 8));
-    for sid in ["s-a", "s-b"] {
+    for sid in ["ta000000000", "tb000000000"] {
         let mut log = opened_log();
         log.mark(
             Mark::new(Kind::Seen, Src::Status, Conf::Strong),
@@ -2837,11 +2837,11 @@ fn a_batch_owed_its_re_pin_sends_no_slot_at_its_old_sequence() {
 /// With the mirror off, the loop's park is judged before the round settles owed acks.
 #[test]
 fn with_the_mirror_off_the_park_is_judged_before_the_rounds_settle() {
-    let (lane, mut bridge, _server) = rig_with_broker(&[(1, "s-a"), (2, "s-b")]);
+    let (lane, mut bridge, _server) = rig_with_broker(&[(1, "ta000000000"), (2, "tb000000000")]);
     assert!(bridge.mirror.is_none() && !bridge.mirror_engaged());
     bridge.refresh_sessions().unwrap();
     *lane.outbox.lock().unwrap() =
-        Some("post sid=s-a id=1 to=@s-b kind=ask dl=1 len=4\nping".to_string());
+        Some("post sid=ta000000000 id=1 to=@tb000000000 kind=ask dl=1 len=4\nping".to_string());
     bridge.in_round = true;
     bridge.drain_outbox();
     bridge.in_round = false;
@@ -2868,7 +2868,7 @@ fn with_the_mirror_off_the_park_is_judged_before_the_rounds_settle() {
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.starts_with("outbox sent s-a 1 off="))
+            .any(|l| l.starts_with("outbox sent ta000000000 1 off="))
         {
             if Instant::now() >= give_up {
                 return false;
@@ -3074,7 +3074,7 @@ fn a_second_dedup_at_an_offset_the_face_does_not_hold_is_a_collision() {
     let (producer, node) = (first.producer_id, first.node.clone());
     let (next_lane, mut next) = successor(&lane, first, &socket);
     let (mut god, _) = next.connect().unwrap();
-    let elsewhere = subject::session_face("f", &node, "s-other", "ev");
+    let elsewhere = subject::session_face("f", &node, "t0ther00000", "ev");
     let (foreign, _) = god
         .publish(producer, pseq, &elsewhere, b"v=1 t=1 ev=foreign")
         .unwrap();
@@ -3155,6 +3155,55 @@ fn a_move_before_the_hello_drops_the_batch_of_the_pin_on_disk() {
             (back.inc, back.total, back.key),
             (3, 4096, Some([7; 16])),
             "{mode:?}: the incarnation, the total and the key stay"
+        );
+    }
+}
+
+/// A MOVE ON A PIN ALREADY EMPTY WRITES IT ON THE MEDIA AGAIN (hostile review of
+/// ATERM-KI-1111-4's seed 355 fix): a write under the pin's fence (a pruned window, a cleared
+/// batch) may have emptied it, and the version a power cut brings back can still hold the old
+/// log's window ledger, under the new log's witness the window budget's stall of seed 355.
+/// So the drop flushes the empty pin before the attach moves the witness, whether or not a
+/// mirror judged it into memory. NC (run): the drop that returned on an empty pin on disk
+/// flushed nothing here.
+#[test]
+fn a_move_on_an_empty_pin_writes_it_on_the_media() {
+    for mode in [crate::mirror::LogMode::Auto, crate::mirror::LogMode::Off] {
+        let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
+        let pin = crate::mirror::Pin {
+            inc: 3,
+            total: 4096,
+            key: Some([7; 16]),
+            win: Vec::new(),
+            slots: Vec::new(),
+        };
+        bridge.state.set_logpin(&pin.render()).unwrap();
+        // The second write is under the fence the first made: not on the media.
+        let before = bridge.state.ops();
+        bridge.state.set_logpin(&pin.render()).unwrap();
+        assert_eq!(
+            (bridge.state.ops() - before).fsyncs,
+            0,
+            "{mode:?}: a write under the fence"
+        );
+        bridge.mirror = MirrorRun::new(mode, &bridge.state, Instant::now(), || None);
+        let before = bridge.state.ops();
+        bridge.mirror_forget_log().unwrap();
+        assert!(
+            (bridge.state.ops() - before).fsyncs > 0,
+            "{mode:?}: the empty pin is flushed before the witness moves"
+        );
+        let back = crate::mirror::Pin::parse(&bridge.state.logpin().unwrap().unwrap()).unwrap();
+        assert_eq!(
+            (
+                back.inc,
+                back.total,
+                back.key,
+                back.win.len(),
+                back.slots.len()
+            ),
+            (3, 4096, Some([7; 16]), 0, 0),
+            "{mode:?}: the pin is unchanged"
         );
     }
 }

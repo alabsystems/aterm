@@ -6,6 +6,83 @@
 
 use super::*;
 
+/// Classify a matched span: 1 for an ASCII URL scheme or www. host, 2 for a
+/// path, and 3 for other text. Prefix checks borrow the input without changing
+/// the returned spelling or allocating a lowercase copy.
+pub(crate) fn classify(s: &str) -> u8 {
+    if ["http://", "https://", "ftp://", "file://", "www."]
+        .iter()
+        .any(|prefix| {
+            s.get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        })
+    {
+        return 1;
+    }
+    if s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with("~/")
+        || (s.contains('/') && !s.contains("://"))
+    {
+        return 2;
+    }
+    3
+}
+
+/// Encode only actual wide heads, retaining the host's full-width marker string.
+#[inline]
+fn row_export_widths(cols: usize, cells: &[aterm_core::grid::Cell]) -> Option<String> {
+    let mut widths: Option<String> = None;
+    // The occupied prefix covers every wide head. Blank viewport padding
+    // needs narrow markers only when a width string is actually exported.
+    for (col, cell) in cells.iter().take(cols).enumerate() {
+        let wide = cell.is_wide();
+        if wide && widths.is_none() {
+            let mut encoded = String::with_capacity(cols);
+            encoded.extend(std::iter::repeat_n('1', col));
+            widths = Some(encoded);
+        }
+        if let Some(encoded) = &mut widths {
+            encoded.push(if wide { '2' } else { '1' });
+        }
+    }
+    if let Some(encoded) = &mut widths {
+        encoded.extend(std::iter::repeat_n('1', cols - encoded.len()));
+    }
+    widths
+}
+
+/// A live Row supplies one coherent metadata read; history keeps its viewport projection.
+#[inline]
+fn row_export_layout(
+    grid: &aterm_core::grid::Grid,
+    row_index: u16,
+    cols: usize,
+) -> (bool, usize, Option<String>) {
+    if grid.display_offset() == 0 {
+        if let Some(row) = grid.row(row_index) {
+            let len = usize::from(row.len());
+            let widths = if row
+                .flags()
+                .contains(aterm_core::grid::row::RowFlags::HAS_WIDE_CHARS)
+            {
+                let view = grid.visible_row_view(row_index);
+                row_export_widths(cols, view.cells_slice())
+            } else {
+                None
+            };
+            return (row.is_wrapped(), len, widths);
+        }
+    }
+    // Missing rows and scrolled history retain the existing view-aware fallback,
+    // including the column count used when row length is unavailable.
+    let wrapped = grid.row_is_wrapped(row_index).unwrap_or(false);
+    let len = grid.row_len(row_index).map_or(cols, usize::from);
+    let view = grid.visible_row_view(row_index);
+    (wrapped, len, row_export_widths(cols, view.cells_slice()))
+}
+
 /// Convert a display-relative row into a terminal-relative row.
 #[inline]
 fn display_row_to_terminal(term: &Terminal, display_row: i32) -> i32 {
@@ -152,14 +229,24 @@ macro_rules! bind {
 
             /// Drain pending OSC app events as a JSON array of `[code, payload]` pairs.
             pub fn take_osc_events(&mut self) -> Option<String> {
+                use std::fmt::Write as _;
+
                 if !self.term.has_osc_events() {
                     return None;
                 }
-                let mut pairs = Vec::new();
-                while let Some((code, payload)) = self.term.take_osc_event() {
-                    pairs.push(format!("[{code},{}]", json_string(&payload)));
+                let mut out = String::from("[");
+                for (i, (code, payload)) in
+                    std::iter::from_fn(|| self.term.take_osc_event()).enumerate()
+                {
+                    if i != 0 {
+                        out.push(',');
+                    }
+                    write!(out, "[{code},").expect("writing into a String cannot fail");
+                    write_json_string(&mut out, &payload);
+                    out.push(']');
                 }
-                Some(format!("[{}]", pairs.join(",")))
+                out.push(']');
+                Some(out)
             }
 
             /// Display-relative cursor column (0-based).
@@ -206,12 +293,31 @@ macro_rules! bind {
 
             /// Grapheme cluster text at display cell `(row, col)` (empty for blank/spacer/out-of-range).
             pub fn cell_text(&self, row: u16, col: u16) -> String {
+                if self.term.grid().display_offset() == 0 {
+                    return self
+                        .term
+                        .display_cell_grapheme(usize::from(row), usize::from(col))
+                        .unwrap_or_default();
+                }
                 self.with_display_row_cell(row, col, |(text, _)| text.clone())
                     .unwrap_or_default()
             }
 
             /// Whether display cell `(row, col)` is a double-width character (`None` if out of range).
             pub fn cell_is_wide(&self, row: u16, col: u16) -> Option<bool> {
+                let grid = self.term.grid();
+                if row >= grid.rows() || col >= grid.cols() {
+                    return None;
+                }
+                // Live metadata needs no grapheme strings. History retains the
+                // row cache so a per-column walk materializes that row only once.
+                if grid.display_offset() == 0 {
+                    return Some(
+                        grid.visible_row_view(row)
+                            .cell(col)
+                            .is_some_and(|cell| cell.is_wide()),
+                    );
+                }
                 self.with_display_row_cell(row, col, |(_, wide)| *wide)
             }
 
@@ -635,13 +741,20 @@ macro_rules! bind {
                 let block = self.term.last_completed_block()?;
                 match self.term.block_output_text(block) {
                     BlockText::Text(text) => {
-                        let exit = block
-                            .exit_code
-                            .map_or_else(|| "null".to_owned(), |c| c.to_string());
-                        Some(format!(
-                            "{{\"status\":\"ok\",\"text\":{},\"exitCode\":{exit}}}",
-                            json_string(&text)
-                        ))
+                        use std::fmt::Write as _;
+
+                        let mut out = String::with_capacity(text.len().saturating_add(48));
+                        out.push_str(r#"{"status":"ok","text":"#);
+                        write_json_string(&mut out, &text);
+                        out.push_str(r#","exitCode":"#);
+                        match block.exit_code {
+                            Some(exit) => {
+                                write!(out, "{exit}").expect("writing into a String cannot fail");
+                            }
+                            None => out.push_str("null"),
+                        }
+                        out.push('}');
+                        Some(out)
                     }
                     BlockText::Evicted => Some("{\"status\":\"evicted\"}".to_owned()),
                     BlockText::NotAvailable => None,
@@ -822,6 +935,8 @@ macro_rules! bind {
 
             /// Export `count` display rows from `first_row` as a JSON array of `{text, wrapped, len, widths?}`.
             pub fn row_range_json(&self, first_row: u32, count: u32) -> Option<String> {
+                use std::fmt::Write as _;
+
                 let rows = u32::try_from(self.rows).unwrap_or(u32::MAX);
                 let cols = self.cols;
                 let end = first_row.checked_add(count)?;
@@ -835,36 +950,15 @@ macro_rules! bind {
                     }
                     let row_u16 = u16::try_from(y).ok()?;
                     let text = self.term.display_row_text(y as usize).unwrap_or_default();
-                    let wrapped = self.term.grid().row_is_wrapped(row_u16).unwrap_or(false);
-                    let len = self
-                        .term
-                        .grid()
-                        .row_len(row_u16)
-                        .map_or(self.cols, usize::from);
-                    let view = self.term.grid().visible_row_view(row_u16);
-                    let mut widths = String::with_capacity(cols);
-                    let mut any_wide = false;
-                    for col in 0..cols {
-                        let wide = u16::try_from(col)
-                            .ok()
-                            .and_then(|c| view.cell(c))
-                            .is_some_and(|c| c.is_wide());
-                        if wide {
-                            widths.push('2');
-                            any_wide = true;
-                        } else {
-                            widths.push('1');
-                        }
-                    }
+                    let (wrapped, len, widths) = row_export_layout(self.term.grid(), row_u16, cols);
                     out.push_str("{\"text\":");
-                    out.push_str(&json_string(&text));
+                    write_json_string(&mut out, &text);
                     out.push_str(",\"wrapped\":");
                     out.push_str(if wrapped { "true" } else { "false" });
-                    out.push_str(",\"len\":");
-                    out.push_str(&len.to_string());
-                    if any_wide {
+                    write!(out, ",\"len\":{len}").expect("writing into a String cannot fail");
+                    if let Some(widths) = widths {
                         out.push_str(",\"widths\":");
-                        out.push_str(&json_string(&widths));
+                        write_json_string(&mut out, &widths);
                     }
                     out.push('}');
                 }
@@ -885,46 +979,51 @@ macro_rules! bind {
                 if query.is_empty() {
                     return empty();
                 }
-                let (matches, total, incomplete) = {
-                    let Ok(results) =
-                        self.term
-                            .search_summary_results(query, case_sensitive, is_regex)
-                    else {
-                        return empty();
-                    };
-                    let total = results.matches.len();
-                    let cap = if max_matches == 0 {
-                        total
-                    } else {
-                        (max_matches as usize).min(total)
-                    };
-                    let matches: Vec<(u64, usize, usize)> = results.matches[..cap]
-                        .iter()
-                        .map(|m| (m.line as u64, m.start_col, m.len()))
-                        .collect();
-                    (matches, total, results.incomplete)
+                use std::fmt::Write as _;
+
+                let Ok(results) = self
+                    .term
+                    .search_summary_results(query, case_sensitive, is_regex)
+                else {
+                    return empty();
+                };
+                let total = results.matches.len();
+                let cap = if max_matches == 0 {
+                    total
+                } else {
+                    (max_matches as usize).min(total)
                 };
                 let mut out = String::from("{\"matches\":[");
-                for (i, (abs, col, len)) in matches.iter().enumerate() {
+                // Matches are row ordered. Retain only the current row's encoded snippet,
+                // so many hits on one row do not repeatedly extract and escape its text.
+                let mut snippet: Option<(u64, String)> = None;
+                for (i, m) in results.matches[..cap].iter().enumerate() {
                     if i != 0 {
                         out.push(',');
                     }
-                    let snippet = self.term.abs_row_text(*abs).unwrap_or_default();
-                    out.push_str("{\"absRow\":");
-                    out.push_str(&abs.to_string());
-                    out.push_str(",\"col\":");
-                    out.push_str(&col.to_string());
-                    out.push_str(",\"len\":");
-                    out.push_str(&len.to_string());
-                    out.push_str(",\"snippet\":");
-                    out.push_str(&json_string(&snippet));
+                    let abs = m.line as u64;
+                    if snippet.as_ref().map(|(row, _)| *row) != Some(abs) {
+                        let text = self.term.abs_row_text(abs).unwrap_or_default();
+                        snippet = Some((abs, json_string(&text)));
+                    }
+                    write!(
+                        out,
+                        "{{\"absRow\":{abs},\"col\":{},\"len\":{},\"snippet\":",
+                        m.start_col,
+                        m.len()
+                    )
+                    .expect("writing into a String cannot fail");
+                    if let Some((_, encoded)) = &snippet {
+                        out.push_str(encoded);
+                    }
                     out.push('}');
                 }
-                out.push_str("],\"total\":");
-                out.push_str(&total.to_string());
-                out.push_str(",\"incomplete\":");
-                out.push_str(if incomplete { "true" } else { "false" });
-                out.push('}');
+                write!(
+                    out,
+                    "],\"total\":{total},\"incomplete\":{}}}",
+                    results.incomplete
+                )
+                .expect("writing into a String cannot fail");
                 Some(out)
             }
         }

@@ -345,8 +345,6 @@ struct Stamp {
 }
 
 /// `file`'s [`Stamp`], `None` where its metadata cannot be read (the file missing included).
-/// Named apart from the lock-taking `stamp`s the lock-order census, which resolves a call by its
-/// name, would take a call to it for (`aterm_uds::exitwatch`'s, `aterm-gui`'s `app_nudge`'s):
 /// [`LocalLog::keys`] calls it with its verdict's lock held.
 fn metadata_stamp(file: &Path) -> Option<Stamp> {
     let meta = std::fs::symlink_metadata(file).ok()?;

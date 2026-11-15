@@ -333,7 +333,7 @@ pub fn pack_build(ctx: &Ctx, program: &str, dir: &Path, compiler_moved: bool) ->
                 "{staging} does not list for this identity — a private repo answers 404 to a \
                  token that cannot see it, so a build number published there would read as \
                  free. The staging owner's token ({}) must see it",
-                ctx.shown(&ctx.tokens.staging)
+                ctx.shown_token(&ctx.tokens.staging)
             )));
         }
         Err(e) => {
@@ -370,10 +370,15 @@ pub fn pack_build(ctx: &Ctx, program: &str, dir: &Path, compiler_moved: bool) ->
 /// An invalid native source origin returns before any compiler probe or payload scan.
 #[must_use]
 pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight {
+    let keyed = crate::identity::keyed(ctx);
     let mut pf = Preflight {
-        have_key: ctx.identity.key.is_file(),
+        have_key: matches!(keyed, Ok(true)),
         ..Preflight::default()
     };
+    if let Err(why) = keyed {
+        pf.problems
+            .push(format!("this Mac's signing key cannot be read: {why}"));
+    }
     if !gh_serves(ctx, HostRole::Staging)
         && let Err(why) =
             crate::git::source_with_origin(&req.trust_repo, &ctx.staging_slug("trust"))
@@ -665,8 +670,8 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
     if upload {
         if !pf.have_key {
             pf.problems.push(format!(
-                "--stage-upload needs a rostered machine key at {} (this box has none: stage here, \
-                 sign and upload on a rostered machine)",
+                "--stage-upload needs a rostered machine key, the store's release ring or {} \
+                 (this box has neither: stage here, sign and upload on a rostered machine)",
                 ctx.shown(&ctx.identity.key)
             ));
         }
@@ -684,21 +689,21 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
             match ctx.usable_token(&ctx.tokens.staging) {
                 Ok(true) => {}
                 Ok(false) => pf.problems.push(format!(
-                    "--stage-upload needs the staging owner's token at {} (every pack is uploaded to {} \
+                    "--stage-upload needs the staging owner's token, {} (every pack is uploaded to {} \
                  first, and a write never goes anonymously)",
-                    ctx.shown(&ctx.tokens.staging),
+                    ctx.shown_token(&ctx.tokens.staging),
                     ctx.accounts.staging
                 )),
                 Err(why) => pf.problems.push(format!(
-                    "--stage-upload needs the staging owner's token at {}: {why}",
-                    ctx.shown(&ctx.tokens.staging)
+                    "--stage-upload needs the staging owner's token, {}: {why}",
+                    ctx.shown_token(&ctx.tokens.staging)
                 )),
             }
         }
     } else if !pf.have_key {
         pf.notes.push(format!(
-            "no machine key at {}: the packs are STAGED UNSIGNED and no index is signed; a \
-             rostered machine signs and uploads",
+            "no machine key (the store holds no release ring, and none is at {}): the packs are \
+             STAGED UNSIGNED and no index is signed; a rostered machine signs and uploads",
             ctx.shown(&ctx.identity.key)
         ));
     }
@@ -970,6 +975,7 @@ pub fn publish_group(
                 upload,
                 env: Vec::new(),
                 build_within: None,
+                build_queue: None,
             },
         )?;
         builds.insert(program.clone(), outcome.build);

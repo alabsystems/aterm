@@ -130,7 +130,7 @@ fn produced_envelopes_bind_exact_registration_kind_and_real_phase_ordinal() {
 fn role7_cannot_enter_legacy_proxy_or_fabricate_new_cpu_gnu_or_query_authority() {
     let request = request();
     assert!(!request.member.role.is_proxy_member());
-    assert!(Call::Member(request.member.clone()).encode().is_err());
+    assert!(Call::Member(Box::new(request.member.clone())).encode().is_err());
     assert!(
         crate::accounting::AccountedRequest {
             request: request.member.clone(),

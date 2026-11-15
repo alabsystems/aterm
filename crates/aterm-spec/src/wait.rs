@@ -67,6 +67,175 @@ pub fn until_within<T>(budget: Duration, what: &str, probe: impl FnMut() -> Opti
     }
 }
 
+/// How a wait on a working process ended without its answer ([`within_while_working`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unanswered {
+    /// The process and its descendants used no CPU and did no I/O for a whole window: a hang.
+    Stalled,
+    /// The process is gone, and the probe still had no answer once it was.
+    Ended,
+    /// The process kept working for the whole guard and the probe never answered.
+    Guard,
+}
+
+/// How often [`within_while_working`] reads the process tree: a sweep of the process table,
+/// so not once a poll.
+const WORK_TICK: Duration = Duration::from_millis(500);
+
+/// Polls `probe` every `gap` until it returns `Some`, for as long as process `root` works:
+/// a wait for something a process must do, held to that process's progress and not to the
+/// wall clock, which a loaded machine stretches without bound. It ends unanswered only
+/// when `root` and its descendants used no CPU and did no I/O for one whole `window`
+/// ([`aterm_uds::deadline::ProcessProgressProbe`]: a starved process still advances its CPU
+/// time within any window it is scheduled in, a hung one does not), when `root` is gone and
+/// one more probe had no answer, or when `guard` passed in all (a process that works forever
+/// without the answer). A tree that does not read, or whose members changed since the last
+/// reading, is no evidence of a stall: the window opens again at the next comparable reading.
+///
+/// # Errors
+/// [`Unanswered`], naming which of the three ended the wait.
+pub fn within_while_working<T>(
+    root: u32,
+    window: Duration,
+    guard: Duration,
+    gap: Duration,
+    probe: impl FnMut() -> Option<T>,
+) -> Result<T, Unanswered> {
+    use aterm_uds::process::ProcessPresence;
+    use aterm_uds::runs::Kernel as _;
+    let kernel = aterm_uds::runs::LiveKernel;
+    let pid = i32::try_from(root).unwrap_or(0);
+    let birth = kernel.birth(pid);
+    let mut tree = aterm_uds::deadline::ProcessProgressProbe::default();
+    working(
+        window,
+        guard,
+        gap,
+        &mut Instant::now,
+        // Gone where the kernel says so, or where its pid now names a process born at another
+        // time; a reading that fails is no evidence that it ended.
+        &mut || match kernel.presence(pid) {
+            ProcessPresence::Exited | ProcessPresence::Absent => false,
+            ProcessPresence::Present | ProcessPresence::Unknown => {
+                birth.is_none() || kernel.birth(pid).is_none_or(|now| Some(now) == birth)
+            }
+        },
+        &mut || tree.read(root),
+        &mut |gap| std::thread::sleep(gap),
+        probe,
+    )
+}
+
+/// Polls `probe` every 10 ms until it returns `Some`, for as long as the processes this one
+/// started work: [`until_while_working`] for a wait on what this process's own children do (a
+/// build it runs, a helper it drives), read as its descendants' CPU and I/O without its own
+/// ([`aterm_uds::deadline::ProcessProgressProbe::read_descendants`]: the poll here is work
+/// too, and would hide a hang). Every descendant counts, so in a test binary that runs tests
+/// side by side another test's working child holds the window open; only the guard ends that.
+///
+/// # Panics
+/// Panics, naming `what` and why the wait ended, when it ends unanswered.
+#[track_caller]
+pub fn until_while_descendants_work<T>(what: &str, probe: impl FnMut() -> Option<T>) -> T {
+    let mut tree = aterm_uds::deadline::ProcessProgressProbe::default();
+    let own = std::process::id();
+    let got = working(
+        MUST_HAPPEN,
+        WORKING_GUARD,
+        UNTIL_GAP,
+        &mut Instant::now,
+        &mut || true,
+        &mut || tree.read_descendants(own),
+        &mut |gap| std::thread::sleep(gap),
+        probe,
+    );
+    match got {
+        Ok(value) => value,
+        Err(Unanswered::Stalled | Unanswered::Ended) => panic!(
+            "what this process started made no CPU or I/O progress for {MUST_HAPPEN:?} while \
+             waiting for: {what}"
+        ),
+        Err(Unanswered::Guard) => {
+            panic!("what this process started kept working for {WORKING_GUARD:?} without: {what}")
+        }
+    }
+}
+
+/// [`within_while_working`] over its seams: the clock, whether the process still runs, one
+/// reading of its tree's progress generation, and the pause between polls.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the wait's four seams beside its three bounds and its probe; a struct would only rename them"
+)]
+fn working<T>(
+    window: Duration,
+    guard: Duration,
+    gap: Duration,
+    now: &mut dyn FnMut() -> Instant,
+    runs: &mut dyn FnMut() -> bool,
+    read: &mut dyn FnMut() -> Option<u64>,
+    pause: &mut dyn FnMut(Duration),
+    mut probe: impl FnMut() -> Option<T>,
+) -> Result<T, Unanswered> {
+    let began = now();
+    let tick = WORK_TICK.min(window / 4).max(Duration::from_millis(1));
+    // The window's start: the last reading at which the tree had advanced or did not compare.
+    let mut worked_at = began;
+    let mut seen = None;
+    let mut read_at: Option<Instant> = None;
+    loop {
+        if let Some(value) = probe() {
+            return Ok(value);
+        }
+        let at = now();
+        if at.saturating_duration_since(began) >= guard {
+            return Err(Unanswered::Guard);
+        }
+        if read_at.is_none_or(|last| at.saturating_duration_since(last) >= tick) {
+            read_at = Some(at);
+            if !runs() {
+                // What it did as it ended may be the answer.
+                return probe().ok_or(Unanswered::Ended);
+            }
+            match read() {
+                Some(generation) if seen == Some(generation) => {}
+                reading => {
+                    seen = reading;
+                    worked_at = at;
+                }
+            }
+            if at.saturating_duration_since(worked_at) >= window {
+                return Err(Unanswered::Stalled);
+            }
+        }
+        pause(gap.max(Duration::from_millis(1)));
+    }
+}
+
+/// The guard of [`until_while_working`]: how long a process that keeps working may go without
+/// the answer. Not a latency budget: a stalled process is named after one [`MUST_HAPPEN`].
+pub const WORKING_GUARD: Duration = Duration::from_secs(15 * 60);
+
+/// Polls `probe` every 10 ms until it returns `Some`, for as long as process `root` works
+/// ([`within_while_working`], its window [`MUST_HAPPEN`] and its guard [`WORKING_GUARD`]).
+///
+/// # Panics
+/// Panics, naming `what` and why the wait ended, when it ends unanswered.
+#[track_caller]
+pub fn until_while_working<T>(root: u32, what: &str, probe: impl FnMut() -> Option<T>) -> T {
+    match within_while_working(root, MUST_HAPPEN, WORKING_GUARD, UNTIL_GAP, probe) {
+        Ok(value) => value,
+        Err(Unanswered::Stalled) => panic!(
+            "process {root} and its descendants made no CPU or I/O progress for \
+             {MUST_HAPPEN:?} while waiting for: {what}"
+        ),
+        Err(Unanswered::Ended) => panic!("process {root} ended while waiting for: {what}"),
+        Err(Unanswered::Guard) => {
+            panic!("process {root} kept working for {WORKING_GUARD:?} without: {what}")
+        }
+    }
+}
+
 /// Waits within [`MUST_HAPPEN`] for `stream`'s peer to close both halves
 /// ([`aterm_uds::hangup::peer_closed`]) once a test dropped the peer's end. The socket closes
 /// with the last descriptor of that end, and a child spawned while the end could still be

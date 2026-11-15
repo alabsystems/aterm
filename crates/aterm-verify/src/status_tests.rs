@@ -31,8 +31,8 @@ fn compiler_progress_is_latest_file_order_metadata_independent_of_terminal_verdi
     assert_eq!(observed.terminal_records, 0);
     let terminal = format!(
         "{}{}",
-        event(Check::Doc),
-        crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        event(Check::Census),
+        crate::report::run_event(&[result(Check::Census, Outcome::Ok)], crate::exit::PASS)
     );
     let completed = observe(&format!("{text}{terminal}"));
     let baseline = observe(&terminal);
@@ -126,8 +126,8 @@ fn unsupported_compiler_metadata_is_unprojected_and_cannot_change_finished_check
     let wire = compiler_wire("compile", false);
     let complete = format!(
         "{}{}",
-        event(Check::Doc),
-        crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        event(Check::Census),
+        crate::report::run_event(&[result(Check::Census, Outcome::Ok)], crate::exit::PASS)
     );
     let baseline = observe(&complete);
     for unsupported in [
@@ -267,8 +267,8 @@ fn changed_phase(key: &str, value: aterm_json::Value) -> String {
 fn phase_ends_reject_unsupported_payloads_without_changing_verdicts() {
     let terminal = format!(
         "{}{}",
-        event(Check::Doc),
-        crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        event(Check::Census),
+        crate::report::run_event(&[result(Check::Census, Outcome::Ok)], crate::exit::PASS)
     );
     let baseline = observe(&terminal);
     let zero = observe(&changed_phase("seconds", aterm_json::json!(0)));
@@ -277,7 +277,7 @@ fn phase_ends_reject_unsupported_payloads_without_changing_verdicts() {
         ("event", aterm_json::json!("test-phase-started")),
         ("provisional", aterm_json::json!(false)),
         ("sample_complete", aterm_json::json!(true)),
-        ("check", aterm_json::json!("doc")),
+        ("check", aterm_json::json!("census")),
         ("check", aterm_json::json!("unknown")),
         ("test_run", aterm_json::json!(0)),
         ("test_run", aterm_json::json!(-1)),
@@ -439,8 +439,8 @@ fn phase_ends_cap_keys_update_existing_and_survive_terminals_without_start_joins
     assert_eq!(observed.phase_ends[0].occurrences, 2);
     let terminal = format!(
         "{}{}",
-        event(Check::Doc),
-        crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        event(Check::Census),
+        crate::report::run_event(&[result(Check::Census, Outcome::Ok)], crate::exit::PASS)
     );
     let completed = observe(&format!("{text}{terminal}"));
     assert_eq!(completed.phase_ends, observed.phase_ends);
@@ -473,8 +473,8 @@ fn long_case_wire(test: &str, case: &str, at: u64) -> String {
 fn long_cases_are_historical_metadata_and_never_change_terminal_consistency() {
     let terminal = format!(
         "{}{}",
-        event(Check::Doc),
-        crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        event(Check::Census),
+        crate::report::run_event(&[result(Check::Census, Outcome::Ok)], crate::exit::PASS)
     );
     let wire = long_case_wire("-p fixture --lib", "t::a", 20);
     let observed = observe(&format!(
@@ -709,8 +709,8 @@ fn case_observations_keep_repeats_conflicts_and_null_or_empty_reported_names() {
 fn unsupported_case_metadata_and_running_observations_leave_terminal_consistency_unchanged() {
     let complete = format!(
         "{}{}",
-        event(Check::Doc),
-        crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        event(Check::Census),
+        crate::report::run_event(&[result(Check::Census, Outcome::Ok)], crate::exit::PASS)
     );
     let baseline = observe(&complete);
     for (key, value) in [
@@ -892,7 +892,7 @@ fn writer(head: Option<String>) -> crate::event_log::EventLog {
         crate::EnvSnapshot::default(),
         PathBuf::from("/fixture/scratch"),
     )
-    .with_checks(&[Check::Doc])
+    .with_checks(&[Check::Census])
     .with_head_at_start(head);
     let mut writer = crate::event_log::EventLog::unrecorded();
     writer.bind(crate::event_log::Context::captured(&ctx));
@@ -902,9 +902,9 @@ fn writer(head: Option<String>) -> crate::event_log::EventLog {
 #[test]
 fn ambiguous_raw_bindings_stay_globally_observed_but_unattributed() {
     let writer = writer(None);
-    let check = writer.prepare(&event(Check::Doc));
+    let check = writer.prepare(&event(Check::Census));
     let terminal = writer.prepare(&crate::report::run_event(
-        &[result(Check::Doc, Outcome::Ok)],
+        &[result(Check::Census, Outcome::Ok)],
         crate::exit::PASS,
     ));
     let value: aterm_json::Value =
@@ -948,8 +948,8 @@ fn ambiguous_raw_bindings_stay_globally_observed_but_unattributed() {
     let second = self::writer(None);
     let mixed = observe(&format!(
         "{text}{}{}\n",
-        second.prepare(&event(Check::Doc)),
-        event(Check::Doc)
+        second.prepare(&event(Check::Census)),
+        event(Check::Census)
     ));
     assert_eq!(mixed.invocations.len(), 2);
     assert_eq!(mixed.unattributed.as_ref().unwrap().checks.len(), 1);
@@ -959,8 +959,8 @@ fn ambiguous_raw_bindings_stay_globally_observed_but_unattributed() {
 fn duplicate_raw_event_headers_cannot_supply_last_winning_checks_or_terminals() {
     let writer = writer(None);
     for raw in [
-        event(Check::Doc),
-        crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS),
+        event(Check::Census),
+        crate::report::run_event(&[result(Check::Census, Outcome::Ok)], crate::exit::PASS),
     ] {
         let bound = writer.prepare(&raw);
         for (key, replacement) in [
@@ -983,7 +983,7 @@ fn duplicate_raw_event_headers_cannot_supply_last_winning_checks_or_terminals() 
 #[test]
 fn an_oversized_rejected_record_cannot_supply_attribution_and_crlf_uses_the_same_gate() {
     let writer = writer(None);
-    let bound = writer.prepare(&event(Check::Doc));
+    let bound = writer.prepare(&event(Check::Census));
     let crlf = format!("{}\r\n", bound.trim_end_matches('\n'));
     assert_eq!(observe(&crlf).invocations.len(), 1);
     let mut value: aterm_json::Value =
@@ -1006,8 +1006,8 @@ fn incomplete_overlapping_invocations_partition_by_each_event_and_leave_legacy_u
     // Neither writer needs a header for its actual check record to retain attribution.
     let text = format!(
         "{}{}{}",
-        first.prepare(&event(Check::Doc)),
-        second.prepare(&event(Check::Doc)),
+        first.prepare(&event(Check::Census)),
+        second.prepare(&event(Check::Census)),
         event(Check::Fmt)
     );
     let observed = observe(&text);
@@ -1032,18 +1032,18 @@ fn incomplete_overlapping_invocations_partition_by_each_event_and_leave_legacy_u
     let header_only = format!(
         "{}{}",
         first.prepare("verify-event: {\"schema\":1,\"event\":\"invocation-started\"}"),
-        event(Check::Doc)
+        event(Check::Census)
     );
     let observed = observe(&header_only);
     assert!(observed.invocations[0].observed.checks.is_empty());
-    assert_eq!(observed.unattributed.unwrap().checks[0].check, "doc");
+    assert_eq!(observed.unattributed.unwrap().checks[0].check, "census");
 }
 
 #[test]
 fn conflicting_source_metadata_and_partial_invalid_ids_never_become_checkout_proof() {
     let first = writer(Some("a".repeat(40)));
     let other = writer(Some("b".repeat(40)));
-    let original = first.prepare(&event(Check::Doc));
+    let original = first.prepare(&event(Check::Census));
     let mut foreign: aterm_json::Value = aterm_json::from_str(
         other
             .prepare(&event(Check::Fmt))
@@ -1105,7 +1105,7 @@ fn full_durable_file_keeps_earlier_checks_despite_later_output_volume() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let path = dir.path().join("verify.events");
     let log = crate::event_log::EventLog::open(&path).unwrap();
-    log.write(&event(Check::Doc));
+    log.write(&event(Check::Census));
     log.write(&event(Check::Lint));
     for index in 0..1100 {
         log.write(&crate::report::stage_started(index, &"stage".repeat(1000)));
@@ -1119,7 +1119,7 @@ fn full_durable_file_keeps_earlier_checks_despite_later_output_volume() {
             .iter()
             .map(|row| row.check.as_str())
             .collect::<Vec<_>>(),
-        ["doc", "lint", "test"]
+        ["census", "lint", "test"]
     );
     let mut tail = text.lines().rev().take(1000).collect::<Vec<_>>();
     tail.reverse();
@@ -1143,8 +1143,12 @@ fn legacy_incomplete_appended_runs_are_indistinguishable_from_one_run() {
     let two = dir.path().join("two.events");
     // Historical report bytes predate per-event attribution. Current EventLog writers
     // deliberately cannot reproduce this ambiguity: each now supplies its own identity.
-    std::fs::write(&one, format!("{}{}", event(Check::Doc), event(Check::Lint))).unwrap();
-    for row in [event(Check::Doc), event(Check::Lint)] {
+    std::fs::write(
+        &one,
+        format!("{}{}", event(Check::Census), event(Check::Lint)),
+    )
+    .unwrap();
+    for row in [event(Check::Census), event(Check::Lint)] {
         std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -1167,11 +1171,11 @@ fn legacy_incomplete_appended_runs_are_indistinguishable_from_one_run() {
 
 #[test]
 fn duplicates_conflicts_and_terminal_lists_do_not_become_latest_run_verdicts() {
-    let doc = result(Check::Doc, Outcome::Ok);
+    let census = result(Check::Census, Outcome::Ok);
     let complete = format!(
         "{}{}",
-        event(Check::Doc),
-        crate::report::run_event(&[doc], 0)
+        event(Check::Census),
+        crate::report::run_event(&[census], 0)
     );
     assert_eq!(
         observe(&complete).terminal_consistency,
@@ -1181,7 +1185,7 @@ fn duplicates_conflicts_and_terminal_lists_do_not_become_latest_run_verdicts() {
     assert_eq!(twice.terminal_consistency, "multiple-terminal-records");
     assert_eq!(twice.checks[0].occurrences, 2);
     let failed = crate::report::check_event(
-        &result(Check::Doc, Outcome::Fail(crate::Severity::GateFailed)),
+        &result(Check::Census, Outcome::Fail(crate::Severity::GateFailed)),
         &[],
     );
     let conflict = observe(&format!("{complete}{failed}"));
@@ -1191,7 +1195,7 @@ fn duplicates_conflicts_and_terminal_lists_do_not_become_latest_run_verdicts() {
 
 #[test]
 fn malformed_complete_and_partial_records_are_distinct_and_never_filled_in() {
-    let partial = observe(&format!("{}verify-event: {{", event(Check::Doc)));
+    let partial = observe(&format!("{}verify-event: {{", event(Check::Census)));
     assert!(partial.trailing_partial);
     assert_eq!(partial.malformed_complete_records, 0);
     let invalid = observe(
@@ -1205,7 +1209,7 @@ fn malformed_complete_and_partial_records_are_distinct_and_never_filled_in() {
 fn explicit_file_reader_needs_no_checkout_or_toolchain_and_never_runs_checks() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let path = dir.path().join("observations.events");
-    std::fs::write(&path, event(Check::Doc)).unwrap();
+    std::fs::write(&path, event(Check::Census)).unwrap();
     assert_eq!(
         crate::run_cli(
             &[

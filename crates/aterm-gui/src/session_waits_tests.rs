@@ -20,6 +20,11 @@ const CLOSE: &[u8] = b"\x1b[201~";
 
 fn app_with_reader() -> (App, Arc<SinkWriter>, UnixStream) {
     let (reader, writer) = UnixStream::pair().expect("socketpair");
+    app_over(reader, writer)
+}
+
+/// [`app_with_reader`] over a socket pair the test made.
+fn app_over(reader: UnixStream, writer: UnixStream) -> (App, Arc<SinkWriter>, UnixStream) {
     reader
         .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
         .expect("timeout");
@@ -30,6 +35,38 @@ fn app_with_reader() -> (App, Arc<SinkWriter>, UnixStream) {
         .expect("window 0")
         .window_on_screen_for_test = true;
     (app, sink, reader)
+}
+
+/// Asks `writer`'s kernel for a send buffer of `bytes` and returns the most a writer can have in
+/// flight through it, unread: twice what the kernel then reports (Linux reports twice what was
+/// asked and takes one more write past it; macOS reports what was asked).
+fn hold_in_flight(writer: &UnixStream, bytes: libc::c_int) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).expect("an int");
+    // SAFETY: a live socket, an int option's value and its exact size.
+    let set = unsafe {
+        libc::setsockopt(
+            writer.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&raw const bytes).cast(),
+            len,
+        )
+    };
+    assert_eq!(set, 0, "SO_SNDBUF: {}", std::io::Error::last_os_error());
+    let mut held: libc::c_int = 0;
+    // SAFETY: a live socket, a writable int and its exact size.
+    let got = unsafe {
+        libc::getsockopt(
+            writer.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&raw mut held).cast(),
+            &raw mut len,
+        )
+    };
+    assert_eq!(got, 0, "SO_SNDBUF: {}", std::io::Error::last_os_error());
+    2 * usize::try_from(held).expect("a buffer's size")
 }
 
 fn paste(app: &mut App, bytes: usize) {
@@ -393,48 +430,86 @@ fn a_torn_rerun_after_the_rewrap_asks_its_window_for_a_frame() {
     );
 }
 
-/// A paste wait restates its row every [`WAIT_SAMPLE`] while the paste moves, and ends it when
+/// A paste wait restates its row at each sample that finds the paste moved, and ends it when
 /// the paste is delivered. No window draws the row, so neither asks a window for a frame: not
 /// the paste's own window, and not every window at once. No Settings view is open, so no
 /// publish repaints one.
+///
+/// The test sets the pace. Before each sample the reader takes only bytes the paste has sent,
+/// until it has sent past what its row shows; the writer's socket holds a few KiB
+/// ([`hold_in_flight`]), so no move is larger and sixteen leave the paste under way. Left to
+/// the kernel's own buffer, Linux's 208 KiB wakes its writer only once the reader has drained
+/// it to a quarter: the paste moved 6 times in all, in bursts of 147,456 bytes, and a reader
+/// that sampled after each 16 KiB it read was still waiting on its sixteenth restatement when
+/// the paste ran out (Linux arm64, 2026-11-12).
 #[test]
 fn a_paste_waits_restates_and_end_ask_no_window_for_a_frame() {
-    let (mut app, sink, mut reader) = app_with_reader();
+    let (reader, writer) = UnixStream::pair().expect("socketpair");
+    let in_flight = hold_in_flight(&writer, 8 * 1024);
+    let (mut app, sink, mut reader) = app_over(reader, writer);
     let body = 1 << 20;
+    assert!(
+        17 * in_flight < body,
+        "PRECONDITION: sixteen moves of at most {in_flight} bytes leave the paste under way"
+    );
     paste(&mut app, body);
     let started = app.session_waits.pastes[&0].started;
     let mut at = started + PROGRESS_GRACE / 4;
     app.sample_session_waits(at);
     let id = app.messages.live_rows().next().expect("the paste's row").id;
     let asks = crate::frame_asks_for_test(&app);
-    let (mut samples, mut restates, mut read) = (0_u32, 0_u32, 0_usize);
+    let shown = |app: &App| {
+        app.messages
+            .live(id)
+            .and_then(|row| row.msg.meter.as_ref()?.amount)
+            .expect("the row's amount")
+            .done
+    };
+    let (mut restates, mut read) = (0_u32, 0_usize);
     let mut chunk = vec![0u8; 16 * 1024];
     let hang = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while restates < 16 {
-        assert!(
-            Instant::now() < hang,
-            "the paste restated its row 16 times in a minute ({restates} so far)"
-        );
-        reader
-            .read_exact(&mut chunk)
-            .expect("the paste's next bytes");
-        read += chunk.len();
+        let was = shown(&app);
+        loop {
+            let sent = app.session_waits.pastes[&0].amounts().0;
+            if sent > was {
+                break;
+            }
+            assert!(
+                Instant::now() < hang,
+                "the paste moved 16 times in a minute ({restates} so far)"
+            );
+            let sent = usize::try_from(sent).expect("a paste's size");
+            let unread = (sent - read).min(chunk.len());
+            if unread == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            let n = reader
+                .read(&mut chunk[..unread])
+                .expect("the bytes the paste sent");
+            assert_ne!(n, 0, "the paste's socket stays open");
+            read += n;
+        }
         let revision = app.messages.revision();
         at += WAIT_SAMPLE;
         app.sample_session_waits(at);
-        samples += 1;
-        restates += u32::from(app.messages.revision() != revision);
+        assert_ne!(
+            app.messages.revision(),
+            revision,
+            "a sample that finds the paste moved restates its row"
+        );
+        restates += 1;
     }
     assert!(
         app.messages.live(id).is_some(),
         "PRECONDITION: the paste is still under way"
     );
     let asked = crate::frame_asks_for_test(&app) - asks;
-    let waited = WAIT_SAMPLE * samples;
     assert_eq!(
         asked, 0,
-        "{restates} restatements over {samples} samples ({waited:?} of the wait at one \
-         sample per {WAIT_SAMPLE:?}) asked the windows for {asked} frames"
+        "{restates} restatements, one a sample at one sample per {WAIT_SAMPLE:?}, asked the \
+         windows for {asked} frames"
     );
     let rest = body + OPEN.len() + CLOSE.len() - read;
     let drain = std::thread::spawn(move || {

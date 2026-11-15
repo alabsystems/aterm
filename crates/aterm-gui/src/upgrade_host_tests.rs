@@ -598,7 +598,8 @@ fn a_restart_in_flight_speaks_for_its_tab_and_ends_as_went_through() {
         app.apply_agent_upgrades(vec![moving(Phase::Failed("stale-exit".to_string()))]);
         let (id, _) = row_of(&app, &sid_a).expect("its row");
         if put_down {
-            assert!(app.messages.dismiss(id, std::time::Instant::now()));
+            let wall = app.messages_wall.now();
+            assert!(app.messages.dismiss(id, wall, std::time::Instant::now()));
         }
         app.apply_agent_upgrades(with_newer(moving(Phase::Relaunched { at_s: now - 30 })));
         let column = upgrade_column(&app, a);
@@ -672,7 +673,8 @@ fn a_conversation_pending_beside_a_move_down_never_ends_its_row() {
         app.apply_agent_upgrades(vec![down.clone()]);
         let (id, _) = row_of(&app, &sid_a).expect("its row");
         if put_down {
-            assert!(app.messages.dismiss(id, std::time::Instant::now()));
+            let wall = app.messages_wall.now();
+            assert!(app.messages.dismiss(id, wall, std::time::Instant::now()));
         }
         let posted = |app: &App| app.upgrade_view.stalled.get(&sid_a).map(|p| p.id);
         app.apply_agent_upgrades(by_session(vec![down.clone(), pending.clone()]));
@@ -705,7 +707,8 @@ fn a_conversation_pending_beside_a_move_down_never_ends_its_row() {
     };
     app.apply_agent_upgrades(vec![down.clone()]);
     let (id, _) = row_of(&app, &sid_a).expect("its row");
-    assert!(app.messages.dismiss(id, std::time::Instant::now()));
+    let wall = app.messages_wall.now();
+    assert!(app.messages.dismiss(id, wall, std::time::Instant::now()));
     app.apply_agent_upgrades(vec![Row {
         session: "f000".to_string(),
         from: "2.1.282".to_string(),
@@ -1480,7 +1483,8 @@ fn a_stuck_row_put_down_ends_on_the_record_as_moving_again_never_asking() {
     app.apply_agent_upgrades(vec![stuck(a), stuck(b)]);
     let (id, _) = row_of(&app, a).expect("a restart that sticks is a row");
     assert!(row_of(&app, b).is_some(), "s-b's row too");
-    assert!(app.messages.dismiss(id, std::time::Instant::now()));
+    let wall = app.messages_wall.now();
+    assert!(app.messages.dismiss(id, wall, std::time::Instant::now()));
     app.sync_messages();
 
     let moving = |tab| at(tab, Phase::Relaunched { at_s: now });
@@ -2279,7 +2283,8 @@ fn a_refusal_the_owner_put_off_from_the_tab_menu_is_news_when_it_returns() {
     app.upgrade_view.writer = writer;
     app.apply_agent_upgrades(vec![refused("s-a")]);
     let (id, _) = row_of(&app, "s-a").expect("the refusal's row");
-    assert!(app.messages.dismiss(id, std::time::Instant::now()));
+    let wall = app.messages_wall.now();
+    assert!(app.messages.dismiss(id, wall, std::time::Instant::now()));
     app.sync_messages();
     app.apply_agent_upgrades(vec![rearmed_refused("s-a", Request::None)]);
     assert!(
@@ -2317,7 +2322,9 @@ fn a_stall_the_owner_saw_is_not_posted_again_after_a_restart() {
     first.apply_agent_upgrades(vec![refused(a), refused(b), refused(c)]);
     assert_eq!(first.messages.live_rows().count(), 3);
     let (id_a, _) = row_of(&first, a).expect("a's row");
-    assert!(first.messages.dismiss(id_a, std::time::Instant::now()));
+    let wall = first.messages_wall.now();
+    let now = std::time::Instant::now();
+    assert!(first.messages.dismiss(id_a, wall, now));
     first.sync_messages();
     first.apply_agent_upgrades(vec![refused(a), refused(b)]);
     assert!(row_of(&first, c).is_none());
@@ -2626,7 +2633,8 @@ fn a_stall_that_ended_while_its_row_was_down_is_news_when_it_returns() {
     app.apply_agent_upgrades(vec![refused(a), refused(b)]);
     for tab in [a, b] {
         let (id, _) = row_of(&app, tab).expect("a row");
-        assert!(app.messages.dismiss(id, std::time::Instant::now()));
+        let wall = app.messages_wall.now();
+        assert!(app.messages.dismiss(id, wall, std::time::Instant::now()));
     }
     app.sync_messages();
     app.apply_agent_upgrades(vec![refused(a), refused(b)]);

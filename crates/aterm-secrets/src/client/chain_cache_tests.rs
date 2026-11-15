@@ -9,6 +9,10 @@ const PREVIOUS: [u8; 32] = [33; 32];
 const OTHER: [u8; 32] = [47; 32];
 
 fn signed(previous: &[u8; 32], sequence: u64) -> Vec<u8> {
+    signed_holding(previous, sequence, b"inert encrypted fixture")
+}
+
+fn signed_holding(previous: &[u8; 32], sequence: u64, locker: &[u8]) -> Vec<u8> {
     let signer = envelope::signer_public(&SIGNER).unwrap();
     envelope::sign(
         &envelope::Unsigned {
@@ -22,7 +26,7 @@ fn signed(previous: &[u8; 32], sequence: u64) -> Vec<u8> {
             parents: Vec::new(),
             lockers: vec![envelope::Locker {
                 label: "admin".into(),
-                armored: envelope::test_armor(b"inert encrypted fixture"),
+                armored: envelope::test_armor(locker),
             }],
         },
         &SIGNER,
@@ -175,6 +179,110 @@ fn a_warm_entry_answers_exactly_as_the_reader_verification_does() {
         "the table reaches several outcomes: {outcomes:?}"
     );
     assert_eq!(cache.parses.load(Ordering::Relaxed), 3);
+}
+
+/// The law of [`verify_as_held`]: bytes that are the held entry's are verified by that entry,
+/// which parses nothing and verifies its signature once however often it is asked, and every
+/// other body is parsed and verified whole each time it is asked: a later seq, the held seq with
+/// another body of the same length, a body whose signature does not verify (refused each time),
+/// the held bytes less their last byte and the held bytes with a line after them (each refused
+/// each time: neither is an envelope, though one is a prefix of the held bytes and the other
+/// begins with them), and any body where no entry is held. Each answer is the one
+/// [`envelope::verify_for_reader`] gives of those bytes, and none of the bodies becomes an entry
+/// of the process's cache. Counted, never timed.
+///
+/// Negative controls: find no entry (`held.filter(|_| false)`): the 16 asks of the held bytes
+/// are each verified whole (`left: [0, 16, 16, 16]`, `right: [16, 0, 0, 0]`); take the entry for
+/// any body of its length (`held.filter(|held| held.bytes().len() == bytes.len())`): the later
+/// version is answered as the held bytes (`left: Ok((11, <the held digest>, Rotated(..)))`,
+/// `right: Ok((12, <its own>, Rotated(..)))`); take the entry for a body that is a prefix of
+/// its bytes or begins with them (`held.filter(|held| held.bytes().starts_with(bytes) ||
+/// bytes.starts_with(held.bytes()))`): the held bytes less their last byte are answered as the
+/// held bytes (`left: Ok((11, <the held digest>, Rotated(..)))`, `right: Err(.. "envelope: does
+/// not end with LF" ..)`); keep each body verified whole
+/// (`CACHE.parsed(SecretBytes::from(bytes), None)` in the whole arm): each is parsed once more
+/// (`left: [16, 10, 10, 15]`, `right: [16, 10, 10, 10]`), and kept from a thread that works for
+/// no pass, where no count sees the parse, a body is an entry
+/// (`assertion failed: !keeps(body)`).
+#[test]
+fn only_the_held_bytes_are_verified_by_the_held_entry() {
+    use crate::pass_counts::{self, Count, PassCounts};
+    let cache = Cache::new();
+    let held_bytes = signed(&PREVIOUS, 11);
+    let later = signed(&PREVIOUS, 12);
+    let other_body = signed_holding(&PREVIOUS, 11, b"inert encrypted fixturE");
+    assert_eq!(other_body.len(), held_bytes.len());
+    assert_ne!(other_body, held_bytes);
+    let forged = String::from_utf8(held_bytes.clone())
+        .unwrap()
+        .replace("seq: 11\n", "seq: 12\n")
+        .into_bytes();
+    // The length half of "exactly these bytes": one byte short, and one line long.
+    let short = held_bytes[..held_bytes.len() - 1].to_vec();
+    let long = [&held_bytes[..], b"x\n"].concat();
+    let previous = envelope::signer_public(&PREVIOUS).unwrap();
+    let reader = Reader {
+        name: "chain-cache",
+        pin: &previous,
+        followed: &[],
+        floor: None,
+    };
+    let whole = |bytes: &[u8]| {
+        envelope::verify_for_reader(bytes, reader.name, reader.pin, reader.followed, None)
+            .map(|(envelope, pin, _)| (envelope.seq, envelope.digest(), pin))
+    };
+    let others = [&later, &other_body, &forged, &short, &long];
+    let wants: Vec<_> = [&[&held_bytes][..], &others[..]]
+        .concat()
+        .into_iter()
+        .map(|bytes| whole(bytes))
+        .collect();
+    assert!(wants[..3].iter().all(Result::is_ok), "{wants:?}");
+    assert!(wants[3..].iter().all(Result::is_err), "{wants:?}");
+    let entry = cache.parsed(secret(&held_bytes), None);
+
+    let counts = Arc::new(PassCounts::default());
+    let metered = pass_counts::metered(&counts);
+    let ask = |held: Option<&Parsed>, bytes: &[u8]| {
+        verify_as_held(
+            held,
+            bytes,
+            reader,
+            (Count::MemoProbe, Count::FreshProbe),
+            |envelope, pin| (envelope.seq, envelope.digest(), pin),
+        )
+    };
+    let read = || {
+        [
+            Count::MemoProbe,
+            Count::FreshProbe,
+            Count::Verifies,
+            Count::Parses,
+        ]
+        .map(|what| counts.get(what))
+    };
+    for _ in 0..16 {
+        assert_eq!(ask(Some(&entry), &held_bytes), wants[0]);
+    }
+    assert_eq!(read(), [16, 0, 0, 0]);
+    assert_eq!(entry.signature_checks(), 1);
+    for (bytes, want) in others.into_iter().zip(&wants[1..]) {
+        for _ in 0..2 {
+            assert_eq!(&ask(Some(&entry), bytes), want);
+        }
+    }
+    assert_eq!(read(), [16, 10, 10, 10]);
+    // No entry held: the held bytes are any bytes.
+    assert_eq!(ask(None, &held_bytes), wants[0]);
+    assert_eq!(read(), [16, 11, 11, 11]);
+    drop(metered);
+    // The entry was asked for its own bytes only, and no body became an entry of the process's
+    // cache, which is the one a verification could have kept it in (no other test parses these
+    // bodies into it: they are this file's, and its other laws use caches of their own).
+    assert_eq!(entry.signature_checks(), 1);
+    for body in others {
+        assert!(!keeps(body));
+    }
 }
 
 fn charged(cache: &Cache) -> usize {

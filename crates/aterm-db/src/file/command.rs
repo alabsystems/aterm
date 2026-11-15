@@ -4,7 +4,8 @@
 //! `aterm file` (docs/DESIGN-shared-files-2026-11-11.md §3): the read verbs and `outbox` are
 //! `aterm_file::cli`'s, which cannot open custody because their crate cannot reach this one;
 //! `refresh` is here, beside the materializer it runs, and the write verbs (`set`, `add`, `rm`,
-//! `revert`, `resolve`) beside the publisher they give two seconds ([`super::write`]).
+//! `revert`, `resolve`) beside the publisher they give two seconds (the private `write`
+//! module, which [`main_entry`] alone runs: each makes an owner act).
 
 use super::{
     materialize::{self, Outcome, Pass},
@@ -208,7 +209,12 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             json,
             stdin: stdin.as_deref(),
         };
-        return match write::verb(&paths, &config, &rest, &env) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the explicit `aterm file` verb: set, add, rm, revert and resolve"
+        )]
+        let said = write::verb(&paths, &config, &rest, &env);
+        return match said {
             Ok((text, code)) => aterm_uds::stdout::answer_exit(VERB, &text, code),
             Err(write::Refusal::Usage(why)) => usage(&why),
             Err(write::Refusal::Problem(why)) => {

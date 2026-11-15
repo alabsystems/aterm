@@ -87,7 +87,7 @@ pub(super) fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
             wall: "019a4b54-5fa2-7123-8123-123456789abc".into(),
             identity: Identity::from_native("account", "user"),
         },
-        sid: "s-fixture".into(),
+        sid: "t000fjxtvre".into(),
         old_pid: 10,
         old_birth: 11,
         claim_revision: 3,

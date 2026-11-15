@@ -13,6 +13,8 @@ use crate::error::{Error, Result};
 /// Container recursion threshold (`128`, matching `serde_json`); at most `127` nested containers are accepted.
 pub const RECURSION_LIMIT: u32 = 128;
 
+const RETAINED_VALUE_COST: usize = 64;
+
 /// One step in a typed path through a JSON document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathSegment<'a> {
@@ -30,6 +32,7 @@ pub struct Deserializer<'de> {
     /// Refuse an integer literal too wide for `u64`/`i64` instead of widening
     /// it to `f64`.
     exact_integers: bool,
+    retained_budget: Option<usize>,
 }
 
 impl<'de> Deserializer<'de> {
@@ -42,6 +45,7 @@ impl<'de> Deserializer<'de> {
             pos: 0,
             depth: 0,
             exact_integers: false,
+            retained_budget: None,
         }
     }
 
@@ -60,6 +64,17 @@ impl<'de> Deserializer<'de> {
 
     fn eof(&self) -> Error {
         self.err("unexpected end of JSON input")
+    }
+
+    fn retain(&mut self, cost: usize) -> Result<()> {
+        if let Some(remaining) = self.retained_budget {
+            self.retained_budget = Some(
+                remaining
+                    .checked_sub(cost)
+                    .ok_or_else(|| self.err("retained JSON data exceeds its budget"))?,
+            );
+        }
+        Ok(())
     }
 
     #[inline]
@@ -139,6 +154,13 @@ impl<'de> Deserializer<'de> {
     /// Parse a string body, the opening quote already consumed.
     fn parse_string_body(&mut self) -> Result<Cow<'de, str>> {
         let start = self.pos;
+        if self.retained_budget.is_some() {
+            // Validate and charge before an escaped string can allocate. The
+            // decoded UTF-8 is never longer than its JSON source spelling.
+            self.skip_string_body()?;
+            self.retain(self.pos - start)?;
+            self.pos = start;
+        }
         loop {
             let Some(byte) = self.peek() else {
                 return Err(self.eof());
@@ -198,14 +220,15 @@ impl<'de> Deserializer<'de> {
 
     /// Validate a discarded string without allocating its decoded contents.
     fn skip_string_body(&mut self) -> Result<()> {
+        let input = self.input;
         let mut chunk = self.pos;
         loop {
-            let Some(byte) = self.peek() else {
+            let Some(byte) = input.get(self.pos).copied() else {
                 return Err(self.eof());
             };
             match byte {
                 b'"' | b'\\' => {
-                    let raw = self.input.get(chunk..self.pos).unwrap_or(&[]);
+                    let raw = input.get(chunk..self.pos).unwrap_or(&[]);
                     if core::str::from_utf8(raw).is_err() {
                         return Err(self.err("invalid UTF-8 in string"));
                     }
@@ -374,6 +397,7 @@ impl<'de> Deserializer<'de> {
     /// Note that `i128` targets go through [`Self::deserialize_wide`], which accepts `-0` as `0` before [`Self::dispatch`].
     fn visit_number<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
         let parsed = self.parse_number()?;
+        self.retain(parsed.text.len())?;
         Self::dispatch(parsed.value, visitor)
     }
 
@@ -402,6 +426,7 @@ impl<'de> Deserializer<'de> {
     /// the generic path so the visitor reports the type error itself.
     fn deserialize_integer<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value> {
         if matches!(self.peek_value()?, b'-' | b'0'..=b'9') {
+            self.retain(RETAINED_VALUE_COST)?;
             self.visit_number(visitor)
         } else {
             serde::de::Deserializer::deserialize_any(&mut *self, visitor)
@@ -416,6 +441,7 @@ impl<'de> Deserializer<'de> {
             return serde::de::Deserializer::deserialize_any(&mut *self, visitor);
         }
         let parsed = self.parse_number()?;
+        self.retain(RETAINED_VALUE_COST.saturating_add(parsed.text.len()))?;
         if !parsed.floating {
             if signed {
                 if let Ok(wide) = parsed.text.parse::<i128>() {
@@ -631,6 +657,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.retain(RETAINED_VALUE_COST)?;
         match self.peek_value()? {
             b'n' => {
                 self.literal(b"null", "null")?;
@@ -685,6 +712,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.retain(RETAINED_VALUE_COST)?;
         if self.peek_value()? == b'n' {
             self.literal(b"null", "null")?;
             visitor.visit_none()
@@ -694,6 +722,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     }
 
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.retain(RETAINED_VALUE_COST)?;
         self.peek_value()?;
         self.literal(b"null", "null")?;
         visitor.visit_unit()
@@ -734,6 +763,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value> {
+        self.retain(RETAINED_VALUE_COST)?;
         match self.peek_value()? {
             b'"' => {
                 self.bump();
@@ -824,6 +854,9 @@ impl<'de> de::SeqAccess<'de> for SeqAccess<'_, 'de> {
         } else {
             return Err(self.de.err("expected `,` or `]`"));
         }
+        // Even an ignored child can produce a sized wrapper with defaulted
+        // fields. Bound the retained sequence length before calling its seed.
+        self.de.retain(RETAINED_VALUE_COST)?;
         seed.deserialize(&mut *self.de).map(Some)
     }
 }
@@ -867,6 +900,7 @@ impl<'de> de::MapAccess<'de> for MapAccess<'_, 'de> {
 impl<'de> Deserializer<'de> {
     /// The object key or variant name at the cursor, ready for its seed.
     fn key(&mut self) -> Result<TextKeyDeserializer<Key<'de>>> {
+        self.retain(RETAINED_VALUE_COST)?;
         self.expect(b'"', "an object key")?;
         let text = self.parse_string_body()?;
         Ok(TextKeyDeserializer::new(Key { text }))
@@ -961,6 +995,28 @@ impl<'de> de::VariantAccess<'de> for EnumAccess<'_, 'de> {
 #[inline]
 pub fn from_slice<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<T> {
     let mut de = Deserializer::from_slice(input);
+    let value = T::deserialize(&mut de)?;
+    de.end()?;
+    Ok(value)
+}
+
+/// Deserializes with a budget for data delivered to `T`: 64 units per value
+/// visit (including option wrappers), array element, and object key, plus the
+/// source bytes of retained strings and numbers.
+/// Ignored values are validated in full without spending this budget.
+///
+/// This bounds the amount of JSON a normal typed visitor can materialize;
+/// it does not limit allocations a custom `Deserialize` implementation makes
+/// independently of its input. Recursion remains bounded by [`RECURSION_LIMIT`].
+///
+/// # Errors
+/// The failures of [`from_slice`], or retained data exceeding `budget`.
+pub fn from_slice_with_budget<'de, T: serde::Deserialize<'de>>(
+    input: &'de [u8],
+    budget: usize,
+) -> Result<T> {
+    let mut de = Deserializer::from_slice(input);
+    de.retained_budget = Some(budget);
     let value = T::deserialize(&mut de)?;
     de.end()?;
     Ok(value)

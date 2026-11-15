@@ -6,7 +6,6 @@
 pub mod approvals;
 pub mod background;
 pub mod blocks;
-pub mod classify;
 pub mod config;
 pub mod custody;
 #[cfg(any(test, debug_assertions))]
@@ -16,7 +15,6 @@ pub mod facts_offer;
 #[cfg(any(test, debug_assertions))]
 mod facts_offer_environment;
 pub(crate) mod fx;
-pub mod ladder;
 pub use aterm_phase::{phase, prompt};
 pub mod journal;
 pub mod ledger;
@@ -36,8 +34,7 @@ pub mod transport;
 
 pub use background::{BackgroundCall, BackgroundEvidence};
 pub use blocks::View;
-pub use classify::{DEFAULT_PYTHON_ALLOW, classify_command_with};
-pub use config::{Autopilot, LandAt, Occupancy, SupervisorConfig};
+pub use config::{LandAt, Occupancy, SupervisorConfig};
 #[cfg(any(test, debug_assertions))]
 pub use custody_environment::line_custody_environment;
 pub use facts::{Fact, FactsReading, HeldCall, HeldReading, LeftoverReading};
@@ -49,11 +46,11 @@ pub use ledger::{
     parse_since_local, render as render_ledger, render_local as render_ledger_local,
 };
 pub use phase::{
-    Busy, Phase, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,
+    Busy, Zone, busy_signal, context_left, is_placeholder, limit_notice, survey_open,
     transcript_end, worker_phase,
 };
 pub use policy::approval::{PriorityWord, QuestionPriority};
-pub use policy::turn_end::{AgentResumed, Outage, WaitKind};
+pub use policy::turn_end::{AgentResumed, HostAgent, Outage, WaitKind};
 pub use report::{DEFAULT_MAX_ROWS, Mark, Marker, Reason, Report, ReportOpts};
 pub use run::{
     ATTENTION_OWNER, ATTENTION_PREFIX, AnswerOpts, ApprovalEnv, BuiltinAuthority, CLAIM_HELD,
@@ -62,7 +59,7 @@ pub use run::{
     Lasting, LineHeld, NEEDS_ATTENTION_OWNER, ProbeMiss, ProbeNo, RELAUNCH_ATTENTION_OWNER,
     REPEATED_WHY, STARTUP_HEAD, Session, SessionSetup, StallSeen, StuckSurvey, SuperviseOpts, Turn,
     UNBOUNDED, USAGE_LIMIT_WHY, UsageSeen, WaitPlan, WorkerSource, deadline_attention, event_line,
-    exit_reason, mark_task_exited, render_phase, render_phase_and_survey,
+    exit_reason, mark_task_exited, needs_attention_text, render_phase, render_phase_and_survey,
 };
 pub use transport::{Endpoint, RelayCtl};
 

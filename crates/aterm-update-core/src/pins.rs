@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-/// Ed25519 public key(s) of the paper master: the offline root of the machine roster and the
-/// one anchor that authorizes a release.
+/// Ed25519 public key(s) of the paper master, whose phrase the vault holds as
+/// `release-paper-master`: the root of the machine roster and the one anchor that authorizes a
+/// release.
 ///
 /// Do not hand-edit the value or its layout: `atpkg-keys` writes this declaration and reads it
 /// back in this shape (`pins_edit::read_anchor`).

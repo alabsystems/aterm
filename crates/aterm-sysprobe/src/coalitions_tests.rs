@@ -35,7 +35,7 @@ fn a_recorded_usage_record_decodes_its_words_and_scales_its_ticks() {
             id: 307,
             tasks_started: 1,
             tasks_exited: 0,
-            cpu_ns: 4_198_156_800_000,
+            cpu_ns: 4_227_000_000_000,
             bytes_read: 13_640_070_000,
             eqos_ns: [
                 5_400_000_000,
@@ -50,7 +50,7 @@ fn a_recorded_usage_record_decodes_its_words_and_scales_its_ticks() {
         }
     );
     let intel = decode_usage(307, &mds_record(), (1, 1)).expect("7 QoS classes");
-    assert_eq!(intel.cpu_ns, 100_755_763_200);
+    assert_eq!(intel.cpu_ns, 101_448_000_000);
     assert_eq!(intel.eqos_ns[2], 43_891_200_000);
 }
 
@@ -63,7 +63,24 @@ fn a_record_cut_before_the_footprint_gives_none_for_it() {
     raw[40..].fill(UNWRITTEN);
     let usage = decode_usage(307, &raw, (125, 3)).expect("7 QoS classes");
     assert_eq!(usage.footprint, None);
-    assert_eq!(usage.cpu_ns, 4_198_156_800_000);
+    assert_eq!(usage.cpu_ns, 4_227_000_000_000);
+}
+
+/// The scheduler ledger is a different account: a coalition can have running thread time
+/// absent from it. Missing QoS words must refuse the reading instead of inventing that work.
+#[test]
+fn cpu_uses_complete_thread_time_and_refuses_a_partial_qos_record() {
+    let mut raw = mds_record();
+    raw[CPU_TIME] = 0;
+    assert_eq!(
+        decode_usage(307, &raw, (1, 1)).unwrap().cpu_ns,
+        101_448_000_000
+    );
+    for word in EQOS..EQOS + QOS_CLASSES {
+        let mut cut = raw;
+        cut[word] = UNWRITTEN;
+        assert_eq!(decode_usage(307, &cut, (1, 1)), None);
+    }
 }
 
 /// The footprint word alone decodes as the whole record's does, and a record of

@@ -5,7 +5,7 @@
  ▝▝   ▝▝   ~/scratch.noindex/q-measure-20649/m/work
 
 
-⏺ agents-md: no CLAUDE.md found; AGENTS.md loaded: /Users//user00/scratch.noindex/q-measure-20649/AGENTS.md
+⏺ agents-md: no CLAUDE.md found; AGENTS.md loaded: /Users/_user0/scratch.noindex/q-measure-20649/AGENTS.md
 
 ❯ Use the AskUserQuestion tool exactly once with ONE question: question "Which colour do you prefer?", header "Colour",
   options "Red (Recommended)" (description "A warm colour") and "Blue" (description "A cool colour"), single-select.

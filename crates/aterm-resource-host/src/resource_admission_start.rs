@@ -182,7 +182,13 @@ impl Owner {
                         Some(proof),
                         failure::stage_refusal(pending.events, "native target did not start"),
                     ),
-                    LaunchError::Unbound { spawned, .. } => (Some(spawned), None, None),
+                    LaunchError::Unbound { mut spawned, .. } => {
+                        crate::resource_observation::born(
+                            &pending.submission.request.binding,
+                            spawned.child_mut().id(),
+                        );
+                        (Some(spawned), None, None)
+                    }
                     LaunchError::Refused(_) => (None, None, None),
                 };
                 // An unbound or unknown native outcome has no affirmative
@@ -215,6 +221,7 @@ impl Owner {
         let original_deadline = pending.original_deadline();
         let binding = pending.submission.request.binding;
         let pid = child.child_mut().id();
+        crate::resource_observation::born(&binding, pid);
         let birth = i32::try_from(pid)
             .ok()
             .and_then(aterm_uds::process::read_birth)

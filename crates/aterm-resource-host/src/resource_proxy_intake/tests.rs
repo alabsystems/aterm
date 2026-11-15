@@ -19,7 +19,7 @@ fn deadline() -> Instant {
 fn request() -> Request {
     Request {
         binding: JobBinding {
-            session: "s-ab12".into(),
+            session: "s-0000000000000000ab12".into(),
             root_attempt: [1; 16],
             capability: [7; 32],
         },
@@ -106,7 +106,7 @@ fn cached_helper_intake_success_deny_wrong_challenge_and_truncated_bundle() {
             .unwrap(),
     );
     let expected = Binding {
-        session: "s-ab12".into(),
+        session: "s-0000000000000000ab12".into(),
         attempt: [1; 16],
     };
     for mode in ["deny", "truncated", "wrongnonce", "success"] {

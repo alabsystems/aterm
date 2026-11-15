@@ -81,7 +81,7 @@ aterm init --converge [--check] [--json] [--verbose] [--trigger subscriber|windo
   and Linux (the base layer, the vault and --clone; each Mac row reads \"macOS only\").
   Run it as yourself, without sudo; safe to run again. Every Mac gets what `aterm doctor`
   restores, the ALab toolset, the Command Line Tools if missing (one sudo password), and
-    Disable Spotlight indexing on the data volume (file-search updates stop; same password)
+    Stop Spotlight indexing home folders but Documents and Desktop (same password)
     {spotlight}
     {secrets} (authenticated ALab members admit this Mac on its home LAN, over SSH too)
     {permissions} (a row for each grant to switch on)
@@ -2639,10 +2639,13 @@ fn automatic_clone(
             Ok(None) => {}
         }
     }
-    let token = crate::init_github::token_file(Path::new(&ctx.users[0].home));
+    // The store holds no development token: nothing is owed until the vault delivers one.
     if sys
-        .stat(&token)
-        .is_err_and(|why| why.kind() == std::io::ErrorKind::NotFound)
+        .vault_entry(
+            Path::new(&ctx.users[0].home),
+            crate::init_github::TOKEN_ENTRY,
+        )
+        .is_ok_and(|token| token.is_none())
     {
         return Ok(nothing());
     }
@@ -5056,7 +5059,7 @@ const ACCOUNTS_GROUP: &str = "init.accounts";
 
 /// The id of GitHub's group, and the word that names each of its items ([`Setting::Repositories`]).
 const GITHUB: SettingGroup = SettingGroup {
-    id: "init.github",
+    id: crate::init_github::ID,
     family: "github",
     setting: Setting::Repositories,
 };
@@ -5530,6 +5533,18 @@ fn context_selection(sys: &dyn System, ctx: &Ctx, only: &[String], picks: Picks)
     } else {
         runs
     }
+}
+
+/// Whether a change journaled under item `id` writes no row System State reads privately
+/// ([`aterm_types::macos_setup::Subject::reads_privately`]: the Mac settings, the sign-outs,
+/// Rust in Spotlight), so a kept reading of such a row still stands after it. Two lanes' items
+/// do: the sync lane's own ([`crate::sync::own_item`]), whose rows are the sync rows, and the
+/// Repositories stage's ([`crate::init_github::names_item`]), whose row is the repositories'.
+/// Every other id is held to write one, an id this build does not know included: a Mac
+/// setting's, a sign-out's, Spotlight's, a base-layer repair's.
+#[must_use]
+pub fn writes_no_private_row(id: &str) -> bool {
+    crate::sync::own_item(id) || crate::init_github::names_item(id)
 }
 
 /// What the running coordinator read back settled of the rows a reader asks about (`setup

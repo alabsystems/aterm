@@ -60,8 +60,10 @@
 //! [`Overrun`]); its reservation is the same.
 //! A claim made by a process whose ancestor holds one is that held work going on: it is held to
 //! the other held claims only, never to its ancestors' or to a waiter, so a run that holds a
-//! claim can start a tool that claims for itself. Other sessions' plain builds hold no claim,
-//! but they show in the reading.
+//! claim can start a tool that claims for itself. Other sessions' plain builds claim here too: a
+//! `targo` or `cargo` call that compiles claims its memory and a CPU share before it starts,
+//! unless a held claim it runs under covers it (atpkg's BUILD-ADMIT); work that holds no claim
+//! (a build's `run`, any program that claims nothing) shows only in the reading.
 //!
 //! Cohort namespaces instead retain the complete declared budget while a launch is armed,
 //! its bound group remains present or unknown, or its original holder is no longer alive.
@@ -81,6 +83,7 @@ aterm_durable::plain_durable_flushes_in_tests!();
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub mod admission_log;
 pub mod admit;
 pub mod book;
 pub mod build_slot_wait;
@@ -116,8 +119,8 @@ pub use retained_claim::RetainedClaim;
 #[cfg(all(test, unix))]
 mod retained_claim_tests;
 pub use timing::{
-    CpuPoint, CpuWindow, Observed, Protection, QuietPolicy, StatedEntry, TimingCause,
-    TimingEvidence, TimingIssue, Unqualified,
+    ComparisonObservation, CpuPoint, CpuWindow, Observed, Protection, QuietPolicy, StatedEntry,
+    TimingCause, TimingEvidence, TimingIssue, Unqualified,
 };
 mod cohort_reference;
 pub use cohort_reference::CohortClosureRef;
@@ -139,6 +142,7 @@ pub mod footprint;
 pub mod host_vitals;
 pub mod ledger;
 pub mod machine_footprint;
+pub mod machine_look;
 pub mod overrun;
 pub mod phase;
 pub mod reading;
@@ -160,7 +164,8 @@ mod retained_cohort_tests;
 pub use admit::{
     Alone, CREDIT_MAX, Claim, Error, Forced, Holder, Pace, Polled, QuietStart, Relief, Reserve,
     Short, Shortfall, Spared, Waiter, admit, admit_relieved, admit_until, admit_with,
-    covered_memory, covering, covering_disk, gib, never, reserved, span, spared,
+    covered_memory, covering, covering_disk, gib, heavy_queue, never, reserved, span, spared,
+    tree_roots,
 };
 #[cfg(unix)]
 pub use cohort_environment::capacity_cohort_environment;
@@ -328,16 +333,25 @@ pub struct LeadSponsor {
     pub order: (u64, u32, u64),
     /// The bytes this claim pledges by ending.
     pub bytes: u64,
+    /// Its holder's kernel start identity at the proving look ([`Proc::start`],
+    /// `Procs::start_of`), 0 where that sweep did not read it. Once its claim has ended, only that
+    /// same process's tree counts toward what the end has yet to give back (the fit's REMAINS,
+    /// `sure_leads`), and 0 counts nothing.
+    pub start: u64,
 }
 
 /// The append-only proof that lets a critical Release waiter retain memory its sponsors free.
 ///
 /// At the proving look, the sponsors' whole claims cover `needed` bytes of the lead's shortage
-/// beside every other held claim at its immutable peak. Every unrelated later admission
-/// counts the lead, including after a sponsor record disappears, so it cannot refill the released
-/// room. A sponsor descendant may pass as the bounded ABBA escape; the lead continues to count
-/// that descendant's held claim until it ends. Critical claims cannot add numeric credits or
-/// duplicate or detach their custody after the proof, so this process-tree relation stays stable.
+/// beside every other held claim its own look counts, none of its kin's, at what it owed there.
+/// While every sponsor holds, a later waiter counts the lead where the lead fits, as any lead
+/// does, on what is available then. Once a sponsor has ended, the same fit also counts what that
+/// sponsor's own processes still hold, capped at its pledge, where no claimant is its holder or
+/// under it, so the room they have yet to free is no gap a later unit can refill. Nothing about
+/// the proof stands in for what is available: a fall in it since the proof makes the lead unsure.
+/// A sponsor descendant may pass as the bounded ABBA escape; the lead continues to count that
+/// descendant's held claim until it ends. Critical claims cannot add numeric credits or duplicate
+/// or detach their custody after the proof, so this process-tree relation stays stable.
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeadReservation {
@@ -362,7 +376,7 @@ mod background;
 mod branch_shares;
 mod jobserver;
 pub use branch_shares::{BranchShares, FixtureShare, InitialReservation};
-pub use jobserver::{IMPLICIT_POOL_ENV, Jobserver, POOL_ENV, Token};
+pub use jobserver::{IMPLICIT_POOL_ENV, Jobserver, POOL_ENV, Token, TokenCount};
 
 /// What a claim needs. Sizes are bytes.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -427,6 +441,40 @@ pub struct Need {
     /// its patience ([`AtBound`], [`Self::runs_loaded`]). The waiter's own, never in a [`Record`]:
     /// the fact a record keeps is its cause ([`TimingCause::Loaded`]).
     pub at_bound: AtBound,
+    /// It asks for THE JUDGMENT TURN ([`Self::heavy`], [`Heavy`]): one heavy judgment holds it at
+    /// a time on this machine, and its waiters take it shortest predicted first, aged.
+    pub heavy: Option<Heavy>,
+}
+
+/// THE JUDGMENT TURN (`docs/DESIGN-landing-economy.md` §2.3): a ledger resource one heavy
+/// judgment holds at a time, so N heavy judgments on a Mac end one after another at full width
+/// instead of all together at 1/N of it. A claim that asks for it ([`Need::heavy`]) holds no
+/// memory, cores or disk by it. It waits while another process holds the turn, or while another
+/// heavy waiter has a smaller [`Self::key`] (then the earlier claim, [`Record::order`]): shortest
+/// predicted first, with aging at rate 1, since the key is when the work was first queued plus
+/// what it is predicted to take. A waiter predicted `P` therefore waits at most for the holder's
+/// rest and for the waiters whose key is below its own, each of which was queued before it by
+/// less than `P` less their own prediction: none starves behind a stream of shorter work.
+/// While its holder holds it, the holder's own claims of cores are granted all the room there is,
+/// not the fair share ([`mod@admit`]'s CORES-GRANT): the turn exists to run one judgment at full width.
+/// A claim of its holder's descendants is inside the turn and never waits for it.
+/// Only Ordinary work asks for it ([`never`] refuses a Release or Background one). A verifier built
+/// from a tree that predates the turn reads no `heavy` in a record and keeps the rule it had.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Heavy {
+    /// When its work was first queued, unix ms: a judgment's landing keeps it across re-judges.
+    pub since_ms: u64,
+    /// What its work is predicted to take of this machine, ms: its CPU-ms over the machine's
+    /// cores.
+    pub predicted_ms: u64,
+}
+
+impl Heavy {
+    /// Its place among the turn's waiters: smaller goes first.
+    #[must_use]
+    pub const fn key(self) -> u64 {
+        self.since_ms.saturating_add(self.predicted_ms)
+    }
 }
 
 /// What a measured claim does at its patience bound on a machine that stayed busy: a valid CPU
@@ -523,7 +571,9 @@ impl Need {
     /// a release slice's compiler, the release's critical path, whose room the release's other
     /// work leaves while it waits rather than taking it first.
     /// Waiters that lead keep rank and arrival order among themselves; a held claim is never
-    /// preempted. Its record says so; a build that predates it reads an ordinary waiter.
+    /// preempted. Its record says so; a build that predates it reads an ordinary waiter. A
+    /// background need never leads: it yields to every release claim ([`crate::Short::Release`]),
+    /// so the ledger enters and reads one as an ordinary waiter.
     #[must_use]
     pub const fn leads(mut self) -> Need {
         self.leads = true;
@@ -668,6 +718,17 @@ impl Need {
     #[must_use]
     pub const fn runs_loaded(mut self) -> Need {
         self.at_bound = AtBound::RunLoaded;
+        self
+    }
+
+    /// Ask for the judgment turn ([`Heavy`]) for work first queued at `since_ms` (unix ms) and
+    /// predicted to take `predicted_ms` of this machine.
+    #[must_use]
+    pub const fn heavy(mut self, since_ms: u64, predicted_ms: u64) -> Need {
+        self.heavy = Some(Heavy {
+            since_ms,
+            predicted_ms,
+        });
         self
     }
 }

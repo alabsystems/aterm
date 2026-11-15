@@ -3,105 +3,9 @@
 
 //! Classifies the wall a worker's turn ended on: usage window, model bucket, spend, full context, expired login, API error, overload, or Claude Code's critical-memory banner ([`memory_wall`], detected by screen position rather than [`PHRASES`]).
 
+use alab_policy::vocab::{ApiCause, WallKind};
+
 use crate::phase::Transcript;
-
-/// Which wall.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WallKind {
-    /// The five-hour session window (`You've hit your session limit · resets 3pm`), or a usage limit that does not say which window (`Usage limit reached · continuing automatically at 1:50pm`, `Goal paused · usage limit reached`).
-    UsageSession,
-    /// The seven-day window (`You've hit your weekly limit · resets Sep 19 at 11am`).
-    UsageWeekly,
-    /// A per-model bucket (`You've reached your Fable limit. Run /usage-credits to continue or
-    /// switch models with /model.`).
-    ModelBucket { consent: bool },
-    /// Money: a monthly spend limit, a shared budget, no usage credits left.
-    Spend,
-    /// The context is full (`Context limit reached · /compact or /clear to continue`, `Prompt is too long`): `/compact` moves it, waiting does not.
-    Context,
-    /// The login is gone (`Not logged in · Please run /login`, `API Error: 401 Invalid API key · Please run /login`, `Login expired · Please run /login` — the row Claude Code 2.1.281 writes as its `<synthetic>` `authentication_failed` answer and draws as `⏺ Login expired · …`, [`Placement::ErrorRow`]): a human's browser moves it, and until it does every turn ends on it in milliseconds, whatever was typed.
-    Auth,
-    /// Any other `API Error: …` the turn ended on, and Claude Code's own refusal of the request ([`ApiCause::Request`]).
-    ApiError {
-        code: Option<u16>,
-        retryable: bool,
-        cause: ApiCause,
-    },
-    /// The service is overloaded (`API Error: 529 Overloaded. This is a server-side issue,
-    /// usually temporary — try again in a moment.`, `Repeated 529 Overloaded errors`,
-    /// `Opus is experiencing high load`).
-    Overloaded,
-    /// Claude Code's critical-memory banner: indicates the process must be restarted and resumed on its conversation (`claude --resume <id>`, never `claude --continue`: [`memory_banner_head`]).
-    Memory,
-}
-
-/// Failure category of an [`WallKind::ApiError`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiCause {
-    /// Server-side failure: a retryable HTTP status (5xx, 408, 409, 429; or 401/451) or an unclassified `API Error` without a status (`API Error: terminated`, `API Error: fetch failed`, `API Error: Please wait a moment and try again.`).
-    Server,
-    /// Network or DNS failure before reaching the API (e.g. `ENOTFOUND`,
-    /// `ECONNREFUSED`, timeout, or sleep).
-    Unreachable,
-    /// Response cut off mid-stream or stalled before a response was produced.
-    CutOff,
-    /// TLS, certificate, or proxy-tunnel refusal (not retried by the vendor).
-    Config,
-    /// Request refused by the API (non-retryable 4xx statuses other than 401, 408, 409, 429, 451, or [`Tag::Refused`] notices such as safeguards, unsupported model/effort, or account holds).
-    Request,
-    /// Response exceeded the output token maximum (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`).
-    Overlong,
-}
-
-impl WallKind {
-    /// The lowercase word the CLI prints after `wall:` (`overloaded`).
-    #[inline]
-    #[must_use]
-    pub const fn name(&self) -> &'static str {
-        match self {
-            WallKind::UsageSession => "usage-session",
-            WallKind::UsageWeekly => "usage-weekly",
-            WallKind::ModelBucket { .. } => "model-bucket",
-            WallKind::Spend => "spend",
-            WallKind::Context => "context",
-            WallKind::Auth => "auth",
-            WallKind::ApiError { .. } => "api-error",
-            WallKind::Overloaded => "overloaded",
-            WallKind::Memory => "memory",
-        }
-    }
-
-    /// The whole word `status agent=` publishes for this wall: `wall:` and [`Self::name`] (`wall:overloaded`).
-    #[inline]
-    #[must_use]
-    pub const fn wire(&self) -> &'static str {
-        match self {
-            WallKind::UsageSession => "wall:usage-session",
-            WallKind::UsageWeekly => "wall:usage-weekly",
-            WallKind::ModelBucket { .. } => "wall:model-bucket",
-            WallKind::Spend => "wall:spend",
-            WallKind::Context => "wall:context",
-            WallKind::Auth => "wall:auth",
-            WallKind::ApiError { .. } => "wall:api-error",
-            WallKind::Overloaded => "wall:overloaded",
-            WallKind::Memory => "wall:memory",
-        }
-    }
-
-    /// Whether [`crate::phase::worker_phase`] reads this wall as [`crate::phase::Phase::Limited`]: the usage windows, a model bucket, spend, and an API rate limit (429) — the kinds it has always read so.
-    #[inline]
-    #[must_use]
-    pub const fn reads_limited(&self) -> bool {
-        match self {
-            WallKind::UsageSession
-            | WallKind::UsageWeekly
-            | WallKind::ModelBucket { .. }
-            | WallKind::Spend => true,
-            WallKind::ApiError { code, .. } => matches!(*code, Some(429)),
-            WallKind::Context | WallKind::Auth | WallKind::Overloaded | WallKind::Memory => false,
-        }
-    }
-}
 
 /// Where on the screen a wall was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +202,9 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
     if opens_with_label(&lower) {
         return None;
     }
+    if let Some(code) = edge_status(&lower) {
+        return Some(edge_wall(code));
+    }
     if lower.contains("temporary network issue")
         || lower.contains("another claude code process is refreshing it")
     {
@@ -386,9 +293,66 @@ pub fn named_by_status_alone(text: &str) -> bool {
     matches!(
         classify_wall(text),
         Some(WallKind::ApiError { code: Some(_), .. })
-    ) && !PHRASES.iter().any(|&(phrase, tag)| {
-        opening.opens_with(phrase) || (tag == Tag::Refused && lower.contains(phrase))
+    ) && edge_status(&lower).is_none()
+        && !PHRASES.iter().any(|&(phrase, tag)| {
+            opening.opens_with(phrase) || (tag == Tag::Refused && lower.contains(phrase))
+        })
+}
+
+/// The statuses Cloudflare answers a blocked or challenged request with in place of the API
+/// ([`edge_block`]): 403 for its block page (`Attention Required! | Cloudflare`, `Access denied`)
+/// and its managed challenge (`Just a moment...`), 503 for its older interstitial challenge.
+const EDGE_STATUSES: &[u16] = &[403, 503];
+
+/// The words of Cloudflare's own block and challenge pages ([`edge_block`]): the `| Cloudflare`
+/// every one of its error pages' titles ends with, its challenge page's `Just a moment...`, and
+/// the `cf-ray` header or `Ray ID` the pages print.
+const EDGE_PAGE_WORDS: &[&str] = &["cloudflare", "just a moment...", "cf-ray", "ray id"];
+
+/// WHETHER `text`, A NOTICE CLAUDE CODE WROTE OR DREW, IS CLOUDFLARE'S BLOCK OR CHALLENGE PAGE
+/// ANSWERING IN PLACE OF THE API: an `API Error:` whose status is one Cloudflare answers so
+/// ([`EDGE_STATUSES`]) with its page's words after it ([`EDGE_PAGE_WORDS`]). Claude Code 2.1.323
+/// writes any 403 as its `<synthetic>` `authentication_failed` answer and prefixes its sign-in
+/// remedy, so the edge's bot check reads `Please run /login · API Error: 403 Attention Required!
+/// | Cloudflare` (measured on m2, 2026-11-13): yet nothing about the login was answered, and the
+/// same process served turns on the same login 90 minutes later with no sign-in. It is a network
+/// block ([`classify_wall`] names it an [`ApiCause::Server`] API error, retried with the outage's
+/// backoff), never a lost login: no sign-in moves it, and a sign-in run against the same edge
+/// meets the same bot check. A 401, `OAuth token has expired` or `Not logged in` with no page
+/// of Cloudflare's stays the lost login it is.
+#[must_use]
+pub fn edge_block(text: &str) -> bool {
+    edge_status(&text.replace('\u{2019}', "'").to_lowercase()).is_some()
+}
+
+/// [`edge_block`]'s status, `lower` already lowercased: the first `api error` that opens a line
+/// (past its gutter's marks) or one of its `·` segments (as Claude Code puts it after its
+/// remedy), never one a sentence only names, whose status is Cloudflare's with its page's words
+/// after it.
+fn edge_status(lower: &str) -> Option<u16> {
+    lower.match_indices("api error").find_map(|(at, head)| {
+        let line = lower[..at].rsplit('\n').next().unwrap_or_default();
+        let before = line
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .trim_end();
+        if !(before.is_empty() || before.ends_with(['·', '∙'])) {
+            return None;
+        }
+        let rest = &lower[at + head.len()..];
+        api_status(rest)
+            .filter(|code| EDGE_STATUSES.contains(code))
+            .filter(|_| EDGE_PAGE_WORDS.iter().any(|word| rest.contains(word)))
     })
+}
+
+/// The wall Cloudflare's page answering with `code` is ([`edge_block`]): the API's error, the
+/// server side's and retried, its status kept.
+const fn edge_wall(code: u16) -> WallKind {
+    WallKind::ApiError {
+        code: Some(code),
+        retryable: true,
+        cause: ApiCause::Server,
+    }
 }
 
 /// Whether `lower` (a notice as it opens, lowercased) is Claude Code's `/goal` echo of a request

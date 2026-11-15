@@ -158,6 +158,12 @@ pub struct State {
     pub complete: bool,
     /// Cells left out because their value was shaped like a credential.
     pub withheld: u64,
+    /// Records of the file's collection held inert at that frontier (§5): a Mac's row at
+    /// another Mac's key, an automatic record past its writer's quota. They stay in history
+    /// with their authors and never project. `None` in a status file that does not say (an
+    /// older build wrote it, or rewrote one a newer build wrote): the count is unknown, so the
+    /// materializer projects the snapshot again rather than trust it, and a display says 0.
+    pub inert: Option<u64>,
     /// The file's kind (`table`) and its face's extension (`tsv`).
     pub kind: String,
     pub ext: String,
@@ -189,6 +195,7 @@ impl State {
         put("projection", Value::from(u64::from(self.projection)));
         put("complete", Value::from(self.complete));
         put("withheld", Value::from(self.withheld));
+        put("inert", Value::from(self.inert));
         put("kind", Value::from(self.kind.as_str()));
         put("ext", Value::from(self.ext.as_str()));
         put("face", Value::from(self.face.as_deref()));
@@ -237,6 +244,7 @@ impl State {
             projection: u32::try_from(number("projection")).ok()?,
             complete: value.get("complete").and_then(Value::as_bool) == Some(true),
             withheld: number("withheld"),
+            inert: value.get("inert").and_then(Value::as_u64),
             kind: text("kind"),
             ext: text("ext"),
             face: value.get("face").and_then(Value::as_str).map(str::to_owned),
@@ -293,7 +301,8 @@ impl Status {
 
     /// The status as one line: `live · rev 7 · 12 rows`, `held (succession) · rev 7 · 12 rows`,
     /// `never (membership)`, `held (custody) · rev 7 · 12 rows · last read not taken (behind)`,
-    /// `held (succession) · rev 7 · 12 rows · 2 queued · 1 held back`.
+    /// `held (succession) · rev 7 · 12 rows · 2 queued · 1 held back`, `live · rev 7 · 12 rows ·
+    /// 3 inert`.
     #[must_use]
     pub fn line(&self) -> String {
         let mut line = self.word.as_str().to_owned();
@@ -306,6 +315,9 @@ impl Status {
             line.push_str(&format!(" · rev {} · {} rows", state.rev, state.rows));
             if !state.complete {
                 line.push_str(" · history incomplete");
+            }
+            if let Some(inert) = state.inert.filter(|inert| *inert > 0) {
+                line.push_str(&format!(" · {inert} inert"));
             }
         }
         if let Some(kept) = self.state.as_ref().and_then(|state| state.kept) {
@@ -336,6 +348,7 @@ impl Status {
                 ("generation", u64::from(state.generation)),
                 ("records", state.records),
                 ("withheld", state.withheld),
+                ("inert", state.inert.unwrap_or(0)),
             ] {
                 object.insert(name.to_owned(), Value::from(value));
             }

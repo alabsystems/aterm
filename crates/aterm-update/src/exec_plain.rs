@@ -1,13 +1,25 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A plain `exec` that puts SIGPIPE's disposition back when it fails.
+//! A plain `exec` that excludes process-table reads and restores SIGPIPE on failure.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
 
 /// Replace this process with `command`'s program, restoring `SIGPIPE` on failure.
+/// A process-table read that does not settle within the exec gate's bound refuses the exec
+/// with `WouldBlock`, leaving the command and signal disposition untouched.
 pub fn exec_keeping_sigpipe(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
+    let _closed = match aterm_sysprobe::exec_gate::close(aterm_sysprobe::exec_gate::SETTLES_WITHIN)
+    {
+        Ok(closed) => closed,
+        Err(reading) => {
+            return io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("refusing exec while {reading}"),
+            );
+        }
+    };
     let saved = sigpipe_disposition();
     let error = command.exec();
     if let Some(saved) = saved.as_ref() {

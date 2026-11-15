@@ -258,6 +258,11 @@ fn ensure_root_clones_every_file_and_then_touches_nothing() {
         assert!(cloned(&fx.tool(8595, tool), &rbin.join(tool)), "{tool}");
     }
     for (public, trust) in crate::seam::STOCK_NAMES {
+        if !fx.tool(8595, trust).is_file() {
+            // This build ships no such tool, so the root lays no name for it.
+            assert!(!rbin.join(public).exists(), "{public} without {trust}");
+            continue;
+        }
         assert!(
             cloned(&fx.tool(8595, trust), &rbin.join(public)),
             "{public} holds {trust}'s bytes"

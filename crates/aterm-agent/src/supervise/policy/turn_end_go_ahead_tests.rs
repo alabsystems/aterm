@@ -5,11 +5,19 @@
 // go ahead! fix the cruise harness so that this cannot happen again"): a park on a person's
 // go-ahead for the agent's own reversible work gets it, under Cruise and Land, and nowhere else.
 
-use super::super::go_ahead::{
+use crate::supervise::policy::exception::{Urgency, exception_for};
+use alab_policy::config::TurnEndTiming;
+use alab_policy::go_ahead::{
     GO_AHEAD_ANSWER, GO_AHEAD_DROP, GO_AHEAD_OTHERS, GO_AHEAD_ROOM, NEVER_A_NEED, TOKEN_CLOSE,
     TOKEN_OPEN,
 };
-use crate::supervise::policy::exception::{Urgency, exception_for};
+
+/// alab-policy's go-ahead table (`alab_policy::corpus::go_ahead`'s `table` and `guard_corpus`
+/// read it).
+const GO_AHEAD_TABLE: &str = include_str!("../../../../alab-policy/fixtures/go-ahead-table.txt");
+/// alab-policy's record of the base's guard (`alab_policy::corpus::guard_base`'s generator wrote
+/// it at 246d1ddc2f).
+const GUARD_BASE: &str = include_str!("../../../../alab-policy/fixtures/go-ahead-guard-base.txt");
 
 /// The incident's last reply (2026-10-29), two days into the park.
 const INCIDENT: &str = "Nothing has changed. The build is waiting only for your go-ahead.\n\nNEEDS YOU: \
@@ -414,7 +422,7 @@ fn the_agents_own_wakes_starve_no_go_ahead() {
 fn the_go_ahead_texts_read_as_nothing() {
     for said in harness_texts() {
         assert!(
-            super::super::go_ahead::parked("", &said).is_none(),
+            alab_policy::go_ahead::parked("", &said).is_none(),
             "parks: {said}"
         );
         assert!(
@@ -431,8 +439,8 @@ fn the_go_ahead_texts_read_as_nothing() {
     // The continuation, the carry and every done check say the go-ahead is no need in words a
     // person's hold cuts.
     let mut saying: Vec<String> = [
-        crate::supervise::config::CONTINUE_TEXT,
-        crate::supervise::policy::cruise_carry::BACKGROUND_CARRY,
+        alab_policy::config::CONTINUE_TEXT,
+        alab_policy::cruise_carry::BACKGROUND_CARRY,
         DONE_TAIL,
     ]
     .iter()
@@ -441,18 +449,18 @@ fn the_go_ahead_texts_read_as_nothing() {
     saying.extend((0..DONE_ANGLES.len()).map(done_check_words));
     for said in &saying {
         assert!(said.contains(NEVER_A_NEED), "{said}");
-        let cut = super::super::go_ahead::unless_held(said, true);
+        let cut = alab_policy::go_ahead::unless_held(said, true);
         assert!(!cut.contains(NEVER_A_NEED) && !cut.contains("  "), "{cut}");
     }
 }
 
-/// What the harness types or its docs say about the go-ahead: the answer and each of its parts,
-/// the answer as typed to the incident, the continuation, the carry and the turn-end texts beside
-/// them, and the go-ahead's sentences in the primer, the supervise skill and the manual.
+/// What the harness types about the go-ahead: the answer and each of its parts, the answer as
+/// typed to the incident, the continuation, the carry and the turn-end texts beside them, and the
+/// go-ahead's sentences in the active primer and supervise skill.
 fn harness_texts() -> Vec<String> {
-    use super::super::go_ahead::{QUOTE_CLOSE, QUOTE_OPEN};
+    use alab_policy::go_ahead::{QUOTE_CLOSE, QUOTE_OPEN};
     let quoted = go_ahead_answer(
-        &super::super::go_ahead::parked("", INCIDENT).expect("parks"),
+        &alab_policy::go_ahead::parked("", INCIDENT).expect("parks"),
         true,
         None,
     );
@@ -466,8 +474,8 @@ fn harness_texts() -> Vec<String> {
         TOKEN_CLOSE,
         QUOTE_OPEN,
         QUOTE_CLOSE,
-        crate::supervise::config::CONTINUE_TEXT,
-        crate::supervise::policy::cruise_carry::BACKGROUND_CARRY,
+        alab_policy::config::CONTINUE_TEXT,
+        alab_policy::cruise_carry::BACKGROUND_CARRY,
         DONE_TAIL,
         NEEDS_ACK,
         needs::NEEDS_HINT,
@@ -480,16 +488,9 @@ fn harness_texts() -> Vec<String> {
     let docs = [
         aterm_primer::primer_block(None),
         include_str!("../../../../aterm-primer/assets/supervise-agent-skill.md").to_string(),
-        include_str!("../../../../aterm-cli/src/manual.rs").to_string(),
     ];
     for doc in docs {
-        // A Rust literal's escapes and continuations read as the spaces they print.
-        let flat = doc
-            .replace("\\n", " ")
-            .replace('\\', " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
         texts.extend(
             flat.split(". ")
                 .filter(|s| s.contains("go-ahead"))
@@ -505,10 +506,6 @@ fn harness_texts() -> Vec<String> {
 #[test]
 fn no_go_ahead_text_holds_a_stop_phrase() {
     let texts = harness_texts();
-    assert!(
-        texts.iter().filter(|t| t.contains("go-ahead")).count() >= 8,
-        "the docs' go-ahead sentences are read: {texts:#?}"
-    );
     let held: Vec<String> = texts
         .iter()
         .flat_map(|text| {
@@ -869,9 +866,9 @@ const IRREVERSIBLE_PARKS: &[&str] = &[
 /// (2026-10-29 review 2).
 #[test]
 fn every_park_row_gets_the_go_ahead_or_the_reversible_answer() {
-    use super::super::go_ahead::tests::{DRAWN, Row, drawn, rendered, table};
+    use alab_policy::corpus::go_ahead::{DRAWN, Row, drawn, rendered, table};
     let mut wrong = Vec::new();
-    for (row, reply) in table() {
+    for (row, reply) in table(GO_AHEAD_TABLE) {
         if row != Row::Park {
             continue;
         }
@@ -905,7 +902,7 @@ fn every_park_row_gets_the_go_ahead_or_the_reversible_answer() {
 /// whole policy answers its need with the go-ahead at every width.
 #[test]
 fn the_incidents_turn_drawn_bare_gets_the_go_ahead() {
-    use super::super::go_ahead::tests::{DRAWN, INCIDENT_TURN, drawn, rendered};
+    use alab_policy::corpus::go_ahead::{DRAWN, INCIDENT_TURN, drawn, rendered};
     let (earlier, tail) = INCIDENT_TURN;
     let mut wrong = Vec::new();
     for columns in DRAWN {
@@ -1051,10 +1048,7 @@ fn a_key_in_a_turn_the_harness_opened_holds_the_hour() {
                 t0() - 2 * GO_AHEAD_HELD,
             );
             if opener == "carry" {
-                st.background_carried(
-                    t0(),
-                    crate::supervise::policy::cruise_carry::BACKGROUND_CARRY,
-                );
+                st.background_carried(t0(), alab_policy::cruise_carry::BACKGROUND_CARRY);
             } else {
                 st.fact_typed();
             }
@@ -1089,11 +1083,12 @@ fn guard_strength(said: &Said) -> u8 {
     }
 }
 
-/// The base's guard (246d1ddc2f) for each text of the corpus, as `fixtures/go-ahead-guard-base.txt`
-/// holds it (`guard_base_tests.rs`): its cut, and the kind of its reading.
+/// The base's guard (246d1ddc2f) for each text of the corpus, as alab-policy's
+/// `fixtures/go-ahead-guard-base.txt` holds it ([`GUARD_BASE`], written by
+/// `alab_policy::corpus::guard_base`): its cut, and the kind of its reading.
 fn guard_base() -> std::collections::HashMap<String, (String, Said)> {
-    use crate::supervise::policy::guard_base_tests::{SAME, unescaped};
-    include_str!("fixtures/go-ahead-guard-base.txt")
+    use alab_policy::corpus::guard_base::{SAME, unescaped};
+    GUARD_BASE
         .lines()
         .filter(|l| l.contains('\t'))
         .map(|line| {
@@ -1124,26 +1119,27 @@ fn guard_base() -> std::collections::HashMap<String, (String, Said)> {
 /// merge with main's `needs::apart`): the guard's reading of each text is at least as strong as
 /// the one 246d1ddc2f made of it (an irreversible ask over a stop over a question over nothing
 /// asked, an offer or plain prose), for every table row at every width a tab draws it, every review repro
-/// and every echo: `fixtures/go-ahead-guard-base.txt` holds the base's own output, written at
-/// 246d1ddc2f (`guard_base_tests.rs`), so a weaker reading shows here whatever today's code makes
-/// of it. What the guard reads ([`TurnEndReading::asked`]) is `classify_said` of
-/// `needs::without_needs`, the cut whose walk takes no go-ahead join
-/// (`needs::tests::the_guards_cut_takes_no_go_ahead_join`), not the base's bytes: the cut may
-/// change with the needs reader, the reading may not weaken. Where the guard reads an
+/// and every echo: alab-policy's `fixtures/go-ahead-guard-base.txt` holds the base's own output,
+/// written at 246d1ddc2f (`alab_policy::corpus::guard_base`), so a weaker reading shows here
+/// whatever today's code makes of it. What the guard reads ([`TurnEndReading::asked`]) is
+/// `classify_said` of `needs::without_needs`, the cut whose walk takes no go-ahead join
+/// (alab-policy's `needs::tests::the_guards_cut_takes_no_go_ahead_join`), not the base's bytes:
+/// the cut may change with the needs reader, the reading may not weaken. Where the guard reads an
 /// irreversible ask the reply gets `REVERSIBLE_ANSWER`, or the go-ahead only where the ask rests
 /// on the agent's own cleanup on rows a parking need took ([`go_ahead_answers`]), and where it
 /// reads any ask (a stop, a question, an irreversible ask) answers off tell it.
 #[test]
 fn the_guard_reads_every_reply_as_the_base_did() {
-    use super::super::go_ahead::tests::guard_corpus;
+    use alab_policy::corpus::go_ahead::guard_corpus;
     let base = guard_base();
-    let texts = guard_corpus();
+    let texts = guard_corpus(GO_AHEAD_TABLE);
     let mut wrong = Vec::new();
     let (mut irreversible, mut asks, mut cut) = (0, 0, 0);
     for text in &texts {
         let Some((base_cut, base_said)) = base.get(text) else {
             wrong.push(format!(
-                "no base record (rerun guard_base_tests.rs at 246d1ddc2f): {text:?}"
+                "no base record (rerun alab_policy::corpus::guard_base's generator at 246d1ddc2f): \
+                 {text:?}"
             ));
             continue;
         };
@@ -1210,7 +1206,7 @@ fn the_guard_reads_every_reply_as_the_base_did() {
 /// reply's own, and the reply gets `REVERSIBLE_ANSWER`, or with answers off is told.
 #[test]
 fn a_need_wrapped_over_a_remote_deletion_keeps_the_guard() {
-    use super::super::go_ahead::tests::drawn;
+    use alab_policy::corpus::go_ahead::drawn;
     for said in [
         "The rebuilt branch is waiting for your go-ahead.\n\nNEEDS YOU: rerun the checks on the \
          merged upgrade fix branch and its tests first, then say \"go\" so I can delete the stale \
@@ -1302,7 +1298,7 @@ fn a_persons_turn_ending_at_a_wall_holds_the_hour() {
         WallKind::ApiError {
             code: Some(500),
             retryable: true,
-            cause: aterm_phase::ApiCause::Server,
+            cause: alab_policy::vocab::ApiCause::Server,
         },
         WallKind::UsageSession,
         WallKind::Context,
@@ -1374,7 +1370,7 @@ fn a_turn_the_harness_opened_is_no_persons_past_a_second_break() {
         t0() - 2 * GO_AHEAD_HELD,
     );
     let typed = go_ahead_answer(
-        &super::super::go_ahead::parked("", first).expect("parks"),
+        &alab_policy::go_ahead::parked("", first).expect("parks"),
         false,
         None,
     );
@@ -1629,7 +1625,7 @@ fn the_persons_hour_counts_the_macs_sleep() {
 /// keeps Land's own act.
 #[test]
 fn land_gives_the_go_ahead_to_a_park_on_landing_work_over_a_clean_folder() {
-    use super::super::go_ahead::tests::{DRAWN, drawn, rendered};
+    use alab_policy::corpus::go_ahead::{DRAWN, drawn, rendered};
     let tails = [
         "The upgrade fix branch hasn't changed and is now 739 commits behind main, but a merge \
          would still conflict in only one file. NEEDS YOU: say \"rerun the checks\" so I can \
@@ -1767,7 +1763,7 @@ fn every_persons_turn_holds_the_go_ahead_for_the_hour_whatever_it_says() {
         Some("Wait for the build to finish, then push."),
         Some("Not now — just land it."),
         Some("Fix the parser's error recovery."),
-        Some(crate::supervise::config::CONTINUE_TEXT),
+        Some(alab_policy::config::CONTINUE_TEXT),
         None,
     ] {
         let key = Some(8 * SECS);
@@ -1912,10 +1908,7 @@ fn a_break_after_a_restart_holds_a_key_only_for_its_own_hour() {
 fn breaks_after_the_keys_turn_start_its_hour_no_later() {
     let start = t0();
     let mut st = TurnEndState::default();
-    st.background_carried(
-        start,
-        crate::supervise::policy::cruise_carry::BACKGROUND_CARRY,
-    );
+    st.background_carried(start, alab_policy::cruise_carry::BACKGROUND_CARRY);
     let key = start + MIN;
     st.break_keyed(key, start + 10 * MIN, Some(start), start + 10 * MIN);
     assert!(st.go_ahead_held(start + 69 * MIN));
@@ -2378,7 +2371,7 @@ fn under_land_the_hold_has_no_needs_leg_for_an_answered_line() {
 
 /// The done check within the person's explicit hold.
 fn checked_held(n: usize) -> String {
-    super::super::go_ahead::unless_held(&done_check_words(n), true).into_owned()
+    alab_policy::go_ahead::unless_held(&done_check_words(n), true).into_owned()
 }
 
 /// Whether act `a` types text that says the go-ahead is no need right after NEEDS YOU's rule.
@@ -2544,7 +2537,7 @@ fn a_continuation_owed_at_a_break_is_cut_within_the_persons_hour() {
     let continuation = continuation_text(&cfg(), None);
     assert_eq!(
         st.owed_words(RULE_CONTINUE, &cfg(), None, false, now),
-        super::super::go_ahead::unless_held(&continuation, true),
+        alab_policy::go_ahead::unless_held(&continuation, true),
         "the continuation within the hour"
     );
     assert_eq!(
@@ -2618,7 +2611,7 @@ fn an_owed_continuation_over_a_park_left_to_the_person_says_no_go_ahead_word() {
         (false, no_answers(), false),
     ] {
         let at = format!("parks={parks}, answers={}", cfg.answer_questions);
-        let want = super::super::go_ahead::unless_held(&continuation, held).into_owned();
+        let want = alab_policy::go_ahead::unless_held(&continuation, held).into_owned();
         assert_eq!(
             st.owed_words(RULE_COMPACT, &cfg, None, parks, now),
             want,

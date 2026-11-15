@@ -6,7 +6,8 @@
 //! half-drawn frame is one a turn-end reader takes again rather than judges
 //! (`docs/measured/half-drawn-frame-2026-10-22.md`).
 
-use aterm_phase::{Phase, Program};
+use alab_policy::vocab::Phase;
+use aterm_phase::Program;
 
 use super::fixture_files::fixture_screens;
 

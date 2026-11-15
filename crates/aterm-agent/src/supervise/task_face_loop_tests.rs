@@ -2,15 +2,16 @@
 // Copyright 2026 Andrew Yates
 
 use crate::harness::acts::TaskFace;
-use crate::supervise::policy::turn_end::{
-    RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_CHECK, RULE_LAND_NUDGE, RULE_LEFT,
+use alab_policy::{
+    land_check::RULE_LAND_CHECK,
+    words::{RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE, RULE_LEFT},
 };
 
 const LANDING_REPLY: &str = "Committed and pushed the parser and its tests.\nNothing left: all of \
                              it is merged into the remote main branch.";
 const PROGRESS: &str = "Committing the parser now; the lexer is next.";
 /// The land check's one landing answer: a landing's last reply.
-const LANDED: &str = crate::supervise::policy::land_check::LANDED;
+const LANDED: &str = alab_policy::land_check::LANDED;
 
 /// A LANDING'S LAST SCREENS: the defense (where the land check is typed, so a run gates it on
 /// the check's turn), the check's turn, and its `LANDED`.
@@ -1072,7 +1073,7 @@ fn a_restated_landings_note_carries_its_first_time_forward() {
 #[test]
 fn the_page_counts_each_landing_once_through_its_wake_and_restarts() {
     use crate::harness::stats::stats_windows;
-    use crate::supervise::policy::turn_end::WAKE_KEPT;
+    use alab_policy::words::WAKE_KEPT;
     const WAKE: &str = "The monitor fired: the deploy finished.";
     let dir = crate::supervise::test_scratch_path("task-face", "landed-count");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1375,7 +1376,7 @@ fn a_rest_on_a_need_survives_a_loop_that_follows() {
 #[test]
 fn an_off_no_person_set_keeps_lands_rest_at_the_loop() {
     use crate::supervise::approvals::{OFF_STOOD, OFF_STOOD_RESTING};
-    use crate::supervise::policy::land_check::WAITS_ON_YOU;
+    use alab_policy::land_check::WAITS_ON_YOU;
     let need = "NEEDS YOU: rotate the deploy nod in the dashboard";
     let screens = || {
         vec![
@@ -2614,7 +2615,7 @@ fn a_relaunched_task_landed_under_land_is_told_so_and_typed_nothing() {
 /// nothing).
 #[test]
 fn a_relaunched_task_that_failed_under_land_rests_and_typed_nothing() {
-    use crate::supervise::policy::turn_end::GaveUp;
+    use alab_policy::words::GaveUp;
     let min = |n: u64| Duration::from_secs(60 * n);
     let carried = |tag: &str, said: &str, word: &'static str, seeded: bool| {
         let (dir, path) = if seeded {
@@ -3687,7 +3688,10 @@ fn restart_over_landing(
     let opts = SuperviseOpts {
         policy: SupervisorConfig {
             human_grace_s: 0,
-            autopilot: table,
+            turn_end: alab_policy::config::PolicyConfig {
+                autopilot: table,
+                ..owners_policy().turn_end.clone()
+            },
             ..owners_policy()
         },
         journal: Some(crate::supervise::approvals::journal_beside(ledger)),

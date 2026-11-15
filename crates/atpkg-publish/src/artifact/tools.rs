@@ -27,7 +27,61 @@ pub struct Run {
     pub env: Vec<(String, OsString)>,
     /// A hang detector: the runner owns termination and cleanup past it.
     pub deadline: Option<Duration>,
+    /// The build queue [`Run::deadline`] does not count ([`Queue`]); `None` counts every second.
+    pub queue: Option<Queue>,
 }
+
+/// The time a bounded run's builds wait to be admitted, which its bound does not count.
+///
+/// A `targo` build claims this machine's capacity before it compiles
+/// ([`aterm_capacity::Ledger`]) and waits its turn behind every claim ahead of it: an hour and
+/// more behind a release's qualification. That wait says how busy the machine is and nothing of
+/// the run, so a run that carries a queue is ended once its own time, the time since it started
+/// less the time a claim of its checkout waited, reaches [`Run::deadline`]; a wait past
+/// [`QUEUE_PATIENCE`] ends it whatever it waits for. Two queues are equal when they name one
+/// checkout.
+#[derive(Clone, Debug)]
+pub struct Queue {
+    /// The checkout whose claims' waits are not counted: the one the run builds in.
+    pub checkout: PathBuf,
+    waited_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The longest a run with a [`Queue`] is left to wait for admission beyond its own bound: a hang
+/// detector for the queue itself, far past a release's whole qualification.
+pub const QUEUE_PATIENCE: Duration = Duration::from_secs(12 * 3600);
+
+impl Queue {
+    /// The queue of builds in `checkout`, nothing waited yet.
+    #[must_use]
+    pub fn of(checkout: &Path) -> Self {
+        Self {
+            checkout: checkout.to_path_buf(),
+            waited_ms: std::sync::Arc::default(),
+        }
+    }
+
+    /// How long the run's builds have waited for admission, as its runner last read it.
+    #[must_use]
+    pub fn waited(&self) -> Duration {
+        Duration::from_millis(self.waited_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Record `waited`, the whole wait so far: the runner's own reading, or a test's.
+    pub fn set_waited(&self, waited: Duration) {
+        let ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+        self.waited_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl PartialEq for Queue {
+    fn eq(&self, other: &Self) -> bool {
+        self.checkout == other.checkout
+    }
+}
+
+impl Eq for Queue {}
 
 impl Run {
     /// `program args…`, inheriting this environment, unbounded.
@@ -44,6 +98,7 @@ impl Run {
             env_remove: Vec::new(),
             env: Vec::new(),
             deadline: None,
+            queue: None,
         }
     }
 
@@ -213,15 +268,19 @@ pub trait Tools {
     fn compressor(&self) -> &dyn super::tarwrite::Compressor;
 }
 
-/// A compiler's `-vV`, bounded — the probe the client's lineage checker takes.
+/// A compiler's complete UTF-8 `-vV`, bounded in time and size — the client's lineage probe.
 /// # Errors
-/// The text of why it did not answer.
+/// Why it did not answer successfully with complete, valid UTF-8 stdout within the bound.
 pub fn version(tools: &dyn Tools, compiler: &Path) -> Result<String, String> {
     let ran = tools
-        .run(&Run::new(compiler, ["-vV"]).bounded())
+        .run_complete(
+            &Run::new(compiler, ["-vV"]).bounded(),
+            aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+        )
         .map_err(|e| format!("`{} -vV` {e}", compiler.display()))?;
     if ran.success() {
-        Ok(String::from_utf8_lossy(&ran.stdout).into_owned())
+        atpkg::lineage::decode_version_stdout(ran.stdout)
+            .map_err(|why| format!("`{} -vV` {why}", compiler.display()))
     } else {
         Err(format!(
             "`{} -vV` exited {:?}: {}",
@@ -280,19 +339,31 @@ fn host_command(run: &Run) -> aterm_uds::spawnfd::Command {
     cmd
 }
 
+fn host_deadline(within: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(within)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 86_400))
+}
+
 impl Tools for HostTools {
     fn run(&self, run: &Run) -> Result<Ran, RunError> {
         let mut cmd = host_command(run);
-        let out = match run.deadline {
-            Some(limit) => {
-                let now = Instant::now();
-                let until = now
-                    .checked_add(limit)
-                    .unwrap_or_else(|| now + Duration::from_secs(365 * 86_400));
-                aterm_uds::deadline::output_until(&mut cmd, until)
+        let out = match (run.deadline, &run.queue) {
+            (Some(limit), Some(queue)) => {
+                let mut clock = super::queue_clock::HostClock::start(limit, queue);
+                aterm_uds::deadline::output_until_from_unless(
+                    &mut cmd,
+                    aterm_uds::spawnfd::Stdio::null(),
+                    host_deadline(limit.saturating_add(QUEUE_PATIENCE)),
+                    &mut || clock.over(),
+                )
+                .map_err(RunError::from_collector)?
+            }
+            (Some(limit), None) => {
+                aterm_uds::deadline::output_until(&mut cmd, host_deadline(limit))
                     .map_err(RunError::from_collector)?
             }
-            None => {
+            (None, _) => {
                 // Match Command::output's stdio and collection, keeping the owned-child
                 // boundary visible: a capture or wait failure cannot mean no dispatch.
                 let child = cmd
@@ -315,11 +386,23 @@ impl Tools for HostTools {
 
     fn run_complete(&self, run: &Run, limit: usize) -> Result<Ran, RunError> {
         let mut cmd = host_command(run);
-        let out = aterm_uds::deadline::output_until_complete_stdout_with_limit(
-            &mut cmd,
-            Instant::now() + run.deadline.unwrap_or(HANG),
-            limit,
-        )
+        let within = run.deadline.unwrap_or(HANG);
+        let out = match &run.queue {
+            Some(queue) => {
+                let mut clock = super::queue_clock::HostClock::start(within, queue);
+                aterm_uds::deadline::output_until_complete_stdout_with_limit_unless(
+                    &mut cmd,
+                    host_deadline(within.saturating_add(QUEUE_PATIENCE)),
+                    limit,
+                    &mut || clock.over(),
+                )
+            }
+            None => aterm_uds::deadline::output_until_complete_stdout_with_limit(
+                &mut cmd,
+                host_deadline(within),
+                limit,
+            ),
+        }
         .map_err(RunError::from_complete_collector)?;
         Ok(Ran {
             code: out.status.code(),

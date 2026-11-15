@@ -709,12 +709,26 @@ fn the_worst_row_decides_and_a_failed_test_is_its_own_finding() {
     let r = judge(Check::Lint, &[&lint], 2.0, "-p a", "rerun".into(), None);
     assert_eq!(r.outcome, Outcome::Ok);
 
-    let mut skipped = Report::new("doc");
-    skipped.skip("targo test --doc (no library)");
-    let r = judge(Check::Doc, &[&skipped], 0.0, "-p a", "rerun".into(), None);
+    let mut skipped = Report::new("appkit");
+    skipped.skip("appkit (no app)");
+    let r = judge(
+        Check::Appkit,
+        &[&skipped],
+        0.0,
+        "-p a",
+        "rerun".into(),
+        None,
+    );
     assert_eq!(r.outcome, Outcome::Skip);
     skipped.skip("another (no tool)");
-    let r = judge(Check::Doc, &[&skipped], 0.0, "-p a", "rerun".into(), None);
+    let r = judge(
+        Check::Appkit,
+        &[&skipped],
+        0.0,
+        "-p a",
+        "rerun".into(),
+        None,
+    );
     assert_eq!(r.findings.len(), 2, "each reason listed under it");
 
     let mut test = Report::new("test");
@@ -739,7 +753,7 @@ fn the_worst_row_decides_and_a_failed_test_is_its_own_finding() {
 #[test]
 fn the_exit_code_is_the_worst_check_and_a_release_skip_is_could_not_run() {
     let ok = result(Check::Fmt, Outcome::Ok);
-    let skip = result(Check::Doc, Outcome::Skip);
+    let skip = result(Check::Appkit, Outcome::Skip);
     let fail = result(Check::Lint, Outcome::Fail(Severity::GateFailed));
     let unrun = result(Check::Test, Outcome::Fail(Severity::CouldNotRun));
     let code = |results: &[CheckResult], release: bool| verdict(results, release, 1.0).1;
@@ -766,8 +780,8 @@ fn a_check_the_first_red_stopped_is_counted_apart_from_what_could_not_run() {
     let words = "stopped: the release failed at fmt";
     let mut halted = Report::new("tippy");
     halted.cannot_run(format!("tippy — {words}"));
-    let mut machine = Report::new("doc");
-    machine.cannot_run("targo test --doc — no disk");
+    let mut machine = Report::new("appkit");
+    machine.cannot_run("appkit — no disk");
     let lint = judge(
         Check::Lint,
         &[&halted],
@@ -776,8 +790,8 @@ fn a_check_the_first_red_stopped_is_counted_apart_from_what_could_not_run() {
         "rerun".into(),
         Some(words),
     );
-    let doc = judge(
-        Check::Doc,
+    let appkit = judge(
+        Check::Appkit,
         &[&machine],
         0.0,
         "",
@@ -786,15 +800,15 @@ fn a_check_the_first_red_stopped_is_counted_apart_from_what_could_not_run() {
     );
     assert!(lint.stopped, "every NOT RUN row says the halt's words");
     assert!(
-        !doc.stopped,
+        !appkit.stopped,
         "the machine kept it from running, not the halt"
     );
     let fmt = result(Check::Fmt, Outcome::Fail(Severity::GateFailed));
-    let (line, code) = verdict(&[fmt, lint.clone(), doc], true, 1.0);
+    let (line, code) = verdict(&[fmt, lint.clone(), appkit], true, 1.0);
     assert_eq!(code, crate::exit::FAILED);
     assert_eq!(
         line,
-        "verify: FAIL — fmt failed; doc could not run; \
+        "verify: FAIL — fmt failed; appkit could not run; \
          1 not run (stopped at the first red: lint); 0 ok in 1.0s"
     );
     let (line, code) = verdict(&[lint], true, 1.0);

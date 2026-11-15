@@ -684,6 +684,31 @@ impl HeldProgram {
         self.validate(deadline)
     }
 
+    /// Require closed local-archive service support from this SAME retained
+    /// Targo image. This reads no request-selected image and grants no Root,
+    /// source/contents custody, native execution, seed or settlement authority.
+    pub fn require_bootstrap_archive_protocol_marker(
+        &self,
+        _expected: &[u8; 64],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.validate(deadline)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        protocol_marker::require(
+            &self.executable.file,
+            protocol_marker::Profile::BootstrapArchive,
+            _expected,
+            deadline,
+        )?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native Bootstrap archive declarations require macOS arm64",
+        ));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.validate(deadline)
+    }
+
     /// Require the distinct compiler member-original/extra/return declaration
     /// from this same held executable. Generic resource-v3 and root-workload
     /// support are insufficient. This grants no CPU, SDK, GO or proof authority.

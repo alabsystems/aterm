@@ -145,7 +145,7 @@ fn create_rows_in<const N: usize>(
             Layout::Unit => 1_790_000_000,
             Layout::SourceHost => crate::supervise::limit::unix_now(),
         },
-        sid: "s-test-owner".into(),
+        sid: "t0test0wner".into(),
         sock: None,
         config: None,
         claude_tmp: None,

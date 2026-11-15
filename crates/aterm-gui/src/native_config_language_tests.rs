@@ -2280,7 +2280,12 @@ fn every_ai_key_is_known_to_the_config_language() {
         "{:?}",
         ignored_key_warnings(&text)
     );
-    for key in ["ai.reviewers", "ai.review_count", "ai.review_timeout_s"] {
+    for key in [
+        "ai.machine",
+        "ai.reviewers",
+        "ai.review_count",
+        "ai.review_timeout_s",
+    ] {
         assert!(
             crate::prefs::nested_leaf(key).is_none(),
             "{key} has no Settings row"
@@ -2295,7 +2300,6 @@ fn every_ai_key_is_known_to_the_config_language() {
         crate::prefs::EDIT_AI_PREFERRED,
         crate::prefs::EDIT_AI_REVIEWS,
         crate::prefs::EDIT_AI_REVIEW_PERMISSIONS,
-        crate::prefs::EDIT_AI_MACHINE,
         crate::prefs::EDIT_AI_FLEET,
         crate::prefs::EDIT_AI_FLEET_KEY,
     ]

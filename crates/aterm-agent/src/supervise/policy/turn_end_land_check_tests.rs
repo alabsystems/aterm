@@ -7,7 +7,8 @@
 
 use crate::harness::acts::HoldLeg;
 use crate::harness::repo_work::{RepoRead, RepoWork};
-use crate::supervise::policy::land_check::{self, CheckAnswer};
+use alab_policy::config::TurnEndTiming;
+use alab_policy::land_check::{self, CheckAnswer};
 
 /// What the agent lists as left, answering the check.
 const LIST: &str = "The docs PR is still open.";
@@ -756,7 +757,7 @@ fn the_checks_turn_may_name_what_it_then_landed() {
 /// nudged, never checked twice.
 #[test]
 fn a_check_typed_again_after_a_compaction_audits_the_same_defense() {
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let context = |worked| land(walled(WallKind::Context, "Context limit reached", worked));
     let compacted = land(idle(
         "Conversation compacted.",

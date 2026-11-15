@@ -13,7 +13,7 @@
 //! one file in this user's aterm state directory ([`Book::live`]). A record is keyed by the stage,
 //! the checkout it ran in (each checkout builds into a cache of its own, and a warm cache compiles
 //! less than a cold one), the run's sorted crate selection for a stage that reads it (the test
-//! compile and run, the doctests, the lint, and the cells a selection pulled; every other stage
+//! compile and run, the lint, and the cells a selection pulled; every other stage
 //! does the same work whatever is selected), and what else changes its work: the cells asked for
 //! ([`Key`]). It keeps the last [`KEPT`] peaks, so a light run never hides the heavy one before
 //! it. The next run of that stage over that key claims the most of them and a fifth more, at
@@ -107,7 +107,7 @@ pub enum Named {
 #[must_use]
 pub fn read_unit(pid: u32) -> Named {
     static OWN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    let Some(buf) = aterm_sysprobe::procargs::read(pid) else {
+    let Ok(buf) = aterm_sysprobe::procargs::read(pid) else {
         return Named::Unread;
     };
     let Some(args) = aterm_sysprobe::procargs::parse(&buf) else {
@@ -232,7 +232,7 @@ pub const PLAIN_RECORD: &str = aterm_capacity::book::TARGO_RECORD;
 
 /// Whether stage `id` compiles, and so claims [`aterm_capacity::cold_claim`] until a run of it,
 /// or runs of narrower selections that cover its own ([`composed`]), are measured: each such
-/// stage runs a cargo or rustdoc build of its own (a test, lint, doctest, checkers or measuring
+/// stage runs a cargo build of its own (a test, lint, checkers or measuring
 /// compile, a cell's or the libc oracle's workspace, the export's release tools, the web modules,
 /// the conformance and Objective-C drives' binaries, `spec-check`, the aterm the codex-alab proof
 /// drives, the lab the Linux lane boots its VM with, which claims its guest's memory as a claim
@@ -244,20 +244,19 @@ pub const PLAIN_RECORD: &str = aterm_capacity::book::TARGO_RECORD;
 pub const fn compiles(id: StageId) -> bool {
     match id {
         StageId::TestCompile
-        | StageId::Doctests
         | StageId::Tippy
         | StageId::Export
         | StageId::LibcOracle
         | StageId::SpecCheck
+        | StageId::CandidateShim
         | StageId::MeasurePrebuild
         | StageId::ForeignCells
-        | StageId::WasmSmoke
         | StageId::WasmGlue
         | StageId::BrowserLane
         | StageId::RedrawConformance
         | StageId::ObjcDrives
         | StageId::CodexAlabProof
-        | StageId::LinuxLane => true,
+        | StageId::LinuxLabBuild => true,
         StageId::Test
         | StageId::ReleasedShim
         | StageId::Formatting
@@ -266,7 +265,8 @@ pub const fn compiles(id: StageId) -> bool {
         | StageId::SpecCheckers
         | StageId::MeasuringTests
         | StageId::GuiSmoke
-        | StageId::Forge => false,
+        | StageId::Forge
+        | StageId::LinuxLane => false,
     }
 }
 
@@ -388,6 +388,9 @@ pub struct Meter {
     cpu: Mutex<std::collections::BTreeMap<(u32, u64), u64>>,
     /// Each live group's CPU rate between its last two reads, cores, and when it was last read.
     rates: Mutex<std::collections::BTreeMap<u32, (std::time::Instant, f64)>>,
+    /// The waits for a core its compile calls' accounts read, summed ([`Meter::book_starved`]);
+    /// `None` where none read one.
+    starved: Mutex<Option<std::time::Duration>>,
 }
 
 impl Meter {
@@ -410,6 +413,7 @@ impl Meter {
             held: Mutex::default(),
             cpu: Mutex::default(),
             rates: Mutex::default(),
+            starved: Mutex::default(),
             units: Some(Mutex::new(Units {
                 reader,
                 floor,
@@ -625,6 +629,20 @@ impl Meter {
         (!rates.is_empty()).then(|| rates.values().map(|(_, rate)| rate).sum())
     }
 
+    /// Add `waited`, the time one of the stage's compile calls waited for a core as its account
+    /// read it ([`crate::compile_account::Account`]), to the stage's ([`Meter::starved`]).
+    pub fn book_starved(&self, waited: std::time::Duration) {
+        let mut starved = self.starved.lock().unwrap_or_else(PoisonError::into_inner);
+        *starved = Some(starved.unwrap_or_default().saturating_add(waited));
+    }
+
+    /// The time the stage's compile calls waited for a core, as their accounts read it, summed;
+    /// `None` where no call's account read one (no compile, or an unread tree).
+    #[must_use]
+    pub fn starved(&self) -> Option<std::time::Duration> {
+        *self.starved.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Retain observed CPU after groups exit, counting a process incarnation once
     /// even if it moves between groups. No sample is unknown, not zero; CPU from
     /// descendants that exited between samples and in-process verifier work is absent.
@@ -649,8 +667,8 @@ impl Meter {
     }
 
     /// What the stage held at most, bytes, for its record: its [`Meter::peak`], or 0 when it
-    /// started no child ([`Meter::started`]: a doctest stage over crates with no fenced Rust
-    /// block), so its next run claims the margin alone and not the cold figure. `None` when
+    /// started no child ([`Meter::started`]), so its next run claims the margin alone and not
+    /// the cold figure. `None` when
     /// children started and no read booked anything (a host whose groups are unread: every
     /// platform but macOS).
     #[must_use]
@@ -759,21 +777,15 @@ impl Drop for Covering {
 }
 
 /// Whether stage `id` does work that depends on the run's crate selection, with cells pulled by
-/// it or not: the test compile and run, the doctests and the lint build and run what is selected,
+/// it or not: the test compile and run (its doctests included) and the lint build and run what is selected,
 /// and the cells lane, when the selection pulled it ([`crate::Ctx::cells_pulled`]), checks the
 /// cells whose graph holds a selected crate. Every other stage builds and runs the same whatever
 /// is selected, so its peak is kept for the workspace.
 #[must_use]
 pub const fn reads_selection(id: StageId, cells_pulled: bool) -> bool {
     match id {
-        StageId::TestCompile
-        | StageId::Test
-        | StageId::Doctests
-        | StageId::Tippy
-        | StageId::SpecCheckers => true,
-        StageId::ForeignCells | StageId::WasmSmoke | StageId::WasmGlue | StageId::BrowserLane => {
-            cells_pulled
-        }
+        StageId::TestCompile | StageId::Test | StageId::Tippy | StageId::SpecCheckers => true,
+        StageId::ForeignCells | StageId::WasmGlue | StageId::BrowserLane => cells_pulled,
         _ => false,
     }
 }
@@ -823,10 +835,7 @@ impl StageKey for Key {
         };
         key.checkout = ctx.root.display().to_string();
         key.variant = match id {
-            StageId::ForeignCells
-            | StageId::WasmSmoke
-            | StageId::WasmGlue
-            | StageId::BrowserLane
+            StageId::ForeignCells | StageId::WasmGlue | StageId::BrowserLane
                 if ctx.cells_pulled =>
             {
                 Some("cells pulled".to_owned())
@@ -1087,7 +1096,7 @@ fn and_list(items: &[String]) -> String {
 /// than the heaviest unit of its crates any checkout kept ([`Records::unit_floor`]): either shows
 /// the wider run warm. LIMIT: a warm wider run neither outweighs answers, and nothing here can
 /// tell. A one-crate selection has no narrower named selection inside it, so where it has no unit
-/// floor its most wider record elsewhere always answers: for the lint, the doctests and the
+/// floor its most wider record elsewhere always answers: for the lint and the
 /// cells, which keep no unit's peak, and for a test compile none of whose crates kept a unit
 /// (one is kept only at [`UNIT_FLOOR`] or more).
 #[must_use]
@@ -1303,7 +1312,7 @@ pub fn composed(records: &Records, key: &Key) -> Option<Cover> {
 /// before. The plan raises the unshaped test compile to at least its estimate besides
 /// ([`crate::shape::shape`]), which, where narrower records are kept, is at least the heaviest
 /// disjoint narrower records summed: the lesser decides the test compile's claim only where it
-/// exceeds that estimate, and always decides the lint's, the doctests' and the pulled cells',
+/// exceeds that estimate, and always decides the lint's and the pulled cells',
 /// which no estimate raises.
 #[must_use]
 pub fn need(
@@ -1381,15 +1390,28 @@ pub(crate) fn need_for_jobs(
     physical: Option<u64>,
     jobs: Option<u32>,
 ) -> StageNeed {
+    need_keyed(records, plain, spec, key, physical, jobs).0
+}
+
+/// [`need_for_jobs`], with the compiler jobs of the record it read where that record is the one
+/// keyed by them (`compiler jobs N`, [`crate::compile_width::record_key`]): `Some(N)` where the
+/// pooled key kept a peak here or elsewhere and sized the need, `None` where the unkeyed key's
+/// lookup did (no width, or an unseen one), whatever that found. What a stage's admission-log
+/// row says its claim was sized at.
+#[must_use]
+pub(crate) fn need_keyed(
+    records: &Records,
+    plain: &Records,
+    spec: &StageSpec,
+    key: &Key,
+    physical: Option<u64>,
+    jobs: Option<u32>,
+) -> (StageNeed, Option<u32>) {
     let pooled = crate::compile_width::record_key(key.clone(), jobs);
-    let key = if jobs.is_some()
-        && (records.learned(&pooled).is_some() || records.elsewhere(&pooled).is_some())
-    {
-        &pooled
-    } else {
-        key
-    };
-    need(records, plain, spec, key, physical)
+    let keyed =
+        jobs.filter(|_| records.learned(&pooled).is_some() || records.elsewhere(&pooled).is_some());
+    let key = if keyed.is_some() { &pooled } else { key };
+    (need(records, plain, spec, key, physical), keyed)
 }
 
 /// THE RUN'S MEMORY BOOK: where its stages' peaks are kept, and the machine they are claimed on,
@@ -1499,7 +1521,19 @@ impl Book {
     /// What `spec`, its record kept under `key`, claims ([`need`]).
     #[must_use]
     pub fn need(&self, spec: &StageSpec, key: &Key, jobs: Option<u32>) -> StageNeed {
-        need_for_jobs(
+        self.need_keyed(spec, key, jobs).0
+    }
+
+    /// [`Self::need`], with the compiler jobs of the width-keyed record that sized it, where one
+    /// did ([`need_keyed`]).
+    #[must_use]
+    pub(crate) fn need_keyed(
+        &self,
+        spec: &StageSpec,
+        key: &Key,
+        jobs: Option<u32>,
+    ) -> (StageNeed, Option<u32>) {
+        need_keyed(
             &self.records(),
             &self.plain_records(),
             spec,

@@ -4,7 +4,7 @@
 use super::super::approval_loop::whole_box_decision;
 use super::super::box_head::joined_box;
 use crate::supervise::policy::approval::{self as policy, ApprovalCtx, Choice, Decision};
-use crate::supervise::policy::row_guard;
+use alab_policy::guard::row_guard;
 use aterm_phase::prompt::fixtures as fx;
 
 /// A measured box's screen and the row its top rule is on (the rows above it

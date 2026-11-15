@@ -141,6 +141,22 @@ impl Grid {
 
     /// Scroll full-screen content up by `n` lines, pushing evicted top rows into scrollback.
     #[doc(hidden)]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ScrollbackHandoff",
+            action = "FillRoom",
+            project = "grid::scrollback_offload::tests::handoff_environment_actions_match_grid_and_reject_wrong_rows"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ScrollbackHandoff",
+            action = "Output",
+            project = "grid::scrollback_offload::tests::handoff_environment_actions_match_grid_and_reject_wrong_rows"
+        )
+    )]
     pub fn scroll_up(&mut self, n: usize) {
         if n == 0 {
             return;

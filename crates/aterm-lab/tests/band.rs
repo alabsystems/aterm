@@ -140,6 +140,38 @@ fn band_launch(dir: &Path, label: &str, program: &[&str]) {
 }
 
 #[test]
+fn intentional_jobs_relaunch_in_one_world_without_rearming_a_generation() {
+    let owned_world = aterm_tempfile::TempDir::new_in(aterm_tempfile::target_tmpdir())
+        .expect("exclusive scratch world");
+    let dir = real_path(owned_world.path());
+    let mut command = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-lab"));
+    command.arg("band-sequence").arg(&dir).setsid(true);
+    // Each launch has start, two child echoes, old-generation activity and
+    // automatic-removal bounds. Reserve two further finite cleanup phases;
+    // successful stages do not share a cumulative one-minute latency budget.
+    let outer = HANG * (2 * 5 + 2);
+    let out = aterm_uds::deadline::output_within(&mut command, outer)
+        .expect("sequential Job launches finish within the hang detector");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let proof = String::from_utf8(out.stdout).expect("launch proof");
+    let rows: Vec<_> = proof.lines().collect();
+    assert_eq!(rows.len(), 2, "{proof}");
+    assert!(rows[0].starts_with("launch=1 "), "{proof}");
+    assert!(rows[1].starts_with("launch=2 "), "{proof}");
+    for row in rows {
+        assert!(row.ends_with("absent=yes replay=refused"), "{proof}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("log")).unwrap(),
+        "launch=1 before\nlaunch=1 after\nlaunch=2 before\nlaunch=2 after\n"
+    );
+}
+
+#[test]
 fn an_app_band_job_runs_its_program_as_an_app_in_its_own_coalition_and_is_removed_once_it_ends() {
     let owned_world = aterm_tempfile::TempDir::new_in(aterm_tempfile::target_tmpdir())
         .expect("exclusive scratch world");

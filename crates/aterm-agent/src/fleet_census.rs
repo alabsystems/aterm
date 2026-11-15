@@ -85,7 +85,8 @@ impl StragglerReason {
 pub struct MemberAccountSummary {
     /// Number of pool accounts whose `warm` list includes this Mac (or its aliases).
     pub warm: usize,
-    /// Number of pool accounts this Mac holds a lease on: its senior live claims of kind lease.
+    /// Number of pool accounts this Mac holds a lease on: its senior live claims that are no
+    /// home's use as the census host reads them (`claims::View::home_use`).
     pub leased: usize,
     /// Number of warm accounts for this Mac currently reported walled.
     pub walled: usize,
@@ -367,12 +368,13 @@ pub struct CensusInputs {
     pub commons_labels: BTreeSet<String>,
     /// Explicit Commons member count override when per-label bindings are opaque.
     pub commons_member_count: Option<usize>,
-    /// Parsed `ai-pool.toml`, when materialized.
+    /// The vault's `ai-pool.toml`, where this Mac's store reads it.
     pub pool: Option<Pool>,
     /// Every Mac's account claims row (`accounts/claims/1`).
     pub claims: claims::Book,
-    /// How the census host reads `claims`: its machine and what its Commons hears, so a lease
-    /// whose Mac it has not heard counts for nobody, as on every Mac's claims path.
+    /// How the census host reads `claims`: its machine, what its Commons hears, so a lease
+    /// whose Mac it has not heard counts for nobody, as on every Mac's claims path, and each
+    /// account's homes as its lab names them.
     pub claims_view: claims::View,
     /// Bonjour LAN hosts (`_ssh._tcp`, `_rfb._tcp`, `_alab._tcp`).
     pub bonjour_hosts: Vec<BonjourHostInput>,
@@ -1050,7 +1052,7 @@ impl SwarmCensus {
                 .filter(|row| identity.matches(&row.label))
                 .flat_map(|row| {
                     row.claims.iter().filter(|claim| {
-                        claim.kind == claims::Kind::Lease
+                        !inputs.claims_view.home_use(&row.machine, claim)
                             && active_claims
                                 .senior(&claim.key, &inputs.claims_view, now_i64)
                                 .is_some_and(|holder| holder.machine == row.machine)
@@ -1633,28 +1635,6 @@ static CENSUS_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(unix)]
 const CENSUS_FILE_MAX_BYTES: usize = 4 << 20;
 
-#[cfg(unix)]
-fn read_regular_nofollow_bounded(path: &Path, max_bytes: usize) -> Option<String> {
-    use std::io::Read as _;
-    let file = astream_sys::open_nonblocking(path, astream_sys::Links::Refuse).ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > max_bytes as u64 {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(meta.len())
-            .unwrap_or(0)
-            .min(max_bytes)
-            .saturating_add(1),
-    );
-    file.take((max_bytes as u64).saturating_add(1))
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() <= max_bytes)
-        .then_some(bytes)
-        .and_then(|b| String::from_utf8(b).ok())
-}
-
 /// Read `<state_dir>/swarm-census.json` when present and valid.
 #[cfg(unix)]
 #[must_use]
@@ -1892,12 +1872,7 @@ fn collect_local_census_inputs_until(
         for (vault, subject, at) in aterm_secrets::server::read_last_heard(&paths.served()) {
             server_heard.push(ServerHeardFact { vault, subject, at });
         }
-        let pool_path = home.join(".secrets").join(ai_pool::AI_POOL_FILE);
-        if let Some(raw) = read_regular_nofollow_bounded(&pool_path, CENSUS_FILE_MAX_BYTES)
-            && let Ok(parsed) = Pool::from_toml(&raw, &pool_path.display().to_string())
-        {
-            pool = Some(parsed);
-        }
+        pool = ai_pool::read_under(home);
     }
 
     let ListedBook {

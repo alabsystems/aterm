@@ -8,7 +8,10 @@
 //! chain, or the writer a one-run push grant names); a release-tier owner gets
 //! a credential only under a live grant for that slug, asked by a process in the grant's
 //! tree, and a grant never outlives the child it was written for (a spawner killed before it
-//! consumed the grant leaves a stale file, which expires).
+//! consumed the grant leaves a stale file, which expires). Supplied invalid grants never
+//! fall back to reads, and final output compares the operation commitment with the actual
+//! credential retained for emission. Model grants represent the correct writer the runner
+//! issues; corrupt writer profiles are covered by concrete helper regressions.
 
 use aterm_spec::derive::Model;
 
@@ -26,6 +29,8 @@ pub fn agh_git_grant_model() -> Model {
             var op = 0;     // 0 get, 1 store, 2 erase
             var slugm = 1;  // 1: the grant's slug is the request's
             var asker = 0;  // 1: the asking process is outside the grant's tree
+            var supplied = 0; // an operation nonce was supplied, even when invalid
+            var bindingm = 1; // the emitted credential matches the operation commitment
             var grant = 0;  // 0 none, 1 live, 2 stale (its spawner was killed)
             var child = 0;  // 0 none, 1 running, 2 exited
             var phase = 0;  // 0 choosing, 1 answered with a credential, 2 quit
@@ -37,18 +42,18 @@ pub fn agh_git_grant_model() -> Model {
             action NextOp when (phase == 0) { op = if op == 2 { 0 } else { op + 1 }; }
             action ToggleSlug when (phase == 0) { slugm = 1 - slugm; }
             action ToggleAsker when (phase == 0) { asker = 1 - asker; }
-            action Spawn when (phase == 0 && grant == 0 && child == 0) { grant = 1; child = 1; }
+            action ToggleSupplied when (phase == 0) { supplied = 1 - supplied; }
+            action ToggleBinding when (phase == 0) { bindingm = 1 - bindingm; }
+            action Spawn when (phase == 0 && grant == 0 && child == 0) { grant = 1; child = 1; supplied = 1; }
             action ChildExits when (phase == 0 && child == 1) { child = 2; }
             action Consume when (phase == 0 && child == 2 && grant == 1) { grant = 0; child = 0; }
             action SpawnerKilled when (phase == 0 && child == 2 && grant == 1) { grant = 2; }
             action Expire when (phase == 0 && grant == 2) { grant = 0; child = 0; }
             action Answer when (phase == 0) {
                 phase = if path == 1 && host == 1 && tty == 0 && op == 0
-                        && (tier == 0 || (grant == 1 && child == 1 && asker == 0 && slugm == 1)) { 1 } else { 2 };
-                used = if path == 1 && host == 1 && tty == 0 && op == 0 && tier == 1
-                        && grant == 1 && child == 1 && asker == 0 && slugm == 1 { 2 }
-                    else if path == 1 && host == 1 && tty == 0 && op == 0 && tier == 0 { 1 }
-                    else { 0 };
+                        && ((supplied == 0 && tier == 0) || (supplied == 1 && grant == 1 && child == 1 && asker == 0 && slugm == 1 && bindingm == 1)) { 1 } else { 2 };
+                used = if path == 1 && host == 1 && tty == 0 && op == 0
+                        && ((supplied == 0 && tier == 0) || (supplied == 1 && grant == 1 && child == 1 && asker == 0 && slugm == 1 && bindingm == 1)) { tier + 1 } else { 0 };
             }
             action Reset when (phase > 0) { phase = 0; used = 0; }
             action BuggyPathless when (Buggy == 1 && phase == 0 && path == 0 && tier == 0) { phase = 1; used = 1; }
@@ -65,6 +70,12 @@ pub fn agh_git_grant_model() -> Model {
                     && tier == 1 && grant == 1 && child == 1 && slugm == 0) { phase = 1; used = 2; }
             action BuggyReleaseForDev when (Buggy == 1 && phase == 0 && path == 1 && host == 1 && tty == 0 && op == 0
                     && tier == 0 && grant == 1 && child == 1) { phase = 1; used = 2; }
+            action BuggySuppliedFallback when (Buggy == 1 && phase == 0 && path == 1 && host == 1 && tty == 0 && op == 0
+                    && tier == 0 && supplied == 1 && grant == 0) { phase = 1; used = 1; }
+            action BuggyMismatchedCredential when (Buggy == 1 && phase == 0 && path == 1 && host == 1 && tty == 0 && op == 0
+                    && supplied == 1 && grant == 1 && child == 1 && asker == 0 && slugm == 1 && bindingm == 0) { phase = 1; used = tier + 1; }
+            invariant SuppliedGrantBound: used <= 0 || supplied == 0 || (grant == 1 && child == 1 && asker == 0 && slugm == 1);
+            invariant GrantCredentialBound: used <= 0 || supplied == 0 || bindingm == 1;
             invariant PathlessGetsNothing: path > 0 || used <= 0;
             invariant GithubOnly: host > 0 || used <= 0;
             invariant NoTerminalDoor: tty <= 0 || used <= 0;
@@ -76,6 +87,7 @@ pub fn agh_git_grant_model() -> Model {
             invariant GrantLive: used <= 1 || (grant == 1 && child == 1);
             invariant GrantPidBound: used <= 1 || asker <= 0;
             invariant GrantSlugBound: used <= 1 || slugm > 0;
+            bound SuppliedRange: supplied <= 1; bound BindingRange: bindingm <= 1;
             bound TierRange: tier <= 1;   bound PathRange: path <= 1;     bound HostRange: host <= 1;
             bound TtyRange: tty <= 1;     bound OpRange: op <= 2;         bound SlugRange: slugm <= 1;
             bound AskerRange: asker <= 1; bound GrantRange: grant <= 2;   bound ChildRange: child <= 2;

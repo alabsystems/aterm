@@ -34,6 +34,16 @@ struct Fake {
     removed: RefCell<Vec<PathBuf>>,
     runs: RefCell<Vec<Run>>,
     reply: Ran,
+    /// The vault's principal, `None` for a host that holds none.
+    principal: Option<Vec<(String, String)>>,
+    /// Each principal lookup, by what its miss would do.
+    looked: RefCell<Vec<Miss>>,
+    /// Each file's bytes, by its Windows spelling.
+    contents: RefCell<BTreeMap<String, Vec<u8>>>,
+    /// What a `signtool sign` leaves in each file it signs, by its Windows spelling.
+    signs_to: BTreeMap<String, Vec<u8>>,
+    /// Each file opened for reading.
+    opened: RefCell<Vec<PathBuf>>,
 }
 
 impl Fake {
@@ -46,7 +56,19 @@ impl Fake {
             removed: RefCell::new(Vec::new()),
             runs: RefCell::new(Vec::new()),
             reply: Ran::default(),
+            principal: None,
+            looked: RefCell::new(Vec::new()),
+            contents: RefCell::new(BTreeMap::new()),
+            signs_to: BTreeMap::new(),
+            opened: RefCell::new(Vec::new()),
         }
+    }
+
+    /// A file at `path` holding `bytes`, which a `signtool sign` replaces with `signed`.
+    fn package(&mut self, path: &Path, bytes: Vec<u8>, signed: Vec<u8>) {
+        self.files.push(path.to_path_buf());
+        self.contents.borrow_mut().insert(win_path(path), bytes);
+        self.signs_to.insert(win_path(path), signed);
     }
 }
 
@@ -57,6 +79,15 @@ impl Host for Fake {
     fn is_file(&self, path: &Path) -> bool {
         let want = win_path(path);
         self.files.iter().any(|f| win_path(f) == want)
+    }
+    fn open(&self, path: &Path) -> Result<Box<dyn ReadSeek + '_>, String> {
+        self.opened.borrow_mut().push(path.to_path_buf());
+        self.contents
+            .borrow()
+            .get(&win_path(path))
+            .cloned()
+            .map(|b| Box::new(std::io::Cursor::new(b)) as Box<dyn ReadSeek>)
+            .ok_or_else(|| format!("{}: not found", path.display()))
     }
     fn list_dir(&self, path: &Path) -> Vec<String> {
         let want = win_path(path);
@@ -96,11 +127,38 @@ impl Host for Fake {
         self.runs
             .borrow_mut()
             .push((program.to_path_buf(), args.to_vec(), env.to_vec()));
+        if args.first().is_some_and(|a| a == "sign") {
+            for arg in args {
+                if let Some(signed) = self.signs_to.get(&win_path(Path::new(arg))) {
+                    self.contents
+                        .borrow_mut()
+                        .insert(win_path(Path::new(arg)), signed.clone());
+                }
+            }
+        }
         Ok(self.reply.clone())
     }
     fn is_windows(&self) -> bool {
         true
     }
+    fn azure_principal(&self, miss: Miss) -> Result<Principal, String> {
+        self.looked.borrow_mut().push(miss);
+        self.principal
+            .clone()
+            .map(Principal::new)
+            .ok_or_else(|| format!("no principal in this vault ({miss:?})"))
+    }
+}
+
+/// A principal the fake vault holds.
+fn vault_principal() -> Vec<(String, String)> {
+    [
+        ("AZURE_TENANT_ID", "t"),
+        ("AZURE_CLIENT_ID", "c"),
+        ("AZURE_CLIENT_SECRET", "sentinel-secret"),
+    ]
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .to_vec()
 }
 
 /// `signtool verify /pa /v` over an Artifact Signing signature: each chain
@@ -377,12 +435,15 @@ fn metadata_json_escapes_what_a_name_could_carry() {
 }
 
 #[test]
-fn metadata_json_excludes_the_interactive_browser_credential() {
+fn metadata_json_excludes_every_credential_but_the_environments() {
     let m = trusted_signing_metadata("https://x", "a", "p");
     assert!(
-        m.contains(r#""ExcludeCredentials": ["InteractiveBrowserCredential"]"#),
+        m.contains(
+            r#""ExcludeCredentials": ["ManagedIdentityCredential", "WorkloadIdentityCredential", "SharedTokenCacheCredential", "VisualStudioCredential", "VisualStudioCodeCredential", "AzureCliCredential", "AzurePowerShellCredential", "AzureDeveloperCliCredential", "InteractiveBrowserCredential"]"#
+        ),
         "{m}"
     );
+    assert!(!m.contains("EnvironmentCredential"), "{m}");
 }
 
 #[test]
@@ -680,9 +741,7 @@ fn a_trusted_signing_sign_passes_dotnet_root_for_a_user_local_runtime() {
     ];
     h.env
         .insert("LOCALAPPDATA".into(), r"C:\Users\u\AppData\Local".into());
-    for k in ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"] {
-        h.env.insert(k.into(), "x".into());
-    }
+    h.principal = Some(vault_principal());
     h.dirs.insert(
         PathBuf::from(r"C:\Users\u\AppData\Local\Microsoft\dotnet\shared\Microsoft.NETCore.App"),
         vec!["8.0.31".into()],
@@ -714,12 +773,25 @@ fn a_trusted_signing_sign_passes_dotnet_root_for_a_user_local_runtime() {
     assert_eq!(runs.len(), 2);
     assert!(runs[0].1.contains(&"/dlib".to_string()));
     let child_env = &runs[0].2;
-    assert_eq!(child_env.len(), 1, "one variable, and only that one");
+    assert_eq!(
+        child_env[1..],
+        vault_principal(),
+        "the vault's principal, in signtool's environment and nowhere else"
+    );
+    assert!(
+        runs[0].1.iter().all(|arg| !arg.contains('=')),
+        "no variable on the command line"
+    );
+    assert_eq!(*h.looked.borrow(), [Miss::File]);
     assert!(
         h.written.borrow()[0]
             .1
             .contains("InteractiveBrowserCredential"),
         "the metadata shuts the browser sign-in out"
+    );
+    assert!(
+        !h.written.borrow()[0].1.contains("sentinel"),
+        "the metadata holds no value"
     );
     assert_eq!(child_env[0].0, "DOTNET_ROOT");
     assert_eq!(
@@ -747,6 +819,7 @@ fn a_trusted_signing_sign_passes_dotnet_root_for_a_user_local_runtime() {
     none.files.extend([exe.clone(), st.clone(), dlib.clone()]);
     none.env = h.env.clone();
     none.env.remove("LOCALAPPDATA");
+    none.principal = h.principal.clone();
     assert_eq!(run_with(sign, &none, &Tier::Inactive, Some(&lane)), 2);
     assert!(none.runs.borrow().is_empty());
 }
@@ -825,12 +898,27 @@ fn a_trusted_signing_sign_without_an_azure_principal_refuses_before_signtool() {
         dlib.display().to_string(),
         exe.display().to_string(),
     ];
+    for k in ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET"] {
+        h.env.insert(k.into(), "x".into());
+    }
     assert_eq!(
         run_inner(&sign, &h, &Tier::Inactive, Ok(Some(&lane))),
-        Err(NO_PRINCIPAL.to_string())
+        Err("no principal in this vault (File)".to_string()),
+        "the vault is the one source: winsign's own AZURE_* variables are not one"
     );
+    assert_eq!(*h.looked.borrow(), [Miss::File], "a miss is filed");
     assert!(h.runs.borrow().is_empty(), "nothing was executed");
     assert!(h.written.borrow().is_empty(), "no metadata written");
+    h.files.clear();
+    assert_eq!(
+        run_inner(&["doctor".into()], &h, &Tier::Inactive, Ok(Some(&lane))),
+        Ok(2)
+    );
+    assert_eq!(
+        *h.looked.borrow(),
+        [Miss::File, Miss::Report],
+        "doctor reports a miss and files nothing"
+    );
 }
 
 #[test]
@@ -859,4 +947,199 @@ fn an_invalid_pin_fails_only_the_verbs_that_sign() {
         run_inner(&["doctor".into()], &h, &Tier::Inactive, bad),
         Ok(2)
     );
+}
+
+/// A RUN THAT CARRIES THE VAULT'S PRINCIPAL DROPS EVERY INHERITED `AZURE_*` (an authority host
+/// would choose where the secret goes); one with no principal leaves the environment alone.
+#[test]
+fn the_principal_run_drops_every_inherited_azure_variable() {
+    let inherited = || {
+        ["AZURE_AUTHORITY_HOST", "AZURE_CLIENT_SECRET", "PATH"]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+    };
+    let principal = [("AZURE_TENANT_ID".to_owned(), "t".to_owned())];
+    assert_eq!(
+        stripped(&principal, inherited()),
+        ["AZURE_AUTHORITY_HOST", "AZURE_CLIENT_SECRET"]
+    );
+    assert!(stripped(&[], inherited()).is_empty());
+}
+
+/// A signer's package: an unsigned `.msix` whose manifest says `publisher`, which signtool
+/// leaves signed by a leaf whose subject is `signer`.
+fn signer_package(h: &mut Fake, msix: &Path, publisher: Option<&str>, signer: &[u8]) {
+    use crate::msix::tests::{manifest, signed_by, zip};
+    let manifest = manifest(publisher);
+    let unsigned = zip(&[("AppxManifest.xml", manifest.as_bytes())]);
+    let signed = zip(&[
+        ("AppxManifest.xml", manifest.as_bytes()),
+        ("AppxSignature.p7x", &signed_by(signer)),
+    ]);
+    h.package(msix, unsigned, signed);
+}
+
+fn sign_package_args(st: &Path, files: &[&Path]) -> Vec<String> {
+    let mut a = vec!["sign".into(), "--signtool".into(), st.display().to_string()];
+    a.extend(files.iter().map(|f| f.display().to_string()));
+    a
+}
+
+/// THE RELEASE MSIX'S PUBLISHER IS CHECKED AT BUILD, NOT AT INSTALL: one whose manifest
+/// Publisher is the pinned signer's subject signs, is read back after signing, and exits 0;
+/// an exe beside it is never opened as a package.
+#[test]
+fn a_package_whose_publisher_is_the_signers_subject_signs() {
+    use crate::msix::tests::{PUBLISHER, publisher_name};
+    let mut h = Fake::new();
+    let msix = PathBuf::from(r"C:\d\aterm-0.3.0-x64.msix");
+    let exe = PathBuf::from(r"C:\d\aterm.exe");
+    let st = PathBuf::from(r"C:\sdk\signtool.exe");
+    h.files.extend([exe.clone(), st.clone()]);
+    signer_package(&mut h, &msix, Some(PUBLISHER), &publisher_name());
+    h.reply = ran(0, VERIFIED);
+    let code = run_with(
+        sign_package_args(&st, &[&exe, &msix]),
+        &h,
+        &tier_from("Andrew Yates"),
+        Some(&Lane::Thumbprint("CD".repeat(20))),
+    );
+    assert_eq!(code, 0);
+    let runs = h.runs.borrow();
+    assert_eq!(runs.len(), 3, "one sign, then a verify of each file");
+    assert_eq!(runs[0].1[0], "sign");
+    let opened: Vec<String> = h.opened.borrow().iter().map(|p| win_path(p)).collect();
+    assert!(!opened.is_empty());
+    assert!(
+        opened.iter().all(|p| *p == win_path(&msix)),
+        "only the package is read: {opened:?}"
+    );
+}
+
+/// Before signtool runs, a manifest Publisher whose CN is not the pin, or that is missing or
+/// malformed, refuses the sign with exit 2 and names both values; nothing is executed.
+#[test]
+fn a_package_whose_publisher_is_not_the_pin_is_refused_before_signtool() {
+    use crate::msix::tests::publisher_name;
+    let msix = PathBuf::from(r"C:\d\aterm-0.3.0-x64.msix");
+    let st = PathBuf::from(r"C:\sdk\signtool.exe");
+    let lane = Lane::Thumbprint("CD".repeat(20));
+    let pin = tier_from("Andrew Yates");
+    let refused = |publisher: Option<&str>, tier: &Tier| {
+        let mut h = Fake::new();
+        h.files.push(st.clone());
+        signer_package(&mut h, &msix, publisher, &publisher_name());
+        h.reply = ran(0, VERIFIED);
+        let args = sign_package_args(&st, &[&msix]);
+        let why = run_inner(&args, &h, tier, Ok(Some(&lane))).unwrap_err();
+        assert_eq!(run_with(args, &h, tier, Some(&lane)), 2);
+        assert!(h.runs.borrow().is_empty(), "signtool never ran: {why}");
+        why
+    };
+    let why = refused(Some("CN=Andrew Yate, O=Andrew Yates, C=US"), &pin);
+    assert!(
+        why.contains("CN `Andrew Yate`")
+            && why.contains("pins::WINDOWS_SIGNING_PUBLISHER is `Andrew Yates`"),
+        "{why}"
+    );
+    assert!(refused(None, &pin).contains("no Publisher"));
+    assert!(refused(None, &Tier::Inactive).contains("no Publisher"));
+    let why = refused(Some("Andrew Yates"), &Tier::Inactive);
+    assert!(why.contains("not a distinguished name"), "{why}");
+
+    // Lane A looks up the vault's principal, and a miss files a need with the lab: a bad
+    // Publisher is refused before that lookup, and before any metadata is written.
+    let mut h = Fake::new();
+    let dlib = PathBuf::from(r"C:\n\Azure.CodeSigning.Dlib.dll");
+    h.files.extend([st.clone(), dlib.clone()]);
+    signer_package(&mut h, &msix, Some("CN=Andrew Yate"), &publisher_name());
+    let lane_a = Lane::TrustedSigning {
+        endpoint: "https://eus.codesigning.azure.net".into(),
+        account: "acct".into(),
+        profile: "prof".into(),
+    };
+    let mut args = sign_package_args(&st, &[&msix]);
+    args.splice(3..3, ["--dlib".into(), dlib.display().to_string()]);
+    let why = run_inner(&args, &h, &pin, Ok(Some(&lane_a))).unwrap_err();
+    assert!(why.contains("CN `Andrew Yate`"), "{why}");
+    assert!(h.looked.borrow().is_empty(), "no principal lookup: {why}");
+    assert!(h.written.borrow().is_empty(), "no metadata written");
+    assert!(h.runs.borrow().is_empty(), "signtool never ran");
+}
+
+/// After signtool runs, a manifest Publisher that is not the signing leaf's subject as Windows
+/// writes it fails the sign with exit 1 (the package would not install), and `verify` says so.
+#[test]
+fn a_package_signed_by_another_subject_fails_after_signing() {
+    use crate::msix::tests::publisher_name;
+    let mut h = Fake::new();
+    let msix = PathBuf::from(r"C:\d\aterm-0.3.0-x64.msix");
+    let st = PathBuf::from(r"C:\sdk\signtool.exe");
+    h.files.push(st.clone());
+    let typo = "CN=Andrew Yates, O=Andrew Yates, L=Seattle, C=UK";
+    signer_package(&mut h, &msix, Some(typo), &publisher_name());
+    h.reply = ran(0, VERIFIED);
+    let pin = tier_from("Andrew Yates");
+    let lane = Lane::Thumbprint("CD".repeat(20));
+    assert_eq!(
+        run_with(sign_package_args(&st, &[&msix]), &h, &pin, Some(&lane)),
+        1
+    );
+    assert_eq!(
+        h.runs.borrow().len(),
+        2,
+        "it signed, then read the signature back"
+    );
+    let verify = vec![
+        "verify".into(),
+        "--signtool".into(),
+        st.display().to_string(),
+        msix.display().to_string(),
+    ];
+    assert_eq!(run_with(verify, &h, &Tier::Inactive, None), 1);
+}
+
+/// The check after signing hands back the signer's subject when it is the Publisher, names both
+/// DNs when it is not, and refuses a package signtool left without a signature; `verify` of the
+/// matching package exits 0.
+#[test]
+fn a_signed_package_is_accepted_only_when_its_signer_is_its_publisher() {
+    use crate::msix::tests::{PUBLISHER, publisher_name, zip};
+    use crate::msix::{Kind, SIGNATURE, signed_as_published, tests::manifest};
+    let mut h = Fake::new();
+    let st = PathBuf::from(r"C:\sdk\signtool.exe");
+    h.files.push(st.clone());
+    let good = PathBuf::from(r"C:\d\good.msix");
+    let typo = PathBuf::from(r"C:\d\typo.msix");
+    let bare = PathBuf::from(r"C:\d\bare.msix");
+    let typo_dn = "CN=Andrew Yates, O=Andrew Yates, L=Seattle, C=UK";
+    signer_package(&mut h, &good, Some(PUBLISHER), &publisher_name());
+    signer_package(&mut h, &typo, Some(typo_dn), &publisher_name());
+    let unsigned = zip(&[("AppxManifest.xml", manifest(Some(PUBLISHER)).as_bytes())]);
+    h.package(&bare, unsigned.clone(), unsigned);
+    h.reply = ran(0, VERIFIED);
+    let sign = sign_package_args(&st, &[&good, &typo, &bare]);
+    let lane = Lane::Thumbprint("CD".repeat(20));
+    assert_eq!(
+        run_with(sign, &h, &tier_from("Andrew Yates"), Some(&lane)),
+        1
+    );
+    let check = |file: &Path| signed_as_published(&h, file, Kind::Package);
+    assert_eq!(check(&good), Ok(PUBLISHER.to_owned()));
+    let why = check(&typo).unwrap_err();
+    assert!(
+        why.contains(&format!("`{typo_dn}`"))
+            && why.contains(&format!("`{PUBLISHER}`"))
+            && why.contains("0x80080204"),
+        "{why}"
+    );
+    let why = check(&bare).unwrap_err();
+    assert!(why.contains(SIGNATURE), "{why}");
+    let verify = vec![
+        "verify".into(),
+        "--signtool".into(),
+        st.display().to_string(),
+        good.display().to_string(),
+    ];
+    assert_eq!(run_with(verify, &h, &Tier::Inactive, None), 0);
 }

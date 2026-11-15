@@ -55,7 +55,7 @@ pub const ALPN_DATABASE_CREDENTIALS: &[u8] = b"atdb/3";
 
 /// Database repair with fixed metadata, bounded authority evidence and causal frontiers, each
 /// side sending the whole seat witness its bootstrap selected, as 0.153 released it. Newer
-/// endpoints prefer [`ALPN_DATABASE_DELTA`] and keep this one, frame for frame, for 0.153 peers.
+/// endpoints prefer [`ALPN_DATABASE_DUPLEX`] and keep this one, frame for frame, for 0.153 peers.
 /// This remains a database-only protocol with exporter-bound node proofs.
 pub const ALPN_DATABASE_FRONTIER: &[u8] = b"atdb/4";
 
@@ -64,6 +64,11 @@ pub const ALPN_DATABASE_FRONTIER: &[u8] = b"atdb/4";
 /// rounds move bounded batches. Older database peers still select [`ALPN_DATABASE_FRONTIER`] or an
 /// earlier protocol. This remains a database-only protocol with exporter-bound node proofs.
 pub const ALPN_DATABASE_DELTA: &[u8] = b"atdb/5";
+
+/// Delta-frontier database repair followed by credential handoffs in both directions.
+/// Custody is independent of which endpoint dialled. Earlier peers negotiate an earlier
+/// database protocol with its original handoff framing.
+pub const ALPN_DATABASE_DUPLEX: &[u8] = b"atdb/6";
 
 const PROTOCOLS: [&[u8]; 2] = [ALPN_NODES, ALPN];
 
@@ -1147,6 +1152,9 @@ fn database_server_config() -> Arc<ServerConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_DELTA.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_DUPLEX.to_vec());
         Arc::new(config)
     }))
 }
@@ -1168,6 +1176,9 @@ fn database_client_config() -> Arc<ClientConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_DELTA.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_DUPLEX.to_vec());
         Arc::new(config)
     }))
 }
@@ -1398,7 +1409,7 @@ pub fn server_handshake_with_denied(
     )
 }
 
-/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_DELTA`]
+/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_DUPLEX`]
 /// and retaining the earlier database and fleet protocols for older dialers. This serves
 /// only [`FleetOp::Database`], with no terminal survey or drive capability.
 ///
@@ -1466,6 +1477,20 @@ pub fn test_server_handshake_database_v4_as(
     test_server_handshake_database_version_as(tcp, secret, me, within, 4)
 }
 
+/// A released `atdb/5` listener for cross-version protocol tests.
+///
+/// # Errors
+/// As [`server_handshake_database_as`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_server_handshake_database_v5_as(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    within: Duration,
+) -> Result<Accepted, FleetError> {
+    test_server_handshake_database_version_as(tcp, secret, me, within, 5)
+}
+
 /// The `atdb` version `alpn` names, or `None` for a protocol that is not a database one.
 #[cfg(any(test, debug_assertions))]
 fn database_version(alpn: &[u8]) -> Option<u8> {
@@ -1474,6 +1499,7 @@ fn database_version(alpn: &[u8]) -> Option<u8> {
         ALPN_DATABASE_CREDENTIALS,
         ALPN_DATABASE_FRONTIER,
         ALPN_DATABASE_DELTA,
+        ALPN_DATABASE_DUPLEX,
     ]
     .iter()
     .zip(2..)
@@ -1680,7 +1706,7 @@ pub fn client_handshake_as(
     client_handshake_by(tcp, secret, me, op, within).map_err(|undialed| undialed.error)
 }
 
-/// Authenticate a database dialer, preferring [`ALPN_DATABASE_DELTA`] and
+/// Authenticate a database dialer, preferring [`ALPN_DATABASE_DUPLEX`] and
 /// negotiating an earlier database or fleet protocol with an older listener. TLS pins,
 /// secret proofs and exporter-bound node proofs are unchanged.
 ///
@@ -1743,6 +1769,20 @@ pub fn test_client_handshake_database_v4_as(
     within: Duration,
 ) -> Result<Dialed, FleetError> {
     test_client_handshake_database_version_as(tcp, secret, me, within, 4)
+}
+
+/// A released `atdb/5` dialer for cross-version protocol tests.
+///
+/// # Errors
+/// As [`client_handshake_database_as`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_client_handshake_database_v5_as(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    within: Duration,
+) -> Result<Dialed, FleetError> {
+    test_client_handshake_database_version_as(tcp, secret, me, within, 5)
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -3436,7 +3476,8 @@ const fn spoken(alpn: Option<&[u8]>) -> Option<Spoken> {
             | ALPN_DATABASE_REPAIR
             | ALPN_DATABASE_CREDENTIALS
             | ALPN_DATABASE_FRONTIER
-            | ALPN_DATABASE_DELTA,
+            | ALPN_DATABASE_DELTA
+            | ALPN_DATABASE_DUPLEX,
         ) => Some(Spoken::Fleet { nodes: true }),
         Some(ALPN) => Some(Spoken::Fleet { nodes: false }),
         Some(ALPN_MESH) => Some(Spoken::Mesh),

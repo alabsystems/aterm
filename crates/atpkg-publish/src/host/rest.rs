@@ -93,11 +93,97 @@ impl GitAuth {
     }
 }
 
+/// Where one identity's GitHub token is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenSource {
+    /// A vault entry, read in place from the verified secret store under `home`
+    /// (`agh::identity::vault_value`): no file under `~/.secrets` is read.
+    Entry {
+        /// The home whose store holds it.
+        home: PathBuf,
+        /// The entry's name (`gh_access_token`, `gh_access_token_alabsystems`).
+        name: String,
+    },
+    /// Tests: a token file of the test's own, read in place.
+    #[cfg(any(test, debug_assertions))]
+    File(PathBuf),
+}
+
+impl TokenSource {
+    /// Vault entry `name` of the store under `home`.
+    #[must_use]
+    pub fn entry(home: &Path, name: &str) -> Self {
+        Self::Entry {
+            home: home.to_path_buf(),
+            name: name.to_string(),
+        }
+    }
+
+    /// The token: `None` when the store holds no such entry, or it holds only whitespace.
+    /// # Errors
+    /// The store cannot be read, or the token holds a byte outside visible ASCII; the text
+    /// names the entry, never a value.
+    pub fn read(&self) -> Result<Option<Token>, String> {
+        match self {
+            Self::Entry { home, name } => {
+                let Some(value) = agh::identity::vault_value(home, name)
+                    .map_err(|why| format!("the vault entry {name} cannot be read: {why}"))?
+                else {
+                    return Ok(None);
+                };
+                if value.expose().trim_ascii().is_empty() {
+                    return Ok(None);
+                }
+                Token::new(value.expose())
+                    .map(Some)
+                    .map_err(|why| format!("the vault entry {name}: {why}"))
+            }
+            #[cfg(any(test, debug_assertions))]
+            Self::File(path) => Token::from_file(path),
+        }
+    }
+
+    /// Tests: the token set to `value` (`None` removes it): a vault entry is published in the
+    /// test home's store (`agh::identity::vault::put_entry_for_tests`), a file written or
+    /// removed.
+    /// # Panics
+    /// When the fixture cannot be written.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    pub fn put_for_tests(&self, value: Option<&[u8]>) {
+        match self {
+            Self::Entry { home, name } => {
+                agh::identity::vault::put_entry_for_tests(home, name, value);
+            }
+            Self::File(path) => match value {
+                Some(value) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).expect("the token's folder");
+                    }
+                    std::fs::write(path, value).expect("the token file");
+                }
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            },
+        }
+    }
+
+    /// How a message names it: `the vault entry NAME`, or a test's file by its path.
+    #[must_use]
+    pub fn shown(&self) -> String {
+        match self {
+            Self::Entry { name, .. } => format!("the vault entry {name}"),
+            #[cfg(any(test, debug_assertions))]
+            Self::File(path) => path.display().to_string(),
+        }
+    }
+}
+
 /// GitHub's REST API, as one identity.
 #[derive(Clone)]
 pub struct RestHost {
-    /// The token file this identity reads; `None` reads anonymously and writes nothing.
-    pub token_file: Option<PathBuf>,
+    /// The token this identity reads; `None` reads anonymously and writes nothing.
+    pub token_source: Option<TokenSource>,
     origins: Origins,
     /// Where git finds `{owner}/{repo}.git`: the web origin, or a test's server or directory
     /// of bare repositories.
@@ -119,7 +205,7 @@ pub struct RestHost {
 impl std::fmt::Debug for RestHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RestHost")
-            .field("token_file", &self.token_file)
+            .field("token_source", &self.token_source)
             .field("origins", &self.origins)
             .field("git_base", &self.git_base)
             .finish_non_exhaustive()
@@ -127,12 +213,12 @@ impl std::fmt::Debug for RestHost {
 }
 
 impl RestHost {
-    /// github.com, speaking as the token in `token_file`, or anonymously.
+    /// github.com, speaking as the token `token_source` holds, or anonymously.
     #[must_use]
-    pub fn new(token_file: Option<PathBuf>) -> Self {
+    pub fn new(token_source: Option<TokenSource>) -> Self {
         let origins = Origins::github();
         Self {
-            token_file,
+            token_source,
             git_base: origins.web.clone(),
             origins,
             retry_pause: RETRY_PAUSE,
@@ -150,9 +236,9 @@ impl RestHost {
     /// reads try each route once.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn at(token_file: Option<PathBuf>, origins: Origins, git_base: String) -> Self {
+    pub fn at(token_source: Option<TokenSource>, origins: Origins, git_base: String) -> Self {
         Self {
-            token_file,
+            token_source,
             origins,
             git_base,
             retry_pause: Duration::ZERO,
@@ -187,9 +273,9 @@ impl RestHost {
     }
 
     fn token(&self) -> Result<Option<Token>, HostError> {
-        match &self.token_file {
+        match &self.token_source {
             None => Ok(None),
-            Some(file) => Token::from_file(file).map_err(HostError::Refused),
+            Some(source) => source.read().map_err(HostError::Refused),
         }
     }
 
@@ -217,8 +303,8 @@ impl RestHost {
         match self.token()? {
             Some(token) => Ok(self.client(Some(token))),
             None => Err(HostError::Refused(
-                "no token file is configured for this owner (it was absent or empty when the \
-                 run started), and a write never goes anonymously"
+                "no token is configured for this owner (its vault entry was absent or empty when \
+                 the run started), and a write never goes anonymously"
                     .to_string(),
             )),
         }
@@ -617,31 +703,6 @@ fn anonymous_git_read<T>(
     })
 }
 
-/// Publish a complete clone only if `dest` is still absent. Unix uses the workspace's kernel
-/// NOREPLACE primitive, so a concurrent creator is never replaced.
-#[cfg(unix)]
-fn publish_clone_noreplace(from: &Path, dest: &Path) -> std::io::Result<()> {
-    aterm_dirfd::renameat_with(
-        aterm_dirfd::CWD,
-        from,
-        aterm_dirfd::CWD,
-        dest,
-        aterm_dirfd::RenameFlags::NOREPLACE,
-    )
-    .map_err(std::io::Error::from)
-}
-
-#[cfg(not(unix))]
-fn publish_clone_noreplace(from: &Path, dest: &Path) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(dest).is_ok() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "clone destination already exists",
-        ));
-    }
-    std::fs::rename(from, dest)
-}
-
 fn credential_origin(base: &str) -> Option<&str> {
     let (scheme, host) = base.split_once("://")?;
     (matches!(scheme, "https" | "http")
@@ -1031,7 +1092,9 @@ impl ReleaseHost for RestHost {
                 }
             },
         )?;
-        publish_clone_noreplace(&cloned, dest).map_err(|error| {
+        // A complete clone is published only while `dest` is still absent, so a concurrent
+        // creator is never replaced.
+        crate::identity::rename_noreplace(&cloned, dest).map_err(|error| {
             HostError::Refused(format!(
                 "publish clone at {} without replacing another entry: {error}",
                 dest.display()

@@ -88,7 +88,10 @@ pub(crate) struct ShowPlan<W> {
 impl<W> ShowPlan<W> {
     /// Whether the plan has nothing to do.
     pub(crate) const fn is_empty(&self) -> bool {
-        self.minimize.is_empty() && self.raise.is_empty() && self.fullscreen.is_empty()
+        self.minimize.is_empty()
+            && self.raise.is_empty()
+            && self.key.is_none()
+            && self.fullscreen.is_empty()
     }
 }
 
@@ -97,48 +100,45 @@ impl<W> ShowPlan<W> {
 pub(crate) enum ShowOp<W> {
     /// Miniaturize into the Dock (winit `set_minimized(true)`).
     Minimize(W),
-    /// Order front within the app and make it the app's key window, without activating the app (winit `set_visible(true)`, `makeKeyAndOrderFront:`).
-    Raise(W),
+    /// Show and order front without changing the key window or activating the app.
+    OrderFront(W),
+    /// Choose the already-visible key window without activating the app.
+    MakeKey(W),
     /// Enter native full screen on its current display (winit `set_fullscreen(Borderless(None))`).
     EnterFullScreen(W),
 }
 
 impl<W: Copy + Eq> ShowPlan<W> {
-    /// Key the most recent window in `typed` that this plan raises or minimizes instead of the carried key window.
+    /// Preserve the latest chosen live window, including one opened after the saved manifest.
     pub(crate) fn key_typed_window(&mut self, typed: &[W]) -> Option<W> {
-        let window = *typed
-            .iter()
-            .rev()
-            .find(|window| self.raise.contains(window) || self.minimize.contains(window))?;
+        let window = *typed.last()?;
+        let changed = self.key != Some(window);
+        self.minimize.retain(|candidate| *candidate != window);
+        self.key = Some(window);
+        for list in [&mut self.raise, &mut self.focus_seed] {
+            list.retain(|candidate| *candidate != window);
+            list.push(window);
+        }
         if let Some(at) = self
-            .minimize
+            .fullscreen
             .iter()
             .position(|candidate| *candidate == window)
         {
-            self.minimize.remove(at);
-            self.raise.push(window);
+            self.fullscreen.remove(at);
+            self.fullscreen.push(window);
         }
-        if self.key == Some(window) {
-            return None;
-        }
-        self.key = Some(window);
-        for list in [&mut self.raise, &mut self.fullscreen, &mut self.focus_seed] {
-            if let Some(at) = list.iter().position(|candidate| *candidate == window) {
-                let window = list.remove(at);
-                list.push(window);
-            }
-        }
-        Some(window)
+        changed.then_some(window)
     }
 }
 
 impl<W: Copy> ShowPlan<W> {
-    /// Stage 1, the stack: minimize first, so the key window the raises settle on is the last window AppKit was told to key, then raise back to front.
+    /// Stage 1: minimize, order back to front passively, then key the chosen window once.
     pub(crate) fn stacking_ops(&self) -> Vec<ShowOp<W>> {
         self.minimize
             .iter()
             .map(|&window| ShowOp::Minimize(window))
-            .chain(self.raise.iter().map(|&window| ShowOp::Raise(window)))
+            .chain(self.raise.iter().map(|&window| ShowOp::OrderFront(window)))
+            .chain(self.key.iter().map(|&window| ShowOp::MakeKey(window)))
             .collect()
     }
 
@@ -263,6 +263,7 @@ impl crate::App {
         if self.headless {
             return;
         }
+        self.prepare_restore_focus();
         let lane = if self.handoff_ready.is_some() || self.incoming_handoff_pending {
             ShowLane::Handoff
         } else {
@@ -306,7 +307,12 @@ impl crate::App {
         if self.carried_window_show.is_none() {
             return Vec::new();
         }
-        let typed = self.pre_commit_typed_windows();
+        let typed: Vec<_> = self
+            .pre_commit_typed_windows()
+            .into_iter()
+            .filter(|window| self.windows.contains_key(window))
+            .collect();
+        let choice = self.restore_focus.current_choice();
         let Some(carried) = self.carried_window_show.as_mut() else {
             return Vec::new();
         };
@@ -335,16 +341,22 @@ impl crate::App {
                 return performed;
             }
             carried.stacked = true;
-            if !carried.committed
-                && let Some(typed_into) = carried.plan.key_typed_window(&typed)
-            {
+            if let Some(typed_into) = carried.plan.key_typed_window(&typed) {
                 aterm_log::info!(
                     "window show: typing reached window {} before the stack, so the stack keys \
                      it rather than the carried key window",
                     typed_into.0
                 );
             }
-            let ops = carried.plan.stacking_ops();
+            if choice == crate::restore_focus::Choice::Stale {
+                carried.plan.key = None;
+            }
+            let ops: Vec<_> = carried
+                .plan
+                .stacking_ops()
+                .into_iter()
+                .filter(|op| carried.committed || !matches!(op, ShowOp::MakeKey(_)))
+                .collect();
             let seed = carried.plan.focus_seed.clone();
             let key = carried.plan.key;
             let minimized = carried.plan.minimize.len();
@@ -357,12 +369,6 @@ impl crate::App {
             for window in &seed {
                 self.focus_order.retain(|candidate| candidate != window);
                 self.focus_order.push(*window);
-            }
-            if let Some(key) = key
-                && self.frontmost_window != Some(key)
-            {
-                self.frontmost_window = Some(key);
-                self.sync_active_session();
             }
             aterm_log::info!(
                 "window show: the carried stack of {} window(s) is restored ({minimized} \
@@ -386,7 +392,8 @@ impl crate::App {
 
     /// The carried windows keys or text were typed into while the update finished.
     pub(crate) fn pre_commit_typed_windows(&self) -> Vec<WindowId> {
-        self.handoff_deferred_input
+        let mut typed: Vec<_> = self
+            .handoff_deferred_input
             .iter()
             .filter(|(_, event, _)| {
                 matches!(
@@ -396,7 +403,13 @@ impl crate::App {
                 )
             })
             .filter_map(|(winit_id, ..)| self.winit_to_window.get(winit_id).copied())
-            .collect()
+            .collect();
+        if let crate::restore_focus::Choice::Window(window) = self.restore_focus.current_choice()
+            && typed.last() != Some(&window)
+        {
+            typed.push(window);
+        }
+        typed
     }
 
     /// The update has committed: this process owns every window now.
@@ -423,8 +436,8 @@ impl crate::App {
                     key.0
                 );
             } else {
-                self.perform_show_op(ShowOp::Raise(key));
-                performed.push(ShowOp::Raise(key));
+                self.perform_show_op(ShowOp::MakeKey(key));
+                performed.push(ShowOp::MakeKey(key));
             }
         }
         performed.extend(self.settle_carried_window_show());
@@ -442,6 +455,7 @@ impl crate::App {
         }
         if carried.plan.fullscreen.is_empty() {
             self.carried_window_show = None;
+            self.restore_focus.finish();
             return Vec::new();
         }
         let in_front = carried.plan.focus_seed.iter().any(|window| {
@@ -450,8 +464,32 @@ impl crate::App {
         if !in_front {
             return Vec::new();
         }
-        let ops = carried.plan.fullscreen_ops();
-        self.carried_window_show = None;
+        let choice = self.restore_focus.current_choice();
+        let ops: Vec<_> = carried
+            .plan
+            .fullscreen_ops()
+            .into_iter()
+            .filter(|op| match (choice, op) {
+                (crate::restore_focus::Choice::Saved, _) => true,
+                (crate::restore_focus::Choice::Window(chosen), ShowOp::EnterFullScreen(window)) => {
+                    chosen == *window
+                }
+                _ => false,
+            })
+            .collect();
+        if ops.is_empty() {
+            return ops;
+        }
+        if let Some(carried) = self.carried_window_show.as_mut() {
+            carried
+                .plan
+                .fullscreen
+                .retain(|window| !ops.contains(&ShowOp::EnterFullScreen(*window)));
+            if carried.plan.fullscreen.is_empty() {
+                self.carried_window_show = None;
+                self.restore_focus.finish();
+            }
+        }
         let now = std::time::Instant::now();
         for op in &ops {
             self.perform_show_op(*op);
@@ -485,9 +523,15 @@ impl crate::App {
     /// headless instance, or one whose attach failed — is skipped: this is the
     /// only place the show state reaches AppKit, and it goes through the
     /// window's own winit handle, never a process-global query.
-    fn perform_show_op(&self, op: ShowOp<WindowId>) {
-        let (ShowOp::Minimize(window) | ShowOp::Raise(window) | ShowOp::EnterFullScreen(window)) =
-            op;
+    fn perform_show_op(&mut self, op: ShowOp<WindowId>) {
+        let (ShowOp::Minimize(window)
+        | ShowOp::OrderFront(window)
+        | ShowOp::MakeKey(window)
+        | ShowOp::EnterFullScreen(window)) = op;
+        if matches!(op, ShowOp::MakeKey(_)) && self.windows.contains_key(&window) {
+            self.frontmost_window = Some(window);
+            self.sync_active_session();
+        }
         let Some(os_window) = self
             .windows
             .get(&window)
@@ -497,9 +541,18 @@ impl crate::App {
         };
         match op {
             ShowOp::Minimize(_) => os_window.set_minimized(true),
-            ShowOp::Raise(_) | ShowOp::EnterFullScreen(_)
+            ShowOp::OrderFront(_) | ShowOp::MakeKey(_) | ShowOp::EnterFullScreen(_)
                 if os_window.is_minimized() == Some(true) => {}
-            ShowOp::Raise(_) => os_window.set_visible(true),
+            ShowOp::OrderFront(_) => crate::app_window::reveal_os_window(os_window, true),
+            ShowOp::MakeKey(_) => {
+                #[cfg(target_os = "macos")]
+                {
+                    use aterm_window::platform::macos::WindowExtMacOS as _;
+                    os_window.make_key();
+                }
+                #[cfg(not(target_os = "macos"))]
+                os_window.focus_window();
+            }
             ShowOp::EnterFullScreen(_) => {
                 os_window.set_fullscreen(Some(aterm_window::window::Fullscreen::Borderless(None)));
             }

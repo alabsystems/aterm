@@ -43,6 +43,12 @@ mod startup_stop_retry_tests;
 #[path = "startup_newer_tests.rs"]
 mod startup_newer_tests;
 
+#[path = "converge_end_reread_tests.rs"]
+mod converge_end_reread_tests;
+
+#[path = "keeper_hint_tests.rs"]
+mod keeper_hint_tests;
+
 use super::*;
 use aterm_cli::macos_doctor::{
     InitialSetupObservation, InitialSetupSnapshot, InitialSetupSnapshotError,

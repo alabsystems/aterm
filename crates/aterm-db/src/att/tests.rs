@@ -32,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn never_open(_: &Path, _: usize, _: &[String]) -> Result<()> {
+fn never_open(_: &Path, _: usize) -> Result<()> {
     panic!("this verb opens no editor")
 }
 
@@ -56,7 +56,6 @@ fn export_machines(paths: &Paths) -> sheet::Export {
         &MACHINE,
         &handle.view().unwrap().cells,
         &[],
-        false,
     )
     .unwrap()
 }
@@ -632,7 +631,7 @@ fn an_edit_session_reopens_on_a_bad_cell_then_writes_and_leaves_no_scratch() {
     let mut opened: Vec<(PathBuf, usize)> = Vec::new();
     let mut reports = Vec::new();
     let edited = {
-        let mut open = |path: &Path, line: usize, _: &[String]| -> Result<()> {
+        let mut open = |path: &Path, line: usize| -> Result<()> {
             opened.push((path.to_owned(), line));
             let held = std::fs::read_to_string(path).unwrap();
             let row = record(&held, MC);
@@ -644,17 +643,9 @@ fn an_edit_session_reopens_on_a_bad_cell_then_writes_and_leaves_no_scratch() {
             std::fs::write(path, type_in(&held, row, "status", value)).unwrap();
             Ok(())
         };
-        edit::edit(
-            &handle,
-            &MACHINE,
-            &[],
-            false,
-            None,
-            &mut open,
-            &mut |line| {
-                reports.push(line.to_owned());
-            },
-        )
+        edit::edit(&handle, &MACHINE, &[], &mut open, &mut |line| {
+            reports.push(line.to_owned());
+        })
         .unwrap()
     };
     assert_eq!(edited.rounds, 2);
@@ -681,9 +672,7 @@ fn an_edit_session_reopens_on_a_bad_cell_then_writes_and_leaves_no_scratch() {
         &handle,
         &MACHINE,
         &[],
-        false,
-        None,
-        &mut |path: &Path, _, _: &[String]| {
+        &mut |path: &Path, _| {
             rounds += 1;
             if rounds == 1 {
                 let held = std::fs::read_to_string(path).unwrap();
@@ -702,21 +691,20 @@ fn an_edit_session_reopens_on_a_bad_cell_then_writes_and_leaves_no_scratch() {
     );
 }
 
-/// No table verb shows an address unless asked (design §3.3, §8): scan as JSON and as TSV, get,
-/// history, check, ls, schema and an exported file with its baseline all mask it, and
-/// `--show-addresses` shows it.
-/// NEGATIVE CONTROL: with history rendering values unmasked (`change_json` passing `true`), the
-/// history output holds the address and the check fails naming it: `` history:
-/// {"operations":[…"value":"ann.lee@example.invalid"…`` (a synthetic address).
+/// An address is ordinary data: scan as JSON and as TSV, get, history and an exported file all
+/// show it as stored, and `--show-addresses` is no option of any verb.
+/// NEGATIVE CONTROL: with `grid::show` abbreviating an `Email` (`an…@…`), the TSV scan lacks the
+/// address and the check fails naming the verb: `` scan tsv: addr domain … =pk an…@… … ``.
 #[test]
-fn no_table_verb_shows_an_address_unless_asked() {
+fn every_table_verb_shows_an_address_as_stored() {
+    const ADDR: &str = "ann.lee@example.invalid";
     let lab = Lab::new(&[Role::Writer]);
     let owner = Registry::at(lab.paths[0].clone());
     owner.open().unwrap();
-    let pk = keys::address_pk("ann.lee@example.invalid").unwrap();
+    let pk = keys::address_pk(ADDR).unwrap();
     owner
         .write(vec![vec![
-            put(&ADDRESS, &pk, "addr", json!("ann.lee@example.invalid")),
+            put(&ADDRESS, &pk, "addr", json!(ADDR)),
             put(&ADDRESS, &pk, "domain", json!("example.invalid")),
             put(&ADDRESS, &pk, "origin", json!("owner")),
             put(&ADDRESS, &pk, "row", json!("live")),
@@ -724,67 +712,66 @@ fn no_table_verb_shows_an_address_unless_asked() {
         .unwrap();
     let scratch = aterm_tempfile::tempdir().unwrap();
     let file = scratch.path().join("address.tsv");
-    let file_word = file.to_str().unwrap();
     let paths = &lab.paths[0];
-    let outputs = [
+    run(
+        paths,
+        &[
+            "export",
+            "alab/registry",
+            "address",
+            "--tsv",
+            file.to_str().unwrap(),
+        ],
+    );
+    let seen = [
         (
             "scan json",
-            run(paths, &["scan", "alab/registry", "address", "--json"]),
+            text(&run(paths, &["scan", "alab/registry", "address", "--json"])),
         ),
         (
             "scan tsv",
-            run(paths, &["scan", "alab/registry", "address", "--tsv"]),
+            text(&run(paths, &["scan", "alab/registry", "address", "--tsv"])),
         ),
-        ("get", run(paths, &["get", "alab/registry", "address", &pk])),
+        (
+            "get",
+            text(&run(paths, &["get", "alab/registry", "address", &pk])),
+        ),
         (
             "history",
-            run(paths, &["history", "alab/registry", "address"]),
+            text(&run(paths, &["history", "alab/registry", "address"])),
         ),
-        ("check", run(paths, &["check", "alab/registry"])),
-        ("ls", run(paths, &["ls"])),
-        ("schema", run(paths, &["schema", "alab/registry/address"])),
+        ("file", std::fs::read_to_string(&file).unwrap()),
         (
-            "export",
-            run(
-                paths,
-                &["export", "alab/registry", "address", "--tsv", file_word],
-            ),
+            "baseline",
+            std::fs::read_to_string(command::baseline(&file)).unwrap(),
         ),
     ];
-    let mut seen = outputs
-        .map(|(verb, output)| (verb.to_owned(), text(&output)))
-        .to_vec();
-    seen.push(("file".into(), std::fs::read_to_string(&file).unwrap()));
-    seen.push((
-        "baseline".into(),
-        std::fs::read_to_string(command::baseline(&file)).unwrap(),
-    ));
     for (verb, shown) in &seen {
-        assert!(!shown.contains("ann.lee"), "{verb}: {shown}");
-        assert!(!shown.contains("@example.invalid"), "{verb}");
+        assert!(shown.contains(ADDR), "{verb}: {shown}");
+        assert!(!shown.contains("an…@…"), "{verb}: {shown}");
     }
-    assert!(seen[0].1.contains("an…@…"));
-    assert!(seen[3].1.contains("an…@…"), "{}", seen[3].1);
-    let shown = text(&run(
-        paths,
-        &[
-            "scan",
-            "alab/registry",
-            "address",
-            "--json",
-            "--show-addresses",
-        ],
-    ));
-    assert!(shown.contains("ann.lee@example.invalid"));
+    for verb in [
+        vec!["scan", "alab/registry", "address", "--show-addresses"],
+        vec!["get", "alab/registry", "address", &pk, "--show-addresses"],
+        vec!["history", "alab/registry", "--show-addresses"],
+    ] {
+        let words: Vec<String> = verb.into_iter().map(str::to_owned).collect();
+        let why = command::run(paths, &words, &mut never_open, &mut |_| {})
+            .unwrap_err()
+            .0;
+        assert!(why.contains("unknown option"), "{why}");
+    }
 }
 
-/// A value another writer's build stored though this one refuses it never shows as stored: a
-/// note holding a token or a phone number reads `REFUSED` on every verb, even with
-/// `--show-addresses`, and a note holding an address is masked unless asked, history included.
+/// A value another writer's build stored though this one refuses it: a note holding a token
+/// reads `REFUSED` on every verb, history included, while a note holding a phone number or an
+/// address, ordinary data, shows as stored.
 /// NEGATIVE CONTROLS: with `grid::show` skipping its `admissible` check, history prints the
 /// stored token: `` history: {"operations":[{"authored_ms":…`` (the token assertion); with
-/// `raw_masked` never consulting `refused`, scan prints it: `` scan json:
-/// {"collection":"machine",…"note":"ghp_cccc…"…``.
+/// `raw_shown` never consulting `guard::withheld`, scan prints it: `` scan json:
+/// {"collection":"machine",…"note":"ghp_cccc…"…``; with `raw_shown` refusing
+/// `guard::phone_shaped` text again, the phone note reads `REFUSED` and the assertion that it
+/// shows as stored fails.
 #[test]
 fn no_table_verb_shows_a_refused_value_another_build_stored() {
     // In halves, so the export guard never reads a token here.
@@ -811,53 +798,42 @@ fn no_table_verb_shows_a_refused_value_another_build_stored() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let file = scratch.path().join("machine.tsv");
     let paths = &lab.paths[0];
-    for reveal in [false, true] {
-        let words = |verb: &[&str]| {
-            let mut list = verb.to_vec();
-            if reveal {
-                list.push("--show-addresses");
-            }
-            text(&run(paths, &list))
-        };
-        let seen = [
-            (
-                "scan json",
-                words(&["scan", "alab/registry", "machine", "--json"]),
-            ),
-            (
-                "scan tsv",
-                words(&["scan", "alab/registry", "machine", "--tsv"]),
-            ),
-            ("get", words(&["get", "alab/registry", "machine", address])),
-            ("history", words(&["history", "alab/registry", "machine"])),
-            (
-                "export",
-                words(&[
-                    "export",
-                    "alab/registry",
-                    "machine",
-                    "--tsv",
-                    file.to_str().unwrap(),
-                ]),
-            ),
-            ("file", std::fs::read_to_string(&file).unwrap()),
-        ];
-        for (verb, shown) in &seen {
-            assert!(!shown.contains(TOKEN), "{verb}: {shown}");
-            assert!(!shown.contains("555 0101"), "{verb}: {shown}");
-            // `export` reports only where it wrote; `file` is what it wrote.
-            if *verb != "export" {
-                assert_eq!(shown.contains("ann.lee"), reveal, "{verb}: {shown}");
-            }
+    let words = |verb: &[&str]| text(&run(paths, verb));
+    words(&[
+        "export",
+        "alab/registry",
+        "machine",
+        "--tsv",
+        file.to_str().unwrap(),
+    ]);
+    let seen = [
+        (
+            "scan json",
+            words(&["scan", "alab/registry", "machine", "--json"]),
+        ),
+        (
+            "scan tsv",
+            words(&["scan", "alab/registry", "machine", "--tsv"]),
+        ),
+        ("get", words(&["get", "alab/registry", "machine", address])),
+        ("history", words(&["history", "alab/registry", "machine"])),
+        ("file", std::fs::read_to_string(&file).unwrap()),
+    ];
+    for (verb, shown) in &seen {
+        assert!(!shown.contains(TOKEN), "{verb}: {shown}");
+        // `get` reads the one row whose note holds the address.
+        if *verb != "get" {
+            assert!(shown.contains("555 0101"), "{verb}: {shown}");
         }
-        assert!(seen[0].1.contains(sheet::REFUSED), "{}", seen[0].1);
-        assert!(seen[3].1.contains(sheet::REFUSED), "{}", seen[3].1);
-        let get = words(&["get", "alab/registry", "machine", token]);
-        assert!(
-            get.contains(sheet::REFUSED) && !get.contains(TOKEN),
-            "{get}"
-        );
+        assert!(shown.contains("ann.lee@example.invalid"), "{verb}: {shown}");
     }
+    assert!(seen[0].1.contains(sheet::REFUSED), "{}", seen[0].1);
+    assert!(seen[3].1.contains(sheet::REFUSED), "{}", seen[3].1);
+    let get = words(&["get", "alab/registry", "machine", token]);
+    assert!(
+        get.contains(sheet::REFUSED) && !get.contains(TOKEN),
+        "{get}"
+    );
 }
 
 /// `export` and `apply` round trip a file: the owner's edit is written, a cell a peer changed
@@ -1385,9 +1361,7 @@ fn filtered_edit_reopen_keeps_a_stale_row_that_left_the_filter() {
         &handle,
         &MACHINE,
         &filters,
-        false,
-        None,
-        &mut |path: &Path, line: usize, _: &[String]| {
+        &mut |path: &Path, line: usize| {
             rounds += 1;
             let held = std::fs::read_to_string(path).unwrap();
             if rounds == 1 {
@@ -1449,45 +1423,37 @@ fn unchecked_set_cells_and_cli_refusals_never_leak_tokens_or_addresses() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let file = scratch.path().join("machine.tsv");
     let paths = &lab.paths[0];
-    for reveal in [false, true] {
-        let words = |verb: &[&str]| {
-            let mut list = verb.to_vec();
-            if reveal {
-                list.push("--show-addresses");
-            }
-            text(&run(paths, &list))
-        };
-        let seen = [
-            (
-                "scan json",
-                words(&["scan", "alab/registry", "machine", "--json"]),
-            ),
-            (
-                "scan tsv",
-                words(&["scan", "alab/registry", "machine", "--tsv"]),
-            ),
-            ("get", words(&["get", "alab/registry", "machine", MC])),
-            ("history", words(&["history", "alab/registry", "machine"])),
-            ("check", words(&["check", "alab/registry"])),
-            (
+    let words = |verb: &[&str]| text(&run(paths, verb));
+    let seen = [
+        (
+            "scan json",
+            words(&["scan", "alab/registry", "machine", "--json"]),
+        ),
+        (
+            "scan tsv",
+            words(&["scan", "alab/registry", "machine", "--tsv"]),
+        ),
+        ("get", words(&["get", "alab/registry", "machine", MC])),
+        ("history", words(&["history", "alab/registry", "machine"])),
+        ("check", words(&["check", "alab/registry"])),
+        (
+            "export",
+            words(&[
                 "export",
-                words(&[
-                    "export",
-                    "alab/registry",
-                    "machine",
-                    "--tsv",
-                    file.to_str().unwrap(),
-                ]),
-            ),
-            ("file", std::fs::read_to_string(&file).unwrap()),
-        ];
-        for (verb, shown) in &seen {
-            assert!(!shown.contains(TOKEN), "{verb}: {shown}");
-        }
-        assert!(seen[0].1.contains(sheet::REFUSED), "{}", seen[0].1);
-        assert!(seen[1].1.contains("future-tag"), "{}", seen[1].1);
-        assert!(seen[3].1.contains(sheet::REFUSED), "{}", seen[3].1);
+                "alab/registry",
+                "machine",
+                "--tsv",
+                file.to_str().unwrap(),
+            ]),
+        ),
+        ("file", std::fs::read_to_string(&file).unwrap()),
+    ];
+    for (verb, shown) in &seen {
+        assert!(!shown.contains(TOKEN), "{verb}: {shown}");
     }
+    assert!(seen[0].1.contains(sheet::REFUSED), "{}", seen[0].1);
+    assert!(seen[1].1.contains("future-tag"), "{}", seen[1].1);
+    assert!(seen[3].1.contains(sheet::REFUSED), "{}", seen[3].1);
 
     let addr = "ann.lee@example.invalid";
     let opt = format!("--token={TOKEN}");

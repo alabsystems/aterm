@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::credit_offers;
-use aterm_agent::supervise::Autopilot;
 
 use super::*;
 use crate::harness_host::credit_claim::WORKER_FOR;

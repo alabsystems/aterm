@@ -4,7 +4,7 @@
 //! The SAME accepted socket carries buffered observations only after native
 //! retirement and journal settlement. Write EOF/ACK never supply that closure.
 
-use super::{alive, preparation::Prepared, refused, wire};
+use super::{alive, capture, preparation::Prepared, refused, wire};
 use aterm_uds::CtlStream;
 use std::{
     collections::VecDeque,
@@ -62,13 +62,15 @@ impl Delivery {
         // exact original source descriptions were received. Never repeat it.
         let mut frames =
             vec![wire::Event::Started(started).encode(&prepared.request, prepared.digest)?];
-        prepared.stdout.append_frames(
+        capture::append_frames(
+            &prepared.stdout,
             wire::Stream::Stdout,
             &prepared.request,
             prepared.digest,
             &mut frames,
         )?;
-        prepared.stderr.append_frames(
+        capture::append_frames(
+            &prepared.stderr,
             wire::Stream::Stderr,
             &prepared.request,
             prepared.digest,

@@ -10,12 +10,12 @@ use crate::App;
 const NEED_A: &str = "grant Screen Recording to com.aterm.aterm in System Settings ▸ Privacy \
                       & Security ▸ Screen Recording, so the windowed check can capture the \
                       menu";
-const NEED_B: &str = "the release credential (~/.aterm/release-credentials.toml) to sign 0.48.0";
+const NEED_B: &str = "the release permission (~/.aterm/release-permissions.toml) to sign 0.48.0";
 const NEED_C: &str = "approve the 0.48.0 release notes";
 const ENTRY_AB: &str = "claude needs you: grant Screen Recording to com.aterm.aterm in System \
                         Settings ▸ … (+1 more) \u{2014} carrying on";
-const ENTRY_B: &str = "claude needs you: the release credential \
-                       (~/.aterm/release-credentials.toml) to sign 0.48.0 \u{2014} carrying on";
+const ENTRY_B: &str = "claude needs you: the release permission \
+                       (~/.aterm/release-permissions.toml) to sign 0.48.0 \u{2014} carrying on";
 const NEED_A_CUT: &str = "grant Screen Recording to com.aterm.aterm in System Settings ▸ …";
 
 fn set(needs: &[&str]) -> Vec<String> {
@@ -412,10 +412,10 @@ fn the_chips_description_costs_no_more_for_nine_needs_than_for_two() {
 }
 
 /// The `owner=needs` entry codex-alab sets for [`CODEX_NEEDS`], as it sets it.
-const CODEX_ENTRY: &str = "Codex needs you: the release credential \
-                           (~/.aterm/release-credentials.toml) to sign 0.48.0 (+2 more) \u{2014} \
+const CODEX_ENTRY: &str = "Codex needs you: the release permission \
+                           (~/.aterm/release-permissions.toml) to sign 0.48.0 (+2 more) \u{2014} \
                            carrying on";
-const NEED_D: &str = "rotate the deploy key";
+const NEED_D: &str = "rotate the deploy log";
 const CODEX_NEEDS: [&str; 3] = [NEED_B, NEED_C, NEED_D];
 
 /// Session 0 as a codex-alab tab: codex in front, read with no state of its own.

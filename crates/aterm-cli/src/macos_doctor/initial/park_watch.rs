@@ -3,7 +3,7 @@
 
 //! What tells a parked setup run that a fact it reads may have moved, with no timer
 //! ([`super::InitialSetupParkMark::watches`]): the secrets folder changing (the subscriber's
-//! `state.toml`, a join's identity or source, and materialized `~/.secrets` files), this Mac's
+//! `state.toml`, the verified vault, a join's identity or source), this Mac's
 //! network changing (the kernel's network-change events, [`aterm_uds::network::RouteChanges`]),
 //! and a `git`
 //! arriving (atpkg's, the Command Line Tools' or Xcode's), and the selected repository inputs
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 /// The facts a park watches ([`super::InitialSetupParkMark::watches`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Watches {
-    /// The secrets folder: the vault's status, its materialization and the subscriber's state.
+    /// The secrets folder: the vault's status, its verified copy and the subscriber's state.
     pub secrets: bool,
     /// This Mac's network addresses.
     pub network: bool,
@@ -246,19 +246,10 @@ impl From<(PathBuf, PathBuf)> for FolderTarget {
     }
 }
 
-/// State writes and output repairs can happen independently. Watch both, following missing
-/// parents from home. Materialization refuses a symlink at `~/.secrets`, so watch its parent
-/// until a real directory replaces it rather than opening the link's destination.
+/// The store's folder, following missing parents from home: every value is read in place from
+/// it, so nothing under `~/.secrets` is watched.
 fn secrets_folders(home: &Path) -> Vec<FolderTarget> {
-    vec![
-        (home.join(".config/aterm/secrets"), home.to_path_buf()).into(),
-        FolderTarget {
-            target: home.join(".secrets"),
-            floor: home.to_path_buf(),
-            follow_links: false,
-            owner: None,
-        },
-    ]
+    vec![(home.join(".config/aterm/secrets"), home.to_path_buf()).into()]
 }
 
 /// The canonical standing inputs also need leaf watches: an in-place write or permission
@@ -340,10 +331,9 @@ impl Folders {
                         .ancestors()
                         .take_while(|folder| folder.starts_with(&target.floor))
                     {
-                        // The materialized root itself refuses links. Its parents, including
-                        // the login's home path, retain their ordinary path resolution.
-                        let follow = target.owner.is_none()
-                            && (target.follow_links || folder != target.target.as_path());
+                        // A scoped (owned) target never follows a link; every other folder
+                        // keeps its ordinary path resolution.
+                        let follow = target.owner.is_none();
                         wanted
                             .entry(folder.to_path_buf())
                             .and_modify(|(links, scoped)| {

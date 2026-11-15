@@ -132,6 +132,8 @@ struct Fake {
     kept: Mutex<Vec<(Vec<u64>, String)>>,
     posts: Mutex<Vec<(String, String, String, String)>>,
     unsent: Option<Unsent>,
+    /// Every client reads cut from the shell that started it.
+    detached: bool,
 }
 
 impl Fake {
@@ -167,6 +169,9 @@ impl Fake {
             }
         };
         let places = Places::default();
+        let detached = |_: &crate::typed_by::Who| self.detached;
+        let clean =
+            |after: &str, _: ExitActor, by: &str| format!("OK clean-asked {after} by={by}\n");
         cmd_as(
             verb,
             rest,
@@ -174,8 +179,10 @@ impl Fake {
             store,
             &Hands {
                 client,
+                detached: &detached,
                 keep_tabs: &keep_tabs,
                 post: &post,
+                clean: &clean,
                 places: &places,
             },
         )
@@ -293,7 +300,7 @@ fn requests_lists_newest_first_and_filters_state_and_from() {
     // NEGATIVE: a node no request came from lists none, and a word the grammar lacks is refused.
     assert!(ids(&fake.run(&no_client, "requests", "from=ffffffff", &sessions)).is_empty());
     assert_eq!(
-        fake.run(&no_client, "requests", "state=cleaned", &sessions),
+        fake.run(&no_client, "requests", "state=gone", &sessions),
         LIST_USAGE
     );
     assert_eq!(
@@ -537,6 +544,7 @@ fn review_keep_reply_refuse_an_agent_tab_the_harness_and_a_drive() {
         format!("review {id}"),
         format!("keep {id}"),
         format!("reply {id} -- hello"),
+        format!("clean {id}"),
     ] {
         let verb = act.split(' ').next().unwrap();
         let refused = fake.run(&in_agent, "request", &act, &sessions);
@@ -577,6 +585,87 @@ fn review_keep_reply_refuse_an_agent_tab_the_harness_and_a_drive() {
     let review = here.store().get(&id).unwrap().review.clone().unwrap();
     assert_eq!(review.by, person.sid.as_str());
     assert_eq!(review.note.as_deref(), Some("fine"));
+    // NEGATIVE: a person's clean reaches the cleanup, by its token.
+    assert_eq!(
+        fake.run(
+            &in_shell,
+            "request",
+            &format!("clean {id} stop=1"),
+            &sessions
+        ),
+        format!("OK clean-asked  {id} stop=1 by={}\n", person.sid.as_str())
+    );
+}
+
+/// A client launchd adopted (the top of its line of parents lost its launcher) is cut from the
+/// shell that started it; CONTROL: one under a process launchd started, a platform with no
+/// launcher version, an unread lineage and a client with no process are not.
+#[test]
+fn detached_with_reads_a_client_launchd_adopted() {
+    const LAUNCHD: i32 = 7;
+    let read = |launcher: Option<i32>| {
+        move |pid: i32| {
+            Some(aterm_uds::process::Lineage {
+                identity: aterm_uds::process::Identity {
+                    pid,
+                    birth: aterm_uds::process::Birth(1),
+                    idversion: Some(9),
+                },
+                uniqueid: 1,
+                parent: 1,
+                pgid: 50,
+                launcher_version: launcher,
+                tty: None,
+            })
+        }
+    };
+    // `(aterm ctl request clean <id> &)`: its subshell exited, so launchd adopted the ctl.
+    let ctl = crate::typed_by::Who::client_with(Some(50), 2, &|_| Some(1), &|_| None, &|_| None);
+    assert!(detached_with(&ctl, &read(Some(3)), Some(LAUNCHD)));
+    assert!(!detached_with(&ctl, &read(Some(LAUNCHD)), Some(LAUNCHD)));
+    assert!(!detached_with(&ctl, &read(None), Some(LAUNCHD)));
+    assert!(!detached_with(&ctl, &|_| None, Some(LAUNCHD)));
+    assert!(!detached_with(&ctl, &read(Some(3)), None));
+    assert!(!detached_with(&no_client(), &read(Some(3)), Some(LAUNCHD)));
+}
+
+/// Every person's act refuses an `aterm ctl` cut from the shell that started it, and writes
+/// nothing; CONTROL: the same ctl, not cut, reviews.
+#[test]
+fn a_persons_acts_refuse_a_ctl_cut_from_its_shell() {
+    let here = Here::new();
+    let sessions = new_store();
+    let mut store = here.store();
+    let work = test_handle(9);
+    let id = request(
+        &mut store,
+        AT,
+        fleet_shell(NODE, BY, "judge me"),
+        work.sid.as_str(),
+        Some(0),
+    );
+    let cut = Fake {
+        detached: true,
+        ..Fake::default()
+    };
+    let before = here.journal();
+    for act in [
+        format!("review {id}"),
+        format!("keep {id}"),
+        format!("reply {id} -- hello"),
+        format!("clean {id}"),
+    ] {
+        let refused = cut.run(&no_client, "request", &act, &sessions);
+        assert!(
+            refused.contains("never a command cut from the shell that started it"),
+            "{refused}"
+        );
+    }
+    assert_eq!(here.journal(), before, "a refused act writes nothing");
+    assert_eq!(
+        Fake::default().run(&no_client, "request", &format!("review {id}"), &sessions),
+        format!("OK reviewed req={id}\n")
+    );
 }
 
 #[test]

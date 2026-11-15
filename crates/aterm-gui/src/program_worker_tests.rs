@@ -598,7 +598,7 @@ fn a_turn_never_reopens_a_program_workers_concluded_task() {
 /// and reopens at Cruise.
 #[test]
 fn no_autopilot_word_moves_a_program_workers_task() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     let t0 = std::time::Instant::now();
     let by = crate::session_timeline::AutopilotSetBy {
         actor: aterm_slog::Actor::Ctl,

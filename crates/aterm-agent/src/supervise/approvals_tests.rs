@@ -6,7 +6,7 @@
 /// as no instruction.
 #[test]
 fn the_switchs_ask_reads_as_lands_instruction() {
-    use crate::supervise::policy::turn_end::{LAND, is_switch_ask, past_switch_why, switch_why};
+    use alab_policy::words::{LAND, is_switch_ask, past_switch_why, switch_why};
     let mark = crate::harness::harness_mark!();
     let ask = format!(
         "{mark} {}{}",
@@ -31,9 +31,8 @@ fn the_switchs_ask_reads_as_lands_instruction() {
 #[test]
 fn a_restart_counts_lands_contradiction_as_its_nudge() {
     use crate::harness::repo_work::{RepoRead, RepoWork};
-    use crate::supervise::policy::turn_end::{
-        LAND, RULE_COMPACT, RULE_LAND, RULE_LAND_NUDGE, land_contradicted,
-    };
+    use crate::supervise::policy::turn_end::{RULE_COMPACT, land_contradicted};
+    use alab_policy::words::{LAND, RULE_LAND, RULE_LAND_NUDGE};
     let sid = Some("@s-9");
     let work = RepoWork {
         repo: "/r/proj/land-c".to_string(),
@@ -114,7 +113,7 @@ fn the_hold_and_the_land_checks_books_ride_the_ledger() {
         RULE_OFF_STOOD, RULE_POINT, Replies, Row, act_reason_after, json_str, land_books_note,
         off_kept_in, point_reason, short_streak_in,
     };
-    use crate::supervise::policy::turn_end::{LAND, RULE_LAND, switch_why};
+    use alab_policy::words::{LAND, RULE_LAND, switch_why};
     let sid = Some("@s-9");
     let typed_row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str| {
         let row = Row {
@@ -215,7 +214,7 @@ fn the_hold_and_the_land_checks_books_ride_the_ledger() {
         typed_row(1_000, RULE_LAND, Outcome::Typed, LAND, "land"),
         typed_row(
             5_000,
-            crate::supervise::policy::land_check::RULE_LAND_CHECK,
+            alab_policy::land_check::RULE_LAND_CHECK,
             Outcome::Typed,
             "land check",
             "check"
@@ -437,7 +436,7 @@ fn the_journal_sits_beside_the_ledger_and_both_are_bounded() {
 
 #[test]
 fn a_file_past_sixteen_mib_is_streamed_and_cut() {
-    use super::super::policy::turn_end::RULE_LAND;
+    use alab_policy::words::RULE_LAND;
     let dir = crate::supervise::ScratchDir::new("apr", "big");
     let past = 17 << 20;
     let sid = "s-195cbb43bd1fc3dc2c7b";
@@ -695,7 +694,8 @@ fn a_left_at_wall_key_carries_the_exchanges_work() {
 #[test]
 fn a_person_left_after_work_is_told_from_the_opening_message() {
     use super::super::policy::login::RULE_LOGIN_DONE;
-    use super::super::policy::turn_end::{RULE_ACCOUNT, RULE_LEFT, RULE_USAGE_PROBE};
+    use super::super::policy::turn_end::{RULE_ACCOUNT, RULE_USAGE_PROBE};
+    use alab_policy::words::RULE_LEFT;
     let row = |rule, outcome, box_seq| Row {
         rule_id: rule,
         outcome,
@@ -772,7 +772,8 @@ fn a_person_left_after_work_is_told_from_the_opening_message() {
 
 #[test]
 fn open_left_is_the_last_left_row_no_typed_row_closed() {
-    use super::super::policy::turn_end::{RULE_LEFT, RULE_USAGE_PROBE};
+    use super::super::policy::turn_end::RULE_USAGE_PROBE;
+    use alab_policy::words::RULE_LEFT;
     let dir = crate::supervise::ScratchDir::new("apr", "open-left");
     let path = dir.join("s-1.jsonl");
     let row = |rule, outcome, command: &'static str| Row {
@@ -811,7 +812,8 @@ fn open_left_is_the_last_left_row_no_typed_row_closed() {
 
 #[test]
 fn the_carry_ends_at_the_tasks_end_an_exchange_left_or_off_after_the_answer() {
-    use super::super::policy::turn_end::{RULE_LEFT, RULE_USAGE_PROBE};
+    use super::super::policy::turn_end::RULE_USAGE_PROBE;
+    use alab_policy::words::RULE_LEFT;
     let row = |rule, outcome, ts| {
         Row {
             rule_id: rule,
@@ -874,8 +876,9 @@ fn the_carry_ends_at_the_tasks_end_an_exchange_left_or_off_after_the_answer() {
 #[test]
 fn a_walls_retry_keeps_a_persons_exchange_at_the_wall_open() {
     use super::super::policy::turn_end::{
-        RULE_API_BACK, RULE_API_RETRY, RULE_COMPACT, RULE_LEFT, RULE_LIMIT_RESUME,
+        RULE_API_BACK, RULE_API_RETRY, RULE_COMPACT, RULE_LIMIT_RESUME,
     };
+    use alab_policy::words::RULE_LEFT;
     let row = |rule, outcome, command: &'static str, ts| {
         Row {
             rule_id: rule,
@@ -1230,7 +1233,7 @@ fn the_ledger_lives_under_the_state_root_by_sid_and_appends() {
 /// loop's own row of each of those rules changes its reader's answer, and is no self-claim's.
 #[test]
 fn a_self_claims_row_is_appended_whole_and_read_as_none_of_the_loops_acts() {
-    use super::super::policy::turn_end::{RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT};
+    use alab_policy::words::{RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LEFT};
     let root = crate::supervise::ScratchDir::new("apr", "self-claim");
     let sid = Some("@s-sc");
     let path = path_under(&root, sid).expect("path");
@@ -1389,7 +1392,7 @@ fn spend_wall_reason() -> String {
     wall_wait_reason(
         None,
         None,
-        aterm_phase::WallKind::Spend,
+        alab_policy::vocab::WallKind::Spend,
         "You've hit your monthly spend limit.",
     )
 }
@@ -1455,7 +1458,8 @@ fn a_record_between_a_try_and_its_first_read_is_no_read() {
 
 #[test]
 fn a_try_aged_out_for_a_successor_ends_no_wall() {
-    use super::super::policy::turn_end::{AccountAt, RULE_ACCOUNT, RULE_DONE_CHECK, RULE_LAND};
+    use super::super::policy::turn_end::{AccountAt, RULE_ACCOUNT};
+    use alab_policy::words::{RULE_DONE_CHECK, RULE_LAND};
     let dir = crate::supervise::ScratchDir::new("apr-seed", "try-over");
     let limit = LimitTry {
         bucket: false,
@@ -1539,7 +1543,8 @@ fn a_try_aged_out_for_a_successor_ends_no_wall() {
 
 #[test]
 fn the_short_streak_is_the_last_act_s_or_point_s() {
-    use super::super::policy::turn_end::{AccountAt, RULE_ACCOUNT, RULE_CONTINUE};
+    use super::super::policy::turn_end::{AccountAt, RULE_ACCOUNT};
+    use alab_policy::words::RULE_CONTINUE;
     let dir = crate::supervise::ScratchDir::new("apr-seed", "streak");
     let act = |ts: i64, n: u32| {
         (
@@ -1686,7 +1691,7 @@ fn the_short_streak_is_the_last_act_s_or_point_s() {
 #[test]
 fn the_wall_s_retries_read_back_as_written() {
     use super::super::policy::turn_end::RULE_API_RETRY;
-    use aterm_phase::WallKind;
+    use alab_policy::vocab::WallKind;
     let dir = crate::supervise::ScratchDir::new("apr-seed", "retries");
     let sid = Some("@s-9");
     let mut kinds = vec![WallKind::Overloaded];
@@ -1789,7 +1794,7 @@ fn the_wall_s_retries_read_back_as_written() {
                     kind: WallKind::ApiError {
                         code: None,
                         retryable: true,
-                        cause: aterm_phase::ApiCause::CutOff,
+                        cause: alab_policy::vocab::ApiCause::CutOff,
                     },
                     attempts: 0,
                     ups: 0,
@@ -1819,7 +1824,7 @@ fn the_wall_s_retries_read_back_as_written() {
 /// the test fails at the act's row.
 #[test]
 fn the_checks_note_carries_the_cruise_runs_count_and_an_older_row_reads_none() {
-    use super::super::policy::turn_end::{RULE_DONE_CHECK, done_check_words};
+    use alab_policy::words::{RULE_DONE_CHECK, done_check_words};
     let sid = Some("@s-9");
     let row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str| {
         let row = Row {
@@ -1880,7 +1885,7 @@ fn the_checks_note_carries_the_cruise_runs_count_and_an_older_row_reads_none() {
 /// back (the set changed or came down), and an older build's rows, with no note, read none.
 #[test]
 fn the_needs_acked_note_stands_until_a_point_row_says_otherwise() {
-    use super::super::policy::turn_end::RULE_CONTINUE;
+    use alab_policy::words::RULE_CONTINUE;
     let sid = Some("@s-9");
     let row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str| {
         let row = Row {
@@ -1954,9 +1959,9 @@ fn the_needs_acked_note_stands_until_a_point_row_says_otherwise() {
 /// delivered.
 #[test]
 fn every_angled_check_is_delivered_and_owed_as_the_done_check() {
-    use super::super::policy::turn_end::{
-        DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, RULE_CONTINUE, RULE_DONE_CHECK, done_check_act,
-        done_check_words,
+    use super::super::policy::turn_end::done_check_act;
+    use alab_policy::words::{
+        DONE_ANGLES, DONE_CHECK_FIXED_BEFORE, RULE_CONTINUE, RULE_DONE_CHECK, done_check_words,
     };
     let sid = Some("@s-9");
     let typed = |rule_id: &str, command: &str| {
@@ -1974,8 +1979,7 @@ fn every_angled_check_is_delivered_and_owed_as_the_done_check() {
             [
                 done_check_words(n),
                 done_check_act(n, Some("never push to main"), true),
-                super::super::policy::go_ahead::unless_held(&done_check_words(n), true)
-                    .into_owned(),
+                alab_policy::go_ahead::unless_held(&done_check_words(n), true).into_owned(),
             ]
         })
         .collect();
@@ -1999,9 +2003,10 @@ fn every_angled_check_is_delivered_and_owed_as_the_done_check() {
 
 #[test]
 fn a_compactions_continuation_that_types_the_check_again_keeps_it_owed() {
-    use super::super::policy::turn_end::{
-        DONE_CHECK, DONE_CHECK_MARKER_BEFORE, DONE_CHECK_ORDINARY_BEFORE, LAND, RULE_COMPACT,
-        RULE_DONE_CHECK, RULE_LAND,
+    use super::super::policy::turn_end::RULE_COMPACT;
+    use alab_policy::words::{
+        DONE_CHECK, DONE_CHECK_MARKER_BEFORE, DONE_CHECK_ORDINARY_BEFORE, LAND, RULE_DONE_CHECK,
+        RULE_LAND,
     };
     let ledger = |rows: &[(i64, &str, Outcome, &str, String)]| -> String {
         rows.iter()
@@ -2080,7 +2085,8 @@ fn a_compactions_continuation_that_types_the_check_again_keeps_it_owed() {
 
 #[test]
 fn an_answer_judged_is_owed_no_more() {
-    use super::super::policy::turn_end::{RULE_DONE_CHECK, RULE_LAND, RULE_LIMIT_RESUME};
+    use super::super::policy::turn_end::RULE_LIMIT_RESUME;
+    use alab_policy::words::{RULE_DONE_CHECK, RULE_LAND};
     let dir = crate::supervise::ScratchDir::new("apr-seed", "owed");
     let sid = Some("@s-9");
     let check = (
@@ -2178,7 +2184,8 @@ fn an_answer_judged_is_owed_no_more() {
 
 #[test]
 fn a_done_check_an_api_error_cut_is_owed_to_the_walls_retry() {
-    use super::super::policy::turn_end::{RULE_API_RETRY, RULE_DONE_CHECK};
+    use super::super::policy::turn_end::RULE_API_RETRY;
+    use alab_policy::words::RULE_DONE_CHECK;
     let dir = crate::supervise::ScratchDir::new("apr-seed", "check-cut-by-api");
     let sid = Some("@s-9");
     let check = (
@@ -2189,7 +2196,7 @@ fn a_done_check_an_api_error_cut_is_owed_to_the_walls_retry() {
         act_reason(None),
     );
     let mark = |attempts: usize| RetryMark {
-        kind: aterm_phase::WallKind::Overloaded,
+        kind: alab_policy::vocab::WallKind::Overloaded,
         attempts,
         ups: 0,
         since_ms: 310_000,
@@ -2267,9 +2274,8 @@ fn a_done_check_an_api_error_cut_is_owed_to_the_walls_retry() {
 
 #[test]
 fn a_compact_at_the_checks_point_owes_the_check_to_its_continuation() {
-    use super::super::policy::turn_end::{
-        DONE_CHECK, RULE_API_RETRY, RULE_COMPACT, RULE_DONE_CHECK, RULE_LIMIT_RESUME,
-    };
+    use super::super::policy::turn_end::{RULE_API_RETRY, RULE_COMPACT, RULE_LIMIT_RESUME};
+    use alab_policy::words::{DONE_CHECK, RULE_DONE_CHECK};
     let sid = Some("@s-9");
     let body = |rows: &[(i64, &str, Outcome, &str, String)]| -> String {
         rows.iter()
@@ -2291,7 +2297,7 @@ fn a_compact_at_the_checks_point_owes_the_check_to_its_continuation() {
     };
     let check = typed(10_000, RULE_DONE_CHECK, DONE_CHECK);
     let mark = RetryMark {
-        kind: aterm_phase::WallKind::Overloaded,
+        kind: alab_policy::vocab::WallKind::Overloaded,
         attempts: 0,
         ups: 0,
         since_ms: 20_000,
@@ -2463,9 +2469,9 @@ fn a_compact_at_the_checks_point_owes_the_check_to_its_continuation() {
 
 #[test]
 fn a_compact_at_a_land_acts_point_owes_the_act_to_its_continuation() {
-    use super::super::policy::turn_end::{
-        LAND, LAND_ANSWER, LAND_NUDGE, RULE_API_RETRY, RULE_COMPACT, RULE_LAND, RULE_LAND_ANSWER,
-        RULE_LAND_NUDGE, RULE_LIMIT_RESUME,
+    use super::super::policy::turn_end::{RULE_API_RETRY, RULE_COMPACT, RULE_LIMIT_RESUME};
+    use alab_policy::words::{
+        LAND, LAND_ANSWER, LAND_NUDGE, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE,
     };
     type R = (i64, &'static str, Outcome, &'static str, String);
     let sid = Some("@s-9");
@@ -2489,7 +2495,7 @@ fn a_compact_at_a_land_acts_point_owes_the_act_to_its_continuation() {
         (ts, rule, Outcome::Typed, words, act_reason(None))
     };
     let mark = RetryMark {
-        kind: aterm_phase::WallKind::Overloaded,
+        kind: alab_policy::vocab::WallKind::Overloaded,
         attempts: 0,
         ups: 0,
         since_ms: 20_000,
@@ -2709,9 +2715,10 @@ fn a_compact_at_a_land_acts_point_owes_the_act_to_its_continuation() {
 #[test]
 fn lands_instruction_typed_under_a_resumes_rule_starts_the_episode() {
     use super::super::policy::turn_end::{
-        Cleared, Clearing, LAND, LAND_REMOTE_MAIN_BEFORE, Outage, RULE_COMPACT, RULE_LAND,
-        RULE_LIMIT_RESUME, RULE_OUTAGE_RESUME, cleared_text,
+        Cleared, Clearing, Outage, RULE_COMPACT, RULE_LIMIT_RESUME, RULE_OUTAGE_RESUME,
+        cleared_text,
     };
+    use alab_policy::words::{LAND, LAND_REMOTE_MAIN_BEFORE, RULE_LAND};
     let sid = Some("@s-9");
     let why = act_reason(None);
     let ep = |rule: &str, command: &str| {
@@ -2745,7 +2752,7 @@ fn lands_instruction_typed_under_a_resumes_rule_starts_the_episode() {
 
 #[test]
 fn a_cut_keeps_what_the_readers_read_of_a_run_of_records() {
-    use super::super::policy::turn_end::{RULE_LAND, RULE_LAND_NUDGE};
+    use alab_policy::words::{RULE_LAND, RULE_LAND_NUDGE};
     let dir = crate::supervise::ScratchDir::new("apr-seed", "cut");
     let sid = Some("@s-9");
     let filler = "cd /Users//someone/Developer/project && cargo test -p project-core --lib -- parser::tests 2>&1 | tail -40";
@@ -2831,9 +2838,9 @@ fn a_cut_keeps_what_the_readers_read_of_a_run_of_records() {
 
 #[test]
 fn a_cut_keeps_the_rows_of_the_states_that_stand_past_a_run_of_acts() {
-    use super::super::policy::turn_end::{
-        LAND, LAND_ANSWER, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE, RULE_LAND,
-        RULE_LAND_ANSWER, RULE_LAND_NUDGE,
+    use super::super::policy::turn_end::{RULE_API_RETRY, RULE_COMPACT};
+    use alab_policy::words::{
+        LAND, LAND_ANSWER, RULE_CONTINUE, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE,
     };
     let dir = crate::supervise::ScratchDir::new("apr-seed", "cut-acts");
     let sid = Some("@s-9");
@@ -2988,9 +2995,8 @@ fn a_cut_keeps_the_rows_of_the_states_that_stand_past_a_run_of_acts() {
 
 #[test]
 fn a_land_episodes_since_is_its_instruction_rows_stamp_through_a_cut() {
-    use super::super::policy::turn_end::{
-        RULE_API_RETRY, RULE_CONTINUE, RULE_LAND, RULE_LAND_NUDGE,
-    };
+    use super::super::policy::turn_end::RULE_API_RETRY;
+    use alab_policy::words::{RULE_CONTINUE, RULE_LAND, RULE_LAND_NUDGE};
     let dir = crate::supervise::ScratchDir::new("apr-seed", "land-since");
     let sid = Some("@s-9");
     let point = |ts: i64| {
@@ -3064,7 +3070,8 @@ fn a_land_episodes_since_is_its_instruction_rows_stamp_through_a_cut() {
 
 #[test]
 fn a_landing_ends_the_hold_a_loop_that_follows_seeds() {
-    use super::super::policy::turn_end::{HoldStart, RULE_LAND, RULE_LAND_NUDGE};
+    use super::super::policy::turn_end::HoldStart;
+    use alab_policy::words::{RULE_LAND, RULE_LAND_NUDGE};
     let dir = crate::supervise::ScratchDir::new("apr-seed", "land-relanded");
     let sid = Some("@s-9");
     let point = |ts: i64| {
@@ -3120,10 +3127,10 @@ fn a_landing_ends_the_hold_a_loop_that_follows_seeds() {
 
 #[test]
 fn a_restored_tab_s_cut_keeps_its_take_up_while_a_state_of_the_earlier_books_stands() {
-    use super::super::policy::turn_end::{RULE_CONTINUE, RULE_LAND};
+    use alab_policy::words::{RULE_CONTINUE, RULE_LAND};
     let dir = crate::supervise::ScratchDir::new("apr-seed", "restored-cut");
     let root: &Path = &dir;
-    let (was, tab) = ("s-a0", "s-b1");
+    let (was, tab) = ("t00000000a0", "t00000000b1");
     std::fs::create_dir_all(root.join("drive")).expect("the drive");
     let row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str, sid| {
         let row = Row {
@@ -3248,10 +3255,10 @@ fn the_books_through_the_earlier_tabs_are_theirs_re_signed_oldest_first() {
 
 #[test]
 fn a_second_restore_reads_no_state_the_tab_between_ended_before_its_cut() {
-    use super::super::policy::turn_end::{RULE_CONTINUE, RULE_LAND};
+    use alab_policy::words::{RULE_CONTINUE, RULE_LAND};
     let dir = crate::supervise::ScratchDir::new("apr-seed", "restored-chain");
     let root: &Path = &dir;
-    let (a, b, c) = ("s-a0", "s-b1", "s-c2");
+    let (a, b, c) = ("t00000000a0", "t00000000b1", "t00000000c2");
     std::fs::create_dir_all(root.join("drive")).expect("the drive");
     let row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str, sid| {
         let row = Row {
@@ -3330,7 +3337,7 @@ fn a_second_restore_reads_no_state_the_tab_between_ended_before_its_cut() {
     let cont = dir.join("continuous.jsonl");
     let a_rows = std::fs::read_to_string(ledger_under(root, Some(a)))
         .unwrap()
-        .replace("\"sid\":\"s-a0\"", "\"sid\":\"s-b1\"");
+        .replace("\"sid\":\"t00000000a0\"", "\"sid\":\"t00000000b1\"");
     std::fs::write(&cont, format!("{a_rows}{over}{approvals}")).unwrap();
     bound(&cont);
     assert!(
@@ -3421,9 +3428,9 @@ fn a_legacy_limits_next_try_never_wraps_its_recorded_count() {
 
 #[test]
 fn a_cut_keeps_every_standing_row_when_its_standing_workspace_is_full() {
-    use super::super::policy::turn_end::RULE_LAND;
+    use alab_policy::words::RULE_LAND;
     let mut rows = vec![String::new()];
-    for sid in ["@s-9", "@s-10"] {
+    for sid in ["@t0000000009", "@t0000000010"] {
         rows.push(
             Row {
                 rule_id: RULE_LAND,
@@ -3444,7 +3451,7 @@ fn a_cut_keeps_every_standing_row_when_its_standing_workspace_is_full() {
                 reason: "a captured ordinary approval",
                 box_seq: 1,
             }
-            .to_json(i64::try_from(i).unwrap() + 2_000, Some("@s-9")),
+            .to_json(i64::try_from(i).unwrap() + 2_000, Some("@t0000000009")),
         );
     }
     rows.push(String::new());
@@ -3468,7 +3475,7 @@ fn a_cut_keeps_every_standing_row_when_its_standing_workspace_is_full() {
     };
     let cut = cut_of(&body, path, &read, &mut CutWork::for_cut());
     assert!(cut.len() < original.len(), "an ordinary cut still cuts");
-    for sid in ["@s-9", "@s-10"] {
+    for sid in ["@t0000000009", "@t0000000010"] {
         assert_eq!(
             land_episode_in(&cut.join("\n"), Some(sid)),
             land_episode_in(&body, Some(sid)),
@@ -3484,7 +3491,7 @@ fn a_cut_keeps_every_standing_row_when_its_standing_workspace_is_full() {
                 reason: "an earlier ordinary approval",
                 box_seq: 1,
             }
-            .to_json(i, Some("@s-1"))
+            .to_json(i, Some("@t0000000001"))
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -3506,8 +3513,8 @@ fn a_cut_keeps_every_standing_row_when_its_standing_workspace_is_full() {
     };
     let read_earlier = |path: &Path| {
         if path.extension().is_some_and(|e| e == "earlier-tabs") {
-            Some("s-1\n".to_string())
-        } else if path.file_name().is_some_and(|n| n == "s-1.jsonl") {
+            Some("t0000000001\n".to_string())
+        } else if path.file_name().is_some_and(|n| n == "t0000000001.jsonl") {
             Some(earlier.clone())
         } else {
             None
@@ -3519,7 +3526,7 @@ fn a_cut_keeps_every_standing_row_when_its_standing_workspace_is_full() {
         bytes: earlier.len() * 3 + 4_096,
     };
     let under_drive = Path::new("/captured/drive/self.jsonl");
-    let short = take_up("@s-2");
+    let short = take_up("@t0000000002");
     assert!(
         cut_of(&short, under_drive, &read_earlier, &mut allowance()).len() < held(&short).len(),
         "ordinary predecessor rows still admit a cut"
@@ -3553,7 +3560,7 @@ fn a_cut_keeps_every_standing_row_when_its_standing_workspace_is_full() {
             held(&body),
             "STANDING_WORKSPACE_EXCESS_MUST_PRESERVE_EVERY_STANDING_ROW"
         );
-        for sid in ["@s-9", "@s-10"] {
+        for sid in ["@t0000000009", "@t0000000010"] {
             assert_eq!(
                 land_episode_in(&kept.join("\n"), Some(sid)),
                 land_episode_in(&body, Some(sid)),

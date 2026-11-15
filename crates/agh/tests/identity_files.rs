@@ -2,10 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Token file and environment source loading tests under strict permissions.
+//! Token file loading tests under strict permissions.
 
-use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -27,7 +25,7 @@ fn file_profile(path: &Path) -> Profile {
 }
 
 fn load(path: &Path) -> Result<identity::Credential, LoadError> {
-    identity::load_for_tests(&file_profile(path), &common::env())
+    identity::load_for_tests(&file_profile(path))
 }
 
 #[test]
@@ -137,10 +135,7 @@ fn a_symlink_is_refused_and_a_missing_file_is_absent() {
     assert_eq!(missing, LoadError::Missing);
     assert_eq!(missing.presence(), Presence::Absent);
     let profile = file_profile(&root.path().join("tokens").join("none.token"));
-    assert_eq!(
-        identity::presence(&profile, &common::env()),
-        Presence::Absent
-    );
+    assert_eq!(identity::presence(&profile), Presence::Absent);
 }
 
 #[test]
@@ -162,10 +157,6 @@ fn the_loose_remedy_names_only_the_loose_parts() {
     assert!(file_only.contains("chmod 600 ~/f/dev.token"), "{file_only}");
     assert!(file_only.contains("chmod 644 ~/f/dev.token"), "{file_only}");
     assert!(!file_only.contains("chmod 700"), "{file_only}");
-    assert!(
-        file_only.contains("agh auth add dev --tier dev --stdin < ~/f/dev.token"),
-        "{file_only}"
-    );
     let dir_only = remedy_for("d", 0o755, 0o600);
     assert!(dir_only.contains("chmod 700 ~/d"), "{dir_only}");
     assert!(dir_only.contains("chmod 755 ~/d"), "{dir_only}");
@@ -200,17 +191,13 @@ fn the_loose_remedy_never_narrows_home() {
         common::chmod(&path, file_mode);
         let error = load(&path).expect_err("loose");
         assert!(matches!(error, LoadError::Loose(_)), "{error:?}");
-        error
-            .remedy(&file_profile(&path), home)
-            .expect("a loose file has a remedy")
+        error.remedy(&file_profile(&path), home)
     };
-    for remedy in [remedy_for(0o644), remedy_for(0o600)] {
-        assert!(!remedy.contains("chmod"), "{remedy}");
-        assert!(remedy.contains("--stdin < ~/dev.token"), "{remedy}");
-        assert!(!remedy.contains("''"), "{remedy}");
-    }
+    // No chmod of home, and a file the vault does not land has no other step.
+    assert_eq!(remedy_for(0o644), None);
+    assert_eq!(remedy_for(0o600), None);
     common::chmod(home, 0o700);
-    let file_only = remedy_for(0o644);
+    let file_only = remedy_for(0o644).expect("a loose file has a remedy");
     assert!(file_only.contains("chmod 600 ~/dev.token"), "{file_only}");
     assert!(!file_only.contains("chmod 700"), "{file_only}");
 }
@@ -230,11 +217,11 @@ fn the_loose_remedy_never_narrows_the_config_directories() {
     for path in [&in_config, &in_aterm, &spelled] {
         let error = load(path).expect_err("a loose directory");
         assert!(matches!(error, LoadError::Loose(_)), "{error:?}");
-        let remedy = error
-            .remedy(&file_profile(path), home)
-            .expect("a loose directory has a remedy");
-        assert!(!remedy.contains("chmod 700"), "{remedy}");
-        assert!(remedy.contains("--stdin < ~/.config/"), "{remedy}");
+        assert_eq!(
+            error.remedy(&file_profile(path), home),
+            None,
+            "no chmod 700"
+        );
     }
 }
 
@@ -266,7 +253,6 @@ fn the_loose_remedy_names_no_chmod_of_a_link_or_a_directory() {
     assert!(matches!(error, LoadError::Loose(_)), "{error:?}");
     let remedy = error.remedy(&file_profile(&sub), home).expect("a remedy");
     assert!(!remedy.contains("chmod"), "{remedy}");
-    assert!(!remedy.contains("--stdin"), "{remedy}");
     assert_eq!(
         Some(remedy),
         LoadError::Malformed("x").remedy(&file_profile(&sub), home)
@@ -279,11 +265,27 @@ fn the_loose_remedy_names_no_chmod_of_another_users_directory() {
         return;
     }
     let root = common::scratch("id-owner");
-    let remedy = LoadError::Loose("x".into())
-        .remedy(&file_profile(Path::new("/agh-no-such-token")), root.path())
-        .expect("the provisioning remedy");
-    assert!(!remedy.contains("chmod 700 /"), "{remedy}");
-    assert!(remedy.contains("--stdin < /agh-no-such-token"), "{remedy}");
+    let loose = LoadError::Loose("x".into());
+    assert_eq!(
+        loose.remedy(&file_profile(Path::new("/agh-no-such-token")), root.path()),
+        None,
+        "no chmod 700 /"
+    );
+    let vault = Profile::new(
+        "dev",
+        agh::identity::vault::Slot::Dev.source(Path::new("/")),
+        Tier::Dev,
+    );
+    assert_eq!(
+        loose.remedy(&vault, root.path()),
+        None,
+        "a vault entry has no mode, so no chmod is its remedy"
+    );
+    assert_eq!(
+        LoadError::Malformed("x").remedy(&vault, root.path()),
+        Some(agh::identity::vault::Slot::Dev.sync_step()),
+        "a vault entry that is no token is the vault's to fix"
+    );
 }
 
 #[test]
@@ -378,43 +380,20 @@ fn the_malformed_remedy_follows_the_rule_broken() {
         .remedy(&file_profile(&dir), home)
         .expect("a remedy");
     assert!(!not_file_remedy.contains("20-255"), "{not_file_remedy}");
-    let env_profile = Profile::new("ext", Source::Env("AGH_TEST_TOKEN".into()), Tier::External);
-    let bytes = OsString::from_vec(vec![b'g', b'h', b'p', b'_', 0xff, 0xfe]);
-    let not_utf8 = identity::load_for_tests(&env_profile, &RawEnv(bytes)).expect_err("not UTF-8");
-    let env_remedy = not_utf8.remedy(&env_profile, home).expect("a remedy");
-    assert_ne!(env_remedy, shape_remedy);
-    assert_ne!(env_remedy, not_file_remedy);
-}
-
-/// An environment whose every variable is one raw value, which need not be UTF-8.
-struct RawEnv(OsString);
-
-impl identity::EnvSource for RawEnv {
-    fn var_os(&self, _: &str) -> Option<OsString> {
-        Some(self.0.clone())
-    }
-}
-
-#[test]
-fn an_env_source_loads_and_judges_its_variable() {
-    let token = agh_fake::token("env");
-    let profile = Profile::new("ext", Source::Env("AGH_TEST_TOKEN".into()), Tier::External);
-    let set = MapEnv::new().with("AGH_TEST_TOKEN", &token);
-    let cred = identity::load_for_tests(&profile, &set).expect("the variable loads");
-    assert_eq!(cred.file_id(), None);
-    assert_eq!(cred.fingerprint(), identity::fingerprint(token.as_bytes()));
-    assert_eq!(cred.tier(), Tier::External);
-    let unset = identity::load_for_tests(&profile, &MapEnv::new()).expect_err("unset");
-    assert_eq!(unset, LoadError::Missing);
-    let empty = MapEnv::new().with("AGH_TEST_TOKEN", "");
-    assert_eq!(
-        identity::load_for_tests(&profile, &empty).expect_err("empty"),
-        LoadError::Missing
+    agh::identity::vault::put_entry_for_tests(home, "gh_access_token_org", Some(b"too short"));
+    let entry = Profile::new(
+        "dev",
+        Source::Entry(identity::VaultEntry::new("gh_access_token_org", home)),
+        Tier::Dev,
     );
-    let bytes = OsString::from_vec(vec![b'g', b'h', b'p', b'_', 0xff, 0xfe]);
-    let error = identity::load_for_tests(&profile, &RawEnv(bytes)).expect_err("not UTF-8");
-    assert_eq!(error.slug(), "malformed");
-    assert_eq!(identity::presence(&profile, &set), Presence::Present);
+    let vaulted = identity::load_for_tests(&entry).expect_err("a short vault token");
+    assert_eq!(vaulted.slug(), "malformed");
+    let entry_remedy = vaulted.remedy(&entry, home).expect("a remedy");
+    assert!(
+        entry_remedy.starts_with("aterm secrets sync applies the vault's current entries, ")
+            && entry_remedy.contains(" aterm secrets need entry:gh_access_token_org "),
+        "the vault's entry is the vault's to fix: {entry_remedy}"
+    );
 }
 
 #[test]

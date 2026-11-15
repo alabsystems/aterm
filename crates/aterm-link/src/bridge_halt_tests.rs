@@ -14,11 +14,12 @@ use crate::halt::{carried_id, Ask, Said, Word};
 /// One Mac of a halt world: its log, its node key and hand-off, and its bridge hosting `sid`.
 /// Fields drop in order: the bridge, its lane, the log's sockets, then the Mac. Every socket the
 /// log was served on stays served until then, as the node service keeps it while a bridge
-/// restarts: a dropped handle closes the broker.
+/// restarts: a dropped handle closes the broker. Each socket's folder is its own ([`Served`]),
+/// so it outlives every lane the restarts dropped.
 struct Seat {
     bridge: Bridge,
     lane: FakeVerbLane,
-    served: Vec<astream_broker::BrokerHandle>,
+    served: Vec<Served>,
     sid: &'static str,
     state: aterm_tempfile::TempDir,
     keys: aterm_tempfile::TempDir,
@@ -212,7 +213,7 @@ fn an_agent_cannot_halt() {
         crate::halt::ANY_PRINCIPAL.with(|c| c.set(control));
         let case = format!("control={control}");
         let x = node_of(&key_of(92));
-        let mut seats = world(&[91], &["s-a"]);
+        let mut seats = world(&[91], &["ta000000000"]);
         let a = &seats[0];
         let nodes = [a.mac.node.as_str(), x.as_str()];
         members(&a.mac, &nodes)
@@ -270,7 +271,7 @@ fn an_agent_cannot_halt() {
 fn a_replayed_halt_off_does_not_lift_a_later_halt() {
     for control in [false, true] {
         let case = format!("control={control}");
-        let mut seats = world(&[81], &["s-a"]);
+        let mut seats = world(&[81], &["ta000000000"]);
         let mac = &seats[0].mac;
         ask(mac, "h-a", 1, &on(1)).expect("the halt");
         settle(&mut seats, &format!("{case}: the halt holds"), |s| {
@@ -322,7 +323,10 @@ fn a_halt_off_lifts_on_every_mac() {
     for control in [false, true] {
         crate::federate::OWN_HALTS_ONLY.with(|c| c.set(control));
         let case = format!("control={control}");
-        let mut seats = world(&[61, 62, 63], &["s-a", "s-b", "s-c"]);
+        let mut seats = world(
+            &[61, 62, 63],
+            &["ta000000000", "tb000000000", "tc000000000"],
+        );
         let net = Arc::new(Net::default());
         let routes = relays(&seats, &net, &[(0, 1), (1, 2)]);
         ask(&seats[0].mac, "h-a", 1, &on(1)).expect("the halt");
@@ -362,7 +366,7 @@ fn a_halt_off_from_another_members_person_lifts_it() {
     for control in [false, true] {
         crate::halt::OFF_FROM_ORIGIN_ONLY.with(|c| c.set(control));
         let case = format!("control={control}");
-        let mut seats = world(&[71, 72], &["s-a", "s-b"]);
+        let mut seats = world(&[71, 72], &["ta000000000", "tb000000000"]);
         let net = Arc::new(Net::default());
         let routes = relays(&seats, &net, &[(0, 1)]);
         ask(&seats[0].mac, "h-a", 1, &on(1)).expect("the halt");
@@ -401,7 +405,10 @@ fn removing_or_rotating_the_origin_lifts_its_halts_on_every_mac() {
     for (rotate, control) in [(false, false), (true, false), (false, true), (true, true)] {
         crate::halt::NO_LIFT_ON_GONE.with(|c| c.set(control));
         let case = format!("rotate={rotate} control={control}");
-        let mut seats = world(&[51, 52, 53], &["s-a", "s-b", "s-c"]);
+        let mut seats = world(
+            &[51, 52, 53],
+            &["ta000000000", "tb000000000", "tc000000000"],
+        );
         let net = Arc::new(Net::default());
         let routes = relays(&seats, &net, &[(0, 1), (1, 2), (0, 2)]);
         ask(&seats[0].mac, "h-a", 1, &on(1)).expect("the halt");
@@ -520,10 +527,9 @@ fn a_halt_under_the_old_subject_holds_after_the_upgrade_and_its_id_lifts_it() {
         mac.broker.set_origin_keys([mac.key]);
         let state = crate::test_scratch_dir("halt");
         let (lane, mut before) =
-            FakeVerbLane::bridge_configured(&[(1, "s-a")], Some(state.path()), None);
+            FakeVerbLane::bridge_configured(&[(1, "ta000000000")], Some(state.path()), None);
         let old_fleet = before.cfg.fleet.clone();
-        let socket = lane.dir.path().join("bus.sock");
-        let served_off = mac.broker.serve(&socket).expect("bus.log served");
+        let (served_off, socket) = Served::on(&mac);
         before.cfg.broker = socket.to_string_lossy().into_owned();
         before.caps = crate::enable::node_rules(&old_fleet, &before.node)
             .into_iter()
@@ -544,7 +550,7 @@ fn a_halt_under_the_old_subject_holds_after_the_upgrade_and_its_id_lifts_it() {
             before.attach_broker(),
             "the bridge attaches with the mesh off"
         );
-        assert!(lane.holds("s-a"), "{case}: the old row holds");
+        assert!(lane.holds("ta000000000"), "{case}: the old row holds");
         before.close_subscriptions();
         drop((before, lane));
         let carol = subject::person_halt(&old_fleet, "h-carol");
@@ -571,7 +577,7 @@ fn a_halt_under_the_old_subject_holds_after_the_upgrade_and_its_id_lifts_it() {
         .expect("the root's mint secret");
         let (lane, mut bridge, served) = bridge_on(
             &mac,
-            "s-a",
+            "ta000000000",
             keys.path(),
             Some(state.path()),
             crate::fx::Fx::os(),
@@ -599,7 +605,7 @@ fn a_halt_under_the_old_subject_holds_after_the_upgrade_and_its_id_lifts_it() {
             bridge,
             lane,
             served: vec![served_off, served],
-            sid: "s-a",
+            sid: "ta000000000",
             state,
             keys,
             mac,
@@ -660,7 +666,7 @@ fn a_halt_under_the_old_subject_holds_after_the_upgrade_and_its_id_lifts_it() {
 fn a_halt_off_here_lifts_it_on_that_mac_alone() {
     for here in [true, false] {
         let case = format!("here={here}");
-        let mut seats = world(&[75, 76], &["s-a", "s-b"]);
+        let mut seats = world(&[75, 76], &["ta000000000", "tb000000000"]);
         let net = Arc::new(Net::default());
         let routes = relays(&seats, &net, &[(0, 1)]);
         ask(&seats[0].mac, "h-a", 1, &on(1)).expect("the halt");
@@ -724,7 +730,7 @@ fn a_mac_that_lifted_a_halt_for_every_mac_answers_its_origin_saying_it_again() {
     for here in [false, true] {
         let case = format!("here={here}");
         let x = node_of(&key_of(68));
-        let mut seats = world(&[67], &["s-b"]);
+        let mut seats = world(&[67], &["tb000000000"]);
         let nodes = [seats[0].mac.node.as_str(), x.as_str()];
         members(&seats[0].mac, &nodes)
             .write(seats[0].keys.path())
@@ -788,7 +794,7 @@ fn a_halt_off_reaches_a_mac_back_from_however_long_away() {
         NO_STALE_ASK.with(|c| c.set(control));
         let case = format!("control={control}");
         let x = node_of(&key_of(78));
-        let mut seats = world(&[76, 77], &["s-b", "s-c"]);
+        let mut seats = world(&[76, 77], &["tb000000000", "tc000000000"]);
         let nodes = [
             seats[0].mac.node.as_str(),
             seats[1].mac.node.as_str(),
@@ -890,7 +896,7 @@ fn a_halt_off_reaches_a_mac_back_from_however_long_away() {
 #[test]
 fn a_mac_says_its_halt_and_its_halt_off_again_on_their_clock() {
     use crate::halt::{OFF_RESAY_SPAN_MS, RESAY_MS};
-    let mut seats = world(&[65], &["s-a"]);
+    let mut seats = world(&[65], &["ta000000000"]);
     ask(&seats[0].mac, "h-a", 1, &on(1)).expect("the halt");
     settle(&mut seats, "the halt holds", |s| s[0].held());
     let first = said_on(&seats[0]);
@@ -939,7 +945,7 @@ fn a_mac_says_its_halt_and_its_halt_off_again_on_their_clock() {
 fn a_relay_holds_a_halt_the_far_end_does_not_take_yet() {
     for control in [false, true] {
         let case = format!("control={control}");
-        let mut seats = world(&[45, 46], &["s-a", "s-d"]);
+        let mut seats = world(&[45, 46], &["ta000000000", "td000000000"]);
         let n = node_of(&key_of(47));
         let (a_key, d_key) = (seats[0].mac.key, seats[1].mac.key);
         seats[1].mac.broker.set_origin_keys([a_key, d_key]);
@@ -1003,7 +1009,7 @@ fn a_relay_holds_a_halt_the_far_end_does_not_take_yet() {
 /// and said once the key names the bridge's node again.
 #[test]
 fn a_request_that_cannot_be_said_waits_and_the_bridge_stays_attached() {
-    let mut seats = world(&[43], &["s-a"]);
+    let mut seats = world(&[43], &["ta000000000"]);
     let seed = |tag: u8| format!("{}\n", aterm_codec::hex::encode_lower(&[tag; 32]));
     let write_key = |seat: &Seat, tag: u8| {
         aterm_uds::private_file::write_private(

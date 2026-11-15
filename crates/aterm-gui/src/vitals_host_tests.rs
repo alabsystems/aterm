@@ -1395,15 +1395,15 @@ fn homes_volume_key_on_windows_is_the_disk_watchs() {
         |_: &[&aterm_sysprobe::volumes::Mount]| -> Vec<aterm_sysprobe::blockio::BlockReading> {
             panic!("Windows has no block reader to ask")
         };
-    let watch = aterm_agent::harness::disk::volume_of(home, &aterm_sysprobe::volumes::table())
+    let watch = aterm_agent::harness::disk::volume_of(&home, &aterm_sysprobe::volumes::table())
         .expect("this checkout's volume");
 
-    let keyed = machine_volumes(home, true, Some(home), no_devices);
+    let keyed = machine_volumes(&home, true, Some(&home), no_devices);
     assert_eq!(keyed.key.as_ref(), Some(&watch.key));
     assert!(keyed.home.is_some());
     assert!(keyed.block.is_empty());
 
-    let unwatched = machine_volumes(home, false, Some(home), no_devices);
+    let unwatched = machine_volumes(&home, false, Some(&home), no_devices);
     assert_eq!(unwatched.key, None);
     assert!(unwatched.home.is_some());
 }
@@ -3109,11 +3109,19 @@ fn land(app: &crate::App, seq: u64, rows: Vec<JobRow>, demand: Demand) {
         demand,
         ..JobsView::default()
     };
-    app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+    let snap = Arc::new(Snapshot {
         seq,
         jobs: Some(Arc::new(view)),
         ..Snapshot::default()
-    }));
+    });
+    // A new view replies to the latest ask on the test's clock. Cached or older in-flight views
+    // use hand_over directly with their own original observation instead.
+    hand_over(
+        &app.vitals.latest,
+        &snap,
+        Vec::new(),
+        app.vitals.asked_at.unwrap_or_else(Instant::now),
+    );
 }
 
 fn sid_of_tab0(app: &crate::App) -> String {
@@ -3272,6 +3280,129 @@ fn a_dropped_windowless_ask_is_asked_again_at_the_floor() {
     drop((tx, rx));
     app.serve_windowless_vitals(Audience::None, due + JOBS_FLOOR, false);
     assert_eq!(app.vitals.jobs_due, None, "no thread: nothing to ask");
+    assert!(
+        app.vitals.jobs_owed.is_none(),
+        "the reader's death ends its debt"
+    );
+    assert_eq!(app.vitals_deadline(), None, "no retry after reader death");
+}
+
+/// An accepted final edge can meet a stalled process lane. Its unchanged jobs view is no
+/// acknowledgement: retry at the floor without another edge, until a fresh jobs observation
+/// covers the original requirement. Queue acceptance must not clear that requirement.
+#[test]
+fn an_accepted_final_edge_survives_a_stalled_view_until_a_fresh_jobs_acknowledgement() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let now = Instant::now();
+    land(&app, 1, Vec::new(), Demand::Idle);
+    assert!(app.adopt_vitals(Audience::None, now, false));
+    let held = app.vitals.snapshot.as_ref().unwrap().jobs.clone();
+    app.vitals.note_edge();
+    app.service_vitals(now);
+    assert!(read_req(&rx, "the final edge's accepted ask").jobs_now);
+    assert_eq!(app.vitals.jobs_owed.unwrap().after, now);
+    let stalled = Arc::new(Snapshot {
+        seq: 2,
+        jobs: held,
+        stalled: vec![aterm_vitals::lanes::LaneStall {
+            lane: aterm_vitals::lanes::PROCS,
+            call: "process_start",
+            pid: Some(4321),
+            name: None,
+            since_unix_ms: 1,
+            for_ms: 400,
+        }],
+        ..Snapshot::default()
+    });
+    hand_over(&app.vitals.latest, &stalled, Vec::new(), now);
+    assert!(app.adopt_vitals(Audience::None, now + Duration::from_millis(500), false));
+    assert_eq!(app.vitals_deadline(), Some(now + JOBS_FLOOR));
+    app.service_vitals(now + JOBS_FLOOR - Duration::from_millis(1));
+    assert_eq!(asked(&rx), 0, "no retry before the floor");
+    for attempt in 1..=2 {
+        let at = now + JOBS_FLOOR * attempt;
+        app.service_vitals(at);
+        assert!(read_req(&rx, "the owed look retries without another edge").jobs_now);
+        assert_eq!(
+            app.vitals.jobs_owed.unwrap().after,
+            now,
+            "retries do not move the requirement"
+        );
+        assert_eq!(app.vitals_deadline(), Some(at + JOBS_FLOOR));
+        app.service_vitals(at);
+        assert_eq!(asked(&rx), 0, "one attempt per floor");
+    }
+    let fresh = Arc::new(Snapshot {
+        seq: 3,
+        jobs: Some(Arc::new(JobsView::default())),
+        ..Snapshot::default()
+    });
+    // This actual view covers the edge, but began before the latest retry. It still pays the debt.
+    hand_over(
+        &app.vitals.latest,
+        &fresh,
+        Vec::new(),
+        now + Duration::from_millis(750),
+    );
+    let adopted = now + 2 * JOBS_FLOOR;
+    assert!(app.adopt_vitals(Audience::None, adopted, false));
+    assert!(app.vitals.jobs_owed.is_none());
+    assert_eq!(
+        app.vitals_deadline(),
+        None,
+        "a fresh idle view arms nothing"
+    );
+    app.service_vitals(adopted + JOBS_FLOOR);
+    assert_eq!(asked(&rx), 0, "no residual retry after acknowledgement");
+}
+
+#[test]
+fn a_new_external_edge_cannot_be_acknowledged_by_an_older_inflight_jobs_view() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let now = Instant::now();
+    app.vitals.note_edge();
+    app.service_vitals(now);
+    assert!(read_req(&rx, "the first edge").jobs_now);
+    let newer = now + Duration::from_secs(1);
+    app.vitals.note_edge();
+    let old = Arc::new(Snapshot {
+        seq: 1,
+        jobs: Some(Arc::new(JobsView::default())),
+        ..Snapshot::default()
+    });
+    hand_over(
+        &app.vitals.latest,
+        &old,
+        Vec::new(),
+        now + Duration::from_millis(500),
+    );
+    app.service_vitals(newer);
+    assert_eq!(
+        app.vitals.jobs_owed.unwrap().after,
+        newer,
+        "stamp the external edge before adoption"
+    );
+    assert_eq!(asked(&rx), 0, "the new edge respects the existing floor");
+    app.service_vitals(now + JOBS_FLOOR);
+    assert!(read_req(&rx, "the new edge's reading").jobs_now);
+    let fresh = Arc::new(Snapshot {
+        seq: 2,
+        jobs: Some(Arc::new(JobsView::default())),
+        ..Snapshot::default()
+    });
+    hand_over(
+        &app.vitals.latest,
+        &fresh,
+        Vec::new(),
+        newer + Duration::from_millis(500),
+    );
+    assert!(app.adopt_vitals(Audience::None, now + JOBS_FLOOR, false));
+    assert!(app.vitals.jobs_owed.is_none());
+    assert_eq!(app.vitals_deadline(), None);
 }
 
 /// A dropped ask stays due at the floor across an in-flight pull's whole reading that ran no
@@ -3338,7 +3469,11 @@ fn machine_only_and_held_engine_views_do_not_move_delegated_sweeps() {
     assert_eq!(asked(&rx), 1);
     land_held(&app, 3, true);
     assert!(app.adopt_vitals(Audience::None, now + BACKGROUND_PERIOD, true));
-    assert_eq!(app.vitals_deadline(), None, "the full sweep is pending");
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(now + BACKGROUND_PERIOD + JOBS_FLOOR),
+        "the accepted full sweep still owes a jobs observation"
+    );
     app.serve_windowless_vitals(Audience::None, now + BACKGROUND_PERIOD, true);
     assert_eq!(
         asked(&rx),
@@ -3354,6 +3489,12 @@ fn machine_only_and_held_engine_views_do_not_move_delegated_sweeps() {
         "the engine view did not change"
     );
     assert_eq!(app.vitals.full_adopted_at, Some(now + BACKGROUND_PERIOD));
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(now + BACKGROUND_PERIOD + JOBS_FLOOR)
+    );
+    land(&app, 5, Vec::new(), Demand::Idle);
+    assert!(app.adopt_vitals(Audience::None, now + BACKGROUND_PERIOD, true));
     assert_eq!(app.vitals_deadline(), Some(now + 2 * BACKGROUND_PERIOD));
 }
 
@@ -3407,7 +3548,7 @@ fn a_late_machine_snapshot_does_not_duplicate_a_pending_engine_sweep() {
         ..Snapshot::default()
     }));
     assert!(app.adopt_vitals(Audience::None, due, true));
-    assert_eq!(app.vitals_deadline(), None);
+    assert_eq!(app.vitals_deadline(), Some(due + JOBS_FLOOR));
     app.serve_windowless_vitals(Audience::None, due, true);
     assert_eq!(asked(&rx), 0, "the engine's full sweep is already pending");
 }
@@ -3448,7 +3589,11 @@ fn with_no_window_the_disk_look_reads_once_and_the_board_names_the_hung_call() {
     assert_eq!(asked(&rx), 0, "not before the engine's cadence");
     app.service_vitals(due);
     assert_eq!(asked(&rx), 1, "the engine's demand reads");
-    assert_eq!(app.vitals_deadline(), None, "named again when it lands");
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(due + JOBS_FLOOR),
+        "owed until a fresh view lands"
+    );
 
     land(&app, 2, Vec::new(), Demand::Idle);
     app.on_vitals_wake();
@@ -3787,7 +3932,7 @@ fn a_hidden_deck_reads_the_machine_and_the_engine_reads_whole() {
 }
 
 /// A session's close asks one whole reading at once, whatever the pacing, so the leftover pass
-/// reads the closed tab's horizon at the exit edge; the next service asks nothing more.
+/// reads the closed tab's horizon at the exit edge; the same turn asks nothing more.
 /// NEGATIVE CONTROL: drop the close's pull, and the close is read only at the next edge.
 #[test]
 fn the_close_asks_for_a_reading_at_once() {
@@ -4129,6 +4274,8 @@ fn a_write_that_moves_no_cell_is_no_edge_and_arms_nothing() {
         1,
         "the prompt moved the screen: read in its wake"
     );
+    land(&app, 2, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
 
     for (n, bytes) in (1_u64..).zip([MUSE_RESET, BACKGROUND_QUERY, MUSE_RESET]) {
         let at = t0 + Duration::from_millis(400 * n);
@@ -4170,6 +4317,8 @@ fn a_write_whose_wake_meets_the_term_lock_held_is_judged_by_what_the_reader_fed(
         1,
         "the prompt moved the screen: read in its wake"
     );
+    land(&app, 2, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
     let term = Arc::clone(&app.pool.get(0).expect("tab 0").term);
     for (n, bytes) in (1_u64..).zip([MUSE_RESET, BACKGROUND_QUERY, MUSE_RESET]) {
         let at = t0 + Duration::from_millis(400 * n);
@@ -4542,10 +4691,24 @@ impl JobAtRest {
     fn app(&self, board: &'static JobsBoard) -> (crate::App, Receiver<Msg>) {
         let sink = Arc::new(aterm_session::sink::SinkWriter::new(self.master()));
         let mut app = crate::App::headless_for_test_with_sink(sink);
-        app.pool.sessions.get_mut(&0).expect("tab 0").session.pid =
-            i32::try_from(self.leader.as_ref().expect("owned leader").id()).expect("pid");
+        self.bind_session(&mut app);
         let rx = with_reader(&mut app, board);
         (app, rx)
+    }
+
+    fn bind_session(&self, app: &mut crate::App) {
+        let leader = self.leader.as_ref().expect("owned leader");
+        assert!(
+            leader.owns_unreaped(),
+            "the fixture still owns its original leader"
+        );
+        let pid = i32::try_from(leader.id()).expect("pid");
+        let birth = aterm_pty::process_birth(pid).expect("the owned live leader's kernel birth");
+        let session = &mut app.pool.sessions.get_mut(&0).expect("tab 0").session;
+        session.pid = pid;
+        session.shell_identity = aterm_pty::ShellIdentity::from_parts(pid, Some(birth), false);
+        // This Session borrows the terminal and leader. Only JobAtRest::stop may signal/reap it.
+        session.teardown_started.store(true, Ordering::Release);
     }
 }
 
@@ -4722,7 +4885,7 @@ fn engine_reads(
         &app.vitals.latest,
         &snap,
         req.ttys.iter().map(TtyWord::seen).collect(),
-        Instant::now(),
+        app.vitals.asked_at.unwrap_or_else(Instant::now),
     );
 }
 
@@ -4815,13 +4978,18 @@ fn a_parked_screens_redraw_is_read_once_a_floor_and_never_on_a_deadline() {
         let reads = rx
             .try_iter()
             .filter_map(|m| match m {
-                Msg::Read(r) => Some(r.jobs_now),
+                Msg::Read(r) => Some(r),
                 _ => None,
             })
             .collect::<Vec<_>>();
         match reads.as_slice() {
             [] => {}
-            [true] => read.push(s),
+            [req] => {
+                assert!(req.jobs_now);
+                read.push(s);
+                engine_reads(&mut pass, &app, req, 1_000 + s * 1_000, 1_000 + s);
+                assert!(app.adopt_vitals(Audience::None, at, false));
+            }
             other => panic!("redraw {s}: one reading that makes the engine look: {other:?}"),
         }
         assert_eq!(app.vitals.edge_at(at), None, "redraw {s}: no edge owed");
@@ -4843,7 +5011,10 @@ fn a_parked_screens_redraw_is_read_once_a_floor_and_never_on_a_deadline() {
     );
     let heard = last + JOBS_FLOOR;
     app.service_vitals(heard);
-    assert!(read_req(&rx, "past the floor: read at once").jobs_now);
+    let req = read_req(&rx, "past the floor: read at once");
+    assert!(req.jobs_now);
+    engine_reads(&mut pass, &app, &req, 1_000 + 22_000, 1_022);
+    assert!(app.adopt_vitals(Audience::None, heard, false));
     let inside = heard + Duration::from_secs(1);
     redraw(&mut app, inside);
     assert_eq!(
@@ -4916,7 +5087,7 @@ fn a_parked_screens_redraw_is_read_once_a_floor_and_never_on_a_deadline() {
     let req = read_req(&rx, "the end's prompt: read at once");
     assert!(req.jobs_now);
     assert!(!app.vitals.parked.contains_key(&0), "the park dropped");
-    engine_reads(&mut pass, &app, &req, 1_000 + 600_000, 1_000);
+    engine_reads(&mut pass, &app, &req, 1_000 + 600_000, 2_000);
     app.adopt_vitals(Audience::None, at, false);
     let view = app
         .vitals
@@ -5067,8 +5238,7 @@ fn parked_by_the_thread_with(
 ) -> (crate::App, Parked) {
     let sink = Arc::new(aterm_session::sink::SinkWriter::new(job.master()));
     let mut app = crate::App::headless_for_test_with_sink(sink);
-    app.pool.sessions.get_mut(&0).expect("tab 0").session.pid =
-        i32::try_from(job.leader.as_ref().expect("owned leader").id()).expect("pid");
+    job.bind_session(&mut app);
     app.vitals.board = board;
     app.vitals.start(engine, || true, None, None);
     assert!(app.vitals.parked.is_empty(), "nothing read: nothing parked");
@@ -5425,7 +5595,9 @@ fn a_terminal_word_holds_until_output_and_never_over_an_unread_key() {
 /// names for tab 0's live job, and the engine's demand.
 #[cfg(target_os = "macos")]
 fn read_wait(req: &Request) -> (Option<aterm_vitals::jobs::WaitName>, Demand) {
-    let snap = Reader::new(Arc::default()).read(req);
+    let mut reader = Reader::new(Arc::default());
+    reader.ownership.use_native_shell_verifier();
+    let snap = reader.read(req);
     let view = snap.jobs.expect("a jobs view");
     let wait = view
         .rows
@@ -5453,6 +5625,39 @@ fn the_readers_whole_reading_names_a_raw_program_from_the_loops_word() {
     assert_eq!(read_wait(&req), (Some(WaitName::TtyRaw), Demand::Idle));
     feed(&app, b"x");
     assert_eq!(read_wait(&req), (Some(WaitName::Unnamed), Demand::Fast));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_valid_terminal_word_never_attaches_a_wait_to_an_unproved_shell_generation() {
+    use aterm_vitals::jobs::WaitName;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(true);
+    let (app, _rx) = job.app(&BOARD);
+    let mut req = app.vitals_request(Duration::ZERO, false);
+    assert_eq!(read_wait(&req), (Some(WaitName::TtyRaw), Demand::Idle));
+    let (_, identity) = req
+        .shell_identities
+        .iter_mut()
+        .find(|(key, _)| *key == 0)
+        .unwrap();
+    identity.birth = identity.birth.map(|birth| birth + 1);
+    assert!(
+        req.ttys[0].current().is_some(),
+        "the borrowed terminal's word remains valid"
+    );
+    assert_eq!(
+        read_wait(&req),
+        (None, Demand::Idle),
+        "a stale shell cannot claim the job tree"
+    );
+    req.shell_identities[0].1.birth = None;
+    assert!(req.ttys[0].current().is_some());
+    assert_eq!(
+        read_wait(&req),
+        (None, Demand::Idle),
+        "an unread shell generation is not PID authority"
+    );
 }
 
 /// A line `ping` prints, fed on a terminal holding no block.
@@ -5581,6 +5786,7 @@ fn a_reading_takes_its_tabs_before_its_sweep() {
     req.jobs_now = true;
     let mut reader = Reader::new(Arc::default());
     reader.split = SplitReader::new(MID_SWEEP, Box::leak(Box::new(Arming::new())));
+    reader.ownership.use_native_shell_verifier();
     reader.clock = ticking;
     let mut quiet = || {
         let view = reader.read(&req).jobs.expect("a jobs view");
@@ -5956,11 +6162,10 @@ fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
     );
 }
 
-/// A pull keeps the engine's cadence unless a `sys jobs` waiting on it arms the engine or an
-/// explicit naming request forces a fresh jobs pass, and
-/// then its last reading alone looks: a cold pull's warm reading keeps the cadence, so the
-/// engine never takes two passes half a second apart. NEGATIVE CONTROL: a pull that never asks
-/// the engine to look leaves an armed `sys jobs` the carried view.
+/// A pull requests jobs only on its final reading, when a `sys jobs` arms the engine or an
+/// explicit naming request forces it. A preparatory cold reading never asks for jobs. A recent
+/// reading can become cold while this test is descheduled, so no assertion depends on its age.
+/// NEGATIVE CONTROL: never asking for jobs leaves an armed request with only its carried view.
 #[test]
 fn a_pull_looks_at_jobs_only_when_a_sys_jobs_arms_it() {
     struct Looks {
@@ -5993,29 +6198,26 @@ fn a_pull_looks_at_jobs_only_when_a_sys_jobs_arms_it() {
         let _ = pull(&mut source, &mut req, last_whole, force);
         source.looked
     };
-    let warm = Some(Instant::now());
-    assert_eq!(
-        looked(false, warm, false),
-        [false],
-        "unarmed: the engine's cadence"
-    );
-    assert_eq!(looked(true, warm, false), [true], "armed: the engine looks");
-    assert_eq!(looked(false, None, false), [false, false], "cold, unarmed");
-    assert_eq!(
-        looked(true, None, false),
-        [false, true],
-        "cold, armed: its last reading"
-    );
-    assert_eq!(
-        looked(false, warm, true),
-        [true],
-        "explicit naming looks without an audience"
-    );
-    assert_eq!(
-        looked(false, None, true),
-        [false, true],
-        "a cold naming pull forces only its final pass"
-    );
+    for armed in [false, true] {
+        for force in [false, true] {
+            let expected = armed || force;
+            assert_eq!(
+                looked(armed, None, force),
+                [false, expected],
+                "a cold pull assesses only its final reading: armed={armed}, force={force}"
+            );
+            let readings = looked(armed, Some(Instant::now()), force);
+            let (last, preparatory) = readings.split_last().expect("a pull always reads");
+            assert_eq!(
+                *last, expected,
+                "the final reading assesses exactly when requested: armed={armed}, force={force}"
+            );
+            assert!(
+                preparatory.iter().all(|&jobs| !jobs),
+                "preparatory readings never assess jobs: {readings:?}"
+            );
+        }
+    }
 }
 
 /// THE AFTER-PUBLISH HOOK ADDS NO MAIN-LOOP WAKE (A3 L1): the TCP readers' hook runs once a
@@ -6414,12 +6616,15 @@ fn the_oss_exact_thermal_state_wins_over_the_counters_estimate() {
     let cached = Instant::now() + Duration::from_secs(3_600);
     reader.counter_throttle = Some((cached, Some(estimate)));
     assert_eq!(
-        reader.machine_sample(&req, 0, None).thermal,
+        reader.machine_sample(&req, 0, None, (None, None)).thermal,
         Some(thermal_of(2, Some(true)))
     );
     reader.thermal = || None;
     reader.counter_throttle = Some((cached, Some(estimate)));
-    assert_eq!(reader.machine_sample(&req, 0, None).thermal, Some(estimate));
+    assert_eq!(
+        reader.machine_sample(&req, 0, None, (None, None)).thermal,
+        Some(estimate)
+    );
 }
 
 /// With no window, an idle view holding a program at macOS's program check, or a backed-up

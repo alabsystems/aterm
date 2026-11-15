@@ -22,11 +22,19 @@ pub(crate) const PAGE: Page = Page {
             "@<sid> log",
             "a closed session's log too, while the journal kept it",
         ),
+        row(
+            "@<sid> log prev[=<k>]",
+            "the log the tab kept before aterm last started it (owner), from the journal",
+        ),
     ],
     options: &[
         row(
             "<node>",
             "a subtree: `-` the session, `r<n>` a run, `t<n>` an agent turn, `p<n>` a step",
+        ),
+        row(
+            "prev[=<k>]",
+            "the log before the one a plain `log` reads, or <k> logs back, from the journal",
         ),
         row(
             "lvl=<l>",
@@ -174,15 +182,25 @@ pub(crate) const PAGE: Page = Page {
         Section {
             name: "closed",
             about: "a closed session's log, the journal that keeps it, and the fabric mirror",
-            rows: &[para(
-                "A closed session stays readable as `@<sid> log` (its last 512, journaled while \
+            rows: &[
+                para(
+                    "A closed session stays readable as `@<sid> log` (its last 512, journaled while \
                  `status log_journal=` is `on`, or `armed` or `paused` until it starts or \
                  resumes, and by an update's successor once `handed`; `stopped` and `off` journal \
                  nothing more, and `log_journal_why=` says why: `[session_log] journal = false`, \
                  `restore_session = false`, an instance that keeps no desktop, as a headless one \
                  does, a platform other than macOS and Linux, no logs folder (`no-folder`), or \
                  what stopped the writer), mirrored under `[fabric] log = \"auto\"|\"turns\"`.",
-            )],
+                ),
+                para(
+                    "A tab keeps its ID across a quit, a reboot or a crash, and the launch that \
+                 restores it starts it a new log, so one ID names every log the tab kept. `@<sid> \
+                 log prev` reads, from the journal and for the owner only, the one before the log \
+                 a plain `@<sid> log` reads, and `prev=<k>` the log <k> back; `brief prev` is its \
+                 brief. Its cursors page within that log. Past the oldest log the journal kept \
+                 the reply is `ERR the journal keeps no earlier log of this session`.",
+                ),
+            ],
         },
         Section {
             name: "node",

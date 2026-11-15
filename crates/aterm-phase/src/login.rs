@@ -298,7 +298,7 @@ fn wall_above_login(
 #[must_use]
 pub fn login_at_wall(rows: &[String]) -> Option<LoginAtWall> {
     let (wall, left_before) = wall_above_login(rows, true)?;
-    (wall.kind == crate::wall::WallKind::Auth).then_some(LoginAtWall {
+    (wall.kind == alab_policy::vocab::WallKind::Auth).then_some(LoginAtWall {
         message: wall.message,
         left_before,
     })

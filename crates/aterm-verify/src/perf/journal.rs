@@ -12,7 +12,7 @@ use aterm_json::{Value, json};
 
 use super::arena::{Halt, chip, outcome};
 use super::bench_build::{self, Targo};
-use super::driver::cargo_driver;
+use super::driver::{cargo_driver, compiler_output};
 use super::{LaneRun, workspace_root};
 
 const TEST: &str = "note_latency_reports_its_percentiles";
@@ -54,22 +54,48 @@ fn measure(json_out: Option<&Path>) -> Result<String, Halt> {
         "aterm-db",
         "--test",
         "journal_note",
-        TEST,
-        "--",
-        "--exact",
-        "--ignored",
-        "--nocapture",
-        "--test-threads=1",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
     ];
     let build = targo.display("test", &args);
     eprintln!("  {}", plan.summary());
     eprintln!("  $ {build}");
-    let output = targo
-        .command("test")?
-        .args(args)
-        .current_dir(workspace_root())
+    let root = workspace_root();
+    let mut build_command = targo.command("test")?;
+    build_command.args(args).current_dir(&root);
+    let built = compiler_output(&mut build_command)
+        .map_err(|error| format!("could not build the journal measurement: {error}"))?;
+    if !built.status.success() {
+        return Err(Halt::Fail(format!(
+            "journal measurement build failed: {}",
+            String::from_utf8_lossy(&built.stderr)
+        )));
+    }
+    let executable = bench_build::built_executable(
+        &String::from_utf8_lossy(&built.stdout),
+        "journal_note",
+        "test",
+    )?;
+    let mut run = crate::exec::check_command(&executable);
+    targo.environment(&mut run);
+    run.current_dir(&root).args([
+        TEST,
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    eprintln!(
+        "  $ {} {TEST} --exact --ignored --nocapture --test-threads=1",
+        executable.display()
+    );
+    let entry = super::measurement_entry().map_err(Halt::Timing)?;
+    let output = run
         .output()
         .map_err(|error| format!("could not run the journal measurement: {error}"))?;
+    entry
+        .timing_admission()
+        .map_err(|why| Halt::Timing(why.to_string()))?;
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),

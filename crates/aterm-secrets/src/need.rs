@@ -5,7 +5,7 @@
 //! consumer that lacks a credential raises a *need* ([`raise`]); the need ledger
 //! (`~/.config/aterm/secrets/needs.toml`, 0600, a path no vault entry can name) keeps it with a
 //! request id fixed before anything is posted; the [`catalog`] answers at once the wants no Mac
-//! can give (the paper master, a vendor login); the absence proof over this Mac's applied
+//! can give (a vendor login, this Mac's own keys); the absence proof over this Mac's applied
 //! envelope ([`Sight`]) shows what the vault already gives this Mac; every other need is posted
 //! to the lab's Macs and names the one party it waits on ([`Wait`]). No need is ever handed to a
 //! person: one no Mac holds retires `not-held`, the blocked operation its line records. Nothing
@@ -24,9 +24,9 @@ pub mod transfer;
 pub use crate::client::version::RefusalClaim;
 pub use catalog::{Class, GhProfile, Purpose, Want};
 pub use ledger::{
-    FILE as LEDGER, absorb, acknowledge_from_snapshot, list, peek, raise, raise_refused,
-    raise_refused_from_snapshot, raise_rotations, raise_with_admission, retire, rotated, satisfied,
-    unneeded_from_snapshot, with_ledger,
+    FILE as LEDGER, absorb, acknowledge_from_snapshot, ask_for_tokens, list, peek, raise,
+    raise_refused, raise_refused_from_snapshot, raise_rotations, raise_with_admission, retire,
+    rotated, satisfied, unneeded_from_snapshot, with_ledger,
 };
 
 use crate::commons::Unavailable;
@@ -48,8 +48,18 @@ pub const LAPSE_SECS: u64 = 30 * 86_400;
 /// How old a requester's newest record on a waiting request may grow before it writes `Still`.
 pub const STILL_SECS: u64 = 7 * 86_400;
 
-/// The most open requests one requester holds; past that, its records are inert.
+/// The most open requests one requester holds in each [`pool`]; past that, its records are inert.
 pub const MAX_OPEN: usize = 16;
+
+/// The pool of open requests [`MAX_OPEN`] counts a request for `want` in: 1 for a want with a
+/// producer ([`Want::producer`]), whose request waits for as long as a person takes to make it, 0
+/// for every other want. Each pool has its own [`MAX_OPEN`], so a requester's waiting tokens
+/// never hold back its other requests. A table reader that does not know a want with a producer
+/// leaves its request inert, so it counts in neither.
+#[must_use]
+pub fn pool(want: &Want) -> usize {
+    usize::from(want.producer().is_some())
+}
 
 /// The longest note a `Retired` record carries (§5).
 pub const MAX_NOTE: usize = 160;
@@ -110,7 +120,9 @@ impl State {
 /// Why a request ended (§6.2; the model's `why`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Reason {
-    /// The want exists on no computer.
+    /// An earlier build's: the want existed on no computer (the paper master, before the vault
+    /// held it). The lab's table keeps such records, so the word still reads; nothing writes it
+    /// now.
     NeverStored,
     /// Each Mac makes its own.
     NeverCopied,
@@ -132,6 +144,17 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Whether a need it retired may be raised again once this Mac's facts change ([`changed`]):
+    /// `not-needed` and `lapsed` always may, `not-authorized` under a newer policy and `not-held`
+    /// once a member offers it; the rest never.
+    #[must_use]
+    pub const fn may_change(self) -> bool {
+        matches!(
+            self,
+            Self::NotNeeded | Self::Lapsed | Self::NotAuthorized | Self::NotHeld
+        )
+    }
+
     /// Every reason.
     pub const ALL: [Self; 9] = [
         Self::NeverStored,
@@ -273,7 +296,23 @@ pub struct Need {
     pub exposed: Vec<String>,
 }
 
+/// A withdrawal by hand's evidence, before the Mac it was withdrawn on ([`Act::Withdraw`]).
+const WITHDRAWN_BY_HAND: &str = "withdrawn by hand on ";
+
 impl Need {
+    /// Whether a person withdrew it by hand (`aterm secrets need retire`, [`retire`]): retired
+    /// `not-needed` on their word, not on a check. [`raise`] asks again as for any `not-needed`;
+    /// [`ask_for_tokens`], which asks on each read of the harness's offers, leaves it standing,
+    /// and the ledger prunes it after every other ended row.
+    #[must_use]
+    pub fn withdrawn_by_hand(&self) -> bool {
+        self.state == State::Retired
+            && self.retired.as_ref().is_some_and(|retired| {
+                retired.reason == Reason::NotNeeded
+                    && retired.evidence.starts_with(WITHDRAWN_BY_HAND)
+            })
+    }
+
     /// Whether `selector`, a want key or a ledger id in hex, names it (`need retire`).
     #[must_use]
     pub fn named(&self, selector: &str) -> bool {
@@ -347,6 +386,14 @@ impl Policy {
 pub struct Facts {
     /// The applied vault version, or `None` when this Mac reads no signed vault.
     pub sight: Option<Sight>,
+    /// The entries, of those the sight names, of the wants with a producer ([`Want::producer`])
+    /// this reading judged ([`judged_for`]: the ledger's open ones, and one being raised) whose
+    /// value this Mac uses now: each Claude Code token whose standing is verified and in use here
+    /// ([`crate::claude_token::Standing::verified_in_use`], which a refusal here ends). A token
+    /// whose name alone the sight shows (unreadable here, ended, mismatched, refused here, or
+    /// unverified, whose serving on its minting Mac is the harness's verdict there) is not one; a
+    /// reading that judged no such want ([`facts`]) holds none.
+    pub in_use: BTreeSet<String>,
     /// Commons for this Mac.
     pub commons: Commons,
     /// The policy in force.
@@ -398,12 +445,16 @@ impl Facts {
         }
     }
 
+    /// Whether the vault gives this Mac `want`: its entry is in the sight, and, for a want with
+    /// a producer, its value is in use here ([`Self::in_use`]), not its name alone.
     fn holds(&self, want: &Want) -> bool {
         let Some(sight) = &self.sight else {
             return false;
         };
-        want.entry()
-            .is_some_and(|entry| sight.held.contains(&entry))
+        want.entry().is_some_and(|entry| {
+            sight.held.contains(&entry)
+                && (want.producer().is_none() || self.in_use.contains(&entry))
+        })
     }
 
     fn writer(&self) -> bool {
@@ -444,7 +495,7 @@ fn entry_words(want: &Want) -> String {
 /// The waiter of a need still in the ledger.
 fn local_wait(want: &Want, facts: &Facts) -> Wait {
     match want.class() {
-        Class::Nowhere | Class::PerMac => Wait::Requester,
+        Class::PerMac => Wait::Requester,
         Class::AdminAct => Wait::Founding,
         Class::Copyable | Class::VaultOnly if facts.writer() => Wait::Requester,
         Class::Copyable | Class::VaultOnly => Wait::Founding,
@@ -489,23 +540,19 @@ fn local_line(want: &Want, facts: &Facts, refused: Option<&RefusalClaim>) -> Str
             )
         ),
         Class::VaultOnly | Class::AdminAct => founding,
-        Class::Nowhere | Class::PerMac => String::new(),
+        Class::PerMac => String::new(),
     }
 }
 
 /// Whether the reason a need ended has changed, so it may be raised again (§6.2): never time,
 /// except a lapse.
 fn changed(retirement: &Retirement, facts: &Facts) -> bool {
-    match retirement.reason {
-        Reason::NotNeeded | Reason::Lapsed => true,
-        Reason::NotAuthorized => retirement.generation != Some(facts.policy.generation),
-        Reason::NotHeld => facts.offered,
-        Reason::NeverStored
-        | Reason::NeverCopied
-        | Reason::Declined
-        | Reason::RequesterGone
-        | Reason::Superseded => false,
-    }
+    retirement.reason.may_change()
+        && match retirement.reason {
+            Reason::NotAuthorized => retirement.generation != Some(facts.policy.generation),
+            Reason::NotHeld => facts.offered,
+            _ => true,
+        }
 }
 
 /// `text` as a `Retired` record's field holds it (§5): at most `cap` characters, each control
@@ -549,14 +596,6 @@ fn retire_with(need: &Need, retirement: Retirement, line: String, now: u64) -> N
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "DbCredentialRequest",
-        action = "RaiseNowhere",
-        project = "aterm_secrets::need::tests::request_transition"
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "DbCredentialRequest",
         action = "RaisePerMachine",
         project = "aterm_secrets::need::tests::request_transition"
     )
@@ -566,6 +605,14 @@ fn retire_with(need: &Need, retirement: Retirement, line: String, now: u64) -> N
     aterm_spec_anchor::refines(
         machine = "DbCredentialRequest",
         action = "RaiseVaultOnly",
+        project = "aterm_secrets::need::tests::request_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbCredentialRequest",
+        action = "RaiseProducer",
         project = "aterm_secrets::need::tests::request_transition"
     )
 )]
@@ -729,7 +776,7 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
                     let host = facts.sight.as_ref().map(|sight| sight.host.as_str());
                     (
                         format!(
-                            "withdrawn by hand on {}",
+                            "{WITHDRAWN_BY_HAND}{}",
                             host.unwrap_or("the requesting Mac")
                         ),
                         note_of(note),
@@ -808,16 +855,33 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
                 && need.purpose.asks_the_lab()
                 && facts.writer()
                 && facts.policy.allows(&need.want);
-            guard.then(|| Need {
-                state: State::Open,
-                wait: Wait::Holders,
-                posted: true,
-                line: format!(
-                    "posted to the lab: waits on the Macs allowed to give {} to sweep for it, and on the vault admin's aterm to copy it from the vault",
-                    need.want.title()
-                ),
-                updated: now,
-                ..need.clone()
+            // A want with a producer has no holder to offer it and no copy to take: what moves
+            // it is this Mac's own reading of the vault's log ([`settle`]), so it waits on the
+            // requester, and its line names the producer.
+            guard.then(|| match need.want.producer() {
+                None => Need {
+                    state: State::Open,
+                    wait: Wait::Holders,
+                    posted: true,
+                    line: format!(
+                        "posted to the lab: waits on the Macs allowed to give {} to sweep for it, and on the vault admin's aterm to copy it from the vault",
+                        need.want.title()
+                    ),
+                    updated: now,
+                    ..need.clone()
+                },
+                Some(producer) => Need {
+                    state: State::Open,
+                    wait: Wait::Requester,
+                    posted: true,
+                    line: format!(
+                        "posted to the lab: {} has one producer, {producer}, run on a Mac signed in to that account; this Mac ends the request once the vault's log gives it {} and the token is in use here",
+                        need.want.title(),
+                        entry_words(&need.want)
+                    ),
+                    updated: now,
+                    ..need.clone()
+                },
             })
         }
         Act::Refresh => (need.state == State::Local && posted_class).then(|| {
@@ -945,7 +1009,12 @@ pub fn decided(need: &Need, facts: &Facts, decision: &Decision) -> Option<Need> 
 /// the table, or one this observation leaves as it is.
 #[must_use]
 pub fn silent(need: &Need, facts: &Facts) -> Option<Need> {
-    if !need.posted || !matches!(need.state, State::Open | State::Offered) {
+    // A want with a producer waits on no custodian: a value in use here, arriving in the
+    // vault's log, ends it ([`settle`]).
+    if !need.posted
+        || !matches!(need.state, State::Open | State::Offered)
+        || need.want.producer().is_some()
+    {
         return None;
     }
     if let Some(sight) = facts.sight.as_ref()
@@ -1005,7 +1074,10 @@ fn fill_id(id: &mut [u8; 16]) {
 /// Every automatic move `need` takes under `facts`, in the order the design fixes: the catalog
 /// first, then the policy before anything reads whether the vault holds it, then, for a need no
 /// consumer checks for itself, the delivery fulfils it, then the waiter named again. The admin act ends when the control entry
-/// applies; `entry:<name>` is answered from this Mac's own envelope.
+/// applies; `entry:<name>` is answered from this Mac's own envelope; a want with a producer
+/// ([`Want::producer`]) is answered whatever its purpose, since no consumer in this build checks
+/// one for itself, once the vault's log gives this Mac a value in use here ([`arrival`]): a token
+/// whose name alone it shows answers nothing.
 #[must_use]
 pub fn settle(need: &Need, facts: &Facts) -> Need {
     if need.state.ended() {
@@ -1038,7 +1110,13 @@ pub fn settle(need: &Need, facts: &Facts) -> Need {
     if let Want::Entry(name) = &need.want {
         return answer_entry(need, name, facts);
     }
+    if need.want == Want::FleetCode {
+        return fleet_code(need, facts);
+    }
     if let Some(next) = act(need, facts, &Act::Unauthorized) {
+        return next;
+    }
+    if let Some(next) = arrival(need, facts) {
         return next;
     }
     if !need.purpose.checks_itself()
@@ -1057,6 +1135,38 @@ pub fn settle(need: &Need, facts: &Facts) -> Need {
     act(need, facts, &Act::Refresh).unwrap_or_else(|| need.clone())
 }
 
+/// The arrival of a want with a producer (the model's `Arrived`): once the vault's log gives this
+/// Mac its value in use here ([`Facts::in_use`]), `need` ends as the model's `Unneeded` does, said
+/// as an arrival resting on the vault seq this Mac reads it at. No Mac copied it: this Mac reads
+/// it in place in the vault's log. `None` for any other want, or one not in use here.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbCredentialRequest",
+        action = "Arrived",
+        project = "aterm_secrets::need::tests::request_transition"
+    )
+)]
+fn arrival(need: &Need, facts: &Facts) -> Option<Need> {
+    if need.want.producer().is_none() || !facts.holds(&need.want) {
+        return None;
+    }
+    let next = act(need, facts, &Act::Unneeded)?;
+    let seq = facts.sight.as_ref().map_or(0, |sight| sight.seq);
+    Some(Need {
+        retired: next.retired.map(|retired| Retirement {
+            evidence: format!("vault seq {seq}"),
+            ..retired
+        }),
+        line: format!(
+            "arrived: the vault's log gives this Mac {} at seq {seq}, in use here; it is read there in place and never copied or written to a file",
+            entry_words(&need.want)
+        ),
+        seq: Some(seq),
+        ..next
+    })
+}
+
 /// A stolen Mac's rotation stays on this Mac until a new value is published in each section it
 /// read the entry in ([`rotated`]) or it is withdrawn by hand: no Mac's copy answers it, and the
 /// vault holding the entry proves nothing.
@@ -1072,6 +1182,45 @@ fn rotation_wait(need: &Need) -> Need {
             "filed for rotation: a stolen Mac could read {}{sections}; an aterm secrets set of it there on this Mac closes this",
             entry_words(&need.want)
         ),
+        ..need.clone()
+    }
+}
+
+/// `fleet-code` is the ALab vault's `[everyone]` control entry, which no holder contributes: it is
+/// fulfilled once this Mac's envelope holds it, and until then waits on this Mac joining the ALab
+/// vault (default setup does that) or, in it, on an admin's `aterm fleet publish`.
+fn fleet_code(need: &Need, facts: &Facts) -> Need {
+    let (state, wait, line) = match &facts.sight {
+        Some(sight) if facts.holds(&need.want) => (
+            State::Fulfilled,
+            Wait::Nobody,
+            format!(
+                "fulfilled: the vault gives this Mac the default fleet's code at seq {}",
+                sight.seq
+            ),
+        ),
+        Some(sight) if sight.alab => (
+            State::Local,
+            Wait::Custodian,
+            "waits on an ALab vault admin's `aterm fleet publish`, or this Mac's admission to \
+             the vault"
+                .to_owned(),
+        ),
+        _ => (
+            State::Local,
+            Wait::Requester,
+            "waits on this Mac joining the ALab vault, which alone carries the default fleet"
+                .to_owned(),
+        ),
+    };
+    if need.state == state && need.wait == wait && need.line == line {
+        return need.clone();
+    }
+    Need {
+        state,
+        wait,
+        line,
+        updated: facts.now,
         ..need.clone()
     }
 }
@@ -1135,6 +1284,7 @@ pub fn status_line(needs: &[Need]) -> Option<String> {
 }
 
 /// What this Mac observes now: its applied vault version's entry names, Commons, and the policy.
+/// It judges no want with a producer ([`judged_for`] does).
 ///
 /// # Errors
 /// This Mac's vault state cannot be read.
@@ -1182,11 +1332,47 @@ pub(crate) fn facts_with_commons(
     };
     Ok(Facts {
         sight,
+        in_use: BTreeSet::new(),
         commons,
         policy,
         offered: false,
         now,
     })
+}
+
+/// `facts` with [`Facts::in_use`] judged for `wants`: each Claude Code token one of them names
+/// whose entry the sight names has its standing read here, by the typed token reading, which
+/// returns no value, and counts where it is verified and in use at `facts.now`. Only those tokens are read, so
+/// a ledger that asks for none pays nothing. A reading that finds this Mac's state busy, or fails,
+/// gives none: a need of one waits, which is never a false answer, and the next reading tries
+/// again.
+pub(crate) fn judged_for<'a>(
+    paths: &crate::client::Paths,
+    mut facts: Facts,
+    wants: impl IntoIterator<Item = &'a Want>,
+) -> Facts {
+    let Some(sight) = facts.sight.as_ref() else {
+        return facts;
+    };
+    let keys: BTreeSet<&crate::claude_token::Key> = wants
+        .into_iter()
+        .filter_map(|want| match want {
+            Want::ClaudeToken(key) if sight.held.contains(&key.entry()) => Some(key),
+            _ => None,
+        })
+        .collect();
+    let in_use: BTreeSet<String> = keys
+        .into_iter()
+        .filter(|key| {
+            matches!(
+                crate::claude_token::standing(paths, key),
+                Ok(crate::claude_token::Lookup::Found(standing)) if standing.verified_in_use(facts.now)
+            )
+        })
+        .map(crate::claude_token::Key::entry)
+        .collect();
+    facts.in_use = in_use;
+    facts
 }
 
 /// The policy for a Mac whose configured vault is `configured` (`Some(true)` for the ALab
@@ -1249,7 +1435,7 @@ fn alab_for_tests(paths: &crate::client::Paths) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbCredentialRequest",
         action = "Arrive",
-        reason = "A member holding a copy is that member's disk: aterm_db::credentials::pass_at's sweep stats the hold probe's one path (Want::hold_path) and writes the Offer, which this ledger takes in through need::decided."
+        reason = "A member holding a copy is that member's store: aterm_db::credentials::pass_at's sweep asks it for the hold probe's one entry (Want::hold_entry) and writes the Offer, which this ledger takes in through need::decided."
     )
 )]
 #[cfg_attr(
@@ -1428,8 +1614,59 @@ fn alab_for_tests(paths: &crate::client::Paths) -> bool {
         reason = "A Buggy negative control of the model, dead at the committed config; the real code has no such step."
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbCredentialRequest",
+        action = "BuggyCopyProducer",
+        reason = "A Buggy negative control of the model, dead at the committed config; the real code has no such step."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbCredentialRequest",
+        action = "BuggyFlushProducerToHolders",
+        reason = "A Buggy negative control of the model, dead at the committed config; the real code has no such step."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbCredentialRequest",
+        action = "InUse",
+        reason = "A want with a producer's value coming into use on the requester is a person running aterm harness accounts token on a Mac signed in to the account and the vault's log carrying it here, verified (claude_token::Standing::verified_in_use); need::judged_for reads it into Facts::in_use, as the need-of-a-token log-lab test exercises."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "DbCredentialRequest",
+        action = "OutOfUse",
+        reason = "A want with a producer's value leaving use on the requester is Claude Code refusing it on this Mac (claude_token::note_refused, which Standing::state reads as State::Rejected) or its end passing (State::Ended); Standing::verified_in_use is false for both until a newer token replaces it, so need::judged_for puts nothing in Facts::in_use, as the need-of-a-token log-lab test exercises with m40's refusal."
+    )
+)]
 #[doc(hidden)]
 pub fn credential_request_environment() {}
+
+/// File `want` for `purpose` ([`raise`]) and say so: the one line a step that lacks a usable
+/// value reports, naming the want, `why` this Mac holds none and the request (or why none was
+/// filed). It names no value.
+#[must_use]
+pub fn blocked(paths: &crate::client::Paths, want: Want, purpose: Purpose, why: &str) -> String {
+    let key = want.key();
+    match raise(paths, want, purpose) {
+        Ok(need) => format!(
+            "this Mac holds no usable {key} ({why}); `aterm secrets need {key}` asked the lab's \
+             Macs (request {})",
+            aterm_codec::hex::encode_lower(&need.id)
+        ),
+        Err(error) => format!(
+            "this Mac holds no usable {key} ({why}); `aterm secrets need {key}` was not filed: \
+             {error}"
+        ),
+    }
+}
 
 #[cfg(test)]
 mod tests;

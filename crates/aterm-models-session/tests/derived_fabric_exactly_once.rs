@@ -171,3 +171,37 @@ fn fabric_exactly_once_walks_the_round_a_bridge_makes() {
         "a record a cut gave up is on stable media: no move takes it: {kept:?}"
     );
 }
+
+/// ATERM-KI-1114-479's round (the sim's keyed world, cuts and losses both on, seed 479): a move
+/// took the record at the offset, the GUI was told the new log, the offset was reused, and a
+/// second move kept every record before the bridge handed the reused offset's record over, with
+/// no tell between. The log the GUI was told still holds that record there, so the delivery is
+/// its one row; a relaunch's tell after a move that kept leaves `dd` as it is, so the redelivery
+/// is not a second. Under a `Deliver` that needed a tell for a second occupant, this walk stops
+/// at its `Deliver`.
+#[test]
+fn fabric_exactly_once_delivers_a_reused_offset_a_move_kept_before_its_tell() {
+    let m = fabric_exactly_once_model();
+    let steps = [
+        "Publish",
+        "MoveTakes",
+        "Tell",
+        "Reuse",
+        "MoveKeeps",
+        "Deliver",
+        "Kill",
+        "Relaunch",
+        "Tell",
+        "Deliver",
+        "Commit",
+    ];
+    let end = walk(&m, &steps);
+    assert_eq!(
+        (end["nr"], end["nr2"], end["c"], end["g"]),
+        (0, 1, 2, 2),
+        "the record the first move took was no row, the one at its offset now one: {end:?}"
+    );
+    for invariant in ["NoDuplicate", "NoSkip"] {
+        assert!(m.check_invariant(invariant, &end), "{invariant}: {end:?}");
+    }
+}

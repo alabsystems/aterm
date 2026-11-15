@@ -990,6 +990,72 @@ fn ten_looks(ok: &mut dyn FnMut() -> bool) -> Result<bool, Stopped> {
     Ok((0..10).any(|_| ok()))
 }
 
+/// THE FENCE OUTLASTS TWO READS OF A RESTING TAB ([`fence_wait`], the wait the rollout leg
+/// hands [`past_the_fence`]), on a scripted clock that only the wait's rests move: a tap that
+/// answers once in 60 s, as it reads a tab silent for ten minutes, its last answer just before
+/// the fence's look, is past the fence at the look 120 s in; one that answers once in 15 s, at
+/// the look 30 s in, inside a minute; one that answers nothing is stuck at the look 150 s in.
+/// Counts are the looks the wait made. NEGATIVE CONTROL: with [`FENCE_WAIT`] one minute, the
+/// tab read once in 60 s is stuck.
+#[test]
+fn the_fence_outlasts_two_reads_of_a_resting_tab() {
+    use std::cell::Cell;
+    // What the fence found of a tap that answers one ask each `every` (none where `None`),
+    // the first of them one `every` after the fence's first look, and the looks the wait made.
+    let fenced = |every: Option<Duration>| {
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let looks = Cell::new(0u32);
+        let look = || {
+            let asks = every.map_or(0, |every| elapsed.get().as_millis() / every.as_millis());
+            tap_said(&format!("OK rollout=bound rollout_asks={}", 40 + asks))
+        };
+        let found = past_the_fence(
+            look,
+            || (),
+            |ok| {
+                fence_wait(
+                    &mut || {
+                        looks.set(looks.get() + 1);
+                        ok()
+                    },
+                    || start + elapsed.get(),
+                    |step| {
+                        elapsed.set(elapsed.get() + step);
+                        Ok(())
+                    },
+                )
+            },
+        )
+        .expect("not stopped");
+        let asks = match found {
+            Fenced::Past { from, to, got: () } => Some(to.asks - from.asks),
+            Fenced::Stuck { from, to } => {
+                assert!(to.asks - from.asks < FENCE_ASKS, "stuck short of the fence");
+                None
+            }
+            Fenced::NoTap => panic!("the script names a tap"),
+        };
+        (asks, elapsed.get(), looks.get())
+    };
+    let s = Duration::from_secs;
+    assert_eq!(
+        fenced(Some(s(60))),
+        (Some(2), s(120), 481),
+        "a tab silent for ten minutes: two reads a minute apart"
+    );
+    assert_eq!(
+        fenced(Some(s(15))),
+        (Some(2), s(30), 121),
+        "a tab that wrote in the last ten minutes: inside a minute"
+    );
+    assert_eq!(
+        fenced(None),
+        (None, FENCE_WAIT, 601),
+        "a tap that answers nothing: the hang detector"
+    );
+}
+
 #[test]
 fn the_rollout_leg_reads_past_the_taps_fence() {
     let verdict = |measured: bool, script: &Script| match past_the_fence(

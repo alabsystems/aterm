@@ -130,7 +130,7 @@ fn fail() -> Error {
 /// generation, so it must not read as [`fail`]'s finding that the generation changed: on a
 /// loaded Mac a slow, unheld check is out of time, and the next check may pass.
 fn out_of_time() -> Error {
-    Error::new("Commons writer generation check ran out of time before it finished")
+    Error::out_of_time("Commons writer generation check ran out of time before it finished")
 }
 
 /// Every deadline gate of a generation check: refuse with [`out_of_time`] once `deadline` has

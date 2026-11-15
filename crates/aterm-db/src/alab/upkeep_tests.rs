@@ -122,21 +122,16 @@ fn the_owners_pass_publishes_a_queued_write_and_then_materializes_it() {
     let hang = || Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     assert!(!super::files_pass(paths, &config, true, hang()));
     let machines = File::at(&crate::file::root(paths), &crate::file::MACHINES.file());
-    let draft = crate::file::write::draft_set(
+    let draft = crate::file::seam::draft_set(
         paths,
         crate::file::MACHINES.name,
         "m7",
         "note",
         Some("said at the desk"),
     )
-    .unwrap()
     .unwrap();
     let intent = machines
-        .write(
-            &aterm_file::OwnerAct::verb("person", None).unwrap(),
-            draft,
-            1,
-        )
+        .write(&crate::file::seam::owner(), draft, 1)
         .unwrap();
     let records = || {
         crate::att::Handle::at(paths.clone(), &crate::att::REGISTRY)

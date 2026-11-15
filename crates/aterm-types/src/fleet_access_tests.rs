@@ -45,6 +45,7 @@ fn each_kind_needs_its_level() {
         (K::Turn, A::ReadWrite),
         (K::Key, A::ReadWrite),
         (K::Send, A::ReadWrite),
+        (K::Configure, A::ReadWrite),
         (K::Hold, A::ReadWrite),
         (K::Close, A::ReadWrite),
         (K::Claim, A::ReadWrite),

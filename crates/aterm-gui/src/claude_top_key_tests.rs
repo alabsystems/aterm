@@ -447,7 +447,7 @@ fn held(app: &mut App, session: u64) -> Hosted {
 
 #[test]
 fn the_ghost_shows_with_the_harness_off_and_writes_only_its_cells() {
-    use aterm_agent::supervise::Autopilot;
+    use alab_policy::config::Autopilot;
     {
         let (mut app, wid, session, _reader) = idle();
         let _host = held(&mut app, session);

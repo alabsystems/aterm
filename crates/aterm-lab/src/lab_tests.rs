@@ -311,12 +311,11 @@ fn a_line_typed_in_a_tab_shell_reaches_the_stub_with_the_labs_key() {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let build = bin.join("client");
-    std::fs::write(
+    aterm_tempfile::stand_in(
         &build,
         "#!/bin/sh\nprintf 'key=%s url=%s google=%s args=%s\\n' \"$GEMINI_API_KEY\" \"$GOOGLE_GEMINI_BASE_URL\" \"${GOOGLE_API_KEY-unset}\" \"$*\"\n",
     )
     .unwrap();
-    std::fs::set_permissions(&build, fs::Permissions::from_mode(0o755)).unwrap();
     let w = dir.join("scratch");
     put_tab_shell(&w, "4242");
     let written = std::fs::read_to_string(w.join("home/.zshrc")).unwrap();
@@ -325,15 +324,17 @@ fn a_line_typed_in_a_tab_shell_reaches_the_stub_with_the_labs_key() {
     let typed = |profile: &str| {
         let rc = dir.join("zshrc");
         std::fs::write(&rc, profile).unwrap();
-        let out = aterm_uds::spawnfd::command("/bin/zsh")
+        let mut command = aterm_uds::spawnfd::command("/bin/zsh");
+        command
             .args(["-f", "-c", "source \"$1\"; client --resume abc"])
             .arg("zsh")
             .arg(&rc)
             .env_clear()
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("GOOGLE_API_KEY", "an-owner-key")
-            .output()
-            .unwrap();
+            .env("GOOGLE_API_KEY", "an-owner-key");
+        let out = aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+            .expect("the tab-shell fixture answers");
+        assert!(out.status.success(), "{out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
     assert_eq!(

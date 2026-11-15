@@ -25,7 +25,7 @@ const PID: i32 = 4251;
 /// The process's birth, and its registry row's `startedAt`.
 const START: u64 = 1_790_607_848;
 /// The tab its environment names.
-const TAB: &str = "s-1a";
+const TAB: &str = "t000000001a";
 /// The clock every read is judged at.
 const NOW: i64 = 1_792_050_000;
 /// The week's reset.

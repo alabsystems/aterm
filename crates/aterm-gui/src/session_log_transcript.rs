@@ -20,13 +20,17 @@ use crate::session_timeline::SessionTimeline;
 /// The most transcript events one timeline hold applies: a catch-up read of a long resumed conversation never makes the footer thread a long holder of the lock the composer and the sweep take.
 pub(crate) const CHUNK: usize = 32;
 
-/// What arming the tap takes from the log: the floor (wall ms: the latest of the join's floor, the adoption for a carried run, and the run's open in this log, so the tap's fold takes a row as live exactly when the tracker admits it) and the watermark the run's join holds.
+/// What arming the tap takes from the log: the floor (wall ms: the later of the join's floor and the run's open in this log, so the tap's fold takes a row as history exactly when the tracker does), the adoption for a carried run (below it a row of the run's own is lost, as the tracker counts it), and the watermark the run's join holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TapArm {
     /// The exact run this arm belongs to, including its log epoch.
     pub(crate) run: TapRun,
-    /// Rows older than this are another process's (wall ms).
+    /// Rows older than this are another process's or another run's (wall ms).
     pub(crate) floor_ms: u64,
+    /// The adoption (wall ms; 0: the run was not carried): a row past the watermark dated at or
+    /// past the floor and below it was written after the predecessor's last read, and the join
+    /// never places it, so it is lost ([`aterm_slog::TxView::adopted_ms`]).
+    pub(crate) adopted_ms: u64,
     /// Rows at or below it were applied.
     pub(crate) given: Option<StepMark>,
 }
@@ -163,11 +167,20 @@ impl SessionLog {
     /// reads takes its turns from its claims again (`aterm_slog::TurnTracker::tx_stopped`), as
     /// where no rollout ever bound, until the tap's next fact says it reads again.
     fn rollout_unread(&mut self) {
-        if let Some(a) = self
-            .agent
-            .as_mut()
-            .filter(|a| reads(a.who, Source::Rollout))
-        {
+        self.reader_stopped(Source::Rollout);
+    }
+
+    /// THE CLAUDE TRANSCRIPT READS NOTHING NOW (the footer resolver stopped the session's reads,
+    /// `crate::claude_footer::stop_session`): the run it reads says its reader stopped, as a
+    /// rollout's does ([`Self::rollout_unread`]), until the next transcript fact says it reads
+    /// again.
+    pub(crate) fn transcript_stopped(&mut self) {
+        self.reader_stopped(Source::Transcript);
+    }
+
+    /// `source`'s reader of the run in front stopped (`aterm_slog::TurnTracker::tx_stopped`).
+    fn reader_stopped(&mut self, source: Source) {
+        if let Some(a) = self.agent.as_mut().filter(|a| reads(a.who, source)) {
             a.tracker.tx_stopped();
         }
     }
@@ -228,14 +241,14 @@ const fn tx_state(s: StepState) -> TxState {
 }
 
 /// The log's wall kind for the reader's.
-fn slog_wall(k: aterm_phase::WallKind) -> Option<WallKind> {
+fn slog_wall(k: alab_policy::vocab::WallKind) -> Option<WallKind> {
     WallKind::from_name(k.wire())
 }
 
 /// The judge's answer for the screen's wall of the log's `kind`: the reader's
 /// kind of the same class.
 fn judge_screen(kind: WallKind, end: &End, opened_ms: u64) -> Judge {
-    use aterm_phase::{ApiCause, WallKind as W};
+    use alab_policy::vocab::{ApiCause, WallKind as W};
     let one = |k: W| judge_wall(k, end, opened_ms);
     match kind {
         WallKind::UsageSession => one(W::UsageSession),
@@ -459,6 +472,7 @@ impl SessionLog {
                 pgid: a.pgid,
             },
             floor_ms: view.floor_ms.max(opened),
+            adopted_ms: view.adopted_ms,
             given: view.through.map(|m| StepMark {
                 fp: m.fp,
                 id: m.id,
@@ -473,6 +487,41 @@ impl SessionLog {
             .as_ref()
             .filter(|a| self.log.is_open(a.node) && reads(a.who, source))
             .map(|a| a.tracker.tx_view())
+    }
+
+    /// Whether `who`'s transcript join of the run in front holds every tool step of that run
+    /// whole: its tap reads that run, has bound a file, its reader has not stopped
+    /// ([`aterm_slog::TxView::stopped`]), and the join has lost no row (`dropped=` is 0: the
+    /// fold's lost rows (a row written while a seamless update handed over among them), an
+    /// overflow's, which desyncs the join, a ninth parallel tool call, and
+    /// the row a fold latched `state=off` on, after which it reads none of that file, are all
+    /// counted there). Only then is a count of the log's tool steps the run's count: one read
+    /// while the join binds nothing (no file found yet, a rollout tap that refused) is unread,
+    /// never 0, and one read while the reader stopped or after the join lost a row is unread
+    /// too, never the frozen or short count sent as exact.
+    pub(crate) fn transcript_whole(&self, who: aterm_phase::Program) -> bool {
+        reader_of(who)
+            .and_then(|source| self.transcript_view(source))
+            .is_some_and(|view| view.through.is_some() && !view.stopped && view.dropped == 0)
+    }
+
+    /// THE TOOL STEPS OF THE AGENT RUN IN FRONT, every class: its run node's own count (the log
+    /// adds each step to every open ancestor's roll, and a seamless update carries it), where
+    /// `who`'s join holds that run's steps whole ([`Self::transcript_whole`]); `None` otherwise,
+    /// and where no agent run is open. The run's count, never the session's: each run has its
+    /// own join, so a whole join of this run says nothing of an earlier run's lost rows, and a
+    /// session total would carry that run's short count as exact.
+    pub(crate) fn run_tools(&self, who: aterm_phase::Program) -> Option<u32> {
+        if !self.transcript_whole(who) {
+            return None;
+        }
+        let run = self.log.open_entry(self.agent.as_ref()?.node)?;
+        Some(
+            run.roll
+                .tools
+                .iter()
+                .fold(0, |sum: u32, n| sum.saturating_add(*n)),
+        )
     }
 
     fn transcript_ready(&mut self, source: Source) -> Ready {
@@ -589,15 +638,27 @@ impl SessionLog {
                 };
                 self.transcript_event(source, ev, pos, state, now);
             }
+            // The fold latches off on a row it could not read, and reads none of that file's
+            // after it: that row is lost, counted `dropped=` with the `state=off` it says, so the
+            // run's join is short of rows for good even once it binds another file. The tracker
+            // counts it once at its position: a fold re-armed from the join's watermark (a
+            // seamless update, a rollout tap bound again after a stale read) latches on the same
+            // row again, which is no new loss.
             StepEvent::Off { .. } => {
-                self.transcript_event(source, TxEvent::Lost { n: 0 }, pos, TxState::Off, now);
+                self.transcript_event(source, TxEvent::Off, pos, TxState::Off, now);
+            }
+            // A row the fold could not hand on (or the facts of one): a row at its position, so
+            // the tracker counts it once and moves its watermark past it, and a fold re-armed
+            // from that watermark never reads it again.
+            StepEvent::Lost { n } => {
+                self.transcript_event(source, TxEvent::Lost { n }, pos, state, now);
             }
         }
     }
 
-    /// A count of the glue's (`Lost`, `Overflow`, the batch's end) or a
-    /// judge's answer: no row of the file, so dated at `now` at the join's
-    /// own watermark.
+    /// A count of the glue's (`Overflow`, the batch's end) or a judge's
+    /// answer: no row of the file, so dated at `now` at the join's own
+    /// watermark.
     fn transcript_count(&mut self, source: Source, ev: TxEvent<'_>, now: Stamp) {
         let Some(view) = self.transcript_view(source) else {
             return;
@@ -737,10 +798,10 @@ enum Item<'a> {
 }
 
 /// The order a batch applies in: its leading binds and
-/// latch, then its counts — the steps an overflow dropped were the oldest
-/// after the bind (a bind is never dropped), so the join is desynced
-/// before the newest apply, on the file they are of — then its other
-/// steps.
+/// latch, then its overflow's count — the steps an overflow dropped were
+/// the oldest after the bind (a bind is never dropped), so the join is
+/// desynced before the newest apply, on the file they are of — then its
+/// other steps, its lost rows among them at their positions.
 fn ordered(batch: &StepBatch) -> impl Iterator<Item = Item<'_>> {
     let lead = batch
         .steps
@@ -748,14 +809,11 @@ fn ordered(batch: &StepBatch) -> impl Iterator<Item = Item<'_>> {
         .take_while(|s| matches!(s.ev, StepEvent::Bind { .. } | StepEvent::Off { .. }))
         .count();
     let (pinned, rest) = batch.steps.split_at(lead);
-    let counts = [
-        (batch.overflow > 0).then_some(TxEvent::Overflow { n: batch.overflow }),
-        (batch.lost > 0).then_some(TxEvent::Lost { n: batch.lost }),
-    ];
+    let overflow = (batch.overflow > 0).then_some(TxEvent::Overflow { n: batch.overflow });
     pinned
         .iter()
         .map(Item::Step)
-        .chain(counts.into_iter().flatten().map(Item::Count))
+        .chain(overflow.into_iter().map(Item::Count))
         .chain(rest.iter().map(Item::Step))
 }
 

@@ -270,6 +270,50 @@ fn aterm_work_holds_when_aterm_itself_is_the_largest_part() {
     assert_eq!(causes(&under), [CauseId::Unexplained]);
 }
 
+#[test]
+fn work_outside_tabs_must_exceed_each_competing_owners_possible_cpu() {
+    for (tab, app_unknown, others, services, global_unknown) in [
+        (1000, 400, 0, 0, 400),
+        (0, 0, 1000, 0, 700),
+        (0, 0, 0, 1000, 700),
+    ] {
+        let own = 1500;
+        let tabs = if tab == 0 { Vec::new() } else { vec![(1, tab)] };
+        let mut facts = WhyFacts {
+            split: CoalSplit {
+                via: Via::Coalitions,
+                global_mc: own + tab + app_unknown + others + services,
+                aterm_mc: own + tab + app_unknown,
+                own_mc: own,
+                own_floor_mc: own,
+                tabs: tabs.clone(),
+                tab_floors: tabs,
+                unattributed_mc: app_unknown,
+                others_mc: others,
+                services_mc: services,
+                ..CoalSplit::default()
+            },
+            ..WhyFacts::default()
+        };
+        let holds = |facts: &WhyFacts| {
+            detect(facts, &Snapshot::default())
+                .iter()
+                .any(|cause| cause.id == CauseId::AtermWork)
+        };
+        assert!(
+            holds(&facts),
+            "the own floor exceeds every upper bound without global unknown CPU"
+        );
+        facts.split.global_mc += global_unknown;
+        facts.split.unaccounted_mc = global_unknown;
+        assert!(
+            !holds(&facts),
+            "unknown work could make a competing owner larger: {:?}",
+            facts.split
+        );
+    }
+}
+
 /// The busiest coalition outside aterm's, led by the user's app: app-work,
 /// since its lead's birth.
 #[test]
@@ -510,7 +554,12 @@ fn with_the_lane_off_only_the_machines_contexts_hold() {
         let a = account(WhySubject::Cpu, Some(1), &s);
         assert_eq!(
             a.cannot,
-            [("coalitions", "lane_off:coalitions")],
+            [
+                ("coalitions", "lane_off:coalitions"),
+                ("every_process_start", "not_sampled"),
+                ("between_sweep_orphans", "not_sampled"),
+                ("socket_delegation", "unsupported"),
+            ],
             "{lane:?}"
         );
         assert_eq!((a.headline, a.nothing_needed), (None, true));
@@ -551,16 +600,16 @@ fn with_the_lane_off_only_the_machines_contexts_hold() {
         a.cannot,
         [
             ("remedy", "unsupported"),
-            ("coalitions", "lane_off:coalitions")
+            ("coalitions", "lane_off:coalitions"),
+            ("every_process_start", "not_sampled"),
+            ("between_sweep_orphans", "not_sampled"),
+            ("socket_delegation", "unsupported"),
         ]
     );
 }
 
-/// With no split the machine's contexts still hold: Windows reads no
-/// process's owner, so no split is ever made, by coalition or by
-/// subtraction, and no facts are; memory pressure at warn and a light
-/// throttle are the CPU's causes all the same, nothing is known needless,
-/// and the lane is said.
+/// Without machine CPU counters no split is made, but memory pressure and throttling remain
+/// current machine evidence. No absent CPU reading can establish that nothing is needed.
 #[test]
 fn with_no_split_the_machines_contexts_still_hold() {
     let scene = Scene {
@@ -579,7 +628,7 @@ fn with_no_split_the_machines_contexts_still_hold() {
     };
     let mut v = Vitals::new();
     let [_, _, s] = scene.samples().map(|mut sample| {
-        sample.self_uid = None;
+        sample.cores = None;
         v.absorb(&sample)
     });
     assert!(s.why.is_none() && s.split.is_none());
@@ -1042,6 +1091,9 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
     assert_eq!(
         a.cannot,
         [
+            ("every_process_start", "not_sampled"),
+            ("between_sweep_orphans", "not_sampled"),
+            ("socket_delegation", "unsupported"),
             ("index_progress", "unsupported"),
             ("index_folder", "needs_privilege:root")
         ]
@@ -1097,8 +1149,8 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
     let r = you(&claude_reaped_1032(), 1);
     assert_eq!(
         (r.you.role, r.you.figure, r.you.unattributed_mc),
-        (Role::Main, Some(3200), None),
-        "the compilers claude reaped count in its tab"
+        (Role::Unavailable("ambiguous_reap"), Some(200), Some(3000)),
+        "an unseen inherited charge cannot prove actual CPU"
     );
     assert!(!r.cannot.contains(&("finished_tab_work", "not_sampled")));
     let mut build = tab2_build_1048();
@@ -1113,6 +1165,53 @@ fn the_you_role_needs_a_whole_sweep_and_its_bound() {
         (Role::Main, Some(6000), Some(1000))
     );
     assert!(!g.cannot.contains(&("finished_tab_work", "not_sampled")));
+}
+
+#[test]
+fn a_current_stalled_sweep_keeps_its_reason_beside_carried_healthy_cpu_facts() {
+    let scene = spotlight_1032();
+    let mut v = Vitals::new();
+    let [base, sweep, now] = scene.samples();
+    v.absorb(&base);
+    v.absorb(&sweep);
+    let healthy = v.absorb(&now);
+    assert_eq!(
+        account(WhySubject::Cpu, Some(1), &healthy).you.role,
+        Role::Minor
+    );
+
+    let mut stalled = scene.reading(scene.window_ms + scene.sweep_ms, false);
+    stalled.procs = None;
+    stalled.stalled = vec![crate::lanes::LaneStall {
+        lane: crate::lanes::PROCS,
+        call: "proc_pid_rusage",
+        pid: Some(1210),
+        name: Some("claude".into()),
+        since_unix_ms: now.at_unix_ms,
+        for_ms: scene.sweep_ms,
+    }];
+    let current = v.absorb(&stalled);
+    assert_eq!(
+        current.why.as_ref().unwrap().at_ns,
+        healthy.why.as_ref().unwrap().at_ns
+    );
+    assert!(current.at_ns > current.why.as_ref().unwrap().at_ns);
+    assert!(current.aterm.is_none());
+    assert!(
+        !current.procs_truncated,
+        "the sweep stalled rather than reaching its list cap"
+    );
+    let you = account(WhySubject::Cpu, Some(1), &current).you;
+    assert_eq!(
+        (you.role, you.figure, you.share_pm),
+        (Role::Unavailable("stalled"), None, None)
+    );
+
+    let recovered = v.absorb(&scene.reading(2 * scene.window_ms, true));
+    assert_eq!(
+        account(WhySubject::Cpu, Some(1), &recovered).you.role,
+        Role::Minor
+    );
 }
 
 /// A tab the reap credit marked short of its work, over a window with no unattributed work, may
@@ -1276,10 +1375,11 @@ fn the_counters_skew_never_reads_as_finished_work() {
     let (split, a) = read(&stray, |_| {});
     assert_eq!(
         (split.skew_mc, split.unattributed_mc),
-        (0, 1),
+        (0, 0),
         "a member in no live figure"
     );
-    assert_eq!(a.you.role, Role::Unavailable("not_sampled"));
+    assert!(split.ownership_incomplete);
+    assert_ne!(a.you.role, Role::Main);
     let (split, a) = read(&idle_skewed_1510(), |now| {
         for p in now.procs.iter_mut().flatten().filter(|p| p.pid == 1210) {
             p.coalition = None;
@@ -1287,10 +1387,11 @@ fn the_counters_skew_never_reads_as_finished_work() {
     });
     assert_eq!(
         (split.skew_mc, split.unattributed_mc),
-        (0, 1),
+        (0, 0),
         "a member whose coalition went unread"
     );
-    assert_eq!(a.you.role, Role::Unavailable("not_sampled"));
+    assert!(split.ownership_incomplete);
+    assert_ne!(a.you.role, Role::Main);
     let mut root = idle_skewed_1510();
     root.busy_mc += 500;
     root.procs.push(Proc::new(
@@ -1309,12 +1410,12 @@ fn the_counters_skew_never_reads_as_finished_work() {
     let (split, a) = read(&root, |_| {});
     assert_eq!(
         (split.skew_mc, split.unattributed_mc),
-        (0, 501),
-        "a member whose CPU was not read at both ends"
+        (1, 0),
+        "a readable owned process keeps its CPU even under another UID"
     );
     assert_eq!(
-        (a.you.role, a.you.unattributed_mc),
-        (Role::Unavailable("not_sampled"), Some(501))
+        (a.you.role, a.you.figure, a.you.unattributed_mc),
+        (Role::Main, Some(500), None)
     );
     let mut busy = idle_skewed_1510();
     busy.busy_mc += 300;
@@ -1331,14 +1432,13 @@ fn the_counters_skew_never_reads_as_finished_work() {
     });
     assert_eq!(
         (split.skew_mc, split.unattributed_mc, split.tabs.as_slice()),
-        (0, 61, &[(1, 240)][..]),
-        "a member whose user went unread at the window's end: its work to the reading before \
-         counts in its tab (the window's 4 s of 5), its last second does not"
+        (1, 0, &[(1, 300)][..]),
+        "a proved member's readable CPU remains attributed when its UID is unread"
     );
     assert_eq!(
         (a.you.role, a.you.unattributed_mc),
-        (Role::Minor, Some(61)),
-        "with its last second the tab is still minor, so its role is read"
+        (Role::Minor, None),
+        "all independently read CPU is retained"
     );
 
     let (split, a) = read(&exited_skewed_1510(), |_| {});
@@ -1355,8 +1455,8 @@ fn the_counters_skew_never_reads_as_finished_work() {
     );
     assert_eq!(
         (a.you.role, a.you.figure, a.you.unattributed_mc),
-        (Role::Minor, Some(3), Some(1)),
-        "a 1 mc bound leaves the tab minor"
+        (Role::Minor, Some(2), Some(1)),
+        "the independently observed floor and whole-app upper bound both establish a minor role"
     );
     assert!(!a.cannot.contains(&("finished_tab_work", "not_sampled")));
 
@@ -1394,7 +1494,7 @@ fn the_memory_account_reads_the_tabs_footprint() {
     let a = account(WhySubject::Mem, Some(1), &snap(&scene));
     assert_eq!(
         (a.you.role, a.you.figure, a.you.share_pm),
-        (Role::Minor, Some(32 << 20), Some(2))
+        (Role::Minor, Some(32 << 20), None)
     );
     assert_eq!((a.parts, a.headline), (None, None));
     assert_eq!(
@@ -1412,6 +1512,25 @@ fn the_memory_account_reads_the_tabs_footprint() {
                 1210 => *p = p.clone().holding(fp),
                 1187 => *p = p.clone().holding(own),
                 _ => {}
+            }
+        }
+        scene.unanswered = 0;
+        for coalition in &mut scene.coalitions {
+            coalition.started = coalition.exited
+                + scene
+                    .procs
+                    .iter()
+                    .filter(|p| p.coalition == coalition.id)
+                    .count() as u64;
+            if coalition.id == 1342 {
+                coalition.footprint = Some(
+                    scene
+                        .procs
+                        .iter()
+                        .filter(|p| p.coalition == coalition.id)
+                        .map(|p| p.footprint)
+                        .sum(),
+                );
             }
         }
         scene.mem = Some(MemSample {
@@ -1455,6 +1574,25 @@ fn the_memory_account_reads_the_tabs_footprint() {
         let mut scene = spotlight_1032();
         for p in scene.procs.iter_mut().filter(|p| p.pid == 1210) {
             *p = p.clone().holding(tab);
+        }
+        scene.unanswered = 0;
+        for coalition in &mut scene.coalitions {
+            coalition.started = coalition.exited
+                + scene
+                    .procs
+                    .iter()
+                    .filter(|p| p.coalition == coalition.id)
+                    .count() as u64;
+            if coalition.id == 1342 {
+                coalition.footprint = Some(
+                    scene
+                        .procs
+                        .iter()
+                        .filter(|p| p.coalition == coalition.id)
+                        .map(|p| p.footprint)
+                        .sum(),
+                );
+            }
         }
         scene.mem = Some(MemSample {
             total: 128 << 30,
@@ -1510,6 +1648,117 @@ fn the_memory_account_reads_the_tabs_footprint() {
         (Role::Unavailable("warming"), true),
         "before the first window"
     );
+}
+
+#[test]
+fn memory_competition_uses_current_foreign_charge_without_counting_the_tab_twice() {
+    let mut scene = super::fixtures::delegated_1032(500, 100);
+    scene
+        .coalitions
+        .retain(|coalition| matches!(coalition.id, 1342 | 4000));
+    scene
+        .procs
+        .retain(|process| matches!(process.coalition, 1342 | 4000));
+    for process in &mut scene.procs {
+        process.footprint = match process.pid {
+            4010 => 4 << 30,
+            4001 => 1 << 30,
+            1187 => 1 << 20,
+            _ => 0,
+        };
+    }
+    for coalition in &mut scene.coalitions {
+        coalition.footprint = Some(
+            scene
+                .procs
+                .iter()
+                .filter(|process| process.coalition == coalition.id)
+                .map(|process| process.footprint)
+                .sum(),
+        );
+    }
+    scene.unanswered = 0;
+    scene.mem = Some(MemSample {
+        total: 16 << 30,
+        app: 4 << 30,
+        wired: 2 << 30,
+        compressed: Some(0),
+        ..MemSample::default()
+    });
+    for launcher_now_owned in [false, true] {
+        let mut vitals = Vitals::new();
+        vitals.absorb(&scene.reading(0, true));
+        vitals.absorb(&scene.reading(4_000, false));
+        let mut now = scene.reading(5_000, true);
+        if launcher_now_owned {
+            let process = now
+                .procs
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|process| process.pid == 4001)
+                .unwrap();
+            now.shared_roots.push(crate::model::SharedRoot {
+                pid: process.pid,
+                start: process.start,
+                version: process.version,
+            });
+        }
+        let snapshot = vitals.absorb(&now);
+        let foreign = snapshot
+            .why
+            .as_ref()
+            .unwrap()
+            .split
+            .rows
+            .iter()
+            .find(|row| row.id == 4000)
+            .unwrap();
+        assert_eq!(
+            foreign.part,
+            Part::Others,
+            "CPU history remains foreign or mixed"
+        );
+        assert_eq!(foreign.footprint, Some(5 << 30));
+        assert_eq!(
+            foreign.footprint_aterm, launcher_now_owned,
+            "memory follows the current census"
+        );
+        let you = account(WhySubject::Mem, Some(1), &snapshot).you;
+        assert_eq!(
+            (you.role, you.figure, you.share_pm),
+            (Role::Main, Some(4 << 30), None)
+        );
+        if !launcher_now_owned {
+            for (owned_bytes, unread) in [(4 << 30, 1), (6 << 30, 0)] {
+                let mut partial = snapshot.clone();
+                let row = Arc::make_mut(partial.why.as_mut().unwrap())
+                    .split
+                    .rows
+                    .iter_mut()
+                    .find(|row| row.id == 4000)
+                    .unwrap();
+                row.owned_footprint.bytes = owned_bytes;
+                row.owned_footprint.unread = unread;
+                let partial = account(WhySubject::Mem, Some(1), &partial).you;
+                assert_eq!(
+                    partial.role,
+                    Role::Unavailable("not_sampled"),
+                    "unread or inconsistent app subsets cannot prove a foreign remainder"
+                );
+                assert_eq!(partial.figure, Some(4 << 30));
+            }
+        }
+        let stale = vitals.absorb(&scene.reading(6_000, false));
+        assert!(stale.why.as_ref().unwrap().at_ns < stale.at_ns);
+        let stale = account(WhySubject::Mem, Some(1), &stale).you;
+        assert_eq!(
+            stale.role,
+            Role::Unavailable("not_sampled"),
+            "old coalition charges cannot establish the current footprint ranking"
+        );
+        assert_eq!(stale.figure, Some(4 << 30));
+    }
 }
 
 /// The bare `sys why`: memory under pressure or swapping first; then the CPU
@@ -1668,14 +1917,7 @@ fn with_the_lane_off_a_reading_with_no_split_carries_no_facts() {
         ..lane_off_1032()
     })
     .series(2);
-    for p in series[3]
-        .procs
-        .iter_mut()
-        .flatten()
-        .filter(|p| p.pid == 387)
-    {
-        p.uid = None;
-    }
+    series[3].cores = None;
     assert!(last(&series[..3]).why.is_some());
     let s = last(&series[..4]);
     assert!(s.split.is_none() && s.why.is_none());
@@ -1684,7 +1926,10 @@ fn with_the_lane_off_a_reading_with_no_split_carries_no_facts() {
         (a.parts, a.you.role),
         (None, Role::Unavailable("not_sampled"))
     );
-    assert_eq!((bare_subject(&s), a.nothing_needed), (Bare::Calm, true));
+    assert_eq!(
+        (bare_subject(&s), a.nothing_needed),
+        (Bare::Subject(WhySubject::Cpu), false)
+    );
 }
 
 /// A tab the readings never read has no figure yet: on the CPU one opened
@@ -1815,7 +2060,15 @@ fn a_coalitions_lead_is_named_anew_once_its_identity_moves() {
     let mut names = IdMap::default();
     let mut ids = IdMap::default();
     let mut lead = |ids: &IdMap<(u32, i64), LeadIdentity>| {
-        let _ = name(&mut names, &read, &procs, 1, 501, &[], ids);
+        let _ = name(
+            &mut names,
+            &read,
+            &procs,
+            501,
+            &crate::model::attribute(&procs, 1, &[]),
+            &vec![None; procs.len()],
+            ids,
+        );
         assert_eq!(names[&307].part, Part::Services);
         names[&307].lead.clone().expect("a lead")
     };

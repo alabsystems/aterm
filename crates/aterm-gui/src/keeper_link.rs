@@ -1177,11 +1177,10 @@ impl Tag {
     }
 }
 
-/// `s-<hex>`, at most 64 characters.
+/// Whether `s` names a tab: a session ID this Mac's tabs hold ([`aterm_session::is_minted_sid`]),
+/// a legacy tab's included, whose shell holds it in its environment until aterm restores the tab.
 pub(crate) fn valid_sid(s: &str) -> bool {
-    s.len() <= 64
-        && s.strip_prefix("s-")
-            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    aterm_session::is_minted_sid(s)
 }
 
 /// A process's start time in the keeper wire's shape, from the pty crate's

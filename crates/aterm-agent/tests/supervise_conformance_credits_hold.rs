@@ -5,10 +5,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use alab_policy::config::TurnEndTiming;
+use alab_policy::words::RULE_CONTINUE;
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::turn_end::{
-    CREDITS_HOLD_TOLD, CreditsCarry, RULE_CONTINUE, TurnEndAction, TurnEndReading, TurnEndState,
-    TurnEndTiming, decide_turn_end,
+    CREDITS_HOLD_TOLD, CreditsCarry, TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end,
 };
 use aterm_models_harness::supervisor_credits_hold_model;
 use aterm_phase::prompt::fixtures::{CREDITS_IN_USE_2_1_300, screen};

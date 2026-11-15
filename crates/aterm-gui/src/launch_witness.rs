@@ -141,7 +141,7 @@ impl LaunchWitness {
         let Unread { id, word, rows } = unread;
         let read = || {
             let reading = aterm_phase::read(Some(word), &rows, None);
-            reading.phase == aterm_phase::Phase::Prompt || reading.prompt.is_some()
+            reading.phase == alab_policy::vocab::Phase::Prompt || reading.prompt.is_some()
         };
         let Some(boxed) =
             crate::reader_guard::read_or_none("launch", "launch witness", &rows, read)

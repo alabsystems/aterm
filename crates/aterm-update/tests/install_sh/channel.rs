@@ -200,9 +200,16 @@ fn a_ctrl_c_during_a_download_ends_the_run() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
     lib.env("INSTALL_SH", s(&install_sh()));
+    let curl = scratch.stand_in(
+        "download-signal-curl",
+        "#!/bin/sh\n[ \"$SIG\" != QUIT ] || { kill -s \"$SIG\" \"$RUN\"; exit 131; }\nkill -s \"$SIG\" 0\nexec /bin/sleep 30\n",
+    );
+    lib.step(format!(
+        "mkdir -p \"$TMPDIR/bin\" && ln -s {} \"$TMPDIR/bin/curl\"",
+        q(s(&curl))
+    ));
     lib.step(
-        "mkdir -p \"$TMPDIR/bin\" && printf '#!/bin/sh\\n[ \"$SIG\" != QUIT ] || { kill -s \"$SIG\" \"$RUN\"; exit 131; }\\nkill -s \"$SIG\" 0\\nexec /bin/sleep 30\\n' >\"$TMPDIR/bin/curl\" && \
-         chmod +x \"$TMPDIR/bin/curl\" && cat >\"$TMPDIR/download.bash\" <<'EOF'
+        "cat >\"$TMPDIR/download.bash\" <<'EOF'
 ATERM_INSTALL_LIBRARY_ONLY=1
 . \"$INSTALL_SH\"
 PATH=\"$TMPDIR/bin:$PATH\" REPO_SLUG=example/aterm

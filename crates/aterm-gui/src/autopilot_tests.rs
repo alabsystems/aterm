@@ -118,7 +118,10 @@ fn the_view_is_the_master_switch_then_the_word_then_the_default() {
         );
         for default in Autopilot::ALL {
             let cfg = SupervisorConfig {
-                autopilot: default,
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: default,
+                    ..alab_policy::config::PolicyConfig::default()
+                },
                 ..SupervisorConfig::default()
             };
             assert_eq!(

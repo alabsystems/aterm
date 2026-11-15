@@ -54,12 +54,12 @@
 //! - **No secret.** A file has no `Secret` column ([`super::Type::check`]). A cell whose value
 //!   this build's guards refuse (shaped like a credential, naming a secret) shows the grid's
 //!   refusal text and has no typed value, and a sealed value in a column a newer build wrote is
-//!   left out; both are counted in the status. A derived cell is held to the same guards: what
+//!   left out; both are counted in the status. A computed cell is held to the same guards: what
 //!   it takes from another row (a machine's label) is taken in the spelling the grid shows, and
-//!   every derived text is checked once more before it is written.
+//!   every computed text is checked once more before it is written.
 
 use super::{
-    Derived, Type,
+    Computed, Type,
     types::{TABLE, TSV},
 };
 use crate::{
@@ -115,7 +115,7 @@ impl Projecting {
 
 /// The version of the projection rules: a snapshot made under another version is projected
 /// again whatever its frontier.
-pub const PROJECTION: u32 = 2;
+pub const PROJECTION: u32 = 3;
 
 /// How long a pass waits for a vault another program is writing before it records `held`
 /// (`busy`).
@@ -188,13 +188,17 @@ impl Refusal {
         }
     }
 
-    /// `error` under the word of the stage it stopped: a local holder past the wait is `busy`
-    /// and a membership view that lacks the record's grant is `membership`, at any stage.
+    /// `error` under the word of the stage it stopped: a local holder past the wait is `busy`,
+    /// a membership view that lacks the record's grant is `membership`, and a check that ran
+    /// out of time before it learned anything is `custody` (it met no holder and judged no
+    /// stage), at any stage.
     fn of(error: &Error, stage: Why) -> Self {
         let why = if error.is_busy() {
             Why::Busy
         } else if error.is_awaiting_membership() || error.is_enrollment_pending() {
             Why::Membership
+        } else if error.is_out_of_time() {
+            Why::Custody
         } else {
             stage
         };
@@ -268,11 +272,13 @@ fn with_custody<T>(
     if !policy.enabled {
         return Err(Refusal::off("[commons] turns sharing off on this Mac"));
     }
-    // Each step waits only `vault_wait` for a vault or a store another program holds: a pass
+    // Each wait for a vault or a store another program holds lasts only `vault_wait`: a pass
     // that meets one records `held` (`busy`) and leaves, rather than wait out a reader's bound.
+    // The writer-generation walks read files and wait on no holder, so `read_by` alone bounds
+    // them, as it bounds `observe_materializer`'s own reads: a slow walk is not a busy vault.
     let wait = || (Instant::now() + pass.vault_wait).min(pass.read_by);
     let by = Projecting(());
-    let held = generation::materializer_generation_until(home, wait(), &by)
+    let held = generation::materializer_generation_until(home, pass.read_by, &by)
         .map_err(|error| Refusal::of(&error, Why::Succession))?;
     #[cfg(test)]
     super::seam::standing_read();
@@ -321,7 +327,7 @@ fn with_custody<T>(
     // and invalidated, so a fence that fell since the first look is seen only here. A home that
     // is no longer the one this lineage names (its succession completed, or its predecessor's
     // completion was invalidated) is not projected at all.
-    let after = generation::materializer_generation_until(home, wait(), &by)
+    let after = generation::materializer_generation_until(home, pass.read_by, &by)
         .map_err(|error| Refusal::of(&error, Why::Succession))?;
     if after.paths != held.paths {
         return Err(Refusal::held(
@@ -424,7 +430,7 @@ fn typed(ty: &Ty, field: &Field) -> Option<Value> {
         register => register
             .value()
             .filter(|x| !x.is_null() && cell::admissible(ty, x))
-            .map(|x| grid::raw_masked(x, true)),
+            .map(grid::raw_shown),
     }
 }
 
@@ -432,7 +438,7 @@ fn typed(ty: &Ty, field: &Field) -> Option<Value> {
 /// the row is missing, conflicted to nothing, or says something this build refuses to show.
 fn address_of(addresses: &Projection, pk: &str) -> Option<String> {
     let x = addresses.rows.get(pk)?.get("addr")?;
-    let shown = grid::show(&Ty::Email, x, true);
+    let shown = grid::show(&Ty::Email, x);
     keys::address(&shown)
         .ok()
         .filter(|address| *address == shown)
@@ -501,7 +507,7 @@ impl Accounts {
     }
 }
 
-/// Each machine's label, by key, as a derived cell may carry it: the stored label where it is
+/// Each machine's label, by key, as a computed cell may carry it: the stored label where it is
 /// one this build's guards admit, in the spelling the grid shows, and the grid's refusal text
 /// ([`grid::REFUSED`]) in place of any other, which an older or modified build stored unchecked.
 fn machine_labels(compiled: &Compiled, view: &View) -> BTreeMap<String, String> {
@@ -516,7 +522,7 @@ fn machine_labels(compiled: &Compiled, view: &View) -> BTreeMap<String, String> 
         .iter()
         .filter_map(|(pk, row)| {
             let stored = row.get("label").filter(|x| !x.is_null())?;
-            let shown = grid::show(&column.ty, stored, true);
+            let shown = grid::show(&column.ty, stored);
             let label = if stored.as_str() == Some(shown.as_str()) && guarded(&shown) {
                 shown
             } else {
@@ -528,13 +534,13 @@ fn machine_labels(compiled: &Compiled, view: &View) -> BTreeMap<String, String> 
 }
 
 /// Whether `text` is one the guards let a surface show: not shaped like a credential, naming a
-/// secret, holding a phone number or sealed (what [`grid::raw_masked`] replaces).
+/// secret or sealed (what [`grid::raw_shown`] replaces).
 fn guarded(text: &str) -> bool {
-    grid::raw_masked(&Value::from(text), true).as_str() == Some(text)
+    grid::raw_shown(&Value::from(text)).as_str() == Some(text)
 }
 
-/// The derived cells of every row of `file`, by key then column.
-fn derived(
+/// The computed cells of every row of `file`, by key then column.
+fn computed(
     file: &Type,
     compiled: &Compiled,
     view: &View,
@@ -549,9 +555,9 @@ fn derived(
                 .insert(column, value.clone());
         }
     };
-    match file.derived {
-        Derived::None => {}
-        Derived::Accounts => {
+    match file.computed {
+        Computed::None => {}
+        Computed::Accounts => {
             let accounts = Accounts::read(compiled, view);
             let machines = machine_labels(compiled, view);
             // Each account's live links on live machines, smallest rank first, unranked last.
@@ -584,7 +590,7 @@ fn derived(
                 }
             }
         }
-        Derived::Links => {
+        Computed::Links => {
             let accounts = Accounts::read(compiled, view);
             let machines = machine_labels(compiled, view);
             for (pk, row) in &projection.rows {
@@ -598,7 +604,7 @@ fn derived(
                 );
             }
         }
-        Derived::Machines => {
+        Computed::Machines => {
             let empty = OwnedRead::default();
             let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
             let lab = LabView::read_view(
@@ -649,8 +655,7 @@ fn table(
     let projection = view.project(collection);
     // The face is the grid's own export, addresses shown: one layout, one spelling of each
     // value, one refusal text.
-    let export =
-        grid::export(compiled.table, collection, &view.cells, &[], true).map_err(custody)?;
+    let export = grid::export(compiled.table, collection, &view.cells, &[]).map_err(custody)?;
     let layout = grid::layout(collection, &projection);
     let mut columns: Vec<Column> = layout
         .iter()
@@ -673,7 +678,7 @@ fn table(
             },
         })
         .collect();
-    columns.extend(file.derived.columns().iter().map(|name| Column {
+    columns.extend(file.computed.columns().iter().map(|name| Column {
         name: (*name).to_owned(),
         source: Source::Derived,
         read_only: true,
@@ -685,7 +690,7 @@ fn table(
         read_only: true,
         refers: None,
     });
-    let mut derived = derived(file, compiled, view, &projection, me);
+    let mut computed = computed(file, compiled, view, &projection, me);
     let mut withheld = 0_u64;
     let mut rows = Vec::with_capacity(export.base.rows.len());
     for (pk, seen) in &export.base.rows {
@@ -717,12 +722,12 @@ fn table(
             }
             cells.insert(column.name.clone(), seen.shown.clone());
         }
-        // Derived cells come from guarded values (an address and a label in the spelling the
+        // Computed cells come from guarded values (an address and a label in the spelling the
         // grid shows, a uuid) and from a slug `keys::account_slugs` holds to the same guards.
-        // Each is checked again here, so no derived text reaches a file unguarded: one that
+        // Each is checked again here, so no computed text reaches a file unguarded: one that
         // carries a refusal, or that the guards refuse whole, shows the refusal text, has no
         // typed value and is counted.
-        for (column, value) in derived.remove(pk).unwrap_or_default() {
+        for (column, value) in computed.remove(pk).unwrap_or_default() {
             if !guarded(&value) {
                 withheld += 1;
                 cells.insert(column.to_owned(), grid::REFUSED.to_owned());
@@ -758,6 +763,31 @@ fn table(
         // then asks for a refresh rather than guess what its author saw.
         aterm_json::to_vec(&export.base.to_json()).ok(),
     ))
+}
+
+/// How many retained records of `file`'s collection `view` holds inert (§5): automatic records
+/// past their writer's quota ([`crate::typed::owned::Quota::over`]), and, in an owned
+/// collection, each row at a key that does not name its signer's machine or that is no bounded
+/// object with a counter ([`OwnedRead::inert`]). They stay in history with their authors; the
+/// status counts them. A log's inert entries are its own read's, which no view holds: no log
+/// file compiles yet ([`Type::check`]).
+pub(super) fn inert(file: &Type, view: &View) -> u64 {
+    let over = view
+        .ops
+        .iter()
+        .filter(|op| {
+            view.quota.over.contains(&op.id)
+                && op
+                    .changes
+                    .iter()
+                    .any(|change| change.collection == file.collection.name)
+        })
+        .count();
+    let owned = view
+        .owned
+        .get(file.collection.name)
+        .map_or(0, |read| read.inert);
+    u64::try_from(over.saturating_add(owned)).unwrap_or(u64::MAX)
 }
 
 /// The operations that wrote `file`'s collection, oldest claim first (by the time each says it
@@ -843,19 +873,23 @@ fn opened(
     let fingerprint = aterm_codec::hex::encode_lower(&family.frontier.fingerprint());
     // The status describes the snapshot at the revision it records. One at another revision
     // was written by a pass killed before its status: it is projected again, and that pass
-    // records the revision.
-    let same = !pass.again
-        && held.state().is_some_and(|state| {
-            state.rev > 0
+    // records the revision. So is one that does not say its inert count, which an older build
+    // leaves out when it rewrites a status a newer one wrote: the count is unknown, never 0.
+    let kept = held
+        .state()
+        .filter(|state| {
+            !pass.again
+                && state.rev > 0
                 && state.fingerprint == fingerprint
                 && state.projection == PROJECTION
                 && held
                     .published()
                     .snapshot
                     .is_some_and(|snapshot| snapshot.rev == state.rev)
-        });
-    let (projected, withheld) = if same {
-        (None, held.state().map_or(0, |state| state.withheld))
+        })
+        .and_then(|state| state.inert.map(|inert| (state.withheld, inert)));
+    let (projected, withheld, inert) = if let Some((withheld, inert)) = kept {
+        (None, withheld, inert)
     } else {
         let view = family.view(custody.session);
         let (snapshot, withheld, baseline) = table(
@@ -872,6 +906,7 @@ fn opened(
                 baseline,
             }),
             withheld,
+            inert(file, view),
         )
     };
     Ok(Opened {
@@ -880,6 +915,7 @@ fn opened(
         frontier: family.frontier.clone(),
         projection: PROJECTION,
         withheld,
+        inert,
         projected,
     })
 }

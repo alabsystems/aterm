@@ -370,3 +370,285 @@ fn a_live_muse_sessions_goal_is_the_one_in_the_store_beside_the_lock_it_holds() 
         "a session its launch names, found by its folder, holds the store beside its lock there"
     );
 }
+
+/// Claude Code 2.1.323 clearing a goal after a Cloudflare 403 it read as a lost login (m2,
+/// 2026-11-13): the measured rows, their ids, session and paths synthetic.
+const CLEARED_BY_ERROR: &str =
+    include_str!("testdata/goal/claude-2.1.323-transcript-goal-cleared-by-error.jsonl");
+
+/// The same goal dropped by a person's `/goal clear`: the command row and the same clear row, no
+/// notice after it.
+const CLEARED_BY_PERSON: &str =
+    include_str!("testdata/goal/claude-2.1.323-transcript-goal-cleared-by-person.jsonl");
+
+const MEASURED_GOAL: &str = "the account registry and automated account switching just works";
+
+fn folded(lines: &str) -> ClaudeGoal {
+    let mut goal = ClaudeGoal::default();
+    for line in lines.lines() {
+        goal.line(line);
+    }
+    goal
+}
+
+/// T1: THE MEASURED ERROR CLEAR folds to a goal cleared by the error, its condition and cause
+/// kept, served once a real answer came after it (never by the error's own synthetic answer).
+/// Negative control: a person's `/goal clear` folds to a goal cleared by them, which the harness
+/// reads as no goal.
+#[test]
+fn an_error_clear_is_told_from_a_persons_goal_clear() {
+    let goal = folded(CLEARED_BY_ERROR);
+    let ended = goal.ended().expect("an ended goal");
+    assert_eq!(ended.condition, MEASURED_GOAL);
+    assert_eq!(
+        ended.end,
+        GoalEnd::ByError {
+            label: "authentication failed".to_owned()
+        }
+    );
+    assert_eq!(goal.active(), None);
+    let GoalRead::Lost(lost) = goal.read() else {
+        panic!("not lost: {:?}", goal.read());
+    };
+    assert_eq!(
+        (lost.condition.as_str(), lost.clear.as_str(), lost.served),
+        (MEASURED_GOAL, "00000000-0000-4000-8000-000000000005", true)
+    );
+    assert_eq!(
+        lost.line.as_deref(),
+        Ok(MEASURED_GOAL),
+        "typed back as held"
+    );
+    let to_the_error: String = CLEARED_BY_ERROR
+        .lines()
+        .take(7)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(
+        matches!(
+            folded(&to_the_error).read(),
+            GoalRead::Lost(Lost { served: false, .. })
+        ),
+        "the error's own synthetic answer is no served one"
+    );
+
+    let person = folded(CLEARED_BY_PERSON);
+    assert_eq!(person.ended().map(|e| &e.end), Some(&GoalEnd::Cleared));
+    assert_eq!(person.read(), GoalRead::Off);
+}
+
+/// The notice names the error only as the clear row's own child. Negative controls: a notice
+/// under another row, one in a sidechain, and one before any clear leave the clear a person's;
+/// a goal set after the error clear is the goal in force.
+#[test]
+fn only_the_clears_own_notice_makes_it_an_error_clear() {
+    let lines: Vec<&str> = CLEARED_BY_ERROR.lines().collect();
+    let notice = lines[5];
+    let without = |swap: &dyn Fn(&str) -> String| {
+        let mut rows: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+        rows[5] = swap(notice);
+        folded(&rows.join("\n")).read()
+    };
+    let elsewhere = without(&|n| {
+        n.replace(
+            r#""parentUuid":"00000000-0000-4000-8000-000000000005""#,
+            r#""parentUuid":"00000000-0000-4000-8000-000000000004""#,
+        )
+    });
+    assert_eq!(elsewhere, GoalRead::Off, "a notice under another row");
+    let aside = without(&|n| n.replace(r#""isSidechain":false"#, r#""isSidechain":true"#));
+    assert_eq!(aside, GoalRead::Off, "a sidechain's notice");
+    let mut early = folded(notice);
+    for line in &lines[..5] {
+        early.line(line);
+    }
+    assert_eq!(early.read(), GoalRead::Off, "a notice before the clear");
+    let mut again = folded(CLEARED_BY_ERROR);
+    again.line(lines[1]);
+    assert_eq!(again.read(), GoalRead::Active(MEASURED_GOAL.to_owned()));
+}
+
+/// A goal record reads the whole transcript once, then only what was written since: a line still
+/// being written waits for its end, and a shorter file, or another, starts it over. Negative
+/// control: a transcript that cannot be opened reads nothing.
+#[test]
+fn a_goal_record_reads_on_from_where_it_stopped() {
+    use std::io::Write as _;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-goal-record-")
+        .tempdir()
+        .expect("scratch");
+    let path = dir.path().join("t.jsonl");
+    let lines: Vec<&str> = CLEARED_BY_ERROR.lines().collect();
+    let mut record = GoalRecord::default();
+    assert_eq!(record.read(&path), GoalRead::Unread, "no file");
+    let mut f = std::fs::File::create(&path).expect("transcript");
+    for line in &lines[..3] {
+        writeln!(f, "{line}").expect("write");
+    }
+    assert_eq!(
+        record.read(&path),
+        GoalRead::Active(MEASURED_GOAL.to_owned())
+    );
+    for line in &lines[3..7] {
+        writeln!(f, "{line}").expect("write");
+    }
+    let (head, tail) = lines[9].split_at(lines[9].len() / 2);
+    for line in &lines[7..9] {
+        writeln!(f, "{line}").expect("write");
+    }
+    write!(f, "{head}").expect("write");
+    assert!(
+        matches!(
+            record.read(&path),
+            GoalRead::Lost(Lost { served: false, .. })
+        ),
+        "the half-written answer is not folded"
+    );
+    writeln!(f, "{tail}").expect("write");
+    assert!(matches!(
+        record.read(&path),
+        GoalRead::Lost(Lost { served: true, .. })
+    ));
+    drop(f);
+    std::fs::write(&path, format!("{}\n", lines[1])).expect("shorter");
+    assert_eq!(
+        record.read(&path),
+        GoalRead::Active(MEASURED_GOAL.to_owned()),
+        "a shorter file is read over"
+    );
+    let other = dir.path().join("u.jsonl");
+    std::fs::write(&other, CLEARED_BY_PERSON).expect("other");
+    assert_eq!(
+        record.read(&other),
+        GoalRead::Off,
+        "another file is read over"
+    );
+}
+
+/// A person's `/goal clear` typed once Claude Code had cleared the goal after an error: Claude Code
+/// holds no goal then, so it answers `No goal set` and writes no goal row, only the command row
+/// and its output (the rows' form as 2.1.323 writes a `/goal` command; ids synthetic).
+const PERSON_CLEARS_AFTER: &str =
+    include_str!("testdata/goal/claude-2.1.323-goal-clear-with-no-goal-set.jsonl");
+
+/// The command row a `/goal` typed with `args` writes (2.1.323), on the main chain or a sidechain.
+fn goal_command(args: &str, sidechain: bool) -> String {
+    format!(
+        r#"{{"parentUuid":"00000000-0000-4000-8000-000000000009","isSidechain":{sidechain},"type":"user","message":{{"role":"user","content":"<command-name>/goal</command-name>\n            <command-message>goal</command-message>\n            <command-args>{args}</command-args>"}},"uuid":"00000000-0000-4000-8000-000000000012","timestamp":"2026-11-13T12:00:00.000Z","userType":"external","cwd":"/w","sessionId":"s","version":"2.1.323"}}"#
+    )
+}
+
+/// A PERSON'S `/goal` AFTER AN ERROR CLEAR TAKES THE GOAL UP, though it writes no goal row: the
+/// measured error clear and then `/goal clear` answered `No goal set` folds to no goal, so the
+/// harness never sets back a goal the person dropped. So do `/goal off` typed while a turn ran (a
+/// `local_command` system row), a condition Claude Code refused and a bare `/goal`. Negative
+/// controls: the error clear alone stays lost; the harness's own restore line (the very
+/// condition) with no set row after it, a sidechain's `/goal clear` and a `/goal` command whose
+/// output alone names it change nothing.
+#[test]
+fn a_persons_goal_after_an_error_clear_takes_the_goal_up() {
+    let cleared = folded(&format!("{CLEARED_BY_ERROR}{PERSON_CLEARS_AFTER}"));
+    assert_eq!(cleared.read(), GoalRead::Off, "the person's /goal clear");
+    assert!(cleared.ended().is_some_and(|e| e.taken));
+    let after = |line: &str| folded(&format!("{CLEARED_BY_ERROR}{line}\n")).read();
+    let local = r#"{"parentUuid":"00000000-0000-4000-8000-000000000009","isSidechain":false,"type":"system","subtype":"local_command","content":"<command-name>/goal</command-name>\n            <command-message>goal</command-message>\n            <command-args>off</command-args>","uuid":"00000000-0000-4000-8000-000000000013","timestamp":"2026-11-13T12:00:00.000Z","sessionId":"s","version":"2.1.323"}"#;
+    assert_eq!(
+        after(local),
+        GoalRead::Off,
+        "/goal off typed while a turn ran"
+    );
+    let refused = format!("{} more", "x".repeat(CONDITION_UNITS));
+    assert_eq!(
+        after(&goal_command(&refused, false)),
+        GoalRead::Off,
+        "a condition Claude Code refused"
+    );
+    assert_eq!(
+        after(&goal_command("", false)),
+        GoalRead::Off,
+        "a bare /goal"
+    );
+
+    assert!(matches!(folded(CLEARED_BY_ERROR).read(), GoalRead::Lost(_)));
+    assert!(
+        matches!(
+            after(&goal_command(MEASURED_GOAL, false)),
+            GoalRead::Lost(_)
+        ),
+        "the restore's own line"
+    );
+    assert!(
+        matches!(after(&goal_command("clear", true)), GoalRead::Lost(_)),
+        "a sidechain's /goal clear"
+    );
+    let stdout = PERSON_CLEARS_AFTER.lines().nth(1).expect("the output row");
+    assert!(
+        matches!(after(stdout), GoalRead::Lost(_)),
+        "the output row alone names no command"
+    );
+}
+
+/// THE CONDITION IS TYPED BACK AS CLAUDE CODE HELD IT, never cut or re-flowed: a 3000-character
+/// goal and one of 700 CJK characters (2100 bytes, past aterm's shown bound) are kept whole, and a
+/// goal read lost keeps its whole line though its shown form is cut. Negative controls: a goal
+/// with a line break or a tab, one longer than Claude Code's own limit, and an empty one are
+/// untypable, never typed changed.
+#[test]
+fn a_cleared_condition_is_typed_back_whole_or_not_at_all() {
+    let long = "a".repeat(3000);
+    assert_eq!(typable(&long).as_deref(), Ok(long.as_str()));
+    let cjk = "目".repeat(700);
+    assert!(cjk.len() > GOAL_BYTES, "PRECONDITION: past the shown bound");
+    assert_eq!(typable(&format!("  {cjk} ")).as_deref(), Ok(cjk.as_str()));
+    let astral = "😀".repeat(CONDITION_UNITS / 2);
+    assert_eq!(
+        typable(&astral).as_deref(),
+        Ok(astral.as_str()),
+        "4000 units"
+    );
+    assert_eq!(typable(&format!("{astral}a")), Err(Untypable::Long));
+    assert_eq!(
+        typable(&"a".repeat(CONDITION_UNITS + 1)),
+        Err(Untypable::Long)
+    );
+    assert_eq!(typable("land it\nthen push"), Err(Untypable::Breaks));
+    assert_eq!(typable("land\tit"), Err(Untypable::Breaks));
+    assert_eq!(typable("land\u{2028}it"), Err(Untypable::Breaks));
+    assert_eq!(typable(" \n "), Err(Untypable::Empty));
+
+    let at_clear = |condition: &str| {
+        let swap = |l: &str| l.replace(MEASURED_GOAL, condition);
+        let lines: String = CLEARED_BY_ERROR
+            .lines()
+            .map(|l| format!("{}\n", swap(l)))
+            .collect();
+        folded(&lines).read()
+    };
+    let GoalRead::Lost(lost) = at_clear(&cjk) else {
+        panic!("not lost");
+    };
+    assert_eq!(lost.line.as_deref(), Ok(cjk.as_str()), "whole");
+    assert!(lost.condition.len() <= GOAL_BYTES, "shown cut");
+    let GoalRead::Lost(lost) = at_clear("land it\\nthen push") else {
+        panic!("not lost");
+    };
+    assert_eq!(
+        lost.line,
+        Err(Untypable::Breaks),
+        "never re-flowed onto one line"
+    );
+    let mut set = folded(CLEARED_BY_ERROR);
+    set.line(
+        &CLEARED_BY_ERROR
+            .lines()
+            .nth(1)
+            .expect("set")
+            .replace(MEASURED_GOAL, &cjk),
+    );
+    assert_eq!(set.read(), GoalRead::Active(cjk.clone()), "held whole");
+    assert!(
+        set.active().is_some_and(|a| a.len() <= GOAL_BYTES),
+        "shown cut"
+    );
+}

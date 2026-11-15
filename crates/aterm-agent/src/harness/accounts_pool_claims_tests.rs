@@ -15,6 +15,16 @@ impl World {
     /// `cli`'s roster of two with an email on each row, on a Mac whose accounts sheet is
     /// `ai-pool.toml`'s, where claims apply.
     fn claimed_two(&self, cli: Cli) {
+        self.emailed_two(cli);
+        crate::vault_entry::put(
+            &self.home,
+            crate::harness::ai_pool::AI_POOL_FILE,
+            "version = 1\n",
+        );
+    }
+
+    /// `cli`'s roster of two with an email on each row (`main` and `work`), and no pool entry.
+    fn emailed_two(&self, cli: Cli) {
         let work = self.work_dir(cli);
         let text = format!(
             "[[account]]\nlabel = \"main\"\nclass = \"shared\"\nemail = \"main@example.test\"\n\n\
@@ -23,13 +33,6 @@ impl World {
             toml(&work)
         );
         std::fs::write(self.cfg.join(cli.accounts().roster_file), text).expect("roster");
-        let secrets = self.home.join(".secrets");
-        std::fs::create_dir_all(&secrets).expect("secrets dir");
-        std::fs::write(
-            secrets.join(crate::harness::ai_pool::AI_POOL_FILE),
-            "version = 1\n",
-        )
-        .expect("pool");
     }
 }
 
@@ -170,6 +173,7 @@ fn native_quota_commit_claims_the_destination_and_refuses_a_senior_peer() {
                         kind: claims::Kind::Lease,
                         since: NOW - 1,
                     }],
+                    ranks_homes: false,
                 },
             )
             .unwrap();
@@ -541,4 +545,203 @@ fn an_asked_row_whose_admission_fails_is_left_unclaimed() {
         .map(|row| row.claims.iter().any(|claim| claim.key == work_key))
         .unwrap_or(false);
     assert!(!claimed, "no claim on the row nothing started on");
+}
+
+/// A lab naming `me` (Commons `aa01` binds `mc-m1`, `bb02` binds `mc-m13`), where `main` is
+/// preferred by `main_on` and `work` by `mc-m13`.
+fn lab(me: &str, main_on: &str) -> crate::harness::alab_roster::Lab {
+    use crate::harness::alab_roster::{Lab, LabAccount, MachineKey, MachineRef};
+    let account = |pk: &str, email: &str, on: &str| LabAccount {
+        pk: pk.to_owned(),
+        cli: Cli::Claude,
+        vendor: accounts::Vendor::default(),
+        label: email.split('@').next().unwrap_or_default().to_owned(),
+        legacy_label: None,
+        email: email.to_owned(),
+        identity: None,
+        browser: None,
+        joinable: true,
+        preferred: vec![(MachineRef::from_registry(on, None), Some(1))],
+    };
+    Lab {
+        me: Some(MachineRef::from_registry(me, None)),
+        bound: [
+            ("aa01".to_owned(), MachineKey::from_registry("mc-m1")),
+            ("bb02".to_owned(), MachineKey::from_registry("mc-m13")),
+        ]
+        .into_iter()
+        .collect(),
+        accounts: vec![
+            account("ac-main", "main@example.test", main_on),
+            account("ac-work", "work@example.test", "mc-m13"),
+        ],
+        ..Lab::default()
+    }
+}
+
+/// A HOME WITH NO POOL FILE CLAIMS ITS ACCOUNT (the owner's ruling of 2026-11-11, "Accounts on
+/// their own machine"): m1 has no `ai-pool.toml`, and its lab names it `main`'s home. m13, which
+/// has one, has borrowed `main` for an hour. m1's launch starts on `main` and claims it, a home's
+/// claim, so m13's next launch reads `main` held elsewhere and starts on `work`. A Mac with no
+/// pool file that its lab names no account's home claims nothing, and yields to a home's claim
+/// alone: m3's launch reads `main` held by m1 and starts on `work`, which no home claims.
+///
+/// NEGATIVE CONTROLS: apply claims only where `ai-pool.toml` is (`claims::scope` returning `None`
+/// for a Mac with no pool file, as `applies` did), and m1's launch wrote no claim (`m1's launch
+/// claims its home account`), so m13 never yields it; apply them under `Scope::Homes` only where
+/// the lab names this Mac a home (`claims::scope` testing `Lab::me` alone, as before), or settle
+/// there no account another Mac is the home of (`touch_using`'s `borrowed` always empty), and m3
+/// started on `main` beside its home (`left: "main"`, `right: "work"`).
+#[test]
+fn a_home_with_no_pool_file_claims_its_account_and_the_borrower_yields() {
+    use claims::Table;
+    let (m1, m13) = (World::new("claims-home"), World::new("claims-borrower"));
+    m1.emailed_two(Cli::Claude);
+    m13.claimed_two(Cli::Claude);
+    for world in [&m1, &m13] {
+        world.on_main(Cli::Claude, &[]);
+    }
+    let homes = claims::Homes::of(&lab("mc-m1", "mc-m1"));
+    let (t1, t13) = (
+        Arc::new(Replica::with_homes("aa01", homes.clone())),
+        Arc::new(Replica::with_homes("bb02", homes)),
+    );
+    let main = LeaseKey::new("claude", "main@example.test").expect("a key");
+    t13.write(
+        &m13.home,
+        &claims::Row {
+            machine: "bb02".into(),
+            label: "m13".into(),
+            counter: 1,
+            until: NOW + claims::HORIZON_S,
+            claims: vec![claims::Claim {
+                key: main.clone(),
+                kind: claims::Kind::Lease,
+                since: NOW - HOUR,
+            }],
+            ranks_homes: true,
+        },
+    )
+    .expect("the borrower's row");
+    t1.merge(&t13);
+
+    let pick = crate::harness::alab_roster::with_lab(lab("mc-m1", "mc-m1"), || {
+        claims::with_table(t1.clone(), || {
+            launch_env(&m1.seat(), Cli::Claude, &no_usage)
+        })
+    });
+    assert_eq!(pick.expect("a pick").label, "main");
+    if cfg!(not(unix)) {
+        // Off Unix no claim activity can be kept, so the claim is unrecorded: a Mac with no pool
+        // file starts on its account all the same, and marks nothing.
+        assert_eq!(t1.row("aa01"), None);
+        assert!(!m1.load(Cli::Claude).unrecorded);
+        return;
+    }
+    let row = t1.row("aa01").expect("m1's launch claims its home account");
+    assert!(row.ranks_homes);
+    assert_eq!(
+        row.claims
+            .iter()
+            .map(|claim| (&claim.key, claim.kind))
+            .collect::<Vec<_>>(),
+        [(&main, claims::Kind::Home)]
+    );
+    assert_eq!(m1.load(Cli::Claude).lease_verdict("main", NOW), Ok(()));
+
+    t13.merge(&t1);
+    let pick = crate::harness::alab_roster::with_lab(lab("mc-m13", "mc-m1"), || {
+        claims::with_table(t13.clone(), || {
+            launch_env(&m13.seat(), Cli::Claude, &no_usage)
+        })
+    });
+    assert_eq!(pick.expect("a pick").label, "work");
+    assert!(matches!(
+        m13.load(Cli::Claude).lease_verdict("main", NOW),
+        Err(accounts::WhyNot::LeasedElsewhere { .. })
+    ));
+
+    // A Mac with no pool file its lab names no account's home: it claims nothing, and yields
+    // `main` to its home's claim; m13's lease on it, a borrower's, refuses it nothing.
+    let m3 = World::new("claims-no-home");
+    m3.emailed_two(Cli::Claude);
+    m3.on_main(Cli::Claude, &[]);
+    let t3 = Arc::new(Replica::with_homes(
+        "cc03",
+        claims::Homes::of(&lab("mc-m3", "mc-m1")),
+    ));
+    t3.merge(&t1);
+    let pick = crate::harness::alab_roster::with_lab(lab("mc-m3", "mc-m1"), || {
+        claims::with_table(t3.clone(), || {
+            launch_env(&m3.seat(), Cli::Claude, &no_usage)
+        })
+    });
+    assert_eq!(pick.expect("a pick").label, "work");
+    assert_eq!(t3.row("cc03"), None);
+    let state = m3.load(Cli::Claude);
+    assert!(matches!(
+        state.lease_verdict("main", NOW),
+        Err(accounts::WhyNot::LeasedElsewhere { .. })
+    ));
+    assert_eq!(state.lease_verdict("work", NOW), Ok(()));
+    assert!(!state.unrecorded);
+}
+
+/// A HOME WITH NO POOL FILE GIVES ITS CLAIMS UP WHATEVER ITS LAB NAMES BY THEN: m1 claims its home
+/// account `main` with no `ai-pool.toml`. Its lab then goes (turned off, or not read yet), and m1
+/// shuts down: its off gives up every claim, so its row stands empty, not to its `until` a day
+/// away, where other Macs' labs would still read it as a home's use. A Mac with no pool file that
+/// never kept claim activity is untouched by an off, as before.
+///
+/// NEGATIVE CONTROL: decide every act's scope by the lab alone (`claims::scope` without its
+/// `activity::kept` arm), and m1's off answered `NotApplicable` and left its claim standing (`left:
+/// NotApplicable`, `right: Quieted`).
+#[test]
+fn a_home_with_no_pool_file_gives_its_claims_up_whatever_its_lab_names_by_then() {
+    use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
+    if cfg!(not(unix)) {
+        // Off Unix no claim activity is kept, so a Mac with no pool file writes no claim row.
+        return;
+    }
+    let m1 = World::new("claims-home-off");
+    m1.emailed_two(Cli::Claude);
+    m1.on_main(Cli::Claude, &[]);
+    let t1 = Arc::new(Replica::with_homes(
+        "aa01",
+        claims::Homes::of(&lab("mc-m1", "mc-m1")),
+    ));
+    let pick = crate::harness::alab_roster::with_lab(lab("mc-m1", "mc-m1"), || {
+        claims::with_table(t1.clone(), || {
+            launch_env(&m1.seat(), Cli::Claude, &no_usage)
+        })
+    });
+    assert_eq!(pick.expect("a pick").label, "main");
+    let main = LeaseKey::new("claude", "main@example.test").expect("a key");
+    assert!(
+        t1.row("aa01").is_some_and(|row| row.claim(&main).is_some()),
+        "CONTROL: m1 claims its home account"
+    );
+
+    // The lab is gone: the table names no homes, and neither does this process.
+    let _gone = TestSourceOverride::new(SourceSnapshot::Disabled);
+    let unlabbed = Arc::new(Replica::new("aa01"));
+    unlabbed.merge(&t1);
+    let off = claims::with_table(unlabbed.clone(), || {
+        m1.seat().claim(Cli::Claude, claims::Act::Off)
+    });
+    assert_eq!(off, claims::Touched::Quieted);
+    assert_eq!(
+        unlabbed.row("aa01").map(|row| row.claims),
+        Some(Vec::new()),
+        "m1's off gives its claim up"
+    );
+
+    let m3 = World::new("claims-never-claimed");
+    m3.emailed_two(Cli::Claude);
+    let t3 = Arc::new(Replica::new("cc03"));
+    let off = claims::with_table(t3.clone(), || {
+        m3.seat().claim(Cli::Claude, claims::Act::Off)
+    });
+    assert_eq!(off, claims::Touched::NotApplicable);
+    assert_eq!(t3.row("cc03"), None);
 }

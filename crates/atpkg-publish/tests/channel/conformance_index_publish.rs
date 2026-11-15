@@ -16,6 +16,8 @@ use atpkg_publish::channel::index::{parse_delta, publish_with};
 use atpkg_publish::ctx::Ctx;
 #[cfg(unix)]
 use atpkg_publish::ctx::HostChoice;
+#[cfg(unix)]
+use atpkg_publish::error::Error;
 use atpkg_publish::host::fake::{FakeHost, FakeRelease};
 use atpkg_publish::host::{HostRef, Hosts, Slug};
 use atpkg_publish::quad::{QUAD_FILES, index_tag};
@@ -444,4 +446,72 @@ fn the_real_indexer_takes_the_models_decision_on_every_channel_it_reaches() {
 #[test]
 fn the_real_indexer_takes_the_models_decision_over_agh_host() {
     takes_the_models_decision(&AghChannel);
+}
+
+/// A create agh's journal made for one candidate, killed before its first upload, leaves a
+/// draft no other candidate completes: the indexer names it orphaned with the act that clears
+/// it, and once a person deletes it the next publish creates the index.
+#[cfg(unix)]
+#[test]
+fn a_draft_agh_made_for_another_candidate_is_named_orphaned_until_it_is_deleted() {
+    use agh_fake::{Change, Fault, Match};
+
+    let fx = Fixture::new();
+    let world = AghWorld::build(Setup::RELEASE);
+    assert_eq!(world.slug(), fx.slug(), "the channel is the index slug");
+    let one = fx.laid(1, 2).expect("index 1, published");
+    let assets: Vec<(&str, &[u8])> = one
+        .assets
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    world.lay(&one.tag, false, &assets);
+    let ctx = world.ctx(&fx.rig);
+    let publish = |until: &str, out: &str| {
+        let req = IndexRequest {
+            baseline: Baseline::Dir(fx.own[&1].clone()),
+            delta: valid_until(until),
+            out: fx.rig.path(out),
+            upload: true,
+            pack_dir: None,
+        };
+        publish_with(&ctx, &req, &mut Rig::log())
+    };
+    let tag = index_tag(2);
+    world.fake.fault(
+        Match::uploads(&format!("{}/", world.releases_path())).method("POST"),
+        Fault::Status {
+            status: 400,
+            body: "{\"message\":\"fixture stopped before first upload\"}".into(),
+            headers: vec![],
+        },
+    );
+    publish(OWN_VALID_UNTIL, "killed-create").unwrap_err();
+    let held = world.read(&tag);
+    assert!(
+        held.len() == 1 && held[0].draft && held[0].assets.is_empty(),
+        "the killed create left one empty draft"
+    );
+
+    let error = publish(FOREIGN_VALID_UNTIL, "other-candidate").unwrap_err();
+    let why = error.to_string();
+    assert!(matches!(error, Error::Refused(_)), "{why}");
+    assert!(
+        why.contains("orphaned DRAFT without an index.toml, which this host will not complete"),
+        "{why}"
+    );
+    assert!(why.contains("inspect it, delete it, then re-run"), "{why}");
+    assert_eq!(world.read(&tag), held, "a refusal writes nothing");
+
+    world.fake.apply(Change::DeleteRelease {
+        release_id: world.id_of(&tag),
+    });
+    publish(FOREIGN_VALID_UNTIL, "after-deletion").unwrap();
+    let held = world.read(&tag);
+    assert_eq!(held.len(), 1);
+    assert!(!held[0].draft);
+    assert_eq!(
+        held[0].assets[QUAD_FILES[0]],
+        std::fs::read(fx.rig.path("after-deletion").join(QUAD_FILES[0])).expect("candidate")
+    );
 }

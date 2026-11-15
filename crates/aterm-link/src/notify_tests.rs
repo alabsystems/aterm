@@ -25,7 +25,7 @@ fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value(
             "f1",
             7,
             "/f/f1/in/p/h-andrew/n-a/ask",
-            b"v=1 t=1 from=s-b text=hi"
+            b"v=1 t=1 from=tb000000000 text=hi"
         )
         .is_some());
     for bad in [
@@ -46,11 +46,11 @@ fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value(
     let att = Sel::Attention;
     let body = b"v=1 t=1 state=live attention=needs%20a%20key";
     assert!(att
-        .hit("f1", 3, "/f/f1/pub/n-a/s-b/presence", body)
+        .hit("f1", 3, "/f/f1/pub/n-a/tb000000000/presence", body)
         .is_some());
     for bad in [
         format!("/f/f1/pub/n-a/{huge}/presence"),
-        format!("/f/f1/pub/{huge}/s-b/presence"),
+        format!("/f/f1/pub/{huge}/tb000000000/presence"),
         format!("/f/f1/pub/n-a/{bidi}/presence"),
     ] {
         assert_eq!(att.hit("f1", 3, &bad, body), None, "{}", &bad[..40]);
@@ -69,7 +69,7 @@ fn a_subject_segment_that_is_not_a_principal_never_becomes_an_environment_value(
             "f1",
             7,
             "/f/f1/in/p/h-andrew/n-a/ask",
-            b"v=1 t=1 from=s-b text=hi",
+            b"v=1 t=1 from=tb000000000 text=hi",
         )
         .expect("the honest ask");
     for v in [&hit.subject, &hit.node, &hit.who, &hit.sid, &hit.text] {
@@ -150,16 +150,21 @@ fn a_selector_matches_by_position_and_an_overlong_subject_never_matches() {
     let ask = Sel::Ask("h-andrew".into());
     let honest = "/f/f1/in/p/h-andrew/n-a/ask";
     let hit = ask
-        .hit("f1", 7, honest, b"v=1 t=1 from=s-b text=is%20this%20ok%3F")
+        .hit(
+            "f1",
+            7,
+            honest,
+            b"v=1 t=1 from=tb000000000 text=is%20this%20ok%3F",
+        )
         .expect("the honest ask to h-andrew matches");
     assert_eq!(
         (hit.who.as_str(), hit.node.as_str(), hit.sid.as_str()),
-        ("h-andrew", "n-a", "s-b")
+        ("h-andrew", "n-a", "tb000000000")
     );
     assert_eq!(hit.text, "is this ok?");
     for bad in [
-        "/f/f1/in/n-a/s-b/h-andrew/ask",
-        "/f/f1/in/p/h-andrew/n-a/s-1/ask",
+        "/f/f1/in/n-a/tb000000000/h-andrew/ask",
+        "/f/f1/in/p/h-andrew/n-a/t0000000001/ask",
         "/f/f1/in/p/h-other/n-a/ask",
         "/f/f1/in/p/h-andrew/n-a/note",
         "/f/f2/in/p/h-andrew/n-a/ask",
@@ -173,7 +178,7 @@ fn a_selector_matches_by_position_and_an_overlong_subject_never_matches() {
 #[test]
 fn attention_fires_only_on_a_presence_row_that_carries_one() {
     let sel = Sel::Attention;
-    let subject = "/f/f1/pub/n-a/s-b/presence";
+    let subject = "/f/f1/pub/n-a/tb000000000/presence";
     let hit = sel
         .hit(
             "f1",
@@ -183,7 +188,10 @@ fn attention_fires_only_on_a_presence_row_that_carries_one() {
         )
         .expect("a presence row with an attention matches");
     assert_eq!(hit.text, "needs a key");
-    assert_eq!((hit.node.as_str(), hit.who.as_str()), ("n-a", "s-b"));
+    assert_eq!(
+        (hit.node.as_str(), hit.who.as_str()),
+        ("n-a", "tb000000000")
+    );
     for body in [
         &b"v=1 t=1 state=live"[..],
         b"v=1 t=1 attention=",
@@ -411,31 +419,31 @@ fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
     feed(
         &mut n,
         1,
-        "s-one",
+        "t0ne0000000",
         &format!("v=1 t=1 state=live inc=1 {key}"),
     );
     feed(
         &mut n,
         2,
-        "s-one",
+        "t0ne0000000",
         &format!("v=1 t=2 state=live inc=2 {key}"),
     );
     feed(
         &mut n,
         3,
-        "s-one",
+        "t0ne0000000",
         &format!("v=1 t=3 inc=2 phase=busy {key}"),
     );
     feed(
         &mut n,
         4,
-        "s-one",
+        "t0ne0000000",
         &format!("v=1 t=4 state=exited inc=2 {key}"),
     );
     feed(
         &mut n,
         5,
-        "s-two",
+        "ttw00000000",
         &format!("v=1 t=5 state=live inc=1 {key}"),
     );
     assert_eq!(fired_offsets(&fired), [1, 5]);
@@ -445,11 +453,16 @@ fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
     }
     assert_eq!(n.stamps.len(), 2, "and charges no budget");
 
-    feed(&mut n, 6, "s-one", "v=1 t=6 state=live inc=3 attention=-");
+    feed(
+        &mut n,
+        6,
+        "t0ne0000000",
+        "v=1 t=6 state=live inc=3 attention=-",
+    );
     feed(
         &mut n,
         7,
-        "s-one",
+        "t0ne0000000",
         &format!("v=1 t=7 state=live inc=3 {key}"),
     );
     assert_eq!(fired_offsets(&fired), [1, 5, 7], "a clear re-arms it");
@@ -459,28 +472,33 @@ fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
     feed(
         &mut back,
         8,
-        "s-one",
+        "t0ne0000000",
         &format!("v=1 t=8 state=live inc=4 {key}"),
     );
     assert_eq!(fired_offsets(&fired), [1, 5, 7], "a restart remembers");
     feed(
         &mut back,
         9,
-        "s-one",
+        "t0ne0000000",
         "v=1 t=9 attention=a%20new%20question",
     );
-    feed(&mut back, 10, "s-one", &format!("v=1 t=10 {key}"));
+    feed(&mut back, 10, "t0ne0000000", &format!("v=1 t=10 {key}"));
     assert_eq!(
         fired_offsets(&fired),
         [1, 5, 7, 9, 10],
         "a value that moved is a new escalation, and so is moving back"
     );
 
-    feed(&mut back, 11, "s-two", "v=1 t=11 attention=-");
-    feed(&mut back, 12, "s-two", &format!("v=1 t=12 {key}"));
-    feed(&mut back, 11, "s-two", "v=1 t=11 attention=-");
-    feed(&mut back, 12, "s-two", &format!("v=1 t=12 {key}"));
-    feed(&mut back, 13, "s-two", &format!("v=1 t=13 inc=2 {key}"));
+    feed(&mut back, 11, "ttw00000000", "v=1 t=11 attention=-");
+    feed(&mut back, 12, "ttw00000000", &format!("v=1 t=12 {key}"));
+    feed(&mut back, 11, "ttw00000000", "v=1 t=11 attention=-");
+    feed(&mut back, 12, "ttw00000000", &format!("v=1 t=12 {key}"));
+    feed(
+        &mut back,
+        13,
+        "ttw00000000",
+        &format!("v=1 t=13 inc=2 {key}"),
+    );
     assert_eq!(fired_offsets(&fired), [1, 5, 7, 9, 10, 12]);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -489,18 +507,28 @@ fn a_standing_attention_pages_once_per_transition_not_once_per_offset() {
 fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
     let dir = scratch("untold");
     let (mut n, fired) = appending(&dir, 1, "");
-    feed(&mut n, 1, "s-one", "v=1 t=1 attention=first");
-    feed(&mut n, 2, "s-two", "v=1 t=2 attention=second");
+    feed(&mut n, 1, "t0ne0000000", "v=1 t=1 attention=first");
+    feed(&mut n, 2, "ttw00000000", "v=1 t=2 attention=second");
     assert_eq!(n.verdict(2), Some("dropped"));
     drop(n);
     let (mut room, _) = appending(&dir, 10, "");
-    feed(&mut room, 3, "s-two", "v=1 t=3 inc=2 attention=second");
+    feed(
+        &mut room,
+        3,
+        "ttw00000000",
+        "v=1 t=3 inc=2 attention=second",
+    );
     assert_eq!(
         fired_offsets(&fired),
         [1, 3],
         "the dropped escalation pages"
     );
-    feed(&mut room, 4, "s-two", "v=1 t=4 inc=3 attention=second");
+    feed(
+        &mut room,
+        4,
+        "ttw00000000",
+        "v=1 t=4 inc=3 attention=second",
+    );
     assert_eq!(fired_offsets(&fired), [1, 3], "and, told, stands");
 
     drop(room);
@@ -509,8 +537,13 @@ fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
         10,
         &format!("if [ ! -e {dir}/fixed ]; then exit 3; fi; "),
     );
-    feed(&mut broken, 5, "s-three", "v=1 t=5 attention=third");
-    feed(&mut broken, 6, "s-three", "v=1 t=6 inc=2 attention=third");
+    feed(&mut broken, 5, "tthree00000", "v=1 t=5 attention=third");
+    feed(
+        &mut broken,
+        6,
+        "tthree00000",
+        "v=1 t=6 inc=2 attention=third",
+    );
     assert!(
         broken
             .journal
@@ -520,8 +553,18 @@ fn an_escalation_nobody_was_told_of_is_offered_again_on_its_republish() {
         broken.journal
     );
     std::fs::write(Path::new(&dir).join("fixed"), b"").expect("fix the command");
-    feed(&mut broken, 7, "s-three", "v=1 t=7 inc=3 attention=third");
-    feed(&mut broken, 8, "s-three", "v=1 t=8 inc=4 attention=third");
+    feed(
+        &mut broken,
+        7,
+        "tthree00000",
+        "v=1 t=7 inc=3 attention=third",
+    );
+    feed(
+        &mut broken,
+        8,
+        "tthree00000",
+        "v=1 t=8 inc=4 attention=third",
+    );
     assert_eq!(fired_offsets(&fired), [1, 3, 7]);
     assert_eq!(broken.counts.standing, 1);
     let _ = std::fs::remove_dir_all(&dir);
@@ -687,7 +730,7 @@ fn a_notifier_files_its_cursor_and_journal_under_the_log_it_read() {
             .publish(
                 7,
                 1,
-                "/f/f1/pub/n-a/s-x/presence",
+                "/f/f1/pub/n-a/tx000000000/presence",
                 b"v=1 t=1 attention=help",
             )
             .unwrap();
@@ -751,7 +794,7 @@ fn a_catch_up_below_the_retained_floor_reads_on_from_it() {
     let sock = base.join("b.sock");
     let mut server = broker.serve(&sock).unwrap();
     let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
-    for (seq, sid) in [(1, "s-a"), (2, "s-b"), (3, "s-c")] {
+    for (seq, sid) in [(1, "ta000000000"), (2, "tb000000000"), (3, "tc000000000")] {
         let subject = format!("/f/f1/pub/n-a/{sid}/presence");
         let (off, _) = conn
             .publish(7, seq, &subject, b"v=1 t=1 attention=help")
@@ -817,9 +860,14 @@ fn after_a_relaxed_stop(
         let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
         let seq = u64::from(text.as_bytes()[text.len() - 1] - b'0') + 1;
         let body = format!("v=1 t=1 attention={text}");
-        conn.publish(7, seq, "/f/f1/pub/n-a/s-x/presence", body.as_bytes())
-            .unwrap()
-            .0
+        conn.publish(
+            7,
+            seq,
+            "/f/f1/pub/n-a/tx000000000/presence",
+            body.as_bytes(),
+        )
+        .unwrap()
+        .0
     };
     let run = || {
         Notifier::new(c.clone())
@@ -962,7 +1010,7 @@ fn a_moved_generation_carries_the_newest_store_it_continues() {
         Flush::Ordered,
     )
     .unwrap();
-    one.set_standing(&[("/f/f1/pub/n-a/s-x/presence".into(), "help".into())])
+    one.set_standing(&[("/f/f1/pub/n-a/tx000000000/presence".into(), "help".into())])
         .unwrap();
 
     let lineage = lineage_of(&[(1, 3), (2, 5)]);
@@ -1082,8 +1130,8 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
         &mut n,
         vec![
             Notice::Log(0, log(true, 0)),
-            Notice::Record(0, 5, presence("s-a"), raise("key")),
-            Notice::Record(0, 7, presence("s-b"), raise("disk")),
+            Notice::Record(0, 5, presence("ta000000000"), raise("key")),
+            Notice::Record(0, 7, presence("tb000000000"), raise("disk")),
             Notice::Checkpoint(0, 9),
         ],
     );
@@ -1105,7 +1153,7 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
     feed(
         &mut n,
         vec![
-            Notice::Record(0, 10, presence("s-c"), raise("lost")),
+            Notice::Record(0, 10, presence("tc000000000"), raise("lost")),
             Notice::Log(0, log(true, 1)),
             Notice::Durable(0, 99),
         ],
@@ -1121,9 +1169,9 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
         &mut n,
         vec![
             Notice::Log(0, log(true, 1)),
-            Notice::Record(0, 20, presence("s-f"), raise("held")),
+            Notice::Record(0, 20, presence("tf000000000"), raise("held")),
             Notice::Log(0, log(false, 1)),
-            Notice::Record(0, 21, presence("s-g"), raise("strict")),
+            Notice::Record(0, 21, presence("tg000000000"), raise("strict")),
         ],
     );
     assert_eq!(fired_offsets(&fired), [5, 7, 20, 21], "in read order");
@@ -1133,8 +1181,8 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
     feed(
         &mut n,
         vec![
-            Notice::Record(0, 30, presence("s-d"), raise("first")),
-            Notice::Record(0, 31, presence("s-e"), {
+            Notice::Record(0, 30, presence("td000000000"), raise("first")),
+            Notice::Record(0, 31, presence("te000000000"), {
                 let mut body = raise("big");
                 body.resize(HOLD_MAX, b' ');
                 body
@@ -1153,7 +1201,7 @@ fn the_executor_holds_a_record_until_a_durable_mark_covers_it() {
             &mut n,
             vec![
                 Notice::Log(0, log(ordered, 0)),
-                Notice::Record(0, 5, presence("s-a"), raise("key")),
+                Notice::Record(0, 5, presence("ta000000000"), raise("key")),
                 Notice::Checkpoint(0, 9),
             ],
         );
@@ -1196,27 +1244,30 @@ fn a_durable_wait_is_said_once_per_log_and_a_hold_past_its_cap_once_per_streak()
     WARNED.with(|warned| warned.borrow_mut().clear());
     n.take(Notice::Log(0, log(0))).expect("log");
     for off in 0..50 {
-        n.take(Notice::Record(0, off, presence_of("s-a"), live()))
+        n.take(Notice::Record(0, off, presence_of("ta000000000"), live()))
             .expect("held");
-        assert_eq!(n.held_bytes, presence_of("s-a").len() + live().len());
+        assert_eq!(
+            n.held_bytes,
+            presence_of("ta000000000").len() + live().len()
+        );
         n.take(Notice::Durable(0, off + 1)).expect("released");
         assert_eq!(n.held_bytes, 0, "{off}: released");
     }
     assert_eq!(waits(), 1, "fifty held records say the wait once");
     n.take(Notice::Log(0, log(0))).expect("the same log again");
-    n.take(Notice::Record(0, 50, presence_of("s-a"), live()))
+    n.take(Notice::Record(0, 50, presence_of("ta000000000"), live()))
         .expect("held");
     n.take(Notice::Durable(0, 51)).expect("released");
     assert_eq!(waits(), 1, "a reconnect to the same log says nothing new");
     n.take(Notice::Log(0, log(1))).expect("another log");
-    n.take(Notice::Record(0, 60, presence_of("s-a"), live()))
+    n.take(Notice::Record(0, 60, presence_of("ta000000000"), live()))
         .expect("held");
     n.take(Notice::Durable(0, 61)).expect("released");
     assert_eq!(waits(), 2, "another log's wait is said once more");
     for off in 70..73 {
         let mut big = live();
         big.resize(HOLD_MAX, b' ');
-        n.take(Notice::Record(0, off, presence_of("s-a"), big))
+        n.take(Notice::Record(0, off, presence_of("ta000000000"), big))
             .expect("paged past the cap");
         assert_eq!(n.held_bytes, 0, "{off}: released at once");
     }
@@ -1225,7 +1276,7 @@ fn a_durable_wait_is_said_once_per_log_and_a_hold_past_its_cap_once_per_streak()
     let past_cap = |n: &mut Notifier, off: u64| {
         let mut big = live();
         big.resize(HOLD_MAX, b' ');
-        n.take(Notice::Record(0, off, presence_of("s-a"), big))
+        n.take(Notice::Record(0, off, presence_of("ta000000000"), big))
             .expect("paged past the cap");
         assert_eq!(n.held_bytes, 0, "{off}: released at once");
     };
@@ -1313,28 +1364,37 @@ fn a_page_flushes_in_full_once_and_before_its_command_runs() {
             "a first raise",
             D,
             Vec::new(),
-            vec![row(1, "s-a", "help-a"), row(2, "s-b", "help-b")],
+            vec![
+                row(1, "ta000000000", "help-a"),
+                row(2, "tb000000000", "help-b"),
+            ],
             &[D],
         ),
         (
             "NEGATIVE CONTROL: an ordered `firing` line",
             O,
             Vec::new(),
-            vec![row(1, "s-a", "help-a"), row(2, "s-b", "help-b")],
+            vec![
+                row(1, "ta000000000", "help-a"),
+                row(2, "tb000000000", "help-b"),
+            ],
             &[O],
         ),
         (
             "a raise that replaces another token, its cursor owed",
             D,
-            vec![row(1, "s-a", "help-1"), row(2, "s-q", "-")],
-            vec![row(3, "s-a", "help-2")],
+            vec![row(1, "ta000000000", "help-1"), row(2, "tq000000000", "-")],
+            vec![row(3, "ta000000000", "help-2")],
             &[O, D],
         ),
         (
             "a log's own store, under logs/",
             D,
             Vec::new(),
-            vec![row(1, "s-a", "help-a"), row(2, "s-b", "help-b")],
+            vec![
+                row(1, "ta000000000", "help-a"),
+                row(2, "tb000000000", "help-b"),
+            ],
             &[O, D],
         ),
     ];
@@ -1422,7 +1482,10 @@ fn a_record_that_pages_nothing_flushes_nothing_and_the_cursor_trails_it_by_at_mo
     for (i, body) in s.bodies().into_iter().enumerate() {
         records.push((NEED_FACE.to_string(), body.into_bytes()));
         if i % 3 == 2 {
-            records.push((presence_of("s-x"), b"v=1 t=1 inc=1 state=live".to_vec()));
+            records.push((
+                presence_of("tx000000000"),
+                b"v=1 t=1 inc=1 state=live".to_vec(),
+            ));
         }
     }
     let need = Sel::Need(None);
@@ -1504,10 +1567,10 @@ fn a_standing_value_never_reaches_the_media_ahead_of_its_selectors_cursor() {
     n.cursor_every = Duration::MAX;
     n.take(Notice::Log(0, strict_log())).expect("log");
     let records = [
-        (1, "s-a", raise.clone()),
-        (2, "s-a", raise.clone()),
-        (3, "s-a", b"v=1 t=1 attention=-".to_vec()),
-        (4, "s-b", b"v=1 t=1 state=live".to_vec()),
+        (1, "ta000000000", raise.clone()),
+        (2, "ta000000000", raise.clone()),
+        (3, "ta000000000", b"v=1 t=1 attention=-".to_vec()),
+        (4, "tb000000000", b"v=1 t=1 state=live".to_vec()),
     ];
     for (off, sid, body) in &records {
         n.take(Notice::Record(0, *off, presence_of(sid), body.clone()))
@@ -1565,7 +1628,7 @@ fn the_notifiers_standing_change_and_its_cursor_reach_the_media_together() {
         n.standing_split = mutant;
         n.take(Notice::Log(0, strict_log())).expect("log");
         for (off, body) in [(1, raise.clone()), (2, raise.clone())] {
-            n.take(Notice::Record(0, off, presence_of("s-a"), body))
+            n.take(Notice::Record(0, off, presence_of("ta000000000"), body))
                 .expect("a record");
         }
         let path = n.log_store.root.join(journal::FILE);
@@ -1573,7 +1636,7 @@ fn the_notifiers_standing_change_and_its_cursor_reach_the_media_together() {
         n.take(Notice::Record(
             0,
             3,
-            presence_of("s-a"),
+            presence_of("ta000000000"),
             b"v=1 t=1 attention=-".to_vec(),
         ))
         .expect("the clear");
@@ -1581,7 +1644,10 @@ fn the_notifiers_standing_change_and_its_cursor_reach_the_media_together() {
         let (mut apart, mut cleared_seen) = (0, false);
         for cut in usize::try_from(before).expect("small")..=bytes.len() {
             let held = journal::read(&bytes[..cut]).index;
-            let cleared = !held.standing.iter().any(|(s, _)| *s == presence_of("s-a"));
+            let cleared = !held
+                .standing
+                .iter()
+                .any(|(s, _)| *s == presence_of("ta000000000"));
             cleared_seen |= cleared;
             apart += usize::from(cleared && held.cursors.get(&key).is_none_or(|&c| c < 3));
         }
@@ -1628,7 +1694,10 @@ fn a_followers_cursor_is_written_per_page_and_per_second_never_per_record() {
     for (i, body) in bodies.into_iter().enumerate() {
         records.push((NEED_FACE.to_string(), body.into_bytes()));
         if i % 2 == 1 {
-            records.push((presence_of("s-y"), b"v=1 t=1 inc=1 state=live".to_vec()));
+            records.push((
+                presence_of("ty000000000"),
+                b"v=1 t=1 inc=1 state=live".to_vec(),
+            ));
         }
     }
     let n_records = u32::try_from(records.len()).expect("a small run");
@@ -1942,10 +2011,10 @@ fn refuse(name: &'static str, times: usize) {
 fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_nor_repeats() {
     let retry = Duration::from_secs(60);
     let miss: [Row; 4] = [
-        (1, "s-a", "help"),
-        (2, "s-a", "-"),
-        (3, "s-b", "other"),
-        (4, "s-a", "help"),
+        (1, "ta000000000", "help"),
+        (2, "ta000000000", "-"),
+        (3, "tb000000000", "other"),
+        (4, "ta000000000", "help"),
     ];
     for crash in [false, true] {
         let dir = scratch(&format!("standing-miss-{crash}"));
@@ -1955,12 +2024,12 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
         n.take(raised(&miss[0])).expect("1 pages");
         refuse("standing", 2);
         n.take(raised(&miss[1]))
-            .expect("2 clears s-a, its standing value refused");
+            .expect("2 clears ta000000000, its standing value refused");
         let waits = n.take(raised(&miss[2]));
         assert_eq!(
             (waits.map_err(|e| e.raw_os_error()), fired_offsets(&fired)),
             (Err(Some(libc::ENOSPC)), vec![1]),
-            "crash={crash}: s-b's raise at 3 waits behind the clear at 2"
+            "crash={crash}: tb000000000's raise at 3 waits behind the clear at 2"
         );
         n.clock = Some(base + retry);
         let _ = n.tick(n.now());
@@ -1986,17 +2055,17 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
         assert_eq!(
             paged,
             [1, 3, 4],
-            "crash={crash}: s-b's raise at 3 pages once, and s-a's help, cleared at 2, \
+            "crash={crash}: tb000000000's raise at 3 pages once, and ta000000000's help, cleared at 2, \
              pages again at 4"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     let repeat: [Row; 4] = [
-        (1, "s-a", "help"),
-        (2, "s-b", "help"),
-        (3, "s-a", "help"),
-        (4, "s-a", "-"),
+        (1, "ta000000000", "help"),
+        (2, "tb000000000", "help"),
+        (3, "ta000000000", "help"),
+        (4, "ta000000000", "-"),
     ];
     let dir = scratch("standing-repeat");
     let (mut n, fired) = attending(&dir, 100, retry);
@@ -2007,7 +2076,7 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
         *r.borrow_mut() = vec![("standing", 0, libc::ENOSPC), ("cur/", 0, libc::ENOSPC)];
     });
     n.take(raised(&repeat[1]))
-        .expect("2 pages s-b, its standing value refused");
+        .expect("2 pages tb000000000, its standing value refused");
     for row in &repeat[2..] {
         let _ = n.take(raised(row));
     }
@@ -2019,14 +2088,14 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
             REFUSE.with(std::cell::RefCell::take).len()
         ),
         (vec![1, 2], 0),
-        "PRECONDITION: 1 and 2 paged, 3 stood, s-b's standing value was refused, and at \
+        "PRECONDITION: 1 and 2 paged, 3 stood, tb000000000's standing value was refused, and at \
          its retry a cursor"
     );
     drop(n);
     assert_eq!(
         restart(&dir, &repeat, 100).1,
         [1, 2],
-        "a crash re-reads s-a's republish at 3 under the value it stood under, and pages \
+        "a crash re-reads ta000000000's republish at 3 under the value it stood under, and pages \
          nothing again"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -2038,10 +2107,10 @@ fn a_record_waits_behind_an_unwritten_standing_change_so_a_crash_neither_misses_
 #[test]
 fn no_cursor_passes_a_record_whose_standing_change_is_unwritten() {
     let rows: [Row; 4] = [
-        (1, "s-a", "help"),
-        (2, "s-a", "-"),
-        (3, "s-c", "-"),
-        (4, "s-a", "help"),
+        (1, "ta000000000", "help"),
+        (2, "ta000000000", "-"),
+        (3, "tc000000000", "-"),
+        (4, "ta000000000", "help"),
     ];
     let dir = scratch("standing-hold");
     let (mut n, _) = attending(&dir, 100, Duration::ZERO);
@@ -2050,7 +2119,7 @@ fn no_cursor_passes_a_record_whose_standing_change_is_unwritten() {
     n.take(raised(&rows[0])).expect("1 pages");
     refuse("standing", 2);
     n.take(raised(&rows[1]))
-        .expect("2 clears s-a, refused, and its retry refused");
+        .expect("2 clears ta000000000, refused, and its retry refused");
     assert!(
         REFUSE.with(std::cell::RefCell::take).is_empty(),
         "PRECONDITION: the clear and its retry, due at once, were refused"
@@ -2059,7 +2128,7 @@ fn no_cursor_passes_a_record_whose_standing_change_is_unwritten() {
     assert_eq!(
         restart(&dir, &rows, 100).1,
         [1, 4],
-        "the restart re-read the clear at 2, so s-a's help at 4 paged"
+        "the restart re-read the clear at 2, so ta000000000's help at 4 paged"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2071,7 +2140,7 @@ fn no_cursor_passes_a_record_whose_standing_change_is_unwritten() {
 fn a_drops_count_never_reaches_the_store_ahead_of_its_line_and_no_cursor_passes_it() {
     let key = Sel::Attention.key();
     let retry = Duration::from_secs(60);
-    let rows: [Row; 2] = [(1, "s-a", "help"), (2, "s-b", "other")];
+    let rows: [Row; 2] = [(1, "ta000000000", "help"), (2, "tb000000000", "other")];
     let on_store = |n: &Notifier| {
         (
             n.log_store
@@ -2153,15 +2222,15 @@ fn kill_sweep(own_store: bool) {
             format!("v=1 t=1 attention=help-{sid}").into_bytes(),
         )
     };
-    let quiet = || (presence_of("s-q"), b"v=1 t=1 state=live".to_vec());
+    let quiet = || (presence_of("tq000000000"), b"v=1 t=1 state=live".to_vec());
     let records: Vec<(u64, String, Vec<u8>)> = [
         quiet(),
-        raise("s-a"),
+        raise("ta000000000"),
         quiet(),
-        raise("s-b"),
-        raise("s-c"),
-        raise("s-d"),
-        raise("s-e"),
+        raise("tb000000000"),
+        raise("tc000000000"),
+        raise("td000000000"),
+        raise("te000000000"),
         quiet(),
     ]
     .into_iter()
@@ -2299,7 +2368,7 @@ fn the_flush_tally_tells_every_flush_a_carried_generation_asks_for() {
     one.set_cursor("attention", 9).unwrap();
     one.set_journal(&["2 fired rc=0".to_string()], Flush::Ordered)
         .unwrap();
-    one.set_standing(&[("/f/f1/pub/n-a/s-x/presence".into(), "help".into())])
+    one.set_standing(&[("/f/f1/pub/n-a/tx000000000/presence".into(), "help".into())])
         .unwrap();
 
     let recording = aterm_durable::seam::Recording::start();
@@ -2337,7 +2406,12 @@ fn the_exec_stamps_tell_each_fresh_page_once_in_the_order_it_ran() {
         untold: None,
     });
     for off in [1, 2] {
-        feed(&mut n, off, &format!("s-{off}"), "v=1 t=1 attention=help");
+        feed(
+            &mut n,
+            off,
+            &format!("t{off:010}"),
+            "v=1 t=1 attention=help",
+        );
         n.tell();
         assert_eq!(
             fired_offsets(&fired).last(),
@@ -2371,7 +2445,7 @@ fn exec_of(dir: &str, command: &str, timeout: Duration) -> String {
             "f1",
             7,
             "/f/f1/in/p/h-andrew/n-a/ask",
-            b"v=1 t=1 from=s-b text=x",
+            b"v=1 t=1 from=tb000000000 text=x",
         )
         .expect("an ask to h-andrew");
     let mut c = cfg(dir);
@@ -2549,7 +2623,7 @@ fn an_ordered_broker_pages_a_record_only_once_it_is_durable() {
             .publish(
                 7,
                 1,
-                "/f/f1/pub/n-a/s-x/presence",
+                "/f/f1/pub/n-a/tx000000000/presence",
                 b"v=1 t=1 attention=needs%20a%20key",
             )
             .unwrap()
@@ -2568,7 +2642,7 @@ fn an_ordered_broker_pages_a_record_only_once_it_is_durable() {
             .publish(
                 7,
                 2,
-                "/f/f1/pub/n-b/s-y/presence",
+                "/f/f1/pub/n-b/ty000000000/presence",
                 b"v=1 t=1 attention=disk",
             )
             .unwrap()
@@ -2682,7 +2756,7 @@ fn in_follow_mode_the_horizon_alone_pages_an_attention_row() {
             .publish(
                 7,
                 1,
-                "/f/f1/pub/n-a/s-x/presence",
+                "/f/f1/pub/n-a/tx000000000/presence",
                 b"v=1 t=1 attention=needs%20a%20key",
             )
             .unwrap()
@@ -2708,7 +2782,7 @@ fn in_follow_mode_the_horizon_alone_pages_an_attention_row() {
         conn.publish(
             7,
             2,
-            "/f/f1/pub/n-a/s-y/presence",
+            "/f/f1/pub/n-a/ty000000000/presence",
             b"v=1 t=1 attention=disk",
         )
         .unwrap();
@@ -2975,7 +3049,7 @@ impl Needs {
     }
 }
 
-const NEED_FACE: &str = "/f/f1/pub/n-a/s-x/ev";
+const NEED_FACE: &str = "/f/f1/pub/n-a/tx000000000/ev";
 
 #[cfg(unix)]
 #[test]
@@ -3051,7 +3125,7 @@ fn a_need_pages_once_per_rise_and_a_restart_pages_nothing_again() {
             .map(str::to_string)
             .collect()
     };
-    let line = |off: u64, word: &str| format!("{off} need {word} s-x n-a");
+    let line = |off: u64, word: &str| format!("{off} need {word} tx000000000 n-a");
     let failure = Sel::Need(Some(vec!["failure"]));
     assert_eq!(
         run("failure", failure.clone()),
@@ -3152,7 +3226,8 @@ fn a_following_need_reader_folds_below_its_cursor_before_it_judges() {
     assert!(quiet.iter().any(|b| b.contains(" op=snap ")), "a snapshot");
     publish(&mut conn, NEED_FACE, quiet);
     let mut y = Needs::open();
-    let other = publish(&mut conn, "/f/f1/pub/n-a/s-y/ev", failing(&mut y)).expect("a rise");
+    let other =
+        publish(&mut conn, "/f/f1/pub/n-a/ty000000000/ev", failing(&mut y)).expect("a rise");
     pump(&mut n, &rx, "the other session's page", |_| {
         fired_offsets(&fired).contains(&other)
     });
@@ -3193,7 +3268,7 @@ fn an_exited_session_clears_its_standing_needs_and_a_will_or_a_relaunch_does_not
             n.on_record(&sel, off, subject, body).expect("on_record");
             off
         };
-        let faces = ["s-x", "s-y"].map(|sid| format!("/f/f1/pub/n-a/{sid}/ev"));
+        let faces = ["tx000000000", "ty000000000"].map(|sid| format!("/f/f1/pub/n-a/{sid}/ev"));
         let mut rises = Vec::new();
         for face in &faces {
             let mut s = Needs::open();
@@ -3218,7 +3293,7 @@ fn an_exited_session_clears_its_standing_needs_and_a_will_or_a_relaunch_does_not
         );
         feed(
             &mut n,
-            "/f/f1/pub/n-a/s-x/presence",
+            "/f/f1/pub/n-a/tx000000000/presence",
             b"v=1 t=1 inc=1 state=live",
         );
         assert_eq!(
@@ -3228,7 +3303,7 @@ fn an_exited_session_clears_its_standing_needs_and_a_will_or_a_relaunch_does_not
         );
         feed(
             &mut n,
-            "/f/f1/pub/n-a/s-x/presence",
+            "/f/f1/pub/n-a/tx000000000/presence",
             b"v=1 t=2 inc=2 state=exited",
         );
         assert_eq!(
@@ -3282,7 +3357,7 @@ fn a_need_standing_since_before_the_warm_window_pages_nothing_again_after_a_rest
     }
     let rose = rose.expect("the failed run's close");
     for _ in 0..crate::notify_need::WARM_WINDOW + 10 {
-        publish(&mut conn, "/f/f1/pub/n-a/s-z/filler", b"v=1 t=1");
+        publish(&mut conn, "/f/f1/pub/n-a/tz000000000/filler", b"v=1 t=1");
     }
     let state = base.join("state");
     let fired = base.join("fired");
@@ -3354,7 +3429,7 @@ fn a_need_standing_since_before_the_warm_window_pages_nothing_again_after_a_rest
 
 #[test]
 fn a_sessions_exit_pages_once_whichever_of_its_close_and_its_row_comes_first() {
-    let presence = "/f/f1/pub/n-a/s-x/presence";
+    let presence = "/f/f1/pub/n-a/tx000000000/presence";
     let exited: &[u8] = b"v=1 t=2 inc=1 state=exited";
     let mut s = Needs::open();
     let cmd = s.cmd_open();
@@ -3458,22 +3533,22 @@ fn failed_then_waiting() -> Vec<String> {
 /// A DEAD SESSION'S EXIT PAGES ONCE, AND ONLY AT A SUCCESSOR'S RESTORE (fix unit E9, finding
 /// E2E-5; the orchestrator's 2026-10-27 ruling). Two sessions each page a failure and then
 /// wait in an agent turn; their node's bridge dies (its will) and the node relaunches. A
-/// successor's restore names s-x: the watch derives s-x's close and pages `exited`, detail
-/// `gone`, for s-x, once, at the restore, under bare `--on need` and under `need:exited`.
-/// Nothing else pages: s-x's own `exited` row after it, the restore delivered again, a
-/// record of s-x delivered again, and s-y, whose row a later incarnation retired with no
+/// successor's restore names tx000000000: the watch derives tx000000000's close and pages `exited`, detail
+/// `gone`, for tx000000000, once, at the restore, under bare `--on need` and under `need:exited`.
+/// Nothing else pages: tx000000000's own `exited` row after it, the restore delivered again, a
+/// record of tx000000000 delivered again, and ty000000000, whose row a later incarnation retired with no
 /// successor naming it (the brief derives its close; its row alone pages nothing, and its
-/// pairs clear, as G2's rule says), nor a record of s-y delivered after that row. NEGATIVE
+/// pairs clear, as G2's rule says), nor a record of ty000000000 delivered after that row. NEGATIVE
 /// CONTROLS, run: a watch that derives nothing (the restore pages nothing), one that judges
-/// the restore as the successor's record only (the exit pages late, at s-x's next record),
-/// one that derives on a retired row too (s-y pages at its next record), and one that pages
+/// the restore as the successor's record only (the exit pages late, at tx000000000's next record),
+/// one that derives on a retired row too (ty000000000 pages at its next record), and one that pages
 /// the derived exit without its `gone`.
 #[test]
 fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_nothing() {
     let face = |sid: &str| format!("/f/f1/pub/n-a/{sid}/ev");
     let row = |sid: &str| format!("/f/f1/pub/n-a/{sid}/presence");
     let waiting = failed_then_waiting();
-    let restore = restore_of("s-x");
+    let restore = restore_of("tx000000000");
     for (tag, sel) in [
         ("exited", Sel::Need(Some(vec!["exited"]))),
         ("any", Sel::Need(None)),
@@ -3497,7 +3572,7 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
             off
         };
         let mut want = Vec::new();
-        for sid in ["s-x", "s-y"] {
+        for sid in ["tx000000000", "ty000000000"] {
             feed(&mut n, &row(sid), b"v=1 t=1 inc=1 state=live");
             for b in &waiting {
                 let at = feed(&mut n, &face(sid), b.as_bytes());
@@ -3513,7 +3588,7 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
         );
         feed(&mut n, &row("node"), b"v=1 t=3 state=live inc=2");
         for b in &restore {
-            let at = feed(&mut n, &face("s-z"), b.as_bytes());
+            let at = feed(&mut n, &face("tz000000000"), b.as_bytes());
             if b.contains(" k=restore ") {
                 want.push(at);
             }
@@ -3523,12 +3598,12 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
             want,
             "{tag}: the dead session's exit pages at its successor's restore"
         );
-        feed(&mut n, &row("s-x"), b"v=1 t=4 inc=2 state=exited");
-        feed(&mut n, &row("s-y"), b"v=1 t=4 inc=2 state=exited");
+        feed(&mut n, &row("tx000000000"), b"v=1 t=4 inc=2 state=exited");
+        feed(&mut n, &row("ty000000000"), b"v=1 t=4 inc=2 state=exited");
         for b in &restore {
-            feed(&mut n, &face("s-z"), b.as_bytes());
+            feed(&mut n, &face("tz000000000"), b.as_bytes());
         }
-        for sid in ["s-x", "s-y"] {
+        for sid in ["tx000000000", "ty000000000"] {
             feed(&mut n, &face(sid), waiting[0].as_bytes());
         }
         assert_eq!(fired_offsets(&fired), want, "{tag}: and nothing else pages");
@@ -3537,12 +3612,16 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
             said.lines()
                 .filter(|l| l.starts_with("exited "))
                 .collect::<Vec<_>>(),
-            ["exited gone s-x"],
+            ["exited gone tx000000000"],
             "{tag}: {said}"
         );
-        assert_eq!(standing_words(&n, &face("s-x")), ["exited"], "{tag}");
         assert_eq!(
-            standing_words(&n, &face("s-y")),
+            standing_words(&n, &face("tx000000000")),
+            ["exited"],
+            "{tag}"
+        );
+        assert_eq!(
+            standing_words(&n, &face("ty000000000")),
             Vec::<&str>::new(),
             "{tag}: a retired row alone clears its session's pairs"
         );
@@ -3552,17 +3631,17 @@ fn a_successors_restore_pages_a_dead_sessions_exit_once_and_its_row_alone_pages_
 
 /// A QUIT'S RELAUNCH AND A REOPENED TAB PAGE NO EXIT FOR THE SESSION THEIR RESTORE NAMES (fix
 /// unit E9, the lander's review). aterm writes `restore prev=<sid>` whenever a new shell fills
-/// a pane: after a clean quit's relaunch too, and when a closed tab is reopened. On n-a, s-q
+/// a pane: after a clean quit's relaunch too, and when a closed tab is reopened. On n-a, tq000000000
 /// pages a failure and waits in a turn; its aterm quits (the bridge withdraws it, `exited`
 /// under `inc=1`, the incarnation that hosted it; its close stays in the journal), its node's
-/// will fires as the bridge goes, the node relaunches under `inc=2`, and s-z's restore names
-/// s-q: nothing pages for s-q's exit (its row alone says it exited, G2's rule), and its pairs
-/// clear. On n-b, s-t waits in a turn, its tab closes and is reopened under the same
-/// incarnation (`inc=1`): s-u's restore names s-t before s-t's own close reaches the bus,
-/// and s-t's `exited` pages once, at that close. Under bare `--on need` and `need:exited`.
+/// will fires as the bridge goes, the node relaunches under `inc=2`, and tz000000000's restore names
+/// tq000000000: nothing pages for tq000000000's exit (its row alone says it exited, G2's rule), and its pairs
+/// clear. On n-b, tt000000000 waits in a turn, its tab closes and is reopened under the same
+/// incarnation (`inc=1`): tv000000000's restore names tt000000000 before tt000000000's own close reaches the bus,
+/// and tt000000000's `exited` pages once, at that close. Under bare `--on need` and `need:exited`.
 /// NEGATIVE CONTROLS, run: a restore that counts whatever withdrew the session pages
-/// `exited gone s-q` at s-z's restore; one that counts while the session's own incarnation
-/// lives pages s-t's exit twice, at s-u's restore and at s-t's close.
+/// `exited gone tq000000000` at tz000000000's restore; one that counts while the session's own incarnation
+/// lives pages tt000000000's exit twice, at tv000000000's restore and at tt000000000's close.
 #[test]
 fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restore_names() {
     let face = |node: &str, sid: &str| format!("/f/f1/pub/{node}/{sid}/ev");
@@ -3597,25 +3676,33 @@ fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restor
         };
         let mut want = Vec::new();
         feed(&mut n, &row("n-a", "node"), b"v=1 t=1 state=live inc=1");
-        feed(&mut n, &row("n-a", "s-q"), b"v=1 t=1 inc=1 state=live");
+        feed(
+            &mut n,
+            &row("n-a", "tq000000000"),
+            b"v=1 t=1 inc=1 state=live",
+        );
         for b in &waiting {
-            let at = feed(&mut n, &face("n-a", "s-q"), b.as_bytes());
+            let at = feed(&mut n, &face("n-a", "tq000000000"), b.as_bytes());
             if b.contains("out=fail") && tag == "any" {
                 want.push(at);
             }
         }
-        feed(&mut n, &row("n-a", "s-q"), b"v=1 t=2 inc=1 state=exited");
+        feed(
+            &mut n,
+            &row("n-a", "tq000000000"),
+            b"v=1 t=2 inc=1 state=exited",
+        );
         feed(
             &mut n,
             &row("n-a", "node"),
             b"v=1 t=2 state=away inc=1 fabric=disconnected",
         );
         feed(&mut n, &row("n-a", "node"), b"v=1 t=3 state=live inc=2");
-        for b in restore_of("s-q") {
-            feed(&mut n, &face("n-a", "s-z"), b.as_bytes());
+        for b in restore_of("tq000000000") {
+            feed(&mut n, &face("n-a", "tz000000000"), b.as_bytes());
         }
         for b in &waiting {
-            feed(&mut n, &face("n-a", "s-q"), b.as_bytes());
+            feed(&mut n, &face("n-a", "tq000000000"), b.as_bytes());
         }
         assert_eq!(
             fired_offsets(&fired),
@@ -3623,26 +3710,34 @@ fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restor
             "{tag}: a quit's relaunch pages no exit for the session it withdrew"
         );
         assert_eq!(
-            standing_words(&n, &face("n-a", "s-q")),
+            standing_words(&n, &face("n-a", "tq000000000")),
             Vec::<&str>::new(),
             "{tag}: its row alone clears its pairs"
         );
 
         feed(&mut n, &row("n-b", "node"), b"v=1 t=1 state=live inc=1");
-        feed(&mut n, &row("n-b", "s-t"), b"v=1 t=1 inc=1 state=live");
+        feed(
+            &mut n,
+            &row("n-b", "tt000000000"),
+            b"v=1 t=1 inc=1 state=live",
+        );
         for b in &tab_open {
-            feed(&mut n, &face("n-b", "s-t"), b.as_bytes());
+            feed(&mut n, &face("n-b", "tt000000000"), b.as_bytes());
         }
-        for b in restore_of("s-t") {
-            feed(&mut n, &face("n-b", "s-u"), b.as_bytes());
+        for b in restore_of("tt000000000") {
+            feed(&mut n, &face("n-b", "tv000000000"), b.as_bytes());
         }
         for b in &tab_close {
-            let at = feed(&mut n, &face("n-b", "s-t"), b.as_bytes());
+            let at = feed(&mut n, &face("n-b", "tt000000000"), b.as_bytes());
             if b.contains(" op=close node=- ") {
                 want.push(at);
             }
         }
-        feed(&mut n, &row("n-b", "s-t"), b"v=1 t=2 inc=1 state=exited");
+        feed(
+            &mut n,
+            &row("n-b", "tt000000000"),
+            b"v=1 t=2 inc=1 state=exited",
+        );
         assert_eq!(
             fired_offsets(&fired),
             want,
@@ -3653,7 +3748,7 @@ fn a_quits_relaunch_and_a_reopened_tab_page_no_exit_for_the_session_their_restor
             said.lines()
                 .filter(|l| l.starts_with("exited "))
                 .collect::<Vec<_>>(),
-            ["exited  s-t"],
+            ["exited  tt000000000"],
             "{tag}: {said}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3670,7 +3765,7 @@ fn a_restore_naming_a_session_whose_close_reached_the_bus_pages_nothing_more() {
     s.turn();
     s.exit();
     let closing = s.bodies();
-    let restore = restore_of("s-x");
+    let restore = restore_of("tx000000000");
     for (tag, sel) in [
         ("exited", Sel::Need(Some(vec!["exited"]))),
         ("any", Sel::Need(None)),
@@ -3697,7 +3792,7 @@ fn a_restore_naming_a_session_whose_close_reached_the_bus_pages_nothing_more() {
             "PRECONDITION: one session close: {closing:?}"
         );
         for b in &restore {
-            feed(&mut n, "/f/f1/pub/n-a/s-z/ev", b.as_bytes());
+            feed(&mut n, "/f/f1/pub/n-a/tz000000000/ev", b.as_bytes());
         }
         assert_eq!(
             fired_offsets(&fired),
@@ -3710,16 +3805,16 @@ fn a_restore_naming_a_session_whose_close_reached_the_bus_pages_nothing_more() {
 }
 
 /// A CLEAN QUIT'S CLOSE AND ITS RELAUNCH PAGE NOTHING; A CRASH PAGES ITS EXIT ONCE (fix unit
-/// Q1). On n-a, s-q pages a failure and waits in a turn, and its aterm quits cleanly: its
+/// Q1). On n-a, tq000000000 pages a failure and waits in a turn, and its aterm quits cleanly: its
 /// close `out=app-quit` reaches the bus before the bridge's `bye quit`, with the bridge's
 /// withdrawal after it (`exited` under `inc=1`) or with none (a withdrawal that never
 /// landed); the node's will fires as the bridge goes, the node relaunches under `inc=2`, and
-/// s-z's restore names s-q: nothing pages for s-q but its failure, and none of its pairs
-/// stands. On n-c, s-c pages the same failure and waits, and its aterm crashes (no close, no
-/// withdrawal); the node relaunches, and s-w's restore names s-c: `exited gone s-c` pages
+/// tz000000000's restore names tq000000000: nothing pages for tq000000000 but its failure, and none of its pairs
+/// stands. On n-c, tc000000000 pages the same failure and waits, and its aterm crashes (no close, no
+/// withdrawal); the node relaunches, and tw000000000's restore names tc000000000: `exited gone tc000000000` pages
 /// once. Under bare `--on need` and `need:exited`. NEGATIVE CONTROLS, run: a watch that pages
-/// a quit's close as any other close pages `exited` at s-q's close; one that pages no
-/// `exited` at all pages nothing for s-c.
+/// a quit's close as any other close pages `exited` at tq000000000's close; one that pages no
+/// `exited` at all pages nothing for tc000000000.
 #[test]
 fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_once() {
     let face = |node: &str, sid: &str| format!("/f/f1/pub/{node}/{sid}/ev");
@@ -3760,7 +3855,7 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                 off
             };
             let mut want = Vec::new();
-            for (node, sid) in [("n-a", "s-q"), ("n-c", "s-c")] {
+            for (node, sid) in [("n-a", "tq000000000"), ("n-c", "tc000000000")] {
                 feed(&mut n, &row(node, "node"), b"v=1 t=1 state=live inc=1");
                 feed(&mut n, &row(node, sid), b"v=1 t=1 inc=1 state=live");
                 for b in &waiting {
@@ -3771,10 +3866,14 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                 }
             }
             for b in &quit {
-                feed(&mut n, &face("n-a", "s-q"), b.as_bytes());
+                feed(&mut n, &face("n-a", "tq000000000"), b.as_bytes());
             }
             if withdrawn {
-                feed(&mut n, &row("n-a", "s-q"), b"v=1 t=2 inc=1 state=exited");
+                feed(
+                    &mut n,
+                    &row("n-a", "tq000000000"),
+                    b"v=1 t=2 inc=1 state=exited",
+                );
             }
             for node in ["n-a", "n-c"] {
                 feed(
@@ -3784,8 +3883,8 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                 );
                 feed(&mut n, &row(node, "node"), b"v=1 t=3 state=live inc=2");
             }
-            for b in restore_of("s-q") {
-                feed(&mut n, &face("n-a", "s-z"), b.as_bytes());
+            for b in restore_of("tq000000000") {
+                feed(&mut n, &face("n-a", "tz000000000"), b.as_bytes());
             }
             assert_eq!(
                 fired_offsets(&fired),
@@ -3794,12 +3893,12 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                  nothing"
             );
             assert_eq!(
-                standing_words(&n, &face("n-a", "s-q")),
+                standing_words(&n, &face("n-a", "tq000000000")),
                 Vec::<&str>::new(),
                 "{tag}, withdrawn {withdrawn}: the quit's close leaves no pair standing"
             );
-            for b in restore_of("s-c") {
-                let at = feed(&mut n, &face("n-c", "s-w"), b.as_bytes());
+            for b in restore_of("tc000000000") {
+                let at = feed(&mut n, &face("n-c", "tw000000000"), b.as_bytes());
                 if b.contains(" k=restore ") {
                     want.push(at);
                 }
@@ -3814,7 +3913,7 @@ fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_
                 said.lines()
                     .filter(|l| l.starts_with("exited "))
                     .collect::<Vec<_>>(),
-                ["exited gone s-c"],
+                ["exited gone tc000000000"],
                 "{tag}, withdrawn {withdrawn}: {said}"
             );
             let _ = std::fs::remove_dir_all(&dir);
@@ -3850,7 +3949,10 @@ fn a_derived_exit_stands_through_later_foreign_records_and_its_real_close() {
             .max()
             .expect("a mirror head");
         bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=1 state=live inc=1");
-        bus.row("/f/f1/pub/n-a/s-x/presence", "v=1 t=1 inc=1 state=live");
+        bus.row(
+            "/f/f1/pub/n-a/tx000000000/presence",
+            "v=1 t=1 inc=1 state=live",
+        );
         bus.publish(NEED_FACE, waiting);
         bus.row(
             "/f/f1/pub/n-a/node/presence",
@@ -3858,7 +3960,7 @@ fn a_derived_exit_stands_through_later_foreign_records_and_its_real_close() {
         );
         bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=3 state=live inc=2");
         let restored = offset_of(
-            &bus.publish("/f/f1/pub/n-a/s-z/ev", restore_of("s-x")),
+            &bus.publish("/f/f1/pub/n-a/tz000000000/ev", restore_of("tx000000000")),
             &[" k=restore "],
         );
         let state = base.join("follow");
@@ -4013,7 +4115,10 @@ fn a_dead_sessions_derived_exit_pages_nothing_again_after_a_restart_or_a_late_st
     let sock = bus.sock.clone();
     let waiting = failed_then_waiting();
     bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=1 state=live inc=1");
-    bus.row("/f/f1/pub/n-a/s-x/presence", "v=1 t=1 inc=1 state=live");
+    bus.row(
+        "/f/f1/pub/n-a/tx000000000/presence",
+        "v=1 t=1 inc=1 state=live",
+    );
     let failed = offset_of(&bus.publish(NEED_FACE, waiting.clone()), &["out=fail"]);
     bus.row(
         "/f/f1/pub/n-a/node/presence",
@@ -4021,7 +4126,7 @@ fn a_dead_sessions_derived_exit_pages_nothing_again_after_a_restart_or_a_late_st
     );
     bus.row("/f/f1/pub/n-a/node/presence", "v=1 t=3 state=live inc=2");
     let restored = offset_of(
-        &bus.publish("/f/f1/pub/n-a/s-z/ev", restore_of("s-x")),
+        &bus.publish("/f/f1/pub/n-a/tz000000000/ev", restore_of("tx000000000")),
         &[" k=restore "],
     );
     let (follow, late) = (base.join("follow"), base.join("late"));
@@ -4044,7 +4149,7 @@ fn a_dead_sessions_derived_exit_pages_nothing_again_after_a_restart_or_a_late_st
     );
     bus.publish(NEED_FACE, vec![waiting[0].clone()]);
     bus.publish(
-        "/f/f1/pub/n-a/s-x/presence",
+        "/f/f1/pub/n-a/tx000000000/presence",
         vec!["v=1 t=4 inc=2 state=exited".to_string()],
     );
     assert_eq!(
@@ -4305,7 +4410,7 @@ fn a_rise_in_a_session_older_than_the_warm_window_pages_once() {
         "PRECONDITION: the session's start and its first snapshot"
     );
     for _ in 0..crate::notify_need::WARM_WINDOW + 10 {
-        bus.row("/f/f1/pub/n-a/s-z/filler", "v=1 t=1");
+        bus.row("/f/f1/pub/n-a/tz000000000/filler", "v=1 t=1");
     }
     let state = base.join("state");
     let run = || need_once(&sock, &state, Sel::Need(None), Since::Start);
@@ -4405,7 +4510,10 @@ fn a_nodes_will_keeps_its_sessions_needs_and_a_reattach_pages_nothing_again() {
         let sock = bus.sock.clone();
         let state = base.join("state");
         let run = || need_once(&sock, &state, Sel::Need(None), Since::Start);
-        let (node, session) = ("/f/f1/pub/n-a/node/presence", "/f/f1/pub/n-a/s-x/presence");
+        let (node, session) = (
+            "/f/f1/pub/n-a/node/presence",
+            "/f/f1/pub/n-a/tx000000000/presence",
+        );
         bus.row(node, "v=1 t=1 state=live inc=1");
         bus.row(session, "v=1 t=1 inc=1 state=live");
         let mut s = Needs::open();
@@ -4606,7 +4714,7 @@ fn the_standing_stores_bound_drops_no_face_the_watch_holds() {
         [NEED_FACE],
         "PRECONDITION: the face is the oldest subject written"
     );
-    let other = |i: usize| format!("/f/f1/pub/n-b/s-{i}/presence");
+    let other = |i: usize| format!("/f/f1/pub/n-b/t{i:010}/presence");
     n.standing
         .extend((1..STANDING_KEEP).map(|i| (other(i), "x".to_string())));
     n.set_standing(&sel.key(), off, &other(STANDING_KEEP), Some("x"));
@@ -4671,7 +4779,7 @@ fn a_need_whose_page_failed_or_was_dropped_pages_at_its_next_record_after_a_rest
     );
     assert_eq!(run(&failing), once, "once: it stands now");
 
-    let y_face = "/f/f1/pub/n-a/s-y/ev";
+    let y_face = "/f/f1/pub/n-a/ty000000000/ev";
     let mut y = Needs::open();
     let cmd = y.cmd_open();
     y.cmd_close(cmd, aterm_slog::RunOut::Fail);
@@ -4688,7 +4796,7 @@ fn a_need_whose_page_failed_or_was_dropped_pages_at_its_next_record_after_a_rest
     assert_eq!(
         fired_lines(&fired),
         budget,
-        "PRECONDITION: s-x's failure spends the budget and --rate drops s-y's"
+        "PRECONDITION: tx000000000's failure spends the budget and --rate drops ty000000000's"
     );
     y.quiet();
     let quiet = bus.publish(y_face, y.bodies());
@@ -5190,7 +5298,7 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
         Flush::Ordered,
     )
     .unwrap();
-    from.set_standing(&[("/f/f/pub/n-a/s-a/presence".into(), "help".into())])
+    from.set_standing(&[("/f/f/pub/n-a/ta000000000/presence".into(), "help".into())])
         .unwrap();
     let logs_store = Store::at(dir.path().join("target"))
         .unwrap()
@@ -5359,7 +5467,10 @@ fn an_unreadable_standing_file_keeps_the_journals_standing_values() {
     let from = Store::at(dir.path().join("from")).unwrap();
     std::fs::create_dir_all(from.root.join("cur")).unwrap();
     from.set_cursor("attention", 9).unwrap();
-    let rows = vec![("/f/f1/pub/n-a/s-one/presence".to_owned(), "key".to_owned())];
+    let rows = vec![(
+        "/f/f1/pub/n-a/t0ne0000000/presence".to_owned(),
+        "key".to_owned(),
+    )];
     from.set_standing(&rows).unwrap();
     std::fs::create_dir(from.root.join(journal::STANDING)).unwrap();
     assert_eq!(from.standing(), rows);
@@ -5400,7 +5511,7 @@ fn an_unreadable_standing_file_keeps_the_journals_standing_values() {
     );
     std::fs::write(
         from.root.join(journal::STANDING),
-        "/f/f1/pub/n-a/s-two/presence other\n",
+        "/f/f1/pub/n-a/ttw00000000/presence other\n",
     )
     .unwrap();
     assert_ne!(
@@ -5591,15 +5702,15 @@ fn a_drop_flood_writes_bytes_in_proportion_to_its_drops() {
             }
             let dir = scratch(&format!("drop-flood-{mutant}-{full}"));
             let (mut n, fired) = appending(&dir, 1, "");
-            n.clock = Some(Instant::now());
-            feed(&mut n, 1, "s-0", "v=1 t=1 attention=paged");
+            n.wall_clock = Some(1_000);
+            feed(&mut n, 1, "t0000000000", "v=1 t=1 attention=paged");
             if full {
                 let mut off = 2;
                 while n.root_file.steps + 100 < n.root_file.bound.steps {
                     feed(
                         &mut n,
                         off,
-                        &format!("s-{off}"),
+                        &format!("t{off:010}"),
                         "v=1 t=1 attention=filling",
                     );
                     off += 1;
@@ -5614,7 +5725,12 @@ fn a_drop_flood_writes_bytes_in_proportion_to_its_drops() {
             let (dropped, steps) = (n.counts.dropped, n.root_file.steps);
             let wrote = bytes_of(|| {
                 for off in 100_000..100_000 + DROPS {
-                    feed(&mut n, off, &format!("s-{off}"), "v=1 t=1 attention=flood");
+                    feed(
+                        &mut n,
+                        off,
+                        &format!("t{off:010}"),
+                        "v=1 t=1 attention=flood",
+                    );
                 }
             });
             assert_eq!(
@@ -5686,11 +5802,11 @@ fn a_flood_of_distinct_need_drops_writes_bytes_in_proportion_to_its_drops() {
     for mutant in [false, true] {
         let dir = scratch(&format!("need-drop-flood-{mutant}"));
         let (mut n, fired) = appending(&dir, 1, "");
-        n.clock = Some(Instant::now());
+        n.wall_clock = Some(1_000);
         let sel = Sel::Need(None);
         n.cfg.on = vec![sel.clone()];
         n.standing_whole = mutant;
-        let face = |i: u64| format!("/f/f1/pub/n-a/s-{i}/ev");
+        let face = |i: u64| format!("/f/f1/pub/n-a/t{i:010}/ev");
         let mut off = 0;
         let mut first = Needs::open();
         let cmd = first.cmd_open();
@@ -5769,8 +5885,8 @@ fn a_frozen_line_format_journal_migrates_and_its_pending_page_runs_again() {
         ),
         "the stamps and the count migrated"
     );
-    feed(&mut n, 1, "s-a", "v=1 t=9 inc=2 attention=again");
-    feed(&mut n, 5, "s-e", "v=1 t=9 attention=pending");
+    feed(&mut n, 1, "ta000000000", "v=1 t=9 inc=2 attention=again");
+    feed(&mut n, 5, "te000000000", "v=1 t=9 attention=pending");
     assert_eq!(
         fired_offsets(&fired),
         [5],
@@ -5811,7 +5927,7 @@ fn a_distinct_need_drops_cursor_is_a_step_of_the_change_it_orders() {
         n.cursor_every = Duration::MAX;
         n.cursor_file = mutant;
         n.take(Notice::Log(0, strict_log())).expect("log");
-        let face = |i: u64| format!("/f/f1/pub/n-a/s-{i}/ev");
+        let face = |i: u64| format!("/f/f1/pub/n-a/t{i:010}/ev");
         let mut off = 0;
         let mut feed = |n: &mut Notifier, i: u64| {
             let mut s = Needs::open();

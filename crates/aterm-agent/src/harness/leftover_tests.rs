@@ -70,3 +70,39 @@ fn a_token_reads_in_either_shape() {
         assert_eq!(token_of(bad), None, "{bad:?}");
     }
 }
+
+/// The policy's keep lines read a token as this harness does: a word is token-shaped
+/// (`alab_policy::needs::token_shaped`) exactly where it names a process ([`token_of`]).
+#[test]
+fn the_policys_token_shape_is_the_harness_token() {
+    for word in [
+        "2606@1792098840004410:3",
+        "2606@1792098840004410",
+        "2@0",
+        "2147483647@18446744073709551615:0",
+        "2606",
+        "it",
+        "2606@",
+        "@1",
+        "1@5",
+        "0@5",
+        "2606@01",
+        "02606@5",
+        "2606@5:",
+        "2606@5:03",
+        "-2@5",
+        "2@5:-1",
+        "2@5:1:2",
+        "2147483648@5",
+        "2@18446744073709551616",
+        "2@5:2147483648",
+        "2@5@6",
+        "2:3@5",
+    ] {
+        assert_eq!(
+            alab_policy::needs::token_shaped(word),
+            token_of(word).is_some(),
+            "{word:?}"
+        );
+    }
+}

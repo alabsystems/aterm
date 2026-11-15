@@ -764,11 +764,13 @@ fn insert_build_hop(
 }
 
 /// Render the complete maintained shim with this explicit helper and no capability probe.
-/// The caller compares bytes; a backend hint alone never selects the actual route.
+/// The caller compares bytes; a backend hint alone never selects the actual route. It is also
+/// the text `verify candidate-shim` judges a tree by: what this atpkg would lay for `helper`,
+/// with no query of it and no filesystem write.
 /// # Errors
 /// The target or its maintained placement block does not support a build hop.
 #[cfg(target_os = "macos")]
-pub(crate) fn canonical_build_hop_shim(
+pub fn canonical_build_hop_shim(
     shim: &Path,
     target: &Path,
     env: &crate::shim_env::ShimEnv,
@@ -784,20 +786,6 @@ pub(crate) fn canonical_build_hop_shim(
     insert_build_hop(&mut body, tool, target, helper, route.as_deref())
         .ok_or_else(|| io::Error::other("maintained build placement block unavailable"))?;
     Ok(crate::lay::Executable::new(shim, body))
-}
-
-/// Render the production build hop for an isolated native integration fixture.
-/// This performs no capability query or filesystem write.
-/// # Errors
-/// The target or maintained placement does not support a build hop.
-#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
-pub fn build_hop_fixture(
-    shim: &Path,
-    target: &Path,
-    env: &crate::shim_env::ShimEnv,
-    helper: &Path,
-) -> io::Result<crate::lay::Executable> {
-    canonical_build_hop_shim(shim, target, env, helper)
 }
 
 /// The `agents/` twin's shim.
@@ -887,10 +875,56 @@ pub fn shim_env_of(shim: &Path) -> crate::shim_env::ShimEnv {
     }
 }
 
-/// Replace the current process image with `command` (`execve`).
+/// Replace the current process image with `command` (`execve`). On macOS the exec is made only
+/// with this process's exec gate closed (`aterm_sysprobe::exec_gate`): an `execve` waits, with
+/// no way to end the wait, for every other thread of its process to end, and a thread still in a
+/// process-table read waits the same way on another process's exec. Where such a read is still
+/// in the kernel after the gate's bound, `command` runs as this process's child instead
+/// (`run_in_place_of_exec`) and this process exits as it ended.
 pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
     use std::os::unix::process::CommandExt as _;
+    // Held until the exec has returned, which only a failed one does: the gate then opens again.
+    #[cfg(target_os = "macos")]
+    let _closed = match aterm_sysprobe::exec_gate::close(aterm_sysprobe::exec_gate::SETTLES_WITHIN)
+    {
+        Ok(closed) => closed,
+        Err(still) => return run_in_place_of_exec(command, still),
+    };
     command.exec()
+}
+
+/// [`exec_or_run`] where it may not exec: `command` as a child that has what the exec would have
+/// given it (this process's environment and every descriptor of it that is not close-on-exec,
+/// `InheritEverything`), SIGTERM and SIGHUP passed on to it and the terminal's interrupt and
+/// quit keys left to it ([`stand_aside`]); this process then leaves as the child left
+/// ([`leave_like`]). The command is the caller's own `std` one, spawned as it stands (its
+/// `arg0` has no getter to rebuild it from), under the spawn lock every spawn holds. Returns
+/// only where the child did not start or its wait failed: the error.
+#[cfg(target_os = "macos")]
+fn run_in_place_of_exec(
+    command: &mut aterm_uds::spawnfd::StdCommand,
+    still: aterm_sysprobe::exec_gate::StillReading,
+) -> io::Error {
+    use aterm_uds::spawnfd::InheritEverything as _;
+    eprintln!(
+        "atpkg: {still}; an exec would wait on it, so {} runs as a child of this process",
+        command.get_program().to_string_lossy()
+    );
+    let forwarding = arm_forwarding();
+    command.inherit_everything();
+    let spawned = {
+        let _spawning = aterm_uds::spawn_lock::spawning();
+        command.spawn()
+    };
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => return error,
+    };
+    let pid = libc::pid_t::try_from(child.id()).unwrap_or(0);
+    match stand_aside(pid, || child.wait(), forwarding) {
+        Ok(status) => std::process::exit(i32::from(leave_like(status))),
+        Err(error) => error,
+    }
 }
 
 /// SIGTERM and SIGHUP armed to pass on to the child [`wait_standing_aside`] waits on, from before that child is spawned ([`arm_forwarding`]).
@@ -988,8 +1022,17 @@ pub fn wait_standing_aside(
     child: &mut aterm_uds::spawnfd::TransparentChild,
     forwarding: Forwarding,
 ) -> io::Result<std::process::ExitStatus> {
-    use std::sync::atomic::Ordering;
     let pid = libc::pid_t::try_from(child.id()).unwrap_or(0);
+    stand_aside(pid, || child.wait(), forwarding)
+}
+
+/// [`wait_standing_aside`] for the child `pid`, waited for by `wait`.
+fn stand_aside(
+    pid: libc::pid_t,
+    wait: impl FnOnce() -> io::Result<std::process::ExitStatus>,
+    forwarding: Forwarding,
+) -> io::Result<std::process::ExitStatus> {
+    use std::sync::atomic::Ordering;
     FORWARD_TO.store(pid, Ordering::SeqCst);
     let held = HELD.swap(0, Ordering::SeqCst);
     if held != 0 && pid > 0 {
@@ -1004,7 +1047,7 @@ pub fn wait_standing_aside(
             (libc::SIGQUIT, libc::signal(libc::SIGQUIT, libc::SIG_IGN)),
         ]
     };
-    let status = child.wait();
+    let status = wait();
     let _ = FORWARD_TO.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
     for (sig, was) in previous {
         if was != libc::SIG_ERR {
@@ -1060,12 +1103,18 @@ extern "C" fn forward_to_child(sig: libc::c_int) {
 /// Leave this process the way `status` says its child left.
 #[must_use = "return or inspect the child exit status"]
 pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCode {
+    std::process::ExitCode::from(leave_like(status))
+}
+
+/// [`exit_code_like`]'s code: the child's own, or, for one a signal ended, that signal raised
+/// here where its default action ends a process with no core, else `128 + n`.
+fn leave_like(status: std::process::ExitStatus) -> u8 {
     use std::os::unix::process::ExitStatusExt as _;
     if let Some(code) = status.code() {
-        return std::process::ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1));
+        return u8::try_from(code & 0xff).unwrap_or(1);
     }
     let Some(sig) = status.signal() else {
-        return std::process::ExitCode::from(1);
+        return 1;
     };
     if matches!(
         sig,
@@ -1082,7 +1131,7 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
             libc::raise(sig);
         }
     }
-    std::process::ExitCode::from(u8::try_from(128 + sig).unwrap_or(255))
+    u8::try_from(128 + sig).unwrap_or(255)
 }
 
 #[cfg(any(test, debug_assertions))]

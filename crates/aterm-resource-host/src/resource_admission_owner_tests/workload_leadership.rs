@@ -15,7 +15,7 @@ fn calls(owner: &mut Owner) -> [io::Error; 2] {
         owner
             .workload_phase(
                 peer,
-                "s-acde",
+                "s-0000000000000000acde",
                 &phase::Request {
                     key: bank::Key {
                         root_attempt: [1; 16],
@@ -30,7 +30,7 @@ fn calls(owner: &mut Owner) -> [io::Error; 2] {
         owner
             .workload_census(
                 peer,
-                "s-acde",
+                "s-0000000000000000acde",
                 &census::Request {
                     root_attempt: [1; 16],
                     invocation_sha256: [2; 32],

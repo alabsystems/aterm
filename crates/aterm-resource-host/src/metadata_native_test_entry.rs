@@ -2,13 +2,20 @@
 // Copyright 2026 Andrew Yates
 
 //! The one early entry of this crate's library test image. It runs the
-//! production internal exec role, then the native metadata fixture's roles,
+//! closed-image qualification, production internal exec role, then metadata fixture roles,
 //! before libtest parses argv, without a helper executable. Only this image
 //! mounts it: an integration image that compiles the same fixture modules
 //! keeps its own argv.
 
 extern "C" fn enter() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Some(code) = crate::native_fixture::qualification(&args) {
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            101
+        });
+    }
     if matches!(args.as_slice(), [argument] if argument == "--resource-capabilities")
         && let Some(marker) = std::env::var_os("ATERM_TEST_RECIPE_PROBE_MARKER")
     {

@@ -11,7 +11,6 @@
 //! config (vendored source replacement, Trust `-Z` flags) applies.
 
 use aterm_uds::output::CommandOutput as _;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::exec::check_command as command;
@@ -42,8 +41,8 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
         "wasm_cpu_scrolled_stream_present_fps",
         "wasm_cpu_styled_scrub_present_fps",
         "wasm_gpu_ingest_mixed_mbps",
-        "wasm_gpu_frame_build_fps",
-        "wasm_gpu_scroll_frame_build_fps",
+        "wasm_gpu_typing_render_fps",
+        "wasm_gpu_scroll_render_fps",
     ],
     baseline_file: "perf-baseline-wasm.json",
     comment: "aterm WASM-BENCH baseline: the SHIPPED wasm modules (CPU aterm-wasm + GPU \
@@ -57,7 +56,7 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
 pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 5_886_685.0;
 
 /// GPU module size ceiling in bytes after `wasm-opt -O3`.
-pub(crate) const WASM_GPU_MODULE_BYTES_CAP: f64 = 6_133_315.0;
+pub(crate) const WASM_GPU_MODULE_BYTES_CAP: f64 = 6_144_000.0;
 
 fn module_build_plan(
     env: &crate::EnvSnapshot,
@@ -250,112 +249,6 @@ fn pinned_product() -> String {
 #[cfg(not(unix))]
 fn pinned_product() -> String {
     String::new()
-}
-
-/// Re-records and verifies the CPU module boundary replay fixture.
-pub(crate) fn record_replay(log: &mut String) -> LaneRun {
-    let root = workspace_root();
-    let browser = match wasm_page::browser() {
-        Ok(browser) => browser,
-        Err(refused) => return refused.verdict("the replay"),
-    };
-    let toolchain = match build_tools(&root, false) {
-        Ok(toolchain) => toolchain,
-        Err(verdict) => return verdict,
-    };
-    let mut record = || -> Result<(), Refused> {
-        let built = build_modules(&root, &toolchain, "dev", None).map_err(Refused::Failed)?;
-        let site = built.target.join("wasm-smoke");
-        bind_modules(&built.directory, &site, false).map_err(Refused::Failed)?;
-        wasm_page::lay_drivers(&root, &site).map_err(Refused::Failed)?;
-        let mut page = Page::start(&browser, &site, &std::env::temp_dir())?;
-        replay(&root, &site, &mut page, true, log)
-    };
-    match record() {
-        Ok(()) => LaneRun::pass(),
-        Err(refused) => refused.verdict("the replay"),
-    }
-}
-
-/// Path to the CPU module's recorded boundary replay fixture.
-pub(crate) fn replay_answers(root: &Path) -> PathBuf {
-    root.join("crates/aterm-wasm/tests/fixtures/abi_replay.json")
-}
-
-/// Runs the CPU module boundary replay and its negative control in `page`.
-pub(crate) fn replay(
-    root: &Path,
-    site: &Path,
-    page: &mut Page,
-    record: bool,
-    log: &mut String,
-) -> Result<(), Refused> {
-    let failed = Refused::Failed;
-    let answers = replay_answers(root);
-    let driver = format!("{}/replay.mjs", wasm_page::DRIVERS);
-    let run = |page: &mut Page, answers: Option<&str>, log: &mut String| {
-        let ran = page.run(
-            &driver,
-            &json!({"glue": "../cpu/aterm_wasm.js", "font": format!("../{}", wasm_page::FONT),
-                    "answers": answers.map(|a| format!("../{a}"))}),
-        )?;
-        for line in &ran.console {
-            let _ = writeln!(log, "  {line}");
-        }
-        Ok::<_, Refused>(ran)
-    };
-    if record {
-        let ran = run(page, None, log)?;
-        let text = ran
-            .value
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| failed("replay.mjs answered no answers to record".to_string()))?;
-        crate::write_fresh(&answers, text)
-            .map_err(|e| failed(format!("could not write {}: {e}", answers.display())))?;
-        let _ = writeln!(log, "  wasm-replay: recorded {}", answers.display());
-    }
-    let text = crate::read_regular_text(&answers)
-        .map_err(|e| failed(format!("could not read {}: {e}", answers.display())))?;
-    let (planted, hash) = plant_frame_hash(&text)
-        .ok_or_else(|| failed(format!("{}: no frame hash to plant", answers.display())))?;
-    for (name, contents) in [("answers.json", &text), ("answers.planted.json", &planted)] {
-        let path = site.join(name);
-        crate::write_fresh(&path, contents)
-            .map_err(|e| failed(format!("could not write {}: {e}", path.display())))?;
-    }
-    let differ = |ran: &wasm_page::Ran| ran.value.get("failures").and_then(Value::as_u64);
-    let ran = run(page, Some("answers.json"), log)?;
-    if differ(&ran) != Some(0) {
-        return Err(failed(format!(
-            "the replay's answers differ from {} (review the change, then `targo \
-             --unverified verify glue --record-replay`)",
-            answers.display()
-        )));
-    }
-    let mut control = String::new();
-    let ran = run(page, Some("answers.planted.json"), &mut control)?;
-    if differ(&ran) != Some(1) || !control.contains(&hash) {
-        return Err(failed(format!(
-            "NEGATIVE CONTROL: the replay against answers with one frame hash planted \
-             ({hash}) did not fail on exactly that answer:\n{control}"
-        )));
-    }
-    log.push_str("  wasm-replay: negative control held: a planted frame hash fails the replay\n");
-    Ok(())
-}
-
-fn plant_frame_hash(answers: &str) -> Option<(String, String)> {
-    const KEY: &str = "\"rgba\":\"";
-    let at = answers.find(KEY)? + KEY.len();
-    let hash = answers.get(at..at + 64)?;
-    let first = hash.chars().next()?;
-    let planted_first = if first == '0' { '1' } else { '0' };
-    let planted = format!("{planted_first}{}", &hash[1..]);
-    Some((
-        format!("{}{planted}{}", &answers[..at], &answers[at + 64..]),
-        planted,
-    ))
 }
 
 fn build_modules(

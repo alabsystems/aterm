@@ -23,7 +23,6 @@ fn compilation_only_cannot_replace_test_execution_or_release_qualification() {
     for args in [
         vec!["test", "--all", "--compile-only", "--as-release"],
         vec!["test", "--all", "--as-release"],
-        vec!["doc", "--all", "--as-release"],
     ] {
         assert!(super::parse(args).unwrap().as_release);
     }

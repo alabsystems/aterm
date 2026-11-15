@@ -54,12 +54,16 @@
 //!   link reach the window's host on its standard input, never in an argument, and no report
 //!   holds either.
 //! - **Whose account.** `Authorize` is pressed only where the consent page names the account's
-//!   email, or names no address in a store this flow itself signed in as that account (in
-//!   this run, or in an earlier one it recorded, [`Desk::store_is_the_accounts`]). A page
-//!   that names another address, or none in a store nothing recorded, ends the sign-in with
-//!   nothing pressed ([`Stop::WrongAccount`], [`Stop::UnknownSession`]), and the account's
-//!   own store is emptied ([`Desk::forget`]) so its next sign-in starts at the sign-in page:
-//!   that forgets a session in aterm's window alone, and signs nothing out anywhere.
+//!   email, or names no address in a store this flow itself proved is that account's: in this
+//!   run, by verifying the code it read from the account's mailbox or by the mailbox's sign-in
+//!   link signing the store in ([`Progress::proved_here`]), or in an earlier run it recorded
+//!   ([`Desk::store_is_the_accounts`]). Continuing with the account's email proves nothing:
+//!   a code a person typed may be any session's. A page that names another address, or none
+//!   in a store nothing proved, ends the sign-in with nothing pressed ([`Stop::WrongAccount`],
+//!   [`Stop::UnknownSession`]), a page a human check holds included, and the account's own
+//!   store is emptied ([`Desk::forget`]) so its next sign-in starts at the sign-in page: that
+//!   forgets a session in aterm's window alone, and signs nothing out anywhere. Only a run
+//!   that proved the session records the store as the account's ([`Desk::note_signed_in`]).
 //! - **Cloudflare's check is never operated.** A page that is its check is waited on with
 //!   nothing read from its controls, pressed or filled: it may clear by itself, and a person
 //!   at the desk may complete it. One that stands until the deadline ends the sign-in naming
@@ -481,6 +485,15 @@ impl std::fmt::Display for Stop {
     }
 }
 
+/// Why the code page waited for a person where the window had no mailbox to read
+/// ([`VisibleStop::CodeNoMailbox`]).
+pub(super) const NO_MAILBOX_READ: &str = "the window reads no mailbox of the account on this Mac";
+
+/// What the opener records of a stop. The code page's deadline where the window read no
+/// mailbox of the account from the start is [`VisibleStop::CodeNoMailbox`], which holds a token
+/// step; one where it dropped the mailbox it had ([`Stop::MailboxDropped`]: reads that failed,
+/// or an answer it could not use) is an ordinary failure that another try may pass, since a
+/// connection that failed may not fail twice.
 impl From<Stop> for VisibleStop {
     fn from(stop: Stop) -> Self {
         match stop {
@@ -490,6 +503,8 @@ impl From<Stop> for VisibleStop {
             Stop::HumanCheck(host) => Self::HumanCheck(host),
             Stop::WrongAccount => Self::WrongAccount,
             Stop::Closed => Self::Closed,
+            Stop::TimedOut(Phase::CodeNoMailbox) => Self::CodeNoMailbox(NO_MAILBOX_READ.to_owned()),
+            Stop::TimedOut(phase) => Self::Deadline(phase.words().to_owned()),
             other => Self::Failed(other.to_string()),
         }
     }
@@ -642,9 +657,19 @@ impl Progress {
         self.enter(Phase::CodeNoMailbox, desk);
     }
 
-    /// Whether this run signed the window's store in itself.
-    const fn signed_in_here(&self) -> bool {
-        self.continued || self.verified || self.link_opened
+    /// Whether this run proved the window's store's session is the account's by its own acts:
+    /// it verified the code it read from the account's mailbox and set itself, or the
+    /// mailbox's sign-in link signed the store in. Continuing with the account's email is no
+    /// proof: the code a person types after it may be any session's.
+    const fn proved_here(&self) -> bool {
+        self.verified || self.link_opened
+    }
+
+    /// Whether a consent page that names no address may be authorized: this run proved the
+    /// store's session ([`Self::proved_here`]), or an earlier run recorded it
+    /// ([`Desk::store_is_the_accounts`]).
+    fn vouches_unnamed(&self, desk: &dyn Desk) -> bool {
+        self.proved_here() || desk.store_is_the_accounts()
     }
 
     /// Whether the page at `url` shows that the code this run verified was taken: the page
@@ -831,8 +856,13 @@ fn step(
         && facts.check.is_some()
         && facts.disabled.iter().any(|held| Button::Authorize.is(held));
     if did.human_stands {
-        if account_named(&facts.text, run.email) == Account::Other {
-            return Err(Stop::WrongAccount.into());
+        // A page aterm would not authorize once the check cleared ends now: nobody is asked
+        // to complete a check for nothing.
+        match account_named(&facts.text, run.email) {
+            Account::Named => {}
+            Account::Other => return Err(Stop::WrongAccount.into()),
+            Account::Unnamed if did.vouches_unnamed(desk) => {}
+            Account::Unnamed => return Err(Stop::UnknownSession.into()),
         }
         did.bot_host = host;
         did.enter(Phase::HumanCheck, desk);
@@ -840,12 +870,13 @@ fn step(
     }
 
     if shows(Button::Authorize) && !did.authorized {
-        // The page says whose consent this is, or this flow made the store's session itself;
-        // nothing else is authorized, and another account's session is left as it is.
+        // The page says whose consent this is, or this flow proved the store's session is
+        // the account's; nothing else is authorized, and another account's session is left
+        // as it is.
         match account_named(&facts.text, run.email) {
             Account::Named => {}
             Account::Other => return Err(Stop::WrongAccount.into()),
-            Account::Unnamed if did.signed_in_here() || desk.store_is_the_accounts() => {}
+            Account::Unnamed if did.vouches_unnamed(desk) => {}
             Account::Unnamed => return Err(Stop::UnknownSession.into()),
         }
         if desk.press(Button::Authorize, run.email, url)? {
@@ -1075,11 +1106,12 @@ fn steps(run: &SignIn<'_>, desk: &mut dyn Desk, end: Instant) -> Result<Done, St
                 let stepped = step(run, desk, &mut did, &facts, (now, left));
                 if !did.noted
                     && (did.session_made(&facts.url)
-                        || (did.signed_in_here() && matches!(stepped, Ok(Some(_)))))
+                        || (did.proved_here() && matches!(stepped, Ok(Some(_)))))
                 {
-                    // The store's session is the account's from here: a later flow in it
-                    // (the account's token, or this sign-in run again) meets the consent
-                    // page alone.
+                    // The store's session is the account's from here, by this run's own
+                    // proof: a later flow in it (the account's token, or this sign-in run
+                    // again) meets the consent page alone. A run whose code a person typed
+                    // records nothing, whatever page it ended on.
                     desk.note_signed_in();
                     did.noted = true;
                 }
@@ -1794,6 +1826,13 @@ pub(super) fn store_id(account: &str) -> String {
 /// the data store `store` in as its account.
 fn marker_of(records: &Path, store: &str) -> PathBuf {
     records.join("signin-window").join(store)
+}
+
+/// The file, under the accounts store `records`, that says a sign-in in the window signed the
+/// data store of the Claude account `email` in as its account: a held token step reads when it
+/// was written ([`super::token_steps::route_at`]).
+pub(super) fn store_marker(records: &Path, email: &str) -> PathBuf {
+    marker_of(records, &claude_store(email))
 }
 
 /// Takes back the record that the window's store for `email` holds that account's session,

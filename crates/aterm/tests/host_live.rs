@@ -158,7 +158,7 @@ fn status_of(inst: &Instance, sid: &str) -> String {
 fn spawn_tab(inst: &Instance) -> String {
     let body = ctl_ok(inst, &["spawn"]);
     body.split_whitespace()
-        .find(|w| w.starts_with("s-"))
+        .find(|w| aterm_types::tab_id::is_tab_id(w))
         .unwrap_or_else(|| panic!("spawn names its sid: {body}"))
         .to_string()
 }
@@ -851,7 +851,7 @@ fn chose(inst: &Instance, within: Duration) -> String {
     }
     panic!(
         "no CHOSE within {within:?}; journal:\n{}\nharness log:\n{}\n\
-         processes under the instance (pid ppid stat wchan etime command):\n{}",
+         processes under the instance (pid ppid stat command):\n{}",
         journal(inst),
         harness_lines(inst),
         headless_boot::process_tree(inst)
@@ -1621,12 +1621,12 @@ fn write_native_relaunch_fake(inst: &Instance) {
 }
 
 fn launches(inst: &Instance) -> Vec<(u32, String)> {
-    exec_log(inst, "launches.log")
+    exec_log(&inst.tmp, "launches.log")
 }
 
 #[cfg(target_os = "macos")]
 fn probes(inst: &Instance) -> Vec<(u32, String)> {
-    exec_log(inst, "probes.log")
+    exec_log(&inst.tmp, "probes.log")
 }
 
 #[cfg(target_os = "macos")]
@@ -1690,13 +1690,14 @@ fn probed_once(inst: &Instance) {
         assert_eq!(
             logged,
             ["2.1.282 --help"],
-            "the probe the new build ran ({verdicts:?})"
+            "the probe the new build ran ({verdicts:?}); harness log:\n{}",
+            harness_lines(inst)
         );
     }
 }
 
-fn exec_log(inst: &Instance, name: &str) -> Vec<(u32, String)> {
-    std::fs::read_to_string(inst.tmp.join(name))
+fn exec_log(tmp: &Path, name: &str) -> Vec<(u32, String)> {
+    std::fs::read_to_string(tmp.join(name))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| {
@@ -1889,7 +1890,7 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         harness_lines(&inst)
     );
     assert_eq!(
-        exec_log(&inst, "launch-env.log"),
+        exec_log(&inst.tmp, "launch-env.log"),
         [(*old, "0 1 0".to_owned()), (*new, "0 0 1".to_owned())],
         "the relaunched body observed the helper's execution environment, not either cached source"
     );
@@ -2671,10 +2672,13 @@ fn at_the_notice(tag: &str) -> (Instance, PathBuf) {
         |tmp| {
             let clock = tmp.join("typing-clock");
             std::fs::create_dir(&clock).expect("the typing clock");
-            vec![(
-                "ATERM_DEBUG_TYPING_CLOCK",
-                clock.to_string_lossy().into_owned(),
-            )]
+            vec![
+                (
+                    "ATERM_DEBUG_TYPING_CLOCK",
+                    clock.to_string_lossy().into_owned(),
+                ),
+                ("ATERM_LOG", "debug".into()),
+            ]
         },
     );
     let current = stage_upgrade_fake(&inst, "2.1.281", true);
@@ -2778,14 +2782,27 @@ fn a_notice_typed_into_a_starved_agent_lands_whole_and_upgrades_it() {
     let (inst, newer) = at_the_notice("vs");
     std::fs::write(inst.tmp.join("starved-2.1.281"), "").expect("starve the running build");
     land(&inst, &newer);
-    let got = aterm_spec::wait::until_within(
+    let got = aterm_spec::wait::within(
         HANG,
-        "the new build launched after the clock barriers",
+        Duration::from_millis(20),
         || {
             let got = launches(&inst);
             (got.len() >= 2).then_some(got)
         },
-    );
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "the new build did not launch after the clock barriers within {HANG:?}: {:?}\nharness log:\n{}\njournal:\n{}\nworker stack:\n{}",
+            launches(&inst),
+            harness_lines(&inst),
+            journal(&inst),
+            headless_boot::thread_stack(
+                inst.child.id(),
+                &inst.log,
+                Some(&format!("aterm-harness-{}", inst.sid))
+            )
+        )
+    });
     assert_eq!(
         got.len(),
         2,
@@ -2987,11 +3004,11 @@ fn worker_line_of(inst: &Instance, from: Option<&str>) -> String {
     }
 }
 
-/// The lines of two workers of a tab running `line` under bash (the twin's quoted path in it as
-/// `{twin}`), once its tab's status says `ready`: one no session started, whose parent the tab is,
-/// and one the tab's own program starts.
+/// Checks the lines of two workers of a tab running `line` under bash (the twin's quoted path in
+/// it as `{twin}`), once its tab's status says `ready`: one no session started, whose parent the
+/// tab is, and one the tab's own program starts. A mismatch keeps the instance's launch log.
 #[cfg(target_os = "macos")]
-fn worker_of_a_tab_running(tag: &str, line: &str, ready: impl Fn(&str) -> bool) -> [String; 2] {
+fn worker_of_a_tab_running(tag: &str, line: &str, ready: impl Fn(&str) -> bool, expected: &str) {
     let inst = boot_on(tag, "relaunch = false\n", 40, None, true, |tmp| {
         let agents = fake_path(tmp);
         let agents = agents.parent().expect("agents/").display().to_string();
@@ -3022,10 +3039,18 @@ fn worker_of_a_tab_running(tag: &str, line: &str, ready: impl Fn(&str) -> bool) 
         assert_eq!(lead.len(), 1, "the lead's launch alone: {lead:?}");
     }
     until(HANG, "the tab's status", || status(&inst), ready);
-    [
+    let got = [
         worker_line_of(&inst, None),
         worker_line_of(&inst, Some(&inst.sid)),
-    ]
+    ];
+    assert_eq!(
+        got,
+        [expected; 2],
+        "{tag}: launches: {:?}\nharness log:\n{}\ninstance log:\n{}",
+        launches(&inst),
+        harness_lines(&inst),
+        std::fs::read_to_string(inst.tmp.join("state/logs/aterm.log")).unwrap_or_default()
+    );
 }
 
 /// A lead behind a program that leads its process group runs Claude Code all the same, and its
@@ -3034,21 +3059,17 @@ fn worker_of_a_tab_running(tag: &str, line: &str, ready: impl Fn(&str) -> bool) 
 #[cfg(target_os = "macos")]
 #[test]
 fn a_worker_of_a_lead_behind_a_wrapper_starts_at_the_floor() {
-    assert_eq!(
-        worker_of_a_tab_running(
-            "ywt",
-            "/usr/bin/time -p {twin} --permission-mode default",
-            |s| field(s, "program") == Some("time"),
-        ),
-        ["2.1.281 --permission-mode auto -- the task"; 2]
+    worker_of_a_tab_running(
+        "ywt",
+        "/usr/bin/time -p {twin} --permission-mode default",
+        |s| field(s, "program") == Some("time"),
+        "2.1.281 --permission-mode auto -- the task",
     );
-    assert_eq!(
-        worker_of_a_tab_running(
-            "yws",
-            "/bin/sh -c \"{twin} --permission-mode default; :\"",
-            |s| field(s, "program") == Some("sh"),
-        ),
-        ["2.1.281 --permission-mode auto -- the task"; 2]
+    worker_of_a_tab_running(
+        "yws",
+        "/bin/sh -c \"{twin} --permission-mode default; :\"",
+        |s| field(s, "program") == Some("sh"),
+        "2.1.281 --permission-mode auto -- the task",
     );
 }
 
@@ -3085,11 +3106,11 @@ fn a_worker_of_a_lead_that_could_not_be_read_stays_out_of_the_twins_yolo() {
         "cp {{build}} ../cli.js && '{}' \"$PWD/../cli.js\"",
         node.display()
     );
-    assert_eq!(
-        worker_of_a_tab_running("ywn", &line, |s| {
-            field(s, "program") == Some("node") && field(s, "agent").is_some_and(|a| a != "-")
-        }),
-        ["2.1.281 -- the task"; 2]
+    worker_of_a_tab_running(
+        "ywn",
+        &line,
+        |s| field(s, "program") == Some("node") && field(s, "agent").is_some_and(|a| a != "-"),
+        "2.1.281 -- the task",
     );
 }
 
@@ -3098,9 +3119,11 @@ fn a_worker_of_a_lead_that_could_not_be_read_stays_out_of_the_twins_yolo() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_worker_of_a_tab_with_no_claude_code_takes_the_launch_default() {
-    assert_eq!(
-        worker_of_a_tab_running("ywp", "", |s| field(s, "program") == Some("bash")),
-        ["2.1.281 --dangerously-skip-permissions -- the task"; 2]
+    worker_of_a_tab_running(
+        "ywp",
+        "",
+        |s| field(s, "program") == Some("bash"),
+        "2.1.281 --dangerously-skip-permissions -- the task",
     );
 }
 
@@ -3247,7 +3270,7 @@ fn hand_evidence(inst: &Instance) -> String {
     let sel = format!("@{}", inst.sid);
     format!(
         "status: {}\nscreen:\n{}\nlaunches: {:?}\nharness log:\n{}\njournal:\n{}\n\
-         processes under the instance (pid ppid stat wchan etime command):\n{}",
+         processes under the instance (pid ppid stat command):\n{}",
         look(&[&sel, "status"]),
         look(&[&sel, "text"]),
         launches(inst),
@@ -3257,6 +3280,68 @@ fn hand_evidence(inst: &Instance) -> String {
     )
 }
 
+// A hand can precede the replacement. The fake's launch receipt precedes its
+// registration hold, so both observations are needed before input meets that hold.
+#[cfg(target_os = "macos")]
+fn fresh_launch_is_held(status: &str, launches: &[(u32, String)]) -> bool {
+    field(status, "hand").is_some_and(|hand| hand.starts_with("lease:aterm-harness@"))
+        && matches!(
+            launches,
+            [(old_pid, old_args), (new_pid, new_args)]
+                if old_pid != new_pid
+                    && old_args == "2.1.281 --model opus"
+                    && new_args == "2.1.282 --model opus"
+        )
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_harness_hand_waits_for_the_fresh_agents_launch_receipt() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-collision-receipts-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("receipt scratch");
+    let path = dir.path().join("launches.log");
+    let hand = "OK schema=1 hand=lease:aterm-harness@9001";
+    for (what, second) in [
+        ("only the original launch", ""),
+        ("partial PID", "41"),
+        ("no arguments yet", "4102 "),
+        ("partial version", "4102 2.1."),
+        ("partial arguments", "4102 2.1.282 --model op"),
+        ("the original PID", "4101 2.1.282 --model opus"),
+        ("the original version", "4102 2.1.281 --model opus"),
+        ("another model", "4102 2.1.282 --model sonnet"),
+        (
+            "a resumed conversation",
+            "4102 2.1.282 --model opus --resume previous",
+        ),
+    ] {
+        std::fs::write(&path, format!("4101 2.1.281 --model opus\n{second}"))
+            .expect("the producer's receipt format");
+        let got = exec_log(dir.path(), "launches.log");
+        assert!(
+            !fresh_launch_is_held(hand, &got),
+            "{what} must leave the collision pending: {got:?}"
+        );
+    }
+
+    std::fs::write(
+        &path,
+        "4101 2.1.281 --model opus\n4102 2.1.282 --model opus\n",
+    )
+    .expect("the intended replacement's receipt");
+    let got = exec_log(dir.path(), "launches.log");
+    assert!(fresh_launch_is_held(hand, &got), "{got:?}");
+    for status in [
+        "OK schema=1 hand=-",
+        "OK schema=1 hand=lease:another-driver@9001",
+    ] {
+        assert!(!fresh_launch_is_held(status, &got), "{status}: {got:?}");
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
     let inst = a_fresh_session_behind(tag, shell, "relaunch = false\n", Some(SHORT_SETTLE_S));
@@ -3264,14 +3349,22 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
     let pwned = inst.tmp.join("work/pwned");
     let prompt = format!("Fix the parser; touch {}", pwned.display());
     let gate = inst.tmp.join("hold-registration-2.1.282");
-    let hand_on =
-        |s: &String| field(s, "hand").is_some_and(|h| h.starts_with("lease:aterm-harness@"));
-    let st = upgrade_until(&inst, Instant::now(), || status(&inst), hand_on);
+    let (st, ready_launches) = upgrade_until(
+        &inst,
+        Instant::now(),
+        || (status(&inst), launches(&inst)),
+        |(status, launches)| fresh_launch_is_held(status, launches),
+    );
     assert!(
-        hand_on(&st),
-        "{shell}: the restart's hand on the tab: {st}\n{}",
+        fresh_launch_is_held(&st, &ready_launches),
+        "{shell}: the replacement launched under the restart's hand: {st}\n{}",
         hand_evidence(&inst)
     );
+    assert!(
+        gate.is_file(),
+        "{shell}: registration stays held until input"
+    );
+    let replacement_pid = ready_launches[1].0;
 
     let deadline = Instant::now() + HANG;
     let mut held = 0;
@@ -3313,17 +3406,35 @@ fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
     );
     let got = launches(&inst);
     assert_eq!(got.len(), 2, "{shell}: {got:?}\n{log}");
-    until(
-        HANG,
-        "the prompt in the relaunched agent",
-        || format!("{:?}", typed_by(&inst)),
-        |_| {
-            typed_by(&inst)
-                .iter()
-                .any(|(pid, line)| *pid == got[1].0 && *line == prompt)
-        },
+    assert_eq!(
+        got[1].0, replacement_pid,
+        "{shell}: the replacement observed before input: {got:?}\n{log}"
     );
-    assert!(!pwned.exists(), "{shell}: the shell ran the prompt");
+    // A prompt the shell ran never reaches the agent afterwards: that miss is said at once, with
+    // what held the tab (each process's state among it), not after the hang window with nothing.
+    let deadline = Instant::now() + HANG;
+    while !typed_by(&inst)
+        .iter()
+        .any(|(pid, line)| *pid == replacement_pid && *line == prompt)
+    {
+        assert!(
+            !pwned.exists(),
+            "{shell}: the shell ran the prompt\n{}",
+            hand_evidence(&inst)
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{shell}: the prompt in the relaunched agent: not within {HANG:?}; typed: {:?}\n{}",
+            typed_by(&inst),
+            hand_evidence(&inst)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !pwned.exists(),
+        "{shell}: the shell ran the prompt\n{}",
+        hand_evidence(&inst)
+    );
     assert!(
         !typed_by(&inst).iter().any(|(pid, _)| *pid == got[0].0),
         "{shell}: the old process read nothing: {:?}",

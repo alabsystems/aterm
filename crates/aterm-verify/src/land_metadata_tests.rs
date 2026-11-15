@@ -39,7 +39,7 @@ fn objc_wording_data_composes_without_relabeling_the_checked_tree() {
     let checked = git(&world.work, &["rev-parse", "HEAD"]);
     let checked_tree = git(&world.work, &["rev-parse", "HEAD^{tree}"]);
     let moved = RefCell::new(None);
-    let (code, said, bases) = land_with(&world, crates(&["aterm-verify"]), Lane::Pass, |_, n| {
+    let (code, said, bases) = land_with(&world, crates(&["aterm-verify"]), |_, n| {
         if n == 0 {
             *moved.borrow_mut() = Some(rival_moves(
                 &world,
@@ -98,29 +98,28 @@ fn shared_objc_policy_and_malformed_rust_still_require_a_new_judgment() {
         let world = prepared();
         let checked = git(&world.work, &["rev-parse", "HEAD"]);
         let moved = RefCell::new(None);
-        let (code, said, bases) =
-            land_with(&world, crates(&["aterm-verify"]), Lane::Pass, |base, n| {
-                if n == 0 {
-                    *moved.borrow_mut() = Some(rival_moves(&world, POLICY, &changed));
-                    return green();
-                }
-                let tree = git(&world.work, &["rev-parse", "HEAD^{tree}"]);
-                assert!(
-                    !receipt_composition(
-                        &world.work,
-                        &std::env::var_os("PATH").unwrap_or_default(),
-                        &checked,
-                        base,
-                        &tree,
-                    )
-                    .unwrap()
-                );
-                ran(
-                    exit::FAILED,
-                    vec![red("test", &["-p aterm-verify --lib"])],
-                    1,
+        let (code, said, bases) = land_with(&world, crates(&["aterm-verify"]), |base, n| {
+            if n == 0 {
+                *moved.borrow_mut() = Some(rival_moves(&world, POLICY, &changed));
+                return green();
+            }
+            let tree = git(&world.work, &["rev-parse", "HEAD^{tree}"]);
+            assert!(
+                !receipt_composition(
+                    &world.work,
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                    &checked,
+                    base,
+                    &tree,
                 )
-            });
+                .unwrap()
+            );
+            ran(
+                exit::FAILED,
+                vec![red("test", &["-p aterm-verify --lib"])],
+                1,
+            )
+        });
         assert_eq!(bases.len(), 2, "{changed}: {said:#?}");
         assert_eq!(code, exit::FAILED, "{changed}: {said:#?}");
         assert_eq!(origin_main(&world), moved.into_inner().unwrap());
@@ -131,7 +130,7 @@ fn shared_objc_policy_and_malformed_rust_still_require_a_new_judgment() {
 fn the_wording_data_filename_does_not_waive_shared_changes() {
     let world = prepared();
     commit(&world.work, WORDING, "window_drive\tbranch wording\n");
-    let (code, said, bases) = land_with(&world, crates(&["aterm-verify"]), Lane::Pass, |_, n| {
+    let (code, said, bases) = land_with(&world, crates(&["aterm-verify"]), |_, n| {
         if n == 0 {
             rival_moves(&world, WORDING, "window_drive\tmain wording\n");
         }

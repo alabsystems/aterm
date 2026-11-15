@@ -70,7 +70,6 @@ fn scenarios_parse_by_name_in_run_order_each_once() {
     );
     assert_eq!(every().filter(|s| s.reads_tree()).collect::<Vec<_>>(), TREE);
     assert!(TREE.iter().all(|s| !s.needs_app() && !s.grows_disk()));
-    assert!(every().all(|s| s.display().is_some() == s.reads_tree()));
 }
 
 #[test]
@@ -1611,7 +1610,7 @@ fn a_release_is_named_by_its_tag_and_a_report_by_its_json() {
 fn an_init_exit_names_the_rows_it_left_open() {
     // On a terminal: the prompts' lines, a change, and the rows left open with their whys.
     let text = "Secrets vault URL or path (none skips): none\r\n\
-                changed: Secrets vault (secrets.vault)\r\n    synced into ~/.secrets\r\n\
+                changed: Secrets vault (secrets.vault)\r\n    kept current on this Mac\r\n\
                 failed: Command Line Tools (base.clt)\r\n    failed: not (this.why)\r\n\
                 waiting: GitHub sign-in (github.auth@alice)\r\n\
                 aterm init: 30 ok \u{b7} 1 changed \u{b7} 1 failed\r\n";

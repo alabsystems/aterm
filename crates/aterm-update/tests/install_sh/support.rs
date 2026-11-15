@@ -4,6 +4,7 @@
 //! Driving tools/install.sh from a test.
 
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -640,6 +641,15 @@ impl Lib {
 
     /// Run the batch with HOME and TMPDIR under `scratch`.
     pub fn run(&self, scratch: &Scratch) -> Vec<Rec> {
+        self.run_qualifying(scratch, None)
+    }
+
+    /// Run with an optional fresh-executable call and body receipt before normal progress bounds.
+    pub fn run_qualifying(
+        &self,
+        scratch: &Scratch,
+        first_exec: Option<(usize, &Path)>,
+    ) -> Vec<Rec> {
         let dir = scratch.mkdir(&format!("lib.{}", BATCH.fetch_add(1, Ordering::Relaxed)));
         let home = scratch.mkdir("home");
         let tmp = scratch.mkdir("tmp");
@@ -654,6 +664,9 @@ impl Lib {
                     driver.push_str("\n__tick\n");
                 }
                 Item::Call(code, vars) => {
+                    if first_exec.is_some_and(|(call, _)| call == calls.len()) {
+                        driver.push_str("__drain\n: >\"$__d/first-exec\"\n");
+                    }
                     driver.push_str("__drain\n__rc=0\n{\n");
                     driver.push_str(code);
                     driver.push_str(
@@ -669,6 +682,9 @@ impl Lib {
                 }
                 Item::Row(code, vars) => {
                     let n = calls.len();
+                    if first_exec.is_some_and(|(call, _)| call == n) {
+                        driver.push_str("__drain\n: >\"$__d/first-exec\"\n");
+                    }
                     driver.push_str("__hold\n{\n__rc=0\n{\n");
                     driver.push_str(code);
                     driver.push_str(&format!(
@@ -702,7 +718,50 @@ impl Lib {
         let (records, ticks) = (dir.join("records"), dir.join("progress"));
         let len = |file: &Path| std::fs::metadata(file).map_or(0, |m| m.len());
         let mut grown = || len(&records) + len(&ticks);
-        let out = aterm_uds::deadline::output_while_progressing(&mut cmd, HANG, &mut grown);
+        let out = if let Some((call, receipt)) = first_exec {
+            assert!(call < calls.len(), "the qualification call is in the batch");
+            let initial_receipt = len(receipt);
+            let mut qualified = false;
+            let mut preparing = None;
+            let mut progress_at = Instant::now();
+            let mut progress = grown();
+            let mut stalled = || {
+                let now = Instant::now();
+                let next = grown();
+                if next > progress {
+                    progress = next;
+                    progress_at = now;
+                }
+                if !qualified && len(receipt) > initial_receipt {
+                    qualified = true;
+                    progress_at = now;
+                }
+                if !qualified && dir.join("first-exec").exists() {
+                    let began = preparing.get_or_insert(now);
+                    return now.duration_since(*began) >= aterm_uds::deadline::FIRST_EXEC_HANG;
+                }
+                now.duration_since(progress_at) >= HANG
+            };
+            let steps = u32::try_from(calls.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            let output = aterm_uds::deadline::output_until_from_unless(
+                &mut cmd,
+                aterm_uds::spawnfd::Stdio::null(),
+                Instant::now() + aterm_uds::deadline::FIRST_EXEC_HANG + HANG.saturating_mul(steps),
+                &mut stalled,
+            );
+            if output.is_ok() {
+                assert!(
+                    len(receipt) > initial_receipt,
+                    "the qualification call returned without a new body receipt: {}",
+                    receipt.display()
+                );
+            }
+            output
+        } else {
+            aterm_uds::deadline::output_while_progressing(&mut cmd, HANG, &mut grown)
+        };
         let raw = std::fs::read(&records).unwrap_or_default();
         let raw = String::from_utf8_lossy(&raw);
         let recs: Vec<Rec> = raw
@@ -721,14 +780,28 @@ impl Lib {
                 let left = |n: &usize| {
                     !dir.join(format!("r.{n}")).exists() && !dir.join(format!("d.{n}")).exists()
                 };
+                let pending = (recs.len()..calls.len()).find(left);
+                let captured = |stem: &str| {
+                    let path = pending
+                        .map(|n| dir.join(format!("{stem}.{n}")))
+                        .filter(|path| path.exists())
+                        .unwrap_or_else(|| dir.join(stem));
+                    let mut bytes = Vec::new();
+                    if let Ok(file) = std::fs::File::open(path) {
+                        let _ = file.take(16_384).read_to_end(&mut bytes);
+                    }
+                    String::from_utf8_lossy(&bytes).into_owned()
+                };
                 panic!(
-                    "no call returned for {HANG:?}, so the batch was killed after {} of {} calls; \
-                     the one that never returned (or a step just before it): {:?}",
+                    "the batch's hang detector ended it (ordinary progress {HANG:?}, first exec {:?}) after {} of {} calls; \
+                     the one that never returned (or a step just before it): {:?}; \
+                     captured stdout: {}; captured stderr: {}",
+                    first_exec.map(|(call, _)| (call, aterm_uds::deadline::FIRST_EXEC_HANG)),
                     calls.len() - (recs.len()..calls.len()).filter(left).count(),
                     calls.len(),
-                    (recs.len()..calls.len())
-                        .find(left)
-                        .and_then(|n| calls.get(n))
+                    pending.and_then(|n| calls.get(n)),
+                    captured("o"),
+                    captured("e"),
                 )
             }
             Err(e) => panic!("{:?} {e}", bash()),

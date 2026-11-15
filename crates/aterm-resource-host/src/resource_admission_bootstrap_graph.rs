@@ -20,12 +20,13 @@ use trust_resource_controller::bootstrap_graph as wire;
 #[path = "resource_admission_bootstrap_graph/custody.rs"]
 mod input_custody;
 pub(crate) use input_custody::{
-    EnrollmentAttachment, OutputTransfer, Preparing, SourceTransfer, Support,
+    ConfigurationTransfer, EnrollmentAttachment, MaterializationTransfer, OutputTransfer,
+    Preparing, SourceTransfer, Support,
 };
-pub(super) use input_custody::{OriginalOutput, OriginalSource};
+pub(super) use input_custody::{OriginalMaterializationInputs, OriginalOutput, OriginalSource};
 #[path = "resource_admission_bootstrap_graph/query_gate.rs"]
 mod query_gate;
-pub(super) use query_gate::{ObjectOperation, QueryOperation};
+pub(super) use query_gate::{ArchiveOperation, ObjectOperation, QueryOperation};
 
 pub(super) const MAX_ROOT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
@@ -218,7 +219,7 @@ impl Root {
         self.gnu.handoff.bind_child(pid)
     }
     pub(super) fn poll(&mut self, child: &mut spawnfd::Child) -> io::Result<bool> {
-        time(self.deadline)?;
+        time(self.deadline())?;
         let sdk = Arc::clone(&self.sdk);
         if !self.prelude.poll(child, |pid| sdk.validate_loaded(pid))? {
             return Ok(false);
@@ -234,7 +235,9 @@ impl Root {
         Ok(true)
     }
     pub(super) fn deadline(&self) -> Instant {
-        self.deadline
+        self.inputs
+            .input_deadline()
+            .map_or(self.deadline, |input| input.min(self.deadline))
     }
     pub(super) fn no_fork_target(&self) -> io::Result<&crate::metadata_prelude::NoForkTarget> {
         self.target
@@ -258,13 +261,14 @@ impl Root {
         self.queries.release(closed)
     }
     fn validate(&self, pid: u32, deadline: Instant) -> io::Result<()> {
-        time(self.deadline.min(deadline))?;
+        time(self.deadline().min(deadline))?;
+        self.inputs.check_current(self.deadline().min(deadline))?;
         self.sdk.validate_loaded(pid)?;
         self.gnu.check()?;
         if !crate::metadata_prelude::no_fork(pid)? {
             return Err(refused("Bootstrap Root lost native no-fork confinement"));
         }
-        time(self.deadline.min(deadline))
+        time(self.deadline().min(deadline))
     }
 }
 

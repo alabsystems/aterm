@@ -128,11 +128,8 @@ impl Inspection {
     /// Stable version-3 JSON. Validation only checks the observation's shape;
     /// the owner must independently validate live custody before constructing it.
     pub fn json(&self) -> io::Result<Value> {
-        let sid = self.session.strip_prefix("s-").ok_or_else(invalid)?;
         let marker: Vec<_> = self.memory.marker.split('-').collect();
-        if sid.is_empty()
-            || sid.len() > 62
-            || !hex(sid, sid.len())
+        if !crate::control_verbs::is_minted_sid(&self.session)
             || self.host.is_empty()
             || self.host.len() > 256
             || self.boot.is_empty()

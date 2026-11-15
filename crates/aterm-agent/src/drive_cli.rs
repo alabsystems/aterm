@@ -12,9 +12,10 @@ use crate::supervise::tape::acts::Candidate;
 use crate::supervise::tape::{corpus, explain, replay, show, store};
 use crate::supervise::{
     self, ANCHOR_REMOVED, LedgerFormat, LedgerHost, LedgerOpts, Session, SupervisorConfig,
-    classify_command_with, render_phase_and_survey,
+    render_phase_and_survey,
 };
 use crate::{CtlClient, DRIVE_HELP};
+use alab_policy::classify::classify_command_with;
 
 #[derive(Debug)]
 struct Opts {
@@ -243,7 +244,7 @@ fn classify_verb_at(
 
 fn python_allow(sub: &SubArgs) -> Vec<String> {
     if sub.allow_python.is_empty() {
-        supervise::DEFAULT_PYTHON_ALLOW
+        alab_policy::classify::DEFAULT_PYTHON_ALLOW
             .iter()
             .map(|s| s.to_string())
             .collect()

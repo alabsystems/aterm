@@ -1263,7 +1263,7 @@ fn closing_native_from_mixed_promotes_terminal_projection_and_reopen_demotes_it(
     );
     assert!(app.structural_invariants_ok());
 
-    app.reopen_last_closed_view().unwrap();
+    app.reopen_closed_view_and_wait_for_test().unwrap();
     assert_eq!(app.windows[&wid].layouts.len(), 1);
     let tab = app.windows[&wid].tab_set.active().unwrap();
     assert_eq!(tab.root.len(), 2);
@@ -1333,7 +1333,7 @@ fn reopening_a_closed_terminal_pane_activates_its_original_tab_and_input_target(
         assert_eq!(app.windows[&wid].tabs.active, 1);
         let view_count = app.view_store.len();
 
-        app.reopen_last_closed_view().unwrap();
+        app.reopen_closed_view_and_wait_for_test().unwrap();
 
         let ws = &app.windows[&wid];
         let restored = ws.tab_set.get(original_tab).unwrap();
@@ -1428,7 +1428,7 @@ fn reopening_a_closed_terminal_pane_activates_its_original_tab_and_input_target(
         let after_active = ws.tab_set.active_id();
         let after_next_session = app.next_session_id;
         assert!(
-            app.reopen_last_closed_view().is_err(),
+            app.reopen_closed_view_and_wait_for_test().is_err(),
             "the record is consumed once"
         );
         assert_eq!(
@@ -1494,7 +1494,7 @@ fn reopening_a_closed_pane_in_another_window_preserves_the_front_input_owner() {
     assert_eq!(app.clipboard_session_in(front_window), Some(front_session));
     let view_count = app.view_store.len();
 
-    app.reopen_last_closed_view().unwrap();
+    app.reopen_closed_view_and_wait_for_test().unwrap();
 
     let restored_window = &app.windows[&original_window];
     let restored = restored_window.tab_set.active().unwrap();
@@ -1688,9 +1688,9 @@ fn reopened_background_recovery_preserves_the_global_input_owner() {
         let view_count = app.view_store.len();
 
         if pane_fallback {
-            app.reopen_last_closed_view().unwrap();
+            app.reopen_closed_view_and_wait_for_test().unwrap();
         } else {
-            app.reopen_last_closed_tab().unwrap();
+            app.reopen_closed_tab_and_wait_for_test().unwrap();
         }
 
         let target = &app.windows[&target_window];
@@ -1808,9 +1808,9 @@ fn reopened_background_recovery_preserves_the_global_input_owner() {
         let after_next = app.next_session_id;
         let after_tab = restored.clone();
         let again = if pane_fallback {
-            app.reopen_last_closed_view()
+            app.reopen_closed_view_and_wait_for_test()
         } else {
-            app.reopen_last_closed_tab()
+            app.reopen_closed_tab_and_wait_for_test()
         };
         assert!(again.is_err(), "{path}: recovery is consumed once");
         assert_eq!(
@@ -1839,7 +1839,7 @@ fn whole_mixed_tab_close_and_reopen_preserves_one_tab_record_and_topology() {
     assert!(app.pool.get(terminal).is_none());
     assert_eq!(app.windows[&wid].tab_set.len(), 1);
 
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     let restored = app
         .tab_restore_descriptor(app.windows[&wid].tab_set.active().unwrap())
         .unwrap();
@@ -1887,7 +1887,7 @@ fn a_reopened_mixed_tab_stages_without_fronting_a_later_tab() {
     assert!(!app.close_tab_at(wid, 1));
     assert_eq!(app.windows[&wid].tab_set.active_index(), Some(0));
 
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     assert!(
         unseen(&app),
         "staging the reopened tab's Settings leaf fronts no other tab"
@@ -2070,7 +2070,7 @@ fn reopen_settings_mints_fresh_tab_view_and_instance_with_route() {
     app.close_active_native_tab(wid).unwrap();
     assert!(app.view_store.get(old_view).is_none());
     assert!(app.native_runtime.app(old_instance).is_none());
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
 
     let (new_instance, new_view) = app.active_native_view(wid).unwrap();
     assert_ne!(new_view, old_view, "closed ViewId is never reused");
@@ -2152,7 +2152,7 @@ fn reopened_editor_keeps_document_identity_and_shares_only_a_live_controller() {
             Some(retained_views)
         );
         assert_eq!(app.native_runtime.app(old_instance).is_some(), keep_peer);
-        app.reopen_last_closed_tab().unwrap();
+        app.reopen_closed_tab_and_wait_for_test().unwrap();
         let (new_instance, new_view) = app.active_native_view(wid).unwrap();
         let new_tab = app.windows[&wid].tab_set.active_id().unwrap();
         assert_eq!(new_instance == old_instance, keep_peer);
@@ -2182,40 +2182,54 @@ fn reopened_editor_keeps_document_identity_and_shares_only_a_live_controller() {
 }
 
 #[test]
-fn reopen_missing_document_installs_recovery_view_instead_of_losing_the_record() {
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-reopen-missing-document-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("gone.md");
+fn closed_reopen_reuses_a_retained_missing_file_but_keeps_unreadable_absent_history() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = scratch.path().canonicalize().unwrap().join("gone.md");
     std::fs::write(&path, "gone soon\n").unwrap();
     let uri = file_uri(&path);
-
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     app.open_document_tab(crate::native_app::AppKind::Markdown, &uri)
         .unwrap();
-    let (_, old_view) = app.active_native_view(wid).unwrap();
+    let (old_instance, old_view) = app.active_native_view(wid).unwrap();
+    let document = app.native_runtime.document_id(old_instance).unwrap();
+    let saved = app.document_store.snapshot(document).unwrap();
     app.close_active_native_tab(wid).unwrap();
+    let source = app.closed_recovery.tabs.candidate_snapshot(0).unwrap();
     std::fs::remove_file(&path).unwrap();
     let before_tabs = app.windows[&wid].tab_set.len();
     let before_views = app.view_store.len();
-
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     assert_eq!(app.windows[&wid].tab_set.len(), before_tabs + 1);
     assert_eq!(app.view_store.len(), before_views + 1);
     assert!(app.view_store.get(old_view).is_none());
     assert!(app.closed_recovery.tabs.is_empty());
-    let (instance, _) = app.active_native_view(wid).expect("Recovery active");
+    let (instance, _) = app.active_native_view(wid).expect("retained Editor active");
     assert_eq!(
         app.native_runtime.app(instance).map(|app| app.kind()),
-        Some(crate::native_app::AppKind::Recovery)
+        Some(crate::native_app::AppKind::Editor)
+    );
+    assert_eq!(app.native_runtime.document_id(instance), Some(document));
+    assert_eq!(
+        app.document_store.snapshot(document).unwrap().text,
+        saved.text
     );
     assert!(app.structural_invariants_ok());
-    let _ = std::fs::remove_dir_all(dir);
+
+    let mut absent = App::headless_for_test();
+    absent.closed_recovery.tabs.push(source.value, 0);
+    let candidate = absent.closed_recovery.tabs.candidate_snapshot(0).unwrap();
+    let before_tabs = absent.windows[&wid].tab_set.len();
+    let before_views = absent.view_store.len();
+    assert!(absent.reopen_closed_tab_and_wait_for_test().is_err());
+    assert_eq!(absent.windows[&wid].tab_set.len(), before_tabs);
+    assert_eq!(absent.view_store.len(), before_views);
+    assert_eq!(
+        absent.closed_recovery.tabs.candidate_snapshot(0).unwrap(),
+        candidate
+    );
+    assert!(absent.active_native_view(wid).is_none());
+    assert!(absent.structural_invariants_ok());
 }
 
 #[test]
@@ -2232,7 +2246,7 @@ fn closed_terminal_tab_reattaches_a_still_live_shared_session() {
     assert_eq!(app.pool.views(0), Some(1));
     app.frontmost_window = Some(original);
 
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     assert_eq!(app.pool.views(0), Some(2));
     assert_eq!(app.windows[&original].tab_set.len(), 2);
     assert!(app.closed_recovery.tabs.is_empty());
@@ -2285,7 +2299,7 @@ fn reopen_same_window_settings_mints_an_independent_view_instead_of_aliasing() {
         0,
     );
 
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     let reopened = app.active_native_view(wid).expect("reopened Settings view");
     assert_eq!(reopened.0, existing.0, "singleton controller is shared");
     assert_ne!(reopened.1, existing.1, "presentation identity is fresh");
@@ -2327,7 +2341,7 @@ fn native_reopen_ledger_tier1_conforms_and_negative_controls_are_rejected() {
     after_close.insert("retired_id", 2);
     assert_step(&model, &before_close, &after_close, "Close");
 
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     let reopened = app.windows[&wid].tab_set.active_id().unwrap().get();
     let mut after_reopen = after_close.clone();
     after_reopen.insert("ledger", app.closed_recovery.tabs.len() as i64);
@@ -2348,7 +2362,7 @@ fn native_reopen_ledger_tier1_conforms_and_negative_controls_are_rejected() {
     failed.close_active_native_tab(wid).unwrap();
     failed.windows.clear();
     failed.frontmost_window = None;
-    assert!(failed.reopen_last_closed_tab().is_err());
+    assert!(failed.reopen_closed_tab_and_wait_for_test().is_err());
     let mut after_failure = after_close.clone();
     after_failure.insert("ledger", failed.closed_recovery.tabs.len() as i64);
     after_failure.insert("failures", 1);

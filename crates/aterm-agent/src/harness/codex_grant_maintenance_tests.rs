@@ -75,7 +75,7 @@ pub(super) fn fixture() -> Fixture {
         codex_login: None,
         agy_conversation: None,
         now: 1_800_000_000,
-        sid: "s-maintenance-fixture".into(),
+        sid: "tncefjxtvre".into(),
         sock: None,
         config: Some(config_path),
         claude_tmp: None,

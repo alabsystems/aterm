@@ -1593,6 +1593,27 @@ fn fleet_drive_keeps_whole_minted_sid() {
     assert_eq!(Actor::from_word(drive.word()), drive);
 }
 
+/// A FLEET DRIVE KEEPS A `t` TAB ID WHOLE TOO: a requester names its tab in either form, and
+/// a tab opened before the `t` form keeps its `s-` ID until it closes.
+/// NEGATIVE CONTROLS: a `t` ID one character short, upper case, or with a letter outside the
+/// Crockford alphabet records `-`.
+#[test]
+fn fleet_drive_keeps_a_t_tab_id_whole() {
+    let node = "ab".repeat(16);
+    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        let drive = Actor::fleet_drive(&node, Some(sid));
+        assert_eq!(drive.word(), format!("fleet:abababab:{sid}"));
+        assert_eq!(Actor::from_word(drive.word()), drive);
+    }
+    for bad in ["tqn5r6e014", "TQN5R6E0148", "tqn5r6e014u"] {
+        assert_eq!(
+            Actor::fleet_drive(&node, Some(bad)).word(),
+            "fleet:abababab:-",
+            "CONTROL: {bad:?}"
+        );
+    }
+}
+
 /// A FLEET DRIVE'S UNMINTED SID IS `-`: a requester names a session only in the shape aterm
 /// mints. NEGATIVE CONTROLS: a short sid, an uppercase one and a chosen name each record `-`.
 #[test]

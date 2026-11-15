@@ -249,12 +249,16 @@ impl Canvas {
     }
 
     /// Fill the half-open rect `[x0, x1) x [y0, y1)`, clamped to the canvas.
+    // Share the clipping and row fill across the wasm glyph recipes.
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
     fn rect(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
         let (x1, y1) = (x1.min(self.w), y1.min(self.h));
+        if x0 >= x1 {
+            return;
+        }
         for y in y0..y1 {
-            for x in x0..x1 {
-                self.buf[y * self.w + x] = 255;
-            }
+            let row = y * self.w;
+            self.buf[row + x0..row + x1].fill(255);
         }
     }
 
@@ -582,174 +586,176 @@ fn dash_v(c: &mut Canvas, m: &Metrics, n: usize, t: usize) {
 
 /// Double-line glyphs U+2550–256C.
 fn draw_double(c: &mut Canvas, m: &Metrics, cp: u32) {
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    enum Coord {
+        Zero,
+        W,
+        H,
+        Tr0,
+        Tr1,
+        Br0,
+        Br1,
+        Lr0,
+        Lr1,
+        Rr0,
+        Rr1,
+        Vl0,
+        Vl1,
+        Hl0,
+        Hl1,
+    }
+    use Coord::{Br0, Br1, H, Hl0, Hl1, Lr0, Lr1, Rr0, Rr1, Tr0, Tr1, Vl0, Vl1, W, Zero};
     let t = m.light;
     let (w, h) = (m.w, m.h);
     let (tr0, tr1) = (m.hh0, m.hh0 + t);
     let (br0, br1) = (m.hh1 - t, m.hh1);
     let (lr0, lr1) = (m.vh0, m.vh0 + t);
     let (rr0, rr1) = (m.vh1 - t, m.vh1);
-    match cp {
-        0x2550 => {
-            c.rect(0, tr0, w, tr1);
-            c.rect(0, br0, w, br1);
-        }
-        0x2551 => {
-            c.rect(lr0, 0, lr1, h);
-            c.rect(rr0, 0, rr1, h);
-        }
-        0x2552 => {
-            c.rect(m.vl0, tr0, w, tr1);
-            c.rect(m.vl0, br0, w, br1);
-            c.rect(m.vl0, tr0, m.vl1, h);
-        }
-        0x2553 => {
-            c.rect(lr0, m.hl0, w, m.hl1);
-            c.rect(lr0, m.hl0, lr1, h);
-            c.rect(rr0, m.hl0, rr1, h);
-        }
-        0x2554 => {
-            c.rect(lr0, tr0, w, tr1);
-            c.rect(lr0, tr0, lr1, h);
-            c.rect(rr0, br0, w, br1);
-            c.rect(rr0, br0, rr1, h);
-        }
-        0x2555 => {
-            c.rect(0, tr0, m.vl1, tr1);
-            c.rect(0, br0, m.vl1, br1);
-            c.rect(m.vl0, tr0, m.vl1, h);
-        }
-        0x2556 => {
-            c.rect(0, m.hl0, rr1, m.hl1);
-            c.rect(lr0, m.hl0, lr1, h);
-            c.rect(rr0, m.hl0, rr1, h);
-        }
-        0x2557 => {
-            c.rect(0, tr0, rr1, tr1);
-            c.rect(rr0, tr0, rr1, h);
-            c.rect(0, br0, lr1, br1);
-            c.rect(lr0, br0, lr1, h);
-        }
-        0x2558 => {
-            c.rect(m.vl0, tr0, w, tr1);
-            c.rect(m.vl0, br0, w, br1);
-            c.rect(m.vl0, 0, m.vl1, br1);
-        }
-        0x2559 => {
-            c.rect(lr0, m.hl0, w, m.hl1);
-            c.rect(lr0, 0, lr1, m.hl1);
-            c.rect(rr0, 0, rr1, m.hl1);
-        }
-        0x255A => {
-            c.rect(lr0, br0, w, br1);
-            c.rect(lr0, 0, lr1, br1);
-            c.rect(rr0, tr0, w, tr1);
-            c.rect(rr0, 0, rr1, tr1);
-        }
-        0x255B => {
-            c.rect(0, tr0, m.vl1, tr1);
-            c.rect(0, br0, m.vl1, br1);
-            c.rect(m.vl0, 0, m.vl1, br1);
-        }
-        0x255C => {
-            c.rect(0, m.hl0, rr1, m.hl1);
-            c.rect(lr0, 0, lr1, m.hl1);
-            c.rect(rr0, 0, rr1, m.hl1);
-        }
-        0x255D => {
-            c.rect(0, br0, rr1, br1);
-            c.rect(rr0, 0, rr1, br1);
-            c.rect(0, tr0, lr1, tr1);
-            c.rect(lr0, 0, lr1, tr1);
-        }
-        0x255E => {
-            c.rect(m.vl0, 0, m.vl1, h);
-            c.rect(m.vl0, tr0, w, tr1);
-            c.rect(m.vl0, br0, w, br1);
-        }
-        0x255F => {
-            c.rect(lr0, 0, lr1, h);
-            c.rect(rr0, 0, rr1, h);
-            c.rect(rr0, m.hl0, w, m.hl1);
-        }
-        0x2560 => {
-            c.rect(lr0, 0, lr1, h);
-            c.rect(rr0, 0, rr1, tr1);
-            c.rect(rr0, br0, rr1, h);
-            c.rect(rr0, tr0, w, tr1);
-            c.rect(rr0, br0, w, br1);
-        }
-        0x2561 => {
-            c.rect(m.vl0, 0, m.vl1, h);
-            c.rect(0, tr0, m.vl1, tr1);
-            c.rect(0, br0, m.vl1, br1);
-        }
-        0x2562 => {
-            c.rect(lr0, 0, lr1, h);
-            c.rect(rr0, 0, rr1, h);
-            c.rect(0, m.hl0, lr1, m.hl1);
-        }
-        0x2563 => {
-            c.rect(rr0, 0, rr1, h);
-            c.rect(lr0, 0, lr1, tr1);
-            c.rect(lr0, br0, lr1, h);
-            c.rect(0, tr0, lr1, tr1);
-            c.rect(0, br0, lr1, br1);
-        }
-        0x2564 => {
-            c.rect(0, tr0, w, tr1);
-            c.rect(0, br0, w, br1);
-            c.rect(m.vl0, br0, m.vl1, h);
-        }
-        0x2565 => {
-            c.rect(0, m.hl0, w, m.hl1);
-            c.rect(lr0, m.hl0, lr1, h);
-            c.rect(rr0, m.hl0, rr1, h);
-        }
-        0x2566 => {
-            c.rect(0, tr0, w, tr1);
-            c.rect(0, br0, lr1, br1);
-            c.rect(rr0, br0, w, br1);
-            c.rect(lr0, br0, lr1, h);
-            c.rect(rr0, br0, rr1, h);
-        }
-        0x2567 => {
-            c.rect(0, tr0, w, tr1);
-            c.rect(0, br0, w, br1);
-            c.rect(m.vl0, 0, m.vl1, tr1);
-        }
-        0x2568 => {
-            c.rect(0, m.hl0, w, m.hl1);
-            c.rect(lr0, 0, lr1, m.hl1);
-            c.rect(rr0, 0, rr1, m.hl1);
-        }
-        0x2569 => {
-            c.rect(0, br0, w, br1);
-            c.rect(0, tr0, lr1, tr1);
-            c.rect(rr0, tr0, w, tr1);
-            c.rect(lr0, 0, lr1, tr1);
-            c.rect(rr0, 0, rr1, tr1);
-        }
-        0x256A => {
-            c.rect(m.vl0, 0, m.vl1, h);
-            c.rect(0, tr0, w, tr1);
-            c.rect(0, br0, w, br1);
-        }
-        0x256B => {
-            c.rect(0, m.hl0, w, m.hl1);
-            c.rect(lr0, 0, lr1, h);
-            c.rect(rr0, 0, rr1, h);
-        }
-        0x256C => {
-            c.rect(lr0, 0, lr1, tr1);
-            c.rect(0, tr0, lr1, tr1);
-            c.rect(rr0, 0, rr1, tr1);
-            c.rect(rr0, tr0, w, tr1);
-            c.rect(lr0, br0, lr1, h);
-            c.rect(0, br0, lr1, br1);
-            c.rect(rr0, br0, rr1, h);
-            c.rect(rr0, br0, w, br1);
-        }
+    // Indexed by the Coord discriminants; each recipe stores only these tags.
+    let coordinates = [
+        0, w, h, tr0, tr1, br0, br1, lr0, lr1, rr0, rr1, m.vl0, m.vl1, m.hl0, m.hl1,
+    ];
+    let rectangles: &'static [[Coord; 4]] = match cp {
+        0x2550 => &[[Zero, Tr0, W, Tr1], [Zero, Br0, W, Br1]],
+        0x2551 => &[[Lr0, Zero, Lr1, H], [Rr0, Zero, Rr1, H]],
+        0x2552 => &[[Vl0, Tr0, W, Tr1], [Vl0, Br0, W, Br1], [Vl0, Tr0, Vl1, H]],
+        0x2553 => &[[Lr0, Hl0, W, Hl1], [Lr0, Hl0, Lr1, H], [Rr0, Hl0, Rr1, H]],
+        0x2554 => &[
+            [Lr0, Tr0, W, Tr1],
+            [Lr0, Tr0, Lr1, H],
+            [Rr0, Br0, W, Br1],
+            [Rr0, Br0, Rr1, H],
+        ],
+        0x2555 => &[
+            [Zero, Tr0, Vl1, Tr1],
+            [Zero, Br0, Vl1, Br1],
+            [Vl0, Tr0, Vl1, H],
+        ],
+        0x2556 => &[
+            [Zero, Hl0, Rr1, Hl1],
+            [Lr0, Hl0, Lr1, H],
+            [Rr0, Hl0, Rr1, H],
+        ],
+        0x2557 => &[
+            [Zero, Tr0, Rr1, Tr1],
+            [Rr0, Tr0, Rr1, H],
+            [Zero, Br0, Lr1, Br1],
+            [Lr0, Br0, Lr1, H],
+        ],
+        0x2558 => &[
+            [Vl0, Tr0, W, Tr1],
+            [Vl0, Br0, W, Br1],
+            [Vl0, Zero, Vl1, Br1],
+        ],
+        0x2559 => &[
+            [Lr0, Hl0, W, Hl1],
+            [Lr0, Zero, Lr1, Hl1],
+            [Rr0, Zero, Rr1, Hl1],
+        ],
+        0x255A => &[
+            [Lr0, Br0, W, Br1],
+            [Lr0, Zero, Lr1, Br1],
+            [Rr0, Tr0, W, Tr1],
+            [Rr0, Zero, Rr1, Tr1],
+        ],
+        0x255B => &[
+            [Zero, Tr0, Vl1, Tr1],
+            [Zero, Br0, Vl1, Br1],
+            [Vl0, Zero, Vl1, Br1],
+        ],
+        0x255C => &[
+            [Zero, Hl0, Rr1, Hl1],
+            [Lr0, Zero, Lr1, Hl1],
+            [Rr0, Zero, Rr1, Hl1],
+        ],
+        0x255D => &[
+            [Zero, Br0, Rr1, Br1],
+            [Rr0, Zero, Rr1, Br1],
+            [Zero, Tr0, Lr1, Tr1],
+            [Lr0, Zero, Lr1, Tr1],
+        ],
+        0x255E => &[[Vl0, Zero, Vl1, H], [Vl0, Tr0, W, Tr1], [Vl0, Br0, W, Br1]],
+        0x255F => &[[Lr0, Zero, Lr1, H], [Rr0, Zero, Rr1, H], [Rr0, Hl0, W, Hl1]],
+        0x2560 => &[
+            [Lr0, Zero, Lr1, H],
+            [Rr0, Zero, Rr1, Tr1],
+            [Rr0, Br0, Rr1, H],
+            [Rr0, Tr0, W, Tr1],
+            [Rr0, Br0, W, Br1],
+        ],
+        0x2561 => &[
+            [Vl0, Zero, Vl1, H],
+            [Zero, Tr0, Vl1, Tr1],
+            [Zero, Br0, Vl1, Br1],
+        ],
+        0x2562 => &[
+            [Lr0, Zero, Lr1, H],
+            [Rr0, Zero, Rr1, H],
+            [Zero, Hl0, Lr1, Hl1],
+        ],
+        0x2563 => &[
+            [Rr0, Zero, Rr1, H],
+            [Lr0, Zero, Lr1, Tr1],
+            [Lr0, Br0, Lr1, H],
+            [Zero, Tr0, Lr1, Tr1],
+            [Zero, Br0, Lr1, Br1],
+        ],
+        0x2564 => &[[Zero, Tr0, W, Tr1], [Zero, Br0, W, Br1], [Vl0, Br0, Vl1, H]],
+        0x2565 => &[[Zero, Hl0, W, Hl1], [Lr0, Hl0, Lr1, H], [Rr0, Hl0, Rr1, H]],
+        0x2566 => &[
+            [Zero, Tr0, W, Tr1],
+            [Zero, Br0, Lr1, Br1],
+            [Rr0, Br0, W, Br1],
+            [Lr0, Br0, Lr1, H],
+            [Rr0, Br0, Rr1, H],
+        ],
+        0x2567 => &[
+            [Zero, Tr0, W, Tr1],
+            [Zero, Br0, W, Br1],
+            [Vl0, Zero, Vl1, Tr1],
+        ],
+        0x2568 => &[
+            [Zero, Hl0, W, Hl1],
+            [Lr0, Zero, Lr1, Hl1],
+            [Rr0, Zero, Rr1, Hl1],
+        ],
+        0x2569 => &[
+            [Zero, Br0, W, Br1],
+            [Zero, Tr0, Lr1, Tr1],
+            [Rr0, Tr0, W, Tr1],
+            [Lr0, Zero, Lr1, Tr1],
+            [Rr0, Zero, Rr1, Tr1],
+        ],
+        0x256A => &[
+            [Vl0, Zero, Vl1, H],
+            [Zero, Tr0, W, Tr1],
+            [Zero, Br0, W, Br1],
+        ],
+        0x256B => &[
+            [Zero, Hl0, W, Hl1],
+            [Lr0, Zero, Lr1, H],
+            [Rr0, Zero, Rr1, H],
+        ],
+        0x256C => &[
+            [Lr0, Zero, Lr1, Tr1],
+            [Zero, Tr0, Lr1, Tr1],
+            [Rr0, Zero, Rr1, Tr1],
+            [Rr0, Tr0, W, Tr1],
+            [Lr0, Br0, Lr1, H],
+            [Zero, Br0, Lr1, Br1],
+            [Rr0, Br0, Rr1, H],
+            [Rr0, Br0, W, Br1],
+        ],
         _ => unreachable!("draw_double covers 0x2550..=0x256C"),
+    };
+    for &[x0, y0, x1, y1] in rectangles {
+        c.rect(
+            coordinates[x0 as usize],
+            coordinates[y0 as usize],
+            coordinates[x1 as usize],
+            coordinates[y1 as usize],
+        );
     }
 }
 

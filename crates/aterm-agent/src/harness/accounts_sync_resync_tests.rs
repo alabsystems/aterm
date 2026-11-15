@@ -314,28 +314,26 @@ fn a_row_added_beside_a_local_fleet_survives_the_next_sync() {
 fn a_row_added_under_a_source_this_machine_does_not_write_is_refused_by_name() {
     let desk = Desk::new("m27");
     desk.default_login("sol-m27@example.test");
-    let secrets = desk.home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
     let vault = concat!(
         "[[account]]\nlabel = \"m27\"\nmachines = [\"m27\"]\nemail = \"sol-m27@example.test\"\n\n",
         "[[account]]\nlabel = \"m28\"\nmachines = [\"m28\"]\nemail = \"m28@example.test\"\n",
     );
-    let vault_path = secrets.join(FLEET_ROSTER_FILE);
-    fs::write(&vault_path, vault).unwrap();
+    crate::vault_entry::seed(&desk.home, &[(FLEET_ROSTER_FILE, vault.as_bytes())]);
+    let vault_path = crate::vault_entry::source_name(FLEET_ROSTER_FILE);
     sync_accounts_for_init(&desk.home, &desk.state, &desk.roster(), NOW).expect("vault fleet");
     let roster_was = fs::read(desk.roster()).unwrap();
     let (code, _, err) = add(&desk, "work", Some("work@example.test"));
     assert_eq!(code, ExitCode::from(1));
-    assert!(err.contains(&vault_path.display().to_string()), "{err}");
+    assert!(err.contains(&vault_path), "{err}");
     assert_eq!(fs::read(desk.roster()).unwrap(), roster_was);
-    assert_eq!(fs::read_to_string(&vault_path).unwrap(), vault);
+    assert_eq!(
+        crate::vault_entry::read_text(&desk.home, FLEET_ROSTER_FILE, 1 << 20).text(),
+        Some(vault)
+    );
     assert!(!desk.store().login_dir("work").unwrap().exists());
     assert_eq!(
         listed_origin(&desk),
-        (
-            Some("vault".to_owned()),
-            Some(vault_path.display().to_string())
-        )
+        (Some("vault".to_owned()), Some(vault_path.clone()))
     );
 
     let keyed = Desk::new("m27");
@@ -465,16 +463,7 @@ fn the_converge_read_is_due_where_the_resync_syncs_a_missing_roster() {
     let spawn = |_work: Box<dyn FnOnce() + Send>| Ok(());
     let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
     let read = Mutex::new(Rediscovery::default());
-    let probe = |now: i64| {
-        read_resync_with(
-            &desk.home,
-            &desk.state,
-            &desk.roster(),
-            now,
-            &read,
-            &read_local_source_text,
-        )
-    };
+    let probe = |now: i64| read_resync_with(&desk.home, &desk.state, &desk.roster(), now, &read);
     // Each runner is a process of its own: a resync with fresh effects, as the pass's apply.
     let resync = |now: i64| {
         let (cooldown, rediscovery) = (Mutex::new(None), Mutex::new(Rediscovery::default()));
@@ -519,12 +508,10 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
     let config = desk.config.join("aterm.toml");
     let kimi = accounts::roster_beside_for(&config, Cli::Kimi).unwrap();
     fs::write(&kimi, "").unwrap();
-    let secrets = desk.home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
-    let source = secrets.join(cli_fleet_file(Cli::Kimi));
+    let source = cli_fleet_file(Cli::Kimi);
     let fleet = "[[account]]\nlabel='kimi-1'\nemail='kimi-one@example.test'\n\
                  machines=['m16']\nregion='global'\n";
-    fs::write(&source, fleet).unwrap();
+    crate::vault_entry::seed(&desk.home, &[(source.as_str(), fleet.as_bytes())]);
     assert!(!desk.roster().exists() && !desk.fleet_file().exists());
     assert!(!has_init_accounts_source(
         &desk.home,
@@ -533,13 +520,7 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
         NOW
     ));
 
-    // Availability and due work belong to one probe of this actual selected local source.
-    // Count bounded reads, not generic named-source fetches, which defaults do not use.
-    let reads = std::cell::RefCell::new(BTreeMap::<PathBuf, usize>::new());
-    let local_read = |path: &Path| {
-        *reads.borrow_mut().entry(path.to_owned()).or_default() += 1;
-        read_local_source_text(path)
-    };
+    // Availability and due work belong to one probe of the vault entry this Mac reads.
     assert!(matches!(
         read_resync_with(
             &desk.home,
@@ -547,15 +528,9 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
             &desk.roster(),
             NOW,
             &Mutex::new(Rediscovery::default()),
-            &local_read,
         ),
         ResyncRead::Due(_)
     ));
-    assert_eq!(
-        reads.borrow().get(&source),
-        Some(&1),
-        "one selected-source read per probe"
-    );
 
     let fetch = |_: &Env, source: &str| -> Result<String, String> {
         Err(format!("no fetch in a test: {source}"))
@@ -570,7 +545,6 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
     assert!(fs::read_to_string(&kimi).unwrap().contains("kimi-1"));
     assert!(synced.cli_failed.is_empty(), "{synced:?}");
     assert!(!desk.roster().exists() && !desk.fleet_file().exists());
-    assert_eq!(fs::read_to_string(&source).unwrap(), fleet);
     assert!(synced.failed.is_none(), "{synced:?}");
 
     let store = accounts::Store::at_for(&desk.state, Cli::Kimi, &desk.home);
@@ -582,7 +556,6 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
         Err(why) => panic!("could not read fixture account state: {why}"),
     };
     let before = (fs::read(&kimi).unwrap(), state_bytes());
-    reads.borrow_mut().clear();
     let probe = || {
         read_resync_with(
             &desk.home,
@@ -590,48 +563,30 @@ fn a_kimi_only_resync_reaches_current_without_a_claude_roster_or_source() {
             &desk.roster(),
             NOW + 2,
             &Mutex::new(Rediscovery::default()),
-            &local_read,
         )
     };
     assert_eq!(probe(), ResyncRead::Current);
-    assert_eq!(reads.borrow().get(&source), Some(&1));
 
-    // A new probe must reopen even when a refused replacement has the same size and stamp.
-    let stamp = fs::metadata(&source).unwrap().modified().unwrap();
-    fs::write(
-        &source,
-        format!("{:<width$}", "[[account]\n", width = fleet.len()),
-    )
-    .unwrap();
-    fs::File::options()
-        .write(true)
-        .open(&source)
-        .unwrap()
-        .set_modified(stamp)
-        .unwrap();
-    assert_eq!(fs::metadata(&source).unwrap().len(), fleet.len() as u64);
-    assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), stamp);
-    reads.borrow_mut().clear();
+    // A refused replacement of the same size is due again: the probe reads the entry itself.
+    let refused = format!("{:<width$}", "[[account]\n", width = fleet.len());
+    crate::vault_entry::seed(&desk.home, &[(source.as_str(), refused.as_bytes())]);
     assert!(matches!(probe(), ResyncRead::Due(_)));
-    assert_eq!(reads.borrow().get(&source), Some(&1));
     assert_eq!((fs::read(&kimi).unwrap(), state_bytes()), before);
 
-    // All three other CLIs select this same pool before the refused Kimi-specific source.
-    // This counter covers their local loader, not Claude's separate scheduling/discovery IO.
-    let pool = secrets.join(super::super::ai_pool::AI_POOL_FILE);
-    fs::write(
-        &pool,
-        concat!(
-            "version=1\n[[account]]\nprovider='codex'\nemail='c@example.test'\nwarm=['m16']\n",
-            "[[account]]\nprovider='grok'\nemail='g@example.test'\nwarm=['m16']\n",
-            "[[account]]\nprovider='kimi:global'\nemail='k@example.test'\nwarm=['m16']\n",
-        ),
-    )
-    .unwrap();
-    reads.borrow_mut().clear();
+    // All three other CLIs select this same pool before the refused Kimi-specific entry.
+    crate::vault_entry::seed(
+        &desk.home,
+        &[(
+            super::super::ai_pool::AI_POOL_FILE,
+            concat!(
+                "version=1\n[[account]]\nprovider='codex'\nemail='c@example.test'\nwarm=['m16']\n",
+                "[[account]]\nprovider='grok'\nemail='g@example.test'\nwarm=['m16']\n",
+                "[[account]]\nprovider='kimi:global'\nemail='k@example.test'\nwarm=['m16']\n",
+            )
+            .as_bytes(),
+        )],
+    );
     assert!(matches!(probe(), ResyncRead::Due(_)));
-    assert_eq!(reads.borrow().get(&pool), Some(&1));
-    assert!(!reads.borrow().contains_key(&source));
     assert_eq!((fs::read(&kimi).unwrap(), state_bytes()), before);
 }
 
@@ -653,16 +608,7 @@ fn a_missing_claude_roster_keeps_its_unannotated_local_source_and_its_refusal() 
             NOW
         ));
         let read = Mutex::new(Rediscovery::default());
-        let probe = |now| {
-            read_resync_with(
-                &desk.home,
-                &desk.state,
-                &desk.roster(),
-                now,
-                &read,
-                &read_local_source_text,
-            )
-        };
+        let probe = |now| read_resync_with(&desk.home, &desk.state, &desk.roster(), now, &read);
         assert_eq!(probe(NOW), ResyncRead::NoSource);
         let fetch = |_: &Env, source: &str| -> Result<String, String> {
             Err(format!("no fetch in a test: {source}"))
@@ -695,29 +641,20 @@ fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
     let desk = Desk::new("m16");
     let config = desk.config.join("aterm.toml");
     let codex = accounts::roster_beside_for(&config, Cli::Codex).unwrap();
-    let secrets = desk.home.join(".secrets");
-    aterm_types::fs_restricted::ensure_private_dir(&secrets).unwrap();
-    fs::write(
-        secrets.join(super::super::ai_pool::AI_POOL_FILE),
-        "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m16\"]\n",
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &desk.home,
+        &[(
+            super::super::ai_pool::AI_POOL_FILE,
+            b"version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m16\"]\n",
+        )],
+    );
     assert_eq!(
         cli_pools_due(&config, &desk.state, &desk.home, NOW),
         vec![Cli::Codex]
     );
 
     let read = Mutex::new(Rediscovery::default());
-    let probe = |now| {
-        read_resync_with(
-            &desk.home,
-            &desk.state,
-            &desk.roster(),
-            now,
-            &read,
-            &read_local_source_text,
-        )
-    };
+    let probe = |now| read_resync_with(&desk.home, &desk.state, &desk.roster(), now, &read);
     let before = probe(NOW);
     assert!(
         matches!(&before, ResyncRead::Due(why) if why.contains("codex-m16")),
@@ -750,11 +687,13 @@ fn an_ai_pool_without_claude_accounts_for_this_machine_reaches_current() {
     );
     assert!(!quiet.changed && quiet.failed.is_none(), "{quiet:?}");
 
-    fs::write(
-        secrets.join(super::super::ai_pool::AI_POOL_FILE),
-        "version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m22\"]\n",
-    )
-    .unwrap();
+    crate::vault_entry::seed(
+        &desk.home,
+        &[(
+            super::super::ai_pool::AI_POOL_FILE,
+            b"version = 1\n\n[[account]]\nprovider = \"codex\"\nemail = \"codex-one@example.test\"\nwarm = [\"m22\"]\n",
+        )],
+    );
     let moved = probe(NOW + 61);
     assert!(
         matches!(&moved, ResyncRead::Due(why) if why.contains("codex-m16")),

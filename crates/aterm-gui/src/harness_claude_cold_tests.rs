@@ -285,7 +285,13 @@ fn owned_helper_retained_managed_authority_rechecks_owner_and_generation() {
             now: c.a.clock(),
         };
         seed.account_intent = Some(Box::new(
-            accounts_pool::capture_execution(&pool, accounts::Cli::Claude, &context.who).unwrap(),
+            accounts_pool::capture_execution(
+                &pool,
+                accounts::Cli::Claude,
+                &context.who,
+                accounts_pool::Purpose::Select,
+            )
+            .unwrap(),
         ));
         let (resolved, context, pooled) =
             cold_resolve_at(&c.seat, &seed, &intent, &facts, &derive).unwrap();
@@ -310,9 +316,13 @@ fn owned_helper_retained_managed_authority_rechecks_owner_and_generation() {
         } else {
             aterm_uds::atomic_file::write(&Path::new(&c.original_dir).join(".claude.json"),
                 br#"{"oauthAccount":{"accountUuid":"synthetic-generation","emailAddress":"synthetic@example.invalid"}}"#, 0o600).unwrap();
-            let fresh =
-                accounts_pool::capture_execution(&pool, accounts::Cli::Claude, &context.who)
-                    .expect("the replacement metadata is valid fresh authority");
+            let fresh = accounts_pool::capture_execution(
+                &pool,
+                accounts::Cli::Claude,
+                &context.who,
+                accounts_pool::Purpose::Select,
+            )
+            .expect("the replacement metadata is valid fresh authority");
             assert_ne!(Some(&fresh), resolved.account_intent.as_deref());
         }
         assert!(cold_guard_at(&c.seat, &resolved, &context).is_err());

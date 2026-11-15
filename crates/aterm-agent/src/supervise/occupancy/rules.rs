@@ -9,8 +9,8 @@ use super::templates::{self, FactLine};
 use super::wakes::UNHEARD_MS;
 use super::wakes_seen::{WAKE_RULE, WakeSeen, WakeState, WakesSeen, head_key};
 use crate::harness::disk::Level;
-use crate::supervise::config::Autopilot;
 use crate::supervise::run::Guard;
+use alab_policy::config::Autopilot;
 
 /// `hold-room`'s slot term, as the board latches it over its looks (`AwaitSys::parse` reads it
 /// whole, its leading `sys` included).

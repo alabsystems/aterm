@@ -16,6 +16,17 @@ mod live {
 
     const HANG: Duration = Duration::from_secs(60);
 
+    /// A test binary waits for the real table as the tests' hang detector, never the production
+    /// bound a loaded machine can miss.
+    #[test]
+    fn a_test_binary_waits_for_the_table_as_its_hang_detector() {
+        assert!(crate::test_binary::this_is_a_test_binary());
+        assert_eq!(
+            crate::kproc::imp::table_wait(),
+            aterm_spec::wait::MUST_HAPPEN
+        );
+    }
+
     fn ps(args: &[&str]) -> Vec<String> {
         ps_in("C", args)
     }
@@ -261,7 +272,7 @@ mod live {
     }
 
     fn past_what_the_kernel_hands_over(pid: u32) -> bool {
-        crate::procargs::read(pid).is_none() && record(pid).is_some_and(|r| !r.zombie)
+        crate::procargs::read(pid).is_err() && record(pid).is_some_and(|r| !r.zombie)
     }
 
     /// Whether `ps` printed `pid`'s kernel name in parentheses, its word for a process whose
@@ -271,7 +282,7 @@ mod live {
     /// zombie's row, which both print in parentheses, does not differ.
     fn ps_read_no_arguments(pid: u32, ps_comm: &str) -> bool {
         record(pid).is_some_and(|r| !r.zombie && ps_comm == format!("({})", r.comm))
-            && crate::procargs::read(pid).is_some()
+            && crate::procargs::read(pid).is_ok()
     }
 
     #[test]
@@ -448,111 +459,87 @@ mod live {
     }
 }
 
-/// The bounded read of the whole table ([`super::imp::Bounded`]).
+/// The table's lane inside the exec gate ([`super::imp::inside`]): the lane's own laws (one call
+/// on one worker, the stall, contention, a read that panics) are `lane_tests.rs`'s.
 #[cfg(target_os = "macos")]
-mod bounded {
+mod gated {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 
     use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
-    use super::super::imp::Bounded;
+    use super::super::imp::inside;
+    use crate::exec_gate::{ExecGate, Reading, StillReading};
+    use crate::lane::{Lane, Read};
 
-    /// A read the kernel holds ends the wait with no answer, and while it is still in the kernel
-    /// a second read starts nothing and ends its bounded wait; once it returns, a read is answered.
-    /// The held read stands for a `KERN_PROC_ALL` read behind a process in the middle of an exec
-    /// (2026-11-06: 13 minutes): before the bound, the first call here never returned.
+    /// A bound a read that never ends outlasts: the stall and the refusal under test, not a
+    /// latency budget.
+    const HELD: Duration = Duration::from_millis(20);
+
+    /// AN EXEC IS REFUSED WHILE THE READ ITS CALLER GAVE UP ON IS STILL IN THE KERNEL, and goes
+    /// ahead once that read has returned: the lane names itself stalled and its worker's read
+    /// counts in the gate for as long as it is held. A read asked for while the gate is closed is
+    /// not made, and its asker is answered nothing at once: that is no stall. The held read
+    /// stands for a build front's table read behind another process's exec (m72, 2026-11-12:
+    /// seven fronts exec'ed over theirs, and none ever finished).
+    /// NEGATIVE CONTROL (by hand: the lane's reader reading inside a gate other than `GATE`, a
+    /// fresh `ExecGate`): this gate counts no read.
     #[test]
-    fn a_read_the_kernel_holds_ends_the_wait_and_starts_no_second() {
-        static BOUNDED: Bounded = Bounded::new();
+    fn a_read_its_caller_gave_up_on_refuses_the_exec_until_it_returns() {
+        static GATE: ExecGate = ExecGate::new();
         static OPEN: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
         static READS: AtomicUsize = AtomicUsize::new(0);
-        fn held() -> Option<u32> {
-            READS.fetch_add(1, Ordering::SeqCst);
-            let (open, opened) = &OPEN;
-            let mut now = open.lock().unwrap();
-            while !*now {
-                now = opened.wait(now).unwrap();
-            }
-            Some(7)
-        }
-        fn answered() -> Option<u32> {
-            READS.fetch_add(1, Ordering::SeqCst);
-            Some(9)
-        }
-        assert_eq!(BOUNDED.read(Duration::from_millis(20), held), None);
-        assert!(BOUNDED.in_flight(), "the held read is still in the kernel");
-        until_within(MUST_HAPPEN, "the held reader started", || {
-            (READS.load(Ordering::SeqCst) == 1).then_some(())
-        });
-        assert_eq!(BOUNDED.read(Duration::from_millis(20), answered), None);
-        assert_eq!(READS.load(Ordering::SeqCst), 1, "no second read started");
-        *OPEN.0.lock().unwrap() = true;
-        OPEN.1.notify_all();
-        until_within(MUST_HAPPEN, "the held read returned", || {
-            (!BOUNDED.in_flight()).then_some(())
-        });
-        assert_eq!(BOUNDED.read(MUST_HAPPEN, answered), Some(9));
-        assert_eq!(READS.load(Ordering::SeqCst), 2);
-    }
-
-    /// Contention is not an unreadable table, and a later reader gets a fresh snapshot.
-    #[test]
-    fn a_contending_reader_waits_then_takes_its_own_fresh_snapshot() {
-        static BOUNDED: Bounded = Bounded::new();
-        static OPEN: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
-        static READS: AtomicUsize = AtomicUsize::new(0);
-        fn held() -> Option<u32> {
-            READS.fetch_add(1, Ordering::SeqCst);
+        /// Held until `OPEN`: the first read stands for one the kernel holds, every later one
+        /// for one it answers. Its answer is which read it was.
+        fn read(_: &Reading) -> Option<usize> {
+            let nth = READS.fetch_add(1, Ordering::SeqCst) + 1;
             let mut open = OPEN.0.lock().unwrap();
             while !*open {
                 open = OPEN.1.wait(open).unwrap();
             }
-            Some(7)
+            Some(nth)
         }
-        fn fresh() -> Option<u32> {
-            READS.fetch_add(1, Ordering::SeqCst);
-            Some(9)
-        }
-        let first = std::thread::spawn(|| BOUNDED.read(MUST_HAPPEN, held));
-        until_within(MUST_HAPPEN, "the first read entered the kernel", || {
+        static LANE: Lane<(), Option<usize>> = Lane::new("kproc_table", |()| inside(&GATE, read));
+        let Read::Stalled(stall) = LANE.ask_within((), HELD) else {
+            panic!("a held read is stalled");
+        };
+        assert_eq!(stall.lane, "kproc_table");
+        until_within(MUST_HAPPEN, "the held read started", || {
             (READS.load(Ordering::SeqCst) == 1).then_some(())
         });
-        let (waiting, observed) = std::sync::mpsc::sync_channel(1);
-        let second = std::thread::spawn(move || {
-            let mut waiting = Some(waiting);
-            BOUNDED.read_observing_wait(MUST_HAPPEN, fresh, || {
-                if let Some(waiting) = waiting.take() {
-                    waiting.send(()).unwrap();
-                }
-            })
-        });
-        observed
-            .recv_timeout(MUST_HAPPEN)
-            .expect("the second caller waited behind the first");
-        assert_eq!(READS.load(Ordering::SeqCst), 1);
+        assert_eq!(GATE.in_kernel(), 1, "one read, counted once");
+        assert_eq!(GATE.close(HELD).err(), Some(StillReading(1)));
+        assert_eq!(
+            LANE.stall().map(|s| s.lane),
+            Some("kproc_table"),
+            "the read its asker gave up on is still held"
+        );
         *OPEN.0.lock().unwrap() = true;
         OPEN.1.notify_all();
-        assert_eq!(first.join().expect("the first caller"), Some(7));
-        assert_eq!(second.join().expect("the second caller"), Some(9));
-        assert_eq!(READS.load(Ordering::SeqCst), 2);
-    }
-
-    /// A read that panics lets go of the flag, so the next read starts.
-    #[test]
-    fn a_read_that_panics_lets_the_next_one_start() {
-        static BOUNDED: Bounded = Bounded::new();
-        fn panics() -> Option<u32> {
-            panic!("a read that panics")
-        }
-        fn answered() -> Option<u32> {
-            Some(3)
-        }
-        assert_eq!(BOUNDED.read(MUST_HAPPEN, panics), None);
-        until_within(MUST_HAPPEN, "the panicked read let go", || {
-            (!BOUNDED.in_flight()).then_some(())
+        let closed = GATE.close(MUST_HAPPEN).expect("the held read returned");
+        until_within(MUST_HAPPEN, "the lane took the late call's return", || {
+            LANE.stall().is_none().then_some(())
         });
-        assert_eq!(BOUNDED.read(MUST_HAPPEN, answered), Some(3));
+        match LANE.ask_within((), MUST_HAPPEN) {
+            Read::Answered { out, ended, .. } => {
+                assert_eq!(out, None, "a closed gate answers nothing");
+                assert_eq!(
+                    ended.map(|s| s.lane),
+                    Some("kproc_table"),
+                    "the held read's stall ended"
+                );
+            }
+            other => panic!("a closed gate is an answer, not a stall: {other:?}"),
+        }
+        assert_eq!(LANE.stall(), None, "a closed gate stalls nothing");
+        assert_eq!(
+            READS.load(Ordering::SeqCst),
+            1,
+            "no read behind a closed gate"
+        );
+        drop(closed);
+        assert_eq!(LANE.ask_within((), MUST_HAPPEN).answer(), Some(Some(2)));
+        assert_eq!(GATE.in_kernel(), 0, "the answered read left the gate");
     }
 }

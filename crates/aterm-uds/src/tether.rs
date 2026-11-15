@@ -6,13 +6,13 @@
 //! determine whether the helper ends.
 //!
 //! Linux has the parent-death signal: the child is spawned with `PR_SET_PDEATHSIG` set to
-//! `SIGTERM`, and a child that ignores it runs on. The kernel sends it when the thread that forked
-//! the child exits, so every tethered spawn forks on a spawner, a thread that lives as long as the
+//! `SIGTERM`, and a child that ignores it runs on. The kernel sends it when the thread that started
+//! the child exits, so every tethered spawn starts on a spawner, a thread that lives as long as the
 //! process (`spawned`): the child ends with the process, not with the thread that asked for it,
 //! which may end while the child runs on (its wait handed to the reaper). An exec in the process's
 //! place ends every other thread, the spawners among them, so it ends tethered children too. A
 //! process serving [`VERB`] on Linux sets the signal on itself, so it is tied to whichever thread
-//! forked it. Darwin has none, so a tethered spawn there runs this process's own executable as
+//! started it. Darwin has none, so a tethered spawn there runs this process's own executable as
 //! [`VERB`] first, under [`NAME`], and that tether leaves a watcher behind as it execs the child in
 //! its own place: the parent's handle names the child itself, its pid, its signals and its exit
 //! status. A Linux spawn whose child leads its own process group (below) runs so too, its signal
@@ -23,7 +23,7 @@
 //! adopted by launchd (on Linux by init, or the nearest subreaper), watching the parent's end and
 //! the child's exit: on Darwin by a kqueue watch on the parent's exit and exec (`NOTE_EXIT`,
 //! `NOTE_EXEC`) and on the child's exit; on Linux by pidfds (Linux 5.3), one of the thread that
-//! forked the tether, which ends at the parent's exit or exec as the signal's thread does
+//! started the tether, which ends at the parent's exit or exec as the signal's thread does
 //! (`THREAD_VAR`; `PIDFD_THREAD`, Linux 6.9; an older kernel watches the parent's own, readable
 //! at its exit alone), and one of the child. A Linux kernel with no pidfd, or a seccomp filter
 //! that refuses one, arms the watcher with nothing to watch, and the child is tied by its signal
@@ -362,6 +362,8 @@ impl Through {
                     .open(source)
             })
             .ok()?;
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let held = std::fs::File::from(crate::spawnfd::off_stdio(held.into()).ok()?);
             let meta = held.metadata().ok()?;
             image
                 .matches_metadata(&meta)
@@ -464,7 +466,7 @@ impl Through {
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn prepared(&self) -> Result<Option<&Path>, String> {
+    fn prepared(&self, execution_hang: Duration) -> Result<Option<&Path>, String> {
         let Some(path) = self.available() else {
             return Ok(None);
         };
@@ -480,9 +482,8 @@ impl Through {
         if self.ready.get().is_none() {
             let mut command = crate::spawnfd::command(path);
             command.arg(READY_VERB).process_group(0);
-            let output =
-                crate::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
-                    .map_err(|error| format!("tether helper did not prepare: {error}"))?;
+            let output = crate::deadline::output_within(&mut command, execution_hang)
+                .map_err(|error| format!("tether helper did not prepare: {error}"))?;
             if !output.status.success() || output.stdout != READY_LINE.as_bytes() {
                 return Err("tether helper returned no execution receipt".into());
             }
@@ -605,7 +606,7 @@ fn maps_file_at(line: &str, address: usize) -> Option<(&str, u64)> {
 /// This arms the same parent-death watch as [`entry`] without requiring a preceding exec.
 /// Use [`hold_parent_of`] when the original parent was captured before spawning, so an
 /// adopter cannot replace it before this entry runs.
-/// The same platform conditions apply; on Linux the signal follows the thread that forked
+/// The same platform conditions apply; on Linux the signal follows the thread that started
 /// this process, so that thread must live while it owns this process.
 /// # Errors
 /// The parent has already exited, or the platform cannot arm its watch.
@@ -662,16 +663,31 @@ pub fn executable() -> Option<&'static Path> {
 /// Helper preparation's lock, spawn or I/O fails, it hangs, or the child returns no
 /// successful execution receipt.
 pub fn prepared_executable() -> Result<Option<&'static Path>, String> {
+    prepared_executable_within(Duration::from_secs(60))
+}
+
+/// Prepare the retained helper with the caller's execution hang detector. Native first-exec
+/// qualification can use [`crate::deadline::FIRST_EXEC_HANG`] before starting a separate
+/// consumer budget; [`prepared_executable`] keeps the ordinary one-minute bound.
+/// On macOS and Linux a successful execution receipt is required and cached for this process.
+/// Other platforms use [`executable`] without an extra execution.
+///
+/// # Errors
+/// As [`prepared_executable`].
+pub fn prepared_executable_within(
+    execution_hang: Duration,
+) -> Result<Option<&'static Path>, String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         THROUGH
             .get()
             .and_then(Option::as_ref)
-            .map(Through::prepared)
+            .map(|recorded_image| recorded_image.prepared(execution_hang))
             .unwrap_or(Ok(None))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        let _ = execution_hang;
         Ok(executable())
     }
 }
@@ -752,7 +768,7 @@ pub(crate) fn route(
     } else {
         executable()?.to_path_buf()
     };
-    // The tether and its watcher read themselves, the parent and its forking thread by their
+    // The tether and its watcher read themselves, the parent and its spawning thread by their
     // pids in `/proc`, which must be this pid namespace's on every kernel; a watcher with no
     // pidfd scope for its group judges it empty by whole listings alone (`group::linger`).
     #[cfg(target_os = "linux")]
@@ -794,6 +810,10 @@ fn serve(rest: &[OsString]) -> ExitCode {
         );
         return ExitCode::from(UNTETHERED);
     }
+    if let Err(why) = crate::spawnfd::entry_barrier::before_exec() {
+        eprintln!("aterm: target entry was not released: {why}");
+        return ExitCode::from(UNTETHERED);
+    }
     // The exec searches the `PATH` the spawn gave this tether as its spawn would have searched
     // it: as a `PATH` a spawn sets, which on Darwin passes over an entry too long to join to the
     // name, unless the spawn left the child this process's own (Darwin's [`OWN_PATH_VAR`]), whose
@@ -801,7 +821,8 @@ fn serve(rest: &[OsString]) -> ExitCode {
     // (every one it inherits for a transparent spawn, stdio alone otherwise, and its exec status,
     // close-on-exec), so the exec hands them on as they are.
     let mut command = crate::spawnfd::transparent(program).into_command();
-    // The forking thread's id, the exec status and the search's rule are the tether's to read
+    command.env_remove(crate::spawnfd::entry_barrier::VAR);
+    // The spawning thread's id, the exec status and the search's rule are the tether's to read
     // ([`THREAD_VAR`], [`STATUS_VAR`], [`OWN_PATH_VAR`]), never the program's, as the test's
     // listing seam is.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
@@ -922,7 +943,7 @@ fn hold(parent: i32) -> Result<(), String> {
 }
 
 /// The variable a Linux tethered spawn that runs through its tether ([`route`]) names the thread
-/// that forked it by, in decimal: that thread ends at this process's exit or exec, as the one the
+/// that started it by, in decimal: that thread ends at this process's exit or exec, as the one the
 /// parent-death signal follows does ([`bind`]), so the tether's watcher watches it
 /// ([`parent_end`]). The tether takes it out of the program's environment.
 #[cfg(target_os = "linux")]
@@ -939,42 +960,27 @@ fn hold(parent: i32) -> Result<(), String> {
 }
 
 /// `PR_SET_PDEATHSIG` to `SIGTERM`, then the check that `parent` did not die before it was set:
-/// the kernel signals when the thread that forked this process exits, which for a tethered spawn
+/// the kernel signals when the thread that started this process exits, which for a tethered spawn
 /// is a spawner ([`spawned`]), alive as long as the process, and for a process serving [`VERB`]
-/// whichever thread forked it; a child that ignores `SIGTERM` runs on. Async-signal-safe (two
-/// system calls), for a spawn's hook between fork and exec.
+/// whichever thread started it; a child that ignores `SIGTERM` runs on. Two raw system calls
+/// (`spawnfd::bind_parent_death`), the ones a tethered spawn's child makes before its exec.
 ///
 /// # Errors
 /// `prctl`'s, or `ESRCH` when `parent` is no longer this process's parent.
 #[cfg(target_os = "linux")]
 pub(crate) fn bind(parent: i32) -> std::io::Result<()> {
-    const PR_SET_PDEATHSIG: i32 = 1;
-    unsafe extern "C" {
-        fn prctl(option: i32, ...) -> i32;
-    }
-    // SAFETY: `PR_SET_PDEATHSIG` takes one integer, the signal; it touches no memory of ours.
-    if unsafe {
-        prctl(
-            PR_SET_PDEATHSIG,
-            libc::c_ulong::from(libc::SIGTERM.unsigned_abs()),
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    if parent_is(parent) {
-        Ok(())
-    } else {
-        Err(std::io::Error::from_raw_os_error(libc::ESRCH))
+    match crate::spawnfd::bind_parent_death(parent) {
+        0 => Ok(()),
+        errno => Err(std::io::Error::from_raw_os_error(errno)),
     }
 }
 
-/// The name of each thread a tethered spawn forks on, a spawner ([`spawned`]).
+/// The name of each thread a tethered spawn starts on, a spawner ([`spawned`]).
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const SPAWNER: &str = "aterm-tether-spawner";
 
-/// One fork for a spawner. It is handed the spawner's way to list itself free again, which it
-/// calls once its fork is done and before it answers, so a caller that has its answer finds
+/// One spawn for a spawner. It is handed the spawner's way to list itself free again, which it
+/// calls once its spawn is done and before it answers, so a caller that has its answer finds
 /// that spawner free.
 #[cfg(any(target_os = "linux", test))]
 type Job = Box<dyn FnOnce(&dyn Fn()) + Send>;
@@ -984,7 +990,7 @@ type Job = Box<dyn FnOnce(&dyn Fn()) + Send>;
 #[cfg(any(target_os = "linux", test))]
 type Start = fn(std::thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
 
-/// The threads tethered spawns fork on ([`SPAWNER`]): each free one by the sender of its own
+/// The threads tethered spawns start on ([`SPAWNER`]): each free one by the sender of its own
 /// queue. A spawner keeps a sender of its own queue too, so its thread waits for its next job
 /// for as long as the process lives.
 #[cfg(any(target_os = "linux", test))]
@@ -1010,8 +1016,8 @@ fn start_thread(
 
 /// Runs `spawn` on a spawner ([`SPAWNER`]), a thread that lives as long as the process, and
 /// answers what `spawn` answered. Linux sends a tethered child's parent-death signal when the
-/// thread that forked it exits ([`bind`]), so a child forked here is tied to this process, not to
-/// the calling thread. The call waits for no other call's fork: it takes a free spawner, or
+/// thread that started it exits ([`bind`]), so a child started here is tied to this process, not
+/// to the calling thread. The call waits for no other call's spawn: it takes a free spawner, or
 /// starts one when none is free. `spawn` runs under `catch_unwind`: one that panics answers an
 /// error, and its spawner runs on.
 ///

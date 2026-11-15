@@ -83,6 +83,7 @@ fn said(ev: &StepEvent) -> String {
             ver.as_ref().map_or("-", StepId::as_str)
         ),
         StepEvent::Off { why } => format!("off {why}"),
+        StepEvent::Lost { n } => format!("lost {n}"),
     }
 }
 
@@ -176,7 +177,7 @@ fn the_labs_rollout_folds_to_its_legs() {
         "end 32 15611 23".into(),
     ];
     assert_eq!(saids(&batch), want);
-    assert_eq!((batch.lost, batch.overflow), (0, 0));
+    assert_eq!((batch.lost(), batch.overflow), (0, 0));
     assert!(batch.steps.iter().all(|s| s.state == StepState::Partial));
     assert_eq!(batch.end, End::default());
     let offs: Vec<u64> = batch.steps.iter().map(|s| s.pos.off).collect();
@@ -198,7 +199,7 @@ fn a_subagents_copy_steps_nothing() {
             "end 13 15211 13".into(),
         ]
     );
-    assert_eq!((batch.lost, batch.overflow), (0, 0));
+    assert_eq!((batch.lost(), batch.overflow), (0, 0));
     let headless: String = rows(SUBAGENT).skip(1).map(|r| format!("{r}\n")).collect();
     let phantoms = saids(&fold(&headless));
     for parent in [turn("10"), turn("17")] {
@@ -379,7 +380,7 @@ fn a_wrong_shape_latches_the_fold_off() {
     let long_call = [base.as_str(), &call(T0 + 2, &long, "functions", "exec")].concat();
     let (fold, batch) = fold_with(&long_call, 0, 0);
     assert!(!fold.broken());
-    assert_eq!(batch.lost, 1);
+    assert_eq!(batch.lost(), 1);
     assert!(!saids(&batch).iter().any(|s| s.starts_with("call")));
     let good = [
         base.as_str(),
@@ -435,6 +436,54 @@ fn history_folds_and_queues_nothing() {
     assert!(saids(&fold(&text)).contains(&turn("0e")));
 }
 
+/// A ROW BELOW THE ADOPTION IS LOST, NEVER HISTORY: a seamless update's successor arms its fold
+/// with the process's floor and the adoption. A call written after the predecessor's last read
+/// and dated below the adoption is the run's own, yet the join never places it: it is queued as
+/// one lost row at its end. A row older than the floor is history still, and one past the
+/// adoption is placed.
+/// CONTROL: the adoption taken as the floor (`set_adopted` raising the floor, as the tap armed
+/// it before) is caught: nothing lost.
+#[test]
+fn a_row_below_the_adoption_is_lost_never_history() {
+    let text: String = [
+        opening(),
+        ctx(T0 + 1_000, "turn-1", "gpt-6.1-sol"),
+        call(T0 + 1_500, "call_old", "", "exec"),
+        call(T0 + 2_000, "call_hid", "", "exec"),
+        call(T0 + 4_000, "call_new", "", "exec"),
+    ]
+    .concat();
+    let ends: Vec<u64> = rows(&text)
+        .scan(0, |o, r| {
+            *o += r.len() as u64 + 1;
+            Some(*o)
+        })
+        .collect();
+    assert_eq!(ends.len(), 5, "PRECONDITION: {text}");
+    let at = |ms: i64| u64::try_from(T0 + ms).expect("ms");
+    let mut fold = CodexStepFold::new(at(1_800));
+    fold.set_adopted(at(3_000));
+    fold.bind(FP, ID, ends[1]);
+    for (row, end) in rows(&text).zip(&ends) {
+        fold.push(row.as_bytes(), *end);
+    }
+    let batch = fold.take();
+    let got: Vec<(u64, String)> = batch
+        .steps
+        .iter()
+        .map(|s| (s.pos.off, said(&s.ev)))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (ends[1], format!("bind {}", ends[1])),
+            (ends[3], "lost 1".to_string()),
+            (ends[4], "call call_new exec other".to_string()),
+        ],
+        "the hidden row is lost at its end; the older one is history"
+    );
+}
+
 #[test]
 fn the_queue_is_bounded() {
     let calls: String = (0..STEP_QUEUE + 10)
@@ -483,20 +532,32 @@ fn a_rollout_is_read_within_its_bounds() {
     assert!(read.complete);
     assert_eq!(read.long, 1);
     let batch = fold.take();
-    assert_eq!(batch.lost, 2, "the long line and the one not UTF-8");
+    assert_eq!(batch.lost(), 2, "the long line and the one not UTF-8");
     assert_eq!(
         saids(&batch),
         [
             "bind 0",
             "prompt turn-1",
             "model gpt-6.1-sol - 0.163.0",
+            "lost 1",
+            "lost 1",
             "end 5 0 0"
-        ]
+        ],
+        "each lost line in its place"
+    );
+    assert_eq!(
+        batch
+            .steps
+            .iter()
+            .find(|s| s.ev == StepEvent::Lost { n: 1 })
+            .map(|s| s.pos.off),
+        Some(long_end),
+        "the long line is lost at its end"
     );
     let mut fold = CodexStepFold::new(0);
     fold.bind(FP, ID, long_end);
     fold_rollout(&path, &mut fold, u64::MAX).expect("read");
-    assert_eq!(fold.take().lost, 1, "only the line past the seed");
+    assert_eq!(fold.take().lost(), 1, "only the line past the seed");
     let mut fold = CodexStepFold::new(0);
     fold.bind(FP, ID, 0);
     let short = fold_rollout(&path, &mut fold, head.len() as u64).expect("read");
@@ -553,7 +614,7 @@ fn every_committed_codex_reduction_folds_whole() {
             );
         }
         let batch = fold(&text);
-        assert_eq!((batch.lost, batch.overflow), (0, 0), "{name}");
+        assert_eq!((batch.lost(), batch.overflow), (0, 0), "{name}");
         let want = state_for(CODEX_MEASURED_BUILDS, Some(build));
         for s in &batch.steps[1..] {
             assert!(!matches!(s.ev, StepEvent::Off { .. }), "{name}");
@@ -1181,10 +1242,11 @@ fn leg_holds(build: &str, name: &str, text: &str) -> Result<Vec<String>, String>
     if read.first().map(String::as_str) != Some("bind 0") {
         return Err(format!("{name}: no bind first: {read:?}"));
     }
-    if (batch.lost, batch.overflow) != (0, 0) {
+    if (batch.lost(), batch.overflow) != (0, 0) {
         return Err(format!(
             "{name}: lost {} and overflowed {}",
-            batch.lost, batch.overflow
+            batch.lost(),
+            batch.overflow
         ));
     }
     if !batch.steps[1..].iter().all(|s| s.state == StepState::On) {
@@ -1522,7 +1584,7 @@ fn a_failed_command_fails_its_step() {
     let batch = fold(&failed);
     assert_eq!(saids(&batch), failing(&plain, "call_r0010"));
     assert!(batch.steps[1..].iter().all(|s| s.state == StepState::On));
-    assert_eq!((batch.lost, batch.overflow), (0, 0));
+    assert_eq!((batch.lost(), batch.overflow), (0, 0));
 }
 
 /// A declined command's completion says `-1` (codex-rs/core/src/tools/events.rs): a failed step.

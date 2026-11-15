@@ -303,6 +303,15 @@ fn a_translated_image_requires_the_kernel_exec_descriptor_and_its_mapping() {
         if let Some(loaded) = loaded {
             assert_eq!(loaded.launch_path(), program);
             assert_eq!(loaded.matches_file(&program), Some(true));
+            let meta = std::fs::metadata(&program).unwrap();
+            assert_eq!(
+                loaded.file_identity(),
+                Some(aterm_sysprobe::kproc::ImageFile {
+                    device: meta.dev(),
+                    inode: meta.ino(),
+                }),
+                "ownership names the translated guest, never the shared translator"
+            );
             let next = root.path().join("next");
             std::fs::write(&next, b"next").unwrap();
             std::fs::rename(next, &program).unwrap();

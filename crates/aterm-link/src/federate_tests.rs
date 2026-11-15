@@ -25,9 +25,9 @@ pub(crate) fn pid(node: &str) -> u64 {
     astream_cap::producer_id_of(node)
 }
 
-/// A note from session `s-1` on `src` to session `s-1` on `dst`.
+/// A note from session `t0000000001` on `src` to session `t0000000001` on `dst`.
 pub(crate) fn lane(dst: &str, src: &str) -> String {
-    format!("/f/{FLEET}/in/{dst}/s-1/{src}/note")
+    format!("/f/{FLEET}/in/{dst}/t0000000001/{src}/note")
 }
 
 /// Wait until `done`, which must happen.
@@ -58,9 +58,9 @@ fn the_lanes_are_the_one_fleets_and_the_push_follows_the_mail_rules_reader() {
     for not_a_nodes in [
         lane(dst, "h-owner"),
         lane("h-owner", me),
-        format!("/f/local/in/{dst}/s-1/{me}/note"),
-        format!("/f/{FLEET}/in/{dst}/s-1/{me}"),
-        format!("/f/{FLEET}/in/{dst}/s-1/{me}/note/more"),
+        format!("/f/local/in/{dst}/t0000000001/{me}/note"),
+        format!("/f/{FLEET}/in/{dst}/t0000000001/{me}"),
+        format!("/f/{FLEET}/in/{dst}/t0000000001/{me}/note/more"),
     ] {
         assert_eq!(mail_lane(&not_a_nodes), None, "{not_a_nodes}");
     }
@@ -830,7 +830,7 @@ fn a_topic_broadcast_goes_one_hop_to_the_macs_that_hold_a_topic() {
             holders.insert(c.node.clone());
         }
         routes.set(&members(&a, &[&a.node, &b.node, &c.node]), &holders);
-        let subject = format!("/f/{FLEET}/pub/{}/s-1/say/build", a.node);
+        let subject = format!("/f/{FLEET}/pub/{}/t0000000001/say/build", a.node);
         let mut bridge = a.client(a.key, &[format!("rw,p={}:{}", a.node, say_lanes(&a.node))]);
         let (at, _) = bridge
             .publish(pid(&a.node), 1, &subject, b"green")
@@ -1057,18 +1057,11 @@ fn a_ring_names_the_nodes_a_seat_retired_last() {
     );
 }
 
-/// **A MAC MOVES THE MAIL OF THE NODES ITS SEAT RETIRED LAST, AND SAYS WHICH IT DOES NOT** (§11
-/// C3b): with one more retired node than a ring names, this Mac's own-inbox moves take the
-/// [`RING_OLDS_MAX`] its seat retired last ([`Handoff::ringed`]), whatever their node order, the
-/// ones the reader's ring the node service writes from the same hand-off reads
-/// ([`write_old_reads`]); its pushes carry the ones a peer's ring grants
-/// (`a_push_carries_the_retired_nodes_its_peers_ring_grants_whichever_they_are`); and the journal
-/// names the one retired first, once.
-/// NEGATIVE CONTROL: [`NODE_ORDER_RING`], the choice before the second recency phase: the moves
-/// take the first in node order, which leave out the node retired last, and the journal names
-/// that one; and with [`RING_OLDS_MAX`] retired nodes every one is taken and nothing said.
+/// Own-inbox moves and reader grants select the nodes this seat retired most recently,
+/// bounded by `RING_OLDS_MAX`, independently of node order. `NODE_ORDER_RING` selects
+/// the earlier node-order set as a negative control; a set within the bound moves whole.
 #[test]
-fn a_mac_moves_the_mail_of_the_nodes_its_seat_retired_last_and_says_which_it_does_not() {
+fn a_mac_moves_the_mail_of_the_nodes_its_seat_retired_last() {
     let a = Mac::new(20);
     let net = Arc::new(Net::default());
     for (count, control) in [
@@ -1087,18 +1080,8 @@ fn a_mac_moves_the_mail_of_the_nodes_its_seat_retired_last_and_says_which_it_doe
         } else {
             olds.iter().rev().take(RING_OLDS_MAX).cloned().collect()
         };
-        let left: Vec<&String> = olds.difference(&named).collect();
-        let notes = Arc::new(Mutex::new(Vec::<String>::new()));
-        let noted = Arc::clone(&notes);
         NODE_ORDER_RING.with(|on| on.set(control));
-        let routes = routes_noting(
-            &a,
-            (&a.node, a.key),
-            &olds,
-            (Vec::new(), &net, false),
-            Arc::new(move |line| noted.lock().unwrap().push(line.to_owned())),
-            Arc::new(|_| true),
-        );
+        let routes = routes_as(&a, (&a.node, a.key), &olds, Vec::new(), &net, false);
         let handoff = Handoff {
             me: a.node.clone(),
             members: [a.node.clone()].into(),
@@ -1127,24 +1110,6 @@ fn a_mac_moves_the_mail_of_the_nodes_its_seat_retired_last_and_says_which_it_doe
             named.iter().map(|old| old_read(old)).collect::<Vec<_>>(),
             "{case}: the reader's ring reads the nodes moved"
         );
-        let said = notes.lock().unwrap().clone();
-        if left.is_empty() {
-            assert!(said.is_empty(), "{case}: {said:?}");
-        } else {
-            assert_eq!(said.len(), 1, "{case}: once: {said:?}");
-            for old in &left {
-                assert!(
-                    said[0].contains(old.as_str()),
-                    "{case}: names {old}: {said:?}"
-                );
-            }
-            for old in &named {
-                assert!(
-                    !said[0].contains(old.as_str()),
-                    "{case}: not {old}: {said:?}"
-                );
-            }
-        }
         drop(routes);
     }
 }

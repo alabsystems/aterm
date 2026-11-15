@@ -493,15 +493,28 @@ fn an_unchanged_intervening_release_does_not_stale_an_announcement() {
 #[cfg(unix)]
 fn applying_a_bump_uses_native_release_objects_and_stops_before_untrusted_writes() {
     struct LocalOnly<'a>(&'a dyn GitRunner);
-    impl GitRunner for LocalOnly<'_> {
-        fn git(&self, args: &[&str]) -> Result<crate::ledger::RunOut> {
+    impl LocalOnly<'_> {
+        fn local(args: &[&str]) {
             assert!(
                 !args
                     .iter()
                     .any(|arg| matches!(*arg, "fetch" | "push" | "ls-remote")),
                 "harness application must use its typed origin: {args:?}"
             );
+        }
+    }
+    impl GitRunner for LocalOnly<'_> {
+        fn git(&self, args: &[&str]) -> Result<crate::ledger::RunOut> {
+            Self::local(args);
             self.0.git(args)
+        }
+        fn git_read(&self, args: &[&str]) -> Result<crate::ledger::RunOut> {
+            Self::local(args);
+            self.0.git_read(args)
+        }
+        fn git_read_input(&self, args: &[&str], input: &[u8]) -> Result<crate::ledger::RunOut> {
+            Self::local(args);
+            self.0.git_read_input(args, input)
         }
     }
     let tmp = aterm_tempfile::TempDir::new().unwrap();

@@ -10,7 +10,7 @@ fn a_stage_diagnostic_is_durable_before_its_held_sibling_finishes() {
     fn stage(ctx: &Ctx, spec: &plan::StageSpec) -> Report {
         let mut report = Report::new(spec.title.clone());
         let until = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        if spec.id == plan::StageId::Doctests {
+        if spec.id == plan::StageId::TestCompile {
             std::fs::write(ctx.scratch.join("sibling-started"), "").unwrap();
             let release = ctx.scratch.join("release-sibling");
             while !release.exists() && std::time::Instant::now() < until {
@@ -39,7 +39,7 @@ fn a_stage_diagnostic_is_durable_before_its_held_sibling_finishes() {
         EnvSnapshot::default(),
         dir.path().into(),
     )
-    .with_checks(&[Check::Doc, Check::Libc])
+    .with_checks(&[Check::Test, Check::Libc])
     .with_events(Some(event_log::EventLog::open(&events).unwrap()));
     let (early, held, result, stdout) = std::thread::scope(|scope| {
         let worker = scope.spawn(|| {

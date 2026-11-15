@@ -12,7 +12,7 @@ use aterm_models_agh::agh_git_grant_model;
 use aterm_spec::walk::walk;
 use aterm_spec::{interp, verify};
 
-const HELPER_AND_WORLD: [&str; 14] = [
+const HELPER_AND_WORLD: [&str; 16] = [
     "Answer",
     "ChildExits",
     "Consume",
@@ -27,8 +27,10 @@ const HELPER_AND_WORLD: [&str; 14] = [
     "TogglePath",
     "ToggleSlug",
     "ToggleTty",
+    "ToggleSupplied",
+    "ToggleBinding",
 ];
-const MUTANTS: [&str; 9] = [
+const MUTANTS: [&str; 11] = [
     "BuggyEraseAnswers",
     "BuggyForeignHost",
     "BuggyOtherPid",
@@ -38,6 +40,8 @@ const MUTANTS: [&str; 9] = [
     "BuggyStaleGrant",
     "BuggyTtyAnswers",
     "BuggyWrongSlug",
+    "BuggySuppliedFallback",
+    "BuggyMismatchedCredential",
 ];
 
 /// A walk: the actions fired in order from the initial state.
@@ -45,8 +49,8 @@ type Walk = &'static [&'static str];
 /// The values a walk must end with: (variable, value).
 type Values = [(&'static str, i64); 2];
 
-/// At `Buggy = 0` exactly the fourteen helper and world actions fire, at `Buggy = 1` all
-/// twenty-three do, and the model is proved at 0 and caught at 1.
+/// At `Buggy = 0` exactly the sixteen helper and world actions fire, at `Buggy = 1` all
+/// twenty-seven do, and the model is proved at 0 and caught at 1.
 #[test]
 fn git_grant_proves_catches_and_fires_every_action() {
     let model = agh_git_grant_model();
@@ -54,17 +58,17 @@ fn git_grant_proves_catches_and_fires_every_action() {
     assert_eq!(interp::fired_actions(&model), lawful);
     let every: BTreeSet<&str> = HELPER_AND_WORLD.into_iter().chain(MUTANTS).collect();
     assert_eq!(interp::fired_actions(&interp::with_buggy(&model, 1)), every);
-    assert_eq!(model.actions.len(), 23);
+    assert_eq!(model.actions.len(), 27);
     verify::prove_and_catch_scalar(
         &model,
         "agh git grant: github.com with a path only, no terminal, store and erase inert, release tier only under a live grant for its slug and process tree",
     );
 }
 
-/// The fault sweep finds nothing, and each of the nine mutants is an audited negative
+/// The fault sweep finds nothing, and each of the eleven mutants is an audited negative
 /// control.
 #[test]
-fn git_grant_has_no_fault_and_nine_audited_controls() {
+fn git_grant_has_no_fault_and_eleven_audited_controls() {
     let model = agh_git_grant_model();
     assert_eq!(
         verify::sweep_faults(std::slice::from_ref(&model)),
@@ -72,7 +76,7 @@ fn git_grant_has_no_fault_and_nine_audited_controls() {
     );
     assert_eq!(
         verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
-        Ok(9)
+        Ok(11)
     );
 }
 
@@ -80,7 +84,7 @@ fn git_grant_has_no_fault_and_nine_audited_controls() {
 #[test]
 fn each_mutant_breaks_its_law() {
     let buggy = interp::with_buggy(&agh_git_grant_model(), 1);
-    let rows: [(Walk, &[&str]); 9] = [
+    let rows: [(Walk, &[&str]); 11] = [
         (&["TogglePath", "BuggyPathless"], &["PathlessGetsNothing"]),
         (&["ToggleHost", "BuggyForeignHost"], &["GithubOnly"]),
         (&["ToggleTty", "BuggyTtyAnswers"], &["NoTerminalDoor"]),
@@ -102,6 +106,14 @@ fn each_mutant_breaks_its_law() {
             &["GrantSlugBound"],
         ),
         (&["Spawn", "BuggyReleaseForDev"], &["ReleaseStaysHome"]),
+        (
+            &["ToggleSupplied", "BuggySuppliedFallback"],
+            &["SuppliedGrantBound"],
+        ),
+        (
+            &["Spawn", "ToggleBinding", "BuggyMismatchedCredential"],
+            &["GrantCredentialBound"],
+        ),
     ];
     for (path, laws) in rows {
         let state = walk(&buggy, path);
@@ -118,8 +130,13 @@ fn each_mutant_breaks_its_law() {
 #[test]
 fn the_answer_table_at_buggy_zero() {
     let model = agh_git_grant_model();
-    let rows: [(Walk, Values); 8] = [
+    let rows: [(Walk, Values); 10] = [
         (&["Answer"], [("phase", 1), ("used", 1)]),
+        (&["ToggleSupplied", "Answer"], [("phase", 2), ("used", 0)]),
+        (
+            &["Spawn", "ToggleBinding", "Answer"],
+            [("phase", 2), ("used", 0)],
+        ),
         (&["NextTier", "Answer"], [("phase", 2), ("used", 0)]),
         (
             &["NextTier", "Spawn", "Answer"],

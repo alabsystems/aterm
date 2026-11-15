@@ -457,12 +457,18 @@ impl InboxRow {
     }
 }
 
-/// The sender class of a delivered row, read from the prefix the subject's `<src>` segment carries.
+/// The sender class of a delivered row, read from the prefix the subject's `<src>` segment carries:
+/// a session is a tab ID or a legacy tab's ID ([`aterm_types::tab_id::is_legacy`]), bare or as
+/// `<sid>@<node>`.
 #[inline]
 pub fn sender_class(from: &str) -> &'static str {
+    let session = from.split_once('@').map_or(from, |(sid, _)| sid);
     if from.starts_with("h-") {
         "human"
-    } else if from.starts_with("s-") || from.starts_with("fleet:") {
+    } else if aterm_types::tab_id::is_tab_id(session)
+        || aterm_types::tab_id::is_legacy(session)
+        || from.starts_with("fleet:")
+    {
         "agent"
     } else if from.starts_with("a-") {
         "service"
@@ -598,12 +604,12 @@ pub struct Driver {
 }
 
 thread_local! {
-    static DRIVING: std::cell::RefCell<Option<(Driver, Requester)>> =
+    static DRIVING: std::cell::RefCell<Option<Box<(Driver, Requester)>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Marks the connection this thread serves as a remote node's drive connection until dropped.
-pub struct DrivingAs(Option<(Driver, Requester)>);
+pub struct DrivingAs(Option<Box<(Driver, Requester)>>);
 
 impl DrivingAs {
     /// Serve as `driver` for no named requester until the guard drops.
@@ -616,7 +622,7 @@ impl DrivingAs {
     /// names: a claim within the node `driver` proved, kept apart from it ([`serving_requester`]).
     #[must_use]
     pub fn requested(driver: Driver, requester: Requester) -> Self {
-        Self(DRIVING.with(|driving| driving.replace(Some((driver, requester)))))
+        Self(DRIVING.with(|driving| driving.replace(Some(Box::new((driver, requester))))))
     }
 }
 
@@ -630,7 +636,12 @@ impl Drop for DrivingAs {
 /// The remote node this thread serves a drive connection for, if any.
 #[must_use]
 pub fn serving_driver() -> Option<Driver> {
-    DRIVING.with(|driving| driving.borrow().as_ref().map(|(driver, _)| driver.clone()))
+    DRIVING.with(|driving| {
+        driving
+            .borrow()
+            .as_deref()
+            .map(|(driver, _)| driver.clone())
+    })
 }
 
 /// Who on the driving Mac asked for the drive this thread serves, as its first line claims
@@ -641,7 +652,7 @@ pub fn serving_requester() -> Option<Requester> {
     DRIVING.with(|driving| {
         driving
             .borrow()
-            .as_ref()
+            .as_deref()
             .map(|(_, requester)| requester.clone())
     })
 }

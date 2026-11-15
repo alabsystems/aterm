@@ -1352,12 +1352,12 @@ fn a_quota_view_at_rest_costs_nothing_and_a_moved_figure_composes_once() {
     // repaint key, so the rule composes once and says the stop in words.
     let mut stop = quota_unit(6);
     if let Some(view) = stop.quota.as_mut() {
-        view.tail.verdict = Some(aterm_agent::harness::quota_view::Phrase {
-            full: "\u{2573} ~Wed 22:00\u{2013}Thu 09:00".into(),
-            short: "\u{2573} ~Wed 22:00".into(),
-            ink: aterm_agent::harness::quota_view::Role::Warn,
-            kept: true,
-        });
+        view.tail.verdict = Some(aterm_agent::harness::quota_view::Phrase::new(
+            "\u{2573} ~Wed 22:00\u{2013}Thu 09:00".into(),
+            "\u{2573} ~Wed 22:00".into(),
+            aterm_agent::harness::quota_view::Role::Warn,
+            true,
+        ));
     }
     publish(&app, session, stop);
     let told = cost(&mut app, wid);

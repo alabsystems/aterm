@@ -23,55 +23,6 @@ pub struct MetadataFailureObservation {
     pub capture_error: Option<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn observation() -> MetadataFailureObservation {
-        MetadataFailureObservation {
-            root_attempt: [1; 16],
-            member_attempt: [3; 16],
-            stdout: b"retained\0stdout".to_vec(),
-            stderr: vec![0xff],
-            stdout_eof: false,
-            stderr_eof: true,
-            output_limit_exceeded: false,
-            event_prefix: vec![0, 0, 0, 8, 1],
-            event_bytes_seen: 5,
-            capture_error: None,
-        }
-    }
-    #[test]
-    fn failure_data_is_bounded_versioned_and_never_a_native_execution_event() {
-        let value = observation();
-        let bytes = value.encode().unwrap();
-        assert_eq!(MetadataFailureObservation::decode(&bytes).unwrap(), value);
-        assert!(crate::MetadataEvent::decode(&bytes, [1; 16], [3; 16]).is_err());
-        assert!(crate::Request::decode(&bytes).is_err());
-        assert!(crate::Call::decode(&bytes).is_err());
-        let mut changed = bytes.clone();
-        changed[23] = 2;
-        assert!(MetadataFailureObservation::decode(&changed).is_err());
-        let mut trailing = bytes;
-        trailing.push(0);
-        assert!(MetadataFailureObservation::decode(&trailing).is_err());
-        for change in 0..5 {
-            let mut invalid = value.clone();
-            match change {
-                0 => invalid.member_attempt = invalid.root_attempt,
-                1 => invalid.stdout.resize(METADATA_MAX_OUTPUT + 1, 0),
-                2 => invalid.event_bytes_seen -= 1,
-                3 => invalid.event_prefix.resize(METADATA_EVENT_PREFIX_MAX_BYTES + 1, 0),
-                _ => invalid.capture_error = Some(String::new()),
-            }
-            assert!(invalid.encode().is_err());
-        }
-        let mut truncated = value;
-        truncated.event_prefix.resize(METADATA_EVENT_PREFIX_MAX_BYTES, 0);
-        truncated.event_bytes_seen = truncated.event_prefix.len() as u64 + 100;
-        assert!(truncated.event_prefix_truncated());
-        assert!(truncated.encode().is_ok());
-    }
-}
 impl MetadataFailureObservation {
     pub fn validate(&self) -> io::Result<()> {
         if self.root_attempt == [0; 16]
@@ -161,5 +112,55 @@ impl MetadataFailureObservation {
         };
         value.validate()?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn observation() -> MetadataFailureObservation {
+        MetadataFailureObservation {
+            root_attempt: [1; 16],
+            member_attempt: [3; 16],
+            stdout: b"retained\0stdout".to_vec(),
+            stderr: vec![0xff],
+            stdout_eof: false,
+            stderr_eof: true,
+            output_limit_exceeded: false,
+            event_prefix: vec![0, 0, 0, 8, 1],
+            event_bytes_seen: 5,
+            capture_error: None,
+        }
+    }
+    #[test]
+    fn failure_data_is_bounded_versioned_and_never_a_native_execution_event() {
+        let value = observation();
+        let bytes = value.encode().unwrap();
+        assert_eq!(MetadataFailureObservation::decode(&bytes).unwrap(), value);
+        assert!(crate::MetadataEvent::decode(&bytes, [1; 16], [3; 16]).is_err());
+        assert!(crate::Request::decode(&bytes).is_err());
+        assert!(crate::Call::decode(&bytes).is_err());
+        let mut changed = bytes.clone();
+        changed[23] = 2;
+        assert!(MetadataFailureObservation::decode(&changed).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(MetadataFailureObservation::decode(&trailing).is_err());
+        for change in 0..5 {
+            let mut invalid = value.clone();
+            match change {
+                0 => invalid.member_attempt = invalid.root_attempt,
+                1 => invalid.stdout.resize(METADATA_MAX_OUTPUT + 1, 0),
+                2 => invalid.event_bytes_seen -= 1,
+                3 => invalid.event_prefix.resize(METADATA_EVENT_PREFIX_MAX_BYTES + 1, 0),
+                _ => invalid.capture_error = Some(String::new()),
+            }
+            assert!(invalid.encode().is_err());
+        }
+        let mut truncated = value;
+        truncated.event_prefix.resize(METADATA_EVENT_PREFIX_MAX_BYTES, 0);
+        truncated.event_bytes_seen = truncated.event_prefix.len() as u64 + 100;
+        assert!(truncated.event_prefix_truncated());
+        assert!(truncated.encode().is_ok());
     }
 }

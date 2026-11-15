@@ -4,6 +4,7 @@
 //! [`SessionSetup`].
 
 use super::*;
+use crate::supervise::config::{ladder_scale, timing_for_seams};
 use crate::supervise::tape::header::{Entry, Header};
 
 struct NoCtl;
@@ -292,14 +293,13 @@ fn the_ladder_seam_scales_the_short_and_outage_ladders_and_nothing_else() {
     let steps = |t: &TurnEndTiming| -> Vec<u64> {
         (0..7)
             .map(|n| {
-                crate::supervise::ladder::doubling(t.short_backoff, n, t.short_backoff_max)
-                    .as_secs()
+                alab_policy::ladder::doubling(t.short_backoff, n, t.short_backoff_max).as_secs()
             })
             .collect()
     };
     let outage = |t: &TurnEndTiming| -> Vec<u64> {
         (0..7)
-            .map(|n| crate::supervise::ladder::doubling(t.outage_first, n, t.outage_cap).as_secs())
+            .map(|n| alab_policy::ladder::doubling(t.outage_first, n, t.outage_cap).as_secs())
             .collect()
     };
     assert_eq!(steps(&scaled), [15, 30, 60, 120, 240, 450, 450]);
@@ -322,14 +322,14 @@ fn the_ladder_seam_scales_the_short_and_outage_ladders_and_nothing_else() {
         "only the ladders move"
     );
     assert_eq!(TurnEndTiming::default().ladder_scaled(1.0), shipped);
-    let read = |v: &str| TurnEndTiming::ladder_scale(Some(OsStr::new(v)));
+    let read = |v: &str| ladder_scale(Some(OsStr::new(v)));
     assert_eq!(read("0.125"), Some(0.125));
     assert_eq!(read(" 0.5 "), Some(0.5));
     assert_eq!(read("1"), Some(1.0));
     for bad in ["0", "-0.5", "1.5", "nan", "inf", "eighth", ""] {
         assert_eq!(read(bad), None, "{bad:?}");
     }
-    assert_eq!(TurnEndTiming::ladder_scale(None), None);
+    assert_eq!(ladder_scale(None), None);
     let mut setup = SessionSetup::new(None);
     setup.approval_env.worker = WorkerSource::Session;
     setup.turn_end_timing = scaled.clone();
@@ -346,12 +346,10 @@ fn the_ladder_seam_scales_the_short_and_outage_ladders_and_nothing_else() {
 /// the span's: a world test's carry-on comes at the wall's own reset (`ATERM_DEV_RESET_SCALE`).
 #[test]
 fn the_reset_seam_scales_the_wait_past_a_walls_reset_and_nothing_else() {
-    use crate::supervise::policy::turn_end::{
-        LADDER_SCALE_SEAM, RESET_SCALE_SEAM, RESET_SPAN_SCALE_SEAM,
-    };
+    use crate::supervise::config::{LADDER_SCALE_SEAM, RESET_SCALE_SEAM, RESET_SPAN_SCALE_SEAM};
     use std::ffi::OsStr;
     let shipped = TurnEndTiming::default();
-    let scaled = TurnEndTiming::for_seams(None, Some(OsStr::new("0.5")), None);
+    let scaled = timing_for_seams(None, Some(OsStr::new("0.5")), None);
     assert_eq!(
         (scaled.reset_grace, scaled.reset_jitter),
         (Duration::from_secs(75), Duration::from_secs(30))
@@ -365,88 +363,47 @@ fn the_reset_seam_scales_the_wait_past_a_walls_reset_and_nothing_else() {
         shipped,
         "only the reset's wait moves"
     );
-    let both = TurnEndTiming::for_seams(Some(OsStr::new("0.125")), Some(OsStr::new("0.5")), None);
+    let both = timing_for_seams(Some(OsStr::new("0.125")), Some(OsStr::new("0.5")), None);
     assert_eq!(
         both,
         scaled.clone().ladder_scaled(0.125),
         "each seam its own"
     );
-    let all = TurnEndTiming::for_seams(
+    let all = timing_for_seams(
         Some(OsStr::new("0.125")),
         Some(OsStr::new("0.5")),
         Some(OsStr::new("0.05")),
     );
     assert_eq!(all, both.reset_span_scaled(0.05), "each seam its own");
-    assert_eq!(TurnEndTiming::for_seams(None, None, None), shipped);
+    assert_eq!(timing_for_seams(None, None, None), shipped);
     for bad in ["0", "1.5", "nan", "soon"] {
         let bad = Some(OsStr::new(bad));
-        assert_eq!(
-            TurnEndTiming::for_seams(None, bad, None),
-            shipped,
-            "{bad:?}"
-        );
-        assert_eq!(
-            TurnEndTiming::for_seams(None, None, bad),
-            shipped,
-            "{bad:?}"
-        );
+        assert_eq!(timing_for_seams(None, bad, None), shipped, "{bad:?}");
+        assert_eq!(timing_for_seams(None, None, bad), shipped, "{bad:?}");
     }
     assert_ne!(LADDER_SCALE_SEAM, RESET_SCALE_SEAM);
     assert_ne!(RESET_SPAN_SCALE_SEAM, RESET_SCALE_SEAM);
     assert_ne!(RESET_SPAN_SCALE_SEAM, LADDER_SCALE_SEAM);
 }
 
-/// THE SPAN SEAM PLACES A WALL'S RESET SOONER, NEVER BEFORE ITS SCALED TIME
-/// (`ATERM_DEV_RESET_SPAN_SCALE`): at a twentieth, `in 1m` falls three seconds after a read on a
-/// whole second, and on the first whole second at or after its scaled time from any other read;
-/// a shipped timing, the seam at one, a reset at or before the read and one too far off to scale
-/// leave it where its words name it.
+/// THE SPAN SEAM SCALES THE TIME TO A WALL'S RESET AND NOTHING ELSE
+/// (`ATERM_DEV_RESET_SPAN_SCALE`): at a twentieth a minute of it lasts three seconds, as
+/// [`TurnEndTiming::reset_span_scaled`] places the reset, and the seam at one leaves the shipped
+/// timing.
 #[test]
-fn the_span_seam_places_a_walls_reset_sooner_and_never_before_its_scaled_time() {
+fn the_span_seam_scales_the_time_to_a_walls_reset_and_nothing_else() {
     use std::ffi::OsStr;
     let shipped = TurnEndTiming::default();
-    let span = TurnEndTiming::for_seams(None, None, Some(OsStr::new("0.05")));
+    let span = timing_for_seams(None, None, Some(OsStr::new("0.05")));
     assert_eq!(span.reset_minute, Duration::from_secs(3));
+    assert_eq!(span, shipped.clone().reset_span_scaled(0.05));
     assert_eq!(
         TurnEndTiming {
             reset_minute: shipped.reset_minute,
-            ..span.clone()
+            ..span
         },
         shipped,
         "only the time to the reset moves"
     );
-    assert!(shipped.reset_as_named() && !span.reset_as_named());
-    let read_s: i64 = 1_793_527_588;
-    assert_eq!(span.reset_placed(read_s + 60, read_s * 1000), read_s + 3);
-    // Read 700 ms into its second, `in 1m` is 59.3 s off: 2.965 s at a twentieth, placed on the
-    // next whole second.
-    let read_ms = read_s * 1000 + 700;
-    assert_eq!(span.reset_placed(read_s + 60, read_ms), read_s + 4);
-    for frac in [0, 1, 299, 500, 999] {
-        for minutes in [1, 2, 5, 60] {
-            let now_ms = read_s * 1000 + frac;
-            let at = read_s + minutes * 60;
-            let placed = span.reset_placed(at, now_ms);
-            // Twenty times the scaled time, in milliseconds: the read's and the span's.
-            let scaled = now_ms * 20 + (at * 1000 - now_ms);
-            let after = placed * 1000 * 20 - scaled;
-            assert!(
-                (0..20 * 1000).contains(&after),
-                "{minutes}m read {frac} ms into its second: placed {placed}, {after} past"
-            );
-            assert!(placed <= at, "{minutes}m: placed after its words' reset");
-        }
-    }
-    assert_eq!(span.reset_placed(read_s, read_ms), read_s, "passed");
-    assert_eq!(span.reset_placed(read_s - 60, read_ms), read_s - 60);
-    assert_eq!(shipped.reset_placed(read_s + 60, read_ms), read_s + 60);
-    assert_eq!(
-        TurnEndTiming::for_seams(None, None, Some(OsStr::new("1"))),
-        shipped
-    );
-    let unbounded = TurnEndTiming {
-        reset_minute: Duration::MAX,
-        ..shipped.clone()
-    };
-    assert_eq!(unbounded.reset_placed(read_s + 60, read_ms), read_s + 60);
+    assert_eq!(timing_for_seams(None, None, Some(OsStr::new("1"))), shipped);
 }

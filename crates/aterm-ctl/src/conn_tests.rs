@@ -65,6 +65,32 @@ fn selectors_refuse_titles_and_the_active_tab() {
     assert!(classify_selector("@s-ab\n12").is_err());
 }
 
+/// A tab opened before the tab-ID update keeps its `s-` ID until it closes, so a selector names
+/// a tab by its ID in either form. NEGATIVE CONTROLS: a malformed ID of either form is no
+/// selector, and a bare ID asks for its `@`.
+#[test]
+fn a_selector_names_a_tab_by_its_id_in_either_form() {
+    for sid in ["tqn5r6e0148", "s-0123456789abcdef0123"] {
+        assert_eq!(
+            classify_selector(&format!("@{sid}")).unwrap(),
+            SelTok::Sid(sid)
+        );
+        let bare = classify_selector(sid).unwrap_err().to_string();
+        assert!(bare.contains(&format!("needs an @: @{sid}")), "{bare}");
+    }
+    for bad in [
+        "@tqn5r6e014",
+        "@tqn5r6e014i",
+        "@Tqn5r6e0148",
+        "@S-0123456789abcdef0123",
+        "@s-",
+        "@s-0123456789 abcdef0123",
+    ] {
+        let e = classify_selector(bad).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad}");
+    }
+}
+
 #[test]
 fn self_selector_outside_aterm_refuses_with_the_env_var_named() {
     let mut no_lookup = |_n: u64| -> io::Result<Option<String>> {

@@ -344,7 +344,7 @@ pub fn announce() {
 #[cfg(unix)]
 #[must_use]
 pub fn fleet_started(state: &Path, sid: &str) -> bool {
-    aterm_types::control_request::Sid::parse(sid).is_some()
+    aterm_types::control_verbs::is_minted_sid(sid)
         && std::fs::symlink_metadata(
             state
                 .join(aterm_types::fleet_access::DRIVE_WORKERS)

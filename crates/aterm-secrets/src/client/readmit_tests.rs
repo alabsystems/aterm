@@ -1243,7 +1243,7 @@ fn a_mac_whose_vault_key_changed_takes_its_seat_back_by_proof_with_nobody() {
     write_from_log_bundle(&fresh, &bundle).expect("the Mac writes its vault from the log");
     assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
     assert_eq!(
-        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
+        crate::client::stored(&fresh, "shared").unwrap(),
         b"everyone-v1"
     );
     let store = load_records(&fresh).unwrap();
@@ -1803,7 +1803,7 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
     );
     assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
     assert_eq!(
-        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
+        crate::client::stored(&fresh, "shared").unwrap(),
         b"everyone-v1"
     );
     let membership = load_records(&fresh).unwrap().log().unwrap().membership();
@@ -1995,7 +1995,7 @@ fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_by_its_proof() {
 
     assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
     assert_eq!(
-        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
+        crate::client::stored(&fresh, "shared").unwrap(),
         b"everyone-v1"
     );
     let fresh_actor = device
@@ -2152,7 +2152,7 @@ fn a_member_commons_control_leaves_out_lets_in_a_mac_a_person_allowed() {
     write_from_log_bundle(&fresh, &bundle).expect("the Mac writes the log bundle");
     assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
     assert_eq!(
-        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
+        crate::client::stored(&fresh, "shared").unwrap(),
         b"everyone-v1"
     );
     let fresh_actor = device
@@ -2835,7 +2835,7 @@ fn a_member_whose_newest_records_keep_it_or_the_mac_out_refuses_before_possessio
     );
     assert_eq!(load_state(&fresh).unwrap().membership, Stored::In);
     assert_eq!(
-        std::fs::read(fresh.home.join(".secrets/shared")).unwrap(),
+        crate::client::stored(&fresh, "shared").unwrap(),
         b"everyone-v1"
     );
     macs.server.stop();

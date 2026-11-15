@@ -139,7 +139,11 @@ fn host() {
     let service = build.join("bin/targo");
     let compiler = build.join("bin/trustc");
     fs::copy(program.path(), &service).unwrap();
+    crate::native_fixture::qualify_image(&service);
+    progressed("service-qualified");
     fs::copy(program.path(), &compiler).unwrap();
+    crate::native_fixture::qualify_image(&compiler);
+    progressed("compiler-qualified");
     atpkg::platform::install_shim_to(&layout.bin_dir().join("targo"), &service).unwrap();
     atpkg::store::mark_build_ready(&build).unwrap();
     progressed("sdk-prepared");

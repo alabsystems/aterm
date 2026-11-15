@@ -156,6 +156,21 @@ pub enum Keep {
     Unpushed,
     /// It has not been measured, or a repo in it could not be read.
     Unmeasured,
+    /// Its request is kept (`request keep`): its folders are a person's.
+    Kept,
+    /// The folder at its path now is not the one claimed: its birth moved.
+    Replaced,
+    /// A tab that still stands works in it, or in a folder inside it.
+    InUse,
+    /// The cleanup's manifest of it is not whole (a cap, a folder it could not read).
+    Unlisted,
+    /// The cleanup's archive was not written.
+    Unarchived,
+    /// It changed after the cleanup listed it, so its listing no longer describes it, or it could
+    /// not be listed again whole.
+    Changed,
+    /// It was not there when a first cleanup looked: something else removed or moved it.
+    Missing,
 }
 
 impl Keep {
@@ -169,7 +184,37 @@ impl Keep {
             Self::Touched => "touched",
             Self::Unpushed => "unpushed",
             Self::Unmeasured => "unmeasured",
+            Self::Kept => "kept",
+            Self::Replaced => "replaced",
+            Self::InUse => "in-use",
+            Self::Unlisted => "unlisted",
+            Self::Unarchived => "unarchived",
+            Self::Changed => "changed",
+            Self::Missing => "missing",
         }
+    }
+
+    /// Every reason.
+    pub const ALL: [Self; 13] = [
+        Self::BornBefore,
+        Self::Contested,
+        Self::Unattributed,
+        Self::Touched,
+        Self::Unpushed,
+        Self::Unmeasured,
+        Self::Kept,
+        Self::Replaced,
+        Self::InUse,
+        Self::Unlisted,
+        Self::Unarchived,
+        Self::Changed,
+        Self::Missing,
+    ];
+
+    /// The reason a word names.
+    #[must_use]
+    pub fn of(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|keep| keep.word() == word)
     }
 }
 
@@ -312,6 +357,64 @@ pub fn keep_of(
         Some(true) => Some(Keep::Unpushed),
         Some(false) => None,
     }
+}
+
+/// What a cleanup found of a claimed folder on the host, as [`clean_verdict`] judges it.
+#[derive(Clone, Copy, Debug)]
+pub struct HostFacts<'a> {
+    /// When the cleanup began (its `clean` record), Unix milliseconds: a measure older than this
+    /// is no measure of the folder as the cleanup found it.
+    pub clean_at_ms: u64,
+    /// The birth of the folder at the claim's path now, where the filesystem says.
+    pub born_now: Option<u64>,
+    /// The working folder of every tab that still stands (in [`normal`] form).
+    pub cwds: &'a [String],
+    /// Whether the cleanup's manifest of the folder is whole.
+    pub listed: bool,
+    /// Whether the cleanup's archive was written.
+    pub archived: bool,
+}
+
+/// Why a cleanup must keep `held` of `request`, measured as `measured`, with the host as `host`
+/// says, at `now_ms`; `None` where it may delete it. Pure: it writes nothing.
+///
+/// In order: the request is kept; [`keep_of`] (with a measure the cleanup did not make after it
+/// began read as none, so [`Keep::Unmeasured`]); the folder's birth moved; a standing tab works at
+/// or under it; its manifest is not whole; the archive was not written.
+#[must_use]
+pub fn clean_verdict(
+    request: &Request,
+    held: &HeldClaim,
+    measured: Option<&Measured>,
+    host: &HostFacts<'_>,
+    now_ms: u64,
+) -> Option<Keep> {
+    if request.kept.is_some() {
+        return Some(Keep::Kept);
+    }
+    let fresh = measured.filter(|measured| measured.at_ms >= host.clean_at_ms);
+    if let Some(keep) = keep_of(request, &held.claim, fresh, now_ms) {
+        return Some(keep);
+    }
+    if host.born_now.is_none() || host.born_now != held.claim.born_ms {
+        return Some(Keep::Replaced);
+    }
+    if inside_any(&held.claim.path, host.cwds) {
+        return Some(Keep::InUse);
+    }
+    if !host.listed {
+        return Some(Keep::Unlisted);
+    }
+    if !host.archived {
+        return Some(Keep::Unarchived);
+    }
+    None
+}
+
+/// Whether any of `cwds` lies at or under `path`, component by component.
+fn inside_any(path: &str, cwds: &[String]) -> bool {
+    let path = Path::new(path);
+    cwds.iter().any(|cwd| Path::new(cwd).starts_with(path))
 }
 
 #[cfg(test)]

@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alab_policy::config::Autopilot;
 use aterm_agent::harness::acts::TaskFace;
-use aterm_agent::supervise::Autopilot;
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::turn_end::{
     Composer, TurnEndReading, TurnEndState, decide_turn_end,
@@ -418,6 +418,7 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
     app.on_meta_changed(0);
     assert_eq!(app.harness_ab_reading(0), (AbArm::Unsupervised, false));
     let leaf = |word: &str| crate::restore::TerminalLeafRestore {
+        pinned: false,
         sid: None,
         lineage: None,
         log_ep: None,
@@ -625,7 +626,7 @@ fn the_faces_show_under_land_and_none_under_cruise_or_off() {
 
 fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> TurnEndReading {
     TurnEndReading {
-        phase: aterm_agent::supervise::phase::Phase::Idle,
+        phase: alab_policy::vocab::Phase::Idle,
         authoritative: true,
         survey: false,
         wall: None,
@@ -691,7 +692,8 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
-        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
+        credentials: alab_policy::credential_need::CredentialRead::NotAsked,
+        goal: aterm_agent::harness::goal::GoalRead::Unread,
         login_screen: None,
         login_interrupted: false,
         login_at_wall: None,

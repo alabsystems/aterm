@@ -14,6 +14,12 @@ pub mod stale;
 #[path = "build_cache_tooling.rs"]
 pub mod tooling;
 
+#[path = "build_cache_leftovers.rs"]
+pub mod leftovers;
+
+#[path = "build_cache_holders.rs"]
+pub mod holders;
+
 #[path = "build_cache_retired.rs"]
 pub mod retired;
 
@@ -301,6 +307,11 @@ impl ReclaimPolicy<'_> {
                 ReclaimAfter::by_floor(free <= floor)
             }),
         }
+    }
+
+    /// Whether the volume of `path` is below the disk watch's floor, as this policy reads it.
+    fn pressed(self, path: &Path) -> bool {
+        self.leaf(path) == ReclaimAfter::UNDER_PRESSURE
     }
 }
 
@@ -777,6 +788,12 @@ pub enum Unused {
     Refused { by: Refusal },
     /// A completed pinned tool of the tooling cache nothing ran for `idle`, at least `after` ([`RECLAIM_IDLE`]).
     Tooling { idle: Duration, after: Duration },
+    /// A regenerable cache outside the shared cache ([`leftovers`]): a directory carrying a signed cache directory tag in a campaign scope, a worktree root or a per-campaign cache folder, it and its unit's own folder unwritten for `idle`, at least `after`; `finished` when the unit holds a receipt naming it landed or delivered ([`leftovers::receipt`]).
+    Leftover {
+        idle: Duration,
+        after: Duration,
+        finished: bool,
+    },
     /// A tooling scratch carrying both its give-up exec stamp and a regular run-proof file ([`aterm_uds::deadline::RAN`]); elapsed time and a reboot never replace that proof.
     GivenUp,
     /// PART of a build directory that stays ([`stale`]): `incremental` crate folders, `units` an old compiler built, and `superseded` units none of its kept check runs uses beside another build of their package and kind that one does ([`stale::USED`]); each unwritten for `after` ([`ReclaimAfter::stale`]) or more, but for a superseded unit the run that ended last retired ([`stale::Kept::retired`]), which goes however lately it was written before that run began.
@@ -1987,7 +2004,8 @@ fn compiler_store(_: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// One pass over this user's roots, now: the dead entries of the root the cache moved from
-/// ([`reclaim_moved`]), its tooling cache ([`tooling::reclaim`]) and each registered cache, then
+/// ([`reclaim_moved`]), its tooling cache ([`tooling::reclaim`]), the leftovers outside the
+/// shared cache ([`leftovers`]) and each registered cache, then
 /// the shared cache ([`reclaim_watched`]), then each live registered cache's stale parts and each
 /// package target, unless the shared cache's record declined a prune; `record` is asked before
 /// each removal, and every path is returned with why it went. Nothing off macOS or without a home.
@@ -2056,10 +2074,12 @@ pub fn gone_leaves(root: &Path, home: Option<&Path>) -> std::collections::BTreeS
 }
 
 /// WHAT COSTS NOTHING GOES FIRST, ACROSS EVERY ROOT, because a pass may stop at a goal: the root
-/// the cache moved from, the tooling and each registered cache's dead entries, then the shared
+/// the cache moved from, the tooling, the leftovers of finished and idle units ([`leftovers`])
+/// and each registered cache's dead entries, then the shared
 /// cache's dead entries and its live worktrees' stale parts, then each live registered cache's
 /// and each package target, whose retirement costs a cold build.
-/// `shared` adds the shared cache, the moved root and the tooling to the registered caches. Once
+/// `shared` adds the shared cache, the moved root, the tooling and the leftovers to the registered
+/// caches. Once
 /// the shared cache's record declines a prune no registered cache is pruned, since that would only
 /// move its parts aside and back. Each registered cache decides for itself below that: a run's
 /// relief keeps by path, so one cache's decline says nothing of the next.
@@ -2078,6 +2098,13 @@ fn reclaim_roots(
         removed.extend(tooling::reclaim_on(
             &tooling::root(home),
             now,
+            record,
+            fence,
+        ));
+        removed.extend(leftovers::reclaim_on(
+            home,
+            now,
+            after.pressed(home),
             record,
             fence,
         ));
@@ -2267,7 +2294,8 @@ pub fn plan_moved(root: &Path, now: SystemTime) -> Vec<Planned> {
     planned
 }
 
-/// Advisory candidates for this user's current, moved, tooling and registered caches, with
+/// Advisory candidates for this user's current, moved, tooling and registered caches and the
+/// leftovers outside them ([`leftovers::plan`]), with
 /// the same observed per-volume stale-parts policy as explicit cleanup. Whole-cache,
 /// moved and tooling policies remain fixed. Active use is checked by cleanup. Nothing
 /// is listed off macOS or without a home.
@@ -2292,6 +2320,7 @@ fn plan_home_on(
     let mut planned = plan_on(&cache_root(home), Some(home), now, policy, None);
     planned.extend(plan_moved(&moved_from(home), now));
     planned.extend(tooling::plan(&tooling::root(home), now));
+    planned.extend(leftovers::plan(home, now, policy.pressed(home)));
     planned.extend(registered::plan_on(home, now, policy));
     planned
 }

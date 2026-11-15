@@ -5,6 +5,127 @@
 
 use serde::{Deserialize, Serialize};
 
+#[test]
+fn retained_budget_validates_ignored_subtrees_without_materializing_them() {
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct Status {
+        status: String,
+    }
+    let evidence = "x".repeat(1024 * 1024);
+    let text = format!(r#"{{"status":"proved","evidence":{{"nested":["{evidence}",null,1]}}}}"#);
+    let parsed: Status = aterm_json::from_slice_with_budget(text.as_bytes(), 1024).unwrap();
+    assert_eq!(parsed.status, "proved");
+    for bad in [
+        text.replace("x\",null", "\\uD800\",null"),
+        text.replace("null,1]", "null,1,]"),
+        format!("{text} false"),
+    ] {
+        let why = aterm_json::from_slice_with_budget::<Status>(bad.as_bytes(), 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(!why.contains("budget"), "{why}");
+    }
+    let mut invalid_utf8 = text.into_bytes();
+    let last_x = invalid_utf8.iter().rposition(|b| *b == b'x').unwrap();
+    invalid_utf8[last_x] = 0xff;
+    assert!(
+        aterm_json::from_slice_with_budget::<Status>(&invalid_utf8, 1024)
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8")
+    );
+}
+
+#[test]
+fn retained_budget_bounds_strings_keys_and_container_growth() {
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    struct PaddedIgnored {
+        _ignored: serde::de::IgnoredAny,
+        #[serde(skip)]
+        _padding: [u8; 32],
+    }
+    let large = "a".repeat(4096);
+    for text in [
+        format!(r#""{large}""#),
+        format!(r#""{}""#, "\\u0061".repeat(1024)),
+        format!(r#"{{"{large}":0}}"#),
+        format!("[{}null]", "null,".repeat(1024)),
+        format!("[{}0]", "0,".repeat(1024)),
+        format!("[{}null]", "[],".repeat(1024)),
+    ] {
+        assert!(aterm_json::from_str::<aterm_json::Value>(&text).is_ok());
+        let why = aterm_json::from_slice_with_budget::<aterm_json::Value>(text.as_bytes(), 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains("retained JSON data exceeds its budget"),
+            "{why}"
+        );
+    }
+    let integers = format!("[{}0]", "0,".repeat(1024));
+    assert!(aterm_json::from_slice_with_budget::<Vec<u64>>(integers.as_bytes(), 1024).is_err());
+    let nulls = format!("[{}null]", "null,".repeat(1024));
+    assert!(
+        aterm_json::from_slice_with_budget::<Vec<Option<u64>>>(nulls.as_bytes(), 1024).is_err()
+    );
+    assert!(aterm_json::from_slice_with_budget::<Vec<()>>(nulls.as_bytes(), 1024).is_err());
+    assert!(
+        aterm_json::from_slice_with_budget::<Vec<Option<serde::de::IgnoredAny>>>(
+            integers.as_bytes(),
+            1024,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        aterm_json::from_slice::<Vec<PaddedIgnored>>(integers.as_bytes())
+            .unwrap()
+            .len(),
+        1025
+    );
+    assert!(
+        aterm_json::from_slice_with_budget::<Vec<PaddedIgnored>>(integers.as_bytes(), 1024)
+            .is_err()
+    );
+}
+
+struct Borrowed<'a>(&'a str);
+
+impl<'de> Deserialize<'de> for Borrowed<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BorrowedVisitor;
+        impl<'de> serde::de::Visitor<'de> for BorrowedVisitor {
+            type Value = Borrowed<'de>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a borrowed JSON string")
+            }
+            fn visit_borrowed_str<E: serde::de::Error>(
+                self,
+                value: &'de str,
+            ) -> Result<Self::Value, E> {
+                Ok(Borrowed(value))
+            }
+        }
+        deserializer.deserialize_str(BorrowedVisitor)
+    }
+}
+
+#[test]
+fn budgeted_and_ordinary_slice_strings_borrow_the_original_input() {
+    let bytes = br#""borrowed text""#;
+    let Borrowed(ordinary) = aterm_json::from_slice::<Borrowed<'_>>(bytes).unwrap();
+    let Borrowed(budgeted) =
+        aterm_json::from_slice_with_budget::<Borrowed<'_>>(bytes, 1024).unwrap();
+    assert_eq!(ordinary, "borrowed text");
+    assert_eq!(budgeted, "borrowed text");
+    assert_eq!(ordinary.as_ptr(), bytes[1..].as_ptr());
+    assert_eq!(budgeted.as_ptr(), bytes[1..].as_ptr());
+    assert!(aterm_json::from_slice::<Borrowed<'_>>(br#""escaped\ntext""#).is_err());
+    assert!(
+        aterm_json::from_slice_with_budget::<Borrowed<'_>>(br#""escaped\ntext""#, 1024).is_err()
+    );
+}
+
 struct Golden(u64);
 
 impl Golden {

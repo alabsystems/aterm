@@ -1432,11 +1432,42 @@ pub(super) struct SelectionInputs {
     bounds: RecordBounds,
 }
 
+/// The stamps a selection is judged by: [`observation_inputs`] with `state.toml` by what it holds
+/// but `heard` and the rounds' receipts ([`stamp_memo_inputs_in`]), which the subscriber rewrites
+/// about once a minute and no selection reads (each reader is handed the state it selects under),
+/// and the record bounds.
 pub(super) fn selection_inputs(paths: &Paths) -> Option<SelectionInputs> {
     Some(SelectionInputs {
-        inputs: stamp_inputs(paths, observation_inputs)?,
+        inputs: stamp_memo_inputs_in(paths, observation_inputs, true, None)?,
         bounds: record_bounds(),
     })
+}
+
+/// The stamps of every file an entry read is judged by ([`selection_inputs`]' files), which a
+/// pass's own read of its policy servers is held under ([`super::policy_peer_urls`]).
+pub(super) fn entry_read_stamps(paths: &Paths) -> Option<InputStamps> {
+    stamp_memo_inputs_in(paths, observation_inputs, true, None)
+}
+
+/// [`materialization_selection::current`](super::materialization_selection::current)'s reading of
+/// a signed vault, read again only when one of the files a selection reads
+/// ([`observation_inputs`], `state.toml` by what it holds but `heard` and the rounds' receipts) or
+/// the record bounds moved, or for another `basis`. Not quiet: an apply asks it under its own
+/// exclusive take, and a kept answer stands for unmoved files whoever holds the lock; a read under
+/// a writer is not kept.
+///
+/// # Errors
+/// As `read`.
+pub(super) fn selection_now(
+    paths: &Paths,
+    basis: &super::materialization_selection::Basis,
+    read: impl FnOnce(&Paths) -> crate::Result<Option<super::materialization_selection::Current>>,
+) -> crate::Result<Option<super::materialization_selection::Current>> {
+    static MEMO: Memo<
+        Option<super::materialization_selection::Current>,
+        super::materialization_selection::Basis,
+    > = Memo::of(Set::Observation, false);
+    MEMO.read_keyed(paths, basis, read)
 }
 
 /// Every file `inputs`' stamps stand for: its own and the membership records' selection's

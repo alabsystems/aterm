@@ -69,7 +69,7 @@ fn a_bad_character_is_refused_by_position_and_never_echoed() {
         "the 37th character (1-based) is the bad one"
     );
     let msg = refused(&bad).message();
-    assert!(msg.contains("character 37"), "{msg}");
+    assert!(msg.contains("symbol 37"), "{msg}");
     assert!(!msg.contains(&bad[30..40]), "{msg}");
 
     let mut first = String::from(SYNTHETIC);
@@ -218,7 +218,7 @@ fn scrub_zeroes_the_buffer() {
 }
 
 #[test]
-fn b32_encode_decode_and_format_phrase_line_preserve_invariants() {
+fn b32_encode_and_decode_preserve_invariants() {
     for raw in [
         [0x00; 32],
         [0xFF; 32],
@@ -229,15 +229,5 @@ fn b32_encode_decode_and_format_phrase_line_preserve_invariants() {
         assert!(encoded.iter().all(|c| ALPHABET.contains(c)));
         assert!(matches!(encoded[51], b'0' | b'g'));
         assert_eq!(b32_decode(&encoded), raw);
-        let line = format_phrase_line(&encoded);
-        assert_eq!(line.len(), 65);
-        assert_eq!(line[64], b'\n');
-        for (i, &b) in line[..64].iter().enumerate() {
-            if i % 5 == 4 {
-                assert_eq!(b, b' ');
-            } else {
-                assert!(ALPHABET.contains(&b));
-            }
-        }
     }
 }

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::harness::account_series::{self, SeriesRow};
 use aterm_agent::harness::accounts::{self, Mode};
+use aterm_agent::harness::alab_seen;
 use aterm_agent::harness::outlook::{self, Figure, Outlook, Refusal};
 use aterm_agent::harness::quota_view::QuotaView;
 
@@ -321,12 +322,21 @@ impl OutlookMemo {
             {
                 self.replays += 1;
             }
+            // The journal as this process holds it, never waited for: a peer's bound of a row
+            // this Mac read nothing current of, for its line and the lean's best case alone.
+            let lab = match alab_seen::journal() {
+                alab_seen::Journal::Read(seen) => {
+                    alab_seen::bounds(accounts::Cli::Claude, roster, &seen, now)
+                }
+                alab_seen::Journal::Off | alab_seen::Journal::NotReadYet => BTreeMap::new(),
+            };
             self.outlook = Some(Arc::new(outlook::outlook(&outlook::Inputs {
                 roster,
                 state,
                 enrolled,
                 series: &series,
                 renewals: &held.renewals,
+                lab: &lab,
                 mode: policy.0,
                 credits: policy.1,
                 now,

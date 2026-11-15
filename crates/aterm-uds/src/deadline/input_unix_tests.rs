@@ -350,7 +350,13 @@ fn uncertain_input_wait_retains_the_original_caller_lock_until_actual_reap() {
                     to_child: None,
                     sent: 0,
                     reaped: false,
+                    natural_exit: false,
+                    observed_exit: None,
                     retire: None,
+                    streams: [
+                        Capture::empty(ChildOutput::Stdout),
+                        Capture::empty(ChildOutput::Stderr),
+                    ],
                 };
                 let mut calls = 0;
                 run.settle_with(|child| {

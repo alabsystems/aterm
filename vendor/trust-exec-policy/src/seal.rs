@@ -6,6 +6,15 @@ unsafe extern "C" {
     fn sandbox_init(profile: *const libc::c_char, flags: u64, error: *mut *mut libc::c_char)
     -> i32;
     fn sandbox_free_error(error: *mut libc::c_char);
+    // Native ABI also used by Chromium's sandbox/mac/seatbelt.cc and WebKit's
+    // Source/WTF/wtf/spi/darwin/SandboxSPI.h. Parameters are key/value pairs
+    // terminated by a null pointer, not source text interpolated into SBPL.
+    fn sandbox_init_with_parameters(
+        profile: *const libc::c_char,
+        flags: u64,
+        parameters: *const *const libc::c_char,
+        error: *mut *mut libc::c_char,
+    ) -> i32;
     fn sandbox_check(pid: libc::pid_t, operation: *const libc::c_char, filter: i32, ...) -> i32;
 }
 
@@ -33,23 +42,53 @@ impl ExecutionSeal {
                 c"(version 1)(allow default)(deny process-fork)(deny process-exec)"
             }
         };
-        let mut message = std::ptr::null_mut();
-        // SAFETY: static valid profile; flags0 means inline profile. This call
-        // restricts only the current process. Error storage is initialized null.
-        let result = unsafe { sandbox_init(profile.as_ptr(), 0, &mut message) };
-        if !message.is_null() {
-            // SAFETY: only the OS initializer supplied this error allocation;
-            // free it once with its corresponding native allocator.
-            unsafe { sandbox_free_error(message) };
-        }
-        if result != 0 {
-            return Err(io::Error::other("native execution seal installation refused"));
-        }
+        install_profile(profile)?;
         if !fork_denied(std::process::id())? {
             return Err(io::Error::other("native execution seal observation unavailable"));
         }
         Ok(())
     }
+}
+
+pub(super) fn install_profile(profile: &std::ffi::CStr) -> io::Result<()> {
+    let mut message = std::ptr::null_mut();
+    // SAFETY: static valid profile; flags0 means inline profile. This call
+    // restricts only the current process. Error storage is initialized null.
+    let result = unsafe { sandbox_init(profile.as_ptr(), 0, &mut message) };
+    finish_installation(result, message)
+}
+
+pub(super) fn install_image_profile(
+    image: &std::ffi::CStr,
+    descriptor: &std::ffi::CStr,
+) -> io::Result<()> {
+    let parameters = [
+        c"IMAGE".as_ptr(),
+        image.as_ptr(),
+        c"DESCRIPTOR".as_ptr(),
+        descriptor.as_ptr(),
+        std::ptr::null(),
+    ];
+    let profile = c"(version 1)(deny default)(allow file-read* file-map-executable (literal (param \"IMAGE\")) (literal (param \"DESCRIPTOR\")))";
+    let mut message = std::ptr::null_mut();
+    // SAFETY: fixed profile, live native strings and a null-terminated pair list.
+    // The path is passed as data, so quotes/backslashes cannot add policy rules.
+    let result = unsafe {
+        sandbox_init_with_parameters(profile.as_ptr(), 0, parameters.as_ptr(), &mut message)
+    };
+    finish_installation(result, message)
+}
+
+fn finish_installation(result: i32, message: *mut libc::c_char) -> io::Result<()> {
+    if !message.is_null() {
+        // SAFETY: only the OS initializer supplied this error allocation;
+        // free it once with its corresponding native allocator.
+        unsafe { sandbox_free_error(message) };
+    }
+    if result != 0 {
+        return Err(io::Error::other("native execution seal installation refused"));
+    }
+    Ok(())
 }
 
 /// Read-only fork denial. This does not establish a no-exec policy,

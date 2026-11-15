@@ -364,6 +364,7 @@ fn the_word_byte_class_is_the_engines_for_word_alphabet() {
 fn a_failed_handoff_takes_the_face_the_control_client_names() {
     let all = [
         EditErr::Refused("ERR scope".to_string()),
+        EditErr::Busy("ERR busy drafts (x)".to_string()),
         EditErr::TimedOut("ERR timeout ticket=1".to_string()),
         EditErr::Unreachable(io::ErrorKind::NotFound.into()),
         EditErr::NoAnswer(io::ErrorKind::TimedOut.into()),
@@ -378,4 +379,78 @@ fn a_failed_handoff_takes_the_face_the_control_client_names() {
             "{error:?}: {face:?}"
         );
     }
+}
+
+/// A window that opens nothing: each `edit` answers the next of `refusals`.
+struct Refusing {
+    asked: Vec<EditRequest>,
+    refusals: Vec<EditErr>,
+}
+
+impl Window for Refusing {
+    fn edit(&mut self, request: &EditRequest) -> Result<EditOk, EditErr> {
+        self.asked.push(request.clone());
+        Err(self.refusals.remove(0))
+    }
+    fn await_edit(&mut self, _: &EditOk) -> Result<EditOutcome, AwaitErr> {
+        unreachable!("nothing opened, so nothing is waited on")
+    }
+}
+
+/// A draft another aterm process is writing ends the run 1 with the busy
+/// line and opens no editor here, which would split that draft; any other
+/// refusal still hands the file to the terminal face.
+#[test]
+fn a_busy_draft_ends_the_run_1_and_opens_nothing_here() {
+    let dir = crate::test_scratch_dir("busy-draft");
+    let first = dir.path().join("COMMIT_EDITMSG");
+    let second = dir.path().join("notes.md");
+    std::fs::write(&first, "x\n").expect("first file");
+    std::fs::write(&second, "y\n").expect("second file");
+    let target = |path: &Path| Target {
+        path: path.to_path_buf(),
+        line: None,
+    };
+    let args = Args {
+        targets: vec![target(&first), target(&second)],
+        ..Args::default()
+    };
+    let busy = "ERR busy drafts (another aterm process is writing this file's draft)";
+    let mut window = Refusing {
+        asked: Vec::new(),
+        refusals: vec![EditErr::Busy(busy.to_string())],
+    };
+    let mut tty = MemTty::default();
+    assert_eq!(
+        edit_files(&args, None, &mut window, &mut tty),
+        Ending::Exit(1)
+    );
+    assert_eq!(window.asked.len(), 1, "the second file is never asked for");
+    let said = String::from_utf8_lossy(&tty.0);
+    assert_eq!(
+        said,
+        format!(
+            "amacs: {}: the aterm window did not open it ({busy})\n{}\n",
+            first.display(),
+            decide::BUSY
+        )
+    );
+
+    let mut window = Refusing {
+        asked: Vec::new(),
+        refusals: vec![EditErr::Refused("ERR refused not-regular".to_string())],
+    };
+    let mut tty = MemTty::default();
+    let ending = edit_files(&args, None, &mut window, &mut tty);
+    assert_eq!(
+        ending,
+        Ending::Terminal {
+            why: format!(
+                "{}: the aterm window did not open it (ERR refused not-regular)",
+                first.display()
+            ),
+            from: 0,
+        }
+    );
+    assert!(tty.0.is_empty(), "the terminal face says why");
 }

@@ -374,6 +374,7 @@ impl Rung {
                 profile: true,
                 mailbox: false,
                 mailbox_unready: None,
+                mailbox_filed: false,
                 browser: Browser::Found,
                 window: true,
                 adopt: ADOPT_LABEL.to_owned(),
@@ -969,14 +970,7 @@ fn a_caller_that_does_not_wait_is_busy_while_another_signs_in() {
 /// Every setup for `label`, each with and without a window `accounts browser` opens here.
 fn every_setup(label: &str) -> Vec<Setup> {
     let label = label.to_owned();
-    let mut all = vec![
-        Setup::Window(label.clone()),
-        Setup::Mailbox(label.clone()),
-        Setup::MailboxPassword {
-            label: label.clone(),
-            login: super::super::mailbox_routes::mask_login("\u{1F600}\u{1F600}@example.test"),
-        },
-    ];
+    let mut all = vec![Setup::Window(label.clone()), Setup::Chromium(label.clone())];
     for window in [true, false] {
         all.push(Setup::Email {
             label: label.clone(),
@@ -991,12 +985,11 @@ fn every_setup(label: &str) -> Vec<Setup> {
 }
 
 /// The need's first step after adopting the row or adding its email is one that works on this
-/// machine, in the order it runs. With a window `accounts browser` opens here (one installed, or
-/// the pinned one fetched first), the terminal's line runs `adopt-default`, then `accounts
-/// browser`, the mailbox the alternative. NEGATIVE CONTROL: with none (no window browser and the
-/// pinned fetch failed), it runs `adopt-default`, then puts the mailbox in the vault, and names
-/// `accounts browser` only after installing a browser, never as the next command; the email
-/// setup alike.
+/// machine, in the order it runs, and none asks the person for a credential. With a window
+/// `accounts browser` opens here (one installed, or the pinned one fetched first), the terminal's
+/// line runs `adopt-default`, then `accounts browser`. NEGATIVE CONTROL: with none (no window
+/// browser and the pinned fetch failed), it runs `adopt-default`, then installs a browser and
+/// names `accounts browser` only after it, never as the next command; the email setup alike.
 #[test]
 fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
     let url = "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ";
@@ -1015,8 +1008,7 @@ fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
         format!(
             "NEEDS YOU: once, so Grok Build signs in by itself from now on: {adopt}then run \
              `aterm harness accounts browser main --cli grok` at this machine's desk and sign in \
-             there, or put that email's mailbox in the vault (ai-mailbox.toml); or approve this \
-             sign-in now: code WMRT-8KQZ at {url}"
+             there; or approve this sign-in now: code WMRT-8KQZ at {url}"
         )
     );
     let none = needs_you_line(
@@ -1030,14 +1022,13 @@ fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
     assert_eq!(
         none,
         format!(
-            "NEEDS YOU: once, so Grok Build signs in by itself from now on: {adopt}then put that \
-             email's mailbox in the vault (ai-mailbox.toml), or install a Chromium that opens a \
-             window (Google Chrome for Testing or Chromium) and run `aterm harness accounts \
-             browser main --cli grok` at this machine's desk; or approve this sign-in now: code \
-             WMRT-8KQZ at {url}"
+            "NEEDS YOU: once, so Grok Build signs in by itself from now on: {adopt}then install a \
+             Chromium that opens a window (Google Chrome for Testing or Chromium) and run `aterm \
+             harness accounts browser main --cli grok` at this machine's desk; or approve this \
+             sign-in now: code WMRT-8KQZ at {url}"
         )
     );
-    // The step after the first, in each: the window where it opens, else the mailbox.
+    // The step after the first, in each: the window where it opens, else a browser installed.
     let next = |line: &str| {
         let after = line.split_once("then ").expect("a second step").1;
         after
@@ -1046,7 +1037,13 @@ fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
             .to_owned()
     };
     assert!(next(&window).starts_with("run `aterm harness accounts browser main"));
-    assert!(next(&none).starts_with("put that email's mailbox in the vault"));
+    assert!(next(&none).starts_with("install a Chromium that opens a window"));
+    for line in [&window, &none] {
+        assert!(
+            !line.contains("vault") && !line.contains("password"),
+            "{line}"
+        );
+    }
     assert!(
         none.find("install a Chromium").expect("the alternative")
             < none.find("accounts browser").expect("named after it"),
@@ -1075,7 +1072,7 @@ fn the_setup_names_accounts_browser_only_where_it_opens_a_window() {
             "{email}"
         );
         assert_eq!(
-            step.starts_with("put that email's mailbox in the vault"),
+            step.starts_with("install a Chromium that opens a window"),
             !window,
             "{email}"
         );
@@ -1103,20 +1100,22 @@ fn the_need_leads_with_the_setup_and_fits_the_attention_cap() {
         needs_you_line(Some(&window), url, Some("WMRT-8KQZ")),
         format!(
             "NEEDS YOU: once, so Grok Build signs in by itself from now on: run `aterm harness \
-             accounts browser main --cli grok` at this machine's desk and sign in there, or put \
-             main's mailbox in the vault (ai-mailbox.toml); or approve this sign-in now: code \
-             WMRT-8KQZ at {url}"
+             accounts browser main --cli grok` at this machine's desk and sign in there; or \
+             approve this sign-in now: code WMRT-8KQZ at {url}"
         )
     );
-    let mailbox = Setup::Mailbox("main".to_owned());
+    let chromium = Setup::Chromium("main".to_owned());
     assert_eq!(
-        need_words(Some(&mailbox), url, Some("WMRT-8KQZ")),
-        format!("once: main's mailbox in the vault; or code WMRT-8KQZ at {url} (ai-mailbox.toml)")
+        need_words(Some(&chromium), url, Some("WMRT-8KQZ")),
+        format!(
+            "once: a window browser, then sign main in; or code WMRT-8KQZ at {url} (aterm \
+             harness accounts browser main --cli grok)"
+        )
     );
     assert!(
-        needs_you_line(Some(&mailbox), url, Some("WMRT-8KQZ")).starts_with(
-            "NEEDS YOU: once, so Grok Build signs in by itself from now on: put main's mailbox in \
-             the vault (ai-mailbox.toml), or install a Chromium that opens a window"
+        needs_you_line(Some(&chromium), url, Some("WMRT-8KQZ")).starts_with(
+            "NEEDS YOU: once, so Grok Build signs in by itself from now on: install a Chromium \
+             that opens a window"
         )
     );
     assert!(
@@ -1565,7 +1564,7 @@ fn the_default_home_s_row_is_its_rosters_row_else_the_active_one() {
     ladder.email = Some("work@example.com".to_owned());
     assert_eq!(
         ladder.setup(),
-        Setup::Mailbox("work".to_owned()),
+        Setup::Chromium("work".to_owned()),
         "no window browser and none fetchable: `accounts browser` would refuse"
     );
     ladder.window = true;
@@ -2704,11 +2703,12 @@ fn the_refusals_way_out_names_accounts_browser_only_where_it_opens_a_window() {
 }
 
 /// A row whose `[[mailboxes]]` entry has no password yet names that entry, never "none
-/// configured": its words say `mailbox(ab…@… has no password yet)`, and its setup asks for that
-/// password, not for a mailbox the vault already holds. NEGATIVE CONTROL: reading `mailbox`
-/// alone (the branch's first form) says `none configured`, and this fails.
+/// configured": its words say `mailbox(ab…@… has no password yet)`, and where its want stands
+/// filed the record says `filed mailbox:<label>`. Its setup and the person's line ask for no
+/// credential: only the sign-in in aterm's window. NEGATIVE CONTROL: reading `mailbox` alone (the
+/// branch's first form) says `none configured`, and this fails.
 #[test]
-fn a_mailbox_with_no_password_yet_is_named_not_called_missing() {
+fn a_mailbox_with_no_password_yet_is_named_and_filed_never_asked_of_a_person() {
     let mut ladder = Ladder::bare("none installed");
     ladder.label = "main".to_owned();
     ladder.from = RowFrom::Default;
@@ -2719,25 +2719,31 @@ fn a_mailbox_with_no_password_yet_is_named_not_called_missing() {
         words.contains("mailbox(ow…@… has no password yet)"),
         "{words}"
     );
-    assert_eq!(
-        ladder.setup(),
-        Setup::MailboxPassword {
-            label: "main".to_owned(),
-            login: "ow…@…".to_owned(),
-        }
+    ladder.mailbox_filed = true;
+    let words = ladder.words();
+    assert!(
+        words.contains("mailbox(ow…@… has no password yet; filed mailbox:main)"),
+        "{words}"
     );
+    assert_eq!(ladder.setup(), Setup::Chromium("main".to_owned()));
     let line = needs_you_line(
         Some(&ladder.setup()),
         "https://accounts.x.ai/oauth2/device?user_code=WMRT-8KQZ",
         Some("WMRT-8KQZ"),
     );
     assert!(
-        line.contains("fill in the password of mailbox ow…@…"),
+        !line.contains("password") && !line.contains("vault") && !line.contains("mailbox"),
         "{line}"
     );
     ladder.mailbox_unready = None;
+    assert!(
+        ladder
+            .words()
+            .contains("mailbox(none configured; filed mailbox:main)")
+    );
+    ladder.mailbox_filed = false;
     assert!(ladder.words().contains("mailbox(none configured)"));
-    assert_eq!(ladder.setup(), Setup::Mailbox("main".to_owned()));
+    assert_eq!(ladder.setup(), Setup::Chromium("main".to_owned()));
 
     #[cfg(unix)]
     {
@@ -2765,4 +2771,40 @@ fn a_mailbox_with_no_password_yet_is_named_not_called_missing() {
         assert_eq!(read_record(&fifo_state), Record::default());
         assert!(!running(&fifo_state));
     }
+}
+
+/// A ROW THE AUTOMATIC STEP COULD SIGN IN WITH A MAILBOX IT LACKS FILES `mailbox:<label>`, and
+/// the need is met once the mailbox holds. NEGATIVE CONTROLS: a step that renews no page
+/// headlessly, or a row with no email, files nothing.
+#[cfg(unix)]
+#[test]
+fn a_row_with_no_mailbox_files_its_mailbox_need_and_its_arrival_meets_it() {
+    use aterm_secrets::need::{self, Purpose, Want};
+    let home = aterm_tempfile::tempdir().expect("home");
+    let paths = aterm_secrets::client::Paths::for_home(home.path());
+    let want = Want::parse("mailbox:grok-1").expect("want");
+    let open = || {
+        need::peek(&paths)
+            .expect("ledger")
+            .into_iter()
+            .find(|need| need.want == want)
+            .map(|need| (need.purpose, need.state.ended()))
+    };
+    assert_eq!(
+        row_mailbox_need(home.path(), "grok-1", true, false, false),
+        None
+    );
+    assert_eq!(
+        row_mailbox_need(home.path(), "grok-1", false, false, true),
+        None
+    );
+    assert_eq!(open(), None, "nothing filed");
+    assert!(row_mailbox_need(home.path(), "grok-1", true, false, true).is_some());
+    assert_eq!(open(), Some((Purpose::HarnessSignIn, false)));
+    assert!(row_mailbox_need(home.path(), "grok-1", true, true, true).is_some());
+    assert_eq!(
+        open(),
+        Some((Purpose::HarnessSignIn, true)),
+        "met once it holds"
+    );
 }

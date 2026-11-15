@@ -820,10 +820,12 @@ fn one_rejoin_heard_on_the_browse_is_one_move() {
     drop(browse);
 }
 
-/// A Commons peer heard after every peer's silence longer than [`SILENCE`], or one new, is
-/// a move once the baseline is over; one heard within it, or one gone silent, is not.
-/// NEGATIVE CONTROL: a look that takes every heard peer as new fails the second look; one
-/// that never forgets a peer misses its return after the silence.
+/// A Commons peer heard after every peer's silence longer than [`SILENCE`] is a move once
+/// the baseline is over; one heard within it, one gone silent, or one never heard that joins
+/// a peer still heard, is not.
+/// NEGATIVE CONTROL: a look that takes every heard peer as a move fails the second look; one
+/// that never forgets a peer misses its return after the silence; one that takes a peer never
+/// heard as a move (0.200.0) fails "a peer coming".
 #[test]
 fn a_peer_heard_again_after_a_silence_is_a_move() {
     use aterm_types::network_state::Reachability::{LastSeen, Reachable};
@@ -843,8 +845,8 @@ fn a_peer_heard_again_after_a_silence_is_a_move() {
     );
     assert!(heard.look_at(&[peer(1, Reachable)], after(back)), "back");
     assert!(
-        heard.look_at(&[peer(1, Reachable), peer(2, Reachable)], after(back + 2)),
-        "new"
+        !heard.look_at(&[peer(1, Reachable), peer(2, Reachable)], after(back + 2)),
+        "a peer coming"
     );
     assert!(
         !heard.look_at(&[peer(1, Reachable), peer(2, Reachable)], after(back + 4)),
@@ -859,13 +861,11 @@ fn a_peer_heard_again_after_a_silence_is_a_move() {
 /// until an authenticated contact), so the first look hears none; from the second it hears
 /// two. A peer first heard on the half minute's last look was there before this process
 /// looked, so it is no move, nor on the next look (heard within [`SILENCE`], as are the
-/// peers heard throughout); a peer first heard on the first look after the half minute is
-/// one.
-/// NEGATIVE CONTROL: `SETTLE_LOOKS = 14` fails "first heard on the baseline's last look";
-/// `SETTLE_LOOKS = 16` fails "new on the first look after the baseline"; a baseline used up
-/// once per peer heard rather than once per look fails "first heard on the baseline's last
-/// look"; one that a look hearing no peer leaves whole fails "new on the first look after
-/// the baseline".
+/// peers heard throughout). A process whose half minute heard no peer at all tells the first
+/// it hears on the first look after it, and not on the half minute's last look.
+/// NEGATIVE CONTROL: `SETTLE_LOOKS = 14` fails "first heard on a silent baseline's last
+/// look"; `SETTLE_LOOKS = 16`, and a baseline that a look hearing no peer leaves whole, fail
+/// "heard on the first look after a silent baseline".
 #[test]
 fn the_commons_baseline_is_fifteen_looks() {
     use aterm_types::network_state::Reachability::{LastSeen, Reachable, Unknown};
@@ -897,7 +897,7 @@ fn the_commons_baseline_is_fifteen_looks() {
         "heard throughout, and since the baseline's last look"
     );
     assert!(
-        heard.look_at(
+        !heard.look_at(
             &[
                 peer(1, Reachable),
                 peer(4, Reachable),
@@ -906,18 +906,37 @@ fn the_commons_baseline_is_fifteen_looks() {
             ],
             at(last + 2)
         ),
-        "new after the baseline"
+        "a peer coming after the baseline joins those heard"
     );
     assert!(
         !fresh.look_at(&two, at(last)),
         "heard throughout the baseline"
     );
+    let mut silent = Heard::commons();
+    for look in 1..=last {
+        assert!(
+            !silent.look_at(&unconfirmed, at(look)),
+            "silent baseline look {look}"
+        );
+    }
     assert!(
-        fresh.look_at(
-            &[peer(1, Reachable), peer(4, Reachable), peer(3, Reachable)],
-            at(last + 1)
-        ),
-        "new on the first look after the baseline"
+        silent.look_at(&two, at(last + 1)),
+        "heard on the first look after a silent baseline"
+    );
+    let mut late = Heard::commons();
+    for look in 1..last {
+        assert!(
+            !late.look_at(&unconfirmed, at(look)),
+            "silent baseline look {look}"
+        );
+    }
+    assert!(
+        !late.look_at(&two, at(last)),
+        "first heard on a silent baseline's last look"
+    );
+    assert!(
+        !late.look_at(&two, at(last + 1)),
+        "heard since the baseline's last look"
     );
 }
 
@@ -945,8 +964,8 @@ fn an_unavailable_commons_sample_leaves_the_watch_unchanged() {
     assert_eq!(heard.baseline, 0);
     assert_eq!(heard.heard.get(&[1; 16]), Some(&later));
     assert!(
-        heard.look_sample_at(Some(&[peer(1, Reachable), peer(2, Reachable)]), later),
-        "a new peer in a subsequent actual sample is a move"
+        !heard.look_sample_at(Some(&[peer(1, Reachable), peer(2, Reachable)]), later),
+        "a peer coming in a subsequent actual sample is no move"
     );
 }
 
@@ -986,6 +1005,54 @@ fn a_peer_back_while_another_is_heard_is_no_move() {
         !heard.look_at(&both, at + Duration::from_secs(back)),
         "peer 1 was heard all along"
     );
+}
+
+/// This Mac off its network for longer than [`SILENCE`], then back. The Commons runtime reads
+/// every peer Unknown while it has no network. Back on one, it reads a peer LastSeen on a
+/// contact from before it left, however long that contact was promised (its observer curtails
+/// those as the link opens), so the watch tells no move until a round reaches a peer again,
+/// and tells one then. The last looks are the same return as an observer that kept the old
+/// contacts would show it, every peer Reachable as the link opens: the watch cannot tell that
+/// from a contact, and tells a move no round stands behind.
+/// NEGATIVE CONTROL: a look that hears every peer whose reachability is known (LastSeen too)
+/// tells the move at the first look back, "back, no contact yet".
+#[test]
+fn back_on_its_network_the_runtime_is_heard_only_once_it_contacts_a_peer() {
+    use aterm_types::network_state::Reachability::{LastSeen, Reachable, Unknown};
+    let at = Instant::now();
+    let after = |secs| at + Duration::from_secs(secs);
+    let all = |state| [peer(1, state), peer(2, state)];
+    let away = |heard: &mut Heard| {
+        assert!(!heard.look_at(&all(Reachable), at), "baseline");
+        let back = SILENCE.as_secs() + 60;
+        for secs in (2..back).step_by(2) {
+            assert!(
+                !heard.look_at(&all(Unknown), after(secs)),
+                "off the network at {secs} s"
+            );
+        }
+        back
+    };
+    let mut heard = Heard::new(1);
+    let back = away(&mut heard);
+    for secs in [back, back + 2] {
+        assert!(
+            !heard.look_at(&all(LastSeen), after(secs)),
+            "back, no contact yet"
+        );
+    }
+    assert!(
+        heard.look_at(&[peer(1, Reachable), peer(2, LastSeen)], after(back + 4)),
+        "the first contact since"
+    );
+    assert!(
+        !heard.look_at(&all(Reachable), after(back + 6)),
+        "one return is one move"
+    );
+    // Contacts kept through the absence read Reachable as the link opens.
+    let mut heard = Heard::new(1);
+    let back = away(&mut heard);
+    assert!(heard.look_at(&all(Reachable), after(back)));
 }
 
 /// The beacon reads the network's peers and asks for no services read, which would keep the

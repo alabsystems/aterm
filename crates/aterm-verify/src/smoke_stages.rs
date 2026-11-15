@@ -938,7 +938,7 @@ fn gui_smoke_unavailable(ctx: &Ctx) -> Option<String> {
     None
 }
 
-/// `hwkey x count=30 interval=50`.
+/// `hwkey x count=30 interval=50 shape=press`, through the CoreGraphics-backed key path.
 #[must_use]
 pub fn hwkey_burst_args() -> Vec<String> {
     vec![
@@ -946,6 +946,7 @@ pub fn hwkey_burst_args() -> Vec<String> {
         "x".into(),
         format!("count={BURST_KEYS}"),
         format!("interval={}", BURST_GAP.as_millis()),
+        "shape=press".into(),
     ]
 }
 
@@ -958,14 +959,16 @@ fn reply_field<'a>(reply: &'a str, name: &str) -> &'a str {
 }
 
 /// WHAT A REPORTED p99 IS, and why these four bars read `>` and not `>=`.
-/// Native-clock availability counters are required, including from older subjects. Both must
-/// be zero: dispatch-time fallback samples cannot establish latency including OS queue residence.
-/// The measured hardware-write floor is unchanged.
+/// Native-clock counters are required, including from older subjects. Every posted key must
+/// have a queue sample, and both unavailable counters must be zero: dispatch-time fallback
+/// samples cannot establish latency including OS queue residence. The measured hardware-write
+/// floor is unchanged.
 /// # Errors
-/// [`Miss::Fail`] for a reply that cannot be parsed, unreported or unavailable native clocks, a
-/// floored count that booked nothing, a sampled slice without its maximum, or any present retry,
-/// drop or sync timeout-release, each judged before any breach; [`Miss::Breach`] for a floored
-/// count that booked some samples but too few, or any gated reading at or over its ceiling.
+/// [`Miss::Fail`] for a reply that cannot be parsed, unreported or unavailable native clocks,
+/// a queue sample count different from the posted count, a floored count that booked nothing,
+/// a sampled slice without its maximum, or any present retry, drop or sync timeout-release,
+/// each judged before any breach; [`Miss::Breach`] for a floored count that booked some samples
+/// but too few, or any gated reading at or over its ceiling.
 pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<String, Miss> {
     let whole = |name: &str| metric_ms_whole(reply, name);
     let (
@@ -1024,13 +1027,14 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
             })
     };
     let bar = |ms: u64| f64::from(u32::try_from(ms).unwrap_or(u32::MAX));
-    let (Some(queue_unavailable), Some(write_unavailable)) = (
+    let (Some(n_key_queue), Some(queue_unavailable), Some(write_unavailable)) = (
+        metric_u64(reply, "n_key_queue"),
         metric_u64(reply, "key_queue_unavailable"),
         metric_u64(reply, "key_write_unavailable"),
     ) else {
         return Err(Miss::Fail(format!(
             "gui smoke: hardware clock availability is unreported or invalid; the subject \
-             must publish key_queue_unavailable and key_write_unavailable to validate \
+             must publish n_key_queue, key_queue_unavailable and key_write_unavailable to validate \
              hardware latency [{reply}]"
         )));
     };
@@ -1040,6 +1044,13 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
              unavailable; input_clock=unconfirmed key_queue_unavailable={queue_unavailable} \
              key_write_unavailable={write_unavailable} n_key_write={n_key_write} \
              posted={posted} n_input={n_input} [{reply}]"
+        )));
+    }
+    if n_key_queue != posted {
+        return Err(Miss::Fail(format!(
+            "gui smoke: native queue clock samples do not match the posted burst; \
+             input_clock=unconfirmed n_key_queue={n_key_queue} posted={posted} \
+             n_input={n_input} [{reply}]"
         )));
     }
     let floors = [
@@ -1158,7 +1169,8 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         "gui smoke: frames={frames} max_input_present={max_input}ms, no present retries, \
          drops or sync timeouts; hardware keys n_key_write={n_key_write}/{posted} \
          key_write_p99={}ms max_term_wait_press={}ms acquire_p99={}ms (n={n_acquire}) \
-         input_p99={}ms (n={n_input}) input_clock=native key_queue_unavailable={queue_unavailable} \
+         input_p99={}ms (n={n_input}) input_clock=native n_key_queue={n_key_queue} \
+         key_queue_unavailable={queue_unavailable} \
          key_write_unavailable={write_unavailable} present_glass_p99={}ms (n={n_present_glass}, {} \
          never shown); echo_p99={}ms is the child's round trip (reported, not gated)",
         f("key_write_p99_ms"),

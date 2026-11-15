@@ -340,6 +340,7 @@ pub fn sound_event_words(w: &mut impl Words, event: &SoundEvent) {
         SoundVoice::Marimba => (4, u64::MAX),
         SoundVoice::Felt => (5, u64::MAX),
         SoundVoice::RainbowKittyV2 => (6, u64::MAX),
+        SoundVoice::MusicBoxII => (7, u64::MAX),
     };
     w.put("voice", voice);
     w.put("voice.of", of);

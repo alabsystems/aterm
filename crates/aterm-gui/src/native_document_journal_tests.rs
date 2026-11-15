@@ -56,6 +56,39 @@ impl JournalRecording {
     }
 }
 
+type ReplacementHook = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
+static REPLACEMENT_HOOKS: std::sync::Mutex<BTreeMap<PathBuf, ReplacementHook>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(unix)]
+pub(crate) struct ReplacementGate(PathBuf);
+
+#[cfg(unix)]
+impl ReplacementGate {
+    pub(super) fn install(path: PathBuf, hook: ReplacementHook) -> Self {
+        assert!(
+            REPLACEMENT_HOOKS
+                .lock()
+                .unwrap()
+                .insert(path.clone(), hook)
+                .is_none()
+        );
+        Self(path)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReplacementGate {
+    fn drop(&mut self) {
+        REPLACEMENT_HOOKS.lock().unwrap().remove(&self.0);
+    }
+}
+
+pub(super) fn after_replacement(path: &Path) -> std::io::Result<()> {
+    let hook = REPLACEMENT_HOOKS.lock().unwrap().remove(path);
+    hook.map_or(Ok(()), |hook| hook())
+}
+
 pub(super) fn test_root(name: &str) -> PathBuf {
     let root =
         std::env::temp_dir().join(format!("aterm-draft-journal-{}-{name}", std::process::id()));
@@ -68,6 +101,131 @@ pub(super) fn snapshots(text: &str) -> (DocumentStore, DocumentId, DocumentSnaps
     let id = store.open("file:///tmp/draft.md".to_string(), text.to_string());
     let snapshot = store.snapshot(id).unwrap();
     (store, id, snapshot)
+}
+
+#[test]
+fn prepared_journal_adoption_rejects_a_different_document_with_identical_text_and_sequence() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let mut journals = DocumentJournalStore::for_test(scratch.path().join("journals")).unwrap();
+    let mut documents = crate::test_document_store();
+    let a = documents.open("file:///prepared-a.txt".into(), "same text".into());
+    let b = documents.open("file:///prepared-b.txt".into(), "same text".into());
+    let a = documents.snapshot(a).unwrap();
+    let b = documents.snapshot(b).unwrap();
+    assert_eq!((a.seq, &a.text), (b.seq, &b.text));
+    let host = journals.admission_host();
+    let decision = host
+        .inspect_open("file:///prepared-a.txt", a.text.as_bytes())
+        .unwrap();
+    let prepared = host.initialize_on_worker(decision, &a, &a).unwrap();
+    assert!(
+        journals
+            .adopt_initialized(&prepared, "file:///prepared-b.txt", &b, &b)
+            .is_err()
+    );
+    assert!(journals.journal_path(b.id).is_none());
+    assert!(
+        journals
+            .adopt_initialized(&prepared, "file:///wrong-uri.txt", &a, &a)
+            .is_err()
+    );
+    let mut unrelated = DocumentJournalStore::for_test(scratch.path().join("journals")).unwrap();
+    assert!(
+        unrelated
+            .adopt_initialized(&prepared, "file:///prepared-a.txt", &a, &a)
+            .is_err()
+    );
+    journals
+        .adopt_initialized(&prepared, "file:///prepared-a.txt", &a, &a)
+        .unwrap();
+    assert_eq!(journals.journal_path(a.id), Some(prepared.path));
+}
+
+#[test]
+fn prepared_journal_adoption_rejects_another_host_before_consuming_ownership() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let mut original = DocumentJournalStore::for_test(scratch.path().join("original")).unwrap();
+    let mut other = DocumentJournalStore::for_test(scratch.path().join("other")).unwrap();
+    let (_documents, document, disk) = snapshots("same document and sequence");
+    let host = original.admission_host();
+    let decision = host
+        .inspect_open("file:///tmp/draft.md", disk.text.as_bytes())
+        .unwrap();
+    let prepared = host.initialize_on_worker(decision, &disk, &disk).unwrap();
+    assert!(
+        other
+            .adopt_initialized(&prepared, "file:///tmp/draft.md", &disk, &disk)
+            .is_err(),
+        "a result from another host cannot enter this store"
+    );
+    assert!(other.journal_path(document).is_none());
+    original
+        .adopt_initialized(&prepared, "file:///tmp/draft.md", &disk, &disk)
+        .unwrap();
+    assert_eq!(original.journal_path(document), Some(prepared.path));
+}
+
+#[test]
+fn adopted_preparation_clones_keep_one_live_registration_until_retirement() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let mut journals = DocumentJournalStore::for_test(scratch.path().join("journals")).unwrap();
+    let (_documents, document, disk) = snapshots("durable clean text");
+    let host = journals.admission_host();
+    let uri = "file:///tmp/draft.md";
+    let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+    let prepared = host.initialize_on_worker(decision, &disk, &disk).unwrap();
+    let duplicate = prepared.clone();
+    let stale = prepared.clone();
+    let path = prepared.path.clone();
+    assert!(
+        journals
+            .adopt_initialized(&duplicate, "file:///wrong.md", &disk, &disk)
+            .is_err()
+    );
+    let mut wrong_seq = disk.clone();
+    wrong_seq.seq = Seq(disk.seq.0 + 1);
+    let mut wrong_text = disk.clone();
+    wrong_text.text = Arc::from("another snapshot at the same sequence");
+    for invalid in [&wrong_seq, &wrong_text] {
+        assert!(
+            journals
+                .adopt_initialized(&duplicate, uri, invalid, &disk)
+                .is_err(),
+            "a mismatched disk baseline cannot consume the receipt"
+        );
+        assert!(
+            journals
+                .adopt_initialized(&duplicate, uri, &disk, invalid)
+                .is_err(),
+            "a mismatched captured head cannot consume the receipt"
+        );
+        assert!(journals.journal_path(document).is_none());
+    }
+    journals
+        .adopt_initialized(&prepared, uri, &disk, &disk)
+        .unwrap();
+    drop(prepared);
+    drop(duplicate);
+    journals.await_worker_for_test();
+    assert!(
+        path.exists(),
+        "dropping receipts cannot retire an adopted open"
+    );
+    assert!(journals.carry_candidate(&disk).is_ok());
+    let registered = journals.host.owner.is_some();
+    assert!(journals.forget(&[document]));
+    journals.await_worker_for_test();
+    assert_eq!(
+        path.exists(),
+        !registered,
+        "only a registered last holder can reclaim the clean image"
+    );
+    assert!(
+        journals
+            .adopt_initialized(&stale, uri, &disk, &disk)
+            .is_err()
+    );
+    assert!(journals.journal_path(document).is_none());
 }
 
 #[cfg(unix)]
@@ -159,7 +317,10 @@ fn fifo_lock_cannot_park_journal_initialization() {
         started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
         "the FIFO journal lock parked initialization"
     );
-    assert!(error.contains("journal lock"), "{error}");
+    assert!(
+        matches!(&error, JournalFault::Other(why) if why.contains("journal lock")),
+        "{error:?}"
+    );
     assert!(fs::symlink_metadata(&lock).unwrap().file_type().is_fifo());
     let _ = fs::remove_dir_all(root);
 }
@@ -182,8 +343,13 @@ fn held_journal_lock_returns_busy_and_a_later_retry_succeeds() {
         started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
         "the held journal lock parked initialization"
     );
-    assert!(error.contains("busy"), "{error}");
-    assert!(error.contains("retry"), "{error}");
+    assert_eq!(error, JournalFault::Busy, "a held lock is typed busy");
+    let said = String::from(error);
+    assert_eq!(said, JournalFault::BUSY);
+    assert!(
+        !said.contains("Manual") && !said.contains(".atdj") && !said.contains("journal"),
+        "busy words name no surface and no drafts path: {said}"
+    );
 
     drop(held);
     let initialized = host.initialize(decision, &disk, &disk).unwrap();
@@ -229,7 +395,7 @@ fn a_released_journal_lock_is_free_while_a_forked_copy_of_it_lives() {
     let path = root.join("draft.atdj");
     let lock_path = journal_lock_path(&path).unwrap();
 
-    let forked_copy = with_journal_lock(&path, JournalLockPatience::Worker, || {
+    let forked_copy = with_journal_lock::<_, String>(&path, JournalLockPatience::Worker, || {
         Ok(copy_of_the_open_description_of(&lock_path))
     })
     .unwrap();
@@ -259,7 +425,10 @@ fn final_symlink_lock_is_refused_without_touching_its_victim() {
     std::os::unix::fs::symlink(&victim, &lock_path).unwrap();
 
     let error = host.initialize(decision, &disk, &disk).unwrap_err();
-    assert!(error.contains("journal lock"), "{error}");
+    assert!(
+        matches!(&error, JournalFault::Other(why) if why.contains("journal lock")),
+        "{error:?}"
+    );
     assert_eq!(fs::read(&victim).unwrap(), b"do not lock through me");
     assert!(
         fs::symlink_metadata(&lock_path)
@@ -504,10 +673,8 @@ fn stale_open_inspection_cannot_replace_a_newer_initialized_journal() {
     let before = fs::read(&initialized.path).unwrap();
 
     let error = host.initialize(stale, &disk, &disk).unwrap_err();
-    assert!(
-        error.contains("changed after recovery inspection"),
-        "{error}"
-    );
+    assert_eq!(error, JournalFault::Changed);
+    assert_eq!(String::from(error), JournalFault::CHANGED);
     assert_eq!(fs::read(&initialized.path).unwrap(), before);
     let _ = fs::remove_dir_all(root);
 }
@@ -984,7 +1151,7 @@ fn cross_process_same_journal_generation_has_one_winner() {
         let verdict = loop {
             match execute_journal_append(&path, key, &plan, JournalLockPatience::Worker) {
                 JournalAppendResult::Committed(_) => break "committed",
-                JournalAppendResult::Failed { message, .. } if message.contains("busy") => {
+                JournalAppendResult::Failed { message, .. } if message == JournalFault::BUSY => {
                     assert!(
                         std::time::Instant::now() < retry_deadline,
                         "journal lock remained busy past the bounded retry window"
@@ -1489,8 +1656,8 @@ fn a_failed_reseat_is_refused_by_name_until_a_retry_lands() {
     let held = hold_journal_lock_for_test(&path);
     let refused = execute_journal_reseat(&path, &plan, JournalLockPatience::EventLoop);
     assert!(
-        matches!(refused, JournalReseatResult::Failed(_)),
-        "{refused:?}"
+        matches!(&refused, JournalReseatResult::Failed(why) if why == JournalFault::BUSY),
+        "a busy re-seat says the busy words: {refused:?}"
     );
     assert!(matches!(
         journals.complete_reseat(id, plan.generation, refused),
@@ -1633,7 +1800,7 @@ pub(super) fn open_as_the_app_does(
             base.seq,
             vec![TextEdit {
                 range: 0..base.text.len(),
-                insert: recovered,
+                insert: recovered.to_string(),
             }],
         );
     }
@@ -1727,7 +1894,7 @@ fn a_legacy_journal_rewritten_after_a_migration_wins_and_the_keyed_one_is_kept()
     let mut store = crate::test_document_store();
     let (_, _, first) = open_as_the_app_does(&mut successor, &mut store, URI, "disk");
     let migrated = fs::read(&first.path).unwrap();
-    drop(successor);
+    successor.end_for_test();
     write_legacy_journal(&root, URI, "disk", "disk v2");
 
     let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
@@ -1825,7 +1992,7 @@ fn a_clean_legacy_journal_never_hides_a_keyed_draft() {
     let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
     let mut store = crate::test_document_store();
     let keyed = journal_a_draft(&mut journals, &mut store, URI, "the newest draft");
-    drop(journals);
+    journals.end_for_test();
     let legacy = write_legacy_journal(&root, URI, "", "");
 
     let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
@@ -1864,7 +2031,7 @@ fn a_legacy_draft_that_is_the_file_never_sets_a_keyed_draft_aside_silently() {
     let mut store = crate::test_document_store();
     let keyed = journal_a_draft(&mut journals, &mut store, URI, "the keyed draft");
     let keyed_image = fs::read(&keyed).unwrap();
-    drop(journals);
+    journals.end_for_test();
     let legacy = write_legacy_journal_typing(&root, URI, "", &["typed", ""]);
 
     let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
@@ -1909,7 +2076,7 @@ fn a_legacy_draft_never_sets_a_faulted_keyed_image_aside_silently() {
         URI,
         "\u{a5}q\u{1}\0\0\0\0\0\0\0\0\0 and after",
     );
-    drop(journals);
+    journals.end_for_test();
     let typed = fs::read(&keyed).unwrap();
     let nested = 1 + typed
         .windows(4)

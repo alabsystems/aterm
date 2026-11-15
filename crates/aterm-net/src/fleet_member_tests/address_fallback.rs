@@ -132,6 +132,155 @@ impl Drop for Peer {
 
 static RESOLVED: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+fn discovered_routes_reach_a_restarted_node_without_dialling_its_stale_endpoint() {
+    let want = identity(&node_of(0xd7), 4);
+    let me = identity(&node_of(0x3a), 8);
+    let peer = Peer::start(want.clone(), SERVES);
+    let impostor = Peer::start(identity(want.node(), 5), SERVES);
+    let old_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let stale = old_listener.local_addr().unwrap();
+    let target = Target {
+        host: stale.ip().to_string(),
+        addr: Some(stale.ip()),
+        port: stale.port(),
+        node: Some(want.node().into()),
+        key: Some(want.key()),
+    };
+    // A deterministic silent address seam records whether the obsolete endpoint was tried.
+    let silence = HeldSilent::at(stale);
+    let routes = [impostor.addr, peer.addr];
+    let mut driven = drive_routes(
+        &target,
+        &Keyring::default(),
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+        &routes,
+    )
+    .unwrap();
+    assert_eq!(driven.addr, peer.addr);
+    driven.write_all(b"version\n").unwrap();
+    let mut reply = String::new();
+    io::BufRead::read_line(&mut io::BufReader::new(&mut driven), &mut reply).unwrap();
+    assert_eq!(reply, "OK reached\n");
+    assert_eq!(
+        silence.dials(),
+        0,
+        "a known live route bypasses the obsolete endpoint"
+    );
+    assert_eq!(
+        impostor.asked.load(Ordering::Acquire),
+        0,
+        "no request goes to a wrong key"
+    );
+    let stale_peer =
+        crate::fleet_member::Peer::own(&want, (&target.host, target.port, "0.198.0"), 100);
+    let (reads, _) = read_whole_routes(
+        &[stale_peer],
+        &Keyring::default(),
+        None,
+        (&secret(6), Some(&me)),
+        HANG,
+        "survey facts",
+        &[(want.node().into(), peer.addr)],
+    );
+    assert_eq!(
+        reads[0].read.as_ref().unwrap().addr,
+        peer.addr,
+        "the peers probe also uses the discovered restart port"
+    );
+}
+
+#[test]
+fn a_silent_discovered_route_leaves_time_for_the_other_known_route() {
+    let want = identity(&node_of(0xd7), 4);
+    let me = identity(&node_of(0x3a), 8);
+    let peer = Peer::start(want.clone(), SERVES);
+    let old_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let stale = old_listener.local_addr().unwrap();
+    let silence = HeldSilent::at(stale);
+    let target = Target {
+        host: peer.addr.ip().to_string(),
+        addr: None,
+        port: peer.addr.port(),
+        node: Some(want.node().into()),
+        key: Some(want.key()),
+    };
+    let driven = drive_routes(
+        &target,
+        &Keyring::default(),
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+        &[stale, peer.addr],
+    )
+    .unwrap();
+    assert_eq!(driven.addr, peer.addr);
+    assert_eq!(silence.dials(), 1);
+    assert!(
+        silence.overrode().unwrap() <= HANG / 2,
+        "a silent first route must leave the other known route its share of the deadline"
+    );
+}
+
+#[test]
+fn a_silent_observation_leaves_time_for_the_signed_numeric_host() {
+    let want = identity(&node_of(0xd7), 4);
+    let me = identity(&node_of(0x3a), 8);
+    let peer = Peer::start(want.clone(), SERVES);
+    let old_listener =
+        TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, peer.addr.port())).unwrap();
+    let stale = old_listener.local_addr().unwrap();
+    let silence = HeldSilent::at(stale);
+    let target = Target {
+        host: peer.addr.ip().to_string(),
+        addr: Some(stale.ip()),
+        port: peer.addr.port(),
+        node: Some(want.node().into()),
+        key: Some(want.key()),
+    };
+    let driven = drive_routes(
+        &target,
+        &Keyring::default(),
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(driven.addr, peer.addr);
+    assert_eq!(silence.dials(), 1);
+    assert!(
+        silence.overrode().unwrap() <= HANG / 2,
+        "an observation must leave time for the already known signed host"
+    );
+}
+
+#[test]
+fn discovered_routes_cannot_bypass_a_refusal_proved_by_the_bound_node() {
+    let want = identity(&node_of(0xd7), 4);
+    let me = identity(&node_of(0x3a), 8);
+    let refusing = Peer::start(want.clone(), &[FleetOp::Survey]);
+    let other = Peer::start(want.clone(), SERVES);
+    let target = Target {
+        host: other.addr.ip().to_string(),
+        addr: Some(other.addr.ip()),
+        port: other.addr.port(),
+        node: Some(want.node().into()),
+        key: Some(want.key()),
+    };
+    let refused = drive_routes(
+        &target,
+        &Keyring::default(),
+        (&secret(6), &me),
+        (Instant::now() + HANG, HANG),
+        &[refusing.addr, other.addr],
+    );
+    assert!(matches!(
+        refused,
+        Err(Unreached::Handshake(_, FleetError::UnknownOp(_)))
+    ));
+    assert_eq!(other.asked.load(Ordering::Acquire), 0);
+}
+
 fn addresses(host: &str, _: u16) -> Vec<SocketAddr> {
     RESOLVED.fetch_add(1, Ordering::AcqRel);
     host.split(',').map(|word| word.parse().unwrap()).collect()
@@ -261,7 +410,7 @@ fn bound_target_refusals_keep_their_own_retry_disposition() {
             &Keyring::default(),
             (Instant::now() + HANG, HANG),
             move |_, _| vec![second, third],
-            |at| {
+            |at, _| {
                 if at == first {
                     return AtAddr::Passed(Unreached::Deadline(Stage::Handshake, HANG));
                 }

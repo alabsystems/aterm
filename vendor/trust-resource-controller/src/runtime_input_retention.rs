@@ -310,7 +310,7 @@ impl SupportQuery {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SupportReply {
-    Supported { context: ContextReply },
+    Supported { context: Box<ContextReply> },
     Refused { root_attempt: [u8; 16], call_attempt: [u8; 16], reason: String },
 }
 impl SupportReply {
@@ -348,7 +348,9 @@ impl SupportReply {
         }
         let value = match d.number()? {
             0 => {
-                Self::Supported { context: ContextReply::decode(&d.frame_bytes()?, &query.query)? }
+                Self::Supported {
+                    context: Box::new(ContextReply::decode(&d.frame_bytes()?, &query.query)?),
+                }
             }
             1 => Self::Refused {
                 root_attempt: d.array()?,
@@ -359,12 +361,11 @@ impl SupportReply {
         };
         d.done()?;
         value.encode()?;
-        if let Self::Refused { root_attempt, call_attempt, .. } = &value {
-            if *root_attempt != query.query.binding.root_attempt
-                || *call_attempt != query.query.call_attempt
-            {
+        if let Self::Refused { root_attempt, call_attempt, .. } = &value
+            && (*root_attempt != query.query.binding.root_attempt
+                || *call_attempt != query.query.call_attempt)
+        {
                 return Err(invalid());
-            }
         }
         Ok(value)
     }

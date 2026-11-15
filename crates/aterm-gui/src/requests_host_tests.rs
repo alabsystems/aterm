@@ -618,3 +618,112 @@ fn listed_counts_unreviewed_newest_first_with_the_fallback_why() {
     assert_eq!(again.unreviewed, 0);
     assert_eq!(again.rows[1].stage, Stage::Reviewed);
 }
+
+/// A drive's plain shell joins only a plain shell's request, which a lease ends: its `req=` of
+/// the requester's worker request is refused, saying why and that a spawn without `req=` opens
+/// its own. NEGATIVE CONTROLS: a worker joins the worker's request and a shell the shell's; a
+/// worker does not join the shell's.
+#[test]
+fn a_drives_plain_shell_joins_only_a_plain_shells_request() {
+    let _here = Here::new();
+    let asker = fleet_asker(BY);
+    let (worker, shell) = (test_handle(1), test_handle(2));
+    let worker_req = opened(&asker, Made::Agent("claude"), worker.sid.as_str());
+    let shell_req = opened(&asker, Made::Shell, shell.sid.as_str());
+    let join = |id: &str, made| {
+        let prepared = prepare(Some(&asker), Some(id), made, Some("beside it"), None);
+        begin(prepared.expect("prepared")).map(|begun| {
+            // Settled as a refused spawn, which leaves its open request as it was.
+            drop(hand(begun, None));
+        })
+    };
+    let why = aterm_requests::Refusal::Via {
+        request: Via::FleetWorker,
+        spawn: Via::FleetShell,
+    };
+    assert_eq!(
+        join(&worker_req, Made::Shell).err(),
+        Some(format!("ERR spawn req={worker_req}: {why}\n"))
+    );
+    assert!(
+        why.to_string()
+            .contains("spawn it without req= to open its own")
+    );
+    assert!(join(&shell_req, Made::Agent("claude")).is_err());
+    assert_eq!(join(&worker_req, Made::Agent("claude")), Ok(()));
+    assert_eq!(join(&shell_req, Made::Shell), Ok(()));
+    // A hang detector: the writer settles the joins before the folder goes.
+    assert!(flush_within(Duration::from_secs(60)), "the writer flushed");
+}
+
+/// A tab's leaving the journal refused (another process held its lock past the wait) is written
+/// once the journal takes it, and concludes its request. NEGATIVE CONTROL: while the lock is
+/// held, the request stays running.
+#[test]
+fn a_leaving_the_journal_refused_is_written_once_it_takes_it() {
+    let here = Here::new();
+    let tab = test_handle(1);
+    let id = opened(&fleet_asker(BY), Made::Shell, tab.sid.as_str());
+    let journal = here.0.path().join(aterm_requests::JOURNAL);
+    let held = aterm_uds::line_log::hold(&journal).expect("the journal's lock");
+    left(tab_left(&tab.sid, ExitReason::ShellExit, Some(0)));
+    // A hang detector: the writer tried, and the lock refused it.
+    assert!(flush_within(Duration::from_secs(60)), "the writer flushed");
+    assert_eq!(
+        here.store().get(&id).map(aterm_requests::Request::state),
+        Some(State::Running),
+        "{}",
+        here.journal()
+    );
+    drop(held);
+    assert!(flush_within(Duration::from_secs(60)), "the writer flushed");
+    assert_eq!(
+        here.store().get(&id).map(aterm_requests::Request::state),
+        Some(State::Concluded(Out::Done)),
+        "{}",
+        here.journal()
+    );
+}
+
+/// A tab's leaving the journal refused is written on the writer's timer where nothing else comes
+/// for it to write (no lease looks, no shell block runs), and concludes its request. NEGATIVE
+/// CONTROL: while the lock is held, the timer's tries leave the request running.
+#[test]
+fn a_refused_leaving_is_written_on_the_writers_timer_with_nothing_else_to_write() {
+    let here = Here::new();
+    let tab = test_handle(1);
+    let id = opened(&fleet_asker(BY), Made::Shell, tab.sid.as_str());
+    let state = || here.store().get(&id).map(aterm_requests::Request::state);
+    // A writer of this test's own, so no other test's item makes it try again.
+    let (tx, rx) = mpsc::channel();
+    let writer = std::thread::spawn(move || write_items(&rx, Duration::from_millis(10)));
+    let held = aterm_uds::line_log::hold(&here.0.path().join(aterm_requests::JOURNAL))
+        .expect("the journal's lock");
+    let item = Item::Left {
+        dir: here.0.path().to_path_buf(),
+        at: now_unix_ms(),
+        left: tab_left(&tab.sid, ExitReason::ShellExit, Some(0)),
+    };
+    tx.send(item).expect("the writer takes the leaving");
+    let (flushed, done) = mpsc::channel();
+    tx.send(Item::Flush(flushed))
+        .expect("the writer takes the flush");
+    // A hang detector: the writer tried, and the lock refused it.
+    done.recv_timeout(Duration::from_secs(60))
+        .expect("the writer flushed");
+    assert_eq!(state(), Some(State::Running), "{}", here.journal());
+    drop(held);
+    // Nothing more is handed to the writer, so only its timer can write the leaving. A hang
+    // detector.
+    let detector = std::time::Instant::now() + Duration::from_secs(60);
+    while state() != Some(State::Concluded(Out::Done)) {
+        assert!(
+            std::time::Instant::now() < detector,
+            "the timer wrote the leaving: {}",
+            here.journal()
+        );
+        aterm_uds::deadline::poll_yield();
+    }
+    drop(tx);
+    writer.join().expect("the writer ended");
+}

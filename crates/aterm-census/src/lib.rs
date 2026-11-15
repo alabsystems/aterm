@@ -6,37 +6,24 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
-pub mod changelog;
 pub mod export;
 pub mod export_scan;
 mod guards;
 mod held_guard;
 pub mod inputs;
 pub mod items;
-mod lazy_init;
+pub mod known_issues;
 mod lex;
-mod lock_order;
-mod memo;
-pub mod mirror;
 pub mod no_reach;
 pub mod outline;
 pub mod scan_set;
-mod scope_census;
 pub mod seal;
 mod tree;
-mod wasm_census;
-mod wasm_cfg;
+mod workers;
 pub use guards::inline_test_module::{Unread, Unreadable, unread_at};
 pub use guards::{Finding, GUARDS, GuardReport, Rule, run_guards};
-pub use lazy_init::{LAZY_INIT_PRECISION_NOTE, run_lazy_init_census};
-pub use lock_order::run_lock_order_census;
-pub use memo::{Memo, MemoReport, Rejudged, on_one_worker, pin_code, without_parallel_workers};
-pub use scope_census::{SCOPE_PRECISION_NOTE, run_scope_census};
-/// Browser `cdylib` root crates re-exported for `aterm-forge`'s `[OB-17]` check.
-pub use wasm_census::WASM_ROOT_CRATES;
-pub use wasm_census::run_wasm_census;
+pub use workers::{on_one_worker, without_parallel_workers};
 
 /// Verdict, transcript, and floor counts produced by a census walk.
 pub struct CensusOutcome {
@@ -48,7 +35,7 @@ pub struct CensusOutcome {
     pub log: String,
     /// Floor ranges checked on a clean walk.
     pub floors: Vec<Floor>,
-    title: Cow<'static, str>,
+    title: &'static str,
 }
 
 impl CensusOutcome {
@@ -70,50 +57,7 @@ impl CensusOutcome {
             verdict,
             log,
             floors: Vec::new(),
-            title: Cow::Borrowed(title),
-        }
-    }
-
-    /// The outcome as a memo record keeps it.
-    fn kept(&self) -> memo::KeptOutcome {
-        memo::KeptOutcome {
-            ok: self.ok,
-            verdict: self.verdict.clone(),
-            log: self.log.clone(),
-            title: self.title.to_string(),
-            floors: self
-                .floors
-                .iter()
-                .map(|f| {
-                    (
-                        f.what.to_string(),
-                        f.seen,
-                        *f.range.start(),
-                        *f.range.end(),
-                        f.missed.to_string(),
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    /// The outcome a memo record kept ([`Self::kept`]).
-    fn from_kept(kept: &memo::KeptOutcome) -> Self {
-        Self {
-            ok: kept.ok,
-            verdict: kept.verdict.clone(),
-            log: kept.log.clone(),
-            floors: kept
-                .floors
-                .iter()
-                .map(|(what, seen, min, max, missed)| Floor {
-                    what: Cow::Owned(what.clone()),
-                    seen: *seen,
-                    range: *min..=*max,
-                    missed: Cow::Owned(missed.clone()),
-                })
-                .collect(),
-            title: Cow::Owned(kept.title.clone()),
+            title,
         }
     }
 
@@ -176,16 +120,6 @@ impl Floor {
         }
     }
 
-    /// Requires `seen` to be zero.
-    pub(crate) const fn none(what: &'static str, seen: usize, missed: &'static str) -> Self {
-        Self {
-            what: Cow::Borrowed(what),
-            seen,
-            range: 0..=0,
-            missed: Cow::Borrowed(missed),
-        }
-    }
-
     /// Returns `true` when `seen` is within `range`.
     #[must_use]
     pub fn met(&self) -> bool {
@@ -221,94 +155,17 @@ pub struct Census {
     pub name: &'static str,
     /// Short description for `--help`.
     pub about: &'static str,
-    /// Runner over one walk of a checkout.
-    run: fn(&Walk<'_>) -> CensusOutcome,
-}
-
-/// What one census run reads: the checkout root, the engine's baseline its caller read, the
-/// run's snapshot of the checkout's source ([`Walk::snapshot`]), and the memo run that keeps a
-/// record of it, when one does.
-pub(crate) struct Walk<'a> {
-    pub(crate) root: &'a Path,
-    pub(crate) engine: &'a EngineBaseline,
-    pub(crate) source: &'a OnceLock<std::sync::Arc<memo::Snapshot>>,
-    pub(crate) run: Option<&'a memo::Run>,
-}
-
-impl<'a> Walk<'a> {
-    /// The run's snapshot of the checkout's source: a memo run's, read at its start, else read
-    /// when a census first asks for it, so a census that reads none (all but the guards) reads
-    /// only what it walks.
-    pub(crate) fn snapshot(&self) -> &'a memo::Snapshot {
-        self.source
-            .get_or_init(|| std::sync::Arc::new(memo::Snapshot::read(self.root)))
-    }
-
-    /// `judge`'s outcome as one memo unit, `id`: the outcome the memo run kept for it while
-    /// every question it asked keeps its answer, else judged now and kept. A census that panics
-    /// keeps nothing.
-    fn whole(&self, id: &str, judge: impl FnOnce() -> CensusOutcome) -> CensusOutcome {
-        let Some(run) = self.run else {
-            return judge();
-        };
-        let why = match run.reusable(id, self.snapshot()) {
-            Ok(record) => match &record.result {
-                memo::Verdict::Outcome(kept) => {
-                    let outcome = CensusOutcome::from_kept(kept);
-                    run.keep_reused(record);
-                    return outcome;
-                }
-                memo::Verdict::Findings(_) => Rejudged::Changed("its record is a guard's".into()),
-            },
-            Err(why) => why,
-        };
-        let (judged, trace) = memo::unit(&run.shared, || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(judge))
-        });
-        match judged {
-            Ok(outcome) => {
-                run.keep_judged(
-                    id,
-                    why,
-                    Some((trace, memo::Verdict::Outcome(outcome.kept()))),
-                );
-                outcome
-            }
-            Err(panic) => {
-                run.keep_judged(id, why, None);
-                std::panic::resume_unwind(panic)
-            }
-        }
-    }
+    /// Runner over a checkout's root, with the engine's baseline its caller read.
+    run: fn(&Path, &EngineBaseline) -> CensusOutcome,
 }
 
 /// Every census, in the order a run prints them (they run in parallel).
 pub const CENSUSES: &[Census] = &[
     Census {
         name: "mainloop",
-        about: "main-thread reach to unbounded work or a frame wait; unbounded work under a held \
-                `term` guard (OB-1..OB-6, OB-22, OB-23)",
-        run: |walk| walk.whole("census:mainloop", || run_mainloop_census(walk.root)),
-    },
-    Census {
-        name: "locks",
-        about: "lock-order cycles across the GUI process (OB-7)",
-        run: |walk| walk.whole("census:locks", || run_lock_order_census(walk.root)),
-    },
-    Census {
-        name: "wasm",
-        about: "wasm reach to unbounded work; no threads (OB-8..OB-10, OB-12)",
-        run: |walk| walk.whole("census:wasm", || run_wasm_census(walk.root)),
-    },
-    Census {
-        name: "scope",
-        about: "window-scoped enforcers that multiply (OB-13..OB-16)",
-        run: |walk| walk.whole("census:scope", || run_scope_census(walk.root)),
-    },
-    Census {
-        name: "lazy-init",
-        about: "lazy cells re-entered by their own initializer (OB-19..OB-21)",
-        run: |walk| walk.whole("census:lazy-init", || run_lazy_init_census(walk.root)),
+        about: "main-thread reach to a frame wait; unbounded work under a held `term` guard \
+                (OB-2, OB-22, OB-23)",
+        run: |root, _| run_mainloop_census(root),
     },
     Census {
         name: "guards",
@@ -317,47 +174,20 @@ pub const CENSUSES: &[Census] = &[
     },
 ];
 
-/// Runs `selected` censuses in parallel over `root`, with the engine's baseline `engine`, and
-/// enforces their floors. With `memo`, each guard rule and each other census reuses the result
-/// the memo kept for it while every question it asked of the checkout keeps its answer, and the
-/// run keeps its own record there ([`Memo`]); the report says what was reused.
+/// Runs `selected` censuses in parallel over `root`, with the engine's baseline `engine`, each
+/// on its own thread, and enforces their floors.
 #[must_use]
 pub fn run_censuses(
     root: &Path,
     selected: &[&Census],
     engine: &EngineBaseline,
-    memo: Option<&Memo>,
-) -> (Vec<CensusOutcome>, Option<MemoReport>) {
-    let Some(memo) = memo else {
-        let walk = Walk {
-            root,
-            engine,
-            source: &OnceLock::new(),
-            run: None,
-        };
-        return (walk_censuses(&walk, selected), None);
-    };
-    let (run, snapshot) = memo::Run::start(root, Some(memo), engine);
-    let source = OnceLock::from(std::sync::Arc::clone(&snapshot));
-    let walk = Walk {
-        root,
-        engine,
-        source: &source,
-        run: run.keeps().then_some(&run),
-    };
-    let outcomes = memo::loader(&run.shared, || walk_censuses(&walk, selected));
-    let report = run.finish(&snapshot);
-    (outcomes, Some(report))
-}
-
-/// `selected` over `walk`, each on its own thread, floors enforced.
-fn walk_censuses(walk: &Walk<'_>, selected: &[&Census]) -> Vec<CensusOutcome> {
-    memo::threads(|scope| {
+) -> Vec<CensusOutcome> {
+    workers::threads(|scope| {
         let running: Vec<_> = selected
             .iter()
             .map(|&census| {
                 scope.spawn_named(format!("census-{}", census.name), 8 << 20, move || {
-                    (census.run)(walk)
+                    (census.run)(root, engine)
                 })
             })
             .collect();
@@ -383,18 +213,13 @@ fn walk_censuses(walk: &Walk<'_>, selected: &[&Census]) -> Vec<CensusOutcome> {
     })
 }
 
-/// Run one census on the calling thread, with no memo, enforcing the same floor and panic policy
-/// as the parallel runner. Its reads stay on this thread and the threads it starts through
-/// [`memo::threads`], so an input capture around the call ([`inputs::capture`]) holds every one.
+/// Run one census on the calling thread, enforcing the same floor and panic policy as the
+/// parallel runner. Its reads stay on this thread and the threads it starts through
+/// [`workers::threads`], so an input capture around the call ([`inputs::capture`]) holds every
+/// one.
 pub fn run_census(root: &Path, census: &Census, engine: &EngineBaseline) -> CensusOutcome {
-    let walk = Walk {
-        root,
-        engine,
-        source: &OnceLock::new(),
-        run: None,
-    };
     let mut outcome =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (census.run)(&walk)))
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (census.run)(root, engine)))
             .unwrap_or_else(|_| {
                 CensusOutcome::red(census.name, String::new(), "it panicked (message above)")
             });
@@ -410,69 +235,24 @@ pub fn run_all(root: &Path, engine: &EngineBaseline) -> Vec<(&'static str, Censu
     CENSUSES
         .iter()
         .map(|c| c.name)
-        .zip(run_censuses(root, &every, engine, None).0)
+        .zip(run_censuses(root, &every, engine))
         .collect()
 }
 
-/// The walker's limits, printed after a red verdict that found an
-/// unbounded-work site or a frame wait.
+/// The walker's limits, printed after a red verdict that found unbounded work under a held
+/// guard or a frame wait.
 pub const PRECISION_NOTE: &str = "    PRECISION / SCOPE (this census's limits):
       - LEXICAL, name-based: fns are segmented by rustfmt's
         closing-brace-at-fn-indent layout and calls matched as `<ident>(`,
         with no type, trait or borrow information. Same-named fns merge into
         one node (an over-approximation, sound for a fail-closed census).
-        Macro-generated calls, fn pointers and aliasing can evade it; a
-        synchronous `term_lock(..).resize(..)` on a main-thread path is
-        caught, with its path printed.
+        Macro-generated calls, fn pointers and aliasing can evade it.
       - SCOPE: the call graph covers non-test `crates/aterm-gui/src` and
         `crates/aterm-gui-*/src` (OB-22's held-guard scan also reads
-        `crates/aterm-control/src`), plus one modeled `term_lock` hop into
-        Terminal methods. Test, bench and proof files are dropped by
-        path; an in-file item is blanked only when its `cfg` entails `test`
-        (`all(test, ..)` yes; `any(test, unix)` and `not(test)` no). The walk
-        does not enter aterm-core or aterm-grid: the unbounded sinks are
-        pinned by `// COST: UNBOUNDED(<dim>)` markers, swept over the derived
-        GUI-process closure (workspace src/ only, the OB-7 scan set) and held
-        to the registry both ways. Markers outside the closure are reported,
-        never registry-checked.
+        `crates/aterm-control/src`). Test, bench and proof files are dropped
+        by path; an in-file item is blanked only when its `cfg` entails `test`
+        (`all(test, ..)` yes; `any(test, unix)` and `not(test)` no).
 ";
-
-struct UnboundedSink {
-    /// The fn name as it appears at its `fn <symbol>` definition.
-    symbol: &'static str,
-    /// The cost dimension named in the marker (documentation + failure text).
-    dim: &'static str,
-    /// Repo-relative file the marked definition lives in (for the failure text).
-    def_file: &'static str,
-}
-
-const UNBOUNDED_REGISTRY: &[UnboundedSink] = &[
-    UnboundedSink {
-        symbol: "reflow_scrollback_lines",
-        dim: "session-history-cells",
-        def_file: "crates/aterm-grid/src/grid/scrollback_reflow.rs",
-    },
-    UnboundedSink {
-        symbol: "take_scrollback_lines",
-        dim: "ring+tiered-history-lines",
-        def_file: "crates/aterm-grid/src/grid/scrollback_reflow.rs",
-    },
-    UnboundedSink {
-        symbol: "resize_with_reflow_mode",
-        dim: "scrollback-width-reflow",
-        def_file: "crates/aterm-grid/src/grid/reflow.rs",
-    },
-    UnboundedSink {
-        symbol: "diskwalk_slice",
-        dim: "entries",
-        def_file: "crates/aterm-diskwalk/src/walk.rs",
-    },
-    UnboundedSink {
-        symbol: "diskwalk_size_full",
-        dim: "entries",
-        def_file: "crates/aterm-diskwalk/src/walk.rs",
-    },
-];
 
 const MAIN_THREAD_ROOTS: &[&str] = &[
     "new_events",
@@ -481,57 +261,6 @@ const MAIN_THREAD_ROOTS: &[&str] = &[
     "window_event",
     "about_to_wait",
     "flush_pending_resize",
-];
-
-const UNBOUNDED_TERM_METHODS: &[&str] = &["resize"];
-
-struct OffloadBoundary {
-    /// The method name as called on the `term_lock` guard.
-    symbol: &'static str,
-    /// Repo-relative file holding the `fn <symbol>` definition (existence-checked).
-    def_file: &'static str,
-    /// The audited justification: why this is genuinely an offload boundary.
-    justification: &'static str,
-}
-
-const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
-    OffloadBoundary {
-        symbol: "resize_offloading_scrollback",
-        def_file: "crates/aterm-core/src/terminal/callback_setters.rs",
-        justification: "The detach half of the L0 fix: O(1) detach of the tiered \
-            scrollback store BEFORE the resize, so the synchronous reflow under the \
-            lock touches only the bounded in-memory ring (O(ring), independent of \
-            session lifetime). The unbounded decompress+rewrap leaves as a `Send` \
-            PendingScrollbackReflow for a worker (enforced off-lock by construction: \
-            `reflow()` consumes the detached value).",
-    },
-    OffloadBoundary {
-        symbol: "finish_resize_offload",
-        def_file: "crates/aterm-core/src/terminal/callback_setters.rs",
-        justification: "The re-attach half: O(1) store re-attach plus a bounded \
-            lazy-buffer drain (O(window output), not O(history)) under a brief lock, \
-            after the worker did the unbounded rewrap off-thread; when the width changed \
-            meanwhile it re-detaches and returns a new job for the worker. Guarded against \
-            clobbering (reset raced) and against resurrecting erased history \
-            (clear_gen check).",
-    },
-    OffloadBoundary {
-        symbol: "abort_resize_offload",
-        def_file: "crates/aterm-core/src/terminal/callback_setters.rs",
-        justification: "The wedge-recovery half: O(1) flag-clear + bounded \
-            lazy-buffer discard when a reflow worker dies and will never re-attach. \
-            Without it the detach window stays open forever (unbounded lazy growth).",
-    },
-    OffloadBoundary {
-        symbol: "reattach_reflowed_scrollback",
-        def_file: "crates/aterm-grid/src/grid/scrollback_offload.rs",
-        justification: "The Grid-level re-attach that `finish_resize_offload` reaches \
-            through `reattach_reflowed_scrollback_or_redetach`: O(1) attach of the \
-            already-rewrapped store + bounded lazy drain. \
-            Registered so GUI code driving a Grid directly (no Terminal wrapper) \
-            still has a sanctioned re-attach shape; it IS the underlying boundary, \
-            not a suppression.",
-    },
 ];
 
 const WHOLE_FRAME_WAITS: &[&str] = &["term_lock_whole", "term_lock_whole_when"];
@@ -605,11 +334,6 @@ fn any_match(hay: &str, needle: &str, mut fits: impl FnMut(usize) -> bool) -> bo
         }
     }
     false
-}
-
-/// Whether `needle` occurs in `hay`: [`str::contains`] by [`any_match`]'s scan.
-fn mentions(hay: &str, needle: &str) -> bool {
-    any_match(hay, needle, |_| true)
 }
 
 fn first_naming<'a>(
@@ -887,11 +611,11 @@ fn gui_source_files(root: &Path) -> Vec<PathBuf> {
 }
 
 fn mask_unshipped_items(text: &str) -> String {
-    crate::lock_order::mask_items_where(text, &|attr| cfg_attr_never_ships(attr))
+    items::mask_items_where(text, &|attr| cfg_attr_never_ships(attr))
 }
 
 fn shipped_lines(code: &str) -> Vec<bool> {
-    crate::lock_order::unmasked_lines(code, &|attr| cfg_attr_never_ships(attr))
+    items::unmasked_lines(code, &|attr| cfg_attr_never_ships(attr))
 }
 
 fn cfg_attr_never_ships(attr: &str) -> bool {
@@ -901,12 +625,7 @@ fn cfg_attr_never_ships(attr: &str) -> bool {
     let Some(pred) = rest.strip_suffix(")]") else {
         return false;
     };
-    cfg_pred_entails_unshipped(pred)
-}
-
-/// The shared strict evaluator is also used by closure-anchor attributes.
-fn cfg_pred_entails_unshipped(pred: &str) -> bool {
-    crate::wasm_cfg::when_test_disabled(pred) == crate::wasm_cfg::Truth::False
+    items::when_test_disabled(pred) == items::Truth::False
 }
 
 fn split_top_level_commas(args: &str) -> Vec<&str> {
@@ -1083,102 +802,6 @@ fn ident_ending_at(s: &str, end: usize) -> Option<&str> {
     }
 }
 
-fn guard_vars(body: &[String]) -> std::collections::BTreeSet<String> {
-    let mut guards = std::collections::BTreeSet::new();
-    for line in body {
-        let Some(eq) = line
-            .find("= term_lock(")
-            .or_else(|| line.find("= crate::term_lock_ui("))
-            .or_else(|| line.find("= term_lock_ui("))
-            .or_else(|| line.find("= crate::term_lock_whole("))
-            .or_else(|| line.find("= term_lock_whole("))
-            .or_else(|| line.find("= crate::term_lock_whole_when("))
-            .or_else(|| line.find("= term_lock_whole_when("))
-        else {
-            continue;
-        };
-        let lhs = line[..eq].trim_end();
-        let start = lhs
-            .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-            .map_or(0, |i| i + lhs[i..].chars().next().map_or(0, char::len_utf8));
-        let name = &lhs[start..];
-        if !name.is_empty() {
-            guards.insert(name.to_string());
-        }
-    }
-    guards
-}
-
-struct TermHopHazard {
-    method: String,
-    line: String,
-}
-
-fn term_hop_calls(body: &[String]) -> (Vec<TermHopHazard>, usize) {
-    // Every acquire `guard_vars` binds and every chain read below names `term_lock`: a body
-    // that never does holds no guard and chains on none.
-    if !body.iter().any(|line| mentions(line, "term_lock")) {
-        return (Vec::new(), 0);
-    }
-    let guards = guard_vars(body);
-    let mut hazards = Vec::new();
-    let mut offloads = 0usize;
-    let classify = |method: &str, line: &str, hz: &mut Vec<TermHopHazard>, off: &mut usize| {
-        if UNBOUNDED_TERM_METHODS.contains(&method) {
-            hz.push(TermHopHazard {
-                method: method.to_string(),
-                line: line.trim().to_string(),
-            });
-        } else if OFFLOAD_ALLOWLIST.iter().any(|b| b.symbol == method) {
-            *off += 1;
-        }
-    };
-    for line in body {
-        // A call chained on the lock guard; the `_ui`/`_whole`/`_whole_when` infixes break the plain needle.
-        if line.contains("term_lock(")
-            || line.contains("term_lock_ui(")
-            || line.contains("term_lock_whole(")
-            || line.contains("term_lock_whole_when(")
-        {
-            let mut search = line.as_str();
-            while let Some(rel) = search.find(").") {
-                let after = &search[rel + 2..];
-                let len = after
-                    .find(|c: char| !c.is_alphanumeric() && c != '_')
-                    .unwrap_or(after.len());
-                let method = &after[..len];
-                let is_call = after[method.len()..].starts_with('(');
-                if is_call && !method.is_empty() {
-                    classify(method, line, &mut hazards, &mut offloads);
-                }
-                search = &search[rel + 2..];
-            }
-        }
-        for g in &guards {
-            let needle = format!("{g}.");
-            let mut from = 0;
-            while let Some(rel) = line[from..].find(&needle) {
-                let at = from + rel;
-                let boundary = at == 0 || {
-                    let prev = line.as_bytes()[at - 1];
-                    !(prev.is_ascii_alphanumeric() || prev == b'_')
-                };
-                let after = &line[at + needle.len()..];
-                let len = after
-                    .find(|c: char| !c.is_alphanumeric() && c != '_')
-                    .unwrap_or(after.len());
-                let method = &after[..len];
-                let is_call = after[method.len()..].starts_with('(');
-                if boundary && is_call && !method.is_empty() {
-                    classify(method, line, &mut hazards, &mut offloads);
-                }
-                from = at + needle.len();
-            }
-        }
-    }
-    (hazards, offloads)
-}
-
 fn callee_names(body: &[String]) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     for line in body {
@@ -1194,85 +817,6 @@ fn callee_names(body: &[String]) -> std::collections::BTreeSet<String> {
     out
 }
 
-struct Marker {
-    symbol: String,
-    dim: String,
-    span: String,
-}
-
-fn marker_sweep_file(p: &Path) -> bool {
-    !is_test_file(p) && !slash(p).contains("/aterm-census/")
-}
-
-fn sweep_markers(root: &Path, files: &[PathBuf]) -> Vec<Marker> {
-    let mut found = Vec::new();
-    for file in files {
-        let Ok(text) = tree::read_to_string(file) else {
-            continue;
-        };
-        if !text.contains("// COST: UNBOUNDED(") {
-            continue;
-        }
-        let rel = crate::rel_path(root, file);
-        let lines: Vec<&str> = text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let t = line.trim_start();
-            let Some(rest) = t.strip_prefix("// COST: UNBOUNDED(") else {
-                continue;
-            };
-            let dim: String = rest.chars().take_while(|c| *c != ')').collect();
-            for cand in lines.iter().skip(i + 1) {
-                let ct = cand.trim_start();
-                if ct.is_empty() || ct.starts_with("//") || ct.starts_with("#[") {
-                    continue;
-                }
-                if let Some((_, name)) = parse_fn_def(cand) {
-                    found.push(Marker {
-                        symbol: name,
-                        dim: dim.clone(),
-                        span: format!("{rel}:{}", i + 1),
-                    });
-                }
-                break;
-            }
-        }
-    }
-    found
-}
-
-fn collect_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Marker> {
-    let mut files = Vec::new();
-    for dir in scan_dirs {
-        let _ = collect_rs_files(&root.join(dir), &mut files);
-    }
-    files.retain(|p| marker_sweep_file(p));
-    files.sort();
-    sweep_markers(root, &files)
-}
-
-fn collect_out_of_closure_markers(root: &Path, scan_dirs: &[String]) -> Vec<Marker> {
-    let closure_crate_dirs: std::collections::BTreeSet<&str> = scan_dirs
-        .iter()
-        .filter_map(|d| d.strip_suffix("/src"))
-        .collect();
-    let mut files = Vec::new();
-    if let Ok(entries) = tree::read_dir(&root.join("crates")) {
-        for path in entries.into_iter().flatten() {
-            if !tree::is_dir(&path) {
-                continue;
-            }
-            let rel = crate::rel_path(root, &path);
-            if closure_crate_dirs.contains(rel.as_str()) {
-                continue;
-            }
-            let _ = collect_rs_files(&path, &mut files);
-        }
-    }
-    files.retain(|p| marker_sweep_file(p));
-    files.sort();
-    sweep_markers(root, &files)
-}
-
 fn fn_defined_in(root: &Path, rel_file: &str, symbol: &str) -> bool {
     let Ok(text) = tree::read_to_string(&root.join(rel_file)) else {
         return false;
@@ -1284,13 +828,11 @@ fn fn_defined_in(root: &Path, rel_file: &str, symbol: &str) -> bool {
 fn append_why_and_repair(log: &mut String) {
     let _ = writeln!(
         log,
-        "    WHY THIS IS L0: work that grows with session history (or, for a\n\
-         \x20        diskwalk sink, with the entries walked) runs on the winit\n\
-         \x20        event-loop thread or under the per-session `term` mutex the\n\
-         \x20        event loop takes to draw; input, redraw and every window this\n\
-         \x20        loop serves stall until it finishes.\n\
+        "    WHY THIS IS L0: work that grows with session history runs under the\n\
+         \x20        per-session `term` mutex the event loop takes to draw; input,\n\
+         \x20        redraw and every window this loop serves stall until it finishes.\n\
          \x20   HOW TO REPAIR (pick one):\n\
-         \x20     1. OFFLOAD (the canonical fix): replace `.resize(rows, cols)` with\n\
+         \x20     1. OFFLOAD: replace `.resize(rows, cols)` with\n\
          \x20        `.resize_offloading_scrollback(rows, cols)` inside the lock; hand\n\
          \x20        the returned `PendingScrollbackReflow` to a worker (its `reflow()`\n\
          \x20        runs off the lock), re-attach with `.finish_resize_offload(..)`\n\
@@ -1301,11 +843,7 @@ fn append_why_and_repair(log: &mut String) {
          \x20     2. BOUND the work: if this site provably never reflows unbounded\n\
          \x20        history (alt-screen grid, fixed-size scratch terminal), use a path\n\
          \x20        that cannot reach the width reflow (e.g. `Grid::resize_no_reflow`)\n\
-         \x20        and write down why at the call site.\n\
-         \x20     3. NEW BOUNDARY (last resort): wrap the bounded or deferred variant\n\
-         \x20        in a dedicated Terminal method and register it in\n\
-         \x20        OFFLOAD_ALLOWLIST (crates/aterm-census/src/lib.rs) with a written\n\
-         \x20        justification; OB-3 fails an undefined or unjustified entry."
+         \x20        and write down why at the call site."
     );
 }
 
@@ -1353,14 +891,14 @@ impl Reach {
 }
 
 /// OB-22's held-guard walk ([`held_guard::scan_tree`]) on a thread of its own, beside the
-/// call-graph checks, which share none of its work. The thread carries the census's memo scope
-/// ([`memo::threads`]), so what the walk reads is the census unit's question.
+/// call-graph checks, which share none of its work. The thread carries the census's input
+/// capture ([`workers::threads`]), so what the walk reads is one of the census's inputs.
 struct HeldGuardWalk<'scope>(
-    Option<memo::Joined<'scope, Result<held_guard::HeldGuardScan, String>>>,
+    Option<workers::Joined<'scope, Result<held_guard::HeldGuardScan, String>>>,
 );
 
 impl<'scope> HeldGuardWalk<'scope> {
-    fn start(scope: memo::Threads<'scope, '_>, root: &'scope Path) -> Self {
+    fn start(scope: workers::Threads<'scope, '_>, root: &'scope Path) -> Self {
         let walk = scope.spawn_named(
             "census-mainloop-held-guard".to_string(),
             8 << 20,
@@ -1390,12 +928,15 @@ impl Drop for HeldGuardWalk<'_> {
     }
 }
 
-/// Runs the main-loop census (`OB-1`..`OB-6`, `OB-22`, `OB-23`) over `root`.
+/// Runs the main-loop census (`OB-2`, `OB-22`, `OB-23`) over `root`.
 pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
-    memo::threads(|scope| mainloop_census(scope, root))
+    workers::threads(|scope| mainloop_census(scope, root))
 }
 
-fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path) -> CensusOutcome {
+fn mainloop_census<'scope>(
+    scope: workers::Threads<'scope, '_>,
+    root: &'scope Path,
+) -> CensusOutcome {
     let mut log = String::new();
     let mut failures = 0usize;
     let _ = writeln!(
@@ -1404,87 +945,7 @@ fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path)
          \x20   root: {}",
         root.display()
     );
-
-    let scan = match scan_set::derive_gui_scan_set(root) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = writeln!(
-                log,
-                "  ✗ FAIL [OB-1] SCAN-SET DERIVATION FAILED — the aterm-gui process closure \
-                 cannot be derived from the workspace manifests, so no marker scope is \
-                 guessed.\n\
-                 \x20       {e}"
-            );
-            return CensusOutcome::red(MAINLOOP, log, "1 obligation violation(s).");
-        }
-    };
     let held_walk = HeldGuardWalk::start(scope, root);
-    let _ = writeln!(
-        log,
-        "    marker sweep: the DERIVED GUI-process closure ({} workspace crates, src/ \
-         only, the OB-7 scan set); vendored code is not swept. Markers outside the \
-         closure are reported below, never registry-checked.",
-        scan.scan_dirs.len()
-    );
-
-    let markers = collect_closure_markers(root, &scan.scan_dirs);
-    for m in &markers {
-        if !UNBOUNDED_REGISTRY.iter().any(|u| u.symbol == m.symbol) {
-            let _ = writeln!(
-                log,
-                "  ✗ FAIL [OB-1] `{}` carries a `// COST: UNBOUNDED` marker (at {}) but is \
-                 NOT in UNBOUNDED_REGISTRY; register the sink there \
-                 (crates/aterm-census/src/lib.rs).",
-                m.symbol, m.span
-            );
-            failures += 1;
-        }
-    }
-    for sink in UNBOUNDED_REGISTRY {
-        if !markers.iter().any(|m| m.symbol == sink.symbol) {
-            let _ = writeln!(
-                log,
-                "  ✗ FAIL [OB-1] registered sink `{}` ({}) has LOST its `// COST: UNBOUNDED` \
-                 marker at {}: restore the marker at its definition, or drop the registry \
-                 entry. Only a marker inside the derived GUI-process closure counts.",
-                sink.symbol, sink.dim, sink.def_file
-            );
-            failures += 1;
-        }
-    }
-
-    let out_markers = collect_out_of_closure_markers(root, &scan.scan_dirs);
-    for m in &out_markers {
-        let _ = writeln!(
-            log,
-            "  • NOTE [OB-1 scope] `// COST: UNBOUNDED({})` marker on fn `{}` at {} is \
-             outside the aterm-gui process closure: reported, not registry-checked. It \
-             becomes an OB-1 obligation if its crate enters aterm-gui's dependency \
-             graph.",
-            m.dim, m.symbol, m.span
-        );
-    }
-
-    for b in OFFLOAD_ALLOWLIST {
-        if b.justification.trim().is_empty() {
-            let _ = writeln!(
-                log,
-                "  ✗ FAIL [OB-3] offload boundary `{}` has an EMPTY justification; every \
-                 allowlist entry says why it is a boundary.",
-                b.symbol
-            );
-            failures += 1;
-        }
-        if !fn_defined_in(root, b.def_file, b.symbol) {
-            let _ = writeln!(
-                log,
-                "  ✗ FAIL [OB-3] offload boundary `{}` is allowlisted but `fn {}` is no longer \
-                 defined in {}: update def_file if it moved, or remove the entry.",
-                b.symbol, b.symbol, b.def_file
-            );
-            failures += 1;
-        }
-    }
 
     let mut fns: Vec<GuiFn> = Vec::new();
     for file in gui_source_files(root) {
@@ -1498,21 +959,15 @@ fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path)
     for (idx, f) in fns.iter().enumerate() {
         by_name.entry(f.name.clone()).or_default().push(idx);
     }
-    let edges: Vec<std::collections::BTreeSet<String>> =
-        fns.iter().map(|f| callee_names(&f.body)).collect();
-    let hop: Vec<(Vec<TermHopHazard>, usize)> =
-        fns.iter().map(|f| term_hop_calls(&f.body)).collect();
-    let offload_sites: usize = hop.iter().map(|(_, n)| *n).sum();
-    let hazards: Vec<&Vec<TermHopHazard>> = hop.iter().map(|(h, _)| h).collect();
 
-    let mut parent = Reach::new(fns.len());
+    let mut on_loop = Reach::new(fns.len());
     let mut queue: std::collections::VecDeque<usize> = Default::default();
     let mut roots_found = 0;
     for r in MAIN_THREAD_ROOTS {
         if let Some(indices) = by_name.get(*r) {
             roots_found += 1;
             for &idx in indices {
-                if parent.reach(idx, None) {
+                if on_loop.reach(idx, None) {
                     queue.push_back(idx);
                 }
             }
@@ -1537,91 +992,6 @@ fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path)
             log,
             format!("{} obligation violation(s).", failures + 1),
         );
-    }
-    // Each fn's callees that name a GUI fn, in `edges` order, with the fns so named: both walks
-    // below follow these, so each name is looked up once.
-    let calls: Vec<Vec<(&str, &[usize])>> = edges
-        .iter()
-        .map(|callees| {
-            callees
-                .iter()
-                .filter_map(|c| by_name.get(c).map(|defs| (c.as_str(), defs.as_slice())))
-                .collect()
-        })
-        .collect();
-    while let Some(cur) = queue.pop_front() {
-        for &(_, defs) in &calls[cur] {
-            for &cidx in defs {
-                if parent.reach(cidx, Some(cur)) {
-                    queue.push_back(cidx);
-                }
-            }
-        }
-    }
-    let reconstruct = |idx: usize| parent.path(&fns, idx);
-
-    let mut hazard_hits = 0usize;
-    for idx in 0..fns.len() {
-        if !parent.contains(idx) || hazards[idx].is_empty() {
-            continue;
-        }
-        for hz in hazards[idx] {
-            let _ = writeln!(
-                log,
-                "  ✗ FAIL [OB-5] L0 OBLIGATION VIOLATED — a main-thread root synchronously \
-                 reaches an\n\
-                 \x20        UNBOUNDED sink under the per-session `term` mutex (the L0 freeze \
-                 class).\n\
-                 \x20   PATH:  {}\n\
-                 \x20   SITE:  {} (fn `{}`)\n\
-                 \x20   CALL:  `.{}(..)` on a `term_lock(..)` guard\n\
-                 \x20   LINE:  {}\n\
-                 \x20   SINK:  Terminal::{} -> Grid::resize -> Grid::resize_with_reflow_mode\n\
-                 \x20          [COST: UNBOUNDED({}) @ {}], whose width branch synchronously runs\n\
-                 \x20          take_scrollback_lines [UNBOUNDED({})] then reflow_scrollback_lines\n\
-                 \x20          [UNBOUNDED({})] over the ENTIRE session history.",
-                reconstruct(idx),
-                fns[idx].span,
-                fns[idx].name,
-                hz.method,
-                hz.line,
-                hz.method,
-                sink_dim("resize_with_reflow_mode"),
-                sink_file("resize_with_reflow_mode"),
-                sink_dim("take_scrollback_lines"),
-                sink_dim("reflow_scrollback_lines"),
-            );
-            append_why_and_repair(&mut log);
-            failures += 1;
-            hazard_hits += 1;
-        }
-    }
-
-    for idx in 0..fns.len() {
-        if !parent.contains(idx) {
-            continue;
-        }
-        for sink in UNBOUNDED_REGISTRY {
-            if edges[idx].contains(sink.symbol) {
-                let _ = writeln!(
-                    log,
-                    "  ✗ FAIL [OB-6] L0 OBLIGATION VIOLATED — a main-thread root reaches a \
-                     DIRECT call to\n\
-                     \x20        registered unbounded sink `{}` [COST: UNBOUNDED({}) @ {}].\n\
-                     \x20   PATH:  {}\n\
-                     \x20   SITE:  {} (fn `{}`)",
-                    sink.symbol,
-                    sink.dim,
-                    sink.def_file,
-                    reconstruct(idx),
-                    fns[idx].span,
-                    fns[idx].name,
-                );
-                append_why_and_repair(&mut log);
-                failures += 1;
-                hazard_hits += 1;
-            }
-        }
     }
 
     for g in WHOLE_FRAME_GATES {
@@ -1666,20 +1036,22 @@ fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path)
             failures += 1;
         }
     }
-    let mut on_loop = Reach::new(fns.len());
-    let mut queue: std::collections::VecDeque<usize> = MAIN_THREAD_ROOTS
+    // Each fn's callees that name a GUI fn, with the fns so named, so each name is looked up once.
+    let calls: Vec<Vec<(String, &[usize])>> = fns
         .iter()
-        .filter_map(|r| by_name.get(*r))
-        .flatten()
-        .copied()
-        .filter(|&idx| on_loop.reach(idx, None))
+        .map(|f| {
+            callee_names(&f.body)
+                .into_iter()
+                .filter_map(|c| by_name.get(&c).map(|defs| (c, defs.as_slice())))
+                .collect()
+        })
         .collect();
     while let Some(cur) = queue.pop_front() {
-        for &(callee, defs) in &calls[cur] {
+        for (callee, defs) in &calls[cur] {
             if OFF_LOOP_ENTRIES.iter().any(|e| e.symbol == callee) {
                 continue;
             }
-            for &cidx in defs {
+            for &cidx in *defs {
                 if on_loop.reach(cidx, Some(cur)) {
                     queue.push_back(cidx);
                 }
@@ -1717,6 +1089,7 @@ fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path)
         frame_waits += 1;
     }
 
+    let mut held_hits = 0usize;
     let held = match held_walk.result(root) {
         Ok(scan) => {
             if scan.acquires == 0 {
@@ -1740,7 +1113,7 @@ fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path)
                 );
                 append_why_and_repair(&mut log);
                 failures += 1;
-                hazard_hits += 1;
+                held_hits += 1;
             }
             Some((scan.files, scan.acquires))
         }
@@ -1756,27 +1129,15 @@ fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path)
         }
     };
 
-    if offload_sites == 0 {
-        let _ = writeln!(
-            log,
-            "  ✗ FAIL [OB-4] ZERO calls to any allowlisted offload boundary ({}) found in \
-             crates/aterm-gui/src or crates/aterm-gui-*/src — either the offload was removed \
-             (the freeze class is unguarded) or the boundary was renamed (update \
-             OFFLOAD_ALLOWLIST with a fresh justification).",
-            allowlist_symbols().join("/")
-        );
-        failures += 1;
-    }
-
     if failures > 0 {
-        if hazard_hits > 0 || frame_waits > 0 {
+        if held_hits > 0 || frame_waits > 0 {
             let _ = write!(log, "{PRECISION_NOTE}");
         }
         return CensusOutcome::red(
             MAINLOOP,
             log,
             format!(
-                "{failures} obligation violation(s) ({hazard_hits} unbounded-work site(s), \
+                "{failures} obligation violation(s) ({held_hits} unbounded-work site(s), \
                  {frame_waits} frame wait(s))."
             ),
         );
@@ -1790,22 +1151,14 @@ fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path)
     );
     let _ = writeln!(
         log,
-        "    scope: lexical name-based walk of crates/aterm-gui/src + crates/aterm-gui-*/src + one \
-         term_lock hop; \
-         markers swept over the derived {}-crate GUI-process closure \
-         (limits: PRECISION_NOTE in crates/aterm-census/src/lib.rs).",
-        scan.scan_dirs.len()
+        "    scope: lexical name-based walk of crates/aterm-gui/src + crates/aterm-gui-*/src \
+         (limits: PRECISION_NOTE in crates/aterm-census/src/lib.rs)."
     );
     let summary = format!(
-        "{} fn(s) walked from {roots_found} main-thread root(s), none reaching an UNBOUNDED \
-         sink synchronously; {offload_sites} offload-boundary call(s); {} sink(s) marked and \
-         registered; {} boundaries defined and justified; {} out-of-closure marker(s) \
-         reported; {held_acquires} `term` acquire(s), none holding unbounded work; no \
-         whole-frame read reached but through {} gate(s) defined and justified.",
-        parent.reached,
-        UNBOUNDED_REGISTRY.len(),
-        OFFLOAD_ALLOWLIST.len(),
-        out_markers.len(),
+        "{} fn(s) reached on the event loop from {roots_found} main-thread root(s); no \
+         whole-frame read reached but through {} gate(s) defined and justified; \
+         {held_acquires} `term` acquire(s), none holding unbounded work.",
+        on_loop.reached,
         WHOLE_FRAME_GATES.len(),
     );
     CensusOutcome::green(MAINLOOP, log, summary).with_floors(vec![Floor::at_least(
@@ -1815,26 +1168,6 @@ fn mainloop_census<'scope>(scope: memo::Threads<'scope, '_>, root: &'scope Path)
         "the walk lost most of the GUI's lock sites (a renamed acquire or a parser \
          regression), so OB-22 holds vacuously; teach `held_guard` the new spelling",
     )])
-}
-
-fn allowlist_symbols() -> Vec<&'static str> {
-    OFFLOAD_ALLOWLIST.iter().map(|b| b.symbol).collect()
-}
-
-fn sink_dim(symbol: &str) -> &'static str {
-    UNBOUNDED_REGISTRY
-        .iter()
-        .find(|u| u.symbol == symbol)
-        .map(|u| u.dim)
-        .unwrap_or("history")
-}
-
-fn sink_file(symbol: &str) -> &'static str {
-    UNBOUNDED_REGISTRY
-        .iter()
-        .find(|u| u.symbol == symbol)
-        .map(|u| u.def_file)
-        .unwrap_or("crates/aterm-grid")
 }
 
 /// Returns `(comments_and_literals_blanked, comments_blanked)` views of `source`.

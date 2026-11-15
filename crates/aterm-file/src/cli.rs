@@ -11,7 +11,7 @@
 //! (`set`, `add`, `rm`, `revert`, `resolve`) live in aterm-db, beside the materializer and the
 //! publisher, and hand every other word here.
 
-use crate::{Dropped, File, Intent, Name, Read, Root, Row, Status, exit, snapshot::PK};
+use crate::{Dropped, File, Intent, Name, OwnerAct, Read, Root, Row, Status, exit, snapshot::PK};
 use aterm_json::{Map, Value};
 use std::time::{Duration, Instant};
 
@@ -650,12 +650,12 @@ fn intent_line(intent: &Intent, state: &str, why: Option<&str>) -> String {
 }
 
 #[cfg(any(unix, windows))]
-fn drop_one(file: &File, id: &str) -> std::io::Result<Dropped> {
-    file.drop_intent(id)
+fn drop_one(file: &File, act: &OwnerAct, id: &str) -> std::io::Result<Dropped> {
+    file.drop_intent(act, id)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn drop_one(_: &File, _: &str) -> std::io::Result<Dropped> {
+fn drop_one(_: &File, _: &OwnerAct, _: &str) -> std::io::Result<Dropped> {
     Err(std::io::Error::other("no outbox on this platform"))
 }
 
@@ -665,8 +665,22 @@ fn outbox(root: &Root, known: &[Known], rest: &[&str], json: bool) -> Answer {
         let [_, id] = rest else {
             return Answer::usage("outbox drop <id>");
         };
+        // A person's word at a terminal, else a program's; nothing records which.
+        let by = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            "person"
+        } else {
+            "program"
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the explicit `aterm file outbox drop` verb"
+        )]
+        let act = OwnerAct::verb(by, None);
+        let Some(act) = act else {
+            return Answer::usage("outbox drop: no owner act");
+        };
         for name in known_names(root, known) {
-            match drop_one(&File::at(root, &name), id) {
+            match drop_one(&File::at(root, &name), &act, id) {
                 Ok(Dropped::Absent) => {}
                 Ok(Dropped::Published) => {
                     return Answer {

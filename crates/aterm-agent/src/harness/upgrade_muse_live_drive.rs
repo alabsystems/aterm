@@ -202,7 +202,7 @@ pub(super) fn log_look(lock: &Path, pid: u32, started_ms: u64) -> Result<(), Ope
 /// G-M1'S SCREEN HALF: whether Muse Code's own reader reads `rows` as the quiet restart's idle point — Idle AUTHORITATIVELY and no wall.
 #[must_use]
 pub(super) fn screen_idle(rows: &[String]) -> bool {
-    aterm_phase::muse::phase(rows) == (aterm_phase::Phase::Idle, true)
+    aterm_phase::muse::phase(rows) == (alab_policy::vocab::Phase::Idle, true)
         && aterm_phase::muse::wall(rows).is_none()
 }
 
@@ -395,6 +395,9 @@ pub(super) fn upgrade_visit(
     match plan(opts, &st, k) {
         Ok(_) => {}
         Err(super::NoPlan::Wait(why)) => return Some(said(r, format!("wait:{why}"))),
+        Err(super::NoPlan::Account(refusal)) => {
+            return Some(said(r, format!("wait:{}", refusal.kind.word())));
+        }
         Err(super::NoPlan::Refused { why, .. }) => return Some(said(r, format!("skip:{why}"))),
     }
     if super::super::super::relaunch::running_cmdline(&mut c, &tab)

@@ -1021,10 +1021,16 @@ fn born_before(pid: i32, when: std::time::SystemTime) -> bool {
     born_before_observation(rc, &record, size, when)
 }
 
+/// `pid`'s `kinfo_proc` (`KERN_PROC_PID`): the call's return, the record and its size. Read
+/// inside this process's exec gate ([`aterm_sysprobe::exec_gate`]); while an exec of this process
+/// has it closed nothing is read and the return is `-1`, which both observations take as unread.
 #[cfg(target_os = "macos")]
 fn process_table_record(pid: i32) -> (libc::c_int, [u8; 1024], usize) {
     const KERN_PROC: libc::c_int = 14;
     const KERN_PROC_PID: libc::c_int = 1;
+    let Some(_in_kernel) = aterm_sysprobe::exec_gate::reading() else {
+        return (-1, [0u8; 1024], 0);
+    };
     let mut mib = [libc::CTL_KERN, KERN_PROC, KERN_PROC_PID, pid];
     let mut record = [0u8; 1024];
     let mut size: libc::size_t = record.len();
@@ -2883,6 +2889,7 @@ fn run_spawn(job: SpawnJob) {
                     None,
                     None,
                     None,
+                    None,
                 )
             })
         }))
@@ -2916,7 +2923,7 @@ impl Wake {
             #[cfg(target_os = "linux")]
             Wake::WindowOp { session, .. } => Some(*session),
             #[cfg(target_os = "macos")]
-            Wake::MachineName(..) | Wake::MachineNameNotSet(..) => None,
+            Wake::MachineName(..) | Wake::MachineNameNotSet(..) | Wake::MachinePage(..) => None,
             Wake::ProtectedRead { session, .. } => Some(*session),
             Wake::GrokSigninLooked { session } => Some(*session),
             Wake::LeaseChanged { .. }
@@ -3005,6 +3012,7 @@ impl Wake {
             | Wake::TrailAdmissions { .. }
             | Wake::TrailStatus { .. }
             | Wake::TrailLight { .. }
+            | Wake::TrailWarm { .. }
             | Wake::KittyCollection { .. }
             | Wake::KittyWear { .. }
             | Wake::TypingMomentum { .. }
@@ -3023,6 +3031,7 @@ impl Wake {
             | Wake::SpareNote { .. }
             | Wake::CloseSession { .. }
             | Wake::KeepTabs { .. }
+            | Wake::CloseRequestTabs { .. }
             | Wake::RaiseSession { .. }
             | Wake::ConnectionsChanged
             | Wake::SettingsOverlay { .. }
@@ -3210,7 +3219,11 @@ impl Wake {
             | Wake::InitialSetupApplyResolved
             | Wake::InitialSetupPhraseJoined
             | Wake::KittyBaked
+            | Wake::AgentsDiscoveryReady
+            | Wake::RestoreDocumentReady
             | Wake::AccountMenuRead(_) => None,
+            #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+            Wake::RestoreMeasurementReady => None,
         }
     }
 }

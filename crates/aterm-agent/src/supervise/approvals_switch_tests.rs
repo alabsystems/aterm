@@ -6,11 +6,12 @@
 use super::*;
 use crate::supervise::facts::FactKind;
 use crate::supervise::policy::turn_end::{
-    AccountAt, FABLE_FALLBACK, RULE_ACCOUNT, RULE_API_RETRY, RULE_CONTINUE, RULE_LAND,
-    RULE_LAND_NUDGE, RULE_LIMIT_RESUME, RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, SwitchProc,
+    AccountAt, FABLE_FALLBACK, RULE_ACCOUNT, RULE_API_RETRY, RULE_LIMIT_RESUME,
+    RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, SwitchProc,
 };
+use alab_policy::words::{RULE_CONTINUE, RULE_LAND, RULE_LAND_NUDGE};
 
-const SID: &str = "@s-9";
+const SID: &str = "@t0000000009";
 
 /// The move's typed command, as the loop writes it for `Restart::Model { to: FABLE_FALLBACK }`.
 fn move_command() -> String {
@@ -355,15 +356,15 @@ fn a_switch_is_read_for_its_own_tab() {
         Outcome::Typed,
         &move_command(),
         &model_switch_reason(Some("fable"), None, None, 1),
-        "@s-10",
+        "@t0000000010",
     );
     let b = body(&[theirs]);
     assert_eq!(open_model_switch_in(&b, Some(SID)), None);
     assert!(
-        open_model_switch_in(&b, Some("s-10")).is_some(),
+        open_model_switch_in(&b, Some("t0000000010")).is_some(),
         "the `@` is no part of the sid"
     );
-    assert!(open_model_switch_in(&b, Some("@s-10")).is_some());
+    assert!(open_model_switch_in(&b, Some("@t0000000010")).is_some());
     assert_eq!(open_model_switch_in(&b, None), None);
     // Another tab's restore closes nothing of this tab's.
     let mine = switch_row(1_000, None, None, 1);
@@ -373,7 +374,7 @@ fn a_switch_is_read_for_its_own_tab() {
         Outcome::Typed,
         BACK_UNNAMED,
         "-",
-        "@s-10",
+        "@t0000000010",
     );
     assert!(open(&[mine, their_back]).is_some());
 }
@@ -650,7 +651,7 @@ fn a_cut_keeps_a_land_episode_and_a_switch_standing_together() {
 #[test]
 fn a_cut_keeps_every_standing_switch_row_when_its_workspace_is_full() {
     let mut rows = vec![String::new()];
-    for sid in ["@s-9", "@s-10"] {
+    for sid in ["@t0000000009", "@t0000000010"] {
         rows.push(row_of(
             1_000,
             RULE_MODEL_FALLBACK,
@@ -693,7 +694,7 @@ fn a_cut_keeps_every_standing_switch_row_when_its_workspace_is_full() {
     };
     let cut = cut_of(&body, &mut CutWork::for_cut());
     assert!(cut.len() < original.len(), "an ordinary cut still cuts");
-    for sid in ["@s-9", "@s-10"] {
+    for sid in ["@t0000000009", "@t0000000010"] {
         let standing = open_model_switch_in(&body, Some(sid));
         assert!(
             standing
@@ -730,7 +731,7 @@ fn a_cut_keeps_every_standing_switch_row_when_its_workspace_is_full() {
             held(&body),
             "STANDING_WORKSPACE_EXCESS_MUST_PRESERVE_EVERY_STANDING_ROW"
         );
-        for sid in ["@s-9", "@s-10"] {
+        for sid in ["@t0000000009", "@t0000000010"] {
             assert_eq!(
                 open_model_switch_in(&kept.join("\n"), Some(sid)),
                 open_model_switch_in(&body, Some(sid)),
@@ -744,7 +745,7 @@ fn a_cut_keeps_every_standing_switch_row_when_its_workspace_is_full() {
 fn a_restored_tab_s_cut_keeps_its_take_up_while_the_earlier_tab_s_switch_stands() {
     let dir = crate::supervise::ScratchDir::new("apr-switch", "restored-cut");
     let root: &Path = &dir;
-    let (was, tab) = ("s-a0", "s-b1");
+    let (was, tab) = ("t00000000a0", "t00000000b1");
     std::fs::create_dir_all(root.join("drive")).expect("the drive");
     let row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str, sid| {
         format!("{}\n", row_of(ts, rule_id, outcome, command, reason, sid))
@@ -826,7 +827,7 @@ fn a_restored_tab_s_cut_keeps_its_take_up_while_the_earlier_tab_s_switch_stands(
 fn a_second_restore_reads_no_switch_the_tab_between_ended_before_its_cut() {
     let dir = crate::supervise::ScratchDir::new("apr-switch", "restored-chain");
     let root: &Path = &dir;
-    let (a, b, c) = ("s-a0", "s-b1", "s-c2");
+    let (a, b, c) = ("t00000000a0", "t00000000b1", "t00000000c2");
     std::fs::create_dir_all(root.join("drive")).expect("the drive");
     let row = |ts: i64, rule_id: &str, outcome: Outcome, command: &str, reason: &str, sid| {
         format!("{}\n", row_of(ts, rule_id, outcome, command, reason, sid))
@@ -904,7 +905,7 @@ fn a_second_restore_reads_no_switch_the_tab_between_ended_before_its_cut() {
     let cont = dir.join("continuous.jsonl");
     let a_rows = std::fs::read_to_string(ledger_under(root, Some(a)))
         .unwrap()
-        .replace("\"sid\":\"s-a0\"", "\"sid\":\"s-b1\"");
+        .replace("\"sid\":\"t00000000a0\"", "\"sid\":\"t00000000b1\"");
     std::fs::write(&cont, format!("{a_rows}{back}{approvals}")).unwrap();
     bound(&cont);
     assert!(
@@ -1004,7 +1005,7 @@ fn a_fallback_ask_between_a_try_and_its_first_read_is_no_read() {
         wall_wait_reason(
             None,
             None,
-            aterm_phase::WallKind::Spend,
+            alab_policy::vocab::WallKind::Spend,
             "You've hit your monthly spend limit.",
         )
     };

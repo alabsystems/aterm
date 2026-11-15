@@ -221,17 +221,15 @@ pub fn cmd_browser(args: &[String]) -> Res {
             return Err(s.into());
         }
     }
-    let report = crate::linux_proof::render_as(
-        "LINUX LANE BROWSER",
-        &rows,
-        &[],
-        t0.elapsed().saturating_sub(waited).as_secs_f64(),
-    );
-    print!("\n{report}");
+    let total_secs = t0.elapsed().saturating_sub(waited).as_secs_f64();
     let path = results.join("report.txt");
-    if let Err(e) = crate::util::write_fresh(&path, &report) {
-        eprintln!("aterm-lab: linux: {}: {e}", path.display());
-    } else {
+    let published =
+        crate::linux_proof::publish_report("LINUX LANE BROWSER", &mut rows, &[], total_secs, &path);
+    print!(
+        "\n{}",
+        crate::linux_proof::render_as("LINUX LANE BROWSER", &rows, &[], total_secs)
+    );
+    if published {
         println!("report and frames: {}", results.display());
     }
     let code = crate::linux_proof::exit_code(&rows);

@@ -313,7 +313,7 @@ pub(crate) fn judge_read(
         return Judged::Settled;
     }
     let since = standing.since;
-    let python_allow: Vec<String> = aterm_agent::supervise::DEFAULT_PYTHON_ALLOW
+    let python_allow: Vec<String> = alab_policy::classify::DEFAULT_PYTHON_ALLOW
         .iter()
         .map(|g| (*g).to_string())
         .collect();

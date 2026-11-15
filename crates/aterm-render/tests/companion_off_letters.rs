@@ -2693,13 +2693,23 @@ type WallRun = (
 /// every room that leaves no seat, in every face): its fade lies on the letters or the caret below
 /// full alpha in 19 frames or more (measured 28 at every room that holds the line; to the wrap 12
 /// on 13 x 29 and 11 x 28 and 9 on 14 x 26, so 6 or more there; Linux arm64, 2026-11-09).
-#[test]
-fn a_last_row_that_holds_no_seat_hides_the_companion() {
+///
+/// Judged by the tests of [`a_last_row_that_holds_no_seat_hides_the_companion`], one per
+/// [`WallPart`], each of what follows the line in [`WALL_THENS`] of that part.
+fn judge_the_wall(part: WallPart) {
     const ROOMS: [i16; 6] = [4, 3, 2, 1, 0, -1];
     const PAGES: [Look; 4] = [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT];
     let cat = "rainbow + cat";
     let faces = wall_faces();
     let seated_at = |cell| i32::from(last_row_cols(cell)) - i32::from(last_row_line());
+    let thens: Vec<LastRowThen> = WALL_THENS
+        .into_iter()
+        .filter(|&then| WallPart::of(then) == part)
+        .collect();
+    assert!(
+        !thens.is_empty(),
+        "fixture: {part:?} judges no row of WALL_THENS"
+    );
     let mut runs: Vec<WallRun> = Vec::new();
     for (f, face) in faces.iter().enumerate() {
         let window = face.face.is_none();
@@ -2714,7 +2724,7 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
         };
         let seats_judged = !window || lays_the_bundled_cell();
         for room in ROOMS {
-            for then in WALL_THENS {
+            for &then in &thens {
                 let unseated = i32::from(room) < seated;
                 let judged = match then {
                     LastRowThen::Rests => true,
@@ -2791,18 +2801,20 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
             scene,
         )
     });
-    let full: Vec<usize> = runs
-        .iter()
-        .zip(&seen)
-        .filter(|(run, _)| run.5 == Some(OldPath::CaretTypesOn))
-        .map(|(_, w)| w.full)
-        .collect();
-    assert!(
-        full.iter().sum::<usize>() >= 15,
-        "negative control ({:?}): typed on past the console after the pause, it lay on the \
-         letters at full alpha in only {full:?} frames",
-        OldPath::CaretTypesOn
-    );
+    if part == WallPart::Paused {
+        let full: Vec<usize> = runs
+            .iter()
+            .zip(&seen)
+            .filter(|(run, _)| run.5 == Some(OldPath::CaretTypesOn))
+            .map(|(_, w)| w.full)
+            .collect();
+        assert!(
+            full.iter().sum::<usize>() >= 15,
+            "negative control ({:?}): typed on past the console after the pause, it lay on the \
+             letters at full alpha in only {full:?} frames",
+            OldPath::CaretTypesOn
+        );
+    }
     let (_, fit) = head_law(true, true);
     for (&(f, style, look, (room, then), drive, control), w) in runs.iter().zip(&seen) {
         let WallFace { family, cell, .. } = faces[f];
@@ -2934,6 +2946,58 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
             "{why}: past the wrap or the Enter, frames on the letters or the caret: {:?}",
             w.after
         );
+    }
+}
+
+/// Declares [`WallPart`] and, in [`a_last_row_that_holds_no_seat_hides_the_companion`], the test
+/// that judges each part ([`judge_the_wall`]), from one list: a part has its test or does not
+/// exist.
+macro_rules! wall_parts {
+    ($($part:ident => $test:ident,)+) => {
+        /// What follows the line in one test of the wall's scene: the kind of [`LastRowThen`].
+        /// Each kind is its own test, so where the verifier runs the module's shard on more than
+        /// one libtest thread, the parts run side by side; on one thread they run in turn, as
+        /// long as the one test they replace (182 s against 194 s at four cores, macOS,
+        /// 2026-11-13).
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum WallPart {
+            $($part,)+
+        }
+
+        /// THE WALL THAT HOLDS NO SEAT HIDES THE COMPANION ([`judge_the_wall`]): one test per
+        /// [`WallPart`].
+        mod a_last_row_that_holds_no_seat_hides_the_companion {
+            $(
+                #[test]
+                fn $test() {
+                    super::judge_the_wall(super::WallPart::$part);
+                }
+            )+
+        }
+    };
+}
+
+wall_parts! {
+    Rests => at_rest,
+    Erased => through_an_erase,
+    Back => back_along_the_line,
+    Paused => past_a_pause,
+    Opened => as_a_seat_opens,
+    Gapped => past_a_gap,
+}
+
+impl WallPart {
+    /// The part that judges `then`. The match takes every kind of [`LastRowThen`], so a new kind
+    /// joins a part, and a new part comes only with its test ([`wall_parts`]).
+    fn of(then: LastRowThen) -> Self {
+        match then {
+            LastRowThen::Rests => Self::Rests,
+            LastRowThen::Erased { .. } => Self::Erased,
+            LastRowThen::Back => Self::Back,
+            LastRowThen::Paused => Self::Paused,
+            LastRowThen::Opened => Self::Opened,
+            LastRowThen::Gapped => Self::Gapped,
+        }
     }
 }
 
@@ -3140,6 +3204,11 @@ pub fn walled(
     r.run(ev, *tail)
 }
 
+/// One [`walled`] replay a wall test judges: how the keys come, the grid's columns, the companion,
+/// the page and the laws reverted. A test lists its runs and judges each on its own worker
+/// (`aterm_spec::check::each`), so its replays take the cores the test was granted, not one.
+type WalledRun = (Drive, u16, &'static str, Look, &'static [OldPath]);
+
 /// Whether a frame's companion lies on the caret's cell: its art drawn under the letters there
 /// ([`Coat::caret_px`]), or its box over the cell as the brain judges one ([`Coat::box_on_caret`]),
 /// which reads a body drawn over blank ground too, where the knock layer has no runs.
@@ -3209,48 +3278,56 @@ fn at_the_wall_the_caret_s_cell_is_no_seat() {
     const RIDDEN: u64 = 40;
     const SETS_OFF: u64 = 400;
     const HIDE: OldPath = OldPath::NoSeatHidesTheBody;
+    let mut runs: Vec<WalledRun> = Vec::new();
     for drive in [Drive::Console, Drive::Ctl] {
         for cols in [72, 71, 70] {
-            let (scene, (last, enter)) = last_row_at(cols);
-            let walls = (last + LEAVES, enter);
-            let ridden = (enter + RIDDEN, enter + SETS_OFF);
             for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
                 for style in COMPANIONS {
-                    let judged = walled((style, look), cols, drive, &scene, &[]);
-                    for (span, when) in [(walls, ""), (ridden, " after the Enter")] {
-                        let met = on_the_caret_or_letters(&judged, span);
-                        assert!(
-                            met.is_empty(),
-                            "{style} on {} at {cols} columns ({drive:?}): {} frames{when} on the \
-                             caret or the letters: {:?}",
-                            look.name,
-                            met.len(),
-                            &met[..met.len().min(4)]
-                        );
-                    }
-                    let judged = walled((style, look), cols, drive, &scene, &[HIDE]);
-                    for (span, when) in [(walls, ""), (ridden, " after the Enter")] {
-                        let met = off_the_caret_and_letters(&judged, span);
-                        assert!(
-                            met.is_empty(),
-                            "{style} on {} at {cols} columns ({drive:?}), the hide reverted: {} \
-                             frames{when} on the caret, the letters or off the glass: {:?}",
-                            look.name,
-                            met.len(),
-                            &met[..met.len().min(4)]
-                        );
-                    }
+                    runs.push((drive, cols, style, look, &[]));
+                    runs.push((drive, cols, style, look, &[HIDE]));
                 }
             }
             if cols < 72 {
-                let old = walled(
-                    ("rainbow + cat", DARK),
-                    cols,
-                    drive,
-                    &scene,
-                    &[HIDE, OldPath::CaretCellIsNoSeat],
-                );
-                let on_caret = old
+                let cat = "rainbow + cat";
+                runs.push((drive, cols, cat, DARK, &[HIDE, OldPath::CaretCellIsNoSeat]));
+                runs.push((drive, cols, cat, DARK, &[HIDE, OldPath::SeatRidesThePage]));
+            }
+        }
+    }
+    aterm_spec::check::each(&runs, |&(drive, cols, style, look, old)| {
+        let (scene, (last, enter)) = last_row_at(cols);
+        let walls = (last + LEAVES, enter);
+        let ridden = (enter + RIDDEN, enter + SETS_OFF);
+        let judged = walled((style, look), cols, drive, &scene, old);
+        match old {
+            [] => {
+                for (span, when) in [(walls, ""), (ridden, " after the Enter")] {
+                    let met = on_the_caret_or_letters(&judged, span);
+                    assert!(
+                        met.is_empty(),
+                        "{style} on {} at {cols} columns ({drive:?}): {} frames{when} on the \
+                         caret or the letters: {:?}",
+                        look.name,
+                        met.len(),
+                        &met[..met.len().min(4)]
+                    );
+                }
+            }
+            [HIDE] => {
+                for (span, when) in [(walls, ""), (ridden, " after the Enter")] {
+                    let met = off_the_caret_and_letters(&judged, span);
+                    assert!(
+                        met.is_empty(),
+                        "{style} on {} at {cols} columns ({drive:?}), the hide reverted: {} \
+                         frames{when} on the caret, the letters or off the glass: {:?}",
+                        look.name,
+                        met.len(),
+                        &met[..met.len().min(4)]
+                    );
+                }
+            }
+            [HIDE, OldPath::CaretCellIsNoSeat] => {
+                let on_caret = judged
                     .iter()
                     .filter(|j| (last + LEAVES..enter).contains(&j.ms) && on_the_caret(&j.coat))
                     .count();
@@ -3259,17 +3336,9 @@ fn at_the_wall_the_caret_s_cell_is_no_seat() {
                     "negative control ({drive:?}): at {cols} columns the wall kept the body off \
                      the caret's cell ({on_caret} frames on it)"
                 );
-                let stayed = off_the_caret_and_letters(
-                    &walled(
-                        ("rainbow + cat", DARK),
-                        cols,
-                        drive,
-                        &scene,
-                        &[HIDE, OldPath::SeatRidesThePage],
-                    ),
-                    ridden,
-                )
-                .len();
+            }
+            _ => {
+                let stayed = off_the_caret_and_letters(&judged, ridden).len();
                 assert!(
                     stayed > 10,
                     "negative control ({drive:?}): at {cols} columns the body kept off the \
@@ -3277,7 +3346,7 @@ fn at_the_wall_the_caret_s_cell_is_no_seat() {
                 );
             }
         }
-    }
+    });
 }
 
 /// A WATCHED PAGE'S CARET TAKES ITS CELL BACK (W4, the trail gallery's `flood` at 72 and 70
@@ -3303,10 +3372,9 @@ fn at_the_wall_the_caret_s_cell_is_no_seat() {
 #[test]
 fn a_watched_page_s_caret_takes_its_cell_back() {
     const STEPS: u64 = 300;
+    let mut runs: Vec<WalledRun> = Vec::new();
     for drive in [Drive::Console, Drive::Ctl] {
         for cols in [72, 70] {
-            let (scene, last) = flood_at(cols);
-            let end = last + scene.1;
             // Typed through the console, each key reads the whole page: on dark alone, where
             // the body is placed as on every page.
             let looks: &[Look] = if drive == Drive::Console {
@@ -3316,60 +3384,62 @@ fn a_watched_page_s_caret_takes_its_cell_back() {
             };
             for &look in looks {
                 for style in COMPANIONS {
-                    let judged = walled((style, look), cols, drive, &scene, &[]);
-                    let met: Vec<_> = judged
-                        .iter()
-                        .filter(|j| (last + STEPS..end).contains(&j.ms))
-                        .filter(|j| {
-                            on_the_caret(&j.coat)
-                                || if drive == Drive::Console {
-                                    j.ms >= last + REST && !j.coat.box_cells.is_empty()
-                                } else {
-                                    j.coat.pet.is_none()
-                                }
-                        })
-                        .map(|j| (j.ms, j.coat.pet, j.coat.caret_px, j.coat.box_cells.len()))
-                        .collect();
-                    assert!(
-                        met.is_empty(),
-                        "{style} on {} at {cols} columns ({drive:?}): {} frames on the caret's \
-                         cell, {}: {:?}",
-                        look.name,
-                        met.len(),
-                        if drive == Drive::Console {
-                            "or at rest on the letters"
-                        } else {
-                            "or off the glass"
-                        },
-                        &met[..met.len().min(4)]
-                    );
+                    runs.push((drive, cols, style, look, &[]));
                 }
             }
-            let old = walled(
-                ("rainbow + cat", DARK),
-                cols,
-                drive,
-                &scene,
-                &[OldPath::CaretCellIsNoSeat],
-            );
-            let on_caret = old
-                .iter()
-                .filter(|j| (last + STEPS..end).contains(&j.ms) && on_the_caret(&j.coat))
-                .count();
-            assert!(
-                on_caret > 10,
-                "negative control ({drive:?}): at {cols} columns the body was let off the \
-                 caret's cell ({on_caret} frames on it)"
-            );
+            let cat = "rainbow + cat";
+            runs.push((drive, cols, cat, DARK, &[OldPath::CaretCellIsNoSeat]));
             if drive == Drive::Console {
-                let old = walled(
-                    ("rainbow + cat", DARK),
-                    cols,
-                    drive,
-                    &scene,
-                    &[OldPath::NoSeatAnywhereHides],
+                runs.push((drive, cols, cat, DARK, &[OldPath::NoSeatAnywhereHides]));
+            }
+        }
+    }
+    aterm_spec::check::each(&runs, |&(drive, cols, style, look, old)| {
+        let (scene, last) = flood_at(cols);
+        let end = last + scene.1;
+        let judged = walled((style, look), cols, drive, &scene, old);
+        match old {
+            [] => {
+                let met: Vec<_> = judged
+                    .iter()
+                    .filter(|j| (last + STEPS..end).contains(&j.ms))
+                    .filter(|j| {
+                        on_the_caret(&j.coat)
+                            || if drive == Drive::Console {
+                                j.ms >= last + REST && !j.coat.box_cells.is_empty()
+                            } else {
+                                j.coat.pet.is_none()
+                            }
+                    })
+                    .map(|j| (j.ms, j.coat.pet, j.coat.caret_px, j.coat.box_cells.len()))
+                    .collect();
+                assert!(
+                    met.is_empty(),
+                    "{style} on {} at {cols} columns ({drive:?}): {} frames on the caret's \
+                     cell, {}: {:?}",
+                    look.name,
+                    met.len(),
+                    if drive == Drive::Console {
+                        "or at rest on the letters"
+                    } else {
+                        "or off the glass"
+                    },
+                    &met[..met.len().min(4)]
                 );
-                let on_letters = old
+            }
+            [OldPath::CaretCellIsNoSeat] => {
+                let on_caret = judged
+                    .iter()
+                    .filter(|j| (last + STEPS..end).contains(&j.ms) && on_the_caret(&j.coat))
+                    .count();
+                assert!(
+                    on_caret > 10,
+                    "negative control ({drive:?}): at {cols} columns the body was let off the \
+                     caret's cell ({on_caret} frames on it)"
+                );
+            }
+            _ => {
+                let on_letters = judged
                     .iter()
                     .filter(|j| {
                         (last + REST..end).contains(&j.ms)
@@ -3384,7 +3454,7 @@ fn a_watched_page_s_caret_takes_its_cell_back() {
                 );
             }
         }
-    }
+    });
 }
 
 /// THE WALL SIDE TURNS IN THE ROW'S LAST CELL (W4, the trail gallery's `flood` at 70 columns as
@@ -3415,8 +3485,14 @@ fn the_wall_side_turns_in_the_row_s_last_cell() {
             .map(|j| (j.ms, j.coat.pet, j.coat.box_cells.len()))
             .collect::<Vec<_>>()
     };
-    for style in COMPANIONS {
-        let met = short(&walled((style, DARK), COLS, Drive::Console, &scene, &[]));
+    let mut runs: Vec<(&str, &[OldPath])> =
+        COMPANIONS.iter().map(|&style| (style, &[][..])).collect();
+    runs.push(("rainbow + cat", &[OldPath::TurnAtTheLastCell]));
+    let mut seen = aterm_spec::check::each(&runs, |&(style, old)| {
+        short(&walled((style, DARK), COLS, Drive::Console, &scene, old))
+    });
+    let old = seen.pop().expect("the control's run");
+    for (&(style, _), met) in runs.iter().zip(&seen) {
         assert!(
             met.is_empty(),
             "{style} at {COLS} columns: {} frames off the glass or a cell short of the wall: {:?}",
@@ -3424,13 +3500,6 @@ fn the_wall_side_turns_in_the_row_s_last_cell() {
             &met[..met.len().min(4)]
         );
     }
-    let old = short(&walled(
-        ("rainbow + cat", DARK),
-        COLS,
-        Drive::Console,
-        &scene,
-        &[OldPath::TurnAtTheLastCell],
-    ));
     assert!(
         old.len() > 10,
         "negative control: at {COLS} columns the body kept the wall with the wall side turned in \
@@ -3497,50 +3566,56 @@ fn a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page() {
     const LEAVES: u64 = 900;
     const RIDDEN: u64 = 40;
     const SETS_OFF: u64 = 400;
+    let mut runs: Vec<WalledRun> = Vec::new();
     for drive in [Drive::Console, Drive::Ctl] {
         for cols in [72, 71, 70] {
-            let (scene, (last, enter)) = last_row_spaced(cols);
-            let walls = (last + LEAVES, enter);
-            let ridden = (enter + RIDDEN, enter + SETS_OFF);
-            let (_, ch) = gallery_cell();
-            let caret_top = i32::from(crate::trail_letters_read::ROWS - 1) * ch as i32;
             for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
                 for style in COMPANIONS {
-                    let judged = walled((style, look), cols, drive, &scene, &[]);
-                    for (span, when) in [(walls, ""), (ridden, " after the Enter")] {
-                        let met = off_the_caret_and_letters(&judged, span);
-                        assert!(
-                            met.is_empty(),
-                            "{style} on {} at {cols} columns ({drive:?}): {} frames{when} on the \
-                             caret, the letters or off the glass: {:?}",
-                            look.name,
-                            met.len(),
-                            &met[..met.len().min(4)]
-                        );
-                    }
-                    if cols < 72 {
-                        let seat = judged
-                            .iter()
-                            .rfind(|j| j.ms < enter)
-                            .and_then(|j| j.coat.pet);
-                        assert!(
-                            seat.is_some_and(|(.., y1)| y1 <= caret_top),
-                            "{style} on {} at {cols} columns ({drive:?}): at the Enter the body \
-                             is not seated over the caret's row (top {caret_top}): {seat:?}",
-                            look.name
-                        );
-                    }
+                    runs.push((drive, cols, style, look, &[]));
                 }
             }
             if cols < 72 {
-                let old = walled(
-                    ("rainbow + cat", DARK),
-                    cols,
-                    drive,
-                    &scene,
-                    &[OldPath::CaretCellIsNoSeat],
-                );
-                let on_caret = old
+                let cat = "rainbow + cat";
+                runs.push((drive, cols, cat, DARK, &[OldPath::CaretCellIsNoSeat]));
+                runs.push((drive, cols, cat, DARK, &[OldPath::SeatRidesThePage]));
+            }
+        }
+    }
+    aterm_spec::check::each(&runs, |&(drive, cols, style, look, old)| {
+        let (scene, (last, enter)) = last_row_spaced(cols);
+        let walls = (last + LEAVES, enter);
+        let ridden = (enter + RIDDEN, enter + SETS_OFF);
+        let judged = walled((style, look), cols, drive, &scene, old);
+        match old {
+            [] => {
+                for (span, when) in [(walls, ""), (ridden, " after the Enter")] {
+                    let met = off_the_caret_and_letters(&judged, span);
+                    assert!(
+                        met.is_empty(),
+                        "{style} on {} at {cols} columns ({drive:?}): {} frames{when} on the \
+                         caret, the letters or off the glass: {:?}",
+                        look.name,
+                        met.len(),
+                        &met[..met.len().min(4)]
+                    );
+                }
+                if cols < 72 {
+                    let (_, ch) = gallery_cell();
+                    let caret_top = i32::from(crate::trail_letters_read::ROWS - 1) * ch as i32;
+                    let seat = judged
+                        .iter()
+                        .rfind(|j| j.ms < enter)
+                        .and_then(|j| j.coat.pet);
+                    assert!(
+                        seat.is_some_and(|(.., y1)| y1 <= caret_top),
+                        "{style} on {} at {cols} columns ({drive:?}): at the Enter the body \
+                         is not seated over the caret's row (top {caret_top}): {seat:?}",
+                        look.name
+                    );
+                }
+            }
+            [OldPath::CaretCellIsNoSeat] => {
+                let on_caret = judged
                     .iter()
                     .filter(|j| (last + LEAVES..enter).contains(&j.ms) && on_the_caret(&j.coat))
                     .count();
@@ -3549,17 +3624,9 @@ fn a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page() {
                     "negative control ({drive:?}): at {cols} columns the wall kept the body off \
                      the caret's cell ({on_caret} frames on it)"
                 );
-                let stayed = on_the_caret_or_letters(
-                    &walled(
-                        ("rainbow + cat", DARK),
-                        cols,
-                        drive,
-                        &scene,
-                        &[OldPath::SeatRidesThePage],
-                    ),
-                    ridden,
-                )
-                .len();
+            }
+            _ => {
+                let stayed = on_the_caret_or_letters(&judged, ridden).len();
                 assert!(
                     stayed > 10,
                     "negative control ({drive:?}): at {cols} columns the body kept off the \
@@ -3567,5 +3634,5 @@ fn a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page() {
                 );
             }
         }
-    }
+    });
 }

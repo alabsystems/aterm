@@ -369,7 +369,7 @@ fn cpu_accounting_scope_identity_and_unknowns_survive_both_reports() {
     let json = render_json(&query(View::Procs, true), &ctx);
     let text = all_text(&render_text(&query(View::Procs, false), &ctx));
     assert!(text.contains("cpu_mc_scope=process_self"));
-    let accounting = cpu_accounting_json(&c, "macOS");
+    let accounting = cpu_accounting_json(&c, "macOS", None);
     let procs = json.get("procs").unwrap();
     assert_eq!(procs.get("cpu_mc_scope"), Some(&Jv::s("process_self")));
     let Some(Jv::Arr(rows)) = procs.get("rows") else {
@@ -399,16 +399,29 @@ fn cpu_accounting_scope_identity_and_unknowns_survive_both_reports() {
         .find(|p| p.get("pid") == Some(&Jv::u(201)))
         .unwrap();
     assert_eq!(worker.get("cpu_accounting"), Some(&accounting));
-    let unknown = cpu_accounting_json(&CpuAccounting::default(), "macOS");
+    let unknown = cpu_accounting_json(&CpuAccounting::default(), "macOS", None);
     assert_eq!(unknown.get("self_ns"), Some(&Jv::why("refused")));
     assert_eq!(
         unknown.get("reaped_children_ns"),
         Some(&Jv::why("not_sampled"))
     );
-    let unsupported = cpu_accounting_json(&CpuAccounting::default(), "Linux");
+    let unsupported = cpu_accounting_json(&CpuAccounting::default(), "Linux", None);
     assert_eq!(
         unsupported.get("reaped_children_ns"),
         Some(&Jv::why("unsupported"))
+    );
+    let held = cpu_accounting_json(
+        &CpuAccounting::default(),
+        "macOS",
+        Some(crate::lanes::KPROC_TABLE),
+    );
+    assert_eq!(
+        held.get("auto_reaps_children"),
+        Some(&Jv::stalled(crate::lanes::KPROC_TABLE))
+    );
+    assert_eq!(
+        unknown.get("auto_reaps_children"),
+        Some(&Jv::why("not_sampled"))
     );
     assert!(contract_violations(&json).is_empty());
 }
@@ -792,8 +805,8 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
     };
     assert_eq!(sum, busy, "{}", split.to_text());
     assert_eq!(busy, 2400);
-    assert_eq!(split.get("tab"), Some(&Jv::Int(1200)));
-    assert_eq!(split.get("others"), Some(&Jv::Int(300)));
+    assert_eq!(split.get("tab").and_then(part_value), Some(1200));
+    assert_eq!(split.get("others").and_then(part_value), Some(300));
 
     for self_uid in [None, Some(501)] {
         let input = |at, busy: &[u64], k| {
@@ -817,7 +830,10 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
             Some(&Jv::why("warming"))
         );
         let unknown = model.absorb(&input(11, &[20, 30, 100, 90], 1));
-        assert!(unknown.split.is_none());
+        assert!(
+            unknown.split.is_some(),
+            "unknown ownership must not erase known CPU"
+        );
         let row = |pid| unknown.procs.iter().find(|p| p.pid == pid).unwrap();
         assert_eq!(row(900).scope, RowScope::Unknown);
         assert_eq!(row(900).cores, Some(0.3));
@@ -832,16 +848,19 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
         let c = ctx(&w, Some(&unknown), true, true);
         for view in [View::Overview, View::Global] {
             let j = render_json(&query(view, true), &c);
-            assert_eq!(j.get("split_mc"), Some(&Jv::why("not_sampled")));
+            let split = j.get("split_mc").unwrap();
+            assert_eq!(split.get("tab").and_then(part_value), Some(1200));
+            assert!(split.get("unaccounted").and_then(part_value).unwrap() >= 300);
             assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
             let text = render_text(&query(view, false), &c);
-            assert!(text.lines.iter().any(|l| {
-                matches!(l.key.as_str(), "rest" | "split")
-                    && l.text.contains("unavailable(not_sampled)")
-            }));
+            assert!(
+                text.lines.iter().any(|l| {
+                    matches!(l.key.as_str(), "rest" | "split") && l.text.contains('≥')
+                })
+            );
         }
         let global = render_json(&query(View::Global, true), &c);
-        assert_eq!(global.get("aterm_mc"), Some(&Jv::u(1450)));
+        assert_eq!(global.get("aterm_mc").and_then(part_value), Some(1450));
         let procs = render_json(
             &SysQuery {
                 scope: Some(ScopeArg::Global),
@@ -859,11 +878,17 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
             .unwrap();
         assert_eq!(outside.get("scope"), Some(&Jv::s("unknown")));
         assert_eq!(outside.get("cpu_mc"), Some(&Jv::u(300)));
-        let mem = render_text(&query(View::Mem, false), &c);
-        assert!(
-            mem.lines.iter().any(|l| {
-                l.key == "owners" && l.text.contains("others unavailable(not_sampled)")
-            })
+        let mem = render_json(&query(View::Mem, true), &c);
+        let expected_unknown = if self_uid.is_none() {
+            1020 << 20
+        } else {
+            900 << 20
+        };
+        assert_eq!(
+            mem.get("owners")
+                .and_then(|o| o.get("unknown"))
+                .and_then(|o| o.get("footprint_bytes")),
+            Some(&Jv::u(expected_unknown))
         );
         let scoped = render_json(
             &query(View::Global, true),
@@ -888,14 +913,343 @@ fn the_split_adds_up_to_the_machines_busy_figure() {
             .any(|p| p.pid == 900 && p.scope == RowScope::Others)
     );
     let mem = render_text(&query(View::Mem, false), &ctx(&w, Some(&known), true, true));
-    let owners = mem.lines.iter().find(|l| l.key == "owners").unwrap();
+    let owners = mem.lines.iter().find(|l| l.key == "charges").unwrap();
     assert!(
         owners
             .text
-            .contains(&format!("others ≥{}", words::mem(900 << 20))),
+            .contains(&format!("others {}", words::mem(900 << 20))),
         "{}",
         owners.text
     );
+}
+
+#[test]
+fn memory_coverage_is_independent_of_cpu_and_survives_the_scope_mean() {
+    let w = world();
+    let mut model = Vitals::new();
+    let input = |at, unread| {
+        let mut s = sample(at, &[0, 0, at * 10, at * 10], at);
+        let members = s.procs.as_mut().unwrap();
+        members.iter_mut().find(|p| p.pid == 201).unwrap().footprint =
+            if unread { None } else { Some(300 << 20) };
+        members.iter_mut().find(|p| p.pid == 202).unwrap().cpu_ns = None;
+        s.at_unix_ms = (at * 1000) as i64;
+        s
+    };
+    model.absorb(&input(10, true));
+    let s = model.absorb(&input(11, true));
+    let tab = s.tab(7).unwrap();
+    assert_eq!(tab.scope.refused, 1);
+    assert_eq!(tab.scope.footprint_unread, 1);
+    assert_eq!(tab.scope.footprint, Some(95 << 20));
+    assert_eq!(
+        s.resource(crate::model::Resource::Memory, &[7]).tab.unread,
+        1
+    );
+    let json = render_json(&query(View::Mem, true), &ctx(&w, Some(&s), true, true));
+    assert_eq!(
+        json.get("tab").and_then(|o| o.get("footprint_bytes")),
+        Some(&Jv::at_least_refused(95 << 20, 1))
+    );
+    let complete = model.absorb(&input(12, false));
+    assert_eq!(complete.tab(7).unwrap().scope.footprint_unread, 0);
+    assert_eq!(
+        complete
+            .resource(crate::model::Resource::Memory, &[7])
+            .tab
+            .unread,
+        1,
+        "an unread contributor remains in the trailing mean"
+    );
+    let complete = model.absorb(&input(30, false));
+    assert_eq!(
+        complete
+            .resource(crate::model::Resource::Memory, &[7])
+            .tab
+            .unread,
+        0
+    );
+}
+
+#[test]
+fn memory_ownership_totals_include_processes_past_the_display_row_cap() {
+    let mut model = Vitals::new();
+    let input = |at| {
+        let mut s = sample(at, &[0, 0, 0, 0], at);
+        for pid in 1000..1300 {
+            s.procs
+                .as_mut()
+                .unwrap()
+                .push(proc(pid, 1, Some(0), 1, "idle", 501));
+        }
+        s
+    };
+    model.absorb(&input(10));
+    let s = model.absorb(&input(11));
+    assert!(s.procs.len() < 300);
+    let all = s.memory_owners.unwrap();
+    assert_eq!(all.others.bytes, 1200 << 20);
+    assert_eq!(all.others.members, 301);
+    assert_eq!(all.others.unread, 0);
+    let w = world();
+    let json = render_json(&query(View::Mem, true), &ctx(&w, Some(&s), true, true));
+    let owners = json.get("owners").unwrap();
+    assert_eq!(owners.get("via"), Some(&Jv::s("processes")));
+    assert_eq!(
+        owners.get("others").and_then(|o| o.get("footprint_bytes")),
+        Some(&Jv::u(1200 << 20))
+    );
+}
+
+#[test]
+fn memory_ownership_uses_complete_coalition_charges_with_their_own_age() {
+    use crate::explain::{CoalLane, CoalRow, CoalSplit, Part, WhyFacts};
+    let mut s = snapshot();
+    s.why = Some(std::sync::Arc::new(WhyFacts {
+        at_ns: s.at_ns - 2_000_000_000,
+        lane: CoalLane::On,
+        split: CoalSplit {
+            listed: 2,
+            rows: vec![
+                CoalRow {
+                    part: Part::Aterm,
+                    footprint_aterm: true,
+                    footprint: Some(123),
+                    ..CoalRow::default()
+                },
+                CoalRow {
+                    part: Part::Services,
+                    footprint_outside: Some(Part::Services),
+                    footprint: Some(456),
+                    live: 2,
+                    ..CoalRow::default()
+                },
+            ],
+            ..CoalSplit::default()
+        },
+        ..WhyFacts::default()
+    }));
+    let read = MemoryReading::of(&s).unwrap();
+    assert_eq!(read.via, "coalitions");
+    assert_eq!(read.age_ms, 2000);
+    assert_eq!(read.owners.aterm.bytes, 123);
+    assert_eq!(read.owners.services.bytes, 456);
+    assert!(!read.owners.truncated);
+    {
+        let row = &mut std::sync::Arc::make_mut(s.why.as_mut().unwrap()).split.rows[1];
+        row.owned_footprint = crate::model::MemoryCharge {
+            bytes: 56,
+            members: 1,
+            unread: 0,
+        };
+    }
+    let moved = MemoryReading::of(&s).unwrap();
+    assert_eq!(moved.owners.aterm.bytes, 179);
+    assert_eq!(moved.owners.services.bytes, 400);
+    assert_eq!(moved.owners.unknown.bytes, 0);
+    {
+        let row = &mut std::sync::Arc::make_mut(s.why.as_mut().unwrap()).split.rows[1];
+        row.owned_footprint.unread = 1;
+    }
+    let mixed = MemoryReading::of(&s).unwrap();
+    assert_eq!(mixed.owners.aterm.bytes, 123);
+    assert_eq!(mixed.owners.services.bytes, 0);
+    assert_eq!(
+        mixed.owners.unknown.bytes, 456,
+        "an unread member leaves the complete charge explicitly mixed rather than inventing an owner"
+    );
+    std::sync::Arc::make_mut(s.why.as_mut().unwrap()).split.rows[1].owned_footprint =
+        crate::model::MemoryCharge::default();
+    std::sync::Arc::make_mut(s.why.as_mut().unwrap())
+        .split
+        .listed = 3;
+    let read = MemoryReading::of(&s).unwrap();
+    assert!(read.owners.truncated);
+    assert_eq!(
+        read.json()
+            .get("services")
+            .and_then(|o| o.get("footprint_bytes")),
+        Some(&Jv::at_least(456, "truncated"))
+    );
+    s.memory_owners.as_mut().unwrap().ownership_incomplete = true;
+    std::sync::Arc::make_mut(s.why.as_mut().unwrap())
+        .split
+        .listed = 2;
+    let read = MemoryReading::of(&s).unwrap();
+    assert!(!read.owners.truncated);
+    let json = read.json();
+    assert_eq!(json.get("ownership_incomplete"), Some(&Jv::Bool(true)));
+    assert_eq!(
+        json.get("services").and_then(|o| o.get("footprint_bytes")),
+        Some(&Jv::why("ownership_incomplete"))
+    );
+    assert_eq!(
+        json.get("services")
+            .and_then(|o| o.get("observed_footprint_bytes")),
+        Some(&Jv::u(456)),
+        "the kernel charge stays known while its owner is unresolved"
+    );
+}
+
+#[test]
+fn native_wait_totals_remain_known_when_the_final_cpu_split_is_missing() {
+    use crate::model::{NativeCpuCut, NativeCpuWindow};
+    let mut s = snapshot();
+    s.native_terminals.push(crate::model::NativeTerminal {
+        timing: NativeCpuWindow {
+            previous: NativeCpuCut {
+                continuous_ns: Some(10),
+                boot: None,
+            },
+            current: NativeCpuCut {
+                continuous_ns: Some(20),
+                boot: None,
+            },
+            exited_ns: Some(15),
+        },
+        host: crate::delegated::ProcessKey { pid: 100, start: 1 },
+        seq: 1,
+        process: ProcSample {
+            pid: 9000,
+            start: Some(999),
+            ppid: 100,
+            state: ProcState::Zombie,
+            ..ProcSample::default()
+        },
+        wait_cpu_ns: Some(12345),
+        tab: Some(7),
+    });
+    let json = native_waits_json(&s);
+    assert_eq!(json.get("scope"), Some(&Jv::s("owning_wait_total")));
+    assert_eq!(json.get("wait_cpu_ns"), Some(&Jv::u(12345)));
+    let rows = match json.get("rows").unwrap() {
+        Jv::Arr(rows) => rows,
+        _ => unreachable!(),
+    };
+    assert_eq!(rows[0].get("own_cpu_ns"), Some(&Jv::why("not_sampled")));
+    assert_eq!(rows[0].get("child_cpu_ns"), Some(&Jv::why("not_sampled")));
+    let timing = rows[0].get("timing").unwrap();
+    assert_eq!(timing.get("clock"), Some(&Jv::s("continuous_boot_ns")));
+    assert_eq!(timing.get("exited_ns"), Some(&Jv::u(15)));
+    assert_eq!(timing.get("previous_cut_ns"), Some(&Jv::u(10)));
+    assert_eq!(timing.get("current_cut_ns"), Some(&Jv::u(20)));
+    s.native_terminals[0].timing.exited_ns = None;
+    let json = native_waits_json(&s);
+    let Jv::Arr(rows) = json.get("rows").unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        rows[0].get("timing").unwrap().get("exited_ns"),
+        Some(&Jv::why("not_sampled"))
+    );
+}
+
+#[test]
+fn incomplete_mixed_coalition_memory_stays_unknown_and_never_becomes_foreign_memory() {
+    use crate::explain::{CoalLane, CoalRow, CoalSplit, Part, WhyFacts};
+    let mut s = snapshot();
+    let mixed = CoalRow {
+        part: Part::Others,
+        footprint_outside: Some(Part::Others),
+        footprint: Some(100),
+        ownership_mixed: true,
+        owned_footprint: crate::model::MemoryCharge {
+            bytes: 30,
+            members: 1,
+            unread: 0,
+        },
+        live: 2,
+        ..CoalRow::default()
+    };
+    s.why = Some(std::sync::Arc::new(WhyFacts {
+        at_ns: s.at_ns,
+        lane: CoalLane::On,
+        split: CoalSplit {
+            listed: 1,
+            rows: vec![mixed],
+            ..CoalSplit::default()
+        },
+        ..WhyFacts::default()
+    }));
+    let read = MemoryReading::of(&s).unwrap();
+    assert_eq!(
+        (
+            read.owners.aterm.bytes,
+            read.owners.others.bytes,
+            read.owners.unknown.bytes
+        ),
+        (30, 70, 0)
+    );
+    {
+        let row = &mut std::sync::Arc::make_mut(s.why.as_mut().unwrap()).split.rows[0];
+        row.footprint_ownership_incomplete = true;
+    }
+    let incomplete = MemoryReading::of(&s).unwrap();
+    assert_eq!(
+        (
+            incomplete.owners.aterm.bytes,
+            incomplete.owners.others.bytes,
+            incomplete.owners.unknown.bytes
+        ),
+        (0, 0, 100)
+    );
+    assert!(
+        incomplete.owners.ownership_incomplete,
+        "known unassigned memory must not produce an exact zero for the app"
+    );
+    {
+        let row = &mut std::sync::Arc::make_mut(s.why.as_mut().unwrap()).split.rows[0];
+        row.footprint_ownership_incomplete = false;
+        row.owned_footprint = crate::model::MemoryCharge::default();
+        row.footprint_outside = None;
+    }
+    let missing = MemoryReading::of(&s).unwrap();
+    assert_eq!(
+        missing.owners.unknown.bytes, 100,
+        "a mixed coalition with no currently proved app subset must not become entirely foreign"
+    );
+    {
+        let row = &mut std::sync::Arc::make_mut(s.why.as_mut().unwrap()).split.rows[0];
+        row.owned_footprint = crate::model::MemoryCharge {
+            bytes: 30,
+            members: 1,
+            unread: 0,
+        };
+        row.live = 1;
+    }
+    let only_owned = MemoryReading::of(&s).unwrap();
+    assert_eq!(
+        (
+            only_owned.owners.aterm.bytes,
+            only_owned.owners.others.bytes,
+            only_owned.owners.unknown.bytes
+        ),
+        (30, 0, 70),
+        "with no current foreign member, an unexplained remainder is not proof of foreign memory"
+    );
+    std::sync::Arc::make_mut(s.why.as_mut().unwrap()).memory_provenance_incomplete = true;
+    assert!(
+        !s.memory_owners.as_ref().unwrap().ownership_incomplete,
+        "the newer process reading repaired its identities"
+    );
+    assert!(
+        MemoryReading::of(&s).unwrap().owners.ownership_incomplete,
+        "that repair cannot upgrade the provenance of carried coalition charges"
+    );
+}
+
+#[test]
+fn overlapping_or_unread_vm_classes_do_not_claim_an_exact_partition() {
+    let w = world();
+    let mut s = snapshot();
+    s.mem.as_mut().unwrap().sample.app = 64 << 30;
+    let c = ctx(&w, Some(&s), true, true);
+    assert!(!exact_partition(&c));
+    let json = render_json(&query(View::Mem, true), &c);
+    assert_eq!(json.get("partition"), Some(&Jv::s("remainder")));
+    assert!(matches!(json.get("class_overflow_bytes"), Some(Jv::Int(n)) if *n > 0));
+    s.mem.as_mut().unwrap().sample.compressed = None;
+    assert!(!exact_partition(&ctx(&w, Some(&s), true, true)));
 }
 
 #[test]
@@ -1259,6 +1613,7 @@ fn a_panes_programs_are_its_tabs() {
         n: 1,
         cores: 0.5,
         footprint: None,
+        footprint_unread: 1,
         born_ms: None,
         unborn: 1,
     };
@@ -2012,14 +2367,24 @@ fn sys_jobs_reads_the_engines_rows_of_the_scope_in_both_shapes() {
         first,
         "jobs  tab 1 · 2 jobs · 1 running · 1 stuck · worst: silent 19m12s, about 19× the assumed 60 s gap, φ 8.34"
     );
-    assert!(
-        text.contains("job id=a40977 kind=agent-call consumer=agent-bg task=bq7f2k1za pgid=40977 exe=curl class=waiting wait=tcp remote=127.0.0.1:47811 state=ESTABLISHED queued=0 quiet_ms=1152000 phi=8.34 mu_ms=60000 mu_from=prior verdict=stuck"),
-        "{text}"
-    );
-    assert!(
-        text.contains("exe=targo class=running verdict=fine"),
-        "{text}"
-    );
+    for (id, fields) in [
+        (
+            "a40977",
+            &["exe=curl", "class=waiting", "wait=tcp", "verdict=stuck"][..],
+        ),
+        (
+            "a44120",
+            &["exe=targo", "class=running", "verdict=fine"][..],
+        ),
+    ] {
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(&format!("job id={id} ")))
+            .unwrap();
+        for field in fields {
+            assert!(line.split_whitespace().any(|word| word == *field), "{line}");
+        }
+    }
     assert!(!text.contains("a9 "), "{text}");
     assert!(
         text.contains("finding kind=stopped pid=10 exe=vim"),
@@ -3117,6 +3482,327 @@ fn an_unmeasured_disk_says_what_its_platform_measures() {
         "{win}"
     );
     assert!(!win.contains("writers are measured"), "{win}");
+}
+
+/// The process sweep's lane as a reading found it stalled: in `proc_pid_rusage` of the held
+/// `aterm-verify` (its name the last answered sweep's) since 21:18:20.000, 3m12s before.
+fn procs_stall() -> crate::lanes::LaneStall {
+    crate::lanes::LaneStall {
+        lane: crate::lanes::PROCS,
+        call: "proc_pid_rusage",
+        pid: Some(4321),
+        name: Some("aterm-verify".into()),
+        since_unix_ms: 1_792_185_500_000,
+        for_ms: 192_000,
+    }
+}
+
+/// [`snapshot`]'s model one reading on, whose sweep stalled: the machine's counters read, the
+/// processes not.
+fn stalled_snapshot() -> Snapshot {
+    let mut v = Vitals::new();
+    let _ = v.absorb(&sample(10, &[0, 0, 0, 0], 0));
+    let _ = v.absorb(&sample(11, &[20, 30, 100, 90], 1));
+    let mut stalled = sample(12, &[40, 60, 200, 180], 2);
+    stalled.procs = None;
+    stalled.stalled = vec![procs_stall()];
+    v.absorb(&stalled)
+}
+
+/// A stalled sweep's reading keeps the machine's figures, and every view names the read it is
+/// held in and since when, its own figures unavailable(stalled), never warming or zero; a reading
+/// whose lanes answered prints no stall.
+#[test]
+fn a_stalled_lane_prints_its_read_and_since_in_overview_procs_why_and_jobs() {
+    let s = stalled_snapshot();
+    assert!(s.cpu.is_some() && s.mem.is_some() && s.volume.is_some());
+    assert!(s.aterm.is_none(), "no sweep, no aterm figures");
+    let w = world();
+    let mut c = ctx(&w, Some(&s), true, true);
+    c.state = Freshness::Partial;
+    let head = "stalled procs: proc_pid_rusage pid=4321 (aterm-verify) since 21:18:20.000 for \
+                3m12s · figures aterm,tab,procs,wait,writes,split,top,why,jobs,left";
+    for view in [
+        View::Overview,
+        View::Procs,
+        View::Why,
+        View::Jobs,
+        View::Tab,
+    ] {
+        let reply = render_text(&query(view, false), &c);
+        let text = all_text(&reply);
+        assert!(text.contains(head), "{view:?}: {text}");
+        let header = reply.header(&c, false);
+        assert!(
+            header.contains(" state=partial stalled=procs"),
+            "{view:?}: {header}"
+        );
+    }
+    let overview = all_text(&render_text(&query(View::Overview, false), &c));
+    assert!(
+        overview.contains("aterm   unavailable(stalled)"),
+        "{overview}"
+    );
+    assert!(
+        overview.contains("tab 1   unavailable(stalled)"),
+        "{overview}"
+    );
+    assert!(
+        overview.contains("memory "),
+        "the machine's figures stay: {overview}"
+    );
+    assert!(!overview.contains("warming"), "{overview}");
+    assert!(!overview.contains("measuring"), "{overview}");
+    let procs = all_text(&render_text(&query(View::Procs, false), &c));
+    assert!(
+        procs.contains("procs  tab 1 · unavailable(stalled): the process sweep did not answer"),
+        "{procs}"
+    );
+    let jobs = all_text(&render_text(&query(View::Jobs, false), &c));
+    assert!(jobs.contains("unavailable(stalled)"), "{jobs}");
+    // The negative control: a reading whose lanes answered names no stall.
+    let fresh = snapshot();
+    let c = ctx(&w, Some(&fresh), true, true);
+    for view in View::ALL {
+        let reply = render_text(&query(view, false), &c);
+        assert!(!all_text(&reply).contains("stalled"), "{view:?}");
+        assert!(!reply.header(&c, false).contains("stalled"), "{view:?}");
+    }
+}
+
+/// `--json` lists each stalled lane with its read, pid, name and since, and each figure the
+/// lane leaves unknown is `{"why":"stalled","lane":…}`; the contract holds both, and a reading
+/// whose lanes answered carries no `lanes`.
+#[test]
+fn sys_json_carries_each_stalled_lane_and_marks_its_figures() {
+    let s = stalled_snapshot();
+    let w = world();
+    let mut c = ctx(&w, Some(&s), true, true);
+    c.state = Freshness::Partial;
+    for view in View::ALL {
+        let j = render_json(&query(view, true), &c);
+        let v = contract_violations(&j);
+        assert!(v.is_empty(), "{view:?}: {v:?}\n{}", j.to_text());
+        let Some(Jv::Arr(lanes)) = j.get("lanes") else {
+            panic!("{view:?}: no lanes: {}", j.to_text());
+        };
+        assert_eq!(lanes.len(), 1);
+        let lane = &lanes[0];
+        assert_eq!(lane.get("lane"), Some(&Jv::s("procs")));
+        assert_eq!(lane.get("state"), Some(&Jv::s("stalled")));
+        assert_eq!(lane.get("call"), Some(&Jv::s("proc_pid_rusage")));
+        assert_eq!(lane.get("pid"), Some(&Jv::u(4321)));
+        assert_eq!(lane.get("name"), Some(&Jv::s("aterm-verify")));
+        assert_eq!(lane.get("since"), Some(&Jv::s("21:18:20.000")));
+        assert_eq!(lane.get("for_ms"), Some(&Jv::u(192_000)));
+    }
+    let overview = render_json(&query(View::Overview, true), &c);
+    assert_eq!(
+        overview.get("aterm").and_then(|a| a.get("cpu_mc")),
+        Some(&Jv::stalled("procs")),
+        "{}",
+        overview.to_text()
+    );
+    assert_eq!(
+        overview.get("tab").and_then(|t| t.get("cpu_mc")),
+        Some(&Jv::stalled("procs")),
+        "{}",
+        overview.to_text()
+    );
+    let procs = render_json(&query(View::Procs, true), &c);
+    assert_eq!(procs.get("procs"), Some(&Jv::stalled("procs")));
+    let memory = render_json(&query(View::Mem, true), &c);
+    assert_eq!(
+        memory.get("owners"),
+        Some(&Jv::stalled("procs")),
+        "missing memory-owner evidence keeps the stalled sweep reason: {}",
+        memory.to_text()
+    );
+    // The negative control.
+    let fresh = snapshot();
+    let c = ctx(&w, Some(&fresh), true, true);
+    for view in View::ALL {
+        assert!(
+            render_json(&query(view, true), &c).get("lanes").is_none(),
+            "{view:?}"
+        );
+    }
+}
+
+/// [`stalled_snapshot`]'s readings with the third sweep answered: the same machine, its
+/// processes read.
+fn answered_snapshot() -> Snapshot {
+    let mut v = Vitals::new();
+    let _ = v.absorb(&sample(10, &[0, 0, 0, 0], 0));
+    let _ = v.absorb(&sample(11, &[20, 30, 100, 90], 1));
+    let mut s = v.absorb(&sample(12, &[40, 60, 200, 180], 2));
+    s.set_left(Some(std::sync::Arc::new(
+        crate::sys::left::tests::view_fixture(),
+    )));
+    s
+}
+
+/// The words an unknown is read by that are not `stalled`.
+const UNSTALLED_UNKNOWNS: [&str; 3] = ["warming", "not_sampled", "measuring"];
+
+/// Every `{"why": w}` under `v` with `w` one of [`UNSTALLED_UNKNOWNS`], by path.
+fn unstalled_unknowns(v: &Jv, path: &str, out: &mut Vec<(String, String)>) {
+    match v {
+        Jv::Obj(pairs) => {
+            if let Some(Jv::Str(w)) = v.get("why")
+                && UNSTALLED_UNKNOWNS.contains(&w.as_str())
+            {
+                out.push((path.to_owned(), w.clone()));
+            }
+            for (k, x) in pairs {
+                unstalled_unknowns(x, &format!("{path}.{k}"), out);
+            }
+        }
+        Jv::Arr(xs) => {
+            for (i, x) in xs.iter().enumerate() {
+                unstalled_unknowns(x, &format!("{path}[{i}]"), out);
+            }
+        }
+        Jv::Int(_) | Jv::Str(_) | Jv::Bool(_) => {}
+    }
+}
+
+/// A stalled sweep leaves no figure warming, not sampled or measuring that the same reading
+/// with its sweep answered reads: every figure the stall leaves unknown says it stalled, in
+/// every view's text and JSON. The answered reading is the control.
+#[test]
+fn a_stall_leaves_no_figure_it_feeds_warming_or_unsampled() {
+    let stalled = stalled_snapshot();
+    let answered = answered_snapshot();
+    let w = world();
+    let mut c = ctx(&w, Some(&stalled), true, true);
+    c.state = Freshness::Partial;
+    let a = ctx(&w, Some(&answered), true, true);
+    let mut wrong = Vec::new();
+    for view in View::ALL {
+        let held = render_text(&query(view, false), &c);
+        let read = render_text(&query(view, false), &a);
+        for l in &held.lines {
+            let twin = read.lines.iter().find(|r| r.key == l.key);
+            for word in UNSTALLED_UNKNOWNS {
+                let n = l.text.matches(word).count();
+                let m = twin.map_or(0, |r| r.text.matches(word).count());
+                if n > m {
+                    wrong.push(format!("{view:?} text {}: {}", l.key, l.text));
+                }
+            }
+        }
+        let mut held_json = Vec::new();
+        unstalled_unknowns(&render_json(&query(view, true), &c), "", &mut held_json);
+        let mut read_json = Vec::new();
+        unstalled_unknowns(&render_json(&query(view, true), &a), "", &mut read_json);
+        for u in held_json {
+            if !read_json.contains(&u) {
+                wrong.push(format!("{view:?} json {}: {}", u.0, u.1));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    let global = render_json(&query(View::Global, true), &c);
+    let g = global.get("global").expect("global");
+    for key in ["procs", "wait_mc", "disk_write_bytes_per_s"] {
+        assert_eq!(
+            g.get(key),
+            Some(&Jv::stalled("procs")),
+            "{key}: {}",
+            global.to_text()
+        );
+    }
+    assert_eq!(
+        global.get("top"),
+        Some(&Jv::stalled("procs")),
+        "{}",
+        global.to_text()
+    );
+    let text = all_text(&render_text(&query(View::Global, false), &c));
+    assert!(text.contains("top      unavailable(stalled)"), "{text}");
+    let aterm = all_text(&render_text(&query(View::Aterm, false), &c));
+    assert!(aterm.contains("cpu     unavailable(stalled)"), "{aterm}");
+    let aterm = render_json(&query(View::Aterm, true), &c);
+    assert_eq!(aterm.get("parts"), Some(&Jv::stalled("procs")));
+    let mem = all_text(&render_text(&query(View::Why, false), &c));
+    assert!(mem.contains("role=unavailable(stalled)"), "{mem}");
+    // A sweep stalled before any answered: why's split has no account to carry, and says the
+    // sweep stalled rather than warming.
+    let mut v = Vitals::new();
+    let _ = v.absorb(&sample(10, &[0, 0, 0, 0], 0));
+    let mut first = sample(11, &[20, 30, 100, 90], 1);
+    first.procs = None;
+    first.stalled = vec![procs_stall()];
+    let cold = v.absorb(&first);
+    let mut c = ctx(&w, Some(&cold), true, true);
+    c.state = Freshness::Partial;
+    let mut cpu = query(View::Why, false);
+    cpu.subject = Some(crate::explain::WhySubject::Cpu);
+    let why = all_text(&render_text(&cpu, &c));
+    assert!(why.contains("split unavailable(stalled)"), "{why}");
+    assert!(why.contains("role=unavailable(stalled)"), "{why}");
+    assert!(!why.contains("warming"), "{why}");
+    cpu.json = true;
+    let why = render_json(&cpu, &c).to_text();
+    assert!(why.contains(r#"{"why":"stalled","lane":"procs"}"#), "{why}");
+    assert!(!why.contains("warming"), "{why}");
+}
+
+/// Every `age_ms` under `v`.
+fn ages(v: &Jv, out: &mut Vec<Jv>) {
+    match v {
+        Jv::Obj(pairs) => {
+            for (k, x) in pairs {
+                if k == "age_ms" {
+                    out.push(x.clone());
+                } else {
+                    ages(x, out);
+                }
+            }
+        }
+        Jv::Arr(xs) => xs.iter().for_each(|x| ages(x, out)),
+        Jv::Int(_) | Jv::Str(_) | Jv::Bool(_) => {}
+    }
+}
+
+/// While the process table's lane is stalled, an age no birth was read for says so, in text and
+/// JSON; the same reading with the table answering reads it unsampled.
+#[test]
+fn a_stalled_table_leaves_ages_stalled_not_unsampled() {
+    let w = world();
+    let answered = answered_snapshot();
+    let mut held = answered_snapshot();
+    held.stalled = vec![crate::lanes::LaneStall {
+        lane: crate::lanes::KPROC_TABLE,
+        call: "sysctl KERN_PROC_ALL",
+        pid: None,
+        name: None,
+        since_unix_ms: 1_792_185_500_000,
+        for_ms: 1_500,
+    }];
+    let mut c = ctx(&w, Some(&held), true, true);
+    c.state = Freshness::Partial;
+    let mut got = Vec::new();
+    ages(&render_json(&query(View::Procs, true), &c), &mut got);
+    let stalled = Jv::stalled(crate::lanes::KPROC_TABLE);
+    assert!(got.contains(&stalled), "{got:?}");
+    assert!(
+        got.iter().all(|a| *a == stalled || matches!(a, Jv::Int(_))),
+        "{got:?}"
+    );
+    let text = all_text(&render_text(&query(View::Procs, false), &c));
+    assert!(text.contains("age_ms=unavailable(stalled)"), "{text}");
+    assert!(text.contains("figures ages,reaping"), "{text}");
+    let a = ctx(&w, Some(&answered), true, true);
+    let mut got = Vec::new();
+    ages(&render_json(&query(View::Procs, true), &a), &mut got);
+    assert!(got.contains(&Jv::why("not_sampled")), "{got:?}");
+    assert!(
+        got.iter()
+            .all(|a| *a == Jv::why("not_sampled") || matches!(a, Jv::Int(_))),
+        "{got:?}"
+    );
 }
 
 /// SYS DISK PRINTS THE REBUILDABLE BUDGET AS ONE RECORD OF ITS OWN, IN TEXT AND IN JSON, AND

@@ -1666,6 +1666,10 @@ impl Real {
                 .join(format!("{stamp}-{}", std::process::id()))
         };
         std::fs::create_dir_all(&logs).map_err(|e| format!("create {}: {e}", logs.display()))?;
+        if !dry {
+            // Each run leaves one folder here: remove those no release names any more.
+            crate::release_leftovers::at_run_start(&state, &release, &logs);
+        }
         Ok(Self {
             prefreeze_claim: None,
             prefrozen_step1: None,
@@ -1942,6 +1946,7 @@ impl Real {
         let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
         let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
         let waited = wait_accounted(&mut child, &mut forwarded);
+        self.reaped_client(cmd, child.id(), &waited);
         let ended_at_unix_ms = now_ms();
         drop(forwarded);
         let (status, usage) = waited?;
@@ -2013,6 +2018,20 @@ impl Real {
             cmd.env(aterm_capacity::DISK_COVER_ENV, claim.marker());
         }
         cmd
+    }
+
+    /// Note a reaped child that may have been handed a qualify branch's FIFO, for that branch's
+    /// next count ([`aterm_capacity::BranchShares::reaped`]).
+    fn reaped_client<T>(
+        &self,
+        cmd: &Command,
+        pid: u32,
+        waited: &std::io::Result<(std::process::ExitStatus, T)>,
+    ) {
+        if let Some(pool) = &self.pool {
+            let status = waited.as_ref().ok().map(|(status, _)| *status);
+            pool.jobs.reaped(cmd, pid, status);
+        }
     }
 
     /// Hand the build or tree its private FIFO. Bundle checks reuse tree's FIFO after qualify,
@@ -2469,6 +2488,7 @@ impl Real {
             })
         });
         let waited = wait_accounted(&mut child, &mut forwarded);
+        self.reaped_client(cmd, child.id(), &waited);
         let ended_at_unix_ms = now_ms();
         let code = waited
             .as_ref()
@@ -3574,6 +3594,7 @@ impl Real {
             .join(format!("cutter-{key}.noindex"));
         std::fs::create_dir_all(source.parent().ok_or("no cutter source parent")?)
             .map_err(|e| e.to_string())?;
+        crate::release_leftovers::own_cutter(&source, cache);
         // Only the exclusive workspace holder changes this regenerable checkout. An
         // interrupted Git transaction may leave locks or a partially populated index;
         // reconstruct those sources, retaining the separately placed compiler cache.
@@ -4753,25 +4774,6 @@ impl Real {
         }
         if run.strict_subset() {
             cmd.arg("--checks").arg(run.checks.join(","));
-        }
-        if !run.passed_binaries.is_empty() {
-            let path = side("passed-binaries");
-            let mut proofs = aterm_verify::testrun::Passed::new();
-            for binary in &run.passed_binaries {
-                if let Some(proof) = binary.proof() {
-                    proofs.insert(proof.spec.clone(), proof);
-                }
-            }
-            let text = aterm_verify::testrun::encode_passed(&proofs).map_err(|e| {
-                Refusal::new(
-                    format!("cannot encode prior test-binary content proofs: {e}"),
-                    format!("remove {}, then {RELEASE_COMMAND}", path.display()),
-                )
-                .could_not_run()
-            })?;
-            crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
-                .map_err(|e| cannot(&path, e))?;
-            cmd.arg("--passed-binaries").arg(&path);
         }
         if !run.passed_lint_packages.is_empty() {
             let path = side("passed-lint-packages");
@@ -6191,7 +6193,6 @@ pub(crate) fn measure_local_appkit(
     let run = crate::check_record::VerifyRun {
         half: crate::check_record::Half::Bundle,
         checks: vec!["appkit".to_owned()],
-        passed_binaries: Vec::new(),
         passed_lint_packages: Vec::new(),
         passed_appkit_groups: Vec::new(),
     };
@@ -7092,9 +7093,10 @@ impl EngineCause {
                  runs (`no help for: repo fetch`, `unknown topic 'repo'`) is older than the \
                  engine, so unset {ENGINE_AGH_ENV} (this checkout's agh is then built) or point \
                  it at a current one; else `agh whoami --for OWNER/REPO` names the identity agh \
-                 routes for the repository it names, and a private one reads only with a vault \
-                 token that can read it (`agh auth add`, or `aterm secrets sync`); an \
-                 alabsystems one is read anonymously, so it must be public; then run it again"
+                 routes for the repository it names, and a private one reads only with the dev \
+                 token this Mac's vault registry holds (`aterm secrets need gh:dev` where it \
+                 holds none); an alabsystems one is read anonymously, so it must be public; \
+                 then run it again"
             ),
             Self::Engine => {
                 "fix the publication engine's checkout or records it names, then run it again"
@@ -7793,6 +7795,66 @@ fn settle_post_claim_public_state(
         let refusal = error.refusal(Some(previous));
         classify(format!("{} — {}", refusal.why, refusal.remedy))
     })
+}
+
+/// How a supersession that took its claim ended ([`Real::supersede_held`]), which decides what
+/// becomes of that claim ([`settle_supersession`]).
+enum Held {
+    /// The supersession is durable, by this run's record or an identical one already on main,
+    /// with no check stopping this run between its take and that: the run goes on holding the
+    /// line.
+    Durable(String),
+    /// Nothing of this run's own is on main: a check after the take stopped it before its
+    /// record write, or that write was proved absent. The take is undone.
+    Undone(SupersedeResult),
+    /// This run's own record write has an unknown outcome. A record it made retires the
+    /// displaced holder's line, so nothing is handed back and the claim is let go as it stands.
+    Unknown(String),
+}
+
+impl Held {
+    /// A result reached with this run's claim standing and nothing of its own written.
+    fn standing(result: SupersedeResult) -> Self {
+        match result {
+            SupersedeResult::Committed(note) => Self::Durable(note),
+            result => Self::Undone(result),
+        }
+    }
+}
+
+/// Settle the claim a supersession took as `held` says: kept (returned), handed back to the
+/// holder it displaced (`hand_back`, [`crate::line_claim::Claim::hand_back`]), whose outcome
+/// joins the result's words, or let go.
+fn settle_supersession<C>(
+    claim: C,
+    held: Held,
+    hand_back: impl FnOnce(C) -> Result<Option<String>, String>,
+) -> (SupersedeResult, Option<C>) {
+    let result = match held {
+        Held::Durable(note) => return (SupersedeResult::Committed(note), Some(claim)),
+        Held::Unknown(why) => return (SupersedeResult::Unknown(why), None),
+        Held::Undone(result) => result,
+    };
+    let returned = match hand_back(claim) {
+        Ok(Some(holder)) => format!("the line was handed back to its holder {holder}"),
+        Ok(None) => "another holder took the line from this run since, and keeps it".into(),
+        Err(error) => format!(
+            "handing the line back to its holder failed ({error}); that holder stops at its \
+             next renewal, naming this supersession"
+        ),
+    };
+    let result = match result {
+        SupersedeResult::Committed(note) => {
+            SupersedeResult::Committed(format!("{note}; {returned}"))
+        }
+        SupersedeResult::Refused { why, retry, winner } => SupersedeResult::Refused {
+            why: format!("{why}; {returned}"),
+            retry,
+            winner,
+        },
+        SupersedeResult::Unknown(why) => SupersedeResult::Unknown(format!("{why}; {returned}")),
+    };
+    (result, None)
 }
 
 fn staged_ahead_of_version(staged: &str, requested: &str) -> Result<bool, SupersedeCheck> {
@@ -8867,6 +8929,103 @@ impl Real {
         };
         f(&git, &origin, &plan, &date)
     }
+
+    /// [`Backend::supersede_line`] once its claim of `previous` is held: every check that must
+    /// follow the take, then the durable record, and how that ended for the claim ([`Held`]).
+    fn supersede_held(
+        &mut self,
+        claim: &mut crate::line_claim::Claim,
+        requested: &crate::line::Supersession,
+        previous: &Line,
+        line: &Line,
+    ) -> Held {
+        self.prefetched_origin = None;
+        if let Err(error) = self.prefetch_source() {
+            return Held::Undone(self.classify_after_claim_stop(requested, error.why));
+        }
+        match crate::line::supersession(&self.git(), &line.version) {
+            Ok(Some(record)) if record.replacement.base != previous.base => {
+                return Held::standing(self.verify_supersede_result(classify_supersession_reread(
+                    requested,
+                    Ok(Some(record)),
+                    false,
+                )));
+            }
+            Ok(_) => {}
+            Err(why) => return Held::Undone(self.classify_after_claim_stop(requested, why)),
+        }
+        if let Err(why) = claim.audit() {
+            return Held::Undone(self.classify_after_claim_stop(requested, why));
+        }
+        self.origin_main = None;
+        let public_state = self.supersede_public_state(previous, line);
+        if let Err(result) = settle_post_claim_public_state(public_state, previous, |why| {
+            self.classify_after_claim_stop(requested, why)
+        }) {
+            return Held::Undone(result);
+        }
+        if let Err(why) = claim.audit() {
+            return Held::Undone(self.classify_after_claim_stop(requested, why));
+        }
+        let record = supersession_record(previous.clone(), line.clone());
+        let origin = match crate::github_remote::Remote::origin(&self.repo) {
+            Ok(origin) => origin,
+            Err(why) => return Held::Undone(self.classify_after_claim_stop(requested, why)),
+        };
+        let recorded = match crate::line::supersede(&self.git(), &origin, &record) {
+            Ok(merge) => format!("recorded on main at {merge}"),
+            Err(write_error) => {
+                self.prefetched_origin = None;
+                if let Err(refusal) = self.prefetch_source() {
+                    return Held::Unknown(format!(
+                        "{write_error}; exact reread unavailable: {} — {}",
+                        refusal.why, refusal.remedy
+                    ));
+                }
+                match self.verify_supersede_result(classify_supersession_reread(
+                    &record,
+                    crate::line::supersession(&self.git(), &line.version),
+                    false,
+                )) {
+                    SupersedeResult::Committed(_) => {
+                        "recorded on main (confirmed by an exact reread)".into()
+                    }
+                    SupersedeResult::Refused { why, retry, winner } => {
+                        return Held::Undone(SupersedeResult::Refused {
+                            why: format!("{write_error}; {why}"),
+                            retry,
+                            winner,
+                        });
+                    }
+                    SupersedeResult::Unknown(read_error) => {
+                        return Held::Unknown(format!(
+                            "{write_error}; exact reread failed: {read_error}"
+                        ));
+                    }
+                }
+            }
+        };
+        let mut warnings = Vec::new();
+        if let Err(why) = claim.boundary(line, "commit", &self.times()) {
+            warnings.push(format!("claim boundary will retry: {why}"));
+        }
+        if let Err(why) = claim.audit() {
+            warnings.push(format!("claim audit will retry: {why}"));
+        }
+        let warnings = if warnings.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", warnings.join("; "))
+        };
+        Held::Durable(format!(
+            "SUPERSEDED v{} line {} (base {}) with {}: {}; {recorded}{warnings}",
+            line.version,
+            record.previous.head(),
+            record.previous.base,
+            line.base,
+            record.reason
+        ))
+    }
 }
 
 impl Backend for Real {
@@ -9036,6 +9195,15 @@ impl Backend for Real {
         Ok(selected)
     }
 
+    fn fleet_contender_refusal(
+        &mut self,
+        version: &str,
+        continued: bool,
+    ) -> Result<Option<String>, String> {
+        crate::line_claim::held(&self.repo, version, continued)
+            .map(|held| held.map(|held| held.refusal))
+    }
+
     fn fleet_supersession(
         &mut self,
         version: &str,
@@ -9101,129 +9269,41 @@ impl Backend for Real {
         ))
     }
 
+    /// Take the claim of `expected_previous` and record its supersession by `line`. An origin
+    /// that cannot be read refuses before anything is taken. The take compares the claim it
+    /// swaps from with `expected_previous` ([`Take::Supersede`]), so a line that advanced since
+    /// this run judged it is refused with nothing taken and its holder running. What becomes of
+    /// the claim then follows from how the supersession ended ([`Held`]): kept once it is
+    /// durable, handed back to the holder it displaced
+    /// ([`crate::line_claim::Claim::hand_back`]) where nothing of this run's own is on main,
+    /// and let go without a hand-back where this run's own record write has an unknown outcome.
+    ///
+    /// [`Take::Supersede`]: crate::line_claim::Take::Supersede
     fn supersede_line(&mut self, expected_previous: &Line, line: &Line) -> SupersedeResult {
         let requested = supersession_record(expected_previous.clone(), line.clone());
-        let refused = |why: String| SupersedeResult::Refused {
-            why,
-            retry: false,
-            winner: None,
-        };
         self.prefetched_origin = None;
         if let Err(error) = self.prefetch_source() {
-            return refused(error.why);
+            return SupersedeResult::Refused {
+                why: error.why,
+                retry: false,
+                winner: None,
+            };
         }
-        let previous = match crate::line_claim::existing(&self.repo, &line.version) {
-            Ok(Some(previous)) => previous,
-            Ok(None) => return refused("no existing fleet line to supersede".into()),
-            Err(why) => return refused(why),
-        };
         let mut claim = match crate::line_claim::Claim::take(
             &self.repo,
-            &previous,
+            expected_previous,
             &self.logs,
             crate::line_claim::Take::Supersede,
         ) {
             Ok(claim) => claim,
             Err(why) => return self.classify_after_claim_stop(&requested, why),
         };
-        let previous = claim.line.clone();
-        self.prefetched_origin = None;
-        if let Err(error) = self.prefetch_source() {
-            return self.classify_after_claim_stop(&requested, error.why);
+        let held = self.supersede_held(&mut claim, &requested, expected_previous, line);
+        let (result, kept) = settle_supersession(claim, held, crate::line_claim::Claim::hand_back);
+        if kept.is_some() {
+            self.fleet_line = kept;
         }
-        match crate::line::supersession(&self.git(), &line.version) {
-            Ok(Some(record)) if record.replacement.base != expected_previous.base => {
-                let result = self.verify_supersede_result(classify_supersession_reread(
-                    &requested,
-                    Ok(Some(record)),
-                    false,
-                ));
-                if matches!(result, SupersedeResult::Committed(_)) {
-                    self.fleet_line = Some(claim);
-                }
-                return result;
-            }
-            Ok(_) => {}
-            Err(why) => return self.classify_after_claim_stop(&requested, why),
-        }
-        if previous != *expected_previous {
-            return self.classify_after_claim_stop(
-                &requested,
-                "the fleet line advanced while the replacement took its claim".into(),
-            );
-        }
-        if let Err(why) = claim.audit() {
-            return self.classify_after_claim_stop(&requested, why);
-        }
-        self.origin_main = None;
-        let public_state = self.supersede_public_state(&previous, line);
-        if let Err(result) = settle_post_claim_public_state(public_state, &previous, |why| {
-            self.classify_after_claim_stop(&requested, why)
-        }) {
-            return result;
-        }
-        if let Err(why) = claim.audit() {
-            return self.classify_after_claim_stop(&requested, why);
-        }
-        let record = supersession_record(previous, line.clone());
-        let origin = match crate::github_remote::Remote::origin(&self.repo) {
-            Ok(origin) => origin,
-            Err(why) => return self.classify_after_claim_stop(&requested, why),
-        };
-        let recorded = match crate::line::supersede(&self.git(), &origin, &record) {
-            Ok(merge) => format!("recorded on main at {merge}"),
-            Err(write_error) => {
-                self.prefetched_origin = None;
-                if let Err(refusal) = self.prefetch_source() {
-                    return SupersedeResult::Unknown(format!(
-                        "{write_error}; exact reread unavailable: {} — {}",
-                        refusal.why, refusal.remedy
-                    ));
-                }
-                match self.verify_supersede_result(classify_supersession_reread(
-                    &record,
-                    crate::line::supersession(&self.git(), &line.version),
-                    false,
-                )) {
-                    SupersedeResult::Committed(_) => {
-                        "recorded on main (confirmed by an exact reread)".into()
-                    }
-                    SupersedeResult::Refused { why, retry, winner } => {
-                        return SupersedeResult::Refused {
-                            why: format!("{write_error}; {why}"),
-                            retry,
-                            winner,
-                        };
-                    }
-                    SupersedeResult::Unknown(read_error) => {
-                        return SupersedeResult::Unknown(format!(
-                            "{write_error}; exact reread failed: {read_error}"
-                        ));
-                    }
-                }
-            }
-        };
-        let mut warnings = Vec::new();
-        if let Err(why) = claim.boundary(line, "commit", &self.times()) {
-            warnings.push(format!("claim boundary will retry: {why}"));
-        }
-        if let Err(why) = claim.audit() {
-            warnings.push(format!("claim audit will retry: {why}"));
-        }
-        self.fleet_line = Some(claim);
-        let warnings = if warnings.is_empty() {
-            String::new()
-        } else {
-            format!("; {}", warnings.join("; "))
-        };
-        SupersedeResult::Committed(format!(
-            "SUPERSEDED v{} line {} (base {}) with {}: {}; {recorded}{warnings}",
-            line.version,
-            record.previous.head(),
-            record.previous.base,
-            line.base,
-            record.reason
-        ))
+        result
     }
 
     fn supersession_completed(&mut self) {
@@ -9296,6 +9376,13 @@ impl Backend for Real {
             .as_mut()
             .ok_or("no fleet line claim")?
             .audit()
+    }
+
+    fn fleet_wait(&mut self, what: &str) -> Result<(), String> {
+        match &mut self.fleet_line {
+            Some(claim) => claim.waiting(what),
+            None => Ok(()),
+        }
     }
 
     fn observe_operational(&mut self) {
@@ -9475,7 +9562,7 @@ impl Backend for Real {
         names
     }
 
-    fn machine(&mut self, creds: &Path, explicit: bool) -> (String, Vec<Refusal>) {
+    fn machine(&mut self, creds: Option<&Path>) -> (String, Vec<Refusal>) {
         let mut out = Vec::new();
         if let Err(why) = crate::source_signing::Tools::authority(
             &self.home,
@@ -9486,27 +9573,28 @@ impl Backend for Real {
                 "run targo --unverified ship provision --id <existing signer id> to restore the complete canonical ring, then retry",
             ));
         }
-        if explicit && !creds.is_file() {
+        if let Some(creds) = creds.filter(|creds| !creds.is_file()) {
             out.push(Refusal::new(
                 format!("--release-credentials {} is not a file", creds.display()),
-                "name the signing profile ship provision wrote (docs/RELEASE-KEYS.md), or \
-                 drop the flag for ~/.aterm/release-ring/release-credentials.toml",
+                "name an operator's signing profile file (docs/RELEASE-KEYS.md), or drop the \
+                 flag for the store's release ring",
             ));
         }
-        let field = |path: &Path, key: &str| {
-            crate::durable::read_text(path).ok().and_then(|t| {
-                t.lines().find_map(|l| {
-                    let (k, v) = l.split_once('=')?;
-                    (k.trim() == key).then(|| v.trim().trim_matches('"').to_string())
-                })
-            })
+        // The machine id the cut signs as: the store ring's record (or the operator's profile),
+        // the same credentials the cut resolves; no ring file under the home is read.
+        let id = match crate::sign::ReleaseCredentials::resolve_with(creds, self.home.to_str()) {
+            Ok(credentials) => credentials
+                .and_then(|credentials| credentials.machine_id().map(str::to_string))
+                .unwrap_or_default(),
+            Err(why) => {
+                out.push(Refusal::new(
+                    format!("the release signing credentials cannot be read: {why}"),
+                    "the vault admin republishes the store's release ring as one identity, or \
+                     name an operator's profile file with --release-credentials",
+                ));
+                String::new()
+            }
         };
-        let id = field(
-            &self.home.join(atpkg_keys::provision::MACHINE_PUB_REL),
-            "id",
-        )
-        .or_else(|| field(creds, "machine_id"))
-        .unwrap_or_default();
         if let (Some(free), _) = self.disk()
             && free < crate::gates::MIN_FREE_DISK_GIB
         {
@@ -10382,7 +10470,10 @@ impl Backend for Real {
                     .and_then(|f| f.parse::<u64>().ok())
             })
             .map(|kib| kib / (1024 * 1024));
-        let warm = self.repo.join("target/debug").is_dir();
+        // Verification pins its final target from the release child's layout, which
+        // need not be Cargo's legacy target/. Unresolved or unreadable stays cold.
+        let warm = verify_plan(&self.repo)
+            .is_ok_and(|plan| std::fs::read_dir(plan.target().join("debug")).is_ok());
         (free, warm)
     }
 
@@ -10437,7 +10528,7 @@ impl Backend for Real {
     fn cut_gates(
         &mut self,
         c: &Candidate,
-        creds: &Path,
+        creds: Option<&Path>,
         kind: crate::publish::CutKind,
     ) -> Vec<Refusal> {
         let checkout = if self.scratch_logs {
@@ -12277,8 +12368,7 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
     }
     real.line_priority = line;
     real.argv = opts.dispatch_args(std::env::args_os().skip(1).collect());
-    let home = real.home.clone();
-    crate::release::run_with(&mut real, &opts, &home).code
+    crate::release::run_with(&mut real, &opts).code
 }
 
 /// What `ship check` asks: the commit, engine, selected sections and optional stable compile.

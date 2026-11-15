@@ -52,7 +52,10 @@ fn a_post_on_a_topic_is_the_sessions_last_topic_post_and_an_addressed_one_is_not
         ("build", "crate 3 of 9")
     );
     // Negative control: mail to a session is no channel post, and leaves the last one.
-    assert_eq!(post("to=@s-peer kind=report -- to the manager"), "OK 2\n");
+    assert_eq!(
+        post("to=@t0000100000 kind=report -- to the manager"),
+        "OK 2\n"
+    );
     assert_eq!(ctx.fabric.last_topic_post().as_ref(), Some(&first));
     assert_eq!(post("to=say kind=note -- everyone"), "OK 3\n");
     let bare = ctx.fabric.last_topic_post().expect("a topic post");

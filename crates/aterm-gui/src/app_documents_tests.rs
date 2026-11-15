@@ -690,6 +690,7 @@ fn admission_key(uri: &str, kind: AppKind) -> DocumentAdmissionKey {
         uri: uri.to_string(),
         kind,
         edit: None,
+        config: false,
     }
 }
 
@@ -706,6 +707,11 @@ fn worker_outcome(
     }
 }
 
+/// A directory listing's Enter follows the entry's links where a plain open refuses them. An
+/// entry whose read failed shows on a Recovery tab standing for the entry itself, whose Retry and
+/// Open Original follow its link and whose document, once it opens, takes that tab's place.
+/// NEGATIVE CONTROLS (scratch): retiring the failure tab by the target's URI alone, or an Open
+/// Original that does not follow the link, leaves the tab.
 #[test]
 #[cfg(unix)]
 fn directory_entry_admission_follows_links_without_loosening_normal_opens() {
@@ -727,11 +733,16 @@ fn directory_entry_admission_follows_links_without_loosening_normal_opens() {
         let key = admission_key(&link_uri, AppKind::Editor);
         let options = app.admission_options(&key);
         assert!(
-            App::admit_document_request(&key, DocumentAdmissionPurpose::Open, options).is_err()
+            App::admit_document_request(&key, DocumentAdmissionPurpose::Open, options, false)
+                .is_err()
         );
-        let admitted =
-            App::admit_document_request(&key, DocumentAdmissionPurpose::DirectoryEntry, options)
-                .unwrap();
+        let admitted = App::admit_document_request(
+            &key,
+            DocumentAdmissionPurpose::DirectoryEntry,
+            options,
+            false,
+        )
+        .unwrap();
         assert_eq!(admitted.canonical_uri(), target_uri);
         app.open_document_tab_in_window(wid, AppKind::Editor, &uri)
             .unwrap();
@@ -780,11 +791,99 @@ fn directory_entry_admission_follows_links_without_loosening_normal_opens() {
     std::os::unix::fs::symlink(path.join("missing"), path.join("dangling")).unwrap();
     let dangling = crate::native_document_host::path_to_file_uri(&path.join("dangling")).unwrap();
     let focus = app.active_native_view(wid).unwrap();
-    assert!(
-        app.execute_editor_effect(source, EditorEffect::OpenPath { uri: dangling })
-            .is_err()
+    app.execute_editor_effect(
+        source,
+        EditorEffect::OpenPath {
+            uri: dangling.clone(),
+        },
+    )
+    .unwrap();
+    // The entry that did not open says so in its window; its Retry follows the link again.
+    let (instance, _) = app.active_native_view(wid).unwrap();
+    assert_ne!(instance, focus.0);
+    let Some(NativeApp::Recovery(recovery)) = app.native_runtime.app(instance) else {
+        panic!("the dangling entry's failure is in front");
+    };
+    assert!(matches!(
+        recovery.origin,
+        crate::native_app::RecoveryOrigin::Open { entry: true, .. }
+    ));
+    assert!(matches!(
+        &recovery.capability,
+        Some(crate::native_app::RecoveryCapability::Document { uri, .. }) if *uri == dangling
+    ));
+    let (_, failure_view) = app.active_native_view(wid).unwrap();
+    // A plain open refuses the entry's link, so no capture names it.
+    assert!(app.view_restore_descriptor(failure_view).is_none());
+    let press = |app: &mut App, view, action: &str| {
+        app.act_app(crate::app_control::ActRequest {
+            view,
+            ui_key: action.to_string(),
+            action: action.to_string(),
+            value: None,
+        })
+        .unwrap();
+    };
+    let recovery_tabs = |app: &App| {
+        app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .filter(|tab| {
+                let mut found = false;
+                tab.root.any_leaf(&mut |&view| {
+                    found = matches!(
+                        app.view_store.get(view).copied(),
+                        Some(crate::tab_model::View::Native(native))
+                            if matches!(app.native_runtime.app(native.instance), Some(NativeApp::Recovery(_)))
+                    );
+                    found
+                });
+                found
+            })
+            .count()
+    };
+    // Open Original follows the link as Retry does: still dangling, it fails again on the same tab,
+    // which still follows the entry's link.
+    press(&mut app, failure_view, "recovery/open-original");
+    assert_eq!(recovery_tabs(&app), 1);
+    let (instance, _) = app.active_native_view(wid).unwrap();
+    assert!(matches!(
+        app.native_runtime.app(instance),
+        Some(NativeApp::Recovery(recovery))
+            if matches!(recovery.origin, crate::native_app::RecoveryOrigin::Open { entry: true, .. })
+    ));
+    // Once the link's target exists, Open Original opens it, and the document takes the failure
+    // tab's place: the tab stood for the entry, the document is the link's target.
+    fs::write(path.join("missing"), "now here").unwrap();
+    let missing = crate::native_document_host::path_to_file_uri(&path.join("missing")).unwrap();
+    press(&mut app, failure_view, "recovery/open-original");
+    assert_eq!(recovery_tabs(&app), 0, "the failure tab is gone");
+    let focus = app.active_native_view(wid).unwrap();
+    assert_eq!(
+        app.document_store
+            .canonical_uri(editor_buffer(&app, focus.1).document),
+        Some(missing.as_str())
     );
-    assert_eq!(app.active_native_view(wid).unwrap(), focus);
+
+    // Retry on a second dangling entry, once its target exists, takes its tab's place too.
+    std::os::unix::fs::symlink(path.join("later"), path.join("dangling-later")).unwrap();
+    let later_link =
+        crate::native_document_host::path_to_file_uri(&path.join("dangling-later")).unwrap();
+    app.execute_editor_effect(source, EditorEffect::OpenPath { uri: later_link })
+        .unwrap();
+    assert_eq!(recovery_tabs(&app), 1);
+    let (_, failure_view) = app.active_native_view(wid).unwrap();
+    fs::write(path.join("later"), "later").unwrap();
+    let later = crate::native_document_host::path_to_file_uri(&path.join("later")).unwrap();
+    press(&mut app, failure_view, "recovery/retry");
+    assert_eq!(recovery_tabs(&app), 0, "the failure tab is gone");
+    let focus = app.active_native_view(wid).unwrap();
+    assert_eq!(
+        app.document_store
+            .canonical_uri(editor_buffer(&app, focus.1).document),
+        Some(later.as_str())
+    );
 }
 
 #[test]
@@ -1139,8 +1238,14 @@ fn directory_refresh_preserves_selection_and_does_not_steal_focus_or_reopen_a_cl
         .unwrap()
         .purpose = DocumentAdmissionPurpose::DirectoryRefresh(document);
     let superseded = worker_outcome(ticket, wid, &key);
-    app.request_document_tab_in_window(wid, AppKind::Editor, &uri)
-        .unwrap();
+    app.open_document_tab_revealing(
+        wid,
+        AppKind::Editor,
+        &uri,
+        None,
+        DocumentAdmissionPurpose::Open,
+    )
+    .unwrap();
     assert!(matches!(
         app.complete_document_admission(superseded),
         Err(DocumentAdmissionRejected::Dropped(_))
@@ -1325,7 +1430,13 @@ fn admission_completion_for_a_closed_window_is_dropped_cleanly() {
     assert_eq!(app.document_store.id_for_uri(&canonical), None);
     assert_eq!(app.native_documents.grants.id_for_uri(&canonical), None);
     assert!(matches!(
-        app.request_document_tab_in_window(WindowId(0), AppKind::Markdown, &uri),
+        app.open_document_tab_revealing(
+            WindowId(0),
+            AppKind::Markdown,
+            &uri,
+            None,
+            DocumentAdmissionPurpose::Open
+        ),
         Ok(DocumentAdmission::Opened(_))
     ));
     let _ = fs::remove_dir_all(dir);
@@ -1340,7 +1451,13 @@ fn same_file_from_another_window_is_its_own_admission_not_a_coalesce() {
     let key = admission_key(&uri, AppKind::Markdown);
     let first = app.mint_document_admission(gone, key.clone());
     let second = app
-        .request_document_tab_in_window(live, AppKind::Markdown, &uri)
+        .open_document_tab_revealing(
+            live,
+            AppKind::Markdown,
+            &uri,
+            None,
+            DocumentAdmissionPurpose::Open,
+        )
         .unwrap();
     assert!(
         matches!(second, DocumentAdmission::Opened(_)),
@@ -1365,6 +1482,7 @@ fn stale_and_failed_admissions_never_register_a_document() {
     let (dir, uri) = admission_fixture("stale", b"# stale\n");
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
+    let tabs = app.windows[&wid].tab_set.len();
     let key = admission_key(&uri, AppKind::Markdown);
     let old = app.mint_document_admission(wid, key.clone());
     let fresh = app.mint_document_admission(wid, key.clone());
@@ -1379,6 +1497,25 @@ fn stale_and_failed_admissions_never_register_a_document() {
         app.document_admission_pending(wid, &key),
         Some(fresh),
         "a stale completion leaves the live admission pending"
+    );
+    assert_eq!(
+        app.windows[&wid].tab_set.len(),
+        tabs,
+        "a stale completion shows nothing"
+    );
+    let gone = WindowId(77);
+    let closed = app.mint_document_admission(gone, key.clone());
+    let error = app
+        .complete_document_admission(worker_outcome(closed, gone, &key))
+        .unwrap_err();
+    assert!(
+        matches!(error, DocumentAdmissionRejected::Dropped(_)),
+        "{error:?}"
+    );
+    assert_eq!(
+        app.windows[&wid].tab_set.len(),
+        tabs,
+        "a closed window's completion shows nothing anywhere"
     );
 
     let failed = DocumentAdmissionOutcome {
@@ -1404,7 +1541,36 @@ fn stale_and_failed_admissions_never_register_a_document() {
     )
     .unwrap();
     assert_eq!(app.document_store.id_for_uri(&canonical), None);
-    assert!(app.active_native_view(wid).is_none());
+    // The window that asked says why, in front: a Recovery tab for the file, which asks for no
+    // attention since the person is looking at this window.
+    let (instance, _) = app
+        .active_native_view(wid)
+        .expect("the failure shows in the window that asked");
+    let Some(NativeApp::Recovery(recovery)) = app.native_runtime.app(instance) else {
+        panic!("a Recovery tab in front");
+    };
+    assert!(matches!(
+        recovery.origin,
+        crate::native_app::RecoveryOrigin::Open { entry: false, .. }
+    ));
+    assert_eq!(
+        recovery.capability,
+        Some(crate::native_app::RecoveryCapability::Document {
+            kind: AppKind::Markdown,
+            uri: uri.clone(),
+            config_editor: false,
+        })
+    );
+    assert!(
+        recovery.reason.contains("evicted from iCloud Drive")
+            && !recovery.reason.starts_with("document open failed"),
+        "{}",
+        recovery.reason
+    );
+    let tab = app.windows[&wid].tab_set.active().unwrap();
+    assert!(!tab.presentation.indicators.attention);
+    assert_eq!(tab.presentation.title, "dropped.md");
+    assert_eq!(app.windows[&wid].tab_set.len(), tabs + 1);
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -1603,7 +1769,10 @@ fn manual_open_reports_busy_held_journal_lock_and_retries_cleanly() {
         .ensure_and_open_config_editor_path_in_window(WindowId(0), &config)
         .expect_err("held journal lock must report busy");
     assert!(started.elapsed() < REFUSES_WITHOUT_BLOCKING);
-    assert!(error.contains("busy"), "{error}");
+    assert!(
+        error.contains(crate::native_document_journal::JournalFault::BUSY),
+        "{error}"
+    );
     assert!(app.active_native_view(WindowId(0)).is_none());
 
     drop(held);
@@ -3154,6 +3323,7 @@ fn an_absent_key_is_added_at_its_default_or_awaits_a_value() {
         parsed["harness"]["continue_text"].as_str(),
         Some(
             aterm_agent::supervise::SupervisorConfig::default()
+                .turn_end
                 .continue_text
                 .as_str()
         ),
@@ -4934,11 +5104,28 @@ fn an_emacs_buffer_close_waits_for_its_inflight_save_then_finishes_once() {
     };
     close(&mut app);
     assert_eq!(tabs(&app), opened);
+    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+        panic!("editor view");
+    };
+    assert!(
+        state
+            .status
+            .as_deref()
+            .is_some_and(|status| !status.is_empty())
+    );
+    assert!(
+        app.native_documents
+            .pending_closes
+            .get(&document)
+            .is_some_and(|closes| closes
+                .iter()
+                .any(|close| close.views.contains(&DocumentViewId(view.get()))))
+    );
     assert_eq!(app.document_store.view_count(document), Some(1));
-    assert!(app.document_close_pending_for_test(document));
     assert_eq!(fs::read_to_string(&path).unwrap(), "base\n");
     finish_inflight_save_for_test(&mut app, document, view, save);
     assert_eq!(tabs(&app), opened - 1, "the original key request finishes");
+    assert!(app.view_store.get(view).is_none());
     assert_eq!(app.document_store.view_count(document), Some(0));
     assert!(!app.document_close_pending_for_test(document));
     assert_eq!(fs::read_to_string(&path).unwrap(), "edit base\n");
@@ -6551,25 +6738,6 @@ fn shipping_buffer_queries_refuse_ambiguous_views_before_switch_or_kill() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// End `app` as a crash ends its process: its journal locks are gone before anyone reopens.
-/// Dropping an App only asks its journal custody worker to release; the worker settles each
-/// journal under that journal's lock afterwards, which a reopen's event-loop take must not meet.
-fn crash(mut app: App) {
-    let finished = app
-        .native_documents
-        .journals
-        .as_mut()
-        .and_then(|store| store.custody_finished_for_test());
-    drop(app);
-    if let Some(finished) = finished {
-        finished
-            .lock()
-            .unwrap()
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .expect("the crashed App's journal custody worker finished");
-    }
-}
-
 #[test]
 fn production_open_recovers_durable_draft_before_publishing_editor_view() {
     let dir = fresh_dir("aterm-app-crash-recovery");
@@ -6595,7 +6763,7 @@ fn production_open_recovers_durable_draft_before_publishing_editor_view() {
             "unsaved disk\n"
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "disk\n");
-        crash(crashed);
+        crashed.exit_for_test();
     }
 
     let mut reopened = App::headless_for_test();
@@ -6621,6 +6789,80 @@ fn production_open_recovers_durable_draft_before_publishing_editor_view() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// The crash tests' reopen never meets the lock of the App it stands in for. Dropping an
+/// App sends its journal custody worker a release that settles the draft under the draft's
+/// journal lock afterwards, at background priority; here that settle is held inside the
+/// lock, as a loaded Mac holds it, and `exit_for_test` returns only once it has let go, so
+/// the held settle has gone on by the time it returns; an exit that does not wait can return
+/// before it.
+/// NEGATIVE CONTROL: a plain drop reopens while the release holds the lock, and the open
+/// fails busy ([`InstallFailure::DRAFTS_BUSY`]), as `production_open_recovers_durable_draft_…`
+/// failed in aterm 0.201.0's qualification on 2026-11-13.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_reopen_after_the_first_app_exits_never_meets_its_release() {
+    let dir = fresh_dir("aterm-app-reopen-after-exit");
+    for exit in [false, true] {
+        let path = dir.join(format!("recover-{exit}.md"));
+        let journal_root = dir.join(format!("private-drafts-{exit}"));
+        fs::write(&path, "disk\n").unwrap();
+        let uri = file_uri(&path);
+        let mut first = App::headless_for_test();
+        first.native_documents.journals = JournalSlot::for_test(journal_root.clone());
+        first.open_document_tab(AppKind::Editor, &uri).unwrap();
+        commit(&mut first, WindowId(0), "unsaved ");
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let (went_on_tx, went_on) = std::sync::mpsc::channel::<()>();
+        first.inside_next_journal_release_for_test(move || {
+            entered_tx.send(()).unwrap();
+            let _ = go_rx.recv();
+            let _ = went_on_tx.send(());
+        });
+        let mut reopened = App::headless_for_test();
+        reopened.native_documents.journals = JournalSlot::for_test(journal_root);
+        if exit {
+            let releaser = std::thread::spawn(move || {
+                entered
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .expect("the release settled the draft");
+                go.send(()).unwrap();
+            });
+            first.exit_for_test();
+            assert_eq!(
+                went_on.try_recv(),
+                Ok(()),
+                "exit_for_test returned before the held settle went on"
+            );
+            releaser.join().unwrap();
+            reopened.open_document_tab(AppKind::Editor, &uri).unwrap();
+            let (instance, _) = reopened.active_native_view(WindowId(0)).unwrap();
+            let document = reopened.native_runtime.document_id(instance).unwrap();
+            assert_eq!(
+                reopened
+                    .document_store
+                    .snapshot(document)
+                    .unwrap()
+                    .text
+                    .as_ref(),
+                "unsaved disk\n"
+            );
+        } else {
+            drop(first);
+            entered
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the release settles the draft");
+            let refused = reopened.open_document_tab(AppKind::Editor, &uri);
+            go.send(()).unwrap();
+            let Err(why) = refused else {
+                panic!("the reopen met no held release")
+            };
+            assert_eq!(why, InstallFailure::DRAFTS_BUSY);
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// A recovered draft is where the reopened buffer's undo starts: C-/
 /// stops at it and says how to take the file's text instead, so the
 /// draft stays unsaved and journaled, and closing still asks. Typing
@@ -6637,7 +6879,7 @@ fn undo_stops_at_a_recovered_draft_and_keeps_it_unsaved() {
         crashed.native_documents.journals = JournalSlot::for_test(journal_root.clone());
         crashed.open_document_tab(AppKind::Editor, &uri).unwrap();
         commit(&mut crashed, WindowId(0), "unsaved ");
-        crash(crashed);
+        crashed.exit_for_test();
     }
     let mut reopened = App::headless_for_test();
     reopened.native_documents.journals = JournalSlot::for_test(journal_root.clone());
@@ -6684,7 +6926,7 @@ fn production_open_surfaces_disk_conflict_and_preserves_draft() {
         crashed.native_documents.journals = JournalSlot::for_test(journal_root.clone());
         crashed.open_document_tab(AppKind::Editor, &uri).unwrap();
         commit(&mut crashed, WindowId(0), "draft ");
-        crash(crashed);
+        crashed.exit_for_test();
     }
     fs::write(&path, "external\n").unwrap();
 
@@ -7093,7 +7335,7 @@ fn final_dirty_document_leaf_is_saved_before_only_that_split_leaf_detaches() {
     let recovery_count = app.closed_recovery.views.len();
     assert!(app.closed_recovery.tabs.is_empty());
     if recovery_count == 1 {
-        app.reopen_last_closed_view().unwrap();
+        app.reopen_closed_view_and_wait_for_test().unwrap();
         let (reopened_instance, reopened_view) = app.active_native_view(wid).unwrap();
         assert_ne!(reopened_view, editor_view);
         assert_ne!(reopened_instance, editor_instance);
@@ -7128,7 +7370,7 @@ fn final_dirty_document_leaf_is_saved_before_only_that_split_leaf_detaches() {
         assert!(app.closed_recovery.views.is_empty());
         assert!(app.closed_recovery.tabs.is_empty());
         assert!(
-            app.reopen_last_closed_view().is_err(),
+            app.reopen_closed_view_and_wait_for_test().is_err(),
             "the saved close is recorded once"
         );
         assert!(app.structural_invariants_ok());
@@ -7257,7 +7499,7 @@ fn final_dirty_document_leaf_is_saved_before_only_that_split_leaf_detaches() {
             && closed
             && recovery_count == 1
         {
-            app.reopen_last_closed_tab().unwrap();
+            app.reopen_closed_tab_and_wait_for_test().unwrap();
             let (reopened_instance, reopened_view) = app.active_native_view(wid).unwrap();
             assert_ne!(reopened_instance, editor_instance);
             assert_ne!(reopened_view, editor_view);
@@ -7283,7 +7525,7 @@ fn final_dirty_document_leaf_is_saved_before_only_that_split_leaf_detaches() {
             assert!(app.closed_recovery.tabs.is_empty());
             assert_eq!(app.closed_recovery.views.len(), 1);
             assert!(
-                app.reopen_last_closed_tab().is_err(),
+                app.reopen_closed_tab_and_wait_for_test().is_err(),
                 "the saved tab close is recorded once"
             );
             assert!(app.structural_invariants_ok());
@@ -7371,7 +7613,7 @@ fn a_closed_document_leaves_memory_once_no_reopen_can_bring_it_back() {
         "the closed-tab record can still reopen it"
     );
     assert!(!app.native_documents.release_due);
-    app.reopen_last_closed_tab().unwrap();
+    app.reopen_closed_tab_and_wait_for_test().unwrap();
     let (instance, _) = app.active_native_view(wid).unwrap();
     assert_eq!(app.native_runtime.document_id(instance), Some(document));
     assert!(app.editor_workspace.can_undo(document), "undo survived");

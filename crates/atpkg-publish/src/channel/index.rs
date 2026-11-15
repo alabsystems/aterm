@@ -930,7 +930,7 @@ pub fn render(plan: &Plan) -> String {
 #[derive(Clone, Debug)]
 pub struct RosterPair {
     /// Where it was found.
-    pub path: PathBuf,
+    pub source: RosterCandidate,
     /// Its exact bytes.
     pub bytes: Vec<u8>,
     /// The master's signature over them.
@@ -939,21 +939,79 @@ pub struct RosterPair {
     pub roster: aterm_update_core::Roster,
 }
 
+/// Where a roster pair may be read: a file beside its `<path>.sig`, or the signed pair the
+/// verified store under a home holds, read in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RosterCandidate {
+    /// `<path>` beside `<path>.sig`.
+    File(PathBuf),
+    /// The store's pair under this home (`aterm_secrets::client::current_public_roster`).
+    Store(PathBuf),
+}
+
+impl RosterCandidate {
+    /// How the candidate is named to a person.
+    #[must_use]
+    pub fn shown(&self, ctx: &Ctx) -> String {
+        match self {
+            Self::File(path) => ctx.shown(path),
+            Self::Store(_) => "the store's signed roster pair".to_owned(),
+        }
+    }
+
+    /// Its bytes and signature, or why they cannot be read; `Ok(None)` where nothing is there.
+    fn read(&self) -> std::result::Result<Option<(Vec<u8>, Vec<u8>)>, String> {
+        match self {
+            Self::File(path) => {
+                let mut sig_path = path.as_os_str().to_owned();
+                sig_path.push(".sig");
+                Ok(
+                    match (
+                        crate::identity::read_regular_bytes(path, MANIFEST_CAP),
+                        crate::identity::read_regular_bytes(&PathBuf::from(sig_path), MANIFEST_CAP),
+                    ) {
+                        (Ok(bytes), Ok(sig)) => Some((bytes, sig)),
+                        _ => None,
+                    },
+                )
+            }
+            #[cfg(unix)]
+            Self::Store(home) => {
+                use aterm_secrets::client::{self, PublicRosterRead};
+                match client::current_public_roster(&client::Paths::locate_for_home(home)) {
+                    Ok(PublicRosterRead::Pair(pair)) => Ok(Some((pair.roster, pair.signature))),
+                    Ok(PublicRosterRead::Absent | PublicRosterRead::Unconfigured) => Ok(None),
+                    Err(why) => Err(why.to_string()),
+                }
+            }
+            #[cfg(not(unix))]
+            Self::Store(_) => Ok(None),
+        }
+    }
+}
+
 /// The newest master-verified roster pair among `candidates` (each `<path>` beside its `<path>.sig`); the head's own pair is one, so the generation shipped is never below the head's.
 /// # Errors
 /// A refusal when no candidate verifies, or at a fork.
-pub fn newest_roster(ctx: &Ctx, candidates: &[PathBuf], log: &mut Log) -> Result<RosterPair> {
+pub fn newest_roster(
+    ctx: &Ctx,
+    candidates: &[RosterCandidate],
+    log: &mut Log,
+) -> Result<RosterPair> {
     let anchor: Vec<&str> = ctx.anchor.iter().map(String::as_str).collect();
     let mut best: Option<RosterPair> = None;
-    let mut fork: Option<PathBuf> = None;
+    let mut fork: Option<RosterCandidate> = None;
     for path in candidates {
-        let mut sig_path = path.as_os_str().to_owned();
-        sig_path.push(".sig");
-        let (Ok(bytes), Ok(sig)) = (
-            crate::identity::read_regular_bytes(path, MANIFEST_CAP),
-            crate::identity::read_regular_bytes(&PathBuf::from(sig_path), MANIFEST_CAP),
-        ) else {
-            continue;
+        let (bytes, sig) = match path.read() {
+            Ok(Some(pair)) => pair,
+            Ok(None) => continue,
+            Err(why) => {
+                return Err(Error::refused(format!(
+                    "{} cannot be read now ({why}): a newer roster it may hold is never passed \
+                     over for an older one, so run again once it reads",
+                    path.shown(ctx)
+                )));
+            }
         };
         let verdict = aterm_update_core::verify_roster(&anchor, bytes.clone(), &sig)
             .and_then(|v| aterm_update_core::Roster::parse(&v))
@@ -964,7 +1022,7 @@ pub fn newest_roster(ctx: &Ctx, candidates: &[PathBuf], log: &mut Log) -> Result
                 log.note(format!(
                     "skipped the roster pair at {}: it does not verify under the paper master, \
                      or has lapsed ({why:?})",
-                    ctx.shown(path)
+                    path.shown(ctx)
                 ));
                 continue;
             }
@@ -979,7 +1037,7 @@ pub fn newest_roster(ctx: &Ctx, candidates: &[PathBuf], log: &mut Log) -> Result
             _ => {
                 fork = None;
                 best = Some(RosterPair {
-                    path: path.clone(),
+                    source: path.clone(),
                     bytes,
                     sig,
                     roster,
@@ -994,7 +1052,7 @@ pub fn newest_roster(ctx: &Ctx, candidates: &[PathBuf], log: &mut Log) -> Result
              Never start a second roster",
             candidates
                 .iter()
-                .map(|c| ctx.shown(c))
+                .map(|c| c.shown(ctx))
                 .collect::<Vec<_>>()
                 .join(", "),
             ctx.index_slug()
@@ -1006,8 +1064,8 @@ pub fn newest_roster(ctx: &Ctx, candidates: &[PathBuf], log: &mut Log) -> Result
              paper master signed two documents at one generation. Settle which is canonical \
              before publishing anything under either",
             best.roster.roster_seq,
-            ctx.shown(&best.path),
-            ctx.shown(&other)
+            best.source.shown(ctx),
+            other.shown(ctx)
         )));
     }
     Ok(best)
@@ -1143,10 +1201,13 @@ pub fn publish_with_observer(
 
     let mut candidates = Vec::new();
     if let Some(q) = &head {
-        candidates.push(q.file(QUAD_FILES[2]));
+        candidates.push(RosterCandidate::File(q.file(QUAD_FILES[2])));
     }
-    candidates.push(ctx.repo_root.join("dist").join(QUAD_FILES[2]));
-    candidates.push(ctx.identity.roster.clone());
+    candidates.push(RosterCandidate::File(
+        ctx.repo_root.join("dist").join(QUAD_FILES[2]),
+    ));
+    candidates.push(RosterCandidate::Store(ctx.home.clone()));
+    candidates.push(RosterCandidate::File(ctx.identity.roster.clone()));
     let roster = newest_roster(ctx, &candidates, log)?;
     let signer = signer_for(ctx, &roster.roster)?;
 
@@ -1189,7 +1250,7 @@ pub fn publish_with_observer(
         "publishing as machine '{}' under roster_seq {} ({})",
         signer.record.id,
         signer.roster_seq,
-        ctx.shown(&roster.path)
+        roster.source.shown(ctx)
     ));
     log.say(format!(
         "horizon — index {valid_until}, roster {}",
@@ -1302,24 +1363,34 @@ pub(crate) fn resume_exact(
             "retained candidate differs from the native publication plan",
         ));
     }
+    let slug = ctx.index_slug();
     let live = Scratch::new("retained-live-head")?;
-    let (number, head) =
-        quad::fetch_head_with(ctx, &ctx.index_slug(), live.path(), Freshness::Ignore)?;
+    let (number, head) = quad::fetch_head_with(ctx, &slug, live.path(), Freshness::Ignore)?;
+    // The package campaign is this function's one caller: a re-run with its --state
+    // settles the attempt against the channel before any resume.
+    let settle = "Re-run publish-package with the same --state: it reports the campaign's \
+                  index done where the channel serves it, and otherwise retires this attempt \
+                  and plans afresh over the channel head";
     if number == previous.index.index_build {
         if quad_digests(&head)? != quad_digests(&previous)? {
-            return Err(Error::refused(
-                "the retained predecessor differs from the public head",
-            ));
+            return Err(Error::refused(format!(
+                "the public head {} on {slug} differs from the predecessor this retained \
+                 candidate was signed over: the channel replaced a published index. {settle}",
+                index_tag(number)
+            )));
         }
     } else if number == candidate.index.index_build {
         if quad_digests(&head)? != quad_digests(&candidate)? {
-            return Err(Error::refused(
-                "another candidate owns the retained index number",
-            ));
+            return Err(Error::refused(format!(
+                "another index holds the retained number {} on {slug}; refusing to repin over \
+                 it. {settle}",
+                index_tag(number)
+            )));
         }
     } else {
         return Err(Error::refused(format!(
-            "public head {number} supersedes or does not follow this retained attempt; refusing to repin it"
+            "public head {number} supersedes or does not follow this retained attempt; refusing \
+             to repin it. {settle}"
         )));
     }
     // Compare all public predecessor files, rather than trusting only its tag
@@ -1372,16 +1443,16 @@ fn publication_preflight(ctx: &Ctx, upload: bool) -> Result<()> {
             Ok(true) => {}
             Ok(false) => {
                 return Err(Error::refused(format!(
-                    "--upload needs the public owner's token at {} — the index and the packs it \
+                    "--upload needs the public owner's token, {} — the index and the packs it \
                      pins are published to {}",
-                    ctx.shown(&ctx.tokens.channel),
+                    ctx.shown_token(&ctx.tokens.channel),
                     ctx.accounts.public
                 )));
             }
             Err(why) => {
                 return Err(Error::refused(format!(
-                    "--upload needs the public owner's token at {}: {why}",
-                    ctx.shown(&ctx.tokens.channel),
+                    "--upload needs the public owner's token, {}: {why}",
+                    ctx.shown_token(&ctx.tokens.channel),
                 )));
             }
         }
@@ -1630,7 +1701,7 @@ fn quad_digests_at(root: &Path) -> Result<[String; 4]> {
 /// Confirm the bytes that clients can fetch, rather than a HEAD response that
 /// may disagree with GET. `new` has already passed the normal signature chain;
 /// exact equality closes this readback without repeating cryptographic checks.
-fn confirm_public_quad(ctx: &Ctx, new: &VerifiedQuad) -> Result<()> {
+pub(crate) fn confirm_public_quad(ctx: &Ctx, new: &VerifiedQuad) -> Result<()> {
     let slug = ctx.index_slug();
     let tag = index_tag(new.index.index_build);
     let scratch = Scratch::new("published-quad")?;
@@ -1665,6 +1736,63 @@ fn confirm_public_quad(ctx: &Ctx, new: &VerifiedQuad) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What the anonymous download route serves at a signed candidate's index number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Served {
+    /// All four public files equal the candidate's.
+    Exactly,
+    /// A public file holds other bytes: another index owns the number.
+    Other,
+    /// None of the four files is served.
+    Absent,
+}
+
+/// Compare what clients fetch at `candidate`'s number with its exact signed files.
+/// # Errors
+/// A download host that does not answer, or one serving only part of the candidate
+/// and nothing else: a release still uploading or a route not yet caught up.
+pub(crate) fn served(ctx: &Ctx, candidate: &VerifiedQuad) -> Result<Served> {
+    let slug = ctx.index_slug();
+    let tag = index_tag(candidate.index.index_build);
+    let scratch = Scratch::new("served-quad")?;
+    let mut absent = Vec::new();
+    for name in QUAD_FILES {
+        let path = scratch.path().join(name);
+        let cap = quad::wire_cap(name);
+        match ctx
+            .hosts
+            .channel
+            .fetch_public(&slug, &tag, name, &path, cap)
+        {
+            Probe::Present => {
+                let theirs = crate::identity::read_regular_bytes(&path, cap)
+                    .map_err(|e| Error::io(format!("read public {name}"), &e))?;
+                let ours = crate::identity::read_regular_bytes(&candidate.file(name), cap)
+                    .map_err(|e| Error::io(format!("read retained {name}"), &e))?;
+                if theirs != ours {
+                    return Ok(Served::Other);
+                }
+            }
+            Probe::Absent => absent.push(name),
+            Probe::Unknown(why) => {
+                return Err(Error::cannot_run(format!(
+                    "anonymous readback of {tag}/{name} did not complete: {why} — re-run once \
+                     the download host answers"
+                )));
+            }
+        }
+    }
+    match absent.len() {
+        0 => Ok(Served::Exactly),
+        n if n == QUAD_FILES.len() => Ok(Served::Absent),
+        _ => Err(Error::cannot_run(format!(
+            "the anonymous download route serves only part of {tag} on {slug} (no {}), each \
+             file it serves equal to this candidate's — re-run once it serves all four",
+            absent.join(", ")
+        ))),
+    }
 }
 
 /// The release notes every index release carries: what it is, first, because these tags
@@ -1723,36 +1851,51 @@ pub fn compare_and_swap(ctx: &Ctx, plan: &Plan, out: &Path, log: &mut Log) -> Re
         }
         Ok(r) => r,
     };
-    let draft_note = if existing.draft {
-        " It is an orphaned DRAFT (a publish killed between create and publish leaves one)."
-    } else {
-        ""
+    // A draft never becomes the channel head, so a re-run baselines below it,
+    // mints this number again and meets the same draft: only its removal clears it.
+    let orphan = |what: String| {
+        Error::refused(format!(
+            "{tag} exists on {slug} as an orphaned DRAFT {what} — half-created by a publish \
+             killed before it published; never clobbered or published. No client reads a \
+             draft, and it keeps index {} taken: inspect it, delete it, then re-run",
+            plan.index_build
+        ))
     };
     if !existing.assets.iter().any(|a| a == QUAD_FILES[0]) {
-        if existing.draft
-            && host
-                .complete_created(
-                    &slug,
-                    &tag,
-                    &format!("atpkg index {}", plan.index_build),
-                    &notes,
-                    &files,
-                )
-                .map_err(|error| {
-                    host_error(
-                        format!("recovering the native create intent for {tag}"),
-                        &error,
-                    )
-                })?
-        {
-            log.say(format!(
-                "{tag}: completed the original native create intent with its exact candidate"
-            ));
-            return Ok(());
+        if existing.draft {
+            // A host completes a draft only through its own create intent for these exact
+            // notes. A draft it refuses to complete for them (its journal made it for another
+            // candidate) is as orphaned for this publish as one no create intent owns.
+            return match host.complete_created(
+                &slug,
+                &tag,
+                &format!("atpkg index {}", plan.index_build),
+                &notes,
+                &files,
+            ) {
+                Ok(true) => {
+                    log.say(format!(
+                        "{tag}: completed the original native create intent with its exact \
+                         candidate"
+                    ));
+                    Ok(())
+                }
+                Ok(false) => Err(orphan(
+                    "without an index.toml, and no create intent this host holds owns it".into(),
+                )),
+                Err(HostError::Refused(why)) => Err(orphan(format!(
+                    "without an index.toml, which this host will not complete for this \
+                     candidate ({why})"
+                ))),
+                Err(error) => Err(host_error(
+                    format!("recovering the native create intent for {tag}"),
+                    &error,
+                )),
+            };
         }
         return Err(Error::refused(format!(
             "{tag} exists on {slug} without an index.toml — a release mid-upload, or \
-             half-created; never clobbered. Look at it before re-running.{draft_note}"
+             half-created; never clobbered. Look at it before re-running"
         )));
     }
     let present: Vec<&str> = QUAD_FILES
@@ -1777,10 +1920,13 @@ pub fn compare_and_swap(ctx: &Ctx, plan: &Plan, out: &Path, log: &mut Log) -> Re
         let ours = crate::identity::read_regular_bytes(&out.join(name), MANIFEST_CAP)
             .map_err(|e| Error::io(name, &e))?;
         if theirs != ours {
+            if existing.draft {
+                return Err(orphan(format!("with DIFFERENT bytes ({name})")));
+            }
             return Err(Error::refused(format!(
                 "{tag} already exists on {slug} with DIFFERENT bytes ({name}) — another \
-                 publisher took index {}; never clobbered. Re-baseline on it (publish again \
-                 over the channel head) and publish again.{draft_note}",
+                 publisher took index {}; never clobbered. Re-baseline on it: publish again, \
+                 and the new publish baselines on the channel head",
                 plan.index_build
             )));
         }

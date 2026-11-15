@@ -323,7 +323,7 @@ pub type Answer = Box<dyn Fn(&Run) -> Option<Ran> + Send + Sync>;
 /// else a default), every other run from [`FakeTools::answer`] (else exit 0, silent),
 /// `lipo -thin` writes a thin Mach-O of the asked arch, and every call is logged.
 pub struct FakeTools {
-    versions: Mutex<BTreeMap<PathBuf, String>>,
+    versions: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
     /// The `-vV` of a compiler the table does not name.
     pub default_version: Option<String>,
     /// Every other run.
@@ -357,11 +357,16 @@ impl FakeTools {
 
     /// `compiler -vV` answers `text`.
     pub fn version(&self, compiler: &Path, text: &str) {
+        self.version_bytes(compiler, text.as_bytes());
+    }
+
+    /// `compiler -vV` answers these stdout bytes, including malformed text.
+    pub fn version_bytes(&self, compiler: &Path, bytes: &[u8]) {
         let key = std::fs::canonicalize(compiler).unwrap_or_else(|_| compiler.to_path_buf());
         self.versions
             .lock()
             .expect("versions")
-            .insert(key, text.to_string());
+            .insert(key, bytes.to_vec());
     }
 
     /// Every call so far, in order (`run <program> <args…>`, `strip <file>`, …).
@@ -410,15 +415,23 @@ impl Tools for FakeTools {
         ));
         if run.argv() == ["-vV"] {
             let key = std::fs::canonicalize(&run.program).unwrap_or_else(|_| run.program.clone());
-            let text = self
+            let bytes = self
                 .versions
                 .lock()
                 .expect("versions")
                 .get(&key)
                 .cloned()
-                .or_else(|| self.default_version.clone());
-            return Ok(match text {
-                Some(t) => ran(0, &t, ""),
+                .or_else(|| {
+                    self.default_version
+                        .as_ref()
+                        .map(|text| text.as_bytes().to_vec())
+                });
+            return Ok(match bytes {
+                Some(stdout) => Ran {
+                    code: Some(0),
+                    stdout,
+                    stderr: Vec::new(),
+                },
                 None => ran(1, "", "not a compiler"),
             });
         }

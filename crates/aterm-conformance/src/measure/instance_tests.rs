@@ -99,6 +99,35 @@ fn a_spent_budget_gives_up_at_once_but_still_asks_the_probe_once() {
     assert_eq!(asked, 1);
 }
 
+/// A row's recording arm holds only where the instance reads it: the other value (a setting
+/// that fell back to the shipped default) refuses the take, and a reply with no `enabled=`
+/// has no answer, so neither passes as the arm the row names.
+#[test]
+fn a_take_records_only_where_its_temporal_status_reads_the_arm_its_row_asks() {
+    let on = "OK enabled=true keyframes=1 witnessed=0 diverged=0";
+    let off = "OK enabled=false keyframes=0";
+    assert_eq!(recording_line(true), "temporal_recording = true");
+    assert_eq!(recording_line(false), "temporal_recording = false");
+    assert_eq!(recording_reads(on, true), Ok(()));
+    assert_eq!(recording_reads(off, false), Ok(()));
+    assert!(matches!(
+        recording_reads(off, true),
+        Err(CouldNotRun::Refused(why)) if why.contains("enabled=false")
+    ));
+    assert!(matches!(
+        recording_reads(on, false),
+        Err(CouldNotRun::Refused(_))
+    ));
+    assert!(matches!(
+        recording_reads("OK keyframes=1", true),
+        Err(CouldNotRun::Unanswered(_))
+    ));
+    assert!(
+        recording_reads("OK enabled=truely", true).is_err(),
+        "a value is read whole"
+    );
+}
+
 #[test]
 fn a_live_budget_leaves_the_moment_the_event_lands() {
     let budget = Budget::from_now(60);

@@ -5,9 +5,6 @@ use super::*;
 
 fn passing() -> Evidence {
     Evidence {
-        imported: true,
-        outside_printed: true,
-        outside_said: String::new(),
         editor_opened: true,
         file_holds_values: true,
         refusals: vec![(
@@ -16,13 +13,12 @@ fn passing() -> Evidence {
                 .to_owned(),
         )],
         doc_read: "aterm-ctl: ERR refused private doc".to_owned(),
-        tab_names_editor: true,
+        tab_holds_command: true,
         tab_text_clean: true,
         blocks_hold_command: true,
         blocks_clean: true,
         log_clean: true,
         closed_ends_command: true,
-        folder_removed: true,
         after_close_clean: true,
         ax: Some(AxEvidence {
             grid_read: true,
@@ -97,24 +93,23 @@ fn a_reports_evidence_reads_back_and_carries_no_value() {
 
     let mut leaked = passing();
     leaked.refusals[0].1 = format!("{NEEDLE}01");
-    leaked.outside_said = format!("box01@proton.example {NEEDLE}01");
+    leaked.doc_read = format!("box01@lab.example {NEEDLE}01");
     let wire = evidence_json(&leaked);
     assert!(!aterm_json::to_string(&wire).unwrap().contains(NEEDLE));
     let back = evidence_from(&wire).unwrap();
     assert!(!refused_view(&back.refusals[0].1));
-    assert_eq!(judge(&back).iter().filter(|(_, held)| !*held).count(), 1);
+    assert!(!back.doc_read.contains(NEEDLE));
+    assert_eq!(judge(&back).iter().filter(|(_, held)| !*held).count(), 2);
 }
 
 /// The guest helper's reading is its strings, or no grant; anything else is no reading.
 #[test]
 fn the_helpers_reading_is_its_strings_or_no_grant() {
     assert_eq!(
-        helper_reading(
-            "{\"trusted\":true,\"texts\":[\"hidden value\",\"box01@proton.example\"]}\n"
-        ),
+        helper_reading("{\"trusted\":true,\"texts\":[\"hidden value\",\"box01@lab.example\"]}\n"),
         Some(Some(vec![
             "hidden value".to_owned(),
-            "box01@proton.example".to_owned()
+            "box01@lab.example".to_owned()
         ]))
     );
     assert_eq!(
@@ -155,7 +150,7 @@ fn the_plain_publication_is_the_instances_alone_and_only_when_asked() {
 /// The tree's three checks are judged under the names a host reads them by.
 #[test]
 fn the_trees_checks_are_named_as_judged() {
-    let names: Vec<String> = judge_tab(&passing())
+    let names: Vec<String> = judge(&passing())
         .into_iter()
         .map(|(name, _)| name)
         .collect();
@@ -182,18 +177,53 @@ fn each_verbs_refusal_reads_as_one() {
     }
 }
 
+/// The grid names each synthetic login once, its password in the concealed column.
 #[test]
-fn the_mailbox_file_names_each_synthetic_login_once() {
-    let file = mailbox_file(3);
-    assert_eq!(file.matches("[[mailboxes]]").count(), 3);
+fn the_grid_names_each_synthetic_login_once() {
+    let file = grid_file(3);
+    assert_eq!(file.lines().next(), Some("login\tpassword"));
+    assert_eq!(file.lines().count(), 4);
     assert_eq!(file.matches(NEEDLE).count(), 3);
-    assert!(file.contains("login = \"box03@proton.example\"\npassword = \"synthetic-pass-03\""));
+    assert!(file.contains("box03@lab.example\tsynthetic-pass-03\n"));
+}
+
+/// The boot tab's line opens the grid concealing its password column, and a path the rc's one
+/// quoted word cannot carry is refused.
+#[test]
+fn the_edit_line_conceals_the_password_column() {
+    assert_eq!(
+        edit_line(
+            Path::new("/b/aterm"),
+            Path::new("/w/a17.private.noindex/logins.tsv")
+        )
+        .as_deref(),
+        Some("/b/aterm edit --wait --secret=password +1 /w/a17.private.noindex/logins.tsv")
+    );
+    for (aterm, grid) in [("/b/at'erm", "/w/g.tsv"), ("/b/aterm", "/w x/g.tsv")] {
+        assert_eq!(edit_line(Path::new(aterm), Path::new(grid)), None);
+    }
+}
+
+/// The document the Editor shows is the grid only when its URI ends in the grid's folder and
+/// file.
+#[test]
+fn the_shown_document_is_the_grid_by_its_folder_and_name() {
+    let grid = Path::new("/var/w/a17.private.noindex/logins.tsv");
+    assert!(shows(
+        "file:///private/var/w/a17.private.noindex/logins.tsv",
+        grid
+    ));
+    assert!(!shows(
+        "file:///var/w/other.private.noindex/logins.tsv",
+        grid
+    ));
+    assert!(!shows("file:///var/w/a17.private.noindex/other.tsv", grid));
 }
 
 #[test]
 fn the_rc_accepts_its_line_once() {
-    let rc = zshrc("/b/aterm db emails --show-passwords");
-    assert!(rc.contains("print -z -- '/b/aterm db emails --show-passwords'"));
+    let rc = zshrc("/b/aterm edit --wait --secret=password +1 /w/g.tsv");
+    assert!(rc.contains("print -z -- '/b/aterm edit --wait --secret=password +1 /w/g.tsv'"));
     assert!(rc.contains("zle -N zle-line-init __a17_accept"));
     assert!(rc.contains("__a17_go=0; zle accept-line"));
 }

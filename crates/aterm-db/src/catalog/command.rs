@@ -128,6 +128,20 @@ pub(crate) fn run_at(
         let session = Session::from_admitted_journal(&bootstrap, journal)?;
         let directory = Directory::new(paths, bootstrap.trust());
         let mut descriptor = if command == "commons-open" {
+            // A declaration is this Mac's word that it reads the table (a roll's seal stops
+            // waiting for a Writer that declared the next generation), so the generation whose
+            // secret cells name store entries is declared by no verb of this build, as its roll
+            // (`Registry::roll`) and `Handle::publish_schema` refuse it.
+            if version == crate::alab::registry::VERSION
+                && crate::alab::registry::GENERATIONS.iter().any(|table| {
+                    table.names_store() && table.application == application && table.role == role
+                })
+            {
+                return Err(Error::new(
+                    "this build of aterm declares no table whose secret cells name secret-store \
+                     entries",
+                ));
+            }
             Descriptor::application(bootstrap.trust(), application, role, version)?
         } else {
             Descriptor::fresh(bootstrap.trust(), application, role, version)?

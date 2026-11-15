@@ -11,11 +11,6 @@ use std::time::Duration;
 
 use crate::checks::{CHECKS, Check, DEV, RELEASE, RELEASE_BUNDLE, RELEASE_TREE, Word, lookup};
 
-/// `--input-drift`: a development test run brackets each test binary's executable and declared
-/// runtime inputs, and a successful binary whose inputs changed while it ran makes the test check
-/// NOT RUN, as a release's always does. `verify land` passes it to every judgment.
-pub const INPUT_DRIFT: &str = "--input-drift";
-
 /// `--judged <commit>`: with [`SHARED`] and `--base`, a round of `verify land`
 /// ([`Args::judged`]).
 pub const JUDGED: &str = "--judged";
@@ -23,9 +18,24 @@ pub const JUDGED: &str = "--judged";
 /// `--shared <file>`: the paths a round's cone is read from ([`Args::shared`]).
 pub const SHARED: &str = "--shared";
 
-/// `--by-hand`: with [`JUDGED`] and [`SHARED`], the round's merge is not the one Git makes of
-/// the judged commit and the base ([`Args::by_hand`]).
+/// `--readers <file>`: with [`JUDGED`] and [`SHARED`], the files that may read the round's
+/// shared Markdown ([`Args::readers`]).
+pub const READERS: &str = "--readers";
+
+/// `--by-hand`: with [`JUDGED`] and [`SHARED`], the round's merge is not the one the landing
+/// makes of the judged commit and the base, Git's merge with its open-issues file merged by
+/// entry ([`Args::by_hand`]).
 pub const BY_HAND: &str = "--by-hand";
+
+/// `--events-file-only`: with `--events`, the run's events go to that file and its retained
+/// copy alone, never to its output ([`Args::events_file_only`]). `verify land` passes it to every
+/// judgment, whose console then carries what a person reads.
+pub const EVENTS_FILE_ONLY: &str = "--events-file-only";
+
+/// `--queued-since <unix ms>`: when the work this run judges was first queued
+/// ([`Args::queued_since`]). `verify land` passes its own start, so each judgment of one landing
+/// keeps the landing's place in the judgment turn's queue.
+pub const QUEUED_SINCE: &str = "--queued-since";
 
 /// What the command line asked for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -61,9 +71,18 @@ pub struct Args {
     pub judged: Option<String>,
     /// [`SHARED`]: the file that names a round's shared paths, each ended by a NUL.
     pub shared: Option<PathBuf>,
-    /// [`BY_HAND`]: the round's merge was resolved or edited by hand, so a shared path may be
-    /// a change of the base's that the merge dropped, whose file is the judged commit's own:
-    /// the paths are compared with no one tree, and no member is judged alone for one.
+    /// [`READERS`]: the file that names, each ended by a NUL, the files that may read a shared
+    /// path that is Markdown no cone holds: each is a reader of the round's change, so its
+    /// member is judged where the merge's cone holds it, with its dependents unless only its
+    /// tests, benches and examples compile the file, and main's change is judged as for a
+    /// shared path a crate owns (`crate::changed::resolve_round`). `verify land` names them
+    /// only for the landing's own merge, so never with [`Self::by_hand`].
+    pub readers: Option<PathBuf>,
+    /// [`BY_HAND`]: the round's merge is not the landing's own (it was resolved or edited by
+    /// hand, or Git made it unlike the landing's merge of the open-issues file), so a shared
+    /// path may be a change of the base's that the merge dropped, whose file is the judged
+    /// commit's own: the paths are compared with no one tree, and no member is judged alone
+    /// for one.
     pub by_hand: bool,
     pub app: Option<PathBuf>,
     /// `--fix`: `fmt` or `census` rewrites what it finds.
@@ -76,8 +95,8 @@ pub struct Args {
     pub cursor_pacing: bool,
     /// Compile selected tests or measurement benches without executing them or qualifying a release.
     pub compile_only: bool,
-    /// `--as-release`: with `test` or `doc` and `--all`, that check as `release` runs it, pulling
-    /// nothing ([`Args::wanted`]), the command a release's red row prints; with
+    /// `--as-release`: with `test` and `--all`, that check as `release` runs it, the command a
+    /// release's red row prints; with
     /// `test --all --compile-only`, what it compiles.
     pub as_release: bool,
     /// `--admit now|wait`: whether the run waits for room for the disk it will write, each stage
@@ -97,36 +116,28 @@ pub struct Args {
     /// `--timeout`: `Some(None)` is `off`; `None` keeps the default ceiling.
     pub timeout: Option<Option<Duration>>,
     pub log: Option<PathBuf>,
-    /// `--passed-binaries <path>`: with `release` and `test`, the versioned content proofs of
-    /// prior successful test binaries; only a complete matching proof is carried
-    /// ([`crate::testrun::carry`]).
-    pub passed_binaries: Option<PathBuf>,
     /// `--passed-lint-packages <path>`: prior successful per-package lint content proofs.
     pub passed_lint_packages: Option<PathBuf>,
     /// `--passed-appkit-groups <path>`: prior successful AppKit executable-group proofs.
     pub passed_appkit_groups: Option<PathBuf>,
     /// `--carry-context <sha256>`: a release's frozen verifier, seal and toolchain context for
-    /// its test, lint or AppKit run. It is part of every item content key.
+    /// its lint, AppKit and source-reader evidence. It is part of every item content key.
     pub carry_context: Option<String>,
-    /// [`INPUT_DRIFT`]: a development test run's input-drift bracket.
-    pub input_drift: bool,
+    /// [`QUEUED_SINCE`]: when the work it judges was first queued, unix ms: a heavy run's place
+    /// in the judgment turn's queue (`crate::turn`) ages from here, not from its own start.
+    pub queued_since: Option<u64>,
     /// `--events <path>`: the file each `check-finished`, `test-binary-finished` and
     /// `lint-package-finished` line is appended to whole, apart from the output its children share
     /// ([`crate::event_log`]): what a release's cutter keeps its records from, and `verify land`
     /// its judgment.
     pub events: Option<PathBuf>,
+    /// [`EVENTS_FILE_ONLY`]: no `verify-event:` line reaches the run's output or its error
+    /// stream; the events file and the copy kept beside the run's log hold every one. A release's
+    /// cutter reads them from captured output (`ship status`), so a release run never names it.
+    pub events_file_only: bool,
 }
 
 impl Args {
-    /// The checks this command runs over a selection `holds` reads: those it names and what they
-    /// pull ([`crate::checks::with_pulled`]). `release` pulls nothing, and so neither does
-    /// `--as-release`, which is one of its checks as it ran: a pulled check's verdict would answer
-    /// for something no release runs.
-    #[must_use]
-    pub fn wanted(&self, holds: impl Fn(&str) -> bool) -> Vec<Check> {
-        crate::checks::with_pulled(&self.checks, self.release || self.as_release, holds)
-    }
-
     /// Does any selected check read the selection (the cone, `-p`, `--all`)? `cells` reads `-p`
     /// alone: named with no `-p`, it judges every cell's whole graph.
     #[must_use]
@@ -139,7 +150,7 @@ impl Args {
     }
 
     /// Does this run hand its `-p` specs to this host's cargo: a check that builds its selection
-    /// here ([`Check::builds_selection`]: lint, test, doc, checkers), with `-p` and no `--all`?
+    /// here ([`Check::builds_selection`]: lint, test, checkers), with `-p` and no `--all`?
     /// Only such a run can reach cargo's resolver with a spec the host's graph lacks
     /// ([`crate::changed::foreign_specs`]); `cells` resolves each `-p` per cell, and
     /// `export-scan` reads files.
@@ -175,8 +186,8 @@ impl Usage {
 /// # Errors
 /// An unknown word or flag, a flag without its value, a value that is not one,
 /// options that contradict each other or the checks named, `--judged` without `--shared` or
-/// either without `--base`, `--by-hand` without them, `--tree`, `--bundle` or `--checks`
-/// without `release`, a `--checks` name that is no check of the release (or of the half named),
+/// either without `--base`, `--by-hand` or `--readers` without them or together, `--tree`, `--bundle` or `--checks`
+/// without `release`, `--events-file-only` without `--events` or with `release`, a `--checks` name that is no check of the release (or of the half named),
 /// `--fix` under `release`, or a release run of `measure` without `--app`, or of no `measure`
 /// with one.
 pub fn parse<I, S>(args: I) -> Result<Args, Usage>
@@ -213,6 +224,7 @@ where
             "--base" => a.base = Some(value("--base")?),
             JUDGED => a.judged = Some(value(JUDGED)?),
             SHARED => a.shared = Some(PathBuf::from(value(SHARED)?)),
+            READERS => a.readers = Some(PathBuf::from(value(READERS)?)),
             BY_HAND => a.by_hand = true,
             "--app" => a.app = Some(PathBuf::from(value("--app")?)),
             "--fix" => a.fix = true,
@@ -252,9 +264,6 @@ where
                 }
             }
             "--log" => a.log = Some(PathBuf::from(value("--log")?)),
-            "--passed-binaries" => {
-                a.passed_binaries = Some(PathBuf::from(value("--passed-binaries")?));
-            }
             "--passed-lint-packages" => {
                 a.passed_lint_packages = Some(PathBuf::from(value("--passed-lint-packages")?));
             }
@@ -262,8 +271,16 @@ where
                 a.passed_appkit_groups = Some(PathBuf::from(value("--passed-appkit-groups")?));
             }
             "--carry-context" => a.carry_context = Some(value("--carry-context")?),
-            INPUT_DRIFT => a.input_drift = true,
+            QUEUED_SINCE => {
+                let raw = value(QUEUED_SINCE)?;
+                a.queued_since = Some(raw.parse().map_err(|_| {
+                    Usage::new(format!(
+                        "{QUEUED_SINCE} takes unix milliseconds, not `{raw}`"
+                    ))
+                })?);
+            }
             "--events" => a.events = Some(PathBuf::from(value("--events")?)),
+            EVENTS_FILE_ONLY => a.events_file_only = true,
             p if p.starts_with("-p") && p.len() > 2 => a.packages.push(p[2..].to_string()),
             f if f.starts_with('-') => return usage(format!("unknown flag `{f}`")),
             w => match lookup(w) {
@@ -347,6 +364,18 @@ where
             "{BY_HAND} says how a round's merge was made; it needs {JUDGED} and {SHARED}"
         ));
     }
+    if a.readers.is_some() && a.judged.is_none() {
+        return usage(format!(
+            "{READERS} names the files that may read a round's shared Markdown; it needs \
+             {JUDGED} and {SHARED}"
+        ));
+    }
+    if a.readers.is_some() && a.by_hand {
+        return usage(format!(
+            "{READERS} and {BY_HAND} contradict each other: a merge made by hand that shares \
+             Markdown a file may read is judged in full, never by a round"
+        ));
+    }
     if a.judged.is_some() && (a.release || a.all || !a.packages.is_empty() || a.base.is_none()) {
         return usage(format!(
             "{JUDGED} and {SHARED} select a round's cone since --base; they need it, and -p, \
@@ -367,14 +396,9 @@ where
     if a.background && !(a.release && tree && !bundle) {
         return usage("--background requires release --tree".into());
     }
-    if a.as_release
-        && (!a.all
-            || a.checks.is_empty()
-            || a.checks
-                .iter()
-                .any(|c| !matches!(c, Check::Test | Check::Doc)))
+    if a.as_release && (!a.all || a.checks.is_empty() || a.checks.iter().any(|c| *c != Check::Test))
     {
-        return usage("--as-release goes with `test` or `doc`, and `--all`".into());
+        return usage("--as-release goes with `test` and `--all`".into());
     }
     if a.cursor_pacing
         && (a.release || a.compile_only || a.checks != [Check::Measure] || a.app.is_none())
@@ -402,17 +426,10 @@ where
             );
         }
     }
-    if a.passed_binaries.is_some() && !(a.release && a.checks.contains(&Check::Test)) {
-        return usage(
-            "--passed-binaries carries complete test proofs into a release's test run; run it \
-             with `release` and its test check"
-                .into(),
-        );
-    }
-    if a.input_drift && (a.release || !a.checks.contains(&Check::Test)) {
+    if a.events_file_only && (a.events.is_none() || a.release) {
         return usage(format!(
-            "{INPUT_DRIFT} brackets a development test run's inputs (a release's always are); \
-             run it with the test check and without `release`"
+            "{EVENTS_FILE_ONLY} keeps a run's events in its --events file alone; it needs \
+             --events, and a release's cutter reads them from its output, so not `release`"
         ));
     }
     if a.passed_lint_packages.is_some() && !(a.release && a.checks.contains(&Check::Lint)) {
@@ -436,8 +453,8 @@ where
                 .any(|check| matches!(check, Check::Test | Check::Lint | Check::Appkit)))
         {
             return usage(
-                "--carry-context salts release test, lint or AppKit evidence; run it with \
-                 `release` and one of those checks"
+                "--carry-context salts a release's lint, AppKit and source-reader evidence; run \
+                 it with `release` and its test, lint or appkit check"
                     .into(),
             );
         }
@@ -445,9 +462,7 @@ where
             return usage("--carry-context takes exactly 64 lowercase hex digits".into());
         }
     }
-    if (a.passed_binaries.is_some()
-        || a.passed_lint_packages.is_some()
-        || a.passed_appkit_groups.is_some())
+    if (a.passed_lint_packages.is_some() || a.passed_appkit_groups.is_some())
         && a.carry_context.is_none()
     {
         return usage("prior content proofs require --carry-context <64 lowercase hex>".into());
@@ -552,7 +567,7 @@ Run aterm's checks in place, alone or in any combination.
 
   verify                          the dev set on what changed since origin/main
   verify lint test -p aterm-grid  two checks on one crate
-  verify test --all               every crate's tests (+ wasm-smoke)
+  verify test --all               every crate's tests and doctests
   verify fmt --fix                rewrite what fmt finds unformatted
   verify census --fix             move test modules a release build reads out of line
   verify release --app <APP>      everything publication requires
@@ -570,6 +585,10 @@ Run aterm's checks in place, alone or in any combination.
                                   machine's recovery ledger, not the tree
   verify glue <in.wasm> <out-dir>
                                   a wasm module's ES module glue (`verify glue --help`)
+  verify vendor-out --into <dir> [--check]
+                                  sealed copies of alab-policy, aterm-phase and
+                                  aterm-agent-names in <dir>/vendor for another
+                                  repository to build (`verify vendor-out --help`)
   verify provision [--linux] [--check] [ROW...]
                                   the tools this checkout pins (fish, bash
                                   5.3, pwsh, binaryen, the browsers, rustup's
@@ -589,7 +608,7 @@ Run aterm's checks in place, alone or in any combination.
                                   session's worker row out of the run's set
 
 Sets:
-  dev      released-shim fmt census export-scan lint test doc (the default);
+  dev      released-shim fmt census export-scan lint test (the default);
            released-shim builds only when bootstrap inputs change; its lint brings cells,
            one cell per other OS that builds a selected crate, and one of
            this OS for a lint with debug assertions off, which shipped code
@@ -605,24 +624,27 @@ Checks:
 {checks}
 
 Options:
-  -p, --package <crate>   narrow lint/test/doc/cells to a crate (repeatable)
+  -p, --package <crate>   narrow lint/test/cells to a crate (repeatable)
       --all               the whole workspace (default: the change cone)
       --base <ref>        the cone's base (origin/main, else main; no fetch);
                           cannot combine with -p or --all, which replace the cone
-      --judged <commit> --shared <file> [--by-hand]
+      --judged <commit> --shared <file> [--readers <file> | --by-hand]
                           with --base, a round of `verify land`: the crates are
                           those of the cone since --base that the paths the
                           file names (each ended by a NUL), or the change
                           since the judged commit, reach, while each check
-                          still reads the change since --base; --by-hand: the
-                          merge was resolved or edited by hand, so no crate
-                          is judged alone for a path the file names
+                          still reads the change since --base; --readers: the
+                          files that may read the Markdown among those paths
+                          (each ended by a NUL), whose crates in that cone
+                          are judged too;
+                          --by-hand: the merge was resolved or edited by hand,
+                          so no crate is judged alone for a path the file names
       --app <APP>         the release bundle `measure` judges
       --fix               with fmt alone: rewrite the files it finds unformatted;
                           with census alone: move the test modules it finds out of line
       --cell <name>       the forge cell `cells` checks (repeatable; any cell)
       --compile-only      with test/checkers/measure: compile tests or measuring benches without executing them
-      --as-release        with test or doc and --all: as release runs them, with
+      --as-release        with test and --all: as release runs it, with
                           ATERM_SPEC_CHECKERS=1, a disposable HOME
                           holding release history, and test owes the golden frame
                           test (--compile-only: what release's test stage compiles)
@@ -669,11 +691,6 @@ Options:
       --log <path>        where the full log goes (default: a new file in
                           <target>/verify/.ubd/logs.noindex/runs.noindex; retention
                           targets 20 while preserving all running logs)
-      --passed-binaries <path>
-                          with release and test: binaries that passed
-                          before, as schema-1 content proofs; only a prior ok
-                          whose executable and complete runtime-input key match
-                          is carried, not run again
       --passed-lint-packages <path>
                           with release and lint: prior schema-1 per-package lint
                           proofs; only a prior ok with the same complete compiler
@@ -683,13 +700,15 @@ Options:
                           proofs; each current group is built and carried only when
                           its exact executable-byte key still matches
       --carry-context <sha256>
-                          a release's frozen context for test, lint or appkit;
-                          required with prior content proofs
-      --input-drift       with test, outside release: a successful test binary
-                          whose executable or declared runtime inputs changed
-                          while it ran makes the test check NOT RUN
+                          a release's frozen context for its lint, appkit and
+                          source-reader evidence; required with prior content
+                          proofs
       --events <path>     append each check-finished and test-binary-finished
-                          line there too, whole
+                          line there too, whole; with the run's land plan
+                          (run-planned, run-resealed: each check's key)
+      --events-file-only  with --events, outside release: keep every event
+                          line off the console (the file and the copy beside
+                          the log hold them; `verify status --events` reads one)
   -h, --help
 
 Exit: 0 every check that ran passed, 1 a check failed, 2 usage, 3 could not run.

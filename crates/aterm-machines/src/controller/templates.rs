@@ -15,8 +15,7 @@ schema = 1
 parallel = 8
 
 # The GitHub machine user the hosts' keys are registered with (design §7). Its token (one
-# with the admin:public_key scope) is read from keys/github_token (0600), never the login
-# keychain.
+# with the admin:public_key scope) is the vault's gh:fleet entry.
 # [github]
 # account = "your-lab-bot"
 "#;

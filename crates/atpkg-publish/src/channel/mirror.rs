@@ -752,15 +752,15 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
             Ok(true) => {}
             Ok(false) => {
                 return Err(Error::refused(format!(
-                    "publishing needs the public owner's token at {} (--dry-run plans without it)",
-                    ctx.shown(&ctx.tokens.channel)
+                    "publishing needs the public owner's token, {} (--dry-run plans without it)",
+                    ctx.shown_token(&ctx.tokens.channel)
                 )));
             }
             Err(why) => {
                 return Err(Error::refused(format!(
-                    "publishing needs the public owner's token at {}: {why} (--dry-run plans \
+                    "publishing needs the public owner's token, {}: {why} (--dry-run plans \
                      without it)",
-                    ctx.shown(&ctx.tokens.channel)
+                    ctx.shown_token(&ctx.tokens.channel)
                 )));
             }
         }

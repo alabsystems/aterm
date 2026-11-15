@@ -22,15 +22,49 @@ fn a_minted_sid_parses_and_a_chosen_name_does_not() {
         assert!(!is_minted_sid(chosen), "{chosen}");
     }
     assert!(is_minted_sid("s-0123456789abcdef0123"));
+    assert!(is_minted_sid("tqn5r6e0148"), "the `t` form reads too");
+    assert_eq!(
+        SessionId::parse("tqn5r6e0148").map(|id| id.to_string()),
+        Some("tqn5r6e0148".to_owned())
+    );
+    assert_eq!(
+        SessionId::parse("s-0123456789abcdef0123").map(|id| id.to_string()),
+        Some("s-0123456789abcdef0123".to_owned())
+    );
+    for chosen in ["s-1", "s-boss", "tqn5r6e014", "Tqn5r6e0148", "worker"] {
+        assert_eq!(SessionId::parse(chosen), None, "NEGATIVE CONTROL: {chosen}");
+    }
+    // The two crates' readers give one answer.
+    for s in [
+        "s-0123456789abcdef0123",
+        "tqn5r6e0148",
+        "s-1",
+        "tqn5r6e014u",
+        "",
+    ] {
+        assert_eq!(
+            is_minted_sid(s),
+            aterm_types::control_verbs::is_minted_sid(s),
+            "{s}"
+        );
+    }
 }
 
 #[test]
-fn session_id_generate_is_prefixed_and_minted() {
+fn session_id_generate_mints_the_t_form() {
     use std::borrow::Borrow;
 
     let a = SessionId::generate();
-    assert!(a.as_str().starts_with("s-"), "id must be s-prefixed: {a}");
-    assert_eq!(a.as_str().len(), 2 + 20, "s- plus 20 hex chars (80 bits)");
+    assert!(
+        a.as_str().starts_with('t'),
+        "a minted id is the t form: {a}"
+    );
+    assert_eq!(
+        a.as_str().len(),
+        aterm_types::tab_id::LEN,
+        "t plus 10 Crockford base32 characters (50 bits)"
+    );
+    assert!(a.tab().is_some(), "every minted ID is a tab ID: {a}");
     assert!(
         a.is_minted(),
         "generated id must satisfy is_minted_sid: {a}"
@@ -67,5 +101,35 @@ fn launch_nonce_hex_roundtrips_and_ct_eq() {
     assert_eq!(
         LaunchNonce::from_hex(&"A".repeat(32)),
         Some(LaunchNonce::from_bytes([0xaa; 16]))
+    );
+}
+
+#[test]
+fn mint_draws_again_while_taken_knows_the_id() {
+    assert!(
+        SessionId::mint(|_| false).tab().is_some(),
+        "a mint nothing refuses is a tab id"
+    );
+    // `taken` names every ID it is asked about until the fourth draw: the mint refuses the first
+    // three and returns the fourth, which is unlike each refused one.
+    let mut refused = Vec::new();
+    let sid = SessionId::mint(|id| {
+        if refused.len() < 3 {
+            refused.push(*id);
+            true
+        } else {
+            false
+        }
+    });
+    assert_eq!(refused.len(), 3);
+    let kept = sid.tab().expect("a tab id");
+    assert!(
+        refused.iter().all(|r| r.as_str() != kept.as_str()),
+        "NEGATIVE CONTROL: a taken ID is never the one minted: {sid} {refused:?}"
+    );
+    // A wrapped name that is no tab ID has none.
+    assert_eq!(
+        SessionId::new("human").tab().map(|t| t.as_str().to_owned()),
+        None
     );
 }

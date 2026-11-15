@@ -867,15 +867,13 @@ fn a_quad_missing_its_roster_moves_no_pack() {
     // The `gh` arm's token check, said outright; under agh the channel writer is asked
     // instead (`publishing_asks_the_channel_writer_under_agh`).
     let gh = rig.ctx.clone().with_host_choice(HostChoice::Gh);
-    std::fs::create_dir_all(gh.tokens.channel.parent().expect("secrets dir"))
-        .expect("mkdir secrets");
-    std::fs::write(&gh.tokens.channel, "  \n").expect("whitespace token");
+    gh.tokens.channel.put_for_tests(Some(b"  \n"));
     let blank_err = mirror::run(&gh, &[dir.display().to_string()])
         .expect_err("whitespace-only channel token refused before mirroring");
     assert!(
         blank_err
             .to_string()
-            .contains("publishing needs the public owner's token at ~/.secrets/"),
+            .contains("publishing needs the public owner's token, the vault entry "),
         "{blank_err}"
     );
     assert!(rig.host.calls().is_empty());

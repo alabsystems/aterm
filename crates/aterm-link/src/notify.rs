@@ -450,7 +450,7 @@ impl Sel {
                 let sid = parsed
                     .from
                     .as_deref()
-                    .filter(|s| s.starts_with("s-") && crate::subject::is_principal(s))
+                    .filter(|s| crate::subject::is_session_id(s))
                     .unwrap_or_default();
                 Some(Hit {
                     on: self.label(),
@@ -1375,6 +1375,9 @@ struct Notifier {
     /// A test's clock ([`Notifier::now`]).
     #[cfg(test)]
     clock: Option<Instant>,
+    /// A test's wall clock for persisted rate-window timestamps.
+    #[cfg(test)]
+    wall_clock: Option<u64>,
     /// A test's mutant: each change of the standing values replaces the line-format `standing`
     /// file whole, the write a build before the steps made ([`Notifier::put_standing`]).
     #[cfg(test)]
@@ -1462,6 +1465,8 @@ impl Notifier {
             #[cfg(test)]
             clock: None,
             #[cfg(test)]
+            wall_clock: None,
+            #[cfg(test)]
             standing_whole: false,
             #[cfg(test)]
             standing_split: false,
@@ -1479,6 +1484,14 @@ impl Notifier {
             return now;
         }
         Instant::now()
+    }
+
+    fn wall_now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(now) = self.wall_clock {
+            return now;
+        }
+        crate::now_ms()
     }
 
     /// Tell the development seams on what the last notice or tick did: the flushes
@@ -2486,7 +2499,7 @@ impl Notifier {
                 return Ok(());
             }
             None => {
-                let now = crate::now_ms();
+                let now = self.wall_now_ms();
                 if !self.has_room(now) {
                     let mark = now.max(self.suppressed_mark.saturating_add(1));
                     self.owe_verdict(

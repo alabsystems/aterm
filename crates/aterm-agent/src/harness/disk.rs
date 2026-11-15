@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use aterm_json::{Map, Value};
 
+use super::harness_mark;
 use super::truncate_bytes;
 use super::usage::rfc3339_utc;
 
@@ -1102,7 +1103,7 @@ impl Report {
             None => "unknown".to_owned(),
         };
         format!(
-            "OK schema=1 kind=disk root={} free={free} warn_below={} room={} state={} trigger={} rows={} reclaimable={} under_pressure_up_to={} idle_whole_up_to={} apply={}",
+            "OK schema=1 kind=disk root={} free={free} warn_below={} room={} state={} trigger={} rows={} reclaimable={} under_pressure_up_to={} idle_whole_up_to={} manual_apply={} automatic_grant={}",
             self.root.display(),
             human_bytes(self.warn_free_bytes),
             self.room.map_or_else(|| "unknown".to_owned(), human_bytes),
@@ -1113,6 +1114,11 @@ impl Report {
             human_bytes(self.reclaimable_under_pressure()),
             human_bytes(self.idle_whole_up_to()),
             if self.config.apply { "allowed" } else { "off" },
+            if self.config.auto_free_gib > 0 {
+                "on"
+            } else {
+                "off"
+            },
         )
     }
 
@@ -1146,6 +1152,10 @@ impl Report {
         );
         projection_fields(&mut o, self.projected.as_ref());
         o.insert("apply_allowed".to_owned(), Value::from(self.config.apply));
+        o.insert(
+            "automatic_grant".to_owned(),
+            Value::from(self.config.auto_free_gib > 0),
+        );
         o.insert(
             "reclaimable_bytes".to_owned(),
             Value::from(self.reclaimable_total()),
@@ -2380,10 +2390,67 @@ pub fn removal_row(now: i64, sid: &str, row: &Row, removed: &Removed) -> String 
         .unwrap_or_else(|_| "{\"kind\":\"removed\",\"reason\":\"unserializable\"}".to_owned())
 }
 
+/// How long a pressed tick measures who holds the disk for its report row
+/// ([`report_row_naming`]): each tick measures what was measured longest ago, so the ticks of
+/// one episode converge on every holder.
+pub const HOLDERS_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long the daily upkeep measures who holds the disk, while space is ample, so the first
+/// row of an episode already names holders.
+pub const HOLDERS_DAILY_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// One report row, for the durable record of a measurement.
 #[must_use]
 pub fn report_row(now: i64, sid: &str, rep: &Report) -> String {
+    report_row_naming(now, sid, rep, None)
+}
+
+/// [`report_row`] that also names who holds the disk: the row of a tick whose volume is below
+/// its floor or projected under it. `holders` adds `holders` (the largest
+/// [`atpkg::build_cache::holders::NAMED`], each with its `path`, `kind`, `bytes`, whether the
+/// figure is a whole measure (`complete`), how long ago it was measured and when the folder was
+/// last written), `holders_bytes` (the sum over every measured folder) and
+/// `holders_unmeasured` (folders no tick has measured yet).
+#[must_use]
+pub fn report_row_naming(
+    now: i64,
+    sid: &str,
+    rep: &Report,
+    holders: Option<&atpkg::build_cache::holders::Survey>,
+) -> String {
     let mut o = Map::new();
+    if let Some(survey) = holders {
+        let at = u64::try_from(now).unwrap_or(0);
+        let named: Vec<Value> = survey
+            .holders
+            .iter()
+            .take(atpkg::build_cache::holders::NAMED)
+            .map(|holder| {
+                let mut h = Map::new();
+                h.insert("path".to_owned(), Value::from(path_text(&holder.path)));
+                h.insert("kind".to_owned(), Value::from(holder.kind.clone()));
+                h.insert("bytes".to_owned(), Value::from(holder.bytes));
+                h.insert("complete".to_owned(), Value::from(holder.complete));
+                h.insert(
+                    "measured_s_ago".to_owned(),
+                    Value::from(at.saturating_sub(holder.measured)),
+                );
+                h.insert(
+                    "written_s_ago".to_owned(),
+                    holder
+                        .written
+                        .map_or(Value::Null, |w| Value::from(at.saturating_sub(w))),
+                );
+                Value::Object(h)
+            })
+            .collect();
+        o.insert("holders".to_owned(), Value::Array(named));
+        o.insert("holders_bytes".to_owned(), Value::from(survey.bytes()));
+        o.insert(
+            "holders_unmeasured".to_owned(),
+            Value::from(u64::try_from(survey.unmeasured).unwrap_or(u64::MAX)),
+        );
+    }
     o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
     o.insert("sid".to_owned(), Value::from(sid.to_owned()));
     o.insert("kind".to_owned(), Value::from("report".to_owned()));
@@ -2703,6 +2770,22 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
             span(idle),
             span(after)
         ),
+        Unused::Leftover {
+            idle,
+            after,
+            finished,
+        } => format!(
+            "a regenerable cache outside the shared cache (a folder carrying a signed \
+             CACHEDIR.TAG) {}; it was unwritten for {} and nothing seen in its unit was written \
+             within the sweep's wait ({}); no build held its locks and no process used its unit",
+            if finished {
+                "of a unit whose receipt says landed or delivered"
+            } else {
+                "of a unit with no receipt"
+            },
+            span(idle),
+            span(after)
+        ),
         Unused::GivenUp => "a scratch a failed provisioning run left, past macOS's \
                             first-exec assessment of what ran from it"
             .to_owned(),
@@ -2759,6 +2842,15 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
             }
         }
         Unused::Tooling { idle, .. } => format!("a tool unused {}", sweep_span(idle)),
+        Unused::Leftover { idle, finished, .. } => format!(
+            "a {} cache unwritten {}",
+            if finished {
+                "finished unit's"
+            } else {
+                "leftover"
+            },
+            sweep_span(idle)
+        ),
         Unused::GivenUp => "a failed provisioning run's scratch".to_owned(),
         Unused::Stale {
             incremental,
@@ -2916,6 +3008,7 @@ pub fn sweep_row(
         atpkg::build_cache::Unused::Refused { .. } => "kept whole",
         atpkg::build_cache::Unused::Tooling { .. } => "a pinned tool, whole",
         atpkg::build_cache::Unused::GivenUp => "a tooling scratch, whole",
+        atpkg::build_cache::Unused::Leftover { .. } => "a leftover cache, whole",
         _ => "a build cache, whole",
     };
     let mut text = format!("{what}: {}", sweep_words(why));

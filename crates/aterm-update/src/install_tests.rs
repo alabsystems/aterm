@@ -573,7 +573,7 @@ fn a_stage_withdrawn_while_it_downloaded_is_never_published() {
 
     let (s, root) = temp_staging();
     let incoming = incoming_stage(&s, 7, commit);
-    hold_artifact(&s, 7, &ready.dmg_sha256);
+    hold_artifact(&s, 7, &ready.dmg_sha256, unix_now_secs());
     let refused = publish_verified_stage(&s, &incoming, &ready);
     assert!(
         refused
@@ -1593,7 +1593,7 @@ fn a_stage_state_refusal_is_passing_and_a_verdict_is_not() {
         "{yanked}"
     );
     std::fs::remove_file(s.floor()).unwrap();
-    hold_artifact(&s, 20, &"ab".repeat(32));
+    hold_artifact(&s, 20, &"ab".repeat(32), unix_now_secs());
     let held =
         preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ)
             .unwrap_err();
@@ -2072,10 +2072,12 @@ fn expected_handoff_authority_is_exact_build_commit_and_digest() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// Hold the artifact `(build, digest)` now, as a crash-loop revert would.
-fn hold_artifact(s: &Staging, build: u64, digest: &str) {
+/// Hold the artifact `(build, digest)` from `now`, as a crash-loop revert would. A test that
+/// asks a gate about the hold at a time of its own passes that same time here: a second clock
+/// read may be a second later, and a hold that starts after the time its gate is asked at is
+/// not the hold the test wrote.
+fn hold_artifact(s: &Staging, build: u64, digest: &str, now: u64) {
     let sha = crate::hold::sha(digest).expect("a digest");
-    let now = unix_now_secs();
     crate::hold::edit(s, "test hold", |record| {
         record.set_hold(
             aterm_update_core::update_record::Failure {
@@ -2104,7 +2106,7 @@ fn every_gate_refuses_a_held_stage_until_its_hold_ends_and_an_unreadable_record_
     let now = unix_now_secs();
     let ready = publish_confirmed_stage(&s, 20, "m3", Some(now));
     let incoming = incoming_stage(&s, 20, commit);
-    hold_artifact(&s, 20, &digest);
+    hold_artifact(&s, 20, &digest, now);
 
     let held = |why: &str| why.contains("held until") && !crate::is_passing_refusal(why);
     assert!(
@@ -2139,7 +2141,7 @@ fn every_gate_refuses_a_held_stage_until_its_hold_ends_and_an_unreadable_record_
     assert_eq!(handoff_cached_pass_refusal_at(&s, 20, commit), None);
 
     // Held again, then the swap retires the held stage.
-    hold_artifact(&s, 20, &digest);
+    hold_artifact(&s, 20, &digest, now);
     assert_eq!(
         stage_admission_gates(&s, 10, &ready, None, now),
         Some(ApplyOutcome::NoUpdate)
@@ -3191,7 +3193,7 @@ fn a_supersede_moves_nothing_unless_every_precondition_holds() {
         std::fs::write(s.floor(), "revoked_machines = [\"m-revoked\"]\n").unwrap();
     };
     let held_stage = |s: &Staging, _installed: &Path, _root: &Path| {
-        hold_artifact(s, 12, &"cd".repeat(32));
+        hold_artifact(s, 12, &"cd".repeat(32), unix_now_secs());
     };
     let stale_roster = |s: &Staging, _installed: &Path, _root: &Path| {
         let mut r = Ready::read(&s.ready).unwrap();
@@ -4235,7 +4237,7 @@ fn stale_roster_of_the_stage(s: &Staging, _: &Path, _: &mut Option<aterm_uds::sp
 }
 
 fn hold_the_stage(s: &Staging, _: &Path, _: &mut Option<aterm_uds::spawnfd::Child>) {
-    hold_artifact(s, 12, &"cd".repeat(32));
+    hold_artifact(s, 12, &"cd".repeat(32), unix_now_secs());
 }
 
 fn withdraw_the_stage(s: &Staging, _: &Path, _: &mut Option<aterm_uds::spawnfd::Child>) {

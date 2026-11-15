@@ -621,6 +621,21 @@
 //! the B09 review; the `5e5` entries `-209`, `-210`, `-213` to `-216` filled
 //! three populations, about 305 MiB).
 //!
+//! **Wanted mail among the backlog, `--attach-wanted K`** (F11c, ATERM-KI-1111-9;
+//! none by default). With a backlog in the bench's process, the fill posts K
+//! notes to every session among its oldest records, 600 filler records before
+//! each (`bench_spec::WANTED_GAP`), all within the backlog's oldest fifth, so what
+//! follows them outgrows a 16 MiB resident budget at the fabric-counts lane's
+//! 100,000. The fill waits for each note to be listed before it writes the next
+//! filler, so the notes land where the layout puts them under any load, and the
+//! report names the records the log took past the newest one
+//! (`wanted_past_records`), which the fabric-counts lane holds above that budget.
+//! The live bridge delivers them and no session marks them seen, so every
+//! restart's refill reads them again, cold, the pages that hold one record by
+//! record among the filler pages it passes whole (`Tier::passing`). After each
+//! restart every session must still list each of its notes once. The bench refuses
+//! notes that do not fit that fifth, and an outside broker.
+//!
 //! **Handoff** (since `-104`). A headless instance cannot update, so the arm
 //! measures a seamless update's bridges' half on a fourth world. A successor
 //! headless instance armed with the same fabric command (the same broker, cap
@@ -1021,6 +1036,9 @@ pub(crate) struct Args {
     /// every session's refill watermark; with an outside broker, records for each population
     /// seeded into its log before it starts (`bench_spec::Spec::backlog`).
     pub backlog: Option<u32>,
+    /// Notes to every attach session among the backlog's oldest records (`--attach-wanted`,
+    /// `bench_spec::Spec::wanted`).
+    pub wanted: Option<u32>,
     /// Rows the ask world's asked table is pre-filled to (`--asked-prefill`).
     pub asked_prefill: Option<u32>,
     /// One-way notes the messaging world posts paced after its burst (`--paced-notes`).
@@ -1185,6 +1203,7 @@ impl Args {
                             })?,
                     );
                 }
+                "--attach-wanted" => a.wanted = Some(positive(flag, raw)?),
                 "--asked-prefill" => {
                     a.asked_prefill = Some(
                         raw.bytes()
@@ -1350,6 +1369,9 @@ impl Args {
         if let Some(n) = self.backlog {
             words.push(format!("backlog={n}"));
         }
+        if let Some(n) = self.wanted {
+            words.push(format!("wanted={n}"));
+        }
         if let Some(n) = self.asked_prefill {
             words.push(format!("asked_prefill={n}"));
         }
@@ -1411,6 +1433,9 @@ impl Args {
         }
         if let Some(n) = self.backlog {
             line.push_str(&format!(" --attach-backlog {n}"));
+        }
+        if let Some(n) = self.wanted {
+            line.push_str(&format!(" --attach-wanted {n}"));
         }
         if let Some(n) = self.asked_prefill {
             line.push_str(&format!(" --asked-prefill {n}"));
@@ -1567,6 +1592,22 @@ fn run_arm(
         super::publication::publish_named(out, &json)
             .map_err(|e| format!("could not write {}: {e}", out.display()))?;
         eprintln!("json written: {}", out.display());
+    }
+    // The shipped broker's starts on a seeded log, clean and after a SIGKILL, held to C27: a
+    // count, judged once the entry that carries it is written.
+    let ceiling = super::fabric_open_peak::C27_BYTES;
+    match super::fabric_open_peak::judge(&report, ceiling) {
+        Ok(verdict) => {
+            if let Some(line) = verdict.line(ceiling) {
+                eprintln!("{line}");
+            }
+        }
+        Err(why) => {
+            return Err(Halt::Fail(format!(
+                "{why} (ledger entry {} kept)",
+                md_path.display()
+            )));
+        }
     }
     Ok(md_path)
 }

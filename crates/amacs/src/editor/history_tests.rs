@@ -1376,3 +1376,188 @@ mod conformance {
         }
     }
 }
+
+#[test]
+fn worker_prepared_recovery_adopts_boundedly_and_retains_undo_floor() {
+    for repeats in [1, 131_072] {
+        let pool = crate::prepared::tests::TestPool::start(1);
+        let reservation = pool.reserve();
+        let (base, recovery, worker_work) = std::thread::spawn(move || {
+            crate::store::take_preparation_work();
+            let base = crate::store::PreparedText::prepare_reserved(
+                std::sync::Arc::new("é old\n".repeat(repeats)),
+                None,
+                reservation,
+            );
+            let recovered = "新 draft\n".repeat(repeats);
+            let recovery = PreparedRecovery::new(&base, &recovered).unwrap().unwrap();
+            (base, recovery, crate::store::take_preparation_work())
+        })
+        .join()
+        .unwrap();
+        eprintln!("recovery-work repeats={repeats} worker={worker_work:?}");
+        assert!(worker_work.diff_input_bytes > 0);
+        assert!(worker_work.inverse_bytes > 0);
+        let mut store = DocumentStore::for_test();
+        let document = store.open_prepared("mem://recovery".into(), base).unwrap();
+        let disk = store.snapshot(document).unwrap();
+        let mut workspace = EditorWorkspace::new();
+        crate::store::take_preparation_work();
+        workspace
+            .adopt_recovery(&mut store, document, disk.seq, recovery)
+            .unwrap();
+        assert_eq!(
+            crate::store::take_preparation_work(),
+            crate::store::PreparationWork {
+                adoptions: 1,
+                retirement_transfers: 1,
+                ..Default::default()
+            }
+        );
+        let prepared_frames = workspace.frame_probe(document);
+        let prepared_inverse = workspace
+            .histories
+            .get(&document)
+            .unwrap()
+            .undo
+            .back()
+            .unwrap()
+            .inverse
+            .clone();
+        assert_eq!(store.checkpoint_seq(document), Some(disk.seq));
+        assert_eq!(text(&store, document), "新 draft\n".repeat(repeats));
+        let mut view = workspace
+            .attach(&mut store, document, crate::store::DocumentViewId(1))
+            .unwrap();
+        assert_eq!(
+            workspace.execute(&mut store, &mut view, EditorCommand::Undo),
+            Err(EditorError::UndoRefused {
+                why: RECOVERED_FLOOR.into()
+            })
+        );
+        workspace.insert_text(&mut store, &mut view, "x").unwrap();
+        workspace
+            .execute(&mut store, &mut view, EditorCommand::Undo)
+            .unwrap();
+        assert_eq!(text(&store, document), "新 draft\n".repeat(repeats));
+        assert!(!workspace.can_undo(document));
+        let mut old_store = DocumentStore::for_test();
+        let old_document =
+            old_store.open("mem://ui-replay-control".into(), "é old\n".repeat(repeats));
+        let mut old_workspace = EditorWorkspace::new();
+        let base = old_store.snapshot(old_document).unwrap().seq;
+        crate::store::take_preparation_work();
+        old_workspace
+            .replace_text(
+                &mut old_store,
+                old_document,
+                base,
+                &"新 draft\n".repeat(repeats),
+                Origin::Recovered,
+            )
+            .unwrap();
+        let control = crate::store::take_preparation_work();
+        eprintln!("recovery-ui-replay-negative repeats={repeats} ui={control:?}");
+        assert!(control.projection_input_bytes > 0);
+        assert!(control.rope_leaf_input_bytes > 0);
+        assert!(control.diff_input_bytes > 0);
+        assert!(control.inverse_bytes > 0);
+        assert_eq!(old_workspace.frame_probe(old_document), prepared_frames);
+        assert_eq!(
+            old_workspace
+                .histories
+                .get(&old_document)
+                .unwrap()
+                .undo
+                .back()
+                .unwrap()
+                .inverse,
+            prepared_inverse
+        );
+    }
+}
+
+#[test]
+fn prepared_recovery_refuses_newer_or_unrelated_base_without_losing_history() {
+    let prepared = crate::store::PreparedText::new("disk".into());
+    let recovery = PreparedRecovery::new(&prepared, "draft").unwrap().unwrap();
+    let mut store = DocumentStore::for_test();
+    let document = store
+        .open_prepared("mem://stale".into(), prepared.clone())
+        .unwrap();
+    let base = store.snapshot(document).unwrap();
+    store.replace_text(document, base.seq, "live");
+    let mut workspace = EditorWorkspace::new();
+    assert!(
+        workspace
+            .adopt_recovery(&mut store, document, base.seq, recovery)
+            .is_err()
+    );
+    assert_eq!(text(&store, document), "live");
+    let recovery = PreparedRecovery::new(&prepared, "draft").unwrap().unwrap();
+    let other = store.open("mem://unrelated".into(), "disk".into());
+    let head = seq(&store, other);
+    assert!(
+        workspace
+            .adopt_recovery(&mut store, other, head, recovery)
+            .is_err()
+    );
+    assert_eq!(text(&store, other), "disk");
+}
+
+#[test]
+fn unused_recovered_storage_and_history_retire_after_refusal_and_cancellation() {
+    use crate::store::{PreparedText, take_preparation_work};
+    fn released(receipt: &crate::store::RetirementReceipt) -> crate::store::RetirementObservation {
+        receipt.wait()
+    }
+    for refuse in [false, true] {
+        let pool = crate::prepared::tests::TestPool::start(1);
+        let reservation = pool.reserve();
+        let (base, recovery) = std::thread::spawn(move || {
+            let base = PreparedText::prepare_reserved(
+                std::sync::Arc::new("old é\n".repeat(65_536)),
+                None,
+                reservation,
+            );
+            let recovery = PreparedRecovery::new(&base, &"new 新\n".repeat(65_536))
+                .unwrap()
+                .unwrap();
+            (base, recovery)
+        })
+        .join()
+        .unwrap();
+        let (text_receipt, history_receipt) = recovery.retirement_receipts();
+        let mut store = DocumentStore::for_test();
+        let document = store
+            .open_prepared("mem://retire-recovery".into(), base)
+            .unwrap();
+        let disk = store.snapshot(document).unwrap();
+        let mut workspace = EditorWorkspace::new();
+        if refuse {
+            store.replace_text(document, disk.seq, "newer live edit");
+        }
+        take_preparation_work();
+        let outcome = workspace.adopt_recovery(&mut store, document, disk.seq, recovery);
+        assert_eq!(outcome.is_err(), refuse);
+        if !refuse {
+            store.remove_if_unattached(document).unwrap();
+            workspace.forget(document);
+        }
+        let ui = take_preparation_work();
+        assert_eq!(ui.retired_rope_nodes, 0);
+        assert_eq!(ui.retired_history_edits, 0);
+        assert_eq!(ui.projection_input_bytes, 0);
+        assert_eq!(ui.rope_input_bytes, 0);
+        assert!(ui.retirement_transfers <= 3);
+        let text_release = released(&text_receipt);
+        let history = released(&history_receipt);
+        assert_eq!(text_release.executor, 1);
+        assert_eq!(history.executor, 1);
+        assert!(text_release.work.retired_rope_nodes > 0);
+        assert!(history.work.retired_history_edits > 0);
+        if refuse {
+            assert_eq!(text(&store, document), "newer live edit");
+        }
+    }
+}

@@ -62,6 +62,7 @@ impl Reason {
                 Short::Turn { .. } | Short::Ledger(_) => "ledger",
                 Short::Disk { .. } => "disk",
                 Short::Release => "preemption",
+                Short::Heavy { .. } => "turn",
                 _ => "admission",
             })
             .collect();

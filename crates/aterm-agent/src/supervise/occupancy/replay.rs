@@ -10,7 +10,7 @@ use super::ring::RingRow;
 use super::rules::{self, Books, Guards, HoldSeen, RuleId, Verdict, WakeSight};
 use super::said::{SaidVerdict, clock_words};
 use crate::supervise::Guard;
-use crate::supervise::config::Autopilot;
+use alab_policy::config::Autopilot;
 
 /// One hold as the ledger's rows tell it, unix ms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

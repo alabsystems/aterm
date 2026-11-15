@@ -24,7 +24,7 @@ const PUBLIC_ROSTER_NAMES: [&str; 2] = crate::entry_class::PUBLIC_ROSTER;
 
 /// Public release-roster bytes observed together in the authenticated, locally applied vault.
 /// The caller must verify the release master signature and apply its roster authority policy.
-/// This observation does not establish ownership of any materialized file.
+/// It reads no file under the home.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PublicRosterPair {
     /// Opaque canonical roster bytes; release-master verification remains the caller's job.
@@ -137,7 +137,7 @@ std::thread_local! {
 }
 
 /// Authenticated local vault version for a named entry, even when that entry
-/// is absent or not safely materialized. Carries no secret commitment.
+/// is absent or its anchor set does not resolve. Carries no secret commitment.
 #[derive(Clone)]
 pub struct EntryVersion {
     name: String,
@@ -259,14 +259,14 @@ impl EntryVersion {
     }
 }
 
-/// A verified vault version and optional matching materialized entry. Absence
+/// A verified vault version and optional verified entry. Absence
 /// does not authorize use, but its version can retain an observed revocation.
 pub struct EntryObservation {
     pub version: EntryVersion,
     pub entry: Option<VerifiedEntry>,
 }
 
-/// One exact authenticated entry, including its audience and materialization
+/// One exact authenticated entry, including its audience and put-if-absent
 /// policy. The private commitment is not a public identifier or a generation
 /// counter. It must not be exported: weak secrets may be guessed from hashes.
 /// This is not a revocation ledger or proof of uninterrupted membership.
@@ -290,8 +290,8 @@ impl std::fmt::Debug for EntrySnapshot {
     }
 }
 
-/// Owned materialized bytes that matched an entry in the verified, locally
-/// applied encrypted vault. This does not prove the provider accepts them.
+/// Owned bytes of an entry, read in place from the verified, locally applied
+/// encrypted vault. This does not prove the provider accepts them.
 pub struct VerifiedEntry {
     value: SecretBytes,
     snapshot: EntrySnapshot,
@@ -355,14 +355,14 @@ impl EntrySnapshot {
 
     /// Read again only while this exact entry and configured trust context still
     /// hold. An unrelated vault update may pass; a changed value, audience,
-    /// materialization policy or source may not. Rejects rollback below the
+    /// put-if-absent policy or source may not. Rejects rollback below the
     /// observed sequence and a different envelope at the same sequence. This
     /// does not establish global freshness. The lock is released on return;
     /// this is an observation, not a lease across subsequent effects.
     /// Retain the returned snapshot to advance the observation floor; this
     /// immutable snapshot keeps the floor it originally observed.
     /// # Errors
-    /// Local state, the signed cache or the entry file cannot be safely read.
+    /// Local state or the signed cache cannot be safely read.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -412,7 +412,7 @@ impl EntrySnapshot {
         )
     )]
     pub fn read(&self, paths: &Paths) -> crate::Result<Option<VerifiedEntry>> {
-        self.read_as(paths, Reading::Materialized)
+        self.read_as(paths, Reading::Ordinary)
     }
 
     pub(super) fn read_publication(&self, paths: &Paths) -> crate::Result<Option<VerifiedEntry>> {
@@ -428,13 +428,13 @@ impl EntrySnapshot {
 
 /// Read an ordinary entry under a signed vault's shared state lock. The current
 /// configuration must match the independently observed `expected` configuration.
-/// A busy, unsigned, revoked, partial or mismatched state returns no entry. Neither
-/// a manifest name nor a self-consistent edited file/manifest establishes trust:
-/// the recipient's decrypted signed entry must match the actual file bytes.
-/// This creates no state, fetches no source and grants no application authority.
+/// A busy, unsigned, revoked, partial or mismatched state, or an anchor chain that does not
+/// resolve in the view, returns no entry. The value is the recipient's decrypted signed entry,
+/// read in place: no file under the home is opened, so neither a file nor the manifest can
+/// supply or block it. This creates no state, fetches no source and grants no application
+/// authority.
 /// # Errors
-/// The name is invalid/reserved, local state is unreadable, decryption fails or
-/// the file cannot be safely opened as a bounded, private regular file.
+/// The name is invalid/reserved, local state is unreadable or decryption fails.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -447,15 +447,7 @@ impl EntrySnapshot {
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "DbVerifiedEntry",
-        action = "LocalEdit",
-        project = "aterm_secrets::client::entry::tests::entry_transition"
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "DbVerifiedEntry",
-        action = "ForgedManifest",
+        action = "FileIgnored",
         project = "aterm_secrets::client::entry::tests::entry_transition"
     )
 )]
@@ -511,22 +503,6 @@ impl EntrySnapshot {
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "DbVerifiedEntry",
-        action = "ParentLink",
-        project = "aterm_secrets::client::entry::tests::entry_transition"
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "DbVerifiedEntry",
-        action = "Missing",
-        project = "aterm_secrets::client::entry::tests::entry_transition"
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "DbVerifiedEntry",
         action = "Reserved",
         project = "aterm_secrets::client::entry::tests::entry_transition"
     )
@@ -535,7 +511,7 @@ impl EntrySnapshot {
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "DbVerifiedEntry",
-        action = "ClaudeTokenMaterialized",
+        action = "ClaudeTokenOrdinary",
         project = "aterm_secrets::client::entry::tests::entry_transition"
     )
 )]
@@ -548,15 +524,107 @@ pub fn read_verified_entry(
     if name == crate::mailbox_component::SOURCE_ENTRY {
         MAILBOX_READS.with(|reads| reads.set(reads.get() + 1));
     }
-    let value = read_entry(paths, expected, name, Reading::Materialized)?.map(|(entry, _)| entry);
+    let value = read_entry(paths, expected, name, Reading::Ordinary)?.map(|(entry, _)| entry);
     if let Some(value) = &value {
         let _ = super::mailbox_index::record_verified(paths, value);
     }
     Ok(value)
 }
 
+/// [`read_verified_entry`], waiting until `deadline` while a writer holds this Mac's vault state.
+/// A store still busy then is an error, never an absent entry, so a caller does not take a sync
+/// in progress for a missing value.
+///
+/// # Errors
+/// As [`read_verified_entry`], or the vault state stayed busy until `deadline`.
+pub fn read_verified_entry_until(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+    deadline: Instant,
+) -> crate::Result<Option<VerifiedEntry>> {
+    validate_reading(name, Reading::Ordinary)?;
+    if expected.signer.is_none() {
+        return Ok(None);
+    }
+    match StateLock::observe_classified_until(paths, deadline)? {
+        StateObservation::Held(observation) => Ok(read_entry_with_version_held(
+            paths,
+            expected,
+            name,
+            Reading::Ordinary,
+            &mut None,
+            &observation,
+        )?
+        .map(|(entry, _)| entry)),
+        StateObservation::Absent => Ok(None),
+        StateObservation::Busy => Err(Error::new(
+            "this Mac's vault state stayed busy; run the command again",
+        )),
+    }
+}
+
+/// Read every entry of `names` from one verified view, in place, or none of them: an entry set
+/// that only works together (the release identity, a Developer ID pair) is never read across two
+/// versions (DESIGN-secrets §4, "Read together"). `None` where any name is absent, an anchored
+/// member's chain does not resolve in that view, or the reads saw different versions. A writer
+/// holding this Mac's vault state is waited for, with a minute hang detector.
+///
+/// # Errors
+/// A name is invalid or reserved, local state cannot be read, or the vault state stayed busy
+/// past that wait: a sync in progress is never taken for an absent set.
+pub fn read_verified_set(
+    paths: &Paths,
+    expected: &Config,
+    names: &[&str],
+) -> crate::Result<Option<Vec<VerifiedEntry>>> {
+    for name in names {
+        validate_reading(name, Reading::Ordinary)?;
+    }
+    if expected.signer.is_none() {
+        return Ok(None);
+    }
+    let observation =
+        match StateLock::observe_classified_until(paths, Instant::now() + PUBLIC_ROSTER_WAIT)? {
+            StateObservation::Held(observation) => observation,
+            StateObservation::Absent => return Ok(None),
+            StateObservation::Busy => {
+                return Err(Error::new(
+                    "this Mac's vault state stayed busy; run the command again",
+                ));
+            }
+        };
+    let mut first: Option<EntryVersion> = None;
+    let mut read = Vec::with_capacity(names.len());
+    for name in names {
+        let mut version = None;
+        let Some((entry, _)) = read_entry_with_version_held(
+            paths,
+            expected,
+            name,
+            Reading::Ordinary,
+            &mut version,
+            &observation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(version) = version else {
+            return Ok(None);
+        };
+        if let Some(first) = &first
+            && first.vault != version.vault
+        {
+            return Ok(None);
+        }
+        first.get_or_insert(version);
+        read.push(entry);
+    }
+    Ok(Some(read))
+}
+
 /// Read the authenticated vault version even if the named entry is absent or
-/// its materialized file does not match. Untrusted/unavailable vault state has
+/// its anchor set does not resolve. Untrusted/unavailable vault state has
 /// no version. Callers must retain the version before interpreting `entry`.
 /// # Errors
 /// The local source or entry cannot be safely read.
@@ -566,32 +634,52 @@ pub fn observe_verified_entry(
     name: &str,
 ) -> crate::Result<Option<EntryObservation>> {
     let mut version = None;
-    let entry =
-        read_entry_with_version(paths, expected, name, Reading::Materialized, &mut version)?;
+    let entry = read_entry_with_version(paths, expected, name, Reading::Ordinary, &mut version)?;
     Ok(version.map(|version| EntryObservation {
         version,
         entry: entry.map(|(entry, _)| entry),
     }))
 }
 
-/// Read existing signing bytes only when they equal the currently authorized vault entry.
-/// Unlike the general reader, an untracked file may supply these bytes without transferring
-/// its ownership to the vault. Any anchors must still be current vault-owned files.
-/// No file or manifest is changed.
+/// THE NAMES THIS MAC'S VERIFIED VIEW HOLDS, value-free: every entry of the authenticated
+/// recipient view an ordinary read may return (no control record and no Claude Code token, which
+/// only their typed reads see), sorted. The values are decrypted in memory to authenticate the
+/// view and dropped; none is returned, written or logged. A writer holding the vault state is
+/// waited for, with a minute hang detector. `None` where the view is not authenticated now (not a
+/// member, a pending or denied view, a writer still holding the state past that wait), which says
+/// nothing of what the vault holds.
+///
 /// # Errors
-/// The name is outside the signing directory, or the existing authenticated entry or private
-/// file cannot be safely read.
-pub(super) fn read_signing_material(
-    paths: &Paths,
-    expected: &Config,
-    name: &str,
-) -> crate::Result<Option<SecretBytes>> {
-    Ok(read_entry(paths, expected, name, Reading::SigningMaterial)?.map(|(entry, _)| entry.value))
+/// Local state cannot be read.
+pub(crate) fn held_names(paths: &Paths, expected: &Config) -> crate::Result<Option<Vec<String>>> {
+    if expected.signer.is_none() {
+        return Ok(None);
+    }
+    let Some(observation) = StateLock::observe_until(paths, Instant::now() + PUBLIC_ROSTER_WAIT)?
+    else {
+        return Ok(None);
+    };
+    let Some(view) = view::read(paths, expected, view::Request::View, &observation)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        view.entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .filter(|name| {
+                validate_reading(name, Reading::Ordinary).is_ok()
+                    && !crate::entry_class::claude_token(&name.to_ascii_lowercase())
+            })
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+    ))
 }
 
-/// Exact authenticated publication-token bytes, without claiming an existing file.
-/// This exception is private to the explicit release probe; ordinary entry reads retain
-/// their manifest requirement. Its snapshot must use the same narrow mode on revalidation.
+/// Exact authenticated publication-token bytes, read in place. The reading is narrowed to the
+/// two GitHub token names for the explicit release probe; its snapshot uses the same narrow
+/// mode on revalidation.
 pub(super) fn read_publication_material(
     paths: &Paths,
     expected: &Config,
@@ -735,8 +823,7 @@ pub(crate) fn read_claude_token_until(
 
 #[derive(Clone, Copy)]
 enum Reading {
-    Materialized,
-    SigningMaterial,
+    Ordinary,
     PublicationMaterial,
     Reserved,
     ReservedAndAdmin,
@@ -794,21 +881,27 @@ fn read_entry_with_version(
     read_entry_with_version_held(paths, expected, name, reading, version, &_observation)
 }
 
+/// Whether `name` is set apart (DESIGN-secrets §4): an AI CLI's login file, a home path aterm does
+/// not name, another spelling of a held or consumed name, or a name in the Claude Code token
+/// namespace outside its grammar. Every read refuses it, whatever a vault an older build wrote
+/// holds.
+fn set_apart(name: &str) -> bool {
+    matches!(
+        crate::entry_class::of(name),
+        crate::entry_class::EntryClass::SetApart(_)
+    )
+}
+
 fn validate_reading(name: &str, reading: Reading) -> crate::Result<()> {
-    let materialized = matches!(
-        reading,
-        Reading::Materialized | Reading::SigningMaterial | Reading::PublicationMaterial
-    );
+    let ordinary = matches!(reading, Reading::Ordinary | Reading::PublicationMaterial);
     let valid = if matches!(reading, Reading::PublicRoster) {
         PUBLIC_ROSTER_NAMES.contains(&name)
     } else if matches!(reading, Reading::ClaudeToken) {
         crate::entry_class::claude_token(name)
-    } else if matches!(reading, Reading::SigningMaterial) {
-        text::valid_entry_name(name) && crate::entry_class::signing_material(name)
     } else if matches!(reading, Reading::PublicationMaterial) {
         name == crate::entry_class::DEV_GH_TOKEN || name == crate::entry_class::RELEASE_GH_TOKEN
-    } else if materialized {
-        text::valid_entry_name(name) && !crate::reserved_name(name)
+    } else if ordinary {
+        text::valid_entry_name(name) && !crate::reserved_name(name) && !set_apart(name)
     } else {
         text::valid_entry_name(name)
             && name.starts_with("aterm-")
@@ -913,7 +1006,7 @@ fn read_entry_held(
     )
 }
 
-/// Retain authenticated presence independently of materialization success.
+/// Retain authenticated presence beside the entry read.
 fn read_entry_held_observing(
     paths: &Paths,
     expected: &Config,
@@ -926,12 +1019,8 @@ fn read_entry_held_observing(
     if matches!(reading, Reading::ClaudeToken) != crate::entry_class::claude_token(name) {
         return Err(Error::new("invalid or reserved secret entry name"));
     }
-    let materialized = matches!(
-        reading,
-        Reading::Materialized | Reading::SigningMaterial | Reading::PublicationMaterial
-    );
+    let ordinary = matches!(reading, Reading::Ordinary | Reading::PublicationMaterial);
     let Some(view::View {
-        state,
         entries,
         version: context,
         is_admin,
@@ -955,7 +1044,7 @@ fn read_entry_held_observing(
             "canonical public roster entry has a host-specific audience",
         ));
     }
-    if !materialized
+    if !ordinary
         && !matches!(reading, Reading::PublicRoster)
         && entry.is_some_and(|entry| entry.if_absent || entry.anchor.is_some())
     {
@@ -969,25 +1058,20 @@ fn read_entry_held_observing(
     };
     let source = provenance::Source::selected(selected_log, trusted_log.as_ref(), entry)?;
     *trusted = trusted_log;
-    let (value, admin) = if materialized {
-        let untracked = matches!(
-            reading,
-            Reading::SigningMaterial | Reading::PublicationMaterial
-        );
-        let strict = matches!(reading, Reading::PublicationMaterial);
-        if untracked
-            && !state.manifest.files.contains_key(name)
-            && !material_anchors_current(paths, &state, &entries, entry, strict)?
-        {
-            return Ok(None);
-        }
-        let Some(value) = materialized_value(paths, &state, entry, !untracked, strict)? else {
-            return Ok(None);
-        };
-        (value, false)
-    } else {
-        (entry.value.clone(), is_admin)
-    };
+    // Every reading takes the value in place from the verified view; no file under the home is
+    // read (DESIGN-secrets §7). An anchored entry is read only where its whole anchor chain
+    // resolves to put-if-absent entries of this same view, so a set is read from one version.
+    if ordinary && entry.anchor.is_some() && !anchors_resolve(&entries, entry) {
+        return Ok(None);
+    }
+    // Two names that fold alike are one name (DESIGN-secrets §4): neither spelling reads.
+    if ordinary
+        && crate::entry_class::folded_pairs(entries.iter().map(|entry| entry.name.as_str()))
+            .contains_key(name)
+    {
+        return Ok(None);
+    }
+    let (value, admin) = (entry.value.clone(), !ordinary && is_admin);
     Ok(Some((
         VerifiedEntry {
             value,
@@ -1026,101 +1110,40 @@ pub(super) fn public_state_stamp(config: &Config, state: &State, recipient: Reci
     digest.finalize()
 }
 
-fn material_anchors_current(
-    paths: &Paths,
-    state: &State,
-    entries: &[Entry],
-    entry: &Entry,
-    strict: bool,
-) -> crate::Result<bool> {
-    let mut seen = BTreeSet::new();
+/// Whether `entry`'s anchor chain resolves within `entries`, one view: each anchor it names is
+/// present and put-if-absent. A chain that comes back to a name already walked is a complete set
+/// (the release ring's three files, a Developer ID pair, the public roster pair are published as
+/// such cycles, DESIGN-secrets §4) and resolves; an anchor naming an absent or ordinary entry
+/// does not.
+fn anchors_resolve(entries: &[Entry], entry: &Entry) -> bool {
+    let mut seen = BTreeSet::from([entry.name.as_str()]);
     let mut anchor = entry.anchor.as_deref();
     while let Some(name) = anchor {
         if !seen.insert(name) {
-            return Ok(false);
+            return true;
+        }
+        #[cfg(test)]
+        if HIDDEN_ANCHOR.with_borrow(|hidden| hidden.as_deref() == Some(name)) {
+            return false;
         }
         let Some(entry) = entries.iter().find(|entry| entry.name == name) else {
-            return Ok(false);
+            return false;
         };
-        if !entry.if_absent || materialized_value(paths, state, entry, true, strict)?.is_none() {
-            return Ok(false);
+        if !entry.if_absent {
+            return false;
         }
         anchor = entry.anchor.as_deref();
     }
-    Ok(true)
+    true
 }
 
-fn materialized_value(
-    paths: &Paths,
-    state: &State,
-    entry: &Entry,
-    require_tracked: bool,
-    strict: bool,
-) -> crate::Result<Option<SecretBytes>> {
-    let digest = materialize::digest_hex(entry.value.as_slice());
-    let tracked = state.manifest.files.get(&entry.name);
-    if tracked.is_some_and(|held| held != &digest) || (require_tracked && tracked.is_none()) {
-        return Ok(None);
-    }
-    let path = materialize::target_path(&paths.home, &entry.name)?;
-    // Refuse observed parent links too. A concurrent path replacement cannot substitute
-    // returned bytes: the opened file is compared with the signed plaintext below.
-    // This does not claim a path lease against other writers.
-    let mut parent = path.parent();
-    loop {
-        let Some(directory) = parent.filter(|directory| directory.starts_with(&paths.home)) else {
-            return Ok(None);
-        };
-        if fsx::kind(directory)? != fsx::Kind::Dir {
-            return Ok(None);
-        }
-        if directory == paths.home {
-            break;
-        }
-        parent = directory.parent();
-    }
-    let Some(value) = (if strict {
-        read_single_private(&path)?
-    } else {
-        fsx::read_private(&path, text::MAX_VALUE)?
-    }) else {
-        return Ok(None);
-    };
-    if !aterm_digest::ct_eq(value.as_slice(), entry.value.as_slice()) {
-        return Ok(None);
-    }
-    Ok(Some(value))
-}
-
-fn read_single_private(path: &Path) -> crate::Result<Option<SecretBytes>> {
-    use std::io::Read as _;
-    use std::os::unix::fs::MetadataExt as _;
-    let dir = path
-        .parent()
-        .ok_or_else(|| Error::new("publication material has no parent"))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::new("publication material has an invalid name"))?;
-    let (file, metadata) = match aterm_uds::private_file::open_private(dir, name) {
-        Ok(opened) => opened,
-        Err(aterm_uds::private_file::PrivateFileError::Missing) => return Ok(None),
-        Err(_) => {
-            return Err(Error::new(
-                "publication material is not a private owned file",
-            ));
-        }
-    };
-    if metadata.nlink() != 1 || metadata.len() > text::MAX_VALUE as u64 {
-        return Err(Error::new("publication material has unsafe links or size"));
-    }
-    let mut bytes = crate::fsx::read_buffer(metadata.len(), text::MAX_VALUE);
-    crate::secret::read_to_end_wiping_on_error(file.take(text::MAX_VALUE as u64 + 1), &mut bytes)?;
-    let value = SecretBytes::new(bytes);
-    if value.as_slice().len() > text::MAX_VALUE {
-        return Err(Error::new("publication material exceeds its bound"));
-    }
-    Ok(Some(value))
+#[cfg(test)]
+std::thread_local! {
+    /// An anchor name the walk reads as absent from the view. The document check refuses every
+    /// envelope whose anchor some host does not receive, so no envelope fixture can hold the
+    /// unresolved chain a reader must treat as unavailable; this seam stands in for it.
+    pub(super) static HIDDEN_ANCHOR: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn field(hash: &mut aterm_digest::Sha256, bytes: &[u8]) {

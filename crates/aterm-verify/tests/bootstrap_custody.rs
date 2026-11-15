@@ -86,6 +86,11 @@ mod native {
                 return;
             }
             let case = std::env::var(CASE).unwrap();
+            if case == "healthy" {
+                aterm_uds::tether::prepared_executable_within(aterm_uds::deadline::FIRST_EXEC_HANG)
+                    .expect("healthy fixture qualifies its retained helper")
+                    .expect("healthy fixture has retained helper custody");
+            }
             line(&world, "original-executed", "executed original frontend");
             until_within(MUST_HAPPEN, "controller changes launch name", || {
                 world.join("go").exists().then_some(())
@@ -144,14 +149,18 @@ mod native {
                     .spawn()
                     .unwrap(),
             );
-            let receipt = until_within(MUST_HAPPEN, "original frontend executes", || {
-                assert!(
-                    parent.0.try_wait().unwrap().is_none(),
-                    "frontend ended before startup receipt"
-                );
-                let text = std::fs::read_to_string(world.join("original-executed")).ok()?;
-                text.ends_with('\n').then_some(text)
-            });
+            let receipt = until_within(
+                aterm_uds::deadline::FIRST_EXEC_HANG,
+                "original frontend and retained helper qualify",
+                || {
+                    assert!(
+                        parent.0.try_wait().unwrap().is_none(),
+                        "frontend ended before startup receipt"
+                    );
+                    let text = std::fs::read_to_string(world.join("original-executed")).ok()?;
+                    text.ends_with('\n').then_some(text)
+                },
+            );
             assert_eq!(receipt, "executed original frontend\n");
             if case != "healthy" {
                 let next = world.join("next");

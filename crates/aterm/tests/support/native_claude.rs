@@ -12,18 +12,15 @@ pub fn place(root: &Path, dest: &Path, idle: &str) {
     std::fs::create_dir_all(dest.parent().expect("native fixture parent"))
         .expect("native fixture directory");
     aterm_uds::deadline::ad_hoc_copy(&aterm_tempfile::bin_exe("aterm-claude-fixture"), dest);
-    let mut proof = aterm_uds::spawnfd::command(dest)
+    let mut proof = aterm_uds::spawnfd::command(dest);
+    proof
         .env("ATERM_CLAUDE_FIXTURE_ROOT", root)
-        .arg("--version")
-        .stdout(aterm_uds::spawnfd::Stdio::piped())
-        .spawn()
-        .expect("run the native fixture in place");
-    aterm_uds::deadline::prints(
-        &mut proof,
-        "2.1.281 (Claude Code)",
-        aterm_uds::deadline::ECHO_HANG,
-    );
-    assert!(proof.wait().expect("native fixture version exit").success());
+        .arg("--version");
+    let output =
+        aterm_uds::deadline::output_within(&mut proof, aterm_uds::deadline::FIRST_EXEC_HANG)
+            .expect("the native fixture version invocation completes in place");
+    assert!(output.status.success(), "{dest:?}: {output:?}");
+    assert_eq!(output.stdout, b"2.1.281 (Claude Code)\n", "{dest:?}");
 }
 
 /// The server acknowledged a live watch for this exact fixture process before it is ended.

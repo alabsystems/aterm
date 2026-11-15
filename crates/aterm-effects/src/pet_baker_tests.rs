@@ -232,13 +232,24 @@ fn host_ids_are_stable_and_namespaced() {
 
 /// At the 1.5× ship size (36 px), for every pose on both grounds, every authored eye subpath
 /// keeps its own ≥2×2 block of opaque dark ink (each channel under 64) near its centre, far
-/// eyes included, and a pair authored with daylight keeps a non-dark texel between cores.
+/// eyes included, and a pair authored with daylight keeps a non-dark texel between cores. The
+/// glide's shut and happy faces are the exception: their lids are curves with coat at their
+/// middle (`curved_lids`), held apart at ship size by `pet_art_quality`'s
+/// `the_glide_faces_read_apart_at_ship_size`; its open faces keep their cores here.
 #[test]
 fn face_lod_keeps_a_dark_eye_core_at_ship_size() {
     const H: u32 = 36;
     let mut failures: Vec<String> = Vec::new();
     for &id in PET_GLYPH_IDS {
         let needle = PET_GLYPHS[id as usize].id;
+        if crate::kitty_pet::glide_species(id).is_some()
+            && PET_GLYPHS[id as usize]
+                .layers
+                .iter()
+                .all(|l| l.role != GlyphRole::Iris)
+        {
+            continue;
+        }
         let w = (H as f32 * PetBaker::aspect(id)).round() as u32;
         for dark_bg in [false, true] {
             let fills = ResolvedFills::from_indices(9, 4, dark_bg);

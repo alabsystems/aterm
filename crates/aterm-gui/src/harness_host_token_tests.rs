@@ -3,15 +3,23 @@
 
 //! A Claude Code session on its account's vault token, as this host attributes it
 //! (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.6–§5.8, slice S11): its exec-time
-//! environment holds the descriptor variable and the marker naming its row's entry, and its
-//! walls, tap readings and tap claim count under the row; the tap records its served facts in
-//! this Mac's token table, and on the minting Mac (a scratch seated vault, m22) verification by
-//! windows; `/login`, the profile reads and the `/usage` probe leave it out. Every vault is a
+//! environment holds the descriptor variable, the marker naming its row's entry and the served
+//! token's `minted_at`, and its walls, tap readings and tap claim count under the row; the tap
+//! records its served facts in this Mac's token table, and on the minting Mac (a scratch seated
+//! vault, m22) verification by windows: the basis is a reading of a session on the row's stored
+//! login, never a token's, a new token is held off while that stored login works here until one
+//! reports, a reading of a token whose windows differ is folded into no row, a session the
+//! wrapper served another token than the vault's (it names the one it served) supplies nothing of
+//! the vault's token's verification or refusal, one an earlier wrapper served counts by its birth
+//! and compares nothing, a session on no token the vault holds for its row supplies nothing, a
+//! reading taken while the vault is busy is read again, a lost login is recorded as the refusal of
+//! the token the session runs on, the turn-end route move judges a session by the token it was
+//! served; `/login`, the profile reads and the `/usage` probe leave it out. Every vault is a
 //! scratch one, and the token an inert fixture.
 
 use super::*;
 use aterm_agent::harness::accounts_tokens::{self, Verdict, Windows};
-use aterm_agent::harness::token_route::{DESCRIPTOR_ENV, MARKER_ENV};
+use aterm_agent::harness::token_route::{self, DESCRIPTOR_ENV, MARKER_ENV, MINTED_ENV, TokenFact};
 use aterm_agent::harness::{claims, journal};
 use aterm_secrets::claude_token::{self, ExpiryFrom, Key, Lookup, Meta};
 use aterm_secrets::client::{MemberWritten, OnBusy, Paths};
@@ -34,24 +42,34 @@ fn entry() -> accounts::TokenEntry {
     accounts::TokenEntry::parse(&format!("aterm-claude-token-{KEY}")).expect("an entry")
 }
 
-/// The environment the wrapper leaves a session it served: the descriptor and the marker.
-fn token_env(marker: &str) -> Vec<String> {
+/// The environment the wrapper leaves a session it served: the descriptor, the marker and the
+/// served token's `minted_at`.
+fn token_env(marker: &str, minted_at: u64) -> Vec<String> {
     vec![
         "HOME=/Users//example".to_owned(),
         format!("{DESCRIPTOR_ENV}=5"),
         format!("{MARKER_ENV}={marker}"),
+        format!("{MINTED_ENV}={minted_at}"),
     ]
 }
 
-/// A scratch seated vault in `home`, as m22, holding the account's inert token, minted here at
-/// `now`: what a `token` verb's mint leaves.
-struct Vault {
+/// A scratch seated vault in `home`, as m22, holding the account's inert token, minted here:
+/// what a `token` verb's mint leaves.
+pub(super) struct Vault {
     _server: aterm_secrets::server::Running,
     paths: Paths,
+    /// The account the token is made for.
+    email: String,
 }
 
 impl Vault {
-    fn minted_in(home: &Path, now: u64) -> Self {
+    /// The vault, its token made at `minted_at`.
+    fn minted_in(home: &Path, minted_at: u64) -> Self {
+        Self::minted_for(home, minted_at, EMAIL)
+    }
+
+    /// The vault, its token for `email` made at `minted_at`.
+    pub(super) fn minted_for(home: &Path, minted_at: u64, email: &str) -> Self {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let server = aterm_secrets::server::start(
             socket,
@@ -72,19 +90,32 @@ impl Vault {
         aterm_secrets::client::seed_vault_genesis(&paths, &home.with_extension("genesis"))
             .expect("genesis");
         aterm_secrets::client::admin_mirror_log(&paths, &[]).expect("the log");
+        let vault = Self {
+            _server: server,
+            paths,
+            email: email.to_owned(),
+        };
+        vault.mint(minted_at);
+        vault
+    }
+
+    /// Writes the account's token as one made here at `minted_at` and not verified: the first
+    /// mint, or a `--replace`.
+    fn mint(&self, minted_at: u64) {
         let meta = Meta {
-            email: EMAIL.to_owned(),
+            email: self.email.clone(),
             account_id: "c-0123456789ab".to_owned(),
-            minted_at: now - 60,
-            expires_at: now + 365 * 86_400,
+            minted_at,
+            expires_at: minted_at + 365 * 86_400,
             expiry_from: ExpiryFrom::Printed,
             minted_on: "m22".to_owned(),
             cli: "2.1.318".to_owned(),
+            minted_by: None,
             verified: None,
         };
         let token = concat!("sk-ant-", "oat01-inert_fixture-token-0123456789");
         let written = claude_token::write(
-            &paths,
+            &self.paths,
             &Key::parse(KEY).unwrap(),
             &aterm_secrets::SecretBytes::from(token.as_bytes()),
             &meta,
@@ -92,10 +123,6 @@ impl Vault {
         )
         .expect("the write");
         assert_eq!(written, MemberWritten::Posted);
-        Self {
-            _server: server,
-            paths,
-        }
     }
 
     fn verified(&self) -> bool {
@@ -106,23 +133,147 @@ impl Vault {
     }
 }
 
-/// A [`TapWorld`] whose roster is [`ROSTER`] and whose seat's home holds the scratch vault.
+/// How long before the world's session was born its vault's first token was made: the session
+/// started on it.
+const MINTED_BEFORE_BIRTH: u64 = 600;
+
+/// Records the row a mint of the verb leaves in this Mac's token table for the token made at
+/// `minted_at`: the row's label, the token's `minted_at`, in the vault, nothing compared yet.
+fn record_mint(w: &TapWorld, minted_at: u64) {
+    accounts_tokens::update_table(&accounts::Store::at(&w.state()), |table| {
+        table.rows.insert(
+            KEY.to_owned(),
+            accounts_tokens::TokenRow {
+                key: KEY.to_owned(),
+                email: EMAIL.to_owned(),
+                account_id: Some("c-0123456789ab".to_owned()),
+                label: Some("main".to_owned()),
+                entry: Key::parse(KEY).unwrap().entry(),
+                minted_at: Some(minted_at),
+                expires_at: Some(minted_at + 365 * 86_400),
+                expiry_from: Some("printed".to_owned()),
+                minted_on: Some("m22".to_owned()),
+                signer: Some("m22".to_owned()),
+                used_on: accounts_tokens::UsedOn::default(),
+                vault: accounts_tokens::InVault::InVault,
+                verified: None,
+                verification: accounts_tokens::Verification::default(),
+                removed_at: None,
+            },
+        );
+    })
+    .expect("the mint's row");
+}
+
+/// What the verb's mint leaves: the token made at `minted_at` in the vault, then its row here.
+fn mint(w: &TapWorld, vault: &Vault, minted_at: u64) {
+    vault.mint(minted_at);
+    record_mint(w, minted_at);
+}
+
+/// A [`TapWorld`] whose roster is [`ROSTER`] and whose seat's home holds the scratch vault, its
+/// token made [`MINTED_BEFORE_BIRTH`] before the world's session was born, with the row its mint
+/// left in this Mac's token table.
 fn token_world() -> (Arc<TapWorld>, Vault) {
     let w = TapWorld::new();
     std::fs::write(w.roster_path(), ROSTER).expect("roster");
     let home = w.tmp.path().join("home");
     std::fs::create_dir_all(home.join(".secrets")).expect("home");
-    let vault = Vault::minted_in(&home, u64::try_from(w.clock()).unwrap());
+    let minted_at = born(&w) - MINTED_BEFORE_BIRTH;
+    let vault = Vault::minted_in(&home, minted_at);
+    record_mint(&w, minted_at);
     (w, vault)
 }
 
-/// Puts the worker's agent on its row's vault token: its snapshot's route and its exec-time
-/// environment.
-fn on_token(w: &TapWorld, idle: &WorkerIdle) {
-    w.env.lock().unwrap().extend(token_env(&entry().name()));
+/// The default login's record under the seat's home, naming [`EMAIL`]: the row's stored login is
+/// on this Mac.
+fn stored_login_here(w: &TapWorld) {
+    std::fs::write(
+        w.tmp.path().join("home/.claude.json"),
+        format!(r#"{{"oauthAccount":{{"emailAddress":"{EMAIL}"}}}}"#),
+    )
+    .expect("the login record");
+}
+
+/// The token route's judgment of the vault's token for `main` now
+/// ([`token_route::standing_judged`]): this Mac's table and accounts state, the roster and the
+/// seat's home.
+fn judged(w: &TapWorld, vault: &Vault) -> TokenFact {
+    let key = Key::parse(KEY).unwrap();
+    let roster = accounts::Roster::load(&w.roster_path()).expect("the roster");
+    let found = claude_token::standing(&vault.paths, &key).expect("a standing");
+    token_route::standing_judged(
+        &found,
+        &vault.paths,
+        &accounts::Store::at(&w.state()),
+        Some(&roster),
+        &key,
+        &token_route::Account {
+            label: Some("main".to_owned()),
+            email: EMAIL.to_owned(),
+        },
+        u64::try_from(w.clock()).unwrap(),
+    )
+}
+
+/// The windows a status line [`TapWorld::tap`] writes shows: the row's own account's.
+fn rows_windows(w: &TapWorld) -> Windows {
+    Windows {
+        week_reset: Some(w.born + 4 * 3600 + 86_400),
+        session_reset: Some(w.born + 4 * 3600),
+    }
+}
+
+/// The windows a status line [`theirs`] writes shows: another account's.
+fn their_windows(w: &TapWorld) -> Windows {
+    Windows {
+        week_reset: Some(w.born + 4 * 3600 + 2 * 86_400),
+        session_reset: Some(w.born + 4 * 3600 + 1800),
+    }
+}
+
+/// When the world's session was born.
+fn born(w: &TapWorld) -> u64 {
+    u64::try_from(w.born).unwrap()
+}
+
+/// The `minted_at` of the world's first token ([`token_world`]).
+fn first(w: &TapWorld) -> u64 {
+    born(w) - MINTED_BEFORE_BIRTH
+}
+
+/// Puts the worker's agent on its row's vault token, the one made at `minted_at`, as the wrapper
+/// serves it: its snapshot's route and its exec-time environment.
+fn on_token(w: &TapWorld, idle: &WorkerIdle, minted_at: u64) {
+    let mut env = w.env.lock().unwrap();
+    env.retain(|kv| {
+        !token_route::TOKEN_STATE_ENV
+            .iter()
+            .chain([&MINTED_ENV])
+            .any(|name| kv.split_once('=').is_some_and(|(k, _)| k == *name))
+    });
+    env.extend(token_env(&entry().name(), minted_at));
+    drop(env);
     if let Some(snap) = idle.kept.lock().unwrap().snapshot.as_mut() {
         snap.route = accounts::AuthRoute::VaultToken { entry: entry() };
     }
+}
+
+/// Puts the worker's agent back on its row's stored login, as the route move's relaunch does.
+fn on_stored(w: &TapWorld, idle: &WorkerIdle) {
+    *w.env.lock().unwrap() = vec!["HOME=/Users//example".to_owned()];
+    if let Some(snap) = idle.kept.lock().unwrap().snapshot.as_mut() {
+        snap.route = accounts::AuthRoute::Stored;
+    }
+}
+
+/// A status line of another account: its five-hour window `pct` used, and both windows' resets
+/// later than the ones [`TapWorld::tap`] names.
+fn theirs(w: &TapWorld, api_ms: u64, pct: u32) -> String {
+    let (session, week) = (w.born + 4 * 3600 + 1800, w.born + 4 * 3600 + 2 * 86_400);
+    format!(
+        r#"{{"cost":{{"total_api_duration_ms":{api_ms}}},"rate_limits":{{"five_hour":{{"used_percentage":{pct},"resets_at":{session}}},"seven_day":{{"used_percentage":61,"resets_at":{week}}}}}}}"#
+    )
 }
 
 fn table(w: &TapWorld) -> accounts_tokens::Table {
@@ -147,6 +298,7 @@ impl claims::Table for Kept {
             clock: None,
             skewed: Vec::new(),
             held: Vec::new(),
+            homes: None,
         })
     }
 
@@ -198,11 +350,11 @@ fn the_wall_recorder_credits_a_token_sessions_wall_to_its_row() {
         })
     };
     assert_eq!(
-        read(&token_env(&entry().name())),
+        read(&token_env(&entry().name(), 1)),
         ("wall", Some("main".to_owned()))
     );
     assert_eq!(
-        read(&token_env("aterm-claude-token-ac-0000000000000001")),
+        read(&token_env("aterm-claude-token-ac-0000000000000001", 1)),
         ("not-stored", None),
         "another account's entry"
     );
@@ -219,23 +371,19 @@ fn the_wall_recorder_credits_a_token_sessions_wall_to_its_row() {
 }
 
 /// THE TAP CREDITS A TOKEN SESSION'S READING TO ITS ROW AND CLAIMS IT, AND RECORDS WHERE IT
-/// SERVES: on the minting Mac, a session on its row's token with no stored-login reading before
-/// it has its readings recorded under `main`, its tap claim on the row's account written, and its
-/// first and last served in the token table; with no basis (no stored-login windows before the
-/// fold) its token stays `unverified (no reading yet)` and nothing writes `verified`, though the
-/// row's sample now holds the token's own windows.
+/// SERVES, BUT NEVER AS ITS BASIS: on the minting Mac, a session on its row's token with no
+/// stored-login reading before it has its readings recorded under `main`, its tap claim on the
+/// row's account written, and its first and last served in the token table; no basis is recorded
+/// from them, so its token stays `unverified (awaiting a stored-login reading)` and nothing writes
+/// `verified`, though the row's sample now holds the token's own windows.
 #[cfg(unix)]
 #[test]
 fn the_tap_credits_a_token_sessions_reading_and_claim_to_its_row() {
     let (w, vault) = token_world();
     // The pool file a fleet Mac holds: what turns account claims on.
-    std::fs::write(
-        w.tmp.path().join("home/.secrets/ai-pool.toml"),
-        "version = 1\n",
-    )
-    .expect("the pool");
+    aterm_agent::vault_entry::put(&w.tmp.path().join("home"), "ai-pool.toml", "version = 1\n");
     let idle = w.worker(&tap_on(), tapped_argv(), true);
-    on_token(&w, &idle);
+    on_token(&w, &idle, first(&w));
     let kept = Arc::new(Kept {
         rows: Mutex::default(),
     });
@@ -261,11 +409,7 @@ fn the_tap_credits_a_token_sessions_reading_and_claim_to_its_row() {
     assert_eq!(row.label.as_deref(), Some("main"));
     assert_eq!(row.used_on.first_served_at, Some(now));
     assert_eq!(row.used_on.last_served_at, Some(now));
-    assert_eq!(
-        row.verification.basis.map(|(_, basis)| basis),
-        Some(Windows::default()),
-        "no stored-login windows before the fold"
-    );
+    assert_eq!(row.verification.basis, None, "a token reading is no basis");
     assert_eq!(row.verification.verdict, Some(Verdict::NoBasis));
 
     w.later(60);
@@ -273,19 +417,36 @@ fn the_tap_credits_a_token_sessions_reading_and_claim_to_its_row() {
     let row = table(&w).rows.remove(KEY).expect("the token's row");
     assert_eq!(row.used_on.first_served_at, Some(now));
     assert_eq!(row.used_on.last_served_at, Some(now + 60));
+    assert_eq!(
+        row.verification.basis, None,
+        "the row's sample, now the token's own windows, is no basis either"
+    );
     assert_eq!(row.verification.verdict, Some(Verdict::NoBasis));
     assert_eq!(row.verified, None);
     assert!(!vault.verified(), "nothing compared the token with itself");
 }
 
-/// EQUAL WINDOWS ON THE MINTING MAC WRITE `verified`: the row's stored login read its windows
-/// first (a session on it), then a session on the row's token reads the same windows; the basis
-/// recorded before the token's reading was folded is the stored login's, the comparison finds them
-/// equal, and the scratch vault's meta now says `verified`.
+/// A NEW TOKEN IS HELD UNTIL ITS STORED LOGIN REPORTS, THEN EQUAL WINDOWS VERIFY IT (§5.6): with
+/// the row's stored login on this Mac, the token its mint left is held (`awaiting-basis`): a launch
+/// stays on the stored login. That session's reading, credited to the row, is the basis, and the
+/// hold lifts; a session on the token then reads the same windows, the comparison finds them
+/// equal, and the scratch vault's meta says `verified`. CONTROL: with no stored login here the
+/// same token is not held, so the row is never left with no route.
 #[cfg(unix)]
 #[test]
-fn equal_windows_after_a_stored_reading_verify_the_token() {
+fn a_new_token_is_held_until_its_stored_login_reports_then_equal_windows_verify_it() {
     let (w, vault) = token_world();
+    assert_eq!(
+        judged(&w, &vault),
+        TokenFact::InUse,
+        "CONTROL: no stored login here, nothing to hold it for"
+    );
+    stored_login_here(&w);
+    assert_eq!(
+        judged(&w, &vault),
+        TokenFact::AwaitingBasis,
+        "held: a launch stays on the stored login"
+    );
     let idle = w.worker(&tap_on(), tapped_argv(), true);
     w.tap(10, 42, None);
     let stored = journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
@@ -294,30 +455,100 @@ fn equal_windows_after_a_stored_reading_verify_the_token() {
         Some("reading recorded"),
         "the stored login's reading"
     );
-    let sample = w.sample_of("main").expect("the stored login's sample");
-    let basis = Windows::current(&sample, w.clock());
-    assert!(basis.week_reset.is_some() && basis.session_reset.is_some());
-    assert!(table(&w).rows.is_empty(), "a stored login serves no token");
+    let row = table(&w).rows.remove(KEY).expect("the token's row");
+    assert_eq!(
+        row.verification.basis,
+        Some((u64::try_from(w.clock()).unwrap(), rows_windows(&w))),
+        "the stored login's reading is the basis"
+    );
+    assert_eq!(row.verification.verdict, None, "nothing compared yet");
+    assert_eq!(judged(&w, &vault), TokenFact::InUse, "the hold lifts");
 
-    on_token(&w, &idle);
+    on_token(&w, &idle, first(&w));
     w.later(30);
     w.tap(20, 43, None);
     let step = journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
     assert_eq!(step, Some("reading recorded"));
     let row = table(&w).rows.remove(KEY).expect("the token's row");
-    assert_eq!(
-        row.verification.basis.map(|(_, b)| b),
-        Some(basis),
-        "the basis is the stored login's"
-    );
     assert_eq!(row.verification.verdict, Some(Verdict::Equal));
     assert!(row.verified.is_some(), "the minting Mac wrote it");
     assert!(vault.verified(), "the vault's meta says verified");
+    assert_eq!(judged(&w, &vault), TokenFact::InUse);
     assert_eq!(
         w.sample_of("main").and_then(|s| s.session_pct),
         Some(43),
         "the token's reading is the row's"
     );
+}
+
+/// A STORED-LOGIN READING IS A BASIS ONLY AS FAR AS THE FOLD CREDITS IT: a session on the row's
+/// stored login reports the row's windows, recorded as the basis. Its login record then names
+/// another `accountUuid` for the same email (the account made again, or another signed in to the
+/// home), so the next reading, other windows, is held back while the row adopts the new key
+/// ([`accounts::Account::adopting`]), and it replaces nothing of the basis. A session whose login
+/// record names an account no row lists is attributed to no row, and records nothing either.
+/// CONTROL: the same reading under the unchanged key is credited to the row and, the newer
+/// stored-login reading, replaces the basis.
+#[cfg(unix)]
+#[test]
+fn a_stored_login_reading_the_fold_does_not_credit_is_no_basis() {
+    for next in ["held back", "unlisted", "credited"] {
+        let (w, _vault) = token_world();
+        let record = |email: &str, uuid: &str| {
+            std::fs::write(
+                w.tmp.path().join("home/.claude.json"),
+                format!(
+                    r#"{{"oauthAccount":{{"emailAddress":"{email}","accountUuid":"{uuid}"}}}}"#
+                ),
+            )
+            .expect("the login record");
+        };
+        record(EMAIL, "00000000-0000-4000-8000-000000000001");
+        // The session's own home, whose login record the tap reads.
+        *w.env.lock().unwrap() = vec![format!("HOME={}", w.tmp.path().join("home").display())];
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        let step = || journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+        w.tap(10, 42, None);
+        assert_eq!(
+            step(),
+            Some("reading recorded"),
+            "the stored login's reading"
+        );
+        let basis = |w: &TapWorld| table(w).rows[KEY].verification.basis.map(|(_, b)| b);
+        assert_eq!(basis(&w), Some(rows_windows(&w)), "PRECONDITION: its basis");
+
+        match next {
+            "held back" => record(EMAIL, "00000000-0000-4000-8000-000000000002"),
+            "unlisted" => record(
+                "someone-else@example.com",
+                "00000000-0000-4000-8000-000000000003",
+            ),
+            _ => {}
+        }
+        w.later(30);
+        w.tap_text(&theirs(&w, 20, 8), None, None);
+        let said = step();
+        if next == "credited" {
+            assert_eq!(said, Some("reading recorded"), "CONTROL");
+            assert_eq!(
+                basis(&w),
+                Some(their_windows(&w)),
+                "CONTROL: the newer credited reading is the basis"
+            );
+        } else {
+            assert_ne!(
+                w.sample_of("main").and_then(|s| s.session_pct),
+                Some(8),
+                "PRECONDITION: {next}: the fold credited nothing of the reading to the row \
+                 ({said:?})"
+            );
+            assert_eq!(
+                basis(&w),
+                Some(rows_windows(&w)),
+                "{next}: a reading the fold did not credit to the row is no basis"
+            );
+        }
+    }
 }
 
 /// `/login`, THE PROFILE READS AND THE `/usage` PROBE LEAVE A TOKEN SESSION OUT: its login pin is
@@ -358,7 +589,7 @@ fn login_the_profile_reads_and_the_usage_probe_leave_a_token_session_out() {
     assert_ne!(claimed, Some(NoProbe::NotJudged), "CONTROL");
 
     let token = w.worker(&cfg, tapped_argv(), true);
-    on_token(&w, &token);
+    on_token(&w, &token, first(&w));
     assert_eq!(token.login_pin(), LoginPin::Token);
     assert!(
         probing(&token).is_none(),
@@ -369,4 +600,619 @@ fn login_the_profile_reads_and_the_usage_probe_leave_a_token_session_out() {
         Some(NoProbe::NotJudged)
     );
     assert_eq!(token.login_account(), None, "no profile read");
+}
+
+/// A REPLACEMENT IS COMPARED ONLY WITH A STORED-LOGIN READING, NEVER WITH WHAT AN EARLIER TOKEN
+/// FOLDED INTO THE ROW: a first token made for `main` while signed in as another account (B) is
+/// served with no stored-login reading yet, so its readings are compared with nothing and folded
+/// into the row, whose sample now shows B's windows. A `--replace` signed in as B again makes a
+/// second token; a session on it reads B's windows, not verified either (no stored-login reading
+/// since it was made). A session on the row's stored login then reports the row's own windows,
+/// recorded as the basis, which compares the second token's kept B reading at once: `differ`, and
+/// its next B reading is folded into nothing, never verified. CONTROL: a second token whose
+/// reading shows the row's own windows is verified at that stored-login reading. NEGATIVE
+/// CONTROL: the row's sample after the first token's fold, taken as the second token's basis (the
+/// rule this replaces), finds B's reading equal and would have verified another account's token.
+#[cfg(unix)]
+#[test]
+fn a_replacement_is_compared_only_with_a_stored_login_reading() {
+    for second_is_the_rows in [false, true] {
+        let (w, vault) = token_world();
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        let step = || journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+        on_token(&w, &idle, first(&w));
+        w.tap_text(&theirs(&w, 10, 7), None, None);
+        assert_eq!(step(), Some("reading recorded"), "compared with nothing");
+        let row = table(&w).rows.remove(KEY).expect("the first token's row");
+        assert_eq!(row.verification.basis, None);
+        assert_eq!(row.verification.verdict, Some(Verdict::NoBasis));
+        assert!(!vault.verified());
+        let folded = w.sample_of("main").expect("the row's sample");
+        assert_eq!(
+            folded.week_reset,
+            their_windows(&w).week_reset,
+            "the first token's reading is the row's"
+        );
+
+        let second = born(&w) - MINTED_BEFORE_BIRTH / 2;
+        mint(&w, &vault, second);
+        on_token(&w, &idle, second);
+        w.later(30);
+        if second_is_the_rows {
+            w.tap(20, 43, None);
+        } else {
+            w.tap_text(&theirs(&w, 20, 8), None, None);
+        }
+        // The fold finds nothing new in the row's own windows here (`reading: nothing new`); the
+        // token's table records the reading either way.
+        assert!(step().is_some(), "compared with nothing");
+        let row = table(&w).rows.remove(KEY).expect("the second token's row");
+        assert_eq!(row.minted_at, Some(second));
+        assert_eq!(row.verification.basis, None);
+        assert_eq!(row.verification.verdict, Some(Verdict::NoBasis));
+        assert!(!vault.verified(), "the second token is not verified yet");
+        assert_eq!(
+            Verdict::of(
+                Some(&Windows::current(&folded, w.clock())),
+                &their_windows(&w),
+                &[],
+                w.clock()
+            ),
+            Verdict::Equal,
+            "NEGATIVE CONTROL: the folded sample as a basis verifies B's token"
+        );
+
+        on_stored(&w, &idle);
+        w.later(30);
+        w.tap(30, 44, None);
+        assert!(step().is_some(), "the stored login's reading");
+        let row = table(&w).rows.remove(KEY).expect("the second token's row");
+        assert_eq!(
+            row.verification.basis.map(|(_, basis)| basis),
+            Some(rows_windows(&w)),
+            "the stored login's windows are the basis"
+        );
+        assert_eq!(
+            (row.verification.verdict, vault.verified()),
+            if second_is_the_rows {
+                (Some(Verdict::Equal), true)
+            } else {
+                (Some(Verdict::Differ), false)
+            },
+            "the second token's kept reading is compared with the basis at once"
+        );
+
+        on_token(&w, &idle, second);
+        w.later(30);
+        if second_is_the_rows {
+            w.tap(40, 45, None);
+            assert!(step().is_some(), "the row's own windows");
+            let row = table(&w).rows.remove(KEY).expect("the second token's row");
+            assert_eq!(row.verification.verdict, Some(Verdict::Equal));
+            assert!(
+                vault.verified(),
+                "CONTROL: the row's account's token is verified"
+            );
+        } else {
+            let kept = w.sample_of("main");
+            w.tap_text(&theirs(&w, 40, 9), None, None);
+            assert_eq!(step(), Some(TAP_APART), "B's windows");
+            assert_eq!(
+                w.sample_of("main"),
+                kept,
+                "nothing of B's reading is folded into the row"
+            );
+            let row = table(&w).rows.remove(KEY).expect("the second token's row");
+            assert_eq!(row.verification.verdict, Some(Verdict::Differ));
+            assert!(!vault.verified(), "another account's token is not verified");
+            assert_eq!(
+                accounts_tokens::TokenState::of(
+                    &claude_token::standing(&vault.paths, &Key::parse(KEY).unwrap()).unwrap(),
+                    Some(&row),
+                    u64::try_from(w.clock()).unwrap(),
+                )
+                .words(),
+                "unverified (windows differ)"
+            );
+            assert_eq!(judged(&w, &vault), TokenFact::Differ);
+        }
+    }
+}
+
+/// A SESSION ON ANOTHER TOKEN THAN THE VAULT'S SUPPLIES NOTHING OF ITS VERIFICATION: a
+/// stored-login reading gives the basis and a session on the row's token verifies it; the token
+/// is then replaced, and the session, still running on the one it started on, reads again. Its
+/// marker names the entry alone, but the wrapper named the token it served beside it: the reading
+/// is taken as neither the new token's nor the row's (`TAP_OTHER_TOKEN`), the new token's row
+/// records nothing of it, and nothing writes `verified`.
+#[cfg(unix)]
+#[test]
+fn a_session_on_an_earlier_token_supplies_nothing_of_the_new_ones_verification() {
+    let (w, vault) = token_world();
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    let step = || journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+    w.tap(10, 42, None);
+    assert_eq!(step(), Some("reading recorded"), "the stored login");
+    on_token(&w, &idle, first(&w));
+    w.later(30);
+    w.tap(20, 43, None);
+    assert_eq!(step(), Some("reading recorded"));
+    assert!(vault.verified(), "the token the session started on");
+    assert_eq!(table(&w).rows[KEY].minted_at, Some(first(&w)));
+
+    let replaced = u64::try_from(w.clock()).unwrap();
+    mint(&w, &vault, replaced);
+    assert!(
+        !vault.verified(),
+        "PRECONDITION: the new token is not verified"
+    );
+    w.later(30);
+    w.tap(30, 44, None);
+    assert_eq!(step(), Some(TAP_OTHER_TOKEN));
+    assert!(
+        !vault.verified(),
+        "a session on the earlier token verified the new one"
+    );
+    let row = table(&w).rows.remove(KEY).expect("the new token's row");
+    assert_eq!(row.minted_at, Some(replaced));
+    assert_eq!(
+        (row.used_on.first_served_at, row.verification),
+        (None, accounts_tokens::Verification::default()),
+        "no served fact of the new token"
+    );
+    assert_eq!(
+        w.sample_of("main").and_then(|s| s.session_pct),
+        Some(43),
+        "and nothing of the reading is the row's"
+    );
+}
+
+/// A SESSION THE WRAPPER SERVED BEFORE THE NEW TOKEN REACHED THE VAULT IS NOT ON IT, HOWEVER LATE
+/// IT WAS BORN (§5.6): a `--replace` stamps the new token's `minted_at` at its capture, and the
+/// vault holds it only once its write lands; a launch in between is served the token the vault
+/// still holds. That session was born after the new token's `minted_at`, so its birth would take
+/// it for one on the new token; it names the token it was served, so its reading, the row's own
+/// windows, verifies nothing and is folded into nothing. A session an earlier aterm's wrapper
+/// served names no token, so its birth alone says which it runs on: it began after the new token
+/// was made, so its reading counts for the new token and the row, but compares nothing and
+/// verifies nothing. CONTROL: a session served the new token, its windows the same, verifies it.
+#[cfg(unix)]
+#[test]
+fn a_session_served_before_the_new_token_reached_the_vault_is_not_on_it() {
+    for served in ["the earlier token", "no token named", "the vault's token"] {
+        let (w, vault) = token_world();
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        let step = || journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+        let new = born(&w) - 1;
+        assert!(
+            born(&w) > new && new > first(&w),
+            "PRECONDITION: {served}: born after the new token's minted_at, on the earlier one"
+        );
+        mint(&w, &vault, new);
+        w.tap(10, 42, None);
+        assert_eq!(
+            step(),
+            Some("reading recorded"),
+            "{served}: the stored login"
+        );
+        assert_eq!(
+            table(&w).rows[KEY]
+                .verification
+                .basis
+                .map(|(_, basis)| basis),
+            Some(rows_windows(&w)),
+            "PRECONDITION: {served}: the new token's basis"
+        );
+        match served {
+            "the earlier token" => on_token(&w, &idle, first(&w)),
+            "no token named" => {
+                on_token(&w, &idle, first(&w));
+                w.env
+                    .lock()
+                    .unwrap()
+                    .retain(|kv| !kv.starts_with(&format!("{MINTED_ENV}=")));
+            }
+            _ => on_token(&w, &idle, new),
+        }
+        w.later(30);
+        w.tap(20, 43, None);
+        let now = u64::try_from(w.clock()).unwrap();
+        match served {
+            "the vault's token" => {
+                assert_eq!(step(), Some("reading recorded"), "CONTROL");
+                assert_eq!(
+                    table(&w).rows[KEY].verification.verdict,
+                    Some(Verdict::Equal)
+                );
+                assert!(
+                    vault.verified(),
+                    "CONTROL: the token the session was served"
+                );
+            }
+            "no token named" => {
+                assert_eq!(step(), Some("reading recorded"), "{served}");
+                let row = table(&w).rows.remove(KEY).expect("the new token's row");
+                assert_eq!(
+                    (row.used_on.first_served_at, row.verification.verdict),
+                    (Some(now), None),
+                    "{served}: served, and nothing compared"
+                );
+                assert!(!vault.verified(), "{served}: the new token is not verified");
+                assert_eq!(
+                    w.sample_of("main").and_then(|s| s.session_pct),
+                    Some(43),
+                    "{served}: the reading is the row's"
+                );
+            }
+            _ => {
+                assert_eq!(step(), Some(TAP_OTHER_TOKEN), "{served}");
+                assert!(!vault.verified(), "{served}: the new token is not verified");
+                let row = table(&w).rows.remove(KEY).expect("the new token's row");
+                assert_eq!(
+                    (row.used_on.first_served_at, row.verification.verdict),
+                    (None, None),
+                    "{served}: no served fact or verdict of the new token"
+                );
+                assert_eq!(
+                    w.sample_of("main").and_then(|s| s.session_pct),
+                    Some(42),
+                    "{served}: nothing of the reading is the row's"
+                );
+            }
+        }
+    }
+}
+
+/// A REFUSAL IS THE VAULT'S TOKEN'S ONLY WHERE THE SESSION RUNS ON IT (§5.6): a session on the
+/// row's token loses its login; the wrapper served it the token the vault held when it started,
+/// since replaced, so its refusal is recorded of nothing here and the vault's token is still
+/// judged as before; a wrapper that named no token, of a session begun before the vault's token
+/// was made, records nothing either; nor does a session on the vault's token whose newest API
+/// error answered `403`, Cloudflare's block page, which Claude Code writes as a lost login
+/// though the token works. CONTROL: a session served the vault's token records the refusal where
+/// its newest API error answered `401`, and so does one an earlier wrapper served that began
+/// after the vault's token was made; the token then reads `rejected` here.
+#[cfg(unix)]
+#[test]
+fn a_refusal_is_the_vaults_tokens_only_where_the_session_was_served_it() {
+    for (served, status) in [
+        ("the earlier token", Some(token_route::REFUSED_STATUS)),
+        (
+            "no token named, begun before it",
+            Some(token_route::REFUSED_STATUS),
+        ),
+        (
+            "no token named, begun after it",
+            Some(token_route::REFUSED_STATUS),
+        ),
+        ("the vault's token", Some(token_route::REFUSED_STATUS)),
+        ("the vault's token", Some(CLOUDFLARE_STATUS)),
+        ("the vault's token", None),
+    ] {
+        let case = format!("{served}, status {status:?}");
+        let (w, vault) = token_world();
+        let new = if served == "no token named, begun after it" {
+            born(&w) - 1
+        } else {
+            u64::try_from(w.clock()).unwrap()
+        };
+        mint(&w, &vault, new);
+        let minted = match served {
+            "the earlier token" => Some(first(&w)),
+            "the vault's token" => Some(new),
+            _ => None,
+        };
+        let mut env = token_env(&entry().name(), minted.unwrap_or(new));
+        if minted.is_none() {
+            env.retain(|kv| !kv.starts_with(&format!("{MINTED_ENV}=")));
+        }
+        let roster = accounts::Roster::load(&w.roster_path()).expect("the roster");
+        let recorded = journal::with_keyer(keyer, || {
+            let who = accounts::ProcessLogin::of_exec_env(&env).expect("an env");
+            let token = token_route::ServedToken::of(
+                env.iter().filter_map(|kv| kv.split_once('=')),
+                Some(born(&w)),
+            );
+            assert_eq!(
+                token,
+                minted.map_or(
+                    token_route::ServedToken::Unnamed(Some(born(&w))),
+                    token_route::ServedToken::Named
+                ),
+                "{case}"
+            );
+            token_route::token_refused(
+                &w.tmp.path().join("home"),
+                &vault.paths,
+                &accounts::Store::at(&w.state()),
+                Some(&roster),
+                (&who, token),
+                status,
+                u64::try_from(w.clock()).unwrap(),
+            )
+        });
+        assert!(table(&w).rows.contains_key(KEY), "the new token's row");
+        if matches!(
+            served,
+            "the vault's token" | "no token named, begun after it"
+        ) && status == Some(token_route::REFUSED_STATUS)
+        {
+            assert_eq!(recorded, Some(true), "CONTROL: {case}");
+            assert_eq!(judged(&w, &vault), TokenFact::Rejected, "CONTROL: {case}");
+        } else {
+            assert_eq!(recorded, Some(false), "{case}");
+            assert_eq!(
+                judged(&w, &vault),
+                TokenFact::InUse,
+                "{case}: the vault's token is judged as before"
+            );
+        }
+    }
+}
+
+/// The status Cloudflare's block page answers, which Claude Code writes as `authentication_failed`
+/// (`Please run /login`) though the credential works.
+const CLOUDFLARE_STATUS: u16 = 403;
+
+/// Writes the world's conversation's transcript under the seat's home ending on the lost-login
+/// notice Claude Code writes, answered `status` (`None`: a notice that names none): what
+/// [`upgrade_drive::named_api_error_status`] reads of the session.
+fn lost_login_notice(w: &TapWorld, status: Option<u16>) {
+    let project = w.tmp.path().join("home/.claude/projects/p");
+    std::fs::create_dir_all(&project).expect("its project");
+    let status = status.map_or(String::new(), |s| format!(r#","apiErrorStatus":{s}"#));
+    std::fs::write(
+        project.join("0badf00d-1111-2222-3333-444455556666.jsonl"),
+        format!(
+            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"go on\"}}}}\n\
+             {{\"type\":\"assistant\",\"isSidechain\":false,\"isApiErrorMessage\":true,\
+             \"error\":\"authentication_failed\"{status},\"message\":{{\"model\":\"<synthetic>\",\
+             \"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Please run /login\"}}]}}}}\n"
+        ),
+    )
+    .expect("its conversation's transcript");
+}
+
+/// THE HOST RECORDS A LOST LOGIN AS THE REFUSAL OF THE TOKEN ITS SESSION RUNS ON (§5.6): a
+/// session on the row's token hits Claude Code's sign-in wall, or its login ends; the host's
+/// account step reads what the wrapper served it from its exec-time environment and its birth,
+/// so where that is the vault's token the refusal is recorded and the token reads `rejected`
+/// here, and where the session runs on a token since replaced nothing is, nor where an earlier
+/// wrapper's session (it names no token) began before the vault's token was made. NEGATIVE
+/// CONTROL: the step judging the session by anything but what it was served, its birth included,
+/// records the refusal of the wrong token, or of none.
+#[cfg(unix)]
+#[test]
+fn the_host_records_a_lost_login_as_the_refusal_of_the_token_its_session_runs_on() {
+    let wall = AccountPoint::Wall {
+        kind: alab_policy::vocab::WallKind::Auth,
+    };
+    for (served, point, status) in [
+        ("the vault's token", wall, token_route::REFUSED_STATUS),
+        (
+            "the vault's token",
+            AccountPoint::LoginEnded,
+            token_route::REFUSED_STATUS,
+        ),
+        (
+            "no token named, begun after it",
+            AccountPoint::LoginEnded,
+            token_route::REFUSED_STATUS,
+        ),
+        (
+            "no token named, begun before it",
+            AccountPoint::LoginEnded,
+            token_route::REFUSED_STATUS,
+        ),
+        ("the earlier token", wall, token_route::REFUSED_STATUS),
+        ("the vault's token", wall, CLOUDFLARE_STATUS),
+    ] {
+        let case = format!("{served} at {point:?}, status {status}");
+        let (w, vault) = token_world();
+        lost_login_notice(&w, Some(status));
+        let new = if served == "no token named, begun before it" {
+            born(&w) + 1
+        } else {
+            born(&w) - 1
+        };
+        mint(&w, &vault, new);
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        match served {
+            "the vault's token" => on_token(&w, &idle, new),
+            "the earlier token" => on_token(&w, &idle, first(&w)),
+            _ => {
+                on_token(&w, &idle, first(&w));
+                w.env
+                    .lock()
+                    .unwrap()
+                    .retain(|kv| !kv.starts_with(&format!("{MINTED_ENV}=")));
+            }
+        }
+        let _ = journal::with_keyer(keyer, || idle.account(point));
+        assert!(table(&w).rows.contains_key(KEY), "the new token's row");
+        if matches!(
+            served,
+            "the earlier token" | "no token named, begun before it"
+        ) || status != token_route::REFUSED_STATUS
+        {
+            assert_eq!(judged(&w, &vault), TokenFact::InUse, "{case}");
+        } else {
+            assert_eq!(judged(&w, &vault), TokenFact::Rejected, "{case}");
+        }
+    }
+}
+
+/// A TOKEN READING TAKEN WHILE THE VAULT OR THE TOKEN TABLE CANNOT BE READ IS RECORDED NOWHERE AND
+/// READ AGAIN (§5.6): a session on the row's token reports while a vault apply holds the vault's
+/// state, so whose token it runs on is not known: the step drops it (`TAP_TOKEN_UNREAD`), the
+/// row's record and the token's row keep nothing of it, and the next step, the vault read again,
+/// folds that same reading. A token table that cannot be read drops the fold the same way.
+/// NEGATIVE CONTROLS: a busy vault taken for a session on the stored login, or a table error
+/// passed over, folds the reading into the row at once, though the token it runs on may be one
+/// whose windows differ.
+#[cfg(unix)]
+#[test]
+fn a_token_reading_taken_while_the_vault_or_its_table_cannot_be_read_is_read_again() {
+    let (w, vault) = token_world();
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    let step = || journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+    on_token(&w, &idle, first(&w));
+    let held =
+        aterm_secrets::client::test_hold_state_lock(&vault.paths).expect("a pass holds the state");
+    w.tap(10, 42, None);
+    assert_eq!(step(), Some(TAP_TOKEN_UNREAD));
+    assert_eq!(w.sample_of("main"), None, "nothing of it is the row's");
+    assert_eq!(
+        table(&w).rows[KEY].used_on.first_served_at,
+        None,
+        "nor the token's"
+    );
+    drop(held);
+    assert_eq!(
+        step(),
+        Some("reading recorded"),
+        "the same reading, read again"
+    );
+    assert_eq!(w.sample_of("main").and_then(|s| s.session_pct), Some(42));
+    assert_eq!(
+        table(&w).rows[KEY].used_on.first_served_at,
+        Some(u64::try_from(w.clock()).unwrap())
+    );
+
+    // A token table that cannot be read is no reading's served facts or comparison: the fold is
+    // dropped, nothing of the reading is the row's, and the next step, the table whole again,
+    // folds it.
+    let file = accounts::Store::at(&w.state())
+        .shared_dir()
+        .join(accounts_tokens::TABLE_FILE);
+    let whole = std::fs::read(&file).expect("the table");
+    std::fs::write(&file, b"not a table").expect("a broken table");
+    w.later(60);
+    w.tap(20, 44, None);
+    assert_eq!(step(), Some("reading dropped: not recorded"));
+    assert_eq!(
+        w.sample_of("main").and_then(|s| s.session_pct),
+        Some(42),
+        "nothing of it is the row's"
+    );
+    std::fs::write(&file, whole).expect("the table again");
+    assert_eq!(
+        step(),
+        Some("reading recorded"),
+        "the same reading, read again"
+    );
+    assert_eq!(w.sample_of("main").and_then(|s| s.session_pct), Some(44));
+}
+
+/// THE TURN-END ROUTE MOVE JUDGES A TOKEN SESSION BY THE TOKEN IT WAS SERVED (§5.6): a session the
+/// wrapper served the vault's token, in use here, is offered nothing; one served a token a
+/// `--replace` has since replaced is offered the vault's new token, in use here, which a relaunch
+/// serves. Nothing moves off macOS. NEGATIVE CONTROL: judged by anything but what it was served,
+/// the session on the vault's own token is offered a relaunch onto that same token at every turn
+/// end.
+#[cfg(unix)]
+#[test]
+fn the_route_move_judges_a_token_session_by_the_token_it_was_served() {
+    for served in ["the vault's token", "a replaced token"] {
+        let (w, vault) = token_world();
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        if served == "a replaced token" {
+            mint(&w, &vault, u64::try_from(w.clock()).unwrap());
+        }
+        on_token(&w, &idle, first(&w));
+        assert_eq!(
+            judged(&w, &vault),
+            TokenFact::InUse,
+            "PRECONDITION: {served}: the vault's token is in use here"
+        );
+        let moves = served == "a replaced token" && cfg!(target_os = "macos");
+        assert_eq!(
+            journal::with_keyer(keyer, || idle.route_move()),
+            moves.then_some(RouteTo::Token),
+            "{served}"
+        );
+    }
+}
+
+/// A READING OF A SESSION ON NO TOKEN THE VAULT HOLDS FOR ITS ROW IS FOLDED NOWHERE (§5.6): a
+/// session keeps running on its row's token after `--remove` took it out of the vault, and a
+/// session an earlier wrapper served (it names no token) began before the vault's token was made,
+/// so it runs on an earlier one. Either may be another account's token: its reading is the row's
+/// in nothing (no sample, no tap claim) and no served fact of the vault's token. CONTROL: a
+/// session served the vault's token has its reading recorded and claimed.
+#[cfg(unix)]
+#[test]
+fn a_reading_of_a_session_on_no_token_the_vault_holds_is_folded_nowhere() {
+    for served in [
+        "a removed token",
+        "no token named, begun before it",
+        "the vault's token",
+    ] {
+        let (w, vault) = token_world();
+        // The pool file a fleet Mac holds: what turns account claims on.
+        aterm_agent::vault_entry::put(&w.tmp.path().join("home"), "ai-pool.toml", "version = 1\n");
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        let kept = Arc::new(Kept {
+            rows: Mutex::default(),
+        });
+        let key = Key::parse(KEY).unwrap();
+        match served {
+            "a removed token" => {
+                claude_token::remove(
+                    &vault.paths,
+                    &key,
+                    Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                )
+                .expect("the removal");
+                assert!(
+                    matches!(
+                        claude_token::standing(&vault.paths, &key),
+                        Ok(Lookup::Absent)
+                    ),
+                    "PRECONDITION: the vault holds no token of the row"
+                );
+            }
+            "no token named, begun before it" => mint(&w, &vault, born(&w) + 1),
+            _ => {}
+        }
+        on_token(&w, &idle, first(&w));
+        if served == "no token named, begun before it" {
+            w.env
+                .lock()
+                .unwrap()
+                .retain(|kv| !kv.starts_with(&format!("{MINTED_ENV}=")));
+        }
+        w.tap(10, 42, None);
+        let step = journal::with_keyer(keyer, || {
+            claims::with_table(kept.clone(), || idle.tap_step(TapAt::Point))
+        });
+        let claimed = kept
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|row| !row.claims.is_empty());
+        if served == "the vault's token" {
+            assert_eq!(step, Some("reading recorded"), "CONTROL");
+            assert_eq!(
+                w.sample_of("main").and_then(|s| s.session_pct),
+                Some(42),
+                "CONTROL"
+            );
+            assert!(claimed, "CONTROL: the tap claimed the row's account");
+        } else {
+            assert_eq!(step, Some(TAP_OTHER_TOKEN), "{served}");
+            assert_eq!(
+                w.sample_of("main"),
+                None,
+                "{served}: nothing of it is the row's"
+            );
+            assert!(!claimed, "{served}: no claim");
+            assert_eq!(
+                table(&w).rows[KEY].used_on.first_served_at,
+                None,
+                "{served}: no served fact of the vault's token"
+            );
+        }
+    }
 }

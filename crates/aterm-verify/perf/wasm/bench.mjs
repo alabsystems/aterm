@@ -25,8 +25,8 @@
 //                                 CJK, accented Latin, box drawing and emoji: the
 //                                 non-ASCII half of that boundary.
 //   wasm_cpu_scroll_present_fps   scroll_lines(3) + render() per frame over deep
-//                                 history — today's FullRepaint + full RGBA
-//                                 expansion path (the E3/E5/E7 target).
+//                                 history, including damage-aware RGBA
+//                                 presentation of the scrolled frame.
 //   wasm_cpu_typing_present_fps   1 char + render() per frame — the dirty-row
 //                                 damage path (steady-state present).
 //   wasm_cpu_search_build_klps    first search() after a content change — the
@@ -54,13 +54,13 @@
 //                                 SGR'd history (a colour/attribute change every
 //                                 4 cells) — the E6a attr run-cursor path.
 //   wasm_gpu_ingest_mixed_mbps    the GPU module's engine ingest.
-//   wasm_gpu_frame_build_fps      render() WITHOUT WebGL init: pump + cell_frame
-//                                 + effects + stamp + spill run, then the GPU
-//                                 access errors — i.e. the GPU path's per-frame
-//                                 wasm-side cost. GL submission is the browser
-//                                 lane's (`verify browser`) and the on-glass
-//                                 half's (aterm-ctl metrics / arena).
-//   wasm_gpu_scroll_frame_build_fps  same, while scrolled through history.
+//   wasm_gpu_typing_render_fps     initialized OffscreenCanvas WebGL2 render,
+//                                 including GL completion for each batch, after
+//                                 text damages the live viewport. The page uses
+//                                 the lane's pinned SwiftShader backend.
+//   wasm_gpu_scroll_render_fps     same, scrolling through retained history.
+//                                 Neither rate measures on-glass latency.
+
 
 const N = 5
 const WARMUP = 1
@@ -413,7 +413,7 @@ await note(
     `styled-scrub ${report.wasm_cpu_styled_scrub_present_fps.toFixed(1)} fps`
 )
 
-// --- GPU module: ingest + per-frame wasm-side build cost --------------------
+// --- GPU module: ingest and initialized WebGL2 rendering -------------------
 report.wasm_gpu_ingest_mixed_mbps = rate('wasm_gpu_ingest_mixed_mbps', () => {
   const t = newGpuTerm()
   const secs = timeIt(() => t.process(MIX))
@@ -424,53 +424,50 @@ report.wasm_gpu_ingest_mixed_mbps = rate('wasm_gpu_ingest_mixed_mbps', () => {
   const t = newGpuTerm()
   t.set_scrollback_limit(15000)
   t.process(new TextEncoder().encode(rotatingLines(12000)))
-  // render() without init(): the full wasm-side frame build runs (pump +
-  // cell_frame_into + effects + stamp + spill), then the GPU access errors.
-  // Assert the seam once so a future behavior change cannot silently turn
-  // this scenario into a no-op (or into a real GL call).
-  let seam = ''
-  try {
+  const canvas = new OffscreenCanvas(t.width, t.height)
+  t.init_offscreen(canvas)
+  const gl = canvas.getContext('webgl2')
+  if (!gl) throw new Error('wasm-bench: initialized GPU has no WebGL2 context')
+  const rendererInfo = gl.getExtension('WEBGL_debug_renderer_info')
+  const renderer = rendererInfo
+    ? gl.getParameter(rendererInfo.UNMASKED_RENDERER_WEBGL)
+    : gl.getParameter(gl.RENDERER)
+  await note(`wasm-bench: gpu renderer ${renderer}`)
+  const renderFrame = () => {
+    if (!t.needs_frame()) throw new Error('wasm-bench: GPU workload did not damage a frame')
     t.render()
-  } catch (e) {
-    seam = String(e)
+    if (t.needs_frame()) throw new Error('wasm-bench: GPU render left the frame dirty')
   }
-  if (!seam.includes('before init()')) {
-    throw new Error(`wasm-bench: unexpected gpu render() seam: ${JSON.stringify(seam)}`)
-  }
-  const FRAMES = 200
+  renderFrame()
+  gl.finish()
+  const FRAMES = 20
   const oneChar = new TextEncoder().encode('x')
-  report.wasm_gpu_frame_build_fps = rate('wasm_gpu_frame_build_fps', () => {
+  report.wasm_gpu_typing_render_fps = rate('wasm_gpu_typing_render_fps', () => {
     const secs = timeIt(() => {
       for (let i = 0; i < FRAMES; i++) {
         t.process(oneChar) // the GPU module has no process_str export
-        try {
-          t.render()
-        } catch {
-          /* expected: no init(), so no GL */
-        }
+        renderFrame()
       }
+      gl.finish()
     })
     return { work: FRAMES, secs }
   })
-  report.wasm_gpu_scroll_frame_build_fps = rate('wasm_gpu_scroll_frame_build_fps', () => {
+  report.wasm_gpu_scroll_render_fps = rate('wasm_gpu_scroll_render_fps', () => {
     t.scroll_to_bottom()
     const secs = timeIt(() => {
       for (let i = 0; i < FRAMES; i++) {
         t.scroll_lines(3)
-        try {
-          t.render()
-        } catch {
-          /* expected: no init(), so no GL */
-        }
+        renderFrame()
       }
+      gl.finish()
     })
     return { work: FRAMES, secs }
   })
   t.free()
   await note(
     `wasm-bench: gpu ingest ${report.wasm_gpu_ingest_mixed_mbps.toFixed(1)} MB/s | ` +
-      `frame-build ${report.wasm_gpu_frame_build_fps.toFixed(1)} fps | ` +
-      `scroll frame-build ${report.wasm_gpu_scroll_frame_build_fps.toFixed(1)} fps`
+      `typing render ${report.wasm_gpu_typing_render_fps.toFixed(1)} fps | ` +
+      `scroll render ${report.wasm_gpu_scroll_render_fps.toFixed(1)} fps`
   )
 }
 

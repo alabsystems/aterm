@@ -316,3 +316,112 @@ fn returns_stop_at_63_members_while_the_gate_holds() {
     ledger.record(old.actor(), NOW, Said::Version(LIFTED));
     assert_eq!(ledger.room(false, [&old, &new], NOW), MAX_MEMBERS);
 }
+
+/// The registry's gate ([`in_place`]) counts only what it heard: a member on an older release,
+/// one whose last round said nothing and one unheard through a watch of any length each hold it,
+/// and so does this device where its own build is older. With no release named every member
+/// holds it. It opens only once every member reported the release or later within 7 days.
+/// CONTROL: the same ledger passes the caps' gate, which lets a member unheard through a 7-day
+/// watch pass.
+/// NEGATIVE CONTROL: with `holding_below` skipping its `unheard_passes` arm (an unheard member
+/// judged by the watch alone), the member never heard no longer holds: `` left: [(…, Older(Some(
+/// Version(0, 146, 0))))] right: [(…, Older(Some(Version(0, 146, 0)))), (…, Unheard)] ``.
+#[test]
+fn the_in_place_gate_counts_only_members_it_heard_and_none_while_no_release_is_named() {
+    let (old, _) = member(1);
+    let (new, _) = member(2);
+    let (unheard, _) = member(3);
+    let release = Version(0, 150, 0);
+    let mut ledger = Ledger::watched(TRUST, NOW - 2 * RECENT, NOW);
+    ledger.record(old.actor(), NOW - DAY_MS, Said::Version(LIFTED));
+    ledger.record(new.actor(), NOW - DAY_MS, Said::Version(release));
+    let members = [&old, &new, &unheard];
+    assert_eq!(
+        ledger.holding_below(members, NOW, in_place(Some(release))),
+        vec![
+            (old.actor(), Hold::Older(Some(LIFTED))),
+            (unheard.actor(), Hold::Unheard)
+        ]
+    );
+    assert!(ledger.holding(members, NOW).is_empty(), "control");
+    // No release named: the member on the newest release holds it with the rest.
+    assert_eq!(
+        ledger.holding_below(members, NOW, in_place(None)),
+        vec![
+            (old.actor(), Hold::Older(Some(LIFTED))),
+            (new.actor(), Hold::Older(Some(release))),
+            (unheard.actor(), Hold::Unheard)
+        ]
+    );
+    // Every member reported the release or later: the gate opens.
+    ledger.record(old.actor(), NOW, Said::Version(release));
+    ledger.record(unheard.actor(), NOW, Said::Version(Version(0, 151, 0)));
+    assert!(
+        ledger
+            .holding_below(members, NOW, in_place(Some(release)))
+            .is_empty()
+    );
+    // A later round that said nothing holds it again, and so does a report 7 days old.
+    let mut quiet = ledger.clone();
+    quiet.record(new.actor(), NOW, Said::Nothing);
+    assert_eq!(
+        quiet.holding_below(members, NOW, in_place(Some(release))),
+        vec![(new.actor(), Hold::Older(None))]
+    );
+    assert_eq!(
+        ledger
+            .holding_below(members, NOW + RECENT, in_place(Some(release)))
+            .len(),
+        3
+    );
+    // This device is judged by its own running build, which a test binary reports as LIFTED.
+    let mut own = ledger.clone();
+    own.know_local(&old);
+    assert_eq!(
+        own.holding_below(members, NOW, in_place(Some(release))),
+        vec![(old.actor(), Hold::Older(Some(Version::own())))]
+    );
+    assert!(
+        own.holding_below([&old], NOW, in_place(Some(LIFTED)))
+            .is_empty()
+    );
+    assert_eq!(
+        own.holding_below([&old], NOW, in_place(None)),
+        vec![(old.actor(), Hold::Older(Some(Version::own())))]
+    );
+}
+
+/// One device writes no vault entry to a file only where it reported [`NO_SECRET_FILE`] or later
+/// within 7 days ([`Ledger::writes_no_secret_file`]); every other device, and this one on a test
+/// binary's own build, fails closed.
+/// NEGATIVE CONTROL: with `writes_no_secret_file` judging by [`CAPS`] (an unheard member passes
+/// a 7-day watch), the device never heard passes: `assertion failed: !ledger
+/// .writes_no_secret_file(&unheard, NOW)`.
+#[test]
+fn a_device_writes_no_secret_file_only_on_a_recent_report_of_the_release_that_stopped() {
+    let release = NO_SECRET_FILE.expect("a release is named");
+    let (new, _) = member(1);
+    let (old, _) = member(2);
+    let (silent, _) = member(3);
+    let (unheard, _) = member(4);
+    let (stale, _) = member(5);
+    let mut ledger = Ledger::watched(TRUST, NOW - 2 * RECENT, NOW);
+    ledger.record(new.actor(), NOW - DAY_MS, Said::Version(release));
+    ledger.record(old.actor(), NOW - DAY_MS, Said::Version(Version(0, 202, 0)));
+    ledger.record(silent.actor(), NOW - DAY_MS, Said::Nothing);
+    ledger.record(stale.actor(), NOW - RECENT - DAY_MS, Said::Version(release));
+    // Heard since, by a round that ended before reports were traded: the report stays 8 days old.
+    ledger.record(stale.actor(), NOW, Said::Unknown);
+    assert!(ledger.writes_no_secret_file(&new, NOW));
+    assert!(!ledger.writes_no_secret_file(&old, NOW));
+    assert!(!ledger.writes_no_secret_file(&silent, NOW));
+    assert!(!ledger.writes_no_secret_file(&unheard, NOW));
+    assert!(!ledger.writes_no_secret_file(&stale, NOW));
+    // The report stops counting 7 days after it was made.
+    assert!(!ledger.writes_no_secret_file(&new, NOW - DAY_MS + RECENT));
+    // This device is judged by its own running build, older than the release in a test binary.
+    let mut own = ledger.clone();
+    own.know_local(&new);
+    assert!(Version::own() < release);
+    assert!(!own.writes_no_secret_file(&new, NOW));
+}

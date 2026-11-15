@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -18,10 +18,6 @@ use crate::test_progress::{Phase, Progress};
 
 use crate::resource_waits as test_waits;
 use aterm_capacity::Machine as _;
-
-pub use crate::test_content::{
-    CarryProof, Evidence, KeyParts, Passed, encode_passed, moved_parts, read_passed,
-};
 
 /// The flag cargo's runner config hands this binary.
 pub const RECORD_FLAG: &str = "--record-test-binary";
@@ -847,9 +843,15 @@ where
 /// LOST TOKENS. A GNU client that dies holding a token takes it with it, and the pool cannot
 /// name who. So a binary whose whole charge the pool does not hold, while no binary of this
 /// dispatch runs and no child of the run is alive (`idle`, [`exec::no_child_runs`] in a run),
-/// waits for nobody: it starts on the tokens there are, at least one, its width and its cores
-/// within them (`BinaryPermit::granted`), and a line says so. It holds only what the pool had,
-/// so no other holder is overdrawn. This dispatch, outside a run, lists no children and waits.
+/// waits for nobody. The pool's sole adopter counts it first
+/// ([`aterm_capacity::Jobserver::count_alone`]) and writes back the tokens no holder has, so the
+/// binary takes its whole charge; where that count cannot be judged (another process adopted
+/// the pool, its creator is moving an allocation, or a wait of this process is in its read)
+/// the binary starts on the tokens there are, at least one, its width and its cores within them
+/// (`BinaryPermit::granted`), and a line says so. It holds only what the pool had, so no other
+/// holder is overdrawn. Each binary's end in a run is a reap point too: with no binary left
+/// running and no child of the run alive, the pool is counted there ([`count_at_reap`]). This
+/// dispatch, outside a run, lists no children and waits.
 #[expect(
     clippy::too_many_arguments,
     reason = "dispatch's own seven inputs and the release's pool, which only a run under a \
@@ -968,7 +970,7 @@ where
                                 pool,
                                 b,
                                 &waiters,
-                                held == 0 && idle(),
+                                &|| held == 0 && idle(),
                                 Some((&probes, generation)),
                             );
                             waits.change(b.index, reason);
@@ -1012,7 +1014,7 @@ where
                             binary.spec, b.charge, planned.charge
                         );
                     }
-                    let _charged = Charged {
+                    let charged = Charged {
                         state: &state,
                         turn: &turn,
                         index: b.index,
@@ -1043,6 +1045,15 @@ where
                         drop(_binary_cover);
                         drop(_binary_reservation);
                         drop(permit);
+                        // For the record of the pool's next count that is not whole.
+                        if let (Some(pool), Some(run)) = (pool, answered.as_ref()) {
+                            pool.note_reaped(format!(
+                                "binary={} code={:?} hung={}",
+                                binary.spec,
+                                run.code,
+                                run.hung.is_some()
+                            ));
+                        }
                         if let Some(run) = answered {
                             let ran = Ran {
                                 run,
@@ -1057,6 +1068,15 @@ where
                                 .unwrap_or_else(PoisonError::into_inner) = Some(ran);
                         }
                     }
+                    drop(charged);
+                    // A reap point: with no binary of this dispatch left running (read here,
+                    // never under the count's locks, which a dispatch holding its own lock may
+                    // wait on) and no child of the run alive, the pool is counted.
+                    if let Some(pool) = pool {
+                        let none_runs =
+                            state.lock().unwrap_or_else(PoisonError::into_inner).held() == 0;
+                        count_at_reap(pool, &|| none_runs && idle());
+                    }
                 }
             });
         }
@@ -1065,6 +1085,19 @@ where
         .into_iter()
         .map(|a| a.into_inner().unwrap_or_else(PoisonError::into_inner))
         .collect()
+}
+
+/// Count the release's pool at a reap point of this run, a binary's or a stage's end, once
+/// `quiet` says nothing of the run is left running (asked again under the count's locks,
+/// [`aterm_capacity::Jobserver::count_alone`]): a loss is written back and recorded with the
+/// clients noted since the last whole count, and each whole count closes that window, so a
+/// later record names only the clients reaped after it.
+pub(crate) fn count_at_reap(pool: &aterm_capacity::Jobserver, quiet: &dyn Fn() -> bool) {
+    if quiet()
+        && let Err(why) = pool.count_alone(quiet)
+    {
+        eprintln!("verify: the release's pool was not counted: {why}");
+    }
 }
 
 /// Actual per-binary custody. Memory is acquired before pool tokens. A failed permit drops
@@ -1277,7 +1310,7 @@ fn binary_permit_observed<'a>(
     pool: Option<&'a aterm_capacity::Jobserver>,
     b: &Planned,
     waiters: &BinaryWaiters,
-    alone: bool,
+    alone: &dyn Fn() -> bool,
     pass: Option<(&Mutex<AdmissionPass>, u64)>,
 ) -> (
     Option<Result<BinaryPermit<'a>, std::io::Error>>,
@@ -1354,7 +1387,7 @@ fn binary_permit_with<'a>(
         Option<aterm_capacity::Admit>,
     ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error>,
 ) -> Option<Result<BinaryPermit<'a>, std::io::Error>> {
-    binary_permit_noting(ctx, pool, b, attempt, false, &mut None)
+    binary_permit_noting(ctx, pool, b, attempt, &|| false, &mut None)
 }
 
 fn binary_permit_noting<'a>(
@@ -1365,7 +1398,7 @@ fn binary_permit_noting<'a>(
         aterm_capacity::Need,
         Option<aterm_capacity::Admit>,
     ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error>,
-    alone: bool,
+    alone: &dyn Fn() -> bool,
     waiting: &mut Option<test_waits::Reason>,
 ) -> Option<Result<BinaryPermit<'a>, std::io::Error>> {
     let claim = if let Some(ctx) = ctx.filter(|ctx| ctx.memory.is_some()) {
@@ -1403,18 +1436,35 @@ fn binary_permit_noting<'a>(
         None => None,
         Some(pool) => {
             let mut tokens = Vec::new();
-            for _ in 0..b.charge {
+            let mut counted = false;
+            while tokens.len() < b.charge as usize {
                 match pool.try_acquire() {
                     Ok(Some(token)) => tokens.push(token),
-                    // LOST TOKENS. `alone` says no binary of this dispatch runs and no child of
-                    // this run is alive, so no holder this run knows of is left to give a token
-                    // back: a GNU client that died holding one took it with it, and the pool
-                    // cannot name that. Waiting for the whole charge would then never end, so
-                    // the binary takes the tokens there are and runs within them
-                    // ([`BinaryPermit::granted`]). It holds no more than the pool had, so the
-                    // pool's other branches are never overdrawn.
-                    Ok(None) if alone && !tokens.is_empty() => break,
                     Ok(None) => {
+                        // LOST TOKENS. `alone` says no binary of this dispatch runs and no child
+                        // of this run is alive, so no holder this run knows of is left to give a
+                        // token back: a GNU client that died holding one took it with it. The
+                        // pool's sole adopter counts it then, with the tokens it holds, against
+                        // the allocation published beside it, and makes it whole
+                        // ([`aterm_capacity::Jobserver::count_alone`], asking `alone` again
+                        // under its locks); the binary then takes its whole charge.
+                        let lone = alone();
+                        if lone && !std::mem::replace(&mut counted, true) {
+                            match pool.count_alone(alone) {
+                                Ok(count) if count.reminted() > 0 => continue,
+                                Ok(_) => {}
+                                Err(why) => {
+                                    eprintln!("verify: the release's pool was not counted: {why}");
+                                }
+                            }
+                        }
+                        // A count that was not judged (another adopter, a transfer in flight, a
+                        // wait in its read) leaves the binary to the tokens there are, at least one, its width
+                        // within them ([`BinaryPermit::granted`]): no more than the pool had,
+                        // so no other holder is overdrawn.
+                        if lone && !tokens.is_empty() {
+                            break;
+                        }
                         *waiting = Some(test_waits::Reason::fifo());
                         return None;
                     }
@@ -1601,215 +1651,6 @@ pub const FAILURE_OUTPUT_BYTES: usize = 2048;
 /// release reader's 64 KiB line cap beside ten full failure blocks and the hang detail.
 const HUNG_CASES_SHOWN: usize = 8;
 
-/// What a run carries from prior successful binaries ([`carry`]).
-pub struct Carried {
-    /// The binaries that run, in their order.
-    pub run: Vec<Binary>,
-    /// The binaries carried, with current evidence and the prior execution wall.
-    pub carried: Vec<CarriedBinary>,
-    /// The current evidence of every candidate binary, by spec.
-    pub known: BTreeMap<String, Evidence>,
-    /// Each binary a bounded prior proof was offered for and which runs again, with the first
-    /// thing that differs ([`refusal`]), in the binaries' order.
-    pub refused: Vec<(String, String)>,
-}
-
-/// Why a bounded prior proof does not carry `evidence`'s binary: a content key that differs
-/// names the parts that moved, so a part no two runs can share is read off the first report.
-fn refusal(golden: bool, prior: &CarryProof, evidence: &Evidence) -> String {
-    if golden {
-        return format!("{} always runs", crate::checks::GOLDEN.0);
-    }
-    if let Some(reason) = &evidence.reason {
-        return format!("unbounded here: {reason}");
-    }
-    if prior.exe_sha256 != evidence.exe_sha256 {
-        return "executable bytes changed".into();
-    }
-    let moved = moved_parts(&prior.key_parts, &evidence.parts);
-    if moved.is_empty() {
-        "content key changed; the prior proof names no parts".into()
-    } else {
-        format!("content key moved in {}", moved.join(", "))
-    }
-}
-
-/// The report's lines for the offered proofs that did not carry: one per reason, most frequent
-/// first, each with its count and one binary it holds for.
-fn refused_lines(refused: &[(String, String)]) -> Vec<String> {
-    let mut reasons: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (spec, why) in refused {
-        reasons.entry(why.as_str()).or_default().push(spec.as_str());
-    }
-    let mut reasons: Vec<_> = reasons.into_iter().collect();
-    reasons.sort_by_key(|(_, specs)| std::cmp::Reverse(specs.len()));
-    reasons
-        .into_iter()
-        .map(|(why, specs)| {
-            format!(
-                "  offered and run again: {} ({why}), as {}",
-                specs.len(),
-                specs[0]
-            )
-        })
-        .collect()
-}
-
-/// A prior success reused without executing this hop.
-pub struct CarriedBinary {
-    pub binary: Binary,
-    pub evidence: Evidence,
-    /// The prior run's global libtest JSON decision, which is part of the reconstructed command.
-    pub json: bool,
-    pub prior_execution_s: f64,
-    /// The release run whose execution this is, when its proof names one.
-    pub origin_run: Option<String>,
-}
-
-/// Which of `bins` a run carries. `evidence` runs for every binary, including a first run
-/// with an empty `passed` set. A binary is carried only when its prior outcome was `ok` (enforced
-/// by [`read_passed`]), both input sets are bounded, executable and complete content key match,
-/// and its package is not [`crate::checks::GOLDEN`]'s. The rest run, in their original order.
-pub fn carry(
-    passed: &Passed,
-    bins: Vec<Binary>,
-    evidence: impl Fn(&Binary, Option<&CarryProof>) -> Evidence + Sync,
-    jobs: usize,
-) -> Carried {
-    let golden = |b: &Binary| {
-        b.record.var("CARGO_PKG_NAME").and_then(OsStr::to_str) == Some(crate::checks::GOLDEN.0)
-    };
-    let asked: Vec<usize> = (0..bins.len()).collect();
-    let evidence = pool(bins.len(), &asked, jobs, |i| {
-        evidence(&bins[i], passed.get(&bins[i].spec))
-    });
-    let mut known = BTreeMap::new();
-    let (mut run, mut carried, mut refused) = (Vec::new(), Vec::new(), Vec::new());
-    for (binary, evidence) in bins.into_iter().zip(evidence) {
-        let evidence = evidence.expect("every candidate binary was assigned to the evidence pool");
-        known.insert(binary.spec.clone(), evidence.clone());
-        let prior = passed.get(&binary.spec);
-        let matches = !golden(&binary)
-            && evidence.bounded()
-            && prior.is_some_and(|prior| {
-                prior.outcome == "ok"
-                    && prior.inputs_bounded
-                    && prior.exe_sha256 == evidence.exe_sha256
-                    && prior.content_key == evidence.content_key
-            });
-        if matches {
-            carried.push(CarriedBinary {
-                json: prior.expect("matched prior proof").json,
-                prior_execution_s: prior.expect("matched prior proof").execution_s,
-                origin_run: prior.expect("matched prior proof").origin_run.clone(),
-                binary,
-                evidence,
-            });
-        } else {
-            if let Some(prior) = prior.filter(|prior| prior.outcome == "ok" && prior.inputs_bounded)
-            {
-                refused.push((
-                    binary.spec.clone(),
-                    refusal(golden(&binary), prior, &evidence),
-                ));
-            }
-            run.push(binary);
-        }
-    }
-    Carried {
-        run,
-        carried,
-        known,
-        refused,
-    }
-}
-
-/// The `test-binary-finished` event of a binary a resume carried: its prior execution passed with
-/// exactly this executable and complete bounded runtime-input key. It runs no time in this hop,
-/// while `recorded_execution_s` preserves the prior real wall for the next hop and accounting.
-fn carried_event(carried: &CarriedBinary) -> String {
-    let binary = &carried.binary;
-    let evidence = &carried.evidence;
-    format!(
-        "verify-event: {}",
-        crate::event_log::event_value(
-            crate::event_log::EventKind::TestBinaryFinished,
-            aterm_json::json!({
-                  "test": binary.spec,
-                "outcome": "ok", "exit_code": aterm_json::Value::Null,
-                "waiting_s": 0.0, "execution_s": 0.0,
-                "cpu_s": aterm_json::Value::Null, "starved_s": aterm_json::Value::Null,
-                "peak_bytes": aterm_json::Value::Null,
-                "width": aterm_json::Value::Null, "tests": aterm_json::Value::Null,
-                "test_counts": aterm_json::Value::Null,
-                "failures": [],
-                "detail": format!(
-                    "carried{}: prior ok with equal executable and complete runtime inputs",
-                    carried
-                        .origin_run
-                        .as_deref()
-                        .map(|run| format!(" from run {run}"))
-                        .unwrap_or_default()
-                ),
-                "evidence": {
-                    "schema": crate::test_content::SCHEMA,
-                    "exe_sha256": evidence.exe_sha256,
-                    "content_key": evidence.content_key,
-                    "inputs_bounded": evidence.bounded(),
-                    "input_reason": evidence.reason,
-                },
-                "exe_sha256": evidence.exe_sha256,
-                "content_key": evidence.content_key,
-                "inputs_bounded": evidence.bounded(),
-                "input_reason": evidence.reason,
-                "key_parts": evidence.parts,
-                "json": carried.json,
-                "recorded_execution_s": carried.prior_execution_s,
-                "carried": true,
-                "carried_from": carried.origin_run,
-            })
-        )
-    )
-}
-
-/// A candidate which matched before dispatch but did not remain equal through the whole run.
-/// It never executed, so it is NOT RUN rather than a failure. This later row supersedes any
-/// older candidate for the spec and makes the test check incomplete instead of inheriting OK.
-fn unstable_carried_event(carried: &CarriedBinary, evidence: &Evidence) -> String {
-    let binary = &carried.binary;
-    format!(
-        "verify-event: {}",
-        crate::event_log::event_value(
-            crate::event_log::EventKind::TestBinaryFinished,
-            aterm_json::json!({
-                  "test": binary.spec,
-                "outcome": "NOT RUN", "exit_code": aterm_json::Value::Null,
-                "waiting_s": 0.0, "execution_s": 0.0,
-                "cpu_s": aterm_json::Value::Null, "starved_s": aterm_json::Value::Null,
-                "peak_bytes": aterm_json::Value::Null,
-                "width": aterm_json::Value::Null, "tests": aterm_json::Value::Null,
-                "test_counts": aterm_json::Value::Null,
-                "failures": [],
-                "detail": "not carried: runtime inputs changed after carry selection",
-                "evidence": {
-                    "schema": crate::test_content::SCHEMA,
-                    "exe_sha256": evidence.exe_sha256,
-                    "content_key": evidence.content_key,
-                    "inputs_bounded": false,
-                    "input_reason": evidence.reason,
-                },
-                "exe_sha256": evidence.exe_sha256,
-                "content_key": aterm_json::Value::Null,
-                "inputs_bounded": false,
-                "input_reason": evidence.reason,
-                "json": carried.json,
-                "recorded_execution_s": carried.prior_execution_s,
-                "carried": false,
-            })
-        )
-    )
-}
-
 /// Write one structured line to stderr in one `write_all` of the line and its newline
 /// (`eprintln!` writes the newline apart), and to a release's events file, where it lands whole
 /// whatever else writes ([`Ctx::record_event`]): stderr is shared with every child, and a line
@@ -1828,7 +1669,6 @@ fn binary_event(
     binary: &Binary,
     ran: &Ran,
     started: bool,
-    evidence: Option<&Evidence>,
     json: bool,
 ) -> (Outcome, String, Option<crate::test_history::Sample>) {
     let run = &ran.run;
@@ -1990,21 +1830,8 @@ fn binary_event(
                 "hang_window_s": run.hung.as_ref().map(|h| h.window.as_secs_f64()),
                 "stack_sample": stack_sample,
                 "stack_sample_error": stack_sample_error,
-                "evidence": evidence.map(|evidence| aterm_json::json!({
-                    "schema": crate::test_content::SCHEMA,
-                    "exe_sha256": evidence.exe_sha256,
-                    "content_key": evidence.content_key,
-                    "inputs_bounded": evidence.bounded(),
-                    "input_reason": evidence.reason,
-                })),
-                "exe_sha256": evidence.and_then(|evidence| evidence.exe_sha256.as_deref()),
-                "content_key": evidence.and_then(|evidence| evidence.content_key.as_deref()),
-                "inputs_bounded": evidence.map(Evidence::bounded),
-                "input_reason": evidence.and_then(|evidence| evidence.reason.as_deref()),
-                "key_parts": evidence.map(|evidence| &evidence.parts),
                 "json": json,
                 "recorded_execution_s": ran.execution.as_secs_f64(),
-                "carried": false,
             })
         )
     );
@@ -2014,7 +1841,7 @@ fn binary_event(
     let sample = (measured(run, started) || stopped).then(|| crate::test_history::Sample {
         at_ms: aterm_time::unix_millis().unwrap_or(0),
         outcome: crate::report::word(outcome).to_owned(),
-        wall_ms: if stopped { 0 } else { ms(ran.execution) },
+        wall_ms: if stopped { 0 } else { wall_ms(ran.execution) },
         cpu_ms: if stopped {
             None
         } else {
@@ -2034,7 +1861,6 @@ fn binary_event(
         cores: Some(crate::exec::test_thread_cores(width, ran.planned.charge)),
         tests,
         partition: learned_partition,
-        exe_sha256: evidence.and_then(|evidence| evidence.exe_sha256.clone()),
     });
     (outcome, event, sample)
 }
@@ -2090,6 +1916,15 @@ fn stopped_detail(stopped: &crate::libtest_json::Stopped, log: &str) -> String {
 /// ([`Run::stopped_at`]) is deliberately not measured: its caller keeps an outcome-only schema-1
 /// sample with a zero wall, so the latest FAIL is retained without replacing its last timed
 /// wall or changing duration priority.
+/// A measured run's own wall in whole milliseconds, rounded up: a binary that ran in under a
+/// millisecond still took time, and a wall of 0 is a stopped run's, which plans nothing
+/// (`test_history::Sample::timed`).
+fn wall_ms(execution: Duration) -> u64 {
+    u64::try_from(execution.as_micros().div_ceil(1000))
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
 fn measured(run: &Run, started: bool) -> bool {
     started
         && run.stopped_at.is_none()
@@ -2121,42 +1956,6 @@ pub fn poles(bins: &[Binary], walls: &[Duration], total: Duration) -> String {
         crate::report::duration(total.as_secs_f64()),
         named.join(", ")
     )
-}
-
-/// Run `run(i)` for each distinct index below `n` in `order`, `jobs` at a time (at least one),
-/// each worker booking its children into the calling stage's memory meter
-/// ([`crate::memory::current`]) and handing them its cover marker ([`crate::memory::cover`]).
-/// Workers also retain the actual stage reservation so a nested bounded walk can outlive
-/// its pool callback without releasing memory still used by that walk.
-pub fn pool<T, F>(n: usize, order: &[usize], jobs: usize, run: F) -> Vec<Option<T>>
-where
-    T: Send,
-    F: Fn(usize) -> T + Sync,
-{
-    let answers: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    let next = AtomicUsize::new(0);
-    let meter = crate::memory::current();
-    let cover = crate::memory::cover();
-    let resources = crate::current_resource_claim();
-    std::thread::scope(|scope| {
-        for _ in 0..jobs.clamp(1, order.len().max(1)) {
-            scope.spawn(|| {
-                let _metering = crate::memory::metering(meter.clone());
-                let _covering = crate::memory::covering(cover.clone());
-                let _reservation = crate::holding_resource_claim(resources.clone());
-                while let Some(&i) = order.get(next.fetch_add(1, Ordering::SeqCst)) {
-                    let out = run(i);
-                    *answers[i]
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(out);
-                }
-            });
-        }
-    });
-    answers
-        .into_iter()
-        .map(|s| s.into_inner().ok().flatten())
-        .collect()
 }
 
 /// The command that runs `b` as cargo would have, with `threads` test threads sharing the `cores`
@@ -2478,8 +2277,8 @@ fn split_unrun<'a>(
 /// Decide the test run's rows from each binary's run: one COULD NOT RUN row per binary
 /// [`split_unrun`] takes out, `label — spec: why`, in declared order, then `decide` over the
 /// [`combined`] log of the rest, unless it took out every binary (so a run of unrun binaries
-/// alone has no [`crate::libtest::RAN_NO_TEST`] row). No binary at all, a resume that carried
-/// every one ([`carry`]), is decided as before.
+/// alone has no [`crate::libtest::RAN_NO_TEST`] row). With no binary at all, `decide` reads the
+/// empty log.
 fn decide_runs(
     r: &mut Report,
     bins: &[Binary],
@@ -2599,16 +2398,41 @@ impl Cores {
 
 /// The plan a run dispatches: each binary's width, charge and peak planned on the recording
 /// pass's grant ([`Cores::planned_on`]), dispatched within the cores the run asked
-/// ([`Cores::dispatch_share`], [`test_plan::Plan::within`]).
+/// ([`Cores::dispatch_share`], [`test_plan::Plan::within`]), the binaries of `scope`'s seeds
+/// first ([`plan_from_history`]).
 fn dispatch_plan(
     history: &crate::test_history::History,
     bins: &[Binary],
+    scope: &crate::scope::Scope,
     cores: Cores,
     ceiling: Option<u32>,
     fallback_peak: u64,
 ) -> Plan {
-    plan_from_history(history, bins, cores.planned_on(), ceiling, fallback_peak)
-        .within(cores.dispatch_share())
+    plan_from_history(
+        history,
+        bins,
+        scope,
+        cores.planned_on(),
+        ceiling,
+        fallback_peak,
+    )
+    .within(cores.dispatch_share())
+}
+
+/// Keep recorded binary budgets while allowing a release's returned credits to pack peers.
+/// Recording can observe a smaller allocation while the fixture producer holds a token. The
+/// FIFO still admits only whole charges it actually holds, including before that token returns.
+fn pool_dispatch_plan(
+    plan: Plan,
+    pool: Option<&aterm_capacity::Jobserver>,
+    test_cores: Option<u32>,
+) -> Plan {
+    let Some(pool) = pool else {
+        return plan;
+    };
+    let grant = pool.grant().max(1);
+    let ceiling = test_cores.map_or(grant, |cap| cap.clamp(1, grant));
+    plan.within(ceiling)
 }
 
 /// The `test-core-grant` event: what one claim of cores for the test run asked and was granted,
@@ -2642,7 +2466,8 @@ fn core_grant_event(
 /// The `test-core-grant` event of scope `dispatch`: the run's live share
 /// ([`crate::test_share::Live`]) at a look that moved it, of the cores asked, with what the look
 /// read: the load, the cores other claims hold and the load they account for, the waiters
-/// ahead, the load this run's own binaries put in, and the subprocess slots left open. Its
+/// ahead, whether the run holds the judgment turn (its share then all the room), the load this
+/// run's own binaries put in, and the subprocess slots left open. Its
 /// `source` is `recording grant` where the ledger could not be read.
 fn share_event(asked: u32, standing: &crate::test_share::Standing) -> String {
     let look = standing.look.as_ref();
@@ -2661,6 +2486,7 @@ fn share_event(asked: u32, standing: &crate::test_share::Standing) -> String {
                 "held_by_others": look.map(|l| l.others.held),
                 "others_in_load": look.map(|l| l.others.in_load),
                 "waiting_ahead": look.map(|l| l.others.waiting),
+                "holds_turn": look.map(|l| l.others.turn),
                 "own_load": standing.own_load,
             })
         )
@@ -2930,10 +2756,18 @@ pub fn run_tests(
         .filter(|l| !l.trim_start().starts_with("Running "))
         .map(|l| format!("{l}\n"))
         .collect();
+    let recording = crate::admission_rows::Recording {
+        claim: claims
+            .resources
+            .as_ref()
+            .map(|held| held.claim.record().need.mem),
+        peak: pass.usage.map(|usage| usage.peak_bytes),
+    };
     let planned = RunPlan {
         bins,
         history,
         fallback_peak,
+        recording,
         claims,
         cores,
         share,
@@ -2960,11 +2794,14 @@ pub(crate) struct RunPlan {
     pub(crate) history: crate::test_history::History,
     /// The selection's heaviest peak, else cold bound, used where a binary has no peak.
     pub(crate) fallback_peak: u64,
+    /// What the recording pass claimed and held, for the run's admission-log row.
+    pub(crate) recording: crate::admission_rows::Recording,
     /// The recording pass's memory and core claims, which go back before the dispatch: each
     /// binary then claims its own.
     pub(crate) claims: Claims,
     /// What the run asked and its recording pass was granted: the full binary set is planned on
-    /// the grant and dispatched within the ask ([`dispatch_plan`]).
+    /// the grant ([`dispatch_plan`]); pooled packing may use later returned credits without
+    /// replanning those binary budgets ([`pool_dispatch_plan`]).
     pub(crate) cores: Cores,
     /// The run's live share ([`crate::test_share`]), where its binaries claim their cores in
     /// the ledger: none under a release's pool, with no capacity book, or under `--now`.
@@ -2987,6 +2824,7 @@ impl RunPlan {
             bins,
             history: crate::test_history::History::default(),
             fallback_peak: aterm_capacity::cold_claim(None),
+            recording: crate::admission_rows::Recording::default(),
             claims: Claims {
                 resources: None,
                 granted: share,
@@ -3019,10 +2857,13 @@ fn fallback_peak(
 
 /// Plan `bins` from their history, replacing every missing peak (an unseen binary or a timed
 /// sample whose tree usage was unread) with `fallback_peak`. Thus every dispatched binary has a
-/// positive memory cost until this machine has measured one for it.
+/// positive memory cost until this machine has measured one for it. The binaries of a crate the
+/// change itself touched ([`crate::scope::Scope::touches`]: a cone's seeds; every crate of any
+/// other scope) lead the plan ([`test_plan::plan`]).
 fn plan_from_history(
     history: &crate::test_history::History,
     bins: &[Binary],
+    scope: &crate::scope::Scope,
     share: u32,
     ceiling: Option<u32>,
     fallback_peak: u64,
@@ -3038,7 +2879,11 @@ fn plan_from_history(
             })
         })
         .collect();
-    test_plan::plan(&seen, share, ceiling, fallback_peak)
+    let seeds: Vec<bool> = bins
+        .iter()
+        .map(|b| crate::scope::Scope::package_of(&b.spec).is_some_and(|name| scope.touches(name)))
+        .collect();
+    test_plan::plan(&seen, &seeds, share, ceiling, fallback_peak)
 }
 
 /// Remove one binary from a fixed plan after its JSON probe itself ended hung. Every peer keeps
@@ -3053,55 +2898,17 @@ fn remove_plan_index(plan: &mut Plan, removed: usize) {
     }
 }
 
-/// Project a fixed full-set plan onto `kept` binaries, identified by their unique Cargo rerun
-/// specs. This is what carry uses: removing an equal-content binary cannot replan a miss more
-/// widely and thereby change the command whose content key was just judged.
-fn project_plan(plan: &Plan, full: &[Binary], kept: &[Binary]) -> Plan {
-    let positions: BTreeMap<_, _> = kept
-        .iter()
-        .enumerate()
-        .map(|(index, binary)| (binary.spec.as_str(), index))
-        .collect();
-    let order: Vec<_> = plan
-        .order
-        .iter()
-        .filter_map(|planned| {
-            let spec = full.get(planned.index)?.spec.as_str();
-            positions
-                .get(spec)
-                .map(|&index| Planned { index, ..*planned })
-        })
-        .collect();
-    assert_eq!(
-        order.len(),
-        kept.len(),
-        "fixed test plan and carried binary set disagree"
-    );
-    Plan {
-        share: plan.share,
-        target: plan.target,
-        order,
-    }
-}
-
 /// Each binary's rerun spec with the width and the charge it ran at ([`Ran::planned`]): what
 /// its ledger claim or pool tokens granted where that was less than the plan
-/// ([`execution_grant`]). A run that keys each binary's content on its command (`fixed`) runs
-/// every one at the plan's width whatever it was granted, and a binary the run left unstarted
-/// has the plan's too.
-fn ran_widths(
-    bins: &[Binary],
-    plan: &Plan,
-    ran: &[Option<Ran>],
-    fixed: bool,
-) -> Vec<(String, u32, u32)> {
+/// ([`execution_grant`]). A binary the run left unstarted has the plan's.
+fn ran_widths(bins: &[Binary], plan: &Plan, ran: &[Option<Ran>]) -> Vec<(String, u32, u32)> {
     plan.order
         .iter()
         .filter_map(|planned| {
             let at = ran
                 .get(planned.index)
                 .and_then(Option::as_ref)
-                .filter(|ran| ran.started && !fixed)
+                .filter(|ran| ran.started)
                 .map_or(*planned, |ran| ran.planned);
             Some((bins.get(planned.index)?.spec.clone(), at.width, at.charge))
         })
@@ -3209,7 +3016,7 @@ fn probe_json(
                 ctx.pool.as_deref(),
                 planned,
                 &waiters,
-                exec::no_child_runs(),
+                &exec::no_child_runs,
                 None,
             );
             waits.change(index, reason);
@@ -3324,32 +3131,6 @@ pub struct Watch {
     pub seed: Option<u64>,
 }
 
-/// The salt of a run's test content keys: a release's frozen context (`--carry-context`), or
-/// for a development run that brackets its inputs ([`crate::Ctx::input_drift`]) a fixed domain
-/// of its own. A development key is compared only within its run, before and after each binary,
-/// and no proof leaves it, so one salt for every such run carries nothing between them.
-pub(crate) fn evidence_context(ctx: &crate::Ctx) -> Option<String> {
-    if ctx.release {
-        return ctx.carry_context.clone();
-    }
-    ctx.input_drift.then(|| {
-        let mut hash = aterm_digest::Sha256::new();
-        hash.update(b"aterm-dev-test-input-drift-v1\0");
-        aterm_codec::hex::encode_lower(&hash.finalize())
-    })
-}
-
-/// ` (moved: a, b)` for the key parts two observations of one binary disagree on, or nothing
-/// when either recorded none.
-fn moved_note(before: &KeyParts, after: &KeyParts) -> String {
-    let moved = moved_parts(before, after);
-    if moved.is_empty() {
-        String::new()
-    } else {
-        format!(" (moved: {})", moved.join(", "))
-    }
-}
-
 /// Run the planned binaries: each through [`pool`], its cases read as they end ([`Watch`]), and
 /// decide the run's rows ([`decide_runs`]). The first binary that fails ends the run when its halt
 /// is armed: a JSON run ends that binary at its first decisive red case (`exec`'s `LiveCases`), a
@@ -3402,6 +3183,7 @@ fn run_planned_observed(
         mut bins,
         history,
         fallback_peak,
+        recording,
         claims,
         cores,
         share,
@@ -3409,15 +3191,20 @@ fn run_planned_observed(
         preface,
         rerun,
     } = planned;
-    bins = crate::test_shards::expand(
-        bins,
-        &history,
-        ctx.passed_binaries.as_ref().filter(|_| ctx.release),
+    bins = crate::test_shards::expand(bins, &history);
+    // Plan the complete recorded set.
+    let mut plan = pool_dispatch_plan(
+        dispatch_plan(
+            &history,
+            &bins,
+            &ctx.scope,
+            cores,
+            ctx.test_threads,
+            fallback_peak,
+        ),
+        ctx.pool.as_deref(),
+        ctx.test_cores,
     );
-    let listed = bins.len();
-    // Plan the complete recorded set. A carry may remove work, but cannot change any
-    // peer's width or charge after that peer's content key has committed to its command.
-    let mut plan = dispatch_plan(&history, &bins, cores, ctx.test_threads, fallback_peak);
     let predicted_peak = plan_claim(&plan).unwrap_or(0);
     r.raw(format!("  test binaries: {} predicted concurrent recorded bytes; reservations are per binary, released at completion; unrecorded bound {}",
         predicted_peak, fallback_peak));
@@ -3434,182 +3221,12 @@ fn run_planned_observed(
     };
     progress.enter(Phase::Planning);
     // A failed test reruns at the width its binary runs at, which the full plan sets. A probe hang
-    // or carry only projects this plan; neither replans the peers after their widths are fixed.
+    // only projects this plan; it does not replan the peers after their widths are fixed.
     let rerun_base = rerun;
     // Local packing obeys the machine's budget too; actual claims arbitrate against slices
     // and other processes at every admission, and return at each binary's completion.
     let memory = ctx.memory.as_ref().map(crate::memory::Book::budget);
-    // A candidate is judged before any harness process starts. Reconstruct the prior run's
-    // global JSON decision under this hop's already-fixed width, and carry only an equal complete
-    // key. Misses finalize their actual capacity cover after admission. The probe sees misses alone, so a
-    // binary reported as carried has not even run startup code in this hop.
-    let evidenced = AtomicU64::new(0);
-    let content_evidence = ctx.release || ctx.input_drift;
-    let verifier = crate::report::running_driver().map(str::to_owned);
-    let new_evidence_builder = || {
-        crate::test_content::EvidenceBuilder::new(
-            evidence_context(ctx),
-            verifier.clone(),
-            ctx.scratch.clone(),
-        )
-    };
-    let candidate_evidence = new_evidence_builder();
-    let fixed: BTreeMap<_, _> = plan
-        .order
-        .iter()
-        .map(|planned| (bins[planned.index].spec.clone(), *planned))
-        .collect();
-    let command_for = |binary: &Binary, json: bool| {
-        let planned = fixed
-            .get(&binary.spec)
-            .expect("every candidate binary is in the fixed test plan");
-        let command = final_binary_cmd(
-            ctx,
-            binary,
-            planned.width,
-            planned.charge,
-            checkers,
-            Watch {
-                json,
-                stop_at_red: ctx.halt.armed(),
-                seed: ctx.test_seed,
-            },
-        );
-        match exec::finalize_exact_command(command.clone(), ctx.exec_env()) {
-            Ok(finalized) => (finalized, None),
-            Err(why) => (command, Some(why)),
-        }
-    };
-    let evidence_for = |builder: &crate::test_content::EvidenceBuilder,
-                        binary: &Binary,
-                        command: &Cmd,
-                        exact_error: Option<&str>| {
-        let began = Instant::now();
-        let mut evidence = if !ctx.release && !builder.inputs_declared(binary, command) {
-            Evidence {
-                exe_sha256: None,
-                content_key: None,
-                reason: Some("runtime inputs have no complete bounded declaration".into()),
-                parts: KeyParts::new(),
-            }
-        } else if exact_error.is_some() {
-            let mut incomplete = command.clone();
-            incomplete.exact_env = false;
-            builder.evidence(binary, &incomplete)
-        } else {
-            builder.evidence(binary, command)
-        };
-        if let Some(why) = exact_error {
-            evidence.content_key = None;
-            evidence.parts.clear();
-            evidence.reason = Some(format!("the exact spawn environment is unbounded: {why}"));
-        }
-        evidenced.fetch_add(
-            u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        evidence
-    };
-    let candidate_for = |binary: &Binary, json: bool| {
-        let (command, exact_error) = command_for(binary, json);
-        evidence_for(
-            &candidate_evidence,
-            binary,
-            &command,
-            exact_error.as_deref(),
-        )
-    };
-    let empty_passed = Passed::new();
-    let (carried, known, refused) = if content_evidence {
-        let all = bins;
-        let Carried {
-            run,
-            carried,
-            mut known,
-            refused,
-        } = carry(
-            // Only a release carries: a development run's bracket runs every binary.
-            ctx.passed_binaries
-                .as_ref()
-                .filter(|_| ctx.release)
-                .unwrap_or(&empty_passed),
-            all.clone(),
-            |binary, prior| {
-                prior.map_or_else(
-                    || Evidence {
-                        exe_sha256: None,
-                        content_key: None,
-                        reason: Some("there is no prior successful execution to carry".into()),
-                        parts: KeyParts::new(),
-                    },
-                    |proof| candidate_for(binary, proof.json),
-                )
-            },
-            usize::try_from(cores.planned_on()).unwrap_or(1),
-        );
-        plan = project_plan(&plan, &all, &run);
-        for binary in &run {
-            known.remove(&binary.spec);
-        }
-        bins = run;
-        (carried, known, refused)
-    } else {
-        (Vec::new(), BTreeMap::new(), Vec::new())
-    };
-    let evidence = Mutex::new(known);
-    let evidence_of = |b: &Binary| {
-        evidence
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&b.spec)
-            .cloned()
-    };
-    // Carry selection happens before a harness starts, but another miss may mutate a candidate's
-    // declared input later. Delay every carried OK until all probe/dispatch activity ends, then
-    // rehash with a fresh builder. Persistent drift becomes a final NOT RUN row and an incomplete
-    // check; `read-only = true` is the run-wide audit boundary for transient restore writes.
-    let finish_carried = || {
-        let mut drifted = Vec::new();
-        for candidate in &carried {
-            let (command, exact_error) = command_for(&candidate.binary, candidate.json);
-            let after = evidence_for(
-                &new_evidence_builder(),
-                &candidate.binary,
-                &command,
-                exact_error.as_deref(),
-            );
-            if after == candidate.evidence {
-                evidence
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(candidate.binary.spec.clone(), after);
-                emit(ctx, &carried_event(candidate));
-            } else {
-                let changed = Evidence {
-                    exe_sha256: after
-                        .exe_sha256
-                        .clone()
-                        .or_else(|| candidate.evidence.exe_sha256.clone()),
-                    content_key: None,
-                    reason: Some(format!(
-                        "runtime inputs changed after carry selection; the run-wide read-only \
-                         declaration was violated{}",
-                        moved_note(&candidate.evidence.parts, &after.parts)
-                    )),
-                    parts: KeyParts::new(),
-                };
-                evidence
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(candidate.binary.spec.clone(), changed.clone());
-                emit(ctx, &unstable_carried_event(candidate, &changed));
-                drifted.push(candidate.binary.spec.clone());
-            }
-        }
-        drifted
-    };
     let mut preface = preface;
-    let mut probe_hung_count = 0_usize;
     let mut probe_samples = Vec::new();
     progress.enter(Phase::Probing);
     let probe = loop {
@@ -3635,7 +3252,7 @@ fn run_planned_observed(
                     waiting: Duration::ZERO,
                     execution: elapsed,
                 };
-                let (outcome, event, sample) = binary_event(&binary, &ran, true, None, true);
+                let (outcome, event, sample) = binary_event(&binary, &ran, true, true);
                 let red = mark_red_decided(outcome, ctx.halt.armed(), None);
                 emit(ctx, &event);
                 if red {
@@ -3659,7 +3276,6 @@ fn run_planned_observed(
                     label,
                     |r, run| decide(ctx, r, run, label, &hung_rerun),
                 );
-                probe_hung_count += 1;
                 remove_plan_index(&mut plan, index);
                 if bins.is_empty() {
                     if let Some(Err(why)) = ctx
@@ -3669,15 +3285,6 @@ fn run_planned_observed(
                     {
                         r.raw(format!(
                             "  test binaries' history not kept (planning data only): {why}"
-                        ));
-                    }
-                    let drifted = finish_carried();
-                    if !drifted.is_empty() {
-                        r.cannot_run(format!(
-                            "{label} — {} carried candidate(s) changed after selection and were \
-                             not run: {}",
-                            drifted.len(),
-                            drifted.join(", ")
                         ));
                     }
                     return;
@@ -3698,9 +3305,6 @@ fn run_planned_observed(
         stop_at_red: ctx.halt.armed(),
         seed: ctx.test_seed,
     };
-    // Each miss finalizes and retains its exact command under its own admitted cover. The
-    // same frozen command brackets both content observations, even after its claim ends.
-    let commands: Mutex<BTreeMap<String, (Cmd, Option<String>)>> = Mutex::new(BTreeMap::new());
     let meter = crate::memory::current();
     let live = || meter.as_ref().and_then(|m| m.live_rate()).unwrap_or(0.0);
     let ceiling = ctx.exec_env().child_ceiling;
@@ -3709,67 +3313,10 @@ fn run_planned_observed(
     let spent = || ceiling.is_some_and(|limit| started.elapsed() >= limit);
     let stop = || spent() || ctx.halted().is_some();
     let dispatch_samples = Mutex::new(Vec::with_capacity(bins.len()));
-    // A successful process whose declared inputs do not bracket its execution has not supplied
-    // a stable verdict for this tree. Keep its unbounded event as a tombstone and make the
-    // aggregate check COULD NOT RUN after every child has settled.
-    let miss_drift = Mutex::new(Vec::new());
     // Hear one binary's end: classify its red before event I/O can hold up the local stop, emit
     // its FAIL before the halt's NOT RUN events, arm that run-wide halt, and keep its sample.
     let ended = |binary: &Binary, ran: &Ran, halt: Option<&dyn Fn()>| {
-        if content_evidence && ran.started && ran.run.ok {
-            let (command, exact_error) = commands
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&binary.spec)
-                .cloned()
-                .expect("every successful miss keeps its exact command");
-            let after = evidence_for(
-                &new_evidence_builder(),
-                binary,
-                &command,
-                exact_error.as_deref(),
-            );
-            let mut evidence = evidence.lock().unwrap_or_else(PoisonError::into_inner);
-            let before = evidence.get(&binary.spec).cloned();
-            let stable = match before {
-                Some(before) if before == after => after,
-                Some(before) => {
-                    miss_drift
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push(binary.spec.clone());
-                    Evidence {
-                        reason: Some(format!(
-                            "runtime inputs changed while the test binary ran; its read-only \
-                             declaration was violated{}",
-                            moved_note(&before.parts, &after.parts)
-                        )),
-                        exe_sha256: after.exe_sha256.or(before.exe_sha256),
-                        content_key: None,
-                        parts: KeyParts::new(),
-                    }
-                }
-                None => {
-                    miss_drift
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push(binary.spec.clone());
-                    Evidence {
-                        exe_sha256: after.exe_sha256,
-                        content_key: None,
-                        reason: Some(
-                            "runtime inputs were not captured immediately before the test binary ran"
-                                .into(),
-                        ),
-                        parts: KeyParts::new(),
-                    }
-                }
-            };
-            evidence.insert(binary.spec.clone(), stable);
-        }
-        let evidence = evidence_of(binary);
-        let (outcome, event, sample) =
-            binary_event(binary, ran, ran.started, evidence.as_ref(), watch.json);
+        let (outcome, event, sample) = binary_event(binary, ran, ran.started, watch.json);
         let red = mark_red_decided(outcome, ctx.halt.armed(), halt);
         emit(ctx, &event);
         if red {
@@ -3804,25 +3351,7 @@ fn run_planned_observed(
                 }
                 env.child_ceiling = Some(left);
             }
-            let (cmd, exact_error) = if content_evidence {
-                command_for(b, watch.json)
-            } else {
-                (
-                    final_binary_cmd(ctx, b, planned.width, planned.charge, checkers, watch),
-                    None,
-                )
-            };
-            if content_evidence {
-                commands
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(b.spec.clone(), (cmd.clone(), exact_error.clone()));
-                let before = evidence_for(&new_evidence_builder(), b, &cmd, exact_error.as_deref());
-                evidence
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(b.spec.clone(), before);
-            }
+            let cmd = final_binary_cmd(ctx, b, planned.width, planned.charge, checkers, watch);
             let mut run = exec::run_test(&cmd, env, local_halt);
             if cmd.test_cases.as_ref().is_some_and(|w| w.json) {
                 // The raw events were the child's log; every reader takes libtest's report.
@@ -3872,14 +3401,6 @@ fn run_planned_observed(
             Some(left)
         })
         .collect();
-    let mut miss_drift = miss_drift
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    miss_drift.sort();
-    miss_drift.dedup();
-    let carried_drift = finish_carried();
-    let carried_stable = carried.len().saturating_sub(carried_drift.len());
     let mut samples = probe_samples;
     samples.extend(
         dispatch_samples
@@ -3901,6 +3422,9 @@ fn run_planned_observed(
     // not the sum of dispatched binary rows alone. Preserve that distinction, and an unread
     // or overlapping sample, rather than allocating setup CPU to tests that did not use it.
     let binary = BinaryCpu::of(ran.iter().flatten());
+    crate::admission_rows::tests(ctx, label, &bins, &ran, &history, recording);
+    ctx.tests_cpu_ms
+        .fetch_add(binary.ns / 1_000_000, std::sync::atomic::Ordering::Relaxed);
     let stage_ns = crate::memory::current()
         .and_then(|meter| meter.observed_cpu())
         .map(|cpu| cpu.nanoseconds);
@@ -3923,11 +3447,10 @@ fn run_planned_observed(
             )
         ),
     );
-    // What the binaries' memory claim was, what the run carried and what hashing the
-    // executables cost, how the binaries used their charges and whether their history was kept,
-    // in a halted run's report as in a whole one's.
+    // What the binaries' memory claim was, how the binaries used their charges and whether their
+    // history was kept, in a halted run's report as in a whole one's.
     // A failed test reruns at the width its binary ran at and the grant it ran under.
-    let rerun = rerun_base.at_widths(ran_widths(&bins, &plan, &ran, content_evidence));
+    let rerun = rerun_base.at_widths(ran_widths(&bins, &plan, &ran));
     let accounted = |r: &mut Report| {
         r.raw(summary(&plan, &ran));
         if let Some((least, most)) = share.as_ref().and_then(crate::test_share::Live::range) {
@@ -3936,41 +3459,6 @@ fn run_planned_observed(
                  each start",
                 plan.share
             ));
-        }
-        if content_evidence {
-            r.raw(format!(
-                "  test binaries: {} of {listed} carried (prior ok, executable and complete \
-                 runtime inputs equal through dispatch); {} run; {} invalidated",
-                carried_stable,
-                bins.len() + probe_hung_count,
-                carried_drift.len()
-            ));
-            for line in refused_lines(&refused) {
-                r.raw(line);
-            }
-        }
-        if content_evidence {
-            let evidence = evidence.lock().unwrap_or_else(PoisonError::into_inner);
-            let bounded = evidence.values().filter(|item| item.bounded()).count();
-            let mut unbounded: BTreeMap<&str, usize> = BTreeMap::new();
-            for reason in evidence.values().filter_map(|item| item.reason.as_deref()) {
-                *unbounded.entry(reason).or_default() += 1;
-            }
-            r.raw(format!(
-                "  test binaries' content evidence: {bounded} bounded, {} unbounded, {} \
-                 executables hashed in {} summed over workers",
-                listed.saturating_sub(bounded),
-                evidence
-                    .values()
-                    .filter(|item| item.exe_sha256.is_some())
-                    .count(),
-                crate::report::duration(
-                    Duration::from_nanos(evidenced.load(Ordering::Relaxed)).as_secs_f64()
-                )
-            ));
-            for (reason, count) in unbounded.into_iter().take(crate::report::FINDINGS_SHOWN) {
-                r.raw(format!("    unbounded ({count}): {reason}"));
-            }
         }
     };
     let tail = |r: &mut Report| {
@@ -4011,30 +3499,6 @@ fn run_planned_observed(
             "{label} — {} of {} test binaries not run: {words}",
             stopped.len(),
             bins.len()
-        ));
-        return;
-    }
-    if !carried_drift.is_empty() && runs.iter().all(|run| run.ok) {
-        r.raw(preface);
-        accounted(r);
-        r.raw(combined(&bins, &runs).output);
-        tail(r);
-        r.cannot_run(format!(
-            "{label} — {} carried candidate(s) changed after selection and were not run: {}",
-            carried_drift.len(),
-            carried_drift.join(", ")
-        ));
-        return;
-    }
-    if !miss_drift.is_empty() && runs.iter().all(|run| run.ok) {
-        r.raw(preface);
-        accounted(r);
-        r.raw(combined(&bins, &runs).output);
-        tail(r);
-        r.cannot_run(format!(
-            "{label} — runtime inputs changed while {} successful test binary(s) ran: {}",
-            miss_drift.len(),
-            miss_drift.join(", ")
         ));
         return;
     }
@@ -4085,6 +3549,7 @@ pub(crate) fn dispatch_each<T: Send>(n: usize, run: impl Fn(usize) -> T + Sync) 
         .collect();
     let plan = test_plan::plan(
         &vec![None; n],
+        &[],
         u32::try_from(n).unwrap_or(u32::MAX),
         None,
         0,

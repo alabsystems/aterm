@@ -423,7 +423,8 @@ fn fleet_cwd(dir: &str) -> Result<bool, &'static str> {
 /// A plain remote shell carries no task or command, names its one destination folder, and says in
 /// `why=` what it is for: the one line the driven Mac keeps for a person reviewing what was asked
 /// of it (ATERM-KI-1109-3), held here to the rule that Mac holds it to. A `req=<id>` (an earlier
-/// spawn's reply named it) joins the new shell to that request there.
+/// spawn's reply named it) joins the new shell to that request there, where it is an open request
+/// a plain fleet shell of the same requester opened: that Mac refuses any other, a worker's too.
 fn shell_spawn_head(args: &[String]) -> io::Result<String> {
     const FORM: &str = "a plain fleet shell is spawn cwd=/absolute|'cwd=~/<path>' 'why=<one line, at \
                         most 200 characters, saying what it is for>' [req=<id>] [raise=false]; \
@@ -654,7 +655,7 @@ fn refuse_local_selector(parts: &[String]) -> io::Result<()> {
         return Ok(());
     };
     let sid = &selector[1..];
-    if is_sid(sid) {
+    if crate::board::is_sid(sid) {
         return Ok(());
     }
     Err(refused(format!(
@@ -662,14 +663,6 @@ fn refuse_local_selector(parts: &[String]) -> io::Result<()> {
          shows it): `{}` names a session of this Mac, or several",
         aterm_codec::tty::one_line(selector, 40)
     )))
-}
-
-/// Whether `word` is a global session id (`s-<hex>`).
-fn is_sid(word: &str) -> bool {
-    word.len() <= 64
-        && word
-            .strip_prefix("s-")
-            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The options the server's dispatch takes off a `turn` before the turn's
@@ -900,7 +893,7 @@ pub fn spawned_sid_from_answer(answer: &str) -> Option<String> {
     let rest = line.strip_prefix("OK ")?;
     rest.split_whitespace()
         .map(|w| w.trim_start_matches('@'))
-        .find(|w| is_sid(w))
+        .find(|w| crate::board::is_sid(w))
         .map(str::to_owned)
 }
 
@@ -911,7 +904,7 @@ fn any_target_sid<'a>(
 ) -> io::Result<&'a str> {
     if let Some(sel) = selector {
         let sid = sel.trim_start_matches('@');
-        if is_sid(sid) {
+        if crate::board::is_sid(sid) {
             return Ok(sid);
         }
     }
@@ -919,7 +912,7 @@ fn any_target_sid<'a>(
         && let Some(first) = args.first()
     {
         let sid = first.trim_start_matches('@');
-        if is_sid(sid) {
+        if crate::board::is_sid(sid) {
             return Ok(sid);
         }
     }
@@ -1010,7 +1003,7 @@ pub(crate) fn resolve_any_sid_hosts(
             for session in &survey.sessions {
                 if let Some(found_sid) = session.get("sid") {
                     let clean = found_sid.trim_start_matches('@');
-                    if is_sid(clean) && !placed.contains_key(clean) {
+                    if crate::board::is_sid(clean) && !placed.contains_key(clean) {
                         let nodes = discovered.entry(clean.to_owned()).or_default();
                         if !nodes.iter().any(|existing| existing == node) {
                             nodes.push(node.to_owned());
@@ -1241,7 +1234,13 @@ fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::R
     }
     // The answer's first line says what the lock there decided, whatever follows it and
     // however printing it goes; the row goes to the writer thread, never onto this answer's way.
-    let printed = print_answer(&mut reader, status, (request, verb), &label, within);
+    let printed = print_answer(
+        &mut reader,
+        (status, complete),
+        (request, verb),
+        &label,
+        within,
+    );
     asked.note(aterm_types::fleet_activity::kind_of_line(request), status);
     printed.map(Exchange::Completed)
 }
@@ -1250,7 +1249,7 @@ fn exchange(link: DriveLink, request: &str, verb: &str, within: Within) -> io::R
 /// [`exchange`] frames it; the exit status it gives.
 fn print_answer(
     reader: &mut BufReader<Box<dyn DriveStream>>,
-    status: &str,
+    (status, complete): (&str, bool),
     (request, verb): (&str, &str),
     label: &str,
     within: Within,
@@ -1259,6 +1258,11 @@ fn print_answer(
     let (head, tail) = status.split_once(' ').unwrap_or((status, ""));
     if head != "OK" {
         stderr_line(status)?;
+        if complete && head == "ERR" && verb == "ls" {
+            stderr_line(&format!(
+                "{label} is reachable; use `survey` to list sessions or `version` to probe the connection"
+            ))?;
+        }
         return Ok(ExitCode::FAILURE);
     }
     if streams_payload(verb, request) {

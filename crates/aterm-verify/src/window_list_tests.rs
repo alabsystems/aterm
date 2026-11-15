@@ -26,7 +26,7 @@ fn the_reading_is_the_devtools_subject_and_list() {
 
 /// The sid a test's rendezvous names.
 #[cfg(unix)]
-const SID: &str = "s-5e55";
+const SID: &str = "t5e55000000";
 
 /// A rendezvous whose graph names `SID`'s instance: a socket served once, on a thread of its
 /// own, by an instance that reads the two request lines it is sent, answers `reply`, and gives

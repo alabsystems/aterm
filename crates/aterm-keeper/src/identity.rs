@@ -181,6 +181,41 @@ impl PeerCheck {
     }
 }
 
+/// What the code checks of one caller cost ([`Identity::check_named_costed`]): totals that only
+/// rise, added on the helper thread that ran each check as that check returns.
+///
+/// `cpu_ns / checks` is the helper thread's CPU per check. Security.framework may also spend CPU
+/// on threads of its own, which this does not see. A process's whole CPU
+/// (`aterm_uds::cpu::process_ns`) read beside these bounds that from above and does not
+/// measure it: what is left of it holds every other thread of the process as well. The live
+/// macOS law `a_costed_check_is_counted_on_the_helper_that_ran_it` holds these: it counts
+/// `checks` over real checks, and nothing asserts a value of `cpu_ns`, which is a clock's
+/// reading.
+#[derive(Debug, Default)]
+pub struct CheckCost {
+    /// Checks whose helper returned (a check its caller stopped waiting for is counted when it
+    /// returns; one that never returns is not).
+    pub checks: std::sync::atomic::AtomicU64,
+    /// The helper threads' CPU time inside those checks, in nanoseconds.
+    pub cpu_ns: std::sync::atomic::AtomicU64,
+}
+
+/// `check` on the calling thread (a helper started for it), its CPU time and its return added to
+/// `cost`.
+#[cfg(target_vendor = "apple")]
+fn costed(
+    cost: &CheckCost,
+    check: impl FnOnce() -> Result<(), CheckError>,
+) -> Result<(), CheckError> {
+    use std::sync::atomic::Ordering;
+    let before = aterm_uds::cpu::thread_ns();
+    let answer = check();
+    let spent = aterm_uds::cpu::thread_ns().saturating_sub(before);
+    cost.cpu_ns.fetch_add(spent, Ordering::Relaxed);
+    cost.checks.fetch_add(1, Ordering::Relaxed);
+    answer
+}
+
 /// Which identity a peer must prove.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IdentityPolicy {
@@ -422,7 +457,26 @@ impl Identity {
         within: Duration,
     ) -> Result<(), CheckError> {
         let hang = within.max(aterm_uds::peer::CHECK_HANG);
-        self.begin_check(stream, token, hang)
+        self.begin_check(stream, token, hang, None)
+            .wait(hang)
+            .unwrap_or_else(|check| Err(CheckError::Unanswered(check.unanswered())))
+    }
+
+    /// [`Self::check_named`], the code check's cost added to `cost` by the helper thread that
+    /// runs it: the same check and the same answer. A check settled without the helper (a uid
+    /// refused, no token, a token that does not name the connected peer, no requirement in
+    /// force) adds nothing.
+    /// # Errors
+    /// As [`Self::check`].
+    pub fn check_named_costed(
+        &self,
+        stream: &CtlStream,
+        token: Option<aterm_uds::peer::AuditToken>,
+        within: Duration,
+        cost: &std::sync::Arc<CheckCost>,
+    ) -> Result<(), CheckError> {
+        let hang = within.max(aterm_uds::peer::CHECK_HANG);
+        self.begin_check(stream, token, hang, Some(cost))
             .wait(hang)
             .unwrap_or_else(|check| Err(CheckError::Unanswered(check.unanswered())))
     }
@@ -434,7 +488,7 @@ impl Identity {
         stream: &CtlStream,
         token: Option<aterm_uds::peer::AuditToken>,
     ) -> PeerCheck {
-        self.begin_check(stream, token, aterm_uds::peer::CHECK_HANG)
+        self.begin_check(stream, token, aterm_uds::peer::CHECK_HANG, None)
     }
 
     fn begin_check(
@@ -442,6 +496,7 @@ impl Identity {
         stream: &CtlStream,
         token: Option<aterm_uds::peer::AuditToken>,
         suspect: Duration,
+        cost: Option<&std::sync::Arc<CheckCost>>,
     ) -> PeerCheck {
         #[cfg(unix)]
         if !self.any_uid {
@@ -462,7 +517,7 @@ impl Identity {
         }
         #[cfg(not(unix))]
         {
-            let _ = (stream, token, suspect);
+            let _ = (stream, token, suspect, cost);
             return PeerCheck::settled(Err(CheckError::Unchecked(
                 "the keeper is Unix-only".to_string(),
             )));
@@ -485,12 +540,17 @@ impl Identity {
                 Err(why) => return PeerCheck::settled(Err(CheckError::from(why))),
             };
             let req = Arc::clone(req);
-            return PeerCheck::start(suspect, move || {
-                captured.check(&req).map_err(CheckError::from)
-            });
+            return match cost.map(Arc::clone) {
+                Some(cost) => PeerCheck::start(suspect, move || {
+                    costed(&cost, || captured.check(&req).map_err(CheckError::from))
+                }),
+                None => PeerCheck::start(suspect, move || {
+                    captured.check(&req).map_err(CheckError::from)
+                }),
+            };
         }
         #[cfg(all(unix, not(target_vendor = "apple")))]
-        let _ = (suspect, token);
+        let _ = (suspect, token, cost);
         #[allow(unreachable_code)]
         PeerCheck::settled(Ok(()))
     }

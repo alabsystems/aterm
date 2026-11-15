@@ -588,6 +588,39 @@ pub struct DelegatedJob {
     pub members: Vec<crate::delegated::ProcessKey>,
 }
 
+/// The host's app-image proof for one process generation. A kernel PID version also changes on
+/// exec and is readable when a system service's resource usage/start record is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedRoot {
+    /// The observed process ID.
+    pub pid: u32,
+    /// Its kernel start token, where readable.
+    pub start: Option<u64>,
+    /// Its kernel PID version, changed by PID reuse and exec, where readable.
+    pub version: Option<i32>,
+}
+
+/// A native app-server job's original process, authenticated by its peer identity and source
+/// session. Its ordinary process and reaped-child counters belong to the same natural owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeRoot {
+    /// The actor's validated process generation.
+    pub process: crate::delegated::ProcessKey,
+    /// The source session's local tab key, where that session is still present.
+    pub tab: Option<u64>,
+}
+
+impl SharedRoot {
+    fn matches(self, process: &ProcSample) -> bool {
+        self.pid == process.pid
+            && (self.start.is_some() || self.version.is_some())
+            && self.start.is_none_or(|start| process.start == Some(start))
+            && self
+                .version
+                .is_none_or(|version| process.version == Some(version))
+    }
+}
+
 /// One delegated job's contribution from the same sweep as the normal scopes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DelegatedUsage {
@@ -1060,6 +1093,18 @@ pub struct PlanFact {
 /// One sample of everything, from the host's probe thread.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
+    /// End of the frontend sweep on the two native, cross-process CPU clocks.
+    pub native_cpu_cut: NativeCpuCut,
+    /// Authenticated final process counters collected by their original native owning wait.
+    /// They stay separate from live rows so a reused PID cannot replace the ended generation.
+    pub native_terminals: Vec<NativeTerminal>,
+    /// The current native origin or custodian ownership reading is incomplete.
+    pub native_incomplete: bool,
+    /// Historical native CPU evidence was lost or could not be positioned in a window.
+    /// This does not make a later complete process/coalition footprint inventory unreadable.
+    pub native_source_lost: bool,
+    /// Natural ownership evidence was lost or could not be revalidated on this reading.
+    pub ownership_incomplete: bool,
     /// Independent native hardware and power-policy observations.
     pub hardware: Option<crate::hardware::Sample>,
     /// The host's monotonic clock, ns.
@@ -1082,14 +1127,26 @@ pub struct Sample {
     pub gpu_clients: Option<crate::gpu_clients::GpuClientsSample>,
     /// The volume the focused tab works on; `None` where unreadable.
     pub volume: Option<VolumeSample>,
-    /// One process sweep; `None` when the host skipped it.
+    /// One process sweep; `None` when the host skipped it, or its lane stalled
+    /// ([`Self::stalled`]).
     pub procs: Option<Vec<ProcSample>>,
+    /// The reader lanes this sample found stalled ([`crate::lanes`]): the figures each feeds are
+    /// unknown at it, and every other figure is read.
+    pub stalled: Vec<crate::lanes::LaneStall>,
     /// This aterm instance's pid.
     pub self_pid: u32,
     /// Every tab, in the host's order.
     pub tabs: Vec<TabRoot>,
     /// Explicit jobs whose process identities were validated in this sweep.
     pub delegated: Vec<DelegatedJob>,
+    /// Generation-checked processes running this app's loaded executable or a validated signed
+    /// copy outside its instance tree.
+    /// Their descendants are shared app work; a current tab or instance lineage takes priority.
+    pub shared_roots: Vec<SharedRoot>,
+    /// Tab keys whose current shell generation could not be proved by the host.
+    pub unproved_tabs: Vec<u64>,
+    /// Authenticated original jobs admitted by the native app server outside tab process trees.
+    pub native_roots: Vec<NativeRoot>,
     /// Wall-clock timestamp of the sample in Unix ms: on a reading with a process sweep, read
     /// before the sweep lists the processes, so a process born at or after one reading's is in no
     /// earlier reading's sweep ([`crate::explain::reap`]).
@@ -1181,6 +1238,46 @@ pub struct Sample {
     /// The machine's situation and type as the host's readers last heard them
     /// ([`crate::situation`]); unread throughout where the host read none.
     pub situation: crate::situation::Situation,
+}
+
+/// End of a frontend sweep on clocks shared with native owning waits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeCpuCut {
+    /// Continuous nanoseconds since boot, including sleep; never the frontend's local epoch.
+    pub continuous_ns: Option<u64>,
+    /// Kernel boot clock in the same platform-specific units as [`ProcSample::start`].
+    /// macOS uses Mach ticks and Linux uses boot nanoseconds.
+    pub boot: Option<u64>,
+}
+
+/// Immutable source timing retained with a final native receipt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeCpuWindow {
+    /// Frontend cut preceding the receipt's first eligible delivery.
+    pub previous: NativeCpuCut,
+    /// Frontend cut of the receipt's first eligible delivery.
+    pub current: NativeCpuCut,
+    /// Exit confirmation before final reading and owning wait, continuous boot nanoseconds.
+    pub exited_ns: Option<u64>,
+}
+
+/// A final native child reading, carried once from the process that owns its wait.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeTerminal {
+    /// Source timing; rate eligibility is checked against the model's adopted whole sweeps.
+    pub timing: NativeCpuWindow,
+    /// Owning daemon identity and terminal sequence form the journal cursor.
+    pub host: crate::delegated::ProcessKey,
+    /// Monotonic terminal sequence within this daemon generation.
+    pub seq: u64,
+    /// Exact final own and reaped-child counters, with the child's original kernel start.
+    /// `state` is zombie; unavailable counters remain `None`, never an invented split.
+    pub process: ProcSample,
+    /// Exact combined own and waited-descendant CPU collected by the original wait, when read.
+    /// It remains an aggregate if the final per-process split was unavailable.
+    pub wait_cpu_ns: Option<u64>,
+    /// Owning live tab key, or aterm's own scope after its tab closed.
+    pub tab: Option<u64>,
 }
 
 impl Sample {
@@ -1307,8 +1404,12 @@ impl MemView {
 pub struct ScopeView {
     /// Cores-worth of CPU.
     pub cores: TrendView,
-    /// Summed physical footprint, bytes, where any member could be read.
+    /// Current physical footprint, bytes: a proved app coalition total where available,
+    /// otherwise the readable processes' sum. Separate from physical VM classes.
     pub footprint: Option<u64>,
+    /// Unread memory contributions or ownership/accounting gaps. A readable footprint is a
+    /// lower bound while this is nonzero, independently of CPU coverage.
+    pub footprint_unread: u32,
     /// Footprint, smoothed (as `f32` GiB), for its motion.
     pub footprint_gib: TrendView,
     /// Processes in the scope.
@@ -1360,6 +1461,7 @@ impl ScopeView {
         Self {
             cores: trend(self.cores, other.cores),
             footprint: plus(self.footprint, other.footprint, u64::saturating_add),
+            footprint_unread: self.footprint_unread.saturating_add(other.footprint_unread),
             footprint_gib: trend(self.footprint_gib, other.footprint_gib),
             procs: self.procs.saturating_add(other.procs),
             history: (0..n)
@@ -1395,6 +1497,8 @@ pub enum RowScope {
     Tab(u64),
     /// aterm's other descendants (its helpers).
     Helper,
+    /// Other instances and detached services proven to run this app or a validated signed copy.
+    Shared,
     /// The user's own processes outside aterm.
     Others,
     /// Other users' processes.
@@ -1411,6 +1515,7 @@ impl RowScope {
             Self::SelfProc => "self",
             Self::Tab(_) => "tab",
             Self::Helper => "helpers",
+            Self::Shared => "shared-aterm",
             Self::Others => "others",
             Self::Services => "services",
             Self::Unknown => "unknown",
@@ -1420,7 +1525,10 @@ impl RowScope {
     /// Whether the process is aterm's.
     #[must_use]
     pub fn in_aterm(self) -> bool {
-        matches!(self, Self::SelfProc | Self::Tab(_) | Self::Helper)
+        matches!(
+            self,
+            Self::SelfProc | Self::Tab(_) | Self::Helper | Self::Shared
+        )
     }
 }
 
@@ -1495,8 +1603,7 @@ pub struct ProcView {
     pub birth_ms: Option<i64>,
 }
 
-/// Busy CPU cores split across aterm, the user's other processes, and system or unattributed
-/// services.
+/// Busy CPU cores split into measured process contributions and a signed unknown residual.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Split {
     /// The machine's busy cores-worth (the cores' own ticks).
@@ -1505,9 +1612,9 @@ pub struct Split {
     pub aterm: f32,
     /// The user's other processes'.
     pub others: f32,
-    /// By subtraction, never below 0.
+    /// Readable other-user processes' own CPU, a lower bound for services.
     pub services: f32,
-    /// The signed residual when the subtraction went below 0, else 0.
+    /// Busy CPU less the measured contributions, including finished and unread work.
     pub unaccounted: f32,
     /// Processes whose CPU time the OS refused (another user's).
     pub unread: u32,
@@ -1538,6 +1645,8 @@ pub enum ProcScope {
     Tab(u64),
     /// aterm itself (or a child that belongs to no tab).
     Aterm,
+    /// Shared app work outside this instance's process and tab trees.
+    Shared,
     /// Everything else on the machine.
     Other,
 }
@@ -1587,6 +1696,8 @@ pub struct ProgramGroup {
     pub cores: f32,
     /// Their footprints, summed over those read; `None` when none was.
     pub footprint: Option<u64>,
+    /// Members whose footprint was unreadable; the sum is a lower bound while nonzero.
+    pub footprint_unread: u32,
     /// The earliest birth read among them, unix ms; `None` when none was.
     pub born_ms: Option<i64>,
     /// How many of them have no birth read, any of whom may be older than [`Self::born_ms`].
@@ -1601,6 +1712,7 @@ impl ProgramGroup {
             n: 0,
             cores: 0.0,
             footprint: None,
+            footprint_unread: 0,
             born_ms: None,
             unborn: 0,
         }
@@ -1611,6 +1723,8 @@ impl ProgramGroup {
         self.cores += cores;
         if let Some(f) = footprint {
             self.footprint = Some(self.footprint.unwrap_or(0).saturating_add(f));
+        } else {
+            self.footprint_unread = self.footprint_unread.saturating_add(1);
         }
         match birth_ms {
             Some(b) => self.born_ms = earliest(self.born_ms, Some(b)),
@@ -1801,6 +1915,12 @@ pub const SCOPE_RUN_BUCKETS: usize = 60;
 pub struct ScopeFig {
     /// Trailing mean in the row's native unit, or `None` before the first full reading.
     pub now: Option<f64>,
+    /// Raw CPU charge over the same trailing window as `now`, where it differs from the
+    /// independently observed actual-CPU floor. Never an actual-work lower bound.
+    pub cpu_charge: Option<f64>,
+    /// Largest number of unread contributions in the readings contributing to `now`.
+    /// Nonzero means the CPU or memory figure is a lower bound.
+    pub unread: u32,
     /// Why there is no figure at all, where that is known.
     pub missing: Option<NoFigure>,
     /// The newest [`SCOPE_RUN_BUCKETS`] of the scope's 10 s cells, oldest first, raw; empty where
@@ -1818,12 +1938,12 @@ impl ScopeFig {
         columns_of(&self.run, self.run_k, per_s, ncols, now_unix_ms)
     }
 
-    /// One tab's figure from its panes' `figs`, each a scope inside `within` (all tabs): `now`
-    /// and each run cell's mean and max (an upper bound) add over the panes that read them, so a
-    /// bucket no pane read stays hollow. Each figure is held at `within`'s so the tab stays inside
-    /// all tabs; that binds only on GPU, whose pane figures are each held at the Mac's and so can
-    /// sum past it. One pane's is its own.
-    fn sum(figs: &[&Self], within: &Self) -> Self {
+    /// One tab's figure from its panes: `now` and each run cell's mean and max (an upper bound)
+    /// add over the panes that read them, so a bucket no pane read stays hollow. An optional
+    /// ceiling bounds GPU shares whose independently held pane figures can sum past the
+    /// device. Other figures retain their sums, including panes with different read coverage.
+    /// One pane's is its own.
+    fn sum(figs: &[&Self], ceiling: Option<&Self>) -> Self {
         if let [one] = figs {
             return (*one).clone();
         }
@@ -1847,7 +1967,7 @@ impl ScopeFig {
                     cell.tau_ms = cell.tau_ms.max(c.tau_ms);
                     cell.over_ms = cell.over_ms.max(c.over_ms);
                 }
-                let all = within.run_cell(k);
+                let all = ceiling.and_then(|within| within.run_cell(k));
                 Cell {
                     mean: held(cell.mean, all.and_then(|c| c.mean)),
                     max: held(cell.max, all.and_then(|c| c.max)),
@@ -1857,7 +1977,14 @@ impl ScopeFig {
             })
             .collect();
         Self {
-            now: held(figs.iter().fold(None, |sum, f| add(sum, f.now)), within.now),
+            now: held(
+                figs.iter().fold(None, |sum, f| add(sum, f.now)),
+                ceiling.and_then(|within| within.now),
+            ),
+            cpu_charge: figs.iter().fold(None, |sum, f| add(sum, f.cpu_charge)),
+            unread: figs
+                .iter()
+                .fold(0_u32, |sum, f| sum.saturating_add(f.unread)),
             missing: figs
                 .iter()
                 .map(|f| f.missing)
@@ -1929,6 +2056,9 @@ pub struct ResourceView {
     pub tab: ScopeFig,
     /// Every tab's figure, by key, in the host's order.
     pub tabs: Vec<(u64, ScopeFig)>,
+    /// CPU figures for complete logical tabs, each with its current pane keys. These include
+    /// work whose logical tab is known after its originating pane closed.
+    pub logical_cpu: Vec<(Vec<u64>, ScopeFig)>,
     /// What the capacity is.
     pub basis: CapBasis,
     /// Secondary series for a two-series row: Network's sending (Processes has one since F4′).
@@ -2398,6 +2528,9 @@ impl Unread {
 /// Everything at one moment. Immutable once made; the host shares it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    /// Original native waits observed on this sample, including known aggregate CPU where a
+    /// final own/child split was unavailable.
+    pub native_terminals: Vec<NativeTerminal>,
     /// Most recent raw kernel core counters, for a bounded diagnostic export.
     pub cpu_counter_sample: Option<Vec<Ticks>>,
     /// Latest native hardware sample, with its own time window.
@@ -2427,8 +2560,10 @@ pub struct Snapshot {
     pub place: Option<PlaceView>,
     /// The machine.
     pub global: ScopeView,
-    /// This instance and its tabs; `None` until two sweeps exist.
+    /// App work: this instance, its tabs and proved shared app processes; no value until two sweeps.
     pub aterm: Option<ScopeView>,
+    /// The shared app slice of [`Self::aterm`], outside this instance and its tabs.
+    pub shared: Option<ScopeView>,
     /// Every tab, in the host's order; empty until two sweeps exist.
     pub tabs: Vec<TabView>,
     /// Busiest processes this sweep (at most [`TOP_PROCS`]) with attribution scope.
@@ -2444,7 +2579,8 @@ pub struct Snapshot {
     /// Latest leftover view (`sys left`): what closed tabs and dead verify runs left running,
     /// and what macOS's program check holds, each with its proof.
     pub left: Option<std::sync::Arc<crate::left::LeftView>>,
-    /// Delegated-job totals, from exactly the same process rates as the scopes.
+    /// Complete delegated-job totals, from the same process rates as the scopes. Omitted while
+    /// process or ownership coverage is incomplete; the host retains its prior dated receipt.
     pub delegated: Vec<DelegatedUsage>,
     /// Whether this reading omitted the process sweep and read machine counters only.
     pub machine_only: bool,
@@ -2465,6 +2601,9 @@ pub struct Snapshot {
     pub cores_window_ns: Option<u64>,
     /// Busy CPU breakdown across scopes, once two full sweeps and core ticks are available.
     pub split: Option<Split>,
+    /// Current common-window CPU account, including observed final own CPU and separate
+    /// ambiguous kernel charges. Process-live rates remain in the scope and process views.
+    pub scoped_cpu: Option<crate::explain::ScopeCpu>,
     /// Process rows: aterm's (up to [`ATERM_ROWS`]), the top [`TOP_ROWS`] by CPU and by
     /// footprint, and every other process with a GPU share.
     pub procs: Vec<ProcView>,
@@ -2473,6 +2612,11 @@ pub struct Snapshot {
     pub programs: Vec<ProgramGroup>,
     /// Whether the process sweep stopped at its cap.
     pub procs_truncated: bool,
+    /// Memory charges over the full process sweep, before display rows are bounded.
+    pub memory_owners: Option<MemoryOwners>,
+    /// The reader lanes this reading found stalled ([`Sample::stalled`]): the figures each feeds
+    /// are unknown, never none.
+    pub stalled: Vec<crate::lanes::LaneStall>,
     /// The thermal state, where read.
     pub thermal: Option<Thermal>,
     /// The heat chain (A4 §4): the thermal pressure level, compute watts, the Super and
@@ -2519,6 +2663,108 @@ pub struct Snapshot {
     pub situation: crate::situation::Situation,
 }
 
+/// A sum of process memory charges with its independent read coverage. Charges can include
+/// compressed pages and are not a partition of the VM's physical-memory classes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryCharge {
+    /// Readable members' charges, bytes.
+    pub bytes: u64,
+    /// Number of members counted, including unread members.
+    pub members: u32,
+    /// Members whose memory charge was unreadable.
+    pub unread: u32,
+}
+
+impl MemoryCharge {
+    /// An exact readable charge; no value where the group is absent or partly unread.
+    pub(crate) fn value(self) -> Option<u64> {
+        (self.members > 0 && self.unread == 0).then_some(self.bytes)
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.members = self.members.saturating_add(other.members);
+        self.unread = self.unread.saturating_add(other.unread);
+    }
+
+    pub(crate) fn add(&mut self, bytes: Option<u64>) {
+        self.members = self.members.saturating_add(1);
+        match bytes {
+            Some(bytes) => self.bytes = self.bytes.saturating_add(bytes),
+            None => self.unread = self.unread.saturating_add(1),
+        }
+    }
+}
+
+/// Ownership totals from process or coalition charges, without the UI's row cap.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryOwners {
+    /// This app's instances, tabs and proven shared work.
+    pub aterm: MemoryCharge,
+    /// Other work under the current user.
+    pub others: MemoryCharge,
+    /// Other users and system services.
+    pub services: MemoryCharge,
+    /// Processes whose owner could not be read, or mixed coalition charges whose members could
+    /// not all be read to separate their owners.
+    pub unknown: MemoryCharge,
+    /// Whether the process or coalition list stopped before every member/group answered.
+    pub truncated: bool,
+    /// Some roots, current members or owner identities could not be reconciled. Measured
+    /// charges remain known but their assignment among owners is incomplete.
+    pub ownership_incomplete: bool,
+}
+
+impl MemoryOwners {
+    /// Current coalition footprints are the same charged account as process footprints.
+    /// A mixed coalition moves only a readable, complete app subset; the unexplained charge
+    /// stays explicitly unknown. No footprint is subtracted from physical VM classes.
+    pub(crate) fn of_coalitions(
+        split: &crate::explain::CoalSplit,
+        provenance_incomplete: bool,
+    ) -> Self {
+        use crate::explain::Part;
+        let mut owners = Self {
+            truncated: split.list_truncated || split.rows.len() < split.listed as usize,
+            ownership_incomplete: provenance_incomplete,
+            ..Self::default()
+        };
+        for row in &split.rows {
+            let account = row.footprint_account();
+            owners.ownership_incomplete |= account.incomplete;
+            owners.aterm.merge(account.aterm);
+            match account.outside_part {
+                Some(Part::Others) => owners.others.merge(account.outside),
+                Some(Part::Services) => owners.services.merge(account.outside),
+                _ => owners.unknown.merge(account.outside),
+            }
+            owners.unknown.merge(account.unknown);
+        }
+        owners
+    }
+
+    fn of(rows: &[ProcView], truncated: bool, ownership_incomplete: bool) -> Self {
+        let mut result = Self {
+            truncated,
+            ownership_incomplete,
+            ..Self::default()
+        };
+        for row in rows {
+            let charge = if row.scope.in_aterm() {
+                &mut result.aterm
+            } else {
+                match row.scope {
+                    RowScope::Others => &mut result.others,
+                    RowScope::Services => &mut result.services,
+                    _ => &mut result.unknown,
+                }
+            };
+            charge.add(row.footprint);
+        }
+        result
+    }
+}
+
 /// aterm's own process rows kept per snapshot, busiest first.
 pub const ATERM_ROWS: usize = 512;
 /// The machine's rows kept per snapshot by CPU and, separately, by footprint.
@@ -2553,14 +2799,22 @@ impl Snapshot {
     #[must_use]
     pub fn resource(&self, res: Resource, panes: &[u64]) -> ResourceView {
         let mut v = self.resources[res.index()].clone();
+        let complete: Vec<_> = v
+            .logical_cpu
+            .iter()
+            .filter(|(keys, _)| !keys.is_empty() && keys.iter().all(|key| panes.contains(key)))
+            .collect();
         let figs: Vec<&ScopeFig> = self.resources[res.index()]
             .tabs
             .iter()
-            .filter(|(k, _)| panes.contains(k))
+            .filter(|(k, _)| {
+                panes.contains(k) && !complete.iter().any(|(keys, _)| keys.contains(k))
+            })
             .map(|(_, f)| f)
+            .chain(complete.iter().map(|(_, fig)| fig))
             .collect();
         if !figs.is_empty() {
-            v.tab = ScopeFig::sum(&figs, &v.aterm);
+            v.tab = ScopeFig::sum(&figs, (res == Resource::Gpu).then_some(&v.aterm));
         }
         v
     }
@@ -2817,6 +3071,7 @@ impl ScopeState {
         ScopeView {
             cores: self.cores.view(),
             footprint: acc.footprint,
+            footprint_unread: acc.footprint_unread,
             footprint_gib: self.footprint.view(),
             procs: acc.procs,
             history: self.history.to_vec(),
@@ -2833,7 +3088,10 @@ impl ScopeState {
 #[derive(Clone, Debug, Default)]
 struct ScopeAcc {
     cores: f32,
+    /// Raw inherited CPU charge over the ledger's exact same window as the primary figure.
+    cpu_charge: Option<f64>,
     footprint: Option<u64>,
+    footprint_unread: u32,
     procs: u32,
     top: Option<(String, f32)>,
     /// Bytes read per second, where any member's counter gave a delta.
@@ -2844,6 +3102,8 @@ struct ScopeAcc {
     wait: Option<f32>,
     /// Members whose CPU time the OS refused.
     refused: u32,
+    /// Additional gaps in the CPU scope figure: a rate with no baseline, or lost reap credit.
+    cpu_incomplete: u32,
     /// GPU share of the device across members, while client shares are held.
     gpu: Option<f32>,
 }
@@ -2857,6 +3117,8 @@ impl ScopeAcc {
         self.cores += cores;
         if let Some(f) = p.footprint {
             self.footprint = Some(self.footprint.unwrap_or(0).saturating_add(f));
+        } else {
+            self.footprint_unread = self.footprint_unread.saturating_add(1);
         }
         if let Some(rd) = r.read_bps {
             self.reads = Some(self.reads.unwrap_or(0.0) + rd);
@@ -2869,6 +3131,8 @@ impl ScopeAcc {
         }
         if p.cpu_ns.is_none() {
             self.refused += 1;
+        } else if r.cores.is_none() {
+            self.cpu_incomplete += 1;
         }
         self.procs += 1;
         if cores > 0.0 && self.top.as_ref().is_none_or(|(_, c)| cores > *c) {
@@ -3003,6 +3267,7 @@ struct SweepFigs {
 #[derive(Debug, Default)]
 struct ProcPass {
     aterm: Option<ScopeView>,
+    shared: Option<ScopeView>,
     tabs: Vec<TabView>,
     top: Vec<TopProc>,
     delegated: Vec<DelegatedUsage>,
@@ -3011,8 +3276,9 @@ struct ProcPass {
     rows: Vec<ProcView>,
     /// [`Snapshot::programs`] ([`keep_programs`]).
     programs: Vec<ProgramGroup>,
-    /// `(aterm_cores, user_other_cores, cpu_unreadable_count)` for [`Split`].
-    split_parts: Option<(f32, f32, u32)>,
+    memory_owners: Option<MemoryOwners>,
+    /// `(aterm_cores, user_other_cores, service_cores, cpu_unreadable_count)` for [`Split`].
+    split_parts: Option<(f32, f32, f32, u32)>,
     /// `(aterm, others, services)` GPU shares for [`crate::gpu_clients::GpuSplit`].
     gpu_parts: Option<(f32, f32, f32)>,
     /// The sweep's window, ns.
@@ -3045,6 +3311,8 @@ struct Rows {
     aterm: ScopeRings,
     /// Each tab's, by key.
     tabs: HashMap<u64, ScopeRings>,
+    /// Logical-tab CPU series keyed by the ledger's stable tab identity.
+    logical_cpu: HashMap<u64, ScopeRings>,
     /// aterm's input tokens per minute.
     tokens_in: Recent,
     peaks: Peaks,
@@ -3093,7 +3361,7 @@ struct Rows {
 
 /// One scope's hour rings in [`Resource::ALL`] order; a row's ring exists once the scope read it.
 #[derive(Debug, Default)]
-struct ScopeRings([Option<BucketRing>; 7]);
+struct ScopeRings([Option<BucketRing>; 7], [BucketRing; 2], BucketRing);
 
 impl ScopeRings {
     fn push(&mut self, t: Taken, vals: [Option<f64>; 7]) {
@@ -3137,7 +3405,13 @@ pub struct Vitals {
     last_runnable: HashMap<u32, u64>,
     last_read_at: HashMap<u32, u64>,
     global_foot: Trend,
+    app_footprint: Trend,
+    last_app_footprint_at: Option<u64>,
     aterm: ScopeState,
+    shared: ScopeState,
+    /// Live process origin keyed by PID and kernel start, retained across reparenting.
+    origins: HashMap<crate::delegated::ProcessKey, Origin>,
+    origins_incomplete: bool,
     tabs: HashMap<u64, ScopeState>,
     detector: crate::events::Detector,
     why: crate::explain::WhyState,
@@ -3161,10 +3435,11 @@ pub const STRIP_HISTORY_CAP: usize = 128;
 pub const STRIP_HORIZON_MS: i64 = 6 * 3_600_000;
 
 /// How many rings a strip checkpoint holds, by slot ([`SavedStrip::ring_mut`]): the seven rows',
-/// Network's send direction, memory pressure, aterm's seven and the process count.
-pub const STRIP_RINGS: usize = 17;
+/// Network's send direction, memory pressure, aterm's seven, the process count, aterm's
+/// memory/CPU coverage and raw CPU charge.
+pub const STRIP_RINGS: usize = 20;
 
-/// Persisted strip state across restarts and crashes (the strip folder's base, schema 2): an
+/// Persisted strip state across restarts and crashes (the strip folder's base, schema 3): an
 /// hour of 10 s buckets and seven of ten-minute ones, replayed forward by the tail's
 /// [`StripLine`]s.
 #[derive(Clone, Debug, PartialEq)]
@@ -3189,6 +3464,10 @@ pub struct SavedStrip {
     pub pressure: crate::ring::SavedRing,
     /// aterm-scope multi-scale rings (1-hour 10 s and 6-hour 10-minute) in [`Resource::ALL`] order.
     pub aterm: [crate::ring::SavedRing; 7],
+    /// Scope coverage in memory/CPU order; preserves lower bounds across a restart.
+    pub aterm_unread: [crate::ring::SavedRing; 2],
+    /// Inherited CPU counter charge, separate from confirmed CPU.
+    pub aterm_cpu_charge: crate::ring::SavedRing,
     /// What the Processes rings hold: starts a second (`true`), the process count (`false`), or
     /// nothing yet.
     pub proc_starts: Option<bool>,
@@ -3210,6 +3489,8 @@ impl Default for SavedStrip {
             proc_count: crate::ring::SavedRing::default(),
             pressure: crate::ring::SavedRing::default(),
             aterm: std::array::from_fn(|_| crate::ring::SavedRing::default()),
+            aterm_unread: std::array::from_fn(|_| crate::ring::SavedRing::default()),
+            aterm_cpu_charge: crate::ring::SavedRing::default(),
             proc_starts: None,
             time_gaps: Vec::new(),
             strip_events: Vec::new(),
@@ -3218,9 +3499,25 @@ impl Default for SavedStrip {
 }
 
 impl SavedStrip {
+    /// Preserve a checkpoint's measured figures when its old format did not retain coverage.
+    /// Every old CPU/memory scope reading stays explicitly incomplete at its original time.
+    pub fn mark_scope_coverage_unknown(&mut self) {
+        for (resource, coverage) in [(Resource::Memory, 0), (Resource::Cpu, 1)] {
+            let mut ring = self.aterm[resource.index()].clone();
+            for (_, agg) in ring.buckets.iter_mut().chain(&mut ring.long) {
+                *agg = unknown_coverage(*agg);
+            }
+            for (_, value, over, _) in &mut ring.recent {
+                *value = 1.0;
+                *over = false;
+            }
+            self.aterm_unread[coverage] = ring;
+        }
+    }
+
     /// The ring in slot `slot` (`0..`[`STRIP_RINGS`]): the rows' in [`Resource::ALL`] order,
     /// then Network's send direction, memory pressure, aterm's in row order and the process
-    /// count. `None` past the last.
+    /// count, aterm's memory/CPU coverage and its raw CPU charge. `None` past the last.
     pub fn ring_mut(&mut self, slot: usize) -> Option<&mut crate::ring::SavedRing> {
         match slot {
             0..7 => self.rings.get_mut(slot),
@@ -3228,6 +3525,8 @@ impl SavedStrip {
             8 => Some(&mut self.pressure),
             9..16 => self.aterm.get_mut(slot - 9),
             16 => Some(&mut self.proc_count),
+            17..19 => self.aterm_unread.get_mut(slot - 17),
+            19 => Some(&mut self.aterm_cpu_charge),
             _ => None,
         }
     }
@@ -3241,6 +3540,8 @@ impl SavedStrip {
             8 => Some(&self.pressure),
             9..16 => self.aterm.get(slot - 9),
             16 => Some(&self.proc_count),
+            17..19 => self.aterm_unread.get(slot - 17),
+            19 => Some(&self.aterm_cpu_charge),
             _ => None,
         }
     }
@@ -3250,9 +3551,18 @@ impl SavedStrip {
     /// it opened, and the strip's newest wall clock moves to the line's. A line at or before
     /// [`Self::through_k`] holds nothing the base does not, and changes nothing; the result says
     /// whether it was replayed.
-    pub fn replay(&mut self, line: StripLine) -> bool {
+    pub fn replay(&mut self, mut line: StripLine) -> bool {
         if line.k <= self.through_k {
             return false;
+        }
+        // Older tail lines retained scope figures but no coverage. Reading that absence as
+        // zero would turn a historical lower bound into an exact figure after a restart.
+        for (figure, coverage) in [(9, 18), (11, 17)] {
+            if !line.rings.iter().any(|(slot, _)| *slot == coverage)
+                && let Some((_, agg)) = line.rings.iter().find(|(slot, _)| *slot == figure)
+            {
+                line.rings.push((coverage, unknown_coverage(*agg)));
+            }
         }
         for (slot, agg) in line.rings {
             if let Some(r) = self.ring_mut(usize::from(slot)) {
@@ -3272,6 +3582,16 @@ impl SavedStrip {
         self.last_wall_ms = self.last_wall_ms.max(line.wall_ms);
         self.through_k = line.k;
         true
+    }
+}
+
+fn unknown_coverage(agg: Agg) -> Agg {
+    Agg {
+        mean: 1.0,
+        min: 1.0,
+        max: 1.0,
+        over_ms: 0,
+        ..agg
     }
 }
 
@@ -3299,6 +3619,12 @@ pub struct StripLine {
 }
 
 impl Vitals {
+    /// Whether native completion evidence needs another complete process reading before its
+    /// delivered journal cursor can be considered adopted by the model.
+    #[must_use]
+    pub fn has_pending_native(&self) -> bool {
+        self.why.has_pending_native()
+    }
     /// A model that has read nothing.
     #[must_use]
     pub fn new() -> Self {
@@ -3468,6 +3794,8 @@ impl Vitals {
                     .as_ref()
                     .map_or_else(crate::ring::SavedRing::default, BucketRing::saved)
             }),
+            aterm_unread: self.rows.aterm.1.each_ref().map(BucketRing::saved),
+            aterm_cpu_charge: self.rows.aterm.2.saved(),
             proc_starts: self.rows.proc_starts,
             time_gaps: self.time_gaps.iter().copied().collect(),
             strip_events: self.strip_events.iter().cloned().collect(),
@@ -3498,6 +3826,11 @@ impl Vitals {
         self.rows.net_tx = BucketRing::restored(&saved.net_tx, now_unix_ms);
         self.rows.proc_count = BucketRing::restored(&saved.proc_count, now_unix_ms);
         self.rows.pressure = BucketRing::restored(&saved.pressure, now_unix_ms);
+        self.rows.aterm.1 = saved
+            .aterm_unread
+            .each_ref()
+            .map(|ring| BucketRing::restored(ring, now_unix_ms));
+        self.rows.aterm.2 = BucketRing::restored(&saved.aterm_cpu_charge, now_unix_ms);
         self.rows.proc_starts = saved.proc_starts;
         self.strip_rewrites += 1;
 
@@ -3572,6 +3905,8 @@ impl Vitals {
             8 => Some(&self.rows.pressure),
             9..16 => self.rows.aterm.0.get(slot - 9).and_then(Option::as_ref),
             16 => Some(&self.rows.proc_count),
+            17..19 => self.rows.aterm.1.get(slot - 17),
+            19 => Some(&self.rows.aterm.2),
             _ => None,
         }
     }
@@ -3668,6 +4003,25 @@ impl Vitals {
 
     /// Absorb one sample and return the snapshot it makes.
     pub fn absorb(&mut self, s: &Sample) -> Snapshot {
+        // A known PID with an unread start is neither a validated origin nor a disproved one.
+        // Keep its proof dormant and mark every accounting consumer of this reading partial.
+        let mut checked;
+        let s = if !s.ownership_incomplete
+            && (self.origins_incomplete
+                || s.procs.as_ref().is_some_and(|procs| {
+                    let unread: HashSet<_> = procs
+                        .iter()
+                        .filter(|p| p.start.is_none())
+                        .map(|p| p.pid)
+                        .collect();
+                    self.origins.keys().any(|key| unread.contains(&key.pid))
+                })) {
+            checked = s.clone();
+            checked.ownership_incomplete = true;
+            &checked
+        } else {
+            s
+        };
         self.seq += 1;
         let busy = s
             .gpu
@@ -3845,7 +4199,7 @@ impl Vitals {
             global.footprint_gib = self.global_foot.view();
         }
 
-        let pass = match s.procs.as_deref() {
+        let mut pass = match s.procs.as_deref() {
             Some(procs) => self.absorb_procs(procs, s, &mut global, sweep_dt),
             None => {
                 self.aterm.history.push_at(None, s.at_ns);
@@ -3855,6 +4209,99 @@ impl Vitals {
                 ProcPass::default()
             }
         };
+        let attribution = pass
+            .attribution
+            .as_ref()
+            .map(|(m, o)| (m.as_slice(), o.as_slice()));
+        let mut scoped_cpu = self.why.scope_cpu(s, attribution);
+        let prepared_why = self.why.prepare(s, attribution);
+        if let Some(cpu) = scoped_cpu.as_mut() {
+            prepared_why.apply_app(s, cpu);
+        }
+        if let Some(owners) = prepared_why.memory_owners()
+            && let Some(figs) = pass.figs.as_mut()
+        {
+            let charge = owners.aterm;
+            let measured =
+                (charge.members == 0 || charge.unread < charge.members).then_some(charge.bytes);
+            let observed = figs.aterm.footprint;
+            figs.aterm.footprint = plus(measured, observed, u64::max);
+            figs.aterm.footprint_unread = u32::from(
+                owners.ownership_incomplete
+                    || owners.truncated
+                    || charge.unread > 0
+                    || owners.unknown.bytes > 0
+                    || owners.unknown.unread > 0
+                    || observed
+                        .zip(measured)
+                        .is_some_and(|(observed, measured)| observed > measured),
+            );
+            if let Some(aterm) = pass.aterm.as_mut() {
+                aterm.footprint = figs.aterm.footprint;
+                aterm.footprint_unread = figs.aterm.footprint_unread;
+            }
+        }
+        if let Some(aterm) = pass.aterm.as_mut() {
+            if let Some(bytes) = aterm.footprint {
+                self.app_footprint
+                    .push(gib(bytes), interval_s(self.last_app_footprint_at, s.at_ns));
+                self.last_app_footprint_at = Some(s.at_ns);
+            }
+            aterm.footprint_gib = self.app_footprint.view();
+        }
+        if let Some(cpu) = scoped_cpu.as_ref()
+            && let Some(figs) = pass.figs.as_mut()
+        {
+            if pass.window_ns != Some(cpu.window_ns) {
+                figs.aterm.cpu_incomplete += 1;
+                for tab in &mut figs.tabs {
+                    tab.cpu_incomplete += 1;
+                }
+            } else {
+                if cpu.missed || cpu.own_ambiguous {
+                    figs.aterm.cpu_incomplete += 1;
+                }
+                let mut charge = cpu.own_charge;
+                for tab in &cpu.tabs {
+                    let indexes: Vec<_> = s
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, root)| (root.tab == tab.key).then_some(i))
+                        .collect();
+                    let pane_floor: f64 = indexes
+                        .iter()
+                        .filter_map(|&index| {
+                            cpu.panes.iter().find(|pane| pane.key == s.tabs[index].key)
+                        })
+                        .map(|pane| pane.floor)
+                        .sum();
+                    let pane_charge_known = (tab.charge - pane_floor).abs() < f64::EPSILON;
+                    for &index in &indexes {
+                        let floor = cpu
+                            .panes
+                            .iter()
+                            .find(|pane| pane.key == s.tabs[index].key)
+                            .map_or(0.0, |pane| pane.floor);
+                        figs.tabs[index].cores = floor as f32;
+                        figs.tabs[index].cpu_charge = pane_charge_known.then_some(floor);
+                        if tab.missed || tab.ambiguous || tab.actual() > pane_floor {
+                            figs.tabs[index].cpu_incomplete += 1;
+                        }
+                    }
+                    if tab.missed || tab.ambiguous {
+                        figs.aterm.cpu_incomplete += 1;
+                    }
+                    charge += tab.charge;
+                }
+                figs.aterm.cores = cpu.all_actual() as f32;
+                figs.aterm.cpu_charge = Some(charge);
+                if cpu.app_measured.is_some() {
+                    figs.aterm.refused = 0;
+                    figs.aterm.cpu_incomplete = u32::from(cpu.app_incomplete);
+                }
+            }
+        }
         // Each core's fraction this reading, every core measured: the CPU row's reading is their
         // sum and each core's unit their own, so the tiles' mean is the row's %.
         let core_fracs: Option<Vec<f64>> = cpu
@@ -3870,7 +4317,9 @@ impl Vitals {
         let figs = pass.figs.as_ref().filter(|_| !s.machine_only);
         let opens_before = self.strip_opens();
         let meaning_before = self.rows.proc_starts;
-        let (resources, mut facts, net) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
+        let (resources, mut facts, net) =
+            self.rows
+                .absorb(s, stamp, busy, figs, sweep_dt, scoped_cpu.as_ref());
         (facts.zombies, facts.dstate) = self
             .rows
             .blockage
@@ -3928,17 +4377,14 @@ impl Vitals {
             cpu.as_ref().and_then(CpuView::current_busy),
             pass.split_parts,
         ) {
-            (Some(busy), Some((aterm, others, unread))) => {
-                let rest = busy - aterm - others;
-                Some(Split {
-                    global: busy,
-                    aterm,
-                    others,
-                    services: rest.max(0.0),
-                    unaccounted: rest.min(0.0),
-                    unread,
-                })
-            }
+            (Some(busy), Some((aterm, others, services, unread))) => Some(Split {
+                global: busy,
+                aterm,
+                others,
+                services,
+                unaccounted: busy - aterm - others - services,
+                unread,
+            }),
             _ => None,
         };
 
@@ -3953,6 +4399,7 @@ impl Vitals {
             host: s.host_watts,
         });
         let mut snap = Snapshot {
+            native_terminals: s.native_terminals.clone(),
             cpu_counter_sample: s.cores.clone(),
             hardware: s.hardware.clone(),
             cpu_diagnostics: None,
@@ -3969,6 +4416,7 @@ impl Vitals {
             place: None,
             global,
             aterm: pass.aterm,
+            shared: pass.shared,
             tabs: pass.tabs,
             top: pass.top,
             jobs: None,
@@ -3984,9 +4432,12 @@ impl Vitals {
             procs_window_ns: pass.window_ns,
             cores_window_ns,
             split,
+            scoped_cpu,
             procs: pass.rows,
             programs: pass.programs,
+            memory_owners: pass.memory_owners,
             procs_truncated: s.procs_truncated,
+            stalled: s.stalled.clone(),
             thermal: s.thermal,
             heat,
             ane: s.ane,
@@ -4005,11 +4456,7 @@ impl Vitals {
             units,
             situation: s.situation.clone(),
         };
-        let attribution = pass
-            .attribution
-            .as_ref()
-            .map(|(m, o)| (m.as_slice(), o.as_slice()));
-        snap.why = self.why.absorb(s, &snap, attribution);
+        snap.why = self.why.finish(s, &snap, prepared_why);
         snap.coal_lane = self.why.lane(s);
         snap.events = self.detector.detect(&snap);
         snap.cpu_diagnostics = self.hardware_recorder.observe(&snap, s.cores.as_deref());
@@ -4107,7 +4554,17 @@ impl Vitals {
         let mut next_runnable = HashMap::with_capacity(procs.len());
         let mut next_read_at = HashMap::with_capacity(procs.len());
         let mut rates: Vec<ProcRates> = Vec::with_capacity(procs.len());
+        let mut common_cores = Vec::with_capacity(procs.len());
         for p in procs {
+            common_cores.push(
+                p.cpu_ns
+                    .zip(self.last_cpu.get(&p.pid))
+                    .zip(wall_ns)
+                    .and_then(|((now, &(start, before)), window)| {
+                        (window > 0 && start.is_some() && start == p.start)
+                            .then(|| now.saturating_sub(before) as f32 / window as f32)
+                    }),
+            );
             let mut r = ProcRates {
                 read_bps: sweep_dt
                     .zip(reads.get(&p.pid))
@@ -4155,28 +4612,39 @@ impl Vitals {
         self.last_runnable = next_runnable;
         self.last_read_at = next_read_at;
         global.procs = u32::try_from(procs.len()).unwrap_or(u32::MAX);
+        let (membership, delegated_members) = self.attribute_owned(s, procs);
         let Some(wall_ns) = wall_ns else {
             // No window yet, but the explanations' reap credit takes its first members here.
             return ProcPass {
-                attribution: Some(attribute_delegated(
-                    procs,
-                    s.self_pid,
-                    &s.tabs,
-                    &s.delegated,
-                )),
+                attribution: Some((membership, delegated_members)),
                 ..ProcPass::default()
             };
         };
         let dt_s = wall_ns as f32 / 1e9;
 
-        let (membership, delegated_members) =
-            attribute_delegated(procs, s.self_pid, &s.tabs, &s.delegated);
         let mut aterm_acc = ScopeAcc::default();
+        let mut shared_acc = ScopeAcc::default();
         let mut global_acc = ScopeAcc::default();
         let mut tab_acc: Vec<ScopeAcc> = vec![ScopeAcc::default(); s.tabs.len()];
-        let mut others = 0.0f32;
+        let incomplete = s.native_incomplete || s.ownership_incomplete || s.procs_truncated;
+        if incomplete || !s.unproved_tabs.is_empty() {
+            aterm_acc.cpu_incomplete += 1;
+            aterm_acc.footprint_unread += 1;
+        }
+        if s.native_source_lost {
+            aterm_acc.cpu_incomplete += 1;
+        }
+        for (root, acc) in s.tabs.iter().zip(&mut tab_acc) {
+            if incomplete || s.unproved_tabs.contains(&root.key) {
+                acc.cpu_incomplete = acc.cpu_incomplete.saturating_add(1);
+                acc.footprint_unread = acc.footprint_unread.saturating_add(1);
+            }
+            if s.native_source_lost {
+                acc.cpu_incomplete = acc.cpu_incomplete.saturating_add(1);
+            }
+        }
+        let (mut others, mut services) = (0.0f32, 0.0f32);
         let (mut others_gpu, mut services_gpu) = (0.0f32, 0.0f32);
-        let mut ownership_known = s.self_uid.is_some();
         let mut rows: Vec<ProcView> = Vec::with_capacity(procs.len());
         let mut job_acc: Vec<ScopeAcc> = vec![ScopeAcc::default(); s.delegated.len()];
         let mut top: Vec<TopProc> = Vec::with_capacity(TOP_PROCS + 1);
@@ -4197,13 +4665,14 @@ impl Vitals {
             if let Some(job) = delegated_members[index] {
                 job_acc[job].add(p, r);
             }
-            let scope = || match (m.tab, m.aterm) {
-                (Some(t), _) => s
+            let scope = || match (m.tab, m.aterm, m.shared) {
+                (Some(t), _, _) => s
                     .tabs
                     .get(t)
                     .map_or(ProcScope::Aterm, |r| ProcScope::Tab(r.tab)),
-                (None, true) => ProcScope::Aterm,
-                (None, false) => ProcScope::Other,
+                (None, true, true) => ProcScope::Shared,
+                (None, true, false) => ProcScope::Aterm,
+                (None, false, _) => ProcScope::Other,
             };
             if cores >= 0.01
                 && (top.len() < TOP_PROCS || top.last().is_some_and(|t| cores > t.cores))
@@ -4279,6 +4748,9 @@ impl Vitals {
             if m.aterm {
                 aterm_acc.add(p, r);
             }
+            if m.shared {
+                shared_acc.add(p, r);
+            }
             if let Some(t) = m.tab {
                 tab_acc[t].add(p, r);
             }
@@ -4286,24 +4758,27 @@ impl Vitals {
                 RowScope::SelfProc
             } else if let Some(t) = m.tab {
                 RowScope::Tab(s.tabs[t].key)
+            } else if m.shared {
+                RowScope::Shared
             } else if m.aterm {
                 RowScope::Helper
             } else {
                 match (p.uid, s.self_uid) {
                     (Some(u), Some(me)) if u == me => RowScope::Others,
                     (Some(_), Some(_)) => RowScope::Services,
-                    _ => {
-                        ownership_known = false;
-                        RowScope::Unknown
-                    }
+                    _ => RowScope::Unknown,
                 }
             };
             match row_scope {
                 RowScope::Others => {
-                    others += cores;
+                    others += common_cores[index].unwrap_or(0.0);
                     others_gpu += r.gpu.unwrap_or(0.0);
                 }
-                RowScope::Services | RowScope::Unknown => services_gpu += r.gpu.unwrap_or(0.0),
+                RowScope::Services => {
+                    services += common_cores[index].unwrap_or(0.0);
+                    services_gpu += r.gpu.unwrap_or(0.0);
+                }
+                RowScope::Unknown => services_gpu += r.gpu.unwrap_or(0.0),
                 _ => {}
             }
             rows.push(ProcView {
@@ -4340,6 +4815,7 @@ impl Vitals {
         let aterm_cores = aterm_acc.cores;
         let gpu_parts = aterm_acc.gpu.map(|aterm| (aterm, others_gpu, services_gpu));
         let aterm = self.aterm.absorb(&aterm_acc, dt_s, s.at_ns);
+        let shared = self.shared.absorb(&shared_acc, dt_s, s.at_ns);
         let named = front_names(procs, &s.tabs);
         let mut live = std::collections::HashSet::with_capacity(s.tabs.len());
         let tabs = s
@@ -4369,7 +4845,15 @@ impl Vitals {
             .delegated
             .iter()
             .zip(job_acc)
-            .filter(|(_, acc)| acc.procs > 0)
+            // This legacy receipt has no coverage flag. Retain partial process/scope evidence,
+            // but do not publish a reduced job total as a new complete receipt.
+            .filter(|(_, acc)| {
+                !incomplete
+                    && acc.procs > 0
+                    && acc.cpu_incomplete == 0
+                    && acc.refused == 0
+                    && acc.footprint_unread == 0
+            })
             .map(|(job, acc)| DelegatedUsage {
                 root: job.root,
                 cores: acc.cores,
@@ -4379,6 +4863,7 @@ impl Vitals {
             .collect();
         ProcPass {
             aterm: Some(aterm),
+            shared: Some(shared),
             tabs,
             top,
             delegated,
@@ -4389,9 +4874,14 @@ impl Vitals {
                 writers,
                 busiest,
             }),
+            memory_owners: Some(MemoryOwners::of(
+                &rows,
+                s.procs_truncated,
+                s.native_incomplete || s.ownership_incomplete || !s.unproved_tabs.is_empty(),
+            )),
             rows: keep_rows(rows),
             programs: keep_programs(programs),
-            split_parts: ownership_known.then_some((aterm_cores, others, global_acc.refused)),
+            split_parts: Some((aterm_cores, others, services, global_acc.refused)),
             gpu_parts,
             window_ns: Some(wall_ns),
             attribution: Some((membership, delegated_members)),
@@ -4474,7 +4964,12 @@ fn keep_rows(rows: Vec<ProcView>) -> Vec<ProcView> {
     let (mut mine, mut rest): (Vec<ProcView>, Vec<ProcView>) =
         rows.into_iter().partition(|r| r.scope.in_aterm());
     mine.sort_by(busiest_first);
-    mine.truncate(ATERM_ROWS);
+    if mine.len() > ATERM_ROWS {
+        let mut by_foot = mine.split_off(ATERM_ROWS / 2);
+        by_foot.sort_by_key(|p| std::cmp::Reverse(p.footprint.unwrap_or(0)));
+        by_foot.truncate(ATERM_ROWS - mine.len());
+        mine.extend(by_foot);
+    }
     rest.sort_by(busiest_first);
     let mut kept: Vec<ProcView> = rest.iter().take(TOP_ROWS).cloned().collect();
     let mut by_foot: Vec<&ProcView> = rest.iter().skip(TOP_ROWS).collect();
@@ -4495,14 +4990,19 @@ fn busiest_program_first(a: &ProgramGroup, b: &ProgramGroup) -> std::cmp::Orderi
 }
 
 /// [`Snapshot::programs`]' bound, as [`keep_rows`] bounds the rows: every aterm and tab group
-/// up to [`ATERM_ROWS`], and of the machine's others the [`TOP_ROWS`] busiest and the
-/// [`TOP_ROWS`] largest of the rest.
+/// up to [`ATERM_ROWS`] (half busiest and half largest when over the cap), and of the machine's
+/// others the [`TOP_ROWS`] busiest and the [`TOP_ROWS`] largest of the rest.
 fn keep_programs(groups: Vec<ProgramGroup>) -> Vec<ProgramGroup> {
     let (mut kept, mut rest): (Vec<ProgramGroup>, Vec<ProgramGroup>) = groups
         .into_iter()
         .partition(|g| g.scope != ProcScope::Other);
     kept.sort_by(busiest_program_first);
-    kept.truncate(ATERM_ROWS);
+    if kept.len() > ATERM_ROWS {
+        let mut by_foot = kept.split_off(ATERM_ROWS / 2);
+        by_foot.sort_by_key(|g| std::cmp::Reverse(g.footprint.unwrap_or(0)));
+        by_foot.truncate(ATERM_ROWS - kept.len());
+        kept.extend(by_foot);
+    }
     rest.sort_by(busiest_program_first);
     let mut by_foot = rest.split_off(rest.len().min(TOP_ROWS));
     by_foot.sort_by_key(|g| std::cmp::Reverse(g.footprint.unwrap_or(0)));
@@ -4521,10 +5021,37 @@ impl Rows {
         busy: Option<f64>,
         figs: Option<&SweepFigs>,
         sweep_dt: Option<f64>,
+        scoped_cpu: Option<&crate::explain::ScopeCpu>,
     ) -> ([ResourceView; 7], RowFacts, Option<NetView>) {
         use Resource::{Cpu, Disk, Gpu, Memory, Network, Processes, Tokens};
         let now = s.at_unix_ms;
         let t = Taken::at(now, s.period_ms());
+        if let Some(cpu) = scoped_cpu
+            .filter(|cpu| sweep_dt.is_some_and(|dt| (dt * 1e9 - cpu.window_ns as f64).abs() < 1.0))
+        {
+            self.logical_cpu
+                .retain(|id, _| cpu.tabs.iter().any(|tab| tab.id == *id));
+            for tab in &cpu.tabs {
+                let rings = self.logical_cpu.entry(tab.id).or_default();
+                let mut values = [None; 7];
+                values[Cpu.index()] = Some(tab.actual());
+                rings.push(t, values);
+                let _ = rings.2.push(t, Some(tab.charge), false);
+                let incomplete = tab.missed
+                    || tab.ambiguous
+                    || cpu.missed
+                    || s.native_incomplete
+                    || s.native_source_lost
+                    || s.ownership_incomplete
+                    || s.procs_truncated
+                    || s.tabs.iter().enumerate().any(|(index, root)| {
+                        root.tab == tab.key
+                            && (s.unproved_tabs.contains(&root.key)
+                                || figs.is_some_and(|figs| figs.tabs[index].refused > 0))
+                    });
+                let _ = rings.1[1].push(t, Some(f64::from(u32::from(incomplete))), false);
+            }
+        }
         if let Some(brand) = s.cpu_brand.as_ref().filter(|b| !b.is_empty()) {
             self.cpu_brand = Some(brand.clone());
         }
@@ -4753,6 +5280,15 @@ impl Rows {
             };
             let aterm_v = vals(&f.aterm, tokens.out, s.aterm_sockets, aterm_procs(&f.aterm));
             self.aterm.push(t, aterm_v);
+            let _ = self.aterm.2.push(t, f.aterm.cpu_charge, false);
+            let _ = self.aterm.1[0].push(t, Some(f64::from(f.aterm.footprint_unread)), false);
+            let _ = self.aterm.1[1].push(
+                t,
+                Some(f64::from(
+                    f.aterm.refused.saturating_add(f.aterm.cpu_incomplete),
+                )),
+                false,
+            );
             for (root, acc) in s.tabs.iter().zip(&f.tabs) {
                 let rings = self.tabs.entry(root.key).or_default();
                 let tab_sock = s
@@ -4769,6 +5305,13 @@ impl Rows {
                         tab_sock,
                         tab_procs,
                     ),
+                );
+                let _ = rings.1[0].push(t, Some(f64::from(acc.footprint_unread)), false);
+                let _ = rings.2.push(t, acc.cpu_charge, false);
+                let _ = rings.1[1].push(
+                    t,
+                    Some(f64::from(acc.refused.saturating_add(acc.cpu_incomplete))),
+                    false,
                 );
             }
             facts.writers = crate::writes::top_per_scope(f.writers.iter().cloned(), |w| w.scope);
@@ -4807,6 +5350,20 @@ impl Rows {
                     .then_some(())
                     .and(ring)
                     .and_then(|r| r.now_mean(now, window_of(res))),
+                cpu_charge: if res == Cpu {
+                    rings.and_then(|r| r.2.now_mean(now, window_of(res)))
+                } else {
+                    None
+                },
+                unread: match res {
+                    Memory | Cpu => {
+                        let i = usize::from(res == Cpu);
+                        rings
+                            .and_then(|r| r.1[i].now_max(now, window_of(res)))
+                            .unwrap_or(0.0) as u32
+                    }
+                    _ => 0,
+                },
                 missing: missing(res, agent),
                 run: ring.map_or_else(|| Arc::from([]), |r| r.tail_cells(SCOPE_RUN_BUCKETS).into()),
                 run_k: ring.and_then(BucketRing::open_k).unwrap_or(0),
@@ -4868,6 +5425,23 @@ impl Rows {
                     (t.key, fig(self.tabs.get(&t.key), res, agent))
                 })
                 .collect();
+            if res == Cpu
+                && let Some(cpu) = scoped_cpu
+            {
+                view.logical_cpu = cpu
+                    .tabs
+                    .iter()
+                    .map(|tab| {
+                        let keys = s
+                            .tabs
+                            .iter()
+                            .filter(|root| root.tab == tab.key)
+                            .map(|root| root.key)
+                            .collect();
+                        (keys, fig(self.logical_cpu.get(&tab.id), Cpu, false))
+                    })
+                    .collect();
+            }
             if res == Gpu
                 && let Some(mac) = view.now
             {
@@ -5231,21 +5805,233 @@ fn front_names(procs: &[ProcSample], tabs: &[TabRoot]) -> Vec<String> {
 pub struct Membership {
     /// In aterm's scope.
     pub aterm: bool,
+    /// Shared app work outside this instance and its tab trees (also in `aterm`).
+    pub shared: bool,
     /// In this tab (an index into the sample's tabs).
     pub tab: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Origin {
+    tab: Option<u64>,
+    shared: bool,
+}
+
+/// The largest natural-origin inventory transferred through one private GUI handoff.
+pub const PROCESS_ORIGIN_CAP: usize = 65_536;
+
+/// Natural app custody previously established from a process tree or app-service proof.
+/// The boot containing `process` is supplied and checked by the private handoff owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessOrigin {
+    /// Kernel process generation; never a PID alone.
+    pub process: crate::delegated::ProcessKey,
+    /// The source's local pane key, translated through a stable session ID by the host.
+    pub tab: Option<u64>,
+    /// App-service custody outside a tab or this GUI's own process tree.
+    pub shared: bool,
+}
+
+impl Vitals {
+    /// Snapshot natural origins, plus whether the bounded inventory omitted any proof.
+    /// Explicit delegated claims are excluded and remain in their authenticated ledger.
+    #[must_use]
+    pub fn process_origins(&self) -> (Vec<ProcessOrigin>, bool) {
+        let mut origins: Vec<_> = self
+            .origins
+            .iter()
+            .map(|(&process, origin)| ProcessOrigin {
+                process,
+                tab: origin.tab,
+                shared: origin.shared,
+            })
+            .collect();
+        let truncated = origins.len() > PROCESS_ORIGIN_CAP;
+        if truncated {
+            origins.select_nth_unstable_by_key(PROCESS_ORIGIN_CAP, |origin| origin.process);
+        }
+        origins.truncate(PROCESS_ORIGIN_CAP);
+        (origins, truncated || self.origins_incomplete)
+    }
+
+    /// Restore dormant same-boot origin proofs. Only a matching process generation in a later
+    /// sweep can use one; absent rows in a truncated sweep do not discard the proof.
+    pub fn restore_process_origins(&mut self, origins: &[ProcessOrigin]) {
+        self.origins_incomplete |= origins.len() > PROCESS_ORIGIN_CAP;
+        let mut rejected = HashSet::new();
+        for origin in origins.iter().take(PROCESS_ORIGIN_CAP) {
+            if rejected.contains(&origin.process) {
+                continue;
+            }
+            if origin.process.pid > 1 && !(origin.shared && origin.tab.is_some()) {
+                let claim = Origin {
+                    tab: origin.tab,
+                    shared: origin.shared,
+                };
+                if self
+                    .origins
+                    .get(&origin.process)
+                    .is_some_and(|previous| *previous != claim)
+                {
+                    self.origins.remove(&origin.process);
+                    rejected.insert(origin.process);
+                    self.origins_incomplete = true;
+                } else {
+                    self.origins.insert(origin.process, claim);
+                }
+            } else {
+                self.origins_incomplete = true;
+                self.origins.remove(&origin.process);
+                rejected.insert(origin.process);
+            }
+        }
+    }
+
+    fn attribute_owned(
+        &mut self,
+        s: &Sample,
+        procs: &[ProcSample],
+    ) -> (Vec<Membership>, Vec<Option<usize>>) {
+        let current = attribute(procs, s.self_pid, &s.tabs);
+        let mut roots = HashMap::new();
+        let mut native = HashMap::new();
+        for root in &s.native_roots {
+            native
+                .entry(root.process)
+                .and_modify(|tab| {
+                    if *tab != Some(root.tab) {
+                        *tab = None;
+                    }
+                })
+                .or_insert(Some(root.tab));
+        }
+        for (process, member) in procs.iter().zip(&current) {
+            let natural = process
+                .start
+                .and_then(|start| {
+                    native.get(&crate::delegated::ProcessKey {
+                        pid: process.pid,
+                        start,
+                    })
+                })
+                .copied()
+                .flatten();
+            if let Some(tab) = natural {
+                roots.insert(
+                    process.pid,
+                    Membership {
+                        aterm: true,
+                        shared: false,
+                        tab: tab.and_then(|key| s.tabs.iter().position(|tab| tab.key == key)),
+                    },
+                );
+                continue;
+            }
+            if member.aterm {
+                continue;
+            }
+            // A proved tab origin survives setsid/reparenting. Merely loading this app's
+            // executable does not turn a tab's orphaned helper into shared app overhead.
+            let origin = process
+                .start
+                .and_then(|start| {
+                    self.origins.get(&crate::delegated::ProcessKey {
+                        pid: process.pid,
+                        start,
+                    })
+                })
+                .copied()
+                .or_else(|| {
+                    s.shared_roots
+                        .iter()
+                        .any(|root| root.matches(process))
+                        .then_some(Origin {
+                            tab: None,
+                            shared: true,
+                        })
+                });
+            if let Some(origin) = origin {
+                roots.insert(
+                    process.pid,
+                    Membership {
+                        aterm: true,
+                        shared: origin.shared,
+                        tab: origin
+                            .tab
+                            .and_then(|key| s.tabs.iter().position(|tab| tab.key == key)),
+                    },
+                );
+            }
+        }
+        let membership = attribute_roots(procs, s.self_pid, &s.tabs, roots);
+        let origins = membership.clone();
+        let (membership, owners) = attribute_delegated(procs, &s.tabs, &s.delegated, membership);
+        if !s.procs_truncated {
+            let present: HashMap<_, _> = procs.iter().map(|p| (p.pid, p.start)).collect();
+            self.origins.retain(|key, _| {
+                present
+                    .get(&key.pid)
+                    .is_some_and(|start| start.is_none() || *start == Some(key.start))
+            });
+        }
+        // Explicit delegated custody belongs to its own ledger. Remembering those claims here
+        // would keep charging a foreign process after that job deliberately let it go.
+        for (process, member) in procs.iter().zip(&origins) {
+            if member.aterm
+                && let Some(start) = process.start
+            {
+                self.origins.insert(
+                    crate::delegated::ProcessKey {
+                        pid: process.pid,
+                        start,
+                    },
+                    Origin {
+                        tab: member.tab.map(|index| s.tabs[index].key),
+                        shared: member.shared,
+                    },
+                );
+            }
+        }
+        (membership, owners)
+    }
 }
 
 /// Attribute each process in `procs` to `aterm` (`self_pid` tree + tab trees) and its nearest tab.
 #[must_use]
 pub fn attribute(procs: &[ProcSample], self_pid: u32, tabs: &[TabRoot]) -> Vec<Membership> {
-    let parent: HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
+    attribute_roots(procs, self_pid, tabs, HashMap::new())
+}
+
+fn attribute_roots(
+    procs: &[ProcSample],
+    self_pid: u32,
+    tabs: &[TabRoot],
+    mut memo: HashMap<u32, Membership>,
+) -> Vec<Membership> {
+    let starts: HashMap<_, _> = procs.iter().map(|p| (p.pid, p.start)).collect();
+    let parent: HashMap<u32, u32> = procs
+        .iter()
+        .map(|p| {
+            // A sweep is not atomic: an old parent may exit and its PID name a newer process by
+            // the time that row is read. Such a row cannot be this child's parent.
+            let reused = p
+                .start
+                .zip(starts.get(&p.ppid).copied().flatten())
+                .is_some_and(|(child, parent)| parent > child);
+            (p.pid, if reused { 1 } else { p.ppid })
+        })
+        .collect();
     let shells: HashMap<u32, usize> = tabs
         .iter()
         .enumerate()
         .filter(|(_, t)| t.shell_pid != 0)
         .map(|(i, t)| (t.shell_pid, i))
         .collect();
-    let mut memo: HashMap<u32, Membership> = HashMap::with_capacity(procs.len());
+    // Current lineage overrides remembered origins, including a process moved to a new tab.
+    memo.remove(&self_pid);
+    for shell in shells.keys() {
+        memo.remove(shell);
+    }
     procs
         .iter()
         .map(|p| resolve(p.pid, self_pid, &parent, &shells, &mut memo))
@@ -5254,11 +6040,10 @@ pub fn attribute(procs: &[ProcSample], self_pid: u32, tabs: &[TabRoot]) -> Vec<M
 
 fn attribute_delegated(
     procs: &[ProcSample],
-    self_pid: u32,
     tabs: &[TabRoot],
     jobs: &[DelegatedJob],
+    mut membership: Vec<Membership>,
 ) -> (Vec<Membership>, Vec<Option<usize>>) {
-    let mut membership = attribute(procs, self_pid, tabs);
     let mut claims = HashMap::new();
     for (index, job) in jobs.iter().enumerate() {
         for &key in &job.members {
@@ -5279,6 +6064,7 @@ fn attribute_delegated(
             let job = claims.get(&key).copied().flatten()?;
             membership[index] = Membership {
                 aterm: true,
+                shared: false,
                 tab: jobs[job]
                     .tab
                     .and_then(|key| tabs.iter().position(|tab| tab.key == key)),
@@ -5304,6 +6090,7 @@ fn resolve(
         }
         let here = Membership {
             aterm: cur == self_pid,
+            shared: false,
             tab: shells.get(&cur).copied(),
         };
         if here.aterm || here.tab.is_some() {

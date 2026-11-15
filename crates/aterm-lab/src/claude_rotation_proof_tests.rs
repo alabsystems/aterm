@@ -695,7 +695,7 @@ fn the_keys_hold_only_the_moves_resumes_and_cruises_rules_and_no_picker_key() {
     let long = format!("{} and then some", "keep going ".repeat(4).trim_end());
     let wrapped = format!(
         "1 send if-human=0 if={} -- {long}\n2 key if-human=0 if=^\\x20{{2}}and\\x20then\\x20some\\s*$ enter\n",
-        aterm_agent::supervise::policy::row_guard(COMPOSER)
+        alab_policy::guard::row_guard(COMPOSER)
     );
     assert_eq!(
         judge_keys(&journal, &acts_of(&wrapped)).verdict,

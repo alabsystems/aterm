@@ -4787,20 +4787,16 @@ pub fn cmd_baseline(args: &[String]) -> Res {
         eprintln!("aterm-lab: linux: guest build output NOT removed: {e}");
     }
     up.end(ask.keep_up);
-    let report = proof::render(&rows, &[], t0.elapsed().as_secs_f64()).replacen(
-        "LINUX LANE PROOF",
-        if ask.record {
-            "LINUX LANE BASELINE (record)"
-        } else {
-            "LINUX LANE BASELINE (replay)"
-        },
-        1,
-    );
-    print!("\n{report}");
-    let path = results.join("report.txt");
-    if let Err(e) = crate::util::write_fresh(&path, &report) {
-        eprintln!("aterm-lab: linux: {}: {e}", path.display());
+    let title = if ask.record {
+        "LINUX LANE BASELINE (record)"
     } else {
+        "LINUX LANE BASELINE (replay)"
+    };
+    let total_secs = t0.elapsed().as_secs_f64();
+    let path = results.join("report.txt");
+    let published = proof::publish_report(title, &mut rows, &[], total_secs, &path);
+    print!("\n{}", proof::render_as(title, &rows, &[], total_secs));
+    if published {
         println!("report and fresh recordings: {}", results.display());
     }
     if let Some(s) = stopped {

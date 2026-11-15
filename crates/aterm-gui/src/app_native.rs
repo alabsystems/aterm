@@ -2126,10 +2126,10 @@ impl App {
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings)
         {
-            // Both pages expose session navigation under the shared Owner fence;
-            // Harness also writes Autopilot words.
-            if self.harness_page_in(view) || self.lab_page_in(view) {
-                crate::control::FrontControlSurface::HarnessSettings
+            // Harness and Lab expose session navigation under the shared Owner fence (Harness
+            // also writes Autopilot words), and This Mac shows this machine's identity.
+            if self.harness_page_in(view) || self.lab_page_in(view) || self.machine_page_in(view) {
+                crate::control::FrontControlSurface::OwnerSettings
             } else {
                 crate::control::FrontControlSurface::NativeSettings
             }
@@ -5132,18 +5132,38 @@ impl App {
                 }
             }
             AppEffect::Recovery { request, reply } => {
-                let outcome = self.execute_recovery_request(wid, request);
-                if self.native_runtime.completion_is_current(&reply) {
-                    self.dispatch_native_completion(
-                        wid,
-                        instance,
-                        view,
-                        AppEvent::RecoveryFinished {
-                            operation: reply.operation,
-                            outcome,
-                        },
-                    )?;
+                if !self.native_runtime.completion_is_current(&reply)
+                    || self.locate_native_view(view) != Ok((wid, instance))
+                {
+                    return Ok(());
                 }
+                let guard_reply = reply.clone();
+                self.execute_recovery_request(
+                    wid,
+                    request,
+                    move |app| {
+                        app.native_runtime.completion_is_current(&guard_reply)
+                            && app.locate_native_view(view) == Ok((wid, instance))
+                    },
+                    move |app, outcome| {
+                        if app.native_runtime.completion_is_current(&reply)
+                            && let Ok((current_window, current_instance)) =
+                                app.locate_native_view(view)
+                            && current_instance == instance
+                        {
+                            app.dispatch_native_completion(
+                                current_window,
+                                instance,
+                                view,
+                                AppEvent::RecoveryFinished {
+                                    operation: reply.operation,
+                                    outcome,
+                                },
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             AppEffect::Update { request, reply } => {
                 let outcome = self.execute_native_update(request);
@@ -5194,30 +5214,53 @@ impl App {
                 self.open_markdown_link(wid, document, &destination)?;
             }
             AppEffect::OpenDocumentEditor { document } => {
-                let outcome = self
+                if self.locate_native_view(view) != Ok((wid, instance))
+                    || self.native_runtime.document_id(instance) != Some(document)
+                {
+                    return Ok(());
+                }
+                let Some(uri) = self
                     .document_store
                     .canonical_uri(document)
-                    .ok_or_else(|| "Markdown document disappeared before edit".to_string())
                     .map(str::to_string)
-                    .and_then(|uri| {
-                        self.open_document_tab_in_window(
-                            wid,
-                            crate::native_app::AppKind::Editor,
-                            &uri,
-                        )
-                        .map(|_| ())
-                    });
-                let completion = self.dispatch_native_completion(
+                else {
+                    self.dispatch_native_completion(
+                        wid,
+                        instance,
+                        view,
+                        AppEvent::DocumentEditorFinished {
+                            document,
+                            outcome: Err("Markdown document disappeared before edit".to_string()),
+                        },
+                    )?;
+                    return Ok(());
+                };
+                self.request_document_with_guard(
                     wid,
-                    instance,
-                    view,
-                    AppEvent::DocumentEditorFinished {
-                        document,
-                        outcome: outcome.clone(),
+                    crate::native_app::AppKind::Editor,
+                    &uri,
+                    crate::app_edit::Placement::FocusOrNewTab,
+                    move |app| {
+                        app.locate_native_view(view) == Ok((wid, instance))
+                            && app.native_runtime.document_id(instance) == Some(document)
                     },
-                );
-                outcome?;
-                completion?;
+                    move |app, installed| {
+                        if app.locate_native_view(view) == Ok((wid, instance))
+                            && app.native_runtime.document_id(instance) == Some(document)
+                        {
+                            app.dispatch_native_completion(
+                                wid,
+                                instance,
+                                view,
+                                AppEvent::DocumentEditorFinished {
+                                    document,
+                                    outcome: installed.map(|_| ()),
+                                },
+                            )?;
+                        }
+                        Ok(String::new())
+                    },
+                )?;
             }
             AppEffect::ChooseWallpaperImage => {
                 // Only an affirmative selection writes config, through the same
@@ -5315,6 +5358,7 @@ impl App {
             }
             AppEffect::Harness(request) => self.execute_native_harness(request),
             AppEffect::HarnessTimer(request) => self.execute_harness_timer(request),
+            AppEffect::Machine(request) => self.execute_machine_page(request),
             AppEffect::InvalidateOwnPresentation => {
                 self.refresh_native_presentation(wid, instance, view);
             }
@@ -7493,34 +7537,47 @@ impl App {
         &mut self,
         wid: WindowId,
         request: crate::native_app::RecoveryRequest,
-    ) -> crate::native_app::RecoveryOutcome {
+        allow: impl Fn(&App) -> bool + 'static,
+        after: impl FnOnce(&mut App, crate::native_app::RecoveryOutcome) -> Result<(), String> + 'static,
+    ) -> Result<(), String> {
         use crate::native_app::{RecoveryCapability, RecoveryOutcome, RecoveryRequest};
 
-        let open_document =
-            |app: &mut Self, kind: crate::native_app::AppKind, uri: String| -> RecoveryOutcome {
-                let safe = uri.len() <= 4_096
-                    && uri.starts_with("file:///")
-                    && !uri
-                        .chars()
-                        .any(|character| matches!(character, '\0' | '\r' | '\n'))
-                    && matches!(
+        let request = match request {
+            RecoveryRequest::Retry(RecoveryCapability::Document {
+                kind,
+                uri,
+                config_editor,
+            }) => {
+                return self.request_recovery_document(
+                    wid,
+                    RecoveryCapability::Document {
                         kind,
-                        crate::native_app::AppKind::Markdown | crate::native_app::AppKind::Editor
-                    );
-                if !safe {
-                    return RecoveryOutcome::Denied {
-                        message: "This document can no longer be reopened".to_string(),
-                    };
-                }
-                match app.open_document_tab_in_window(wid, kind, &uri) {
-                    Ok(_) => RecoveryOutcome::Opened {
-                        message: format!("Opened in {}", kind.display_name()),
+                        uri,
+                        config_editor,
                     },
-                    Err(message) => RecoveryOutcome::Failed { message },
-                }
-            };
+                    allow,
+                    after,
+                );
+            }
+            RecoveryRequest::OpenOriginal { uri } => {
+                return self.request_recovery_document(
+                    wid,
+                    RecoveryCapability::Document {
+                        kind: crate::native_app::AppKind::Editor,
+                        uri,
+                        config_editor: false,
+                    },
+                    allow,
+                    after,
+                );
+            }
+            request => request,
+        };
+        if !allow(self) {
+            return Ok(());
+        }
 
-        match request {
+        let outcome = match request {
             RecoveryRequest::Retry(RecoveryCapability::About) => {
                 if self.open_about_tab_in_window(wid) {
                     RecoveryOutcome::Opened {
@@ -7545,9 +7602,12 @@ impl App {
             }
             RecoveryRequest::Retry(RecoveryCapability::Settings { route }) => {
                 let Some(route) = crate::native_settings::SettingsRoute::from_path(&route) else {
-                    return RecoveryOutcome::Denied {
-                        message: "That Settings page no longer exists".to_string(),
-                    };
+                    return after(
+                        self,
+                        RecoveryOutcome::Denied {
+                            message: "That Settings page no longer exists".to_string(),
+                        },
+                    );
                 };
                 if self.open_settings_tab_in_window(wid, route) {
                     RecoveryOutcome::Opened {
@@ -7559,26 +7619,123 @@ impl App {
                     }
                 }
             }
-            RecoveryRequest::Retry(RecoveryCapability::Document {
+            // A failed open's tab opens the file again the way the person first asked: through
+            // the two-phase admission, whose install takes this tab's place and whose failure
+            // says so on it again (`App::show_failed_open`).
+            RecoveryRequest::Reopen {
                 kind,
                 uri,
-                config_editor,
-            }) => {
-                if config_editor {
-                    match self.ensure_and_open_config_editor_in_window(wid) {
-                        Ok(_) => RecoveryOutcome::Opened {
-                            message: "Reopened aterm.toml in Manual configuration mode".to_string(),
+                reveal,
+                entry,
+            } => {
+                if !recovery_document_is_safe(kind, &uri) {
+                    return after(
+                        self,
+                        RecoveryOutcome::Denied {
+                            message: "This document can no longer be reopened".to_string(),
                         },
-                        Err(message) => RecoveryOutcome::Failed { message },
-                    }
+                    );
+                }
+                let purpose = if entry {
+                    crate::app_documents::DocumentAdmissionPurpose::DirectoryEntry
                 } else {
-                    open_document(self, kind, uri)
+                    crate::app_documents::DocumentAdmissionPurpose::Open
+                };
+                match self.open_document_tab_revealing(wid, kind, &uri, reveal, purpose) {
+                    Ok(
+                        crate::app_documents::DocumentAdmission::InFlight(_)
+                        | crate::app_documents::DocumentAdmission::Coalesced(_),
+                    ) => {
+                        let name = crate::native_document_host::file_uri_path(&uri)
+                            .ok()
+                            .and_then(|path| {
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                            })
+                            .unwrap_or(uri);
+                        RecoveryOutcome::Started {
+                            message: format!("Opening {name}…"),
+                        }
+                    }
+                    Ok(crate::app_documents::DocumentAdmission::Opened(_)) => {
+                        RecoveryOutcome::Opened {
+                            message: format!("Opened in {}", kind.display_name()),
+                        }
+                    }
+                    Ok(crate::app_documents::DocumentAdmission::Shown(_)) => {
+                        RecoveryOutcome::Failed {
+                            message: crate::app_documents::STILL_COULD_NOT_OPEN.to_string(),
+                        }
+                    }
+                    Err(message) => RecoveryOutcome::Failed { message },
                 }
             }
-            RecoveryRequest::OpenOriginal { uri } => {
-                open_document(self, crate::native_app::AppKind::Editor, uri)
-            }
+            RecoveryRequest::Retry(RecoveryCapability::Document { .. })
+            | RecoveryRequest::OpenOriginal { .. } => unreachable!("document recovery was queued"),
+        };
+        after(self, outcome)
+    }
+
+    fn request_recovery_document(
+        &mut self,
+        wid: WindowId,
+        document: crate::native_app::RecoveryCapability,
+        allow: impl Fn(&App) -> bool + 'static,
+        after: impl FnOnce(&mut App, crate::native_app::RecoveryOutcome) -> Result<(), String> + 'static,
+    ) -> Result<(), String> {
+        use crate::native_app::{RecoveryCapability, RecoveryOutcome};
+
+        let RecoveryCapability::Document {
+            kind,
+            uri,
+            config_editor,
+        } = document
+        else {
+            unreachable!("only document capabilities enter document admission")
+        };
+        if !config_editor && !recovery_document_is_safe(kind, &uri) {
+            return after(
+                self,
+                RecoveryOutcome::Denied {
+                    message: "This document can no longer be reopened".to_string(),
+                },
+            );
         }
+        let completed =
+            move |app: &mut App,
+                  installed: Result<crate::app_documents::InstalledDocument, String>| {
+                let outcome = match installed {
+                    Ok(_) => RecoveryOutcome::Opened {
+                        message: if config_editor {
+                            "Reopened aterm.toml in Manual configuration mode".to_string()
+                        } else {
+                            format!("Opened in {}", kind.display_name())
+                        },
+                    },
+                    Err(message) => RecoveryOutcome::Failed { message },
+                };
+                after(app, outcome)?;
+                Ok(String::new())
+            };
+        if config_editor {
+            self.request_config_editor_with_guard(
+                wid,
+                None,
+                crate::app_edit::Placement::FocusOrNewTab,
+                allow,
+                completed,
+            )
+        } else {
+            self.request_document_with_guard(
+                wid,
+                kind,
+                &uri,
+                crate::app_edit::Placement::FocusOrNewTab,
+                allow,
+                completed,
+            )
+        }
+        .map(|_| ())
     }
 
     pub(crate) fn start_native_update_check(&mut self) -> UpdateOutcome {
@@ -10332,12 +10489,14 @@ impl App {
         for ws in self.windows.values_mut() {
             let count = ws.tab_set.len();
             for index in 0..count {
-                let Some(tab) = ws.tab_set.tab_at_mut(index) else {
+                let Some(tab) = ws.tab_set.tab_at(index) else {
                     continue;
                 };
-                if tab.root.any_leaf(&mut |view| setting_views.contains(view)) {
-                    tab.presentation.indicators.busy = checking;
-                    tab.presentation.indicators.attention = attention;
+                if tab.root.any_leaf(&mut |view| setting_views.contains(view))
+                    && let Some(presentation) = ws.tab_set.presentation_at_mut(index)
+                {
+                    presentation.indicators.busy = checking;
+                    presentation.indicators.attention = attention;
                 }
             }
             ws.last_present = None;
@@ -12211,6 +12370,9 @@ impl App {
             .count();
 
         let mut blockers = Vec::new();
+        if self.unpublished_document_preparations() {
+            blockers.push("Updating after document recovery finishes".to_string());
+        }
         if changed_cells > 0 {
             blockers.push(format!(
                 "Wait: {changed_cells} edited table cell(s) are still open; Return keeps a cell, Escape drops it"
@@ -12476,9 +12638,9 @@ impl App {
                 .tabs()
                 .iter()
                 .position(|tab| tab.id == tab_id)
-            && let Some(tab) = window.tab_set.tab_at_mut(index)
+            && let Some(slot) = window.tab_set.presentation_at_mut(index)
         {
-            tab.presentation = presentation;
+            *slot = presentation;
         }
     }
 }
@@ -13021,6 +13183,20 @@ fn machine_command_output_bounded(
     Err("machine settings commands require macOS".into())
 }
 
+/// Whether a Recovery tab may open `uri` as a `kind` document again: a bounded, single-line
+/// `file:///` URI, opened as Markdown or in the Editor.
+fn recovery_document_is_safe(kind: crate::native_app::AppKind, uri: &str) -> bool {
+    uri.len() <= 4_096
+        && uri.starts_with("file:///")
+        && !uri
+            .chars()
+            .any(|character| matches!(character, '\0' | '\r' | '\n'))
+        && matches!(
+            kind,
+            crate::native_app::AppKind::Markdown | crate::native_app::AppKind::Editor
+        )
+}
+
 /// The `machine-state:` record in one `atpkg machine` stdout, if any line carries a parseable one.
 pub(crate) fn parse_machine_state_output(stdout: &str) -> Option<atpkg::machine::MachineState> {
     stdout.lines().find_map(|line| {
@@ -13045,7 +13221,7 @@ fn machine_apply_completion(
                 PackagesCommandOutcome::Failed {
                     operation,
                     message: format!(
-                        "{message}; changes may be partial — refresh This Mac before retrying"
+                        "{message}; changes may be partial — refresh Machine settings (Settings ▸ Security) before retrying"
                     ),
                 },
                 None,

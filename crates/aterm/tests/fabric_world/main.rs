@@ -31,6 +31,7 @@ mod broadcast;
 mod broker_lifeline;
 mod broker_poison;
 mod broker_retention;
+mod broker_start_stamps;
 mod doctor_retire;
 mod exactly_once;
 mod fabric_cli;

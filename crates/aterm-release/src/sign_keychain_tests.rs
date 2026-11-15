@@ -31,7 +31,7 @@ fn argv(id: &DevIdIdentity) -> Vec<String> {
 /// is unavailable. Readiness still requires a new proof of the changed keychain.
 #[test]
 fn profile_reload_keeps_shared_identity_after_partition_upkeep() {
-    use aterm_secrets::{client, fsx, materialize::digest_hex, text::Audience};
+    use aterm_secrets::{client, digest_hex, fsx, text::Audience};
     use aterm_update_core::roster::{Machine, Roster, SUPPORTED_SCHEMA};
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
     use std::os::unix::fs::MetadataExt as _;
@@ -73,14 +73,16 @@ fn profile_reload_keeps_shared_identity_after_partition_upkeep() {
     let master_key = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
     let master = Ed25519KeyPair::from_pkcs8(master_key.as_ref()).unwrap();
     let anchor = aterm_secrets::b64::encode_padded(master.public_key().as_ref());
-    let ring = home.join(".aterm/release-ring");
-    fsx::ensure_private_dir(&ring.join("roster")).unwrap();
-    let profile = ring.join("release-credentials.toml");
-    fsx::write_atomic(&profile, format!(
-        "signing_key = \"{}\"\nmachine_id = \"m1\"\nmachine_roster = \"~/.aterm/release-ring/roster/aterm-machines.toml\"\nnotary_profile = \"fixture\"\nsigning_identity_sha1 = \"{SHA1}\"\n",
+    // The release ring and its roster pair, held in the store and read in place.
+    let profile = format!(
+        "signing_key = \"{}\"\nmachine_id = \"m1\"\nmachine_roster = \"{}\"\nnotary_profile = \"fixture\"\nsigning_identity_sha1 = \"{SHA1}\"\n",
         aterm_secrets::b64::encode_padded(key.as_ref()),
-    ).as_bytes(), 0o600).unwrap();
-    fsx::write_atomic(&ring.join("machine.key"), key.as_ref(), 0o600).unwrap();
+        super::STORE_ROSTER,
+    );
+    let record = format!(
+        "id = \"m1\"\npubkey = \"{}\"\n",
+        aterm_secrets::b64::encode_padded(signer.public_key().as_ref())
+    );
     let mut roster = Roster {
         schema: SUPPORTED_SCHEMA,
         roster_seq: 1,
@@ -94,18 +96,21 @@ fn profile_reload_keeps_shared_identity_after_partition_upkeep() {
         }],
     };
     let roster_text = roster.to_toml().unwrap();
-    fsx::write_atomic(
-        &ring.join("roster/aterm-machines.toml"),
-        roster_text.as_bytes(),
-        0o644,
-    )
-    .unwrap();
-    fsx::write_atomic(
-        &ring.join("roster/aterm-machines.toml.sig"),
-        master.sign(roster_text.as_bytes()).as_ref(),
-        0o644,
-    )
-    .unwrap();
+    let roster_sig = master.sign(roster_text.as_bytes());
+    let [ring_key, ring_record, ring_profile] = aterm_secrets::entry_class::RELEASE_RING;
+    let [roster_name, roster_sig_name] = aterm_secrets::entry_class::PUBLIC_ROSTER;
+    let admin = client::admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    for (name, value) in [
+        (ring_key, key.as_ref()),
+        (ring_record, record.as_bytes()),
+        (ring_profile, profile.as_bytes()),
+        (roster_name, roster_text.as_bytes()),
+        (roster_sig_name, roster_sig.as_ref()),
+    ] {
+        doc.set_entry(&Audience::Everyone, name, value).unwrap();
+    }
+    client::admin_publish(&paths, &admin, &doc).unwrap();
 
     let mut world = World::new(&shared);
     let login = login_keychain_path(&home);
@@ -152,16 +157,13 @@ fn profile_reload_keeps_shared_identity_after_partition_upkeep() {
         0o600,
     )
     .unwrap();
-    let selection = |profile: &Path| {
-        client::release::test_signing_observation(&paths, profile, &[&anchor], proved as i64)
-            .unwrap()
-    };
-    let observation = || selection(&profile);
+    let selection =
+        || client::release::test_signing_observation(&paths, &[&anchor], proved as i64).unwrap();
+    let observation = selection;
     let load = || {
-        ReleaseCredentials::load_with_identity(&profile, Some(&home), |_, profile| {
-            selection(profile).0
-        })
-        .unwrap()
+        ReleaseCredentials::from_store_with(&home, |_| selection().0)
+            .unwrap()
+            .expect("the store holds the ring")
     };
     assert_eq!(load().signing_identity_sha1(), Some(shared.as_str()));
     assert!(matches!(
@@ -223,13 +225,10 @@ fn profile_reload_keeps_shared_identity_after_partition_upkeep() {
         "the profile's old identity is unavailable"
     );
 
+    // An operator's profile file is not the store's and never adopts the shared identity.
     let unrelated = home.join("unrelated-release.toml");
-    fsx::write_atomic(&unrelated, &std::fs::read(&profile).unwrap(), 0o600).unwrap();
-    let unrelated =
-        ReleaseCredentials::load_with_identity(&unrelated, Some(&home), |_, profile| {
-            selection(profile).0
-        })
-        .unwrap();
+    fsx::write_atomic(&unrelated, profile.as_bytes(), 0o600).unwrap();
+    let unrelated = ReleaseCredentials::load(&unrelated, Some(&home)).unwrap();
     assert_eq!(unrelated.signing_identity_sha1(), Some(SHA1));
 
     let admin = client::admin_open(&paths).unwrap();
@@ -255,18 +254,17 @@ fn profile_reload_keeps_shared_identity_after_partition_upkeep() {
 
     roster.revoked.push("m1".into());
     let revoked = roster.to_toml().unwrap();
-    fsx::write_atomic(
-        &ring.join("roster/aterm-machines.toml"),
-        revoked.as_bytes(),
-        0o644,
-    )
-    .unwrap();
-    fsx::write_atomic(
-        &ring.join("roster/aterm-machines.toml.sig"),
+    let admin = client::admin_open(&paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, roster_name, revoked.as_bytes())
+        .unwrap();
+    doc.set_entry(
+        &Audience::Everyone,
+        roster_sig_name,
         master.sign(revoked.as_bytes()).as_ref(),
-        0o644,
     )
     .unwrap();
+    client::admin_publish(&paths, &admin, &doc).unwrap();
     assert_eq!(load().signing_identity_sha1(), Some(SHA1));
 }
 

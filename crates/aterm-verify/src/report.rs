@@ -280,7 +280,7 @@ pub fn compile_unit_events(stage: &str, output: &str) -> Vec<String> {
         let string = |key| value.get(key).and_then(Value::as_str);
         let fresh = value.get("fresh").and_then(Value::as_bool);
         let (cause, cause_status) = unit.cause(fresh);
-        // Only the four measuring benches supply cross-tree bundle evidence. Hash the
+        // Only the measuring benches supply cross-tree bundle evidence. Hash the
         // executable itself, including its linked harness implementation and dependencies.
         let harness_sha256 = value.get("target").filter(|target| {
             target["kind"].as_array().is_some_and(|k| k.len() == 1 && k[0].as_str() == Some("bench"))
@@ -547,13 +547,29 @@ pub(crate) fn json_char_bytes(c: char) -> usize {
 }
 
 /// A finished check's `check-finished` event, one newline-terminated line: its outcome word, its
-/// own time, its detail, its stage rows (each with its word), its findings' ids and the command
-/// that reruns it. The release's cutter keeps one record per check from these (A19), so the line
-/// is bounded well under the 64 KiB its readers hold a line to: the detail to
-/// [`EVENT_DETAIL_BYTES`], [`EVENT_ROWS`] rows of [`EVENT_ROW_BYTES`] each, [`FINDINGS_SHOWN`]
-/// findings, each part's JSON encoding counted ([`clip_json`]); the totals say what was left out.
+/// own time, its detail, its stage rows (each with its word), its findings' ids, the command
+/// that reruns it, and whether the run's first red stopped it ([`CheckResult::stopped`]). The
+/// release's cutter keeps one record per check from these (A19), so the line is bounded well
+/// under the 64 KiB its readers hold a line to: the detail to [`EVENT_DETAIL_BYTES`],
+/// [`EVENT_ROWS`] rows of [`EVENT_ROW_BYTES`] each, [`FINDINGS_SHOWN`] findings, each part's
+/// JSON encoding counted ([`clip_json`]); the totals say what was left out.
+/// It carries no land key: a run that keeps a land plan writes [`keyed_check_event`].
 #[must_use]
 pub fn check_event(r: &CheckResult, reports: &[&Report]) -> String {
+    keyed_check_event(r, reports, None)
+}
+
+/// [`check_event`], with what the run's land plan says of the check beside its word
+/// ([`crate::land_seal::Keyed`]): its `key`, the `scope` (`{crates, widened}`) of a crate-scoped
+/// check, and the `external` reads of export-scan and census, for whoever reads the events (no
+/// controller keeps them: `run-planned`'s seal fields are what the keys sealed). The crate list
+/// is the selection's, a few KiB for the widest cone, well inside a line's 64 KiB.
+#[must_use]
+pub fn keyed_check_event(
+    r: &CheckResult,
+    reports: &[&Report],
+    keyed: Option<&crate::land_seal::Keyed>,
+) -> String {
     let all: Vec<(Outcome, &str)> = reports.iter().flat_map(|rep| rep.outcomes()).collect();
     let rows: Vec<_> = all
         .iter()
@@ -568,20 +584,109 @@ pub fn check_event(r: &CheckResult, reports: &[&Report]) -> String {
         .take(FINDINGS_SHOWN)
         .map(|f| clip_json(&f.id, EVENT_ROW_BYTES))
         .collect();
+    let mut payload = aterm_json::json!({
+        "check": r.check.name(),
+        "outcome": word(r.outcome),
+        "seconds": r.seconds,
+        "detail": clip_json(&r.detail, EVENT_DETAIL_BYTES),
+        "rows": rows,
+        "rows_total": all.len(),
+        "findings": findings,
+        "findings_total": r.findings.len(),
+        "rerun": clip_json(&r.rerun, EVENT_ROW_BYTES),
+        "stopped": r.stopped,
+    });
+    if let (Some(keyed), Some(fields)) = (keyed, payload.as_object_mut()) {
+        fields.insert("key".into(), keyed.key.clone().into());
+        if let Some((crates, widened)) = &keyed.scope {
+            fields.insert(
+                "scope".into(),
+                aterm_json::json!({"crates": crates, "widened": widened}),
+            );
+        }
+        if let Some(external) = &keyed.external {
+            fields.insert("external".into(), aterm_json::json!(external));
+        }
+    }
+    format!(
+        "verify-event: {}\n",
+        crate::event_log::event_value(crate::event_log::EventKind::CheckFinished, payload)
+    )
+}
+
+/// The run's `run-planned` event, one newline-terminated line written before its first stage
+/// ([`crate::land_seal::Plan`]): the commit and tree it judges, the base commit, whether the
+/// checkout is clean, each required check (the full plan's, pulls included) with its part, key,
+/// seal and the digest of each field its seal names, the local digest and its attributes, the
+/// plan digest, and each field it could not seal and why.
+#[must_use]
+pub fn run_planned(plan: &crate::land_seal::Plan) -> String {
+    let required: Vec<_> = plan
+        .required
+        .iter()
+        .map(|row| {
+            let fields: std::collections::BTreeMap<&str, &str> =
+                crate::land_seal::fields_of(row.check)
+                    .iter()
+                    .filter_map(|name| {
+                        plan.fields
+                            .get_key_value(name)
+                            .map(|(name, value)| (name.as_str(), value.as_str()))
+                    })
+                    .collect();
+            aterm_json::json!({
+                "check": row.check.name(),
+                "part": row.part,
+                "key": row.key,
+                "seal": row.seal,
+                "fields": fields,
+            })
+        })
+        .collect();
+    let unsealed: Vec<_> = plan
+        .unsealed
+        .iter()
+        .map(|(field, why)| aterm_json::json!({"field": field, "why": clip_json(why, EVENT_ROW_BYTES)}))
+        .collect();
     format!(
         "verify-event: {}\n",
         crate::event_log::event_value(
-            crate::event_log::EventKind::CheckFinished,
+            crate::event_log::EventKind::RunPlanned,
             aterm_json::json!({
-                "check": r.check.name(),
-                "outcome": word(r.outcome),
-                "seconds": r.seconds,
-                "detail": clip_json(&r.detail, EVENT_DETAIL_BYTES),
-                "rows": rows,
-                "rows_total": all.len(),
-                "findings": findings,
-                "findings_total": r.findings.len(),
-                "rerun": clip_json(&r.rerun, EVENT_ROW_BYTES),
+                "commit": plan.tree.commit,
+                "tree": plan.tree.tree,
+                "base": plan.tree.base,
+                "clean": plan.tree.clean,
+                "required": required,
+                "local": {"digest": plan.local_digest, "fields": plan.local},
+                "plan_digest": plan.plan_digest,
+                "unsealed": unsealed,
+            })
+        )
+    )
+}
+
+/// The run's `run-resealed` event, one newline-terminated line just before `run-finished`
+/// ([`crate::land_seal::Resealed`]): each required check's seal over its fields as they read now,
+/// the local digest now, each field's reading (`moved` where it moved), the fields that moved, and
+/// whether every seal and the local digest stood through the run.
+#[must_use]
+pub fn run_resealed(resealed: &crate::land_seal::Resealed) -> String {
+    let seals: Vec<_> = resealed
+        .seals
+        .iter()
+        .map(|(check, seal)| aterm_json::json!({"check": check.name(), "seal": seal}))
+        .collect();
+    format!(
+        "verify-event: {}\n",
+        crate::event_log::event_value(
+            crate::event_log::EventKind::RunResealed,
+            aterm_json::json!({
+                "seals": seals,
+                "fields": resealed.fields,
+                "local": {"digest": resealed.local_digest, "fields": resealed.local},
+                "moved": resealed.moved,
+                "sealed_through": resealed.sealed_through,
             })
         )
     )

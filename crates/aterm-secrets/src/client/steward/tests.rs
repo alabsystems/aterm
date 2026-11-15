@@ -158,7 +158,7 @@ fn a_legacy_reserved_host_gets_an_admitted_discovery_name_without_reconfiguratio
             let mut incomplete = healthy.clone();
             incomplete.failed = !pending;
             if pending {
-                incomplete.pending.insert("a-file".into(), "pending".into());
+                incomplete.failed = true;
             }
             save_state(&lab.m1, &incomplete).unwrap();
             assert!(decide(&mut crate::cli::ServeRole::default()).is_none());
@@ -255,9 +255,7 @@ fn server_role_survives_only_same_context_transient_reads() {
     lab.as_alab(|| {
         let healthy = load_state(&m2).unwrap();
         let mut pending = healthy.clone();
-        pending
-            .pending
-            .insert("a-file".into(), "in-progress".into());
+        pending.failed = true;
         assert_eq!(decide(&mut role).as_deref(), Some("m2"));
         save_state(&m2, &pending).unwrap();
         assert_eq!(decide(&mut role).as_deref(), Some("m2"));
@@ -425,7 +423,7 @@ fn denied_server_never_falls_back_during_a_failed_or_pending_apply() {
         sync(&m2, None).unwrap();
         let mut denied = load_state(&m2).unwrap();
         denied.failed = true;
-        denied.pending.insert("a-file".into(), "in-progress".into());
+        denied.failed = true;
         save_state(&m2, &denied).unwrap();
         assert!(matches!(
             observe_alab_role(&m2),

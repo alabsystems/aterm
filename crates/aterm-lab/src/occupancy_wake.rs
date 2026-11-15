@@ -17,6 +17,7 @@
 
 use std::path::Path;
 
+use alab_policy::vocab::Phase;
 use aterm_agent::harness::upgrade::HARNESS_MARK;
 use aterm_agent::supervise::facts::FactKind;
 use aterm_agent::supervise::occupancy::door::INTENT_RULE;
@@ -25,7 +26,7 @@ use aterm_agent::supervise::occupancy::reading::LOOK_EVERY_MS;
 use aterm_agent::supervise::occupancy::rules::WOULD_RULE;
 use aterm_agent::supervise::occupancy::templates;
 use aterm_agent::supervise::occupancy::wakes_seen::{AtomKind, Declarer, WAKE_RULE, WakeDoor};
-use aterm_phase::phase::{Phase, background_wait, worker_phase};
+use aterm_phase::phase::{background_wait, worker_phase};
 
 use crate::pyjson::{COMPACT, J};
 use crate::record::{Frame, rec_s};

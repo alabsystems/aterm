@@ -8,11 +8,16 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(unix, test))]
+use std::time::Instant;
 
+#[cfg(any(unix, test))]
 use aterm_uds::deadline::{self, RunError};
+#[cfg(any(unix, test))]
 use aterm_uds::spawnfd::{self, Tether as _};
 
+#[cfg(any(unix, test))]
 use crate::error::{Error, Result, SideEffect};
 
 /// A child's bound when nothing names another.
@@ -26,15 +31,15 @@ pub(crate) const MAX_RECORD_SPOOL_BYTES: usize = deadline::MAX_COMPLETE_LISTING_
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChildSpec {
-    /// The program, absolute wherever a child runs: WP8's `gh` is one of `GH_ABSOLUTE`, given
-    /// as `Path::new(GH_ABSOLUTE[i])`, and WP7's runner resolves `git` to `{PATH entry}/git`
-    /// first (§4.6.13, step 7). A replaying git run names the bare `git`, which nothing runs
-    /// (`Fx::git` answers from the tape). `run` refuses a relative program as could_not_run,
-    /// why `{program} is not an absolute path`, before anything is spawned.
+    /// The program, absolute wherever a child runs: WP7's runner resolves `git` to
+    /// `{PATH entry}/git` first (§4.6.13, step 7). A replaying git run names the bare `git`,
+    /// which nothing runs (`Fx::git` answers from the tape). `run_unless` refuses a relative
+    /// program as could_not_run, why `{program} is not an absolute path`, before anything is
+    /// spawned.
     pub program: PathBuf,
     /// Its arguments.
     pub args: Vec<OsString>,
-    /// Its whole environment: `run` calls `env_clear()` and then `envs(..)` on the
+    /// Its whole environment: `run_unless` calls `env_clear()` and then `envs(..)` on the
     /// `spawnfd::Command` that `spawnfd::command` returns, so nothing is inherited.
     /// (`env_exactly` is `spawnfd::LaneCommand`'s, which agh does not use.)
     pub env: Vec<(OsString, OsString)>,
@@ -192,8 +197,8 @@ impl ChildSpec {
 }
 
 /// What a child left: the last `aterm_uds::deadline::OUTPUT_KEEP` bytes of each stream. Its
-/// `Debug` names the exit code and each stream's length, never the bytes: `gh auth token`'s
-/// stdout is a token until its caller moves it into a `Secret`.
+/// `Debug` names the exit code and each stream's length, never the bytes, which may carry a
+/// credential.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ChildOut {
     /// Its exit code; `None` when a signal ended it.
@@ -227,25 +232,14 @@ impl fmt::Debug for ChildOut {
     }
 }
 
-/// A test's scripted child.
-#[cfg(any(test, debug_assertions))]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScriptedChild {
-    /// The program the run must ask for.
-    pub program: PathBuf,
-    /// The arguments it must pass.
-    pub args: Vec<String>,
-    /// What it answers.
-    pub out: ChildOut,
-}
-
-/// The refusals every door that runs or logs a spec shares (`run`, and the simulated arms of
-/// `Fx::child` and `Fx::git`), before anything runs or is logged: a relative program or
+/// The refusals every door that runs or logs a spec shares (`run_unless`, and the simulated arm of
+/// `Fx::git`), before anything runs or is logged: a relative program or
 /// explicit input above 1 MiB is could_not_run, `Sub::Local`.
 ///
 /// # Errors
 ///
 /// A relative program or oversized explicit input, as above.
+#[cfg(any(unix, test))]
 pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
     if spec
         .input
@@ -286,14 +280,12 @@ pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
 /// `SideEffect::Unknown`: a git push may already have reached its remote. Neither the
 /// collector failure nor its termination attempt proves that nothing happened; its cleanup
 /// contract is separate from dispatch classification. A caller that only reads remotely
-/// (ls-remote, clone, `gh auth token`) may lower the side effect to none.
-pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
-    run_unless(spec, &mut || false)
-}
-
-/// The same owned collector, with an operation owner's cooperative cancellation request.
-/// An explicit stop before dispatch has no side effect; after dispatch the collector retires
-/// its actual child/group before returning, while a remote write may already have happened.
+/// (ls-remote, clone) may lower the side effect to none.
+///
+/// `stopped` is an operation owner's cooperative cancellation request. An explicit stop
+/// before dispatch has no side effect; after dispatch the collector retires its actual
+/// child/group before returning, while a remote write may already have happened.
+#[cfg(any(unix, test))]
 pub(crate) fn run_unless(spec: &ChildSpec, stopped: &mut dyn FnMut() -> bool) -> Result<ChildOut> {
     check(spec)?;
     if stopped() {
@@ -494,6 +486,7 @@ fn run_record_spool(
     })
 }
 
+#[cfg(any(unix, test))]
 fn interrupted(effect: SideEffect) -> Error {
     Error::new(
         crate::error::Kind::Interrupted,
@@ -528,6 +521,7 @@ fn config_output(spec: &ChildSpec, mut out: ChildOut) -> ChildOut {
 }
 
 /// Dispatch classification is independent of the collector's cleanup contract.
+#[cfg(any(unix, test))]
 fn classify_failure(spec: &ChildSpec, error: RunError) -> Error {
     let program = spec.program.display();
     match error {
@@ -545,6 +539,7 @@ fn classify_failure(spec: &ChildSpec, error: RunError) -> Error {
     }
 }
 
+#[cfg(any(unix, test))]
 fn classify_progress_failure(spec: &ChildSpec, error: deadline::ProgressError) -> Error {
     match error {
         deadline::ProgressError::Run(error) => classify_failure(spec, error),

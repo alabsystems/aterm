@@ -39,6 +39,9 @@ pub struct ResourceProbe {
     reading: Reading,
     records: Vec<Record>,
     used: ProcessUse,
+    /// What every look reads of every claim the probe read, and of the probe's own need as the
+    /// claim its look would read ([`Ledgerwide`]).
+    wide: Ledgerwide,
 }
 
 impl ResourceProbe {
@@ -111,17 +114,40 @@ impl ResourceProbe {
             Some(procs)
         };
         let pid = std::process::id();
-        let records: Vec<_> = counted(
-            records.iter().collect(),
+        // A stand-in for the waiting claim each need checked against this look would be, asked
+        // last: one claim more of its process's, whose line every lead's fit reads
+        // ([`ledgerwide`]). It asks for nothing and leads nothing, so it reserves nothing and no
+        // waiter counts it: it moves another claim's standing only as that waiting claim would, by
+        // its process's claim count (a held claim of its process no longer gives back the rest of
+        // the tree at its end, [`Other::sole`]) and its line in each lead's fit; each need is
+        // judged against the look in `check_at`.
+        let asking = Record {
+            accounting: crate::Accounting::Holder,
             pid,
+            start_ms: now,
+            seq: u64::MAX,
+            checkout: String::new(),
+            need: Need::new("probe"),
+            timing: crate::TimingEvidence::default(),
+            held: None,
+            credit: Vec::new(),
+            wrote: None,
+            next_ms: None,
+        };
+        let LookRead {
+            counted: records,
+            used,
+            wide,
+        } = look_read(
+            &records
+                .iter()
+                .chain(std::iter::once(&asking))
+                .collect::<Vec<_>>(),
+            &asking,
             procs.as_ref(),
-            reading.available,
-        )
-        .into_iter()
-        .cloned()
-        .collect();
-        let refs: Vec<_> = records.iter().collect();
-        let used = process_use(&refs, pid, procs.as_ref());
+            &reading,
+        );
+        let records: Vec<_> = records.into_iter().cloned().collect();
         Ok(Some(Self {
             captured,
             now,
@@ -129,6 +155,7 @@ impl ResourceProbe {
             reading,
             records,
             used,
+            wide,
         }))
     }
 
@@ -178,7 +205,13 @@ impl ResourceProbe {
             return Some(ProbeRejection::Unreachable(why));
         }
         let refs: Vec<_> = self.records.iter().collect();
-        let others = others(&refs, self.used.claimants.clone(), &self.used.trees);
+        let others = others(
+            &refs,
+            self.used.claimants.clone(),
+            &self.used.trees,
+            &self.used.lines,
+            &self.wide,
+        );
         let mine = (self.now, self.pid, u64::MAX);
         decide(need, mine, &self.reading, &others, self.now)
             .err()

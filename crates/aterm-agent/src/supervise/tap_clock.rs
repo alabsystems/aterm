@@ -3,7 +3,7 @@
 
 //! Usage-tap reset clock for timing `usage-resume@v1` continuations at a Claude Code usage wall.
 
-use aterm_phase::WallKind;
+use alab_policy::vocab::WallKind;
 
 use super::limit::{CLOCK_SLACK_S, names_a_session_window};
 use crate::harness::tap::Window;

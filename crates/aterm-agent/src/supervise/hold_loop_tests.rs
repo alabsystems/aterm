@@ -3,7 +3,7 @@
 
 use crate::harness::acts::{HoldLeg, LandHeld, TaskFace};
 use crate::harness::hold_said::HoldSaid;
-use crate::supervise::policy::turn_end::{RULE_LAND, RULE_LAND_NUDGE};
+use alab_policy::words::{RULE_LAND, RULE_LAND_NUDGE};
 
 const HOLD_DOOR: &str = "host.land_held";
 
@@ -398,7 +398,7 @@ fn the_hold_ends_at_a_landing() {
         let lines = run(&mut m, &host, None);
         (host.tells(), lines)
     };
-    let (told, lines) = landing(crate::supervise::policy::land_check::LANDED);
+    let (told, lines) = landing(alab_policy::land_check::LANDED);
     let tail: Vec<Told> = told.iter().rev().take(2).rev().copied().collect();
     assert_eq!(
         tail,
@@ -768,10 +768,7 @@ const ALL_DONE: &str = "Merged the parser and pushed it to origin/main. All done
 fn switch_asks(m: &Mock) -> usize {
     m.requests
         .iter()
-        .filter(|r| {
-            r.starts_with("turn ")
-                && r.contains(crate::supervise::policy::turn_end::SWITCH_WHY_HEAD)
-        })
+        .filter(|r| r.starts_with("turn ") && r.contains(alab_policy::words::SWITCH_WHY_HEAD))
         .count()
 }
 

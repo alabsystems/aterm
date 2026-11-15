@@ -265,6 +265,20 @@ fn the_ai_route_renders_its_cards_and_controls() {
     }
 }
 
+/// `[ai] machine` is written by a rename from this machine's number
+/// (`aterm_agent::machine_name::publish`), so the page draws no row that edits it: one would
+/// be a second writer the next rename overwrites. It stays a Manual row.
+/// NEGATIVE CONTROL: the fleet document's own rows are drawn.
+#[test]
+fn the_ai_page_lists_no_machine_row() {
+    let (mut runtime, instance, view) = ai_route(fixture());
+    let pages = every_page(&mut runtime, instance, view, &view_cx_at(1_200.0, 820.0));
+    assert!(!shown(&pages, "settings/control/ai.machine"));
+    assert!(shown(&pages, "settings/control/ai.fleet"));
+    assert!(crate::prefs::nested_leaf("ai.machine").is_none());
+    assert!(crate::native_config_language::config_schema_entry("ai.machine").is_some());
+}
+
 #[test]
 fn the_ai_routes_presses_are_typed_host_requests() {
     let harness = |effects: &[AppEffect]| {

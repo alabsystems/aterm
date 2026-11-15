@@ -6,7 +6,7 @@ use std::path::Path;
 
 #[cfg(unix)]
 const EXE: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
-const SID: &str = "s-60776b6e2ed1b73bd013";
+const SID: &str = "td1b73bd013";
 
 /// A Claude Code 2.1.300 status-line payload (lab capture `tap-inline.jsonl`, paths replaced).
 fn payload(api_ms: u64, five: Option<(u32, i64)>, seven: Option<(u32, i64)>) -> String {
@@ -465,6 +465,7 @@ fn a_re_report_keeps_the_first_reports_stamp() {
     };
     let beside = Beside {
         seen: true,
+        served: true,
         refilled: [None, None],
     };
     assert_eq!(account(late.tap_read(beside, None)), (30, 1));
@@ -650,7 +651,7 @@ fn a_reading_is_read_only_from_its_own_processes_file() {
         .and_then(|s| i64::try_from(s).ok())
         .unwrap_or(0);
     assert!(Reading::read(&dir, SID, 68537, now - 60).is_some());
-    assert!(Reading::read(&dir, "s-0000", 68537, 0).is_none());
+    assert!(Reading::read(&dir, "t0000000000", 68537, 0).is_none());
     assert!(Reading::read(&dir, SID, 68538, 0).is_none());
     assert!(
         Reading::read(&dir, SID, 68537, now + 3600).is_none(),
@@ -727,7 +728,7 @@ fn a_reading_keeps_the_vendors_tenths_and_its_model() {
     assert_eq!(r.model.as_deref(), Some("claude-opus-5-5"));
     let back = Reading::of_json(&r.to_json()).expect("reads back");
     assert_eq!(back, r);
-    let old = r#"{"v":1,"at":5,"sid":"s-1","pid":7,"session":null,"login":null,"home":null,
+    let old = r#"{"v":1,"at":5,"sid":"t0000000001","pid":7,"session":null,"login":null,"home":null,
 "api_ms":3,"five_hour":{"pct":42,"resets_at":9},"seven_day":null,"cache":{},"version":null}"#;
     let old = Reading::of_json(old).expect("an older file reads");
     let w = old.five_hour.expect("its window");
@@ -824,7 +825,7 @@ fn a_reading_keeps_the_context_left_claude_code_counts() {
     let wild = text.replace("64.6}", "164}");
     let r = Reading::of_stdin(&wild, &vars(), 1_792_050_000).expect("a reading");
     assert_eq!(r.ctx_left, None, "past 100 is no percent");
-    let old = r#"{"v":1,"at":5,"sid":"s-1","pid":7,"session":null,"login":null,"home":null,
+    let old = r#"{"v":1,"at":5,"sid":"t0000000001","pid":7,"session":null,"login":null,"home":null,
 "api_ms":3,"five_hour":null,"seven_day":null,"cache":{},"version":null}"#;
     assert_eq!(
         Reading::of_json(old).expect("an older file reads").ctx_left,
@@ -884,7 +885,7 @@ fn a_reading_keeps_the_effort_claude_code_reports() {
     let unnamed = PAYLOAD_2_1_310.replace(r#""effort":{"level":"high"},"#, "");
     assert_ne!(unnamed, PAYLOAD_2_1_310);
     assert_eq!(said(&unnamed), None, "a payload with no effort");
-    let old = r#"{"v":1,"at":5,"sid":"s-1","pid":7,"session":null,"login":null,"home":null,
+    let old = r#"{"v":1,"at":5,"sid":"t0000000001","pid":7,"session":null,"login":null,"home":null,
 "api_ms":3,"five_hour":null,"seven_day":null,"cache":{},"version":null}"#;
     assert_eq!(
         Reading::of_json(old).expect("an older file reads").effort,
@@ -901,7 +902,8 @@ fn a_reading_keeps_the_effort_claude_code_reports() {
 }
 
 /// WHAT A READING SAYS BESIDE THE LAST ADMITTED ([`Fresh::beside`]): the
-/// same process read before is `seen`; a window is REFILLED, from the
+/// same process read before is `seen`, and `served` where its `api_ms`
+/// rose since; a window is REFILLED, from the
 /// figure that process read before, where it was served since (`api_ms`
 /// rose) and reads lower by a whole point or more under the same reset —
 /// the drop a limit reset used inside the window makes.
@@ -925,12 +927,17 @@ fn a_refill_is_a_drop_in_one_process_served_since_under_one_reset() {
         beside(&read(7, 200, at(50, 50))),
         Beside {
             seen: true,
+            served: true,
             refilled: [Some(1000), None],
         }
     );
     assert_eq!(
-        beside(&read(7, 100, at(50, 50))).refilled,
-        [None, None],
+        beside(&read(7, 100, at(50, 50))),
+        Beside {
+            seen: true,
+            served: false,
+            refilled: [None, None],
+        },
         "no API time since"
     );
     assert_eq!(
@@ -1086,7 +1093,7 @@ fn a_sweep_takes_the_dead_and_the_old_and_nothing_else() {
         format!("{SID}-2.json"),
         format!(".{SID}-3.json.tmp99"),
         "notes.txt".to_string(),
-        "s-zz-4.json".to_string(),
+        "t00000000zu-4.json".to_string(),
     ] {
         std::fs::write(dir.join(name), "{}").expect("write");
     }
@@ -1102,7 +1109,7 @@ fn a_sweep_takes_the_dead_and_the_old_and_nothing_else() {
     left.sort();
     assert_eq!(
         left,
-        ["notes.txt", "s-60776b6e2ed1b73bd013-2.json", "s-zz-4.json"]
+        ["notes.txt", "t00000000zu-4.json", "td1b73bd013-2.json"]
     );
     sweep(&dir, now + 2 * SWEEP_AFTER_S as i64, &|_| true);
     let left: Vec<String> = std::fs::read_dir(&dir)
@@ -1111,6 +1118,52 @@ fn a_sweep_takes_the_dead_and_the_old_and_nothing_else() {
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
     assert!(!left.contains(&format!("{SID}-2.json")), "an old one");
+}
+
+/// A sweep takes a stale temp file and a gone process's reading of a tab opened before the `t`
+/// form, whose `s-` ID holds a `-` of its own. NEGATIVE CONTROLS: a temp file whose name before
+/// the pid is not a tab ID in either form (a short `s-`, an upper-case one, a bare word) stays,
+/// and so does a fresh temp file of an `s-` tab.
+#[test]
+fn a_sweep_takes_an_earlier_tabs_stale_temp_file() {
+    const EARLIER: &str = "s-1a2b3c4d5e6f70819203";
+    let root = scratch("sweep-earlier");
+    let dir = root.path().to_path_buf();
+    let not_tabs = [
+        ".s-1a2b-5.json.tmp99".to_string(),
+        ".S-1A2B3C4D5E6F70819203-6.json.tmp99".to_string(),
+        ".notatab-7.json.tmp99".to_string(),
+    ];
+    for name in [
+        format!(".{EARLIER}-3.json.tmp99"),
+        format!("{EARLIER}-4.json"),
+    ]
+    .iter()
+    .chain(&not_tabs)
+    {
+        std::fs::write(dir.join(name), "{}").expect("write");
+    }
+    let now = aterm_time::unix_secs()
+        .and_then(|s| i64::try_from(s).ok())
+        .unwrap_or(0);
+    let list = || {
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("ls")
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        left.sort();
+        left
+    };
+    sweep(&dir, now, &|_| true);
+    assert!(
+        list().contains(&format!(".{EARLIER}-3.json.tmp99")),
+        "NEGATIVE CONTROL: a fresh temp file stays"
+    );
+    sweep(&dir, now + 60, &|_| false);
+    let mut want = not_tabs.to_vec();
+    want.sort();
+    assert_eq!(list(), want, "the earlier tab's files go; the others stay");
 }
 
 /// The facts of a line the gate admits: the switch on, the machine's own
@@ -1591,7 +1644,7 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
             assert_eq!(parse_line(&row[2..]), Some(width), "{row}");
             let screen = with_tap_row(&rows, &row);
             let read = aterm_phase::read(Some("claude"), &screen, None);
-            assert_eq!(read.phase, aterm_phase::Phase::Idle, "{row}");
+            assert_eq!(read.phase, alab_policy::vocab::Phase::Idle, "{row}");
             assert!(read.wall.is_none(), "{row}");
             assert_eq!(footer::mode_row(&screen), Some(bottom + 2), "{row}");
             assert_eq!(footer::live_repl_row(&screen), Some(bottom + 2), "{row}");
@@ -1602,7 +1655,7 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
         let walled = with_tap_row(&rows, "  ⚠ Usage limit reached · limit resets 12:23pm");
         let read = aterm_phase::read(Some("claude"), &walled, None);
         assert!(
-            read.wall.is_some() || matches!(read.phase, aterm_phase::Phase::Limited { .. }),
+            read.wall.is_some() || matches!(read.phase, alab_policy::vocab::Phase::Limited { .. }),
             "the readers read that row: {read:?}"
         );
         let said = with_tap_row(
@@ -1771,9 +1824,9 @@ fn claude_2_1_318_keeps_the_week_row_under_the_bottom_rule_for_every_reader() {
         assert_eq!(footer::live_repl_row(&rows), Some(mode), "{name}");
         let read = aterm_phase::read(Some("claude"), &rows, None);
         let phase = if case.busy {
-            aterm_phase::Phase::Busy
+            alab_policy::vocab::Phase::Busy
         } else {
-            aterm_phase::Phase::Idle
+            alab_policy::vocab::Phase::Idle
         };
         assert_eq!(read.phase, phase, "{name}");
         assert!(read.wall.is_none(), "{name}: {read:?}");
@@ -2648,7 +2701,19 @@ fn the_launch_gate_taps_a_plain_launch_in_a_tab_and_each_guard_alone_refuses() {
         },
         "no tab",
     );
-    for sid in ["", "s-", "60776b6e", "s-xyz", "s-../x"] {
+    for sid in [
+        "",
+        "t",
+        "60776b6e",
+        "t0000000xyu",
+        "tqn5r",
+        "TQN5R6E0148",
+        "t../x",
+        "s-0123456789abcdef012",
+        "s-0123456789ABCDEF0123",
+        "S-0123456789abcdef0123",
+        "s-../0123456789abcdef0",
+    ] {
         refused(
             LaunchFacts {
                 sid: Some(sid),
@@ -2657,6 +2722,16 @@ fn the_launch_gate_taps_a_plain_launch_in_a_tab_and_each_guard_alone_refuses() {
             &format!("tab {sid:?}"),
         );
     }
+    // A tab opened before the `t` form keeps its `s-` ID until it closes: its agent is still
+    // carried at launch.
+    assert!(
+        launch_value(&LaunchFacts {
+            sid: Some("s-0123456789abcdef0123"),
+            ..facts(&argv)
+        })
+        .is_some(),
+        "a tab's earlier s- ID"
+    );
     refused(
         LaunchFacts {
             no_harness: true,

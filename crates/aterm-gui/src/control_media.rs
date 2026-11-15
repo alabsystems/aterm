@@ -1981,6 +1981,9 @@ fn parse_settings_section_route(input: &str) -> Option<crate::native_settings::S
         "tabs" | "tab control" | "control panel" | "fleet" | "monitor" | "fleet monitor"
         | "system monitor" => Some(SettingsRoute::Tabs),
         "showcase" | "theme showcase" | "themes gallery" | "gallery" => Some(SettingsRoute::Themes),
+        "this mac" | "this machine" | "mac" | "name" | "rename" | "nickname" => {
+            Some(SettingsRoute::Machine)
+        }
         _ => None,
     }
 }
@@ -2495,6 +2498,8 @@ pub(crate) enum TrailForm {
     Status,
     /// The front window's light latch (`docs/design/PRISM-GLASS.md` §15.2 1.3).
     Light,
+    /// Warm the trail's pipeline states off the frame path and read the warm's standing.
+    Warm,
 }
 
 /// Parses the argument tail of the `trail` control verb.
@@ -2503,14 +2508,15 @@ pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
         "" => Ok(TrailForm::Admissions(None)),
         "status" => Ok(TrailForm::Status),
         "light" => Ok(TrailForm::Light),
+        "warm" => Ok(TrailForm::Warm),
         n => n
             .parse::<usize>()
             .map(|n| TrailForm::Admissions(Some(n)))
-            .map_err(|_| "usage: trail [status|light|<n>]".to_string()),
+            .map_err(|_| "usage: trail [status|light|warm|<n>]".to_string()),
     }
 }
 
-/// Handles `trail [status|light|<n>]`, reporting cursor-trail diagnostics for the focused window.
+/// Handles `trail [status|light|warm|<n>]`, reporting cursor-trail diagnostics for the focused window.
 pub(crate) fn cmd_trail(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let count = match parse_trail_form(rest) {
         Ok(TrailForm::Admissions(count)) => count,
@@ -2523,6 +2529,13 @@ pub(crate) fn cmd_trail(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         }
         Ok(TrailForm::Light) => {
             return match call_main(proxy, |tx| Wake::TrailLight { reply: tx }) {
+                Ok(Ok(msg)) => format!("OK 1\n{msg}\n"),
+                Ok(Err(e)) => format!("ERR {e}\n"),
+                Err(e) => format!("ERR {e}\n"),
+            };
+        }
+        Ok(TrailForm::Warm) => {
+            return match call_main(proxy, |tx| Wake::TrailWarm { reply: tx }) {
                 Ok(Ok(msg)) => format!("OK 1\n{msg}\n"),
                 Ok(Err(e)) => format!("ERR {e}\n"),
                 Err(e) => format!("ERR {e}\n"),
@@ -2653,7 +2666,8 @@ pub(crate) enum AgentSpec {
     Worker {
         agent: aterm_phase::Program,
         model: Option<String>,
-        autopilot: Option<aterm_agent::supervise::Autopilot>,
+        effort: Option<String>,
+        autopilot: Option<alab_policy::config::Autopilot>,
         from: Option<aterm_session::SessionId>,
     },
     Program {
@@ -2690,6 +2704,7 @@ fn agent_spec(word: &str) -> Option<AgentSpec> {
     aterm_agent::harness::worker::worker_cli(program).map(|_| AgentSpec::Worker {
         agent: program,
         model: None,
+        effort: None,
         autopilot: None,
         from: None,
     })
@@ -2739,7 +2754,7 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
     use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
     let (mut cwd, mut split, mut kind, mut place, mut origin) = (None, None, None, None, None);
     let (mut window, mut raise, mut theme) = (None, None, None);
-    let (mut agent, mut model, mut from, mut framed) = (None, None, None, false);
+    let (mut agent, mut model, mut effort, mut from, mut framed) = (None, None, None, None, false);
     let (mut autopilot, mut why, mut req) = (None, None, None);
     let (mut program, mut args) = (None, Vec::new());
     let Some(tokens) = split_quoted_tokens(rest) else {
@@ -2804,14 +2819,19 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
         } else if let Some(v) = tok.strip_prefix("arg=") {
             args.push(program_word(v, false).ok_or_else(refused)?);
         } else if let Some(v) = tok.strip_prefix("model=") {
-            if !valid_model(v) {
+            if !valid_model(v) || model.replace(v.to_string()).is_some() {
                 return Err(refused());
             }
-            model = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("effort=") {
+            if !aterm_types::agent_settings::valid_effort(v)
+                || effort.replace(v.to_string()).is_some()
+            {
+                return Err(refused());
+            }
         } else if let Some(v) = tok.strip_prefix("autopilot=") {
             let word = match v {
-                "land" => aterm_agent::supervise::Autopilot::Land,
-                "cruise" => aterm_agent::supervise::Autopilot::Cruise,
+                "land" => alab_policy::config::Autopilot::Land,
+                "cruise" => alab_policy::config::Autopilot::Cruise,
                 _ => return Err(refused()),
             };
             if autopilot.replace(word).is_some() {
@@ -2840,16 +2860,21 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
         }
     }
     let agent = match (agent, program) {
-        (Some(AgentSpec::Worker { agent, .. }), None) if args.is_empty() => {
+        (Some(AgentSpec::Worker { agent, .. }), None)
+            if args.is_empty()
+                && (effort.is_none()
+                    || aterm_agent::harness::worker::supports_reasoning_effort(agent)) =>
+        {
             Some(AgentSpec::Worker {
                 agent,
                 model,
+                effort,
                 autopilot,
                 from,
             })
         }
         // A program worker has no model and no Autopilot: no harness of its reads either.
-        (None, Some(program)) if model.is_none() && autopilot.is_none() => {
+        (None, Some(program)) if model.is_none() && effort.is_none() && autopilot.is_none() => {
             Some(AgentSpec::Program {
                 run: crate::program_worker::ProgramRun { program, args },
                 from,
@@ -2857,6 +2882,7 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
         }
         (None, None)
             if model.is_none()
+                && effort.is_none()
                 && autopilot.is_none()
                 && from.is_none()
                 && !framed
@@ -2951,12 +2977,15 @@ fn worker_order(
     frame: Option<Vec<u8>>,
     agent: aterm_phase::Program,
     model: Option<String>,
-    autopilot: Option<aterm_agent::supervise::Autopilot>,
+    effort: Option<String>,
+    autopilot: Option<alab_policy::config::Autopilot>,
     from: Option<aterm_session::SessionId>,
     cwd: Option<&str>,
 ) -> Result<crate::task_launch::TaskOrder, String> {
-    crate::task_launch::TaskOrder::of_frame(frame, agent, model, cwd, from)
-        .map(|order| order.under(autopilot))
+    crate::task_launch::TaskOrder::of_frame(frame, agent, model, cwd, from).map(|mut order| {
+        order.effort = effort;
+        order.under(autopilot)
+    })
 }
 
 /// The form of a `spawn ...` line, or its refusal: the usage line
@@ -3088,12 +3117,16 @@ pub(crate) fn cmd_spawn(
                 Some(AgentSpec::Worker {
                     agent,
                     model,
+                    effort,
                     autopilot,
                     from,
-                }) => match worker_order(frame, agent, model, autopilot, from, cwd.as_deref()) {
-                    Ok(order) => Some(order),
-                    Err(refusal) => return refusal,
-                },
+                }) => {
+                    match worker_order(frame, agent, model, effort, autopilot, from, cwd.as_deref())
+                    {
+                        Ok(order) => Some(order),
+                        Err(refusal) => return refusal,
+                    }
+                }
                 Some(AgentSpec::Program { run, from }) => {
                     match crate::task_launch::TaskOrder::of_program_frame(
                         frame,
@@ -3205,9 +3238,6 @@ pub(crate) fn cmd_tab_aimed(
 pub(crate) enum WorkerBlock {
     Unhosted,
     Unsupervised(&'static str),
-    /// Nothing would see the worker's task end
-    /// ([`aterm_agent::harness::worker::WorkerCli::end_unseen`]).
-    Unseen(String),
     NoIntegration,
     Shell(String),
     OldFish,
@@ -3224,7 +3254,6 @@ impl WorkerBlock {
                     .to_string()
             }
             Self::Unsupervised(switch) => format!("unsupervised: {switch}"),
-            Self::Unseen(why) => format!("spawn {form}: {why}"),
             Self::NoIntegration => {
                 format!("spawn {form}: shell integration is off, so no prompt is marked to type at")
             }
@@ -3602,17 +3631,11 @@ impl crate::App {
         spawned.sid
     }
 
-    /// Checks whether this instance can launch a worker for `agent` and returns its shell dialect;
-    /// an agent no Mac starts is refused as that before anything of this one is asked.
+    /// Checks whether this instance can launch a worker for `agent` and returns its shell dialect.
     pub(crate) fn worker_shell(
         &self,
         agent: aterm_phase::Program,
     ) -> Result<(std::path::PathBuf, aterm_agent::harness::upgrade::Dialect), WorkerBlock> {
-        if let Some(why) =
-            aterm_agent::harness::worker::worker_cli(agent).and_then(|cli| cli.end_unseen())
-        {
-            return Err(WorkerBlock::Unseen(why));
-        }
         if self.harness.is_none() {
             return Err(WorkerBlock::Unhosted);
         }
@@ -3770,6 +3793,16 @@ impl crate::App {
                     .as_ref()
                     .and_then(crate::program_worker::ProgramRun::name),
             );
+            // The task as given, never the task file's text, whose last line is aterm's fact
+            // line; a program worker's task is its program's input, which names nothing.
+            timeline.set_task_line(
+                worker
+                    .order
+                    .program
+                    .is_none()
+                    .then(|| crate::task_record::task_line(&worker.order.task))
+                    .flatten(),
+            );
             // A manager that is a session here is here, whatever drive the spawn came over.
             timeline.set_task_manager_node(
                 worker
@@ -3791,6 +3824,7 @@ impl crate::App {
             dialect: worker.dialect,
             agent: worker.order.agent,
             model: worker.order.model,
+            effort: worker.order.effort,
             trusted_cwd: worker.order.trusted_cwd,
             caller,
             chrome: worker.order.chrome,

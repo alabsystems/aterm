@@ -46,19 +46,15 @@ fn unavailable_control_observations_name_the_boundary_without_initializing() {
         (0, Unavailable::NotAdmitted),
         (1, Unavailable::Revoked),
         (2, Unavailable::IncompleteApply),
-        (3, Unavailable::IncompleteApply),
-        (4, Unavailable::SourceChanged),
-        (5, Unavailable::IncompleteApply),
+        (3, Unavailable::SourceChanged),
+        (4, Unavailable::IncompleteApply),
     ] {
         let mut state = original.clone();
         match variant {
             0 => state.membership = Stored::Pending,
             1 => state.membership = Stored::Revoked,
             2 => state.failed = true,
-            3 => {
-                state.pending.insert("ordinary".into(), "incomplete".into());
-            }
-            4 => state.source_identity = None,
+            3 => state.source_identity = None,
             _ => state.digest = None,
         }
         save_state(&paths, &state).unwrap();
@@ -96,10 +92,11 @@ fn unavailable_control_observations_name_the_boundary_without_initializing() {
     assert!(!paths.dir.join("commons").exists());
 }
 
-/// A vault an older admin's build wrote an AI CLI's login into: this Mac never writes the
-/// login, and the rest of the vault is applied with nothing failed, so its Commons control
-/// stays visible and its files are repaired as any vault's are. The refusal is reported on
-/// each pass that applies, in its own bucket.
+/// A vault an older admin's build wrote an AI CLI's login into: this Mac never reads the
+/// login by name and never touches the CLI's own file, and the rest of the vault is applied
+/// with nothing failed, so its Commons control stays visible and a pass that applies the same
+/// version again reads the rest in place as any vault's. The refusal is reported on each pass
+/// that applies, in its own bucket.
 #[test]
 fn a_vault_holding_an_ai_clis_login_still_applies_and_keeps_its_commons_control() {
     use commons::Observation;
@@ -121,14 +118,19 @@ fn a_vault_holding_an_ai_clis_login_still_applies_and_keeps_its_commons_control(
         "the Commons control is still read"
     );
     assert_eq!(std::fs::read(&login).unwrap(), b"this machine's own login");
-    // A repair pass applies the vault again and names the refusal.
-    let ordinary = materialize::target_path(&paths.home, "ordinary").unwrap();
-    std::fs::remove_file(&ordinary).unwrap();
+    // A state no apply of this build recorded (an older aterm's) is applied again on the next
+    // pass, which names the refusal.
+    let mut state = load_state(&paths).unwrap();
+    state.held = None;
+    save_state(&paths, &state).unwrap();
     let outcome = sync(&paths, None).unwrap();
     let SyncOutcome::Applied { report, .. } = &outcome else {
         panic!("a repair applies: {outcome:?}");
     };
-    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(
+        report.held.iter().any(|name| name == "ordinary"),
+        "{report:?}"
+    );
     assert_eq!(
         report
             .refused
@@ -140,17 +142,23 @@ fn a_vault_holding_an_ai_clis_login_still_applies_and_keeps_its_commons_control(
     let config = config(&paths).unwrap().unwrap();
     let line = pass_line(&paths, &config, &outcome, &mut String::new()).unwrap();
     assert!(line.contains(LOGIN), "{line}");
-    assert!(ordinary.exists(), "repaired");
-    assert!(!load_state(&paths).unwrap().failed);
+    assert_eq!(
+        stored(&paths, "ordinary").as_deref(),
+        Some(&b"ordinary value"[..]),
+        "read in place"
+    );
+    let state = load_state(&paths).unwrap();
+    assert!(!state.failed);
+    assert!(state.held.is_some_and(|held| !held.contains_key(LOGIN)));
     assert_eq!(std::fs::read(&login).unwrap(), b"this machine's own login");
 }
 
 /// A manifest an older build wrote names an AI CLI's login that build wrote
 /// (`~/.codex/auth.json`), and the CLI has since rotated the file as its own: the login is no
-/// file this vault keeps, so it is never counted as changed, and nothing is due to be put
-/// back over it.
+/// entry this vault reads, so the older manifest makes no repair due, the next apply prunes the
+/// name from it, and nothing touches the CLI's file.
 #[test]
-fn a_cli_login_an_older_manifest_names_is_never_counted_as_changed() {
+fn a_cli_login_an_older_manifest_names_makes_no_repair_due_and_is_pruned() {
     const LOGIN: &str = "~/.codex/auth.json";
     let (_root, paths, _) = fixture();
     sync(&paths, None).unwrap();
@@ -160,20 +168,25 @@ fn a_cli_login_an_older_manifest_names_is_never_counted_as_changed() {
     std::fs::create_dir_all(login.parent().unwrap()).unwrap();
     fsx::write_atomic(&login, b"the CLI's own rotated login", 0o600).unwrap();
     let mut state = load_state(&paths).unwrap();
-    state.manifest.files.insert(
+    state.legacy_manifest.insert(
         LOGIN.to_owned(),
-        materialize::digest_hex(b"the copy an older build wrote"),
+        crate::digest_hex(b"the copy an older build wrote"),
     );
     save_state(&paths, &state).unwrap();
-    let state = load_state(&paths).unwrap();
-    assert!(state.manifest.files.contains_key(LOGIN));
-    assert!(
-        !changed_files(&paths, &state).contains(LOGIN),
-        "a CLI's login is never a changed vault file"
-    );
-    assert!(unsettled(&paths, &state).is_empty());
-    assert!(files_intact(&paths, &state));
+    let mut state = load_state(&paths).unwrap();
+    assert!(state.legacy_manifest.contains_key(LOGIN));
+    assert!(applied_intact(&paths, &state));
     assert!(!repair_due(&paths, &mut repaired), "nothing to put back");
+    // The next apply of the same version prunes the login from the older manifest.
+    state.held = None;
+    save_state(&paths, &state).unwrap();
+    assert!(matches!(
+        sync(&paths, None).unwrap(),
+        SyncOutcome::Applied { .. }
+    ));
+    let state = load_state(&paths).unwrap();
+    assert!(!state.legacy_manifest.contains_key(LOGIN));
+    assert!(applied_intact(&paths, &state));
     assert_eq!(
         std::fs::read(&login).unwrap(),
         b"the CLI's own rotated login"
@@ -428,9 +441,10 @@ fn control_journal_uses_its_own_authority_without_ordinary_materialization() {
             )
             .is_err()
     );
-    let ordinary = paths.home.join(".secrets/ordinary");
-    std::fs::remove_file(&ordinary).unwrap();
-    std::fs::create_dir(&ordinary).unwrap();
+    // An ordinary apply left unfinished: the control journal below must not finish it.
+    let mut state = load_state(&paths).unwrap();
+    state.failed = true;
+    save_state(&paths, &state).unwrap();
     assert!(!materialization_ready(&paths).unwrap());
     let mut journal = Journal::open(
         &root.path().join("control"),
@@ -461,7 +475,7 @@ fn control_journal_uses_its_own_authority_without_ordinary_materialization() {
     );
     assert!(
         !materialization_ready(&paths).unwrap(),
-        "control repair never marks ordinary files applied"
+        "control repair never marks the ordinary apply finished"
     );
 }
 
@@ -482,11 +496,21 @@ fn commons_cache_is_authenticated_offline_and_never_a_plaintext_file() {
         read_identity(&paths).unwrap().unwrap().recipient()
     );
     assert!(!format!("{snapshot:?}").contains("inert-commons-key-material"));
-    assert!(!state.manifest.files.contains_key(ENTRY));
+    let held = state
+        .held
+        .as_ref()
+        .expect("an apply of this build recorded what it reads");
+    assert!(!held.contains_key(ENTRY));
+    assert!(held.contains_key("ordinary"));
     assert!(!paths.home.join(".secrets").join(ENTRY).exists());
     assert_eq!(
-        std::fs::read(paths.home.join(".secrets/ordinary")).unwrap(),
-        b"ordinary value"
+        stored(&paths, ENTRY),
+        None,
+        "the control is no entry read by name"
+    );
+    assert_eq!(
+        stored(&paths, "ordinary").as_deref(),
+        Some(&b"ordinary value"[..])
     );
     let lock = StateLock::take(&paths).unwrap();
     assert!(commons::cached(&paths).unwrap().is_none());
@@ -551,17 +575,14 @@ fn commons_bootstrap_uses_the_vault_cache_and_preserves_custody_through_handoff(
 fn commons_cache_refuses_unbound_revoked_pending_and_changed_state() {
     let (_root, paths, _source) = fixture();
     let original = load_state(&paths).unwrap();
-    for variant in 0..6 {
+    for variant in 0..5 {
         let mut state = original.clone();
         match variant {
             0 => state.source_identity = None,
             1 => state.digest = None,
             2 => state.membership = Stored::Revoked,
             3 => state.membership = Stored::Pending,
-            4 => state.failed = true,
-            _ => {
-                state.pending.insert("ordinary".into(), "incomplete".into());
-            }
+            _ => state.failed = true,
         }
         save_state(&paths, &state).unwrap();
         assert!(

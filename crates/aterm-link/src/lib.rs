@@ -82,6 +82,8 @@ pub mod render;
 /// doors answered by a seeded world.
 #[cfg(test)]
 mod sim;
+/// The broker's start, stamped phase by phase on its stderr.
+pub mod start_stamps;
 pub mod state;
 pub mod subject;
 pub mod transport;

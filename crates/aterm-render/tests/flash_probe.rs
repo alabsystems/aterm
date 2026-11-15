@@ -11,19 +11,20 @@
 //! 0.80; two opposing turns are a flash; a pixel is over the bound with more than six turns in
 //! a second less one frame step. A pixel is the trail's own when fewer than half the turns of
 //! its busiest second fell in the pet's drawn box, the flying head's, the caret's cell or a
-//! word icon's box: those are other laws' to hold (the pet's gait frames, the icon's pop). A
-//! body's box holds the turns on the frame after it held the pixel too: a sprite moving off a
-//! pixel turns it on the first frame its box no longer holds it.
+//! word icon's box: those are other laws' to hold (the pet's gait frames; a word icon's, held by
+//! [`a_word_icon_never_flashes`]). A body's box holds the turns on the frame after it held the
+//! pixel too: a sprite moving off a pixel turns it on the first frame its box no longer holds it.
 
-use crate::trail_film::{Take, film_replay};
+use crate::trail_film::{Lane, Take, film_replay};
 use crate::trail_letters_read::*;
 use crate::wcag::luma;
 use std::collections::HashMap;
 use std::sync::mpsc::sync_channel;
 
-/// The flagship, and the dog's style.
+/// The flagship, the dog's style, and the trail with the pet off.
 const CAT: &str = "rainbow + cat";
 const DOG: &str = "rainbow + dog";
+const OFF: &str = "rainbow";
 /// The carets a film is taken under, each with the DECSCUSR that sets it.
 const BLOCK: (&str, &[u8]) = ("block", b"");
 const BAR: (&str, &[u8]) = ("bar", b"\x1b[6 q");
@@ -37,7 +38,7 @@ const DARK_BELOW: f64 = 0.80;
 /// Turns in a second at the bound: three flashes.
 const TURNS_MOST: usize = 6;
 
-/// One film's trail: the pixels of its own over the bound, and the most turns one has in a
+/// One place's reading of a film: its pixels over the bound, and the most turns one has in a
 /// second with where it is.
 #[derive(Debug)]
 struct Read {
@@ -45,6 +46,19 @@ struct Read {
     most: usize,
     worst: (usize, usize),
     frames: usize,
+}
+
+/// One film read by place, as `lab trail-film`'s `by_place` sorts its pixels: a pixel is the
+/// place's that held the most of its busiest second's turns where those boxes held half of them
+/// or more (the pet's body first, then the caret's cell, then a word icon's box), else the
+/// trail's own. With how many frames held a word icon.
+#[derive(Debug)]
+struct Places {
+    pet: Read,
+    caret: Read,
+    icon: Read,
+    trail: Read,
+    iconed: usize,
 }
 
 /// A pixel's turns, as the judge's `Turns` counts them.
@@ -70,6 +84,14 @@ fn most_within(times: &[u64], window: u64) -> (usize, usize) {
 /// Film `take` in `style` on `look` under the caret `caret` sets and read the trail's own
 /// flashes.
 fn trail_flashes(style: &str, take: Take, look: Look, caret: &[u8]) -> Read {
+    flashes_by_place(style, take, look, caret).trail
+}
+
+/// A pixel-space box, end exclusive: `(x0, x1, y0, y1)`.
+type PxBox = (i32, i32, i32, i32);
+
+/// Film `take` in `style` on `look` under the caret `caret` sets and read its flashes by place.
+fn flashes_by_place(style: &str, take: Take, look: Look, caret: &[u8]) -> Places {
     let (mut ev, tail) = take.events(look);
     ev.insert(0, (0, Ev::Out(caret.to_vec())));
     let (rows, cols) = take.grid();
@@ -78,13 +100,13 @@ fn trail_flashes(style: &str, take: Take, look: Look, caret: &[u8]) -> Read {
     let (to, kept) = sync_channel::<Kept>(2);
     let mut zig: Vec<Option<Zig>> = Vec::new();
     let mut turns: HashMap<usize, Vec<u64>> = HashMap::new();
-    // Each frame's boxes (px, end exclusive): the pet's body, the flying head, the caret's
-    // cell and the word icons; and its bodies alone, which hold the frame after theirs too.
-    let mut boxes: HashMap<u64, Vec<(i32, i32, i32, i32)>> = HashMap::new();
-    let mut bodies: HashMap<u64, Vec<(i32, i32, i32, i32)>> = HashMap::new();
+    // Each frame's boxes (px, end exclusive): the pet's body and the flying head, which hold
+    // the frame after theirs too; the caret's cell; and the word icons.
+    let mut boxes: HashMap<u64, (Vec<PxBox>, PxBox, Vec<PxBox>)> = HashMap::new();
     let mut width = 1;
     let mut seen = 0;
-    let (width, turns, boxes, bodies, seen) = std::thread::scope(|s| {
+    let mut iconed = 0;
+    let (width, turns, boxes, seen, iconed) = std::thread::scope(|s| {
         let reader = s.spawn(move || {
             for k in kept.iter() {
                 width = k.w;
@@ -97,11 +119,9 @@ fn trail_flashes(style: &str, take: Take, look: Look, caret: &[u8]) -> Read {
                     (k.top + (k.caret.0 + 1) * ch) as i32,
                 );
                 let g = &k.glass;
-                let mut here: Vec<_> = g.pet_body.into_iter().chain(g.head_body).collect();
-                bodies.insert(k.ms, here.clone());
-                here.push(caret);
-                here.extend(g.word_icons.iter().copied());
-                boxes.insert(k.ms, here);
+                let bodies: Vec<_> = g.pet_body.into_iter().chain(g.head_body).collect();
+                iconed += usize::from(!g.word_icons.is_empty());
+                boxes.insert(k.ms, (bodies, caret, g.word_icons.clone()));
                 for (i, &p) in k.px.iter().enumerate() {
                     if turn(&mut zig[i], luma(p)) {
                         turns.entry(i).or_default().push(k.ms);
@@ -109,47 +129,64 @@ fn trail_flashes(style: &str, take: Take, look: Look, caret: &[u8]) -> Read {
                 }
                 seen += 1;
             }
-            (width, turns, boxes, bodies, seen)
+            (width, turns, boxes, seen, iconed)
         });
         // The replay runs on the caller's thread: a negative control's seam is that thread's.
-        let mut r = film_replay(style, look, rows, cols);
+        let mut r = film_replay(style, look, rows, cols, Lane::Paper);
         r.keep.clone_from(&frames);
         r.keep_to = Some(to);
         let _ = r.run(&ev, tail);
         drop(r);
         reader.join().expect("the film's reader")
     });
-    let mut read = Read {
+    let mut reads: [Read; 4] = std::array::from_fn(|_| Read {
         over: 0,
         most: 0,
         worst: (0, 0),
         frames: seen,
-    };
+    });
     for (&i, times) in &turns {
         let (x, y) = ((i % width) as i32, (i / width) as i32);
         let (n, from) = most_within(times, 1_000);
-        let holds = |b: &Vec<(i32, i32, i32, i32)>| {
-            b.iter()
-                .any(|&(x0, x1, y0, y1)| x0 <= x && x < x1 && y0 <= y && y < y1)
-        };
-        let boxed = times[from..from + n]
-            .iter()
-            .filter(|&&t| {
-                boxes.get(&t).is_some_and(holds)
-                    || t.checked_sub(STEP_MS)
-                        .and_then(|was| bodies.get(&was))
-                        .is_some_and(holds)
-            })
-            .count();
-        if 2 * boxed >= n {
-            continue;
+        let holds = |&(x0, x1, y0, y1): &PxBox| x0 <= x && x < x1 && y0 <= y && y < y1;
+        let mut held = [0usize; 3];
+        for t in &times[from..from + n] {
+            let Some((bodies, cell, icons)) = boxes.get(t) else {
+                continue;
+            };
+            let left = t
+                .checked_sub(STEP_MS)
+                .and_then(|was| boxes.get(&was))
+                .is_some_and(|(before, _, _)| before.iter().any(holds));
+            if bodies.iter().any(holds) || left {
+                held[0] += 1;
+            } else if holds(cell) {
+                held[1] += 1;
+            } else if icons.iter().any(holds) {
+                held[2] += 1;
+            }
         }
+        let boxed: usize = held.iter().sum();
+        // The first of the most: `max_by_key` keeps the last, so the places are read from the end.
+        let place = if 2 * boxed >= n {
+            (0..3).rev().max_by_key(|&p| held[p]).unwrap_or(3)
+        } else {
+            3
+        };
+        let read = &mut reads[place];
         if n > read.most {
             (read.most, read.worst) = (n, (x as usize, y as usize));
         }
         read.over += usize::from(most_within(times, 1_000 - STEP_MS).0 > TURNS_MOST);
     }
-    read
+    let [pet, caret, icon, trail] = reads;
+    Places {
+        pet,
+        caret,
+        icon,
+        trail,
+        iconed,
+    }
 }
 
 /// Feed a pixel's next luminance to its zigzag; true when it turned.
@@ -380,5 +417,214 @@ fn the_flagship_trail_stays_under_three_flashes_a_second() {
          at most, so the law is not reading the sparks",
         thrown.over,
         thrown.most
+    );
+}
+
+/// CT-48: a word icon never flashes. A sparkle word's icon (a fox's, a dog's,
+/// a cat's face peeking from behind its word) is drawn whole at its rest box
+/// on every frame it shows and comes and goes by its alpha alone, so no pixel
+/// of an icon's box turns more than six times in a second: before, its art
+/// slid over the glass in whole-pixel steps (the rise with its overshoot, the
+/// breathing bob and sway, the descent) and put 487 to 1439 px of each burst
+/// and composer film over the bound. Held with the pet off, where the icons
+/// are the only sprites on the row: the burst on paper under a block caret and
+/// on a dark page under a bar, Return on paper, and the composer on a dark page
+/// and on paper. The pet's films are read and printed, not held here: what
+/// the pet does to an icon (its claim, its stand on the span, its bat cue) is
+/// the pet's own package.
+///
+/// The control restores the dwell pose that shipped before
+/// (`word_decorations::with_icons_breathing`): a dwelling icon's 1-2 px bob
+/// and sway alone put the burst's icons over the bound again.
+#[test]
+fn a_word_icon_never_flashes() {
+    let g = Take::Gallery;
+    let held: Vec<Film> = vec![
+        ("burst", OFF, g(Scene::Burst), GITHUB_LIGHT, BLOCK),
+        ("burst", OFF, g(Scene::Burst), DARK, BAR),
+        ("enter", OFF, g(Scene::EnterBottom), GITHUB_LIGHT, BAR),
+        ("composer", OFF, Take::Composer, DARK, BLOCK),
+        ("composer", OFF, Take::Composer, GITHUB_LIGHT, BAR),
+    ];
+    let read: Vec<Film> = vec![
+        ("burst", CAT, g(Scene::Burst), GITHUB_LIGHT, BLOCK),
+        ("composer", DOG, Take::Composer, GITHUB_LIGHT, BAR),
+    ];
+    let (reads, pets, breathing) = std::thread::scope(|s| {
+        let film = |&(_, style, take, look, caret): &Film| {
+            s.spawn(move || flashes_by_place(style, take, look, caret.1))
+        };
+        let held: Vec<_> = held.iter().map(film).collect();
+        let pets: Vec<_> = read.iter().map(film).collect();
+        let breathing = s.spawn(move || {
+            aterm_effects::word_decorations::with_icons_breathing(|| {
+                flashes_by_place(OFF, g(Scene::Burst), GITHUB_LIGHT, BLOCK.1)
+            })
+        });
+        let join = |h: Vec<std::thread::ScopedJoinHandle<'_, Places>>| -> Vec<Places> {
+            h.into_iter().map(|h| h.join().expect("a film")).collect()
+        };
+        (
+            join(held),
+            join(pets),
+            breathing.join().expect("the breathing control"),
+        )
+    });
+    let mut reds = Vec::new();
+    for ((scene, style, _, look, caret), read) in held.iter().zip(&reads) {
+        let film = format!("{style}, {scene} on {}, {} caret", look.name, caret.0);
+        eprintln!("flash_probe icons {film}: {read:?}");
+        let iconed = *scene != "enter";
+        if read.icon.frames <= 100 {
+            reds.push(format!("{film} filmed {} frames", read.icon.frames));
+        } else if iconed && read.iconed <= 100 {
+            reds.push(format!("{film} showed icons in {} frames", read.iconed));
+        } else if read.icon.over != 0 {
+            reds.push(format!(
+                "{film}: {} px of the word icons flash faster than 3 a second, the worst {} \
+                 turns in a second at px {:?}",
+                read.icon.over, read.icon.most, read.icon.worst
+            ));
+        }
+    }
+    for ((scene, style, _, look, caret), read) in read.iter().zip(&pets) {
+        let film = format!("{style}, {scene} on {}, {} caret", look.name, caret.0);
+        eprintln!(
+            "flash_probe icons (read, not held) {film}: px over the bound by place: pet {}, \
+             caret {}, icon {} (worst {} turns at {:?}), trail {}; icons in {} of {} frames",
+            read.pet.over,
+            read.caret.over,
+            read.icon.over,
+            read.icon.most,
+            read.icon.worst,
+            read.trail.over,
+            read.iconed,
+            read.icon.frames
+        );
+    }
+    eprintln!(
+        "flash_probe icons control (the dwell breathing, burst, github-light): {breathing:?}"
+    );
+    assert!(reds.is_empty(), "{}", reds.join("\n"));
+    assert!(
+        breathing.icon.over > 10 && breathing.icon.most > TURNS_MOST,
+        "control: with the icons breathing in their dwell the burst reads {} px of the icons' \
+         over and {} turns at most, so the law is not reading the icons",
+        breathing.icon.over,
+        breathing.icon.most
+    );
+}
+
+/// The Default Light block Backspace film's pixels still over the bound (ATERM-KI-1114-262).
+const DEFAULT_LIGHT_BLOCK_KNOWN: usize = 5;
+
+/// Held Backspace on a light page keeps the trail under three flashes a second, block caret and
+/// bar (`lab trail-film`'s `backspace` scene with the pet off, on GitHub Light, Default Light and
+/// Paper Grey): no pixel of the trail's own is over the bound.
+///
+/// Three lights turned there. A Backspace whose echo shared its engine tick laid a fresh cell
+/// under the caret it moved back onto, and the rail and band there dropped to the page for a
+/// frame and came back (`rainbow_kitty`'s `erase_tail_start`); its control replays that order as
+/// it was (`with_same_tick_erase_as_was`). The block caret's innermost halo ring hugged the
+/// block one pixel out, an outline that left its old cell and lit its new one on every
+/// Backspace; it is drawn inside the block over the caret's fill now, as a keyline that moves
+/// with the caret's own pixels (`CursorFxFrame::keyline_tint`), and its control draws it outside
+/// again (`with_block_rim_outside`). And the block's outer rings, whose reach follows the paint
+/// a key lifts, stepped a pixel in a frame or two after each key and out again at the next: on
+/// Default Light's pale band a turn pair beside the caret at every key; their reach is held at
+/// the caret's cell now (`cursor_rainbow`'s `RingHold`), and their control lets it follow the
+/// paint again (`with_halo_rings_unheld`).
+///
+/// Not held yet: Default Light under the block, where 5 px still turn 8 times in a second
+/// (ATERM-KI-1114-262, the outer ring beside the caret on the pale band), so that film is held
+/// to those 5 and the unheld rings' control to more than them.
+#[test]
+fn a_light_page_s_backspace_stays_under_three_flashes_a_second() {
+    const STYLE: &str = "rainbow";
+    let take = Take::Backspace;
+    let films = [GITHUB_LIGHT, DEFAULT_LIGHT, PAPER_GREY]
+        .into_iter()
+        .flat_map(|look| [(look, BLOCK), (look, BAR)]);
+    let (reads, same_tick, rim_outside, unheld) = std::thread::scope(|s| {
+        let reads: Vec<_> = films
+            .map(|(look, caret)| {
+                (
+                    look.name,
+                    caret.0,
+                    s.spawn(move || trail_flashes(STYLE, take, look, caret.1)),
+                )
+            })
+            .collect();
+        let same_tick = s.spawn(move || {
+            aterm_effects::rainbow_kitty::with_same_tick_erase_as_was(|| {
+                trail_flashes(STYLE, take, GITHUB_LIGHT, BAR.1)
+            })
+        });
+        let rim_outside = s.spawn(move || {
+            aterm_effects::cursor_fx::with_block_rim_outside(|| {
+                trail_flashes(STYLE, take, GITHUB_LIGHT, BLOCK.1)
+            })
+        });
+        let unheld = s.spawn(move || {
+            aterm_effects::cursor_rainbow::with_halo_rings_unheld(|| {
+                trail_flashes(STYLE, take, DEFAULT_LIGHT, BLOCK.1)
+            })
+        });
+        (
+            reads
+                .into_iter()
+                .map(|(look, caret, j)| (look, caret, j.join().expect("a film")))
+                .collect::<Vec<_>>(),
+            same_tick.join().expect("the same-tick control"),
+            rim_outside.join().expect("the rim's control"),
+            unheld.join().expect("the rings' control"),
+        )
+    });
+    for (look, caret, read) in &reads {
+        eprintln!("flash_probe backspace on {look}, {caret} caret: {read:?}");
+    }
+    eprintln!("flash_probe control (the same-tick Backspace as it was, light bar): {same_tick:?}");
+    eprintln!("flash_probe control (the block's rim outside it, light block): {rim_outside:?}");
+    eprintln!("flash_probe control (the rings' reach unheld, default-light block): {unheld:?}");
+    for (look, caret, read) in &reads {
+        assert!(
+            read.frames > 100,
+            "the {look} {caret} film filmed {} frames",
+            read.frames
+        );
+        let known = if (*look, *caret) == (DEFAULT_LIGHT.name, BLOCK.0) {
+            DEFAULT_LIGHT_BLOCK_KNOWN
+        } else {
+            0
+        };
+        assert!(
+            read.over <= known,
+            "backspace on {look}, {caret} caret: {} px of the trail's own flash faster than 3 a \
+             second, the worst {} turns in a second at px {:?}",
+            read.over,
+            read.most,
+            read.worst
+        );
+    }
+    assert!(
+        same_tick.over > 10 && same_tick.most > TURNS_MOST,
+        "control: with the same-tick Backspace as it was the bar film reads {} px over and {} \
+         turns at most, so the law is not reading the rail's dip",
+        same_tick.over,
+        same_tick.most
+    );
+    assert!(
+        rim_outside.over > 0 && rim_outside.most > TURNS_MOST,
+        "control: with the block's rim outside it the block film reads {} px over and {} turns \
+         at most, so the law is not reading the rim",
+        rim_outside.over,
+        rim_outside.most
+    );
+    assert!(
+        unheld.over > DEFAULT_LIGHT_BLOCK_KNOWN && unheld.most > TURNS_MOST,
+        "control: with the rings' reach unheld the Default Light block film reads {} px over and \
+         {} turns at most, so the law is not reading the rings' step",
+        unheld.over,
+        unheld.most
     );
 }

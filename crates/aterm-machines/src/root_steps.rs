@@ -17,8 +17,11 @@
 //! - the root LAN broker ([`crate::items::lan::LanBroker`]), a resident root LaunchDaemon through
 //!   which all of aterm's own outbound LAN traffic goes, so macOS never asks its Local Network
 //!   question about aterm (`docs/DESIGN-lan-broker-2026-11-05.md`);
-//! - disabled Spotlight indexing on the data volume, so generated files outside Rust's
-//!   build caches cannot start an indexing storm ([`crate::init_spotlight`]).
+//! - Spotlight no longer indexing the console account's home folders other than Documents and
+//!   Desktop (Library and Applications stay too): they join the data volume's excluded
+//!   folders, so checkouts, downloads and generated files there cannot start an indexing
+//!   storm ([`crate::init_spotlight::Scope`]). Its failure is journaled and never fails the
+//!   transaction.
 //!
 //! Why a sudoers rule for the name, and not a privileged helper or a second password: a second
 //! password is a second prompt, which the ruling rules out, and a helper would put root code of
@@ -122,7 +125,8 @@ pub enum Owed {
     /// source's own signing team, which the running broker adopts by itself
     /// ([`crate::items::lan::reading`], [`aterm_uds::lan::install::Part::Adopting`]).
     LanBroker,
-    /// Spotlight still indexes the writable data volume.
+    /// Spotlight still indexes a folder of this account's home that setup has never excluded
+    /// nor failed to ([`crate::init_spotlight::scope_owed`]).
     Spotlight,
 }
 
@@ -137,7 +141,7 @@ impl Owed {
                 "installs the helper that lets aterm reach this network's Macs without macOS \
                  asking"
             }
-            Self::Spotlight => "disables Spotlight indexing of the data volume",
+            Self::Spotlight => "stops Spotlight indexing your other home folders",
         }
     }
 }
@@ -342,7 +346,7 @@ pub fn owed(sys: &dyn System) -> Vec<Owed> {
     }) {
         owed.push(Owed::LanBroker);
     }
-    if sys.macos() && crate::init_spotlight::indexing(sys) == Ok(true) {
+    if crate::init_spotlight::scope_owed(sys) {
         owed.push(Owed::Spotlight);
     }
     owed

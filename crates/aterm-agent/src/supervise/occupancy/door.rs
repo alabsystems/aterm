@@ -9,9 +9,10 @@ use super::reading::OccupancyReading;
 use super::rules::{self, Books, Guards, HoldSeen, RuleId};
 use super::templates::FactLine;
 use crate::supervise::Guard;
-use crate::supervise::config::{Autopilot, StuckBreakGrant};
+use crate::supervise::config::StuckBreakGrant;
 use crate::supervise::facts::{EpisodeKey, FactKind, Left, SeedOutcome, Settled};
 use crate::supervise::screen::HumanInput;
+use alab_policy::config::Autopilot;
 
 /// Ledger rule for the loop's intent to type a fact line before the write.
 pub const INTENT_RULE: &str = "fact-intent@v1";

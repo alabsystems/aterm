@@ -2190,7 +2190,9 @@ fn inline_configs_with_unknown_or_escaped_output_selection_grant_no_target() {
     };
     for value in [
         r#"build."target\u002ddir"=false"#,
+        r#"build."target\x2ddir"=false"#,
         r#"build."build\u002ddir"=false"#,
+        r#"build."build\x2ddir"=false"#,
         r#""incl\u0075de"=[3]"#,
         "include=[3]",
         "build=3",
@@ -3199,6 +3201,10 @@ fn cli_config_targets_keep_the_winning_values_path_base() {
         (
             vec!["build.target-dir='inline.noindex'"],
             cwd.join("inline.noindex"),
+        ),
+        (
+            vec!["build.\"target\\x2Ddir\" = \"toml\\x31\\x31.noindex\""],
+            cwd.join("toml11.noindex"),
         ),
         (vec!["settings.toml"], home.join("file.noindex")),
         (vec!["nested/settings.toml"], cwd.join("nested.noindex")),

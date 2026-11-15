@@ -1134,6 +1134,146 @@ fn a_person_only_button_is_pressed_by_no_accessibility_or_control_client() {
     }
 }
 
+/// SETTINGS ▸ THIS MAC'S WRITES TAKE A PERSON'S OWN PRESS, as Security's Full Disk Access
+/// button does ([`a_person_only_button_is_pressed_by_no_accessibility_or_control_client`]):
+/// `act` refuses `name/press/save` and `name/press/undo` by their prefix, and the page's Save
+/// and Undo Last Rename pressed through the accessibility tree, by a control client's key or
+/// click, or by input another process posted into the window, as a press or as a palette
+/// command, are refused and reach no name writer.
+/// NEGATIVE CONTROL: the person's own press reaches the host, which answers it (here, with no
+/// writer in this process, on the page's notice).
+#[cfg(all(a11y_tree, target_os = "macos"))]
+#[test]
+fn this_macs_writes_are_pressed_by_no_accessibility_or_control_client() {
+    use crate::machine_title::page::fixture::{Names, found, named, rename};
+    use crate::native_app::ActionInvocation;
+    use crate::native_settings::SettingsRoute;
+    use aterm_types::machine_name::Class;
+    #[derive(Clone, Copy, Debug)]
+    enum By {
+        Assistive,
+        Controller,
+        Relayed,
+        Person,
+    }
+    let wid = WindowId(0);
+    let seeded = named(Class::Seeded, 7, "Heron");
+    // Renamed twice, so Undo Last Rename is drawn available.
+    let renamed = named(Class::Chosen, 7, "Heron");
+    rename(&renamed, Class::Chosen, 8, "Puffin");
+    let names = Names::authorized(Ok(true));
+    for (key, write, scratch) in [
+        ("name/primary", "name/press/save", &seeded),
+        ("name/press/undo", "name/press/undo", &renamed),
+    ] {
+        for by in [By::Assistive, By::Controller, By::Relayed, By::Person] {
+            let mut app = App::headless_for_test();
+            if let Some(window) = app.windows.get_mut(&wid) {
+                window.cols = 160;
+                window.rows = 120;
+            }
+            assert!(app.open_settings_tab(SettingsRoute::Machine));
+            let seq = app.machine_page.reads;
+            app.machine_page_read(seq, found(scratch, &[], &names));
+            let (_, view) = app.active_native_view(wid).unwrap();
+            let refused = app
+                .act_app(crate::app_control::ActRequest {
+                    view,
+                    ui_key: key.to_string(),
+                    action: write.to_string(),
+                    value: None,
+                })
+                .expect_err("act presses no machine-name button");
+            assert!(
+                refused.contains("Settings' machine-name buttons"),
+                "{refused}"
+            );
+            assert_eq!(app.machine_page.state.notice, None);
+            let id = ActionId::new(write);
+            // The button carries the read it was drawn over; a pointer's press dispatches that.
+            let drawn = app
+                .compiled_native_ui(wid)
+                .unwrap()
+                .semantic(&UiKey::new(key))
+                .filter(|node| node.state.is_none_or(|state| state.enabled))
+                .and_then(|node| node.action.clone())
+                .unwrap_or_else(|| panic!("the page draws {key} available"));
+            assert!(drawn.as_str().starts_with(write), "{drawn:?}");
+            let command = |app: &mut App| {
+                app.dispatch_native_view_event(
+                    wid,
+                    view,
+                    crate::native_app::AppEvent::Action(ActionInvocation {
+                        id: id.clone(),
+                        value: None,
+                    }),
+                )
+            };
+            let press = |app: &mut App| {
+                app.dispatch_native_control_action(
+                    wid,
+                    view,
+                    UiKey::new(key),
+                    ActionInvocation {
+                        id: drawn.clone(),
+                        value: None,
+                    },
+                    false,
+                )
+            };
+            match by {
+                By::Assistive => {
+                    let request = app.accessibility_request_for_test(
+                        wid,
+                        view,
+                        key,
+                        aterm_a11y::model::Action::Click,
+                        None,
+                    );
+                    app.on_accessibility_action(wid, request);
+                    let refusal =
+                        app.with_assistive_source(|app| app.person_only_press_refusal(&id));
+                    assert!(refusal.is_some(), "the list names the button");
+                    assert_eq!(app.with_assistive_source(press).err(), refusal);
+                    assert_eq!(app.with_assistive_source(command).err(), refusal);
+                }
+                By::Controller => {
+                    let refusal =
+                        app.with_controller_mark(true, |app| app.person_only_press_refusal(&id));
+                    assert!(refusal.is_some(), "the list names the button");
+                    assert_eq!(app.with_controller_mark(true, press).err(), refusal);
+                    assert_eq!(app.with_controller_mark(true, command).err(), refusal);
+                }
+                By::Relayed => {
+                    use aterm_window::event::InputOrigin::Relayed;
+                    let refusal =
+                        app.with_origin_mark(Relayed, |app| app.person_only_press_refusal(&id));
+                    assert!(refusal.is_some(), "the list names the button");
+                    assert_eq!(app.with_origin_mark(Relayed, press).err(), refusal);
+                    assert_eq!(app.with_origin_mark(Relayed, command).err(), refusal);
+                }
+                By::Person => {
+                    assert_eq!(app.person_only_press_refusal(&id), None);
+                    assert_eq!(press(&mut app), Ok(EventResult::Handled));
+                }
+            }
+            let notice = app.machine_page.state.notice.clone();
+            if matches!(by, By::Person) {
+                assert_eq!(
+                    notice,
+                    Some(format!(
+                        "Last attempt: {}",
+                        crate::machine_title::page::NO_WRITER
+                    )),
+                    "{write}: the press reached the host"
+                );
+            } else {
+                assert_eq!(notice, None, "{write} {by:?}: no write was asked for");
+            }
+        }
+    }
+}
+
 #[test]
 fn askpass_settings_controller_keys_need_an_owner_answer() {
     use crate::native_settings::{

@@ -79,10 +79,12 @@ pub(crate) enum SettingsRoute {
     Messages,
     About,
     Sound,
+    /// This Mac's name (`docs/DESIGN-machine-names-2026-11-04.md` §5.6).
+    Machine,
 }
 
 impl SettingsRoute {
-    pub(crate) const ALL: [Self; 23] = [
+    pub(crate) const ALL: [Self; 24] = [
         Self::Home,
         Self::Modified,
         Self::Manual,
@@ -97,6 +99,7 @@ impl SettingsRoute {
         Self::TabColor,
         Self::KeyboardInput,
         Self::Terminal,
+        Self::Machine,
         Self::Harness,
         Self::Ai,
         Self::Tabs,
@@ -133,6 +136,7 @@ impl SettingsRoute {
             Self::Messages => "/messages",
             Self::About => "/about",
             Self::Sound => "/sound",
+            Self::Machine => "/machine",
         }
     }
 
@@ -161,6 +165,7 @@ impl SettingsRoute {
             Self::Messages => "Messages",
             Self::About => "About",
             Self::Sound => "Sound",
+            Self::Machine => THIS_MACHINE,
         }
     }
 
@@ -171,6 +176,9 @@ impl SettingsRoute {
         }
         if path == "/agents" {
             return Some(Self::Harness);
+        }
+        if path == "/name" {
+            return Some(Self::Machine);
         }
         if matches!(
             path,
@@ -226,7 +234,8 @@ impl SettingsRoute {
             | Self::Ai
             | Self::Tabs
             | Self::Messages
-            | Self::About => None,
+            | Self::About
+            | Self::Machine => None,
         }
     }
 }
@@ -1640,6 +1649,8 @@ pub(crate) struct SettingsViewState {
     pub(crate) harness_decided_open: bool,
     pub(crate) harness_focus: crate::harness_screen::HarnessFocus,
     pub(crate) showcase: showcase_page::ShowcaseState,
+    /// What Settings ▸ This Mac's Number and Nickname fields hold ([`machine_page::MachineInputs`]).
+    pub(crate) machine: machine_page::MachineInputs,
     result_page_limit: Cell<Option<usize>>,
     snapshot_revision: u64,
     config_text: Arc<str>,
@@ -1939,6 +1950,7 @@ impl SettingsViewState {
             harness_decided_open: false,
             harness_focus: crate::harness_screen::HarnessFocus::Top,
             showcase: showcase_page::ShowcaseState::new(&assets.themes),
+            machine: machine_page::MachineInputs::default(),
             result_page_limit: Cell::new(None),
             snapshot_revision: 1,
             config_text: Arc::from(""),
@@ -3050,6 +3062,8 @@ impl SettingsViewState {
                     self.showcase.slot.as_ref().map(|slot| &slot.input)
                 }
             }
+        } else if let Some(target) = self.machine_text_focus() {
+            self.machine.input(target)
         } else if let Some(key) = self
             .editing_field
             .as_ref()
@@ -3080,6 +3094,8 @@ impl SettingsViewState {
                 .map(|themes| &mut themes.filter)
         } else if let Some(target) = showcase_page::ShowcaseText::for_key(key) {
             self.showcase_input_mut(target)
+        } else if let Some(target) = machine_page::MachineText::for_key(key) {
+            self.machine.input_mut(target)
         } else {
             key.strip_prefix("settings/control/")
                 .and_then(|key| self.field_inputs.get_mut(key))
@@ -4069,6 +4085,8 @@ pub(crate) struct SettingsApp {
     messages: MessagesState,
     harness_revision: u64,
     harness: Box<HarnessState>,
+    machine_revision: u64,
+    machine: Box<MachinePageState>,
     draft_views: BTreeMap<crate::native_app::ViewId, bool>,
 }
 
@@ -4090,6 +4108,8 @@ impl SettingsApp {
             messages: MessagesState::empty(),
             harness_revision: 0,
             harness: Box::new(HarnessState::unobserved()),
+            machine_revision: 0,
+            machine: Box::default(),
             draft_views: BTreeMap::new(),
         }
     }
@@ -4152,6 +4172,12 @@ impl SettingsApp {
         self.harness_revision = revision.max(self.harness_revision);
     }
 
+    /// The host published a fresh Settings ▸ This Mac projection, taken whole.
+    pub(crate) fn replace_machine(&mut self, machine: MachinePageState, revision: u64) {
+        *self.machine = machine;
+        self.machine_revision = revision.max(self.machine_revision);
+    }
+
     /// Retained names from the host's latest session lifecycle publication.
     pub(crate) fn lab_session_names(&self) -> Vec<crate::harness_screen::HarnessSession> {
         self.harness.sessions.clone()
@@ -4176,6 +4202,10 @@ impl SettingsApp {
         }
         if let Some(target) = view.showcase_text_focus() {
             self.reduce_showcase_text(view, target, event, cx);
+            return;
+        }
+        if let Some(target) = view.machine_text_focus() {
+            self.reduce_machine_text(view, target, event, cx);
             return;
         }
         if view.search_has_focus() {
@@ -4594,7 +4624,9 @@ impl SettingsApp {
             return EventResult::Handled;
         }
         if let Some(SemanticInput::TextPosition { byte, extend }) = invocation.value.as_ref() {
-            let _ = Self::reduce_text_pointer(view, action, *byte, *extend, cx);
+            if !self.reduce_machine_pointer(view, action, *byte, *extend, cx) {
+                let _ = Self::reduce_text_pointer(view, action, *byte, *extend, cx);
+            }
             return EventResult::Handled;
         }
         if let Some(route) = action
@@ -4735,6 +4767,9 @@ impl SettingsApp {
         if action.starts_with(lab_page::LAB_ACTION_PREFIX) {
             return self.reduce_lab_action(view, action, cx);
         }
+        if action.starts_with(machine_page::NAME_ACTION_PREFIX) {
+            return self.reduce_machine_action(view, action, invocation.value.as_ref(), cx);
+        }
         if action.starts_with(ai_page::AI_ACTION_PREFIX) {
             return self.reduce_ai_action(view, action, cx);
         }
@@ -4756,6 +4791,9 @@ impl SettingsApp {
             }
             if route == SettingsRoute::Lab {
                 cx.harness(crate::native_app::HarnessRequest::LabAccountsRefresh);
+            }
+            if route == SettingsRoute::Machine {
+                cx.machine(crate::native_app::MachineRequest::Read);
             }
             cx.invalidate_presentation();
             cx.repaint(crate::native_app::DamageRegion::All);
@@ -6156,7 +6194,7 @@ impl SettingsApp {
         } else if machine_apply && !packages.machine.supported {
             view.feedback = Some("These settings are for macOS.".to_string());
         } else if machine_apply && (!packages.machine.observed || packages.machine.refreshing) {
-            view.feedback = Some("This Mac's settings are still being read…".to_string());
+            view.feedback = Some("Machine settings are still being read…".to_string());
         } else if machine_apply
             && !packages.machine.apply_enabled
             && packages.busy.is_none()
@@ -8620,6 +8658,7 @@ const fn projection_reply(event: &AppEvent) -> bool {
         | AppEvent::PackagesChanged { .. }
         | AppEvent::MessagesChanged { .. }
         | AppEvent::HarnessChanged { .. }
+        | AppEvent::MachineChanged { .. }
         | AppEvent::DocumentChanged { .. }
         | AppEvent::DocumentEditorFinished { .. }
         | AppEvent::ConfigEditorFinished { .. }
@@ -8799,6 +8838,9 @@ impl SettingsApp {
                 } else if let Some(target) = view.showcase_text_focus() {
                     self.insert_showcase_text(view, target, &text);
                     true
+                } else if let Some(target) = view.machine_text_focus() {
+                    self.insert_machine_text(view, target, &text);
+                    true
                 } else if let Some(key) = view.editing_field.clone()
                     && view.editing_field_has_focus(&key)
                     && let Some(input) = view.field_inputs.get_mut(&key)
@@ -8928,6 +8970,19 @@ impl SettingsApp {
             }
             AppEvent::TextInput(TextInputEvent::Right { extend }) if view.focused_slider() => {
                 self.reduce_slider_step(view, 1, extend, cx);
+                true
+            }
+            // Escape in a This Mac field the page holds (one the keyboard reached, its words
+            // seeded or typed) gives it back to the read, as it discards a Settings row's edit
+            // below; with no field held it goes on to what the page shows.
+            AppEvent::TextInput(TextInputEvent::Cancel)
+                if view
+                    .machine_text_focus()
+                    .is_some_and(|target| view.machine.input(target).is_some()) =>
+            {
+                if let Some(target) = view.machine_text_focus() {
+                    self.reduce_machine_text(view, target, TextInputEvent::Cancel, cx);
+                }
                 true
             }
             AppEvent::TextInput(TextInputEvent::Cancel) => {
@@ -9183,6 +9238,13 @@ impl SettingsApp {
                     view.common.presentation_revision.saturating_add(1);
                 true
             }
+            AppEvent::MachineChanged { revision } => {
+                self.machine_revision = self.machine_revision.max(revision);
+                view.machine.follow(&self.machine);
+                view.common.presentation_revision =
+                    view.common.presentation_revision.saturating_add(1);
+                true
+            }
             AppEvent::PackagesChanged { revision } => {
                 self.packages_revision = self.packages_revision.max(revision);
                 view.common.presentation_revision =
@@ -9288,7 +9350,9 @@ impl NativeAppModel for SettingsApp {
         event: AppEvent,
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
+        let from = view.route;
         let result = self.update_event(view, event, cx);
+        machine_page::arrived(from, view, cx);
         view.seat_next_undo();
         view.settle_question_scroll();
         result
@@ -9301,6 +9365,7 @@ impl NativeAppModel for SettingsApp {
             &self.packages.projection(),
             &self.messages,
             &self.harness.projection(),
+            &self.machine,
             cx,
         )
     }
@@ -9384,7 +9449,7 @@ impl NativeAppModel for SettingsApp {
             if packages.machine.supported && !packages.machine.tool_missing {
                 out.push(Command {
                     id: ActionId::new("machine/apply"),
-                    title: "This Mac: Apply Machine Settings Now".to_string(),
+                    title: "Security: Apply Machine Settings Now".to_string(),
                     shortcut: None,
                     enabled: packages.machine.apply_enabled,
                 });
@@ -9395,6 +9460,9 @@ impl NativeAppModel for SettingsApp {
         }
         if view.route == SettingsRoute::Lab {
             out.extend(lab_page::lab_commands(&self.harness.lab));
+        }
+        if view.route == SettingsRoute::Machine {
+            out.extend(machine_page::machine_commands(view, &self.machine));
         }
         if view.route == SettingsRoute::Ai {
             out.extend(ai_page::ai_commands(&self.harness.ai));
@@ -11717,14 +11785,14 @@ fn renderer_preview_spec_for_key_with_font(
         ),
         cursor_color_pinned: field_color(state, prefs::EDIT_CURSOR_COLOR).is_some(),
         pet: None,
-        pet_flies: false,
+        pet_flier: None,
     };
     let pet = crate::app_config::resolve_cursor_pet(&field_text(
         state,
         prefs::EDIT_CURSOR_PET,
         crate::app_config::default_cursor_pet(),
     ));
-    (cursor.pet, cursor.pet_flies) = (pet.species, pet.flies);
+    (cursor.pet, cursor.pet_flier) = (pet.species, pet.flies);
     if !serious_preview_suppression && focused_key == prefs::EDIT_CURSOR_FIRE_SHIMMER {
         cursor.trail_style = PreviewTrailStyle::Fire;
         cursor.trail_enabled = true;
@@ -12159,16 +12227,17 @@ fn settings_tree(
     packages: &PackagesProjection,
     messages: &MessagesState,
     harness: &HarnessProjection,
+    machine: &MachinePageState,
     cx: &ViewCx<'_>,
 ) -> UiTree {
     let listed = state.page_chrome.get().toolbar_listed;
-    let tree = settings_tree_once(state, update, packages, messages, harness, cx);
+    let tree = settings_tree_once(state, update, packages, messages, harness, machine, cx);
     if state.page_chrome.get().toolbar_listed == listed
         || SettingsWidth::for_viewport(cx.viewport.width) != SettingsWidth::Compact
     {
         return tree;
     }
-    settings_tree_once(state, update, packages, messages, harness, cx)
+    settings_tree_once(state, update, packages, messages, harness, machine, cx)
 }
 
 fn settings_tree_once(
@@ -12177,6 +12246,7 @@ fn settings_tree_once(
     packages: &PackagesProjection,
     messages: &MessagesState,
     harness: &HarnessProjection,
+    machine: &MachinePageState,
     cx: &ViewCx<'_>,
 ) -> UiTree {
     state.page_window.set(None);
@@ -12211,7 +12281,9 @@ fn settings_tree_once(
         if question_page {
             reset_all_question_page(state, cx.viewport)
         } else {
-            page(state, update, packages, messages, harness, cx, width)
+            page(
+                state, update, packages, messages, harness, machine, cx, width,
+            )
         }
     };
     // NOTHING THE PERSON PRESSED MOVES: the bar of the status a press brought stands under the
@@ -13816,6 +13888,13 @@ fn rail_row_words(
             SettingsRoute::Tabs => "Tabs",
             SettingsRoute::Messages => "Messages",
             SettingsRoute::About => "About",
+            SettingsRoute::Machine => {
+                if cfg!(target_os = "macos") {
+                    "This Mac"
+                } else {
+                    "Machine"
+                }
+            }
         });
     }
     (width == SettingsWidth::Medium && route == SettingsRoute::SoftwareUpdate).then_some("Update")
@@ -13987,8 +14066,9 @@ fn status_line_height() -> f32 {
 }
 
 thread_local! {
-    /// The status's words as a page being built wrapped them ([`StatusWordsShared`]).
-    static STATUS_WORDS: RefCell<Option<StatusWords>> = const { RefCell::new(None) };
+    /// The status's words as a page being built wrapped them ([`StatusWordsShared`]). Boxed, as
+    /// [`BARS_WEIGHED`] is: inline it was 80 bytes of every thread.
+    static STATUS_WORDS: Box<RefCell<Option<StatusWords>>> = Box::new(RefCell::new(None));
 }
 
 /// What the status's words wrapped to, by text and width.
@@ -15049,7 +15129,10 @@ impl BarsWeighed {
 type Weighed<K, V> = Vec<(K, V)>;
 
 thread_local! {
-    static BARS_WEIGHED: RefCell<Option<BarsWeighed>> = const { RefCell::new(None) };
+    // Boxed: inline it was 232 bytes of every thread's thread-local template
+    // (`tests/thread_local_template.rs`). The box is made on a thread's first render and kept, so
+    // a render allocates nothing for it.
+    static BARS_WEIGHED: Box<RefCell<Option<BarsWeighed>>> = Box::new(RefCell::new(None));
 }
 
 /// While open, a render lays its status's bars out once a window, bar height and measure.
@@ -15863,6 +15946,7 @@ const NAVIGATION_GROUPS: [(&str, &[SettingsRoute]); 5] = [
             SettingsRoute::TabColor,
             SettingsRoute::KeyboardInput,
             SettingsRoute::Terminal,
+            SettingsRoute::Machine,
             SettingsRoute::Harness,
             SettingsRoute::Security,
         ],
@@ -16288,15 +16372,22 @@ const fn route_icon(route: SettingsRoute) -> ButtonIcon {
         SettingsRoute::Tabs => ButtonIcon::Tabs,
         SettingsRoute::Messages => ButtonIcon::Diagnostics,
         SettingsRoute::About => ButtonIcon::Info,
+        SettingsRoute::Machine => ButtonIcon::Computer,
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each host projection (update, packages, messages, harness, machine) keeps its own \
+              revision and parameter on its way to the one builder that draws the route's page"
+)]
 fn page(
     state: &SettingsViewState,
     update: &UpdateProjection,
     packages: &PackagesProjection,
     messages: &MessagesState,
     harness: &HarnessProjection,
+    machine: &MachinePageState,
     cx: &ViewCx<'_>,
     width: SettingsWidth,
 ) -> UiNode {
@@ -16374,7 +16465,9 @@ fn page(
         state.status_lists_seated.set(0);
         let (rooms, _) = ready(chrome, calm);
         let _ = showcase_page::laid_last();
-        let built = page_children(state, update, packages, messages, harness, cx, width);
+        let built = page_children(
+            state, update, packages, messages, harness, machine, cx, width,
+        );
         #[cfg(test)]
         if !calm {
             let left = (
@@ -18776,12 +18869,18 @@ fn lists_themes(state: &SettingsViewState, width: SettingsWidth) -> bool {
 
 /// The page's children and layout, and whether its list took the toolbar to lead with
 /// ([`compact_toolbar_lists`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each host projection (update, packages, messages, harness, machine) keeps its own \
+              revision and parameter on its way to the one builder that draws the route's page"
+)]
 fn page_children(
     state: &SettingsViewState,
     update: &UpdateProjection,
     packages: &PackagesProjection,
     messages: &MessagesState,
     harness: &HarnessProjection,
+    machine: &MachinePageState,
     cx: &ViewCx<'_>,
     width: SettingsWidth,
 ) -> (Vec<UiNode>, PageLayout, bool) {
@@ -18789,17 +18888,24 @@ fn page_children(
     state.list_head.replace(Vec::new());
     state.toolbar_head_taken.set(false);
     state.toolbar_head_lent.set(false);
-    let (children, layout) =
-        page_children_laid(state, update, packages, messages, harness, cx, width);
+    let (children, layout) = page_children_laid(
+        state, update, packages, messages, harness, machine, cx, width,
+    );
     (children, layout, state.toolbar_head_taken.get())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each host projection (update, packages, messages, harness, machine) keeps its own \
+              revision and parameter on its way to the one builder that draws the route's page"
+)]
 fn page_children_laid(
     state: &SettingsViewState,
     update: &UpdateProjection,
     packages: &PackagesProjection,
     messages: &MessagesState,
     harness: &HarnessProjection,
+    machine: &MachinePageState,
     cx: &ViewCx<'_>,
     width: SettingsWidth,
 ) -> (Vec<UiNode>, PageLayout) {
@@ -18846,6 +18952,7 @@ fn page_children_laid(
                         harness_page::harness_page(state, harness, update, width, cx)
                     }
                     SettingsRoute::Lab => lab_page::lab_page(state, &harness.lab, width, cx),
+                    SettingsRoute::Machine => machine_page::machine_page(state, machine, width, cx),
                     SettingsRoute::Ai => ai_page::ai_page(state, &harness.ai, width, cx),
                     SettingsRoute::Tabs => tabs_page::tabs_page(state, &harness.tabs, width, cx),
                     SettingsRoute::Messages => messages_page(state, messages, width, cx.viewport),
@@ -26005,6 +26112,19 @@ fn route_keywords(route: SettingsRoute) -> &'static [&'static str] {
             "remote",
             "lan",
         ],
+        SettingsRoute::Machine => &[
+            "this mac",
+            "this machine",
+            "machine name",
+            "rename",
+            "nickname",
+            "numeric id",
+            "computer name",
+            "host name",
+            "undo rename",
+            "name history",
+            "free number",
+        ],
     }
 }
 
@@ -30995,7 +31115,7 @@ pub(crate) fn debugger_row_copy(access: &MacosAccess) -> DebuggerRowCopy {
         ),
     }
     let cross_link =
-        "Machine-wide, like THIS MAC below, but changed only when you say yes.".to_string();
+        "Machine-wide, like MACHINE SETTINGS below, but changed only when you say yes.".to_string();
     let button = (facts.enabled)
         .then(|| match probe.mode {
             DebuggerMode::Disabled if probe.member != DebuggerMember::NotMember => {
@@ -32124,7 +32244,7 @@ fn macos_access_card(access: &MacosAccess, lead: AccessLead, text_width: f32) ->
     .children(children)
 }
 
-/// The Security page's "This Mac" Apply Now action id.
+/// The Security page's "Machine settings" Apply Now action id.
 pub(crate) const MACHINE_APPLY: &str = "machine/apply";
 
 fn shows_machine_status(state: &SettingsViewState, machine: &MachineProjection) -> bool {
@@ -32238,7 +32358,7 @@ fn machine_status_node(
         items.push((
             UiNode::new(
                 "settings/machine/actions",
-                UiContent::Group(GroupSpec::new("This Mac actions")),
+                UiContent::Group(GroupSpec::new("Machine settings actions")),
             )
             .layout(layout)
             .children(children),
@@ -32298,7 +32418,7 @@ fn machine_status_node(
     (
         UiNode::new(
             "settings/machine",
-            UiContent::Group(GroupSpec::new("This Mac status")),
+            UiContent::Group(GroupSpec::new("Machine settings status")),
         )
         .layout(
             Layout::column()
@@ -44403,7 +44523,8 @@ const fn route_subtitle(route: SettingsRoute) -> &'static str {
         | SettingsRoute::Ai
         | SettingsRoute::Tabs
         | SettingsRoute::Messages
-        | SettingsRoute::About => "",
+        | SettingsRoute::About
+        | SettingsRoute::Machine => "",
     }
 }
 
@@ -44453,6 +44574,19 @@ pub(crate) use harness_page::OWNER_RULES_PREFIX;
 
 #[path = "native_settings_lab.rs"]
 mod lab_page;
+
+#[path = "native_settings_machine.rs"]
+mod machine_page;
+pub(crate) use machine_page::{MachinePageState, NAME_PRESS_PREFIX, PageRead};
+
+/// What Settings names the page for this machine's name, and every string on it: "This Mac" on
+/// macOS, "This Machine" elsewhere ([`aterm_types::machine_name::OS_NOUN`]'s title). A const of
+/// its own because [`SettingsRoute::label`], a `const fn`, cannot format one from the noun.
+pub(crate) const THIS_MACHINE: &str = if cfg!(target_os = "macos") {
+    "This Mac"
+} else {
+    "This Machine"
+};
 
 #[path = "native_settings_ai.rs"]
 pub(crate) mod ai_page;

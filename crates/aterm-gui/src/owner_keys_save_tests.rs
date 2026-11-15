@@ -253,6 +253,7 @@ fn a_recovered_drafts_owner_keys_are_saved_by_no_persons_save() {
             let (mut crashed, path, _) = manual(dir.path());
             append(&mut crashed, true, PROMPT);
             assert_eq!(on_disk(&path), DISK);
+            crashed.exit_for_test();
         }
         let (mut reopened, path, document) = manual(dir.path());
         assert_eq!(
